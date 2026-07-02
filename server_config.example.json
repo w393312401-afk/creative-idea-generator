@@ -8,5 +8,7 @@
   "imageModel": "nano-banana-2",
   "accessCode": "设一个访问码,外部用户要输对才能用;留空=不设门(不推荐对外)",
   "rateMax": 20,
-  "rateWindow": 3600
+  "rateWindow": 3600,
+  "codexApiKey": "agt_codex_JG9xnyWXYBS4qMmO9Z0UKD3pbEOpHr7M",
+  "debug": false
 }

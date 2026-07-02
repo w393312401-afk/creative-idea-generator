@@ -3968,4 +3968,30 @@
     box-shadow: 0 2px 4px rgba(0,0,0,0.4);
 }
 
+/* Stale / Lineage-mismatched Card & Badge */
+.frame-card.stale-card {
+    border: 1px solid rgba(139, 92, 246, 0.6) !important;
+    background: rgba(139, 92, 246, 0.03) !important;
+}
+
+.frame-card.stale-card:hover {
+    border-color: #8b5cf6 !important;
+    box-shadow: 0 0 8px rgba(139, 92, 246, 0.3) !important;
+}
+
+.stale-badge {
+    position: absolute;
+    top: 5px;
+    left: 5px;
+    background: rgba(139, 92, 246, 0.9);
+    color: #fff;
+    padding: 2px 5px;
+    font-size: 9px;
+    border-radius: 3px;
+    font-weight: bold;
+    z-index: 10;
+    pointer-events: none;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.4);
+}
+
 
