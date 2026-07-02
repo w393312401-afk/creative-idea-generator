@@ -1,0 +1,12 @@
+{
+  "_comment": "复制为 server_config.json 后填写。填了 apiKey 即进入『服务端托管模式』:模型密钥只留在服务端,浏览器再也拿不到。",
+  "baseUrl": "http://127.0.0.1:8046/v1",
+  "apiKey": "在这里填你 Antigravity 的 API Key(建议新建一个 User Token 专用于本服务)",
+  "geminiDirectApiKey": "",
+  "geminiDirectImageModel": "gemini-3.1-flash-image",
+  "model": "gemini-3-flash-agent",
+  "imageModel": "nano-banana-2",
+  "accessCode": "设一个访问码,外部用户要输对才能用;留空=不设门(不推荐对外)",
+  "rateMax": 20,
+  "rateWindow": 3600
+}

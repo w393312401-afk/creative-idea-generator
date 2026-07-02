@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SPARK 开发者中心 & 控制台</title>
+  <script>(function(){try{if(localStorage.getItem('spark_theme')==='dark'){document.documentElement.setAttribute('data-theme','dark');}}catch(e){}})();</script>
+  <link rel="stylesheet" href="tokens.css?v=1.0.7">
+  <link rel="stylesheet" href="console.css?v=1.0.7">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Top Header (spans full width!) -->
+    <header class="app-header">
+      <div class="header-logo">
+        <div class="logo-icon">💻</div>
+        <div class="logo-text">
+          <h1>SPARK DevPortal</h1>
+          <span>Developer Center</span>
+        </div>
+      </div>
+      
+      <!-- Unified App Switcher -->
+      <div class="app-switcher">
+        <a href="/" class="switcher-item" data-app="workshop">
+          <span class="switcher-icon">⚡</span>
+          <span class="switcher-text">创意工坊</span>
+        </a>
+        <a href="/image-service-station/" class="switcher-item" data-app="image-station">
+          <span class="switcher-icon">🎨</span>
+          <span class="switcher-text">图像服务站</span>
+        </a>
+        <a href="/console.html" class="switcher-item active" data-app="console">
+          <span class="switcher-icon">💻</span>
+          <span class="switcher-text">控制台</span>
+        </a>
+      </div>
+      
+      <!-- System Status & Controls -->
+      <div class="header-controls">
+        <div class="system-status">
+          <!-- Gateway Status -->
+          <div class="status-badge" title="底层模型代理网关 (8045)">
+            <span class="status-dot offline" id="status-gateway-dot"></span>
+            <span><span class="status-label">代理网关: </span><span id="status-gateway-text">正在检查...</span></span>
+          </div>
+          <!-- App Server Status -->
+          <div class="status-badge" title="SPARK应用服务 (8085)">
+            <span class="status-dot online" id="status-app-dot"></span>
+            <span><span class="status-label">应用服务: </span><span id="status-app-text">在线</span></span>
+          </div>
+          <!-- Mode Status -->
+          <div class="status-badge" id="managed-mode-badge">
+            <span id="managed-mode-text">获取模式中...</span>
+          </div>
+        </div>
+        <button id="theme-toggle-btn" class="icon-btn" title="切换暗夜模式">
+          <span id="theme-toggle-icon">🌙</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- App Main Workspace Grid (Unifies size and centering) -->
+    <main class="app-main">
+      <!-- Sidebar Navigation (floating glass panel!) -->
+      <aside class="sidebar glass-panel">
+        <div>
+          <div class="brand">
+            <div class="brand-logo">S</div>
+            <div class="brand-name-container">
+              <span class="brand-name">SPARK DevPortal</span>
+              <span class="brand-sub">Developer Center</span>
+            </div>
+          </div>
+          <nav class="nav-menu">
+            <div class="nav-item active" data-tab="dashboard">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6A2.25 2.25 0 0 1 3.75 18v-2.25ZM13.5 6a2.25 2.25 0 0 1 2.25-2.25H18A2.25 2.25 0 0 1 20.25 6v2.25A2.25 2.25 0 0 1 18 10.5h-2.25a2.25 2.25 0 0 1-2.25-2.25V6ZM13.5 15.75a2.25 2.25 0 0 1 2.25-2.25H18a2.25 2.25 0 0 1 2.25 2.25V18A2.25 2.25 0 0 1 18 20.25h-2.25A2.25 2.25 0 0 1 13.5 18v-2.25Z" />
+              </svg>
+              <span>仪表盘控制台</span>
+            </div>
+            <div class="nav-item" data-tab="models">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904 9 21l8.982-5.63M9 21l4.5-4.5M9 21l-4.5-4.5M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
+              </svg>
+              <span>可用模型中心</span>
+            </div>
+            <div class="nav-item" data-tab="docs">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
+              </svg>
+              <span>API 交互文档</span>
+            </div>
+            <div class="nav-item" data-tab="playground">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M17.25 6.75 22.5 12l-5.25 5.25m-10.5 0L1.5 12l5.25-5.25m7.5-3-4.5 16.5" />
+              </svg>
+              <span>接口测试沙盒</span>
+            </div>
+          </nav>
+        </div>
+        
+        <!-- User API Key Settings -->
+        <div class="sidebar-footer">
+          <div class="user-token-box">
+            <label for="local-token-input">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" style="width:13px;height:13px;color:var(--primary);">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z" />
+              </svg>
+              <span>本地凭证 (API Key)</span>
+            </label>
+            <div class="user-token-input-wrapper">
+              <input type="password" id="local-token-input" class="user-token-input" placeholder="输入 User Token 进行测试..." />
+              <button type="button" class="token-toggle-btn" id="token-toggle-btn" title="显示/隐藏凭证">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:15px;height:15px;" id="token-toggle-icon">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 0 1 0-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178Z" />
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Main Content Area (glass-panel!) -->
+      <div class="main-content glass-panel">
+        <!-- Unified Panel Header -->
+        <div class="panel-header">
+          <div class="header-left-group">
+            <button class="mobile-menu-toggle" id="mobile-menu-toggle" aria-label="打开菜单">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
+              </svg>
+            </button>
+            <h2 id="page-title-label">控制台仪表盘</h2>
+          </div>
+          <p id="page-title-desc">监控后台任务、系统状态并管理可用 AI 模型与 API 接口</p>
+        </div>
+
+        <!-- TAB 1: DASHBOARD -->
+        <section class="tab-content active" id="tab-dashboard">
+        <!-- Tunnel URL Announcement banner -->
+        <div class="alert alert-info" id="tunnel-url-banner" style="display: none;">
+          <div class="alert-info-left">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" style="width:18px;height:18px;color:var(--primary);filter:drop-shadow(0 0 4px var(--primary-glow));">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
+            </svg>
+            <span><strong>公网访问已开启</strong>：当前已通过 Cloudflare Tunnel 暴露服务，公网 API Base URL 为：<code id="tunnel-url-code">-</code></span>
+          </div>
+          <button class="alert-copy-btn" id="btn-copy-tunnel-url">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:14px;height:14px;">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H5.25m11.9-3.664A2.251 2.251 0 0 0 15 2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25h-.007a2.25 2.25 0 0 0-2.25 2.25M18.75 8.25v11.25m0-11.25a2.25 2.25 0 0 0-2.25-2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25m7.5 0v11.25m-18-11.25a2.25 2.25 0 0 1 2.25-2.25h1.5a2.25 2.25 0 0 1 2.25 2.25m-4.5 0v11.25m11.9-3.664C19.302 15.1 19.5 14.201 19.5 13.25V9.75" />
+            </svg>
+            <span>复制 URL</span>
+          </button>
+        </div>
+
+        <!-- Quick Stats Cards -->
+        <div class="dashboard-grid">
+          <div class="glass-card">
+            <div class="card-icon">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+              </svg>
+            </div>
+            <div class="card-value" id="stat-active-tasks">0</div>
+            <div class="card-label">后台活跃生成任务</div>
+          </div>
+          <div class="glass-card">
+            <div class="card-icon">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M9 12h3.75M9 15h3.375c.9 0 1.625-.724 1.625-1.625V12.75M9 9h3.375c.9 0 1.625-.724 1.625-1.625V6.75M12 3v18M3 21h18" />
+              </svg>
+            </div>
+            <div class="card-value" id="stat-rate-max">20</div>
+            <div class="card-label">单IP限制量 (1小时内最多/次)</div>
+          </div>
+          <div class="glass-card">
+            <div class="card-icon">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 15a4.5 4.5 0 0 0 4.5 4.5H18a3.75 3.75 0 0 0 1.332-7.257 3 3 0 0 0-3.758-3.848 5.25 5.25 0 0 0-10.233 2.33A4.502 4.502 0 0 0 2.25 15Z" />
+              </svg>
+            </div>
+            <div class="card-value" id="stat-server-mode">托管模式</div>
+            <div class="card-label">服务器运行状态</div>
+          </div>
+          <div class="glass-card" style="display: flex; flex-direction: column; justify-content: space-between;">
+            <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+              <div class="card-icon" style="margin-bottom: 0;">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" />
+                </svg>
+              </div>
+              <button id="btn-clear-system-cache" class="btn btn-sm" style="margin: 0; padding: 4px 8px; font-size: 11px; background: rgba(255, 75, 75, 0.12); border: 1px solid rgba(255, 75, 75, 0.25); color: #ff4b4b; border-radius: 6px; cursor: pointer; transition: 0.2s; font-weight: 600;">清理缓存</button>
+            </div>
+            <div class="card-value" id="stat-cache-size" style="margin-top: 12px; margin-bottom: 6px;">计算中...</div>
+            <div class="card-label">系统缓存 (packet_cache)</div>
+          </div>
+        </div>
+
+        <!-- Task Monitor Section -->
+        <div class="glass-card">
+          <div class="section-title">
+            <span>活跃时光机合成任务监视器</span>
+            <span id="task-monitor-sync-time">上次更新: 刚刚</span>
+          </div>
+          <div class="table-container">
+            <table class="custom-table">
+              <thead>
+                <tr>
+                  <th>任务 ID</th>
+                  <th>改造主题</th>
+                  <th>状态</th>
+                  <th>维度数 (Beats)</th>
+                  <th>持续时长</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="task-table-body">
+                <tr>
+                  <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 40px 0;">
+                    正在获取任务列表...
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: MODEL HUB -->
+      <section class="tab-content" id="tab-models">
+        <div class="marketplace-container">
+          <!-- Left Sidebar Filters -->
+          <aside class="market-sidebar">
+            <!-- Mobile Filter Header -->
+            <div class="market-sidebar-mobile-header">
+              <span>筛选模型</span>
+              <button id="btn-close-filters" aria-label="关闭筛选">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            
+            <div class="sidebar-filter-header">
+              <span class="filter-title">供应商</span>
+              <button class="btn-reset-filters" id="btn-reset-all">重置</button>
+            </div>
+            
+            <!-- Provider Selector -->
+            <ul class="filter-list" id="filter-provider">
+              <li class="filter-item active" data-value="all">全部供应商 <span class="count-badge">9</span></li>
+              <li class="filter-item" data-value="Google">Google <span class="count-badge">3</span></li>
+              <li class="filter-item" data-value="OpenAI">OpenAI <span class="count-badge">3</span></li>
+              <li class="filter-item" data-value="Doubao">Doubao (豆包) <span class="count-badge">3</span></li>
+            </ul>
+
+            <span class="filter-title">模型类型</span>
+            <!-- Model Type Selector -->
+            <ul class="filter-list" id="filter-type">
+              <li class="filter-item active" data-value="all">全部类型 <span class="count-badge">9</span></li>
+              <li class="filter-item" data-value="text">文本 <span class="count-badge">4</span></li>
+              <li class="filter-item" data-value="image">图像 <span class="count-badge">2</span></li>
+              <li class="filter-item" data-value="video">音视频 <span class="count-badge">3</span></li>
+            </ul>
+
+            <span class="filter-title">标签</span>
+            <!-- Tags Selector -->
+            <ul class="filter-list" id="filter-tags">
+              <li class="filter-item active" data-value="all">全部标签 <span class="count-badge">9</span></li>
+              <li class="filter-item" data-value="对话">对话 <span class="count-badge">4</span></li>
+              <li class="filter-item" data-value="工具">工具 <span class="count-badge">4</span></li>
+              <li class="filter-item" data-value="识图">识图 <span class="count-badge">4</span></li>
+              <li class="filter-item" data-value="思考">思考 <span class="count-badge">1</span></li>
+              <li class="filter-item" data-value="绘画">绘画 <span class="count-badge">2</span></li>
+              <li class="filter-item" data-value="dall-e-3格式">dall-e-3格式 <span class="count-badge">1</span></li>
+              <li class="filter-item" data-value="参考图">参考图 <span class="count-badge">2</span></li>
+              <li class="filter-item" data-value="视频">视频 <span class="count-badge">3</span></li>
+              <li class="filter-item" data-value="多模态">多模态 <span class="count-badge">3</span></li>
+            </ul>
+
+            <span class="filter-title">计费类型</span>
+            <!-- Billing Selector -->
+            <ul class="filter-list" id="filter-billing">
+              <li class="filter-item active" data-value="all">全部类型 <span class="count-badge">9</span></li>
+              <li class="filter-item" data-value="payg">按量计费 <span class="count-badge">9</span></li>
+            </ul>
+          </aside>
+
+          <!-- Right Content Area -->
+          <div class="market-content">
+            <!-- Top Action bar -->
+            <div class="market-action-bar">
+              <div class="search-box-container">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="search-icon">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="m21-21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
+                </svg>
+                <input type="text" id="search-model-input" placeholder="模糊搜索模型名称..." class="market-search-input" />
+              </div>
+              
+              <button class="mobile-filter-toggle" id="mobile-filter-toggle" aria-label="筛选">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M12 3c2.755 0 5.455.232 8.083.678.533.09.917.556.917 1.096v1.044a2.25 2.25 0 0 1-.659 1.591l-5.432 5.432a2.25 2.25 0 0 0-.659 1.591v2.927a2.25 2.25 0 0 1-1.244 2.013L9.75 21v-6.568a2.25 2.25 0 0 0-.659-1.591L3.659 7.409A2.25 2.25 0 0 1 3 5.818V4.774c0-.54.384-1.006.917-1.096A48.32 48.32 0 0 1 12 3Z" />
+                </svg>
+                <span>筛选</span>
+              </button>
+              
+              <div class="market-action-controls">
+                <div class="multiplier-control">
+                  <span>倍率</span>
+                  <label class="switch-toggle">
+                    <input type="checkbox" checked />
+                    <span class="slider-round"></span>
+                  </label>
+                </div>
+                <button class="btn-view-toggle active" title="网格视图">
+                  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:16px;height:16px;">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V-2.25Z" />
+                  </svg>
+                </button>
+                <button class="btn-view-toggle" title="表格视图">
+                  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:16px;height:16px;">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 6.75h12M8.25 12h12M8.25 17.25h12M3.75 6.75h.007v.008H3.75V6.75Zm.007 8.25h-.008v-.008h.008v.008Zm0 2.25h-.008v-.008h.008v.008Z" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- Model Grid -->
+            <div class="market-grid" id="market-model-grid">
+              <!-- Dynamically populated by console.js -->
+            </div>
+          </div>
+        </div>
+
+        <!-- Suffix Generator (Maintained at bottom as dynamic tool) -->
+        <div class="glass-card" style="margin-top: 40px;">
+          <h2 class="section-title">图像模型规格魔法后缀生成器 <span>针对 Imagen 3 和多模态图生图的参数自动计算</span></h2>
+          <div class="generator-panel">
+            <div class="generator-controls">
+              <div class="control-group">
+                <label for="suffix-base-model">基础图像模型 (Base Model)</label>
+                <select id="suffix-base-model" class="form-select">
+                  <option value="gemini-3.1-flash-image">gemini-3.1-flash-image (推荐)</option>
+                  <option value="nano-banana-2">nano-banana-2 (界面别名)</option>
+                </select>
+              </div>
+              <div class="control-group">
+                <label for="suffix-ratio">宽高比 (Aspect Ratio)</label>
+                <select id="suffix-ratio" class="form-select">
+                  <option value="9-16">9:16 (时光机竖屏, 768×1376)</option>
+                  <option value="16-9">16:9 (横屏宽幅, 1376×768)</option>
+                  <option value="1-1">1:1 (正方形, 1024×1024)</option>
+                  <option value="3-2">3:2 (摄影经典比例, 1264×848)</option>
+                  <option value="2-3">2:3 (人像经典比例, 848×1264)</option>
+                  <option value="21-9">21:9 (电影宽幅, 1584×672)</option>
+                </select>
+              </div>
+              <div class="control-group">
+                <label for="suffix-quality">清晰度级别 (Quality)</label>
+                <select id="suffix-quality" class="form-select">
+                  <option value="2k">2K 超清分辨率 (推荐， Imagen 3 高细节渲染)</option>
+                  <option value="4k">4K 极清分辨率 (极限画质表现)</option>
+                  <option value="1k">1K 标准分辨率 (快速调试首选)</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Output Result -->
+            <div class="generator-result">
+              <div class="result-title">生成的完整模型 ID</div>
+              <div class="result-id" id="generated-model-id">gemini-3.1-flash-image-9-16-2k</div>
+              <div class="result-info">
+                生成尺寸：<span id="generated-model-pixels" style="color: #fff; font-weight: 500;">1536 × 2752</span> 像素 (基于所选宽高比及清晰度标准)
+              </div>
+              <button class="btn btn-primary" id="btn-copy-model-id">
+                复制完整模型 ID
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: API DOCUMENTS -->
+      <section class="tab-content" id="tab-docs">
+        <div class="docs-layout">
+          <!-- Sidebar tabs for API routes -->
+          <nav class="docs-menu">
+            <h3 style="font-size: 11px; color: var(--text-dark); text-transform: uppercase; letter-spacing: 0.5px; padding: 0 12px 8px 12px;">网关底座模型接口</h3>
+            <div class="docs-menu-item active" data-doc="post-chat">
+              <span>对话/多模态 chat</span>
+              <span class="method-tag method-post">POST</span>
+            </div>
+            <div class="docs-menu-item" data-doc="post-image-gen">
+              <span>文生图 generations</span>
+              <span class="method-tag method-post">POST</span>
+            </div>
+            
+            <h3 style="font-size: 11px; color: var(--text-dark); text-transform: uppercase; letter-spacing: 0.5px; padding: 16px 12px 8px 12px;">SPARK 业务接口</h3>
+            <div class="docs-menu-item" data-doc="post-ideate">
+              <span>方案策划 ideate</span>
+              <span class="method-tag method-post">POST</span>
+            </div>
+            <div class="docs-menu-item" data-doc="post-compose">
+              <span>指令合成 compose</span>
+              <span class="method-tag method-post">POST</span>
+            </div>
+            <div class="docs-menu-item" data-doc="post-image-edit">
+              <span>多参考重绘 edits</span>
+              <span class="method-tag method-post">POST</span>
+            </div>
+            <div class="docs-menu-item" data-doc="post-reverse-video">
+              <span>视频解析 reverse</span>
+              <span class="method-tag method-post">POST</span>
+            </div>
+          </nav>
+
+          <!-- Docs Body Panels -->
+          <div class="docs-content">
+            <!-- DOCS PANEL 1: POST-CHAT -->
+            <div class="doc-panel" id="doc-post-chat">
+              <div class="endpoint-header">
+                <h2 style="font-size: 20px; font-weight: 600; color: #fff;">对话与多模态 Chat Completions</h2>
+                <p style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">遵循标准 OpenAI 协议，支持纯文本输入以及包含 Base64 图像的多模态输入。</p>
+                <div class="endpoint-url-box">
+                  <span class="method-tag method-post" style="padding: 6px 10px; font-size: 11px;">POST</span>
+                  <span class="endpoint-url" id="doc-url-chat">/v1/chat/completions</span>
+                </div>
+              </div>
+              
+              <!-- Code view -->
+              <div class="code-tab-container">
+                <div class="code-tab-header">
+                  <button class="code-tab-btn active" data-lang="curl">cURL</button>
+                  <button class="code-tab-btn" data-lang="python">Python</button>
+                  <button class="code-tab-btn" data-lang="js">JavaScript</button>
+                </div>
+                <div class="code-block-container">
+                  <pre class="code-block" id="code-chat-block">加载中...</pre>
+                  <div class="btn-copy-code" title="复制代代码" onclick="copyDocCode('code-chat-block')">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:16px;height:16px;">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H5.25m11.9-3.664A2.251 2.251 0 0 0 15 2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25h-.007a2.25 2.25 0 0 0-2.25 2.25M18.75 8.25v11.25m0-11.25a2.25 2.25 0 0 0-2.25-2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25m7.5 0v11.25m-18-11.25a2.25 2.25 0 0 1 2.25-2.25h1.5a2.25 2.25 0 0 1 2.25 2.25m-4.5 0v11.25m11.9-3.664C19.302 15.1 19.5 14.201 19.5 13.25V9.75" />
+                    </svg>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- DOCS PANEL 2: POST-IMAGE-GEN -->
+            <div class="doc-panel" id="doc-post-image-gen" style="display:none;">
+              <div class="endpoint-header">
+                <h2 style="font-size: 20px; font-weight: 600; color: #fff;">标准文本生成图像 Generations</h2>
+                <p style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">根据提示词直接生成全新图像。网关层会自动将其重定向并优化至 Imagen 3 模型渲染。</p>
+                <div class="endpoint-url-box">
+                  <span class="method-tag method-post" style="padding: 6px 10px; font-size: 11px;">POST</span>
+                  <span class="endpoint-url" id="doc-url-image-gen">/v1/images/generations</span>
+                </div>
+              </div>
+              
+              <div class="code-tab-container">
+                <div class="code-tab-header">
+                  <button class="code-tab-btn active" data-lang="curl">cURL</button>
+                  <button class="code-tab-btn" data-lang="python">Python</button>
+                  <button class="code-tab-btn" data-lang="js">JavaScript</button>
+                </div>
+                <div class="code-block-container">
+                  <pre class="code-block" id="code-image-gen-block">加载中...</pre>
+                  <div class="btn-copy-code" title="复制代码" onclick="copyDocCode('code-image-gen-block')">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:16px;height:16px;">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H5.25m11.9-3.664A2.251 2.251 0 0 0 15 2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25h-.007a2.25 2.25 0 0 0-2.25 2.25M18.75 8.25v11.25m0-11.25a2.25 2.25 0 0 0-2.25-2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25m7.5 0v11.25m-18-11.25a2.25 2.25 0 0 1 2.25-2.25h1.5a2.25 2.25 0 0 1 2.25 2.25m-4.5 0v11.25m11.9-3.664C19.302 15.1 19.5 14.201 19.5 13.25V9.75" />
+                    </svg>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- DOCS PANEL 3: POST-IDEATE -->
+            <div class="doc-panel" id="doc-post-ideate" style="display:none;">
+              <div class="endpoint-header">
+                <h2 style="font-size: 20px; font-weight: 600; color: #fff;">空间改造创意策划 Ideate</h2>
+                <p style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">由后台语言模型基于历史成功的改造维度记录，生成数个全新的设计方案脑洞。</p>
+                <div class="endpoint-url-box">
+                  <span class="method-tag method-post" style="padding: 6px 10px; font-size: 11px;">POST</span>
+                  <span class="endpoint-url" id="doc-url-ideate">/api/ideate</span>
+                </div>
+              </div>
+              
+              <div class="code-tab-container">
+                <div class="code-tab-header">
+                  <button class="code-tab-btn active" data-lang="curl">cURL</button>
+                  <button class="code-tab-btn" data-lang="python">Python</button>
+                  <button class="code-tab-btn" data-lang="js">JavaScript</button>
+                </div>
+                <div class="code-block-container">
+                  <pre class="code-block" id="code-ideate-block">加载中...</pre>
+                  <div class="btn-copy-code" title="复制代码" onclick="copyDocCode('code-ideate-block')">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:16px;height:16px;">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H5.25m11.9-3.664A2.251 2.251 0 0 0 15 2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25h-.007a2.25 2.25 0 0 0-2.25 2.25M18.75 8.25v11.25m0-11.25a2.25 2.25 0 0 0-2.25-2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25m7.5 0v11.25m-18-11.25a2.25 2.25 0 0 1 2.25-2.25h1.5a2.25 2.25 0 0 1 2.25 2.25m-4.5 0v11.25m11.9-3.664C19.302 15.1 19.5 14.201 19.5 13.25V9.75" />
+                    </svg>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- DOCS PANEL 4: POST-COMPOSE -->
+            <div class="doc-panel" id="doc-post-compose" style="display:none;">
+              <div class="endpoint-header">
+                <h2 style="font-size: 20px; font-weight: 600; color: #fff;">时空重建指令合成 Compose</h2>
+                <p style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">传入主题、核心锚点、清晰度等设计维度，启动后台线程批量合成全段时光重绘指令（SCUP 算法）。</p>
+                <div class="endpoint-url-box">
+                  <span class="method-tag method-post" style="padding: 6px 10px; font-size: 11px;">POST</span>
+                  <span class="endpoint-url" id="doc-url-compose">/api/compose</span>
+                </div>
+              </div>
+              
+              <div class="code-tab-container">
+                <div class="code-tab-header">
+                  <button class="code-tab-btn active" data-lang="curl">cURL</button>
+                  <button class="code-tab-btn" data-lang="python">Python</button>
+                  <button class="code-tab-btn" data-lang="js">JavaScript</button>
+                </div>
+                <div class="code-block-container">
+                  <pre class="code-block" id="code-compose-block">加载中...</pre>
+                  <div class="btn-copy-code" title="复制代码" onclick="copyDocCode('code-compose-block')">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:16px;height:16px;">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H5.25m11.9-3.664A2.251 2.251 0 0 0 15 2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25h-.007a2.25 2.25 0 0 0-2.25 2.25M18.75 8.25v11.25m0-11.25a2.25 2.25 0 0 0-2.25-2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25m7.5 0v11.25m-18-11.25a2.25 2.25 0 0 1 2.25-2.25h1.5a2.25 2.25 0 0 1 2.25 2.25m-4.5 0v11.25m11.9-3.664C19.302 15.1 19.5 14.201 19.5 13.25V9.75" />
+                    </svg>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- DOCS PANEL 5: POST-IMAGE-EDIT -->
+            <div class="doc-panel" id="doc-post-image-edit" style="display:none;">
+              <div class="endpoint-header">
+                <h2 style="font-size: 20px; font-weight: 600; color: #fff;">多参考图局部编辑与重绘 Edits</h2>
+                <p style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">上传一张或多张参考图片并提供重绘指令，在保持原始空间透视关系、构图比例不变的前提下，对画面进行精准的高物理一致性局部修改。</p>
+                <div class="endpoint-url-box">
+                  <span class="method-tag method-post" style="padding: 6px 10px; font-size: 11px;">POST</span>
+                  <span class="endpoint-url" id="doc-url-image-edit">/api/image/edits</span>
+                </div>
+              </div>
+              
+              <div class="code-tab-container">
+                <div class="code-tab-header">
+                  <button class="code-tab-btn active" data-lang="curl">cURL</button>
+                  <button class="code-tab-btn" data-lang="python">Python</button>
+                  <button class="code-tab-btn" data-lang="js">JavaScript</button>
+                </div>
+                <div class="code-block-container">
+                  <pre class="code-block" id="code-image-edit-block">加载中...</pre>
+                  <div class="btn-copy-code" title="复制代码" onclick="copyDocCode('code-image-edit-block')">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:16px;height:16px;">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H5.25m11.9-3.664A2.251 2.251 0 0 0 15 2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25h-.007a2.25 2.25 0 0 0-2.25 2.25M18.75 8.25v11.25m0-11.25a2.25 2.25 0 0 0-2.25-2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25m7.5 0v11.25m-18-11.25a2.25 2.25 0 0 1 2.25-2.25h1.5a2.25 2.25 0 0 1 2.25 2.25m-4.5 0v11.25m11.9-3.664C19.302 15.1 19.5 14.201 19.5 13.25V9.75" />
+                    </svg>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- DOCS PANEL 6: POST-REVERSE-VIDEO -->
+            <div class="doc-panel" id="doc-post-reverse-video" style="display:none;">
+              <div class="endpoint-header">
+                <h2 style="font-size: 20px; font-weight: 600; color: #fff;">视频关键帧时序语义解析 Reverse Video</h2>
+                <p style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">上传一段现有视频，系统自动使用高频 CV 算法提取运动与光影，结合多模态大模型反向推导重建时光机所需的 SCUP 提示词序列。</p>
+                <div class="endpoint-url-box">
+                  <span class="method-tag method-post" style="padding: 6px 10px; font-size: 11px;">POST</span>
+                  <span class="endpoint-url" id="doc-url-reverse-video">/api/reverse-video</span>
+                </div>
+              </div>
+              
+              <div class="code-tab-container">
+                <div class="code-tab-header">
+                  <button class="code-tab-btn active" data-lang="curl">cURL</button>
+                  <button class="code-tab-btn" data-lang="python">Python</button>
+                  <button class="code-tab-btn" data-lang="js">JavaScript</button>
+                </div>
+                <div class="code-block-container">
+                  <pre class="code-block" id="code-reverse-video-block">加载中...</pre>
+                  <div class="btn-copy-code" title="复制代码" onclick="copyDocCode('code-reverse-video-block')">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:16px;height:16px;">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H5.25m11.9-3.664A2.251 2.251 0 0 0 15 2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25h-.007a2.25 2.25 0 0 0-2.25 2.25M18.75 8.25v11.25m0-11.25a2.25 2.25 0 0 0-2.25-2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25m7.5 0v11.25m-18-11.25a2.25 2.25 0 0 1 2.25-2.25h1.5a2.25 2.25 0 0 1 2.25 2.25m-4.5 0v11.25m11.9-3.664C19.302 15.1 19.5 14.201 19.5 13.25V9.75" />
+                    </svg>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: SANDBOX / PLAYGROUND -->
+      <section class="tab-content" id="tab-playground">
+        <div class="playground-layout">
+          <!-- Request inputs -->
+          <div class="playground-inputs">
+            <div class="glass-card" style="padding: 20px;">
+              <h3 style="font-size: 15px; font-weight:600; color:#fff; margin-bottom:16px;">构造请求参数</h3>
+              
+              <div class="control-group">
+                <label for="play-endpoint">选择 API 接口 (Endpoint)</label>
+                <select id="play-endpoint" class="form-select">
+                  <option value="ideate">POST /api/ideate (空间改造策划)</option>
+                  <option value="image-gen">POST /api/image/generations (文本生成图像)</option>
+                  <option value="image-edit">POST /api/image/edits (多参考图重绘/编辑)</option>
+                  <option value="video-gen">POST /api/contents/generations/tasks (视频生成)</option>
+                  <option value="chat">POST /v1/chat/completions (OpenAI兼容多模态)</option>
+                </select>
+              </div>
+
+              <!-- JSON Body Editor -->
+              <div class="control-group">
+                <label for="play-body">请求 Payload (JSON 格式)</label>
+                <textarea id="play-body" class="form-input" style="font-family:var(--font-mono); font-size:12px; height:240px; resize:vertical; background:#000; line-height:1.5;">{}</textarea>
+              </div>
+
+              <!-- Premium Visual Image Reference Zone -->
+              <div class="control-group" id="play-files-group" style="display: none;">
+                <label class="form-label" style="font-weight: 500; color: #fff; margin-bottom: 8px; display: block;">图片参考 (Image References)</label>
+                <div class="image-uploader-zone" id="image-upload-zone">
+                  <div class="uploader-prompt">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="uploader-icon">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M6.827 6.175A2.31 2.31 0 0 1 5.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 0 0-1.134-.175 2.31 2.31 0 0 1-1.64-1.055l-.822-1.316a2.192 2.192 0 0 0-1.736-1.039 48.774 48.774 0 0 0-5.232 0 2.192 2.192 0 0 0-1.736 1.039l-.821 1.316Z" />
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 12.75a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0ZM18.75 10.5h.008v.008h-.008V10.5Z" />
+                    </svg>
+                    <span class="uploader-text">选择或拖拽图片到此处</span>
+                    <span class="uploader-sub">支持单张主图 + 多张材质/风格参考图</span>
+                  </div>
+                  <input type="file" id="sandbox-image-input" accept="image/*" multiple style="display: none;" />
+                </div>
+                <!-- Preview list container -->
+                <div class="image-preview-list" id="sandbox-preview-list" style="display: none;"></div>
+              </div>
+
+              <button class="btn btn-primary" id="btn-send-request" style="width: 100%; margin-top: 10px; height:44px; font-size:14px;">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" style="width:16px;height:16px;">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M6 12 3.269 3.125A59.769 59.769 0 0 1 21.485 12 59.768 59.768 0 0 1 3.27 20.875L5.999 12Zm0 0h7.5" />
+                </svg>
+                <span>发送 API 请求</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Console log output -->
+          <div class="playground-console">
+            <div class="console-header">
+              <span style="font-size:14px; font-weight:500; color:#fff;">API 响应控制台 (API Console Output)</span>
+              <button class="btn btn-sm" id="btn-clear-console">清空日志</button>
+            </div>
+            <div class="console-body" id="play-console-log">
+              <div class="console-log-line">
+                <span class="console-timestamp" style="color:var(--text-dark); font-size:11px; margin-right:6px;">[-:-:-]</span>
+                <span class="console-prefix prefix-system">⚙️ [SYSTEM]</span>
+                <span class="console-message" style="color:var(--text-main);">测试沙盒已就绪。在左侧选择接口、编辑参数并点击“发送请求”，响应的 JSON 和生成的图像将在此处即时解析渲染。</span>
+              </div>
+              <span class="console-cursor"></span>
+            </div>
+
+            <!-- Image/Video preview rendering -->
+            <div class="image-preview-panel" id="play-preview-panel" style="display: none;">
+              <span id="play-preview-title" style="font-size:13px; font-weight:500; color:var(--text-muted);">生成的图片预览</span>
+              <div class="preview-box">
+                <img id="play-preview-img" src="" alt="API Generated Image Preview" style="max-width: 100%; border-radius: 6px; display: none;" />
+                <video id="play-preview-video" controls autoplay loop style="max-width: 100%; border-radius: 6px; display: none;"></video>
+              </div>
+              <button class="btn btn-sm btn-primary" id="btn-download-img">下载该文件</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+  <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+  <!-- Lightbox Screen Overlay (for zoomed image/video) -->
+  <div class="lightbox-overlay" id="lightbox-modal" style="display: none;">
+      <span class="lightbox-close" id="close-lightbox-btn">✕</span>
+      <button class="lightbox-nav lightbox-prev" id="prev-lightbox-btn" title="上一张 (Left Arrow)">◀</button>
+      <div class="lightbox-content">
+          <img id="lightbox-img" src="" alt="Fullscreen view" style="display: none;">
+          <video id="lightbox-video" src="" controls autoplay loop style="display: none; max-width: 100%; max-height: 80vh; object-fit: contain; border-radius: 8px; box-shadow: 0 10px 50px rgba(0,0,0,0.8);"></video>
+          <div class="lightbox-caption" id="lightbox-caption">Caption text...</div>
+      </div>
+      <button class="lightbox-nav lightbox-next" id="next-lightbox-btn" title="下一张 (Right Arrow)">▶</button>
+  </div>
+
+  <script src="console.js"></script>
+</body>
+</html>

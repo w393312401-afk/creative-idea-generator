@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SPARK - 创意点子激发中心</title>
+    <!-- Google Fonts (loaded async so a slow/blocked CDN never delays first paint) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@600;700;800&display=swap" media="print" onload="this.media='all'">
+    <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@600;700;800&display=swap"></noscript>
+    <script>(function(){try{if(localStorage.getItem('spark_theme')==='dark'){document.documentElement.setAttribute('data-theme','dark');}}catch(e){}})();</script>
+    <link rel="stylesheet" href="tokens.css?v=1.0.7">
+    <link rel="stylesheet" href="style.css?v=1.0.7">
+</head>
+<body>
+    <!-- Background Canvas for Interactive Particles -->
+    <canvas id="particle-canvas"></canvas>
+
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="header-logo">
+                <div class="logo-icon">⚡</div>
+                <div class="logo-text">
+                    <h1>SPARK</h1>
+                    <span>创意点子激发中心</span>
+                </div>
+            </div>
+            <div class="app-switcher">
+                <a href="/" class="switcher-item active" data-app="workshop">
+                    <span class="switcher-icon">⚡</span>
+                    <span class="switcher-text">创意工坊</span>
+                </a>
+                <a href="/image-service-station/" class="switcher-item" data-app="image-station">
+                    <span class="switcher-icon">🎨</span>
+                    <span class="switcher-text">图像服务站</span>
+                </a>
+                <a href="/console.html" class="switcher-item" data-app="console">
+                    <span class="switcher-icon">💻</span>
+                    <span class="switcher-text">控制台</span>
+                </a>
+            </div>
+            <div class="header-controls">
+                <div id="api-status-badge" class="status-badge checking">
+                    <span class="status-dot"></span>
+                    <span class="status-text">检测 API 连接中...</span>
+                </div>
+                <button id="toggle-tasks-btn" class="icon-btn" title="任务列表">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="8" y1="6" x2="21" y2="6"></line>
+                        <line x1="8" y1="12" x2="21" y2="12"></line>
+                        <line x1="8" y1="18" x2="21" y2="18"></line>
+                        <line x1="3" y1="6" x2="3.01" y2="6"></line>
+                        <line x1="3" y1="12" x2="3.01" y2="12"></line>
+                        <line x1="3" y1="18" x2="3.01" y2="18"></line>
+                    </svg>
+                    <span>任务列表</span>
+                    <span class="task-badge" id="active-task-count" style="display: none;">0</span>
+                </button>
+                <button id="toggle-library-btn" class="icon-btn" title="我的点子库">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
+                    <span>点子库</span>
+                </button>
+                <button id="theme-toggle-btn" class="icon-btn" title="切换暗夜模式"><span id="theme-toggle-icon" style="font-size:18px;line-height:1;">🌙</span></button>
+                <button id="open-settings-btn" class="icon-btn" title="配置中心">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+                </button>
+            </div>
+        </header>
+
+        <!-- Mobile Navigation Tabs (visible only on screens <= 768px) -->
+        <div class="mobile-nav-tabs">
+            <button id="mobile-tab-left" class="mobile-nav-btn active" onclick="switchMobileTab('left')">
+                <span class="btn-icon">⚙️</span>
+                <span class="btn-text">激发维度</span>
+            </button>
+            <button id="mobile-tab-right" class="mobile-nav-btn" onclick="switchMobileTab('right')">
+                <span class="btn-icon">☄️</span>
+                <span class="btn-text">激发结果</span>
+            </button>
+        </div>
+
+        <!-- Main Workspace Grid -->
+        <main class="app-main">
+            <!-- Left Workspace: Brainstorming Panel -->
+            <section class="panel-left glass-panel mobile-active">
+                <div class="panel-header">
+                    <h2>概念设定与维度映射</h2>
+                    <p>配置您想激发的改造或建造项目的核心维度</p>
+                </div>
+
+                <div class="panel-header-tabs">
+                    <button class="panel-tab-btn active" id="input-tab-text" onclick="switchInputTab('text')">维度激发 (Forward)</button>
+                    <button class="panel-tab-btn" id="input-tab-video" onclick="switchInputTab('video')">视频反推 (Reverse)</button>
+                </div>
+
+                <div class="panel-body">
+                    <!-- Pane 1: Text prompt generation -->
+                    <div id="input-pane-text" class="input-pane active">
+                        <!-- Quick Presets -->
+                        <div class="control-group">
+                            <div class="preset-header-row">
+                                <label class="group-title">快速预设样式</label>
+                                <button type="button" id="save-preset-btn" class="preset-header-action" title="保存当前维度为自定义预设">💾 保存我的预设</button>
+                            </div>
+                            <div class="preset-flex" id="preset-list">
+                                <button type="button" class="preset-btn" data-preset="nature_wonder">🌲 自然奇观</button>
+                                <button type="button" class="preset-btn" data-preset="industrial_relic">🏚️ 工业遗迹</button>
+                                <button type="button" class="preset-btn" data-preset="retired_vehicle">🚢 退役载具</button>
+                                <button type="button" class="preset-btn" data-preset="contrast_novelty">🤯 反差猎奇</button>
+                                <button type="button" id="randomize-btn" class="preset-btn random-btn">🎲 随机激发</button>
+                            </div>
+                            <div class="custom-presets-list" id="custom-presets-list" style="display: none;">
+                                <!-- Custom presets will render here -->
+                            </div>
+                        </div>
+
+                        <!-- Topic Ideation Engine (P2) -->
+                        <div class="control-group">
+                            <div class="preset-header-row">
+                                <label class="group-title">💡 智能灵感推荐 (点击卡片一键载入并生成)</label>
+                                <button type="button" id="ideate-refresh-btn" class="preset-header-action">🎲 换一批灵感</button>
+                            </div>
+                            <div class="ideation-cards-container" id="ideation-cards-container">
+                                <div class="ideation-loading">正在载入灵感引擎...</div>
+                            </div>
+                        </div>
+
+                        <!-- Theme Selector -->
+                        <div class="control-group">
+                            <label class="group-title">1. 基础场景主题</label>
+                            <div class="theme-grid" id="theme-selector">
+                                <button class="theme-btn active" data-value="hollow_oak">
+                                    <span class="theme-icon">🌳</span>
+                                    <span class="theme-name">百年空心橡树</span>
+                                </button>
+                                <button class="theme-btn" data-value="glacier_cave">
+                                    <span class="theme-icon">🧊</span>
+                                    <span class="theme-name">蓝冰冰川洞</span>
+                                </button>
+                                <button class="theme-btn" data-value="submarine_cabin">
+                                    <span class="theme-icon">⚓</span>
+                                    <span class="theme-name">退役潜艇舱</span>
+                                </button>
+                                <button class="theme-btn" data-value="water_tower">
+                                    <span class="theme-icon">🏰</span>
+                                    <span class="theme-name">废弃水塔</span>
+                                </button>
+                                <button class="theme-btn" data-value="shipwreck_hull">
+                                    <span class="theme-icon">🚢</span>
+                                    <span class="theme-name">搁浅货轮船体</span>
+                                </button>
+                                <button class="theme-btn" data-value="missile_silo">
+                                    <span class="theme-icon">🚀</span>
+                                    <span class="theme-name">废弃导弹井</span>
+                                </button>
+                                <button class="theme-btn" data-value="giant_geode">
+                                    <span class="theme-icon">💎</span>
+                                    <span class="theme-name">巨型紫晶洞</span>
+                                </button>
+                                <button class="theme-btn" data-value="sea_cave">
+                                    <span class="theme-icon">🌊</span>
+                                    <span class="theme-name">海蚀洞穴</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Core Innovation Anchor Nodes -->
+                        <div class="control-group">
+                            <label class="group-title">2. 核心激发锚点 (多选)</label>
+                            <div class="anchor-flex" id="anchor-selector">
+                                <button class="anchor-node active" data-value="carrier_cutout_window">
+                                    <span class="node-dot"></span> 载体本体材质切面窗
+                                </button>
+                                <button class="anchor-node" data-value="water_glass_floor">
+                                    <span class="node-dot"></span> 水面玻璃地板
+                                </button>
+                                <button class="anchor-node" data-value="bark_camouflaged_hatch">
+                                    <span class="node-dot"></span> 树皮伪装天窗
+                                </button>
+                                <button class="anchor-node active" data-value="living_wood_stair">
+                                    <span class="node-dot"></span> 活体木纹/岩壁旋梯
+                                </button>
+                                <button class="anchor-node" data-value="bioluminescent_moss">
+                                    <span class="node-dot"></span> 生物荧光苔藓照明
+                                </button>
+                                <button class="anchor-node" data-value="single_slab_counter">
+                                    <span class="node-dot"></span> 整块载体板材台面
+                                </button>
+                                <button class="anchor-node" data-value="rerouted_waterfall_shower">
+                                    <span class="node-dot"></span> 改道瀑布淋浴
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Advanced Parameter Toggle -->
+                        <div class="advanced-toggle-row" id="toggle-workshop-advanced-row">
+                            <span>高级维度设置</span>
+                            <button type="button" id="toggle-workshop-advanced" class="toggle-btn-small">展开 ▾</button>
+                        </div>
+                        
+                        <div class="workshop-advanced-fields" id="workshop-advanced-fields" style="display: none; margin-top: 12px;">
+                            <!-- Dimensional Sliders -->
+                            <div class="control-group">
+                                <label class="group-title">3. 复杂度与美学配比</label>
+                                <div class="sliders-container">
+                                    <div class="slider-wrapper">
+                                        <div class="slider-labels">
+                                            <span>项目复杂度 (Complexity)</span>
+                                            <span id="val-complexity">中等</span>
+                                        </div>
+                                        <input type="range" id="slider-complexity" min="1" max="3" value="2" class="neon-slider">
+                                    </div>
+
+                                    <div class="slider-wrapper">
+                                        <div class="slider-labels">
+                                            <span>预算水平 (Budget)</span>
+                                            <span id="val-budget">轻奢级</span>
+                                        </div>
+                                        <input type="range" id="slider-budget" min="1" max="3" value="2" class="neon-slider">
+                                    </div>
+
+                                    <div class="slider-wrapper">
+                                        <div class="slider-labels">
+                                            <span>外壳粗野 ↔ 内里精致 反差强度</span>
+                                            <span id="val-ratio">50%</span>
+                                        </div>
+                                        <input type="range" id="slider-ratio" min="0" max="100" value="50" class="neon-slider">
+                                    </div>
+
+                                    <div class="slider-wrapper">
+                                        <div class="slider-labels">
+                                            <span>脑洞大开度 (Creativity Scale)</span>
+                                            <span id="val-creativity">高度激发</span>
+                                        </div>
+                                        <input type="range" id="slider-creativity" min="1" max="3" value="3" class="neon-slider">
+                                    </div>
+
+                                    <div class="slider-wrapper">
+                                        <div class="slider-labels">
+                                            <span>施工节拍数 (Beat Count)</span>
+                                            <span id="val-beats">15 拍</span>
+                                        </div>
+                                        <input type="range" id="slider-beats" min="15" max="25" value="15" class="neon-slider">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Pane 2: Video prompt reverse engineering -->
+                    <div id="input-pane-video" class="input-pane">
+                        <!-- File Upload Zone -->
+                        <div class="control-group">
+                            <label class="group-title">上传延时视频</label>
+                            <div id="upload-zone" class="upload-zone">
+                                <div class="upload-icon">📤</div>
+                                <p class="upload-text">点击选择或拖拽视频文件到此处</p>
+                                <p class="upload-hint">支持 .mp4, .mov, .avi, .webm 格式</p>
+                                <input type="file" id="video-file-input" accept="video/mp4,video/quicktime,video/x-msvideo,video/webm" style="display: none;">
+                                <div id="selected-file-info" class="selected-file-info" style="display: none;">
+                                    <span class="file-name">video.mp4</span>
+                                    <span class="remove-file-btn" onclick="clearSelectedFile(event)">&times;</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Video parameter: FPS -->
+                        <div class="control-group" style="margin-top: 15px;">
+                            <div class="slider-header" style="display: flex; justify-content: space-between; align-items: center;">
+                                <label class="group-title" for="fps-input">抽帧频率 (FPS)</label>
+                                <span id="fps-value" class="slider-value" style="font-weight: 700; color: var(--neon-cyan);">3.0</span>
+                            </div>
+                            <input type="range" id="fps-input" min="0.5" max="10.0" step="0.5" value="3.0" class="neon-slider">
+                        </div>
+
+                        <!-- Model Selection -->
+                        <div class="control-group" style="margin-top: 15px;">
+                            <label class="group-title" for="api-select">反推多模态 API</label>
+                            <select id="api-select" class="neon-select" style="width: 100%; padding: 10px; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; color: var(--text-primary); font-family: inherit;">
+                                <option value="local" selected>本地配置模型 (Local Settings Model)</option>
+                            </select>
+                        </div>
+
+                        <!-- Prompt Style Selection -->
+                        <div class="control-group" style="margin-top: 15px;">
+                            <label class="group-title" for="prompt-style-select">生成提示词风格</label>
+                            <select id="prompt-style-select" class="neon-select" style="width: 100%; padding: 10px; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; color: var(--text-primary); font-family: inherit;">
+                                <option value="clean" selected>🎨 精简电影感风格 (Clean Cinematic)</option>
+                                <option value="technical">🛠️ 严格学术 SCUP 风格 (Strict Technical)</option>
+                            </select>
+                        </div>
+
+                        <!-- Prompt Cache Hint -->
+                        <div class="config-summary-box" style="margin-top: 20px; border-color: rgba(0, 242, 254, 0.2); background: rgba(0, 242, 254, 0.02);">
+                            <span class="summary-label" style="color: var(--neon-cyan);">📸 多模态抽帧反推：</span>
+                            <span class="summary-text" style="color: var(--text-secondary); font-size: 12px; line-height: 1.5;">本工具将提取关键帧结合计算机视觉算法分析运动与亮度，然后通过多模态模型提取动作、坐标与因果标记，还原为 100% 符合 SCUP 规范的提示词。</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Sticky Footer at the bottom of panel-left -->
+                <div class="panel-footer">
+                    <!-- Text Mode Footer -->
+                    <div id="footer-pane-text" class="footer-pane active">
+                        <div id="config-summary" class="config-summary-box">
+                            <span class="summary-label">配置摘要：</span>
+                            <span id="config-summary-text" class="summary-text">正在计算...</span>
+                        </div>
+                        <button id="generate-btn" class="pulse-btn">
+                            <div class="btn-glow"></div>
+                            <span class="btn-text">⚡ 激发核心创意点子 ⚡</span>
+                            <span class="btn-shortcut-hint">Ctrl + Enter</span>
+                        </button>
+                    </div>
+                    <!-- Video Mode Footer -->
+                    <div id="footer-pane-video" class="footer-pane">
+                        <button id="reverse-btn" class="pulse-btn">
+                            <div class="btn-glow"></div>
+                            <span class="btn-text">⚡ 开始反推提示词 ⚡</span>
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right Workspace: Spark Outputs -->
+            <section class="panel-right glass-panel">
+                <!-- Active Generation Banner -->
+                <div id="active-generation-banner" class="active-generation-banner" style="display: none;">
+                    <div class="banner-content">
+                        <span class="banner-icon">⚡</span>
+                        <span class="banner-text">正在激发新创意中，您可以继续浏览...</span>
+                    </div>
+                    <button id="view-progress-btn" class="banner-btn">查看生成进度</button>
+                </div>
+
+                <!-- Welcome/Placeholder View -->
+                <div class="output-placeholder active" id="output-placeholder-view">
+                    <div class="placeholder-icon">☄️</div>
+                    <h3>等待引燃创意星火...</h3>
+                    <p>在左侧选择场景、锚点并调整参数，点击“激发”。后端会把你的维度送入 <b>restoration-prompt-composer</b> skill，按其连续性契约合成完整的「图片 1–N+1 + 视频 1–N」提示词集，并附质量审核报告。</p>
+                </div>
+
+                <!-- Loading State View -->
+                <div class="output-loading" id="output-loading-view">
+                    <div class="loader-container">
+                        <div class="glowing-spinner">
+                            <div class="inner-spin"></div>
+                        </div>
+                        <h3>正在按 skill 契约合成提示词...</h3>
+                        <div class="loading-timer">已用时: <span id="loading-timer-val">0.0</span> 秒</div>
+                        <div class="loading-stage-info" id="loading-stage-text">解析主题，拆解场景变量与施工节拍...</div>
+                        <ul class="loading-steps">
+                            <li id="step-1" class="pending">解析主题，拆解场景变量与施工节拍...</li>
+                            <li id="step-2" class="pending">装配 Drift Lock 与九宫格锚点...</li>
+                            <li id="step-3" class="pending">渲染 IMAGE 锚点与连续动作 VIDEO 链...</li>
+                            <li id="step-4" class="pending">运行质量门 + 工序与场景一致性二次校验与修复...</li>
+                        </ul>
+
+                        <!-- Live Output Terminal -->
+                        <div class="live-terminal-panel">
+                            <div class="terminal-header">
+                                <div class="terminal-dots">
+                                    <span class="dot red"></span>
+                                    <span class="dot yellow"></span>
+                                    <span class="dot green"></span>
+                                </div>
+                                <span class="terminal-title">LIVE STREAMING CONSOLE</span>
+                                <span class="terminal-status">ONLINE</span>
+                            </div>
+                            <div class="terminal-body" id="live-terminal-body">
+                                <span class="terminal-cursor"></span>
+                            </div>
+                        </div>
+
+                        <button id="cancel-generate-btn" class="action-btn text-btn secondary" style="margin-top: 24px; padding: 10px 24px; font-size: 13px;">
+                            <span>取消生成</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Error State View -->
+                <div class="output-error" id="output-error-view" style="display: none;">
+                    <div class="error-container">
+                        <div class="error-icon">⚠️</div>
+                        <h3>激发过程中发生阻碍</h3>
+                        <p id="error-message-text">错误详情将在此处显示。</p>
+                        <button id="retry-btn" class="action-btn text-btn primary">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg>
+                            <span>使用相同配置重试</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Idea Content View -->
+                <div class="output-content" id="output-content-view">
+                    <div class="content-header">
+                        <div class="idea-title-row">
+                            <h2 id="idea-title">神秘浮空木屋：清水混凝土卧室</h2>
+                            <div class="card-badges">
+                                <span class="tag-badge" id="tag-theme">木屋改建</span>
+                                <span class="tag-badge" id="tag-creativity">脑洞大开</span>
+                            </div>
+                        </div>
+                        <div class="action-row header-sticky-actions">
+                            <button id="copy-prompt-btn-all" class="action-btn text-btn primary">
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                                <span>复制全部提示词</span>
+                            </button>
+                            <button id="make-cover-btn" class="action-btn text-btn">
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
+                                <span>生成封面图</span>
+                            </button>
+                            <button id="generate-frames-btn" class="action-btn text-btn">
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+                                <span>生成帧序列</span>
+                            </button>
+                            <button id="generate-videos-btn" class="action-btn text-btn">
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"></rect><line x1="7" y1="2" x2="7" y2="22"></line><line x1="17" y1="2" x2="17" y2="22"></line><line x1="2" y1="12" x2="22" y2="12"></line><line x1="2" y1="7" x2="7" y2="7"></line><line x1="2" y1="17" x2="7" y2="17"></line><line x1="17" y1="17" x2="22" y2="17"></line><line x1="17" y1="7" x2="22" y2="7"></line></svg>
+                                <span>生成视频序列</span>
+                            </button>
+                            <button id="merge-videos-btn" class="action-btn text-btn">
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15V9a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v6M6 12h12M15 8l-3 4 3 4M9 16l3-4-3-4"></path></svg>
+                                <span>合并并加速视频</span>
+                            </button>
+                            <button id="save-idea-btn" class="action-btn text-btn">
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
+                                <span id="save-idea-btn-text">收藏点子</span>
+                            </button>
+                            <button id="export-idea-btn" class="action-btn text-btn">
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                                <span>导出 Markdown</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Navigation Tabs -->
+                    <div class="result-tabs-bar">
+                        <button class="tab-btn active" data-tab="overview" id="tab-btn-overview">
+                            <span>📊 结果概览</span>
+                            <span class="tab-status-dot" id="overview-status-dot" style="display: none;"></span>
+                        </button>
+                        <button class="tab-btn" data-tab="prompts" id="tab-btn-prompts">📋 提示词槽位</button>
+                        <button class="tab-btn" data-tab="audit" id="tab-btn-audit">✅ 校验与质量审核</button>
+                    </div>
+
+                    <div class="content-scroll-area">
+                        <!-- Tab 1: Overview -->
+                        <div class="tab-panel active" id="tab-panel-overview">
+                            <!-- Cover Section -->
+                            <div class="idea-section" id="cover-section">
+                                <div class="section-title">
+                                    <span class="section-icon">🖼️</span>
+                                    <h3>TikTok 9:16 视频封面</h3>
+                                </div>
+                                <div class="cover-wrapper card-dark">
+                                    <div class="cover-content">
+                                        <div class="cover-preview-box">
+                                            <div class="cover-phone-frame">
+                                                <div class="cover-img-loading" id="cover-img-loading" style="display:none;">
+                                                    <div class="cover-spinner"></div>
+                                                    <p>正在后台生成封面图...</p>
+                                                </div>
+                                                <div id="cover-image-placeholder" class="cover-placeholder">
+                                                    <span class="placeholder-icon">📸</span>
+                                                    <p>点击按钮或等待自动生成封面</p>
+                                                </div>
+                                                <img id="cover-img-display" src="" alt="TikTok Cover" style="display:none;">
+                                            </div>
+                                        </div>
+                                        <div class="cover-info-controls">
+                                            <p class="cover-desc-text">使用 <b id="cover-desc-model">gemini-3.1-flash-image</b> 图像生成模型制作 <b id="cover-desc-ratio">9:16</b> 规格 (<b id="cover-desc-quality">2K</b>) 封面图。采用<b>左右柔和过渡前后对比</b>形式，画面偏写实，文字风格固定且惊艳。</p>
+                                            <div id="cover-hook-display" class="cover-hook-box" style="display: none;">
+                                                <span class="hook-label">TikTok US 英文文案</span>
+                                                <div class="hook-value-wrapper">
+                                                    <span id="cover-hook-val" class="hook-value"></span>
+                                                    <button id="copy-hook-btn" class="mini-icon-btn" title="复制文案">
+                                                        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                                                    </button>
+                                                </div>
+                                            </div>
+                                            <div class="cover-history-container" id="cover-history-container" style="display:none;">
+                                                <h4>历史封面记录</h4>
+                                                <div class="cover-history-thumbnails" id="cover-history-thumbnails">
+                                                    <!-- 缩略图将动态渲染在此处 -->
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Sequential frame generator -->
+                            <div class="idea-section" id="frames-section">
+                                <div class="section-title">
+                                    <span class="section-icon">🎞️</span>
+                                    <h3>连续帧序列生成</h3>
+                                </div>
+                                <div class="frames-wrapper card-dark">
+                                    <div class="frames-controls">
+                                        <div>
+                                            <p class="frames-desc">将生成的所有图片提示词连成单链帧序列：第一帧进行文本生成图像，后续每一帧均以前一帧为唯一参考进行图生图（img2img）修改。</p>
+                                            <p class="frames-meta" id="frames-meta">尚未生成任何帧序列。</p>
+                                        </div>
+                                    </div>
+                                    <div class="frames-progress" id="frames-progress" style="display:none; align-items: center; gap: 12px; justify-content: center; flex-wrap: wrap;">
+                                        <div class="cover-spinner"></div>
+                                        <span>正在生成连续帧序列，此过程可能会耗费几分钟，请耐心等待...</span>
+                                        <button id="cancel-frames-btn" class="action-btn text-btn secondary mini-btn" style="margin-left: 12px; margin-top: 0; padding: 4px 10px; font-size: 11px;">取消</button>
+                                    </div>
+                                    <div class="frames-grid" id="frames-grid"></div>
+                                </div>
+                            </div>
+
+                            <!-- Videos Section -->
+                            <div class="idea-section" id="videos-section" style="margin-top: 20px;">
+                                <div class="section-title">
+                                    <span class="section-icon">🎬</span>
+                                    <h3>本地 UI 自动化视频生成</h3>
+                                </div>
+                                <div class="frames-wrapper card-dark">
+                                    <div class="frames-controls">
+                                        <div>
+                                            <p class="frames-desc">利用本地 UI 自动化 (Playwright + Adspower)，将图片帧序列与对应的视频提示词结合，插值生成连续的视频剪辑。</p>
+                                            <p class="frames-meta" id="videos-meta">尚未生成任何视频序列。</p>
+                                        </div>
+                                    </div>
+                                    <div class="frames-progress" id="videos-progress" style="display:none; align-items: center; gap: 12px; justify-content: center; flex-wrap: wrap;">
+                                        <div class="cover-spinner"></div>
+                                        <span>正在通过本地 UI 自动化生成视频，此过程可能较慢，请耐心等待...</span>
+                                        <button id="cancel-videos-btn" class="action-btn text-btn secondary mini-btn" style="margin-left: 12px; margin-top: 0; padding: 4px 10px; font-size: 11px;">取消</button>
+                                    </div>
+                                    
+                                    <!-- Merged finished video player -->
+                                    <div id="merged-video-container" style="display: none; margin-bottom: 20px; padding: 15px; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px;">
+                                        <h4 style="margin-top: 0; margin-bottom: 12px; color: var(--text-primary); font-size: 14px; display: flex; align-items: center; gap: 8px;">
+                                            <span>🎬 2倍速合并成品视频 (Merged Finished Video)</span>
+                                        </h4>
+                                        <div style="display: flex; gap: 15px; align-items: flex-start; flex-wrap: wrap;">
+                                            <video id="merged-video-player" controls style="width: 180px; aspect-ratio: 9/16; object-fit: cover; border-radius: 6px; background: #03050c; border: 1px solid var(--border-color);"></video>
+                                            <div style="flex: 1; min-width: 200px; display: flex; flex-direction: column; gap: 8px;">
+                                                <p style="margin: 0; font-size: 12px; color: var(--text-secondary); line-height: 1.5;">所有生成的视频片段已按顺序合并，并已调整为2倍速度进行快进展示（呈现出顺畅的时空转换建造过程）。</p>
+                                                <p id="merged-video-info" style="margin: 0; font-size: 12px; color: var(--neon-cyan); font-family: monospace;"></p>
+                                                <div style="margin-top: 8px;">
+                                                    <a id="merged-video-download" href="#" download class="action-btn text-btn mini-btn" style="display: inline-flex; align-items: center; gap: 6px; text-decoration: none; padding: 6px 12px; font-size: 12px; color: var(--text-primary); background: rgba(var(--ink-rgb), 0.08); border: 1px solid var(--border-color); border-radius: 4px;">
+                                                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: middle;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                                                        <span>下载成品视频</span>
+                                                    </a>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div class="frames-grid" id="videos-grid"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Tab 2: Prompts -->
+                        <div class="tab-panel" id="tab-panel-prompts">
+                            <!-- Slot Filters & Bulk Actions -->
+                            <div class="prompt-controls-panel">
+                                <div class="filter-group">
+                                    <span class="control-label">查看槽位：</span>
+                                    <div class="filter-btn-group">
+                                        <button type="button" class="slot-filter-btn active" data-filter="all">全部</button>
+                                        <button type="button" class="slot-filter-btn" data-filter="image">🖼️ 仅图片</button>
+                                        <button type="button" class="slot-filter-btn" data-filter="video">🎬 仅视频</button>
+                                    </div>
+                                </div>
+                                <div class="bulk-group">
+                                    <button type="button" id="expand-all-btn" class="action-btn text-btn mini-btn">展开全部</button>
+                                    <button type="button" id="collapse-all-btn" class="action-btn text-btn mini-btn">收起全部</button>
+                                    <button type="button" id="copy-images-btn" class="action-btn text-btn mini-btn" title="一键复制所有图片提示词">复制所有图</button>
+                                    <button type="button" id="copy-videos-btn" class="action-btn text-btn mini-btn" title="一键复制所有视频提示词">复制所有视</button>
+                                </div>
+                            </div>
+
+                            <!-- Quick Jump Pills -->
+                            <div class="jump-pills-wrapper">
+                                <span class="jump-title">快速跳转：</span>
+                                <div class="jump-pills" id="jump-pills"></div>
+                            </div>
+
+                            <!-- Video Reverse Collage Preview -->
+                            <div id="collage-preview-wrapper" class="collage-preview-wrapper" style="display: none; margin-bottom: 20px; padding: 15px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                                    <span class="group-title" style="margin: 0; display: flex; align-items: center; gap: 8px; font-weight: 700; color: var(--neon-cyan);">
+                                        🖼️ 视频关键帧多宫格拼图 (Keyframe Collage)
+                                    </span>
+                                    <a id="collage-download-link" href="#" target="_blank" class="action-btn text-btn mini-btn" download style="text-decoration: none;">下载拼图</a>
+                                </div>
+                                <img id="collage-preview-img" src="" alt="关键帧多宫格拼图" style="width: 100%; border-radius: 6px; border: 1px solid rgba(255,255,255,0.15); object-fit: contain; max-height: 300px; cursor: pointer;">
+                            </div>
+
+                            <!-- Parsed slots container -->
+                            <div id="parsed-prompts-container" class="parsed-prompts-container"></div>
+
+                            <!-- Raw copy-ready prompt set (collapsed by default) -->
+                            <details class="raw-prompt-details">
+                                <summary>📜 查看原始 Markdown 提示词块</summary>
+                                <div class="prompt-box card-dark" style="margin-top: 12px;">
+                                    <div class="prompt-header">
+                                        <span>📋 复制即用提示词集 · 图片 1–N+1 / 视频 1–N</span>
+                                        <button class="action-btn icon-btn mini-btn" id="copy-prompt-btn" title="复制全部提示词">
+                                            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                                        </button>
+                                    </div>
+                                    <pre class="prompt-pre" id="idea-prompt-block">在左侧选择维度并点击「激发」，这里会输出经 restoration-prompt-composer skill 合成的完整图片 / 视频提示词集。</pre>
+                                </div>
+                            </details>
+                        </div>
+
+                        <!-- Tab 3: Audit -->
+                        <div class="tab-panel" id="tab-panel-audit">
+                            <!-- Second-pass construction-order / causality / spatial-consistency verdict -->
+                            <div class="repair-banner" id="idea-repair" style="display:none;"></div>
+
+                            <!-- Quality audit report (skill output) wrapped in details -->
+                            <details id="audit-details" class="audit-details" open>
+                                <summary class="audit-details-summary">
+                                    <div class="summary-summary-title">
+                                        <span class="section-icon">✅</span>
+                                        <h3>提示词质量审核报告 (Quality Audit)</h3>
+                                    </div>
+                                    <span class="fold-indicator">展开/折叠</span>
+                                </summary>
+                                <div class="audit-panel card-dark" id="idea-audit" style="margin-top: 12px;"></div>
+                            </details>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Saved Library Drawer -->
+    <div class="drawer" id="library-drawer">
+        <div class="drawer-header">
+            <h3>我的点子库</h3>
+            <button id="close-library-btn" class="close-btn">&times;</button>
+        </div>
+        <div class="drawer-search-filter">
+            <div class="search-input-wrapper">
+                <input type="text" id="library-search" placeholder="搜索标题、主题或提示词...">
+            </div>
+            <div class="filter-dropdowns">
+                <select id="library-filter-theme">
+                    <option value="">所有场景主题</option>
+                    <option value="百年空心橡树">百年空心橡树</option>
+                    <option value="蓝冰冰川洞">蓝冰冰川洞</option>
+                    <option value="退役潜艇舱">退役潜艇舱</option>
+                    <option value="废弃水塔">废弃水塔</option>
+                    <option value="搁浅货轮船体">搁浅货轮船体</option>
+                    <option value="废弃导弹井">废弃导弹井</option>
+                    <option value="巨型紫晶洞">巨型紫晶洞</option>
+                    <option value="海蚀洞穴">海蚀洞穴</option>
+                </select>
+                <select id="library-filter-time">
+                    <option value="newest">按保存时间：最新</option>
+                    <option value="oldest">按保存时间：最早</option>
+                </select>
+            </div>
+        </div>
+        <div class="drawer-actions">
+            <button id="import-btn" class="action-btn text-btn secondary">导入 JSON</button>
+            <button id="export-all-btn" class="action-btn text-btn secondary">全部导出</button>
+            <input type="file" id="import-file" style="display: none;" accept=".json">
+        </div>
+        <div class="drawer-body" id="library-list">
+            <!-- Saved items will populate here -->
+            <div class="library-empty">
+                暂无保存的点子，快去生成并点击“收藏点子”吧！
+            </div>
+        </div>
+    </div>
+
+    <!-- Tasks Drawer -->
+    <div class="drawer" id="tasks-drawer">
+        <div class="drawer-header">
+            <h3>激发任务列表</h3>
+            <button id="close-tasks-btn" class="close-btn">&times;</button>
+        </div>
+        
+        <div class="drawer-actions" style="display: flex; gap: 8px; padding: 10px 20px; border-bottom: 1px solid var(--border-color); background: rgba(var(--panel-rgb), 0.1);">
+            <button id="clear-completed-btn" class="action-btn text-btn secondary" style="flex: 1; font-size: 11px; padding: 6px; margin: 0; justify-content: center; height: auto;">🧹 清空已完成</button>
+            <button id="clear-failed-btn" class="action-btn text-btn secondary" style="flex: 1; font-size: 11px; padding: 6px; margin: 0; justify-content: center; height: auto;">🗑️ 清空失败/已取消</button>
+        </div>
+
+        <div class="drawer-search-filter">
+            <div class="search-input-wrapper">
+                <input type="text" id="tasks-search" placeholder="搜索主题或任务标题...">
+            </div>
+            <div class="filter-dropdowns">
+                <select id="tasks-filter-status">
+                    <option value="">所有状态</option>
+                    <option value="running">运行中</option>
+                    <option value="completed">已完成</option>
+                    <option value="failed">已失败</option>
+                    <option value="cancelled">已取消</option>
+                </select>
+                <select id="tasks-filter-type">
+                    <option value="">所有类型</option>
+                    <option value="idea">创意激发</option>
+                    <option value="frames">分镜生成</option>
+                    <option value="videos">视频生成</option>
+                    <option value="cover">封面生成</option>
+                    <option value="reverse-video">视频反推</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="drawer-body" id="tasks-list">
+            <!-- Tasks will populate here -->
+            <div class="tasks-empty">
+                暂无生成任务
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div class="modal" id="settings-modal">
+        <div class="modal-content glass-panel">
+            <div class="modal-header">
+                <h3>⚙️ API 配置中心</h3>
+                <button id="close-settings-btn" class="close-btn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="settings-base-url">API Base URL</label>
+                    <input type="text" id="settings-base-url" placeholder="http://127.0.0.1:8046/v1">
+                </div>
+                <div class="form-group">
+                    <label for="settings-api-key">API Key (密钥)</label>
+                    <div class="password-input-wrapper">
+                        <input type="password" id="settings-api-key" placeholder="sk-6cfc7127d57249e0986aaa3e...">
+                        <button id="toggle-key-visibility" class="view-btn">👁️</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="settings-model">Model Name (模型名称)</label>
+                    <select id="settings-model">
+                        <option value="gemini-3-flash-agent">gemini-3-flash-agent (推荐 / 本地代理)</option>
+                        <option value="gpt-5.5">gpt-5.5 (GPT 代理)</option>
+                    </select>
+                </div>
+                <div class="form-group" id="gpt-port-group" style="display: none;">
+                    <label for="settings-gpt-port">GPT 代理端口 (GPT Port)</label>
+                    <select id="settings-gpt-port">
+                        <option value="65038">65038 (旧版代理)</option>
+                        <option value="8046">8046 (默认代理)</option>
+                        <option value="8045">8045 (备用代理)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="settings-image-model">Image Model Name (生图模型名称)</label>
+                    <select id="settings-image-model">
+                        <option value="nano-banana-2" selected>🍌 Nano Banana 2</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="settings-image-ratio">Image Aspect Ratio (生图宽高比)</label>
+                    <select id="settings-image-ratio">
+                        <option value="9:16">9:16 (纵向视频封面 / TikTok / 抖音)</option>
+                        <option value="16:9">16:9 (横向视频封面 / B站 / YouTube)</option>
+                        <option value="1:1">1:1 (方形比例)</option>
+                        <option value="3:2">3:2 (摄影经典比例)</option>
+                        <option value="2:3">2:3 (纵向比例)</option>
+                        <option value="21:9">21:9 (电影宽屏幕比例)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="settings-image-quality">Image Clarity / Resolution (生图清晰度)</label>
+                    <select id="settings-image-quality">
+                        <option value="1K">1K (标准画质)</option>
+                        <option value="2K">2K (中等清晰 / 推荐)</option>
+                        <option value="4K">4K (高清画质)</option>
+                    </select>
+                </div>
+                <div class="modal-info">
+                    <p>💡 <b>提示:</b> 默认已填装检测到的本地 API 代理服务配置（端口 8046）。若您的中转接口发生端口变动，可在此进行修改并保存。</p>
+                </div>
+                <div class="form-group cache-group" style="margin-top: 15px; padding-top: 15px; border-top: 1px solid var(--border-color, rgba(255,255,255,0.1));">
+                    <label>系统缓存管理</label>
+                    <div style="display: flex; gap: 12px; align-items: center; margin-top: 6px;">
+                        <button id="clear-cache-btn" class="text-btn danger" style="flex: 1; margin: 0; justify-content: center; height: 38px;">🧹 清理系统缓存</button>
+                        <span id="cache-size-info" style="font-size: 12.5px; color: var(--text-secondary); white-space: nowrap; font-family: monospace;">计算中...</span>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="test-settings-btn" class="action-btn text-btn secondary" style="margin-right: auto;">测试连接</button>
+                <button id="reset-settings-btn" class="action-btn text-btn secondary">恢复默认</button>
+                <button id="save-settings-btn" class="action-btn text-btn primary">保存配置</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notification Container -->
+    <!-- Toast Notification Container -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- Floating Log Panel -->
+    <div class="log-panel-drawer" id="log-panel-drawer">
+        <div class="log-panel-header" id="log-panel-header">
+            <div class="log-panel-title">
+                <span class="log-panel-status-dot"></span>
+                <span>🖥️ 本地服务工作日志</span>
+            </div>
+            <div class="log-panel-actions">
+                <label class="log-panel-checkbox-label">
+                    <input type="checkbox" id="log-autoscroll-chk" checked> 自动滚动
+                </label>
+                <button id="clear-log-btn" class="log-action-btn" title="清空日志面板">清空</button>
+                <button id="toggle-log-btn" class="log-action-btn" title="展开/收起日志">展开</button>
+            </div>
+        </div>
+        <div class="log-panel-body" id="log-panel-body">
+            <pre id="log-output-pre">正在连接本地服务日志流...</pre>
+        </div>
+    </div>
+
+    <script src="app.js?v=1.0.8"></script>
+    <!-- Mobile responsive UI helper script -->
+    <script>
+        // Tab switching function for mobile screens
+        function switchMobileTab(tabName) {
+            const leftTab = document.getElementById('mobile-tab-left');
+            const rightTab = document.getElementById('mobile-tab-right');
+            const leftPanel = document.querySelector('.panel-left');
+            const rightPanel = document.querySelector('.panel-right');
+
+            if (!leftTab || !rightTab || !leftPanel || !rightPanel) return;
+
+            if (tabName === 'left') {
+                leftTab.classList.add('active');
+                rightTab.classList.remove('active');
+                leftPanel.classList.add('mobile-active');
+                rightPanel.classList.remove('mobile-active');
+            } else if (tabName === 'right') {
+                rightTab.classList.add('active');
+                leftTab.classList.remove('active');
+                rightPanel.classList.add('mobile-active');
+                leftPanel.classList.remove('mobile-active');
+            }
+        }
+
+        // MutationObserver to automatically switch to the output tab when generation starts or finishes
+        document.addEventListener('DOMContentLoaded', () => {
+            const loadingView = document.getElementById('output-loading-view');
+            const contentView = document.getElementById('output-content-view');
+            const errorView = document.getElementById('output-error-view');
+
+            const handleMobileSwitch = () => {
+                if (window.innerWidth <= 768) {
+                    switchMobileTab('right');
+                }
+            };
+
+            const observer = new MutationObserver((mutations) => {
+                mutations.forEach((mutation) => {
+                    if (mutation.attributeName === 'class') {
+                        const target = mutation.target;
+                        if (target.classList.contains('active')) {
+                            handleMobileSwitch();
+                        }
+                    }
+                });
+            });
+
+            if (loadingView) observer.observe(loadingView, { attributes: true });
+            if (contentView) observer.observe(contentView, { attributes: true });
+            if (errorView) observer.observe(errorView, { attributes: true });
+
+            // Attach click listeners to other trigger buttons to ensure switching
+            document.getElementById('retry-btn')?.addEventListener('click', handleMobileSwitch);
+            document.getElementById('view-progress-btn')?.addEventListener('click', handleMobileSwitch);
+        });
+    </script>
+
+    <!-- Lightbox Screen Overlay (for zoomed image/video) -->
+    <div class="lightbox-overlay" id="lightbox-modal" style="display: none;">
+        <span class="lightbox-close" id="close-lightbox-btn">✕</span>
+        <button class="lightbox-nav lightbox-prev" id="prev-lightbox-btn" title="上一张 (Left Arrow)">◀</button>
+        <div class="lightbox-content">
+            <img id="lightbox-img" src="" alt="Fullscreen view" style="display: none;">
+            <video id="lightbox-video" src="" controls autoplay loop style="display: none; max-width: 100%; max-height: 80vh; object-fit: contain; border-radius: 8px; box-shadow: 0 10px 50px rgba(0,0,0,0.8);"></video>
+            <div class="lightbox-caption" id="lightbox-caption">Caption text...</div>
+        </div>
+        <button class="lightbox-nav lightbox-next" id="next-lightbox-btn" title="下一张 (Right Arrow)">▶</button>
+    </div>
+</body>
+</html>
