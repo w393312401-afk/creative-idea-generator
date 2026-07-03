@@ -27,6 +27,7 @@ def _get_google_fx_video_service():
 
 
 def generate_video_sequence(config, title, prompt_block, on_progress=None, target_slots=None):
+    from prompt_pipeline import _parse_prompt_slots
     images, videos = _parse_prompt_slots(prompt_block)
     project_dir = _get_project_dir(title)
     frames_dir = os.path.join(project_dir, 'frames')

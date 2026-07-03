@@ -20,8 +20,8 @@ from video_generator import *
 from prompt_pipeline import *
 
 # Explicitly import private functions that are not imported by wildcard '*'
-from server_common import _get_project_dir, _safe_project_name
-from prompt_pipeline import _parse_prompt_slots
+from server_common import _get_project_dir, _safe_project_name, _LOG_PATH
+from prompt_pipeline import _parse_prompt_slots, _chat
 from frame_generator import (
     _image_generation_model_for_request,
     _image_quality_to_label,
@@ -29,6 +29,11 @@ from frame_generator import (
     _run_async_image_generation,
     _run_async_image_edit
 )
+
+# Per-IP sliding-window rate-limit state used by rate_ok() (managed mode only)
+import collections
+_RATE_BUCKET = collections.defaultdict(list)
+_RATE_LOCK = threading.Lock()
 
 
 
@@ -1051,7 +1056,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     tmp_file.write(file_data)
                     temp_video_path = tmp_file.name
 
+                # Working directory for extracted frames; video_reverse_worker owns cleanup()
+                temp_dir_obj = tempfile.TemporaryDirectory()
+
                 # Setup dimensions
+                gemini_key = client_config.get('geminiDirectApiKey') or client_config.get('apiKey') or os.environ.get('GEMINI_API_KEY')
+                openai_key = os.environ.get('OPENAI_API_KEY')
                 video_name = os.path.splitext(filename)[0]
                 model_label = "Gemini-1.5-Flash"
                 if api == "openai" or (api == "auto" and not gemini_key and openai_key):

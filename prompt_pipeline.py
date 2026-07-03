@@ -10,6 +10,7 @@ import urllib.parse
 import base64
 import threading
 from PIL import Image
+from datetime import datetime
 
 from server_common import (
     SERVER_CONFIG, resolve_gateway, effective_config,
@@ -21,6 +22,26 @@ from frame_generator import (
     call_image_llm, _crop_to_aspect_ratio, _detect_image_mime_from_path,
     _generate_image_edit
 )
+
+# Clip timing constants: single source of truth for the video-model clip length and the
+# worker exit deadline referenced throughout the fix_*/check_* pipeline and skill contract.
+VIDEO_DURATION = 8.0
+WORKER_EXIT_TIME = 7.5
+
+CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'packet_cache.json')
+PROCESS_BRIEF_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'process_brief_cache.json')
+
+
+def _slice_between(text, start_marker, end_marker):
+    """Return the substring from start_marker up to (not including) end_marker.
+    Falls back to the tail from start_marker if end_marker is absent."""
+    start = text.find(start_marker)
+    if start == -1:
+        return ''
+    end = text.find(end_marker, start + len(start_marker))
+    if end == -1:
+        return text[start:]
+    return text[start:end]
 
 
 def load_skill_contract():
@@ -442,6 +463,86 @@ def parse_space_workflows():
     return workflows
 
 
+def _flatten_to_text(value):
+    """Coerce an LLM-produced JSON value into a plain prose string.
+    The packet/ladder generators occasionally return a nested object or list where the
+    contract asks for one sentence (e.g. worker_choreography split into
+    trajectory/silhouette/manual_tool_lock keys). The content is usually fine — only the
+    shape is wrong — so flatten it instead of discarding it."""
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        return ' '.join(t for t in (_flatten_to_text(v) for v in value) if t)
+    if isinstance(value, dict):
+        parts = []
+        for k, v in value.items():
+            text = _flatten_to_text(v)
+            if text:
+                parts.append(f"{k}: {text}" if isinstance(k, str) and k else text)
+        return '; '.join(parts)
+    return str(value)
+
+
+def normalize_packet(packet):
+    """Coerce every Drift Lock Packet field to its canonical type. Downstream fix_*/check_*
+    code calls .lower()/.replace() on the prose fields and must never see a dict/list —
+    a dict-shaped worker_choreography aborted whole compose runs at Beat 2 (the first beat
+    where check_stylistic_repetition runs). Applied to fresh LLM output before caching AND
+    to cache hits, so previously-poisoned cache entries heal on load."""
+    if not isinstance(packet, dict):
+        return packet
+    for key in ('camera_dna', 'geometry_lock', 'worker_choreography', 'passive_environment'):
+        if key in packet and not isinstance(packet[key], str):
+            packet[key] = _flatten_to_text(packet[key])
+    for lm in packet.get('primary_landmarks') or []:
+        if isinstance(lm, dict):
+            for k, v in list(lm.items()):
+                if not isinstance(v, str):
+                    lm[k] = _flatten_to_text(v)
+    for coll in (packet.get('frame_boundaries'), packet.get('lighting_phase_ladder')):
+        if isinstance(coll, dict):
+            for k, v in list(coll.items()):
+                if not isinstance(v, str):
+                    coll[k] = _flatten_to_text(v)
+    for item in packet.get('object_ledger') or []:
+        if isinstance(item, dict):
+            for k, v in list(item.items()):
+                if not isinstance(v, str):
+                    item[k] = _flatten_to_text(v)
+    return packet
+
+
+def normalize_beat_ladder(beat_ladder):
+    """Shape-coercion for beat ladder entries: index must be an int, operation/description
+    prose strings, bridge_stage an int or None. Guards the same dict-where-string-expected
+    LLM quirk as normalize_packet."""
+    if not isinstance(beat_ladder, list):
+        return beat_ladder
+    for beat in beat_ladder:
+        if not isinstance(beat, dict):
+            continue
+        idx = beat.get('index')
+        if idx is not None and not isinstance(idx, int):
+            try:
+                beat['index'] = int(str(idx).strip())
+            except (ValueError, TypeError):
+                pass
+        for key in ('operation', 'description'):
+            if key in beat and not isinstance(beat[key], str):
+                beat[key] = _flatten_to_text(beat[key])
+        bs = beat.get('bridge_stage')
+        if bs is not None and not isinstance(bs, int):
+            try:
+                beat['bridge_stage'] = int(str(bs).strip())
+            except (ValueError, TypeError):
+                beat['bridge_stage'] = None
+    return beat_ladder
+
+
 def load_packet_cache():
     with PACKET_CACHE_LOCK:
         if os.path.exists(CACHE_PATH):
@@ -811,6 +912,75 @@ def fix_rhma_blur(prompt, is_last):
     return prompt
 
 
+def fix_horizon_line(prompt):
+    if not prompt:
+        return prompt
+    low = prompt.lower()
+    if "horizon line" not in low:
+        if "horizon" in low:
+            prompt = re.sub(r'\bhorizon\b', 'horizon line', prompt, flags=re.IGNORECASE)
+        else:
+            if not prompt.endswith('.'):
+                prompt += '.'
+            prompt += " The horizon line remains perfectly level at exactly 50-percent height of the frame."
+    return prompt
+
+
+def fix_primary_landmarks(prompt, packet):
+    if not prompt or not packet or 'primary_landmarks' not in packet:
+        return prompt
+    
+    landmarks = packet['primary_landmarks']
+    
+    # First, make sure the landmark names are exactly present by replacing partial matches
+    for lm in landmarks:
+        name = lm.get('name', '').strip()
+        if not name:
+            continue
+        low = prompt.lower()
+        if name.lower() not in low:
+            # Try to match sub-phrases of length >= 2, or the last word (e.g. "basin")
+            words = name.lower().split()
+            replaced = False
+            for length in range(len(words), 0, -1):
+                for start in range(len(words) - length + 1):
+                    subphrase = " ".join(words[start:start+length])
+                    if length == 1 and subphrase in ('floor', 'wall', 'stone', 'ceiling', 'door', 'entrance'):
+                        continue
+                    if subphrase in low:
+                        pattern = re.compile(rf'\b{re.escape(subphrase)}\b', re.IGNORECASE)
+                        prompt, count = pattern.subn(name, prompt, count=1)
+                        if count > 0:
+                            replaced = True
+                            break
+                if replaced:
+                    break
+                    
+    # Next, check if any landmark names or grid coordinates are still missing from the prompt
+    low = prompt.lower()
+    missing_clauses = []
+    for lm in landmarks:
+        name = lm.get('name', '').strip()
+        grid = lm.get('grid', '').strip()
+        if not name:
+            continue
+        raw_coord = grid.replace("Grid", "").strip()
+        
+        name_missing = name.lower() not in low
+        grid_missing = (grid.lower() not in low) and (raw_coord.lower() not in low)
+        
+        if name_missing or grid_missing:
+            missing_clauses.append(f"{name} at {grid}")
+            
+    if missing_clauses:
+        clause = "Locked anchors: " + ", ".join(missing_clauses) + "."
+        if not prompt.endswith('.'):
+            prompt += '.'
+        prompt += f" {clause}"
+        
+    return prompt
+
+
 def compress_prompt_to_budget(prompt, target_max_words, config, is_video=True):
     if not config:
         return prompt
@@ -835,6 +1005,7 @@ CRITICAL CONSTRAINTS:
         model = config.get('auxModel') or config.get('model') or 'gemini-3-flash-agent'
         compressed = _chat(config, system_prompt, user_prompt, temperature=0.1, timeout=30, model=model).strip()
         compressed = _strip_code_fences(compressed).strip()
+        compressed = clean_prompt_text(compressed)
         compressed_words = compressed.split()
         if len(compressed_words) > 0 and len(compressed_words) < len(words):
             if sys.stdout:
@@ -847,9 +1018,16 @@ CRITICAL CONSTRAINTS:
 
 
 def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal, beat=None, config=None):
+    # 1. Clean initial prompt text
     image_prompt = clean_prompt_text(image_prompt)
-    image_prompt = fix_image_clean_frame_proactive(image_prompt)
     video_prompt = clean_prompt_text(video_prompt)
+    
+    # 2. Compress first with a slightly lower target budget to leave room for post-compression proactive additions
+    image_prompt = compress_prompt_to_budget(image_prompt, 120, config, is_video=False)
+    video_prompt = compress_prompt_to_budget(video_prompt, 110, config, is_video=True)
+    
+    # 3. Apply proactive fixes post-compression to guarantee mandatory quality requirements
+    image_prompt = fix_image_clean_frame_proactive(image_prompt)
     video_prompt = fix_video_opening(i, video_prompt)
     video_prompt = fix_pacing_control(video_prompt, is_threshold_or_reveal)
     video_prompt = fix_out_and_in(video_prompt, is_threshold_or_reveal)
@@ -875,10 +1053,8 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
     image_prompt = fix_camera_contradictions(image_prompt, is_bridge)
     
     image_prompt = fix_rhma_blur(image_prompt, is_last)
-    
-    # Compress prompts to target budgets if they exceed limits
-    image_prompt = compress_prompt_to_budget(image_prompt, 170, config, is_video=False)
-    video_prompt = compress_prompt_to_budget(video_prompt, 180, config, is_video=True)
+    image_prompt = fix_horizon_line(image_prompt)
+    image_prompt = fix_primary_landmarks(image_prompt, packet)
     
     return video_prompt, image_prompt
 
@@ -1025,17 +1201,17 @@ def check_stylistic_repetition(curr_prompt, prev_prompt, packet, is_video=True):
         # Replace digits with empty string or space to ignore frame index/beat numbers
         text = re.sub(r'\b\d+\b', '', text)
         
-        # Strip Camera DNA
-        dna = packet.get('camera_dna', '')
+        # Strip Camera DNA (_flatten_to_text: packet may come from an un-normalized caller)
+        dna = _flatten_to_text(packet.get('camera_dna', ''))
         if dna:
             dna_clean = re.sub(r'\b\d+\b', '', dna.lower()).strip()
             dna_words = re.sub(r'[^\w\s]', ' ', dna_clean).split()
             for word in dna_words:
                 if len(word) > 3:
                     text = text.replace(word, '')
-                    
+
         # Strip Worker Choreography
-        choreography = packet.get('worker_choreography', '')
+        choreography = _flatten_to_text(packet.get('worker_choreography', ''))
         if choreography:
             ch_clean = re.sub(r'\b\d+\b', '', choreography.lower()).strip()
             ch_words = re.sub(r'[^\w\s]', ' ', ch_clean).split()
@@ -1241,6 +1417,71 @@ def check_primary_landmarks_exact_match(image_prompt, packet):
             if raw_coord.lower() not in image_prompt.lower():
                 errors.append(f"IMAGE prompt fails to restate grid coordinate '{grid}' for landmark '{name}'")
     return errors
+
+
+def check_monotonic_state_regression(config, prev_image, current_image):
+    if not config or not prev_image or not current_image:
+        return []
+    
+    system_prompt = """You are a construction prompt quality auditor.
+Compare the previous beat's image state (IMAGE i) and the current beat's image state (IMAGE i+1).
+
+Your ONLY job is to catch REAL continuity breaks: a MAJOR completed feature — an installed panel/wall/floor/fixture, a primary landmark, a finished surface, or a structural element — that was clearly present and finished in IMAGE i but has now vanished, reverted to an earlier unfinished state, or is directly contradicted in IMAGE i+1 (e.g. a finished floor becomes bare subfloor again, an installed door frame disappears, a painted wall is now unpainted).
+
+Do NOT flag the omission of minor decorative or cosmetic micro-details — individual screws/nails/bolts/heads, dust, sawdust, pencil marks, scuff marks, slag flecks, heat-tint rings, wire clippings, and similar small persistent traces. A concise, natural-sounding image description is EXPECTED to drop most of these from beat to beat as new details accumulate — that is correct, not a regression. Only flag one of these if IMAGE i+1 actively describes that exact surface as pristine/untouched/unworked in a way that contradicts the completed work.
+
+If everything major is correctly maintained, respond with exactly "PASS".
+Otherwise, output a short bulleted list (at most 3 items, the most important ones) of MAJOR continuity breaks only. Keep it concise, direct, and actionable."""
+
+    user_prompt = f"""IMAGE i (Previous State):
+{prev_image}
+
+IMAGE i+1 (New State):
+{current_image}"""
+
+    try:
+        response = _chat(config, system_prompt, user_prompt, temperature=0.1, timeout=30, model=config.get('auxModel'))
+        response_clean = response.strip()
+        if response_clean.upper() == "PASS" or "PASS" in response_clean.upper()[:10]:
+            return []
+        
+        lines = [line.strip().lstrip('-* ').strip() for line in response_clean.split('\n') if line.strip()]
+        errors = [f"Monotonic state regression: {line}" for line in lines if line and "PASS" not in line.upper()]
+        return errors
+    except Exception as e:
+        if sys.stdout:
+            print(f"[DEBUG] check_monotonic_state_regression failed: {e}")
+        return []
+
+
+def check_visible_delta_between_frames(config, prev_image, current_image):
+    if not config or not prev_image or not current_image:
+        return []
+    
+    system_prompt = """You are a construction prompt quality auditor.
+Compare the previous beat's image state (IMAGE i) and the current beat's image state (IMAGE i+1).
+Check if there is a clear, visible progression or increment of construction work between the two states (e.g., a new panel installed, walls painted, wiring added, floor finished).
+The current state MUST contain new completed elements or modifications that were not present in the previous state.
+If there is a clear visible progression, respond with exactly "PASS".
+If the two descriptions represent the exact same state of completion (even if worded differently), output a short description of the lack of progress (e.g. "No visible progress or added elements between IMAGE i and IMAGE i+1")."""
+
+    user_prompt = f"""IMAGE i (Previous State):
+{prev_image}
+
+IMAGE i+1 (New State):
+{current_image}"""
+
+    try:
+        response = _chat(config, system_prompt, user_prompt, temperature=0.1, timeout=30, model=config.get('auxModel'))
+        response_clean = response.strip()
+        if response_clean.upper() == "PASS" or "PASS" in response_clean.upper()[:10]:
+            return []
+        
+        return [f"Static frame violation: {response_clean}"]
+    except Exception as e:
+        if sys.stdout:
+            print(f"[DEBUG] check_visible_delta_between_frames failed: {e}")
+        return []
 
 
 def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal, prev_video=None, prev_image=None, config=None, beat=None, skip_llm_checks=False):
@@ -1661,7 +1902,7 @@ Space Type: {space_type}
         try:
             beat_text = _chat(config, beat_system, beat_user_current, temperature=0.3, timeout=90)
             beat_text_cleaned = _strip_code_fences(beat_text)
-            beat_ladder = json.loads(beat_text_cleaned)
+            beat_ladder = normalize_beat_ladder(json.loads(beat_text_cleaned))
             if isinstance(beat_ladder, list) and len(beat_ladder) == total_beats:
                 idxs = [b.get('index') for b in beat_ladder]
                 if idxs == list(range(1, total_beats + 1)):
@@ -1710,7 +1951,8 @@ Space Type: {space_type}
     brief_fingerprint = get_brief_fingerprint(dimensions)
     with PACKET_CACHE_LOCK:
         cache = load_packet_cache()
-        packet = cache.get(brief_fingerprint)
+        # normalize_packet also heals cache entries poisoned before shape-coercion existed
+        packet = normalize_packet(cache.get(brief_fingerprint))
 
     if not packet:
         scup_ref = load_reference_file('spatial-consistency-upgrade-protocol.md')
@@ -1751,7 +1993,7 @@ Beat Ladder:
             try:
                 packet_text = _chat(config, packet_system, packet_user, temperature=0.2, timeout=90)
                 packet_text_cleaned = _strip_code_fences(packet_text)
-                packet = json.loads(packet_text_cleaned)
+                packet = normalize_packet(json.loads(packet_text_cleaned))
                 if all(k in packet for k in ["camera_dna", "geometry_lock", "primary_landmarks", "frame_boundaries"]):
                     ladder_errs = check_lighting_phase_ladder_monotonicity(packet.get("lighting_phase_ladder"))
                     if ladder_errs:
@@ -1787,6 +2029,8 @@ Beat Ladder:
 
     compiled_images = {}
     compiled_videos = {}
+
+    mode = parsed_brief.get('mode', 'Standard')
 
     scup_ref = load_reference_file('spatial-consistency-upgrade-protocol.md')
     templates_raw = load_reference_file('prompt-templates.md')
@@ -1938,13 +2182,13 @@ Instructions:
 <image prompt body>
 ===TRACES===
 [
-  {
+  {{
     "name": "precise name of new permanent feature/material/trace (e.g. steel screw heads, green insulation foam)",
     "material_color": "color/texture (e.g. metallic silver)",
     "initial_state": "state when introduced (e.g. freshly installed)",
     "grid": "approximate grid coordinate if mentioned (e.g. Grid B2, default to Grid B2)",
     "z_depth_scale": "depth scale if mentioned (e.g. 50%, default to 50%)"
-  }
+  }}
 ]
 """
             beat_user = f"Generate prompts for Beat {i}: {beat['operation']} - {beat['description']}."
@@ -2357,5 +2601,118 @@ def parse_sections(content):
     if not out['title']:
         out['title'] = '未命名创意'
     return out
+
+
+def run_ideate(config, count=8):
+    engine_path = os.path.join(SKILL_DIR, 'references', 'idea-engine.md')
+    ledger_path = os.path.join(SKILL_DIR, 'references', 'used-topic-ledger.md')
+    
+    engine_content = ""
+    if os.path.exists(engine_path):
+        with open(engine_path, 'r', encoding='utf-8') as f:
+            engine_content = f.read()
+            
+    ledger_content = ""
+    if os.path.exists(ledger_path):
+        with open(ledger_path, 'r', encoding='utf-8') as f:
+            ledger_content = f.read()
+            
+    system_prompt = f"""You are the Upstream Ideation Layer for the `restoration-prompt-composer` skill.
+Your task is to generate a ranked list of {count} highly novel, realistic, buildable time-lapse renovation topic seeds.
+You must combine axes from the Morphological Matrix in `idea-engine.md` and filter them to ensure quality.
+
+Here is the authoritative `idea-engine.md` specifying the matrices, rules, filters, scoring rubric, and continuous-supply mechanisms:
+==================== IDEA ENGINE ====================
+{engine_content}
+
+Here is the current `used-topic-ledger.md` showing already used/burned topic DNAs:
+==================== USED TOPIC LEDGER ====================
+{ledger_content}
+
+==================== GENERATION INSTRUCTIONS ====================
+1. Combine Axis 1 (Carrier), Axis 2 (Environment), Axis 3 (Trauma), Axis 4 (Destiny), and Axis 5 (Signature Twist) to form candidates.
+2. Filter out any candidates that:
+   - Have a NON-SHELTER destiny. SHELTER-ONLY POLICY is a hard veto: every destiny MUST be a habitable private dwelling / refuge (a place to sleep, shelter, and live). Reject outright any bar, cafe, tea house, speakeasy, recording/ceramics/painting/art studio, shop, gallery, museum, public observatory, commercial spa/sauna/onsen, or lab. Litmus: "could one person live and sleep here as their own refuge?" — if no, drop it.
+   - Violate the Orthogonal-Pairing Rule (Raw shell vs cozy interior contrast).
+   - Do not have exactly ONE Axis-5 signature twist.
+   - Match or are one edit-step away from any burned Topic DNA in the ledger.
+   - Are in the Cliché Blocklist.
+   - Fail the Buildability Gate (no magic/conjuring).
+3. Score each candidate (0-5 for Novelty, Visual Contrast, Twist Strength, Buildability, Scroll-Stop).
+4. Select the top {count} candidates with highest total score.
+5. In this batch, ensure Axis-1 carrier families (Living/Natural, Abandoned Man-made, Vehicles/Vessels, Fantasy-grounded) rotate and do not repeat consecutively.
+6. Translate all names to natural Chinese for the final title and one-click input string.
+7. Return ONLY a valid JSON array of objects, with no markdown code fences, no other text.
+
+Each object in the JSON array must have EXACTLY these keys:
+- "title": (string) A catchy Chinese one-sentence title, e.g. "蓝冰冰川洞改造成隐居雪境卧室"
+- "input_str": (string) A Chinese Tier-1 one-click input string, e.g. "做一个蓝冰冰川洞穴改造成隐居雪境卧室"
+- "carrier": (string) Carrier in English, e.g. "glacier ice cave"
+- "env": (string) Environment in English, e.g. "alpine cliff"
+- "trauma": (string) Trauma state in English, e.g. "frost-cracked & ice-encased"
+- "destiny": (string) Destiny in English — MUST be a habitable shelter/dwelling/refuge, e.g. "snug winter refuge den"
+- "twist": (string) Signature twist DNA name in English, e.g. "self-material-window"
+- "twist_zh": (string) Chinese display description of the signature twist, e.g. "窗户直接切穿半透明蓝冰"
+- "carrier_family": (string) one of: "natural", "man-made", "vehicle", "fantasy"
+- "dna": (string) Topic DNA in the format "carrier-family / destiny / twist-family", e.g., "natural / refuge-den / self-material-window"
+- "score": (number) Total score out of 25.
+"""
+
+    user_prompt = f"Generate {count} top-quality unique renovation ideas following the instructions."
+    
+    for attempt in range(3):
+        try:
+            resp = _chat(config, system_prompt, user_prompt, temperature=0.8, timeout=90)
+            cleaned = _strip_code_fences(resp).strip()
+            ideas = json.loads(cleaned)
+            if isinstance(ideas, list) and len(ideas) > 0:
+                return ideas
+        except Exception as e:
+            if sys.stdout:
+                print(f"[DEBUG] run_ideate attempt {attempt+1} failed: {e}")
+                
+    # Fallback if LLM fails (shelter-only destinies, per SHELTER-ONLY POLICY)
+    return [
+        {
+            "title": "蓝冰冰川洞改造成隐居雪境卧室",
+            "input_str": "做一个蓝冰冰川洞穴改造成隐居雪境卧室",
+            "carrier": "glacier ice cave",
+            "env": "alpine cliff",
+            "trauma": "frost-cracked & ice-encased",
+            "destiny": "snug winter refuge den",
+            "twist": "self-material-window",
+            "twist_zh": "窗户直接切穿半透明蓝冰",
+            "carrier_family": "natural",
+            "dna": "natural / refuge-den / self-material-window",
+            "score": 24
+        },
+        {
+            "title": "退役潜艇舱改造成离网单人居所",
+            "input_str": "做一个退役潜艇舱改造成离网单人居所",
+            "carrier": "retired submarine",
+            "env": "misty fjord",
+            "trauma": "rust-flaked & gutted",
+            "destiny": "off-grid micro-home",
+            "twist": "porthole-lighting",
+            "twist_zh": "保留黄铜舷窗作为背光搁板灯",
+            "carrier_family": "vehicle",
+            "dna": "vehicle / micro-home / porthole-lighting",
+            "score": 23
+        },
+        {
+            "title": "废弃导弹井改造成地下隐居卧室",
+            "input_str": "做一个废弃导弹发射井改造成地下隐居卧室",
+            "carrier": "missile silo",
+            "env": "high desert mesa",
+            "trauma": "debris-packed & guano-caked",
+            "destiny": "subterranean burrow dwelling",
+            "twist": "roof-hatch",
+            "twist_zh": "混凝土屋顶舱门滑动打开露出天空",
+            "carrier_family": "man-made",
+            "dna": "man-made / burrow-dwelling / roof-hatch",
+            "score": 23
+        }
+    ]
+
 
 

@@ -5,6 +5,7 @@ server_config.json
 __pycache__/
 *.pyc
 server.log
+server.log.*
 server_stdout.log
 server_stderr.log
 

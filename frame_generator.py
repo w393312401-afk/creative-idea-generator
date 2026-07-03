@@ -15,8 +15,28 @@ from PIL import Image
 from server_common import (
     SERVER_CONFIG, SERVER_MANAGED, resolve_gateway, effective_config,
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
-    IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT
+    IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT,
+    IMAGE_TASKS, IMAGE_TASKS_LOCK
 )
+
+
+def _get_file_hash(filepath):
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(filepath, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def update_manifest_stale_status(manifest, project_dir):
+    if 'merged_video' in manifest:
+        del manifest['merged_video']
+    if 'videos' in manifest:
+        manifest['videos'] = []
 
 
 def call_image_llm(config, prompt_content):
@@ -417,6 +437,7 @@ def _persist_data_url_image(data_url, title, prefix='cover'):
 
 
 def _extract_image_prompts(block):
+    from prompt_pipeline import _parse_prompt_slots
     images, _ = _parse_prompt_slots(block)
     return [{'index': idx, 'prompt': images[idx]} for idx in sorted(images)]
 
@@ -701,6 +722,7 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
 
 
 def generate_frame_sequence(config, title, prompt_block, on_progress=None, target_sequences=None):
+    from prompt_pipeline import _parse_prompt_slots, run_vlm_qa_check
     images, videos = _parse_prompt_slots(prompt_block)
     prompts = [{'index': idx, 'prompt': images[idx]} for idx in sorted(images)]
     if not prompts:

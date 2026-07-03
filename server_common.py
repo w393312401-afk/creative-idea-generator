@@ -217,7 +217,9 @@ def resolve_gateway(model_name, config):
     m_lower = (model_name or '').lower()
     if 'gpt-5' in m_lower or 'codex' in m_lower or 'gpt-image-2' in m_lower:
         base_url = 'http://127.0.0.1:65038/v1'
-        api_key = config.get('codexApiKey') or SERVER_CONFIG.get('codexApiKey') or 'agt_codex_JG9xnyWXYBS4qMmO9Z0UKD3pbEOpHr7M'
+        api_key = config.get('codexApiKey') or SERVER_CONFIG.get('codexApiKey') or ''
+        if not api_key and sys.stdout:
+            print("Warning: codex-routed model requested but no codexApiKey configured in server_config.json")
     return base_url, api_key
 
 
@@ -265,6 +267,10 @@ PACKET_CACHE_LOCK = threading.RLock()
 PROCESS_BRIEF_CACHE_LOCK = threading.RLock()
 ACTIVE_TASKS = {}
 ACTIVE_TASKS_LOCK = threading.RLock()
+
+# Async image-station generation/edit tasks (polled via the /api/image-station endpoints)
+IMAGE_TASKS = {}
+IMAGE_TASKS_LOCK = threading.Lock()
 
 def save_tasks_to_disk():
     # Only serialize the serializable parts of ACTIVE_TASKS
@@ -383,3 +389,23 @@ def cleanup_old_tasks():
             del ACTIVE_TASKS[tid]
     if to_delete:
         save_tasks_to_disk()
+
+
+def ping_proxy(config):
+    model = config.get('model') or 'gemini-3-flash-agent'
+    base_url, api_key = resolve_gateway(model, config)
+    payload = json.dumps({
+        'model': model,
+        'messages': [{'role': 'user', 'content': 'ping'}],
+        'max_tokens': 5,
+    }).encode('utf-8')
+    req = urllib.request.Request(
+        f'{base_url}/chat/completions',
+        data=payload,
+        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+        method='POST',
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=10) as resp:
+        return resp.status == 200
+

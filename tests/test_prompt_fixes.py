@@ -4,7 +4,11 @@ from prompt_pipeline import (
     fix_image_clean_frame_proactive,
     check_nlvtr_violations,
     fix_sound_design,
-    fix_video_opening
+    fix_video_opening,
+    _flatten_to_text,
+    normalize_packet,
+    normalize_beat_ladder,
+    check_stylistic_repetition
 )
 
 class TestPromptFixes(unittest.TestCase):
@@ -76,6 +80,73 @@ class TestPromptFixes(unittest.TestCase):
         self.assertTrue(fixed_partial.startswith("Use the provided first frame and last frame as exact composition anchors."))
         self.assertIn("IMAGE 2", fixed_partial)
         self.assertIn("IMAGE 3", fixed_partial)
+
+class TestPacketShapeNormalization(unittest.TestCase):
+    """Regression tests for the Beat-2 abort: the packet LLM returned worker_choreography
+    as a nested dict, and check_stylistic_repetition crashed on dict.lower()."""
+
+    # Shape taken verbatim from the real poisoned cache entry (rooftop tram project)
+    DICT_CHOREOGRAPHY = {
+        "trajectory": "Workers enter from Grid C1 and exit via Grid C1 before the final frame.",
+        "silhouette": "one lone worker in a solid bright-neon-yellow safety vest",
+        "manual_tool_lock": "tools are locked to the worker's hands with no morphing",
+    }
+
+    def test_flatten_to_text(self):
+        self.assertEqual(_flatten_to_text("already text"), "already text")
+        self.assertEqual(_flatten_to_text(None), "")
+        self.assertEqual(_flatten_to_text(["a", "b"]), "a b")
+        flat = _flatten_to_text(self.DICT_CHOREOGRAPHY)
+        self.assertIsInstance(flat, str)
+        self.assertIn("trajectory:", flat)
+        self.assertIn("safety vest", flat)
+
+    def test_normalize_packet_flattens_prose_fields(self):
+        packet = {
+            "camera_dna": {"lens": "14mm", "height": "1.6m"},
+            "worker_choreography": dict(self.DICT_CHOREOGRAPHY),
+            "passive_environment": {"direction": "left-to-right", "elements": "clouds"},
+            "primary_landmarks": [{"name": "column", "grid": "Grid B2", "z_depth_scale": 50}],
+            "frame_boundaries": {"left": {"grid": "B1", "feature": "wall"}},
+            "lighting_phase_ladder": {"1": "ambient only", "2": ["temporary", "work light"]},
+            "object_ledger": [{"name": "bucket", "z_depth_scale": 10}],
+        }
+        normalize_packet(packet)
+        self.assertIsInstance(packet["camera_dna"], str)
+        self.assertIsInstance(packet["worker_choreography"], str)
+        self.assertIn("safety vest", packet["worker_choreography"])
+        self.assertIsInstance(packet["passive_environment"], str)
+        self.assertIsInstance(packet["primary_landmarks"][0]["z_depth_scale"], str)
+        self.assertIsInstance(packet["frame_boundaries"]["left"], str)
+        self.assertIsInstance(packet["lighting_phase_ladder"]["2"], str)
+        self.assertIsInstance(packet["object_ledger"][0]["z_depth_scale"], str)
+
+    def test_normalize_packet_keeps_clean_packet_unchanged(self):
+        packet = {"camera_dna": "static tripod shot", "worker_choreography": "one lone worker"}
+        normalize_packet(packet)
+        self.assertEqual(packet["camera_dna"], "static tripod shot")
+        self.assertEqual(packet["worker_choreography"], "one lone worker")
+
+    def test_check_stylistic_repetition_survives_dict_packet(self):
+        # Even an UN-normalized packet must not crash the validator (defense in depth)
+        packet = {"camera_dna": {"lens": "14mm"}, "worker_choreography": dict(self.DICT_CHOREOGRAPHY)}
+        curr = "The worker lays grey stone tiles across the floor in repeated pressing cycles."
+        prev = "The worker hoists timber studs into place and drives nails along the frame."
+        errors = check_stylistic_repetition(curr, prev, packet, is_video=True)
+        self.assertIsInstance(errors, list)
+
+    def test_normalize_beat_ladder(self):
+        ladder = [
+            {"index": "1", "operation": "clearing", "description": {"text": "remove debris"}, "bridge_stage": None},
+            {"index": 2, "operation": ["threshold", "approach"], "description": "push to sill", "bridge_stage": "1"},
+        ]
+        normalize_beat_ladder(ladder)
+        self.assertEqual(ladder[0]["index"], 1)
+        self.assertIsInstance(ladder[0]["description"], str)
+        self.assertIn("remove debris", ladder[0]["description"])
+        self.assertIsInstance(ladder[1]["operation"], str)
+        self.assertEqual(ladder[1]["bridge_stage"], 1)
+
 
 if __name__ == '__main__':
     unittest.main()
