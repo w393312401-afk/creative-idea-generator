@@ -10,22 +10,25 @@ function parsePromptBlock(blockText) {
         const line = lines[i].trim();
         if (!line) continue;
         
-        const imgMatch = line.match(/^(?:图片)\s*(\d+)\s*:/i);
-        const vidMatch = line.match(/^(?:视频)\s*(\d+)\s*:/i);
-        
+        // Labels may carry a metadata tag between the number and the colon: "图片 8 [BRIDGE]:"
+        const imgMatch = line.match(/^(?:图片)\s*(\d+)(?:\s*\[(.*?)\])?\s*:/i);
+        const vidMatch = line.match(/^(?:视频)\s*(\d+)(?:\s*\[(.*?)\])?\s*:/i);
+
         if (imgMatch || vidMatch) {
             if (currentSlot) {
                 currentSlot.body = currentBody.join('\n').trim();
                 slots.push(currentSlot);
             }
-            
+
             const isImage = !!imgMatch;
             const index = parseInt(isImage ? imgMatch[1] : vidMatch[1], 10);
-            
+            const meta = (isImage ? imgMatch[2] : vidMatch[2]) || '';
+
             currentSlot = {
                 type: isImage ? 'image' : 'video',
                 index: index,
-                label: isImage ? `图片提示词 ${index}` : `视频提示词 ${index}`,
+                meta: meta,
+                label: (isImage ? `图片提示词 ${index}` : `视频提示词 ${index}`) + (meta ? ` [${meta}]` : ''),
                 id: isImage ? `slot-image-${index}` : `slot-video-${index}`,
                 body: ''
             };

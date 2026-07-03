@@ -696,6 +696,14 @@ document.addEventListener('DOMContentLoaded', () => {
       const duration = t.result && t.result.timings ? `${t.result.timings.total_duration_seconds}s` : '-';
       const beats = t.dimensions ? (t.dimensions.beats_count || 15) : '-';
       
+      let themeDisplay = theme;
+      if (t.result && t.result.token_usage) {
+        const usage = t.result.token_usage;
+        themeDisplay += `<div style="font-size: 11px; color: var(--text-muted); margin-top: 4px; font-family: var(--font-mono, monospace);">` +
+                       `Tokens: ${usage.total_tokens} (I:${usage.prompt_tokens} O:${usage.completion_tokens}) | Calls: ${usage.api_calls}` +
+                       `</div>`;
+      }
+      
       let statusBadge = '';
       if (t.status === 'running') {
         statusBadge = '<span class="badge badge-running">● 正在合成</span>';
@@ -715,7 +723,7 @@ document.addEventListener('DOMContentLoaded', () => {
       return `
         <tr>
           <td style="font-family: var(--font-mono); font-size:13px; color: var(--primary);">${t.id}</td>
-          <td style="font-weight: 500; color:#fff;">${theme}</td>
+          <td style="font-weight: 500; color:#fff;">${themeDisplay}</td>
           <td>${statusBadge}</td>
           <td>${beats}</td>
           <td style="font-family: var(--font-mono);">${duration}</td>

@@ -273,60 +273,101 @@ IMAGE_TASKS = {}
 IMAGE_TASKS_LOCK = threading.Lock()
 
 def save_tasks_to_disk():
-    # Only serialize the serializable parts of ACTIVE_TASKS
-    serializable = {}
+    # Save individual tasks to tasks/ folder
+    os.makedirs("tasks", exist_ok=True)
     with ACTIVE_TASKS_LOCK:
+        active_ids = set(ACTIVE_TASKS.keys())
         for tid, t in ACTIVE_TASKS.items():
-            serializable[tid] = {
+            task_data = {
                 "id": t["id"],
                 "status": t["status"],
                 "events": t["events"],
                 "dimensions": t["dimensions"],
-                "result": t["result"],
-                "error": t["error"],
+                "result": t.get("result"),
+                "error": t.get("error"),
                 "last_active": t["last_active"]
             }
+            try:
+                filepath = os.path.join("tasks", f"{tid}.json")
+                with open(filepath, "w", encoding="utf-8") as f:
+                    json.dump(task_data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                if sys.stdout:
+                    print(f"Error saving task {tid} to disk: {e}")
+                    
+    # Delete task files on disk for tasks no longer present in memory
     try:
-        with open("tasks.json", "w", encoding="utf-8") as f:
-            json.dump(serializable, f, ensure_ascii=False, indent=2)
+        if os.path.exists("tasks"):
+            for filename in os.listdir("tasks"):
+                if filename.endswith(".json"):
+                    tid = filename[:-5]
+                    if tid not in active_ids:
+                        try:
+                            os.remove(os.path.join("tasks", filename))
+                        except OSError:
+                            pass
     except Exception as e:
         if sys.stdout:
-            print(f"Error saving tasks to disk: {e}")
+            print(f"Error cleaning up task files: {e}")
 
 
 def load_tasks_from_disk():
     global ACTIVE_TASKS
-    if not os.path.exists("tasks.json"):
-        return
-    try:
-        with open("tasks.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-        with ACTIVE_TASKS_LOCK:
+    # Backward compatibility: migrate monolithic tasks.json if present
+    if os.path.exists("tasks.json") and not os.path.exists("tasks"):
+        try:
+            with open("tasks.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+            os.makedirs("tasks", exist_ok=True)
             for tid, t in data.items():
-                status = t["status"]
-                error = t.get("error")
-                events = t.get("events", [])
-                if status == "running":
-                    status = "failed"
-                    error = "服务已重启，生成中断。"
-                    # Append error event if not already present
-                    if not any(isinstance(evt, (list, tuple)) and len(evt) > 0 and evt[0] == 'error' for evt in events):
-                        events.append(['error', {'message': error}])
-                
-                ACTIVE_TASKS[tid] = {
-                    "id": t["id"],
-                    "status": status,
-                    "events": [tuple(evt) if isinstance(evt, (list, tuple)) else evt for evt in events],
-                    "listeners": set(),
-                    "cancel_event": threading.Event(),
-                    "dimensions": t["dimensions"],
-                    "result": t.get("result"),
-                    "error": error,
-                    "last_active": t["last_active"]
-                }
+                filepath = os.path.join("tasks", f"{tid}.json")
+                with open(filepath, "w", encoding="utf-8") as f:
+                    json.dump(t, f, ensure_ascii=False, indent=2)
+            os.remove("tasks.json")
+        except Exception as e:
+            if sys.stdout:
+                print(f"Error migrating tasks.json to tasks/ folder: {e}")
+
+    if not os.path.exists("tasks"):
+        return
+
+    try:
+        with ACTIVE_TASKS_LOCK:
+            for filename in os.listdir("tasks"):
+                if filename.endswith(".json"):
+                    tid = filename[:-5]
+                    filepath = os.path.join("tasks", filename)
+                    try:
+                        with open(filepath, "r", encoding="utf-8") as f:
+                            t = json.load(f)
+                        
+                        status = t["status"]
+                        error = t.get("error")
+                        events = t.get("events", [])
+                        if status == "running":
+                            status = "failed"
+                            error = "服务已重启，生成中断。"
+                            # Append error event if not already present
+                            if not any(isinstance(evt, (list, tuple)) and len(evt) > 0 and evt[0] == 'error' for evt in events):
+                                events.append(['error', {'message': error}])
+                        
+                        ACTIVE_TASKS[tid] = {
+                            "id": t["id"],
+                            "status": status,
+                            "events": [tuple(evt) if isinstance(evt, (list, tuple)) else evt for evt in events],
+                            "listeners": set(),
+                            "cancel_event": threading.Event(),
+                            "dimensions": t["dimensions"],
+                            "result": t.get("result"),
+                            "error": error,
+                            "last_active": t["last_active"]
+                        }
+                    except Exception as e:
+                        if sys.stdout:
+                            print(f"Error loading task file {filename}: {e}")
     except Exception as e:
         if sys.stdout:
-            print(f"Error loading tasks from disk: {e}")
+            print(f"Error reading tasks directory: {e}")
 
 
 def get_or_create_task(task_id, dimensions=None):

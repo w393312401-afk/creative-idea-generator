@@ -10,6 +10,35 @@ from prompt_pipeline import (
     normalize_beat_ladder,
     check_stylistic_repetition
 )
+from frame_generator import _extract_image_prompts
+
+
+class TestSlotExtraction(unittest.TestCase):
+    """Regression: _parse_prompt_slots returns {'body','meta'} dicts; _extract_image_prompts
+    must unwrap them so 'prompt' is plain prose (a dict repr would reach the image model)
+    and the BRIDGE meta flag sits at the top level where generate_frame_sequence reads it."""
+
+    BLOCK = (
+        "图片提示词\n"
+        "图片 1:\n"
+        "A static shot of the ruined cabin.\n"
+        "\n"
+        "图片 2 [BRIDGE]:\n"
+        "CHANGE IN THIS FRAME: camera now at the sill.\n"
+    )
+
+    def test_prompt_is_plain_string(self):
+        items = _extract_image_prompts(self.BLOCK)
+        self.assertEqual(len(items), 2)
+        for it in items:
+            self.assertIsInstance(it['prompt'], str)
+            self.assertNotIn("{'body'", it['prompt'])
+
+    def test_bridge_meta_surfaces_at_top_level(self):
+        items = _extract_image_prompts(self.BLOCK)
+        self.assertEqual(items[0]['meta'], '')
+        self.assertEqual(items[1]['meta'], 'BRIDGE')
+        self.assertIn('camera now at the sill', items[1]['prompt'])
 
 class TestPromptFixes(unittest.TestCase):
     
@@ -80,6 +109,120 @@ class TestPromptFixes(unittest.TestCase):
         self.assertTrue(fixed_partial.startswith("Use the provided first frame and last frame as exact composition anchors."))
         self.assertIn("IMAGE 2", fixed_partial)
         self.assertIn("IMAGE 3", fixed_partial)
+
+    def test_fix_primary_landmarks_no_replacement(self):
+        from prompt_pipeline import fix_primary_landmarks
+        packet = {
+            'primary_landmarks': [
+                {'name': 'sliding door frame sill', 'grid': 'Grid B2'},
+                {'name': 'metal support beam', 'grid': 'Grid A1'}
+            ]
+        }
+        
+        # 'frame' and 'support beam' must NOT be replaced, and since they do not match the exact names,
+        # both landmarks must be appended to the end of the prompt.
+        prompt = "The horizon line remains level at 50-percent height of the frame. A worker inspects the support beam."
+        fixed = fix_primary_landmarks(prompt, packet)
+        
+        # Original text remains untouched (no replacement)
+        self.assertIn("height of the frame", fixed)
+        self.assertIn("inspects the support beam", fixed)
+        
+        # Missing/imprecise landmarks are appended at the end
+        self.assertIn("Locked anchors: sliding door frame sill at Grid B2, metal support beam at Grid A1", fixed)
+
+    def test_threshold_bridge_stage_validation(self):
+        # 1. Valid Threshold beat ladder
+        valid_ladder = [
+            {"index": 1, "operation": "clearing", "description": "Clear site", "bridge_stage": None},
+            {"index": 2, "operation": "threshold", "description": "Approach doorway", "bridge_stage": 1},
+            {"index": 3, "operation": "threshold", "description": "Cross doorway sill", "bridge_stage": 2},
+            {"index": 4, "operation": "reward", "description": "Finished room", "bridge_stage": None}
+        ]
+        
+        violations = []
+        has_bridge_1 = False
+        has_bridge_2 = False
+        bridge_1_idx = -1
+        bridge_2_idx = -1
+        for idx, b in enumerate(valid_ladder):
+            bs = b.get('bridge_stage')
+            if bs == 1:
+                has_bridge_1 = True
+                bridge_1_idx = idx
+            elif bs == 2:
+                has_bridge_2 = True
+                bridge_2_idx = idx
+        if not (has_bridge_1 and has_bridge_2 and bridge_2_idx == bridge_1_idx + 1):
+            violations.append("In Threshold mode, there must be exactly two consecutive beats with bridge_stage=1 and bridge_stage=2.")
+        
+        self.assertEqual(len(violations), 0)
+
+        # 2. Invalid Threshold beat ladder (non-consecutive bridge stages)
+        invalid_ladder = [
+            {"index": 1, "operation": "clearing", "description": "Clear site", "bridge_stage": 1},
+            {"index": 2, "operation": "threshold", "description": "Approach doorway", "bridge_stage": None},
+            {"index": 3, "operation": "threshold", "description": "Cross doorway sill", "bridge_stage": 2},
+            {"index": 4, "operation": "reward", "description": "Finished room", "bridge_stage": None}
+        ]
+        violations = []
+        has_bridge_1 = False
+        has_bridge_2 = False
+        bridge_1_idx = -1
+        bridge_2_idx = -1
+        for idx, b in enumerate(invalid_ladder):
+            bs = b.get('bridge_stage')
+            if bs == 1:
+                has_bridge_1 = True
+                bridge_1_idx = idx
+            elif bs == 2:
+                has_bridge_2 = True
+                bridge_2_idx = idx
+        if not (has_bridge_1 and has_bridge_2 and bridge_2_idx == bridge_1_idx + 1):
+            violations.append("In Threshold mode, there must be exactly two consecutive beats with bridge_stage=1 and bridge_stage=2.")
+        
+        self.assertEqual(len(violations), 1)
+
+    def test_parse_and_format_prompt_slots_metadata(self):
+        from prompt_pipeline import _parse_prompt_slots, _format_prompt_block
+        block = """图片提示词
+图片 1 [TRAUMA]:
+Trauma state image prompt here.
+
+图片 8 [BRIDGE]:
+Bridge state image prompt here.
+
+视频提示词
+视频 1:
+Video prompt 1 here.
+
+视频 8 [BRIDGE]:
+Video prompt 8 here.
+"""
+        images, videos = _parse_prompt_slots(block)
+        
+        self.assertIn(1, images)
+        self.assertEqual(images[1]['body'], "Trauma state image prompt here.")
+        self.assertEqual(images[1]['meta'], "TRAUMA")
+        
+        self.assertIn(8, images)
+        self.assertEqual(images[8]['body'], "Bridge state image prompt here.")
+        self.assertEqual(images[8]['meta'], "BRIDGE")
+        
+        self.assertIn(1, videos)
+        self.assertEqual(videos[1]['body'], "Video prompt 1 here.")
+        self.assertEqual(videos[1]['meta'], "")
+        
+        self.assertIn(8, videos)
+        self.assertEqual(videos[8]['body'], "Video prompt 8 here.")
+        self.assertEqual(videos[8]['meta'], "BRIDGE")
+        
+        # Format back and check that [BRIDGE] and [TRAUMA] are kept
+        formatted = _format_prompt_block(images, videos)
+        self.assertIn("图片 1 [TRAUMA]:", formatted)
+        self.assertIn("图片 8 [BRIDGE]:", formatted)
+        self.assertIn("视频 8 [BRIDGE]:", formatted)
+        self.assertIn("视频 1:", formatted)
 
 class TestPacketShapeNormalization(unittest.TestCase):
     """Regression tests for the Beat-2 abort: the packet LLM returned worker_choreography

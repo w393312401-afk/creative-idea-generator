@@ -54,6 +54,8 @@ def background_worker(task_id, config, dimensions):
         notify_listeners(task_id, 'text_chunk' if stage == 'text_chunk' else 'progress', details)
 
     try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
         if isinstance(config, dict):
             config['_skipped_checks'] = 0
         content = call_llm(config, dimensions, on_progress=on_progress)
@@ -66,6 +68,10 @@ def background_worker(task_id, config, dimensions):
         # We assign its audit results directly to repair_md.
         result['repair_md'] = result.get('audit_md') or 'PASS — 工序与场景一致性检查通过，未发现违规，提示词未改动。'
         result['skipped_checks_count'] = config.get('_skipped_checks', 0) if isinstance(config, dict) else 0
+        
+        usage = stop_and_get_accounting()
+        if usage:
+            result['token_usage'] = usage
             
         duration = time.time() - start_time
         images, videos = _parse_prompt_slots(result['prompt_block'])
@@ -158,6 +164,8 @@ def rate_ok(ip):
 def generate_frames_worker(task_id, config, title, prompt_block, target_sequences):
     t = get_or_create_task(task_id)
     try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
         def progress_cb(stage, details):
             with ACTIVE_TASKS_LOCK:
                 t["events"].append((stage, details))
@@ -168,6 +176,10 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
             on_progress=progress_cb,
             target_sequences=target_sequences
         )
+        usage = stop_and_get_accounting()
+        if usage:
+            result['token_usage'] = usage
+            
         with ACTIVE_TASKS_LOCK:
             t["status"] = "completed"
             t["result"] = result
@@ -185,43 +197,72 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
     finally:
         save_tasks_to_disk()
 
+_VIDEO_GEN_SERIAL_LOCK = threading.Lock()
+
 
 def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
     t = get_or_create_task(task_id)
     try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
         def progress_cb(stage, details):
             with ACTIVE_TASKS_LOCK:
                 t["events"].append((stage, details))
             notify_listeners(task_id, stage, details)
+
+        progress_cb('queue', {'message': '视频生成请求已加入队列，正在等待排队生成...'})
+
+        with _VIDEO_GEN_SERIAL_LOCK:
+            result = generate_video_sequence(
+                config, title, prompt_block,
+                on_progress=progress_cb,
+                target_slots=target_slots
+            )
             
-        result = generate_video_sequence(
-            config, title, prompt_block,
-            on_progress=progress_cb,
-            target_slots=target_slots
-        )
-        
-        # Try to automatically merge videos
-        try:
-            progress_cb('merge_start', {'message': '正在自动合并并加速视频...'})
-            project_dir = _get_project_dir(title)
-            merged_info = merge_project_videos(project_dir)
-            if merged_info:
-                result['merged_video'] = merged_info
-                # Also update manifest file on disk
-                manifest_path = os.path.join(project_dir, 'manifest.json')
-                if os.path.exists(manifest_path):
-                    try:
-                        with open(manifest_path, 'r', encoding='utf-8') as f:
-                            mdata = json.load(f)
-                        mdata['merged_video'] = merged_info
-                        with open(manifest_path, 'w', encoding='utf-8') as f:
-                            json.dump(mdata, f, ensure_ascii=False, indent=2)
-                    except Exception as e:
-                        print(f"Warning: could not update manifest.json with merged_video ({e})")
-            progress_cb('merge_done', {'merged_video': merged_info})
-        except Exception as merge_err:
-            print(f"Error during auto-merge: {merge_err}")
-            progress_cb('merge_error', {'message': f'自动合并视频失败: {str(merge_err)}'})
+            usage = stop_and_get_accounting()
+            if usage:
+                result['token_usage'] = usage
+            
+            # Check if all expected videos are successfully generated
+            _, expected_videos = _parse_prompt_slots(prompt_block)
+            expected_slots = list(expected_videos.keys())
+            manifest_videos = result.get('videos', [])
+            manifest_video_slots = {v['slot']: v for v in manifest_videos}
+            
+            has_failures = False
+            for slot in expected_slots:
+                if slot not in manifest_video_slots:
+                    has_failures = True
+                    break
+                if manifest_video_slots[slot].get('status') != 'success':
+                    has_failures = True
+                    break
+
+            if has_failures:
+                progress_cb('merge_skip', {'message': '检测到存在生成失败或缺失的视频片段，已跳过自动合并视频。'})
+            else:
+                # Try to automatically merge videos
+                try:
+                    progress_cb('merge_start', {'message': '正在自动合并并加速视频...'})
+                    project_dir = _get_project_dir(title)
+                    merged_info = merge_project_videos(project_dir)
+                    if merged_info:
+                        result['merged_video'] = merged_info
+                        # Also update manifest file on disk
+                        manifest_path = os.path.join(project_dir, 'manifest.json')
+                        if os.path.exists(manifest_path):
+                            try:
+                                with open(manifest_path, 'r', encoding='utf-8') as f:
+                                    mdata = json.load(f)
+                                mdata['merged_video'] = merged_info
+                                with open(manifest_path, 'w', encoding='utf-8') as f:
+                                    json.dump(mdata, f, ensure_ascii=False, indent=2)
+                            except Exception as e:
+                                print(f"Warning: could not update manifest.json with merged_video ({e})")
+                    progress_cb('merge_done', {'merged_video': merged_info})
+                except Exception as merge_err:
+                    print(f"Error during auto-merge: {merge_err}")
+                    progress_cb('merge_error', {'message': f'自动合并视频失败: {str(merge_err)}'})
 
         with ACTIVE_TASKS_LOCK:
             t["status"] = "completed"
@@ -265,7 +306,11 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
             images, _ = _parse_prompt_slots(block)
             if images:
                 keys = sorted(images)
-                return images[keys[0]], images[keys[-1]]
+                before_item = images[keys[0]]
+                after_item = images[keys[-1]]
+                before_body = before_item['body'] if isinstance(before_item, dict) else before_item
+                after_body = after_item['body'] if isinstance(after_item, dict) else after_item
+                return before_body, after_body
             return None, None
         
         before_prompt, after_prompt = _extract_before_after_prompts(prompt_block)
@@ -1573,6 +1618,14 @@ def run_migrations():
 
 def run():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    # Record our PID so run.bat/stop.bat and restart tooling kill the right process.
+    # This write was lost in the module split; the stale pid file then caused restarts
+    # to no-op and pile up duplicate server instances fighting over port 8085.
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server.pid'), 'w', encoding='utf-8') as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
     run_migrations()
     load_tasks_from_disk()
     # sys.stdout is None under pythonw (no console); guard prints so the server

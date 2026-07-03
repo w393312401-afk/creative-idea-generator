@@ -15,6 +15,7 @@ outputs/
 
 # 新增忽略规则
 tasks.json
+tasks/
 packet_cache.json
 scratch/
 image-service-station/restored_history.json

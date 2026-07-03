@@ -28,6 +28,36 @@ from frame_generator import (
 VIDEO_DURATION = 8.0
 WORKER_EXIT_TIME = 7.5
 
+# Thread-local storage for LLM usage accounting
+_usage_tracker = threading.local()
+
+def start_accounting():
+    _usage_tracker.active = True
+    _usage_tracker.prompt_tokens = 0
+    _usage_tracker.completion_tokens = 0
+    _usage_tracker.total_tokens = 0
+    _usage_tracker.api_calls = 0
+
+def stop_and_get_accounting():
+    if not getattr(_usage_tracker, 'active', False):
+        return None
+    stats = {
+        'prompt_tokens': _usage_tracker.prompt_tokens,
+        'completion_tokens': _usage_tracker.completion_tokens,
+        'total_tokens': _usage_tracker.total_tokens,
+        'api_calls': _usage_tracker.api_calls
+    }
+    _usage_tracker.active = False
+    return stats
+
+def _record_tokens(usage):
+    if not getattr(_usage_tracker, 'active', False) or not usage:
+        return
+    _usage_tracker.api_calls += 1
+    _usage_tracker.prompt_tokens += usage.get('prompt_tokens', 0)
+    _usage_tracker.completion_tokens += usage.get('completion_tokens', 0)
+    _usage_tracker.total_tokens += usage.get('total_tokens', 0)
+
 CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'packet_cache.json')
 PROCESS_BRIEF_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'process_brief_cache.json')
 
@@ -220,6 +250,8 @@ def _chat(config, system, user, temperature=0.85, max_tokens=16384, timeout=240,
                             break
                         try:
                             chunk = json.loads(data_part)
+                            if 'usage' in chunk:
+                                _record_tokens(chunk['usage'])
                             if 'choices' in chunk and len(chunk['choices']) > 0:
                                 delta = chunk['choices'][0].get('delta', {})
                                 content = delta.get('content', '')
@@ -248,6 +280,7 @@ def _chat(config, system, user, temperature=0.85, max_tokens=16384, timeout=240,
     try:
         with opener.open(req, timeout=timeout) as resp:
             body = json.loads(resp.read().decode('utf-8'))
+            _record_tokens(body.get('usage'))
     except urllib.error.HTTPError:
         # Real HTTP error from the proxy/model — handled specially upstream.
         raise
@@ -318,10 +351,11 @@ def _multimodal_chat(config, system, user_text, image_paths, model=None):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(req, timeout=90) as resp:
         res_data = json.loads(resp.read().decode('utf-8'))
+        _record_tokens(res_data.get('usage'))
         return res_data['choices'][0]['message']['content']
 
 
-def run_vlm_qa_check(config, img_i_path, img_ip1_path, video_prompt):
+def run_vlm_qa_check(config, img_i_path, img_ip1_path, video_prompt, is_bridge=False):
     """
     Compare generated IMAGE i and IMAGE i+1 with the transition VIDEO i prompt.
     Returns (pass_boolean, reason_string).
@@ -333,7 +367,19 @@ def run_vlm_qa_check(config, img_i_path, img_ip1_path, video_prompt):
             "of a video segment. The transition action is described by the VIDEO prompt.\n\n"
             "Your task is to detect the following flaws:\n"
             "1. NO CHANGE: The two images are identical or almost identical, meaning the image editor failed to execute the change.\n"
-            "2. CAMERA perspective/viewpoint jumps: The camera position, angle, or background layout shifted or jumped. The background structure must remain locked (same viewpoint, same horizon line level, same perspective).\n"
+        )
+        if is_bridge:
+            system_prompt += (
+                "2. CAMERA viewpoint jumps: The camera is performing a bridge transition (entering/crossing the threshold), "
+                "so the perspective/camera position is ALLOWED and REQUIRED to move forward (closer view, crossing sill). "
+                "However, the horizontal level and general alignment must still be consistent with entering the same space. "
+                "Do not fail for perspective shifts that move forward along the viewpoint axis.\n"
+            )
+        else:
+            system_prompt += (
+                "2. CAMERA perspective/viewpoint jumps: The camera position, angle, or background layout shifted or jumped. The background structure must remain locked (same viewpoint, same horizon line level, same perspective).\n"
+            )
+        system_prompt += (
             "3. ACTION mismatch: The visual change between Image 1 and Image 2 does NOT correspond to the action described in the VIDEO prompt.\n\n"
             "Response format:\n"
             "- If the background/composition is consistent AND the change corresponds to the video prompt, respond EXACTLY with: PASS\n"
@@ -353,6 +399,38 @@ def run_vlm_qa_check(config, img_i_path, img_ip1_path, video_prompt):
         if sys.stdout:
             print(f"[VLM QA] VLM API call failed: {e}. Skipping VLM check to avoid blocking pipeline.")
         return True, f"Skipped (API Error: {e})"
+
+
+def fix_image_prompt_with_vlm_feedback(config, original_prompt, vlm_reason):
+    """
+    Use LLM (auxModel) to generate a corrected image prompt based on the VLM QA audit failure reason.
+    """
+    system_prompt = (
+        "You are an expert prompt engineering assistant. Your job is to modify a stable-diffusion-style IMAGE prompt "
+        "to fix specific visual errors detected by a visual auditor (VLM). "
+        "You will be given the original IMAGE prompt and the audit failure reason (in Chinese). "
+        "Provide a corrected IMAGE prompt that addresses the failure reason. "
+        "Specifically:\n"
+        "- If the auditor reported that an object wasn't removed, make sure to state that the object has been removed, using terms like 'REMOVED: [object name]'.\n"
+        "- If the auditor reported that a required object is missing, append a clear description of the object to the prompt.\n"
+        "- Keep the rest of the original prompt's structure, landmarks, Camera DNA, and style intact.\n"
+        "- Do NOT output any explanations, markdown code fences, or headers. Output ONLY the raw corrected prompt text in English."
+    )
+    user_prompt = (
+        f"Original IMAGE prompt:\n{original_prompt}\n\n"
+        f"VLM Audit Failure Reason:\n{vlm_reason}\n\n"
+        f"Please output the corrected IMAGE prompt in English."
+    )
+    try:
+        response = _chat(
+            config, system_prompt, user_prompt,
+            temperature=0.3, timeout=60, model=config.get('auxModel') or config.get('model')
+        )
+        return _strip_code_fences(response).strip()
+    except Exception as e:
+        if sys.stdout:
+            print(f"[DEBUG] fix_image_prompt_with_vlm_feedback failed: {e}")
+        return original_prompt
 
 
 def load_reference_file(name):
@@ -834,7 +912,9 @@ def select_camera_dna(beat, base_camera_dna):
     return cleaned_base
 
 
-def fix_camera_contradictions(prompt, is_moving):
+def fix_camera_contradictions(prompt, is_moving=False, is_bridge=None):
+    if is_bridge is not None:
+        is_moving = is_bridge
     sentences = re.split(r'(?<=[.!?])\s+', prompt)
     cleaned_sentences = []
     
@@ -931,32 +1011,6 @@ def fix_primary_landmarks(prompt, packet):
         return prompt
     
     landmarks = packet['primary_landmarks']
-    
-    # First, make sure the landmark names are exactly present by replacing partial matches
-    for lm in landmarks:
-        name = lm.get('name', '').strip()
-        if not name:
-            continue
-        low = prompt.lower()
-        if name.lower() not in low:
-            # Try to match sub-phrases of length >= 2, or the last word (e.g. "basin")
-            words = name.lower().split()
-            replaced = False
-            for length in range(len(words), 0, -1):
-                for start in range(len(words) - length + 1):
-                    subphrase = " ".join(words[start:start+length])
-                    if length == 1 and subphrase in ('floor', 'wall', 'stone', 'ceiling', 'door', 'entrance'):
-                        continue
-                    if subphrase in low:
-                        pattern = re.compile(rf'\b{re.escape(subphrase)}\b', re.IGNORECASE)
-                        prompt, count = pattern.subn(name, prompt, count=1)
-                        if count > 0:
-                            replaced = True
-                            break
-                if replaced:
-                    break
-                    
-    # Next, check if any landmark names or grid coordinates are still missing from the prompt
     low = prompt.lower()
     missing_clauses = []
     for lm in landmarks:
@@ -988,12 +1042,22 @@ def compress_prompt_to_budget(prompt, target_max_words, config, is_video=True):
     if len(words) <= target_max_words:
         return prompt
 
-    system_prompt = f"""You are an expert prompt optimization tool.
-Your job is to compress the given prompt to be under {target_max_words} words.
+    if is_video:
+        system_prompt = f"""You are an expert prompt optimization tool.
+Your job is to compress the given VIDEO prompt to be under {target_max_words} words.
 CRITICAL CONSTRAINTS:
-1. You MUST preserve the beginning of the prompt (for videos: 'Use the provided first frame and last frame as exact composition anchors.', camera DNA descriptions).
+1. You MUST preserve the beginning of the prompt (specifically: 'Use the provided first frame and last frame as exact composition anchors. Use IMAGE X as the actual first-frame image and IMAGE Y as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout.', camera DNA descriptions).
 2. You MUST preserve the end of the prompt (specifically: worker entry/exit actions at t=0s and t=7.5s, persistent trace descriptions, and sound effects/ambient noise).
 3. Do NOT lose the core action being performed.
+4. Reduce word count by pruning redundant adjectives, repetitive descriptions, and overly wordy details in the middle of the prompt.
+5. The final output must be exactly under {target_max_words} words, and contain ONLY the compressed prompt prose. No labels, no quotes, no conversational filler."""
+    else:
+        system_prompt = f"""You are an expert prompt optimization tool.
+Your job is to compress the given IMAGE prompt to be under {target_max_words} words.
+CRITICAL CONSTRAINTS:
+1. You MUST preserve the beginning of the prompt, specifically the camera DNA and any change/absence statements (e.g. 'CHANGE IN THIS FRAME:', 'REMOVED:', 'ABSENT:', 'CHANGE:'). These clauses MUST remain completely intact as they tell the image-to-image editor what to add or remove.
+2. You MUST preserve the end of the prompt (specifically: 'Locked anchors: ...', 'frame_boundaries', and 'horizon line' constraints).
+3. Do NOT lose the key structural additions or modifications described in the middle of the prompt.
 4. Reduce word count by pruning redundant adjectives, repetitive descriptions, and overly wordy details in the middle of the prompt.
 5. The final output must be exactly under {target_max_words} words, and contain ONLY the compressed prompt prose. No labels, no quotes, no conversational filler."""
 
@@ -1042,12 +1106,7 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
     desc = beat.get('description', '').lower() if beat else ''
     
     bridge_stage = beat.get('bridge_stage') if beat else None
-    if bridge_stage in (1, 2):
-        is_bridge = True
-    elif bridge_stage is not None:
-        is_bridge = False
-    else:
-        is_bridge = "bridge" in desc or "threshold" in op or "dolly" in desc or "push" in desc
+    is_bridge = bridge_stage in (1, 2)
         
     video_prompt = fix_camera_contradictions(video_prompt, is_bridge)
     image_prompt = fix_camera_contradictions(image_prompt, is_bridge)
@@ -1524,12 +1583,7 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
     desc = beat.get('description', '').lower() if beat else ''
     
     bridge_stage = beat.get('bridge_stage') if beat else None
-    if bridge_stage in (1, 2):
-        is_bridge = True
-    elif bridge_stage is not None:
-        is_bridge = False
-    else:
-        is_bridge = "bridge" in desc or "threshold" in op or "dolly" in desc or "push" in desc
+    is_bridge = bridge_stage in (1, 2)
         
     errors.extend(check_camera_contradictions(video_prompt, is_bridge))
     errors.extend(check_camera_contradictions(image_prompt, is_bridge))
@@ -1909,10 +1963,28 @@ Space Type: {space_type}
                     # Semantic gate: does this internally-valid ladder still violate a real-world
                     # hard prerequisite for THIS carrier? Only the grounding step can catch this.
                     violations = check_real_world_order_violation(config, hard_prerequisites, beat_ladder)
+                    # Threshold mode validation
+                    is_threshold_mode = (parsed_brief.get('mode') == 'Threshold')
+                    if is_threshold_mode:
+                        has_bridge_1 = False
+                        has_bridge_2 = False
+                        bridge_1_idx = -1
+                        bridge_2_idx = -1
+                        for idx, b in enumerate(beat_ladder):
+                            bs = b.get('bridge_stage')
+                            if bs == 1:
+                                has_bridge_1 = True
+                                bridge_1_idx = idx
+                            elif bs == 2:
+                                has_bridge_2 = True
+                                bridge_2_idx = idx
+                        if not (has_bridge_1 and has_bridge_2 and bridge_2_idx == bridge_1_idx + 1):
+                            violations.append("In Threshold mode, there must be exactly two consecutive beats with bridge_stage=1 and bridge_stage=2.")
+                    
                     if not violations:
                         break
                     if sys.stdout:
-                        print(f"[DEBUG] Beat ladder attempt {attempt+1} violated real-world order: {violations}")
+                        print(f"[DEBUG] Beat ladder attempt {attempt+1} violated real-world order/structure: {violations}")
                     if attempt < 2:
                         beat_user_current = beat_user + "\n\n" + "==================== PRIOR REAL-WORLD ORDER VIOLATIONS ====================\n" + \
                             "The previous beat ladder violated these real-world prerequisites. Fix the ordering:\n" + \
@@ -2322,9 +2394,36 @@ Instructions:
 
         # Step 7: Final Audit & Reassembly
         if on_progress:
-            on_progress('audit', '正在运行工序与场景一致性二次校验...')
+            on_progress('audit', '正在运行工序与场景一致性二次校验与二次修复...')
 
-        reassembled_prompts_block = _format_prompt_block(compiled_images, compiled_videos)
+        # Convert compiled_images and compiled_videos to dicts with meta before formatting
+        formatted_images = {}
+        for idx, img in compiled_images.items():
+            meta = ""
+            # For idx > 1, the image is the end frame of beat idx - 1
+            if idx > 1 and (idx - 2) < len(beat_ladder):
+                beat = beat_ladder[idx - 2]
+                if beat.get('bridge_stage') in (1, 2):
+                    meta = "BRIDGE"
+            formatted_images[idx] = {"body": img, "meta": meta}
+
+        formatted_videos = {}
+        for idx, vid in compiled_videos.items():
+            meta = ""
+            if (idx - 1) < len(beat_ladder):
+                beat = beat_ladder[idx - 1]
+                if beat.get('bridge_stage') in (1, 2):
+                    meta = "BRIDGE"
+            formatted_videos[idx] = {"body": vid, "meta": meta}
+
+        reassembled_prompts_block = _format_prompt_block(formatted_images, formatted_videos)
+
+        # Run validator LLM to check and repair in place, and re-process the repaired slots
+        repaired_block, repair_md = validate_and_repair(
+            config, parsed_brief, reassembled_prompts_block,
+            packet=packet, beat_ladder=beat_ladder, on_progress=on_progress
+        )
+        reassembled_prompts_block = repaired_block
 
         audit_system = """You are a construction sequence and prompt quality auditor.
 Your job is to analyze the complete, reassembled IMAGE and VIDEO prompt set and output a quality audit report.
@@ -2389,6 +2488,8 @@ Please generate the detailed quality audit table."""
 ===PROMPTS===
 {reassembled_prompts_block}
 ===AUDIT===
+{repair_md}
+
 {audit_md_cleaned}{skipped_str}"""
 
     return final_output
@@ -2445,7 +2546,7 @@ Output EXACTLY these two sections, in THIS order, nothing before or after, no co
 <If and ONLY IF you changed something, output the COMPLETE corrected prompt set here. If you changed nothing, output exactly the single word: UNCHANGED>"""
 
 
-def validate_and_repair(config, dimensions, prompt_block, on_progress=None):
+def validate_and_repair(config, dimensions, prompt_block, packet=None, beat_ladder=None, on_progress=None):
     """Second pass: enforce construction order + physical causality + scene consistency (SCUP) and repair in place.
     Returns (repaired_prompt_block, repair_md). Best-effort — caller falls back to the
     first-pass block if this raises."""
@@ -2477,7 +2578,107 @@ def validate_and_repair(config, dimensions, prompt_block, on_progress=None):
                     new_prompts = _normalize_prompt_block(new_prompts)
                     # Guard against output truncation in the validator pass
                     if len(new_prompts) >= len(prompt_block) * 0.9:
-                        repaired = new_prompts
+                        if packet and beat_ladder:
+                            if sys.stdout:
+                                print("[DEBUG] validate_and_repair: running proactive fixes and validations on repaired prompts...")
+                            repaired_images, repaired_videos = _parse_prompt_slots(new_prompts)
+                            orig_images, orig_videos = _parse_prompt_slots(prompt_block)
+                            
+                            processed_images = {}
+                            processed_videos = {}
+                            
+                            # 1. Process IMAGE 1
+                            img_1_item = repaired_images.get(1)
+                            img_1_body = img_1_item['body'] if isinstance(img_1_item, dict) else (img_1_item or '')
+                            img_1_meta = img_1_item.get('meta', '') if isinstance(img_1_item, dict) else ''
+                            
+                            img_1_body = clean_prompt_text(img_1_body)
+                            img_1_body = fix_image_clean_frame_proactive(img_1_body)
+                            camera_dna = packet.get('camera_dna', '')
+                            if camera_dna:
+                                img_1_body = fix_camera_dna(img_1_body, camera_dna)
+                            # Apply additional proactive fixes for images on IMAGE 1
+                            img_1_body = fix_horizon_line(img_1_body)
+                            img_1_body = fix_primary_landmarks(img_1_body, packet)
+                            img_1_body = fix_camera_contradictions(img_1_body, is_bridge=False)
+                            
+                            # Validate IMAGE 1
+                            img_1_errs = check_image_clean_frame(img_1_body)
+                            img_1_errs.extend(check_grid_coordinates(img_1_body))
+                            img_1_errs.extend(check_primary_landmarks_exact_match(img_1_body, packet))
+                            img_1_errs.extend(check_nlvtr_violations(img_1_body))
+                            if "horizon line" not in img_1_body.lower():
+                                img_1_errs.append("IMAGE 1 missing 'horizon line' camera lock statement")
+                            
+                            orig_img_1_item = orig_images.get(1)
+                            orig_img_1_body = orig_img_1_item['body'] if isinstance(orig_img_1_item, dict) else (orig_img_1_item or '')
+                            orig_img_1_meta = orig_img_1_item.get('meta', '') if isinstance(orig_img_1_item, dict) else ''
+                            
+                            if not img_1_errs:
+                                processed_images[1] = {'body': img_1_body, 'meta': img_1_meta}
+                            else:
+                                if sys.stdout:
+                                    print(f"[DEBUG] Repaired IMAGE 1 failed basic validation: {img_1_errs}. Falling back to original.")
+                                processed_images[1] = {'body': orig_img_1_body, 'meta': orig_img_1_meta}
+                            
+                            # 2. Process beats 1..total_beats
+                            total_beats = len(beat_ladder)
+                            mode = dimensions.get('mode', 'Standard')
+                            
+                            for i in range(1, total_beats + 1):
+                                beat = beat_ladder[i - 1]
+                                is_last = (i == total_beats)
+                                is_threshold_or_reveal = (i == total_beats) if mode == "Reveal" else False
+                                
+                                v_item = repaired_videos.get(i)
+                                v_body = v_item['body'] if isinstance(v_item, dict) else (v_item or '')
+                                v_meta = v_item.get('meta', '') if isinstance(v_item, dict) else ''
+                                
+                                i_item = repaired_images.get(i + 1)
+                                i_body = i_item['body'] if isinstance(i_item, dict) else (i_item or '')
+                                i_meta = i_item.get('meta', '') if isinstance(i_item, dict) else ''
+                                
+                                # Apply proactive fixes
+                                v_body_fixed, i_body_fixed = apply_proactive_fixes(
+                                    i, v_body, i_body, packet, mode, is_last, is_threshold_or_reveal,
+                                    beat=beat, config=config
+                                )
+                                
+                                # Validate
+                                prev_v_str = processed_videos[i - 1]['body'] if (i > 1 and i - 1 in processed_videos) else None
+                                prev_i_str = processed_images[i]['body'] if (i > 1 and i in processed_images) else None
+                                errs = validate_beat_prompts(
+                                    i, v_body_fixed, i_body_fixed, packet, mode, is_last, is_threshold_or_reveal,
+                                    prev_v_str, prev_i_str, config=config, beat=beat, skip_llm_checks=True
+                                )
+                                if not errs:
+                                    # If cheap validations passed, run LLM validation (monotonic, delta, etc.)
+                                    errs = validate_beat_prompts(
+                                        i, v_body_fixed, i_body_fixed, packet, mode, is_last, is_threshold_or_reveal,
+                                        prev_v_str, prev_i_str, config=config, beat=beat, skip_llm_checks=False
+                                    )
+                                
+                                if not errs:
+                                    processed_videos[i] = {'body': v_body_fixed, 'meta': v_meta}
+                                    processed_images[i + 1] = {'body': i_body_fixed, 'meta': i_meta}
+                                else:
+                                    if sys.stdout:
+                                        print(f"[DEBUG] Repaired beat {i} failed basic/LLM validation: {errs}. Falling back to original.")
+                                    
+                                    orig_v_item = orig_videos.get(i)
+                                    orig_v_body = orig_v_item['body'] if isinstance(orig_v_item, dict) else (orig_v_item or '')
+                                    orig_v_meta = orig_v_item.get('meta', '') if isinstance(orig_v_item, dict) else ''
+                                    
+                                    orig_i_item = orig_images.get(i + 1)
+                                    orig_i_body = orig_i_item['body'] if isinstance(orig_i_item, dict) else (orig_i_item or '')
+                                    orig_i_meta = orig_i_item.get('meta', '') if isinstance(orig_i_item, dict) else ''
+                                    
+                                    processed_videos[i] = {'body': orig_v_body, 'meta': orig_v_meta}
+                                    processed_images[i + 1] = {'body': orig_i_body, 'meta': orig_i_meta}
+                                    
+                            repaired = _format_prompt_block(processed_images, processed_videos)
+                        else:
+                            repaired = new_prompts
                     else:
                         if sys.stdout:
                             print("[DEBUG] validate_and_repair: validator output was truncated. Discarding repaired block.")
@@ -2508,20 +2709,40 @@ def _strip_code_fences(s):
 
 
 def _parse_prompt_slots(block):
-    """Parse Chinese-labeled image/video prompt slots from a prompt block."""
+    """Parse Chinese-labeled image/video prompt slots from a prompt block,
+    preserving optional metadata annotations like [BRIDGE] attached to the labels."""
     text = _strip_code_fences(block or '')
+    
+    # Matches: "图片 8:" or "图片 8 [BRIDGE]:"
     image_matches = re.findall(
-        r'图片\s*(\d+)\s*:\s*(.*?)(?=\n图片\s*\d+\s*:|\n视频提示词|\n视频\s*\d+\s*:|\Z)',
+        r'图片\s*(\d+)(?:\s*\[(.*?)\])?\s*:\s*(.*?)(?=\n图片\s*\d+|\n视频提示词|\n视频\s*\d+|\Z)',
         text,
         re.DOTALL
     )
+    
+    # Matches: "视频 8:" or "视频 8 [BRIDGE]:"
     video_matches = re.findall(
-        r'视频\s*(\d+)\s*:\s*(.*?)(?=\n视频\s*\d+\s*:|\n图片提示词|\n图片\s*\d+\s*:|\Z)',
+        r'视频\s*(\d+)(?:\s*\[(.*?)\])?\s*:\s*(.*?)(?=\n视频\s*\d+|\n图片提示词|\n图片\s*\d+|\Z)',
         text,
         re.DOTALL
     )
-    images = {int(n): body.strip() for n, body in image_matches if body.strip()}
-    videos = {int(n): body.strip() for n, body in video_matches if body.strip()}
+    
+    images = {}
+    for n, meta, body in image_matches:
+        if body.strip():
+            images[int(n)] = {
+                'body': body.strip(),
+                'meta': meta.strip() if meta else ''
+            }
+            
+    videos = {}
+    for n, meta, body in video_matches:
+        if body.strip():
+            videos[int(n)] = {
+                'body': body.strip(),
+                'meta': meta.strip() if meta else ''
+            }
+            
     return images, videos
 
 
@@ -2534,11 +2755,19 @@ def _missing_prompt_slots(images, videos, image_range, video_range):
 def _format_prompt_block(images, videos):
     image_lines = ["图片提示词"]
     for idx in sorted(images):
-        image_lines.extend([f"图片 {idx}:", images[idx].strip(), ""])
+        item = images[idx]
+        body = item['body'] if isinstance(item, dict) else item
+        meta = item.get('meta', '') if isinstance(item, dict) else ''
+        meta_str = f" [{meta}]" if meta else ""
+        image_lines.extend([f"图片 {idx}{meta_str}:", body.strip(), ""])
 
     video_lines = ["视频提示词"]
     for idx in sorted(videos):
-        video_lines.extend([f"视频 {idx}:", videos[idx].strip(), ""])
+        item = videos[idx]
+        body = item['body'] if isinstance(item, dict) else item
+        meta = item.get('meta', '') if isinstance(item, dict) else ''
+        meta_str = f" [{meta}]" if meta else ""
+        video_lines.extend([f"视频 {idx}{meta_str}:", body.strip(), ""])
 
     return ("\n".join(image_lines).rstrip() + "\n\n" + "\n".join(video_lines).rstrip()).strip()
 

@@ -425,6 +425,10 @@ async function retrySingleVideo(slot) {
                                     retrySingleVideo(idx);
                                 });
                             }
+                        } else if (parsed.type === 'queue') {
+                            meta.textContent = parsed.data.message || '正在排队等待生成视频...';
+                        } else if (parsed.type === 'merge_skip') {
+                            meta.textContent = parsed.data.message || '由于存在失败片段，已跳过自动合并。';
                         } else if (parsed.type === 'result') {
                             manifestData = parsed.data;
                         } else if (parsed.type === 'error') {

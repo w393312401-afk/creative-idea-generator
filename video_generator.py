@@ -118,7 +118,8 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     import shutil
 
     for seq, idx in enumerate(video_items, start=1):
-        prompt = videos[idx]
+        item = videos[idx]
+        prompt = item['body'] if isinstance(item, dict) else item
         
         # Automatically map IMAGE N -> IMAGE 1 and IMAGE N+1 -> IMAGE 2
         # to match the 2-card UI in Google Labs FX (Veo)
@@ -399,7 +400,8 @@ def merge_project_videos(project_dir):
         ]
         try:
             import subprocess
-            res = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+            res = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                 encoding='utf-8', errors='replace', check=True)
             if "audio" in res.stdout.lower():
                 has_audio = True
         except Exception as probe_err:
@@ -433,8 +435,11 @@ def merge_project_videos(project_dir):
     ])
     
     print(f"[INFO] Merging {len(video_files)} videos to {output_path} (has_audio={has_audio})...")
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    
+    # encoding must be explicit: ffmpeg emits UTF-8, but Windows text-mode default is GBK,
+    # which crashes the subprocess stderr reader thread mid-merge
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         encoding='utf-8', errors='replace')
+
     try:
         os.remove(concat_list_path)
     except:
@@ -452,7 +457,8 @@ def merge_project_videos(project_dir):
                 "-of", "csv=p=0",
                 output_path
             ]
-            dur_res = subprocess.run(dur_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+            dur_res = subprocess.run(dur_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                     encoding='utf-8', errors='replace', check=True)
             duration = float(dur_res.stdout.strip())
         except Exception as dur_err:
             print(f"[DEBUG] ffprobe duration check failed: {dur_err}")

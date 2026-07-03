@@ -439,7 +439,16 @@ def _persist_data_url_image(data_url, title, prefix='cover'):
 def _extract_image_prompts(block):
     from prompt_pipeline import _parse_prompt_slots
     images, _ = _parse_prompt_slots(block)
-    return [{'index': idx, 'prompt': images[idx]} for idx in sorted(images)]
+    # _parse_prompt_slots returns {'body','meta'} dicts; unwrap so 'prompt' is always the
+    # plain prose (a dict here would leak its repr into the image-model request) and 'meta'
+    # is at the top level where generate_frame_sequence reads the BRIDGE flag.
+    items = []
+    for idx in sorted(images):
+        slot = images[idx]
+        body = slot['body'] if isinstance(slot, dict) else slot
+        meta = slot.get('meta', '') if isinstance(slot, dict) else ''
+        items.append({'index': idx, 'prompt': body, 'meta': meta})
+    return items
 
 
 def _decode_or_download_image(data_item, target_path, config):
@@ -724,7 +733,18 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
 def generate_frame_sequence(config, title, prompt_block, on_progress=None, target_sequences=None):
     from prompt_pipeline import _parse_prompt_slots, run_vlm_qa_check
     images, videos = _parse_prompt_slots(prompt_block)
-    prompts = [{'index': idx, 'prompt': images[idx]} for idx in sorted(images)]
+    
+    prompts = []
+    for idx in sorted(images):
+        item = images[idx]
+        body = item['body'] if isinstance(item, dict) else item
+        meta = item.get('meta', '') if isinstance(item, dict) else ''
+        prompts.append({
+            'index': idx,
+            'prompt': body,
+            'meta': meta
+        })
+        
     if not prompts:
         raise RuntimeError('未在 prompt_block 中找到任何 图片 N: 提示词')
 
@@ -788,6 +808,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         retries = 0
         vlm_qa_failed = False
         vlm_qa_reason = None
+        is_bridge = ('BRIDGE' in item.get('meta', '').upper())
 
         if not skip_api_call:
             use_text_generation = (seq == 1 or not previous_path or not os.path.exists(previous_path))
@@ -801,13 +822,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     _generate_text_image(config, item['prompt'], target_path)
                     lineage_degraded = False
                 else:
-                    prompt_text = item['prompt'].lower()
-                    is_camera_moving = any(kw in prompt_text for kw in [
-                        'push-in', 'push in', 'forward-pushing', 'forward pushing', 'dolly',
-                        'camera moves', 'camera relocates', 'crosses the sill', 'sill-handoff',
-                        'camera advances', 'zoom-in', 'zoom in', 'closer view'
-                    ])
-                    ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT if is_camera_moving else IMG2IMG_CONTROL_PROMPT
+                    ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT if is_bridge else IMG2IMG_CONTROL_PROMPT
                     is_fallback = _generate_image_edit(config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
                     if is_fallback:
                         lineage_degraded = True
@@ -817,35 +832,58 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     _generate_text_image(config, item['prompt'], target_path)
                     lineage_degraded = False
                 else:
-                    prompt_text = item['prompt'].lower()
-                    is_camera_moving = any(kw in prompt_text for kw in [
-                        'push-in', 'push in', 'forward-pushing', 'forward pushing', 'dolly',
-                        'camera moves', 'camera relocates', 'crosses the sill', 'sill-handoff',
-                        'camera advances', 'zoom-in', 'zoom in', 'closer view'
-                    ])
-                    ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT if is_camera_moving else IMG2IMG_CONTROL_PROMPT
+                    ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT if is_bridge else IMG2IMG_CONTROL_PROMPT
                     is_fallback = _generate_image_edit(config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
                     if is_fallback:
                         lineage_degraded = True
 
             # Run VLM visual QA check on successful edits
             if seq > 1 and not use_text_generation and os.path.exists(previous_path) and os.path.exists(target_path):
-                video_prompt = videos.get(seq - 1, "")
+                video_item = videos.get(seq - 1, "")
+                video_prompt = video_item['body'] if isinstance(video_item, dict) else video_item
                 if video_prompt:
-                    vlm_pass, vlm_reason = run_vlm_qa_check(config, previous_path, target_path, video_prompt)
+                    vlm_pass, vlm_reason = run_vlm_qa_check(config, previous_path, target_path, video_prompt, is_bridge=is_bridge)
                     if not vlm_pass:
                         if sys.stdout:
-                            print(f"[VLM QA] Beat {seq-1} (IMAGE {seq}) failed VLM check: {vlm_reason}. Retrying generation...")
+                            print(f"[VLM QA] Beat {seq-1} (IMAGE {seq}) failed VLM check: {vlm_reason}. Retrying generation with VLM feedback...")
                         # Retry generation up to 2 times
                         for retry_attempt in range(2):
                             try:
-                                is_fallback = _generate_image_edit(config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
+                                # Get corrected prompt from auxModel using VLM feedback
+                                from prompt_pipeline import fix_image_prompt_with_vlm_feedback, clean_prompt_text, fix_image_clean_frame_proactive, fix_horizon_line, fix_camera_contradictions, fix_rhma_blur, fix_camera_dna
+                                
+                                orig_prompt = item['prompt']
+                                corrected_prompt = fix_image_prompt_with_vlm_feedback(config, orig_prompt, vlm_reason)
+                                
+                                # Apply proactive fixes to the corrected prompt
+                                corrected_prompt = clean_prompt_text(corrected_prompt)
+                                corrected_prompt = fix_image_clean_frame_proactive(corrected_prompt)
+                                corrected_prompt = fix_horizon_line(corrected_prompt)
+                                corrected_prompt = fix_camera_contradictions(corrected_prompt, is_bridge=is_bridge)
+                                corrected_prompt = fix_rhma_blur(corrected_prompt, is_last=(seq == len(prompts)))
+                                
+                                # Extract camera DNA prefix from the original prompt to preserve it
+                                camera_dna = ""
+                                if ":" in orig_prompt:
+                                    parts = orig_prompt.split(":", 1)
+                                    if any(kw in parts[0].lower() for kw in ['tripod', 'camera', 'shot', 'height', 'view']):
+                                        camera_dna = parts[0] + ":"
+                                
+                                if camera_dna:
+                                    corrected_prompt = fix_camera_dna(corrected_prompt, camera_dna)
+                                
+                                if sys.stdout:
+                                    print(f"[VLM QA] Attempt {retry_attempt+1} corrected prompt: {corrected_prompt}")
+                                
+                                is_fallback = _generate_image_edit(config, corrected_prompt, previous_path, target_path, control_prompt=ctrl_prompt)
                                 if is_fallback:
                                     lineage_degraded = True
-                                vlm_pass, vlm_reason = run_vlm_qa_check(config, previous_path, target_path, video_prompt)
+                                vlm_pass, vlm_reason = run_vlm_qa_check(config, previous_path, target_path, video_prompt, is_bridge=is_bridge)
                                 if vlm_pass:
                                     if sys.stdout:
                                         print(f"[VLM QA] Beat {seq-1} passed VLM check on retry {retry_attempt+1}!")
+                                    # Update the prompt in our active prompts list so it writes back to manifest!
+                                    item['prompt'] = corrected_prompt
                                     break
                                 else:
                                     if sys.stdout:
@@ -887,6 +925,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             'file': rel_path,
             'url': '/' + rel_path,
             'prompt': item['prompt'],
+            'meta': item.get('meta', ''),
             'reference': os.path.relpath(reference, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/') if reference else None,
             'model': model,
             'aspect_ratio': config.get('imageAspectRatio') or '9:16',

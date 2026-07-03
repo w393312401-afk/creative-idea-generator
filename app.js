@@ -1089,6 +1089,7 @@ async function renderTasks() {
             let footerButtons = '';
             let progressHtml = '';
             let errorHtml = '';
+            let tokenInfoHtml = '';
             
             if (task.status === 'running') {
                 statusLabel = '运行中';
@@ -1154,6 +1155,14 @@ async function renderTasks() {
             } else if (task.status === 'completed') {
                 statusLabel = '已完成';
                 statusClass = 'completed';
+                if (task.result && task.result.token_usage) {
+                    const usage = task.result.token_usage;
+                    tokenInfoHtml = `
+                        <div class="task-token-info" style="font-size: 11px; color: var(--text-secondary, #94a3b8); margin-top: 8px; font-family: var(--font-mono, monospace);">
+                            Tokens: ${usage.total_tokens} (I:${usage.prompt_tokens} O:${usage.completion_tokens}) | Calls: ${usage.api_calls}
+                        </div>
+                    `;
+                }
                 footerButtons = `
                     <button class="task-action-btn view" onclick="loadCompletedTask('${task.id}')">查看</button>
                     <button class="task-action-btn delete" onclick="deleteTask('${task.id}', event)">删除</button>
@@ -1186,6 +1195,7 @@ async function renderTasks() {
                         </div>
                         <span class="task-status-badge ${statusClass}">${escapeHtml(statusLabel)}</span>
                     </div>
+                    ${tokenInfoHtml}
                     ${progressHtml}
                     ${errorHtml}
                     <div class="task-card-footer">
@@ -2272,6 +2282,10 @@ async function streamVideosProgress(taskId) {
                                     retrySingleVideo(idx);
                                 });
                             }
+                        } else if (parsed.type === 'queue') {
+                            meta.textContent = parsed.data.message || '正在排队等待生成视频...';
+                        } else if (parsed.type === 'merge_skip') {
+                            meta.textContent = parsed.data.message || '由于存在失败片段，已跳过自动合并。';
                         } else if (parsed.type === 'merge_start') {
                             meta.textContent = '正在自动合并并加速视频 (2x Speed)...';
                         } else if (parsed.type === 'merge_done') {
@@ -2884,6 +2898,18 @@ async function generateVideos() {
     if (!currentIdea.frameRun || !currentIdea.frameRun.frames || currentIdea.frameRun.frames.length === 0) {
         showToast("请先生成帧序列图！", "error");
         return;
+    }
+
+    // Check for VLM QA failed frames
+    if (currentIdea.frameRun && currentIdea.frameRun.frames) {
+        const failedFrames = currentIdea.frameRun.frames.filter(f => f.quality_gate === 'vlm_qa_failed');
+        if (failedFrames.length > 0) {
+            const frameSeqs = failedFrames.map(f => f.sequence).join(', ');
+            const confirmed = await customConfirm(`⚠️ 警告：检测到第 ${frameSeqs} 帧未能通过 VLM 图像质检（VLM 失败）。\n\n如果强行生成视频，对应的视频分段可能存在跳变、无动作或动作不一致的缺陷。\n\n确定要强制继续生成视频吗？`);
+            if (!confirmed) {
+                return;
+            }
+        }
     }
 
     const btn = document.getElementById('generate-videos-btn');
