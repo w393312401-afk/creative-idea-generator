@@ -256,6 +256,26 @@ function loadConfig() {
         imageModelSelect.value = currentImgModel;
     }
 
+    // Load frame sequence backend + Google FX image model options
+    const imageBackendSelect = document.getElementById('settings-image-backend');
+    if (imageBackendSelect) {
+        imageBackendSelect.value = config.imageBackend || 'api';
+        imageBackendSelect.onchange = updateFxImageModelVisibility;
+    }
+    const fxImageModelSelect = document.getElementById('settings-fx-image-model');
+    if (fxImageModelSelect) {
+        fxImageModelSelect.value = config.googleFxImageModel || 'Nano Banana 2';
+    }
+    const fxVideoModelSelect = document.getElementById('settings-fx-video-model');
+    if (fxVideoModelSelect) {
+        fxVideoModelSelect.value = config.videoModel || 'Veo 3.1 - Lite [Lower Priority]';
+    }
+    const fxIpRotateRequestsInput = document.getElementById('settings-fx-ip-rotate-requests');
+    if (fxIpRotateRequestsInput) {
+        fxIpRotateRequestsInput.value = config.googleFxIpRotateRequests !== undefined ? config.googleFxIpRotateRequests : 5;
+    }
+    updateFxImageModelVisibility();
+
     // Load aspect ratio option
     const imageRatioSelect = document.getElementById('settings-image-ratio');
     if (imageRatioSelect) {
@@ -268,43 +288,20 @@ function loadConfig() {
         imageQualitySelect.value = config.imageQuality || '2K';
     }
 
-    // Initialize GPT port selector value based on config.baseUrl
-    const gptPortSelect = document.getElementById('settings-gpt-port');
-    if (gptPortSelect) {
-        let currentPort = '65038'; // default
-        try {
-            const match = config.baseUrl.match(/:(\d+)/);
-            if (match) {
-                currentPort = match[1];
-            }
-        } catch (e) {}
-        
-        let portOptionExists = false;
-        for (let i = 0; i < gptPortSelect.options.length; i++) {
-            if (gptPortSelect.options[i].value === currentPort) {
-                portOptionExists = true;
-                break;
-            }
-        }
-        if (!portOptionExists) {
-            const opt = document.createElement('option');
-            opt.value = currentPort;
-            opt.textContent = `${currentPort} (自定义)`;
-            gptPortSelect.appendChild(opt);
-        }
-        gptPortSelect.value = currentPort;
-    }
-    
-    updateGptPortVisibility();
+    // 端口已永久固定（应用 8085 / 代理 8046，gpt-5.5 由服务端 resolve_gateway 固定路由），
+    // 原「GPT 代理端口」选择器已移除，防止端口漂移。
     updateCoverModelDisplay();
 }
 
-function updateGptPortVisibility() {
-    const modelSelect = document.getElementById('settings-model');
-    const gptPortGroup = document.getElementById('gpt-port-group');
-    if (modelSelect && gptPortGroup) {
-        gptPortGroup.style.display = modelSelect.value === 'gpt-5.5' ? 'block' : 'none';
-    }
+function updateFxImageModelVisibility() {
+    const backendSelect = document.getElementById('settings-image-backend');
+    const fxImageGroup = document.getElementById('fx-image-model-group');
+    const fxVideoGroup = document.getElementById('fx-video-model-group');
+    const fxIpGroup = document.getElementById('fx-ip-rotate-requests-group');
+    const showFx = backendSelect && backendSelect.value === 'google_fx';
+    if (fxImageGroup) fxImageGroup.style.display = showFx ? 'block' : 'none';
+    if (fxVideoGroup) fxVideoGroup.style.display = showFx ? 'block' : 'none';
+    if (fxIpGroup) fxIpGroup.style.display = showFx ? 'block' : 'none';
 }
 
 function saveConfig() {
@@ -312,9 +309,26 @@ function saveConfig() {
     config.apiKey = document.getElementById('settings-api-key').value.trim();
     config.model = document.getElementById('settings-model').value.trim();
     config.imageModel = document.getElementById('settings-image-model').value.trim();
+    const imageBackendSelect = document.getElementById('settings-image-backend');
+    if (imageBackendSelect) {
+        config.imageBackend = imageBackendSelect.value;
+    }
+    const fxImageModelSelect = document.getElementById('settings-fx-image-model');
+    if (fxImageModelSelect) {
+        config.googleFxImageModel = fxImageModelSelect.value;
+    }
+    const fxVideoModelSelect = document.getElementById('settings-fx-video-model');
+    if (fxVideoModelSelect) {
+        config.videoModel = fxVideoModelSelect.value;
+    }
+    const fxIpRotateRequestsInput = document.getElementById('settings-fx-ip-rotate-requests');
+    if (fxIpRotateRequestsInput) {
+        const val = parseInt(fxIpRotateRequestsInput.value.trim(), 10);
+        config.googleFxIpRotateRequests = isNaN(val) ? 5 : val;
+    }
     config.imageAspectRatio = document.getElementById('settings-image-ratio').value.trim();
     config.imageQuality = document.getElementById('settings-image-quality').value.trim();
-    
+
     localStorage.setItem('spark_config', JSON.stringify(config));
     updateCoverModelDisplay();
     showToast("API 配置保存成功！", "success");
@@ -328,9 +342,25 @@ function resetConfig() {
     // Update the image model options list back to default options first
     updateImageModelOptions(false);
     document.getElementById('settings-image-model').value = DEFAULT_CONFIG.imageModel;
+    const imageBackendSelect = document.getElementById('settings-image-backend');
+    if (imageBackendSelect) {
+        imageBackendSelect.value = DEFAULT_CONFIG.imageBackend;
+    }
+    const fxImageModelSelect = document.getElementById('settings-fx-image-model');
+    if (fxImageModelSelect) {
+        fxImageModelSelect.value = DEFAULT_CONFIG.googleFxImageModel;
+    }
+    const fxVideoModelSelect = document.getElementById('settings-fx-video-model');
+    if (fxVideoModelSelect) {
+        fxVideoModelSelect.value = DEFAULT_CONFIG.videoModel;
+    }
+    const fxIpRotateRequestsInput = document.getElementById('settings-fx-ip-rotate-requests');
+    if (fxIpRotateRequestsInput) {
+        fxIpRotateRequestsInput.value = DEFAULT_CONFIG.googleFxIpRotateRequests;
+    }
     document.getElementById('settings-image-ratio').value = DEFAULT_CONFIG.imageAspectRatio;
     document.getElementById('settings-image-quality').value = DEFAULT_CONFIG.imageQuality;
-    updateGptPortVisibility();
+    updateFxImageModelVisibility();
 }
 
 function updateCoverModelDisplay() {

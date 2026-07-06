@@ -167,6 +167,8 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
         from prompt_pipeline import start_accounting, stop_and_get_accounting
         start_accounting()
         def progress_cb(stage, details):
+            if stage == 'cancel_check':
+                return t["cancel_event"].is_set()
             with ACTIVE_TASKS_LOCK:
                 t["events"].append((stage, details))
             notify_listeners(task_id, stage, details)
@@ -185,6 +187,22 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
             t["result"] = result
             t["events"].append(('result', result))
         notify_listeners(task_id, 'result', result)
+    except ConnectionError:
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "cancelled"
+            t["error"] = "用户取消了帧序列生成"
+            t["events"].append(('error', {'message': '用户取消了帧序列生成'}))
+        notify_listeners(task_id, 'error', {'message': '用户取消了帧序列生成'})
+        try:
+            adspower_path = SERVER_CONFIG.get('adspowerPath') or 'C:\\Users\\video\\Desktop\\N8N-main\\Adspower\\AI\\core'
+            if adspower_path not in sys.path:
+                sys.path.append(adspower_path)
+            from utils.browser import stop_ads_browser
+            user_id = config.get('userId')
+            port = config.get('port')
+            stop_ads_browser(user_id=user_id, port=port)
+        except Exception:
+            pass
     except Exception as e:
         if sys.stdout:
             import traceback
@@ -206,6 +224,8 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
         from prompt_pipeline import start_accounting, stop_and_get_accounting
         start_accounting()
         def progress_cb(stage, details):
+            if stage == 'cancel_check':
+                return t["cancel_event"].is_set()
             with ACTIVE_TASKS_LOCK:
                 t["events"].append((stage, details))
             notify_listeners(task_id, stage, details)
@@ -269,6 +289,22 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
             t["result"] = result
             t["events"].append(('result', result))
         notify_listeners(task_id, 'result', result)
+    except ConnectionError:
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "cancelled"
+            t["error"] = "用户取消了视频生成"
+            t["events"].append(('error', {'message': '用户取消了视频生成'}))
+        notify_listeners(task_id, 'error', {'message': '用户取消了视频生成'})
+        try:
+            adspower_path = SERVER_CONFIG.get('adspowerPath') or 'C:\\Users\\video\\Desktop\\N8N-main\\Adspower\\AI\\core'
+            if adspower_path not in sys.path:
+                sys.path.append(adspower_path)
+            from utils.browser import stop_ads_browser
+            user_id = config.get('userId')
+            port = config.get('port')
+            stop_ads_browser(user_id=user_id, port=port)
+        except Exception:
+            pass
     except Exception as e:
         if sys.stdout:
             import traceback
@@ -351,8 +387,18 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
         
         if sys.stdout:
             print(f"[DEBUG] Generating cover image via _generate_text_image to {target_path}...")
-        
-        _generate_text_image(config, image_prompt, target_path)
+
+        try:
+            _generate_text_image(config, image_prompt, target_path)
+        except QuotaExhaustedError:
+            fallback_model = config.get('imageEditFallbackModel') or config.get('fallbackImageModel')
+            if not fallback_model:
+                raise
+            if sys.stdout:
+                print(f"[COVER] Quota exhausted on primary model. Retrying cover with fallback model: {fallback_model}")
+            fallback_config = dict(config)
+            fallback_config['imageModel'] = fallback_model
+            _generate_text_image(fallback_config, image_prompt, target_path)
         
         rel_path = os.path.relpath(target_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
         image_content = '/' + rel_path
@@ -831,6 +877,24 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 task_id = body.get('task_id')
                 if task_id and task_id in ACTIVE_TASKS:
                     ACTIVE_TASKS[task_id]["cancel_event"].set()
+                    
+                    # Cancel any active Google FX Playwright UI generation
+                    import builtins
+                    builtins.google_fx_cancelled = True
+                    
+                    # Stop AdsPower browser to ensure it's freed and stopped
+                    try:
+                        adspower_path = SERVER_CONFIG.get('adspowerPath') or 'C:\\Users\\video\\Desktop\\N8N-main\\Adspower\\AI\\core'
+                        if adspower_path not in sys.path:
+                            sys.path.append(adspower_path)
+                        from utils.browser import stop_ads_browser
+                        dimensions = ACTIVE_TASKS[task_id].get("dimensions") or {}
+                        user_id = dimensions.get("userId")
+                        port = dimensions.get("port")
+                        stop_ads_browser(user_id=user_id, port=port)
+                    except Exception as browser_err:
+                        if sys.stdout:
+                            print(f"[CANCEL] Failed to stop AdsPower browser: {browser_err}")
                 self._send_json({'status': 'ok'})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)

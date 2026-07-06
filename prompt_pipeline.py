@@ -74,6 +74,20 @@ def _slice_between(text, start_marker, end_marker):
     return text[start:end]
 
 
+def _aux_model(config):
+    """Return the low-cost model for mechanical parsing/audit tasks.
+    Defaults to gemini-2.5-flash if the main model is gemini-3-flash-agent."""
+    if not isinstance(config, dict):
+        return 'gemini-2.5-flash'
+    explicit = (config.get('cheapModel') or config.get('auxModel') or '').strip()
+    if explicit:
+        return explicit
+    main_model = (config.get('model') or '').strip()
+    if 'agent' in main_model.lower() or not main_model:
+        return 'gemini-2.5-flash'
+    return main_model
+
+
 def load_skill_contract():
     """Read the live SKILL.md + prompt-templates.md and assemble the authoritative
     composition contract. Reading at request time keeps the shell in sync with the skill."""
@@ -424,9 +438,9 @@ def fix_image_prompt_with_vlm_feedback(config, original_prompt, vlm_reason):
     try:
         response = _chat(
             config, system_prompt, user_prompt,
-            temperature=0.3, timeout=60, model=config.get('auxModel') or config.get('model')
+            temperature=0.3, timeout=60, model=_aux_model(config)
         )
-        return _strip_code_fences(response).strip()
+        return _strip_markdown_fences_only(response).strip()
     except Exception as e:
         if sys.stdout:
             print(f"[DEBUG] fix_image_prompt_with_vlm_feedback failed: {e}")
@@ -1047,7 +1061,7 @@ def compress_prompt_to_budget(prompt, target_max_words, config, is_video=True):
 Your job is to compress the given VIDEO prompt to be under {target_max_words} words.
 CRITICAL CONSTRAINTS:
 1. You MUST preserve the beginning of the prompt (specifically: 'Use the provided first frame and last frame as exact composition anchors. Use IMAGE X as the actual first-frame image and IMAGE Y as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout.', camera DNA descriptions).
-2. You MUST preserve the end of the prompt (specifically: worker entry/exit actions at t=0s and t=7.5s, persistent trace descriptions, and sound effects/ambient noise).
+2. You MUST preserve the actual end of the prompt (specifically: the actual worker entry/exit sentences, actual persistent trace descriptions, and actual sound effects/ambient noise sentences from the input). Do NOT copy these instruction descriptions literally; preserve the original concrete sentences describing them.
 3. Do NOT lose the core action being performed.
 4. Reduce word count by pruning redundant adjectives, repetitive descriptions, and overly wordy details in the middle of the prompt.
 5. The final output must be exactly under {target_max_words} words, and contain ONLY the compressed prompt prose. No labels, no quotes, no conversational filler."""
@@ -1066,9 +1080,9 @@ CRITICAL CONSTRAINTS:
 
     user_prompt = f"Original Prompt ({len(words)} words):\n{prompt}"
     try:
-        model = config.get('auxModel') or config.get('model') or 'gemini-3-flash-agent'
+        model = _aux_model(config)
         compressed = _chat(config, system_prompt, user_prompt, temperature=0.1, timeout=30, model=model).strip()
-        compressed = _strip_code_fences(compressed).strip()
+        compressed = _strip_markdown_fences_only(compressed).strip()
         compressed = clean_prompt_text(compressed)
         compressed_words = compressed.split()
         if len(compressed_words) > 0 and len(compressed_words) < len(words):
@@ -1086,9 +1100,9 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
     image_prompt = clean_prompt_text(image_prompt)
     video_prompt = clean_prompt_text(video_prompt)
     
-    # 2. Compress first with a slightly lower target budget to leave room for post-compression proactive additions
-    image_prompt = compress_prompt_to_budget(image_prompt, 120, config, is_video=False)
-    video_prompt = compress_prompt_to_budget(video_prompt, 110, config, is_video=True)
+    # 2. Compress first with a lower target budget to leave room for post-compression proactive additions
+    image_prompt = compress_prompt_to_budget(image_prompt, 100, config, is_video=False)
+    video_prompt = compress_prompt_to_budget(video_prompt, 70, config, is_video=True)
     
     # 3. Apply proactive fixes post-compression to guarantee mandatory quality requirements
     image_prompt = fix_image_clean_frame_proactive(image_prompt)
@@ -1418,6 +1432,39 @@ def check_lighting_phase_ladder_monotonicity(ladder):
     phases = ["ambient only", "temporary work light active", "fixture install in progress", "partial practical activation", "final practical stabilization"]
     phase_to_val = {p: idx for idx, p in enumerate(phases)}
     
+    # Auto-heal keys and values of the ladder dict in-place
+    healed_ladder = {}
+    for k, v in list(ladder.items()):
+        # Try to extract the integer from key, e.g. "IMAGE 1" -> "1"
+        try:
+            match = re.search(r'\d+', str(k))
+            if match:
+                new_k = str(match.group(0))
+            else:
+                new_k = str(k)
+        except Exception:
+            new_k = str(k)
+            
+        # Try to map value to allowed phases
+        val_str = str(v).lower()
+        new_v = v
+        if 'ambient' in val_str or 'natural' in val_str or 'dawn' in val_str or 'dusk' in val_str:
+            new_v = "ambient only"
+        elif 'work light' in val_str or 'temporary' in val_str:
+            new_v = "temporary work light active"
+        elif 'fixture install' in val_str or 'wiring' in val_str or 'rough-in' in val_str or 'install' in val_str:
+            new_v = "fixture install in progress"
+        elif 'partial' in val_str or 'activation' in val_str:
+            new_v = "partial practical activation"
+        elif 'final' in val_str or 'stabilization' in val_str or 'glow' in val_str or 'stable' in val_str:
+            new_v = "final practical stabilization"
+            
+        healed_ladder[new_k] = new_v
+        
+    # Replace in-place so the cached/saved packet is also healed
+    ladder.clear()
+    ladder.update(healed_ladder)
+    
     try:
         sorted_keys = sorted([int(k) for k in ladder.keys()])
     except Exception as e:
@@ -1499,7 +1546,7 @@ IMAGE i+1 (New State):
 {current_image}"""
 
     try:
-        response = _chat(config, system_prompt, user_prompt, temperature=0.1, timeout=30, model=config.get('auxModel'))
+        response = _chat(config, system_prompt, user_prompt, temperature=0.1, timeout=30, model=_aux_model(config))
         response_clean = response.strip()
         if response_clean.upper() == "PASS" or "PASS" in response_clean.upper()[:10]:
             return []
@@ -1531,7 +1578,7 @@ IMAGE i+1 (New State):
 {current_image}"""
 
     try:
-        response = _chat(config, system_prompt, user_prompt, temperature=0.1, timeout=30, model=config.get('auxModel'))
+        response = _chat(config, system_prompt, user_prompt, temperature=0.1, timeout=30, model=_aux_model(config))
         response_clean = response.strip()
         if response_clean.upper() == "PASS" or "PASS" in response_clean.upper()[:10]:
             return []
@@ -1621,7 +1668,7 @@ IMAGE Prompt:
 {image_prompt}"""
 
     try:
-        response = _chat(config, system_prompt, user_prompt, temperature=0.1, timeout=30, model=config.get('auxModel'))
+        response = _chat(config, system_prompt, user_prompt, temperature=0.1, timeout=30, model=_aux_model(config))
         response_clean = _strip_code_fences(response).strip()
         new_items = json.loads(response_clean)
         if isinstance(new_items, list):
@@ -1658,7 +1705,7 @@ Example output:
 Do not include any code fences, markdown, or other text."""
 
     try:
-        response = _chat(config, system_prompt, audit_md, temperature=0.1, timeout=30, model=config.get('auxModel'))
+        response = _chat(config, system_prompt, audit_md, temperature=0.1, timeout=30, model=_aux_model(config))
         response_clean = _strip_code_fences(response).strip()
         failures = json.loads(response_clean)
         if isinstance(failures, dict):
@@ -1768,7 +1815,7 @@ Proposed Beat Ladder:
 {beats_desc}"""
 
     try:
-        response = _chat(config, system_prompt, user_prompt, temperature=0.1, timeout=30, model=config.get('auxModel'))
+        response = _chat(config, system_prompt, user_prompt, temperature=0.1, timeout=30, model=_aux_model(config))
         response_clean = response.strip()
         if response_clean.upper() == "PASS" or "PASS" in response_clean.upper()[:10]:
             return []
@@ -2130,7 +2177,7 @@ Hard Rules:
     for attempt in range(3):
         try:
             image_1_prompt = _chat(config, image_1_system, image_1_user, temperature=0.8, timeout=60)
-            image_1_prompt = _strip_code_fences(image_1_prompt).strip()
+            image_1_prompt = _strip_markdown_fences_only(image_1_prompt).strip()
             image_1_prompt = clean_prompt_text(image_1_prompt)
             image_1_prompt = fix_image_clean_frame_proactive(image_1_prompt)
             camera_dna = packet.get('camera_dna', '')
@@ -2171,7 +2218,12 @@ Hard Rules:
             if sys.stdout:
                 print(f"[AUDIT] Initial pass: Generating all {total_beats} beats...")
         else:
-            beats_to_generate = sorted([int(k) for k in audit_feedback_dict.keys() if k.isdigit()])
+            raw_beats = sorted([int(k) for k in audit_feedback_dict.keys() if k.isdigit()])
+            beats_to_generate = [b for b in raw_beats if 1 <= b <= total_beats]
+            out_of_range = [b for b in raw_beats if b not in beats_to_generate]
+            if out_of_range and sys.stdout:
+                print(f"[AUDIT] Ignoring out-of-range beat indices from audit feedback: {out_of_range} "
+                      f"(valid range is 1-{total_beats}; likely the audit LLM referenced an IMAGE index instead of a beat index)")
             if sys.stdout:
                 print(f"[AUDIT] Self-healing pass: Regenerating only failed beats: {beats_to_generate}...")
 
@@ -2242,7 +2294,7 @@ Instructions:
 - VIDEO {i} must end with a PERSISTENT-TRACES clause naming the marks this beat leaves behind (e.g. scrape grooves, end-grain circles, screw heads, nail rows, sawdust trails, trimmed edges, compression tracks), followed by a natural-language description of both the near-field diegetic sound effects (2-4 specific sounds of tools, materials, or footsteps) and the steady room/environment ambient noise. Use varied phrasing for these audio descriptions rather than a single formulaic structure.
 - IMAGE {i+1} must be a clean frame with ZERO workers/machinery. Do NOT use the words 'worker', 'builder', 'carpenter', 'laborer', 'person', 'man', 'woman', or 'people' under any circumstances, even to state that they are absent or not present. Describe only static objects, surfaces, and traces. It must RESTATE the locked anchors by name and Grid cell exactly as given in the packet primary_landmarks (e.g. "Locked anchors: <name> at Grid A2, <name> at Grid B2, <name> at Grid C2"), restate the left/right/top/bottom boundaries from the packet frame_boundaries, and then describe the visible state delta of this beat plus a FEW (2-3, not exhaustive) PERSISTENT physical traces that prove the work happened (scrape marks, fastener heads, sawdust, membrane wrinkles, displaced soil, etc.). Prior MAJOR installed/finished features (panels, walls, floors, fixtures, primary landmarks) stay present and unchanged (monotonic state) — but you do NOT need to re-list every minor trace from every earlier beat; it is fine and expected for small cosmetic details to fade from the description as new ones accumulate.
 - For threshold bridge beats (if beat is a threshold bridge), follow the TBCP rules (Bridge-1 stops at sill, Bridge-2 crosses sill; soft exposure roll; door-frame wipe).
-- NLVTR visual-only rule: No '%' symbols, no numeric ranges, no acronyms (HAL, SCUP, NGCS, VMFP, RCE, GCTR, RPL, etc.) in the prompts.
+- NLVTR visual-only rule: No '%' symbols, no numeric ranges, no acronyms (HAL, SCUP, NGCS, VMFP, RCE, GCTR, RPL, OSPL, RHMA, PBISP, HCL, NLVTR, MTAL, TSPA) in the prompts.
 - FULL-ENCLOSURE COVERAGE: When the beat involves framing, insulating, paneling, or painting walls, the IMAGE prompt MUST explicitly include the ceiling/roof/top surface as well. For example, if walls in Grid B1, B3, C1, C3 are paneled, the ceiling curve in Grid A1, A2, A3 must ALSO be described as paneled. Never treat wall coverage as complete without ceiling coverage in any enclosed space (cabin, room, fuselage, container, vault, etc.).
 - CAMERA VIEWPOINT CONTINUITY: If the previous IMAGE was shot from an interior viewpoint (camera inside the space, entry behind camera), the next IMAGE MUST maintain the same interior viewpoint UNLESS an explicit camera-pullback VIDEO is inserted between them. You CANNOT jump from interior to exterior viewpoint without a transition. If the beat requires switching back to an exterior view, generate the VIDEO as a reverse dolly pulling back through the doorway, and describe the exposure transition accordingly.
 - EXTERIOR WORK VISIBILITY: If the beat involves work on the EXTERIOR surface of the structure (e.g., exterior insulation, exterior membrane), and the camera is positioned INSIDE looking out, the VIDEO must show the worker operating at the boundary edges visible from inside (e.g., working at seam lines visible in Grid B1/B3 from the interior). Do not describe exterior work that would be invisible from the current camera position.
@@ -2460,7 +2512,7 @@ Please generate the detailed quality audit table."""
                 if sys.stdout:
                     print(f"[DEBUG] Pass 3 Exception: {e}")
 
-        audit_md_cleaned = _strip_code_fences(audit_md)
+        audit_md_cleaned = _strip_markdown_fences_only(audit_md)
 
         # Parse failures from the audit table
         failures = parse_audit_failures(config, audit_md_cleaned)
@@ -2480,6 +2532,22 @@ Please generate the detailed quality audit table."""
 
     skipped = config.get('_skipped_checks', 0) if isinstance(config, dict) else 0
     skipped_str = f"\n\n[WARNING] 本次跳过了 {skipped} 项校验。" if skipped > 0 else ""
+
+    # Safety net: the validator/audit LLM calls above process reassembled_prompts_block
+    # through free-form text generation, which can silently truncate or drop slots.
+    # compiled_images/compiled_videos are the verified-complete source of truth (every
+    # beat unconditionally writes both an image and video entry), so re-check the final
+    # block against them and rebuild from source if anything went missing rather than
+    # shipping a partial prompt set.
+    check_images, check_videos = _parse_prompt_slots(reassembled_prompts_block)
+    missing_images, missing_videos = _missing_prompt_slots(
+        check_images, check_videos, (1, total_beats + 1), (1, total_beats)
+    )
+    if missing_images or missing_videos:
+        if sys.stdout:
+            print(f"[WARNING] Final prompt block was missing slots (images={missing_images}, videos={missing_videos}) "
+                  f"after validator/audit processing; rebuilding from the verified-complete compiled beat data.")
+        reassembled_prompts_block = _format_prompt_block(formatted_images, formatted_videos)
 
     final_output = f"""===TITLE===
 {title}
@@ -2573,7 +2641,7 @@ def validate_and_repair(config, dimensions, prompt_block, packet=None, beat_ladd
             repair_md = secs.get('===REPAIR===', '').strip()
             
             if repair_md:
-                new_prompts = _strip_code_fences(secs.get('===PROMPTS===', ''))
+                new_prompts = _strip_markdown_fences_only(secs.get('===PROMPTS===', ''))
                 if new_prompts and new_prompts.strip().upper() != 'UNCHANGED' and len(new_prompts) > 800:
                     new_prompts = _normalize_prompt_block(new_prompts)
                     # Guard against output truncation in the validator pass
@@ -2696,10 +2764,16 @@ def validate_and_repair(config, dimensions, prompt_block, packet=None, beat_ladd
     return repaired, last_repair_md
 
 
-def _strip_code_fences(s):
+def _strip_markdown_fences_only(s):
     """Remove a leading ```lang line and trailing ``` line if the model wrapped a
-    section in a markdown code fence (it tends to do this for the prompt block)."""
-    s = s.strip()
+    section in a markdown code fence. Unlike _strip_code_fences, this does NOT try
+    to extract an embedded JSON object/array — it is safe to use on free-form prose
+    (prompt bodies, audit markdown, repaired prompt sets) that legitimately contains
+    '[' / ']' characters (e.g. '[BRIDGE]' meta tags, 'Locked anchors: [C2, B2, A2]',
+    or 'REMOVED: [object name]' edit markers). Using the JSON-extraction variant on
+    such text slices from the first stray '[' anywhere in the string to the last ']'
+    anywhere in the string, silently discarding everything outside that span."""
+    s = (s or '').strip()
     if s.startswith('```'):
         nl = s.find('\n')
         s = s[nl + 1:] if nl != -1 else s[3:]
@@ -2708,10 +2782,44 @@ def _strip_code_fences(s):
     return s.strip()
 
 
+def _strip_code_fences(s):
+    """Remove a leading ```lang line and trailing ``` line if the model wrapped a
+    section in a markdown code fence (it tends to do this for the prompt block).
+    Also extracts the outermost JSON block/list if conversational noise is present.
+    Only use this on content expected to be JSON — see _strip_markdown_fences_only
+    for free-form prose that may legitimately contain '[' / ']' / '{' / '}'."""
+    s = s.strip()
+    if s.startswith('```'):
+        nl = s.find('\n')
+        s = s[nl + 1:] if nl != -1 else s[3:]
+    if s.rstrip().endswith('```'):
+        s = s[:s.rstrip().rfind('```')]
+    s = s.strip()
+
+    first_brace = s.find('{')
+    first_bracket = s.find('[')
+
+    start_idx = -1
+    end_char = ''
+    if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+        start_idx = first_brace
+        end_char = '}'
+    elif first_bracket != -1:
+        start_idx = first_bracket
+        end_char = ']'
+        
+    if start_idx != -1:
+        end_idx = s.rfind(end_char)
+        if end_idx != -1 and end_idx > start_idx:
+            return s[start_idx:end_idx + 1]
+            
+    return s
+
+
 def _parse_prompt_slots(block):
     """Parse Chinese-labeled image/video prompt slots from a prompt block,
     preserving optional metadata annotations like [BRIDGE] attached to the labels."""
-    text = _strip_code_fences(block or '')
+    text = _strip_markdown_fences_only(block or '')
     
     # Matches: "图片 8:" or "图片 8 [BRIDGE]:"
     image_matches = re.findall(
@@ -2775,7 +2883,7 @@ def _format_prompt_block(images, videos):
 def _normalize_prompt_block(block):
     images, videos = _parse_prompt_slots(block)
     if not images and not videos:
-        return _strip_code_fences(block or '')
+        return _strip_markdown_fences_only(block or '')
     return _format_prompt_block(images, videos)
 
 
@@ -2814,19 +2922,19 @@ def parse_sections(content):
             positions.append((match.start(), match.end(), k))
             
     if not positions:
-        out['prompt_block'] = _strip_code_fences(content)
+        out['prompt_block'] = _strip_markdown_fences_only(content)
         first_line = content.strip().splitlines()[0] if content.strip() else '未命名创意'
         out['title'] = first_line[:40]
         return out
-        
+
     positions.sort(key=lambda x: x[0])
-    
+
     for i, (start, end, key) in enumerate(positions):
         next_start = positions[i + 1][0] if i + 1 < len(positions) else len(content)
         out[key] = content[end:next_start].strip()
-        
+
     out['prompt_block'] = _normalize_prompt_block(out['prompt_block'])
-    out['audit_md'] = _strip_code_fences(out['audit_md'])
+    out['audit_md'] = _strip_markdown_fences_only(out['audit_md'])
     if not out['title']:
         out['title'] = '未命名创意'
     return out

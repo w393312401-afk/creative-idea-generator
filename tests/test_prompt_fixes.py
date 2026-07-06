@@ -1,5 +1,7 @@
 import re
+import json
 import unittest
+from unittest.mock import patch
 from prompt_pipeline import (
     fix_image_clean_frame_proactive,
     check_nlvtr_violations,
@@ -8,7 +10,12 @@ from prompt_pipeline import (
     _flatten_to_text,
     normalize_packet,
     normalize_beat_ladder,
-    check_stylistic_repetition
+    check_stylistic_repetition,
+    _aux_model,
+    check_adjacent_frame_semantics_batch,
+    _beat_chunk_size,
+    _chunk_consecutive_beats,
+    _parse_chunk_prompt_response,
 )
 from frame_generator import _extract_image_prompts
 
@@ -109,6 +116,72 @@ class TestPromptFixes(unittest.TestCase):
         self.assertTrue(fixed_partial.startswith("Use the provided first frame and last frame as exact composition anchors."))
         self.assertIn("IMAGE 2", fixed_partial)
         self.assertIn("IMAGE 3", fixed_partial)
+
+    def test_aux_model_defaults_to_low_cost_for_reasoning_agent(self):
+        self.assertEqual(_aux_model({'model': 'gemini-3-flash-agent'}), 'gemini-3.5-flash-low')
+        self.assertEqual(_aux_model({'model': 'gemini-3-flash-agent', 'cheapModel': 'cheap-json-model'}), 'cheap-json-model')
+        self.assertEqual(_aux_model({'model': 'gpt-5.5'}), 'gpt-5.5')
+
+    def test_beat_chunk_size_bounds_config(self):
+        self.assertEqual(_beat_chunk_size({}), 4)
+        self.assertEqual(_beat_chunk_size({'beatChunkSize': 1}), 1)
+        self.assertEqual(_beat_chunk_size({'beatChunkSize': 9}), 5)
+        self.assertEqual(_beat_chunk_size({'promptChunkSize': '3'}), 3)
+        self.assertEqual(_beat_chunk_size({'beatChunkSize': 'bad'}), 4)
+
+    def test_chunk_consecutive_beats_splits_gaps_and_size(self):
+        chunks = _chunk_consecutive_beats([1, 2, 3, 4, 5, 8, 9, 11], 4)
+        self.assertEqual(chunks, [[1, 2, 3, 4], [5], [8, 9], [11]])
+
+    def test_parse_chunk_prompt_response(self):
+        content = """===BEAT 3===
+===VIDEO===
+Video three.
+===IMAGE===
+Image four.
+===TRACES===
+[{"name": "new screw heads", "grid": "Grid B2"}]
+
+===BEAT 4===
+===VIDEO===
+Video four.
+===IMAGE===
+Image five.
+===TRACES===
+[]
+"""
+        parsed = _parse_chunk_prompt_response(content, [3, 4])
+        self.assertEqual(parsed[3]['video'], "Video three.")
+        self.assertEqual(parsed[3]['image'], "Image four.")
+        self.assertEqual(parsed[3]['traces'][0]['name'], "new screw heads")
+        self.assertEqual(parsed[4]['traces'], [])
+
+    def test_batch_adjacent_frame_semantics_maps_failures_to_beats(self):
+        fake_response = json.dumps([
+            {
+                "beat": 2,
+                "monotonic_errors": ["finished floor reverted to raw subfloor"],
+                "delta_errors": []
+            },
+            {
+                "beat": 3,
+                "monotonic_errors": [],
+                "delta_errors": ["no new construction progress"]
+            }
+        ])
+        images = {
+            1: "raw room",
+            2: "new finished floor",
+            3: "raw subfloor again",
+            4: "raw subfloor again",
+        }
+        with patch('prompt_pipeline._chat', return_value=fake_response) as mocked_chat:
+            failures = check_adjacent_frame_semantics_batch({'model': 'gemini-3-flash-agent'}, images)
+        self.assertIn(2, failures)
+        self.assertIn(3, failures)
+        self.assertIn("Monotonic state regression", failures[2][0])
+        self.assertIn("Static frame violation", failures[3][0])
+        self.assertEqual(mocked_chat.call_args.kwargs['model'], 'gemini-3.5-flash-low')
 
     def test_fix_primary_landmarks_no_replacement(self):
         from prompt_pipeline import fix_primary_landmarks

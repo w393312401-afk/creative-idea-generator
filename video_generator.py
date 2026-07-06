@@ -5,6 +5,7 @@ import time
 import shutil
 import re
 import subprocess
+import tempfile
 import threading
 
 from server_common import (
@@ -26,7 +27,314 @@ def _get_google_fx_video_service():
     return google_fx_video, models
 
 
+# ── 视频锚点帧校验 ──
+# 2026-07-04 复盘（loft 任务）：Flow 画布 tile 追踪在换 IP 重试后可能绑定到旧的重复
+# 卡片，导致下载到错误槽位的视频甚至完全无关任务的视频（实测 vid_008 下载到了一段
+# 铁路隧道视频，vid_009/vid_010 内容整体错位两个槽位）。浏览器侧无法完全杜绝，
+# 因此在下载落盘后做一次内容级校验：抽取视频首帧/尾帧与该槽位的首尾锚点图对比，
+# 不匹配的直接判失败并删除文件，防止串片/文生视频混入成片。
+# 实测同任务匹配段 MAD 在 1.5~10.3，错位段在 28+，阈值取 18。
+_ANCHOR_MAD_THRESHOLD = 18.0
+
+
+def _load_gray_thumb(path, size=(64, 114)):
+    from PIL import Image
+    import numpy as np
+    with Image.open(path) as im:
+        return np.asarray(im.convert('L').resize(size), dtype=np.float32)
+
+
+def _extract_video_frame(video_path, out_png, position):
+    """position: 'first' | 'last'。返回 True 表示抽帧成功。"""
+    if position == 'first':
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", video_path,
+               "-frames:v", "1", out_png]
+    else:
+        cmd = ["ffmpeg", "-y", "-v", "error", "-sseof", "-0.3", "-i", video_path,
+               "-frames:v", "1", "-update", "1", out_png]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding='utf-8', errors='replace', timeout=60)
+        return res.returncode == 0 and os.path.exists(out_png) and os.path.getsize(out_png) > 0
+    except Exception:
+        return False
+
+
+def verify_video_anchors(video_path, start_frame_path, end_frame_path):
+    """校验视频首帧/尾帧是否与锚点图一致。
+
+    返回 (ok: bool, reason: str)。校验环境异常（ffmpeg/PIL 不可用等）时返回
+    (True, 'skipped:...')，不拦截正常流程——该校验只用来挡住明确的串片。
+    """
+    import tempfile
+    import numpy as np
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            checks = []
+            for pos, anchor in (('first', start_frame_path), ('last', end_frame_path)):
+                if not anchor or not os.path.exists(anchor):
+                    continue
+                png = os.path.join(td, f'{pos}.png')
+                if not _extract_video_frame(video_path, png, pos):
+                    return True, f'skipped:extract_{pos}_failed'
+                mad = float(np.abs(_load_gray_thumb(png) - _load_gray_thumb(anchor)).mean())
+                checks.append((pos, mad))
+            if not checks:
+                return True, 'skipped:no_anchor'
+            bad = [(pos, mad) for pos, mad in checks if mad > _ANCHOR_MAD_THRESHOLD]
+            detail = ", ".join(f"{pos}={mad:.1f}" for pos, mad in checks)
+            if bad:
+                return False, detail
+            return True, detail
+    except Exception as e:
+        return True, f'skipped:{type(e).__name__}'
+
+
+# ════════════════════════════════════════════════════════════════════
+# 帧 → 视频 生成编排（2026-07-04 重构）
+# ════════════════════════════════════════════════════════════════════
+# 职责划分：
+#   rewrite_prompt_for_two_card_ui() —— 纯文本改写，可单测
+#   load_slot_frames()               —— manifest → 槽位帧路径/质量门映射
+#   plan_video_slots()               —— 纯决策：复用/生成/拦截，可单测
+#   _ManifestWriter                  —— manifest.videos 增量合并落盘
+#   _BatchBridge                     —— 批量脚本回调 → SPARK 进度事件 + 锚点校验拒收
+#   generate_video_sequence()        —— 瘦编排器，装配以上部件调用 AdsPower 批量脚本
+# 浏览器自动化在外部模块 google_fx_video.py（改动两侧任一文件都需重启 SPARK 进程）。
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _rel_url(abs_path):
+    rel = os.path.relpath(abs_path, _BASE_DIR).replace('\\', '/')
+    return rel, '/' + rel
+
+
+def rewrite_prompt_for_two_card_ui(prompt, slot):
+    """把提示词里的 IMAGE slot / IMAGE slot+1（含中文「图片 N」）改写为
+    IMAGE 1 / IMAGE 2，对应 Google Labs Flow 两卡位（首帧/尾帧）UI。"""
+    prompt = re.sub(rf'\bimage\s+{slot}\b', 'IMAGE 1', prompt, flags=re.IGNORECASE)
+    prompt = re.sub(rf'\bimage\s+{slot + 1}\b', 'IMAGE 2', prompt, flags=re.IGNORECASE)
+    prompt = re.sub(rf'图片\s*{slot}\b', 'IMAGE 1', prompt)
+    prompt = re.sub(rf'图片\s*{slot + 1}\b', 'IMAGE 2', prompt)
+    return prompt
+
+
+def load_slot_frames(manifest_data, frames_dir, image_count):
+    """从 manifest.frames 建立 槽位→帧绝对路径 与 槽位→质量门标记 的映射；
+    manifest 缺失/为空时按 frames/img_NNN.webp 命名约定兜底。"""
+    slot_to_path = {}
+    slot_to_quality = {}
+    for frame in (manifest_data or {}).get('frames', []):
+        try:
+            slot_to_path[frame['slot']] = os.path.join(_BASE_DIR, frame['file'].lstrip('/'))
+            slot_to_quality[frame['slot']] = frame.get('quality_gate')
+        except Exception:
+            continue
+    if not slot_to_path:
+        for i in range(1, image_count + 1):
+            guess_path = os.path.join(frames_dir, f'img_{i:03d}.webp')
+            if os.path.exists(guess_path):
+                slot_to_path[i] = os.path.abspath(guess_path)
+    return slot_to_path, slot_to_quality
+
+
+def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, target_slots=None):
+    """为每个视频槽位做生成决策。只读文件系统，不做任何写操作，可单测。
+
+    video_slots: _parse_prompt_slots 的 videos 输出（{slot: str 或 {'body':...}}）
+    target_slots: None=整单生成；列表=只处理这些槽位（显式重试）
+
+    返回按槽位升序的计划列表，每项：
+      slot / seq / prompt（已改写 IMAGE 1/2）/ dest_path
+      action: 'reuse'    —— 断点续传，直接复用已存在的 mp4
+              'generate' —— 需要提交生成
+              'blocked'  —— 前置条件不满足（缺帧/降级帧），reason 说明原因
+      start_frame / end_frame: 锚点帧绝对路径
+      delete_existing: 显式重试且旧文件存在，调用方需先删除
+    """
+    slots = sorted(video_slots.keys())
+    if target_slots is not None:
+        wanted = {int(x) for x in target_slots}
+        slots = [s for s in slots if s in wanted]
+    is_explicit_retry = target_slots is not None
+
+    plans = []
+    for seq, slot in enumerate(slots, start=1):
+        item = video_slots[slot]
+        prompt = item['body'] if isinstance(item, dict) else item
+        prompt = rewrite_prompt_for_two_card_ui(prompt, slot)
+        dest_path = os.path.join(videos_dir, f'vid_{slot:03d}.mp4')
+        plan = {
+            'slot': slot,
+            'seq': seq,
+            'prompt': prompt,
+            'dest_path': dest_path,
+            'start_frame': slot_to_path.get(slot),
+            'end_frame': slot_to_path.get(slot + 1),
+            'delete_existing': False,
+            'reason': '',
+        }
+
+        # 断点续传：非显式重试时，已存在的有效视频直接复用
+        if not is_explicit_retry and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+            plan['action'] = 'reuse'
+            plans.append(plan)
+            continue
+        if is_explicit_retry and os.path.exists(dest_path):
+            plan['delete_existing'] = True
+
+        start_p, end_p = plan['start_frame'], plan['end_frame']
+        if not start_p or not os.path.exists(start_p):
+            plan['action'] = 'blocked'
+            plan['reason'] = f"视频 {slot} 所需的起始帧 IMAGE {slot} 不存在。请重新生成该帧！"
+        elif not end_p or not os.path.exists(end_p):
+            plan['action'] = 'blocked'
+            plan['reason'] = f"视频 {slot} 所需的结束帧 IMAGE {slot + 1} 不存在。请重新生成该帧！"
+        elif slot_to_quality.get(slot) == 'i2i_fallback_degraded' \
+                or slot_to_quality.get(slot + 1) == 'i2i_fallback_degraded':
+            plan['action'] = 'blocked'
+            plan['reason'] = (
+                f"视频 {slot} 的起始帧 IMAGE {slot} 或结束帧 IMAGE {slot + 1} 属于降级帧（i2i fallback degraded），"
+                f"已拦截该段视频生成以防止画面跳变。请重新生成并修复受损帧。"
+            )
+        else:
+            plan['action'] = 'generate'
+        plans.append(plan)
+    return plans
+
+
+def _video_info(plan, video_model, status, error=None):
+    """由槽位计划生成 manifest.videos 条目。"""
+    if status == 'success':
+        rel, url = _rel_url(plan['dest_path'])
+    else:
+        rel, url = '', ''
+    info = {
+        'slot': plan['slot'],
+        'sequence': plan['seq'],
+        'file': rel,
+        'url': url,
+        'prompt': plan['prompt'],
+        'model': video_model,
+        'status': status,
+    }
+    if error:
+        info['error'] = error
+    return info
+
+
+class _ManifestWriter:
+    """manifest.json 的 videos 段增量写入：同槽位后写覆盖先写，按槽位升序排列。
+    每次 record() 立即落盘——浏览器批量任务动辄十几分钟，进度必须实时可恢复。"""
+
+    def __init__(self, manifest_path, manifest_data, all_slots):
+        self.path = manifest_path
+        self.data = manifest_data
+        self.all_slots = sorted(all_slots)
+        self.results = []  # 本次运行产生的 video_info（含失败），按发生顺序
+
+    def record(self, video_info):
+        self.results.append(video_info)
+        self.save()
+
+    def save(self):
+        by_slot = {v['slot']: v for v in self.data.get('videos', [])}
+        for v in self.results:
+            by_slot[v['slot']] = v
+        self.data['videos'] = [by_slot[s] for s in self.all_slots if s in by_slot]
+        try:
+            with open(self.path, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Warning: could not write updated manifest.json ({e})")
+
+
+class _BatchBridge:
+    """把 google_fx_video 批量脚本的回调 (batch_idx, stage, details) 翻译成 SPARK
+    进度事件并落盘 manifest。下载落盘后做锚点内容校验：视频首尾帧与该槽位锚点图
+    不符（画布串片/错误下载）时删除文件并回传 'rejected'，批量脚本据此把该任务
+    标记失败进入重试轮。"""
+
+    def __init__(self, pending, total, video_model, writer, on_progress):
+        self.pending = pending          # [{'plan':..., 'req':..., 'temp_out_dir':...}]
+        self.total = total
+        self.video_model = video_model
+        self.writer = writer
+        self.on_progress = on_progress
+
+    def _emit(self, stage, payload):
+        if self.on_progress:
+            return self.on_progress(stage, payload)
+        return None
+
+    def _fail(self, plan, message):
+        self.writer.record(_video_info(plan, self.video_model, status='failed', error=message))
+        self._emit('video_error', {
+            'index': plan['slot'], 'current': plan['seq'],
+            'total': self.total, 'message': message,
+        })
+
+    def __call__(self, batch_idx, stage, details):
+        plan = self.pending[batch_idx]['plan']
+        if stage == 'video_start':
+            self._emit('video_start', {
+                'index': plan['slot'], 'current': plan['seq'], 'total': self.total,
+            })
+        elif stage == 'video_done':
+            generated_path = (details or {}).get('video_url')
+            if not (generated_path and os.path.exists(generated_path)):
+                self._fail(plan, '生成的视频文件不存在')
+                return None
+            shutil.move(generated_path, plan['dest_path'])
+            ok, reason = verify_video_anchors(plan['dest_path'], plan['start_frame'], plan['end_frame'])
+            if not ok:
+                try:
+                    os.remove(plan['dest_path'])
+                except Exception:
+                    pass
+                self._fail(plan, (
+                    f"下载的视频内容与槽位 {plan['slot']} 的首尾锚点帧不符 (MAD {reason})，"
+                    f"疑似画布串片/错误下载，已拦截并删除。请重试该片段。"
+                ))
+                return 'rejected'  # 通知批量脚本该片段实际失败，可参与失败重试
+            info = _video_info(plan, self.video_model, status='success')
+            self.writer.record(info)
+            self._emit('video_done', {
+                'index': plan['slot'], 'current': plan['seq'],
+                'total': self.total, 'video': info,
+            })
+        elif stage == 'video_error':
+            # 单段失败隔离：记录失败状态，其余槽位继续
+            self._fail(plan, (details or {}).get('message') or '生成失败')
+        return None
+
+
+def _clear_previous_outputs(videos_dir, manifest_data):
+    """整单重跑（非重试）时清空旧视频文件与 manifest.videos，
+    防止断点续传把上一轮的旧视频当成本轮结果。"""
+    if os.path.isdir(videos_dir):
+        cleared = 0
+        for fname in os.listdir(videos_dir):
+            fpath = os.path.join(videos_dir, fname)
+            if os.path.isfile(fpath) and fname.lower().endswith('.mp4'):
+                try:
+                    os.remove(fpath)
+                    cleared += 1
+                except Exception as rm_err:
+                    print(f"Warning: could not remove old video {fpath}: {rm_err}")
+        if cleared:
+            print(f"[INFO] Cleared {cleared} old video file(s) for full regeneration.")
+    if 'videos' in manifest_data:
+        manifest_data['videos'] = []
+
+
 def generate_video_sequence(config, title, prompt_block, on_progress=None, target_slots=None):
+    import builtins
+    builtins.google_fx_cancelled = False
+    rotate_requests = config.get('googleFxIpRotateRequests')
+    if rotate_requests is not None:
+        os.environ['MIYA_ROTATE_THRESHOLD'] = str(rotate_requests)
     from prompt_pipeline import _parse_prompt_slots
     images, videos = _parse_prompt_slots(prompt_block)
     project_dir = _get_project_dir(title)
@@ -34,259 +342,78 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     videos_dir = os.path.join(project_dir, 'videos')
     os.makedirs(videos_dir, exist_ok=True)
 
-    # Load existing manifest to map slots to frame paths and quality gates
     manifest_path = os.path.join(project_dir, 'manifest.json')
-    slot_to_path = {}
-    slot_to_quality = {}
     manifest_data = {}
     if os.path.exists(manifest_path):
         try:
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 manifest_data = json.load(f)
-            for frame in manifest_data.get('frames', []):
-                slot_to_path[frame['slot']] = os.path.join(os.path.dirname(os.path.abspath(__file__)), frame['file'].lstrip('/'))
-                slot_to_quality[frame['slot']] = frame.get('quality_gate')
         except Exception as e:
             print(f"Warning: could not read manifest.json ({e})")
 
-    # If manifest doesn't exist or is empty, we can try to guess paths
-    if not slot_to_path:
-        for i in range(1, len(images) + 1):
-            guess_path = os.path.join(frames_dir, f'img_{i:03d}.webp')
-            if os.path.exists(guess_path):
-                slot_to_path[i] = os.path.abspath(guess_path)
-
+    slot_to_path, slot_to_quality = load_slot_frames(manifest_data, frames_dir, len(images))
     if not slot_to_path:
         raise RuntimeError('未找到已生成的帧图像。请先生成帧序列！')
 
-    google_fx_video, models = _get_google_fx_video_service()
+    if target_slots is None:
+        _clear_previous_outputs(videos_dir, manifest_data)
 
-    video_items = sorted(videos.keys())
-    if target_slots is not None:
-        target_slots = [int(x) for x in target_slots]
-        video_items = [idx for idx in video_items if idx in target_slots]
-    else:
-        # Full regeneration (not a retry): clear all old video files so
-        # breakpoint-resume doesn't reuse stale videos from a previous run.
-        # This ensures the UI always shows freshly generated videos.
-        if os.path.isdir(videos_dir):
-            cleared = 0
-            for fname in os.listdir(videos_dir):
-                fpath = os.path.join(videos_dir, fname)
-                if os.path.isfile(fpath) and fname.lower().endswith('.mp4'):
-                    try:
-                        os.remove(fpath)
-                        cleared += 1
-                    except Exception as rm_err:
-                        print(f"Warning: could not remove old video {fpath}: {rm_err}")
-            if cleared:
-                print(f"[INFO] Cleared {cleared} old video file(s) for full regeneration.")
-        # Also clear old video entries from manifest
-        if 'videos' in manifest_data:
-            manifest_data['videos'] = []
+    plans = plan_video_slots(videos, slot_to_path, slot_to_quality, videos_dir, target_slots)
 
     if on_progress:
         on_progress('start', {
-            'total': len(video_items),
-            'slots': video_items
+            'total': len(plans),
+            'slots': [p['slot'] for p in plans],
         })
 
-    video_results = []
-    pending_items = []
-    
-    def save_manifest_incremental():
-        existing_videos = manifest_data.get('videos', [])
-        video_map = {v['slot']: v for v in existing_videos}
-        for v in video_results:
-            video_map[v['slot']] = v
-            
-        merged_videos = []
-        for slot_idx in sorted(videos.keys()):
-            if slot_idx in video_map:
-                merged_videos.append(video_map[slot_idx])
-                
-        manifest_data['videos'] = merged_videos
-        try:
-            with open(manifest_path, 'w', encoding='utf-8') as f:
-                json.dump(manifest_data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"Warning: could not write updated manifest.json ({e})")
-    
+    google_fx_video, models = _get_google_fx_video_service()
     video_model = config.get('videoModel') or 'Veo 3.1 - Lite [Lower Priority]'
+    writer = _ManifestWriter(manifest_path, manifest_data, videos.keys())
 
-    import tempfile
-    import shutil
-
-    for seq, idx in enumerate(video_items, start=1):
-        item = videos[idx]
-        prompt = item['body'] if isinstance(item, dict) else item
-        
-        # Automatically map IMAGE N -> IMAGE 1 and IMAGE N+1 -> IMAGE 2
-        # to match the 2-card UI in Google Labs FX (Veo)
-        import re
-        prompt = re.sub(rf'\bimage\s+{idx}\b', 'IMAGE 1', prompt, flags=re.IGNORECASE)
-        prompt = re.sub(rf'\bimage\s+{idx + 1}\b', 'IMAGE 2', prompt, flags=re.IGNORECASE)
-        prompt = re.sub(rf'图片\s*{idx}\b', 'IMAGE 1', prompt)
-        prompt = re.sub(rf'图片\s*{idx + 1}\b', 'IMAGE 2', prompt)
-
-        dest_filename = f'vid_{idx:03d}.mp4'
-        dest_path = os.path.join(videos_dir, dest_filename)
-        
-        # 1. Breakpoint Resume: Check if file already exists and is valid
-        # If it is an explicit retry, we bypass this check and delete the existing file.
-        is_explicit_retry = target_slots is not None and idx in target_slots
-        if is_explicit_retry and os.path.exists(dest_path):
-            try:
-                os.remove(dest_path)
-            except Exception as e:
-                print(f"Warning: could not remove old video file {dest_path}: {e}")
-
-        if not is_explicit_retry and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-            rel_path = os.path.relpath(dest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
-            video_info = {
-                'slot': idx,
-                'sequence': seq,
-                'file': rel_path,
-                'url': '/' + rel_path,
-                'prompt': prompt,
-                'model': video_model,
-                'status': 'success'
-            }
-            video_results.append(video_info)
+    # 按计划分流：复用/拦截立即出结果，待生成的装配为批量请求
+    pending_items = []
+    for plan in plans:
+        if plan['action'] == 'reuse':
+            info = _video_info(plan, video_model, status='success')
+            writer.record(info)
             if on_progress:
                 on_progress('video_done', {
-                    'index': idx,
-                    'current': seq,
-                    'total': len(video_items),
-                    'video': video_info
+                    'index': plan['slot'], 'current': plan['seq'],
+                    'total': len(plans), 'video': info,
                 })
             continue
-
-        start_frame_path = slot_to_path.get(idx)
-        end_frame_path = slot_to_path.get(idx + 1)
-        
-        err_msg = None
-        if not start_frame_path or not os.path.exists(start_frame_path):
-            err_msg = f"视频 {idx} 所需的起始帧 IMAGE {idx} 不存在。请重新生成该帧！"
-        elif not end_frame_path or not os.path.exists(end_frame_path):
-            err_msg = f"视频 {idx} 所需的结束帧 IMAGE {idx+1} 不存在。请重新生成该帧！"
-        else:
-            start_quality = slot_to_quality.get(idx)
-            end_quality = slot_to_quality.get(idx + 1)
-            if start_quality == 'i2i_fallback_degraded' or end_quality == 'i2i_fallback_degraded':
-                err_msg = (
-                    f"视频 {idx} 的起始帧 IMAGE {idx} 或结束帧 IMAGE {idx+1} 属于降级帧（i2i fallback degraded），"
-                    f"已拦截该段视频生成以防止画面跳变。请重新生成并修复受损帧。"
-                )
-
-        if err_msg:
-            video_info = {
-                'slot': idx,
-                'sequence': seq,
-                'file': '',
-                'url': '',
-                'prompt': prompt,
-                'model': video_model,
-                'status': 'failed',
-                'error': err_msg
-            }
-            video_results.append(video_info)
-            save_manifest_incremental()
+        if plan['action'] == 'blocked':
+            writer.record(_video_info(plan, video_model, status='failed', error=plan['reason']))
             if on_progress:
                 on_progress('video_error', {
-                    'index': idx,
-                    'current': seq,
-                    'total': len(video_items),
-                    'message': err_msg
+                    'index': plan['slot'], 'current': plan['seq'],
+                    'total': len(plans), 'message': plan['reason'],
                 })
             continue
-
+        # action == 'generate'
+        if plan['delete_existing']:
+            try:
+                os.remove(plan['dest_path'])
+            except Exception as e:
+                print(f"Warning: could not remove old video file {plan['dest_path']}: {e}")
         temp_out_dir = tempfile.mkdtemp()
         req = models.VideoRequest(
-            prompt=prompt,
-            image=start_frame_path,
-            end_image=end_frame_path,
+            prompt=plan['prompt'],
+            image=plan['start_frame'],
+            end_image=plan['end_frame'],
             model=video_model,
-            ratio=config.get('imageAspectRatio') or '9:16',  # FIX ratio
+            ratio=config.get('imageAspectRatio') or '9:16',
             output_path=temp_out_dir
         )
-        pending_items.append({
-            'idx': idx,
-            'seq': seq,
-            'req': req,
-            'dest_path': dest_path,
-            'temp_out_dir': temp_out_dir,
-            'prompt': prompt
-        })
+        pending_items.append({'plan': plan, 'req': req, 'temp_out_dir': temp_out_dir})
 
     if pending_items:
-        reqs_list = [item['req'] for item in pending_items]
-        
-        def batch_progress_cb(batch_idx, stage, details):
-            if not on_progress:
-                return
-            item = pending_items[batch_idx]
-            if stage == 'video_start':
-                on_progress('video_start', {
-                    'index': item['idx'],
-                    'current': item['seq'],
-                    'total': len(video_items)
-                })
-            elif stage == 'video_done':
-                # Move the generated file to final destination
-                generated_path = details.get('video_url')
-                if generated_path and os.path.exists(generated_path):
-                    shutil.move(generated_path, item['dest_path'])
-                    rel_path = os.path.relpath(item['dest_path'], os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
-                    video_info = {
-                        'slot': item['idx'],
-                        'sequence': item['seq'],
-                        'file': rel_path,
-                        'url': '/' + rel_path,
-                        'prompt': item['prompt'],
-                        'model': video_model,
-                        'status': 'success'
-                    }
-                    video_results.append(video_info)
-                    save_manifest_incremental()
-                    on_progress('video_done', {
-                        'index': item['idx'],
-                        'current': item['seq'],
-                        'total': len(video_items),
-                        'video': video_info
-                    })
-                else:
-                    on_progress('video_error', {
-                        'index': item['idx'],
-                        'current': item['seq'],
-                        'total': len(video_items),
-                        'message': '生成的视频文件不存在'
-                    })
-            elif stage == 'video_error':
-                # Per-segment failure isolation: record failed status and continue
-                video_info = {
-                    'slot': item['idx'],
-                    'sequence': item['seq'],
-                    'file': '',
-                    'url': '',
-                    'prompt': item['prompt'],
-                    'model': video_model,
-                    'status': 'failed',
-                    'error': details.get('message') or '生成失败'
-                }
-                video_results.append(video_info)
-                save_manifest_incremental()
-                on_progress('video_error', {
-                    'index': item['idx'],
-                    'current': item['seq'],
-                    'total': len(video_items),
-                    'message': details.get('message') or '生成失败'
-                })
+        bridge = _BatchBridge(pending_items, len(plans), video_model, writer, on_progress)
 
         def cancel_check_cb():
             if on_progress:
                 try:
-                    # Trigger a dummy call to check if the connection is dead
+                    # 空探测调用：连接已死/用户已取消时返回 True
                     return on_progress('cancel_check', None)
                 except Exception:
                     return True
@@ -294,48 +421,101 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
 
         try:
             google_fx_video.generate_videos_batch_google_fx(
-                reqs_list,
-                on_progress=batch_progress_cb,
+                [it['req'] for it in pending_items],
+                on_progress=bridge,
                 cancel_check=cancel_check_cb
             )
         finally:
-            # Clean up all temp directories
-            for item in pending_items:
-                try:
-                    shutil.rmtree(item['temp_out_dir'], ignore_errors=True)
-                except:
-                    pass
+            for it in pending_items:
+                shutil.rmtree(it['temp_out_dir'], ignore_errors=True)
 
-    # Final merge and save of manifest
-    save_manifest_incremental()
-
-    manifest_data['manifest'] = '/' + os.path.relpath(manifest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+    writer.save()
+    manifest_data['manifest'] = '/' + os.path.relpath(manifest_path, _BASE_DIR).replace('\\', '/')
     manifest_data['project_dir'] = os.path.abspath(project_dir)
     return manifest_data
 
 
-def merge_project_videos(project_dir):
+def merge_project_videos(project_dir, allow_partial=False):
+    """合并项目内全部视频片段。
+
+    2026-07-04 复盘：之前失败/缺失的槽位会被静默跳过（loft 任务缺 6、7 两段仍合出了
+    成片，观感为画面硬跳/回到初始状态），且串片的片段会原样混入。现在默认执行两道门禁：
+    1) 槽位完整性 —— 依据 manifest.frames 推出应有片段数，缺失/失败即拒绝合并；
+    2) 锚点一致性 —— 每段首尾帧须与对应锚点图匹配，不匹配即拒绝合并。
+    allow_partial=True 时跳过两道门禁（用户显式确认后强制合并）。
+    """
     manifest_path = os.path.join(project_dir, 'manifest.json')
     if not os.path.exists(manifest_path):
         return None
-    
+
     with open(manifest_path, 'r', encoding='utf-8') as f:
         manifest_data = json.load(f)
-        
+
     videos = manifest_data.get('videos', [])
+    frames = manifest_data.get('frames', [])
+
+    def _resolve_abs(rel):
+        abs_path = os.path.abspath(rel.lstrip('/'))
+        if not os.path.exists(abs_path):
+            abs_path = os.path.abspath(os.path.join(project_dir, 'videos', os.path.basename(rel)))
+        return abs_path
+
+    # ── 门禁 1: 槽位完整性 ──
+    if frames and not allow_partial:
+        expected_slots = list(range(1, len(frames)))
+        by_slot = {v.get('slot'): v for v in videos}
+        missing = []
+        for slot in expected_slots:
+            v = by_slot.get(slot)
+            if not v or v.get('status') != 'success' or not v.get('file') \
+                    or not os.path.exists(_resolve_abs(v['file'])):
+                missing.append(slot)
+        if missing:
+            raise RuntimeError(
+                f"存在失败或缺失的视频片段（槽位 {', '.join(map(str, missing))}），已拒绝合并。"
+                f"请先重试这些片段，或确认后强制合并。"
+            )
+
     # Filter and sort by slot index
     video_files = []
+    slot_of_file = {}
     # Make sure we only check files that exist
     for v in sorted(videos, key=lambda x: x.get('slot', 0)):
         if v.get('status') == 'success' and v.get('file'):
-            abs_path = os.path.abspath(v['file'].lstrip('/'))
-            if not os.path.exists(abs_path):
-                abs_path = os.path.abspath(os.path.join(project_dir, 'videos', os.path.basename(v['file'])))
+            abs_path = _resolve_abs(v['file'])
             if os.path.exists(abs_path):
                 video_files.append(abs_path)
-                
+                slot_of_file[abs_path] = v.get('slot')
+
     if not video_files:
         return None
+
+    # ── 门禁 2: 每段首尾帧与锚点图一致（拦截串片/文生视频混入） ──
+    if frames and not allow_partial:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        def _resolve_frame(entry):
+            if not entry or not entry.get('file'):
+                return None
+            p = os.path.join(base_dir, entry['file'].lstrip('/'))
+            if not os.path.exists(p):
+                p = os.path.join(project_dir, 'frames', os.path.basename(entry['file']))
+            return p if os.path.exists(p) else None
+
+        frame_by_slot = {f.get('slot'): f for f in frames}
+        mismatched = []
+        for vf in video_files:
+            slot = slot_of_file.get(vf)
+            start_p = _resolve_frame(frame_by_slot.get(slot))
+            end_p = _resolve_frame(frame_by_slot.get((slot or 0) + 1))
+            ok, reason = verify_video_anchors(vf, start_p, end_p)
+            if not ok:
+                mismatched.append(f"{slot} (MAD {reason})")
+        if mismatched:
+            raise RuntimeError(
+                f"以下片段内容与锚点帧不符，疑似串片/错误下载：槽位 {'; '.join(mismatched)}。"
+                f"已拒绝合并，请重新生成这些片段。"
+            )
         
     # Write concat list to project directory
     concat_list_path = os.path.join(project_dir, 'concat_list.txt')

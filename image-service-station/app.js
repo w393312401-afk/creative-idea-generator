@@ -27,7 +27,8 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 120000) {
         });
     } catch (error) {
         if (error && error.name === 'AbortError') {
-            throw new Error('请求超时：图像服务超过 120 秒未返回，请稍后重试或换一张更小的参考图。');
+            const seconds = Math.round(timeoutMs / 1000);
+            throw new Error(`请求超时：图像服务超过 ${seconds} 秒未返回，请稍后重试或换一张更小的参考图。`);
         }
         throw error;
     } finally {
@@ -50,8 +51,8 @@ const CREATIVE_PROMPTS = [
         en: "A cozy steampunk bar converted from a retired submarine cabin, circular portholes showing glowing jellyfish swimming outside, brass pipes, flickering gauges, warm amber lighting, wooden bar counter, vintage aesthetic, film grain texture, ultra-high definition."
     },
     {
-        zh: "一座悬挂在巨型紫水晶洞穴顶部的玻璃茶室，巨大的紫色晶体在黑暗中散发着梦幻般的幽光，茶室散发出温热的蒸汽，极简主义日式设计，微光，治愈系，超现实主义",
-        en: "A minimalist Japanese tea room suspended from the top of a giant amethyst geode, massive purple crystals glowing dreamily in the dark, warm steam rising from a teapot, soft lighting, healing atmosphere, surrealism."
+        zh: "在河畔斜坡上搭建的一座圆锥形树皮屋，粗糙的木柱作为骨架，外侧铺满深灰色树皮瓦，黄昏时分屋里点亮温暖的马灯，温暖舒适，写实摄影质感",
+        en: "A conical bark hut built on a rocky riverside slope, rough wooden poles forming the frame, dark grey bark shingles covering the exterior, a warm lantern glowing inside at dusk, cozy atmosphere, photorealistic photography."
     },
     {
         zh: "废弃水塔顶部改造而成的工业风奢华阁楼，360度环形玻璃窗可以俯瞰雨后的纽约落日，混凝土粗犷质感与高档现代家具完美融合，暖色调软装，落日余晖，极高画质",
@@ -200,7 +201,7 @@ async function checkApiStatus() {
     badgeText.textContent = '检测 API 连接中...';
     
     try {
-        const response = await fetch('/api/ping', {
+        const response = await fetchWithTimeout('/api/ping', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -209,7 +210,7 @@ async function checkApiStatus() {
                     apiKey: serverConfig.apiKey
                 }
             })
-        });
+        }, 8000);
         const res = await response.json();
         if (res.online) {
             badge.className = 'status-badge online';

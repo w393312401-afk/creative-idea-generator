@@ -113,9 +113,11 @@ body {
     position: relative;
     box-sizing: border-box;
     -webkit-font-smoothing: antialiased;
+    /* Performance: optimize font rendering for speed */
+    text-rendering: optimizeSpeed;
 }
 
-/* Reset box-sizing universally */
+/* Reset box-sizing universally + performance baseline */
 * {
     box-sizing: border-box;
     margin: 0;

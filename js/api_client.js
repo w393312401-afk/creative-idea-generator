@@ -79,7 +79,7 @@ function initLocalServiceLogs() {
         // Prevent toggling when clicking action buttons/checkbox
         if (e.target.closest('.log-panel-actions')) return;
         toggleLog();
-    });
+    }, { passive: true });
 
     toggleBtn.addEventListener('click', toggleLog);
 
@@ -87,11 +87,18 @@ function initLocalServiceLogs() {
         output.textContent = '';
     });
 
+    // ── rAF-throttled scroll: reading scrollHeight causes forced layout,
+    //    batch to at most one DOM read per animation frame ──
+    let _logScrollPending = false;
     function scrollToBottom() {
         if (autoscrollChk && autoscrollChk.checked) {
-            const body = document.getElementById('log-panel-body');
-            if (body) {
-                body.scrollTop = body.scrollHeight;
+            if (!_logScrollPending) {
+                _logScrollPending = true;
+                requestAnimationFrame(() => {
+                    const body = document.getElementById('log-panel-body');
+                    if (body) body.scrollTop = body.scrollHeight;
+                    _logScrollPending = false;
+                });
             }
         }
     }

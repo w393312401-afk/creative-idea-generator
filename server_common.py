@@ -195,6 +195,8 @@ def effective_config(client_config):
         'model': SERVER_CONFIG.get('model') or 'gemini-3-flash-agent',
         'imageModel': SERVER_CONFIG.get('imageModel') or 'gemini-3.1-flash-image',
     }
+    if SERVER_CONFIG.get('imageEditFallbackModel'):
+        merged['imageEditFallbackModel'] = SERVER_CONFIG.get('imageEditFallbackModel')
     for k in ('geminiDirectApiKey', 'geminiApiKey', 'geminiDirectImageModel'):
         if SERVER_CONFIG.get(k):
             merged[k] = SERVER_CONFIG.get(k)
@@ -203,7 +205,9 @@ def effective_config(client_config):
             merged['model'] = client_config['model']
         if client_config.get('imageModel'):
             merged['imageModel'] = client_config['imageModel']
-    for k in ('imageAspectRatio', 'imageQuality'):
+        if client_config.get('imageEditFallbackModel'):
+            merged['imageEditFallbackModel'] = client_config['imageEditFallbackModel']
+    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'googleFxIpRotateRequests'):
         if client_config.get(k):
             merged[k] = client_config[k]
     for k in ('geminiDirectApiKey', 'geminiApiKey', 'geminiDirectImageModel'):
@@ -226,28 +230,54 @@ def resolve_gateway(model_name, config):
 def _safe_project_name(title):
     raw = (title or 'spark_frames').strip()
     import hashlib
-    # 仅保留英文字母、数字、下划线和连字符，彻底杜绝中文编码问题以及 #、?、%、&、+ 等 URL 特殊字符引发的 404 截断
-    sanitized = re.sub(r'[^a-zA-Z0-9_-]', '_', raw)
-    # 合并连续的下划线，并去除首尾的下划线/连字符
-    sanitized = re.sub(r'_+', '_', sanitized).strip('_-')
-    
-    # 计算原始标题的 MD5 值，用于防冲突和兜底
+    import unicodedata
+    normalized = unicodedata.normalize('NFKC', raw)
+    # 保留中文主题作为本地项目目录名，同时过滤 Windows 禁用字符和 URL 高风险符号。
+    sanitized = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', '_', normalized)
+    sanitized = re.sub(r'[#?%&+=;,@!`~^()\[\]{}]+', '_', sanitized)
+    sanitized = re.sub(r'\s+', '_', sanitized)
+    sanitized = re.sub(r'_+', '_', sanitized).strip(' ._-')
     title_hash = hashlib.md5(raw.encode('utf-8', errors='ignore')).hexdigest()
-    
+
     if not sanitized:
-        # 如果纯中文或其他非 ASCII 字符导致过滤后为空，直接使用前 12 位 MD5 哈希
         return title_hash[:12]
-    else:
-        # 截取前 40 个 ASCII 字符，并附加 6 位 MD5 后缀以保证唯一性
-        return f"{sanitized[:40]}_{title_hash[:6]}"
+    return sanitized[:60].rstrip(' ._-') or title_hash[:12]
+
+
+def _legacy_ascii_project_name(title):
+    raw = (title or 'spark_frames').strip()
+    import hashlib
+    sanitized = re.sub(r'[^a-zA-Z0-9_-]', '_', raw)
+    sanitized = re.sub(r'_+', '_', sanitized).strip('_-')
+    title_hash = hashlib.md5(raw.encode('utf-8', errors='ignore')).hexdigest()
+    if not sanitized:
+        return title_hash[:12]
+    return f"{sanitized[:40]}_{title_hash[:6]}"
 
 
 def _get_project_dir(title):
-    # 1. Try new naming scheme
+    # 1. Try new Chinese-preserving naming scheme
     new_name = _safe_project_name(title)
     new_dir = os.path.join(OUTPUT_ROOT, new_name)
     if os.path.exists(new_dir):
         return new_dir
+
+    # 2. Try legacy ASCII+hash naming scheme used before Chinese folder names
+    legacy_dir = os.path.join(OUTPUT_ROOT, _legacy_ascii_project_name(title))
+    if os.path.exists(legacy_dir):
+        return legacy_dir
+
+    # 3. Try old raw-title naming scheme
+    old_raw = (title or 'spark_frames').strip()
+    old_raw = re.sub(r'[\\/:*?"<>|]+', '_', old_raw)
+    old_raw = re.sub(r'\s+', '_', old_raw)
+    old_name = old_raw
+    old_dir = os.path.join(OUTPUT_ROOT, old_name)
+    if os.path.exists(old_dir):
+        return old_dir
+
+    # 4. Default to new naming scheme path if neither exists (for creation)
+    return new_dir
         
     # 2. Try old naming scheme
     old_raw = (title or 'spark_frames').strip()
@@ -424,7 +454,7 @@ def cleanup_old_tasks():
     to_delete = []
     with ACTIVE_TASKS_LOCK:
         for tid, t in ACTIVE_TASKS.items():
-            if t["status"] in ("completed", "failed") and now - t["last_active"] > 604800:
+            if t["status"] in ("completed", "failed", "cancelled") and now - t["last_active"] > 604800:
                 to_delete.append(tid)
         for tid in to_delete:
             del ACTIVE_TASKS[tid]
@@ -433,6 +463,30 @@ def cleanup_old_tasks():
 
 
 def ping_proxy(config):
+    model = config.get('model') or 'gemini-3-flash-agent'
+    base_url, api_key = resolve_gateway(model, config)
+    req = urllib.request.Request(
+        f'{base_url}/models',
+        headers={'Authorization': f'Bearer {api_key}'},
+        method='GET',
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=5) as resp:
+            return 200 <= resp.status < 500
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return False
+        # Some OpenAI-compatible proxies do not expose /models, but any HTTP
+        # response still proves the local gateway is reachable.
+        return e.code in (404, 405)
+    except (urllib.error.URLError, TimeoutError, socket.timeout):
+        return False
+    except Exception:
+        return False
+
+
+def ping_model_completion(config):
     model = config.get('model') or 'gemini-3-flash-agent'
     base_url, api_key = resolve_gateway(model, config)
     payload = json.dumps({
@@ -447,6 +501,6 @@ def ping_proxy(config):
         method='POST',
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=10) as resp:
+    with opener.open(req, timeout=8) as resp:
         return resp.status == 200
 

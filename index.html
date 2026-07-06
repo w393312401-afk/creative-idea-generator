@@ -10,8 +10,11 @@
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@600;700;800&display=swap" media="print" onload="this.media='all'">
     <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@600;700;800&display=swap"></noscript>
     <script>(function(){try{if(localStorage.getItem('spark_theme')==='dark'){document.documentElement.setAttribute('data-theme','dark');}}catch(e){}})();</script>
-    <link rel="stylesheet" href="tokens.css?v=1.0.7">
-    <link rel="stylesheet" href="style.css?v=1.0.7">
+    <!-- Preload critical CSS for faster first paint -->
+    <link rel="preload" href="tokens.css?v=1.0.8" as="style">
+    <link rel="preload" href="style.css?v=1.0.9" as="style">
+    <link rel="stylesheet" href="tokens.css?v=1.0.8">
+    <link rel="stylesheet" href="style.css?v=1.0.9">
 </head>
 <body>
     <!-- Background Canvas for Interactive Particles -->
@@ -135,10 +138,6 @@
                                     <span class="theme-icon">🌳</span>
                                     <span class="theme-name">百年空心橡树</span>
                                 </button>
-                                <button class="theme-btn" data-value="glacier_cave">
-                                    <span class="theme-icon">🧊</span>
-                                    <span class="theme-name">蓝冰冰川洞</span>
-                                </button>
                                 <button class="theme-btn" data-value="submarine_cabin">
                                     <span class="theme-icon">⚓</span>
                                     <span class="theme-name">退役潜艇舱</span>
@@ -155,13 +154,9 @@
                                     <span class="theme-icon">🚀</span>
                                     <span class="theme-name">废弃导弹井</span>
                                 </button>
-                                <button class="theme-btn" data-value="giant_geode">
-                                    <span class="theme-icon">💎</span>
-                                    <span class="theme-name">巨型紫晶洞</span>
-                                </button>
-                                <button class="theme-btn" data-value="sea_cave">
-                                    <span class="theme-icon">🌊</span>
-                                    <span class="theme-name">海蚀洞穴</span>
+                                <button class="theme-btn" data-value="riverside_bark_hut">
+                                    <span class="theme-icon">🛖</span>
+                                    <span class="theme-name">河畔树皮小屋</span>
                                 </button>
                             </div>
                         </div>
@@ -351,6 +346,16 @@
                         <h3>正在按 skill 契约合成提示词...</h3>
                         <div class="loading-timer">已用时: <span id="loading-timer-val">0.0</span> 秒</div>
                         <div class="loading-stage-info" id="loading-stage-text">解析主题，拆解场景变量与施工节拍...</div>
+                        <div class="generation-progress-shell" aria-live="polite">
+                            <div class="generation-progress-meta">
+                                <span id="generation-progress-label">准备中...</span>
+                                <span id="generation-progress-percent">0%</span>
+                            </div>
+                            <div class="generation-progress-bar">
+                                <div class="generation-progress-fill" id="generation-progress-fill"></div>
+                            </div>
+                            <div class="generation-progress-detail" id="generation-progress-detail"></div>
+                        </div>
                         <ul class="loading-steps">
                             <li id="step-1" class="pending">解析主题，拆解场景变量与施工节拍...</li>
                             <li id="step-2" class="pending">装配 Drift Lock 与九宫格锚点...</li>
@@ -397,8 +402,14 @@
                 <div class="output-content" id="output-content-view">
                     <div class="content-header">
                         <div class="idea-title-row">
-                            <h2 id="idea-title">神秘浮空木屋：清水混凝土卧室</h2>
-                            <div class="card-badges">
+                            <div class="tiktok-title-line">
+                                <h2 id="idea-title">Secret Floating Treehouse Build #TinyHome #Renovation #Restoration #DIYBuild #BeforeAndAfter #OddlySatisfying</h2>
+                                <button id="copy-tiktok-meta-btn" class="mini-icon-btn tiktok-copy-btn" title="复制推荐主题和 tags">
+                                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                                </button>
+                            </div>
+                            <div id="idea-title-cn" class="idea-title-cn">神秘浮空树屋改造</div>
+                            <div class="card-badges" hidden>
                                 <span class="tag-badge" id="tag-theme">木屋改建</span>
                                 <span class="tag-badge" id="tag-creativity">脑洞大开</span>
                             </div>
@@ -471,15 +482,7 @@
                                         </div>
                                         <div class="cover-info-controls">
                                             <p class="cover-desc-text">使用 <b id="cover-desc-model">gemini-3.1-flash-image</b> 图像生成模型制作 <b id="cover-desc-ratio">9:16</b> 规格 (<b id="cover-desc-quality">2K</b>) 封面图。采用<b>左右柔和过渡前后对比</b>形式，画面偏写实，文字风格固定且惊艳。</p>
-                                            <div id="cover-hook-display" class="cover-hook-box" style="display: none;">
-                                                <span class="hook-label">TikTok US 英文文案</span>
-                                                <div class="hook-value-wrapper">
-                                                    <span id="cover-hook-val" class="hook-value"></span>
-                                                    <button id="copy-hook-btn" class="mini-icon-btn" title="复制文案">
-                                                        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                                                    </button>
-                                                </div>
-                                            </div>
+
                                             <div class="cover-history-container" id="cover-history-container" style="display:none;">
                                                 <h4>历史封面记录</h4>
                                                 <div class="cover-history-thumbnails" id="cover-history-thumbnails">
@@ -506,7 +509,15 @@
                                     </div>
                                     <div class="frames-progress" id="frames-progress" style="display:none; align-items: center; gap: 12px; justify-content: center; flex-wrap: wrap;">
                                         <div class="cover-spinner"></div>
-                                        <span>正在生成连续帧序列，此过程可能会耗费几分钟，请耐心等待...</span>
+                                        <div class="inline-progress-shell">
+                                            <div class="inline-progress-meta">
+                                                <span id="frames-progress-label">正在生成连续帧序列...</span>
+                                                <span id="frames-progress-percent">0%</span>
+                                            </div>
+                                            <div class="inline-progress-bar">
+                                                <div class="inline-progress-fill" id="frames-progress-fill"></div>
+                                            </div>
+                                        </div>
                                         <button id="cancel-frames-btn" class="action-btn text-btn secondary mini-btn" style="margin-left: 12px; margin-top: 0; padding: 4px 10px; font-size: 11px;">取消</button>
                                     </div>
                                     <div class="frames-grid" id="frames-grid"></div>
@@ -528,7 +539,15 @@
                                     </div>
                                     <div class="frames-progress" id="videos-progress" style="display:none; align-items: center; gap: 12px; justify-content: center; flex-wrap: wrap;">
                                         <div class="cover-spinner"></div>
-                                        <span>正在通过本地 UI 自动化生成视频，此过程可能较慢，请耐心等待...</span>
+                                        <div class="inline-progress-shell">
+                                            <div class="inline-progress-meta">
+                                                <span id="videos-progress-label">正在生成视频序列...</span>
+                                                <span id="videos-progress-percent">0%</span>
+                                            </div>
+                                            <div class="inline-progress-bar">
+                                                <div class="inline-progress-fill" id="videos-progress-fill"></div>
+                                            </div>
+                                        </div>
                                         <button id="cancel-videos-btn" class="action-btn text-btn secondary mini-btn" style="margin-left: 12px; margin-top: 0; padding: 4px 10px; font-size: 11px;">取消</button>
                                     </div>
                                     
@@ -654,7 +673,7 @@
                     <option value="废弃水塔">废弃水塔</option>
                     <option value="搁浅货轮船体">搁浅货轮船体</option>
                     <option value="废弃导弹井">废弃导弹井</option>
-                    <option value="巨型紫晶洞">巨型紫晶洞</option>
+                    <option value="河畔树皮小屋">河畔树皮小屋</option>
                     <option value="海蚀洞穴">海蚀洞穴</option>
                 </select>
                 <select id="library-filter-time">
@@ -686,6 +705,15 @@
         <div class="drawer-actions" style="display: flex; gap: 8px; padding: 10px 20px; border-bottom: 1px solid var(--border-color); background: rgba(var(--panel-rgb), 0.1);">
             <button id="clear-completed-btn" class="action-btn text-btn secondary" style="flex: 1; font-size: 11px; padding: 6px; margin: 0; justify-content: center; height: auto;">🧹 清空已完成</button>
             <button id="clear-failed-btn" class="action-btn text-btn secondary" style="flex: 1; font-size: 11px; padding: 6px; margin: 0; justify-content: center; height: auto;">🗑️ 清空失败/已取消</button>
+        </div>
+
+        <!-- Batch Actions Bar -->
+        <div id="tasks-batch-actions-bar" style="display: none; align-items: center; justify-content: space-between; padding: 8px 20px; background: rgba(244, 63, 94, 0.08); border-bottom: 1px solid var(--border-color);">
+            <span id="tasks-batch-count" style="font-size: 12px; color: var(--text-primary); font-weight: 500;">已选中 0 项</span>
+            <div style="display: flex; gap: 8px;">
+                <button id="batch-delete-btn" class="action-btn text-btn secondary mini-btn" style="margin: 0; padding: 4px 8px; font-size: 11px; background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.25); color: #ef4444;">批量删除</button>
+                <button id="batch-cancel-select-btn" class="action-btn text-btn secondary mini-btn" style="margin: 0; padding: 4px 8px; font-size: 11px;">取消选择</button>
+            </div>
         </div>
 
         <div class="drawer-search-filter">
@@ -745,19 +773,40 @@
                         <option value="gpt-5.5">gpt-5.5 (GPT 代理)</option>
                     </select>
                 </div>
-                <div class="form-group" id="gpt-port-group" style="display: none;">
-                    <label for="settings-gpt-port">GPT 代理端口 (GPT Port)</label>
-                    <select id="settings-gpt-port">
-                        <option value="65038">65038 (旧版代理)</option>
-                        <option value="8046">8046 (默认代理)</option>
-                        <option value="8045">8045 (备用代理)</option>
-                    </select>
-                </div>
                 <div class="form-group">
                     <label for="settings-image-model">Image Model Name (生图模型名称)</label>
                     <select id="settings-image-model">
                         <option value="nano-banana-2" selected>🍌 Nano Banana 2</option>
                     </select>
+                </div>
+                <div class="form-group">
+                    <label for="settings-image-backend">Frame Sequence Backend (帧序列生成方式)</label>
+                    <select id="settings-image-backend">
+                        <option value="api" selected>🔌 API 接口（LLM 网关）</option>
+                        <option value="google_fx">🤖 Google FX UI 自动化（AdsPower 浏览器）</option>
+                    </select>
+                </div>
+                <div class="form-group" id="fx-image-model-group" style="display: none;">
+                    <label for="settings-fx-image-model">Google FX Image Model (FX 生图模型)</label>
+                    <select id="settings-fx-image-model">
+                        <option value="Nano Banana Pro">Nano Banana Pro</option>
+                        <option value="Nano Banana 2" selected>🍌 Nano Banana 2</option>
+                        <option value="Imagen 4">Imagen 4</option>
+                    </select>
+                </div>
+                <div class="form-group" id="fx-video-model-group" style="display: none;">
+                    <label for="settings-fx-video-model">Google FX Video Model (FX 视频模型)</label>
+                    <select id="settings-fx-video-model">
+                        <option value="Veo 3.1 - Lite">Veo 3.1 - Lite</option>
+                        <option value="Veo 3.1 - Fast">Veo 3.1 - Fast</option>
+                        <option value="Veo 3.1 - Quality">Veo 3.1 - Quality</option>
+                        <option value="Omni Flash">Omni Flash</option>
+                        <option value="Veo 3.1 - Lite [Lower Priority]" selected>Veo 3.1 - Lite [Lower Priority]</option>
+                    </select>
+                </div>
+                <div class="form-group" id="fx-ip-rotate-requests-group" style="display: none;">
+                    <label for="settings-fx-ip-rotate-requests">Auto-rotate IP Frequency (自动轮换 IP 频率，单位：次请求)</label>
+                    <input type="number" id="settings-fx-ip-rotate-requests" min="1" max="100" placeholder="默认 5 次">
                 </div>
                 <div class="form-group">
                     <label for="settings-image-ratio">Image Aspect Ratio (生图宽高比)</label>
@@ -779,7 +828,7 @@
                     </select>
                 </div>
                 <div class="modal-info">
-                    <p>💡 <b>提示:</b> 默认已填装检测到的本地 API 代理服务配置（端口 8046）。若您的中转接口发生端口变动，可在此进行修改并保存。</p>
+                    <p>💡 <b>提示:</b> 服务端口已永久固定 —— 应用入口 <b>8085</b>（图像服务站在 /image-service-station/），LLM 代理 <b>8046</b>（gpt-5.5 由服务端自动路由，无需配置）。托管模式下代理地址以 server_config.json 为准，此处 Base URL 仅作展示/本地自用。</p>
                 </div>
                 <div class="form-group cache-group" style="margin-top: 15px; padding-top: 15px; border-top: 1px solid var(--border-color, rgba(255,255,255,0.1));">
                     <label>系统缓存管理</label>
@@ -821,12 +870,14 @@
         </div>
     </div>
 
-    <script src="js/utils.js?v=1.0.9"></script>
-    <script src="js/config.js?v=1.0.9"></script>
-    <script src="js/api_client.js?v=1.0.9"></script>
-    <script src="js/prompt_pipeline.js?v=1.0.9"></script>
-    <script src="js/media_renderer.js?v=1.0.9"></script>
-    <script src="app.js?v=1.0.9"></script>
+    <!-- Modular JS: defer so they never block HTML parsing. Order preserved. -->
+    <script src="js/utils.js?v=1.1.0" defer></script>
+    <script src="js/config.js?v=1.1.0" defer></script>
+    <script src="js/progress_model.js?v=1.2.0" defer></script>
+    <script src="js/api_client.js?v=1.1.0" defer></script>
+    <script src="js/prompt_pipeline.js?v=1.1.2" defer></script>
+    <script src="js/media_renderer.js?v=1.1.0" defer></script>
+    <script src="app.js?v=1.1.2" defer></script>
     <!-- Mobile responsive UI helper script -->
     <script>
         // Tab switching function for mobile screens

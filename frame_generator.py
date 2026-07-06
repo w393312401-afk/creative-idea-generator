@@ -4,6 +4,8 @@ import json
 import io
 import time
 import socket
+import shutil
+import tempfile
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -18,6 +20,121 @@ from server_common import (
     IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT,
     IMAGE_TASKS, IMAGE_TASKS_LOCK
 )
+
+
+
+class QuotaExhaustedError(RuntimeError):
+    """Raised when the upstream API quota is exhausted; retrying is pointless."""
+    pass
+
+
+def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, initial_delay=2.0):
+    import random
+    if opener is None:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    
+    last_exception = None
+    delay = initial_delay
+    
+    for attempt in range(max_attempts):
+        try:
+            url_str = req.full_url if hasattr(req, 'full_url') else str(req)
+            if sys.stdout:
+                print(f"[HTTP] Sending request to {url_str} (attempt {attempt+1}/{max_attempts})")
+            
+            with opener.open(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            last_exception = e
+            detail = ''
+            try:
+                detail = e.read().decode('utf-8')[:800]
+            except Exception:
+                pass
+            
+            if sys.stdout:
+                print(f"[HTTP] Attempt {attempt+1}/{max_attempts} failed with HTTP {e.code}: {detail}")
+            
+            # Detect quota exhaustion (direct 429 or 502 wrapping upstream 429)
+            # and fail immediately – retrying only wastes quota.
+            quota_signal = (
+                "QUOTA_EXHAUSTED" in detail
+                or "RESOURCE_EXHAUSTED" in detail
+                or "capacity on this model" in detail
+                or "quotaResetDelay" in detail
+            )
+            if quota_signal:
+                err_msg = "您的图片生成配额已耗尽 (QUOTA_EXHAUSTED)。"
+                try:
+                    # The 502 body wraps the upstream 429 JSON, find "message"
+                    err_json = json.loads(detail)
+                    inner = err_json.get('error', {})
+                    msg = inner.get('message') or ""
+                    # Sometimes the real 429 JSON is nested deeper
+                    if not msg:
+                        m = re.search(r'"message":\s*"([^"]+)"', detail)
+                        if m:
+                            msg = m.group(1)
+                    if msg:
+                        err_msg += f" {msg}"
+                    # Extract quota reset delay for user-friendly message
+                    delay_m = re.search(r'quotaResetDelay[":\s]+([^,\}"]+)', detail)
+                    if delay_m:
+                        err_msg += f" Quota resets in: {delay_m.group(1).strip()}"
+                except Exception:
+                    m = re.search(r'"message":\s*"([^"]+)"', detail)
+                    if m:
+                        err_msg += f" {m.group(1)}"
+                raise QuotaExhaustedError(err_msg)
+
+            # Retry on 429 and 5xx errors
+            if e.code in (429, 500, 502, 503, 504):
+                if attempt < max_attempts - 1:
+                    sleep_time = delay
+                    retry_after = e.headers.get('Retry-After')
+                    if retry_after:
+                        try:
+                            sleep_time = float(retry_after)
+                        except ValueError:
+                            pass
+                    else:
+                        sleep_time = delay * (1.5 ** attempt) + random.uniform(0.5, 1.5)
+                    
+                    if sys.stdout:
+                        print(f"[HTTP] Rate-limited or server error. Retrying in {sleep_time:.2f} seconds...")
+                    time.sleep(sleep_time)
+                    continue
+            raise e
+        except urllib.error.URLError as e:
+            last_exception = e
+            if sys.stdout:
+                print(f"[HTTP] Attempt {attempt+1}/{max_attempts} failed with URLError: {e.reason}")
+            if attempt < max_attempts - 1:
+                sleep_time = delay * (1.5 ** attempt) + random.uniform(0.5, 1.5)
+                time.sleep(sleep_time)
+                continue
+            raise e
+        except socket.timeout as e:
+            last_exception = e
+            if sys.stdout:
+                print(f"[HTTP] Attempt {attempt+1}/{max_attempts} failed with socket timeout")
+            if attempt < max_attempts - 1:
+                sleep_time = delay * (1.5 ** attempt) + random.uniform(0.5, 1.5)
+                time.sleep(sleep_time)
+                continue
+            raise e
+        except Exception as e:
+            last_exception = e
+            if sys.stdout:
+                print(f"[HTTP] Attempt {attempt+1}/{max_attempts} failed with unexpected error: {e}")
+            if attempt < max_attempts - 1:
+                sleep_time = delay * (1.5 ** attempt) + random.uniform(0.5, 1.5)
+                time.sleep(sleep_time)
+                continue
+            raise e
+            
+    if last_exception:
+        raise last_exception
 
 
 def _get_file_hash(filepath):
@@ -86,8 +203,8 @@ def call_image_llm(config, prompt_content):
         method='POST',
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=180) as resp:
-        body = json.loads(resp.read().decode('utf-8'))
+    resp_bytes = _execute_request_with_retry(req, opener=opener, timeout=180)
+    body = json.loads(resp_bytes.decode('utf-8'))
     return body['choices'][0]['message'].get('content') or ''
 
 
@@ -304,8 +421,8 @@ def _post_gemini_direct_json(url, api_key, payload, timeout=240):
         method='POST',
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode('utf-8'))
+    resp_bytes = _execute_request_with_retry(req, opener=opener, timeout=timeout)
+    return json.loads(resp_bytes.decode('utf-8'))
 
 
 def _gemini_native_image_edit(config, model, prompt, file_items, aspect_ratio, image_size):
@@ -468,8 +585,7 @@ def _decode_or_download_image(data_item, target_path, config):
         image_bytes = base64.b64decode(encoded)
     elif url and (url.startswith('http://') or url.startswith('https://')):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(url, timeout=180) as resp:
-            image_bytes = resp.read()
+        image_bytes = _execute_request_with_retry(url, opener=opener, timeout=180)
 
     if not image_bytes:
         raise RuntimeError('image response did not include b64_json, data URL, or downloadable URL')
@@ -523,8 +639,7 @@ def _save_image_station_result(resp_data):
         elif url and (url.startswith('http://') or url.startswith('https://')):
             try:
                 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                with opener.open(url, timeout=180) as resp:
-                    image_bytes = resp.read()
+                image_bytes = _execute_request_with_retry(url, opener=opener, timeout=180)
             except Exception as e:
                 print(f"[IMAGE STATION] Failed to download remote image {url}: {e}")
                 
@@ -561,8 +676,8 @@ def _post_json(base_url, api_key, path, payload, timeout=240):
         method='POST',
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode('utf-8'))
+    resp_bytes = _execute_request_with_retry(req, opener=opener, timeout=timeout)
+    return json.loads(resp_bytes.decode('utf-8'))
 
 
 def _post_multipart(base_url, api_key, path, fields, file_field, file_path, timeout=300):
@@ -595,8 +710,8 @@ def _post_multipart(base_url, api_key, path, fields, file_field, file_path, time
         method='POST',
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode('utf-8'))
+    resp_bytes = _execute_request_with_retry(req, opener=opener, timeout=timeout)
+    return json.loads(resp_bytes.decode('utf-8'))
 
 
 def _generate_text_image(config, prompt, target_path):
@@ -711,14 +826,17 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
                 method='POST',
             )
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(req, timeout=360) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
+            resp_bytes = _execute_request_with_retry(req, opener=opener, timeout=360)
+            data = json.loads(resp_bytes.decode('utf-8'))
 
             if not data.get('data'):
                 raise RuntimeError('image-to-image response contained no image data')
             _decode_or_download_image(data['data'][0], target_path, config)
             return False  # Success, not a fallback
 
+        except QuotaExhaustedError:
+            # Quota is gone – no point retrying with any attempt count, re-raise immediately
+            raise
         except Exception as e:
             if sys.stdout:
                 print(f"[FRAME SEQUENCE] Image edit attempt {attempt+1}/{max_attempts} failed: {e}")
@@ -730,7 +848,419 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
                 raise RuntimeError(f"All image-to-image edit attempts failed. Last error: {e}")
 
 
+# ════════════════════════════════════════════════════════════════════
+# Google FX UI 自动化帧序列生成（2026-07-04 新增，config.imageBackend == 'google_fx'）
+# ════════════════════════════════════════════════════════════════════
+# 复用外部 AdsPower 浏览器自动化脚本 services/google_fx_image.py（labs.google Flow 画布）：
+#   · 单次批量 ≤5 张，批内自动链式图生图（第 N+1 张自动挂第 N 张为参考）；
+#   · 跨批次/单帧重试的续链：外部脚本挂参考只认「文件名里的画布 UUID」，
+#     所以每帧除 webp 外把原始 jpg（文件名含 UUID）留档到 frames/fx_src/；
+#   · 每次调用用唯一临时 output_path，避免命中外部脚本的 dedupe 结果缓存；
+#   · 与 API 路径一致：逐帧 VLM QA，失败改写提示词单帧重生（≤2 次）。
+# 改动外部脚本或本文件都需重启 SPARK 进程。
+
+_FX_CHUNK_SIZE = 5  # 外部脚本单次批量上限（google_fx_image 内部 prompts[:5]）
+
+_FX_UUID_RE = re.compile(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
+
+
+def _get_google_fx_image_service():
+    adspower_path = SERVER_CONFIG.get('adspowerPath') or 'C:\\Users\\video\\Desktop\\N8N-main\\Adspower\\AI\\core'
+    if adspower_path not in sys.path:
+        sys.path.append(adspower_path)
+    import services.google_fx as google_fx
+    import models
+    return google_fx, models
+
+
+def _fx_image_model(config):
+    # 外部 _normalize_model_name 只认 "Nano Banana Pro" / "Nano Banana 2" / "Imagen 4"
+    # 及其别名；未知名称会静默落到默认值，所以这里给一个确定的合法默认。
+    return (config.get('googleFxImageModel') or 'Nano Banana 2').strip()
+
+
+def _fx_extract_uuid(path_or_url):
+    m = _FX_UUID_RE.search(os.path.basename(str(path_or_url or '')))
+    return m.group(1) if m else None
+
+
+def plan_fx_chunks(seqs, chunk_size=_FX_CHUNK_SIZE):
+    """把待生成的帧序号切成可交给外部批量脚本的批次（纯函数，可单测）。
+
+    只有「连续」的序号才能进同一批：批内链式参考是 外部脚本按提交顺序自动挂前一张,
+    序号断开意味着中间帧已存在/不重生，链必须重新从 fx_src 留档接起。
+    """
+    chunks = []
+    cur = []
+    for s in sorted(seqs):
+        if cur and (s != cur[-1] + 1 or len(cur) >= chunk_size):
+            chunks.append(cur)
+            cur = []
+        cur.append(s)
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _fx_src_dir(frames_dir):
+    d = os.path.join(frames_dir, 'fx_src')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _fx_find_ref_for(frames_dir, seq):
+    """返回第 seq-1 帧留档的 UUID jpg 路径（用于挂参考续链）；找不到返回 None。"""
+    if seq <= 1:
+        return None
+    src_dir = os.path.join(frames_dir, 'fx_src')
+    if not os.path.isdir(src_dir):
+        return None
+    prefix = f'img_{seq - 1:03d}_'
+    for name in sorted(os.listdir(src_dir)):
+        if name.startswith(prefix) and name.lower().endswith('.jpg') and _fx_extract_uuid(name):
+            return os.path.join(src_dir, name)
+    return None
+
+
+def _fx_store_frame(src_path, frames_dir, seq):
+    """外部脚本下载的原始 jpg → frames/img_NNN.webp，原始文件按
+    img_NNN_<uuid>.jpg 留档到 frames/fx_src/（同槽位旧档先清掉，防止
+    重试后按前缀找参考时命中旧 UUID）。返回 (webp_path, fx_src_path, uuid)。"""
+    target_path = os.path.join(frames_dir, f'img_{seq:03d}.webp')
+    with Image.open(src_path) as img:
+        img.convert('RGB').save(target_path, format='WEBP', quality=80)
+
+    uuid_str = _fx_extract_uuid(src_path)
+    src_dir = _fx_src_dir(frames_dir)
+    prefix = f'img_{seq:03d}_'
+    for old in os.listdir(src_dir):
+        if old.startswith(prefix):
+            try:
+                os.remove(os.path.join(src_dir, old))
+            except Exception:
+                pass
+    fx_src_path = os.path.join(src_dir, f'{prefix}{uuid_str or "nouuid"}.jpg')
+    shutil.copyfile(src_path, fx_src_path)
+    return target_path, fx_src_path, uuid_str
+
+
+def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path):
+    """调用外部批量生图脚本一次，返回 (本地文件路径列表, 临时目录)。
+
+    ref_path：上一帧留档 jpg（首帧/无续链传 None）。
+    外部脚本对失败的单张会静默跳过导致列表变短，而批内链式参考使得
+    prompt↔图片 的对应关系无法事后修复，所以数量不齐一律按失败抛出。
+    调用方负责在把图片转存后 shutil.rmtree 临时目录。
+    """
+    temp_out = tempfile.mkdtemp(prefix='spark_fx_img_')
+    req = models.ImageBatchRequest(
+        prompts=list(prompt_texts),
+        images=[ref_path] if ref_path else [],
+        ratio=config.get('imageAspectRatio') or '9:16',
+        model=_fx_image_model(config),
+        output_path=temp_out,  # 每次唯一，绕开外部 dedupe 缓存（同提示词重试不会拿到旧图）
+    )
+    result = google_fx._generate_images_batch_google_fx(req)
+    if not isinstance(result, dict) or result.get('status') != 'success':
+        shutil.rmtree(temp_out, ignore_errors=True)
+        raise RuntimeError(f"Google FX 批量生图失败: {(result or {}).get('message') or '未知错误'}")
+    paths = [p for p in (result.get('image_urls') or []) if isinstance(p, str) and os.path.exists(p)]
+    if len(paths) < len(prompt_texts):
+        shutil.rmtree(temp_out, ignore_errors=True)
+        raise RuntimeError(
+            f"Google FX 批量生图不完整: 期望 {len(prompt_texts)} 张，实际落盘 {len(paths)} 张，"
+            f"已放弃本批结果（批内链式对应关系无法修复）"
+        )
+    return paths, temp_out
+
+
+def _fx_apply_vlm_fixes(config, orig_prompt, vlm_reason, is_bridge, is_last):
+    """按 API 路径同款流程，用 VLM 反馈改写提示词并套用主动修复。"""
+    from prompt_pipeline import (
+        fix_image_prompt_with_vlm_feedback, clean_prompt_text,
+        fix_image_clean_frame_proactive, fix_horizon_line,
+        fix_camera_contradictions, fix_rhma_blur, fix_camera_dna,
+    )
+    corrected = fix_image_prompt_with_vlm_feedback(config, orig_prompt, vlm_reason)
+    corrected = clean_prompt_text(corrected)
+    corrected = fix_image_clean_frame_proactive(corrected)
+    corrected = fix_horizon_line(corrected)
+    corrected = fix_camera_contradictions(corrected, is_bridge=is_bridge)
+    corrected = fix_rhma_blur(corrected, is_last=is_last)
+
+    camera_dna = ""
+    if ":" in orig_prompt:
+        parts = orig_prompt.split(":", 1)
+        if any(kw in parts[0].lower() for kw in ['tripod', 'camera', 'shot', 'height', 'view']):
+            camera_dna = parts[0] + ":"
+    if camera_dna:
+        corrected = fix_camera_dna(corrected, camera_dna)
+    return corrected
+
+
+def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=None, target_sequences=None):
+    import builtins
+    builtins.google_fx_cancelled = False
+    rotate_requests = config.get('googleFxIpRotateRequests')
+    if rotate_requests is not None:
+        os.environ['MIYA_ROTATE_THRESHOLD'] = str(rotate_requests)
+    from prompt_pipeline import _parse_prompt_slots, run_vlm_qa_check
+    images, videos = _parse_prompt_slots(prompt_block)
+
+    prompts = []
+    for idx in sorted(images):
+        item = images[idx]
+        body = item['body'] if isinstance(item, dict) else item
+        meta = item.get('meta', '') if isinstance(item, dict) else ''
+        prompts.append({'index': idx, 'prompt': body, 'meta': meta})
+    if not prompts:
+        raise RuntimeError('未在 prompt_block 中找到任何 图片 N: 提示词')
+
+    def _check_cancel():
+        if on_progress and on_progress('cancel_check', None):
+            raise ConnectionError('用户取消了帧序列生成')
+
+    project_dir = _get_project_dir(title)
+    frames_dir = os.path.join(project_dir, 'frames')
+    os.makedirs(frames_dir, exist_ok=True)
+
+    google_fx, fx_models = _get_google_fx_image_service()
+    fx_model = _fx_image_model(config)
+
+    manifest_path = os.path.join(project_dir, 'manifest.json')
+    manifest = {
+        'title': title,
+        'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'method': 'A_single_chain',
+        'backend': 'google_fx',
+        'aspect_ratio': config.get('imageAspectRatio') or '9:16',
+        'image_size': _image_quality_to_label(config.get('imageQuality')),
+        'control_prompt': '',  # Flow UI 链式参考不走 IMG2IMG_CONTROL_PROMPT
+        'frames': [],
+    }
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                existing_manifest = json.load(f)
+            if isinstance(existing_manifest, dict) and 'frames' in existing_manifest:
+                manifest['frames'] = existing_manifest['frames']
+                manifest['created_at'] = existing_manifest.get('created_at', manifest['created_at'])
+        except Exception:
+            pass
+
+    manifest_frames_by_seq = {f['sequence']: f for f in manifest['frames']}
+    prompts_by_seq = {seq: item for seq, item in enumerate(prompts, start=1)}
+    all_seqs = sorted(prompts_by_seq.keys())
+
+    def _webp_path(seq):
+        return os.path.join(frames_dir, f'img_{seq:03d}.webp')
+
+    def _frame_exists(seq):
+        p = _webp_path(seq)
+        return os.path.exists(p) and os.path.getsize(p) > 0
+
+    # 任务分解：full run = 已有帧直接复用（断点续传），缺失帧成批生成；
+    # target 模式 = 只重生指定序号，其余帧不动也不发事件（与 API 路径一致）。
+    if target_sequences is not None:
+        wanted = {int(s) for s in target_sequences}
+        skip_seqs = []
+        gen_seqs = [s for s in all_seqs if s in wanted]
+    else:
+        skip_seqs = [s for s in all_seqs if _frame_exists(s)]
+        gen_seqs = [s for s in all_seqs if not _frame_exists(s)]
+
+    total_to_generate = len(skip_seqs) + len(gen_seqs)
+    if on_progress:
+        on_progress('start', {'total': total_to_generate})
+
+    def _save_manifest():
+        manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    generated_count = 0
+
+    def _emit_frame(frame_info):
+        nonlocal generated_count
+        generated_count += 1
+        if on_progress:
+            on_progress('frame', {'frame': frame_info, 'current': generated_count, 'total': total_to_generate})
+
+    def _run_vlm_qa(seq, item, is_bridge, ref_path):
+        """逐帧 VLM 质检 + 失败改写重生（≤2 次）。返回 (quality_gate, vlm_reason)。"""
+        if seq <= 1 or not _frame_exists(seq - 1):
+            return 'pending_manual_review', None
+        video_item = videos.get(seq - 1, "")
+        video_prompt = video_item['body'] if isinstance(video_item, dict) else video_item
+        if not video_prompt:
+            return 'pending_manual_review', None
+
+        prev_path = _webp_path(seq - 1)
+        target_path = _webp_path(seq)
+        vlm_pass, vlm_reason = run_vlm_qa_check(config, prev_path, target_path, video_prompt, is_bridge=is_bridge)
+        if vlm_pass:
+            return 'pending_manual_review', None
+
+        if sys.stdout:
+            print(f"[VLM QA][FX] Beat {seq-1} (IMAGE {seq}) failed VLM check: {vlm_reason}. Retrying via Google FX...")
+        for retry_attempt in range(2):
+            _check_cancel()
+            try:
+                if on_progress:
+                    on_progress('frame_retry', {
+                        'slot': item['index'],
+                        'sequence': seq,
+                        'attempt': retry_attempt + 1,
+                        'reason': vlm_reason,
+                    })
+                corrected = _fx_apply_vlm_fixes(
+                    config, item['prompt'], vlm_reason,
+                    is_bridge=is_bridge, is_last=(seq == len(prompts)),
+                )
+                if sys.stdout:
+                    print(f"[VLM QA][FX] Attempt {retry_attempt+1} corrected prompt: {corrected}")
+                retry_paths, retry_tmp = _fx_generate_batch(google_fx, fx_models, config, [corrected], ref_path)
+                try:
+                    _fx_store_frame(retry_paths[0], frames_dir, seq)
+                finally:
+                    shutil.rmtree(retry_tmp, ignore_errors=True)
+                vlm_pass, vlm_reason = run_vlm_qa_check(config, prev_path, target_path, video_prompt, is_bridge=is_bridge)
+                if vlm_pass:
+                    if sys.stdout:
+                        print(f"[VLM QA][FX] Beat {seq-1} passed VLM check on retry {retry_attempt+1}!")
+                    item['prompt'] = corrected  # 回写 manifest 用的提示词
+                    return 'pending_manual_review', None
+                if sys.stdout:
+                    print(f"[VLM QA][FX] Beat {seq-1} failed VLM check on retry {retry_attempt+1}: {vlm_reason}")
+            except ConnectionError:
+                raise
+            except Exception as retry_err:
+                if sys.stdout:
+                    print(f"[VLM QA][FX] Retry {retry_attempt+1} hit exception: {retry_err}")
+        return 'vlm_qa_failed', vlm_reason
+
+    def _record_frame(seq, item, fx_src_path, fx_uuid, quality_gate, vlm_reason):
+        webp = _webp_path(seq)
+        rel_path = os.path.relpath(webp, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+        prev_path = _webp_path(seq - 1) if seq > 1 else None
+        reference = prev_path if (prev_path and os.path.exists(prev_path)) else None
+        frame_info = {
+            'slot': item['index'],
+            'sequence': seq,
+            'file': rel_path,
+            'url': '/' + rel_path,
+            'prompt': item['prompt'],
+            'meta': item.get('meta', ''),
+            'reference': os.path.relpath(reference, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/') if reference else None,
+            'model': fx_model,
+            'backend': 'google_fx',
+            'fx_uuid': fx_uuid,
+            'fx_src': os.path.relpath(fx_src_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/') if fx_src_path else None,
+            'aspect_ratio': config.get('imageAspectRatio') or '9:16',
+            'image_size': _image_quality_to_label(config.get('imageQuality')),
+            'retry_count': 0,
+            'quality_gate': quality_gate,
+            'vlm_qa_reason': vlm_reason,
+            'parent_hash': _get_file_hash(reference) if reference else "",
+        }
+        manifest_frames_by_seq[seq] = frame_info
+        _save_manifest()  # 浏览器批量任务动辄数分钟，逐帧落盘保证进度可恢复
+        _emit_frame(frame_info)
+
+    chunks = plan_fx_chunks(gen_seqs)
+    chunk_by_start = {c[0]: c for c in chunks}
+    done_seqs = set()
+
+    for seq in all_seqs:
+        if seq in done_seqs:
+            continue
+        if seq in skip_seqs:
+            # 断点续传：直接复用已有帧与其 manifest 条目
+            existing = manifest_frames_by_seq.get(seq)
+            if not existing:
+                item = prompts_by_seq[seq]
+                own_src = _fx_find_ref_for(frames_dir, seq + 1)  # 本帧自己的留档（img_{seq}_*）
+                rel_path = os.path.relpath(_webp_path(seq), os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+                existing = {
+                    'slot': item['index'], 'sequence': seq,
+                    'file': rel_path, 'url': '/' + rel_path,
+                    'prompt': item['prompt'], 'meta': item.get('meta', ''),
+                    'reference': None, 'model': fx_model, 'backend': 'google_fx',
+                    'fx_uuid': _fx_extract_uuid(own_src) if own_src else None,
+                    'fx_src': os.path.relpath(own_src, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/') if own_src else None,
+                    'aspect_ratio': config.get('imageAspectRatio') or '9:16',
+                    'image_size': _image_quality_to_label(config.get('imageQuality')),
+                    'retry_count': 0, 'quality_gate': 'pending_manual_review',
+                    'vlm_qa_reason': None, 'parent_hash': '',
+                }
+                manifest_frames_by_seq[seq] = existing
+            _emit_frame(existing)
+            done_seqs.add(seq)
+            continue
+
+        chunk = chunk_by_start.get(seq)
+        if not chunk:
+            continue  # target 模式下不在重生名单里的序号
+        _check_cancel()
+
+        ref_path = _fx_find_ref_for(frames_dir, chunk[0])
+        if chunk[0] > 1 and not ref_path and sys.stdout:
+            print(
+                f"[FRAME SEQUENCE][FX] 第 {chunk[0]} 帧找不到上一帧的 UUID 留档 "
+                f"(frames/fx_src/img_{chunk[0]-1:03d}_*.jpg)，本批将以无参考模式起链，画面连续性可能下降"
+            )
+
+        chunk_prompts = [prompts_by_seq[s]['prompt'] for s in chunk]
+        if on_progress:
+            for s in chunk:
+                item = prompts_by_seq[s]
+                on_progress('frame_start', {
+                    'slot': item['index'],
+                    'sequence': s,
+                    'total': total_to_generate,
+                })
+        if sys.stdout:
+            print(f"[FRAME SEQUENCE][FX] Google FX 批量生图: 帧 {chunk[0]}~{chunk[-1]} ({len(chunk)} 张), ref={'有' if ref_path else '无'}")
+        try:
+            local_paths, temp_out = _fx_generate_batch(google_fx, fx_models, config, chunk_prompts, ref_path)
+        except ConnectionError:
+            raise
+        except Exception as e:
+            if sys.stdout:
+                print(f"[FRAME SEQUENCE][FX] 批量生图失败，3 秒后整批重试一次: {e}")
+            _check_cancel()
+            time.sleep(3.0)
+            local_paths, temp_out = _fx_generate_batch(google_fx, fx_models, config, chunk_prompts, ref_path)
+
+        try:
+            for offset, s in enumerate(chunk):
+                item = prompts_by_seq[s]
+                is_bridge = ('BRIDGE' in item.get('meta', '').upper())
+                _, fx_src_path, fx_uuid = _fx_store_frame(local_paths[offset], frames_dir, s)
+                prev_ref = _fx_find_ref_for(frames_dir, s)
+                quality_gate, vlm_reason = _run_vlm_qa(s, item, is_bridge, prev_ref)
+                # QA 重生会替换留档，重新定位当前帧的 fx_src
+                cur_ref = _fx_find_ref_for(frames_dir, s + 1)
+                if cur_ref:
+                    fx_src_path, fx_uuid = cur_ref, _fx_extract_uuid(cur_ref)
+                _record_frame(s, item, fx_src_path, fx_uuid, quality_gate, vlm_reason)
+                done_seqs.add(s)
+        finally:
+            shutil.rmtree(temp_out, ignore_errors=True)
+
+    update_manifest_stale_status(manifest, project_dir)
+    _save_manifest()
+    manifest['manifest'] = '/' + os.path.relpath(manifest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+    manifest['project_dir'] = os.path.abspath(project_dir)
+    return manifest
+
+
 def generate_frame_sequence(config, title, prompt_block, on_progress=None, target_sequences=None):
+    if (config.get('imageBackend') or 'api').strip().lower() == 'google_fx':
+        return _generate_frame_sequence_google_fx(
+            config, title, prompt_block,
+            on_progress=on_progress, target_sequences=target_sequences,
+        )
     from prompt_pipeline import _parse_prompt_slots, run_vlm_qa_check
     images, videos = _parse_prompt_slots(prompt_block)
     
@@ -747,6 +1277,10 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         
     if not prompts:
         raise RuntimeError('未在 prompt_block 中找到任何 图片 N: 提示词')
+
+    def _check_cancel():
+        if on_progress and on_progress('cancel_check', None):
+            raise ConnectionError('用户取消了帧序列生成')
 
     project_dir = _get_project_dir(title)
     frames_dir = os.path.join(project_dir, 'frames')
@@ -784,9 +1318,10 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
     lineage_degraded = False
 
     for seq, item in enumerate(prompts, start=1):
+        _check_cancel()
         filename = f'img_{seq:03d}.webp'
         target_path = os.path.join(frames_dir, filename)
-        
+
         should_generate = True
         if target_sequences is not None:
             should_generate = seq in target_sequences
@@ -814,6 +1349,12 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             use_text_generation = (seq == 1 or not previous_path or not os.path.exists(previous_path))
             model = _image_generation_model(config) if use_text_generation else _image_edit_model(config)
             reference = previous_path if not use_text_generation else None
+            if on_progress:
+                on_progress('frame_start', {
+                    'slot': item['index'],
+                    'sequence': seq,
+                    'total': total_to_generate,
+                })
             
             is_fallback = False
             ctrl_prompt = IMG2IMG_CONTROL_PROMPT
@@ -826,16 +1367,48 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     is_fallback = _generate_image_edit(config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
                     if is_fallback:
                         lineage_degraded = True
-            except Exception:
-                retries += 1
-                if use_text_generation:
-                    _generate_text_image(config, item['prompt'], target_path)
-                    lineage_degraded = False
-                else:
-                    ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT if is_bridge else IMG2IMG_CONTROL_PROMPT
-                    is_fallback = _generate_image_edit(config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
-                    if is_fallback:
+            except QuotaExhaustedError as quota_err:
+                # Primary model quota exhausted.
+                # Try fallbackImageModel if configured, otherwise use text-to-image.
+                fallback_model = config.get('imageEditFallbackModel') or config.get('fallbackImageModel')
+                if fallback_model and not use_text_generation:
+                    if sys.stdout:
+                        print(f"[FRAME SEQUENCE] Quota exhausted on primary model. "
+                              f"Retrying frame {seq} with fallback model: {fallback_model}")
+                    fallback_config = dict(config)
+                    fallback_config['imageModel'] = fallback_model
+                    try:
+                        is_fallback = _generate_image_edit(fallback_config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
+                        lineage_degraded = True  # degraded since we switched models mid-sequence
+                        model = _image_edit_model(fallback_config)
+                    except QuotaExhaustedError:
+                        # Fallback model also quota-exhausted – last resort: text-to-image
+                        # on the fallback model (the primary is still exhausted).
+                        if sys.stdout:
+                            print(f"[FRAME SEQUENCE] Fallback model also quota-exhausted. Using text-to-image (fallback model) for frame {seq}.")
+                        _generate_text_image(fallback_config, item['prompt'], target_path)
                         lineage_degraded = True
+                    except Exception as fb_err:
+                        if sys.stdout:
+                            print(f"[FRAME SEQUENCE] Fallback model failed: {fb_err}. Using text-to-image (fallback model) for frame {seq}.")
+                        _generate_text_image(fallback_config, item['prompt'], target_path)
+                        lineage_degraded = True
+                else:
+                    # No fallback model configured – degrade to text-to-image
+                    if sys.stdout:
+                        print(f"[FRAME SEQUENCE] {quota_err} — No fallbackImageModel configured. "
+                              f"Falling back to text-to-image for frame {seq}.")
+                    _generate_text_image(config, item['prompt'], target_path)
+                    lineage_degraded = True
+            except Exception as gen_err:
+                retries += 1
+                if sys.stdout:
+                    print(f"[FRAME SEQUENCE] Frame {seq} generation failed (attempt 1): {gen_err}. "
+                          f"{'Falling back to text-to-image.' if not use_text_generation else 'Retrying text-to-image.'}")
+                # For image-edit failures fall back to text-to-image generation
+                # (preserves the sequence instead of hard-crashing).
+                _generate_text_image(config, item['prompt'], target_path)
+                lineage_degraded = True  # mark lineage as degraded since we lost the i2i chain
 
             # Run VLM visual QA check on successful edits
             if seq > 1 and not use_text_generation and os.path.exists(previous_path) and os.path.exists(target_path):
@@ -849,6 +1422,13 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                         # Retry generation up to 2 times
                         for retry_attempt in range(2):
                             try:
+                                if on_progress:
+                                    on_progress('frame_retry', {
+                                        'slot': item['index'],
+                                        'sequence': seq,
+                                        'attempt': retry_attempt + 1,
+                                        'reason': vlm_reason,
+                                    })
                                 # Get corrected prompt from auxModel using VLM feedback
                                 from prompt_pipeline import fix_image_prompt_with_vlm_feedback, clean_prompt_text, fix_image_clean_frame_proactive, fix_horizon_line, fix_camera_contradictions, fix_rhma_blur, fix_camera_dna
                                 
@@ -969,8 +1549,8 @@ def _run_async_image_generation(task_id, base_url, api_key, payload):
             method='POST',
         )
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(req, timeout=180) as resp:
-            resp_data = json.loads(resp.read().decode('utf-8'))
+        resp_bytes = _execute_request_with_retry(req, opener=opener, timeout=180)
+        resp_data = json.loads(resp_bytes.decode('utf-8'))
         resp_data = _save_image_station_result(resp_data)
         with IMAGE_TASKS_LOCK:
             IMAGE_TASKS[task_id] = {'status': 'completed', 'result': resp_data, 'error': None}
@@ -1002,8 +1582,8 @@ def _run_async_image_edit(task_id, base_url, api_key, body_data, boundary):
             method='POST',
         )
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(req, timeout=180) as resp:
-            resp_data = json.loads(resp.read().decode('utf-8'))
+        resp_bytes = _execute_request_with_retry(req, opener=opener, timeout=180)
+        resp_data = json.loads(resp_bytes.decode('utf-8'))
         resp_data = _save_image_station_result(resp_data)
         with IMAGE_TASKS_LOCK:
             IMAGE_TASKS[task_id] = {'status': 'completed', 'result': resp_data, 'error': None}

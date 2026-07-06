@@ -177,10 +177,9 @@ function showToast(message, type = 'success') {
     
     container.appendChild(toast);
     
-    // Remove after 3s
+    // Use CSS class for exit (avoids JS writing style.opacity/transform → forced layout)
     setTimeout(() => {
-        toast.style.opacity = '0';
-        toast.style.transform = 'translateY(10px)';
+        toast.classList.add('hiding');
         setTimeout(() => toast.remove(), 200);
     }, 3000);
 }

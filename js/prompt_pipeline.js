@@ -229,6 +229,34 @@ function renderAuditMarkdown(md) {
     return html || '<p class="audit-empty">（本次未返回审核报告）</p>';
 }
 
+let loadedIdeationCover = null;
+
+// NOTE: There is no server-side "/api/generate_ideation_cover" endpoint — it was
+// never implemented (grep the whole backend, zero matches for "ideation"). Calling
+// it used to fire a failing POST for every idea card on every page load and every
+// "换一批灵感" refresh, each ending in a console error and a "生成失败" flash. Ideation
+// cards get a fast, free, deterministic placeholder instead; the covers actually
+// worth spending an image-generation call on are the ones made after a project is
+// selected and composed (see /api/generate_cover, which does work — task-based,
+// polled for the result).
+const IDEATION_FAMILY_ICON = { 'natural': '🌲', 'man-made': '🏚️', 'vehicle': '🚢', 'fantasy': '🔮' };
+
+async function fetchIdeationCover(idea, idx, coverContainer) {
+    if (idea.cover_url) {
+        coverContainer.innerHTML = `
+            <img src="${idea.cover_url}" alt="${idea.title}" class="ideation-cover-img" />
+        `;
+        return;
+    }
+
+    const icon = IDEATION_FAMILY_ICON[idea.carrier_family] || '💡';
+    coverContainer.innerHTML = `
+        <div class="ideation-cover-placeholder">
+            <span class="ideation-cover-placeholder-icon">${icon}</span>
+        </div>
+    `;
+}
+
 function renderIdeationCards(ideas) {
     const container = document.getElementById('ideation-cards-container');
     if (!container) return;
@@ -253,6 +281,12 @@ function renderIdeationCards(ideas) {
         }[familyClass] || '自然';
         
         card.innerHTML = `
+            <div class="ideation-card-cover" id="ideation-cover-${idx}">
+                <div class="cover-spinner">
+                    <span class="spinner-icon">⏳</span>
+                    <span class="spinner-text">正在制作灵感封面...</span>
+                </div>
+            </div>
             <div class="ideation-card-header">
                 <div class="ideation-card-title">${idea.title}</div>
                 <div class="ideation-card-score">${idea.score}分</div>
@@ -271,6 +305,24 @@ function renderIdeationCards(ideas) {
                 <button type="button" class="ideation-card-btn primary compose-action-btn">一键合成</button>
             </div>
         `;
+        
+        // Asynchronously fetch cover
+        const coverContainer = card.querySelector('.ideation-card-cover');
+        fetchIdeationCover(idea, idx, coverContainer);
+        
+        // Clicking the cover opens the lightbox
+        coverContainer.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (idea.cover_url && typeof openLightbox === 'function') {
+                openLightbox([{
+                    type: 'image',
+                    url: idea.cover_url,
+                    caption: `<strong>${idea.title}</strong><br>载体: ${idea.carrier} | 现状: ${idea.trauma} | 招牌反差: ${idea.twist_zh || idea.twist}`
+                }], 0);
+            } else {
+                selectIdeationCard(idx);
+            }
+        });
         
         // Clicking the card itself loads the dimensions
         card.addEventListener('click', (e) => {
@@ -304,6 +356,14 @@ function selectIdeationCard(index) {
     
     // 1. Select matching carrier theme in GUI
     const themeVal = mapEnglishCarrierToValue(idea.carrier);
+    
+    // Set loaded cover information
+    loadedIdeationCover = {
+        themeValue: themeVal,
+        cover_url: idea.cover_url || null,
+        english_title: idea.english_title || null
+    };
+    
     const themeBtn = document.querySelector(`#theme-selector .theme-btn[data-value="${themeVal}"]`);
     if (themeBtn) {
         document.querySelectorAll('#theme-selector .theme-btn').forEach(btn => btn.classList.remove('active'));
@@ -346,7 +406,9 @@ function composeIdeationCard(index) {
         budget: "轻奢设计师级",
         ratio: "50% (外壳粗野 ↔ 内里精致)",
         creativity: "脑洞大开",
-        beats_count: 15
+        beats_count: 15,
+        cover_url: idea.cover_url || null,
+        english_title: idea.english_title || null
     };
     
     showToast(`🚀 开始一键合成灵感: ${idea.title}...`, "success");

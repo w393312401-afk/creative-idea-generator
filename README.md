@@ -32,7 +32,11 @@
         3.  **打开网页**（重新拉起浏览器页面）
         4.  **退出**
 
-*   ⚠️ **图像子服务说明（勿单独启动）**：图像服务站已完美整合进主服务（通过 `http://127.0.0.1:8085/image-service-station/` 访问）。**平时请勿单独运行 `image-service-station/run.bat`（**勿单独启动**）**。为了避免端口冲突，该独立子服务的默认端口已修改为 `8086`，仅作为备用开发/调试使用。
+*   **停止服务**：双击运行 [stop.bat](file:///c:/Users/video/Desktop/creative-idea-generator/stop.bat)（一次清掉 8085 与所有残留 8086 监听进程）。
+
+*   📌 **端口永久固定（2026-07-04）**：服务入口只有一个 —— **`http://127.0.0.1:8085/`**。
+    *   图像服务站已整合进主服务（`http://127.0.0.1:8085/image-service-station/` 访问），`run.bat` **不再拉起 8086 独立子服务**（旧逻辑每次启动/重启都会堆积一个 8086 实例）。`image-service-station/server.py` 仅作为开发调试备用，勿单独启动。
+    *   LLM 代理固定 `8046`（`server_config.json` 的 `baseUrl` 为准）；`gpt-5.5` 由服务端 `resolve_gateway` 固定路由到 codex 代理，前端无需也无法再切换端口（设置面板的「GPT 代理端口」选择器已移除）。
 
 ---
 

@@ -11,6 +11,11 @@ const DEFAULT_CONFIG = {
     apiKey: '',
     model: 'gemini-3-flash-agent',
     imageModel: 'nano-banana-2',
+    // 帧序列生成方式: 'api'（LLM 网关）| 'google_fx'（AdsPower 浏览器 UI 自动化）
+    imageBackend: 'api',
+    googleFxImageModel: 'Nano Banana 2',
+    videoModel: 'Veo 3.1 - Lite [Lower Priority]',
+    googleFxIpRotateRequests: 5,
     imageAspectRatio: '9:16',
     imageQuality: '2K'
 };
@@ -109,6 +114,15 @@ let currentVideosController = null;
 
 // Initialize Elements
 document.addEventListener('DOMContentLoaded', () => {
+    // ── Minimal debounce utility (avoids lodash dep) ──
+    window._debounce = function(fn, delay) {
+        let t;
+        return function(...args) {
+            clearTimeout(t);
+            t = setTimeout(() => fn.apply(this, args), delay);
+        };
+    };
+
     loadConfig();
     loadLibrary();
     loadCustomPresets();
@@ -129,7 +143,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const refreshBtn = document.getElementById('ideate-refresh-btn');
     if (refreshBtn) {
         refreshBtn.addEventListener('click', () => {
-            loadIdeationCards();
+            loadIdeationCards(true);
         });
     }
     initLocalServiceLogs();
@@ -250,6 +264,7 @@ function updateFavoriteButtonState() {
     }
 }
 
+let _scrollPending = false;
 function appendLiveTerminal(chunk) {
     const body = document.getElementById('live-terminal-body');
     if (!body) return;
@@ -260,8 +275,14 @@ function appendLiveTerminal(chunk) {
     } else {
         body.textContent += chunk;
     }
-    // Auto-scroll to bottom
-    body.scrollTop = body.scrollHeight;
+    // Throttle auto-scroll with rAF to avoid forced layout on every chunk
+    if (!_scrollPending) {
+        _scrollPending = true;
+        requestAnimationFrame(() => {
+            body.scrollTop = body.scrollHeight;
+            _scrollPending = false;
+        });
+    }
 }
 
 function startLoadingTimer(startTimeOverride = null) {
@@ -527,10 +548,11 @@ function initCanvas() {
         canvas.height = window.innerHeight;
     }
     let resizeTimer;
+    // passive:true — browser does NOT need to wait for event handler before scrolling
     window.addEventListener('resize', () => {
         clearTimeout(resizeTimer);
         resizeTimer = setTimeout(resize, 150);
-    });
+    }, { passive: true });
     resize();
     
     class Particle {
@@ -568,12 +590,20 @@ function initCanvas() {
         particles.push(new Particle());
     }
     
-    function animate() {
+    // ── FPS cap at 30fps to cut GPU load in half without visual regression ──
+    const TARGET_INTERVAL = 1000 / 30; // ~33ms between frames
+    let lastFrameTime = 0;
+
+    function animate(timestamp) {
         requestAnimationFrame(animate);
 
-        // Skip all drawing while the tab is hidden; otherwise run at the display's
-        // native refresh rate. Per-frame work is just a handful of dots, so it stays smooth.
+        // Skip all drawing while the tab is hidden
         if (document.hidden) return;
+
+        // Throttle: skip frame if not enough time has passed
+        const delta = timestamp - lastFrameTime;
+        if (delta < TARGET_INTERVAL) return;
+        lastFrameTime = timestamp - (delta % TARGET_INTERVAL);
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -776,10 +806,12 @@ function setupEventListeners() {
     const clearFailedBtn = document.getElementById('clear-failed-btn');
 
     if (tasksSearchInput) {
-        tasksSearchInput.addEventListener('input', (e) => {
+        // Debounce: avoid firing a network fetch on every single keystroke
+        const debouncedSearch = _debounce((e) => {
             tasksSearchQuery = e.target.value;
             renderTasks();
-        });
+        }, 300);
+        tasksSearchInput.addEventListener('input', debouncedSearch);
     }
     if (tasksStatusSelect) {
         tasksStatusSelect.addEventListener('change', (e) => {
@@ -932,20 +964,32 @@ function setupEventListeners() {
     document.getElementById('save-preset-btn').addEventListener('click', saveCustomPreset);
 
     // Save state on slider input/change
+    // rAF-gate the heavy updateConfigSummary (many DOM reads) so it runs
+    // at most once per animation frame during rapid drag gestures
+    let _configSummaryPending = false;
+    const rafConfigSummary = () => {
+        if (!_configSummaryPending) {
+            _configSummaryPending = true;
+            requestAnimationFrame(() => {
+                updateConfigSummary();
+                _configSummaryPending = false;
+            });
+        }
+    };
     ['slider-complexity', 'slider-budget', 'slider-ratio', 'slider-creativity', 'slider-beats'].forEach(id => {
         const el = document.getElementById(id);
         if (el) {
-            el.addEventListener('input', updateConfigSummary);
+            el.addEventListener('input', rafConfigSummary);
             el.addEventListener('change', saveSelectionState);
         }
     });
 
-    // Save state on selectors click
+    // Save state on selectors click - direct call, no redundant setTimeout
     document.getElementById('theme-selector').addEventListener('click', () => {
-        setTimeout(saveSelectionState, 50);
+        saveSelectionState();
     });
     document.getElementById('anchor-selector').addEventListener('click', () => {
-        setTimeout(saveSelectionState, 50);
+        saveSelectionState();
     });
 
     // Tab buttons switching
@@ -964,16 +1008,20 @@ function setupEventListeners() {
     document.getElementById('generate-frames-btn').addEventListener('click', () => generateFrames());
     document.getElementById('generate-videos-btn').addEventListener('click', () => generateVideos());
     document.getElementById('merge-videos-btn').addEventListener('click', () => mergeVideos());
-    document.getElementById('copy-hook-btn').addEventListener('click', () => {
-        const val = document.getElementById('cover-hook-val').textContent;
-        if (val) {
-            copyText(val).then(() => {
-                showToast("英文文案已复制！", "success");
-            }).catch(err => {
-                showToast("复制失败", "error");
-            });
-        }
-    });
+    const copyHookBtn = document.getElementById('copy-hook-btn');
+    if (copyHookBtn) {
+        copyHookBtn.addEventListener('click', () => {
+            const hookValEl = document.getElementById('cover-hook-val');
+            const val = hookValEl ? hookValEl.textContent : '';
+            if (val) {
+                copyText(val).then(() => {
+                    showToast("英文文案已复制！", "success");
+                }).catch(err => {
+                    showToast("复制失败", "error");
+                });
+            }
+        });
+    }
 
     // Library search & filters
     const libSearch = document.getElementById('library-search');
@@ -2012,6 +2060,7 @@ async function streamFramesProgress(taskId) {
                     try {
                         const parsed = JSON.parse(jsonStr);
                         if (parsed.type === 'start') {
+                            applyVideoProgress('start', parsed.data);
                             const total = parsed.data.total;
                             meta.textContent = `开始生成共 ${total} 帧序列图...`;
                             
@@ -2177,6 +2226,16 @@ async function streamVideosProgress(taskId) {
     updateTabStatusDot();
 
     currentVideosController = new AbortController();
+    let videoProgressState = window.ProgressModel ? ProgressModel.createProgressState('videos') : null;
+    const applyVideoProgress = (eventType, eventData) => {
+        if (!window.ProgressModel) return null;
+        const progressInfo = ProgressModel.normalizeGenerationProgress(eventType, eventData, 'videos', videoProgressState);
+        videoProgressState = progressInfo.state;
+        setProgressBar('videos', progressInfo);
+        if (progressInfo.label) meta.textContent = progressInfo.label;
+        return progressInfo;
+    };
+    applyVideoProgress('queue', { message: '连接视频生成事件流...' });
 
     try {
         const response = await fetch(`/api/compose-stream?task_id=${taskId}`, {
@@ -2210,6 +2269,7 @@ async function streamVideosProgress(taskId) {
                     try {
                         const parsed = JSON.parse(jsonStr);
                         if (parsed.type === 'start') {
+                            applyVideoProgress('start', parsed.data);
                             const total = parsed.data.total;
                             const slots = parsed.data.slots || [];
                             meta.textContent = `开始生成共 ${total} 段视频...`;
@@ -2229,6 +2289,7 @@ async function streamVideosProgress(taskId) {
                                 grid.appendChild(placeholderCard);
                             });
                         } else if (parsed.type === 'video_start') {
+                            applyVideoProgress('video_start', parsed.data);
                             const cur = parsed.data.current;
                             const tot = parsed.data.total;
                             const idx = parsed.data.index;
@@ -2244,6 +2305,7 @@ async function streamVideosProgress(taskId) {
                                 `;
                             }
                         } else if (parsed.type === 'video_done') {
+                            applyVideoProgress('video_done', parsed.data);
                             const v = parsed.data.video;
                             const cur = parsed.data.current;
                             const tot = parsed.data.total;
@@ -2260,6 +2322,7 @@ async function streamVideosProgress(taskId) {
                                 `;
                             }
                         } else if (parsed.type === 'video_error') {
+                            applyVideoProgress('video_error', parsed.data);
                             const cur = parsed.data.current;
                             const tot = parsed.data.total;
                             const idx = parsed.data.index;
@@ -2283,19 +2346,26 @@ async function streamVideosProgress(taskId) {
                                 });
                             }
                         } else if (parsed.type === 'queue') {
+                            applyVideoProgress('queue', parsed.data);
                             meta.textContent = parsed.data.message || '正在排队等待生成视频...';
                         } else if (parsed.type === 'merge_skip') {
+                            applyVideoProgress('merge_skip', parsed.data);
                             meta.textContent = parsed.data.message || '由于存在失败片段，已跳过自动合并。';
                         } else if (parsed.type === 'merge_start') {
+                            applyVideoProgress('merge_start', parsed.data);
                             meta.textContent = '正在自动合并并加速视频 (2x Speed)...';
                         } else if (parsed.type === 'merge_done') {
+                            applyVideoProgress('merge_done', parsed.data);
                             meta.textContent = '所有视频已成功生成并合并加速！';
                         } else if (parsed.type === 'merge_error') {
+                            applyVideoProgress('merge_error', parsed.data);
                             meta.textContent = `自动合并视频失败: ${parsed.data.message || '未知错误'}`;
                             showToast(`自动合并失败: ${parsed.data.message || '未知错误'}`, "warning");
                         } else if (parsed.type === 'result') {
+                            applyVideoProgress('result', parsed.data);
                             manifestData = parsed.data;
                         } else if (parsed.type === 'error') {
+                            applyVideoProgress('error', parsed.data);
                             throw new Error(parsed.data.message || '未知错误');
                         }
                     } catch (err) {
@@ -2378,7 +2448,7 @@ async function streamVideosProgress(taskId) {
             });
 
             try {
-                const resp = await fetch(`/api/get_manifest?title=${encodeURIComponent(currentIdea.title)}`);
+                const resp = await fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(currentIdea))}`);
                 if (resp.ok) {
                     const manifest = await resp.json();
                     currentIdea.frameRun = manifest;
@@ -2768,10 +2838,8 @@ function exportIdeaMarkdown() {
             + '\n';
     }
 
-    let hookMarkdown = '';
-    if (currentIdea.english_title) {
-        hookMarkdown = `\n*TikTok US 英文文案：${currentIdea.english_title}*\n`;
-    }
+    const tiktokMeta = getIdeaTikTokMeta(currentIdea);
+    let hookMarkdown = `\n*TikTok US 推荐主题和 tags：${tiktokMeta.english}*\n*中文翻译：${tiktokMeta.chinese}*\n`;
 
     const markdownContent = `# ${currentIdea.title}
 *场景主题：${currentIdea.theme}*
@@ -2811,6 +2879,16 @@ ${currentIdea.audit_md || '（本次未返回审核报告）'}
 }
 
 // Copy the full prompt set to clipboard
+function copyTikTokMetaToClipboard() {
+    const meta = getIdeaTikTokMeta(currentIdea);
+    copyText(meta.english).then(() => {
+        showToast("TikTok 主题和 hashtags 已复制！", "success");
+    }).catch(err => {
+        showToast("复制失败，请手动选择复制", "error");
+        console.error(err);
+    });
+}
+
 function copyPromptToClipboard() {
     const text = (currentIdea && currentIdea.prompt_block) || document.getElementById('idea-prompt-block').textContent;
     copyText(text).then(() => {
@@ -2849,7 +2927,7 @@ async function generateFrames() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: currentIdea.title,
+                title: getIdeaSaveTitle(currentIdea),
                 prompt_block: currentIdea.prompt_block
             })
         });
@@ -2931,7 +3009,7 @@ async function generateVideos() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: currentIdea.title,
+                title: getIdeaSaveTitle(currentIdea),
                 prompt_block: currentIdea.prompt_block
             })
         });
@@ -3007,7 +3085,7 @@ async function mergeVideos() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                title: currentIdea.title
+                title: getIdeaSaveTitle(currentIdea)
             })
         });
 
@@ -3555,6 +3633,8 @@ async function handleReverse() {
     localStorage.setItem('spark_active_task_id', taskId);
     localStorage.setItem('spark_active_task_dimensions', JSON.stringify(dimensions));
 
+    generationState.progressTaskType = 'reverse-video';
+    generationState.progressState = window.ProgressModel ? ProgressModel.createProgressState('reverse-video') : null;
     setupLoadingSteps('reverse-video');
 
     if (loadingHeader) {
@@ -3677,9 +3757,25 @@ function setupVideoUploadDragAndDrop() {
 // --------------------------------------------------------------------------
 let currentIdeatedIdeas = [];
 
-async function loadIdeationCards() {
+async function loadIdeationCards(force = false) {
     const container = document.getElementById('ideation-cards-container');
     if (!container) return;
+    
+    if (!force) {
+        const cached = localStorage.getItem('ideation_cached_ideas');
+        if (cached) {
+            try {
+                const parsed = JSON.parse(cached);
+                if (parsed && Array.isArray(parsed) && parsed.length > 0) {
+                    currentIdeatedIdeas = parsed;
+                    renderIdeationCards(parsed);
+                    return;
+                }
+            } catch (e) {
+                console.error("Failed to parse cached ideas:", e);
+            }
+        }
+    }
     
     container.innerHTML = '<div class="ideation-loading">正在寻找灵感中，请稍候...</div>';
     
@@ -3698,6 +3794,7 @@ async function loadIdeationCards() {
         const data = await response.json();
         if (data.status === 'ok' && data.ideas) {
             currentIdeatedIdeas = data.ideas;
+            localStorage.setItem('ideation_cached_ideas', JSON.stringify(data.ideas));
             renderIdeationCards(data.ideas);
         } else {
             container.innerHTML = `<div class="ideation-error">加载失败: ${data.message || '未知错误'}</div>`;

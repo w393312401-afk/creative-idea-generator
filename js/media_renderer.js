@@ -27,9 +27,21 @@ function safeSetImageSrc(imgEl, url) {
 }
 
 function renderIdea(result) {
-    document.getElementById('idea-title').textContent = result.title || '未命名创意';
-    document.getElementById('tag-theme').textContent = result.theme || '';
-    document.getElementById('tag-creativity').textContent = result.creativity || '';
+    const titleEl = document.getElementById('idea-title');
+    const titleCnEl = document.getElementById('idea-title-cn');
+    const meta = getIdeaTikTokMeta(result);
+    if (titleEl) {
+        titleEl.textContent = meta.english;
+        titleEl.title = result.title || meta.english;
+    }
+    if (titleCnEl) {
+        titleCnEl.textContent = meta.chinese;
+        titleCnEl.title = meta.chinese;
+    }
+    const tagThemeEl = document.getElementById('tag-theme');
+    const tagCreativityEl = document.getElementById('tag-creativity');
+    if (tagThemeEl) tagThemeEl.textContent = result.theme || '';
+    if (tagCreativityEl) tagCreativityEl.textContent = result.creativity || '';
 
     renderRepairBanner(result.repair_md);
     document.getElementById('idea-prompt-block').textContent = result.prompt_block || '（本次未返回提示词内容）';
@@ -84,7 +96,7 @@ function renderIdea(result) {
     renderCoversForIdea(result);
 
     // Asynchronously fetch latest manifest (frames & videos) from server if it exists
-    fetch(`/api/get_manifest?title=${encodeURIComponent(result.title)}`)
+    fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(result))}`)
         .then(resp => {
             if (resp.ok) {
                 return resp.json();
