@@ -1004,7 +1004,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
     rotate_requests = config.get('googleFxIpRotateRequests')
     if rotate_requests is not None:
         os.environ['MIYA_ROTATE_THRESHOLD'] = str(rotate_requests)
-    from prompt_pipeline import _parse_prompt_slots, run_vlm_qa_check
+    from prompt_pipeline import _parse_prompt_slots, run_frame_qa_check
     images, videos = _parse_prompt_slots(prompt_block)
 
     prompts = []
@@ -1087,7 +1087,9 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             on_progress('frame', {'frame': frame_info, 'current': generated_count, 'total': total_to_generate})
 
     def _run_vlm_qa(seq, item, is_bridge, ref_path):
-        """逐帧 VLM 质检 + 失败改写重生（≤2 次）。返回 (quality_gate, vlm_reason)。"""
+        """逐帧 VLM 质检 + 失败改写重生（≤2 次）。返回 (quality_gate, vlm_reason)。
+        quality_gate 为 'auto_approved' 表示 VLM 自动判定通过；'pending_manual_review'
+        表示未跑过任何自动校验（如首帧或上一帧缺失）；'vlm_qa_failed' 表示重试后仍未通过。"""
         if seq <= 1 or not _frame_exists(seq - 1):
             return 'pending_manual_review', None
         video_item = videos.get(seq - 1, "")
@@ -1097,9 +1099,9 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
         prev_path = _webp_path(seq - 1)
         target_path = _webp_path(seq)
-        vlm_pass, vlm_reason = run_vlm_qa_check(config, prev_path, target_path, video_prompt, is_bridge=is_bridge)
+        vlm_pass, vlm_reason = run_frame_qa_check(config, _webp_path(1), prev_path, target_path, video_prompt, seq, is_bridge=is_bridge)
         if vlm_pass:
-            return 'pending_manual_review', None
+            return 'auto_approved', None
 
         if sys.stdout:
             print(f"[VLM QA][FX] Beat {seq-1} (IMAGE {seq}) failed VLM check: {vlm_reason}. Retrying via Google FX...")
@@ -1124,12 +1126,12 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                     _fx_store_frame(retry_paths[0], frames_dir, seq)
                 finally:
                     shutil.rmtree(retry_tmp, ignore_errors=True)
-                vlm_pass, vlm_reason = run_vlm_qa_check(config, prev_path, target_path, video_prompt, is_bridge=is_bridge)
+                vlm_pass, vlm_reason = run_frame_qa_check(config, _webp_path(1), prev_path, target_path, video_prompt, seq, is_bridge=is_bridge)
                 if vlm_pass:
                     if sys.stdout:
                         print(f"[VLM QA][FX] Beat {seq-1} passed VLM check on retry {retry_attempt+1}!")
                     item['prompt'] = corrected  # 回写 manifest 用的提示词
-                    return 'pending_manual_review', None
+                    return 'auto_approved', None
                 if sys.stdout:
                     print(f"[VLM QA][FX] Beat {seq-1} failed VLM check on retry {retry_attempt+1}: {vlm_reason}")
             except ConnectionError:
@@ -1237,6 +1239,11 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                 item = prompts_by_seq[s]
                 is_bridge = ('BRIDGE' in item.get('meta', '').upper())
                 _, fx_src_path, fx_uuid = _fx_store_frame(local_paths[offset], frames_dir, s)
+                if s > 1:
+                    first_frame_path = _webp_path(1)
+                    target_path = _webp_path(s)
+                    if os.path.exists(first_frame_path) and os.path.exists(target_path):
+                        _match_color_lab(target_path, first_frame_path, target_path)
                 prev_ref = _fx_find_ref_for(frames_dir, s)
                 quality_gate, vlm_reason = _run_vlm_qa(s, item, is_bridge, prev_ref)
                 # QA 重生会替换留档，重新定位当前帧的 fx_src
@@ -1255,13 +1262,74 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
     return manifest
 
 
+def _match_color_lab(source_path, reference_path, output_path):
+    """
+    Adjusts the color statistics of source to match reference in LAB color space.
+    L channel (lightness): 15% blend (allows progressive lighting changes).
+    A & B color channels: 85% blend (suppresses pink/magenta color drift).
+    """
+    try:
+        import cv2
+        import numpy as np
+        
+        src = cv2.imread(source_path)
+        ref = cv2.imread(reference_path)
+        if src is None or ref is None:
+            return
+
+        # Convert BGR to LAB
+        src_lab = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float32)
+        ref_lab = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+        # Split channels
+        s_l, s_a, s_b = cv2.split(src_lab)
+        r_l, r_a, r_b = cv2.split(ref_lab)
+
+        # Channel stats
+        s_means = [np.mean(s_l), np.mean(s_a), np.mean(s_b)]
+        s_stds = [np.std(s_l), np.std(s_a), np.std(s_b)]
+        r_means = [np.mean(r_l), np.mean(r_a), np.mean(r_b)]
+        r_stds = [np.std(r_l), np.std(r_a), np.std(r_b)]
+
+        adjusted_channels = []
+        for i, (s_ch, s_mean, s_std, r_mean, r_std) in enumerate(zip(
+            [s_l, s_a, s_b], s_means, s_stds, r_means, r_stds
+        )):
+            if s_std < 1e-4:
+                adjusted_channels.append(s_ch)
+                continue
+            
+            # Reinhard color transfer
+            adjusted = (s_ch - s_mean) * (r_std / s_std) + r_mean
+            
+            # Soft-blend to preserve local lighting transitions
+            if i == 0:  # L channel (lightness) - keep most of original L variations
+                blend = 0.15 * adjusted + 0.85 * s_ch
+            else:       # A & B color channels - transfer color profile
+                blend = 0.85 * adjusted + 0.15 * s_ch
+            
+            adjusted_channels.append(blend)
+
+        # Merge back and convert
+        merged = cv2.merge(adjusted_channels)
+        merged[:, :, 0] = np.clip(merged[:, :, 0], 0, 100)
+        merged[:, :, 1] = np.clip(merged[:, :, 1], -127, 127)
+        merged[:, :, 2] = np.clip(merged[:, :, 2], -127, 127)
+        
+        result_bgr = cv2.cvtColor(merged.astype(np.uint8), cv2.COLOR_LAB2BGR)
+        cv2.imwrite(output_path, result_bgr)
+    except Exception as e:
+        if sys.stdout:
+            print(f"[COLOR MATCH] Warning: LAB color matching failed: {e}")
+
+
 def generate_frame_sequence(config, title, prompt_block, on_progress=None, target_sequences=None):
     if (config.get('imageBackend') or 'api').strip().lower() == 'google_fx':
         return _generate_frame_sequence_google_fx(
             config, title, prompt_block,
             on_progress=on_progress, target_sequences=target_sequences,
         )
-    from prompt_pipeline import _parse_prompt_slots, run_vlm_qa_check
+    from prompt_pipeline import _parse_prompt_slots, run_frame_qa_check
     images, videos = _parse_prompt_slots(prompt_block)
     
     prompts = []
@@ -1343,6 +1411,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         retries = 0
         vlm_qa_failed = False
         vlm_qa_reason = None
+        vlm_checked = False
         is_bridge = ('BRIDGE' in item.get('meta', '').upper())
 
         if not skip_api_call:
@@ -1369,53 +1438,65 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                         lineage_degraded = True
             except QuotaExhaustedError as quota_err:
                 # Primary model quota exhausted.
-                # Try fallbackImageModel if configured, otherwise use text-to-image.
+                # Try fallbackImageModel if configured, otherwise raise error.
                 fallback_model = config.get('imageEditFallbackModel') or config.get('fallbackImageModel')
-                if fallback_model and not use_text_generation:
+                if fallback_model:
                     if sys.stdout:
                         print(f"[FRAME SEQUENCE] Quota exhausted on primary model. "
                               f"Retrying frame {seq} with fallback model: {fallback_model}")
                     fallback_config = dict(config)
                     fallback_config['imageModel'] = fallback_model
                     try:
-                        is_fallback = _generate_image_edit(fallback_config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
-                        lineage_degraded = True  # degraded since we switched models mid-sequence
-                        model = _image_edit_model(fallback_config)
-                    except QuotaExhaustedError:
-                        # Fallback model also quota-exhausted – last resort: text-to-image
-                        # on the fallback model (the primary is still exhausted).
-                        if sys.stdout:
-                            print(f"[FRAME SEQUENCE] Fallback model also quota-exhausted. Using text-to-image (fallback model) for frame {seq}.")
-                        _generate_text_image(fallback_config, item['prompt'], target_path)
-                        lineage_degraded = True
+                        if use_text_generation:
+                            _generate_text_image(fallback_config, item['prompt'], target_path)
+                            lineage_degraded = False
+                            model = _image_generation_model(fallback_config)
+                        else:
+                            is_fallback = _generate_image_edit(fallback_config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
+                            lineage_degraded = True  # degraded since we switched models mid-sequence
+                            model = _image_edit_model(fallback_config)
                     except Exception as fb_err:
-                        if sys.stdout:
-                            print(f"[FRAME SEQUENCE] Fallback model failed: {fb_err}. Using text-to-image (fallback model) for frame {seq}.")
-                        _generate_text_image(fallback_config, item['prompt'], target_path)
-                        lineage_degraded = True
+                        if not use_text_generation:
+                            if sys.stdout:
+                                print(f"[FRAME SEQUENCE] Fallback model failed on frame {seq}: {fb_err}. "
+                                      f"Using last-resort text-to-image (fallback model) for frame {seq}.")
+                            _generate_text_image(fallback_config, item['prompt'], target_path)
+                            lineage_degraded = True
+                            model = _image_generation_model(fallback_config)
+                        else:
+                            if sys.stdout:
+                                print(f"[FRAME SEQUENCE] Fallback model failed on frame {seq}: {fb_err}.")
+                            raise RuntimeError(f"第 {seq} 帧生成失败（主模型配额耗尽，且备用模型也失败）: {fb_err}")
                 else:
-                    # No fallback model configured – degrade to text-to-image
-                    if sys.stdout:
-                        print(f"[FRAME SEQUENCE] {quota_err} — No fallbackImageModel configured. "
-                              f"Falling back to text-to-image for frame {seq}.")
-                    _generate_text_image(config, item['prompt'], target_path)
-                    lineage_degraded = True
+                    raise quota_err
             except Exception as gen_err:
-                retries += 1
-                if sys.stdout:
-                    print(f"[FRAME SEQUENCE] Frame {seq} generation failed (attempt 1): {gen_err}. "
-                          f"{'Falling back to text-to-image.' if not use_text_generation else 'Retrying text-to-image.'}")
-                # For image-edit failures fall back to text-to-image generation
-                # (preserves the sequence instead of hard-crashing).
-                _generate_text_image(config, item['prompt'], target_path)
-                lineage_degraded = True  # mark lineage as degraded since we lost the i2i chain
+                if use_text_generation:
+                    retries += 1
+                    if sys.stdout:
+                        print(f"[FRAME SEQUENCE] First frame generation failed: {gen_err}. Retrying text-to-image.")
+                    _generate_text_image(config, item['prompt'], target_path)
+                    lineage_degraded = False
+                else:
+                    if sys.stdout:
+                        print(f"[FRAME SEQUENCE] Frame {seq} image-to-image generation failed: {gen_err}. Subsequent frames cannot fall back to text-to-image.")
+                    raise RuntimeError(f"第 {seq} 帧图生图失败: {gen_err}")
+
+            # Apply LAB color matching to prevent pink drift
+            if seq > 1 and os.path.exists(target_path):
+                first_frame_path = os.path.join(frames_dir, 'img_001.webp')
+                if os.path.exists(first_frame_path):
+                    if sys.stdout:
+                        print(f"[COLOR MATCH] Aligning frame {seq} color to baseline first frame.")
+                    _match_color_lab(target_path, first_frame_path, target_path)
 
             # Run VLM visual QA check on successful edits
             if seq > 1 and not use_text_generation and os.path.exists(previous_path) and os.path.exists(target_path):
                 video_item = videos.get(seq - 1, "")
                 video_prompt = video_item['body'] if isinstance(video_item, dict) else video_item
                 if video_prompt:
-                    vlm_pass, vlm_reason = run_vlm_qa_check(config, previous_path, target_path, video_prompt, is_bridge=is_bridge)
+                    vlm_checked = True
+                    image_1_path = os.path.join(frames_dir, 'img_001.webp')
+                    vlm_pass, vlm_reason = run_frame_qa_check(config, image_1_path, previous_path, target_path, video_prompt, seq, is_bridge=is_bridge)
                     if not vlm_pass:
                         if sys.stdout:
                             print(f"[VLM QA] Beat {seq-1} (IMAGE {seq}) failed VLM check: {vlm_reason}. Retrying generation with VLM feedback...")
@@ -1458,7 +1539,10 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                                 is_fallback = _generate_image_edit(config, corrected_prompt, previous_path, target_path, control_prompt=ctrl_prompt)
                                 if is_fallback:
                                     lineage_degraded = True
-                                vlm_pass, vlm_reason = run_vlm_qa_check(config, previous_path, target_path, video_prompt, is_bridge=is_bridge)
+                                first_frame_path = os.path.join(frames_dir, 'img_001.webp')
+                                if os.path.exists(first_frame_path) and os.path.exists(target_path):
+                                    _match_color_lab(target_path, first_frame_path, target_path)
+                                vlm_pass, vlm_reason = run_frame_qa_check(config, first_frame_path, previous_path, target_path, video_prompt, seq, is_bridge=is_bridge)
                                 if vlm_pass:
                                     if sys.stdout:
                                         print(f"[VLM QA] Beat {seq-1} passed VLM check on retry {retry_attempt+1}!")
@@ -1477,8 +1561,12 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                         
             if vlm_qa_failed:
                 current_quality_gate = 'vlm_qa_failed'
+            elif lineage_degraded:
+                current_quality_gate = 'i2i_fallback_degraded'
+            elif vlm_checked:
+                current_quality_gate = 'auto_approved'
             else:
-                current_quality_gate = 'i2i_fallback_degraded' if lineage_degraded else 'pending_manual_review'
+                current_quality_gate = 'pending_manual_review'
         else:
             reference = previous_path if seq > 1 else None
             existing_frame = manifest_frames_by_seq.get(seq)

@@ -1736,11 +1736,11 @@ fetch("${tunnelOrigin}/api/reverse-video", {
                 btnSendRequest.disabled = false;
                 btnSendRequest.querySelector('span').textContent = '发送 API 请求';
                 
-              } else if (status === 'failed') {
+              } else if (status === 'failed' || status === 'cancelled' || status === 'not_found' || !status) {
                 clearInterval(videoPollInterval);
                 videoPollInterval = null;
                 
-                logToPlayConsole(`视频生成任务失败！完整响应 JSON：\n${JSON.stringify(pollData, null, 2)}`, 'error');
+                logToPlayConsole(`视频生成任务结束（状态：${status || '未知'}）！完整响应 JSON：\n${JSON.stringify(pollData, null, 2)}`, 'error');
                 
                 btnSendRequest.disabled = false;
                 btnSendRequest.querySelector('span').textContent = '发送 API 请求';

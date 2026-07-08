@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | Antigravity Tools 代理 | `http://127.0.0.1:8046` | 底层 OpenAI 兼容接口及 Gemini 图像路由 |
 | SPARK 应用服务 | `http://127.0.0.1:8085` | 网页、任务管理和应用层图像接口 |
-| SPARK Studio 图像服务站 | `http://127.0.0.1:8085/image-service-station/` | 文生图、图生图操作界面 |
+| SPARK 图像工坊 | `http://127.0.0.1:8085/`（顶部「🎨 图像工坊」标签页） | 文生图、图生图操作界面 |
 
 当前 `server_config.json` 的推荐配置：
 

@@ -76,15 +76,15 @@ def _slice_between(text, start_marker, end_marker):
 
 def _aux_model(config):
     """Return the low-cost model for mechanical parsing/audit tasks.
-    Defaults to gemini-2.5-flash if the main model is gemini-3-flash-agent."""
+    Defaults to gemini-3.5-flash-low if the main model is gemini-3-flash-agent."""
     if not isinstance(config, dict):
-        return 'gemini-2.5-flash'
+        return 'gemini-3.5-flash-low'
     explicit = (config.get('cheapModel') or config.get('auxModel') or '').strip()
     if explicit:
         return explicit
     main_model = (config.get('model') or '').strip()
     if 'agent' in main_model.lower() or not main_model:
-        return 'gemini-2.5-flash'
+        return 'gemini-3.5-flash-low'
     return main_model
 
 
@@ -394,17 +394,29 @@ def run_vlm_qa_check(config, img_i_path, img_ip1_path, video_prompt, is_bridge=F
                 "2. CAMERA perspective/viewpoint jumps: The camera position, angle, or background layout shifted or jumped. The background structure must remain locked (same viewpoint, same horizon line level, same perspective).\n"
             )
         system_prompt += (
-            "3. ACTION mismatch: The visual change between Image 1 and Image 2 does NOT correspond to the action described in the VIDEO prompt.\n\n"
+            "3. ACTION mismatch: The visual change between Image 1 and Image 2 does NOT correspond to the action described in the VIDEO prompt.\n"
+            "4. CLEAN FRAME (Image 2 only): Image 2 is a static handoff anchor, not mid-action footage — it must contain "
+            "zero workers, people, or active machinery, even though the VIDEO prompt describes them acting during the "
+            "clip. Fail if any person or machine is visibly present in Image 2 itself.\n"
+            "5. BOUNDED PROGRESS: only the change described by the VIDEO prompt should be visible. Fail if areas or "
+            "systems NOT mentioned in the VIDEO prompt also changed (uninvited bonus progress), or if the change is "
+            "far more extensive than a single short labor beat could plausibly accomplish.\n"
+            "6. CAUSAL TRACE: the resulting state in Image 2 should carry at least some visible physical evidence "
+            "consistent with labor having happened (tool marks, seams, fasteners, residue, debris, drag marks, dust), "
+            "not a perfectly clean instantaneous swap with zero trace of how the change occurred.\n"
+            "7. NO TEXT ARTIFACTS: Image 2 must contain no readable text, captions, watermarks, or UI glyphs rendered "
+            "into the scene.\n\n"
             "Response format:\n"
-            "- If the background/composition is consistent AND the change corresponds to the video prompt, respond EXACTLY with: PASS\n"
-            "- If there is a camera jump, no change, or incorrect change, respond with: FAIL: <reason in Chinese>"
+            "- If all checks pass, respond EXACTLY with: PASS\n"
+            "- Otherwise respond with: FAIL: <reason in Chinese, at most 2 sentences, name the single most important "
+            "failure only>"
         )
-        
+
         user_text = f"VIDEO transition prompt:\n{video_prompt}\n\nPlease analyze the transition from Image 1 to Image 2."
-        
+
         response = _multimodal_chat(config, system_prompt, user_text, [img_i_path, img_ip1_path])
         response_clean = response.strip()
-        
+
         if response_clean.upper() == "PASS" or response_clean.upper().startswith("PASS"):
             return True, "PASS"
         else:
@@ -413,6 +425,178 @@ def run_vlm_qa_check(config, img_i_path, img_ip1_path, video_prompt, is_bridge=F
         if sys.stdout:
             print(f"[VLM QA] VLM API call failed: {e}. Skipping VLM check to avoid blocking pipeline.")
         return True, f"Skipped (API Error: {e})"
+
+
+def check_landmark_drift(config, image_1_path, current_image_path):
+    """
+    Compares the current frame directly against IMAGE 1 (the original anchor), not just the
+    immediately preceding frame. run_vlm_qa_check only ever compares adjacent pairs, so slow
+    multi-beat drift (a landmark creeping position/scale beat by beat, or an earlier repair
+    silently reverting several beats later) can pass every individual adjacent check while
+    still having drifted badly by frame N. This is the cross-frame backstop for that gap.
+    Returns (pass_boolean, reason_string).
+    """
+    try:
+        system_prompt = (
+            "You are a strict visual consistency auditor comparing two frames from the SAME "
+            "static-camera restoration time-lapse project: Image 1 is the ORIGINAL first anchor "
+            "frame (IMAGE 1); Image 2 is a LATER frame from the same sequence, several beats downstream.\n\n"
+            "Both frames should share the exact same camera position, lens, height, angle, and background "
+            "structure — only the construction/renovation state in the active work area is expected to "
+            "change between them (that is normal and correct, do not flag it). Check specifically for DRIFT "
+            "and REGRESSION, not for expected construction progress:\n"
+            "1. LANDMARK DRIFT: any fixed structural landmark visible in Image 1 (walls, columns, window/door "
+            "openings, roofline, horizon line) that has silently shifted position, changed scale, or vanished "
+            "in Image 2 without an explicit demolition/removal reason.\n"
+            "2. CAMERA DRIFT: the viewpoint, height, angle, or horizon line level has crept away from Image 1's "
+            "framing.\n"
+            "3. STATE REGRESSION: any area, surface, or object that was already repaired/cleaned/installed at "
+            "some point in this project has reverted to a more damaged or unfinished state in Image 2.\n\n"
+            "Do NOT fail for expected construction progress in the active work zone, and do NOT fail merely "
+            "because the two images look different overall — only flag unexplained structural/camera drift or "
+            "a completed element that has un-happened.\n\n"
+            "Response format:\n"
+            "- If no drift or regression is detected, respond EXACTLY with: PASS\n"
+            "- Otherwise respond with: FAIL: <reason in Chinese, at most 2 sentences>"
+        )
+        user_text = "Image 1 = the project's original IMAGE 1 anchor. Image 2 = a later frame being checked for drift/regression against it."
+
+        response = _multimodal_chat(config, system_prompt, user_text, [image_1_path, current_image_path])
+        response_clean = response.strip()
+
+        if response_clean.upper() == "PASS" or response_clean.upper().startswith("PASS"):
+            return True, "PASS"
+        return False, response_clean
+    except Exception as e:
+        if sys.stdout:
+            print(f"[LANDMARK DRIFT QA] check_landmark_drift API call failed: {e}. Skipping to avoid blocking pipeline.")
+        return True, f"Skipped (API Error: {e})"
+
+
+def run_frame_qa_check(config, image_1_path, prev_path, target_path, video_prompt, seq, is_bridge=False):
+    """
+    Combined per-frame QA for IMAGE `seq`: the existing adjacent-pair check (run_vlm_qa_check)
+    plus, for seq > 2, the cross-frame landmark-drift backstop (check_landmark_drift) against
+    IMAGE 1. Skips the drift check for seq <= 2 since IMAGE 1 IS the adjacent frame there and
+    the adjacent check already covers it. Returns (pass_boolean, reason_string).
+    """
+    passed, reason = run_vlm_qa_check(config, prev_path, target_path, video_prompt, is_bridge=is_bridge)
+    if not passed:
+        return passed, reason
+    if seq > 2 and image_1_path and os.path.exists(image_1_path) and os.path.exists(target_path):
+        return check_landmark_drift(config, image_1_path, target_path)
+    return passed, reason
+
+
+def check_anchor_frame_compliance(config, image_path, image_1_prompt, packet, parsed_brief):
+    """
+    Autonomous Anchor Acceptance Gate for the rendered IMAGE 1 (the anchor every
+    subsequent frame visually chains from via image-to-image reference). Unlike
+    run_vlm_qa_check (which only compares two consecutive frames' MOTION), this checks
+    the single rendered image against the SKILL's static-frame rules and Genre DNA tone,
+    since IMAGE 1 never gets any other automated check today.
+    Returns (pass_boolean, reason_string).
+    """
+    try:
+        landmarks = packet.get('primary_landmarks') or []
+        landmarks_str = "; ".join(
+            f"{lm.get('name', '?')} at {lm.get('grid', '?')} (scale {lm.get('z_depth_scale', '?')})"
+            for lm in landmarks if isinstance(lm, dict)
+        ) or "(none declared)"
+
+        system_prompt = (
+            "You are a strict visual quality auditor for the FIRST anchor frame (IMAGE 1 / trauma state) "
+            "of a restoration/renovation time-lapse. Every later frame in this project will be generated "
+            "using this exact image as its visual reference, so this is the only checkpoint before the "
+            "whole downstream sequence commits to it. Check the attached image against ALL of the following:\n\n"
+            "1. CLEAN FRAME: the image must contain zero workers, people, or active machinery.\n"
+            "2. ZERO INTERVENTION EVIDENCE: this is the BEFORE/trauma anchor — nobody has touched this space "
+            "yet, not even briefly. The image must contain no tools, ladders, scaffolding, paint cans, tarps, "
+            "drop cloths, staged/stacked fresh construction materials, work lights, safety cones, or any patch "
+            "of surface that reads as already-repaired, already-cleaned, or already-painted. Every object and "
+            "surface visible must look like pre-existing neglect or decay that nobody has prepared for or begun "
+            "acting on. Fail this check if ANY object implies restoration work has already started or is staged "
+            "to start, even with zero people present.\n"
+            "3. CAMERA DNA: the shot should plausibly match this declared camera description: "
+            f"\"{packet.get('camera_dna', '(none declared)')}\". Flag only a clear mismatch (e.g. declared "
+            "eye-level static shot but the image is an aerial/drone view).\n"
+            "4. PRIMARY LANDMARKS: the packet declares these 3 landmarks across foreground/mid/background: "
+            f"{landmarks_str}. At least the general idea of these features should be visible somewhere in "
+            "the frame, roughly in their declared depth zone. Do not fail for minor position drift.\n"
+            "5. GENUINE DAMAGE (positive severity threshold, not just 'not clean'): the scene must show AT "
+            "LEAST THREE of these independent damage categories simultaneously, each clearly visible: (a) "
+            "structural damage — cracks, collapse, sagging, holes, missing sections; (b) surface decay — rust, "
+            "water stains, peeling paint, mold/mildew, corrosion; (c) biological/vegetation intrusion — moss, "
+            "vines, roots, weeds growing through gaps or across surfaces; (d) debris/clutter accumulation — "
+            "rubble, fallen materials, scattered trash, collapsed fixtures. A room that is merely lightly aged, "
+            "faded, or covered in light dust WITHOUT at least three of these categories present must FAIL — "
+            "generic mild weathering is not sufficient severity for a trauma anchor.\n"
+            "6. GENRE TONE (most important): this project's premise is "
+            f"\"{parsed_brief.get('carrier', 'the carrier')}\" in \"{parsed_brief.get('env', 'its environment')}\", "
+            f"currently in this ruined state: \"{parsed_brief.get('trauma', 'a ruined state')}\". The shell "
+            "should read as monumental, improbable, and visually striking — a raw, wild-looking structure "
+            "nobody would expect to be habitable — not a small, mundane, or generic-looking space. Fail this "
+            "check if the image looks like an ordinary interior/exterior with none of that scale or wildness.\n"
+            "7. NO TEXT ARTIFACTS: no readable text, captions, watermarks, or UI glyphs rendered into the scene.\n\n"
+            "Response format:\n"
+            "- If all checks pass, respond EXACTLY with: PASS\n"
+            "- Otherwise respond with: FAIL: <reason in Chinese, at most 2 sentences, name the single most "
+            "important failure only, and if it's check 2 or check 5, explicitly name the offending object(s) "
+            "or state which damage categories are missing>"
+        )
+        user_text = f"IMAGE 1 prompt that was used to generate this image:\n{image_1_prompt}\n\nPlease audit the attached image."
+
+        response = _multimodal_chat(config, system_prompt, user_text, [image_path])
+        response_clean = response.strip()
+
+        if response_clean.upper() == "PASS" or response_clean.upper().startswith("PASS"):
+            return True, "PASS"
+        return False, response_clean
+    except Exception as e:
+        if sys.stdout:
+            print(f"[ANCHOR QA] check_anchor_frame_compliance API call failed: {e}. Skipping to avoid blocking pipeline.")
+        return True, f"Skipped (API Error: {e})"
+
+
+def refine_packet_from_accepted_anchor(config, image_path, packet):
+    """
+    After IMAGE 1 passes the Anchor Acceptance Gate, reconcile the Drift Lock packet
+    (written by an LLM before any image ever existed) against what the image model
+    actually rendered, so beats 2..N+1 are written against confirmed reality instead
+    of the pre-visualized spec. Falls back to the original packet unchanged on any
+    parse/API failure — this is a refinement pass, not a required generation step.
+    """
+    system_prompt = (
+        "You are a spatial consistency supervisor reconciling a Drift Lock & SCUP packet against "
+        "the ACTUAL rendered anchor image (IMAGE 1) for a restoration time-lapse project. The packet "
+        "was written before any image existed, so some details may not perfectly match the render. "
+        "Your job is to adjust ONLY the fields that visibly disagree with the image, so every "
+        "subsequent beat's prompts describe what is truly on screen.\n\n"
+        "You must output ONLY a valid JSON object with the SAME shape as the input packet (keys: "
+        "camera_dna, geometry_lock, primary_landmarks, frame_boundaries, object_ledger, "
+        "worker_choreography, lighting_phase_ladder, passive_environment, interest_budget). Keep every "
+        "field that already matches the image unchanged, verbatim. Only rewrite camera_dna / "
+        "primary_landmarks / frame_boundaries / object_ledger entries that clearly contradict what is "
+        "visible (e.g. a landmark that isn't there, a grid position that's obviously wrong, a lens/height "
+        "that doesn't match the visible framing). Do not invent new landmarks or objects that are not "
+        "visible in the image. No markdown, no code fences, no other text."
+    )
+    user_text = f"Current packet:\n{json.dumps(packet, indent=2, ensure_ascii=False)}\n\nReconcile this packet against the attached IMAGE 1."
+
+    try:
+        response = _multimodal_chat(config, system_prompt, user_text, [image_path])
+        response_clean = _strip_code_fences(response).strip()
+        refined = json.loads(response_clean)
+        if not isinstance(refined, dict):
+            return packet
+        refined = normalize_packet(refined)
+        if not all(k in refined for k in ["camera_dna", "geometry_lock", "primary_landmarks", "frame_boundaries"]):
+            return packet
+        return refined
+    except Exception as e:
+        if sys.stdout:
+            print(f"[ANCHOR QA] refine_packet_from_accepted_anchor failed, keeping original packet: {e}")
+        return packet
 
 
 def fix_image_prompt_with_vlm_feedback(config, original_prompt, vlm_reason):
@@ -427,6 +611,8 @@ def fix_image_prompt_with_vlm_feedback(config, original_prompt, vlm_reason):
         "Specifically:\n"
         "- If the auditor reported that an object wasn't removed, make sure to state that the object has been removed, using terms like 'REMOVED: [object name]'.\n"
         "- If the auditor reported that a required object is missing, append a clear description of the object to the prompt.\n"
+        "- If the auditor reported intervention evidence (tools, ladders, scaffolding, paint cans, tarps, staged materials, work lights, or any already-repaired/already-cleaned/already-painted patch), explicitly add a negation clause naming and removing each offending item (e.g. 'no ladders, no tools, no scaffolding, no staged materials anywhere in frame; every surface is untouched original decay') — do not just soften the wording, actually state their absence.\n"
+        "- If the auditor reported insufficient damage severity (missing damage categories), strengthen the trauma description by adding concrete, specific damage from the categories the auditor said were missing (structural cracks/collapse, rust/water stains/peeling paint/mold, moss/vines/roots growing through, rubble/scattered debris) — do not just say 'very damaged', name the specific material and damage type and where it is.\n"
         "- Keep the rest of the original prompt's structure, landmarks, Camera DNA, and style intact.\n"
         "- Do NOT output any explanations, markdown code fences, or headers. Output ONLY the raw corrected prompt text in English."
     )
@@ -1829,11 +2015,16 @@ Proposed Beat Ladder:
         return []
 
 
-def call_llm(config, dimensions, on_progress=None):
+def compose_anchor_and_packet(config, dimensions, on_progress=None):
+    """Phase 1 of the composer: brief parsing, real-world grounding, beat ladder,
+    Drift Lock packet, and the IMAGE 1 (anchor) prompt only. Returns a state dict
+    consumed by compose_remaining_beats(). Callers that want to gate on the actual
+    rendered IMAGE 1 (e.g. the autonomous pipeline) can inspect/replace
+    state['image_1_prompt'] and refine state['packet'] before continuing to phase 2."""
     if isinstance(config, dict):
         config['_skipped_checks'] = 0
     if sys.stdout:
-        print("[DEBUG] call_llm: Starting structured agent loop...")
+        print("[DEBUG] compose_anchor_and_packet: Starting structured agent loop...")
 
     # Step 1: Brief Parsing
     if on_progress:
@@ -2200,7 +2391,38 @@ Hard Rules:
 
     compiled_images[1] = image_1_prompt
 
+    return {
+        'theme': theme,
+        'total_beats': total_beats,
+        'parsed_brief': parsed_brief,
+        'title': title,
+        'beat_ladder': beat_ladder,
+        'packet': packet,
+        'brief_fingerprint': brief_fingerprint,
+        'image_1_prompt': image_1_prompt,
+        'compiled_images': compiled_images,
+        'compiled_videos': compiled_videos,
+    }
+
+
+def compose_remaining_beats(config, state, on_progress=None):
+    """Phase 2 of the composer: beats 2..N+1 text generation with the self-healing
+    audit loop, then the final validator/audit passes and assembly. Consumes `state`
+    from compose_anchor_and_packet(); if the caller refined state['packet'] against
+    an accepted rendered IMAGE 1, beats 2+ are written against that confirmed packet
+    instead of the pre-visualized one."""
+    theme = state['theme']
+    total_beats = state['total_beats']
+    parsed_brief = state['parsed_brief']
+    title = state['title']
+    beat_ladder = state['beat_ladder']
+    packet = state['packet']
+    compiled_images = state['compiled_images']
+    compiled_videos = state['compiled_videos']
+
     mode = parsed_brief.get('mode', 'Standard')
+    scup_ref = load_reference_file('spatial-consistency-upgrade-protocol.md')
+    templates_raw = load_reference_file('prompt-templates.md')
 
     audit_passes = 0
     max_audit_passes = 2
@@ -2561,6 +2783,13 @@ Please generate the detailed quality audit table."""
 {audit_md_cleaned}{skipped_str}"""
 
     return final_output
+
+
+def call_llm(config, dimensions, on_progress=None):
+    """One-shot entry point preserved for existing callers (e.g. /api/compose):
+    runs both composer phases back-to-back with no anchor-frame gating in between."""
+    state = compose_anchor_and_packet(config, dimensions, on_progress=on_progress)
+    return compose_remaining_beats(config, state, on_progress=on_progress)
 
 
 def build_validator_system_prompt():
@@ -3050,6 +3279,142 @@ Each object in the JSON array must have EXACTLY these keys:
             "score": 23
         }
     ]
+
+
+def _beat_chunk_size(config):
+    if not isinstance(config, dict):
+        return 4
+    val = config.get('beatChunkSize') or config.get('promptChunkSize')
+    if val is None:
+        return 4
+    try:
+        val = int(val)
+    except (ValueError, TypeError):
+        return 4
+    return max(1, min(5, val))
+
+
+def _chunk_consecutive_beats(beats, chunk_size):
+    if not beats:
+        return []
+    sorted_beats = sorted(list(beats))
+    chunks = []
+    current_chunk = []
+    for b in sorted_beats:
+        if not current_chunk:
+            current_chunk.append(b)
+        elif b == current_chunk[-1] + 1 and len(current_chunk) < chunk_size:
+            current_chunk.append(b)
+        else:
+            chunks.append(current_chunk)
+            current_chunk = [b]
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
+
+
+def _parse_chunk_prompt_response(content, beat_indices):
+    import re
+    import json
+    
+    pattern = re.compile(r'===BEAT\s+(\d+)===')
+    matches = list(pattern.finditer(content))
+    
+    parsed = {}
+    for idx in beat_indices:
+        parsed[idx] = {'video': '', 'image': '', 'traces': []}
+        
+    for i, match in enumerate(matches):
+        beat_num = int(match.group(1))
+        if beat_num not in beat_indices:
+            continue
+        start_pos = match.end()
+        end_pos = matches[i+1].start() if i + 1 < len(matches) else len(content)
+        beat_text = content[start_pos:end_pos]
+        
+        # Now find ===VIDEO===, ===IMAGE===, ===TRACES=== within beat_text
+        sub_pattern = re.compile(r'===(VIDEO|IMAGE|TRACES)===')
+        sub_matches = list(sub_pattern.finditer(beat_text))
+        
+        sections = {}
+        for j, sub_match in enumerate(sub_matches):
+            sec_name = sub_match.group(1).lower()
+            sec_start = sub_match.end()
+            sec_end = sub_matches[j+1].start() if j + 1 < len(sub_matches) else len(beat_text)
+            sections[sec_name] = beat_text[sec_start:sec_end].strip()
+            
+        parsed[beat_num]['video'] = sections.get('video', '')
+        parsed[beat_num]['image'] = sections.get('image', '')
+        
+        traces_str = sections.get('traces', '[]')
+        try:
+            traces_str = _strip_markdown_fences_only(traces_str)
+            parsed[beat_num]['traces'] = json.loads(traces_str)
+        except Exception:
+            parsed[beat_num]['traces'] = []
+            
+    return parsed
+
+
+def check_adjacent_frame_semantics_batch(config, images):
+    import json
+    import sys
+    formatted = []
+    for seq in sorted(images.keys()):
+        item = images[seq]
+        body = item['body'] if isinstance(item, dict) else item
+        formatted.append(f"IMAGE {seq}:\n{body}")
+    
+    prompt = (
+        "You are an expert consistency auditor. Examine the following sequence of image prompts "
+        "for a construction/restoration video, and detect semantic consistency issues between consecutive frames.\n\n"
+        "Specifically, check for:\n"
+        "1. Monotonic state regression: A completed feature reverting to a prior state in a subsequent frame.\n"
+        "2. Static frame violation (no new progress): No meaningful change/delta between adjacent frames.\n\n"
+        "For each transition from IMAGE N to IMAGE N+1 (corresponding to Beat N, i.e., transition from IMAGE 1 to IMAGE 2 is Beat 2), "
+        "identify any errors.\n\n"
+        "Format your output strictly as a JSON array of objects, each representing a beat with errors:\n"
+        "[\n"
+        "  {\n"
+        "    \"beat\": integer_beat_number,\n"
+        "    \"monotonic_errors\": [\"description of regression error\", ...],\n"
+        "    \"delta_errors\": [\"description of no-progress error\", ...]\n"
+        "  }\n"
+        "]\n\n"
+        "Sequence of prompts:\n"
+        + "\n\n".join(formatted)
+    )
+    
+    model = _aux_model(config)
+    system = "You are a strict construction sequence validator. Output ONLY raw JSON."
+    
+    try:
+        response_text = _chat(config, system, prompt, temperature=0.1, model=model)
+        response_text = _strip_code_fences(response_text)
+        data = json.loads(response_text)
+        
+        failures = {}
+        if isinstance(data, list):
+            for item in data:
+                beat = item.get('beat')
+                if beat is None:
+                    continue
+                m_errors = item.get('monotonic_errors', [])
+                d_errors = item.get('delta_errors', [])
+                
+                beat_failures = []
+                for err in m_errors:
+                    beat_failures.append(f"Monotonic state regression: {err}")
+                for err in d_errors:
+                    beat_failures.append(f"Static frame violation: {err}")
+                    
+                if beat_failures:
+                    failures[beat] = beat_failures
+        return failures
+    except Exception as e:
+        if sys.stdout:
+            print(f"[SEMANTIC BATCH] Exception: {e}")
+        return {}
 
 
 

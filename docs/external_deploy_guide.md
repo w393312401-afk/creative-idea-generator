@@ -34,7 +34,7 @@ Antigravity Tools 内置 Cloudflare Tunnel:
 2. 模式 `quick`,**端口填 `8085`（SPARK 专用端口）**,协议 `http2`,开启。
    - ⚠️ 不要填 `8046`:这是 Antigravity 底层 API 与管理界面，不是 SPARK 网页。
    - ⚠️ 不要再使用旧端口 `8082`:该端口可能存在残留监听或超时。
-   - SPARK 现在固定运行在 **8085**，图像服务站地址为 `/image-service-station/`。
+   - SPARK 现在固定运行在 **8085**，图像服务站已并入主页面的「🎨 图像工坊」标签页，不再有独立地址。
 3. 拿到形如 `https://xxx.trycloudflare.com` 的公网链接。
 
 把**公网链接 + 访问码**发给外部用户即可。

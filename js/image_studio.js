@@ -1,0 +1,1011 @@
+/* ==========================================================================
+   Image Studio (图像工坊) — free-form text-to-image / image-to-image generator.
+   Folded in from the former standalone /image-service-station/ page: this
+   module owns its own tab (t2i/i2i), task queue and history gallery, but
+   reuses the host app's shared config, toast, and lightbox systems instead
+   of duplicating them.
+   ========================================================================== */
+
+let imgStudioCurrentTab = 't2i';
+let imgStudioSelectedT2iRatio = '16:9';
+let imgStudioSelectedT2iQuality = '2K';
+let imgStudioSelectedI2iRatio = 'auto';
+let imgStudioSelectedI2iQuality = '1K';
+let imgStudioUploadedFiles = []; // Array of { name, file, base64 }
+let imgStudioHistory = []; // Array of { id, type, prompt, model, ratio, quality, timestamp, image }
+let imgStudioTaskList = []; // Array of { id, type, prompt, model, ratio, quality, status, error, image, timestamp, controller, extraData }
+
+async function imgStudioFetchWithTimeout(url, options = {}, timeoutMs = 120000) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, {
+            ...options,
+            signal: controller.signal
+        });
+    } catch (error) {
+        if (error && error.name === 'AbortError') {
+            const seconds = Math.round(timeoutMs / 1000);
+            throw new Error(`请求超时：图像服务超过 ${seconds} 秒未返回，请稍后重试或换一张更小的参考图。`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+// Curated Creative Prompts for Random Generator
+const IMGSTUDIO_CREATIVE_PROMPTS = [
+    {
+        zh: "一座隐藏在巨型橡树内部的复古图书馆，温暖的阳光穿过树叶间的缝隙照亮飞舞的微尘，空中漂浮着几本发光的魔法书，精致的木质雕花楼梯，维多利亚风格，极高细节，写实摄影质感",
+        en: "A retro library hidden inside a giant hollow oak tree, warm sunlight filtering through leaves illuminating floating dust motes, glowing magic books floating in the air, intricate carved wooden staircases, Victorian style, hyper-detailed, photorealistic photography."
+    },
+    {
+        zh: "蓝冰冰川深处的科幻风格研究基地，半透明的冰墙透出幽蓝色的微光，未来主义的实验仪器，透明的液晶显示屏，一名科学家在操作全息图像，电影级光影，极简科技感，8k分辨率",
+        en: "A sci-fi research base deep inside a blue glacier cave, translucent ice walls emitting a mysterious blue glow, futuristic laboratory instruments, transparent LCD screens, a scientist operating a holographic display, cinematic lighting, minimalist high-tech, 8k resolution."
+    },
+    {
+        zh: "退役潜艇改装的深海蒸汽朋克风格酒吧，圆形的潜水窗外可以看到游动的发光水母，铜质管道，闪烁的仪表盘，温暖的琥珀色灯光，木质吧台，复古舒适，胶片质感，超清",
+        en: "A cozy steampunk bar converted from a retired submarine cabin, circular portholes showing glowing jellyfish swimming outside, brass pipes, flickering gauges, warm amber lighting, wooden bar counter, vintage aesthetic, film grain texture, ultra-high definition."
+    },
+    {
+        zh: "在河畔斜坡上搭建的一座圆锥形树皮屋，粗糙的木柱作为骨架，外侧铺满深灰色树皮瓦，黄昏时分屋里点亮温暖的马灯，温暖舒适，写实摄影质感",
+        en: "A conical bark hut built on a rocky riverside slope, rough wooden poles forming the frame, dark grey bark shingles covering the exterior, a warm lantern glowing inside at dusk, cozy atmosphere, photorealistic photography."
+    },
+    {
+        zh: "废弃水塔顶部改造而成的工业风奢华阁楼，360度环形玻璃窗可以俯瞰雨后的纽约落日，混凝土粗犷质感与高档现代家具完美融合，暖色调软装，落日余晖，极高画质",
+        en: "An industrial luxury loft penthouse converted from an abandoned water tower top, 360-degree circular glass windows overlooking a rainy New York sunset, raw concrete textures blended with premium modern furniture, warm interior, golden hour glow, cinematic render."
+    },
+    {
+        zh: "一只穿着航天服的可爱英短猫咪，漂浮在五彩斑斓的太空星云中，爪子里抓着一包太空小鱼干，头盔面罩上倒映着绚丽的超新星爆发，皮克斯风格，3D渲染，可爱，极其精致",
+        en: "A cute British Shorthair cat wearing a detailed space suit, floating in a colorful cosmic nebula, holding a pack of space fish snacks in its paws, helmet visor reflecting a brilliant supernova explosion, Pixar style, 3D rendering, adorable, hyper-detailed."
+    },
+    {
+        zh: "阳光明媚的森林深处，一只巨大的神秘生物（半鹿半猫，长着发光的鹿角），一名小女孩正在伸手触摸它，周围环绕着飞舞的金色荧光，吉卜力治愈风，丁达尔光效，梦幻仙境",
+        en: "In the depths of a sun-drenched forest, a massive mystical creature (half deer, half cat, with glowing antlers) being touched by a little girl, surrounded by dancing golden fireflies, Studio Ghibli style, Tyndall light effect, dreamlike wonderland."
+    },
+    {
+        zh: "赛步朋克雨夜街道，五颜六色的霓虹灯牌倒映在潮湿的积水中，一辆复古未来的悬浮跑车停在面馆前，蒸汽袅袅升起，高对比度，电影质感，冷暖色调对比",
+        en: "A cyberpunk rainy night street, colorful neon signs reflected in wet puddles, a retro-futuristic hovering sports car parked in front of a steaming noodle shop, dramatic reflections, cinematic photography, cold and warm color contrast."
+    }
+];
+
+// Tab Switch (T2I / I2I panes) — named distinctly from the host app's own switchTab()
+function switchImageStudioTab(tabId) {
+    imgStudioCurrentTab = tabId;
+    document.querySelectorAll('#imgstudio-controls .panel-tab-btn').forEach(btn => {
+        btn.classList.remove('active');
+    });
+    document.getElementById(`imgstudio-tab-${tabId}`).classList.add('active');
+
+    document.querySelectorAll('#imgstudio-controls .input-pane').forEach(pane => {
+        pane.classList.remove('active');
+    });
+    document.getElementById(`imgstudio-pane-${tabId}`).classList.add('active');
+}
+
+// Selection Handlers for Custom Grids (Ratio, Quality, Styles)
+function initImageStudioSelectors() {
+    const t2iRatioCards = document.querySelectorAll('#t2i-ratio-selector .ratio-card');
+    t2iRatioCards.forEach(card => {
+        card.addEventListener('click', () => {
+            t2iRatioCards.forEach(c => c.classList.remove('active'));
+            card.classList.add('active');
+            imgStudioSelectedT2iRatio = card.getAttribute('data-ratio');
+        });
+    });
+
+    const i2iRatioCards = document.querySelectorAll('#i2i-ratio-selector .ratio-card');
+    i2iRatioCards.forEach(card => {
+        card.addEventListener('click', () => {
+            i2iRatioCards.forEach(c => c.classList.remove('active'));
+            card.classList.add('active');
+            imgStudioSelectedI2iRatio = card.getAttribute('data-ratio');
+        });
+    });
+
+    const t2iQualityCards = document.querySelectorAll('#t2i-quality-selector .quality-card');
+    t2iQualityCards.forEach(card => {
+        card.addEventListener('click', () => {
+            t2iQualityCards.forEach(c => c.classList.remove('active'));
+            card.classList.add('active');
+            imgStudioSelectedT2iQuality = card.getAttribute('data-quality');
+        });
+    });
+
+    const i2iQualityCards = document.querySelectorAll('#i2i-quality-selector .quality-card');
+    i2iQualityCards.forEach(card => {
+        card.addEventListener('click', () => {
+            i2iQualityCards.forEach(c => c.classList.remove('active'));
+            card.classList.add('active');
+            imgStudioSelectedI2iQuality = card.getAttribute('data-quality');
+        });
+    });
+
+    // Style Tags adding to prompt
+    const styleTags = document.querySelectorAll('#imgstudio-controls .style-tag');
+    const promptTextarea = document.getElementById('t2i-prompt');
+
+    styleTags.forEach(tag => {
+        tag.addEventListener('click', () => {
+            const tagText = tag.getAttribute('data-tag');
+            const currentPrompt = promptTextarea.value;
+
+            if (tag.classList.contains('active')) {
+                tag.classList.remove('active');
+                promptTextarea.value = currentPrompt.replace(tagText, '');
+            } else {
+                tag.classList.add('active');
+                promptTextarea.value = currentPrompt + tagText;
+            }
+        });
+    });
+
+    document.getElementById('t2i-clear-btn').addEventListener('click', () => {
+        document.getElementById('t2i-prompt').value = '';
+        styleTags.forEach(t => t.classList.remove('active'));
+    });
+    document.getElementById('i2i-clear-btn').addEventListener('click', () => {
+        document.getElementById('i2i-prompt').value = '';
+    });
+
+    const advToggleBtn = document.getElementById('toggle-i2i-advanced');
+    const advFields = document.getElementById('i2i-advanced-fields');
+    advToggleBtn.addEventListener('click', () => {
+        if (advFields.style.display === 'none') {
+            advFields.style.display = 'flex';
+            advToggleBtn.textContent = '收起 ▴';
+        } else {
+            advFields.style.display = 'none';
+            advToggleBtn.textContent = '展开 ▾';
+        }
+    });
+}
+
+function imgStudioSetRandomPrompt() {
+    const randomIndex = Math.floor(Math.random() * IMGSTUDIO_CREATIVE_PROMPTS.length);
+    const prompt = IMGSTUDIO_CREATIVE_PROMPTS[randomIndex];
+    const finalText = Math.random() > 0.4 ? prompt.zh : prompt.en;
+
+    const textarea = document.getElementById('t2i-prompt');
+    textarea.value = finalText;
+
+    document.querySelectorAll('#imgstudio-controls .style-tag').forEach(t => t.classList.remove('active'));
+    showToast('灵感提示词已载入，可直接点击生成', 'success');
+}
+
+// Drag & Drop / File Uploader Setup
+function initImageStudioFileUploader() {
+    const dragArea = document.getElementById('i2i-drag-area');
+    const fileInput = document.getElementById('i2i-file-input');
+
+    dragArea.addEventListener('click', () => {
+        fileInput.click();
+    });
+
+    fileInput.addEventListener('change', (e) => {
+        imgStudioHandleFiles(e.target.files);
+    });
+
+    ['dragenter', 'dragover'].forEach(eventName => {
+        dragArea.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dragArea.classList.add('drag-over');
+        }, false);
+    });
+
+    ['dragleave', 'drop'].forEach(eventName => {
+        dragArea.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dragArea.classList.remove('drag-over');
+        }, false);
+    });
+
+    dragArea.addEventListener('drop', (e) => {
+        imgStudioHandleFiles(e.dataTransfer.files);
+    }, false);
+}
+
+function imgStudioHandleFiles(files) {
+    if (!files || files.length === 0) return;
+
+    Array.from(files).forEach(file => {
+        if (!file.type.startsWith('image/')) {
+            showToast(`文件 ${file.name} 不是合法的图片格式`, 'error');
+            return;
+        }
+
+        if (file.size > 10 * 1024 * 1024) {
+            showToast(`文件 ${file.name} 超过了 10MB 的上限`, 'error');
+            return;
+        }
+
+        const item = { name: file.name, file: file, base64: '' };
+        imgStudioUploadedFiles.push(item);
+
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            item.base64 = e.target.result;
+            imgStudioRenderUploadPreviews();
+        };
+        reader.onerror = () => {
+            imgStudioUploadedFiles = imgStudioUploadedFiles.filter(uploaded => uploaded !== item);
+            imgStudioRenderUploadPreviews();
+            showToast(`无法读取图片 ${file.name}`, 'error');
+        };
+        reader.readAsDataURL(file);
+    });
+
+    imgStudioRenderUploadPreviews();
+}
+
+function imgStudioRenderUploadPreviews() {
+    const container = document.getElementById('i2i-upload-previews');
+
+    if (imgStudioUploadedFiles.length === 0) {
+        container.style.display = 'none';
+        container.innerHTML = '';
+        return;
+    }
+
+    container.style.display = 'flex';
+    container.innerHTML = '';
+
+    imgStudioUploadedFiles.forEach((item, index) => {
+        const card = document.createElement('div');
+        card.className = 'upload-preview-card';
+        card.innerHTML = `
+            ${item.base64 ? `<img src="${item.base64}" alt="${item.name}">` : '<div class="upload-preview-loading">读取中…</div>'}
+            <button type="button" class="upload-preview-delete" onclick="removeImageStudioFile(${index})">✕</button>
+        `;
+        container.appendChild(card);
+    });
+}
+
+window.removeImageStudioFile = function (index) {
+    imgStudioUploadedFiles.splice(index, 1);
+    imgStudioRenderUploadPreviews();
+};
+
+// Action: Generate Image (T2I & I2I Router)
+function imgStudioTriggerGeneration() {
+    const generateBtn = document.getElementById('imgstudio-generate-btn');
+
+    generateBtn.disabled = true;
+    setTimeout(() => { generateBtn.disabled = false; }, 200);
+
+    if (imgStudioCurrentTab === 't2i') {
+        const prompt = document.getElementById('t2i-prompt').value.trim();
+        const model = document.getElementById('t2i-model').value;
+
+        if (!prompt) {
+            showToast('请输入创意提示词再开始生成', 'error');
+            return;
+        }
+
+        imgStudioAddTask('t2i', prompt, model, imgStudioSelectedT2iRatio, imgStudioSelectedT2iQuality, null);
+        showToast('文生图任务已加入生成队列', 'success');
+    } else {
+        const prompt = document.getElementById('i2i-prompt').value.trim();
+        const model = document.getElementById('i2i-model').value;
+        const style = document.getElementById('i2i-style').value;
+
+        if (imgStudioUploadedFiles.length === 0) {
+            showToast('请至少上传一张参考图片再开始图生图', 'error');
+            return;
+        }
+        if (!prompt) {
+            showToast('请输入修改或编辑指令提示词', 'error');
+            return;
+        }
+
+        const filesData = imgStudioUploadedFiles.map(f => ({ name: f.name, base64: f.base64 }));
+        const extraData = { style: style, files: filesData };
+        const finalRatio = imgStudioSelectedI2iRatio === 'auto' ? 'Auto' : imgStudioSelectedI2iRatio;
+
+        imgStudioAddTask('i2i', prompt, model, finalRatio, imgStudioSelectedI2iQuality, extraData);
+        showToast('图生图修改任务已加入生成队列', 'success');
+    }
+}
+
+function imgStudioBase64ToBlob(base64, mimeType) {
+    try {
+        const parts = base64.split(',');
+        const byteString = atob(parts[1]);
+        const ab = new ArrayBuffer(byteString.length);
+        const ia = new Uint8Array(ab);
+        for (let i = 0; i < byteString.length; i++) {
+            ia[i] = byteString.charCodeAt(i);
+        }
+        return new Blob([ab], { type: mimeType });
+    } catch (e) {
+        console.error("Base64 to Blob conversion failed:", e);
+        return null;
+    }
+}
+
+function imgStudioLoadTaskList() {
+    const saved = localStorage.getItem('spark_image_tasks');
+    if (saved) {
+        try {
+            imgStudioTaskList = JSON.parse(saved);
+            imgStudioTaskList = imgStudioTaskList.filter(task => !task.image || !task.image.includes('undefined'));
+            imgStudioTaskList.forEach(task => {
+                task.controller = null;
+                if (task.status === 'pending') {
+                    if (task.backendTaskId) {
+                        imgStudioPollTaskStatus(task);
+                    } else {
+                        task.status = 'failed';
+                        task.error = '页面刷新，任务被中断';
+                    }
+                }
+            });
+            imgStudioSaveTaskList();
+        } catch (e) {
+            imgStudioTaskList = [];
+        }
+    } else {
+        imgStudioTaskList = [];
+    }
+    imgStudioRenderTaskListUI();
+}
+
+function imgStudioSaveTaskList() {
+    try {
+        const tasksToSave = imgStudioTaskList.map(task => {
+            const { controller, ...serializable } = task;
+            return serializable;
+        });
+        localStorage.setItem('spark_image_tasks', JSON.stringify(tasksToSave));
+    } catch (e) {
+        console.error("Failed to save tasks to localStorage:", e);
+    }
+}
+
+function imgStudioRenderTaskListUI() {
+    const activeCount = imgStudioTaskList.filter(t => t.status === 'pending').length;
+    const totalCount = imgStudioTaskList.length;
+
+    const activeCountSpan = document.getElementById('tasks-active-count');
+    const totalCountSpan = document.getElementById('tasks-total-count');
+    const section = document.getElementById('tasks-section');
+    const container = document.getElementById('imgstudio-tasks-list');
+
+    if (activeCountSpan) activeCountSpan.textContent = activeCount;
+    if (totalCountSpan) totalCountSpan.textContent = totalCount;
+    if (section) section.style.display = totalCount > 0 ? 'block' : 'none';
+
+    if (!container) return;
+    container.innerHTML = '';
+
+    imgStudioTaskList.forEach(task => {
+        const card = document.createElement('div');
+        card.className = `task-card ${task.status}`;
+
+        let visualHTML = '';
+        if (task.status === 'pending') {
+            visualHTML = `<div class="task-visual"><div class="task-spinner-ring"></div></div>`;
+        } else if (task.status === 'completed' && task.image) {
+            visualHTML = `<div class="task-visual"><img src="${task.image}" alt="Thumb" onclick="viewImageStudioTaskItem('${task.id}')"></div>`;
+        } else if (task.status === 'failed') {
+            visualHTML = `<div class="task-visual"><span class="task-failed-icon">❌</span></div>`;
+        } else if (task.status === 'cancelled') {
+            visualHTML = `<div class="task-visual"><span class="task-cancelled-icon">⏹️</span></div>`;
+        }
+
+        let statusBadgeHTML = '';
+        if (task.status === 'pending') {
+            statusBadgeHTML = `<span class="task-status-badge pending">渲染中</span>`;
+        } else if (task.status === 'completed') {
+            statusBadgeHTML = `<span class="task-status-badge completed">已完成</span>`;
+        } else if (task.status === 'failed') {
+            statusBadgeHTML = `<span class="task-status-badge failed" title="${task.error || ''}">失败</span>`;
+        } else if (task.status === 'cancelled') {
+            statusBadgeHTML = `<span class="task-status-badge cancelled">已取消</span>`;
+        }
+
+        let actionHTML = '';
+        if (task.status === 'pending') {
+            actionHTML = `<button type="button" class="task-btn-icon danger-hover" title="取消任务" onclick="cancelImageStudioTask('${task.id}')">✕</button>`;
+        } else {
+            let retryBtn = '';
+            if (task.status === 'failed' || task.status === 'cancelled') {
+                retryBtn = `<button type="button" class="task-btn-icon" title="重试任务" onclick="retryImageStudioTask('${task.id}')">🔄</button>`;
+            }
+            actionHTML = `
+                ${retryBtn}
+                <button type="button" class="task-btn-icon danger-hover" title="删除记录" onclick="deleteImageStudioTask('${task.id}')">✕</button>
+            `;
+        }
+
+        const truncatedPrompt = task.prompt.replace(/"/g, '&quot;');
+
+        card.innerHTML = `
+            ${visualHTML}
+            <div class="task-info">
+                <div class="task-meta">
+                    <span class="task-badge-type">${task.type === 't2i' ? '文生图' : '图生图'}</span>
+                    <span class="task-model" translate="no">${task.model.replace('-image', '')}</span>
+                    <span>${task.ratio}</span>
+                    <span>${task.quality}</span>
+                    <span style="margin-left: auto;">${task.timestamp}</span>
+                </div>
+                <div class="task-prompt" title="${truncatedPrompt}">${task.prompt}</div>
+                ${task.status === 'failed' ? `<div class="task-error" title="${task.error || ''}">原因: ${task.error || '未知错误'}</div>` : ''}
+            </div>
+            <div class="task-control">
+                ${statusBadgeHTML}
+                ${actionHTML}
+            </div>
+        `;
+        container.appendChild(card);
+    });
+}
+
+function imgStudioAddTask(type, prompt, model, ratio, quality, extraData) {
+    const id = 'task_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+    const task = {
+        id, type, prompt, model, ratio, quality,
+        status: 'pending',
+        error: null,
+        image: null,
+        timestamp: new Date().toLocaleTimeString(),
+        controller: null,
+        extraData: extraData
+    };
+
+    imgStudioTaskList.unshift(task);
+
+    if (imgStudioTaskList.length > 15) {
+        const removed = imgStudioTaskList.pop();
+        if (removed && removed.status === 'pending' && removed.controller) {
+            try { removed.controller.abort(); } catch (e) {}
+        }
+    }
+
+    imgStudioSaveTaskList();
+    imgStudioRenderTaskListUI();
+    imgStudioRunTaskFetch(task);
+    return task;
+}
+
+async function imgStudioPollTaskStatus(task) {
+    if (!task.backendTaskId) return;
+
+    const intervalId = setInterval(async () => {
+        const currentTask = imgStudioTaskList.find(t => t.id === task.id);
+        if (!currentTask || currentTask.status === 'cancelled' || currentTask.status === 'completed' || currentTask.status === 'failed') {
+            clearInterval(intervalId);
+            return;
+        }
+
+        try {
+            const response = await fetch(`/api/image/task/status?task_id=${task.backendTaskId}`);
+            if (!response.ok) return;
+
+            const data = await response.json();
+            if (!data) return;
+
+            if (data.status === 'completed') {
+                clearInterval(intervalId);
+
+                const result = data.result;
+                if (result && result.data && result.data.length > 0) {
+                    const item = result.data[0];
+                    let imgDataUrl = '';
+                    if (item.b64_json) {
+                        imgDataUrl = `data:image/png;base64,${item.b64_json}`;
+                    } else if (item.url) {
+                        imgDataUrl = item.url;
+                    }
+
+                    if (imgDataUrl) {
+                        currentTask.status = 'completed';
+                        currentTask.image = imgDataUrl;
+                        currentTask.controller = null;
+
+                        imgStudioSaveToHistory(currentTask.type, currentTask.prompt, currentTask.model, currentTask.ratio, currentTask.quality, imgDataUrl);
+                        imgStudioDisplaySpotlight(imgDataUrl, currentTask.prompt, currentTask.model, currentTask.ratio, currentTask.quality);
+                        showToast('图像渲染成功！已存入历史画廊', 'success');
+                    } else {
+                        currentTask.status = 'failed';
+                        currentTask.error = '返回结果中无有效图像数据';
+                        currentTask.controller = null;
+                        showToast('生图失败: 未在响应中找到图像数据', 'error');
+                    }
+                } else {
+                    currentTask.status = 'failed';
+                    currentTask.error = '返回的数据格式不正确';
+                    currentTask.controller = null;
+                    showToast('生图失败: 数据格式不正确', 'error');
+                }
+
+                imgStudioSaveTaskList();
+                imgStudioRenderTaskListUI();
+            } else if (data.status === 'failed' || data.status === 'not_found') {
+                clearInterval(intervalId);
+                currentTask.status = 'failed';
+                currentTask.error = data.status === 'not_found' ? '后台任务未找到（可能服务已重启）' : (data.error || '未知后台错误');
+                currentTask.controller = null;
+                showToast(`生图失败: ${currentTask.error}`, 'error');
+                imgStudioSaveTaskList();
+                imgStudioRenderTaskListUI();
+            }
+        } catch (e) {
+            console.error("Polling error:", e);
+        }
+    }, 1500);
+}
+
+async function imgStudioRunTaskFetch(task) {
+    const controller = new AbortController();
+    task.controller = controller;
+
+    try {
+        let response;
+        if (task.type === 't2i') {
+            const body = {
+                prompt: task.prompt,
+                model: task.model,
+                size: task.ratio,
+                quality: task.quality,
+                image_size: task.quality,
+                response_format: 'b64_json',
+                config: config
+            };
+
+            response = await fetch('/api/image/generations', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: controller.signal
+            });
+        } else {
+            const formData = new FormData();
+            formData.append('prompt', task.prompt);
+            formData.append('model', task.model);
+            formData.append('response_format', 'b64_json');
+
+            if (task.ratio && task.ratio !== 'auto') {
+                formData.append('aspect_ratio', task.ratio);
+            }
+            formData.append('image_size', task.quality);
+
+            if (task.extraData && task.extraData.style) {
+                formData.append('style', task.extraData.style);
+            }
+
+            if (task.extraData && task.extraData.files) {
+                task.extraData.files.forEach((f, idx) => {
+                    const mime = f.base64.split(';')[0].split(':')[1] || 'image/png';
+                    const blob = imgStudioBase64ToBlob(f.base64, mime);
+                    if (blob) {
+                        const file = new File([blob], f.name, { type: mime });
+                        const fieldName = idx === 0 ? 'image' : 'image[]';
+                        formData.append(fieldName, file, f.name);
+                    }
+                });
+            }
+
+            formData.append('config', JSON.stringify(config));
+
+            response = await fetch('/api/image/edits', {
+                method: 'POST',
+                body: formData,
+                signal: controller.signal
+            });
+        }
+
+        if (task.status === 'cancelled') return;
+
+        const result = await response.json();
+
+        if (response.ok && result.task_id) {
+            task.backendTaskId = result.task_id;
+            task.controller = null;
+            imgStudioSaveTaskList();
+            imgStudioPollTaskStatus(task);
+        } else {
+            throw new Error(result.error || result.message || '任务提交失败');
+        }
+    } catch (e) {
+        if (task.status === 'cancelled') return;
+
+        console.error(e);
+        task.status = 'failed';
+        task.error = e.name === 'AbortError' ? '请求超时或被手动取消' : e.message;
+        task.controller = null;
+        showToast(`生图失败: ${task.error}`, 'error');
+    } finally {
+        imgStudioSaveTaskList();
+        imgStudioRenderTaskListUI();
+    }
+}
+
+function cancelImageStudioTask(taskId) {
+    const task = imgStudioTaskList.find(t => t.id === taskId);
+    if (task && task.status === 'pending') {
+        task.status = 'cancelled';
+        if (task.controller) {
+            try { task.controller.abort(); } catch (e) { console.error(e); }
+        }
+        task.controller = null;
+        imgStudioSaveTaskList();
+        imgStudioRenderTaskListUI();
+        showToast('任务已取消', 'success');
+    }
+}
+
+function deleteImageStudioTask(taskId) {
+    const index = imgStudioTaskList.findIndex(t => t.id === taskId);
+    if (index > -1) {
+        const task = imgStudioTaskList[index];
+        if (task.status === 'pending') {
+            cancelImageStudioTask(taskId);
+        }
+        imgStudioTaskList.splice(index, 1);
+        imgStudioSaveTaskList();
+        imgStudioRenderTaskListUI();
+        showToast('任务记录已删除', 'success');
+    }
+}
+
+function retryImageStudioTask(taskId) {
+    const task = imgStudioTaskList.find(t => t.id === taskId);
+    if (task && task.status !== 'pending') {
+        task.status = 'pending';
+        task.error = null;
+        task.image = null;
+        task.timestamp = new Date().toLocaleTimeString();
+        imgStudioSaveTaskList();
+        imgStudioRenderTaskListUI();
+        imgStudioRunTaskFetch(task);
+        showToast('正在重试生图任务...', 'success');
+    }
+}
+
+function clearCompletedImageStudioTasks() {
+    const activeTasks = imgStudioTaskList.filter(t => t.status === 'pending');
+    const hasCompleted = imgStudioTaskList.length > activeTasks.length;
+    if (hasCompleted) {
+        imgStudioTaskList = activeTasks;
+        imgStudioSaveTaskList();
+        imgStudioRenderTaskListUI();
+        showToast('已清除已完成和已失效的任务记录', 'success');
+    } else {
+        showToast('没有可清除的记录', 'success');
+    }
+}
+
+function clearAllImageStudioTasks() {
+    if (imgStudioTaskList.length === 0) return;
+    if (confirm('确认清空所有任务记录？运行中的任务将被取消。')) {
+        imgStudioTaskList.forEach(task => {
+            if (task.status === 'pending' && task.controller) {
+                try { task.controller.abort(); } catch (e) {}
+            }
+        });
+        imgStudioTaskList = [];
+        imgStudioSaveTaskList();
+        imgStudioRenderTaskListUI();
+        showToast('所有任务已成功清空', 'success');
+    }
+}
+
+window.cancelImageStudioTask = cancelImageStudioTask;
+window.deleteImageStudioTask = deleteImageStudioTask;
+window.retryImageStudioTask = retryImageStudioTask;
+window.viewImageStudioTaskItem = function (taskId) {
+    const task = imgStudioTaskList.find(t => t.id === taskId);
+    if (task && task.status === 'completed' && task.image) {
+        imgStudioDisplaySpotlight(task.image, task.prompt, task.model, task.ratio, task.quality);
+        showToast('已在渲染室展示该图片', 'success');
+    }
+};
+
+function imgStudioDisplaySpotlight(imgDataUrl, prompt, model, ratio, quality) {
+    document.getElementById('spotlight-skeleton').style.display = 'none';
+    document.getElementById('spotlight-placeholder').style.display = 'none';
+    document.getElementById('spotlight-image-wrapper').style.display = 'flex';
+
+    document.getElementById('spotlight-img').src = imgDataUrl;
+    document.getElementById('spotlight-info-model').textContent = model.replace('-image', '');
+    document.getElementById('spotlight-info-prompt').textContent = prompt;
+
+    imgStudioSetupSpotlightActions(imgDataUrl, prompt, model, ratio, quality);
+}
+
+function imgStudioResetSpotlightUI() {
+    document.getElementById('spotlight-skeleton').style.display = 'none';
+    document.getElementById('spotlight-image-wrapper').style.display = 'none';
+    document.getElementById('spotlight-placeholder').style.display = 'flex';
+}
+
+function imgStudioCaptionFor(item) {
+    return `
+        <strong>提示词:</strong> ${item.prompt}<br>
+        <span style="font-size:0.75rem; color: #94a3b8; display:block; margin-top:0.4rem">
+            模型: ${item.model} | 比例: ${item.ratio} | 画质: ${item.quality}
+        </span>
+    `;
+}
+
+function imgStudioSetupSpotlightActions(imgDataUrl, prompt, model, ratio, quality) {
+    document.getElementById('spotlight-zoom-btn').onclick = () => {
+        const spotlightImg = document.getElementById('spotlight-img');
+        const currentSrc = spotlightImg ? spotlightImg.src : imgDataUrl;
+
+        const clickedIndex = imgStudioHistory.findIndex(item => item.image === currentSrc);
+        if (clickedIndex === -1) {
+            const currentItem = { type: 'image', url: currentSrc, caption: imgStudioCaptionFor({ prompt, model, ratio, quality }) };
+            const mediaList = [currentItem, ...imgStudioHistory.map(item => ({ type: 'image', url: item.image, caption: imgStudioCaptionFor(item) }))];
+            openLightbox(mediaList, 0);
+        } else {
+            const mediaList = imgStudioHistory.map(item => ({ type: 'image', url: item.image, caption: imgStudioCaptionFor(item) }));
+            openLightbox(mediaList, clickedIndex);
+        }
+    };
+
+    document.getElementById('spotlight-download-btn').onclick = () => {
+        imgStudioDownloadImage(imgDataUrl, `spark_${Date.now()}.png`);
+    };
+
+    document.getElementById('spotlight-copy-btn').onclick = () => {
+        imgStudioCopyImageToClipboard(imgDataUrl);
+    };
+
+    document.getElementById('spotlight-reuse-btn').onclick = () => {
+        imgStudioReusePrompt(prompt, ratio, quality);
+    };
+
+    document.getElementById('spotlight-to-i2i-btn').onclick = () => {
+        imgStudioSendToImageToImage(imgDataUrl, `ref_spark_${Date.now()}.png`);
+    };
+}
+
+function imgStudioDownloadImage(dataUrl, filename) {
+    const a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    showToast('图片下载已启动', 'success');
+}
+
+async function imgStudioCopyImageToClipboard(dataUrl) {
+    try {
+        const response = await fetch(dataUrl);
+        const blob = await response.blob();
+        await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+        showToast('图片二进制已成功复制到剪贴板', 'success');
+    } catch (err) {
+        console.error('Copy image failed', err);
+        try {
+            await navigator.clipboard.writeText(dataUrl);
+            showToast('直接复制二进制失败，已复制 Base64 文本数据', 'error');
+        } catch (e) {
+            showToast('复制图片失败，浏览器安全权限受限', 'error');
+        }
+    }
+}
+
+function imgStudioReusePrompt(prompt, ratio, quality) {
+    if (imgStudioCurrentTab === 't2i') {
+        document.getElementById('t2i-prompt').value = prompt;
+        const ratioCard = document.querySelector(`#t2i-ratio-selector .ratio-card[data-ratio="${ratio}"]`);
+        if (ratioCard) ratioCard.click();
+
+        const qualityCard = document.querySelector(`#t2i-quality-selector .quality-card[data-quality="${quality}"]`);
+        if (qualityCard) qualityCard.click();
+    } else {
+        document.getElementById('i2i-prompt').value = prompt;
+    }
+
+    showToast('创意提示词已填回配置面板', 'success');
+}
+
+function imgStudioSendToImageToImage(dataUrl, filename) {
+    switchImageStudioTab('i2i');
+
+    fetch(dataUrl)
+        .then(res => res.blob())
+        .then(blob => {
+            const file = new File([blob], filename, { type: "image/png" });
+            imgStudioUploadedFiles = [{ name: filename, file: file, base64: dataUrl }];
+            imgStudioRenderUploadPreviews();
+            showToast('图片已送往图生图作为参考画布！', 'success');
+        })
+        .catch(e => {
+            console.error(e);
+            showToast('转换图片失败', 'error');
+        });
+}
+
+function imgStudioSaveHistoryToStorage() {
+    try {
+        localStorage.setItem('spark_image_history', JSON.stringify(imgStudioHistory));
+    } catch (e) {
+        if (e.name === 'QuotaExceededError' || e.code === 22 || e.number === 0x8007000E) {
+            console.warn("Storage quota exceeded, trying to prune older items...");
+            let prunedHistory = [...imgStudioHistory];
+            let success = false;
+
+            while (prunedHistory.length > 1) {
+                prunedHistory.pop();
+                try {
+                    localStorage.setItem('spark_image_history', JSON.stringify(prunedHistory));
+                    success = true;
+                    break;
+                } catch (innerErr) {
+                    // continue pruning
+                }
+            }
+
+            if (!success) {
+                showToast('由于高清大图尺寸过大，无法存入浏览器本地持久缓存。图片已在当前会话中生成，刷新页面后将消失，请及时下载保存！', 'error');
+            } else {
+                showToast('本地浏览器缓存已满，已自动清理较旧的生图记录以释放空间。', 'success');
+            }
+        } else {
+            console.error("Failed to save history to localStorage:", e);
+        }
+    }
+}
+
+function imgStudioSaveToHistory(type, prompt, model, ratio, quality, image) {
+    const newItem = {
+        id: 'img_' + Date.now(),
+        type, prompt, model, ratio, quality,
+        timestamp: new Date().toLocaleTimeString(),
+        image
+    };
+
+    imgStudioHistory.unshift(newItem);
+    if (imgStudioHistory.length > 30) {
+        imgStudioHistory = imgStudioHistory.slice(0, 30);
+    }
+
+    imgStudioSaveHistoryToStorage();
+    imgStudioRenderHistoryGrid();
+}
+
+async function imgStudioCheckImageExists(url) {
+    if (!url || url.includes('undefined')) return false;
+    if (url.startsWith('data:')) return true;
+    try {
+        const response = await fetch(url, { method: 'HEAD' });
+        return response.ok;
+    } catch (e) {
+        return false;
+    }
+}
+
+async function imgStudioLoadHistory() {
+    const saved = localStorage.getItem('spark_image_history');
+    if (saved) {
+        try {
+            imgStudioHistory = JSON.parse(saved);
+        } catch (e) {}
+    }
+
+    // Filter out history items whose images no longer exist on the server (non-data URLs only)
+    const filteredHistory = [];
+    let needCleanSave = false;
+    for (const item of imgStudioHistory) {
+        if (await imgStudioCheckImageExists(item.image)) {
+            filteredHistory.push(item);
+        } else {
+            needCleanSave = true;
+        }
+    }
+    imgStudioHistory = filteredHistory;
+    if (needCleanSave) {
+        imgStudioSaveHistoryToStorage();
+    }
+
+    imgStudioRenderHistoryGrid();
+}
+
+function imgStudioRenderHistoryGrid() {
+    const grid = document.getElementById('history-grid');
+    const countSpan = document.getElementById('history-count');
+
+    countSpan.textContent = imgStudioHistory.length;
+
+    if (imgStudioHistory.length === 0) {
+        grid.innerHTML = '<div class="history-empty-text">画廊目前空空如也。生成的图片都会收录在此处。</div>';
+        return;
+    }
+
+    grid.innerHTML = '';
+
+    imgStudioHistory.forEach(item => {
+        const card = document.createElement('div');
+        card.className = 'history-card';
+        card.innerHTML = `
+            <img src="${item.image}" alt="History Item" loading="lazy">
+            <div class="history-card-overlay">
+                <button class="history-card-btn" title="查看" onclick="viewImageStudioHistoryItem('${item.id}', 'zoom')">🔍</button>
+                <button class="history-card-btn" title="下载" onclick="viewImageStudioHistoryItem('${item.id}', 'download')">📥</button>
+                <button class="history-card-btn" title="填回提示词" onclick="viewImageStudioHistoryItem('${item.id}', 'reuse')">🔄</button>
+                <button class="history-card-btn" title="送往图生图" onclick="viewImageStudioHistoryItem('${item.id}', 'to-i2i')">🎨</button>
+                <button class="history-card-btn" style="background:rgba(239, 68, 68, 0.4)" title="删除" onclick="deleteImageStudioHistoryItem('${item.id}')">✕</button>
+            </div>
+        `;
+        grid.appendChild(card);
+    });
+}
+
+window.viewImageStudioHistoryItem = function (id, action) {
+    const item = imgStudioHistory.find(x => x.id === id);
+    if (!item) return;
+
+    imgStudioDisplaySpotlight(item.image, item.prompt, item.model, item.ratio, item.quality);
+
+    if (action === 'zoom') {
+        const clickedIndex = imgStudioHistory.findIndex(x => x.id === id);
+        const mediaList = imgStudioHistory.map(h => ({ type: 'image', url: h.image, caption: imgStudioCaptionFor(h) }));
+        openLightbox(mediaList, clickedIndex !== -1 ? clickedIndex : 0);
+    } else if (action === 'download') {
+        imgStudioDownloadImage(item.image, `spark_${item.id}.png`);
+    } else if (action === 'reuse') {
+        imgStudioReusePrompt(item.prompt, item.ratio, item.quality);
+    } else if (action === 'to-i2i') {
+        imgStudioSendToImageToImage(item.image, `ref_${item.id}.png`);
+    }
+};
+
+window.deleteImageStudioHistoryItem = function (id) {
+    const index = imgStudioHistory.findIndex(x => x.id === id);
+    if (index > -1) {
+        imgStudioHistory.splice(index, 1);
+        imgStudioSaveHistoryToStorage();
+        imgStudioRenderHistoryGrid();
+        showToast('记录已删除', 'success');
+    }
+};
+
+function imgStudioClearHistory() {
+    if (confirm('确认清空所有生图历史记录？此操作不可撤销。')) {
+        imgStudioHistory = [];
+        localStorage.removeItem('spark_image_history');
+        imgStudioRenderHistoryGrid();
+        imgStudioResetSpotlightUI();
+        showToast('创作历史画廊已成功清空', 'success');
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    imgStudioLoadHistory();
+    imgStudioLoadTaskList();
+    initImageStudioSelectors();
+    initImageStudioFileUploader();
+
+    const clearCompletedTasksBtn = document.getElementById('clear-completed-tasks-btn');
+    if (clearCompletedTasksBtn) clearCompletedTasksBtn.addEventListener('click', clearCompletedImageStudioTasks);
+
+    const clearAllTasksBtn = document.getElementById('clear-all-tasks-btn');
+    if (clearAllTasksBtn) clearAllTasksBtn.addEventListener('click', clearAllImageStudioTasks);
+
+    document.getElementById('t2i-random-prompt-btn').addEventListener('click', imgStudioSetRandomPrompt);
+    document.getElementById('imgstudio-generate-btn').addEventListener('click', imgStudioTriggerGeneration);
+    document.getElementById('clear-history-btn').addEventListener('click', imgStudioClearHistory);
+
+    // Ctrl/Cmd+Enter triggers generation only while the Image Studio tab is the active view
+    document.addEventListener('keydown', (e) => {
+        const panel = document.getElementById('panel-image-studio');
+        if (!panel || !panel.classList.contains('mobile-active')) return;
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            const genBtn = document.getElementById('imgstudio-generate-btn');
+            if (genBtn && !genBtn.disabled) {
+                genBtn.click();
+            }
+        }
+    });
+
+    imgStudioSetRandomPrompt();
+});

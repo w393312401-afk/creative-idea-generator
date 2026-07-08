@@ -77,13 +77,23 @@
     border-radius: 50%;
 }
 
-/* Panel Layout Override */
+/* Panel Layout: exclusive single-panel view at every screen size (three peer
+   workspaces — config / results / image studio — toggled by .mobile-active,
+   switched via switchMainTab() in app.js). */
 .app-main {
-    display: grid;
-    grid-template-columns: 1fr 1.2fr;
-    gap: 24px;
     flex-grow: 1;
+    display: flex;
+    flex-direction: column;
     min-height: 0; /* Important for scroll sizing */
+    gap: 0;
+}
+
+.glass-panel {
+    display: none;
+}
+
+.glass-panel.mobile-active {
+    display: flex;
 }
 
 .panel-body {
@@ -611,7 +621,7 @@
     font-size: 19px;
     line-height: 1.35;
     font-weight: 700;
-    color: #ffffff;
+    color: var(--text-primary);
     min-width: 0;
     overflow-wrap: anywhere;
 }
@@ -1120,6 +1130,10 @@
     width: 100%;
     max-width: 480px;
     box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+}
+
+.modal .modal-content.glass-panel {
+    display: flex !important;
 }
 
 .modal-header {
@@ -3486,10 +3500,41 @@ select option {
 }
 
 /* =====================================================================
-   Mobile Responsive Navigation Tabs (Desktop Hidden Style)
+   Top-level workspace tabs — always visible (config / results / image studio)
    ===================================================================== */
 .mobile-nav-tabs {
-    display: none;
+    display: flex;
+    background: rgba(var(--panel-rgb), 0.45);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 4px;
+    margin-bottom: 12px;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
+.mobile-nav-btn {
+    flex: 1;
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    color: var(--text-secondary);
+    padding: 10px 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    transition: var(--transition-fast);
+}
+
+.mobile-nav-btn.active {
+    background: rgba(176, 123, 82, 0.08);
+    color: var(--neon-cyan);
+    border: 1px solid rgba(176, 123, 82, 0.2);
+    box-shadow: 0 0 10px rgba(176, 123, 82, 0.1);
 }
 
 /* =====================================================================
@@ -3545,8 +3590,8 @@ select option {
         gap: 0 !important;
     }
     
-    .header-controls .icon-btn span {
-        display: none !important; /* Hide "任务列表", "点子库" text */
+    .header-controls .icon-btn span:not(#theme-toggle-icon):not(.task-badge) {
+        display: none !important; /* Hide "任务列表", "点子库" text, but keep the theme emoji and task-count badge */
     }
 
     /* API Status Badge on mobile: show only status dot, hide text to save space */
@@ -3560,42 +3605,6 @@ select option {
     
     #api-status-badge .status-text {
         display: none !important;
-    }
-
-    /* 3. Mobile Tab Navigation Bar */
-    .mobile-nav-tabs {
-        display: flex !important; /* Make visible only on mobile */
-        background: rgba(var(--panel-rgb), 0.45);
-        border: 1px solid var(--border-color);
-        border-radius: 12px;
-        padding: 4px;
-        margin-bottom: 12px;
-        gap: 4px;
-        flex-shrink: 0;
-    }
-
-    .mobile-nav-btn {
-        flex: 1;
-        background: transparent;
-        border: none;
-        border-radius: 8px;
-        color: var(--text-secondary);
-        padding: 10px 8px;
-        font-size: 13px;
-        font-weight: 600;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 6px;
-        transition: var(--transition-fast);
-    }
-
-    .mobile-nav-btn.active {
-        background: rgba(176, 123, 82, 0.08);
-        color: var(--neon-cyan);
-        border: 1px solid rgba(176, 123, 82, 0.2);
-        box-shadow: 0 0 10px rgba(176, 123, 82, 0.1);
     }
 
     /* 4. Main Panel Layout overrides */
