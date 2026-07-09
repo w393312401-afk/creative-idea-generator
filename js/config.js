@@ -113,15 +113,15 @@ function updateConfigSummary() {
 function applyPreset(presetName) {
     const p = PRESETS[presetName];
     if (!p) return;
-    
-    // Theme
-    document.querySelectorAll('#theme-selector .theme-btn').forEach(btn => {
-        if (btn.dataset.value === p.theme) {
-            btn.classList.add('active');
-        } else {
-            btn.classList.remove('active');
-        }
-    });
+
+    // Theme：先确认预设指向的主题按钮存在，再清空重选；
+    // 否则一个失配的预设会把所有主题全部取消激活
+    const targetThemeBtn = document.querySelector(`#theme-selector .theme-btn[data-value="${p.theme}"]`);
+    if (targetThemeBtn) {
+        document.querySelectorAll('#theme-selector .theme-btn').forEach(btn => {
+            btn.classList.toggle('active', btn === targetThemeBtn);
+        });
+    }
     
     // Anchors
     document.querySelectorAll('#anchor-selector .anchor-node').forEach(btn => {
@@ -147,7 +147,13 @@ function applyPreset(presetName) {
     setVal('slider-beats', p.beats);
     
     saveSelectionState();
-    showToast(`已应用预设：${presetName === 'tech_hardcore' ? '科技硬核' : presetName === 'eco_natural' ? '自然生态' : '废土实用'}`, 'success');
+    const PRESET_LABELS = {
+        nature_wonder: '自然奇观',
+        industrial_relic: '工业遗迹',
+        retired_vehicle: '退役载具',
+        contrast_novelty: '反差猎奇'
+    };
+    showToast(`已应用预设：${PRESET_LABELS[presetName] || presetName}`, 'success');
 }
 
 function updateImageModelOptions(preserveValue = true) {
@@ -190,8 +196,9 @@ function loadConfig() {
         try {
             config = { ...DEFAULT_CONFIG, ...JSON.parse(stored) };
             
-            // Auto-migrate legacy port 65038 defaults to new port 8045 defaults
-            if (config.baseUrl === 'http://localhost:65038/v1' && config.apiKey === 'agt_codex_JG9xnyWXYBS4qMmO9Z0UKD3pbEOpHr7M') {
+            // Auto-migrate legacy port 65038 defaults to new port 8045 defaults.
+            // 只按 baseUrl + 密钥前缀识别旧默认值——绝不能在前端源码里内联完整密钥
+            if (config.baseUrl === 'http://localhost:65038/v1' && config.apiKey && config.apiKey.startsWith('agt_codex_')) {
                 config.baseUrl = DEFAULT_CONFIG.baseUrl;
                 config.apiKey = DEFAULT_CONFIG.apiKey;
                 config.model = DEFAULT_CONFIG.model;

@@ -41,9 +41,12 @@
 
 ## ⚙️ 配置说明
 
+*   **Python 依赖**：首次部署请先执行 `pip install -r requirements.txt`（Pillow / requests）。
 *   **配置文件**：`server_config.json`（实际运行配置，已加入 `.gitignore` 避免密钥泄露）
 *   **配置模板**：[server_config.example.json](file:///c:/Users/video/Desktop/creative-idea-generator/server_config.example.json)
     *   包含 API 密钥、访问密码以及各类服务端参数配置。首次部署时请参考模板新建 `server_config.json` / [server_config.json](file:///c:/Users/video/Desktop/creative-idea-generator/server_config.json)。
+    *   `adspowerPath`：AdsPower 自动化脚本目录（google_fx 帧序列/视频生成依赖），换机部署时必须改成本机路径。
+    *   `accessCode` 设置后，除 `/api/mode` 外的全部 API（含任务/日志/清单读取）都需要访问码；静态路由永不吐出配置、日志、任务与服务端源码。
 
 ---
 

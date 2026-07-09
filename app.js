@@ -102,6 +102,11 @@ let currentGenerationController = null;
 let currentFramesController = null;
 let currentVideosController = null;
 
+// 流代际守卫：每个通道一个递增序号。viewTask/retryTask 接管面板时会开启新一代流，
+// 旧流被 abort 后其 catch/finally 仍会异步执行——只有仍是最新一代的流才允许触碰 UI，
+// 否则旧流的收尾会清掉新任务刚建好的视图。
+const streamEpochs = { compose: 0, frames: 0, videos: 0, cover: 0 };
+
 // Safe Clipboard Copy Helper with HTTP LAN Fallback
 // Function copyText moved to modular JS file
 
@@ -483,6 +488,7 @@ async function checkApiStatus() {
         if (res.ok && data.online) {
             badge.className = 'status-badge online';
             badge.querySelector('.status-text').textContent = `本地 ${config.model} 在线`;
+            return true;
         } else {
             throw new Error(data.message || `HTTP Error ${res.status}`);
         }
@@ -490,6 +496,7 @@ async function checkApiStatus() {
         badge.className = 'status-badge offline';
         badge.querySelector('.status-text').textContent = 'API 连接断开';
         console.error("API check failed:", e);
+        return false;
     }
 }
 
@@ -555,6 +562,12 @@ function initSelectors() {
 // Interactive Particle Background (Canvas)
 function initCanvas() {
     const canvas = document.getElementById('particle-canvas');
+    if (!canvas) return;
+    // The particle field is disabled via CSS (#particle-canvas { display:none }). Bail before
+    // starting a perpetual requestAnimationFrame loop that would read canvas.offsetParent every
+    // frame — a forced-layout trigger that can cost a synchronous reflow during interactions —
+    // just to early-return and draw nothing. If the field is re-enabled in CSS, this runs again.
+    if (getComputedStyle(canvas).display === 'none') return;
     const ctx = canvas.getContext('2d');
     
     // Check prefers-reduced-motion
@@ -621,8 +634,8 @@ function initCanvas() {
     function animate(timestamp) {
         requestAnimationFrame(animate);
 
-        // Skip all drawing while the tab is hidden
-        if (document.hidden) return;
+        // Skip all drawing while the tab is hidden or the canvas is display:none
+        if (document.hidden || canvas.offsetParent === null) return;
 
         // Throttle: skip frame if not enough time has passed
         const delta = timestamp - lastFrameTime;
@@ -719,38 +732,13 @@ function setupEventListeners() {
         });
     }
 
-    // Model select change handling (show/hide GPT port group and auto-update base URL)
+    // Model select change: refresh the image-model options for the chosen main model.
+    // （GPT 代理端口选择器已从设置面板移除：gpt-5.5 由服务端 resolve_gateway 固定路由，
+    //   旧的 gpt-port-group 联动整块随之删除——之前它把整个 change 绑定都卡死了。）
     const modelSelect = document.getElementById('settings-model');
-    const gptPortGroup = document.getElementById('gpt-port-group');
-    const gptPortSelect = document.getElementById('settings-gpt-port');
-    const baseUrlInput = document.getElementById('settings-base-url');
-
-    if (modelSelect && gptPortGroup && gptPortSelect && baseUrlInput) {
+    if (modelSelect) {
         modelSelect.addEventListener('change', () => {
-            updateGptPortVisibility();
             updateImageModelOptions(false);
-            if (modelSelect.value === 'gpt-5.5') {
-                const port = gptPortSelect.value;
-                baseUrlInput.value = `http://localhost:${port}/v1`;
-            } else if (modelSelect.value === 'gemini-3-flash-agent') {
-                baseUrlInput.value = 'http://127.0.0.1:8046/v1';
-            }
-        });
-
-        gptPortSelect.addEventListener('change', () => {
-            const port = gptPortSelect.value;
-            const currentUrl = baseUrlInput.value.trim();
-            try {
-                if (currentUrl.startsWith('http://') || currentUrl.startsWith('https://')) {
-                    const urlObj = new URL(currentUrl);
-                    urlObj.port = port;
-                    baseUrlInput.value = urlObj.toString().replace(/\/$/, '');
-                } else {
-                    baseUrlInput.value = `http://localhost:${port}/v1`;
-                }
-            } catch (e) {
-                baseUrlInput.value = `http://localhost:${port}/v1`;
-            }
         });
     }
 
@@ -776,7 +764,10 @@ function setupEventListeners() {
                 });
                 const data = await res.json();
                 if (res.ok && data.online) {
-                    showToast("连接测试成功！模型在线。", "success");
+                    showToast("连接测试成功！模型在线。（若修改了配置，保存后生效）", "success");
+                    // 顺手刷新顶部状态徽章：徽章之前只在启动时检测一次，
+                    // 代理恢复后过期的「离线」状态会一直硬拦生成按钮
+                    checkApiStatus();
                 } else {
                     showToast(`连接测试失败: ${data.message || '模型离线'}`, "error");
                 }
@@ -951,9 +942,15 @@ function setupEventListeners() {
     // Keyboard Hotkeys
     document.addEventListener('keydown', (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-            const genBtn = document.getElementById('generate-btn');
-            if (genBtn && !genBtn.disabled) {
-                genBtn.click();
+            // 面板守卫：只有「激发维度」工作区可见且处于文本输入页时才触发主合成，
+            // 否则在图像工坊/结果页按 Ctrl+Enter 会静默发起一次隐藏的 LLM 合成任务
+            const configPanel = document.querySelector('.panel-left');
+            const cfgActive = configPanel && configPanel.classList.contains('mobile-active');
+            if (cfgActive && activeInputTab === 'text') {
+                const genBtn = document.getElementById('generate-btn');
+                if (genBtn && !genBtn.disabled) {
+                    genBtn.click();
+                }
             }
         }
         handleGlobalHotkeys(e);
@@ -1144,14 +1141,17 @@ async function renderTasks() {
             return true;
         });
         
-        if (filteredTasks.length === 0) {
-            tasksListContainer.innerHTML = `<div class="tasks-empty">暂无符合筛选条件的任务</div>`;
-            return;
-        }
-        
         let html = '';
+        if (filteredTasks.length === 0) {
+            html = `<div class="tasks-empty">暂无符合筛选条件的任务</div>`;
+        }
+        // (loop body is skipped naturally when there are no filtered tasks)
         filteredTasks.forEach(task => {
-            const dateStr = new Date(parseInt(task.id, 10)).toLocaleString();
+            // frames_/videos_/cover_ 前缀的任务 ID 不是时间戳，直接 parseInt 会显示 Invalid Date
+            const idMs = parseInt(task.id, 10);
+            const dateStr = Number.isFinite(idMs) && String(idMs) === String(task.id)
+                ? new Date(idMs).toLocaleString()
+                : (task.last_active ? new Date(task.last_active * 1000).toLocaleString() : '—');
             const theme = task.dimensions ? (task.dimensions.theme || '未命名主题') : '未命名主题';
             const isVideoReverse = (task.dimensions && task.dimensions.type === 'reverse-video') || theme.startsWith('视频反推');
             const beats = (task.dimensions && task.dimensions.beats_count && !isVideoReverse) ? ` (${task.dimensions.beats_count} 镜)` : '';
@@ -1278,9 +1278,19 @@ async function renderTasks() {
             `;
         });
         
+        // Skip the DOM teardown when the rendered output is byte-identical to the last poll.
+        // `html` reflects only visible state (status, bucketed progress %, stage text, buttons) —
+        // not the raw growing events array — so identical html means an identical view. This turns
+        // most 2.5s poll ticks into a no-op and stops the drawer from snapping to the top and
+        // dropping hover/focus while a task runs. When it does change, scroll position is preserved.
+        if (html === _lastTasksRenderHtml) return;
+        _lastTasksRenderHtml = html;
+        const _prevScroll = tasksListContainer.scrollTop;
         tasksListContainer.innerHTML = html;
+        tasksListContainer.scrollTop = _prevScroll;
     } catch (e) {
         console.error("Failed to render tasks list:", e);
+        _lastTasksRenderHtml = null; // force a real re-render on the next successful poll
         tasksListContainer.innerHTML = `<div class="tasks-empty" style="color: #f87171;">加载任务列表失败: ${escapeHtml(e.message)}</div>`;
     }
 }
@@ -1290,6 +1300,9 @@ async function renderTasks() {
 // Function stopTasksPolling moved to modular JS file
 
 // Function updateTasksBadge moved to modular JS file
+
+// Last rendered tasks-list markup; used to skip no-op re-renders (see renderTasks).
+let _lastTasksRenderHtml = null;
 
 let globalBadgeTimeout = null;
 
@@ -1622,12 +1635,16 @@ window.clearTasks = clearTasks;
 async function generateIdea(retryParams = null) {
     const badge = document.getElementById('api-status-badge');
     if (badge && badge.classList.contains('offline')) {
-        showToast("⚠️ API 连接已断开，请先在配置中心检查连接并保存！", "error");
-        const settingsModal = document.getElementById('settings-modal');
-        if (settingsModal) {
-            settingsModal.classList.add('active');
+        // 徽章可能是启动时的过期状态（代理其间已恢复）——先实时复测一次再决定拦不拦
+        const online = await checkApiStatus();
+        if (!online) {
+            showToast("⚠️ API 连接已断开，请先在配置中心检查连接并保存！", "error");
+            const settingsModal = document.getElementById('settings-modal');
+            if (settingsModal) {
+                settingsModal.classList.add('active');
+            }
+            return;
         }
-        return;
     }
 
     const placeholderView = document.getElementById('output-placeholder-view');
@@ -1640,6 +1657,9 @@ async function generateIdea(retryParams = null) {
     contentView.classList.remove('active');
     if (errorView) errorView.style.display = 'none';
     loadingView.classList.add('active');
+    // 生成开始即切到「激发结果」工作区——旧的自动切换脚本指向已删除的 ID，
+    // 导致用户点了激发却停在配置面板，以为没有反应
+    switchMainTab('results');
     updateActiveGenerationBanner();
 
     if (genBtn) {
@@ -1739,73 +1759,64 @@ async function streamProgress(taskId, dimensions) {
     const errorView = document.getElementById('output-error-view');
     const genBtn = document.getElementById('generate-btn');
 
-    currentGenerationController = new AbortController();
-    const timeoutId = setTimeout(() => {
-        if (currentGenerationController) {
-            currentGenerationController.abort();
-        }
-    }, 480000); // 8 minutes timeout
+    // 开启新一代 compose 流：先掐掉上一代（若有），旧流的收尾逻辑会被 epoch 守卫拦下
+    const epoch = ++streamEpochs.compose;
+    const isCurrent = () => epoch === streamEpochs.compose;
+    if (currentGenerationController) {
+        try { currentGenerationController.abort(); } catch (_) { /* noop */ }
+    }
+    const controller = new AbortController();
+    currentGenerationController = controller;
+
+    // 驱动 #generation-progress-* 进度条（之前这组 DOM 从未被任何 JS 更新过）
+    const taskType = window.ProgressModel ? ProgressModel.inferTaskType(dimensions) : 'compose';
+    let progressState = window.ProgressModel ? ProgressModel.createProgressState(taskType) : null;
+    const applyComposeProgress = (type, data) => {
+        if (!window.ProgressModel) return;
+        const info = ProgressModel.normalizeGenerationProgress(type, data, taskType, progressState);
+        progressState = info.state;
+        setProgressBar('generation', info);
+    };
+    applyComposeProgress('init', null);
 
     try {
-        const response = await fetch(`/api/compose-stream?task_id=${taskId}`, {
-            signal: currentGenerationController.signal
-        });
-
-        clearTimeout(timeoutId);
-
-        if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errText}`);
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buffer = '';
-        let resultData = null;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop();
-
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed) continue;
-
-                if (trimmed.startsWith('data: ')) {
-                    const jsonStr = trimmed.substring(6);
-                    try {
-                        const parsed = JSON.parse(jsonStr);
-                        if (parsed.type === 'progress') {
-                            updateProgressUI(parsed.data);
-                        } else if (parsed.type === 'text_chunk') {
-                            appendLiveTerminal(parsed.data);
-                        } else if (parsed.type === 'result') {
-                            resultData = parsed.data;
-                        } else if (parsed.type === 'error') {
-                            throw new Error(parsed.data.message || '未知错误');
-                        }
-                    } catch (e) {
-                        console.error("Failed to parse compose progress chunk", e);
-                        if (e.message) throw e;
-                    }
+        const watch = await watchTaskUntilTerminal(taskId, {
+            label: 'compose',
+            signal: controller.signal,
+            onEvent: (type, data) => {
+                if (!isCurrent()) return;
+                if (type === 'progress') {
+                    updateProgressUI(data || {});
+                    applyComposeProgress(type, data);
+                } else if (type === 'text_chunk') {
+                    appendLiveTerminal(data);
+                    applyComposeProgress(type, data);
+                } else if (type === 'reconnecting') {
+                    const stageText = document.getElementById('loading-stage-text');
+                    if (stageText) stageText.textContent = `与服务的连接中断，正在自动重连（第 ${data.attempt} 次）...`;
+                } else if (type === 'result' || type === 'error') {
+                    applyComposeProgress(type, data);
                 }
             }
-        }
+        });
 
+        if (!isCurrent()) return;
         stopLoadingTimer();
-        currentGenerationController = null;
+        if (currentGenerationController === controller) currentGenerationController = null;
         localStorage.removeItem('spark_active_task_id');
         localStorage.removeItem('spark_active_task_dimensions');
 
-        if (!resultData) {
+        if (watch.status === 'cancelled') {
+            throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+        }
+        if (watch.status === 'failed') {
+            throw new Error(watch.error || '未知错误');
+        }
+        if (!watch.result) {
             throw new Error("模型未返回有效结果");
         }
 
-        const data = resultData;
+        const data = watch.result;
         const isVideoReverse = dimensions.type === 'reverse-video' || (dimensions.theme && dimensions.theme.startsWith('视频反推'));
         
         const result = {
@@ -1852,13 +1863,15 @@ async function streamProgress(taskId, dimensions) {
         }
 
     } catch (e) {
+        // 旧一代流的收尾不允许触碰新一代流的 UI（viewTask/retryTask 接管场景）
+        if (!isCurrent()) return;
         stopLoadingTimer();
-        currentGenerationController = null;
+        if (currentGenerationController === controller) currentGenerationController = null;
         console.error("Failed to stream progress:", e);
 
         loadingView.classList.remove('active');
         contentView.classList.remove('active');
-        
+
         generationState.status = 'idle';
 
         const isVideoReverse = dimensions.type === 'reverse-video' || (dimensions.theme && dimensions.theme.startsWith('视频反推'));
@@ -1893,16 +1906,18 @@ async function streamProgress(taskId, dimensions) {
             showToast(errorMsg, "error");
         }
     } finally {
-        if (genBtn) {
-            genBtn.disabled = false;
-            genBtn.classList.remove('loading');
+        if (isCurrent()) {
+            if (genBtn) {
+                genBtn.disabled = false;
+                genBtn.classList.remove('loading');
+            }
+            const reverseBtn = document.getElementById('reverse-btn');
+            if (reverseBtn) {
+                reverseBtn.disabled = false;
+                reverseBtn.classList.remove('loading');
+            }
+            updateActiveGenerationBanner();
         }
-        const reverseBtn = document.getElementById('reverse-btn');
-        if (reverseBtn) {
-            reverseBtn.disabled = false;
-            reverseBtn.classList.remove('loading');
-        }
-        updateActiveGenerationBanner();
     }
 }
 
@@ -1985,6 +2000,7 @@ async function resumeActiveTaskIfExists() {
             if (contentView) contentView.classList.remove('active');
             if (errorView) errorView.style.display = 'none';
             if (loadingView) loadingView.classList.add('active');
+            switchMainTab('results');
             
             const isVideoReverse = dimensions.type === 'reverse-video' || (dimensions.theme && dimensions.theme.startsWith('视频反推'));
             setupLoadingSteps(isVideoReverse ? 'reverse-video' : 'compose');
@@ -2039,12 +2055,69 @@ async function resumeActiveTaskIfExists() {
 
 // Function resumeActiveBackgroundTasksIfExists moved to modular JS file
 
+/**
+ * 把一个已生成的帧渲染进对应槽位卡片。
+ * 事件重放/重连会对同一槽位重复触发，所以这里用 on* 赋值（幂等）而不是
+ * addEventListener（旧实现每次事件都往同一元素堆叠一套新监听器）。
+ */
+function updateFrameSlotCard(f) {
+    if (!f) return;
+    const slot = document.getElementById(`frame-slot-${f.sequence}`);
+    if (!slot) return;
+    slot.className = 'frame-card';
+    slot.style.cursor = 'pointer';
+    slot.title = `打开第 ${f.sequence} 帧`;
+    slot.innerHTML = `
+        <img src="" alt="Frame ${f.sequence}" loading="lazy">
+        <div class="frame-card-actions" style="position: absolute; top: 5px; right: 5px; display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s;">
+            <button class="action-btn text-btn mini-btn retry-frame-btn" data-seq="${f.sequence}" style="background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.3); padding: 2px 6px; font-size: 10px;">重试</button>
+        </div>
+        <span>IMG ${String(f.sequence).padStart(3, '0')}</span>
+    `;
+    // Live/retry SSE path: a frame just arrived from the backend and may have overwritten an
+    // already-shown file (retry), so bump its cache version to force one fresh fetch. Passive
+    // grid re-renders (media_renderer) use bust=false and stay on the browser cache.
+    safeSetImageSrc(slot.querySelector('img'), f.url, true);
+
+    slot.onmouseenter = () => {
+        const actions = slot.querySelector('.frame-card-actions');
+        if (actions) actions.style.opacity = '1';
+    };
+    slot.onmouseleave = () => {
+        const actions = slot.querySelector('.frame-card-actions');
+        if (actions) actions.style.opacity = '0';
+    };
+    slot.onclick = (e) => {
+        if (e.target.classList.contains('retry-frame-btn')) return;
+        const validFrames = (currentIdea && currentIdea.frameRun && currentIdea.frameRun.frames) || [];
+        const mediaList = validFrames.map((frame) => ({
+            type: 'image',
+            url: frame.url || frame.file,
+            caption: `<strong>第 ${frame.sequence} 帧 / 共 ${validFrames.length} 帧</strong>`
+        }));
+        const clickedIndex = validFrames.findIndex(frame => frame.sequence === f.sequence);
+        openLightbox(mediaList, clickedIndex >= 0 ? clickedIndex : 0);
+    };
+    slot.querySelector('.retry-frame-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        retrySingleFrame(f.sequence);
+    });
+}
+
 async function streamFramesProgress(taskId) {
     const btn = document.getElementById('generate-frames-btn');
     const progress = document.getElementById('frames-progress');
     const meta = document.getElementById('frames-meta');
     const grid = document.getElementById('frames-grid');
     if (!btn || !progress || !meta || !grid) return;
+
+    const epoch = ++streamEpochs.frames;
+    const isCurrent = () => epoch === streamEpochs.frames;
+    if (currentFramesController) {
+        try { currentFramesController.abort(); } catch (_) { /* noop */ }
+    }
+    const controller = new AbortController();
+    currentFramesController = controller;
 
     btn.disabled = true;
     progress.style.display = 'flex';
@@ -2053,171 +2126,93 @@ async function streamFramesProgress(taskId) {
     activeBackgroundTasks.frames = true;
     updateTabStatusDot();
 
-    currentFramesController = new AbortController();
+    let frameProgressState = window.ProgressModel ? ProgressModel.createProgressState('frames') : null;
+    const applyFramesProgress = (type, data) => {
+        if (!window.ProgressModel) return null;
+        const info = ProgressModel.normalizeGenerationProgress(type, data, 'frames', frameProgressState);
+        frameProgressState = info.state;
+        setProgressBar('frames', info);
+        return info;
+    };
+    applyFramesProgress('queue', { message: '连接帧生成事件流...' });
 
     try {
-        const response = await fetch(`/api/compose-stream?task_id=${taskId}`, {
-            signal: currentFramesController.signal
-        });
+        const watch = await watchTaskUntilTerminal(taskId, {
+            label: 'frames',
+            signal: controller.signal,
+            onEvent: (type, data) => {
+                if (!isCurrent()) return;
+                if (type === 'start') {
+                    applyFramesProgress('start', data);
+                    const total = (data && data.total) || 0;
+                    meta.textContent = `开始生成共 ${total} 帧序列图...`;
 
-        if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errText}`);
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buffer = '';
-        let manifestData = null;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop();
-
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed) continue;
-
-                if (trimmed.startsWith('data: ')) {
-                    const jsonStr = trimmed.substring(6);
-                    try {
-                        const parsed = JSON.parse(jsonStr);
-                        if (parsed.type === 'start') {
-                            const total = parsed.data.total;
-                            meta.textContent = `开始生成共 ${total} 帧序列图...`;
-                            
-                            if (currentIdea) {
-                                if (!currentIdea.frameRun) {
-                                    currentIdea.frameRun = { title: currentIdea.title, frames: [] };
-                                }
-                                currentIdea.frameRun.frames = [];
-                                saveCurrentIdeaState();
-                                const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
-                                if (existingIdx !== -1) {
-                                    savedIdeas[existingIdx].frameRun = currentIdea.frameRun;
-                                    saveLibrary();
-                                }
-                            }
-
-                            grid.innerHTML = '';
-                            for (let i = 1; i <= total; i++) {
-                                const placeholderCard = document.createElement('div');
-                                placeholderCard.className = 'frame-card placeholder-frame-card';
-                                placeholderCard.id = `frame-slot-${i}`;
-                                placeholderCard.innerHTML = `
-                                    <div class="frame-placeholder-spinner">
-                                        <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-                                    </div>
-                                    <span>第 ${String(i).padStart(3, '0')} 帧 (等待中)</span>
-                                `;
-                                grid.appendChild(placeholderCard);
-                            }
-                        } else if (parsed.type === 'frame') {
-                            const f = parsed.data.frame;
-                            const cur = parsed.data.current;
-                            const tot = parsed.data.total;
-                            if (cur < tot) {
-                                meta.textContent = `正在生成帧序列: ${cur}/${tot} (正在处理第 ${cur + 1} 帧)...`;
-                            } else {
-                                meta.textContent = `正在生成帧序列: ${cur}/${tot} (已生成完毕，正在整理)...`;
-                            }
-                            
-                            const slot = document.getElementById(`frame-slot-${f.sequence}`);
-                            if (slot) {
-                                slot.className = 'frame-card';
-                                slot.style.cursor = 'pointer';
-                                slot.title = `打开第 ${f.sequence} 帧`;
-                                slot.innerHTML = `
-                                    <img src="" alt="Frame ${f.sequence}" loading="lazy">
-                                    <div class="frame-card-actions" style="position: absolute; top: 5px; right: 5px; display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s;">
-                                        <button class="action-btn text-btn mini-btn retry-frame-btn" data-seq="${f.sequence}" style="background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.3); padding: 2px 6px; font-size: 10px;">重试</button>
-                                    </div>
-                                    <span>IMG ${String(f.sequence).padStart(3, '0')}</span>
-                                `;
-                                safeSetImageSrc(slot.querySelector('img'), f.url);
-                                
-                                slot.addEventListener('mouseenter', () => {
-                                    const actions = slot.querySelector('.frame-card-actions');
-                                    if (actions) actions.style.opacity = '1';
-                                });
-                                slot.addEventListener('mouseleave', () => {
-                                    const actions = slot.querySelector('.frame-card-actions');
-                                    if (actions) actions.style.opacity = '0';
-                                });
-                                
-                                slot.addEventListener('click', (e) => {
-                                    if (e.target.classList.contains('retry-frame-btn')) return;
-                                    const validFrames = (currentIdea && currentIdea.frameRun && currentIdea.frameRun.frames) || [];
-                                    const mediaList = validFrames.map((frame) => ({
-                                        type: 'image',
-                                        url: frame.url || frame.file,
-                                        caption: `<strong>第 ${frame.sequence} 帧 / 共 ${validFrames.length} 帧</strong>`
-                                    }));
-                                    const clickedIndex = validFrames.findIndex(frame => frame.sequence === f.sequence);
-                                    openLightbox(mediaList, clickedIndex >= 0 ? clickedIndex : 0);
-                                });
-                                
-                                slot.querySelector('.retry-frame-btn').addEventListener('click', (e) => {
-                                    e.stopPropagation();
-                                    retrySingleFrame(f.sequence);
-                                });
-                            }
-
-                            if (currentIdea) {
-                                if (!currentIdea.frameRun) {
-                                    currentIdea.frameRun = { title: currentIdea.title, frames: [] };
-                                }
-                                if (!currentIdea.frameRun.frames) {
-                                    currentIdea.frameRun.frames = [];
-                                }
-                                const idx = currentIdea.frameRun.frames.findIndex(item => item.sequence === f.sequence);
-                                if (idx !== -1) {
-                                    currentIdea.frameRun.frames[idx] = f;
-                                } else {
-                                    currentIdea.frameRun.frames.push(f);
-                                    currentIdea.frameRun.frames.sort((a, b) => a.sequence - b.sequence);
-                                }
-                                saveCurrentIdeaState();
-                                const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
-                                if (existingIdx !== -1) {
-                                    savedIdeas[existingIdx].frameRun = currentIdea.frameRun;
-                                    saveLibrary();
-                                }
-                            }
-                        } else if (parsed.type === 'result') {
-                            manifestData = parsed.data;
-                        } else if (parsed.type === 'error') {
-                            throw new Error(parsed.data.message || '未知错误');
+                    if (currentIdea) {
+                        if (!currentIdea.frameRun) {
+                            currentIdea.frameRun = { title: currentIdea.title, frames: [] };
                         }
-                    } catch (err) {
-                        console.error("Error parsing frames SSE data", err);
-                        if (err.message) throw err;
+                        currentIdea.frameRun.frames = [];
+                        saveCurrentIdeaState();
+                        const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
+                        if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = currentIdea.frameRun;
                     }
+
+                    grid.innerHTML = '';
+                    for (let i = 1; i <= total; i++) {
+                        const placeholderCard = document.createElement('div');
+                        placeholderCard.className = 'frame-card placeholder-frame-card';
+                        placeholderCard.id = `frame-slot-${i}`;
+                        placeholderCard.innerHTML = `
+                            <div class="frame-placeholder-spinner">
+                                <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
+                            </div>
+                            <span>第 ${String(i).padStart(3, '0')} 帧 (等待中)</span>
+                        `;
+                        grid.appendChild(placeholderCard);
+                    }
+                } else if (type === 'frame') {
+                    applyFramesProgress('frame', data);
+                    const f = data && data.frame;
+                    const cur = (data && data.current) || 0;
+                    const tot = (data && data.total) || 0;
+                    if (cur < tot) {
+                        meta.textContent = `正在生成帧序列: ${cur}/${tot} (正在处理第 ${cur + 1} 帧)...`;
+                    } else {
+                        meta.textContent = `正在生成帧序列: ${cur}/${tot} (已生成完毕，正在整理)...`;
+                    }
+                    updateFrameSlotCard(f);
+                    applyFrameEventToIdea(f);
+                } else if (type === 'frame_start' || type === 'frame_retry' || type === 'queue') {
+                    const info = applyFramesProgress(type, data);
+                    if (info && info.label) meta.textContent = info.label;
+                } else if (type === 'reconnecting') {
+                    meta.textContent = `连接中断，正在重连（第 ${data.attempt} 次）...`;
+                } else if (type === 'result' || type === 'error') {
+                    applyFramesProgress(type, data);
                 }
             }
-        }
+        });
 
-        currentFramesController = null;
+        if (!isCurrent()) return;
+        if (currentFramesController === controller) currentFramesController = null;
         activeBackgroundTasks.framesTaskId = null;
         saveActiveBackgroundTasksToLocalStorage();
 
-        if (manifestData) {
-            currentIdea.frameRun = manifestData;
-            saveCurrentIdeaState();
-            const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
-            if (existingIdx !== -1) {
-                savedIdeas[existingIdx].frameRun = manifestData;
-                await saveLibrary();
-            }
+        if (watch.status === 'cancelled') {
+            throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+        }
+        if (watch.status === 'failed') {
+            throw new Error(watch.error || '未知错误');
+        }
+
+        if (watch.result) {
+            await syncFrameRunToLibrary(watch.result);
             renderFramesForIdea(currentIdea);
-            showToast(`已成功生成 ${manifestData.frames.length} 帧连续帧序列图。`, "success");
+            showToast(`已成功生成 ${(watch.result.frames || []).length} 帧连续帧序列图。`, "success");
         }
     } catch (e) {
-        currentFramesController = null;
+        if (!isCurrent()) return;
+        if (currentFramesController === controller) currentFramesController = null;
         console.error("Failed to generate frames:", e);
         if (e.name === 'AbortError') {
             meta.textContent = '帧序列生成已被用户取消。';
@@ -2226,7 +2221,7 @@ async function streamFramesProgress(taskId) {
             meta.textContent = `帧序列生成失败: ${e.message}`;
             showToast(`帧序列生成失败: ${e.message}`, "error");
         }
-        
+
         activeBackgroundTasks.framesTaskId = null;
         saveActiveBackgroundTasksToLocalStorage();
 
@@ -2234,10 +2229,12 @@ async function streamFramesProgress(taskId) {
             renderFramesForIdea(currentIdea);
         }
     } finally {
-        progress.style.display = 'none';
-        btn.disabled = false;
-        activeBackgroundTasks.frames = false;
-        updateTabStatusDot();
+        if (isCurrent()) {
+            progress.style.display = 'none';
+            btn.disabled = false;
+            activeBackgroundTasks.frames = false;
+            updateTabStatusDot();
+        }
     }
 }
 
@@ -2248,6 +2245,14 @@ async function streamVideosProgress(taskId) {
     const grid = document.getElementById('videos-grid');
     if (!btn || !progress || !meta || !grid) return;
 
+    const epoch = ++streamEpochs.videos;
+    const isCurrent = () => epoch === streamEpochs.videos;
+    if (currentVideosController) {
+        try { currentVideosController.abort(); } catch (_) { /* noop */ }
+    }
+    const controller = new AbortController();
+    currentVideosController = controller;
+
     btn.disabled = true;
     progress.style.display = 'flex';
     meta.textContent = '连接视频生成事件流...';
@@ -2255,250 +2260,128 @@ async function streamVideosProgress(taskId) {
     activeBackgroundTasks.videos = true;
     updateTabStatusDot();
 
-    currentVideosController = new AbortController();
     let videoProgressState = window.ProgressModel ? ProgressModel.createProgressState('videos') : null;
     const applyVideoProgress = (eventType, eventData) => {
         if (!window.ProgressModel) return null;
         const progressInfo = ProgressModel.normalizeGenerationProgress(eventType, eventData, 'videos', videoProgressState);
         videoProgressState = progressInfo.state;
         setProgressBar('videos', progressInfo);
-        if (progressInfo.label) meta.textContent = progressInfo.label;
         return progressInfo;
     };
     applyVideoProgress('queue', { message: '连接视频生成事件流...' });
 
-    try {
-        const response = await fetch(`/api/compose-stream?task_id=${taskId}`, {
-            signal: currentVideosController.signal
+    // 失败/取消时把还挂着转圈的槽位统一改画失败卡
+    const failPendingSlots = (message, labelText) => {
+        grid.querySelectorAll('.placeholder-frame-card').forEach(card => {
+            const slotMatch = card.id && card.id.match(/video-slot-(\d+)/);
+            if (slotMatch) renderVideoSlotFailed(parseInt(slotMatch[1], 10), message, labelText);
         });
+    };
 
-        if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errText}`);
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buffer = '';
-        let manifestData = null;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop();
-
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed) continue;
-
-                if (trimmed.startsWith('data: ')) {
-                    const jsonStr = trimmed.substring(6);
-                    try {
-                        const parsed = JSON.parse(jsonStr);
-                        if (parsed.type === 'start') {
-                            applyVideoProgress('start', parsed.data);
-                            const total = parsed.data.total;
-                            const slots = parsed.data.slots || [];
-                            meta.textContent = `开始生成共 ${total} 段视频...`;
-                            grid.innerHTML = '';
-                            
-                            const slotsToRender = slots.length ? slots : Array.from({length: total}, (_, i) => i + 1);
-                            slotsToRender.forEach(slotIdx => {
-                                const placeholderCard = document.createElement('div');
-                                placeholderCard.className = 'frame-card placeholder-frame-card';
-                                placeholderCard.id = `video-slot-${slotIdx}`;
-                                placeholderCard.innerHTML = `
-                                    <div class="frame-placeholder-spinner">
-                                        <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-                                    </div>
-                                    <span>第 ${String(slotIdx).padStart(3, '0')} 段视频 (等待中)</span>
-                                `;
-                                grid.appendChild(placeholderCard);
-                            });
-                        } else if (parsed.type === 'video_start') {
-                            applyVideoProgress('video_start', parsed.data);
-                            const cur = parsed.data.current;
-                            const tot = parsed.data.total;
-                            const idx = parsed.data.index;
-                            meta.textContent = `正在生成视频: ${cur}/${tot} (正在处理第 ${idx} 段视频)...`;
-                            
-                            const slot = document.getElementById(`video-slot-${idx}`);
-                            if (slot) {
-                                slot.innerHTML = `
-                                    <div class="frame-placeholder-spinner">
-                                        <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-                                    </div>
-                                    <span>第 ${String(idx).padStart(3, '0')} 段视频 (生成中...)</span>
-                                `;
-                            }
-                        } else if (parsed.type === 'video_done') {
-                            applyVideoProgress('video_done', parsed.data);
-                            const v = parsed.data.video;
-                            const cur = parsed.data.current;
-                            const tot = parsed.data.total;
-                            const idx = parsed.data.index;
-                            meta.textContent = `正在生成视频: ${cur}/${tot}...`;
-                            
-                            const slot = document.getElementById(`video-slot-${idx}`);
-                            if (slot) {
-                                slot.className = 'frame-card';
-                                slot.style.cursor = 'default';
-                                slot.innerHTML = `
-                                    <video src="${v.url}" controls style="width:100%; aspect-ratio: 9/16; object-fit: cover; border-radius: 5px; display: block; background: #03050c;"></video>
-                                    <span>VID ${String(v.slot).padStart(3, '0')}</span>
-                                `;
-                            }
-                        } else if (parsed.type === 'video_error') {
-                            applyVideoProgress('video_error', parsed.data);
-                            const cur = parsed.data.current;
-                            const tot = parsed.data.total;
-                            const idx = parsed.data.index;
-                            const msg = parsed.data.message || '生成失败';
-                            meta.textContent = `视频 ${idx} 生成失败: ${msg}`;
-                            
-                            const slot = document.getElementById(`video-slot-${idx}`);
-                            if (slot) {
-                                slot.className = 'frame-card video-failed-card';
-                                slot.innerHTML = `
-                                    <div class="video-failed-placeholder">
-                                        <span class="error-icon">⚠️</span>
-                                        <span class="error-text" title="${msg}">生成失败</span>
-                                        <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${idx}">重试</button>
-                                    </div>
-                                    <span>VID ${String(idx).padStart(3, '0')}</span>
-                                `;
-                                slot.querySelector('.retry-video-btn').addEventListener('click', (e) => {
-                                    e.stopPropagation();
-                                    retrySingleVideo(idx);
-                                });
-                            }
-                        } else if (parsed.type === 'queue') {
-                            applyVideoProgress('queue', parsed.data);
-                            meta.textContent = parsed.data.message || '正在排队等待生成视频...';
-                        } else if (parsed.type === 'merge_skip') {
-                            applyVideoProgress('merge_skip', parsed.data);
-                            meta.textContent = parsed.data.message || '由于存在失败片段，已跳过自动合并。';
-                        } else if (parsed.type === 'merge_start') {
-                            applyVideoProgress('merge_start', parsed.data);
-                            meta.textContent = '正在自动合并并加速视频 (2x Speed)...';
-                        } else if (parsed.type === 'merge_done') {
-                            applyVideoProgress('merge_done', parsed.data);
-                            meta.textContent = '所有视频已成功生成并合并加速！';
-                        } else if (parsed.type === 'merge_error') {
-                            applyVideoProgress('merge_error', parsed.data);
-                            meta.textContent = `自动合并视频失败: ${parsed.data.message || '未知错误'}`;
-                            showToast(`自动合并失败: ${parsed.data.message || '未知错误'}`, "warning");
-                        } else if (parsed.type === 'result') {
-                            applyVideoProgress('result', parsed.data);
-                            manifestData = parsed.data;
-                        } else if (parsed.type === 'error') {
-                            applyVideoProgress('error', parsed.data);
-                            throw new Error(parsed.data.message || '未知错误');
-                        }
-                    } catch (err) {
-                        console.error("Error parsing videos SSE data", err);
-                        if (err.message) throw err;
+    try {
+        const watch = await watchTaskUntilTerminal(taskId, {
+            label: 'videos',
+            signal: controller.signal,
+            onEvent: (type, data) => {
+                if (!isCurrent()) return;
+                if (type === 'start') {
+                    applyVideoProgress('start', data);
+                    const total = (data && data.total) || 0;
+                    const slots = (data && data.slots) || [];
+                    meta.textContent = `开始生成共 ${total} 段视频...`;
+                    grid.innerHTML = '';
+                    const slotsToRender = slots.length ? slots : Array.from({ length: total }, (_, i) => i + 1);
+                    slotsToRender.forEach(slotIdx => {
+                        const placeholderCard = document.createElement('div');
+                        placeholderCard.className = 'frame-card placeholder-frame-card';
+                        placeholderCard.id = `video-slot-${slotIdx}`;
+                        grid.appendChild(placeholderCard);
+                        renderVideoSlotPending(slotIdx, '等待中');
+                    });
+                } else if (type === 'video_start') {
+                    applyVideoProgress('video_start', data);
+                    meta.textContent = `正在生成视频: ${data.current}/${data.total} (正在处理第 ${data.index} 段视频)...`;
+                    const slot = document.getElementById(`video-slot-${data.index}`);
+                    if (slot && slot.classList.contains('placeholder-frame-card')) {
+                        renderVideoSlotPending(data.index, '生成中...');
                     }
+                } else if (type === 'video_done') {
+                    applyVideoProgress('video_done', data);
+                    meta.textContent = `正在生成视频: ${data.current}/${data.total}...`;
+                    renderVideoSlotDone(data.index, data.video);
+                } else if (type === 'video_error') {
+                    applyVideoProgress('video_error', data);
+                    const msg = (data && data.message) || '生成失败';
+                    meta.textContent = `视频 ${data.index} 生成失败: ${msg}`;
+                    renderVideoSlotFailed(data.index, msg);
+                } else if (type === 'queue') {
+                    applyVideoProgress('queue', data);
+                    meta.textContent = (data && data.message) || '正在排队等待生成视频...';
+                } else if (type === 'merge_skip') {
+                    applyVideoProgress('merge_skip', data);
+                    meta.textContent = (data && data.message) || '由于存在失败片段，已跳过自动合并。';
+                } else if (type === 'merge_start') {
+                    applyVideoProgress('merge_start', data);
+                    meta.textContent = '正在自动合并并加速视频 (2x Speed)...';
+                } else if (type === 'merge_done') {
+                    applyVideoProgress('merge_done', data);
+                    meta.textContent = '所有视频已成功生成并合并加速！';
+                } else if (type === 'merge_error') {
+                    applyVideoProgress('merge_error', data);
+                    meta.textContent = `自动合并视频失败: ${(data && data.message) || '未知错误'}`;
+                    showToast(`自动合并失败: ${(data && data.message) || '未知错误'}`, "warning");
+                } else if (type === 'reconnecting') {
+                    meta.textContent = `连接中断，正在重连（第 ${data.attempt} 次）...`;
+                } else if (type === 'result' || type === 'error') {
+                    applyVideoProgress(type, data);
                 }
             }
-        }
+        });
 
-        currentVideosController = null;
+        if (!isCurrent()) return;
+        if (currentVideosController === controller) currentVideosController = null;
         activeBackgroundTasks.videosTaskId = null;
         saveActiveBackgroundTasksToLocalStorage();
 
-        if (manifestData) {
-            currentIdea.frameRun = manifestData;
-            saveCurrentIdeaState();
-            const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
-            if (existingIdx !== -1) {
-                savedIdeas[existingIdx].frameRun = manifestData;
-                await saveLibrary();
-            }
+        if (watch.status === 'cancelled') {
+            throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+        }
+        if (watch.status === 'failed') {
+            throw new Error(watch.error || '未知错误');
+        }
+
+        if (watch.result) {
+            await syncFrameRunToLibrary(watch.result);
             renderVideosForIdea(currentIdea);
-            showToast(`已成功生成 ${manifestData.videos.length} 段连续视频。`, "success");
+            showToast(`已成功生成 ${(watch.result.videos || []).length} 段连续视频。`, "success");
         }
     } catch (e) {
-        currentVideosController = null;
+        if (!isCurrent()) return;
+        if (currentVideosController === controller) currentVideosController = null;
         console.error("Failed to generate videos:", e);
-        
+
         activeBackgroundTasks.videosTaskId = null;
         saveActiveBackgroundTasksToLocalStorage();
 
         if (e.name === 'AbortError') {
             meta.textContent = '视频生成已被用户取消。';
             showToast('已取消视频生成', 'info');
-
-            const placeholders = grid.querySelectorAll('.placeholder-frame-card');
-            placeholders.forEach(card => {
-                const slotMatch = card.id && card.id.match(/video-slot-(\d+)/);
-                const slotIdx = slotMatch ? parseInt(slotMatch[1]) : null;
-                if (slotIdx !== null) {
-                    card.className = 'frame-card video-failed-card';
-                    card.innerHTML = `
-                        <div class="video-failed-placeholder">
-                            <span class="error-icon">⚠️</span>
-                            <span class="error-text" title="已被用户取消">未生成</span>
-                            <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${slotIdx}">重试</button>
-                        </div>
-                        <span>VID ${String(slotIdx).padStart(3, '0')}</span>
-                    `;
-                    card.querySelector('.retry-video-btn').addEventListener('click', (ev) => {
-                        ev.stopPropagation();
-                        retrySingleVideo(slotIdx);
-                    });
-                }
-            });
+            failPendingSlots('已被用户取消', '未生成');
         } else {
             meta.textContent = `视频生成失败: ${e.message}`;
             showToast(`视频生成失败: ${e.message}`, "error");
+            failPendingSlots(e.message || '生成失败', '生成失败');
 
-            const placeholders = grid.querySelectorAll('.placeholder-frame-card');
-            placeholders.forEach(card => {
-                const slotMatch = card.id && card.id.match(/video-slot-(\d+)/);
-                const slotIdx = slotMatch ? parseInt(slotMatch[1]) : null;
-                if (slotIdx !== null) {
-                    card.className = 'frame-card video-failed-card';
-                    card.innerHTML = `
-                        <div class="video-failed-placeholder">
-                            <span class="error-icon">⚠️</span>
-                            <span class="error-text" title="${e.message || '生成失败'}">生成失败</span>
-                            <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${slotIdx}">重试</button>
-                        </div>
-                        <span>VID ${String(slotIdx).padStart(3, '0')}</span>
-                    `;
-                    card.querySelector('.retry-video-btn').addEventListener('click', (ev) => {
-                        ev.stopPropagation();
-                        retrySingleVideo(slotIdx);
-                    });
-                }
-            });
-
-            try {
-                const resp = await fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(currentIdea))}`);
-                if (resp.ok) {
-                    const manifest = await resp.json();
-                    currentIdea.frameRun = manifest;
-                    saveCurrentIdeaState();
-                    const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
-                    if (existingIdx !== -1) {
-                        savedIdeas[existingIdx].frameRun = manifest;
-                        await saveLibrary();
-                    }
-                    renderVideosForIdea(currentIdea);
-                }
-            } catch (err) {
-                console.error("Failed to load partial manifest after failure:", err);
-            }
+            await reloadManifestIntoIdea();
+            if (currentIdea && currentIdea.frameRun) renderVideosForIdea(currentIdea);
         }
     } finally {
-        progress.style.display = 'none';
-        btn.disabled = false;
-        activeBackgroundTasks.videos = false;
-        updateTabStatusDot();
+        if (isCurrent()) {
+            progress.style.display = 'none';
+            btn.disabled = false;
+            activeBackgroundTasks.videos = false;
+            updateTabStatusDot();
+        }
     }
 }
 
@@ -2517,55 +2400,24 @@ async function streamCoverProgress(taskId) {
     activeBackgroundTasks.cover = true;
     updateTabStatusDot();
 
+    const epoch = ++streamEpochs.cover;
+    const isCurrent = () => epoch === streamEpochs.cover;
+
     try {
-        const response = await fetch(`/api/compose-stream?task_id=${taskId}`);
-        if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`HTTP ${response.ok ? 'OK' : response.status}: ${errText}`);
-        }
+        const watch = await watchTaskUntilTerminal(taskId, { label: 'cover' });
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buffer = '';
-        let resultData = null;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop();
-
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed) continue;
-
-                if (trimmed.startsWith('data: ')) {
-                    const jsonStr = trimmed.substring(6);
-                    try {
-                        const parsed = JSON.parse(jsonStr);
-                        if (parsed.type === 'result') {
-                            resultData = parsed.data;
-                        } else if (parsed.type === 'error') {
-                            throw new Error(parsed.data.message || '未知错误');
-                        }
-                    } catch (err) {
-                        console.error("Error parsing cover SSE data", err);
-                        if (err.message) throw err;
-                    }
-                }
-            }
-        }
-
+        if (!isCurrent()) return;
         activeBackgroundTasks.coverTaskId = null;
         saveActiveBackgroundTasksToLocalStorage();
 
-        if (!resultData) {
+        if (watch.status === 'failed' || watch.status === 'cancelled') {
+            throw new Error(watch.error || '封面任务未完成');
+        }
+        if (!watch.result) {
             throw new Error("模型未返回有效结果");
         }
 
-        const data = resultData;
+        const data = watch.result;
         const imageUrl = extractImageUrl(data.content);
         const englishTitle = data.english_title;
 
@@ -2594,6 +2446,7 @@ async function streamCoverProgress(taskId) {
         renderCoversForIdea(currentIdea, currentIdea.covers.length - 1);
         showToast("封面图制作成功！", "success");
     } catch (e) {
+        if (!isCurrent()) return;
         console.error("Failed to generate cover:", e);
         showToast(`封面制作失败: ${e.message}`, "error");
 
@@ -2606,10 +2459,12 @@ async function streamCoverProgress(taskId) {
             placeholderEl.style.display = 'flex';
         }
     } finally {
-        loadingEl.style.display = 'none';
-        makeBtn.disabled = false;
-        activeBackgroundTasks.cover = false;
-        updateTabStatusDot();
+        if (isCurrent()) {
+            loadingEl.style.display = 'none';
+            makeBtn.disabled = false;
+            activeBackgroundTasks.cover = false;
+            updateTabStatusDot();
+        }
     }
 }
 
@@ -3634,6 +3489,7 @@ async function handleReverse() {
     contentView.classList.remove('active');
     if (errorView) errorView.style.display = 'none';
     loadingView.classList.add('active');
+    switchMainTab('results');
     updateActiveGenerationBanner();
 
     if (reverseBtn) {

@@ -1,29 +1,43 @@
 // --- media_renderer.js ---
 
-function safeSetImageSrc(imgEl, url) {
+// Per-URL cache-bust versions. Previously EVERY render appended `?t=Date.now()`, giving
+// each render a unique URL that defeated the browser cache — so re-viewing an idea, switching
+// tabs, or re-rendering the frame grid re-downloaded every image (server logs showed each
+// frame fetched 10-13x, with visible blank-then-reload flicker). We now use a STABLE version
+// per URL: passive re-renders reuse the same URL and hit the cache; only an explicit
+// regeneration (bust=true, e.g. a retried frame overwriting the same file) bumps the version
+// to force exactly one refetch.
+const _imgCacheVersions = new Map();
+
+function safeSetImageSrc(imgEl, url, bust = false) {
     if (!imgEl) return;
     if (!url) {
         imgEl.removeAttribute('src');
         return;
     }
     const lower = url.trim().toLowerCase();
-    const isSafe = lower.startsWith('http://') || 
-                   lower.startsWith('https://') || 
+    const isSafe = lower.startsWith('http://') ||
+                   lower.startsWith('https://') ||
                    lower.startsWith('data:image/') ||
                    lower.startsWith('/') ||
                    lower.startsWith('outputs/');
-    if (isSafe) {
-        // Add cache buster for local files to avoid caching issues during regeneration
-        let finalUrl = url;
-        if (!lower.startsWith('http://') && !lower.startsWith('https://') && !lower.startsWith('data:image/')) {
-            const separator = url.includes('?') ? '&' : '?';
-            finalUrl = url + separator + 't=' + Date.now();
-        }
-        imgEl.src = finalUrl;
-    } else {
+    if (!isSafe) {
         console.warn("Blocked potentially unsafe image URL:", url);
         imgEl.removeAttribute('src');
+        return;
     }
+    // Remote (http/https) and inline data: URIs are immutable/opaque — never cache-bust them.
+    const isLocalFile = !lower.startsWith('http://') && !lower.startsWith('https://') && !lower.startsWith('data:image/');
+    let finalUrl = url;
+    if (isLocalFile) {
+        if (bust) _imgCacheVersions.set(url, Date.now());
+        const version = _imgCacheVersions.get(url);
+        if (version) {
+            const separator = url.includes('?') ? '&' : '?';
+            finalUrl = url + separator + 'v=' + version;
+        }
+    }
+    imgEl.src = finalUrl;
 }
 
 function renderIdea(result) {

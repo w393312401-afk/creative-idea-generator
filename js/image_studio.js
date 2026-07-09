@@ -15,25 +15,6 @@ let imgStudioUploadedFiles = []; // Array of { name, file, base64 }
 let imgStudioHistory = []; // Array of { id, type, prompt, model, ratio, quality, timestamp, image }
 let imgStudioTaskList = []; // Array of { id, type, prompt, model, ratio, quality, status, error, image, timestamp, controller, extraData }
 
-async function imgStudioFetchWithTimeout(url, options = {}, timeoutMs = 120000) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        return await fetch(url, {
-            ...options,
-            signal: controller.signal
-        });
-    } catch (error) {
-        if (error && error.name === 'AbortError') {
-            const seconds = Math.round(timeoutMs / 1000);
-            throw new Error(`请求超时：图像服务超过 ${seconds} 秒未返回，请稍后重试或换一张更小的参考图。`);
-        }
-        throw error;
-    } finally {
-        clearTimeout(timeoutId);
-    }
-}
-
 // Curated Creative Prompts for Random Generator
 const IMGSTUDIO_CREATIVE_PROMPTS = [
     {
@@ -162,16 +143,19 @@ function initImageStudioSelectors() {
     });
 }
 
-function imgStudioSetRandomPrompt() {
+function imgStudioSetRandomPrompt(options = {}) {
+    const { silent = false, onlyIfEmpty = false } = options;
+    const textarea = document.getElementById('t2i-prompt');
+    if (!textarea) return;
+    // 页面加载时的静默预填不能覆盖用户已有输入，也不该在别的工作区弹 toast
+    if (onlyIfEmpty && textarea.value.trim()) return;
+
     const randomIndex = Math.floor(Math.random() * IMGSTUDIO_CREATIVE_PROMPTS.length);
     const prompt = IMGSTUDIO_CREATIVE_PROMPTS[randomIndex];
-    const finalText = Math.random() > 0.4 ? prompt.zh : prompt.en;
-
-    const textarea = document.getElementById('t2i-prompt');
-    textarea.value = finalText;
+    textarea.value = Math.random() > 0.4 ? prompt.zh : prompt.en;
 
     document.querySelectorAll('#imgstudio-controls .style-tag').forEach(t => t.classList.remove('active'));
-    showToast('灵感提示词已载入，可直接点击生成', 'success');
+    if (!silent) showToast('灵感提示词已载入，可直接点击生成', 'success');
 }
 
 // Drag & Drop / File Uploader Setup
@@ -354,14 +338,34 @@ function imgStudioLoadTaskList() {
 }
 
 function imgStudioSaveTaskList() {
+    // 序列化时剥离参考图 base64：几张参考图就能把 5MB 的 localStorage 配额打爆，
+    // 之前配额溢出是静默的，整个任务队列的持久化会就此失效
+    const serialize = () => imgStudioTaskList.map(task => {
+        const { controller, extraData, ...serializable } = task;
+        if (extraData) {
+            const { files, ...restExtra } = extraData;
+            serializable.extraData = restExtra;
+            if (files && files.length) {
+                serializable.extraData.fileNames = files.map(f => f.name);
+                serializable.filesStripped = true;
+            }
+        }
+        return serializable;
+    });
     try {
-        const tasksToSave = imgStudioTaskList.map(task => {
-            const { controller, ...serializable } = task;
-            return serializable;
-        });
-        localStorage.setItem('spark_image_tasks', JSON.stringify(tasksToSave));
+        localStorage.setItem('spark_image_tasks', JSON.stringify(serialize()));
     } catch (e) {
-        console.error("Failed to save tasks to localStorage:", e);
+        // 配额不足：丢弃已完成任务里内联的 data: 图片后再试一次
+        console.warn('任务列表保存失败（疑似超出 localStorage 配额），压缩后重试:', e);
+        try {
+            const slim = serialize().map(t =>
+                (t.image && typeof t.image === 'string' && t.image.startsWith('data:')) ? { ...t, image: null } : t
+            );
+            localStorage.setItem('spark_image_tasks', JSON.stringify(slim));
+        } catch (e2) {
+            console.error('任务队列持久化失败:', e2);
+            showToast('任务队列本地持久化失败（浏览器存储空间不足）', 'warning');
+        }
     }
 }
 
@@ -385,6 +389,10 @@ function imgStudioRenderTaskListUI() {
         const card = document.createElement('div');
         card.className = `task-card ${task.status}`;
 
+        // 提示词与错误信息可能包含引号/尖括号（LLM 或服务端原文），必须转义后再进 innerHTML
+        const safePrompt = escapeHtml(task.prompt);
+        const safeError = escapeHtml(task.error || '');
+
         let visualHTML = '';
         if (task.status === 'pending') {
             visualHTML = `<div class="task-visual"><div class="task-spinner-ring"></div></div>`;
@@ -402,7 +410,7 @@ function imgStudioRenderTaskListUI() {
         } else if (task.status === 'completed') {
             statusBadgeHTML = `<span class="task-status-badge completed">已完成</span>`;
         } else if (task.status === 'failed') {
-            statusBadgeHTML = `<span class="task-status-badge failed" title="${task.error || ''}">失败</span>`;
+            statusBadgeHTML = `<span class="task-status-badge failed" title="${safeError}">失败</span>`;
         } else if (task.status === 'cancelled') {
             statusBadgeHTML = `<span class="task-status-badge cancelled">已取消</span>`;
         }
@@ -421,20 +429,18 @@ function imgStudioRenderTaskListUI() {
             `;
         }
 
-        const truncatedPrompt = task.prompt.replace(/"/g, '&quot;');
-
         card.innerHTML = `
             ${visualHTML}
             <div class="task-info">
                 <div class="task-meta">
                     <span class="task-badge-type">${task.type === 't2i' ? '文生图' : '图生图'}</span>
-                    <span class="task-model" translate="no">${task.model.replace('-image', '')}</span>
-                    <span>${task.ratio}</span>
-                    <span>${task.quality}</span>
-                    <span style="margin-left: auto;">${task.timestamp}</span>
+                    <span class="task-model" translate="no">${escapeHtml(task.model.replace('-image', ''))}</span>
+                    <span>${escapeHtml(task.ratio)}</span>
+                    <span>${escapeHtml(task.quality)}</span>
+                    <span style="margin-left: auto;">${escapeHtml(task.timestamp)}</span>
                 </div>
-                <div class="task-prompt" title="${truncatedPrompt}">${task.prompt}</div>
-                ${task.status === 'failed' ? `<div class="task-error" title="${task.error || ''}">原因: ${task.error || '未知错误'}</div>` : ''}
+                <div class="task-prompt" title="${safePrompt}">${safePrompt}</div>
+                ${task.status === 'failed' ? `<div class="task-error" title="${safeError}">原因: ${safeError || '未知错误'}</div>` : ''}
             </div>
             <div class="task-control">
                 ${statusBadgeHTML}
@@ -475,6 +481,10 @@ function imgStudioAddTask(type, prompt, model, ratio, quality, extraData) {
 async function imgStudioPollTaskStatus(task) {
     if (!task.backendTaskId) return;
 
+    // 连续失败上限（约 60 秒）：服务挂掉后不再让任务永远转圈「渲染中」
+    let failStreak = 0;
+    const MAX_FAIL_STREAK = 40;
+
     const intervalId = setInterval(async () => {
         const currentTask = imgStudioTaskList.find(t => t.id === task.id);
         if (!currentTask || currentTask.status === 'cancelled' || currentTask.status === 'completed' || currentTask.status === 'failed') {
@@ -482,9 +492,22 @@ async function imgStudioPollTaskStatus(task) {
             return;
         }
 
+        const registerFailure = () => {
+            failStreak += 1;
+            if (failStreak >= MAX_FAIL_STREAK) {
+                clearInterval(intervalId);
+                currentTask.status = 'failed';
+                currentTask.error = '与本地服务失联，已停止轮询（服务恢复后可点重试）';
+                currentTask.controller = null;
+                imgStudioSaveTaskList();
+                imgStudioRenderTaskListUI();
+            }
+        };
+
         try {
             const response = await fetch(`/api/image/task/status?task_id=${task.backendTaskId}`);
-            if (!response.ok) return;
+            if (!response.ok) { registerFailure(); return; }
+            failStreak = 0;
 
             const data = await response.json();
             if (!data) return;
@@ -536,6 +559,7 @@ async function imgStudioPollTaskStatus(task) {
             }
         } catch (e) {
             console.error("Polling error:", e);
+            registerFailure();
         }
     }, 1500);
 }
@@ -633,6 +657,14 @@ function cancelImageStudioTask(taskId) {
             try { task.controller.abort(); } catch (e) { console.error(e); }
         }
         task.controller = null;
+        // 通知后端放弃该任务：之前只掐前端 fetch，后台 worker 会继续烧上游配额
+        if (task.backendTaskId) {
+            fetch('/api/image/task/cancel', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_id: task.backendTaskId })
+            }).catch(() => { /* 服务不可达时取消请求本身失败可忽略 */ });
+        }
         imgStudioSaveTaskList();
         imgStudioRenderTaskListUI();
         showToast('任务已取消', 'success');
@@ -655,16 +687,29 @@ function deleteImageStudioTask(taskId) {
 
 function retryImageStudioTask(taskId) {
     const task = imgStudioTaskList.find(t => t.id === taskId);
-    if (task && task.status !== 'pending') {
-        task.status = 'pending';
-        task.error = null;
-        task.image = null;
-        task.timestamp = new Date().toLocaleTimeString();
+    if (!task || task.status === 'pending') return;
+
+    // 页面刷新后参考图 base64 不再持久化（防爆 localStorage 配额）：
+    // 没有参考图的 i2i 重试会静默变成"无参考图生图"，必须拦下
+    const hasFiles = task.extraData && task.extraData.files && task.extraData.files.length > 0;
+    if (task.type === 'i2i' && !hasFiles) {
+        task.status = 'failed';
+        task.error = '参考图已失效（页面刷新后不保留），请重新上传后再生成';
         imgStudioSaveTaskList();
         imgStudioRenderTaskListUI();
-        imgStudioRunTaskFetch(task);
-        showToast('正在重试生图任务...', 'success');
+        showToast('参考图已失效，请重新上传后再生成', 'warning');
+        return;
     }
+
+    task.status = 'pending';
+    task.error = null;
+    task.image = null;
+    task.backendTaskId = null;
+    task.timestamp = new Date().toLocaleTimeString();
+    imgStudioSaveTaskList();
+    imgStudioRenderTaskListUI();
+    imgStudioRunTaskFetch(task);
+    showToast('正在重试生图任务...', 'success');
 }
 
 function clearCompletedImageStudioTasks() {
@@ -750,7 +795,8 @@ function imgStudioSetupSpotlightActions(imgDataUrl, prompt, model, ratio, qualit
     };
 
     document.getElementById('spotlight-download-btn').onclick = () => {
-        imgStudioDownloadImage(imgDataUrl, `spark_${Date.now()}.png`);
+        const ext = /\.webp(\?|$)/i.test(imgDataUrl) ? 'webp' : 'png';
+        imgStudioDownloadImage(imgDataUrl, `spark_${Date.now()}.${ext}`);
     };
 
     document.getElementById('spotlight-copy-btn').onclick = () => {
@@ -776,20 +822,44 @@ function imgStudioDownloadImage(dataUrl, filename) {
     showToast('图片下载已启动', 'success');
 }
 
+/** 任意图片 Blob → PNG Blob（Chromium 剪贴板只收 image/png，后端现在返回 WebP URL）。 */
+function imgStudioBlobToPngBlob(blob) {
+    return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload = () => {
+            try {
+                const canvas = document.createElement('canvas');
+                canvas.width = img.naturalWidth;
+                canvas.height = img.naturalHeight;
+                canvas.getContext('2d').drawImage(img, 0, 0);
+                canvas.toBlob(b => (b ? resolve(b) : reject(new Error('PNG 转码失败'))), 'image/png');
+            } catch (e) {
+                reject(e);
+            } finally {
+                URL.revokeObjectURL(url);
+            }
+        };
+        img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('图片加载失败')); };
+        img.src = url;
+    });
+}
+
 async function imgStudioCopyImageToClipboard(dataUrl) {
     try {
-        const response = await fetch(dataUrl);
-        const blob = await response.blob();
-        await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
-        showToast('图片二进制已成功复制到剪贴板', 'success');
+        // 把 Promise<Blob> 直接交给 ClipboardItem：保住用户手势上下文（Safari 要求），
+        // 同时统一转码成 PNG——直接写 image/webp 会被 Chromium 拒绝
+        const pngPromise = (async () => {
+            const response = await fetch(dataUrl);
+            let blob = await response.blob();
+            if (blob.type !== 'image/png') blob = await imgStudioBlobToPngBlob(blob);
+            return blob;
+        })();
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngPromise })]);
+        showToast('图片已复制到剪贴板', 'success');
     } catch (err) {
         console.error('Copy image failed', err);
-        try {
-            await navigator.clipboard.writeText(dataUrl);
-            showToast('直接复制二进制失败，已复制 Base64 文本数据', 'error');
-        } catch (e) {
-            showToast('复制图片失败，浏览器安全权限受限', 'error');
-        }
+        showToast('复制图片失败（浏览器权限受限或格式不支持），可改用下载按钮保存', 'error');
     }
 }
 
@@ -831,17 +901,21 @@ function imgStudioSaveHistoryToStorage() {
     } catch (e) {
         if (e.name === 'QuotaExceededError' || e.code === 22 || e.number === 0x8007000E) {
             console.warn("Storage quota exceeded, trying to prune older items...");
-            let prunedHistory = [...imgStudioHistory];
+            // Prune in a few large steps instead of one item at a time. The old loop popped a
+            // single item and re-JSON.stringify'd the ENTIRE multi-MB array on every iteration
+            // (~25x for 30 base64 images, each ~1-3MB) plus re-attempted a failing setItem each
+            // time — a multi-second main-thread FREEZE on the delete-history click and at each
+            // generation-complete. Trying a handful of "keep newest N" cut points bounds this to
+            // at most 4 stringifies of small slices.
             let success = false;
-
-            while (prunedHistory.length > 1) {
-                prunedHistory.pop();
+            for (const keep of [10, 5, 3, 1]) {
+                if (imgStudioHistory.length <= keep) continue;
                 try {
-                    localStorage.setItem('spark_image_history', JSON.stringify(prunedHistory));
+                    localStorage.setItem('spark_image_history', JSON.stringify(imgStudioHistory.slice(0, keep)));
                     success = true;
                     break;
                 } catch (innerErr) {
-                    // continue pruning
+                    // still too big — try keeping fewer
                 }
             }
 
@@ -991,7 +1065,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const clearAllTasksBtn = document.getElementById('clear-all-tasks-btn');
     if (clearAllTasksBtn) clearAllTasksBtn.addEventListener('click', clearAllImageStudioTasks);
 
-    document.getElementById('t2i-random-prompt-btn').addEventListener('click', imgStudioSetRandomPrompt);
+    document.getElementById('t2i-random-prompt-btn').addEventListener('click', () => imgStudioSetRandomPrompt());
     document.getElementById('imgstudio-generate-btn').addEventListener('click', imgStudioTriggerGeneration);
     document.getElementById('clear-history-btn').addEventListener('click', imgStudioClearHistory);
 
@@ -1007,5 +1081,5 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    imgStudioSetRandomPrompt();
+    imgStudioSetRandomPrompt({ silent: true, onlyIfEmpty: true });
 });

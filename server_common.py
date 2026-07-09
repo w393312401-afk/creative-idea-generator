@@ -154,10 +154,23 @@ sys.stderr = _Tee(sys.stderr, _rotating_log) if (sys.stderr or _rotating_log.fil
 SERVER_MANAGED = bool(SERVER_CONFIG.get('apiKey'))
 ALLOW_CLIENT_MODEL = SERVER_CONFIG.get('allowClientModel', True) is not False
 ACCESS_CODE = (SERVER_CONFIG.get('accessCode') or '').strip()
-RATE_MAX = int(os.environ.get('SPARK_RATE_MAX', SERVER_CONFIG.get('rateMax', 20) or 20))
-RATE_WINDOW = int(os.environ.get('SPARK_RATE_WINDOW', SERVER_CONFIG.get('rateWindow', 3600) or 3600))
 
-PORT = int(os.environ.get('PORT', '8085'))
+
+def _int_setting(env_key, cfg_key, default):
+    """数值配置的容错解析：非法值给出中文告警并回退默认，而不是 import 时崩掉整个服务。"""
+    raw = os.environ.get(env_key, SERVER_CONFIG.get(cfg_key, default))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        if sys.stdout:
+            print(f"[WARN] 配置项 {cfg_key}/{env_key} 的值 {raw!r} 不是有效整数，已回退默认值 {default}")
+        return default
+
+
+RATE_MAX = _int_setting('SPARK_RATE_MAX', 'rateMax', 20)
+RATE_WINDOW = _int_setting('SPARK_RATE_WINDOW', 'rateWindow', 3600)
+
+PORT = _int_setting('PORT', 'port', 8085)
 DB_FILE = 'library.json'
 OUTPUT_ROOT = 'outputs'
 IMG2IMG_CONTROL_PROMPT = (
@@ -185,6 +198,19 @@ SKILL_DIR = os.environ.get(
     os.path.join(os.path.expanduser('~'), '.codex', 'skills', 'restoration-prompt-composer')
 )
 
+# AdsPower 自动化脚本目录：可用 server_config.json 的 adspowerPath 覆盖。
+# 旧代码把这个绝对路径连同 3 行 sys.path 注入复制粘贴在 5 个调用点。
+_ADSPOWER_DEFAULT_PATH = 'C:\\Users\\video\\Desktop\\N8N-main\\Adspower\\AI\\core'
+
+
+def ensure_adspower_on_path():
+    """把 AdsPower 脚本目录加入 sys.path（幂等），返回实际使用的路径。"""
+    p = SERVER_CONFIG.get('adspowerPath') or _ADSPOWER_DEFAULT_PATH
+    if p not in sys.path:
+        sys.path.append(p)
+    return p
+
+
 def effective_config(client_config):
     client_config = client_config or {}
     if not SERVER_MANAGED:
@@ -197,7 +223,9 @@ def effective_config(client_config):
     }
     if SERVER_CONFIG.get('imageEditFallbackModel'):
         merged['imageEditFallbackModel'] = SERVER_CONFIG.get('imageEditFallbackModel')
-    for k in ('geminiDirectApiKey', 'geminiApiKey', 'geminiDirectImageModel'):
+    # cheapModel/auxModel 此前在托管模式下被静默丢弃（example 配置里承诺了
+    # cheapModel）——与已修复过的 imageEditFallbackModel 漏传属同一类 bug
+    for k in ('geminiDirectApiKey', 'geminiApiKey', 'geminiDirectImageModel', 'cheapModel', 'auxModel'):
         if SERVER_CONFIG.get(k):
             merged[k] = SERVER_CONFIG.get(k)
     if ALLOW_CLIENT_MODEL:
@@ -207,6 +235,9 @@ def effective_config(client_config):
             merged['imageModel'] = client_config['imageModel']
         if client_config.get('imageEditFallbackModel'):
             merged['imageEditFallbackModel'] = client_config['imageEditFallbackModel']
+        for k in ('cheapModel', 'auxModel'):
+            if client_config.get(k):
+                merged[k] = client_config[k]
     for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'googleFxIpRotateRequests'):
         if client_config.get(k):
             merged[k] = client_config[k]
@@ -298,9 +329,81 @@ PROCESS_BRIEF_CACHE_LOCK = threading.RLock()
 ACTIVE_TASKS = {}
 ACTIVE_TASKS_LOCK = threading.RLock()
 
+# library.json 读写共用一把锁：Windows 上 os.replace 会因并发打开的读句柄抛
+# PermissionError，读路径也必须串行化，否则存在整库清零风险
+LIBRARY_LOCK = threading.Lock()
+
 # Async image-station generation/edit tasks (polled via the /api/image-station endpoints)
 IMAGE_TASKS = {}
 IMAGE_TASKS_LOCK = threading.Lock()
+
+
+def write_json_atomic(path, data, indent=2):
+    """写 JSON 的原子替换版本：先写同目录 .tmp 再 os.replace。
+
+    进程中途崩溃/断电不会留下半截 JSON。Windows 上目标文件被并发打开时
+    os.replace 可能瞬时抛 PermissionError，重试一次后仍失败则记录告警并
+    抛出，由调用方决定是否容忍。
+    """
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=indent)
+    try:
+        os.replace(tmp_path, path)
+    except (OSError, PermissionError):
+        time.sleep(0.15)
+        try:
+            os.replace(tmp_path, path)
+        except (OSError, PermissionError) as e:
+            if sys.stdout:
+                print(f"[WARN] 原子写入 {path} 失败（文件可能被占用）: {e}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+
+
+# manifest.json 的每项目写锁：三个代码路径（同步器/帧生成/视频生成）此前
+# 各自整读整写同一份 manifest，无锁竞争会互相覆盖对方的字段
+_MANIFEST_LOCKS = {}
+_MANIFEST_LOCKS_GUARD = threading.Lock()
+
+
+def manifest_lock(project_dir):
+    key = os.path.normcase(os.path.abspath(project_dir))
+    with _MANIFEST_LOCKS_GUARD:
+        lock = _MANIFEST_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _MANIFEST_LOCKS[key] = lock
+        return lock
+
+
+def read_manifest(project_dir):
+    """读取项目 manifest.json；损坏/缺失时返回 None（调用方自行决定降级策略）。"""
+    manifest_path = os.path.join(project_dir, 'manifest.json')
+    with manifest_lock(project_dir):
+        if not os.path.exists(manifest_path):
+            return None
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            if sys.stdout:
+                print(f"[WARN] manifest.json 损坏或不可读 ({manifest_path}): {e}")
+            return None
+
+
+def write_manifest(project_dir, data):
+    manifest_path = os.path.join(project_dir, 'manifest.json')
+    with manifest_lock(project_dir):
+        try:
+            write_json_atomic(manifest_path, data)
+        except (OSError, PermissionError):
+            # 已在 write_json_atomic 里告警；manifest 写失败不应炸掉生成任务，
+            # 下一次写入（每帧后都会写）会自然补上
+            pass
 
 def save_tasks_to_disk():
     # Save individual tasks to tasks/ folder
@@ -318,16 +421,15 @@ def save_tasks_to_disk():
                 "last_active": t["last_active"]
             }
             try:
-                filepath = os.path.join("tasks", f"{tid}.json")
-                with open(filepath, "w", encoding="utf-8") as f:
-                    json.dump(task_data, f, ensure_ascii=False, indent=2)
+                # 原子替换：任务文件写一半崩溃会留下半截 JSON，重启加载时整个任务丢失
+                write_json_atomic(os.path.join("tasks", f"{tid}.json"), task_data)
             except Exception as e:
                 if sys.stdout:
                     print(f"Error saving task {tid} to disk: {e}")
-                    
-    # Delete task files on disk for tasks no longer present in memory
-    try:
-        if os.path.exists("tasks"):
+
+        # 清理必须留在同一把锁内：旧写法在锁外用过期快照删文件，
+        # 期间其他线程新建的任务文件会被当成孤儿误删
+        try:
             for filename in os.listdir("tasks"):
                 if filename.endswith(".json"):
                     tid = filename[:-5]
@@ -336,9 +438,9 @@ def save_tasks_to_disk():
                             os.remove(os.path.join("tasks", filename))
                         except OSError:
                             pass
-    except Exception as e:
-        if sys.stdout:
-            print(f"Error cleaning up task files: {e}")
+        except Exception as e:
+            if sys.stdout:
+                print(f"Error cleaning up task files: {e}")
 
 
 def load_tasks_from_disk():

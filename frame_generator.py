@@ -12,13 +12,18 @@ import urllib.parse
 import base64
 import threading
 import re
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:
+    print("[FATAL] 缺少 Pillow 依赖，请运行: pip install -r requirements.txt")
+    raise
 
 from server_common import (
     SERVER_CONFIG, SERVER_MANAGED, resolve_gateway, effective_config,
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
     IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT,
-    IMAGE_TASKS, IMAGE_TASKS_LOCK
+    IMAGE_TASKS, IMAGE_TASKS_LOCK, ensure_adspower_on_path,
+    read_manifest, write_manifest
 )
 
 
@@ -28,15 +33,22 @@ class QuotaExhaustedError(RuntimeError):
     pass
 
 
-def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, initial_delay=2.0):
+class ImageTaskCancelled(Exception):
+    """图像任务被用户取消（在重试间隙检测到）。"""
+
+
+def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, initial_delay=2.0, cancel_check=None):
     import random
     if opener is None:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    
+
     last_exception = None
     delay = initial_delay
-    
+
     for attempt in range(max_attempts):
+        # 每次（重）试前检查取消：已取消的任务不再烧上游配额
+        if cancel_check and cancel_check():
+            raise ImageTaskCancelled("任务已被用户取消")
         try:
             url_str = req.full_url if hasattr(req, 'full_url') else str(req)
             if sys.stdout:
@@ -865,9 +877,7 @@ _FX_UUID_RE = re.compile(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 
 
 def _get_google_fx_image_service():
-    adspower_path = SERVER_CONFIG.get('adspowerPath') or 'C:\\Users\\video\\Desktop\\N8N-main\\Adspower\\AI\\core'
-    if adspower_path not in sys.path:
-        sys.path.append(adspower_path)
+    ensure_adspower_on_path()
     import services.google_fx as google_fx
     import models
     return google_fx, models
@@ -1049,7 +1059,9 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             pass
 
     manifest_frames_by_seq = {f['sequence']: f for f in manifest['frames']}
-    prompts_by_seq = {seq: item for seq, item in enumerate(prompts, start=1)}
+    # 按提示词块里的真实槽位号建索引（与 API 路径同一修复）：
+    # 枚举位置在子集渲染时与槽位号错位，目标帧会静默漏渲
+    prompts_by_seq = {int(item['index']): item for item in prompts}
     all_seqs = sorted(prompts_by_seq.keys())
 
     def _webp_path(seq):
@@ -1075,8 +1087,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
     def _save_manifest():
         manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
-        with open(manifest_path, 'w', encoding='utf-8') as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        write_manifest(project_dir, manifest)
 
     generated_count = 0
 
@@ -1126,6 +1137,10 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                     _fx_store_frame(retry_paths[0], frames_dir, seq)
                 finally:
                     shutil.rmtree(retry_tmp, ignore_errors=True)
+                # 与初次渲染路径保持同序：先做 LAB 颜色匹配再重新质检，
+                # 否则重试帧带着色偏被判卷，行为与首轮不一致（三处复制中的漂移点）
+                if _frame_exists(1) and os.path.exists(target_path):
+                    _match_color_lab(target_path, _webp_path(1), target_path)
                 vlm_pass, vlm_reason = run_frame_qa_check(config, _webp_path(1), prev_path, target_path, video_prompt, seq, is_bridge=is_bridge)
                 if vlm_pass:
                     if sys.stdout:
@@ -1385,7 +1400,12 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
     generated_count = 0
     lineage_degraded = False
 
-    for seq, item in enumerate(prompts, start=1):
+    for item in prompts:
+        # 用提示词块里的真实槽位号，绝不能用枚举位置：单帧/子集渲染时
+        # prompt_block 可能只含目标槽位，枚举位置永远从 1 开始，
+        # 会导致 `seq in target_sequences` 永假 → 一帧不渲染，
+        # 下游锚点门禁又因 fail-open 而自动放行——静默漏帧
+        seq = int(item['index'])
         _check_cancel()
         filename = f'img_{seq:03d}.webp'
         target_path = os.path.join(frames_dir, filename)
@@ -1552,6 +1572,29 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                                 else:
                                     if sys.stdout:
                                         print(f"[VLM QA] Beat {seq-1} failed VLM check on retry {retry_attempt+1}: {vlm_reason}")
+                            except QuotaExhaustedError:
+                                # 配额耗尽不能被下面的通用 except 吞成一条日志：
+                                # 有兜底模型就切换重试本帧（与首次渲染路径一致），否则上抛
+                                fallback_model = config.get('imageEditFallbackModel') or config.get('fallbackImageModel')
+                                if not fallback_model:
+                                    raise
+                                if sys.stdout:
+                                    print(f"[VLM QA] Retry {retry_attempt+1} 配额耗尽，切换兜底模型 {fallback_model} 重试本帧")
+                                try:
+                                    fallback_config = dict(config)
+                                    fallback_config['imageModel'] = fallback_model
+                                    is_fallback = _generate_image_edit(fallback_config, corrected_prompt, previous_path, target_path, control_prompt=ctrl_prompt)
+                                    lineage_degraded = True
+                                    first_frame_path = os.path.join(frames_dir, 'img_001.webp')
+                                    if os.path.exists(first_frame_path) and os.path.exists(target_path):
+                                        _match_color_lab(target_path, first_frame_path, target_path)
+                                    vlm_pass, vlm_reason = run_frame_qa_check(config, first_frame_path, previous_path, target_path, video_prompt, seq, is_bridge=is_bridge)
+                                    if vlm_pass:
+                                        item['prompt'] = corrected_prompt
+                                        break
+                                except Exception as fb_err:
+                                    if sys.stdout:
+                                        print(f"[VLM QA] 兜底模型重试也失败: {fb_err}")
                             except Exception as retry_err:
                                 if sys.stdout:
                                     print(f"[VLM QA] Retry {retry_attempt+1} hit exception: {retry_err}")
@@ -1608,6 +1651,12 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         previous_path = target_path
         generated_count += 1
 
+        # 逐帧落盘（与 FX 路径一致）：旧行为只在整轮结束时写一次 manifest，
+        # 中途崩溃会丢掉所有逐帧质检门禁记录，劣化帧拦截随之失效
+        manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
+        update_manifest_stale_status(manifest, project_dir)
+        write_manifest(project_dir, manifest)
+
         if on_progress:
             on_progress('frame', {'frame': frame_info, 'current': generated_count, 'total': total_to_generate})
 
@@ -1615,17 +1664,33 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
     update_manifest_stale_status(manifest, project_dir)
 
     manifest_path = os.path.join(project_dir, 'manifest.json')
-    with open(manifest_path, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    write_manifest(project_dir, manifest)
     manifest['manifest'] = '/' + os.path.relpath(manifest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
     manifest['project_dir'] = os.path.abspath(project_dir)
     return manifest
+
+
+def _image_task_cancelled(task_id):
+    with IMAGE_TASKS_LOCK:
+        t = IMAGE_TASKS.get(task_id)
+        return bool(t and t.get('status') == 'cancelled')
+
+
+def _finish_image_task(task_id, entry):
+    """写终态，但绝不覆盖用户已取消的状态。"""
+    with IMAGE_TASKS_LOCK:
+        current = IMAGE_TASKS.get(task_id)
+        if current and current.get('status') == 'cancelled':
+            return
+        IMAGE_TASKS[task_id] = entry
 
 
 def _run_async_image_generation(task_id, base_url, api_key, payload):
     try:
         import urllib.request
         import json
+        if _image_task_cancelled(task_id):
+            return
         data = json.dumps(payload).encode('utf-8')
         req = urllib.request.Request(
             f'{base_url}/images/generations',
@@ -1637,29 +1702,30 @@ def _run_async_image_generation(task_id, base_url, api_key, payload):
             method='POST',
         )
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        resp_bytes = _execute_request_with_retry(req, opener=opener, timeout=180)
+        resp_bytes = _execute_request_with_retry(
+            req, opener=opener, timeout=180,
+            cancel_check=lambda: _image_task_cancelled(task_id))
         resp_data = json.loads(resp_bytes.decode('utf-8'))
         resp_data = _save_image_station_result(resp_data)
-        with IMAGE_TASKS_LOCK:
-            IMAGE_TASKS[task_id] = {'status': 'completed', 'result': resp_data, 'error': None}
+        _finish_image_task(task_id, {'status': 'completed', 'result': resp_data, 'error': None})
+    except ImageTaskCancelled:
+        pass
     except urllib.error.HTTPError as e:
         detail = ''
         try:
             detail = e.read().decode('utf-8')[:500]
         except Exception: pass
-        error_msg = f'Image API HTTP {e.code}: {detail}'
-        with IMAGE_TASKS_LOCK:
-            IMAGE_TASKS[task_id] = {'status': 'failed', 'result': None, 'error': error_msg}
+        _finish_image_task(task_id, {'status': 'failed', 'result': None, 'error': f'Image API HTTP {e.code}: {detail}'})
     except Exception as e:
-        error_msg = str(e)
-        with IMAGE_TASKS_LOCK:
-            IMAGE_TASKS[task_id] = {'status': 'failed', 'result': None, 'error': error_msg}
+        _finish_image_task(task_id, {'status': 'failed', 'result': None, 'error': str(e)})
 
 
 def _run_async_image_edit(task_id, base_url, api_key, body_data, boundary):
     try:
         import urllib.request
         import json
+        if _image_task_cancelled(task_id):
+            return
         req = urllib.request.Request(
             f'{base_url}/images/edits',
             data=body_data,
@@ -1670,22 +1736,21 @@ def _run_async_image_edit(task_id, base_url, api_key, body_data, boundary):
             method='POST',
         )
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        resp_bytes = _execute_request_with_retry(req, opener=opener, timeout=180)
+        resp_bytes = _execute_request_with_retry(
+            req, opener=opener, timeout=180,
+            cancel_check=lambda: _image_task_cancelled(task_id))
         resp_data = json.loads(resp_bytes.decode('utf-8'))
         resp_data = _save_image_station_result(resp_data)
-        with IMAGE_TASKS_LOCK:
-            IMAGE_TASKS[task_id] = {'status': 'completed', 'result': resp_data, 'error': None}
+        _finish_image_task(task_id, {'status': 'completed', 'result': resp_data, 'error': None})
+    except ImageTaskCancelled:
+        pass
     except urllib.error.HTTPError as e:
         detail = ''
         try:
             detail = e.read().decode('utf-8')[:500]
         except Exception: pass
-        error_msg = f'Image API HTTP {e.code}: {detail}'
-        with IMAGE_TASKS_LOCK:
-            IMAGE_TASKS[task_id] = {'status': 'failed', 'result': None, 'error': error_msg}
+        _finish_image_task(task_id, {'status': 'failed', 'result': None, 'error': f'Image API HTTP {e.code}: {detail}'})
     except Exception as e:
-        error_msg = str(e)
-        with IMAGE_TASKS_LOCK:
-            IMAGE_TASKS[task_id] = {'status': 'failed', 'result': None, 'error': error_msg}
+        _finish_image_task(task_id, {'status': 'failed', 'result': None, 'error': str(e)})
 
 

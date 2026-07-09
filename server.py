@@ -49,14 +49,20 @@ def background_worker(task_id, config, dimensions):
     def on_progress(stage, details):
         if t["cancel_event"].is_set():
             raise ConnectionError("Generation cancelled by user")
-            
+
         with ACTIVE_TASKS_LOCK:
             if stage == 'text_chunk':
                 t["events"].append(('text_chunk', details))
             else:
                 t["events"].append(('progress', {'stage': stage, 'details': details}))
-                
-        notify_listeners(task_id, 'text_chunk' if stage == 'text_chunk' else 'progress', details)
+
+        # 实时推送必须和历史重放（上面 events 里存的）同形：旧写法实时只发
+        # 裸 details（没有 stage 字段），前端 updateProgressUI 靠 stage 分派，
+        # 导致实时阶段文本/步骤条从不更新、只有断线重连重放时才对
+        if stage == 'text_chunk':
+            notify_listeners(task_id, 'text_chunk', details)
+        else:
+            notify_listeners(task_id, 'progress', {'stage': stage, 'details': details})
 
     try:
         from prompt_pipeline import start_accounting, stop_and_get_accounting
@@ -136,7 +142,10 @@ def auto_run_worker(task_id, config, dimensions):
             notify_listeners(task_id, stage, details)
 
         from pipeline_orchestrator import run_autonomous_pipeline
-        result = run_autonomous_pipeline(config, dimensions, on_progress=progress_cb)
+        # 自治管线的渲染/视频阶段驱动共享 FX 浏览器：全程持有 FX 串行锁
+        # （_FX_SERIAL_LOCK 定义在本模块靠后位置，调用时才解析，安全）
+        with _FX_SERIAL_LOCK:
+            result = run_autonomous_pipeline(config, dimensions, on_progress=progress_cb)
 
         usage = stop_and_get_accounting()
         if usage:
@@ -192,7 +201,17 @@ def access_ok(handler):
     if auth.startswith('Bearer '):
         if auth[7:].strip() == ACCESS_CODE:
             return True
-            
+
+    # EventSource 无法携带自定义请求头：只读流式端点（日志流）允许用
+    # query 参数携带访问码
+    try:
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(handler.path).query)
+        if (q.get('access_code', [''])[0] or '').strip() == ACCESS_CODE:
+            return True
+    except Exception:
+        pass
+
     return False
 
 
@@ -224,12 +243,16 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
             with ACTIVE_TASKS_LOCK:
                 t["events"].append((stage, details))
             notify_listeners(task_id, stage, details)
-            
-        result = generate_frame_sequence(
-            config, title, prompt_block,
-            on_progress=progress_cb,
-            target_sequences=target_sequences
-        )
+
+        # google_fx 后端共享同一个 AdsPower 浏览器和 builtins.google_fx_cancelled
+        # 全局旗标：必须与视频生成互斥，否则新任务开跑时重置旗标/抢浏览器，
+        # 会把另一个在跑的 FX 任务搅乱（跨任务串片事故的同族问题）
+        with _fx_serial_lock_for(config):
+            result = generate_frame_sequence(
+                config, title, prompt_block,
+                on_progress=progress_cb,
+                target_sequences=target_sequences
+            )
         usage = stop_and_get_accounting()
         if usage:
             result['token_usage'] = usage
@@ -246,9 +269,7 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
             t["events"].append(('error', {'message': '用户取消了帧序列生成'}))
         notify_listeners(task_id, 'error', {'message': '用户取消了帧序列生成'})
         try:
-            adspower_path = SERVER_CONFIG.get('adspowerPath') or 'C:\\Users\\video\\Desktop\\N8N-main\\Adspower\\AI\\core'
-            if adspower_path not in sys.path:
-                sys.path.append(adspower_path)
+            ensure_adspower_on_path()
             from utils.browser import stop_ads_browser
             user_id = config.get('userId')
             port = config.get('port')
@@ -288,7 +309,9 @@ def render_staged_worker(task_id, config, title, prompt_block):
             notify_listeners(task_id, stage, details)
 
         from pipeline_orchestrator import run_staged_frame_rendering
-        result = run_staged_frame_rendering(config, title, prompt_block, on_progress=progress_cb)
+        # 分步渲染尾段总会驱动 FX 视频生成：全程持有 FX 串行锁
+        with _FX_SERIAL_LOCK:
+            result = run_staged_frame_rendering(config, title, prompt_block, on_progress=progress_cb)
 
         usage = stop_and_get_accounting()
         if usage:
@@ -318,7 +341,18 @@ def render_staged_worker(task_id, config, title, prompt_block):
         save_tasks_to_disk()
 
 
-_VIDEO_GEN_SERIAL_LOCK = threading.Lock()
+# FX 浏览器串行锁：所有驱动 AdsPower/google_fx 浏览器的任务（帧序列 FX 路径、
+# 视频生成、分步渲染、自治管线）共用一把，代替旧的仅视频任务持有的
+# _VIDEO_GEN_SERIAL_LOCK。共享的还有 builtins.google_fx_cancelled 旗标——
+# 只有互斥后，任务开始时的旗标重置才是安全的。
+_FX_SERIAL_LOCK = threading.Lock()
+
+
+def _fx_serial_lock_for(config):
+    """帧序列任务仅在走 google_fx 后端时才需要 FX 串行锁；纯 API 渲染不串行。"""
+    import contextlib
+    uses_fx = isinstance(config, dict) and config.get('imageBackend') == 'google_fx'
+    return _FX_SERIAL_LOCK if uses_fx else contextlib.nullcontext()
 
 
 def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
@@ -335,7 +369,7 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
 
         progress_cb('queue', {'message': '视频生成请求已加入队列，正在等待排队生成...'})
 
-        with _VIDEO_GEN_SERIAL_LOCK:
+        with _FX_SERIAL_LOCK:
             result = generate_video_sequence(
                 config, title, prompt_block,
                 on_progress=progress_cb,
@@ -371,17 +405,15 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
                     merged_info = merge_project_videos(project_dir)
                     if merged_info:
                         result['merged_video'] = merged_info
-                        # Also update manifest file on disk
-                        manifest_path = os.path.join(project_dir, 'manifest.json')
-                        if os.path.exists(manifest_path):
-                            try:
-                                with open(manifest_path, 'r', encoding='utf-8') as f:
-                                    mdata = json.load(f)
-                                mdata['merged_video'] = merged_info
-                                with open(manifest_path, 'w', encoding='utf-8') as f:
-                                    json.dump(mdata, f, ensure_ascii=False, indent=2)
-                            except Exception as e:
-                                print(f"Warning: could not update manifest.json with merged_video ({e})")
+                        # Also update manifest file on disk (locked read-modify-write)
+                        try:
+                            with manifest_lock(project_dir):
+                                mdata = read_manifest(project_dir)
+                                if mdata is not None:
+                                    mdata['merged_video'] = merged_info
+                                    write_manifest(project_dir, mdata)
+                        except Exception as e:
+                            print(f"Warning: could not update manifest.json with merged_video ({e})")
                     progress_cb('merge_done', {'merged_video': merged_info})
                 except Exception as merge_err:
                     print(f"Error during auto-merge: {merge_err}")
@@ -399,9 +431,7 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
             t["events"].append(('error', {'message': '用户取消了视频生成'}))
         notify_listeners(task_id, 'error', {'message': '用户取消了视频生成'})
         try:
-            adspower_path = SERVER_CONFIG.get('adspowerPath') or 'C:\\Users\\video\\Desktop\\N8N-main\\Adspower\\AI\\core'
-            if adspower_path not in sys.path:
-                sys.path.append(adspower_path)
+            ensure_adspower_on_path()
             from utils.browser import stop_ads_browser
             user_id = config.get('userId')
             port = config.get('port')
@@ -547,11 +577,28 @@ class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
     # ThreadingMixIn so a long-running /api/compose call (the skill can take 60-180s)
     # does not block static file serving or library reads in the same browser session.
     address_family = socket.AF_INET6
-    allow_reuse_address = True
+    # Windows 上 SO_REUSEADDR 允许第二个实例静默绑定同一端口——这正是文档记录过的
+    # “重复实例越积越多”的根源；显式 False + SO_EXCLUSIVEADDRUSE 让第二次启动立刻报错。
+    allow_reuse_address = (sys.platform != 'win32')
     daemon_threads = True
 
     def server_bind(self):
-        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        if self.address_family == socket.AF_INET6:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        if sys.platform == 'win32' and hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+class IPv4HTTPServer(ThreadingMixIn, HTTPServer):
+    """IPv4 回退：本机禁用 IPv6 时 DualStackHTTPServer 无法启动。"""
+    address_family = socket.AF_INET
+    allow_reuse_address = (sys.platform != 'win32')
+    daemon_threads = True
+
+    def server_bind(self):
+        if sys.platform == 'win32' and hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
 
 
@@ -645,6 +692,16 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(obj, ensure_ascii=False).encode('utf-8'))
 
+    def _gate(self, with_rate=False):
+        """访问码（及可选频控）门禁。未设置访问码时恒放行。返回 False 时已回写响应。"""
+        if not access_ok(self):
+            self._send_json({'status': 'error', 'message': '访问码无效或缺失'}, status=401)
+            return False
+        if with_rate and not rate_ok(_client_ip(self)):
+            self._send_json({'status': 'error', 'message': '请求过于频繁，请稍后再试'}, status=429)
+            return False
+        return True
+
     def _read_json_body(self):
         content_length = int(self.headers.get('Content-Length', 0))
         raw = self.rfile.read(content_length) if content_length else b'{}'
@@ -704,6 +761,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     try:
                         _raw_write(": keepalive\n\n")
                     except Exception:
+                        # 客户端已断开：必须 set stop_evt 释放阻塞在
+                        # stop_evt.wait() 的处理线程，否则它会一直滞留
+                        stop_evt.set()
                         break
 
         threading.Thread(target=_heartbeat, daemon=True).start()
@@ -720,16 +780,26 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         query = parse_qs(parsed.query)
 
         if path == '/api/library':
-            data = []
-            if os.path.exists(DB_FILE):
+            if not self._gate():
+                return
+            # 读失败必须报 500 而不是静默返回 []：前端拿到空列表后一次保存
+            # 就会把整个创意库覆盖成空——这是真实存在过的整库清零路径
+            with LIBRARY_LOCK:
+                if not os.path.exists(DB_FILE):
+                    self._send_json([])
+                    return
                 try:
                     with open(DB_FILE, 'r', encoding='utf-8') as f:
                         data = json.load(f)
                 except Exception as e:
                     if sys.stdout:
                         print(f"Error reading {DB_FILE}: {e}")
+                    self._send_json({'error': f'创意库文件读取失败: {e}'}, status=500)
+                    return
             self._send_json(data)
         elif path == '/api/get_manifest':
+            if not self._gate():
+                return
             title = query.get('title', [''])[0]
             if not title:
                 self._send_json({'error': 'Missing title'}, status=400)
@@ -751,6 +821,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             else:
                 self._send_json({'error': 'Not found'}, status=404)
         elif path == '/api/logs/stream':
+            # 服务日志包含内部路径/任务详情，必须过门禁（EventSource 用 ?access_code= 传码）
+            if not self._gate():
+                return
             send_event = None
             stop_evt = None
             try:
@@ -799,6 +872,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 if stop_evt:
                     stop_evt.set()
         elif path == '/api/tasks':
+            if not self._gate():
+                return
             cleanup_old_tasks()
             limit = 100
             if 'limit' in query:
@@ -809,15 +884,38 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             with ACTIVE_TASKS_LOCK:
                 res = []
                 for tid, t in ACTIVE_TASKS.items():
-                    res.append({
+                    # 列表接口只回瘦身摘要：完整 result（提示词全文/封面/帧清单）
+                    # 会被 2.5s 一次的角标轮询反复整包下载
+                    full_result = t.get("result")
+                    result_summary = None
+                    if isinstance(full_result, dict):
+                        result_summary = {}
+                        if full_result.get("timings"):
+                            result_summary["timings"] = full_result["timings"]
+                        if full_result.get("token_usage"):
+                            result_summary["token_usage"] = full_result["token_usage"]
+                    # 运行中任务附带精简事件流（去掉 text_chunk 大块文本），
+                    # 任务抽屉靠它渲染阶段与进度——之前根本没回传，进度永远 0%
+                    events_summary = None
+                    if t["status"] == "running":
+                        non_chunks = [evt for evt in t["events"] if evt[0] != 'text_chunk']
+                        events_summary = non_chunks[-50:]
+                        if len(non_chunks) != len(t["events"]):
+                            events_summary = events_summary + [('text_chunk', '')]
+                    entry = {
                         "id": t["id"],
                         "status": t["status"],
                         "dimensions": t["dimensions"],
-                        "result": t["result"],
+                        "result": result_summary,
                         "error": t["error"],
                         "last_active": t["last_active"]
-                    })
-            res.sort(key=lambda x: x["id"], reverse=True)
+                    }
+                    if events_summary is not None:
+                        entry["events"] = events_summary
+                    res.append(entry)
+            # 按活跃时间排序：任务 ID 是「毫秒时间戳」和「frames_<uuid>」混排，
+            # 旧的字符串排序会把两类 ID 搅在一起
+            res.sort(key=lambda x: x.get("last_active") or 0, reverse=True)
             total_count = len(res)
             if limit and limit > 0:
                 sliced = res[:limit]
@@ -828,6 +926,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 "total_count": total_count
             })
         elif path == '/api/compose-stream':
+            if not self._gate():
+                return
             task_id = query.get('task_id', [None])[0]
             if not task_id:
                 self.send_error(400, "Missing task_id")
@@ -839,35 +939,44 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 return
                 
             send_event, stop_evt = self._open_sse_stream()
-            
-            # Replay history
-            with ACTIVE_TASKS_LOCK:
-                history = list(task["events"])
-                
-            for event_type, event_data in history:
-                try:
-                    send_event(event_type, event_data)
-                except Exception:
-                    stop_evt.set()
-                    return
-            
-            # If the task is already finished, stop immediately
-            if task["status"] in ("completed", "failed", "cancelled"):
+
+            # 追赶式重放 + 原子注册：事件追加和监听器注册都在 ACTIVE_TASKS_LOCK
+            # 下进行，所以「锁内确认无未发事件后立即注册」能确保零丢失。
+            # 旧写法在快照历史和注册监听器之间有窗口——任务恰好在这期间完成
+            # 的话，终态事件永远送不到，前端只能对着心跳干等。
+            sent = 0
+            is_terminal = False
+            while True:
+                with ACTIVE_TASKS_LOCK:
+                    pending = list(task["events"][sent:])
+                    if not pending:
+                        is_terminal = task["status"] in ("completed", "failed", "cancelled")
+                        if not is_terminal:
+                            task["listeners"].add((send_event, stop_evt))
+                        break
+                for event_type, event_data in pending:
+                    try:
+                        send_event(event_type, event_data)
+                    except Exception:
+                        stop_evt.set()
+                        return
+                    sent += 1
+
+            # Task already finished — history fully replayed, close the stream
+            if is_terminal:
                 stop_evt.set()
                 return
-                
-            # Add to listeners
-            with ACTIVE_TASKS_LOCK:
-                task["listeners"].add((send_event, stop_evt))
-                
+
             # Block until stream is stopped
             stop_evt.wait()
-            
+
             # Clean up listener
             with ACTIVE_TASKS_LOCK:
                 task["listeners"].discard((send_event, stop_evt))
                 
         elif path == '/api/compose-status':
+            if not self._gate():
+                return
             task_id = query.get('task_id', [None])[0]
             if not task_id:
                 self.send_error(400, "Missing task_id")
@@ -895,6 +1004,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 'needs_access_code': bool(ACCESS_CODE),
             })
         elif path == '/api/image/task/status':
+            if not self._gate():
+                return
             task_id = query.get('task_id', [None])[0]
             if not task_id:
                 self._send_json({'error': 'Missing task_id'}, status=400)
@@ -906,6 +1017,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             else:
                 self._send_json(task)
         elif path == '/api/cache-info':
+            if not self._gate():
+                return
             try:
                 packet_cache_size = 0
                 cache_keys_count = 0
@@ -952,7 +1065,43 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'error': str(e)}, status=500)
         else:
+            if not self._static_path_allowed(path):
+                self.send_error(404, "Not found")
+                return
             super().do_GET()
+
+    # ── 静态兜底路由封锁 ─────────────────────────────────────────────
+    # 服务绑定在所有网卡且 CORS 为 *：兜底静态路由绝不允许吐出密钥配置、
+    # 日志、任务数据或服务端源码。登录页所需的 html/css/js 保持公开。
+    _BLOCKED_BASENAMES = (
+        'server_config', 'server.log', 'server.pid', 'library.json',
+        'packet_cache.json', 'process_brief_cache.json', 'tasks.json',
+        'requirements.txt',
+    )
+    _BLOCKED_PREFIXES = (
+        '/tasks/', '/.git', '/.claude/', '/.gemini/', '/scratch/',
+        '/tests/', '/.pytest_cache/', '/.agents/',
+    )
+    _BLOCKED_SUFFIXES = ('.py', '.pyc', '.bat', '.pid', '.log')
+
+    def _static_path_allowed(self, path):
+        low = path.split('?', 1)[0].lower()
+        if any(low.endswith(sfx) for sfx in self._BLOCKED_SUFFIXES):
+            return False
+        if any(low.startswith(pfx) for pfx in self._BLOCKED_PREFIXES):
+            return False
+        base = low.rsplit('/', 1)[-1]
+        if any(base.startswith(b) for b in self._BLOCKED_BASENAMES):
+            return False
+        return True
+
+    def do_HEAD(self):
+        # 图像工坊用 HEAD 探测 /outputs 资源存活；封锁规则必须与 GET 一致
+        from urllib.parse import urlparse
+        if not self._static_path_allowed(urlparse(self.path).path):
+            self.send_error(404, "Not found")
+            return
+        super().do_HEAD()
 
     def do_POST(self):
         from urllib.parse import urlparse, parse_qs
@@ -960,10 +1109,13 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         path = parsed.path
 
         if path == '/api/library':
+            if not self._gate():
+                return
             try:
                 data = self._read_json_body()
-                with open(DB_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+                # 加锁 + 原子替换：直接 open('w') 在写一半崩溃时会留下半截 JSON
+                with LIBRARY_LOCK:
+                    write_json_atomic(DB_FILE, data)
                 self._send_json({'status': 'success'})
             except Exception as e:
                 if sys.stdout:
@@ -979,6 +1131,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({'online': False, 'message': str(e)})
 
         elif path == '/api/vlm_qa':
+            if not self._gate(with_rate=True):
+                return
             try:
                 body = self._read_json_body()
                 config_req = effective_config(body.get('config', {}))
@@ -1020,6 +1174,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/generate_image_with_vlm':
+            if not self._gate(with_rate=True):
+                return
             try:
                 import requests
                 body = self._read_json_body()
@@ -1171,6 +1327,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/clear-cache':
+            if not self._gate():
+                return
             try:
                 with PACKET_CACHE_LOCK:
                     with open(CACHE_PATH, 'w', encoding='utf-8') as f:
@@ -1258,34 +1416,44 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/compose-cancel':
+            if not self._gate():
+                return
             try:
                 body = self._read_json_body()
                 task_id = body.get('task_id')
                 if task_id and task_id in ACTIVE_TASKS:
                     ACTIVE_TASKS[task_id]["cancel_event"].set()
-                    
-                    # Cancel any active Google FX Playwright UI generation
-                    import builtins
-                    builtins.google_fx_cancelled = True
-                    
-                    # Stop AdsPower browser to ensure it's freed and stopped
-                    try:
-                        adspower_path = SERVER_CONFIG.get('adspowerPath') or 'C:\\Users\\video\\Desktop\\N8N-main\\Adspower\\AI\\core'
-                        if adspower_path not in sys.path:
-                            sys.path.append(adspower_path)
-                        from utils.browser import stop_ads_browser
-                        dimensions = ACTIVE_TASKS[task_id].get("dimensions") or {}
-                        user_id = dimensions.get("userId")
-                        port = dimensions.get("port")
-                        stop_ads_browser(user_id=user_id, port=port)
-                    except Exception as browser_err:
-                        if sys.stdout:
-                            print(f"[CANCEL] Failed to stop AdsPower browser: {browser_err}")
+
+                    # 只有可能驱动 FX 浏览器的任务才触发全局 FX 取消与浏览器停止：
+                    # 旧写法无条件设 builtins.google_fx_cancelled，取消一个纯 LLM
+                    # 合成任务会把另一个在跑的帧/视频 FX 任务一并打断
+                    dimensions = ACTIVE_TASKS[task_id].get("dimensions") or {}
+                    id_prefix = str(task_id).split('_', 1)[0]
+                    is_fx_capable = (
+                        id_prefix in ('frames', 'videos', 'staged', 'auto')
+                        or dimensions.get('type') in ('frames', 'videos', 'staged', 'auto_run')
+                    )
+                    if is_fx_capable:
+                        import builtins
+                        builtins.google_fx_cancelled = True
+
+                        # Stop AdsPower browser to ensure it's freed and stopped
+                        try:
+                            ensure_adspower_on_path()
+                            from utils.browser import stop_ads_browser
+                            user_id = dimensions.get("userId")
+                            port = dimensions.get("port")
+                            stop_ads_browser(user_id=user_id, port=port)
+                        except Exception as browser_err:
+                            if sys.stdout:
+                                print(f"[CANCEL] Failed to stop AdsPower browser: {browser_err}")
                 self._send_json({'status': 'ok'})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/tasks/delete':
+            if not self._gate():
+                return
             try:
                 body = self._read_json_body()
                 task_id = body.get('task_id')
@@ -1300,7 +1468,26 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/image/task/cancel':
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                task_id = body.get('task_id')
+                if not task_id:
+                    self._send_json({'status': 'error', 'message': 'Missing task_id'}, status=400)
+                    return
+                with IMAGE_TASKS_LOCK:
+                    t = IMAGE_TASKS.get(task_id)
+                    if t and t.get('status') == 'pending':
+                        IMAGE_TASKS[task_id] = {'status': 'cancelled', 'result': None, 'error': '用户取消了任务'}
+                self._send_json({'status': 'ok'})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/tasks/clear':
+            if not self._gate():
+                return
             try:
                 body = self._read_json_body()
                 status_group = body.get('status_group')
@@ -1472,16 +1659,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'error': '合并失败：未找到任何成功的视频片段'}, status=400)
                     return
                 
-                # Update manifest.json on disk
-                manifest_path = os.path.join(project_dir, 'manifest.json')
-                mdata = {}
-                if os.path.exists(manifest_path):
-                    with open(manifest_path, 'r', encoding='utf-8') as f:
-                        mdata = json.load(f)
-                mdata['merged_video'] = merged_info
-                with open(manifest_path, 'w', encoding='utf-8') as f:
-                    json.dump(mdata, f, ensure_ascii=False, indent=2)
-                
+                # Update manifest.json on disk (locked read-modify-write)
+                with manifest_lock(project_dir):
+                    mdata = read_manifest(project_dir) or {}
+                    mdata['merged_video'] = merged_info
+                    write_manifest(project_dir, mdata)
+
                 self._send_json({'status': 'ok', 'merged_video': merged_info})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
@@ -1600,6 +1783,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
                 import tempfile
                 import shutil
+
+                # 缺少文件段必须给出明确的 400：旧逻辑会在 splitext(None) 上抛
+                # TypeError，用户只看到一个不透明的 500
+                if not file_data or not filename:
+                    self._send_json({'error': '缺少视频文件（file 字段），请重新选择视频后再上传'}, status=400)
+                    return
 
                 # Verify file extension
                 suffix = os.path.splitext(filename)[1].lower()
@@ -2186,8 +2375,7 @@ def sync_project_manifest_with_disk(project_dir):
             modified = True
 
     if modified:
-        with open(manifest_path, 'w', encoding='utf-8') as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        write_manifest(project_dir, manifest)
         print(f"[SYNC] Saved synchronized manifest for {project_dir}")
 
 
@@ -2211,9 +2399,9 @@ def run_migrations():
 
 def run():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    # Record our PID so run.bat/stop.bat and restart tooling kill the right process.
-    # This write was lost in the module split; the stale pid file then caused restarts
-    # to no-op and pile up duplicate server instances fighting over port 8085.
+    # Record our PID as a diagnostic breadcrumb. 注意：run.bat/stop.bat 实际是按
+    # 端口号（Get-NetTCPConnection）找进程杀的，并不读取这个文件——真正防止
+    # 重复实例的是 DualStackHTTPServer 的 SO_EXCLUSIVEADDRUSE 独占绑定。
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server.pid'), 'w', encoding='utf-8') as f:
             f.write(str(os.getpid()))
@@ -2227,8 +2415,26 @@ def run():
         print(f"Starting SPARK server on port {PORT}...")
         print(f"Persisted library file will be saved at: {os.path.abspath(DB_FILE)}")
         print(f"Skill contract source: {SKILL_DIR}")
+        # 技能契约文件缺失时旧行为是静默降级为空契约，生成质量悄悄劣化——
+        # 启动时显式列出缺失文件，便于第一时间发现
+        _skill_expected = [
+            os.path.join(SKILL_DIR, 'SKILL.md'),
+            os.path.join(SKILL_DIR, 'references', 'prompt-templates.md'),
+            os.path.join(SKILL_DIR, 'video_to_prompt_pipeline.py'),
+        ]
+        _missing = [p for p in _skill_expected if not os.path.exists(p)]
+        if _missing:
+            print("[WARN] 技能契约文件缺失，提示词合成/视频反推将降级运行：")
+            for p in _missing:
+                print(f"[WARN]   缺失: {p}")
     server_address = ('', PORT)
-    httpd = DualStackHTTPServer(server_address, SparkRequestHandler)
+    try:
+        httpd = DualStackHTTPServer(server_address, SparkRequestHandler)
+    except OSError as e:
+        # 本机未启用 IPv6（或双栈绑定失败）时回退到纯 IPv4，而不是直接启动失败
+        if sys.stdout:
+            print(f"IPv6 双栈监听失败（{e}），回退到 IPv4 监听...")
+        httpd = IPv4HTTPServer(server_address, SparkRequestHandler)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

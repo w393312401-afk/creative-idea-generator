@@ -38,7 +38,9 @@ rem     「🎨 图像工坊」标签页，不再单独拉起 8086，否则重�
 rem     重复实例（2026-07-04 实测同时挂着 2 个 8086 进程）。
 
 rem --- 轮询确认主端口真正起来了，而不是盲等再关窗口（单次 powershell 内部自行重试，避免反复起进程）---
-powershell -NoProfile -Command "$ok=$false; for($i=0;$i -lt 15;$i++){ if(Get-NetTCPConnection -State Listen -LocalPort %PORT% -ErrorAction SilentlyContinue){$ok=$true;break}; Start-Sleep -Milliseconds 700 }; if(-not $ok){exit 1}"
+rem     等待窗口 ~28 秒：启动期要先跑 outputs/ 的 manifest 同步迁移（PNG→WebP），
+rem     素材多时 10 秒不够，会误报“启动失败”
+powershell -NoProfile -Command "$ok=$false; for($i=0;$i -lt 40;$i++){ if(Get-NetTCPConnection -State Listen -LocalPort %PORT% -ErrorAction SilentlyContinue){$ok=$true;break}; Start-Sleep -Milliseconds 700 }; if(-not $ok){exit 1}"
 if errorlevel 1 goto notup
 goto up
 

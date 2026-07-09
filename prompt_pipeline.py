@@ -9,7 +9,11 @@ import urllib.error
 import urllib.parse
 import base64
 import threading
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:
+    print("[FATAL] 缺少 Pillow 依赖，请运行: pip install -r requirements.txt")
+    raise
 from datetime import datetime
 
 from server_common import (
@@ -387,7 +391,10 @@ def run_vlm_qa_check(config, img_i_path, img_ip1_path, video_prompt, is_bridge=F
                 "2. CAMERA viewpoint jumps: The camera is performing a bridge transition (entering/crossing the threshold), "
                 "so the perspective/camera position is ALLOWED and REQUIRED to move forward (closer view, crossing sill). "
                 "However, the horizontal level and general alignment must still be consistent with entering the same space. "
-                "Do not fail for perspective shifts that move forward along the viewpoint axis.\n"
+                "Do not fail for perspective shifts that move forward along the viewpoint axis. "
+                "The interior landmarks visible through the opening must be the SAME objects in both frames and must "
+                "appear clearly LARGER in Image 2 than in Image 1 (the camera moved closer): fail if they hold the same "
+                "apparent size (fake digital zoom), shrink, or get swapped for different objects.\n"
             )
         else:
             system_prompt += (
@@ -405,7 +412,18 @@ def run_vlm_qa_check(config, img_i_path, img_ip1_path, video_prompt, is_bridge=F
             "consistent with labor having happened (tool marks, seams, fasteners, residue, debris, drag marks, dust), "
             "not a perfectly clean instantaneous swap with zero trace of how the change occurred.\n"
             "7. NO TEXT ARTIFACTS: Image 2 must contain no readable text, captions, watermarks, or UI glyphs rendered "
-            "into the scene.\n\n"
+            "into the scene.\n"
+            "8. VOLUME CONSERVATION: if a large amount of material (rubble, debris, soil, cut-out pieces) disappears "
+            "between Image 1 and Image 2, the frames plus the VIDEO prompt must plausibly account for it — containers "
+            "of matching scale, repeated trips, a growing spoil pile, or an explicit carry-out. Fail if room-scale "
+            "material vanishes into one or two small hand containers, or a large cut-out solid piece simply evaporates.\n"
+            "9. POWER CHAIN: if a practical light, lamp, or powered fixture is lit in Image 2 but unlit or absent in "
+            "Image 1, the VIDEO prompt must describe that fixture being installed/connected and activated on camera. "
+            "Fail if a light simply turns on with no installation or wiring action described. (A portable battery work "
+            "light carried in by a worker is fine.)\n"
+            "10. TEMPORARY WORKS: scaffolding, formwork, shoring, or cribbing visible in Image 1 may disappear in "
+            "Image 2 ONLY if the VIDEO prompt describes a strike/removal action; silent disappearance is a fail. Their "
+            "continued static presence across frames is normal — never fail for that.\n\n"
             "Response format:\n"
             "- If all checks pass, respond EXACTLY with: PASS\n"
             "- Otherwise respond with: FAIL: <reason in Chinese, at most 2 sentences, name the single most important "
@@ -452,6 +470,9 @@ def check_landmark_drift(config, image_1_path, current_image_path):
             "framing.\n"
             "3. STATE REGRESSION: any area, surface, or object that was already repaired/cleaned/installed at "
             "some point in this project has reverted to a more damaged or unfinished state in Image 2.\n\n"
+            "TEMPORARY WORKS EXEMPTION: scaffolding, formwork, shoring, cribbing, protection sheets, and portable "
+            "work lights are staged site plant — appearing mid-project and being removed by later frames is normal "
+            "and must NOT be flagged as drift or regression.\n"
             "Do NOT fail for expected construction progress in the active work zone, and do NOT fail merely "
             "because the two images look different overall — only flag unexplained structural/camera drift or "
             "a completed element that has un-happened.\n\n"
@@ -2072,6 +2093,15 @@ Required JSON keys:
 - Creativity Scale: {creativity}
 """
     
+    _brief_fallback = {
+        "carrier": theme,
+        "env": "surrounding environment",
+        "trauma": "ruined state",
+        "destiny": "finished design",
+        "reward": "lights activate",
+        "mode": "Threshold" if beats_count >= 12 else "Standard",
+        "space_type": "abandoned property"
+    }
     parsed_brief = {}
     for attempt in range(3):
         try:
@@ -2084,16 +2114,14 @@ Required JSON keys:
         except Exception as e:
             if sys.stdout:
                 print(f"[DEBUG] Brief parsing attempt {attempt+1} failed: {e}")
-            if attempt == 2:
-                parsed_brief = {
-                    "carrier": theme,
-                    "env": "surrounding environment",
-                    "trauma": "ruined state",
-                    "destiny": "finished design",
-                    "reward": "lights activate",
-                    "mode": "Threshold" if beats_count >= 12 else "Standard",
-                    "space_type": "abandoned property"
-                }
+
+    # 兜底合并：LLM 可能返回「能解析但缺键」的部分 JSON——旧逻辑只在最后一次
+    # 抛异常时才整体兜底，缺键的 partial dict 会带着漏洞流进下游 f-string，
+    # 直接 KeyError 崩掉整个合成任务。保留模型返回的有效键，只补缺失键。
+    if not isinstance(parsed_brief, dict):
+        parsed_brief = {}
+    for k, v in _brief_fallback.items():
+        parsed_brief.setdefault(k, v)
 
     title = parsed_brief.get('destiny', '未命名创意')
     if title:
@@ -2797,13 +2825,17 @@ def build_validator_system_prompt():
 
 Check the whole set in shot order for these hard vetoes:
 [Construction Order & Causality]
-- No powered lights, glowing strips, lit screens, or running equipment before the wiring / power beat. Power-on and lighting must come AFTER the beat that installs their wiring.
+- No powered lights, glowing strips, lit screens, or running equipment before the wiring / power beat. Power-on and lighting must come AFTER the beat that installs their wiring. For off-grid carriers (tree, cave, buried vehicle, gondola, boat, bunker), a visible power source (solar panel, battery bank, generator) must ALSO be installed in an earlier beat before anything lights up; if the set has no wiring beat at all yet something glows, insert one — absence of the wiring beat is itself the violation.
 - No crossing the threshold into the interior before the exterior (facade / roof / site / rust-proofing) is finished.
 - No paint, spray, or topcoat before rust removal, cleaning, and priming.
 - No covering wet or uncured material (mortar, concrete, glue, paint) with the next layer before it has cured.
 - No service (wiring / plumbing / waterproofing) installed after the panel that would hide it.
-- Construction state must be monotonic: cleaned stays clean, installed stays installed, dried stays dried — no regression to an earlier state.
+- Construction state must be monotonic: cleaned stays clean, installed stays installed, dried stays dried — no regression to an earlier state. EXEMPTION: declared temporary works (scaffolding, formwork, shoring, cribbing, protection sheets, portable work lights) MAY be removed in a beat that explicitly shows the strike/carry-out with removal traces (foot pads, compression marks, patched tie holes); never flag such a declared strike as regression, and never "repair" it away. Undeclared blink-out of temporary plant between anchors IS a violation — add the strike action, do not delete the plant.
+- PERSISTENT SITE PLANT: scaffolding, formwork, shoring, and cribbing erected in one beat must stay visible in every later IMAGE anchor until their declared strike beat; an anchor showing freshly poured, unset concrete must still show the formwork supporting it.
 - CEILING/ROOF COVERAGE: No enclosed space (room, cabin, fuselage, container, vault) may have walls paneled/insulated/painted while the ceiling/roof is left as raw exposed structure. If walls are covered, the ceiling must also be covered in the same or a subsequent beat. If ceiling coverage is missing, add it to the wall-coverage beat.
+- CEILING-BEFORE-WALL ORDER: when both overhead/ceiling boarding and wall paneling occur in an enclosed space, the ceiling/overhead beat must come BEFORE the wall paneling beat (wall panels support and hide the ceiling-board edges); reorder if the walls close first.
+- ENCLOSED-SPACE PROVENANCE: any interior chamber revealed behind a newly opened shell (carved portal, cut opening, excavated mouth) must be physically accounted for — either the opening beat explicitly states the space is pre-existing (a natural cavity, an original room), or dedicated excavation/mucking-out beats appear before any interior finishing. A finished or large unexplained chamber behind a fresh opening is a violation, and the interior volume must plausibly fit inside the exterior shell.
+- VOLUME CONSERVATION: container scale, trip count, or a visibly growing spoil pile must plausibly account for the material removed or delivered in each beat. Room-scale debris or a passable cut opening cannot disappear into one or two hand crates; cubic-metre-scale removals need mechanical containers (excavator buckets, skips, chutes) or repeated trips feeding a growing spoil pile. Any cut-out slab, panel, or door-sized solid piece needs its own pry-out and carry-out action — crumbs in buckets never account for a large solid piece.
 - CAMERA VIEWPOINT CONTINUITY: No sudden camera viewpoint jumps. If IMAGE N is interior (camera inside the space, entry behind camera), IMAGE N+1 cannot be exterior (camera outside looking in) without an intervening reverse-dolly VIDEO that pulls the camera back through the doorway. If this occurs, either keep the viewpoint consistent or insert a camera-pullback transition in the VIDEO.
 - FLOOR-BEFORE-HEAVY-OBJECTS: Floor finish must be installed BEFORE heavy anchored objects (fireplace, stove) are placed on it. If a heavy object is installed on a bare subfloor and then the finished floor appears under it, reorder the beats so flooring comes first.
 - FIXTURE COMPLETENESS: If wiring/electrical rough-in is present, light fixture installation must occur BEFORE the reward beat. Fixtures cannot appear in the final reward without an installation beat.
@@ -2818,13 +2850,16 @@ Check the whole set in shot order for these hard vetoes:
 - Material Continuity: Materials (e.g. wood type, steel type) must not magically transform between shots unless painted or replaced.
 - NGCS coordinate lock: Ensure the 3 Primary Landmarks remain locked to the same coordinates (e.g. A1, B3, C2) across all images unless explicitly altered.
 - Ghost Clause: Occluded landmarks must be preserved in parenthetical tags, e.g. `[Object Name] remains physically locked at [Grid Cell] ... hidden behind [occluding object]`.
-- VMFP & RCE Volume: Loose materials must be encapsulated in rigid, countable containers (buckets/bags) and have volume percentage capacities.
+- VMFP & RCE Volume: Loose materials must be encapsulated in rigid, countable containers (buckets/bags) and have volume percentage capacities, with the container scale matched to the load per the VOLUME CONSERVATION veto above (a correctly scaled, visibly growing spoil pile also satisfies encapsulation for material that stays in frame).
 - RHMA Reflection: Glossy/wet surfaces must use highly blurred, diffused reflections (RHMA-Blur) to prevent video flicker.
 - Clean Frame Boundary: Image anchors must have ZERO active workers or active machinery.
 - Out-and-In Passage: Workers in video prompts must enter at t=0s and exit before t={int(VIDEO_DURATION)}s.
 - PERSPECTIVE ISOLATION: Do not flip camera facing directions (e.g. turning 180 degrees from looking out to looking in) in the same spatial axis without a clean separate phase or TBCP transition. If the project centers on a slide-out reward action, lock the Camera Family (e.g. Camera Family B looking outward through the opening towards the view) from the very first frame to maintain spatial consistency.
 - BI-DIRECTIONAL AGENT FLOW: Workers in video prompts must enter from a specific coordinate edge at t=0s and walk out through the same edge by t={WORKER_EXIT_TIME}s, leaving the frame completely empty of active agents at t={int(VIDEO_DURATION)}s. No teleportation or instant popping.
 - RIGID CONTAINER ENCAPSULATION: All loose materials, debris, fasteners, and liquids must be stored and tracked inside rigid, quantifiable containers (e.g. buckets, parts trays, boxes), and their volumes must be described as continuously increasing or decreasing.
+- THRESHOLD PEEK ANCHOR QUALIFICATION & SCALE: the two interior landmarks pre-visualized through the doorway before a threshold bridge must plausibly ALREADY EXIST at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. NEVER future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures): the bridge precedes interior construction, so peeking them forces objects to exist before the beat that creates them. Each peeked anchor's declared frame-height scale must strictly INCREASE across the bridge IMAGEs (approach -> sill handoff -> interior settled); a constant scale across the crossing is a violation — fix the scales, keep the objects.
+- BRIDGE WHITE-BALANCE DIRECTION: Bridge-1 and Bridge-2 must state ONE consistent colour-temperature direction attributed to the same light source (default: dimmer and cooler; dimmer and warmer only when a warm interior light source is already burning and visible through the doorway). Opposite directions across the two bridge clips (warmer on approach, cooler on settle, or vice versa) are a violation.
+- CAMERA ATTITUDE BY SHOT FAMILY: enclosed interior prompts must never mention a horizon, sky, or drifting clouds (use a level camera pitch + centered vanishing axis instead); elevated steep-downward shots must never claim a mid-frame horizon (lock the pitch angle and vertical convergence instead). Fix the wording, never the shot.
 - MANDATORY CLIMAX VIDEO: The prompt composer must generate exactly N video prompts for N+1 images, ensuring the transition between the final two frames (the "Dressed interior" -> "Retract/slide action") is fully animated. The climax video (VIDEO N) must depict the actual physical kinetic movement of the mechanism (e.g. the bed rolling smoothly forward, the glass door sliding open).
 - NLVTR Text Lock: No '%' symbol, numeric ranges, colons in variable strings, or acronyms (HAL, DKP, VMFP, RPL, RCE, SCUP, NGCS, OSPL, RHMA, PBISP, HCL, NLVTR) in prompt bodies.
 

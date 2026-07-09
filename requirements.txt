@@ -1,0 +1,11 @@
+# SPARK 创意点子工坊 — Python 依赖清单
+# 安装: pip install -r requirements.txt
+# 仅列硬依赖；AdsPower 自动化脚本（外部目录，见 server_config.json 的 adspowerPath）
+# 自带其独立的依赖环境，不在此列。
+
+# 图像处理：帧序列 WebP 转换、LAB 颜色匹配、封面合成（硬依赖，缺失无法启动）
+Pillow>=10.0
+
+# HTTP 客户端：/api/generate_image_with_vlm 的上游调用使用 requests，
+# 其余出站请求走标准库 urllib
+requests>=2.31

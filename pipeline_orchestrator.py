@@ -31,7 +31,7 @@ dead-ends in a manual-review state.
 import os
 import json
 
-from server_common import _get_project_dir
+from server_common import _get_project_dir, read_manifest, write_manifest, manifest_lock
 from prompt_pipeline import (
     compose_anchor_and_packet,
     compose_remaining_beats,
@@ -56,11 +56,9 @@ def _frame_path(title, sequence):
 def _frame_quality_gate(project_dir, sequence):
     """Read a single frame's recorded quality_gate from manifest.json, or None if no
     manifest/frame entry exists yet."""
-    manifest_path = os.path.join(project_dir, 'manifest.json')
-    if not os.path.exists(manifest_path):
+    manifest = read_manifest(project_dir)
+    if not manifest:
         return None
-    with open(manifest_path, 'r', encoding='utf-8') as f:
-        manifest = json.load(f)
     for frame in manifest.get('frames', []):
         if frame.get('sequence') == sequence:
             return frame.get('quality_gate')
@@ -72,18 +70,17 @@ def _set_manifest_quality_gate(project_dir, sequence, quality_gate, reason=None)
     Needed because generate_frame_sequence's own per-frame QA never produces a real
     verdict for frame 1 (it has no prior frame to compare motion against), so the
     Anchor Acceptance Gate's verdict has to be written back out-of-band."""
-    manifest_path = os.path.join(project_dir, 'manifest.json')
-    if not os.path.exists(manifest_path):
-        return
-    with open(manifest_path, 'r', encoding='utf-8') as f:
-        manifest = json.load(f)
-    for frame in manifest.get('frames', []):
-        if frame.get('sequence') == sequence:
-            frame['quality_gate'] = quality_gate
-            frame['vlm_qa_reason'] = reason
-            break
-    with open(manifest_path, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    # read_manifest/write_manifest：同一把项目级锁 + 原子替换（读改写不再互相覆盖）
+    with manifest_lock(project_dir):
+        manifest = read_manifest(project_dir)
+        if not manifest:
+            return
+        for frame in manifest.get('frames', []):
+            if frame.get('sequence') == sequence:
+                frame['quality_gate'] = quality_gate
+                frame['vlm_qa_reason'] = reason
+                break
+        write_manifest(project_dir, manifest)
 
 
 def _retry_frame_until_pass(config, title, sequence, images, videos, judge, on_progress=None,

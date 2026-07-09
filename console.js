@@ -490,7 +490,9 @@ document.addEventListener('DOMContentLoaded', () => {
       copyTunnelBtn.addEventListener('click', () => {
         const urlText = tunnelUrlCode.textContent.trim();
         if (urlText && urlText !== '-') {
-          navigator.clipboard.writeText(urlText).then(() => {
+          // copyText（js/utils.js）在 http 局域网环境下自动回退 execCommand，
+          // 直接调 navigator.clipboard 在非安全上下文里是 undefined，会静默 TypeError
+          copyText(urlText).then(() => {
             const originalText = copyTunnelBtn.innerHTML;
             copyTunnelBtn.innerHTML = `
               <span style="color:var(--success)">✓ 已复制</span>
@@ -498,6 +500,9 @@ document.addEventListener('DOMContentLoaded', () => {
             setTimeout(() => {
               copyTunnelBtn.innerHTML = originalText;
             }, 1500);
+          }).catch(() => {
+            copyTunnelBtn.innerHTML = `<span style="color:var(--danger, #f87171)">复制失败</span>`;
+            setTimeout(() => { copyTunnelBtn.innerHTML = '复制'; }, 1500);
           });
         }
       });
@@ -530,9 +535,28 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     }
 
-    // Start background status checks
+    // Start background status checks.
+    // 页面隐藏时暂停轮询（旧行为：4 个接口每 3 秒永久轮询，即使标签页在后台）
     checkSystemStatuses();
-    dashboardPollInterval = setInterval(checkSystemStatuses, 3000);
+    const startDashboardPolling = () => {
+      if (dashboardPollInterval) return;
+      dashboardPollInterval = setInterval(checkSystemStatuses, 3000);
+    };
+    const stopDashboardPolling = () => {
+      if (dashboardPollInterval) {
+        clearInterval(dashboardPollInterval);
+        dashboardPollInterval = null;
+      }
+    };
+    startDashboardPolling();
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        stopDashboardPolling();
+      } else {
+        checkSystemStatuses();
+        startDashboardPolling();
+      }
+    });
 
     // Setup Marketplace filter bindings
     setupMarketplaceFilters();
@@ -642,19 +666,32 @@ document.addEventListener('DOMContentLoaded', () => {
       statusAppDot.className = 'status-dot online';
       statusAppText.textContent = '在线 (8085)';
 
-      const tasksResp = await fetch('/api/tasks');
-      if (tasksResp.ok) {
-        const tasks = await tasksResp.json();
-        const runningTasks = tasks.filter(t => t.status === 'running');
-        statActiveTasks.textContent = runningTasks.length;
-        renderTasksTable(tasks);
+      // 托管模式下受门禁保护的端点需要携带访问码（侧栏凭证框）
+      const gateHeaders = {};
+      if (needsAccessCode && devToken) {
+        gateHeaders['X-Access-Code'] = devToken;
       }
-      
+
+      // 任务表独立 try/catch：任务列表出错不能把整页服务状态误标为离线
+      try {
+        const tasksResp = await fetch('/api/tasks', { headers: gateHeaders });
+        if (tasksResp.ok) {
+          // 服务端契约是 {tasks, total_count}；兼容旧的纯数组形状
+          const resData = await tasksResp.json();
+          const tasks = Array.isArray(resData) ? resData : (resData.tasks || []);
+          const runningTasks = tasks.filter(t => t.status === 'running');
+          statActiveTasks.textContent = runningTasks.length;
+          renderTasksTable(tasks);
+        }
+      } catch (taskErr) {
+        console.warn('Failed to refresh task table', taskErr);
+      }
+
       statRateMax.textContent = '20';
 
       // Get cache info
       try {
-        const cacheResp = await fetch('/api/cache-info');
+        const cacheResp = await fetch('/api/cache-info', { headers: gateHeaders });
         if (cacheResp.ok) {
           const cacheData = await cacheResp.json();
           const sizeKb = (cacheData.packet_cache_size / 1024).toFixed(2);
@@ -692,10 +729,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     taskTableBody.innerHTML = tasks.map(t => {
-      const theme = t.dimensions ? (t.dimensions.theme || '未指定主题') : '应用内直呼生成';
+      // 主题名来自 LLM/用户输入，错误信息来自服务端——都必须转义再进 innerHTML
+      const theme = escapeHtml(t.dimensions ? (t.dimensions.theme || '未指定主题') : '应用内直呼生成');
       const duration = t.result && t.result.timings ? `${t.result.timings.total_duration_seconds}s` : '-';
       const beats = t.dimensions ? (t.dimensions.beats_count || 15) : '-';
-      
+
       let themeDisplay = theme;
       if (t.result && t.result.token_usage) {
         const usage = t.result.token_usage;
@@ -703,27 +741,30 @@ document.addEventListener('DOMContentLoaded', () => {
                        `Tokens: ${usage.total_tokens} (I:${usage.prompt_tokens} O:${usage.completion_tokens}) | Calls: ${usage.api_calls}` +
                        `</div>`;
       }
-      
+
       let statusBadge = '';
       if (t.status === 'running') {
         statusBadge = '<span class="badge badge-running">● 正在合成</span>';
       } else if (t.status === 'completed') {
         statusBadge = '<span class="badge badge-completed">● 已完成</span>';
       } else {
-        statusBadge = `<span class="badge badge-failed" title="${t.error || ''}">● 失败</span>`;
+        statusBadge = `<span class="badge badge-failed" title="${escapeHtml(t.error || '')}">● 失败</span>`;
       }
 
+      // 中止/删除的处理器在本页实现（consoleCancelTask/consoleDeleteTask）：
+      // 旧代码引用的 cancelTask/deleteTask 只存在于 app.js，本页不加载它，点击即 ReferenceError
+      const safeId = escapeHtml(String(t.id));
       let actionButtons = '';
       if (t.status === 'running') {
-        actionButtons = `<button class="btn btn-sm btn-danger" onclick="cancelTask('${t.id}')">中止</button>`;
+        actionButtons = `<button class="btn btn-sm btn-danger" onclick="consoleCancelTask('${safeId}')">中止</button>`;
       } else {
-        actionButtons = `<button class="btn btn-sm" style="color:#f87171; border-color:transparent;" onclick="deleteTask('${t.id}')">删除</button>`;
+        actionButtons = `<button class="btn btn-sm" style="color:#f87171; border-color:transparent;" onclick="consoleDeleteTask('${safeId}')">删除</button>`;
       }
 
       return `
         <tr>
-          <td style="font-family: var(--font-mono); font-size:13px; color: var(--primary);">${t.id}</td>
-          <td style="font-weight: 500; color:#fff;">${themeDisplay}</td>
+          <td style="font-family: var(--font-mono); font-size:13px; color: var(--primary);">${safeId}</td>
+          <td style="font-weight: 500; color: var(--text-main);">${themeDisplay}</td>
           <td>${statusBadge}</td>
           <td>${beats}</td>
           <td style="font-family: var(--font-mono);">${duration}</td>
@@ -732,6 +773,45 @@ document.addEventListener('DOMContentLoaded', () => {
       `;
     }).join('');
   }
+
+  // 任务监控行内按钮的本页实现：直接 POST 后端并刷新状态
+  const consoleTaskHeaders = () => {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = localTokenInput ? localTokenInput.value.trim() : '';
+    if (needsAccessCode && token) headers['X-Access-Code'] = token;
+    return headers;
+  };
+
+  window.consoleCancelTask = async (taskId) => {
+    try {
+      const resp = await fetch('/api/compose-cancel', {
+        method: 'POST',
+        headers: consoleTaskHeaders(),
+        body: JSON.stringify({ task_id: taskId })
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      checkSystemStatuses();
+    } catch (e) {
+      console.error('Cancel task failed:', e);
+      alert(`中止任务失败: ${e.message}`);
+    }
+  };
+
+  window.consoleDeleteTask = async (taskId) => {
+    if (!window.confirm('确定删除此任务记录吗？')) return;
+    try {
+      const resp = await fetch('/api/tasks/delete', {
+        method: 'POST',
+        headers: consoleTaskHeaders(),
+        body: JSON.stringify({ task_id: taskId })
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      checkSystemStatuses();
+    } catch (e) {
+      console.error('Delete task failed:', e);
+      alert(`删除任务失败: ${e.message}`);
+    }
+  };
 
   // 4. Model Marketplace Filter & Search Engine
   const setupMarketplaceFilters = () => {
@@ -791,7 +871,7 @@ document.addEventListener('DOMContentLoaded', () => {
       btn.addEventListener('click', (e) => {
         e.stopPropagation(); // Prevent card trigger
         const modelId = btn.getAttribute('data-id');
-        navigator.clipboard.writeText(modelId).then(() => {
+        copyText(modelId).then(() => {
           const originalSvg = btn.innerHTML;
           btn.innerHTML = `<span style="font-size:10px; font-weight:600; color:var(--success);">✓</span>`;
           btn.style.borderColor = 'var(--success)';
@@ -799,6 +879,9 @@ document.addEventListener('DOMContentLoaded', () => {
             btn.innerHTML = originalSvg;
             btn.style.borderColor = '';
           }, 1200);
+        }).catch(() => {
+          btn.style.borderColor = 'var(--danger, #f87171)';
+          setTimeout(() => { btn.style.borderColor = ''; }, 1200);
         });
       });
     });
@@ -872,8 +955,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
       if (matchesSearch && matchesProvider && matchesType && matchesTag && matchesBilling) {
         card.style.display = 'flex';
-        card.style.opacity = '0';
-        setTimeout(() => { card.style.opacity = '1'; }, 20); // Smooth fade transition
+        // Keep cards fully opaque. The old code reset opacity to 0 then transitioned back to 1
+        // on EVERY keystroke, re-firing the 0.3s `transition: all` on all visible glass cards —
+        // a visible flicker while typing in the search box. Setting '1' is idempotent (no
+        // transition re-fires once it is already 1), so filtering no longer flickers.
+        card.style.opacity = '1';
         matchCount++;
       } else {
         card.style.display = 'none';
@@ -942,7 +1028,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   btnCopyModelId.addEventListener('click', () => {
-    navigator.clipboard.writeText(generatedModelId.textContent).then(() => {
+    copyText(generatedModelId.textContent).then(() => {
       const originalText = btnCopyModelId.textContent;
       btnCopyModelId.textContent = '已成功复制！';
       btnCopyModelId.style.background = 'var(--success)';
@@ -996,28 +1082,48 @@ document.addEventListener('DOMContentLoaded', () => {
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;');
 
+    // 单趟高亮：一个按优先级排列的选择分支正则，一次扫描完成。
+    // 旧实现是链式 .replace —— 后面的字符串/引号规则会重新扫描前面插入的
+    // <span class="..."> 标记本身，把 span 属性再包一层 span，页面上直接可见乱码。
+    const wrap = (cls, text) => `<span class="${cls}">${text}</span>`;
+
     if (lang === 'curl') {
-      html = html
-        .replace(/\b(curl)\b/g, '<span class="token-keyword">$1</span>')
-        .replace(/(\s-[A-Za-z]\b|\s--[A-Za-z-]+\b)/g, '<span class="token-method">$1</span>')
-        .replace(/(Authorization:|Content-Type:|Bearer)/g, '<span class="token-comment">$1</span>')
-        .replace(/("application\/json"|"multipart\/form-data")/g, '<span class="token-string">$1</span>')
-        .replace(/(https?:\/\/[^\s\"\\]+)/g, '<span class="token-url">$1</span>')
-        .replace(/(YOUR_[A-Z_]+)/g, '<span class="token-string">$1</span>');
+      html = html.replace(
+        /(https?:\/\/[^\s"\\]+)|("application\/json"|"multipart\/form-data")|(YOUR_[A-Z_]+)|(Authorization:|Content-Type:|Bearer)|(\s--?[A-Za-z][A-Za-z-]*\b)|\b(curl)\b/g,
+        (m, url, str, ph, hdr, flag, kw) => {
+          if (url) return wrap('token-url', url);
+          if (str) return wrap('token-string', str);
+          if (ph) return wrap('token-string', ph);
+          if (hdr) return wrap('token-comment', hdr);
+          if (flag) return wrap('token-method', flag);
+          if (kw) return wrap('token-keyword', kw);
+          return m;
+        }
+      );
     } else if (lang === 'python') {
-      html = html
-        .replace(/\b(import|from|print|with|as)\b/g, '<span class="token-keyword">$1</span>')
-        .replace(/(#.*)$/gm, '<span class="token-comment">$1</span>')
-        .replace(/(\".*?\"|\'.*?\')/g, '<span class="token-string">$1</span>')
-        .replace(/(https?:\/\/[^\s\"\']+)/g, '<span class="token-url">$1</span>')
-        .replace(/(YOUR_[A-Z_]+)/g, '<span class="token-string">$1</span>');
+      html = html.replace(
+        /(#.*$)|("[^"\n]*"|'[^'\n]*')|(https?:\/\/[^\s"']+)|(YOUR_[A-Z_]+)|\b(import|from|print|with|as)\b/gm,
+        (m, comment, str, url, ph, kw) => {
+          if (comment) return wrap('token-comment', comment);
+          if (str) return wrap('token-string', str);
+          if (url) return wrap('token-url', url);
+          if (ph) return wrap('token-string', ph);
+          if (kw) return wrap('token-keyword', kw);
+          return m;
+        }
+      );
     } else if (lang === 'js' || lang === 'javascript') {
-      html = html
-        .replace(/\b(const|let|var|function|return|then|catch|console|log|method|headers|body|JSON|stringify|fetch)\b/g, '<span class="token-keyword">$1</span>')
-        .replace(/(\/\/.*)$/gm, '<span class="token-comment">$1</span>')
-        .replace(/(\".*?\"|\'.*?\'|\`.*?\`)/g, '<span class="token-string">$1</span>')
-        .replace(/(https?:\/\/[^\s\"\`\']+)/g, '<span class="token-url">$1</span>')
-        .replace(/(YOUR_[A-Z_]+)/g, '<span class="token-string">$1</span>');
+      html = html.replace(
+        /(\/\/.*$)|("[^"\n]*"|'[^'\n]*'|`[^`]*`)|(https?:\/\/[^\s"'`]+)|(YOUR_[A-Z_]+)|\b(const|let|var|function|return|then|catch|console|log|method|headers|body|JSON|stringify|fetch)\b/gm,
+        (m, comment, str, url, ph, kw) => {
+          if (comment) return wrap('token-comment', comment);
+          if (str) return wrap('token-string', str);
+          if (url) return wrap('token-url', url);
+          if (ph) return wrap('token-string', ph);
+          if (kw) return wrap('token-keyword', kw);
+          return m;
+        }
+      );
     }
     return html;
   }
@@ -1321,13 +1427,15 @@ fetch("${tunnelOrigin}/api/reverse-video", {
     const preBlock = document.getElementById(blockId);
     if (!preBlock) return;
 
-    navigator.clipboard.writeText(preBlock.textContent).then(() => {
+    copyText(preBlock.textContent).then(() => {
       const copyBtn = preBlock.parentElement.querySelector('.btn-copy-code');
       const originalSvg = copyBtn.innerHTML;
       copyBtn.innerHTML = `<span style="font-size:10px; font-weight:600; color:var(--success);">✓</span>`;
       setTimeout(() => {
         copyBtn.innerHTML = originalSvg;
       }, 1500);
+    }).catch(err => {
+      console.error('Copy doc code failed:', err);
     });
   };
 
@@ -1679,6 +1787,7 @@ fetch("${tunnelOrigin}/api/reverse-video", {
           btnSendRequest.disabled = true;
           btnSendRequest.querySelector('span').textContent = '视频生成中 (轮询中)...';
 
+          let pollFailCount = 0;
           videoPollInterval = setInterval(async () => {
             try {
               let pollHeaders = {};
@@ -1747,7 +1856,18 @@ fetch("${tunnelOrigin}/api/reverse-video", {
               }
             } catch (err) {
               logToPlayConsole(`轮询出现异常：${err.message}`, 'error');
+              // 连续轮询失败上限：不让发送按钮跟着一个死任务永远禁用
+              pollFailCount += 1;
+              if (pollFailCount >= 5) {
+                clearInterval(videoPollInterval);
+                videoPollInterval = null;
+                logToPlayConsole('连续 5 次轮询失败，已停止轮询。任务可能仍在后台运行。', 'error');
+                btnSendRequest.disabled = false;
+                btnSendRequest.querySelector('span').textContent = '发送 API 请求';
+              }
+              return;
             }
+            pollFailCount = 0;
           }, 3000);
           
           return; // Skip normal image/chat handling
@@ -1797,8 +1917,9 @@ fetch("${tunnelOrigin}/api/reverse-video", {
     } catch (error) {
       logToPlayConsole(`请求发送异常：${error.message}`, 'error');
     } finally {
-      // If we are polling video-gen, do not reset the button yet!
-      if (endpoint !== 'video-gen') {
+      // 只有确实启动了视频轮询才把按钮留给轮询回调恢复；
+      // 否则（提交阶段就失败/无任务 ID）这里必须自己恢复，不然按钮永久禁用
+      if (endpoint !== 'video-gen' || !videoPollInterval) {
         btnSendRequest.disabled = false;
         btnSendRequest.querySelector('span').textContent = '发送 API 请求';
       }

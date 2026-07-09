@@ -141,7 +141,7 @@
 
 #panel-image-studio textarea {
     width: 100%;
-    background: rgba(0, 0, 0, 0.25);
+    background: var(--bg-card);
     border: 1px solid var(--border-color);
     color: var(--text-main);
     border-radius: 12px;
@@ -190,7 +190,7 @@
 
 #panel-image-studio .styled-select {
     width: 100%;
-    background: rgba(0, 0, 0, 0.25);
+    background: var(--bg-card);
     border: 1px solid var(--border-color);
     color: var(--text-main);
     border-radius: 12px;
@@ -259,7 +259,7 @@
 }
 
 #panel-image-studio .ratio-card {
-    background: rgba(0, 0, 0, 0.15);
+    background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
     border-radius: 12px;
     padding: 0.75rem;
@@ -329,7 +329,7 @@
 }
 
 #panel-image-studio .quality-card {
-    background: rgba(0, 0, 0, 0.15);
+    background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
     border-radius: 12px;
     padding: 0.6rem;
@@ -404,7 +404,7 @@
     flex-direction: column;
     gap: 1.25rem;
     padding: 0.75rem;
-    background: rgba(0, 0, 0, 0.15);
+    background: rgba(var(--ink-rgb), 0.04);
     border-radius: 12px;
     border: 1px solid var(--border-color);
 }
@@ -467,7 +467,7 @@
     border-radius: 12px;
     padding: 1.5rem;
     text-align: center;
-    background: rgba(0, 0, 0, 0.15);
+    background: rgba(var(--ink-rgb), 0.04);
     cursor: pointer;
     transition: var(--transition-normal);
     display: flex;
@@ -514,7 +514,7 @@
     flex-wrap: wrap;
     gap: 0.5rem;
     margin-top: 0.5rem;
-    background: rgba(0, 0, 0, 0.2);
+    background: rgba(var(--ink-rgb), 0.05);
     padding: 0.5rem;
     border-radius: 8px;
     border: 1px solid var(--border-color);
@@ -801,7 +801,7 @@
     aspect-ratio: 1 / 1;
     border-radius: 10px;
     overflow: hidden;
-    background: rgba(0, 0, 0, 0.2);
+    background: rgba(var(--ink-rgb), 0.05);
     border: 1px solid var(--border-color);
     position: relative;
     cursor: pointer;
@@ -903,6 +903,9 @@
 
 #panel-image-studio .task-card {
     display: flex;
+    /* 显式恢复行布局：宿主 style.css 的 .task-card（任务抽屉卡片）设了 column，
+       会顺着通用类名泄漏进来把队列卡片竖着摆 */
+    flex-direction: row;
     align-items: center;
     gap: 12px;
     background: rgba(var(--panel-rgb), 0.4);

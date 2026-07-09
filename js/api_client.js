@@ -1,5 +1,209 @@
 // --- api_client.js ---
 
+/**
+ * 统一的任务事件流消费引擎（断线恢复版）。
+ *
+ * 之前六处手写的 SSE 读取循环把「连接断开」当成「任务失败」，这是
+ * “上游做好了但前端不同步”问题的根源。本引擎的保证：
+ *  - 服务端在连接时会重放全部事件历史，所以 onEvent 处理器必须幂等；
+ *  - 单行 JSON 解析失败只跳过该行，绝不杀死整个流；
+ *  - 服务端 'error' 事件才是任务失败；连接断开本身不是；
+ *  - 流断开且任务仍在运行时，按指数退避自动重连（成功连上即重置计数）；
+ *  - 流结束但没读到终态事件时，用 /api/compose-status 仲裁真实状态。
+ *
+ * @returns {Promise<{status: 'completed'|'failed'|'cancelled', result?: any, error?: string}>}
+ *          AbortError（用户取消）原样抛出，由调用方处理。
+ */
+async function watchTaskUntilTerminal(taskId, opts = {}) {
+    const { onEvent, signal, label = 'task', maxReconnects = 8 } = opts;
+    let reconnects = 0;
+    let resultData = null;
+
+    const emit = (type, data, raw) => {
+        if (!onEvent) return;
+        try {
+            onEvent(type, data, raw);
+        } catch (uiErr) {
+            // UI 处理器抛错不能中断事件流
+            console.error(`[watchTask:${label}] onEvent 处理器异常（已忽略）`, uiErr);
+        }
+    };
+
+    const checkStatus = async () => {
+        const res = await fetch(`/api/compose-status?task_id=${encodeURIComponent(taskId)}`, { signal });
+        if (!res.ok) return null;
+        return res.json();
+    };
+
+    while (true) {
+        if (signal && signal.aborted) {
+            throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+        }
+
+        let sawTerminal = null;
+        try {
+            const response = await fetch(`/api/compose-stream?task_id=${encodeURIComponent(taskId)}`, { signal });
+            if (response.status === 404) {
+                // 任务不在内存中（服务可能重启过）——用状态接口做最终仲裁
+                let st = null;
+                try { st = await checkStatus(); } catch (e) { if (e.name === 'AbortError') throw e; }
+                if (st && st.status === 'completed') return { status: 'completed', result: st.result };
+                if (st && st.status === 'cancelled') return { status: 'cancelled' };
+                return { status: 'failed', error: (st && st.error) || '任务不存在（服务可能已重启）' };
+            }
+            if (!response.ok) {
+                const errText = await response.text().catch(() => '');
+                throw new Error(`HTTP ${response.status}: ${errText}`);
+            }
+            reconnects = 0;
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let buffer = '';
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed || !trimmed.startsWith('data: ')) continue;
+                    let parsed;
+                    try {
+                        parsed = JSON.parse(trimmed.substring(6));
+                    } catch (parseErr) {
+                        console.warn(`[watchTask:${label}] 跳过无法解析的事件行`, parseErr);
+                        continue;
+                    }
+                    if (!parsed || !parsed.type) continue;
+                    if (parsed.type === 'result') resultData = parsed.data;
+                    emit(parsed.type, parsed.data, parsed);
+                    if (parsed.type === 'error') {
+                        sawTerminal = { status: 'failed', error: (parsed.data && parsed.data.message) || '未知错误' };
+                    }
+                }
+            }
+        } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            console.warn(`[watchTask:${label}] 事件流中断:`, e.message || e);
+        }
+
+        if (sawTerminal) return { ...sawTerminal, result: resultData };
+        if (resultData) return { status: 'completed', result: resultData };
+
+        // 流结束但没有终态事件：先问状态接口，任务真的还在跑才重连
+        let st = null;
+        try { st = await checkStatus(); } catch (e) { if (e.name === 'AbortError') throw e; }
+        if (st) {
+            if (st.status === 'completed') return { status: 'completed', result: st.result };
+            if (st.status === 'failed') return { status: 'failed', error: st.error || '任务失败' };
+            if (st.status === 'cancelled') return { status: 'cancelled' };
+            if (st.status === 'not_found') return { status: 'failed', error: '任务不存在（服务可能已重启）' };
+        }
+
+        reconnects += 1;
+        if (reconnects > maxReconnects) {
+            return { status: 'failed', error: '与服务的连接反复中断，已停止重连。任务可能仍在后台运行，稍后可在任务列表中查看。' };
+        }
+        const delay = Math.min(15000, 1000 * Math.pow(2, reconnects - 1));
+        emit('reconnecting', { attempt: reconnects, delay });
+        await new Promise(r => setTimeout(r, delay));
+    }
+}
+
+/**
+ * 把一个 'frame' 事件合并进 currentIdea（幂等：同序号覆盖）。
+ * 注意：这里只写 localStorage 快照，不再每帧向服务端 POST 整个库
+ * （旧行为在长任务里造成持续的大请求）；库同步集中在任务终态时进行。
+ */
+function applyFrameEventToIdea(f) {
+    if (!f || !currentIdea) return;
+    if (!currentIdea.frameRun) currentIdea.frameRun = { title: currentIdea.title, frames: [] };
+    if (!currentIdea.frameRun.frames) currentIdea.frameRun.frames = [];
+    const idx = currentIdea.frameRun.frames.findIndex(item => item.sequence === f.sequence);
+    if (idx !== -1) {
+        currentIdea.frameRun.frames[idx] = f;
+    } else {
+        currentIdea.frameRun.frames.push(f);
+        currentIdea.frameRun.frames.sort((a, b) => a.sequence - b.sequence);
+    }
+    saveCurrentIdeaState();
+    const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
+    if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = currentIdea.frameRun;
+}
+
+/** 任务终态时把 manifest 同步进 currentIdea 与创意库（含服务端持久化）。 */
+async function syncFrameRunToLibrary(manifestData) {
+    if (!currentIdea || !manifestData) return;
+    currentIdea.frameRun = manifestData;
+    saveCurrentIdeaState();
+    const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
+    if (existingIdx !== -1) {
+        savedIdeas[existingIdx].frameRun = manifestData;
+        await saveLibrary();
+    }
+}
+
+/** 失败后从服务端 manifest 恢复已完成的部分结果。 */
+async function reloadManifestIntoIdea() {
+    if (!currentIdea) return;
+    try {
+        const resp = await fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(currentIdea))}`);
+        if (resp.ok) {
+            await syncFrameRunToLibrary(await resp.json());
+        }
+    } catch (err) {
+        console.error('Failed to load partial manifest after failure:', err);
+    }
+}
+
+/** 视频槽位卡片渲染（等待中/生成中/完成/失败），供事件流与重试路径共用。 */
+function renderVideoSlotPending(slotIdx, text) {
+    const el = document.getElementById(`video-slot-${slotIdx}`);
+    if (!el) return;
+    el.className = 'frame-card placeholder-frame-card';
+    el.innerHTML = `
+        <div class="frame-placeholder-spinner">
+            <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
+        </div>
+        <span>第 ${String(slotIdx).padStart(3, '0')} 段视频 (${text})</span>
+    `;
+}
+
+function renderVideoSlotDone(idx, video) {
+    const el = document.getElementById(`video-slot-${idx}`);
+    if (!el || !video) return;
+    el.className = 'frame-card';
+    el.style.cursor = 'default';
+    el.innerHTML = `
+        <video controls style="width:100%; aspect-ratio: 9/16; object-fit: cover; border-radius: 5px; display: block; background: #03050c;"></video>
+        <span>VID ${String(video.slot || idx).padStart(3, '0')}</span>
+    `;
+    el.querySelector('video').src = video.url;
+}
+
+function renderVideoSlotFailed(idx, message, labelText = '生成失败') {
+    const el = document.getElementById(`video-slot-${idx}`);
+    if (!el) return;
+    el.className = 'frame-card video-failed-card';
+    el.innerHTML = `
+        <div class="video-failed-placeholder">
+            <span class="error-icon">⚠️</span>
+            <span class="error-text"></span>
+            <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${idx}">重试</button>
+        </div>
+        <span>VID ${String(idx).padStart(3, '0')}</span>
+    `;
+    const errText = el.querySelector('.error-text');
+    errText.textContent = labelText;
+    errText.title = message || labelText;
+    el.querySelector('.retry-video-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        retrySingleVideo(idx);
+    });
+}
+
 function startTasksPolling(interval = 2500) {
     stopTasksPolling();
     currentPollInterval = interval;
@@ -111,7 +315,10 @@ function initLocalServiceLogs() {
         }
 
         if (statusDot) statusDot.className = 'log-panel-status-dot'; // Reset to disconnected
-        eventSource = new EventSource('/api/logs/stream');
+        // EventSource 无法携带自定义请求头：托管模式下用 query 参数传访问码
+        const code = (typeof ACCESS_CODE !== 'undefined' && ACCESS_CODE) ? ACCESS_CODE : (localStorage.getItem('spark_access_code') || '');
+        const streamUrl = code ? `/api/logs/stream?access_code=${encodeURIComponent(code)}` : '/api/logs/stream';
+        eventSource = new EventSource(streamUrl);
 
         eventSource.addEventListener('open', () => {
             if (statusDot) statusDot.className = 'log-panel-status-dot connected';
@@ -210,107 +417,32 @@ async function retrySingleFrame(seq) {
         const data = await response.json();
         const taskId = data.task_id;
 
-        const streamResponse = await fetch(`/api/compose-stream?task_id=${taskId}`, {
-            signal: controller.signal
-        });
-
-        if (!streamResponse.ok) {
-            const errText = await streamResponse.text();
-            throw new Error(`HTTP ${streamResponse.status}: ${errText}`);
-        }
-
-        const reader = streamResponse.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buffer = '';
-        let manifestData = null;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop();
-
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed) continue;
-
-                if (trimmed.startsWith('data: ')) {
-                    const jsonStr = trimmed.substring(6);
-                    try {
-                        const parsed = JSON.parse(jsonStr);
-                        if (parsed.type === 'frame') {
-                            const f = parsed.data.frame;
-                            
-                            // Save incrementally
-                            if (currentIdea) {
-                                if (!currentIdea.frameRun) {
-                                    currentIdea.frameRun = { title: currentIdea.title, frames: [] };
-                                }
-                                if (!currentIdea.frameRun.frames) {
-                                    currentIdea.frameRun.frames = [];
-                                }
-                                const idx = currentIdea.frameRun.frames.findIndex(item => item.sequence === f.sequence);
-                                if (idx !== -1) {
-                                    currentIdea.frameRun.frames[idx] = f;
-                                } else {
-                                    currentIdea.frameRun.frames.push(f);
-                                    currentIdea.frameRun.frames.sort((a, b) => a.sequence - b.sequence);
-                                }
-                                saveCurrentIdeaState();
-                                const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
-                                if (existingIdx !== -1) {
-                                    savedIdeas[existingIdx].frameRun = currentIdea.frameRun;
-                                    saveLibrary();
-                                }
-                                // Update UI immediately so the user doesn't have to wait for the entire stream to finish
-                                renderFramesForIdea(currentIdea);
-                            }
-                        } else if (parsed.type === 'result') {
-                            manifestData = parsed.data;
-                        } else if (parsed.type === 'error') {
-                            throw new Error(parsed.data.message || '未知错误');
-                        }
-                    } catch (err) {
-                        console.error("Error parsing frame SSE data", err);
-                        if (err.message) throw err;
-                    }
+        const watch = await watchTaskUntilTerminal(taskId, {
+            label: `retry-frame-${seq}`,
+            signal: controller.signal,
+            onEvent: (type, evData) => {
+                if (type === 'frame') {
+                    applyFrameEventToIdea(evData && evData.frame);
+                    if (currentIdea) renderFramesForIdea(currentIdea);
+                } else if (type === 'reconnecting') {
+                    meta.textContent = `连接中断，正在重连（第 ${evData.attempt} 次）...`;
                 }
             }
-        }
+        });
 
-        if (manifestData) {
-            currentIdea.frameRun = manifestData;
-            saveCurrentIdeaState();
-            const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
-            if (existingIdx !== -1) {
-                savedIdeas[existingIdx].frameRun = manifestData;
-                await saveLibrary();
-            }
+        if (watch.status === 'failed') throw new Error(watch.error || '未知错误');
+
+        if (watch.result) {
+            await syncFrameRunToLibrary(watch.result);
             renderFramesForIdea(currentIdea);
             showToast(`第 ${seq} 帧重试生成成功。`, "success");
         }
     } catch (e) {
         console.error(`Failed to retry frame ${seq}:`, e);
         showToast(`第 ${seq} 帧重试失败: ${e.message}`, "error");
-        
+
         // Restore state by reloading manifest or rendering whatever is local
-        try {
-            const resp = await fetch(`/api/get_manifest?title=${encodeURIComponent(currentIdea.title)}`);
-            if (resp.ok) {
-                const manifest = await resp.json();
-                currentIdea.frameRun = manifest;
-                saveCurrentIdeaState();
-                const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
-                if (existingIdx !== -1) {
-                    savedIdeas[existingIdx].frameRun = manifest;
-                    await saveLibrary();
-                }
-            }
-        } catch (err) {
-            console.error("Failed to load partial manifest after failure:", err);
-        }
+        await reloadManifestIntoIdea();
         renderFramesForIdea(currentIdea);
     } finally {
         progress.style.display = 'none';
@@ -367,96 +499,30 @@ async function retrySingleVideo(slot) {
         const data = await response.json();
         const taskId = data.task_id;
 
-        const streamResponse = await fetch(`/api/compose-stream?task_id=${taskId}`, {
-            signal: controller.signal
-        });
-
-        if (!streamResponse.ok) {
-            const errText = await streamResponse.text();
-            throw new Error(`HTTP ${streamResponse.status}: ${errText}`);
-        }
-
-        const reader = streamResponse.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buffer = '';
-        let manifestData = null;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop();
-
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed) continue;
-
-                if (trimmed.startsWith('data: ')) {
-                    const jsonStr = trimmed.substring(6);
-                    try {
-                        const parsed = JSON.parse(jsonStr);
-                        if (parsed.type === 'video_start') {
-                            const idx = parsed.data.index;
-                            meta.textContent = `正在生成视频: 正在处理第 ${idx} 段视频...`;
-                        } else if (parsed.type === 'video_done') {
-                            const v = parsed.data.video;
-                            const idx = parsed.data.index;
-                            
-                            const slotEl = document.getElementById(`video-slot-${idx}`);
-                            if (slotEl) {
-                                slotEl.className = 'frame-card';
-                                slotEl.style.cursor = 'default';
-                                slotEl.innerHTML = `
-                                    <video src="${v.url}" controls style="width:100%; aspect-ratio: 9/16; object-fit: cover; border-radius: 5px; display: block; background: #03050c;"></video>
-                                    <span>VID ${String(v.slot).padStart(3, '0')}</span>
-                                `;
-                            }
-                        } else if (parsed.type === 'video_error') {
-                            const idx = parsed.data.index;
-                            const msg = parsed.data.message || '生成失败';
-                            const slotEl = document.getElementById(`video-slot-${idx}`);
-                            if (slotEl) {
-                                slotEl.className = 'frame-card video-failed-card';
-                                slotEl.innerHTML = `
-                                    <div class="video-failed-placeholder">
-                                        <span class="error-icon">⚠️</span>
-                                        <span class="error-text" title="${msg}">生成失败</span>
-                                        <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${idx}">重试</button>
-                                    </div>
-                                    <span>VID ${String(idx).padStart(3, '0')}</span>
-                                `;
-                                slotEl.querySelector('.retry-video-btn').addEventListener('click', (e) => {
-                                    e.stopPropagation();
-                                    retrySingleVideo(idx);
-                                });
-                            }
-                        } else if (parsed.type === 'queue') {
-                            meta.textContent = parsed.data.message || '正在排队等待生成视频...';
-                        } else if (parsed.type === 'merge_skip') {
-                            meta.textContent = parsed.data.message || '由于存在失败片段，已跳过自动合并。';
-                        } else if (parsed.type === 'result') {
-                            manifestData = parsed.data;
-                        } else if (parsed.type === 'error') {
-                            throw new Error(parsed.data.message || '未知错误');
-                        }
-                    } catch (err) {
-                        console.error("Error parsing videos SSE data", err);
-                        if (err.message) throw err;
-                    }
+        const watch = await watchTaskUntilTerminal(taskId, {
+            label: `retry-video-${slot}`,
+            signal: controller.signal,
+            onEvent: (type, evData) => {
+                if (type === 'video_start') {
+                    meta.textContent = `正在生成视频: 正在处理第 ${evData.index} 段视频...`;
+                } else if (type === 'video_done') {
+                    renderVideoSlotDone(evData.index, evData.video);
+                } else if (type === 'video_error') {
+                    renderVideoSlotFailed(evData.index, evData.message || '生成失败');
+                } else if (type === 'queue') {
+                    meta.textContent = (evData && evData.message) || '正在排队等待生成视频...';
+                } else if (type === 'merge_skip') {
+                    meta.textContent = (evData && evData.message) || '由于存在失败片段，已跳过自动合并。';
+                } else if (type === 'reconnecting') {
+                    meta.textContent = `连接中断，正在重连（第 ${evData.attempt} 次）...`;
                 }
             }
-        }
+        });
 
-        if (manifestData) {
-            currentIdea.frameRun = manifestData;
-            saveCurrentIdeaState();
-            const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
-            if (existingIdx !== -1) {
-                savedIdeas[existingIdx].frameRun = manifestData;
-                await saveLibrary();
-            }
+        if (watch.status === 'failed') throw new Error(watch.error || '未知错误');
+
+        if (watch.result) {
+            await syncFrameRunToLibrary(watch.result);
             renderVideosForIdea(currentIdea);
             showToast(`视频第 ${slot} 段重试成功。`, "success");
         }
@@ -464,23 +530,7 @@ async function retrySingleVideo(slot) {
         console.error("Failed to retry video:", e);
         meta.textContent = `视频第 ${slot} 段重试失败: ${e.message}`;
         showToast(`视频第 ${slot} 段重试失败: ${e.message}`, "error");
-        
-        const slotEl = document.getElementById(`video-slot-${slot}`);
-        if (slotEl) {
-            slotEl.className = 'frame-card video-failed-card';
-            slotEl.innerHTML = `
-                <div class="video-failed-placeholder">
-                    <span class="error-icon">⚠️</span>
-                    <span class="error-text">生成失败</span>
-                    <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${slot}">重试</button>
-                </div>
-                <span>VID ${String(slot).padStart(3, '0')}</span>
-            `;
-            slotEl.querySelector('.retry-video-btn').addEventListener('click', (e) => {
-                e.stopPropagation();
-                retrySingleVideo(slot);
-            });
-        }
+        renderVideoSlotFailed(slot, e.message || '生成失败');
     } finally {
         progress.style.display = 'none';
         activeBackgroundTasks.videos = false;

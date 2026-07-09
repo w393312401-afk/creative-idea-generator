@@ -12,15 +12,13 @@ from server_common import (
     SERVER_CONFIG, resolve_gateway, effective_config,
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
     ACTIVE_TASKS_LOCK, ACTIVE_TASKS, get_or_create_task,
-    notify_listeners, save_tasks_to_disk
+    notify_listeners, save_tasks_to_disk, ensure_adspower_on_path,
+    read_manifest, write_manifest
 )
 
 
 def _get_google_fx_video_service():
-    import sys
-    adspower_path = SERVER_CONFIG.get('adspowerPath') or 'C:\\Users\\video\\Desktop\\N8N-main\\Adspower\\AI\\core'
-    if adspower_path not in sys.path:
-        sys.path.append(adspower_path)
+    ensure_adspower_on_path()
     import services.google_fx
     from services import google_fx_video
     import models
@@ -244,8 +242,8 @@ class _ManifestWriter:
             by_slot[v['slot']] = v
         self.data['videos'] = [by_slot[s] for s in self.all_slots if s in by_slot]
         try:
-            with open(self.path, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
+            # 项目级锁 + 原子替换（write_manifest 内部处理 Windows 句柄占用重试）
+            write_manifest(os.path.dirname(self.path), self.data)
         except Exception as e:
             print(f"Warning: could not write updated manifest.json ({e})")
 
@@ -744,7 +742,7 @@ def video_reverse_worker(task_id, temp_video_path, temp_dir_obj, fps, api, promp
             "|---|---|---|---|"
         ]
         for g in audit_results["gates"]:
-            status_emoji = "✅ PASS" if g["status"] == "PASS" else "❌ FAIL"
+            status_emoji = "✅ PASS" if g["status"] == "PASS" else ("⏭️ NOT CHECKED" if g["status"] == "SKIP" else "❌ FAIL")
             details_str = "<br>".join(g["details"])
             report_lines.append(f"| {g['name']} | {g.get('tier', 'P0')} | {status_emoji} | {details_str} |")
             

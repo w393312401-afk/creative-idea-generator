@@ -168,20 +168,45 @@ function customConfirm(message) {
 
 function showToast(message, type = 'success') {
     const container = document.getElementById('toast-container');
+    if (!container) return;
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
-    
-    // Add icon
-    const icon = type === 'success' ? '✓' : '✗';
-    toast.innerHTML = `<span class="toast-icon">${icon}</span> <span class="toast-message">${message}</span>`;
-    
+
+    const icons = { success: '✓', error: '✗', warning: '⚠', info: 'ℹ' };
+    const iconEl = document.createElement('span');
+    iconEl.className = 'toast-icon';
+    iconEl.textContent = icons[type] || icons.info;
+    const msgEl = document.createElement('span');
+    msgEl.className = 'toast-message';
+    // textContent: messages often embed server/LLM error strings — never inject as HTML
+    msgEl.textContent = message;
+    toast.append(iconEl, ' ', msgEl);
+
     container.appendChild(toast);
-    
+
     // Use CSS class for exit (avoids JS writing style.opacity/transform → forced layout)
     setTimeout(() => {
         toast.classList.add('hiding');
         setTimeout(() => toast.remove(), 200);
     }, 3000);
+}
+
+/**
+ * Drives one of the page's progress-bar triplets:
+ *   #<prefix>-progress-label / #<prefix>-progress-percent / #<prefix>-progress-fill
+ * (prefix: 'generation' | 'frames' | 'videos').
+ * Null-safe by design: a missing DOM node or malformed info must never be able
+ * to crash a stream-consumer loop.
+ */
+function setProgressBar(prefix, info) {
+    if (!prefix) return;
+    const label = document.getElementById(`${prefix}-progress-label`);
+    const percentEl = document.getElementById(`${prefix}-progress-percent`);
+    const fill = document.getElementById(`${prefix}-progress-fill`);
+    const pct = Math.max(0, Math.min(100, Number(info && info.percent) || 0));
+    if (label && info && info.label) label.textContent = info.label;
+    if (percentEl) percentEl.textContent = `${Math.round(pct)}%`;
+    if (fill) fill.style.width = `${pct}%`;
 }
 
 function mapEnglishCarrierToValue(carrier) {

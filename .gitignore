@@ -27,4 +27,7 @@ process_brief_cache.json
 *.log
 .claude/
 .gemini/
+.pytest_cache/
+__pycache__/
+*.json.tmp
 

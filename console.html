@@ -290,7 +290,7 @@
             <div class="market-action-bar">
               <div class="search-box-container">
                 <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="search-icon">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="m21-21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
+                  <path stroke-linecap="round" stroke-linejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
                 </svg>
                 <input type="text" id="search-model-input" placeholder="模糊搜索模型名称..." class="market-search-input" />
               </div>
@@ -302,25 +302,8 @@
                 <span>筛选</span>
               </button>
               
-              <div class="market-action-controls">
-                <div class="multiplier-control">
-                  <span>倍率</span>
-                  <label class="switch-toggle">
-                    <input type="checkbox" checked />
-                    <span class="slider-round"></span>
-                  </label>
-                </div>
-                <button class="btn-view-toggle active" title="网格视图">
-                  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:16px;height:16px;">
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V-2.25Z" />
-                  </svg>
-                </button>
-                <button class="btn-view-toggle" title="表格视图">
-                  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:16px;height:16px;">
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 6.75h12M8.25 12h12M8.25 17.25h12M3.75 6.75h.007v.008H3.75V6.75Zm.007 8.25h-.008v-.008h.008v.008Zm0 2.25h-.008v-.008h.008v.008Z" />
-                  </svg>
-                </button>
-              </div>
+              <!-- 「倍率」开关与网格/表格视图切换按钮已移除：从未接线（零 JS 引用），
+                   点击无任何反应，纯误导用户 -->
             </div>
 
             <!-- Model Grid -->
@@ -368,7 +351,7 @@
               <div class="result-title">生成的完整模型 ID</div>
               <div class="result-id" id="generated-model-id">gemini-3.1-flash-image-9-16-2k</div>
               <div class="result-info">
-                生成尺寸：<span id="generated-model-pixels" style="color: #fff; font-weight: 500;">1536 × 2752</span> 像素 (基于所选宽高比及清晰度标准)
+                生成尺寸：<span id="generated-model-pixels" style="color: var(--text-main); font-weight: 500;">1536 × 2752</span> 像素 (基于所选宽高比及清晰度标准)
               </div>
               <button class="btn btn-primary" id="btn-copy-model-id">
                 复制完整模型 ID
@@ -417,7 +400,7 @@
             <!-- DOCS PANEL 1: POST-CHAT -->
             <div class="doc-panel" id="doc-post-chat">
               <div class="endpoint-header">
-                <h2 style="font-size: 20px; font-weight: 600; color: #fff;">对话与多模态 Chat Completions</h2>
+                <h2 style="font-size: 20px; font-weight: 600; color: var(--text-main);">对话与多模态 Chat Completions</h2>
                 <p style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">遵循标准 OpenAI 协议，支持纯文本输入以及包含 Base64 图像的多模态输入。</p>
                 <div class="endpoint-url-box">
                   <span class="method-tag method-post" style="padding: 6px 10px; font-size: 11px;">POST</span>
@@ -446,7 +429,7 @@
             <!-- DOCS PANEL 2: POST-IMAGE-GEN -->
             <div class="doc-panel" id="doc-post-image-gen" style="display:none;">
               <div class="endpoint-header">
-                <h2 style="font-size: 20px; font-weight: 600; color: #fff;">标准文本生成图像 Generations</h2>
+                <h2 style="font-size: 20px; font-weight: 600; color: var(--text-main);">标准文本生成图像 Generations</h2>
                 <p style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">根据提示词直接生成全新图像。网关层会自动将其重定向并优化至 Imagen 3 模型渲染。</p>
                 <div class="endpoint-url-box">
                   <span class="method-tag method-post" style="padding: 6px 10px; font-size: 11px;">POST</span>
@@ -474,7 +457,7 @@
             <!-- DOCS PANEL 3: POST-IDEATE -->
             <div class="doc-panel" id="doc-post-ideate" style="display:none;">
               <div class="endpoint-header">
-                <h2 style="font-size: 20px; font-weight: 600; color: #fff;">空间改造创意策划 Ideate</h2>
+                <h2 style="font-size: 20px; font-weight: 600; color: var(--text-main);">空间改造创意策划 Ideate</h2>
                 <p style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">由后台语言模型基于历史成功的改造维度记录，生成数个全新的设计方案脑洞。</p>
                 <div class="endpoint-url-box">
                   <span class="method-tag method-post" style="padding: 6px 10px; font-size: 11px;">POST</span>
@@ -502,7 +485,7 @@
             <!-- DOCS PANEL 4: POST-COMPOSE -->
             <div class="doc-panel" id="doc-post-compose" style="display:none;">
               <div class="endpoint-header">
-                <h2 style="font-size: 20px; font-weight: 600; color: #fff;">时空重建指令合成 Compose</h2>
+                <h2 style="font-size: 20px; font-weight: 600; color: var(--text-main);">时空重建指令合成 Compose</h2>
                 <p style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">传入主题、核心锚点、清晰度等设计维度，启动后台线程批量合成全段时光重绘指令（SCUP 算法）。</p>
                 <div class="endpoint-url-box">
                   <span class="method-tag method-post" style="padding: 6px 10px; font-size: 11px;">POST</span>
@@ -530,7 +513,7 @@
             <!-- DOCS PANEL 5: POST-IMAGE-EDIT -->
             <div class="doc-panel" id="doc-post-image-edit" style="display:none;">
               <div class="endpoint-header">
-                <h2 style="font-size: 20px; font-weight: 600; color: #fff;">多参考图局部编辑与重绘 Edits</h2>
+                <h2 style="font-size: 20px; font-weight: 600; color: var(--text-main);">多参考图局部编辑与重绘 Edits</h2>
                 <p style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">上传一张或多张参考图片并提供重绘指令，在保持原始空间透视关系、构图比例不变的前提下，对画面进行精准的高物理一致性局部修改。</p>
                 <div class="endpoint-url-box">
                   <span class="method-tag method-post" style="padding: 6px 10px; font-size: 11px;">POST</span>
@@ -558,7 +541,7 @@
             <!-- DOCS PANEL 6: POST-REVERSE-VIDEO -->
             <div class="doc-panel" id="doc-post-reverse-video" style="display:none;">
               <div class="endpoint-header">
-                <h2 style="font-size: 20px; font-weight: 600; color: #fff;">视频关键帧时序语义解析 Reverse Video</h2>
+                <h2 style="font-size: 20px; font-weight: 600; color: var(--text-main);">视频关键帧时序语义解析 Reverse Video</h2>
                 <p style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">上传一段现有视频，系统自动使用高频 CV 算法提取运动与光影，结合多模态大模型反向推导重建时光机所需的 SCUP 提示词序列。</p>
                 <div class="endpoint-url-box">
                   <span class="method-tag method-post" style="padding: 6px 10px; font-size: 11px;">POST</span>
@@ -592,7 +575,7 @@
           <!-- Request inputs -->
           <div class="playground-inputs">
             <div class="glass-card" style="padding: 20px;">
-              <h3 style="font-size: 15px; font-weight:600; color:#fff; margin-bottom:16px;">构造请求参数</h3>
+              <h3 style="font-size: 15px; font-weight:600; color: var(--text-main); margin-bottom:16px;">构造请求参数</h3>
               
               <div class="control-group">
                 <label for="play-endpoint">选择 API 接口 (Endpoint)</label>
@@ -613,7 +596,7 @@
 
               <!-- Premium Visual Image Reference Zone -->
               <div class="control-group" id="play-files-group" style="display: none;">
-                <label class="form-label" style="font-weight: 500; color: #fff; margin-bottom: 8px; display: block;">图片参考 (Image References)</label>
+                <label class="form-label" style="font-weight: 500; color: var(--text-main); margin-bottom: 8px; display: block;">图片参考 (Image References)</label>
                 <div class="image-uploader-zone" id="image-upload-zone">
                   <div class="uploader-prompt">
                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="uploader-icon">
@@ -641,7 +624,7 @@
           <!-- Console log output -->
           <div class="playground-console">
             <div class="console-header">
-              <span style="font-size:14px; font-weight:500; color:#fff;">API 响应控制台 (API Console Output)</span>
+              <span style="font-size:14px; font-weight:500; color: var(--text-main);">API 响应控制台 (API Console Output)</span>
               <button class="btn btn-sm" id="btn-clear-console">清空日志</button>
             </div>
             <div class="console-body" id="play-console-log">
@@ -682,6 +665,8 @@
       <button class="lightbox-nav lightbox-next" id="next-lightbox-btn" title="下一张 (Right Arrow)">▶</button>
   </div>
 
+  <!-- 共享工具（escapeHtml/copyText 等）必须先于 console.js 加载 -->
+  <script src="js/utils.js?v=1.1.1"></script>
   <script src="console.js"></script>
 </body>
 </html>
