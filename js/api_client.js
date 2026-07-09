@@ -538,3 +538,94 @@ async function retrySingleVideo(slot) {
     }
 }
 
+// 批量重试缺失/串片的视频槽位（供「合并被拦截」时一键重试用）。
+// 重试完成后自动再走一次合并，若仍有缺口会再次弹出可操作选项。
+async function retryMissingVideos(slots) {
+    if (!currentIdea || !currentIdea.prompt_block) {
+        showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+    slots = (slots || []).map(Number).filter(s => Number.isFinite(s));
+    if (!slots.length) return;
+
+    const progress = document.getElementById('videos-progress');
+    const meta = document.getElementById('videos-meta');
+    if (!progress || !meta) return;
+
+    slots.forEach(slot => {
+        const slotCard = document.getElementById(`video-slot-${slot}`);
+        if (slotCard) {
+            slotCard.className = 'frame-card placeholder-frame-card';
+            slotCard.innerHTML = `
+                <div class="frame-placeholder-spinner">
+                    <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
+                </div>
+                <span>第 ${String(slot).padStart(3, '0')} 段视频 (重试中...)</span>
+            `;
+        }
+    });
+
+    progress.style.display = 'flex';
+    meta.textContent = `正在重试缺失的 ${slots.length} 段视频（槽位 ${slots.join(', ')}）...`;
+    activeBackgroundTasks.videos = true;
+    updateTabStatusDot();
+
+    const controller = new AbortController();
+    try {
+        const response = await fetch('/api/generate_videos', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                config,
+                title: currentIdea.title,
+                prompt_block: currentIdea.prompt_block,
+                target_slots: slots
+            }),
+            signal: controller.signal
+        });
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errText}`);
+        }
+        const data = await response.json();
+        const taskId = data.task_id;
+
+        const watch = await watchTaskUntilTerminal(taskId, {
+            label: `retry-missing-videos`,
+            signal: controller.signal,
+            onEvent: (type, evData) => {
+                if (type === 'video_start') {
+                    meta.textContent = `正在生成视频: 正在处理第 ${evData.index} 段视频...`;
+                } else if (type === 'video_done') {
+                    renderVideoSlotDone(evData.index, evData.video);
+                } else if (type === 'video_error') {
+                    renderVideoSlotFailed(evData.index, evData.message || '生成失败');
+                } else if (type === 'queue') {
+                    meta.textContent = (evData && evData.message) || '正在排队等待生成视频...';
+                } else if (type === 'reconnecting') {
+                    meta.textContent = `连接中断，正在重连（第 ${evData.attempt} 次）...`;
+                }
+            }
+        });
+
+        if (watch.status === 'failed') throw new Error(watch.error || '未知错误');
+        if (watch.result) {
+            await syncFrameRunToLibrary(watch.result);
+            renderVideosForIdea(currentIdea);
+        }
+        showToast("缺失片段重试完成，正在尝试重新合并...", "success");
+        // 自动再合并一次；若仍有缺口，mergeVideos 会再次给出重试/强制选项
+        if (typeof mergeVideos === 'function') {
+            await mergeVideos();
+        }
+    } catch (e) {
+        console.error("Failed to retry missing videos:", e);
+        meta.textContent = `重试缺失片段失败: ${e.message}`;
+        showToast(`重试缺失片段失败: ${e.message}`, "error");
+    } finally {
+        progress.style.display = 'none';
+        activeBackgroundTasks.videos = false;
+        updateTabStatusDot();
+    }
+}
+

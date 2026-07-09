@@ -1653,8 +1653,18 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'error': f'找不到项目目录: {title}'}, status=404)
                     return
                 
-                # Run the merge
-                merged_info = merge_project_videos(project_dir)
+                # Run the merge. force/allow_partial=True 时用占位帧填充缺口（强制合并）。
+                force = bool(body.get('force') or body.get('allow_partial'))
+                try:
+                    merged_info = merge_project_videos(project_dir, allow_partial=force)
+                except PartialMergeBlocked as blocked:
+                    self._send_json({
+                        'status': 'blocked',
+                        'missing': blocked.missing,
+                        'mismatched': blocked.mismatched,
+                        'message': str(blocked),
+                    }, status=409)
+                    return
                 if not merged_info:
                     self._send_json({'error': '合并失败：未找到任何成功的视频片段'}, status=400)
                     return

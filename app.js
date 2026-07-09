@@ -83,7 +83,6 @@ let activeInputTab = 'text';
 let selectedVideoFile = null;
 
 let customPresets = {};
-let currentSlotFilter = 'all';
 let activeBackgroundTasks = {
     cover: false,
     frames: false,
@@ -138,7 +137,6 @@ document.addEventListener('DOMContentLoaded', () => {
     initCanvas();
     checkApiStatus();
     setupEventListeners();
-    setupPromptControls();
     setupDragAndDrop();
     setupVideoUploadDragAndDrop();
     resumeActiveTaskIfExists();
@@ -2947,7 +2945,7 @@ async function generateVideos() {
     }
 }
 
-async function mergeVideos() {
+async function mergeVideos(force = false) {
     if (!currentIdea || !currentIdea.title) {
         showToast("请先激发一个创意点子并生成视频！", "error");
         return;
@@ -2961,34 +2959,41 @@ async function mergeVideos() {
     mergeBtn.disabled = true;
     mergeBtn.innerHTML = `
         <div class="cover-spinner" style="width:14px; height:14px; border-width:2px; margin-bottom:0; display:inline-block; vertical-align:middle; margin-right:6px;"></div>
-        <span>正在合并中...</span>
+        <span>${force ? '正在占位合并中...' : '正在合并中...'}</span>
     `;
-    videosMeta.textContent = "正在调用 FFmpeg 合并并加速视频，此过程可能需要几秒钟，请稍候...";
+    videosMeta.textContent = force
+        ? "正在用占位帧填充缺口并合并预览片，请稍候..."
+        : "正在调用 FFmpeg 合并并加速视频，此过程可能需要几秒钟，请稍候...";
 
     try {
         const response = await fetch('/api/merge_videos', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                title: getIdeaSaveTitle(currentIdea)
+                title: getIdeaSaveTitle(currentIdea),
+                force: !!force
             })
         });
 
-        if (!response.ok) {
-            const errText = await response.text();
-            let parsedErr;
-            try { parsedErr = JSON.parse(errText); } catch(e) {}
-            throw new Error((parsedErr && (parsedErr.message || parsedErr.error)) || `HTTP ${response.status}: ${errText}`);
+        const data = await response.json().catch(() => ({}));
+
+        // 合成门禁拦截：缺失/串片片段 → 给出「重试」「强制合并」两条出路
+        if (response.status === 409 && data.status === 'blocked') {
+            renderMergeBlocked(data);
+            return;
         }
 
-        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.message || data.error || `HTTP ${response.status}`);
+        }
+
         if (data.status === 'ok') {
             if (!currentIdea.frameRun) {
                 currentIdea.frameRun = {};
             }
             currentIdea.frameRun.merged_video = data.merged_video;
             saveCurrentIdeaState();
-            
+
             const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
             if (existingIdx !== -1) {
                 savedIdeas[existingIdx].frameRun = currentIdea.frameRun;
@@ -2996,8 +3001,16 @@ async function mergeVideos() {
             }
 
             renderVideosForIdea(currentIdea);
-            showToast("视频合并并加速成功！", "success");
-            videosMeta.textContent = "视频合并已完成！";
+
+            const mv = data.merged_video || {};
+            if (mv.partial) {
+                const slots = (mv.placeholder_slots || []).join(', ');
+                showToast("已生成占位预览片（缺口用起始帧填充）", "success");
+                videosMeta.innerHTML = `⚠️ 占位预览已生成：槽位 <b>${escapeHtml(slots)}</b> 为「缺失/串片」占位帧，成片仅供预览（无音轨）。建议重试这些片段后重新合并以获得完整成片。`;
+            } else {
+                showToast("视频合并并加速成功！", "success");
+                videosMeta.textContent = "视频合并已完成！";
+            }
         } else {
             throw new Error(data.message || '合并失败');
         }
@@ -3009,6 +3022,45 @@ async function mergeVideos() {
         mergeBtn.disabled = false;
         mergeBtn.innerHTML = originalText;
     }
+}
+
+// 合成被门禁拦截时，在 videos-meta 区域渲染可操作面板：
+//   ① 重试缺失/串片片段并自动重合   ② 强制合并（占位帧填充预览）
+function renderMergeBlocked(data) {
+    const videosMeta = document.getElementById('videos-meta');
+    if (!videosMeta) return;
+
+    const missing = (data.missing || []).map(Number).filter(Number.isFinite);
+    const mismatched = (data.mismatched || []).map(Number).filter(Number.isFinite);
+    const all = [...new Set([...missing, ...mismatched])].sort((a, b) => a - b);
+
+    const parts = [];
+    if (missing.length) parts.push(`缺失/失败：槽位 <b>${escapeHtml(missing.join(', '))}</b>`);
+    if (mismatched.length) parts.push(`疑似串片：槽位 <b>${escapeHtml(mismatched.join(', '))}</b>`);
+
+    videosMeta.innerHTML = `
+        <div class="merge-blocked" style="text-align:left; line-height:1.7;">
+            <div style="color:#f6c453; margin-bottom:8px;">⚠️ 已拦截合并（避免成片硬跳/串片）：${parts.join('；')}。</div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <button type="button" class="action-btn text-btn" id="merge-retry-missing-btn">🔁 重试这些片段并合并 (${all.length})</button>
+                <button type="button" class="action-btn text-btn" id="merge-force-btn">⛰️ 强制合并（占位预览）</button>
+            </div>
+        </div>`;
+
+    const retryBtn = document.getElementById('merge-retry-missing-btn');
+    if (retryBtn) retryBtn.addEventListener('click', () => {
+        if (typeof retryMissingVideos === 'function') {
+            retryMissingVideos(all);
+        } else {
+            showToast('重试功能不可用', 'error');
+        }
+    });
+
+    const forceBtn = document.getElementById('merge-force-btn');
+    if (forceBtn) forceBtn.addEventListener('click', async () => {
+        const ok = await customConfirm('强制合并会把缺失/串片的片段用「起始帧定格 + 缺失标注」填充，生成的成片仅供预览（无音轨），缺口不会被静默丢弃。确定继续吗？');
+        if (ok) mergeVideos(true);
+    });
 }
 
 
@@ -3144,100 +3196,8 @@ async function deleteCustomPreset(name, event) {
 // =====================================================================
 // Function randomizeDimensions moved to modular JS file
 
-// =====================================================================
-// Prompt Slots Filtering & Bulk Operations
-// =====================================================================
-function setupPromptControls() {
-    // Filter buttons
-    const filterBtns = document.querySelectorAll('.slot-filter-btn');
-    filterBtns.forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            filterBtns.forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            currentSlotFilter = btn.dataset.filter;
-            applySlotFilter();
-        });
-    });
-    
-    // Expand / Collapse all
-    document.getElementById('expand-all-btn').addEventListener('click', () => {
-        document.querySelectorAll('.prompt-slot-card').forEach(card => {
-            const body = card.querySelector('.prompt-slot-body');
-            const foldBtn = card.querySelector('.slot-actions button:last-child');
-            if (body && foldBtn) {
-                body.style.display = 'block';
-                foldBtn.innerHTML = '收起';
-            }
-        });
-    });
-    
-    document.getElementById('collapse-all-btn').addEventListener('click', () => {
-        document.querySelectorAll('.prompt-slot-card').forEach(card => {
-            const body = card.querySelector('.prompt-slot-body');
-            const foldBtn = card.querySelector('.slot-actions button:last-child');
-            if (body && foldBtn) {
-                body.style.display = 'none';
-                foldBtn.innerHTML = '展开';
-            }
-        });
-    });
-    
-    // Copy all images / Copy all videos separately
-    document.getElementById('copy-images-btn').addEventListener('click', (e) => {
-        copySlotsByType('image', e.currentTarget);
-    });
-    
-    document.getElementById('copy-videos-btn').addEventListener('click', (e) => {
-        copySlotsByType('video', e.currentTarget);
-    });
-}
-
-function applySlotFilter() {
-    const cards = document.querySelectorAll('.prompt-slot-card');
-    cards.forEach(card => {
-        if (currentSlotFilter === 'all') {
-            card.style.display = 'block';
-        } else if (currentSlotFilter === 'image' && card.classList.contains('image-slot')) {
-            card.style.display = 'block';
-        } else if (currentSlotFilter === 'video' && card.classList.contains('video-slot')) {
-            card.style.display = 'block';
-        } else {
-            card.style.display = 'none';
-        }
-    });
-}
-
-function copySlotsByType(type, btnEl) {
-    const cards = Array.from(document.querySelectorAll(`.prompt-slot-card.${type}-slot`));
-    if (cards.length === 0) {
-        showToast(`当前无${type === 'image' ? '图片' : '视频'}提示词可复制`, 'error');
-        return;
-    }
-    
-    const promptsText = cards.map(card => {
-        const label = card.querySelector('.slot-label').textContent.trim();
-        const body = card.querySelector('.prompt-slot-body').textContent.trim();
-        return `${label}:\n${body}`;
-    }).join('\n\n');
-    
-    copyText(promptsText).then(() => {
-        showToast(`成功复制所有${type === 'image' ? '图片' : '视频'}提示词！`, "success");
-        
-        // Visual feedback on button
-        if (btnEl) {
-            const originalText = btnEl.textContent;
-            btnEl.textContent = "已复制！✓";
-            btnEl.classList.add('copied');
-            setTimeout(() => {
-                btnEl.textContent = originalText;
-                btnEl.classList.remove('copied');
-            }, 1000);
-        }
-    }).catch(err => {
-        showToast("复制失败", "error");
-        console.error(err);
-    });
-}
+// 提示词槽位卡片相关的 setupPromptControls / applySlotFilter / copySlotsByType 已移除：
+// 提示词页现在只展示原始 Markdown 块，不再解析成槽位卡片（parsePromptBlock 仍保留供帧序列使用）。
 
 // =====================================================================
 // Drag & Drop and Hotkeys Setup

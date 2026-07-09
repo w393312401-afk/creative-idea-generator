@@ -60,10 +60,10 @@ function renderIdea(result) {
     renderRepairBanner(result.repair_md);
     document.getElementById('idea-prompt-block').textContent = result.prompt_block || '（本次未返回提示词内容）';
     document.getElementById('idea-audit').innerHTML = renderAuditMarkdown(result.audit_md);
-    
-    // Parse slots and render them
-    renderParsedPrompts(result.prompt_block);
-    
+
+    // 提示词槽位卡片已移除：本页仅展示原始 Markdown 提示词块（#idea-prompt-block，见上）。
+    // 注意 parsePromptBlock 仍被帧序列渲染用于推算图片槽位，切勿删除其定义。
+
     // Collapsible Audit panel logic: default fold, auto expand & highlight on repair
     const auditDetails = document.getElementById('audit-details');
     const hasRepairs = result.repair_md && result.repair_md.trim() && 

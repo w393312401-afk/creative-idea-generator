@@ -433,6 +433,92 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     return manifest_data
 
 
+class PartialMergeBlocked(RuntimeError):
+    """合成门禁拦截：项目存在缺失/失败片段或串片片段。携带槽位清单供前端决策。"""
+    def __init__(self, missing, mismatched, message=None):
+        self.missing = list(missing or [])
+        self.mismatched = list(mismatched or [])
+        super().__init__(message or self._default_message())
+
+    def _default_message(self):
+        parts = []
+        if self.missing:
+            parts.append(f"缺失/失败片段（槽位 {', '.join(map(str, self.missing))}）")
+        if self.mismatched:
+            parts.append(f"内容与锚点不符、疑似串片（槽位 {', '.join(map(str, self.mismatched))}）")
+        return "存在" + "；".join(parts) + "，已拒绝合并。请重试这些片段，或选择「强制合并（占位填充）」。"
+
+
+def _ffprobe_video_params(path):
+    """探测视频的 width/height/fps/duration；失败返回 None。"""
+    try:
+        cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "stream=width,height,r_frame_rate:format=duration",
+               "-of", "json", path]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding='utf-8', errors='replace', check=True)
+        info = json.loads(res.stdout)
+        st = (info.get('streams') or [{}])[0]
+        rate = st.get('r_frame_rate') or '24/1'
+        num, _, den = rate.partition('/')
+        den = den or '1'
+        fps = (float(num) / float(den)) if float(den) else 24.0
+        return {
+            'width': int(st.get('width') or 0),
+            'height': int(st.get('height') or 0),
+            'fps': round(fps, 3),
+            'duration': float((info.get('format') or {}).get('duration') or 0) or 0.0,
+        }
+    except Exception as e:
+        print(f"[WARN] _ffprobe_video_params failed for {path}: {e}")
+        return None
+
+
+def _find_label_font():
+    """定位一个可用于 drawtext 的字体（尽量支持中文），找不到返回 None。"""
+    candidates = [
+        r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\msyh.ttf",
+        r"C:\Windows\Fonts\simhei.ttf", r"C:\Windows\Fonts\arial.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ]
+    for p in candidates:
+        try:
+            if os.path.exists(p):
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def _project_display_name(title):
+    """项目中文名：优先 library.json 主题中的中文，其次标题中文，最后安全化项目名。"""
+    chinese_name = ""
+    library_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'library.json')
+    if os.path.exists(library_path):
+        try:
+            with open(library_path, 'r', encoding='utf-8') as lf:
+                lib_data = json.load(lf)
+            if isinstance(lib_data, list):
+                for item in lib_data:
+                    if item.get('title') == title:
+                        theme_chinese = "".join(re.findall(r'[一-龥]+', item.get('theme', '')))
+                        if theme_chinese:
+                            chinese_name = theme_chinese
+                            break
+        except Exception as le:
+            print(f"Warning: could not read library.json for theme lookup ({le})")
+    if not chinese_name and title:
+        title_chinese = "".join(re.findall(r'[一-龥]+', title))
+        if title_chinese:
+            chinese_name = title_chinese
+    if not chinese_name:
+        chinese_name = _safe_project_name(title)
+    return chinese_name
+
+
 def merge_project_videos(project_dir, allow_partial=False):
     """合并项目内全部视频片段。
 
@@ -458,63 +544,67 @@ def merge_project_videos(project_dir, allow_partial=False):
             abs_path = os.path.abspath(os.path.join(project_dir, 'videos', os.path.basename(rel)))
         return abs_path
 
-    # ── 门禁 1: 槽位完整性 ──
-    if frames and not allow_partial:
+    # ── 槽位分类：good（成功且锚点一致）/ missing（缺失/失败）/ mismatched（串片） ──
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    def _resolve_frame(entry):
+        if not entry or not entry.get('file'):
+            return None
+        p = os.path.join(base_dir, entry['file'].lstrip('/'))
+        if not os.path.exists(p):
+            p = os.path.join(project_dir, 'frames', os.path.basename(entry['file']))
+        return p if os.path.exists(p) else None
+
+    by_slot = {v.get('slot'): v for v in videos}
+    frame_by_slot = {f.get('slot'): f for f in frames}
+    good = {}          # slot -> 绝对路径（可用片段）
+    missing = []       # 缺失/失败/文件不存在
+    mismatched = []    # 首尾帧与锚点不符（疑似串片）
+    expected_slots = []
+
+    if frames:
         expected_slots = list(range(1, len(frames)))
-        by_slot = {v.get('slot'): v for v in videos}
-        missing = []
         for slot in expected_slots:
             v = by_slot.get(slot)
-            if not v or v.get('status') != 'success' or not v.get('file') \
-                    or not os.path.exists(_resolve_abs(v['file'])):
+            if not v or v.get('status') != 'success' or not v.get('file'):
                 missing.append(slot)
-        if missing:
-            raise RuntimeError(
-                f"存在失败或缺失的视频片段（槽位 {', '.join(map(str, missing))}），已拒绝合并。"
-                f"请先重试这些片段，或确认后强制合并。"
-            )
-
-    # Filter and sort by slot index
-    video_files = []
-    slot_of_file = {}
-    # Make sure we only check files that exist
-    for v in sorted(videos, key=lambda x: x.get('slot', 0)):
-        if v.get('status') == 'success' and v.get('file'):
+                continue
             abs_path = _resolve_abs(v['file'])
-            if os.path.exists(abs_path):
-                video_files.append(abs_path)
-                slot_of_file[abs_path] = v.get('slot')
+            if not os.path.exists(abs_path):
+                missing.append(slot)
+                continue
+            start_p = _resolve_frame(frame_by_slot.get(slot))
+            end_p = _resolve_frame(frame_by_slot.get(slot + 1))
+            ok, reason = verify_video_anchors(abs_path, start_p, end_p)
+            if not ok:
+                mismatched.append(slot)
+                continue
+            good[slot] = abs_path
+    else:
+        # 无 frames（历史/兜底）：不做完整性/锚点门禁，直接取所有成功片段
+        for v in sorted(videos, key=lambda x: x.get('slot', 0)):
+            if v.get('status') == 'success' and v.get('file'):
+                abs_path = _resolve_abs(v['file'])
+                if os.path.exists(abs_path):
+                    good[v.get('slot')] = abs_path
+        expected_slots = sorted(good)
 
+    # 默认（allow_partial=False）：有缺口/串片一律拒绝，携带槽位清单抛出供前端决策
+    if not allow_partial and (missing or mismatched):
+        raise PartialMergeBlocked(missing, mismatched)
+
+    # 强制合并且确有缺口：用起始锚点帧定格 + 缺失标注填充，保持时间轴与顺序（绝不静默丢弃）
+    if allow_partial and (missing or mismatched):
+        return _merge_with_placeholders(
+            project_dir, manifest_data, expected_slots, good,
+            missing, mismatched, frame_by_slot,
+        )
+
+    # 无缺口/无串片：走原有干净合并路径
+    video_files = [good[s] for s in sorted(good)]
     if not video_files:
         return None
 
-    # ── 门禁 2: 每段首尾帧与锚点图一致（拦截串片/文生视频混入） ──
-    if frames and not allow_partial:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-
-        def _resolve_frame(entry):
-            if not entry or not entry.get('file'):
-                return None
-            p = os.path.join(base_dir, entry['file'].lstrip('/'))
-            if not os.path.exists(p):
-                p = os.path.join(project_dir, 'frames', os.path.basename(entry['file']))
-            return p if os.path.exists(p) else None
-
-        frame_by_slot = {f.get('slot'): f for f in frames}
-        mismatched = []
-        for vf in video_files:
-            slot = slot_of_file.get(vf)
-            start_p = _resolve_frame(frame_by_slot.get(slot))
-            end_p = _resolve_frame(frame_by_slot.get((slot or 0) + 1))
-            ok, reason = verify_video_anchors(vf, start_p, end_p)
-            if not ok:
-                mismatched.append(f"{slot} (MAD {reason})")
-        if mismatched:
-            raise RuntimeError(
-                f"以下片段内容与锚点帧不符，疑似串片/错误下载：槽位 {'; '.join(mismatched)}。"
-                f"已拒绝合并，请重新生成这些片段。"
-            )
-        
     # Write concat list to project directory
     concat_list_path = os.path.join(project_dir, 'concat_list.txt')
     with open(concat_list_path, 'w', encoding='utf-8') as f:
@@ -651,6 +741,156 @@ def merge_project_videos(project_dir, allow_partial=False):
     else:
         print(f"[ERROR] ffmpeg merge failed with code {res.returncode}: {res.stderr}")
         raise RuntimeError(f"FFmpeg merge failed: {res.stderr}")
+
+
+def _merge_with_placeholders(project_dir, manifest_data, expected_slots, good,
+                             missing, mismatched, frame_by_slot):
+    """强制合并（allow_partial）：缺失/串片槽位用起始锚点帧定格 + 「缺失」标注填充，
+    保持时间轴对齐与顺序，输出带 _partial 后缀的预览成片（视频轨、2x 加速、无音轨）。
+    绝不静默丢弃缺口——这正是当初加合成门禁的原因。"""
+    bad = set(missing) | set(mismatched)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    def _resolve_frame(entry):
+        if not entry or not entry.get('file'):
+            return None
+        p = os.path.join(base_dir, entry['file'].lstrip('/'))
+        if not os.path.exists(p):
+            p = os.path.join(project_dir, 'frames', os.path.basename(entry['file']))
+        return p if os.path.exists(p) else None
+
+    # 目标画面参数：优先探测一段真实视频；无则给竖屏默认值
+    params = None
+    for s in sorted(good):
+        params = _ffprobe_video_params(good[s])
+        if params and params.get('width') and params.get('height'):
+            break
+    width = (params or {}).get('width') or 1080
+    height = (params or {}).get('height') or 1920
+    fps = (params or {}).get('fps') or 24.0
+    seg_dur = (params or {}).get('duration') or 5.0
+    if seg_dur <= 0:
+        seg_dur = 5.0
+
+    norm = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"fps={fps},setsar=1,format=yuv420p")
+
+    # 把字体拷进项目目录并用相对名引用，规避 filtergraph 里 Windows 盘符冒号(C:)的转义问题
+    font = _find_label_font()
+    font_rel = None
+    if font:
+        try:
+            ext = os.path.splitext(font)[1] or '.ttf'
+            shutil.copyfile(font, os.path.join(project_dir, f"_ph_font{ext}"))
+            font_rel = f"_ph_font{ext}"
+        except Exception as _fe:
+            print(f"[WARN] copy label font failed: {_fe}")
+            font_rel = None
+
+    inputs = []
+    filter_parts = []
+    concat_labels = []
+    placeholder_slots = []
+    label_files = []
+    idx = 0
+    for slot in expected_slots:
+        if slot in good:
+            inputs += ["-i", good[slot]]
+            filter_parts.append(f"[{idx}:v]{norm}[v{idx}]")
+        else:
+            placeholder_slots.append(slot)
+            frame_path = _resolve_frame(frame_by_slot.get(slot))
+            if frame_path:
+                inputs += ["-loop", "1", "-t", f"{seg_dur:.3f}", "-i", frame_path]
+                chain = (f"[{idx}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                         f"eq=brightness=-0.30:saturation=0.55,fps={fps},setsar=1,format=yuv420p")
+            else:
+                inputs += ["-f", "lavfi", "-t", f"{seg_dur:.3f}",
+                           "-i", f"color=c=0x1a0f0f:s={width}x{height}:r={fps}"]
+                chain = f"[{idx}:v]setsar=1,format=yuv420p"
+            if font_rel:
+                reason = '串片' if slot in set(mismatched) else '缺失'
+                label_rel = f"_ph_label_{slot}.txt"
+                label_file = os.path.join(project_dir, label_rel)
+                try:
+                    with open(label_file, 'w', encoding='utf-8') as lf:
+                        lf.write(f"片段 {slot} {reason} · SEGMENT {slot} MISSING")
+                    label_files.append(label_file)
+                    # 相对名（无冒号），配合 ffmpeg cwd=project_dir 使用
+                    chain += (f",drawbox=x=0:y=(ih-160)/2:w=iw:h=160:color=black@0.55:t=fill,"
+                              f"drawtext=fontfile={font_rel}:textfile={label_rel}:reload=0:"
+                              f"fontcolor=white:fontsize={max(28, width // 22)}:"
+                              f"x=(w-text_w)/2:y=(h-text_h)/2")
+                except Exception as _le:
+                    print(f"[WARN] placeholder label write failed slot {slot}: {_le}")
+            filter_parts.append(chain + f"[v{idx}]")
+        concat_labels.append(f"[v{idx}]")
+        idx += 1
+
+    if idx == 0:
+        return None
+
+    filtergraph = ";".join(filter_parts) + ";" + "".join(concat_labels)
+    filtergraph += f"concat=n={idx}:v=1:a=0[vc];[vc]setpts=0.5*PTS[vout]"
+
+    title = manifest_data.get('title', '')
+    chinese_name = _project_display_name(title)
+    output_path = os.path.join(project_dir, f"{chinese_name}_partial_2x.mp4")
+
+    # 清理项目根下旧 mp4（保持单一成片）
+    for fname in os.listdir(project_dir):
+        if fname.lower().endswith('.mp4') and os.path.isfile(os.path.join(project_dir, fname)):
+            try:
+                os.remove(os.path.join(project_dir, fname))
+            except Exception as e:
+                print(f"Warning: could not remove old merged file {fname} ({e})")
+
+    cmd = ["ffmpeg", "-y", *inputs,
+           "-filter_complex", filtergraph,
+           "-map", "[vout]",
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", output_path]
+    print(f"[INFO] Partial merge: {idx} segments, {len(placeholder_slots)} placeholder(s) "
+          f"{placeholder_slots} -> {output_path}")
+    res = subprocess.run(cmd, cwd=project_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, encoding='utf-8', errors='replace')
+
+    for lf in label_files:
+        try:
+            os.remove(lf)
+        except Exception:
+            pass
+    if font_rel:
+        try:
+            os.remove(os.path.join(project_dir, font_rel))
+        except Exception:
+            pass
+
+    if res.returncode != 0:
+        print(f"[ERROR] partial ffmpeg failed: {res.stderr}")
+        raise RuntimeError(f"占位合并失败（FFmpeg）：{res.stderr[-400:]}")
+
+    rel_path = os.path.relpath(output_path, base_dir).replace('\\', '/')
+    duration = 0.0
+    try:
+        dur_res = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", output_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding='utf-8', errors='replace', check=True)
+        duration = float(dur_res.stdout.strip())
+    except Exception:
+        pass
+
+    return {
+        'file': rel_path,
+        'url': '/' + rel_path,
+        'size_bytes': os.path.getsize(output_path),
+        'duration_seconds': round(duration, 2),
+        'status': 'success',
+        'partial': True,
+        'placeholder_slots': placeholder_slots,
+    }
 
 
 def video_reverse_worker(task_id, temp_video_path, temp_dir_obj, fps, api, prompt_style, client_config, filename):

@@ -453,7 +453,7 @@
                             <span>📊 结果概览</span>
                             <span class="tab-status-dot" id="overview-status-dot" style="display: none;"></span>
                         </button>
-                        <button class="tab-btn" data-tab="prompts" id="tab-btn-prompts">📋 提示词槽位</button>
+                        <button class="tab-btn" data-tab="prompts" id="tab-btn-prompts">📋 提示词</button>
                         <button class="tab-btn" data-tab="audit" id="tab-btn-audit">✅ 校验与质量审核</button>
                     </div>
 
@@ -590,29 +590,7 @@
 
                         <!-- Tab 2: Prompts -->
                         <div class="tab-panel" id="tab-panel-prompts">
-                            <!-- Slot Filters & Bulk Actions -->
-                            <div class="prompt-controls-panel">
-                                <div class="filter-group">
-                                    <span class="control-label">查看槽位：</span>
-                                    <div class="filter-btn-group">
-                                        <button type="button" class="slot-filter-btn active" data-filter="all">全部</button>
-                                        <button type="button" class="slot-filter-btn" data-filter="image">🖼️ 仅图片</button>
-                                        <button type="button" class="slot-filter-btn" data-filter="video">🎬 仅视频</button>
-                                    </div>
-                                </div>
-                                <div class="bulk-group">
-                                    <button type="button" id="expand-all-btn" class="action-btn text-btn mini-btn">展开全部</button>
-                                    <button type="button" id="collapse-all-btn" class="action-btn text-btn mini-btn">收起全部</button>
-                                    <button type="button" id="copy-images-btn" class="action-btn text-btn mini-btn" title="一键复制所有图片提示词">复制所有图</button>
-                                    <button type="button" id="copy-videos-btn" class="action-btn text-btn mini-btn" title="一键复制所有视频提示词">复制所有视</button>
-                                </div>
-                            </div>
-
-                            <!-- Quick Jump Pills -->
-                            <div class="jump-pills-wrapper">
-                                <span class="jump-title">快速跳转：</span>
-                                <div class="jump-pills" id="jump-pills"></div>
-                            </div>
+                            <!-- 提示词槽位卡片、筛选/复制工具条、快速跳转已移除：本页仅保留原始 Markdown 提示词块 -->
 
                             <!-- Video Reverse Collage Preview -->
                             <div id="collage-preview-wrapper" class="collage-preview-wrapper" style="display: none; margin-bottom: 20px; padding: 15px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px;">
@@ -625,22 +603,16 @@
                                 <img id="collage-preview-img" src="" alt="关键帧多宫格拼图" style="width: 100%; border-radius: 6px; border: 1px solid rgba(255,255,255,0.15); object-fit: contain; max-height: 300px; cursor: pointer;">
                             </div>
 
-                            <!-- Parsed slots container -->
-                            <div id="parsed-prompts-container" class="parsed-prompts-container"></div>
-
-                            <!-- Raw copy-ready prompt set (collapsed by default) -->
-                            <details class="raw-prompt-details">
-                                <summary>📜 查看原始 Markdown 提示词块</summary>
-                                <div class="prompt-box card-dark" style="margin-top: 12px;">
-                                    <div class="prompt-header">
-                                        <span>📋 复制即用提示词集 · 图片 1–N+1 / 视频 1–N</span>
-                                        <button class="action-btn icon-btn mini-btn" id="copy-prompt-btn" title="复制全部提示词">
-                                            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                                        </button>
-                                    </div>
-                                    <pre class="prompt-pre" id="idea-prompt-block">在左侧选择维度并点击「激发」，这里会输出经 restoration-prompt-composer skill 合成的完整图片 / 视频提示词集。</pre>
+                            <!-- 原始 Markdown 提示词块（本页唯一内容，直接展开显示） -->
+                            <div class="prompt-box card-dark">
+                                <div class="prompt-header">
+                                    <span>📋 复制即用提示词集 · 图片 1–N+1 / 视频 1–N</span>
+                                    <button class="action-btn icon-btn mini-btn" id="copy-prompt-btn" title="复制全部提示词">
+                                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                                    </button>
                                 </div>
-                            </details>
+                                <pre class="prompt-pre" id="idea-prompt-block">在左侧选择维度并点击「激发」，这里会输出经 restoration-prompt-composer skill 合成的完整图片 / 视频提示词集。</pre>
+                            </div>
                         </div>
 
                         <!-- Tab 3: Audit -->
@@ -1154,10 +1126,10 @@
     <script src="js/utils.js?v=1.1.1" defer></script>
     <script src="js/config.js?v=1.1.0" defer></script>
     <script src="js/progress_model.js?v=1.2.0" defer></script>
-    <script src="js/api_client.js?v=1.1.0" defer></script>
-    <script src="js/prompt_pipeline.js?v=1.1.2" defer></script>
-    <script src="js/media_renderer.js?v=1.1.1" defer></script>
-    <script src="app.js?v=1.1.4" defer></script>
+    <script src="js/api_client.js?v=1.1.1" defer></script>
+    <script src="js/prompt_pipeline.js?v=1.1.3" defer></script>
+    <script src="js/media_renderer.js?v=1.1.2" defer></script>
+    <script src="app.js?v=1.1.5" defer></script>
     <script src="js/image_studio.js?v=1.0.1" defer></script>
     <!-- 旧「移动端标签切换」内联脚本已删除：它指向早已不存在的 mobile-tab-left/right，
          MutationObserver 永远空转；自动切换结果面板改由 app.js 的 switchMainTab('results') 完成 -->
