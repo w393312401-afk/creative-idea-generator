@@ -13,9 +13,6 @@ from prompt_pipeline import (
     check_stylistic_repetition,
     _aux_model,
     check_adjacent_frame_semantics_batch,
-    _beat_chunk_size,
-    _chunk_consecutive_beats,
-    _parse_chunk_prompt_response,
 )
 from frame_generator import _extract_image_prompts
 
@@ -121,40 +118,6 @@ class TestPromptFixes(unittest.TestCase):
         self.assertEqual(_aux_model({'model': 'gemini-3-flash-agent'}), 'gemini-3.5-flash-low')
         self.assertEqual(_aux_model({'model': 'gemini-3-flash-agent', 'cheapModel': 'cheap-json-model'}), 'cheap-json-model')
         self.assertEqual(_aux_model({'model': 'gpt-5.5'}), 'gpt-5.5')
-
-    def test_beat_chunk_size_bounds_config(self):
-        self.assertEqual(_beat_chunk_size({}), 4)
-        self.assertEqual(_beat_chunk_size({'beatChunkSize': 1}), 1)
-        self.assertEqual(_beat_chunk_size({'beatChunkSize': 9}), 5)
-        self.assertEqual(_beat_chunk_size({'promptChunkSize': '3'}), 3)
-        self.assertEqual(_beat_chunk_size({'beatChunkSize': 'bad'}), 4)
-
-    def test_chunk_consecutive_beats_splits_gaps_and_size(self):
-        chunks = _chunk_consecutive_beats([1, 2, 3, 4, 5, 8, 9, 11], 4)
-        self.assertEqual(chunks, [[1, 2, 3, 4], [5], [8, 9], [11]])
-
-    def test_parse_chunk_prompt_response(self):
-        content = """===BEAT 3===
-===VIDEO===
-Video three.
-===IMAGE===
-Image four.
-===TRACES===
-[{"name": "new screw heads", "grid": "Grid B2"}]
-
-===BEAT 4===
-===VIDEO===
-Video four.
-===IMAGE===
-Image five.
-===TRACES===
-[]
-"""
-        parsed = _parse_chunk_prompt_response(content, [3, 4])
-        self.assertEqual(parsed[3]['video'], "Video three.")
-        self.assertEqual(parsed[3]['image'], "Image four.")
-        self.assertEqual(parsed[3]['traces'][0]['name'], "new screw heads")
-        self.assertEqual(parsed[4]['traces'], [])
 
     def test_batch_adjacent_frame_semantics_maps_failures_to_beats(self):
         fake_response = json.dumps([

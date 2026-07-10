@@ -1081,6 +1081,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
     _BLOCKED_PREFIXES = (
         '/tasks/', '/.git', '/.claude/', '/.gemini/', '/scratch/',
         '/tests/', '/.pytest_cache/', '/.agents/',
+        '/prompt_pipeline/',  # Python 源码包目录:.py 内容已被后缀拦,此项兜住目录列表
     )
     _BLOCKED_SUFFIXES = ('.py', '.pyc', '.bat', '.pid', '.log')
 

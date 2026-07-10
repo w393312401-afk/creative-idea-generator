@@ -20,7 +20,7 @@ from server_common import (
     SERVER_CONFIG, resolve_gateway, effective_config,
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
     IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT,
-    PACKET_CACHE_LOCK, PROCESS_BRIEF_CACHE_LOCK
+    PACKET_CACHE_LOCK, PROCESS_BRIEF_CACHE_LOCK, strict_gates_enabled
 )
 from frame_generator import (
     call_image_llm, _crop_to_aspect_ratio, _detect_image_mime_from_path,
@@ -62,8 +62,11 @@ def _record_tokens(usage):
     _usage_tracker.completion_tokens += usage.get('completion_tokens', 0)
     _usage_tracker.total_tokens += usage.get('total_tokens', 0)
 
-CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'packet_cache.json')
-PROCESS_BRIEF_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'process_brief_cache.json')
+# 包化后本文件位于 prompt_pipeline/ 子目录,__file__ 比原来深一层;
+# 缓存文件仍写在仓库根(与包化前位置一致),故向上多取一级目录。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CACHE_PATH = os.path.join(_REPO_ROOT, 'packet_cache.json')
+PROCESS_BRIEF_CACHE_PATH = os.path.join(_REPO_ROOT, 'process_brief_cache.json')
 
 
 def _slice_between(text, start_marker, end_marker):
@@ -373,6 +376,27 @@ def _multimodal_chat(config, system, user_text, image_paths, model=None):
         return res_data['choices'][0]['message']['content']
 
 
+def is_skipped_verdict(reason):
+    """True 表示该判定其实没跑成（服务异常被跳过后的 fail-open 放行），不是真实 PASS。
+    调用方据此把 quality_gate 记为 auto_approved_degraded，而不是伪装成正常通过。"""
+    return isinstance(reason, str) and reason.startswith('Skipped (')
+
+
+def _judge_unavailable_verdict(config, gate_name, exc):
+    """视觉 judge 的 API 异常统一出口。默认 fail-open：放行但计入 _skipped_checks 并带
+    Skipped 标记；strictGates 开启时 fail-closed：按判定失败处理，走既有重试链直至
+    needs_human_review，杜绝判定服务宕机导致整套视觉门静默失效。"""
+    if isinstance(config, dict):
+        config['_skipped_checks'] = config.get('_skipped_checks', 0) + 1
+    if strict_gates_enabled(config):
+        if sys.stdout:
+            print(f"[{gate_name}] API call failed: {exc}. strictGates on, failing closed.")
+        return False, f"FAIL: 视觉判定服务异常，严格模式(strictGates)拒绝放行: {exc}"
+    if sys.stdout:
+        print(f"[{gate_name}] API call failed: {exc}. Skipping check to avoid blocking pipeline (fail-open).")
+    return True, f"Skipped (API Error: {exc})"
+
+
 def run_vlm_qa_check(config, img_i_path, img_ip1_path, video_prompt, is_bridge=False):
     """
     Compare generated IMAGE i and IMAGE i+1 with the transition VIDEO i prompt.
@@ -440,9 +464,7 @@ def run_vlm_qa_check(config, img_i_path, img_ip1_path, video_prompt, is_bridge=F
         else:
             return False, response_clean
     except Exception as e:
-        if sys.stdout:
-            print(f"[VLM QA] VLM API call failed: {e}. Skipping VLM check to avoid blocking pipeline.")
-        return True, f"Skipped (API Error: {e})"
+        return _judge_unavailable_verdict(config, 'VLM QA', e)
 
 
 def check_landmark_drift(config, image_1_path, current_image_path):
@@ -489,9 +511,7 @@ def check_landmark_drift(config, image_1_path, current_image_path):
             return True, "PASS"
         return False, response_clean
     except Exception as e:
-        if sys.stdout:
-            print(f"[LANDMARK DRIFT QA] check_landmark_drift API call failed: {e}. Skipping to avoid blocking pipeline.")
-        return True, f"Skipped (API Error: {e})"
+        return _judge_unavailable_verdict(config, 'LANDMARK DRIFT QA', e)
 
 
 def run_frame_qa_check(config, image_1_path, prev_path, target_path, video_prompt, seq, is_bridge=False):
@@ -505,7 +525,14 @@ def run_frame_qa_check(config, image_1_path, prev_path, target_path, video_promp
     if not passed:
         return passed, reason
     if seq > 2 and image_1_path and os.path.exists(image_1_path) and os.path.exists(target_path):
-        return check_landmark_drift(config, image_1_path, target_path)
+        drift_passed, drift_reason = check_landmark_drift(config, image_1_path, target_path)
+        if not drift_passed:
+            return drift_passed, drift_reason
+        # 邻帧动作校验若是被跳过的放行（judge 异常 fail-open），合并结论必须保留
+        # Skipped 标记——否则漂移检查的真实 PASS 会把没跑过的动作校验洗成 auto_approved
+        if is_skipped_verdict(reason):
+            return True, reason
+        return drift_passed, drift_reason
     return passed, reason
 
 
@@ -574,9 +601,7 @@ def check_anchor_frame_compliance(config, image_path, image_1_prompt, packet, pa
             return True, "PASS"
         return False, response_clean
     except Exception as e:
-        if sys.stdout:
-            print(f"[ANCHOR QA] check_anchor_frame_compliance API call failed: {e}. Skipping to avoid blocking pipeline.")
-        return True, f"Skipped (API Error: {e})"
+        return _judge_unavailable_verdict(config, 'ANCHOR QA', e)
 
 
 def refine_packet_from_accepted_anchor(config, image_path, packet):
@@ -3314,81 +3339,6 @@ Each object in the JSON array must have EXACTLY these keys:
             "score": 23
         }
     ]
-
-
-def _beat_chunk_size(config):
-    if not isinstance(config, dict):
-        return 4
-    val = config.get('beatChunkSize') or config.get('promptChunkSize')
-    if val is None:
-        return 4
-    try:
-        val = int(val)
-    except (ValueError, TypeError):
-        return 4
-    return max(1, min(5, val))
-
-
-def _chunk_consecutive_beats(beats, chunk_size):
-    if not beats:
-        return []
-    sorted_beats = sorted(list(beats))
-    chunks = []
-    current_chunk = []
-    for b in sorted_beats:
-        if not current_chunk:
-            current_chunk.append(b)
-        elif b == current_chunk[-1] + 1 and len(current_chunk) < chunk_size:
-            current_chunk.append(b)
-        else:
-            chunks.append(current_chunk)
-            current_chunk = [b]
-    if current_chunk:
-        chunks.append(current_chunk)
-    return chunks
-
-
-def _parse_chunk_prompt_response(content, beat_indices):
-    import re
-    import json
-    
-    pattern = re.compile(r'===BEAT\s+(\d+)===')
-    matches = list(pattern.finditer(content))
-    
-    parsed = {}
-    for idx in beat_indices:
-        parsed[idx] = {'video': '', 'image': '', 'traces': []}
-        
-    for i, match in enumerate(matches):
-        beat_num = int(match.group(1))
-        if beat_num not in beat_indices:
-            continue
-        start_pos = match.end()
-        end_pos = matches[i+1].start() if i + 1 < len(matches) else len(content)
-        beat_text = content[start_pos:end_pos]
-        
-        # Now find ===VIDEO===, ===IMAGE===, ===TRACES=== within beat_text
-        sub_pattern = re.compile(r'===(VIDEO|IMAGE|TRACES)===')
-        sub_matches = list(sub_pattern.finditer(beat_text))
-        
-        sections = {}
-        for j, sub_match in enumerate(sub_matches):
-            sec_name = sub_match.group(1).lower()
-            sec_start = sub_match.end()
-            sec_end = sub_matches[j+1].start() if j + 1 < len(sub_matches) else len(beat_text)
-            sections[sec_name] = beat_text[sec_start:sec_end].strip()
-            
-        parsed[beat_num]['video'] = sections.get('video', '')
-        parsed[beat_num]['image'] = sections.get('image', '')
-        
-        traces_str = sections.get('traces', '[]')
-        try:
-            traces_str = _strip_markdown_fences_only(traces_str)
-            parsed[beat_num]['traces'] = json.loads(traces_str)
-        except Exception:
-            parsed[beat_num]['traces'] = []
-            
-    return parsed
 
 
 def check_adjacent_frame_semantics_batch(config, images):
