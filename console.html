@@ -5,8 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SPARK 开发者中心 & 控制台</title>
   <script>(function(){try{if(localStorage.getItem('spark_theme')==='dark'){document.documentElement.setAttribute('data-theme','dark');}}catch(e){}})();</script>
-  <link rel="stylesheet" href="tokens.css?v=1.0.7">
-  <link rel="stylesheet" href="console.css?v=1.0.7">
+  <link rel="stylesheet" href="css/tokens.css?v=1.1.0">
+  <link rel="stylesheet" href="css/console.css?v=1.1.0">
+  <link rel="stylesheet" href="css/shared/lightbox.css?v=1.1.0">
 </head>
 <body>
   <div class="app-container">
@@ -667,6 +668,8 @@
 
   <!-- 共享工具（escapeHtml/copyText 等）必须先于 console.js 加载 -->
   <script src="js/utils.js?v=1.1.1"></script>
-  <script src="console.js"></script>
+  <script src="js/theme_toggle.js?v=1.1.0"></script>
+  <script src="js/lightbox.js?v=1.1.0"></script>
+  <script src="console.js?v=1.1.0"></script>
 </body>
 </html>

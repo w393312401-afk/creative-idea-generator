@@ -2,26 +2,9 @@
    SPARK Creative Idea Generator - Core Javascript Logic
    ===================================================================== */
 
-// Default Configurations
-const DEFAULT_CONFIG = {
-    baseUrl: 'http://127.0.0.1:8046/v1',
-    // Key intentionally NOT shipped to the browser. In server-managed (external) mode the
-    // backend supplies the key from server_config.json. For local self-use, enter your key
-    // once in the ⚙️ 配置中心 (it persists in this browser's localStorage).
-    apiKey: '',
-    model: 'gemini-3-flash-agent',
-    imageModel: 'nano-banana-2',
-    // 帧序列生成方式: 'api'（LLM 网关）| 'google_fx'（AdsPower 浏览器 UI 自动化）
-    imageBackend: 'api',
-    googleFxImageModel: 'Nano Banana 2',
-    videoModel: 'Veo 3.1 - Lite [Lower Priority]',
-    googleFxIpRotateRequests: 5,
-    imageAspectRatio: '9:16',
-    imageQuality: '2K'
-};
-
-// Global State
-let config = { ...DEFAULT_CONFIG };
+// 全局共享状态(DEFAULT_CONFIG / config / ACCESS_CODE / savedIdeas / currentIdea /
+// generationState / streamEpochs / controllers 等)已抽出到 js/state.js(最先加载)。
+// 本文件仅保留其初始化逻辑与运行时赋值(下方 fetch 包装器、initServerMode 等)。
 
 // HTML Escape Utility to prevent XSS / render breakage
 // Function escapeHtml moved to modular JS file
@@ -30,7 +13,6 @@ let config = { ...DEFAULT_CONFIG };
 // All /api/* requests transparently carry the access code (if one is set). If the server
 // rejects it (401) we prompt for a new one and retry once. Implemented by wrapping window.fetch
 // so every existing call site is covered without changes.
-let ACCESS_CODE = localStorage.getItem('spark_access_code') || '';
 
 // Function _setAccessHeader moved to modular JS file
 
@@ -77,34 +59,6 @@ async function initServerMode() {
     }
 }
 document.addEventListener('DOMContentLoaded', initServerMode);
-let savedIdeas = [];
-let currentIdea = null;
-let activeInputTab = 'text';
-let selectedVideoFile = null;
-
-let customPresets = {};
-let activeBackgroundTasks = {
-    cover: false,
-    frames: false,
-    videos: false
-};
-
-let generationState = {
-    status: 'idle', // idle | composing | error
-    startTime: 0,
-    timerInterval: null,
-    lastParams: null
-};
-
-// Global controllers for cancellation
-let currentGenerationController = null;
-let currentFramesController = null;
-let currentVideosController = null;
-
-// 流代际守卫：每个通道一个递增序号。viewTask/retryTask 接管面板时会开启新一代流，
-// 旧流被 abort 后其 catch/finally 仍会异步执行——只有仍是最新一代的流才允许触碰 UI，
-// 否则旧流的收尾会清掉新任务刚建好的视图。
-const streamEpochs = { compose: 0, frames: 0, videos: 0, cover: 0 };
 
 // Safe Clipboard Copy Helper with HTTP LAN Fallback
 // Function copyText moved to modular JS file
@@ -3661,48 +3615,11 @@ async function loadIdeationCards(force = false) {
 
 // Function mapTwistToAnchorValue moved to modular JS file
 
-/* ============================================================
-   General Settings (通用设置) panel + 暗夜模式 toggle
-   The general gear is ALWAYS visible (unlike the API-config gear,
-   which app.js hides in managed mode). Theme persists in
-   localStorage('spark_theme') and is shared across both apps
-   (same origin), so main + image-station stay in sync.
-   ============================================================ */
-(function initThemeToggle() {
-    const btn = document.getElementById('theme-toggle-btn');
-    const icon = document.getElementById('theme-toggle-icon');
-    if (!btn) return;
-    const isDark = () => document.documentElement.getAttribute('data-theme') === 'dark';
-    const sync = () => {
-        if (icon) icon.textContent = isDark() ? '☀️' : '🌙';
-        btn.title = isDark() ? '切换到明亮模式' : '切换到暗夜模式';
-    };
-    sync();
-    btn.addEventListener('click', () => {
-        const next = !isDark();
-        document.documentElement.setAttribute('data-theme', next ? 'dark' : 'light');
-        try { localStorage.setItem('spark_theme', next ? 'dark' : 'light'); } catch (e) {}
-        sync();
-    });
-})();
+/* 暗夜模式 toggle 已抽出到 js/theme_toggle.js(双前端共享,index.html 加载)*/
 
 // Local Service Logs Stream
 // Function initLocalServiceLogs moved to modular JS file
 
-// --- LIGHTBOX SYSTEM ---
-let lightboxItems = [];
-let lightboxActiveIndex = -1;
-
-// Function initLightbox moved to modular JS file
-
-// Function openLightbox moved to modular JS file
-
-// Function closeLightbox moved to modular JS file
-
-// Function updateLightboxContent moved to modular JS file
-
-// Function navigateLightbox moved to modular JS file
-
-// Function handleLightboxKeydown moved to modular JS file
-
-document.addEventListener('DOMContentLoaded', initLightbox);
+// --- LIGHTBOX SYSTEM 已整体抽出到 js/lightbox.js ---
+// 全局控制器函数 + 状态(lightboxItems/lightboxActiveIndex)+ 初始化均在该共享模块;
+// 本文件其余处仍直接调用全局 openLightbox()。

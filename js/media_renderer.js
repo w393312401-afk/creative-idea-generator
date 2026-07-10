@@ -197,21 +197,24 @@ function renderFramesForIdea(idea) {
         if (hasImage) {
             const isDegraded = frame.quality_gate === 'i2i_fallback_degraded';
             const isVlmFailed = frame.quality_gate === 'vlm_qa_failed';
+            const isUnverified = frame.quality_gate === 'auto_approved_degraded';
             const isStale = frame.quality_gate === 'stale' || frame.stale;
-            card.className = 'frame-card' + (isDegraded ? ' degraded-card' : '') + (isVlmFailed ? ' vlm-failed-card' : '') + (isStale ? ' stale-card' : '');
+            card.className = 'frame-card' + (isDegraded ? ' degraded-card' : '') + (isVlmFailed ? ' vlm-failed-card' : '') + (isUnverified ? ' degraded-card' : '') + (isStale ? ' stale-card' : '');
             card.style.cursor = 'pointer';
-            
+
             let hoverTitle = `打开第 ${seq} 帧`;
             if (isDegraded) hoverTitle += ' (降级为文生图)';
             if (isVlmFailed) hoverTitle += ` (VLM 检查未通过: ${frame.vlm_qa_reason || '跳变或无变化'})`;
+            if (isUnverified) hoverTitle += ' (VLM 判定服务异常，此帧未经核验被放行)';
             if (isStale) hoverTitle += ' (过期：父帧已被重新生成，此帧与父帧血统不一致)';
             card.title = hoverTitle;
-            
+
             card.innerHTML = `
                 <img src="" alt="Frame ${seq}" loading="lazy">
                 ${isDegraded ? '<div class="degraded-badge">降级</div>' : ''}
                 ${isVlmFailed ? '<div class="vlm-failed-badge" title="' + (frame.vlm_qa_reason || '').replace(/"/g, '&quot;') + '">VLM 失败</div>' : ''}
-                ${isStale ? `<div class="stale-badge" ${isDegraded || isVlmFailed ? 'style="left: 45px;"' : ''} title="此帧派生自已被替换的旧帧，建议重新生成">Stale</div>` : ''}
+                ${isUnverified ? '<div class="degraded-badge" title="' + (frame.vlm_qa_reason || 'VLM 判定服务异常，未经核验').replace(/"/g, '&quot;') + '">未核验</div>' : ''}
+                ${isStale ? `<div class="stale-badge" ${isDegraded || isVlmFailed || isUnverified ? 'style="left: 45px;"' : ''} title="此帧派生自已被替换的旧帧，建议重新生成">Stale</div>` : ''}
                 <div class="frame-card-actions" style="position: absolute; top: 5px; right: 5px; display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s;">
                     <button class="action-btn text-btn mini-btn retry-frame-btn" data-seq="${seq}" style="background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.3); padding: 2px 6px; font-size: 10px;">重试</button>
                 </div>
@@ -509,118 +512,6 @@ function extractImageUrl(content) {
     return null;
 }
 
-function initLightbox() {
-    const modal = document.getElementById('lightbox-modal');
-    const closeBtn = document.getElementById('close-lightbox-btn');
-    const prevBtn = document.getElementById('prev-lightbox-btn');
-    const nextBtn = document.getElementById('next-lightbox-btn');
-    
-    if (!modal) return;
-    
-    closeBtn?.addEventListener('click', closeLightbox);
-    prevBtn?.addEventListener('click', () => navigateLightbox(-1));
-    nextBtn?.addEventListener('click', () => navigateLightbox(1));
-    
-    // Close on clicking outside the content
-    modal.addEventListener('click', (e) => {
-        if (e.target === modal) {
-            closeLightbox();
-        }
-    });
-}
-
-function openLightbox(items, index) {
-    lightboxItems = items;
-    lightboxActiveIndex = index;
-    
-    const modal = document.getElementById('lightbox-modal');
-    if (!modal) return;
-    
-    modal.style.display = 'flex';
-    updateLightboxContent();
-    
-    document.addEventListener('keydown', handleLightboxKeydown);
-}
-
-function closeLightbox() {
-    const modal = document.getElementById('lightbox-modal');
-    if (!modal) return;
-    modal.style.display = 'none';
-    
-    const video = document.getElementById('lightbox-video');
-    if (video) {
-        video.pause();
-        video.src = '';
-    }
-    
-    document.removeEventListener('keydown', handleLightboxKeydown);
-}
-
-function updateLightboxContent() {
-    const img = document.getElementById('lightbox-img');
-    const video = document.getElementById('lightbox-video');
-    const caption = document.getElementById('lightbox-caption');
-    const prevBtn = document.getElementById('prev-lightbox-btn');
-    const nextBtn = document.getElementById('next-lightbox-btn');
-    
-    if (!img || !video || !caption) return;
-    
-    if (lightboxActiveIndex < 0 || lightboxActiveIndex >= lightboxItems.length) {
-        closeLightbox();
-        return;
-    }
-    
-    const item = lightboxItems[lightboxActiveIndex];
-    
-    if (item.type === 'video') {
-        img.style.display = 'none';
-        video.src = item.url;
-        video.style.display = 'block';
-        video.play().catch(err => console.log("Auto-play prevented", err));
-    } else {
-        video.style.display = 'none';
-        video.pause();
-        video.src = '';
-        img.src = item.url;
-        img.style.display = 'block';
-    }
-    
-    if (item.caption) {
-        caption.innerHTML = item.caption;
-        caption.style.display = 'block';
-    } else {
-        caption.style.display = 'none';
-    }
-    
-    if (lightboxItems.length <= 1) {
-        if (prevBtn) prevBtn.style.display = 'none';
-        if (nextBtn) nextBtn.style.display = 'none';
-    } else {
-        if (prevBtn) prevBtn.style.display = 'flex';
-        if (nextBtn) nextBtn.style.display = 'flex';
-    }
-}
-
-function navigateLightbox(direction) {
-    if (lightboxItems.length <= 1) return;
-    
-    lightboxActiveIndex += direction;
-    if (lightboxActiveIndex < 0) {
-        lightboxActiveIndex = lightboxItems.length - 1;
-    } else if (lightboxActiveIndex >= lightboxItems.length) {
-        lightboxActiveIndex = 0;
-    }
-    
-    updateLightboxContent();
-}
-
-function handleLightboxKeydown(e) {
-    if (e.key === 'ArrowLeft') {
-        navigateLightbox(-1);
-    } else if (e.key === 'ArrowRight') {
-        navigateLightbox(1);
-    } else if (e.key === 'Escape') {
-        closeLightbox();
-    }
-}
+// --- LIGHTBOX 通用控制器已抽出到 js/lightbox.js(双前端共享的全局函数)---
+// 本文件其余处的 openLightbox(mediaList, idx) 调用点保持不变,直接调用该共享模块的全局函数。
 

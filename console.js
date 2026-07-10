@@ -2044,26 +2044,7 @@ const renderUploadPreviews = () => {
   });
 };
 
-/* ============================================================
-   General Settings Theme Switch (Light/Dark Mode)
-   ============================================================ */
-(function initThemeToggle() {
-  const btn = document.getElementById('theme-toggle-btn');
-  const icon = document.getElementById('theme-toggle-icon');
-  if (!btn) return;
-  const isDark = () => document.documentElement.getAttribute('data-theme') === 'dark';
-  const sync = () => {
-    if (icon) icon.textContent = isDark() ? '☀️' : '🌙';
-    btn.title = isDark() ? '切换到明亮模式' : '切换到暗夜模式';
-  };
-  sync();
-  btn.addEventListener('click', () => {
-    const next = !isDark();
-    document.documentElement.setAttribute('data-theme', next ? 'dark' : 'light');
-    try { localStorage.setItem('spark_theme', next ? 'dark' : 'light'); } catch (e) {}
-    sync();
-  });
-})();
+/* 暗夜模式 toggle 已抽出到 js/theme_toggle.js(双前端共享,console.html 加载)*/
 
 /* ============================================================
    Mobile Sidebar Toggle & Filter Panel Drawer Control
@@ -2129,31 +2110,11 @@ const renderUploadPreviews = () => {
   });
 })();
 
-// --- LIGHTBOX SYSTEM FOR CONSOLE ---
-(function() {
-    let lightboxItems = [];
-    let lightboxActiveIndex = -1;
-
-    function initLightbox() {
-        const modal = document.getElementById('lightbox-modal');
-        const closeBtn = document.getElementById('close-lightbox-btn');
-        const prevBtn = document.getElementById('prev-lightbox-btn');
-        const nextBtn = document.getElementById('next-lightbox-btn');
-        
-        if (!modal) return;
-        
-        closeBtn?.addEventListener('click', closeLightbox);
-        prevBtn?.addEventListener('click', () => navigateLightbox(-1));
-        nextBtn?.addEventListener('click', () => navigateLightbox(1));
-        
-        // Close on clicking outside the content
-        modal.addEventListener('click', (e) => {
-            if (e.target === modal) {
-                closeLightbox();
-            }
-        });
-
-        // Add click listeners to the preview elements
+// --- LIGHTBOX:通用控制器已抽出到 js/lightbox.js(全局 openLightbox / closeLightbox / … )---
+// 控制台专属:把 API 预览的图片/视频元素点击后打开共享 lightbox(调用全局 openLightbox)。
+// 通用的关闭/翻页/键盘/点击遮罩关闭等由 js/lightbox.js 的 initLightbox 统一处理。
+(function initConsolePreviewLightbox() {
+    function wire() {
         const previewImg = document.getElementById('play-preview-img');
         const previewVideo = document.getElementById('play-preview-video');
 
@@ -2171,13 +2132,8 @@ const renderUploadPreviews = () => {
         }
 
         if (previewVideo) {
-            // Remove controls in the inline video so clicking it doesn't toggle native play/pause in conflict with lightbox
-            // Wait, we can keep controls but add a click listener. Let's make it click-to-preview.
             previewVideo.style.cursor = 'pointer';
-            previewVideo.addEventListener('click', (e) => {
-                // If clicked on the video itself (not controls), open lightbox
-                // On some browsers, clicking the video element with controls triggers the click event.
-                // We can open the lightbox.
+            previewVideo.addEventListener('click', () => {
                 if (previewVideo.src) {
                     openLightbox([{
                         type: 'video',
@@ -2189,106 +2145,10 @@ const renderUploadPreviews = () => {
         }
     }
 
-    function openLightbox(items, index) {
-        lightboxItems = items;
-        lightboxActiveIndex = index;
-        
-        const modal = document.getElementById('lightbox-modal');
-        if (!modal) return;
-        
-        modal.style.display = 'flex';
-        updateLightboxContent();
-        
-        document.addEventListener('keydown', handleLightboxKeydown);
-    }
-
-    function closeLightbox() {
-        const modal = document.getElementById('lightbox-modal');
-        if (!modal) return;
-        modal.style.display = 'none';
-        
-        const video = document.getElementById('lightbox-video');
-        if (video) {
-            video.pause();
-            video.src = '';
-        }
-        
-        document.removeEventListener('keydown', handleLightboxKeydown);
-    }
-
-    function updateLightboxContent() {
-        const img = document.getElementById('lightbox-img');
-        const video = document.getElementById('lightbox-video');
-        const caption = document.getElementById('lightbox-caption');
-        const prevBtn = document.getElementById('prev-lightbox-btn');
-        const nextBtn = document.getElementById('next-lightbox-btn');
-        
-        if (!img || !video || !caption) return;
-        
-        if (lightboxActiveIndex < 0 || lightboxActiveIndex >= lightboxItems.length) {
-            closeLightbox();
-            return;
-        }
-        
-        const item = lightboxItems[lightboxActiveIndex];
-        
-        if (item.type === 'video') {
-            img.style.display = 'none';
-            video.src = item.url;
-            video.style.display = 'block';
-            video.play().catch(err => console.log("Auto-play prevented", err));
-        } else {
-            video.style.display = 'none';
-            video.pause();
-            video.src = '';
-            img.src = item.url;
-            img.style.display = 'block';
-        }
-        
-        if (item.caption) {
-            caption.innerHTML = item.caption;
-            caption.style.display = 'block';
-        } else {
-            caption.style.display = 'none';
-        }
-        
-        if (lightboxItems.length <= 1) {
-            if (prevBtn) prevBtn.style.display = 'none';
-            if (nextBtn) nextBtn.style.display = 'none';
-        } else {
-            if (prevBtn) prevBtn.style.display = 'flex';
-            if (nextBtn) nextBtn.style.display = 'flex';
-        }
-    }
-
-    function navigateLightbox(direction) {
-        if (lightboxItems.length <= 1) return;
-        
-        lightboxActiveIndex += direction;
-        if (lightboxActiveIndex < 0) {
-            lightboxActiveIndex = lightboxItems.length - 1;
-        } else if (lightboxActiveIndex >= lightboxItems.length) {
-            lightboxActiveIndex = 0;
-        }
-        
-        updateLightboxContent();
-    }
-
-    function handleLightboxKeydown(e) {
-        if (e.key === 'ArrowLeft') {
-            navigateLightbox(-1);
-        } else if (e.key === 'ArrowRight') {
-            navigateLightbox(1);
-        } else if (e.key === 'Escape') {
-            closeLightbox();
-        }
-    }
-
-    // Initialize on load
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', initLightbox);
+        document.addEventListener('DOMContentLoaded', wire);
     } else {
-        initLightbox();
+        wire();
     }
 })();
 
