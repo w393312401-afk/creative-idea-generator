@@ -6,7 +6,11 @@
   <title>SPARK 开发者中心 & 控制台</title>
   <script>(function(){try{if(localStorage.getItem('spark_theme')==='dark'){document.documentElement.setAttribute('data-theme','dark');}}catch(e){}})();</script>
   <link rel="stylesheet" href="css/tokens.css?v=1.1.0">
-  <link rel="stylesheet" href="css/console.css?v=1.1.0">
+  <!-- console.css split into ordered contiguous slices (concatenation == original); load order = cascade order -->
+  <link rel="stylesheet" href="css/console/base.css?v=1.2.0">
+  <link rel="stylesheet" href="css/console/dashboard.css?v=1.2.0">
+  <link rel="stylesheet" href="css/console/marketplace.css?v=1.2.0">
+  <link rel="stylesheet" href="css/console/sandbox-layout.css?v=1.2.0">
   <link rel="stylesheet" href="css/shared/lightbox.css?v=1.1.0">
 </head>
 <body>

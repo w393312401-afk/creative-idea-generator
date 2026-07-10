@@ -1,0 +1,338 @@
+/* 
+ ==========================================================================
+ SPARK Developer Portal & Console - Premium Glassmorphic Design System
+ ==========================================================================
+ */
+
+/* Google Fonts Import */
+@import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
+
+/* Design System Tokens */
+:root {
+  /* HSL Color Palette (reference only) */
+  --hue-primary: 185;   /* Cyber Cyan */
+  --hue-secondary: 270; /* Electric Purple */
+  --hue-accent: 330;    /* Neon Magenta */
+  --hue-success: 150;   /* Emerald Green */
+  --hue-warning: 38;    /* Amber Orange */
+  --hue-error: 350;     /* Rose Red */
+
+  /* Backgrounds & Glassmorphism mappings */
+  --bg-main: var(--bg-dark);
+  --bg-sidebar: #EFEAE0;
+  --bg-glass: var(--bg-panel);
+  --bg-glass-card: var(--bg-card);
+  --border-glass: var(--border-color);
+  --border-glass-hover: var(--border-glow);
+  --bg-input: rgba(46, 42, 36, 0.05);
+
+  /* Typography */
+  --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: 'Fira Code', source-code-pro, Menlo, Monaco, Consolas, monospace;
+
+  /* Nav item themes */
+  --nav-hover-text: var(--text-main);
+  --nav-hover-bg: rgba(46, 42, 36, 0.04);
+  --nav-active-text: var(--primary);
+  --nav-active-bg: rgba(46, 42, 36, 0.08);
+
+  /* Transitions & FX */
+  --transition-smooth: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+  --transition-fast: all 0.18s ease;
+  --radius-lg: 16px;
+  --radius-md: 10px;
+  --radius-sm: 6px;
+
+  /* Gradient background image */
+  --bg-gradient-image: 
+    radial-gradient(at 0% 0%, rgba(122, 139, 111, 0.08) 0px, transparent 55%),
+    radial-gradient(at 100% 100%, rgba(176, 123, 82, 0.06) 0px, transparent 55%),
+    radial-gradient(at 50% 50%, rgba(176, 101, 78, 0.04) 0px, transparent 60%);
+}
+
+/* ============================================================
+   Dark (暗夜) Theme — variable overrides
+   ============================================================ */
+html[data-theme="dark"] {
+  --bg-sidebar: #0D0B08;
+  --bg-input: rgba(0, 0, 0, 0.25);
+
+  --nav-hover-text: #fff;
+  --nav-hover-bg: rgba(255, 255, 255, 0.04);
+  --nav-active-text: #fff;
+  --nav-active-bg: linear-gradient(to right, rgba(214, 154, 85, 0.12), rgba(157, 174, 126, 0.06));
+
+  --bg-gradient-image: 
+    radial-gradient(at 0% 0%, rgba(157, 174, 126, 0.12) 0px, transparent 55%),
+    radial-gradient(at 100% 100%, rgba(214, 154, 85, 0.1) 0px, transparent 55%),
+    radial-gradient(at 50% 50%, rgba(208, 138, 107, 0.06) 0px, transparent 60%);
+}
+
+/* Reset & Global Base Styles */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--bg-main);
+  color: var(--text-main);
+  font-family: var(--font-sans);
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  /* 使用主题化渐变令牌（:root 亮色 / html[data-theme=dark] 暗色）——
+     旧写法把初版暗夜霓虹渐变硬编码在这里，令牌定义了却从未生效 */
+  background-image: var(--bg-gradient-image);
+  background-attachment: fixed;
+  letter-spacing: -0.2px;
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.15);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 20px;
+  transition: var(--transition-fast);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* ==========================================================================
+   SIDEBAR NAVIGATION
+   ========================================================================== */
+.sidebar {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 24px 18px;
+  z-index: 10;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 10px 28px 10px;
+  border-bottom: 1px solid var(--border-glass);
+  margin-bottom: 28px;
+  position: relative;
+}
+
+/* Premium Rotating Glowing Logo */
+.brand-logo {
+  width: 38px;
+  height: 38px;
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-weight: 800;
+  font-size: 20px;
+  box-shadow: 0 0 20px rgba(0, 242, 254, 0.35);
+  position: relative;
+  overflow: hidden;
+}
+
+.brand-logo::before {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: -50%;
+  width: 200%;
+  height: 200%;
+  background: linear-gradient(45deg, transparent, rgba(255,255,255,0.3), transparent);
+  transform: rotate(45deg);
+  animation: shine 4s infinite linear;
+}
+
+.brand-name-container {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.brand-name {
+  font-weight: 800;
+  font-size: 16.5px;
+  background: linear-gradient(135deg, var(--text-main) 0%, var(--text-muted) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  letter-spacing: 0.5px;
+}
+
+.brand-sub {
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--primary);
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  opacity: 0.85;
+  text-shadow: 0 0 8px var(--primary-glow);
+}
+
+.nav-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-grow: 1;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12.5px 16px;
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  text-decoration: none;
+  font-weight: 600;
+  font-size: 14.5px;
+  cursor: pointer;
+  transition: var(--transition-smooth);
+  border: 1px solid transparent;
+  position: relative;
+  overflow: hidden;
+}
+
+.nav-item::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 25%;
+  height: 50%;
+  width: 3px;
+  background-color: var(--primary);
+  border-radius: 0 4px 4px 0;
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: var(--transition-smooth);
+  box-shadow: 0 0 10px var(--primary);
+}
+
+.nav-item:hover {
+  color: var(--nav-hover-text);
+  background-color: var(--nav-hover-bg);
+  transform: translateX(4px);
+}
+
+.nav-item.active {
+  color: var(--nav-active-text);
+  background: var(--nav-active-bg);
+  border: 1px solid var(--border-glass-hover);
+  box-shadow: 
+    inset 0 0 12px rgba(var(--ink-rgb), 0.02),
+    0 4px 15px rgba(0, 0, 0, 0.1);
+}
+
+.nav-item.active::before {
+  transform: scaleX(1);
+}
+
+.nav-item svg {
+  width: 18px;
+  height: 18px;
+  color: var(--text-muted);
+  transition: var(--transition-smooth);
+}
+
+.nav-item:hover svg {
+  color: #fff;
+  transform: scale(1.05);
+}
+
+.nav-item.active svg {
+  color: var(--primary);
+  filter: drop-shadow(0 0 5px var(--primary));
+}
+
+.sidebar-footer {
+  padding-top: 22px;
+  border-top: 1px solid var(--border-glass);
+}
+
+/* Encrypted Security Token Box */
+.user-token-box {
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-md);
+  padding: 14px;
+  font-size: 12px;
+  position: relative;
+  box-shadow: inset 0 2px 8px rgba(0,0,0,0.3);
+}
+
+.user-token-box label {
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.user-token-input-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.user-token-input {
+  width: 100%;
+  background: var(--bg-input);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-sm);
+  padding: 8px 36px 8px 10px;
+  color: #fff;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  outline: none;
+  transition: var(--transition-smooth);
+}
+
+.user-token-input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 10px rgba(0, 242, 254, 0.15);
+}
+
+.user-token-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  border-color: rgba(255, 255, 255, 0.03);
+}
+
+.token-toggle-btn {
+  position: absolute;
+  right: 8px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: var(--transition-fast);
+  opacity: 0.7;
+}
+
+.token-toggle-btn:hover {
+  color: #fff;
+  opacity: 1;
+}
+

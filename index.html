@@ -12,9 +12,13 @@
     <script>(function(){try{if(localStorage.getItem('spark_theme')==='dark'){document.documentElement.setAttribute('data-theme','dark');}}catch(e){}})();</script>
     <!-- Preload critical CSS for faster first paint -->
     <link rel="preload" href="css/tokens.css?v=1.1.0" as="style">
-    <link rel="preload" href="css/style.css?v=1.1.0" as="style">
+    <link rel="preload" href="css/app/base.css?v=1.2.0" as="style">
     <link rel="stylesheet" href="css/tokens.css?v=1.1.0">
-    <link rel="stylesheet" href="css/style.css?v=1.1.0">
+    <!-- style.css split into ordered contiguous slices (concatenation == original); load order = cascade order -->
+    <link rel="stylesheet" href="css/app/base.css?v=1.2.0">
+    <link rel="stylesheet" href="css/app/skill-output.css?v=1.2.0">
+    <link rel="stylesheet" href="css/app/efficiency.css?v=1.2.0">
+    <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.2.0">
     <link rel="stylesheet" href="css/image_studio.css?v=1.1.0">
     <link rel="stylesheet" href="css/shared/lightbox.css?v=1.1.0">
 </head>
