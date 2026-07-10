@@ -1,0 +1,12 @@
+# SPARK — 项目工具配置
+#
+# 目前唯一用途:固定 pytest 的导入根,使 `import prompt_pipeline` / `import server_common`
+# 等顶层模块在任意工作目录下都能解析。这是文件结构重构的安全网:后续把巨石文件拆成包
+# (prompt_pipeline/、frame_generator/ …)时,测试收集不会因 cwd / sys.path 差异而破坏。
+#
+# `pythonpath` 的取值相对 rootdir(即本文件所在的仓库根),故 "." = 仓库根。
+# 不引入构建系统 / 打包 —— 这不是一个可安装的分发包。
+
+[tool.pytest.ini_options]
+pythonpath = "."
+testpaths = ["tests"]
