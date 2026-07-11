@@ -302,6 +302,7 @@ function renderIdeationCards(ideas) {
             </div>
             <div class="ideation-card-actions">
                 <button type="button" class="ideation-card-btn select-action-btn">载入维度</button>
+                <button type="button" class="ideation-card-btn copy-action-btn">复制选题</button>
                 <button type="button" class="ideation-card-btn primary compose-action-btn">一键合成</button>
             </div>
         `;
@@ -335,6 +336,18 @@ function renderIdeationCards(ideas) {
         composeBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             composeIdeationCard(idx);
+        });
+
+        // Clicking "复制选题" copies the ready-to-paste Tier-1 input string so it can be
+        // pasted directly into a real restoration-prompt-composer skill chat session.
+        const copyBtn = card.querySelector('.copy-action-btn');
+        copyBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            copyText(idea.input_str).then(() => {
+                showToast(`已复制选题："${idea.title}"，可直接粘贴到 restoration-prompt-composer 技能会话中使用`, 'success');
+            }).catch(() => {
+                showToast('复制失败', 'error');
+            });
         });
         
         container.appendChild(card);
@@ -408,7 +421,8 @@ function composeIdeationCard(index) {
         creativity: "脑洞大开",
         beats_count: 15,
         cover_url: idea.cover_url || null,
-        english_title: idea.english_title || null
+        english_title: idea.english_title || null,
+        topic_dna: idea.dna || null
     };
     
     showToast(`🚀 开始一键合成灵感: ${idea.title}...`, "success");

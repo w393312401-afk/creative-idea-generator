@@ -877,21 +877,62 @@ def save_process_brief_cache(cache):
                 print(f"Warning: could not write process_brief_cache.json ({e})")
 
 
-def append_to_used_topic_ledger(parsed_brief, dimensions):
+def _slugify(text):
+    slug = re.sub(r'-+', '-', re.sub(r'\s+', '-', str(text or '').strip().lower())).strip('-')
+    return slug or 'unknown'
+
+
+def _ledger_recent_topic_dnas(ledger_path, tail_lines=20):
+    """Topic DNA column of the last `tail_lines` physical data rows. Reads from the true file
+    tail rather than parsing the Markdown table structurally, because the table is interrupted
+    mid-file by a stray '## Avoid List' heading; new rows are always appended at the end."""
+    try:
+        with open(ledger_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except Exception:
+        return set()
+    dnas = set()
+    for line in lines[-tail_lines:]:
+        stripped = line.strip()
+        if not stripped.startswith('|'):
+            continue
+        cells = [c.strip() for c in stripped.strip('|').split('|')]
+        if len(cells) >= 2:
+            dnas.add(cells[1].lower())
+    return dnas
+
+
+def append_to_used_topic_ledger(parsed_brief, dimensions, brief_parse_failed=False):
+    if brief_parse_failed:
+        if sys.stdout:
+            print("[DEBUG] Skipping used-topic-ledger.md write: brief parsing failed, no reliable topic DNA.")
+        return
+
     ledger_path = os.path.join(SKILL_DIR, 'references', 'used-topic-ledger.md')
     if not os.path.exists(ledger_path):
         return
+
+    # Ideation-card composes already carry a correctly-formatted "carrier-family / destiny /
+    # twist-family" fingerprint from run_ideate()'s idea.dna — use it verbatim instead of
+    # re-deriving a worse one from the (often much longer, free-form) parsed_brief fields.
+    topic_dna = (dimensions.get('topic_dna') or '').strip()
+    if not topic_dna:
+        carrier_family = _slugify(parsed_brief.get('carrier_family') or 'unclassified')
+        destiny_family = _slugify(parsed_brief.get('destiny_family') or parsed_brief.get('destiny') or 'unknown')
+        anchors = dimensions.get('anchors') or []
+        twist = _slugify(anchors[0]) if anchors else 'custom-twist'
+        topic_dna = f"{carrier_family} / {destiny_family} / {twist}"
+
+    if topic_dna.lower() in _ledger_recent_topic_dnas(ledger_path):
+        if sys.stdout:
+            print(f"[DEBUG] Skipping duplicate used-topic-ledger.md write (already recent): {topic_dna}")
+        return
+
     date_str = datetime.now().strftime('%Y-%m-%d')
-    carrier = parsed_brief.get('carrier', 'unknown').lower().replace(' ', '-')
-    destiny = parsed_brief.get('destiny', 'unknown').lower().replace(' ', '-')
-    anchors = dimensions.get('anchors') or []
-    twist = anchors[0].lower().replace(' ', '-') if anchors else 'custom-twist'
-    
-    topic_dna = f"{carrier} / {destiny} / {twist}"
     one_sentence = f"{dimensions.get('theme', '未命名主题')}"
     source = "GUI Generation"
     avoid_notes = "Automatically registered by backend generator."
-    
+
     new_row = f"| {date_str} | {topic_dna} | {one_sentence} | {source} | {avoid_notes} |\n"
     try:
         with open(ledger_path, 'a', encoding='utf-8') as f:
@@ -2062,6 +2103,12 @@ Required JSON keys:
    - "retail / showroom"
    - "underground space"
    - "custom build object"
+8. "carrier_family": Must be exactly one of "natural", "man-made", "vehicle", "fantasy" —
+   classify the carrier's shell family (e.g. a tree or cave is "natural", a silo or water
+   tower is "man-made", a bus or submarine is "vehicle", a geode or giant mushroom is "fantasy").
+9. "destiny_family": A short 2-5 word English noun phrase summarizing the destiny for topic
+   fingerprinting only (e.g. "off-grid micro-home", "refuge den"). Always in English, regardless
+   of the input language of Theme.
 """
     brief_user = f"""Design dimensions to parse:
 - Theme: {theme}
@@ -2099,9 +2146,14 @@ Required JSON keys:
     if title:
         title = f"{creativity}·{title}"
 
+    # A parsed_brief missing any required key means all 3 LLM attempts failed and we're on
+    # the hardcoded fallback (or a malformed partial parse) — not reliable enough to fingerprint.
+    required_keys = ["carrier", "env", "trauma", "destiny", "reward", "mode", "space_type"]
+    brief_parse_failed = not all(k in parsed_brief for k in required_keys)
+
     # Register used topic DNA
     try:
-        append_to_used_topic_ledger(parsed_brief, dimensions)
+        append_to_used_topic_ledger(parsed_brief, dimensions, brief_parse_failed=brief_parse_failed)
     except Exception as e:
         if sys.stdout:
             print(f"Warning: could not write topic to used topic ledger ({e})")
