@@ -1,0 +1,20 @@
+{
+  "_purpose": "Regression for the shipped Bridge-1 video that contained static-lock + push-in wording simultaneously. fix_camera_contradictions(video_prompt, is_bridge=True) must strip the static-tripod sentence while keeping the separate, legitimate forward-movement sentence; check_camera_contradictions must then find zero residue.",
+  "i": 7,
+  "mode": "standard",
+  "is_last": false,
+  "is_threshold_or_reveal": true,
+  "beat": {
+    "operation": "threshold",
+    "description": "Cross the sill into the interior beyond.",
+    "bridge_stage": 2
+  },
+  "packet": {
+    "camera_dna": "static tripod shot, 24mm lens feel, camera height 1.4m.",
+    "primary_landmarks": [
+      {"name": "iron door hinge", "grid": "Grid B1"}
+    ]
+  },
+  "image_prompt": "Camera height 1.6m, coaxial forward-pushing camera crossing the threshold, the iron door hinge catching light in Grid B1 as the interior floor comes into full view. CHANGE IN THIS FRAME: sunlight now floods the swept plank floor beyond the sill. The horizon line remains level at 50-percent height of the frame.",
+  "video_prompt": "Camera remains locked in a static tripod shot, holding perfectly still at the threshold edge. The camera actively advances and crosses the sill toward the warmly lit interior beyond, tracking forward without hesitation."
+}

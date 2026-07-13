@@ -29,9 +29,9 @@ leftover 'vlm_qa_failed' frame and any rejected/blocked video clip, so nothing e
 dead-ends in a manual-review state.
 """
 import os
-import json
 
 from server_common import _get_project_dir
+from manifest_store import QualityGate, load_manifest, get_frame_quality_gate, set_frame_quality_gate
 from prompt_pipeline import (
     compose_anchor_and_packet,
     compose_remaining_beats,
@@ -41,6 +41,7 @@ from prompt_pipeline import (
     run_frame_qa_check,
     _format_prompt_block,
     _parse_prompt_slots,
+    prompt_slots_list,
 )
 from frame_generator import generate_frame_sequence
 from video_generator import generate_video_sequence
@@ -51,39 +52,6 @@ _MAX_RECOVERY_ATTEMPTS = 2
 
 def _frame_path(title, sequence):
     return os.path.join(_get_project_dir(title), 'frames', f'img_{sequence:03d}.webp')
-
-
-def _frame_quality_gate(project_dir, sequence):
-    """Read a single frame's recorded quality_gate from manifest.json, or None if no
-    manifest/frame entry exists yet."""
-    manifest_path = os.path.join(project_dir, 'manifest.json')
-    if not os.path.exists(manifest_path):
-        return None
-    with open(manifest_path, 'r', encoding='utf-8') as f:
-        manifest = json.load(f)
-    for frame in manifest.get('frames', []):
-        if frame.get('sequence') == sequence:
-            return frame.get('quality_gate')
-    return None
-
-
-def _set_manifest_quality_gate(project_dir, sequence, quality_gate, reason=None):
-    """Overwrite one frame's recorded quality_gate/vlm_qa_reason in manifest.json.
-    Needed because generate_frame_sequence's own per-frame QA never produces a real
-    verdict for frame 1 (it has no prior frame to compare motion against), so the
-    Anchor Acceptance Gate's verdict has to be written back out-of-band."""
-    manifest_path = os.path.join(project_dir, 'manifest.json')
-    if not os.path.exists(manifest_path):
-        return
-    with open(manifest_path, 'r', encoding='utf-8') as f:
-        manifest = json.load(f)
-    for frame in manifest.get('frames', []):
-        if frame.get('sequence') == sequence:
-            frame['quality_gate'] = quality_gate
-            frame['vlm_qa_reason'] = reason
-            break
-    with open(manifest_path, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
 
 
 def _retry_frame_until_pass(config, title, sequence, images, videos, judge, on_progress=None,
@@ -131,8 +99,8 @@ def render_and_gate_single_frame(config, title, sequence, prompt, meta='', judge
     images = {sequence: {'body': prompt, 'meta': meta}}
     passed, reason = _retry_frame_until_pass(config, title, sequence, images, {}, judge, on_progress=on_progress)
     project_dir = _get_project_dir(title)
-    status = 'auto_approved' if passed else 'needs_human_review'
-    _set_manifest_quality_gate(project_dir, sequence, status, reason)
+    status = QualityGate.AUTO_APPROVED if passed else QualityGate.NEEDS_HUMAN_REVIEW
+    set_frame_quality_gate(project_dir, sequence, status, reason)
     return {
         'status': status,
         'reason': reason,
@@ -149,12 +117,10 @@ def _recover_failed_frames(config, title, prompt_block, project_dir, on_progress
     instead of tone/rule compliance. Returns the prompt_block, re-formatted only if a
     recovered prompt actually changed."""
     images, videos = _parse_prompt_slots(prompt_block)
-    manifest_path = os.path.join(project_dir, 'manifest.json')
-    if not os.path.exists(manifest_path):
+    manifest = load_manifest(project_dir)
+    if not manifest:
         return prompt_block
-    with open(manifest_path, 'r', encoding='utf-8') as f:
-        manifest = json.load(f)
-    failed_seqs = [f['sequence'] for f in manifest.get('frames', []) if f.get('quality_gate') == 'vlm_qa_failed']
+    failed_seqs = [f['sequence'] for f in manifest.get('frames', []) if f.get('quality_gate') == QualityGate.VLM_QA_FAILED]
     for seq in failed_seqs:
         video_item = videos.get(seq - 1)
         video_prompt = video_item['body'] if isinstance(video_item, dict) else (video_item or '')
@@ -172,7 +138,7 @@ def _recover_failed_frames(config, title, prompt_block, project_dir, on_progress
             config, title, seq, images, videos, frame_judge,
             on_progress=on_progress, max_attempts=_MAX_RECOVERY_ATTEMPTS,
         )
-        _set_manifest_quality_gate(project_dir, seq, 'auto_approved' if passed else 'vlm_qa_failed', reason)
+        set_frame_quality_gate(project_dir, seq, QualityGate.AUTO_APPROVED if passed else QualityGate.VLM_QA_FAILED, reason)
     if failed_seqs:
         prompt_block = _format_prompt_block(images, videos)
     return prompt_block
@@ -231,6 +197,7 @@ def run_autonomous_pipeline(config, dimensions, on_progress=None):
         'title': title,
         'status': 'completed',
         'prompt_block': prompt_block,
+        'prompt_slots': prompt_slots_list(prompt_block),
         'project_dir': project_dir,
         'videos': video_result,
     }
@@ -250,7 +217,7 @@ def run_staged_frame_rendering(config, title, prompt_block, on_progress=None):
 
     project_dir = _get_project_dir(title)
 
-    if _frame_quality_gate(project_dir, 1) == 'auto_approved':
+    if get_frame_quality_gate(project_dir, 1) == QualityGate.AUTO_APPROVED:
         if on_progress:
             on_progress('anchor_check', {'sequence': 1, 'attempt': 0, 'passed': True, 'reason': '此前已通过判定，跳过重复渲染'})
     else:
@@ -273,6 +240,7 @@ def run_staged_frame_rendering(config, title, prompt_block, on_progress=None):
         'title': title,
         'status': 'completed',
         'prompt_block': prompt_block,
+        'prompt_slots': prompt_slots_list(prompt_block),
         'project_dir': project_dir,
         'videos': video_result,
     }

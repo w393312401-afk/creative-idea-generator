@@ -1,0 +1,20 @@
+{
+  "_purpose": "Sanity/false-positive guard: an already-compliant beat must survive apply_proactive_fixes byte-for-byte unchanged and validate_beat_prompts must report zero mechanical errors. If a future edit to the fix_*/check_* chain makes this fixture start mutating text or raising errors, that is itself a regression worth investigating.",
+  "i": 4,
+  "mode": "standard",
+  "is_last": false,
+  "is_threshold_or_reveal": false,
+  "beat": {
+    "operation": "install",
+    "description": "Install the last run of wall paneling.",
+    "bridge_stage": null
+  },
+  "packet": {
+    "camera_dna": "static tripod shot, 24mm lens feel, camera height 1.4m, eye-level perspective.",
+    "primary_landmarks": [
+      {"name": "copper pipe elbow", "grid": "Grid A3"}
+    ]
+  },
+  "image_prompt": "Camera height 1.4m, static tripod shot, 24mm lens feel, eye-level perspective holds level on the copper pipe elbow in Grid A3 as new wall paneling closes in around it. CHANGE IN THIS FRAME: honey-toned paneling now covers the stud bay, its seams pressed flush against the corner trim. The horizon line remains level at 50-percent height of the frame.",
+  "video_prompt": "Use the provided first frame and last frame as exact composition anchors. Use IMAGE 4 as the actual first-frame image and IMAGE 5 as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout. The paneling seam closes seam by seam across the stud bay in a continuous construction time-lapse, not real-time footage, completely sterile of any human presence throughout. Sound effects include the tool contact, material movement, and footsteps of this beat. Ambient noise is the steady enclosed room tone of the space."
+}

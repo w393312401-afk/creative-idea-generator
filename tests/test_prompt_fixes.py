@@ -16,6 +16,8 @@ from prompt_pipeline import (
     _beat_chunk_size,
     _chunk_consecutive_beats,
     _parse_chunk_prompt_response,
+    check_transition_shortcuts,
+    select_camera_dna,
 )
 from frame_generator import _extract_image_prompts
 
@@ -256,6 +258,64 @@ Image five.
         
         self.assertEqual(len(violations), 1)
 
+    def test_compose_image_and_video_prompt_are_independently_callable(self):
+        # Direction-3 refactor: apply_proactive_fixes used to interleave image-only and
+        # video-only fix calls in one function body with no way to exercise just one side.
+        from prompt_pipeline import compose_image_prompt, compose_video_prompt, apply_proactive_fixes
+
+        packet = {'camera_dna': 'static tripod shot, camera height 1.4m.'}
+        beat = {'operation': 'install', 'description': 'install shelving', 'bridge_stage': None}
+
+        video_only = compose_video_prompt(1, "The camera pans across the room.", False, False)
+        self.assertTrue(video_only.startswith("Use the provided first frame"))
+        self.assertNotIn("worker", video_only.lower())  # no image-side scrubbing applied
+
+        image_only = compose_image_prompt(1, "A worker installs the shelf.", packet, beat, False, '', False)
+        self.assertNotIn("worker", image_only.lower())
+        self.assertIn("equipment", image_only)
+
+        # apply_proactive_fixes must still produce the same result as calling both halves
+        # directly with the camera_dna/is_bridge it derives internally.
+        video_combo, image_combo = apply_proactive_fixes(
+            1, "The camera pans across the room.", "A worker installs the shelf.",
+            packet, 'standard', False, False, beat=beat, config=None,
+        )
+        self.assertEqual(video_combo, video_only)
+        camera_dna = select_camera_dna(beat, packet['camera_dna'])
+        self.assertEqual(image_combo, compose_image_prompt(1, "A worker installs the shelf.", packet, beat, False, camera_dna, False))
+
+    def test_check_image_and_video_prompt_errors_are_independently_callable(self):
+        from prompt_pipeline import check_image_prompt_errors, check_video_prompt_errors, validate_beat_prompts
+
+        packet = {}
+        img_errors = check_image_prompt_errors("A short image prompt.", packet, False, False, None, None, True)
+        self.assertTrue(any("horizon line" in e for e in img_errors))
+
+        vid_errors = check_video_prompt_errors(1, "A short video prompt.", False, False, None, packet)
+        self.assertTrue(any("missing required opening sentence" in e for e in vid_errors))
+
+        combined = validate_beat_prompts(
+            1, "A short video prompt.", "A short image prompt.", packet, 'standard', False, False,
+            config=None, beat=None,
+        )
+        for e in img_errors + vid_errors:
+            self.assertIn(e, combined)
+
+    def test_check_transition_shortcuts_ignores_the_mandated_guardrail_sentence(self):
+        # Regression: naive substring-matching 'jump cut' inside the mandated guardrail
+        # sentence ("...cross-dissolves, fade-ins, or jump cuts are strictly forbidden")
+        # used to permanently flag that required sentence as a violation of itself.
+        guardrail = ("Transition shortcuts like cross-dissolves, fade-ins, or jump cuts are "
+                     "strictly forbidden; every visible change must occur through continuous, "
+                     "physically traceable actions in real time.")
+        self.assertEqual(check_transition_shortcuts(guardrail), [])
+
+        # A real (non-negated) violation in a separate sentence must still be caught.
+        violation = guardrail + " The wall suddenly appears fully painted."
+        errors = check_transition_shortcuts(violation)
+        self.assertTrue(any("suddenly appears" in e for e in errors))
+        self.assertFalse(any("jump cut" in e for e in errors))
+
     def test_parse_and_format_prompt_slots_metadata(self):
         from prompt_pipeline import _parse_prompt_slots, _format_prompt_block
         block = """图片提示词
@@ -296,6 +356,30 @@ Video prompt 8 here.
         self.assertIn("图片 8 [BRIDGE]:", formatted)
         self.assertIn("视频 8 [BRIDGE]:", formatted)
         self.assertIn("视频 1:", formatted)
+
+    def test_prompt_slots_list_is_the_single_source_the_frontend_should_consume(self):
+        # Direction-1 refactor: the API now ships a structured 'prompt_slots' list
+        # alongside the legacy 'prompt_block' string, so the frontend can stop
+        # re-deriving slots with its own independent regex (js/prompt_pipeline.js
+        # resolvePromptSlots prefers this field when present).
+        from prompt_pipeline import prompt_slots_list
+        block = """图片提示词
+图片 1:
+Image one body.
+
+图片 2 [BRIDGE]:
+Image two body.
+
+视频提示词
+视频 1 [BRIDGE]:
+Video one body.
+"""
+        slots = prompt_slots_list(block)
+        self.assertEqual(slots, [
+            {'type': 'image', 'index': 1, 'meta': '', 'body': 'Image one body.'},
+            {'type': 'image', 'index': 2, 'meta': 'BRIDGE', 'body': 'Image two body.'},
+            {'type': 'video', 'index': 1, 'meta': 'BRIDGE', 'body': 'Video one body.'},
+        ])
 
 class TestPacketShapeNormalization(unittest.TestCase):
     """Regression tests for the Beat-2 abort: the packet LLM returned worker_choreography

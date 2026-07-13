@@ -18,10 +18,6 @@ from server_common import (
     IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT,
     PACKET_CACHE_LOCK, PROCESS_BRIEF_CACHE_LOCK
 )
-from frame_generator import (
-    call_image_llm, _crop_to_aspect_ratio, _detect_image_mime_from_path,
-    _generate_image_edit
-)
 
 # Clip timing constants: single source of truth for the video-model clip length and the
 # worker exit deadline referenced throughout the fix_*/check_* pipeline and skill contract.
@@ -58,20 +54,8 @@ def _record_tokens(usage):
     _usage_tracker.completion_tokens += usage.get('completion_tokens', 0)
     _usage_tracker.total_tokens += usage.get('total_tokens', 0)
 
-CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'packet_cache.json')
-PROCESS_BRIEF_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'process_brief_cache.json')
-
-
-def _slice_between(text, start_marker, end_marker):
-    """Return the substring from start_marker up to (not including) end_marker.
-    Falls back to the tail from start_marker if end_marker is absent."""
-    start = text.find(start_marker)
-    if start == -1:
-        return ''
-    end = text.find(end_marker, start + len(start_marker))
-    if end == -1:
-        return text[start:]
-    return text[start:end]
+CACHE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'packet_cache.json')
+PROCESS_BRIEF_CACHE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'process_brief_cache.json')
 
 
 def _aux_model(config):
@@ -86,135 +70,6 @@ def _aux_model(config):
     if 'agent' in main_model.lower() or not main_model:
         return 'gemini-3.5-flash-low'
     return main_model
-
-
-def load_skill_contract():
-    """Read the live SKILL.md + prompt-templates.md and assemble the authoritative
-    composition contract. Reading at request time keeps the shell in sync with the skill."""
-    skill_md_path = os.path.join(SKILL_DIR, 'SKILL.md')
-    templates_path = os.path.join(SKILL_DIR, 'references', 'prompt-templates.md')
-
-    pipeline = ''
-    templates = ''
-    try:
-        with open(skill_md_path, 'r', encoding='utf-8') as f:
-            skill_md = f.read()
-        # Forward-composition portion only: pipeline + the vocab/camera/lighting/audio
-        # reference tables. Drops the video reverse-engineering tiers (Tier 4) and the
-        # cross-skill/Notion plumbing that do not apply to GUI-driven generation.
-        pipeline = _slice_between(skill_md, '## Internal Composition Pipeline', '## Cross-Skill Integration')
-    except Exception as e:
-        if sys.stdout:
-            print(f"Warning: could not read SKILL.md ({e})")
-    try:
-        with open(templates_path, 'r', encoding='utf-8') as f:
-            templates = f.read()
-    except Exception as e:
-        if sys.stdout:
-            print(f"Warning: could not read prompt-templates.md ({e})")
-
-    # Replace hardcoded durations with constants dynamically
-    if pipeline:
-        pipeline = pipeline.replace("8-second", f"{int(VIDEO_DURATION)}-second")
-        pipeline = pipeline.replace("t=8s", f"t={int(VIDEO_DURATION)}s")
-        pipeline = pipeline.replace("t=7.5s", f"t={WORKER_EXIT_TIME}s")
-    if templates:
-        templates = templates.replace("8-second", f"{int(VIDEO_DURATION)}-second")
-        templates = templates.replace("t=8s", f"t={int(VIDEO_DURATION)}s")
-        templates = templates.replace("t=7.5s", f"t={WORKER_EXIT_TIME}s")
-
-    return pipeline, templates
-
-
-def build_topic_brief(d):
-    """Translate the GUI dimension selections into a Tier-1 topic brief the skill consumes."""
-    theme = d.get('theme', '未指定场景')
-    anchors = d.get('anchors') or []
-    anchors_str = '、'.join(anchors) if anchors else '由作曲家自行选取最契合主题的锚点'
-    complexity = d.get('complexity', '中等重工')
-    budget = d.get('budget', '轻奢设计师级')
-    ratio = d.get('ratio', '50%')
-    creativity = d.get('creativity', '突破常规')
-
-    return f"""本次为 GUI 维度驱动的 Tier-1 合成请求。请据此走完内部合成管线（Step 1 至 Step 9），产出完整的 IMAGE/VIDEO 提示词集与中文质量审核报告。
-
-输入维度：
-- 场景主题：{theme}
-- 核心创意锚点：{anchors_str}
-- 项目复杂度：{complexity}
-- 预算级别：{budget}
-- 外壳 \u2194 内里反差强度：{ratio}
-- 创意尺度：{creativity}
-
-硬性要求：
-1. 把该主题落成一个「可真实搭建 / 改造」的延时场景，必须显式给出 CARRIER / ENV / TRAUMA（初始残破或空白态）/ DESTINY（成品态）/ REWARD ACTION。因为场景主题均为写实载体（如百年空心橡树、蓝冰冰川洞、退役潜艇舱、废弃水塔等），所以必须以「真实可施工的废弃外壳\u2192温暖室内改造」为核心，用真实的工具链、材料来源与物理因果痕迹把它落地，禁止物体凭空出现。
-2. 节拍数下限：至少 15 个施工节拍（即 N ≥ 15，对应至少 16 张 IMAGE、15 段 VIDEO），再加最终 reward；按真实工序把改造拆成足够细的独立步骤（拆除清运 \u2192 结构修复 \u2192 水电管线粗装 \u2192 封板封墙 \u2192 底漆 \u2192 面漆 \u2192 地面 \u2192 灯具/设备接线 \u2192 家具软装…）。每拍只允许一个物理操作 + 微增量拆分，相邻 IMAGE 锚点状态变化不超过 3 个九宫格。如果一个工序变化超过画面三分之一，再拆成连续子节拍。
-3. 【施工顺序与物理因果，最高优先级】整套视频的推进必须符合现实物理因果顺序；任何违反都视为致命错误并必须重排节拍。明确禁止下列情况：
-   - 在「布线 / 通电」节拍完成之前，出现任何亮灯、灯带发光、屏幕点亮、设备通电运行的画面；
-   - 在外部（外立面 / 屋面 / 场地 / 除锈防腐）尚未处理完成之前，就跨过门槛进入室内施工；
-   - 在「除锈 / 打磨 / 清洁 / 底漆」完成之前，出现面漆、喷漆、清漆或任何光泽涂层；
-   - 湿作业（砂浆 / 混凝土 / 胶水 / 油漆）尚未干结固化之前，就进入会把它覆盖掉的下一道工序；
-   - 任何会被后续封板/饰面遮盖的管线、结构、防水层，必须在封盖节拍之前先完成。
-   施工状态必须单调递增：已清理的保持干净、已安装的保持就位、已干的保持干态，禁止回退。
-4. 全程执行 NGCS 九宫格坐标、Camera DNA 逐字复制、GCTR 因果痕迹（每处变化至少 2 个接触痕迹）、连续动作流（工人 t=0s 进、t=7.5s 出）、以及纯自然语言铁律——最终提示词正文里不得出现 % 符号、数字区间或任何技术缩写。
-5. 创意尺度越高，DESTINY 与视觉反差越大胆，但绝不能牺牲第 1、3、4 条的物理连续性与因果顺序。
-6. 【方案新颖度避雷/克制套路】严禁采用陈旧套路的方案（如：集装箱改造成极简小屋、旧货车/巴士改造成标准露营房车、仓库改造成工业Loft、灯塔改造成海滨卧室等），必须提供高新颖度与强反差的方案组合。
-7. 【可施工性屏障】严禁任何魔法般瞬间变出家具、无合理生根基础或材料突变的片段。必须留下真实的物理因果痕迹与接触痕迹，扅术细节和接口连接均需合理，必须能够映射到真实的施工工序中。
-8. 【截图招牌反差点】整个场景必须包含且仅包含一个风格化的招牌反差点（如：载体本体材质切面窗、水面玻璃地板、树皮伪装天窗、活体木纹/岩壁旋梯、生物荧光苔藓照明、整块载体板材台面、改道瀑布淋浴等）。必须在成品态（DESTINY）的醒目位置体现。"""
-
-
-def build_system_prompt():
-    pipeline, templates = load_skill_contract()
-    contract_block = pipeline if pipeline else "(SKILL.md 合成管线未能加载，请依据通用延时改造连续性契约生成。)"
-    templates_block = templates if templates else "(canonical templates 未能加载)"
-
-    return f"""You are operating as the `restoration-prompt-composer` skill — a one-shot prompt composition engine for restoration / renovation / construction time-lapse video. You receive a GUI-collected topic brief and must produce a complete, production-ready IMAGE + VIDEO prompt set that strictly conforms to the skill contract below. Internalize every gate; do not expose internal step names to the user.
-
-==================== SKILL CONTRACT (authoritative) ====================
-{contract_block}
-
-==================== CANONICAL TEMPLATES & CHECKLIST ====================
-{templates_block}
-
-==================== OUTPUT FORMAT (MANDATORY) ====================
-Respond with EXACTLY the four section markers below, in this order, with nothing before `===TITLE===` and nothing after the audit body. Do NOT wrap anything in markdown code fences.
-
-===TITLE===
-<a short, catchy, viral Chinese project name, e.g. 工业复古·废土集装箱卧室>
-===THEME===
-<the scene theme in Chinese, one short phrase>
-===PROMPTS===
-图片提示词
-图片 1:
-<English image-model prompt prose>
-
-图片 2:
-<English image-model prompt prose>
-
-视频提示词
-视频 1:
-<English video-model prompt prose>
-
-视频 2:
-<English video-model prompt prose>
-===AUDIT===
-<提示词质量审核报告：用 Markdown 表格列出关键 P0/P1 检查项（九宫格锁定、Camera DNA 复制、因果痕迹 GCTR、微增量拆分、连续动作流、纯自然语言、累计状态、施工顺序等）及通过状态与一句话说明。>
-
-Hard rules for the ===PROMPTS=== section:
-- Use ONLY these labels: `图片提示词`, `图片 N:`, `视频提示词`, `视频 N:`. Each label on its own line.
-- IMAGE count must equal N+1; VIDEO count must equal N. N must be AT LEAST 15 (so at least 16 image slots and 15 video slots); use more if the build genuinely needs it. Do not collapse or skip beats to stay short.
-- The beat ladder MUST obey real construction order: demolition and debris clearing → structural repair → rough-in wiring/plumbing/ducting → close-up panels → primer → finish/topcoat → flooring → fixtures and lighting ONLY after their wiring beat → furniture and decoration last. Hard vetoes (a single occurrence invalidates the whole set): never show powered lights, glowing strips, lit screens, or running equipment before the wiring/power beat; never cross the threshold into the interior before the exterior is finished; never show paint, spray, or topcoat before rust removal, cleaning, and priming; never cover wet/uncured material with the next layer. Construction state is monotonic — finished work never regresses.
-- [NEW RULE] Clear Path Requirement: If a project introduces any sliding, rolling, retracting, folding, or moving mechanical parts (e.g. bed rails, slide-out bed, retractable roof, folding stairs), the prompt generator must ensure a clean spatial path. If there are structural columns, support pillars, or bulkheads in the trauma state (IMAGE 1) that block this path, they must be explicitly cut and removed early (typically in structural repair phase) and replaced by peripheral support frames (e.g. ceiling arches or beams) before any rails or mechanisms are installed.
-- [NEW RULE] Floor and Skeleton Logic: If floor/wall joists, ribs, or framing studs will be insulated or paneled later, the bare structural skeleton (e.g. open metal joists or ribs) must be exposed at the very beginning (IMAGE 1/2). The floor/wall states must progress monotonically forward: bare joists/studs -> rough-in / insulation -> subfloor -> wood planks / paneling. Never start with a solid finished-looking floor that disappears to reveal raw joists later.
-- [NEW RULE] Perspective Isolation: Do not flip camera facing directions (e.g. turning 180 degrees from looking out to looking in) in the same spatial axis without a clean separate phase or TBCP transition. If the project centers on a slide-out reward action (e.g. bed sliding out of a cliff cabin), lock Camera Family B (looking outward through the opening towards the view) from the very first frame to maintain spatial consistency.
-- [NEW RULE] Strict Single-Operation Beat Rule: Each {int(VIDEO_DURATION)}-second video prompt must describe exactly one homogeneous physical task. Combining multiple distinct stages (e.g. painting AND mounting frames, or framing AND insulating, or laying tile AND anchoring stoves AND mounting bed frames) into a single {int(VIDEO_DURATION)}-second clip is strictly prohibited to prevent visual morphing and cut-scene jumps.
-- [NEW RULE] Bi-Directional Agent Flow: Standardize worker paths to prevent teleporting or instant popping. Workers must enter the frame from a specific coordinate edge at t=0s and walk out through the same edge by t={WORKER_EXIT_TIME}s, leaving the frame completely empty of personnel at t={int(VIDEO_DURATION)}s.
-- [NEW RULE] Rigid Container Encapsulation: All loose materials, debris, fasteners, and liquids must be stored and tracked inside rigid, quantifiable containers (e.g. buckets, parts trays, boxes), and their volumes must be described as continuously increasing or decreasing.
-- [NEW RULE] Mandatory Climax Video: Ensure the transition between the final two frames (the "Dressed interior" -> "Retract/slide action") is fully animated. The climax video (VIDEO N) must depict the actual physical kinetic movement of the mechanism (e.g. the bed rolling smoothly forward, the glass door sliding open).
-- One blank line between each slot. No markdown headings, bullets, or tables inside this section.
-- Prompt bodies are English natural-language prose suitable for an image / video generation model.
-- Never emit `%`, raw numeric ranges (e.g. `10% to 90%`), or technical acronyms (HAL, GCTR, RPL, VMFP, RCE, NGCS, SCUP) inside the prompt bodies. Express all progress and traces as fluid visual prose.
-- Every VIDEO begins with `Use the provided first frame and last frame as exact composition anchors.` and binds IMAGE N to IMAGE N+1."""
 
 
 def _chat(config, system, user, temperature=0.85, max_tokens=16384, timeout=240, on_chunk=None, model=None):
@@ -1281,40 +1136,49 @@ CRITICAL CONSTRAINTS:
     return prompt
 
 
-def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal, beat=None, config=None):
-    # 1. Clean initial prompt text
-    image_prompt = clean_prompt_text(image_prompt)
+def compose_video_prompt(i, video_prompt, is_threshold_or_reveal, is_bridge, config=None):
+    """The VIDEO-only half of apply_proactive_fixes's fix chain, extracted so it can be
+    read, tested, and (eventually) reused independently of the IMAGE-only half. Order and
+    arguments are unchanged from the original interleaved function — see apply_proactive_fixes."""
     video_prompt = clean_prompt_text(video_prompt)
-    
-    # 2. Compress first with a lower target budget to leave room for post-compression proactive additions
-    image_prompt = compress_prompt_to_budget(image_prompt, 100, config, is_video=False)
     video_prompt = compress_prompt_to_budget(video_prompt, 70, config, is_video=True)
-    
-    # 3. Apply proactive fixes post-compression to guarantee mandatory quality requirements
-    image_prompt = fix_image_clean_frame_proactive(image_prompt)
     video_prompt = fix_video_opening(i, video_prompt)
     video_prompt = fix_pacing_control(video_prompt, is_threshold_or_reveal)
     video_prompt = fix_out_and_in(video_prompt, is_threshold_or_reveal)
     video_prompt = fix_sound_design(video_prompt)
-    
-    base_camera_dna = packet.get('camera_dna', '')
-    camera_dna = select_camera_dna(beat, base_camera_dna)
+    video_prompt = fix_camera_contradictions(video_prompt, is_bridge)
+    return video_prompt
+
+
+def compose_image_prompt(i, image_prompt, packet, beat, is_last, camera_dna, is_bridge, config=None):
+    """The IMAGE-only half of apply_proactive_fixes's fix chain — see compose_video_prompt."""
+    image_prompt = clean_prompt_text(image_prompt)
+    image_prompt = compress_prompt_to_budget(image_prompt, 100, config, is_video=False)
+    image_prompt = fix_image_clean_frame_proactive(image_prompt)
     if camera_dna:
         image_prompt = fix_camera_dna(image_prompt, camera_dna)
-        
-    op = beat.get('operation', '').lower() if beat else ''
-    desc = beat.get('description', '').lower() if beat else ''
-    
-    bridge_stage = beat.get('bridge_stage') if beat else None
-    is_bridge = bridge_stage in (1, 2)
-        
-    video_prompt = fix_camera_contradictions(video_prompt, is_bridge)
     image_prompt = fix_camera_contradictions(image_prompt, is_bridge)
-    
     image_prompt = fix_rhma_blur(image_prompt, is_last)
     image_prompt = fix_horizon_line(image_prompt)
     image_prompt = fix_primary_landmarks(image_prompt, packet)
-    
+    return image_prompt
+
+
+def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal, beat=None, config=None):
+    """Thin composition of compose_video_prompt + compose_image_prompt. camera_dna/is_bridge
+    are derived once here (from beat/packet, independent of either prompt's own fix chain)
+    and threaded into both — mirrors the original interleaved function's data flow exactly,
+    just reorganized into two independently-testable halves (see tests/fixtures/prompt_rules/
+    golden fixtures, which pin this function's end-to-end output and caught zero regressions
+    across this split)."""
+    base_camera_dna = packet.get('camera_dna', '')
+    camera_dna = select_camera_dna(beat, base_camera_dna)
+    bridge_stage = beat.get('bridge_stage') if beat else None
+    is_bridge = bridge_stage in (1, 2)
+
+    video_prompt = compose_video_prompt(i, video_prompt, is_threshold_or_reveal, is_bridge, config=config)
+    image_prompt = compose_image_prompt(i, image_prompt, packet, beat, is_last, camera_dna, is_bridge, config=config)
+
     return video_prompt, image_prompt
 
 
@@ -1429,15 +1293,27 @@ def check_out_and_in(prompt, is_threshold_or_reveal=False):
 
 def check_transition_shortcuts(prompt):
     """Reject abstract / causal-shortcut phrasing that skips concrete physical action — the exact
-    failure mode of the placeholder fallback. Forces the model toward observable build actions."""
+    failure mode of the placeholder fallback. Forces the model toward observable build actions.
+
+    Negation-aware (mirrors clean_prompt_text's negation_words): the mandated guardrail sentence
+    ("Transition shortcuts like cross-dissolves, fade-ins, or jump cuts are strictly forbidden")
+    itself names 'jump cuts', so a naive substring scan would permanently flag that required
+    sentence as a violation of the very rule it states.
+    """
     errors = []
-    low = prompt.lower()
     lazy_phrases = ['transformation progresses', 'magically', 'instantly transform',
                     'jump cut', 'time skip', 'suddenly appears', 'teleport',
                     'as if by magic', 'out of nowhere']
-    for p in lazy_phrases:
-        if p in low:
-            errors.append(f"VIDEO uses abstract/causal-shortcut phrase '{p}'; describe concrete, traceable physical actions instead")
+    negation_words = ['forbid', 'avoid', 'no', 'without', 'never', 'not', 'stop', 'prevent', 'strictly', 'prohibit']
+
+    sentences = re.split(r'(?<=[.!?])\s+', prompt)
+    for sentence in sentences:
+        low_sent = sentence.lower()
+        if any(neg in low_sent for neg in negation_words):
+            continue
+        for p in lazy_phrases:
+            if p in low_sent:
+                errors.append(f"VIDEO uses abstract/causal-shortcut phrase '{p}'; describe concrete, traceable physical actions instead")
     return errors
 
 
@@ -1776,59 +1652,70 @@ IMAGE i+1 (New State):
         return []
 
 
-def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal, prev_video=None, prev_image=None, config=None, beat=None, skip_llm_checks=False):
+def check_image_prompt_errors(image_prompt, packet, is_last, is_bridge, prev_image, config, skip_llm_checks):
+    """The IMAGE-only half of validate_beat_prompts's check chain — see
+    check_video_prompt_errors and validate_beat_prompts."""
     errors = []
-    
-    # Word count limits check
     img_word_count = len(image_prompt.split())
     if img_word_count > 170:
         errors.append(f"IMAGE prompt word count ({img_word_count}) exceeds limit of 170 words")
-        
-    vid_word_count = len(video_prompt.split())
-    if vid_word_count > 180:
-        errors.append(f"VIDEO prompt word count ({vid_word_count}) exceeds limit of 180 words")
 
-    # Grid coordinate checks
     errors.extend(check_grid_coordinates(image_prompt))
-    errors.extend(check_grid_coordinates(video_prompt))
-    
-    # Landmark exact-match restatement check
     errors.extend(check_primary_landmarks_exact_match(image_prompt, packet))
-
     errors.extend(check_nlvtr_violations(image_prompt))
     errors.extend(check_image_clean_frame(image_prompt))
     if "horizon line" not in image_prompt.lower():
         errors.append("IMAGE prompt missing 'horizon line' camera lock statement")
-        
+
     if is_last:
         if "reflection" in image_prompt.lower() or "polished" in image_prompt.lower():
             if "blurred" not in image_prompt.lower() and "diffused" not in image_prompt.lower():
                 errors.append("Final IMAGE with polished/reflective floor missing RHMA-Blur diffused reflection description")
-                
-    errors.extend(check_nlvtr_violations(video_prompt))
-    errors.extend(check_video_opening(i, video_prompt))
-    errors.extend(check_out_and_in(video_prompt, is_threshold_or_reveal))
-    errors.extend(check_transition_shortcuts(video_prompt))
-    errors.extend(check_pacing_control(video_prompt, is_threshold_or_reveal))
-    
-    # Check camera contradictions
-    op = beat.get('operation', '').lower() if beat else ''
-    desc = beat.get('description', '').lower() if beat else ''
-    
-    bridge_stage = beat.get('bridge_stage') if beat else None
-    is_bridge = bridge_stage in (1, 2)
-        
-    errors.extend(check_camera_contradictions(video_prompt, is_bridge))
+
     errors.extend(check_camera_contradictions(image_prompt, is_bridge))
-    
-    if prev_video:
-        errors.extend(check_stylistic_repetition(video_prompt, prev_video, packet, is_video=True))
+
     if prev_image:
         errors.extend(check_stylistic_repetition(image_prompt, prev_image, packet, is_video=False))
         if config and not skip_llm_checks:
             errors.extend(check_monotonic_state_regression(config, prev_image, image_prompt))
             errors.extend(check_visible_delta_between_frames(config, prev_image, image_prompt))
-        
+
+    return errors
+
+
+def check_video_prompt_errors(i, video_prompt, is_threshold_or_reveal, is_bridge, prev_video, packet):
+    """The VIDEO-only half of validate_beat_prompts's check chain — see check_image_prompt_errors."""
+    errors = []
+    vid_word_count = len(video_prompt.split())
+    if vid_word_count > 180:
+        errors.append(f"VIDEO prompt word count ({vid_word_count}) exceeds limit of 180 words")
+
+    errors.extend(check_grid_coordinates(video_prompt))
+    errors.extend(check_nlvtr_violations(video_prompt))
+    errors.extend(check_video_opening(i, video_prompt))
+    errors.extend(check_out_and_in(video_prompt, is_threshold_or_reveal))
+    errors.extend(check_transition_shortcuts(video_prompt))
+    errors.extend(check_pacing_control(video_prompt, is_threshold_or_reveal))
+    errors.extend(check_camera_contradictions(video_prompt, is_bridge))
+
+    if prev_video:
+        errors.extend(check_stylistic_repetition(video_prompt, prev_video, packet, is_video=True))
+
+    return errors
+
+
+def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal, prev_video=None, prev_image=None, config=None, beat=None, skip_llm_checks=False):
+    """Thin composition of check_image_prompt_errors + check_video_prompt_errors — mirrors
+    apply_proactive_fixes/compose_image_prompt/compose_video_prompt's split. Only the
+    ordering of entries in the combined error list changes versus the previous interleaved
+    version; callers only ever check truthiness of the result (`if not errs`) or display the
+    full list, never index into it positionally."""
+    bridge_stage = beat.get('bridge_stage') if beat else None
+    is_bridge = bridge_stage in (1, 2)
+
+    errors = []
+    errors.extend(check_image_prompt_errors(image_prompt, packet, is_last, is_bridge, prev_image, config, skip_llm_checks))
+    errors.extend(check_video_prompt_errors(i, video_prompt, is_threshold_or_reveal, is_bridge, prev_video, packet))
     return errors
 
 
@@ -3081,6 +2968,23 @@ def _parse_prompt_slots(block):
             }
             
     return images, videos
+
+
+def prompt_slots_list(prompt_block):
+    """Structured wire-format counterpart to the 'prompt_block' text field: one parse,
+    consumed by both the API response and any server-side slot-count logic, so the
+    frontend no longer needs its own regex re-derivation of the same slots (which used to
+    drift from this parser's re.DOTALL same-line-body handling — see js/prompt_pipeline.js
+    resolvePromptSlots). Callers that already have images/videos dicts from
+    _parse_prompt_slots should build this list directly instead of re-parsing.
+    """
+    images, videos = _parse_prompt_slots(prompt_block)
+    slots = []
+    for idx in sorted(images):
+        slots.append({'type': 'image', 'index': idx, 'meta': images[idx].get('meta', ''), 'body': images[idx].get('body', '')})
+    for idx in sorted(videos):
+        slots.append({'type': 'video', 'index': idx, 'meta': videos[idx].get('meta', ''), 'body': videos[idx].get('body', '')})
+    return slots
 
 
 def _missing_prompt_slots(images, videos, image_range, video_range):

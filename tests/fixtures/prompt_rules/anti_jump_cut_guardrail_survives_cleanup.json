@@ -1,0 +1,20 @@
+{
+  "_purpose": "Regression for two related bugs: (1) clean_prompt_text must not mangle the mandated anti-jump-cut guardrail sentence into 'like , , or' (it is negation-aware via the word 'forbidden'/'strictly'); (2) check_transition_shortcuts must not flag that same mandated sentence as itself being a jump-cut violation (fixed in this session — see test_check_transition_shortcuts_ignores_the_mandated_guardrail_sentence).",
+  "i": 3,
+  "mode": "standard",
+  "is_last": false,
+  "is_threshold_or_reveal": false,
+  "beat": {
+    "operation": "install",
+    "description": "Install new floor boards across the room.",
+    "bridge_stage": null
+  },
+  "packet": {
+    "camera_dna": "static tripod shot, 24mm lens feel, camera height 1.4m, eye-level perspective.",
+    "primary_landmarks": [
+      {"name": "cast iron radiator", "grid": "Grid A2"}
+    ]
+  },
+  "image_prompt": "Camera height 1.4m, static tripod shot holding steady on the cast iron radiator in Grid A2 as new floor boards spread across the room. CHANGE IN THIS FRAME: pale oak floor boards now cover the subfloor, their fresh grain catching the light. The horizon line remains level at 50-percent height of the frame.",
+  "video_prompt": "One lone worker fits floor boards into place across the room, working steadily toward the far wall. Transition shortcuts like cross-dissolves, fade-ins, or jump cuts are strictly forbidden; every visible change must occur through continuous, physically traceable actions in real time. At t=0s, one lone worker enters the frame from the Grid C1 edge; the worker performs work, and by t=7.5s, walks out of the frame through the Grid C1 edge, leaving the frame completely empty at t=8s. This is a continuous construction time-lapse, not real-time footage."
+}

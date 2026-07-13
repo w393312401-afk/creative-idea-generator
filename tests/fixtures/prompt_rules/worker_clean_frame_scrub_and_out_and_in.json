@@ -1,0 +1,20 @@
+{
+  "_purpose": "Composite fixture: fix_image_clean_frame_proactive must scrub worker/active-verb references from the IMAGE prompt (clean-frame requirement), while the VIDEO prompt for the same beat is allowed to keep its worker and must instead gain the Out-and-In entry/exit clause, the pacing-control sentence, and the sound-design sentence.",
+  "i": 2,
+  "mode": "standard",
+  "is_last": false,
+  "is_threshold_or_reveal": false,
+  "beat": {
+    "operation": "clear",
+    "description": "Clear debris from the hearth.",
+    "bridge_stage": null
+  },
+  "packet": {
+    "camera_dna": "static tripod shot, 24mm lens feel, camera height 1.4m.",
+    "primary_landmarks": [
+      {"name": "soot-stained fireplace mantel", "grid": "Grid A1"}
+    ]
+  },
+  "image_prompt": "Camera height 1.4m, static tripod shot framing the soot-stained fireplace mantel in Grid A1. A worker is sweeping ash away from the hearth stones. The horizon line remains level at 50-percent height of the frame.",
+  "video_prompt": "A builder pries the fallen roof beam free and drags it clear of the hearth, then sweeps loose stones aside."
+}

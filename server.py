@@ -85,6 +85,7 @@ def background_worker(task_id, config, dimensions):
         }
         result['image_count'] = len(images)
         result['video_count'] = len(videos)
+        result['prompt_slots'] = prompt_slots_list(result['prompt_block'])
         
         if t["cancel_event"].is_set():
             raise ConnectionError("Generation cancelled by user")
@@ -318,9 +319,6 @@ def render_staged_worker(task_id, config, title, prompt_block):
         save_tasks_to_disk()
 
 
-_VIDEO_GEN_SERIAL_LOCK = threading.Lock()
-
-
 def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
     t = get_or_create_task(task_id)
     try:
@@ -335,57 +333,54 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
 
         progress_cb('queue', {'message': '视频生成请求已加入队列，正在等待排队生成...'})
 
-        with _VIDEO_GEN_SERIAL_LOCK:
-            result = generate_video_sequence(
-                config, title, prompt_block,
-                on_progress=progress_cb,
-                target_slots=target_slots
-            )
+        result = generate_video_sequence(
+            config, title, prompt_block,
+            on_progress=progress_cb,
+            target_slots=target_slots
+        )
             
-            usage = stop_and_get_accounting()
-            if usage:
-                result['token_usage'] = usage
-            
-            # Check if all expected videos are successfully generated
-            _, expected_videos = _parse_prompt_slots(prompt_block)
-            expected_slots = list(expected_videos.keys())
-            manifest_videos = result.get('videos', [])
-            manifest_video_slots = {v['slot']: v for v in manifest_videos}
-            
-            has_failures = False
-            for slot in expected_slots:
-                if slot not in manifest_video_slots:
-                    has_failures = True
-                    break
-                if manifest_video_slots[slot].get('status') != 'success':
-                    has_failures = True
-                    break
+        usage = stop_and_get_accounting()
+        if usage:
+            result['token_usage'] = usage
 
-            if has_failures:
-                progress_cb('merge_skip', {'message': '检测到存在生成失败或缺失的视频片段，已跳过自动合并视频。'})
+        # Try to automatically merge videos. merge_project_videos is the single source of
+        # truth for "is this project complete enough to merge" (slot-completeness gate +
+        # anchor-consistency gate) — it raises a descriptive RuntimeError when it refuses,
+        # which the except branch below surfaces as 'merge_error'. This worker used to
+        # duplicate that completeness judgment here first (deriving expected slots from
+        # prompt_block instead of manifest.frames, which could disagree with the gate
+        # merge_project_videos actually enforces) purely to emit a friendlier 'merge_skip'
+        # message before even attempting the merge; removing it also brings this path in
+        # line with /api/merge_videos, which has always called merge_project_videos
+        # directly with no separate pre-check.
+        try:
+            progress_cb('merge_start', {'message': '正在自动合并并加速视频...'})
+            project_dir = _get_project_dir(title)
+            merged_info = merge_project_videos(project_dir)
+            if merged_info:
+                result['merged_video'] = merged_info
+                # Also update manifest file on disk
+                manifest_path = os.path.join(project_dir, 'manifest.json')
+                if os.path.exists(manifest_path):
+                    try:
+                        with open(manifest_path, 'r', encoding='utf-8') as f:
+                            mdata = json.load(f)
+                        mdata['merged_video'] = merged_info
+                        with open(manifest_path, 'w', encoding='utf-8') as f:
+                            json.dump(mdata, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        print(f"Warning: could not update manifest.json with merged_video ({e})")
+                progress_cb('merge_done', {'merged_video': merged_info})
             else:
-                # Try to automatically merge videos
-                try:
-                    progress_cb('merge_start', {'message': '正在自动合并并加速视频...'})
-                    project_dir = _get_project_dir(title)
-                    merged_info = merge_project_videos(project_dir)
-                    if merged_info:
-                        result['merged_video'] = merged_info
-                        # Also update manifest file on disk
-                        manifest_path = os.path.join(project_dir, 'manifest.json')
-                        if os.path.exists(manifest_path):
-                            try:
-                                with open(manifest_path, 'r', encoding='utf-8') as f:
-                                    mdata = json.load(f)
-                                mdata['merged_video'] = merged_info
-                                with open(manifest_path, 'w', encoding='utf-8') as f:
-                                    json.dump(mdata, f, ensure_ascii=False, indent=2)
-                            except Exception as e:
-                                print(f"Warning: could not update manifest.json with merged_video ({e})")
-                    progress_cb('merge_done', {'merged_video': merged_info})
-                except Exception as merge_err:
-                    print(f"Error during auto-merge: {merge_err}")
-                    progress_cb('merge_error', {'message': f'自动合并视频失败: {str(merge_err)}'})
+                progress_cb('merge_skip', {'message': '未找到任何成功生成的视频片段，已跳过自动合并视频。'})
+        except VideoMergeBlocked as merge_blocked:
+            # A deliberate gate rejection (missing/failed slot, or anchor mismatch) is not
+            # a system failure — surface it the same way the old pre-check used to (a soft
+            # 'skipped' status), just with the gate's own more specific slot-level message.
+            progress_cb('merge_skip', {'message': str(merge_blocked)})
+        except Exception as merge_err:
+            print(f"Error during auto-merge: {merge_err}")
+            progress_cb('merge_error', {'message': f'自动合并视频失败: {str(merge_err)}'})
 
         with ACTIVE_TASKS_LOCK:
             t["status"] = "completed"

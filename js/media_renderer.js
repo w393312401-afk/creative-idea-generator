@@ -47,8 +47,8 @@ function renderIdea(result) {
     document.getElementById('idea-prompt-block').textContent = result.prompt_block || '（本次未返回提示词内容）';
     document.getElementById('idea-audit').innerHTML = renderAuditMarkdown(result.audit_md);
     
-    // Parse slots and render them
-    renderParsedPrompts(result.prompt_block);
+    // Parse slots and render them (prefers result.prompt_slots when present — see resolvePromptSlots)
+    renderParsedPrompts(result);
     
     // Collapsible Audit panel logic: default fold, auto expand & highlight on repair
     const auditDetails = document.getElementById('audit-details');
@@ -136,8 +136,8 @@ function renderFramesForIdea(idea) {
         return;
     }
 
-    // Get expected image slots
-    const slots = parsePromptBlock(idea ? idea.prompt_block : '');
+    // Get expected image slots (prefers idea.prompt_slots when present — see resolvePromptSlots)
+    const slots = resolvePromptSlots(idea || '');
     const imageSlots = slots.filter(s => s.type === 'image').sort((a, b) => a.index - b.index);
 
     if (imageSlots.length === 0) {

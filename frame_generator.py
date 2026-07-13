@@ -20,6 +20,7 @@ from server_common import (
     IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT,
     IMAGE_TASKS, IMAGE_TASKS_LOCK
 )
+from manifest_store import QualityGate
 
 
 
@@ -154,58 +155,6 @@ def update_manifest_stale_status(manifest, project_dir):
         del manifest['merged_video']
     if 'videos' in manifest:
         manifest['videos'] = []
-
-
-def call_image_llm(config, prompt_content):
-    base_model = config.get('imageModel') or 'gemini-3.1-flash-image'
-    if 'nano-banana-2' in base_model:
-        base_model = base_model.replace('nano-banana-2', 'gemini-3.1-flash-image')
-
-    # Build magic suffix model name (Method 3)
-    model = base_model
-    
-    # 1. Aspect Ratio suffix
-    aspect_ratio = config.get('imageAspectRatio')
-    if aspect_ratio:
-        # replace ':' with '-' to convert '9:16' to '9-16'
-        ratio_suffix = aspect_ratio.replace(':', '-')
-        model = f"{model}-{ratio_suffix}"
-
-    # 2. Quality suffix
-    quality = config.get('imageQuality')
-    if quality:
-        q_lower = quality.lower()
-        if q_lower in ('2k', 'medium'):
-            model = f"{model}-2k"
-        elif q_lower in ('4k', 'hd'):
-            model = f"{model}-4k"
-        # '1k' or 'standard' gets no suffix
-
-    if sys.stdout:
-        print(f"[DEBUG] call_image_llm (magic suffix): original_model='{base_model}', constructed_model='{model}'")
-
-    base_url, api_key = resolve_gateway(model, config)
-    payload = {
-        'model': model,
-        'messages': [
-            {'role': 'user', 'content': prompt_content},
-        ]
-    }
-
-    data = json.dumps(payload).encode('utf-8')
-    req = urllib.request.Request(
-        f'{base_url}/chat/completions',
-        data=data,
-        headers={
-            'Authorization': f'Bearer {api_key}',
-            'Content-Type': 'application/json',
-        },
-        method='POST',
-    )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    resp_bytes = _execute_request_with_retry(req, opener=opener, timeout=180)
-    body = json.loads(resp_bytes.decode('utf-8'))
-    return body['choices'][0]['message'].get('content') or ''
 
 
 def _quality_to_images_api(quality):
@@ -516,20 +465,6 @@ def _gemini_native_image_edit(config, model, prompt, file_items, aspect_ratio, i
                 print(f"[GEMINI DIRECT] {last_error}")
 
     raise RuntimeError(f'Gemini direct image edit failed: {last_error}')
-
-
-def _detect_image_mime_from_path(path):
-    with open(path, 'rb') as image_file:
-        signature = image_file.read(16)
-    if signature.startswith(b'\x89PNG\r\n\x1a\n'):
-        return 'image/png'
-    if signature.startswith(b'\xff\xd8\xff'):
-        return 'image/jpeg'
-    if signature.startswith((b'GIF87a', b'GIF89a')):
-        return 'image/gif'
-    if signature.startswith(b'RIFF') and signature[8:12] == b'WEBP':
-        return 'image/webp'
-    return 'application/octet-stream'
 
 
 def _persist_data_url_image(data_url, title, prefix='cover'):
@@ -1091,17 +1026,17 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         quality_gate 为 'auto_approved' 表示 VLM 自动判定通过；'pending_manual_review'
         表示未跑过任何自动校验（如首帧或上一帧缺失）；'vlm_qa_failed' 表示重试后仍未通过。"""
         if seq <= 1 or not _frame_exists(seq - 1):
-            return 'pending_manual_review', None
+            return QualityGate.PENDING_MANUAL_REVIEW, None
         video_item = videos.get(seq - 1, "")
         video_prompt = video_item['body'] if isinstance(video_item, dict) else video_item
         if not video_prompt:
-            return 'pending_manual_review', None
+            return QualityGate.PENDING_MANUAL_REVIEW, None
 
         prev_path = _webp_path(seq - 1)
         target_path = _webp_path(seq)
         vlm_pass, vlm_reason = run_frame_qa_check(config, _webp_path(1), prev_path, target_path, video_prompt, seq, is_bridge=is_bridge)
         if vlm_pass:
-            return 'auto_approved', None
+            return QualityGate.AUTO_APPROVED, None
 
         if sys.stdout:
             print(f"[VLM QA][FX] Beat {seq-1} (IMAGE {seq}) failed VLM check: {vlm_reason}. Retrying via Google FX...")
@@ -1131,7 +1066,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                     if sys.stdout:
                         print(f"[VLM QA][FX] Beat {seq-1} passed VLM check on retry {retry_attempt+1}!")
                     item['prompt'] = corrected  # 回写 manifest 用的提示词
-                    return 'auto_approved', None
+                    return QualityGate.AUTO_APPROVED, None
                 if sys.stdout:
                     print(f"[VLM QA][FX] Beat {seq-1} failed VLM check on retry {retry_attempt+1}: {vlm_reason}")
             except ConnectionError:
@@ -1139,7 +1074,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             except Exception as retry_err:
                 if sys.stdout:
                     print(f"[VLM QA][FX] Retry {retry_attempt+1} hit exception: {retry_err}")
-        return 'vlm_qa_failed', vlm_reason
+        return QualityGate.VLM_QA_FAILED, vlm_reason
 
     def _record_frame(seq, item, fx_src_path, fx_uuid, quality_gate, vlm_reason):
         webp = _webp_path(seq)

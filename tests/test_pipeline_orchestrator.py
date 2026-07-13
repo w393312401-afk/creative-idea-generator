@@ -119,6 +119,9 @@ class TestRunAutonomousPipeline(unittest.TestCase):
         mock_phase2.assert_called_once()
         mock_video.assert_called_once()
         self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved')
+        # Direction-1 refactor: the structured slot list ships alongside prompt_block.
+        self.assertIn('prompt_slots', result)
+        self.assertEqual(result['prompt_slots'], [])  # 'FULL PROMPT BLOCK' fixture has no real slots
 
     def test_needs_human_review_when_anchor_gate_never_passes(self):
         state = self._fake_state()
@@ -240,6 +243,12 @@ class TestRunStagedFrameRendering(unittest.TestCase):
         mock_phase1.assert_not_called()  # no text (re)composition in this path
         mock_phase2.assert_not_called()
         self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved')
+        # Direction-1 refactor: the structured slot list ships alongside prompt_block.
+        self.assertEqual(result['prompt_slots'], [
+            {'type': 'image', 'index': 1, 'meta': '', 'body': 'first frame prompt'},
+            {'type': 'image', 'index': 2, 'meta': '', 'body': 'second frame prompt'},
+            {'type': 'video', 'index': 1, 'meta': '', 'body': 'video one'},
+        ])
 
     def test_needs_human_review_when_anchor_never_passes(self):
         def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):

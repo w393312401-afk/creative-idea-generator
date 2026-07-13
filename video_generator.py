@@ -14,6 +14,7 @@ from server_common import (
     ACTIVE_TASKS_LOCK, ACTIVE_TASKS, get_or_create_task,
     notify_listeners, save_tasks_to_disk
 )
+from manifest_store import QualityGate
 
 
 def _get_google_fx_video_service():
@@ -191,8 +192,8 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
         elif not end_p or not os.path.exists(end_p):
             plan['action'] = 'blocked'
             plan['reason'] = f"视频 {slot} 所需的结束帧 IMAGE {slot + 1} 不存在。请重新生成该帧！"
-        elif slot_to_quality.get(slot) == 'i2i_fallback_degraded' \
-                or slot_to_quality.get(slot + 1) == 'i2i_fallback_degraded':
+        elif slot_to_quality.get(slot) == QualityGate.I2I_FALLBACK_DEGRADED \
+                or slot_to_quality.get(slot + 1) == QualityGate.I2I_FALLBACK_DEGRADED:
             plan['action'] = 'blocked'
             plan['reason'] = (
                 f"视频 {slot} 的起始帧 IMAGE {slot} 或结束帧 IMAGE {slot + 1} 属于降级帧（i2i fallback degraded），"
@@ -329,7 +330,22 @@ def _clear_previous_outputs(videos_dir, manifest_data):
         manifest_data['videos'] = []
 
 
+# Serializes access to the single shared AdsPower browser session used by
+# generate_videos_batch_google_fx. Enforced here at the function boundary (rather than as a
+# call-site convention) so every caller — the manual /api/generate_videos path, and the
+# autonomous auto_run/render_staged paths that reach this via
+# pipeline_orchestrator._render_videos_with_recovery — is serialized the same way. Before this,
+# only the manual path wrapped its call in a lock, leaving auto_run/render_staged free to run
+# concurrently against the same browser session (or against a manual request).
+_VIDEO_GEN_SERIAL_LOCK = threading.Lock()
+
+
 def generate_video_sequence(config, title, prompt_block, on_progress=None, target_slots=None):
+    with _VIDEO_GEN_SERIAL_LOCK:
+        return _generate_video_sequence_locked(config, title, prompt_block, on_progress=on_progress, target_slots=target_slots)
+
+
+def _generate_video_sequence_locked(config, title, prompt_block, on_progress=None, target_slots=None):
     import builtins
     builtins.google_fx_cancelled = False
     rotate_requests = config.get('googleFxIpRotateRequests')
@@ -435,6 +451,13 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     return manifest_data
 
 
+class VideoMergeBlocked(RuntimeError):
+    """merge_project_videos deliberately refused to merge (slot-completeness or
+    anchor-consistency gate) — distinct from an unexpected failure (e.g. ffmpeg crashing),
+    so callers can treat the two differently (e.g. a soft 'skipped, try again later' status
+    vs a hard 'something went wrong' error)."""
+
+
 def merge_project_videos(project_dir, allow_partial=False):
     """合并项目内全部视频片段。
 
@@ -471,7 +494,7 @@ def merge_project_videos(project_dir, allow_partial=False):
                     or not os.path.exists(_resolve_abs(v['file'])):
                 missing.append(slot)
         if missing:
-            raise RuntimeError(
+            raise VideoMergeBlocked(
                 f"存在失败或缺失的视频片段（槽位 {', '.join(map(str, missing))}），已拒绝合并。"
                 f"请先重试这些片段，或确认后强制合并。"
             )
@@ -512,7 +535,7 @@ def merge_project_videos(project_dir, allow_partial=False):
             if not ok:
                 mismatched.append(f"{slot} (MAD {reason})")
         if mismatched:
-            raise RuntimeError(
+            raise VideoMergeBlocked(
                 f"以下片段内容与锚点帧不符，疑似串片/错误下载：槽位 {'; '.join(mismatched)}。"
                 f"已拒绝合并，请重新生成这些片段。"
             )
