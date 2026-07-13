@@ -4,6 +4,9 @@ import shutil
 import tempfile
 import unittest
 
+from unittest.mock import patch
+
+import video_generator
 from video_generator import (
     rewrite_prompt_for_two_card_ui,
     load_slot_frames,
@@ -11,7 +14,126 @@ from video_generator import (
     _ManifestWriter,
     _video_info,
     _BatchBridge,
+    generate_video_sequence,
+    merge_project_videos,
+    VideoMergeBlocked,
 )
+
+
+class TestVideoGenSerialLock(unittest.TestCase):
+    """Direction-4 fix: the shared-AdsPower-browser serial lock used to only wrap the
+    manual /api/generate_videos call site in server.py, leaving the auto_run/render_staged
+    paths (which reach generate_video_sequence via pipeline_orchestrator) unguarded. It now
+    lives inside generate_video_sequence itself so every caller is serialized the same way."""
+
+    def test_generate_video_sequence_holds_the_serial_lock_while_running(self):
+        observed = {}
+
+        def fake_impl(config, title, prompt_block, on_progress=None, target_slots=None):
+            observed['locked'] = video_generator._VIDEO_GEN_SERIAL_LOCK.locked()
+            return {'videos': []}
+
+        with patch('video_generator._generate_video_sequence_locked', side_effect=fake_impl):
+            generate_video_sequence({}, 'proj', 'block')
+
+        self.assertTrue(observed['locked'])
+        # Lock must be released again afterward, not held forever.
+        self.assertFalse(video_generator._VIDEO_GEN_SERIAL_LOCK.locked())
+
+    def test_concurrent_calls_are_serialized_not_parallel(self):
+        import threading
+        import time
+
+        order = []
+        entered = threading.Event()
+
+        def fake_impl(config, title, prompt_block, on_progress=None, target_slots=None):
+            order.append(('start', title))
+            if title == 'first':
+                entered.set()
+                time.sleep(0.2)
+            order.append(('end', title))
+            return {'videos': []}
+
+        with patch('video_generator._generate_video_sequence_locked', side_effect=fake_impl):
+            t1 = threading.Thread(target=lambda: generate_video_sequence({}, 'first', 'block'))
+            t1.start()
+            entered.wait(timeout=2)
+            t2 = threading.Thread(target=lambda: generate_video_sequence({}, 'second', 'block'))
+            t2.start()
+            t1.join(timeout=2)
+            t2.join(timeout=2)
+
+        # 'first' must fully finish (its 'end') before 'second' can even start — proving the
+        # second caller (simulating an auto_run/render_staged task) blocked on the lock
+        # instead of running concurrently against the shared browser session.
+        self.assertEqual(order, [('start', 'first'), ('end', 'first'), ('start', 'second'), ('end', 'second')])
+
+
+class TestMergeProjectVideosGates(unittest.TestCase):
+    """Direction-7 fix: merge_project_videos is now the single source of truth for 'is this
+    project complete enough to merge' — server.py's generate_videos_worker used to duplicate
+    this judgment with its own slot-completeness derivation (from prompt_block instead of
+    manifest.frames) before even calling merge_project_videos. A deliberate gate rejection
+    raises VideoMergeBlocked (a RuntimeError subclass, so /api/merge_videos's generic
+    `except Exception` still works unchanged) instead of a bare RuntimeError, so callers can
+    tell 'refused on purpose' apart from an unexpected failure."""
+
+    def setUp(self):
+        self.project_dir = tempfile.mkdtemp()
+        self.videos_dir = os.path.join(self.project_dir, 'videos')
+        os.makedirs(self.videos_dir, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.project_dir, ignore_errors=True)
+
+    def _write_manifest(self, frames, videos):
+        with open(os.path.join(self.project_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
+            json.dump({'frames': frames, 'videos': videos}, f)
+
+    def _touch_video_file(self, name):
+        path = os.path.join(self.videos_dir, name)
+        with open(path, 'wb') as f:
+            f.write(b'fake video bytes')
+        return f'/videos/{name}'
+
+    def test_raises_video_merge_blocked_when_a_slot_is_missing(self):
+        # 3 frames -> expected video slots 1..2; only slot 1 has a successful video.
+        slot1_rel = self._touch_video_file('vid_001.mp4')
+        self._write_manifest(
+            frames=[{'slot': 1}, {'slot': 2}, {'slot': 3}],
+            videos=[{'slot': 1, 'status': 'success', 'file': slot1_rel}],
+        )
+        with self.assertRaises(VideoMergeBlocked) as ctx:
+            merge_project_videos(self.project_dir)
+        self.assertIn('2', str(ctx.exception))
+
+    def test_video_merge_blocked_is_a_runtime_error_subclass(self):
+        # /api/merge_videos catches plain `except Exception` — must keep working unchanged.
+        self.assertTrue(issubclass(VideoMergeBlocked, RuntimeError))
+
+    def test_allow_partial_skips_the_completeness_gate(self):
+        slot1_rel = self._touch_video_file('vid_001.mp4')
+        self._write_manifest(
+            frames=[{'slot': 1}, {'slot': 2}, {'slot': 3}],
+            videos=[{'slot': 1, 'status': 'success', 'file': slot1_rel}],
+        )
+        # Should not raise — allow_partial bypasses gate 1 (and gate 2, since only one
+        # video file exists to concat, ffmpeg construction below is exercised but the
+        # gates themselves are what this test cares about).
+        try:
+            merge_project_videos(self.project_dir, allow_partial=True)
+        except VideoMergeBlocked:
+            self.fail("allow_partial=True must not raise VideoMergeBlocked")
+        except Exception:
+            pass  # ffmpeg/concat-stage failures in this minimal fixture are out of scope here
+
+    def test_returns_none_when_manifest_missing(self):
+        empty_dir = tempfile.mkdtemp()
+        try:
+            self.assertIsNone(merge_project_videos(empty_dir))
+        finally:
+            shutil.rmtree(empty_dir, ignore_errors=True)
 
 
 class TestPromptRewrite(unittest.TestCase):

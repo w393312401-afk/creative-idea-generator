@@ -8,13 +8,12 @@
 
 本项目采用扁平化的前端资源结构，配合后端服务进行相对路径的分发。
 
-### 1. 三大集成视图
+### 1. 两大集成视图
 
 | 视图入口 | 核心文件 | 说明 |
 | :--- | :--- | :--- |
-| **创意工坊** (`/`) | [index.html](file:///c:/Users/video/Desktop/creative-idea-generator/index.html)<br>[app.js](file:///c:/Users/video/Desktop/creative-idea-generator/app.js)<br>[style.css](file:///c:/Users/video/Desktop/creative-idea-generator/style.css)<br>[tokens.css](file:///c:/Users/video/Desktop/creative-idea-generator/tokens.css) | 主应用界面，用于点子的生成、展示与交互。 |
+| **创意工坊** (`/`) | [index.html](file:///c:/Users/video/Desktop/creative-idea-generator/index.html)<br>[app.js](file:///c:/Users/video/Desktop/creative-idea-generator/app.js)<br>[js/image_studio.js](file:///c:/Users/video/Desktop/creative-idea-generator/js/image_studio.js)<br>[style.css](file:///c:/Users/video/Desktop/creative-idea-generator/style.css)<br>[image_studio.css](file:///c:/Users/video/Desktop/creative-idea-generator/image_studio.css)<br>[tokens.css](file:///c:/Users/video/Desktop/creative-idea-generator/tokens.css) | 主应用界面，含「激发维度／激发结果／图像工坊」三个顶部标签页，用于点子的生成、展示、交互，以及独立的文生图/图生图创作。 |
 | **控制台** (`/console.html`) | [console.html](file:///c:/Users/video/Desktop/creative-idea-generator/console.html)<br>[console.js](file:///c:/Users/video/Desktop/creative-idea-generator/console.js)<br>[console.css](file:///c:/Users/video/Desktop/creative-idea-generator/console.css)<br>[tokens.css](file:///c:/Users/video/Desktop/creative-idea-generator/tokens.css) | 与后端深度协同的第二视图，用于系统状态监控与管理。 |
-| **图像服务站** (`/image-service-station/`) | [image-service-station/](file:///c:/Users/video/Desktop/creative-idea-generator/image-service-station/) 内的网页资产 | 独立的图像子服务，已整合至主系统中。 |
 
 > ⚠️ **开发注意事项**：根目录下的 `index.html`, `app.js`, `style.css`, `tokens.css` 以及 `console.*` 属于核心前端资产，**请勿移动到子文件夹**，否则后端 `SimpleHTTPRequestHandler` 的静态路由与页面引用将会失效。
 
@@ -35,7 +34,7 @@
 *   **停止服务**：双击运行 [stop.bat](file:///c:/Users/video/Desktop/creative-idea-generator/stop.bat)（一次清掉 8085 与所有残留 8086 监听进程）。
 
 *   📌 **端口永久固定（2026-07-04）**：服务入口只有一个 —— **`http://127.0.0.1:8085/`**。
-    *   图像服务站已整合进主服务（`http://127.0.0.1:8085/image-service-station/` 访问），`run.bat` **不再拉起 8086 独立子服务**（旧逻辑每次启动/重启都会堆积一个 8086 实例）。`image-service-station/server.py` 仅作为开发调试备用，勿单独启动。
+    *   图像服务站已完全并入创意工坊单页应用（顶部「🎨 图像工坊」标签页），不再是独立路由/独立目录，`run.bat` 也不再拉起任何 8086 子服务。
     *   LLM 代理固定 `8046`（`server_config.json` 的 `baseUrl` 为准）；`gpt-5.5` 由服务端 `resolve_gateway` 固定路由到 codex 代理，前端无需也无法再切换端口（设置面板的「GPT 代理端口」选择器已移除）。
 
 ---

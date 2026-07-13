@@ -202,6 +202,30 @@ const PRESETS = {
 
 // Function renderParsedPrompts moved to modular JS file
 
+// Top-level workspace switch: exclusive single-panel view (config / results / image studio),
+// used at every screen size. 'left'/'right' are accepted as aliases of 'config'/'results' for
+// backward compatibility with any inline handlers still spelled the old way.
+function switchMainTab(tabName) {
+    const aliases = { left: 'config', right: 'results' };
+    const tab = aliases[tabName] || tabName;
+
+    const panels = {
+        config: document.querySelector('.panel-left'),
+        results: document.querySelector('.panel-right'),
+        image: document.getElementById('panel-image-studio'),
+    };
+    const buttons = {
+        config: document.getElementById('main-tab-config'),
+        results: document.getElementById('main-tab-results'),
+        image: document.getElementById('main-tab-image'),
+    };
+
+    Object.keys(panels).forEach((key) => {
+        if (panels[key]) panels[key].classList.toggle('mobile-active', key === tab);
+        if (buttons[key]) buttons[key].classList.toggle('active', key === tab);
+    });
+}
+
 function switchTab(tabId) {
     localStorage.setItem('spark_active_tab', tabId);
     document.querySelectorAll('.result-tabs-bar .tab-btn').forEach(btn => {
@@ -1004,6 +1028,7 @@ function setupEventListeners() {
     document.getElementById('export-idea-btn').addEventListener('click', exportIdeaMarkdown);
     document.getElementById('copy-prompt-btn').addEventListener('click', copyPromptToClipboard);
     document.getElementById('copy-prompt-btn-all').addEventListener('click', copyPromptToClipboard);
+    document.getElementById('copy-tiktok-meta-btn').addEventListener('click', copyTikTokMetaToClipboard);
     document.getElementById('make-cover-btn').addEventListener('click', () => generateCover());
     document.getElementById('generate-frames-btn').addEventListener('click', () => generateFrames());
     document.getElementById('generate-videos-btn').addEventListener('click', () => generateVideos());
@@ -1378,6 +1403,7 @@ async function loadCompletedTask(taskId) {
                 theme: task.dimensions ? task.dimensions.theme : '视频反推',
                 creativity: task.dimensions ? task.dimensions.creativity : '多模态反推',
                 prompt_block: data.prompt_block || data.raw || '',
+                prompt_slots: data.prompt_slots || null,
                 audit_md: data.audit_md || '',
                 repair_md: data.repair_md || '',
                 timestamp: new Date(parseInt(task.id, 10)).toLocaleString(),
@@ -1394,7 +1420,8 @@ async function loadCompletedTask(taskId) {
             saveCurrentIdeaState();
             generationState.status = 'idle';
             renderIdea(result);
-            
+            switchMainTab('results');
+
             if (placeholderView) placeholderView.classList.remove('active');
             if (loadingView) loadingView.classList.remove('active');
             if (contentView) contentView.classList.add('active');
@@ -1788,6 +1815,7 @@ async function streamProgress(taskId, dimensions) {
             theme: dimensions.theme || '视频反推',
             creativity: dimensions.creativity || '多模态反推',
             prompt_block: data.prompt_block || data.raw || '',
+            prompt_slots: data.prompt_slots || null,
             audit_md: data.audit_md || '',
             repair_md: data.repair_md || '',
             timestamp: new Date(parseInt(taskId, 10)).toLocaleString(),
@@ -1803,8 +1831,9 @@ async function streamProgress(taskId, dimensions) {
         currentIdea = result;
         saveCurrentIdeaState();
         generationState.status = 'idle';
-        
+
         renderIdea(result);
+        switchMainTab('results');
 
         updateLoadingStep('step-1', 'completed');
         updateLoadingStep('step-2', 'completed');
@@ -2060,7 +2089,6 @@ async function streamFramesProgress(taskId) {
                     try {
                         const parsed = JSON.parse(jsonStr);
                         if (parsed.type === 'start') {
-                            applyVideoProgress('start', parsed.data);
                             const total = parsed.data.total;
                             meta.textContent = `开始生成共 ${total} 帧序列图...`;
                             
@@ -2094,7 +2122,11 @@ async function streamFramesProgress(taskId) {
                             const f = parsed.data.frame;
                             const cur = parsed.data.current;
                             const tot = parsed.data.total;
-                            meta.textContent = `正在生成帧序列: ${cur}/${tot} (正在处理第 ${cur + 1} 帧)...`;
+                            if (cur < tot) {
+                                meta.textContent = `正在生成帧序列: ${cur}/${tot} (正在处理第 ${cur + 1} 帧)...`;
+                            } else {
+                                meta.textContent = `正在生成帧序列: ${cur}/${tot} (已生成完毕，正在整理)...`;
+                            }
                             
                             const slot = document.getElementById(`frame-slot-${f.sequence}`);
                             if (slot) {

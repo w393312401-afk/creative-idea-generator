@@ -209,3 +209,25 @@ function mapTwistToAnchorValue(dna) {
     return 'carrier_cutout_window';
 }
 
+/**
+ * Returns the TikTok display metadata for an idea.
+ * english: the English hook title (falls back to the Chinese title if not set)
+ * chinese: the Chinese title
+ */
+function getIdeaTikTokMeta(idea) {
+    if (!idea) return { english: '', chinese: '' };
+    return {
+        english: idea.english_title || idea.title || '',
+        chinese: idea.title || '',
+    };
+}
+
+/**
+ * Returns the canonical save-title used as the server-side project directory key.
+ * This is the raw Chinese title string stored in idea.title.
+ */
+function getIdeaSaveTitle(idea) {
+    if (!idea) return '';
+    return idea.title || '';
+}
+

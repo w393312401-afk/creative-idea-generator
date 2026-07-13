@@ -1,5 +1,31 @@
 // --- prompt_pipeline.js ---
 
+// Prefer the backend's already-parsed structured slots (idea.prompt_slots, added by
+// prompt_pipeline.py::prompt_slots_list) over re-deriving them from raw prompt_block text
+// with parsePromptBlock's own regex. The two parsers are independently maintained and can
+// drift (e.g. same-line label+body text is handled differently by each); consuming the
+// backend's single parse removes that drift for any idea that has the new field. Ideas
+// saved to localStorage before this field existed won't have prompt_slots, so this still
+// falls back to the legacy text-regex path for those.
+function resolvePromptSlots(source) {
+    const idea = (typeof source === 'string') ? { prompt_block: source } : (source || {});
+    if (Array.isArray(idea.prompt_slots) && idea.prompt_slots.length > 0) {
+        return idea.prompt_slots.map(s => {
+            const isImage = s.type === 'image';
+            const meta = s.meta || '';
+            return {
+                type: s.type,
+                index: s.index,
+                meta: meta,
+                label: (isImage ? `图片提示词 ${s.index}` : `视频提示词 ${s.index}`) + (meta ? ` [${meta}]` : ''),
+                id: isImage ? `slot-image-${s.index}` : `slot-video-${s.index}`,
+                body: s.body || ''
+            };
+        });
+    }
+    return parsePromptBlock(idea.prompt_block || '');
+}
+
 function parsePromptBlock(blockText) {
     const lines = (blockText || '').split('\n');
     const slots = [];
@@ -50,8 +76,8 @@ function parsePromptBlock(blockText) {
     return slots;
 }
 
-function renderParsedPrompts(blockText) {
-    const slots = parsePromptBlock(blockText);
+function renderParsedPrompts(source) {
+    const slots = resolvePromptSlots(source);
     const container = document.getElementById('parsed-prompts-container');
     const jumpPills = document.getElementById('jump-pills');
     

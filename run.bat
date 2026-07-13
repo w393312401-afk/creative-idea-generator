@@ -33,9 +33,9 @@ echo [SPARK] 正在以 %PORT% 端口后台启动主服务 (pythonw)...
 if not exist "outputs" mkdir "outputs"
 start "" "%PYW%" server.py
 
-rem --- 服务入口永久固定为 %PORT% 一个端口。图像服务站已整合进主服务
-rem     （http://127.0.0.1:%PORT%/image-service-station/），不再单独拉起 8086，
-rem     否则重启会不断堆积重复实例（2026-07-04 实测同时挂着 2 个 8086 进程）。
+rem --- 服务入口永久固定为 %PORT% 一个端口。图像服务站已并入主页面的
+rem     「🎨 图像工坊」标签页，不再单独拉起 8086，否则重启会不断堆积
+rem     重复实例（2026-07-04 实测同时挂着 2 个 8086 进程）。
 
 rem --- 轮询确认主端口真正起来了，而不是盲等再关窗口（单次 powershell 内部自行重试，避免反复起进程）---
 powershell -NoProfile -Command "$ok=$false; for($i=0;$i -lt 15;$i++){ if(Get-NetTCPConnection -State Listen -LocalPort %PORT% -ErrorAction SilentlyContinue){$ok=$true;break}; Start-Sleep -Milliseconds 700 }; if(-not $ok){exit 1}"

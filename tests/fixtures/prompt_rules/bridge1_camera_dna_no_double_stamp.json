@@ -1,0 +1,20 @@
+{
+  "_purpose": "Regression for the shipped bug where 17/34 slots got a second, contradictory camera_dna block prepended. fix_camera_dna's prefix-keyword guard must recognize camera-DNA-shaped text already present at the start of the IMAGE prompt and skip prepending the bridge_stage=1 camera_dna a second time.",
+  "i": 6,
+  "mode": "standard",
+  "is_last": false,
+  "is_threshold_or_reveal": true,
+  "beat": {
+    "operation": "threshold",
+    "description": "Approach the doorway sill, camera pushing toward the threshold.",
+    "bridge_stage": 1
+  },
+  "packet": {
+    "camera_dna": "static tripod shot, 24mm lens feel, camera height 1.4m, eye-level perspective.",
+    "primary_landmarks": [
+      {"name": "weathered oak doorway sill", "grid": "Grid B2"}
+    ]
+  },
+  "image_prompt": "Camera height 1.6m, eye-level perspective, coaxial forward-pushing camera already framing the weathered oak doorway sill in Grid B2 as the interior threshold comes into view. CHANGE IN THIS FRAME: warm interior light spills through the gap in the boards, softly illuminating dust motes near the sill edge. Fresh iron hinge pins have been driven into the frame, catching a faint gleam. The horizon line remains level at 50-percent height of the frame. Locked anchors: weathered oak doorway sill at Grid B2.",
+  "video_prompt": "The camera glides forward across the threshold, closing toward the sill as warm light grows on the far wall."
+}

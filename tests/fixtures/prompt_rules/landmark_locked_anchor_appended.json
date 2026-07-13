@@ -1,0 +1,21 @@
+{
+  "_purpose": "fix_primary_landmarks must append a 'Locked anchors: <name> at <grid>, ...' clause when a packet landmark is not restated verbatim in the IMAGE prompt, so check_primary_landmarks_exact_match passes after the fix even though the raw LLM output omitted it.",
+  "i": 5,
+  "mode": "standard",
+  "is_last": false,
+  "is_threshold_or_reveal": false,
+  "beat": {
+    "operation": "finish",
+    "description": "Finish the built-in bench along the far wall.",
+    "bridge_stage": null
+  },
+  "packet": {
+    "camera_dna": "static tripod shot, 24mm lens feel, camera height 1.4m.",
+    "primary_landmarks": [
+      {"name": "brass reading lamp", "grid": "Grid C2"},
+      {"name": "walnut window seat", "grid": "Grid B3"}
+    ]
+  },
+  "image_prompt": "Camera height 1.4m, static tripod shot holds level across the finished built-in bench along the far wall. CHANGE IN THIS FRAME: a soft wool cushion now rests along the bench seat, and warm afternoon light falls across the boards. The horizon line remains level at 50-percent height of the frame.",
+  "video_prompt": "A single builder settles the cushion onto the bench seat and smooths the fabric into place."
+}

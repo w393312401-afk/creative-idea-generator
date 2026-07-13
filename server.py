@@ -9,9 +9,14 @@ import re
 import base64
 import time
 import threading
+import mimetypes
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
+
+# Register MIME types to ensure correct browser content-type headers
+mimetypes.add_type('image/webp', '.webp')
+mimetypes.add_type('video/mp4', '.mp4')
 
 # Import everything from sub-modules to preserve namespace compatibility
 from server_common import *
@@ -21,7 +26,7 @@ from prompt_pipeline import *
 
 # Explicitly import private functions that are not imported by wildcard '*'
 from server_common import _get_project_dir, _safe_project_name, _LOG_PATH
-from prompt_pipeline import _parse_prompt_slots, _chat
+from prompt_pipeline import _parse_prompt_slots, _chat, _aux_model
 from frame_generator import (
     _image_generation_model_for_request,
     _image_quality_to_label,
@@ -80,6 +85,7 @@ def background_worker(task_id, config, dimensions):
         }
         result['image_count'] = len(images)
         result['video_count'] = len(videos)
+        result['prompt_slots'] = prompt_slots_list(result['prompt_block'])
         
         if t["cancel_event"].is_set():
             raise ConnectionError("Generation cancelled by user")
@@ -111,6 +117,53 @@ def background_worker(task_id, config, dimensions):
             t["events"] = [evt for evt in t["events"] if evt[0] != 'text_chunk']
             t["events"].append(('error', {'message': str(e)}))
         notify_listeners(task_id, 'error', {'message': str(e)})
+        save_tasks_to_disk()
+
+
+def auto_run_worker(task_id, config, dimensions):
+    """Drives the full autonomous pipeline (compose -> render+verify IMAGE 1 -> refine
+    packet -> remaining beats -> remaining frames -> videos) as one background task,
+    reusing the same ACTIVE_TASKS/SSE plumbing as the three manual stages."""
+    t = get_or_create_task(task_id, dimensions)
+    try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
+
+        def progress_cb(stage, details):
+            if stage == 'cancel_check':
+                return t["cancel_event"].is_set()
+            with ACTIVE_TASKS_LOCK:
+                t["events"].append((stage, details))
+            notify_listeners(task_id, stage, details)
+
+        from pipeline_orchestrator import run_autonomous_pipeline
+        result = run_autonomous_pipeline(config, dimensions, on_progress=progress_cb)
+
+        usage = stop_and_get_accounting()
+        if usage:
+            result['token_usage'] = usage
+
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "completed"
+            t["result"] = result
+            t["events"].append(('result', result))
+        notify_listeners(task_id, 'result', result)
+    except ConnectionError:
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "cancelled"
+            t["error"] = "用户取消了生成任务"
+            t["events"].append(('error', {'message': '用户取消了生成任务'}))
+        notify_listeners(task_id, 'error', {'message': '用户取消了生成任务'})
+    except Exception as e:
+        if sys.stdout:
+            import traceback
+            traceback.print_exc()
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "failed"
+            t["error"] = str(e)
+            t["events"].append(('error', {'message': str(e)}))
+        notify_listeners(task_id, 'error', {'message': str(e)})
+    finally:
         save_tasks_to_disk()
 
 
@@ -215,7 +268,55 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
     finally:
         save_tasks_to_disk()
 
-_VIDEO_GEN_SERIAL_LOCK = threading.Lock()
+
+def render_staged_worker(task_id, config, title, prompt_block):
+    """Stages an ALREADY-composed prompt_block through pipeline_orchestrator's
+    render/gate/recovery machinery (render IMAGE 1 -> Anchor Acceptance Gate -> render
+    the rest -> autonomous recovery passes -> videos), instead of the old
+    generate_frames_worker's one-shot full-batch render. Used by /api/render_staged,
+    which scripts/generate_frames.py now calls so a skill-driven (agent-composed)
+    prompt set also gets staged, gated rendering instead of a blind batch render."""
+    t = get_or_create_task(task_id)
+    try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
+
+        def progress_cb(stage, details):
+            if stage == 'cancel_check':
+                return t["cancel_event"].is_set()
+            with ACTIVE_TASKS_LOCK:
+                t["events"].append((stage, details))
+            notify_listeners(task_id, stage, details)
+
+        from pipeline_orchestrator import run_staged_frame_rendering
+        result = run_staged_frame_rendering(config, title, prompt_block, on_progress=progress_cb)
+
+        usage = stop_and_get_accounting()
+        if usage:
+            result['token_usage'] = usage
+
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "completed"
+            t["result"] = result
+            t["events"].append(('result', result))
+        notify_listeners(task_id, 'result', result)
+    except ConnectionError:
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "cancelled"
+            t["error"] = "用户取消了分步渲染任务"
+            t["events"].append(('error', {'message': '用户取消了分步渲染任务'}))
+        notify_listeners(task_id, 'error', {'message': '用户取消了分步渲染任务'})
+    except Exception as e:
+        if sys.stdout:
+            import traceback
+            traceback.print_exc()
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "failed"
+            t["error"] = str(e)
+            t["events"].append(('error', {'message': str(e)}))
+        notify_listeners(task_id, 'error', {'message': str(e)})
+    finally:
+        save_tasks_to_disk()
 
 
 def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
@@ -232,57 +333,54 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
 
         progress_cb('queue', {'message': '视频生成请求已加入队列，正在等待排队生成...'})
 
-        with _VIDEO_GEN_SERIAL_LOCK:
-            result = generate_video_sequence(
-                config, title, prompt_block,
-                on_progress=progress_cb,
-                target_slots=target_slots
-            )
+        result = generate_video_sequence(
+            config, title, prompt_block,
+            on_progress=progress_cb,
+            target_slots=target_slots
+        )
             
-            usage = stop_and_get_accounting()
-            if usage:
-                result['token_usage'] = usage
-            
-            # Check if all expected videos are successfully generated
-            _, expected_videos = _parse_prompt_slots(prompt_block)
-            expected_slots = list(expected_videos.keys())
-            manifest_videos = result.get('videos', [])
-            manifest_video_slots = {v['slot']: v for v in manifest_videos}
-            
-            has_failures = False
-            for slot in expected_slots:
-                if slot not in manifest_video_slots:
-                    has_failures = True
-                    break
-                if manifest_video_slots[slot].get('status') != 'success':
-                    has_failures = True
-                    break
+        usage = stop_and_get_accounting()
+        if usage:
+            result['token_usage'] = usage
 
-            if has_failures:
-                progress_cb('merge_skip', {'message': '检测到存在生成失败或缺失的视频片段，已跳过自动合并视频。'})
+        # Try to automatically merge videos. merge_project_videos is the single source of
+        # truth for "is this project complete enough to merge" (slot-completeness gate +
+        # anchor-consistency gate) — it raises a descriptive RuntimeError when it refuses,
+        # which the except branch below surfaces as 'merge_error'. This worker used to
+        # duplicate that completeness judgment here first (deriving expected slots from
+        # prompt_block instead of manifest.frames, which could disagree with the gate
+        # merge_project_videos actually enforces) purely to emit a friendlier 'merge_skip'
+        # message before even attempting the merge; removing it also brings this path in
+        # line with /api/merge_videos, which has always called merge_project_videos
+        # directly with no separate pre-check.
+        try:
+            progress_cb('merge_start', {'message': '正在自动合并并加速视频...'})
+            project_dir = _get_project_dir(title)
+            merged_info = merge_project_videos(project_dir)
+            if merged_info:
+                result['merged_video'] = merged_info
+                # Also update manifest file on disk
+                manifest_path = os.path.join(project_dir, 'manifest.json')
+                if os.path.exists(manifest_path):
+                    try:
+                        with open(manifest_path, 'r', encoding='utf-8') as f:
+                            mdata = json.load(f)
+                        mdata['merged_video'] = merged_info
+                        with open(manifest_path, 'w', encoding='utf-8') as f:
+                            json.dump(mdata, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        print(f"Warning: could not update manifest.json with merged_video ({e})")
+                progress_cb('merge_done', {'merged_video': merged_info})
             else:
-                # Try to automatically merge videos
-                try:
-                    progress_cb('merge_start', {'message': '正在自动合并并加速视频...'})
-                    project_dir = _get_project_dir(title)
-                    merged_info = merge_project_videos(project_dir)
-                    if merged_info:
-                        result['merged_video'] = merged_info
-                        # Also update manifest file on disk
-                        manifest_path = os.path.join(project_dir, 'manifest.json')
-                        if os.path.exists(manifest_path):
-                            try:
-                                with open(manifest_path, 'r', encoding='utf-8') as f:
-                                    mdata = json.load(f)
-                                mdata['merged_video'] = merged_info
-                                with open(manifest_path, 'w', encoding='utf-8') as f:
-                                    json.dump(mdata, f, ensure_ascii=False, indent=2)
-                            except Exception as e:
-                                print(f"Warning: could not update manifest.json with merged_video ({e})")
-                    progress_cb('merge_done', {'merged_video': merged_info})
-                except Exception as merge_err:
-                    print(f"Error during auto-merge: {merge_err}")
-                    progress_cb('merge_error', {'message': f'自动合并视频失败: {str(merge_err)}'})
+                progress_cb('merge_skip', {'message': '未找到任何成功生成的视频片段，已跳过自动合并视频。'})
+        except VideoMergeBlocked as merge_blocked:
+            # A deliberate gate rejection (missing/failed slot, or anchor mismatch) is not
+            # a system failure — surface it the same way the old pre-check used to (a soft
+            # 'skipped' status), just with the gate's own more specific slot-level message.
+            progress_cb('merge_skip', {'message': str(merge_blocked)})
+        except Exception as merge_err:
+            print(f"Error during auto-merge: {merge_err}")
+            progress_cb('merge_error', {'message': f'自动合并视频失败: {str(merge_err)}'})
 
         with ACTIVE_TASKS_LOCK:
             t["status"] = "completed"
@@ -332,7 +430,7 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
             f"Chinese Title: {title}"
         )
         
-        english_title = _chat(config, "You are a viral TikTok US marketing expert specializing in high-CTR hooks.", title_prompt, temperature=0.7, max_tokens=30)
+        english_title = _chat(config, "You are a viral TikTok US marketing expert specializing in high-CTR hooks.", title_prompt, temperature=0.7, max_tokens=30, model=_aux_model(config))
         english_title = english_title.strip().strip('"').strip("'").strip()
         
         aspect_ratio = config.get('imageAspectRatio') or '9:16'
@@ -450,6 +548,68 @@ class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
     def server_bind(self):
         self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         super().server_bind()
+
+
+def check_video_prompt_semantically(config, video_prompt, vlm_reason):
+    """
+    Use LLM to determine if the video transition prompt has semantic or logical issues
+    and is responsible for the VLM QA failure.
+    """
+    system_prompt = (
+        "You are a video transition auditor. Your job is to check if the VIDEO transition prompt "
+        "has any logical errors, contradictions, or is responsible for a VLM QA failure.\n"
+        "You will be given the VIDEO prompt and the VLM QA failure reason (in Chinese).\n\n"
+        "Determine if the video prompt itself has issues (e.g., describes impossible actions, has camera pan/zoom/tilt when it must be static, or is contradictory).\n"
+        "Response format:\n"
+        "- If the video prompt has issues, respond EXACTLY in this format: FAIL: <reason in Chinese>\n"
+        "- If the video prompt is completely fine and doesn't need to be corrected, respond EXACTLY with: PASS"
+    )
+    user_prompt = f"VIDEO prompt:\n{video_prompt}\n\nVLM Failure Reason:\n{vlm_reason}"
+    from prompt_pipeline import _chat, _aux_model
+    try:
+        response = _chat(config, system_prompt, user_prompt, temperature=0.2, timeout=45, model=_aux_model(config))
+        return response.strip()
+    except Exception as e:
+        if sys.stdout:
+            print(f"[DEBUG] check_video_prompt_semantically failed: {e}")
+        return "PASS"
+
+
+def fix_video_prompt_with_vlm_feedback(config, original_video_prompt, vlm_reason, validation_errors=None):
+    """
+    Use LLM (auxModel) to generate a corrected video prompt based on the VLM QA audit failure reason and any validation errors.
+    """
+    system_prompt = (
+        "You are an expert prompt engineering assistant. Your job is to modify a video transition prompt "
+        "to fix specific errors detected by a visual quality auditor (VLM) or rule validation errors.\n"
+        "You will be given the original video transition prompt, the VLM failure reason (in Chinese), "
+        "and optionally any rule validation errors.\n\n"
+        "Please provide a corrected video transition prompt that:\n"
+        "- Corrects the action or pacing so it matches the image changes or fixes the VLM failure.\n"
+        "- Ensures there are no forbidden camera movement instructions (like zoom, pan, tilt) if the camera must remain static.\n"
+        "- Fixes any coordinates, pacing, or rule validation errors listed.\n"
+        "- Keeps the original action intent, style, and duration constraints intact.\n"
+        "- Do NOT output any explanations, markdown code fences, or headers. Output ONLY the raw corrected prompt text in English."
+    )
+    user_prompt = (
+        f"Original VIDEO prompt:\n{original_video_prompt}\n\n"
+        f"VLM Audit Failure Reason:\n{vlm_reason}\n\n"
+    )
+    if validation_errors:
+        user_prompt += f"Rule Validation Errors:\n" + "\n".join(f"- {e}" for e in validation_errors) + "\n\n"
+    user_prompt += "Please output the corrected VIDEO prompt in English."
+
+    from prompt_pipeline import _chat, _aux_model, _strip_markdown_fences_only
+    try:
+        response = _chat(
+            config, system_prompt, user_prompt,
+            temperature=0.3, timeout=60, model=_aux_model(config)
+        )
+        return _strip_markdown_fences_only(response).strip()
+    except Exception as e:
+        if sys.stdout:
+            print(f"[DEBUG] fix_video_prompt_with_vlm_feedback failed: {e}")
+        return original_video_prompt
 
 
 class SparkRequestHandler(SimpleHTTPRequestHandler):
@@ -813,6 +973,198 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'online': False, 'message': str(e)})
 
+        elif path == '/api/vlm_qa':
+            try:
+                body = self._read_json_body()
+                config_req = effective_config(body.get('config', {}))
+                img_i_path = body.get('img_i_path')
+                img_ip1_path = body.get('img_ip1_path')
+                video_prompt = body.get('video_prompt')
+                is_bridge = bool(body.get('is_bridge', False))
+
+                # If img_i_path is empty, it means we are checking the first frame (no previous frame).
+                # In this case, we skip the check and directly return success.
+                if not img_i_path:
+                    self._send_json({
+                        'status': 'ok',
+                        'vlm_pass': True,
+                        'vlm_reason': 'First frame skipped'
+                    })
+                    return
+
+                if not img_ip1_path or not video_prompt:
+                    self._send_json({'status': 'error', 'message': 'Missing parameters: img_ip1_path and video_prompt are required'}, status=400)
+                    return
+
+                if not os.path.exists(img_i_path):
+                    self._send_json({'status': 'error', 'message': f'img_i_path does not exist: {img_i_path}'}, status=400)
+                    return
+
+                if not os.path.exists(img_ip1_path):
+                    self._send_json({'status': 'error', 'message': f'img_ip1_path does not exist: {img_ip1_path}'}, status=400)
+                    return
+
+                from prompt_pipeline import run_vlm_qa_check
+                vlm_pass, vlm_reason = run_vlm_qa_check(config_req, img_i_path, img_ip1_path, video_prompt, is_bridge=is_bridge)
+                self._send_json({
+                    'status': 'ok',
+                    'vlm_pass': bool(vlm_pass),
+                    'vlm_reason': vlm_reason
+                })
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/generate_image_with_vlm':
+            try:
+                import requests
+                body = self._read_json_body()
+                config_req = effective_config(body.get('config', {}))
+                prompt = body.get('prompt')
+                reference_image = body.get('reference_image')
+                ratio = body.get('ratio', '9:16')
+                model = body.get('model', 'Nano Banana 2')
+                output_path = body.get('output_path')
+                video_prompt = body.get('video_prompt')
+                chain_index = int(body.get('chain_index', 1))
+                is_bridge = bool(body.get('is_bridge', False))
+                base_url = body.get('base_url', 'http://127.0.0.1:8000')
+
+                if reference_image and not os.path.exists(reference_image):
+                    self._send_json({'status': 'error', 'message': f'reference_image does not exist: {reference_image}'}, status=400)
+                    return
+
+                if not prompt or not output_path:
+                    self._send_json({'status': 'error', 'message': 'Missing parameters: prompt and output_path are required'}, status=400)
+                    return
+
+                current_prompt = prompt
+                last_generated_path = None
+                vlm_pass = True
+                vlm_reason = None
+                video_prompt_corrected = False
+
+                for attempt in range(3): # 1 initial + 2 retries = 3 total attempts
+                    # Prepare call to AdsPower AI service
+                    payload = {
+                        "prompts": [current_prompt],
+                        "ratio": ratio,
+                        "model": model,
+                        "output_path": output_path
+                    }
+                    if reference_image:
+                        payload["images"] = [reference_image]
+
+                    log_msg = f"[VLM QA Retry Flow] Generating image frame {chain_index} (attempt {attempt + 1}/3)..."
+                    if sys.stdout:
+                        print(log_msg)
+
+                    gen_url = f"{base_url.rstrip('/')}/generate_images_batch"
+                    headers = {"Content-Type": "application/json"}
+                    
+                    response = requests.post(gen_url, json=payload, headers=headers, timeout=600)
+                    
+                    if not response.ok:
+                        raise RuntimeError(f"AdsPower generation failed: HTTP {response.status_code} - {response.text}")
+                    
+                    res_data = response.json()
+                    img_path = None
+                    for k in ['generated_image_path', 'generated_image_url', 'image_url', 'output_path', 'local_path', 'path', 'url']:
+                        if isinstance(res_data.get(k), str) and res_data[k].strip():
+                            img_path = res_data[k].strip()
+                            break
+                    if not img_path and isinstance(res_data.get('image_urls'), list) and res_data['image_urls']:
+                        img_path = res_data['image_urls'][0]
+
+                    if not img_path or not os.path.exists(img_path):
+                        raise RuntimeError(f"Generated image path not found or does not exist: {img_path}")
+
+                    last_generated_path = img_path
+
+                    # Perform VLM Check if it's not the first frame and we have a reference image and video prompt
+                    if chain_index > 1 and reference_image and video_prompt:
+                        from prompt_pipeline import run_vlm_qa_check
+                        vlm_pass, vlm_reason = run_vlm_qa_check(config_req, reference_image, img_path, video_prompt, is_bridge=is_bridge)
+                        if vlm_pass:
+                            if sys.stdout:
+                                print(f"[VLM QA Retry Flow] Frame {chain_index} passed VLM check on attempt {attempt + 1}!")
+                            break
+                        else:
+                            if attempt < 2:
+                                if sys.stdout:
+                                    print(f"[VLM QA Retry Flow] Frame {chain_index} failed VLM check on attempt {attempt + 1}: {vlm_reason}.")
+                                
+                                # Run Quality Check on Video Prompt
+                                from prompt_pipeline import (
+                                    check_grid_coordinates,
+                                    check_nlvtr_violations,
+                                    check_video_opening,
+                                    check_out_and_in,
+                                    check_transition_shortcuts,
+                                    check_pacing_control,
+                                    check_camera_contradictions
+                                )
+                                video_errs = []
+                                video_errs.extend(check_grid_coordinates(video_prompt))
+                                video_errs.extend(check_nlvtr_violations(video_prompt))
+                                video_errs.extend(check_video_opening(chain_index - 1, video_prompt))
+                                video_errs.extend(check_out_and_in(video_prompt, is_bridge))
+                                video_errs.extend(check_transition_shortcuts(video_prompt))
+                                video_errs.extend(check_pacing_control(video_prompt, is_bridge))
+                                video_errs.extend(check_camera_contradictions(video_prompt, is_bridge))
+                                
+                                vid_word_count = len(video_prompt.split())
+                                if vid_word_count > 180:
+                                    video_errs.append(f"VIDEO prompt word count ({vid_word_count}) exceeds limit of 180 words")
+                                
+                                semantic_res = check_video_prompt_semantically(config_req, video_prompt, vlm_reason)
+                                video_prompt_failed = bool(video_errs) or semantic_res.startswith("FAIL")
+                                
+                                if video_prompt_failed:
+                                    combined_errs = list(video_errs)
+                                    if semantic_res.startswith("FAIL"):
+                                        combined_errs.append(semantic_res)
+                                    if sys.stdout:
+                                        print(f"[VLM QA Retry Flow] Frame {chain_index} video prompt failed quality check. Errors: {combined_errs}")
+                                    
+                                    new_video_prompt = fix_video_prompt_with_vlm_feedback(config_req, video_prompt, vlm_reason, combined_errs)
+                                    if sys.stdout:
+                                        print(f"[VLM QA Retry Flow] Rewritten video prompt: {new_video_prompt}")
+                                    video_prompt = new_video_prompt
+                                    video_prompt_corrected = True
+                                else:
+                                    if sys.stdout:
+                                        print(f"[VLM QA Retry Flow] Frame {chain_index} video prompt passed quality check.")
+
+                                # Correct the image prompt as before
+                                from prompt_pipeline import fix_image_prompt_with_vlm_feedback
+                                current_prompt = fix_image_prompt_with_vlm_feedback(config_req, current_prompt, vlm_reason)
+                                if sys.stdout:
+                                    print(f"[VLM QA Retry Flow] Rewritten image prompt: {current_prompt}")
+                            else:
+                                if sys.stdout:
+                                    print(f"[VLM QA Retry Flow] Frame {chain_index} failed VLM check and retries exhausted.")
+                    else:
+                        vlm_pass = True
+                        break
+
+                res_payload = {
+                    'generated_image_path': last_generated_path,
+                    'vlm_pass': bool(vlm_pass)
+                }
+                if video_prompt_corrected:
+                    res_payload['corrected_video_prompt'] = video_prompt
+
+                if vlm_pass:
+                    res_payload['status'] = 'ok'
+                    self._send_json(res_payload)
+                else:
+                    res_payload['status'] = 'failed'
+                    res_payload['message'] = f"VLM QA failed: {vlm_reason}"
+                    self._send_json(res_payload)
+
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/clear-cache':
             try:
                 with PACKET_CACHE_LOCK:
@@ -867,6 +1219,35 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     daemon=True
                 ).start()
                 
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/auto_run':
+            try:
+                if not access_ok(self):
+                    self._send_json({'status': 'error', 'message': '访问码无效或缺失'}, status=401)
+                    return
+                if not rate_ok(_client_ip(self)):
+                    self._send_json({'status': 'error', 'message': '请求过于频繁，请稍后再试'}, status=429)
+                    return
+                body = self._read_json_body()
+                dimensions = body.get('dimensions', {})
+                config = effective_config(body.get('config'))
+                task_id = body.get('task_id')
+                if not task_id:
+                    task_id = f"auto_{int(time.time() * 1000)}"
+
+                # Start background thread
+                cleanup_old_tasks()
+                get_or_create_task(task_id, dimensions)
+
+                threading.Thread(
+                    target=auto_run_worker,
+                    args=(task_id, config, dimensions),
+                    daemon=True
+                ).start()
+
                 self._send_json({'status': 'ok', 'task_id': task_id})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
@@ -961,6 +1342,76 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 ).start()
 
                 self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/render_staged':
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                if not rate_ok(_client_ip(self)):
+                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                title = body.get('title', '')
+                prompt_block = body.get('prompt_block', '')
+
+                import uuid
+                task_id = f"staged_{uuid.uuid4().hex}"
+
+                cleanup_old_tasks()
+                get_or_create_task(task_id, {"type": "staged_render", "theme": title})
+
+                threading.Thread(
+                    target=render_staged_worker,
+                    args=(task_id, config, title, prompt_block),
+                    daemon=True
+                ).start()
+
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/render_anchor':
+            try:
+                if not access_ok(self):
+                    self._send_json({'status': 'error', 'message': '访问码无效或缺失'}, status=401)
+                    return
+                if not rate_ok(_client_ip(self)):
+                    self._send_json({'status': 'error', 'message': '请求过于频繁，请稍后再试'}, status=429)
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                title = body.get('title', '')
+                prompt = body.get('prompt', '')
+                sequence = int(body.get('sequence', 1))
+                meta = body.get('meta', '')
+                if not title or not prompt:
+                    self._send_json({'status': 'error', 'message': 'title 和 prompt 均为必填'}, status=400)
+                    return
+
+                # Synchronous by design: a conversational agent calls this mid-turn and
+                # needs the verdict back directly, not a task_id to poll. The server is
+                # ThreadingMixIn, so blocking here does not stall other requests.
+                from prompt_pipeline import start_accounting, stop_and_get_accounting
+                from pipeline_orchestrator import render_and_gate_single_frame
+                start_accounting()
+                gate = render_and_gate_single_frame(config, title, sequence, prompt, meta=meta)
+                usage = stop_and_get_accounting()
+
+                response = {
+                    'status': 'ok',
+                    'gate_status': gate['status'],
+                    'reason': gate['reason'],
+                    'prompt': gate['prompt'],
+                    'image_url': '/' + os.path.relpath(gate['image_path'], os.path.dirname(os.path.abspath(__file__))).replace('\\', '/'),
+                    'project_dir': gate['project_dir'],
+                }
+                if usage:
+                    response['token_usage'] = usage
+                self._send_json(response)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -1534,6 +1985,21 @@ def sync_project_manifest_with_disk(project_dir):
                 except Exception:
                     pass
                     
+    def _rel_url_for(path):
+        rel = os.path.relpath(path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+        return rel, '/' + rel
+
+    def _normalize_media_entry(entry, path):
+        rel, url = _rel_url_for(path)
+        changed = False
+        if entry.get('file') != rel:
+            entry['file'] = rel
+            changed = True
+        if entry.get('url') != url:
+            entry['url'] = url
+            changed = True
+        return changed
+
     # 3. Synchronize manifest['frames']
     manifest_frames = manifest['frames']
     new_frames = []
@@ -1543,6 +2009,9 @@ def sync_project_manifest_with_disk(project_dir):
         seq = frame.get('sequence') or frame.get('slot')
         if seq:
             file_path = frame.get('file')
+            if not file_path:
+                modified = True
+                continue
             if file_path and file_path.lower().endswith('.png'):
                 file_path = os.path.splitext(file_path)[0] + '.webp'
                 frame['file'] = file_path
@@ -1576,23 +2045,126 @@ def sync_project_manifest_with_disk(project_dir):
             modified = True
             print(f"[SYNC] Restored missing frame {seq} to manifest")
             
+    manifest_frames_by_seq = {}
+    for frame in manifest['frames']:
+        seq = frame.get('sequence') or frame.get('slot')
+        if seq:
+            try:
+                manifest_frames_by_seq[int(seq)] = frame
+            except Exception:
+                pass
+
+    rebuilt_frames = []
+    for seq, fname in sorted(existing_webp_frames.items()):
+        frame_path = os.path.join(frames_dir, fname)
+        frame = manifest_frames_by_seq.get(seq, {}).copy()
+        frame['slot'] = frame.get('slot') or seq
+        frame['sequence'] = frame.get('sequence') or seq
+        if _normalize_media_entry(frame, frame_path):
+            modified = True
+        frame.setdefault("prompt", "Recovered frame image from disk")
+        frame.setdefault("reference", None)
+        frame.setdefault("model", "gemini-3.1-flash-image")
+        frame.setdefault("aspect_ratio", manifest.get('aspect_ratio') or "9:16")
+        frame.setdefault("image_size", manifest.get('image_size') or "2K")
+        frame.setdefault("retry_count", 0)
+        frame.setdefault("quality_gate", "pending_manual_review")
+        rebuilt_frames.append(frame)
+    if rebuilt_frames:
+        new_frames = rebuilt_frames
+
     new_frames.sort(key=lambda x: x.get('sequence', 0))
     if len(manifest['frames']) != len(new_frames) or modified:
         manifest['frames'] = new_frames
         modified = True
         
     videos_dir = os.path.join(project_dir, 'videos')
+    existing_videos = {}
+    if os.path.exists(videos_dir):
+        for fname in os.listdir(videos_dir):
+            if fname.lower().endswith('.mp4') and fname.lower().startswith('vid_'):
+                try:
+                    slot = int(fname.split('_')[1].split('.')[0])
+                    existing_videos[slot] = fname
+                except Exception:
+                    pass
+
+    # Load library to lookup the prompt block for this project if needed
+    project_title = os.path.basename(project_dir)
+    parsed_videos = {}
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, 'r', encoding='utf-8') as f:
+                lib_data = json.load(f)
+            for item in lib_data:
+                if item.get('title') == project_title:
+                    p_block = item.get('prompt_block')
+                    if p_block:
+                        _, parsed_videos = _parse_prompt_slots(p_block)
+                    break
+        except Exception as e:
+            print(f"[SYNC] Error loading prompt block from {DB_FILE}: {e}")
+
     manifest_videos = manifest['videos']
     new_videos = []
+    seen_slots = set()
     for video in manifest_videos:
-        vpath = video.get('file')
-        if vpath:
+        slot = video.get('slot') or video.get('sequence')
+        try:
+            slot = int(slot)
+        except Exception:
+            slot = None
+        if slot in existing_videos:
+            video_path = os.path.join(videos_dir, existing_videos[slot])
+            if _normalize_media_entry(video, video_path):
+                modified = True
+            if not video.get('prompt') or video.get('prompt') == "Recovered video from disk":
+                if slot in parsed_videos:
+                    video['prompt'] = parsed_videos[slot].get('body') or "Recovered video from disk"
+                    modified = True
+                    print(f"[SYNC] Updated existing video slot {slot} prompt from library")
+            new_videos.append(video)
+            if slot:
+                seen_slots.add(slot)
+        else:
+            vpath = video.get('file')
+            if not vpath:
+                continue
             full_vpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), vpath.lstrip('/'))
             if os.path.exists(full_vpath):
                 new_videos.append(video)
+                if slot:
+                    seen_slots.add(slot)
             else:
                 modified = True
-    if len(manifest['videos']) != len(new_videos):
+
+    # Restore missing videos from disk
+    for slot, fname in sorted(existing_videos.items()):
+        if slot not in seen_slots:
+            video_path = os.path.join(videos_dir, fname)
+            rel_file_path = os.path.relpath(video_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+            prompt = "Recovered video from disk"
+            if slot in parsed_videos:
+                prompt = parsed_videos[slot].get('body') or "Recovered video from disk"
+            new_video = {
+                "slot": slot,
+                "sequence": len(new_videos) + 1,
+                "file": rel_file_path,
+                "url": '/' + rel_file_path,
+                "prompt": prompt,
+                "model": "Veo 3.1 - Lite [Lower Priority]",
+                "status": "success"
+            }
+            new_videos.append(new_video)
+            seen_slots.add(slot)
+            modified = True
+            print(f"[SYNC] Restored missing video slot {slot} to manifest: {prompt[:30]}...")
+
+    new_videos.sort(key=lambda x: x.get('slot', 0))
+    for idx, video in enumerate(new_videos):
+        video['sequence'] = idx + 1
+
+    if len(manifest['videos']) != len(new_videos) or modified:
         manifest['videos'] = new_videos
         modified = True
         
@@ -1631,54 +2203,6 @@ def run_migrations():
                     sync_project_manifest_with_disk(project_dir)
                 except Exception as e:
                     print(f"[MIGRATION] Failed to sync project {name}: {e}")
-
-    station_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'image-service-station')
-    history_path = os.path.join(station_dir, 'restored_history.json')
-    if os.path.exists(history_path):
-        try:
-            with open(history_path, 'r', encoding='utf-8') as f:
-                history = json.load(f)
-            
-            if isinstance(history, list):
-                modified = False
-                out_dir = os.path.join(outputs_dir, 'image-station')
-                os.makedirs(out_dir, exist_ok=True)
-                
-                from PIL import Image
-                import io
-                import base64
-                import time
-                
-                for item in history:
-                    img_data = item.get('image')
-                    if img_data and isinstance(img_data, str) and img_data.startswith('data:image/'):
-                        try:
-                            header, encoded = img_data.split(',', 1)
-                            image_bytes = base64.b64decode(encoded)
-                            
-                            item_id = item.get('id', f"restored_{int(time.time())}")
-                            filename = f"restored_{item_id}.webp"
-                            target_path = os.path.join(out_dir, filename)
-                            
-                            img = Image.open(io.BytesIO(image_bytes))
-                            img.save(target_path, format='WEBP', quality=80)
-                            
-                            rel_path = os.path.relpath(target_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
-                            item['image'] = '/' + rel_path
-                            modified = True
-                            if sys.stdout:
-                                print(f"[MIGRATION] Converted history item {item_id} base64 -> local WebP")
-                        except Exception as ex:
-                            print(f"[MIGRATION] Error converting history item: {ex}")
-                
-                if modified:
-                    with open(history_path, 'w', encoding='utf-8') as f:
-                        json.dump(history, f, ensure_ascii=False, indent=2)
-                    if sys.stdout:
-                        print(f"[MIGRATION] Saved updated restored_history.json")
-        except Exception as e:
-            print(f"[MIGRATION] Failed to migrate restored_history.json: {e}")
-
 
 def run():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))

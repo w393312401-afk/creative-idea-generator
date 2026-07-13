@@ -18,7 +18,6 @@ tasks.json
 tasks/
 packet_cache.json
 scratch/
-image-service-station/restored_history.json
 
 # System / Temporary files
 out.txt
