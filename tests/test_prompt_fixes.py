@@ -44,6 +44,28 @@ class TestSlotExtraction(unittest.TestCase):
         self.assertEqual(items[1]['meta'], 'BRIDGE')
         self.assertIn('camera now at the sill', items[1]['prompt'])
 
+    def test_prompt_slots_list_structured_contract(self):
+        # 结构化槽位契约：与后端解析器同语义，含同行冒号正文与 [BRIDGE] meta
+        from prompt_pipeline import prompt_slots_list
+        block = (
+            "图片提示词\n"
+            "图片 1: A static shot of the ruined cabin.\n"
+            "\n"
+            "图片 2 [BRIDGE]:\n"
+            "CHANGE IN THIS FRAME: camera now at the sill.\n"
+            "\n"
+            "视频提示词\n"
+            "视频 1:\n"
+            "Use the provided first frame and last frame as exact composition anchors.\n"
+        )
+        slots = prompt_slots_list(block)
+        self.assertEqual([s['index'] for s in slots['images']], [1, 2])
+        self.assertEqual(slots['images'][1]['meta'], 'BRIDGE')
+        # 同行冒号后的正文必须保留（前端旧正则曾静默丢弃这种形状）
+        self.assertIn('ruined cabin', slots['images'][0]['body'])
+        self.assertEqual([s['index'] for s in slots['videos']], [1])
+        self.assertEqual(prompt_slots_list(''), {'images': [], 'videos': []})
+
 class TestPromptFixes(unittest.TestCase):
     
     def test_fix_image_clean_frame_proactive(self):
@@ -260,6 +282,97 @@ Video prompt 8 here.
         self.assertIn("视频 8 [BRIDGE]:", formatted)
         self.assertIn("视频 1:", formatted)
 
+    def test_build_partial_prompt_block_tags_bridge_and_grows_incrementally(self):
+        """_build_partial_prompt_block powers the progressive per-beat SSE reveal
+        (on_progress('beat_ready', ...)) as well as the final reassembly, so it must:
+        (1) apply the same BRIDGE tagging the final assembly always has, and
+        (2) produce a strictly growing, always-valid block as beats accumulate."""
+        from prompt_pipeline import _build_partial_prompt_block, _parse_prompt_slots
+
+        beat_ladder = [
+            {"operation": "demo", "bridge_stage": None},
+            {"operation": "cross", "bridge_stage": 1},
+            {"operation": "cross", "bridge_stage": 2},
+        ]
+
+        # After only IMAGE 1 (the anchor) is compiled.
+        images, videos, block = _build_partial_prompt_block({1: "trauma state"}, {}, beat_ladder)
+        self.assertEqual(images[1], {"body": "trauma state", "meta": ""})
+        self.assertEqual(videos, {})
+        parsed_images, parsed_videos = _parse_prompt_slots(block)
+        self.assertIn(1, parsed_images)
+        self.assertEqual(parsed_videos, {})
+
+        # After beat 1 (VIDEO 1 + IMAGE 2) and beat 2 (bridge_stage=1, so IMAGE 3 is BRIDGE).
+        compiled_images = {1: "trauma state", 2: "beat 1 result", 3: "bridge entry"}
+        compiled_videos = {1: "video 1", 2: "bridge video 2"}
+        images, videos, block = _build_partial_prompt_block(compiled_images, compiled_videos, beat_ladder)
+        self.assertEqual(images[3]['meta'], "BRIDGE")  # IMAGE 3 follows beat_ladder[1] (bridge_stage=1)
+        self.assertEqual(videos[2]['meta'], "BRIDGE")  # VIDEO 2 is beat_ladder[1] itself
+        self.assertEqual(images[2]['meta'], "")
+        self.assertEqual(videos[1]['meta'], "")
+        self.assertIn("图片 3 [BRIDGE]:", block)
+        self.assertIn("视频 2 [BRIDGE]:", block)
+
+    def test_soft_similarity_only_ratio_gates_best_effort_acceptance(self):
+        """_soft_similarity_only_ratio decides when a beat may be shipped best-effort instead of
+        falling back to a generic placeholder: ONLY when every remaining error is the soft
+        'too similar to previous beat' stylistic check (any hard error -> None)."""
+        from prompt_pipeline import _soft_similarity_only_ratio
+
+        soft_only = [
+            "VIDEO phrasing/structure is too similar to previous beat (cleaned similarity: 0.69 > 0.65). Please vary ...",
+        ]
+        self.assertAlmostEqual(_soft_similarity_only_ratio(soft_only), 0.69)
+
+        # Two soft errors -> return the worst (highest) current-similarity, ignoring the '> 0.65' threshold.
+        two_soft = [
+            "VIDEO sentence is too similar to previous beat's sentence (similarity: 0.72):\n  Current: x",
+            "VIDEO phrasing/structure is too similar to previous beat (cleaned similarity: 0.66 > 0.65).",
+        ]
+        self.assertAlmostEqual(_soft_similarity_only_ratio(two_soft), 0.72)
+
+        # Any hard error present -> not eligible for best-effort acceptance.
+        mixed = [
+            "VIDEO phrasing/structure is too similar to previous beat (cleaned similarity: 0.66 > 0.65).",
+            "VIDEO prompt word count (236) exceeds limit of 180 words",
+        ]
+        self.assertIsNone(_soft_similarity_only_ratio(mixed))
+        self.assertIsNone(_soft_similarity_only_ratio([]))
+
+    def test_checkpoint_is_failed_terminal_detects_poisoned_resume(self):
+        """A checkpoint whose fallback_count already exceeds the quality gate is a failed-terminal
+        snapshot that must NOT be resumed as-is (else every retry is a zero-work instant re-fail)."""
+        from prompt_pipeline import _checkpoint_is_failed_terminal
+
+        # 7 beats -> gate limit = max(2, 7//3) = 2. fallback_count 3 > 2 -> failed terminal.
+        self.assertTrue(_checkpoint_is_failed_terminal(
+            {"fallback_count": 3, "pass_beats_done": [2, 3, 5]}, 7))
+        # At/under the limit -> a legitimately resumable interruption.
+        self.assertFalse(_checkpoint_is_failed_terminal({"fallback_count": 2}, 7))
+        self.assertFalse(_checkpoint_is_failed_terminal({"fallback_count": 0}, 7))
+        # Robust to missing field / non-dict.
+        self.assertFalse(_checkpoint_is_failed_terminal({}, 7))
+        self.assertFalse(_checkpoint_is_failed_terminal(None, 7))
+        # Larger sequence raises the limit: 30 beats -> limit 10, so 3 fallbacks is fine.
+        self.assertFalse(_checkpoint_is_failed_terminal({"fallback_count": 3}, 30))
+
+    def test_local_trim_to_budget_fits_and_keeps_ends(self):
+        """Local trim (used when the 8046 aux model is unreachable for compression) must bring an
+        over-budget prompt under the word limit while preserving the first and last sentences."""
+        from prompt_pipeline import _local_trim_to_budget
+        prompt = ("Use the provided first frame as anchor. "
+                  "Middle detail one is verbose. Middle detail two is verbose. "
+                  "Middle detail three is verbose. Middle detail four is verbose. "
+                  "Locked anchors horizon level.")
+        trimmed = _local_trim_to_budget(prompt, 12)
+        self.assertLessEqual(len(trimmed.split()), 12)
+        self.assertTrue(trimmed.startswith("Use the provided first frame as anchor."))
+        self.assertIn("Locked anchors", trimmed)
+        # Already under budget -> returned unchanged.
+        short = "Short prompt here."
+        self.assertEqual(_local_trim_to_budget(short, 50), short)
+
 class TestPacketShapeNormalization(unittest.TestCase):
     """Regression tests for the Beat-2 abort: the packet LLM returned worker_choreography
     as a nested dict, and check_stylistic_repetition crashed on dict.lower()."""
@@ -325,6 +438,195 @@ class TestPacketShapeNormalization(unittest.TestCase):
         self.assertIn("remove debris", ladder[0]["description"])
         self.assertIsInstance(ladder[1]["operation"], str)
         self.assertEqual(ladder[1]["bridge_stage"], 1)
+
+
+class TestShotFamilySpatialLocks(unittest.TestCase):
+    """空间逻辑修复回归：桥接后镜头族交接、锚点比例锁、锚点子句去重、
+    桥接帧相机线保全、pan/tilt 封禁。四种坏形状均取自 2026-07-12 hollow-oak 实际产出。"""
+
+    PACKET = {
+        'camera_dna': (
+            "Static wide-angle eighteen-millimeter tripod shot at one-point-five meters height, "
+            "locked eye-level perspective facing the hollow oak trunk; horizon line remains level "
+            "at fifty percent height."
+        ),
+        'geometry_lock': 'trunk shell fixed',
+        'primary_landmarks': [
+            {'name': 'decaying trunk base opening', 'grid': 'Grid C2', 'z_depth_scale': '35%'},
+            {'name': 'curved interior cavity wall', 'grid': 'Grid B2', 'z_depth_scale': '65%'},
+            {'name': 'misty forest canopy', 'grid': 'Grid A2', 'z_depth_scale': '45%'},
+        ],
+        'frame_boundaries': {'left': 'B1', 'right': 'B3', 'top': 'A2', 'bottom': 'C2'},
+        'interior_camera_dna': (
+            "Static tripod shot inside the hollow trunk chamber, same ultra-wide lens feel and same "
+            "camera height, camera pitch locked level; the central vanishing axis stays centered on "
+            "the rear cavity wall in Grid B2."
+        ),
+        'interior_primary_landmarks': [
+            {'name': 'heartwood ridge', 'grid': 'Grid B2', 'z_depth_scale': '60%'},
+            {'name': 'mossy root shelf', 'grid': 'Grid C2', 'z_depth_scale': '30%'},
+        ],
+    }
+    LADDER = [
+        {'index': 1, 'operation': 'clearing', 'description': 'clear debris', 'bridge_stage': None},
+        {'index': 2, 'operation': 'framing', 'description': 'frame walls', 'bridge_stage': None},
+        {'index': 3, 'operation': 'threshold', 'description': 'approach to sill', 'bridge_stage': 1},
+        {'index': 4, 'operation': 'threshold', 'description': 'cross the sill', 'bridge_stage': 2},
+        {'index': 5, 'operation': 'paneling', 'description': 'panel interior', 'bridge_stage': None},
+        {'index': 6, 'operation': 'reward', 'description': 'final reveal', 'bridge_stage': None},
+    ]
+
+    def test_beat_space_family_hands_off_at_bridge(self):
+        from prompt_pipeline import beat_space_family
+        self.assertEqual(beat_space_family(self.LADDER, 1), 'exterior')
+        self.assertEqual(beat_space_family(self.LADDER, 2), 'exterior')
+        self.assertEqual(beat_space_family(self.LADDER, 3), 'sill')
+        self.assertEqual(beat_space_family(self.LADDER, 4), 'interior')
+        self.assertEqual(beat_space_family(self.LADDER, 5), 'interior')
+        self.assertEqual(beat_space_family(self.LADDER, 6), 'interior')
+        no_bridge = [dict(b, bridge_stage=None) for b in self.LADDER]
+        for i in range(1, 7):
+            self.assertEqual(beat_space_family(no_bridge, i), 'exterior')
+
+    def test_fix_primary_landmarks_dedupes_and_locks_scale(self):
+        # 实际产出的图4形状：LLM 简称+错比例的 Locked anchors 与追加的全名版并存
+        from prompt_pipeline import fix_primary_landmarks
+        prompt = (
+            "Static wide-angle eighteen-millimeter tripod shot facing the hollow oak trunk. "
+            "Horizon line remains level at fifty percent height. "
+            "Locked anchors: trunk base at Grid C2 (35 percent height), cavity wall at Grid B2 "
+            "(65 percent height), frame at Grid B2 (55 percent height), canopy at Grid A2 (45 percent height). "
+            "Locked anchors: decaying trunk base opening at Grid C2, curved interior cavity wall at Grid B2, "
+            "misty forest canopy at Grid A2."
+        )
+        fixed = fix_primary_landmarks(prompt, self.PACKET, family='exterior')
+        self.assertEqual(fixed.lower().count('locked anchors:'), 1)
+        self.assertIn('decaying trunk base opening at Grid C2 holding 35 percent of frame height', fixed)
+        self.assertIn('curved interior cavity wall at Grid B2 holding 65 percent of frame height', fixed)
+        self.assertIn('misty forest canopy at Grid A2 holding 45 percent of frame height', fixed)
+        self.assertNotIn('55 percent', fixed)
+
+    def test_fix_primary_landmarks_interior_uses_interior_set(self):
+        from prompt_pipeline import fix_primary_landmarks
+        prompt = (
+            "Blonde oak panels line the walls. Camera pitch locked level; the central vanishing axis "
+            "stays centered. Locked anchors: decaying trunk base opening at Grid C2, curved interior "
+            "cavity wall at Grid B2, misty forest canopy at Grid A2."
+        )
+        fixed = fix_primary_landmarks(prompt, self.PACKET, family='interior')
+        self.assertNotIn('misty forest canopy', fixed)
+        self.assertIn('heartwood ridge at Grid B2 holding 60 percent of frame height', fixed)
+        self.assertIn('mossy root shelf at Grid C2 holding 30 percent of frame height', fixed)
+
+    def test_fix_primary_landmarks_sill_strips_exterior_stanza(self):
+        from prompt_pipeline import fix_primary_landmarks
+        prompt = (
+            "The threshold edges hug the left and right boundaries. "
+            "Locked anchors: decaying trunk base opening at Grid C2, curved interior cavity wall at "
+            "Grid B2, misty forest canopy at Grid A2."
+        )
+        fixed = fix_primary_landmarks(prompt, self.PACKET, family='sill')
+        self.assertNotIn('locked anchors', fixed.lower())
+        self.assertIn('threshold edges hug', fixed)
+
+    def test_check_anchor_scale_lock_catches_oscillation(self):
+        # 实际产出的图7/9形状：同一锚点比例 35→55 / 65→85 / 45→25 振荡
+        from prompt_pipeline import check_anchor_scale_lock
+        drifted = (
+            "Locked anchors: decaying trunk base opening at Grid C2 holds a scale of fifty-five "
+            "percent of frame height, curved interior cavity wall at Grid B2 holds a scale of "
+            "eighty-five percent of frame height, misty forest canopy at Grid A2 holds a scale of "
+            "twenty-five percent of frame height."
+        )
+        errs = check_anchor_scale_lock(drifted, self.PACKET, family='exterior')
+        self.assertEqual(len(errs), 3)
+        good = (
+            "Locked anchors: decaying trunk base opening at Grid C2 holding 35 percent of frame "
+            "height, curved interior cavity wall at Grid B2 holding sixty-five percent of frame "
+            "height, misty forest canopy at Grid A2 holding forty-five percent of frame height. "
+            "The horizon line remains perfectly level at exactly 50-percent height of the frame."
+        )
+        self.assertEqual(check_anchor_scale_lock(good, self.PACKET, family='exterior'), [])
+        # 桥接帧豁免（TBCP 要求比例跨桥递增）
+        self.assertEqual(check_anchor_scale_lock(drifted, self.PACKET, family='sill'), [])
+
+    def test_check_shot_family_leakage(self):
+        from prompt_pipeline import check_shot_family_leakage
+        # 实际产出的图7-10形状：穿越后仍把室外锚点钉回网格 + 提及 canopy/horizon
+        leaked = (
+            "Glowing brass sconces activate. Locked anchors: decaying trunk base opening at Grid C2, "
+            "misty forest canopy at Grid A2. The horizon line remains perfectly level."
+        )
+        errs = check_shot_family_leakage(leaked, self.PACKET, family='interior')
+        self.assertTrue(any('decaying trunk base opening' in e for e in errs))
+        self.assertTrue(any('horizon' in e for e in errs))
+        clean = (
+            "Blonde oak panels line the walls. Interior anchors hold steady. Camera pitch locked "
+            "level; the central vanishing axis stays centered."
+        )
+        self.assertEqual(check_shot_family_leakage(clean, self.PACKET, family='interior'), [])
+        # 室外帧不受此检查约束
+        self.assertEqual(check_shot_family_leakage(leaked, self.PACKET, family='exterior'), [])
+
+    def test_bridge_image_keeps_a_camera_declaration(self):
+        # 实际产出的图5/6形状：旧逻辑把静态相机句整句删除且不补任何相机声明
+        from prompt_pipeline import apply_proactive_fixes
+        beat = self.LADDER[2]  # bridge_stage 1
+        image = (
+            "Static wide-angle eighteen-millimeter tripod shot at one-point-five meters height, "
+            "locked eye-level perspective facing the hollow oak trunk. Backlit by overcast daylight, "
+            "a work light illuminates the dim interior's timber framing."
+        )
+        video = (
+            "Use the provided first frame and last frame as exact composition anchors. Use IMAGE 3 as "
+            "the actual first-frame image and IMAGE 4 as the actual last-frame image; every visible "
+            "action must interpolate between those two frame images without inventing a third layout. "
+            "Camera executes a coaxial forward push-in toward the doorway."
+        )
+        v, img = apply_proactive_fixes(3, video, image, self.PACKET, 'Threshold', False, True,
+                                       beat=beat, config=None, family='sill')
+        self.assertNotIn('facing the hollow oak trunk', img)
+        self.assertIn('vanishing axis', img.lower())
+        self.assertIn('sill', img.lower())
+
+    def test_pan_tilt_ban_is_negation_aware(self):
+        from prompt_pipeline import check_camera_contradictions, fix_camera_contradictions
+        # 实际产出的视频5形状：桥接段 180 度横摇
+        bad = ("The camera pushes forward, panning 180 degrees across the chamber. "
+               "Worker installs the frame.")
+        errs = check_camera_contradictions(bad, True, ban_pan_tilt=True)
+        self.assertTrue(any('pan' in e.lower() for e in errs))
+        fixed = fix_camera_contradictions(bad, True, ban_pan_tilt=True)
+        self.assertNotIn('panning', fixed)
+        self.assertIn('Worker installs the frame.', fixed)
+        # TBCP 护栏句（否定式）不得自伤；工人动作里的 pan 名词不受牵连
+        guarded = ("The camera advances straight toward the doorway with no yaw, tilt, roll, or "
+                   "side-step. The worker sweeps sawdust into a dust pan.")
+        self.assertEqual(check_camera_contradictions(guarded, True, ban_pan_tilt=True), [])
+        self.assertIn('dust pan', fix_camera_contradictions(guarded, True, ban_pan_tilt=True))
+
+    def test_fix_horizon_line_family_aware(self):
+        from prompt_pipeline import fix_horizon_line
+        interior = "Blonde oak panels line the walls. The horizon line remains perfectly level at exactly 50-percent height of the frame."
+        fixed = fix_horizon_line(interior, family='interior')
+        self.assertNotIn('horizon', fixed.lower())
+        self.assertIn('pitch locked level', fixed.lower())
+        exterior = "The decaying trunk stands in mist."
+        fixed_ext = fix_horizon_line(exterior, family='exterior')
+        self.assertIn('horizon line', fixed_ext.lower())
+
+    def test_normalize_packet_coerces_interior_fields(self):
+        packet = {
+            'camera_dna': 'static tripod shot',
+            'interior_camera_dna': {'text': 'inside chamber shot'},
+            'interior_primary_landmarks': [
+                {'name': 'heartwood ridge', 'grid': {'cell': 'Grid B2'}, 'z_depth_scale': 60},
+            ],
+        }
+        normalize_packet(packet)
+        self.assertIsInstance(packet['interior_camera_dna'], str)
+        self.assertIsInstance(packet['interior_primary_landmarks'][0]['grid'], str)
+        self.assertIsInstance(packet['interior_primary_landmarks'][0]['z_depth_scale'], str)
 
 
 if __name__ == '__main__':

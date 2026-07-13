@@ -318,12 +318,18 @@ function imgStudioLoadTaskList() {
             imgStudioTaskList = imgStudioTaskList.filter(task => !task.image || !task.image.includes('undefined'));
             imgStudioTaskList.forEach(task => {
                 task.controller = null;
+                // 旧版本存档没有动态流字段：补默认值，别让渲染层到处判空
+                if (!task.createdAt) task.createdAt = Date.now();
+                if (!Array.isArray(task.stages)) task.stages = [];
                 if (task.status === 'pending') {
                     if (task.backendTaskId) {
+                        imgStudioPushStage(task, '页面刷新，恢复轮询中…');
                         imgStudioPollTaskStatus(task);
                     } else {
                         task.status = 'failed';
                         task.error = '页面刷新，任务被中断';
+                        task.finishedAt = task.finishedAt || Date.now();
+                        imgStudioPushStage(task, '❌ 页面刷新，任务被中断（尚未提交到后端）');
                     }
                 }
             });
@@ -369,6 +375,167 @@ function imgStudioSaveTaskList() {
     }
 }
 
+/* ── 实时生成动态（Live Feed）────────────────────────────────────────
+   任务不再以"队列卡片"整表重建展示：每个任务是一条动态条目，阶段行只增量
+   追加、节点只建一次（整表重建会把用户的滚动位置顶回去——任务抽屉踩过的坑）。
+   数组顺序仍是新任务在前（unshift），渲染时倒序遍历 = 旧在上、新在下，
+   容器贴底时自动跟随最新动态。 */
+
+let imgStudioFeedTicker = null;
+
+function imgStudioPushStage(task, text) {
+    if (!Array.isArray(task.stages)) task.stages = [];
+    const last = task.stages[task.stages.length - 1];
+    if (last && last.text === text) return;
+    task.stages.push({ t: Date.now(), text });
+    if (task.stages.length > 40) {
+        task.stages.splice(0, task.stages.length - 40);
+        task._stagesTrimmed = true;
+    }
+}
+
+function imgStudioFmtClock(ms) {
+    const d = new Date(ms);
+    const p = n => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function imgStudioTaskElapsedText(task) {
+    const base = task.createdAt || Date.now();
+    const end = task.finishedAt || Date.now();
+    const s = Math.max(0, Math.round((end - base) / 1000));
+    return s >= 60 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s` : `${s}s`;
+}
+
+function imgStudioLatestPendingTask() {
+    return imgStudioTaskList.find(t => t.status === 'pending') || null; // 数组新在前
+}
+
+function imgStudioFeedActionsHTML(task) {
+    if (task.status === 'pending') {
+        return `<button type="button" class="task-btn-icon danger-hover" title="取消任务" onclick="cancelImageStudioTask('${task.id}')">✕</button>`;
+    }
+    const retryBtn = (task.status === 'failed' || task.status === 'cancelled')
+        ? `<button type="button" class="task-btn-icon" title="重试任务" onclick="retryImageStudioTask('${task.id}')">🔄</button>` : '';
+    return `${retryBtn}<button type="button" class="task-btn-icon danger-hover" title="删除记录" onclick="deleteImageStudioTask('${task.id}')">✕</button>`;
+}
+
+const IMGSTUDIO_STATUS_TEXT = { pending: '渲染中', completed: '已完成', failed: '失败', cancelled: '已取消' };
+
+function imgStudioBuildFeedEntry(task) {
+    const node = document.createElement('div');
+    node.id = `feed-entry-${task.id}`;
+    node.className = 'feed-entry';
+    node.innerHTML = `
+        <div class="feed-entry-head">
+            <span class="task-badge-type">${task.type === 't2i' ? '文生图' : '图生图'}</span>
+            <span class="feed-model" translate="no">${escapeHtml((task.model || '').replace('-image', ''))}</span>
+            <span class="feed-meta">${escapeHtml(task.ratio || '')} · ${escapeHtml(task.quality || '')}</span>
+            <span class="feed-head-right">
+                <span class="feed-status-chip"></span>
+                <span class="feed-actions"></span>
+            </span>
+        </div>
+        <div class="feed-entry-prompt" title="${escapeHtml(task.prompt)}">${escapeHtml(task.prompt)}</div>
+        <div class="feed-stage-lines"></div>
+        <div class="feed-entry-result" style="display:none;"></div>
+    `;
+    return node;
+}
+
+function imgStudioUpdateFeedEntry(node, task) {
+    // 状态胶囊 + 操作按钮：仅在状态变化时重建
+    if (node.dataset.status !== task.status) {
+        node.dataset.status = task.status;
+        node.className = `feed-entry st-${task.status}`;
+        const chip = node.querySelector('.feed-status-chip');
+        if (chip) {
+            chip.className = `feed-status-chip task-status-badge ${task.status}`;
+            chip.innerHTML = task.status === 'pending'
+                ? `${IMGSTUDIO_STATUS_TEXT.pending} <span class="feed-elapsed">(${imgStudioTaskElapsedText(task)})</span>`
+                : `${IMGSTUDIO_STATUS_TEXT[task.status] || task.status} · ${imgStudioTaskElapsedText(task)}`;
+            if (task.status === 'failed') chip.title = task.error || '';
+        }
+        const actions = node.querySelector('.feed-actions');
+        if (actions) actions.innerHTML = imgStudioFeedActionsHTML(task);
+    }
+
+    // 阶段行：只追加新行；被截断或重试重置过的整块重建
+    const linesBox = node.querySelector('.feed-stage-lines');
+    const stages = task.stages || [];
+    let rendered = parseInt(node.dataset.stageCount || '0', 10);
+    if (task._stagesTrimmed || rendered > stages.length) {
+        linesBox.innerHTML = '';
+        rendered = 0;
+        task._stagesTrimmed = false;
+    }
+    for (let i = rendered; i < stages.length; i++) {
+        const line = document.createElement('div');
+        line.className = 'feed-stage-line';
+        line.innerHTML = `<span class="feed-stage-time">[${imgStudioFmtClock(stages[i].t)}]</span> ${escapeHtml(stages[i].text)}`;
+        linesBox.appendChild(line);
+    }
+    node.dataset.stageCount = String(stages.length);
+    if (stages.length !== rendered) linesBox.scrollTop = linesBox.scrollHeight;
+
+    // 完成缩略图（只设一次）
+    if (task.status === 'completed' && task.image && !node.dataset.thumbSet) {
+        node.dataset.thumbSet = '1';
+        const box = node.querySelector('.feed-entry-result');
+        if (box) {
+            box.style.display = 'flex';
+            box.innerHTML = `<img src="${task.image}" alt="生成结果" onclick="viewImageStudioTaskItem('${task.id}')" title="点击在渲染室大屏查看">`;
+        }
+    }
+}
+
+function imgStudioSyncFeedTicker(activeCount) {
+    // 秒表只在有渲染中任务时运转，空闲即停——不留常驻定时器
+    if (activeCount > 0 && !imgStudioFeedTicker) {
+        imgStudioFeedTicker = setInterval(() => {
+            let anyPending = false;
+            imgStudioTaskList.forEach(task => {
+                if (task.status !== 'pending') return;
+                anyPending = true;
+                const el = document.querySelector(`#feed-entry-${task.id} .feed-elapsed`);
+                if (el) el.textContent = `(${imgStudioTaskElapsedText(task)})`;
+            });
+            const sk = document.getElementById('spotlight-skeleton');
+            if (sk && sk.style.display !== 'none') {
+                const t = imgStudioLatestPendingTask();
+                const st = sk.querySelector('.loader-status-text');
+                if (t && st) {
+                    const stageText = (t.stages && t.stages.length) ? t.stages[t.stages.length - 1].text : '渲染中';
+                    st.textContent = `${stageText} · ${imgStudioTaskElapsedText(t)}`;
+                }
+            }
+            if (!anyPending && imgStudioFeedTicker) {
+                clearInterval(imgStudioFeedTicker);
+                imgStudioFeedTicker = null;
+            }
+        }, 1000);
+    } else if (activeCount === 0 && imgStudioFeedTicker) {
+        clearInterval(imgStudioFeedTicker);
+        imgStudioFeedTicker = null;
+    }
+}
+
+function imgStudioSyncSpotlightSkeleton(activeCount) {
+    // 渲染室大屏联动：有任务渲染中且没有成品在展示时，亮起骨架屏当"生成进程"主视觉
+    const skeleton = document.getElementById('spotlight-skeleton');
+    const placeholder = document.getElementById('spotlight-placeholder');
+    const imageWrapper = document.getElementById('spotlight-image-wrapper');
+    if (!skeleton || !placeholder || !imageWrapper) return;
+    const imageShowing = imageWrapper.style.display !== 'none' && imageWrapper.style.display !== '';
+    if (activeCount > 0 && !imageShowing) {
+        placeholder.style.display = 'none';
+        skeleton.style.display = 'flex';
+    } else if (activeCount === 0 && skeleton.style.display === 'flex') {
+        skeleton.style.display = 'none';
+        if (!imageShowing) placeholder.style.display = 'flex';
+    }
+}
+
 function imgStudioRenderTaskListUI() {
     const activeCount = imgStudioTaskList.filter(t => t.status === 'pending').length;
     const totalCount = imgStudioTaskList.length;
@@ -381,74 +548,36 @@ function imgStudioRenderTaskListUI() {
     if (activeCountSpan) activeCountSpan.textContent = activeCount;
     if (totalCountSpan) totalCountSpan.textContent = totalCount;
     if (section) section.style.display = totalCount > 0 ? 'block' : 'none';
+    const liveDot = document.getElementById('feed-live-dot');
+    if (liveDot) liveDot.classList.toggle('active', activeCount > 0);
 
     if (!container) return;
-    container.innerHTML = '';
 
-    imgStudioTaskList.forEach(task => {
-        const card = document.createElement('div');
-        card.className = `task-card ${task.status}`;
+    // 先记滚动位置：只有本就贴底才自动跟随，不打断用户回看历史动态
+    const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 60;
 
-        // 提示词与错误信息可能包含引号/尖括号（LLM 或服务端原文），必须转义后再进 innerHTML
-        const safePrompt = escapeHtml(task.prompt);
-        const safeError = escapeHtml(task.error || '');
-
-        let visualHTML = '';
-        if (task.status === 'pending') {
-            visualHTML = `<div class="task-visual"><div class="task-spinner-ring"></div></div>`;
-        } else if (task.status === 'completed' && task.image) {
-            visualHTML = `<div class="task-visual"><img src="${task.image}" alt="Thumb" onclick="viewImageStudioTaskItem('${task.id}')"></div>`;
-        } else if (task.status === 'failed') {
-            visualHTML = `<div class="task-visual"><span class="task-failed-icon">❌</span></div>`;
-        } else if (task.status === 'cancelled') {
-            visualHTML = `<div class="task-visual"><span class="task-cancelled-icon">⏹️</span></div>`;
-        }
-
-        let statusBadgeHTML = '';
-        if (task.status === 'pending') {
-            statusBadgeHTML = `<span class="task-status-badge pending">渲染中</span>`;
-        } else if (task.status === 'completed') {
-            statusBadgeHTML = `<span class="task-status-badge completed">已完成</span>`;
-        } else if (task.status === 'failed') {
-            statusBadgeHTML = `<span class="task-status-badge failed" title="${safeError}">失败</span>`;
-        } else if (task.status === 'cancelled') {
-            statusBadgeHTML = `<span class="task-status-badge cancelled">已取消</span>`;
-        }
-
-        let actionHTML = '';
-        if (task.status === 'pending') {
-            actionHTML = `<button type="button" class="task-btn-icon danger-hover" title="取消任务" onclick="cancelImageStudioTask('${task.id}')">✕</button>`;
-        } else {
-            let retryBtn = '';
-            if (task.status === 'failed' || task.status === 'cancelled') {
-                retryBtn = `<button type="button" class="task-btn-icon" title="重试任务" onclick="retryImageStudioTask('${task.id}')">🔄</button>`;
-            }
-            actionHTML = `
-                ${retryBtn}
-                <button type="button" class="task-btn-icon danger-hover" title="删除记录" onclick="deleteImageStudioTask('${task.id}')">✕</button>
-            `;
-        }
-
-        card.innerHTML = `
-            ${visualHTML}
-            <div class="task-info">
-                <div class="task-meta">
-                    <span class="task-badge-type">${task.type === 't2i' ? '文生图' : '图生图'}</span>
-                    <span class="task-model" translate="no">${escapeHtml(task.model.replace('-image', ''))}</span>
-                    <span>${escapeHtml(task.ratio)}</span>
-                    <span>${escapeHtml(task.quality)}</span>
-                    <span style="margin-left: auto;">${escapeHtml(task.timestamp)}</span>
-                </div>
-                <div class="task-prompt" title="${safePrompt}">${safePrompt}</div>
-                ${task.status === 'failed' ? `<div class="task-error" title="${safeError}">原因: ${safeError || '未知错误'}</div>` : ''}
-            </div>
-            <div class="task-control">
-                ${statusBadgeHTML}
-                ${actionHTML}
-            </div>
-        `;
-        container.appendChild(card);
+    const alive = new Set(imgStudioTaskList.map(t => `feed-entry-${t.id}`));
+    Array.from(container.children).forEach(child => {
+        if (!alive.has(child.id)) child.remove();
     });
+
+    for (let i = imgStudioTaskList.length - 1; i >= 0; i--) {
+        const task = imgStudioTaskList[i];
+        let node = document.getElementById(`feed-entry-${task.id}`);
+        if (!node) {
+            node = imgStudioBuildFeedEntry(task);
+            container.appendChild(node);
+        }
+        imgStudioUpdateFeedEntry(node, task);
+    }
+
+    if (nearBottom || container.dataset.forceScroll === '1') {
+        container.scrollTop = container.scrollHeight;
+        delete container.dataset.forceScroll;
+    }
+
+    imgStudioSyncFeedTicker(activeCount);
+    imgStudioSyncSpotlightSkeleton(activeCount);
 }
 
 function imgStudioAddTask(type, prompt, model, ratio, quality, extraData) {
@@ -459,9 +588,14 @@ function imgStudioAddTask(type, prompt, model, ratio, quality, extraData) {
         error: null,
         image: null,
         timestamp: new Date().toLocaleTimeString(),
+        createdAt: Date.now(),
+        finishedAt: null,
+        stages: [],
+        lastStage: null,
         controller: null,
         extraData: extraData
     };
+    imgStudioPushStage(task, `任务已提交（${type === 't2i' ? '文生图' : '图生图'} · ${model} · ${ratio} · ${quality}）`);
 
     imgStudioTaskList.unshift(task);
 
@@ -472,6 +606,10 @@ function imgStudioAddTask(type, prompt, model, ratio, quality, extraData) {
         }
     }
 
+    // 新任务永远滚入视野（即便用户此前把动态流滚到了别处）
+    const container = document.getElementById('imgstudio-tasks-list');
+    if (container) container.dataset.forceScroll = '1';
+
     imgStudioSaveTaskList();
     imgStudioRenderTaskListUI();
     imgStudioRunTaskFetch(task);
@@ -481,39 +619,58 @@ function imgStudioAddTask(type, prompt, model, ratio, quality, extraData) {
 async function imgStudioPollTaskStatus(task) {
     if (!task.backendTaskId) return;
 
-    // 连续失败上限（约 60 秒）：服务挂掉后不再让任务永远转圈「渲染中」
+    // 长轮询推送（毫秒级同步）：请求带 wait+since 指纹在服务端挂起，任务的
+    // 状态/阶段一变化立即返回——上游秒报错，动态流秒可见；无变化则 ~20s 一轮空转。
+    // 连续失败上限：服务挂掉后不再让任务永远转圈「渲染中」（失败间隔 1.5s，约 60s 放弃）。
     let failStreak = 0;
     const MAX_FAIL_STREAK = 40;
+    let fingerprint = '';
 
-    const intervalId = setInterval(async () => {
-        const currentTask = imgStudioTaskList.find(t => t.id === task.id);
-        if (!currentTask || currentTask.status === 'cancelled' || currentTask.status === 'completed' || currentTask.status === 'failed') {
-            clearInterval(intervalId);
-            return;
-        }
+    const liveTask = () => {
+        const cur = imgStudioTaskList.find(t => t.id === task.id);
+        return (cur && cur.status === 'pending') ? cur : null;
+    };
 
-        const registerFailure = () => {
+    while (true) {
+        const currentTask = liveTask();
+        if (!currentTask) return;
+
+        const registerFailure = async () => {
             failStreak += 1;
             if (failStreak >= MAX_FAIL_STREAK) {
-                clearInterval(intervalId);
                 currentTask.status = 'failed';
+                currentTask.finishedAt = Date.now();
                 currentTask.error = '与本地服务失联，已停止轮询（服务恢复后可点重试）';
                 currentTask.controller = null;
+                imgStudioPushStage(currentTask, '❌ 与本地服务失联，已停止轮询');
                 imgStudioSaveTaskList();
                 imgStudioRenderTaskListUI();
+                return true;
             }
+            await new Promise(r => setTimeout(r, 1500));
+            return false;
         };
 
         try {
-            const response = await fetch(`/api/image/task/status?task_id=${task.backendTaskId}`);
-            if (!response.ok) { registerFailure(); return; }
+            const qs = `task_id=${encodeURIComponent(task.backendTaskId)}&wait=20&since=${encodeURIComponent(fingerprint)}`;
+            const response = await fetch(`/api/image/task/status?${qs}`);
+            if (!response.ok) { if (await registerFailure()) return; continue; }
             failStreak = 0;
 
             const data = await response.json();
-            if (!data) return;
+            if (!data) continue;
+            fingerprint = data.fingerprint || '';
 
-            if (data.status === 'completed') {
-                clearInterval(intervalId);
+            if (data.status === 'pending') {
+                // 后端 worker 汇报的真实阶段（排队/上游渲染/上游报错重试/落盘）→ 追加进动态流
+                if (data.stage && data.stage !== currentTask.lastStage) {
+                    currentTask.lastStage = data.stage;
+                    imgStudioPushStage(currentTask, data.stage);
+                    imgStudioSaveTaskList();
+                    imgStudioRenderTaskListUI();
+                }
+            } else if (data.status === 'completed') {
+                currentTask.finishedAt = Date.now();
 
                 const result = data.result;
                 if (result && result.data && result.data.length > 0) {
@@ -529,6 +686,7 @@ async function imgStudioPollTaskStatus(task) {
                         currentTask.status = 'completed';
                         currentTask.image = imgDataUrl;
                         currentTask.controller = null;
+                        imgStudioPushStage(currentTask, `✅ 渲染完成，已存入历史画廊（总用时 ${imgStudioTaskElapsedText(currentTask)}）`);
 
                         imgStudioSaveToHistory(currentTask.type, currentTask.prompt, currentTask.model, currentTask.ratio, currentTask.quality, imgDataUrl);
                         imgStudioDisplaySpotlight(imgDataUrl, currentTask.prompt, currentTask.model, currentTask.ratio, currentTask.quality);
@@ -537,31 +695,36 @@ async function imgStudioPollTaskStatus(task) {
                         currentTask.status = 'failed';
                         currentTask.error = '返回结果中无有效图像数据';
                         currentTask.controller = null;
+                        imgStudioPushStage(currentTask, '❌ 失败：返回结果中无有效图像数据');
                         showToast('生图失败: 未在响应中找到图像数据', 'error');
                     }
                 } else {
                     currentTask.status = 'failed';
                     currentTask.error = '返回的数据格式不正确';
                     currentTask.controller = null;
+                    imgStudioPushStage(currentTask, '❌ 失败：返回的数据格式不正确');
                     showToast('生图失败: 数据格式不正确', 'error');
                 }
 
                 imgStudioSaveTaskList();
                 imgStudioRenderTaskListUI();
+                return; // 终态，长轮询循环结束
             } else if (data.status === 'failed' || data.status === 'not_found') {
-                clearInterval(intervalId);
                 currentTask.status = 'failed';
+                currentTask.finishedAt = Date.now();
                 currentTask.error = data.status === 'not_found' ? '后台任务未找到（可能服务已重启）' : (data.error || '未知后台错误');
                 currentTask.controller = null;
+                imgStudioPushStage(currentTask, `❌ 失败：${currentTask.error}`);
                 showToast(`生图失败: ${currentTask.error}`, 'error');
                 imgStudioSaveTaskList();
                 imgStudioRenderTaskListUI();
+                return; // 终态，长轮询循环结束
             }
         } catch (e) {
             console.error("Polling error:", e);
-            registerFailure();
+            if (await registerFailure()) return;
         }
-    }, 1500);
+    }
 }
 
 async function imgStudioRunTaskFetch(task) {
@@ -630,6 +793,7 @@ async function imgStudioRunTaskFetch(task) {
         if (response.ok && result.task_id) {
             task.backendTaskId = result.task_id;
             task.controller = null;
+            imgStudioPushStage(task, `后端已受理（任务 ${result.task_id.slice(-8)}），等待上游返回…`);
             imgStudioSaveTaskList();
             imgStudioPollTaskStatus(task);
         } else {
@@ -640,8 +804,10 @@ async function imgStudioRunTaskFetch(task) {
 
         console.error(e);
         task.status = 'failed';
+        task.finishedAt = Date.now();
         task.error = e.name === 'AbortError' ? '请求超时或被手动取消' : e.message;
         task.controller = null;
+        imgStudioPushStage(task, `❌ 提交失败：${task.error}`);
         showToast(`生图失败: ${task.error}`, 'error');
     } finally {
         imgStudioSaveTaskList();
@@ -653,6 +819,8 @@ function cancelImageStudioTask(taskId) {
     const task = imgStudioTaskList.find(t => t.id === taskId);
     if (task && task.status === 'pending') {
         task.status = 'cancelled';
+        task.finishedAt = Date.now();
+        imgStudioPushStage(task, '⏹ 已被用户取消');
         if (task.controller) {
             try { task.controller.abort(); } catch (e) { console.error(e); }
         }
@@ -694,7 +862,9 @@ function retryImageStudioTask(taskId) {
     const hasFiles = task.extraData && task.extraData.files && task.extraData.files.length > 0;
     if (task.type === 'i2i' && !hasFiles) {
         task.status = 'failed';
+        task.finishedAt = Date.now();
         task.error = '参考图已失效（页面刷新后不保留），请重新上传后再生成';
+        imgStudioPushStage(task, '❌ 参考图已失效（页面刷新后不保留），无法重试');
         imgStudioSaveTaskList();
         imgStudioRenderTaskListUI();
         showToast('参考图已失效，请重新上传后再生成', 'warning');
@@ -706,6 +876,14 @@ function retryImageStudioTask(taskId) {
     task.image = null;
     task.backendTaskId = null;
     task.timestamp = new Date().toLocaleTimeString();
+    // 动态流从头计时、从头记录；旧条目节点删掉由渲染层重建（清缩略图/旧阶段行）
+    task.createdAt = Date.now();
+    task.finishedAt = null;
+    task.stages = [];
+    task.lastStage = null;
+    imgStudioPushStage(task, '🔄 重试：任务重新提交');
+    const oldNode = document.getElementById(`feed-entry-${task.id}`);
+    if (oldNode) oldNode.remove();
     imgStudioSaveTaskList();
     imgStudioRenderTaskListUI();
     imgStudioRunTaskFetch(task);

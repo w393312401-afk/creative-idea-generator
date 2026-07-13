@@ -122,3 +122,84 @@
         max-width: 95%;
     }
 }
+
+/* ── 监修模式审阅面板（复用 lightbox 遮罩，主 app 专用） ── */
+.review-panel {
+    background: var(--panel-bg, rgba(255, 255, 255, 0.98));
+    color: var(--text-primary, #2E2A24);
+    border-radius: 14px;
+    padding: 1.4rem 1.6rem;
+    max-width: min(92vw, 460px);
+    max-height: 90vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
+    box-shadow: 0 12px 60px rgba(0, 0, 0, 0.5);
+}
+
+.review-panel .review-title {
+    margin: 0;
+    font-size: 1.05rem;
+}
+
+.review-panel #review-img {
+    max-width: 100%;
+    max-height: 52vh;
+    object-fit: contain;
+    border-radius: 8px;
+    align-self: center;
+}
+
+.review-panel .review-context {
+    margin: 0;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    opacity: 0.85;
+}
+
+.review-actions {
+    display: flex;
+    gap: 0.7rem;
+}
+
+.review-btn {
+    flex: 1;
+    padding: 0.6rem 0.8rem;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.95rem;
+    cursor: pointer;
+    transition: transform 0.15s ease, opacity 0.15s ease;
+}
+
+.review-btn:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+
+.review-btn:not(:disabled):hover {
+    transform: translateY(-1px);
+}
+
+.review-btn-adopt {
+    background: var(--sage, #7A8B6F);
+    color: #fff;
+}
+
+.review-btn-rerender {
+    background: var(--terracotta, #B07B52);
+    color: #fff;
+}
+
+.review-countdown {
+    margin: 0;
+    font-size: 0.8rem;
+    opacity: 0.6;
+    text-align: center;
+}
+
+html[data-theme="dark"] .review-panel {
+    background: var(--panel-bg, #26221C);
+    color: var(--text-primary, #EAE4D8);
+}

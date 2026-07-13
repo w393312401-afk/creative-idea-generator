@@ -40,18 +40,24 @@ function safeSetImageSrc(imgEl, url, bust = false) {
     imgEl.src = finalUrl;
 }
 
-function renderIdea(result) {
+// 标题双行（TikTok 英文整行 / 国内社媒中文整行）单独可刷新：
+// 封面任务后台补齐 social_title_* 字段后需要在不整页重渲的情况下更新这两行
+function renderIdeaTitles(idea) {
     const titleEl = document.getElementById('idea-title');
     const titleCnEl = document.getElementById('idea-title-cn');
-    const meta = getIdeaTikTokMeta(result);
+    const meta = getIdeaTikTokMeta(idea);
     if (titleEl) {
         titleEl.textContent = meta.english;
-        titleEl.title = result.title || meta.english;
+        titleEl.title = idea.title || meta.english;
     }
     if (titleCnEl) {
         titleCnEl.textContent = meta.chinese;
         titleCnEl.title = meta.chinese;
     }
+}
+
+function renderIdea(result) {
+    renderIdeaTitles(result);
     const tagThemeEl = document.getElementById('tag-theme');
     const tagCreativityEl = document.getElementById('tag-creativity');
     if (tagThemeEl) tagThemeEl.textContent = result.theme || '';
@@ -150,8 +156,8 @@ function renderFramesForIdea(idea) {
         return;
     }
 
-    // Get expected image slots
-    const slots = parsePromptBlock(idea ? idea.prompt_block : '');
+    // Get expected image slots：优先消费后端结构化 prompt_slots，正则解析仅兜底
+    const slots = resolvePromptSlots(idea);
     const imageSlots = slots.filter(s => s.type === 'image').sort((a, b) => a.index - b.index);
 
     if (imageSlots.length === 0) {
@@ -169,9 +175,11 @@ function renderFramesForIdea(idea) {
     meta.textContent = `已生成 ${generatedCount}/${totalFramesCount} 帧连续帧序列图${dirText}`;
 
     // Loop through the slots (or frames if slots is empty)
-    const itemsToRender = imageSlots.length > 0 
-        ? imageSlots.map((slot, idx) => {
-            const seq = idx + 1; // 1-based sequence
+    const itemsToRender = imageSlots.length > 0
+        ? imageSlots.map((slot) => {
+            // 用槽位号本身做 sequence（后端保证 1..N 连续），不再用"数组下标+1"——
+            // 一旦解析漏掉一个槽位，下标制会让后续所有帧整体错位配对（历史事故前提）。
+            const seq = slot.index;
             const frame = frames.find(f => f.sequence === seq || f.slot === slot.index);
             return {
                 sequence: seq,
@@ -199,13 +207,18 @@ function renderFramesForIdea(idea) {
             const isVlmFailed = frame.quality_gate === 'vlm_qa_failed';
             const isUnverified = frame.quality_gate === 'auto_approved_degraded';
             const isStale = frame.quality_gate === 'stale' || frame.stale;
+            // 宽松档软性瑕疵放行：quality_gate 仍是 auto_approved，告警留在 vlm_qa_reason
+            const isWarned = frame.quality_gate === 'auto_approved' && typeof frame.vlm_qa_reason === 'string' && frame.vlm_qa_reason.indexOf('WARN') === 0;
+            // 主动关门(qaGateLevel=off)与判定服务异常共用 degraded 记录，靠留痕文本区分文案
+            const isGateOff = isUnverified && (frame.vlm_qa_reason || '').indexOf('qaGateLevel=off') !== -1;
             card.className = 'frame-card' + (isDegraded ? ' degraded-card' : '') + (isVlmFailed ? ' vlm-failed-card' : '') + (isUnverified ? ' degraded-card' : '') + (isStale ? ' stale-card' : '');
             card.style.cursor = 'pointer';
 
             let hoverTitle = `打开第 ${seq} 帧`;
             if (isDegraded) hoverTitle += ' (降级为文生图)';
             if (isVlmFailed) hoverTitle += ` (VLM 检查未通过: ${frame.vlm_qa_reason || '跳变或无变化'})`;
-            if (isUnverified) hoverTitle += ' (VLM 判定服务异常，此帧未经核验被放行)';
+            if (isUnverified) hoverTitle += isGateOff ? ' (质检门已关闭，此帧未质检放行)' : ' (VLM 判定服务异常，此帧未经核验被放行)';
+            if (isWarned) hoverTitle += ` (宽松档放行: ${frame.vlm_qa_reason})`;
             if (isStale) hoverTitle += ' (过期：父帧已被重新生成，此帧与父帧血统不一致)';
             card.title = hoverTitle;
 
@@ -213,8 +226,9 @@ function renderFramesForIdea(idea) {
                 <img src="" alt="Frame ${seq}" loading="lazy">
                 ${isDegraded ? '<div class="degraded-badge">降级</div>' : ''}
                 ${isVlmFailed ? '<div class="vlm-failed-badge" title="' + (frame.vlm_qa_reason || '').replace(/"/g, '&quot;') + '">VLM 失败</div>' : ''}
-                ${isUnverified ? '<div class="degraded-badge" title="' + (frame.vlm_qa_reason || 'VLM 判定服务异常，未经核验').replace(/"/g, '&quot;') + '">未核验</div>' : ''}
-                ${isStale ? `<div class="stale-badge" ${isDegraded || isVlmFailed || isUnverified ? 'style="left: 45px;"' : ''} title="此帧派生自已被替换的旧帧，建议重新生成">Stale</div>` : ''}
+                ${isUnverified ? '<div class="degraded-badge" title="' + (frame.vlm_qa_reason || (isGateOff ? '质检门已关闭，未质检放行' : 'VLM 判定服务异常，未经核验')).replace(/"/g, '&quot;') + '">' + (isGateOff ? '未质检' : '未核验') + '</div>' : ''}
+                ${isWarned ? '<div class="degraded-badge" title="' + frame.vlm_qa_reason.replace(/"/g, '&quot;') + '">留痕</div>' : ''}
+                ${isStale ? `<div class="stale-badge" ${isDegraded || isVlmFailed || isUnverified || isWarned ? 'style="left: 45px;"' : ''} title="此帧派生自已被替换的旧帧，建议重新生成">Stale</div>` : ''}
                 <div class="frame-card-actions" style="position: absolute; top: 5px; right: 5px; display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s;">
                     <button class="action-btn text-btn mini-btn retry-frame-btn" data-seq="${seq}" style="background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.3); padding: 2px 6px; font-size: 10px;">重试</button>
                 </div>

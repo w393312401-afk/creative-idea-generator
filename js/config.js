@@ -156,37 +156,145 @@ function applyPreset(presetName) {
     showToast(`已应用预设：${PRESET_LABELS[presetName] || presetName}`, 'success');
 }
 
-function updateImageModelOptions(preserveValue = true) {
-    const modelSelect = document.getElementById('settings-model');
-    const imageModelSelect = document.getElementById('settings-image-model');
-    if (!modelSelect || !imageModelSelect) return;
+// updateImageModelOptions 已删除（2026-07-12）：配置中心的 LLM/生图模型下拉整体移除，
+// 模型选择完全由激发页脚 #ideation-llm-model 与帧序列卡片 #frames-image-model 承担。
 
-    const mainModel = modelSelect.value;
-    const previousValue = imageModelSelect.value;
-    
-    imageModelSelect.innerHTML = '';
+/* ── 激发维度内嵌 LLM 模型选择器 ─────────────────────────────────────
+   LLM 主模型（激发/合成/审核/质检判定共用 config.model）的唯一 UI 入口：
+   在激发按钮上方直接切换，改动即写 localStorage，下次激发/合成生效。
+   （配置中心的主模型下拉已于 2026-07-12 移除。）
+   2026-07-13 改为分组芯片单选器：GPT/Gemini/Claude 每个供应商一行，模型平铺成
+   胶囊按钮，全局有且只有一个 .selected（此前的三个并排 <select> 方案光看选中项
+   容易误以为三个都在生效——用户当日反馈"用哪个模型没有唯一性"）。点任意芯片即
+   切换 config.model；label 旁的徽标（#ideation-llm-model-active-hint）另行点名
+   当前生效模型作双保险。整个分组区每次 sync 全量重建，事件直接绑在新节点上。 */
+const LLM_MODEL_PICKER_FAMILIES = [
+    { key: 'gpt', label: 'GPT' },
+    { key: 'gemini', label: 'Gemini' },
+    { key: 'claude', label: 'Claude' },
+];
 
-    const models = IMAGE_MODELS_BY_MAIN_MODEL[mainModel] || [
-        { value: 'nano-banana-2', label: '🍌 Nano Banana 2' }
-    ];
+function syncIdeationLlmPicker() {
+    const wrap = document.getElementById('ideation-llm-groups');
+    if (!wrap) return;
+    const current = config.model || 'gemini-3-flash-agent';
+    const isKnown = LLM_MODEL_PICKER_FAMILIES.some(
+        fam => LLM_MODEL_GROUPS[fam.key].some(m => m.value === current)
+    );
 
-    models.forEach(m => {
+    wrap.innerHTML = '';
+    LLM_MODEL_PICKER_FAMILIES.forEach(fam => {
+        const models = LLM_MODEL_GROUPS[fam.key].slice();
+        // 当前生效模型不属于任何一组（比如手动改过 localStorage 的自定义模型名）：
+        // 追加展示在 GPT 组末尾，避免用户看不到当前实际生效的值。
+        if (!isKnown && fam.key === 'gpt') {
+            models.push({ value: current, label: `${current}（自定义）` });
+        }
+
+        const group = document.createElement('div');
+        group.className = 'model-family-group'
+            + (models.some(m => m.value === current) ? ' active' : '');
+        group.dataset.family = fam.key;
+
+        const tag = document.createElement('span');
+        tag.className = 'model-family-tag';
+        tag.textContent = fam.label;
+        group.appendChild(tag);
+
+        const row = document.createElement('div');
+        row.className = 'model-chip-row';
+        models.forEach(m => {
+            const isSelected = m.value === current;
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = 'model-chip' + (isSelected ? ' selected' : '');
+            chip.title = isSelected
+                ? `${m.value}（当前生效，激发/提示词合成/审核/质检判定共用）`
+                : `点击切换为 ${m.value}`;
+
+            const name = document.createElement('span');
+            name.className = 'model-chip-name';
+            name.textContent = m.label;
+            chip.appendChild(name);
+            if (m.recommended) {
+                const badge = document.createElement('span');
+                badge.className = 'model-chip-badge';
+                badge.textContent = '推荐';
+                chip.appendChild(badge);
+            }
+
+            chip.addEventListener('click', () => {
+                if (config.model === m.value) return;
+                config.model = m.value;
+                localStorage.setItem('spark_config', JSON.stringify(config));
+                showToast(`LLM 模型已切换：${m.value}（下次激发/合成生效）`, 'success');
+                syncIdeationLlmPicker();
+                // 顶栏「本地 xxx 在线」徽章即时复测：不同供应商路由到不同网关
+                // （gpt→codex / 其余→8046），不复测的话徽章会一直挂着旧模型名
+                // 和旧网关的在线状态。ping 只查网关可达（毫秒级、零 token），
+                // 不发真实补全验模型——8046 间歇抽风，单点真调用探测误报率高，
+                // 激发链路自有重试兜底。
+                checkApiStatus();
+            });
+            row.appendChild(chip);
+        });
+        group.appendChild(row);
+        wrap.appendChild(group);
+    });
+
+    const hint = document.getElementById('ideation-llm-model-active-hint');
+    if (hint) hint.textContent = `使用中 · ${current}`;
+}
+
+/* ── 帧序列模块内嵌生图模型选择器 ────────────────────────────────────
+   生图模型的唯一 UI 入口（配置中心的生图模型下拉已于 2026-07-12 移除）：
+   在「连续帧序列生成」卡片里直接切换。选项集随帧后端切换
+   （api → IMAGE_MODELS 绑 config.imageModel；google_fx → FX_IMAGE_MODELS
+   绑 config.googleFxImageModel，后者仍与配置中心的 FX 生图下拉同步），
+   改动即写 localStorage，下次生成/单帧重试生效。 */
+function syncFramesImageModelPicker() {
+    const sel = document.getElementById('frames-image-model');
+    if (!sel) return;
+
+    const isFx = (config.imageBackend || 'api') === 'google_fx';
+    const options = isFx ? FX_IMAGE_MODELS : IMAGE_MODELS;
+    const current = isFx
+        ? (config.googleFxImageModel || 'Nano Banana 2')
+        : (config.imageModel || 'nano-banana-2');
+
+    sel.innerHTML = '';
+    options.forEach(m => {
         const opt = document.createElement('option');
         opt.value = m.value;
         opt.textContent = m.label;
-        imageModelSelect.appendChild(opt);
+        sel.appendChild(opt);
     });
-
-    if (preserveValue && previousValue) {
-        const optionExists = models.some(m => m.value === previousValue);
-        if (optionExists) {
-            imageModelSelect.value = previousValue;
-            return;
-        }
+    if (!options.some(m => m.value === current)) {
+        const opt = document.createElement('option');
+        opt.value = current;
+        opt.textContent = `${current} (自定义)`;
+        sel.appendChild(opt);
     }
+    sel.value = current;
+    sel.title = isFx
+        ? 'Google FX（AdsPower 浏览器）生图模型；改动即存，下次生成/单帧重试生效'
+        : 'API 后端生图模型（封面图共用）；改动即存，下次生成/单帧重试生效';
 
-    if (models.length > 0) {
-        imageModelSelect.value = models[0].value;
+    if (!sel.dataset.bound) {
+        sel.dataset.bound = '1';
+        sel.addEventListener('change', () => {
+            const fx = (config.imageBackend || 'api') === 'google_fx';
+            if (fx) {
+                config.googleFxImageModel = sel.value;
+                const fxSel = document.getElementById('settings-fx-image-model');
+                if (fxSel) fxSel.value = sel.value;
+            } else {
+                config.imageModel = sel.value;
+            }
+            localStorage.setItem('spark_config', JSON.stringify(config));
+            updateCoverModelDisplay();
+            showToast(`帧序列生图模型已切换：${sel.value}（下次生成/单帧重试生效）`, 'success');
+        });
     }
 }
 
@@ -220,48 +328,11 @@ function loadConfig() {
     }
     
     // Fill settings inputs
-    document.getElementById('settings-base-url').value = config.baseUrl;
-    document.getElementById('settings-api-key').value = config.apiKey;
-    
-    const modelSelect = document.getElementById('settings-model');
-    // Ensure all options are checked, and append custom option if config.model is not in the list
-    let optionExists = false;
-    for (let i = 0; i < modelSelect.options.length; i++) {
-        if (modelSelect.options[i].value === config.model) {
-            optionExists = true;
-            break;
-        }
-    }
-    if (!optionExists) {
-        const opt = document.createElement('option');
-        opt.value = config.model;
-        opt.textContent = `${config.model} (自定义)`;
-        modelSelect.appendChild(opt);
-    }
-    modelSelect.value = config.model;
-
-    // Dynamically update image model dropdown choices based on loaded main model
-    updateImageModelOptions(false);
-
-    // Load image model option
-    const imageModelSelect = document.getElementById('settings-image-model');
-    if (imageModelSelect) {
-        let imgOptionExists = false;
-        const currentImgModel = config.imageModel || 'nano-banana-2';
-        for (let i = 0; i < imageModelSelect.options.length; i++) {
-            if (imageModelSelect.options[i].value === currentImgModel) {
-                imgOptionExists = true;
-                break;
-            }
-        }
-        if (!imgOptionExists) {
-            const opt = document.createElement('option');
-            opt.value = currentImgModel;
-            opt.textContent = `${currentImgModel} (自定义)`;
-            imageModelSelect.appendChild(opt);
-        }
-        imageModelSelect.value = currentImgModel;
-    }
+    // （Base URL / API Key 输入框已移除：托管模式下 effective_config 不透传
+    //   浏览器端的这两项，密钥与网关地址由 server_config.json 统一管理；
+    //   config.baseUrl / config.apiKey 仍保留在 localStorage 供非托管兜底。
+    //   LLM 模型 / 生图模型下拉也已移除：改由激发页脚 #ideation-llm-model 与
+    //   帧序列卡片 #frames-image-model 内嵌选择器管理（见文件尾部 sync 函数）。）
 
     // Load frame sequence backend + Google FX image model options
     const imageBackendSelect = document.getElementById('settings-image-backend');
@@ -281,6 +352,14 @@ function loadConfig() {
     if (fxIpRotateRequestsInput) {
         fxIpRotateRequestsInput.value = config.googleFxIpRotateRequests !== undefined ? config.googleFxIpRotateRequests : 5;
     }
+    const qaGateSelect = document.getElementById('settings-qa-gate');
+    if (qaGateSelect) {
+        qaGateSelect.value = config.qaGateLevel || 'standard';
+    }
+    const supervisedSelect = document.getElementById('settings-supervised-mode');
+    if (supervisedSelect) {
+        supervisedSelect.value = config.supervisedMode ? 'on' : 'off';
+    }
     updateFxImageModelVisibility();
 
     // Load aspect ratio option
@@ -298,6 +377,8 @@ function loadConfig() {
     // 端口已永久固定（应用 8085 / 代理 8046，gpt-5.5 由服务端 resolve_gateway 固定路由），
     // 原「GPT 代理端口」选择器已移除，防止端口漂移。
     updateCoverModelDisplay();
+    syncFramesImageModelPicker();
+    syncIdeationLlmPicker();
 }
 
 function updateFxImageModelVisibility() {
@@ -312,10 +393,8 @@ function updateFxImageModelVisibility() {
 }
 
 function saveConfig() {
-    config.baseUrl = document.getElementById('settings-base-url').value.trim();
-    config.apiKey = document.getElementById('settings-api-key').value.trim();
-    config.model = document.getElementById('settings-model').value.trim();
-    config.imageModel = document.getElementById('settings-image-model').value.trim();
+    // config.model / config.imageModel 不再从本弹窗读取：由激发页脚与帧序列卡片的
+    // 内嵌选择器直接维护（改动即存），这里只负责其余生成参数并整体持久化
     const imageBackendSelect = document.getElementById('settings-image-backend');
     if (imageBackendSelect) {
         config.imageBackend = imageBackendSelect.value;
@@ -333,22 +412,31 @@ function saveConfig() {
         const val = parseInt(fxIpRotateRequestsInput.value.trim(), 10);
         config.googleFxIpRotateRequests = isNaN(val) ? 5 : val;
     }
+    const qaGateSelect = document.getElementById('settings-qa-gate');
+    if (qaGateSelect) {
+        config.qaGateLevel = qaGateSelect.value;
+    }
+    const supervisedSelect = document.getElementById('settings-supervised-mode');
+    if (supervisedSelect) {
+        config.supervisedMode = supervisedSelect.value === 'on';
+    }
     config.imageAspectRatio = document.getElementById('settings-image-ratio').value.trim();
     config.imageQuality = document.getElementById('settings-image-quality').value.trim();
 
     localStorage.setItem('spark_config', JSON.stringify(config));
     updateCoverModelDisplay();
+    syncFramesImageModelPicker();
+    syncIdeationLlmPicker();
     showToast("API 配置保存成功！", "success");
     checkApiStatus();
 }
 
 function resetConfig() {
-    document.getElementById('settings-base-url').value = DEFAULT_CONFIG.baseUrl;
-    document.getElementById('settings-api-key').value = DEFAULT_CONFIG.apiKey;
-    document.getElementById('settings-model').value = DEFAULT_CONFIG.model;
-    // Update the image model options list back to default options first
-    updateImageModelOptions(false);
-    document.getElementById('settings-image-model').value = DEFAULT_CONFIG.imageModel;
+    // 模型项已无配置中心表单：直接重置 config 对象，尾部的 sync 会刷新两个内嵌选择器
+    //（与其余表单项一致，点「保存配置」后才整体持久化到 localStorage）
+    config.model = DEFAULT_CONFIG.model;
+    config.imageModel = DEFAULT_CONFIG.imageModel;
+    config.googleFxImageModel = DEFAULT_CONFIG.googleFxImageModel;
     const imageBackendSelect = document.getElementById('settings-image-backend');
     if (imageBackendSelect) {
         imageBackendSelect.value = DEFAULT_CONFIG.imageBackend;
@@ -365,9 +453,19 @@ function resetConfig() {
     if (fxIpRotateRequestsInput) {
         fxIpRotateRequestsInput.value = DEFAULT_CONFIG.googleFxIpRotateRequests;
     }
+    const qaGateSelect = document.getElementById('settings-qa-gate');
+    if (qaGateSelect) {
+        qaGateSelect.value = DEFAULT_CONFIG.qaGateLevel;
+    }
+    const supervisedSelect = document.getElementById('settings-supervised-mode');
+    if (supervisedSelect) {
+        supervisedSelect.value = DEFAULT_CONFIG.supervisedMode ? 'on' : 'off';
+    }
     document.getElementById('settings-image-ratio').value = DEFAULT_CONFIG.imageAspectRatio;
     document.getElementById('settings-image-quality').value = DEFAULT_CONFIG.imageQuality;
     updateFxImageModelVisibility();
+    syncFramesImageModelPicker();
+    syncIdeationLlmPicker();
 }
 
 function updateCoverModelDisplay() {
@@ -540,7 +638,7 @@ function randomizeDimensions() {
     setRandomVal('slider-budget', 1, 3);
     setRandomVal('slider-ratio', 0, 100);
     setRandomVal('slider-creativity', 1, 3);
-    setRandomVal('slider-beats', 5, 25);
+    setRandomVal('slider-beats', 5, 15);
     
     saveSelectionState();
     showToast("🎲 随机激发配比已装配！", "success");

@@ -53,6 +53,33 @@ function parsePromptBlock(blockText) {
 // renderParsedPrompts 已移除：提示词页现在只展示原始 Markdown 块（#idea-prompt-block），
 // 不再把 prompt_block 解析成槽位卡片。parsePromptBlock 仍保留，供帧序列渲染推算图片槽位数。
 
+// 结构化槽位契约（2026-07-12）：后端 result.prompt_slots 是唯一权威（由后端解析器产出，
+// 语义与帧/视频生成完全一致）；仅当字段缺失（旧任务/旧库存条目）时才退回上面的逐行正则
+// 解析 prompt_block 兜底。前后端双实现解析的行为差异（同行冒号正文被前端静默丢弃、帧配对
+// 按数组下标错位）是两次生产事故的共同前提，此处收口。返回形状与 parsePromptBlock 一致。
+function resolvePromptSlots(source) {
+    const ps = source && source.prompt_slots;
+    if (ps && Array.isArray(ps.images) && Array.isArray(ps.videos)
+            && (ps.images.length || ps.videos.length)) {
+        const norm = (arr, type) => arr
+            .filter(it => it && Number.isFinite(Number(it.index)))
+            .map(it => {
+                const index = Number(it.index);
+                const meta = it.meta || '';
+                return {
+                    type: type,
+                    index: index,
+                    meta: meta,
+                    label: (type === 'image' ? `图片提示词 ${index}` : `视频提示词 ${index}`) + (meta ? ` [${meta}]` : ''),
+                    id: type === 'image' ? `slot-image-${index}` : `slot-video-${index}`,
+                    body: it.body || ''
+                };
+            });
+        return norm(ps.images, 'image').concat(norm(ps.videos, 'video'));
+    }
+    return parsePromptBlock(source ? source.prompt_block : '');
+}
+
 function updateTasksBadge(tasksList) {
     const badge = document.getElementById('active-task-count');
     if (!badge) return;
@@ -197,6 +224,7 @@ function renderIdeationCards(ideas) {
             </div>
             <div class="ideation-card-actions">
                 <button type="button" class="ideation-card-btn select-action-btn">载入维度</button>
+                <button type="button" class="ideation-card-btn copy-action-btn">复制选题</button>
                 <button type="button" class="ideation-card-btn primary compose-action-btn">一键合成</button>
             </div>
         `;
@@ -231,7 +259,19 @@ function renderIdeationCards(ideas) {
             e.stopPropagation();
             composeIdeationCard(idx);
         });
-        
+
+        // Clicking "复制选题" copies the ready-to-paste Tier-1 input string so it can be
+        // pasted directly into a real restoration-prompt-composer skill chat session.
+        const copyBtn = card.querySelector('.copy-action-btn');
+        copyBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            copyText(idea.input_str).then(() => {
+                showToast(`已复制选题："${idea.title}"，可直接粘贴到 restoration-prompt-composer 技能会话中使用`, 'success');
+            }).catch(() => {
+                showToast('复制失败', 'error');
+            });
+        });
+
         container.appendChild(card);
     });
 }
@@ -303,9 +343,10 @@ function composeIdeationCard(index) {
         creativity: "脑洞大开",
         beats_count: 15,
         cover_url: idea.cover_url || null,
-        english_title: idea.english_title || null
+        english_title: idea.english_title || null,
+        topic_dna: idea.dna || null
     };
-    
+
     showToast(`🚀 开始一键合成灵感: ${idea.title}...`, "success");
     
     generateIdea({

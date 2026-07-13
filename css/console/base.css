@@ -80,6 +80,7 @@ body {
   color: var(--text-main);
   font-family: var(--font-sans);
   height: 100vh;
+  height: 100dvh; /* mobile URL-bar-aware; older browsers keep 100vh */
   overflow: hidden;
   display: flex;
   /* 使用主题化渐变令牌（:root 亮色 / html[data-theme=dark] 暗色）——

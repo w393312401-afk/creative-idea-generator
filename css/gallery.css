@@ -1,0 +1,486 @@
+/* ==========================================================================
+   Gallery (画廊) — styles scoped under #panel-gallery only.
+   与 image_studio.css 同一套约定：所有选择器都锚在面板 id 下，
+   避免通用类名与主应用其他面板互相污染。
+   ========================================================================== */
+
+#panel-gallery .gallery-shell {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-panel);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--border-color);
+    border-radius: 20px;
+    overflow: hidden;
+}
+
+#panel-gallery .panel-header {
+    padding: 1.5rem 1.5rem 0.75rem 1.5rem;
+    flex-shrink: 0;
+}
+
+#panel-gallery .panel-header h2 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    letter-spacing: -0.3px;
+    margin-bottom: 0.25rem;
+    color: var(--text-main);
+}
+
+#panel-gallery .panel-header p {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+/* ── 工具栏：筛选 chips + 统计 + 管理按钮 ─────────────────────────── */
+#panel-gallery .gallery-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 10px 1.5rem;
+    border-bottom: 1px solid var(--border-color);
+    background: rgba(var(--ink-rgb), 0.03);
+    flex-shrink: 0;
+}
+
+#panel-gallery .gallery-filters {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+#panel-gallery .gallery-filter-chip {
+    background: transparent;
+    border: 1px solid var(--border-color);
+    border-radius: 20px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 5px 14px;
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+#panel-gallery .gallery-filter-chip:hover {
+    color: var(--neon-cyan);
+    border-color: rgba(176, 123, 82, 0.35);
+}
+
+#panel-gallery .gallery-filter-chip.active {
+    background: rgba(176, 123, 82, 0.1);
+    border-color: rgba(176, 123, 82, 0.4);
+    color: var(--neon-cyan);
+}
+
+#panel-gallery .gallery-filter-chip.warn {
+    border-style: dashed;
+}
+
+#panel-gallery .gallery-filter-chip.warn.active {
+    background: rgba(239, 68, 68, 0.08);
+    border-color: rgba(239, 68, 68, 0.4);
+    color: #f87171;
+}
+
+/* ── 搜索与排序 ──────────────────────────────────────────────────── */
+#panel-gallery .gallery-search-sort {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 200px;
+    max-width: 380px;
+}
+
+#panel-gallery .gallery-search-input {
+    flex: 1;
+    min-width: 120px;
+    background: rgba(var(--ink-rgb), 0.04);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-main);
+    font-size: 12px;
+    padding: 6px 12px;
+    outline: none;
+    transition: var(--transition-fast);
+}
+
+#panel-gallery .gallery-search-input:focus {
+    border-color: rgba(176, 123, 82, 0.45);
+    box-shadow: 0 0 0 2px rgba(176, 123, 82, 0.12);
+}
+
+#panel-gallery .gallery-search-input::placeholder {
+    color: var(--text-muted);
+}
+
+#panel-gallery .gallery-sort-select {
+    background: rgba(var(--ink-rgb), 0.04);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 6px 8px;
+    cursor: pointer;
+    outline: none;
+    transition: var(--transition-fast);
+}
+
+#panel-gallery .gallery-sort-select:hover,
+#panel-gallery .gallery-sort-select:focus {
+    border-color: rgba(176, 123, 82, 0.35);
+    color: var(--neon-cyan);
+}
+
+#panel-gallery .gallery-toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+#panel-gallery .gallery-stats {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-right: 4px;
+    white-space: nowrap;
+}
+
+#panel-gallery .gallery-tool-btn {
+    background: rgba(var(--ink-rgb), 0.04);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 6px 12px;
+    cursor: pointer;
+    transition: var(--transition-fast);
+    white-space: nowrap;
+}
+
+#panel-gallery .gallery-tool-btn:hover:not(:disabled) {
+    color: var(--neon-cyan);
+    border-color: rgba(176, 123, 82, 0.35);
+}
+
+#panel-gallery .gallery-tool-btn.danger:hover:not(:disabled) {
+    color: #f87171;
+    border-color: rgba(239, 68, 68, 0.4);
+    background: rgba(239, 68, 68, 0.06);
+}
+
+#panel-gallery .gallery-tool-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+#panel-gallery .gallery-tool-btn.small {
+    padding: 4px 10px;
+    font-size: 11px;
+}
+
+/* ── 滚动区与分组 ─────────────────────────────────────────────────── */
+#panel-gallery .gallery-scroll {
+    gap: 22px;
+}
+
+#panel-gallery .gallery-status {
+    text-align: center;
+    padding: 40px 16px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    background: rgba(var(--ink-rgb), 0.03);
+    border: 1px dashed rgba(var(--ink-rgb), 0.08);
+    border-radius: 10px;
+}
+
+#panel-gallery .gallery-status.error {
+    color: #f87171;
+    border-color: rgba(239, 68, 68, 0.25);
+}
+
+#panel-gallery .gallery-group-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+}
+
+#panel-gallery .gallery-group-head h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-main);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+    user-select: none;
+}
+
+#panel-gallery .g-collapse-caret {
+    font-size: 11px;
+    color: var(--text-muted);
+    width: 12px;
+    flex-shrink: 0;
+}
+
+#panel-gallery .gallery-group.collapsed .gallery-group-head {
+    margin-bottom: 0;
+    opacity: 0.75;
+}
+
+#panel-gallery .g-orphan-badge {
+    font-size: 10px;
+    font-weight: 700;
+    color: #f87171;
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: 6px;
+    padding: 1px 7px;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+#panel-gallery .gallery-expand-btn {
+    display: block;
+    width: 100%;
+    margin-top: 8px;
+    background: rgba(var(--ink-rgb), 0.03);
+    border: 1px dashed var(--border-color);
+    border-radius: 8px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 7px;
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+#panel-gallery .gallery-expand-btn:hover {
+    color: var(--neon-cyan);
+    border-color: rgba(176, 123, 82, 0.35);
+}
+
+#panel-gallery .g-group-icon {
+    font-size: 15px;
+}
+
+#panel-gallery .g-count {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+#panel-gallery .gallery-group-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+/* ── 缩略图网格与卡片 ─────────────────────────────────────────────── */
+#panel-gallery .gallery-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 12px;
+}
+
+#panel-gallery .gallery-card {
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    overflow: hidden;
+    background: rgba(var(--panel-rgb), 0.4);
+    transition: var(--transition-fast);
+}
+
+#panel-gallery .gallery-card:hover {
+    border-color: rgba(176, 123, 82, 0.4);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+}
+
+#panel-gallery .gallery-card.selected {
+    border-color: var(--neon-cyan);
+    box-shadow: 0 0 0 2px rgba(176, 123, 82, 0.25);
+}
+
+#panel-gallery .gallery-thumb {
+    position: relative;
+    aspect-ratio: 4 / 3;
+    background: rgba(var(--ink-rgb), 0.06);
+    cursor: zoom-in;
+}
+
+#panel-gallery .gallery-thumb img,
+#panel-gallery .gallery-thumb video {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+#panel-gallery .gallery-play-badge {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.5);
+    color: #fff;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+}
+
+#panel-gallery .gallery-kind-badge {
+    position: absolute;
+    right: 6px;
+    top: 6px;
+    font-size: 10px;
+    font-weight: 600;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.55);
+    border-radius: 6px;
+    padding: 2px 7px;
+    pointer-events: none;
+}
+
+#panel-gallery .gallery-inuse-badge {
+    position: absolute;
+    right: 6px;
+    top: 28px;
+    font-size: 10px;
+    font-weight: 600;
+    color: #fff;
+    background: rgba(176, 123, 82, 0.85);
+    border-radius: 6px;
+    padding: 2px 7px;
+    pointer-events: none;
+}
+
+/* 勾选框：默认淡出，悬停或已选中时显形 */
+#panel-gallery .gallery-check {
+    position: absolute;
+    left: 6px;
+    top: 6px;
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.45);
+    border-radius: 6px;
+    cursor: pointer;
+    opacity: 0;
+    transition: var(--transition-fast);
+}
+
+#panel-gallery .gallery-card:hover .gallery-check,
+#panel-gallery .gallery-card.selected .gallery-check {
+    opacity: 1;
+}
+
+#panel-gallery .gallery-check input {
+    accent-color: var(--neon-cyan);
+    cursor: pointer;
+}
+
+/* 悬停操作条 */
+#panel-gallery .gallery-card-actions {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    justify-content: flex-end;
+    gap: 4px;
+    padding: 5px 6px;
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.55));
+    opacity: 0;
+    transition: var(--transition-fast);
+}
+
+#panel-gallery .gallery-card:hover .gallery-card-actions {
+    opacity: 1;
+}
+
+#panel-gallery .g-act {
+    background: rgba(0, 0, 0, 0.45);
+    border: none;
+    border-radius: 6px;
+    color: #fff;
+    font-size: 12px;
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+#panel-gallery .g-act:hover {
+    background: rgba(176, 123, 82, 0.75);
+}
+
+#panel-gallery .g-act.g-act-delete:hover {
+    background: rgba(239, 68, 68, 0.8);
+}
+
+#panel-gallery .gallery-card-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 7px 9px 8px 9px;
+}
+
+#panel-gallery .g-name {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-main);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#panel-gallery .g-sub {
+    font-size: 10px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* ── 移动端微调 ───────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+    #panel-gallery .gallery-toolbar {
+        padding: 8px 12px;
+    }
+
+    #panel-gallery .gallery-grid {
+        grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+        gap: 8px;
+    }
+
+    /* 触屏没有 hover：操作条与勾选框常显 */
+    #panel-gallery .gallery-card-actions,
+    #panel-gallery .gallery-check {
+        opacity: 1;
+    }
+}

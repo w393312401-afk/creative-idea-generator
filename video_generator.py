@@ -13,7 +13,7 @@ from server_common import (
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
     ACTIVE_TASKS_LOCK, ACTIVE_TASKS, get_or_create_task,
     notify_listeners, save_tasks_to_disk, ensure_adspower_on_path,
-    read_manifest, write_manifest
+    read_manifest, write_manifest, strict_gates_enabled, qa_gate_level
 )
 
 
@@ -58,15 +58,17 @@ def _extract_video_frame(video_path, out_png, position):
         return False
 
 
-def verify_video_anchors(video_path, start_frame_path, end_frame_path):
+def verify_video_anchors(video_path, start_frame_path, end_frame_path, strict=False):
     """校验视频首帧/尾帧是否与锚点图一致。
 
-    返回 (ok: bool, reason: str)。校验环境异常（ffmpeg/PIL 不可用等）时返回
-    (True, 'skipped:...')，不拦截正常流程——该校验只用来挡住明确的串片。
+    返回 (ok: bool, reason: str)。校验环境异常（ffmpeg/PIL 不可用等）时默认返回
+    (True, 'skipped:...')，不拦截正常流程——该校验只用来挡住明确的串片；
+    strict=True（strictGates 开启）时环境异常按校验失败处理，防止环境退化
+    悄悄关掉串片检测。
     """
     import tempfile
-    import numpy as np
     try:
+        import numpy as np
         with tempfile.TemporaryDirectory() as td:
             checks = []
             for pos, anchor in (('first', start_frame_path), ('last', end_frame_path)):
@@ -74,10 +76,14 @@ def verify_video_anchors(video_path, start_frame_path, end_frame_path):
                     continue
                 png = os.path.join(td, f'{pos}.png')
                 if not _extract_video_frame(video_path, png, pos):
+                    if strict:
+                        return False, f'strict:extract_{pos}_failed（严格模式下环境异常按失败处理）'
                     return True, f'skipped:extract_{pos}_failed'
                 mad = float(np.abs(_load_gray_thumb(png) - _load_gray_thumb(anchor)).mean())
                 checks.append((pos, mad))
             if not checks:
+                if strict:
+                    return False, 'strict:no_anchor（严格模式下锚点图缺失按失败处理）'
                 return True, 'skipped:no_anchor'
             bad = [(pos, mad) for pos, mad in checks if mad > _ANCHOR_MAD_THRESHOLD]
             detail = ", ".join(f"{pos}={mad:.1f}" for pos, mad in checks)
@@ -85,7 +91,61 @@ def verify_video_anchors(video_path, start_frame_path, end_frame_path):
                 return False, detail
             return True, detail
     except Exception as e:
+        if strict:
+            return False, f'strict:{type(e).__name__}（严格模式下环境异常按失败处理）'
         return True, f'skipped:{type(e).__name__}'
+
+
+def _extract_video_mid_frames(video_path, out_dir, fractions=(0.25, 0.5, 0.75)):
+    """从视频中段按时长比例抽帧（默认 25%/50%/75% 三张），返回成功抽出的帧路径列表。
+    时长探测失败返回 []（调用方按环境异常处理）；个别时间点抽帧失败则跳过该张。"""
+    params = _ffprobe_video_params(video_path)
+    duration = (params or {}).get('duration') or 0.0
+    if duration <= 0:
+        return []
+    paths = []
+    for i, frac in enumerate(fractions):
+        t = max(0.0, min(duration * frac, duration - 0.05))
+        out_png = os.path.join(out_dir, f'mid_{i}.png')
+        cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.3f}", "-i", video_path,
+               "-frames:v", "1", out_png]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, encoding='utf-8', errors='replace', timeout=60)
+            if res.returncode == 0 and os.path.exists(out_png) and os.path.getsize(out_png) > 0:
+                paths.append(out_png)
+        except Exception:
+            continue
+    return paths
+
+
+def check_video_process(config, video_path, start_frame, end_frame, prompt):
+    """段内过程门：verify_video_anchors 只钉住首尾两端，段内 8 秒是盲区（空心视频/
+    幽灵内容的来源）。这里抽出中段帧交给 VLM（prompt_pipeline.run_video_process_check）
+    判定"两锚点之间是否真的发生了描述的施工过程"，并把判定映射为动作：
+
+    返回 (action, reason)，action ∈：
+      'accept' —— 通过 / off 档跳过 / 环境·判定服务异常 fail-open 放行（reason 留痕）
+      'warn'   —— lenient 档下检出硬伤：不拒收（重试要再烧一整段视频额度，宽松档
+                   保留成片交用户决策），发 video_warning + manifest 留痕
+      'reject' —— standard 档检出硬伤，或 strictGates 开启时环境/判定异常：删片重试
+    """
+    level = qa_gate_level(config)
+    if level == 'off':
+        return 'accept', 'Skipped (qaGateLevel=off: 质检门已关闭)'
+    with tempfile.TemporaryDirectory() as td:
+        mids = _extract_video_mid_frames(video_path, td)
+        if not mids:
+            if strict_gates_enabled(config):
+                return 'reject', 'strict:mid_extract_failed（严格模式下环境异常按失败处理）'
+            return 'accept', 'skipped:mid_extract_failed'
+        from prompt_pipeline import run_video_process_check
+        passed, reason = run_video_process_check(config, start_frame, mids, end_frame, prompt)
+    if passed:
+        return 'accept', reason
+    if level == 'lenient':
+        return 'warn', reason
+    return 'reject', reason
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -137,11 +197,27 @@ def load_slot_frames(manifest_data, frames_dir, image_count):
     return slot_to_path, slot_to_quality
 
 
-def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, target_slots=None):
+def load_stale_slots(manifest_data):
+    """manifest.frames 里被标为 stale_lineage 的槽位集合：部分重生后仍派生自旧 i2i 链
+    的帧（见 frame_generator.update_manifest_stale_status）。"""
+    stale = set()
+    for frame in (manifest_data or {}).get('frames', []):
+        if isinstance(frame, dict) and frame.get('stale_lineage'):
+            try:
+                stale.add(int(frame['slot']))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return stale
+
+
+def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, target_slots=None,
+                      strict=False, verify_fn=None, gate_level='standard', stale_slots=None):
     """为每个视频槽位做生成决策。只读文件系统，不做任何写操作，可单测。
 
     video_slots: _parse_prompt_slots 的 videos 输出（{slot: str 或 {'body':...}}）
     target_slots: None=整单生成；列表=只处理这些槽位（显式重试）
+    strict/verify_fn: 断点续传复用判定用，见下方注释；verify_fn 默认为
+      verify_video_anchors，测试可注入假实现，避免依赖真实 ffmpeg/视频文件。
 
     返回按槽位升序的计划列表，每项：
       slot / seq / prompt（已改写 IMAGE 1/2）/ dest_path
@@ -149,8 +225,11 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
               'generate' —— 需要提交生成
               'blocked'  —— 前置条件不满足（缺帧/降级帧），reason 说明原因
       start_frame / end_frame: 锚点帧绝对路径
-      delete_existing: 显式重试且旧文件存在，调用方需先删除
+      delete_existing: 旧文件存在且即将被重新生成覆盖（显式重试，或断点续传时检测到
+        与当前锚点帧不符的过期片段），调用方需先删除
     """
+    if verify_fn is None:
+        verify_fn = verify_video_anchors
     slots = sorted(video_slots.keys())
     if target_slots is not None:
         wanted = {int(x) for x in target_slots}
@@ -163,26 +242,33 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
         prompt = item['body'] if isinstance(item, dict) else item
         prompt = rewrite_prompt_for_two_card_ui(prompt, slot)
         dest_path = os.path.join(videos_dir, f'vid_{slot:03d}.mp4')
+        start_p, end_p = slot_to_path.get(slot), slot_to_path.get(slot + 1)
         plan = {
             'slot': slot,
             'seq': seq,
             'prompt': prompt,
             'dest_path': dest_path,
-            'start_frame': slot_to_path.get(slot),
-            'end_frame': slot_to_path.get(slot + 1),
+            'start_frame': start_p,
+            'end_frame': end_p,
             'delete_existing': False,
             'reason': '',
         }
 
-        # 断点续传：非显式重试时，已存在的有效视频直接复用
-        if not is_explicit_retry and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-            plan['action'] = 'reuse'
-            plans.append(plan)
-            continue
-        if is_explicit_retry and os.path.exists(dest_path):
+        existing = os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
+        if not is_explicit_retry and existing:
+            # 断点续传：已存在的视频仍须与当前锚点帧内容一致才复用——起止帧可能在
+            # 上一轮失败后被单独重渲（retrySingleFrame），旧片段这时已经过期，
+            # 复用会重蹈 spark-video-mixup-postmortem 那类串片问题，须按缺失处理重渲。
+            ok, verify_reason = verify_fn(dest_path, start_p, end_p, strict=strict)
+            if ok:
+                plan['action'] = 'reuse'
+                plans.append(plan)
+                continue
+            plan['delete_existing'] = True
+            plan['reason'] = f"已存在的片段与当前锚点帧不符（{verify_reason}），视为过期，将重新生成。"
+        elif is_explicit_retry and existing:
             plan['delete_existing'] = True
 
-        start_p, end_p = plan['start_frame'], plan['end_frame']
         if not start_p or not os.path.exists(start_p):
             plan['action'] = 'blocked'
             plan['reason'] = f"视频 {slot} 所需的起始帧 IMAGE {slot} 不存在。请重新生成该帧！"
@@ -196,8 +282,32 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                 f"视频 {slot} 的起始帧 IMAGE {slot} 或结束帧 IMAGE {slot + 1} 属于降级帧（i2i fallback degraded），"
                 f"已拦截该段视频生成以防止画面跳变。请重新生成并修复受损帧。"
             )
+        elif gate_level != 'off' and 'vlm_qa_failed' in (slot_to_quality.get(slot), slot_to_quality.get(slot + 1)):
+            # 已知坏帧不再烧昂贵的视频生成额度：'vlm_qa_failed' 是重试用尽后的终态判定
+            # （lenient 档下只有硬伤才会走到这一步），跳过质检的帧不受影响。
+            _bad = slot if slot_to_quality.get(slot) == 'vlm_qa_failed' else slot + 1
+            plan['action'] = 'blocked'
+            plan['reason'] = (
+                f"视频 {slot} 的锚点帧 IMAGE {_bad} 未通过视觉质检（vlm_qa_failed），已拦截该段视频生成。"
+                f"请重渲该帧（或将质检档位调为 off 放行）后重试。"
+            )
+        elif stale_slots and gate_level == 'standard' \
+                and (slot in stale_slots or (slot + 1) in stale_slots):
+            _stale = slot if slot in stale_slots else slot + 1
+            plan['action'] = 'blocked'
+            plan['reason'] = (
+                f"视频 {slot} 的锚点帧 IMAGE {_stale} 派生自旧的 i2i 链（上游帧已被单独重渲，"
+                f"血统过期），已拦截以防跨链跳变。请顺序重渲 IMAGE {_stale} 及其后续帧，"
+                f"或将质检档位调为 lenient 带警告放行。"
+            )
         else:
             plan['action'] = 'generate'
+            if stale_slots and (slot in stale_slots or (slot + 1) in stale_slots):
+                _stale = slot if slot in stale_slots else slot + 1
+                plan['warning'] = (
+                    f"视频 {slot} 的锚点帧 IMAGE {_stale} 派生自旧 i2i 链（上游帧已被单独重渲），"
+                    f"两端帧可能存在跨链色彩/内容漂移。"
+                )
         plans.append(plan)
     return plans
 
@@ -254,12 +364,18 @@ class _BatchBridge:
     不符（画布串片/错误下载）时删除文件并回传 'rejected'，批量脚本据此把该任务
     标记失败进入重试轮。"""
 
-    def __init__(self, pending, total, video_model, writer, on_progress):
+    def __init__(self, pending, total, video_model, writer, on_progress, strict=False,
+                 process_check_fn=None):
         self.pending = pending          # [{'plan':..., 'req':..., 'temp_out_dir':...}]
         self.total = total
         self.video_model = video_model
         self.writer = writer
         self.on_progress = on_progress
+        self.strict = strict            # strictGates：锚点校验环境异常按失败处理
+        # 段内过程门（空心视频拦截）：plan -> ('accept'|'warn'|'reject', reason)。
+        # None = 不检（旧调用方/测试兼容）；生产路径由 generate_video_sequence 注入
+        # check_video_process 的闭包。
+        self.process_check_fn = process_check_fn
 
     def _emit(self, stage, payload):
         if self.on_progress:
@@ -285,7 +401,7 @@ class _BatchBridge:
                 self._fail(plan, '生成的视频文件不存在')
                 return None
             shutil.move(generated_path, plan['dest_path'])
-            ok, reason = verify_video_anchors(plan['dest_path'], plan['start_frame'], plan['end_frame'])
+            ok, reason = verify_video_anchors(plan['dest_path'], plan['start_frame'], plan['end_frame'], strict=self.strict)
             if not ok:
                 try:
                     os.remove(plan['dest_path'])
@@ -296,8 +412,31 @@ class _BatchBridge:
                     f"疑似画布串片/错误下载，已拦截并删除。请重试该片段。"
                 ))
                 return 'rejected'  # 通知批量脚本该片段实际失败，可参与失败重试
+            process_reason = None
+            if self.process_check_fn is not None:
+                action, process_reason = self.process_check_fn(plan)
+                if action == 'reject':
+                    try:
+                        os.remove(plan['dest_path'])
+                    except Exception:
+                        pass
+                    self._fail(plan, (
+                        f"槽位 {plan['slot']} 的视频段内过程检测未通过（{process_reason}），"
+                        f"疑似空心片段/无关内容，已拦截并删除。请重试该片段。"
+                    ))
+                    return 'rejected'  # 与锚点拒收同路径：批量脚本据此进入失败重试轮
             info = _video_info(plan, self.video_model, status='success')
+            # 校验结果留痕：skipped:* 表示该片段其实没经过锚点核验（环境异常被放行）
+            info['anchor_check'] = reason
+            if process_reason is not None:
+                # 段内过程检测留痕：PASS / WARN:... / Skipped(...) / skipped:...
+                info['process_check'] = process_reason
             self.writer.record(info)
+            if self.process_check_fn is not None and process_reason and action == 'warn':
+                self._emit('video_warning', {
+                    'index': plan['slot'], 'current': plan['seq'], 'total': self.total,
+                    'message': f"VID {plan['slot']:03d} 段内过程检测告警（宽松档放行）：{process_reason}",
+                })
             self._emit('video_done', {
                 'index': plan['slot'], 'current': plan['seq'],
                 'total': self.total, 'video': info,
@@ -306,25 +445,6 @@ class _BatchBridge:
             # 单段失败隔离：记录失败状态，其余槽位继续
             self._fail(plan, (details or {}).get('message') or '生成失败')
         return None
-
-
-def _clear_previous_outputs(videos_dir, manifest_data):
-    """整单重跑（非重试）时清空旧视频文件与 manifest.videos，
-    防止断点续传把上一轮的旧视频当成本轮结果。"""
-    if os.path.isdir(videos_dir):
-        cleared = 0
-        for fname in os.listdir(videos_dir):
-            fpath = os.path.join(videos_dir, fname)
-            if os.path.isfile(fpath) and fname.lower().endswith('.mp4'):
-                try:
-                    os.remove(fpath)
-                    cleared += 1
-                except Exception as rm_err:
-                    print(f"Warning: could not remove old video {fpath}: {rm_err}")
-        if cleared:
-            print(f"[INFO] Cleared {cleared} old video file(s) for full regeneration.")
-    if 'videos' in manifest_data:
-        manifest_data['videos'] = []
 
 
 def generate_video_sequence(config, title, prompt_block, on_progress=None, target_slots=None):
@@ -353,10 +473,10 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     if not slot_to_path:
         raise RuntimeError('未找到已生成的帧图像。请先生成帧序列！')
 
-    if target_slots is None:
-        _clear_previous_outputs(videos_dir, manifest_data)
-
-    plans = plan_video_slots(videos, slot_to_path, slot_to_quality, videos_dir, target_slots)
+    plans = plan_video_slots(videos, slot_to_path, slot_to_quality, videos_dir, target_slots,
+                              strict=strict_gates_enabled(config),
+                              gate_level=qa_gate_level(config),
+                              stale_slots=load_stale_slots(manifest_data))
 
     if on_progress:
         on_progress('start', {
@@ -389,6 +509,13 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                 })
             continue
         # action == 'generate'
+        if plan.get('warning'):
+            print(f"[VIDEO GATE][WARN] {plan['warning']}")
+            if on_progress:
+                on_progress('video_warning', {
+                    'index': plan['slot'], 'current': plan['seq'],
+                    'total': len(plans), 'message': plan['warning'],
+                })
         if plan['delete_existing']:
             try:
                 os.remove(plan['dest_path'])
@@ -406,7 +533,13 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
         pending_items.append({'plan': plan, 'req': req, 'temp_out_dir': temp_out_dir})
 
     if pending_items:
-        bridge = _BatchBridge(pending_items, len(plans), video_model, writer, on_progress)
+        def _process_gate(plan):
+            return check_video_process(config, plan['dest_path'], plan['start_frame'],
+                                       plan['end_frame'], plan['prompt'])
+
+        bridge = _BatchBridge(pending_items, len(plans), video_model, writer, on_progress,
+                              strict=strict_gates_enabled(config),
+                              process_check_fn=_process_gate)
 
         def cancel_check_cb():
             if on_progress:
@@ -575,7 +708,8 @@ def merge_project_videos(project_dir, allow_partial=False):
                 continue
             start_p = _resolve_frame(frame_by_slot.get(slot))
             end_p = _resolve_frame(frame_by_slot.get(slot + 1))
-            ok, reason = verify_video_anchors(abs_path, start_p, end_p)
+            # 合并门禁没有请求级 config，strict 开关直接取服务端配置
+            ok, reason = verify_video_anchors(abs_path, start_p, end_p, strict=strict_gates_enabled())
             if not ok:
                 mismatched.append(slot)
                 continue
@@ -891,190 +1025,3 @@ def _merge_with_placeholders(project_dir, manifest_data, expected_slots, good,
         'partial': True,
         'placeholder_slots': placeholder_slots,
     }
-
-
-def video_reverse_worker(task_id, temp_video_path, temp_dir_obj, fps, api, prompt_style, client_config, filename):
-    t = get_or_create_task(task_id)
-    output_root = temp_dir_obj.name
-    
-    def on_progress(stage, details):
-        if t["cancel_event"].is_set():
-            raise ConnectionError("Video analysis cancelled by user")
-        with ACTIVE_TASKS_LOCK:
-            t["events"].append(('progress', {'stage': stage, 'details': details}))
-        notify_listeners(task_id, 'progress', {'stage': stage, 'details': details})
-
-    try:
-        # Import video_to_prompt_pipeline from skill root
-        if str(SKILL_DIR) not in sys.path:
-            sys.path.append(str(SKILL_DIR))
-        import video_to_prompt_pipeline
-        
-        # Step 1: Keyframe Extraction
-        on_progress('keyframe_extraction', '正在提取视频关键帧...')
-        keyframe_paths = video_to_prompt_pipeline.extract_keyframes(temp_video_path, output_root, fps)
-        if not keyframe_paths:
-            raise RuntimeError("关键帧提取失败。请确保视频文件有效且 FFmpeg 环境正常。")
-
-        # Step 2: Local CV Motion & Light Heuristics
-        on_progress('cv_analysis', '正在使用计算机视觉算法分析运动与光照变化...')
-        if t["cancel_event"].is_set():
-            raise ConnectionError("Video analysis cancelled by user")
-        cv_data = video_to_prompt_pipeline.analyze_video_cv(keyframe_paths)
-
-        # Step 3: Fetch semantic metadata from Multimodal LLM
-        on_progress('semantic_metadata', '大模型多模态视频分析与时序语义提取中...')
-        if t["cancel_event"].is_set():
-            raise ConnectionError("Video analysis cancelled by user")
-        
-        old_gemini_key = os.environ.get("GEMINI_API_KEY")
-        gemini_key = client_config.get("apiKey") or os.environ.get("GEMINI_API_KEY")
-        current_gemini_key = client_config.get("apiKey") or gemini_key
-        if current_gemini_key:
-            os.environ["GEMINI_API_KEY"] = current_gemini_key
-
-        try:
-            client_base_url = client_config.get("baseUrl")
-            client_model = client_config.get("model")
-            metadata = video_to_prompt_pipeline.fetch_semantic_metadata(
-                keyframe_paths, cv_data, force_local=False, fps=fps, base_url=client_base_url, model=client_model
-            )
-        finally:
-            if old_gemini_key is not None:
-                os.environ["GEMINI_API_KEY"] = old_gemini_key
-            elif "GEMINI_API_KEY" in os.environ:
-                del os.environ["GEMINI_API_KEY"]
-
-        if not metadata or "time_sequence" not in metadata:
-            raise RuntimeError("大模型多模态视频分析失败，请检查 API 密钥、网络连接或稍后重试。")
-
-        # Step 4: Prompt Composition & Audit
-        on_progress('prompt_composition', '正在合成 SCUP 提示词并进行物理一致性审计...')
-        if t["cancel_event"].is_set():
-            raise ConnectionError("Video analysis cancelled by user")
-        images, videos = video_to_prompt_pipeline.compose_scup_prompts(metadata, clean_mode=(prompt_style == "clean"))
-
-        if t["cancel_event"].is_set():
-            raise ConnectionError("Video analysis cancelled by user")
-        audit_results = video_to_prompt_pipeline.run_scup_audit(
-            images,
-            videos,
-            fps=fps,
-            num_analyzed_frames=metadata.get("num_analyzed_frames"),
-            total_frames=len(keyframe_paths),
-            change_events=metadata.get("change_events"),
-            analysis_frame_indices=metadata.get("analysis_frame_indices"),
-            time_sequence=metadata.get("time_sequence"),
-            post_render_qc=metadata.get("post_render_qc"),
-            video_path=temp_video_path
-        )
-
-        # Build Markdown Audit report
-        video_name = os.path.splitext(filename)[0]
-        failed_gates = [g for g in audit_results["gates"] if g["status"] == "FAIL"]
-        
-        report_lines = [
-            f"# SCUP Quality Audit Report — {video_name}",
-            f"**Audit Score**: `{audit_results['score']}/100`",
-            f"**Audit Status**: {'PASS' if audit_results['score'] >= 80 else 'REWRITE REQUIRED'}\n",
-            "## Detailed Gate Checks\n",
-            "| Gate Name | Tier | Status | Details |",
-            "|---|---|---|---|"
-        ]
-        for g in audit_results["gates"]:
-            status_emoji = "✅ PASS" if g["status"] == "PASS" else ("⏭️ NOT CHECKED" if g["status"] == "SKIP" else "❌ FAIL")
-            details_str = "<br>".join(g["details"])
-            report_lines.append(f"| {g['name']} | {g.get('tier', 'P0')} | {status_emoji} | {details_str} |")
-            
-        report_lines.append("\n## Action Items & Recommendations\n")
-        if not failed_gates:
-            report_lines.append("🎉 **Congratulations!** Your prompts perfectly adhere to the spatial consistency and time-lapse continuity rules. Ready for production rendering.")
-        else:
-            for g in failed_gates:
-                report_lines.append(f"### ⚠️ Fix {g['name']} ({g['tier']})")
-                report_lines.append(f"- **Problem**: {', '.join(g['details'])}")
-                report_lines.append(f"- **Solution**: {g['solution']}\n")
-                
-        audit_md = "\n".join(report_lines)
-
-        # Format prompts lists
-        images_list = [{"n": i+1, "text": img} for i, img in enumerate(images)]
-        videos_list = [{"n": i+1, "text": vid} for i, vid in enumerate(videos)]
-
-        raw_text = f"===TITLE===\n视频反推提示词 ({video_name})\n\n===THEME===\n从视频分析反推\n\n===PROMPTS===\n图片提示词\n--------------------------------------------------\n"
-        for i, img in enumerate(images):
-            raw_text += f"图片 {i+1}:\n{img}\n\n"
-        raw_text += "--------------------------------------------------\n视频提示词\n--------------------------------------------------\n"
-        for i, vid in enumerate(videos):
-            raw_text += f"视频 {i+1}:\n{vid}\n\n"
-        raw_text += f"--------------------------------------------------\n===AUDIT===\n{audit_md}"
-
-        # Copy collage file to outputs directory if it was generated
-        collage_src = os.path.splitext(temp_video_path)[0] + "_collage.jpg"
-        collage_url = None
-        if os.path.exists(collage_src):
-            try:
-                os.makedirs(OUTPUT_ROOT, exist_ok=True)
-                import time
-                dest_filename = f"reverse_{int(time.time())}_{video_name}_collage.jpg"
-                dest_path = os.path.join(OUTPUT_ROOT, dest_filename)
-                shutil.copy(collage_src, dest_path)
-                collage_url = f"/outputs/{dest_filename}"
-                print(f"[+] Saved keyframe collage to persistent outputs: {dest_path}")
-            except Exception as e:
-                print(f"[-] Failed to copy keyframe collage to outputs: {e}")
-
-        # Model label selection
-        model_label = "Gemini-1.5-Flash"
-        openai_key = os.environ.get("OPENAI_API_KEY")
-        if api == "openai" or (api == "auto" and not gemini_key and openai_key):
-            model_label = "GPT-4o-Mini"
-
-        result = {
-            "images": images_list,
-            "videos": videos_list,
-            "audit_md": audit_md,
-            "prompt_block": raw_text,
-            "title": f"视频反推提示词 ({video_name})",
-            "model": model_label,
-            "collage_url": collage_url,
-            "image_count": len(images_list),
-            "video_count": len(videos_list),
-            "timings": {}
-        }
-
-        with ACTIVE_TASKS_LOCK:
-            t["status"] = "completed"
-            t["result"] = result
-            t["events"].append(('result', result))
-
-        notify_listeners(task_id, 'result', result)
-
-    except ConnectionError:
-        with ACTIVE_TASKS_LOCK:
-            t["status"] = "cancelled"
-            t["error"] = "用户取消了视频反推"
-            t["events"].append(('error', {'message': "用户取消了视频反推"}))
-        notify_listeners(task_id, 'error', {'message': "用户取消了视频反推"})
-    except Exception as e:
-        if sys.stdout:
-            import traceback
-            print(f"[DEBUG] Video reverse background task {task_id} failed: {e}")
-            traceback.print_exc()
-        error_msg = str(e)
-        with ACTIVE_TASKS_LOCK:
-            t["status"] = "failed"
-            t["error"] = error_msg
-            t["events"].append(('error', {'message': error_msg}))
-        notify_listeners(task_id, 'error', {'message': error_msg})
-    finally:
-        # Cleanup files
-        try:
-            if os.path.exists(temp_video_path):
-                os.remove(temp_video_path)
-            temp_dir_obj.cleanup()
-        except Exception as ce:
-            print(f"[DEBUG] Cleanup error: {ce}")
-        save_tasks_to_disk()
-
-

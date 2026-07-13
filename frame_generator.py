@@ -37,7 +37,33 @@ class ImageTaskCancelled(Exception):
     """图像任务被用户取消（在重试间隙检测到）。"""
 
 
-def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, initial_delay=2.0, cancel_check=None):
+_UPSTREAM_SINK = threading.local()
+
+
+def set_upstream_event_sink(fn):
+    """注册（传 None=清除）当前线程的上游失败即时广播回调。
+    _execute_request_with_retry 每次尝试失败都会立刻回调一次——帧序列 worker 把它
+    转成 SSE 'upstream_retry' 事件、图像站 worker 把它写进任务 stage——前端因此在
+    上游报错的瞬间就能看到真相，而不是等整条重试退避链（最长分钟级）烧完才知道。"""
+    _UPSTREAM_SINK.fn = fn
+
+
+def _emit_upstream_failure(attempt, max_attempts, error_text, retry_in=None):
+    fn = getattr(_UPSTREAM_SINK, 'fn', None)
+    if not fn:
+        return
+    try:
+        fn({
+            'attempt': attempt,
+            'max_attempts': max_attempts,
+            'error': str(error_text)[:200],
+            'retry_in': round(retry_in, 1) if retry_in else None,
+        })
+    except Exception:
+        pass  # 广播失败绝不能影响请求重试本身
+
+
+def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, initial_delay=2.0, cancel_check=None, on_attempt=None):
     import random
     if opener is None:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -49,6 +75,12 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, 
         # 每次（重）试前检查取消：已取消的任务不再烧上游配额
         if cancel_check and cancel_check():
             raise ImageTaskCancelled("任务已被用户取消")
+        if on_attempt:
+            # 图像站实时动态用：报告当前是第几次尝试（回调异常不许影响请求本身）
+            try:
+                on_attempt(attempt + 1, max_attempts)
+            except Exception:
+                pass
         try:
             url_str = req.full_url if hasattr(req, 'full_url') else str(req)
             if sys.stdout:
@@ -69,34 +101,43 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, 
             
             # Detect quota exhaustion (direct 429 or 502 wrapping upstream 429)
             # and fail immediately – retrying only wastes quota.
+            # The account-pool token broker in front of the gateway also fails this
+            # way when it has no account left for the model at all (not a JSON body,
+            # e.g. "Max retries exhausted. Last error: Token error: No accounts
+            # available with quota for model: ...") – treat that the same as a
+            # quota error so the imageEditFallbackModel switch-over still fires.
             quota_signal = (
                 "QUOTA_EXHAUSTED" in detail
                 or "RESOURCE_EXHAUSTED" in detail
                 or "capacity on this model" in detail
                 or "quotaResetDelay" in detail
+                or "no accounts available" in detail.lower()
             )
             if quota_signal:
                 err_msg = "您的图片生成配额已耗尽 (QUOTA_EXHAUSTED)。"
+                msg = ""
                 try:
                     # The 502 body wraps the upstream 429 JSON, find "message"
                     err_json = json.loads(detail)
                     inner = err_json.get('error', {})
                     msg = inner.get('message') or ""
-                    # Sometimes the real 429 JSON is nested deeper
-                    if not msg:
-                        m = re.search(r'"message":\s*"([^"]+)"', detail)
-                        if m:
-                            msg = m.group(1)
-                    if msg:
-                        err_msg += f" {msg}"
-                    # Extract quota reset delay for user-friendly message
-                    delay_m = re.search(r'quotaResetDelay[":\s]+([^,\}"]+)', detail)
-                    if delay_m:
-                        err_msg += f" Quota resets in: {delay_m.group(1).strip()}"
                 except Exception:
+                    pass
+                if not msg:
+                    # Sometimes the real 429 JSON is nested deeper, or (token
+                    # broker case) the body is plain text with no JSON at all.
                     m = re.search(r'"message":\s*"([^"]+)"', detail)
                     if m:
-                        err_msg += f" {m.group(1)}"
+                        msg = m.group(1)
+                if msg:
+                    err_msg += f" {msg}"
+                elif detail.strip():
+                    err_msg += f" {detail.strip()[:300]}"
+                # Extract quota reset delay for user-friendly message
+                delay_m = re.search(r'quotaResetDelay[":\s]+([^,\}"]+)', detail)
+                if delay_m:
+                    err_msg += f" Quota resets in: {delay_m.group(1).strip()}"
+                _emit_upstream_failure(attempt + 1, max_attempts, f'HTTP {e.code} 配额耗尽: {detail.strip()[:120]}')
                 raise QuotaExhaustedError(err_msg)
 
             # Retry on 429 and 5xx errors
@@ -111,11 +152,13 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, 
                             pass
                     else:
                         sleep_time = delay * (1.5 ** attempt) + random.uniform(0.5, 1.5)
-                    
+
+                    _emit_upstream_failure(attempt + 1, max_attempts, f'HTTP {e.code}: {detail.strip()[:120]}', retry_in=sleep_time)
                     if sys.stdout:
                         print(f"[HTTP] Rate-limited or server error. Retrying in {sleep_time:.2f} seconds...")
                     time.sleep(sleep_time)
                     continue
+            _emit_upstream_failure(attempt + 1, max_attempts, f'HTTP {e.code}: {detail.strip()[:120]}')
             raise e
         except urllib.error.URLError as e:
             last_exception = e
@@ -123,8 +166,10 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, 
                 print(f"[HTTP] Attempt {attempt+1}/{max_attempts} failed with URLError: {e.reason}")
             if attempt < max_attempts - 1:
                 sleep_time = delay * (1.5 ** attempt) + random.uniform(0.5, 1.5)
+                _emit_upstream_failure(attempt + 1, max_attempts, f'连接失败: {e.reason}', retry_in=sleep_time)
                 time.sleep(sleep_time)
                 continue
+            _emit_upstream_failure(attempt + 1, max_attempts, f'连接失败: {e.reason}')
             raise e
         except socket.timeout as e:
             last_exception = e
@@ -132,8 +177,10 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, 
                 print(f"[HTTP] Attempt {attempt+1}/{max_attempts} failed with socket timeout")
             if attempt < max_attempts - 1:
                 sleep_time = delay * (1.5 ** attempt) + random.uniform(0.5, 1.5)
+                _emit_upstream_failure(attempt + 1, max_attempts, '请求超时 (socket timeout)', retry_in=sleep_time)
                 time.sleep(sleep_time)
                 continue
+            _emit_upstream_failure(attempt + 1, max_attempts, '请求超时 (socket timeout)')
             raise e
         except Exception as e:
             last_exception = e
@@ -141,8 +188,10 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, 
                 print(f"[HTTP] Attempt {attempt+1}/{max_attempts} failed with unexpected error: {e}")
             if attempt < max_attempts - 1:
                 sleep_time = delay * (1.5 ** attempt) + random.uniform(0.5, 1.5)
+                _emit_upstream_failure(attempt + 1, max_attempts, str(e), retry_in=sleep_time)
                 time.sleep(sleep_time)
                 continue
+            _emit_upstream_failure(attempt + 1, max_attempts, str(e))
             raise e
             
     if last_exception:
@@ -161,11 +210,45 @@ def _get_file_hash(filepath):
         return ""
 
 
-def update_manifest_stale_status(manifest, project_dir):
+def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=None, finalize=False):
+    """帧内容变了 → 已合并视频/视频清单作废（旧行为，任何调用都执行）。
+
+    finalize=True 时（帧生成整轮成功收尾处调用）额外维护 i2i 链的血统标记：
+    部分重生（regenerated_sequences 为槽位子集）后，位于最早重生帧之后、又没被本轮
+    重生的帧，其画面仍派生自旧链——标记 stale_lineage=True，供视频配对门禁与前端
+    识别；被本轮重生的帧清除标记。整单全量重生（regenerated_sequences=None）时链条
+    重新连续，清空全部标记。"""
     if 'merged_video' in manifest:
         del manifest['merged_video']
     if 'videos' in manifest:
         manifest['videos'] = []
+    if not finalize:
+        return
+    frames = manifest.get('frames') or []
+    if regenerated_sequences is None:
+        for fr in frames:
+            if isinstance(fr, dict):
+                fr.pop('stale_lineage', None)
+        return
+    regen = set()
+    for s in regenerated_sequences:
+        try:
+            regen.add(int(s))
+        except (TypeError, ValueError):
+            continue
+    if not regen:
+        return
+    start = min(regen)
+    for fr in frames:
+        if not isinstance(fr, dict):
+            continue
+        seq = fr.get('sequence')
+        if not isinstance(seq, int):
+            continue
+        if seq in regen:
+            fr.pop('stale_lineage', None)
+        elif seq > start:
+            fr['stale_lineage'] = True
 
 
 def call_image_llm(config, prompt_content):
@@ -984,8 +1067,10 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path):
     return paths, temp_out
 
 
-def _fx_apply_vlm_fixes(config, orig_prompt, vlm_reason, is_bridge, is_last):
-    """按 API 路径同款流程，用 VLM 反馈改写提示词并套用主动修复。"""
+def _fx_apply_vlm_fixes(config, orig_prompt, vlm_reason, is_bridge, is_last, family=None):
+    """按 API 路径同款流程，用 VLM 反馈改写提示词并套用主动修复。
+    family（'exterior'/'sill'/'interior'）用于镜头族感知：室内帧不回填 horizon、
+    不把静态相机声明当"运动矛盾"删掉；不传时退回旧的 is_bridge 行为。"""
     from prompt_pipeline import (
         fix_image_prompt_with_vlm_feedback, clean_prompt_text,
         fix_image_clean_frame_proactive, fix_horizon_line,
@@ -994,8 +1079,9 @@ def _fx_apply_vlm_fixes(config, orig_prompt, vlm_reason, is_bridge, is_last):
     corrected = fix_image_prompt_with_vlm_feedback(config, orig_prompt, vlm_reason)
     corrected = clean_prompt_text(corrected)
     corrected = fix_image_clean_frame_proactive(corrected)
-    corrected = fix_horizon_line(corrected)
-    corrected = fix_camera_contradictions(corrected, is_bridge=is_bridge)
+    corrected = fix_horizon_line(corrected, family=(family or 'exterior'))
+    _strip_static = (family == 'sill') if family is not None else is_bridge
+    corrected = fix_camera_contradictions(corrected, is_bridge=_strip_static)
     corrected = fix_rhma_blur(corrected, is_last=is_last)
 
     camera_dna = ""
@@ -1014,7 +1100,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
     rotate_requests = config.get('googleFxIpRotateRequests')
     if rotate_requests is not None:
         os.environ['MIYA_ROTATE_THRESHOLD'] = str(rotate_requests)
-    from prompt_pipeline import _parse_prompt_slots, run_frame_qa_check
+    from prompt_pipeline import _parse_prompt_slots, run_frame_qa_check, resolve_family_anchor, image_space_family, is_skipped_verdict, is_warn_verdict
     images, videos = _parse_prompt_slots(prompt_block)
 
     prompts = []
@@ -1055,6 +1141,12 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             if isinstance(existing_manifest, dict) and 'frames' in existing_manifest:
                 manifest['frames'] = existing_manifest['frames']
                 manifest['created_at'] = existing_manifest.get('created_at', manifest['created_at'])
+                # 未知键保留：检查点重锚定/校准记录（reanchors、anchor_recalibrations）等
+                # 是在分段渲染的间隙写入的，重建 manifest 时丢掉它们会让下一段渲染的
+                # 逐帧落盘把这些记录抹掉（videos/merged_video 仍由 stale 逻辑显式清理）
+                for _k, _v in existing_manifest.items():
+                    if _k not in manifest:
+                        manifest[_k] = _v
         except Exception:
             pass
 
@@ -1110,8 +1202,21 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
         prev_path = _webp_path(seq - 1)
         target_path = _webp_path(seq)
-        vlm_pass, vlm_reason = run_frame_qa_check(config, _webp_path(1), prev_path, target_path, video_prompt, seq, is_bridge=is_bridge)
+        # Drift-check against the CURRENT shot family's anchor, not always IMAGE 1 -- once a
+        # threshold crossing has happened, IMAGE 1's exterior family no longer meaningfully
+        # bounds interior frames. None means this frame IS the family anchor itself.
+        # resolve_family_anchor：链中检查点重锚定过的族，以新基线为准（见其 docstring）。
+        anchor_seq = resolve_family_anchor(config, videos, seq)
+        anchor_path = _webp_path(anchor_seq) if anchor_seq != seq else None
+        if on_progress:
+            on_progress('frame_qa', {'slot': item['index'], 'sequence': seq})
+        vlm_pass, vlm_reason = run_frame_qa_check(config, anchor_path, prev_path, target_path, video_prompt, seq, is_bridge=is_bridge, anchor_seq=anchor_seq)
         if vlm_pass:
+            if is_skipped_verdict(vlm_reason):
+                return 'auto_approved_degraded', vlm_reason
+            if is_warn_verdict(vlm_reason):
+                # 宽松档软性瑕疵：放行不重试，但把告警留进 manifest 供人工复核
+                return 'auto_approved', vlm_reason
             return 'auto_approved', None
 
         if sys.stdout:
@@ -1129,6 +1234,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                 corrected = _fx_apply_vlm_fixes(
                     config, item['prompt'], vlm_reason,
                     is_bridge=is_bridge, is_last=(seq == len(prompts)),
+                    family=image_space_family(videos, seq),
                 )
                 if sys.stdout:
                     print(f"[VLM QA][FX] Attempt {retry_attempt+1} corrected prompt: {corrected}")
@@ -1141,11 +1247,15 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                 # 否则重试帧带着色偏被判卷，行为与首轮不一致（三处复制中的漂移点）
                 if _frame_exists(1) and os.path.exists(target_path):
                     _match_color_lab(target_path, _webp_path(1), target_path)
-                vlm_pass, vlm_reason = run_frame_qa_check(config, _webp_path(1), prev_path, target_path, video_prompt, seq, is_bridge=is_bridge)
+                vlm_pass, vlm_reason = run_frame_qa_check(config, anchor_path, prev_path, target_path, video_prompt, seq, is_bridge=is_bridge, anchor_seq=anchor_seq)
                 if vlm_pass:
                     if sys.stdout:
                         print(f"[VLM QA][FX] Beat {seq-1} passed VLM check on retry {retry_attempt+1}!")
                     item['prompt'] = corrected  # 回写 manifest 用的提示词
+                    if is_skipped_verdict(vlm_reason):
+                        return 'auto_approved_degraded', vlm_reason
+                    if is_warn_verdict(vlm_reason):
+                        return 'auto_approved', vlm_reason
                     return 'auto_approved', None
                 if sys.stdout:
                     print(f"[VLM QA][FX] Beat {seq-1} failed VLM check on retry {retry_attempt+1}: {vlm_reason}")
@@ -1252,7 +1362,13 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         try:
             for offset, s in enumerate(chunk):
                 item = prompts_by_seq[s]
-                is_bridge = ('BRIDGE' in item.get('meta', '').upper())
+                # Only VIDEO slots carry [BRIDGE] tags per the delivery contract; the
+                # incoming transition (VIDEO s-1) is the real signal for IMAGE s.
+                incoming_video = videos.get(s - 1)
+                is_bridge = (
+                    'BRIDGE' in item.get('meta', '').upper()
+                    or 'BRIDGE' in (incoming_video.get('meta', '') if isinstance(incoming_video, dict) else '').upper()
+                )
                 _, fx_src_path, fx_uuid = _fx_store_frame(local_paths[offset], frames_dir, s)
                 if s > 1:
                     first_frame_path = _webp_path(1)
@@ -1270,7 +1386,8 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         finally:
             shutil.rmtree(temp_out, ignore_errors=True)
 
-    update_manifest_stale_status(manifest, project_dir)
+    update_manifest_stale_status(manifest, project_dir,
+                                 regenerated_sequences=target_sequences, finalize=True)
     _save_manifest()
     manifest['manifest'] = '/' + os.path.relpath(manifest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
     manifest['project_dir'] = os.path.abspath(project_dir)
@@ -1344,9 +1461,9 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             config, title, prompt_block,
             on_progress=on_progress, target_sequences=target_sequences,
         )
-    from prompt_pipeline import _parse_prompt_slots, run_frame_qa_check
+    from prompt_pipeline import _parse_prompt_slots, run_frame_qa_check, resolve_family_anchor, image_space_family, is_skipped_verdict, is_warn_verdict
     images, videos = _parse_prompt_slots(prompt_block)
-    
+
     prompts = []
     for idx in sorted(images):
         item = images[idx]
@@ -1387,6 +1504,11 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                 if isinstance(existing_manifest, dict) and 'frames' in existing_manifest:
                     manifest['frames'] = existing_manifest['frames']
                     manifest['created_at'] = existing_manifest.get('created_at', manifest['created_at'])
+                    # 未知键保留（与 FX 路径同款）：分段渲染间隙写入的 reanchors/
+                    # anchor_recalibrations 等记录不能被逐帧落盘的重建 manifest 抹掉
+                    for _k, _v in existing_manifest.items():
+                        if _k not in manifest:
+                            manifest[_k] = _v
         except Exception:
             pass
 
@@ -1398,8 +1520,6 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
 
     previous_path = None
     generated_count = 0
-    lineage_degraded = False
-
     for item in prompts:
         # 用提示词块里的真实槽位号，绝不能用枚举位置：单帧/子集渲染时
         # prompt_block 可能只含目标槽位，枚举位置永远从 1 开始，
@@ -1417,9 +1537,6 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         if not should_generate:
             if os.path.exists(target_path):
                 previous_path = target_path
-                existing_frame = manifest_frames_by_seq.get(seq)
-                if existing_frame and existing_frame.get('quality_gate') == 'i2i_fallback_degraded':
-                    lineage_degraded = True
             continue
 
         # If the file already exists on disk and we are not doing a specific target retry/regeneration,
@@ -1432,7 +1549,24 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         vlm_qa_failed = False
         vlm_qa_reason = None
         vlm_checked = False
-        is_bridge = ('BRIDGE' in item.get('meta', '').upper())
+        # Only VIDEO slots carry [BRIDGE] tags per the delivery contract; the incoming
+        # transition (VIDEO seq-1) is the real signal for IMAGE seq, not the image's own tag.
+        incoming_video = videos.get(seq - 1)
+        is_bridge = (
+            'BRIDGE' in item.get('meta', '').upper()
+            or 'BRIDGE' in (incoming_video.get('meta', '') if isinstance(incoming_video, dict) else '').upper()
+        )
+        # Shot family of this IMAGE for prompt-rewrite fixes: the Bridge-2 image and every
+        # later frame are 'interior' — their static interior camera declaration must NOT be
+        # stripped as a "moving-camera contradiction", and no horizon may be stamped on them.
+        space_family = image_space_family(videos, seq)
+        # Drift-check reference for QA (NOT color-matching, which intentionally still uses
+        # IMAGE 1 as the baseline): once a threshold crossing has happened before this frame,
+        # IMAGE 1's exterior family no longer meaningfully bounds interior frames. None means
+        # this frame IS the family anchor itself, nothing to compare against yet.
+        # resolve_family_anchor：链中检查点重锚定过的族，以新基线为准
+        _anchor_seq = resolve_family_anchor(config, videos, seq)
+        qa_anchor_path = os.path.join(frames_dir, f'img_{_anchor_seq:03d}.webp') if _anchor_seq != seq else None
 
         if not skip_api_call:
             use_text_generation = (seq == 1 or not previous_path or not os.path.exists(previous_path))
@@ -1445,17 +1579,13 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     'total': total_to_generate,
                 })
             
-            is_fallback = False
             ctrl_prompt = IMG2IMG_CONTROL_PROMPT
             try:
                 if use_text_generation:
                     _generate_text_image(config, item['prompt'], target_path)
-                    lineage_degraded = False
                 else:
                     ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT if is_bridge else IMG2IMG_CONTROL_PROMPT
-                    is_fallback = _generate_image_edit(config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
-                    if is_fallback:
-                        lineage_degraded = True
+                    _generate_image_edit(config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
             except QuotaExhaustedError as quota_err:
                 # Primary model quota exhausted.
                 # Try fallbackImageModel if configured, otherwise raise error.
@@ -1464,29 +1594,28 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     if sys.stdout:
                         print(f"[FRAME SEQUENCE] Quota exhausted on primary model. "
                               f"Retrying frame {seq} with fallback model: {fallback_model}")
+                    if on_progress:
+                        # 主模型这一路虽然终止，任务并没有结束——必须显式广播切换，
+                        # 否则前端刚看到"已放弃"下一秒又见转圈，读起来像卡死
+                        on_progress('model_fallback', {'slot': item['index'], 'sequence': seq, 'to': fallback_model})
                     fallback_config = dict(config)
                     fallback_config['imageModel'] = fallback_model
                     try:
                         if use_text_generation:
                             _generate_text_image(fallback_config, item['prompt'], target_path)
-                            lineage_degraded = False
                             model = _image_generation_model(fallback_config)
                         else:
-                            is_fallback = _generate_image_edit(fallback_config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
-                            lineage_degraded = True  # degraded since we switched models mid-sequence
+                            # 兜底模型仍走 /images/edits 且挂同一张参考帧：图生图链路不断，
+                            # 不算降级（真实使用的模型已随帧记入 manifest 的 model 字段）
+                            _generate_image_edit(fallback_config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
                             model = _image_edit_model(fallback_config)
                     except Exception as fb_err:
-                        if not use_text_generation:
-                            if sys.stdout:
-                                print(f"[FRAME SEQUENCE] Fallback model failed on frame {seq}: {fb_err}. "
-                                      f"Using last-resort text-to-image (fallback model) for frame {seq}.")
-                            _generate_text_image(fallback_config, item['prompt'], target_path)
-                            lineage_degraded = True
-                            model = _image_generation_model(fallback_config)
-                        else:
-                            if sys.stdout:
-                                print(f"[FRAME SEQUENCE] Fallback model failed on frame {seq}: {fb_err}.")
-                            raise RuntimeError(f"第 {seq} 帧生成失败（主模型配额耗尽，且备用模型也失败）: {fb_err}")
+                        # 兜底模型也失败：宁可整帧明确失败等用户重试（断点续传保住已完成帧），
+                        # 也不静默丢掉参考图改文生图重画——那会产出真正断链的帧（构图跳变
+                        # 的根源），且下游视频门禁会把它拦成只能重生的堵点
+                        if sys.stdout:
+                            print(f"[FRAME SEQUENCE] Fallback model failed on frame {seq}: {fb_err}.")
+                        raise RuntimeError(f"第 {seq} 帧生成失败（主模型配额耗尽，兜底模型 {fallback_model} 也失败）: {fb_err}")
                 else:
                     raise quota_err
             except Exception as gen_err:
@@ -1495,7 +1624,6 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     if sys.stdout:
                         print(f"[FRAME SEQUENCE] First frame generation failed: {gen_err}. Retrying text-to-image.")
                     _generate_text_image(config, item['prompt'], target_path)
-                    lineage_degraded = False
                 else:
                     if sys.stdout:
                         print(f"[FRAME SEQUENCE] Frame {seq} image-to-image generation failed: {gen_err}. Subsequent frames cannot fall back to text-to-image.")
@@ -1515,8 +1643,11 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                 video_prompt = video_item['body'] if isinstance(video_item, dict) else video_item
                 if video_prompt:
                     vlm_checked = True
-                    image_1_path = os.path.join(frames_dir, 'img_001.webp')
-                    vlm_pass, vlm_reason = run_frame_qa_check(config, image_1_path, previous_path, target_path, video_prompt, seq, is_bridge=is_bridge)
+                    if on_progress:
+                        # 渲染完→质检判定的间隙此前对前端完全静默（判定超时可达
+                        # 90s×2），显式广播"质检判定中"填补动态流的黑洞
+                        on_progress('frame_qa', {'slot': item['index'], 'sequence': seq})
+                    vlm_pass, vlm_reason = run_frame_qa_check(config, qa_anchor_path, previous_path, target_path, video_prompt, seq, is_bridge=is_bridge, anchor_seq=_anchor_seq)
                     if not vlm_pass:
                         if sys.stdout:
                             print(f"[VLM QA] Beat {seq-1} (IMAGE {seq}) failed VLM check: {vlm_reason}. Retrying generation with VLM feedback...")
@@ -1536,11 +1667,14 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                                 orig_prompt = item['prompt']
                                 corrected_prompt = fix_image_prompt_with_vlm_feedback(config, orig_prompt, vlm_reason)
                                 
-                                # Apply proactive fixes to the corrected prompt
+                                # Apply proactive fixes to the corrected prompt (shot-family
+                                # aware: only the sill handoff frame sheds static-lock wording;
+                                # interior frames keep their static declaration and never get a
+                                # horizon stamped back on)
                                 corrected_prompt = clean_prompt_text(corrected_prompt)
                                 corrected_prompt = fix_image_clean_frame_proactive(corrected_prompt)
-                                corrected_prompt = fix_horizon_line(corrected_prompt)
-                                corrected_prompt = fix_camera_contradictions(corrected_prompt, is_bridge=is_bridge)
+                                corrected_prompt = fix_horizon_line(corrected_prompt, family=space_family)
+                                corrected_prompt = fix_camera_contradictions(corrected_prompt, is_bridge=(space_family == 'sill'))
                                 corrected_prompt = fix_rhma_blur(corrected_prompt, is_last=(seq == len(prompts)))
                                 
                                 # Extract camera DNA prefix from the original prompt to preserve it
@@ -1556,13 +1690,11 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                                 if sys.stdout:
                                     print(f"[VLM QA] Attempt {retry_attempt+1} corrected prompt: {corrected_prompt}")
                                 
-                                is_fallback = _generate_image_edit(config, corrected_prompt, previous_path, target_path, control_prompt=ctrl_prompt)
-                                if is_fallback:
-                                    lineage_degraded = True
+                                _generate_image_edit(config, corrected_prompt, previous_path, target_path, control_prompt=ctrl_prompt)
                                 first_frame_path = os.path.join(frames_dir, 'img_001.webp')
                                 if os.path.exists(first_frame_path) and os.path.exists(target_path):
                                     _match_color_lab(target_path, first_frame_path, target_path)
-                                vlm_pass, vlm_reason = run_frame_qa_check(config, first_frame_path, previous_path, target_path, video_prompt, seq, is_bridge=is_bridge)
+                                vlm_pass, vlm_reason = run_frame_qa_check(config, qa_anchor_path, previous_path, target_path, video_prompt, seq, is_bridge=is_bridge, anchor_seq=_anchor_seq)
                                 if vlm_pass:
                                     if sys.stdout:
                                         print(f"[VLM QA] Beat {seq-1} passed VLM check on retry {retry_attempt+1}!")
@@ -1580,15 +1712,17 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                                     raise
                                 if sys.stdout:
                                     print(f"[VLM QA] Retry {retry_attempt+1} 配额耗尽，切换兜底模型 {fallback_model} 重试本帧")
+                                if on_progress:
+                                    on_progress('model_fallback', {'slot': item['index'], 'sequence': seq, 'to': fallback_model})
                                 try:
                                     fallback_config = dict(config)
                                     fallback_config['imageModel'] = fallback_model
-                                    is_fallback = _generate_image_edit(fallback_config, corrected_prompt, previous_path, target_path, control_prompt=ctrl_prompt)
-                                    lineage_degraded = True
+                                    # 兜底模型仍挂同一张参考帧走图生图，链路不断，不算降级
+                                    _generate_image_edit(fallback_config, corrected_prompt, previous_path, target_path, control_prompt=ctrl_prompt)
                                     first_frame_path = os.path.join(frames_dir, 'img_001.webp')
                                     if os.path.exists(first_frame_path) and os.path.exists(target_path):
                                         _match_color_lab(target_path, first_frame_path, target_path)
-                                    vlm_pass, vlm_reason = run_frame_qa_check(config, first_frame_path, previous_path, target_path, video_prompt, seq, is_bridge=is_bridge)
+                                    vlm_pass, vlm_reason = run_frame_qa_check(config, qa_anchor_path, previous_path, target_path, video_prompt, seq, is_bridge=is_bridge, anchor_seq=_anchor_seq)
                                     if vlm_pass:
                                         item['prompt'] = corrected_prompt
                                         break
@@ -1602,12 +1736,21 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                             vlm_qa_failed = True
                             vlm_qa_reason = vlm_reason
                         
+            # 「降级」标记已退役：图生图帧的兜底永远仍是图生图（换模型不算降级），
+            # 兜底也失败则整帧明确报错——不存在静默断链，也就没有可传染的降级血统。
+            # 旧 manifest 里遗留的 i2i_fallback_degraded 在跳过路径原样保留，重生该帧即清除。
             if vlm_qa_failed:
                 current_quality_gate = 'vlm_qa_failed'
-            elif lineage_degraded:
-                current_quality_gate = 'i2i_fallback_degraded'
             elif vlm_checked:
-                current_quality_gate = 'auto_approved'
+                if is_skipped_verdict(vlm_reason):
+                    # 判定服务异常被 fail-open 放行：不伪装成真实通过，manifest 留痕
+                    current_quality_gate = 'auto_approved_degraded'
+                    vlm_qa_reason = vlm_reason
+                else:
+                    current_quality_gate = 'auto_approved'
+                    if is_warn_verdict(vlm_reason):
+                        # 宽松档软性瑕疵：放行不重试，告警留进 manifest 供人工复核
+                        vlm_qa_reason = vlm_reason
             else:
                 current_quality_gate = 'pending_manual_review'
         else:
@@ -1618,8 +1761,6 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             
             current_quality_gate = existing_frame.get('quality_gate', 'pending_manual_review') if existing_frame else 'pending_manual_review'
             vlm_qa_reason = existing_frame.get('vlm_qa_reason') if existing_frame else None
-            if current_quality_gate == 'i2i_fallback_degraded':
-                lineage_degraded = True
 
         rel_path = os.path.relpath(target_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
         
@@ -1646,7 +1787,11 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             'vlm_qa_reason': vlm_qa_reason,
             'parent_hash': p_hash,
         }
-        
+        # 锚点门写入的提示词指纹要在断点续传/整轮重放时保留，
+        # 否则下次 staged 调用会把已验过的首帧当作未验重新过门
+        if skip_api_call and existing_frame and existing_frame.get('anchor_prompt_sha256'):
+            frame_info['anchor_prompt_sha256'] = existing_frame['anchor_prompt_sha256']
+
         manifest_frames_by_seq[seq] = frame_info
         previous_path = target_path
         generated_count += 1
@@ -1661,7 +1806,8 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             on_progress('frame', {'frame': frame_info, 'current': generated_count, 'total': total_to_generate})
 
     manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
-    update_manifest_stale_status(manifest, project_dir)
+    update_manifest_stale_status(manifest, project_dir,
+                                 regenerated_sequences=target_sequences, finalize=True)
 
     manifest_path = os.path.join(project_dir, 'manifest.json')
     write_manifest(project_dir, manifest)
@@ -1677,15 +1823,41 @@ def _image_task_cancelled(task_id):
 
 
 def _finish_image_task(task_id, entry):
-    """写终态，但绝不覆盖用户已取消的状态。"""
+    """写终态，但绝不覆盖用户已取消的状态；保留 created_at 供前端算总用时。"""
     with IMAGE_TASKS_LOCK:
         current = IMAGE_TASKS.get(task_id)
         if current and current.get('status') == 'cancelled':
             return
+        if current and current.get('created_at') and 'created_at' not in entry:
+            entry = dict(entry, created_at=current['created_at'])
         IMAGE_TASKS[task_id] = entry
 
 
+def _set_image_task_stage(task_id, stage):
+    """更新图像站任务的当前阶段文案（前端实时生成动态轮询展示）。
+    只在任务仍 pending 时写入——终态/已取消不回退。"""
+    with IMAGE_TASKS_LOCK:
+        t = IMAGE_TASKS.get(task_id)
+        if t and t.get('status') == 'pending':
+            t['stage'] = stage
+            t['stage_at'] = time.time()
+
+
+def _image_task_upstream_sink(task_id):
+    """图像站任务的上游失败即时广播：每次尝试失败立刻写进 stage（含剩余重试信息），
+    状态接口的长轮询会在 ~50ms 内把它推给前端——上游秒报错，前端秒可见。"""
+    def _sink(ev):
+        if ev.get('retry_in'):
+            tail = f"，{ev['retry_in']}s 后自动重试（第 {ev['attempt']}/{ev['max_attempts']} 次）"
+        else:
+            tail = f"（第 {ev['attempt']}/{ev['max_attempts']} 次，已放弃重试）"
+        _set_image_task_stage(task_id, f"⚠️ 上游报错：{ev.get('error', '未知错误')}{tail}"[:300])
+    return _sink
+
+
 def _run_async_image_generation(task_id, base_url, api_key, payload):
+    # 每任务一条独立 daemon 线程，线程随任务结束销毁——sink 不需要显式清除
+    set_upstream_event_sink(_image_task_upstream_sink(task_id))
     try:
         import urllib.request
         import json
@@ -1704,7 +1876,10 @@ def _run_async_image_generation(task_id, base_url, api_key, payload):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         resp_bytes = _execute_request_with_retry(
             req, opener=opener, timeout=180,
-            cancel_check=lambda: _image_task_cancelled(task_id))
+            cancel_check=lambda: _image_task_cancelled(task_id),
+            on_attempt=lambda a, m: _set_image_task_stage(
+                task_id, '上游模型渲染中' if a == 1 else f'上游重试中（第 {a}/{m} 次尝试）'))
+        _set_image_task_stage(task_id, '渲染完成，图像落盘中')
         resp_data = json.loads(resp_bytes.decode('utf-8'))
         resp_data = _save_image_station_result(resp_data)
         _finish_image_task(task_id, {'status': 'completed', 'result': resp_data, 'error': None})
@@ -1721,6 +1896,8 @@ def _run_async_image_generation(task_id, base_url, api_key, payload):
 
 
 def _run_async_image_edit(task_id, base_url, api_key, body_data, boundary):
+    # 每任务一条独立 daemon 线程，线程随任务结束销毁——sink 不需要显式清除
+    set_upstream_event_sink(_image_task_upstream_sink(task_id))
     try:
         import urllib.request
         import json
@@ -1738,7 +1915,10 @@ def _run_async_image_edit(task_id, base_url, api_key, body_data, boundary):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         resp_bytes = _execute_request_with_retry(
             req, opener=opener, timeout=180,
-            cancel_check=lambda: _image_task_cancelled(task_id))
+            cancel_check=lambda: _image_task_cancelled(task_id),
+            on_attempt=lambda a, m: _set_image_task_stage(
+                task_id, '上游模型渲染中（图生图）' if a == 1 else f'上游重试中（第 {a}/{m} 次尝试）'))
+        _set_image_task_stage(task_id, '渲染完成，图像落盘中')
         resp_data = json.loads(resp_bytes.decode('utf-8'))
         resp_data = _save_image_station_result(resp_data)
         _finish_image_task(task_id, {'status': 'completed', 'result': resp_data, 'error': None})

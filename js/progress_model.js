@@ -34,8 +34,6 @@
         const d = dimensions || {};
         const explicit = String(d.type || '').trim();
         if (explicit) return explicit;
-        const theme = String(d.theme || '');
-        if (theme.startsWith('视频反推')) return 'reverse-video';
         return 'compose';
     }
 
@@ -101,18 +99,6 @@
             label = messageFrom(details, '生成失败');
             status = 'failed';
             phase = 'error';
-        } else if (stage === 'keyframe_extraction') {
-            percent = 15;
-            label = messageFrom(details, '正在提取视频关键帧...');
-        } else if (stage === 'cv_analysis') {
-            percent = 40;
-            label = messageFrom(details, '正在分析运动与光照变化...');
-        } else if (stage === 'semantic_metadata') {
-            percent = 70;
-            label = messageFrom(details, '正在进行多模态时序语义分析...');
-        } else if (stage === 'prompt_composition') {
-            percent = 90;
-            label = messageFrom(details, '正在合成反推提示词...');
         }
 
         return { phase, label, percent, current, total, slot, status };
@@ -146,6 +132,23 @@
             percent = Math.max(state.percent, 5);
             label = slot ? `IMG ${String(slot).padStart(3, '0')} 质检重试${attempt ? ` ${attempt}` : ''}` : '图片质检重试中';
             if (reason) label += `：${reason}`;
+            status = 'retrying';
+        } else if (stage === 'upstream_retry') {
+            // 上游失败即时广播（毫秒级）：区别于 frame_retry（质检不过重生），
+            // 这是 HTTP 层报错后的自动退避重试
+            const attempt = details && details.attempt;
+            const maxA = details && details.max_attempts;
+            percent = Math.max(state.percent, 5);
+            label = `上游报错，自动重试中${attempt ? `（第 ${attempt}/${maxA || '?'} 次）` : ''}`;
+            status = 'retrying';
+        } else if (stage === 'frame_qa') {
+            percent = Math.max(state.percent, 5);
+            label = slot ? `IMG ${String(slot).padStart(3, '0')} 质检判定中` : '质检判定中';
+            status = 'active';
+        } else if (stage === 'model_fallback') {
+            const fbModel = details && details.to;
+            percent = Math.max(state.percent, 5);
+            label = `主模型配额耗尽，兜底模型${fbModel ? ` ${fbModel}` : ''}渲染中`;
             status = 'retrying';
         } else if (stage === 'frame') {
             current = Number(details && details.current) || 0;

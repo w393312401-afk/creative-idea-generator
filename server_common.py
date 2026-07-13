@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import socket
+import shutil
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -156,6 +157,32 @@ ALLOW_CLIENT_MODEL = SERVER_CONFIG.get('allowClientModel', True) is not False
 ACCESS_CODE = (SERVER_CONFIG.get('accessCode') or '').strip()
 
 
+def strict_gates_enabled(config=None):
+    """视觉门禁 fail-closed 开关（server_config.json 的 strictGates / 环境变量
+    SPARK_STRICT_GATES）。默认关闭：判定服务异常时放行但在 manifest 留痕
+    （auto_approved_degraded）；开启后判定服务异常按判定失败处理。"""
+    if isinstance(config, dict) and config.get('strictGates') is not None:
+        return bool(config.get('strictGates'))
+    return bool(SERVER_CONFIG.get('strictGates') or os.environ.get('SPARK_STRICT_GATES'))
+
+
+QA_GATE_LEVELS = ('standard', 'lenient', 'off')
+
+
+def qa_gate_level(config=None):
+    """帧质检门档位（请求 config 的 qaGateLevel > server_config.json > 环境变量
+    SPARK_QA_GATE_LEVEL）。standard=现有全量质检；lenient=只拦硬伤（无变化/换场景/
+    出现人物机械/文字水印），构图视角漂移等降级为警告放行，且停用跨帧地标漂移复查；
+    off=视觉门全部跳过（manifest 记 auto_approved_degraded 留痕）。非法值回退 standard。"""
+    raw = None
+    if isinstance(config, dict) and config.get('qaGateLevel'):
+        raw = config.get('qaGateLevel')
+    else:
+        raw = SERVER_CONFIG.get('qaGateLevel') or os.environ.get('SPARK_QA_GATE_LEVEL')
+    level = str(raw).strip().lower() if raw else 'standard'
+    return level if level in QA_GATE_LEVELS else 'standard'
+
+
 def _int_setting(env_key, cfg_key, default):
     """数值配置的容错解析：非法值给出中文告警并回退默认，而不是 import 时崩掉整个服务。"""
     raw = os.environ.get(env_key, SERVER_CONFIG.get(cfg_key, default))
@@ -173,15 +200,22 @@ RATE_WINDOW = _int_setting('SPARK_RATE_WINDOW', 'rateWindow', 3600)
 PORT = _int_setting('PORT', 'port', 8085)
 DB_FILE = 'library.json'
 OUTPUT_ROOT = 'outputs'
+# 2026-07-12: 旧版要求 "smallest localized edit"，与"每拍必须有全画幅阶段变化"的产品方向
+# 直接对抗——提示词写了大变换、控制指令又叫模型最小化改动，结果就是整单"挤牙膏"式微小
+# 变化。现改为：相机/几何/锚点绝对锁定，但阶段变换本身必须完整执行、覆盖其全部可见范围。
 IMG2IMG_CONTROL_PROMPT = (
     "IMAGE EDITING MODE. The attached previous frame is the authoritative source image, "
-    "not a loose style reference. Preserve its exact camera position, lens, crop, horizon, "
-    "perspective, boundaries, structural geometry, object positions, background, and every "
-    "unchanged pixel-level detail. The target-state description below may repeat the whole "
-    "scene only to identify continuity; do not redraw or redesign the scene from that text. "
-    "Make the smallest localized edit required to reach the next construction state. "
-    "Do not add grid lines, guides, labels, letters, numbers, percentages, captions, text, "
-    "watermarks, extra people, or active machinery. Return one clean edited image only."
+    "not a loose style reference. Keep the camera ABSOLUTELY locked: exact camera position, "
+    "lens, crop, horizon, perspective, frame boundaries, structural geometry, and the "
+    "positions/scales of all locked anchor landmarks must match the source frame precisely. "
+    "Within that locked framing, EXECUTE THE FULL STAGE TRANSFORMATION the description "
+    "specifies: apply the described construction change across its entire visible extent — "
+    "every surface and region the description says has changed must visibly change. Do NOT "
+    "minimize, shrink, or token-patch the edit; the result must read as a completed "
+    "construction stage clearly different from the source frame, while everything the "
+    "description does not change stays pixel-faithful. Do not add grid lines, guides, labels, "
+    "letters, numbers, percentages, captions, text, watermarks, extra people, or active "
+    "machinery. Return one clean edited image only."
 )
 IMG2IMG_BRIDGE_CONTROL_PROMPT = (
     "IMAGE EDITING MODE (CAMERA MOVEMENT ACTIVE). The attached previous frame is the authoritative "
@@ -189,8 +223,9 @@ IMG2IMG_BRIDGE_CONTROL_PROMPT = (
     "materials, light source angles, and structural features. However, the camera viewpoint is "
     "actively advancing forward in a controlled camera-move / push-in (the camera perspective is "
     "shifting closer along the central axis). Shift object placement, horizon, and perspective boundaries "
-    "according to correct optical flow and 3D depth parallax. Make the smallest localized edits to "
-    "reveal newly exposed details at the margins while preserving the core content of the scene. "
+    "according to correct optical flow and 3D depth parallax, and render the advanced viewpoint "
+    "fully and decisively — inherited landmarks scale up naturally, newly exposed margins are "
+    "filled with coherent detail; do not shrink the camera advance into a timid crop. "
     "Do not add extra objects, active machinery, or workers. Return one clean edited image only."
 )
 SKILL_DIR = os.environ.get(
@@ -224,8 +259,9 @@ def effective_config(client_config):
     if SERVER_CONFIG.get('imageEditFallbackModel'):
         merged['imageEditFallbackModel'] = SERVER_CONFIG.get('imageEditFallbackModel')
     # cheapModel/auxModel 此前在托管模式下被静默丢弃（example 配置里承诺了
-    # cheapModel）——与已修复过的 imageEditFallbackModel 漏传属同一类 bug
-    for k in ('geminiDirectApiKey', 'geminiApiKey', 'geminiDirectImageModel', 'cheapModel', 'auxModel'):
+    # cheapModel）——与已修复过的 imageEditFallbackModel 漏传属同一类 bug；
+    # realityCheckpointInterval（帧链现实同步检查点间隔）同批透传，防复刻同类静默失效
+    for k in ('geminiDirectApiKey', 'geminiApiKey', 'geminiDirectImageModel', 'cheapModel', 'auxModel', 'realityCheckpointInterval'):
         if SERVER_CONFIG.get(k):
             merged[k] = SERVER_CONFIG.get(k)
     if ALLOW_CLIENT_MODEL:
@@ -238,7 +274,7 @@ def effective_config(client_config):
         for k in ('cheapModel', 'auxModel'):
             if client_config.get(k):
                 merged[k] = client_config[k]
-    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'googleFxIpRotateRequests'):
+    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'googleFxIpRotateRequests', 'qaGateLevel', 'realityCheckpointInterval', 'supervisedMode', 'reviewTimeoutSeconds'):
         if client_config.get(k):
             merged[k] = client_config[k]
     for k in ('geminiDirectApiKey', 'geminiApiKey', 'geminiDirectImageModel'):
@@ -309,7 +345,7 @@ def _get_project_dir(title):
 
     # 4. Default to new naming scheme path if neither exists (for creation)
     return new_dir
-        
+
     # 2. Try old naming scheme
     old_raw = (title or 'spark_frames').strip()
     old_raw = re.sub(r'[\\/:*?"<>|]+', '_', old_raw)
@@ -318,14 +354,355 @@ def _get_project_dir(title):
     old_dir = os.path.join(OUTPUT_ROOT, old_name)
     if os.path.exists(old_dir):
         return old_dir
-        
+
     # 3. Default to new naming scheme path if neither exists (for creation)
     return new_dir
 
 
+def delete_idea_output_files(title, covers=None):
+    """Best-effort purge of everything a generated idea left on disk: its whole
+    project directory (frames/videos/manifest under outputs/<project>/) plus any
+    standalone cover images (outputs/covers/*.webp) referenced by a saved idea.
+    Deleting the task/library record alone leaves these behind as orphan files,
+    so this must be called from both the task-delete and library-delete endpoints.
+    """
+    deleted = {"project_dir": None, "covers": []}
+
+    if title:
+        try:
+            project_dir = _get_project_dir(title)
+            if project_dir and os.path.isdir(project_dir):
+                shutil.rmtree(project_dir, ignore_errors=True)
+                deleted["project_dir"] = project_dir
+        except Exception as e:
+            if sys.stdout:
+                print(f"[DELETE] Failed to remove project dir for '{title}': {e}")
+
+    output_root_abs = os.path.abspath(OUTPUT_ROOT)
+    for cover_url in (covers or []):
+        if not isinstance(cover_url, str):
+            continue
+        rel = cover_url.lstrip('/')
+        # Only ever touch files SPARK itself served out of outputs/ — never an
+        # external/data URI, and never anything that normalizes outside outputs/.
+        if not (rel == OUTPUT_ROOT or rel.startswith(OUTPUT_ROOT + '/')):
+            continue
+        cover_path = os.path.abspath(rel)
+        if not (cover_path == output_root_abs or cover_path.startswith(output_root_abs + os.sep)):
+            continue
+        try:
+            if os.path.isfile(cover_path):
+                os.remove(cover_path)
+                deleted["covers"].append(cover_path)
+        except Exception as e:
+            if sys.stdout:
+                print(f"[DELETE] Failed to remove cover '{cover_path}': {e}")
+
+    return deleted
+
+
+# --- Gallery (画廊) helpers ---
+# 画廊只认这两类扩展名：既是扫描的准入名单，也是删除接口的白名单——
+# manifest.json / 检查点等非媒体文件永远不会被画廊接口碰到。
+GALLERY_IMAGE_EXTS = ('.webp', '.png', '.jpg', '.jpeg', '.gif', '.bmp')
+GALLERY_VIDEO_EXTS = ('.mp4', '.webm', '.mov', '.m4v')
+
+# outputs/ 下这两个一级目录不是"项目"：covers 是全局封面池，image-station 是
+# 图像工坊的出图历史。它们没有 manifest，删除后也不做项目级清理/同步。
+GALLERY_SPECIAL_DIRS = ('covers', 'image-station')
+
+
+def _gallery_media_type(name):
+    ext = os.path.splitext(name)[1].lower()
+    if ext in GALLERY_IMAGE_EXTS:
+        return 'image'
+    if ext in GALLERY_VIDEO_EXTS:
+        return 'video'
+    return None
+
+
+def _gallery_item(abs_path, base_dir, kind):
+    st = os.stat(abs_path)
+    rel = os.path.relpath(abs_path, base_dir).replace('\\', '/')
+    return {
+        'name': os.path.basename(abs_path),
+        'path': rel,
+        'url': '/' + rel,
+        'type': _gallery_media_type(abs_path),
+        'kind': kind,
+        'size': st.st_size,
+        'mtime': int(st.st_mtime),
+    }
+
+
+# 项目目录最近 24 小时内有产出时不标孤儿：正在生成中的项目（compose 已挂但
+# staged 帧渲染还在跑等竞态）引用关系可能还没落到 library/tasks 里
+GALLERY_ORPHAN_GRACE_SECONDS = 24 * 3600
+
+
+def _gallery_title_names(title):
+    """一个标题在历代目录命名方案下的全部候选目录名（与 _get_project_dir 的
+    三种方案一一对应，外加曾经存在过的截断变体）。用于引用判定，从宽收集。"""
+    if not isinstance(title, str) or not title.strip():
+        return set()
+    names = {_safe_project_name(title), _legacy_ascii_project_name(title)}
+    old_raw = title.strip()
+    old_raw = re.sub(r'[\\/:*?"<>|]+', '_', old_raw)
+    old_raw = re.sub(r'\s+', '_', old_raw)
+    if old_raw:
+        names.add(old_raw)
+        trimmed = old_raw.strip('._-')[:60]
+        if trimmed:
+            names.add(trimmed)
+    return names
+
+
+def gallery_collect_references(library_items=None, tasks=None):
+    """从 library.json 与任务持久层收集"被引用"的封面文件与项目目录名。
+
+    判定刻意从宽：title/english_title/frameRun 标题与文件路径/staged 任务的
+    theme、所有命名方案变体都算引用——宁可漏标孤儿，绝不能把在用资产标成孤儿
+    （孤儿标记是画廊批量清理的入口，误标的代价是用户删掉活资产）。
+    library_items/tasks 传 None 时从真实数据源读取；测试传显式列表。
+    """
+    cover_paths = set()
+    project_names = set()
+
+    def add_cover(u):
+        if not isinstance(u, str):
+            return
+        rel = u.replace('\\', '/').lstrip('/')
+        if rel.startswith(OUTPUT_ROOT + '/'):
+            cover_paths.add(rel)
+
+    def add_title(t):
+        project_names.update(_gallery_title_names(t))
+
+    def add_path_project(p):
+        if not isinstance(p, str):
+            return
+        parts = p.replace('\\', '/').lstrip('/').split('/')
+        if len(parts) >= 2 and parts[0] == OUTPUT_ROOT and parts[1] not in GALLERY_SPECIAL_DIRS:
+            project_names.add(parts[1])
+
+    def eat_record(rec):
+        if not isinstance(rec, dict):
+            return
+        for u in (rec.get('covers') or []):
+            add_cover(u)
+        add_cover(rec.get('collage_url'))
+        add_title(rec.get('title'))
+        add_title(rec.get('english_title'))
+        fr = rec.get('frameRun')
+        if isinstance(fr, dict):
+            add_title(fr.get('title'))
+            for coll in ('frames', 'videos'):
+                for e in (fr.get(coll) or []):
+                    if isinstance(e, dict):
+                        add_path_project(e.get('url'))
+                        add_path_project(e.get('file'))
+
+    if library_items is None:
+        library_items = []
+        with LIBRARY_LOCK:
+            if os.path.exists(DB_FILE):
+                try:
+                    with open(DB_FILE, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    if isinstance(data, list):
+                        library_items = data
+                except Exception:
+                    pass
+    for item in (library_items or []):
+        eat_record(item)
+
+    if tasks is None:
+        with ACTIVE_TASKS_LOCK:
+            tasks = [
+                {'dimensions': t.get('dimensions'), 'result': t.get('result')}
+                for t in ACTIVE_TASKS.values()
+            ]
+    for t in (tasks or []):
+        if not isinstance(t, dict):
+            continue
+        eat_record(t.get('result'))
+        dims = t.get('dimensions')
+        if isinstance(dims, dict):
+            # staged_render 任务的 theme 就是项目标题；compose 任务的 theme 是
+            # 场景主题，多收一个引用无害（从宽原则）
+            add_title(dims.get('theme'))
+
+    return {'cover_paths': cover_paths, 'project_names': project_names}
+
+
+def scan_gallery(base_dir=None, refs=None):
+    """扫描 outputs/ 下全部历史媒体资产，按来源分组返回（画廊页数据源）。
+
+    分组：covers（封面池）、image-station（图像工坊出图）、以及每个项目目录一组
+    （frames/ 帧序列 + videos/ 分段视频 + 项目根的合成视频）。项目根下的插帧中间
+    产物目录（*_frames，成百上千张 jpg）不属于用户资产，不进画廊。
+
+    refs 传 gallery_collect_references() 的返回值时做引用标注：封面 item 加
+    in_use（被点子库/任务引用），项目组加 orphan（无任何引用且超过活跃宽限期）。
+    refs=None 时不加任何标注字段（前端按无标注降级展示）。
+    """
+    base_dir = base_dir or os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.join(base_dir, OUTPUT_ROOT)
+    groups = []
+    totals = {'images': 0, 'videos': 0, 'bytes': 0}
+
+    def collect_dir(dpath, kind, only_type=None):
+        items = []
+        if not os.path.isdir(dpath):
+            return items
+        for fname in sorted(os.listdir(dpath)):
+            fpath = os.path.join(dpath, fname)
+            if not os.path.isfile(fpath):
+                continue
+            mtype = _gallery_media_type(fname)
+            if mtype is None or (only_type and mtype != only_type):
+                continue
+            try:
+                items.append(_gallery_item(fpath, base_dir, kind))
+            except OSError:
+                continue
+        return items
+
+    def add_group(key, title, gkind, items):
+        if not items:
+            return
+        items.sort(key=lambda it: it['mtime'], reverse=True)
+        gbytes = sum(it['size'] for it in items)
+        for it in items:
+            totals['images' if it['type'] == 'image' else 'videos'] += 1
+        totals['bytes'] += gbytes
+        groups.append({
+            'key': key,
+            'title': title,
+            'kind': gkind,
+            'items': items,
+            'bytes': gbytes,
+            'latest_mtime': items[0]['mtime'],
+        })
+
+    if not os.path.isdir(out_dir):
+        return {'groups': [], 'totals': totals}
+
+    cover_items = collect_dir(os.path.join(out_dir, 'covers'), 'cover', only_type='image')
+    if refs is not None:
+        for it in cover_items:
+            it['in_use'] = it['path'] in refs['cover_paths']
+    add_group('covers', '封面图片', 'covers', cover_items)
+    add_group('image-station', '图像工坊', 'studio',
+              collect_dir(os.path.join(out_dir, 'image-station'), 'studio', only_type='image'))
+
+    now = time.time()
+    for name in sorted(os.listdir(out_dir)):
+        if name in GALLERY_SPECIAL_DIRS:
+            continue
+        pdir = os.path.join(out_dir, name)
+        if not os.path.isdir(pdir):
+            continue
+        items = collect_dir(os.path.join(pdir, 'frames'), 'frame')
+        items += collect_dir(os.path.join(pdir, 'videos'), 'video', only_type='video')
+        # 项目根：合成视频（含 _2x/_配音字幕 等成品）与零散图片
+        items += collect_dir(pdir, 'merged', only_type='video')
+        items += collect_dir(pdir, 'other', only_type='image')
+        add_group(name, name, 'project', items)
+        if refs is not None and items:
+            g = groups[-1]
+            g['orphan'] = (name not in refs['project_names']
+                           and g['latest_mtime'] < now - GALLERY_ORPHAN_GRACE_SECONDS)
+
+    # 最近有动静的组排最前（covers/image-station 也参与排序）
+    groups.sort(key=lambda g: g['latest_mtime'], reverse=True)
+    return {'groups': groups, 'totals': totals}
+
+
+def _project_dir_has_gallery_media(pdir):
+    """项目目录里是否还剩"画廊可见"的媒体：frames/ 任意媒体、videos/ 视频、
+    项目根的图片/视频。与 scan_gallery 的收集范围一一对应——插帧中间产物
+    （*_2x_frames 等隐藏产物）刻意不算数，否则"删除本组"后文件夹永远删不掉，
+    留下带残渣的空壳。"""
+    frames_dir = os.path.join(pdir, 'frames')
+    if os.path.isdir(frames_dir):
+        for f in os.listdir(frames_dir):
+            if _gallery_media_type(f) and os.path.isfile(os.path.join(frames_dir, f)):
+                return True
+    videos_dir = os.path.join(pdir, 'videos')
+    if os.path.isdir(videos_dir):
+        for f in os.listdir(videos_dir):
+            if _gallery_media_type(f) == 'video' and os.path.isfile(os.path.join(videos_dir, f)):
+                return True
+    for f in os.listdir(pdir):
+        if _gallery_media_type(f) and os.path.isfile(os.path.join(pdir, f)):
+            return True
+    return False
+
+
+def gallery_delete_files(paths, base_dir=None):
+    """删除 outputs/ 内指定的媒体文件（画廊删除接口的后端）。
+
+    安全边界：只接受规范化后仍落在 outputs/ 内、且扩展名在媒体白名单内的路径；
+    目录、manifest、越界路径一律进 failed 而不是抛异常。项目目录删到不再有
+    画廊可见媒体时，整个项目文件夹（含 manifest、插帧中间产物等隐藏残留）一并
+    rmtree——"删除本组"的预期就是文件夹也消失。
+    返回 affected_project_dirs（仍存活、需要重同步 manifest 的项目目录绝对路径），
+    manifest 同步函数在 server.py 里，由调用方负责执行。
+    """
+    base_dir = base_dir or os.path.dirname(os.path.abspath(__file__))
+    out_root_abs = os.path.abspath(os.path.join(base_dir, OUTPUT_ROOT))
+    result = {'deleted': [], 'failed': [], 'affected_project_dirs': [], 'removed_project_dirs': []}
+    touched = set()
+
+    for raw in (paths or []):
+        if not isinstance(raw, str) or not raw.strip():
+            result['failed'].append({'path': str(raw), 'error': '无效路径'})
+            continue
+        rel = raw.replace('\\', '/').lstrip('/')
+        abs_p = os.path.abspath(os.path.join(base_dir, rel))
+        if not abs_p.startswith(out_root_abs + os.sep):
+            result['failed'].append({'path': raw, 'error': '路径不在 outputs/ 内'})
+            continue
+        if _gallery_media_type(abs_p) is None:
+            result['failed'].append({'path': raw, 'error': '仅允许删除图片/视频文件'})
+            continue
+        if not os.path.isfile(abs_p):
+            result['failed'].append({'path': raw, 'error': '文件不存在'})
+            continue
+        try:
+            os.remove(abs_p)
+            result['deleted'].append(rel)
+            top = os.path.relpath(abs_p, out_root_abs).replace('\\', '/').split('/')[0]
+            if top not in GALLERY_SPECIAL_DIRS:
+                touched.add(os.path.join(out_root_abs, top))
+        except Exception as e:
+            result['failed'].append({'path': raw, 'error': str(e)})
+
+    for pdir in sorted(touched):
+        if not os.path.isdir(pdir):
+            continue
+        if _project_dir_has_gallery_media(pdir):
+            result['affected_project_dirs'].append(pdir)
+        else:
+            shutil.rmtree(pdir, ignore_errors=True)
+            result['removed_project_dirs'].append(pdir)
+    return result
+
+
 # --- Task Management State and Helpers ---
+class GenerationCancelled(ConnectionError):
+    """用户取消生成任务的专用信号。继承 ConnectionError 以兼容既有的
+    `except ConnectionError → cancelled` worker 收尾逻辑，但可以被
+    _chat 的流式回调、各重试循环精确识别后直接放行（不吞掉、不重试、
+    不降级成一次全新的非流式请求）。"""
+
+
 PACKET_CACHE_LOCK = threading.RLock()
 PROCESS_BRIEF_CACHE_LOCK = threading.RLock()
+# 提示词合成断点续传(compose_checkpoints.json)专用锁,见 prompt_pipeline 的
+# save_compose_checkpoint/load_compose_checkpoint
+COMPOSE_CHECKPOINT_LOCK = threading.RLock()
 ACTIVE_TASKS = {}
 ACTIVE_TASKS_LOCK = threading.RLock()
 
@@ -429,6 +806,11 @@ def save_tasks_to_disk():
 
         # 清理必须留在同一把锁内：旧写法在锁外用过期快照删文件，
         # 期间其他线程新建的任务文件会被当成孤儿误删
+        # 2026-07-12 防呆：内存任务表为空时一律跳过清理——空内存 + 磁盘有任务文件
+        # 意味着本实例没有(或还没)加载历史任务（启动竞态/加载失败/幽灵实例），此时
+        # “孤儿清理”会把全部任务历史当垃圾删光（实际发生过一次，tasks/ 被整目录清空）。
+        if not active_ids:
+            return
         try:
             for filename in os.listdir("tasks"):
                 if filename.endswith(".json"):
@@ -525,6 +907,49 @@ def get_or_create_task(task_id, dimensions=None):
     if save_on_create:
         save_tasks_to_disk()
     return ACTIVE_TASKS[task_id]
+
+
+def prepare_task_for_run(task_id, dimensions=None):
+    """为一次生成运行准备任务记录，返回 (task, already_running)。
+
+    与 get_or_create_task 的区别：重试复用旧 task_id 时，终态记录
+    （failed/cancelled/completed）被原地重置后复用——重试覆盖被重试的
+    那条任务记录，而不是留下失败记录再另开一条新记录。
+
+    - 记录不存在 → 新建（等价 get_or_create_task）
+    - 记录存在且 running → 原样返回 already_running=True：调用方不得再起
+      第二个 worker（连点重试只是重新挂回同一条流）
+    - 记录存在且终态 → 清空 events/result/error、换新 cancel_event 后复用；
+      listeners 保留，仍挂着的旁观流会直接收到新一轮运行的事件
+    """
+    with ACTIVE_TASKS_LOCK:
+        t = ACTIVE_TASKS.get(task_id)
+        if t is not None and t["status"] == "running":
+            return t, True
+        if t is None:
+            t = {
+                "id": task_id,
+                "status": "running",
+                "events": [],
+                "listeners": set(),
+                "cancel_event": threading.Event(),
+                "dimensions": dimensions,
+                "result": None,
+                "error": None,
+                "last_active": time.time()
+            }
+            ACTIVE_TASKS[task_id] = t
+        else:
+            t["status"] = "running"
+            t["events"] = []
+            t["cancel_event"] = threading.Event()
+            t["result"] = None
+            t["error"] = None
+            t["last_active"] = time.time()
+            if dimensions is not None:
+                t["dimensions"] = dimensions
+    save_tasks_to_disk()
+    return t, False
 
 
 def notify_listeners(task_id, event_type, data):

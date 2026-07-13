@@ -74,6 +74,8 @@ class TestPlanVideoSlots(_TmpDirCase):
         self.assertEqual(plans[1]['prompt'], 'move from IMAGE 1 to IMAGE 2')
 
     def test_breakpoint_resume_reuses_existing_video(self):
+        # 默认 verify_fn=None -> 真实 verify_video_anchors；对着 _touch() 出的假 mp4
+        # 提不出真帧，非严格模式下按 fail-open 处理，仍旧复用（不依赖真实 ffmpeg 环境）。
         frames = self._make_frames(4)
         self._touch(os.path.join(self.videos_dir, 'vid_002.mp4'))
         plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir)
@@ -84,6 +86,32 @@ class TestPlanVideoSlots(_TmpDirCase):
         self._touch(os.path.join(self.videos_dir, 'vid_002.mp4'), content=b'')
         plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir)
         self.assertEqual(plans[1]['action'], 'generate')
+
+    def test_stale_video_is_not_reused_and_gets_deleted(self):
+        # 起止帧在上一轮失败后被单独重渲，旧片段这时已过期：verify_fn 判定不符时
+        # 不得复用，应转入重新生成并标记删除旧文件（呼应 spark-video-mixup-postmortem）。
+        frames = self._make_frames(4)
+        self._touch(os.path.join(self.videos_dir, 'vid_002.mp4'))
+        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
+                                  verify_fn=lambda *a, **k: (False, 'mismatch'))
+        self.assertEqual(plans[1]['action'], 'generate')
+        self.assertTrue(plans[1]['delete_existing'])
+        self.assertIn('mismatch', plans[1]['reason'])
+
+    def test_reuse_check_passes_dest_start_end_and_strict(self):
+        frames = self._make_frames(4)
+        dest = self._touch(os.path.join(self.videos_dir, 'vid_002.mp4'))
+        calls = []
+
+        def fake_verify(video_path, start, end, strict=False):
+            calls.append((video_path, start, end, strict))
+            return True, 'ok'
+
+        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
+                                  strict=True, verify_fn=fake_verify)
+        self.assertEqual(plans[1]['action'], 'reuse')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], (dest, frames[2], frames[3], True))
 
     def test_explicit_retry_targets_and_marks_delete(self):
         frames = self._make_frames(4)
@@ -108,6 +136,36 @@ class TestPlanVideoSlots(_TmpDirCase):
         self.assertEqual([p['action'] for p in plans], ['generate', 'blocked', 'blocked'])
         self.assertIn('降级帧', plans[1]['reason'])
 
+    def test_vlm_qa_failed_frame_blocks_pairing(self):
+        # 2026-07-12 前该缺陷曾让 16/16 视频盖着 4 张已知坏帧生成
+        frames = self._make_frames(4)
+        quality = {3: 'vlm_qa_failed'}
+        plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                  gate_level='standard')
+        self.assertEqual([p['action'] for p in plans], ['generate', 'blocked', 'blocked'])
+        self.assertIn('vlm_qa_failed', plans[1]['reason'])
+        # lenient 档同样拦（该档下 vlm_qa_failed 只会由硬伤产生）
+        plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                  gate_level='lenient')
+        self.assertEqual(plans[1]['action'], 'blocked')
+        # off 档放行（质检整体停用时不做事后拦截）
+        plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                  gate_level='off')
+        self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
+
+    def test_stale_lineage_blocks_standard_warns_lenient(self):
+        frames = self._make_frames(4)
+        stale = {3}
+        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
+                                  gate_level='standard', stale_slots=stale)
+        self.assertEqual([p['action'] for p in plans], ['generate', 'blocked', 'blocked'])
+        self.assertIn('血统过期', plans[1]['reason'])
+        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
+                                  gate_level='lenient', stale_slots=stale)
+        self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
+        self.assertIn('旧 i2i 链', plans[1]['warning'])
+        self.assertNotIn('warning', plans[0])
+
 
 class TestLoadSlotFrames(_TmpDirCase):
     def test_fallback_guesses_by_naming_convention(self):
@@ -125,6 +183,54 @@ class TestLoadSlotFrames(_TmpDirCase):
         self.assertEqual(sorted(slot_to_path.keys()), [1, 2])
         self.assertEqual(quality[2], 'i2i_fallback_degraded')
         self.assertTrue(slot_to_path[1].replace('\\', '/').endswith('outputs/p/frames/img_001.webp'))
+
+
+class TestStaleLineage(_TmpDirCase):
+    """部分重生帧的 i2i 血统标记：frame_generator.update_manifest_stale_status 写、
+    video_generator.load_stale_slots 读。"""
+
+    def _manifest(self, n):
+        return {'frames': [
+            {'slot': i, 'sequence': i, 'file': f'/outputs/p/frames/img_{i:03d}.webp'}
+            for i in range(1, n + 1)
+        ]}
+
+    def test_partial_regen_marks_downstream(self):
+        from frame_generator import update_manifest_stale_status
+        from video_generator import load_stale_slots
+        manifest = self._manifest(6)
+        update_manifest_stale_status(manifest, self.tmp, regenerated_sequences=[3], finalize=True)
+        self.assertEqual(load_stale_slots(manifest), {4, 5, 6})
+        # 上游帧（1、2）与被重生帧本身（3）不受影响
+        self.assertNotIn('stale_lineage', manifest['frames'][0])
+        self.assertNotIn('stale_lineage', manifest['frames'][2])
+
+    def test_full_regen_clears_all_marks(self):
+        from frame_generator import update_manifest_stale_status
+        from video_generator import load_stale_slots
+        manifest = self._manifest(4)
+        update_manifest_stale_status(manifest, self.tmp, regenerated_sequences=[2], finalize=True)
+        self.assertEqual(load_stale_slots(manifest), {3, 4})
+        update_manifest_stale_status(manifest, self.tmp, regenerated_sequences=None, finalize=True)
+        self.assertEqual(load_stale_slots(manifest), set())
+
+    def test_downstream_regen_clears_its_own_mark(self):
+        from frame_generator import update_manifest_stale_status
+        from video_generator import load_stale_slots
+        manifest = self._manifest(5)
+        update_manifest_stale_status(manifest, self.tmp, regenerated_sequences=[2], finalize=True)
+        self.assertEqual(load_stale_slots(manifest), {3, 4, 5})
+        # 用户顺序重渲 3-5 → 全部清除
+        update_manifest_stale_status(manifest, self.tmp, regenerated_sequences=[3, 4, 5], finalize=True)
+        self.assertEqual(load_stale_slots(manifest), set())
+
+    def test_non_finalize_call_keeps_old_behavior(self):
+        from frame_generator import update_manifest_stale_status
+        manifest = dict(self._manifest(3), merged_video='x', videos=[{'slot': 1}])
+        update_manifest_stale_status(manifest, self.tmp)
+        self.assertNotIn('merged_video', manifest)
+        self.assertEqual(manifest['videos'], [])
+        self.assertTrue(all('stale_lineage' not in f for f in manifest['frames']))
 
 
 class TestManifestWriter(_TmpDirCase):

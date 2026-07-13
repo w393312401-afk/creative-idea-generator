@@ -482,3 +482,101 @@
     }
 }
 
+
+/* ── 帧序列实时生成动态（gen-live-feed）──────────────────────────────
+   生成过程在模块内滚动直播；帧序列任务不再进任务列表抽屉。 */
+.gen-live-feed {
+    margin: 12px 0;
+    border: 1px solid rgba(var(--ink-rgb), 0.12);
+    border-radius: 10px;
+    background: rgba(var(--panel-rgb), 0.5);
+    overflow: hidden;
+}
+
+.gen-live-feed-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    border-bottom: 1px solid rgba(var(--ink-rgb), 0.08);
+}
+
+.gen-feed-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: rgba(var(--ink-rgb), 0.25);
+}
+
+.gen-feed-dot.active {
+    background: #10b981;
+    animation: genFeedDotPulse 1.6s infinite;
+}
+
+@keyframes genFeedDotPulse {
+    0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.45); }
+    70% { box-shadow: 0 0 0 7px rgba(16, 185, 129, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+
+.gen-live-feed-lines {
+    padding: 8px 12px;
+    max-height: 180px;
+    overflow-y: auto;
+    scroll-behavior: smooth;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 0.72rem;
+    line-height: 1.7;
+    color: var(--text-secondary);
+}
+
+.gen-feed-line { word-break: break-all; }
+.gen-feed-line.ok { color: #10b981; }
+.gen-feed-line.warn { color: #d97706; }
+.gen-feed-line.err { color: #ef4444; }
+
+.gen-feed-time {
+    color: rgba(var(--ink-rgb), 0.45);
+    font-variant-numeric: tabular-nums;
+    margin-right: 4px;
+}
+
+/* ── 帧序列模块内嵌生图模型选择器 ─────────────────────────────────── */
+.frames-model-picker {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+.frames-model-picker label {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.frames-model-picker select {
+    padding: 6px 10px;
+    font-size: 0.8rem;
+    border-radius: 8px;
+    border: 1px solid rgba(var(--ink-rgb), 0.18);
+    background: rgba(var(--panel-rgb), 0.7);
+    color: var(--text-primary);
+    cursor: pointer;
+    max-width: 240px;
+}
+
+.frames-model-picker select:hover {
+    border-color: rgba(var(--ink-rgb), 0.35);
+}
+
+@media (max-width: 768px) {
+    .frames-model-picker {
+        margin-left: 0;
+    }
+}

@@ -463,15 +463,23 @@
 .loading-steps li::before {
     content: "○";
     font-weight: bold;
+    transition: var(--transition-fast);
 }
 
+/* Not reached yet: dim, no glow. */
 .loading-steps li.pending {
-    color: var(--text-secondary);
+    color: var(--text-muted);
 }
-.loading-steps li.pending::before {
+
+/* Currently in progress: the one step that should draw the eye. */
+.loading-steps li.active {
+    color: var(--text-primary);
+}
+.loading-steps li.active::before {
     content: "●";
     color: var(--neon-cyan);
     text-shadow: 0 0 5px var(--neon-cyan);
+    animation: flash 0.9s ease-in-out infinite alternate;
 }
 
 .loading-steps li.completed {
@@ -484,6 +492,72 @@
 }
 
 /* Live Output Terminal */
+/* Live Beat Prompts (progressive per-beat reveal during compose) — mirrors the raw
+   markdown prompt block the final result view shows, but grows one beat at a time as
+   each on_progress('beat_ready', ...) event arrives. */
+.live-beats-panel {
+    width: 100%;
+    max-width: 550px;
+    background: rgba(4, 6, 12, 0.85);
+    border: 1px solid var(--neon-cyan-glow);
+    border-radius: 10px;
+    margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 0 20px rgba(176, 123, 82, 0.1), inset 0 0 15px rgba(176, 123, 82, 0.05);
+}
+
+.live-beats-header {
+    background: rgba(var(--panel-rgb), 0.9);
+    border-bottom: 1px solid rgba(var(--ink-rgb), 0.04);
+    padding: 8px 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--text-secondary);
+}
+
+.live-beats-header span:last-child {
+    font-family: monospace;
+    color: var(--neon-cyan);
+    text-shadow: 0 0 4px var(--neon-cyan-glow);
+}
+
+.live-beats-body {
+    margin: 0;
+    padding: 14px;
+    max-height: 260px;
+    overflow-y: auto;
+    font-family: 'Consolas', 'Courier New', Courier, monospace;
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--text-primary);
+    text-align: left;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.live-beats-body::-webkit-scrollbar { width: 4px; }
+.live-beats-body::-webkit-scrollbar-track { background: transparent; }
+.live-beats-body::-webkit-scrollbar-thumb {
+    background: rgba(176, 123, 82, 0.2);
+    border-radius: 2px;
+}
+
+/* Audit self-healing pass is regenerating some beats — pulse the header until the next
+   beat_ready snapshot replaces the shown content. */
+.live-beats-panel.revising .live-beats-header {
+    animation: live-beats-revising-pulse 1.2s infinite ease-in-out;
+}
+
+@keyframes live-beats-revising-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
 .live-terminal-panel {
     width: 100%;
     max-width: 550px;
@@ -964,10 +1038,13 @@
 /* Saved Drawer */
 .drawer {
     position: fixed;
-    top: 0;
+    /* Docks below the header/tab bar (see updateDrawerTopOffset in app.js) so a
+       persistent drawer never covers its own header toggle/collapse button. */
+    top: var(--drawer-top-offset, 100px);
     right: 0;
     width: 380px;
-    height: 100vh;
+    height: calc(100vh - var(--drawer-top-offset, 100px));
+    height: calc(100dvh - var(--drawer-top-offset, 100px)); /* mobile URL-bar-aware */
     background: var(--bg-panel-solid);
     border-left: 1px solid var(--border-color);
     z-index: 100;
@@ -1109,6 +1186,7 @@
     left: 0;
     width: 100vw;
     height: 100vh;
+    height: 100dvh;
     background: rgba(var(--ink-rgb), 0.38);
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);

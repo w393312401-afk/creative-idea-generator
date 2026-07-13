@@ -235,15 +235,15 @@ function mapTwistToAnchorValue(dna) {
 }
 
 /**
- * Returns the TikTok display metadata for an idea.
- * english: the English hook title (falls back to the Chinese title if not set)
- * chinese: the Chinese title
+ * Returns the publish-ready social caption lines for an idea.
+ * english: TikTok 整行（英文标题+英文tags，可原样粘贴）；旧数据退回封面 hook / 中文标题
+ * chinese: 国内社媒整行（中文标题+中文话题）；旧数据退回中文标题
  */
 function getIdeaTikTokMeta(idea) {
     if (!idea) return { english: '', chinese: '' };
     return {
-        english: idea.english_title || idea.title || '',
-        chinese: idea.title || '',
+        english: idea.social_title_en || idea.english_title || idea.title || '',
+        chinese: idea.social_title_cn || idea.title || '',
     };
 }
 

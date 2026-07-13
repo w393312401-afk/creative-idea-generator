@@ -1133,3 +1133,149 @@
         padding: 12px 16px 16px 16px;
     }
 }
+
+/* ── 实时生成动态（Live Feed，替代旧任务队列卡片） ─────────────────── */
+#panel-image-studio .feed-live-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 8px;
+    background: rgba(var(--ink-rgb), 0.25);
+    vertical-align: middle;
+}
+
+#panel-image-studio .feed-live-dot.active {
+    background: #10b981;
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.5);
+    animation: imgstudioFeedDotPulse 1.6s infinite;
+}
+
+@keyframes imgstudioFeedDotPulse {
+    0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.45); }
+    70% { box-shadow: 0 0 0 7px rgba(16, 185, 129, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+
+#panel-image-studio .live-feed-container {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    max-height: 340px;
+    overflow-y: auto;
+    padding-right: 4px;
+    scroll-behavior: smooth;
+}
+
+#panel-image-studio .feed-entry {
+    background: rgba(var(--panel-rgb), 0.4);
+    border: 1px solid rgba(var(--ink-rgb), 0.1);
+    border-left: 3px solid rgba(var(--ink-rgb), 0.18);
+    border-radius: 10px;
+    padding: 10px 12px;
+}
+
+#panel-image-studio .feed-entry.st-pending {
+    border-left-color: #3b82f6;
+}
+
+#panel-image-studio .feed-entry.st-completed {
+    border-left-color: #10b981;
+}
+
+#panel-image-studio .feed-entry.st-failed {
+    border-left-color: #ef4444;
+}
+
+#panel-image-studio .feed-entry.st-cancelled {
+    border-left-color: #6b7280;
+    opacity: 0.75;
+}
+
+#panel-image-studio .feed-entry-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+#panel-image-studio .feed-model {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--text-muted);
+}
+
+#panel-image-studio .feed-meta {
+    font-size: 0.72rem;
+    color: var(--text-dark);
+}
+
+#panel-image-studio .feed-head-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+#panel-image-studio .feed-status-chip .feed-elapsed {
+    font-variant-numeric: tabular-nums;
+    opacity: 0.85;
+    margin-left: 2px;
+}
+
+#panel-image-studio .feed-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+#panel-image-studio .feed-entry-prompt {
+    margin-top: 6px;
+    font-size: 0.78rem;
+    color: var(--text-main);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#panel-image-studio .feed-stage-lines {
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: rgba(var(--ink-rgb), 0.045);
+    border-radius: 8px;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 0.72rem;
+    line-height: 1.65;
+    color: var(--text-dark);
+    max-height: 110px;
+    overflow-y: auto;
+    scroll-behavior: smooth;
+}
+
+#panel-image-studio .feed-stage-line {
+    white-space: normal;
+    word-break: break-all;
+}
+
+#panel-image-studio .feed-stage-time {
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+    margin-right: 4px;
+}
+
+#panel-image-studio .feed-entry-result {
+    margin-top: 8px;
+    display: flex;
+}
+
+#panel-image-studio .feed-entry-result img {
+    height: 72px;
+    border-radius: 8px;
+    cursor: zoom-in;
+    border: 1px solid rgba(var(--ink-rgb), 0.12);
+    transition: transform 0.15s ease;
+}
+
+#panel-image-studio .feed-entry-result img:hover {
+    transform: scale(1.04);
+}

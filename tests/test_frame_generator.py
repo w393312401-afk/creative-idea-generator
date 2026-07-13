@@ -1,7 +1,10 @@
+import io
 import os
 import shutil
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from unittest.mock import patch
 
 from frame_generator import (
@@ -10,6 +13,7 @@ from frame_generator import (
     _fx_find_ref_for,
     _fx_store_frame,
     generate_frame_sequence,
+    _execute_request_with_retry,
     QuotaExhaustedError,
 )
 import server_common
@@ -145,6 +149,10 @@ visible construction change
         stages = [stage for stage, _ in events]
         self.assertIn('frame_start', stages)
         self.assertIn('frame_retry', stages)
+        # 渲染完成→质检判定之间必须有显式事件（判定可长达 90s×2，不能对前端静默）
+        self.assertIn('frame_qa', stages)
+        qa = next(details for stage, details in events if stage == 'frame_qa')
+        self.assertEqual(qa['sequence'], 2)
         starts = [details for stage, details in events if stage == 'frame_start']
         self.assertEqual(starts[0]['sequence'], 1)
         self.assertEqual(starts[1]['sequence'], 2)
@@ -180,36 +188,54 @@ second frame prompt
         with open(target_path, 'wb') as f:
             f.write(content.encode('utf-8'))
 
-    def test_fallback_model_used_when_primary_quota_exhausted(self):
+    def _read_manifest(self, title):
+        import json
+        for root, _dirs, files in os.walk(self.tmp):
+            if 'manifest.json' in files:
+                with open(os.path.join(root, 'manifest.json'), 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        return None
+
+    def test_fallback_model_used_when_primary_quota_exhausted_without_degrade_mark(self):
+        """兜底模型仍走图生图且挂同一张参考帧：链路不断，绝不能再打
+        i2i_fallback_degraded——那个标记会让下游视频门禁拦掉相邻两段视频。"""
         edit_calls = []
 
         def fake_text_image(config, prompt, target_path, *a, **kw):
             self._write(target_path, f'image:{prompt}')
-            return False
 
         def fake_image_edit(config, prompt, reference_path, target_path, *a, **kw):
             edit_calls.append(config.get('imageModel'))
             if config.get('imageModel') == 'primary-model':
                 raise QuotaExhaustedError('primary exhausted')
             self._write(target_path, f'edit:{prompt}')
-            return False
 
         config = {'imageModel': 'primary-model', 'imageEditFallbackModel': 'fallback-model'}
 
+        events = []
         with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
             generate_frame_sequence(config, 'quota_fallback', self._PROMPT_BLOCK,
-                                     on_progress=lambda stage, details: None)
+                                     on_progress=lambda stage, details: events.append((stage, details)))
 
         self.assertEqual(edit_calls, ['primary-model', 'fallback-model'])
+        manifest = self._read_manifest('quota_fallback')
+        frame2 = next(f for f in manifest['frames'] if f['sequence'] == 2)
+        self.assertNotEqual(frame2['quality_gate'], 'i2i_fallback_degraded')
+        self.assertIn('fallback-model', frame2['model'])  # 真实使用的模型留痕
+        # 切换兜底必须显式广播：否则前端刚看到"此路终止"下一秒又见转圈，读起来像卡死
+        fb = next(details for stage, details in events if stage == 'model_fallback')
+        self.assertEqual(fb['sequence'], 2)
+        self.assertEqual(fb['to'], 'fallback-model')
 
-    def test_last_resort_text_image_uses_fallback_model_not_exhausted_primary(self):
+    def test_no_silent_text_image_fallback_when_both_edit_models_fail(self):
+        """主模型与兜底模型的图生图都失败时：必须整帧明确报错等用户重试，
+        绝不静默丢参考图改文生图重画——那会产出真正断链的帧（构图跳变根源）。"""
         text_calls = []
 
         def fake_text_image(config, prompt, target_path, *a, **kw):
             text_calls.append(config.get('imageModel'))
             self._write(target_path, f'image:{prompt}')
-            return False
 
         def fake_image_edit(config, prompt, reference_path, target_path, *a, **kw):
             # Both primary and fallback edit attempts are quota-exhausted.
@@ -219,14 +245,175 @@ second frame prompt
 
         with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
-            generate_frame_sequence(config, 'quota_fallback_full', self._PROMPT_BLOCK,
-                                     on_progress=lambda stage, details: None)
+            with self.assertRaises(RuntimeError) as ctx:
+                generate_frame_sequence(config, 'quota_fallback_full', self._PROMPT_BLOCK,
+                                         on_progress=lambda stage, details: None)
 
-        # Frame 1 has no previous frame, so it always text-generates on the primary
-        # model. Frame 2's image-edit exhausts both primary and fallback, so the
-        # last-resort text-to-image call must use the fallback model, not the
-        # already-exhausted primary one.
-        self.assertEqual(text_calls, ['primary-model', 'fallback-model'])
+        self.assertIn('兜底模型', str(ctx.exception))
+        # 只有第 1 帧（本就没有参考帧）允许文生图；第 2 帧绝不允许退到文生图
+        self.assertEqual(text_calls, ['primary-model'])
+        # 第 1 帧已落盘，重试时断点续传直接复用
+        manifest = self._read_manifest('quota_fallback_full')
+        self.assertTrue(any(f['sequence'] == 1 for f in manifest['frames']))
+
+
+class TestQuotaSignalDetection(unittest.TestCase):
+    """The account-pool token broker in front of the gateway sometimes fails with a
+    plain-text body (no JSON, no "QUOTA_EXHAUSTED" marker) like:
+      "Max retries exhausted. Last error: Token error: No accounts available with
+       quota for model: gemini-3-pro-image"
+    This must still be classified as quota exhaustion (raise QuotaExhaustedError on
+    the first attempt) so imageEditFallbackModel switch-over fires, instead of being
+    treated as a generic retryable 502 that burns through all retry attempts and
+    then fails the whole frame."""
+
+    class _FakeOpener:
+        def __init__(self, code, body_text):
+            self.code = code
+            self.body_text = body_text
+            self.calls = 0
+
+        def open(self, req, timeout=None):
+            self.calls += 1
+            fp = io.BytesIO(self.body_text.encode('utf-8'))
+            raise urllib.error.HTTPError(
+                req.full_url if hasattr(req, 'full_url') else 'http://x',
+                self.code, 'Bad Gateway', {}, fp,
+            )
+
+    def _make_request(self):
+        return urllib.request.Request('http://example.invalid/v1/images/edits', data=b'', method='POST')
+
+    def test_token_broker_no_accounts_available_raises_quota_error_on_first_attempt(self):
+        body = ("Max retries exhausted. Last error: Token error: No accounts "
+                "available with quota for model: gemini-3-pro-image")
+        opener = self._FakeOpener(502, body)
+
+        with self.assertRaises(QuotaExhaustedError) as ctx:
+            _execute_request_with_retry(self._make_request(), opener=opener, timeout=1)
+
+        # Must fail fast: no point burning retries once the broker has already
+        # exhausted its own retries across the whole account pool.
+        self.assertEqual(opener.calls, 1)
+        self.assertIn('No accounts available', str(ctx.exception))
+
+    def test_unrelated_502_still_retries_and_eventually_raises_http_error(self):
+        opener = self._FakeOpener(502, 'upstream connection reset')
+
+        with self.assertRaises(urllib.error.HTTPError):
+            _execute_request_with_retry(self._make_request(), opener=opener, timeout=1,
+                                         max_attempts=2, initial_delay=0.01)
+
+        self.assertEqual(opener.calls, 2)
+
+    def test_on_attempt_hook_fires_once_per_attempt(self):
+        """图像站实时动态依赖 on_attempt 汇报"第 N 次尝试"；回调异常不得影响请求。"""
+        opener = self._FakeOpener(502, 'upstream connection reset')
+        calls = []
+
+        def hook(attempt, max_attempts):
+            calls.append((attempt, max_attempts))
+            raise RuntimeError('hook 异常必须被吞掉')
+
+        with self.assertRaises(urllib.error.HTTPError):
+            _execute_request_with_retry(self._make_request(), opener=opener, timeout=1,
+                                         max_attempts=2, initial_delay=0.01, on_attempt=hook)
+
+        self.assertEqual(calls, [(1, 2), (2, 2)])
+        self.assertEqual(opener.calls, 2)
+
+    def test_upstream_sink_broadcasts_every_failed_attempt_immediately(self):
+        """毫秒级同步的根基：每次上游失败必须立刻广播（含还剩几次重试），
+        而不是等整条退避链烧完。最后一次失败 retry_in 为 None（已放弃）。"""
+        from frame_generator import set_upstream_event_sink
+        opener = self._FakeOpener(502, 'upstream connection reset')
+        events = []
+        set_upstream_event_sink(events.append)
+        try:
+            with self.assertRaises(urllib.error.HTTPError):
+                _execute_request_with_retry(self._make_request(), opener=opener, timeout=1,
+                                             max_attempts=2, initial_delay=0.01)
+        finally:
+            set_upstream_event_sink(None)
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]['attempt'], 1)
+        self.assertEqual(events[0]['max_attempts'], 2)
+        self.assertIn('HTTP 502', events[0]['error'])
+        self.assertIsNotNone(events[0]['retry_in'])   # 第一次失败：还会重试
+        self.assertIsNone(events[1]['retry_in'])      # 最后一次失败：已放弃
+
+    def test_upstream_sink_fires_on_quota_failfast_and_is_thread_local(self):
+        """配额类 fail-fast 也要广播一次；sink 是线程本地的，别的线程不受影响。"""
+        from frame_generator import set_upstream_event_sink
+        body = ("Max retries exhausted. Last error: Token error: No accounts "
+                "available with quota for model: gemini-3-pro-image")
+        opener = self._FakeOpener(502, body)
+        events = []
+        set_upstream_event_sink(events.append)
+        try:
+            with self.assertRaises(QuotaExhaustedError):
+                _execute_request_with_retry(self._make_request(), opener=opener, timeout=1)
+        finally:
+            set_upstream_event_sink(None)
+        self.assertEqual(len(events), 1)
+        self.assertIn('配额耗尽', events[0]['error'])
+
+        # 未注册 sink 的线程独立运作：主线程注册的回调不会被其它线程触发
+        import threading
+        other_events = []
+        set_upstream_event_sink(other_events.append)
+        try:
+            errs = []
+            def _run():
+                op = self._FakeOpener(502, 'upstream connection reset')
+                try:
+                    _execute_request_with_retry(self._make_request(), opener=op, timeout=1,
+                                                 max_attempts=1, initial_delay=0.01)
+                except Exception as e:
+                    errs.append(e)
+            th = threading.Thread(target=_run)
+            th.start()
+            th.join(timeout=10)
+            self.assertEqual(other_events, [])  # 子线程的失败不会串进主线程的 sink
+            self.assertTrue(errs)
+        finally:
+            set_upstream_event_sink(None)
+
+
+class TestImageTaskStageReporting(unittest.TestCase):
+    """图像站任务的阶段汇报：只在 pending 时写入；终态由 _finish_image_task 落定，
+    且不得丢失 created_at（前端靠它算总用时）。"""
+
+    def test_stage_writes_only_while_pending_and_created_at_survives_finish(self):
+        import server_common
+        from frame_generator import _set_image_task_stage, _finish_image_task
+
+        with patch.dict(server_common.IMAGE_TASKS, {}, clear=True):
+            server_common.IMAGE_TASKS['t1'] = {
+                'status': 'pending', 'result': None, 'error': None,
+                'stage': '任务已受理，排队中', 'created_at': 123.0,
+            }
+            _set_image_task_stage('t1', '上游模型渲染中')
+            self.assertEqual(server_common.IMAGE_TASKS['t1']['stage'], '上游模型渲染中')
+
+            _finish_image_task('t1', {'status': 'completed', 'result': {'data': []}, 'error': None})
+            self.assertEqual(server_common.IMAGE_TASKS['t1']['created_at'], 123.0)
+            self.assertEqual(server_common.IMAGE_TASKS['t1']['status'], 'completed')
+
+            _set_image_task_stage('t1', '终态后不得回退')
+            self.assertNotEqual(server_common.IMAGE_TASKS['t1'].get('stage'), '终态后不得回退')
+
+    def test_cancelled_task_is_not_overwritten_and_stage_ignored(self):
+        import server_common
+        from frame_generator import _set_image_task_stage, _finish_image_task
+
+        with patch.dict(server_common.IMAGE_TASKS, {}, clear=True):
+            server_common.IMAGE_TASKS['t2'] = {'status': 'cancelled', 'result': None, 'error': '用户取消了任务'}
+            _set_image_task_stage('t2', '上游模型渲染中')
+            self.assertNotIn('stage', server_common.IMAGE_TASKS['t2'])
+            _finish_image_task('t2', {'status': 'completed', 'result': {}, 'error': None})
+            self.assertEqual(server_common.IMAGE_TASKS['t2']['status'], 'cancelled')
 
 
 class TestPromptBlockBracketSurvival(unittest.TestCase):

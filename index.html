@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>SPARK - 创意点子激发中心</title>
     <!-- Google Fonts (loaded async so a slow/blocked CDN never delays first paint) -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -10,17 +10,48 @@
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@600;700;800&display=swap" media="print" onload="this.media='all'">
     <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@600;700;800&display=swap"></noscript>
     <script>(function(){try{if(localStorage.getItem('spark_theme')==='dark'){document.documentElement.setAttribute('data-theme','dark');}}catch(e){}})();</script>
+    <!-- Load-failure guard: js/*.js are separate deferred requests sharing one global
+         scope (no bundler). If any 404s, or throws while executing, everything after it
+         is silently undefined and the UI looks broken with no clue why. Surface it instead. -->
+    <script>(function(){
+        var issues = [];
+        window.addEventListener('error', function(e){
+            var t = e.target;
+            if (t && t !== window && t.tagName === 'SCRIPT') {
+                issues.push('脚本加载失败: ' + (t.src || t.getAttribute('src') || '未知文件'));
+            } else if (!t || t === window) {
+                issues.push('脚本运行出错: ' + (e.message || '未知错误') + (e.filename ? ' (' + String(e.filename).split('/').pop() + ':' + e.lineno + ')' : ''));
+            }
+        }, true);
+        window.addEventListener('DOMContentLoaded', function(){
+            if (!issues.length) return;
+            if (window.console) console.error('SPARK 前端加载异常:', issues);
+            var bar = document.createElement('div');
+            bar.setAttribute('style', 'position:fixed;top:0;left:0;right:0;z-index:999999;' +
+                'background:#b91c1c;color:#fff;font:14px/1.5 -apple-system,Segoe UI,sans-serif;' +
+                'padding:10px 16px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.3);');
+            bar.textContent = '页面部分脚本加载失败，界面可能无法正常工作。';
+            var btn = document.createElement('button');
+            btn.textContent = '点击刷新';
+            btn.setAttribute('style', 'margin-left:8px;padding:4px 12px;border:1px solid #fff;' +
+                'border-radius:4px;background:transparent;color:#fff;cursor:pointer;font-weight:600;');
+            btn.onclick = function(){ location.reload(); };
+            bar.appendChild(btn);
+            document.body.insertBefore(bar, document.body.firstChild);
+        });
+    })();</script>
     <!-- Preload critical CSS for faster first paint -->
-    <link rel="preload" href="css/tokens.css?v=1.1.0" as="style">
-    <link rel="preload" href="css/app/base.css?v=1.2.0" as="style">
-    <link rel="stylesheet" href="css/tokens.css?v=1.1.0">
+    <link rel="preload" href="css/tokens.css?v=1.1.1" as="style">
+    <link rel="preload" href="css/app/base.css?v=1.2.3" as="style">
+    <link rel="stylesheet" href="css/tokens.css?v=1.1.1">
     <!-- style.css split into ordered contiguous slices (concatenation == original); load order = cascade order -->
-    <link rel="stylesheet" href="css/app/base.css?v=1.2.0">
-    <link rel="stylesheet" href="css/app/skill-output.css?v=1.2.0">
+    <link rel="stylesheet" href="css/app/base.css?v=1.2.3">
+    <link rel="stylesheet" href="css/app/skill-output.css?v=1.2.2">
     <link rel="stylesheet" href="css/app/efficiency.css?v=1.2.0">
-    <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.2.0">
-    <link rel="stylesheet" href="css/image_studio.css?v=1.1.0">
-    <link rel="stylesheet" href="css/shared/lightbox.css?v=1.1.0">
+    <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.2.3">
+    <link rel="stylesheet" href="css/image_studio.css?v=1.1.1">
+    <link rel="stylesheet" href="css/gallery.css?v=1.1.0">
+    <link rel="stylesheet" href="css/shared/lightbox.css?v=1.2.0">
 </head>
 <body>
     <!-- Background Canvas for Interactive Particles -->
@@ -88,6 +119,10 @@
                 <span class="btn-icon">🎨</span>
                 <span class="btn-text">图像工坊</span>
             </button>
+            <button id="main-tab-gallery" class="mobile-nav-btn" onclick="switchMainTab('gallery')">
+                <span class="btn-icon">🖼️</span>
+                <span class="btn-text">画廊</span>
+            </button>
         </div>
 
         <!-- Main Workspace Grid -->
@@ -97,11 +132,6 @@
                 <div class="panel-header">
                     <h2>概念设定与维度映射</h2>
                     <p>配置您想激发的改造或建造项目的核心维度</p>
-                </div>
-
-                <div class="panel-header-tabs">
-                    <button class="panel-tab-btn active" id="input-tab-text" onclick="switchInputTab('text')">维度激发 (Forward)</button>
-                    <button class="panel-tab-btn" id="input-tab-video" onclick="switchInputTab('video')">视频反推 (Reverse)</button>
                 </div>
 
                 <div class="panel-body">
@@ -243,83 +273,32 @@
                                             <span>施工节拍数 (Beat Count)</span>
                                             <span id="val-beats">15 拍</span>
                                         </div>
-                                        <input type="range" id="slider-beats" min="15" max="25" value="15" class="neon-slider">
+                                        <input type="range" id="slider-beats" min="5" max="15" value="15" class="neon-slider">
                                     </div>
                                 </div>
                             </div>
                         </div>
                     </div>
-
-                    <!-- Pane 2: Video prompt reverse engineering -->
-                    <div id="input-pane-video" class="input-pane">
-                        <!-- File Upload Zone -->
-                        <div class="control-group">
-                            <label class="group-title">上传延时视频</label>
-                            <div id="upload-zone" class="upload-zone">
-                                <div class="upload-icon">📤</div>
-                                <p class="upload-text">点击选择或拖拽视频文件到此处</p>
-                                <p class="upload-hint">支持 .mp4, .mov, .avi, .webm 格式</p>
-                                <input type="file" id="video-file-input" accept="video/mp4,video/quicktime,video/x-msvideo,video/webm" style="display: none;">
-                                <div id="selected-file-info" class="selected-file-info" style="display: none;">
-                                    <span class="file-name">video.mp4</span>
-                                    <span class="remove-file-btn" onclick="clearSelectedFile(event)">&times;</span>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Video parameter: FPS -->
-                        <div class="control-group" style="margin-top: 15px;">
-                            <div class="slider-header" style="display: flex; justify-content: space-between; align-items: center;">
-                                <label class="group-title" for="fps-input">抽帧频率 (FPS)</label>
-                                <span id="fps-value" class="slider-value" style="font-weight: 700; color: var(--neon-cyan);">3.0</span>
-                            </div>
-                            <input type="range" id="fps-input" min="0.5" max="10.0" step="0.5" value="3.0" class="neon-slider">
-                        </div>
-
-                        <!-- Model Selection -->
-                        <div class="control-group" style="margin-top: 15px;">
-                            <label class="group-title" for="api-select">反推多模态 API</label>
-                            <select id="api-select" class="neon-select" style="width: 100%; padding: 10px; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; color: var(--text-primary); font-family: inherit;">
-                                <option value="local" selected>本地配置模型 (Local Settings Model)</option>
-                            </select>
-                        </div>
-
-                        <!-- Prompt Style Selection -->
-                        <div class="control-group" style="margin-top: 15px;">
-                            <label class="group-title" for="prompt-style-select">生成提示词风格</label>
-                            <select id="prompt-style-select" class="neon-select" style="width: 100%; padding: 10px; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; color: var(--text-primary); font-family: inherit;">
-                                <option value="clean" selected>🎨 精简电影感风格 (Clean Cinematic)</option>
-                                <option value="technical">🛠️ 严格学术 SCUP 风格 (Strict Technical)</option>
-                            </select>
-                        </div>
-
-                        <!-- Prompt Cache Hint -->
-                        <div class="config-summary-box" style="margin-top: 20px; border-color: rgba(0, 242, 254, 0.2); background: rgba(0, 242, 254, 0.02);">
-                            <span class="summary-label" style="color: var(--neon-cyan);">📸 多模态抽帧反推：</span>
-                            <span class="summary-text" style="color: var(--text-secondary); font-size: 12px; line-height: 1.5;">本工具将提取关键帧结合计算机视觉算法分析运动与亮度，然后通过多模态模型提取动作、坐标与因果标记，还原为 100% 符合 SCUP 规范的提示词。</span>
-                        </div>
-                    </div>
                 </div>
-                
+
                 <!-- Sticky Footer at the bottom of panel-left -->
                 <div class="panel-footer">
-                    <!-- Text Mode Footer -->
                     <div id="footer-pane-text" class="footer-pane active">
                         <div id="config-summary" class="config-summary-box">
                             <span class="summary-label">配置摘要：</span>
                             <span id="config-summary-text" class="summary-text">正在计算...</span>
                         </div>
+                        <div class="ideation-model-picker">
+                            <div class="model-picker-head">
+                                <span class="model-picker-label">LLM 模型</span>
+                                <span id="ideation-llm-model-active-hint" class="model-active-hint"></span>
+                            </div>
+                            <div id="ideation-llm-groups" class="model-family-groups"></div>
+                        </div>
                         <button id="generate-btn" class="pulse-btn">
                             <div class="btn-glow"></div>
                             <span class="btn-text">⚡ 激发核心创意点子 ⚡</span>
                             <span class="btn-shortcut-hint">Ctrl + Enter</span>
-                        </button>
-                    </div>
-                    <!-- Video Mode Footer -->
-                    <div id="footer-pane-video" class="footer-pane">
-                        <button id="reverse-btn" class="pulse-btn">
-                            <div class="btn-glow"></div>
-                            <span class="btn-text">⚡ 开始反推提示词 ⚡</span>
                         </button>
                     </div>
                 </div>
@@ -385,6 +364,15 @@
                             </div>
                         </div>
 
+                        <!-- Live Beat Prompts: each beat's prompt appears here the moment it's generated (逐拍实时) -->
+                        <div class="live-beats-panel" id="live-beats-panel" style="display: none;">
+                            <div class="live-beats-header">
+                                <span>📝 已生成提示词（逐拍实时）</span>
+                                <span id="live-beats-count">0/0</span>
+                            </div>
+                            <pre class="live-beats-body" id="live-beats-block"></pre>
+                        </div>
+
                         <button id="cancel-generate-btn" class="action-btn text-btn secondary" style="margin-top: 24px; padding: 10px 24px; font-size: 13px;">
                             <span>取消生成</span>
                         </button>
@@ -410,11 +398,16 @@
                         <div class="idea-title-row">
                             <div class="tiktok-title-line">
                                 <h2 id="idea-title">Secret Floating Treehouse Build #TinyHome #Renovation #Restoration #DIYBuild #BeforeAndAfter #OddlySatisfying</h2>
-                                <button id="copy-tiktok-meta-btn" class="mini-icon-btn tiktok-copy-btn" title="复制推荐主题和 tags">
+                                <button id="copy-tiktok-meta-btn" class="mini-icon-btn tiktok-copy-btn" title="复制 TikTok 标题和 tags">
                                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                                 </button>
                             </div>
-                            <div id="idea-title-cn" class="idea-title-cn">神秘浮空树屋改造</div>
+                            <div class="tiktok-title-line tiktok-title-line-cn">
+                                <div id="idea-title-cn" class="idea-title-cn">神秘浮空树屋改造 #旧物改造 #爆改 #解压 #治愈系</div>
+                                <button id="copy-tiktok-meta-cn-btn" class="mini-icon-btn tiktok-copy-btn" title="复制中文标题和话题（国内社媒）">
+                                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                                </button>
+                            </div>
                             <div class="card-badges" hidden>
                                 <span class="tag-badge" id="tag-theme">木屋改建</span>
                                 <span class="tag-badge" id="tag-creativity">脑洞大开</span>
@@ -523,6 +516,10 @@
                                             <p class="frames-desc">将生成的所有图片提示词连成单链帧序列：第一帧进行文本生成图像，后续每一帧均以前一帧为唯一参考进行图生图（img2img）修改。</p>
                                             <p class="frames-meta" id="frames-meta">尚未生成任何帧序列。</p>
                                         </div>
+                                        <div class="frames-model-picker">
+                                            <label for="frames-image-model">生图模型</label>
+                                            <select id="frames-image-model"></select>
+                                        </div>
                                     </div>
                                     <div class="frames-progress" id="frames-progress" style="display:none; align-items: center; gap: 12px; justify-content: center; flex-wrap: wrap;">
                                         <div class="cover-spinner"></div>
@@ -536,6 +533,13 @@
                                             </div>
                                         </div>
                                         <button id="cancel-frames-btn" class="action-btn text-btn secondary mini-btn" style="margin-left: 12px; margin-top: 0; padding: 4px 10px; font-size: 11px;">取消</button>
+                                    </div>
+                                    <div class="gen-live-feed" id="frames-live-feed" style="display: none;">
+                                        <div class="gen-live-feed-head">
+                                            <span class="gen-feed-dot" id="frames-feed-dot"></span>
+                                            <span>实时生成动态</span>
+                                        </div>
+                                        <div class="gen-live-feed-lines" id="frames-live-feed-lines"></div>
                                     </div>
                                     <div class="frames-grid" id="frames-grid"></div>
                                 </div>
@@ -895,15 +899,15 @@
                                 </div>
                             </div>
 
-                            <div class="tasks-section" id="tasks-section" style="display: none;">
+                            <div class="tasks-section live-feed-section" id="tasks-section" style="display: none;">
                                 <div class="tasks-header-row">
-                                    <h3>生成任务队列 (<span id="tasks-active-count">0</span> 运行中 / 共 <span id="tasks-total-count">0</span> 个)</h3>
+                                    <h3><span class="feed-live-dot" id="feed-live-dot"></span>实时生成动态 (<span id="tasks-active-count">0</span> 渲染中 / 共 <span id="tasks-total-count">0</span> 条)</h3>
                                     <div class="tasks-header-actions" style="display: flex; gap: 0.75rem;">
                                         <button type="button" id="clear-completed-tasks-btn" class="text-action-btn">清除已完成</button>
                                         <button type="button" id="clear-all-tasks-btn" class="text-action-btn danger">清除所有</button>
                                     </div>
                                 </div>
-                                <div class="tasks-list-container" id="imgstudio-tasks-list"></div>
+                                <div class="live-feed-container" id="imgstudio-tasks-list"></div>
                             </div>
 
                             <div class="history-section">
@@ -914,6 +918,46 @@
                                 <div class="history-grid-container" id="history-grid"></div>
                             </div>
                         </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Gallery Workspace: 本地历史媒体资产（封面/帧序列/视频/图像工坊）总览与管理 -->
+            <section class="panel-gallery glass-panel" id="panel-gallery">
+                <div class="gallery-shell">
+                    <div class="panel-header">
+                        <h2>本地媒体画廊</h2>
+                        <p>浏览与管理历史生成的封面图片、帧序列图与视频文件（删除会同步移除本地磁盘文件）</p>
+                    </div>
+
+                    <div class="gallery-toolbar">
+                        <div class="gallery-filters" id="gallery-filters">
+                            <button class="gallery-filter-chip active" data-filter="all">全部</button>
+                            <button class="gallery-filter-chip" data-filter="cover">封面</button>
+                            <button class="gallery-filter-chip" data-filter="frame">帧序列</button>
+                            <button class="gallery-filter-chip" data-filter="video">视频</button>
+                            <button class="gallery-filter-chip" data-filter="studio">图像工坊</button>
+                            <button class="gallery-filter-chip warn" data-filter="orphan" title="未被点子库或任务引用的历史遗留资产（24 小时内活跃的项目不计入）">🧹 孤儿</button>
+                        </div>
+                        <div class="gallery-search-sort">
+                            <input type="search" id="gallery-search" class="gallery-search-input" placeholder="🔍 搜索文件名 / 项目名" autocomplete="off">
+                            <select id="gallery-sort" class="gallery-sort-select" title="排序方式">
+                                <option value="newest" selected>最新优先</option>
+                                <option value="oldest">最旧优先</option>
+                                <option value="size">体积大优先</option>
+                                <option value="name">按名称</option>
+                            </select>
+                        </div>
+                        <div class="gallery-toolbar-right">
+                            <span class="gallery-stats" id="gallery-stats"></span>
+                            <button type="button" id="gallery-refresh-btn" class="gallery-tool-btn" title="重新扫描本地文件">🔄 刷新</button>
+                            <button type="button" id="gallery-select-all-btn" class="gallery-tool-btn">☑️ 全选</button>
+                            <button type="button" id="gallery-delete-selected-btn" class="gallery-tool-btn danger" disabled>🗑️ 删除所选</button>
+                        </div>
+                    </div>
+
+                    <div class="panel-body gallery-scroll" id="gallery-groups">
+                        <div class="gallery-status">📡 正在扫描本地媒体文件…</div>
                     </div>
                 </div>
             </section>
@@ -988,10 +1032,6 @@
                 <select id="tasks-filter-type">
                     <option value="">所有类型</option>
                     <option value="idea">创意激发</option>
-                    <option value="frames">分镜生成</option>
-                    <option value="videos">视频生成</option>
-                    <option value="cover">封面生成</option>
-                    <option value="reverse-video">视频反推</option>
                 </select>
             </div>
         </div>
@@ -1013,34 +1053,25 @@
             </div>
             <div class="modal-body">
                 <div class="form-group">
-                    <label for="settings-base-url">API Base URL</label>
-                    <input type="text" id="settings-base-url" placeholder="http://127.0.0.1:8046/v1">
-                </div>
-                <div class="form-group">
-                    <label for="settings-api-key">API Key (密钥)</label>
-                    <div class="password-input-wrapper">
-                        <input type="password" id="settings-api-key" placeholder="sk-xxxxxxxxxxxxxxxxxxxx...">
-                        <button id="toggle-key-visibility" class="view-btn">👁️</button>
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label for="settings-model">Model Name (模型名称)</label>
-                    <select id="settings-model">
-                        <option value="gemini-3-flash-agent">gemini-3-flash-agent (推荐 / 本地代理)</option>
-                        <option value="gpt-5.5">gpt-5.5 (GPT 代理)</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label for="settings-image-model">Image Model Name (生图模型名称)</label>
-                    <select id="settings-image-model">
-                        <option value="nano-banana-2" selected>🍌 Nano Banana 2</option>
-                    </select>
-                </div>
-                <div class="form-group">
                     <label for="settings-image-backend">Frame Sequence Backend (帧序列生成方式)</label>
                     <select id="settings-image-backend">
                         <option value="api" selected>🔌 API 接口（LLM 网关）</option>
                         <option value="google_fx">🤖 Google FX UI 自动化（AdsPower 浏览器）</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="settings-qa-gate">Frame QA Gate (帧质检门档位)</label>
+                    <select id="settings-qa-gate">
+                        <option value="standard" selected>🛡️ 标准 — 逐帧严检 + 跨帧漂移复查</option>
+                        <option value="lenient">🌿 宽松 — 只拦硬伤，构图/视角漂移放行留痕</option>
+                        <option value="off">🚫 关闭 — 不质检，全部放行</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="settings-supervised-mode">Supervised Mode (关键点监修模式)</label>
+                    <select id="settings-supervised-mode">
+                        <option value="off" selected>🤖 关闭 — 全自动</option>
+                        <option value="on">🧑‍⚖️ 开启 — 首帧/换族锚点帧暂停人工确认（10 分钟无操作自动采用）</option>
                     </select>
                 </div>
                 <div class="form-group" id="fx-image-model-group" style="display: none;">
@@ -1085,7 +1116,7 @@
                     </select>
                 </div>
                 <div class="modal-info">
-                    <p>💡 <b>提示:</b> 服务端口已永久固定 —— 应用入口 <b>8085</b>（图像工坊在顶部「🎨 图像工坊」标签页），LLM 代理 <b>8046</b>（gpt-5.5 由服务端自动路由，无需配置）。托管模式下代理地址以 server_config.json 为准，此处 Base URL 仅作展示/本地自用。</p>
+                    <p>💡 <b>提示:</b> 服务端托管模式 —— 网关地址与 API 密钥由服务端 <b>server_config.json</b> 统一管理，浏览器无需（也无法）配置。<b>模型选择已移至使用现场</b>：LLM 模型在激发按钮上方切换，生图模型在帧序列卡片右上角切换，改动即存。端口永久固定：应用入口 <b>8085</b>，LLM 代理 <b>8046</b>（gpt-5.5 / gpt-image-2 由服务端自动路由）。</p>
                 </div>
                 <div class="form-group cache-group" style="margin-top: 15px; padding-top: 15px; border-top: 1px solid var(--border-color, rgba(255,255,255,0.1));">
                     <label>系统缓存管理</label>
@@ -1128,17 +1159,18 @@
     </div>
 
     <!-- Modular JS: defer so they never block HTML parsing. Order preserved. -->
-    <script src="js/state.js?v=1.1.0" defer></script>
-    <script src="js/utils.js?v=1.1.1" defer></script>
+    <script src="js/state.js?v=1.1.6" defer></script>
+    <script src="js/utils.js?v=1.1.2" defer></script>
     <script src="js/theme_toggle.js?v=1.1.0" defer></script>
-    <script src="js/config.js?v=1.1.0" defer></script>
-    <script src="js/progress_model.js?v=1.2.0" defer></script>
-    <script src="js/api_client.js?v=1.1.1" defer></script>
-    <script src="js/prompt_pipeline.js?v=1.1.3" defer></script>
+    <script src="js/config.js?v=1.1.8" defer></script>
+    <script src="js/progress_model.js?v=1.2.3" defer></script>
+    <script src="js/api_client.js?v=1.1.7" defer></script>
+    <script src="js/prompt_pipeline.js?v=1.1.4" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
-    <script src="js/media_renderer.js?v=1.1.3" defer></script>
-    <script src="app.js?v=1.1.7" defer></script>
-    <script src="js/image_studio.js?v=1.0.1" defer></script>
+    <script src="js/media_renderer.js?v=1.1.5" defer></script>
+    <script src="app.js?v=1.3.1" defer></script>
+    <script src="js/image_studio.js?v=1.0.3" defer></script>
+    <script src="js/gallery.js?v=1.1.1" defer></script>
     <!-- 旧「移动端标签切换」内联脚本已删除：它指向早已不存在的 mobile-tab-left/right，
          MutationObserver 永远空转；自动切换结果面板改由 app.js 的 switchMainTab('results') 完成 -->
 
@@ -1152,6 +1184,20 @@
             <div class="lightbox-caption" id="lightbox-caption">Caption text...</div>
         </div>
         <button class="lightbox-nav lightbox-next" id="next-lightbox-btn" title="下一张 (Right Arrow)">▶</button>
+    </div>
+
+    <!-- 监修模式审阅面板：review_pause 事件弹出，采用/重渲回传决策，超时自动采用 -->
+    <div class="lightbox-overlay" id="review-modal" style="display: none;">
+        <div class="review-panel">
+            <h3 class="review-title" id="review-title">🧑‍⚖️ 监修确认</h3>
+            <img id="review-img" src="" alt="待审帧" style="display: none;">
+            <p class="review-context" id="review-context"></p>
+            <div class="review-actions">
+                <button type="button" class="review-btn review-btn-adopt" id="review-adopt-btn">✅ 采用并继续</button>
+                <button type="button" class="review-btn review-btn-rerender" id="review-rerender-btn">🔁 重渲此帧</button>
+            </div>
+            <p class="review-countdown" id="review-countdown"></p>
+        </div>
     </div>
 </body>
 </html>

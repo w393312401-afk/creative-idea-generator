@@ -60,6 +60,7 @@ async function watchTaskUntilTerminal(taskId, opts = {}) {
             const reader = response.body.getReader();
             const decoder = new TextDecoder('utf-8');
             let buffer = '';
+            let streamTerminal = false;
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
@@ -82,6 +83,21 @@ async function watchTaskUntilTerminal(taskId, opts = {}) {
                     if (parsed.type === 'error') {
                         sawTerminal = { status: 'failed', error: (parsed.data && parsed.data.message) || '未知错误' };
                     }
+                    if (parsed.type === 'result' || parsed.type === 'error') {
+                        // 终态事件已经送达：不再等底层连接真正关闭（done）才收尾——
+                        // 服务端虽然会在发完终态事件后立刻关连接，但客户端这边
+                        // 探测到 TCP 连接真正断开可能被本机杀软/代理/系统层面
+                        // 延迟甚至卡住（本机日志里能看到反复的 WinError 10053/10054），
+                        // 那样帧/视频明明已经全部生成完，进度条却会空转到连接
+                        // 被判定断开为止。收到事件本身就是终态的权威来源，直接
+                        // 结束读取即可。
+                        streamTerminal = true;
+                        break;
+                    }
+                }
+                if (streamTerminal) {
+                    try { await reader.cancel(); } catch (_) { /* noop：连接可能已经关闭 */ }
+                    break;
                 }
             }
         } catch (e) {
@@ -110,6 +126,89 @@ async function watchTaskUntilTerminal(taskId, opts = {}) {
         emit('reconnecting', { attempt: reconnects, delay });
         await new Promise(r => setTimeout(r, delay));
     }
+}
+
+// ── 监修模式审阅面板（review_pause / review_resume 事件驱动） ──
+let _reviewCountdownTimer = null;
+
+function hideFrameReviewPanel() {
+    const modal = document.getElementById('review-modal');
+    if (modal) modal.style.display = 'none';
+    if (_reviewCountdownTimer) {
+        clearInterval(_reviewCountdownTimer);
+        _reviewCountdownTimer = null;
+    }
+}
+
+function showFrameReviewPanel(taskId, data) {
+    const modal = document.getElementById('review-modal');
+    const img = document.getElementById('review-img');
+    const ctx = document.getElementById('review-context');
+    const title = document.getElementById('review-title');
+    const countdown = document.getElementById('review-countdown');
+    const adoptBtn = document.getElementById('review-adopt-btn');
+    const rerenderBtn = document.getElementById('review-rerender-btn');
+    if (!modal || !img || !ctx || !adoptBtn || !rerenderBtn) return;
+
+    const seq = data && data.sequence;
+    const isSummary = seq === null || seq === undefined;
+    if (title) {
+        title.textContent = isSummary
+            ? '🧑‍⚖️ 监修确认 — 阶段汇总'
+            : `🧑‍⚖️ 监修确认 — IMG ${String(seq).padStart(3, '0')}`;
+    }
+    if (data && data.image_url) {
+        // 重渲会覆盖同路径文件，必须绕浏览器缓存取新图（单张，无性能顾虑）
+        img.src = `${data.image_url}?t=${Date.now()}`;
+        img.style.display = 'block';
+    } else {
+        img.src = '';
+        img.style.display = 'none';
+    }
+    ctx.textContent = (data && data.context) || '';
+    rerenderBtn.style.display = isSummary ? 'none' : '';
+    adoptBtn.textContent = isSummary ? '✅ 继续' : '✅ 采用并继续';
+
+    const post = async (decision) => {
+        adoptBtn.disabled = true;
+        rerenderBtn.disabled = true;
+        try {
+            const res = await fetch('/api/frame-review', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_id: taskId, sequence: isSummary ? null : seq, decision })
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            // review_resume 事件也会关面板；这里立即关，不等后端下一轮询（≤2s）
+            hideFrameReviewPanel();
+        } catch (e) {
+            showToast(`监修决策提交失败: ${e.message}`, 'error');
+            adoptBtn.disabled = false;
+            rerenderBtn.disabled = false;
+        }
+    };
+    adoptBtn.disabled = false;
+    rerenderBtn.disabled = false;
+    adoptBtn.onclick = () => post('adopt');
+    rerenderBtn.onclick = () => post('rerender');
+
+    if (_reviewCountdownTimer) clearInterval(_reviewCountdownTimer);
+    const timeoutS = (data && data.timeout_seconds) || 600;
+    const deadline = Date.now() + timeoutS * 1000;
+    const tick = () => {
+        const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+        if (countdown) {
+            countdown.textContent = `⏳ ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')} 后自动采用并继续`;
+        }
+        if (left <= 0 && _reviewCountdownTimer) {
+            clearInterval(_reviewCountdownTimer);
+            _reviewCountdownTimer = null;
+        }
+    };
+    tick();
+    _reviewCountdownTimer = setInterval(tick, 1000);
+
+    modal.style.display = 'flex';
 }
 
 /**
@@ -394,6 +493,12 @@ async function retrySingleFrame(seq) {
     activeBackgroundTasks.frames = true;
     updateTabStatusDot();
 
+    // 单帧重试同样在模块内的实时生成动态里直播（helpers 定义在后加载的 app.js，
+    // 本函数只在用户点击时运行，届时必已就绪；仍加 typeof 护栏防御加载序变动）
+    const feedLine = (text, cls) => { if (typeof framesFeedLine === 'function') framesFeedLine(text, cls); };
+    if (typeof framesFeedSetLive === 'function') framesFeedSetLive(true);
+    feedLine(`🔁 重试渲染 IMG ${String(seq).padStart(3, '0')}…`);
+
     const controller = new AbortController();
 
     try {
@@ -422,10 +527,30 @@ async function retrySingleFrame(seq) {
             signal: controller.signal,
             onEvent: (type, evData) => {
                 if (type === 'frame') {
+                    if (typeof framesFeedQualityLine === 'function') framesFeedQualityLine(evData && evData.frame);
                     applyFrameEventToIdea(evData && evData.frame);
                     if (currentIdea) renderFramesForIdea(currentIdea);
+                } else if (type === 'frame_start') {
+                    feedLine(`🎨 IMG ${String(seq).padStart(3, '0')} 渲染中…`);
+                } else if (type === 'frame_qa') {
+                    feedLine(`🧪 IMG ${String(seq).padStart(3, '0')} 质检判定中…`);
+                } else if (type === 'frame_retry') {
+                    const reason = evData && evData.reason ? `：${evData.reason}` : '';
+                    feedLine(`🔁 IMG ${String(seq).padStart(3, '0')} 质检重试 ${evData && evData.attempt ? evData.attempt : ''}${reason}`, 'warn');
+                } else if (type === 'upstream_retry') {
+                    const a = (evData && evData.attempt) || '?';
+                    const m = (evData && evData.max_attempts) || '?';
+                    const tail = evData && evData.retry_in
+                        ? `，${evData.retry_in}s 后自动重试（第 ${a}/${m} 次）`
+                        : `（第 ${a}/${m} 次，此路终止——若有兜底/收尾会紧随其后，否则任务即将报错结束）`;
+                    feedLine(`⚠️ 上游报错：${(evData && evData.error) || '未知错误'}${tail}`, 'warn');
+                } else if (type === 'model_fallback') {
+                    const to = (evData && evData.to) || '兜底模型';
+                    feedLine(`🔀 主模型配额耗尽，切换兜底模型 ${to} 继续渲染 IMG ${String(seq).padStart(3, '0')}…`, 'warn');
+                    meta.textContent = `主模型配额耗尽，兜底模型 ${to} 渲染中...`;
                 } else if (type === 'reconnecting') {
                     meta.textContent = `连接中断，正在重连（第 ${evData.attempt} 次）...`;
+                    feedLine(`⚠️ 连接中断，正在重连（第 ${evData.attempt} 次）…`, 'warn');
                 }
             }
         });
@@ -439,6 +564,7 @@ async function retrySingleFrame(seq) {
         }
     } catch (e) {
         console.error(`Failed to retry frame ${seq}:`, e);
+        feedLine(`❌ IMG ${String(seq).padStart(3, '0')} 重试失败：${e.message}`, 'err');
         showToast(`第 ${seq} 帧重试失败: ${e.message}`, "error");
 
         // Restore state by reloading manifest or rendering whatever is local
@@ -448,6 +574,7 @@ async function retrySingleFrame(seq) {
         progress.style.display = 'none';
         activeBackgroundTasks.frames = false;
         updateTabStatusDot();
+        if (typeof framesFeedSetLive === 'function') framesFeedSetLive(false);
     }
 }
 

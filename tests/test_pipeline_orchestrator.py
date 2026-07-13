@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import server_common
 from pipeline_orchestrator import (
+    _prompt_fingerprint,
     _retry_frame_until_pass,
     render_and_gate_single_frame,
     run_autonomous_pipeline,
@@ -36,7 +37,10 @@ class TestRetryFrameUntilPass(unittest.TestCase):
         self.assertEqual(reason, 'PASS')
         self.assertEqual(mock_render.call_count, 2)
         mock_fix.assert_called_once_with({}, 'original prompt', 'workers visible in frame')
-        self.assertEqual(images[1]['body'], 'corrected prompt')
+        # 改写产物随后过确定性修复链（镜头族感知）：这里是 exterior 帧且无相机行，
+        # fix_horizon_line 会补上地平线锁 —— 存回的是修复后的版本，不再是裸改写文本。
+        self.assertTrue(images[1]['body'].startswith('corrected prompt'))
+        self.assertIn('horizon line', images[1]['body'].lower())
 
     def test_gives_up_after_max_attempts(self):
         def judge(image_path, prompt):
@@ -213,6 +217,11 @@ class TestRunStagedFrameRendering(unittest.TestCase):
         with open(os.path.join(self.project_dir, 'manifest.json'), 'r', encoding='utf-8') as f:
             return json.load(f)
 
+    def _write_frame_file(self, sequence):
+        path = os.path.join(self.project_dir, 'frames', f'img_{sequence:03d}.webp')
+        with open(path, 'wb') as f:
+            f.write(b'fake webp bytes')
+
     def test_happy_path_gates_frame_1_without_recomposing_text(self):
         def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
             manifest_path = os.path.join(self.project_dir, 'manifest.json')
@@ -264,8 +273,14 @@ class TestRunStagedFrameRendering(unittest.TestCase):
     def test_skips_regating_frame_1_if_already_auto_approved(self):
         """If an agent already gated IMAGE 1 inline via render_and_gate_single_frame
         (e.g. through /api/render_anchor) before handing off the full prompt_block here,
-        this must not re-render or re-judge frame 1 a second time."""
-        self._write_manifest([{'sequence': 1, 'quality_gate': 'auto_approved', 'vlm_qa_reason': 'PASS'}])
+        this must not re-render or re-judge frame 1 a second time. Reuse additionally
+        requires the anchor prompt fingerprint recorded at gate time to match AND the
+        gated anchor image to still exist on disk."""
+        self._write_manifest([{
+            'sequence': 1, 'quality_gate': 'auto_approved', 'vlm_qa_reason': 'PASS',
+            'anchor_prompt_sha256': _prompt_fingerprint('first frame prompt'),
+        }])
+        self._write_frame_file(1)
 
         def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
             return {'title': title}
@@ -280,6 +295,85 @@ class TestRunStagedFrameRendering(unittest.TestCase):
         mock_gate.assert_not_called()
         mock_fix.assert_not_called()
         self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved')
+
+    def test_regates_frame_1_when_stale_manifest_has_no_fingerprint(self):
+        """A stale manifest from an earlier same-titled run says 'auto_approved' but has
+        no anchor prompt fingerprint (or a mismatching one) — reusing it would bypass the
+        Anchor Acceptance Gate for a prompt that was never judged. Must re-gate."""
+        self._write_manifest([{'sequence': 1, 'quality_gate': 'auto_approved', 'vlm_qa_reason': 'PASS'}])
+
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            return {'title': title}
+
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(True, 'PASS')) as mock_gate, \
+             patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}):
+            result = run_staged_frame_rendering({}, self.title, self.PROMPT_BLOCK)
+
+        self.assertEqual(result['status'], 'completed')
+        mock_gate.assert_called_once()
+        frame_1 = self._read_manifest()['frames'][0]
+        self.assertEqual(frame_1['quality_gate'], 'auto_approved')
+        self.assertEqual(frame_1['anchor_prompt_sha256'], _prompt_fingerprint('first frame prompt'))
+
+    def test_regates_frame_1_when_gated_image_missing_from_disk(self):
+        """manifest 记录与指纹都对得上，但过门的锚点图已被清理：复用会让下游重渲一张
+        从未过门的新首帧接着整链构图，必须重新过门。"""
+        self._write_manifest([{
+            'sequence': 1, 'quality_gate': 'auto_approved', 'vlm_qa_reason': 'PASS',
+            'anchor_prompt_sha256': _prompt_fingerprint('first frame prompt'),
+        }])
+        # 不写 frames/img_001.webp —— 图不在盘上
+
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            return {'title': title}
+
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(True, 'PASS')) as mock_gate, \
+             patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}):
+            result = run_staged_frame_rendering({}, self.title, self.PROMPT_BLOCK)
+
+        self.assertEqual(result['status'], 'completed')
+        mock_gate.assert_called_once()
+
+    def test_regates_frame_1_when_prompt_changed_since_gate(self):
+        """auto_approved with a fingerprint from a DIFFERENT prompt (the agent edited
+        IMAGE 1 after gating it) must not be reused."""
+        self._write_manifest([{
+            'sequence': 1, 'quality_gate': 'auto_approved', 'vlm_qa_reason': 'PASS',
+            'anchor_prompt_sha256': _prompt_fingerprint('some other prompt entirely'),
+        }])
+        self._write_frame_file(1)
+
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            return {'title': title}
+
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(True, 'PASS')) as mock_gate, \
+             patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}):
+            result = run_staged_frame_rendering({}, self.title, self.PROMPT_BLOCK)
+
+        self.assertEqual(result['status'], 'completed')
+        mock_gate.assert_called_once()
+
+    def test_degraded_gate_pass_continues_but_is_not_reusable(self):
+        """A judge outage (Skipped verdict) lets the run continue (fail-open default)
+        but records auto_approved_degraded — which a later staged call must NOT treat
+        as a reusable verdict."""
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            manifest_path = os.path.join(self.project_dir, 'manifest.json')
+            if not os.path.exists(manifest_path):
+                self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
+
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance',
+                   return_value=(True, 'Skipped (API Error: boom)')) as mock_gate, \
+             patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}):
+            result = run_staged_frame_rendering({}, self.title, self.PROMPT_BLOCK)
+
+        self.assertEqual(result['status'], 'completed')  # fail-open：放行但留痕
+        mock_gate.assert_called_once()
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved_degraded')
 
 
 class TestRenderAndGateSingleFrame(unittest.TestCase):
@@ -355,6 +449,23 @@ class TestRenderAndGateSingleFrame(unittest.TestCase):
         self.assertEqual(result['status'], 'needs_human_review')
         self.assertEqual(result['reason'], 'still generic')
         self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'needs_human_review')
+
+    def test_skipped_verdict_returns_degraded_status_and_records_fingerprint(self):
+        """判定服务异常时 judge 返回 Skipped 放行：状态必须是 auto_approved_degraded
+        （帧未经真实核验），且 manifest 记录验锚提示词指纹供后续复用比对。"""
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
+            return {'title': title}
+
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance',
+                   return_value=(True, 'Skipped (API Error: boom)')):
+            result = render_and_gate_single_frame({}, self.title, 1, 'a prompt')
+
+        self.assertEqual(result['status'], 'auto_approved_degraded')
+        frame_1 = self._read_manifest()['frames'][0]
+        self.assertEqual(frame_1['quality_gate'], 'auto_approved_degraded')
+        self.assertEqual(frame_1['anchor_prompt_sha256'], _prompt_fingerprint('a prompt'))
 
 
 if __name__ == '__main__':

@@ -24,8 +24,52 @@ const DEFAULT_CONFIG = {
     videoModel: 'Veo 3.1 - Lite [Lower Priority]',
     googleFxIpRotateRequests: 5,
     imageAspectRatio: '9:16',
-    imageQuality: '2K'
+    imageQuality: '2K',
+    // 帧质检门档位: 'standard'（全量严检）| 'lenient'（只拦硬伤,构图漂移放行）| 'off'（关闭）
+    qaGateLevel: 'standard',
+    // 关键点监修模式: 首帧/镜头族交接锚点帧渲染后暂停等人工确认（采用/重渲，超时自动采用）
+    supervisedMode: false
 };
+
+// LLM 主模型清单（激发/合成/审核/质检判定共用；网关路由由服务端 resolve_gateway 处理）。
+// 按供应商分三组，渲染成激发页脚的分组芯片单选器（见 config.js syncIdeationLlmPicker）：
+// - gpt: 模型名含 "gpt-5" 会被 resolve_gateway 自动转发到 codex 网关；只保留当前代
+//   gpt-5.5+（旧 gpt-4/gpt-3.5 系列、以及性能较弱的 gpt-5.4 系列都不放进来）。
+//   2026-07-13 已用真实请求逐个验证 gpt-5.5/5.6-sol/5.6-terra/5.6-luna 均原生
+//   支持联网搜索（{"type":"web_search"} 工具自动执行）。
+// - gemini: 走默认网关（config.baseUrl，即 8046）。
+// - claude: claude-sonnet-4-6 / claude-opus-4-6-thinking 也走跟 gemini 一样的默认
+//   网关（resolve_gateway 没有 claude 专属分支，落进默认分支）——2026-07-13 已用
+//   真实请求验证两者都能正常应答。
+const LLM_MODEL_GROUPS = {
+    gpt: [
+        { value: 'gpt-5.5', label: 'gpt-5.5' },
+        { value: 'gpt-5.6-sol', label: 'gpt-5.6-sol' },
+        { value: 'gpt-5.6-terra', label: 'gpt-5.6-terra' },
+        { value: 'gpt-5.6-luna', label: 'gpt-5.6-luna' }
+    ],
+    gemini: [
+        { value: 'gemini-3-flash-agent', label: 'gemini-3-flash-agent', recommended: true }
+    ],
+    claude: [
+        { value: 'claude-sonnet-4-6', label: 'claude-sonnet-4-6' },
+        { value: 'claude-opus-4-6-thinking', label: 'claude-opus-4-6-thinking' }
+    ]
+};
+
+// 生图模型清单（与 LLM 模型解耦：resolve_gateway 会按模型名自动路由网关，
+// gemini LLM + gpt-image-2 生图这类混搭是合法且常用的组合——配额兜底正是这么跑的）
+const IMAGE_MODELS = [
+    { value: 'nano-banana-2', label: '🍌 Nano Banana 2 (Gemini)' },
+    { value: 'gpt-image-2', label: 'gpt-image-2 (GPT / codex 通道)' }
+];
+
+// Google FX（AdsPower 浏览器 UI 自动化）后端的生图模型清单
+const FX_IMAGE_MODELS = [
+    { value: 'Nano Banana Pro', label: 'Nano Banana Pro' },
+    { value: 'Nano Banana 2', label: '🍌 Nano Banana 2' },
+    { value: 'Imagen 4', label: 'Imagen 4' }
+];
 
 // Global State
 let config = { ...DEFAULT_CONFIG };
@@ -35,8 +79,6 @@ let ACCESS_CODE = localStorage.getItem('spark_access_code') || '';
 
 let savedIdeas = [];
 let currentIdea = null;
-let activeInputTab = 'text';
-let selectedVideoFile = null;
 
 let customPresets = {};
 let activeBackgroundTasks = {

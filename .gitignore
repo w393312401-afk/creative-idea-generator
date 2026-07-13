@@ -17,10 +17,16 @@ out.txt
 stderr_crash.txt
 packet_cache.json
 process_brief_cache.json
+compose_checkpoints.json
+search_snippet_cache.json
 *.json.tmp
+# 写前备份轮换(如 library.json.bak / packet_cache.json.bak-YYYYMMDD)
+*.bak
+*.bak-*
 
 # ── 用户数据(默认不提交)──
 library.json
+library.rebuilt.json
 outputs/
 tasks/
 tasks.json

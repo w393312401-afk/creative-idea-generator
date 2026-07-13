@@ -1382,42 +1382,6 @@ fetch("${tunnelOrigin}/api/image/edits", {
 .then(res => res.json())
 .then(data => console.log("编辑图像生成成功！"));`;
       }
-    } 
-    
-    else if (endpointId === 'post-reverse-video') {
-      if (docSelectedLang === 'curl') {
-        code = `curl ${tunnelOrigin}/api/reverse-video \\
-  -H "Authorization: Bearer ${keyString}" \\
-  -F "video=@/path/to/lapse.mp4" \\
-  -F "fps=3.0"`;
-      } else if (docSelectedLang === 'python') {
-        code = `import requests
-
-with open("lapse.mp4", "rb") as video_file:
-    response = requests.post(
-        "${tunnelOrigin}/api/reverse-video",
-        headers={"Authorization": "Bearer ${keyString}"},
-        files={"video": ("lapse.mp4", video_file, "video/mp4")},
-        data={"fps": 3.0}
-    )
-print("解析出的时序关键帧语义与提示词序列:", response.json())`;
-      } else {
-        code = `const formData = new FormData();
-const videoFile = document.getElementById("video-input").files[0];
-
-formData.append("video", videoFile);
-formData.append("fps", 3.0);
-
-fetch("${tunnelOrigin}/api/reverse-video", {
-  method: "POST",
-  headers: {
-    "Authorization": "Bearer ${keyString}"
-  },
-  body: formData
-})
-.then(res => res.json())
-.then(data => console.log("视频时序关键帧解析成功：", data));`;
-      }
     }
 
     preBlock.innerHTML = highlightCode(code, docSelectedLang);

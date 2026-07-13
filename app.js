@@ -92,11 +92,12 @@ document.addEventListener('DOMContentLoaded', () => {
     checkApiStatus();
     setupEventListeners();
     setupDragAndDrop();
-    setupVideoUploadDragAndDrop();
     resumeActiveTaskIfExists();
     resumeActiveBackgroundTasksIfExists();
     startGlobalTasksBadgePolling();
     loadIdeationCards();
+    updateDrawerTopOffset();
+    window.addEventListener('resize', window._debounce(updateDrawerTopOffset, 150));
     const refreshBtn = document.getElementById('ideate-refresh-btn');
     if (refreshBtn) {
         refreshBtn.addEventListener('click', () => {
@@ -120,7 +121,7 @@ const PRESETS = {
         budget: 2,
         ratio: 30,
         creativity: 3,
-        beats: 15
+        beats: 5
     },
     industrial_relic: {
         theme: 'water_tower',
@@ -129,7 +130,7 @@ const PRESETS = {
         budget: 2,
         ratio: 60,
         creativity: 2,
-        beats: 18
+        beats: 8
     },
     retired_vehicle: {
         theme: 'submarine_cabin',
@@ -138,7 +139,7 @@ const PRESETS = {
         budget: 3,
         ratio: 75,
         creativity: 3,
-        beats: 20
+        beats: 10
     },
     contrast_novelty: {
         theme: 'hollow_oak',
@@ -147,7 +148,7 @@ const PRESETS = {
         budget: 1,
         ratio: 50,
         creativity: 3,
-        beats: 15
+        beats: 5
     }
 };
 
@@ -170,17 +171,24 @@ function switchMainTab(tabName) {
         config: document.querySelector('.panel-left'),
         results: document.querySelector('.panel-right'),
         image: document.getElementById('panel-image-studio'),
+        gallery: document.getElementById('panel-gallery'),
     };
     const buttons = {
         config: document.getElementById('main-tab-config'),
         results: document.getElementById('main-tab-results'),
         image: document.getElementById('main-tab-image'),
+        gallery: document.getElementById('main-tab-gallery'),
     };
 
     Object.keys(panels).forEach((key) => {
         if (panels[key]) panels[key].classList.toggle('mobile-active', key === tab);
         if (buttons[key]) buttons[key].classList.toggle('active', key === tab);
     });
+
+    // 画廊首次进入时才扫描本地文件（js/gallery.js 提供；懒加载避免拖慢启动）
+    if (tab === 'gallery' && typeof galleryTabEntered === 'function') {
+        galleryTabEntered();
+    }
 }
 
 function switchTab(tabId) {
@@ -282,7 +290,9 @@ function startLoadingTimer(startTimeOverride = null) {
         terminalBody.innerHTML = '<span class="terminal-cursor"></span>';
         appendLiveTerminal("[SYSTEM] Initializing creative idea engine...\n[SYSTEM] Loading restoration-prompt-composer contract...\n");
     }
-    
+
+    clearLiveBeatsPanel();
+
     generationState.timerInterval = setInterval(() => {
         const elapsed = Date.now() - start;
         if (timerVal) {
@@ -337,20 +347,69 @@ function stopLoadingTimer() {
     }
 }
 
+// Clears the loading screen's progressive-reveal live prompt panel. Runs before every
+// new generation and before the final renderIdea(result) so stale live content never
+// lingers behind the finished result view.
+function clearLiveBeatsPanel() {
+    const block = document.getElementById('live-beats-block');
+    if (block) block.textContent = '';
+    const panel = document.getElementById('live-beats-panel');
+    if (panel) {
+        panel.style.display = 'none';
+        panel.classList.remove('revising');
+    }
+    const countEl = document.getElementById('live-beats-count');
+    if (countEl) countEl.textContent = '0/0';
+}
+
+// Progressive per-beat reveal: as each beat's VIDEO/IMAGE prompt pair finishes on the
+// backend (on_progress('beat_ready', ...)), show the growing prompt_block right away in
+// the loading screen's live panel — mirroring how the final result view renders the raw
+// markdown block (#idea-prompt-block) — instead of making the user wait for the whole
+// 16-beat pipeline (+ audit pass) to show anything. Separate from updateProgressUI,
+// which only drives the stage text / step dots.
+function handleComposeProgressExtras(prog) {
+    if (!prog || typeof prog !== 'object') return;
+    const d = prog.details || {};
+
+    if (prog.stage === 'beat_ready') {
+        const block = document.getElementById('live-beats-block');
+        if (block) {
+            block.textContent = d.prompt_block || '';
+            block.scrollTop = block.scrollHeight;
+        }
+
+        const panel = document.getElementById('live-beats-panel');
+        if (panel) {
+            panel.style.display = 'flex';
+            panel.classList.remove('revising');
+        }
+        const countEl = document.getElementById('live-beats-count');
+        if (countEl) countEl.textContent = `${d.index || 0}/${d.total || 0}`;
+
+        if (d.index === 0) {
+            appendLiveTerminal(`[BEAT] 起始画面 IMAGE 1 已生成。\n`);
+        } else if (d.is_revision) {
+            appendLiveTerminal(`[BEAT] 第 ${d.index} 拍已按审核意见重新生成完毕。\n`);
+        } else {
+            appendLiveTerminal(`[BEAT] 第 ${d.index} 拍提示词已生成 (${d.index}/${d.total})。\n`);
+        }
+    } else if (prog.stage === 'beat_revising') {
+        const indices = d.indices || [];
+        const panel = document.getElementById('live-beats-panel');
+        if (panel && indices.length) panel.classList.add('revising');
+        if (indices.length) {
+            appendLiveTerminal(`[BEAT] 质检未通过，正在重新生成第 ${indices.join('、')} 拍...\n`);
+        }
+    }
+}
+
 
 
 // Mapping of image models by main model
-const IMAGE_MODELS_BY_MAIN_MODEL = {
-    'gemini-3-flash-agent': [
-        { value: 'nano-banana-2', label: '🍌 Nano Banana 2' }
-    ],
-    'gpt-5.5': [
-        { value: 'gpt-image-2', label: 'gpt-image-2' }
-    ]
-};
-
-// Dynamically update image model dropdown choices based on selected main model
-// Function updateImageModelOptions moved to modular JS file
+// IMAGE_MODELS_BY_MAIN_MODEL 已弃用（2026-07-12 生图模型与 LLM 解耦）：
+// 生图模型清单见 js/state.js 的 IMAGE_MODELS / FX_IMAGE_MODELS。
+// updateImageModelOptions 已删除（配置中心模型下拉整体移除，见 js/config.js 内嵌选择器）
 
 // Load configuration from localStorage
 // Function loadConfig moved to modular JS file
@@ -380,6 +439,27 @@ async function loadLibrary() {
         if (response.ok) {
             savedIdeas = await response.json();
             console.log("Successfully loaded library from local server file.");
+            // 2026-07-12 整库清零事故防线：服务器返回“合法空库”但本地备份非空时，
+            // 大概率是服务器文件被状态错乱的客户端清掉了（或刚发生过回滚）——采用
+            // 本地备份并提示，绝不能让空结果静默吞掉最后一份幸存副本。不自动回写
+            // 服务器：用户下一次正常保存动作会自然把恢复的库写回去。
+            if (Array.isArray(savedIdeas) && savedIdeas.length === 0) {
+                const stored = localStorage.getItem('spark_library');
+                if (stored) {
+                    try {
+                        const backup = JSON.parse(stored);
+                        if (Array.isArray(backup) && backup.length > 0) {
+                            savedIdeas = backup;
+                            console.warn(`Server library is empty but localStorage backup has ${backup.length} ideas — using the backup.`);
+                            if (typeof showToast === 'function') {
+                                showToast(`服务器创意库为空，已从本地备份恢复 ${backup.length} 条创意（保存任意改动即回写服务器）`, 'error');
+                            }
+                        }
+                    } catch (err) {
+                        console.error("Failed to parse localStorage library backup", err);
+                    }
+                }
+            }
         } else {
             throw new Error(`Server returned HTTP ${response.status}`);
         }
@@ -624,6 +704,73 @@ async function updateCacheSizeInfo() {
     }
 }
 
+// --- Persistent panel (tasks/library) helpers -----------------------------
+// Both drawers stay open once opened (no auto-close on outside click) so they
+// can be used as a reference alongside the rest of the workspace; the header
+// toggle button doubles as the "收起" (collapse) control, its label swapping
+// to make that discoverable.
+const DRAWER_TOGGLE_LABELS = {
+    'toggle-tasks-btn': '任务列表',
+    'toggle-library-btn': '点子库',
+};
+
+function setDrawerToggleOpenState(btnId, isOpen) {
+    const btn = document.getElementById(btnId);
+    if (!btn) return;
+    const label = DRAWER_TOGGLE_LABELS[btnId] || '';
+    const labelSpan = btn.querySelector('span:not(.task-badge)');
+    btn.classList.toggle('panel-open', isOpen);
+    btn.title = isOpen ? `收起${label}` : label;
+    if (labelSpan) labelSpan.textContent = isOpen ? '收起' : label;
+}
+
+function openLibraryDrawer() {
+    const libraryDrawer = document.getElementById('library-drawer');
+    if (!libraryDrawer) return;
+    closeTasksDrawer();
+    libraryDrawer.classList.add('active');
+    setDrawerToggleOpenState('toggle-library-btn', true);
+    renderLibrary();
+}
+
+function closeLibraryDrawer() {
+    const libraryDrawer = document.getElementById('library-drawer');
+    if (!libraryDrawer) return;
+    libraryDrawer.classList.remove('active');
+    setDrawerToggleOpenState('toggle-library-btn', false);
+}
+
+function openTasksDrawer() {
+    const tasksDrawer = document.getElementById('tasks-drawer');
+    if (!tasksDrawer) return;
+    closeLibraryDrawer();
+    tasksDrawer.classList.add('active');
+    setDrawerToggleOpenState('toggle-tasks-btn', true);
+    renderTasks();
+    startTasksPolling();
+}
+
+function closeTasksDrawer() {
+    const tasksDrawer = document.getElementById('tasks-drawer');
+    if (!tasksDrawer) return;
+    tasksDrawer.classList.remove('active');
+    setDrawerToggleOpenState('toggle-tasks-btn', false);
+    stopTasksPolling();
+}
+
+// The persistent drawers are position:fixed siblings of .app-container, so a plain
+// `top: 0` box would paint over the header (and its own collapse button) rather than
+// under it. Anchor the drawer below the real header+tab-bar height instead of a
+// hardcoded pixel value, since that height differs across breakpoints.
+function updateDrawerTopOffset() {
+    const anchor = document.querySelector('.mobile-nav-tabs') || document.querySelector('.app-header');
+    if (!anchor) return;
+    const bottom = anchor.getBoundingClientRect().bottom;
+    if (bottom > 0) {
+        document.documentElement.style.setProperty('--drawer-top-offset', `${Math.ceil(bottom)}px`);
+    }
+}
+
 // Modal & Drawer event bindings
 function setupEventListeners() {
     // Settings Modal
@@ -637,18 +784,7 @@ function setupEventListeners() {
     });
     closeSettings.addEventListener('click', () => settingsModal.classList.remove('active'));
     
-    // Toggle key visibility
-    const toggleKey = document.getElementById('toggle-key-visibility');
-    const keyInput = document.getElementById('settings-api-key');
-    toggleKey.addEventListener('click', () => {
-        if (keyInput.type === 'password') {
-            keyInput.type = 'text';
-            toggleKey.textContent = '🔒';
-        } else {
-            keyInput.type = 'password';
-            toggleKey.textContent = '👁️';
-        }
-    });
+    // （API Key 输入框与可见性切换按钮已随死配置一并移除：托管模式密钥在服务端）
 
     document.getElementById('save-settings-btn').addEventListener('click', () => {
         saveConfig();
@@ -684,15 +820,10 @@ function setupEventListeners() {
         });
     }
 
-    // Model select change: refresh the image-model options for the chosen main model.
-    // （GPT 代理端口选择器已从设置面板移除：gpt-5.5 由服务端 resolve_gateway 固定路由，
-    //   旧的 gpt-port-group 联动整块随之删除——之前它把整个 change 绑定都卡死了。）
-    const modelSelect = document.getElementById('settings-model');
-    if (modelSelect) {
-        modelSelect.addEventListener('change', () => {
-            updateImageModelOptions(false);
-        });
-    }
+    // 2026-07-12 生图模型与 LLM 模型解耦：原「主模型 change → 重置生图模型下拉」
+    // 的联动已删除（IMAGE_MODELS_BY_MAIN_MODEL 弃用）。生图模型清单固定为
+    // IMAGE_MODELS，混搭组合（gemini LLM + gpt-image-2 生图）由服务端
+    // resolve_gateway 按模型名自动路由。
 
     // Test API connection within Settings
     const testSettingsBtn = document.getElementById('test-settings-btn');
@@ -702,10 +833,12 @@ function setupEventListeners() {
             testSettingsBtn.textContent = '测试中...';
             testSettingsBtn.disabled = true;
             
+            // 配置中心的 Base URL / API Key / 模型下拉均已移除：测试连接直接用
+            // 当前生效的 config 对象（模型由激发页脚/帧序列卡片的内嵌选择器维护）
             const tempConfig = {
-                baseUrl: document.getElementById('settings-base-url').value.trim(),
-                apiKey: document.getElementById('settings-api-key').value.trim(),
-                model: document.getElementById('settings-model').value.trim()
+                baseUrl: config.baseUrl,
+                apiKey: config.apiKey,
+                model: config.model
             };
             
             try {
@@ -737,32 +870,29 @@ function setupEventListeners() {
     const closeLibrary = document.getElementById('close-library-btn');
     const libraryDrawer = document.getElementById('library-drawer');
     const tasksDrawer = document.getElementById('tasks-drawer');
-    
+
     openLibrary.addEventListener('click', () => {
-        if (tasksDrawer) {
-            tasksDrawer.classList.remove('active');
-            stopTasksPolling();
+        if (libraryDrawer.classList.contains('active')) {
+            closeLibraryDrawer();
+        } else {
+            openLibraryDrawer();
         }
-        libraryDrawer.classList.add('active');
-        renderLibrary();
     });
-    closeLibrary.addEventListener('click', () => libraryDrawer.classList.remove('active'));
+    closeLibrary.addEventListener('click', closeLibraryDrawer);
 
     // Tasks Drawer
     const openTasks = document.getElementById('toggle-tasks-btn');
     const closeTasks = document.getElementById('close-tasks-btn');
-    
+
     if (openTasks && closeTasks && tasksDrawer) {
         openTasks.addEventListener('click', () => {
-            if (libraryDrawer) libraryDrawer.classList.remove('active');
-            tasksDrawer.classList.add('active');
-            renderTasks();
-            startTasksPolling();
+            if (tasksDrawer.classList.contains('active')) {
+                closeTasksDrawer();
+            } else {
+                openTasksDrawer();
+            }
         });
-        closeTasks.addEventListener('click', () => {
-            tasksDrawer.classList.remove('active');
-            stopTasksPolling();
-        });
+        closeTasks.addEventListener('click', closeTasksDrawer);
     }
 
     // Tasks Drawer filter inputs and clear buttons
@@ -821,32 +951,6 @@ function setupEventListeners() {
     document.getElementById('generate-btn').addEventListener('click', () => generateIdea());
     document.getElementById('retry-btn').addEventListener('click', () => retryGeneration());
 
-    // Video Reverse Actions
-    const reverseBtn = document.getElementById('reverse-btn');
-    if (reverseBtn) {
-        reverseBtn.addEventListener('click', () => handleReverse());
-    }
-
-    const fpsInput = document.getElementById('fps-input');
-    if (fpsInput) {
-        fpsInput.addEventListener('input', (e) => {
-            const valEl = document.getElementById('fps-value');
-            if (valEl) valEl.textContent = parseFloat(e.target.value).toFixed(1);
-        });
-    }
-
-    const uploadZone = document.getElementById('upload-zone');
-    const fileInput = document.getElementById('video-file-input');
-    if (uploadZone && fileInput) {
-        uploadZone.addEventListener('click', () => {
-            if (!selectedVideoFile) fileInput.click();
-        });
-
-        fileInput.addEventListener('change', (e) => {
-            handleFileSelect(e.target.files[0]);
-        });
-    }
-
     // Cancel Generation Actions
     const cancelGenBtn = document.getElementById('cancel-generate-btn');
     if (cancelGenBtn) {
@@ -894,11 +998,11 @@ function setupEventListeners() {
     // Keyboard Hotkeys
     document.addEventListener('keydown', (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-            // 面板守卫：只有「激发维度」工作区可见且处于文本输入页时才触发主合成，
+            // 面板守卫：只有「激发维度」工作区可见时才触发主合成，
             // 否则在图像工坊/结果页按 Ctrl+Enter 会静默发起一次隐藏的 LLM 合成任务
             const configPanel = document.querySelector('.panel-left');
             const cfgActive = configPanel && configPanel.classList.contains('mobile-active');
-            if (cfgActive && activeInputTab === 'text') {
+            if (cfgActive) {
                 const genBtn = document.getElementById('generate-btn');
                 if (genBtn && !genBtn.disabled) {
                     genBtn.click();
@@ -978,6 +1082,7 @@ function setupEventListeners() {
     document.getElementById('copy-prompt-btn').addEventListener('click', copyPromptToClipboard);
     document.getElementById('copy-prompt-btn-all').addEventListener('click', copyPromptToClipboard);
     document.getElementById('copy-tiktok-meta-btn').addEventListener('click', copyTikTokMetaToClipboard);
+    document.getElementById('copy-tiktok-meta-cn-btn').addEventListener('click', copyTikTokMetaCnToClipboard);
     document.getElementById('make-cover-btn').addEventListener('click', () => generateCover());
     document.getElementById('generate-frames-btn').addEventListener('click', () => generateFrames());
     document.getElementById('generate-videos-btn').addEventListener('click', () => generateVideos());
@@ -1018,31 +1123,6 @@ function setupEventListeners() {
     const importFile = document.getElementById('import-file');
     importBtn.addEventListener('click', () => importFile.click());
     importFile.addEventListener('change', importLibrary);
-
-    // Close drawers when clicking outside
-    document.addEventListener('click', (e) => {
-        const libraryDrawer = document.getElementById('library-drawer');
-        const tasksDrawer = document.getElementById('tasks-drawer');
-        const toggleLibBtn = document.getElementById('toggle-library-btn');
-        const toggleTasksBtn = document.getElementById('toggle-tasks-btn');
-        
-        // For library drawer
-        if (libraryDrawer && libraryDrawer.classList.contains('active')) {
-            if (!libraryDrawer.contains(e.target) && 
-                (!toggleLibBtn || !toggleLibBtn.contains(e.target))) {
-                libraryDrawer.classList.remove('active');
-            }
-        }
-        
-        // For tasks drawer
-        if (tasksDrawer && tasksDrawer.classList.contains('active')) {
-            if (!tasksDrawer.contains(e.target) && 
-                (!toggleTasksBtn || !toggleTasksBtn.contains(e.target))) {
-                tasksDrawer.classList.remove('active');
-                stopTasksPolling();
-            }
-        }
-    });
 }
 
 // --- Tasks Drawer Functions & Polling ---
@@ -1052,26 +1132,32 @@ let tasksSearchQuery = '';
 let tasksFilterStatus = '';
 let tasksFilterType = '';
 
+// 图片/视频生成类任务一律不进激发任务列表（2026-07-12 用户要求）：帧序列、
+// 分步渲染、视频、封面的全过程都在各自模块内直播（含取消/重试入口），
+// 激发任务列表只保留创意激发（compose / auto_run）任务
+const MEDIA_TASK_TYPES = new Set(['frames', 'staged_render', 'videos', 'cover']);
+const isIdeationTask = (t) => !MEDIA_TASK_TYPES.has((t.dimensions && t.dimensions.type) || 'idea');
+
 async function renderTasks() {
     const tasksListContainer = document.getElementById('tasks-list');
     if (!tasksListContainer) return;
-    
+
     try {
         const response = await fetch('/api/tasks');
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const resData = await response.json();
-        const tasks = Array.isArray(resData) ? resData : (resData.tasks || []);
-        
+        const tasks = (Array.isArray(resData) ? resData : (resData.tasks || []))
+            .filter(isIdeationTask);
+
         // Update badge count
         updateTasksBadge(tasks);
         
         // Local filtering
         let filteredTasks = tasks.filter(task => {
             const theme = task.dimensions ? (task.dimensions.theme || '未命名主题') : '未命名主题';
-            const isVideoReverse = (task.dimensions && task.dimensions.type === 'reverse-video') || theme.startsWith('视频反推');
-            const beats = (task.dimensions && task.dimensions.beats_count && !isVideoReverse) ? ` (${task.dimensions.beats_count} 镜)` : '';
-            const taskTitle = isVideoReverse ? theme : `${theme}${beats}`;
-            
+            const beats = (task.dimensions && task.dimensions.beats_count) ? ` (${task.dimensions.beats_count} 镜)` : '';
+            const taskTitle = `${theme}${beats}`;
+
             if (tasksSearchQuery) {
                 const q = tasksSearchQuery.toLowerCase();
                 if (!taskTitle.toLowerCase().includes(q) && !String(task.id).includes(q)) {
@@ -1082,12 +1168,7 @@ async function renderTasks() {
                 if (task.status !== tasksFilterStatus) return false;
             }
             if (tasksFilterType) {
-                const taskType = task.dimensions ? task.dimensions.type : '';
-                let resolvedType = taskType || '';
-                if (!resolvedType) {
-                    if (theme.startsWith('视频反推')) resolvedType = 'reverse-video';
-                    else resolvedType = 'idea';
-                }
+                const resolvedType = (task.dimensions && task.dimensions.type) || 'idea';
                 if (resolvedType !== tasksFilterType) return false;
             }
             return true;
@@ -1105,10 +1186,9 @@ async function renderTasks() {
                 ? new Date(idMs).toLocaleString()
                 : (task.last_active ? new Date(task.last_active * 1000).toLocaleString() : '—');
             const theme = task.dimensions ? (task.dimensions.theme || '未命名主题') : '未命名主题';
-            const isVideoReverse = (task.dimensions && task.dimensions.type === 'reverse-video') || theme.startsWith('视频反推');
-            const beats = (task.dimensions && task.dimensions.beats_count && !isVideoReverse) ? ` (${task.dimensions.beats_count} 镜)` : '';
-            const taskTitle = isVideoReverse ? theme : `${theme}${beats}`;
-            
+            const beats = (task.dimensions && task.dimensions.beats_count) ? ` (${task.dimensions.beats_count} 镜)` : '';
+            const taskTitle = `${theme}${beats}`;
+
             let statusLabel = '';
             let statusClass = '';
             let footerButtons = '';
@@ -1119,48 +1199,18 @@ async function renderTasks() {
             if (task.status === 'running') {
                 statusLabel = '运行中';
                 statusClass = 'running';
-                
-                // Get progress percent and current stage from events (using historical maximum)
-                let progressPercent = 0;
-                let currentStage = '准备中...';
-                
-                if (task.events && task.events.length > 0) {
-                    let maxPercent = 0;
-                    let lastStageText = '正在生成...';
-                    
-                    task.events.forEach(evt => {
-                        const evtType = evt[0];
-                        const evtData = evt[1];
-                        
-                        if (evtType === 'progress') {
-                            const stage = evtData.stage;
-                            let pct = 0;
-                            if (stage === 'init') pct = 5;
-                            else if (stage === 'text_composing') pct = 25;
-                            else if (stage === 'text_composed') pct = 50;
-                            else if (stage === 'checking') pct = 75;
-                            else if (stage === 'repaired') pct = 90;
-                            else if (stage === 'keyframe_extraction') pct = 15;
-                            else if (stage === 'cv_analysis') pct = 40;
-                            else if (stage === 'semantic_metadata') pct = 70;
-                            else if (stage === 'prompt_composition') pct = 90;
-                            
-                            if (pct > maxPercent) {
-                                maxPercent = pct;
-                            }
-                            lastStageText = evtData.details || evtData.stage || lastStageText;
-                        } else if (evtType === 'text_chunk') {
-                            if (maxPercent < 35) {
-                                maxPercent = 35;
-                                lastStageText = '深度创意激发中...';
-                            }
-                        }
-                    });
-                    
-                    progressPercent = maxPercent;
-                    currentStage = lastStageText;
-                }
-                
+
+                // Reuse the same ProgressModel the main loading view drives itself with, so the
+                // drawer's mini progress bar tracks the real backend stages (outline/batch/audit/
+                // repair, or the frames/videos/cover equivalents) instead of a stale, hand-rolled
+                // stage list that no longer matches what the backend actually emits.
+                const taskType = window.ProgressModel ? ProgressModel.inferTaskType(task.dimensions) : 'compose';
+                const progressInfo = window.ProgressModel
+                    ? ProgressModel.progressFromEvents(task.events || [], taskType, null)
+                    : null;
+                const progressPercent = progressInfo ? progressInfo.percent : 0;
+                const currentStage = (progressInfo && progressInfo.label) || '准备中...';
+
                 progressHtml = `
                     <div class="task-progress-container">
                         <div class="task-progress-text">
@@ -1267,7 +1317,9 @@ async function startGlobalTasksBadgePolling() {
             const response = await fetch('/api/tasks');
             if (response.ok) {
                 const resData = await response.json();
-                const tasks = Array.isArray(resData) ? resData : (resData.tasks || []);
+                // 与 renderTasks 同口径：图片/视频生成类任务不计入任务列表角标
+                const tasks = (Array.isArray(resData) ? resData : (resData.tasks || []))
+                    .filter(isIdeationTask);
                 updateTasksBadge(tasks);
                 hasRunning = tasks.some(t => t.status === 'running');
             }
@@ -1283,22 +1335,6 @@ async function startGlobalTasksBadgePolling() {
 }
 
 async function viewTask(taskId, dimensions) {
-    const activeTaskId = localStorage.getItem('spark_active_task_id');
-    if (generationState.status === 'composing' && activeTaskId !== taskId) {
-        const confirmed = await customConfirm("当前有其他任务正在生成，切换查看该任务将接管主面板并替换当前日志流，确定继续吗？");
-        if (!confirmed) return;
-    } else {
-        const contentView = document.getElementById('output-content-view');
-        if (contentView && contentView.classList.contains('active')) {
-            const confirmed = await customConfirm("查看该运行中任务将清空并接管当前主面板的展示内容，确定继续吗？");
-            if (!confirmed) return;
-        }
-    }
-
-    const tasksDrawer = document.getElementById('tasks-drawer');
-    if (tasksDrawer) tasksDrawer.classList.remove('active');
-    stopTasksPolling();
-    
     const placeholderView = document.getElementById('output-placeholder-view');
     const loadingView = document.getElementById('output-loading-view');
     const contentView = document.getElementById('output-content-view');
@@ -1334,21 +1370,6 @@ async function viewTask(taskId, dimensions) {
 }
 
 async function loadCompletedTask(taskId) {
-    if (generationState.status === 'composing') {
-        const confirmed = await customConfirm("当前有任务正在运行，载入历史任务将中断当前生成的实时展示，确定继续吗？");
-        if (!confirmed) return;
-    } else {
-        const contentView = document.getElementById('output-content-view');
-        if (contentView && contentView.classList.contains('active')) {
-            const confirmed = await customConfirm("载入此任务将覆盖当前主面板展示的内容，确定继续吗？");
-            if (!confirmed) return;
-        }
-    }
-
-    const tasksDrawer = document.getElementById('tasks-drawer');
-    if (tasksDrawer) tasksDrawer.classList.remove('active');
-    stopTasksPolling();
-    
     const placeholderView = document.getElementById('output-placeholder-view');
     const loadingView = document.getElementById('output-loading-view');
     const contentView = document.getElementById('output-content-view');
@@ -1365,8 +1386,8 @@ async function loadCompletedTask(taskId) {
             const result = {
                 id: task.id,
                 title: data.title || '未命名创意',
-                theme: task.dimensions ? task.dimensions.theme : '视频反推',
-                creativity: task.dimensions ? task.dimensions.creativity : '多模态反推',
+                theme: task.dimensions ? task.dimensions.theme : '未命名主题',
+                creativity: task.dimensions ? task.dimensions.creativity : '',
                 prompt_block: data.prompt_block || data.raw || '',
                 audit_md: data.audit_md || '',
                 repair_md: data.repair_md || '',
@@ -1377,12 +1398,15 @@ async function loadCompletedTask(taskId) {
                 covers: data.covers || [],
                 frameRun: data.frameRun || null,
                 english_title: data.english_title || '',
+                social_title_en: data.social_title_en || '',
+                social_title_cn: data.social_title_cn || '',
                 collage_url: data.collage_url || ''
             };
             
             currentIdea = result;
             saveCurrentIdeaState();
             generationState.status = 'idle';
+            clearLiveBeatsPanel();
             renderIdea(result);
             switchMainTab('results');
 
@@ -1485,19 +1509,18 @@ async function deleteTask(taskId, event) {
 
 async function retryTask(taskId, dimensions, event) {
     if (event) event.stopPropagation();
-    
-    const tasksDrawer = document.getElementById('tasks-drawer');
-    if (tasksDrawer) {
-        tasksDrawer.classList.remove('active');
-        stopTasksPolling();
-    }
-    
+
+    closeTasksDrawer();
+
     showToast("正在重新提交该生成任务...", "info");
-    
+
     try {
+        // 沿用被重试任务的 task_id：后端会原地重置这条终态记录复用，
+        // 重试直接覆盖旧的失败记录，任务列表不再留一条失败 + 一条新记录
         await generateIdea({
             dimensions: dimensions,
-            config: config
+            config: config,
+            taskId: taskId
         });
     } catch (e) {
         console.error("Retry task failed:", e);
@@ -1619,10 +1642,11 @@ async function generateIdea(retryParams = null) {
         genBtn.classList.add('loading');
     }
 
-    let dimensions, currentConf;
+    let dimensions, currentConf, reuseTaskId = null;
     if (retryParams) {
         dimensions = retryParams.dimensions;
         currentConf = retryParams.config;
+        reuseTaskId = retryParams.taskId ? String(retryParams.taskId) : null;
     } else {
         // Collect GUI dimensions
         const activeThemeBtn = document.querySelector('#theme-selector .theme-btn.active');
@@ -1643,14 +1667,16 @@ async function generateIdea(retryParams = null) {
         currentConf = { ...config };
     }
 
-    // Save last params for retry
-    generationState.lastParams = { dimensions, config: currentConf };
+    // Generate unique taskId (retry reuses the failed record's id so the rerun
+    // overwrites that record server-side instead of piling up a duplicate)
+    const taskId = reuseTaskId || Date.now().toString();
+
+    // Save last params for retry — include taskId so the error-view retry button
+    // also overwrites this run's record instead of creating a new one
+    generationState.lastParams = { dimensions, config: currentConf, taskId };
     generationState.status = 'composing';
 
     setupLoadingSteps('compose');
-
-    // Generate unique taskId
-    const taskId = Date.now().toString();
 
     // Persist active task to localStorage so it survives refresh/close
     localStorage.setItem('spark_active_task_id', taskId);
@@ -1739,14 +1765,21 @@ async function streamProgress(taskId, dimensions) {
                 if (!isCurrent()) return;
                 if (type === 'progress') {
                     updateProgressUI(data || {});
+                    handleComposeProgressExtras(data || {});
                     applyComposeProgress(type, data);
                 } else if (type === 'text_chunk') {
                     appendLiveTerminal(data);
                     applyComposeProgress(type, data);
+                } else if (type === 'review_pause') {
+                    // auto_run 任务（自治管线）的监修暂停也走同一块审阅面板
+                    showFrameReviewPanel(taskId, data);
+                } else if (type === 'review_resume') {
+                    hideFrameReviewPanel();
                 } else if (type === 'reconnecting') {
                     const stageText = document.getElementById('loading-stage-text');
                     if (stageText) stageText.textContent = `与服务的连接中断，正在自动重连（第 ${data.attempt} 次）...`;
                 } else if (type === 'result' || type === 'error') {
+                    hideFrameReviewPanel();
                     applyComposeProgress(type, data);
                 }
             }
@@ -1769,30 +1802,33 @@ async function streamProgress(taskId, dimensions) {
         }
 
         const data = watch.result;
-        const isVideoReverse = dimensions.type === 'reverse-video' || (dimensions.theme && dimensions.theme.startsWith('视频反推'));
-        
+
         const result = {
             id: taskId,
             title: data.title || '未命名创意',
-            theme: dimensions.theme || '视频反推',
-            creativity: dimensions.creativity || '多模态反推',
+            theme: dimensions.theme || '未命名主题',
+            creativity: dimensions.creativity || '',
             prompt_block: data.prompt_block || data.raw || '',
             audit_md: data.audit_md || '',
             repair_md: data.repair_md || '',
-            timestamp: new Date(parseInt(taskId, 10)).toLocaleString(),
+            // 复用的重试 id 可能是 auto_ 前缀（parseInt 得 NaN）→ 落到当前时间
+            timestamp: new Date(Number.isFinite(parseInt(taskId, 10)) ? parseInt(taskId, 10) : Date.now()).toLocaleString(),
             timings: data.timings || {},
             image_count: data.image_count || 0,
             video_count: data.video_count || 0,
             collage_url: data.collage_url || '',
             covers: data.covers || [],
             frameRun: data.frameRun || null,
-            english_title: data.english_title || ''
+            english_title: data.english_title || '',
+            social_title_en: data.social_title_en || '',
+            social_title_cn: data.social_title_cn || ''
         };
 
         currentIdea = result;
         saveCurrentIdeaState();
         generationState.status = 'idle';
 
+        clearLiveBeatsPanel();
         renderIdea(result);
         switchMainTab('results');
 
@@ -1806,13 +1842,9 @@ async function streamProgress(taskId, dimensions) {
         loadingView.classList.remove('active');
         contentView.classList.add('active');
         
-        if (isVideoReverse) {
-            showToast("视频反推提示词成功！", "success");
-        } else {
-            showToast("提示词集合合成成功！已开始在后台制作封面图。", "success");
-            // Background asynchronous cover generation
-            generateCover();
-        }
+        showToast("提示词集合合成成功！已开始在后台制作封面图。", "success");
+        // Background asynchronous cover generation
+        generateCover();
 
     } catch (e) {
         // 旧一代流的收尾不允许触碰新一代流的 UI（viewTask/retryTask 接管场景）
@@ -1826,11 +1858,9 @@ async function streamProgress(taskId, dimensions) {
 
         generationState.status = 'idle';
 
-        const isVideoReverse = dimensions.type === 'reverse-video' || (dimensions.theme && dimensions.theme.startsWith('视频反推'));
-
         if (e.name === 'AbortError') {
             placeholderView.classList.add('active');
-            showToast(isVideoReverse ? "视频反推已被取消" : "合成已被取消或已超时", "info");
+            showToast("合成已被取消或已超时", "info");
         } else {
             generationState.status = 'error';
             if (errorView) {
@@ -1839,15 +1869,13 @@ async function streamProgress(taskId, dimensions) {
                 placeholderView.classList.add('active');
             }
 
-            let errorMsg = isVideoReverse ? "视频反推发生错误。" : "合成发生阻碍，请检查本地 API 与 skill 路径。";
+            let errorMsg = "合成发生阻碍，请检查本地 API 与 skill 路径。";
             if (e.message) {
                 const raw = String(e.message);
                 if (/network error|failed to fetch|networkerror|load failed/i.test(raw)) {
-                    errorMsg = isVideoReverse
-                        ? "反推连接已断开：与本地服务的实时连接中断。请确认 SPARK 服务仍在运行，然后点击「重试」。"
-                        : "合成连接已断开：与本地服务的实时连接中断。请确认 SPARK 服务（端口 8085）与 Antigravity 代理（端口 8046）仍在运行，然后点击「重试」。";
+                    errorMsg = "合成连接已断开：与本地服务的实时连接中断。请确认 SPARK 服务（端口 8085）与 Antigravity 代理（端口 8046）仍在运行，然后点击「重试」。";
                 } else {
-                    errorMsg = isVideoReverse ? `视频反推失败：${raw}` : `合成失败：${raw}`;
+                    errorMsg = `合成失败：${raw}`;
                 }
             }
 
@@ -1862,11 +1890,6 @@ async function streamProgress(taskId, dimensions) {
             if (genBtn) {
                 genBtn.disabled = false;
                 genBtn.classList.remove('loading');
-            }
-            const reverseBtn = document.getElementById('reverse-btn');
-            if (reverseBtn) {
-                reverseBtn.disabled = false;
-                reverseBtn.classList.remove('loading');
             }
             updateActiveGenerationBanner();
         }
@@ -1953,31 +1976,19 @@ async function resumeActiveTaskIfExists() {
             if (errorView) errorView.style.display = 'none';
             if (loadingView) loadingView.classList.add('active');
             switchMainTab('results');
-            
-            const isVideoReverse = dimensions.type === 'reverse-video' || (dimensions.theme && dimensions.theme.startsWith('视频反推'));
-            setupLoadingSteps(isVideoReverse ? 'reverse-video' : 'compose');
+
+            setupLoadingSteps('compose');
 
             const loadingHeader = loadingView.querySelector('h3');
             const loadingStage = document.getElementById('loading-stage-text');
-            if (isVideoReverse) {
-                if (loadingHeader) loadingHeader.textContent = '正在反向逆向视频工程...';
-                if (loadingStage) loadingStage.textContent = '正在提取视频关键帧、计算亮度与运动变化，并提交给多模态大模型进行时序 and 物理一致性分析。';
-                
-                const reverseBtn = document.getElementById('reverse-btn');
-                if (reverseBtn) {
-                    reverseBtn.disabled = true;
-                    reverseBtn.classList.add('loading');
-                }
-            } else {
-                if (loadingHeader) loadingHeader.textContent = '正在按 skill 契约合成提示词...';
-                if (loadingStage) loadingStage.textContent = '解析主题，拆解场景变量与施工节拍...';
-                
-                if (genBtn) {
-                    genBtn.disabled = true;
-                    genBtn.classList.add('loading');
-                }
+            if (loadingHeader) loadingHeader.textContent = '正在按 skill 契约合成提示词...';
+            if (loadingStage) loadingStage.textContent = '解析主题，拆解场景变量与施工节拍...';
+
+            if (genBtn) {
+                genBtn.disabled = true;
+                genBtn.classList.add('loading');
             }
-            
+
             generationState.status = 'composing';
             updateActiveGenerationBanner();
             
@@ -2056,6 +2067,66 @@ function updateFrameSlotCard(f) {
     });
 }
 
+/* ── 帧序列实时生成动态 ─────────────────────────────────────────────
+   生成过程直接在「连续帧序列生成」模块内滚动直播（逐帧渲染/质检结论/重试原因），
+   不必打开任务列表。只增量追加行、贴底才自动跟随，行数上限 300。 */
+function framesFeedSetLive(isLive) {
+    const dot = document.getElementById('frames-feed-dot');
+    if (dot) dot.classList.toggle('active', !!isLive);
+}
+
+function framesFeedReset(introText) {
+    const wrap = document.getElementById('frames-live-feed');
+    const lines = document.getElementById('frames-live-feed-lines');
+    if (!wrap || !lines) return;
+    lines.innerHTML = '';
+    wrap.style.display = 'block';
+    framesFeedSetLive(true);
+    if (introText) framesFeedLine(introText);
+}
+
+function framesFeedLine(text, cls) {
+    const lines = document.getElementById('frames-live-feed-lines');
+    if (!lines) return;
+    const wrap = document.getElementById('frames-live-feed');
+    if (wrap && wrap.style.display === 'none') wrap.style.display = 'block';
+    const nearBottom = lines.scrollHeight - lines.scrollTop - lines.clientHeight < 60;
+    const d = new Date();
+    const p = n => String(n).padStart(2, '0');
+    const line = document.createElement('div');
+    line.className = 'gen-feed-line' + (cls ? ` ${cls}` : '');
+    const safeText = escapeHtml(String(text).length > 220 ? String(text).slice(0, 220) + '…' : String(text));
+    line.innerHTML = `<span class="gen-feed-time">[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}]</span> ${safeText}`;
+    lines.appendChild(line);
+    while (lines.children.length > 300) lines.removeChild(lines.firstChild);
+    if (nearBottom) lines.scrollTop = lines.scrollHeight;
+}
+
+function framesFeedQualityLine(f) {
+    if (!f) return;
+    const seq = String(f.sequence || 0).padStart(3, '0');
+    const gate = f.quality_gate;
+    const reason = typeof f.vlm_qa_reason === 'string' ? f.vlm_qa_reason : '';
+    if (gate === 'auto_approved') {
+        if (reason.indexOf('WARN') === 0) {
+            framesFeedLine(`✅ IMG ${seq} 完成（宽松放行留痕：${reason.replace(/^WARN:?\s*/, '')}）`, 'warn');
+        } else {
+            framesFeedLine(`✅ IMG ${seq} 完成（质检通过）`, 'ok');
+        }
+    } else if (gate === 'auto_approved_degraded') {
+        const cause = reason.indexOf('qaGateLevel=off') !== -1
+            ? '质检门已关闭，未质检'
+            : '质检判定服务异常 fail-open：帧已渲染但未经核验，可单帧重试复检';
+        framesFeedLine(`⚠️ IMG ${seq} 已放行（${cause}）`, 'warn');
+    } else if (gate === 'vlm_qa_failed') {
+        framesFeedLine(`❌ IMG ${seq} 质检未通过（${reason || '原因未知'}），已保留末次渲染结果，可单帧重试`, 'err');
+    } else if (gate === 'pending_manual_review') {
+        framesFeedLine(`✅ IMG ${seq} 完成（首帧/无前帧可比，未质检）`, 'ok');
+    } else {
+        framesFeedLine(`✅ IMG ${seq} 完成`, 'ok');
+    }
+}
+
 async function streamFramesProgress(taskId) {
     const btn = document.getElementById('generate-frames-btn');
     const progress = document.getElementById('frames-progress');
@@ -2087,6 +2158,7 @@ async function streamFramesProgress(taskId) {
         return info;
     };
     applyFramesProgress('queue', { message: '连接帧生成事件流...' });
+    framesFeedReset('🔌 已连接帧生成事件流，等待后台开始…');
 
     try {
         const watch = await watchTaskUntilTerminal(taskId, {
@@ -2098,6 +2170,7 @@ async function streamFramesProgress(taskId) {
                     applyFramesProgress('start', data);
                     const total = (data && data.total) || 0;
                     meta.textContent = `开始生成共 ${total} 帧序列图...`;
+                    framesFeedLine(`🚀 开始生成，共 ${total} 帧（首帧文生图，后续逐帧图生图链式推进）`);
 
                     if (currentIdea) {
                         if (!currentIdea.frameRun) {
@@ -2132,20 +2205,61 @@ async function streamFramesProgress(taskId) {
                     } else {
                         meta.textContent = `正在生成帧序列: ${cur}/${tot} (已生成完毕，正在整理)...`;
                     }
+                    framesFeedQualityLine(f);
                     updateFrameSlotCard(f);
                     applyFrameEventToIdea(f);
-                } else if (type === 'frame_start' || type === 'frame_retry' || type === 'queue') {
+                } else if (type === 'frame_start' || type === 'frame_retry' || type === 'queue' || type === 'frame_qa') {
                     const info = applyFramesProgress(type, data);
                     if (info && info.label) meta.textContent = info.label;
+                    if (type === 'frame_retry') {
+                        const reason = data && data.reason ? `：${data.reason}` : '';
+                        framesFeedLine(`🔁 ${(info && info.label) || '质检重试'}${reason}`, 'warn');
+                    } else if (type === 'frame_start' && info && info.label) {
+                        framesFeedLine(`🎨 ${info.label}`);
+                    } else if (type === 'frame_qa') {
+                        const seq = data && (data.sequence || data.slot);
+                        framesFeedLine(`🧪 IMG ${String(seq || 0).padStart(3, '0')} 质检判定中…`);
+                    }
+                } else if (type === 'upstream_retry') {
+                    // 上游秒报错秒可见：后端每次尝试失败即时推送，不再闷头退避
+                    const a = (data && data.attempt) || '?';
+                    const m = (data && data.max_attempts) || '?';
+                    const tail = data && data.retry_in
+                        ? `，${data.retry_in}s 后自动重试（第 ${a}/${m} 次）`
+                        : `（第 ${a}/${m} 次，此路终止——若有兜底/收尾会紧随其后，否则任务即将报错结束）`;
+                    framesFeedLine(`⚠️ 上游报错：${(data && data.error) || '未知错误'}${tail}`, 'warn');
+                    meta.textContent = `上游报错，自动重试中（第 ${a}/${m} 次）...`;
+                } else if (type === 'model_fallback') {
+                    const to = (data && data.to) || '兜底模型';
+                    const seqNo = data && (data.sequence || data.slot);
+                    framesFeedLine(`🔀 主模型配额耗尽，切换兜底模型 ${to} 继续渲染 IMG ${String(seqNo || 0).padStart(3, '0')}…`, 'warn');
+                    meta.textContent = `主模型配额耗尽，兜底模型 ${to} 渲染中...`;
+                } else if (type === 'review_pause') {
+                    // 监修模式：关键点暂停，弹出审阅面板等待 采用/重渲
+                    showFrameReviewPanel(taskId, data);
+                    meta.textContent = (data && data.message) || '监修暂停，等待人工确认...';
+                    framesFeedLine(`⏸️ ${(data && data.message) || '监修暂停，等待人工确认…'}`, 'warn');
+                } else if (type === 'review_resume') {
+                    hideFrameReviewPanel();
+                    framesFeedLine(`▶️ ${(data && data.message) || '监修继续'}`);
+                } else if (type === 'chain_drift_check' || type === 'anchor_recalibrated' || type === 'reanchor') {
+                    // 检查点现实同步/链回望/重锚定：动态流留痕
+                    if (data && data.message) {
+                        framesFeedLine(`${type === 'reanchor' ? '⚓' : '🔭'} ${data.message}`,
+                                       (type === 'reanchor' || (type === 'chain_drift_check' && data.passed === false)) ? 'warn' : undefined);
+                    }
                 } else if (type === 'reconnecting') {
                     meta.textContent = `连接中断，正在重连（第 ${data.attempt} 次）...`;
+                    framesFeedLine(`⚠️ 连接中断，正在重连（第 ${data.attempt} 次）…`, 'warn');
                 } else if (type === 'result' || type === 'error') {
+                    hideFrameReviewPanel();
                     applyFramesProgress(type, data);
                 }
             }
         });
 
         if (!isCurrent()) return;
+        hideFrameReviewPanel();
         if (currentFramesController === controller) currentFramesController = null;
         activeBackgroundTasks.framesTaskId = null;
         saveActiveBackgroundTasksToLocalStorage();
@@ -2160,6 +2274,7 @@ async function streamFramesProgress(taskId) {
         if (watch.result) {
             await syncFrameRunToLibrary(watch.result);
             renderFramesForIdea(currentIdea);
+            framesFeedLine(`🏁 帧序列全部完成，共 ${(watch.result.frames || []).length} 帧`, 'ok');
             showToast(`已成功生成 ${(watch.result.frames || []).length} 帧连续帧序列图。`, "success");
         }
     } catch (e) {
@@ -2168,9 +2283,11 @@ async function streamFramesProgress(taskId) {
         console.error("Failed to generate frames:", e);
         if (e.name === 'AbortError') {
             meta.textContent = '帧序列生成已被用户取消。';
+            framesFeedLine('⏹ 帧序列生成已被用户取消', 'warn');
             showToast('已取消帧序列生成', 'info');
         } else {
             meta.textContent = `帧序列生成失败: ${e.message}`;
+            framesFeedLine(`❌ 帧序列生成失败：${e.message}`, 'err');
             showToast(`帧序列生成失败: ${e.message}`, "error");
         }
 
@@ -2186,6 +2303,7 @@ async function streamFramesProgress(taskId) {
             btn.disabled = false;
             activeBackgroundTasks.frames = false;
             updateTabStatusDot();
+            framesFeedSetLive(false);
         }
     }
 }
@@ -2384,13 +2502,27 @@ async function streamCoverProgress(taskId) {
         if (englishTitle) {
             currentIdea.english_title = englishTitle;
         }
+        // 旧创意补齐发布用双语标题行（后端只在缺字段时才生成并随结果返回）
+        if (data.social_title_en && !currentIdea.social_title_en) {
+            currentIdea.social_title_en = data.social_title_en;
+        }
+        if (data.social_title_cn && !currentIdea.social_title_cn) {
+            currentIdea.social_title_cn = data.social_title_cn;
+        }
         saveCurrentIdeaState();
+        renderIdeaTitles(currentIdea);
 
         const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
         if (existingIdx !== -1) {
             savedIdeas[existingIdx].covers = currentIdea.covers;
             if (englishTitle) {
                 savedIdeas[existingIdx].english_title = englishTitle;
+            }
+            if (currentIdea.social_title_en) {
+                savedIdeas[existingIdx].social_title_en = currentIdea.social_title_en;
+            }
+            if (currentIdea.social_title_cn) {
+                savedIdeas[existingIdx].social_title_cn = currentIdea.social_title_cn;
             }
             await saveLibrary();
         }
@@ -2434,30 +2566,23 @@ function updateLoadingStep(id, status) {
     el.className = status;
 }
 
-function setupLoadingSteps(type) {
+function setupLoadingSteps() {
     const step1 = document.getElementById('step-1');
     const step2 = document.getElementById('step-2');
     const step3 = document.getElementById('step-3');
     const step4 = document.getElementById('step-4');
     if (!step1 || !step2 || !step3 || !step4) return;
-    
+
     // reset classes
     step1.className = 'pending';
     step2.className = 'pending';
     step3.className = 'pending';
     step4.className = 'pending';
-    
-    if (type === 'reverse-video') {
-        step1.textContent = '提取视频关键帧...';
-        step2.textContent = '计算运动与光照变化 (CV 启发式)...';
-        step3.textContent = '大模型多模态视频分析与时序语义提取...';
-        step4.textContent = '合成 SCUP 契约提示词并进行物理一致性审计...';
-    } else {
-        step1.textContent = '解析主题，拆解场景变量与施工节拍...';
-        step2.textContent = '装配 Drift Lock 与九宫格锚点...';
-        step3.textContent = '渲染 IMAGE 锚点与连续动作 VIDEO 链...';
-        step4.textContent = '运行质量门 + 工序与场景一致性二次校验与修复...';
-    }
+
+    step1.textContent = '解析主题，拆解场景变量与施工节拍...';
+    step2.textContent = '装配 Drift Lock 与九宫格锚点...';
+    step3.textContent = '渲染 IMAGE 锚点与连续动作 VIDEO 链...';
+    step4.textContent = '运行质量门 + 工序与场景一致性二次校验与修复...';
 }
 
 // Render the composed prompt set + quality audit report to the DOM.
@@ -2577,17 +2702,30 @@ function renderLibrary() {
                 return;
             }
             loadSavedIdea(idea);
-            document.getElementById('library-drawer').classList.remove('active');
         });
         
         list.appendChild(card);
     });
 }
 
-function deleteFromLibrary(id) {
+async function deleteFromLibrary(id) {
+    const idea = savedIdeas.find(item => item.id === id);
+
+    if (idea && idea.title) {
+        try {
+            await fetch('/api/library/delete_item', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title: idea.title, covers: idea.covers || [] })
+            });
+        } catch (e) {
+            console.error("Delete idea output files request failed:", e);
+        }
+    }
+
     savedIdeas = savedIdeas.filter(item => item.id !== id);
     saveLibrary();
-    showToast("已从点子库删除", "success");
+    showToast("已从点子库删除，生成的图片/视频文件已一并清理", "success");
     updateFavoriteButtonState();
 }
 
@@ -2676,7 +2814,7 @@ function exportIdeaMarkdown() {
     }
 
     const tiktokMeta = getIdeaTikTokMeta(currentIdea);
-    let hookMarkdown = `\n*TikTok US 推荐主题和 tags：${tiktokMeta.english}*\n*中文翻译：${tiktokMeta.chinese}*\n`;
+    let hookMarkdown = `\n*TikTok US 标题和 tags：${tiktokMeta.english}*\n*国内社媒标题和话题：${tiktokMeta.chinese}*\n`;
 
     const markdownContent = `# ${currentIdea.title}
 *场景主题：${currentIdea.theme}*
@@ -2719,7 +2857,17 @@ ${currentIdea.audit_md || '（本次未返回审核报告）'}
 function copyTikTokMetaToClipboard() {
     const meta = getIdeaTikTokMeta(currentIdea);
     copyText(meta.english).then(() => {
-        showToast("TikTok 主题和 hashtags 已复制！", "success");
+        showToast("TikTok 标题和 tags 已复制！", "success");
+    }).catch(err => {
+        showToast("复制失败，请手动选择复制", "error");
+        console.error(err);
+    });
+}
+
+function copyTikTokMetaCnToClipboard() {
+    const meta = getIdeaTikTokMeta(currentIdea);
+    copyText(meta.chinese).then(() => {
+        showToast("中文标题和话题已复制！", "success");
     }).catch(err => {
         showToast("复制失败，请手动选择复制", "error");
         console.error(err);
@@ -3310,247 +3458,6 @@ function updateActiveGenerationBanner() {
         banner.style.display = 'none';
     }
 }
-
-// =====================================================================
-// Video Reverse Engineering Handlers
-// =====================================================================
-window.switchInputTab = function(tab) {
-    activeInputTab = tab;
-    document.getElementById('input-tab-text').classList.toggle('active', tab === 'text');
-    document.getElementById('input-tab-video').classList.toggle('active', tab === 'video');
-
-    document.getElementById('input-pane-text').classList.toggle('active', tab === 'text');
-    document.getElementById('input-pane-video').classList.toggle('active', tab === 'video');
-
-    const footerText = document.getElementById('footer-pane-text');
-    const footerVideo = document.getElementById('footer-pane-video');
-    if (footerText) footerText.classList.toggle('active', tab === 'text');
-    if (footerVideo) footerVideo.classList.toggle('active', tab === 'video');
-};
-
-window.clearSelectedFile = function(event) {
-    if (event) event.stopPropagation();
-    selectedVideoFile = null;
-    document.getElementById('video-file-input').value = '';
-
-    const zone = document.getElementById('upload-zone');
-    const fileInfo = document.getElementById('selected-file-info');
-    if (fileInfo) fileInfo.style.display = 'none';
-
-    // Restore text
-    if (zone) {
-        const icon = zone.querySelector('.upload-icon');
-        const txt = zone.querySelector('.upload-text');
-        const hint = zone.querySelector('.upload-hint');
-        if (icon) icon.style.display = 'block';
-        if (txt) txt.style.display = 'block';
-        if (hint) hint.style.display = 'block';
-    }
-};
-
-function handleFileSelect(file) {
-    if (!file) return;
-
-    const name = file.name.toLowerCase();
-    if (!name.endsWith('.mp4') && !name.endsWith('.mov') && !name.endsWith('.avi') && !name.endsWith('.webm')) {
-        showToast('仅支持 .mp4, .mov, .avi, .webm 格式的视频文件！', 'error');
-        clearSelectedFile();
-        return;
-    }
-
-    selectedVideoFile = file;
-
-    const zone = document.getElementById('upload-zone');
-    const fileInfo = document.getElementById('selected-file-info');
-
-    if (zone && fileInfo) {
-        // Hide default text
-        const icon = zone.querySelector('.upload-icon');
-        const txt = zone.querySelector('.upload-text');
-        const hint = zone.querySelector('.upload-hint');
-        if (icon) icon.style.display = 'none';
-        if (txt) txt.style.display = 'none';
-        if (hint) hint.style.display = 'none';
-
-        // Show file info
-        fileInfo.style.display = 'flex';
-        const nameEl = fileInfo.querySelector('.file-name');
-        if (nameEl) {
-            nameEl.textContent = file.name;
-            nameEl.title = file.name;
-        }
-    }
-}
-
-async function handleReverse() {
-    if (!selectedVideoFile) {
-        showToast("请先上传一个视频文件！", "error");
-        return;
-    }
-
-    const fps = document.getElementById('fps-input').value;
-    const api = document.getElementById('api-select').value;
-    const promptStyle = document.getElementById('prompt-style-select')?.value || 'clean';
-
-    const placeholderView = document.getElementById('output-placeholder-view');
-    const loadingView = document.getElementById('output-loading-view');
-    const contentView = document.getElementById('output-content-view');
-    const errorView = document.getElementById('output-error-view');
-    const genBtn = document.getElementById('generate-btn');
-    const reverseBtn = document.getElementById('reverse-btn');
-
-    placeholderView.classList.remove('active');
-    contentView.classList.remove('active');
-    if (errorView) errorView.style.display = 'none';
-    loadingView.classList.add('active');
-    switchMainTab('results');
-    updateActiveGenerationBanner();
-
-    if (reverseBtn) {
-        reverseBtn.disabled = true;
-        reverseBtn.classList.add('loading');
-    }
-    if (genBtn) {
-        genBtn.disabled = true;
-    }
-
-    // Set custom loading text for video reverse engineering
-    const loadingStage = document.getElementById('loading-stage-text');
-    const loadingHeader = loadingView.querySelector('h3');
-
-    // Generate unique taskId
-    const taskId = Date.now().toString();
-    const videoNameClean = selectedVideoFile.name.replace(/\.[^/.]+$/, "");
-    const theme = `视频反推 (${videoNameClean})`;
-    const creativity = api === 'openai' ? 'GPT-4o-Mini' : (api === 'gemini' ? 'Gemini-1.5-Flash' : '多模态反推');
-    const dimensions = {
-        theme: theme,
-        creativity: creativity,
-        type: 'reverse-video'
-    };
-
-    // Persist active task to localStorage so it survives refresh/close
-    localStorage.setItem('spark_active_task_id', taskId);
-    localStorage.setItem('spark_active_task_dimensions', JSON.stringify(dimensions));
-
-    generationState.progressTaskType = 'reverse-video';
-    generationState.progressState = window.ProgressModel ? ProgressModel.createProgressState('reverse-video') : null;
-    setupLoadingSteps('reverse-video');
-
-    if (loadingHeader) {
-        loadingHeader.textContent = '正在反向逆向视频工程...';
-    }
-    if (loadingStage) {
-        loadingStage.textContent = '正在提取视频关键帧、计算亮度与运动变化，并提交给多模态大模型进行时序 and 物理一致性分析。';
-    }
-
-    startLoadingTimer();
-    
-    // Log to terminal for cool visual progress feedback
-    appendLiveTerminal("[SYSTEM] Video Upload received. Starting video reverse engineering pipeline...\n");
-    appendLiveTerminal(`[SYSTEM] Video file: ${selectedVideoFile.name} (${(selectedVideoFile.size / (1024 * 1024)).toFixed(2)} MB)\n`);
-    appendLiveTerminal(`[SYSTEM] Target sampling FPS: ${fps}\n`);
-    appendLiveTerminal(`[SYSTEM] Prompt Style: ${promptStyle === 'clean' ? 'Clean Cinematic' : 'Strict Technical SCUP'}\n`);
-    appendLiveTerminal(`[SYSTEM] Multi-modal API: ${api === 'auto' ? 'Auto-detecting Key' : api}\n`);
-    appendLiveTerminal("[SYSTEM] Step 1: Extracting keyframes using FFmpeg...\n");
-
-    const formData = new FormData();
-    formData.append('file', selectedVideoFile);
-    formData.append('fps', fps);
-    formData.append('api', api);
-    formData.append('prompt_style', promptStyle);
-    formData.append('config', JSON.stringify(config));
-    formData.append('task_id', taskId);
-
-    currentGenerationController = new AbortController();
-
-    try {
-        const response = await fetch('/api/reverse-video', {
-            method: 'POST',
-            body: formData,
-            signal: currentGenerationController.signal
-        });
-
-        const data = await response.json();
-
-        if (!response.ok) {
-            throw new Error(data.error || `HTTP Error ${response.status}`);
-        }
-
-        // Wait for streaming progress
-        await streamProgress(taskId, dimensions);
-
-    } catch (err) {
-        stopLoadingTimer();
-        localStorage.removeItem('spark_active_task_id');
-        localStorage.removeItem('spark_active_task_dimensions');
-        currentGenerationController = null;
-        console.error("Failed to reverse video:", err);
-
-        loadingView.classList.remove('active');
-        contentView.classList.remove('active');
-        generationState.status = 'idle';
-
-        if (err.name === 'AbortError') {
-            placeholderView.classList.add('active');
-            showToast("反推已被取消", "info");
-        } else {
-            generationState.status = 'error';
-            if (errorView) {
-                errorView.style.display = 'flex';
-            } else {
-                placeholderView.classList.add('active');
-            }
-
-            const errMsgEl = document.getElementById('error-message-text');
-            const errorMsg = `反推失败：${err.message || '未知错误'}`;
-            if (errMsgEl) {
-                errMsgEl.textContent = errorMsg;
-            }
-            showToast(errorMsg, "error");
-        }
-    } finally {
-        if (reverseBtn) {
-            reverseBtn.disabled = false;
-            reverseBtn.classList.remove('loading');
-        }
-        if (genBtn) {
-            genBtn.disabled = false;
-        }
-        updateActiveGenerationBanner();
-    }
-}
-
-
-function setupVideoUploadDragAndDrop() {
-    const uploadZone = document.getElementById('upload-zone');
-    if (!uploadZone) return;
-
-    ['dragenter', 'dragover'].forEach(eventName => {
-        uploadZone.addEventListener(eventName, (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            uploadZone.classList.add('dragover');
-        }, false);
-    });
-
-    ['dragleave', 'drop'].forEach(eventName => {
-        uploadZone.addEventListener(eventName, (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            uploadZone.classList.remove('dragover');
-        }, false);
-    });
-
-    uploadZone.addEventListener('drop', (e) => {
-        const dt = e.dataTransfer;
-        const files = dt.files;
-        if (files.length > 0) {
-            handleFileSelect(files[0]);
-        }
-    });
-}
-
 
 // ==========================================================================
 // Upstream Topic Ideation Engine (P2)

@@ -2,15 +2,45 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>SPARK 开发者中心 & 控制台</title>
   <script>(function(){try{if(localStorage.getItem('spark_theme')==='dark'){document.documentElement.setAttribute('data-theme','dark');}}catch(e){}})();</script>
-  <link rel="stylesheet" href="css/tokens.css?v=1.1.0">
+  <!-- Load-failure guard: js/*.js are separate blocking requests sharing one global
+       scope (no bundler). If any 404s, or throws while executing, everything after it
+       is silently undefined and the UI looks broken with no clue why. Surface it instead. -->
+  <script>(function(){
+      var issues = [];
+      window.addEventListener('error', function(e){
+          var t = e.target;
+          if (t && t !== window && t.tagName === 'SCRIPT') {
+              issues.push('脚本加载失败: ' + (t.src || t.getAttribute('src') || '未知文件'));
+          } else if (!t || t === window) {
+              issues.push('脚本运行出错: ' + (e.message || '未知错误') + (e.filename ? ' (' + String(e.filename).split('/').pop() + ':' + e.lineno + ')' : ''));
+          }
+      }, true);
+      window.addEventListener('DOMContentLoaded', function(){
+          if (!issues.length) return;
+          if (window.console) console.error('SPARK 前端加载异常:', issues);
+          var bar = document.createElement('div');
+          bar.setAttribute('style', 'position:fixed;top:0;left:0;right:0;z-index:999999;' +
+              'background:#b91c1c;color:#fff;font:14px/1.5 -apple-system,Segoe UI,sans-serif;' +
+              'padding:10px 16px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.3);');
+          bar.textContent = '页面部分脚本加载失败，界面可能无法正常工作。';
+          var btn = document.createElement('button');
+          btn.textContent = '点击刷新';
+          btn.setAttribute('style', 'margin-left:8px;padding:4px 12px;border:1px solid #fff;' +
+              'border-radius:4px;background:transparent;color:#fff;cursor:pointer;font-weight:600;');
+          btn.onclick = function(){ location.reload(); };
+          bar.appendChild(btn);
+          document.body.insertBefore(bar, document.body.firstChild);
+      });
+  })();</script>
+  <link rel="stylesheet" href="css/tokens.css?v=1.1.1">
   <!-- console.css split into ordered contiguous slices (concatenation == original); load order = cascade order -->
-  <link rel="stylesheet" href="css/console/base.css?v=1.2.0">
+  <link rel="stylesheet" href="css/console/base.css?v=1.2.1">
   <link rel="stylesheet" href="css/console/dashboard.css?v=1.2.0">
   <link rel="stylesheet" href="css/console/marketplace.css?v=1.2.0">
-  <link rel="stylesheet" href="css/console/sandbox-layout.css?v=1.2.0">
+  <link rel="stylesheet" href="css/console/sandbox-layout.css?v=1.2.1">
   <link rel="stylesheet" href="css/shared/lightbox.css?v=1.1.0">
 </head>
 <body>
@@ -394,10 +424,6 @@
               <span>多参考重绘 edits</span>
               <span class="method-tag method-post">POST</span>
             </div>
-            <div class="docs-menu-item" data-doc="post-reverse-video">
-              <span>视频解析 reverse</span>
-              <span class="method-tag method-post">POST</span>
-            </div>
           </nav>
 
           <!-- Docs Body Panels -->
@@ -535,34 +561,6 @@
                 <div class="code-block-container">
                   <pre class="code-block" id="code-image-edit-block">加载中...</pre>
                   <div class="btn-copy-code" title="复制代码" onclick="copyDocCode('code-image-edit-block')">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:16px;height:16px;">
-                      <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H5.25m11.9-3.664A2.251 2.251 0 0 0 15 2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25h-.007a2.25 2.25 0 0 0-2.25 2.25M18.75 8.25v11.25m0-11.25a2.25 2.25 0 0 0-2.25-2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25m7.5 0v11.25m-18-11.25a2.25 2.25 0 0 1 2.25-2.25h1.5a2.25 2.25 0 0 1 2.25 2.25m-4.5 0v11.25m11.9-3.664C19.302 15.1 19.5 14.201 19.5 13.25V9.75" />
-                    </svg>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- DOCS PANEL 6: POST-REVERSE-VIDEO -->
-            <div class="doc-panel" id="doc-post-reverse-video" style="display:none;">
-              <div class="endpoint-header">
-                <h2 style="font-size: 20px; font-weight: 600; color: var(--text-main);">视频关键帧时序语义解析 Reverse Video</h2>
-                <p style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">上传一段现有视频，系统自动使用高频 CV 算法提取运动与光影，结合多模态大模型反向推导重建时光机所需的 SCUP 提示词序列。</p>
-                <div class="endpoint-url-box">
-                  <span class="method-tag method-post" style="padding: 6px 10px; font-size: 11px;">POST</span>
-                  <span class="endpoint-url" id="doc-url-reverse-video">/api/reverse-video</span>
-                </div>
-              </div>
-              
-              <div class="code-tab-container">
-                <div class="code-tab-header">
-                  <button class="code-tab-btn active" data-lang="curl">cURL</button>
-                  <button class="code-tab-btn" data-lang="python">Python</button>
-                  <button class="code-tab-btn" data-lang="js">JavaScript</button>
-                </div>
-                <div class="code-block-container">
-                  <pre class="code-block" id="code-reverse-video-block">加载中...</pre>
-                  <div class="btn-copy-code" title="复制代码" onclick="copyDocCode('code-reverse-video-block')">
                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:16px;height:16px;">
                       <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H5.25m11.9-3.664A2.251 2.251 0 0 0 15 2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25h-.007a2.25 2.25 0 0 0-2.25 2.25M18.75 8.25v11.25m0-11.25a2.25 2.25 0 0 0-2.25-2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25m7.5 0v11.25m-18-11.25a2.25 2.25 0 0 1 2.25-2.25h1.5a2.25 2.25 0 0 1 2.25 2.25m-4.5 0v11.25m11.9-3.664C19.302 15.1 19.5 14.201 19.5 13.25V9.75" />
                     </svg>

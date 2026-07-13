@@ -41,12 +41,4 @@ p = progressFromEvents(frameEvents, 'frames', 'running');
 assert.strictEqual(p.percent, 50);
 assert.match(p.label, /图片生成/);
 
-const reverseEvents = [
-  ['progress', { stage: 'keyframe_extraction', details: 'keyframes' }],
-  ['progress', { stage: 'cv_analysis', details: 'cv' }]
-];
-p = progressFromEvents(reverseEvents, 'reverse-video', 'running');
-assert.strictEqual(p.percent, 40);
-assert.strictEqual(p.label, 'cv');
-
 console.log('progress_model tests passed');

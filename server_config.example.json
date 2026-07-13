@@ -19,5 +19,9 @@
   "rateMax": 20,
   "rateWindow": 3600,
   "codexApiKey": "在这里填你本机 Codex API Service 的密钥(agt_codex_ 开头)",
+  "strictGates": false,
+  "_strictGates_comment": "true=视觉门禁(VLM判定/视频锚点校验)服务异常时按判定失败处理(fail-closed,走重试直至needs_human_review);false=异常时跳过放行,但manifest会记为auto_approved_degraded留痕,不再伪装成正常通过",
+  "qaGateLevel": "standard",
+  "_qaGateLevel_comment": "帧质检门档位:standard=全量严检(逐帧10项+跨帧漂移复查);lenient=只拦硬伤(无变化/换场景/出现人物机械/文字水印),构图视角漂移等WARN放行留痕且停用跨帧漂移复查;off=视觉门全部跳过(manifest记auto_approved_degraded)。注意:浏览器每次请求都携带配置中心的档位并覆盖本项——UI用户请直接在⚙️配置中心切换;本项只对不带config的无头/脚本调用生效",
   "debug": false
 }

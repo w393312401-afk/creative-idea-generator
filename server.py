@@ -1,11 +1,11 @@
 import os
 import sys
 import json
+import shutil
 import socket
 import urllib.request
 import urllib.error
 import urllib.parse
-import re
 import base64
 import time
 import threading
@@ -45,12 +45,22 @@ _RATE_LOCK = threading.Lock()
 def background_worker(task_id, config, dimensions):
     t = get_or_create_task(task_id, dimensions)
     start_time = time.time()
-    
-    def on_progress(stage, details):
-        if t["cancel_event"].is_set():
-            raise ConnectionError("Generation cancelled by user")
+    # 本轮运行的身份令牌：重试复用 task_id 时 prepare_task_for_run 会换新
+    # cancel_event。取消已被 /api/compose-cancel 立即终态化，旧线程可能还卡在
+    # 几十秒的 LLM 请求里没死透——它凭令牌发现自己已被接管后必须静默退出，
+    # 绝不能把过期事件/结果写进新一轮运行的记录。
+    run_token = t["cancel_event"]
 
+    def run_cancelled():
+        return run_token.is_set() or t.get("cancel_event") is not run_token
+
+    def on_progress(stage, details):
         with ACTIVE_TASKS_LOCK:
+            if run_cancelled():
+                raise GenerationCancelled("Generation cancelled by user")
+            if stage == 'cancel_check':
+                # 纯取消探针（重试循环的 attempt 边界调用），不产生事件
+                return False
             if stage == 'text_chunk':
                 t["events"].append(('text_chunk', details))
             else:
@@ -71,9 +81,9 @@ def background_worker(task_id, config, dimensions):
             config['_skipped_checks'] = 0
         content = call_llm(config, dimensions, on_progress=on_progress)
         result = parse_sections(content)
-        
-        if t["cancel_event"].is_set():
-            raise ConnectionError("Generation cancelled by user")
+
+        if run_cancelled():
+            raise GenerationCancelled("Generation cancelled by user")
             
         # Double QA merged: call_llm's internal audit self-healing loop is the primary QA.
         # We assign its audit results directly to repair_md.
@@ -91,38 +101,67 @@ def background_worker(task_id, config, dimensions):
         }
         result['image_count'] = len(images)
         result['video_count'] = len(videos)
-        
-        if t["cancel_event"].is_set():
-            raise ConnectionError("Generation cancelled by user")
-            
+        # 结构化槽位契约：前端优先消费，避免前后端双实现解析漂移（帧配对错位事故前提）
+        from prompt_pipeline import prompt_slots_list
+        result['prompt_slots'] = prompt_slots_list(result['prompt_block'])
+
+        # 发布用双语标题行（TikTok 英文标题+tags / 国内社媒中文标题+话题），失败不阻塞出单
+        from prompt_pipeline import generate_social_titles
+        theme = dimensions.get('theme', '') if isinstance(dimensions, dict) else ''
+        social = generate_social_titles(config, result.get('title') or '', theme)
+        if social.get('tiktok'):
+            result['social_title_en'] = social['tiktok']
+        if social.get('cn'):
+            result['social_title_cn'] = social['cn']
+
         with ACTIVE_TASKS_LOCK:
+            # 终态化必须在锁内复核取消/换代：/api/compose-cancel 可能刚把记录切
+            # 到 cancelled，completed 不得把它翻回来
+            if run_cancelled():
+                raise GenerationCancelled("Generation cancelled by user")
             t["status"] = "completed"
             t["result"] = result
             # Trim streaming text_chunk events to optimize tasks.json size
             t["events"] = [evt for evt in t["events"] if evt[0] != 'text_chunk']
             t["events"].append(('result', result))
-            
+
         notify_listeners(task_id, 'result', result)
         save_tasks_to_disk()
-        
+
     except ConnectionError:
+        # GenerationCancelled 走这里（其子类）。/api/compose-cancel 通常已抢先把
+        # 记录终态化并广播过（status 不再是 running），重试也可能已换代接管
+        # （cancel_event 被换新）——两种情况都不再重复写事件/广播。
+        finalize = False
         with ACTIVE_TASKS_LOCK:
-            t["status"] = "cancelled"
-            t["error"] = "用户取消了生成任务"
-            t["events"] = [evt for evt in t["events"] if evt[0] != 'text_chunk']
-            t["events"].append(('error', {'message': '用户取消了生成任务'}))
-        notify_listeners(task_id, 'error', {'message': '用户取消了生成任务'})
-        save_tasks_to_disk()
+            if t.get("cancel_event") is run_token and t["status"] == "running":
+                t["status"] = "cancelled"
+                t["error"] = "用户取消了生成任务"
+                t["events"] = [evt for evt in t["events"] if evt[0] != 'text_chunk']
+                t["events"].append(('error', {'message': '用户取消了生成任务'}))
+                finalize = True
+        if finalize:
+            notify_listeners(task_id, 'error', {'message': '用户取消了生成任务'})
+            save_tasks_to_disk()
     except Exception as e:
         if sys.stdout:
             print(f"[DEBUG] background task {task_id} failed: {e}")
+        error_msg = None
         with ACTIVE_TASKS_LOCK:
-            t["status"] = "failed"
-            t["error"] = str(e)
-            t["events"] = [evt for evt in t["events"] if evt[0] != 'text_chunk']
-            t["events"].append(('error', {'message': str(e)}))
-        notify_listeners(task_id, 'error', {'message': str(e)})
-        save_tasks_to_disk()
+            if t.get("cancel_event") is run_token and t["status"] == "running":
+                if run_token.is_set():
+                    # 取消引发的连带异常（连接被掐等）应记为取消，而不是失败
+                    t["status"] = "cancelled"
+                    error_msg = "用户取消了生成任务"
+                else:
+                    t["status"] = "failed"
+                    error_msg = str(e)
+                t["error"] = error_msg
+                t["events"] = [evt for evt in t["events"] if evt[0] != 'text_chunk']
+                t["events"].append(('error', {'message': error_msg}))
+        if error_msg is not None:
+            notify_listeners(task_id, 'error', {'message': error_msg})
+            save_tasks_to_disk()
 
 
 def auto_run_worker(task_id, config, dimensions):
@@ -137,6 +176,12 @@ def auto_run_worker(task_id, config, dimensions):
         def progress_cb(stage, details):
             if stage == 'cancel_check':
                 return t["cancel_event"].is_set()
+            if stage == 'review_poll':
+                # 监修决策带内通道（与 cancel_check 同款探测，不入事件史）：
+                # /api/frame-review 把决策写进任务记录，这里取走并消费掉
+                with ACTIVE_TASKS_LOCK:
+                    decisions = t.get('review_decisions') or {}
+                    return decisions.pop(str((details or {}).get('sequence')), None)
             with ACTIVE_TASKS_LOCK:
                 t["events"].append((stage, details))
             notify_listeners(task_id, stage, details)
@@ -240,19 +285,41 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
         def progress_cb(stage, details):
             if stage == 'cancel_check':
                 return t["cancel_event"].is_set()
+            if stage == 'review_poll':
+                # 监修决策带内通道（与 cancel_check 同款探测，不入事件史）：
+                # /api/frame-review 把决策写进任务记录，这里取走并消费掉
+                with ACTIVE_TASKS_LOCK:
+                    decisions = t.get('review_decisions') or {}
+                    return decisions.pop(str((details or {}).get('sequence')), None)
             with ACTIVE_TASKS_LOCK:
                 t["events"].append((stage, details))
             notify_listeners(task_id, stage, details)
 
-        # google_fx 后端共享同一个 AdsPower 浏览器和 builtins.google_fx_cancelled
-        # 全局旗标：必须与视频生成互斥，否则新任务开跑时重置旗标/抢浏览器，
-        # 会把另一个在跑的 FX 任务搅乱（跨任务串片事故的同族问题）
-        with _fx_serial_lock_for(config):
-            result = generate_frame_sequence(
-                config, title, prompt_block,
-                on_progress=progress_cb,
-                target_sequences=target_sequences
-            )
+        # 上游失败即时广播：每次尝试失败立刻推 SSE 'upstream_retry'，
+        # 前端不再在后台重试退避链（最长分钟级）里干等着看"生成中"
+        from frame_generator import set_upstream_event_sink
+        set_upstream_event_sink(lambda ev: progress_cb('upstream_retry', ev))
+        try:
+            # google_fx 后端共享同一个 AdsPower 浏览器和 builtins.google_fx_cancelled
+            # 全局旗标：必须与视频生成互斥，否则新任务开跑时重置旗标/抢浏览器，
+            # 会把另一个在跑的 FX 任务搅乱（跨任务串片事故的同族问题）
+            with _fx_serial_lock_for(config):
+                if target_sequences is None:
+                    # 整单渲染走编排层：分段渲染+检查点现实校准+链尾回望+监修暂停。
+                    # 此前一次性端点直调 generate_frame_sequence，这些机制对主界面的
+                    # 帧序列按钮完全不生效。单帧/子集重试仍走原直调路径。
+                    from pipeline_orchestrator import render_frames_for_task
+                    result = render_frames_for_task(
+                        config, title, prompt_block, on_progress=progress_cb,
+                    )
+                else:
+                    result = generate_frame_sequence(
+                        config, title, prompt_block,
+                        on_progress=progress_cb,
+                        target_sequences=target_sequences
+                    )
+        finally:
+            set_upstream_event_sink(None)
         usage = stop_and_get_accounting()
         if usage:
             result['token_usage'] = usage
@@ -304,6 +371,12 @@ def render_staged_worker(task_id, config, title, prompt_block):
         def progress_cb(stage, details):
             if stage == 'cancel_check':
                 return t["cancel_event"].is_set()
+            if stage == 'review_poll':
+                # 监修决策带内通道（与 cancel_check 同款探测，不入事件史）：
+                # /api/frame-review 把决策写进任务记录，这里取走并消费掉
+                with ACTIVE_TASKS_LOCK:
+                    decisions = t.get('review_decisions') or {}
+                    return decisions.pop(str((details or {}).get('sequence')), None)
             with ACTIVE_TASKS_LOCK:
                 t["events"].append((stage, details))
             notify_listeners(task_id, stage, details)
@@ -363,6 +436,12 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
         def progress_cb(stage, details):
             if stage == 'cancel_check':
                 return t["cancel_event"].is_set()
+            if stage == 'review_poll':
+                # 监修决策带内通道（与 cancel_check 同款探测，不入事件史）：
+                # /api/frame-review 把决策写进任务记录，这里取走并消费掉
+                with ACTIVE_TASKS_LOCK:
+                    decisions = t.get('review_decisions') or {}
+                    return decisions.pop(str((details or {}).get('sequence')), None)
             with ACTIVE_TASKS_LOCK:
                 t["events"].append((stage, details))
             notify_listeners(task_id, stage, details)
@@ -467,7 +546,22 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
         
         english_title = _chat(config, "You are a viral TikTok US marketing expert specializing in high-CTR hooks.", title_prompt, temperature=0.7, max_tokens=30, model=_aux_model(config))
         english_title = english_title.strip().strip('"').strip("'").strip()
-        
+
+        # 发布用双语标题行：新激发已在 compose 阶段生成，这里只给缺字段的旧创意补齐
+        social = {}
+        try:
+            has_social = False
+            if parent_task_id:
+                with ACTIVE_TASKS_LOCK:
+                    parent = ACTIVE_TASKS.get(str(parent_task_id)) or ACTIVE_TASKS.get(parent_task_id)
+                    parent_result = (parent or {}).get("result") or {}
+                    has_social = bool(parent_result.get("social_title_en") and parent_result.get("social_title_cn"))
+            if not has_social:
+                from prompt_pipeline import generate_social_titles
+                social = generate_social_titles(config, title, theme)
+        except Exception:
+            social = {}
+
         aspect_ratio = config.get('imageAspectRatio') or '9:16'
         
         # Extract first (Before) and last (After) image prompts from the build process
@@ -547,11 +641,19 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
                     if cover_rel_url not in task["result"]["covers"]:
                         task["result"]["covers"].append(cover_rel_url)
                     task["result"]["english_title"] = english_title
-        
+                    if social.get('tiktok') and not task["result"].get("social_title_en"):
+                        task["result"]["social_title_en"] = social['tiktok']
+                    if social.get('cn') and not task["result"].get("social_title_cn"):
+                        task["result"]["social_title_cn"] = social['cn']
+
         result_data = {
             'content': image_content,
             'english_title': english_title
         }
+        if social.get('tiktok'):
+            result_data['social_title_en'] = social['tiktok']
+        if social.get('cn'):
+            result_data['social_title_cn'] = social['cn']
         
         with ACTIVE_TASKS_LOCK:
             t["status"] = "completed"
@@ -1010,11 +1112,38 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             if not task_id:
                 self._send_json({'error': 'Missing task_id'}, status=400)
                 return
-            with IMAGE_TASKS_LOCK:
-                task = IMAGE_TASKS.get(task_id)
+
+            # 长轮询（毫秒级同步）：带 wait+since 时挂起，直到任务指纹（状态|阶段）
+            # 变化或超时才返回——上游报错被 worker 写进 stage 的瞬间（~50ms 采样）
+            # 就能推到前端。不带 wait 则保持旧的即查即回行为。ThreadingHTTPServer
+            # 每请求一线程，本地单用户挂几条长轮询无压力。
+            try:
+                wait_s = float(query.get('wait', ['0'])[0] or 0)
+            except ValueError:
+                wait_s = 0.0
+            wait_s = max(0.0, min(wait_s, 25.0))
+            since = query.get('since', [''])[0]
+
+            def _snapshot():
+                with IMAGE_TASKS_LOCK:
+                    t = IMAGE_TASKS.get(task_id)
+                    return dict(t) if t else None
+
+            def _fp(t):
+                return f"{t.get('status')}|{t.get('stage', '')}|{t.get('stage_at', '')}"
+
+            task = _snapshot()
+            if wait_s > 0 and task and since and task.get('status') == 'pending' and _fp(task) == since:
+                deadline = time.time() + wait_s
+                while time.time() < deadline:
+                    time.sleep(0.05)
+                    task = _snapshot()
+                    if not task or task.get('status') != 'pending' or _fp(task) != since:
+                        break
             if not task:
                 self._send_json({'status': 'not_found'})
             else:
+                task['fingerprint'] = _fp(task)
                 self._send_json(task)
         elif path == '/api/cache-info':
             if not self._gate():
@@ -1037,6 +1166,22 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     'packet_cache_size': packet_cache_size,
                     'packet_cache_keys': cache_keys_count
                 })
+            except Exception as e:
+                self._send_json({'error': str(e)}, status=500)
+        elif path == '/api/gallery':
+            # 画廊：扫描 outputs/ 下全部历史媒体（封面/帧序列/视频/图像工坊），
+            # 并标注引用关系（封面 in_use / 项目组 orphan）。引用收集失败时降级
+            # 为无标注扫描，画廊本体不受影响。
+            if not self._gate():
+                return
+            try:
+                try:
+                    refs = gallery_collect_references()
+                except Exception as e:
+                    if sys.stdout:
+                        print(f"[GALLERY] reference collection failed: {e}")
+                    refs = None
+                self._send_json(scan_gallery(refs=refs))
             except Exception as e:
                 self._send_json({'error': str(e)}, status=500)
         elif path.startswith('/api/contents/generations/tasks/'):
@@ -1116,6 +1261,35 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 data = self._read_json_body()
                 # 加锁 + 原子替换：直接 open('w') 在写一半崩溃时会留下半截 JSON
                 with LIBRARY_LOCK:
+                    # 2026-07-12 整库清零事故（library.json 被某个 savedIdeas 为空的客户端
+                    # 会话全量覆盖成 []）后的双保险：
+                    # 1) 空列表覆盖非空库一律拒绝——删除单条走 /api/library/delete_item 后
+                    #    的全量回写永远至少剩 0..N-1 条，只有状态错乱的客户端才会 POST []；
+                    # 2) 任何成功覆盖前把现有非空库轮换到 library.json.bak，误写可回滚一版。
+                    existing_count = 0
+                    if os.path.exists(DB_FILE):
+                        try:
+                            with open(DB_FILE, 'r', encoding='utf-8') as f:
+                                _old = json.load(f)
+                            existing_count = len(_old) if isinstance(_old, list) else 1
+                        except Exception:
+                            existing_count = 1  # 读不出来按“非空”保守处理
+                    incoming_count = len(data) if isinstance(data, list) else 0
+                    if incoming_count == 0 and existing_count > 0:
+                        if sys.stdout:
+                            print(f"[LIBRARY GUARD] 拒绝空列表覆盖非空创意库（现有 {existing_count} 条）")
+                        self._send_json({
+                            'status': 'rejected',
+                            'message': f'拒绝将非空创意库（{existing_count} 条）覆盖为空：客户端库状态疑似错乱，'
+                                       f'请刷新页面重新加载库后再操作；如确要清空请逐条删除。'
+                        }, status=409)
+                        return
+                    if existing_count > 0:
+                        try:
+                            shutil.copyfile(DB_FILE, DB_FILE + '.bak')
+                        except Exception as _bak_err:
+                            if sys.stdout:
+                                print(f"[LIBRARY GUARD] 备份 {DB_FILE}.bak 失败（继续写入）: {_bak_err}")
                     write_json_atomic(DB_FILE, data)
                 self._send_json({'status': 'success'})
             except Exception as e:
@@ -1272,7 +1446,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                 video_errs.extend(check_out_and_in(video_prompt, is_bridge))
                                 video_errs.extend(check_transition_shortcuts(video_prompt))
                                 video_errs.extend(check_pacing_control(video_prompt, is_bridge))
-                                video_errs.extend(check_camera_contradictions(video_prompt, is_bridge))
+                                # 桥接段 TBCP 无条件禁 pan/tilt（reward 拍不会是桥接，无误伤面）
+                                video_errs.extend(check_camera_contradictions(video_prompt, is_bridge, ban_pan_tilt=is_bridge))
                                 
                                 vid_word_count = len(video_prompt.split())
                                 if vid_word_count > 180:
@@ -1372,17 +1547,22 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 task_id = body.get('task_id')
                 if not task_id:
                     task_id = str(int(time.time() * 1000))
-                
+
                 # Start background thread
                 cleanup_old_tasks()
-                get_or_create_task(task_id, dimensions)
-                
+                # 重试沿用旧 task_id：终态记录被原地重置复用（覆盖被重试的记录），
+                # 已在运行则不再起第二个 worker，前端拿到 ok 后重新挂流即可
+                _, already_running = prepare_task_for_run(task_id, dimensions)
+                if already_running:
+                    self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
+                    return
+
                 threading.Thread(
-                    target=background_worker, 
-                    args=(task_id, config, dimensions), 
+                    target=background_worker,
+                    args=(task_id, config, dimensions),
                     daemon=True
                 ).start()
-                
+
                 self._send_json({'status': 'ok', 'task_id': task_id})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
@@ -1404,7 +1584,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
                 # Start background thread
                 cleanup_old_tasks()
-                get_or_create_task(task_id, dimensions)
+                # 同 /api/compose：重试复用 task_id 时原地覆盖旧记录，运行中防重复提交
+                _, already_running = prepare_task_for_run(task_id, dimensions)
+                if already_running:
+                    self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
+                    return
 
                 threading.Thread(
                     target=auto_run_worker,
@@ -1415,6 +1599,29 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({'status': 'ok', 'task_id': task_id})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/frame-review':
+            # 监修模式决策回传：{task_id, sequence, decision: 'adopt'|'rerender'}。
+            # 决策写进任务记录，worker 的 progress_cb 对 'review_poll' 探测取走。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                task_id = body.get('task_id')
+                decision = body.get('decision')
+                if decision not in ('adopt', 'rerender'):
+                    self._send_json({'error': "decision 必须是 'adopt' 或 'rerender'"}, status=400)
+                    return
+                with ACTIVE_TASKS_LOCK:
+                    t = ACTIVE_TASKS.get(task_id)
+                    if not t:
+                        self._send_json({'error': '任务不存在或已结束'}, status=404)
+                        return
+                    t.setdefault('review_decisions', {})[str(body.get('sequence'))] = decision
+                self._send_json({'ok': True})
+            except Exception as e:
+                self._send_json({'error': str(e)}, status=500)
+            return
 
         elif path == '/api/compose-cancel':
             if not self._gate():
@@ -1434,6 +1641,23 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         id_prefix in ('frames', 'videos', 'staged', 'auto')
                         or dimensions.get('type') in ('frames', 'videos', 'staged', 'auto_run')
                     )
+                    if not is_fx_capable:
+                        # 纯 LLM 合成任务立即终态化：worker 可能正卡在一个 90-240 秒
+                        # 的 LLM 请求里，等它自己感知取消会让前端"正在取消"挂几分钟。
+                        # 这里直接把记录切到 cancelled 并广播，后台线程随后凭 run
+                        # 令牌发现记录已被终态化/接管，静默退出（见 background_worker）。
+                        finalized = False
+                        with ACTIVE_TASKS_LOCK:
+                            t = ACTIVE_TASKS.get(task_id)
+                            if t and t["status"] == "running":
+                                t["status"] = "cancelled"
+                                t["error"] = "用户取消了生成任务"
+                                t["events"] = [evt for evt in t["events"] if evt[0] != 'text_chunk']
+                                t["events"].append(('error', {'message': '用户取消了生成任务'}))
+                                finalized = True
+                        if finalized:
+                            notify_listeners(task_id, 'error', {'message': '用户取消了生成任务'})
+                            save_tasks_to_disk()
                     if is_fx_capable:
                         import builtins
                         builtins.google_fx_cancelled = True
@@ -1459,13 +1683,52 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 body = self._read_json_body()
                 task_id = body.get('task_id')
                 if task_id:
+                    title = None
                     with ACTIVE_TASKS_LOCK:
-                        if task_id in ACTIVE_TASKS:
+                        task = ACTIVE_TASKS.get(task_id)
+                        if task:
                             # If it's running, cancel it first
-                            ACTIVE_TASKS[task_id]["cancel_event"].set()
+                            task["cancel_event"].set()
+                            title = (task.get("result") or {}).get("title")
                             del ACTIVE_TASKS[task_id]
+                    if title:
+                        delete_idea_output_files(title)
                     save_tasks_to_disk()
                 self._send_json({'status': 'ok'})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/library/delete_item':
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                title = body.get('title', '')
+                covers = body.get('covers') or []
+                deleted = delete_idea_output_files(title, covers) if title else {"project_dir": None, "covers": []}
+                self._send_json({'status': 'ok', 'deleted': deleted})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/gallery/delete':
+            # 画廊删除：按路径删 outputs/ 内媒体文件（白名单校验在 gallery_delete_files 里），
+            # 项目内文件删完后重同步该项目 manifest，保证帧/视频列表与磁盘一致
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                paths = body.get('paths')
+                if not isinstance(paths, list) or not paths:
+                    self._send_json({'status': 'error', 'message': '缺少要删除的文件列表 paths'}, status=400)
+                    return
+                result = gallery_delete_files(paths)
+                for pdir in result.pop('affected_project_dirs', []):
+                    try:
+                        sync_project_manifest_with_disk(pdir)
+                    except Exception as e:
+                        if sys.stdout:
+                            print(f"[GALLERY] Manifest resync failed for {pdir}: {e}")
+                self._send_json({'status': 'ok', **result})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -1711,151 +1974,6 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'error': str(e)}, status=500)
 
-        elif path == '/api/reverse-video':
-            try:
-                if not access_ok(self):
-                    self._send_json({'error': '访问码无效或缺失'}, status=401)
-                    return
-                if not rate_ok(_client_ip(self)):
-                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
-                    return
-                # We need to parse multipart form data.
-                # Since we don't use FastAPI here, we can parse using email.parser.BytesParser
-                content_type = self.headers.get('content-type')
-                if not content_type or 'multipart/form-data' not in content_type:
-                    self._send_json({'error': 'Content-Type must be multipart/form-data'}, status=400)
-                    return
-
-                content_length = int(self.headers.get('content-length', 0))
-                body_bytes = self.rfile.read(content_length)
-
-                # Create a dummy message to parse using email parser
-                msg_bytes = f"Content-Type: {content_type}\r\n\r\n".encode('utf-8') + body_bytes
-                
-                from email.parser import BytesParser
-                from email.policy import default
-                
-                msg = BytesParser(policy=default).parsebytes(msg_bytes)
-
-                file_data = None
-                filename = None
-                fps = 3.0
-                api = "auto"
-                prompt_style = "clean"
-                config_str = "{}"
-
-                for part in msg.walk():
-                    content_disposition = part.get('Content-Disposition', '')
-                    if 'form-data' in content_disposition:
-                        name_match = re.search(r'name="([^"]+)"', content_disposition)
-                        if name_match:
-                            name = name_match.group(1)
-                            if name == 'file':
-                                filename_match = re.search(r'filename="([^"]+)"', content_disposition)
-                                filename = filename_match.group(1) if filename_match else 'video.mp4'
-                                file_data = part.get_payload(decode=True)
-                            elif name == 'fps':
-                                try:
-                                    fps = float(part.get_payload(decode=True).decode('utf-8').strip())
-                                except:
-                                    pass
-                            elif name == 'api':
-                                try:
-                                    api = part.get_payload(decode=True).decode('utf-8').strip()
-                                except:
-                                    pass
-                            elif name == 'prompt_style':
-                                try:
-                                    prompt_style = part.get_payload(decode=True).decode('utf-8').strip()
-                                except:
-                                    pass
-                            elif name == 'config':
-                                try:
-                                    config_str = part.get_payload(decode=True).decode('utf-8').strip()
-                                except:
-                                    pass
-
-                # Parse task_id from multipart form data
-                task_id = None
-                for part in msg.walk():
-                    content_disposition = part.get('Content-Disposition', '')
-                    if 'form-data' in content_disposition:
-                        name_match = re.search(r'name="([^"]+)"', content_disposition)
-                        if name_match:
-                            name = name_match.group(1)
-                            if name == 'task_id':
-                                try:
-                                    task_id = part.get_payload(decode=True).decode('utf-8').strip()
-                                except:
-                                    pass
-
-                if not task_id:
-                    task_id = str(int(time.time() * 1000))
-
-                import tempfile
-                import shutil
-
-                # 缺少文件段必须给出明确的 400：旧逻辑会在 splitext(None) 上抛
-                # TypeError，用户只看到一个不透明的 500
-                if not file_data or not filename:
-                    self._send_json({'error': '缺少视频文件（file 字段），请重新选择视频后再上传'}, status=400)
-                    return
-
-                # Verify file extension
-                suffix = os.path.splitext(filename)[1].lower()
-                if suffix not in ('.mp4', '.mov', '.avi', '.mkv', '.webm'):
-                    self._send_json({'error': '不支持该视频格式。仅支持 .mp4, .mov, .avi, .mkv, .webm 格式的视频。'}, status=400)
-                    return
-
-                # Parse config
-                client_config = {}
-                if config_str:
-                    try:
-                        client_config = json.loads(config_str)
-                    except Exception as e:
-                        if sys.stdout:
-                            print(f"[DEBUG] Failed to parse client config JSON: {e}")
-
-                # Save uploaded video to a temporary file
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                    tmp_file.write(file_data)
-                    temp_video_path = tmp_file.name
-
-                # Working directory for extracted frames; video_reverse_worker owns cleanup()
-                temp_dir_obj = tempfile.TemporaryDirectory()
-
-                # Setup dimensions
-                gemini_key = client_config.get('geminiDirectApiKey') or client_config.get('apiKey') or os.environ.get('GEMINI_API_KEY')
-                openai_key = os.environ.get('OPENAI_API_KEY')
-                video_name = os.path.splitext(filename)[0]
-                model_label = "Gemini-1.5-Flash"
-                if api == "openai" or (api == "auto" and not gemini_key and openai_key):
-                    model_label = "GPT-4o-Mini"
-                dimensions = {
-                    "theme": f"视频反推 ({video_name})",
-                    "creativity": model_label,
-                    "type": "reverse-video"
-                }
-
-                # Create task in ACTIVE_TASKS
-                cleanup_old_tasks()
-                get_or_create_task(task_id, dimensions)
-
-                # Start background thread
-                threading.Thread(
-                    target=video_reverse_worker,
-                    args=(task_id, temp_video_path, temp_dir_obj, fps, api, prompt_style, client_config, filename),
-                    daemon=True
-                ).start()
-
-                self._send_json({'status': 'ok', 'task_id': task_id})
-
-            except Exception as e:
-                if sys.stdout:
-                    import traceback
-                    traceback.print_exc()
-                self._send_json({'error': f'Request processing failed: {str(e)}'}, status=500)
-
         elif path == '/api/image/generations':
             try:
                 if not access_ok(self):
@@ -1885,10 +2003,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
                 import uuid
                 task_id = f"img_task_{uuid.uuid4().hex}"
-                
+
                 with IMAGE_TASKS_LOCK:
-                    IMAGE_TASKS[task_id] = {'status': 'pending', 'result': None, 'error': None}
-                
+                    IMAGE_TASKS[task_id] = {'status': 'pending', 'result': None, 'error': None,
+                                            'stage': '任务已受理，排队中', 'created_at': time.time()}
+
                 threading.Thread(
                     target=_run_async_image_generation,
                     args=(task_id, base_url, api_key, payload),
@@ -2016,10 +2135,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 body_data.extend(f"--{boundary}--\r\n".encode('utf-8'))
 
                 task_id = f"img_task_{uuid.uuid4().hex}"
-                
+
                 with IMAGE_TASKS_LOCK:
-                    IMAGE_TASKS[task_id] = {'status': 'pending', 'result': None, 'error': None}
-                
+                    IMAGE_TASKS[task_id] = {'status': 'pending', 'result': None, 'error': None,
+                                            'stage': '任务已受理，排队中', 'created_at': time.time()}
+
                 threading.Thread(
                     target=_run_async_image_edit,
                     args=(task_id, base_url, api_key, bytes(body_data), boundary),
@@ -2431,11 +2551,10 @@ def run():
         _skill_expected = [
             os.path.join(SKILL_DIR, 'SKILL.md'),
             os.path.join(SKILL_DIR, 'references', 'prompt-templates.md'),
-            os.path.join(SKILL_DIR, 'video_to_prompt_pipeline.py'),
         ]
         _missing = [p for p in _skill_expected if not os.path.exists(p)]
         if _missing:
-            print("[WARN] 技能契约文件缺失，提示词合成/视频反推将降级运行：")
+            print("[WARN] 技能契约文件缺失，提示词合成将降级运行：")
             for p in _missing:
                 print(f"[WARN]   缺失: {p}")
     server_address = ('', PORT)
