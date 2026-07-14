@@ -277,6 +277,13 @@ function galleryUpdateToolbar() {
         const allSelected = visible.length > 0 && visible.every(p => gallerySelected.has(p));
         selAllBtn.textContent = allSelected ? '⬜ 取消全选' : '☑️ 全选';
     }
+    const collapseAllBtn = document.getElementById('gallery-collapse-all-btn');
+    if (collapseAllBtn) {
+        const groups = galleryVisibleGroups();
+        const allCollapsed = groups.length > 0 && groups.every(g => galleryCollapsed.has(g.key));
+        collapseAllBtn.textContent = allCollapsed ? '⬇️ 全部展开' : '⬆️ 全部收起';
+        collapseAllBtn.disabled = groups.length === 0;
+    }
 }
 
 function galleryFindItem(path) {
@@ -298,12 +305,31 @@ function gallerySetSelected(path, on) {
     galleryUpdateToolbar();
 }
 
-function galleryToggleCollapse(key) {
-    if (galleryCollapsed.has(key)) galleryCollapsed.delete(key);
-    else galleryCollapsed.add(key);
+function galleryPersistCollapsed() {
     try {
         localStorage.setItem(GALLERY_COLLAPSED_LS_KEY, JSON.stringify([...galleryCollapsed]));
     } catch (e) { /* 存储满/隐私模式：折叠状态不持久化也能用 */ }
+}
+
+function galleryToggleCollapse(key) {
+    if (galleryCollapsed.has(key)) galleryCollapsed.delete(key);
+    else galleryCollapsed.add(key);
+    galleryPersistCollapsed();
+    renderGallery();
+}
+
+// 工具栏"全部收起/展开"：作用于当前筛选下可见的分组（而非磁盘上的全部分组，
+// 与"全选"按钮的可见范围保持一致）。只要还有一个可见组是展开的就先全部收起；
+// 已经全部收起时再点则整体展开——同一个按钮双态切换，和"全选/取消全选"同款交互。
+function galleryToggleCollapseAll() {
+    const groups = galleryVisibleGroups();
+    if (!groups.length) return;
+    const allCollapsed = groups.every(g => galleryCollapsed.has(g.key));
+    groups.forEach(g => {
+        if (allCollapsed) galleryCollapsed.delete(g.key);
+        else galleryCollapsed.add(g.key);
+    });
+    galleryPersistCollapsed();
     renderGallery();
 }
 
@@ -406,6 +432,8 @@ function initGallery() {
         galleryData = null; // 强制显示扫描中状态
         refreshGallery();
     });
+
+    document.getElementById('gallery-collapse-all-btn')?.addEventListener('click', galleryToggleCollapseAll);
 
     document.getElementById('gallery-select-all-btn')?.addEventListener('click', () => {
         const visible = galleryVisibleGroups().flatMap(g => g.items.map(it => it.path));

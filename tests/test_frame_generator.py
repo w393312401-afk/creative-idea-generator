@@ -104,7 +104,10 @@ class TestFrameProgressEvents(unittest.TestCase):
         server_common.OUTPUT_ROOT = self.old_output_root
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_frame_start_and_retry_events_are_emitted(self):
+    def test_frame_start_events_are_emitted_with_no_per_frame_qa(self):
+        """逐帧 VLM 质检门已停用：渲染只发 frame_start/frame，不再发 frame_qa/frame_retry，
+        每帧落 manifest 的 quality_gate 都是 'pending_manual_review'（一致性审查移到
+        整套序列渲染完成后统一进行，见 pipeline_orchestrator._sequence_consistency_review）。"""
         prompt_block = """图片 1:
 first frame prompt
 
@@ -131,15 +134,8 @@ visible construction change
 
         with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
-             patch('prompt_pipeline.run_vlm_qa_check', side_effect=[(False, 'no visible delta'), (True, None)]), \
-             patch('prompt_pipeline.fix_image_prompt_with_vlm_feedback', return_value='fixed prompt'), \
-             patch('prompt_pipeline.clean_prompt_text', side_effect=lambda s: s), \
-             patch('prompt_pipeline.fix_image_clean_frame_proactive', side_effect=lambda s: s), \
-             patch('prompt_pipeline.fix_horizon_line', side_effect=lambda s: s), \
-             patch('prompt_pipeline.fix_camera_contradictions', side_effect=lambda s, **kwargs: s), \
-             patch('prompt_pipeline.fix_rhma_blur', side_effect=lambda s, **kwargs: s), \
-             patch('prompt_pipeline.fix_camera_dna', side_effect=lambda s, dna: s):
-            generate_frame_sequence(
+             patch('prompt_pipeline.run_vlm_qa_check', side_effect=AssertionError('per-frame QA gate should no longer be called')):
+            manifest = generate_frame_sequence(
                 {},
                 'progress_contract',
                 prompt_block,
@@ -148,18 +144,13 @@ visible construction change
 
         stages = [stage for stage, _ in events]
         self.assertIn('frame_start', stages)
-        self.assertIn('frame_retry', stages)
-        # 渲染完成→质检判定之间必须有显式事件（判定可长达 90s×2，不能对前端静默）
-        self.assertIn('frame_qa', stages)
-        qa = next(details for stage, details in events if stage == 'frame_qa')
-        self.assertEqual(qa['sequence'], 2)
+        self.assertNotIn('frame_retry', stages)
+        self.assertNotIn('frame_qa', stages)
         starts = [details for stage, details in events if stage == 'frame_start']
         self.assertEqual(starts[0]['sequence'], 1)
         self.assertEqual(starts[1]['sequence'], 2)
-        retry = next(details for stage, details in events if stage == 'frame_retry')
-        self.assertEqual(retry['sequence'], 2)
-        self.assertEqual(retry['attempt'], 1)
-        self.assertEqual(retry['reason'], 'no visible delta')
+        for frame in manifest['frames']:
+            self.assertEqual(frame['quality_gate'], 'pending_manual_review')
 
 
 class TestQuotaFallback(unittest.TestCase):

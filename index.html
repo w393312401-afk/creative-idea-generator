@@ -42,15 +42,16 @@
     })();</script>
     <!-- Preload critical CSS for faster first paint -->
     <link rel="preload" href="css/tokens.css?v=1.1.1" as="style">
-    <link rel="preload" href="css/app/base.css?v=1.2.3" as="style">
+    <link rel="preload" href="css/app/base.css?v=1.2.4" as="style">
     <link rel="stylesheet" href="css/tokens.css?v=1.1.1">
     <!-- style.css split into ordered contiguous slices (concatenation == original); load order = cascade order -->
-    <link rel="stylesheet" href="css/app/base.css?v=1.2.3">
+    <link rel="stylesheet" href="css/app/base.css?v=1.2.4">
     <link rel="stylesheet" href="css/app/skill-output.css?v=1.2.2">
-    <link rel="stylesheet" href="css/app/efficiency.css?v=1.2.0">
-    <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.2.3">
+    <link rel="stylesheet" href="css/app/efficiency.css?v=1.2.1">
+    <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.2.6">
     <link rel="stylesheet" href="css/image_studio.css?v=1.1.1">
     <link rel="stylesheet" href="css/gallery.css?v=1.1.0">
+    <link rel="stylesheet" href="css/ledger.css?v=1.1.0">
     <link rel="stylesheet" href="css/shared/lightbox.css?v=1.2.0">
 </head>
 <body>
@@ -68,10 +69,14 @@
                 </div>
             </div>
             <div class="app-switcher">
-                <a href="/" class="switcher-item active" data-app="workshop">
+                <a href="/" id="switcher-workshop-btn" class="switcher-item active" data-app="workshop">
                     <span class="switcher-icon">⚡</span>
                     <span class="switcher-text">创意工坊</span>
                 </a>
+                <button type="button" id="main-tab-image" class="switcher-item" data-app="image" onclick="switchMainTab('image')">
+                    <span class="switcher-icon">🎨</span>
+                    <span class="switcher-text">图像工坊</span>
+                </button>
                 <a href="/console.html" class="switcher-item" data-app="console">
                     <span class="switcher-icon">💻</span>
                     <span class="switcher-text">控制台</span>
@@ -115,13 +120,13 @@
                 <span class="btn-icon">☄️</span>
                 <span class="btn-text">激发结果</span>
             </button>
-            <button id="main-tab-image" class="mobile-nav-btn" onclick="switchMainTab('image')">
-                <span class="btn-icon">🎨</span>
-                <span class="btn-text">图像工坊</span>
-            </button>
             <button id="main-tab-gallery" class="mobile-nav-btn" onclick="switchMainTab('gallery')">
                 <span class="btn-icon">🖼️</span>
                 <span class="btn-text">画廊</span>
+            </button>
+            <button id="main-tab-ledger" class="mobile-nav-btn" onclick="switchMainTab('ledger')">
+                <span class="btn-icon">📒</span>
+                <span class="btn-text">创意台账</span>
             </button>
         </div>
 
@@ -137,25 +142,23 @@
                 <div class="panel-body">
                     <!-- Pane 1: Text prompt generation -->
                     <div id="input-pane-text" class="input-pane active">
-                        <!-- Quick Presets -->
+                        <!-- Trend Reference Library — replaces the removed fixed six-theme
+                             selector: ideation is now driven by user-selected persisted
+                             web-search references (verified viral cases, trend_refs.json)
+                             to break out of the fixed-theme information cocoon. -->
                         <div class="control-group">
                             <div class="preset-header-row">
-                                <label class="group-title">快速预设样式</label>
-                                <button type="button" id="save-preset-btn" class="preset-header-action" title="保存当前维度为自定义预设">💾 保存我的预设</button>
+                                <label class="group-title">1. 联网参考案例库</label>
+                                <button type="button" id="trend-refs-search-btn" class="preset-header-action">🔍 搜一批新参考</button>
                             </div>
-                            <div class="preset-flex" id="preset-list">
-                                <button type="button" class="preset-btn" data-preset="nature_wonder">🌲 自然奇观</button>
-                                <button type="button" class="preset-btn" data-preset="industrial_relic">🏚️ 工业遗迹</button>
-                                <button type="button" class="preset-btn" data-preset="retired_vehicle">🚢 退役载具</button>
-                                <button type="button" class="preset-btn" data-preset="contrast_novelty">🤯 反差猎奇</button>
-                                <button type="button" id="randomize-btn" class="preset-btn random-btn">🎲 随机激发</button>
-                            </div>
-                            <div class="custom-presets-list" id="custom-presets-list" style="display: none;">
-                                <!-- Custom presets will render here -->
+                            <p class="trend-refs-hint">勾选参考后，灵感推荐将直接从这些已验证案例中取材；不勾选则每批自动联网搜索（结果也会沉淀进本库）。</p>
+                            <div class="trend-refs-list" id="trend-refs-list">
+                                <div class="trend-refs-empty">正在载入联网参考案例库...</div>
                             </div>
                         </div>
 
-                        <!-- Topic Ideation Engine (P2) -->
+                        <!-- Topic Ideation Engine (P2) — fed by the selected trend
+                             references above (or auto web search when none selected). -->
                         <div class="control-group">
                             <div class="preset-header-row">
                                 <label class="group-title">💡 智能灵感推荐 (点击卡片一键载入并生成)</label>
@@ -166,117 +169,38 @@
                             </div>
                         </div>
 
-                        <!-- Theme Selector -->
+                        <!-- Beat Count — the one dimension kept manually tunable (it directly
+                             controls how many construction beats get generated); anchors and the
+                             other 4 dimension sliders were removed per user request in favor of
+                             letting the theme-conditioned ideation cards / composer decide them. -->
                         <div class="control-group">
-                            <label class="group-title">1. 基础场景主题</label>
-                            <div class="theme-grid" id="theme-selector">
-                                <button class="theme-btn active" data-value="hollow_oak">
-                                    <span class="theme-icon">🌳</span>
-                                    <span class="theme-name">百年空心橡树</span>
-                                </button>
-                                <button class="theme-btn" data-value="submarine_cabin">
-                                    <span class="theme-icon">⚓</span>
-                                    <span class="theme-name">退役潜艇舱</span>
-                                </button>
-                                <button class="theme-btn" data-value="water_tower">
-                                    <span class="theme-icon">🏰</span>
-                                    <span class="theme-name">废弃水塔</span>
-                                </button>
-                                <button class="theme-btn" data-value="shipwreck_hull">
-                                    <span class="theme-icon">🚢</span>
-                                    <span class="theme-name">搁浅货轮船体</span>
-                                </button>
-                                <button class="theme-btn" data-value="missile_silo">
-                                    <span class="theme-icon">🚀</span>
-                                    <span class="theme-name">废弃导弹井</span>
-                                </button>
-                                <button class="theme-btn" data-value="riverside_bark_hut">
-                                    <span class="theme-icon">🛖</span>
-                                    <span class="theme-name">河畔树皮小屋</span>
-                                </button>
+                            <div class="slider-labels">
+                                <span>施工节拍数 (Beat Count)</span>
+                                <span id="val-beats">15 拍</span>
+                            </div>
+                            <div class="slider-track-row">
+                                <button type="button" class="slider-step-btn" data-target="slider-beats" data-step="-1" aria-label="减少节拍数">−</button>
+                                <input type="range" id="slider-beats" min="5" max="15" step="1" value="15" class="neon-slider" list="beats-ticks">
+                                <datalist id="beats-ticks">
+                                    <option value="5"></option><option value="6"></option><option value="7"></option><option value="8"></option><option value="9"></option><option value="10"></option><option value="11"></option><option value="12"></option><option value="13"></option><option value="14"></option><option value="15"></option>
+                                </datalist>
+                                <button type="button" class="slider-step-btn" data-target="slider-beats" data-step="1" aria-label="增加节拍数">+</button>
                             </div>
                         </div>
 
-                        <!-- Core Innovation Anchor Nodes -->
-                        <div class="control-group">
-                            <label class="group-title">2. 核心激发锚点 (多选)</label>
-                            <div class="anchor-flex" id="anchor-selector">
-                                <button class="anchor-node active" data-value="carrier_cutout_window">
-                                    <span class="node-dot"></span> 载体本体材质切面窗
-                                </button>
-                                <button class="anchor-node" data-value="water_glass_floor">
-                                    <span class="node-dot"></span> 水面玻璃地板
-                                </button>
-                                <button class="anchor-node" data-value="bark_camouflaged_hatch">
-                                    <span class="node-dot"></span> 树皮伪装天窗
-                                </button>
-                                <button class="anchor-node active" data-value="living_wood_stair">
-                                    <span class="node-dot"></span> 活体木纹/岩壁旋梯
-                                </button>
-                                <button class="anchor-node" data-value="bioluminescent_moss">
-                                    <span class="node-dot"></span> 生物荧光苔藓照明
-                                </button>
-                                <button class="anchor-node" data-value="single_slab_counter">
-                                    <span class="node-dot"></span> 整块载体板材台面
-                                </button>
-                                <button class="anchor-node" data-value="rerouted_waterfall_shower">
-                                    <span class="node-dot"></span> 改道瀑布淋浴
-                                </button>
-                            </div>
-                        </div>
-
-                        <!-- Advanced Parameter Toggle -->
-                        <div class="advanced-toggle-row" id="toggle-workshop-advanced-row">
-                            <span>高级维度设置</span>
-                            <button type="button" id="toggle-workshop-advanced" class="toggle-btn-small">展开 ▾</button>
-                        </div>
-                        
-                        <div class="workshop-advanced-fields" id="workshop-advanced-fields" style="display: none; margin-top: 12px;">
-                            <!-- Dimensional Sliders -->
-                            <div class="control-group">
-                                <label class="group-title">3. 复杂度与美学配比</label>
-                                <div class="sliders-container">
-                                    <div class="slider-wrapper">
-                                        <div class="slider-labels">
-                                            <span>项目复杂度 (Complexity)</span>
-                                            <span id="val-complexity">中等</span>
-                                        </div>
-                                        <input type="range" id="slider-complexity" min="1" max="3" value="2" class="neon-slider">
-                                    </div>
-
-                                    <div class="slider-wrapper">
-                                        <div class="slider-labels">
-                                            <span>预算水平 (Budget)</span>
-                                            <span id="val-budget">轻奢级</span>
-                                        </div>
-                                        <input type="range" id="slider-budget" min="1" max="3" value="2" class="neon-slider">
-                                    </div>
-
-                                    <div class="slider-wrapper">
-                                        <div class="slider-labels">
-                                            <span>外壳粗野 ↔ 内里精致 反差强度</span>
-                                            <span id="val-ratio">50%</span>
-                                        </div>
-                                        <input type="range" id="slider-ratio" min="0" max="100" value="50" class="neon-slider">
-                                    </div>
-
-                                    <div class="slider-wrapper">
-                                        <div class="slider-labels">
-                                            <span>脑洞大开度 (Creativity Scale)</span>
-                                            <span id="val-creativity">高度激发</span>
-                                        </div>
-                                        <input type="range" id="slider-creativity" min="1" max="3" value="3" class="neon-slider">
-                                    </div>
-
-                                    <div class="slider-wrapper">
-                                        <div class="slider-labels">
-                                            <span>施工节拍数 (Beat Count)</span>
-                                            <span id="val-beats">15 拍</span>
-                                        </div>
-                                        <input type="range" id="slider-beats" min="5" max="15" value="15" class="neon-slider">
-                                    </div>
-                                </div>
-                            </div>
+                        <!-- Fixed-value data holders for complexity/budget/ratio/creativity — no
+                             longer user-editable, but kept in the DOM (permanently at these
+                             defaults) because config.js/app.js/prompt_pipeline.js read their
+                             .value / label text by id in many places. -->
+                        <div style="display:none" aria-hidden="true">
+                            <span id="val-complexity">中等重工</span>
+                            <input type="range" id="slider-complexity" min="1" max="3" value="2" tabindex="-1">
+                            <span id="val-budget">轻奢设计师级</span>
+                            <input type="range" id="slider-budget" min="1" max="3" value="2" tabindex="-1">
+                            <span id="val-ratio">50%</span>
+                            <input type="range" id="slider-ratio" min="0" max="100" value="50" tabindex="-1">
+                            <span id="val-creativity">脑洞大开 (写实奇观)</span>
+                            <input type="range" id="slider-creativity" min="1" max="3" value="3" tabindex="-1">
                         </div>
                     </div>
                 </div>
@@ -319,7 +243,7 @@
                 <div class="output-placeholder active" id="output-placeholder-view">
                     <div class="placeholder-icon">☄️</div>
                     <h3>等待引燃创意星火...</h3>
-                    <p>在左侧选择场景、锚点并调整参数，点击“激发”。后端会把你的维度送入 <b>restoration-prompt-composer</b> skill，按其连续性契约合成完整的「图片 1–N+1 + 视频 1–N」提示词集，并附质量审核报告。</p>
+                    <p>在左侧勾选联网参考案例、从灵感推荐卡片「载入维度」选定选题并调整节拍数，点击“激发”。后端会把该选题送入 <b>restoration-prompt-composer</b> skill，按其连续性契约合成完整的「图片 1–N+1 + 视频 1–N」提示词集，并附质量审核报告。</p>
                 </div>
 
                 <!-- Loading State View -->
@@ -329,6 +253,7 @@
                             <div class="inner-spin"></div>
                         </div>
                         <h3>正在按 skill 契约合成提示词...</h3>
+                        <div class="loading-topic-name" id="loading-topic-name"></div>
                         <div class="loading-timer">已用时: <span id="loading-timer-val">0.0</span> 秒</div>
                         <div class="loading-stage-info" id="loading-stage-text">解析主题，拆解场景变量与施工节拍...</div>
                         <div class="generation-progress-shell" aria-live="polite">
@@ -679,7 +604,7 @@
                                         <button type="button" id="t2i-clear-btn" class="text-action-btn">清空</button>
                                     </div>
                                     <div class="prompt-input-wrapper">
-                                        <textarea id="t2i-prompt" placeholder="使用中文或英文描述您想生成的画面细节，例如：一座赛博朋克风格的未来都市，霓虹灯倒映在雨后的街道，高清摄影..." rows="4" translate="no"></textarea>
+                                        <textarea id="t2i-prompt" placeholder="使用中文或英文描述您想生成的画面细节，例如：一间晨光洒落的原木阁楼卧室，粗糙石墙与柔软羊毛毯的质感对比，纪实摄影..." rows="4" translate="no"></textarea>
                                         <button type="button" id="t2i-random-prompt-btn" class="random-prompt-btn" title="随机生成创意提示词">🎲 随机灵感</button>
                                     </div>
                                 </div>
@@ -688,11 +613,9 @@
                                     <label class="group-title">常用艺术风格 (快速追加)</label>
                                     <div class="style-tags-container" id="t2i-style-tags" translate="no">
                                         <span class="style-tag" data-tag=", photorealistic, 8k, highly detailed, cinematic lighting">📷 写实照片</span>
-                                        <span class="style-tag" data-tag=", cyberpunk style, neon lighting, futuristic city">🏙️ 赛博朋克</span>
                                         <span class="style-tag" data-tag=", anime style, beautiful digital illustration">🎨 二次元插画</span>
                                         <span class="style-tag" data-tag=", watercolor painting, artistic brush strokes, soft lighting">💧 水彩手绘</span>
                                         <span class="style-tag" data-tag=", 3D cartoon, Disney style, cute rendering">🧸 3D卡通</span>
-                                        <span class="style-tag" data-tag=", sci-fi concept art, epic composition, space age">🚀 科幻太空</span>
                                         <span class="style-tag" data-tag=", oil painting, classical renaissance style">🖼️ 古典油画</span>
                                         <span class="style-tag" data-tag=", minimalist layout, clean background, high contrast">⚪ 极简主义</span>
                                         <span class="style-tag" data-tag=", macro photography, hyper-detailed, depth of field">🔍 微距特写</span>
@@ -951,6 +874,7 @@
                         <div class="gallery-toolbar-right">
                             <span class="gallery-stats" id="gallery-stats"></span>
                             <button type="button" id="gallery-refresh-btn" class="gallery-tool-btn" title="重新扫描本地文件">🔄 刷新</button>
+                            <button type="button" id="gallery-collapse-all-btn" class="gallery-tool-btn" title="统一折叠/展开当前筛选下的所有分组">⬆️ 全部收起</button>
                             <button type="button" id="gallery-select-all-btn" class="gallery-tool-btn">☑️ 全选</button>
                             <button type="button" id="gallery-delete-selected-btn" class="gallery-tool-btn danger" disabled>🗑️ 删除所选</button>
                         </div>
@@ -958,6 +882,57 @@
 
                     <div class="panel-body gallery-scroll" id="gallery-groups">
                         <div class="gallery-status">📡 正在扫描本地媒体文件…</div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Topic Ledger Workspace: 创意台账 —— 已用/候选选题的管理、打分与投放表现回填 -->
+            <section class="panel-ledger glass-panel" id="panel-ledger">
+                <div class="ledger-shell">
+                    <div class="panel-header">
+                        <h2>创意台账</h2>
+                        <p>管理已用/候选选题的状态与表现打分，为后续放量提供方向参考（激发时仍会读取完整历史规避重复）</p>
+                    </div>
+
+                    <div class="ledger-toolbar">
+                        <div class="ledger-filters" id="ledger-filters">
+                            <button class="ledger-filter-chip active" data-filter="all">全部</button>
+                            <button class="ledger-filter-chip" data-filter="candidate">候选</button>
+                            <button class="ledger-filter-chip" data-filter="used">已用</button>
+                            <button class="ledger-filter-chip" data-filter="published">已发布</button>
+                            <button class="ledger-filter-chip" data-filter="discarded">已弃用</button>
+                        </div>
+                        <div class="ledger-search-sort">
+                            <input type="search" id="ledger-search" class="ledger-search-input" placeholder="🔍 搜索 Topic DNA / 选题" autocomplete="off">
+                            <select id="ledger-sort" class="ledger-sort-select" title="排序方式">
+                                <option value="newest" selected>最新日期优先</option>
+                                <option value="oldest">最旧日期优先</option>
+                                <option value="llm_score">LLM 评分高优先</option>
+                                <option value="user_score">表现打分高优先</option>
+                            </select>
+                        </div>
+                        <div class="ledger-toolbar-right">
+                            <span class="ledger-stats" id="ledger-stats"></span>
+                            <button type="button" id="ledger-refresh-btn" class="ledger-tool-btn" title="重新加载台账">🔄 刷新</button>
+                        </div>
+                    </div>
+
+                    <div class="ledger-bulk-bar">
+                        <button type="button" id="ledger-select-all-btn" class="ledger-tool-btn">☑️ 全选</button>
+                        <span class="ledger-bulk-count" id="ledger-bulk-count"></span>
+                        <div class="ledger-bulk-spacer"></div>
+                        <select id="ledger-bulk-status-select" class="ledger-sort-select" title="批量设置为该状态">
+                            <option value="candidate">候选</option>
+                            <option value="used">已用</option>
+                            <option value="published">已发布</option>
+                            <option value="discarded">已弃用</option>
+                        </select>
+                        <button type="button" id="ledger-bulk-status-apply-btn" class="ledger-tool-btn" disabled>批量设为该状态</button>
+                        <button type="button" id="ledger-bulk-delete-btn" class="ledger-tool-btn danger" disabled>🗑️ 批量删除所选</button>
+                    </div>
+
+                    <div class="panel-body ledger-scroll" id="ledger-body">
+                        <div class="ledger-status">📡 正在加载创意台账…</div>
                     </div>
                 </div>
             </section>
@@ -1060,19 +1035,21 @@
                     </select>
                 </div>
                 <div class="form-group">
-                    <label for="settings-qa-gate">Frame QA Gate (帧质检门档位)</label>
-                    <select id="settings-qa-gate">
-                        <option value="standard" selected>🛡️ 标准 — 逐帧严检 + 跨帧漂移复查</option>
-                        <option value="lenient">🌿 宽松 — 只拦硬伤，构图/视角漂移放行留痕</option>
-                        <option value="off">🚫 关闭 — 不质检，全部放行</option>
-                    </select>
-                </div>
-                <div class="form-group">
                     <label for="settings-supervised-mode">Supervised Mode (关键点监修模式)</label>
                     <select id="settings-supervised-mode">
                         <option value="off" selected>🤖 关闭 — 全自动</option>
                         <option value="on">🧑‍⚖️ 开启 — 首帧/换族锚点帧暂停人工确认（10 分钟无操作自动采用）</option>
                     </select>
+                </div>
+                <div class="form-group">
+                    <label for="settings-ideation-search-query">Ideation Search Query (激发联网搜索词，可选)</label>
+                    <input type="text" id="settings-ideation-search-query" placeholder="留空使用默认：最新 爆款 延时摄影 废墟改造成居所 视频 趋势…">
+                    <small style="opacity:.65;display:block;margin-top:4px;">随机创意激发前联网搜索用的查询词；改词立即生效，按搜索词分别缓存 6 小时</small>
+                </div>
+                <div class="form-group">
+                    <label for="settings-ideation-trend-urls">Ideation Reference URLs (激发参考网址，可选)</label>
+                    <textarea id="settings-ideation-trend-urls" rows="3" placeholder="每行一个网址（最多取前 5 个），例如：&#10;https://www.tiktok.com/tag/renovation&#10;留空则只用联网搜索趋势"></textarea>
+                    <small style="opacity:.65;display:block;margin-top:4px;">随机创意激发时抓取这些页面正文，压成要点作为灵感参考注入（6 小时缓存，与联网搜索趋势叠加）</small>
                 </div>
                 <div class="form-group" id="fx-image-model-group" style="display: none;">
                     <label for="settings-fx-image-model">Google FX Image Model (FX 生图模型)</label>
@@ -1159,18 +1136,20 @@
     </div>
 
     <!-- Modular JS: defer so they never block HTML parsing. Order preserved. -->
-    <script src="js/state.js?v=1.1.6" defer></script>
+    <script src="js/state.js?v=1.1.9" defer></script>
     <script src="js/utils.js?v=1.1.2" defer></script>
     <script src="js/theme_toggle.js?v=1.1.0" defer></script>
-    <script src="js/config.js?v=1.1.8" defer></script>
+    <script src="js/config.js?v=1.2.1" defer></script>
+    <script src="js/trend_refs.js?v=1.0.0" defer></script>
     <script src="js/progress_model.js?v=1.2.3" defer></script>
     <script src="js/api_client.js?v=1.1.7" defer></script>
-    <script src="js/prompt_pipeline.js?v=1.1.4" defer></script>
+    <script src="js/prompt_pipeline.js?v=1.1.7" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
     <script src="js/media_renderer.js?v=1.1.5" defer></script>
-    <script src="app.js?v=1.3.1" defer></script>
-    <script src="js/image_studio.js?v=1.0.3" defer></script>
-    <script src="js/gallery.js?v=1.1.1" defer></script>
+    <script src="app.js?v=1.3.7" defer></script>
+    <script src="js/image_studio.js?v=1.0.4" defer></script>
+    <script src="js/gallery.js?v=1.1.2" defer></script>
+    <script src="js/ledger.js?v=1.1.0" defer></script>
     <!-- 旧「移动端标签切换」内联脚本已删除：它指向早已不存在的 mobile-tab-left/right，
          MutationObserver 永远空转；自动切换结果面板改由 app.js 的 switchMainTab('results') 完成 -->
 

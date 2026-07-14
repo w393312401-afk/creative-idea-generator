@@ -1,34 +1,39 @@
 """Autonomous staged pipelines for the restoration-prompt-composer production app.
 
-Three entry points, sharing the same render/gate/recovery machinery:
+No per-frame or IMAGE-1 gating in the GUI/API paths any more: every frame renders
+unconditionally as fast as possible, and cross-frame consistency is checked exactly
+once, after the whole sequence has rendered, against the real images
+(_sequence_consistency_review) rather than per-frame or blind-text. The only
+remaining review during rendering is corrective, not gating: periodic reality-
+checkpoint recalibration and a final chain-tail drift lookback
+(_checkpoint_reality_sync / _chain_drift_lookback), which rewrite drifting prompts
+in place but never block or retry a render.
 
-- render_and_gate_single_frame: render ONE frame and run it through the Anchor
-  Acceptance Gate, synchronously, returning the verdict directly (no task_id/polling).
-  This is what makes staging real for a CONVERSATIONAL skill invocation: an agent
-  following SKILL.md's Steps 1-11 directly in chat calls this (via /api/render_anchor,
-  see server.py) mid-turn, right after composing IMAGE 1's prompt and before composing
-  anything else, and only continues once it gets a real pass/fail back.
+Three entry points, sharing the same render/recovery machinery:
+
+- render_and_gate_single_frame: render ONE frame and run it through a caller-supplied
+  `judge`, synchronously, returning the verdict directly (no task_id/polling). The
+  GUI/API paths below (run_autonomous_pipeline, run_staged_frame_rendering) pass
+  `_no_gate_judge` (always passes) — they only reuse this function for its render +
+  manifest-bookkeeping plumbing. The conversational skill invocation (via
+  /api/render_anchor, see server.py; an agent following SKILL.md's Steps 1-11 mid-
+  turn, right after composing IMAGE 1's prompt) still calls it with no `judge`, which
+  defaults to the real Anchor Acceptance Gate (check_anchor_frame_compliance) — that
+  path is unchanged by this file's GUI-side simplification.
 
 - run_autonomous_pipeline: dimensions in, everything out. Composes IMAGE 1's prompt
-  itself (compose_anchor_and_packet), gates it via render_and_gate_single_frame, refines
-  the Drift Lock packet against the accepted render, then composes and renders the rest
-  (compose_remaining_beats). Used by server.py's /api/auto_run — the GUI/API-driven,
-  dimensions-first path.
+  itself (compose_anchor_and_packet), renders it, refines the Drift Lock packet
+  against that render, then composes and renders the rest (compose_remaining_beats),
+  runs the post-render sequence consistency review, and only then generates video.
+  Used by server.py's /api/auto_run — the GUI/API-driven, dimensions-first path.
 
 - run_staged_frame_rendering: an ALREADY-composed prompt_block in, staged rendering
   out. For the case where an agent already wrote the full IMAGE/VIDEO prompt text
-  (typically AFTER already gating IMAGE 1 itself via render_and_gate_single_frame mid-
-  turn) and now wants the rest rendered. If IMAGE 1 is already 'auto_approved' in
-  manifest.json AND the recorded anchor prompt fingerprint matches this prompt_block's
-  IMAGE 1, this skips re-gating it — otherwise it gates it here too, so calling this
-  endpoint alone (without a prior render_and_gate_single_frame call) still stages
-  correctly and a stale manifest from an earlier same-titled run cannot bypass the
-  gate. Used by server.py's /api/render_staged, which scripts/generate_frames.py
-  calls instead of the old one-shot /api/generate_frames.
+  and now wants the rest rendered. Used by server.py's /api/render_staged, which
+  scripts/generate_frames.py calls instead of the old one-shot /api/generate_frames.
 
-All three paths end with (or lead into) the same autonomous recovery passes over any
-leftover 'vlm_qa_failed' frame and any rejected/blocked video clip, so nothing ever
-dead-ends in a manual-review state.
+All three paths lead into the same autonomous recovery pass over any rejected/blocked
+video clip, so nothing ever dead-ends in a manual-review state.
 """
 import os
 import json
@@ -42,7 +47,8 @@ from prompt_pipeline import (
     check_anchor_frame_compliance,
     refine_packet_from_accepted_anchor,
     fix_image_prompt_with_vlm_feedback,
-    run_frame_qa_check,
+    check_full_sequence_consistency,
+    fix_beat_from_sequence_review,
     run_chain_tail_drift_check,
     family_anchor_seq,
     resolve_family_anchor,
@@ -185,59 +191,6 @@ def render_and_gate_single_frame(config, title, sequence, prompt, meta='', judge
     }
 
 
-def _recover_failed_frames(config, title, prompt_block, project_dir, on_progress=None):
-    """Autonomous recovery pass: retry any frame still stuck at 'vlm_qa_failed' after
-    the main render pass's own retries, using the same judge-and-fix loop as the Anchor
-    Acceptance Gate but checking frame-to-frame motion continuity (run_vlm_qa_check)
-    instead of tone/rule compliance. Returns the prompt_block, re-formatted only if a
-    recovered prompt actually changed."""
-    images, videos = _parse_prompt_slots(prompt_block)
-    manifest_path = os.path.join(project_dir, 'manifest.json')
-    if not os.path.exists(manifest_path):
-        return prompt_block
-    with open(manifest_path, 'r', encoding='utf-8') as f:
-        manifest = json.load(f)
-    failed_seqs = [f['sequence'] for f in manifest.get('frames', []) if f.get('quality_gate') == 'vlm_qa_failed']
-    for seq in failed_seqs:
-        video_item = videos.get(seq - 1)
-        video_prompt = video_item['body'] if isinstance(video_item, dict) else (video_item or '')
-        item = images.get(seq) or {}
-        # Per the delivery contract (SKILL.md Step 10), only VIDEO slots ever carry the
-        # [BRIDGE] tag -- IMAGE slots never do. The incoming transition's own tag (VIDEO
-        # seq-1) is what actually determines whether IMAGE seq is a bridge frame; the
-        # image's own meta is kept as a fallback for the server's internal beat_ladder
-        # composition path, which also stamps images directly.
-        is_bridge = (
-            'BRIDGE' in (item.get('meta', '') if isinstance(item, dict) else '').upper()
-            or 'BRIDGE' in (video_item.get('meta', '') if isinstance(video_item, dict) else '').upper()
-        )
-
-        def frame_judge(image_path, _prompt, _seq=seq, _video_prompt=video_prompt, _is_bridge=is_bridge):
-            if not _video_prompt:
-                return True, 'no video prompt to check against'
-            prev_path = _frame_path(title, _seq - 1)
-            # Drift-check against the CURRENT shot family's anchor, not always IMAGE 1 --
-            # once a threshold crossing has happened, IMAGE 1's exterior family is no longer
-            # a meaningful comparison for interior frames. None means "this frame IS the
-            # family anchor itself, nothing to compare against yet" (mirrors the seq<=2 skip).
-            # resolve_family_anchor：链中检查点重锚定过的族以新基线为准。
-            anchor_seq = resolve_family_anchor(config, videos, _seq)
-            anchor_path = _frame_path(title, anchor_seq) if anchor_seq != _seq else None
-            return run_frame_qa_check(config, anchor_path, prev_path, image_path, _video_prompt, _seq, is_bridge=_is_bridge, anchor_seq=anchor_seq)
-
-        passed, reason = _retry_frame_until_pass(
-            config, title, seq, images, videos, frame_judge,
-            on_progress=on_progress, max_attempts=_MAX_RECOVERY_ATTEMPTS,
-        )
-        if passed:
-            status = 'auto_approved_degraded' if is_skipped_verdict(reason) else 'auto_approved'
-        else:
-            status = 'vlm_qa_failed'
-        _set_manifest_quality_gate(project_dir, seq, status, reason)
-    if failed_seqs:
-        prompt_block = _format_prompt_block(images, videos)
-    return prompt_block
-
 
 def _supervised_mode(config):
     """关键点监修模式开关（config['supervisedMode']，默认关闭=全自动）。开启后流水线
@@ -305,15 +258,15 @@ _MAX_REVIEW_RERENDERS = 3
 
 
 def _supervised_degraded_summary(config, title, project_dir, on_progress=None):
-    """监修模式的收尾暂停点：帧渲染+恢复轮全部结束后，若仍有降级/未过检帧
-    （auto_approved_degraded=判定服务异常放行未核验、vlm_qa_failed=重试用尽仍未过），
-    在烧视频额度之前暂停告知，让用户决定继续还是取消任务去手动重渲。
-    只有"继续"一种决策（重渲入口在帧网格的单帧重试按钮里）。"""
+    """监修模式的收尾暂停点：帧渲染 + 整套序列一致性审查全部结束后，若仍有降级/未过
+    审的帧（auto_approved_degraded=判定服务异常放行未核验、sequence_review_flagged=
+    序列审查修复轮次耗尽仍有问题），在烧视频额度之前暂停告知，让用户决定继续还是
+    取消任务去手动重渲。只有"继续"一种决策（重渲入口在帧网格的单帧重试按钮里）。"""
     if not _supervised_mode(config):
         return
     manifest = read_manifest(project_dir) or {}
     bad = [f.get('sequence') for f in manifest.get('frames', [])
-           if isinstance(f, dict) and f.get('quality_gate') in ('vlm_qa_failed', 'auto_approved_degraded')]
+           if isinstance(f, dict) and f.get('quality_gate') in ('sequence_review_flagged', 'auto_approved_degraded')]
     if not bad:
         return
     seqs = ', '.join(f"IMG {s:03d}" for s in bad if isinstance(s, int))
@@ -514,8 +467,21 @@ def _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on
                 first_segment = False
             if review_anchor and si == 0 and targets:
                 anchor = members[0]
-                context = ('首帧——整链的视觉基因' if anchor == 1
-                           else '镜头族交接锚点帧——桥接后的新基线')
+                # family_anchor_seq 把 [BRIDGE]/[BRIDGE TURN]/[CUT] 都当换族点，所以
+                # pan 变体的摇镜落点帧和 hard_cut 的室内首帧天然成为族锚——正是
+                # 歪掉会污染整条后链、人工把关性价比最高的两个新暂停点。
+                _in_meta = ''
+                _in_vid = videos.get(anchor - 1)
+                if isinstance(_in_vid, dict):
+                    _in_meta = str(_in_vid.get('meta', '')).upper()
+                if anchor == 1:
+                    context = '首帧——整链的视觉基因'
+                elif 'CUT' in _in_meta and 'BRIDGE' not in _in_meta:
+                    context = '声明式硬切后的室内首帧——t2i 新链头，后续整链的视觉基因'
+                elif 'TURN' in _in_meta:
+                    context = '摇镜落点帧——转入室内主轴后的新基线'
+                else:
+                    context = '镜头族交接锚点帧——桥接后的新基线'
                 decision = _await_frame_review(config, title, anchor,
                                                _frame_path(title, anchor), context, on_progress)
                 rerenders = 0
@@ -593,16 +559,93 @@ def _chain_drift_lookback(config, title, prompt_block, project_dir, on_progress=
         print(f"[CHAIN DRIFT] 链尾回望检查异常（不拦截流程）: {e}")
 
 
+_MAX_SEQUENCE_REVIEW_ROUNDS = 2
+
+
+def _sequence_consistency_review(config, title, prompt_block, project_dir, on_progress=None,
+                                 max_rounds=_MAX_SEQUENCE_REVIEW_ROUNDS):
+    """整套序列渲染完成后的一致性审查：对着真实已渲染画面统一跑一次施工顺序/SCUP
+    审查（prompt_pipeline.check_full_sequence_consistency），取代原来逐帧/盲文本的
+    质检门。有问题就定向重写被标记拍的提示词、只重渲那几帧，最多循环 max_rounds
+    轮。轮次耗尽仍有问题的帧在 manifest 里标成 'sequence_review_flagged'（原因写进
+    vlm_qa_reason，帧网格已有的"重试"按钮可直接用来人工处理）；其余标
+    'sequence_reviewed_pass'。返回（可能被改写过的）prompt_block。"""
+    images, videos = _parse_prompt_slots(prompt_block)
+    total_beats = len(images) - 1
+    if total_beats <= 0:
+        return prompt_block
+
+    final_failures = {}
+    for round_num in range(1, max_rounds + 1):
+        frame_paths = {s: _frame_path(title, s) for s in sorted(images) if os.path.exists(_frame_path(title, s))}
+        if len(frame_paths) < len(images):
+            # 有帧还没渲出来（例如只重渲了子集），审查意义不大——直接放弃本轮，且不
+            # 触碰 manifest：既没有真的审过，就不能把没渲出来的帧也标成"已通过"。
+            return prompt_block
+        if on_progress:
+            on_progress('sequence_review', {
+                'round': round_num, 'max_rounds': max_rounds,
+                'message': f'正在对整套已渲染序列做一致性审查（第 {round_num}/{max_rounds} 轮）...',
+            })
+        final_failures = check_full_sequence_consistency(config, prompt_block, frame_paths)
+        if not final_failures:
+            if on_progress:
+                on_progress('sequence_review_result', {'passed': True, 'round': round_num})
+            break
+        if on_progress:
+            on_progress('sequence_review_result', {
+                'passed': False, 'round': round_num, 'beats': sorted(final_failures.keys()),
+                'message': f'一致性审查发现 {len(final_failures)} 拍有问题，正在修复并重渲...',
+            })
+
+        changed_seqs = []
+        for beat, issues in final_failures.items():
+            video_item = videos.get(beat)
+            image_item = images.get(beat + 1)
+            v_body = video_item['body'] if isinstance(video_item, dict) else (video_item or '')
+            v_meta = video_item.get('meta', '') if isinstance(video_item, dict) else ''
+            i_body = image_item['body'] if isinstance(image_item, dict) else (image_item or '')
+            i_meta = image_item.get('meta', '') if isinstance(image_item, dict) else ''
+            new_v, new_i = fix_beat_from_sequence_review(config, v_body, i_body, issues)
+            if new_v != v_body or new_i != i_body:
+                videos[beat] = {'body': new_v, 'meta': v_meta}
+                images[beat + 1] = {'body': new_i, 'meta': i_meta}
+                changed_seqs.append(beat + 1)
+
+        if not changed_seqs:
+            # LLM 没能给出任何实际改动——继续循环也是原地踏步，直接跳出去做收尾标记
+            break
+
+        prompt_block = _format_prompt_block(images, videos)
+        generate_frame_sequence(config, title, prompt_block, on_progress=on_progress,
+                                target_sequences=sorted(changed_seqs))
+
+    flagged_seqs = {beat + 1 for beat in final_failures}
+    for seq in sorted(images):
+        if seq in flagged_seqs:
+            reason = '；'.join(final_failures.get(seq - 1, []))
+            _set_manifest_quality_gate(project_dir, seq, 'sequence_review_flagged', reason)
+        else:
+            _set_manifest_quality_gate(project_dir, seq, 'sequence_reviewed_pass', None)
+    if flagged_seqs and on_progress:
+        on_progress('sequence_review_result', {
+            'passed': False, 'round': max_rounds, 'beats': sorted(final_failures.keys()),
+            'message': f'达到最多 {max_rounds} 轮修复上限，仍有 {len(flagged_seqs)} 帧存在一致性问题，已标记留待人工处理。',
+        })
+    return prompt_block
+
+
 def render_frames_for_task(config, title, prompt_block, on_progress=None):
     """/api/generate_frames 整单渲染的编排入口：分段渲染 + 检查点现实同步 + 监修暂停
-    + 收尾链尾回望，与 staged/auto 流水线共享同一套机制（此前一次性端点直调
-    generate_frame_sequence，检查点/回望/监修对主界面的帧序列按钮完全不生效）。
-    不做锚点门/恢复轮/视频——保持该端点"只渲帧"的语义。
+    + 收尾链尾回望 + 整套序列一致性审查，与 staged/auto 流水线共享同一套机制（此前
+    一次性端点直调 generate_frame_sequence，检查点/回望/监修对主界面的帧序列按钮
+    完全不生效）。不做视频——保持该端点"只渲帧"的语义。
     返回 manifest（与 generate_frame_sequence 同约定，带 manifest/project_dir 瞬态键）。"""
     project_dir = _get_project_dir(title)
     prompt_block = _render_frames_with_checkpoints(config, title, prompt_block, project_dir,
                                                    on_progress=on_progress)
     _chain_drift_lookback(config, title, prompt_block, project_dir, on_progress=on_progress)
+    prompt_block = _sequence_consistency_review(config, title, prompt_block, project_dir, on_progress=on_progress)
     manifest = read_manifest(project_dir) or {}
     manifest_path = os.path.join(project_dir, 'manifest.json')
     manifest['manifest'] = '/' + os.path.relpath(
@@ -616,7 +659,9 @@ def _render_videos_with_recovery(config, title, prompt_block, on_progress=None):
     back rejected/blocked (e.g. a failed Google FX anchor-match) instead of leaving it
     for a human to notice and re-trigger manually."""
     video_result = generate_video_sequence(config, title, prompt_block, on_progress=on_progress)
-    failed_slots = [v['slot'] for v in video_result.get('videos', []) if v.get('status') != 'success']
+    # 'skipped_cut'（声明式硬切槽位）是预期缺失，不进恢复重试轮
+    failed_slots = [v['slot'] for v in video_result.get('videos', [])
+                    if v.get('status') not in ('success', 'skipped_cut')]
     if failed_slots:
         if on_progress:
             on_progress('video_retry_autonomous', {'slots': failed_slots})
@@ -626,19 +671,21 @@ def _render_videos_with_recovery(config, title, prompt_block, on_progress=None):
     return video_result
 
 
+def _no_gate_judge(image_path, prompt):
+    """恒真判定：IMAGE-1 锚点门已去掉——一致性审查移到整套序列渲染完成后统一跑
+    （见 _sequence_consistency_review），不再对首帧单独拦截。仍走
+    render_and_gate_single_frame/_retry_frame_until_pass 的既有管线（manifest 回写、
+    监修模式暂停点等）以保持改动最小。"""
+    return True, None
+
+
 def run_autonomous_pipeline(config, dimensions, on_progress=None):
-    """Runs the full staged pipeline autonomously, composing its own prompt text.
-    Returns a result dict with status='completed', or status='needs_human_review' if
-    IMAGE 1 still fails the Anchor Acceptance Gate after _MAX_ANCHOR_ATTEMPTS retries —
-    a rare escape hatch, not the routine path."""
+    """Runs the full staged pipeline autonomously, composing its own prompt text."""
     state = compose_anchor_and_packet(config, dimensions, on_progress=on_progress)
     title = state['title']
 
-    def anchor_judge(image_path, prompt):
-        return check_anchor_frame_compliance(config, image_path, prompt, state['packet'], state['parsed_brief'])
-
     gate = render_and_gate_single_frame(
-        config, title, 1, state['image_1_prompt'], judge=anchor_judge, on_progress=on_progress,
+        config, title, 1, state['image_1_prompt'], judge=_no_gate_judge, on_progress=on_progress,
     )
     state['image_1_prompt'] = gate['prompt']
     state['compiled_images'][1] = gate['prompt']
@@ -657,7 +704,7 @@ def run_autonomous_pipeline(config, dimensions, on_progress=None):
             break
         _rerenders += 1
         gate = render_and_gate_single_frame(
-            config, title, 1, state['image_1_prompt'], judge=anchor_judge, on_progress=on_progress,
+            config, title, 1, state['image_1_prompt'], judge=_no_gate_judge, on_progress=on_progress,
         )
         state['image_1_prompt'] = gate['prompt']
         state['compiled_images'][1] = gate['prompt']
@@ -675,8 +722,8 @@ def run_autonomous_pipeline(config, dimensions, on_progress=None):
     project_dir = gate['project_dir']
     prompt_block = compose_remaining_beats(config, state, on_progress=on_progress)
     prompt_block = _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on_progress=on_progress)
-    prompt_block = _recover_failed_frames(config, title, prompt_block, project_dir, on_progress=on_progress)
     _chain_drift_lookback(config, title, prompt_block, project_dir, on_progress=on_progress)
+    prompt_block = _sequence_consistency_review(config, title, prompt_block, project_dir, on_progress=on_progress)
     _supervised_degraded_summary(config, title, project_dir, on_progress=on_progress)
     video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress)
 
@@ -724,7 +771,7 @@ def run_staged_frame_rendering(config, title, prompt_block, on_progress=None):
         if on_progress:
             on_progress('anchor_check', {'sequence': 1, 'attempt': 0, 'passed': True, 'reason': '此前已通过判定且提示词未变，跳过重复渲染'})
     else:
-        gate = render_and_gate_single_frame(config, title, 1, prompt, meta=meta, on_progress=on_progress)
+        gate = render_and_gate_single_frame(config, title, 1, prompt, meta=meta, judge=_no_gate_judge, on_progress=on_progress)
         images[1] = {'body': gate['prompt'], 'meta': meta}
         if gate['status'] not in ('auto_approved', 'auto_approved_degraded'):
             if on_progress:
@@ -738,7 +785,7 @@ def run_staged_frame_rendering(config, title, prompt_block, on_progress=None):
             if decision != 'rerender' or _rerenders >= _MAX_REVIEW_RERENDERS:
                 break
             _rerenders += 1
-            gate = render_and_gate_single_frame(config, title, 1, images[1]['body'], meta=meta, on_progress=on_progress)
+            gate = render_and_gate_single_frame(config, title, 1, images[1]['body'], meta=meta, judge=_no_gate_judge, on_progress=on_progress)
             images[1] = {'body': gate['prompt'], 'meta': meta}
             if gate['status'] not in ('auto_approved', 'auto_approved_degraded'):
                 if on_progress:
@@ -747,8 +794,8 @@ def run_staged_frame_rendering(config, title, prompt_block, on_progress=None):
 
     prompt_block = _format_prompt_block(images, videos)
     prompt_block = _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on_progress=on_progress)
-    prompt_block = _recover_failed_frames(config, title, prompt_block, project_dir, on_progress=on_progress)
     _chain_drift_lookback(config, title, prompt_block, project_dir, on_progress=on_progress)
+    prompt_block = _sequence_consistency_review(config, title, prompt_block, project_dir, on_progress=on_progress)
     _supervised_degraded_summary(config, title, project_dir, on_progress=on_progress)
     video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress)
 

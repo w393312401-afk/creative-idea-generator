@@ -328,6 +328,15 @@ body {
     white-space: nowrap;
 }
 
+/* .switcher-item is also used on a <button> (图像工坊, which toggles an in-page panel
+   rather than navigating like its <a> siblings) — strip default button chrome so it
+   matches the anchors exactly. */
+button.switcher-item {
+    background: transparent;
+    border: none;
+    font-family: inherit;
+}
+
 .switcher-item:hover {
     color: var(--text-primary);
     background: rgba(var(--ink-rgb), 0.03);

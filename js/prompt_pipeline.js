@@ -179,6 +179,41 @@ async function fetchIdeationCover(idea, idx, coverContainer) {
     `;
 }
 
+// 本批联网参考面板(可折叠):展示搜索词/自定义网址各自"搜到了什么"。
+// 容器本身是横向滑动轨道,面板作为其上方的兄弟节点插入(宿主 div 幂等复用)。
+// 用 DOM + textContent 构建,LLM/网页返回的文本不走 innerHTML,防注入
+function renderIdeationTrendPanel(cardsContainer) {
+    let host = document.getElementById('ideation-trend-panel-host');
+    if (!host) {
+        host = document.createElement('div');
+        host.id = 'ideation-trend-panel-host';
+        cardsContainer.parentNode.insertBefore(host, cardsContainer);
+    }
+    host.innerHTML = '';
+    const refs = (typeof currentIdeationTrendRefs !== 'undefined' && Array.isArray(currentIdeationTrendRefs))
+        ? currentIdeationTrendRefs.filter(r => r && r.text) : [];
+    if (refs.length === 0) return;
+    const panel = document.createElement('details');
+    panel.className = 'ideation-trend-panel';
+    const summary = document.createElement('summary');
+    summary.textContent = `🌐 本批联网参考（${refs.map(r => r.source === 'custom_urls' ? '自定义网址' : '联网搜索').join(' + ')}）`;
+    panel.appendChild(summary);
+    refs.forEach(r => {
+        const item = document.createElement('div');
+        item.className = 'ideation-trend-ref';
+        const label = document.createElement('div');
+        label.className = 'ideation-trend-ref-label';
+        label.textContent = r.label || r.source || '';
+        const body = document.createElement('pre');
+        body.className = 'ideation-trend-ref-text';
+        body.textContent = r.text;
+        item.appendChild(label);
+        item.appendChild(body);
+        panel.appendChild(item);
+    });
+    host.appendChild(panel);
+}
+
 function renderIdeationCards(ideas) {
     const container = document.getElementById('ideation-cards-container');
     if (!container) return;
@@ -189,6 +224,8 @@ function renderIdeationCards(ideas) {
     }
     
     container.innerHTML = '';
+    renderIdeationTrendPanel(container);
+
     ideas.forEach((idea, idx) => {
         const card = document.createElement('div');
         card.className = 'ideation-card';
@@ -216,15 +253,20 @@ function renderIdeationCards(ideas) {
             <div class="ideation-card-metadata">
                 <span class="ideation-card-tag ${familyClass}">${familyText}</span>
                 <span class="ideation-card-tag">反差强度: ${idea.score >= 23 ? '极高' : '高'}</span>
+                ${Number.isFinite(+idea.recommended_beats) && +idea.recommended_beats > 0
+                    ? `<span class="ideation-card-tag beats" title="${idea.beats_reason || ''}">⏱ 推荐 ${idea.recommended_beats} 拍</span>`
+                    : ''}
             </div>
             <div class="ideation-card-body">
                 <div>载体: ${idea.carrier} (${idea.env})</div>
                 <div>现状: ${idea.trauma}</div>
                 <div class="ideation-card-twist">招牌反差: ${idea.twist_zh || idea.twist}</div>
+                ${idea.trend_ref ? `<div class="ideation-card-trend">🌐 趋势借鉴: ${idea.trend_ref}</div>` : ''}
             </div>
             <div class="ideation-card-actions">
                 <button type="button" class="ideation-card-btn select-action-btn">载入维度</button>
                 <button type="button" class="ideation-card-btn copy-action-btn">复制选题</button>
+                <button type="button" class="ideation-card-btn ledger-action-btn" title="存入创意台账候选池，供后续人工评分/追踪放量表现">📒 存入备选</button>
                 <button type="button" class="ideation-card-btn primary compose-action-btn">一键合成</button>
             </div>
         `;
@@ -272,6 +314,31 @@ function renderIdeationCards(ideas) {
             });
         });
 
+        // Clicking "存入备选" registers this idea in the topic ledger (topic_ledger.json)
+        // as a candidate — the management/scoring layer that used-topic-ledger.md itself
+        // doesn't offer (it's a write-only burn list, see js/ledger.js header comment).
+        const ledgerBtn = card.querySelector('.ledger-action-btn');
+        ledgerBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            if (typeof ledgerAddCandidate !== 'function') return;
+            ledgerBtn.disabled = true;
+            const prevText = ledgerBtn.textContent;
+            ledgerBtn.textContent = '存入中…';
+            const result = await ledgerAddCandidate({
+                topic_dna: idea.dna,
+                one_line: idea.title,
+                llm_score: idea.score,
+                source: 'Ideation Pool',
+            });
+            ledgerBtn.disabled = false;
+            ledgerBtn.textContent = prevText;
+            if (result.added) {
+                showToast(`已存入创意台账候选池："${idea.title}"`, 'success');
+            } else {
+                showToast(`存入失败：${result.reason || '未知错误'}`, result.reason === '该 Topic DNA 已在台账中' ? 'info' : 'error');
+            }
+        });
+
         container.appendChild(card);
     });
 }
@@ -289,22 +356,16 @@ function selectIdeationCard(index) {
         }
     });
     
-    // 1. Select matching carrier theme in GUI
-    const themeVal = mapEnglishCarrierToValue(idea.carrier);
-    
-    // Set loaded cover information
+    // Set loaded cover information — 基础场景主题选择器已移除：主生成按钮的选题
+    // （dimensions.theme）直接用这里存下的一键输入串，任务名用卡片选题名
     loadedIdeationCover = {
-        themeValue: themeVal,
+        input_str: idea.input_str || null,
         cover_url: idea.cover_url || null,
-        english_title: idea.english_title || null
+        english_title: idea.english_title || null,
+        task_label: idea.title || null
     };
-    
-    const themeBtn = document.querySelector(`#theme-selector .theme-btn[data-value="${themeVal}"]`);
-    if (themeBtn) {
-        document.querySelectorAll('#theme-selector .theme-btn').forEach(btn => btn.classList.remove('active'));
-        themeBtn.classList.add('active');
-    }
-    
+
+
     // 2. Select matching anchors
     const mappedAnchorVal = mapTwistToAnchorValue(idea.dna);
     document.querySelectorAll('#anchor-selector .anchor-node').forEach(node => {
@@ -320,9 +381,13 @@ function selectIdeationCard(index) {
     document.getElementById('slider-budget').value = 2;
     document.getElementById('slider-ratio').value = 50;
     document.getElementById('slider-creativity').value = 3;
-    
+    const recBeats = clampRecommendedBeats(idea.recommended_beats);
+    if (recBeats !== null) {
+        document.getElementById('slider-beats').value = recBeats;
+    }
+
     // Trigger input events to update labels
-    ['slider-complexity', 'slider-budget', 'slider-ratio', 'slider-creativity'].forEach(id => {
+    ['slider-complexity', 'slider-budget', 'slider-ratio', 'slider-creativity', 'slider-beats'].forEach(id => {
         document.getElementById(id).dispatchEvent(new Event('input'));
     });
     
@@ -330,18 +395,27 @@ function selectIdeationCard(index) {
     saveSelectionState();
 }
 
+// 推荐拍数合法化:非数字/越界返回 null(调用方保持原值),合法值收进滑块的 5-15 区间
+function clampRecommendedBeats(v) {
+    const n = Math.round(+v);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return Math.min(15, Math.max(5, n));
+}
+
 function composeIdeationCard(index) {
     const idea = currentIdeatedIdeas[index];
     if (!idea) return;
-    
+
     const dimensions = {
         theme: idea.input_str,
+        // 任务名称直接用卡片选题名（任务抽屉/激发 loading 优先展示 task_label）
+        task_label: idea.title || null,
         anchors: [idea.twist_zh || idea.twist],
         complexity: "硬核重工",
         budget: "轻奢设计师级",
         ratio: "50% (外壳粗野 ↔ 内里精致)",
         creativity: "脑洞大开",
-        beats_count: 15,
+        beats_count: clampRecommendedBeats(idea.recommended_beats) || 15,
         cover_url: idea.cover_url || null,
         english_title: idea.english_title || null,
         topic_dna: idea.dna || null

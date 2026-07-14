@@ -85,8 +85,8 @@ def background_worker(task_id, config, dimensions):
         if run_cancelled():
             raise GenerationCancelled("Generation cancelled by user")
             
-        # Double QA merged: call_llm's internal audit self-healing loop is the primary QA.
-        # We assign its audit results directly to repair_md.
+        # skill 直出模式：文本阶段无审查，audit_md 只是直出模式的说明文案；
+        # 一致性审查在帧渲染后对真实画面进行（pipeline_orchestrator）。
         result['repair_md'] = result.get('audit_md') or 'PASS — 工序与场景一致性检查通过，未发现违规，提示词未改动。'
         result['skipped_checks_count'] = config.get('_skipped_checks', 0) if isinstance(config, dict) else 0
         
@@ -470,7 +470,9 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
                 if slot not in manifest_video_slots:
                     has_failures = True
                     break
-                if manifest_video_slots[slot].get('status') != 'success':
+                # 'skipped_cut'（声明式硬切槽位）是预期缺失，不算失败——合并门禁
+                # （merge_project_videos）对它同样按预期缺失处理
+                if manifest_video_slots[slot].get('status') not in ('success', 'skipped_cut'):
                     has_failures = True
                     break
 
@@ -1184,6 +1186,26 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json(scan_gallery(refs=refs))
             except Exception as e:
                 self._send_json({'error': str(e)}, status=500)
+        elif path == '/api/ledger':
+            # 创意台账：topic_ledger.json 全量返回，读失败必须报 500 而不是静默
+            # 降级为 []（同 /api/library 的整库清零教训，见 read_ledger 注释）
+            if not self._gate():
+                return
+            data = read_ledger()
+            if data is None:
+                self._send_json({'error': '创意台账文件读取失败'}, status=500)
+                return
+            self._send_json(data)
+        elif path == '/api/trend-refs':
+            # 联网参考案例库(trend_refs.json)全量返回,新→旧;读失败必须报 500
+            # 而不是静默降级为 [](同 /api/ledger 的整库清零教训)
+            if not self._gate():
+                return
+            refs = load_trend_refs()
+            if refs is None:
+                self._send_json({'error': '联网参考案例库文件读取失败'}, status=500)
+                return
+            self._send_json({'status': 'ok', 'refs': list(reversed(refs))})
         elif path.startswith('/api/contents/generations/tasks/'):
             try:
                 task_id = path.split('/')[-1]
@@ -1295,6 +1317,84 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 if sys.stdout:
                     print(f"Error writing {DB_FILE}: {e}")
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/ledger':
+            # 创意台账全量保存：状态/表现打分/备注编辑与候选入库都走"整表回写"，
+            # 与 /api/library 同一套约定（客户端始终持有完整数组）
+            if not self._gate():
+                return
+            try:
+                data = self._read_json_body()
+                ok, message = write_ledger(data)
+                if not ok:
+                    self._send_json({'status': 'rejected', 'message': message}, status=409)
+                    return
+                self._send_json({'status': 'success'})
+            except Exception as e:
+                if sys.stdout:
+                    print(f"Error writing {LEDGER_FILE}: {e}")
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/ledger/delete':
+            # 台账批量删除：按 id 列表删（全选删空也走这条），不经过 /api/ledger
+            # 整表回写的空列表防护——显式 id 列表本身就是确认过的意图
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                ids = body.get('ids')
+                if not isinstance(ids, list) or not ids:
+                    self._send_json({'status': 'error', 'message': '缺少要删除的 ids'}, status=400)
+                    return
+                result = delete_ledger_entries(ids)
+                if result['remaining'] is None:
+                    self._send_json({'status': 'error', 'message': '创意台账文件读取失败'}, status=500)
+                    return
+                self._send_json({'status': 'ok', 'deleted': result['deleted']})
+            except Exception as e:
+                if sys.stdout:
+                    print(f"Error deleting from {LEDGER_FILE}: {e}")
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/trend-refs/search':
+            # 「搜一批新参考」：绕过 6 小时缓存强制联网重搜+自定义网址重摘要,
+            # 沉淀进案例库后全量返回(新→旧)。同步调用,最长约 1~2 分钟。
+            if not self._gate(with_rate=True):
+                return
+            try:
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                new_refs = refresh_trend_refs(config)
+                refs = load_trend_refs()
+                if refs is None:
+                    self._send_json({'status': 'error', 'message': '联网参考案例库文件读取失败'}, status=500)
+                    return
+                self._send_json({
+                    'status': 'ok',
+                    # 本批搜到的条目 id(文本与旧条目相同则 id 相同,前端据此算真正新增数)
+                    'added': [r['id'] for r in new_refs],
+                    'refs': list(reversed(refs)),
+                })
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/trend-refs/delete':
+            # 案例库按 id 批量删除(显式 id 列表即确认过的意图,同 /api/ledger/delete)
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                ids = body.get('ids')
+                if not isinstance(ids, list) or not ids:
+                    self._send_json({'status': 'error', 'message': '缺少要删除的 ids'}, status=400)
+                    return
+                result = delete_trend_refs(ids)
+                if result['remaining'] is None:
+                    self._send_json({'status': 'error', 'message': '联网参考案例库文件读取失败'}, status=500)
+                    return
+                self._send_json({'status': 'ok', 'deleted': result['deleted']})
+            except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/ping':
@@ -1509,9 +1609,6 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 with PACKET_CACHE_LOCK:
                     with open(CACHE_PATH, 'w', encoding='utf-8') as f:
                         json.dump({}, f, ensure_ascii=False, indent=2)
-                with PROCESS_BRIEF_CACHE_LOCK:
-                    with open(PROCESS_BRIEF_CACHE_PATH, 'w', encoding='utf-8') as f:
-                        json.dump({}, f, ensure_ascii=False, indent=2)
                 self._send_json({'status': 'success', 'message': '系统缓存清理成功'})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
@@ -1527,9 +1624,22 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 body = self._read_json_body()
                 config = effective_config(body.get('config'))
                 count = body.get('count', 8)
-                
-                ideas = run_ideate(config, count)
-                self._send_json({'status': 'ok', 'ideas': ideas})
+                # 基础场景主题选择器已移除；theme/theme_label 仅为旧客户端兼容保留。
+                # trend_ref_ids=用户在联网参考案例库勾选的条目 id：非空时本批灵感
+                # 以选中案例为首要创意来源(不再自动联网搜索)
+                theme = body.get('theme')
+                theme_label = body.get('theme_label')
+                trend_ref_ids = body.get('trend_ref_ids') or []
+
+                result = run_ideate(config, count, theme=theme, theme_label=theme_label,
+                                    trend_ref_ids=trend_ref_ids)
+                self._send_json({
+                    'status': 'ok',
+                    'ideas': result['ideas'],
+                    # 本批注入过灵感 prompt 的联网参考(搜索词摘要/自定义网址摘要),
+                    # 前端展示成可折叠面板,让用户能看到"搜到了什么"
+                    'trend_refs': result.get('trend_refs') or [],
+                })
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 

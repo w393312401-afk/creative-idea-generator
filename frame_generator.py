@@ -21,7 +21,7 @@ except ImportError:
 from server_common import (
     SERVER_CONFIG, SERVER_MANAGED, resolve_gateway, effective_config,
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
-    IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT,
+    IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT, IMG2IMG_TURN_CONTROL_PROMPT,
     IMAGE_TASKS, IMAGE_TASKS_LOCK, ensure_adspower_on_path,
     read_manifest, write_manifest
 )
@@ -238,7 +238,28 @@ def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=No
             continue
     if not regen:
         return
-    start = min(regen)
+    # i2i 链在声明式硬切帧（meta 含 CUT 的图片槽位 = t2i 新链头）处断开：血统标记按
+    # 链段独立计算——重生切点前的帧不会让切点后的帧过期（它们不派生自旧链），反之亦然。
+    cut_head_seqs = sorted({
+        fr.get('sequence') for fr in frames
+        if isinstance(fr, dict) and isinstance(fr.get('sequence'), int)
+        and 'CUT' in str(fr.get('meta', '')).upper()
+        and 'BRIDGE' not in str(fr.get('meta', '')).upper()
+    })
+
+    def _segment_head(seq):
+        head = 1
+        for h in cut_head_seqs:
+            if seq >= h:
+                head = h
+            else:
+                break
+        return head
+
+    regen_start_by_segment = {}
+    for r in regen:
+        seg = _segment_head(r)
+        regen_start_by_segment[seg] = min(r, regen_start_by_segment.get(seg, r))
     for fr in frames:
         if not isinstance(fr, dict):
             continue
@@ -247,7 +268,9 @@ def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=No
             continue
         if seq in regen:
             fr.pop('stale_lineage', None)
-        elif seq > start:
+            continue
+        seg_start = regen_start_by_segment.get(_segment_head(seq))
+        if seg_start is not None and seq > seg_start:
             fr['stale_lineage'] = True
 
 
@@ -1067,40 +1090,13 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path):
     return paths, temp_out
 
 
-def _fx_apply_vlm_fixes(config, orig_prompt, vlm_reason, is_bridge, is_last, family=None):
-    """按 API 路径同款流程，用 VLM 反馈改写提示词并套用主动修复。
-    family（'exterior'/'sill'/'interior'）用于镜头族感知：室内帧不回填 horizon、
-    不把静态相机声明当"运动矛盾"删掉；不传时退回旧的 is_bridge 行为。"""
-    from prompt_pipeline import (
-        fix_image_prompt_with_vlm_feedback, clean_prompt_text,
-        fix_image_clean_frame_proactive, fix_horizon_line,
-        fix_camera_contradictions, fix_rhma_blur, fix_camera_dna,
-    )
-    corrected = fix_image_prompt_with_vlm_feedback(config, orig_prompt, vlm_reason)
-    corrected = clean_prompt_text(corrected)
-    corrected = fix_image_clean_frame_proactive(corrected)
-    corrected = fix_horizon_line(corrected, family=(family or 'exterior'))
-    _strip_static = (family == 'sill') if family is not None else is_bridge
-    corrected = fix_camera_contradictions(corrected, is_bridge=_strip_static)
-    corrected = fix_rhma_blur(corrected, is_last=is_last)
-
-    camera_dna = ""
-    if ":" in orig_prompt:
-        parts = orig_prompt.split(":", 1)
-        if any(kw in parts[0].lower() for kw in ['tripod', 'camera', 'shot', 'height', 'view']):
-            camera_dna = parts[0] + ":"
-    if camera_dna:
-        corrected = fix_camera_dna(corrected, camera_dna)
-    return corrected
-
-
 def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=None, target_sequences=None):
     import builtins
     builtins.google_fx_cancelled = False
     rotate_requests = config.get('googleFxIpRotateRequests')
     if rotate_requests is not None:
         os.environ['MIYA_ROTATE_THRESHOLD'] = str(rotate_requests)
-    from prompt_pipeline import _parse_prompt_slots, run_frame_qa_check, resolve_family_anchor, image_space_family, is_skipped_verdict, is_warn_verdict
+    from prompt_pipeline import _parse_prompt_slots
     images, videos = _parse_prompt_slots(prompt_block)
 
     prompts = []
@@ -1190,81 +1186,10 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             on_progress('frame', {'frame': frame_info, 'current': generated_count, 'total': total_to_generate})
 
     def _run_vlm_qa(seq, item, is_bridge, ref_path):
-        """逐帧 VLM 质检 + 失败改写重生（≤2 次）。返回 (quality_gate, vlm_reason)。
-        quality_gate 为 'auto_approved' 表示 VLM 自动判定通过；'pending_manual_review'
-        表示未跑过任何自动校验（如首帧或上一帧缺失）；'vlm_qa_failed' 表示重试后仍未通过。"""
-        if seq <= 1 or not _frame_exists(seq - 1):
-            return 'pending_manual_review', None
-        video_item = videos.get(seq - 1, "")
-        video_prompt = video_item['body'] if isinstance(video_item, dict) else video_item
-        if not video_prompt:
-            return 'pending_manual_review', None
-
-        prev_path = _webp_path(seq - 1)
-        target_path = _webp_path(seq)
-        # Drift-check against the CURRENT shot family's anchor, not always IMAGE 1 -- once a
-        # threshold crossing has happened, IMAGE 1's exterior family no longer meaningfully
-        # bounds interior frames. None means this frame IS the family anchor itself.
-        # resolve_family_anchor：链中检查点重锚定过的族，以新基线为准（见其 docstring）。
-        anchor_seq = resolve_family_anchor(config, videos, seq)
-        anchor_path = _webp_path(anchor_seq) if anchor_seq != seq else None
-        if on_progress:
-            on_progress('frame_qa', {'slot': item['index'], 'sequence': seq})
-        vlm_pass, vlm_reason = run_frame_qa_check(config, anchor_path, prev_path, target_path, video_prompt, seq, is_bridge=is_bridge, anchor_seq=anchor_seq)
-        if vlm_pass:
-            if is_skipped_verdict(vlm_reason):
-                return 'auto_approved_degraded', vlm_reason
-            if is_warn_verdict(vlm_reason):
-                # 宽松档软性瑕疵：放行不重试，但把告警留进 manifest 供人工复核
-                return 'auto_approved', vlm_reason
-            return 'auto_approved', None
-
-        if sys.stdout:
-            print(f"[VLM QA][FX] Beat {seq-1} (IMAGE {seq}) failed VLM check: {vlm_reason}. Retrying via Google FX...")
-        for retry_attempt in range(2):
-            _check_cancel()
-            try:
-                if on_progress:
-                    on_progress('frame_retry', {
-                        'slot': item['index'],
-                        'sequence': seq,
-                        'attempt': retry_attempt + 1,
-                        'reason': vlm_reason,
-                    })
-                corrected = _fx_apply_vlm_fixes(
-                    config, item['prompt'], vlm_reason,
-                    is_bridge=is_bridge, is_last=(seq == len(prompts)),
-                    family=image_space_family(videos, seq),
-                )
-                if sys.stdout:
-                    print(f"[VLM QA][FX] Attempt {retry_attempt+1} corrected prompt: {corrected}")
-                retry_paths, retry_tmp = _fx_generate_batch(google_fx, fx_models, config, [corrected], ref_path)
-                try:
-                    _fx_store_frame(retry_paths[0], frames_dir, seq)
-                finally:
-                    shutil.rmtree(retry_tmp, ignore_errors=True)
-                # 与初次渲染路径保持同序：先做 LAB 颜色匹配再重新质检，
-                # 否则重试帧带着色偏被判卷，行为与首轮不一致（三处复制中的漂移点）
-                if _frame_exists(1) and os.path.exists(target_path):
-                    _match_color_lab(target_path, _webp_path(1), target_path)
-                vlm_pass, vlm_reason = run_frame_qa_check(config, anchor_path, prev_path, target_path, video_prompt, seq, is_bridge=is_bridge, anchor_seq=anchor_seq)
-                if vlm_pass:
-                    if sys.stdout:
-                        print(f"[VLM QA][FX] Beat {seq-1} passed VLM check on retry {retry_attempt+1}!")
-                    item['prompt'] = corrected  # 回写 manifest 用的提示词
-                    if is_skipped_verdict(vlm_reason):
-                        return 'auto_approved_degraded', vlm_reason
-                    if is_warn_verdict(vlm_reason):
-                        return 'auto_approved', vlm_reason
-                    return 'auto_approved', None
-                if sys.stdout:
-                    print(f"[VLM QA][FX] Beat {seq-1} failed VLM check on retry {retry_attempt+1}: {vlm_reason}")
-            except ConnectionError:
-                raise
-            except Exception as retry_err:
-                if sys.stdout:
-                    print(f"[VLM QA][FX] Retry {retry_attempt+1} hit exception: {retry_err}")
-        return 'vlm_qa_failed', vlm_reason
+        """不再逐帧质检——一致性审查移到整套序列渲染完成后，对着真实画面统一跑一次
+        （见 pipeline_orchestrator._sequence_consistency_review）。'pending_manual_review'
+        是 manifest 里已有的合法值，前端对它没有特殊徽标，渲染成普通帧。"""
+        return 'pending_manual_review', None
 
     def _record_frame(seq, item, fx_src_path, fx_uuid, quality_gate, vlm_reason):
         webp = _webp_path(seq)
@@ -1295,6 +1220,25 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         _emit_frame(frame_info)
 
     chunks = plan_fx_chunks(gen_seqs)
+    # 声明式硬切（[CUT] 视频槽）：切点后的首帧是新链头——FX 链上表现为该帧必须
+    # 另起一批且不带上一帧参考（否则 Flow UI 链式参考把切点前的外部画面串进室内）。
+    cut_heads = set()
+    for _v_idx, _v in (videos or {}).items():
+        _vm = str(_v.get('meta', '') if isinstance(_v, dict) else '').upper()
+        if 'CUT' in _vm and 'BRIDGE' not in _vm:
+            cut_heads.add(int(_v_idx) + 1)
+    if cut_heads:
+        _split = []
+        for _c in chunks:
+            _cur = []
+            for _s in _c:
+                if _s in cut_heads and _cur:
+                    _split.append(_cur)
+                    _cur = []
+                _cur.append(_s)
+            if _cur:
+                _split.append(_cur)
+        chunks = _split
     chunk_by_start = {c[0]: c for c in chunks}
     done_seqs = set()
 
@@ -1330,12 +1274,18 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             continue  # target 模式下不在重生名单里的序号
         _check_cancel()
 
-        ref_path = _fx_find_ref_for(frames_dir, chunk[0])
-        if chunk[0] > 1 and not ref_path and sys.stdout:
-            print(
-                f"[FRAME SEQUENCE][FX] 第 {chunk[0]} 帧找不到上一帧的 UUID 留档 "
-                f"(frames/fx_src/img_{chunk[0]-1:03d}_*.jpg)，本批将以无参考模式起链，画面连续性可能下降"
-            )
+        if chunk[0] in cut_heads:
+            # 硬切新链头：刻意不带参考起链（一致性靠提示词里的 Scene DNA 复述）
+            ref_path = None
+            if sys.stdout:
+                print(f"[FRAME SEQUENCE][FX] 第 {chunk[0]} 帧是声明式硬切新链头，本批以无参考模式起链（既定语义）")
+        else:
+            ref_path = _fx_find_ref_for(frames_dir, chunk[0])
+            if chunk[0] > 1 and not ref_path and sys.stdout:
+                print(
+                    f"[FRAME SEQUENCE][FX] 第 {chunk[0]} 帧找不到上一帧的 UUID 留档 "
+                    f"(frames/fx_src/img_{chunk[0]-1:03d}_*.jpg)，本批将以无参考模式起链，画面连续性可能下降"
+                )
 
         chunk_prompts = [prompts_by_seq[s]['prompt'] for s in chunk]
         if on_progress:
@@ -1455,13 +1405,18 @@ def _match_color_lab(source_path, reference_path, output_path):
             print(f"[COLOR MATCH] Warning: LAB color matching failed: {e}")
 
 
+# P0 门框清除兜底的最大额外推进次数：换族室内侧帧渲出后若门框仍在画面里，
+# 以该帧为参考用推进版控制指令"再往里推一步"，最多推这么多次。
+_DOOR_CLEARANCE_MAX_PUSHES = 2
+
+
 def generate_frame_sequence(config, title, prompt_block, on_progress=None, target_sequences=None):
     if (config.get('imageBackend') or 'api').strip().lower() == 'google_fx':
         return _generate_frame_sequence_google_fx(
             config, title, prompt_block,
             on_progress=on_progress, target_sequences=target_sequences,
         )
-    from prompt_pipeline import _parse_prompt_slots, run_frame_qa_check, resolve_family_anchor, image_space_family, is_skipped_verdict, is_warn_verdict
+    from prompt_pipeline import _parse_prompt_slots, image_space_family, check_door_clearance_frame
     images, videos = _parse_prompt_slots(prompt_block)
 
     prompts = []
@@ -1474,7 +1429,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             'prompt': body,
             'meta': meta
         })
-        
+
     if not prompts:
         raise RuntimeError('未在 prompt_block 中找到任何 图片 N: 提示词')
 
@@ -1546,30 +1501,24 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
 
         model = ""
         retries = 0
-        vlm_qa_failed = False
         vlm_qa_reason = None
-        vlm_checked = False
-        # Only VIDEO slots carry [BRIDGE] tags per the delivery contract; the incoming
-        # transition (VIDEO seq-1) is the real signal for IMAGE seq, not the image's own tag.
+        # Only VIDEO slots carry [BRIDGE]/[BRIDGE TURN]/[CUT] tags per the delivery contract;
+        # the incoming transition (VIDEO seq-1) is the real signal for IMAGE seq, not the
+        # image's own tag.
         incoming_video = videos.get(seq - 1)
+        incoming_meta = (incoming_video.get('meta', '') if isinstance(incoming_video, dict) else '').upper()
         is_bridge = (
             'BRIDGE' in item.get('meta', '').upper()
-            or 'BRIDGE' in (incoming_video.get('meta', '') if isinstance(incoming_video, dict) else '').upper()
+            or 'BRIDGE' in incoming_meta
         )
-        # Shot family of this IMAGE for prompt-rewrite fixes: the Bridge-2 image and every
-        # later frame are 'interior' — their static interior camera declaration must NOT be
-        # stripped as a "moving-camera contradiction", and no horizon may be stamped on them.
-        space_family = image_space_family(videos, seq)
-        # Drift-check reference for QA (NOT color-matching, which intentionally still uses
-        # IMAGE 1 as the baseline): once a threshold crossing has happened before this frame,
-        # IMAGE 1's exterior family no longer meaningfully bounds interior frames. None means
-        # this frame IS the family anchor itself, nothing to compare against yet.
-        # resolve_family_anchor：链中检查点重锚定过的族，以新基线为准
-        _anchor_seq = resolve_family_anchor(config, videos, seq)
-        qa_anchor_path = os.path.join(frames_dir, f'img_{_anchor_seq:03d}.webp') if _anchor_seq != seq else None
-
+        # 摇镜桥（pan 变体 Bridge-3）：同一空间原地旋转视点，用旋转版控制指令
+        is_turn = 'TURN' in incoming_meta
+        # 声明式硬切（[CUT]）：本帧是切点后的室内首帧——不拿上一帧当参考，走 t2i
+        # 新链头（一致性靠提示词里的 Scene DNA 复述），之后的帧从这帧继续 i2i 链
+        is_cut_head = ('CUT' in incoming_meta) and ('BRIDGE' not in incoming_meta)
         if not skip_api_call:
-            use_text_generation = (seq == 1 or not previous_path or not os.path.exists(previous_path))
+            use_text_generation = (seq == 1 or is_cut_head
+                                   or not previous_path or not os.path.exists(previous_path))
             model = _image_generation_model(config) if use_text_generation else _image_edit_model(config)
             reference = previous_path if not use_text_generation else None
             if on_progress:
@@ -1584,7 +1533,12 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                 if use_text_generation:
                     _generate_text_image(config, item['prompt'], target_path)
                 else:
-                    ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT if is_bridge else IMG2IMG_CONTROL_PROMPT
+                    if is_turn:
+                        ctrl_prompt = IMG2IMG_TURN_CONTROL_PROMPT
+                    elif is_bridge:
+                        ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT
+                    else:
+                        ctrl_prompt = IMG2IMG_CONTROL_PROMPT
                     _generate_image_edit(config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
             except QuotaExhaustedError as quota_err:
                 # Primary model quota exhausted.
@@ -1637,122 +1591,62 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                         print(f"[COLOR MATCH] Aligning frame {seq} color to baseline first frame.")
                     _match_color_lab(target_path, first_frame_path, target_path)
 
-            # Run VLM visual QA check on successful edits
-            if seq > 1 and not use_text_generation and os.path.exists(previous_path) and os.path.exists(target_path):
-                video_item = videos.get(seq - 1, "")
-                video_prompt = video_item['body'] if isinstance(video_item, dict) else video_item
-                if video_prompt:
-                    vlm_checked = True
+            # P0 门框清除兜底：换族桥接视频产出的室内侧帧（TBCP settle / vestibule 帧）
+            # 由 i2i 保守编辑生成——sill 参考帧门框占满画面时，编辑模型经常只做保守
+            # 裁切，门框残留导致室内占比过小。渲出后立即对真实像素做单项 VLM 判定，
+            # 未通过则以刚渲出的帧为参考、用推进版控制指令再推一步（把"过门"拆成
+            # 两次连续推进），最多 _DOOR_CLEARANCE_MAX_PUSHES 次；推完仍不过只留痕，
+            # 绝不拦渲染（终审交给整套序列一致性审查）。
+            if (not use_text_generation and is_bridge
+                    and image_space_family(videos, seq) in ('vestibule', 'interior')):
+                for _push in range(_DOOR_CLEARANCE_MAX_PUSHES + 1):
+                    dc_passed, dc_reason = check_door_clearance_frame(config, target_path)
                     if on_progress:
-                        # 渲染完→质检判定的间隙此前对前端完全静默（判定超时可达
-                        # 90s×2），显式广播"质检判定中"填补动态流的黑洞
-                        on_progress('frame_qa', {'slot': item['index'], 'sequence': seq})
-                    vlm_pass, vlm_reason = run_frame_qa_check(config, qa_anchor_path, previous_path, target_path, video_prompt, seq, is_bridge=is_bridge, anchor_seq=_anchor_seq)
-                    if not vlm_pass:
+                        _verdict = '通过' if dc_passed else '未通过'
+                        _detail = f"（{dc_reason}）" if dc_reason and dc_reason != 'PASS' else ''
+                        on_progress('door_clearance', {
+                            'sequence': seq, 'passed': bool(dc_passed),
+                            'reason': dc_reason, 'push': _push,
+                            'message': f"门框清除检查 IMG {seq:03d}：{_verdict}{_detail}",
+                        })
+                    if dc_passed:
+                        break
+                    if _push >= _DOOR_CLEARANCE_MAX_PUSHES:
+                        vlm_qa_reason = dc_reason
                         if sys.stdout:
-                            print(f"[VLM QA] Beat {seq-1} (IMAGE {seq}) failed VLM check: {vlm_reason}. Retrying generation with VLM feedback...")
-                        # Retry generation up to 2 times
-                        for retry_attempt in range(2):
-                            try:
-                                if on_progress:
-                                    on_progress('frame_retry', {
-                                        'slot': item['index'],
-                                        'sequence': seq,
-                                        'attempt': retry_attempt + 1,
-                                        'reason': vlm_reason,
-                                    })
-                                # Get corrected prompt from auxModel using VLM feedback
-                                from prompt_pipeline import fix_image_prompt_with_vlm_feedback, clean_prompt_text, fix_image_clean_frame_proactive, fix_horizon_line, fix_camera_contradictions, fix_rhma_blur, fix_camera_dna
-                                
-                                orig_prompt = item['prompt']
-                                corrected_prompt = fix_image_prompt_with_vlm_feedback(config, orig_prompt, vlm_reason)
-                                
-                                # Apply proactive fixes to the corrected prompt (shot-family
-                                # aware: only the sill handoff frame sheds static-lock wording;
-                                # interior frames keep their static declaration and never get a
-                                # horizon stamped back on)
-                                corrected_prompt = clean_prompt_text(corrected_prompt)
-                                corrected_prompt = fix_image_clean_frame_proactive(corrected_prompt)
-                                corrected_prompt = fix_horizon_line(corrected_prompt, family=space_family)
-                                corrected_prompt = fix_camera_contradictions(corrected_prompt, is_bridge=(space_family == 'sill'))
-                                corrected_prompt = fix_rhma_blur(corrected_prompt, is_last=(seq == len(prompts)))
-                                
-                                # Extract camera DNA prefix from the original prompt to preserve it
-                                camera_dna = ""
-                                if ":" in orig_prompt:
-                                    parts = orig_prompt.split(":", 1)
-                                    if any(kw in parts[0].lower() for kw in ['tripod', 'camera', 'shot', 'height', 'view']):
-                                        camera_dna = parts[0] + ":"
-                                
-                                if camera_dna:
-                                    corrected_prompt = fix_camera_dna(corrected_prompt, camera_dna)
-                                
-                                if sys.stdout:
-                                    print(f"[VLM QA] Attempt {retry_attempt+1} corrected prompt: {corrected_prompt}")
-                                
-                                _generate_image_edit(config, corrected_prompt, previous_path, target_path, control_prompt=ctrl_prompt)
-                                first_frame_path = os.path.join(frames_dir, 'img_001.webp')
-                                if os.path.exists(first_frame_path) and os.path.exists(target_path):
-                                    _match_color_lab(target_path, first_frame_path, target_path)
-                                vlm_pass, vlm_reason = run_frame_qa_check(config, qa_anchor_path, previous_path, target_path, video_prompt, seq, is_bridge=is_bridge, anchor_seq=_anchor_seq)
-                                if vlm_pass:
-                                    if sys.stdout:
-                                        print(f"[VLM QA] Beat {seq-1} passed VLM check on retry {retry_attempt+1}!")
-                                    # Update the prompt in our active prompts list so it writes back to manifest!
-                                    item['prompt'] = corrected_prompt
-                                    break
-                                else:
-                                    if sys.stdout:
-                                        print(f"[VLM QA] Beat {seq-1} failed VLM check on retry {retry_attempt+1}: {vlm_reason}")
-                            except QuotaExhaustedError:
-                                # 配额耗尽不能被下面的通用 except 吞成一条日志：
-                                # 有兜底模型就切换重试本帧（与首次渲染路径一致），否则上抛
-                                fallback_model = config.get('imageEditFallbackModel') or config.get('fallbackImageModel')
-                                if not fallback_model:
-                                    raise
-                                if sys.stdout:
-                                    print(f"[VLM QA] Retry {retry_attempt+1} 配额耗尽，切换兜底模型 {fallback_model} 重试本帧")
-                                if on_progress:
-                                    on_progress('model_fallback', {'slot': item['index'], 'sequence': seq, 'to': fallback_model})
-                                try:
-                                    fallback_config = dict(config)
-                                    fallback_config['imageModel'] = fallback_model
-                                    # 兜底模型仍挂同一张参考帧走图生图，链路不断，不算降级
-                                    _generate_image_edit(fallback_config, corrected_prompt, previous_path, target_path, control_prompt=ctrl_prompt)
-                                    first_frame_path = os.path.join(frames_dir, 'img_001.webp')
-                                    if os.path.exists(first_frame_path) and os.path.exists(target_path):
-                                        _match_color_lab(target_path, first_frame_path, target_path)
-                                    vlm_pass, vlm_reason = run_frame_qa_check(config, qa_anchor_path, previous_path, target_path, video_prompt, seq, is_bridge=is_bridge, anchor_seq=_anchor_seq)
-                                    if vlm_pass:
-                                        item['prompt'] = corrected_prompt
-                                        break
-                                except Exception as fb_err:
-                                    if sys.stdout:
-                                        print(f"[VLM QA] 兜底模型重试也失败: {fb_err}")
-                            except Exception as retry_err:
-                                if sys.stdout:
-                                    print(f"[VLM QA] Retry {retry_attempt+1} hit exception: {retry_err}")
-                        if not vlm_pass:
-                            vlm_qa_failed = True
-                            vlm_qa_reason = vlm_reason
-                        
-            # 「降级」标记已退役：图生图帧的兜底永远仍是图生图（换模型不算降级），
-            # 兜底也失败则整帧明确报错——不存在静默断链，也就没有可传染的降级血统。
-            # 旧 manifest 里遗留的 i2i_fallback_degraded 在跳过路径原样保留，重生该帧即清除。
-            if vlm_qa_failed:
-                current_quality_gate = 'vlm_qa_failed'
-            elif vlm_checked:
-                if is_skipped_verdict(vlm_reason):
-                    # 判定服务异常被 fail-open 放行：不伪装成真实通过，manifest 留痕
-                    current_quality_gate = 'auto_approved_degraded'
-                    vlm_qa_reason = vlm_reason
-                else:
-                    current_quality_gate = 'auto_approved'
-                    if is_warn_verdict(vlm_reason):
-                        # 宽松档软性瑕疵：放行不重试，告警留进 manifest 供人工复核
-                        vlm_qa_reason = vlm_reason
-            else:
-                current_quality_gate = 'pending_manual_review'
+                            print(f"[DOOR CLEARANCE] Frame {seq} still shows the door frame after "
+                                  f"{_DOOR_CLEARANCE_MAX_PUSHES} extra push(es); keeping the frame "
+                                  f"and recording the reason for the sequence review.")
+                        break
+                    push_ref = target_path + '.doorpush.webp'
+                    try:
+                        shutil.copyfile(target_path, push_ref)
+                        if sys.stdout:
+                            print(f"[DOOR CLEARANCE] Frame {seq} failed door clearance "
+                                  f"({dc_reason}); pushing one more step past the threshold.")
+                        _generate_image_edit(config, item['prompt'], push_ref, target_path,
+                                             control_prompt=IMG2IMG_BRIDGE_CONTROL_PROMPT)
+                        retries += 1
+                        first_frame_path = os.path.join(frames_dir, 'img_001.webp')
+                        if os.path.exists(first_frame_path):
+                            _match_color_lab(target_path, first_frame_path, target_path)
+                    except Exception as push_err:
+                        # 再推失败：保留当前帧（已通过正常生成路径），留痕后继续
+                        vlm_qa_reason = dc_reason
+                        if sys.stdout:
+                            print(f"[DOOR CLEARANCE] Extra push for frame {seq} failed "
+                                  f"({push_err}); keeping the current frame.")
+                        break
+                    finally:
+                        try:
+                            if os.path.exists(push_ref):
+                                os.remove(push_ref)
+                        except OSError:
+                            pass
+
+            # 不再逐帧质检——一致性审查移到整套序列渲染完成后统一跑一次，对着真实
+            # 画面判断（见 pipeline_orchestrator._sequence_consistency_review）。
+            current_quality_gate = 'pending_manual_review'
         else:
             reference = previous_path if seq > 1 else None
             existing_frame = manifest_frames_by_seq.get(seq)

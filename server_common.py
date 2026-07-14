@@ -199,6 +199,7 @@ RATE_WINDOW = _int_setting('SPARK_RATE_WINDOW', 'rateWindow', 3600)
 
 PORT = _int_setting('PORT', 'port', 8085)
 DB_FILE = 'library.json'
+LEDGER_FILE = 'topic_ledger.json'
 OUTPUT_ROOT = 'outputs'
 # 2026-07-12: 旧版要求 "smallest localized edit"，与"每拍必须有全画幅阶段变化"的产品方向
 # 直接对抗——提示词写了大变换、控制指令又叫模型最小化改动，结果就是整单"挤牙膏"式微小
@@ -227,6 +228,18 @@ IMG2IMG_BRIDGE_CONTROL_PROMPT = (
     "fully and decisively — inherited landmarks scale up naturally, newly exposed margins are "
     "filled with coherent detail; do not shrink the camera advance into a timid crop. "
     "Do not add extra objects, active machinery, or workers. Return one clean edited image only."
+)
+IMG2IMG_TURN_CONTROL_PROMPT = (
+    "IMAGE EDITING MODE (CAMERA TURN ACTIVE). The attached previous frame is the authoritative "
+    "source image. Maintain extreme consistency of all physical landmarks, geometry, colors, "
+    "materials, light source angles, and structural features. The camera POSITION stays fixed at "
+    "the same point in space, but the viewpoint ROTATES horizontally (one smooth pan) to face a new "
+    "direction inside the same enclosed space. Landmarks visible in the source frame slide toward "
+    "and past the frame edge following correct rotational optical flow; the newly revealed side of "
+    "the space enters from the opposite edge and must be rendered fully and decisively, coherent "
+    "with the established materials, lighting direction, weathering, and decay state — do not "
+    "shrink the turn into a timid crop, and do not dolly forward or backward. Do not add extra "
+    "objects, active machinery, or workers. Return one clean edited image only."
 )
 SKILL_DIR = os.environ.get(
     'SKILL_DIR',
@@ -274,7 +287,7 @@ def effective_config(client_config):
         for k in ('cheapModel', 'auxModel'):
             if client_config.get(k):
                 merged[k] = client_config[k]
-    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'googleFxIpRotateRequests', 'qaGateLevel', 'realityCheckpointInterval', 'supervisedMode', 'reviewTimeoutSeconds'):
+    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'googleFxIpRotateRequests', 'qaGateLevel', 'realityCheckpointInterval', 'supervisedMode', 'reviewTimeoutSeconds', 'ideationTrendUrls', 'ideationSearchQuery'):
         if client_config.get(k):
             merged[k] = client_config[k]
     for k in ('geminiDirectApiKey', 'geminiApiKey', 'geminiDirectImageModel'):
@@ -699,7 +712,6 @@ class GenerationCancelled(ConnectionError):
 
 
 PACKET_CACHE_LOCK = threading.RLock()
-PROCESS_BRIEF_CACHE_LOCK = threading.RLock()
 # 提示词合成断点续传(compose_checkpoints.json)专用锁,见 prompt_pipeline 的
 # save_compose_checkpoint/load_compose_checkpoint
 COMPOSE_CHECKPOINT_LOCK = threading.RLock()
@@ -709,6 +721,9 @@ ACTIVE_TASKS_LOCK = threading.RLock()
 # library.json 读写共用一把锁：Windows 上 os.replace 会因并发打开的读句柄抛
 # PermissionError，读路径也必须串行化，否则存在整库清零风险
 LIBRARY_LOCK = threading.Lock()
+
+# topic_ledger.json（创意台账管理库）读写锁，同一套整库清零教训 → 同一套防护
+LEDGER_LOCK = threading.Lock()
 
 # Async image-station generation/edit tasks (polled via the /api/image-station endpoints)
 IMAGE_TASKS = {}
@@ -739,6 +754,145 @@ def write_json_atomic(path, data, indent=2):
             except OSError:
                 pass
             raise
+
+
+LEDGER_STATUSES = {'candidate', 'used', 'published', 'discarded'}
+
+
+def read_ledger(path=None):
+    """读取 topic_ledger.json。缺失返回 []；损坏返回 None（调用方应回 500，
+    不能静默降级为 [] —— 那正是 library.json 整库清零事故的触发路径）。"""
+    path = path or LEDGER_FILE
+    with LEDGER_LOCK:
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            if sys.stdout:
+                print(f"[WARN] {path} 读取失败: {e}")
+            return None
+        return data if isinstance(data, list) else None
+
+
+def _write_ledger_file(entries, path):
+    """无防护的落盘：写前若现有文件非空则轮换 .bak，然后原子写入。是否允许这次
+    覆盖由调用方（write_ledger 的空列表拒绝 / delete_ledger_entries 的按 id 删除）
+    各自判断，这里只负责"写就写安全"。调用方必须已持有 LEDGER_LOCK。"""
+    existing_count = 0
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                _old = json.load(f)
+            existing_count = len(_old) if isinstance(_old, list) else 1
+        except Exception:
+            existing_count = 1  # 读不出来按"非空"保守处理
+    if existing_count > 0:
+        try:
+            shutil.copyfile(path, path + '.bak')
+        except Exception as _bak_err:
+            if sys.stdout:
+                print(f"[LEDGER GUARD] 备份 {path}.bak 失败（继续写入）: {_bak_err}")
+    write_json_atomic(path, entries)
+
+
+def write_ledger(entries, path=None):
+    """写 topic_ledger.json，套用 library.json 的三层防护：空列表拒绝覆盖非空、
+    写前 .bak 轮换、原子替换。返回 (ok, message)；ok=False 时调用方应回 409。
+
+    这条防护只堵"客户端以为台账是空的"这类状态错乱场景（整表回写、编辑状态/
+    打分/备注时用）。真要批量/全部删除，走 delete_ledger_entries——按 id 删除
+    天然带着"确有意图"的证据，不吃这道防护。"""
+    path = path or LEDGER_FILE
+    if not isinstance(entries, list):
+        return False, '台账数据必须是数组'
+    with LEDGER_LOCK:
+        existing_count = 0
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    _old = json.load(f)
+                existing_count = len(_old) if isinstance(_old, list) else 1
+            except Exception:
+                existing_count = 1  # 读不出来按"非空"保守处理
+        incoming_count = len(entries)
+        if incoming_count == 0 and existing_count > 0:
+            if sys.stdout:
+                print(f"[LEDGER GUARD] 拒绝空列表覆盖非空创意台账（现有 {existing_count} 条）")
+            return False, (
+                f'拒绝将非空创意台账（{existing_count} 条）覆盖为空：客户端状态疑似错乱，'
+                f'请刷新页面重新加载后再操作；如确要清空请用批量删除。'
+            )
+        _write_ledger_file(entries, path)
+        return True, None
+
+
+def delete_ledger_entries(ids, path=None):
+    """按 id 集合批量删除台账条目（批量删除所选 / 全选删除都走这条）。不经过
+    write_ledger 的空列表覆盖防护——那道防护针对的是"客户端以为库是空的"这类
+    状态错乱场景，而显式 id 列表天然不会被这种错乱触发（错乱状态产不出真实 id）。
+
+    返回 dict：
+      - deleted: 实际删除条数
+      - remaining: 删除后的剩余条目列表；读取/解析失败时为 None（调用方应回 500）
+    """
+    path = path or LEDGER_FILE
+    id_set = set(ids or [])
+    if not id_set:
+        return {'deleted': 0, 'remaining': []}
+    with LEDGER_LOCK:
+        if not os.path.exists(path):
+            return {'deleted': 0, 'remaining': []}
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            if sys.stdout:
+                print(f"[WARN] {path} 读取失败: {e}")
+            return {'deleted': 0, 'remaining': None}
+        if not isinstance(data, list):
+            return {'deleted': 0, 'remaining': None}
+        remaining = [e for e in data if not (isinstance(e, dict) and e.get('id') in id_set)]
+        deleted = len(data) - len(remaining)
+        if deleted > 0:
+            _write_ledger_file(remaining, path)
+        return {'deleted': deleted, 'remaining': remaining}
+
+
+def parse_legacy_ledger_md(content):
+    """把 used-topic-ledger.md 的原始文本解析成结构化条目列表，供一次性迁移使用。
+
+    表格在文件中途会被一段 "## Avoid List" 标题打断、随后又继续出现数据行——
+    因此按"是否是 | 开头的数据行"逐行扫描全文，而不是假设单一连续表格。"""
+    import uuid as _uuid
+    entries = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith('|'):
+            continue
+        cells = [c.strip() for c in stripped.strip('|').split('|')]
+        if len(cells) < 5:
+            continue
+        date_str, topic_dna, one_line, source, avoid_notes = cells[:5]
+        # 跳过表头行（"Date"/"日期"）与分隔行（"---"）
+        if not date_str or date_str.lower().startswith('date') or date_str.startswith('日期'):
+            continue
+        if set(date_str) <= {'-'}:
+            continue
+        entries.append({
+            'id': str(_uuid.uuid4()),
+            'date': date_str,
+            'topic_dna': topic_dna,
+            'one_line': one_line,
+            'source': source or 'Migrated',
+            'avoid_notes': avoid_notes,
+            'status': 'used',
+            'llm_score': None,
+            'user_score': None,
+            'performance_note': '',
+        })
+    return entries
 
 
 # manifest.json 的每项目写锁：三个代码路径（同步器/帧生成/视频生成）此前

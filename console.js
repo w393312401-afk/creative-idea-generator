@@ -730,7 +730,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     taskTableBody.innerHTML = tasks.map(t => {
       // 主题名来自 LLM/用户输入，错误信息来自服务端——都必须转义再进 innerHTML
-      const theme = escapeHtml(t.dimensions ? (t.dimensions.theme || '未指定主题') : '应用内直呼生成');
+      // 任务名优先用灵感卡片选题名（task_label），回退基础场景主题
+      const theme = escapeHtml(t.dimensions ? (t.dimensions.task_label || t.dimensions.theme || '未指定主题') : '应用内直呼生成');
       const duration = t.result && t.result.timings ? `${t.result.timings.total_duration_seconds}s` : '-';
       const beats = t.dimensions ? (t.dimensions.beats_count || 15) : '-';
 

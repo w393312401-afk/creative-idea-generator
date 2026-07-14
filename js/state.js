@@ -25,10 +25,14 @@ const DEFAULT_CONFIG = {
     googleFxIpRotateRequests: 5,
     imageAspectRatio: '9:16',
     imageQuality: '2K',
-    // 帧质检门档位: 'standard'（全量严检）| 'lenient'（只拦硬伤,构图漂移放行）| 'off'（关闭）
-    qaGateLevel: 'standard',
     // 关键点监修模式: 首帧/镜头族交接锚点帧渲染后暂停等人工确认（采用/重渲，超时自动采用）
-    supervisedMode: false
+    supervisedMode: false,
+    // 激发参考网址（可选）: 换行/逗号分隔,最多取 5 个;后端抓取正文→aux 模型压成
+    // 中文要点注入激发 prompt,与联网搜索趋势通道叠加,6 小时缓存
+    ideationTrendUrls: '',
+    // 激发联网搜索词（可选）: 留空用默认「爆款延时改造视频」查询;
+    // 自定义后按搜索词分别缓存 6 小时,改词立即生效
+    ideationSearchQuery: ''
 };
 
 // LLM 主模型清单（激发/合成/审核/质检判定共用；网关路由由服务端 resolve_gateway 处理）。
@@ -79,6 +83,10 @@ let ACCESS_CODE = localStorage.getItem('spark_access_code') || '';
 
 let savedIdeas = [];
 let currentIdea = null;
+
+// 本批灵感注入过 prompt 的联网参考(/api/ideate 返回的 trend_refs:
+// 搜索词摘要/自定义网址摘要),渲染在灵感卡片区顶部的可折叠面板
+let currentIdeationTrendRefs = [];
 
 let customPresets = {};
 let activeBackgroundTasks = {

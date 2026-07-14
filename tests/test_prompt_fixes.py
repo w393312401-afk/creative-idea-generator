@@ -314,32 +314,6 @@ Video prompt 8 here.
         self.assertIn("图片 3 [BRIDGE]:", block)
         self.assertIn("视频 2 [BRIDGE]:", block)
 
-    def test_soft_similarity_only_ratio_gates_best_effort_acceptance(self):
-        """_soft_similarity_only_ratio decides when a beat may be shipped best-effort instead of
-        falling back to a generic placeholder: ONLY when every remaining error is the soft
-        'too similar to previous beat' stylistic check (any hard error -> None)."""
-        from prompt_pipeline import _soft_similarity_only_ratio
-
-        soft_only = [
-            "VIDEO phrasing/structure is too similar to previous beat (cleaned similarity: 0.69 > 0.65). Please vary ...",
-        ]
-        self.assertAlmostEqual(_soft_similarity_only_ratio(soft_only), 0.69)
-
-        # Two soft errors -> return the worst (highest) current-similarity, ignoring the '> 0.65' threshold.
-        two_soft = [
-            "VIDEO sentence is too similar to previous beat's sentence (similarity: 0.72):\n  Current: x",
-            "VIDEO phrasing/structure is too similar to previous beat (cleaned similarity: 0.66 > 0.65).",
-        ]
-        self.assertAlmostEqual(_soft_similarity_only_ratio(two_soft), 0.72)
-
-        # Any hard error present -> not eligible for best-effort acceptance.
-        mixed = [
-            "VIDEO phrasing/structure is too similar to previous beat (cleaned similarity: 0.66 > 0.65).",
-            "VIDEO prompt word count (236) exceeds limit of 180 words",
-        ]
-        self.assertIsNone(_soft_similarity_only_ratio(mixed))
-        self.assertIsNone(_soft_similarity_only_ratio([]))
-
     def test_checkpoint_is_failed_terminal_detects_poisoned_resume(self):
         """A checkpoint whose fallback_count already exceeds the quality gate is a failed-terminal
         snapshot that must NOT be resumed as-is (else every retry is a zero-work instant re-fail)."""

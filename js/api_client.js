@@ -303,6 +303,24 @@ function renderVideoSlotFailed(idx, message, labelText = '生成失败') {
     });
 }
 
+// 声明式硬切槽位（[CUT]，TBCP v2 hard_cut 变体）：该槽不生成视频，成片在此处直接
+// 硬切拼接——画中性卡片而不是失败卡（无重试按钮，重试它没有意义）
+function renderVideoSlotSkippedCut(idx, message) {
+    const el = document.getElementById(`video-slot-${idx}`);
+    if (!el) return;
+    el.className = 'frame-card video-failed-card';
+    el.innerHTML = `
+        <div class="video-failed-placeholder">
+            <span class="error-icon">✂️</span>
+            <span class="error-text"></span>
+        </div>
+        <span>VID ${String(idx).padStart(3, '0')}</span>
+    `;
+    const txt = el.querySelector('.error-text');
+    txt.textContent = '声明式硬切（无片段）';
+    txt.title = message || '声明式硬切槽位：不生成视频片段，成片在此处直接硬切。';
+}
+
 function startTasksPolling(interval = 2500) {
     stopTasksPolling();
     currentPollInterval = interval;

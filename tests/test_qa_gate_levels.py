@@ -297,32 +297,37 @@ class TestOffLevelAnchorReuse(unittest.TestCase):
 
     def _run_staged(self, config):
         from pipeline_orchestrator import run_staged_frame_rendering
-        with patch('pipeline_orchestrator.generate_frame_sequence'), \
-             patch('pipeline_orchestrator.check_anchor_frame_compliance',
-                   return_value=(True, 'Skipped (qaGateLevel=off: 质检门已关闭)')) as mock_gate, \
+        with patch('pipeline_orchestrator.generate_frame_sequence') as mock_render, \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance') as mock_gate, \
              patch('pipeline_orchestrator.generate_video_sequence',
                    return_value={'videos': [{'slot': 1, 'status': 'success'}]}):
             result = run_staged_frame_rendering(config, self.title, self._PROMPT_BLOCK)
-        return result, mock_gate
+        return result, mock_gate, mock_render
 
     def test_off_level_reuses_degraded_anchor(self):
         self._write_degraded_anchor()
         with _gate_sources():
-            result, mock_gate = self._run_staged({'qaGateLevel': 'off'})
+            result, mock_gate, mock_render = self._run_staged({'qaGateLevel': 'off'})
         self.assertEqual(result['status'], 'completed')
         mock_gate.assert_not_called()  # 复用成功：没有重新过门（也就不会重渲首帧）
+        self.assertNotIn([1], [c.kwargs.get('target_sequences') for c in mock_render.call_args_list])
 
     def test_standard_level_still_regates_degraded_anchor(self):
+        """degraded 记录在 standard 档仍不可复用：必须重新渲染首帧（不再有锚点门可
+        "重新过"，_no_gate_judge 恒真，重渲后直接记 auto_approved）。"""
         self._write_degraded_anchor()
         with _gate_sources():
-            result, mock_gate = self._run_staged({})
+            result, mock_gate, mock_render = self._run_staged({})
         self.assertEqual(result['status'], 'completed')
-        mock_gate.assert_called_once()  # degraded 在 standard 档仍不可复用
+        mock_gate.assert_not_called()
+        self.assertIn([1], [c.kwargs.get('target_sequences') for c in mock_render.call_args_list])
 
 
-class TestWarnVerdictLandsInManifest(unittest.TestCase):
-    """API 帧生成路径：WARN 放行不触发重试，quality_gate 记 auto_approved，
-    告警文本落进 manifest 的 vlm_qa_reason 供人工复核。"""
+class TestNoPerFrameQaInGenerateFrameSequence(unittest.TestCase):
+    """API 帧生成路径逐帧质检门已停用：不再调用 run_vlm_qa_check，每帧无条件记
+    pending_manual_review——一致性审查移到整套序列渲染完成后统一进行（见
+    pipeline_orchestrator._sequence_consistency_review）。qaGateLevel 对这条路径
+    不再有任何影响。"""
 
     _PROMPT_BLOCK = """图片 1:
 first frame prompt
@@ -343,7 +348,7 @@ visible construction change
         server_common.OUTPUT_ROOT = self.old_output_root
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_warn_pass_records_reason_without_retry(self):
+    def test_no_retry_and_no_qa_call_regardless_of_gate_level(self):
         from frame_generator import generate_frame_sequence
 
         events = []
@@ -365,7 +370,7 @@ visible construction change
              patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
              patch('prompt_pipeline.run_vlm_qa_check',
-                   return_value=(True, 'WARN: 视角轻微偏移')):
+                   side_effect=AssertionError('per-frame QA gate should no longer be called')):
             generate_frame_sequence(
                 {'qaGateLevel': 'lenient'},
                 'qa_gate_warn_contract',
@@ -375,6 +380,7 @@ visible construction change
 
         stages = [stage for stage, _ in events]
         self.assertNotIn('frame_retry', stages)
+        self.assertNotIn('frame_qa', stages)
 
         manifest = None
         for root, _dirs, files in os.walk(self.tmp):
@@ -384,8 +390,7 @@ visible construction change
                 break
         self.assertIsNotNone(manifest, 'manifest.json 未落盘')
         frame2 = next(f for f in manifest['frames'] if f['sequence'] == 2)
-        self.assertEqual(frame2['quality_gate'], 'auto_approved')
-        self.assertEqual(frame2['vlm_qa_reason'], 'WARN: 视角轻微偏移')
+        self.assertEqual(frame2['quality_gate'], 'pending_manual_review')
 
 
 if __name__ == '__main__':

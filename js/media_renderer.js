@@ -204,20 +204,20 @@ function renderFramesForIdea(idea) {
         
         if (hasImage) {
             const isDegraded = frame.quality_gate === 'i2i_fallback_degraded';
-            const isVlmFailed = frame.quality_gate === 'vlm_qa_failed';
+            // 'vlm_qa_failed' 是旧逐帧质检门的终态，逐帧质检门已停用，仅为兼容展示旧 manifest 保留；
+            // 'sequence_review_flagged' 是新的整套序列一致性审查修复轮次耗尽仍有问题的终态
+            const isVlmFailed = frame.quality_gate === 'vlm_qa_failed' || frame.quality_gate === 'sequence_review_flagged';
             const isUnverified = frame.quality_gate === 'auto_approved_degraded';
             const isStale = frame.quality_gate === 'stale' || frame.stale;
             // 宽松档软性瑕疵放行：quality_gate 仍是 auto_approved，告警留在 vlm_qa_reason
             const isWarned = frame.quality_gate === 'auto_approved' && typeof frame.vlm_qa_reason === 'string' && frame.vlm_qa_reason.indexOf('WARN') === 0;
-            // 主动关门(qaGateLevel=off)与判定服务异常共用 degraded 记录，靠留痕文本区分文案
-            const isGateOff = isUnverified && (frame.vlm_qa_reason || '').indexOf('qaGateLevel=off') !== -1;
             card.className = 'frame-card' + (isDegraded ? ' degraded-card' : '') + (isVlmFailed ? ' vlm-failed-card' : '') + (isUnverified ? ' degraded-card' : '') + (isStale ? ' stale-card' : '');
             card.style.cursor = 'pointer';
 
             let hoverTitle = `打开第 ${seq} 帧`;
             if (isDegraded) hoverTitle += ' (降级为文生图)';
-            if (isVlmFailed) hoverTitle += ` (VLM 检查未通过: ${frame.vlm_qa_reason || '跳变或无变化'})`;
-            if (isUnverified) hoverTitle += isGateOff ? ' (质检门已关闭，此帧未质检放行)' : ' (VLM 判定服务异常，此帧未经核验被放行)';
+            if (isVlmFailed) hoverTitle += ` (一致性审查未通过: ${frame.vlm_qa_reason || '跳变或无变化'})`;
+            if (isUnverified) hoverTitle += ' (VLM 判定服务异常，此帧未经核验被放行)';
             if (isWarned) hoverTitle += ` (宽松档放行: ${frame.vlm_qa_reason})`;
             if (isStale) hoverTitle += ' (过期：父帧已被重新生成，此帧与父帧血统不一致)';
             card.title = hoverTitle;
@@ -225,8 +225,8 @@ function renderFramesForIdea(idea) {
             card.innerHTML = `
                 <img src="" alt="Frame ${seq}" loading="lazy">
                 ${isDegraded ? '<div class="degraded-badge">降级</div>' : ''}
-                ${isVlmFailed ? '<div class="vlm-failed-badge" title="' + (frame.vlm_qa_reason || '').replace(/"/g, '&quot;') + '">VLM 失败</div>' : ''}
-                ${isUnverified ? '<div class="degraded-badge" title="' + (frame.vlm_qa_reason || (isGateOff ? '质检门已关闭，未质检放行' : 'VLM 判定服务异常，未经核验')).replace(/"/g, '&quot;') + '">' + (isGateOff ? '未质检' : '未核验') + '</div>' : ''}
+                ${isVlmFailed ? '<div class="vlm-failed-badge" title="' + (frame.vlm_qa_reason || '').replace(/"/g, '&quot;') + '">审查未过</div>' : ''}
+                ${isUnverified ? '<div class="degraded-badge" title="' + (frame.vlm_qa_reason || 'VLM 判定服务异常，未经核验').replace(/"/g, '&quot;') + '">未核验</div>' : ''}
                 ${isWarned ? '<div class="degraded-badge" title="' + frame.vlm_qa_reason.replace(/"/g, '&quot;') + '">留痕</div>' : ''}
                 ${isStale ? `<div class="stale-badge" ${isDegraded || isVlmFailed || isUnverified || isWarned ? 'style="left: 45px;"' : ''} title="此帧派生自已被替换的旧帧，建议重新生成">Stale</div>` : ''}
                 <div class="frame-card-actions" style="position: absolute; top: 5px; right: 5px; display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s;">

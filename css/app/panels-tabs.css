@@ -472,6 +472,182 @@
     font-style: italic;
 }
 
+.ideation-card-trend {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed rgba(var(--ink-rgb), 0.05);
+    color: #4A5B66;
+    font-size: 11px;
+}
+
+.ideation-card-tag.beats {
+    background: rgba(176, 123, 82, 0.12);
+    color: #8A5A32;
+    cursor: help;
+}
+
+/* 本批联网参考面板(灵感卡片轨道上方,可折叠) */
+.ideation-trend-panel {
+    margin-top: 12px;
+    border: 1px solid rgba(var(--ink-rgb), 0.1);
+    border-radius: 8px;
+    background: rgba(var(--ink-rgb), 0.02);
+    font-size: 12px;
+    color: var(--text-secondary, #6B6256);
+}
+
+.ideation-trend-panel summary {
+    padding: 8px 12px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 11px;
+    color: var(--text-secondary, #6B6256);
+}
+
+.ideation-trend-panel summary:hover {
+    color: var(--text-main, #3A342C);
+}
+
+.ideation-trend-ref {
+    padding: 4px 12px 10px 12px;
+}
+
+.ideation-trend-ref-label {
+    font-weight: 600;
+    font-size: 11px;
+    margin-bottom: 4px;
+    color: #8A5A32;
+}
+
+.ideation-trend-ref-text {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+    font-size: 11px;
+    line-height: 1.6;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+/* 联网参考案例库（左面板第 1 区，取代旧主题选择器；js/trend_refs.js） */
+.trend-refs-hint {
+    margin: 0 0 10px 0;
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--text-secondary, #6B6256);
+}
+
+.trend-refs-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 320px;
+    overflow-y: auto;
+}
+
+.trend-refs-empty {
+    padding: 14px 12px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-secondary, #6B6256);
+    border: 1px dashed rgba(var(--ink-rgb), 0.15);
+    border-radius: 8px;
+    text-align: center;
+}
+
+.trend-ref-item {
+    border: 1px solid rgba(var(--ink-rgb), 0.1);
+    border-radius: 8px;
+    background: rgba(var(--ink-rgb), 0.02);
+    transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.trend-ref-item.selected {
+    border-color: rgba(176, 123, 82, 0.55);
+    background: rgba(176, 123, 82, 0.08);
+}
+
+.trend-ref-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.trend-ref-check {
+    flex: 0 0 18px;
+    width: 18px;
+    height: 18px;
+    line-height: 16px;
+    text-align: center;
+    font-size: 12px;
+    border: 1px solid rgba(var(--ink-rgb), 0.25);
+    border-radius: 4px;
+    color: #8A5A32;
+}
+
+.trend-ref-item.selected .trend-ref-check {
+    border-color: rgba(176, 123, 82, 0.7);
+    background: rgba(176, 123, 82, 0.18);
+}
+
+.trend-ref-main {
+    flex: 1;
+    min-width: 0;
+}
+
+.trend-ref-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-main, #3A342C);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.trend-ref-meta {
+    font-size: 10px;
+    color: var(--text-secondary, #6B6256);
+    margin-top: 2px;
+}
+
+.trend-ref-mini-btn {
+    flex-shrink: 0;
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    border: 1px solid rgba(var(--ink-rgb), 0.12);
+    background: rgba(var(--ink-rgb), 0.03);
+    color: var(--text-secondary, #6B6256);
+    cursor: pointer;
+}
+
+.trend-ref-mini-btn:hover {
+    background: rgba(var(--ink-rgb), 0.08);
+    color: var(--text-main, #3A342C);
+}
+
+.trend-ref-delete.confirming {
+    border-color: rgba(200, 80, 60, 0.6);
+    color: #B34A32;
+}
+
+.trend-ref-text {
+    margin: 0;
+    padding: 0 12px 10px 36px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--text-secondary, #6B6256);
+    max-height: 220px;
+    overflow-y: auto;
+}
+
 .ideation-card-actions {
     display: flex;
     gap: 8px;
@@ -820,6 +996,16 @@
 
     .sliders-container {
         gap: 12px !important;
+    }
+
+    .segment-btn {
+        padding: 8px 4px !important;
+        font-size: 11px !important;
+    }
+
+    .slider-step-btn {
+        width: 32px !important;
+        height: 32px !important; /* slightly larger tap target on touch screens */
     }
 
     /* 6. Action buttons swipeable row on mobile */

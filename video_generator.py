@@ -240,6 +240,7 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
     for seq, slot in enumerate(slots, start=1):
         item = video_slots[slot]
         prompt = item['body'] if isinstance(item, dict) else item
+        meta = str(item.get('meta', '') if isinstance(item, dict) else '').upper()
         prompt = rewrite_prompt_for_two_card_ui(prompt, slot)
         dest_path = os.path.join(videos_dir, f'vid_{slot:03d}.mp4')
         start_p, end_p = slot_to_path.get(slot), slot_to_path.get(slot + 1)
@@ -253,6 +254,15 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
             'delete_existing': False,
             'reason': '',
         }
+
+        # 声明式硬切槽位（[CUT]，TBCP v2 hard_cut 变体）：切点两侧的帧不是同一机位的
+        # 首尾帧对，送 i2v 只会在两张无关构图之间硬插值出扭曲变形——该槽不生成片段，
+        # 合成时按"预期缺失"直接硬拼（见 merge_project_videos）。
+        if 'CUT' in meta and 'BRIDGE' not in meta:
+            plan['action'] = 'skip_cut'
+            plan['reason'] = f"视频 {slot} 是声明式硬切槽位（[CUT]）：不生成视频片段，成片在此处直接硬切。"
+            plans.append(plan)
+            continue
 
         existing = os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
         if not is_explicit_retry and existing:
@@ -282,13 +292,19 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                 f"视频 {slot} 的起始帧 IMAGE {slot} 或结束帧 IMAGE {slot + 1} 属于降级帧（i2i fallback degraded），"
                 f"已拦截该段视频生成以防止画面跳变。请重新生成并修复受损帧。"
             )
-        elif gate_level != 'off' and 'vlm_qa_failed' in (slot_to_quality.get(slot), slot_to_quality.get(slot + 1)):
-            # 已知坏帧不再烧昂贵的视频生成额度：'vlm_qa_failed' 是重试用尽后的终态判定
-            # （lenient 档下只有硬伤才会走到这一步），跳过质检的帧不受影响。
-            _bad = slot if slot_to_quality.get(slot) == 'vlm_qa_failed' else slot + 1
+        elif gate_level != 'off' and (
+            slot_to_quality.get(slot) in ('vlm_qa_failed', 'sequence_review_flagged')
+            or slot_to_quality.get(slot + 1) in ('vlm_qa_failed', 'sequence_review_flagged')
+        ):
+            # 已知坏帧不再烧昂贵的视频生成额度：'vlm_qa_failed'（旧逐帧质检门终态，
+            # 现已停用，仅为兼容旧 manifest 保留）/'sequence_review_flagged'（整套序列
+            # 一致性审查修复轮次耗尽仍有问题）都是已知有问题、需要人工介入的终态。
+            _bad_gate = slot_to_quality.get(slot)
+            _bad = slot if _bad_gate in ('vlm_qa_failed', 'sequence_review_flagged') else slot + 1
+            _bad_gate = slot_to_quality.get(_bad)
             plan['action'] = 'blocked'
             plan['reason'] = (
-                f"视频 {slot} 的锚点帧 IMAGE {_bad} 未通过视觉质检（vlm_qa_failed），已拦截该段视频生成。"
+                f"视频 {slot} 的锚点帧 IMAGE {_bad} 未通过一致性审查（{_bad_gate}），已拦截该段视频生成。"
                 f"请重渲该帧（或将质检档位调为 off 放行）后重试。"
             )
         elif stale_slots and gate_level == 'standard' \
@@ -491,6 +507,16 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     # 按计划分流：复用/拦截立即出结果，待生成的装配为批量请求
     pending_items = []
     for plan in plans:
+        if plan['action'] == 'skip_cut':
+            # 声明式硬切：记入 manifest（status='skipped_cut'）供合成门禁识别为预期缺失，
+            # 不提交生成、不算失败
+            writer.record(_video_info(plan, video_model, status='skipped_cut'))
+            if on_progress:
+                on_progress('video_skipped', {
+                    'index': plan['slot'], 'current': plan['seq'],
+                    'total': len(plans), 'message': plan['reason'],
+                })
+            continue
         if plan['action'] == 'reuse':
             info = _video_info(plan, video_model, status='success')
             writer.record(info)
@@ -696,7 +722,11 @@ def merge_project_videos(project_dir, allow_partial=False):
     expected_slots = []
 
     if frames:
-        expected_slots = list(range(1, len(frames)))
+        # 声明式硬切槽位（status='skipped_cut'）是"预期缺失"：不算缺口、不占位填充，
+        # 合成时相邻两段直接相接=成片在此处硬切（TBCP v2 hard_cut 变体的既定语义）。
+        skipped_cut = {v.get('slot') for v in videos
+                       if isinstance(v, dict) and v.get('status') == 'skipped_cut'}
+        expected_slots = [s for s in range(1, len(frames)) if s not in skipped_cut]
         for slot in expected_slots:
             v = by_slot.get(slot)
             if not v or v.get('status') != 'success' or not v.get('file'):

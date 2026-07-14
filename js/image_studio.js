@@ -22,8 +22,8 @@ const IMGSTUDIO_CREATIVE_PROMPTS = [
         en: "A retro library hidden inside a giant hollow oak tree, warm sunlight filtering through leaves illuminating floating dust motes, glowing magic books floating in the air, intricate carved wooden staircases, Victorian style, hyper-detailed, photorealistic photography."
     },
     {
-        zh: "蓝冰冰川深处的科幻风格研究基地，半透明的冰墙透出幽蓝色的微光，未来主义的实验仪器，透明的液晶显示屏，一名科学家在操作全息图像，电影级光影，极简科技感，8k分辨率",
-        en: "A sci-fi research base deep inside a blue glacier cave, translucent ice walls emitting a mysterious blue glow, futuristic laboratory instruments, transparent LCD screens, a scientist operating a holographic display, cinematic lighting, minimalist high-tech, 8k resolution."
+        zh: "蓝冰冰川洞穴深处改造的避寒睡眠小屋，半透明的冰墙透出幽蓝天光，厚实的原木床架铺着羊毛毯，黄铜马灯的暖光与冰蓝形成冷暖对比，纪实摄影质感，8k分辨率",
+        en: "A snug sleeping refuge built deep inside a blue glacier cave, translucent ice walls glowing with cold daylight, a heavy timber bed frame layered with wool blankets, warm brass lantern light contrasting the icy blue, documentary photorealism, 8k resolution."
     },
     {
         zh: "退役潜艇改装的深海蒸汽朋克风格酒吧，圆形的潜水窗外可以看到游动的发光水母，铜质管道，闪烁的仪表盘，温暖的琥珀色灯光，木质吧台，复古舒适，胶片质感，超清",
@@ -38,16 +38,16 @@ const IMGSTUDIO_CREATIVE_PROMPTS = [
         en: "An industrial luxury loft penthouse converted from an abandoned water tower top, 360-degree circular glass windows overlooking a rainy New York sunset, raw concrete textures blended with premium modern furniture, warm interior, golden hour glow, cinematic render."
     },
     {
-        zh: "一只穿着航天服的可爱英短猫咪，漂浮在五彩斑斓的太空星云中，爪子里抓着一包太空小鱼干，头盔面罩上倒映着绚丽的超新星爆发，皮克斯风格，3D渲染，可爱，极其精致",
-        en: "A cute British Shorthair cat wearing a detailed space suit, floating in a colorful cosmic nebula, holding a pack of space fish snacks in its paws, helmet visor reflecting a brilliant supernova explosion, Pixar style, 3D rendering, adorable, hyper-detailed."
+        zh: "一只可爱的英短猫咪蜷在木屋窗台的粗针织羊毛毯上，窗外是落雪的松林，壁炉火光把猫毛染成暖金色，玻璃上有一圈呵气雾痕，纪实摄影，浅景深，极其精致",
+        en: "A cute British Shorthair cat curled up on a chunky wool blanket on a cabin windowsill, snowy pine forest outside, fireplace glow tinting its fur warm gold, a ring of breath fog on the glass, documentary photography, shallow depth of field, hyper-detailed."
     },
     {
         zh: "阳光明媚的森林深处，一只巨大的神秘生物（半鹿半猫，长着发光的鹿角），一名小女孩正在伸手触摸它，周围环绕着飞舞的金色荧光，吉卜力治愈风，丁达尔光效，梦幻仙境",
         en: "In the depths of a sun-drenched forest, a massive mystical creature (half deer, half cat, with glowing antlers) being touched by a little girl, surrounded by dancing golden fireflies, Studio Ghibli style, Tyndall light effect, dreamlike wonderland."
     },
     {
-        zh: "赛步朋克雨夜街道，五颜六色的霓虹灯牌倒映在潮湿的积水中，一辆复古未来的悬浮跑车停在面馆前，蒸汽袅袅升起，高对比度，电影质感，冷暖色调对比",
-        en: "A cyberpunk rainy night street, colorful neon signs reflected in wet puddles, a retro-futuristic hovering sports car parked in front of a steaming noodle shop, dramatic reflections, cinematic photography, cold and warm color contrast."
+        zh: "雨夜老巷深处的一家面馆，暖黄灯笼的光晕倒映在潮湿的青石板积水中，一辆老式自行车停在门口，蒸汽从档口袅袅升起，纪实街头摄影，胶片质感，冷暖色调对比",
+        en: "A tiny noodle shop deep in an old alley on a rainy night, warm paper-lantern glow reflected in wet flagstone puddles, a vintage bicycle parked by the door, steam rising from the counter, documentary street photography, film grain, cold and warm color contrast."
     }
 ];
 

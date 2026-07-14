@@ -189,7 +189,7 @@ class TestDegradedSummaryPause(_TmpProjectCase):
             json.dump({'title': self.TITLE, 'frames': frames}, f)
 
     def test_pauses_when_degraded_frames_exist(self):
-        self._write_manifest(['auto_approved', 'vlm_qa_failed', 'auto_approved_degraded'])
+        self._write_manifest(['auto_approved', 'sequence_review_flagged', 'auto_approved_degraded'])
         pauses = []
         with patch.object(pipeline_orchestrator, '_await_frame_review',
                           lambda *a, **k: pauses.append(a) or 'adopt'):

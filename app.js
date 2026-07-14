@@ -172,12 +172,14 @@ function switchMainTab(tabName) {
         results: document.querySelector('.panel-right'),
         image: document.getElementById('panel-image-studio'),
         gallery: document.getElementById('panel-gallery'),
+        ledger: document.getElementById('panel-ledger'),
     };
     const buttons = {
         config: document.getElementById('main-tab-config'),
         results: document.getElementById('main-tab-results'),
         image: document.getElementById('main-tab-image'),
         gallery: document.getElementById('main-tab-gallery'),
+        ledger: document.getElementById('main-tab-ledger'),
     };
 
     Object.keys(panels).forEach((key) => {
@@ -185,9 +187,19 @@ function switchMainTab(tabName) {
         if (buttons[key]) buttons[key].classList.toggle('active', key === tab);
     });
 
+    // 图像工坊现与"创意工坊"同级挂在顶部 app-switcher 里，两者共享同一高亮态：
+    // 切到 image 时把"创意工坊"熄灭，切回其余任一子标签时把它点亮。
+    const workshopSwitcher = document.getElementById('switcher-workshop-btn');
+    if (workshopSwitcher) workshopSwitcher.classList.toggle('active', tab !== 'image');
+
     // 画廊首次进入时才扫描本地文件（js/gallery.js 提供；懒加载避免拖慢启动）
     if (tab === 'gallery' && typeof galleryTabEntered === 'function') {
         galleryTabEntered();
+    }
+    // 创意台账：每次进入都重新拉取（体量小、纯 JSON 读取，代价远低于画廊的文件系统扫描），
+    // 这样"存入备选"后立刻切回台账页也能看到最新数据，无需手动点刷新
+    if (tab === 'ledger' && typeof ledgerTabEntered === 'function') {
+        ledgerTabEntered();
     }
 }
 
@@ -539,26 +551,95 @@ function initSliders() {
     const ratio = document.getElementById('slider-ratio');
     const creativity = document.getElementById('slider-creativity');
     const beats = document.getElementById('slider-beats');
-    
+
     const complexityLabels = { 1: '轻量级改造', 2: '中等重工', 3: '硬核结构性改建' };
     const budgetLabels = { 1: '平民精简版', 2: '轻奢设计师级', 3: '顶奢艺术级定制' };
-    const creativityLabels = { 1: '常规务实', 2: '突破常规', 3: '脑洞大开 (极致科幻)' };
+    // 注意：这些标签文字会作为 Creativity Scale 原样送进 LLM（generateIdea 直接取
+    // val-creativity 的 textContent）——措辞必须保持写实取向，绝不能出现「科幻」类
+    // 引导词（旧文案「脑洞大开 (极致科幻)」曾把整条产出带偏成科幻题材）。
+    const creativityLabels = { 1: '常规务实', 2: '突破常规', 3: '脑洞大开 (写实奇观)' };
+
+    // 反差强度/节拍数轨道上色到当前值，让拖动时能直接看到进度而不是只有上方的静态文字
+    const updateFill = (input) => {
+        const min = Number(input.min) || 0;
+        const max = Number(input.max) || 100;
+        const pct = max > min ? ((Number(input.value) - min) / (max - min)) * 100 : 0;
+        input.style.setProperty('--fill-pct', `${pct}%`);
+    };
+
+    // 复杂度/预算/脑洞大开度只有 3 档，拖滑块去精确命中某一档很别扭，改成点选式分段按钮。
+    // 底层 <input type=range> 保留（视觉隐藏）：config.js / prompt_pipeline.js 里大量代码
+    // 按 id 直接读写它的 .value，分段按钮只是换了一层交互，不改数据模型。
+    const fillSegmentLabels = (targetId, labels) => {
+        const group = document.querySelector(`.segmented-control[data-target="${targetId}"]`);
+        if (!group) return;
+        group.querySelectorAll('.segment-btn').forEach((btn) => {
+            btn.textContent = labels[btn.dataset.value] || btn.dataset.value;
+        });
+    };
+    fillSegmentLabels('slider-complexity', complexityLabels);
+    fillSegmentLabels('slider-budget', budgetLabels);
+    fillSegmentLabels('slider-creativity', creativityLabels);
+
+    const syncSegments = (input) => {
+        const group = document.querySelector(`.segmented-control[data-target="${input.id}"]`);
+        if (!group) return;
+        group.querySelectorAll('.segment-btn').forEach((btn) => {
+            const isActive = btn.dataset.value === String(input.value);
+            btn.classList.toggle('active', isActive);
+            btn.setAttribute('aria-pressed', String(isActive));
+        });
+    };
+
+    document.querySelectorAll('.segmented-control').forEach((group) => {
+        const input = document.getElementById(group.dataset.target);
+        if (!input) return;
+        group.querySelectorAll('.segment-btn').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                input.value = btn.dataset.value;
+                // 'input' 驱动即时的标签/摘要更新；'change' 是 saveSelectionState() 落盘到
+                // localStorage 唯一挂钩的事件——原生滑块靠"松手"触发它，这里补发使其等效。
+                input.dispatchEvent(new Event('input'));
+                input.dispatchEvent(new Event('change'));
+            });
+        });
+    });
+
+    // 反差强度/节拍数两侧的 −/+：不想拖也能单步精调
+    document.querySelectorAll('.slider-step-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const input = document.getElementById(btn.dataset.target);
+            if (!input) return;
+            const step = Number(input.step) || 1;
+            const min = Number(input.min);
+            const max = Number(input.max);
+            const next = Number(input.value) + Number(btn.dataset.step) * step;
+            input.value = Math.min(max, Math.max(min, next));
+            input.dispatchEvent(new Event('input'));
+            input.dispatchEvent(new Event('change'));
+        });
+    });
 
     complexity.addEventListener('input', (e) => {
         document.getElementById('val-complexity').textContent = complexityLabels[e.target.value];
+        syncSegments(e.target);
     });
     budget.addEventListener('input', (e) => {
         document.getElementById('val-budget').textContent = budgetLabels[e.target.value];
+        syncSegments(e.target);
     });
     ratio.addEventListener('input', (e) => {
         const val = e.target.value;
         document.getElementById('val-ratio').textContent = `反差强度: ${val}%`;
+        updateFill(e.target);
     });
     creativity.addEventListener('input', (e) => {
         document.getElementById('val-creativity').textContent = creativityLabels[e.target.value];
+        syncSegments(e.target);
     });
     beats.addEventListener('input', (e) => {
         document.getElementById('val-beats').textContent = `${e.target.value} 拍`;
+        updateFill(e.target);
     });
 
     // Fire initial displays
@@ -571,24 +652,20 @@ function initSliders() {
 
 // Theme & Anchor Selection Handling
 function initSelectors() {
-    // Theme Selector
-    const themeGrid = document.getElementById('theme-selector');
-    themeGrid.addEventListener('click', (e) => {
-        const btn = e.target.closest('.theme-btn');
-        if (!btn) return;
-        
-        themeGrid.querySelectorAll('.theme-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-    });
+    // 基础场景主题选择器已从 GUI 移除（灵感改由联网参考案例库驱动，见
+    // js/trend_refs.js）；#theme-selector 不复存在，这里不再绑定它的监听。
 
-    // Anchor Selector (Multi-select)
+    // Anchor Selector (Multi-select) — section removed from the GUI; guard kept since
+    // #anchor-selector no longer exists (anchors are now left for the composer to pick).
     const anchorFlex = document.getElementById('anchor-selector');
-    anchorFlex.addEventListener('click', (e) => {
-        const btn = e.target.closest('.anchor-node');
-        if (!btn) return;
-        
-        btn.classList.toggle('active');
-    });
+    if (anchorFlex) {
+        anchorFlex.addEventListener('click', (e) => {
+            const btn = e.target.closest('.anchor-node');
+            if (!btn) return;
+
+            btn.classList.toggle('active');
+        });
+    }
 }
 
 // Interactive Particle Background (Canvas)
@@ -1012,21 +1089,6 @@ function setupEventListeners() {
         handleGlobalHotkeys(e);
     });
 
-    // Advanced Workshop parameters toggle
-    const advToggleBtn = document.getElementById('toggle-workshop-advanced');
-    const advFields = document.getElementById('workshop-advanced-fields');
-    if (advToggleBtn && advFields) {
-        advToggleBtn.addEventListener('click', () => {
-            if (advFields.style.display === 'none') {
-                advFields.style.display = 'block';
-                advToggleBtn.textContent = '收起 ▴';
-            } else {
-                advFields.style.display = 'none';
-                advToggleBtn.textContent = '展开 ▾';
-            }
-        });
-    }
-
     // Preset Selection
     document.querySelectorAll('.preset-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
@@ -1036,9 +1098,6 @@ function setupEventListeners() {
             }
         });
     });
-
-    document.getElementById('randomize-btn').addEventListener('click', randomizeDimensions);
-    document.getElementById('save-preset-btn').addEventListener('click', saveCustomPreset);
 
     // Save state on slider input/change
     // rAF-gate the heavy updateConfigSummary (many DOM reads) so it runs
@@ -1061,13 +1120,7 @@ function setupEventListeners() {
         }
     });
 
-    // Save state on selectors click - direct call, no redundant setTimeout
-    document.getElementById('theme-selector').addEventListener('click', () => {
-        saveSelectionState();
-    });
-    document.getElementById('anchor-selector').addEventListener('click', () => {
-        saveSelectionState();
-    });
+    // （旧 #theme-selector 点击存档监听已随主题选择器一起移除）
 
     // Tab buttons switching
     document.querySelectorAll('.result-tabs-bar .tab-btn').forEach(btn => {
@@ -1154,7 +1207,8 @@ async function renderTasks() {
         
         // Local filtering
         let filteredTasks = tasks.filter(task => {
-            const theme = task.dimensions ? (task.dimensions.theme || '未命名主题') : '未命名主题';
+            // 任务名优先用灵感卡片选题名（task_label），回退基础场景主题
+            const theme = task.dimensions ? (task.dimensions.task_label || task.dimensions.theme || '未命名主题') : '未命名主题';
             const beats = (task.dimensions && task.dimensions.beats_count) ? ` (${task.dimensions.beats_count} 镜)` : '';
             const taskTitle = `${theme}${beats}`;
 
@@ -1185,7 +1239,8 @@ async function renderTasks() {
             const dateStr = Number.isFinite(idMs) && String(idMs) === String(task.id)
                 ? new Date(idMs).toLocaleString()
                 : (task.last_active ? new Date(task.last_active * 1000).toLocaleString() : '—');
-            const theme = task.dimensions ? (task.dimensions.theme || '未命名主题') : '未命名主题';
+            // 任务名优先用灵感卡片选题名（task_label），回退基础场景主题
+            const theme = task.dimensions ? (task.dimensions.task_label || task.dimensions.theme || '未命名主题') : '未命名主题';
             const beats = (task.dimensions && task.dimensions.beats_count) ? ` (${task.dimensions.beats_count} 镜)` : '';
             const taskTitle = `${theme}${beats}`;
 
@@ -1353,13 +1408,17 @@ async function viewTask(taskId, dimensions) {
     
     generationState.status = 'composing';
     updateActiveGenerationBanner();
-    
+
     localStorage.setItem('spark_active_task_id', taskId);
     localStorage.setItem('spark_active_task_dimensions', JSON.stringify(dimensions));
-    
+
+    // 跟进任务时同样在 loading 视图展示选题名
+    const viewTopicEl = document.getElementById('loading-topic-name');
+    if (viewTopicEl) viewTopicEl.textContent = (dimensions && (dimensions.task_label || dimensions.theme)) || '';
+
     const startTimeOffset = parseInt(taskId, 10);
     startLoadingTimer(startTimeOffset);
-    
+
     showToast("已重连至该任务的实时输出日志...", "info");
     
     try {
@@ -1622,6 +1681,14 @@ async function generateIdea(retryParams = null) {
         }
     }
 
+    // 基础场景主题选择器已移除：非重试路径的选题只能来自「载入维度」过的灵感
+    // 卡片（联网参考驱动）。没载入过就没有可合成的主题，在切换视图前先拦下。
+    const loadedIdea = (typeof loadedIdeationCover !== 'undefined' && loadedIdeationCover) ? loadedIdeationCover : null;
+    if (!retryParams && (!loadedIdea || !loadedIdea.input_str)) {
+        showToast('请先在灵感推荐卡片点「载入维度」选定选题（或直接在卡片上一键合成）', 'error');
+        return;
+    }
+
     const placeholderView = document.getElementById('output-placeholder-view');
     const loadingView = document.getElementById('output-loading-view');
     const contentView = document.getElementById('output-content-view');
@@ -1648,15 +1715,17 @@ async function generateIdea(retryParams = null) {
         currentConf = retryParams.config;
         reuseTaskId = retryParams.taskId ? String(retryParams.taskId) : null;
     } else {
-        // Collect GUI dimensions
-        const activeThemeBtn = document.querySelector('#theme-selector .theme-btn.active');
-        const themeName = activeThemeBtn ? activeThemeBtn.querySelector('.theme-name').textContent.trim() : '百年空心橡树';
-
+        // Collect GUI dimensions — 选题（theme=一键输入串）与任务名都取自已载入的
+        // 灵感卡片；函数入口已保证 loadedIdea.input_str 存在
         const activeAnchors = Array.from(document.querySelectorAll('#anchor-selector .anchor-node.active'))
             .map(node => node.textContent.trim());
 
         dimensions = {
-            theme: themeName,
+            theme: loadedIdea.input_str,
+            task_label: loadedIdea.task_label || loadedIdea.input_str,
+            // 与卡片「一键合成」路径对齐：封面与英文标题一并带给后端（有则复用）
+            cover_url: loadedIdea.cover_url || null,
+            english_title: loadedIdea.english_title || null,
             anchors: activeAnchors,
             complexity: document.getElementById('val-complexity').textContent,
             budget: document.getElementById('val-budget').textContent,
@@ -1675,6 +1744,10 @@ async function generateIdea(retryParams = null) {
     // also overwrites this run's record instead of creating a new one
     generationState.lastParams = { dimensions, config: currentConf, taskId };
     generationState.status = 'composing';
+
+    // 激发进行中在 loading 视图显著展示本单选题名（灵感卡片选题名或基础主题）
+    const topicNameEl = document.getElementById('loading-topic-name');
+    if (topicNameEl) topicNameEl.textContent = dimensions.task_label || dimensions.theme || '';
 
     setupLoadingSteps('compose');
 
@@ -1983,6 +2056,9 @@ async function resumeActiveTaskIfExists() {
             const loadingStage = document.getElementById('loading-stage-text');
             if (loadingHeader) loadingHeader.textContent = '正在按 skill 契约合成提示词...';
             if (loadingStage) loadingStage.textContent = '解析主题，拆解场景变量与施工节拍...';
+            // 刷新恢复后同样展示本单选题名
+            const resumeTopicEl = document.getElementById('loading-topic-name');
+            if (resumeTopicEl) resumeTopicEl.textContent = (dimensions && (dimensions.task_label || dimensions.theme)) || '';
 
             if (genBtn) {
                 genBtn.disabled = true;
@@ -2114,14 +2190,13 @@ function framesFeedQualityLine(f) {
             framesFeedLine(`✅ IMG ${seq} 完成（质检通过）`, 'ok');
         }
     } else if (gate === 'auto_approved_degraded') {
-        const cause = reason.indexOf('qaGateLevel=off') !== -1
-            ? '质检门已关闭，未质检'
-            : '质检判定服务异常 fail-open：帧已渲染但未经核验，可单帧重试复检';
-        framesFeedLine(`⚠️ IMG ${seq} 已放行（${cause}）`, 'warn');
-    } else if (gate === 'vlm_qa_failed') {
-        framesFeedLine(`❌ IMG ${seq} 质检未通过（${reason || '原因未知'}），已保留末次渲染结果，可单帧重试`, 'err');
+        framesFeedLine(`⚠️ IMG ${seq} 已放行（判定服务异常 fail-open：帧已渲染但未经核验，可单帧重试复检）`, 'warn');
+    } else if (gate === 'vlm_qa_failed' || gate === 'sequence_review_flagged') {
+        framesFeedLine(`❌ IMG ${seq} 一致性审查未通过（${reason || '原因未知'}），已保留末次渲染结果，可单帧重试`, 'err');
+    } else if (gate === 'sequence_reviewed_pass') {
+        framesFeedLine(`✅ IMG ${seq} 完成（一致性审查通过）`, 'ok');
     } else if (gate === 'pending_manual_review') {
-        framesFeedLine(`✅ IMG ${seq} 完成（首帧/无前帧可比，未质检）`, 'ok');
+        framesFeedLine(`✅ IMG ${seq} 完成（一致性审查将在整套序列渲染完毕后统一进行）`, 'ok');
     } else {
         framesFeedLine(`✅ IMG ${seq} 完成`, 'ok');
     }
@@ -2247,6 +2322,15 @@ async function streamFramesProgress(taskId) {
                     if (data && data.message) {
                         framesFeedLine(`${type === 'reanchor' ? '⚓' : '🔭'} ${data.message}`,
                                        (type === 'reanchor' || (type === 'chain_drift_check' && data.passed === false)) ? 'warn' : undefined);
+                    }
+                } else if (type === 'sequence_review') {
+                    meta.textContent = (data && data.message) || '正在对整套序列做一致性审查...';
+                    framesFeedLine(`🔍 ${(data && data.message) || '正在对整套序列做一致性审查...'}`);
+                } else if (type === 'sequence_review_result') {
+                    if (data && data.message) {
+                        framesFeedLine(`${data.passed ? '✅' : '🛠️'} ${data.message}`, data.passed ? 'ok' : 'warn');
+                    } else if (data && data.passed) {
+                        framesFeedLine('✅ 整套序列一致性审查通过', 'ok');
                     }
                 } else if (type === 'reconnecting') {
                     meta.textContent = `连接中断，正在重连（第 ${data.attempt} 次）...`;
@@ -2384,6 +2468,13 @@ async function streamVideosProgress(taskId) {
                     const msg = (data && data.message) || '生成失败';
                     meta.textContent = `视频 ${data.index} 生成失败: ${msg}`;
                     renderVideoSlotFailed(data.index, msg);
+                } else if (type === 'video_skipped') {
+                    // 声明式硬切槽位（[CUT]）：不生成片段，按已完成计入进度
+                    applyVideoProgress('video_done', data);
+                    meta.textContent = `视频 ${data.index} 为声明式硬切槽位，已跳过生成`;
+                    if (typeof renderVideoSlotSkippedCut === 'function') {
+                        renderVideoSlotSkippedCut(data.index, data && data.message);
+                    }
                 } else if (type === 'queue') {
                     applyVideoProgress('queue', data);
                     meta.textContent = (data && data.message) || '正在排队等待生成视频...';
@@ -2963,12 +3054,12 @@ async function generateVideos() {
         return;
     }
 
-    // Check for VLM QA failed frames
+    // Check for frames that failed the post-render sequence consistency review
     if (currentIdea.frameRun && currentIdea.frameRun.frames) {
-        const failedFrames = currentIdea.frameRun.frames.filter(f => f.quality_gate === 'vlm_qa_failed');
+        const failedFrames = currentIdea.frameRun.frames.filter(f => f.quality_gate === 'vlm_qa_failed' || f.quality_gate === 'sequence_review_flagged');
         if (failedFrames.length > 0) {
             const frameSeqs = failedFrames.map(f => f.sequence).join(', ');
-            const confirmed = await customConfirm(`⚠️ 警告：检测到第 ${frameSeqs} 帧未能通过 VLM 图像质检（VLM 失败）。\n\n如果强行生成视频，对应的视频分段可能存在跳变、无动作或动作不一致的缺陷。\n\n确定要强制继续生成视频吗？`);
+            const confirmed = await customConfirm(`⚠️ 警告：检测到第 ${frameSeqs} 帧未通过一致性审查。\n\n如果强行生成视频，对应的视频分段可能存在跳变、无动作或动作不一致的缺陷。\n\n确定要强制继续生成视频吗？`);
             if (!confirmed) {
                 return;
             }
@@ -3467,14 +3558,27 @@ let currentIdeatedIdeas = [];
 async function loadIdeationCards(force = false) {
     const container = document.getElementById('ideation-cards-container');
     if (!container) return;
-    
+
+    // 灵感推荐由联网参考案例库驱动（js/trend_refs.js）：勾选了参考就直接从选中
+    // 案例取材；没勾选则后端自动联网搜索（结果沉淀回案例库）
+    const selIds = (typeof getSelectedTrendRefIds === 'function') ? getSelectedTrendRefIds() : [];
+    const selKey = selIds.slice().sort().join(',');
+
     if (!force) {
         const cached = localStorage.getItem('ideation_cached_ideas');
-        if (cached) {
+        // 缓存与生成时勾选的联网参考集合绑定：勾选变了缓存即视为过期重新生成，
+        // 不能把按别的参考取材的灵感当成这批参考的
+        const cachedSel = localStorage.getItem('ideation_cached_trend_sel');
+        if (cached && cachedSel === selKey) {
             try {
                 const parsed = JSON.parse(cached);
                 if (parsed && Array.isArray(parsed) && parsed.length > 0) {
                     currentIdeatedIdeas = parsed;
+                    try {
+                        currentIdeationTrendRefs = JSON.parse(localStorage.getItem('ideation_cached_trend_refs')) || [];
+                    } catch (e2) {
+                        currentIdeationTrendRefs = [];
+                    }
                     renderIdeationCards(parsed);
                     return;
                 }
@@ -3483,9 +3587,11 @@ async function loadIdeationCards(force = false) {
             }
         }
     }
-    
-    container.innerHTML = '<div class="ideation-loading">正在寻找灵感中，请稍候...</div>';
-    
+
+    container.innerHTML = selIds.length > 0
+        ? `<div class="ideation-loading">正在从选中的 ${selIds.length} 条联网参考案例中取材激发灵感，请稍候...</div>`
+        : `<div class="ideation-loading">正在自动联网搜索趋势并寻找灵感中，请稍候...</div>`;
+
     try {
         const response = await fetch('/api/ideate', {
             method: 'POST',
@@ -3494,15 +3600,21 @@ async function loadIdeationCards(force = false) {
             },
             body: JSON.stringify({
                 config: config,
-                count: 4
+                count: 4,
+                trend_ref_ids: selIds
             })
         });
-        
+
         const data = await response.json();
         if (data.status === 'ok' && data.ideas) {
             currentIdeatedIdeas = data.ideas;
+            currentIdeationTrendRefs = Array.isArray(data.trend_refs) ? data.trend_refs : [];
             localStorage.setItem('ideation_cached_ideas', JSON.stringify(data.ideas));
+            localStorage.setItem('ideation_cached_trend_refs', JSON.stringify(currentIdeationTrendRefs));
+            localStorage.setItem('ideation_cached_trend_sel', selKey);
             renderIdeationCards(data.ideas);
+            // 自动搜索路径会往案例库沉淀新参考，让左侧列表跟上
+            if (selIds.length === 0 && typeof loadTrendRefs === 'function') loadTrendRefs();
         } else {
             container.innerHTML = `<div class="ideation-error">加载失败: ${data.message || '未知错误'}</div>`;
         }

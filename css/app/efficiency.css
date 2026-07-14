@@ -88,6 +88,18 @@
 }
 
 /* 4. Timer in Loading screen */
+/* 激发进行中展示的本单选题名（灵感卡片选题名或基础主题） */
+.loading-topic-name {
+    font-size: 15px;
+    color: var(--text-primary);
+    font-weight: 700;
+    margin-top: 8px;
+    max-width: 560px;
+    line-height: 1.4;
+}
+.loading-topic-name:empty {
+    display: none;
+}
 .loading-timer {
     font-size: 13px;
     color: var(--text-secondary);

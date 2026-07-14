@@ -124,66 +124,43 @@ class TestRunAutonomousPipeline(unittest.TestCase):
         mock_video.assert_called_once()
         self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved')
 
-    def test_needs_human_review_when_anchor_gate_never_passes(self):
+    def test_frame_1_is_never_gated_and_uses_no_gate_judge(self):
+        """The IMAGE-1 Anchor Acceptance Gate has been removed from the GUI/API path:
+        run_autonomous_pipeline renders frame 1 unconditionally via _no_gate_judge and
+        never calls check_anchor_frame_compliance, so a 'needs_human_review' dead end
+        for frame 1 is no longer reachable from this entry point."""
         state = self._fake_state()
 
         def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
-            self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
+            # Preserve whatever's already on disk (e.g. the gate step's 'auto_approved'
+            # write for frame 1) instead of clobbering it on the later full-sequence call.
+            manifest_path = os.path.join(self.project_dir, 'manifest.json')
+            frames = []
+            if os.path.exists(manifest_path):
+                with open(manifest_path, 'r', encoding='utf-8') as f:
+                    frames = json.load(f).get('frames', [])
+            existing_seqs = {f['sequence'] for f in frames}
+            wanted = target_sequences if target_sequences is not None else [1]
+            for seq in wanted:
+                if seq not in existing_seqs:
+                    frames.append({'sequence': seq, 'quality_gate': 'pending_manual_review'})
+            self._write_manifest(frames)
             return {'title': title}
-
-        with patch('pipeline_orchestrator.compose_anchor_and_packet', return_value=state), \
-             patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render) as mock_render, \
-             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(False, 'still shows a generic room')), \
-             patch('pipeline_orchestrator.fix_image_prompt_with_vlm_feedback', side_effect=lambda c, p, r: p + '!'), \
-             patch('pipeline_orchestrator.refine_packet_from_accepted_anchor') as mock_refine, \
-             patch('pipeline_orchestrator.compose_remaining_beats') as mock_phase2, \
-             patch('pipeline_orchestrator.generate_video_sequence') as mock_video:
-            result = run_autonomous_pipeline({}, {'theme': 'x'})
-
-        self.assertEqual(result['status'], 'needs_human_review')
-        self.assertEqual(mock_render.call_count, 3)  # _MAX_ANCHOR_ATTEMPTS
-        mock_refine.assert_not_called()
-        mock_phase2.assert_not_called()
-        mock_video.assert_not_called()
-        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'needs_human_review')
-
-    def test_recovery_pass_retries_failed_frame_and_marks_approved(self):
-        state = self._fake_state()
-        render_calls = []
-
-        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
-            render_calls.append(target_sequences)
-            if target_sequences == [1]:
-                self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
-            elif target_sequences is None:
-                # Main render pass: frame 2 comes out stuck at vlm_qa_failed.
-                self._write_manifest([
-                    {'sequence': 1, 'quality_gate': 'auto_approved'},
-                    {'sequence': 2, 'quality_gate': 'vlm_qa_failed'},
-                ])
-            elif target_sequences == [2]:
-                pass  # recovery re-render; manifest gate gets overwritten explicitly below
-            return {'title': title}
-
-        prompt_block_with_slots = (
-            "图片提示词\n图片 1:\nfirst frame\n\n图片 2:\nsecond frame\n\n"
-            "视频提示词\n视频 1:\nvideo one\n"
-        )
 
         with patch('pipeline_orchestrator.compose_anchor_and_packet', return_value=state), \
              patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
-             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(True, 'PASS')), \
-             patch('pipeline_orchestrator.refine_packet_from_accepted_anchor', return_value={'camera_dna': 'refined'}), \
-             patch('pipeline_orchestrator.compose_remaining_beats', return_value=prompt_block_with_slots), \
-             patch('pipeline_orchestrator.run_frame_qa_check', return_value=(True, 'PASS')) as mock_vlm, \
-             patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}):
+             patch('pipeline_orchestrator.check_anchor_frame_compliance') as mock_gate, \
+             patch('pipeline_orchestrator.refine_packet_from_accepted_anchor', return_value={'camera_dna': 'refined'}) as mock_refine, \
+             patch('pipeline_orchestrator.compose_remaining_beats', return_value='FULL PROMPT BLOCK') as mock_phase2, \
+             patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}) as mock_video:
             result = run_autonomous_pipeline({}, {'theme': 'x'})
 
         self.assertEqual(result['status'], 'completed')
-        mock_vlm.assert_called_once()
-        self.assertIn([2], render_calls)
-        frames_by_seq = {f['sequence']: f for f in self._read_manifest()['frames']}
-        self.assertEqual(frames_by_seq[2]['quality_gate'], 'auto_approved')
+        mock_gate.assert_not_called()
+        mock_refine.assert_called_once()
+        mock_phase2.assert_called_once()
+        mock_video.assert_called_once()
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved')
 
 
 class TestRunStagedFrameRendering(unittest.TestCase):
@@ -222,7 +199,10 @@ class TestRunStagedFrameRendering(unittest.TestCase):
         with open(path, 'wb') as f:
             f.write(b'fake webp bytes')
 
-    def test_happy_path_gates_frame_1_without_recomposing_text(self):
+    def test_happy_path_renders_frame_1_without_recomposing_text(self):
+        """No Anchor Acceptance Gate on this path any more: frame 1 renders via
+        _no_gate_judge (check_anchor_frame_compliance is never called) and is recorded
+        auto_approved unconditionally."""
         def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
             manifest_path = os.path.join(self.project_dir, 'manifest.json')
             frames = []
@@ -238,33 +218,17 @@ class TestRunStagedFrameRendering(unittest.TestCase):
             return {'title': title}
 
         with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
-             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(True, 'PASS')) as mock_gate, \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance') as mock_gate, \
              patch('pipeline_orchestrator.compose_anchor_and_packet') as mock_phase1, \
              patch('pipeline_orchestrator.compose_remaining_beats') as mock_phase2, \
              patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}):
             result = run_staged_frame_rendering({}, self.title, self.PROMPT_BLOCK)
 
         self.assertEqual(result['status'], 'completed')
-        mock_gate.assert_called_once()
+        mock_gate.assert_not_called()
         mock_phase1.assert_not_called()  # no text (re)composition in this path
         mock_phase2.assert_not_called()
         self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved')
-
-    def test_needs_human_review_when_anchor_never_passes(self):
-        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
-            self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
-            return {'title': title}
-
-        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render) as mock_render, \
-             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(False, 'tone mismatch')), \
-             patch('pipeline_orchestrator.fix_image_prompt_with_vlm_feedback', side_effect=lambda c, p, r: p + '!'), \
-             patch('pipeline_orchestrator.generate_video_sequence') as mock_video:
-            result = run_staged_frame_rendering({}, self.title, self.PROMPT_BLOCK)
-
-        self.assertEqual(result['status'], 'needs_human_review')
-        self.assertEqual(mock_render.call_count, 3)
-        mock_video.assert_not_called()
-        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'needs_human_review')
 
     def test_raises_when_prompt_block_has_no_image_1(self):
         with self.assertRaises(RuntimeError):
@@ -298,27 +262,29 @@ class TestRunStagedFrameRendering(unittest.TestCase):
 
     def test_regates_frame_1_when_stale_manifest_has_no_fingerprint(self):
         """A stale manifest from an earlier same-titled run says 'auto_approved' but has
-        no anchor prompt fingerprint (or a mismatching one) — reusing it would bypass the
-        Anchor Acceptance Gate for a prompt that was never judged. Must re-gate."""
+        no anchor prompt fingerprint (or a mismatching one) — reusing it would skip
+        re-rendering a prompt that was never actually rendered under this run. Must
+        re-render (there is no gate to re-judge any more, just a re-render + record)."""
         self._write_manifest([{'sequence': 1, 'quality_gate': 'auto_approved', 'vlm_qa_reason': 'PASS'}])
 
         def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
             return {'title': title}
 
-        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
-             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(True, 'PASS')) as mock_gate, \
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render) as mock_render, \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance') as mock_gate, \
              patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}):
             result = run_staged_frame_rendering({}, self.title, self.PROMPT_BLOCK)
 
         self.assertEqual(result['status'], 'completed')
-        mock_gate.assert_called_once()
+        mock_gate.assert_not_called()
+        self.assertIn([1], [c.kwargs.get('target_sequences') for c in mock_render.call_args_list])
         frame_1 = self._read_manifest()['frames'][0]
         self.assertEqual(frame_1['quality_gate'], 'auto_approved')
         self.assertEqual(frame_1['anchor_prompt_sha256'], _prompt_fingerprint('first frame prompt'))
 
     def test_regates_frame_1_when_gated_image_missing_from_disk(self):
         """manifest 记录与指纹都对得上，但过门的锚点图已被清理：复用会让下游重渲一张
-        从未过门的新首帧接着整链构图，必须重新过门。"""
+        从未渲染过的新首帧接着整链构图，必须重新渲染。"""
         self._write_manifest([{
             'sequence': 1, 'quality_gate': 'auto_approved', 'vlm_qa_reason': 'PASS',
             'anchor_prompt_sha256': _prompt_fingerprint('first frame prompt'),
@@ -328,13 +294,14 @@ class TestRunStagedFrameRendering(unittest.TestCase):
         def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
             return {'title': title}
 
-        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
-             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(True, 'PASS')) as mock_gate, \
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render) as mock_render, \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance') as mock_gate, \
              patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}):
             result = run_staged_frame_rendering({}, self.title, self.PROMPT_BLOCK)
 
         self.assertEqual(result['status'], 'completed')
-        mock_gate.assert_called_once()
+        mock_gate.assert_not_called()
+        self.assertIn([1], [c.kwargs.get('target_sequences') for c in mock_render.call_args_list])
 
     def test_regates_frame_1_when_prompt_changed_since_gate(self):
         """auto_approved with a fingerprint from a DIFFERENT prompt (the agent edited
@@ -348,32 +315,14 @@ class TestRunStagedFrameRendering(unittest.TestCase):
         def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
             return {'title': title}
 
-        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
-             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(True, 'PASS')) as mock_gate, \
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render) as mock_render, \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance') as mock_gate, \
              patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}):
             result = run_staged_frame_rendering({}, self.title, self.PROMPT_BLOCK)
 
         self.assertEqual(result['status'], 'completed')
-        mock_gate.assert_called_once()
-
-    def test_degraded_gate_pass_continues_but_is_not_reusable(self):
-        """A judge outage (Skipped verdict) lets the run continue (fail-open default)
-        but records auto_approved_degraded — which a later staged call must NOT treat
-        as a reusable verdict."""
-        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
-            manifest_path = os.path.join(self.project_dir, 'manifest.json')
-            if not os.path.exists(manifest_path):
-                self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
-
-        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
-             patch('pipeline_orchestrator.check_anchor_frame_compliance',
-                   return_value=(True, 'Skipped (API Error: boom)')) as mock_gate, \
-             patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}):
-            result = run_staged_frame_rendering({}, self.title, self.PROMPT_BLOCK)
-
-        self.assertEqual(result['status'], 'completed')  # fail-open：放行但留痕
-        mock_gate.assert_called_once()
-        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved_degraded')
+        mock_gate.assert_not_called()
+        self.assertIn([1], [c.kwargs.get('target_sequences') for c in mock_render.call_args_list])
 
 
 class TestRenderAndGateSingleFrame(unittest.TestCase):

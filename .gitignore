@@ -27,6 +27,8 @@ search_snippet_cache.json
 # ── 用户数据(默认不提交)──
 library.json
 library.rebuilt.json
+topic_ledger.json
+trend_refs.json
 outputs/
 tasks/
 tasks.json

@@ -295,6 +295,16 @@ with open("direct_edit.png", "wb") as file:
 
 6. 若底层 `/v1/images/edits` 返回 `502/404`：确认软件版本为 `antigravity_tools v4.2.9`，并确认模型名没有带 `-2k`、`-9-16` 等后缀。
 
+7. 若图生图（Edits）请求返回 `502`，且错误信息为 `No accounts available with quota for model: gemini-3-pro-image`（但实际请求模型为 `gemini-3.1-flash-image` 或 `nano-banana-2`）：
+   - **根本原因**：Antigravity Tools 代理端（8046 端口）的 Rust 源码 `src-tauri/src/proxy/handlers/openai.rs` 在处理 edits 接口时存在硬编码 `gemini-3-pro-image` 模型的 bug。本地虽已进行修复（已提交 `commit eeba7129` 改为动态获取请求中的模型），但每次 **Antigravity 应用自动更新** 时，官方新包都会覆盖本地已编译的补丁 `antigravity_tools.exe`，导致此问题间歇性复发。
+   - **复发解决方案**：
+     1. 打开终端，切换至代理程序 Rust 源码目录：`cd D:\Antigravity-Manager\src-tauri`
+     2. 确认本地 git 处于正确的分支且已合入 `commit eeba7129` 补丁。
+     3. 重新进行 release 编译：`cargo build --release`
+     4. 关闭当前正在运行的 app，并强杀残留的 8046 端口进程，确保端口释放。
+     5. 将新编译生成的 `src-tauri/target/release/antigravity_tools.exe` 覆盖复制到 `D:\Antigravity-Manager\antigravity_tools.exe`。
+     6. 重启服务。*注意：若启动后 cloudflared 隧道未正常拉起，需在命令行手动运行 `cloudflared tunnel run --token <gui_config.cloudflared.token> --protocol http2` 重新建立外网映射通道。*
+
 ## 九、已验证基线
 
 2026-06-30 当前机器验证：

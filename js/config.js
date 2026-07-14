@@ -1,14 +1,11 @@
 // --- config.js ---
 
 function saveSelectionState() {
-    const activeThemeBtn = document.querySelector('#theme-selector .theme-btn.active');
-    const selectedTheme = activeThemeBtn ? activeThemeBtn.dataset.value : 'hollow_oak';
-    
+    // 基础场景主题选择器已移除；state.theme 不再保存（旧档里残留的值被忽略）
     const activeAnchors = Array.from(document.querySelectorAll('#anchor-selector .anchor-node.active'))
         .map(node => node.dataset.value);
-        
+
     const state = {
-        theme: selectedTheme,
         anchors: activeAnchors,
         complexity: document.getElementById('slider-complexity').value,
         budget: document.getElementById('slider-budget').value,
@@ -30,18 +27,9 @@ function loadSelectionState() {
     
     try {
         const state = JSON.parse(stored);
-        
-        // Theme
-        if (state.theme) {
-            document.querySelectorAll('#theme-selector .theme-btn').forEach(btn => {
-                if (btn.dataset.value === state.theme) {
-                    btn.classList.add('active');
-                } else {
-                    btn.classList.remove('active');
-                }
-            });
-        }
-        
+
+        // （主题选择器已移除，旧档 state.theme 直接忽略）
+
         // Anchors
         if (Array.isArray(state.anchors)) {
             document.querySelectorAll('#anchor-selector .anchor-node').forEach(btn => {
@@ -74,9 +62,10 @@ function loadSelectionState() {
 }
 
 function updateConfigSummary() {
-    const activeThemeBtn = document.querySelector('#theme-selector .theme-btn.active');
-    const themeText = activeThemeBtn ? activeThemeBtn.querySelector('.theme-name').textContent.trim() : '未选主题';
-    
+    // 选题来自「载入维度」过的灵感卡片（联网参考驱动），不再有基础场景主题
+    const themeText = (typeof loadedIdeationCover !== 'undefined' && loadedIdeationCover && loadedIdeationCover.task_label)
+        ? loadedIdeationCover.task_label : '未载入灵感卡';
+
     const activeAnchors = Array.from(document.querySelectorAll('#anchor-selector .anchor-node.active'))
         .map(node => {
             const text = node.textContent.trim();
@@ -352,13 +341,17 @@ function loadConfig() {
     if (fxIpRotateRequestsInput) {
         fxIpRotateRequestsInput.value = config.googleFxIpRotateRequests !== undefined ? config.googleFxIpRotateRequests : 5;
     }
-    const qaGateSelect = document.getElementById('settings-qa-gate');
-    if (qaGateSelect) {
-        qaGateSelect.value = config.qaGateLevel || 'standard';
-    }
     const supervisedSelect = document.getElementById('settings-supervised-mode');
     if (supervisedSelect) {
         supervisedSelect.value = config.supervisedMode ? 'on' : 'off';
+    }
+    const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
+    if (trendUrlsInput) {
+        trendUrlsInput.value = config.ideationTrendUrls || '';
+    }
+    const searchQueryInput = document.getElementById('settings-ideation-search-query');
+    if (searchQueryInput) {
+        searchQueryInput.value = config.ideationSearchQuery || '';
     }
     updateFxImageModelVisibility();
 
@@ -412,13 +405,17 @@ function saveConfig() {
         const val = parseInt(fxIpRotateRequestsInput.value.trim(), 10);
         config.googleFxIpRotateRequests = isNaN(val) ? 5 : val;
     }
-    const qaGateSelect = document.getElementById('settings-qa-gate');
-    if (qaGateSelect) {
-        config.qaGateLevel = qaGateSelect.value;
-    }
     const supervisedSelect = document.getElementById('settings-supervised-mode');
     if (supervisedSelect) {
         config.supervisedMode = supervisedSelect.value === 'on';
+    }
+    const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
+    if (trendUrlsInput) {
+        config.ideationTrendUrls = trendUrlsInput.value.trim();
+    }
+    const searchQueryInput = document.getElementById('settings-ideation-search-query');
+    if (searchQueryInput) {
+        config.ideationSearchQuery = searchQueryInput.value.trim();
     }
     config.imageAspectRatio = document.getElementById('settings-image-ratio').value.trim();
     config.imageQuality = document.getElementById('settings-image-quality').value.trim();
@@ -453,13 +450,17 @@ function resetConfig() {
     if (fxIpRotateRequestsInput) {
         fxIpRotateRequestsInput.value = DEFAULT_CONFIG.googleFxIpRotateRequests;
     }
-    const qaGateSelect = document.getElementById('settings-qa-gate');
-    if (qaGateSelect) {
-        qaGateSelect.value = DEFAULT_CONFIG.qaGateLevel;
-    }
     const supervisedSelect = document.getElementById('settings-supervised-mode');
     if (supervisedSelect) {
         supervisedSelect.value = DEFAULT_CONFIG.supervisedMode ? 'on' : 'off';
+    }
+    const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
+    if (trendUrlsInput) {
+        trendUrlsInput.value = DEFAULT_CONFIG.ideationTrendUrls;
+    }
+    const searchQueryInput = document.getElementById('settings-ideation-search-query');
+    if (searchQueryInput) {
+        searchQueryInput.value = DEFAULT_CONFIG.ideationSearchQuery;
     }
     document.getElementById('settings-image-ratio').value = DEFAULT_CONFIG.imageAspectRatio;
     document.getElementById('settings-image-quality').value = DEFAULT_CONFIG.imageQuality;
