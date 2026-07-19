@@ -169,6 +169,8 @@ def auto_run_worker(task_id, config, dimensions):
     packet -> remaining beats -> remaining frames -> videos) as one background task,
     reusing the same ACTIVE_TASKS/SSE plumbing as the three manual stages."""
     t = get_or_create_task(task_id, dimensions)
+    set_log_context(task_id)
+    log('INFO', 'AUTORUN', "开始自治管线任务")
     try:
         from prompt_pipeline import start_accounting, stop_and_get_accounting
         start_accounting()
@@ -201,23 +203,25 @@ def auto_run_worker(task_id, config, dimensions):
             t["result"] = result
             t["events"].append(('result', result))
         notify_listeners(task_id, 'result', result)
+        log('INFO', 'AUTORUN', "自治管线任务完成")
     except ConnectionError:
         with ACTIVE_TASKS_LOCK:
             t["status"] = "cancelled"
             t["error"] = "用户取消了生成任务"
             t["events"].append(('error', {'message': '用户取消了生成任务'}))
         notify_listeners(task_id, 'error', {'message': '用户取消了生成任务'})
+        log('WARN', 'AUTORUN', "自治管线任务已被用户取消")
     except Exception as e:
-        if sys.stdout:
-            import traceback
-            traceback.print_exc()
+        log_exception('AUTORUN')
         with ACTIVE_TASKS_LOCK:
             t["status"] = "failed"
             t["error"] = str(e)
             t["events"].append(('error', {'message': str(e)}))
         notify_listeners(task_id, 'error', {'message': str(e)})
+        log('ERROR', 'AUTORUN', f"自治管线任务失败: {e}")
     finally:
         save_tasks_to_disk()
+        set_log_context(None)
 
 
 def _client_ip(handler):
@@ -279,6 +283,10 @@ def rate_ok(ip):
 
 def generate_frames_worker(task_id, config, title, prompt_block, target_sequences):
     t = get_or_create_task(task_id)
+    # 之后本线程里所有 log() 调用自动带上 [task=task_id]，日志面板可以按任务过滤
+    # （见 server_common.log 的说明），不用在每一处调用手动传 task_id。
+    set_log_context(task_id)
+    log('INFO', 'FRAMES', f"开始帧序列任务 {'（整单）' if target_sequences is None else f'（子集 {target_sequences}）'}", title=title)
     try:
         from prompt_pipeline import start_accounting, stop_and_get_accounting
         start_accounting()
@@ -297,8 +305,15 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
 
         # 上游失败即时广播：每次尝试失败立刻推 SSE 'upstream_retry'，
         # 前端不再在后台重试退避链（最长分钟级）里干等着看"生成中"
-        from frame_generator import set_upstream_event_sink
+        from frame_generator import set_upstream_event_sink, set_cancel_check_sink
         set_upstream_event_sink(lambda ev: progress_cb('upstream_retry', ev))
+        # 取消检测线程局部兜底：generate_frame_sequence 此前只在"每帧开始前"调用
+        # 一次 cancel_check（progress_cb('cancel_check', ...)），一帧内部自己的
+        # HTTP 重试退避链（单次编辑最多 3 外层 × 5 内层 = 15 次尝试，遇上游限流
+        # 单是内层退避就可能烧到分钟级）完全不受它约束——用户点「取消」，这一帧
+        # 卡着不动，任务不会真正停。注册后 _execute_request_with_retry 的每次
+        # （重）试前都会探测这个回调，取消能在下一次尝试前就生效。
+        set_cancel_check_sink(lambda: t["cancel_event"].is_set())
         try:
             # google_fx 后端共享同一个 AdsPower 浏览器和 builtins.google_fx_cancelled
             # 全局旗标：必须与视频生成互斥，否则新任务开跑时重置旗标/抢浏览器，
@@ -320,6 +335,7 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
                     )
         finally:
             set_upstream_event_sink(None)
+            set_cancel_check_sink(None)
         usage = stop_and_get_accounting()
         if usage:
             result['token_usage'] = usage
@@ -329,31 +345,32 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
             t["result"] = result
             t["events"].append(('result', result))
         notify_listeners(task_id, 'result', result)
+        log('INFO', 'FRAMES', "帧序列任务完成", title=title)
     except ConnectionError:
         with ACTIVE_TASKS_LOCK:
             t["status"] = "cancelled"
             t["error"] = "用户取消了帧序列生成"
             t["events"].append(('error', {'message': '用户取消了帧序列生成'}))
         notify_listeners(task_id, 'error', {'message': '用户取消了帧序列生成'})
+        log('WARN', 'FRAMES', "帧序列任务已被用户取消", title=title)
         try:
             ensure_adspower_on_path()
             from utils.browser import stop_ads_browser
-            user_id = config.get('userId')
-            port = config.get('port')
-            stop_ads_browser(user_id=user_id, port=port)
+            user_id = config.get('googleFxUserId') or None
+            stop_ads_browser(user_id=user_id)
         except Exception:
             pass
     except Exception as e:
-        if sys.stdout:
-            import traceback
-            traceback.print_exc()
+        log_exception('FRAMES')
         with ACTIVE_TASKS_LOCK:
             t["status"] = "failed"
             t["error"] = str(e)
             t["events"].append(('error', {'message': str(e)}))
         notify_listeners(task_id, 'error', {'message': str(e)})
+        log('ERROR', 'FRAMES', f"帧序列任务失败: {e}", title=title)
     finally:
         save_tasks_to_disk()
+        set_log_context(None)
 
 
 def render_staged_worker(task_id, config, title, prompt_block):
@@ -364,6 +381,8 @@ def render_staged_worker(task_id, config, title, prompt_block):
     which scripts/generate_frames.py now calls so a skill-driven (agent-composed)
     prompt set also gets staged, gated rendering instead of a blind batch render."""
     t = get_or_create_task(task_id)
+    set_log_context(task_id)
+    log('INFO', 'STAGED', "开始分步渲染任务", title=title)
     try:
         from prompt_pipeline import start_accounting, stop_and_get_accounting
         start_accounting()
@@ -382,9 +401,16 @@ def render_staged_worker(task_id, config, title, prompt_block):
             notify_listeners(task_id, stage, details)
 
         from pipeline_orchestrator import run_staged_frame_rendering
-        # 分步渲染尾段总会驱动 FX 视频生成：全程持有 FX 串行锁
-        with _FX_SERIAL_LOCK:
-            result = run_staged_frame_rendering(config, title, prompt_block, on_progress=progress_cb)
+        from frame_generator import set_cancel_check_sink
+        # 见 generate_frames_worker 里的同款说明：不注册这个，取消按钮点了也拦不住
+        # 一帧内部正卡着的 HTTP 重试退避链。
+        set_cancel_check_sink(lambda: t["cancel_event"].is_set())
+        try:
+            # 分步渲染尾段总会驱动 FX 视频生成：全程持有 FX 串行锁
+            with _FX_SERIAL_LOCK:
+                result = run_staged_frame_rendering(config, title, prompt_block, on_progress=progress_cb)
+        finally:
+            set_cancel_check_sink(None)
 
         usage = stop_and_get_accounting()
         if usage:
@@ -395,23 +421,25 @@ def render_staged_worker(task_id, config, title, prompt_block):
             t["result"] = result
             t["events"].append(('result', result))
         notify_listeners(task_id, 'result', result)
+        log('INFO', 'STAGED', "分步渲染任务完成", title=title)
     except ConnectionError:
         with ACTIVE_TASKS_LOCK:
             t["status"] = "cancelled"
             t["error"] = "用户取消了分步渲染任务"
             t["events"].append(('error', {'message': '用户取消了分步渲染任务'}))
         notify_listeners(task_id, 'error', {'message': '用户取消了分步渲染任务'})
+        log('WARN', 'STAGED', "分步渲染任务已被用户取消", title=title)
     except Exception as e:
-        if sys.stdout:
-            import traceback
-            traceback.print_exc()
+        log_exception('STAGED')
         with ACTIVE_TASKS_LOCK:
             t["status"] = "failed"
             t["error"] = str(e)
             t["events"].append(('error', {'message': str(e)}))
         notify_listeners(task_id, 'error', {'message': str(e)})
+        log('ERROR', 'STAGED', f"分步渲染任务失败: {e}", title=title)
     finally:
         save_tasks_to_disk()
+        set_log_context(None)
 
 
 # FX 浏览器串行锁：所有驱动 AdsPower/google_fx 浏览器的任务（帧序列 FX 路径、
@@ -430,6 +458,8 @@ def _fx_serial_lock_for(config):
 
 def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
     t = get_or_create_task(task_id)
+    set_log_context(task_id)
+    log('INFO', 'VIDEOS', f"开始视频任务{f'（子集 {target_slots}）' if target_slots else '（整单）'}", title=title)
     try:
         from prompt_pipeline import start_accounting, stop_and_get_accounting
         start_accounting()
@@ -494,10 +524,10 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
                                     mdata['merged_video'] = merged_info
                                     write_manifest(project_dir, mdata)
                         except Exception as e:
-                            print(f"Warning: could not update manifest.json with merged_video ({e})")
+                            log('WARN', 'VIDEOS', f"更新 manifest.json 的 merged_video 字段失败: {e}", title=title)
                     progress_cb('merge_done', {'merged_video': merged_info})
                 except Exception as merge_err:
-                    print(f"Error during auto-merge: {merge_err}")
+                    log('ERROR', 'VIDEOS', f"自动合并视频失败: {merge_err}", title=title)
                     progress_cb('merge_error', {'message': f'自动合并视频失败: {str(merge_err)}'})
 
         with ACTIVE_TASKS_LOCK:
@@ -505,35 +535,38 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
             t["result"] = result
             t["events"].append(('result', result))
         notify_listeners(task_id, 'result', result)
+        log('INFO', 'VIDEOS', "视频任务完成", title=title)
     except ConnectionError:
         with ACTIVE_TASKS_LOCK:
             t["status"] = "cancelled"
             t["error"] = "用户取消了视频生成"
             t["events"].append(('error', {'message': '用户取消了视频生成'}))
         notify_listeners(task_id, 'error', {'message': '用户取消了视频生成'})
+        log('WARN', 'VIDEOS', "视频任务已被用户取消", title=title)
         try:
             ensure_adspower_on_path()
             from utils.browser import stop_ads_browser
-            user_id = config.get('userId')
-            port = config.get('port')
-            stop_ads_browser(user_id=user_id, port=port)
+            user_id = config.get('googleFxUserId') or None
+            stop_ads_browser(user_id=user_id)
         except Exception:
             pass
     except Exception as e:
-        if sys.stdout:
-            import traceback
-            traceback.print_exc()
+        log_exception('VIDEOS')
         with ACTIVE_TASKS_LOCK:
             t["status"] = "failed"
             t["error"] = str(e)
             t["events"].append(('error', {'message': str(e)}))
         notify_listeners(task_id, 'error', {'message': str(e)})
+        log('ERROR', 'VIDEOS', f"视频任务失败: {e}", title=title)
     finally:
         save_tasks_to_disk()
+        set_log_context(None)
 
 
 def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_block):
     t = get_or_create_task(task_id)
+    set_log_context(task_id)
+    log('INFO', 'COVER', "开始封面任务", title=title)
     try:
         # Generate a catchy, viral English title/hook for TikTok US cover
         title_prompt = (
@@ -661,20 +694,21 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
             t["status"] = "completed"
             t["result"] = result_data
             t["events"].append(('result', result_data))
-        
+
         notify_listeners(task_id, 'result', result_data)
-        
+        log('INFO', 'COVER', "封面任务完成", title=title)
+
     except Exception as e:
-        if sys.stdout:
-            import traceback
-            traceback.print_exc()
+        log_exception('COVER')
         with ACTIVE_TASKS_LOCK:
             t["status"] = "failed"
             t["error"] = str(e)
             t["events"].append(('error', {'message': str(e)}))
         notify_listeners(task_id, 'error', {'message': str(e)})
+        log('ERROR', 'COVER', f"封面任务失败: {e}", title=title)
     finally:
         save_tasks_to_disk()
+        set_log_context(None)
 
 
 class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
@@ -778,6 +812,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception:
                 pass
 
+    def send_response(self, code, message=None):
+        # 记住本次响应状态码，供 end_headers 判断是否要压制 404 的隐式缓存
+        self._spark_status_code = code
+        super().send_response(code, message)
+
     def end_headers(self):
         # Enable CORS for local development flexibility
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -785,9 +824,34 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         # Never let browsers / Cloudflare serve stale front-end assets. This is what
         # caused "multiple UI forms" (old cached HTML/CSS shown alongside the new one).
+        # no-store（而非 no-cache）：no-cache 只是要求每次都带条件请求去服务端"问一下"，
+        # 但那次协商行为本身是在响应第一次被缓存时就已经和浏览器约定好的——如果某个
+        # URL 是在这条 no-cache 规则生效之前就被缓存下来的（更早的部署/没有这个头的
+        # 历史版本），浏览器压根不会再发请求去验证，永远沿用旧缓存，导致"必须开无痕
+        # 才能看到最新改动"。no-store 直接禁止缓存这个响应本身，不存在"沿用旧协商结果"
+        # 这个坑，每次加载都是从磁盘整份重新拉取。
         p = (self.path or '').split('?')[0]
         if p.endswith(('.html', '.css', '.js')) or p.endswith('/'):
-            self.send_header('Cache-Control', 'no-cache, must-revalidate')
+            self.send_header('Cache-Control', 'no-store')
+        # 帧/视频文件名是确定性的（img_001.webp 等），生成前请求会先拿到 404——
+        # 404 在 RFC 7231 里是浏览器默认可启发式缓存的状态码，Safari 对此尤其
+        # 激进。不加这个头，浏览器可能把"还没生成"的 404 缓存下来，等真正生成
+        # 完成后同一个 URL 仍被浏览器判定为命中缓存直接返回旧的 404，画面上
+        # 表现为"后端明明已经生成成功，图片却一直显示裂图"（macOS/Safari 上
+        # 尤其容易复现）。只压制错误响应的缓存，不影响正常图片的缓存效率。
+        if getattr(self, '_spark_status_code', 200) >= 400:
+            self.send_header('Cache-Control', 'no-store')
+        elif p.startswith('/outputs/'):
+            # 反过来：200 成功响应也会被浏览器启发式缓存（无 Cache-Control 时
+            # 按 Last-Modified 估算新鲜期，期间根本不会再发请求）。但 outputs/
+            # 下的帧/视频文件名是确定性且可被覆写的——重试单帧、"不用的帧"被
+            # 画廊删除后又在同一序号位置重新生成，都是原地覆盖同一个 URL。
+            # 浏览器缓存的旧字节和新生成的内容"打架"：manifest 已经指向新帧，
+            # 图片却仍在显示删除前/重试前的旧画面。no-cache（而非 no-store）
+            # 让浏览器每次都带 If-Modified-Since 去问一声——文件没变就是一个
+            # 廉价的 304（不传输正文，不重新下载），真的被覆盖了才会传新内容，
+            # 两头都不吃亏：既不会显示旧帧，也不会退化回"每次全量重下"。
+            self.send_header('Cache-Control', 'no-cache')
         super().end_headers()
 
     def _send_json(self, obj, status=200):
@@ -933,19 +997,25 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             try:
                 send_event, stop_evt = self._open_sse_stream()
                 
-                # Send the last 100 lines first
+                # Send the last 100 lines first.
+                # 二进制模式读取整份文件再统一 decode，而不是文本模式 seek()——
+                # 文本模式的 seek() 只应该用 tell() 拿到的"不透明游标"，喂一个由
+                # os.path.getsize() 算出来的裸字节偏移量是未定义行为：偏移量一旦
+                # 落在某个多字节 UTF-8 字符中间，errors='replace' 会悄悄垫上
+                # "�" 之类的替换符，前端看到的就是一串乱字符（这不是 print() 端
+                # 输出了乱码，是这里读的时候自己读岔了）。
                 if os.path.exists(_LOG_PATH):
                     try:
-                        with open(_LOG_PATH, 'r', encoding='utf-8', errors='replace') as f:
-                            lines = f.readlines()
-                            last_lines = lines[-100:]
-                            send_event('history', {'lines': last_lines})
+                        with open(_LOG_PATH, 'rb') as f:
+                            raw = f.read()
+                        last_lines = raw.decode('utf-8', errors='replace').splitlines(keepends=True)[-100:]
+                        send_event('history', {'lines': last_lines})
                     except Exception as e:
                         print(f"Error reading log history: {e}")
 
                 # Start tailing
                 last_size = os.path.getsize(_LOG_PATH) if os.path.exists(_LOG_PATH) else 0
-                
+
                 while not stop_evt.is_set():
                     time.sleep(0.5)
                     if not os.path.exists(_LOG_PATH):
@@ -953,11 +1023,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     curr_size = os.path.getsize(_LOG_PATH)
                     if curr_size > last_size:
                         try:
-                            with open(_LOG_PATH, 'r', encoding='utf-8', errors='replace') as f:
+                            with open(_LOG_PATH, 'rb') as f:
                                 f.seek(last_size)
-                                new_content = f.read()
-                                if new_content:
-                                    send_event('log', {'text': new_content})
+                                new_bytes = f.read()
+                            if new_bytes:
+                                send_event('log', {'text': new_bytes.decode('utf-8', errors='replace')})
                         except Exception as e:
                             print(f"Error reading new logs: {e}")
                         last_size = curr_size
@@ -1688,6 +1758,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 body = self._read_json_body()
                 dimensions = body.get('dimensions', {})
                 config = effective_config(body.get('config'))
+                # 自治管线全程驱动 FX 浏览器：把浏览器编号带进 dimensions，
+                # /api/compose-cancel 取消时据此关闭正确的 AdsPower 窗口
+                dimensions['userId'] = config.get('googleFxUserId') or None
                 task_id = body.get('task_id')
                 if not task_id:
                     task_id = f"auto_{int(time.time() * 1000)}"
@@ -1740,6 +1813,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 body = self._read_json_body()
                 task_id = body.get('task_id')
                 if task_id and task_id in ACTIVE_TASKS:
+                    log('INFO', 'CANCEL', "收到取消请求", task_id=task_id)
                     ACTIVE_TASKS[task_id]["cancel_event"].set()
 
                     # 只有可能驱动 FX 浏览器的任务才触发全局 FX 取消与浏览器停止：
@@ -1777,11 +1851,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                             ensure_adspower_on_path()
                             from utils.browser import stop_ads_browser
                             user_id = dimensions.get("userId")
-                            port = dimensions.get("port")
-                            stop_ads_browser(user_id=user_id, port=port)
+                            stop_ads_browser(user_id=user_id)
                         except Exception as browser_err:
-                            if sys.stdout:
-                                print(f"[CANCEL] Failed to stop AdsPower browser: {browser_err}")
+                            log('WARN', 'CANCEL', f"关闭 AdsPower 浏览器失败: {browser_err}", task_id=task_id)
                 self._send_json({'status': 'ok'})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
@@ -1896,10 +1968,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
                 import uuid
                 task_id = f"frames_{uuid.uuid4().hex}"
-                
+
                 # Register in ACTIVE_TASKS
                 cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "frames", "theme": title})
+                # userId：本次使用的 AdsPower 浏览器编号，供 /api/compose-cancel 取消时
+                # 关闭正确的窗口（仅 google_fx 后端相关，api 后端留 None 无影响）
+                get_or_create_task(task_id, {"type": "frames", "theme": title, "userId": config.get('googleFxUserId') or None})
 
                 threading.Thread(
                     target=generate_frames_worker,
@@ -1928,7 +2002,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 task_id = f"staged_{uuid.uuid4().hex}"
 
                 cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "staged_render", "theme": title})
+                get_or_create_task(task_id, {"type": "staged_render", "theme": title, "userId": config.get('googleFxUserId') or None})
 
                 threading.Thread(
                     target=render_staged_worker,
@@ -1999,7 +2073,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 task_id = f"videos_{uuid.uuid4().hex}"
 
                 cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "videos", "theme": title})
+                get_or_create_task(task_id, {"type": "videos", "theme": title, "userId": config.get('googleFxUserId') or None})
 
                 threading.Thread(
                     target=generate_videos_worker,

@@ -212,45 +212,53 @@ function showFrameReviewPanel(taskId, data) {
 }
 
 /**
- * 把一个 'frame' 事件合并进 currentIdea（幂等：同序号覆盖）。
+ * 把一个 'frame' 事件合并进目标创意（幂等：同序号覆盖）。
  * 注意：这里只写 localStorage 快照，不再每帧向服务端 POST 整个库
  * （旧行为在长任务里造成持续的大请求）；库同步集中在任务终态时进行。
+ *
+ * @param {object} f 帧数据
+ * @param {object} [idea] 该事件流实际归属的创意对象；省略时退回 currentIdea——
+ *        但生成过程中用户可能已经切换到另一个创意，这时必须显式传入生成发起
+ *        时捕获的创意引用，否则数据会被写进当前正在浏览的、不相关的创意里。
  */
-function applyFrameEventToIdea(f) {
-    if (!f || !currentIdea) return;
-    if (!currentIdea.frameRun) currentIdea.frameRun = { title: currentIdea.title, frames: [] };
-    if (!currentIdea.frameRun.frames) currentIdea.frameRun.frames = [];
-    const idx = currentIdea.frameRun.frames.findIndex(item => item.sequence === f.sequence);
+function applyFrameEventToIdea(f, idea) {
+    const targetIdea = idea || currentIdea;
+    if (!f || !targetIdea) return;
+    if (!targetIdea.frameRun) targetIdea.frameRun = { title: targetIdea.title, frames: [] };
+    if (!targetIdea.frameRun.frames) targetIdea.frameRun.frames = [];
+    const idx = targetIdea.frameRun.frames.findIndex(item => item.sequence === f.sequence);
     if (idx !== -1) {
-        currentIdea.frameRun.frames[idx] = f;
+        targetIdea.frameRun.frames[idx] = f;
     } else {
-        currentIdea.frameRun.frames.push(f);
-        currentIdea.frameRun.frames.sort((a, b) => a.sequence - b.sequence);
+        targetIdea.frameRun.frames.push(f);
+        targetIdea.frameRun.frames.sort((a, b) => a.sequence - b.sequence);
     }
-    saveCurrentIdeaState();
-    const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
-    if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = currentIdea.frameRun;
+    if (targetIdea === currentIdea) saveCurrentIdeaState();
+    const existingIdx = savedIdeas.findIndex(item => item.id === targetIdea.id);
+    if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = targetIdea.frameRun;
 }
 
-/** 任务终态时把 manifest 同步进 currentIdea 与创意库（含服务端持久化）。 */
-async function syncFrameRunToLibrary(manifestData) {
-    if (!currentIdea || !manifestData) return;
-    currentIdea.frameRun = manifestData;
-    saveCurrentIdeaState();
-    const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
+/** 任务终态时把 manifest 同步进目标创意与创意库（含服务端持久化）。见 applyFrameEventToIdea 的 idea 参数说明。 */
+async function syncFrameRunToLibrary(manifestData, idea) {
+    const targetIdea = idea || currentIdea;
+    if (!targetIdea || !manifestData) return;
+    targetIdea.frameRun = manifestData;
+    if (targetIdea === currentIdea) saveCurrentIdeaState();
+    const existingIdx = savedIdeas.findIndex(item => item.id === targetIdea.id);
     if (existingIdx !== -1) {
         savedIdeas[existingIdx].frameRun = manifestData;
         await saveLibrary();
     }
 }
 
-/** 失败后从服务端 manifest 恢复已完成的部分结果。 */
-async function reloadManifestIntoIdea() {
-    if (!currentIdea) return;
+/** 失败后从服务端 manifest 恢复已完成的部分结果。见 applyFrameEventToIdea 的 idea 参数说明。 */
+async function reloadManifestIntoIdea(idea) {
+    const targetIdea = idea || currentIdea;
+    if (!targetIdea) return;
     try {
-        const resp = await fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(currentIdea))}`);
+        const resp = await fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(targetIdea))}`);
         if (resp.ok) {
-            await syncFrameRunToLibrary(await resp.json());
+            await syncFrameRunToLibrary(await resp.json(), targetIdea);
         }
     } catch (err) {
         console.error('Failed to load partial manifest after failure:', err);
@@ -358,16 +366,23 @@ function resumeActiveBackgroundTasksIfExists() {
     if (!saved) return;
     try {
         const parsed = JSON.parse(saved);
+        // 刷新后重连：此时 currentIdea 是本标签页最后浏览的创意，只能假设它就是
+        // 任务的归属创意（这是 spark_active_task_* 这套 localStorage 快照本身的
+        // 局限，并非本次修复引入）——但仍需显式落到 *Owner 字段，后续事件的
+        // DOM 绘制/数据写入才有依据可循，不会退化回"总是写当前 currentIdea"。
         if (parsed.framesTaskId) {
             activeBackgroundTasks.framesTaskId = parsed.framesTaskId;
+            activeBackgroundTasks.framesOwner = currentIdea;
             streamFramesProgress(parsed.framesTaskId);
         }
         if (parsed.videosTaskId) {
             activeBackgroundTasks.videosTaskId = parsed.videosTaskId;
+            activeBackgroundTasks.videosOwner = currentIdea;
             streamVideosProgress(parsed.videosTaskId);
         }
         if (parsed.coverTaskId) {
             activeBackgroundTasks.coverTaskId = parsed.coverTaskId;
+            activeBackgroundTasks.coverOwner = currentIdea;
             streamCoverProgress(parsed.coverTaskId);
         }
     } catch (e) {
@@ -375,16 +390,266 @@ function resumeActiveBackgroundTasksIfExists() {
     }
 }
 
+// 后端 server_common.log() 的行格式：HH:MM:SS.mmm [LEVEL] [tag] [task=xxx] message
+// 未套用这个格式的旧 print()/异常回溯行匹配不上，统一归入 'OTHER' 级别——
+// 默认仍然显示，不会让没迁移的日志静默消失，只是没有级别/任务过滤的加成。
+const _LOG_LINE_RE = /^(\d{2}:\d{2}:\d{2}\.\d{3})\s+\[(\w+)\s*\]\s+\[([^\]]+)\](?:\s+\[task=([^\]]+)\])?\s?(.*)$/;
+const _LOG_KNOWN_LEVELS = ['ERROR', 'WARN', 'INFO', 'DEBUG'];
+
 function initLocalServiceLogs() {
     const drawer = document.getElementById('log-panel-drawer');
     const header = document.getElementById('log-panel-header');
     const toggleBtn = document.getElementById('toggle-log-btn');
     const clearBtn = document.getElementById('clear-log-btn');
-    const output = document.getElementById('log-output-pre');
+    const linesEl = document.getElementById('log-output-lines');
     const statusDot = drawer?.querySelector('.log-panel-status-dot');
     const autoscrollChk = document.getElementById('log-autoscroll-chk');
-    
-    if (!drawer || !header || !output) return;
+    const levelChipsEl = document.getElementById('log-level-chips');
+    const taskFilterEl = document.getElementById('log-task-filter');
+    const searchInputEl = document.getElementById('log-search-input');
+    const countEl = document.getElementById('log-filter-count');
+
+    if (!drawer || !header || !linesEl) return;
+
+    const MAX_LINES = 3000;
+    // DEBUG 默认关掉（HTTP 每次尝试都打一条，太吵）；其余级别含未识别的 OTHER 默认全开。
+    const activeLevels = new Set(['ERROR', 'WARN', 'INFO', 'OTHER']);
+    let taskFilter = '';
+    let searchFilter = '';
+    const entries = []; // 与 linesEl 的子节点一一对应，顺序一致
+    // DOM 节点 → entry 的反查（展开重复徽标用）：用 WeakMap 而不是给每个节点存
+    // 数组下标，是因为超过 MAX_LINES 淘汰最老的行时下标会整体错位，重新编号
+    // 又是每加一行就要遍历一遍全部子节点——量一大就是明显的卡顿。WeakMap 不
+    // 关心行在数组里的位置，淘汰旧行时旧节点自然被 GC，完全不用重新编号。
+    const elToEntry = new WeakMap();
+
+    function escapeRegExp(s) {
+        return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    function highlightSearch(safeHtml) {
+        if (!searchFilter) return safeHtml;
+        try {
+            const re = new RegExp(escapeRegExp(searchFilter), 'ig');
+            return safeHtml.replace(re, m => `<mark>${m}</mark>`);
+        } catch (e) {
+            return safeHtml;
+        }
+    }
+
+    function parseLine(raw) {
+        const m = _LOG_LINE_RE.exec(raw);
+        if (!m) return { level: 'OTHER', time: '', tag: '', task: '', text: raw, raw };
+        const level = (m[2] || '').trim().toUpperCase();
+        return {
+            level: _LOG_KNOWN_LEVELS.includes(level) ? level : 'OTHER',
+            time: m[1], tag: m[3] || '', task: m[4] || '', text: m[5] || '', raw
+        };
+    }
+
+    // 同一路重试/限流告警反复触发时，文案里唯一变化的通常只有次数/秒数这类
+    // 数字（"第 1/5 次" → "第 2/5 次"）。把数字都抹掉再比较，形状相同就认为是
+    // 同一件事在重复，而不是要求逐字节完全相等（那样几乎永远碰不上）。
+    function shapeKey(entry) {
+        return entry.level + '|' + entry.tag + '|' + entry.task + '|' +
+            entry.text.replace(/\d+(\.\d+)?/g, '#');
+    }
+
+    const MAX_REPEAT_ITEMS = 20;
+
+    function passesFilter(entry) {
+        if (!activeLevels.has(entry.level)) return false;
+        if (taskFilter && entry.task.indexOf(taskFilter) === -1) return false;
+        if (searchFilter && entry.raw.toLowerCase().indexOf(searchFilter.toLowerCase()) === -1) return false;
+        return true;
+    }
+
+    function renderLineEl(entry) {
+        const div = document.createElement('div');
+        div.className = `log-line lvl-${entry.level}`;
+        elToEntry.set(div, entry);
+        if (!passesFilter(entry)) div.classList.add('log-line-hidden');
+        let head;
+        if (entry.time) {
+            head =
+                `<span class="log-line-time">${entry.time}${entry.lastTime && entry.lastTime !== entry.time ? '~' + entry.lastTime : ''}</span>` +
+                `<span class="log-line-level">${entry.level}</span>` +
+                (entry.tag ? `<span class="log-line-tag">[${escapeHtml(entry.tag)}]</span>` : '') +
+                (entry.task ? `<span class="log-line-task" data-task="${escapeHtml(entry.task)}" title="点击按此任务过滤">task=${escapeHtml(entry.task)}</span>` : '') +
+                `<span class="log-line-msg">${highlightSearch(escapeHtml(entry.text))}</span>`;
+        } else {
+            head = `<span class="log-line-msg">${highlightSearch(escapeHtml(entry.raw))}</span>`;
+        }
+        if (entry.repeatCount > 1) {
+            const shown = entry.repeatItems.length;
+            const omitted = entry.repeatCount - 1 - shown;
+            head += `<span class="log-line-repeat-badge">×${entry.repeatCount} 展开</span>`;
+            const itemsHtml = entry.repeatItems
+                .map(it => `<div class="log-line-repeat-item">${it.time || ''} ${escapeHtml(it.raw)}</div>`)
+                .join('') + (omitted > 0 ? `<div class="log-line-repeat-item">…中间还有 ${omitted} 条未保留</div>` : '');
+            head += `<div class="log-line-repeat-detail">${itemsHtml}</div>`;
+        }
+        div.innerHTML = head;
+        return div;
+    }
+
+    function updateCount() {
+        if (!countEl) return;
+        let visible = 0;
+        for (const entry of entries) { if (passesFilter(entry)) visible++; }
+        countEl.textContent = `${visible}/${entries.length} 行（含折叠重复）`;
+    }
+
+    function appendEntry(entry) {
+        // 连续重复折叠：新行与上一行"形状"相同就合并成一条 ×N，而不是逐条铺开
+        // 刷屏——这是"日志纯净度"最直接的对症（同一个上游限流重试 10 次，
+        // 之前是 10 行几乎一模一样的告警，现在是 1 行 + 可展开的 ×10）。
+        const last = entries[entries.length - 1];
+        if (last && shapeKey(last) === shapeKey(entry)) {
+            last.repeatCount = (last.repeatCount || 1) + 1;
+            last.lastTime = entry.time || last.lastTime;
+            if (last.repeatItems.length < MAX_REPEAT_ITEMS) {
+                last.repeatItems.push({ time: entry.time, raw: entry.raw });
+            }
+            const newEl = renderLineEl(last);
+            if (linesEl.lastChild) linesEl.replaceChild(newEl, linesEl.lastChild);
+            else linesEl.appendChild(newEl);
+            return;
+        }
+        entry.repeatCount = 1;
+        entry.repeatItems = [];
+        entries.push(entry);
+        linesEl.appendChild(renderLineEl(entry));
+        while (entries.length > MAX_LINES) {
+            entries.shift();
+            if (linesEl.firstChild) linesEl.removeChild(linesEl.firstChild);
+        }
+    }
+
+    function appendLine(raw) {
+        if (!raw) return;
+        appendEntry(parseLine(raw));
+    }
+
+    // 增量 'log' 事件送来的是任意长度的文本块（服务端从文件末尾增量 read()），
+    // 可能横跨多行也可能一行没写完；缓存半行，凑齐整行再解析渲染，避免一行
+    // 日志被拆成两条、正则匹配失败退化成 OTHER。
+    let pendingPartial = '';
+    function appendChunk(text) {
+        const combined = pendingPartial + text;
+        const parts = combined.split('\n');
+        pendingPartial = parts.pop();
+        parts.forEach(line => { if (line) appendLine(line); });
+    }
+
+    function reapplyVisibility() {
+        entries.forEach((entry, i) => {
+            const el = linesEl.children[i];
+            if (el) el.classList.toggle('log-line-hidden', !passesFilter(entry));
+        });
+        updateCount();
+    }
+
+    // 关键词变了，高亮标记必须重新渲染（不只是显示/隐藏），但仍复用已解析好的
+    // entries，不重新请求/重新 parse 原始文本。
+    function rerenderAll() {
+        linesEl.innerHTML = '';
+        entries.forEach(entry => linesEl.appendChild(renderLineEl(entry)));
+        updateCount();
+    }
+
+    function clearAll() {
+        entries.length = 0;
+        pendingPartial = '';
+        linesEl.innerHTML = '';
+        updateCount();
+    }
+
+    if (levelChipsEl) {
+        levelChipsEl.querySelectorAll('.log-level-chip').forEach(chip => {
+            chip.addEventListener('click', () => {
+                const level = chip.dataset.level;
+                if (activeLevels.has(level)) {
+                    activeLevels.delete(level);
+                    chip.classList.remove('active');
+                } else {
+                    activeLevels.add(level);
+                    chip.classList.add('active');
+                }
+                reapplyVisibility();
+            });
+        });
+    }
+
+    let taskFilterDebounce = null;
+    if (taskFilterEl) {
+        taskFilterEl.addEventListener('input', () => {
+            clearTimeout(taskFilterDebounce);
+            taskFilterDebounce = setTimeout(() => {
+                taskFilter = taskFilterEl.value.trim();
+                reapplyVisibility();
+            }, 150);
+        });
+    }
+
+    let searchDebounce = null;
+    if (searchInputEl) {
+        searchInputEl.addEventListener('input', () => {
+            clearTimeout(searchDebounce);
+            searchDebounce = setTimeout(() => {
+                searchFilter = searchInputEl.value.trim();
+                rerenderAll();
+            }, 150);
+        });
+    }
+
+    // 点某行的任务标签，直接把任务过滤框填上并聚焦——快速把整个抽屉收敛到
+    // "这一个任务从头到尾发生了什么"，不用手动去复制粘贴任务 id。
+    // 点某行的 ×N 徽标，原地展开/收起被折叠掉的那些重复行的完整时间戳原文——
+    // 折叠只是不铺开显示，信息并没有真的丢，需要时随时能看全。
+    linesEl.addEventListener('click', (e) => {
+        const taskSpan = e.target.closest('.log-line-task');
+        if (taskSpan && taskFilterEl) {
+            taskFilterEl.value = taskSpan.dataset.task;
+            taskFilter = taskSpan.dataset.task;
+            reapplyVisibility();
+            taskFilterEl.focus();
+            return;
+        }
+        const badge = e.target.closest('.log-line-repeat-badge');
+        if (badge) {
+            const detail = badge.parentElement.querySelector('.log-line-repeat-detail');
+            if (detail) {
+                const open = detail.classList.toggle('open');
+                badge.textContent = open ? '收起' : `×${elToEntry.get(badge.closest('.log-line')).repeatCount} 展开`;
+            }
+        }
+    });
+
+    // 只看问题：一键只留 WARN/ERROR，再点一次恢复到默认的 ERROR/WARN/INFO/其他——
+    // 排查"哪里出了问题"时最常见的第一步操作，不用一个个去点级别徽标。
+    const problemsOnlyBtn = document.getElementById('log-problems-only-btn');
+    if (problemsOnlyBtn) {
+        let savedLevels = null;
+        problemsOnlyBtn.addEventListener('click', () => {
+            const isActive = problemsOnlyBtn.classList.toggle('active');
+            if (isActive) {
+                savedLevels = new Set(activeLevels);
+                activeLevels.clear();
+                activeLevels.add('ERROR');
+                activeLevels.add('WARN');
+            } else {
+                activeLevels.clear();
+                (savedLevels || new Set(['ERROR', 'WARN', 'INFO', 'OTHER'])).forEach(l => activeLevels.add(l));
+            }
+            if (levelChipsEl) {
+                levelChipsEl.querySelectorAll('.log-level-chip').forEach(chip => {
+                    chip.classList.toggle('active', activeLevels.has(chip.dataset.level));
+                });
+            }
+            reapplyVisibility();
+        });
+    }
 
     // Toggle expand/collapse
     function toggleLog() {
@@ -404,9 +669,7 @@ function initLocalServiceLogs() {
 
     toggleBtn.addEventListener('click', toggleLog);
 
-    clearBtn.addEventListener('click', () => {
-        output.textContent = '';
-    });
+    clearBtn.addEventListener('click', clearAll);
 
     // ── rAF-throttled scroll: reading scrollHeight causes forced layout,
     //    batch to at most one DOM read per animation frame ──
@@ -439,7 +702,9 @@ function initLocalServiceLogs() {
 
         eventSource.addEventListener('open', () => {
             if (statusDot) statusDot.className = 'log-panel-status-dot connected';
-            output.textContent = '[系统] 已连接到本地服务日志流...\n';
+            clearAll();
+            appendLine('[系统] 已连接到本地服务日志流...');
+            scrollToBottom();
         });
 
         eventSource.addEventListener('history', (e) => {
@@ -448,7 +713,8 @@ function initLocalServiceLogs() {
                 // Server sends {type, data} wrapper via _open_sse_stream
                 const payload = parsed.data || parsed;
                 if (payload.lines && payload.lines.length) {
-                    output.textContent = payload.lines.join('');
+                    clearAll();
+                    payload.lines.forEach(line => appendLine(line.replace(/\n$/, '')));
                     scrollToBottom();
                 }
             } catch (err) {
@@ -462,11 +728,8 @@ function initLocalServiceLogs() {
                 // Server sends {type, data} wrapper via _open_sse_stream
                 const payload = parsed.data || parsed;
                 if (payload.text) {
-                    output.textContent += payload.text;
-                    // Limit total text length to prevent memory bloat (e.g. keep last 200,000 chars)
-                    if (output.textContent.length > 200000) {
-                        output.textContent = output.textContent.substring(output.textContent.length - 150000);
-                    }
+                    appendChunk(payload.text);
+                    updateCount();
                     scrollToBottom();
                 }
             } catch (err) {
@@ -476,7 +739,8 @@ function initLocalServiceLogs() {
 
         eventSource.addEventListener('error', (e) => {
             if (statusDot) statusDot.className = 'log-panel-status-dot';
-            output.textContent += '\n[错误] 与本地服务日志流断开连接，正在尝试重新连接...\n';
+            appendLine('[错误] 与本地服务日志流断开连接，正在尝试重新连接...');
+            scrollToBottom();
             eventSource.close();
             // Reconnect after 3 seconds
             setTimeout(connectLogStream, 3000);
@@ -508,12 +772,18 @@ async function retrySingleFrame(seq) {
     progress.style.display = 'flex';
     meta.textContent = `正在重试生成第 ${seq} 帧...`;
 
+    // 单帧重试由用户点击当前正在看的那个创意的网格触发，天然归属于 currentIdea；
+    // 捕获一份引用，避免重试期间用户切走创意导致结果写错/画错地方（与主生成
+    // 流程 app.js streamFramesProgress 的 owningIdea 同一套道理）。
+    const owningIdea = currentIdea;
+    const isDisplayed = () => currentIdea === owningIdea;
     activeBackgroundTasks.frames = true;
+    activeBackgroundTasks.framesOwner = owningIdea;
     updateTabStatusDot();
 
     // 单帧重试同样在模块内的实时生成动态里直播（helpers 定义在后加载的 app.js，
     // 本函数只在用户点击时运行，届时必已就绪；仍加 typeof 护栏防御加载序变动）
-    const feedLine = (text, cls) => { if (typeof framesFeedLine === 'function') framesFeedLine(text, cls); };
+    const feedLine = (text, cls) => { if (isDisplayed() && typeof framesFeedLine === 'function') framesFeedLine(text, cls); };
     if (typeof framesFeedSetLive === 'function') framesFeedSetLive(true);
     feedLine(`🔁 重试渲染 IMG ${String(seq).padStart(3, '0')}…`);
 
@@ -525,8 +795,8 @@ async function retrySingleFrame(seq) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: currentIdea.title,
-                prompt_block: currentIdea.prompt_block,
+                title: owningIdea.title,
+                prompt_block: owningIdea.prompt_block,
                 target_sequences: [seq]
             }),
             signal: controller.signal
@@ -539,15 +809,28 @@ async function retrySingleFrame(seq) {
 
         const data = await response.json();
         const taskId = data.task_id;
+        // 主生成/单帧重试共用同一个「取消」按钮和 activeBackgroundTasks.frames*
+        // 记账：不在这里记录 taskId，取消按钮找不到要取消的任务 id，点了也没用。
+        activeBackgroundTasks.framesTaskId = taskId;
+        saveActiveBackgroundTasksToLocalStorage();
 
         const watch = await watchTaskUntilTerminal(taskId, {
             label: `retry-frame-${seq}`,
             signal: controller.signal,
             onEvent: (type, evData) => {
                 if (type === 'frame') {
-                    if (typeof framesFeedQualityLine === 'function') framesFeedQualityLine(evData && evData.frame);
-                    applyFrameEventToIdea(evData && evData.frame);
-                    if (currentIdea) renderFramesForIdea(currentIdea);
+                    const f = evData && evData.frame;
+                    applyFrameEventToIdea(f, owningIdea);
+                    if (!isDisplayed()) return;
+                    if (typeof framesFeedQualityLine === 'function') framesFeedQualityLine(f);
+                    // 重试覆盖的是同一个文件名（img_00N.webp），必须强制刷新这张图的
+                    // 缓存版本号，否则浏览器可能继续展示重试前的裂图/旧图——与主生成
+                    // 流程（app.js streamFramesProgress）里 updateFrameSlotCard 同款处理
+                    if (f && typeof updateFrameSlotCard === 'function') {
+                        updateFrameSlotCard(f);
+                    } else {
+                        renderFramesForIdea(owningIdea);
+                    }
                 } else if (type === 'frame_start') {
                     feedLine(`🎨 IMG ${String(seq).padStart(3, '0')} 渲染中…`);
                 } else if (type === 'frame_qa') {
@@ -565,9 +848,9 @@ async function retrySingleFrame(seq) {
                 } else if (type === 'model_fallback') {
                     const to = (evData && evData.to) || '兜底模型';
                     feedLine(`🔀 主模型配额耗尽，切换兜底模型 ${to} 继续渲染 IMG ${String(seq).padStart(3, '0')}…`, 'warn');
-                    meta.textContent = `主模型配额耗尽，兜底模型 ${to} 渲染中...`;
+                    if (isDisplayed()) meta.textContent = `主模型配额耗尽，兜底模型 ${to} 渲染中...`;
                 } else if (type === 'reconnecting') {
-                    meta.textContent = `连接中断，正在重连（第 ${evData.attempt} 次）...`;
+                    if (isDisplayed()) meta.textContent = `连接中断，正在重连（第 ${evData.attempt} 次）...`;
                     feedLine(`⚠️ 连接中断，正在重连（第 ${evData.attempt} 次）…`, 'warn');
                 }
             }
@@ -576,21 +859,28 @@ async function retrySingleFrame(seq) {
         if (watch.status === 'failed') throw new Error(watch.error || '未知错误');
 
         if (watch.result) {
-            await syncFrameRunToLibrary(watch.result);
-            renderFramesForIdea(currentIdea);
-            showToast(`第 ${seq} 帧重试生成成功。`, "success");
+            await syncFrameRunToLibrary(watch.result, owningIdea);
+            if (isDisplayed()) renderFramesForIdea(owningIdea);
+            showToast(`《${getIdeaSaveTitle(owningIdea)}》第 ${seq} 帧重试生成成功。`, "success");
         }
     } catch (e) {
         console.error(`Failed to retry frame ${seq}:`, e);
         feedLine(`❌ IMG ${String(seq).padStart(3, '0')} 重试失败：${e.message}`, 'err');
-        showToast(`第 ${seq} 帧重试失败: ${e.message}`, "error");
+        showToast(`《${getIdeaSaveTitle(owningIdea)}》第 ${seq} 帧重试失败: ${e.message}`, "error");
 
         // Restore state by reloading manifest or rendering whatever is local
-        await reloadManifestIntoIdea();
-        renderFramesForIdea(currentIdea);
+        await reloadManifestIntoIdea(owningIdea);
+        if (isDisplayed()) renderFramesForIdea(owningIdea);
     } finally {
-        progress.style.display = 'none';
         activeBackgroundTasks.frames = false;
+        activeBackgroundTasks.framesOwner = null;
+        activeBackgroundTasks.framesTaskId = null;
+        saveActiveBackgroundTasksToLocalStorage();
+        if (typeof syncFramesPanelToCurrentIdea === 'function') {
+            syncFramesPanelToCurrentIdea();
+        } else if (isDisplayed()) {
+            progress.style.display = 'none';
+        }
         updateTabStatusDot();
         if (typeof framesFeedSetLive === 'function') framesFeedSetLive(false);
     }
@@ -618,19 +908,23 @@ async function retrySingleVideo(slot) {
     progress.style.display = 'flex';
     meta.textContent = `正在重试生成第 ${slot} 段视频...`;
 
+    // 见 retrySingleFrame 里 owningIdea 的说明。
+    const owningIdea = currentIdea;
+    const isDisplayed = () => currentIdea === owningIdea;
     activeBackgroundTasks.videos = true;
+    activeBackgroundTasks.videosOwner = owningIdea;
     updateTabStatusDot();
 
     const controller = new AbortController();
-    
+
     try {
         const response = await fetch('/api/generate_videos', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: currentIdea.title,
-                prompt_block: currentIdea.prompt_block,
+                title: owningIdea.title,
+                prompt_block: owningIdea.prompt_block,
                 target_slots: [slot]
             }),
             signal: controller.signal
@@ -643,11 +937,15 @@ async function retrySingleVideo(slot) {
 
         const data = await response.json();
         const taskId = data.task_id;
+        // 见 retrySingleFrame 里的同款说明：取消按钮要靠这个字段找到任务 id。
+        activeBackgroundTasks.videosTaskId = taskId;
+        saveActiveBackgroundTasksToLocalStorage();
 
         const watch = await watchTaskUntilTerminal(taskId, {
             label: `retry-video-${slot}`,
             signal: controller.signal,
             onEvent: (type, evData) => {
+                if (!isDisplayed()) return;
                 if (type === 'video_start') {
                     meta.textContent = `正在生成视频: 正在处理第 ${evData.index} 段视频...`;
                 } else if (type === 'video_done') {
@@ -667,18 +965,27 @@ async function retrySingleVideo(slot) {
         if (watch.status === 'failed') throw new Error(watch.error || '未知错误');
 
         if (watch.result) {
-            await syncFrameRunToLibrary(watch.result);
-            renderVideosForIdea(currentIdea);
-            showToast(`视频第 ${slot} 段重试成功。`, "success");
+            await syncFrameRunToLibrary(watch.result, owningIdea);
+            if (isDisplayed()) renderVideosForIdea(owningIdea);
+            showToast(`《${getIdeaSaveTitle(owningIdea)}》视频第 ${slot} 段重试成功。`, "success");
         }
     } catch (e) {
         console.error("Failed to retry video:", e);
-        meta.textContent = `视频第 ${slot} 段重试失败: ${e.message}`;
-        showToast(`视频第 ${slot} 段重试失败: ${e.message}`, "error");
-        renderVideoSlotFailed(slot, e.message || '生成失败');
+        showToast(`《${getIdeaSaveTitle(owningIdea)}》视频第 ${slot} 段重试失败: ${e.message}`, "error");
+        if (isDisplayed()) {
+            meta.textContent = `视频第 ${slot} 段重试失败: ${e.message}`;
+            renderVideoSlotFailed(slot, e.message || '生成失败');
+        }
     } finally {
-        progress.style.display = 'none';
         activeBackgroundTasks.videos = false;
+        activeBackgroundTasks.videosOwner = null;
+        activeBackgroundTasks.videosTaskId = null;
+        saveActiveBackgroundTasksToLocalStorage();
+        if (typeof syncVideosPanelToCurrentIdea === 'function') {
+            syncVideosPanelToCurrentIdea();
+        } else if (isDisplayed()) {
+            progress.style.display = 'none';
+        }
         updateTabStatusDot();
     }
 }
@@ -712,7 +1019,11 @@ async function retryMissingVideos(slots) {
 
     progress.style.display = 'flex';
     meta.textContent = `正在重试缺失的 ${slots.length} 段视频（槽位 ${slots.join(', ')}）...`;
+    // 见 retrySingleFrame 里 owningIdea 的说明。
+    const owningIdea = currentIdea;
+    const isDisplayed = () => currentIdea === owningIdea;
     activeBackgroundTasks.videos = true;
+    activeBackgroundTasks.videosOwner = owningIdea;
     updateTabStatusDot();
 
     const controller = new AbortController();
@@ -722,8 +1033,8 @@ async function retryMissingVideos(slots) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: currentIdea.title,
-                prompt_block: currentIdea.prompt_block,
+                title: owningIdea.title,
+                prompt_block: owningIdea.prompt_block,
                 target_slots: slots
             }),
             signal: controller.signal
@@ -734,11 +1045,15 @@ async function retryMissingVideos(slots) {
         }
         const data = await response.json();
         const taskId = data.task_id;
+        // 见 retrySingleFrame 里的同款说明：取消按钮要靠这个字段找到任务 id。
+        activeBackgroundTasks.videosTaskId = taskId;
+        saveActiveBackgroundTasksToLocalStorage();
 
         const watch = await watchTaskUntilTerminal(taskId, {
             label: `retry-missing-videos`,
             signal: controller.signal,
             onEvent: (type, evData) => {
+                if (!isDisplayed()) return;
                 if (type === 'video_start') {
                     meta.textContent = `正在生成视频: 正在处理第 ${evData.index} 段视频...`;
                 } else if (type === 'video_done') {
@@ -755,21 +1070,28 @@ async function retryMissingVideos(slots) {
 
         if (watch.status === 'failed') throw new Error(watch.error || '未知错误');
         if (watch.result) {
-            await syncFrameRunToLibrary(watch.result);
-            renderVideosForIdea(currentIdea);
+            await syncFrameRunToLibrary(watch.result, owningIdea);
+            if (isDisplayed()) renderVideosForIdea(owningIdea);
         }
-        showToast("缺失片段重试完成，正在尝试重新合并...", "success");
+        showToast(`《${getIdeaSaveTitle(owningIdea)}》缺失片段重试完成，正在尝试重新合并...`, "success");
         // 自动再合并一次；若仍有缺口，mergeVideos 会再次给出重试/强制选项
-        if (typeof mergeVideos === 'function') {
+        if (isDisplayed() && typeof mergeVideos === 'function') {
             await mergeVideos();
         }
     } catch (e) {
         console.error("Failed to retry missing videos:", e);
-        meta.textContent = `重试缺失片段失败: ${e.message}`;
-        showToast(`重试缺失片段失败: ${e.message}`, "error");
+        showToast(`《${getIdeaSaveTitle(owningIdea)}》重试缺失片段失败: ${e.message}`, "error");
+        if (isDisplayed()) meta.textContent = `重试缺失片段失败: ${e.message}`;
     } finally {
-        progress.style.display = 'none';
         activeBackgroundTasks.videos = false;
+        activeBackgroundTasks.videosOwner = null;
+        activeBackgroundTasks.videosTaskId = null;
+        saveActiveBackgroundTasksToLocalStorage();
+        if (typeof syncVideosPanelToCurrentIdea === 'function') {
+            syncVideosPanelToCurrentIdea();
+        } else if (isDisplayed()) {
+            progress.style.display = 'none';
+        }
         updateTabStatusDot();
     }
 }

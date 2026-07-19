@@ -42,12 +42,12 @@
     })();</script>
     <!-- Preload critical CSS for faster first paint -->
     <link rel="preload" href="css/tokens.css?v=1.1.1" as="style">
-    <link rel="preload" href="css/app/base.css?v=1.2.4" as="style">
+    <link rel="preload" href="css/app/base.css?v=1.2.5" as="style">
     <link rel="stylesheet" href="css/tokens.css?v=1.1.1">
     <!-- style.css split into ordered contiguous slices (concatenation == original); load order = cascade order -->
-    <link rel="stylesheet" href="css/app/base.css?v=1.2.4">
+    <link rel="stylesheet" href="css/app/base.css?v=1.2.5">
     <link rel="stylesheet" href="css/app/skill-output.css?v=1.2.2">
-    <link rel="stylesheet" href="css/app/efficiency.css?v=1.2.1">
+    <link rel="stylesheet" href="css/app/efficiency.css?v=1.2.2">
     <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.2.6">
     <link rel="stylesheet" href="css/image_studio.css?v=1.1.1">
     <link rel="stylesheet" href="css/gallery.css?v=1.1.0">
@@ -1069,9 +1069,25 @@
                         <option value="Veo 3.1 - Lite [Lower Priority]" selected>Veo 3.1 - Lite [Lower Priority]</option>
                     </select>
                 </div>
+                <div class="form-group" id="fx-video-duration-group" style="display: none;">
+                    <label for="settings-fx-video-duration">Omni Flash Duration (Omni Flash 视频时长)</label>
+                    <select id="settings-fx-video-duration">
+                        <option value="" selected>不指定（沿用 Flow 面板当前时长）</option>
+                        <option value="4">4s</option>
+                        <option value="6">6s</option>
+                        <option value="8">8s</option>
+                        <option value="10">10s</option>
+                    </select>
+                    <small style="opacity:.65;display:block;margin-top:4px;">仅 Omni Flash 模型面板提供该时长切换；Veo 系列时长固定，切到 Veo 模型时本项自动隐藏且不生效</small>
+                </div>
                 <div class="form-group" id="fx-ip-rotate-requests-group" style="display: none;">
                     <label for="settings-fx-ip-rotate-requests">Auto-rotate IP Frequency (自动轮换 IP 频率，单位：次请求)</label>
                     <input type="number" id="settings-fx-ip-rotate-requests" min="1" max="100" placeholder="默认 5 次">
+                </div>
+                <div class="form-group" id="fx-browser-id-group" style="display: none;">
+                    <label for="settings-fx-browser-id">AdsPower Browser No. (浏览器编号 / User ID)</label>
+                    <input type="text" id="settings-fx-browser-id" placeholder="留空使用服务端默认浏览器">
+                    <small style="opacity:.65;display:block;margin-top:4px;">多开/多账号场景下切换本次帧序列 / 视频生成实际驱动哪个 AdsPower 窗口（对应 AdsPower 里该浏览器的 user_id/编号）；改动即存，下次生成生效，同进程内其他仍在跑的 FX 任务也会切到新窗口</small>
                 </div>
                 <div class="form-group">
                     <label for="settings-image-ratio">Image Aspect Ratio (生图宽高比)</label>
@@ -1130,16 +1146,29 @@
                 <button id="toggle-log-btn" class="log-action-btn" title="展开/收起日志">展开</button>
             </div>
         </div>
+        <div class="log-panel-filters" id="log-panel-filters">
+            <button type="button" id="log-problems-only-btn" class="log-action-btn" title="只看 WARN 及以上级别，再点一次恢复">只看问题</button>
+            <div class="log-level-chips" id="log-level-chips">
+                <button type="button" class="log-level-chip lvl-ERROR active" data-level="ERROR">ERROR</button>
+                <button type="button" class="log-level-chip lvl-WARN active" data-level="WARN">WARN</button>
+                <button type="button" class="log-level-chip lvl-INFO active" data-level="INFO">INFO</button>
+                <button type="button" class="log-level-chip lvl-DEBUG" data-level="DEBUG">DEBUG</button>
+                <button type="button" class="log-level-chip lvl-OTHER active" data-level="OTHER" title="未套用新格式的旧日志行">其他</button>
+            </div>
+            <input type="text" id="log-task-filter" class="log-filter-input" placeholder="按任务 id 过滤（点行内任务标签快速填入）" spellcheck="false">
+            <input type="text" id="log-search-input" class="log-filter-input" placeholder="搜索关键词..." spellcheck="false">
+            <span class="log-filter-count" id="log-filter-count"></span>
+        </div>
         <div class="log-panel-body" id="log-panel-body">
-            <pre id="log-output-pre">正在连接本地服务日志流...</pre>
+            <div id="log-output-lines"><div class="log-line lvl-OTHER" data-level="OTHER">正在连接本地服务日志流...</div></div>
         </div>
     </div>
 
     <!-- Modular JS: defer so they never block HTML parsing. Order preserved. -->
-    <script src="js/state.js?v=1.1.9" defer></script>
+    <script src="js/state.js?v=1.1.10" defer></script>
     <script src="js/utils.js?v=1.1.2" defer></script>
     <script src="js/theme_toggle.js?v=1.1.0" defer></script>
-    <script src="js/config.js?v=1.2.1" defer></script>
+    <script src="js/config.js?v=1.2.2" defer></script>
     <script src="js/trend_refs.js?v=1.0.0" defer></script>
     <script src="js/progress_model.js?v=1.2.3" defer></script>
     <script src="js/api_client.js?v=1.1.7" defer></script>

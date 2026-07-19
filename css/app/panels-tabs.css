@@ -1432,6 +1432,69 @@
     border-color: var(--neon-cyan);
 }
 
+.log-panel-filters {
+    display: none; /* 折叠时不占地方；展开时靠 .expanded 覆盖打开 */
+    align-items: center;
+    gap: 8px;
+    padding: 6px 16px;
+    background: #0d1018;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    flex-wrap: wrap;
+}
+
+.log-panel-drawer.expanded .log-panel-filters {
+    display: flex;
+}
+
+.log-level-chips {
+    display: flex;
+    gap: 4px;
+}
+
+.log-level-chip {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: var(--text-muted);
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: all 0.15s;
+    opacity: 0.55;
+}
+
+.log-level-chip.active { opacity: 1; }
+.log-level-chip.lvl-ERROR.active { border-color: #ef4444; color: #ef4444; background: rgba(239, 68, 68, 0.12); }
+.log-level-chip.lvl-WARN.active { border-color: #d97706; color: #d97706; background: rgba(217, 119, 6, 0.12); }
+.log-level-chip.lvl-INFO.active { border-color: #38bdf8; color: #38bdf8; background: rgba(56, 189, 248, 0.12); }
+.log-level-chip.lvl-DEBUG.active { border-color: #9ca3af; color: #9ca3af; background: rgba(156, 163, 175, 0.12); }
+.log-level-chip.lvl-OTHER.active { border-color: #a6e22e; color: #a6e22e; background: rgba(166, 226, 46, 0.1); }
+
+.log-filter-input {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: var(--text-primary);
+    padding: 3px 8px;
+    font-size: 11px;
+    border-radius: 5px;
+    min-width: 140px;
+    font-family: inherit;
+}
+
+.log-filter-input:focus {
+    outline: none;
+    border-color: var(--neon-cyan);
+}
+
+.log-filter-count {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-left: auto;
+    white-space: nowrap;
+}
+
 .log-panel-body {
     flex: 1;
     overflow-y: auto;
@@ -1440,13 +1503,99 @@
     margin: 0;
 }
 
-#log-output-pre {
-    margin: 0;
-    white-space: pre-wrap;
-    word-break: break-all;
+#log-output-lines {
     font-size: 12px;
     line-height: 1.6;
     color: #f8f8f2;
+}
+
+.log-line {
+    white-space: pre-wrap;
+    word-break: break-all;
+    padding: 1px 0;
+}
+
+.log-line.log-line-hidden { display: none; }
+
+.log-line-time {
+    color: rgba(255, 255, 255, 0.3);
+    font-variant-numeric: tabular-nums;
+    margin-right: 6px;
+}
+
+.log-line-level {
+    display: inline-block;
+    min-width: 38px;
+    font-weight: 700;
+    font-size: 10px;
+    margin-right: 6px;
+}
+
+.log-line.lvl-ERROR .log-line-level { color: #ef4444; }
+.log-line.lvl-WARN .log-line-level { color: #d97706; }
+.log-line.lvl-INFO .log-line-level { color: #38bdf8; }
+.log-line.lvl-DEBUG .log-line-level { color: #9ca3af; }
+.log-line.lvl-ERROR .log-line-msg { color: #ff8a8a; }
+.log-line.lvl-WARN .log-line-msg { color: #f0b464; }
+
+.log-line-tag {
+    color: #c792ea;
+    margin-right: 6px;
+}
+
+.log-line-task {
+    color: #a6e22e;
+    margin-right: 6px;
+    cursor: pointer;
+    border-bottom: 1px dotted currentColor;
+}
+
+.log-line-task:hover { color: #d4ff7a; }
+
+.log-line-msg mark {
+    background: rgba(255, 214, 0, 0.35);
+    color: inherit;
+    border-radius: 2px;
+}
+
+/* 连续重复行折叠：同一 tag/级别/去数字化后文案相同的行不再逐条铺开，
+   合并成一行 + 一个可展开的 ×N 徽标——纯净度问题的直接对症（同一个上游限流
+   报错重试 10 次，之前是 10 行几乎一样的告警，现在是 1 行 + "×10 展开"）。 */
+.log-line-repeat-badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 0 6px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-muted);
+    font-size: 10px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.log-line-repeat-badge:hover {
+    background: rgba(255, 255, 255, 0.16);
+    color: var(--text-primary);
+}
+
+.log-line-repeat-detail {
+    margin-left: 16px;
+    padding-left: 8px;
+    border-left: 2px solid rgba(255, 255, 255, 0.1);
+    display: none;
+}
+
+.log-line-repeat-detail.open { display: block; }
+
+.log-line-repeat-detail .log-line-repeat-item {
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 11px;
+}
+
+#log-problems-only-btn.active {
+    background: rgba(239, 68, 68, 0.18);
+    border-color: #ef4444;
+    color: #ff8a8a;
 }
 
 /* Adjust page content padding so it doesn't get hidden under the log panel */

@@ -23,6 +23,12 @@ const DEFAULT_CONFIG = {
     googleFxImageModel: 'Nano Banana 2',
     videoModel: 'Veo 3.1 - Lite [Lower Priority]',
     googleFxIpRotateRequests: 5,
+    // AdsPower 浏览器编号（profile 的 user_id）：留空则使用服务端 .env 里的默认浏览器；
+    // 多开/多账号场景下可在此切换本次帧序列/视频生成实际驱动哪个 AdsPower 窗口
+    googleFxUserId: '',
+    // 视频时长（仅 Omni Flash 模型面板提供 4s/6s/8s/10s 时长 tab；Veo 系列时长固定，
+    // 该项对其无效）：留空则不主动切换，沿用 Flow 面板当前时长
+    videoDuration: '',
     imageAspectRatio: '9:16',
     imageQuality: '2K',
     // 关键点监修模式: 首帧/镜头族交接锚点帧渲染后暂停等人工确认（采用/重渲，超时自动采用）
@@ -89,10 +95,17 @@ let currentIdea = null;
 let currentIdeationTrendRefs = [];
 
 let customPresets = {};
+// *Owner 字段记录后台任务实际归属的创意对象引用（而非"当前正在浏览的" currentIdea）：
+// 生成过程中用户切换到另一个创意时，事件流的数据写入/DOM 绘制必须仍然认这个引用，
+// 否则后台任务的结果会被写进/画到切换后正在看的那个创意上——即"实时生成动态日志
+// 都共用"的根因（多个创意的直播流共用同一套全局 DOM/状态）。
 let activeBackgroundTasks = {
     cover: false,
     frames: false,
-    videos: false
+    videos: false,
+    coverOwner: null,
+    framesOwner: null,
+    videosOwner: null
 };
 
 let generationState = {

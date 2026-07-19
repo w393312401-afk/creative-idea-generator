@@ -23,7 +23,8 @@ from server_common import (
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
     IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT, IMG2IMG_TURN_CONTROL_PROMPT,
     IMAGE_TASKS, IMAGE_TASKS_LOCK, ensure_adspower_on_path,
-    read_manifest, write_manifest
+    apply_google_fx_runtime_overrides,
+    read_manifest, write_manifest, GenerationCancelled, log
 )
 
 
@@ -33,11 +34,14 @@ class QuotaExhaustedError(RuntimeError):
     pass
 
 
-class ImageTaskCancelled(Exception):
-    """图像任务被用户取消（在重试间隙检测到）。"""
+class ImageTaskCancelled(GenerationCancelled):
+    """图像任务被用户取消（在重试间隙检测到）。继承 GenerationCancelled（即
+    ConnectionError）以兼容 worker 收尾逻辑既有的 `except ConnectionError → cancelled`
+    分支，取消后任务会被正确终态化成"已取消"而不是"失败"。"""
 
 
 _UPSTREAM_SINK = threading.local()
+_CANCEL_SINK = threading.local()
 
 
 def set_upstream_event_sink(fn):
@@ -46,6 +50,16 @@ def set_upstream_event_sink(fn):
     转成 SSE 'upstream_retry' 事件、图像站 worker 把它写进任务 stage——前端因此在
     上游报错的瞬间就能看到真相，而不是等整条重试退避链（最长分钟级）烧完才知道。"""
     _UPSTREAM_SINK.fn = fn
+
+
+def set_cancel_check_sink(fn):
+    """注册（传 None=清除）当前线程的默认取消检测回调。_execute_request_with_retry
+    的多数调用点（call_image_llm/_post_json/_generate_image_edit 等）此前根本没
+    传 cancel_check 参数——用户点「取消」只会中断前端的 SSE 读取，后端 worker 线程
+    完全无感知，会继续把整条重试退避链（含上游限流的多轮重试）跑完，导致取消按钮
+    "点了没用"。这里用线程局部变量兜底：worker 注册一次，之后所有嵌套多层调用到
+    _execute_request_with_retry 的地方无需逐层传参也能在下一次尝试前感知取消。"""
+    _CANCEL_SINK.fn = fn
 
 
 def _emit_upstream_failure(attempt, max_attempts, error_text, retry_in=None):
@@ -68,12 +82,16 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, 
     if opener is None:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+    # 显式传入的 cancel_check 优先；否则退回 worker 通过 set_cancel_check_sink
+    # 注册的线程局部默认值，见该函数的说明。
+    check_cancel = cancel_check or getattr(_CANCEL_SINK, 'fn', None)
+
     last_exception = None
     delay = initial_delay
 
     for attempt in range(max_attempts):
         # 每次（重）试前检查取消：已取消的任务不再烧上游配额
-        if cancel_check and cancel_check():
+        if check_cancel and check_cancel():
             raise ImageTaskCancelled("任务已被用户取消")
         if on_attempt:
             # 图像站实时动态用：报告当前是第几次尝试（回调异常不许影响请求本身）
@@ -83,9 +101,8 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, 
                 pass
         try:
             url_str = req.full_url if hasattr(req, 'full_url') else str(req)
-            if sys.stdout:
-                print(f"[HTTP] Sending request to {url_str} (attempt {attempt+1}/{max_attempts})")
-            
+            log('DEBUG', 'HTTP', f"发送请求 {url_str}", attempt=f"{attempt+1}/{max_attempts}")
+
             with opener.open(req, timeout=timeout) as resp:
                 return resp.read()
         except urllib.error.HTTPError as e:
@@ -95,9 +112,8 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, 
                 detail = e.read().decode('utf-8')[:800]
             except Exception:
                 pass
-            
-            if sys.stdout:
-                print(f"[HTTP] Attempt {attempt+1}/{max_attempts} failed with HTTP {e.code}: {detail}")
+
+            log('WARN', 'HTTP', f"尝试 {attempt+1}/{max_attempts} 失败 HTTP {e.code}: {detail[:200]}")
             
             # Detect quota exhaustion (direct 429 or 502 wrapping upstream 429)
             # and fail immediately – retrying only wastes quota.
@@ -154,16 +170,14 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, 
                         sleep_time = delay * (1.5 ** attempt) + random.uniform(0.5, 1.5)
 
                     _emit_upstream_failure(attempt + 1, max_attempts, f'HTTP {e.code}: {detail.strip()[:120]}', retry_in=sleep_time)
-                    if sys.stdout:
-                        print(f"[HTTP] Rate-limited or server error. Retrying in {sleep_time:.2f} seconds...")
+                    log('WARN', 'HTTP', f"限流/服务端错误，{sleep_time:.2f}s 后重试")
                     time.sleep(sleep_time)
                     continue
             _emit_upstream_failure(attempt + 1, max_attempts, f'HTTP {e.code}: {detail.strip()[:120]}')
             raise e
         except urllib.error.URLError as e:
             last_exception = e
-            if sys.stdout:
-                print(f"[HTTP] Attempt {attempt+1}/{max_attempts} failed with URLError: {e.reason}")
+            log('WARN', 'HTTP', f"尝试 {attempt+1}/{max_attempts} 失败 URLError: {e.reason}")
             if attempt < max_attempts - 1:
                 sleep_time = delay * (1.5 ** attempt) + random.uniform(0.5, 1.5)
                 _emit_upstream_failure(attempt + 1, max_attempts, f'连接失败: {e.reason}', retry_in=sleep_time)
@@ -173,8 +187,7 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, 
             raise e
         except socket.timeout as e:
             last_exception = e
-            if sys.stdout:
-                print(f"[HTTP] Attempt {attempt+1}/{max_attempts} failed with socket timeout")
+            log('WARN', 'HTTP', f"尝试 {attempt+1}/{max_attempts} 失败：socket timeout")
             if attempt < max_attempts - 1:
                 sleep_time = delay * (1.5 ** attempt) + random.uniform(0.5, 1.5)
                 _emit_upstream_failure(attempt + 1, max_attempts, '请求超时 (socket timeout)', retry_in=sleep_time)
@@ -184,8 +197,7 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=5, 
             raise e
         except Exception as e:
             last_exception = e
-            if sys.stdout:
-                print(f"[HTTP] Attempt {attempt+1}/{max_attempts} failed with unexpected error: {e}")
+            log('WARN', 'HTTP', f"尝试 {attempt+1}/{max_attempts} 出现未预期错误: {e}")
             if attempt < max_attempts - 1:
                 sleep_time = delay * (1.5 ** attempt) + random.uniform(0.5, 1.5)
                 _emit_upstream_failure(attempt + 1, max_attempts, str(e), retry_in=sleep_time)
@@ -955,9 +967,14 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
         except QuotaExhaustedError:
             # Quota is gone – no point retrying with any attempt count, re-raise immediately
             raise
+        except GenerationCancelled:
+            # 取消信号必须原样穿透：这是这个函数自己的外层重试循环（3 次，每次
+            # 内部还套一层 _execute_request_with_retry 的 5 次退避重试）——不加
+            # 这层专门捕获，取消会被下面 except Exception 当成一次普通失败，
+            # 在 sleep 后又 continue 到下一次尝试，用户点了取消也拦不住它。
+            raise
         except Exception as e:
-            if sys.stdout:
-                print(f"[FRAME SEQUENCE] Image edit attempt {attempt+1}/{max_attempts} failed: {e}")
+            log('WARN', 'FRAME_SEQ', f"图生图外层尝试 {attempt+1}/{max_attempts} 失败: {e}")
             if attempt < max_attempts - 1:
                 import time
                 time.sleep(2.0 + attempt * 2.0)
@@ -1093,9 +1110,7 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path):
 def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=None, target_sequences=None):
     import builtins
     builtins.google_fx_cancelled = False
-    rotate_requests = config.get('googleFxIpRotateRequests')
-    if rotate_requests is not None:
-        os.environ['MIYA_ROTATE_THRESHOLD'] = str(rotate_requests)
+    apply_google_fx_runtime_overrides(config)
     from prompt_pipeline import _parse_prompt_slots
     images, videos = _parse_prompt_slots(prompt_block)
 
@@ -1545,9 +1560,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                 # Try fallbackImageModel if configured, otherwise raise error.
                 fallback_model = config.get('imageEditFallbackModel') or config.get('fallbackImageModel')
                 if fallback_model:
-                    if sys.stdout:
-                        print(f"[FRAME SEQUENCE] Quota exhausted on primary model. "
-                              f"Retrying frame {seq} with fallback model: {fallback_model}")
+                    log('WARN', 'FRAME_SEQ', f"主模型配额耗尽，第 {seq} 帧切换兜底模型重试", fallback=fallback_model)
                     if on_progress:
                         # 主模型这一路虽然终止，任务并没有结束——必须显式广播切换，
                         # 否则前端刚看到"已放弃"下一秒又见转圈，读起来像卡死
@@ -1564,23 +1577,28 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                             _generate_image_edit(fallback_config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
                             model = _image_edit_model(fallback_config)
                     except Exception as fb_err:
+                        # 取消信号必须原样穿透，不能被兜底重试逻辑吞掉/改判成"兜底模型
+                        # 也失败"——那样任务会被终态化成 failed 而不是 cancelled。
+                        if isinstance(fb_err, GenerationCancelled):
+                            raise
                         # 兜底模型也失败：宁可整帧明确失败等用户重试（断点续传保住已完成帧），
                         # 也不静默丢掉参考图改文生图重画——那会产出真正断链的帧（构图跳变
                         # 的根源），且下游视频门禁会把它拦成只能重生的堵点
-                        if sys.stdout:
-                            print(f"[FRAME SEQUENCE] Fallback model failed on frame {seq}: {fb_err}.")
+                        log('ERROR', 'FRAME_SEQ', f"第 {seq} 帧兜底模型也失败: {fb_err}", fallback=fallback_model)
                         raise RuntimeError(f"第 {seq} 帧生成失败（主模型配额耗尽，兜底模型 {fallback_model} 也失败）: {fb_err}")
                 else:
                     raise quota_err
             except Exception as gen_err:
+                # 同上：取消信号必须原样穿透，不能被"首帧重试一次 / 包装成 RuntimeError"
+                # 的逻辑吞掉——否则用户点了取消，这里却把它当成一次普通生成失败去重试。
+                if isinstance(gen_err, GenerationCancelled):
+                    raise
                 if use_text_generation:
                     retries += 1
-                    if sys.stdout:
-                        print(f"[FRAME SEQUENCE] First frame generation failed: {gen_err}. Retrying text-to-image.")
+                    log('WARN', 'FRAME_SEQ', f"首帧生成失败，重试文生图: {gen_err}")
                     _generate_text_image(config, item['prompt'], target_path)
                 else:
-                    if sys.stdout:
-                        print(f"[FRAME SEQUENCE] Frame {seq} image-to-image generation failed: {gen_err}. Subsequent frames cannot fall back to text-to-image.")
+                    log('ERROR', 'FRAME_SEQ', f"第 {seq} 帧图生图失败（后续帧无法回退成文生图）: {gen_err}")
                     raise RuntimeError(f"第 {seq} 帧图生图失败: {gen_err}")
 
             # Apply LAB color matching to prevent pink drift
@@ -1631,6 +1649,11 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                         if os.path.exists(first_frame_path):
                             _match_color_lab(target_path, first_frame_path, target_path)
                     except Exception as push_err:
+                        # 取消信号必须原样穿透，不能被"留痕后继续"吞掉——否则用户点了
+                        # 取消，这个门框清除的加推步骤却把它当成一次普通失败吸收掉，
+                        # 循环会继续渲下一帧，取消形同没生效。
+                        if isinstance(push_err, GenerationCancelled):
+                            raise
                         # 再推失败：保留当前帧（已通过正常生成路径），留痕后继续
                         vlm_qa_reason = dc_reason
                         if sys.stdout:

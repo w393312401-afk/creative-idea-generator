@@ -668,7 +668,10 @@
         gap: 16px;
         height: auto;
     }
-    .glass-panel {
+    /* :not(.modal-content) — 弹窗（settings-modal 等）也复用 .glass-panel 做视觉样式，
+       但它的限高+内部滚动必须在所有宽度下都生效，不能被这条"窄屏下让左右主面板
+       撑到内容高度"的规则连带清空，否则窄屏/中等宽度下弹窗关闭按钮会被顶出视口。 */
+    .glass-panel:not(.modal-content) {
         height: auto;
         max-height: none;
     }

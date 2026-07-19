@@ -1053,22 +1053,42 @@ function setupEventListeners() {
     const cancelFramesBtn = document.getElementById('cancel-frames-btn');
     if (cancelFramesBtn) {
         cancelFramesBtn.addEventListener('click', () => {
+            // 光 abort() 前端的 SSE 读取只是让浏览器不再看这个任务的进度——后端
+            // worker 线程完全不知道、会继续把整条上游重试退避链跑完（卡在限流
+            // 重试里可以是分钟级）。必须先把取消请求发到服务端让它真正停下来。
+            const taskId = activeBackgroundTasks.framesTaskId;
+            if (taskId) {
+                fetch('/api/compose-cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ task_id: taskId })
+                }).catch(e => console.error("Failed to cancel frames task on server:", e));
+            }
             if (currentFramesController) {
                 currentFramesController.abort();
                 currentFramesController = null;
-                showToast("已取消帧序列生成", "info");
             }
+            showToast(taskId ? "已发送取消请求，帧序列生成即将停止" : "已取消帧序列生成", "info");
         });
     }
 
     const cancelVideosBtn = document.getElementById('cancel-videos-btn');
     if (cancelVideosBtn) {
         cancelVideosBtn.addEventListener('click', () => {
+            // 见 cancel-frames-btn 的同款说明。
+            const taskId = activeBackgroundTasks.videosTaskId;
+            if (taskId) {
+                fetch('/api/compose-cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ task_id: taskId })
+                }).catch(e => console.error("Failed to cancel videos task on server:", e));
+            }
             if (currentVideosController) {
                 currentVideosController.abort();
                 currentVideosController = null;
-                showToast("已取消视频序列生成", "info");
             }
+            showToast(taskId ? "已发送取消请求，视频序列生成即将停止" : "已取消视频序列生成", "info");
         });
     }
 
@@ -2202,6 +2222,22 @@ function framesFeedQualityLine(f) {
     }
 }
 
+// 帧序列直播面板（进度条/#frames-live-feed/网格）是页面里唯一一套全局 DOM，
+// 不是按创意分开的。切到别的创意、或任务结束后，必须按"这套 DOM 现在到底该
+// 显示谁"重新裁决一次可见性——同一逻辑在 renderIdea() 切换创意、以及本函数
+// 任务收尾时都要用，所以抽成独立函数（收敛口径，避免两处各写一套判断出现分歧）。
+function syncFramesPanelToCurrentIdea() {
+    const progress = document.getElementById('frames-progress');
+    const feed = document.getElementById('frames-live-feed');
+    const btn = document.getElementById('generate-frames-btn');
+    const runningHere = !!(activeBackgroundTasks.frames && activeBackgroundTasks.framesOwner === currentIdea);
+    if (progress) progress.style.display = runningHere ? 'flex' : 'none';
+    if (feed && !runningHere) feed.style.display = 'none';
+    // 按钮禁用跟随"是否有帧序列任务在跑"这个全局事实，与归属哪个创意无关——
+    // 全局只允许一路帧序列任务在跑，禁用是为了不让用户在此期间又发起一路。
+    if (btn) btn.disabled = !!activeBackgroundTasks.frames;
+}
+
 async function streamFramesProgress(taskId) {
     const btn = document.getElementById('generate-frames-btn');
     const progress = document.getElementById('frames-progress');
@@ -2217,11 +2253,21 @@ async function streamFramesProgress(taskId) {
     const controller = new AbortController();
     currentFramesController = controller;
 
+    // 这次任务实际归属的创意（在 generateFrames / 断线重连恢复路径里设置）。
+    // 事件回调里一律靠 isDisplayed() 判断"现在还能不能往 DOM 上画"，数据写入
+    // （帧结果、进度状态）则一律认 owningIdea，不认可能已经变了的全局 currentIdea。
+    const owningIdea = activeBackgroundTasks.framesOwner || currentIdea;
+    const isDisplayed = () => currentIdea === owningIdea;
+
     btn.disabled = true;
-    progress.style.display = 'flex';
-    meta.textContent = '连接帧生成事件流...';
+    if (isDisplayed()) {
+        progress.style.display = 'flex';
+        meta.textContent = '连接帧生成事件流...';
+        framesFeedReset('🔌 已连接帧生成事件流，等待后台开始…');
+    }
 
     activeBackgroundTasks.frames = true;
+    activeBackgroundTasks.framesOwner = owningIdea;
     updateTabStatusDot();
 
     let frameProgressState = window.ProgressModel ? ProgressModel.createProgressState('frames') : null;
@@ -2229,11 +2275,10 @@ async function streamFramesProgress(taskId) {
         if (!window.ProgressModel) return null;
         const info = ProgressModel.normalizeGenerationProgress(type, data, 'frames', frameProgressState);
         frameProgressState = info.state;
-        setProgressBar('frames', info);
+        if (isDisplayed()) setProgressBar('frames', info);
         return info;
     };
     applyFramesProgress('queue', { message: '连接帧生成事件流...' });
-    framesFeedReset('🔌 已连接帧生成事件流，等待后台开始…');
 
     try {
         const watch = await watchTaskUntilTerminal(taskId, {
@@ -2241,50 +2286,54 @@ async function streamFramesProgress(taskId) {
             signal: controller.signal,
             onEvent: (type, data) => {
                 if (!isCurrent()) return;
+                const displayed = isDisplayed();
                 if (type === 'start') {
                     applyFramesProgress('start', data);
                     const total = (data && data.total) || 0;
-                    meta.textContent = `开始生成共 ${total} 帧序列图...`;
-                    framesFeedLine(`🚀 开始生成，共 ${total} 帧（首帧文生图，后续逐帧图生图链式推进）`);
 
-                    if (currentIdea) {
-                        if (!currentIdea.frameRun) {
-                            currentIdea.frameRun = { title: currentIdea.title, frames: [] };
-                        }
-                        currentIdea.frameRun.frames = [];
-                        saveCurrentIdeaState();
-                        const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
-                        if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = currentIdea.frameRun;
+                    if (!owningIdea.frameRun) {
+                        owningIdea.frameRun = { title: owningIdea.title, frames: [] };
                     }
+                    owningIdea.frameRun.frames = [];
+                    if (displayed) saveCurrentIdeaState();
+                    const existingIdx = savedIdeas.findIndex(item => item.id === owningIdea.id);
+                    if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = owningIdea.frameRun;
 
-                    grid.innerHTML = '';
-                    for (let i = 1; i <= total; i++) {
-                        const placeholderCard = document.createElement('div');
-                        placeholderCard.className = 'frame-card placeholder-frame-card';
-                        placeholderCard.id = `frame-slot-${i}`;
-                        placeholderCard.innerHTML = `
-                            <div class="frame-placeholder-spinner">
-                                <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-                            </div>
-                            <span>第 ${String(i).padStart(3, '0')} 帧 (等待中)</span>
-                        `;
-                        grid.appendChild(placeholderCard);
+                    if (displayed) {
+                        meta.textContent = `开始生成共 ${total} 帧序列图...`;
+                        framesFeedLine(`🚀 开始生成，共 ${total} 帧（首帧文生图，后续逐帧图生图链式推进）`);
+                        grid.innerHTML = '';
+                        for (let i = 1; i <= total; i++) {
+                            const placeholderCard = document.createElement('div');
+                            placeholderCard.className = 'frame-card placeholder-frame-card';
+                            placeholderCard.id = `frame-slot-${i}`;
+                            placeholderCard.innerHTML = `
+                                <div class="frame-placeholder-spinner">
+                                    <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
+                                </div>
+                                <span>第 ${String(i).padStart(3, '0')} 帧 (等待中)</span>
+                            `;
+                            grid.appendChild(placeholderCard);
+                        }
                     }
                 } else if (type === 'frame') {
                     applyFramesProgress('frame', data);
                     const f = data && data.frame;
-                    const cur = (data && data.current) || 0;
-                    const tot = (data && data.total) || 0;
-                    if (cur < tot) {
-                        meta.textContent = `正在生成帧序列: ${cur}/${tot} (正在处理第 ${cur + 1} 帧)...`;
-                    } else {
-                        meta.textContent = `正在生成帧序列: ${cur}/${tot} (已生成完毕，正在整理)...`;
+                    applyFrameEventToIdea(f, owningIdea);
+                    if (displayed) {
+                        const cur = (data && data.current) || 0;
+                        const tot = (data && data.total) || 0;
+                        if (cur < tot) {
+                            meta.textContent = `正在生成帧序列: ${cur}/${tot} (正在处理第 ${cur + 1} 帧)...`;
+                        } else {
+                            meta.textContent = `正在生成帧序列: ${cur}/${tot} (已生成完毕，正在整理)...`;
+                        }
+                        framesFeedQualityLine(f);
+                        updateFrameSlotCard(f);
                     }
-                    framesFeedQualityLine(f);
-                    updateFrameSlotCard(f);
-                    applyFrameEventToIdea(f);
                 } else if (type === 'frame_start' || type === 'frame_retry' || type === 'queue' || type === 'frame_qa') {
                     const info = applyFramesProgress(type, data);
+                    if (!displayed) return;
                     if (info && info.label) meta.textContent = info.label;
                     if (type === 'frame_retry') {
                         const reason = data && data.reason ? `：${data.reason}` : '';
@@ -2296,6 +2345,7 @@ async function streamFramesProgress(taskId) {
                         framesFeedLine(`🧪 IMG ${String(seq || 0).padStart(3, '0')} 质检判定中…`);
                     }
                 } else if (type === 'upstream_retry') {
+                    if (!displayed) return;
                     // 上游秒报错秒可见：后端每次尝试失败即时推送，不再闷头退避
                     const a = (data && data.attempt) || '?';
                     const m = (data && data.max_attempts) || '?';
@@ -2305,45 +2355,54 @@ async function streamFramesProgress(taskId) {
                     framesFeedLine(`⚠️ 上游报错：${(data && data.error) || '未知错误'}${tail}`, 'warn');
                     meta.textContent = `上游报错，自动重试中（第 ${a}/${m} 次）...`;
                 } else if (type === 'model_fallback') {
+                    if (!displayed) return;
                     const to = (data && data.to) || '兜底模型';
                     const seqNo = data && (data.sequence || data.slot);
                     framesFeedLine(`🔀 主模型配额耗尽，切换兜底模型 ${to} 继续渲染 IMG ${String(seqNo || 0).padStart(3, '0')}…`, 'warn');
                     meta.textContent = `主模型配额耗尽，兜底模型 ${to} 渲染中...`;
                 } else if (type === 'review_pause') {
-                    // 监修模式：关键点暂停，弹出审阅面板等待 采用/重渲
+                    // 监修模式：关键点暂停，弹出审阅面板等待 采用/重渲。不在当前
+                    // 展示的创意上不弹面板——那样会打断用户正在看的另一个创意；
+                    // 服务端有超时自动采用兜底，不会因此卡死任务。
+                    if (!displayed) return;
                     showFrameReviewPanel(taskId, data);
                     meta.textContent = (data && data.message) || '监修暂停，等待人工确认...';
                     framesFeedLine(`⏸️ ${(data && data.message) || '监修暂停，等待人工确认…'}`, 'warn');
                 } else if (type === 'review_resume') {
+                    if (!displayed) return;
                     hideFrameReviewPanel();
                     framesFeedLine(`▶️ ${(data && data.message) || '监修继续'}`);
                 } else if (type === 'chain_drift_check' || type === 'anchor_recalibrated' || type === 'reanchor') {
+                    if (!displayed) return;
                     // 检查点现实同步/链回望/重锚定：动态流留痕
                     if (data && data.message) {
                         framesFeedLine(`${type === 'reanchor' ? '⚓' : '🔭'} ${data.message}`,
                                        (type === 'reanchor' || (type === 'chain_drift_check' && data.passed === false)) ? 'warn' : undefined);
                     }
                 } else if (type === 'sequence_review') {
+                    if (!displayed) return;
                     meta.textContent = (data && data.message) || '正在对整套序列做一致性审查...';
                     framesFeedLine(`🔍 ${(data && data.message) || '正在对整套序列做一致性审查...'}`);
                 } else if (type === 'sequence_review_result') {
+                    if (!displayed) return;
                     if (data && data.message) {
                         framesFeedLine(`${data.passed ? '✅' : '🛠️'} ${data.message}`, data.passed ? 'ok' : 'warn');
                     } else if (data && data.passed) {
                         framesFeedLine('✅ 整套序列一致性审查通过', 'ok');
                     }
                 } else if (type === 'reconnecting') {
+                    if (!displayed) return;
                     meta.textContent = `连接中断，正在重连（第 ${data.attempt} 次）...`;
                     framesFeedLine(`⚠️ 连接中断，正在重连（第 ${data.attempt} 次）…`, 'warn');
                 } else if (type === 'result' || type === 'error') {
-                    hideFrameReviewPanel();
+                    if (displayed) hideFrameReviewPanel();
                     applyFramesProgress(type, data);
                 }
             }
         });
 
         if (!isCurrent()) return;
-        hideFrameReviewPanel();
+        if (isDisplayed()) hideFrameReviewPanel();
         if (currentFramesController === controller) currentFramesController = null;
         activeBackgroundTasks.framesTaskId = null;
         saveActiveBackgroundTasksToLocalStorage();
@@ -2356,40 +2415,56 @@ async function streamFramesProgress(taskId) {
         }
 
         if (watch.result) {
-            await syncFrameRunToLibrary(watch.result);
-            renderFramesForIdea(currentIdea);
-            framesFeedLine(`🏁 帧序列全部完成，共 ${(watch.result.frames || []).length} 帧`, 'ok');
-            showToast(`已成功生成 ${(watch.result.frames || []).length} 帧连续帧序列图。`, "success");
+            await syncFrameRunToLibrary(watch.result, owningIdea);
+            if (isDisplayed()) {
+                renderFramesForIdea(owningIdea);
+                framesFeedLine(`🏁 帧序列全部完成，共 ${(watch.result.frames || []).length} 帧`, 'ok');
+            }
+            showToast(`《${getIdeaSaveTitle(owningIdea)}》已成功生成 ${(watch.result.frames || []).length} 帧连续帧序列图。`, "success");
         }
     } catch (e) {
         if (!isCurrent()) return;
         if (currentFramesController === controller) currentFramesController = null;
         console.error("Failed to generate frames:", e);
         if (e.name === 'AbortError') {
-            meta.textContent = '帧序列生成已被用户取消。';
-            framesFeedLine('⏹ 帧序列生成已被用户取消', 'warn');
+            if (isDisplayed()) {
+                meta.textContent = '帧序列生成已被用户取消。';
+                framesFeedLine('⏹ 帧序列生成已被用户取消', 'warn');
+            }
             showToast('已取消帧序列生成', 'info');
         } else {
-            meta.textContent = `帧序列生成失败: ${e.message}`;
-            framesFeedLine(`❌ 帧序列生成失败：${e.message}`, 'err');
-            showToast(`帧序列生成失败: ${e.message}`, "error");
+            if (isDisplayed()) {
+                meta.textContent = `帧序列生成失败: ${e.message}`;
+                framesFeedLine(`❌ 帧序列生成失败：${e.message}`, 'err');
+            }
+            showToast(`《${getIdeaSaveTitle(owningIdea)}》帧序列生成失败: ${e.message}`, "error");
         }
 
         activeBackgroundTasks.framesTaskId = null;
         saveActiveBackgroundTasksToLocalStorage();
 
-        if (currentIdea) {
-            renderFramesForIdea(currentIdea);
+        if (isDisplayed()) {
+            renderFramesForIdea(owningIdea);
         }
     } finally {
         if (isCurrent()) {
-            progress.style.display = 'none';
-            btn.disabled = false;
             activeBackgroundTasks.frames = false;
+            activeBackgroundTasks.framesOwner = null;
+            syncFramesPanelToCurrentIdea();
             updateTabStatusDot();
             framesFeedSetLive(false);
         }
     }
+}
+
+// 见 syncFramesPanelToCurrentIdea 的说明：视频直播面板也是页面里唯一一套全局
+// DOM，切创意/任务收尾都要按"这套 DOM 现在到底该显示谁"重新裁决可见性。
+function syncVideosPanelToCurrentIdea() {
+    const progress = document.getElementById('videos-progress');
+    const btn = document.getElementById('generate-videos-btn');
+    const runningHere = !!(activeBackgroundTasks.videos && activeBackgroundTasks.videosOwner === currentIdea);
+    if (progress) progress.style.display = runningHere ? 'flex' : 'none';
+    if (btn) btn.disabled = !!activeBackgroundTasks.videos;
 }
 
 async function streamVideosProgress(taskId) {
@@ -2407,11 +2482,19 @@ async function streamVideosProgress(taskId) {
     const controller = new AbortController();
     currentVideosController = controller;
 
+    // 见 streamFramesProgress 里 owningIdea 的说明：数据写入认它，DOM 绘制只在
+    // 它仍是当前展示的创意时才做。
+    const owningIdea = activeBackgroundTasks.videosOwner || currentIdea;
+    const isDisplayed = () => currentIdea === owningIdea;
+
     btn.disabled = true;
-    progress.style.display = 'flex';
-    meta.textContent = '连接视频生成事件流...';
+    if (isDisplayed()) {
+        progress.style.display = 'flex';
+        meta.textContent = '连接视频生成事件流...';
+    }
 
     activeBackgroundTasks.videos = true;
+    activeBackgroundTasks.videosOwner = owningIdea;
     updateTabStatusDot();
 
     let videoProgressState = window.ProgressModel ? ProgressModel.createProgressState('videos') : null;
@@ -2419,7 +2502,7 @@ async function streamVideosProgress(taskId) {
         if (!window.ProgressModel) return null;
         const progressInfo = ProgressModel.normalizeGenerationProgress(eventType, eventData, 'videos', videoProgressState);
         videoProgressState = progressInfo.state;
-        setProgressBar('videos', progressInfo);
+        if (isDisplayed()) setProgressBar('videos', progressInfo);
         return progressInfo;
     };
     applyVideoProgress('queue', { message: '连接视频生成事件流...' });
@@ -2438,6 +2521,11 @@ async function streamVideosProgress(taskId) {
             signal: controller.signal,
             onEvent: (type, data) => {
                 if (!isCurrent()) return;
+                if (!isDisplayed()) {
+                    // 仍需推进进度状态机（切回来那一刻百分比才准），只是不画 DOM。
+                    if (type !== 'reconnecting') applyVideoProgress(type === 'video_skipped' ? 'video_done' : type, data);
+                    return;
+                }
                 if (type === 'start') {
                     applyVideoProgress('start', data);
                     const total = (data && data.total) || 0;
@@ -2512,9 +2600,9 @@ async function streamVideosProgress(taskId) {
         }
 
         if (watch.result) {
-            await syncFrameRunToLibrary(watch.result);
-            renderVideosForIdea(currentIdea);
-            showToast(`已成功生成 ${(watch.result.videos || []).length} 段连续视频。`, "success");
+            await syncFrameRunToLibrary(watch.result, owningIdea);
+            if (isDisplayed()) renderVideosForIdea(owningIdea);
+            showToast(`《${getIdeaSaveTitle(owningIdea)}》已成功生成 ${(watch.result.videos || []).length} 段连续视频。`, "success");
         }
     } catch (e) {
         if (!isCurrent()) return;
@@ -2525,25 +2613,40 @@ async function streamVideosProgress(taskId) {
         saveActiveBackgroundTasksToLocalStorage();
 
         if (e.name === 'AbortError') {
-            meta.textContent = '视频生成已被用户取消。';
+            if (isDisplayed()) {
+                meta.textContent = '视频生成已被用户取消。';
+                failPendingSlots('已被用户取消', '未生成');
+            }
             showToast('已取消视频生成', 'info');
-            failPendingSlots('已被用户取消', '未生成');
         } else {
-            meta.textContent = `视频生成失败: ${e.message}`;
-            showToast(`视频生成失败: ${e.message}`, "error");
-            failPendingSlots(e.message || '生成失败', '生成失败');
+            if (isDisplayed()) {
+                meta.textContent = `视频生成失败: ${e.message}`;
+                failPendingSlots(e.message || '生成失败', '生成失败');
+            }
+            showToast(`《${getIdeaSaveTitle(owningIdea)}》视频生成失败: ${e.message}`, "error");
 
-            await reloadManifestIntoIdea();
-            if (currentIdea && currentIdea.frameRun) renderVideosForIdea(currentIdea);
+            await reloadManifestIntoIdea(owningIdea);
+            if (isDisplayed() && owningIdea.frameRun) renderVideosForIdea(owningIdea);
         }
     } finally {
         if (isCurrent()) {
-            progress.style.display = 'none';
-            btn.disabled = false;
             activeBackgroundTasks.videos = false;
+            activeBackgroundTasks.videosOwner = null;
+            syncVideosPanelToCurrentIdea();
             updateTabStatusDot();
         }
     }
+}
+
+// 见 syncFramesPanelToCurrentIdea 的说明：封面 loading 遮罩/按钮同理，只是
+// placeholder/display 两态由 renderCoversForIdea（在 renderIdea 里）负责，这里
+// 只管 loading 遮罩本身要不要盖住它们。
+function syncCoverPanelToCurrentIdea() {
+    const loadingEl = document.getElementById('cover-img-loading');
+    const makeBtn = document.getElementById('make-cover-btn');
+    const runningHere = !!(activeBackgroundTasks.cover && activeBackgroundTasks.coverOwner === currentIdea);
+    if (loadingEl) loadingEl.style.display = runningHere ? 'flex' : 'none';
+    if (makeBtn) makeBtn.disabled = !!activeBackgroundTasks.cover;
 }
 
 async function streamCoverProgress(taskId) {
@@ -2553,12 +2656,19 @@ async function streamCoverProgress(taskId) {
     const makeBtn = document.getElementById('make-cover-btn');
     if (!loadingEl || !placeholderEl || !displayEl || !makeBtn) return;
 
-    loadingEl.style.display = 'flex';
-    placeholderEl.style.display = 'none';
-    displayEl.style.display = 'none';
+    // 见 streamFramesProgress 里 owningIdea 的说明。
+    const owningIdea = activeBackgroundTasks.coverOwner || currentIdea;
+    const isDisplayed = () => currentIdea === owningIdea;
+
     makeBtn.disabled = true;
+    if (isDisplayed()) {
+        loadingEl.style.display = 'flex';
+        placeholderEl.style.display = 'none';
+        displayEl.style.display = 'none';
+    }
 
     activeBackgroundTasks.cover = true;
+    activeBackgroundTasks.coverOwner = owningIdea;
     updateTabStatusDot();
 
     const epoch = ++streamEpochs.cover;
@@ -2586,58 +2696,62 @@ async function streamCoverProgress(taskId) {
             throw new Error("无法从模型响应中解析出有效的封面图片 URL");
         }
 
-        if (!currentIdea.covers) {
-            currentIdea.covers = [];
+        if (!owningIdea.covers) {
+            owningIdea.covers = [];
         }
-        currentIdea.covers.push(imageUrl);
+        owningIdea.covers.push(imageUrl);
         if (englishTitle) {
-            currentIdea.english_title = englishTitle;
+            owningIdea.english_title = englishTitle;
         }
         // 旧创意补齐发布用双语标题行（后端只在缺字段时才生成并随结果返回）
-        if (data.social_title_en && !currentIdea.social_title_en) {
-            currentIdea.social_title_en = data.social_title_en;
+        if (data.social_title_en && !owningIdea.social_title_en) {
+            owningIdea.social_title_en = data.social_title_en;
         }
-        if (data.social_title_cn && !currentIdea.social_title_cn) {
-            currentIdea.social_title_cn = data.social_title_cn;
+        if (data.social_title_cn && !owningIdea.social_title_cn) {
+            owningIdea.social_title_cn = data.social_title_cn;
         }
-        saveCurrentIdeaState();
-        renderIdeaTitles(currentIdea);
+        if (isDisplayed()) {
+            saveCurrentIdeaState();
+            renderIdeaTitles(owningIdea);
+        }
 
-        const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
+        const existingIdx = savedIdeas.findIndex(item => item.id === owningIdea.id);
         if (existingIdx !== -1) {
-            savedIdeas[existingIdx].covers = currentIdea.covers;
+            savedIdeas[existingIdx].covers = owningIdea.covers;
             if (englishTitle) {
                 savedIdeas[existingIdx].english_title = englishTitle;
             }
-            if (currentIdea.social_title_en) {
-                savedIdeas[existingIdx].social_title_en = currentIdea.social_title_en;
+            if (owningIdea.social_title_en) {
+                savedIdeas[existingIdx].social_title_en = owningIdea.social_title_en;
             }
-            if (currentIdea.social_title_cn) {
-                savedIdeas[existingIdx].social_title_cn = currentIdea.social_title_cn;
+            if (owningIdea.social_title_cn) {
+                savedIdeas[existingIdx].social_title_cn = owningIdea.social_title_cn;
             }
             await saveLibrary();
         }
 
-        renderCoversForIdea(currentIdea, currentIdea.covers.length - 1);
-        showToast("封面图制作成功！", "success");
+        if (isDisplayed()) renderCoversForIdea(owningIdea, owningIdea.covers.length - 1);
+        showToast(`《${getIdeaSaveTitle(owningIdea)}》封面图制作成功！`, "success");
     } catch (e) {
         if (!isCurrent()) return;
         console.error("Failed to generate cover:", e);
-        showToast(`封面制作失败: ${e.message}`, "error");
+        showToast(`《${getIdeaSaveTitle(owningIdea)}》封面制作失败: ${e.message}`, "error");
 
         activeBackgroundTasks.coverTaskId = null;
         saveActiveBackgroundTasksToLocalStorage();
 
-        if (currentIdea && currentIdea.covers && currentIdea.covers.length > 0) {
-            renderCoversForIdea(currentIdea, currentIdea.covers.length - 1);
-        } else {
-            placeholderEl.style.display = 'flex';
+        if (isDisplayed()) {
+            if (owningIdea.covers && owningIdea.covers.length > 0) {
+                renderCoversForIdea(owningIdea, owningIdea.covers.length - 1);
+            } else {
+                placeholderEl.style.display = 'flex';
+            }
         }
     } finally {
         if (isCurrent()) {
-            loadingEl.style.display = 'none';
-            makeBtn.disabled = false;
             activeBackgroundTasks.cover = false;
+            activeBackgroundTasks.coverOwner = null;
+            syncCoverPanelToCurrentIdea();
             updateTabStatusDot();
         }
     }
@@ -2994,7 +3108,12 @@ async function generateFrames() {
     progress.style.display = 'flex';
     meta.textContent = '准备生成帧序列...';
 
+    // 记住这次生成实际归属的创意，而不是隐式依赖全局 currentIdea——生成过程中
+    // 用户随时可能切换到另一个创意，事件流后续必须仍然认这个引用（见 state.js
+    // 里 activeBackgroundTasks.*Owner 的说明）。
+    const owningIdea = currentIdea;
     activeBackgroundTasks.frames = true;
+    activeBackgroundTasks.framesOwner = owningIdea;
     updateTabStatusDot();
 
     try {
@@ -3003,8 +3122,8 @@ async function generateFrames() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: getIdeaSaveTitle(currentIdea),
-                prompt_block: currentIdea.prompt_block
+                title: getIdeaSaveTitle(owningIdea),
+                prompt_block: owningIdea.prompt_block
             })
         });
 
@@ -3015,25 +3134,25 @@ async function generateFrames() {
 
         const data = await response.json();
         const taskId = data.task_id;
-        
+
         activeBackgroundTasks.framesTaskId = taskId;
         saveActiveBackgroundTasksToLocalStorage();
 
         await streamFramesProgress(taskId);
     } catch (e) {
         console.error("Failed to generate frames:", e);
-        meta.textContent = `帧序列生成失败: ${e.message}`;
-        showToast(`帧序列生成失败: ${e.message}`, "error");
+        if (owningIdea === currentIdea) meta.textContent = `帧序列生成失败: ${e.message}`;
+        showToast(`《${getIdeaSaveTitle(owningIdea)}》帧序列生成失败: ${e.message}`, "error");
 
         activeBackgroundTasks.framesTaskId = null;
+        activeBackgroundTasks.frames = false;
+        activeBackgroundTasks.framesOwner = null;
         saveActiveBackgroundTasksToLocalStorage();
 
-        if (currentIdea) {
-            renderFramesForIdea(currentIdea);
+        if (owningIdea === currentIdea) {
+            renderFramesForIdea(owningIdea);
         }
-        progress.style.display = 'none';
-        btn.disabled = false;
-        activeBackgroundTasks.frames = false;
+        syncFramesPanelToCurrentIdea();
         updateTabStatusDot();
     }
 }
@@ -3076,7 +3195,9 @@ async function generateVideos() {
     progress.style.display = 'flex';
     meta.textContent = '准备生成视频序列...';
 
+    const owningIdea = currentIdea;
     activeBackgroundTasks.videos = true;
+    activeBackgroundTasks.videosOwner = owningIdea;
     updateTabStatusDot();
 
     try {
@@ -3085,8 +3206,8 @@ async function generateVideos() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: getIdeaSaveTitle(currentIdea),
-                prompt_block: currentIdea.prompt_block
+                title: getIdeaSaveTitle(owningIdea),
+                prompt_block: owningIdea.prompt_block
             })
         });
 
@@ -3097,43 +3218,45 @@ async function generateVideos() {
 
         const data = await response.json();
         const taskId = data.task_id;
-        
+
         activeBackgroundTasks.videosTaskId = taskId;
         saveActiveBackgroundTasksToLocalStorage();
 
         await streamVideosProgress(taskId);
     } catch (e) {
         console.error("Failed to generate videos:", e);
-        meta.textContent = `视频生成失败: ${e.message}`;
-        showToast(`视频生成失败: ${e.message}`, "error");
+        showToast(`《${getIdeaSaveTitle(owningIdea)}》视频生成失败: ${e.message}`, "error");
 
         activeBackgroundTasks.videosTaskId = null;
+        activeBackgroundTasks.videos = false;
+        activeBackgroundTasks.videosOwner = null;
         saveActiveBackgroundTasksToLocalStorage();
 
-        const placeholders = grid.querySelectorAll('.placeholder-frame-card');
-        placeholders.forEach(card => {
-            const slotMatch = card.id && card.id.match(/video-slot-(\d+)/);
-            const slotIdx = slotMatch ? parseInt(slotMatch[1]) : null;
-            if (slotIdx !== null) {
-                card.className = 'frame-card video-failed-card';
-                card.innerHTML = `
-                    <div class="video-failed-placeholder">
-                        <span class="error-icon">⚠️</span>
-                        <span class="error-text" title="${e.message || '生成失败'}">生成失败</span>
-                        <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${slotIdx}">重试</button>
-                    </div>
-                    <span>VID ${String(slotIdx).padStart(3, '0')}</span>
-                `;
-                card.querySelector('.retry-video-btn').addEventListener('click', (ev) => {
-                    ev.stopPropagation();
-                    retrySingleVideo(slotIdx);
-                });
-            }
-        });
+        if (owningIdea === currentIdea) {
+            meta.textContent = `视频生成失败: ${e.message}`;
+            const placeholders = grid.querySelectorAll('.placeholder-frame-card');
+            placeholders.forEach(card => {
+                const slotMatch = card.id && card.id.match(/video-slot-(\d+)/);
+                const slotIdx = slotMatch ? parseInt(slotMatch[1]) : null;
+                if (slotIdx !== null) {
+                    card.className = 'frame-card video-failed-card';
+                    card.innerHTML = `
+                        <div class="video-failed-placeholder">
+                            <span class="error-icon">⚠️</span>
+                            <span class="error-text" title="${e.message || '生成失败'}">生成失败</span>
+                            <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${slotIdx}">重试</button>
+                        </div>
+                        <span>VID ${String(slotIdx).padStart(3, '0')}</span>
+                    `;
+                    card.querySelector('.retry-video-btn').addEventListener('click', (ev) => {
+                        ev.stopPropagation();
+                        retrySingleVideo(slotIdx);
+                    });
+                }
+            });
+        }
 
-        progress.style.display = 'none';
-        btn.disabled = false;
-        activeBackgroundTasks.videos = false;
+        syncVideosPanelToCurrentIdea();
         updateTabStatusDot();
     }
 }
@@ -3279,49 +3402,53 @@ async function generateCover() {
     placeholderEl.style.display = 'none';
     displayEl.style.display = 'none';
     makeBtn.disabled = true;
-    
+
+    const owningIdea = currentIdea;
     activeBackgroundTasks.cover = true;
+    activeBackgroundTasks.coverOwner = owningIdea;
     updateTabStatusDot();
-    
+
     try {
         const response = await fetch('/api/generate_cover', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                id: currentIdea.id,
-                title: currentIdea.title,
-                theme: currentIdea.theme,
-                prompt_block: currentIdea.prompt_block
+                id: owningIdea.id,
+                title: owningIdea.title,
+                theme: owningIdea.theme,
+                prompt_block: owningIdea.prompt_block
             })
         });
-        
+
         const data = await response.json();
         if (!response.ok || data.error) {
             throw new Error(data.error || `HTTP ${response.status}`);
         }
-        
+
         const taskId = data.task_id;
         activeBackgroundTasks.coverTaskId = taskId;
         saveActiveBackgroundTasksToLocalStorage();
-        
+
         await streamCoverProgress(taskId);
     } catch (e) {
         console.error("Failed to generate cover:", e);
-        showToast(`封面制作失败: ${e.message}`, "error");
-        
+        showToast(`《${getIdeaSaveTitle(owningIdea)}》封面制作失败: ${e.message}`, "error");
+
         activeBackgroundTasks.coverTaskId = null;
+        activeBackgroundTasks.cover = false;
+        activeBackgroundTasks.coverOwner = null;
         saveActiveBackgroundTasksToLocalStorage();
 
         // Restore state based on whether we already have covers
-        if (currentIdea.covers && currentIdea.covers.length > 0) {
-            renderCoversForIdea(currentIdea, currentIdea.covers.length - 1);
-        } else {
-            placeholderEl.style.display = 'flex';
+        if (owningIdea === currentIdea) {
+            if (owningIdea.covers && owningIdea.covers.length > 0) {
+                renderCoversForIdea(owningIdea, owningIdea.covers.length - 1);
+            } else {
+                placeholderEl.style.display = 'flex';
+            }
         }
-        loadingEl.style.display = 'none';
-        makeBtn.disabled = false;
-        activeBackgroundTasks.cover = false;
+        syncCoverPanelToCurrentIdea();
         updateTabStatusDot();
     }
 }

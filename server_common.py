@@ -25,6 +25,16 @@ class RotatingFileStream:
         self.encoding = encoding
         self.lock = threading.Lock()
         self.file = None
+        # print(x) 对同一条语句会拆成两次独立的 write() 调用（消息一次，末尾的
+        # "\n" 再一次；多参数还会更多次）——每次 write() 各自加锁，但两次之间
+        # 没有互斥。服务端多线程（每个任务一个 worker、每个 HTTP 请求也各自
+        # 一个线程）并发打印时，一个线程的消息体和它自己的换行符之间，另一个
+        # 线程的完整输出可能插进来，落到磁盘上变成两条日志绞在一起的一整段
+        # 乱码——这正是"报错是一串乱字符"的根因，不是编码问题。
+        # 修法：按线程 id 缓冲，凑够一个完整行（遇到 "\n"）才真正落盘，保证
+        # "调用方的一条 print() = 磁盘上一段连续、不被别的线程插队的字节"。
+        self._line_buffers = {}
+        self._line_buffers_lock = threading.Lock()
         self._open()
 
     def _open(self):
@@ -34,20 +44,37 @@ class RotatingFileStream:
             self.file = None
 
     def write(self, data):
+        if not isinstance(data, str) or not data:
+            return 0
+        ident = threading.get_ident()
+        with self._line_buffers_lock:
+            buf = self._line_buffers.get(ident, '') + data
+            if '\n' not in buf:
+                self._line_buffers[ident] = buf
+                return len(data)
+            *complete_lines, remainder = buf.split('\n')
+            if remainder:
+                self._line_buffers[ident] = remainder
+            else:
+                self._line_buffers.pop(ident, None)
+        for line in complete_lines:
+            self._write_line(line + '\n')
+        return len(data)
+
+    def _write_line(self, line):
         with self.lock:
             if not self.file:
-                return 0
+                return
             try:
                 # Calculate if we need to rotate
-                encoded_len = len(data.encode(self.encoding, errors='ignore'))
+                encoded_len = len(line.encode(self.encoding, errors='ignore'))
                 if os.path.exists(self.filepath) and os.path.getsize(self.filepath) + encoded_len > self.max_bytes:
                     self._rotate()
                 if self.file:
-                    self.file.write(data)
+                    self.file.write(line)
                     self.file.flush()
             except Exception:
                 pass
-            return len(data)
 
     def flush(self):
         with self.lock:
@@ -151,6 +178,58 @@ DEBUG_MODE = bool(SERVER_CONFIG.get('debug') or os.environ.get('SPARK_DEBUG'))
 
 sys.stdout = _Tee(sys.stdout, _rotating_log) if (sys.stdout or _rotating_log.file) else DummyWriter()
 sys.stderr = _Tee(sys.stderr, _rotating_log) if (sys.stderr or _rotating_log.file) else DummyWriter()
+
+
+# --- Unified structured logging --------------------------------------------
+# 排查问题此前得在 server.log（裸 print，无时间戳，所有任务的输出混在一起）
+# 和某个任务自己的 SSE 事件流之间来回对照才能拼出时间线。log() 给每行补上
+# 一致的 时间戳/级别/子系统标签/任务 id，前端日志面板据此可以按级别/任务过滤
+# （见 initLocalServiceLogs）。仍然只是 print()，照常经过上面的 _Tee 落盘到
+# server.log + 控制台，不引入新的输出通道；没迁移到这里的旧 print() 不受影响，
+# 可以逐步迁移，不必一次性改完。
+_LOG_CONTEXT = threading.local()
+
+LOG_LEVELS = ('DEBUG', 'INFO', 'WARN', 'ERROR')
+
+
+def set_log_context(task_id):
+    """注册（传 None=清除）当前线程正在处理的任务 id。log() 据此自动打
+    [task=xxx] 标签——worker 线程入口调一次（与 set_upstream_event_sink /
+    set_cancel_check_sink 同一注册点），内部所有 log() 调用不用逐层传参。"""
+    _LOG_CONTEXT.task_id = task_id
+
+
+def log(level, tag, msg, task_id=None, **fields):
+    """结构化输出一行日志：HH:MM:SS.mmm [LEVEL] [tag] [task=xxx] message k=v ...
+    DEBUG 级别在非 DEBUG_MODE 下直接跳过（不落盘也不进控制台，与旧版
+    _Tee 对裸 "[DEBUG]" 前缀的过滤是同一个开关）。
+
+    task_id 通常不用传——worker 线程用 set_log_context 注册一次，这里自动
+    读线程局部值；只有跨线程记一次性事件（例如 HTTP 请求线程收到取消请求，
+    要记的是"哪个任务"而不是"当前线程属于哪个任务"）才需要显式传它，
+    这样仍能落进同一个 [task=xxx] 标签格式，前端按任务过滤时不用认两种写法。"""
+    level = level.upper()
+    if level == 'DEBUG' and not DEBUG_MODE:
+        return
+    ts = time.strftime('%H:%M:%S') + f".{int((time.time() % 1) * 1000):03d}"
+    tid = task_id or getattr(_LOG_CONTEXT, 'task_id', None)
+    head = f"{ts} [{level:<5}] [{tag}]"
+    if tid:
+        head += f" [task={tid}]"
+    extra = (' ' + ' '.join(f'{k}={v}' for k, v in fields.items())) if fields else ''
+    print(f"{head} {msg}{extra}")
+
+
+def log_exception(tag, prefix='', task_id=None):
+    """记录当前异常的完整堆栈——但只在 DEBUG_MODE 下才真正落盘/进控制台。
+    调用点通常已经在 except 块里打了一条 ERROR 级别的一行摘要（"XX 任务失败: {e}"），
+    这里补的是"要深挖根因时才需要"的完整 traceback：平时日志只看到那一行摘要，
+    不会被裸 traceback.print_exc() 糊得满屏都是看不出主线；开 DEBUG_MODE 后
+    这行会带上和其它日志一致的 时间戳/级别/task 标签，而不是一段无标签的裸文本。"""
+    import traceback
+    tb = traceback.format_exc()
+    log('DEBUG', tag, f"{prefix}\n{tb}".strip(), task_id=task_id)
+
 
 SERVER_MANAGED = bool(SERVER_CONFIG.get('apiKey'))
 ALLOW_CLIENT_MODEL = SERVER_CONFIG.get('allowClientModel', True) is not False
@@ -259,6 +338,23 @@ def ensure_adspower_on_path():
     return p
 
 
+def apply_google_fx_runtime_overrides(config):
+    """把 SPARK 配置里的 Google FX / AdsPower 运行时可调项映射为环境变量覆盖。
+
+    AdsPower 侧（config.py 的 runtime_env_or_default）每次调用都重新读取
+    os.environ，所以这里设置后同进程内后续的 FX 调用立即生效，无需重启——
+    与已有的 googleFxIpRotateRequests → MIYA_ROTATE_THRESHOLD 是同一套机制。
+    浏览器编号（AdsPower profile 的 user_id）留空时不覆盖，沿用 AdsPower
+    侧 .env 里的 ADSPOWER_DEFAULT_USER_ID 默认值。
+    """
+    rotate_requests = config.get('googleFxIpRotateRequests')
+    if rotate_requests is not None:
+        os.environ['MIYA_ROTATE_THRESHOLD'] = str(rotate_requests)
+    browser_user_id = str(config.get('googleFxUserId') or '').strip()
+    if browser_user_id:
+        os.environ['ADSPOWER_DEFAULT_USER_ID'] = browser_user_id
+
+
 def effective_config(client_config):
     client_config = client_config or {}
     if not SERVER_MANAGED:
@@ -287,7 +383,7 @@ def effective_config(client_config):
         for k in ('cheapModel', 'auxModel'):
             if client_config.get(k):
                 merged[k] = client_config[k]
-    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'googleFxIpRotateRequests', 'qaGateLevel', 'realityCheckpointInterval', 'supervisedMode', 'reviewTimeoutSeconds', 'ideationTrendUrls', 'ideationSearchQuery'):
+    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'videoDuration', 'googleFxIpRotateRequests', 'googleFxUserId', 'qaGateLevel', 'realityCheckpointInterval', 'supervisedMode', 'reviewTimeoutSeconds', 'ideationTrendUrls', 'ideationSearchQuery'):
         if client_config.get(k):
             merged[k] = client_config[k]
     for k in ('geminiDirectApiKey', 'geminiApiKey', 'geminiDirectImageModel'):

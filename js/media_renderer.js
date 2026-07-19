@@ -115,6 +115,16 @@ function renderIdea(result) {
     // Render covers
     renderCoversForIdea(result);
 
+    // 切换到（或初次载入）这个创意后，立刻按它是否是某个后台生成任务（帧序列/
+    // 视频/封面）的归属对象，重新裁决直播面板的可见性——否则一路后台任务生成
+    // 期间反复切换创意时，进度条/直播日志会停留在离开时的状态，显示着跟眼前
+    // 这个创意毫无关系的内容（即"实时生成动态日志都共用"）。见 app.js 里
+    // syncFramesPanelToCurrentIdea / syncVideosPanelToCurrentIdea /
+    // syncCoverPanelToCurrentIdea 的说明。
+    if (typeof syncFramesPanelToCurrentIdea === 'function') syncFramesPanelToCurrentIdea();
+    if (typeof syncVideosPanelToCurrentIdea === 'function') syncVideosPanelToCurrentIdea();
+    if (typeof syncCoverPanelToCurrentIdea === 'function') syncCoverPanelToCurrentIdea();
+
     // Asynchronously fetch latest manifest (frames & videos) from server if it exists
     fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(result))}`)
         .then(resp => {
@@ -125,19 +135,25 @@ function renderIdea(result) {
         })
         .then(manifest => {
             result.frameRun = manifest;
-            saveCurrentIdeaState();
+            // result 可能在这次请求还没返回时就已经被切走了（用户快速换了创意）；
+            // 全局 currentIdea 快照/网格只能属于眼前这一个，不能被旧请求的结果覆盖。
+            if (result === currentIdea) saveCurrentIdeaState();
             const existingIdx = savedIdeas.findIndex(item => item.id === result.id);
             if (existingIdx !== -1) {
                 savedIdeas[existingIdx].frameRun = manifest;
                 saveLibrary();
             }
-            renderFramesForIdea(result);
-            renderVideosForIdea(result);
+            if (result === currentIdea) {
+                renderFramesForIdea(result);
+                renderVideosForIdea(result);
+            }
         })
         .catch(e => {
             // If not found or error, render using whatever is in result
-            renderFramesForIdea(result);
-            renderVideosForIdea(result);
+            if (result === currentIdea) {
+                renderFramesForIdea(result);
+                renderVideosForIdea(result);
+            }
         });
 }
 

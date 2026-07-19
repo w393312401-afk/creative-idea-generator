@@ -1347,6 +1347,11 @@ html[data-theme="dark"] .segment-btn.active {
 .modal-content {
     width: 100%;
     max-width: 480px;
+    /* 内容项越加越多，固定内容高度会把弹窗撑出视口——modal-header 的关闭按钮
+       跟着被推到屏幕外、点不到也关不掉窗口。改为限高 + modal-body 内部滚动，
+       header/footer（含关闭按钮/保存按钮）用 flex-shrink:0 钉在可见区域内。 */
+    max-height: 90vh;
+    max-height: 90dvh;
     box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
 }
 
@@ -1360,6 +1365,7 @@ html[data-theme="dark"] .segment-btn.active {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    flex-shrink: 0;
 }
 
 .modal-header h3 {
@@ -1373,6 +1379,8 @@ html[data-theme="dark"] .segment-btn.active {
     display: flex;
     flex-direction: column;
     gap: 18px;
+    overflow-y: auto;
+    min-height: 0;
 }
 
 .form-group {
@@ -1455,6 +1463,7 @@ select option {
     display: flex;
     justify-content: flex-end;
     gap: 12px;
+    flex-shrink: 0;
 }
 
 /* Toast System */

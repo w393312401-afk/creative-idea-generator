@@ -33,6 +33,8 @@
 
 *   **停止服务**：双击运行 [stop.bat](file:///c:/Users/video/Desktop/creative-idea-generator/stop.bat)（一次清掉 8085 与所有残留 8086 监听进程）。
 
+*   **macOS**：双击 [run.command](run.command)（不要双击 `run.sh`——Finder 对 `.sh` 后缀默认关联文本编辑器而不是终端，双击只会打开编辑器；`run.command` 是转调 `run.sh` 的薄封装，同一套启动/停止/重启交互菜单）。也可以在终端里直接 `./run.sh` 运行。
+
 *   📌 **端口永久固定（2026-07-04）**：服务入口只有一个 —— **`http://127.0.0.1:8085/`**。
     *   图像服务站已完全并入创意工坊单页应用（顶部「🎨 图像工坊」标签页），不再是独立路由/独立目录，`run.bat` 也不再拉起任何 8086 子服务。
     *   LLM 代理固定 `8046`（`server_config.json` 的 `baseUrl` 为准）；`gpt-5.5` 由服务端 `resolve_gateway` 固定路由到 codex 代理，前端无需也无法再切换端口（设置面板的「GPT 代理端口」选择器已移除）。

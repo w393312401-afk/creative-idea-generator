@@ -336,10 +336,19 @@ function loadConfig() {
     const fxVideoModelSelect = document.getElementById('settings-fx-video-model');
     if (fxVideoModelSelect) {
         fxVideoModelSelect.value = config.videoModel || 'Veo 3.1 - Lite [Lower Priority]';
+        fxVideoModelSelect.onchange = updateFxVideoDurationVisibility;
+    }
+    const fxVideoDurationSelect = document.getElementById('settings-fx-video-duration');
+    if (fxVideoDurationSelect) {
+        fxVideoDurationSelect.value = config.videoDuration || '';
     }
     const fxIpRotateRequestsInput = document.getElementById('settings-fx-ip-rotate-requests');
     if (fxIpRotateRequestsInput) {
         fxIpRotateRequestsInput.value = config.googleFxIpRotateRequests !== undefined ? config.googleFxIpRotateRequests : 5;
+    }
+    const fxBrowserIdInput = document.getElementById('settings-fx-browser-id');
+    if (fxBrowserIdInput) {
+        fxBrowserIdInput.value = config.googleFxUserId || '';
     }
     const supervisedSelect = document.getElementById('settings-supervised-mode');
     if (supervisedSelect) {
@@ -354,6 +363,7 @@ function loadConfig() {
         searchQueryInput.value = config.ideationSearchQuery || '';
     }
     updateFxImageModelVisibility();
+    updateFxVideoDurationVisibility();
 
     // Load aspect ratio option
     const imageRatioSelect = document.getElementById('settings-image-ratio');
@@ -379,10 +389,25 @@ function updateFxImageModelVisibility() {
     const fxImageGroup = document.getElementById('fx-image-model-group');
     const fxVideoGroup = document.getElementById('fx-video-model-group');
     const fxIpGroup = document.getElementById('fx-ip-rotate-requests-group');
+    const fxBrowserIdGroup = document.getElementById('fx-browser-id-group');
     const showFx = backendSelect && backendSelect.value === 'google_fx';
     if (fxImageGroup) fxImageGroup.style.display = showFx ? 'block' : 'none';
     if (fxVideoGroup) fxVideoGroup.style.display = showFx ? 'block' : 'none';
     if (fxIpGroup) fxIpGroup.style.display = showFx ? 'block' : 'none';
+    if (fxBrowserIdGroup) fxBrowserIdGroup.style.display = showFx ? 'block' : 'none';
+    updateFxVideoDurationVisibility();
+}
+
+// Omni Flash 时长切换仅该模型面板提供（Veo 系列时长固定）：需同时满足
+// 「FX 后端已开启」与「当前选中的视频模型是 Omni Flash」两个条件才显示。
+function updateFxVideoDurationVisibility() {
+    const backendSelect = document.getElementById('settings-image-backend');
+    const fxVideoModelSelect = document.getElementById('settings-fx-video-model');
+    const durationGroup = document.getElementById('fx-video-duration-group');
+    if (!durationGroup) return;
+    const showFx = backendSelect && backendSelect.value === 'google_fx';
+    const isOmni = fxVideoModelSelect && fxVideoModelSelect.value === 'Omni Flash';
+    durationGroup.style.display = (showFx && isOmni) ? 'block' : 'none';
 }
 
 function saveConfig() {
@@ -400,10 +425,18 @@ function saveConfig() {
     if (fxVideoModelSelect) {
         config.videoModel = fxVideoModelSelect.value;
     }
+    const fxVideoDurationSelect = document.getElementById('settings-fx-video-duration');
+    if (fxVideoDurationSelect) {
+        config.videoDuration = fxVideoDurationSelect.value;
+    }
     const fxIpRotateRequestsInput = document.getElementById('settings-fx-ip-rotate-requests');
     if (fxIpRotateRequestsInput) {
         const val = parseInt(fxIpRotateRequestsInput.value.trim(), 10);
         config.googleFxIpRotateRequests = isNaN(val) ? 5 : val;
+    }
+    const fxBrowserIdInput = document.getElementById('settings-fx-browser-id');
+    if (fxBrowserIdInput) {
+        config.googleFxUserId = fxBrowserIdInput.value.trim();
     }
     const supervisedSelect = document.getElementById('settings-supervised-mode');
     if (supervisedSelect) {
@@ -446,9 +479,17 @@ function resetConfig() {
     if (fxVideoModelSelect) {
         fxVideoModelSelect.value = DEFAULT_CONFIG.videoModel;
     }
+    const fxVideoDurationSelect = document.getElementById('settings-fx-video-duration');
+    if (fxVideoDurationSelect) {
+        fxVideoDurationSelect.value = DEFAULT_CONFIG.videoDuration;
+    }
     const fxIpRotateRequestsInput = document.getElementById('settings-fx-ip-rotate-requests');
     if (fxIpRotateRequestsInput) {
         fxIpRotateRequestsInput.value = DEFAULT_CONFIG.googleFxIpRotateRequests;
+    }
+    const fxBrowserIdInput = document.getElementById('settings-fx-browser-id');
+    if (fxBrowserIdInput) {
+        fxBrowserIdInput.value = DEFAULT_CONFIG.googleFxUserId;
     }
     const supervisedSelect = document.getElementById('settings-supervised-mode');
     if (supervisedSelect) {
@@ -465,6 +506,7 @@ function resetConfig() {
     document.getElementById('settings-image-ratio').value = DEFAULT_CONFIG.imageAspectRatio;
     document.getElementById('settings-image-quality').value = DEFAULT_CONFIG.imageQuality;
     updateFxImageModelVisibility();
+    updateFxVideoDurationVisibility();
     syncFramesImageModelPicker();
     syncIdeationLlmPicker();
 }

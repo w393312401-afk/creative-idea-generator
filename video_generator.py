@@ -13,6 +13,7 @@ from server_common import (
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
     ACTIVE_TASKS_LOCK, ACTIVE_TASKS, get_or_create_task,
     notify_listeners, save_tasks_to_disk, ensure_adspower_on_path,
+    apply_google_fx_runtime_overrides,
     read_manifest, write_manifest, strict_gates_enabled, qa_gate_level
 )
 
@@ -466,9 +467,7 @@ class _BatchBridge:
 def generate_video_sequence(config, title, prompt_block, on_progress=None, target_slots=None):
     import builtins
     builtins.google_fx_cancelled = False
-    rotate_requests = config.get('googleFxIpRotateRequests')
-    if rotate_requests is not None:
-        os.environ['MIYA_ROTATE_THRESHOLD'] = str(rotate_requests)
+    apply_google_fx_runtime_overrides(config)
     from prompt_pipeline import _parse_prompt_slots
     images, videos = _parse_prompt_slots(prompt_block)
     project_dir = _get_project_dir(title)
@@ -502,6 +501,13 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
 
     google_fx_video, models = _get_google_fx_video_service()
     video_model = config.get('videoModel') or 'Veo 3.1 - Lite [Lower Priority]'
+    # 时长 tab（4s/6s/8s/10s）只有 Omni Flash 模型的 Flow 面板才提供；Veo 系列面板没有
+    # 这个 tab，误传会导致自动化脚本在那边找不到目标 tab、把 duration 判为未确认项而
+    # 直接拒绝生成（见 google_fx.py 的 _verify_and_fix_fx_config）。这里按模型收窄，
+    # 避免用户切换模型后配置面板里残留的旧时长值影响非 Omni 模型的生成。
+    video_duration = config.get('videoDuration') or None
+    if video_duration and str(video_model).strip().lower() != 'omni flash':
+        video_duration = None
     writer = _ManifestWriter(manifest_path, manifest_data, videos.keys())
 
     # 按计划分流：复用/拦截立即出结果，待生成的装配为批量请求
@@ -554,6 +560,7 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
             end_image=plan['end_frame'],
             model=video_model,
             ratio=config.get('imageAspectRatio') or '9:16',
+            duration=video_duration,
             output_path=temp_out_dir
         )
         pending_items.append({'plan': plan, 'req': req, 'temp_out_dir': temp_out_dir})
