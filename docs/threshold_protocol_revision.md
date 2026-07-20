@@ -249,3 +249,22 @@ hard_cut 切点两侧的帧**不得组成首尾帧对送 i2v**（否则视频模
 1. **B-3 摇镜的 i2v 质量**是本方案最大的模型能力赌注：i2v 对 90° pan 的表现未知，需 P2 前先用现有素材做一次小样验证；若不可用，pan 变体退化为"vestibule 帧直接作为 interior 定格帧 + 声明式 [CUT] 转向"（复用 P3 基建）。
 2. **t2i 新链头与外部帧的色调断差**（hard_cut）：Scene DNA 软约束能否稳住色温/胶片感，需实测；不稳则考虑以 IMAGE 1 做弱参考的 i2i（指令="同一世界的另一空间"）作为备选。
 3. 序列审查 checklist 增项会拉长审查轮次耗时，注意与现有修复轮上限的配额平衡。
+
+---
+
+## 11. TBCP v3 — 合并过门视频 + 首现脏乱差（2026-07-20）
+
+**触发**：用户实测反馈——①「进门镜头不再保留中间带门框的帧，直接完全进入到室内」；②「室内也是脏乱差的现象，而不是干净的现象」。根因定位：coaxial/pan 变体的过门本是两段（sill 停驻+door 可见 → cross 完全入内）各自独立成片，拼接处即"停在门口"的观感来源；室内首现的 anchor_rule 分支从未带衰败措辞（仅 hard_cut 变体有）。
+
+**方案（不改 bridge_stage 基数与结构校验，只改视频侧生成/装配）**：
+
+- **HOLD/SPAN 双拍语义不变，视频装配改单可见片段**：`bridge_stage=1`（HOLD）拍的 IMAGE 仍按原两跳 i2i 正常生成（保留门槛内部定格帧，作为 i2i 接续锚点，不丢弃这层空间落地保护），但其 VIDEO 槽确定性覆盖成丢弃占位声明（`BRIDGE_HOLD_VIDEO_PLACEHOLDER`），不生成不送 i2v。`bridge_stage=2`（SPAN，coaxial 里=interior 定格拍，pan 里=vestibule 拍）成为过门唯一可见片段，首帧锚点从"IMAGE i"（HOLD 产出的门槛帧）重定向到"IMAGE i-1"（HOLD 之前的室外锚点帧），正文要求把"接近门口→穿越→门框滑出画外→完全入内"一镜到底叙述完，不得在门口停顿。pan 的 Bridge-3 转向拍不受影响。
+- **meta 标签扩展**：`_build_partial_prompt_block` 的视频侧 meta 由统一 `"BRIDGE"` 拆成 `"BRIDGE HOLD"`（bridge_stage=1）/`"BRIDGE SPAN"`（bridge_stage=2）/`"BRIDGE TURN"`（bridge_stage=3，不变）；IMAGE 侧 meta 不变（仍统一 `"BRIDGE"`，因为 IMAGE 序列本身没有任何改动）。所有既有 `'BRIDGE' in meta` 消费点（`image_space_family`/`family_anchor_seq`/链回望/frame_generator 的 is_bridge 判定）天然兼容，无需改动。
+- **`video_generator.plan_video_slots` 新增 `skip_bridge_hold` 动作**：与既有 `skip_cut` 同款"预期缺失"语义，不生成、不算失败、合并门禁不计缺口。SPAN 槽位新增 `start_anchor_slot = slot - 1` 字段，贯穿 `_video_info`（写入 manifest）→ `merge_project_videos` 的锚点一致性核对（否则会把正确生成的合并片段误判成串片）→ `_merge_with_placeholders` 的强制合并占位帧解析。
+- **首现脏乱差（issue 2）**：`_beat_contract` 新增 `is_first_interior_reveal`（`family=='interior' and bridge_stage in (2,3)`，即 coaxial 的 SPAN 拍或 pan 的 TURN 拍——只命中过门后第一次揭示，不命中后续任何普通室内拍）；命中时在 anchor_rule 追加"UNTOUCHED TRAUMA STATE"条款，措辞对齐既有 IMAGE 1 的 GENUINE DAMAGE 审计（结构损坏/表面腐蚀/植被侵入/碎屑堆积，至少两类)。用户确认 pan 变体的 vestibule 落点帧（现为 SPAN 拍的定格尾帧）也追加一条更轻量的脏乱要求（至少一处可见腐朽迹象），避免转向前那一瞬间显得过于干净。hard_cut 变体本就有独立的衰败措辞（anchor_rule 的 is_cut 分支第4项），不重复处理。
+
+**范围**：coaxial 与 pan 两变体统一处理（两者的 HOLD 拍问题同构）；hard_cut 不受影响（从无门槛停驻帧，衰败措辞已存在）。
+
+**测试**：`tests/test_threshold_variants.py` 新增 `TestBeatContractBridgeFlags`（HOLD/SPAN/is_first_interior_reveal 标记 + 脏乱差条款存在性）、`TestVideoOpeningFirstFrameIndex`（`fix_video_opening`/`check_video_opening` 的 `first_frame_index` 覆盖 + HOLD 拍跳过视频侧全部校验）、`TestPlanVideoSlotsBridgeHold`（HOLD 跳过 + SPAN 锚点重定向 + 缺帧兜底）、`TestMergeGateBridgeHold`（`skipped_bridge_hold` 预期缺失语义）；`tests/test_prompt_fixes.py`/`tests/test_threshold_variants.py` 原有 meta 断言同步改为 `BRIDGE HOLD`/`BRIDGE SPAN`。全量 489 pytest 全绿。
+
+**Rollout 注意**：`packet_cache.json` 无需清理（未新增/改动 packet 字段）；`compose_checkpoints.json` 里若有 Threshold 项目的桥接拍已落在 `pass_beats_done`（部署时正在断点续传中），其存量正文仍是旧两段式叙述、首帧锚点句仍写着旧的 IMAGE 编号——这类存量断点条目建议清理，逼一次整单重新合成，避免装配阶段用新 meta 规则去配对旧正文产生锚点不匹配。已完成/已渲染项目的 manifest/prompt 永远是纯字面 `[BRIDGE]`，不会被新逻辑误触发，不受影响。改动全部在 `refactor/structure` 分支，未提交；需重启 :8085 生效。

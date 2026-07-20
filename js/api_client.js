@@ -9,9 +9,15 @@
  *  - 单行 JSON 解析失败只跳过该行，绝不杀死整个流；
  *  - 服务端 'error' 事件才是任务失败；连接断开本身不是；
  *  - 流断开且任务仍在运行时，按指数退避自动重连（成功连上即重置计数）；
- *  - 流结束但没读到终态事件时，用 /api/compose-status 仲裁真实状态。
+ *  - 流结束但没读到终态事件时，用 /api/compose-status 仲裁真实状态；
+ *  - 重连次数耗尽 ≠ 任务失败：这时后端的生成线程完全不知道客户端已经放弃——
+ *    它是独立线程，会继续跑到底（甚至跑完监修模式里本该等人工确认的后续
+ *    全部片段，全靠 600s 自动采用兜底，人工审阅形同虚设）。返回一个专门的
+ *    'disconnected' 状态，让调用方既不误报"生成失败"，也不清掉任务登记——
+ *    否则用户会看到卡片转圈很久后静默变回空占位，随后过一阵子刷新页面时
+ *    发现后续帧莫名其妙全部"自己"生成完了（2026-07-20 用户实测复现）。
  *
- * @returns {Promise<{status: 'completed'|'failed'|'cancelled', result?: any, error?: string}>}
+ * @returns {Promise<{status: 'completed'|'failed'|'cancelled'|'disconnected', result?: any, error?: string}>}
  *          AbortError（用户取消）原样抛出，由调用方处理。
  */
 async function watchTaskUntilTerminal(taskId, opts = {}) {
@@ -120,7 +126,7 @@ async function watchTaskUntilTerminal(taskId, opts = {}) {
 
         reconnects += 1;
         if (reconnects > maxReconnects) {
-            return { status: 'failed', error: '与服务的连接反复中断，已停止重连。任务可能仍在后台运行，稍后可在任务列表中查看。' };
+            return { status: 'disconnected', error: '与服务的连接反复中断，已停止重连。任务可能仍在后台继续运行，请稍后重新打开本创意或刷新页面查看结果。' };
         }
         const delay = Math.min(15000, 1000 * Math.pow(2, reconnects - 1));
         emit('reconnecting', { attempt: reconnects, delay });
@@ -211,54 +217,117 @@ function showFrameReviewPanel(taskId, data) {
     modal.style.display = 'flex';
 }
 
-/**
- * 把一个 'frame' 事件合并进目标创意（幂等：同序号覆盖）。
- * 注意：这里只写 localStorage 快照，不再每帧向服务端 POST 整个库
- * （旧行为在长任务里造成持续的大请求）；库同步集中在任务终态时进行。
- *
- * @param {object} f 帧数据
- * @param {object} [idea] 该事件流实际归属的创意对象；省略时退回 currentIdea——
- *        但生成过程中用户可能已经切换到另一个创意，这时必须显式传入生成发起
- *        时捕获的创意引用，否则数据会被写进当前正在浏览的、不相关的创意里。
- */
-function applyFrameEventToIdea(f, idea) {
-    const targetIdea = idea || currentIdea;
-    if (!f || !targetIdea) return;
-    if (!targetIdea.frameRun) targetIdea.frameRun = { title: targetIdea.title, frames: [] };
-    if (!targetIdea.frameRun.frames) targetIdea.frameRun.frames = [];
-    const idx = targetIdea.frameRun.frames.findIndex(item => item.sequence === f.sequence);
-    if (idx !== -1) {
-        targetIdea.frameRun.frames[idx] = f;
-    } else {
-        targetIdea.frameRun.frames.push(f);
-        targetIdea.frameRun.frames.sort((a, b) => a.sequence - b.sequence);
-    }
-    if (targetIdea === currentIdea) saveCurrentIdeaState();
-    const existingIdx = savedIdeas.findIndex(item => item.id === targetIdea.id);
-    if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = targetIdea.frameRun;
+/* ── 多创意后台任务登记表 ────────────────────────────────────────────
+   帧序列/视频/封面任务按「所属创意 id」登记进 ideaTasksById（js/state.js），
+   不再是全局单槽位。事件到达时数据合并/DOM 绘制都必须走这里，用「发起任务
+   时捕获的那个创意对象（ownerIdea）」，绝不能隐式落到可能已经切走的全局
+   currentIdea——那正是"多任务共用同一个实时生成动态"（串数据+串显示）的根因。 */
+
+function _ideaTaskSlot(ideaId) {
+    if (!ideaId) return null;
+    if (!ideaTasksById[ideaId]) ideaTasksById[ideaId] = { frames: null, videos: null, cover: null };
+    return ideaTasksById[ideaId];
 }
 
-/** 任务终态时把 manifest 同步进目标创意与创意库（含服务端持久化）。见 applyFrameEventToIdea 的 idea 参数说明。 */
-async function syncFrameRunToLibrary(manifestData, idea) {
-    const targetIdea = idea || currentIdea;
-    if (!targetIdea || !manifestData) return;
-    targetIdea.frameRun = manifestData;
-    if (targetIdea === currentIdea) saveCurrentIdeaState();
-    const existingIdx = savedIdeas.findIndex(item => item.id === targetIdea.id);
+function getIdeaTaskRecord(ideaId, type) {
+    const slot = ideaId && ideaTasksById[ideaId];
+    return (slot && slot[type]) || null;
+}
+
+function isIdeaTaskActive(ideaId, type) {
+    return !!getIdeaTaskRecord(ideaId, type);
+}
+
+function anyActiveTaskOfType(type) {
+    return Object.keys(ideaTasksById).some(id => ideaTasksById[id] && ideaTasksById[id][type]);
+}
+
+/** 登记一个新任务；record 里额外字段（feedLines/progressInfo 等）按需自行补充。 */
+function beginIdeaTask(ideaId, type, taskId, controller) {
+    const slot = _ideaTaskSlot(ideaId);
+    if (!slot) return null;
+    const record = { taskId, controller: controller || null, total: 0, meta: '', progressState: null, progressInfo: null, feedLines: [], live: true };
+    slot[type] = record;
+    saveActiveBackgroundTasksToLocalStorage();
+    if (typeof updateTabStatusDot === 'function') updateTabStatusDot();
+    return record;
+}
+
+function endIdeaTask(ideaId, type) {
+    const slot = ideaId && ideaTasksById[ideaId];
+    if (slot) {
+        slot[type] = null;
+        if (!slot.frames && !slot.videos && !slot.cover) delete ideaTasksById[ideaId];
+    }
+    saveActiveBackgroundTasksToLocalStorage();
+    if (typeof updateTabStatusDot === 'function') updateTabStatusDot();
+}
+
+/** 本次事件流的所属任务是否仍是该(idea,type)槽位里登记的那一个——用于取代旧的全局代际(epoch)守卫。 */
+function isIdeaTaskCurrent(ideaId, type, taskId) {
+    const rec = getIdeaTaskRecord(ideaId, type);
+    return !!rec && rec.taskId === taskId;
+}
+
+/** 用户当前是否正停留在该创意页面——只有这样才允许直接改 DOM，否则只更新数据+缓冲区。 */
+function isViewingIdea(ideaId) {
+    return !!(currentIdea && ideaId && currentIdea.id === ideaId);
+}
+
+/** 按 id 找回创意对象：优先 currentIdea（同对象引用），否则从创意库找。找不到说明该创意从未收藏且已被切走。 */
+function findIdeaObjectById(ideaId) {
+    if (!ideaId) return null;
+    if (currentIdea && currentIdea.id === ideaId) return currentIdea;
+    return savedIdeas.find(item => item.id === ideaId) || null;
+}
+
+/**
+ * 把一个 'frame' 事件合并进 ownerIdea（幂等：同序号覆盖）。
+ * 注意：这里只写 localStorage 快照，不再每帧向服务端 POST 整个库
+ * （旧行为在长任务里造成持续的大请求）；库同步集中在任务终态时进行。
+ */
+function applyFrameEventToIdea(f, ownerIdea) {
+    ownerIdea = ownerIdea || currentIdea;
+    if (!f || !ownerIdea) return;
+    // 一个 'frame' 事件 = 服务端刚把这帧写到磁盘（可能覆盖了同名旧文件）。
+    // 在数据合并的唯一入口统一递增缓存版本，主生成/单帧重试/断线恢复
+    // 之后的任何一次重渲都能拿到新图，而不是浏览器缓存里的旧帧。
+    bustImageCache(f.url || f.file);
+    if (!ownerIdea.frameRun) ownerIdea.frameRun = { title: ownerIdea.title, frames: [] };
+    if (!ownerIdea.frameRun.frames) ownerIdea.frameRun.frames = [];
+    const idx = ownerIdea.frameRun.frames.findIndex(item => item.sequence === f.sequence);
+    if (idx !== -1) {
+        ownerIdea.frameRun.frames[idx] = f;
+    } else {
+        ownerIdea.frameRun.frames.push(f);
+        ownerIdea.frameRun.frames.sort((a, b) => a.sequence - b.sequence);
+    }
+    if (currentIdea && currentIdea.id === ownerIdea.id) saveCurrentIdeaState();
+    const existingIdx = savedIdeas.findIndex(item => item.id === ownerIdea.id);
+    if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = ownerIdea.frameRun;
+}
+
+/** 任务终态时把 manifest 同步进 ownerIdea 与创意库（含服务端持久化）。 */
+async function syncFrameRunToLibrary(manifestData, ownerIdea) {
+    ownerIdea = ownerIdea || currentIdea;
+    if (!ownerIdea || !manifestData) return;
+    ownerIdea.frameRun = manifestData;
+    if (currentIdea && currentIdea.id === ownerIdea.id) saveCurrentIdeaState();
+    const existingIdx = savedIdeas.findIndex(item => item.id === ownerIdea.id);
     if (existingIdx !== -1) {
         savedIdeas[existingIdx].frameRun = manifestData;
         await saveLibrary();
     }
 }
 
-/** 失败后从服务端 manifest 恢复已完成的部分结果。见 applyFrameEventToIdea 的 idea 参数说明。 */
-async function reloadManifestIntoIdea(idea) {
-    const targetIdea = idea || currentIdea;
-    if (!targetIdea) return;
+/** 失败后从服务端 manifest 恢复已完成的部分结果。 */
+async function reloadManifestIntoIdea(ownerIdea) {
+    ownerIdea = ownerIdea || currentIdea;
+    if (!ownerIdea) return;
     try {
-        const resp = await fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(targetIdea))}`);
+        const resp = await fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(ownerIdea))}`);
         if (resp.ok) {
-            await syncFrameRunToLibrary(await resp.json(), targetIdea);
+            await syncFrameRunToLibrary(await resp.json(), ownerIdea);
         }
     } catch (err) {
         console.error('Failed to load partial manifest after failure:', err);
@@ -353,12 +422,17 @@ function stopTasksPolling() {
     }
 }
 
+/** 持久化"当前挂着哪些后台任务"，供刷新页面后重连。改为一份按创意 id 登记的列表
+ *（旧格式每种任务只有一个全局槽位，无法区分任务属于哪个创意）。 */
 function saveActiveBackgroundTasksToLocalStorage() {
-    localStorage.setItem('spark_active_background_tasks', JSON.stringify({
-        framesTaskId: activeBackgroundTasks.framesTaskId || null,
-        videosTaskId: activeBackgroundTasks.videosTaskId || null,
-        coverTaskId: activeBackgroundTasks.coverTaskId || null
-    }));
+    const tasks = [];
+    Object.keys(ideaTasksById).forEach(ideaId => {
+        const slot = ideaTasksById[ideaId];
+        ['frames', 'videos', 'cover'].forEach(type => {
+            if (slot[type]) tasks.push({ ideaId, type, taskId: slot[type].taskId });
+        });
+    });
+    localStorage.setItem('spark_active_background_tasks', JSON.stringify({ tasks }));
 }
 
 function resumeActiveBackgroundTasksIfExists() {
@@ -366,25 +440,27 @@ function resumeActiveBackgroundTasksIfExists() {
     if (!saved) return;
     try {
         const parsed = JSON.parse(saved);
-        // 刷新后重连：此时 currentIdea 是本标签页最后浏览的创意，只能假设它就是
-        // 任务的归属创意（这是 spark_active_task_* 这套 localStorage 快照本身的
-        // 局限，并非本次修复引入）——但仍需显式落到 *Owner 字段，后续事件的
-        // DOM 绘制/数据写入才有依据可循，不会退化回"总是写当前 currentIdea"。
-        if (parsed.framesTaskId) {
-            activeBackgroundTasks.framesTaskId = parsed.framesTaskId;
-            activeBackgroundTasks.framesOwner = currentIdea;
-            streamFramesProgress(parsed.framesTaskId);
+        let tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+        if (!Array.isArray(parsed.tasks)) {
+            // 兼容旧的单槽位格式（无 ideaId）：只能把它归给当时的 currentIdea，最好努力。
+            const legacyOwner = currentIdea && currentIdea.id;
+            if (legacyOwner) {
+                if (parsed.framesTaskId) tasks.push({ ideaId: legacyOwner, type: 'frames', taskId: parsed.framesTaskId });
+                if (parsed.videosTaskId) tasks.push({ ideaId: legacyOwner, type: 'videos', taskId: parsed.videosTaskId });
+                if (parsed.coverTaskId) tasks.push({ ideaId: legacyOwner, type: 'cover', taskId: parsed.coverTaskId });
+            }
         }
-        if (parsed.videosTaskId) {
-            activeBackgroundTasks.videosTaskId = parsed.videosTaskId;
-            activeBackgroundTasks.videosOwner = currentIdea;
-            streamVideosProgress(parsed.videosTaskId);
-        }
-        if (parsed.coverTaskId) {
-            activeBackgroundTasks.coverTaskId = parsed.coverTaskId;
-            activeBackgroundTasks.coverOwner = currentIdea;
-            streamCoverProgress(parsed.coverTaskId);
-        }
+        tasks.forEach(t => {
+            if (!t || !t.ideaId || !t.taskId) return;
+            const idea = findIdeaObjectById(t.ideaId);
+            if (!idea) {
+                console.warn('恢复后台任务失败：本地找不到所属创意', t);
+                return;
+            }
+            if (t.type === 'frames') streamFramesProgress(t.taskId, idea);
+            else if (t.type === 'videos') streamVideosProgress(t.taskId, idea);
+            else if (t.type === 'cover') streamCoverProgress(t.taskId, idea);
+        });
     } catch (e) {
         console.error("Failed to resume active background tasks:", e);
     }
@@ -750,9 +826,15 @@ function initLocalServiceLogs() {
     connectLogStream();
 }
 
+
 async function retrySingleFrame(seq) {
     if (!currentIdea || !currentIdea.prompt_block) {
         showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
+        showToast("该创意的帧序列已在生成/重试中，请稍候", "error");
         return;
     }
 
@@ -772,22 +854,24 @@ async function retrySingleFrame(seq) {
     progress.style.display = 'flex';
     meta.textContent = `正在重试生成第 ${seq} 帧...`;
 
-    // 单帧重试由用户点击当前正在看的那个创意的网格触发，天然归属于 currentIdea；
-    // 捕获一份引用，避免重试期间用户切走创意导致结果写错/画错地方（与主生成
-    // 流程 app.js streamFramesProgress 的 owningIdea 同一套道理）。
-    const owningIdea = currentIdea;
-    const isDisplayed = () => currentIdea === owningIdea;
-    activeBackgroundTasks.frames = true;
-    activeBackgroundTasks.framesOwner = owningIdea;
-    updateTabStatusDot();
+    const controller = new AbortController();
+    const rec = beginIdeaTask(ownerIdea.id, 'frames', null, controller);
+    // 只标记这一帧在范围内：renderFramesForIdea 靠这个字段决定哪些槽位该画
+    // "等待中"，不设置的话会误把其余所有未生成槽位也画成"等待中"。
+    rec.targetSequences = [seq];
 
     // 单帧重试同样在模块内的实时生成动态里直播（helpers 定义在后加载的 app.js，
-    // 本函数只在用户点击时运行，届时必已就绪；仍加 typeof 护栏防御加载序变动）
-    const feedLine = (text, cls) => { if (isDisplayed() && typeof framesFeedLine === 'function') framesFeedLine(text, cls); };
-    if (typeof framesFeedSetLive === 'function') framesFeedSetLive(true);
+    // 本函数只在用户点击时运行，届时必已就绪；仍加 typeof 护栏防御加载序变动）。
+    // framesFeedLine 内部自己判断是否仍停留在这个创意页面才画 DOM，未停留时只缓冲。
+    const feedLine = (text, cls) => { if (typeof framesFeedLine === 'function') framesFeedLine(ownerIdea.id, text, cls); };
+    if (typeof framesFeedSetLive === 'function') framesFeedSetLive(ownerIdea.id, true);
     feedLine(`🔁 重试渲染 IMG ${String(seq).padStart(3, '0')}…`);
 
-    const controller = new AbortController();
+    // 与服务器失联（非任务真的失败）时置真：后端渲染线程是独立线程，跟客户端
+    // 有没有人在看毫无关系，会一直跑到底。这种情况下绝不能在 finally 里
+    // endIdeaTask——那样这条任务在客户端就再也没人认领了，用户可能对同一帧
+    // 再点一次"生成"，跟后台那个还没死的线程并发写同一张图。
+    let disconnected = false;
 
     try {
         const response = await fetch('/api/generate_frames', {
@@ -795,8 +879,8 @@ async function retrySingleFrame(seq) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: owningIdea.title,
-                prompt_block: owningIdea.prompt_block,
+                title: ownerIdea.title,
+                prompt_block: ownerIdea.prompt_block,
                 target_sequences: [seq]
             }),
             signal: controller.signal
@@ -809,28 +893,17 @@ async function retrySingleFrame(seq) {
 
         const data = await response.json();
         const taskId = data.task_id;
-        // 主生成/单帧重试共用同一个「取消」按钮和 activeBackgroundTasks.frames*
-        // 记账：不在这里记录 taskId，取消按钮找不到要取消的任务 id，点了也没用。
-        activeBackgroundTasks.framesTaskId = taskId;
-        saveActiveBackgroundTasksToLocalStorage();
+        const rec = getIdeaTaskRecord(ownerIdea.id, 'frames');
+        if (rec) rec.taskId = taskId;
 
         const watch = await watchTaskUntilTerminal(taskId, {
             label: `retry-frame-${seq}`,
             signal: controller.signal,
             onEvent: (type, evData) => {
                 if (type === 'frame') {
-                    const f = evData && evData.frame;
-                    applyFrameEventToIdea(f, owningIdea);
-                    if (!isDisplayed()) return;
-                    if (typeof framesFeedQualityLine === 'function') framesFeedQualityLine(f);
-                    // 重试覆盖的是同一个文件名（img_00N.webp），必须强制刷新这张图的
-                    // 缓存版本号，否则浏览器可能继续展示重试前的裂图/旧图——与主生成
-                    // 流程（app.js streamFramesProgress）里 updateFrameSlotCard 同款处理
-                    if (f && typeof updateFrameSlotCard === 'function') {
-                        updateFrameSlotCard(f);
-                    } else {
-                        renderFramesForIdea(owningIdea);
-                    }
+                    if (typeof framesFeedQualityLine === 'function') framesFeedQualityLine(ownerIdea.id, evData && evData.frame, true);
+                    applyFrameEventToIdea(evData && evData.frame, ownerIdea);
+                    if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
                 } else if (type === 'frame_start') {
                     feedLine(`🎨 IMG ${String(seq).padStart(3, '0')} 渲染中…`);
                 } else if (type === 'frame_qa') {
@@ -848,47 +921,56 @@ async function retrySingleFrame(seq) {
                 } else if (type === 'model_fallback') {
                     const to = (evData && evData.to) || '兜底模型';
                     feedLine(`🔀 主模型配额耗尽，切换兜底模型 ${to} 继续渲染 IMG ${String(seq).padStart(3, '0')}…`, 'warn');
-                    if (isDisplayed()) meta.textContent = `主模型配额耗尽，兜底模型 ${to} 渲染中...`;
+                    if (isViewingIdea(ownerIdea.id)) meta.textContent = `主模型配额耗尽，兜底模型 ${to} 渲染中...`;
                 } else if (type === 'reconnecting') {
-                    if (isDisplayed()) meta.textContent = `连接中断，正在重连（第 ${evData.attempt} 次）...`;
+                    if (isViewingIdea(ownerIdea.id)) meta.textContent = `连接中断，正在重连（第 ${evData.attempt} 次）...`;
                     feedLine(`⚠️ 连接中断，正在重连（第 ${evData.attempt} 次）…`, 'warn');
                 }
             }
         });
 
+        if (watch.status === 'disconnected') {
+            disconnected = true;
+            feedLine(`⚠️ ${watch.error}`, 'warn');
+            showToast(`第 ${seq} 帧：${watch.error}`, "warning");
+            return;
+        }
         if (watch.status === 'failed') throw new Error(watch.error || '未知错误');
 
         if (watch.result) {
-            await syncFrameRunToLibrary(watch.result, owningIdea);
-            if (isDisplayed()) renderFramesForIdea(owningIdea);
-            showToast(`《${getIdeaSaveTitle(owningIdea)}》第 ${seq} 帧重试生成成功。`, "success");
+            await syncFrameRunToLibrary(watch.result, ownerIdea);
+            if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
+            showToast(`第 ${seq} 帧重试生成成功。`, "success");
         }
     } catch (e) {
         console.error(`Failed to retry frame ${seq}:`, e);
         feedLine(`❌ IMG ${String(seq).padStart(3, '0')} 重试失败：${e.message}`, 'err');
-        showToast(`《${getIdeaSaveTitle(owningIdea)}》第 ${seq} 帧重试失败: ${e.message}`, "error");
+        showToast(`第 ${seq} 帧重试失败: ${e.message}`, "error");
 
         // Restore state by reloading manifest or rendering whatever is local
-        await reloadManifestIntoIdea(owningIdea);
-        if (isDisplayed()) renderFramesForIdea(owningIdea);
+        await reloadManifestIntoIdea(ownerIdea);
+        if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
     } finally {
-        activeBackgroundTasks.frames = false;
-        activeBackgroundTasks.framesOwner = null;
-        activeBackgroundTasks.framesTaskId = null;
-        saveActiveBackgroundTasksToLocalStorage();
-        if (typeof syncFramesPanelToCurrentIdea === 'function') {
-            syncFramesPanelToCurrentIdea();
-        } else if (isDisplayed()) {
+        if (isViewingIdea(ownerIdea.id) && typeof framesFeedSetLive === 'function') framesFeedSetLive(ownerIdea.id, false);
+        // 失联分支保留任务登记（内存 ideaTasksById + localStorage）：下次刷新页面
+        // resumeActiveBackgroundTasksIfExists 才有机会重新接上这条任务的事件流。
+        if (!disconnected) {
+            endIdeaTask(ownerIdea.id, 'frames');
+        }
+        if (isViewingIdea(ownerIdea.id) && !disconnected) {
             progress.style.display = 'none';
         }
-        updateTabStatusDot();
-        if (typeof framesFeedSetLive === 'function') framesFeedSetLive(false);
     }
 }
 
 async function retrySingleVideo(slot) {
     if (!currentIdea || !currentIdea.prompt_block) {
         showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
+        showToast("该创意的视频序列已在生成/重试中，请稍候", "error");
         return;
     }
 
@@ -908,14 +990,11 @@ async function retrySingleVideo(slot) {
     progress.style.display = 'flex';
     meta.textContent = `正在重试生成第 ${slot} 段视频...`;
 
-    // 见 retrySingleFrame 里 owningIdea 的说明。
-    const owningIdea = currentIdea;
-    const isDisplayed = () => currentIdea === owningIdea;
-    activeBackgroundTasks.videos = true;
-    activeBackgroundTasks.videosOwner = owningIdea;
-    updateTabStatusDot();
-
     const controller = new AbortController();
+    beginIdeaTask(ownerIdea.id, 'videos', null, controller);
+    // 与服务器失联（非任务真的失败）：后端渲染线程不知道客户端已经放弃，会继续
+    // 跑到底——这种情况绝不能在 finally 里 endIdeaTask，否则没人能重新接上它。
+    let disconnected = false;
 
     try {
         const response = await fetch('/api/generate_videos', {
@@ -923,8 +1002,8 @@ async function retrySingleVideo(slot) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: owningIdea.title,
-                prompt_block: owningIdea.prompt_block,
+                title: ownerIdea.title,
+                prompt_block: ownerIdea.prompt_block,
                 target_slots: [slot]
             }),
             signal: controller.signal
@@ -937,15 +1016,14 @@ async function retrySingleVideo(slot) {
 
         const data = await response.json();
         const taskId = data.task_id;
-        // 见 retrySingleFrame 里的同款说明：取消按钮要靠这个字段找到任务 id。
-        activeBackgroundTasks.videosTaskId = taskId;
-        saveActiveBackgroundTasksToLocalStorage();
+        const rec = getIdeaTaskRecord(ownerIdea.id, 'videos');
+        if (rec) rec.taskId = taskId;
 
         const watch = await watchTaskUntilTerminal(taskId, {
             label: `retry-video-${slot}`,
             signal: controller.signal,
             onEvent: (type, evData) => {
-                if (!isDisplayed()) return;
+                if (!isViewingIdea(ownerIdea.id)) return;
                 if (type === 'video_start') {
                     meta.textContent = `正在生成视频: 正在处理第 ${evData.index} 段视频...`;
                 } else if (type === 'video_done') {
@@ -962,31 +1040,31 @@ async function retrySingleVideo(slot) {
             }
         });
 
+        if (watch.status === 'disconnected') {
+            disconnected = true;
+            if (isViewingIdea(ownerIdea.id)) meta.textContent = watch.error;
+            showToast(`视频第 ${slot} 段：${watch.error}`, "warning");
+            return;
+        }
         if (watch.status === 'failed') throw new Error(watch.error || '未知错误');
 
         if (watch.result) {
-            await syncFrameRunToLibrary(watch.result, owningIdea);
-            if (isDisplayed()) renderVideosForIdea(owningIdea);
-            showToast(`《${getIdeaSaveTitle(owningIdea)}》视频第 ${slot} 段重试成功。`, "success");
+            await syncFrameRunToLibrary(watch.result, ownerIdea);
+            if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
+            showToast(`视频第 ${slot} 段重试成功。`, "success");
         }
     } catch (e) {
         console.error("Failed to retry video:", e);
-        showToast(`《${getIdeaSaveTitle(owningIdea)}》视频第 ${slot} 段重试失败: ${e.message}`, "error");
-        if (isDisplayed()) {
+        if (isViewingIdea(ownerIdea.id)) {
             meta.textContent = `视频第 ${slot} 段重试失败: ${e.message}`;
             renderVideoSlotFailed(slot, e.message || '生成失败');
         }
+        showToast(`视频第 ${slot} 段重试失败: ${e.message}`, "error");
     } finally {
-        activeBackgroundTasks.videos = false;
-        activeBackgroundTasks.videosOwner = null;
-        activeBackgroundTasks.videosTaskId = null;
-        saveActiveBackgroundTasksToLocalStorage();
-        if (typeof syncVideosPanelToCurrentIdea === 'function') {
-            syncVideosPanelToCurrentIdea();
-        } else if (isDisplayed()) {
-            progress.style.display = 'none';
+        if (!disconnected) {
+            endIdeaTask(ownerIdea.id, 'videos');
+            if (isViewingIdea(ownerIdea.id)) progress.style.display = 'none';
         }
-        updateTabStatusDot();
     }
 }
 
@@ -999,6 +1077,11 @@ async function retryMissingVideos(slots) {
     }
     slots = (slots || []).map(Number).filter(s => Number.isFinite(s));
     if (!slots.length) return;
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
+        showToast("该创意的视频序列已在生成/重试中，请稍候", "error");
+        return;
+    }
 
     const progress = document.getElementById('videos-progress');
     const meta = document.getElementById('videos-meta');
@@ -1019,22 +1102,20 @@ async function retryMissingVideos(slots) {
 
     progress.style.display = 'flex';
     meta.textContent = `正在重试缺失的 ${slots.length} 段视频（槽位 ${slots.join(', ')}）...`;
-    // 见 retrySingleFrame 里 owningIdea 的说明。
-    const owningIdea = currentIdea;
-    const isDisplayed = () => currentIdea === owningIdea;
-    activeBackgroundTasks.videos = true;
-    activeBackgroundTasks.videosOwner = owningIdea;
-    updateTabStatusDot();
 
     const controller = new AbortController();
+    beginIdeaTask(ownerIdea.id, 'videos', null, controller);
+    // 与服务器失联（非任务真的失败）：后端渲染线程不知道客户端已经放弃，会继续
+    // 跑到底——这种情况绝不能在 finally 里 endIdeaTask，否则没人能重新接上它。
+    let disconnected = false;
     try {
         const response = await fetch('/api/generate_videos', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: owningIdea.title,
-                prompt_block: owningIdea.prompt_block,
+                title: ownerIdea.title,
+                prompt_block: ownerIdea.prompt_block,
                 target_slots: slots
             }),
             signal: controller.signal
@@ -1045,15 +1126,14 @@ async function retryMissingVideos(slots) {
         }
         const data = await response.json();
         const taskId = data.task_id;
-        // 见 retrySingleFrame 里的同款说明：取消按钮要靠这个字段找到任务 id。
-        activeBackgroundTasks.videosTaskId = taskId;
-        saveActiveBackgroundTasksToLocalStorage();
+        const rec = getIdeaTaskRecord(ownerIdea.id, 'videos');
+        if (rec) rec.taskId = taskId;
 
         const watch = await watchTaskUntilTerminal(taskId, {
             label: `retry-missing-videos`,
             signal: controller.signal,
             onEvent: (type, evData) => {
-                if (!isDisplayed()) return;
+                if (!isViewingIdea(ownerIdea.id)) return;
                 if (type === 'video_start') {
                     meta.textContent = `正在生成视频: 正在处理第 ${evData.index} 段视频...`;
                 } else if (type === 'video_done') {
@@ -1068,31 +1148,31 @@ async function retryMissingVideos(slots) {
             }
         });
 
+        if (watch.status === 'disconnected') {
+            disconnected = true;
+            if (isViewingIdea(ownerIdea.id)) meta.textContent = watch.error;
+            showToast(`重试缺失片段：${watch.error}`, "warning");
+            return;
+        }
         if (watch.status === 'failed') throw new Error(watch.error || '未知错误');
         if (watch.result) {
-            await syncFrameRunToLibrary(watch.result, owningIdea);
-            if (isDisplayed()) renderVideosForIdea(owningIdea);
+            await syncFrameRunToLibrary(watch.result, ownerIdea);
+            if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
         }
-        showToast(`《${getIdeaSaveTitle(owningIdea)}》缺失片段重试完成，正在尝试重新合并...`, "success");
-        // 自动再合并一次；若仍有缺口，mergeVideos 会再次给出重试/强制选项
-        if (isDisplayed() && typeof mergeVideos === 'function') {
+        showToast("缺失片段重试完成，正在尝试重新合并...", "success");
+        // 自动再合并一次；若仍有缺口，mergeVideos 会再次给出重试/强制选项（仅在仍停留于本创意时才有意义）
+        if (isViewingIdea(ownerIdea.id) && typeof mergeVideos === 'function') {
             await mergeVideos();
         }
     } catch (e) {
         console.error("Failed to retry missing videos:", e);
-        showToast(`《${getIdeaSaveTitle(owningIdea)}》重试缺失片段失败: ${e.message}`, "error");
-        if (isDisplayed()) meta.textContent = `重试缺失片段失败: ${e.message}`;
+        if (isViewingIdea(ownerIdea.id)) meta.textContent = `重试缺失片段失败: ${e.message}`;
+        showToast(`重试缺失片段失败: ${e.message}`, "error");
     } finally {
-        activeBackgroundTasks.videos = false;
-        activeBackgroundTasks.videosOwner = null;
-        activeBackgroundTasks.videosTaskId = null;
-        saveActiveBackgroundTasksToLocalStorage();
-        if (typeof syncVideosPanelToCurrentIdea === 'function') {
-            syncVideosPanelToCurrentIdea();
-        } else if (isDisplayed()) {
-            progress.style.display = 'none';
+        if (!disconnected) {
+            endIdeaTask(ownerIdea.id, 'videos');
+            if (isViewingIdea(ownerIdea.id)) progress.style.display = 'none';
         }
-        updateTabStatusDot();
     }
 }
 

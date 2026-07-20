@@ -22,9 +22,11 @@ from server_common import (
     SERVER_CONFIG, SERVER_MANAGED, resolve_gateway, effective_config,
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
     IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT, IMG2IMG_TURN_CONTROL_PROMPT,
+    IMG2IMG_MODEL_FALLBACK_STYLE_GUARD,
     IMAGE_TASKS, IMAGE_TASKS_LOCK, ensure_adspower_on_path,
     apply_google_fx_runtime_overrides,
-    read_manifest, write_manifest, GenerationCancelled, log
+    read_manifest, write_manifest, GenerationCancelled, log,
+    gpt_image_pixel_size
 )
 
 
@@ -342,7 +344,9 @@ def _quality_to_images_api(quality):
     return _image_quality_to_label(quality)
 
 
-def _image_size_to_api_size(aspect_ratio):
+def _image_size_to_api_size(aspect_ratio, model=None):
+    if model == 'gpt-image-2':
+        return gpt_image_pixel_size(aspect_ratio)
     return aspect_ratio or '9:16'
 
 
@@ -725,6 +729,10 @@ def _decode_or_download_image(data_item, target_path, config):
         import io
         try:
             img = Image.open(io.BytesIO(image_bytes))
+            # 网关对部分 t2i 模型（实测 gpt-image-2）无视 size/aspect_ratio 固定出
+            # ~1254x1254 方图，闭源改不了——落盘前按配置比例居中裁剪兜底，
+            # 否则方帧混进 9:16 链，i2v 配对/合成必然构图跳变。比例已一致时是 no-op。
+            img = _crop_to_aspect_ratio(img, config.get('imageAspectRatio') or '9:16')
             img.save(target_path, format='WEBP', quality=80)
         except Exception as e:
             print(f"Failed to convert image to WebP: {e}. Saving raw bytes instead.")
@@ -857,7 +865,7 @@ def _generate_text_image(config, prompt, target_path):
     payload = {
         'model': _image_generation_model(config),
         'prompt': clean_render_prompt,
-        'size': _image_size_to_api_size(config.get('imageAspectRatio')),
+        'size': _image_size_to_api_size(config.get('imageAspectRatio'), model),
         'quality': _quality_to_images_api(config.get('imageQuality')),
         'image_size': _image_quality_to_label(config.get('imageQuality')),
         'response_format': 'b64_json',
@@ -1342,6 +1350,21 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                         _match_color_lab(target_path, first_frame_path, target_path)
                 prev_ref = _fx_find_ref_for(frames_dir, s)
                 quality_gate, vlm_reason = _run_vlm_qa(s, item, is_bridge, prev_ref)
+                # P1 换族锚点惯性检测（FX 链路只留痕不自动重渲：本批后续帧已链在该帧
+                # 上，中途按 t2i 重渲会与同批链式产物脱节；API 路径有全自动 t2i 兜底）
+                if is_bridge and s > 1 and not vlm_reason:
+                    _stuck, _inertia_mad = detect_anchor_inertia(_webp_path(s), _webp_path(s - 1))
+                    if _stuck:
+                        vlm_reason = (f"anchor_inertia: 桥接帧与参考帧近乎相同"
+                                      f"（MAD={_inertia_mad:.2f}），i2i 惯性疑似未执行换族，"
+                                      f"建议人工重渲该帧及其后续族段")
+                        if sys.stdout:
+                            print(f"[ANCHOR INERTIA][FX] Frame {s} {vlm_reason}")
+                        if on_progress:
+                            on_progress('anchor_inertia', {
+                                'sequence': s, 'mad': round(_inertia_mad, 2),
+                                'message': f"⚠️ IMG {s:03d} 桥接帧疑似被 i2i 惯性卡死（MAD={_inertia_mad:.2f}），已留痕",
+                            })
                 # QA 重生会替换留档，重新定位当前帧的 fx_src
                 cur_ref = _fx_find_ref_for(frames_dir, s + 1)
                 if cur_ref:
@@ -1423,6 +1446,58 @@ def _match_color_lab(source_path, reference_path, output_path):
 # P0 门框清除兜底的最大额外推进次数：换族室内侧帧渲出后若门框仍在画面里，
 # 以该帧为参考用推进版控制指令"再往里推一步"，最多推这么多次。
 _DOOR_CLEARANCE_MAX_PUSHES = 2
+
+
+def _door_clearance_push_prompt(dc_reason, final_attempt=False):
+    """定向门框清除推进指令：把上一轮 VLM 判定的具体残留位置（dc_reason）写回
+    控制指令，而不是重复原样的 IMG2IMG_BRIDGE_CONTROL_PROMPT。根因是通用推进指令
+    对每一轮都下发同一句话，i2i 编辑模型给出同样保守的结果——2026-07-16 岩湖贝壳
+    单 img_005 连续两推、每次都换了措辞的失败原因，画面仍残留门框，印证"泛化推进"
+    对已经推不动的模型无效，必须把失败点明确点名让模型针对性纠正。"""
+    reason_text = dc_reason.split(':', 1)[-1].strip() if dc_reason else ''
+    prompt = (
+        IMG2IMG_BRIDGE_CONTROL_PROMPT +
+        "\n\nDOOR CLEARANCE CORRECTION (mandatory, overrides any timid edit): an automated visual "
+        "audit of the attached source image just found it still shows doorway/threshold remnants"
+        + (f" — specifically: {reason_text}." if reason_text else ".") +
+        " Push the camera decisively further past the threshold than the source image shows: "
+        "every door frame, door leaf, jamb, and threshold/sill edge named above must be pushed "
+        "completely out of frame this time. Do not repeat a small, partial, or timid advance — "
+        "interior walls, ceiling, and floor must fill the frame edge to edge with zero doorway "
+        "silhouette remaining anywhere in the shot."
+    )
+    if final_attempt:
+        prompt += (
+            " This is the last correction attempt budgeted for this frame: push further than "
+            "feels natural rather than risk leaving any sliver of the doorway visible."
+        )
+    return prompt
+
+# 换族/桥接锚点帧的 i2i 惯性判据（2026-07-15 盐湖贝壳单标定）：桥接帧与其参考帧的
+# 64px 灰度缩略 MAD——被参考惯性卡死渲成复制帧的 img_005/img_006 为 1.56/2.17，
+# 正常施工推进对最低 4.8，真实换族 47。i2i 参考惯性压过"进入新空间"文本指令时，
+# 提示词修辞救不了，只能丢参考按 t2i 新链头重渲（TBCP 硬切同款语义）。
+_ANCHOR_INERTIA_MAD = 3.0
+
+
+def detect_anchor_inertia(rendered_path, reference_path):
+    """桥接/换族帧渲后与参考帧比对：近乎相同 = i2i 惯性未执行换族。
+    返回 (stuck: bool, mad: float|None)；文件缺失/环境异常返回 (False, None) 不拦流程。"""
+    try:
+        if not (rendered_path and reference_path
+                and os.path.exists(rendered_path) and os.path.exists(reference_path)):
+            return False, None
+        from PIL import Image
+        import numpy as np
+
+        def _gray(p):
+            with Image.open(p) as im:
+                return np.asarray(im.convert('L').resize((64, 114)), dtype=np.float32)
+
+        mad = float(np.abs(_gray(rendered_path) - _gray(reference_path)).mean())
+        return mad < _ANCHOR_INERTIA_MAD, mad
+    except Exception:
+        return False, None
 
 
 def generate_frame_sequence(config, title, prompt_block, on_progress=None, target_sequences=None):
@@ -1517,6 +1592,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         model = ""
         retries = 0
         vlm_qa_reason = None
+        fallback_used = False
         # Only VIDEO slots carry [BRIDGE]/[BRIDGE TURN]/[CUT] tags per the delivery contract;
         # the incoming transition (VIDEO seq-1) is the real signal for IMAGE seq, not the
         # image's own tag.
@@ -1567,14 +1643,18 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                         on_progress('model_fallback', {'slot': item['index'], 'sequence': seq, 'to': fallback_model})
                     fallback_config = dict(config)
                     fallback_config['imageModel'] = fallback_model
+                    fallback_used = True
                     try:
                         if use_text_generation:
                             _generate_text_image(fallback_config, item['prompt'], target_path)
                             model = _image_generation_model(fallback_config)
                         else:
                             # 兜底模型仍走 /images/edits 且挂同一张参考帧：图生图链路不断，
-                            # 不算降级（真实使用的模型已随帧记入 manifest 的 model 字段）
-                            _generate_image_edit(fallback_config, item['prompt'], previous_path, target_path, control_prompt=ctrl_prompt)
+                            # 不算降级（真实使用的模型已随帧记入 manifest 的 model 字段）。
+                            # 但换模型意味着渲染这张图的模型认不出"自己刚渲出来的东西"，
+                            # 实测会把纪实做旧材质渲成干净 CGI 效果——追加风格强约束子句。
+                            _generate_image_edit(fallback_config, item['prompt'], previous_path, target_path,
+                                                 control_prompt=ctrl_prompt + IMG2IMG_MODEL_FALLBACK_STYLE_GUARD)
                             model = _image_edit_model(fallback_config)
                     except Exception as fb_err:
                         # 取消信号必须原样穿透，不能被兜底重试逻辑吞掉/改判成"兜底模型
@@ -1608,6 +1688,58 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     if sys.stdout:
                         print(f"[COLOR MATCH] Aligning frame {seq} color to baseline first frame.")
                     _match_color_lab(target_path, first_frame_path, target_path)
+
+            # P1 换族锚点惯性兜底（2026-07-15 盐湖贝壳单）：桥接帧由 i2i 生成时，
+            # 参考惯性可能压过"进入新空间"的文本指令，渲出上一帧的近似复制帧——
+            # 规划好的过门没执行，新空间在下一帧硬现身造成空间断裂。渲后与参考帧
+            # 本地比对，近乎相同 = 惯性卡死 → 丢参考按 t2i 新链头重渲一次（TBCP
+            # 硬切同款语义，一致性靠提示词里的场景 DNA 复述）；t2i 失败保留原帧留痕。
+            if not use_text_generation and is_bridge:
+                stuck, inertia_mad = detect_anchor_inertia(target_path, previous_path)
+                if stuck:
+                    if sys.stdout:
+                        print(f"[ANCHOR INERTIA] Frame {seq} 与参考帧近乎相同（MAD={inertia_mad:.2f} < "
+                              f"{_ANCHOR_INERTIA_MAD}），i2i 惯性未执行换族——改以 t2i 新链头重渲")
+                    if on_progress:
+                        on_progress('anchor_inertia', {
+                            'sequence': seq, 'mad': round(inertia_mad, 2),
+                            'message': (f"IMG {seq:03d} 桥接帧被 i2i 参考惯性卡死"
+                                        f"（与参考帧 MAD={inertia_mad:.2f}），正以 t2i 新链头重渲…"),
+                        })
+                    try:
+                        try:
+                            _generate_text_image(config, item['prompt'], target_path)
+                            model = _image_generation_model(config)
+                        except QuotaExhaustedError:
+                            # 2026-07-17 实锤：主模型配额耗尽时这条兜底直接放弃、保留复读帧
+                            # （下游必然空间断裂）——主渲染路径早就会切 fallback 模型，这里
+                            # 必须走同一套切换，而不是把配额错误当普通失败咽掉。
+                            inertia_fallback = (config.get('imageEditFallbackModel')
+                                                or config.get('fallbackImageModel'))
+                            if not inertia_fallback:
+                                raise
+                            if sys.stdout:
+                                print(f"[ANCHOR INERTIA] Frame {seq} t2i 主模型配额耗尽，"
+                                      f"切换兜底模型 {inertia_fallback} 重渲")
+                            if on_progress:
+                                on_progress('model_fallback', {'slot': item['index'],
+                                                               'sequence': seq,
+                                                               'to': inertia_fallback})
+                            fallback_config = dict(config)
+                            fallback_config['imageModel'] = inertia_fallback
+                            _generate_text_image(fallback_config, item['prompt'], target_path)
+                            model = _image_generation_model(fallback_config)
+                            fallback_used = True
+                        retries += 1
+                        reference = None  # 本帧已脱链成 t2i 新链头，如实记录
+                        first_frame_path = os.path.join(frames_dir, 'img_001.webp')
+                        if os.path.exists(first_frame_path):
+                            _match_color_lab(target_path, first_frame_path, target_path)
+                    except Exception as inertia_err:
+                        vlm_qa_reason = (f"anchor_inertia: 与参考帧近乎相同（MAD={inertia_mad:.2f}）"
+                                         f"且 t2i 兜底失败（{inertia_err}），保留 i2i 原帧待人工重试")
+                        if sys.stdout:
+                            print(f"[ANCHOR INERTIA] Frame {seq} t2i 兜底失败（{inertia_err}），保留原帧并留痕")
 
             # P0 门框清除兜底：换族桥接视频产出的室内侧帧（TBCP settle / vestibule 帧）
             # 由 i2i 保守编辑生成——sill 参考帧门框占满画面时，编辑模型经常只做保守
@@ -1643,7 +1775,8 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                             print(f"[DOOR CLEARANCE] Frame {seq} failed door clearance "
                                   f"({dc_reason}); pushing one more step past the threshold.")
                         _generate_image_edit(config, item['prompt'], push_ref, target_path,
-                                             control_prompt=IMG2IMG_BRIDGE_CONTROL_PROMPT)
+                                             control_prompt=_door_clearance_push_prompt(
+                                                 dc_reason, final_attempt=(_push == _DOOR_CLEARANCE_MAX_PUSHES - 1)))
                         retries += 1
                         first_frame_path = os.path.join(frames_dir, 'img_001.webp')
                         if os.path.exists(first_frame_path):
@@ -1678,6 +1811,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             
             current_quality_gate = existing_frame.get('quality_gate', 'pending_manual_review') if existing_frame else 'pending_manual_review'
             vlm_qa_reason = existing_frame.get('vlm_qa_reason') if existing_frame else None
+            fallback_used = bool(existing_frame.get('model_fallback')) if existing_frame else False
 
         rel_path = os.path.relpath(target_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
         
@@ -1685,7 +1819,9 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         if seq > 1:
             if skip_api_call and existing_frame and existing_frame.get('parent_hash'):
                 p_hash = existing_frame['parent_hash']
-            elif previous_path and os.path.exists(previous_path):
+            elif reference and previous_path and os.path.exists(previous_path):
+                # t2i 链头（首帧/硬切/惯性兜底重渲）reference=None：血统在此断开，
+                # 不记上一帧哈希——parent_hash 只描述真实的 i2i 派生关系
                 p_hash = _get_file_hash(previous_path)
 
         frame_info = {
@@ -1703,6 +1839,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             'quality_gate': current_quality_gate,
             'vlm_qa_reason': vlm_qa_reason,
             'parent_hash': p_hash,
+            'model_fallback': fallback_used,
         }
         # 锚点门写入的提示词指纹要在断点续传/整轮重放时保留，
         # 否则下次 staged 调用会把已验过的首帧当作未验重新过门

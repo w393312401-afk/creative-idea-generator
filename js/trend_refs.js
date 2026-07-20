@@ -7,6 +7,9 @@
 // 全部文本用 textContent 渲染（LLM/网页产出不走 innerHTML，防注入）。
 
 let trendRefsCache = [];
+let trendRefsArchiveCache = [];
+let trendRefsArchiveLoaded = false;
+let trendRefsCapValue = null;
 
 const TREND_REFS_SELECTED_KEY = 'spark_selected_trend_refs';
 
@@ -35,6 +38,7 @@ async function loadTrendRefs() {
             const known = new Set(trendRefsCache.map(r => r.id));
             saveSelectedTrendRefIds(getSelectedTrendRefIds().filter(id => known.has(id)));
             renderTrendRefs();
+            updateCapNote(data.cap, data.archived_count);
         } else {
             list.textContent = '';
             const err = document.createElement('div');
@@ -49,6 +53,203 @@ async function loadTrendRefs() {
         err.className = 'trend-refs-empty';
         err.textContent = '案例库载入失败，请检查本地服务';
         list.appendChild(err);
+    }
+}
+
+// 软上限徽标："N / 60 条 · 已归档 M 条"，超上限的老旧未用参考会自动挪进归档
+// （不硬删），archived_count 为 0/null 时不打扰用户，只在有归档可看时露出入口。
+function updateCapNote(cap, archivedCount) {
+    if (typeof cap === 'number') trendRefsCapValue = cap;
+    const note = document.getElementById('trend-refs-cap-note');
+    if (note) {
+        note.textContent = trendRefsCapValue ? `${trendRefsCache.length} / ${trendRefsCapValue} 条` : '';
+    }
+    // archivedCount 省略时只刷新左侧计数(如手动删除后),不改动归档入口的显隐状态
+    if (typeof archivedCount === 'undefined') return;
+    const toggle = document.getElementById('trend-refs-archive-toggle');
+    if (toggle) {
+        const has = typeof archivedCount === 'number' && archivedCount > 0;
+        toggle.hidden = !has;
+        toggle.textContent = has ? `查看归档 (${archivedCount})` : '查看归档';
+        if (!has) {
+            const archiveList = document.getElementById('trend-refs-archive-list');
+            if (archiveList) archiveList.hidden = true;
+            trendRefsArchiveLoaded = false;
+        }
+    }
+}
+
+async function toggleArchivePanel() {
+    const archiveList = document.getElementById('trend-refs-archive-list');
+    const toggle = document.getElementById('trend-refs-archive-toggle');
+    if (!archiveList || !toggle) return;
+    if (!archiveList.hidden) {
+        archiveList.hidden = true;
+        return;
+    }
+    archiveList.hidden = false;
+    if (trendRefsArchiveLoaded) {
+        renderArchiveRefs();
+        return;
+    }
+    archiveList.textContent = '';
+    const loading = document.createElement('div');
+    loading.className = 'trend-refs-empty';
+    loading.textContent = '正在载入归档...';
+    archiveList.appendChild(loading);
+    try {
+        const resp = await fetch('/api/trend-refs/archive');
+        const data = await resp.json();
+        if (data && Array.isArray(data.refs)) {
+            trendRefsArchiveCache = data.refs;
+            trendRefsArchiveLoaded = true;
+            renderArchiveRefs();
+        } else {
+            archiveList.textContent = '';
+            const err = document.createElement('div');
+            err.className = 'trend-refs-empty';
+            err.textContent = `归档载入失败：${(data && data.error) || '未知错误'}`;
+            archiveList.appendChild(err);
+        }
+    } catch (e) {
+        console.error('Failed to load trend refs archive:', e);
+        archiveList.textContent = '';
+        const err = document.createElement('div');
+        err.className = 'trend-refs-empty';
+        err.textContent = '归档载入失败，请检查本地服务';
+        archiveList.appendChild(err);
+    }
+}
+
+function renderArchiveRefs() {
+    const archiveList = document.getElementById('trend-refs-archive-list');
+    if (!archiveList) return;
+    archiveList.textContent = '';
+
+    if (trendRefsArchiveCache.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'trend-refs-empty';
+        empty.textContent = '归档是空的：案例库超过条数上限时，最老且从未被勾选用过的参考会自动挪到这里。';
+        archiveList.appendChild(empty);
+        return;
+    }
+
+    trendRefsArchiveCache.forEach(ref => {
+        const item = document.createElement('div');
+        item.className = 'trend-ref-item';
+
+        const row = document.createElement('div');
+        row.className = 'trend-ref-row';
+
+        const main = document.createElement('div');
+        main.className = 'trend-ref-main';
+        const label = document.createElement('div');
+        label.className = 'trend-ref-label';
+        label.textContent = ref.label || '(未命名参考)';
+        const meta = document.createElement('div');
+        meta.className = 'trend-ref-meta';
+        const usedSuffix = ref.used_count ? ` · 曾用 ${ref.used_count} 次` : '';
+        meta.textContent = `${ref.source === 'custom_urls' ? '🔗 自定义网址' : '🌐 联网搜索'} · ${ref.created_at || ''}${usedSuffix}`;
+        main.appendChild(label);
+        main.appendChild(meta);
+
+        const expandBtn = document.createElement('button');
+        expandBtn.type = 'button';
+        expandBtn.className = 'trend-ref-mini-btn';
+        expandBtn.textContent = '详情';
+        expandBtn.title = '展开/收起参考要点全文';
+
+        const restoreBtn = document.createElement('button');
+        restoreBtn.type = 'button';
+        restoreBtn.className = 'trend-ref-mini-btn trend-ref-restore';
+        restoreBtn.textContent = '♻ 恢复';
+        restoreBtn.title = '恢复到案例库，可重新勾选使用';
+
+        const delBtn = document.createElement('button');
+        delBtn.type = 'button';
+        delBtn.className = 'trend-ref-mini-btn trend-ref-delete';
+        delBtn.textContent = '×';
+        delBtn.title = '从归档永久删除（不可恢复）';
+
+        row.appendChild(main);
+        row.appendChild(expandBtn);
+        row.appendChild(restoreBtn);
+        row.appendChild(delBtn);
+        item.appendChild(row);
+
+        const body = document.createElement('pre');
+        body.className = 'trend-ref-text';
+        body.textContent = ref.text || '';
+        body.hidden = true;
+        item.appendChild(body);
+
+        expandBtn.addEventListener('click', () => {
+            body.hidden = !body.hidden;
+            expandBtn.textContent = body.hidden ? '详情' : '收起';
+        });
+        restoreBtn.addEventListener('click', () => restoreTrendRefFromArchive(ref.id, restoreBtn));
+        delBtn.addEventListener('click', () => deleteArchivedTrendRef(ref.id, delBtn));
+
+        archiveList.appendChild(item);
+    });
+}
+
+async function restoreTrendRefFromArchive(id, btn) {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try {
+        const resp = await fetch('/api/trend-refs/archive/restore', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: [id] })
+        });
+        const data = await resp.json();
+        if (data.status === 'ok') {
+            trendRefsCache = data.refs;
+            trendRefsArchiveCache = data.archive;
+            renderTrendRefs();
+            renderArchiveRefs();
+            updateCapNote(trendRefsCapValue, trendRefsArchiveCache.length);
+            showToast(data.restored > 0 ? '已恢复到案例库' : '该参考已在案例库中', 'success');
+        } else {
+            showToast(`恢复失败：${data.message || '未知错误'}`, 'error');
+        }
+    } catch (e) {
+        showToast('恢复失败，请检查本地服务', 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function deleteArchivedTrendRef(id, btn) {
+    if (btn.dataset.confirming !== '1') {
+        btn.dataset.confirming = '1';
+        btn.textContent = '确认删除？';
+        btn.classList.add('confirming');
+        setTimeout(() => {
+            btn.dataset.confirming = '';
+            btn.textContent = '×';
+            btn.classList.remove('confirming');
+        }, 3000);
+        return;
+    }
+    try {
+        const resp = await fetch('/api/trend-refs/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: [id], archive: true })
+        });
+        const data = await resp.json();
+        if (data.status === 'ok') {
+            trendRefsArchiveCache = trendRefsArchiveCache.filter(r => r.id !== id);
+            renderArchiveRefs();
+            updateCapNote(trendRefsCapValue, trendRefsArchiveCache.length);
+            showToast('已从归档永久删除', 'success');
+        } else {
+            showToast(`删除失败：${data.message || '未知错误'}`, 'error');
+        }
+    } catch (e) {
+        showToast('删除失败，请检查本地服务', 'error');
     }
 }
 
@@ -88,6 +289,7 @@ async function deleteTrendRef(id, btn) {
             trendRefsCache = trendRefsCache.filter(r => r.id !== id);
             saveSelectedTrendRefIds(getSelectedTrendRefIds().filter(sid => sid !== id));
             renderTrendRefs();
+            updateCapNote();
             showToast('已删除该联网参考', 'success');
         } else {
             showToast(`删除失败：${data.message || '未知错误'}`, 'error');
@@ -129,7 +331,8 @@ function renderTrendRefs() {
         label.textContent = ref.label || '(未命名参考)';
         const meta = document.createElement('div');
         meta.className = 'trend-ref-meta';
-        meta.textContent = `${ref.source === 'custom_urls' ? '🔗 自定义网址' : '🌐 联网搜索'} · ${ref.created_at || ''}`;
+        const usedSuffix = ref.used_count ? ` · 曾用 ${ref.used_count} 次` : '';
+        meta.textContent = `${ref.source === 'custom_urls' ? '🔗 自定义网址' : '🌐 联网搜索'} · ${ref.created_at || ''}${usedSuffix}`;
         main.appendChild(label);
         main.appendChild(meta);
 
@@ -198,6 +401,8 @@ async function searchNewTrendRefs() {
             batch.forEach(id => selected.add(id));
             saveSelectedTrendRefIds([...selected]);
             renderTrendRefs();
+            updateCapNote(data.cap, data.archived_count);
+            trendRefsArchiveLoaded = false; // 本轮搜索可能触发了新的自动归档,下次展开面板时重新拉取
             if (batch.length === 0) {
                 showToast('本次联网搜索没有返回结果（已回退旧缓存或搜索失败），请稍后再试', 'info');
             } else if (newCount === 0) {
@@ -220,5 +425,7 @@ async function searchNewTrendRefs() {
 document.addEventListener('DOMContentLoaded', () => {
     const searchBtn = document.getElementById('trend-refs-search-btn');
     if (searchBtn) searchBtn.addEventListener('click', searchNewTrendRefs);
+    const archiveToggle = document.getElementById('trend-refs-archive-toggle');
+    if (archiveToggle) archiveToggle.addEventListener('click', toggleArchivePanel);
     loadTrendRefs();
 });

@@ -648,6 +648,56 @@
     overflow-y: auto;
 }
 
+/* 软上限徽标 + 归档面板(2026-07-16：案例库自动淘汰进 trend_refs.archive.json，
+   这里是查看/恢复/永久删除已归档条目的入口) */
+.trend-refs-archive-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 6px;
+}
+
+.trend-refs-cap-note {
+    font-size: 10px;
+    color: var(--text-secondary, #6B6256);
+}
+
+.trend-refs-archive-toggle {
+    flex-shrink: 0;
+    font-size: 10px;
+    padding: 3px 9px;
+    border-radius: 10px;
+    border: 1px solid rgba(var(--ink-rgb), 0.14);
+    background: transparent;
+    color: var(--text-secondary, #6B6256);
+    cursor: pointer;
+}
+
+.trend-refs-archive-toggle:hover {
+    background: rgba(var(--ink-rgb), 0.06);
+    color: var(--text-main, #3A342C);
+}
+
+.trend-refs-archive-list {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed rgba(var(--ink-rgb), 0.12);
+}
+
+.trend-refs-archive-list .trend-ref-item {
+    opacity: 0.75;
+}
+
+.trend-refs-archive-list .trend-ref-row {
+    cursor: default;
+}
+
+.trend-ref-restore:hover {
+    background: rgba(90, 140, 100, 0.15);
+    color: #3E6B4A;
+}
+
 .ideation-card-actions {
     display: flex;
     gap: 8px;

@@ -14,9 +14,11 @@ from frame_generator import (
     _fx_store_frame,
     generate_frame_sequence,
     _execute_request_with_retry,
+    _image_size_to_api_size,
     QuotaExhaustedError,
 )
 import server_common
+from server_common import gpt_image_pixel_size
 from prompt_pipeline import _parse_prompt_slots, _format_prompt_block, parse_sections
 
 _UUID_A = '11111111-2222-3333-4444-555555555555'
@@ -443,6 +445,246 @@ class TestPromptBlockBracketSurvival(unittest.TestCase):
         images, videos = _parse_prompt_slots(result['prompt_block'])
         self.assertEqual(sorted(images.keys()), list(range(1, total_beats + 2)))
         self.assertEqual(sorted(videos.keys()), list(range(1, total_beats + 1)))
+
+
+class TestGptImagePixelSize(unittest.TestCase):
+    """gpt-image-2 routes to the real OpenAI-shaped codex gateway (65038), which only
+    understands the 'size' enum (1024x1024 / 1024x1536 / 1536x1024 / auto) — not the
+    'w:h' ratio strings ('9:16') that the Gemini gateway (8046) accepts via model-name
+    suffixing. Sending '9:16' straight through silently falls back to square output.
+    This was the real cause of "gpt文生图不是9:16"."""
+
+    def test_portrait_ratio_maps_to_tall_pixels(self):
+        self.assertEqual(gpt_image_pixel_size('9:16'), '1024x1536')
+        self.assertEqual(gpt_image_pixel_size('2:3'), '1024x1536')
+
+    def test_landscape_ratio_maps_to_wide_pixels(self):
+        self.assertEqual(gpt_image_pixel_size('16:9'), '1536x1024')
+        self.assertEqual(gpt_image_pixel_size('3:2'), '1536x1024')
+        self.assertEqual(gpt_image_pixel_size('21:9'), '1536x1024')
+
+    def test_square_ratio_maps_to_square_pixels(self):
+        self.assertEqual(gpt_image_pixel_size('1:1'), '1024x1024')
+
+    def test_missing_or_malformed_ratio_falls_back_to_square(self):
+        self.assertEqual(gpt_image_pixel_size(None), '1024x1024')
+        self.assertEqual(gpt_image_pixel_size(''), '1024x1024')
+        self.assertEqual(gpt_image_pixel_size('garbage'), '1024x1024')
+
+    def test_image_size_to_api_size_only_converts_for_gpt_image(self):
+        # Gemini gateway still gets the raw ratio string — its contract expects it.
+        self.assertEqual(_image_size_to_api_size('9:16', model='gemini-3.1-flash-image'), '9:16')
+        self.assertEqual(_image_size_to_api_size('9:16', model=None), '9:16')
+        # gpt-image-2 gets the converted pixel size.
+        self.assertEqual(_image_size_to_api_size('9:16', model='gpt-image-2'), '1024x1536')
+
+
+class TestAnchorInertiaQuotaFallback(unittest.TestCase):
+    """P1 惯性兜底的 t2i 重渲同样要吃 imageEditFallbackModel：2026-07-17 拱渡槽单
+    实锤——主模型配额耗尽（重置要 30h+）时这条兜底直接放弃、保留 i2i 复读帧，
+    下游必然空间断裂；主渲染路径早就会切兜底模型，这里必须走同一套切换。"""
+
+    _PROMPT_BLOCK = """图片 1:
+exterior prompt
+
+图片 2:
+interior prompt
+
+视频 1 [BRIDGE]:
+bridge video
+"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_output_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+
+    def tearDown(self):
+        server_common.OUTPUT_ROOT = self.old_output_root
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _write(target_path, content):
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        with open(target_path, 'wb') as f:
+            f.write(content.encode('utf-8'))
+
+    def _run(self, config, text_image_side_effect):
+        events = []
+
+        def fake_image_edit(cfg, prompt, reference_path, target_path, *a, **kw):
+            self._write(target_path, 'edit:stuck-duplicate')
+
+        with patch('frame_generator._generate_text_image', side_effect=text_image_side_effect), \
+             patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
+             patch('frame_generator.detect_anchor_inertia', return_value=(True, 1.5)), \
+             patch('prompt_pipeline.check_door_clearance_frame', return_value=(True, 'PASS')):
+            manifest = generate_frame_sequence(
+                config, 'inertia_quota_fallback', self._PROMPT_BLOCK,
+                on_progress=lambda stage, details: events.append((stage, details)))
+        return manifest, events
+
+    def test_inertia_t2i_switches_to_fallback_model_on_quota_exhaustion(self):
+        text_calls = []
+
+        def fake_text_image(cfg, prompt, target_path, *a, **kw):
+            text_calls.append(cfg.get('imageModel'))
+            # 首帧 t2i 用主模型正常成功；惯性兜底重渲时主模型配额已尽，兜底模型成功
+            if len(text_calls) > 1 and cfg.get('imageModel') == 'primary-model':
+                raise QuotaExhaustedError('primary exhausted')
+            self._write(target_path, f'text:{cfg.get("imageModel")}')
+
+        config = {'imageModel': 'primary-model', 'imageEditFallbackModel': 'fallback-model'}
+        manifest, events = self._run(config, fake_text_image)
+
+        self.assertEqual(text_calls, ['primary-model', 'primary-model', 'fallback-model'])
+        frame2 = next(f for f in manifest['frames'] if f['sequence'] == 2)
+        self.assertTrue(frame2['model_fallback'])
+        self.assertIsNone(frame2['reference'])       # t2i 新链头，如实脱链
+        self.assertEqual(frame2['parent_hash'], '')  # 血统断开，不记上一帧哈希
+        self.assertIsNone(frame2['vlm_qa_reason'])   # 兜底成功，不该再留失败痕
+        fb = next(details for stage, details in events if stage == 'model_fallback')
+        self.assertEqual(fb['sequence'], 2)
+        self.assertEqual(fb['to'], 'fallback-model')
+        with open(po_frame_path('inertia_quota_fallback', 2), 'rb') as f:
+            self.assertEqual(f.read(), b'text:fallback-model')
+
+    def test_inertia_t2i_without_fallback_model_keeps_frame_with_reason(self):
+        text_calls = []
+
+        def fake_text_image(cfg, prompt, target_path, *a, **kw):
+            text_calls.append(cfg.get('imageModel'))
+            if len(text_calls) > 1:
+                raise QuotaExhaustedError('primary exhausted')
+            self._write(target_path, 'text:first-frame')
+
+        config = {'imageModel': 'primary-model'}  # 未配置兜底模型
+        manifest, _ = self._run(config, fake_text_image)
+
+        # 只有主模型被尝试过（首帧 + 惯性重渲各一次），失败后保留 i2i 原帧并留痕
+        self.assertEqual(text_calls, ['primary-model', 'primary-model'])
+        frame2 = next(f for f in manifest['frames'] if f['sequence'] == 2)
+        self.assertIn('anchor_inertia', frame2['vlm_qa_reason'])
+        self.assertIn('t2i 兜底失败', frame2['vlm_qa_reason'])
+        with open(po_frame_path('inertia_quota_fallback', 2), 'rb') as f:
+            self.assertEqual(f.read(), b'edit:stuck-duplicate')
+
+
+def po_frame_path(title, seq):
+    project_dir = server_common._get_project_dir(title)
+    return os.path.join(project_dir, 'frames', f'img_{seq:03d}.webp')
+
+
+class TestDecodeImageAspectCrop(unittest.TestCase):
+    """网关对部分 t2i 模型（实测 gpt-image-2）无视 size/aspect_ratio 固定出方图，
+    闭源改不了——落盘前必须按配置比例居中裁剪，否则方帧混进 9:16 链。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _square_png_b64(self, size=128):
+        import base64
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new('RGB', (size, size), (200, 50, 50)).save(buf, format='PNG')
+        return base64.b64encode(buf.getvalue()).decode('ascii')
+
+    def test_square_output_is_cropped_to_configured_aspect(self):
+        from PIL import Image
+        from frame_generator import _decode_or_download_image
+        target = os.path.join(self.tmp, 'img_001.webp')
+        _decode_or_download_image({'b64_json': self._square_png_b64()}, target,
+                                  {'imageAspectRatio': '9:16'})
+        with Image.open(target) as im:
+            w, h = im.size
+        self.assertAlmostEqual(w / h, 9 / 16, delta=0.02)
+
+    def test_matching_aspect_is_untouched_and_auto_skips_crop(self):
+        from PIL import Image
+        from frame_generator import _decode_or_download_image
+        target = os.path.join(self.tmp, 'img_002.webp')
+        _decode_or_download_image({'b64_json': self._square_png_b64()}, target,
+                                  {'imageAspectRatio': 'auto'})
+        with Image.open(target) as im:
+            self.assertEqual(im.size, (128, 128))
+
+
+class TestDoorClearancePushTargeting(unittest.TestCase):
+    """P0 门框清除兜底重试必须把 VLM 判定的具体残留位置喂回控制指令，而不是重复
+    上一轮已经推不动的泛化 IMG2IMG_BRIDGE_CONTROL_PROMPT 措辞——不然模型对同一句
+    "再往前推"给出同样保守的结果（2026-07-16 岩湖贝壳单 img_005 连续两推、
+    每次原因都不同，画面仍残留门框，是这条真实复现）。"""
+
+    _PROMPT_BLOCK = """图片 1:
+exterior prompt
+
+图片 2:
+sill prompt
+
+图片 3:
+interior prompt
+
+视频 1 [BRIDGE]:
+bridge video 1
+
+视频 2 [BRIDGE]:
+bridge video 2
+"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_output_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+
+    def tearDown(self):
+        server_common.OUTPUT_ROOT = self.old_output_root
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_retry_control_prompt_carries_the_reported_failure_location(self):
+        edit_calls = []
+
+        def fake_text_image(config, prompt, target_path, *a, **kw):
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            with open(target_path, 'wb') as f:
+                f.write(b'text')
+
+        def fake_image_edit(config, prompt, reference_path, target_path, control_prompt=None, *a, **kw):
+            edit_calls.append({'reference': reference_path, 'control_prompt': control_prompt})
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            with open(target_path, 'wb') as f:
+                f.write(b'edit')
+
+        dc_results = iter([
+            (False, 'FAIL: 画面左侧可见生锈门框边缘'),
+            (False, 'FAIL: 画面右下角残留门槛踏板'),
+            (False, 'FAIL: 门洞轮廓仍框住整个画面'),
+        ])
+
+        def fake_door_clearance(config, image_path):
+            return next(dc_results)
+
+        with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
+             patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
+             patch('prompt_pipeline.check_door_clearance_frame', side_effect=fake_door_clearance):
+            manifest = generate_frame_sequence({}, 'door_push_targeting', self._PROMPT_BLOCK,
+                                                on_progress=lambda *a: None)
+
+        push_calls = [c for c in edit_calls if 'doorpush' in (c['reference'] or '')]
+        self.assertEqual(len(push_calls), 2)
+        # Each push must be told exactly what the audit just found wrong on THIS frame —
+        # not a copy of the previous round's instruction.
+        self.assertIn('画面左侧可见生锈门框边缘', push_calls[0]['control_prompt'])
+        self.assertIn('画面右下角残留门槛踏板', push_calls[1]['control_prompt'])
+        self.assertNotEqual(push_calls[0]['control_prompt'], push_calls[1]['control_prompt'])
+        # The final budgeted push must escalate urgency instead of repeating the first ask.
+        self.assertNotIn('last correction attempt', push_calls[0]['control_prompt'])
+        self.assertIn('last correction attempt', push_calls[1]['control_prompt'])
+
+        frame3 = next(f for f in manifest['frames'] if f['sequence'] == 3)
+        self.assertIn('门洞轮廓仍框住整个画面', frame3['vlm_qa_reason'])
 
 
 if __name__ == '__main__':

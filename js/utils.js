@@ -222,18 +222,6 @@ function mapEnglishCarrierToValue(carrier) {
     return 'hollow_oak';
 }
 
-function mapTwistToAnchorValue(dna) {
-    const d = dna.toLowerCase();
-    if (d.includes('window') || d.includes('cutout')) return 'carrier_cutout_window';
-    if (d.includes('floor') || d.includes('glass')) return 'water_glass_floor';
-    if (d.includes('hatch') || d.includes('roof')) return 'bark_camouflaged_hatch';
-    if (d.includes('stair') || d.includes('spiral')) return 'living_wood_stair';
-    if (d.includes('moss') || d.includes('bioluminescent') || d.includes('light')) return 'bioluminescent_moss';
-    if (d.includes('counter') || d.includes('slab')) return 'single_slab_counter';
-    if (d.includes('shower') || d.includes('waterfall')) return 'rerouted_waterfall_shower';
-    return 'carrier_cutout_window';
-}
-
 /**
  * Returns the publish-ready social caption lines for an idea.
  * english: TikTok 整行（英文标题+英文tags，可原样粘贴）；旧数据退回封面 hook / 中文标题

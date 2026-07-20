@@ -84,18 +84,6 @@ SEARCH_SNIPPET_CACHE_LOCK = threading.Lock()
 SEARCH_SNIPPET_TTL_SECONDS = 6 * 3600
 
 
-def _slice_between(text, start_marker, end_marker):
-    """Return the substring from start_marker up to (not including) end_marker.
-    Falls back to the tail from start_marker if end_marker is absent."""
-    start = text.find(start_marker)
-    if start == -1:
-        return ''
-    end = text.find(end_marker, start + len(start_marker))
-    if end == -1:
-        return text[start:]
-    return text[start:end]
-
-
 def _aux_model(config):
     """Return the low-cost model for mechanical parsing/audit tasks.
     Defaults to gemini-3.5-flash-low if the main model is gemini-3-flash-agent."""
@@ -319,7 +307,14 @@ def fetch_custom_url_snippet(config, ttl=SEARCH_SNIPPET_TTL_SECONDS):
 # search_snippet_cache.json 只是 6 小时 TTL 的请求缓存;这里是长期沉淀:每次联网
 # 搜索/网址摘要拿到的参考按文本指纹去重落库,前端把它做成可勾选的案例库——用户
 # 制作灵感卡片前选中已验证的案例,run_ideate 把它们当首要创意来源(见下)。
+#
+# 软上限+自动归档(2026-07-16):主库不会无限累积——超过 TREND_REFS_CAP 条时,
+# 最老且"从未被勾选生成过灵感"的条目自动挪进 trend_refs.archive.json(不硬删,
+# 前端可翻查/一键恢复);挪空未使用条目后仍超上限,才退而求其次挪最老的低使用
+# 条目。是否"被使用过"靠 run_ideate 里的 mark_trend_refs_used() 回写统计。
 TREND_REFS_PATH = os.path.join(_REPO_ROOT, 'trend_refs.json')
+TREND_REFS_ARCHIVE_PATH = os.path.join(_REPO_ROOT, 'trend_refs.archive.json')
+TREND_REFS_CAP = 60
 TREND_REFS_LOCK = threading.Lock()
 
 
@@ -328,45 +323,78 @@ def _trend_ref_id(text):
     return 'tr_' + hashlib.md5((text or '').strip().encode('utf-8')).hexdigest()[:12]
 
 
-def _load_trend_refs_unlocked():
-    if not os.path.exists(TREND_REFS_PATH):
+def _load_trend_refs_unlocked(path=None):
+    path = path or TREND_REFS_PATH
+    if not os.path.exists(path):
         return []
     try:
-        with open(TREND_REFS_PATH, 'r', encoding='utf-8') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except Exception as e:
         if sys.stdout:
-            print(f"[TREND REFS] {TREND_REFS_PATH} 读取失败: {e}")
+            print(f"[TREND REFS] {path} 读取失败: {e}")
         return None
     return data if isinstance(data, list) else None
 
 
 def load_trend_refs():
-    """读联网参考案例库。缺失返回 []；损坏返回 None(调用方应回 500,不能静默
-    降级为 []——同 library.json 整库清零事故的教训)。"""
+    """读联网参考案例库(主库,已选可用)。缺失返回 []；损坏返回 None(调用方应
+    回 500,不能静默降级为 []——同 library.json 整库清零事故的教训)。"""
     with TREND_REFS_LOCK:
-        return _load_trend_refs_unlocked()
+        return _load_trend_refs_unlocked(TREND_REFS_PATH)
 
 
-def _write_trend_refs_unlocked(entries):
+def load_trend_refs_archive():
+    """读归档库(软上限淘汰出主库、未使用过的旧参考,仍可翻查/恢复)。缺失返回
+    []；损坏返回 None。"""
+    with TREND_REFS_LOCK:
+        return _load_trend_refs_unlocked(TREND_REFS_ARCHIVE_PATH)
+
+
+def _write_trend_refs_unlocked(entries, path=None):
     """写前 .bak 轮换 + 临时文件原子替换(照 topic_ledger 防护)。须已持锁。"""
-    if os.path.exists(TREND_REFS_PATH):
+    path = path or TREND_REFS_PATH
+    if os.path.exists(path):
         try:
             import shutil
-            shutil.copyfile(TREND_REFS_PATH, TREND_REFS_PATH + '.bak')
+            shutil.copyfile(path, path + '.bak')
         except Exception as e:
             if sys.stdout:
-                print(f"[TREND REFS] 备份 .bak 失败（继续写入）: {e}")
-    tmp = TREND_REFS_PATH + '.tmp'
+                print(f"[TREND REFS] 备份 {path}.bak 失败（继续写入）: {e}")
+    tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(entries, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, TREND_REFS_PATH)
+    os.replace(tmp, path)
+
+
+def _evict_over_cap_unlocked(stored):
+    """超过 TREND_REFS_CAP 时,挑出最该挪进归档的条目:优先"从未被勾选生成过
+    灵感"的(used_count==0),同档位按 created_at 从老到新;挪空未使用条目后仍
+    超上限,才继续挪"使用次数最少且最老"的。返回 (kept, evicted),两者都不含
+    对方。不写文件——调用方负责在归档确实写成功后才采用 kept,避免半途丢数据。"""
+    if len(stored) <= TREND_REFS_CAP:
+        return stored, []
+    overflow = len(stored) - TREND_REFS_CAP
+    order = sorted(
+        range(len(stored)),
+        key=lambda i: (
+            1 if (stored[i].get('used_count') or 0) > 0 else 0,
+            stored[i].get('used_count') or 0,
+            stored[i].get('created_at') or '',
+        ),
+    )
+    evict_idx = set(order[:overflow])
+    kept = [stored[i] for i in range(len(stored)) if i not in evict_idx]
+    evicted = [stored[i] for i in order[:overflow]]
+    return kept, evicted
 
 
 def persist_trend_refs(refs):
     """把本次联网拿到的参考沉淀进案例库(按摘要文本指纹去重;已有的只回填 id 不
     重复入库)。返回带 id 的 refs 副本。库文件损坏时跳过写入但仍回填 id——沉淀
-    失败绝不拖垮上层激发。"""
+    失败绝不拖垮上层激发。新增后若主库超过 TREND_REFS_CAP,把最老且未使用过的
+    条目挪进归档(见 _evict_over_cap_unlocked);归档写入失败时本轮不淘汰,主库
+    宁可暂时超上限也不能丢数据,下次 persist 会重试。"""
     out = []
     with TREND_REFS_LOCK:
         stored = _load_trend_refs_unlocked()
@@ -386,10 +414,26 @@ def persist_trend_refs(refs):
                     'label': r.get('label', ''),
                     'query': r.get('query', ''),
                     'text': r.get('text', ''),
+                    'used_count': 0,
+                    'last_used_at': None,
                 })
                 existing.add(rid)
                 added = True
         if can_write and added:
+            stored, evicted = _evict_over_cap_unlocked(stored)
+            if evicted:
+                archive = _load_trend_refs_unlocked(TREND_REFS_ARCHIVE_PATH)
+                if archive is None:
+                    if sys.stdout:
+                        print("[TREND REFS] 归档库读取失败,本轮跳过软上限淘汰")
+                    stored = stored + evicted  # 放弃这轮淘汰,主库保持原样
+                else:
+                    try:
+                        _write_trend_refs_unlocked(evicted + archive, TREND_REFS_ARCHIVE_PATH)
+                    except Exception as e:
+                        if sys.stdout:
+                            print(f"[TREND REFS] 归档写入失败（本轮跳过淘汰）: {e}")
+                        stored = stored + evicted
             try:
                 _write_trend_refs_unlocked(stored)
             except Exception as e:
@@ -398,26 +442,105 @@ def persist_trend_refs(refs):
     return out
 
 
-def delete_trend_refs(ids):
-    """按 id 集合删除案例库条目。返回 {'deleted': n, 'remaining': list|None}；
-    remaining 为 None 表示库文件读取失败(调用方应回 500)。"""
+def mark_trend_refs_used(ids):
+    """run_ideate 用某些案例当首要创意来源生成过灵感后回写使用统计
+    (used_count/last_used_at),让软上限淘汰时优先保留"验证过有用"的条目而不
+    是纯按时间淘汰。非致命:找不到条目或库损坏时静默跳过。"""
+    id_set = set(ids or [])
+    if not id_set:
+        return
+    with TREND_REFS_LOCK:
+        stored = _load_trend_refs_unlocked()
+        if stored is None:
+            return
+        changed = False
+        now = datetime.now().strftime('%Y-%m-%d %H:%M')
+        for e in stored:
+            if isinstance(e, dict) and e.get('id') in id_set:
+                e['used_count'] = (e.get('used_count') or 0) + 1
+                e['last_used_at'] = now
+                changed = True
+        if changed:
+            try:
+                _write_trend_refs_unlocked(stored)
+            except Exception as e:
+                if sys.stdout:
+                    print(f"[TREND REFS] 使用次数回写失败（非致命）: {e}")
+
+
+def delete_trend_refs(ids, archive=False):
+    """按 id 集合删除条目(硬删,不可恢复)。archive=True 时对归档库操作,否则对
+    主库操作。返回 {'deleted': n, 'remaining': list|None}；remaining 为 None
+    表示对应库文件读取失败(调用方应回 500)。"""
     id_set = set(ids or [])
     if not id_set:
         return {'deleted': 0, 'remaining': []}
+    path = TREND_REFS_ARCHIVE_PATH if archive else TREND_REFS_PATH
     with TREND_REFS_LOCK:
-        data = _load_trend_refs_unlocked()
+        data = _load_trend_refs_unlocked(path)
         if data is None:
             return {'deleted': 0, 'remaining': None}
         remaining = [e for e in data if not (isinstance(e, dict) and e.get('id') in id_set)]
         deleted = len(data) - len(remaining)
         if deleted > 0:
-            _write_trend_refs_unlocked(remaining)
+            _write_trend_refs_unlocked(remaining, path)
         return {'deleted': deleted, 'remaining': remaining}
 
 
+def restore_trend_refs(ids):
+    """把归档里的条目挪回主库(不受软上限约束——这是用户的主动动作,挪回后若
+    再超上限,靠下次 persist_trend_refs 的自动淘汰重新收敛)。恢复的条目排在
+    主库最前面(视觉上"刚恢复=最新")。返回 {'restored': n, 'refs': list|None,
+    'archive': list|None}；任一库读取失败时两者都为 None。"""
+    id_set = set(ids or [])
+    if not id_set:
+        return {'restored': 0, 'refs': None, 'archive': None}
+    with TREND_REFS_LOCK:
+        archive = _load_trend_refs_unlocked(TREND_REFS_ARCHIVE_PATH)
+        stored = _load_trend_refs_unlocked(TREND_REFS_PATH)
+        if archive is None or stored is None:
+            return {'restored': 0, 'refs': None, 'archive': None}
+        moving = [e for e in archive if isinstance(e, dict) and e.get('id') in id_set]
+        if not moving:
+            return {'restored': 0, 'refs': stored, 'archive': archive}
+        remaining_archive = [e for e in archive if not (isinstance(e, dict) and e.get('id') in id_set)]
+        existing_ids = {e.get('id') for e in stored if isinstance(e, dict)}
+        appended = [e for e in moving if e.get('id') not in existing_ids]
+        stored = appended + stored
+        _write_trend_refs_unlocked(stored, TREND_REFS_PATH)
+        _write_trend_refs_unlocked(remaining_archive, TREND_REFS_ARCHIVE_PATH)
+        return {'restored': len(appended), 'refs': stored, 'archive': remaining_archive}
+
+
+_TREND_REF_BOILERPLATE_MARKERS = ('🔍 已为您搜索', '🌐 来源引文')
+
+
+def _strip_search_boilerplate(text):
+    """两条联网搜索 system instruction 都明确写了"no citations, no markdown
+    headers",但开了 enable_search 的 grounding 功能有时无视指令,自己在摘要尾巴
+    拼回搜索词回显(🔍 已为您搜索)和引文链接列表(🌐 来源引文)——这两串不是本仓库
+    代码写的,是模型自己加的(grep 过,不存在于任何 .py/.js 里)。对创意生成零信息
+    量,案例库存这些纯占地方,所以按锚点截断到最早出现的那个标记为止,顺带砍掉
+    紧邻的孤立 "---" 分隔线。"""
+    if not text:
+        return text
+    cut = len(text)
+    for marker in _TREND_REF_BOILERPLATE_MARKERS:
+        idx = text.find(marker)
+        if idx != -1:
+            cut = min(cut, idx)
+    # 截断点前通常还粘着装饰性的残留(分隔线 "---"、markdown 加粗符号 "**"、空行)——
+    # 真实要点内容不会以这些字符收尾,所以连带砍掉再收尾
+    cleaned = re.sub(r'[\s*\-]+$', '', text[:cut])
+    return cleaned.strip()
+
+
 def _build_live_trend_refs(config, search, trend_snippet, custom_snippet):
-    """把两条联网通道的摘要组装成 trend_refs 条目(不带 id;由 persist 回填)。"""
+    """把两条联网通道的摘要组装成 trend_refs 条目(不带 id;由 persist 回填)。
+    入库(及喂进激发 prompt)前先清洗 grounding 泄漏的回显/引文尾巴。"""
     refs = []
+    trend_snippet = _strip_search_boilerplate(trend_snippet)
+    custom_snippet = _strip_search_boilerplate(custom_snippet)
     if trend_snippet:
         refs.append({
             'source': 'web_search',
@@ -452,135 +575,6 @@ def refresh_trend_refs(config):
     custom_snippet = fetch_custom_url_snippet(config, ttl=0)
     return persist_trend_refs(
         _build_live_trend_refs(config, search, trend_snippet, custom_snippet))
-
-
-def load_skill_contract():
-    """Read the live SKILL.md + prompt-templates.md and assemble the authoritative
-    composition contract. Reading at request time keeps the shell in sync with the skill."""
-    skill_md_path = os.path.join(SKILL_DIR, 'SKILL.md')
-    templates_path = os.path.join(SKILL_DIR, 'references', 'prompt-templates.md')
-
-    pipeline = ''
-    templates = ''
-    try:
-        with open(skill_md_path, 'r', encoding='utf-8') as f:
-            skill_md = f.read()
-        # Forward-composition portion only: pipeline + the vocab/camera/lighting/audio
-        # reference tables. Drops the video reverse-engineering tiers (Tier 4) and the
-        # cross-skill/Notion plumbing that do not apply to GUI-driven generation.
-        pipeline = _slice_between(skill_md, '## Internal Composition Pipeline', '## Cross-Skill Integration')
-    except Exception as e:
-        if sys.stdout:
-            print(f"Warning: could not read SKILL.md ({e})")
-    try:
-        with open(templates_path, 'r', encoding='utf-8') as f:
-            templates = f.read()
-    except Exception as e:
-        if sys.stdout:
-            print(f"Warning: could not read prompt-templates.md ({e})")
-
-    # Replace hardcoded durations with constants dynamically
-    if pipeline:
-        pipeline = pipeline.replace("8-second", f"{int(VIDEO_DURATION)}-second")
-        pipeline = pipeline.replace("t=8s", f"t={int(VIDEO_DURATION)}s")
-        pipeline = pipeline.replace("t=7.5s", f"t={WORKER_EXIT_TIME}s")
-    if templates:
-        templates = templates.replace("8-second", f"{int(VIDEO_DURATION)}-second")
-        templates = templates.replace("t=8s", f"t={int(VIDEO_DURATION)}s")
-        templates = templates.replace("t=7.5s", f"t={WORKER_EXIT_TIME}s")
-
-    return pipeline, templates
-
-
-def build_topic_brief(d):
-    """Translate the GUI dimension selections into a Tier-1 topic brief the skill consumes."""
-    theme = d.get('theme', '未指定场景')
-    anchors = d.get('anchors') or []
-    anchors_str = '、'.join(anchors) if anchors else '由作曲家自行选取最契合主题的锚点'
-    complexity = d.get('complexity', '中等重工')
-    budget = d.get('budget', '轻奢设计师级')
-    ratio = d.get('ratio', '50%')
-    creativity = d.get('creativity', '突破常规')
-
-    return f"""本次为 GUI 维度驱动的 Tier-1 合成请求。请据此走完内部合成管线（Step 1 至 Step 9），产出完整的 IMAGE/VIDEO 提示词集与中文质量审核报告。
-
-输入维度：
-- 场景主题：{theme}
-- 核心创意锚点：{anchors_str}
-- 项目复杂度：{complexity}
-- 预算级别：{budget}
-- 外壳 \u2194 内里反差强度：{ratio}
-- 创意尺度：{creativity}
-
-硬性要求：
-1. 把该主题落成一个「可真实搭建 / 改造」的延时场景，必须显式给出 CARRIER / ENV / TRAUMA（初始残破或空白态）/ DESTINY（成品态）/ REWARD ACTION。因为场景主题均为写实载体（如百年空心橡树、蓝冰冰川洞、退役潜艇舱、废弃水塔等），所以必须以「真实可施工的废弃外壳\u2192温暖室内改造」为核心，用真实的工具链、材料来源与物理因果痕迹把它落地，禁止物体凭空出现。
-2. 节拍数下限：至少 15 个施工节拍（即 N ≥ 15，对应至少 16 张 IMAGE、15 段 VIDEO），再加最终 reward；按真实工序把改造拆成足够细的独立步骤（拆除清运 \u2192 结构修复 \u2192 水电管线粗装 \u2192 封板封墙 \u2192 底漆 \u2192 面漆 \u2192 地面 \u2192 灯具/设备接线 \u2192 家具软装…）。每拍只允许一个物理操作 + 微增量拆分，相邻 IMAGE 锚点状态变化不超过 3 个九宫格。如果一个工序变化超过画面三分之一，再拆成连续子节拍。
-3. 【施工顺序与物理因果，最高优先级】整套视频的推进必须符合现实物理因果顺序；任何违反都视为致命错误并必须重排节拍。明确禁止下列情况：
-   - 在「布线 / 通电」节拍完成之前，出现任何亮灯、灯带发光、屏幕点亮、设备通电运行的画面；
-   - 在外部（外立面 / 屋面 / 场地 / 除锈防腐）尚未处理完成之前，就跨过门槛进入室内施工；
-   - 在「除锈 / 打磨 / 清洁 / 底漆」完成之前，出现面漆、喷漆、清漆或任何光泽涂层；
-   - 湿作业（砂浆 / 混凝土 / 胶水 / 油漆）尚未干结固化之前，就进入会把它覆盖掉的下一道工序；
-   - 任何会被后续封板/饰面遮盖的管线、结构、防水层，必须在封盖节拍之前先完成。
-   施工状态必须单调递增：已清理的保持干净、已安装的保持就位、已干的保持干态，禁止回退。
-4. 全程执行 NGCS 九宫格坐标、Camera DNA 逐字复制、GCTR 因果痕迹（每处变化至少 2 个接触痕迹）、连续动作流（工人 t=0s 进、t=7.5s 出）、以及纯自然语言铁律——最终提示词正文里不得出现 % 符号、数字区间或任何技术缩写。
-5. 创意尺度越高，DESTINY 与视觉反差越大胆，但绝不能牺牲第 1、3、4 条的物理连续性与因果顺序。
-6. 【方案新颖度避雷/克制套路】严禁采用陈旧套路的方案（如：集装箱改造成极简小屋、旧货车/巴士改造成标准露营房车、仓库改造成工业Loft、灯塔改造成海滨卧室等），必须提供高新颖度与强反差的方案组合。
-7. 【可施工性屏障】严禁任何魔法般瞬间变出家具、无合理生根基础或材料突变的片段。必须留下真实的物理因果痕迹与接触痕迹，扅术细节和接口连接均需合理，必须能够映射到真实的施工工序中。
-8. 【截图招牌反差点】整个场景必须包含且仅包含一个风格化的招牌反差点（如：载体本体材质切面窗、水面玻璃地板、树皮伪装天窗、活体木纹/岩壁旋梯、生物荧光苔藓照明、整块载体板材台面、改道瀑布淋浴等）。必须在成品态（DESTINY）的醒目位置体现。"""
-
-
-def build_system_prompt():
-    pipeline, templates = load_skill_contract()
-    contract_block = pipeline if pipeline else "(SKILL.md 合成管线未能加载，请依据通用延时改造连续性契约生成。)"
-    templates_block = templates if templates else "(canonical templates 未能加载)"
-
-    return f"""You are operating as the `restoration-prompt-composer` skill — a one-shot prompt composition engine for restoration / renovation / construction time-lapse video. You receive a GUI-collected topic brief and must produce a complete, production-ready IMAGE + VIDEO prompt set that strictly conforms to the skill contract below. Internalize every gate; do not expose internal step names to the user.
-
-==================== SKILL CONTRACT (authoritative) ====================
-{contract_block}
-
-==================== CANONICAL TEMPLATES & CHECKLIST ====================
-{templates_block}
-
-==================== OUTPUT FORMAT (MANDATORY) ====================
-Respond with EXACTLY the four section markers below, in this order, with nothing before `===TITLE===` and nothing after the audit body. Do NOT wrap anything in markdown code fences.
-
-===TITLE===
-<a short, catchy, viral Chinese project name, e.g. 工业复古·废土集装箱卧室>
-===THEME===
-<the scene theme in Chinese, one short phrase>
-===PROMPTS===
-图片提示词
-图片 1:
-<English image-model prompt prose>
-
-图片 2:
-<English image-model prompt prose>
-
-视频提示词
-视频 1:
-<English video-model prompt prose>
-
-视频 2:
-<English video-model prompt prose>
-===AUDIT===
-<提示词质量审核报告：用 Markdown 表格列出关键 P0/P1 检查项（九宫格锁定、Camera DNA 复制、因果痕迹 GCTR、微增量拆分、连续动作流、纯自然语言、累计状态、施工顺序等）及通过状态与一句话说明。>
-
-Hard rules for the ===PROMPTS=== section:
-- Use ONLY these labels: `图片提示词`, `图片 N:`, `视频提示词`, `视频 N:`. Each label on its own line.
-- IMAGE count must equal N+1; VIDEO count must equal N. N must be AT LEAST 15 (so at least 16 image slots and 15 video slots); use more if the build genuinely needs it. Do not collapse or skip beats to stay short.
-- The beat ladder MUST obey real construction order: demolition and debris clearing → structural repair → rough-in wiring/plumbing/ducting → close-up panels → primer → finish/topcoat → flooring → fixtures and lighting ONLY after their wiring beat → furniture and decoration last. Hard vetoes (a single occurrence invalidates the whole set): never show powered lights, glowing strips, lit screens, or running equipment before the wiring/power beat; never cross the threshold into the interior before the exterior is finished; never show paint, spray, or topcoat before rust removal, cleaning, and priming; never cover wet/uncured material with the next layer. Construction state is monotonic — finished work never regresses.
-- [NEW RULE] Clear Path Requirement: If a project introduces any sliding, rolling, retracting, folding, or moving mechanical parts (e.g. bed rails, slide-out bed, retractable roof, folding stairs), the prompt generator must ensure a clean spatial path. If there are structural columns, support pillars, or bulkheads in the trauma state (IMAGE 1) that block this path, they must be explicitly cut and removed early (typically in structural repair phase) and replaced by peripheral support frames (e.g. ceiling arches or beams) before any rails or mechanisms are installed.
-- [NEW RULE] Floor and Skeleton Logic: If floor/wall joists, ribs, or framing studs will be insulated or paneled later, the bare structural skeleton (e.g. open metal joists or ribs) must be exposed at the very beginning (IMAGE 1/2). The floor/wall states must progress monotonically forward: bare joists/studs -> rough-in / insulation -> subfloor -> wood planks / paneling. Never start with a solid finished-looking floor that disappears to reveal raw joists later.
-- [NEW RULE] Perspective Isolation: Do not flip camera facing directions (e.g. turning 180 degrees from looking out to looking in) in the same spatial axis without a clean separate phase or TBCP transition. If the project centers on a slide-out reward action (e.g. bed sliding out of a cliff cabin), lock Camera Family B (looking outward through the opening towards the view) from the very first frame to maintain spatial consistency.
-- [NEW RULE] Strict Single-Operation Beat Rule: Each {int(VIDEO_DURATION)}-second video prompt must describe exactly one homogeneous physical task. Combining multiple distinct stages (e.g. painting AND mounting frames, or framing AND insulating, or laying tile AND anchoring stoves AND mounting bed frames) into a single {int(VIDEO_DURATION)}-second clip is strictly prohibited to prevent visual morphing and cut-scene jumps.
-- [NEW RULE] Bi-Directional Agent Flow: Standardize worker paths to prevent teleporting or instant popping. Workers must enter the frame from a specific coordinate edge at t=0s and walk out through the same edge by t={WORKER_EXIT_TIME}s, leaving the frame completely empty of personnel at t={int(VIDEO_DURATION)}s.
-- [NEW RULE] Rigid Container Encapsulation: All loose materials, debris, fasteners, and liquids must be stored and tracked inside rigid, quantifiable containers (e.g. buckets, parts trays, boxes), and their volumes must be described as continuously increasing or decreasing.
-- [NEW RULE] Mandatory Climax Video: Ensure the transition between the final two frames (the "Dressed interior" -> "Retract/slide action") is fully animated. The climax video (VIDEO N) must depict the actual physical kinetic movement of the mechanism (e.g. the bed rolling smoothly forward, the glass door sliding open).
-- One blank line between each slot. No markdown headings, bullets, or tables inside this section.
-- Prompt bodies are English natural-language prose suitable for an image / video generation model.
-- Never emit `%`, raw numeric ranges (e.g. `10% to 90%`), or technical acronyms (HAL, GCTR, RPL, VMFP, RCE, NGCS, SCUP) inside the prompt bodies. Express all progress and traces as fluid visual prose.
-- Every VIDEO begins with `Use the provided first frame and last frame as exact composition anchors.` and binds IMAGE N to IMAGE N+1."""
 
 
 def _chat(config, system, user, temperature=0.85, max_tokens=16384, timeout=240, on_chunk=None, model=None, enable_search=False):
@@ -717,7 +711,7 @@ def _chat(config, system, user, temperature=0.85, max_tokens=16384, timeout=240,
         raise RuntimeError(f"LLM 代理返回了无法解析的响应：{err or json.dumps(body, ensure_ascii=False)[:300]}")
 
 
-def _multimodal_chat(config, system, user_text, image_paths, model=None, max_tokens=1000):
+def _multimodal_chat(config, system, user_text, image_paths, model=None, max_tokens=1000, timeout=90):
     if not model:
         model = config.get('model') or 'gemini-3-flash-agent'
     base_url, api_key = resolve_gateway(model, config)
@@ -768,7 +762,7 @@ def _multimodal_chat(config, system, user_text, image_paths, model=None, max_tok
     # 走统一重试通道：瞬时抖动快速重试一次（而不是一次 90s 超时就 fail-open 成
     # auto_approved_degraded），且每次失败都经线程本地 sink 即时广播——帧序列
     # 动态流能实时看到"质检判定服务报错/重试中"，不再有几分钟的静默黑洞
-    resp_bytes = _execute_request_with_retry(req, opener=opener, timeout=90,
+    resp_bytes = _execute_request_with_retry(req, opener=opener, timeout=timeout,
                                              max_attempts=2, initial_delay=1.5)
     res_data = json.loads(resp_bytes.decode('utf-8'))
     _record_tokens(res_data.get('usage'))
@@ -1708,8 +1702,8 @@ def normalize_packet(packet):
 
 def normalize_beat_ladder(beat_ladder):
     """Shape-coercion for beat ladder entries: index must be an int, operation/description
-    prose strings, bridge_stage an int or None. Guards the same dict-where-string-expected
-    LLM quirk as normalize_packet."""
+    prose strings, bridge_stage an int or None, stage_scope one of large/small/default.
+    Guards the same dict-where-string-expected LLM quirk as normalize_packet."""
     if not isinstance(beat_ladder, list):
         return beat_ladder
     for beat in beat_ladder:
@@ -1742,7 +1736,55 @@ def normalize_beat_ladder(beat_ladder):
         if isinstance(beat.get('turn_direction'), str):
             td_low = beat['turn_direction'].strip().lower()
             beat['turn_direction'] = td_low if td_low in ('left', 'right') else None
+        # stage_scope（拍级"施工范围档位"：large=全幅完工跳变 / small=局部但可见的
+        # 完工跳变 / default=普通渐进施工，不必达到"完工"里程碑）：白名单归一化，
+        # 缺失或非法值一律退回 'default' —— 与 turn_direction 的"非法退 None"不同，
+        # 这里"没有声明"本就等价于默认档，落回 'default' 最安全，也让下游计数逻辑
+        # 不必再对 None 做额外判断。
+        ss = beat.get('stage_scope')
+        if ss is not None and not isinstance(ss, str):
+            ss = _flatten_to_text(ss)
+        ss_low = ss.strip().lower() if isinstance(ss, str) else ''
+        beat['stage_scope'] = ss_low if ss_low in ('large', 'small', 'default') else 'default'
+        # anchor_keywords（SIGNATURE ANCHOR RULE 收口用的字面短语清单）：只在 reward
+        # 拍上有意义，容错成字符串列表，非法/空值一律归一成 []
+        ak = beat.get('anchor_keywords')
+        if ak is not None and not isinstance(ak, list):
+            ak = [ak]
+        beat['anchor_keywords'] = [str(k).strip() for k in ak if str(k).strip()] if isinstance(ak, list) else []
     return beat_ladder
+
+
+def _stage_scope_ladder_violations(beat_ladder):
+    """Deterministic (no-LLM) quota check for the STAGE SCOPE RULE: among ELIGIBLE beats
+    (operation not in threshold/reward, no bridge_stage, hard_cut not true), exactly one
+    must be tagged stage_scope='large' and 2-3 must be tagged 'small' — the rest default.
+    The small quota narrows gracefully when an unusually small ladder leaves too few
+    eligible beats to fit the full 1+2..3 quota (never happens with the current
+    beats_count slider bounds of 5-15, kept only as defensive robustness)."""
+    if not isinstance(beat_ladder, list):
+        return []
+    eligible = [b for b in beat_ladder if isinstance(b, dict)
+                and b.get('operation') not in ('threshold', 'reward')
+                and not b.get('bridge_stage') and not b.get('hard_cut')]
+    n = len(eligible)
+    if n == 0:
+        return []
+    large_count = sum(1 for b in eligible if b.get('stage_scope') == 'large')
+    small_count = sum(1 for b in eligible if b.get('stage_scope') == 'small')
+    violations = []
+    if large_count != 1:
+        violations.append(
+            f'Exactly ONE eligible beat (operation not threshold/reward, no bridge_stage, '
+            f'no hard_cut) must have stage_scope="large"; found {large_count}.')
+    small_min = min(2, max(0, n - 1))
+    small_max = min(3, max(0, n - 1))
+    if n >= 2 and not (small_min <= small_count <= small_max):
+        violations.append(
+            f'Between {small_min} and {small_max} eligible beats must have '
+            f'stage_scope="small" (given only {n} eligible beats in this ladder); '
+            f'found {small_count}.')
+    return violations
 
 
 def load_packet_cache():
@@ -1998,8 +2040,13 @@ def fix_image_clean_frame_proactive(prompt):
     return " ".join(cleaned_sentences)
 
 
-def fix_video_opening(i, prompt):
-    expected_start = f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {i} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout."
+def fix_video_opening(i, prompt, first_frame_index=None):
+    """first_frame_index overrides which IMAGE the first-frame anchor binds to (defaults to
+    IMAGE i). Used by the TBCP v3 Bridge SPAN beat (bridge_stage=2), whose VIDEO is the sole
+    visible crossing clip and must anchor from the pre-HOLD exterior IMAGE (i-1), not IMAGE i
+    (the internal-only Sill Handoff frame)."""
+    first_frame_index = i if first_frame_index is None else first_frame_index
+    expected_start = f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {first_frame_index} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout."
     prompt_stripped = prompt.strip()
     if "third layout." in prompt_stripped:
         idx = prompt_stripped.lower().find("third layout.")
@@ -2727,10 +2774,14 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
         # are 'interior' even with bridge_stage None); standalone callers fall back to the
         # beat's own bridge_stage.
         family = 'sill' if bridge_stage == 1 else ('interior' if bridge_stage in (2, 3) else 'exterior')
+    # TBCP v3: the Bridge SPAN beat (bridge_stage=2) is the sole visible crossing clip and
+    # anchors from the pre-HOLD exterior IMAGE (i-1), not IMAGE i (the internal-only Sill
+    # Handoff frame) — see fix_video_opening's docstring.
+    first_frame_index = (i - 1) if bridge_stage == 2 else None
 
     # 3. Apply proactive fixes post-compression to guarantee mandatory quality requirements
     image_prompt = fix_image_clean_frame_proactive(image_prompt)
-    video_prompt = fix_video_opening(i, video_prompt)
+    video_prompt = fix_video_opening(i, video_prompt, first_frame_index=first_frame_index)
     video_prompt = fix_pacing_control(video_prompt, is_threshold_or_reveal)
     video_prompt = fix_out_and_in(video_prompt, is_threshold_or_reveal, beat=beat, packet=packet)
     video_prompt = fix_sound_design(video_prompt, family=family)
@@ -2832,16 +2883,19 @@ def check_image_clean_frame(prompt):
     return violations
 
 
-def check_video_opening(i, prompt):
-    """Validate the mandatory first/last-frame anchor opening and its IMAGE i -> IMAGE i+1 binding.
-    Mirrors fix_video_opening, which runs proactively, so well-formed prompts pass here."""
+def check_video_opening(i, prompt, first_frame_index=None):
+    """Validate the mandatory first/last-frame anchor opening and its first-frame -> IMAGE i+1
+    binding. Mirrors fix_video_opening, which runs proactively, so well-formed prompts pass
+    here. first_frame_index overrides the expected first-frame IMAGE number (see
+    fix_video_opening's docstring for the TBCP v3 Bridge SPAN use case)."""
+    first_frame_index = i if first_frame_index is None else first_frame_index
     errors = []
     low = prompt.strip().lower()
     if not low.startswith("use the provided first frame and last frame as exact composition anchors."):
         errors.append(f"VIDEO {i} missing required opening sentence 'Use the provided first frame and last frame as exact composition anchors.'")
-    binding = f"use image {i} as the actual first-frame image and image {i + 1} as the actual last-frame image".lower()
+    binding = f"use image {first_frame_index} as the actual first-frame image and image {i + 1} as the actual last-frame image".lower()
     if binding not in low:
-        errors.append(f"VIDEO {i} opening must bind IMAGE {i} (first frame) to IMAGE {i + 1} (last frame)")
+        errors.append(f"VIDEO {i} opening must bind IMAGE {first_frame_index} (first frame) to IMAGE {i + 1} (last frame)")
     return errors
 
 
@@ -3479,6 +3533,396 @@ def check_video_process_content(video_prompt, is_bridge=False, is_reveal=False, 
     return errors
 
 
+# 直出模式「结构性硬伤」清单：命中这些校验 = VIDEO 提示词给不了 i2v 任何可执行
+# 的画面指令，后果是静止片段/冻结后闪切/模型自造第三空间变形（2026-07-15 盐湖
+# 贝壳单 12 拍全灭实锤）。与风格瑕疵（措辞相似、标签腔、字数超限等）不同级：
+# 风格瑕疵留痕即可，结构性硬伤值得为该拍烧一轮定向回炉。
+_STRUCTURAL_VIDEO_ERROR_MARKERS = (
+    'no visible action/process beyond the anchor opening',
+    'ghost work',
+    'contains no camera-translation description',
+    'contains no camera-pan description',
+    'sterile of workers yet describes construction actions',
+)
+
+
+def split_structural_video_errors(errs):
+    """把 validate_beat_prompts 的结果分成（结构性硬伤, 其余瑕疵）两组。"""
+    structural = [e for e in (errs or []) if any(m in e for m in _STRUCTURAL_VIDEO_ERROR_MARKERS)]
+    rest = [e for e in (errs or []) if e not in structural]
+    return structural, rest
+
+
+def record_beat_audit(config, beat, structural, style_errs, reworked=None, image_reworked=None):
+    """直出模式校验留痕收集：挂在本次运行 config 的暂存键 _beat_audit 上，run 结束
+    后由 server.py 汇入 repair_md（结果页审核面板）。2026-07-15 事故里"10/12 拍没有
+    动作正文"只进了日志，用户烧完 40 分钟视频额度才发现——留痕必须在点"生成帧序列"
+    之前就可见。image_reworked 记录 IMAGE 相似度回炉的结果（None=未命中/未尝试，
+    True=已重写采纳，False=尝试过但复验未通过保留原稿），与 VIDEO 侧 reworked 分开
+    存放，因为同一拍的 style 列表可能同时混着 VIDEO 措辞瑕疵和 IMAGE 相似度瑕疵。"""
+    if not isinstance(config, dict) or not (structural or style_errs):
+        return
+    config.setdefault('_beat_audit', []).append({
+        'beat': int(beat),
+        'structural': list(structural or []),
+        'style': list(style_errs or []),
+        'reworked': reworked,
+        'image_reworked': image_reworked,
+    })
+
+
+def _strip_leading_label_line(text):
+    """回炉重写调用有时会把 user message 里给的标签/引导行复述在正文最前面（例如
+    "Beat 5 video prompt:"）——2026-07-16 实测这类复读曾让严格的开头匹配把内容完全
+    合格的重写稿全部当废稿丢弃。通用启发式：首行很短（<=12 词）且以冒号收尾就丢弃，
+    不依赖具体开头文案，VIDEO/IMAGE 回炉共用。"""
+    if not text:
+        return text
+    first_line, sep, rest = text.partition('\n')
+    stripped_first = first_line.strip().strip('"\'')
+    if sep and stripped_first.endswith(':') and 0 < len(stripped_first.split()) <= 12:
+        return rest.strip()
+    return text
+
+
+def rework_structural_video_beat(config, i, video_prompt, structural_errs, packet, beat=None, max_attempts=2):
+    """直出模式的定向回炉（最多 max_attempts 轮，默认 2）：只重写命中结构性硬伤的
+    VIDEO 提示词。
+
+    契约是「加法式修改」：要求 LLM 逐字保留原文全部句子（锚定开场/音效/节奏行，
+    以及 apply_proactive_fixes 已经盖好的确定性修复），只在锚定开场之后补写缺失
+    的动作/运镜正文。重写稿必须仍以锚定开场起头、且通过 check_video_process_content
+    复验，否则把具体拒绝原因带回去重试下一轮；全部轮次都失败才返回原文——保底
+    不比不回炉更差。返回 (video_prompt, 是否采用重写稿)。
+
+    2026-07-17 实跑三单发现：单发（无重试）命中率在 25~27% 的拍上失败保留了空心
+    VIDEO（只有锚定开场+音效，无任何动作）进最终交付——原单发设计对"回炉成功"
+    要求过严又不给第二次机会；加一轮重试+具体失败原因反馈（同款大纲结构校验的
+    retry-with-feedback 模式）显著提高命中率，且不放松验收标准。
+    """
+    _bridge_stage = beat.get('bridge_stage') if beat else None
+    is_bridge = _bridge_stage in (1, 2, 3)
+    is_turn = (_bridge_stage == 3)
+    is_reveal = (str(beat.get('operation', '')).lower() == 'reward') if beat else False
+    if is_bridge:
+        action_rule = (
+            "- This is a threshold-bridge clip: the added sentences must describe the camera's "
+            "own motion as the clip's action — "
+            + ("a stationary pan/turn locking onto the interior's long axis"
+               if is_turn else
+               "a slow coaxial dolly push toward/through the threshold")
+            + " — no worker, no construction work.\n"
+        )
+    else:
+        chore = _flatten_to_text((packet or {}).get('worker_choreography') or '')[:400]
+        action_rule = (
+            "- The added sentences must describe the beat's single visible operation sweeping "
+            "progressively across its full extent for the whole clip, performed by the same "
+            "single lone worker in progressive -ing verbs (entering near the start, exiting "
+            "near the end so the final frame is clean)."
+            + (f" Reuse this worker choreography verbatim where relevant: {chore}\n" if chore else "\n")
+        )
+    system = (
+        "You are repairing ONE structural defect in a single video-generation prompt for a "
+        "first-frame/last-frame interpolation model. Hard rules:\n"
+        "- KEEP every existing sentence of the prompt VERBATIM — the anchor opening, audio "
+        "description, and pacing line must survive unchanged. Do not delete, reorder, or "
+        "paraphrase them.\n"
+        "- ONLY ADD the missing content as new sentences placed right after the anchor opening.\n"
+        + action_rule +
+        "- No '%' symbols, no numeric ranges, no acronyms. Keep the full prompt under 180 words.\n"
+        "Output ONLY the corrected prompt text itself, starting directly with 'Use the provided "
+        "first frame...'. Do not prefix it with any label, heading, quotation marks, or repetition "
+        "of these instructions, and do not add commentary or markdown fences."
+    )
+    base_user = (
+        f"Here is the video prompt for beat {i}, delimited by triple quotes:\n"
+        f"\"\"\"\n{video_prompt}\n\"\"\"\n\n"
+        "Structural defects to fix (add the missing content, change nothing else):\n- "
+        + "\n- ".join(structural_errs)
+    )
+    rejection_reason = None
+    for attempt in range(max_attempts):
+        user = base_user if rejection_reason is None else (
+            base_user + "\n\nYour previous attempt was rejected: " + rejection_reason +
+            " Fix that specific problem and try again, still following the hard rules above."
+        )
+        try:
+            resp = _chat(config, system, user, temperature=0.5, timeout=90)
+            fixed = _strip_markdown_fences_only(resp).strip()
+            fixed = _strip_leading_label_line(fixed)
+            if not fixed:
+                rejection_reason = "the response was empty after stripping fences/labels."
+                continue
+            # 加法契约抽查：插值锚定开场必须原样打头——但 2026-07-16 实测 LLM 经常会在
+            # 正文前复读 user message 里的标签/引号（"Beat N video prompt:" 之类），严格
+            # startswith 会把内容完全合格的重写稿（3/3 复现）当废稿丢弃。改成在前 200
+            # 字符内定位锚定开场起点，剥掉它前面的任何前导文字，而不是要求位置为 0。
+            anchor_idx = fixed.lower().find('use the provided first frame')
+            if anchor_idx == -1 or anchor_idx > 200:
+                rejection_reason = (
+                    "the anchor opening sentence ('Use the provided first frame and last frame "
+                    "as exact composition anchors...') was missing or buried too far into the "
+                    "response — it must survive VERBATIM and appear at (or very near) the start."
+                )
+                continue
+            fixed = fixed[anchor_idx:]
+            if len(fixed.split()) > 200:
+                rejection_reason = "the rewrite was too long (over 200 words) — keep the full prompt under 180 words."
+                continue
+            proc_errs = check_video_process_content(fixed, is_bridge=is_bridge, is_reveal=is_reveal, is_turn=is_turn)
+            if proc_errs:
+                rejection_reason = "it still failed these checks: " + "; ".join(proc_errs)
+                continue
+            return fixed, True
+        except GenerationCancelled:
+            raise
+        except Exception as e:
+            if sys.stdout:
+                print(f"[DIRECT] Beat {i} 结构性回炉第 {attempt + 1}/{max_attempts} 轮调用失败: {e}")
+            rejection_reason = f"the previous call errored ({e})."
+            continue
+    return video_prompt, False
+
+
+# IMAGE 侧近乎逐字复读清单：check_stylistic_repetition(is_video=False) 命中这些
+# 就意味着这一拍除了"New traces include X"这类可复用填空之外，跟上一拍的相机/
+# 描述文本几乎一字不差（2026-07-16 实测同一条链连续 9 拍 similarity 到 1.00）。
+# VIDEO 侧结构性硬伤有定向回炉，IMAGE 侧此前完全没有对应机制——只记不修。
+_IMAGE_SIMILARITY_ERROR_MARKERS = (
+    'IMAGE phrasing/structure is too similar to previous beat',
+    "IMAGE sentence is too similar to previous beat's sentence",
+)
+
+
+def split_image_similarity_errors(errs):
+    """把 validate_beat_prompts 的结果分成（IMAGE 相似度瑕疵, 其余瑕疵）两组。"""
+    similar = [e for e in (errs or []) if any(m in e for m in _IMAGE_SIMILARITY_ERROR_MARKERS)]
+    rest = [e for e in (errs or []) if e not in similar]
+    return similar, rest
+
+
+def rework_similar_image_beat(config, i, image_prompt, similarity_errs, packet, prev_image=None, beat=None):
+    """IMAGE 侧相似度回炉（最多一轮）：与 rework_structural_video_beat 同款保守契约，
+    但换成替换式——相机/几何/锁定锚点句子必须逐字保留（它们本就该跨拍一致，这不是
+    瑕疵），只重写描述这一拍具体新增痕迹/状态变化的那一两句，换成更具体、和上一拍
+    用词句式不同的说法。重写稿必须让 check_stylistic_repetition 复验不再命中才采纳，
+    否则返回原文——保底不比不回炉更差。返回 (image_prompt, 是否采用重写稿)。
+    """
+    ledger = (packet or {}).get('object_ledger') or []
+    ledger_desc = "; ".join(
+        f"{o.get('name')} ({o.get('material_color', '')})"
+        for o in ledger if isinstance(o, dict) and o.get('name')
+    )[:400]
+    system = (
+        "You are repairing near-duplicate phrasing in one still-frame image prompt from a "
+        "construction time-lapse sequence. Hard rules:\n"
+        "- KEEP every sentence describing camera position, lens, geometry, locked anchors, grid "
+        "coordinates, or frame-height percentages EXACTLY VERBATIM — those must stay identical "
+        "across beats and are not the problem.\n"
+        "- ONLY REWRITE the sentence(s) describing this beat's own new trace or state change — "
+        "make them concretely specific to this beat (name particular materials, tool marks, or "
+        "finish details) using different sentence structure and different verbs than a generic "
+        "reusable template like 'New traces include X, Y, Z'.\n"
+        "- You may draw on this object ledger for concrete, consistent detail where relevant: "
+        + (ledger_desc or "(no ledger provided)") + "\n"
+        "- Do not invent new landmarks, change the camera, or contradict the established "
+        "structural state. Keep the full prompt under 170 words.\n"
+        "Output ONLY the corrected prompt text itself. Do not prefix it with any label, heading, "
+        "quotation marks, or repetition of these instructions, and do not add commentary or "
+        "markdown fences."
+    )
+    user = (
+        f"Here is the image prompt for beat {i}, delimited by triple quotes:\n"
+        f"\"\"\"\n{image_prompt}\n\"\"\"\n\n"
+        "Similarity problems to fix (rewrite only the offending sentence(s), change nothing else):\n- "
+        + "\n- ".join(similarity_errs)
+    )
+    try:
+        resp = _chat(config, system, user, temperature=0.6, timeout=90)
+        fixed = _strip_markdown_fences_only(resp).strip()
+        fixed = _strip_leading_label_line(fixed)
+        if not fixed or len(fixed.split()) > 220:
+            return image_prompt, False
+        if prev_image and check_stylistic_repetition(fixed, prev_image, packet, is_video=False):
+            return image_prompt, False
+        return fixed, True
+    except GenerationCancelled:
+        raise
+    except Exception as e:
+        if sys.stdout:
+            print(f"[DIRECT] Beat {i} IMAGE 相似度回炉调用失败（保留原文）: {e}")
+        return image_prompt, False
+
+
+_STAGE_SCOPE_FULL_COVERAGE_MARKERS = (
+    'entire', 'entirely', 'all interior', 'all visible', 'every wall',
+    'every surface', 'whole visible', 'fully covered', 'completely covered',
+)
+
+
+def check_stage_scope_wording(image_prompt, stage_scope):
+    """Deterministic post-generation check for whether an IMAGE prompt's actual wording
+    matches its declared stage_scope tier. The batched/single-beat generation calls are
+    TOLD to write large-tier beats as full/entire coverage and small/default-tier beats as
+    partial — but free-text LLM generation doesn't reliably honor that (2026-07-17 real-run
+    check: a 'default' beat wrote "entire floor area", a 'large' beat's IMAGE made no
+    full-coverage claim at all). 'large' must contain at least one full-coverage marker;
+    'small'/'default' must NOT contain one — only the one designated large beat may claim
+    full coverage."""
+    if not image_prompt or stage_scope not in ('large', 'small', 'default'):
+        return []
+    low = image_prompt.lower()
+    hit = next((m for m in _STAGE_SCOPE_FULL_COVERAGE_MARKERS if m in low), None)
+    if stage_scope == 'large':
+        if hit is None:
+            return [
+                'This beat is stage_scope="large" but its IMAGE prompt does not claim '
+                'full/entire coverage — rewrite the state-delta sentence to explicitly state '
+                'the operation is COMPLETED across its full visible extent (e.g. "the entire '
+                'floor area", "all interior walls").'
+            ]
+        return []
+    if hit is not None:
+        return [
+            f'This beat is stage_scope="{stage_scope}" but its IMAGE prompt claims full '
+            f'coverage (found "{hit}") — only the sequence\'s one designated large-scope beat '
+            f'may claim full/entire coverage; rewrite this beat to describe partial, localized, '
+            f'or incremental progress instead, with no "entire"/"all"/"every"/"fully covered" '
+            f'style claims.'
+        ]
+    return []
+
+
+def rework_stage_scope_wording_beat(config, i, image_prompt, wording_errs, stage_scope, beat=None):
+    """Single-shot IMAGE rework (max one round) when the generated wording doesn't match its
+    beat's declared stage_scope tier (see check_stage_scope_wording). Same conservative
+    contract as rework_similar_image_beat: camera/geometry/locked-anchor sentences must
+    survive verbatim, only the state-delta sentence(s) get rewritten; the rewrite is only
+    adopted if it re-passes check_stage_scope_wording, otherwise the original is kept — never
+    worse than not reworking. Returns (image_prompt, adopted)."""
+    if stage_scope == 'large':
+        direction = (
+            "ADD an explicit full-coverage claim to the state-delta sentence(s): name the "
+            "whole surface/region this beat's operation covers and state it is now fully/"
+            "entirely done (e.g. \"all interior walls and the ceiling curve are now paneled\", "
+            "\"the entire floor area is finished\")."
+        )
+    else:
+        direction = (
+            "REMOVE any full-coverage claim (words like \"entire\", \"all\", \"every\", "
+            "\"fully covered\", \"completely covered\") from the state-delta sentence(s) and "
+            "replace it with a partial, localized, or incremental description instead — this "
+            "beat must NOT read as a fully completed stage."
+        )
+    system = (
+        "You are repairing ONE wording mismatch in a still-frame construction IMAGE prompt. "
+        "Hard rules:\n"
+        "- KEEP every sentence describing camera position, lens, geometry, locked anchors, grid "
+        "coordinates, or frame-height percentages EXACTLY VERBATIM.\n"
+        "- ONLY REWRITE the sentence(s) describing this beat's own state delta / traces — "
+        + direction + "\n"
+        "- Do not invent new landmarks, change the camera, or contradict the established "
+        "structural state. Keep the full prompt under 170 words.\n"
+        "Output ONLY the corrected prompt text itself. Do not prefix it with any label, heading, "
+        "quotation marks, or repetition of these instructions, and do not add commentary or "
+        "markdown fences."
+    )
+    user = (
+        f"Here is the image prompt for beat {i}, delimited by triple quotes:\n"
+        f"\"\"\"\n{image_prompt}\n\"\"\"\n\n"
+        "Wording problems to fix (rewrite only the offending sentence(s), change nothing else):\n- "
+        + "\n- ".join(wording_errs)
+    )
+    try:
+        resp = _chat(config, system, user, temperature=0.5, timeout=90)
+        fixed = _strip_markdown_fences_only(resp).strip()
+        fixed = _strip_leading_label_line(fixed)
+        if not fixed or len(fixed.split()) > 220:
+            return image_prompt, False
+        if check_stage_scope_wording(fixed, stage_scope):
+            return image_prompt, False
+        return fixed, True
+    except GenerationCancelled:
+        raise
+    except Exception as e:
+        if sys.stdout:
+            print(f"[DIRECT] Beat {i} STAGE SCOPE 措辞回炉调用失败（保留原文）: {e}")
+        return image_prompt, False
+
+
+def check_signature_anchor_realized(image_prompt, beat):
+    """SIGNATURE ANCHOR RULE: the ideation stage's Core Creative Anchor (dimensions.anchors,
+    e.g. a one-click compose card's twist_zh) is the ONE feature that makes this project's
+    concept distinct from a generic renovation. Root-cause fix (2026-07-20): that anchor used
+    to be handed to the Step-1 brief-parsing LLM call as free-text context and then never
+    carried into any structured field the beat ladder or per-beat writers could see, so it
+    silently never appeared in any rendered beat. Now the beat-ladder generation step is
+    required to declare exact 'anchor_keywords' phrases on the reward beat (see beat_system in
+    compose_anchor_and_packet) — this is the deterministic, verbatim-substring check that those
+    declared phrases actually made it into the rendered reveal IMAGE, mirroring check_pbisp_peek's
+    'declare exact strings up front, verify them later' pattern."""
+    errors = []
+    keywords = (beat or {}).get('anchor_keywords') if isinstance(beat, dict) else None
+    if not isinstance(keywords, list) or not keywords:
+        return errors
+    low = (image_prompt or '').lower()
+    for kw in keywords:
+        kw = str(kw).strip()
+        if kw and kw.lower() not in low:
+            errors.append(
+                f"Reward IMAGE must literally show the declared signature anchor phrase "
+                f"'{kw}' as the visual centerpiece of the reveal — it is missing"
+            )
+    return errors
+
+
+def rework_missing_anchor_beat(config, i, image_prompt, anchor_errs, beat=None):
+    """SIGNATURE ANCHOR RULE 回炉（单轮）：奖赏/收尾拍生成的 IMAGE 没有把 beat_ladder
+    声明的招牌反差点关键短语字面写进画面——这是整个创意的题眼，比措辞相似度更严重，
+    不能只留痕不修。契约与 rework_stage_scope_wording_beat 同款保守替换式：相机/几何/
+    锁定锚点句子逐字保留，只重写描述成品态的状态delta句、把缺失的招牌反差点关键词
+    补进去、作为画面视觉中心。复验不过则保留原文——保底不比不回炉更差。
+    Returns (image_prompt, adopted)."""
+    keywords = [str(k).strip() for k in ((beat or {}).get('anchor_keywords') or []) if str(k).strip()]
+    kw_str = "; ".join(keywords) or "the project's declared signature feature"
+    system = (
+        "You are repairing ONE missing content requirement in a still-frame construction "
+        "reveal IMAGE prompt — the project's declared signature/hero feature is missing from "
+        "the described finished scene. Hard rules:\n"
+        "- KEEP every sentence describing camera position, lens, geometry, locked anchors, grid "
+        "coordinates, or frame-height percentages EXACTLY VERBATIM.\n"
+        "- REWRITE the state-delta sentence(s) describing the finished scene so they explicitly "
+        f"name this exact signature feature, verbatim, as the prominent visual centerpiece: {kw_str}\n"
+        "- Do not invent new landmarks, change the camera, or contradict the established "
+        "structural state. Keep the full prompt under 170 words.\n"
+        "Output ONLY the corrected prompt text itself. Do not prefix it with any label, heading, "
+        "quotation marks, or repetition of these instructions, and do not add commentary or "
+        "markdown fences."
+    )
+    user = (
+        f"Here is the reward/reveal image prompt for beat {i}, delimited by triple quotes:\n"
+        f"\"\"\"\n{image_prompt}\n\"\"\"\n\n"
+        "Missing signature feature(s) to add (rewrite only the offending sentence(s), change nothing else):\n- "
+        + "\n- ".join(anchor_errs)
+    )
+    try:
+        resp = _chat(config, system, user, temperature=0.5, timeout=90)
+        fixed = _strip_markdown_fences_only(resp).strip()
+        fixed = _strip_leading_label_line(fixed)
+        if not fixed or len(fixed.split()) > 220:
+            return image_prompt, False
+        if check_signature_anchor_realized(fixed, beat):
+            return image_prompt, False
+        return fixed, True
+    except GenerationCancelled:
+        raise
+    except Exception as e:
+        if sys.stdout:
+            print(f"[DIRECT] Beat {i} 招牌反差点回炉调用失败（保留原文）: {e}")
+        return image_prompt, False
+
+
 _MID_ACTION_PATTERNS = [
     re.compile(r'\b(?:is|are)\s+being\b', re.IGNORECASE),
     re.compile(r'\bcurrently being\b', re.IGNORECASE),
@@ -3531,6 +3975,10 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
 
     _bridge_stage = beat.get('bridge_stage') if beat else None
     _is_cut = bool(beat.get('hard_cut')) if beat else False
+    # TBCP v3: bridge_stage=1 (HOLD) is an internal-only beat — its VIDEO slot is a
+    # deterministically-overridden placeholder (BRIDGE_HOLD_VIDEO_PLACEHOLDER), so every
+    # video-side check is meaningless for it, exactly like a declared hard cut.
+    _is_hold = (_bridge_stage == 1)
     if family is None:
         family = 'sill' if _bridge_stage == 1 else ('interior' if _bridge_stage in (2, 3) else 'exterior')
 
@@ -3574,12 +4022,13 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
             if "blurred" not in image_prompt.lower() and "diffused" not in image_prompt.lower():
                 errors.append("Final IMAGE with polished/reflective floor missing RHMA-Blur diffused reflection description")
                 
-    # 声明式硬切拍（hard_cut）：VIDEO 槽是确定性占位声明（不生成片段、不送 i2v），
-    # 全部视频侧校验对它没有意义，跳过。
-    if not _is_cut:
+    # 声明式硬切拍（hard_cut）和桥接 HOLD 拍（bridge_stage=1）：VIDEO 槽都是确定性
+    # 占位声明（不生成片段、不送 i2v），全部视频侧校验对它们没有意义，跳过。
+    _first_frame_index = (i - 1) if _bridge_stage == 2 else None
+    if not _is_cut and not _is_hold:
         errors.extend(check_nlvtr_violations(video_prompt))
         errors.extend(check_colon_label_style(video_prompt))
-        errors.extend(check_video_opening(i, video_prompt))
+        errors.extend(check_video_opening(i, video_prompt, first_frame_index=_first_frame_index))
         errors.extend(check_out_and_in(video_prompt, is_threshold_or_reveal))
         errors.extend(check_transition_shortcuts(video_prompt))
         errors.extend(check_pacing_control(video_prompt, is_threshold_or_reveal))
@@ -3595,7 +4044,7 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
     # identically-framed anchor stills is uninterpolable (TBCP: bridge clips translate
     # coaxially only — 'no pan, no tilt, no roll'). 放行严格按 bridge_stage 声明限定。
     allow_camera_sweep = (op == 'reward') or is_turn
-    if not _is_cut:
+    if not _is_cut and not _is_hold:
         errors.extend(check_camera_contradictions(video_prompt, is_bridge, ban_pan_tilt=not allow_camera_sweep))
         if is_bridge:
             errors.extend(check_bridge_sterile(video_prompt))
@@ -3753,6 +4202,13 @@ Required JSON keys:
     for k, v in _brief_fallback.items():
         parsed_brief.setdefault(k, v)
 
+    # 核心创意锚点(dimensions.anchors，如一键合成灵感卡片时的 idea.twist_zh)是
+    # Python 侧已经拿到手的确定性输入——不经过这次 Step 1 解析 LLM 的输出 schema
+    # 转录（该 schema 本就没有承载它的字段，之前一路传到这里就丢了，见 anchors_str
+    # 只在下面 brief_user 里当"参考"文字塞给 LLM，从未被写回任何结构化字段）。
+    # 直接原样赋值，保证不管 Step 1 这次调用是否理睬它，锚点都不会丢。
+    parsed_brief['signature_anchor'] = anchors_str if anchors else ''
+
     # 标题=本地母文件夹名的来源，统一固定为纯中文「{载体}改造成{目标}」句式
     # （红框契约，2026-07-12）。旧的 f"{creativity}·{英文destiny}" 拼法会让
     # outputs/ 下落出中英混杂的项目目录，已废弃。
@@ -3796,8 +4252,8 @@ Required JSON keys:
     if _variant in ('pan_left', 'pan_right'):
         _turn_dir = 'left' if _variant == 'pan_left' else 'right'
         threshold_split_rules = f"""- If mode is "Threshold", this project uses the PAN crossing variant: you must split the exterior-interior crossing into THREE consecutive beats:{_elevated_note}
-  - Beat T: "threshold", bridge_stage 1 — Exterior approach pushing toward the open threshold, peeked interior landmarks visible.
-  - Beat T+1: "threshold", bridge_stage 2 — Crossing the sill and settling fully inside at the vestibule point, door frame sliding completely out of frame behind the camera; the camera still faces the entry axis.
+  - Beat T: "threshold", bridge_stage 1 — Exterior approach pushing toward the open threshold, peeked interior landmarks visible. (Internal beat only — this beat's own video is never generated or shown; it exists purely to produce the internal Sill Handoff image that grounds Beat T+1's image.)
+  - Beat T+1: "threshold", bridge_stage 2 — Crossing the sill and settling fully inside at the vestibule point, door frame sliding completely out of frame behind the camera; the camera still faces the entry axis. (This beat's video is the ONLY visible clip for the exterior-to-vestibule crossing — it must depict the full arc from the exterior approach through the settle in one continuous, unbroken shot, never resting on the doorway.)
   - Beat T+2: "threshold", bridge_stage 3, "turn_direction": "{_turn_dir}" — Camera position fixed at the vestibule point; one smooth horizontal pan to the {_turn_dir}, locking onto the interior's long axis; the inherited interior anchors slide into frame and settle.
   - All subsequent beats (through Beat {beats_count}) must be interior construction operations."""
     elif _variant == 'hard_cut':
@@ -3806,10 +4262,19 @@ Required JSON keys:
   - All subsequent beats (through Beat {beats_count}) must be interior construction operations. Use "hard_cut": true on exactly this one beat and never elsewhere; a hard cut is only allowed for the threshold crossing, never as a generic transition."""
     else:
         threshold_split_rules = f"""- If mode is "Threshold", you must split the exterior-interior crossing into two beats:{_elevated_note}
-  - Beat T (e.g. Beat 6): "threshold" - Exterior approach pushing toward the open threshold, peeked interior landmarks visible.
-  - Beat T+1 (e.g. Beat 7): "threshold" - Crossing sill and settling into the interior, door frame sliding fully out of frame behind the camera.
+  - Beat T (e.g. Beat 6): "threshold" - Exterior approach pushing toward the open threshold, peeked interior landmarks visible. (Internal beat only — this beat's own video is never generated or shown; it exists purely to produce the internal Sill Handoff image that grounds Beat T+1's image.)
+  - Beat T+1 (e.g. Beat 7): "threshold" - Crossing sill and settling into the interior, door frame sliding fully out of frame behind the camera. (This beat's video is the ONLY visible clip for the whole crossing — it must depict the full arc from the exterior approach through the settle in one continuous, unbroken shot, never resting on the doorway.)
   - All subsequent beats (Beats T+2 to {beats_count}) must be interior construction operations (e.g., clearing interior, interior walls, interior flooring, etc.)."""
 
+    _signature_anchor = parsed_brief.get('signature_anchor', '')
+    _anchor_keywords_schema = (
+        f"""8. "anchor_keywords": (array of 1-3 short strings, ONLY on Beat {total_beats}, the reward beat; omit or leave empty on every other beat) Exact short English phrases (2-6 words each) naming the concrete realized form of the Core Creative Anchor declared below, VERBATIM as they will appear in that beat's own "description". These are checked word-for-word against the final rendered prompt later, so they must be the literal words you actually use, not a paraphrase."""
+        if _signature_anchor else ""
+    )
+    _anchor_reward_rule = (
+        f"""- SIGNATURE ANCHOR RULE (mandatory): this project's declared Core Creative Anchor is: {_signature_anchor}. Beat {total_beats}'s "description" MUST explicitly show this exact feature completed and in its prominent hero position in the finished scene — name its concrete materials, form, and placement (never a generic substitute, e.g. a plain unrelated fixture standing in for it). If it is a heavy/mounted fixture, an earlier beat (respecting FLOORING-BEFORE-HEAVY-OBJECTS and FIXTURE INSTALLATION RULE below) should be the one that installs it, but Beat {total_beats}'s description must still name it as the visual centerpiece of the reveal. Populate that beat's "anchor_keywords" with the 1-3 exact phrases from your own description that carry this feature — those exact words are enforced verbatim downstream."""
+        if _signature_anchor else ""
+    )
     beat_system = f"""You are a professional construction planner specializing in time-lapse renovation projects.
 Your goal is to expand the standard construction phases into a detailed, step-by-step beat ladder.
 You must output ONLY a valid JSON array of beats, containing exactly {total_beats} elements. Do not output code fences, markdown, or other text.
@@ -3821,13 +4286,22 @@ Each beat object in the JSON array must have:
 4. "bridge_stage": (integer or null) Set to 1 for the first bridge/threshold beat (Beat T), 2 for the second bridge/threshold beat (Beat T+1), 3 for the third bridge/threshold beat ONLY in the PAN crossing variant described below, and null for all other beats.
 5. "hard_cut": (boolean, optional) true ONLY on the single declared-cut threshold beat in the HARD CUT crossing variant described below; omit or false everywhere else.
 6. "turn_direction": (string, optional) "left" or "right", ONLY on the bridge_stage 3 beat of the PAN crossing variant; omit everywhere else.
+7. "stage_scope": (string, REQUIRED on every beat whose "operation" is NOT "threshold" or "reward" AND that has no "bridge_stage" and "hard_cut" is not true — i.e. every ordinary construction beat) One of: "large", "small", "default". Omit (or set null) on threshold/reward/bridge/hard_cut beats — those follow their own dedicated rules elsewhere in this prompt and are not part of this quota. See the STAGE SCOPE RULE below for what each tier means and how many of each are required.
+{_anchor_keywords_schema}
 
 General Rules:
 - The beats must be realistic and in monotonic order matching the phases: {phases_str} -> reward.
 - REAL-WORLD ORDER (mandatory): respect the physically-required construction order for THIS specific carrier and its materials — structural stabilization and hazardous-material removal before finishes, rough-in (wiring/piping) before surfaces are closed, surfaces closed and primed before painting, floor finish before heavy anchored objects. A ladder that reads well but violates real-world sequencing is wrong.
 - Each beat must focus on EXACTLY ONE distinct physical operation (e.g. debris clearing, structural repair, piping, wall paneling, priming, painting, lighting installation, furnishing). Do not combine distinct operations.
-- GLOBAL STAGE DELTA RULE (mandatory): every beat's single operation must be applied at its FULL VISIBLE EXTENT — the whole surface/region that operation covers in frame (e.g. a paneling beat panels ALL visible wall and ceiling surfaces, a flooring beat finishes the ENTIRE visible floor, a painting beat paints EVERY primed surface). Size the ladder so the trauma-to-finished arc is divided into exactly {total_beats} MAJOR, frame-wide jumps; a viewer comparing any two adjacent anchor images side-by-side must instantly see a completed stage. Token beats that change only a small patch or add a single small object are FORBIDDEN (staging small props is allowed only inside the furnishing/reward beats). Write each description naming the full coverage explicitly ("all interior walls and the ceiling curve", "the entire floor area"), never a fraction ("one section", "part of", "begins to").
+- MATERIAL-MATCHED REPAIR (any "repair" operation beat): the specific technique, tool, and material named in the beat's "description" MUST match the carrier's actual established material — e.g. welding/grinding/rust-converter for a metal shell, epoxy or resin fill and wood splicing for timber, fiberglass/gelcoat patching for a composite hull, membrane or sealant work for waterproofing/ice/stone. Wet mortar/cement troweling is valid ONLY when the carrier's structure is genuinely masonry or poured concrete. Never default to generic concrete-crack patching as a stand-in for "repair" on a non-masonry carrier.
+- ZONE-APPROPRIATE PROTECTIVE LAYERS: waterproofing membrane, tar/bitumen coating, or vapor barrier is only a valid operation/description choice on a surface with real moisture or weather exposure — below-grade walls/floors, roofs, the exterior building envelope, and wet-use rooms (bathroom, kitchen, pool, cellar). Never select or describe a waterproofing/vapor-barrier step for an ordinary dry interior wall, floor, or ceiling (bedroom, living room, workshop interior, etc.) — those surfaces get plain primer/finish coating instead.
+- STAGE SCOPE RULE (mandatory, replaces "every beat is a major jump"): among the ELIGIBLE beats (every beat whose operation is not "threshold"/"reward" and that is not a bridge/hard_cut beat), tag each one's "stage_scope" as exactly ONE of:
+  * "large" (exactly ONE eligible beat in the whole ladder): this beat's single operation must be shown COMPLETED at its FULL VISIBLE EXTENT — the whole surface/region that operation covers in frame (e.g. a paneling beat panels ALL visible wall and ceiling surfaces, a flooring beat finishes the ENTIRE visible floor). Name the full coverage explicitly ("all interior walls and the ceiling curve", "the entire floor area"), never a fraction. This is the sequence's one large-scale, whole-of-construction change — pick whichever eligible beat should carry it; it does not need to be the last, the most dramatic, or adjacent to the reward beat.
+  * "small" (BETWEEN 2 AND 3 eligible beats): a real but LOCALIZED jump — a clearly visible, genuinely completed sub-region of that beat's operation, not everything. Name the specific sub-area finished (e.g. "the wall beside the entry and the corner nook are now paneled") while explicitly stating the rest of that surface remains in its prior, untreated state (e.g. "the far wall and ceiling curve remain bare studs"). This must read as real, noticeable progress confined to a named sub-area — never full coverage, never a single decorative prop.
+  * "default" (every remaining eligible beat): ordinary incremental continuing work. Coverage grows somewhat beat to beat but does NOT need to reach any describable completion milestone. For these beats ONLY, phrasing such as "one section", "part of", or "begins to" is explicitly PERMITTED and encouraged — describe the true partial, in-progress state honestly rather than forcing a false sense of completion.
+  Record each eligible beat's tier in its "stage_scope" JSON field. Leave "stage_scope" null/omitted on threshold, reward, and any bridge/hard_cut beat — those follow the rules given elsewhere in this prompt instead.
 - Beat {total_beats} must be the final reward/reveal motion: {parsed_brief['reward']}.
+{_anchor_reward_rule}
 {threshold_split_rules}
 - CEILING/ROOF COVERAGE RULE: For any enclosed space (fuselage, cabin, room, container, vault, bunker, etc.), the ceiling/roof/top surface must be treated as a construction surface just like the walls and floor. When the beat ladder includes framing, paneling, insulating, or painting walls, the SAME operation MUST also explicitly cover the ceiling/roof/top curve. A renovation that covers walls but leaves the ceiling as raw exposed structure is physically incorrect.
 - FIXTURE INSTALLATION RULE: If the beat ladder includes a wiring/electrical rough-in beat, there MUST be a subsequent "lighting" or "fixture install" beat BEFORE the furnishing/staging beat and BEFORE the reward beat. Light fixtures cannot appear in the final reward if they were never installed.
@@ -3893,6 +4367,8 @@ Space Type: {space_type}
                                 violations.append("bridge_stage=3 is only allowed in the PAN variant.")
                     elif any(b.get('bridge_stage') or b.get('hard_cut') for b in beat_ladder):
                         violations.append("Standard mode must not contain bridge_stage or hard_cut beats.")
+
+                    violations.extend(_stage_scope_ladder_violations(beat_ladder))
 
                     if not violations:
                         break
@@ -4166,6 +4642,16 @@ HARD_CUT_VIDEO_PLACEHOLDER = (
     "from the previous IMAGE to this beat's resulting IMAGE, and the story resumes inside."
 )
 
+# TBCP v3 桥接 HOLD 拍（bridge_stage=1）的 VIDEO 槽位占位声明：确定性覆盖 LLM 输出——
+# 该槽不生成视频、不送 i2v，过门唯一可见片段是下一拍（bridge_stage=2 SPAN）的合并跨越
+# 镜头（见 video_generator.plan_video_slots 的 skip_bridge_hold 处理）。
+BRIDGE_HOLD_VIDEO_PLACEHOLDER = (
+    "DISCARDED BRIDGE HOLD - no video clip is generated for this slot; the crossing's only "
+    "visible clip is the NEXT beat's video, which spans the full exterior-to-interior arc in one "
+    "continuous shot. This beat's real output is its resulting IMAGE, an internal Sill Handoff "
+    "frame used only as an i2i grounding step for the next beat's IMAGE."
+)
+
 
 def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
     """All the deterministic (no-LLM-call), beat-specific rendering fragments and
@@ -4179,13 +4665,28 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
     bridge_stage = beat.get('bridge_stage')
     is_bridge = (mode == 'Threshold' and bridge_stage in (1, 2, 3))
     is_turn = (mode == 'Threshold' and bridge_stage == 3)
+    # TBCP v3: bridge_stage 1 ("HOLD") is an internal-only beat whose own video is a
+    # discarded placeholder — the visible crossing clip lives entirely on bridge_stage 2
+    # ("SPAN"), which is redirected to start from the pre-HOLD exterior image so the
+    # rendered film never rests on a frame whose subject is the doorway.
+    is_bridge_hold = (mode == 'Threshold' and bridge_stage == 1)
+    is_bridge_span = (mode == 'Threshold' and bridge_stage == 2)
     is_cut = bool(beat.get('hard_cut'))
+    # STAGE SCOPE RULE tier for this beat's state delta ('large'/'small'/'default');
+    # threshold/reward/bridge/hard_cut beats already have their own dedicated content
+    # rules and are excluded from the quota, so they carry no stage_scope directive.
+    stage_scope = None if (is_threshold_or_reveal or is_bridge or is_cut) else (beat.get('stage_scope') or 'default')
 
     # Shot family for the IMAGE this beat produces: post-crossing beats are
     # 'interior' (TBCP handed the camera family and anchor set across the sill).
     family = beat_space_family(beat_ladder, i)
     family_camera_dna = select_camera_dna(beat, packet.get('camera_dna', ''), packet=packet, family=family)
     family_landmarks = _family_landmarks(packet, family)
+    # First reveal of the interior (settle beat for coaxial, turn beat for pan) must read as
+    # the SAME untouched pre-renovation decay already established outside — nothing has been
+    # worked on yet. Later interior beats (bridge_stage is None) instead follow their own
+    # STAGE SCOPE progressive-completion directive and must NOT get this clause.
+    is_first_interior_reveal = (family == 'interior' and bridge_stage in (2, 3))
     if family == 'exterior':
         anchor_rule = (
             "It must RESTATE the locked anchors by name, Grid cell, AND frame-height scale exactly "
@@ -4214,7 +4715,12 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
             "edges, and entry opening are FULLY BEHIND the camera and must NOT appear anywhere in "
             "the frame — interior surfaces fill the frame edge to edge. Restate the INHERITED "
             "interior anchors that are visible from this facing at near-final scale (larger than "
-            "their sill-handoff size), and name the interior's main light source."
+            "their sill-handoff size), and name the interior's main light source. FIRST GLIMPSE "
+            "CONDITION (mandatory): no interior work has happened yet — this narrow vestibule "
+            "sliver must already show the same untouched weathering and material palette "
+            "established outside (at least one visible sign of neglect, e.g. dust, grime, rust, "
+            "or peeling surface), never a swept or staged look; the full extent of the decay is "
+            "revealed in the next beat's turn."
         )
     elif is_cut:
         # 声明式硬切的室内首帧：没有上一帧作视觉参考（t2i 新链头），一致性只能靠
@@ -4240,17 +4746,30 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
             "anchors, exterior boundaries, horizon, or sky."
         )
     else:
-        # P0 门框出画硬条款（TBCP Settle-Frame Door Clearance）：过门完成后的每一帧
-        # 都必须完全入内——门框/门扇/门槛/门洞不得再出现在画面里，跨门光绳只能写成
-        # 镜头身后的方向光，绝不能写成画面中的门口。
-        _door_clearance_rule = (
-            " DOOR CLEARANCE (mandatory): the door frame, door leaf, threshold edges, and the entry "
-            "opening itself are now FULLY BEHIND the camera and must NOT appear anywhere in the frame — "
-            "interior walls, ceiling, and floor fill the frame edge to edge. If entry daylight is "
-            "mentioned, write it as directional light from behind the camera (e.g. \"daylight from the "
-            "entry behind the camera lays a soft bright wedge across the floor toward the rear wall\"), "
-            "never as a visible doorway, door frame, or bright opening in frame."
-        )
+        # P0 门框出画硬条款（TBCP Settle-Frame Door Clearance）已经由下面
+        # family_contract_lines 的"Door clearance (mandatory)"条目覆盖一次（对
+        # family in ('vestibule','interior') 都生效）；这里不再重复追加同一条要求
+        # 进 anchor_rule——2026-07-20 实机复盘发现同一句"door frame and entry opening
+        # ... never appear in frame"曾被反复提三遍（这里 + family_contract 条目 +
+        # camera_dna 逐字开场句本身），导致 LLM 在生成的 IMAGE 正文里把整句 camera_dna
+        # 逐字复读了两遍（见 img_5/7/9/10/11 实例），纯冗余文本 bug。保留一处权威表述
+        # 即可，不影响约束力。
+        # First interior reveal only (see is_first_interior_reveal above): nothing has been
+        # worked on inside yet, so it must read as untouched decay, not a tidy/staged room.
+        # Later interior beats never get this — they follow their own STAGE SCOPE directive.
+        _first_reveal_rule = (
+            " FIRST INTERIOR REVEAL — UNTOUCHED TRAUMA STATE (mandatory): this is the FIRST "
+            "interior IMAGE after the threshold crossing, and no interior construction beat has "
+            "touched this space yet — it must read as the SAME untouched, pre-renovation trauma "
+            "state already established outside, never a tidy or staged room. Show the same "
+            "material palette and weathering established in the exterior beats, plus AT LEAST TWO "
+            "of these decay categories clearly visible: structural damage (cracks, sagging, holes, "
+            "missing sections), surface decay (rust, water stains, peeling paint, mold, corrosion), "
+            "biological/vegetation intrusion (moss, vines, roots, weeds), or debris/clutter "
+            "accumulation (rubble, fallen materials, scattered trash, collapsed fixtures). Do NOT "
+            "show cleared floors, neatly stacked materials, staged tools, or any surface that "
+            "already reads as repaired or prepared — nobody has acted on this space yet."
+        ) if is_first_interior_reveal else ""
         if family_landmarks:
             _int_names = ", ".join(
                 f"{lm.get('name')} at {lm.get('grid')}" for lm in family_landmarks if isinstance(lm, dict))
@@ -4259,7 +4778,7 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
                 f"INTERIOR primary anchors exactly as registered — {_int_names} — keeping their Grid "
                 f"cells and frame-height scales constant, and NEVER restate the exterior anchors, "
                 f"exterior boundaries, horizon, or sky (they are behind the camera now)."
-                + _door_clearance_rule
+                + _first_reveal_rule
             )
         else:
             anchor_rule = (
@@ -4268,7 +4787,7 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
                 "inherited through the opening), with constant Grid cells and frame-height scales, and "
                 "NEVER restate the exterior anchors, exterior boundaries, horizon, or sky (they are "
                 "behind the camera now)."
-                + _door_clearance_rule
+                + _first_reveal_rule
             )
     # IMAGE i+1 is the exterior threshold frame (IMAGE T) when the NEXT beat is
     # Bridge-1: it must pre-visualize the interior anchors through the opening (PBISP).
@@ -4301,6 +4820,43 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
                " (the carrier's own openings, an installed practical light, or entry daylight from "
                "behind the camera)")
             + "; never invent a window or opening the carrier does not have.")
+    if is_first_interior_reveal or family == 'vestibule':
+        family_contract_lines.append(
+            "- First interior reveal — untouched trauma state (mandatory): this beat's resulting "
+            "IMAGE must show the SAME pre-renovation decay/mess established outside (structural "
+            "damage, surface decay, vegetation intrusion, and/or debris/clutter — at least two "
+            "categories for the settle/turn frame, at least one visible sign for a vestibule "
+            "sliver), never a clean or staged room; this applies ONLY here, not to later interior "
+            "beats, which follow STAGE SCOPE instead.")
+    if is_bridge_span:
+        family_contract_lines.append(
+            "- Bridge SPAN merged-crossing clip (this beat's VIDEO): this is now the ONLY video "
+            "clip for the entire exterior-to-interior crossing — the previous beat (bridge_stage 1) "
+            "is a discarded internal placeholder, never assembled into the final film. This beat's "
+            "VIDEO must depict the FULL crossing as ONE continuous, unbroken camera move, in this "
+            "order, without ever stopping, holding, or pausing on the threshold/doorway as a "
+            "composition: (1) camera pushes coaxially forward toward the open threshold, exterior "
+            "daylight and materials visible at the very start; (2) as the camera reaches and "
+            "crosses the sill, the door-frame edges slide symmetrically outward past the left/right "
+            "boundaries in one continuous wipe, never held static; (3) exposure and white balance "
+            "roll smoothly from exterior daylight to the interior's dimmer tone across the whole "
+            "clip, attributed to the same light source throughout; (4) the inherited interior "
+            "anchors continuously scale up along the camera axis without repositioning or "
+            "re-rendering, reaching their settled scale by the last frame; (5) the clip ends with "
+            "the camera fully inside (or, in the PAN variant, at the vestibule point), the door "
+            "frame and threshold completely behind the camera and out of frame. The door/threshold "
+            "must NEVER read as a resting shot or an implied cut point at any moment — the whole "
+            "crossing is one unbroken push.\n"
+            f"- This beat's VIDEO first-frame anchor is IMAGE {i-1} (the exterior state before the "
+            f"discarded HOLD beat), NOT IMAGE {i} — every 'first frame'/'last frame' binding "
+            f"sentence must reference IMAGE {i-1} and IMAGE {i+1}.")
+    if is_bridge_hold:
+        family_contract_lines.append(
+            "- Bridge HOLD (this beat's VIDEO is a discarded placeholder): this beat's VIDEO slot "
+            "is never generated, rendered, or assembled into the final film — do not write real "
+            "camera-motion prose for it. Its ONLY real output is the resulting IMAGE (the internal "
+            "Sill Handoff frame), generated purely as an i2i grounding step for the next beat's "
+            "IMAGE; the viewer never sees this beat's video or a held shot of the doorway.")
     if is_turn:
         _turn_dir = str(beat.get('turn_direction') or '').strip().lower()
         _dir_txt = f"to the {_turn_dir}" if _turn_dir in ('left', 'right') else "in the declared direction"
@@ -4335,11 +4891,63 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
     return {
         'beat': beat, 'is_last': is_last, 'is_threshold_or_reveal': is_threshold_or_reveal,
         'is_bridge': is_bridge, 'is_turn': is_turn, 'is_cut': is_cut,
-        'is_pre_bridge': is_pre_bridge, 'family': family,
+        'is_bridge_hold': is_bridge_hold, 'is_bridge_span': is_bridge_span,
+        'is_first_interior_reveal': is_first_interior_reveal,
+        'is_pre_bridge': is_pre_bridge, 'family': family, 'stage_scope': stage_scope,
         'anchor_rule': anchor_rule, 'family_contract': family_contract,
         'templates_cropped': templates_cropped,
         'img_i_lighting': img_i_lighting, 'img_ip1_lighting': img_ip1_lighting,
     }
+
+
+def _stage_scope_beat_directive(stage_scope, img_before="this beat's starting IMAGE",
+                                 img_after="this beat's resulting IMAGE"):
+    """The tier-specific state-delta + VIDEO-sweep instruction for ONE beat, given its
+    normalized stage_scope ('large'/'small'/'default'/None). Single source of truth for
+    this wording — both the batched per-beat block (_beat_block_text) and the single-beat
+    fallback system prompt (_generate_single_beat_with_retries) call this instead of each
+    hand-duplicating their own copy, so the two call sites cannot drift on this rule.
+    Returns '' for None (threshold/reward/bridge/hard_cut beats follow their own rules
+    elsewhere and get no stage-scope directive)."""
+    if stage_scope == 'large':
+        return (
+            f'STAGE SCOPE FOR THIS BEAT: LARGE — the sequence\'s one designated large-scale, '
+            f'whole-of-construction jump. Describe this beat\'s state delta as a MAJOR, '
+            f'FRAME-WIDE transformation: the beat\'s single operation COMPLETED across its '
+            f'ENTIRE visible extent (name every surface/region it covers, e.g. "all interior '
+            f'walls and the ceiling curve are now paneled", never "a section of wall" or '
+            f'"begins to"). Comparing {img_before} and {img_after} side by side must instantly '
+            f'show a fully finished construction stage. THIS BEAT\'S VIDEO must show that '
+            f'operation sweeping progressively across its full extent within the clip '
+            f'(coverage grows continuously from start to finish) so the last frame equals '
+            f'{img_after}\'s fully-transformed state.'
+        )
+    elif stage_scope == 'small':
+        return (
+            f'STAGE SCOPE FOR THIS BEAT: SMALL — a real but LOCALIZED jump. Describe this '
+            f'beat\'s state delta as a clearly visible, genuinely completed sub-region of the '
+            f'operation\'s surface: name the specific sub-area finished (e.g. "the wall beside '
+            f'the entry and the corner nook are now paneled") while explicitly stating the rest '
+            f'of that surface remains in its prior, untreated state (e.g. "the far wall and '
+            f'ceiling curve remain bare studs"). {img_after} must show real, noticeable progress '
+            f'confined to that named sub-area — never full coverage, never a single decorative '
+            f'object. THIS BEAT\'S VIDEO must show the operation sweeping progressively across '
+            f'ONLY that sub-region within the clip, so the last frame equals {img_after}\'s '
+            f'partially-but-genuinely-completed sub-area, with the rest of the surface visibly '
+            f'untouched.'
+        )
+    elif stage_scope == 'default':
+        return (
+            f'STAGE SCOPE FOR THIS BEAT: DEFAULT — ordinary incremental continuing work. '
+            f'Describe this beat\'s state delta as modest, believable progress beyond '
+            f'{img_before}: coverage grows somewhat but does NOT need to reach any describable '
+            f'completion milestone. Phrasing such as "one section", "part of", or "begins to" '
+            f'is explicitly PERMITTED and encouraged here — describe the true partial, '
+            f'in-progress state honestly. THIS BEAT\'S VIDEO must show that ordinary '
+            f'incremental work happening across the clip, ending at {img_after}\'s '
+            f'modestly-advanced (still partial) state.'
+        )
+    return ''
 
 
 def _batch_shared_system_prompt(packet, scup_ref, tbcp_ref):
@@ -4366,14 +4974,15 @@ Write the beats IN ORDER. Each beat's resulting IMAGE must continue directly and
 - THIS BEAT'S VIDEO must use progressive (-ing) verbs for ongoing actions, name worker silhouettes (HAL) and tools (MTAL) if workers are present, encapsulate bulk materials in rigid containers (VMFP/RCE), and include pacing control "continuous construction time-lapse, not real-time footage" (unless threshold or reward).
 - THIS BEAT'S VIDEO CONCRETENESS (no abstractions): describe the SAME single lone worker every beat, reusing the exact costume from the packet worker_choreography (e.g. "one lone worker in a solid pale shirt, dark pants, and dark cap"); name the ONE specific manual tool used; describe the concrete repeated work cycle in -ing verbs (e.g. scooping, lifting, pressing, fastening). NEVER write vague filler like "transformation progresses" or "the scene transforms" — show observable physical actions only.
 - THIS BEAT'S VIDEO must end with a PERSISTENT-TRACES clause naming the marks this beat leaves behind (e.g. scrape grooves, end-grain circles, screw heads, nail rows, sawdust trails, trimmed edges, compression tracks), followed by a natural-language description of both the near-field diegetic sound effects (2-4 specific sounds of tools, materials, or footsteps) and the steady room/environment ambient noise. Use varied phrasing for these audio descriptions rather than a single formulaic structure across beats.
-- THIS BEAT'S resulting IMAGE must be a clean frame with ZERO workers/machinery. Do NOT use the words 'worker', 'builder', 'carpenter', 'laborer', 'person', 'man', 'woman', or 'people' under any circumstances, even to state that they are absent or not present. Describe only static objects, surfaces, and traces. Apply the ANCHOR RULE given in this beat's own section below. Then describe this beat's state delta as a MAJOR, FRAME-WIDE transformation: the beat's single operation COMPLETED across its entire visible extent (name every surface/region it covers — e.g. "all interior walls and the ceiling curve are now paneled", never "a section of wall is paneled" or "begins to"). Comparing this beat's starting and resulting IMAGE side by side must instantly show a finished construction stage, not a token patch or a single added object. Also include a FEW (2-3, not exhaustive) PERSISTENT physical traces that prove the work happened (scrape marks, fastener heads, sawdust, membrane wrinkles, displaced soil, etc.).
-- THIS BEAT'S VIDEO must show that same single operation SWEEPING PROGRESSIVELY across its full extent within the clip (coverage grows continuously from start to finish — e.g. panels advancing wall by wall until every surface is covered), so the last frame equals this beat's resulting IMAGE's fully-transformed state. Prior MAJOR installed/finished features (panels, walls, floors, fixtures, primary landmarks) stay present and unchanged (monotonic state) — but you do NOT need to re-list every minor trace from every earlier beat; it is fine and expected for small cosmetic details to fade from the description as new ones accumulate.
-- For threshold bridge beats (if a beat is a threshold bridge, per its own section below), follow the TBCP rules (Bridge-1 stops at sill; Bridge-2 crosses the sill and settles FULLY INSIDE with the door frame completely out of frame; a Bridge-3 turn beat, when present, is a stationary pan locking onto the interior's long axis; soft exposure roll; door-frame wipe). For a DECLARED HARD CUT beat, its VIDEO is a placeholder declaration and its IMAGE re-establishes the interior from scratch per its anchor rule.
+- THIS BEAT'S resulting IMAGE must be a clean frame with ZERO workers/machinery. Do NOT use the words 'worker', 'builder', 'carpenter', 'laborer', 'person', 'man', 'woman', or 'people' under any circumstances, even to state that they are absent or not present. Describe only static objects, surfaces, and traces. Apply the ANCHOR RULE given in this beat's own section below. Then describe this beat's state delta following the STAGE SCOPE TIER declared for THIS beat (see "STAGE SCOPE FOR THIS BEAT" in this beat's own section below): the three possible tiers are LARGE (the sequence's one full-extent completion jump), SMALL (a real but localized sub-region jump, 2-3 of these in the ladder), and DEFAULT (ordinary incremental progress, all other beats) — each tier's exact wording requirement is given per-beat below. For threshold, bridge, and reward beats, ignore this instruction and follow their own dedicated rules elsewhere in this prompt instead. Also include a FEW (2-3, not exhaustive) PERSISTENT physical traces that prove the work happened (scrape marks, fastener heads, sawdust, membrane wrinkles, displaced soil, etc.).
+- THIS BEAT'S VIDEO must follow that same per-beat STAGE SCOPE TIER for how much of the operation it sweeps across within the clip (see this beat's own "STAGE SCOPE FOR THIS BEAT" section below for the exact requirement). Prior MAJOR installed/finished features (panels, walls, floors, fixtures, primary landmarks) stay present and unchanged (monotonic state) — but you do NOT need to re-list every minor trace from every earlier beat; it is fine and expected for small cosmetic details to fade from the description as new ones accumulate.
+- For threshold bridge beats (if a beat is a threshold bridge, per its own section below), follow the TBCP rules: the first bridge beat (bridge_stage 1, HOLD) is a discarded internal placeholder — its VIDEO is never generated or shown; the second bridge beat (bridge_stage 2, SPAN) is the ONLY visible crossing clip and must depict the full exterior-to-settle (or exterior-to-vestibule, in the PAN variant) arc in one continuous shot, anchored from the PRE-HOLD exterior IMAGE, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it; a Bridge-3 turn beat, when present, is unchanged — a stationary pan locking onto the interior's long axis. For a DECLARED HARD CUT beat, its VIDEO is a placeholder declaration and its IMAGE re-establishes the interior from scratch per its anchor rule.
 - NLVTR visual-only rule: No '%' symbols, no numeric ranges, no acronyms (HAL, SCUP, NGCS, VMFP, RCE, GCTR, RPL, OSPL, RHMA, PBISP, HCL, NLVTR, MTAL, TSPA) in the prompts.
 - REALISM rule (mandatory): strictly documentary photorealism. Every material, fixture, tool, and technique must be real-world and present-day (wood, stone, brass, wool, glass, leather, standard trade tools). NO sci-fi, futuristic, cyberpunk, holographic, glowing-tech-panel, LED-neon, or spacecraft-style elements anywhere in the scene.
 - FULL-ENCLOSURE COVERAGE: When a beat involves framing, insulating, paneling, or painting walls, its IMAGE prompt MUST explicitly include the ceiling/roof/top surface as well. For example, if walls in Grid B1, B3, C1, C3 are paneled, the ceiling curve in Grid A1, A2, A3 must ALSO be described as paneled. Never treat wall coverage as complete without ceiling coverage in any enclosed space (cabin, room, fuselage, container, vault, etc.).
 - CAMERA VIEWPOINT CONTINUITY: If the previous IMAGE was shot from an interior viewpoint (camera inside the space, entry behind camera), the next IMAGE MUST maintain the same interior viewpoint UNLESS an explicit camera-pullback VIDEO is inserted between them. You CANNOT jump from interior to exterior viewpoint without a transition. If a beat requires switching back to an exterior view, generate its VIDEO as a reverse dolly pulling back through the doorway, and describe the exposure transition accordingly.
 - EXTERIOR WORK VISIBILITY: If a beat involves work on the EXTERIOR surface of the structure (e.g., exterior insulation, exterior membrane), and the camera is positioned INSIDE looking out, the VIDEO must show the worker operating at the boundary edges visible from inside (e.g., working at seam lines visible in Grid B1/B3 from the interior). Do not describe exterior work that would be invisible from the current camera position.
+- ZONE-APPROPRIATE PROTECTIVE LAYERS: only describe waterproofing membrane, tar/bitumen coating, or vapor barrier material on a surface with real moisture/weather exposure (below-grade wall/floor, roof, exterior envelope, bathroom/kitchen/pool). Never describe these on an ordinary dry interior wall, floor, or ceiling — use plain primer/paint finish there instead.
 - CONSTRUCTION ORDER CONSTRAINTS: Floor finish (hardwood, tile) MUST be installed BEFORE heavy anchored objects (fireplace, stove) are placed on it. If a beat installs a fireplace or heavy object, its IMAGE must show it sitting on the FINISHED floor, not on bare metal/subfloor. If the floor is not yet finished, the fireplace cannot be installed in that beat.
 
 For EACH beat listed in the user message, output its two prompts using EXACTLY these markers (replace N with that beat's own number):
@@ -4399,9 +5008,11 @@ def _beat_block_text(i, contract):
     varies beat-to-beat (shot family lock, cropped template exemplars, lighting phases,
     this beat's own anchor rule, operation/description)."""
     beat = contract['beat']
+    stage_scope_directive = _stage_scope_beat_directive(contract['stage_scope'])
+    stage_scope_section = f"\n{stage_scope_directive}\n" if stage_scope_directive else ""
     return f"""==================== BEAT {i} ====================
 Operation: {beat.get('operation', '')} — {beat.get('description', '')}
-
+{stage_scope_section}
 LIGHTING PHASE CONTRACT FOR THIS BEAT:
 - The state before this beat uses lighting phase: {contract['img_i_lighting']}
 - This beat's resulting IMAGE MUST use lighting phase: {contract['img_ip1_lighting']}
@@ -4561,14 +5172,16 @@ Instructions:
 - VIDEO {i} must use progressive (-ing) verbs for ongoing actions, name worker silhouettes (HAL) and tools (MTAL) if workers are present, encapsulate bulk materials in rigid containers (VMFP/RCE), and include pacing control "continuous construction time-lapse, not real-time footage" (unless threshold or reward).
 - VIDEO {i} CONCRETENESS (no abstractions): describe the SAME single lone worker every beat, reusing the exact costume from the packet worker_choreography (e.g. "one lone worker in a solid pale shirt, dark pants, and dark cap"); name the ONE specific manual tool used; describe the concrete repeated work cycle in -ing verbs (e.g. scooping, lifting, pressing, fastening). NEVER write vague filler like "transformation progresses" or "the scene transforms" — show observable physical actions only.
 - VIDEO {i} must end with a PERSISTENT-TRACES clause naming the marks this beat leaves behind (e.g. scrape grooves, end-grain circles, screw heads, nail rows, sawdust trails, trimmed edges, compression tracks), followed by a natural-language description of both the near-field diegetic sound effects (2-4 specific sounds of tools, materials, or footsteps) and the steady room/environment ambient noise. Use varied phrasing for these audio descriptions rather than a single formulaic structure.
-- IMAGE {i+1} must be a clean frame with ZERO workers/machinery. Do NOT use the words 'worker', 'builder', 'carpenter', 'laborer', 'person', 'man', 'woman', or 'people' under any circumstances, even to state that they are absent or not present. Describe only static objects, surfaces, and traces. {contract['anchor_rule']} Then describe this beat's state delta as a MAJOR, FRAME-WIDE transformation: the beat's single operation COMPLETED across its entire visible extent (name every surface/region it covers — e.g. "all interior walls and the ceiling curve are now paneled", never "a section of wall is paneled" or "begins to"). Comparing IMAGE {i} and IMAGE {i+1} side by side must instantly show a finished construction stage, not a token patch or a single added object. Also include a FEW (2-3, not exhaustive) PERSISTENT physical traces that prove the work happened (scrape marks, fastener heads, sawdust, membrane wrinkles, displaced soil, etc.).
-- VIDEO {i} must show that same single operation SWEEPING PROGRESSIVELY across its full extent within the clip (coverage grows continuously from start to finish — e.g. panels advancing wall by wall until every surface is covered), so the last frame equals IMAGE {i+1}'s fully-transformed state. Prior MAJOR installed/finished features (panels, walls, floors, fixtures, primary landmarks) stay present and unchanged (monotonic state) — but you do NOT need to re-list every minor trace from every earlier beat; it is fine and expected for small cosmetic details to fade from the description as new ones accumulate.
-- For threshold bridge beats (if beat is a threshold bridge), follow the TBCP rules (Bridge-1 stops at sill; Bridge-2 crosses the sill and settles FULLY INSIDE with the door frame completely out of frame; a Bridge-3 turn beat, when present, is a stationary pan locking onto the interior's long axis; soft exposure roll; door-frame wipe). For a DECLARED HARD CUT beat, its VIDEO is a placeholder declaration and its IMAGE re-establishes the interior from scratch per its anchor rule.
+- IMAGE {i+1} must be a clean frame with ZERO workers/machinery. Do NOT use the words 'worker', 'builder', 'carpenter', 'laborer', 'person', 'man', 'woman', or 'people' under any circumstances, even to state that they are absent or not present. Describe only static objects, surfaces, and traces. {contract['anchor_rule']} Then describe this beat's state delta following its own STAGE SCOPE TIER (see the STAGE SCOPE FOR THIS BEAT instruction below). Also include a FEW (2-3, not exhaustive) PERSISTENT physical traces that prove the work happened (scrape marks, fastener heads, sawdust, membrane wrinkles, displaced soil, etc.).
+- {_stage_scope_beat_directive(contract['stage_scope'], img_before=f"IMAGE {i}", img_after=f"IMAGE {i+1}") or 'This is a threshold/bridge/reward beat — follow the TBCP/reward rules given elsewhere in this prompt instead of a stage-scope tier.'}
+  Prior MAJOR installed/finished features (panels, walls, floors, fixtures, primary landmarks) stay present and unchanged (monotonic state) — but you do NOT need to re-list every minor trace from every earlier beat; it is fine and expected for small cosmetic details to fade from the description as new ones accumulate.
+- For threshold bridge beats (if beat is a threshold bridge), follow the TBCP rules: the first bridge beat (bridge_stage 1, HOLD) is a discarded internal placeholder — its VIDEO is never generated or shown; the second bridge beat (bridge_stage 2, SPAN) is the ONLY visible crossing clip and must depict the full exterior-to-settle (or exterior-to-vestibule, in the PAN variant) arc in one continuous shot, anchored from the PRE-HOLD exterior IMAGE, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it; a Bridge-3 turn beat, when present, is unchanged — a stationary pan locking onto the interior's long axis. For a DECLARED HARD CUT beat, its VIDEO is a placeholder declaration and its IMAGE re-establishes the interior from scratch per its anchor rule.
 - NLVTR visual-only rule: No '%' symbols, no numeric ranges, no acronyms (HAL, SCUP, NGCS, VMFP, RCE, GCTR, RPL, OSPL, RHMA, PBISP, HCL, NLVTR, MTAL, TSPA) in the prompts.
 - REALISM rule (mandatory): strictly documentary photorealism. Every material, fixture, tool, and technique must be real-world and present-day (wood, stone, brass, wool, glass, leather, standard trade tools). NO sci-fi, futuristic, cyberpunk, holographic, glowing-tech-panel, LED-neon, or spacecraft-style elements anywhere in the scene.
 - FULL-ENCLOSURE COVERAGE: When the beat involves framing, insulating, paneling, or painting walls, the IMAGE prompt MUST explicitly include the ceiling/roof/top surface as well. For example, if walls in Grid B1, B3, C1, C3 are paneled, the ceiling curve in Grid A1, A2, A3 must ALSO be described as paneled. Never treat wall coverage as complete without ceiling coverage in any enclosed space (cabin, room, fuselage, container, vault, etc.).
 - CAMERA VIEWPOINT CONTINUITY: If the previous IMAGE was shot from an interior viewpoint (camera inside the space, entry behind camera), the next IMAGE MUST maintain the same interior viewpoint UNLESS an explicit camera-pullback VIDEO is inserted between them. You CANNOT jump from interior to exterior viewpoint without a transition. If the beat requires switching back to an exterior view, generate the VIDEO as a reverse dolly pulling back through the doorway, and describe the exposure transition accordingly.
 - EXTERIOR WORK VISIBILITY: If the beat involves work on the EXTERIOR surface of the structure (e.g., exterior insulation, exterior membrane), and the camera is positioned INSIDE looking out, the VIDEO must show the worker operating at the boundary edges visible from inside (e.g., working at seam lines visible in Grid B1/B3 from the interior). Do not describe exterior work that would be invisible from the current camera position.
+- ZONE-APPROPRIATE PROTECTIVE LAYERS: only describe waterproofing membrane, tar/bitumen coating, or vapor barrier material on a surface with real moisture/weather exposure (below-grade wall/floor, roof, exterior envelope, bathroom/kitchen/pool). Never describe these on an ordinary dry interior wall, floor, or ceiling — use plain primer/paint finish there instead.
 - CONSTRUCTION ORDER CONSTRAINTS: Floor finish (hardwood, tile) MUST be installed BEFORE heavy anchored objects (fireplace, stove) are placed on it. If this beat installs a fireplace or heavy object, the IMAGE must show it sitting on the FINISHED floor, not on bare metal/subfloor. If the floor is not yet finished, the fireplace cannot be installed in this beat.
 - Output the prompts in the following format:
 ===VIDEO===
@@ -4609,15 +5222,61 @@ Instructions:
                 # 声明式硬切拍：VIDEO 槽确定性覆盖成占位声明（不生成片段、不送 i2v）
                 if contract['is_cut']:
                     v_p = HARD_CUT_VIDEO_PLACEHOLDER
+                # TBCP v3 桥接 HOLD 拍：VIDEO 槽同样确定性覆盖成占位声明——
+                # 过门唯一可见片段是下一拍（SPAN）合并后的跨越镜头。
+                elif contract['is_bridge_hold']:
+                    v_p = BRIDGE_HOLD_VIDEO_PLACEHOLDER
 
-                # skill 直出模式：结构校验只记录不拦截——确定性修复已经兜住会直接
+                # skill 直出模式：风格瑕疵只记录不拦截——确定性修复已经兜住会直接
                 # 破坏渲染的硬伤，剩余瑕疵交给帧渲染后的真实画面审查
                 # (prompt_pipeline.check_full_sequence_consistency)。
+                # 例外：结构性硬伤（VIDEO 无动作正文/桥接无运镜/幽灵施工）意味着
+                # i2v 将无画面可拍（静止/冻结闪切/自造空间），对该拍定向回炉一轮。
                 prev_v = compiled_videos.get(i - 1) if i > 1 else None
                 prev_i = compiled_images.get(i) if i > 1 else None
                 errs = validate_beat_prompts(i, v_p, i_p, packet, mode, is_last, is_threshold_or_reveal, prev_v, prev_i, beat=beat, family=family, is_pre_bridge=is_pre_bridge)
-                if errs and sys.stdout:
-                    print(f"[DIRECT] Beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {errs}")
+                structural, style_errs = split_structural_video_errors(errs)
+                reworked = None
+                if structural and not contract['is_cut']:
+                    if sys.stdout:
+                        print(f"[DIRECT] Beat {i} 结构性硬伤，定向回炉一轮: {structural}")
+                    v_p, reworked = rework_structural_video_beat(config, i, v_p, structural, packet, beat=beat)
+                    if sys.stdout:
+                        print(f"[DIRECT] Beat {i} 回炉{'成功，已采用重写稿' if reworked else '未通过，保留原稿（仅留痕）'}")
+                image_similar, style_errs = split_image_similarity_errors(style_errs)
+                image_reworked = None
+                if image_similar:
+                    if sys.stdout:
+                        print(f"[DIRECT] Beat {i} IMAGE 相似度瑕疵，定向回炉一轮: {image_similar}")
+                    i_p, image_reworked = rework_similar_image_beat(config, i, i_p, image_similar, packet, prev_image=prev_i, beat=beat)
+                    if sys.stdout:
+                        print(f"[DIRECT] Beat {i} IMAGE 回炉{'成功，已采用重写稿' if image_reworked else '未通过，保留原稿（仅留痕）'}")
+                    style_errs = style_errs + image_similar
+                wording_errs = check_stage_scope_wording(i_p, contract['stage_scope'])
+                if wording_errs:
+                    if sys.stdout:
+                        print(f"[DIRECT] Beat {i} STAGE SCOPE 措辞瑕疵，定向回炉一轮: {wording_errs}")
+                    i_p, wording_reworked = rework_stage_scope_wording_beat(
+                        config, i, i_p, wording_errs, contract['stage_scope'], beat=beat)
+                    if sys.stdout:
+                        print(f"[DIRECT] Beat {i} STAGE SCOPE 回炉{'成功，已采用重写稿' if wording_reworked else '未通过，保留原稿（仅留痕）'}")
+                    style_errs = style_errs + wording_errs
+                    # 相似度回炉和 stage_scope 措辞回炉都改写同一个 IMAGE 正文，合并成
+                    # 一个 image_reworked 信号喂给 record_beat_audit——否则这里两个独立
+                    # 局部变量互相覆盖，措辞回炉真实成功了审核报告也会显示"仅留痕"。
+                    image_reworked = wording_reworked if image_reworked is None else (image_reworked or wording_reworked)
+                anchor_errs = check_signature_anchor_realized(i_p, beat)
+                if anchor_errs:
+                    if sys.stdout:
+                        print(f"[DIRECT] Beat {i} 招牌反差点缺失，定向回炉一轮: {anchor_errs}")
+                    i_p, anchor_reworked = rework_missing_anchor_beat(config, i, i_p, anchor_errs, beat=beat)
+                    if sys.stdout:
+                        print(f"[DIRECT] Beat {i} 招牌反差点回炉{'成功，已采用重写稿' if anchor_reworked else '未通过，保留原稿（仅留痕）'}")
+                    style_errs = style_errs + anchor_errs
+                    image_reworked = anchor_reworked if image_reworked is None else (image_reworked or anchor_reworked)
+                if style_errs and sys.stdout:
+                    print(f"[DIRECT] Beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {style_errs}")
+                record_beat_audit(config, i, structural, style_errs, reworked, image_reworked)
 
                 vid_prompt = v_p
                 img_prompt = i_p
@@ -4661,6 +5320,13 @@ Instructions:
 
             if contract['is_cut']:
                 vid_prompt = HARD_CUT_VIDEO_PLACEHOLDER
+            elif contract['is_bridge_hold']:
+                vid_prompt = BRIDGE_HOLD_VIDEO_PLACEHOLDER
+            elif contract['is_bridge_span']:
+                vid_prompt = (
+                f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {i-1} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout. "
+                f"The camera pushes forward in one continuous coaxial move through the open threshold, the door frame sliding fully out of frame, and settles fully inside by the last frame."
+            )
             else:
                 vid_prompt = (
                 f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {i} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout. "
@@ -4752,6 +5418,8 @@ Instructions:
                 # 声明式硬切拍：VIDEO 槽确定性覆盖成占位声明（不生成片段、不送 i2v）
                 if contract['is_cut']:
                     v_p = HARD_CUT_VIDEO_PLACEHOLDER
+                elif contract['is_bridge_hold']:
+                    v_p = BRIDGE_HOLD_VIDEO_PLACEHOLDER
                 prev_v = compiled_videos.get(i - 1) if i > 1 else None
                 prev_i = compiled_images.get(i) if i > 1 else None
                 errs = validate_beat_prompts(
@@ -4764,11 +5432,52 @@ Instructions:
                     f"batched generation result; aborting to avoid shipping placeholder output. Fix "
                     f"the bug rather than retrying."
                 ) from e
-            # skill 直出模式：批量直出的结果只要有 VIDEO/IMAGE 两段就直接采纳——结构
-            # 校验只记录不打回（确定性修复已兜住渲染硬伤，剩余瑕疵交给帧渲染后对真实
-            # 画面的审查），不再为校验瑕疵烧一轮单拍重写。
-            if errs and sys.stdout:
-                print(f"[DIRECT] Batch beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {errs}")
+            # skill 直出模式：批量直出的结果只要有 VIDEO/IMAGE 两段就直接采纳——风格
+            # 瑕疵只记录不打回（确定性修复已兜住渲染硬伤，剩余瑕疵交给帧渲染后对真实
+            # 画面的审查）。例外：结构性硬伤（VIDEO 无动作正文/桥接无运镜/幽灵施工）
+            # 会让 i2v 无画面可拍，对命中的拍定向回炉一轮（只重写 VIDEO，失败保留原稿）。
+            structural, style_errs = split_structural_video_errors(errs)
+            reworked = None
+            if structural and not contract['is_cut']:
+                if sys.stdout:
+                    print(f"[DIRECT] Batch beat {i} 结构性硬伤，定向回炉一轮: {structural}")
+                v_p, reworked = rework_structural_video_beat(config, i, v_p, structural, packet, beat=contract['beat'])
+                if sys.stdout:
+                    print(f"[DIRECT] Batch beat {i} 回炉{'成功，已采用重写稿' if reworked else '未通过，保留原稿（仅留痕）'}")
+            image_similar, style_errs = split_image_similarity_errors(style_errs)
+            image_reworked = None
+            if image_similar:
+                if sys.stdout:
+                    print(f"[DIRECT] Batch beat {i} IMAGE 相似度瑕疵，定向回炉一轮: {image_similar}")
+                i_p, image_reworked = rework_similar_image_beat(config, i, i_p, image_similar, packet, prev_image=prev_i, beat=contract['beat'])
+                if sys.stdout:
+                    print(f"[DIRECT] Batch beat {i} IMAGE 回炉{'成功，已采用重写稿' if image_reworked else '未通过，保留原稿（仅留痕）'}")
+                style_errs = style_errs + image_similar
+            wording_errs = check_stage_scope_wording(i_p, contract['stage_scope'])
+            if wording_errs:
+                if sys.stdout:
+                    print(f"[DIRECT] Batch beat {i} STAGE SCOPE 措辞瑕疵，定向回炉一轮: {wording_errs}")
+                i_p, wording_reworked = rework_stage_scope_wording_beat(
+                    config, i, i_p, wording_errs, contract['stage_scope'], beat=contract['beat'])
+                if sys.stdout:
+                    print(f"[DIRECT] Batch beat {i} STAGE SCOPE 回炉{'成功，已采用重写稿' if wording_reworked else '未通过，保留原稿（仅留痕）'}")
+                style_errs = style_errs + wording_errs
+                # 相似度回炉和 stage_scope 措辞回炉都改写同一个 IMAGE 正文，合并成一个
+                # image_reworked 信号喂给 record_beat_audit——否则措辞回炉真实成功了
+                # 审核报告也会显示"仅留痕"。
+                image_reworked = wording_reworked if image_reworked is None else (image_reworked or wording_reworked)
+            anchor_errs = check_signature_anchor_realized(i_p, contract['beat'])
+            if anchor_errs:
+                if sys.stdout:
+                    print(f"[DIRECT] Batch beat {i} 招牌反差点缺失，定向回炉一轮: {anchor_errs}")
+                i_p, anchor_reworked = rework_missing_anchor_beat(config, i, i_p, anchor_errs, beat=contract['beat'])
+                if sys.stdout:
+                    print(f"[DIRECT] Batch beat {i} 招牌反差点回炉{'成功，已采用重写稿' if anchor_reworked else '未通过，保留原稿（仅留痕）'}")
+                style_errs = style_errs + anchor_errs
+                image_reworked = anchor_reworked if image_reworked is None else (image_reworked or anchor_reworked)
+            if style_errs and sys.stdout:
+                print(f"[DIRECT] Batch beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {style_errs}")
+            record_beat_audit(config, i, structural, style_errs, reworked, image_reworked)
             vid_prompt, img_prompt, beat_succeeded = v_p, i_p, True
             traces_str = batch_secs.get(f'===BEAT {i} TRACES===', '').strip()
             if traces_str:
@@ -4897,6 +5606,7 @@ Check the whole sequence in shot order for these hard vetoes:
 - No paint, spray, or topcoat before rust removal, cleaning, and priming.
 - No covering wet or uncured material (mortar, concrete, glue, paint) with the next layer before it has cured.
 - No service (wiring / plumbing / waterproofing) installed after the panel that would hide it.
+- ZONE-INAPPROPRIATE WATERPROOFING: flag any waterproofing membrane, tar/bitumen coating, or vapor barrier applied to a surface with no plausible moisture/weather exposure (an ordinary dry interior wall/floor/ceiling in a bedroom, living room, or workshop). Below-grade, roof, exterior envelope, and wet-use rooms (bathroom, kitchen, pool, cellar) are legitimate; anywhere else is a violation.
 - Construction state must be monotonic: cleaned stays clean, installed stays installed, dried stays dried — no regression to an earlier state. EXEMPTION: declared temporary works (scaffolding, formwork, shoring, cribbing, protection sheets, portable work lights) MAY be removed in a beat that explicitly shows the strike/carry-out with removal traces (foot pads, compression marks, patched tie holes); never flag such a declared strike as regression, and never "repair" it away. Undeclared blink-out of temporary plant between anchors IS a violation — add the strike action, do not delete the plant.
 - PERSISTENT SITE PLANT: scaffolding, formwork, shoring, and cribbing erected in one beat must stay visible in every later IMAGE anchor until their declared strike beat; an anchor showing freshly poured, unset concrete must still show the formwork supporting it.
 - CEILING/ROOF COVERAGE: No enclosed space (room, cabin, fuselage, container, vault) may have walls paneled/insulated/painted while the ceiling/roof is left as raw exposed structure. If walls are covered, the ceiling must also be covered in the same or a subsequent beat. If ceiling coverage is missing, add it to the wall-coverage beat.
@@ -4911,7 +5621,8 @@ Check the whole sequence in shot order for these hard vetoes:
 - CLEAR PATH REQUIREMENT: If there are sliding, rolling, retracting, or moving parts (e.g. bed rails, sliding bed, folding stairs), ensure a clean spatial path. If structural columns, pillars, or bulkheads block the path of movement in the trauma state (IMAGE 1), they must be explicitly cut/removed early in the sequence (typically during structural repair) and replaced by peripheral support frames before rails or sliding mechanisms are installed.
 - FLOOR & SKELETON MONOTONICITY: If floor/wall joists, ribs, or framing studs will be insulated or paneled later, the bare structural skeleton must be exposed at the very beginning (IMAGE 1/2). The state must progress monotonically forward: bare joists/studs -> rough-in/insulation -> subfloor -> finished flooring/cladding. Never start with a solid finished-looking floor that disappears to reveal raw joists later.
 - STRICT SINGLE-OPERATION BEAT RULE: Each {int(VIDEO_DURATION)}-second video prompt must describe exactly one homogeneous physical task. Combining multiple distinct stages (e.g. spray painting AND mounting door frames, or framing studs AND packing insulation wool, or laying tile AND anchoring stoves AND installing bed rails) into a single {int(VIDEO_DURATION)}-second video is strictly prohibited.
-- GLOBAL STAGE DELTA: within that single operation, every non-bridge beat's IMAGE pair must differ by the operation COMPLETED at its full visible extent (all walls paneled, the entire floor finished — coverage growing continuously across the video). A token-patch delta (one small object added, one patch treated, only a light toggled outside a declared lighting/reveal beat) is a violation — REWRITE the beat to full coverage; do not split it into smaller beats.
+- STAGE SCOPE FIDELITY: verify each beat's rendered IMAGE pair matches what that beat's OWN prompt text promised. If the prompt text claims full/entire/all-surface coverage (a "large-scope" beat), the rendered images must show that completed extent. If the prompt text names a specific sub-region as completed while stating the rest of that surface is untreated (a "small-scope" beat), the render must show exactly that partial state — not full coverage, and not zero change. If the prompt uses incremental/partial phrasing ("one section", "part of", "begins to"), the render must show modest, believable incremental progress — not a full-coverage jump, and not a frozen/no-change frame. A rendered IMAGE that overshoots or undershoots what its own prompt text described is a violation.
+- STAGE SCOPE DRIFT & STALLED PROGRESSION: flag it if MORE THAN ONE beat in the whole sequence renders as a full/entire-coverage completion jump — only a single beat is meant to look that way; every additional beat that also reads as a complete, frame-wide finished stage is a violation (this is a regression toward forcing every beat to a major jump, and must be reported, listed against each offending beat index). Separately, flag it if MOST beats in the sequence show NO visible construction change at all between their starting and resulting IMAGE (a stalled/frozen progression) — every beat, regardless of scope, must show SOME real visible physical change.
 
 [Scene Consistency & Spatial Consistency Upgrade Protocol (SCUP)]
 - Consistent Scene & Layout: The background environment, geographical elements, time-of-day, camera position/DNA, visual style, and color scheme must be completely consistent across the sequence.
@@ -4926,7 +5637,7 @@ Check the whole sequence in shot order for these hard vetoes:
 - BI-DIRECTIONAL AGENT FLOW: Workers in video prompts must enter from a specific coordinate edge at t=0s and walk out through the same edge by t={WORKER_EXIT_TIME}s, leaving the frame completely empty of active agents at t={int(VIDEO_DURATION)}s. No teleportation or instant popping.
 - RIGID CONTAINER ENCAPSULATION: All loose materials, debris, fasteners, and liquids must be stored and tracked inside rigid, quantifiable containers (e.g. buckets, parts trays, boxes), and their volumes must be described as continuously increasing or decreasing.
 - THRESHOLD PEEK ANCHOR QUALIFICATION & SCALE: the two interior landmarks pre-visualized through the doorway before a threshold bridge must plausibly ALREADY EXIST at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. NEVER future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures): the bridge precedes interior construction, so peeking them forces objects to exist before the beat that creates them. Each peeked anchor's declared frame-height scale must strictly INCREASE across the bridge IMAGEs (approach -> sill handoff -> interior settled); a constant scale across the crossing is a violation — fix the scales, keep the objects.
-- BRIDGE WHITE-BALANCE DIRECTION: Bridge-1 and Bridge-2 must state ONE consistent colour-temperature direction attributed to the same light source (default: dimmer and cooler; dimmer and warmer only when a warm interior light source is already burning and visible through the doorway). Opposite directions across the two bridge clips (warmer on approach, cooler on settle, or vice versa) are a violation.
+- BRIDGE WHITE-BALANCE DIRECTION: the merged crossing clip's (Bridge-2/SPAN) VIDEO prose must describe ONE consistent, gradual colour-temperature direction across its full arc (approach through settle), attributed to the same light source throughout (default: dimmer and cooler; dimmer and warmer only when a warm interior light source is already burning and visible through the doorway). A mid-clip reversal (e.g. warmer at the start, cooler by the end, or vice versa) is a violation. Bridge-1 (HOLD) is a discarded placeholder and has no real prose to check.
 - DOOR-FRAME CLEARANCE: once the threshold crossing has completed (the interior-settled IMAGE produced by the final bridge clip, and EVERY later interior IMAGE), the rendered frame must be FULLY INSIDE the space: no door frame, door jamb, door leaf, threshold/sill edge, or entry-opening silhouette may remain visible anywhere in frame, and the interior walls/ceiling/floor must fill the frame edge to edge. An interior still seen THROUGH the doorway (opening edges visible at or near the frame borders, interior occupying only an inner region) is a violation on every frame it appears in. The sill-handoff/vestibule frame(s) BETWEEN the bridge clips are exempt.
 - INTERIOR OCCUPANCY: post-crossing interior frames must be dominated by the interior space itself — walls, ceiling, and floor reaching the frame edges — never a small bright interior rectangle surrounded by exterior or dark margins.
 - CARRIER IDENTITY: post-crossing interior frames must still read as the inside of THIS specific carrier — its fixed identity features (e.g. a bus's side window band, ribbed roof curve, wheel arches; a boat's rib frames and portholes; this carrier's equivalents, per the registered interior anchors) stay visible unless a declared beat explicitly covers or removes them on camera. An interior that has degraded into a generic room/box with no carrier-specific feature visible is a violation.
@@ -4940,20 +5651,51 @@ Respond with STRICT JSON only, no markdown fences, mapping each beat index (as a
 {{"3": ["天花板未随墙面一起封板", "IMAGE 4 中出现了未在前序拍中安装过的门扇"], "5": ["视角从室内跳切到室外，中间没有回拉镜头过渡"]}}"""
 
 
-def check_full_sequence_consistency(config, prompt_block, frame_image_paths):
+def _compress_frames_for_review(paths, max_side=768, quality=72):
+    """一致性审查降级重试用：把整套帧压成小尺寸 JPEG 临时文件。全尺寸 webp 帧的
+    base64 载荷动辄十几 MB（13 帧 ≈ 15MB），是审查超时的主要嫌疑；压到 768px JPEG
+    可缩 ~10 倍。任何一张压缩失败就整体放弃、原样返回输入路径（宁可用原图再试）。"""
+    try:
+        from PIL import Image
+    except ImportError:
+        return paths
+    import tempfile
+    try:
+        tmp_dir = tempfile.mkdtemp(prefix='seq_review_')
+        out = []
+        for idx, p in enumerate(paths):
+            with Image.open(p) as im:
+                im = im.convert('RGB')
+                im.thumbnail((max_side, max_side))
+                dst = os.path.join(tmp_dir, f'f{idx:03d}.jpg')
+                im.save(dst, 'JPEG', quality=quality)
+                out.append(dst)
+        return out
+    except Exception:
+        return paths
+
+
+def check_full_sequence_consistency(config, prompt_block, frame_image_paths, degraded=False):
     """整套序列渲染完成后的一致性审查：把完整提示词集 + 已渲染的真实帧图一起交给
     多模态 LLM 判断施工顺序/SCUP 违规，取代原来盲文本的逐轮全量审核（见
     prompt_pipeline_refactor 里去掉的 validate_and_repair / 审核表)。
 
     frame_image_paths: {sequence(int): image_path}，按 sequence 升序传给模型。
-    返回 {beat_index(int): [violation, ...]}；空字典 = 通过。best-effort——任何失败
-    (含模型/JSON 解析异常）都当作"本轮无法判定"，返回空字典而不是拦截渲染流程。"""
+    返回 {beat_index(int): [violation, ...]}；空字典 = 审查跑成且未发现违规；
+    **None = 审查没跑成**（超时/网关异常/响应不可解析）。调用方绝不能把 None 当
+    "通过"处理——把调用失败 fail-open 成"无违规"正是 2026-07-15 盐湖贝壳单 13 帧
+    被盖 sequence_reviewed_pass 假章、两处空间断裂直通视频合成的事故根源。
+    degraded=True 为降级重试档：帧图压小 + 超时放宽，用判定精度换可用性。"""
     if not prompt_block or not frame_image_paths:
         return {}
     total_beats = len(frame_image_paths) - 1
     if total_beats <= 0:
         return {}
     ordered_paths = [frame_image_paths[seq] for seq in sorted(frame_image_paths)]
+    timeout = 90
+    if degraded:
+        ordered_paths = _compress_frames_for_review(ordered_paths)
+        timeout = 180
     system_prompt = _sequence_review_system_prompt(total_beats)
     user_text = (
         f"Here is the complete generated prompt set:\n{prompt_block}\n\n"
@@ -4961,10 +5703,11 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths):
         f"first) against this prompt set and report violations as JSON."
     )
     try:
-        response = _multimodal_chat(config, system_prompt, user_text, ordered_paths, max_tokens=2000)
+        response = _multimodal_chat(config, system_prompt, user_text, ordered_paths,
+                                    max_tokens=2000, timeout=timeout)
         data = json.loads(_strip_code_fences(response))
         if not isinstance(data, dict):
-            return {}
+            return None
         failures = {}
         for k, v in data.items():
             try:
@@ -4976,8 +5719,8 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths):
         return failures
     except Exception as e:
         if sys.stdout:
-            print(f"[SEQUENCE REVIEW] check_full_sequence_consistency failed (fail-open, treated as no violations found this round): {e}")
-        return {}
+            print(f"[SEQUENCE REVIEW] check_full_sequence_consistency 未完成（本轮无判定，不视为通过）: {e}")
+        return None
 
 
 def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, family=None):
@@ -5163,8 +5906,14 @@ def _build_partial_prompt_block(compiled_images, compiled_videos, beat_ladder):
         if (idx - 1) < len(beat_ladder):
             beat = beat_ladder[idx - 1]
             bs = beat.get('bridge_stage')
-            if bs in (1, 2):
-                meta = "BRIDGE"
+            if bs == 1:
+                # TBCP v3: HOLD 拍——本拍视频是内部占位声明，不生成也不参与最终成片；
+                # 'BRIDGE' 子串保留，所有既有 is_bridge 检测不受影响。
+                meta = "BRIDGE HOLD"
+            elif bs == 2:
+                # TBCP v3: SPAN 拍——过门唯一可见片段，起点重定向到 HOLD 拍之前的
+                # 室外锚点帧（见 video_generator.plan_video_slots 的 start_anchor_slot）。
+                meta = "BRIDGE SPAN"
             elif bs == 3:
                 # 摇镜桥（pan 变体 Bridge-3）：帧渲染据此选旋转版 i2i 控制指令；
                 # 'BRIDGE' 子串保留，所有既有 is_bridge 检测不受影响
@@ -5309,6 +6058,9 @@ def run_ideate(config, count=8, theme=None, theme_label=None, trend_ref_ids=None
         stored = load_trend_refs() or []
         by_id = {e.get('id'): e for e in stored if isinstance(e, dict)}
         selected_refs = [by_id[i] for i in trend_ref_ids if i in by_id]
+        if selected_refs:
+            # 回写使用统计:软上限淘汰时优先保留"被验证过有用"的条目
+            mark_trend_refs_used([e['id'] for e in selected_refs])
 
     if selected_refs:
         trend_refs = [{

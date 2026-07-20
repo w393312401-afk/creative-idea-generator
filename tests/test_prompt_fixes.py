@@ -13,6 +13,7 @@ from prompt_pipeline import (
     check_stylistic_repetition,
     _aux_model,
     check_adjacent_frame_semantics_batch,
+    _stage_scope_beat_directive,
 )
 from frame_generator import _extract_image_prompts
 
@@ -308,11 +309,13 @@ Video prompt 8 here.
         compiled_videos = {1: "video 1", 2: "bridge video 2"}
         images, videos, block = _build_partial_prompt_block(compiled_images, compiled_videos, beat_ladder)
         self.assertEqual(images[3]['meta'], "BRIDGE")  # IMAGE 3 follows beat_ladder[1] (bridge_stage=1)
-        self.assertEqual(videos[2]['meta'], "BRIDGE")  # VIDEO 2 is beat_ladder[1] itself
+        # VIDEO 2 is beat_ladder[1] itself (bridge_stage=1, TBCP v3 HOLD — discarded
+        # internal placeholder, never assembled into the final film).
+        self.assertEqual(videos[2]['meta'], "BRIDGE HOLD")
         self.assertEqual(images[2]['meta'], "")
         self.assertEqual(videos[1]['meta'], "")
         self.assertIn("图片 3 [BRIDGE]:", block)
-        self.assertIn("视频 2 [BRIDGE]:", block)
+        self.assertIn("视频 2 [BRIDGE HOLD]:", block)
 
     def test_checkpoint_is_failed_terminal_detects_poisoned_resume(self):
         """A checkpoint whose fallback_count already exceeds the quality gate is a failed-terminal
@@ -412,6 +415,23 @@ class TestPacketShapeNormalization(unittest.TestCase):
         self.assertIn("remove debris", ladder[0]["description"])
         self.assertIsInstance(ladder[1]["operation"], str)
         self.assertEqual(ladder[1]["bridge_stage"], 1)
+
+    def test_normalize_beat_ladder_anchor_keywords(self):
+        # SIGNATURE ANCHOR RULE (2026-07-20): the reward beat's anchor_keywords must
+        # survive normalization as a clean list of non-empty strings, defaulting to []
+        # everywhere it wasn't declared (only meaningful on the reward beat) or was
+        # malformed (a bare string instead of a list, stray blanks, non-string items).
+        ladder = [
+            {"index": 1, "operation": "clearing", "description": "d1", "bridge_stage": None},
+            {"index": 2, "operation": "reward", "description": "d2", "bridge_stage": None,
+             "anchor_keywords": ["cast-iron valve stove", "  ", 42, "suspended above the hearth"]},
+            {"index": 3, "operation": "reward", "description": "d3", "bridge_stage": None,
+             "anchor_keywords": "single string form"},
+        ]
+        normalize_beat_ladder(ladder)
+        self.assertEqual(ladder[0]["anchor_keywords"], [])
+        self.assertEqual(ladder[1]["anchor_keywords"], ["cast-iron valve stove", "42", "suspended above the hearth"])
+        self.assertEqual(ladder[2]["anchor_keywords"], ["single string form"])
 
 
 class TestShotFamilySpatialLocks(unittest.TestCase):
@@ -601,6 +621,54 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
         self.assertIsInstance(packet['interior_camera_dna'], str)
         self.assertIsInstance(packet['interior_primary_landmarks'][0]['grid'], str)
         self.assertIsInstance(packet['interior_primary_landmarks'][0]['z_depth_scale'], str)
+
+
+class TestStageScopeBeatDirective(unittest.TestCase):
+    def test_three_tiers_and_none_produce_distinct_text(self):
+        large = _stage_scope_beat_directive('large')
+        small = _stage_scope_beat_directive('small')
+        default = _stage_scope_beat_directive('default')
+        none_text = _stage_scope_beat_directive(None)
+        texts = [large, small, default, none_text]
+        self.assertEqual(len(set(texts)), len(texts))
+        self.assertEqual(none_text, '')
+
+    def test_large_tier_demands_full_coverage_language(self):
+        text = _stage_scope_beat_directive('large')
+        self.assertIn('ENTIRE', text)
+        self.assertIn('MAJOR', text)
+        self.assertIn('FRAME-WIDE', text)
+
+    def test_small_tier_names_subregion_and_untouched_remainder(self):
+        text = _stage_scope_beat_directive('small')
+        self.assertIn('LOCALIZED', text)
+        self.assertIn('sub-region', text)
+        self.assertIn('untreated state', text)
+        self.assertIn('never full coverage', text)
+
+    def test_default_tier_permits_partial_phrasing(self):
+        text = _stage_scope_beat_directive('default')
+        self.assertIn('"one section"', text)
+        self.assertIn('"part of"', text)
+        self.assertIn('"begins to"', text)
+        self.assertIn('PERMITTED', text)
+
+    def test_unknown_scope_returns_empty_string(self):
+        self.assertEqual(_stage_scope_beat_directive('medium'), '')
+        self.assertEqual(_stage_scope_beat_directive(''), '')
+
+    def test_img_before_after_substitution_generic_labels(self):
+        # 'small' 档只引用 img_after（局部完工只跟"完工后"的这一帧比较），'default' 档
+        # 两者都引用 —— 用 default 档验证通用占位符（默认值)能被正确替换进正文。
+        text = _stage_scope_beat_directive('default')
+        self.assertIn("this beat's starting IMAGE", text)
+        self.assertIn("this beat's resulting IMAGE", text)
+
+    def test_img_before_after_substitution_numbered_labels(self):
+        text = _stage_scope_beat_directive('large', img_before='IMAGE 5', img_after='IMAGE 6')
+        self.assertIn('IMAGE 5', text)
+        self.assertIn('IMAGE 6', text)
+        self.assertNotIn("this beat's starting IMAGE", text)
 
 
 if __name__ == '__main__':

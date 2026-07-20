@@ -288,6 +288,9 @@ IMG2IMG_CONTROL_PROMPT = (
     "not a loose style reference. Keep the camera ABSOLUTELY locked: exact camera position, "
     "lens, crop, horizon, perspective, frame boundaries, structural geometry, and the "
     "positions/scales of all locked anchor landmarks must match the source frame precisely. "
+    "Also match the source frame's exact photographic rendering style, grain, and material "
+    "weathering/grime/wear/finish level — do not clean up, smooth, brighten, or re-stylize any "
+    "surface into a crisper or more polished look than the source frame already has. "
     "Within that locked framing, EXECUTE THE FULL STAGE TRANSFORMATION the description "
     "specifies: apply the described construction change across its entire visible extent — "
     "every surface and region the description says has changed must visibly change. Do NOT "
@@ -296,6 +299,18 @@ IMG2IMG_CONTROL_PROMPT = (
     "description does not change stays pixel-faithful. Do not add grid lines, guides, labels, "
     "letters, numbers, percentages, captions, text, watermarks, extra people, or active "
     "machinery. Return one clean edited image only."
+)
+# 2026-07-16: 网关限流兜底切模型时追加的强化子句——实测 gemini-3.1-flash-image→
+# gpt-image-2 回退会把同一张"纪实做旧"参考图渲成干净的 CGI 建筑可视化效果（材质/
+# 磨损/颗粒感全丢），链内出现明显风格断裂。基础控制指令假设是"同一个模型认得自己
+# 刚渲出来的东西"，换模型时这个假设不成立，需要更直白地把参考图当强约束重申一遍。
+IMG2IMG_MODEL_FALLBACK_STYLE_GUARD = (
+    " STYLE-FIDELITY OVERRIDE (fallback model in use): you are a different image model from the "
+    "one that rendered the attached source frame, so do not reinterpret its aesthetic toward your "
+    "own default rendering style. Reproduce the source frame's exact material weathering, grime, "
+    "rust, wear, surface roughness, and photographic grain precisely as shown; if in doubt, err "
+    "toward looking texturally identical to the source image rather than toward a cleaner, "
+    "smoother, or more CGI-like render."
 )
 IMG2IMG_BRIDGE_CONTROL_PROMPT = (
     "IMAGE EDITING MODE (CAMERA MOVEMENT ACTIVE). The attached previous frame is the authoritative "
@@ -390,6 +405,24 @@ def effective_config(client_config):
         if client_config.get(k):
             merged[k] = client_config[k]
     return merged
+
+def gpt_image_pixel_size(aspect_ratio):
+    """gpt-image-2 走独立的 codex 网关(65038)，不认 Gemini 网关(8046)那套
+    'w:h' 比例字符串——它是真正的 OpenAI images API，只认 1024x1024 /
+    1024x1536 / 1536x1024 / auto 这几个像素档位，传 '9:16' 会被忽略掉回默认方形。
+    按宽高比归到最接近的三档之一。"""
+    ratio = (aspect_ratio or '1:1').strip()
+    try:
+        w_str, h_str = ratio.split(':', 1)
+        w, h = float(w_str), float(h_str)
+    except (ValueError, AttributeError):
+        return '1024x1024'
+    if w <= 0 or h <= 0:
+        return '1024x1024'
+    if abs(w - h) / max(w, h) < 0.05:
+        return '1024x1024'
+    return '1024x1536' if h > w else '1536x1024'
+
 
 def resolve_gateway(model_name, config):
     base_url = (config.get('baseUrl') or 'http://127.0.0.1:8046/v1').rstrip('/')

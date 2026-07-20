@@ -168,8 +168,17 @@ class TestSupervisedSegmentation(_TmpProjectCase):
         self.assertEqual(calls, [[1], [2, 3, 4]])
         self.assertEqual([r[0] for r in reviews], [1])
 
-    def test_unsupervised_keeps_original_segmentation(self):
+    def test_unsupervised_defaults_to_bridge_anchor_review(self):
+        # 2026-07-15 起全自动模式（config={}）也默认监修桥接/换族锚点
+        # （bridgeAnchorReview 默认开）：换族锚 IMG7 单独成段并审阅；
+        # 首帧监修仍只归 supervisedMode 管，不打扰。
         calls, reviews = self._run(12, bridge_at=6, config={})
+        self.assertEqual(calls, [[1, 2, 3, 4, 5], [6], [7], [8, 9, 10, 11, 12]])
+        self.assertEqual([r[0] for r in reviews], [7])
+        self.assertIn('交接', reviews[0][1])
+
+    def test_bridge_review_disabled_keeps_original_segmentation(self):
+        calls, reviews = self._run(12, bridge_at=6, config={'bridgeAnchorReview': False})
         self.assertEqual(calls, [[1, 2, 3, 4, 5], [6], [7, 8, 9, 10, 11], [12]])
         self.assertEqual(reviews, [])
 

@@ -7,6 +7,7 @@ import unittest
 from video_generator import (
     rewrite_prompt_for_two_card_ui,
     load_slot_frames,
+    load_drift_break_slots,
     plan_video_slots,
     _ManifestWriter,
     _video_info,
@@ -165,6 +166,58 @@ class TestPlanVideoSlots(_TmpDirCase):
         self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
         self.assertIn('旧 i2i 链', plans[1]['warning'])
         self.assertNotIn('warning', plans[0])
+
+    def test_chain_drift_break_blocks_standard_warns_lenient(self):
+        """链回望 FAIL 段（manifest.chain_drift passed=False）覆盖的槽位：standard 拦、
+        lenient 警告放行、off 放行。2026-07-15 盐湖贝壳单 anchor=6/tail=9 FAIL 被无视，
+        vid_006 在室外/室内两张无关帧之间自由变形——此门即为该事故补的。"""
+        frames = self._make_frames(4)
+        drift = {2, 3}  # 模拟 anchor=2 / tail=4 的 FAIL 段
+        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
+                                  gate_level='standard', drift_slots=drift)
+        self.assertEqual([p['action'] for p in plans], ['generate', 'blocked', 'blocked'])
+        self.assertIn('空间断裂', plans[1]['reason'])
+        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
+                                  gate_level='lenient', drift_slots=drift)
+        self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
+        self.assertIn('空间断裂', plans[1]['warning'])
+        self.assertNotIn('warning', plans[0])
+        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
+                                  gate_level='off', drift_slots=drift)
+        self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
+
+    def test_stale_and_drift_warnings_are_both_kept_on_lenient(self):
+        frames = self._make_frames(4)
+        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
+                                  gate_level='lenient', stale_slots={2}, drift_slots={2})
+        w = plans[1]['warning']
+        self.assertIn('旧 i2i 链', w)
+        self.assertIn('空间断裂', w)
+
+
+class TestLoadDriftBreakSlots(unittest.TestCase):
+    """manifest.chain_drift FAIL 段 → 受影响视频槽位（anchor..tail-1）。"""
+
+    def test_failed_entry_covers_anchor_to_tail_minus_one(self):
+        manifest = {'chain_drift': [
+            {'family_anchor': 1, 'mid': 3, 'tail': 4, 'passed': True, 'reason': 'PASS'},
+            {'family_anchor': 6, 'mid': 8, 'tail': 9, 'passed': False, 'reason': 'FAIL: 断裂'},
+        ]}
+        # 2026-07-15 实案：anchor=6/tail=9 FAIL → vid 6/7/8 都可能横跨断裂
+        self.assertEqual(load_drift_break_slots(manifest), {6, 7, 8})
+
+    def test_passed_and_malformed_entries_are_ignored(self):
+        manifest = {'chain_drift': [
+            {'family_anchor': 1, 'tail': 4, 'passed': True},
+            {'family_anchor': 'x', 'tail': 9, 'passed': False},
+            {'tail': 9, 'passed': False},
+            'not a dict',
+        ]}
+        self.assertEqual(load_drift_break_slots(manifest), set())
+
+    def test_missing_chain_drift_key_or_empty_manifest(self):
+        self.assertEqual(load_drift_break_slots({}), set())
+        self.assertEqual(load_drift_break_slots(None), set())
 
 
 class TestLoadSlotFrames(_TmpDirCase):

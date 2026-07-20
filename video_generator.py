@@ -43,6 +43,34 @@ def _load_gray_thumb(path, size=(64, 114)):
         return np.asarray(im.convert('L').resize(size), dtype=np.float32)
 
 
+# ── i2v 提交前的帧对契约（2026-07-15 盐湖贝壳单复盘）──
+# 两端锚点帧本身就注定了片段质量：近似复制对（MAD≤2.2）产出静止片段，空间断裂对
+# （6→7 实测 47.2）产出冻结闪切/自由变形；正常施工推进对落在 4.8~17.3。
+# 阈值留了余量：<3 判"将无变化"、>35 判"疑似空间断裂"。纯本地计算，零 LLM 成本。
+_PAIR_TOO_SIMILAR_MAD = 3.0
+_PAIR_TOO_DIFFERENT_MAD = 35.0
+
+
+def frame_pair_contract(start_frame_path, end_frame_path):
+    """i2v 提交前对首尾锚点帧做本地相似度双向检查。
+
+    返回 (verdict, mad)，verdict ∈ 'ok' | 'too_similar' | 'too_different' | 'skipped'
+    （环境异常/文件缺失时 'skipped'，不拦截——这只是提示性契约，硬拦截由质量门负责）。"""
+    try:
+        if not (start_frame_path and end_frame_path
+                and os.path.exists(start_frame_path) and os.path.exists(end_frame_path)):
+            return 'skipped', None
+        import numpy as np
+        mad = float(np.abs(_load_gray_thumb(start_frame_path) - _load_gray_thumb(end_frame_path)).mean())
+        if mad < _PAIR_TOO_SIMILAR_MAD:
+            return 'too_similar', mad
+        if mad > _PAIR_TOO_DIFFERENT_MAD:
+            return 'too_different', mad
+        return 'ok', mad
+    except Exception:
+        return 'skipped', None
+
+
 def _extract_video_frame(video_path, out_png, position):
     """position: 'first' | 'last'。返回 True 表示抽帧成功。"""
     if position == 'first':
@@ -120,6 +148,42 @@ def _extract_video_mid_frames(video_path, out_dir, fractions=(0.25, 0.5, 0.75)):
     return paths
 
 
+# 冻结片段本地判据（2026-07-15 盐湖贝壳单标定）：抽样帧（first/25%/50%/75%）两两
+# 相邻 MAD——全程冻结的 vid_012 为 1.74/0.62/1.77，低运动但确有动静的 vid_002 为
+# 7.35/5.15/5.67，正常片段 8~14。阈值取 3.0。
+_FROZEN_CLIP_MAD = 3.0
+
+
+def detect_frozen_clip(video_path, mid_frame_paths, tmp_dir):
+    """本地冻结检测（零 LLM 成本）：视频前 3/4 程的抽样帧几乎无变化 = 冻结片段
+    （含"冻结到最后一秒才闪切到尾帧"的 freeze-snap 变体，尾帧不参与冻结判定、
+    只用来区分两种坏法）。返回 (frozen: bool, reason: str)；抽帧/环境异常返回
+    (False, 'skipped:...')，交给后面的 VLM 过程门兜底。"""
+    try:
+        import numpy as np
+        first_png = os.path.join(tmp_dir, 'freeze_first.png')
+        if not _extract_video_frame(video_path, first_png, 'first'):
+            return False, 'skipped:first_extract_failed'
+        seq = [first_png] + list(mid_frame_paths)
+        if len(seq) < 3:
+            return False, 'skipped:not_enough_samples'
+        grays = [_load_gray_thumb(p) for p in seq]
+        mads = [float(np.abs(grays[i] - grays[i + 1]).mean()) for i in range(len(grays) - 1)]
+        detail = '/'.join(f'{m:.2f}' for m in mads)
+        if max(mads) >= _FROZEN_CLIP_MAD:
+            return False, f'motion_ok:{detail}'
+        last_png = os.path.join(tmp_dir, 'freeze_last.png')
+        snap = ''
+        if _extract_video_frame(video_path, last_png, 'last'):
+            last_mad = float(np.abs(grays[-1] - _load_gray_thumb(last_png)).mean())
+            if last_mad >= _FROZEN_CLIP_MAD:
+                snap = f'，且在结尾闪切到尾帧（末段 MAD={last_mad:.1f}）'
+        return True, (f'本地冻结检测：片段前 3/4 程抽样帧几乎无变化（相邻 MAD={detail}，'
+                      f'阈值 {_FROZEN_CLIP_MAD}）{snap}——i2v 没有可执行的动作，产出了静止片段')
+    except Exception as e:
+        return False, f'skipped:{type(e).__name__}'
+
+
 def check_video_process(config, video_path, start_frame, end_frame, prompt):
     """段内过程门：verify_video_anchors 只钉住首尾两端，段内 8 秒是盲区（空心视频/
     幽灵内容的来源）。这里抽出中段帧交给 VLM（prompt_pipeline.run_video_process_check）
@@ -140,6 +204,13 @@ def check_video_process(config, video_path, start_frame, end_frame, prompt):
             if strict_gates_enabled(config):
                 return 'reject', 'strict:mid_extract_failed（严格模式下环境异常按失败处理）'
             return 'accept', 'skipped:mid_extract_failed'
+        # 本地冻结预筛（零 LLM 成本、确定性）：冻结/冻结闪切是明确硬伤，直接定档，
+        # 省掉一次多模态判定调用；有动静的片段才交给 VLM 判过程内容。
+        frozen, freeze_reason = detect_frozen_clip(video_path, mids, td)
+        if frozen:
+            if level == 'lenient':
+                return 'warn', freeze_reason
+            return 'reject', freeze_reason
         from prompt_pipeline import run_video_process_check
         passed, reason = run_video_process_check(config, start_frame, mids, end_frame, prompt)
     if passed:
@@ -169,12 +240,16 @@ def _rel_url(abs_path):
     return rel, '/' + rel
 
 
-def rewrite_prompt_for_two_card_ui(prompt, slot):
-    """把提示词里的 IMAGE slot / IMAGE slot+1（含中文「图片 N」）改写为
-    IMAGE 1 / IMAGE 2，对应 Google Labs Flow 两卡位（首帧/尾帧）UI。"""
-    prompt = re.sub(rf'\bimage\s+{slot}\b', 'IMAGE 1', prompt, flags=re.IGNORECASE)
+def rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=None):
+    """把提示词里的 IMAGE start_slot / IMAGE slot+1（含中文「图片 N」）改写为
+    IMAGE 1 / IMAGE 2，对应 Google Labs Flow 两卡位（首帧/尾帧）UI。start_slot 默认等于
+    slot；TBCP v3 的 Bridge SPAN 槽位（合并过门唯一可见片段）start_slot 会被重定向到
+    HOLD 拍之前的室外锚点帧编号（slot - 1），因为该槽的提示词正文已把首帧绑定改写成
+    IMAGE {slot-1}（见 prompt_pipeline.fix_video_opening 的 first_frame_index）。"""
+    start_slot = slot if start_slot is None else start_slot
+    prompt = re.sub(rf'\bimage\s+{start_slot}\b', 'IMAGE 1', prompt, flags=re.IGNORECASE)
     prompt = re.sub(rf'\bimage\s+{slot + 1}\b', 'IMAGE 2', prompt, flags=re.IGNORECASE)
-    prompt = re.sub(rf'图片\s*{slot}\b', 'IMAGE 1', prompt)
+    prompt = re.sub(rf'图片\s*{start_slot}\b', 'IMAGE 1', prompt)
     prompt = re.sub(rf'图片\s*{slot + 1}\b', 'IMAGE 2', prompt)
     return prompt
 
@@ -211,8 +286,31 @@ def load_stale_slots(manifest_data):
     return stale
 
 
+def load_drift_break_slots(manifest_data):
+    """manifest.chain_drift 里 FAIL 段覆盖的视频槽位集合。
+
+    链回望（pipeline_orchestrator._chain_drift_lookback）对每个镜头族记录
+    {family_anchor, mid, tail, passed, reason}；passed=False 表示锚点帧与族尾帧之间
+    存在身份/机位断裂——断裂点落在 [anchor, tail] 区间内的某一对帧上，因此该区间内
+    所有相邻帧对（视频槽位 anchor..tail-1）都可能横跨断裂。2026-07-15 盐湖贝壳单
+    正是 anchor=6/tail=9 段 FAIL 被无视，vid_006 在室外/室内两张无关帧之间自由变形。
+    此前链回望是纯检测型（结果只写 manifest），这里把它接进视频配对门禁。"""
+    slots = set()
+    for entry in (manifest_data or {}).get('chain_drift', []):
+        if not isinstance(entry, dict) or entry.get('passed') is not False:
+            continue
+        try:
+            anchor = int(entry['family_anchor'])
+            tail = int(entry['tail'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        slots.update(range(anchor, tail))
+    return slots
+
+
 def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, target_slots=None,
-                      strict=False, verify_fn=None, gate_level='standard', stale_slots=None):
+                      strict=False, verify_fn=None, gate_level='standard', stale_slots=None,
+                      drift_slots=None):
     """为每个视频槽位做生成决策。只读文件系统，不做任何写操作，可单测。
 
     video_slots: _parse_prompt_slots 的 videos 输出（{slot: str 或 {'body':...}}）
@@ -242,9 +340,29 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
         item = video_slots[slot]
         prompt = item['body'] if isinstance(item, dict) else item
         meta = str(item.get('meta', '') if isinstance(item, dict) else '').upper()
-        prompt = rewrite_prompt_for_two_card_ui(prompt, slot)
+
+        # TBCP v3 桥接 HOLD 槽位（[BRIDGE HOLD]）：过门合并前的内部占位拍，本拍不生成
+        # 视频片段——过门唯一可见片段是下一槽位（[BRIDGE SPAN]）合并后的跨越镜头。
+        # 与 skip_cut 同款"预期缺失"处理（见 merge_project_videos）。
+        if 'BRIDGE' in meta and 'HOLD' in meta:
+            plan = {
+                'slot': slot, 'seq': seq, 'prompt': '', 'dest_path': '',
+                'start_frame': None, 'end_frame': None, 'delete_existing': False, 'reason': '',
+            }
+            plan['action'] = 'skip_bridge_hold'
+            plan['reason'] = f"视频 {slot} 是过门合并前的内部占位段（[BRIDGE HOLD]）：不生成视频片段，过门唯一可见片段是下一段的合并跨越镜头。"
+            plans.append(plan)
+            continue
+
+        # TBCP v3 桥接 SPAN 槽位（[BRIDGE SPAN]）：过门唯一可见片段，起点重定向到
+        # HOLD 拍之前的室外锚点帧（slot - 1），而非 HOLD 拍自身产出的门槛内部帧——
+        # 该槽的提示词正文已把首帧绑定改写成 IMAGE {slot-1}（见
+        # prompt_pipeline.fix_video_opening 的 first_frame_index）。
+        start_slot = (slot - 1) if ('BRIDGE' in meta and 'SPAN' in meta) else slot
+
+        prompt = rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=start_slot)
         dest_path = os.path.join(videos_dir, f'vid_{slot:03d}.mp4')
-        start_p, end_p = slot_to_path.get(slot), slot_to_path.get(slot + 1)
+        start_p, end_p = slot_to_path.get(start_slot), slot_to_path.get(slot + 1)
         plan = {
             'slot': slot,
             'seq': seq,
@@ -252,6 +370,7 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
             'dest_path': dest_path,
             'start_frame': start_p,
             'end_frame': end_p,
+            'start_anchor_slot': start_slot,
             'delete_existing': False,
             'reason': '',
         }
@@ -282,26 +401,26 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
 
         if not start_p or not os.path.exists(start_p):
             plan['action'] = 'blocked'
-            plan['reason'] = f"视频 {slot} 所需的起始帧 IMAGE {slot} 不存在。请重新生成该帧！"
+            plan['reason'] = f"视频 {slot} 所需的起始帧 IMAGE {start_slot} 不存在。请重新生成该帧！"
         elif not end_p or not os.path.exists(end_p):
             plan['action'] = 'blocked'
             plan['reason'] = f"视频 {slot} 所需的结束帧 IMAGE {slot + 1} 不存在。请重新生成该帧！"
-        elif slot_to_quality.get(slot) == 'i2i_fallback_degraded' \
+        elif slot_to_quality.get(start_slot) == 'i2i_fallback_degraded' \
                 or slot_to_quality.get(slot + 1) == 'i2i_fallback_degraded':
             plan['action'] = 'blocked'
             plan['reason'] = (
-                f"视频 {slot} 的起始帧 IMAGE {slot} 或结束帧 IMAGE {slot + 1} 属于降级帧（i2i fallback degraded），"
+                f"视频 {slot} 的起始帧 IMAGE {start_slot} 或结束帧 IMAGE {slot + 1} 属于降级帧（i2i fallback degraded），"
                 f"已拦截该段视频生成以防止画面跳变。请重新生成并修复受损帧。"
             )
         elif gate_level != 'off' and (
-            slot_to_quality.get(slot) in ('vlm_qa_failed', 'sequence_review_flagged')
+            slot_to_quality.get(start_slot) in ('vlm_qa_failed', 'sequence_review_flagged')
             or slot_to_quality.get(slot + 1) in ('vlm_qa_failed', 'sequence_review_flagged')
         ):
             # 已知坏帧不再烧昂贵的视频生成额度：'vlm_qa_failed'（旧逐帧质检门终态，
             # 现已停用，仅为兼容旧 manifest 保留）/'sequence_review_flagged'（整套序列
             # 一致性审查修复轮次耗尽仍有问题）都是已知有问题、需要人工介入的终态。
-            _bad_gate = slot_to_quality.get(slot)
-            _bad = slot if _bad_gate in ('vlm_qa_failed', 'sequence_review_flagged') else slot + 1
+            _bad_gate = slot_to_quality.get(start_slot)
+            _bad = start_slot if _bad_gate in ('vlm_qa_failed', 'sequence_review_flagged') else slot + 1
             _bad_gate = slot_to_quality.get(_bad)
             plan['action'] = 'blocked'
             plan['reason'] = (
@@ -309,22 +428,54 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                 f"请重渲该帧（或将质检档位调为 off 放行）后重试。"
             )
         elif stale_slots and gate_level == 'standard' \
-                and (slot in stale_slots or (slot + 1) in stale_slots):
-            _stale = slot if slot in stale_slots else slot + 1
+                and (start_slot in stale_slots or (slot + 1) in stale_slots):
+            _stale = start_slot if start_slot in stale_slots else slot + 1
             plan['action'] = 'blocked'
             plan['reason'] = (
                 f"视频 {slot} 的锚点帧 IMAGE {_stale} 派生自旧的 i2i 链（上游帧已被单独重渲，"
                 f"血统过期），已拦截以防跨链跳变。请顺序重渲 IMAGE {_stale} 及其后续帧，"
                 f"或将质检档位调为 lenient 带警告放行。"
             )
+        elif drift_slots and gate_level == 'standard' and (slot in drift_slots or start_slot in drift_slots):
+            # 链回望确认该族段存在身份/机位断裂（manifest.chain_drift FAIL）：断裂
+            # 区间内的帧对送 i2v 只会得到冻结闪切或自由变形片段，standard 档拦截。
+            # SPAN 槽位横跨两个旧概念上的帧对缺口（HOLD 拍已废弃自身视频），两端都要查。
+            plan['action'] = 'blocked'
+            plan['reason'] = (
+                f"视频 {slot} 位于链回望检测到的空间断裂族段内（chain_drift FAIL）：两端帧"
+                f"可能不属于同一空间/机位，生成只会得到跳变或变形片段。请重渲断裂族段的帧"
+                f"（或将质检档位调为 lenient 带警告放行）后重试。"
+            )
         else:
             plan['action'] = 'generate'
-            if stale_slots and (slot in stale_slots or (slot + 1) in stale_slots):
-                _stale = slot if slot in stale_slots else slot + 1
-                plan['warning'] = (
+            warnings = []
+            if stale_slots and (start_slot in stale_slots or (slot + 1) in stale_slots):
+                _stale = start_slot if start_slot in stale_slots else slot + 1
+                warnings.append(
                     f"视频 {slot} 的锚点帧 IMAGE {_stale} 派生自旧 i2i 链（上游帧已被单独重渲），"
                     f"两端帧可能存在跨链色彩/内容漂移。"
                 )
+            if drift_slots and (slot in drift_slots or start_slot in drift_slots):
+                warnings.append(
+                    f"视频 {slot} 位于链回望检测到的空间断裂族段内（chain_drift FAIL），"
+                    f"两端帧可能不属于同一空间/机位，片段存在跳变/变形风险。"
+                )
+            # i2v 帧对契约：两端锚点帧近乎相同→静止片段，差异过大→断裂/变形。
+            # 提示性警告（不拦截）：断裂的硬拦截由 chain_drift 门负责，这里兜住
+            # 链回望覆盖不到的帧对（如族内相邻帧渲成了复制帧）。
+            verdict, mad = frame_pair_contract(start_p, end_p)
+            if verdict == 'too_similar':
+                warnings.append(
+                    f"视频 {slot} 的首尾锚点帧近乎相同（MAD={mad:.1f}），i2v 大概率产出"
+                    f"静止无变化片段——建议先重渲其中一帧或合并相邻拍。"
+                )
+            elif verdict == 'too_different':
+                warnings.append(
+                    f"视频 {slot} 的首尾锚点帧差异过大（MAD={mad:.1f}），疑似空间断裂，"
+                    f"i2v 只能冻结闪切或自造画面过渡——建议改为 [CUT] 硬切或重渲帧。"
+                )
+            if warnings:
+                plan['warning'] = ' '.join(warnings)
         plans.append(plan)
     return plans
 
@@ -343,6 +494,10 @@ def _video_info(plan, video_model, status, error=None):
         'prompt': plan['prompt'],
         'model': video_model,
         'status': status,
+        # TBCP v3 Bridge SPAN 槽位的真实起始锚点帧编号（非 SPAN 槽位等于自身 slot）；
+        # merge_project_videos 的锚点一致性核对需要它，否则会把 SPAN 片段的真实起点
+        # （室外锚点帧）误判为与自身 slot 不符。
+        'start_anchor_slot': plan.get('start_anchor_slot', plan['slot']),
     }
     if error:
         info['error'] = error
@@ -448,6 +603,9 @@ class _BatchBridge:
             if process_reason is not None:
                 # 段内过程检测留痕：PASS / WARN:... / Skipped(...) / skipped:...
                 info['process_check'] = process_reason
+                if action == 'warn':
+                    # 结构化告警标记：终态质量风险汇总据此计数，不用猜留痕文本语义
+                    info['process_warned'] = True
             self.writer.record(info)
             if self.process_check_fn is not None and process_reason and action == 'warn':
                 self._emit('video_warning', {
@@ -491,7 +649,8 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     plans = plan_video_slots(videos, slot_to_path, slot_to_quality, videos_dir, target_slots,
                               strict=strict_gates_enabled(config),
                               gate_level=qa_gate_level(config),
-                              stale_slots=load_stale_slots(manifest_data))
+                              stale_slots=load_stale_slots(manifest_data),
+                              drift_slots=load_drift_break_slots(manifest_data))
 
     if on_progress:
         on_progress('start', {
@@ -517,6 +676,17 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
             # 声明式硬切：记入 manifest（status='skipped_cut'）供合成门禁识别为预期缺失，
             # 不提交生成、不算失败
             writer.record(_video_info(plan, video_model, status='skipped_cut'))
+            if on_progress:
+                on_progress('video_skipped', {
+                    'index': plan['slot'], 'current': plan['seq'],
+                    'total': len(plans), 'message': plan['reason'],
+                })
+            continue
+        if plan['action'] == 'skip_bridge_hold':
+            # TBCP v3 桥接 HOLD 拍：记入 manifest（status='skipped_bridge_hold'）供合成
+            # 门禁识别为预期缺失，不提交生成、不算失败——过门唯一可见片段是下一槽位
+            # （SPAN）合并后的跨越镜头。
+            writer.record(_video_info(plan, video_model, status='skipped_bridge_hold'))
             if on_progress:
                 on_progress('video_skipped', {
                     'index': plan['slot'], 'current': plan['seq'],
@@ -729,10 +899,12 @@ def merge_project_videos(project_dir, allow_partial=False):
     expected_slots = []
 
     if frames:
-        # 声明式硬切槽位（status='skipped_cut'）是"预期缺失"：不算缺口、不占位填充，
-        # 合成时相邻两段直接相接=成片在此处硬切（TBCP v2 hard_cut 变体的既定语义）。
+        # 声明式硬切槽位（status='skipped_cut'）和桥接 HOLD 槽位（status=
+        # 'skipped_bridge_hold'，TBCP v3）都是"预期缺失"：不算缺口、不占位填充。
+        # 硬切=相邻两段直接相接（成片在此处硬切）；HOLD=过门唯一可见片段是下一槽位
+        # （SPAN）合并后的跨越镜头，本槽本就不该有自己的片段。
         skipped_cut = {v.get('slot') for v in videos
-                       if isinstance(v, dict) and v.get('status') == 'skipped_cut'}
+                       if isinstance(v, dict) and v.get('status') in ('skipped_cut', 'skipped_bridge_hold')}
         expected_slots = [s for s in range(1, len(frames)) if s not in skipped_cut]
         for slot in expected_slots:
             v = by_slot.get(slot)
@@ -743,7 +915,11 @@ def merge_project_videos(project_dir, allow_partial=False):
             if not os.path.exists(abs_path):
                 missing.append(slot)
                 continue
-            start_p = _resolve_frame(frame_by_slot.get(slot))
+            # TBCP v3 Bridge SPAN 片段的真实起点是 HOLD 拍之前的室外锚点帧
+            # （start_anchor_slot），不是自身 slot 对应的帧——否则锚点一致性核对会把
+            # 正确生成的合并跨越镜头误判成串片（mismatched）。
+            start_slot = v.get('start_anchor_slot') or slot
+            start_p = _resolve_frame(frame_by_slot.get(start_slot))
             end_p = _resolve_frame(frame_by_slot.get(slot + 1))
             # 合并门禁没有请求级 config，strict 开关直接取服务端配置
             ok, reason = verify_video_anchors(abs_path, start_p, end_p, strict=strict_gates_enabled())
@@ -768,7 +944,7 @@ def merge_project_videos(project_dir, allow_partial=False):
     if allow_partial and (missing or mismatched):
         return _merge_with_placeholders(
             project_dir, manifest_data, expected_slots, good,
-            missing, mismatched, frame_by_slot,
+            missing, mismatched, frame_by_slot, by_slot,
         )
 
     # 无缺口/无串片：走原有干净合并路径
@@ -915,7 +1091,7 @@ def merge_project_videos(project_dir, allow_partial=False):
 
 
 def _merge_with_placeholders(project_dir, manifest_data, expected_slots, good,
-                             missing, mismatched, frame_by_slot):
+                             missing, mismatched, frame_by_slot, by_slot=None):
     """强制合并（allow_partial）：缺失/串片槽位用起始锚点帧定格 + 「缺失」标注填充，
     保持时间轴对齐与顺序，输出带 _partial 后缀的预览成片（视频轨、2x 加速、无音轨）。
     绝不静默丢弃缺口——这正是当初加合成门禁的原因。"""
@@ -971,7 +1147,11 @@ def _merge_with_placeholders(project_dir, manifest_data, expected_slots, good,
             filter_parts.append(f"[{idx}:v]{norm}[v{idx}]")
         else:
             placeholder_slots.append(slot)
-            frame_path = _resolve_frame(frame_by_slot.get(slot))
+            # TBCP v3 Bridge SPAN 槽位的定格占位帧用真实起点（HOLD 拍之前的室外锚点帧）
+            # 而非自身 slot 对应的帧，与 merge_project_videos 主路径的锚点解析口径一致。
+            _v = (by_slot or {}).get(slot)
+            _anchor_slot = (_v.get('start_anchor_slot') if isinstance(_v, dict) else None) or slot
+            frame_path = _resolve_frame(frame_by_slot.get(_anchor_slot))
             if frame_path:
                 inputs += ["-loop", "1", "-t", f"{seg_dur:.3f}", "-i", frame_path]
                 chain = (f"[{idx}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"

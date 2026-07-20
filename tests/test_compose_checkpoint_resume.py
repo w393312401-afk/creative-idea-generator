@@ -8,6 +8,7 @@ Drift Lock 包/IMAGE 1)和已经生成过的拍全部重新跑一遍。
 3. compose_remaining_beats 命中存档时只重新生成尚未成功的拍;中途崩溃(NameError 等
    代码级错误,现实中最容易触发"合成失败"的场景)后存档要精确停在最后一拍。
 """
+import json
 import os
 import re
 import shutil
@@ -98,6 +99,101 @@ class TestComposeAnchorResume(unittest.TestCase):
         # 没有存档时不应该在这个早期检查上抛异常或误跳过——正常往下走到 Phase 1(会真的
         # 调 _chat),这里只验证没有存档不会被误判为"可续传"。
         self.assertIsNone(pp.load_compose_checkpoint(self.fingerprint))
+
+
+class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
+    """根因回归(2026-07-20)：dimensions.anchors(如一键合成灵感卡片的 idea.twist_zh)
+    此前只被当"参考文字"塞进 Step 1 brief-parsing 的 user message，该调用要求 LLM 输出
+    的 JSON schema 里根本没有承载它的字段——往后整条合成管线（beat ladder / 逐拍撰写 /
+    确定性复核）都读不到它，导致招牌反差点从未出现在渲染出的提示词里。
+
+    修复：parsed_brief['signature_anchor'] 由 Python 侧直接赋值（不经过 LLM 转录），
+    这里用一个「Step 1 LLM 返回的 JSON 完全不含任何锚点相关字段」的桩响应证明它仍然
+    正确落到 parsed_brief 里，并且会被写进 Step 3 beat ladder 生成的 system prompt。"""
+
+    def setUp(self):
+        self._tmp_dir = tempfile.mkdtemp()
+        self._path_patch = patch.object(pp, 'COMPOSE_CHECKPOINT_PATH', os.path.join(self._tmp_dir, 'compose_checkpoints.json'))
+        self._path_patch.start()
+        self.addCleanup(self._path_patch.stop)
+        self.addCleanup(shutil.rmtree, self._tmp_dir, ignore_errors=True)
+        for p in (patch.object(pp, 'load_reference_file', return_value=''),
+                  patch.object(pp, 'get_cropped_templates', return_value='')):
+            p.start()
+            self.addCleanup(p.stop)
+
+        self.dimensions = {
+            'theme': '高山废弃铁路蒸汽机车注水塔改造成独居御寒暖阁',
+            'anchors': ['利用蒸汽机车原装铸铁注水阀门旧物Upcycling改装成悬空柴暖壁炉'],
+            'complexity': '硬核重工', 'budget': '轻奢设计师级', 'ratio': '50%',
+            'creativity': '脑洞大开', 'beats_count': 2,
+        }
+        self.captured_beat_system = {}
+
+        # Step 1 brief-parsing 桩响应：故意不含任何锚点相关字段，证明后面能看到锚点
+        # 靠的是 Python 侧直接赋值，不是指望这次 LLM 调用把它转录出来。
+        brief_json = json.dumps({
+            'carrier': 'abandoned steam-locomotive water tower', 'env': 'alpine mountainside',
+            'trauma': 'rusted and frost-cracked', 'destiny': 'snug winter refuge den',
+            'destiny_zh': '独居御寒暖阁', 'reward': 'firelight fills the finished room',
+            'mode': 'Standard', 'space_type': 'abandoned property', 'carrier_family': 'man-made',
+        })
+        beat_ladder_json = json.dumps([
+            {'index': 1, 'operation': 'clearing', 'description': 'clearing debris', 'bridge_stage': None, 'stage_scope': 'large'},
+            {'index': 2, 'operation': 'framing', 'description': 'framing interior walls', 'bridge_stage': None, 'stage_scope': 'small'},
+            {'index': 3, 'operation': 'reward', 'bridge_stage': None,
+             'description': 'The cast-iron valve stove hangs suspended above the hearth as warm light fills the finished room.',
+             'anchor_keywords': ['cast-iron valve stove']},
+        ])
+        packet_json = json.dumps({
+            'camera_dna': 'static tripod shot, ultra-wide lens, horizon line remains level at 50-percent height',
+            'geometry_lock': 'fixed boundaries', 'primary_landmarks': [
+                {'name': 'tower doorway', 'grid': 'Grid B2', 'z_depth_scale': '40%'},
+            ],
+            'frame_boundaries': {'left': 'B1', 'right': 'B3', 'top': 'A2', 'bottom': 'C2'},
+            'object_ledger': [], 'worker_choreography': 'one lone worker',
+            'lighting_phase_ladder': {str(i): 'ambient only' for i in range(1, 5)},
+            'passive_environment': 'still alpine air', 'interest_budget': {},
+        })
+
+        def fake_chat(config, system, user, **kwargs):
+            if 'scene analysis agent' in system:
+                return brief_json
+            if 'construction planner' in system:
+                self.captured_beat_system['text'] = system
+                return beat_ladder_json
+            if 'spatial consistency supervisor' in system:
+                return packet_json
+            if 'generate the very first IMAGE prompt' in system:
+                return 'A static wide shot of the derelict water tower, rusted and untouched.'
+            raise AssertionError(f'Unexpected _chat call, system prompt head: {system[:80]!r}')
+
+        self._chat_patch = patch.object(pp, '_chat', side_effect=fake_chat)
+        self._chat_patch.start()
+        self.addCleanup(self._chat_patch.stop)
+
+    def test_signature_anchor_survives_into_parsed_brief_and_beat_ladder_prompt(self):
+        state = pp.compose_anchor_and_packet({}, self.dimensions)
+
+        self.assertEqual(
+            state['parsed_brief']['signature_anchor'],
+            '利用蒸汽机车原装铸铁注水阀门旧物Upcycling改装成悬空柴暖壁炉',
+        )
+        # Fix 2: the beat-ladder generation call must have been told about the anchor
+        # and required to realize it on the reward beat.
+        self.assertIn('利用蒸汽机车原装铸铁注水阀门旧物Upcycling改装成悬空柴暖壁炉',
+                       self.captured_beat_system['text'])
+        self.assertIn('SIGNATURE ANCHOR RULE', self.captured_beat_system['text'])
+        # Fix 3 groundwork: the reward beat's anchor_keywords normalized through cleanly.
+        reward_beat = state['beat_ladder'][-1]
+        self.assertEqual(reward_beat['operation'], 'reward')
+        self.assertEqual(reward_beat['anchor_keywords'], ['cast-iron valve stove'])
+
+    def test_no_declared_anchor_leaves_signature_anchor_empty(self):
+        self.dimensions['anchors'] = []
+        state = pp.compose_anchor_and_packet({}, self.dimensions)
+        self.assertEqual(state['parsed_brief']['signature_anchor'], '')
+        self.assertNotIn('SIGNATURE ANCHOR RULE', self.captured_beat_system['text'])
 
 
 class TestComposeRemainingBeatsResume(unittest.TestCase):
@@ -249,8 +345,10 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
         self.assertIsNone(pp.load_compose_checkpoint(self.fingerprint))
 
     def test_direct_mode_accepts_batch_result_despite_validation_errors(self):
-        """skill 直出模式核心契约:批量直出的结果即使校验有瑕疵也直接采纳(只记录日志),
-        绝不触发单拍重写——每拍恰好只被生成一次。"""
+        """skill 直出模式核心契约:批量直出的结果即使校验有**风格**瑕疵也直接采纳
+        (只记录日志),不触发单拍重写——每拍恰好只被生成一次。
+        (2026-07-15 起例外:结构性硬伤会触发单拍定向回炉,见 split_structural_video_errors
+        与 test_structural_beat_rework;本测试的瑕疵字符串刻意不命中结构性标记。)"""
         state = self._make_state(total_beats=3)
         calls = []
         with patch.object(pp, 'validate_beat_prompts', return_value=['soft defect: whatever']), \

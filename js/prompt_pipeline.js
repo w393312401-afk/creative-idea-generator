@@ -365,18 +365,7 @@ function selectIdeationCard(index) {
         task_label: idea.title || null
     };
 
-
-    // 2. Select matching anchors
-    const mappedAnchorVal = mapTwistToAnchorValue(idea.dna);
-    document.querySelectorAll('#anchor-selector .anchor-node').forEach(node => {
-        if (node.dataset.value === mappedAnchorVal) {
-            node.classList.add('active');
-        } else {
-            node.classList.remove('active');
-        }
-    });
-    
-    // 3. Populate slider values
+    // Populate slider values
     document.getElementById('slider-complexity').value = 3;
     document.getElementById('slider-budget').value = 2;
     document.getElementById('slider-ratio').value = 50;

@@ -1050,25 +1050,24 @@ function setupEventListeners() {
         });
     }
 
+    // 取消按钮只作用于「当前正看着的这个创意」的后台任务——每个创意的任务
+    // 各自登记在 ideaTasksById 里，取消动作也必须按创意 id 定位，不能再用全局单例控制器。
     const cancelFramesBtn = document.getElementById('cancel-frames-btn');
     if (cancelFramesBtn) {
         cancelFramesBtn.addEventListener('click', () => {
             // 光 abort() 前端的 SSE 读取只是让浏览器不再看这个任务的进度——后端
             // worker 线程完全不知道、会继续把整条上游重试退避链跑完（卡在限流
             // 重试里可以是分钟级）。必须先把取消请求发到服务端让它真正停下来。
-            const taskId = activeBackgroundTasks.framesTaskId;
-            if (taskId) {
+            const rec = currentIdea && getIdeaTaskRecord(currentIdea.id, 'frames');
+            if (rec && rec.taskId) {
                 fetch('/api/compose-cancel', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ task_id: taskId })
+                    body: JSON.stringify({ task_id: rec.taskId })
                 }).catch(e => console.error("Failed to cancel frames task on server:", e));
             }
-            if (currentFramesController) {
-                currentFramesController.abort();
-                currentFramesController = null;
-            }
-            showToast(taskId ? "已发送取消请求，帧序列生成即将停止" : "已取消帧序列生成", "info");
+            if (rec && rec.controller) rec.controller.abort();
+            showToast(rec && rec.taskId ? "已发送取消请求，帧序列生成即将停止" : "已取消帧序列生成", "info");
         });
     }
 
@@ -1076,19 +1075,16 @@ function setupEventListeners() {
     if (cancelVideosBtn) {
         cancelVideosBtn.addEventListener('click', () => {
             // 见 cancel-frames-btn 的同款说明。
-            const taskId = activeBackgroundTasks.videosTaskId;
-            if (taskId) {
+            const rec = currentIdea && getIdeaTaskRecord(currentIdea.id, 'videos');
+            if (rec && rec.taskId) {
                 fetch('/api/compose-cancel', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ task_id: taskId })
+                    body: JSON.stringify({ task_id: rec.taskId })
                 }).catch(e => console.error("Failed to cancel videos task on server:", e));
             }
-            if (currentVideosController) {
-                currentVideosController.abort();
-                currentVideosController = null;
-            }
-            showToast(taskId ? "已发送取消请求，视频序列生成即将停止" : "已取消视频序列生成", "info");
+            if (rec && rec.controller) rec.controller.abort();
+            showToast(rec && rec.taskId ? "已发送取消请求，视频序列生成即将停止" : "已取消视频序列生成", "info");
         });
     }
 
@@ -1879,6 +1875,20 @@ async function streamProgress(taskId, dimensions) {
         });
 
         if (!isCurrent()) return;
+
+        if (watch.status === 'disconnected') {
+            // 与服务器失联 ≠ 任务失败：合成线程是独立线程，跟客户端有没有人看
+            // 毫无关系，会继续跑到底。不清 localStorage 的 active_task_id——
+            // 保留它，下次刷新页面 resumeActiveTaskIfExists 才能重新接上这条
+            // 任务的事件流，而不是让它在客户端彻底失踪、之后又"凭空"冒出结果。
+            stopLoadingTimer();
+            if (currentGenerationController === controller) currentGenerationController = null;
+            const stageText = document.getElementById('loading-stage-text');
+            if (stageText) stageText.textContent = watch.error;
+            showToast(watch.error, 'warning');
+            return;
+        }
+
         stopLoadingTimer();
         if (currentGenerationController === controller) currentGenerationController = null;
         localStorage.removeItem('spark_active_task_id');
@@ -2133,10 +2143,9 @@ function updateFrameSlotCard(f) {
         </div>
         <span>IMG ${String(f.sequence).padStart(3, '0')}</span>
     `;
-    // Live/retry SSE path: a frame just arrived from the backend and may have overwritten an
-    // already-shown file (retry), so bump its cache version to force one fresh fetch. Passive
-    // grid re-renders (media_renderer) use bust=false and stay on the browser cache.
-    safeSetImageSrc(slot.querySelector('img'), f.url, true);
+    // 缓存版本已由 applyFrameEventToIdea（数据合并的唯一入口）在本次渲染前递增，
+    // 这里用 bust=false 直接取到新版本号；两处各自 bust 会让同一新图被拉两次。
+    safeSetImageSrc(slot.querySelector('img'), f.url, false);
 
     slot.onmouseenter = () => {
         const actions = slot.querySelector('.frame-card-actions');
@@ -2165,29 +2174,18 @@ function updateFrameSlotCard(f) {
 
 /* ── 帧序列实时生成动态 ─────────────────────────────────────────────
    生成过程直接在「连续帧序列生成」模块内滚动直播（逐帧渲染/质检结论/重试原因），
-   不必打开任务列表。只增量追加行、贴底才自动跟随，行数上限 300。 */
-function framesFeedSetLive(isLive) {
-    const dot = document.getElementById('frames-feed-dot');
-    if (dot) dot.classList.toggle('active', !!isLive);
-}
-
-function framesFeedReset(introText) {
-    const wrap = document.getElementById('frames-live-feed');
-    const lines = document.getElementById('frames-live-feed-lines');
-    if (!wrap || !lines) return;
-    lines.innerHTML = '';
-    wrap.style.display = 'block';
-    framesFeedSetLive(true);
-    if (introText) framesFeedLine(introText);
-}
-
-function framesFeedLine(text, cls) {
+   不必打开任务列表。只增量追加行、贴底才自动跟随，行数上限 300。
+   2026-07-15 多创意后台任务改造：行数据先写进该创意在 ideaTasksById 里的
+   TaskRecord.feedLines 缓冲区（无论用户是否正看着这个创意），只有正停留在
+   这个创意页面时才顺带画进 DOM——这样切到另一个创意不会看到串台的动态行，
+   切回来时也能从缓冲区完整回放，而不是"谁最后发起任务谁独占这块面板"。 */
+function _framesFeedAppendDom(text, cls, atDate) {
     const lines = document.getElementById('frames-live-feed-lines');
     if (!lines) return;
     const wrap = document.getElementById('frames-live-feed');
     if (wrap && wrap.style.display === 'none') wrap.style.display = 'block';
     const nearBottom = lines.scrollHeight - lines.scrollTop - lines.clientHeight < 60;
-    const d = new Date();
+    const d = atDate || new Date();
     const p = n => String(n).padStart(2, '0');
     const line = document.createElement('div');
     line.className = 'gen-feed-line' + (cls ? ` ${cls}` : '');
@@ -2198,110 +2196,151 @@ function framesFeedLine(text, cls) {
     if (nearBottom) lines.scrollTop = lines.scrollHeight;
 }
 
-function framesFeedQualityLine(f) {
+function framesFeedSetLive(ideaId, isLive) {
+    const rec = getIdeaTaskRecord(ideaId, 'frames');
+    if (rec) rec.live = !!isLive;
+    if (!isViewingIdea(ideaId)) return;
+    const dot = document.getElementById('frames-feed-dot');
+    if (dot) dot.classList.toggle('active', !!isLive);
+}
+
+function framesFeedReset(ideaId, introText) {
+    if (isViewingIdea(ideaId)) {
+        const wrap = document.getElementById('frames-live-feed');
+        const lines = document.getElementById('frames-live-feed-lines');
+        if (wrap && lines) {
+            lines.innerHTML = '';
+            wrap.style.display = 'block';
+        }
+    }
+    framesFeedSetLive(ideaId, true);
+    if (introText) framesFeedLine(ideaId, introText);
+}
+
+function framesFeedLine(ideaId, text, cls) {
+    const rec = getIdeaTaskRecord(ideaId, 'frames');
+    const atDate = new Date();
+    if (rec) {
+        rec.feedLines.push({ text, cls, time: atDate });
+        while (rec.feedLines.length > 300) rec.feedLines.shift();
+    }
+    if (isViewingIdea(ideaId)) _framesFeedAppendDom(text, cls, atDate);
+}
+
+/** 把这个创意缓冲区里已经攒下的动态行整批回放进 DOM——切回它正在生成的页面时调用。 */
+function framesFeedHydrate(ideaId) {
+    const rec = getIdeaTaskRecord(ideaId, 'frames');
+    const wrap = document.getElementById('frames-live-feed');
+    const lines = document.getElementById('frames-live-feed-lines');
+    if (!wrap || !lines) return;
+    if (!rec) {
+        wrap.style.display = 'none';
+        return;
+    }
+    lines.innerHTML = '';
+    wrap.style.display = 'block';
+    rec.feedLines.forEach(l => _framesFeedAppendDom(l.text, l.cls, l.time));
+    const dot = document.getElementById('frames-feed-dot');
+    if (dot) dot.classList.toggle('active', !!rec.live);
+}
+
+// isIsolatedRetry：单帧/子集重试专用——这类调用只走 generate_frame_sequence
+// 直调路径，从不经过 pipeline_orchestrator 的整套序列一致性审查（那个审查只在
+// target_sequences=None 的整单编排流程里才会跑）。'pending_manual_review' 对
+// 整单流程而言是"审查还没轮到"，但对单帧重试而言这个审查压根不会来——用同一句
+// "将在整套序列渲染完毕后统一进行"会让人误以为还有后续动作（2026-07-20 用户
+// 实测反馈：全自动配置下这句话既不弹窗也等不到审查结果，怀疑是不是卡住了）。
+function framesFeedQualityLine(ideaId, f, isIsolatedRetry) {
     if (!f) return;
     const seq = String(f.sequence || 0).padStart(3, '0');
     const gate = f.quality_gate;
     const reason = typeof f.vlm_qa_reason === 'string' ? f.vlm_qa_reason : '';
     if (gate === 'auto_approved') {
         if (reason.indexOf('WARN') === 0) {
-            framesFeedLine(`✅ IMG ${seq} 完成（宽松放行留痕：${reason.replace(/^WARN:?\s*/, '')}）`, 'warn');
+            framesFeedLine(ideaId, `✅ IMG ${seq} 完成（宽松放行留痕：${reason.replace(/^WARN:?\s*/, '')}）`, 'warn');
         } else {
-            framesFeedLine(`✅ IMG ${seq} 完成（质检通过）`, 'ok');
+            framesFeedLine(ideaId, `✅ IMG ${seq} 完成（质检通过）`, 'ok');
         }
     } else if (gate === 'auto_approved_degraded') {
-        framesFeedLine(`⚠️ IMG ${seq} 已放行（判定服务异常 fail-open：帧已渲染但未经核验，可单帧重试复检）`, 'warn');
+        framesFeedLine(ideaId, `⚠️ IMG ${seq} 已放行（判定服务异常 fail-open：帧已渲染但未经核验，可单帧重试复检）`, 'warn');
     } else if (gate === 'vlm_qa_failed' || gate === 'sequence_review_flagged') {
-        framesFeedLine(`❌ IMG ${seq} 一致性审查未通过（${reason || '原因未知'}），已保留末次渲染结果，可单帧重试`, 'err');
+        framesFeedLine(ideaId, `❌ IMG ${seq} 一致性审查未通过（${reason || '原因未知'}），已保留末次渲染结果，可单帧重试`, 'err');
     } else if (gate === 'sequence_reviewed_pass') {
-        framesFeedLine(`✅ IMG ${seq} 完成（一致性审查通过）`, 'ok');
+        framesFeedLine(ideaId, `✅ IMG ${seq} 完成（一致性审查通过）`, 'ok');
     } else if (gate === 'pending_manual_review') {
-        framesFeedLine(`✅ IMG ${seq} 完成（一致性审查将在整套序列渲染完毕后统一进行）`, 'ok');
+        if (isIsolatedRetry) {
+            framesFeedLine(ideaId, `✅ IMG ${seq} 完成（单帧重试不会触发整套序列一致性审查，如需要请自行确认画面）`, 'ok');
+        } else {
+            framesFeedLine(ideaId, `✅ IMG ${seq} 完成（一致性审查将在整套序列渲染完毕后统一进行）`, 'ok');
+        }
     } else {
-        framesFeedLine(`✅ IMG ${seq} 完成`, 'ok');
+        framesFeedLine(ideaId, `✅ IMG ${seq} 完成`, 'ok');
     }
 }
 
-// 帧序列直播面板（进度条/#frames-live-feed/网格）是页面里唯一一套全局 DOM，
-// 不是按创意分开的。切到别的创意、或任务结束后，必须按"这套 DOM 现在到底该
-// 显示谁"重新裁决一次可见性——同一逻辑在 renderIdea() 切换创意、以及本函数
-// 任务收尾时都要用，所以抽成独立函数（收敛口径，避免两处各写一套判断出现分歧）。
-function syncFramesPanelToCurrentIdea() {
-    const progress = document.getElementById('frames-progress');
-    const feed = document.getElementById('frames-live-feed');
-    const btn = document.getElementById('generate-frames-btn');
-    const runningHere = !!(activeBackgroundTasks.frames && activeBackgroundTasks.framesOwner === currentIdea);
-    if (progress) progress.style.display = runningHere ? 'flex' : 'none';
-    if (feed && !runningHere) feed.style.display = 'none';
-    // 按钮禁用跟随"是否有帧序列任务在跑"这个全局事实，与归属哪个创意无关——
-    // 全局只允许一路帧序列任务在跑，禁用是为了不让用户在此期间又发起一路。
-    if (btn) btn.disabled = !!activeBackgroundTasks.frames;
-}
-
-async function streamFramesProgress(taskId) {
+async function streamFramesProgress(taskId, ownerIdea) {
+    ownerIdea = ownerIdea || currentIdea;
+    if (!ownerIdea) return;
+    const ownerId = ownerIdea.id;
     const btn = document.getElementById('generate-frames-btn');
     const progress = document.getElementById('frames-progress');
     const meta = document.getElementById('frames-meta');
     const grid = document.getElementById('frames-grid');
     if (!btn || !progress || !meta || !grid) return;
 
-    const epoch = ++streamEpochs.frames;
-    const isCurrent = () => epoch === streamEpochs.frames;
-    if (currentFramesController) {
-        try { currentFramesController.abort(); } catch (_) { /* noop */ }
+    // 同一个创意若已有一条帧序列监听在跑（理论上不该发生，generateFrames 已挡住），
+    // 让新的接管旧的，避免两个 watcher 同时往同一份 record 里写。
+    const existingRec = getIdeaTaskRecord(ownerId, 'frames');
+    if (existingRec && existingRec.controller) {
+        try { existingRec.controller.abort(); } catch (_) { /* noop */ }
     }
     const controller = new AbortController();
-    currentFramesController = controller;
+    const rec = beginIdeaTask(ownerId, 'frames', taskId, controller);
+    const isCurrent = () => isIdeaTaskCurrent(ownerId, 'frames', taskId);
+    const isViewing = () => isViewingIdea(ownerId);
+    const setMeta = (text) => { rec.meta = text; if (isViewing()) meta.textContent = text; };
+    const titleTag = () => isViewing() ? '' : `「${ownerIdea.title || '创意'}」`;
 
-    // 这次任务实际归属的创意（在 generateFrames / 断线重连恢复路径里设置）。
-    // 事件回调里一律靠 isDisplayed() 判断"现在还能不能往 DOM 上画"，数据写入
-    // （帧结果、进度状态）则一律认 owningIdea，不认可能已经变了的全局 currentIdea。
-    const owningIdea = activeBackgroundTasks.framesOwner || currentIdea;
-    const isDisplayed = () => currentIdea === owningIdea;
-
-    btn.disabled = true;
-    if (isDisplayed()) {
+    if (isViewing()) {
+        btn.disabled = true;
         progress.style.display = 'flex';
-        meta.textContent = '连接帧生成事件流...';
-        framesFeedReset('🔌 已连接帧生成事件流，等待后台开始…');
     }
+    setMeta('连接帧生成事件流...');
 
-    activeBackgroundTasks.frames = true;
-    activeBackgroundTasks.framesOwner = owningIdea;
-    updateTabStatusDot();
-
-    let frameProgressState = window.ProgressModel ? ProgressModel.createProgressState('frames') : null;
     const applyFramesProgress = (type, data) => {
         if (!window.ProgressModel) return null;
-        const info = ProgressModel.normalizeGenerationProgress(type, data, 'frames', frameProgressState);
-        frameProgressState = info.state;
-        if (isDisplayed()) setProgressBar('frames', info);
+        const info = ProgressModel.normalizeGenerationProgress(type, data, 'frames', rec.progressState);
+        rec.progressState = info.state;
+        rec.progressInfo = info;
+        if (isViewing()) setProgressBar('frames', info);
         return info;
     };
     applyFramesProgress('queue', { message: '连接帧生成事件流...' });
+    framesFeedReset(ownerId, '🔌 已连接帧生成事件流，等待后台开始…');
 
+    let disconnectedFrames = false;
     try {
         const watch = await watchTaskUntilTerminal(taskId, {
             label: 'frames',
             signal: controller.signal,
             onEvent: (type, data) => {
                 if (!isCurrent()) return;
-                const displayed = isDisplayed();
                 if (type === 'start') {
                     applyFramesProgress('start', data);
                     const total = (data && data.total) || 0;
+                    rec.total = total;
+                    setMeta(`开始生成共 ${total} 帧序列图...`);
+                    framesFeedLine(ownerId, `🚀 开始生成，共 ${total} 帧（首帧文生图，后续逐帧图生图链式推进）`);
 
-                    if (!owningIdea.frameRun) {
-                        owningIdea.frameRun = { title: owningIdea.title, frames: [] };
+                    if (!ownerIdea.frameRun) {
+                        ownerIdea.frameRun = { title: ownerIdea.title, frames: [] };
                     }
-                    owningIdea.frameRun.frames = [];
-                    if (displayed) saveCurrentIdeaState();
-                    const existingIdx = savedIdeas.findIndex(item => item.id === owningIdea.id);
-                    if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = owningIdea.frameRun;
+                    ownerIdea.frameRun.frames = [];
+                    if (currentIdea && currentIdea.id === ownerId) saveCurrentIdeaState();
+                    const existingIdx = savedIdeas.findIndex(item => item.id === ownerId);
+                    if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = ownerIdea.frameRun;
 
-                    if (displayed) {
-                        meta.textContent = `开始生成共 ${total} 帧序列图...`;
-                        framesFeedLine(`🚀 开始生成，共 ${total} 帧（首帧文生图，后续逐帧图生图链式推进）`);
+                    if (isViewing()) {
                         grid.innerHTML = '';
                         for (let i = 1; i <= total; i++) {
                             const placeholderCard = document.createElement('div');
@@ -2319,268 +2358,263 @@ async function streamFramesProgress(taskId) {
                 } else if (type === 'frame') {
                     applyFramesProgress('frame', data);
                     const f = data && data.frame;
-                    applyFrameEventToIdea(f, owningIdea);
-                    if (displayed) {
-                        const cur = (data && data.current) || 0;
-                        const tot = (data && data.total) || 0;
-                        if (cur < tot) {
-                            meta.textContent = `正在生成帧序列: ${cur}/${tot} (正在处理第 ${cur + 1} 帧)...`;
-                        } else {
-                            meta.textContent = `正在生成帧序列: ${cur}/${tot} (已生成完毕，正在整理)...`;
-                        }
-                        framesFeedQualityLine(f);
-                        updateFrameSlotCard(f);
+                    const cur = (data && data.current) || 0;
+                    const tot = (data && data.total) || 0;
+                    if (cur < tot) {
+                        setMeta(`正在生成帧序列: ${cur}/${tot} (正在处理第 ${cur + 1} 帧)...`);
+                    } else {
+                        setMeta(`正在生成帧序列: ${cur}/${tot} (已生成完毕，正在整理)...`);
                     }
+                    framesFeedQualityLine(ownerId, f);
+                    // 先合并数据（applyFrameEventToIdea 内会递增该帧 URL 的缓存版本），
+                    // 再渲染卡片，卡片即取到新版本号；两处各自 bust 会造成同一新图被拉两次
+                    applyFrameEventToIdea(f, ownerIdea);
+                    if (isViewing()) updateFrameSlotCard(f);
                 } else if (type === 'frame_start' || type === 'frame_retry' || type === 'queue' || type === 'frame_qa') {
                     const info = applyFramesProgress(type, data);
-                    if (!displayed) return;
-                    if (info && info.label) meta.textContent = info.label;
+                    if (info && info.label) setMeta(info.label);
                     if (type === 'frame_retry') {
                         const reason = data && data.reason ? `：${data.reason}` : '';
-                        framesFeedLine(`🔁 ${(info && info.label) || '质检重试'}${reason}`, 'warn');
+                        framesFeedLine(ownerId, `🔁 ${(info && info.label) || '质检重试'}${reason}`, 'warn');
                     } else if (type === 'frame_start' && info && info.label) {
-                        framesFeedLine(`🎨 ${info.label}`);
+                        framesFeedLine(ownerId, `🎨 ${info.label}`);
                     } else if (type === 'frame_qa') {
                         const seq = data && (data.sequence || data.slot);
-                        framesFeedLine(`🧪 IMG ${String(seq || 0).padStart(3, '0')} 质检判定中…`);
+                        framesFeedLine(ownerId, `🧪 IMG ${String(seq || 0).padStart(3, '0')} 质检判定中…`);
                     }
                 } else if (type === 'upstream_retry') {
-                    if (!displayed) return;
                     // 上游秒报错秒可见：后端每次尝试失败即时推送，不再闷头退避
                     const a = (data && data.attempt) || '?';
                     const m = (data && data.max_attempts) || '?';
                     const tail = data && data.retry_in
                         ? `，${data.retry_in}s 后自动重试（第 ${a}/${m} 次）`
                         : `（第 ${a}/${m} 次，此路终止——若有兜底/收尾会紧随其后，否则任务即将报错结束）`;
-                    framesFeedLine(`⚠️ 上游报错：${(data && data.error) || '未知错误'}${tail}`, 'warn');
-                    meta.textContent = `上游报错，自动重试中（第 ${a}/${m} 次）...`;
+                    framesFeedLine(ownerId, `⚠️ 上游报错：${(data && data.error) || '未知错误'}${tail}`, 'warn');
+                    setMeta(`上游报错，自动重试中（第 ${a}/${m} 次）...`);
                 } else if (type === 'model_fallback') {
-                    if (!displayed) return;
                     const to = (data && data.to) || '兜底模型';
                     const seqNo = data && (data.sequence || data.slot);
-                    framesFeedLine(`🔀 主模型配额耗尽，切换兜底模型 ${to} 继续渲染 IMG ${String(seqNo || 0).padStart(3, '0')}…`, 'warn');
-                    meta.textContent = `主模型配额耗尽，兜底模型 ${to} 渲染中...`;
+                    framesFeedLine(ownerId, `🔀 主模型配额耗尽，切换兜底模型 ${to} 继续渲染 IMG ${String(seqNo || 0).padStart(3, '0')}…`, 'warn');
+                    setMeta(`主模型配额耗尽，兜底模型 ${to} 渲染中...`);
                 } else if (type === 'review_pause') {
-                    // 监修模式：关键点暂停，弹出审阅面板等待 采用/重渲。不在当前
-                    // 展示的创意上不弹面板——那样会打断用户正在看的另一个创意；
-                    // 服务端有超时自动采用兜底，不会因此卡死任务。
-                    if (!displayed) return;
-                    showFrameReviewPanel(taskId, data);
-                    meta.textContent = (data && data.message) || '监修暂停，等待人工确认...';
-                    framesFeedLine(`⏸️ ${(data && data.message) || '监修暂停，等待人工确认…'}`, 'warn');
+                    // 监修模式：关键点暂停，弹出审阅面板等待 采用/重渲。
+                    // 面板是模态弹窗，只在正看着这个创意时弹出；不在时靠动态流留痕+
+                    // 后端超时自动采用兜底（不阻塞用户查看别的创意）。
+                    if (isViewing()) showFrameReviewPanel(taskId, data);
+                    setMeta((data && data.message) || '监修暂停，等待人工确认...');
+                    framesFeedLine(ownerId, `⏸️ ${(data && data.message) || '监修暂停，等待人工确认…'}`, 'warn');
                 } else if (type === 'review_resume') {
-                    if (!displayed) return;
-                    hideFrameReviewPanel();
-                    framesFeedLine(`▶️ ${(data && data.message) || '监修继续'}`);
+                    if (isViewing()) hideFrameReviewPanel();
+                    framesFeedLine(ownerId, `▶️ ${(data && data.message) || '监修继续'}`);
+                } else if (type === 'anchor_inertia' || type === 'door_clearance') {
+                    // 换族锚点惯性卡死 / 门框清除兜底：动态流留痕（含自动 t2i 重渲播报）
+                    if (data && data.message) {
+                        framesFeedLine(ownerId, `${type === 'anchor_inertia' ? '🧲' : '🚪'} ${data.message}`,
+                                       (type === 'anchor_inertia' || data.passed === false) ? 'warn' : undefined);
+                    }
                 } else if (type === 'chain_drift_check' || type === 'anchor_recalibrated' || type === 'reanchor') {
-                    if (!displayed) return;
                     // 检查点现实同步/链回望/重锚定：动态流留痕
                     if (data && data.message) {
-                        framesFeedLine(`${type === 'reanchor' ? '⚓' : '🔭'} ${data.message}`,
+                        framesFeedLine(ownerId, `${type === 'reanchor' ? '⚓' : '🔭'} ${data.message}`,
                                        (type === 'reanchor' || (type === 'chain_drift_check' && data.passed === false)) ? 'warn' : undefined);
                     }
                 } else if (type === 'sequence_review') {
-                    if (!displayed) return;
-                    meta.textContent = (data && data.message) || '正在对整套序列做一致性审查...';
-                    framesFeedLine(`🔍 ${(data && data.message) || '正在对整套序列做一致性审查...'}`);
+                    setMeta((data && data.message) || '正在对整套序列做一致性审查...');
+                    framesFeedLine(ownerId, `🔍 ${(data && data.message) || '正在对整套序列做一致性审查...'}`);
                 } else if (type === 'sequence_review_result') {
-                    if (!displayed) return;
                     if (data && data.message) {
-                        framesFeedLine(`${data.passed ? '✅' : '🛠️'} ${data.message}`, data.passed ? 'ok' : 'warn');
+                        framesFeedLine(ownerId, `${data.passed ? '✅' : '🛠️'} ${data.message}`, data.passed ? 'ok' : 'warn');
                     } else if (data && data.passed) {
-                        framesFeedLine('✅ 整套序列一致性审查通过', 'ok');
+                        framesFeedLine(ownerId, '✅ 整套序列一致性审查通过', 'ok');
                     }
                 } else if (type === 'reconnecting') {
-                    if (!displayed) return;
-                    meta.textContent = `连接中断，正在重连（第 ${data.attempt} 次）...`;
-                    framesFeedLine(`⚠️ 连接中断，正在重连（第 ${data.attempt} 次）…`, 'warn');
+                    setMeta(`连接中断，正在重连（第 ${data.attempt} 次）...`);
+                    framesFeedLine(ownerId, `⚠️ 连接中断，正在重连（第 ${data.attempt} 次）…`, 'warn');
                 } else if (type === 'result' || type === 'error') {
-                    if (displayed) hideFrameReviewPanel();
+                    if (isViewing()) hideFrameReviewPanel();
                     applyFramesProgress(type, data);
                 }
             }
         });
 
         if (!isCurrent()) return;
-        if (isDisplayed()) hideFrameReviewPanel();
-        if (currentFramesController === controller) currentFramesController = null;
-        activeBackgroundTasks.framesTaskId = null;
-        saveActiveBackgroundTasksToLocalStorage();
+        if (isViewing()) hideFrameReviewPanel();
 
         if (watch.status === 'cancelled') {
             throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+        }
+        if (watch.status === 'disconnected') {
+            // 与服务器失联 ≠ 任务失败：后端渲染线程是独立线程，不知道客户端已经
+            // 放弃，会一直跑到底（监修模式的暂停点也会因为没人看事件流而只能
+            // 靠 600s 超时自动采用）。绝不能在这里当成失败收尾——那样 finally
+            // 会 endIdeaTask 清掉任务登记，这条任务从此在客户端没人认领，用户
+            // 还可能对同一帧再点一次"生成"，跟后台线程并发写同一张图。
+            disconnectedFrames = true;
+            setMeta(watch.error);
+            framesFeedLine(ownerId, `⚠️ ${watch.error}`, 'warn');
+            showToast(`${titleTag()}${watch.error}`, 'warning');
+            return;
         }
         if (watch.status === 'failed') {
             throw new Error(watch.error || '未知错误');
         }
 
         if (watch.result) {
-            await syncFrameRunToLibrary(watch.result, owningIdea);
-            if (isDisplayed()) {
-                renderFramesForIdea(owningIdea);
-                framesFeedLine(`🏁 帧序列全部完成，共 ${(watch.result.frames || []).length} 帧`, 'ok');
+            await syncFrameRunToLibrary(watch.result, ownerIdea);
+            if (isViewing()) renderFramesForIdea(ownerIdea);
+            framesFeedLine(ownerId, `🏁 帧序列全部完成，共 ${(watch.result.frames || []).length} 帧`, 'ok');
+            const frameRisks = summarizeRunQuality(watch.result);
+            if (frameRisks) {
+                framesFeedLine(ownerId, `⚠️ 本单质量风险：${frameRisks.join('；')}——建议先处理（详见帧卡片徽标）再生成视频`, 'warn');
+                setMeta(`帧序列完成，但存在质量风险：${frameRisks.join('；')}`);
+                showToast(`${titleTag()}帧序列完成，但检测到质量风险，详见帧序列动态流。`, 'warning');
+            } else {
+                showToast(`${titleTag()}已成功生成 ${(watch.result.frames || []).length} 帧连续帧序列图。`, "success");
             }
-            showToast(`《${getIdeaSaveTitle(owningIdea)}》已成功生成 ${(watch.result.frames || []).length} 帧连续帧序列图。`, "success");
         }
     } catch (e) {
         if (!isCurrent()) return;
-        if (currentFramesController === controller) currentFramesController = null;
         console.error("Failed to generate frames:", e);
         if (e.name === 'AbortError') {
-            if (isDisplayed()) {
-                meta.textContent = '帧序列生成已被用户取消。';
-                framesFeedLine('⏹ 帧序列生成已被用户取消', 'warn');
-            }
-            showToast('已取消帧序列生成', 'info');
+            setMeta('帧序列生成已被用户取消。');
+            framesFeedLine(ownerId, '⏹ 帧序列生成已被用户取消', 'warn');
+            showToast(`${titleTag()}已取消帧序列生成`, 'info');
         } else {
-            if (isDisplayed()) {
-                meta.textContent = `帧序列生成失败: ${e.message}`;
-                framesFeedLine(`❌ 帧序列生成失败：${e.message}`, 'err');
-            }
-            showToast(`《${getIdeaSaveTitle(owningIdea)}》帧序列生成失败: ${e.message}`, "error");
+            setMeta(`帧序列生成失败: ${e.message}`);
+            framesFeedLine(ownerId, `❌ 帧序列生成失败：${e.message}`, 'err');
+            showToast(`${titleTag()}帧序列生成失败: ${e.message}`, "error");
         }
 
-        activeBackgroundTasks.framesTaskId = null;
-        saveActiveBackgroundTasksToLocalStorage();
-
-        if (isDisplayed()) {
-            renderFramesForIdea(owningIdea);
-        }
+        if (isViewing()) renderFramesForIdea(ownerIdea);
     } finally {
         if (isCurrent()) {
-            activeBackgroundTasks.frames = false;
-            activeBackgroundTasks.framesOwner = null;
-            syncFramesPanelToCurrentIdea();
-            updateTabStatusDot();
-            framesFeedSetLive(false);
+            if (isViewing()) framesFeedSetLive(ownerId, false);
+            // 失联分支保留任务登记：下次刷新页面 resumeActiveBackgroundTasksIfExists
+            // 才有机会重新接上这条任务的事件流，而不是让它在客户端彻底失踪。
+            if (!disconnectedFrames) {
+                endIdeaTask(ownerId, 'frames');
+                if (isViewing()) {
+                    progress.style.display = 'none';
+                    btn.disabled = false;
+                }
+            }
         }
     }
 }
 
-// 见 syncFramesPanelToCurrentIdea 的说明：视频直播面板也是页面里唯一一套全局
-// DOM，切创意/任务收尾都要按"这套 DOM 现在到底该显示谁"重新裁决可见性。
-function syncVideosPanelToCurrentIdea() {
-    const progress = document.getElementById('videos-progress');
-    const btn = document.getElementById('generate-videos-btn');
-    const runningHere = !!(activeBackgroundTasks.videos && activeBackgroundTasks.videosOwner === currentIdea);
-    if (progress) progress.style.display = runningHere ? 'flex' : 'none';
-    if (btn) btn.disabled = !!activeBackgroundTasks.videos;
-}
-
-async function streamVideosProgress(taskId) {
+async function streamVideosProgress(taskId, ownerIdea) {
+    ownerIdea = ownerIdea || currentIdea;
+    if (!ownerIdea) return;
+    const ownerId = ownerIdea.id;
     const btn = document.getElementById('generate-videos-btn');
     const progress = document.getElementById('videos-progress');
     const meta = document.getElementById('videos-meta');
     const grid = document.getElementById('videos-grid');
     if (!btn || !progress || !meta || !grid) return;
 
-    const epoch = ++streamEpochs.videos;
-    const isCurrent = () => epoch === streamEpochs.videos;
-    if (currentVideosController) {
-        try { currentVideosController.abort(); } catch (_) { /* noop */ }
+    const existingRec = getIdeaTaskRecord(ownerId, 'videos');
+    if (existingRec && existingRec.controller) {
+        try { existingRec.controller.abort(); } catch (_) { /* noop */ }
     }
     const controller = new AbortController();
-    currentVideosController = controller;
+    const rec = beginIdeaTask(ownerId, 'videos', taskId, controller);
+    const isCurrent = () => isIdeaTaskCurrent(ownerId, 'videos', taskId);
+    const isViewing = () => isViewingIdea(ownerId);
+    const setMeta = (text) => { rec.meta = text; if (isViewing()) meta.textContent = text; };
+    const titleTag = () => isViewing() ? '' : `「${ownerIdea.title || '创意'}」`;
 
-    // 见 streamFramesProgress 里 owningIdea 的说明：数据写入认它，DOM 绘制只在
-    // 它仍是当前展示的创意时才做。
-    const owningIdea = activeBackgroundTasks.videosOwner || currentIdea;
-    const isDisplayed = () => currentIdea === owningIdea;
-
-    btn.disabled = true;
-    if (isDisplayed()) {
+    if (isViewing()) {
+        btn.disabled = true;
         progress.style.display = 'flex';
-        meta.textContent = '连接视频生成事件流...';
     }
+    setMeta('连接视频生成事件流...');
 
-    activeBackgroundTasks.videos = true;
-    activeBackgroundTasks.videosOwner = owningIdea;
-    updateTabStatusDot();
-
-    let videoProgressState = window.ProgressModel ? ProgressModel.createProgressState('videos') : null;
     const applyVideoProgress = (eventType, eventData) => {
         if (!window.ProgressModel) return null;
-        const progressInfo = ProgressModel.normalizeGenerationProgress(eventType, eventData, 'videos', videoProgressState);
-        videoProgressState = progressInfo.state;
-        if (isDisplayed()) setProgressBar('videos', progressInfo);
+        const progressInfo = ProgressModel.normalizeGenerationProgress(eventType, eventData, 'videos', rec.progressState);
+        rec.progressState = progressInfo.state;
+        rec.progressInfo = progressInfo;
+        if (isViewing()) setProgressBar('videos', progressInfo);
         return progressInfo;
     };
     applyVideoProgress('queue', { message: '连接视频生成事件流...' });
 
-    // 失败/取消时把还挂着转圈的槽位统一改画失败卡
+    // 失败/取消时把还挂着转圈的槽位统一改画失败卡（仅在正看着这个创意时才有 DOM 可改）
     const failPendingSlots = (message, labelText) => {
+        if (!isViewing()) return;
         grid.querySelectorAll('.placeholder-frame-card').forEach(card => {
             const slotMatch = card.id && card.id.match(/video-slot-(\d+)/);
             if (slotMatch) renderVideoSlotFailed(parseInt(slotMatch[1], 10), message, labelText);
         });
     };
 
+    let disconnectedVideos = false;
     try {
         const watch = await watchTaskUntilTerminal(taskId, {
             label: 'videos',
             signal: controller.signal,
             onEvent: (type, data) => {
                 if (!isCurrent()) return;
-                if (!isDisplayed()) {
-                    // 仍需推进进度状态机（切回来那一刻百分比才准），只是不画 DOM。
-                    if (type !== 'reconnecting') applyVideoProgress(type === 'video_skipped' ? 'video_done' : type, data);
-                    return;
-                }
                 if (type === 'start') {
                     applyVideoProgress('start', data);
                     const total = (data && data.total) || 0;
                     const slots = (data && data.slots) || [];
-                    meta.textContent = `开始生成共 ${total} 段视频...`;
-                    grid.innerHTML = '';
-                    const slotsToRender = slots.length ? slots : Array.from({ length: total }, (_, i) => i + 1);
-                    slotsToRender.forEach(slotIdx => {
-                        const placeholderCard = document.createElement('div');
-                        placeholderCard.className = 'frame-card placeholder-frame-card';
-                        placeholderCard.id = `video-slot-${slotIdx}`;
-                        grid.appendChild(placeholderCard);
-                        renderVideoSlotPending(slotIdx, '等待中');
-                    });
+                    rec.total = total;
+                    setMeta(`开始生成共 ${total} 段视频...`);
+                    if (isViewing()) {
+                        grid.innerHTML = '';
+                        const slotsToRender = slots.length ? slots : Array.from({ length: total }, (_, i) => i + 1);
+                        slotsToRender.forEach(slotIdx => {
+                            const placeholderCard = document.createElement('div');
+                            placeholderCard.className = 'frame-card placeholder-frame-card';
+                            placeholderCard.id = `video-slot-${slotIdx}`;
+                            grid.appendChild(placeholderCard);
+                            renderVideoSlotPending(slotIdx, '等待中');
+                        });
+                    }
                 } else if (type === 'video_start') {
                     applyVideoProgress('video_start', data);
-                    meta.textContent = `正在生成视频: ${data.current}/${data.total} (正在处理第 ${data.index} 段视频)...`;
-                    const slot = document.getElementById(`video-slot-${data.index}`);
-                    if (slot && slot.classList.contains('placeholder-frame-card')) {
-                        renderVideoSlotPending(data.index, '生成中...');
+                    setMeta(`正在生成视频: ${data.current}/${data.total} (正在处理第 ${data.index} 段视频)...`);
+                    if (isViewing()) {
+                        const slot = document.getElementById(`video-slot-${data.index}`);
+                        if (slot && slot.classList.contains('placeholder-frame-card')) {
+                            renderVideoSlotPending(data.index, '生成中...');
+                        }
                     }
                 } else if (type === 'video_done') {
                     applyVideoProgress('video_done', data);
-                    meta.textContent = `正在生成视频: ${data.current}/${data.total}...`;
-                    renderVideoSlotDone(data.index, data.video);
+                    setMeta(`正在生成视频: ${data.current}/${data.total}...`);
+                    if (isViewing()) renderVideoSlotDone(data.index, data.video);
                 } else if (type === 'video_error') {
                     applyVideoProgress('video_error', data);
                     const msg = (data && data.message) || '生成失败';
-                    meta.textContent = `视频 ${data.index} 生成失败: ${msg}`;
-                    renderVideoSlotFailed(data.index, msg);
+                    setMeta(`视频 ${data.index} 生成失败: ${msg}`);
+                    if (isViewing()) renderVideoSlotFailed(data.index, msg);
                 } else if (type === 'video_skipped') {
                     // 声明式硬切槽位（[CUT]）：不生成片段，按已完成计入进度
                     applyVideoProgress('video_done', data);
-                    meta.textContent = `视频 ${data.index} 为声明式硬切槽位，已跳过生成`;
-                    if (typeof renderVideoSlotSkippedCut === 'function') {
+                    setMeta(`视频 ${data.index} 为声明式硬切槽位，已跳过生成`);
+                    if (isViewing() && typeof renderVideoSlotSkippedCut === 'function') {
                         renderVideoSlotSkippedCut(data.index, data && data.message);
                     }
                 } else if (type === 'queue') {
                     applyVideoProgress('queue', data);
-                    meta.textContent = (data && data.message) || '正在排队等待生成视频...';
+                    setMeta((data && data.message) || '正在排队等待生成视频...');
                 } else if (type === 'merge_skip') {
                     applyVideoProgress('merge_skip', data);
-                    meta.textContent = (data && data.message) || '由于存在失败片段，已跳过自动合并。';
+                    setMeta((data && data.message) || '由于存在失败片段，已跳过自动合并。');
                 } else if (type === 'merge_start') {
                     applyVideoProgress('merge_start', data);
-                    meta.textContent = '正在自动合并并加速视频 (2x Speed)...';
+                    setMeta('正在自动合并并加速视频 (2x Speed)...');
                 } else if (type === 'merge_done') {
                     applyVideoProgress('merge_done', data);
-                    meta.textContent = '所有视频已成功生成并合并加速！';
+                    setMeta('所有视频已成功生成并合并加速！');
                 } else if (type === 'merge_error') {
                     applyVideoProgress('merge_error', data);
-                    meta.textContent = `自动合并视频失败: ${(data && data.message) || '未知错误'}`;
-                    showToast(`自动合并失败: ${(data && data.message) || '未知错误'}`, "warning");
+                    setMeta(`自动合并视频失败: ${(data && data.message) || '未知错误'}`);
+                    if (isViewing()) showToast(`自动合并失败: ${(data && data.message) || '未知错误'}`, "warning");
                 } else if (type === 'reconnecting') {
-                    meta.textContent = `连接中断，正在重连（第 ${data.attempt} 次）...`;
+                    setMeta(`连接中断，正在重连（第 ${data.attempt} 次）...`);
                 } else if (type === 'result' || type === 'error') {
                     applyVideoProgress(type, data);
                 }
@@ -2588,99 +2622,99 @@ async function streamVideosProgress(taskId) {
         });
 
         if (!isCurrent()) return;
-        if (currentVideosController === controller) currentVideosController = null;
-        activeBackgroundTasks.videosTaskId = null;
-        saveActiveBackgroundTasksToLocalStorage();
 
         if (watch.status === 'cancelled') {
             throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+        }
+        if (watch.status === 'disconnected') {
+            // 与服务器失联 ≠ 任务失败，见 streamFramesProgress 同款说明：后端渲染
+            // 线程独立于客户端连接，会继续跑到底。不能在这里当失败处理收尾。
+            disconnectedVideos = true;
+            setMeta(watch.error);
+            showToast(`${titleTag()}${watch.error}`, 'warning');
+            return;
         }
         if (watch.status === 'failed') {
             throw new Error(watch.error || '未知错误');
         }
 
         if (watch.result) {
-            await syncFrameRunToLibrary(watch.result, owningIdea);
-            if (isDisplayed()) renderVideosForIdea(owningIdea);
-            showToast(`《${getIdeaSaveTitle(owningIdea)}》已成功生成 ${(watch.result.videos || []).length} 段连续视频。`, "success");
+            await syncFrameRunToLibrary(watch.result, ownerIdea);
+            if (isViewing()) renderVideosForIdea(ownerIdea);
+            const videoRisks = summarizeRunQuality(watch.result);
+            if (videoRisks) {
+                setMeta(`视频生成完成，但存在质量风险：${videoRisks.join('；')}——建议处理后再合并成片`);
+                showToast(`${titleTag()}视频生成完成，但检测到质量风险，建议合并成片前先处理。`, 'warning');
+            } else {
+                showToast(`${titleTag()}已成功生成 ${(watch.result.videos || []).length} 段连续视频。`, "success");
+            }
         }
     } catch (e) {
         if (!isCurrent()) return;
-        if (currentVideosController === controller) currentVideosController = null;
         console.error("Failed to generate videos:", e);
 
-        activeBackgroundTasks.videosTaskId = null;
-        saveActiveBackgroundTasksToLocalStorage();
-
         if (e.name === 'AbortError') {
-            if (isDisplayed()) {
-                meta.textContent = '视频生成已被用户取消。';
-                failPendingSlots('已被用户取消', '未生成');
-            }
-            showToast('已取消视频生成', 'info');
+            setMeta('视频生成已被用户取消。');
+            showToast(`${titleTag()}已取消视频生成`, 'info');
+            failPendingSlots('已被用户取消', '未生成');
         } else {
-            if (isDisplayed()) {
-                meta.textContent = `视频生成失败: ${e.message}`;
-                failPendingSlots(e.message || '生成失败', '生成失败');
-            }
-            showToast(`《${getIdeaSaveTitle(owningIdea)}》视频生成失败: ${e.message}`, "error");
+            setMeta(`视频生成失败: ${e.message}`);
+            showToast(`${titleTag()}视频生成失败: ${e.message}`, "error");
+            failPendingSlots(e.message || '生成失败', '生成失败');
 
-            await reloadManifestIntoIdea(owningIdea);
-            if (isDisplayed() && owningIdea.frameRun) renderVideosForIdea(owningIdea);
+            await reloadManifestIntoIdea(ownerIdea);
+            if (isViewing() && ownerIdea.frameRun) renderVideosForIdea(ownerIdea);
         }
     } finally {
         if (isCurrent()) {
-            activeBackgroundTasks.videos = false;
-            activeBackgroundTasks.videosOwner = null;
-            syncVideosPanelToCurrentIdea();
-            updateTabStatusDot();
+            // 失联分支保留任务登记，供下次刷新页面重新接上事件流。
+            if (!disconnectedVideos) {
+                endIdeaTask(ownerId, 'videos');
+                if (isViewing()) {
+                    progress.style.display = 'none';
+                    btn.disabled = false;
+                }
+            }
         }
     }
 }
 
-// 见 syncFramesPanelToCurrentIdea 的说明：封面 loading 遮罩/按钮同理，只是
-// placeholder/display 两态由 renderCoversForIdea（在 renderIdea 里）负责，这里
-// 只管 loading 遮罩本身要不要盖住它们。
-function syncCoverPanelToCurrentIdea() {
-    const loadingEl = document.getElementById('cover-img-loading');
-    const makeBtn = document.getElementById('make-cover-btn');
-    const runningHere = !!(activeBackgroundTasks.cover && activeBackgroundTasks.coverOwner === currentIdea);
-    if (loadingEl) loadingEl.style.display = runningHere ? 'flex' : 'none';
-    if (makeBtn) makeBtn.disabled = !!activeBackgroundTasks.cover;
-}
-
-async function streamCoverProgress(taskId) {
+async function streamCoverProgress(taskId, ownerIdea) {
+    ownerIdea = ownerIdea || currentIdea;
+    if (!ownerIdea) return;
+    const ownerId = ownerIdea.id;
     const loadingEl = document.getElementById('cover-img-loading');
     const placeholderEl = document.getElementById('cover-image-placeholder');
     const displayEl = document.getElementById('cover-img-display');
     const makeBtn = document.getElementById('make-cover-btn');
     if (!loadingEl || !placeholderEl || !displayEl || !makeBtn) return;
 
-    // 见 streamFramesProgress 里 owningIdea 的说明。
-    const owningIdea = activeBackgroundTasks.coverOwner || currentIdea;
-    const isDisplayed = () => currentIdea === owningIdea;
+    const isViewing = () => isViewingIdea(ownerId);
+    const titleTag = () => isViewing() ? '' : `「${ownerIdea.title || '创意'}」`;
 
-    makeBtn.disabled = true;
-    if (isDisplayed()) {
+    if (isViewing()) {
         loadingEl.style.display = 'flex';
         placeholderEl.style.display = 'none';
         displayEl.style.display = 'none';
+        makeBtn.disabled = true;
     }
 
-    activeBackgroundTasks.cover = true;
-    activeBackgroundTasks.coverOwner = owningIdea;
-    updateTabStatusDot();
+    const controller = new AbortController();
+    beginIdeaTask(ownerId, 'cover', taskId, controller);
+    const isCurrent = () => isIdeaTaskCurrent(ownerId, 'cover', taskId);
 
-    const epoch = ++streamEpochs.cover;
-    const isCurrent = () => epoch === streamEpochs.cover;
-
+    let disconnectedCover = false;
     try {
-        const watch = await watchTaskUntilTerminal(taskId, { label: 'cover' });
+        const watch = await watchTaskUntilTerminal(taskId, { label: 'cover', signal: controller.signal });
 
         if (!isCurrent()) return;
-        activeBackgroundTasks.coverTaskId = null;
-        saveActiveBackgroundTasksToLocalStorage();
 
+        if (watch.status === 'disconnected') {
+            // 与服务器失联 ≠ 任务失败，见 streamFramesProgress 同款说明。
+            disconnectedCover = true;
+            showToast(`${titleTag()}${watch.error}`, 'warning');
+            return;
+        }
         if (watch.status === 'failed' || watch.status === 'cancelled') {
             throw new Error(watch.error || '封面任务未完成');
         }
@@ -2696,63 +2730,61 @@ async function streamCoverProgress(taskId) {
             throw new Error("无法从模型响应中解析出有效的封面图片 URL");
         }
 
-        if (!owningIdea.covers) {
-            owningIdea.covers = [];
+        if (!ownerIdea.covers) {
+            ownerIdea.covers = [];
         }
-        owningIdea.covers.push(imageUrl);
+        ownerIdea.covers.push(imageUrl);
         if (englishTitle) {
-            owningIdea.english_title = englishTitle;
+            ownerIdea.english_title = englishTitle;
         }
         // 旧创意补齐发布用双语标题行（后端只在缺字段时才生成并随结果返回）
-        if (data.social_title_en && !owningIdea.social_title_en) {
-            owningIdea.social_title_en = data.social_title_en;
+        if (data.social_title_en && !ownerIdea.social_title_en) {
+            ownerIdea.social_title_en = data.social_title_en;
         }
-        if (data.social_title_cn && !owningIdea.social_title_cn) {
-            owningIdea.social_title_cn = data.social_title_cn;
+        if (data.social_title_cn && !ownerIdea.social_title_cn) {
+            ownerIdea.social_title_cn = data.social_title_cn;
         }
-        if (isDisplayed()) {
+        if (currentIdea && currentIdea.id === ownerId) {
             saveCurrentIdeaState();
-            renderIdeaTitles(owningIdea);
+            renderIdeaTitles(ownerIdea);
         }
 
-        const existingIdx = savedIdeas.findIndex(item => item.id === owningIdea.id);
+        const existingIdx = savedIdeas.findIndex(item => item.id === ownerId);
         if (existingIdx !== -1) {
-            savedIdeas[existingIdx].covers = owningIdea.covers;
+            savedIdeas[existingIdx].covers = ownerIdea.covers;
             if (englishTitle) {
                 savedIdeas[existingIdx].english_title = englishTitle;
             }
-            if (owningIdea.social_title_en) {
-                savedIdeas[existingIdx].social_title_en = owningIdea.social_title_en;
+            if (ownerIdea.social_title_en) {
+                savedIdeas[existingIdx].social_title_en = ownerIdea.social_title_en;
             }
-            if (owningIdea.social_title_cn) {
-                savedIdeas[existingIdx].social_title_cn = owningIdea.social_title_cn;
+            if (ownerIdea.social_title_cn) {
+                savedIdeas[existingIdx].social_title_cn = ownerIdea.social_title_cn;
             }
             await saveLibrary();
         }
 
-        if (isDisplayed()) renderCoversForIdea(owningIdea, owningIdea.covers.length - 1);
-        showToast(`《${getIdeaSaveTitle(owningIdea)}》封面图制作成功！`, "success");
+        if (isViewing()) renderCoversForIdea(ownerIdea, ownerIdea.covers.length - 1);
+        showToast(`${titleTag()}封面图制作成功！`, "success");
     } catch (e) {
         if (!isCurrent()) return;
         console.error("Failed to generate cover:", e);
-        showToast(`《${getIdeaSaveTitle(owningIdea)}》封面制作失败: ${e.message}`, "error");
+        showToast(`${titleTag()}封面制作失败: ${e.message}`, "error");
 
-        activeBackgroundTasks.coverTaskId = null;
-        saveActiveBackgroundTasksToLocalStorage();
-
-        if (isDisplayed()) {
-            if (owningIdea.covers && owningIdea.covers.length > 0) {
-                renderCoversForIdea(owningIdea, owningIdea.covers.length - 1);
+        if (isViewing()) {
+            if (ownerIdea.covers && ownerIdea.covers.length > 0) {
+                renderCoversForIdea(ownerIdea, ownerIdea.covers.length - 1);
             } else {
                 placeholderEl.style.display = 'flex';
             }
         }
     } finally {
-        if (isCurrent()) {
-            activeBackgroundTasks.cover = false;
-            activeBackgroundTasks.coverOwner = null;
-            syncCoverPanelToCurrentIdea();
-            updateTabStatusDot();
+        if (isCurrent() && !disconnectedCover) {
+            endIdeaTask(ownerId, 'cover');
+            if (isViewing()) {
+                loadingEl.style.display = 'none';
+                makeBtn.disabled = false;
+            }
         }
     }
 }
@@ -3098,6 +3130,11 @@ async function generateFrames() {
         showToast("请先激发一个创意点子！", "error");
         return;
     }
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
+        showToast("该创意的帧序列已在生成中，请稍候", "error");
+        return;
+    }
 
     const btn = document.getElementById('generate-frames-btn');
     const progress = document.getElementById('frames-progress');
@@ -3108,22 +3145,14 @@ async function generateFrames() {
     progress.style.display = 'flex';
     meta.textContent = '准备生成帧序列...';
 
-    // 记住这次生成实际归属的创意，而不是隐式依赖全局 currentIdea——生成过程中
-    // 用户随时可能切换到另一个创意，事件流后续必须仍然认这个引用（见 state.js
-    // 里 activeBackgroundTasks.*Owner 的说明）。
-    const owningIdea = currentIdea;
-    activeBackgroundTasks.frames = true;
-    activeBackgroundTasks.framesOwner = owningIdea;
-    updateTabStatusDot();
-
     try {
         const response = await fetch('/api/generate_frames', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: getIdeaSaveTitle(owningIdea),
-                prompt_block: owningIdea.prompt_block
+                title: getIdeaSaveTitle(ownerIdea),
+                prompt_block: ownerIdea.prompt_block
             })
         });
 
@@ -3135,25 +3164,19 @@ async function generateFrames() {
         const data = await response.json();
         const taskId = data.task_id;
 
-        activeBackgroundTasks.framesTaskId = taskId;
-        saveActiveBackgroundTasksToLocalStorage();
-
-        await streamFramesProgress(taskId);
+        // streamFramesProgress 内部会登记 ideaTasksById 并接管所有 UI/数据合并；
+        // 不 await 它——generateFrames 只负责发起任务，让它在后台独立运行，
+        // 这样切换到别的创意不会挂起这个 async 调用链。
+        streamFramesProgress(taskId, ownerIdea);
     } catch (e) {
         console.error("Failed to generate frames:", e);
-        if (owningIdea === currentIdea) meta.textContent = `帧序列生成失败: ${e.message}`;
-        showToast(`《${getIdeaSaveTitle(owningIdea)}》帧序列生成失败: ${e.message}`, "error");
-
-        activeBackgroundTasks.framesTaskId = null;
-        activeBackgroundTasks.frames = false;
-        activeBackgroundTasks.framesOwner = null;
-        saveActiveBackgroundTasksToLocalStorage();
-
-        if (owningIdea === currentIdea) {
-            renderFramesForIdea(owningIdea);
+        if (isViewingIdea(ownerIdea.id)) {
+            meta.textContent = `帧序列生成失败: ${e.message}`;
+            renderFramesForIdea(ownerIdea);
+            progress.style.display = 'none';
+            btn.disabled = false;
         }
-        syncFramesPanelToCurrentIdea();
-        updateTabStatusDot();
+        showToast(`帧序列生成失败: ${e.message}`, "error");
     }
 }
 
@@ -3173,9 +3196,15 @@ async function generateVideos() {
         return;
     }
 
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
+        showToast("该创意的视频序列已在生成中，请稍候", "error");
+        return;
+    }
+
     // Check for frames that failed the post-render sequence consistency review
-    if (currentIdea.frameRun && currentIdea.frameRun.frames) {
-        const failedFrames = currentIdea.frameRun.frames.filter(f => f.quality_gate === 'vlm_qa_failed' || f.quality_gate === 'sequence_review_flagged');
+    if (ownerIdea.frameRun && ownerIdea.frameRun.frames) {
+        const failedFrames = ownerIdea.frameRun.frames.filter(f => f.quality_gate === 'vlm_qa_failed' || f.quality_gate === 'sequence_review_flagged');
         if (failedFrames.length > 0) {
             const frameSeqs = failedFrames.map(f => f.sequence).join(', ');
             const confirmed = await customConfirm(`⚠️ 警告：检测到第 ${frameSeqs} 帧未通过一致性审查。\n\n如果强行生成视频，对应的视频分段可能存在跳变、无动作或动作不一致的缺陷。\n\n确定要强制继续生成视频吗？`);
@@ -3195,19 +3224,14 @@ async function generateVideos() {
     progress.style.display = 'flex';
     meta.textContent = '准备生成视频序列...';
 
-    const owningIdea = currentIdea;
-    activeBackgroundTasks.videos = true;
-    activeBackgroundTasks.videosOwner = owningIdea;
-    updateTabStatusDot();
-
     try {
         const response = await fetch('/api/generate_videos', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: getIdeaSaveTitle(owningIdea),
-                prompt_block: owningIdea.prompt_block
+                title: getIdeaSaveTitle(ownerIdea),
+                prompt_block: ownerIdea.prompt_block
             })
         });
 
@@ -3219,20 +3243,13 @@ async function generateVideos() {
         const data = await response.json();
         const taskId = data.task_id;
 
-        activeBackgroundTasks.videosTaskId = taskId;
-        saveActiveBackgroundTasksToLocalStorage();
-
-        await streamVideosProgress(taskId);
+        // 同 generateFrames：不 await，交给 streamVideosProgress 在后台独立跑完。
+        streamVideosProgress(taskId, ownerIdea);
     } catch (e) {
         console.error("Failed to generate videos:", e);
-        showToast(`《${getIdeaSaveTitle(owningIdea)}》视频生成失败: ${e.message}`, "error");
+        showToast(`视频生成失败: ${e.message}`, "error");
 
-        activeBackgroundTasks.videosTaskId = null;
-        activeBackgroundTasks.videos = false;
-        activeBackgroundTasks.videosOwner = null;
-        saveActiveBackgroundTasksToLocalStorage();
-
-        if (owningIdea === currentIdea) {
+        if (isViewingIdea(ownerIdea.id)) {
             meta.textContent = `视频生成失败: ${e.message}`;
             const placeholders = grid.querySelectorAll('.placeholder-frame-card');
             placeholders.forEach(card => {
@@ -3254,10 +3271,10 @@ async function generateVideos() {
                     });
                 }
             });
-        }
 
-        syncVideosPanelToCurrentIdea();
-        updateTabStatusDot();
+            progress.style.display = 'none';
+            btn.disabled = false;
+        }
     }
 }
 
@@ -3390,23 +3407,23 @@ async function generateCover() {
         showToast("请先激发一个创意点子！", "error");
         return;
     }
-    
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'cover')) {
+        showToast("该创意的封面图已在生成中，请稍候", "error");
+        return;
+    }
+
     const loadingEl = document.getElementById('cover-img-loading');
     const placeholderEl = document.getElementById('cover-image-placeholder');
     const displayEl = document.getElementById('cover-img-display');
     const makeBtn = document.getElementById('make-cover-btn');
     if (!loadingEl || !placeholderEl || !displayEl || !makeBtn) return;
-    
+
     // Set loading state
     loadingEl.style.display = 'flex';
     placeholderEl.style.display = 'none';
     displayEl.style.display = 'none';
     makeBtn.disabled = true;
-
-    const owningIdea = currentIdea;
-    activeBackgroundTasks.cover = true;
-    activeBackgroundTasks.coverOwner = owningIdea;
-    updateTabStatusDot();
 
     try {
         const response = await fetch('/api/generate_cover', {
@@ -3414,10 +3431,10 @@ async function generateCover() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                id: owningIdea.id,
-                title: owningIdea.title,
-                theme: owningIdea.theme,
-                prompt_block: owningIdea.prompt_block
+                id: ownerIdea.id,
+                title: ownerIdea.title,
+                theme: ownerIdea.theme,
+                prompt_block: ownerIdea.prompt_block
             })
         });
 
@@ -3427,29 +3444,23 @@ async function generateCover() {
         }
 
         const taskId = data.task_id;
-        activeBackgroundTasks.coverTaskId = taskId;
-        saveActiveBackgroundTasksToLocalStorage();
 
-        await streamCoverProgress(taskId);
+        // 同 generateFrames：不 await，交给 streamCoverProgress 在后台独立跑完。
+        streamCoverProgress(taskId, ownerIdea);
     } catch (e) {
         console.error("Failed to generate cover:", e);
-        showToast(`《${getIdeaSaveTitle(owningIdea)}》封面制作失败: ${e.message}`, "error");
+        showToast(`封面制作失败: ${e.message}`, "error");
 
-        activeBackgroundTasks.coverTaskId = null;
-        activeBackgroundTasks.cover = false;
-        activeBackgroundTasks.coverOwner = null;
-        saveActiveBackgroundTasksToLocalStorage();
-
-        // Restore state based on whether we already have covers
-        if (owningIdea === currentIdea) {
-            if (owningIdea.covers && owningIdea.covers.length > 0) {
-                renderCoversForIdea(owningIdea, owningIdea.covers.length - 1);
+        if (isViewingIdea(ownerIdea.id)) {
+            // Restore state based on whether we already have covers
+            if (ownerIdea.covers && ownerIdea.covers.length > 0) {
+                renderCoversForIdea(ownerIdea, ownerIdea.covers.length - 1);
             } else {
                 placeholderEl.style.display = 'flex';
             }
+            loadingEl.style.display = 'none';
+            makeBtn.disabled = false;
         }
-        syncCoverPanelToCurrentIdea();
-        updateTabStatusDot();
     }
 }
 
@@ -3644,17 +3655,22 @@ function handleGlobalHotkeys(e) {
 function updateTabStatusDot() {
     const dot = document.getElementById('overview-status-dot');
     if (!dot) return;
-    
-    if (activeBackgroundTasks.cover || activeBackgroundTasks.frames || activeBackgroundTasks.videos) {
+
+    // 聚合跨所有创意的后台任务（不再只看当前这一个）——ideaTasksById 才是权威来源。
+    const hasCover = anyActiveTaskOfType('cover');
+    const hasFrames = anyActiveTaskOfType('frames');
+    const hasVideos = anyActiveTaskOfType('videos');
+
+    if (hasCover || hasFrames || hasVideos) {
         dot.style.display = 'inline-block';
         dot.className = 'tab-status-dot active';
-        dot.title = `后台生成中: ${activeBackgroundTasks.cover ? '封面图 ' : ''}${activeBackgroundTasks.frames ? '帧序列 ' : ''}${activeBackgroundTasks.videos ? '视频序列' : ''}`;
+        dot.title = `后台生成中: ${hasCover ? '封面图 ' : ''}${hasFrames ? '帧序列 ' : ''}${hasVideos ? '视频序列' : ''}`;
     } else {
         dot.style.display = 'inline-block';
         dot.className = 'tab-status-dot completed';
         dot.title = '后台任务已全部完成';
         setTimeout(() => {
-            if (!activeBackgroundTasks.cover && !activeBackgroundTasks.frames && !activeBackgroundTasks.videos) {
+            if (!anyActiveTaskOfType('cover') && !anyActiveTaskOfType('frames') && !anyActiveTaskOfType('videos')) {
                 dot.style.display = 'none';
             }
         }, 3000);
@@ -3758,8 +3774,6 @@ async function loadIdeationCards(force = false) {
 // Function composeIdeationCard moved to modular JS file
 
 // Function mapEnglishCarrierToValue moved to modular JS file
-
-// Function mapTwistToAnchorValue moved to modular JS file
 
 /* 暗夜模式 toggle 已抽出到 js/theme_toggle.js(双前端共享,index.html 加载)*/
 

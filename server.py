@@ -79,6 +79,7 @@ def background_worker(task_id, config, dimensions):
         start_accounting()
         if isinstance(config, dict):
             config['_skipped_checks'] = 0
+            config['_beat_audit'] = []
         content = call_llm(config, dimensions, on_progress=on_progress)
         result = parse_sections(content)
 
@@ -88,6 +89,36 @@ def background_worker(task_id, config, dimensions):
         # skill 直出模式：文本阶段无审查，audit_md 只是直出模式的说明文案；
         # 一致性审查在帧渲染后对真实画面进行（pipeline_orchestrator）。
         result['repair_md'] = result.get('audit_md') or 'PASS — 工序与场景一致性检查通过，未发现违规，提示词未改动。'
+        # 直出校验留痕可见化（2026-07-15 事故复盘）：结构校验的命中记录以前只进
+        # 日志，"10/12 拍没有动作正文"要烧完视频额度才被发现。详情汇入 audit_md
+        # （审核面板按 markdown 渲染），存在结构性硬伤时 repair_md 换成醒目摘要
+        # （非 PASS 开头 → 前端审核面板自动展开+高亮），点"生成帧序列"之前就可见。
+        beat_audit = config.get('_beat_audit') if isinstance(config, dict) else None
+        if beat_audit:
+            structural_beats = [r for r in beat_audit if r.get('structural')]
+            unfixed = [r for r in structural_beats if not r.get('reworked')]
+            lines = [f"### 直出校验留痕（{len(beat_audit)} 拍有记录）", '']
+            for rec in beat_audit:
+                if rec.get('structural'):
+                    fixed = '已定向回炉重写' if rec.get('reworked') else '回炉未通过，保留原稿'
+                    lines.append(f"- **第 {rec['beat']} 拍 · 结构性硬伤（{fixed}）**：" + '；'.join(rec['structural']))
+                if rec.get('style'):
+                    # style 桶现在混装 IMAGE 相似度瑕疵和 stage_scope 措辞瑕疵两类，
+                    # image_reworked 是两者合并后的信号，不能再硬说"相似度"——
+                    # 具体是哪一类，读下面拼进来的 rec['style'] 原文就看得出来。
+                    img_rw = rec.get('image_reworked')
+                    style_note = ('IMAGE 已回炉重写' if img_rw is True
+                                  else 'IMAGE 回炉未通过，保留原稿' if img_rw is False
+                                  else '仅留痕')
+                    lines.append(f"- 第 {rec['beat']} 拍 · 风格瑕疵（{style_note}）：" + '；'.join(rec['style']))
+            result['audit_md'] = ((result.get('audit_md') or '').rstrip() + '\n\n' + '\n'.join(lines)).strip()
+            if structural_beats:
+                summary = (f"直出校验发现 {len(structural_beats)} 拍存在结构性硬伤"
+                           f"（{len(structural_beats) - len(unfixed)} 拍已定向回炉重写"
+                           + (f"，{len(unfixed)} 拍回炉未通过保留原稿——生成帧序列前建议先处理" if unfixed else "")
+                           + "），详情见下方审核报告。")
+                result['repair_md'] = summary
+            result['beat_audit'] = beat_audit
         result['skipped_checks_count'] = config.get('_skipped_checks', 0) if isinstance(config, dict) else 0
         
         usage = stop_and_get_accounting()
@@ -500,9 +531,10 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots):
                 if slot not in manifest_video_slots:
                     has_failures = True
                     break
-                # 'skipped_cut'（声明式硬切槽位）是预期缺失，不算失败——合并门禁
-                # （merge_project_videos）对它同样按预期缺失处理
-                if manifest_video_slots[slot].get('status') not in ('success', 'skipped_cut'):
+                # 'skipped_cut'（声明式硬切槽位）和 'skipped_bridge_hold'（TBCP v3
+                # 桥接 HOLD 拍）都是预期缺失，不算失败——合并门禁（merge_project_videos）
+                # 对它们同样按预期缺失处理
+                if manifest_video_slots[slot].get('status') not in ('success', 'skipped_cut', 'skipped_bridge_hold'):
                     has_failures = True
                     break
 
@@ -842,15 +874,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         if getattr(self, '_spark_status_code', 200) >= 400:
             self.send_header('Cache-Control', 'no-store')
         elif p.startswith('/outputs/'):
-            # 反过来：200 成功响应也会被浏览器启发式缓存（无 Cache-Control 时
-            # 按 Last-Modified 估算新鲜期，期间根本不会再发请求）。但 outputs/
-            # 下的帧/视频文件名是确定性且可被覆写的——重试单帧、"不用的帧"被
-            # 画廊删除后又在同一序号位置重新生成，都是原地覆盖同一个 URL。
-            # 浏览器缓存的旧字节和新生成的内容"打架"：manifest 已经指向新帧，
-            # 图片却仍在显示删除前/重试前的旧画面。no-cache（而非 no-store）
-            # 让浏览器每次都带 If-Modified-Since 去问一声——文件没变就是一个
-            # 廉价的 304（不传输正文，不重新下载），真的被覆盖了才会传新内容，
-            # 两头都不吃亏：既不会显示旧帧，也不会退化回"每次全量重下"。
+            # 帧重试会原地覆盖同名 img_XXX.webp，画廊删除会移除文件；没有缓存头时
+            # 浏览器按启发式缓存直接复用旧图——表现为"新帧生成了 UI 还是旧图"、
+            # "已删除的帧仍能显示"。no-cache = 每次使用前带 If-Modified-Since 回源
+            # 验证：未变走 304（只有头部往返，不重新下载，不会回到旧的重复全量
+            # 下载问题），覆盖后立即拿新图，删除后立即 404。
             self.send_header('Cache-Control', 'no-cache')
         super().end_headers()
 
@@ -1268,14 +1296,31 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             self._send_json(data)
         elif path == '/api/trend-refs':
             # 联网参考案例库(trend_refs.json)全量返回,新→旧;读失败必须报 500
-            # 而不是静默降级为 [](同 /api/ledger 的整库清零教训)
+            # 而不是静默降级为 [](同 /api/ledger 的整库清零教训)。附带 cap 与
+            # 归档条数,供前端渲染"N / 上限 · 已归档 M"徽标(archived_count 读取
+            # 失败时省略,不拖垮主库这条请求)
             if not self._gate():
                 return
             refs = load_trend_refs()
             if refs is None:
                 self._send_json({'error': '联网参考案例库文件读取失败'}, status=500)
                 return
-            self._send_json({'status': 'ok', 'refs': list(reversed(refs))})
+            archive = load_trend_refs_archive()
+            self._send_json({
+                'status': 'ok',
+                'refs': list(reversed(refs)),
+                'cap': TREND_REFS_CAP,
+                'archived_count': len(archive) if archive is not None else None,
+            })
+        elif path == '/api/trend-refs/archive':
+            # 归档库(软上限淘汰出主库、未使用过的旧参考)全量返回,新→旧
+            if not self._gate():
+                return
+            archive = load_trend_refs_archive()
+            if archive is None:
+                self._send_json({'error': '联网参考归档文件读取失败'}, status=500)
+                return
+            self._send_json({'status': 'ok', 'refs': list(reversed(archive))})
         elif path.startswith('/api/contents/generations/tasks/'):
             try:
                 task_id = path.split('/')[-1]
@@ -1440,17 +1485,21 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 if refs is None:
                     self._send_json({'status': 'error', 'message': '联网参考案例库文件读取失败'}, status=500)
                     return
+                archive = load_trend_refs_archive()
                 self._send_json({
                     'status': 'ok',
                     # 本批搜到的条目 id(文本与旧条目相同则 id 相同,前端据此算真正新增数)
                     'added': [r['id'] for r in new_refs],
                     'refs': list(reversed(refs)),
+                    'cap': TREND_REFS_CAP,
+                    'archived_count': len(archive) if archive is not None else None,
                 })
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/trend-refs/delete':
-            # 案例库按 id 批量删除(显式 id 列表即确认过的意图,同 /api/ledger/delete)
+            # 案例库按 id 批量删除(显式 id 列表即确认过的意图,同 /api/ledger/delete)。
+            # archive: true 时对归档库操作(永久删除已淘汰条目),否则对主库操作。
             if not self._gate():
                 return
             try:
@@ -1459,11 +1508,35 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 if not isinstance(ids, list) or not ids:
                     self._send_json({'status': 'error', 'message': '缺少要删除的 ids'}, status=400)
                     return
-                result = delete_trend_refs(ids)
+                result = delete_trend_refs(ids, archive=bool(body.get('archive')))
                 if result['remaining'] is None:
                     self._send_json({'status': 'error', 'message': '联网参考案例库文件读取失败'}, status=500)
                     return
                 self._send_json({'status': 'ok', 'deleted': result['deleted']})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/trend-refs/archive/restore':
+            # 把归档里的条目挪回主库,供用户在前端"恢复"(不受软上限约束——用户的
+            # 主动动作;挪回后若再超上限,靠下次搜索/换灵感触发的 persist 自动收敛)
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                ids = body.get('ids')
+                if not isinstance(ids, list) or not ids:
+                    self._send_json({'status': 'error', 'message': '缺少要恢复的 ids'}, status=400)
+                    return
+                result = restore_trend_refs(ids)
+                if result['refs'] is None:
+                    self._send_json({'status': 'error', 'message': '联网参考案例库/归档文件读取失败'}, status=500)
+                    return
+                self._send_json({
+                    'status': 'ok',
+                    'restored': result['restored'],
+                    'refs': list(reversed(result['refs'])),
+                    'archive': list(reversed(result['archive'])),
+                })
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -2176,11 +2249,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 response_format = body.get('response_format') or 'b64_json'
 
                 final_model = _image_generation_model_for_request(model, size, quality)
+                api_size = gpt_image_pixel_size(size) if final_model == 'gpt-image-2' else size
 
                 payload = {
                     'model': final_model,
                     'prompt': prompt,
-                    'size': size,
+                    'size': api_size,
                     'quality': quality,
                     'response_format': response_format
                 }

@@ -48,7 +48,7 @@
     <link rel="stylesheet" href="css/app/base.css?v=1.2.5">
     <link rel="stylesheet" href="css/app/skill-output.css?v=1.2.2">
     <link rel="stylesheet" href="css/app/efficiency.css?v=1.2.2">
-    <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.2.6">
+    <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.2.8">
     <link rel="stylesheet" href="css/image_studio.css?v=1.1.1">
     <link rel="stylesheet" href="css/gallery.css?v=1.1.0">
     <link rel="stylesheet" href="css/ledger.css?v=1.1.0">
@@ -155,6 +155,11 @@
                             <div class="trend-refs-list" id="trend-refs-list">
                                 <div class="trend-refs-empty">正在载入联网参考案例库...</div>
                             </div>
+                            <div class="trend-refs-archive-bar">
+                                <span class="trend-refs-cap-note" id="trend-refs-cap-note"></span>
+                                <button type="button" id="trend-refs-archive-toggle" class="trend-refs-archive-toggle" hidden>查看归档</button>
+                            </div>
+                            <div class="trend-refs-list trend-refs-archive-list" id="trend-refs-archive-list" hidden></div>
                         </div>
 
                         <!-- Topic Ideation Engine (P2) — fed by the selected trend
@@ -1169,13 +1174,13 @@
     <script src="js/utils.js?v=1.1.2" defer></script>
     <script src="js/theme_toggle.js?v=1.1.0" defer></script>
     <script src="js/config.js?v=1.2.2" defer></script>
-    <script src="js/trend_refs.js?v=1.0.0" defer></script>
+    <script src="js/trend_refs.js?v=1.1.0" defer></script>
     <script src="js/progress_model.js?v=1.2.3" defer></script>
-    <script src="js/api_client.js?v=1.1.7" defer></script>
+    <script src="js/api_client.js?v=1.1.8" defer></script>
     <script src="js/prompt_pipeline.js?v=1.1.7" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
-    <script src="js/media_renderer.js?v=1.1.5" defer></script>
-    <script src="app.js?v=1.3.7" defer></script>
+    <script src="js/media_renderer.js?v=1.1.6" defer></script>
+    <script src="app.js?v=1.3.8" defer></script>
     <script src="js/image_studio.js?v=1.0.4" defer></script>
     <script src="js/gallery.js?v=1.1.2" defer></script>
     <script src="js/ledger.js?v=1.1.0" defer></script>

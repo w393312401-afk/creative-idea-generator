@@ -26,7 +26,12 @@ from prompt_pipeline import (
     validate_beat_prompts,
     _build_partial_prompt_block,
     _parse_prompt_slots,
+    _stage_scope_ladder_violations,
     HARD_CUT_VIDEO_PLACEHOLDER,
+    BRIDGE_HOLD_VIDEO_PLACEHOLDER,
+    _beat_contract,
+    fix_video_opening,
+    check_video_opening,
 )
 from video_generator import plan_video_slots, merge_project_videos, PartialMergeBlocked
 from frame_generator import update_manifest_stale_status
@@ -150,6 +155,80 @@ class TestThresholdVariantHelpers(unittest.TestCase):
         self.assertEqual(ladder[1]['turn_direction'], 'right')
         self.assertIsNone(ladder[2]['turn_direction'])
 
+    def test_normalize_beat_ladder_coerces_stage_scope(self):
+        ladder = normalize_beat_ladder([
+            {'index': 1, 'operation': 'repair'},  # missing -> default
+            {'index': 2, 'operation': 'repair', 'stage_scope': 'medium'},  # invalid -> default
+            {'index': 3, 'operation': 'repair', 'stage_scope': 'LARGE'},
+            {'index': 4, 'operation': 'repair', 'stage_scope': ' Small '},
+            {'index': 5, 'operation': 'repair', 'stage_scope': 123},  # non-string -> default
+        ])
+        self.assertEqual(ladder[0]['stage_scope'], 'default')
+        self.assertEqual(ladder[1]['stage_scope'], 'default')
+        self.assertEqual(ladder[2]['stage_scope'], 'large')
+        self.assertEqual(ladder[3]['stage_scope'], 'small')
+        self.assertEqual(ladder[4]['stage_scope'], 'default')
+
+
+class TestStageScopeQuota(unittest.TestCase):
+    def _ladder(self, scopes, reward=True):
+        ladder = [{'index': i + 1, 'operation': 'repair', 'stage_scope': s}
+                  for i, s in enumerate(scopes)]
+        if reward:
+            ladder.append({'index': len(ladder) + 1, 'operation': 'reward', 'stage_scope': 'large'})
+        return ladder
+
+    def test_exactly_one_large_and_two_to_three_small_passes(self):
+        ladder = self._ladder(['large', 'small', 'small', 'default', 'default'])
+        self.assertEqual(_stage_scope_ladder_violations(ladder), [])
+
+    def test_three_small_also_passes(self):
+        ladder = self._ladder(['large', 'small', 'small', 'small', 'default'])
+        self.assertEqual(_stage_scope_ladder_violations(ladder), [])
+
+    def test_zero_large_is_a_violation(self):
+        ladder = self._ladder(['small', 'small', 'default', 'default'])
+        violations = _stage_scope_ladder_violations(ladder)
+        self.assertTrue(any('stage_scope="large"' in v for v in violations))
+
+    def test_two_large_is_a_violation(self):
+        ladder = self._ladder(['large', 'large', 'small', 'small', 'default'])
+        violations = _stage_scope_ladder_violations(ladder)
+        self.assertTrue(any('stage_scope="large"' in v for v in violations))
+
+    def test_small_count_out_of_range_is_a_violation(self):
+        ladder = self._ladder(['large', 'small', 'default', 'default', 'default'])
+        violations = _stage_scope_ladder_violations(ladder)
+        self.assertTrue(any('stage_scope="small"' in v for v in violations))
+
+        ladder = self._ladder(['large', 'small', 'small', 'small', 'small', 'default'])
+        violations = _stage_scope_ladder_violations(ladder)
+        self.assertTrue(any('stage_scope="small"' in v for v in violations))
+
+    def test_threshold_reward_bridge_hard_cut_beats_excluded_from_pool(self):
+        # 唯一的合格拍(index 2)是 large；其余全是 threshold/reward/bridge/hard_cut，
+        # 即便它们的 stage_scope 是垃圾值，也不该被计入合格池、不该触发违规。
+        ladder = [
+            {'index': 1, 'operation': 'threshold', 'bridge_stage': 1, 'stage_scope': 'small'},
+            {'index': 2, 'operation': 'repair', 'stage_scope': 'large'},
+            {'index': 3, 'operation': 'threshold', 'hard_cut': True, 'stage_scope': 'large'},
+            {'index': 4, 'operation': 'reward', 'stage_scope': 'small'},
+        ]
+        self.assertEqual(_stage_scope_ladder_violations(ladder), [])
+
+    def test_small_pool_narrows_small_quota_range(self):
+        # 只有 2 个合格拍：1 large + 1 small 已经是这个池子能装下的上限，不该要求 2-3 个 small。
+        ladder = self._ladder(['large', 'small'])
+        self.assertEqual(_stage_scope_ladder_violations(ladder), [])
+
+    def test_single_eligible_beat_only_checks_large(self):
+        ladder = self._ladder(['large'])
+        self.assertEqual(_stage_scope_ladder_violations(ladder), [])
+
+    def test_empty_ladder_is_no_violations(self):
+        self.assertEqual(_stage_scope_ladder_violations([]), [])
+        self.assertEqual(_stage_scope_ladder_violations(None), [])
+
 
 class TestDoorClearanceCheck(unittest.TestCase):
     def test_flags_in_frame_door_element(self):
@@ -227,8 +306,10 @@ class TestPartialBlockMetas(unittest.TestCase):
         images = {i: f'image {i}' for i in range(1, 9)}
         videos = {i: f'video {i}' for i in range(1, 8)}
         f_imgs, f_vids, block = _build_partial_prompt_block(images, videos, ladder)
-        self.assertEqual(f_vids[3]['meta'], 'BRIDGE')
-        self.assertEqual(f_vids[4]['meta'], 'BRIDGE')
+        # TBCP v3: bridge_stage=1 (HOLD, discarded internal placeholder) and bridge_stage=2
+        # (SPAN, the sole visible merged crossing clip) get distinct meta tags.
+        self.assertEqual(f_vids[3]['meta'], 'BRIDGE HOLD')
+        self.assertEqual(f_vids[4]['meta'], 'BRIDGE SPAN')
         self.assertEqual(f_vids[5]['meta'], 'BRIDGE TURN')
         # 解析回读保留 meta
         p_imgs, p_vids = _parse_prompt_slots(block)
@@ -337,6 +418,174 @@ class TestStaleLineageSegments(_TmpDirCase):
         by_seq = {f['sequence']: f for f in manifest['frames']}
         self.assertTrue(all(by_seq[i].get('stale_lineage') for i in (3, 4, 5, 6)))
         self.assertFalse(by_seq[1].get('stale_lineage'))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# TBCP v3: merged crossing clip (bridge_stage=1 HOLD discarded, bridge_stage=2
+# SPAN is the sole visible clip, redirected to the pre-HOLD exterior anchor) +
+# first-interior-reveal decay-state wording.
+# ─────────────────────────────────────────────────────────────────────────
+
+class TestBeatContractBridgeFlags(unittest.TestCase):
+    PACKET = {'camera_dna': '', 'primary_landmarks': [], 'frame_boundaries': {}}
+
+    def _contract(self, ladder, i, total_beats=None, mode='Threshold'):
+        return _beat_contract(i, total_beats or len(ladder), ladder, mode, self.PACKET, '')
+
+    def test_coaxial_hold_and_span_flags(self):
+        ladder = _ladder_coaxial(n=6, t=3)  # bridge_stage 1 at beat 3, 2 at beat 4
+        hold = self._contract(ladder, 3)
+        self.assertTrue(hold['is_bridge_hold'])
+        self.assertFalse(hold['is_bridge_span'])
+        self.assertFalse(hold['is_first_interior_reveal'])
+
+        span = self._contract(ladder, 4)
+        self.assertFalse(span['is_bridge_hold'])
+        self.assertTrue(span['is_bridge_span'])
+        self.assertEqual(span['family'], 'interior')
+        self.assertTrue(span['is_first_interior_reveal'])
+        # SPAN's video anchors from the pre-HOLD exterior beat (i-1 = 3), not
+        # its own preceding IMAGE (the internal-only Sill Handoff frame).
+        self.assertIn('IMAGE 3', span['family_contract'])
+        self.assertIn('IMAGE 5', span['family_contract'])
+
+        # A later, ordinary interior beat (no bridge_stage) must NOT carry the
+        # first-reveal decay clause or the HOLD/SPAN flags.
+        later = self._contract(ladder, 5)
+        self.assertFalse(later['is_bridge_hold'])
+        self.assertFalse(later['is_bridge_span'])
+        self.assertFalse(later['is_first_interior_reveal'])
+        self.assertNotIn('UNTOUCHED TRAUMA STATE', later['anchor_rule'])
+
+    def test_pan_span_is_vestibule_and_turn_is_first_reveal(self):
+        ladder = _ladder_pan(n=7, t=3)  # bridge_stage 1/2/3 at beats 3/4/5
+        span = self._contract(ladder, 4)
+        self.assertTrue(span['is_bridge_span'])
+        self.assertEqual(span['family'], 'vestibule')
+        # Literal scope is family=='interior', not 'vestibule' — but the user
+        # confirmed the vestibule frame should still get a (lighter) decay clause
+        # via the family_contract bullet and the vestibule anchor_rule branch.
+        self.assertFalse(span['is_first_interior_reveal'])
+        self.assertIn('untouched weathering', span['anchor_rule'])
+        self.assertIn('First interior reveal', span['family_contract'])
+
+        turn = self._contract(ladder, 5)
+        self.assertTrue(turn['is_turn'])
+        self.assertEqual(turn['family'], 'interior')
+        self.assertTrue(turn['is_first_interior_reveal'])
+        self.assertIn('UNTOUCHED TRAUMA STATE', turn['anchor_rule'])
+
+    def test_decay_clause_absent_for_hard_cut_else_branch(self):
+        # hard_cut already has its own dedicated decay wording (item 4 of its
+        # anchor_rule) via the is_cut branch, not the first-reveal clause.
+        ladder = _ladder_cut(n=6, t=3)
+        cut = self._contract(ladder, 3)
+        self.assertTrue(cut['is_cut'])
+        self.assertIn('untouched pre-construction trauma', cut['anchor_rule'])
+        self.assertNotIn('UNTOUCHED TRAUMA STATE', cut['anchor_rule'])
+
+    def test_ordinary_interior_beat_states_door_clearance_only_once(self):
+        # 2026-07-20 实机复盘：普通室内拍(非首现)的 anchor_rule 曾经和下面
+        # family_contract 的"Door clearance (mandatory)"条目重复表述同一条门框出画
+        # 要求，导致 LLM 在生成的 IMAGE 正文里把整句 camera_dna 复读了两遍（img_5/7/
+        # 9/10/11 实例）。现在这条要求只应该出现在 family_contract 里一次，
+        # anchor_rule 不应再重复它。
+        ladder = _ladder_coaxial(n=6, t=3)  # bridge_stage 1 at beat 3, 2 at beat 4
+        later = self._contract(ladder, 5)  # ordinary interior beat, not first reveal
+        self.assertNotIn('DOOR CLEARANCE', later['anchor_rule'])
+        self.assertEqual(later['family_contract'].count('Door clearance (mandatory)'), 1)
+
+
+class TestVideoOpeningFirstFrameIndex(unittest.TestCase):
+    def test_fix_video_opening_default_binds_i_to_ip1(self):
+        out = fix_video_opening(5, 'some prior text')
+        self.assertIn('Use IMAGE 5 as the actual first-frame image', out)
+        self.assertIn('IMAGE 6 as the actual last-frame image', out)
+
+    def test_fix_video_opening_override_binds_custom_first_frame(self):
+        out = fix_video_opening(5, 'some prior text', first_frame_index=3)
+        self.assertIn('Use IMAGE 3 as the actual first-frame image', out)
+        self.assertIn('IMAGE 6 as the actual last-frame image', out)
+
+    def test_check_video_opening_matches_override(self):
+        prompt = fix_video_opening(5, '', first_frame_index=3)
+        self.assertEqual(check_video_opening(5, prompt, first_frame_index=3), [])
+        # Without the matching override, the default IMAGE 5 binding is expected
+        # and this prompt (bound to IMAGE 3) correctly fails it.
+        self.assertTrue(check_video_opening(5, prompt))
+
+    def test_validate_beat_prompts_hold_beat_skips_all_video_checks(self):
+        beat = {'index': 3, 'operation': 'threshold', 'bridge_stage': 1}
+        packet = {'camera_dna': '', 'primary_landmarks': [], 'frame_boundaries': {}}
+        errs = validate_beat_prompts(
+            3, BRIDGE_HOLD_VIDEO_PLACEHOLDER,
+            'This IMAGE is the TBCP Sill Handoff frame; camera pitch locked level; '
+            'the central vanishing axis stays centered.',
+            packet, 'Threshold', False, True, beat=beat, family='sill')
+        self.assertEqual([e for e in errs if 'VIDEO' in e or 'video' in e.lower()], [])
+
+
+class TestPlanVideoSlotsBridgeHold(_TmpDirCase):
+    def test_hold_slot_skipped_span_slot_redirects_start_anchor(self):
+        # Beats: 1=exterior, 2=HOLD (bridge_stage 1), 3=SPAN (bridge_stage 2).
+        # SPAN's video slot (3) redirects its start anchor to slot-1=2, the exterior
+        # IMAGE produced by beat 1 — NOT slot 3 (its own default start, the internal
+        # Sill Handoff frame HOLD produced) and NOT slot 1.
+        frames = self._make_frames(4)  # slots 1..4
+        videos = {
+            1: {'body': 'exterior approach', 'meta': ''},
+            2: {'body': 'HOLD placeholder', 'meta': 'BRIDGE HOLD'},
+            3: {'body': 'Use IMAGE 2 as the actual first-frame image and IMAGE 4 as the '
+                        'actual last-frame image.', 'meta': 'BRIDGE SPAN'},
+        }
+        plans = plan_video_slots(videos, frames, {}, self.videos_dir)
+        by_slot = {p['slot']: p for p in plans}
+
+        self.assertEqual(by_slot[2]['action'], 'skip_bridge_hold')
+        self.assertIn('BRIDGE HOLD', by_slot[2]['reason'])
+
+        span = by_slot[3]
+        self.assertEqual(span['action'], 'generate')
+        self.assertEqual(span['start_anchor_slot'], 2)  # slot 3 - 1
+        self.assertEqual(span['start_frame'], frames[2])
+        self.assertEqual(span['end_frame'], frames[4])
+        # The rewritten two-card prompt binds the true start anchor (IMAGE 2) to the
+        # first-frame card, not the discarded HOLD beat's internal Sill Handoff frame.
+        self.assertIn('IMAGE 1 as the actual first-frame image', span['prompt'])
+
+    def test_span_slot_blocked_when_start_anchor_frame_missing(self):
+        frames = self._make_frames(4)
+        del frames[2]  # slot 2 (start_anchor_slot = slot 3 - 1) missing
+        videos = {2: {'body': 'HOLD', 'meta': 'BRIDGE HOLD'},
+                  3: {'body': 'SPAN', 'meta': 'BRIDGE SPAN'}}
+        plans = plan_video_slots(videos, frames, {}, self.videos_dir)
+        by_slot = {p['slot']: p for p in plans}
+        self.assertEqual(by_slot[3]['action'], 'blocked')
+        self.assertIn('IMAGE 2', by_slot[3]['reason'])
+
+
+class TestMergeGateBridgeHold(_TmpDirCase):
+    def _write_manifest(self, frames_n, videos_entries):
+        frames = []
+        for i in range(1, frames_n + 1):
+            frames.append({'slot': i, 'sequence': i,
+                           'file': os.path.relpath(os.path.join(self.frames_dir, f'img_{i:03d}.webp'),
+                                                   self.tmp).replace('\\', '/')})
+        manifest = {'title': 't', 'frames': frames, 'videos': videos_entries}
+        with open(os.path.join(self.tmp, 'manifest.json'), 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+
+    def test_skipped_bridge_hold_is_expected_gap_not_missing(self):
+        self._make_frames(4)
+        # 槽位 2 是 HOLD 内部占位；槽位 4 真缺失 → 门禁只报 4，不报 2
+        self._write_manifest(4, [
+            {'slot': 1, 'status': 'success', 'file': 'videos/vid_001.mp4'},
+            {'slot': 2, 'status': 'skipped_bridge_hold'},
+        ])
+        with self.assertRaises(PartialMergeBlocked) as ctx:
+            merge_project_videos(self.tmp)
+        self.assertNotIn(2, ctx.exception.missing)
+        self.assertIn(3, ctx.exception.missing)
 
 
 if __name__ == '__main__':

@@ -95,18 +95,14 @@ let currentIdea = null;
 let currentIdeationTrendRefs = [];
 
 let customPresets = {};
-// *Owner 字段记录后台任务实际归属的创意对象引用（而非"当前正在浏览的" currentIdea）：
-// 生成过程中用户切换到另一个创意时，事件流的数据写入/DOM 绘制必须仍然认这个引用，
-// 否则后台任务的结果会被写进/画到切换后正在看的那个创意上——即"实时生成动态日志
-// 都共用"的根因（多个创意的直播流共用同一套全局 DOM/状态）。
-let activeBackgroundTasks = {
-    cover: false,
-    frames: false,
-    videos: false,
-    coverOwner: null,
-    framesOwner: null,
-    videosOwner: null
-};
+// 2026-07-15 多创意后台任务改造：帧序列/视频/封面的生成任务按「所属创意 id」登记，
+// 不再是全局单槽位（旧的 activeBackgroundTasks.frames/framesTaskId 等一次只能追踪
+// 一个任务，切换创意会把还在后台跑的任务事件误写进当前查看的创意，参见
+// ideaTaskHelpers 系列函数 in js/api_client.js）。
+// ideaId -> { frames: TaskRecord|null, videos: TaskRecord|null, cover: TaskRecord|null }
+// TaskRecord(frames/videos): { taskId, controller, total, meta, progressState, progressInfo, feedLines, live }
+// TaskRecord(cover): { taskId, controller }
+let ideaTasksById = {};
 
 let generationState = {
     status: 'idle', // idle | composing | error
@@ -115,12 +111,12 @@ let generationState = {
     lastParams: null
 };
 
-// Global controllers for cancellation
+// Global controller for cancelling the (singular, app-wide) idea-composition task.
+// Frames/videos/cover no longer use a single global controller — each background
+// task's AbortController lives on its own TaskRecord in ideaTasksById instead.
 let currentGenerationController = null;
-let currentFramesController = null;
-let currentVideosController = null;
 
-// 流代际守卫：每个通道一个递增序号。viewTask/retryTask 接管面板时会开启新一代流，
-// 旧流被 abort 后其 catch/finally 仍会异步执行——只有仍是最新一代的流才允许触碰 UI，
-// 否则旧流的收尾会清掉新任务刚建好的视图。
-const streamEpochs = { compose: 0, frames: 0, videos: 0, cover: 0 };
+// 流代际守卫：composing 通道仍是全局单例（一次只合成一个创意），保留递增序号守卫。
+// frames/videos/cover 改为按创意登记后，各自的"是否仍是当前这次运行"改用
+// TaskRecord.taskId 比对（见 js/api_client.js 的 isIdeaTaskCurrent），不再需要全局代数。
+const streamEpochs = { compose: 0 };

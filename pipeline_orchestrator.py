@@ -199,6 +199,18 @@ def _supervised_mode(config):
     return bool(isinstance(config, dict) and config.get('supervisedMode'))
 
 
+def _bridge_anchor_review_enabled(config):
+    """桥接/换族锚点帧强制监修（**默认开**，config['bridgeAnchorReview'] 显式 False
+    才关闭）。与 supervisedMode（全量关键点监修，默认关）互补：本开关只覆盖换族
+    锚点这一个最高风险节点——2026-07-15 盐湖贝壳单里室内锚点帧渲成室外复制帧，
+    有人看一眼就不会有后面 6 段废片。超时自动采用（_review_timeout）保证挂机
+    不至于永久卡住。"""
+    if not isinstance(config, dict):
+        return True
+    v = config.get('bridgeAnchorReview')
+    return True if v is None else bool(v)
+
+
 def _review_timeout(config):
     """监修暂停的超时秒数（超时自动采用并继续，挂机不至于永久卡住）。默认 600。"""
     try:
@@ -423,10 +435,16 @@ def _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on
     interval = _checkpoint_interval(config)
     supervised = _supervised_mode(config)
     missing = {s for s in seqs if not os.path.exists(_frame_path(title, s))}
+    # 桥接/换族锚点默认监修：missing 里存在非首帧族锚（桥接交接/摇镜落点/硬切首帧）
+    # 时也需要分段路径提供暂停点
+    bridge_review = _bridge_anchor_review_enabled(config)
+    has_bridge_anchor = any(
+        s in missing and s != 1 and family_anchor_seq(videos, s) == s for s in seqs)
     # 监修模式强制走分段路径（哪怕链很短/质检 off），否则暂停点无处安放；
     # 全自动模式维持原退化条件
     if interval <= 0 or not missing or \
-            (not supervised and (qa_gate_level(config) == 'off' or len(missing) <= interval)):
+            (not supervised and not (bridge_review and has_bridge_anchor)
+             and (qa_gate_level(config) == 'off' or len(missing) <= interval)):
         generate_frame_sequence(config, title, prompt_block, on_progress=on_progress,
                                 target_sequences=None)
         return prompt_block
@@ -447,8 +465,11 @@ def _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on
     changed = False
     for _fam, members in runs:
         # 监修模式：族锚帧（首帧/桥接交接帧）单独成段——渲染后立即暂停人工确认，
-        # 确认通过之前不渲染任何将链在它身上的后续帧
-        review_anchor = supervised and members[0] in missing
+        # 确认通过之前不渲染任何将链在它身上的后续帧。
+        # 非首帧族锚（换族点）即使全自动模式也默认监修（bridgeAnchorReview，
+        # 显式 False 关闭）——判定器最弱、歪一帧废一族的节点，超时自动采用兜底。
+        review_anchor = (supervised or (bridge_review and members[0] != 1)) \
+            and members[0] in missing
         if review_anchor and len(members) > 1:
             rest = members[1:]
             segments = [[members[0]]] + [rest[i:i + interval] for i in range(0, len(rest), interval)]
@@ -560,14 +581,22 @@ def _chain_drift_lookback(config, title, prompt_block, project_dir, on_progress=
 
 
 _MAX_SEQUENCE_REVIEW_ROUNDS = 2
+# 2026-07-16：max_rounds 早就把"轮数"限住了，但每轮的重渲批次在网关限流/超时下
+# 各帧各自独立退避重试，轮数有限不等于耗时有限——实测一条真实链在网关持续 429 下
+# 卡在"复审→整单重渲→复审"循环里跑了超过 1 小时仍未收敛终止。加一个总时长熔断：
+# 超预算就不再开新一轮/新一批重渲，直接按当前已知的 final_failures 收尾标记
+# （复用既有的 sequence_review_flagged，不是 fail-open 静默放行）。
+_SEQUENCE_REVIEW_TIME_BUDGET_SECONDS = 900
 
 
 def _sequence_consistency_review(config, title, prompt_block, project_dir, on_progress=None,
-                                 max_rounds=_MAX_SEQUENCE_REVIEW_ROUNDS):
+                                 max_rounds=_MAX_SEQUENCE_REVIEW_ROUNDS,
+                                 time_budget_seconds=_SEQUENCE_REVIEW_TIME_BUDGET_SECONDS):
     """整套序列渲染完成后的一致性审查：对着真实已渲染画面统一跑一次施工顺序/SCUP
     审查（prompt_pipeline.check_full_sequence_consistency），取代原来逐帧/盲文本的
     质检门。有问题就定向重写被标记拍的提示词、只重渲那几帧，最多循环 max_rounds
-    轮。轮次耗尽仍有问题的帧在 manifest 里标成 'sequence_review_flagged'（原因写进
+    轮，且总耗时不超过 time_budget_seconds（网关限流下重渲退避可能比轮数本身更慢）。
+    轮次或时长耗尽仍有问题的帧在 manifest 里标成 'sequence_review_flagged'（原因写进
     vlm_qa_reason，帧网格已有的"重试"按钮可直接用来人工处理）；其余标
     'sequence_reviewed_pass'。返回（可能被改写过的）prompt_block。"""
     images, videos = _parse_prompt_slots(prompt_block)
@@ -575,8 +604,24 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
     if total_beats <= 0:
         return prompt_block
 
+    started_at = time.time()
     final_failures = {}
-    for round_num in range(1, max_rounds + 1):
+    review_unavailable = False
+    time_budget_exceeded = False
+    # 审查跑 max_rounds+1 次、回炉最多 max_rounds 次：最后一轮回炉重渲出来的帧
+    # 也要经过一次真实复核再盖章。此前末轮"回炉重渲→不复核→直接按重渲前的
+    # 失败理由标 sequence_review_flagged"——重渲结果从未被验证，标记的理由
+    # 描述的还是已被覆盖的旧帧（2026-07-17 拱渡槽单 4/6/9 帧实锤）。
+    total_review_rounds = max_rounds + 1
+    for round_num in range(1, total_review_rounds + 1):
+        if time.time() - started_at > time_budget_seconds:
+            time_budget_exceeded = True
+            if on_progress:
+                on_progress('sequence_review', {
+                    'round': round_num, 'max_rounds': max_rounds,
+                    'message': f'一致性审查+重渲已超过 {time_budget_seconds}s 总时长预算，停止继续重渲并按当前结果收尾标记...',
+                })
+            break
         frame_paths = {s: _frame_path(title, s) for s in sorted(images) if os.path.exists(_frame_path(title, s))}
         if len(frame_paths) < len(images):
             # 有帧还没渲出来（例如只重渲了子集），审查意义不大——直接放弃本轮，且不
@@ -584,13 +629,29 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
             return prompt_block
         if on_progress:
             on_progress('sequence_review', {
-                'round': round_num, 'max_rounds': max_rounds,
-                'message': f'正在对整套已渲染序列做一致性审查（第 {round_num}/{max_rounds} 轮）...',
+                'round': round_num, 'max_rounds': total_review_rounds,
+                'message': f'正在对整套已渲染序列做一致性审查（第 {round_num}/{total_review_rounds} 轮）...',
             })
         final_failures = check_full_sequence_consistency(config, prompt_block, frame_paths)
+        if final_failures is None:
+            # 审查没跑成（超时/网关异常）≠ 审查通过。降级重试一次：帧图压小 + 超时
+            # 放宽。2026-07-15 事故里这里曾直接 fail-open 放行整单。
+            if on_progress:
+                on_progress('sequence_review', {
+                    'round': round_num, 'max_rounds': max_rounds,
+                    'message': '一致性审查调用失败（超时/网关异常），压缩帧图降级重试一次...',
+                })
+            final_failures = check_full_sequence_consistency(config, prompt_block, frame_paths, degraded=True)
+        if final_failures is None:
+            review_unavailable = True
+            final_failures = {}
+            break
         if not final_failures:
             if on_progress:
                 on_progress('sequence_review_result', {'passed': True, 'round': round_num})
+            break
+        if round_num > max_rounds:
+            # 末位复核轮：回炉额度已用完，本轮只对最后一次重渲的真实结果盖章
             break
         if on_progress:
             on_progress('sequence_review_result', {
@@ -625,12 +686,24 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
         if seq in flagged_seqs:
             reason = '；'.join(final_failures.get(seq - 1, []))
             _set_manifest_quality_gate(project_dir, seq, 'sequence_review_flagged', reason)
+        elif review_unavailable:
+            # 审查服务两次（常规+降级）都没跑成：如实标"未经审查"，绝不盖
+            # sequence_reviewed_pass 假章——前端据此显示黄色"未审查"徽标。
+            _set_manifest_quality_gate(project_dir, seq, 'sequence_review_skipped',
+                                       '一致性审查服务不可用（降级重试仍失败），此帧未经整套序列审查')
         else:
             _set_manifest_quality_gate(project_dir, seq, 'sequence_reviewed_pass', None)
-    if flagged_seqs and on_progress:
+    if review_unavailable and on_progress:
+        on_progress('sequence_review_result', {
+            'passed': False, 'skipped': True,
+            'message': '一致性审查服务不可用（降级重试仍失败）：本单帧已如实标记为「未经审查」，请留意画面一致性。',
+        })
+    elif flagged_seqs and on_progress:
+        limit_desc = (f'总时长预算（{time_budget_seconds}s）' if time_budget_exceeded
+                      else f'最多 {max_rounds} 轮修复上限')
         on_progress('sequence_review_result', {
             'passed': False, 'round': max_rounds, 'beats': sorted(final_failures.keys()),
-            'message': f'达到最多 {max_rounds} 轮修复上限，仍有 {len(flagged_seqs)} 帧存在一致性问题，已标记留待人工处理。',
+            'message': f'达到{limit_desc}，仍有 {len(flagged_seqs)} 帧存在一致性问题，已标记留待人工处理。',
         })
     return prompt_block
 
@@ -659,9 +732,10 @@ def _render_videos_with_recovery(config, title, prompt_block, on_progress=None):
     back rejected/blocked (e.g. a failed Google FX anchor-match) instead of leaving it
     for a human to notice and re-trigger manually."""
     video_result = generate_video_sequence(config, title, prompt_block, on_progress=on_progress)
-    # 'skipped_cut'（声明式硬切槽位）是预期缺失，不进恢复重试轮
+    # 'skipped_cut'（声明式硬切槽位）和 'skipped_bridge_hold'（TBCP v3 桥接 HOLD
+    # 拍）都是预期缺失，不进恢复重试轮
     failed_slots = [v['slot'] for v in video_result.get('videos', [])
-                    if v.get('status') not in ('success', 'skipped_cut')]
+                    if v.get('status') not in ('success', 'skipped_cut', 'skipped_bridge_hold')]
     if failed_slots:
         if on_progress:
             on_progress('video_retry_autonomous', {'slots': failed_slots})
