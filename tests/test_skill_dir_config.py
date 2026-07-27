@@ -73,6 +73,7 @@ class TestResolutionPriority:
 
     def test_user_path_and_relative_path_are_expanded(self, cfg_file, monkeypatch, tmp_path):
         monkeypatch.setenv('HOME', str(tmp_path))
+        monkeypatch.setenv('USERPROFILE', str(tmp_path))
         monkeypatch.setattr(server_common, '_PROJECT_ROOT', str(tmp_path / 'proj'))
 
         _set_config(cfg_file, skillDir='~/skills/composer')

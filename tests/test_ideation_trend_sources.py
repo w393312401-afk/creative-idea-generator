@@ -253,12 +253,21 @@ class TestRunIdeateReturnShape(unittest.TestCase):
         不再按 4 桶轮换,批次多样性改由「同批载体互不重复」承担,DNA 第一槽换成具体载体。"""
         captured = {}
 
+        import json
         def fake_chat(config, system_prompt, user_prompt, **kwargs):
             captured['system'] = system_prompt
-            return '[{"title": "T"}]'
+            return json.dumps([{
+                "title": "T",
+                "carrier_slug": "pot",
+                "destiny": "gold",
+                "twist_family": "paint",
+                "recommended_beats": 5,
+                "beat_outline": ["1", "2", "3", "4", "5", "6"]
+            }])
 
         with patch.object(pp, 'fetch_trend_snippet', return_value=''), \
              patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, 'load_reference_file', return_value=''), \
              patch.object(pp, '_chat', side_effect=fake_chat):
             pp.run_ideate({}, count=4)
 
