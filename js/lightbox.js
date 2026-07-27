@@ -83,7 +83,15 @@ function updateLightboxContent() {
         video.style.display = 'none';
         video.pause();
         video.src = '';
-        img.src = item.url;
+        // 直接赋 src 会命中浏览器对这个 URL 的既有缓存，重试/修复原地覆盖同名
+        // 帧文件后点开还是老图。safeSetImageSrc（media_renderer.js）按 URL 维护
+        // 缓存版本号，重渲发生时该 URL 已被 bump 过，这里用 bust=false 直接
+        // 取新版本号即可，不需要在这里再 bump 一次。
+        if (typeof safeSetImageSrc === 'function') {
+            safeSetImageSrc(img, item.url, false);
+        } else {
+            img.src = item.url;
+        }
         img.style.display = 'block';
     }
 

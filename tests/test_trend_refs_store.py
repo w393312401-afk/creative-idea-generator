@@ -9,6 +9,10 @@
    trend_refs.archive.json;mark_trend_refs_used 回写使用统计让淘汰优先跳过
    验证过有用的条目;restore_trend_refs 可从归档挪回主库;delete_trend_refs
    支持 archive=True 对归档库操作。
+6. 2026-07-23:mark_trend_refs_used 的计次点已从 run_ideate 挪到「一键合成」
+   (/api/compose,见 tests/test_trend_ref_compose_usage.py)——run_ideate 只
+   把候选案例 id 带在每条 idea 上(trend_ref_ids),本文件里 run_ideate 相关
+   用例只验证 id 透传，不再验证 used_count 递增。
 """
 import json
 import os
@@ -224,14 +228,118 @@ class TestMarkTrendRefsUsed(_TrendRefsTmpDirMixin):
         pp.mark_trend_refs_used(['tr_ghost'])  # 不应抛异常
         self.assertEqual(pp.load_trend_refs()[0]['used_count'], 0)
 
-    def test_run_ideate_marks_selected_refs_used(self):
+    def test_run_ideate_no_longer_marks_used_only_tags_candidate_ids(self):
+        # 2026-07-23:计次点挪到「一键合成」(server.py /api/compose)。run_ideate
+        # 生成灵感卡片这一步本身不再计次,只把候选案例 id 原样带在每条 idea 上,
+        # 供合成时按需回填(见 tests/test_trend_ref_compose_usage.py)。
         seeded = pp.persist_trend_refs([
             {'source': 'web_search', 'label': 'L1', 'text': '· 要点一'},
         ])
         with patch.object(pp, '_chat', return_value='[{"title": "T", "trend_ref": "借鉴"}]'):
-            pp.run_ideate({}, count=1, trend_ref_ids=[seeded[0]['id']])
+            result = pp.run_ideate({}, count=1, trend_ref_ids=[seeded[0]['id']])
         stored = pp.load_trend_refs()
-        self.assertEqual(stored[0]['used_count'], 1)
+        self.assertEqual(stored[0]['used_count'], 0)
+        self.assertEqual(result['ideas'][0]['trend_ref_ids'], [seeded[0]['id']])
+
+    def test_mark_used_auto_archives_at_threshold(self):
+        # 用满 TREND_REF_AUTO_ARCHIVE_AFTER(3)次后自动从主库挪进归档(软删可恢复)
+        out = pp.persist_trend_refs([{'source': 'web_search', 'label': 'A', 'text': 'a'}])
+        pp.mark_trend_refs_used([out[0]['id']])
+        pp.mark_trend_refs_used([out[0]['id']])
+        self.assertEqual(pp.load_trend_refs()[0]['used_count'], 2)
+        self.assertEqual(pp.load_trend_refs_archive(), [])
+        pp.mark_trend_refs_used([out[0]['id']])  # 第 3 次触发自动归档
+        self.assertEqual(pp.load_trend_refs(), [])
+        archived = pp.load_trend_refs_archive()
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0]['id'], out[0]['id'])
+        self.assertEqual(archived[0]['used_count'], 3)
+
+    def test_mark_used_archive_unwritable_skips_archive_but_keeps_count(self):
+        # 归档库损坏时本轮跳过自动归档,但 used_count 递增仍要落盘,不能连计数都丢
+        out = pp.persist_trend_refs([{'source': 'web_search', 'label': 'A', 'text': 'a'}])
+        pp.mark_trend_refs_used([out[0]['id']])
+        pp.mark_trend_refs_used([out[0]['id']])
+        with open(pp.TREND_REFS_ARCHIVE_PATH, 'w', encoding='utf-8') as f:
+            f.write('{broken')
+        pp.mark_trend_refs_used([out[0]['id']])  # 第 3 次本该触发归档,但归档库读取失败
+        stored = pp.load_trend_refs()
+        self.assertEqual(len(stored), 1)  # 仍留在主库
+        self.assertEqual(stored[0]['used_count'], 3)  # 计数仍然递增落盘
+
+
+class TestRunIdeateTrendSourcePriority(_TrendRefsTmpDirMixin):
+    """2026-07-25「联网主导」:每一批都走新鲜联网检索(fetch_trend_snippet 自带 6 小时
+    缓存,所以"每批都搜"的真实搜索频率仍是每 6 小时一次),案例库加权随机抽取降级为
+    联网整体失败时的兜底。旧行为(库非空就跳过联网)让绝大多数批次根本没联网、反复
+    复用同几条历史摘要,信息茧房比不联网更严重。手动勾选仍然是最高优先级。"""
+
+    def _seed(self):
+        return pp.persist_trend_refs([
+            {'source': 'web_search', 'label': 'A', 'text': '· 集装箱爆改正在流行'},
+            {'source': 'custom_urls', 'label': 'B', 'text': '· 树屋前后对比很吃香'},
+        ])
+
+    def test_live_search_runs_even_when_library_is_not_empty(self):
+        self._seed()
+        captured = {}
+
+        def fake_chat(config, system_prompt, user_prompt, **kwargs):
+            captured['system'] = system_prompt
+            return '[{"title": "T", "trend_ref": "借鉴"}]'
+
+        with patch.object(pp, 'fetch_trend_snippet', return_value='· 谷仓改住宅本周爆火') as mock_search, \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value='') as mock_urls, \
+             patch.object(pp.random, 'choices') as mock_choices, \
+             patch.object(pp, '_chat', side_effect=fake_chat):
+            result = pp.run_ideate({}, count=2)
+
+        mock_search.assert_called_once()   # 库非空也照样联网
+        mock_urls.assert_called_once()
+        mock_choices.assert_not_called()   # 联网拿到东西就不再走库里的加权随机兜底
+        self.assertIn('PRIMARY CREATIVE SOURCE', captured['system'])
+        self.assertIn('谷仓改住宅本周爆火', captured['system'])
+        self.assertNotIn('集装箱爆改正在流行', captured['system'])  # 旧条目不再顶替新鲜摘要
+        # 新鲜摘要同时沉淀进库,供后续兜底/人工勾选复用
+        self.assertIn('· 谷仓改住宅本周爆火', [e['text'] for e in pp.load_trend_refs()])
+        self.assertEqual(result['ideas'][0]['trend_ref_ids'], [result['trend_refs'][0]['id']])
+
+    def test_falls_back_to_library_pick_when_live_search_yields_nothing(self):
+        seeded = self._seed()
+        captured = {}
+
+        def fake_chat(config, system_prompt, user_prompt, **kwargs):
+            captured['system'] = system_prompt
+            return '[{"title": "T", "trend_ref": "借鉴"}]'
+
+        # 离网/超时/aux 模型不支持搜索时 fetch_trend_snippet 静默返回空串
+        with patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp.random, 'choices', return_value=[seeded[0]]), \
+             patch.object(pp, '_chat', side_effect=fake_chat):
+            result = pp.run_ideate({}, count=2)
+
+        self.assertIn('集装箱爆改正在流行', captured['system'])
+        self.assertNotIn('树屋前后对比', captured['system'])  # 没被抽中的不进 prompt
+        self.assertEqual(result['trend_refs'][0]['id'], seeded[0]['id'])
+        # 2026-07-23:计次点挪到「一键合成」,灵感激发阶段本身不再计次;
+        # 只把抽中的候选 id 带在每条 idea 上供合成时按需回填
+        stored_by_id = {e['id']: e for e in pp.load_trend_refs()}
+        self.assertEqual(stored_by_id[seeded[0]['id']]['used_count'], 0)
+        self.assertEqual(stored_by_id[seeded[1]['id']]['used_count'], 0)
+        self.assertEqual(result['ideas'][0]['trend_ref_ids'], [seeded[0]['id']])
+
+    def test_manual_selection_overrides_live_search(self):
+        seeded = self._seed()
+        with patch.object(pp, 'fetch_trend_snippet') as mock_search, \
+             patch.object(pp, 'fetch_custom_url_snippet'), \
+             patch.object(pp.random, 'choices') as mock_choices, \
+             patch.object(pp, '_chat', return_value='[{"title": "T", "trend_ref": "借鉴"}]'):
+            result = pp.run_ideate({}, count=1, trend_ref_ids=[seeded[1]['id']])
+
+        mock_search.assert_not_called()   # 显式勾选时连搜索都不发
+        mock_choices.assert_not_called()  # 手动勾选命中时不走自动挑选
+        self.assertEqual(result['trend_refs'][0]['id'], seeded[1]['id'])
 
 
 class TestRestoreTrendRefs(_TrendRefsTmpDirMixin):
@@ -271,6 +379,158 @@ class TestDeleteArchiveScope(_TrendRefsTmpDirMixin):
         self.assertEqual(result['deleted'], 1)
         self.assertEqual(pp.load_trend_refs_archive(), [])
         self.assertEqual(len(pp.load_trend_refs()), 1)  # 主库未受影响
+
+
+class TestDeriveTrendRefLabel(unittest.TestCase):
+    """2026-07-21 案例库可用性诊断:旧写法 label = 搜索词前 60 字,同一条(常年不变
+    的默认)搜索词产出的所有历史条目 label 逐字相同,列表只能靠时间戳区分。改成
+    从正文要点关键词提炼,同一批搜索结果里不同条目也应互相区分开。"""
+
+    def test_extracts_bold_keyword_from_bullet(self):
+        text = "* **百年废墟与荒野遗迹复活**：以老屋为载体...\n* **AI辅助渐变**：利用AI工具..."
+        label = pp._derive_trend_ref_label(text, fallback='FALLBACK')
+        self.assertIn('百年废墟与荒野遗迹复活', label)
+        self.assertIn('AI辅助渐变', label)
+        self.assertNotEqual(label, 'FALLBACK')
+
+    def test_extracts_curly_quoted_keyword_from_bullet(self):
+        text = "- 现在最爆的是“AI假延时改造”：废弃屋/地下掩体...\n- 题材从旧房转向“壳体猎奇”：埋地集装箱..."
+        label = pp._derive_trend_ref_label(text, fallback='FALLBACK')
+        self.assertIn('AI假延时改造', label)
+        self.assertIn('壳体猎奇', label)
+
+    def test_falls_back_to_colon_prefix_without_bold_or_quotes(self):
+        text = "- 载体爆点：荒废农村老宅/小院\n- 异形空间升温：山洞、地下掩体"
+        label = pp._derive_trend_ref_label(text, fallback='FALLBACK')
+        self.assertIn('载体爆点', label)
+        self.assertIn('异形空间升温', label)
+
+    def test_two_different_batches_produce_different_labels(self):
+        # 同一条默认搜索词、不同批次搜到的正文——旧写法两者 label 完全相同
+        # (都是"联网搜索 · <搜索词前60字>"),新写法应各自反映自己的正文内容
+        text_a = "* **AI假延时改造**：8-30秒完成废墟到豪宅"
+        text_b = "* **独居女性硬核改造**：单身女性亲自搬砖铺砖"
+        label_a = pp._derive_trend_ref_label(text_a, fallback='SAME')
+        label_b = pp._derive_trend_ref_label(text_b, fallback='SAME')
+        self.assertNotEqual(label_a, label_b)
+
+    def test_empty_text_falls_back(self):
+        self.assertEqual(pp._derive_trend_ref_label('', fallback='FALLBACK'), 'FALLBACK')
+        self.assertEqual(pp._derive_trend_ref_label(None, fallback='FALLBACK'), 'FALLBACK')
+
+    def test_label_topic_is_length_capped(self):
+        text = "* **" + ("超" * 60) + "**：说明文字"
+        label = pp._derive_trend_ref_label(text, fallback='FALLBACK')
+        self.assertLessEqual(len(label), 20)  # 单条主题词截到 16 字,不会整段糊在一起
+
+    def test_quote_marks_do_not_survive_mid_phrase(self):
+        # 加粗内容自身还嵌套了引号（"老破小"与极小户型极限收纳）时,引号不应残留
+        # 在提炼出的主题词中间
+        text = '* **"老破小"与极小户型极限收纳**：聚焦小户型...'
+        label = pp._derive_trend_ref_label(text, fallback='FALLBACK')
+        self.assertNotIn('"', label)
+        self.assertNotIn('“', label)
+        self.assertNotIn('”', label)
+
+
+class TestBuildLiveTrendRefsUsesDerivedLabel(_TrendRefsTmpDirMixin):
+    def test_web_search_label_reflects_content_not_query(self):
+        search = {'query': '固定默认搜索词', 'cache_key': 'k', 'system_instruction': 'sys'}
+        refs = pp._build_live_trend_refs(
+            {}, search,
+            trend_snippet='* **集装箱爆改**：低成本移动城堡概念',
+            custom_snippet='',
+        )
+        self.assertEqual(len(refs), 1)
+        self.assertIn('集装箱爆改', refs[0]['label'])
+        self.assertNotIn('固定默认搜索词', refs[0]['label'])
+
+
+class TestPersistDedupesByTextEvenWithMismatchedId(_TrendRefsTmpDirMixin):
+    """2026-07-21 实测库里真实出现过一对内容相同但 id 不同的重复条目——根因是
+    id=md5(text) 这条不变式在某条目的正文被后续脚本改写(如 boilerplate 回填清洗)
+    而未同步重算 id 时失效。persist 除了按 id 去重,还要按已入库条目的正文文本
+    兜底去重,防止同样的情况让"新" id 绕过去重重复入库。"""
+
+    def test_stale_id_on_existing_entry_does_not_defeat_text_dedup(self):
+        stored = pp._load_trend_refs_unlocked() or []
+        stored.append({
+            'id': 'tr_stale_mismatched_id',  # 不等于 md5(text) 的"脏" id
+            'created_at': '2026-07-15 22:07',
+            'source': 'web_search',
+            'label': 'OLD',
+            'query': 'q',
+            'text': '完全相同的正文内容',
+            'used_count': 1,
+            'last_used_at': None,
+        })
+        pp._write_trend_refs_unlocked(stored)
+
+        out = pp.persist_trend_refs([
+            {'source': 'web_search', 'label': 'NEW', 'text': '完全相同的正文内容'},
+        ])
+        self.assertEqual(out[0]['id'], 'tr_stale_mismatched_id')  # 回填的是旧条目的 id
+        stored_after = pp.load_trend_refs()
+        self.assertEqual(len(stored_after), 1)  # 没有重复入库
+        self.assertEqual(stored_after[0]['label'], 'OLD')  # 保留原条目
+
+
+class TestAvoidRepeatLabelsSuffix(unittest.TestCase):
+    def test_empty_labels_yields_empty_suffix(self):
+        self.assertEqual(pp._avoid_repeat_labels_suffix([]), '')
+        self.assertEqual(pp._avoid_repeat_labels_suffix(None), '')
+
+    def test_includes_sample_labels_capped_at_12(self):
+        labels = [f'label{i}' for i in range(20)]
+        suffix = pp._avoid_repeat_labels_suffix(labels)
+        self.assertIn('label0', suffix)
+        self.assertIn('label11', suffix)
+        self.assertNotIn('label12', suffix)
+
+
+class TestRefreshTrendRefsAvoidsRepeatAngles(_TrendRefsTmpDirMixin):
+    def test_refresh_injects_existing_labels_into_system_instruction(self):
+        pp.persist_trend_refs([
+            {'source': 'web_search', 'label': '已收录角度A', 'text': '旧要点'},
+        ])
+        captured = {}
+
+        def fake_chat(config, system, user, **kwargs):
+            captured['system'] = system
+            return '· 新要点'
+
+        with patch.object(pp, '_chat', side_effect=fake_chat):
+            pp.refresh_trend_refs({'model': 'gemini-3-flash'})
+        self.assertIn('已收录角度A', captured['system'])
+
+
+class TestRelabelTrendRef(_TrendRefsTmpDirMixin):
+    def test_relabel_updates_main_store(self):
+        out = pp.persist_trend_refs([{'source': 'web_search', 'label': 'OLD', 'text': 'a'}])
+        result = pp.relabel_trend_ref(out[0]['id'], '新名字')
+        self.assertTrue(result['ok'])
+        self.assertEqual(pp.load_trend_refs()[0]['label'], '新名字')
+
+    def test_relabel_unknown_id_returns_not_ok(self):
+        pp.persist_trend_refs([{'source': 'web_search', 'label': 'A', 'text': 'a'}])
+        result = pp.relabel_trend_ref('tr_ghost', '新名字')
+        self.assertFalse(result['ok'])
+
+    def test_relabel_empty_label_is_rejected(self):
+        out = pp.persist_trend_refs([{'source': 'web_search', 'label': 'OLD', 'text': 'a'}])
+        result = pp.relabel_trend_ref(out[0]['id'], '   ')
+        self.assertFalse(result['ok'])
+        self.assertEqual(pp.load_trend_refs()[0]['label'], 'OLD')
+
+    def test_relabel_archive_scope(self):
+        with patch.object(pp, 'TREND_REFS_CAP', 1):
+            pp.persist_trend_refs([{'source': 'web_search', 'label': 'A', 'text': 'a'}])
+            pp.persist_trend_refs([{'source': 'web_search', 'label': 'B', 'text': 'b'}])
+        archived_id = pp.load_trend_refs_archive()[0]['id']
+        result = pp.relabel_trend_ref(archived_id, '归档改名', archive=True)
+        self.assertTrue(result['ok'])
+        self.assertEqual(pp.load_trend_refs_archive()[0]['label'], '归档改名')
+        self.assertEqual(pp.load_trend_refs()[0]['label'], 'B')  # 主库未受影响
 
 
 class TestStripSearchBoilerplate(unittest.TestCase):

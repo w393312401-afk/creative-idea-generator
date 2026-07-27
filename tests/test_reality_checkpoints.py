@@ -289,9 +289,6 @@ class TestRenderFramesWithCheckpoints(_TmpProjectCase):
             return False
 
         cfg = dict(config) if config is not None else {}
-        # 本文件只测检查点分段机制；桥接锚点默认监修（bridgeAnchorReview，2026-07-15
-        # 起默认开）会在族锚处进入轮询暂停，显式关闭。监修行为在 test_supervised_review。
-        cfg.setdefault('bridgeAnchorReview', False)
         with patch.object(pipeline_orchestrator, 'generate_frame_sequence', fake_generate), \
              patch.object(pipeline_orchestrator, '_checkpoint_reality_sync', fake_sync):
             out = _render_frames_with_checkpoints(cfg,

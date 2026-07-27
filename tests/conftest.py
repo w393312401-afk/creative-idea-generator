@@ -26,3 +26,29 @@ def _isolate_qa_gate_level(monkeypatch):
     import server_common
     monkeypatch.delenv('SPARK_QA_GATE_LEVEL', raising=False)
     monkeypatch.delitem(server_common.SERVER_CONFIG, 'qaGateLevel', raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_repo_root_state_files(tmp_path_factory, monkeypatch):
+    """把仓库根的三个「本机运行时状态文件」在所有测试里重定向到临时目录。
+
+    这些常量是模块导入期就算好的绝对路径（基于 _REPO_ROOT），因此 monkeypatch.chdir
+    之类的隔离手法穿不透它们：
+      - search_snippet_cache.json —— 联网摘要 6 小时缓存
+      - trend_refs.json / trend_refs.archive.json —— 联网参考案例库
+      - compose_checkpoints.json —— 提示词合成断点续传存档
+
+    不隔离会双向出事：真实缓存/案例库被喂进测试（2026-07-25 实测
+    test_trend_ref_compose_usage 里"联网通道应当拿不到东西"的前提被真实缓存击穿），
+    以及测试反过来把桩数据写进开发者的真实案例库。多数测试各自 patch 过其中一两个，
+    但那是逐个测试的自觉，漏一个就是一个隐蔽 flake —— 这里统一兜底。
+    需要断言具体路径行为的测试仍可自行 patch 覆盖本 fixture。"""
+    import prompt_pipeline
+    state_dir = tmp_path_factory.mktemp('repo_state')
+    for attr, filename in (
+        ('SEARCH_SNIPPET_CACHE_PATH', 'search_snippet_cache.json'),
+        ('TREND_REFS_PATH', 'trend_refs.json'),
+        ('TREND_REFS_ARCHIVE_PATH', 'trend_refs.archive.json'),
+        ('COMPOSE_CHECKPOINT_PATH', 'compose_checkpoints.json'),
+    ):
+        monkeypatch.setattr(prompt_pipeline, attr, str(state_dir / filename), raising=True)

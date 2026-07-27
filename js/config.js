@@ -11,7 +11,8 @@ function saveSelectionState() {
         budget: document.getElementById('slider-budget').value,
         ratio: document.getElementById('slider-ratio').value,
         creativity: document.getElementById('slider-creativity').value,
-        beats: document.getElementById('slider-beats').value
+        beats: document.getElementById('slider-beats').value,
+        beatCountMode: (document.getElementById('beat-count-mode') || {}).value || 'adaptive'
     };
     
     localStorage.setItem('spark_selection_state', JSON.stringify(state));
@@ -54,6 +55,7 @@ function loadSelectionState() {
         setVal('slider-ratio', state.ratio);
         setVal('slider-creativity', state.creativity);
         setVal('slider-beats', state.beats);
+        setVal('beat-count-mode', state.beatCountMode || 'adaptive');
         
     } catch (e) {
         console.error("Failed to load selection state", e);
@@ -62,7 +64,7 @@ function loadSelectionState() {
 }
 
 function updateConfigSummary() {
-    // 选题来自「载入维度」过的灵感卡片（联网参考驱动），不再有基础场景主题
+    // 选题来自选中（载入维度）过的灵感卡片（联网参考驱动），不再有基础场景主题
     const themeText = (typeof loadedIdeationCover !== 'undefined' && loadedIdeationCover && loadedIdeationCover.task_label)
         ? loadedIdeationCover.task_label : '未载入灵感卡';
 
@@ -90,8 +92,10 @@ function updateConfigSummary() {
     const creativityText = creativityLabels[creativityVal] || '常规';
     
     const beatsVal = document.getElementById('slider-beats').value;
+    const beatMode = ((document.getElementById('beat-count-mode') || {}).value || 'adaptive') === 'fixed'
+        ? '固定' : '自适应上限';
     
-    const summaryText = `${themeText}${anchorsStr} | 复杂度:${complexityText}, 预算:${budgetText}, 反差:${ratioVal}%, 尺度:${creativityText}, ${beatsVal}拍`;
+    const summaryText = `${themeText}${anchorsStr} | 复杂度:${complexityText}, 预算:${budgetText}, 反差:${ratioVal}%, 尺度:${creativityText}, ${beatMode}:${beatsVal}拍`;
     
     const summaryEl = document.getElementById('config-summary-text');
     if (summaryEl) {
@@ -103,15 +107,8 @@ function applyPreset(presetName) {
     const p = PRESETS[presetName];
     if (!p) return;
 
-    // Theme：先确认预设指向的主题按钮存在，再清空重选；
-    // 否则一个失配的预设会把所有主题全部取消激活
-    const targetThemeBtn = document.querySelector(`#theme-selector .theme-btn[data-value="${p.theme}"]`);
-    if (targetThemeBtn) {
-        document.querySelectorAll('#theme-selector .theme-btn').forEach(btn => {
-            btn.classList.toggle('active', btn === targetThemeBtn);
-        });
-    }
-    
+    // （#theme-selector 已随基础场景主题选择器一并移除，预设不再有主题这一项）
+
     // Anchors
     document.querySelectorAll('#anchor-selector .anchor-node').forEach(btn => {
         if (p.anchors.includes(btn.dataset.value)) {
@@ -166,7 +163,7 @@ const LLM_MODEL_PICKER_FAMILIES = [
 function syncIdeationLlmPicker() {
     const wrap = document.getElementById('ideation-llm-groups');
     if (!wrap) return;
-    const current = config.model || 'gemini-3-flash-agent';
+    const current = config.model || 'gemini-3.6-flash-high';
     const isKnown = LLM_MODEL_PICKER_FAMILIES.some(
         fam => LLM_MODEL_GROUPS[fam.key].some(m => m.value === current)
     );
@@ -218,6 +215,11 @@ function syncIdeationLlmPicker() {
                 localStorage.setItem('spark_config', JSON.stringify(config));
                 showToast(`LLM 模型已切换：${m.value}（下次激发/合成生效）`, 'success');
                 syncIdeationLlmPicker();
+                // 手机上芯片组是临时展开的（picker-collapsed，见 index.html）：
+                // 选完就收回去，把页脚高度还给上面的案例库/灵感卡。
+                if (typeof collapseIdeationPickerOnMobile === 'function') {
+                    collapseIdeationPickerOnMobile();
+                }
                 // 顶栏「本地 xxx 在线」徽章即时复测：不同供应商路由到不同网关
                 // （gpt→codex / 其余→8046），不复测的话徽章会一直挂着旧模型名
                 // 和旧网关的在线状态。ping 只查网关可达（毫秒级、零 token），
@@ -248,8 +250,9 @@ function syncFramesImageModelPicker() {
     const isFx = (config.imageBackend || 'api') === 'google_fx';
     const options = isFx ? FX_IMAGE_MODELS : IMAGE_MODELS;
     const current = isFx
-        ? (config.googleFxImageModel || 'Nano Banana 2')
+        ? normalizeGoogleFxImageModel(config.googleFxImageModel)
         : (config.imageModel || 'nano-banana-2');
+    if (isFx) config.googleFxImageModel = current;
 
     sel.innerHTML = '';
     options.forEach(m => {
@@ -274,9 +277,9 @@ function syncFramesImageModelPicker() {
         sel.addEventListener('change', () => {
             const fx = (config.imageBackend || 'api') === 'google_fx';
             if (fx) {
-                config.googleFxImageModel = sel.value;
+                config.googleFxImageModel = normalizeGoogleFxImageModel(sel.value);
                 const fxSel = document.getElementById('settings-fx-image-model');
-                if (fxSel) fxSel.value = sel.value;
+                if (fxSel) fxSel.value = config.googleFxImageModel;
             } else {
                 config.imageModel = sel.value;
             }
@@ -311,6 +314,13 @@ function loadConfig() {
                 config.baseUrl = DEFAULT_CONFIG.baseUrl;
                 localStorage.setItem('spark_config', JSON.stringify(config));
             }
+
+            // Flow 已下线旧 Imagen/Image 4；历史 localStorage 自动迁移到新 Lite。
+            const normalizedFxModel = normalizeGoogleFxImageModel(config.googleFxImageModel);
+            if (normalizedFxModel !== config.googleFxImageModel) {
+                config.googleFxImageModel = normalizedFxModel;
+                localStorage.setItem('spark_config', JSON.stringify(config));
+            }
         } catch (e) {
             console.error("Failed to parse stored config, using defaults", e);
         }
@@ -331,7 +341,7 @@ function loadConfig() {
     }
     const fxImageModelSelect = document.getElementById('settings-fx-image-model');
     if (fxImageModelSelect) {
-        fxImageModelSelect.value = config.googleFxImageModel || 'Nano Banana 2';
+        fxImageModelSelect.value = normalizeGoogleFxImageModel(config.googleFxImageModel);
     }
     const fxVideoModelSelect = document.getElementById('settings-fx-video-model');
     if (fxVideoModelSelect) {
@@ -342,17 +352,16 @@ function loadConfig() {
     if (fxVideoDurationSelect) {
         fxVideoDurationSelect.value = config.videoDuration || '';
     }
-    const fxIpRotateRequestsInput = document.getElementById('settings-fx-ip-rotate-requests');
-    if (fxIpRotateRequestsInput) {
-        fxIpRotateRequestsInput.value = config.googleFxIpRotateRequests !== undefined ? config.googleFxIpRotateRequests : 5;
+    const fxAccountSwitchInput = document.getElementById('settings-fx-account-switch-requests');
+    if (fxAccountSwitchInput) {
+        fxAccountSwitchInput.value = config.googleFxIpRotateRequests !== undefined ? config.googleFxIpRotateRequests : 5;
     }
-    const fxBrowserIdInput = document.getElementById('settings-fx-browser-id');
-    if (fxBrowserIdInput) {
-        fxBrowserIdInput.value = config.googleFxUserId || '';
-    }
-    const supervisedSelect = document.getElementById('settings-supervised-mode');
-    if (supervisedSelect) {
-        supervisedSelect.value = config.supervisedMode ? 'on' : 'off';
+    // 浏览器编号是号池环境编号的下拉（选项由 account_pool.js 的
+    // populateFxBrowserIdSelect 异步填），这里赋值可能早于选项到位——
+    // 那边会拿 config.googleFxUserId 再选一次，不会丢已保存的值。
+    const fxBrowserIdSelect = document.getElementById('settings-fx-browser-id');
+    if (fxBrowserIdSelect) {
+        fxBrowserIdSelect.value = config.googleFxUserId || '';
     }
     const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
     if (trendUrlsInput) {
@@ -388,12 +397,12 @@ function updateFxImageModelVisibility() {
     const backendSelect = document.getElementById('settings-image-backend');
     const fxImageGroup = document.getElementById('fx-image-model-group');
     const fxVideoGroup = document.getElementById('fx-video-model-group');
-    const fxIpGroup = document.getElementById('fx-ip-rotate-requests-group');
+    const fxAccountSwitchGroup = document.getElementById('fx-account-switch-group');
     const fxBrowserIdGroup = document.getElementById('fx-browser-id-group');
     const showFx = backendSelect && backendSelect.value === 'google_fx';
     if (fxImageGroup) fxImageGroup.style.display = showFx ? 'block' : 'none';
     if (fxVideoGroup) fxVideoGroup.style.display = showFx ? 'block' : 'none';
-    if (fxIpGroup) fxIpGroup.style.display = showFx ? 'block' : 'none';
+    if (fxAccountSwitchGroup) fxAccountSwitchGroup.style.display = showFx ? 'block' : 'none';
     if (fxBrowserIdGroup) fxBrowserIdGroup.style.display = showFx ? 'block' : 'none';
     updateFxVideoDurationVisibility();
 }
@@ -419,7 +428,7 @@ function saveConfig() {
     }
     const fxImageModelSelect = document.getElementById('settings-fx-image-model');
     if (fxImageModelSelect) {
-        config.googleFxImageModel = fxImageModelSelect.value;
+        config.googleFxImageModel = normalizeGoogleFxImageModel(fxImageModelSelect.value);
     }
     const fxVideoModelSelect = document.getElementById('settings-fx-video-model');
     if (fxVideoModelSelect) {
@@ -429,18 +438,14 @@ function saveConfig() {
     if (fxVideoDurationSelect) {
         config.videoDuration = fxVideoDurationSelect.value;
     }
-    const fxIpRotateRequestsInput = document.getElementById('settings-fx-ip-rotate-requests');
-    if (fxIpRotateRequestsInput) {
-        const val = parseInt(fxIpRotateRequestsInput.value.trim(), 10);
+    const fxAccountSwitchInput = document.getElementById('settings-fx-account-switch-requests');
+    if (fxAccountSwitchInput) {
+        const val = parseInt(fxAccountSwitchInput.value.trim(), 10);
         config.googleFxIpRotateRequests = isNaN(val) ? 5 : val;
     }
-    const fxBrowserIdInput = document.getElementById('settings-fx-browser-id');
-    if (fxBrowserIdInput) {
-        config.googleFxUserId = fxBrowserIdInput.value.trim();
-    }
-    const supervisedSelect = document.getElementById('settings-supervised-mode');
-    if (supervisedSelect) {
-        config.supervisedMode = supervisedSelect.value === 'on';
+    const fxBrowserIdSelect = document.getElementById('settings-fx-browser-id');
+    if (fxBrowserIdSelect) {
+        config.googleFxUserId = fxBrowserIdSelect.value.trim();
     }
     const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
     if (trendUrlsInput) {
@@ -483,17 +488,13 @@ function resetConfig() {
     if (fxVideoDurationSelect) {
         fxVideoDurationSelect.value = DEFAULT_CONFIG.videoDuration;
     }
-    const fxIpRotateRequestsInput = document.getElementById('settings-fx-ip-rotate-requests');
-    if (fxIpRotateRequestsInput) {
-        fxIpRotateRequestsInput.value = DEFAULT_CONFIG.googleFxIpRotateRequests;
+    const fxAccountSwitchInput = document.getElementById('settings-fx-account-switch-requests');
+    if (fxAccountSwitchInput) {
+        fxAccountSwitchInput.value = DEFAULT_CONFIG.googleFxIpRotateRequests;
     }
-    const fxBrowserIdInput = document.getElementById('settings-fx-browser-id');
-    if (fxBrowserIdInput) {
-        fxBrowserIdInput.value = DEFAULT_CONFIG.googleFxUserId;
-    }
-    const supervisedSelect = document.getElementById('settings-supervised-mode');
-    if (supervisedSelect) {
-        supervisedSelect.value = DEFAULT_CONFIG.supervisedMode ? 'on' : 'off';
+    const fxBrowserIdSelect = document.getElementById('settings-fx-browser-id');
+    if (fxBrowserIdSelect) {
+        fxBrowserIdSelect.value = DEFAULT_CONFIG.googleFxUserId;
     }
     const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
     if (trendUrlsInput) {
@@ -579,15 +580,8 @@ function applyCustomPreset(name) {
     const p = customPresets[name];
     if (!p) return;
     
-    // Theme
-    document.querySelectorAll('#theme-selector .theme-btn').forEach(btn => {
-        if (btn.dataset.value === p.theme) {
-            btn.classList.add('active');
-        } else {
-            btn.classList.remove('active');
-        }
-    });
-    
+    // （#theme-selector 已移除；旧自定义预设档里残留的 p.theme 直接忽略）
+
     // Anchors
     document.querySelectorAll('#anchor-selector .anchor-node').forEach(btn => {
         if (p.anchors.includes(btn.dataset.value)) {
@@ -648,15 +642,9 @@ function renderCustomPresets() {
 }
 
 function randomizeDimensions() {
-    // 1. Select a random theme
-    const themeBtns = Array.from(document.querySelectorAll('#theme-selector .theme-btn'));
-    if (themeBtns.length > 0) {
-        themeBtns.forEach(btn => btn.classList.remove('active'));
-        const randomThemeBtn = themeBtns[Math.floor(Math.random() * themeBtns.length)];
-        randomThemeBtn.classList.add('active');
-    }
-    
-    // 2. Select 1 to 3 random anchors
+    // （随机主题这一步已随 #theme-selector 移除；场景主题现在由灵感卡片/联网参考决定）
+
+    // 1. Select 1 to 3 random anchors
     const anchorNodes = Array.from(document.querySelectorAll('#anchor-selector .anchor-node'));
     if (anchorNodes.length > 0) {
         anchorNodes.forEach(node => node.classList.remove('active'));
@@ -667,7 +655,7 @@ function randomizeDimensions() {
         }
     }
     
-    // 3. Randomize sliders
+    // 2. Randomize sliders
     const setRandomVal = (id, min, max) => {
         const el = document.getElementById(id);
         if (el) {
@@ -686,4 +674,3 @@ function randomizeDimensions() {
     saveSelectionState();
     showToast("🎲 随机激发配比已装配！", "success");
 }
-

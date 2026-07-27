@@ -38,6 +38,90 @@ GOOD_REWRITE = (ANCHOR + " One lone worker in a solid pale shirt and dark cap is
                 "continuous construction time-lapse, not real-time footage.")
 
 
+def _milestone_beat(**overrides):
+    beat = {
+        'index': 1,
+        'operation': 'framing',
+        'description': 'install the complete radial roof frame',
+        'bridge_stage': None,
+        'stage_scope': 'large',
+        'milestone_name': 'eight-rafter roof skeleton complete',
+        'before_state': 'the stone wall has no roof framing',
+        'after_state': 'all eight timber rafters meet at the central roof hub',
+        'completion_extent': 'all eight rafters across the full roof circle',
+        'changed_grid_cells': ['Grid A2', 'Grid B2'],
+        'package_operations': ['framing'],
+        'primary_progress': 'the radial skeleton grows from zero to all eight rafters',
+        'secondary_progress': 'the leaned timber bundle drains from eight pieces to none',
+        'persistent_traces': ['sunk nail heads', 'pale sawdust bands'],
+        'preserve_state': 'the five-course stone wall and doorway remain unchanged',
+    }
+    beat.update(overrides)
+    return beat
+
+
+class TestVisibleMilestonePlanningGate(unittest.TestCase):
+    def test_adaptive_accepts_shorter_ladder_but_fixed_does_not(self):
+        self.assertTrue(pp._beat_count_is_valid(6, 16, 'adaptive'))
+        self.assertFalse(pp._beat_count_is_valid(6, 16, 'fixed'))
+        self.assertTrue(pp._beat_count_is_valid(16, 16, 'fixed'))
+
+    def test_complete_countable_milestone_passes(self):
+        self.assertEqual(pp.milestone_ladder_violations([_milestone_beat()]), [])
+
+    def test_local_barely_visible_progress_is_rejected(self):
+        beat = _milestone_beat(
+            milestone_name='one small section begins to receive rafters',
+            after_state='one corner has a local patch of framing',
+            completion_extent='one small section',
+            changed_grid_cells=['Grid A2'],
+        )
+        errors = pp.milestone_ladder_violations([beat])
+        self.assertTrue(any('weak/local' in error for error in errors))
+
+    def test_coherent_closeout_package_is_allowed(self):
+        beat = _milestone_beat(
+            operation='repair',
+            milestone_name='weather-tight exterior shell complete',
+            after_state='all six roof panels, the plank door, and the threshold path are complete',
+            completion_extent='all six roof panels plus the full doorway and threshold approach',
+            changed_grid_cells=['Grid A2', 'Grid B2', 'Grid C2'],
+            package_operations=['roofing', 'door-install', 'threshold-closeout'],
+        )
+        self.assertEqual(pp.milestone_ladder_violations([beat]), [])
+
+    def test_cross_phase_package_is_rejected(self):
+        beat = _milestone_beat(package_operations=['demolition', 'painting'])
+        errors = pp.milestone_ladder_violations([beat])
+        self.assertTrue(any('incompatible construction phases' in error for error in errors))
+
+
+class TestMilestonePromptSkeleton(unittest.TestCase):
+    def test_image_requires_after_state_extent_and_two_traces(self):
+        beat = _milestone_beat()
+        good = (
+            'The scene is the eight-rafter roof skeleton complete anchor. All eight timber rafters '
+            'meet at the central roof hub across the full roof circle. The five-course stone wall '
+            'and doorway remain unchanged. Sunk nail heads and pale sawdust bands remain visible.'
+        )
+        self.assertEqual(pp.check_milestone_image_prompt(good, beat), [])
+        bad = 'One small section begins to show a timber change while everything else remains.'
+        self.assertTrue(pp.check_milestone_image_prompt(bad, beat))
+
+    def test_video_requires_both_progress_lines_and_material_path(self):
+        beat = _milestone_beat()
+        good = (
+            'At the very first moment the stone wall has no roof framing and the worker makes the '
+            'first hammer contact, then repeatedly lifts rafters from a leaned timber bundle and '
+            'carries them to the roof hub. The radial skeleton grows from zero to all eight rafters '
+            'while the leaned timber bundle drains from eight pieces to none. At the end all eight '
+            'timber rafters meet at the central roof hub.'
+        )
+        self.assertEqual(pp.check_milestone_video_prompt(good, beat), [])
+        bad = 'A worker installs some wood and exits.'
+        self.assertTrue(pp.check_milestone_video_prompt(bad, beat))
+
+
 class TestSplitStructuralVideoErrors(unittest.TestCase):
     def test_structural_and_style_errors_are_separated(self):
         errs = [
@@ -114,7 +198,7 @@ class TestReworkStructuralVideoBeat(unittest.TestCase):
 
     def test_bridge_beat_requires_camera_translation_in_rewrite(self):
         errs = ["Bridge VIDEO contains no camera-translation description"]
-        beat = {'bridge_stage': 2}
+        beat = {'bridge_stage': 1}
         # 桥接拍的重写稿写了工人动作但没有运镜 → 复验（is_bridge）不过 → 拒绝
         with patch.object(pp, '_chat', return_value=GOOD_REWRITE):
             out, adopted = pp.rework_structural_video_beat({}, 5, HOLLOW_VIDEO, errs, {}, beat=beat)
@@ -415,6 +499,264 @@ class TestReworkMissingAnchorBeat(unittest.TestCase):
             out, adopted = pp.rework_missing_anchor_beat({}, 12, REWARD_IMAGE_MISSING_ANCHOR, errs, beat=self.BEAT)
         self.assertFalse(adopted)
         self.assertEqual(out, REWARD_IMAGE_MISSING_ANCHOR)
+
+
+# --- IMAGE 侧 sterile 占位句禁令（2026-07-21 水磨坊实测确诊：'sterile'/'sterile of
+# objects' 是 VIDEO 专用声明词汇被合成 LLM 挪用到 IMAGE 当"这拍没新内容"的万能占位
+# 句，4/12 张 IMAGE 命中，直接打穿破损/原始感要求；同款保守回炉契约） ---
+
+STERILE_IMAGE = (
+    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
+    "perspective down the central loft axis; camera pitch locked level; central "
+    "vanishing axis centered. Completely sterile of objects. Locked anchors: historic "
+    "cast-iron drive gear hub at Grid B2 holding 45 percent of frame height."
+)
+
+STERILE_IMAGE_GOOD_REWRITE = (
+    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
+    "perspective down the central loft axis; camera pitch locked level; central "
+    "vanishing axis centered. Fine pale grey scraper score lines streak the granite "
+    "wall beside a bright yellow pressure-washer hose coiled on the damp floor timbers. "
+    "Locked anchors: historic cast-iron drive gear hub at Grid B2 holding 45 percent of "
+    "frame height."
+)
+
+
+class TestCheckImageDecayPlaceholder(unittest.TestCase):
+    def test_completely_sterile_is_flagged(self):
+        errs = pp.check_image_decay_placeholder("Completely sterile.")
+        self.assertTrue(errs)
+        self.assertIn('sterile', errs[0])
+
+    def test_sterile_of_objects_is_flagged(self):
+        errs = pp.check_image_decay_placeholder(STERILE_IMAGE)
+        self.assertTrue(errs)
+
+    def test_prompt_without_sterile_passes(self):
+        self.assertEqual(pp.check_image_decay_placeholder(STERILE_IMAGE_GOOD_REWRITE), [])
+
+    def test_empty_prompt_is_noop(self):
+        self.assertEqual(pp.check_image_decay_placeholder(''), [])
+        self.assertEqual(pp.check_image_decay_placeholder(None), [])
+
+
+class TestReworkDecayPlaceholderBeat(unittest.TestCase):
+    ERRS = ["IMAGE prompt uses the word 'sterile' — that is VIDEO-only vocabulary"]
+
+    def test_valid_rewrite_is_adopted(self):
+        with patch.object(pp, '_chat', return_value=STERILE_IMAGE_GOOD_REWRITE):
+            out, adopted = pp.rework_decay_placeholder_beat({}, 4, STERILE_IMAGE, self.ERRS)
+        self.assertTrue(adopted)
+        self.assertEqual(out, STERILE_IMAGE_GOOD_REWRITE)
+
+    def test_rewrite_still_using_sterile_is_rejected(self):
+        with patch.object(pp, '_chat', return_value=STERILE_IMAGE):
+            out, adopted = pp.rework_decay_placeholder_beat({}, 4, STERILE_IMAGE, self.ERRS)
+        self.assertFalse(adopted)
+        self.assertEqual(out, STERILE_IMAGE)
+
+    def test_llm_exception_keeps_original(self):
+        with patch.object(pp, '_chat', side_effect=RuntimeError('gateway down')):
+            out, adopted = pp.rework_decay_placeholder_beat({}, 4, STERILE_IMAGE, self.ERRS)
+        self.assertFalse(adopted)
+        self.assertEqual(out, STERILE_IMAGE)
+
+
+# --- FIRST INTERIOR REVEAL 强制衰败措辞事后校验（2026-07-21 水磨坊实测：过门后室内
+# 首现拍 (is_first_interior_reveal) 本该强制展示≥2类衰败痕迹的条款被 LLM 静默跳过，
+# 渲成了 "Completely sterile."——此前完全没有事后校验能抓到这个) ---
+
+FIRST_REVEAL_STERILE = (
+    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
+    "perspective down the central loft axis; camera pitch locked level; central "
+    "vanishing axis centered. Completely sterile. Locked anchors: historic cast-iron "
+    "drive gear hub at Grid B2 holding 45 percent of frame height."
+)
+
+FIRST_REVEAL_ONE_CATEGORY = (
+    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
+    "perspective down the central loft axis; camera pitch locked level. Rust streaks "
+    "down the cast-iron gear hub. Locked anchors: historic cast-iron drive gear hub at "
+    "Grid B2 holding 45 percent of frame height."
+)
+
+FIRST_REVEAL_TWO_CATEGORIES = (
+    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
+    "perspective down the central loft axis; camera pitch locked level. Rust streaks "
+    "down the cast-iron gear hub above a floor strewn with fallen debris. Locked "
+    "anchors: historic cast-iron drive gear hub at Grid B2 holding 45 percent of frame height."
+)
+
+FIRST_REVEAL_GOOD = (
+    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
+    "perspective down the central loft axis; camera pitch locked level. Rust streaks "
+    "down the cast-iron gear hub beside a thick patch of moss spreading across the "
+    "collapsed roof section overhead. Locked anchors: historic cast-iron drive gear hub "
+    "at Grid B2 holding 45 percent of frame height."
+)
+
+
+class TestCheckFirstInteriorRevealDecay(unittest.TestCase):
+    def test_not_first_reveal_is_noop_even_if_sterile(self):
+        self.assertEqual(pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, False), [])
+
+    def test_first_reveal_with_zero_categories_is_flagged(self):
+        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, True)
+        self.assertTrue(errs)
+        self.assertIn('FIRST INTERIOR REVEAL', errs[0])
+
+    def test_first_reveal_with_only_one_category_is_flagged(self):
+        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_ONE_CATEGORY, True)
+        self.assertTrue(errs)
+
+    def test_first_reveal_with_three_categories_passes(self):
+        # 锈迹(surface) + 苔藓(vegetation) + 塌陷(structural)
+        self.assertEqual(pp.check_first_interior_reveal_decay(FIRST_REVEAL_GOOD, True), [])
+
+    def test_first_reveal_with_only_two_categories_is_flagged(self):
+        # 2026-07-26 加严：门槛从 2 类提到 3 类，与 IMAGE 1 自己的 GENUINE DAMAGE 审计对齐
+        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_TWO_CATEGORIES, True)
+        self.assertTrue(errs)
+        self.assertIn('3+ decay categories', errs[0])
+
+    def test_empty_prompt_is_noop(self):
+        self.assertEqual(pp.check_first_interior_reveal_decay('', True), [])
+
+
+class TestFirstInteriorRevealInterventionEvidence(unittest.TestCase):
+    """2026-07-26 用户实测："过门帧有人工痕迹、不够原始"。首现帧按契约是没人进来过的
+    废墟，正文里出现梯子/工具/码放整齐的材料/刚清理过的地面 = 契约被违反；但契约本身
+    又鼓励写"no ladders, no tools anywhere in frame"这类澄清句（VLM 反馈修复更是主动
+    加这种句子），所以否定式表述必须放行。"""
+
+    def test_asserted_intervention_evidence_is_flagged(self):
+        prompt = FIRST_REVEAL_GOOD + " An aluminium ladder leans against the far wall beside neatly stacked timber."
+        errs = pp.check_first_interior_reveal_decay(prompt, True)
+        self.assertTrue(any('zero intervention evidence' in e for e in errs))
+        self.assertTrue(any('ladder' in e for e in errs))
+
+    def test_negated_absence_clause_is_not_flagged(self):
+        prompt = (FIRST_REVEAL_GOOD +
+                  " No ladders, no tools, no scaffolding and no staged materials anywhere in frame; "
+                  "every surface is untouched original decay.")
+        self.assertEqual(pp.check_first_interior_reveal_decay(prompt, True), [])
+
+    def test_intervention_check_is_skipped_for_other_beats(self):
+        prompt = FIRST_REVEAL_GOOD + " A ladder leans against the far wall."
+        self.assertEqual(pp.check_first_interior_reveal_decay(prompt, False), [])
+
+
+class TestReworkFirstInteriorRevealDecayBeat(unittest.TestCase):
+    def test_valid_rewrite_is_adopted(self):
+        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, True)
+        with patch.object(pp, '_chat', return_value=FIRST_REVEAL_GOOD):
+            out, adopted = pp.rework_first_interior_reveal_decay_beat({}, 4, FIRST_REVEAL_STERILE, errs)
+        self.assertTrue(adopted)
+        self.assertEqual(out, FIRST_REVEAL_GOOD)
+
+    def test_rewrite_still_insufficient_is_rejected(self):
+        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, True)
+        with patch.object(pp, '_chat', return_value=FIRST_REVEAL_ONE_CATEGORY):
+            out, adopted = pp.rework_first_interior_reveal_decay_beat({}, 4, FIRST_REVEAL_STERILE, errs)
+        self.assertFalse(adopted)
+        self.assertEqual(out, FIRST_REVEAL_STERILE)
+
+    def test_llm_exception_keeps_original(self):
+        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, True)
+        with patch.object(pp, '_chat', side_effect=RuntimeError('gateway down')):
+            out, adopted = pp.rework_first_interior_reveal_decay_beat({}, 4, FIRST_REVEAL_STERILE, errs)
+        self.assertFalse(adopted)
+        self.assertEqual(out, FIRST_REVEAL_STERILE)
+
+
+# --- 相似度免检清单不再豁免 'sterile'（2026-07-21）：之前 'sterile' 在
+# is_mostly_boilerplate 的 dna_keywords 里，含这个词的句子整句被当结构性样板忽略，
+# 两拍写出几乎一样的 "sterile" 占位句也测不出"太像上一拍"。摘除后应恢复可测。 ---
+
+class TestStylisticRepetitionNoLongerIgnoresSterile(unittest.TestCase):
+    def test_duplicate_sterile_sentence_is_now_caught(self):
+        prev = (
+            "Static wide 18mm interior tripod shot, camera height 1.6m, locked "
+            "eye-level perspective down the central loft axis; camera pitch locked "
+            "level; central vanishing axis centered. Completely sterile of objects. "
+            "Historic cast-iron drive gear hub sits centered in frame."
+        )
+        curr = (
+            "Static wide 18mm interior tripod shot, camera height 1.6m, locked "
+            "eye-level perspective down the central loft axis; camera pitch locked "
+            "level; central vanishing axis centered. Completely sterile of objects. "
+            "Solid oak floor joist framework spans the visible floor plane."
+        )
+        errs = pp.check_stylistic_repetition(curr, prev, {}, is_video=False)
+        self.assertTrue(errs)
+        self.assertTrue(any('too similar' in e for e in errs))
+
+
+# --- 拍级"图文内容脱节"校验（2026-07-22 喀斯特溶洞实测确诊：VIDEO 明确写了搬入
+# 躺椅/石桌/盆栽，配套 IMAGE 正文却完全没提这些家具，只写了一句借旧词拼出的空洞
+# 完工声明；check_stage_scope_wording 只查"有没有完工关键词"，查不出这层更深的
+# 内容缺失）---
+
+DAYBED_TRACE_ITEM = {
+    "name": "beige linen daybed",
+    "material_color": "beige linen",
+    "initial_state": "installed",
+    "grid": "Grid B2",
+    "z_depth_scale": "40%",
+}
+
+IMAGE_MISSING_DAYBED = (
+    "Static wide 14mm interior tripod shot, camera height 1.6m, camera pitch locked "
+    "level; central vanishing axis centered. Final lighting is now stable and complete "
+    "across every interior wall, vaulted ceiling, and floor surface. Locked anchors: "
+    "carved limestone archway at Grid B2 holding 45 percent of frame height."
+)
+
+IMAGE_WITH_DAYBED_DIFFERENT_PHRASING = (
+    "Static wide 14mm interior tripod shot, camera height 1.6m, camera pitch locked "
+    "level; central vanishing axis centered. A custom low-profile linen lounge daybed "
+    "with cream beige textiles now sits against the far wall. Locked anchors: carved "
+    "limestone archway at Grid B2 holding 45 percent of frame height."
+)
+
+IMAGE_WITH_DAYBED_GOOD_REWRITE = (
+    "Static wide 14mm interior tripod shot, camera height 1.6m, camera pitch locked "
+    "level; central vanishing axis centered. A beige linen daybed now sits freshly "
+    "installed against the far wall at Grid B2. Locked anchors: carved limestone "
+    "archway at Grid B2 holding 45 percent of frame height."
+)
+
+
+class TestCheckImageRealizesTraces(unittest.TestCase):
+    def test_check_image_realizes_traces_flags_missing_feature(self):
+        errs = pp.check_image_realizes_traces(IMAGE_MISSING_DAYBED, [DAYBED_TRACE_ITEM])
+        self.assertTrue(errs)
+        self.assertIn('beige linen daybed', errs[0])
+
+    def test_check_image_realizes_traces_lenient_on_partial_phrasing(self):
+        errs = pp.check_image_realizes_traces(IMAGE_WITH_DAYBED_DIFFERENT_PHRASING, [DAYBED_TRACE_ITEM])
+        self.assertEqual(errs, [])
+
+    def test_check_image_realizes_traces_empty_when_no_traces(self):
+        self.assertEqual(pp.check_image_realizes_traces(IMAGE_MISSING_DAYBED, []), [])
+        self.assertEqual(pp.check_image_realizes_traces(IMAGE_MISSING_DAYBED, None), [])
+
+
+class TestReworkMissingContentImageBeat(unittest.TestCase):
+    def test_rework_missing_content_image_beat_adopts_good_rewrite(self):
+        with patch.object(pp, '_chat', return_value=IMAGE_WITH_DAYBED_GOOD_REWRITE):
+            out, adopted = pp.rework_missing_content_image_beat(
+                {}, 10, IMAGE_MISSING_DAYBED, [DAYBED_TRACE_ITEM])
+        self.assertTrue(adopted)
+        self.assertEqual(out, IMAGE_WITH_DAYBED_GOOD_REWRITE)
+        self.assertEqual(pp.check_image_realizes_traces(out, [DAYBED_TRACE_ITEM]), [])
+
+    def test_rework_missing_content_image_beat_rejects_bad_rewrite(self):
+        with patch.object(pp, '_chat', return_value=IMAGE_MISSING_DAYBED):
+            out, adopted = pp.rework_missing_content_image_beat(
+                {}, 10, IMAGE_MISSING_DAYBED, [DAYBED_TRACE_ITEM])
+        self.assertFalse(adopted)
+        self.assertEqual(out, IMAGE_MISSING_DAYBED)
 
 
 if __name__ == '__main__':

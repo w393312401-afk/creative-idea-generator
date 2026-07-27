@@ -345,55 +345,6 @@ async function ledgerBulkApplyStatus() {
     renderLedger();
 }
 
-// 供激发卡片「存入备选」按钮调用：拉取最新台账、去重后追加一条候选，回写服务端。
-// 返回 {added: boolean, reason?: string}。
-async function ledgerAddCandidate(entry) {
-    try {
-        const res = await fetch('/api/ledger');
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-        if (data && data.error) throw new Error(data.error);
-        const list = Array.isArray(data) ? data : [];
-
-        const dna = (entry.topic_dna || '').toLowerCase();
-        if (dna && list.some(r => (r.topic_dna || '').toLowerCase() === dna)) {
-            return { added: false, reason: '该 Topic DNA 已在台账中' };
-        }
-
-        const newRow = {
-            id: ledgerGenId(),
-            date: ledgerTodayStr(),
-            topic_dna: entry.topic_dna || '',
-            one_line: entry.one_line || '',
-            source: entry.source || 'Ideation Pool',
-            avoid_notes: '',
-            status: 'candidate',
-            llm_score: (typeof entry.llm_score === 'number') ? entry.llm_score : null,
-            user_score: null,
-            performance_note: '',
-        };
-        list.push(newRow);
-
-        const postRes = await fetch('/api/ledger', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(list),
-        });
-        const postData = await postRes.json().catch(() => ({}));
-        if (!postRes.ok || postData.status !== 'success') {
-            throw new Error(postData.message || `HTTP ${postRes.status}`);
-        }
-
-        // 若台账已加载过，同步本地缓存，避免下次切标签页前数据显得"落后"
-        if (Array.isArray(ledgerData)) {
-            ledgerData = list;
-        }
-        return { added: true };
-    } catch (e) {
-        return { added: false, reason: e.message };
-    }
-}
-
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', initLedger);
 } else {

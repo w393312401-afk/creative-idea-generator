@@ -223,17 +223,8 @@
     word-break: break-word;
 }
 
-/* 6. Sticky action bar inside outputs header */
-.header-sticky-actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    margin-top: 8px;
-}
-.header-sticky-actions .action-btn {
-    padding: 8px 14px;
-    font-size: 12px;
-}
+/* 6.（原 .header-sticky-actions —— 结果页头部那排平铺按钮，已被管线条取代，
+      样式见 css/app/result-minimal.css） */
 
 /* 7. Tab Navigation */
 .result-tabs-bar {
@@ -518,7 +509,7 @@
     height: 65px;
     border-radius: 6px;
     border: 1px solid var(--border-color);
-    background: #03050c;
+    background: rgba(var(--ink-rgb), 0.06);
     overflow: hidden;
     flex-shrink: 0;
     display: flex;
@@ -938,7 +929,7 @@
         position: sticky;
         bottom: 12px;
         z-index: 50;
-        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        box-shadow: 0 4px 20px rgba(var(--ink-rgb), 0.16);
     }
 }
 
@@ -952,7 +943,7 @@
     padding: 12px 24px;
     font-size: 13px;
     z-index: 10;
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+    box-shadow: 0 4px 20px rgba(var(--ink-rgb), 0.08);
     flex-shrink: 0;
     backdrop-filter: blur(8px);
     animation: bannerPulse 2s infinite ease-in-out;
@@ -997,6 +988,67 @@
     background: var(--neon-cyan);
     color: #2E2A24;
     box-shadow: 0 0 15px var(--neon-cyan-glow);
+}
+
+/* Manual Intervention Banner: 登录失效/验证码/安全拦截需要人工处理时常驻显示，
+   app-header 之下、跨所有主标签页可见，颜色刻意区别于上面的"生成中"横幅，
+   传达"需要你现在去做点什么"而不是"正在自动进行中" */
+.manual-intervention-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    background: linear-gradient(90deg, rgba(217, 83, 79, 0.18) 0%, rgba(217, 83, 79, 0.08) 100%);
+    border-bottom: 1px solid rgba(217, 83, 79, 0.5);
+    padding: 12px 24px;
+    font-size: 13px;
+    z-index: 200;
+    box-shadow: 0 4px 20px rgba(217, 83, 79, 0.25);
+    flex-shrink: 0;
+    animation: manualInterventionPulse 1.6s infinite ease-in-out;
+}
+
+@keyframes manualInterventionPulse {
+    0% { border-bottom-color: rgba(217, 83, 79, 0.35); }
+    50% { border-bottom-color: rgba(217, 83, 79, 0.8); }
+    100% { border-bottom-color: rgba(217, 83, 79, 0.35); }
+}
+
+.manual-intervention-banner .banner-content {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.manual-intervention-banner .banner-icon {
+    font-size: 15px;
+    animation: flash 1s infinite alternate;
+    flex-shrink: 0;
+}
+
+.manual-intervention-banner .banner-text {
+    color: var(--text-primary);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.manual-intervention-banner .banner-btn {
+    background: rgba(217, 83, 79, 0.12);
+    border: 1px solid #d9534f;
+    color: #d9534f;
+    padding: 6px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    transition: var(--transition-fast);
+    flex-shrink: 0;
+}
+
+.manual-intervention-banner .banner-btn:hover {
+    background: #d9534f;
+    color: #fff;
 }
 
 /* Ensure child views flex correctly with the header banner */

@@ -11,8 +11,7 @@
  *  - 流断开且任务仍在运行时，按指数退避自动重连（成功连上即重置计数）；
  *  - 流结束但没读到终态事件时，用 /api/compose-status 仲裁真实状态；
  *  - 重连次数耗尽 ≠ 任务失败：这时后端的生成线程完全不知道客户端已经放弃——
- *    它是独立线程，会继续跑到底（甚至跑完监修模式里本该等人工确认的后续
- *    全部片段，全靠 600s 自动采用兜底，人工审阅形同虚设）。返回一个专门的
+ *    它是独立线程，会继续跑到底。返回一个专门的
  *    'disconnected' 状态，让调用方既不误报"生成失败"，也不清掉任务登记——
  *    否则用户会看到卡片转圈很久后静默变回空占位，随后过一阵子刷新页面时
  *    发现后续帧莫名其妙全部"自己"生成完了（2026-07-20 用户实测复现）。
@@ -134,89 +133,6 @@ async function watchTaskUntilTerminal(taskId, opts = {}) {
     }
 }
 
-// ── 监修模式审阅面板（review_pause / review_resume 事件驱动） ──
-let _reviewCountdownTimer = null;
-
-function hideFrameReviewPanel() {
-    const modal = document.getElementById('review-modal');
-    if (modal) modal.style.display = 'none';
-    if (_reviewCountdownTimer) {
-        clearInterval(_reviewCountdownTimer);
-        _reviewCountdownTimer = null;
-    }
-}
-
-function showFrameReviewPanel(taskId, data) {
-    const modal = document.getElementById('review-modal');
-    const img = document.getElementById('review-img');
-    const ctx = document.getElementById('review-context');
-    const title = document.getElementById('review-title');
-    const countdown = document.getElementById('review-countdown');
-    const adoptBtn = document.getElementById('review-adopt-btn');
-    const rerenderBtn = document.getElementById('review-rerender-btn');
-    if (!modal || !img || !ctx || !adoptBtn || !rerenderBtn) return;
-
-    const seq = data && data.sequence;
-    const isSummary = seq === null || seq === undefined;
-    if (title) {
-        title.textContent = isSummary
-            ? '🧑‍⚖️ 监修确认 — 阶段汇总'
-            : `🧑‍⚖️ 监修确认 — IMG ${String(seq).padStart(3, '0')}`;
-    }
-    if (data && data.image_url) {
-        // 重渲会覆盖同路径文件，必须绕浏览器缓存取新图（单张，无性能顾虑）
-        img.src = `${data.image_url}?t=${Date.now()}`;
-        img.style.display = 'block';
-    } else {
-        img.src = '';
-        img.style.display = 'none';
-    }
-    ctx.textContent = (data && data.context) || '';
-    rerenderBtn.style.display = isSummary ? 'none' : '';
-    adoptBtn.textContent = isSummary ? '✅ 继续' : '✅ 采用并继续';
-
-    const post = async (decision) => {
-        adoptBtn.disabled = true;
-        rerenderBtn.disabled = true;
-        try {
-            const res = await fetch('/api/frame-review', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ task_id: taskId, sequence: isSummary ? null : seq, decision })
-            });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            // review_resume 事件也会关面板；这里立即关，不等后端下一轮询（≤2s）
-            hideFrameReviewPanel();
-        } catch (e) {
-            showToast(`监修决策提交失败: ${e.message}`, 'error');
-            adoptBtn.disabled = false;
-            rerenderBtn.disabled = false;
-        }
-    };
-    adoptBtn.disabled = false;
-    rerenderBtn.disabled = false;
-    adoptBtn.onclick = () => post('adopt');
-    rerenderBtn.onclick = () => post('rerender');
-
-    if (_reviewCountdownTimer) clearInterval(_reviewCountdownTimer);
-    const timeoutS = (data && data.timeout_seconds) || 600;
-    const deadline = Date.now() + timeoutS * 1000;
-    const tick = () => {
-        const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
-        if (countdown) {
-            countdown.textContent = `⏳ ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')} 后自动采用并继续`;
-        }
-        if (left <= 0 && _reviewCountdownTimer) {
-            clearInterval(_reviewCountdownTimer);
-            _reviewCountdownTimer = null;
-        }
-    };
-    tick();
-    _reviewCountdownTimer = setInterval(tick, 1000);
-
-    modal.style.display = 'flex';
-}
-
 /* ── 多创意后台任务登记表 ────────────────────────────────────────────
    帧序列/视频/封面任务按「所属创意 id」登记进 ideaTasksById（js/state.js），
    不再是全局单槽位。事件到达时数据合并/DOM 绘制都必须走这里，用「发起任务
@@ -325,7 +241,11 @@ async function reloadManifestIntoIdea(ownerIdea) {
     ownerIdea = ownerIdea || currentIdea;
     if (!ownerIdea) return;
     try {
-        const resp = await fetch(`/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(ownerIdea))}`);
+        // no-store：这个请求要的就是"服务端此刻的状态"。上传/换位刚落盘就来读，
+        // 拿到浏览器启发式缓存里的上一份清单会让界面停在改动前的样子。
+        const resp = await fetch(
+            `/api/get_manifest?title=${encodeURIComponent(getIdeaSaveTitle(ownerIdea))}`,
+            { cache: 'no-store' });
         if (resp.ok) {
             await syncFrameRunToLibrary(await resp.json(), ownerIdea);
         }
@@ -356,10 +276,15 @@ function renderVideoSlotDone(idx, video) {
         <video controls style="width:100%; aspect-ratio: 9/16; object-fit: cover; border-radius: 5px; display: block; background: #03050c;"></video>
         <span>VID ${String(video.slot || idx).padStart(3, '0')}</span>
     `;
-    el.querySelector('video').src = video.url;
+    // 重试会原地覆盖同一个 vid_NNN.mp4：不带缓存版本号的话播的还是旧片
+    bustImageCache(video.url || video.file);
+    el.querySelector('video').src = cacheBustedUrl(video.url);
 }
 
-function renderVideoSlotFailed(idx, message, labelText = '生成失败') {
+// busy=true：该创意的视频序列任务仍在跑（批量重试里其它槽位还没处理完）——
+// 这个刚失败的槽位重新画出来的按钮也要保持禁用，否则用户点了又是一次
+// "已在生成中" 的错误提示。
+function renderVideoSlotFailed(idx, message, labelText = '生成失败', busy = false) {
     const el = document.getElementById(`video-slot-${idx}`);
     if (!el) return;
     el.className = 'frame-card video-failed-card';
@@ -367,14 +292,18 @@ function renderVideoSlotFailed(idx, message, labelText = '生成失败') {
         <div class="video-failed-placeholder">
             <span class="error-icon">⚠️</span>
             <span class="error-text"></span>
-            <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${idx}">重试</button>
+            <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${idx}"${busy ? ' disabled' : ''}>重试</button>
         </div>
         <span>VID ${String(idx).padStart(3, '0')}</span>
     `;
     const errText = el.querySelector('.error-text');
     errText.textContent = labelText;
     errText.title = message || labelText;
-    el.querySelector('.retry-video-btn').addEventListener('click', (e) => {
+    const btn = el.querySelector('.retry-video-btn');
+    // 监听器无条件绑定——同一 busy-skip-addEventListener 的坑在此文件的
+    // markFrameCardMissing / renderVideosForIdea 里都出现过，这里一并修。
+    btn.title = busy ? '该创意的视频序列正在生成/重试中，请稍候' : '';
+    btn.addEventListener('click', (e) => {
         e.stopPropagation();
         retrySingleVideo(idx);
     });
@@ -478,7 +407,12 @@ function initLocalServiceLogs() {
     const toggleBtn = document.getElementById('toggle-log-btn');
     const clearBtn = document.getElementById('clear-log-btn');
     const linesEl = document.getElementById('log-output-lines');
-    const statusDot = drawer?.querySelector('.log-panel-status-dot');
+    // 连接状态点有两颗：dock 标题栏一颗，右下角静息胶囊一颗（收起时它是唯一
+    // 可见的那颗）。统一按类名取全部，避免只更新其中一颗导致两处状态打架。
+    const statusDots = document.querySelectorAll('.log-panel-status-dot');
+    const pill = document.getElementById('log-pill');
+    const pillBadge = document.getElementById('log-pill-badge');
+    const resizer = document.getElementById('log-dock-resizer');
     const autoscrollChk = document.getElementById('log-autoscroll-chk');
     const levelChipsEl = document.getElementById('log-level-chips');
     const taskFilterEl = document.getElementById('log-task-filter');
@@ -486,6 +420,54 @@ function initLocalServiceLogs() {
     const countEl = document.getElementById('log-filter-count');
 
     if (!drawer || !header || !linesEl) return;
+
+    function setConnected(ok) {
+        statusDots.forEach(dot => {
+            dot.className = ok ? 'log-panel-status-dot connected' : 'log-panel-status-dot';
+        });
+    }
+
+    // ── 静息态未读计数 ────────────────────────────────────────────────
+    // dock 收起期间攒下的 ERROR/WARN 数顶到胶囊徽标上。这是把 45px 全宽横栏
+    // 换掉之后仍然保住的那个信号：占位小了，但"出事了"反而更显眼——旧版这个
+    // 信息只体现为横栏里一颗不带计数的小圆点。
+    let unreadError = 0;
+    let unreadWarn = 0;
+    // 首次连接时服务端会回灌最近 100 行历史，那是"以前发生过的事"，不该在页面
+    // 刚打开就顶一个红徽标出来；只统计连上之后新来的行。
+    let replayingHistory = false;
+
+    function renderPillBadge() {
+        if (!pillBadge) return;
+        const total = unreadError + unreadWarn;
+        if (total <= 0) {
+            pillBadge.hidden = true;
+            return;
+        }
+        pillBadge.hidden = false;
+        pillBadge.textContent = total > 99 ? '99+' : String(total);
+        // 只有 WARN 没有 ERROR 时降一档配色，不用红色虚张声势
+        pillBadge.classList.toggle('warn-only', unreadError === 0);
+        if (pill) {
+            pill.title = `本地服务工作日志：${unreadError} 个错误、${unreadWarn} 个警告未查看`;
+        }
+    }
+
+    function bumpUnread(entry) {
+        if (replayingHistory) return;
+        if (drawer.classList.contains('expanded')) return; // 正开着看，不算未读
+        if (entry.level === 'ERROR') unreadError++;
+        else if (entry.level === 'WARN') unreadWarn++;
+        else return;
+        renderPillBadge();
+    }
+
+    function clearUnread() {
+        unreadError = 0;
+        unreadWarn = 0;
+        renderPillBadge();
+        if (pill) pill.title = '打开本地服务工作日志';
+    }
 
     const MAX_LINES = 3000;
     // DEBUG 默认关掉（HTTP 每次尝试都打一条，太吵）；其余级别含未识别的 OTHER 默认全开。
@@ -580,6 +562,7 @@ function initLocalServiceLogs() {
         // 连续重复折叠：新行与上一行"形状"相同就合并成一条 ×N，而不是逐条铺开
         // 刷屏——这是"日志纯净度"最直接的对症（同一个上游限流重试 10 次，
         // 之前是 10 行几乎一模一样的告警，现在是 1 行 + 可展开的 ×10）。
+        bumpUnread(entry);
         const last = entries[entries.length - 1];
         if (last && shapeKey(last) === shapeKey(entry)) {
             last.repeatCount = (last.repeatCount || 1) + 1;
@@ -727,15 +710,32 @@ function initLocalServiceLogs() {
         });
     }
 
-    // Toggle expand/collapse
-    function toggleLog() {
-        const isExpanded = drawer.classList.toggle('expanded');
-        document.body.classList.toggle('log-expanded', isExpanded);
-        toggleBtn.textContent = isExpanded ? '收起' : '展开';
-        if (isExpanded) {
+    // ── 展开 / 收起 ──────────────────────────────────────────────────
+    const LOG_DOCK_WIDTH_KEY = 'spark_log_dock_width';
+    const LOG_DOCK_OPEN_KEY = 'spark_log_dock_open';
+
+    function setLogDockOpen(open) {
+        drawer.classList.toggle('expanded', open);
+        document.body.classList.toggle('log-expanded', open);
+        if (toggleBtn) toggleBtn.textContent = open ? '收起' : '展开';
+        try { localStorage.setItem(LOG_DOCK_OPEN_KEY, open ? '1' : '0'); } catch (e) {}
+        if (open) {
+            // 日志 dock 与保存/任务抽屉同样停靠在右侧，同时打开会叠在一起；
+            // 而且 420+380 在 1440 屏上只给主内容剩 640px，两边都难用——所以
+            // 三者互斥，跟 openLibraryDrawer/openTasksDrawer 之间的关系一致。
+            if (typeof closeLibraryDrawer === 'function') closeLibraryDrawer();
+            if (typeof closeTasksDrawer === 'function') closeTasksDrawer();
+            clearUnread();
             scrollToBottom();
         }
     }
+
+    function toggleLog() {
+        setLogDockOpen(!drawer.classList.contains('expanded'));
+    }
+
+    // 反向互斥：打开右侧任一抽屉时收起日志 dock（app.js 的抽屉开关调用它）
+    window.collapseLogDock = () => setLogDockOpen(false);
 
     header.addEventListener('click', (e) => {
         // Prevent toggling when clicking action buttons/checkbox
@@ -744,6 +744,63 @@ function initLocalServiceLogs() {
     }, { passive: true });
 
     toggleBtn.addEventListener('click', toggleLog);
+    if (pill) pill.addEventListener('click', toggleLog);
+
+    // Esc 收起：dock 覆盖在内容之上时（窄屏）尤其需要一个不用瞄准的退出方式
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && drawer.classList.contains('expanded')) {
+            // 正在筛选框里打字时 Esc 先让给输入框自己
+            if (document.activeElement && document.activeElement.closest('.log-panel-filters')) return;
+            setLogDockOpen(false);
+        }
+    });
+
+    // ── 宽度拖拽 ────────────────────────────────────────────────────
+    const MIN_DOCK_WIDTH = 320;
+    function applyDockWidth(px) {
+        const max = Math.max(MIN_DOCK_WIDTH, window.innerWidth - 360); // 给主工作区留底线
+        const w = Math.min(Math.max(px, MIN_DOCK_WIDTH), max);
+        document.documentElement.style.setProperty('--log-dock-width', w + 'px');
+        return w;
+    }
+
+    if (resizer) {
+        let dragging = false;
+        resizer.addEventListener('mousedown', (e) => {
+            dragging = true;
+            resizer.classList.add('dragging');
+            // 拖拽期间关掉过渡，否则每帧都在补间，跟手感很差
+            drawer.style.transition = 'none';
+            document.body.style.userSelect = 'none';
+            e.preventDefault();
+        });
+        window.addEventListener('mousemove', (e) => {
+            if (!dragging) return;
+            applyDockWidth(window.innerWidth - e.clientX);
+        });
+        window.addEventListener('mouseup', () => {
+            if (!dragging) return;
+            dragging = false;
+            resizer.classList.remove('dragging');
+            drawer.style.transition = '';
+            document.body.style.userSelect = '';
+            try {
+                const cur = getComputedStyle(document.documentElement)
+                    .getPropertyValue('--log-dock-width').trim();
+                if (cur) localStorage.setItem(LOG_DOCK_WIDTH_KEY, parseInt(cur, 10));
+            } catch (e) {}
+        });
+    }
+
+    // 恢复上次的宽度与展开态
+    try {
+        const savedWidth = parseInt(localStorage.getItem(LOG_DOCK_WIDTH_KEY), 10);
+        if (savedWidth > 0) applyDockWidth(savedWidth);
+    } catch (e) {}
+    try {
+        if (localStorage.getItem(LOG_DOCK_OPEN_KEY) === '1') setLogDockOpen(true);
+    } catch (e) {}
+    renderPillBadge();
 
     clearBtn.addEventListener('click', clearAll);
 
@@ -770,15 +827,18 @@ function initLocalServiceLogs() {
             eventSource.close();
         }
 
-        if (statusDot) statusDot.className = 'log-panel-status-dot'; // Reset to disconnected
+        setConnected(false); // Reset to disconnected
         // EventSource 无法携带自定义请求头：托管模式下用 query 参数传访问码
         const code = (typeof ACCESS_CODE !== 'undefined' && ACCESS_CODE) ? ACCESS_CODE : (localStorage.getItem('spark_access_code') || '');
         const streamUrl = code ? `/api/logs/stream?access_code=${encodeURIComponent(code)}` : '/api/logs/stream';
         eventSource = new EventSource(streamUrl);
 
         eventSource.addEventListener('open', () => {
-            if (statusDot) statusDot.className = 'log-panel-status-dot connected';
+            setConnected(true);
             clearAll();
+            // 断线重连会重复触发 open：面板里的行已被 clearAll 清掉，未读计数
+            // 也一并归零，否则徽标会累计上一段连接里早已被清空的那些行。
+            clearUnread();
             appendLine('[系统] 已连接到本地服务日志流...');
             scrollToBottom();
         });
@@ -790,7 +850,12 @@ function initLocalServiceLogs() {
                 const payload = parsed.data || parsed;
                 if (payload.lines && payload.lines.length) {
                     clearAll();
-                    payload.lines.forEach(line => appendLine(line.replace(/\n$/, '')));
+                    replayingHistory = true;
+                    try {
+                        payload.lines.forEach(line => appendLine(line.replace(/\n$/, '')));
+                    } finally {
+                        replayingHistory = false;
+                    }
                     scrollToBottom();
                 }
             } catch (err) {
@@ -814,7 +879,7 @@ function initLocalServiceLogs() {
         });
 
         eventSource.addEventListener('error', (e) => {
-            if (statusDot) statusDot.className = 'log-panel-status-dot';
+            setConnected(false);
             appendLine('[错误] 与本地服务日志流断开连接，正在尝试重新连接...');
             scrollToBottom();
             eventSource.close();
@@ -826,6 +891,17 @@ function initLocalServiceLogs() {
     connectLogStream();
 }
 
+
+// 帧序列渲染有串行锁（同一创意同时只能有一个帧任务在跑），点击某帧的
+// 「生成/重试」后立即把网格里其余按钮禁用，别等下一次事件驱动的整格重渲
+// 才生效——否则用户依次连续点击时，第一下之后的每一下都会先命中
+// isIdeaTaskActive 的错误提示（2026-07-21 实机复现）。
+function setFrameGridButtonsBusy(busy) {
+    document.querySelectorAll('#frames-grid .retry-frame-btn, #frames-grid .fix-frame-btn, #frames-grid .describe-frame-btn, #frames-grid .delete-slot-btn').forEach(btn => {
+        btn.disabled = busy;
+        btn.title = busy ? '该创意的帧序列正在生成/重试中，请稍候' : '';
+    });
+}
 
 async function retrySingleFrame(seq) {
     if (!currentIdea || !currentIdea.prompt_block) {
@@ -859,6 +935,7 @@ async function retrySingleFrame(seq) {
     // 只标记这一帧在范围内：renderFramesForIdea 靠这个字段决定哪些槽位该画
     // "等待中"，不设置的话会误把其余所有未生成槽位也画成"等待中"。
     rec.targetSequences = [seq];
+    setFrameGridButtonsBusy(true);
 
     // 单帧重试同样在模块内的实时生成动态里直播（helpers 定义在后加载的 app.js，
     // 本函数只在用户点击时运行，届时必已就绪；仍加 typeof 护栏防御加载序变动）。
@@ -878,8 +955,10 @@ async function retrySingleFrame(seq) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                config,
-                title: ownerIdea.title,
+                config: (typeof withCoverReference === 'function'
+                    ? withCoverReference(config, ownerIdea) : config),
+                title: getIdeaSaveTitle(ownerIdea),
+                display_title: ownerIdea.title,
                 prompt_block: ownerIdea.prompt_block,
                 target_sequences: [seq]
             }),
@@ -916,12 +995,8 @@ async function retrySingleFrame(seq) {
                     const m = (evData && evData.max_attempts) || '?';
                     const tail = evData && evData.retry_in
                         ? `，${evData.retry_in}s 后自动重试（第 ${a}/${m} 次）`
-                        : `（第 ${a}/${m} 次，此路终止——若有兜底/收尾会紧随其后，否则任务即将报错结束）`;
+                        : `（第 ${a}/${m} 次，此路终止，任务即将报错结束）`;
                     feedLine(`⚠️ 上游报错：${(evData && evData.error) || '未知错误'}${tail}`, 'warn');
-                } else if (type === 'model_fallback') {
-                    const to = (evData && evData.to) || '兜底模型';
-                    feedLine(`🔀 主模型配额耗尽，切换兜底模型 ${to} 继续渲染 IMG ${String(seq).padStart(3, '0')}…`, 'warn');
-                    if (isViewingIdea(ownerIdea.id)) meta.textContent = `主模型配额耗尽，兜底模型 ${to} 渲染中...`;
                 } else if (type === 'reconnecting') {
                     if (isViewingIdea(ownerIdea.id)) meta.textContent = `连接中断，正在重连（第 ${evData.attempt} 次）...`;
                     feedLine(`⚠️ 连接中断，正在重连（第 ${evData.attempt} 次）…`, 'warn');
@@ -959,8 +1034,418 @@ async function retrySingleFrame(seq) {
         }
         if (isViewingIdea(ownerIdea.id) && !disconnected) {
             progress.style.display = 'none';
+            setFrameGridButtonsBusy(false);
         }
     }
+}
+
+// 「修复此帧问题」——2026-07-23 监修模式改动：一致性审查发现问题后不再自动改写
+// 提示词重渲，只标记+报告；人工看过 vlm_qa_reason 后点这个按钮才会真正触发定向
+// 修复（/api/fix_frame_issue -> pipeline_orchestrator.fix_frame_issue）。与
+// retrySingleFrame（盲重渲，同一提示词再来一次）的区别：这个会先用 VLM 反馈优化
+// 提示词，再图生图重渲——首帧也不例外，后端保证不会退化成文生图推倒重来。
+// 「描述问题」——人工主动描述帧序列某一帧的问题。一致性审查是机器视角、也不是
+// 每次都跑，人自己看出来的毛病（比如"这一帧的塔吊凭空消失了"）此前没有任何入口
+// 能录进去：只有被审查标记过的帧才显示「修复此帧问题」，没标记的帧点也没得点。
+// 这里把人写的描述通过 /api/flag_frame_issue 记进 manifest 的 manual_issue
+// （quality_gate 标成 manual_flagged），随后的修复就能拿它当待修问题——机器判定
+// 与人工描述并存时两份一起交给提示词改写（见 pipeline_orchestrator.fix_frame_issue）。
+// 描述留空＝撤销之前的人工标记。
+async function describeFrameIssue(seq, existingIssue) {
+    if (!currentIdea) {
+        showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
+        showToast("该创意的帧序列正在生成/修复中，请稍候", "error");
+        return;
+    }
+
+    const seqLabel = String(seq).padStart(3, '0');
+    const answer = await customTextarea({
+        title: `描述 IMG ${seqLabel} 的问题`,
+        message: '写清楚这一帧哪里不对：缺了什么、多了什么、和上一帧对不上的是哪个部位。'
+               + '描述会用于定向重写该帧的提示词后图生图重渲，越具体越好。\n'
+               + '留空并确定＝撤销之前记录的问题。（Ctrl/⌘+Enter 提交）',
+        defaultValue: existingIssue || '',
+        placeholder: '例：塔吊在上一帧还在画面右侧，这一帧凭空消失了；左侧脚手架的层数也从 3 层变成了 5 层。',
+        confirmLabel: '记录问题',
+        extraLabel: '记录并立即修复',
+    });
+    if (!answer) return;
+
+    const description = (answer.value || '').trim();
+    try {
+        const resp = await fetch('/api/flag_frame_issue', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title: getIdeaSaveTitle(ownerIdea), display_title: ownerIdea.title, sequence: seq, description })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data.status === 'error') {
+            throw new Error(data.message || `HTTP ${resp.status}`);
+        }
+
+        await reloadManifestIntoIdea(ownerIdea);
+        if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
+
+        if (typeof framesFeedLine === 'function') {
+            framesFeedLine(ownerIdea.id,
+                description ? `📝 已记录 IMG ${seqLabel} 的人工问题描述：${description}`
+                            : `📝 已撤销 IMG ${seqLabel} 的人工问题标记`,
+                description ? 'warn' : 'ok');
+        }
+        showToast(description ? `已记录第 ${seq} 帧的问题描述。` : `已撤销第 ${seq} 帧的问题标记。`, "success");
+
+        // 「记录并立即修复」：描述已经落盘，这里不再重复传 manual_reason，
+        // fix_frame_issue 会自己从 manifest 读出来（连同机器判定一起）。
+        if (description && answer.action === 'extra') {
+            await fixFrameIssue(seq);
+        }
+    } catch (e) {
+        console.error(`Failed to flag frame ${seq}:`, e);
+        showToast(`记录第 ${seq} 帧问题失败: ${e.message}`, "error");
+    }
+}
+
+// manualReason：可选，人工在别处现场写的问题描述；后端会先把它落盘再参与改写
+// （见 pipeline_orchestrator.fix_frame_issue）。走 describeFrameIssue 记录过的
+// 描述已经在 manifest 上，无需从这里再传一次。
+async function fixFrameIssue(seq, manualReason) {
+    if (!currentIdea || !currentIdea.prompt_block) {
+        showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
+        showToast("该创意的帧序列已在生成/重试中，请稍候", "error");
+        return;
+    }
+
+    const progress = document.getElementById('frames-progress');
+    const meta = document.getElementById('frames-meta');
+    const slotCard = document.getElementById(`frame-slot-${seq}`);
+    if (!progress || !meta || !slotCard) return;
+
+    slotCard.className = 'frame-card placeholder-frame-card';
+    slotCard.innerHTML = `
+        <div class="frame-placeholder-spinner">
+            <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
+        </div>
+        <span>第 ${String(seq).padStart(3, '0')} 帧 (修复中...)</span>
+    `;
+
+    progress.style.display = 'flex';
+    meta.textContent = `正在依据问题描述修复第 ${seq} 帧...`;
+
+    const controller = new AbortController();
+    const rec = beginIdeaTask(ownerIdea.id, 'frames', null, controller);
+    rec.targetSequences = [seq];
+    setFrameGridButtonsBusy(true);
+
+    const feedLine = (text, cls) => { if (typeof framesFeedLine === 'function') framesFeedLine(ownerIdea.id, text, cls); };
+    if (typeof framesFeedSetLive === 'function') framesFeedSetLive(ownerIdea.id, true);
+    feedLine(`🔧 开始修复 IMG ${String(seq).padStart(3, '0')}…`);
+
+    // 与服务器失联（非任务真的失败）时置真，同 retrySingleFrame 的同款说明。
+    let disconnected = false;
+
+    try {
+        const response = await fetch('/api/fix_frame_issue', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                config,
+                title: getIdeaSaveTitle(ownerIdea),
+                display_title: ownerIdea.title,
+                prompt_block: ownerIdea.prompt_block,
+                sequence: seq,
+                manual_reason: (manualReason || '').trim() || undefined
+            }),
+            signal: controller.signal
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errText}`);
+        }
+
+        const data = await response.json();
+        const taskId = data.task_id;
+        const rec2 = getIdeaTaskRecord(ownerIdea.id, 'frames');
+        if (rec2) rec2.taskId = taskId;
+
+        let reverify = null;
+        const watch = await watchTaskUntilTerminal(taskId, {
+            label: `fix-frame-${seq}`,
+            signal: controller.signal,
+            onEvent: (type, evData) => {
+                if (type === 'frame') {
+                    applyFrameEventToIdea(evData && evData.frame, ownerIdea);
+                    if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
+                } else if (type === 'frame_issue_fix_start') {
+                    feedLine(`🔧 ${(evData && evData.message) || `正在优化 IMG ${String(seq).padStart(3, '0')} 的提示词…`}`);
+                } else if (type === 'frame_issue_fix_render' || type === 'frame_start') {
+                    feedLine(`🎨 ${(evData && evData.message) || `正在重渲 IMG ${String(seq).padStart(3, '0')}…`}`);
+                } else if (type === 'frame_issue_reverify') {
+                    // 修复闭环（2026-07-25）：重渲后对着新画面逐条复核"到底修好没有"
+                    feedLine(`🔎 ${(evData && evData.message) || '正在复核问题是否已解决…'}`);
+                } else if (type === 'frame_issue_reverify_result') {
+                    reverify = evData || null;
+                    const ok = evData && !(evData.remaining || []).length;
+                    feedLine(`${ok ? '✅' : '⚠️'} ${(evData && evData.message) || '复核完成'}`,
+                             ok ? 'ok' : 'warn');
+                } else if (type === 'upstream_retry') {
+                    const a = (evData && evData.attempt) || '?';
+                    const m = (evData && evData.max_attempts) || '?';
+                    const tail = evData && evData.retry_in
+                        ? `，${evData.retry_in}s 后自动重试（第 ${a}/${m} 次）`
+                        : `（第 ${a}/${m} 次，此路终止，任务即将报错结束）`;
+                    feedLine(`⚠️ 上游报错：${(evData && evData.error) || '未知错误'}${tail}`, 'warn');
+                } else if (type === 'reconnecting') {
+                    if (isViewingIdea(ownerIdea.id)) meta.textContent = `连接中断，正在重连（第 ${evData.attempt} 次）...`;
+                    feedLine(`⚠️ 连接中断，正在重连（第 ${evData.attempt} 次）…`, 'warn');
+                }
+            }
+        });
+
+        if (watch.status === 'disconnected') {
+            disconnected = true;
+            feedLine(`⚠️ ${watch.error}`, 'warn');
+            showToast(`第 ${seq} 帧：${watch.error}`, "warning");
+            return;
+        }
+        if (watch.status === 'failed') throw new Error(watch.error || '未知错误');
+
+        if (watch.result) {
+            // fix_frame_issue 返回 {prompt_block, reason}，不是完整 manifest——不能
+            // 像 retrySingleFrame 那样整体替换 frameRun（那会清空其它帧的数据）。
+            // prompt_block 里对应的提示词已被定向重写，必须写回：后续重试/再次
+            // 修复/生成视频都读这份文本。
+            if (watch.result.prompt_block) {
+                ownerIdea.prompt_block = watch.result.prompt_block;
+                if (currentIdea && currentIdea.id === ownerIdea.id) saveCurrentIdeaState();
+                const existingIdx = savedIdeas.findIndex(item => item.id === ownerIdea.id);
+                if (existingIdx !== -1) {
+                    savedIdeas[existingIdx].prompt_block = watch.result.prompt_block;
+                    await saveLibrary();
+                }
+                if (isViewingIdea(ownerIdea.id)) {
+                    const blockEl = document.getElementById('idea-prompt-block');
+                    if (blockEl) blockEl.textContent = ownerIdea.prompt_block;
+                }
+            }
+            if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
+            // 复核结果决定这次修复该不该报"成功"：仍有问题时报 warning，别让人
+            // 看着一个绿勾以为修好了（修复流程此前是开环的，没人回答这个问题）
+            const remaining = (reverify && reverify.remaining) || [];
+            if (remaining.length) {
+                feedLine(`⚠️ IMG ${String(seq).padStart(3, '0')} 重渲完成，但仍有 ${remaining.length} 条问题未解决`, 'warn');
+                showToast(`第 ${seq} 帧已重渲，但复核发现仍有问题：${remaining.join('；')}`, "warning");
+            } else {
+                feedLine(`✅ IMG ${String(seq).padStart(3, '0')} 修复完成`, 'ok');
+                showToast(`第 ${seq} 帧已修复。`, "success");
+            }
+        }
+    } catch (e) {
+        console.error(`Failed to fix frame ${seq}:`, e);
+        feedLine(`❌ IMG ${String(seq).padStart(3, '0')} 修复失败：${e.message}`, 'err');
+        showToast(`第 ${seq} 帧修复失败: ${e.message}`, "error");
+
+        await reloadManifestIntoIdea(ownerIdea);
+        if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
+    } finally {
+        if (isViewingIdea(ownerIdea.id) && typeof framesFeedSetLive === 'function') framesFeedSetLive(ownerIdea.id, false);
+        if (!disconnected) {
+            endIdeaTask(ownerIdea.id, 'frames');
+        }
+        if (isViewingIdea(ownerIdea.id) && !disconnected) {
+            progress.style.display = 'none';
+            setFrameGridButtonsBusy(false);
+        }
+    }
+}
+
+// 「运行一致性审查」——2026-07-24 起一致性审查不再随帧序列渲染自动触发，用户
+// 确认整套序列（含视频提示词描述的施工顺序/空间关系）已经全部渲染完成后，手动
+// 点这个按钮才会跑（/api/sequence_review -> pipeline_orchestrator.
+// run_sequence_consistency_review）。纯粹是可选的人工检查工具，不阻塞视频生成：
+// 结果只把 manifest 里对应帧的 quality_gate 标记成 sequence_review_flagged /
+// sequence_reviewed_pass，真正的改写要等用户看过原因后点「修复此帧问题」
+// （fixFrameIssue）。整套序列还没渲完时后端会直接跳过并说明原因，不算错误。
+async function runSequenceReview() {
+    if (!currentIdea || !currentIdea.prompt_block) {
+        showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
+        showToast("该创意的帧序列已在生成/重试中，请稍候", "error");
+        return;
+    }
+
+    const progress = document.getElementById('frames-progress');
+    const meta = document.getElementById('frames-meta');
+    const reviewBtn = document.getElementById('run-sequence-review-btn');
+    if (!progress || !meta) return;
+
+    progress.style.display = 'flex';
+    meta.textContent = '正在对整套序列做一致性审查...';
+
+    const controller = new AbortController();
+    beginIdeaTask(ownerIdea.id, 'frames', null, controller);
+    setFrameGridButtonsBusy(true);
+    if (reviewBtn) reviewBtn.disabled = true;
+
+    const feedLine = (text, cls) => { if (typeof framesFeedLine === 'function') framesFeedLine(ownerIdea.id, text, cls); };
+    if (typeof framesFeedSetLive === 'function') framesFeedSetLive(ownerIdea.id, true);
+    feedLine('🔍 开始整套序列一致性审查…');
+
+    let disconnected = false;
+
+    try {
+        const response = await fetch('/api/sequence_review', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                config,
+                title: getIdeaSaveTitle(ownerIdea),
+                display_title: ownerIdea.title,
+                prompt_block: ownerIdea.prompt_block
+            }),
+            signal: controller.signal
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errText}`);
+        }
+
+        const data = await response.json();
+        const taskId = data.task_id;
+        const rec2 = getIdeaTaskRecord(ownerIdea.id, 'frames');
+        if (rec2) rec2.taskId = taskId;
+
+        let reviewedBeats = 0;
+        let reviewSummary = null;
+        const watch = await watchTaskUntilTerminal(taskId, {
+            label: 'sequence-review',
+            signal: controller.signal,
+            onEvent: (type, evData) => {
+                if (type === 'sequence_review') {
+                    meta.textContent = (evData && evData.message) || '正在对整套序列做一致性审查...';
+                    feedLine(`🔍 ${(evData && evData.message) || '正在对整套序列做一致性审查...'}`);
+                } else if (type === 'sequence_review_beat') {
+                    // 逐拍进度（2026-07-25 并发化后逐拍回报）：审查此前是几分钟的
+                    // 静默黑洞，只有开始/结束两条消息，看着像卡死
+                    reviewedBeats += 1;
+                    const total = (evData && evData.total) || 0;
+                    if (total) meta.textContent = `一致性审查中… 已完成 ${reviewedBeats}/${total} 拍`;
+                    const cls = evData && evData.reviewed === false ? 'warn'
+                        : ((evData && evData.issues && evData.issues.length) ? 'warn' : 'ok');
+                    feedLine(`　${(evData && evData.message) || '逐拍审查进行中…'}`, cls);
+                } else if (type === 'review_invalidated') {
+                    // 上一轮审查之后有帧被重渲，那些结论已经作废（帧内容哈希对不上）
+                    feedLine(`♻️ ${(evData && evData.message) || '部分帧的旧审查结论已作废'}`, 'warn');
+                } else if (type === 'sequence_review_result') {
+                    if (evData && evData.message) {
+                        feedLine(`${evData.passed ? '✅' : '🛠️'} ${evData.message}`, evData.passed ? 'ok' : 'warn');
+                    } else if (evData && evData.passed) {
+                        feedLine('✅ 整套序列一致性审查通过', 'ok');
+                    }
+                    reviewSummary = evData || null;
+                } else if (type === 'upstream_retry') {
+                    const a = (evData && evData.attempt) || '?';
+                    const m = (evData && evData.max_attempts) || '?';
+                    const tail = evData && evData.retry_in
+                        ? `，${evData.retry_in}s 后自动重试（第 ${a}/${m} 次）`
+                        : `（第 ${a}/${m} 次，此路终止，任务即将报错结束）`;
+                    feedLine(`⚠️ 上游报错：${(evData && evData.error) || '未知错误'}${tail}`, 'warn');
+                } else if (type === 'reconnecting') {
+                    meta.textContent = `连接中断，正在重连（第 ${evData.attempt} 次）...`;
+                    feedLine(`⚠️ 连接中断，正在重连（第 ${evData.attempt} 次）…`, 'warn');
+                }
+            }
+        });
+
+        if (watch.status === 'disconnected') {
+            disconnected = true;
+            feedLine(`⚠️ ${watch.error}`, 'warn');
+            showToast(`一致性审查：${watch.error}`, "warning");
+            return;
+        }
+        if (watch.status === 'cancelled') throw Object.assign(new Error('已取消'), { name: 'AbortError' });
+        if (watch.status === 'failed') throw new Error(watch.error || '未知错误');
+
+        // 结果只改了 manifest 里各帧的 quality_gate 标记，prompt_block 未变——
+        // 从服务端重新拉一次 manifest 让帧网格的徽标反映最新审查结果。
+        await reloadManifestIntoIdea(ownerIdea);
+        if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
+        feedLine('✅ 一致性审查已完成', 'ok');
+        // 只审了已渲染前缀、或有帧没审成时给一条明确 toast——这两种情况下"审查完成"
+        // 不等于"整单都查过了"，光看绿色徽标会误判
+        if (reviewSummary && reviewSummary.partial) {
+            const n = (reviewSummary.reviewed_sequences || []).length;
+            showToast(`一致性审查只覆盖了已渲染的前 ${n} 帧，其余帧渲完后请再跑一次。`, "warning");
+        } else if (reviewSummary && (reviewSummary.unreviewed_sequences || []).length) {
+            showToast(`有 ${reviewSummary.unreviewed_sequences.length} 帧未审完，已标记为「未审查」。`, "warning");
+        }
+    } catch (e) {
+        if (e.name === 'AbortError') {
+            feedLine('⏹️ 一致性审查已取消', 'warn');
+        } else {
+            console.error('Failed to run sequence review:', e);
+            feedLine(`❌ 一致性审查失败：${e.message}`, 'err');
+            showToast(`一致性审查失败: ${e.message}`, "error");
+        }
+    } finally {
+        if (isViewingIdea(ownerIdea.id) && typeof framesFeedSetLive === 'function') framesFeedSetLive(ownerIdea.id, false);
+        if (!disconnected) {
+            endIdeaTask(ownerIdea.id, 'frames');
+        }
+        if (isViewingIdea(ownerIdea.id) && !disconnected) {
+            progress.style.display = 'none';
+            setFrameGridButtonsBusy(false);
+        }
+        if (reviewBtn) reviewBtn.disabled = false;
+    }
+}
+
+// 与 setFrameGridButtonsBusy 同理：视频序列同一创意同时只能有一个任务在跑，
+// 点击「重试」后立即禁用网格里其余按钮，不等下一次事件驱动的重渲。
+function setVideoGridButtonsBusy(busy) {
+    document.querySelectorAll('#videos-grid .retry-video-btn, #videos-grid .delete-slot-btn').forEach(btn => {
+        btn.disabled = busy;
+        btn.title = busy ? '该创意的视频序列正在生成/重试中，请稍候' : '';
+    });
+}
+
+// 一致性审查确认风险后放行：提交视频生成/重试请求前，检查涉及的锚点帧是否带
+// 'vlm_qa_failed'/'sequence_review_flagged' 标记；若有则弹窗确认，确认后必须把
+// override_flagged 一并带给后端——否则后端 plan_video_slots 仍会照旧按 quality_gate
+// 拦截该槽位，前端"确认风险"只是白问了一遍（2026-07-23 修复：此前三处调用点里
+// 只有 generateVideos 弹了确认框，但确认结果从未传给后端，等于白确认）。
+// slots=null 表示不按槽位收窄，检查整套 frameRun.frames（整单生成场景）；传入槽位
+// 数组时只检查这些槽位涉及的锚点帧对（slot 与 slot+1，与 plan_video_slots 的判断
+// 范围一致）。返回 {proceed, override}：proceed=false 表示用户取消，调用方应直接
+// return，不要发起请求。
+async function confirmSequenceReviewOverride(ownerIdea, slots) {
+    const frames = (ownerIdea.frameRun && ownerIdea.frameRun.frames) || [];
+    if (!frames.length) return { proceed: true, override: false };
+    let candidates;
+    if (slots && slots.length) {
+        const relevantSeqs = new Set();
+        slots.forEach(slot => { relevantSeqs.add(slot); relevantSeqs.add(slot + 1); });
+        candidates = frames.filter(f => relevantSeqs.has(f.sequence));
+    } else {
+        candidates = frames;
+    }
+    const failedFrames = candidates.filter(f => f.quality_gate === 'vlm_qa_failed' || f.quality_gate === 'sequence_review_flagged');
+    if (!failedFrames.length) return { proceed: true, override: false };
+    const frameSeqs = failedFrames.map(f => f.sequence).join(', ');
+    const confirmed = await customConfirm(`⚠️ 警告：检测到第 ${frameSeqs} 帧未通过一致性审查。\n\n如果强行生成视频，对应的视频分段可能存在跳变、无动作或动作不一致的缺陷。\n\n确定要强制继续生成视频吗？`);
+    return { proceed: confirmed, override: confirmed };
 }
 
 async function retrySingleVideo(slot) {
@@ -973,6 +1458,9 @@ async function retrySingleVideo(slot) {
         showToast("该创意的视频序列已在生成/重试中，请稍候", "error");
         return;
     }
+
+    const reviewCheck = await confirmSequenceReviewOverride(ownerIdea, [slot]);
+    if (!reviewCheck.proceed) return;
 
     const progress = document.getElementById('videos-progress');
     const meta = document.getElementById('videos-meta');
@@ -991,7 +1479,11 @@ async function retrySingleVideo(slot) {
     meta.textContent = `正在重试生成第 ${slot} 段视频...`;
 
     const controller = new AbortController();
-    beginIdeaTask(ownerIdea.id, 'videos', null, controller);
+    const rec = beginIdeaTask(ownerIdea.id, 'videos', null, controller);
+    // 只标记这一段在范围内：renderVideosForIdea 靠这个字段决定哪些槽位该画
+    // "等待中"，不设置的话会误把其余所有未生成槽位也画成"等待中"。
+    rec.targetSlots = [slot];
+    setVideoGridButtonsBusy(true);
     // 与服务器失联（非任务真的失败）：后端渲染线程不知道客户端已经放弃，会继续
     // 跑到底——这种情况绝不能在 finally 里 endIdeaTask，否则没人能重新接上它。
     let disconnected = false;
@@ -1002,9 +1494,11 @@ async function retrySingleVideo(slot) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: ownerIdea.title,
+                title: getIdeaSaveTitle(ownerIdea),
+                display_title: ownerIdea.title,
                 prompt_block: ownerIdea.prompt_block,
-                target_slots: [slot]
+                target_slots: [slot],
+                override_flagged: reviewCheck.override
             }),
             signal: controller.signal
         });
@@ -1063,8 +1557,580 @@ async function retrySingleVideo(slot) {
     } finally {
         if (!disconnected) {
             endIdeaTask(ownerIdea.id, 'videos');
-            if (isViewingIdea(ownerIdea.id)) progress.style.display = 'none';
+            if (isViewingIdea(ownerIdea.id)) {
+                progress.style.display = 'none';
+                setVideoGridButtonsBusy(false);
+            }
         }
+    }
+}
+
+// 与 setVideoGridButtonsBusy 同理，管的是每张卡片上的「上传」按钮。
+function setVideoUploadButtonsBusy(busy) {
+    document.querySelectorAll('#videos-grid .upload-video-btn').forEach(btn => {
+        btn.disabled = busy;
+        btn.title = busy ? '该创意的视频序列正在生成/重试中，请稍候' : '手动上传本地视频文件覆盖此槽位';
+    });
+}
+
+// 由各视频槽位卡片的「上传」按钮调用：记下目标槽位，触发共用的隐藏文件选择器
+// （见 index.html #video-upload-input 与 app.js 里的 change 监听）。
+function triggerVideoUpload(slot) {
+    const input = document.getElementById('video-upload-input');
+    if (!input) return;
+    input.dataset.slot = String(slot);
+    input.click();
+}
+
+// 帧/视频槽位的手动改动（上传覆盖、换位、复制）同一时刻只允许一件在飞。
+// 按钮路径本来靠 setXxxButtonsBusy 挡住并发，但拖拽绕过按钮——连着往几张卡片上
+// 甩文件会让多个请求同时读改写同一份 manifest，谁最后写完就以谁为准，前面几次
+// 的结果被静默吃掉。这里是所有入口共用的那道闸。
+let _slotMutationBusy = false;
+
+function beginSlotMutation(what) {
+    if (_slotMutationBusy) {
+        showToast(`还有一次${what}没完成，请等它结束`, "error");
+        return false;
+    }
+    _slotMutationBusy = true;
+    return true;
+}
+
+function endSlotMutation() {
+    _slotMutationBusy = false;
+}
+
+// 手动上传/换位改的都是同名文件（img_NNN.webp、vid_NNN.mp4）：路径不变、内容变了，
+// 浏览器凭路径命中缓存，重渲出来的还是旧图/旧片——必须把受影响槽位的缓存版本推进
+// 一格，下一次渲染才会回源。entries 是后端回的清单，keyName 是槽位字段名
+// （视频是 slot、帧是 sequence），wanted 是这次真正动过的槽位号。
+// 服务端已经落盘、也已经把新记录回给我们了：先就地更新本地清单，让调用方能立刻重渲，
+// 拖完手就看到结果。随后的 reloadManifestIntoIdea 仍会拉一次权威清单——它同时负责把
+// 创意库持久化到服务端（一次网络往返），界面不该干等着它才敢刷新。
+function applyManifestPatchToIdea(ownerIdea, patch) {
+    if (!ownerIdea || !patch) return;
+    if (!ownerIdea.frameRun) {
+        ownerIdea.frameRun = { title: ownerIdea.title, frames: [], videos: [] };
+    }
+    const run = ownerIdea.frameRun;
+    if (Array.isArray(patch.frames)) run.frames = patch.frames;
+    if (Array.isArray(patch.videos)) run.videos = patch.videos;
+    if (patch.frame) {
+        run.frames = Array.isArray(run.frames) ? run.frames : [];
+        const idx = run.frames.findIndex(f => f.sequence === patch.frame.sequence);
+        if (idx === -1) run.frames.push(patch.frame); else run.frames[idx] = patch.frame;
+        run.frames.sort((a, b) => (a.sequence || 0) - (b.sequence || 0));
+    }
+    if (patch.video) {
+        run.videos = Array.isArray(run.videos) ? run.videos : [];
+        const idx = run.videos.findIndex(v => v.slot === patch.video.slot);
+        if (idx === -1) run.videos.push(patch.video); else run.videos[idx] = patch.video;
+        run.videos.sort((a, b) => (a.slot || 0) - (b.slot || 0));
+    }
+    // 上传/换位都改变了片段内容，后端已把 merged_video 从 manifest 删掉；
+    // 本地也要跟着删，否则成品播放器还挂在那里放一段已经对不上的旧成片。
+    if (patch.dropMerged) delete run.merged_video;
+}
+
+function bustSlotMedia(entries, keyName, wanted) {
+    const targets = (wanted || []).map(Number);
+    (entries || []).forEach(entry => {
+        if (!entry) return;
+        if (targets.indexOf(Number(entry[keyName])) === -1) return;
+        bustImageCache(entry.url || entry.file);
+    });
+}
+
+// 手动上传本地视频文件覆盖某个槽位（例如外部渠道单独补的片段，或对自动化产出
+// 不满意想换一版）。上传前后端会用与自动生成同一套 verify_video_anchors 校验
+// 首尾帧是否匹配该槽位期望的锚点图——不匹配时先返回 409，这里弹确认框，用户
+// 确认"仍要覆盖"后带 force=true 重新提交才会真正落盘，防止选错文件误覆盖好片段。
+async function uploadVideoToSlot(slot, file, force = false) {
+    if (!currentIdea || !currentIdea.prompt_block) {
+        showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
+        showToast("该创意的视频序列已在生成/重试中，请稍候", "error");
+        return;
+    }
+    // force=true 是同一次用户操作在 409 确认后的续跑，闸门已经在外层那次调用手里
+    const guarded = !force;
+    if (guarded && !beginSlotMutation('槽位改动')) return;
+
+    const progress = document.getElementById('videos-progress');
+    const meta = document.getElementById('videos-meta');
+    const slotCard = document.getElementById(`video-slot-${slot}`);
+    if (!slotCard) {
+        if (guarded) endSlotMutation();
+        return;
+    }
+
+    slotCard.className = 'frame-card placeholder-frame-card';
+    slotCard.innerHTML = `
+        <div class="frame-placeholder-spinner">
+            <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
+        </div>
+        <span>第 ${String(slot).padStart(3, '0')} 段视频 (上传中...)</span>
+    `;
+    if (progress) progress.style.display = 'flex';
+    if (meta) meta.textContent = `正在上传第 ${slot} 段视频...`;
+    setVideoGridButtonsBusy(true);
+    setVideoUploadButtonsBusy(true);
+
+    try {
+        const formData = new FormData();
+        formData.append('title', getIdeaSaveTitle(ownerIdea));
+        formData.append('slot', String(slot));
+        formData.append('prompt_block', ownerIdea.prompt_block || '');
+        if (force) formData.append('force', 'true');
+        formData.append('video', file, file.name);
+
+        const response = await fetch('/api/upload_video', {
+            method: 'POST',
+            body: formData
+        });
+
+        if (response.status === 409) {
+            const data = await response.json().catch(() => ({}));
+            if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
+            const proceed = await customConfirm(escapeHtml(data.error || '上传视频的首/尾帧与该槽位期望的锚点帧不符，疑似传错文件。是否仍要强制覆盖？'));
+            if (proceed) {
+                await uploadVideoToSlot(slot, file, true);
+            } else {
+                showToast('已取消上传。', 'info');
+            }
+            return;
+        }
+
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errText}`);
+        }
+
+        const data = await response.json();
+        if (data.status !== 'ok' || !data.video) {
+            throw new Error(data.message || data.error || '上传失败');
+        }
+
+        // 覆盖的是同名 vid_NNN.mp4：不推进缓存版本，卡片会继续播旧片
+        bustImageCache(data.video.url || data.video.file);
+
+        applyManifestPatchToIdea(ownerIdea, { video: data.video, dropMerged: true });
+        if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
+        await reloadManifestIntoIdea(ownerIdea);
+        if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
+        showToast(`第 ${slot} 段视频已手动覆盖成功。`, "success");
+    } catch (e) {
+        console.error(`Failed to upload video for slot ${slot}:`, e);
+        showToast(`第 ${slot} 段视频上传失败: ${e.message}`, "error");
+        if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
+    } finally {
+        if (guarded) endSlotMutation();
+        if (isViewingIdea(ownerIdea.id)) {
+            if (progress) progress.style.display = 'none';
+            setVideoGridButtonsBusy(false);
+            setVideoUploadButtonsBusy(false);
+        }
+    }
+}
+
+// 视频槽位之间的手动换位/复制（拖拽一张视频卡片到另一张卡片上时调用，见
+// media_renderer.enableVideoSlotDnd）。槽位编号与网格位置固定不变，动的只是"哪段
+// 视频落在哪个槽位"；目标槽位空着时后端自动退化成搬运（源槽位随之清空），
+// mode='copy' 则是复制一份过去、源槽位原样保留。
+// 换位后首尾帧多半不再对应新槽位期望的锚点图，后端会把 anchor_check 标成"未重新
+// 校验"，这里额外提示一句，免得事后误以为它验过了。
+async function swapVideoSlots(fromSlot, toSlot, mode = 'swap') {
+    if (!currentIdea) {
+        showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
+        showToast("该创意的视频序列正在生成/重试中，请稍候", "error");
+        return;
+    }
+    if (!Number.isFinite(fromSlot) || !Number.isFinite(toSlot) || fromSlot === toSlot) return;
+    if (!beginSlotMutation('槽位改动')) return;
+
+    const meta = document.getElementById('videos-meta');
+    if (meta) meta.textContent = mode === 'copy'
+        ? `正在把第 ${fromSlot} 段视频复制到第 ${toSlot} 段...`
+        : `正在把第 ${fromSlot} 段与第 ${toSlot} 段视频换位...`;
+    setVideoGridButtonsBusy(true);
+    setVideoUploadButtonsBusy(true);
+
+    try {
+        const resp = await fetch('/api/swap_video_slots', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                title: getIdeaSaveTitle(ownerIdea),
+                from_slot: fromSlot,
+                to_slot: toSlot,
+                mode
+            })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data.status === 'error') {
+            throw new Error(data.error || data.message || `HTTP ${resp.status}`);
+        }
+
+        // 换位是"文件名不变、内容互换"——不推进缓存版本的话，重渲出来的两张卡片
+        // 会原样播浏览器缓存里的旧片，界面看着像什么都没发生。
+        bustSlotMedia(data.videos, 'slot', [fromSlot, toSlot]);
+
+        // 先用后端回的清单立刻重渲，再去拉权威清单/持久化创意库
+        applyManifestPatchToIdea(ownerIdea, { videos: data.videos, dropMerged: true });
+        if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
+        await reloadManifestIntoIdea(ownerIdea);
+        if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
+
+        const action = mode === 'copy' ? '复制' : (data.moved ? '搬运' : '换位');
+        showToast(`已把第 ${fromSlot} 段视频${action}到第 ${toSlot} 段（首尾帧未重新校验，必要时重跑该槽位）。`, "success");
+    } catch (e) {
+        console.error(`Failed to swap video slots ${fromSlot} -> ${toSlot}:`, e);
+        showToast(`视频换位失败: ${e.message}`, "error");
+        if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
+    } finally {
+        endSlotMutation();
+        if (isViewingIdea(ownerIdea.id)) {
+            setVideoGridButtonsBusy(false);
+            setVideoUploadButtonsBusy(false);
+        }
+    }
+}
+
+// 帧槽位之间的手动换位/复制（拖一张帧卡片到另一张帧卡片上时调用）。与视频换位同构，
+// 多出来的是 i2i 血统：帧序列是单链，任何一格的图被换掉，较小那个槽位之后的帧就都还
+// 派生自旧链——后端统一标 stale_lineage，前端据此显示 Stale 徽标。
+async function swapFrameSlots(fromSeq, toSeq, mode = 'swap') {
+    if (!currentIdea) {
+        showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
+        showToast("该创意的帧序列正在生成/修复中，请稍候", "error");
+        return;
+    }
+    if (!Number.isFinite(fromSeq) || !Number.isFinite(toSeq) || fromSeq === toSeq) return;
+    if (!beginSlotMutation('槽位改动')) return;
+
+    const meta = document.getElementById('frames-meta');
+    if (meta) meta.textContent = mode === 'copy'
+        ? `正在把第 ${fromSeq} 帧复制到第 ${toSeq} 帧...`
+        : `正在把第 ${fromSeq} 帧与第 ${toSeq} 帧换位...`;
+    setFrameGridButtonsBusy(true);
+
+    try {
+        const resp = await fetch('/api/swap_frame_slots', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                title: getIdeaSaveTitle(ownerIdea),
+                from_sequence: fromSeq,
+                to_sequence: toSeq,
+                mode
+            })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data.status === 'error' || data.error) {
+            throw new Error(data.error || data.message || `HTTP ${resp.status}`);
+        }
+
+        // 同视频换位：两格的文件名没变、内容互换了，缓存版本不推进就看不出变化
+        bustSlotMedia(data.frames, 'sequence', [fromSeq, toSeq]);
+
+        applyManifestPatchToIdea(ownerIdea, { frames: data.frames, dropMerged: true });
+        if (isViewingIdea(ownerIdea.id)) {
+            renderFramesForIdea(ownerIdea);
+            renderVideosForIdea(ownerIdea);
+        }
+        await reloadManifestIntoIdea(ownerIdea);
+        if (isViewingIdea(ownerIdea.id)) {
+            renderFramesForIdea(ownerIdea);
+            renderVideosForIdea(ownerIdea);
+        }
+        const action = mode === 'copy' ? '复制' : (data.moved ? '搬运' : '换位');
+        showToast(`已把第 ${fromSeq} 帧${action}到第 ${toSeq} 帧。`, "success");
+        const affected = data.affected_video_slots || [];
+        if (affected.length) {
+            showToast(`受影响的视频片段：VID ${affected.map(s => String(s).padStart(3, '0')).join(' / ')}，建议重跑。`, "info");
+        }
+    } catch (e) {
+        console.error(`Failed to swap frames ${fromSeq} -> ${toSeq}:`, e);
+        showToast(`帧换位失败: ${e.message}`, "error");
+        if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
+    } finally {
+        endSlotMutation();
+        if (isViewingIdea(ownerIdea.id)) setFrameGridButtonsBusy(false);
+    }
+}
+
+// 一次拖进来多张图片：从落点那一格起按文件名顺序往后依次填。文件多于剩余槽位时
+// 多出来的直接丢弃并如实告知——帧槽位数由提示词条数决定，不能凭上传凭空多出几帧。
+async function uploadFramesFromDrop(startSeq, files) {
+    if (!currentIdea || !currentIdea.prompt_block) {
+        showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+    const images = Array.from(files || []).filter(f => isImageFileLike(f))
+        .sort((a, b) => String(a.name).localeCompare(String(b.name), 'zh-CN', { numeric: true }));
+    if (!images.length) return;
+    if (images.length === 1) {
+        await uploadFrameToSlot(startSeq, images[0]);
+        return;
+    }
+
+    const totalSlots = countPromptImageSlots(currentIdea);
+    const room = totalSlots ? Math.max(0, totalSlots - startSeq + 1) : images.length;
+    const batch = images.slice(0, room);
+    if (!batch.length) {
+        showToast(`第 ${startSeq} 帧之后已没有槽位可填。`, "error");
+        return;
+    }
+
+    const endSeq = startSeq + batch.length - 1;
+    const dropped = images.length - batch.length;
+    const proceed = await customConfirm(
+        `将按文件名顺序把 ${batch.length} 张图片依次覆盖到 IMG ${String(startSeq).padStart(3, '0')} – `
+        + `IMG ${String(endSeq).padStart(3, '0')}：<br>`
+        + batch.map((f, i) => `IMG ${String(startSeq + i).padStart(3, '0')} ← ${escapeHtml(f.name)}`).join('<br>')
+        + (dropped ? `<br><br>另有 ${dropped} 张超出槽位范围，将被忽略。` : '')
+    );
+    if (!proceed) {
+        showToast('已取消批量上传。', 'info');
+        return;
+    }
+
+    if (!beginSlotMutation('槽位改动')) return;
+    try {
+        for (let i = 0; i < batch.length; i++) {
+            // 闸门已经由这次批量操作持有，逐张调用时不再重复抢
+            await uploadFrameToSlot(startSeq + i, batch[i], true);
+        }
+        showToast(`已批量覆盖 IMG ${String(startSeq).padStart(3, '0')} – IMG ${String(endSeq).padStart(3, '0')}（共 ${batch.length} 张）。`, "success");
+    } finally {
+        endSlotMutation();
+    }
+}
+
+// 删除一整拍：图片 N 与视频 N 的提示词、落盘文件、manifest 记录一起消失，其后所有
+// 图片/视频整体前移一位（槽位号是契约不是标签——视频 N 恒等于 IMG N → IMG N+1，
+// 留空洞会让配对/合成的每一处都得学会跳过它，见 server.py /api/delete_slot）。
+// 删除不可撤销（文件直接从磁盘移除），因此确认框里逐条列清会消失什么。
+async function deleteSlotBeat(seq) {
+    if (!currentIdea || !currentIdea.prompt_block) {
+        showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'frames') || isIdeaTaskActive(ownerIdea.id, 'videos')) {
+        showToast("该创意的帧/视频序列正在生成中，请等它结束后再删除", "error");
+        return;
+    }
+    const sequence = Number(seq);
+    if (!Number.isFinite(sequence) || sequence < 1) return;
+
+    const slots = (typeof resolvePromptSlots === 'function' ? resolvePromptSlots(ownerIdea) : []) || [];
+    const imageSlots = slots.filter(s => s.type === 'image');
+    const videoSlot = slots.find(s => s.type === 'video' && s.index === sequence);
+    const imageCount = imageSlots.length;
+    if (imageCount <= 1) {
+        showToast("本单只剩最后一张图片，删掉就没有序列了", "error");
+        return;
+    }
+
+    const label = String(sequence).padStart(3, '0');
+    const tail = sequence < imageCount
+        ? `<li>IMG ${String(sequence + 1).padStart(3, '0')} 及其后所有图片/视频<b>整体前移一位</b>（磁盘文件一起改名）</li>`
+        : '';
+    const seam = sequence > 1
+        ? `<li>VID ${String(sequence - 1).padStart(3, '0')} 的尾锚点会换成另一张图，标记为待重跑</li>`
+        : '';
+    const proceed = await customConfirm(
+        `<b>删除第 ${sequence} 拍</b>（不可撤销，文件直接从磁盘删除）：`
+        + '<ul style="margin:8px 0 0 18px; line-height:1.7;">'
+        + `<li>提示词「图片 ${sequence}」${videoSlot ? `与「视频 ${sequence}」` : ''}从提示词块中删除</li>`
+        + `<li>IMG ${label}${videoSlot ? ` 与 VID ${label}` : ''} 的文件删除</li>`
+        + tail + seam
+        + '</ul>'
+    );
+    if (!proceed) {
+        showToast('已取消删除。', 'info');
+        return;
+    }
+    if (!beginSlotMutation('槽位改动')) return;
+
+    setFrameGridButtonsBusy(true);
+    setVideoGridButtonsBusy(true);
+    try {
+        const resp = await fetch('/api/delete_slot', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                title: getIdeaSaveTitle(ownerIdea),
+                sequence,
+                prompt_block: ownerIdea.prompt_block || ''
+            })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data.status === 'error' || data.error) {
+            throw new Error(data.error || data.message || `HTTP ${resp.status}`);
+        }
+
+        // 整体前移＝一大批同名文件换了内容，逐个作废缓存版本，否则网格会拿旧图重排
+        (data.frames || []).forEach(f => bustImageCache(f.url || f.file));
+        (data.videos || []).forEach(v => bustImageCache(v.url || v.file));
+
+        // 提示词块是这一切的源头（槽位总数按它算），必须先落到创意对象上再重渲
+        if (data.prompt_block) {
+            await applyPromptBlockToIdea(ownerIdea, data.prompt_block, data.prompt_slots);
+        }
+        applyManifestPatchToIdea(ownerIdea, {
+            frames: data.frames, videos: data.videos, dropMerged: true
+        });
+        if (isViewingIdea(ownerIdea.id)) {
+            renderFramesForIdea(ownerIdea);
+            renderVideosForIdea(ownerIdea);
+        }
+        await reloadManifestIntoIdea(ownerIdea);
+        if (isViewingIdea(ownerIdea.id)) {
+            renderFramesForIdea(ownerIdea);
+            renderVideosForIdea(ownerIdea);
+        }
+
+        showToast(`已删除第 ${sequence} 拍，其后整体前移一位（现有 ${data.image_count} 张图片）。`, "success");
+        const affected = data.affected_video_slots || [];
+        if (affected.length) {
+            showToast(`VID ${affected.map(s => String(s).padStart(3, '0')).join(' / ')} 的尾锚点已改变，建议重跑这一段。`, "info");
+        }
+    } catch (e) {
+        console.error(`Failed to delete slot ${sequence}:`, e);
+        showToast(`删除第 ${sequence} 拍失败: ${e.message}`, "error");
+        if (isViewingIdea(ownerIdea.id)) {
+            renderFramesForIdea(ownerIdea);
+            renderVideosForIdea(ownerIdea);
+        }
+    } finally {
+        endSlotMutation();
+        if (isViewingIdea(ownerIdea.id)) {
+            setFrameGridButtonsBusy(false);
+            setVideoGridButtonsBusy(false);
+        }
+    }
+}
+
+// 提示词块被服务端改写后落回创意对象：currentIdea、localStorage 快照、创意库、
+// 提示词页展示的原始 Markdown 四处必须一起更新——只改其中一处，下一次生成/重试
+// 读到的还是旧提示词（同 fixFrameIssue 里改写提示词后的那套处理）。
+async function applyPromptBlockToIdea(ownerIdea, promptBlock, promptSlots) {
+    if (!ownerIdea || !promptBlock) return;
+    ownerIdea.prompt_block = promptBlock;
+    // 结构化槽位契约必须跟着换：resolvePromptSlots 优先用它，留着删除前那一份
+    // 会让帧网格继续按旧条数画格子。后端没回新的就删掉，退回正则解析兜底。
+    if (promptSlots) ownerIdea.prompt_slots = promptSlots;
+    else delete ownerIdea.prompt_slots;
+    if (currentIdea && currentIdea.id === ownerIdea.id) saveCurrentIdeaState();
+    const existingIdx = savedIdeas.findIndex(item => item.id === ownerIdea.id);
+    if (existingIdx !== -1) {
+        savedIdeas[existingIdx].prompt_block = promptBlock;
+        if (promptSlots) savedIdeas[existingIdx].prompt_slots = promptSlots;
+        else delete savedIdeas[existingIdx].prompt_slots;
+        await saveLibrary();
+    }
+    if (isViewingIdea(ownerIdea.id)) {
+        const blockEl = document.getElementById('idea-prompt-block');
+        if (blockEl) blockEl.textContent = promptBlock;
+    }
+}
+
+// 提示词里「图片 N:」的条数＝帧槽位总数（与 renderFramesForIdea 用的是同一套契约）。
+// 解析不出来时返回 0，调用方按"不限制"处理，由后端兜底。
+function countPromptImageSlots(idea) {
+    try {
+        const slots = resolvePromptSlots(idea) || [];
+        return slots.filter(s => s.type === 'image').length;
+    } catch (e) {
+        return 0;
+    }
+}
+
+// 手动上传本地图片覆盖某个帧槽位（拖图片到帧卡片上，见 media_renderer.enableFrameSlotDnd）。
+// 后端会把图片按本单画幅裁剪后转存成同款 img_NNN.webp，并把该帧的机器判定全部作废、
+// 其后各帧标为 stale_lineage（i2i 血统在这一帧断开）。
+// skipGuard：批量上传（uploadFramesFromDrop）时用——闸门由那次批量操作整体持有。
+async function uploadFrameToSlot(seq, file, skipGuard = false) {
+    if (!currentIdea || !currentIdea.prompt_block) {
+        showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
+        showToast("该创意的帧序列正在生成/修复中，请稍候", "error");
+        return;
+    }
+    const guarded = !skipGuard;
+    if (guarded && !beginSlotMutation('槽位改动')) return;
+
+    const slotCard = document.getElementById(`frame-slot-${seq}`);
+    if (slotCard) {
+        slotCard.className = 'frame-card placeholder-frame-card';
+        slotCard.innerHTML = `
+            <div class="frame-placeholder-spinner">
+                <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
+            </div>
+            <span>第 ${String(seq).padStart(3, '0')} 帧 (上传中...)</span>
+        `;
+    }
+    setFrameGridButtonsBusy(true);
+
+    try {
+        const formData = new FormData();
+        formData.append('title', getIdeaSaveTitle(ownerIdea));
+        formData.append('sequence', String(seq));
+        formData.append('prompt_block', ownerIdea.prompt_block || '');
+        formData.append('image', file, file.name);
+
+        const resp = await fetch('/api/upload_frame', { method: 'POST', body: formData });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data.status === 'error' || data.error) {
+            throw new Error(data.error || data.message || `HTTP ${resp.status}`);
+        }
+
+        // 覆盖的是同名 img_NNN.webp：不推进缓存版本，卡片会继续显示旧图
+        const uploaded = data.frame || {};
+        bustImageCache(uploaded.url || uploaded.file);
+
+        applyManifestPatchToIdea(ownerIdea, { frame: data.frame, dropMerged: true });
+        if (isViewingIdea(ownerIdea.id)) {
+            renderFramesForIdea(ownerIdea);
+            renderVideosForIdea(ownerIdea);
+        }
+        await reloadManifestIntoIdea(ownerIdea);
+        if (isViewingIdea(ownerIdea.id)) {
+            renderFramesForIdea(ownerIdea);
+            renderVideosForIdea(ownerIdea);
+        }
+        // 批量上传时逐张弹提示会刷屏，收尾由 uploadFramesFromDrop 统一报一次
+        if (guarded) {
+            showToast(`第 ${seq} 帧已用本地图片覆盖。`, "success");
+            const affected = data.affected_video_slots || [];
+            if (affected.length) {
+                showToast(`这张图是 VID ${affected.map(s => String(s).padStart(3, '0')).join(' / ')} 的首尾锚点，建议重跑这些片段。`, "info");
+            }
+        }
+    } catch (e) {
+        console.error(`Failed to upload frame ${seq}:`, e);
+        showToast(`第 ${seq} 帧上传失败: ${e.message}`, "error");
+        if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
+    } finally {
+        if (guarded) endSlotMutation();
+        if (isViewingIdea(ownerIdea.id)) setFrameGridButtonsBusy(false);
     }
 }
 
@@ -1082,6 +2148,9 @@ async function retryMissingVideos(slots) {
         showToast("该创意的视频序列已在生成/重试中，请稍候", "error");
         return;
     }
+
+    const reviewCheck = await confirmSequenceReviewOverride(ownerIdea, slots);
+    if (!reviewCheck.proceed) return;
 
     const progress = document.getElementById('videos-progress');
     const meta = document.getElementById('videos-meta');
@@ -1104,7 +2173,9 @@ async function retryMissingVideos(slots) {
     meta.textContent = `正在重试缺失的 ${slots.length} 段视频（槽位 ${slots.join(', ')}）...`;
 
     const controller = new AbortController();
-    beginIdeaTask(ownerIdea.id, 'videos', null, controller);
+    const rec = beginIdeaTask(ownerIdea.id, 'videos', null, controller);
+    rec.targetSlots = slots;
+    setVideoGridButtonsBusy(true);
     // 与服务器失联（非任务真的失败）：后端渲染线程不知道客户端已经放弃，会继续
     // 跑到底——这种情况绝不能在 finally 里 endIdeaTask，否则没人能重新接上它。
     let disconnected = false;
@@ -1114,9 +2185,11 @@ async function retryMissingVideos(slots) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 config,
-                title: ownerIdea.title,
+                title: getIdeaSaveTitle(ownerIdea),
+                display_title: ownerIdea.title,
                 prompt_block: ownerIdea.prompt_block,
-                target_slots: slots
+                target_slots: slots,
+                override_flagged: reviewCheck.override
             }),
             signal: controller.signal
         });
@@ -1139,7 +2212,7 @@ async function retryMissingVideos(slots) {
                 } else if (type === 'video_done') {
                     renderVideoSlotDone(evData.index, evData.video);
                 } else if (type === 'video_error') {
-                    renderVideoSlotFailed(evData.index, evData.message || '生成失败');
+                    renderVideoSlotFailed(evData.index, evData.message || '生成失败', '生成失败', true);
                 } else if (type === 'queue') {
                     meta.textContent = (evData && evData.message) || '正在排队等待生成视频...';
                 } else if (type === 'reconnecting') {
@@ -1171,8 +2244,10 @@ async function retryMissingVideos(slots) {
     } finally {
         if (!disconnected) {
             endIdeaTask(ownerIdea.id, 'videos');
-            if (isViewingIdea(ownerIdea.id)) progress.style.display = 'none';
+            if (isViewingIdea(ownerIdea.id)) {
+                progress.style.display = 'none';
+                setVideoGridButtonsBusy(false);
+            }
         }
     }
 }
-

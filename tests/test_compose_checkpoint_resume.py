@@ -126,9 +126,10 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
             'theme': '高山废弃铁路蒸汽机车注水塔改造成独居御寒暖阁',
             'anchors': ['利用蒸汽机车原装铸铁注水阀门旧物Upcycling改装成悬空柴暖壁炉'],
             'complexity': '硬核重工', 'budget': '轻奢设计师级', 'ratio': '50%',
-            'creativity': '脑洞大开', 'beats_count': 2,
+            'creativity': '脑洞大开', 'beats_count': 2, 'beat_count_mode': 'fixed',
         }
         self.captured_beat_system = {}
+        self.captured_beat_user = {}
 
         # Step 1 brief-parsing 桩响应：故意不含任何锚点相关字段，证明后面能看到锚点
         # 靠的是 Python 侧直接赋值，不是指望这次 LLM 调用把它转录出来。
@@ -136,11 +137,27 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
             'carrier': 'abandoned steam-locomotive water tower', 'env': 'alpine mountainside',
             'trauma': 'rusted and frost-cracked', 'destiny': 'snug winter refuge den',
             'destiny_zh': '独居御寒暖阁', 'reward': 'firelight fills the finished room',
-            'mode': 'Standard', 'space_type': 'abandoned property', 'carrier_family': 'man-made',
+            'mode': 'Standard', 'space_type': 'abandoned property',
+            'carrier_slug': 'steam-locomotive-water-tower',
         })
         beat_ladder_json = json.dumps([
-            {'index': 1, 'operation': 'clearing', 'description': 'clearing debris', 'bridge_stage': None, 'stage_scope': 'large'},
-            {'index': 2, 'operation': 'framing', 'description': 'framing interior walls', 'bridge_stage': None, 'stage_scope': 'small'},
+            {'index': 1, 'operation': 'clearing', 'description': 'clearing debris', 'bridge_stage': None, 'stage_scope': 'large',
+             'milestone_name': 'approach fully cleared', 'before_state': 'debris covers the approach',
+             'after_state': 'the entire approach is cleared to stable ground',
+             'completion_extent': 'the entire visible approach', 'changed_grid_cells': ['Grid B2', 'Grid C2'],
+             'package_operations': ['clearing'], 'primary_progress': 'clear ground expands across the full approach',
+             'secondary_progress': 'two debris crates fill from empty to full',
+             'persistent_traces': ['rake grooves', 'crate drag marks'],
+             'preserve_state': 'the tower shell remains rusted and untouched'},
+            {'index': 2, 'operation': 'framing', 'description': 'framing interior walls', 'bridge_stage': None, 'stage_scope': 'large',
+             'milestone_name': 'all interior framing complete', 'before_state': 'the interior shell has no studs',
+             'after_state': 'all declared wall and ceiling studs are installed',
+             'completion_extent': 'all interior walls and the ceiling curve',
+             'changed_grid_cells': ['Grid A2', 'Grid B2', 'Grid C2'],
+             'package_operations': ['framing'], 'primary_progress': 'stud count grows from zero to twelve',
+             'secondary_progress': 'the staged timber bundle drains from twelve to zero',
+             'persistent_traces': ['screw heads', 'sawdust bands'],
+             'preserve_state': 'the cleared floor and original shell remain unchanged'},
             {'index': 3, 'operation': 'reward', 'bridge_stage': None,
              'description': 'The cast-iron valve stove hangs suspended above the hearth as warm light fills the finished room.',
              'anchor_keywords': ['cast-iron valve stove']},
@@ -161,6 +178,7 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
                 return brief_json
             if 'construction planner' in system:
                 self.captured_beat_system['text'] = system
+                self.captured_beat_user['text'] = user
                 return beat_ladder_json
             if 'spatial consistency supervisor' in system:
                 return packet_json
@@ -195,6 +213,36 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
         self.assertEqual(state['parsed_brief']['signature_anchor'], '')
         self.assertNotIn('SIGNATURE ANCHOR RULE', self.captured_beat_system['text'])
 
+    def test_card_beat_outline_reaches_the_ladder_call_as_a_soft_plan(self):
+        """灵感卡片上展示的工序预览(idea.beat_outline)随 dimensions 传进来后,必须出现在
+        节拍阶梯生成调用里,否则用户挑卡时看到的工序和成片对不上;同时必须明确标成软参考,
+        不能让它盖过真实施工顺序等硬规则。"""
+        self.dimensions['beat_outline'] = ['清运塔内积渣与锈屑', '架设内墙木龙骨', '点亮壁炉,人物入住']
+        pp.compose_anchor_and_packet({}, self.dimensions)
+
+        beat_user = self.captured_beat_user['text']
+        self.assertIn('清运塔内积渣与锈屑', beat_user)
+        self.assertIn('架设内墙木龙骨', beat_user)
+        self.assertIn('SOFT reference', beat_user)
+        self.assertIn('every mandatory rule in the system prompt outranks it', beat_user)
+        # 编号顺序透传,便于模型对齐用户看到的那一版工序
+        self.assertIn('1. 清运塔内积渣与锈屑', beat_user)
+        self.assertIn('2. 架设内墙木龙骨', beat_user)
+
+    def test_outline_is_capped_at_the_beat_budget_and_absent_when_not_provided(self):
+        """草案条数不该反过来把拍数预算顶穿:beats_count=2(fixed)时最多 3 条(含 reward)。
+        没传 beat_outline 时整块不出现,手工填维度直出的老路径行为不变。"""
+        pp.compose_anchor_and_packet({}, self.dimensions)
+        self.assertNotIn('Draft plan', self.captured_beat_user['text'])
+
+        self.dimensions['beat_outline'] = ['A清渣', 'B龙骨', 'C封板', 'D刷漆', 'E入住']
+        pp.compose_anchor_and_packet({}, self.dimensions)
+        beat_user = self.captured_beat_user['text']
+        self.assertIn('Draft plan', beat_user)
+        self.assertIn('3. C封板', beat_user)
+        self.assertNotIn('D刷漆', beat_user)   # 超出 beats_count + 1 的草案条目被截掉
+        self.assertNotIn('E入住', beat_user)
+
 
 class TestComposeRemainingBeatsResume(unittest.TestCase):
     """compose_remaining_beats 命中断点存档时,只应重新生成 pass_beats_done 里没有记录
@@ -213,6 +261,8 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
             patch.object(pp, 'get_cropped_templates', return_value=''),
             patch.object(pp, 'apply_proactive_fixes', side_effect=lambda i, v, im, *a, **k: (v, im)),
             patch.object(pp, 'validate_beat_prompts', return_value=[]),
+            patch.object(pp, 'check_milestone_video_prompt', return_value=[]),
+            patch.object(pp, 'check_milestone_image_prompt', return_value=[]),
         ]
         for p in patches:
             p.start()

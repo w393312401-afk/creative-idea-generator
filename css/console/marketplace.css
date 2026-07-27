@@ -506,10 +506,17 @@
   box-shadow: 0 0 12px var(--primary-glow);
 }
 
-.form-select option {
-  background-color: var(--bg-sidebar);
-  color: var(--text-main);
+.form-select option,
+.form-select optgroup {
+  background-color: var(--bg-panel-solid, #FBF8F1);
+  color: var(--text-main, #2E2A24);
   padding: 10px;
+}
+
+html[data-theme="dark"] .form-select option,
+html[data-theme="dark"] .form-select optgroup {
+  background-color: var(--bg-panel-solid, #221B14);
+  color: var(--text-main, #ECE4D7);
 }
 
 /* High-Contrast Digital Ticket Output Screen */
@@ -782,3 +789,144 @@
   box-shadow: 0 0 10px rgba(0, 242, 254, 0.1);
 }
 
+/* ==========================================================================
+   MARKETPLACE & DOCS MOBILE RESPONSIVE OPTIMIZATIONS
+   ========================================================================== */
+@media (max-width: 768px) {
+  /* Model cards grid — allow narrower cards on phones */
+  .market-grid {
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 14px;
+  }
+  .market-card:hover {
+    transform: none; /* Disable hover lift on touch */
+  }
+  /* Card banner compact */
+  .card-banner {
+    height: 100px;
+  }
+  .banner-illustration {
+    width: 56px;
+    height: 56px;
+  }
+  /* Card body compact */
+  .card-body {
+    padding: 14px;
+  }
+  .card-model-name {
+    font-size: 13.5px !important;
+  }
+  .card-provider {
+    font-size: 10.5px;
+  }
+  .card-desc {
+    font-size: 12px;
+    height: 48px;
+    margin-bottom: 12px;
+  }
+  /* Pricing compact */
+  .card-pricing {
+    padding: 9px 11px;
+    margin-bottom: 12px;
+    gap: 5px;
+  }
+  .price-label {
+    font-size: 11px;
+  }
+  .price-value {
+    font-size: 11.5px;
+  }
+  /* Card footer compact */
+  .card-footer {
+    padding: 10px 14px;
+    gap: 8px;
+  }
+  .card-tags-row {
+    font-size: 10.5px;
+  }
+  .pill {
+    padding: 2px 6px;
+    font-size: 10px;
+  }
+
+  /* Marketplace search bar compact */
+  .market-action-bar {
+    border-radius: 12px;
+    margin-bottom: 14px;
+    padding: 10px;
+  }
+  .market-search-input {
+    font-size: 13px;
+    padding: 9px 12px 9px 36px;
+  }
+
+  /* Suffix generator output compact */
+  .generator-result {
+    padding: 18px;
+    border-radius: 12px;
+  }
+  .generator-result::before {
+    font-size: 8px;
+    top: 8px;
+  }
+  .result-id {
+    font-size: 14px;
+    padding: 8px 12px;
+  }
+  .result-info {
+    font-size: 11.5px;
+    margin-bottom: 16px;
+  }
+
+  /* Docs sidebar compact */
+  .market-sidebar {
+    padding: 16px;
+    border-radius: 12px;
+  }
+  .filter-item {
+    padding: 8px 10px;
+    font-size: 12.5px;
+    min-height: 36px;
+  }
+
+  /* Code tab container compact */
+  .code-tab-container {
+    border-radius: 12px;
+  }
+
+  /* Doc panel compact */
+  .doc-panel {
+    gap: 16px;
+  }
+}
+
+@media (max-width: 576px) {
+  /* Single column cards on tiny phones */
+  .market-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .card-banner {
+    height: 80px;
+  }
+  .banner-illustration {
+    width: 44px;
+    height: 44px;
+  }
+  .card-body {
+    padding: 12px;
+  }
+  .card-footer {
+    padding: 8px 12px;
+  }
+  .generator-result {
+    padding: 14px;
+  }
+  .result-id {
+    font-size: 12px;
+  }
+  .form-select {
+    padding: 9px 12px;
+    font-size: 13px;
+  }
+}

@@ -268,3 +268,43 @@ hard_cut 切点两侧的帧**不得组成首尾帧对送 i2v**（否则视频模
 **测试**：`tests/test_threshold_variants.py` 新增 `TestBeatContractBridgeFlags`（HOLD/SPAN/is_first_interior_reveal 标记 + 脏乱差条款存在性）、`TestVideoOpeningFirstFrameIndex`（`fix_video_opening`/`check_video_opening` 的 `first_frame_index` 覆盖 + HOLD 拍跳过视频侧全部校验）、`TestPlanVideoSlotsBridgeHold`（HOLD 跳过 + SPAN 锚点重定向 + 缺帧兜底）、`TestMergeGateBridgeHold`（`skipped_bridge_hold` 预期缺失语义）；`tests/test_prompt_fixes.py`/`tests/test_threshold_variants.py` 原有 meta 断言同步改为 `BRIDGE HOLD`/`BRIDGE SPAN`。全量 489 pytest 全绿。
 
 **Rollout 注意**：`packet_cache.json` 无需清理（未新增/改动 packet 字段）；`compose_checkpoints.json` 里若有 Threshold 项目的桥接拍已落在 `pass_beats_done`（部署时正在断点续传中），其存量正文仍是旧两段式叙述、首帧锚点句仍写着旧的 IMAGE 编号——这类存量断点条目建议清理，逼一次整单重新合成，避免装配阶段用新 meta 规则去配对旧正文产生锚点不匹配。已完成/已渲染项目的 manifest/prompt 永远是纯字面 `[BRIDGE]`，不会被新逻辑误触发，不受影响。改动全部在 `refactor/structure` 分支，未提交；需重启 :8085 生效。
+
+---
+
+## 12. TBCP v4 — 单拍收编过门 + 首拍不得过早 + 禁止多宫格图（2026-07-21）
+
+**触发**：用户实测反馈三点——①帧序列一开始就在室内（beat_ladder 把过门拍排到了 Beat 1/2，`_img1_is_pre_bridge` 兜底分支被真实命中，IMAGE 1 直接变成门口帧）；②过门过程过度工程化，只需要「完全室外→完全室内」两张可见图 + 一段视频；③实际生成图出现拼贴/多宫格画面。
+
+**方案**：
+
+- **过门收编成单一 `bridge_stage=1` 拍**：coaxial 与 pan 变体统一为一拍——不再有 HOLD（bridge_stage=1 旧义）/SPAN（2）/TURN（3）三段。该拍自己的 IMAGE 就是定格（pan 变体已完成转向）的室内首现帧；VIDEO 是过门唯一可见片段，正文一镜到底叙述"推进→穿越门槛→（pan 变体）原地摇镜转入纵深轴→定格"，首尾帧锚点就是普通的 IMAGE i → IMAGE i+1，不再需要 TBCP v3 的 `start_anchor_slot` 重定向（因为已经没有 HOLD 帧需要跳过）。`video_generator.plan_video_slots` 的 `skip_bridge_hold` 分支、`prompt_pipeline` 的 `is_bridge_hold`/`is_bridge_span`/'sill'/'vestibule' 族分支、`server_common.IMG2IMG_TURN_CONTROL_PROMPT`（旋转专用）全部删除；新增 `IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT`（推进+转向合并版控制指令）供 pan 变体单拍使用。旧 `skipped_bridge_hold`/`start_anchor_slot` 字段仅保留读取以兼容存量 manifest。
+- **强制最少铺垫拍数**：beat_ladder 结构校验新增硬性下限——过门拍下标必须 ≥3（即至少 2 个普通室外拍在其前面，覆盖"建立大环境印象"+"展示室外清理/维修进度"），LLM 指令与确定性兜底节拍梯生成器同步落这条下限；`_img1_is_pre_bridge` 兜底分支保留但理论上不再会被真实命中。`image_1_system` 新增硬性规则："WIDE ESTABLISHING SHOT"——IMAGE 1 必须是整个场景/载体的大全景，不得是细节特写，覆盖 Standard 模式/纯室内载体也没有真正室外可言的场景。
+- **禁止多宫格图**：`image_1_system`、`_batch_shared_system_prompt`、`compose_remaining_beats` 内层单拍兜底 system prompt 三处统一追加"SINGLE CONTINUOUS PHOTOGRAPH"硬性条款——每张 IMAGE 必须是单一真实照片，严禁拼贴/多宫格/分屏对比/故事板；并明确点破"Grid A1-C3"记号只是给写作者用的内部构图坐标约定，不得被理解成要画出真实网格线。根因假设：现有提示词大量出现"Locked anchors: X at Grid A2..., Y at Grid B2..."这类分区坐标语言，尤其在建立性/多锚点拍里密集出现，是触发生图模型误解成"多面板参考图/故事板"的最可能诱因。
+
+**范围**：coaxial 与 pan 两变体统一收编；hard_cut 变体结构不变（本就是两拍+声明式切点，天然满足"两张图"形态）。
+
+**测试**：`tests/test_threshold_variants.py`/`test_prompt_fixes.py`/`test_spatial_negative_example.py`/`test_structural_beat_rework.py` 里所有 bridge_stage 2/3、'sill'/'vestibule' 族、`is_bridge_hold`/`is_bridge_span`、`skip_bridge_hold`/`start_anchor_slot` 重定向、`BRIDGE HOLD`/`BRIDGE SPAN` meta 相关用例改写为单拍模型；外部 skill 参考文档 `threshold-bridge-consistency-protocol.md`（改写为 TBCP v4）与 `prompt-templates.md`（"Threshold Bridge"章节改写、Interior IMAGE exemplar 措辞同步）一并更新，因为它们会被 `load_reference_file` 逐字注入生成 LLM 的 system prompt。
+
+**Rollout 注意**：改动全部在 `refactor/structure` 分支，未提交；需重启 :8085 生效。未做实机生成验证（本次仅代码+单测层面）。
+
+---
+
+## 13. TBCP v5 — 过门帧回归"原始"+ 过门后强制清理工序 + 过门视频提示词收紧（2026-07-26）
+
+**触发**：用户实测反馈——①「过门帧有人工痕迹，不够原始」（渲出来的室内首现帧地面像被扫过、杂物码得整齐、表面看着刚修过，读起来像被布景过的房间，而不是刚被推开门的废墟）；②「过门帧后也要加一个清理的工序」（首现帧满地瓦砾，下一拍却直接贴板/刷漆，现实里必然存在的清运整拍消失）；③视频提示词同时优化。
+
+根因定位：①契约侧首现帧只要求 2 类衰败（IMAGE 1 自己的 GENUINE DAMAGE 审计要 3 类），且**从未有过"零人工痕迹"条款**（IMAGE 1 有 ZERO INTERVENTION EVIDENCE，首现帧没有）；渲染侧只有门框清除一道像素门禁，门框出画之后没有任何东西看过这一帧"脏不脏"。②节拍梯对过门后第一拍只要求"是室内施工工序"，没有指定清理。③过门片段的正文契约只写了运镜几何（推进/门框擦出/曝光滚动/锚点放大），没有一条约束镜头进去之后看到的**状态**，i2v 完全可以把室内插值成干净房间。
+
+**方案**：
+
+- **首现帧契约加严（`_beat_contract` 的 `is_first_interior_reveal` 分支 + family_contract 条目）**：衰败类别 2→3 类（与 IMAGE 1 的审计门槛对齐）；新增 ZERO INTERVENTION EVIDENCE（工具/工具箱/梯子/脚手架/漆桶/防水布/工作灯/锥筒/码放的新材料，以及任何看着已修补/已清洁/已粉刷的局部）；新增 UNARRANGED（杂物必须散落在重力和时间让它落的位置，不得扫拢成堆、不得对齐摆放），并明写"地面不得读作已清空——那是下一拍的活"。
+- **首现帧事后文本校验加严（`check_first_interior_reveal_decay`）**：门槛同步提到 3 类；新增人工痕迹词表检测，**带否定窗口**（`_mentions_without_negation`，命中词前 60 字符内有 no/without/free of/never 等否定线索即放行）——因为契约本身就鼓励写 "no ladders, no tools anywhere in frame" 这类澄清句，`fix_image_prompt_with_vlm_feedback` 更是主动追加，硬匹配会把最合规的稿子判死。回炉指令（`rework_...`）同步要求 3 类 + 显式否定式删除人工痕迹。
+- **首现帧像素门禁（新，`check_first_interior_reveal_raw_state` + frame_generator）**：紧跟门框清除之后跑，对真实像素判 4 项（人工痕迹 / 已被收拾过 / 已被修复过的表面 / 衰败类别少于 2 类）。未通过则以该帧自身为参考做一次定向状态修正（`IMG2IMG_RAW_STATE_CONTROL_PROMPT` + 把 VLM 报回来的具体原因写进指令，镜头锁死只改内容），最多 `_RAW_STATE_MAX_FIXES=1` 次——这一步不改构图，改不动通常是模型不肯加脏，多刷一轮边际收益很低。修完仍不过只写进 `vlm_qa_reason` 留痕（与门框清除的留痕合并，不互相覆盖），绝不拦渲染。进度事件 `raw_state` 与 `door_clearance` 同款，前端动态流已接。
+- **过门后强制清理工序（节拍梯层）**：`_post_crossing_cleanup_rule` 同时写进 coaxial/pan 与 hard_cut 两套 `threshold_split_rules`；结构校验新增硬性要求——过门拍的下一拍 `operation` 必须是 `clearing`，否则打回重生成并把违规喂回重试提示；确定性兜底节拍梯生成器同步在 `t_idx+1` 落 `clearing`。契约层新增 `is_post_reveal_cleanup` 标记（Threshold 模式 + 上一拍是过门拍/硬切拍 + 本拍是普通室内拍），带自己的 family_contract 条目：搬走一切可搬运的杂物到裸地面，但**结构性衰败（锈迹/裂缝/水渍/剥落/腐朽）原封不动留给后面的修复拍**；VIDEO 要求工人拿一件具名工具反复往外搬、清出的面积随片渐进扩大 + 渣土容器渐满（本拍的两条可观测进度线）。新增确定性校验 `check_post_reveal_cleanup_prompts`（IMAGE 没写清空结果 / IMAGE 把衰败一并擦干净 / VIDEO 没有搬运动作三项），挂在 `validate_beat_prompts` 上，两条生成链（批量直出 + 单拍兜底）自动共享，按风格瑕疵留痕不拦截。
+- **过门视频提示词优化**：过门拍的 family_contract 新增两条——(1) 全程原始废墟（镜头进去看到的第一眼就必须是脏的，穿越途中不得清理/修缮/安装，不得出现工具梯子脚手架防水布工作灯堆料），(2) 一镜到底（不得切/淡入淡出/叠化/变速/定格，唯一的"剪辑感"只能是门框擦出画面；且不得把这一拍写成施工延时）。兜底过门视频正文同步补这两句。新增确定性校验：`check_video_process_content` 的 bridge 分支检测穿越途中的施工/清理动词（`_BRIDGE_WORK_ACTION_PATTERN`，只匹配 -ing/-s/被动态与"动词+杂物宾语/杂物宾语+动词"，避免误伤 peeling paint / stacked wreckage / 门框 clears the frame edge / 光楔 sweeping across the floor 这类合法措辞），命中计入结构性硬伤，对该拍定向回炉一轮。
+
+**范围**：coaxial/pan/hard_cut 三变体统一（清理工序对三者都强制；首现帧原始度对 bridge 变体的 i2i 帧生效，hard_cut 的 t2i 新链头帧走它自己的 anchor_rule 衰败条款，像素门禁按 `is_bridge` 判定不覆盖它）。
+
+**测试**：`tests/test_threshold_variants.py` 新增 `TestPostRevealCleanupContract`（清理拍标记/契约文本、过门拍与后续普通室内拍不误命中、Standard 模式不命中、首现帧 3 类+零人工痕迹、过门片段两条新契约）、`TestBridgeClipWorkContentCheck`（穿越途中施工/清理命中 + 纯运镜措辞不误报）、`TestPostRevealCleanupPromptCheck`、`TestPostCrossingCleanupLadderGate`（节拍梯结构校验打回 + 违规回写重试提示 + 合规一次通过）；`tests/test_structural_beat_rework.py` 新增 2 类被判不合格、3 类通过、人工痕迹命中/否定式放行/非首现拍跳过；`tests/test_frame_generator.py` 新增 `TestFirstInteriorRevealRawState`（定向修正带上 VLM 原因、修完仍不过保留帧并留痕、通过则不动帧）。全量 pytest 除 2 项与本次无关的既有失败（`test_ideation_trend_sources` 两例，命中的是外部 skill 的 `idea-engine.md` 文案与 run_ideate 兜底，改动前后一致）外全绿。
+
+**Rollout 注意**：外部 skill 参考文档 `threshold-bridge-consistency-protocol.md`（Rule 1 补"穿越途中不干活/一镜到底"、Rule 6 改写为三条强制项+像素门禁说明、新增 §9 Post-Crossing Cleanout、审计表改一行加两行）与 `prompt-templates.md`（首现帧说明改写、Interior IMAGE exemplar 补零人工痕迹措辞、三条过门 VIDEO exemplar 补全程原始+一镜到底、总检查清单补三项）一并更新，因为它们会被 `load_reference_file` 逐字注入生成 LLM 的 system prompt。`packet_cache.json` 无需清理（未改 packet 字段）；`MILESTONE_POLICY_VERSION` 已从 `visible-milestones-v1` 换代为 `visible-milestones-v2-post-crossing-cleanout`：它进 `get_brief_fingerprint`，所以全部存量 `compose_checkpoints.json` 断点与 `packet_cache.json` 条目自动失效、整单重排（存量断点的节拍梯没有清理拍，续传会绕过新的结构校验产出旧形态，只能靠指纹换代逼它重来），无需手工清文件。改动全部在 `refactor/structure` 分支，未提交；需重启 :8085 生效。未做实机生成验证（本次仅代码+单测层面）。

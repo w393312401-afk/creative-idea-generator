@@ -161,8 +161,6 @@ let loadedIdeationCover = null;
 // worth spending an image-generation call on are the ones made after a project is
 // selected and composed (see /api/generate_cover, which does work — task-based,
 // polled for the result).
-const IDEATION_FAMILY_ICON = { 'natural': '🌲', 'man-made': '🏚️', 'vehicle': '🚢', 'fantasy': '🔮' };
-
 async function fetchIdeationCover(idea, idx, coverContainer) {
     if (idea.cover_url) {
         coverContainer.innerHTML = `
@@ -171,7 +169,9 @@ async function fetchIdeationCover(idea, idx, coverContainer) {
         return;
     }
 
-    const icon = IDEATION_FAMILY_ICON[idea.carrier_family] || '💡';
+    // 载体家族(4 桶分类)已取消，占位图标不再按家族区分；改成标记这条选题是否
+    // 真的借鉴了本批联网参考——那是现在唯一有信息量的来源区分。
+    const icon = idea.trend_ref ? '🌐' : '💡';
     coverContainer.innerHTML = `
         <div class="ideation-cover-placeholder">
             <span class="ideation-cover-placeholder-icon">${icon}</span>
@@ -214,6 +214,79 @@ function renderIdeationTrendPanel(cardsContainer) {
     host.appendChild(panel);
 }
 
+// LLM 在激发时一次性产出 idea.beat_outline,数组长度约定为 recommended_beats + 1
+// (末条是最终 reward 揭示)。它作为软计划随「一键合成」的 dimensions 一并传给后端
+// (见 composeIdeationCard),但最终节拍仍由合成阶段的节拍阶梯硬规则裁定,所以对外
+// 一律写「预览」而不是承诺。
+function ideaBeatOutline(idea) {
+    return Array.isArray(idea && idea.beat_outline)
+        ? idea.beat_outline.map(s => String(s == null ? '' : s).trim()).filter(Boolean)
+        : [];
+}
+
+// 节拍简介入口只有一个:卡片底部的「🔨 节拍简介」按钮(见 renderIdeationCards)。
+// 卡片正文里原本还有一行计数+首拍的入口,和按钮重复,已删。
+
+// 节拍简介全量视图。卡片轨道装不下十几拍,所以完整清单只在这个弹窗里出现:
+// modal-body 自己滚动,节拍一条不落。
+function openBeatOutlineModal(index) {
+    const idea = currentIdeatedIdeas[index];
+    const modal = document.getElementById('beat-outline-modal');
+    if (!idea || !modal) return;
+
+    const beats = ideaBeatOutline(idea);
+    // 没有节拍简介的卡片(上线前激发的旧缓存卡、或这一条模型没写 beat_outline)不该
+    // 弹一个空窗:维度已经在调用方载入好了,这里只给一句能指导下一步的提示。
+    if (beats.length === 0) {
+        showToast('这张灵感卡没有节拍简介（激发时未产出），维度已载入；点右上「🎲 换一批灵感」可重新激发带节拍简介的卡片', 'info');
+        return;
+    }
+
+    const title = document.getElementById('beat-outline-modal-title');
+    if (title) title.textContent = `🔨 节拍简介 · ${idea.title || '未命名选题'}`;
+
+    const info = document.getElementById('beat-outline-modal-info');
+    if (info) {
+        const recBeats = Number.isFinite(+idea.recommended_beats) && +idea.recommended_beats > 0
+            ? `推荐 ${idea.recommended_beats} 拍${idea.beats_reason ? `（${idea.beats_reason}）` : ''} · `
+            : '';
+        // 卡片上的清单只是软计划:合成阶段的硬规则（真实施工顺序、单里程碑包、
+        // Threshold 拆分等）优先级更高,可能改写/合并/增删,这里如实说明避免误解。
+        info.textContent = `${recBeats}共 ${beats.length} 条（含末条 reward 揭示）。这是激发阶段的工序草案，`
+            + '正式合成时会按施工顺序等硬规则微调，最终节拍以合成结果为准。';
+    }
+
+    const list = document.getElementById('beat-outline-modal-list');
+    if (list) {
+        list.innerHTML = '';
+        beats.forEach((text, i) => {
+            const li = document.createElement('li');
+            // 末条按约定是 reward/揭示拍,单独标色以便一眼看到成片落点
+            if (i === beats.length - 1) li.className = 'reward';
+            li.textContent = text;
+            list.appendChild(li);
+        });
+    }
+
+    modal.classList.add('active');
+}
+
+function closeBeatOutlineModal() {
+    const modal = document.getElementById('beat-outline-modal');
+    if (modal) modal.classList.remove('active');
+}
+
+function initBeatOutlineModal() {
+    const modal = document.getElementById('beat-outline-modal');
+    if (!modal) return;
+    const closeBtn = document.getElementById('beat-outline-modal-close-btn');
+    if (closeBtn) closeBtn.addEventListener('click', closeBeatOutlineModal);
+    // 点遮罩空白处关闭(内容区不冒泡到这里)
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeBeatOutlineModal();
+    });
+}
+
 function renderIdeationCards(ideas) {
     const container = document.getElementById('ideation-cards-container');
     if (!container) return;
@@ -231,14 +304,6 @@ function renderIdeationCards(ideas) {
         card.className = 'ideation-card';
         card.dataset.index = idx;
         
-        const familyClass = idea.carrier_family || 'natural';
-        const familyText = {
-            'natural': '🌲 自然',
-            'man-made': '🏚️ 遗迹',
-            'vehicle': '🚢 载具',
-            'fantasy': '🔮 幻想'
-        }[familyClass] || '自然';
-        
         card.innerHTML = `
             <div class="ideation-card-cover" id="ideation-cover-${idx}">
                 <div class="cover-spinner">
@@ -251,7 +316,6 @@ function renderIdeationCards(ideas) {
                 <div class="ideation-card-score">${idea.score}分</div>
             </div>
             <div class="ideation-card-metadata">
-                <span class="ideation-card-tag ${familyClass}">${familyText}</span>
                 <span class="ideation-card-tag">反差强度: ${idea.score >= 23 ? '极高' : '高'}</span>
                 ${Number.isFinite(+idea.recommended_beats) && +idea.recommended_beats > 0
                     ? `<span class="ideation-card-tag beats" title="${idea.beats_reason || ''}">⏱ 推荐 ${idea.recommended_beats} 拍</span>`
@@ -264,9 +328,12 @@ function renderIdeationCards(ideas) {
                 ${idea.trend_ref ? `<div class="ideation-card-trend">🌐 趋势借鉴: ${idea.trend_ref}</div>` : ''}
             </div>
             <div class="ideation-card-actions">
-                <button type="button" class="ideation-card-btn select-action-btn">载入维度</button>
+                ${ideaBeatOutline(idea).length > 0
+                    ? `<button type="button" class="ideation-card-btn select-action-btn" title="查看该选题的全部节拍简介（共 ${ideaBeatOutline(idea).length} 拍），并把它载入下方维度">🔨 节拍简介</button>`
+                    // 这一条没产出节拍简介时退回按钮的原职责，别给一个点开是空的入口
+                    : `<button type="button" class="ideation-card-btn select-action-btn" title="这张卡激发时未产出节拍简介，点击仅载入维度">载入维度</button>`}
                 <button type="button" class="ideation-card-btn copy-action-btn">复制选题</button>
-                <button type="button" class="ideation-card-btn ledger-action-btn" title="存入创意台账候选池，供后续人工评分/追踪放量表现">📒 存入备选</button>
+                <button type="button" class="ideation-card-btn ledger-action-btn" title="激发成功后已自动存入创意台账候选池" disabled>📒 已自动入账</button>
                 <button type="button" class="ideation-card-btn primary compose-action-btn">一键合成</button>
             </div>
         `;
@@ -295,6 +362,15 @@ function renderIdeationCards(ideas) {
             selectIdeationCard(idx);
         });
         
+        // 「🔨 节拍简介」按钮（原「载入维度」）：打开全量节拍清单，同时保留原按钮的
+        // 载入维度行为——挑卡时看完工序就能直接走下方主生成按钮，不用再点一次卡片。
+        const outlineBtn = card.querySelector('.select-action-btn');
+        outlineBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            selectIdeationCard(idx);
+            openBeatOutlineModal(idx);
+        });
+
         // Clicking "一键合成" directly starts compose
         const composeBtn = card.querySelector('.compose-action-btn');
         composeBtn.addEventListener('click', (e) => {
@@ -312,31 +388,6 @@ function renderIdeationCards(ideas) {
             }).catch(() => {
                 showToast('复制失败', 'error');
             });
-        });
-
-        // Clicking "存入备选" registers this idea in the topic ledger (topic_ledger.json)
-        // as a candidate — the management/scoring layer that used-topic-ledger.md itself
-        // doesn't offer (it's a write-only burn list, see js/ledger.js header comment).
-        const ledgerBtn = card.querySelector('.ledger-action-btn');
-        ledgerBtn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            if (typeof ledgerAddCandidate !== 'function') return;
-            ledgerBtn.disabled = true;
-            const prevText = ledgerBtn.textContent;
-            ledgerBtn.textContent = '存入中…';
-            const result = await ledgerAddCandidate({
-                topic_dna: idea.dna,
-                one_line: idea.title,
-                llm_score: idea.score,
-                source: 'Ideation Pool',
-            });
-            ledgerBtn.disabled = false;
-            ledgerBtn.textContent = prevText;
-            if (result.added) {
-                showToast(`已存入创意台账候选池："${idea.title}"`, 'success');
-            } else {
-                showToast(`存入失败：${result.reason || '未知错误'}`, result.reason === '该 Topic DNA 已在台账中' ? 'info' : 'error');
-            }
         });
 
         container.appendChild(card);
@@ -362,7 +413,11 @@ function selectIdeationCard(index) {
         input_str: idea.input_str || null,
         cover_url: idea.cover_url || null,
         english_title: idea.english_title || null,
-        task_label: idea.title || null
+        task_label: idea.title || null,
+        // 随卡片一并载入，供「载入维度」后走主生成按钮时也能在合成时计次
+        // 联网参考案例库使用次数（见 app.js generateIdea 与 server.py /api/compose）
+        trend_ref: idea.trend_ref || null,
+        trend_ref_ids: idea.trend_ref_ids || []
     };
 
     // Populate slider values
@@ -405,9 +460,19 @@ function composeIdeationCard(index) {
         ratio: "50% (外壳粗野 ↔ 内里精致)",
         creativity: "脑洞大开",
         beats_count: clampRecommendedBeats(idea.recommended_beats) || 15,
+        beat_count_mode: 'adaptive',
+        // 卡片上展示的工序预览作为软计划传给后端节拍规划(硬规则优先,冲突时会被改写),
+        // 让用户挑卡时看到的工序和最终成片大体对得上
+        beat_outline: Array.isArray(idea.beat_outline)
+            ? idea.beat_outline.map(s => String(s == null ? '' : s).trim()).filter(Boolean)
+            : [],
         cover_url: idea.cover_url || null,
         english_title: idea.english_title || null,
-        topic_dna: idea.dna || null
+        topic_dna: idea.dna || null,
+        // 联网参考案例库使用计次：后端只在这条 idea 确实借鉴过参考（trend_ref
+        // 非空）时才对 trend_ref_ids 计次一次，浏览/激发阶段不算数
+        trend_ref: idea.trend_ref || null,
+        trend_ref_ids: idea.trend_ref_ids || []
     };
 
     showToast(`🚀 开始一键合成灵感: ${idea.title}...`, "success");

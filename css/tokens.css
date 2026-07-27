@@ -98,6 +98,26 @@ html[data-theme="dark"] {
     --text-muted: #8C8474;
 }
 
+/* Dark-mode shadow compensation: --ink-rgb flips to a light value (237,230,218)
+   in dark mode, so ink-rgb-based shadows would be nearly invisible. Restore deep
+   shadows on components that were previously using hardcoded rgba(0,0,0,...). */
+html[data-theme="dark"] .glass-panel:hover {
+    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.45);
+}
+html[data-theme="dark"] .drawer {
+    box-shadow: -10px 0 30px rgba(0, 0, 0, 0.5);
+}
+html[data-theme="dark"] .modal-content {
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+}
+html[data-theme="dark"] .toast {
+    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.3);
+}
+html[data-theme="dark"] .live-beats-panel,
+html[data-theme="dark"] .live-terminal-panel {
+    background: rgba(4, 6, 12, 0.85);
+}
+
 /* ==========================================================================
    Unified Layout & Viewport Reset (Page structure consistency)
    ========================================================================== */
@@ -275,7 +295,7 @@ body {
 
 .glass-panel:hover {
     border-color: var(--border-glow);
-    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+    box-shadow: 0 8px 32px 0 rgba(var(--ink-rgb), 0.10);
 }
 
 .panel-header {
@@ -426,8 +446,11 @@ html[data-theme="dark"] .switcher-item.active {
        logo block don't fit a phone row together with the switcher + controls. */
     .app-header {
         height: auto;
-        min-height: 56px;
-        gap: 8px;
+        min-height: 48px;
+        gap: 6px;
+        padding: 8px 12px;
+        border-radius: 12px;
+        margin-bottom: 10px;
     }
     .header-logo {
         gap: 8px;
@@ -445,11 +468,21 @@ html[data-theme="dark"] .switcher-item.active {
         display: none; /* Subtitle never fits on phones */
     }
     .header-controls {
-        gap: 8px;
+        gap: 6px;
         flex-shrink: 0;
     }
     .header-controls .icon-btn {
         padding: 8px 10px;
+    }
+
+    /* Compress container padding for more usable space */
+    .app-container {
+        padding: 10px;
+    }
+
+    /* System status badges are redundant on phones (info is also in dashboard) */
+    .system-status {
+        display: none;
     }
 }
 
@@ -465,4 +498,31 @@ html[data-theme="dark"] .switcher-item.active {
     .header-controls .icon-btn {
         padding: 8px;
     }
+    .app-container {
+        padding: 6px;
+    }
 }
+
+/* ==========================================================================
+   Global High-Contrast Select & Option Dropdown Rules
+   ========================================================================== */
+select option,
+select optgroup {
+    background-color: var(--bg-panel-solid, #FBF8F1);
+    color: var(--text-main, #2E2A24);
+}
+
+html[data-theme="dark"] select option,
+html[data-theme="dark"] select optgroup,
+.dark-theme select option,
+.dark-theme select optgroup {
+    background-color: var(--bg-panel-solid, #221B14);
+    color: var(--text-main, #ECE4D7);
+}
+
+select option:disabled,
+select optgroup:disabled {
+    color: var(--text-muted, #9A8F7E);
+    opacity: 0.6;
+}
+

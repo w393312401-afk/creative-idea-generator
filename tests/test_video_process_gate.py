@@ -64,11 +64,35 @@ class TestRunVideoProcessCheck(unittest.TestCase):
         self.assertTrue(reason.startswith('FAIL'))
 
 
-class TestCheckVideoProcessMapping(unittest.TestCase):
-    """档位 → 动作映射：standard 拒收 / lenient 告警放行 / off 跳过；
-    抽帧环境异常按 verify_video_anchors 同款语义（默认放行留痕、strict 拒收）。"""
+class TestCheckVideoProcessGateDisabled(unittest.TestCase):
+    """2026-07-22：视频段内过程复审按用户要求暂停——画面走向在帧序列阶段已定稿，
+    视频只管生成，不应因为这道门的误判被删片重来。默认（_VIDEO_PROCESS_GATE_DISABLED
+    = True）下 check_video_process 必须直接放行，且不做任何抽帧/VLM 调用。"""
 
     ARGS = ('vid.mp4', 's.png', 'e.png', 'prompt text')
+
+    def test_disabled_by_default_accepts_without_extraction_or_vlm(self):
+        def _boom(*a, **k):
+            raise AssertionError('复审已暂停，不应再抽帧/调用 VLM')
+        with patch.object(video_generator, '_extract_video_mid_frames', _boom), \
+             patch.object(prompt_pipeline, 'run_video_process_check', _boom):
+            action, reason = check_video_process({'qaGateLevel': 'standard'}, *self.ARGS)
+        self.assertEqual(action, 'accept')
+        self.assertTrue(reason.startswith('Skipped'))
+
+
+class TestCheckVideoProcessMapping(unittest.TestCase):
+    """档位 → 动作映射：standard 拒收 / lenient 告警放行 / off 跳过；
+    抽帧环境异常按 verify_video_anchors 同款语义（默认放行留痕、strict 拒收）。
+    该复审门当前被 _VIDEO_PROCESS_GATE_DISABLED 短路（见上面的测试类），这里
+    通过临时打开开关来验证档位映射逻辑本身仍然完好，方便日后恢复。"""
+
+    ARGS = ('vid.mp4', 's.png', 'e.png', 'prompt text')
+
+    def setUp(self):
+        patcher = patch.object(video_generator, '_VIDEO_PROCESS_GATE_DISABLED', False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_off_level_short_circuits_before_extraction(self):
         def _boom(*a, **k):

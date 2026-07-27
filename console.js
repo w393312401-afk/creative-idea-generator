@@ -21,6 +21,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const navItems = document.querySelectorAll('.nav-item');
   const tabContents = document.querySelectorAll('.tab-content');
   const pageTitleLabel = document.getElementById('page-title-label');
+  const pageTitleDesc = document.getElementById('page-title-desc');
   const localTokenInput = document.getElementById('local-token-input');
   
   // Status badges
@@ -139,8 +140,8 @@ document.addEventListener('DOMContentLoaded', () => {
         "tryNowType": "video"
     },
     {
-        "name": "gemini-3.5-flash",
-        "displayName": "gemini-3.5-flash",
+        "name": "gemini-3.6-flash-high",
+        "displayName": "gemini-3.6-flash-high",
         "provider": "Google",
         "providerDisplay": "Google",
         "type": "text",
@@ -260,8 +261,8 @@ document.addEventListener('DOMContentLoaded', () => {
         "tryNowType": "text"
     },
     {
-        "name": "gemini-3-flash-agent",
-        "displayName": "gemini-3-flash-agent",
+        "name": "gemini-3.6-flash-high",
+        "displayName": "gemini-3.6-flash-high",
         "provider": "Google",
         "providerDisplay": "Google",
         "type": "text",
@@ -579,6 +580,9 @@ document.addEventListener('DOMContentLoaded', () => {
     item.addEventListener('click', () => {
       const targetTab = item.getAttribute('data-tab');
       swapTab(targetTab);
+      if (window.history && window.history.replaceState) {
+        window.history.replaceState(null, '', `#${targetTab}`);
+      }
     });
   });
 
@@ -606,11 +610,29 @@ document.addEventListener('DOMContentLoaded', () => {
     // Update header title
     const labelMap = {
       'dashboard': '控制台仪表盘',
+      'google-fx': 'Google FX 服务管理',
       'models': '可用模型中心',
       'docs': 'API 交互文档',
       'playground': '接口测试沙盒'
     };
+    const descMap = {
+      'dashboard': '监控后台任务、系统状态并管理可用 AI 模型与 API 接口',
+      'google-fx': '管理 Flow 自动化运行时、AdsPower 连接、账号池与浏览器任务队列',
+      'models': '浏览当前可用模型、能力标签与计费信息',
+      'docs': '查看 SPARK API 请求格式与调用示例',
+      'playground': '直接构造请求并检查 API 返回结果'
+    };
     pageTitleLabel.textContent = labelMap[activeTab] || '开发者中心';
+    if (pageTitleDesc) pageTitleDesc.textContent = descMap[activeTab] || '';
+    if (globalThis.GoogleFxConsole) {
+      if (activeTab === 'google-fx') globalThis.GoogleFxConsole.activate();
+      else globalThis.GoogleFxConsole.deactivate();
+    }
+  }
+
+  const requestedTab = window.location.hash.replace(/^#/, '');
+  if (requestedTab && Array.from(navItems).some(item => item.getAttribute('data-tab') === requestedTab)) {
+    swapTab(requestedTab);
   }
 
   // 3. Status Checking & Dynamic Dashboard
@@ -1149,7 +1171,7 @@ document.addEventListener('DOMContentLoaded', () => {
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${keyString}" \\
   -d '{
-    "model": "gemini-3-flash-agent",
+    "model": "gemini-3.6-flash-high",
     "messages": [
       {"role": "system", "content": "You are a creative assistant."},
       {"role": "user", "content": "设计一个废弃巴士的改造点子"}
@@ -1165,7 +1187,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gemini-3-flash-agent",
+    model="gemini-3.6-flash-high",
     messages=[
         {"role": "user", "content": "设计一个废弃巴士的改造点子"}
     ]
@@ -1179,7 +1201,7 @@ print(response.choices[0].message.content)`;
     "Authorization": "Bearer ${keyString}"
   },
   body: JSON.stringify({
-    model: "gemini-3-flash-agent",
+    model: "gemini-3.6-flash-high",
     messages: [{"role": "user", "content": "设计一个废弃巴士的改造点子"}]
   })
 })

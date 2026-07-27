@@ -43,12 +43,60 @@
 
 ## ⚙️ 配置说明
 
-*   **Python 依赖**：首次部署请先执行 `pip install -r requirements.txt`（Pillow / requests）。
+*   **Python 依赖**：首次部署请先执行 `pip install -r requirements.txt`（包含 Pillow、Playwright、Pydantic 等）。
 *   **配置文件**：`server_config.json`（实际运行配置，已加入 `.gitignore` 避免密钥泄露）
 *   **配置模板**：[server_config.example.json](file:///c:/Users/video/Desktop/creative-idea-generator/server_config.example.json)
     *   包含 API 密钥、访问密码以及各类服务端参数配置。首次部署时请参考模板新建 `server_config.json` / [server_config.json](file:///c:/Users/video/Desktop/creative-idea-generator/server_config.json)。
-    *   `adspowerPath`：AdsPower 自动化脚本目录（google_fx 帧序列/视频生成依赖），换机部署时必须改成本机路径。
+    *   `skillDir`：技能包（`restoration-prompt-composer`）的本地目录，换机部署时最容易漏配的一项（见下方「技能包路径」）。
+    *   `adsPowerPort`：AdsPower 本地 API 端口（默认 `50325`）。Google FX 运行时已内置在 `integrations/google_fx/`，换机不再需要配置外部源码路径。
     *   `accessCode` 设置后，除 `/api/mode` 外的全部 API（含任务/日志/清单读取）都需要访问码；静态路由永不吐出配置、日志、任务与服务端源码。
+
+### 技能包路径（skillDir）
+
+激发创意与提示词合成都要现读技能包里的 8 个契约文件（`SKILL.md` 与 `references/` 下的形态矩阵 `idea-engine.md`、提示词模板 `prompt-templates.md`、历史选题台账 `used-topic-ledger.md`、三份一致性协议、空间工序表）。**这些文件缺失不会报错**，只会让合成按空契约降级——创意维度变窄、模板与一致性约束整段消失。所以启动日志与前端横幅都会把缺失清单喊出来。
+
+在 `server_config.json` 里指定路径即可：
+
+```json
+{ "skillDir": "~/.codex/skills/restoration-prompt-composer" }
+```
+
+*   支持 `~`、环境变量，以及相对本项目根目录的相对路径（如 `skills/restoration-prompt-composer`）。
+*   **改完不用重启**：服务会在配置文件 mtime 变化时重算，下一次「激发创意」/合成即按新路径读取。
+*   取值优先级：环境变量 `SKILL_DIR` > `skillDir` > 内置默认 `~/.codex/skills/restoration-prompt-composer` > 自动探测。
+*   自动探测只在前三项都没有契约文件时兜底：扫 `~/.codex/skills`、`~/.claude/skills`、`~/.agents/skills`、`<项目>/skills` 的一级子目录，挑契约命中最多（≥2 个）的那个包——技能包被改名或装到别的 agent 目录时能自动捡回来。
+*   显式配了 `skillDir`/`SKILL_DIR` 就绝不再自动探测：路径写错要在启动日志里看得见地报缺失，而不是被悄悄换成另一个技能包。
+
+### 合成节拍输入
+
+`/api/compose` 的 `dimensions` 支持 `beat_count_mode`：
+
+- `adaptive`（默认）：`beats_count` 是施工里程碑上限；规划器会删除局部填充拍，实际拍数以返回槽位数为准。
+- `fixed`：`beats_count` 保持精确施工拍数；仍须通过显著里程碑门禁，不会用弱变化静默凑数。
+
+每个普通施工拍都生成一个完整、可命名的阶段成果，并在 VIDEO 中同时声明主体增长与物料/库存变化两条进度线。
+
+### Google FX 内置运行时
+
+Google FX 的图片、视频、积分探测、浏览器控制与号池运行时代码已收进
+`integrations/google_fx/`。项目不再依赖 `N8N-main/Adspower/AI/core`，也不再通过
+`adspowerPath` 修改 Python 导入路径。AdsPower 桌面应用、浏览器 profile 和登录会话仍然
+保持外置；换机时安装 AdsPower，并在 `server_config.json` 确认 `adsPowerPort` 即可。
+
+底层 FX 环境变量及号池状态放在 Git 忽略的 `runtime/` 目录。代码边界和维护规则详见
+`integrations/google_fx/README.md`。
+
+控制台的「Google FX 管理」页提供运行时/AdsPower 健康状态、模型摘要、账号池维护、
+积分刷新、冷却解除、任务取消与选择器漂移诊断；它不会显示或编辑密码、Cookie 和 `.env`。
+所有帧、视频、分步渲染和自动管线统一进入可观测的浏览器队列，并支持调整等待任务优先级：
+
+- `暂停`：拒绝新任务，同时暂停等待队列调度；当前已运行任务不被强杀。
+- `排空`：拒绝新任务，但继续执行现有等待任务，适合维护前收尾。
+- `恢复`：重新接收并调度任务。
+
+页面中的「运行配置」只开放 AdsPower 端口、图片/视频模型、Omni 时长、换号节拍和最低
+积分等非敏感白名单字段。修改会原子写入 `server_config.json`、立即热生效并记录到
+`runtime/fx_audit.jsonl`，也可一键回滚最近一次修改。
 
 ---
 

@@ -9,77 +9,509 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
+from PIL import Image
+
 import server_common
+import frame_generator
 import prompt_pipeline as pp
 import pipeline_orchestrator as po
+from frame_generator import QuotaExhaustedError
 
 
-class TestSequenceReviewSystemPromptStageScope(unittest.TestCase):
-    """回归防护：GLOBAL STAGE DELTA veto 已被 STAGE SCOPE FIDELITY / DRIFT 两条规则取代
-    （见 stage_scope 三档配额改动），确保这两条规则文本不会被后续改动误删。"""
+class TestSequenceReviewSystemPromptMilestones(unittest.TestCase):
+    """回归防护：整套实图审查必须鼓励每拍显著完成，而不是恢复旧的一拍大变化配额。
+    2026-07-23 改版后这些规则活在局部逐拍审查里（见 _local_beat_review_system_prompt），
+    全局稀疏审查（_global_review_system_prompt）只保留跨帧规则，不应包含它们。"""
 
-    def test_stage_scope_rules_present_and_old_veto_gone(self):
-        prompt = pp._sequence_review_system_prompt(10)
-        self.assertIn('STAGE SCOPE FIDELITY', prompt)
-        self.assertIn('STAGE SCOPE DRIFT & STALLED PROGRESSION', prompt)
-        self.assertIn('MORE THAN ONE beat', prompt)
+    def test_local_system_prompt_is_beat_independent_and_cacheable(self):
+        """2026-07-25：拍号移出 system prompt（规则正文改用 IMAGE A / IMAGE B 别名），
+        整单所有逐拍调用共用同一份前缀，prompt 缓存才可能命中。"""
+        with patch.object(pp, '_multimodal_chat', return_value='[]') as chat:
+            pp.check_beat_consistency({}, 'prompt block', 2, 9, 'a', 'b')
+            pp.check_beat_consistency({}, 'prompt block', 7, 9, 'c', 'd')
+            first, second = chat.call_args_list[0].args[1], chat.call_args_list[1].args[1]
+        self.assertEqual(first, second)  # 逐拍之间 system prompt 必须逐字一致
+
+        prompt = pp._local_beat_review_system_prompt()
+        self.assertNotIn('beat 2 of', prompt)
+        self.assertIn('IMAGE A', prompt)     # 本拍两张图改用稳定别名指代
+        self.assertIn('IMAGE B', prompt)
+        # 但必须要求模型在输出里用真实帧号，否则人在帧网格里对不上是哪一张
+        self.assertIn('real names', prompt)
+
+    def test_beat_number_and_final_beat_flag_live_in_the_user_turn(self):
+        with patch.object(pp, '_multimodal_chat', return_value='[]') as chat:
+            pp.check_beat_consistency({}, 'prompt block', 3, 10, 'a.webp', 'b.webp')
+            user_text = chat.call_args.args[2]
+        self.assertIn('beat 3 of 10', user_text)
+        self.assertIn('IMAGE 3', user_text)
+        self.assertIn('IMAGE 4', user_text)
+        self.assertIn('is NOT the final beat', user_text)
+
+        with patch.object(pp, '_multimodal_chat', return_value='[]') as chat:
+            pp.check_beat_consistency({}, 'prompt block', 10, 10, 'a.webp', 'b.webp')
+        self.assertIn('IS the final beat', chat.call_args.args[2])
+
+    def test_visible_milestone_and_package_rules_present_in_local_prompt(self):
+        prompt = pp._local_beat_review_system_prompt()
+        self.assertIn('VISIBLE MILESTONE FIDELITY', prompt)
+        self.assertIn('SINGLE MILESTONE PACKAGE RULE', prompt)
+        self.assertIn('DUAL PROGRESS FIDELITY', prompt)
+        self.assertIn('Multiple decisive completion jumps', prompt)
         self.assertNotIn('GLOBAL STAGE DELTA', prompt)
+        self.assertNotIn('MORE THAN ONE beat', prompt)
+        # 证据门槛：要求"仅凭这两张图"+不确定就别报，这是压假阳性的关键措辞
+        self.assertIn('CONCRETE visible detail', prompt)
+        self.assertIn('do NOT report it', prompt)
+
+    def test_global_prompt_only_has_cross_frame_rules(self):
+        prompt = pp._global_review_system_prompt(10)
+        self.assertIn('NGCS coordinate lock', prompt)
+        self.assertIn('Consistent Scene & Layout', prompt)
+        self.assertIn('Material Continuity', prompt)
+        self.assertIn('CARRIER IDENTITY', prompt)
+        # 局部规则不该混进全局审查——规则数收窄正是这次改版要解决的稀释问题
+        self.assertNotIn('VISIBLE MILESTONE FIDELITY', prompt)
+        self.assertNotIn('UNEXPLAINED ANCHOR DELTA', prompt)
+        self.assertNotIn('WORKER TEMPLATE CONSISTENCY', prompt)
 
 
-class TestCheckFullSequenceConsistency(unittest.TestCase):
+class TestCheckBeatConsistency(unittest.TestCase):
+    """逐拍局部审查的 JSON 解析契约：单条列表 = 该拍违规，[] = 干净，None = 没跑成。"""
+
+    def test_clean_list_response_means_no_issues(self):
+        with patch.object(pp, '_multimodal_chat', return_value='[]') as chat:
+            issues = pp.check_beat_consistency({}, 'prompt block', 2, 5, 'a.webp', 'b.webp')
+        self.assertEqual(issues, [])
+        chat.assert_called_once()
+        self.assertEqual(chat.call_args.args[3], ['a.webp', 'b.webp'])
+
+    def test_violations_list_is_parsed(self):
+        raw = json.dumps(['天花板未随墙面一起封板'])
+        with patch.object(pp, '_multimodal_chat', return_value=raw):
+            issues = pp.check_beat_consistency({}, 'prompt block', 2, 5, 'a.webp', 'b.webp')
+        self.assertEqual(issues, ['天花板未随墙面一起封板'])
+
+    def test_dict_shaped_response_falls_back_gracefully(self):
+        # 万一模型仍按旧的 {beat: [...]} 形状回复，容错取出对应 beat 的列表
+        raw = json.dumps({'2': ['issue A']})
+        with patch.object(pp, '_multimodal_chat', return_value=raw):
+            issues = pp.check_beat_consistency({}, 'prompt block', 2, 5, 'a.webp', 'b.webp')
+        self.assertEqual(issues, ['issue A'])
+
+    def test_malformed_json_returns_none_not_clean(self):
+        with patch.object(pp, '_multimodal_chat', return_value='not json'):
+            issues = pp.check_beat_consistency({}, 'prompt block', 2, 5, 'a.webp', 'b.webp')
+        self.assertIsNone(issues)
+
+    def test_exception_returns_none(self):
+        with patch.object(pp, '_multimodal_chat', side_effect=RuntimeError('gateway down')):
+            issues = pp.check_beat_consistency({}, 'prompt block', 2, 5, 'a.webp', 'b.webp')
+        self.assertIsNone(issues)
+
+    def test_truncated_response_is_reported_as_truncation_not_gateway_failure(self):
+        """2026-07-25：撞 max_tokens 被截断的半截 JSON 此前和网关故障混为一谈，
+        "违规多到写不下"会被当成基础设施异常、还触发整批降级重跑。"""
+        payload = json.dumps({
+            'choices': [{'finish_reason': 'length', 'message': {'content': '["半截'}}],
+            'usage': {},
+        }).encode()
+        with patch.object(pp, '_execute_request_with_retry', return_value=payload), \
+             patch.object(pp, 'resolve_gateway', return_value=('http://gw', 'k')):
+            with self.assertRaises(pp.ResponseTruncated):
+                pp._multimodal_chat({}, 'sys', 'user', [], max_tokens=10)
+
+
+class TestCheckGlobalSequenceConsistency(unittest.TestCase):
+    """全局稀疏审查沿用原 check_full_sequence_consistency 的单次多模态调用契约，
+    只是规则子集变窄——这部分测试直接照搬原先针对单次调用的解析用例。"""
+
     def test_empty_prompt_block_or_no_frames_short_circuits(self):
-        self.assertEqual(pp.check_full_sequence_consistency({}, '', {1: 'a.webp'}), {})
-        self.assertEqual(pp.check_full_sequence_consistency({}, 'some prompt', {}), {})
+        self.assertEqual(pp.check_global_sequence_consistency({}, '', {1: 'a.webp'}), {})
+        self.assertEqual(pp.check_global_sequence_consistency({}, 'some prompt', {}), {})
 
     def test_clean_json_response_means_no_failures(self):
         with patch.object(pp, '_multimodal_chat', return_value='{}') as chat:
-            failures = pp.check_full_sequence_consistency(
+            failures = pp.check_global_sequence_consistency(
                 {}, 'prompt block text', {1: 'a.webp', 2: 'b.webp'})
         self.assertEqual(failures, {})
         chat.assert_called_once()
-        # 图片路径按 sequence 升序传入，且系统提示词按 total_beats 生成
         self.assertEqual(chat.call_args.args[3], ['a.webp', 'b.webp'])
 
     def test_violations_are_parsed_and_beat_indices_coerced(self):
-        raw = json.dumps({'2': ['天花板未随墙面一起封板'], '5': ['视角跳切']})
+        raw = json.dumps({'2': ['载体身份丢失'], '5': ['视角跳切']})
         with patch.object(pp, '_multimodal_chat', return_value=raw):
-            failures = pp.check_full_sequence_consistency(
+            failures = pp.check_global_sequence_consistency(
                 {}, 'prompt block text', {1: 'a', 2: 'b', 3: 'c'})
         # total_beats = 2 (3 images - 1); beat 5 is out of range and must be dropped
-        self.assertEqual(failures, {2: ['天花板未随墙面一起封板']})
+        self.assertEqual(failures, {2: ['载体身份丢失']})
 
     def test_out_of_range_and_non_list_entries_are_dropped(self):
         raw = json.dumps({'1': ['ok'], '99': ['out of range'], 'x': 'not a list'})
         with patch.object(pp, '_multimodal_chat', return_value=raw):
-            failures = pp.check_full_sequence_consistency(
+            failures = pp.check_global_sequence_consistency(
                 {}, 'prompt block text', {1: 'a', 2: 'b'})
         self.assertEqual(failures, {1: ['ok']})
 
     def test_malformed_json_returns_none_not_pass(self):
-        # 响应不可解析 = 审查没跑成，必须返回 None 哨兵；返回 {} 会被当"审查通过"
-        # 盖 sequence_reviewed_pass 假章（2026-07-15 盐湖贝壳单事故根源）
         with patch.object(pp, '_multimodal_chat', return_value='not json at all'):
-            failures = pp.check_full_sequence_consistency(
+            failures = pp.check_global_sequence_consistency(
                 {}, 'prompt block text', {1: 'a', 2: 'b'})
         self.assertIsNone(failures)
 
     def test_multimodal_chat_exception_returns_none_not_pass(self):
         with patch.object(pp, '_multimodal_chat', side_effect=RuntimeError('gateway down')):
-            failures = pp.check_full_sequence_consistency(
+            failures = pp.check_global_sequence_consistency(
                 {}, 'prompt block text', {1: 'a', 2: 'b'})
         self.assertIsNone(failures)
 
     def test_degraded_mode_extends_timeout_and_still_parses(self):
         with patch.object(pp, '_multimodal_chat', return_value='{}') as chat, \
              patch.object(pp, '_compress_frames_for_review', side_effect=lambda paths, **kw: paths) as comp:
-            failures = pp.check_full_sequence_consistency(
+            failures = pp.check_global_sequence_consistency(
                 {}, 'prompt block text', {1: 'a', 2: 'b'}, degraded=True)
         self.assertEqual(failures, {})
         comp.assert_called_once()
         self.assertEqual(chat.call_args.kwargs.get('timeout'), 180)
+
+
+class TestVerifyReviewViolation(unittest.TestCase):
+    def test_confirmed_true(self):
+        with patch.object(pp, '_multimodal_chat', return_value='{"confirmed": true}'):
+            self.assertTrue(pp._verify_review_violation({}, 'issue text', ['a.webp']))
+
+    def test_confirmed_false(self):
+        with patch.object(pp, '_multimodal_chat', return_value='{"confirmed": false}'):
+            self.assertFalse(pp._verify_review_violation({}, 'issue text', ['a.webp']))
+
+    def test_malformed_response_returns_none(self):
+        with patch.object(pp, '_multimodal_chat', return_value='not json'):
+            self.assertIsNone(pp._verify_review_violation({}, 'issue text', ['a.webp']))
+
+    def test_exception_returns_none(self):
+        with patch.object(pp, '_multimodal_chat', side_effect=RuntimeError('gateway down')):
+            self.assertIsNone(pp._verify_review_violation({}, 'issue text', ['a.webp']))
+
+
+class TestCheckFullSequenceConsistency(unittest.TestCase):
+    """三层编排（局部逐拍 + 全局稀疏 + 二次复核）——mock 三个子函数而非
+    _multimodal_chat，隔离编排逻辑本身的测试和三个子函数各自的解析契约。
+
+    2026-07-25 起返回 {'failures':..., 'unreviewed_beats':..., 'global_reviewed':...}：
+    "审过且干净"与"压根没审成"必须能被调用方区分开，见 test_partial_local_failure_*。"""
+
+    def test_empty_prompt_block_or_no_frames_short_circuits(self):
+        for args in (('', {1: 'a.webp'}), ('some prompt', {})):
+            result = pp.check_full_sequence_consistency({}, *args)
+            self.assertEqual(result['failures'], {})
+            self.assertEqual(result['unreviewed_beats'], [])
+            self.assertTrue(result['global_reviewed'])
+
+    def test_all_clean_means_no_failures_and_nothing_unreviewed(self):
+        with patch.object(pp, 'check_beat_consistency', return_value=[]) as local, \
+             patch.object(pp, 'check_global_sequence_consistency', return_value={}) as glob:
+            result = pp.check_full_sequence_consistency(
+                {}, 'prompt block', {1: 'a', 2: 'b', 3: 'c'})
+        self.assertEqual(result['failures'], {})
+        self.assertEqual(result['unreviewed_beats'], [])
+        self.assertTrue(result['global_reviewed'])
+        self.assertEqual(local.call_count, 2)  # total_beats = 2
+        glob.assert_called_once()
+
+    def test_local_violation_confirmed_by_verifier_is_kept(self):
+        def fake_local(config, prompt_block, beat, total, before, after, timeout=60):
+            return ['issue at beat 1'] if beat == 1 else []
+        with patch.object(pp, 'check_beat_consistency', side_effect=fake_local), \
+             patch.object(pp, 'check_global_sequence_consistency', return_value={}), \
+             patch.object(pp, '_verify_review_violation', return_value=True) as verify:
+            result = pp.check_full_sequence_consistency({}, 'prompt block', {1: 'a', 2: 'b', 3: 'c'})
+        self.assertEqual(result['failures'], {1: ['issue at beat 1']})
+        verify.assert_called_once()
+
+    def test_local_violation_rejected_by_verifier_is_dropped(self):
+        # 这是压"硬塞问题"假阳性的关键路径：初审标了，复核否了，最终不计入结果
+        def fake_local(config, prompt_block, beat, total, before, after, timeout=60):
+            return ['spurious issue'] if beat == 1 else []
+        with patch.object(pp, 'check_beat_consistency', side_effect=fake_local), \
+             patch.object(pp, 'check_global_sequence_consistency', return_value={}), \
+             patch.object(pp, '_verify_review_violation', return_value=False):
+            result = pp.check_full_sequence_consistency({}, 'prompt block', {1: 'a', 2: 'b', 3: 'c'})
+        self.assertEqual(result['failures'], {})
+
+    def test_verifier_infra_failure_keeps_candidate_conservatively(self):
+        # verify 返回 None（复核调用本身没跑成）不能悄悄抹掉初审抓到的问题，
+        # 否则又滑回"找不到问题"——保守起见按"保留"处理
+        with patch.object(pp, 'check_beat_consistency', return_value=['issue']), \
+             patch.object(pp, 'check_global_sequence_consistency', return_value={}), \
+             patch.object(pp, '_verify_review_violation', return_value=None):
+            result = pp.check_full_sequence_consistency({}, 'prompt block', {1: 'a', 2: 'b'})
+        self.assertEqual(result['failures'], {1: ['issue']})
+
+    def test_global_violation_confirmed_is_attributed_to_its_beat(self):
+        with patch.object(pp, 'check_beat_consistency', return_value=[]), \
+             patch.object(pp, 'check_global_sequence_consistency',
+                          return_value={2: ['载体身份丢失']}), \
+             patch.object(pp, '_verify_review_violation', return_value=True):
+            result = pp.check_full_sequence_consistency(
+                {}, 'prompt block', {1: 'a', 2: 'b', 3: 'c'})
+        self.assertEqual(result['failures'], {2: ['载体身份丢失']})
+
+    def test_local_layer_totally_failing_still_uses_global_result(self):
+        # 单拍/全部局部审查抖动不该拖累整批——只要全局层跑成，仍按拿到的信号处理，
+        # 但没审成的拍必须如实出现在 unreviewed_beats 里
+        with patch.object(pp, 'check_beat_consistency', return_value=None), \
+             patch.object(pp, 'check_global_sequence_consistency',
+                          return_value={1: ['全局问题']}), \
+             patch.object(pp, '_verify_review_violation', return_value=True):
+            result = pp.check_full_sequence_consistency({}, 'prompt block', {1: 'a', 2: 'b'})
+        self.assertEqual(result['failures'], {1: ['全局问题']})
+        self.assertEqual(result['unreviewed_beats'], [1])
+
+    def test_global_layer_totally_failing_still_uses_local_result(self):
+        with patch.object(pp, 'check_beat_consistency', return_value=['本地问题']), \
+             patch.object(pp, 'check_global_sequence_consistency', return_value=None), \
+             patch.object(pp, '_verify_review_violation', return_value=True):
+            result = pp.check_full_sequence_consistency({}, 'prompt block', {1: 'a', 2: 'b'})
+        self.assertEqual(result['failures'], {1: ['本地问题']})
+        self.assertFalse(result['global_reviewed'])
+
+    def test_partial_local_failure_is_reported_not_swallowed(self):
+        """回归防护（2026-07-25）：11 拍里第 2 拍超时、其余干净、跨帧层跑成时，旧实现
+        直接返回空 failures，第 2 拍涉及的帧于是被盖 sequence_reviewed_pass 假章——
+        与 2026-07-15 盐湖贝壳单同款 fail-open，只是粒度缩到单拍。"""
+        def fake_local(config, prompt_block, beat, total, before, after, timeout=60):
+            return None if beat == 2 else []
+        with patch.object(pp, 'check_beat_consistency', side_effect=fake_local), \
+             patch.object(pp, 'check_global_sequence_consistency', return_value={}):
+            result = pp.check_full_sequence_consistency(
+                {}, 'prompt block', {1: 'a', 2: 'b', 3: 'c', 4: 'd'})
+        self.assertEqual(result['failures'], {})
+        self.assertEqual(result['unreviewed_beats'], [2])
+        self.assertTrue(result['global_reviewed'])
+
+    def test_cancellation_propagates_instead_of_looking_like_infra_failure(self):
+        """回归防护（2026-07-25）：GenerationCancelled 继承 ConnectionError → Exception，
+        此前被逐拍的 except Exception 吞成"本拍没跑成"，审查会跑完全部拍次、再整批降级
+        重跑，最后把每一帧都标成未审查——用户点一次取消就清零了全部真实结论。"""
+        with patch.object(pp, 'check_beat_consistency',
+                          side_effect=server_common.GenerationCancelled('cancelled')), \
+             patch.object(pp, 'check_global_sequence_consistency',
+                          side_effect=AssertionError('取消后不该继续跑跨帧层')):
+            with self.assertRaises(server_common.GenerationCancelled):
+                pp.check_full_sequence_consistency({}, 'prompt block', {1: 'a', 2: 'b'})
+
+    def test_both_layers_failing_returns_none_not_pass(self):
+        # 两层都没跑成才如实报告"没审成"——绝不能 fail-open 成"无违规"
+        # （2026-07-15 盐湖贝壳单事故根源）
+        with patch.object(pp, 'check_beat_consistency', return_value=None), \
+             patch.object(pp, 'check_global_sequence_consistency', return_value=None):
+            failures = pp.check_full_sequence_consistency({}, 'prompt block', {1: 'a', 2: 'b'})
+        self.assertIsNone(failures)
+
+    def test_degraded_mode_compresses_local_pair_and_passes_through(self):
+        with patch.object(pp, 'check_beat_consistency', return_value=[]) as local, \
+             patch.object(pp, 'check_global_sequence_consistency', return_value={}), \
+             patch.object(pp, '_compress_frames_for_review',
+                          side_effect=lambda paths, **kw: [f'compressed-{p}' for p in paths]):
+            pp.check_full_sequence_consistency({}, 'prompt block', {1: 'a', 2: 'b'}, degraded=True)
+        self.assertEqual(local.call_args.args[4:6], ('compressed-a', 'compressed-b'))
+        self.assertEqual(local.call_args.kwargs.get('timeout'), 120)
+
+
+class TestReviewParallelism(unittest.TestCase):
+    """逐拍审查并发化（2026-07-25）：11 拍串行、每拍 60s 超时的审查此前要跑几分钟，
+    期间没有任何进度、也拦不住取消。并发化必须同时守住三样线程局部的东西：取消 sink、
+    上游广播 sink、token 记账——它们都是 threading.local，裸线程池会静默弄丢。"""
+
+    def _paths(self, n):
+        return {i: f'f{i}' for i in range(1, n + 1)}
+
+    def test_beats_run_concurrently(self):
+        seen_threads = set()
+        barrier_lock = threading.Lock()
+
+        def fake_local(config, prompt_block, beat, total, before, after, timeout=60):
+            with barrier_lock:
+                seen_threads.add(threading.current_thread().name)
+            time.sleep(0.02)
+            return []
+
+        with patch.object(pp, 'check_beat_consistency', side_effect=fake_local), \
+             patch.object(pp, 'check_global_sequence_consistency', return_value={}):
+            pp.check_full_sequence_consistency({}, 'prompt block', self._paths(6))
+        self.assertGreater(len(seen_threads), 1)
+
+    def test_concurrency_one_falls_back_to_serial(self):
+        with patch.object(pp, 'check_beat_consistency', return_value=[]) as local, \
+             patch.object(pp, 'check_global_sequence_consistency', return_value={}):
+            pp.check_full_sequence_consistency({'reviewConcurrency': 1}, 'prompt block',
+                                               self._paths(4))
+        self.assertEqual(local.call_count, 3)
+
+    def test_worker_threads_inherit_cancel_and_upstream_sinks(self):
+        """子线程里 _execute_request_with_retry 必须还能看到取消回调——看不到的话
+        取消按钮在整段审查期间又变成"点了没用"。"""
+        seen = []
+
+        def fake_local(config, prompt_block, beat, total, before, after, timeout=60):
+            seen.append(frame_generator.current_thread_sinks())
+            return []
+
+        frame_generator.set_cancel_check_sink(lambda: False)
+        frame_generator.set_upstream_event_sink(lambda ev: None)
+        try:
+            with patch.object(pp, 'check_beat_consistency', side_effect=fake_local), \
+                 patch.object(pp, 'check_global_sequence_consistency', return_value={}):
+                pp.check_full_sequence_consistency({}, 'prompt block', self._paths(4))
+        finally:
+            frame_generator.set_cancel_check_sink(None)
+            frame_generator.set_upstream_event_sink(None)
+
+        self.assertEqual(len(seen), 3)
+        for upstream, cancel in seen:
+            self.assertIsNotNone(cancel)
+            self.assertIsNotNone(upstream)
+
+    def test_token_usage_from_worker_threads_is_merged_back(self):
+        """_usage_tracker 也是 threading.local：不并回父线程的话，整段并发审查的
+        token 消耗在任务结算里会凭空消失。"""
+        def fake_local(config, prompt_block, beat, total, before, after, timeout=60):
+            pp._record_tokens({'prompt_tokens': 10, 'completion_tokens': 1, 'total_tokens': 11})
+            return []
+
+        pp.start_accounting()
+        try:
+            with patch.object(pp, 'check_beat_consistency', side_effect=fake_local), \
+                 patch.object(pp, 'check_global_sequence_consistency', return_value={}):
+                pp.check_full_sequence_consistency({}, 'prompt block', self._paths(4))
+            stats = pp.stop_and_get_accounting()
+        finally:
+            pp._usage_tracker.active = False
+        self.assertEqual(stats['api_calls'], 3)
+        self.assertEqual(stats['total_tokens'], 33)
+
+    def test_cancellation_inside_a_worker_aborts_the_whole_review(self):
+        def fake_local(config, prompt_block, beat, total, before, after, timeout=60):
+            if beat == 2:
+                raise server_common.GenerationCancelled('cancelled')
+            return []
+
+        with patch.object(pp, 'check_beat_consistency', side_effect=fake_local), \
+             patch.object(pp, 'check_global_sequence_consistency',
+                          side_effect=AssertionError('取消后不该继续跑跨帧层')):
+            with self.assertRaises(server_common.GenerationCancelled):
+                pp.check_full_sequence_consistency({}, 'prompt block', self._paths(5))
+
+    def test_per_beat_progress_events_are_emitted(self):
+        events = []
+
+        def fake_local(config, prompt_block, beat, total, before, after, timeout=60):
+            return ['问题'] if beat == 2 else []
+
+        with patch.object(pp, 'check_beat_consistency', side_effect=fake_local), \
+             patch.object(pp, 'check_global_sequence_consistency', return_value={}), \
+             patch.object(pp, '_verify_review_violation', return_value=True):
+            pp.check_full_sequence_consistency(
+                {}, 'prompt block', self._paths(4),
+                on_progress=lambda stage, data: events.append((stage, data)))
+
+        beats = [d for s, d in events if s == 'sequence_review_beat']
+        self.assertEqual(sorted(d['beat'] for d in beats), [1, 2, 3])
+        flagged = [d for d in beats if d['beat'] == 2][0]
+        self.assertTrue(flagged['reviewed'])
+        self.assertEqual(flagged['issues'], ['问题'])
+
+    def test_on_progress_raising_cancel_stops_remaining_beats(self):
+        def on_progress(stage, data):
+            raise server_common.GenerationCancelled('用户取消')
+
+        with patch.object(pp, 'check_beat_consistency', return_value=[]), \
+             patch.object(pp, 'check_global_sequence_consistency',
+                          side_effect=AssertionError('取消后不该继续跑跨帧层')):
+            with self.assertRaises(server_common.GenerationCancelled):
+                pp.check_full_sequence_consistency({}, 'prompt block', self._paths(6),
+                                                   on_progress=on_progress)
+
+    def test_only_beats_reviews_just_those_and_skips_global(self):
+        called = []
+
+        def fake_local(config, prompt_block, beat, total, before, after, timeout=60):
+            called.append(beat)
+            return []
+
+        with patch.object(pp, 'check_beat_consistency', side_effect=fake_local), \
+             patch.object(pp, 'check_global_sequence_consistency',
+                          side_effect=AssertionError('skip_global 时不该跑跨帧层')):
+            result = pp.check_full_sequence_consistency(
+                {}, 'prompt block', self._paths(6), only_beats=[2, 4], skip_global=True)
+        self.assertEqual(sorted(called), [2, 4])
+        self.assertEqual(result['unreviewed_beats'], [])
+        self.assertFalse(result['global_reviewed'])
+
+    def test_global_violation_verified_against_its_own_beat_not_all_frames(self):
+        """回归防护（2026-07-25）：跨帧违规的二次复核此前把全套帧图又喂了一遍——
+        复核的全部意义就是窄口径只验这一条，喂全套既贵又正好触发要避免的注意力稀释。
+        现在只带这一拍的两张 + IMAGE 1（跨帧规则的身份基准）。"""
+        verify_calls = []
+
+        with patch.object(pp, 'check_beat_consistency', return_value=[]), \
+             patch.object(pp, 'check_global_sequence_consistency',
+                          return_value={3: ['载体身份丢失']}), \
+             patch.object(pp, '_verify_review_violation',
+                          side_effect=lambda cfg, issue, imgs: verify_calls.append(imgs) or True):
+            pp.check_full_sequence_consistency({}, 'prompt block', self._paths(6))
+
+        self.assertEqual(len(verify_calls), 1)
+        self.assertEqual(verify_calls[0], ['f1', 'f3', 'f4'])
+
+    def test_degraded_compresses_once_and_cleans_up_temp_dir(self):
+        """回归防护（2026-07-25）：降级档此前逐拍各压一次、跨帧层再压一次、复核前又
+        压一次，一单几十张图、十几个 mkdtemp 目录且从不清理。"""
+        made_dirs = []
+        real_compress = pp._compress_frames_for_review
+
+        def spy(paths, **kw):
+            out = real_compress(paths, **kw)
+            made_dirs.append(sorted({os.path.dirname(p) for p in out}))
+            return out
+
+        tmp = tempfile.mkdtemp()
+        try:
+            frames = {}
+            for i in (1, 2, 3):
+                path = os.path.join(tmp, f'img_{i}.png')
+                Image.new('RGB', (32, 32), (i * 20, 0, 0)).save(path)
+                frames[i] = path
+            with patch.object(pp, '_compress_frames_for_review', side_effect=spy) as comp, \
+                 patch.object(pp, 'check_beat_consistency', return_value=[]), \
+                 patch.object(pp, 'check_global_sequence_consistency', return_value={}):
+                pp.check_full_sequence_consistency({}, 'prompt block', frames, degraded=True)
+            self.assertEqual(comp.call_count, 1)
+            for dirs in made_dirs:
+                for d in dirs:
+                    self.assertFalse(os.path.exists(d), f'临时目录未清理: {d}')
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestMergeReviewResults(unittest.TestCase):
+    def test_retry_result_fills_in_the_unreviewed_beats(self):
+        first = _review({1: ['旧问题']}, unreviewed_beats=[2, 3], global_reviewed=True)
+        second = _review({2: ['补审出的问题']}, unreviewed_beats=[3], global_reviewed=False)
+        merged = pp.merge_review_results(first, second)
+        self.assertEqual(merged['failures'], {1: ['旧问题'], 2: ['补审出的问题']})
+        self.assertEqual(merged['unreviewed_beats'], [3])   # 重跑后仍没审成的才算漏审
+        self.assertTrue(merged['global_reviewed'])          # 上一轮已跑成，不因本轮跳过而作废
+
+    def test_none_operands_pass_through(self):
+        first = _review({1: ['问题']})
+        self.assertEqual(pp.merge_review_results(first, None), first)
+        self.assertEqual(pp.merge_review_results(None, first), first)
 
 
 class TestFixBeatFromSequenceReview(unittest.TestCase):
@@ -107,6 +539,13 @@ class TestFixBeatFromSequenceReview(unittest.TestCase):
         with patch.object(pp, '_chat', side_effect=RuntimeError('boom')):
             v, i = pp.fix_beat_from_sequence_review({}, 'old video', 'old image', ['issue'])
         self.assertEqual((v, i), ('old video', 'old image'))
+
+
+def _review(failures=None, unreviewed_beats=None, global_reviewed=True):
+    """构造 check_full_sequence_consistency 的新形状返回值（见其 docstring）。"""
+    return {'failures': failures or {},
+            'unreviewed_beats': list(unreviewed_beats or []),
+            'global_reviewed': global_reviewed}
 
 
 class _TmpProjectCase(unittest.TestCase):
@@ -142,14 +581,58 @@ class TestSequenceConsistencyReview(_TmpProjectCase):
         self.assertEqual(result, '')
         self.assertEqual(self._read_manifest(), {})
 
-    def test_missing_frames_skips_review_without_touching_manifest(self):
-        # 只渲了第 1 帧，第 2/3 帧还没落盘——不该在没审过的情况下把它们标"已通过"
+    def test_single_rendered_frame_skips_review_without_touching_manifest(self):
+        # 只渲了第 1 帧：连一拍都凑不齐，没有可比对的画面对，如实早退且不碰 manifest
         self._touch_frame(1)
         with patch.object(po, 'check_full_sequence_consistency',
-                          side_effect=AssertionError('should not run review with missing frames')):
+                          side_effect=AssertionError('should not run review with <2 frames')):
             result = po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
         self.assertEqual(result, self.PROMPT_BLOCK)
         self.assertEqual(self._read_manifest(), {})
+
+    def test_partially_rendered_sequence_reviews_the_rendered_prefix(self):
+        """2026-07-25：此前缺任何一帧就整体放弃、一拍都不审——逐帧手动生成到一半想
+        中途查一下完全办不到。现在审"从 IMAGE 1 起连续渲出来的那一段"，未渲染的帧
+        一律不碰（既没审过，就不能标任何结论）。"""
+        self._touch_frame(1)
+        self._touch_frame(2)          # 第 3 帧还没渲
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
+        ]})
+        seen = {}
+        events = []
+
+        def fake_check(config, prompt_block, frame_paths, **kw):
+            seen['paths'] = sorted(frame_paths)
+            return _review({})
+
+        with patch.object(po, 'check_full_sequence_consistency', side_effect=fake_check):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir,
+                                            on_progress=lambda s, d: events.append((s, d)))
+
+        self.assertEqual(seen['paths'], [1, 2])   # 只把渲出来的前缀送审
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        self.assertEqual(frames[1]['quality_gate'], 'sequence_reviewed_pass')
+        self.assertEqual(frames[2]['quality_gate'], 'sequence_reviewed_pass')
+        self.assertEqual(frames[3]['quality_gate'], 'pending_manual_review')  # 没渲的不碰
+        result_ev = [d for s, d in events if s == 'sequence_review_result'][0]
+        self.assertTrue(result_ev['passed'])
+        self.assertTrue(result_ev['partial'])
+        self.assertIn('前 2', result_ev['message'])   # 必须说清只覆盖了前缀
+
+    def test_gap_in_the_middle_stops_the_reviewed_prefix(self):
+        """中间断开时不把后面的帧混进来：它们接的是另一条 i2i 链，跨帧规则拿它们
+        和链头比只会制造假阳性。"""
+        self._touch_frame(1)
+        self._touch_frame(3)          # 第 2 帧缺失
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
+        ]})
+        with patch.object(po, 'check_full_sequence_consistency',
+                          side_effect=AssertionError('前缀不足两帧时不该开审')):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
+        gates = {f['sequence']: f['quality_gate'] for f in self._read_manifest()['frames']}
+        self.assertEqual(set(gates.values()), {'pending_manual_review'})
 
     def test_clean_review_marks_all_frames_reviewed_pass(self):
         for seq in (1, 2, 3):
@@ -157,7 +640,7 @@ class TestSequenceConsistencyReview(_TmpProjectCase):
         server_common.write_manifest(self.project_dir, {'frames': [
             {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
         ]})
-        with patch.object(po, 'check_full_sequence_consistency', return_value={}) as mock_check, \
+        with patch.object(po, 'check_full_sequence_consistency', return_value=_review({})) as mock_check, \
              patch.object(po, 'generate_frame_sequence') as mock_render:
             result = po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
         mock_check.assert_called_once()
@@ -166,156 +649,70 @@ class TestSequenceConsistencyReview(_TmpProjectCase):
         gates = {f['sequence']: f['quality_gate'] for f in self._read_manifest()['frames']}
         self.assertEqual(gates, {1: 'sequence_reviewed_pass', 2: 'sequence_reviewed_pass', 3: 'sequence_reviewed_pass'})
 
-    def test_failure_triggers_fix_and_targeted_rerender_then_converges(self):
+    def test_failure_flags_without_fixing_or_rerendering(self):
+        # 2026-07-23 行为变更：发现问题不再自动改写提示词+重渲——只标记+报告，
+        # 等人工点「修复此帧问题」才会真正触发 fix_beat_from_sequence_review。
         for seq in (1, 2, 3):
             self._touch_frame(seq)
         server_common.write_manifest(self.project_dir, {'frames': [
             {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
         ]})
-        # Round 1: beat 1 flagged. Round 2: clean.
-        check_results = [{1: ['天花板未封板']}, {}]
-
-        def fake_check(config, prompt_block, frame_paths):
-            return check_results.pop(0)
-
-        render_calls = []
-
-        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
-            render_calls.append(target_sequences)
-
-        with patch.object(po, 'check_full_sequence_consistency', side_effect=fake_check), \
+        with patch.object(po, 'check_full_sequence_consistency',
+                          return_value=_review({1: ['天花板未封板']})) as mock_check, \
              patch.object(po, 'fix_beat_from_sequence_review',
-                          return_value=('fixed video 1', 'fixed image 2')) as mock_fix, \
-             patch.object(po, 'generate_frame_sequence', side_effect=fake_render):
+                          side_effect=AssertionError('不该自动修复')) as mock_fix, \
+             patch.object(po, 'generate_frame_sequence') as mock_render:
             result = po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
 
-        mock_fix.assert_called_once_with({}, 'video one', 'second frame', ['天花板未封板'])
-        self.assertEqual(render_calls, [[2]])  # beat 1 -> IMAGE 2 only, no full re-render
-        self.assertIn('fixed video 1', result)
-        self.assertIn('fixed image 2', result)
+        mock_check.assert_called_once()
+        mock_fix.assert_not_called()
+        mock_render.assert_not_called()
+        self.assertEqual(result, self.PROMPT_BLOCK)  # 提示词原样返回，没有被改写
         gates = {f['sequence']: f['quality_gate'] for f in self._read_manifest()['frames']}
-        self.assertEqual(gates, {1: 'sequence_reviewed_pass', 2: 'sequence_reviewed_pass', 3: 'sequence_reviewed_pass'})
-
-    def test_exhausting_rounds_flags_remaining_beats_with_reason(self):
-        for seq in (1, 2, 3):
-            self._touch_frame(seq)
-        server_common.write_manifest(self.project_dir, {'frames': [
-            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
-        ]})
-        # Every round reports the same violation on beat 2, and the fixer keeps producing
-        # a genuinely new (round-numbered) rewrite each time so the loop never converges
-        # on its own — it must be the max_rounds cap that stops it, not the no-change exit.
-        fix_calls = {'n': 0}
-
-        def fake_fix(config, video_prompt, image_prompt, issues):
-            fix_calls['n'] += 1
-            return f'changed video r{fix_calls["n"]}', f'changed image r{fix_calls["n"]}'
-
-        with patch.object(po, 'check_full_sequence_consistency',
-                          return_value={2: ['视角跳切，中间没有回拉镜头过渡']}), \
-             patch.object(po, 'fix_beat_from_sequence_review', side_effect=fake_fix), \
-             patch.object(po, 'generate_frame_sequence') as mock_render:
-            result = po._sequence_consistency_review(
-                {}, self.TITLE, self.PROMPT_BLOCK, self.project_dir, max_rounds=2)
-
-        self.assertEqual(mock_render.call_count, 2)  # one rerender per round, capped at max_rounds
-        gates_by_seq = {f['sequence']: f for f in self._read_manifest()['frames']}
-        self.assertEqual(gates_by_seq[3]['quality_gate'], 'sequence_review_flagged')
-        self.assertIn('视角跳切', gates_by_seq[3]['vlm_qa_reason'])
-        self.assertEqual(gates_by_seq[1]['quality_gate'], 'sequence_reviewed_pass')
-        self.assertEqual(gates_by_seq[2]['quality_gate'], 'sequence_reviewed_pass')
-
-    def test_final_rework_is_verified_before_stamping_pass(self):
-        """末轮回炉重渲出来的帧必须再审一次才盖章：此前末轮"回炉重渲→不复核→直接按
-        重渲前的失败理由标 flagged"——重渲结果从未被验证（2026-07-17 拱渡槽单实锤）。
-        本例最后一次重渲真的修好了，复核轮应把全部帧盖 sequence_reviewed_pass。"""
-        for seq in (1, 2, 3):
-            self._touch_frame(seq)
-        server_common.write_manifest(self.project_dir, {'frames': [
-            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
-        ]})
-        check_results = [{1: ['问题A']}, {1: ['问题A仍在']}, {}]
-        fix_calls = {'n': 0}
-
-        def fake_fix(config, video_prompt, image_prompt, issues):
-            fix_calls['n'] += 1
-            return f'changed video r{fix_calls["n"]}', f'changed image r{fix_calls["n"]}'
-
-        with patch.object(po, 'check_full_sequence_consistency',
-                          side_effect=lambda *a, **kw: check_results.pop(0)) as mock_check, \
-             patch.object(po, 'fix_beat_from_sequence_review', side_effect=fake_fix), \
-             patch.object(po, 'generate_frame_sequence') as mock_render:
-            po._sequence_consistency_review(
-                {}, self.TITLE, self.PROMPT_BLOCK, self.project_dir, max_rounds=2)
-
-        self.assertEqual(mock_check.call_count, 3)   # 2 轮回炉 + 1 轮末位复核
-        self.assertEqual(mock_render.call_count, 2)  # 回炉重渲仍以 max_rounds 为上限
-        gates = {f['sequence']: f['quality_gate'] for f in self._read_manifest()['frames']}
-        self.assertEqual(gates, {1: 'sequence_reviewed_pass', 2: 'sequence_reviewed_pass',
+        self.assertEqual(gates, {1: 'sequence_reviewed_pass', 2: 'sequence_review_flagged',
                                  3: 'sequence_reviewed_pass'})
+        reason = self._read_manifest()['frames'][1]['vlm_qa_reason']
+        self.assertIn('天花板未封板', reason)
 
-    def test_flag_reason_comes_from_final_verification_not_stale_round(self):
-        """复核轮仍失败时，flagged 理由必须描述重渲后的真实画面（末轮复核给出的），
-        而不是重渲前旧帧的过期理由。"""
+    def test_multiple_failing_beats_all_flagged_independently(self):
         for seq in (1, 2, 3):
             self._touch_frame(seq)
         server_common.write_manifest(self.project_dir, {'frames': [
             {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
         ]})
-        check_results = [{1: ['round1 旧理由']}, {1: ['round2 旧理由']}, {1: ['复核后仍存在的问题']}]
-        fix_calls = {'n': 0}
-
-        def fake_fix(config, video_prompt, image_prompt, issues):
-            fix_calls['n'] += 1
-            return f'changed video r{fix_calls["n"]}', f'changed image r{fix_calls["n"]}'
-
         with patch.object(po, 'check_full_sequence_consistency',
-                          side_effect=lambda *a, **kw: check_results.pop(0)), \
-             patch.object(po, 'fix_beat_from_sequence_review', side_effect=fake_fix), \
+                          return_value=_review({1: ['问题A'], 2: ['问题B', '问题C']})), \
              patch.object(po, 'generate_frame_sequence') as mock_render:
-            po._sequence_consistency_review(
-                {}, self.TITLE, self.PROMPT_BLOCK, self.project_dir, max_rounds=2)
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
 
-        self.assertEqual(mock_render.call_count, 2)  # 复核轮绝不再触发新的回炉重渲
+        mock_render.assert_not_called()
         gates_by_seq = {f['sequence']: f for f in self._read_manifest()['frames']}
         self.assertEqual(gates_by_seq[2]['quality_gate'], 'sequence_review_flagged')
-        self.assertIn('复核后仍存在的问题', gates_by_seq[2]['vlm_qa_reason'])
-        self.assertNotIn('旧理由', gates_by_seq[2]['vlm_qa_reason'])
+        self.assertIn('问题A', gates_by_seq[2]['vlm_qa_reason'])
+        self.assertEqual(gates_by_seq[3]['quality_gate'], 'sequence_review_flagged')
+        self.assertIn('问题B', gates_by_seq[3]['vlm_qa_reason'])
+        self.assertIn('问题C', gates_by_seq[3]['vlm_qa_reason'])
+        self.assertEqual(gates_by_seq[1]['quality_gate'], 'sequence_reviewed_pass')
 
-    def test_exhausting_time_budget_flags_remaining_beats_with_reason(self):
-        """2026-07-16：max_rounds 限的是轮数，不是耗时——网关限流下每轮重渲的退避
-        可能比轮数本身慢得多（实测真实链跑了超过 1 小时未收敛）。time_budget_seconds
-        应该在总耗时超预算时提前熔断，即使 max_rounds 还没用完；round 1 必须真的
-        跑完（不是被总时长熔断在第一轮就拦住），round 2 才因为超预算被跳过。"""
+    def test_failure_progress_message_names_flagged_frames(self):
         for seq in (1, 2, 3):
             self._touch_frame(seq)
         server_common.write_manifest(self.project_dir, {'frames': [
             {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
         ]})
-        fix_calls = {'n': 0}
+        events = []
+        with patch.object(po, 'check_full_sequence_consistency',
+                          return_value=_review({1: ['天花板未封板']})), \
+             patch.object(po, 'generate_frame_sequence'):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir,
+                                            on_progress=lambda stage, data: events.append((stage, data)))
 
-        def fake_fix(config, video_prompt, image_prompt, issues):
-            fix_calls['n'] += 1
-            return f'changed video r{fix_calls["n"]}', f'changed image r{fix_calls["n"]}'
-
-        # started_at=0；round1 起始检查 10s（<100 预算，正常跑）；round2 起始检查 200s
-        # （>100 预算，熔断，round2 连 check_full_sequence_consistency 都不该调用）。
-        with patch.object(po.time, 'time', side_effect=[0, 10, 200]), \
-             patch.object(po, 'check_full_sequence_consistency',
-                          return_value={2: ['视角跳切，中间没有回拉镜头过渡']}) as mock_check, \
-             patch.object(po, 'fix_beat_from_sequence_review', side_effect=fake_fix), \
-             patch.object(po, 'generate_frame_sequence') as mock_render:
-            result = po._sequence_consistency_review(
-                {}, self.TITLE, self.PROMPT_BLOCK, self.project_dir,
-                max_rounds=5, time_budget_seconds=100)
-
-        mock_check.assert_called_once()  # round 1 really ran the review
-        self.assertEqual(mock_render.call_count, 1)  # round 2's rerender never started
-        gates_by_seq = {f['sequence']: f for f in self._read_manifest()['frames']}
-        self.assertEqual(gates_by_seq[3]['quality_gate'], 'sequence_review_flagged')
-        self.assertIn('视角跳切', gates_by_seq[3]['vlm_qa_reason'])
-        self.assertEqual(gates_by_seq[1]['quality_gate'], 'sequence_reviewed_pass')
-        self.assertEqual(gates_by_seq[2]['quality_gate'], 'sequence_reviewed_pass')
+        result_events = [d for s, d in events if s == 'sequence_review_result']
+        self.assertEqual(len(result_events), 1)
+        self.assertFalse(result_events[0]['passed'])
+        self.assertIn('IMG 002', result_events[0]['message'])
+        self.assertIn('天花板未封板', result_events[0]['message'])
+        self.assertIn('修复此帧问题', result_events[0]['message'])
 
     def test_review_unavailable_marks_frames_skipped_not_pass(self):
         """审查两次（常规+降级）都没跑成：帧必须标 sequence_review_skipped，绝不能
@@ -327,7 +724,7 @@ class TestSequenceConsistencyReview(_TmpProjectCase):
         ]})
         calls = []
 
-        def fake_check(config, prompt_block, frame_paths, degraded=False):
+        def fake_check(config, prompt_block, frame_paths, degraded=False, **kw):
             calls.append(degraded)
             return None
 
@@ -349,9 +746,9 @@ class TestSequenceConsistencyReview(_TmpProjectCase):
         server_common.write_manifest(self.project_dir, {'frames': [
             {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
         ]})
-        results = [None, {}]
+        results = [None, _review({})]
 
-        def fake_check(config, prompt_block, frame_paths, degraded=False):
+        def fake_check(config, prompt_block, frame_paths, degraded=False, **kw):
             return results.pop(0)
 
         with patch.object(po, 'check_full_sequence_consistency', side_effect=fake_check), \
@@ -363,23 +760,673 @@ class TestSequenceConsistencyReview(_TmpProjectCase):
         self.assertEqual(gates, {1: 'sequence_reviewed_pass', 2: 'sequence_reviewed_pass',
                                  3: 'sequence_reviewed_pass'})
 
-    def test_no_actual_change_from_fix_stops_the_loop_early(self):
+
+    def test_unreviewed_beat_frames_are_marked_skipped_not_pass(self):
+        """回归防护（2026-07-25）：第 1 拍没审成时，它涉及的 IMG 001/002 必须标
+        sequence_review_skipped；旧实现会把它们连同真正审过的 IMG 003 一起盖
+        sequence_reviewed_pass。"""
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
+        ]})
+        events = []
+        with patch.object(po, 'check_full_sequence_consistency',
+                          return_value=_review({}, unreviewed_beats=[1])):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir,
+                                            on_progress=lambda s, d: events.append((s, d)))
+
+        gates = {f['sequence']: f['quality_gate'] for f in self._read_manifest()['frames']}
+        self.assertEqual(gates, {1: 'sequence_review_skipped', 2: 'sequence_review_skipped',
+                                 3: 'sequence_reviewed_pass'})
+        result_ev = [d for s, d in events if s == 'sequence_review_result'][0]
+        self.assertFalse(result_ev['passed'])
+        self.assertEqual(result_ev['unreviewed_sequences'], [1, 2])
+        self.assertIn('未审完', result_ev['message'])
+
+    def test_global_layer_not_reviewed_means_no_frame_gets_a_pass(self):
+        """跨帧层没跑成时，跨帧规则对所有帧都没查过——一帧都不能盖"通过"。"""
         for seq in (1, 2, 3):
             self._touch_frame(seq)
         server_common.write_manifest(self.project_dir, {'frames': [
             {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
         ]})
         with patch.object(po, 'check_full_sequence_consistency',
-                          return_value={1: ['issue the LLM cannot actually fix']}), \
-             patch.object(po, 'fix_beat_from_sequence_review',
-                          side_effect=lambda config, v, i, issues: (v, i)) as mock_fix, \
-             patch.object(po, 'generate_frame_sequence') as mock_render:
-            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir, max_rounds=2)
+                          return_value=_review({}, global_reviewed=False)):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
 
-        mock_fix.assert_called_once()
-        mock_render.assert_not_called()  # no rerender since nothing actually changed
         gates = {f['sequence']: f['quality_gate'] for f in self._read_manifest()['frames']}
-        self.assertEqual(gates.get(2), 'sequence_review_flagged')
+        self.assertEqual(set(gates.values()), {'sequence_review_skipped'})
+
+    def test_flagged_beat_wins_over_unreviewed_neighbour_beat(self):
+        """帧同时"参与的另一拍没审成"和"本拍被检出问题"时，检出的问题优先——
+        漏审不得把已经抓到的违规洗成一句"未审查"。"""
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
+        ]})
+        with patch.object(po, 'check_full_sequence_consistency',
+                          return_value=_review({1: ['天花板未封板']}, unreviewed_beats=[2])):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
+
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        self.assertEqual(frames[2]['quality_gate'], 'sequence_review_flagged')
+        self.assertIn('天花板未封板', frames[2]['vlm_qa_reason'])
+        self.assertEqual(frames[3]['quality_gate'], 'sequence_review_skipped')
+
+    def test_totally_failed_review_keeps_previous_real_verdicts(self):
+        """回归防护（2026-07-25）：审查整轮没跑起来（网关抖动/用户取消）时，上一轮
+        真实的 reviewed_pass / review_flagged 必须原样保留——帧文件这期间没被动过，
+        一次失败不该把整单的审查结论清零。只有本来没有真实结论的帧才标未审查。"""
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 1, 'quality_gate': 'sequence_reviewed_pass', 'vlm_qa_reason': None},
+            {'sequence': 2, 'quality_gate': 'sequence_review_flagged', 'vlm_qa_reason': '天花板未封板'},
+            {'sequence': 3, 'quality_gate': 'pending_manual_review', 'vlm_qa_reason': None},
+        ]})
+        with patch.object(po, 'check_full_sequence_consistency', return_value=None):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
+
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        self.assertEqual(frames[1]['quality_gate'], 'sequence_reviewed_pass')
+        self.assertEqual(frames[2]['quality_gate'], 'sequence_review_flagged')
+        self.assertEqual(frames[2]['vlm_qa_reason'], '天花板未封板')  # 问题描述也不能丢
+        self.assertEqual(frames[3]['quality_gate'], 'sequence_review_skipped')
+
+
+    def test_partial_failure_retries_only_the_unreviewed_beats(self):
+        """回归防护（2026-07-25）：第 1 拍没审成时，降级重试只重跑第 1 拍，不再把
+        已经审干净的整批再烧一遍全部调用；跨帧层上一轮跑成了也不重跑。"""
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
+        ]})
+        calls = []
+
+        def fake_check(config, prompt_block, frame_paths, degraded=False,
+                       only_beats=None, skip_global=False, on_progress=None):
+            calls.append({'degraded': degraded, 'only_beats': only_beats,
+                          'skip_global': skip_global})
+            if not degraded:
+                return _review({}, unreviewed_beats=[1], global_reviewed=True)
+            return _review({1: ['补审出的问题']}, unreviewed_beats=[], global_reviewed=False)
+
+        with patch.object(po, 'check_full_sequence_consistency', side_effect=fake_check):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], {'degraded': True, 'only_beats': [1], 'skip_global': True})
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        # 补审出的问题落到 IMG 002；其余帧因两轮合计已审完，正常盖通过
+        self.assertEqual(frames[2]['quality_gate'], 'sequence_review_flagged')
+        self.assertIn('补审出的问题', frames[2]['vlm_qa_reason'])
+        self.assertEqual(frames[1]['quality_gate'], 'sequence_reviewed_pass')
+        self.assertEqual(frames[3]['quality_gate'], 'sequence_reviewed_pass')
+
+
+class TestFrameReviewStatus(unittest.TestCase):
+    """审查结果 → 每帧 quality_gate 的翻译规则（覆盖判定的单元测试）。"""
+
+    def test_frame_needs_all_of_its_beats_and_the_global_layer(self):
+        # 4 帧 3 拍：IMG 2 参与 beat 1/2，IMG 3 参与 beat 2/3
+        status = pp.frame_review_status([1, 2, 3, 4], _review({}, unreviewed_beats=[2]))
+        self.assertEqual(status[1][0], 'reviewed')       # 只参与 beat 1
+        self.assertEqual(status[2][0], 'unreviewed')     # 参与 beat 2
+        self.assertEqual(status[3][0], 'unreviewed')     # 参与 beat 2
+        self.assertEqual(status[4][0], 'reviewed')       # 只参与 beat 3
+
+    def test_reason_text_names_which_layer_missed(self):
+        status = pp.frame_review_status([1, 2], _review({}, unreviewed_beats=[1]))
+        self.assertIn('逐拍审查未跑成', status[2][1])
+        status = pp.frame_review_status([1, 2], _review({}, global_reviewed=False))
+        self.assertIn('跨帧一致性审查未跑成', status[2][1])
+
+    def test_clean_full_review_marks_every_frame_reviewed(self):
+        status = pp.frame_review_status([1, 2, 3], _review({}))
+        self.assertEqual({s: v[0] for s, v in status.items()},
+                         {1: 'reviewed', 2: 'reviewed', 3: 'reviewed'})
+
+
+class TestFixFrameIssue(_TmpProjectCase):
+    """人工确认后触发的定向修复：读取该帧记录的问题原因，优化提示词后重渲——
+    非首帧走一致性审查的定向重写，首帧走单提示词反馈重写；重渲一律图生图。"""
+
+    def setUp(self):
+        super().setUp()
+        # 修复收尾会对着新画面复核每条问题（_reverify_frame_issues）；这些用例关心的
+        # 是修复本身，统一桩成"复核没跑成"（保守按未解决处理，不改变既有断言）。
+        patcher = patch.object(po, '_verify_review_violation', return_value=None)
+        self.reverify = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write_gate(self, seq_gates):
+        frames = [{'sequence': s, 'quality_gate': g, 'vlm_qa_reason': r}
+                  for s, (g, r) in seq_gates.items()]
+        server_common.write_manifest(self.project_dir, {'frames': frames})
+
+    def test_no_recorded_reason_raises(self):
+        self._touch_frame(2)
+        self._write_gate({1: ('sequence_reviewed_pass', None), 2: ('sequence_reviewed_pass', None),
+                          3: ('sequence_reviewed_pass', None)})
+        with self.assertRaises(RuntimeError):
+            po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
+
+    def test_non_first_frame_uses_beat_fix_and_i2i_rerender(self):
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        self._write_gate({1: ('sequence_reviewed_pass', None),
+                          2: ('sequence_review_flagged', '天花板未随墙面一起封板'),
+                          3: ('sequence_reviewed_pass', None)})
+        render_calls = []
+
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            render_calls.append(target_sequences)
+
+        with patch.object(po, 'fix_beat_from_sequence_review',
+                          return_value=('fixed video 1', 'fixed image 2')) as mock_fix, \
+             patch.object(po, 'generate_frame_sequence', side_effect=fake_render):
+            result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
+
+        mock_fix.assert_called_once_with({}, 'video one', 'second frame', ['天花板未随墙面一起封板'])
+        self.assertEqual(render_calls, [[2]])  # 只重渲第 2 帧，图生图链式编辑
+        self.assertIn('fixed image 2', result['prompt_block'])
+        self.assertIn('fixed video 1', result['prompt_block'])
+        self.assertEqual(result['reason'], '天花板未随墙面一起封板')
+
+    def test_first_frame_uses_prompt_feedback_and_image_edit_never_t2i(self):
+        # 首帧没有前置视频过渡（beat 0 不存在），必须走单提示词反馈重写，
+        # 且重渲必须是图生图自编辑——绝不能走 generate_frame_sequence 的
+        # seq==1 强制文生图路径（那条路径会推倒重来，丢掉已确认的构图）。
+        self._touch_frame(1)
+        self._write_gate({1: ('sequence_review_flagged', 'IMAGE 1 不够原始'),
+                          2: ('sequence_reviewed_pass', None), 3: ('sequence_reviewed_pass', None)})
+
+        with patch.object(po, 'fix_image_prompt_with_vlm_feedback',
+                          return_value='fixed first frame') as mock_fix, \
+             patch.object(po, '_fix_frame_via_image_edit') as mock_edit, \
+             patch.object(po, 'generate_frame_sequence',
+                          side_effect=AssertionError('首帧修复不该走 generate_frame_sequence')):
+            result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 1)
+
+        mock_fix.assert_called_once_with({}, 'first frame', 'IMAGE 1 不够原始')
+        mock_edit.assert_called_once()
+        self.assertEqual(mock_edit.call_args.args[2], 1)  # sequence
+        self.assertIn('fixed first frame', result['prompt_block'])
+
+
+class TestReviewVerdictInvalidation(_TmpProjectCase):
+    """审查结论与帧内容绑定（2026-07-25）：审查时把看过的帧内容哈希记进
+    review_frames_sha256，之后任何一帧被重渲都会让相关结论自动作废。此前完全没有这套
+    机制——修完 IMG 005 后 IMG 004/006 仍挂着 sequence_reviewed_pass，前端显示的
+    "全部审查通过"从那一刻起就是假的。"""
+
+    def _write_frame(self, seq, color):
+        Image.new('RGB', (16, 16), color).save(po._frame_path(self.TITLE, seq), format='WEBP')
+
+    def _reviewed_manifest(self):
+        for seq, color in ((1, (10, 0, 0)), (2, (20, 0, 0)), (3, (30, 0, 0))):
+            self._write_frame(seq, color)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'sequence_reviewed_pass', 'vlm_qa_reason': None}
+            for s in (1, 2, 3)
+        ]})
+        po._record_review_fingerprints(self.project_dir, self.TITLE, [1, 2, 3])
+
+    def test_fingerprints_cover_the_neighbouring_frames(self):
+        self._reviewed_manifest()
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        # IMG 002 的结论同时依赖 001/002/003 三张图（它参与 beat 1 与 beat 2）
+        self.assertEqual(set(frames[2]['review_frames_sha256']), {'1', '2', '3'})
+        self.assertEqual(set(frames[1]['review_frames_sha256']), {'1', '2'})
+        self.assertIn('reviewed_at', frames[1])
+
+    def test_rerendering_one_frame_invalidates_its_neighbours_verdicts(self):
+        self._reviewed_manifest()
+        self._write_frame(2, (99, 99, 99))   # 模拟 IMG 002 被重渲
+
+        changed = po.invalidate_stale_review_verdicts(self.project_dir)
+
+        self.assertEqual(sorted(changed), [1, 2, 3])  # 三帧的结论都依赖 IMG 002
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        for seq in (1, 2, 3):
+            self.assertEqual(frames[seq]['quality_gate'], 'pending_manual_review')
+            self.assertNotIn('review_frames_sha256', frames[seq])
+
+    def test_untouched_frames_keep_their_verdicts(self):
+        for seq, color in ((1, (10, 0, 0)), (2, (20, 0, 0)), (3, (30, 0, 0)),
+                           (4, (40, 0, 0)), (5, (50, 0, 0))):
+            self._write_frame(seq, color)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'sequence_reviewed_pass'} for s in range(1, 6)
+        ]})
+        po._record_review_fingerprints(self.project_dir, self.TITLE, [1, 2, 3, 4, 5])
+        self._write_frame(1, (99, 0, 0))     # 只重渲了 IMG 001
+
+        changed = po.invalidate_stale_review_verdicts(self.project_dir)
+
+        self.assertEqual(sorted(changed), [1, 2])    # 只有依赖 IMG 001 的两帧作废
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        for seq in (3, 4, 5):
+            self.assertEqual(frames[seq]['quality_gate'], 'sequence_reviewed_pass')
+
+    def test_invalidation_also_drops_chain_drift_and_structured_issues(self):
+        self._reviewed_manifest()
+        with server_common.manifest_lock(self.project_dir):
+            m = server_common.read_manifest(self.project_dir)
+            m['chain_drift'] = [{'family_anchor': 1, 'passed': True}]
+            for f in m['frames']:
+                f['review_issues'] = [{'text': '旧问题', 'layer': 'local', 'beat': 1,
+                                       'frames': [1, 2]}]
+            server_common.write_manifest(self.project_dir, m)
+        self._write_frame(3, (99, 99, 99))
+
+        po.invalidate_stale_review_verdicts(self.project_dir)
+
+        manifest = self._read_manifest()
+        self.assertNotIn('chain_drift', manifest)   # 链尾回望比的也是这些帧
+        frames = {f['sequence']: f for f in manifest['frames']}
+        self.assertNotIn('review_issues', frames[3])
+
+    def test_review_records_fingerprints_after_a_successful_run(self):
+        for seq, color in ((1, (10, 0, 0)), (2, (20, 0, 0)), (3, (30, 0, 0))):
+            self._write_frame(seq, color)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
+        ]})
+        with patch.object(po, 'check_full_sequence_consistency', return_value=_review({})):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
+
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        self.assertTrue(all('review_frames_sha256' in frames[s] for s in (1, 2, 3)))
+
+    def test_unreviewed_frames_do_not_get_fingerprints(self):
+        """没审成的帧不该留指纹——留了就等于宣称"这个结论对这几张图成立"。"""
+        for seq, color in ((1, (10, 0, 0)), (2, (20, 0, 0)), (3, (30, 0, 0))):
+            self._write_frame(seq, color)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
+        ]})
+        with patch.object(po, 'check_full_sequence_consistency',
+                          return_value=_review({}, unreviewed_beats=[1])):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
+
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        self.assertNotIn('review_frames_sha256', frames[1])
+        self.assertNotIn('review_frames_sha256', frames[2])
+        self.assertIn('review_frames_sha256', frames[3])
+
+
+class TestReverifyAfterFix(_TmpProjectCase):
+    """修复闭环（2026-07-25）：重渲之后对着新画面把刚才那几条问题逐条再验一遍，
+    直接回答"到底修好没有"。此前修复是开环的——重渲完把 gate 设回 pending_manual_review
+    就走人，那条问题是否解决没有任何人回答。"""
+
+    ISSUES = [
+        {'text': '天花板未封板', 'layer': 'local', 'beat': 1, 'frames': [1, 2]},
+        {'text': '载体身份丢失', 'layer': 'global', 'beat': 1, 'frames': [1, 2]},
+    ]
+
+    def _setup_flagged_frame(self):
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 2, 'quality_gate': 'sequence_review_flagged',
+             'vlm_qa_reason': '天花板未封板；载体身份丢失',
+             'review_issues': [dict(i) for i in self.ISSUES]},
+        ]})
+
+    def _run_fix(self, verify_side_effect):
+        with patch.object(po, 'fix_beat_from_sequence_review', return_value=('v', 'i')), \
+             patch.object(po, 'generate_frame_sequence'), \
+             patch.object(po, '_verify_review_violation', side_effect=verify_side_effect):
+            return po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
+
+    def test_all_issues_gone_clears_the_flag(self):
+        self._setup_flagged_frame()
+        result = self._run_fix(lambda cfg, text, imgs: False)  # 复核：这条问题不存在了
+
+        self.assertEqual(result['reverify']['remaining'], [])
+        self.assertEqual(sorted(result['reverify']['resolved']),
+                         ['天花板未封板', '载体身份丢失'])
+        frame = self._read_manifest()['frames'][0]
+        self.assertEqual(frame['quality_gate'], 'pending_manual_review')
+        self.assertNotIn('review_issues', frame)
+
+    def test_still_present_issue_keeps_the_frame_flagged_with_only_that_issue(self):
+        self._setup_flagged_frame()
+        result = self._run_fix(lambda cfg, text, imgs: text == '载体身份丢失')
+
+        self.assertEqual(result['reverify']['resolved'], ['天花板未封板'])
+        self.assertEqual(result['reverify']['remaining'], ['载体身份丢失'])
+        frame = self._read_manifest()['frames'][0]
+        self.assertEqual(frame['quality_gate'], 'sequence_review_flagged')
+        self.assertEqual(frame['vlm_qa_reason'], '载体身份丢失')   # 已解决的那条不再挂着
+        self.assertEqual([i['text'] for i in frame['review_issues']], ['载体身份丢失'])
+
+    def test_verifier_infra_failure_never_reports_a_false_success(self):
+        self._setup_flagged_frame()
+        result = self._run_fix(lambda cfg, text, imgs: None)   # 复核本身没跑成
+
+        self.assertEqual(result['reverify']['resolved'], [])
+        self.assertEqual(len(result['reverify']['remaining']), 2)
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'],
+                         'sequence_review_flagged')
+
+    def test_reverify_uses_the_frames_recorded_on_each_issue(self):
+        self._setup_flagged_frame()
+        calls = []
+
+        def spy(cfg, text, imgs):
+            calls.append(imgs)
+            return False
+
+        self._run_fix(spy)
+        for imgs in calls:
+            self.assertEqual([os.path.basename(p) for p in imgs],
+                             ['img_001.webp', 'img_002.webp'])
+
+    def test_manual_description_without_structured_issues_still_gets_reverified(self):
+        """旧 manifest / 人工描述没有结构化记录时，退化成"只看这一帧"的一条问题。"""
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 2, 'quality_gate': 'sequence_reviewed_pass'},
+        ]})
+        po.set_manual_frame_issue(self.TITLE, 2, '塔吊凭空消失了')
+        calls = []
+
+        with patch.object(po, 'fix_beat_from_sequence_review', return_value=('v', 'i')), \
+             patch.object(po, 'generate_frame_sequence'), \
+             patch.object(po, '_verify_review_violation',
+                          side_effect=lambda cfg, text, imgs: calls.append(text) or False):
+            result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
+
+        self.assertEqual(calls, ['塔吊凭空消失了'])
+        self.assertEqual(result['reverify']['resolved'], ['塔吊凭空消失了'])
+
+
+class TestFixFrameViaImageEdit(_TmpProjectCase):
+    def test_missing_frame_raises(self):
+        with self.assertRaises(RuntimeError):
+            po._fix_frame_via_image_edit({}, self.TITLE, 1, 'new prompt')
+
+    def test_self_edit_updates_manifest_and_uses_own_file_as_reference(self):
+        self._touch_frame(1)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 1, 'quality_gate': 'sequence_review_flagged', 'vlm_qa_reason': 'bad',
+             'retry_count': 0},
+        ]})
+        edit_calls = []
+
+        def fake_edit(config, prompt, reference_path, target_path, control_prompt=None):
+            edit_calls.append((reference_path, target_path))
+
+        with patch.object(po, '_generate_image_edit', side_effect=fake_edit), \
+             patch.object(po, '_image_edit_model', return_value='edit-model'):
+            result = po._fix_frame_via_image_edit({}, self.TITLE, 1, 'new prompt')
+
+        target_path = po._frame_path(self.TITLE, 1)
+        self.assertEqual(edit_calls, [(target_path, target_path)])  # 自己当参考、原地编辑
+        self.assertEqual(result['sequence'], 1)
+        frame = self._read_manifest()['frames'][0]
+        self.assertEqual(frame['quality_gate'], 'pending_manual_review')
+        self.assertIsNone(frame['vlm_qa_reason'])
+        self.assertEqual(frame['prompt'], 'new prompt')
+        self.assertEqual(frame['retry_count'], 1)
+
+    def test_quota_exhausted_never_switches_models(self):
+        """定向修复撞上配额耗尽：原样上抛，配了 imageEditFallbackModel 也不换模型。
+        修复本就是"改这一处、其余不动"，换模型重画整张会把已确认的构图一起改掉。"""
+        self._touch_frame(1)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 1, 'quality_gate': 'sequence_review_flagged', 'vlm_qa_reason': 'bad'},
+        ]})
+        calls = []
+
+        def fake_edit(config, prompt, reference_path, target_path, control_prompt=None):
+            calls.append(config.get('imageModel'))
+            raise QuotaExhaustedError('quota')
+
+        with patch.object(po, '_generate_image_edit', side_effect=fake_edit), \
+             patch.object(po, '_image_edit_model', side_effect=lambda c: c.get('imageModel', 'primary')):
+            with self.assertRaises(QuotaExhaustedError):
+                po._fix_frame_via_image_edit(
+                    {'imageEditFallbackModel': 'fallback-model'}, self.TITLE, 1, 'new prompt')
+
+        self.assertEqual(len(calls), 1)
+
+    def test_quota_exhausted_reraises(self):
+        self._touch_frame(1)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 1, 'quality_gate': 'sequence_review_flagged', 'vlm_qa_reason': 'bad'},
+        ]})
+        with patch.object(po, '_generate_image_edit', side_effect=QuotaExhaustedError('quota')):
+            with self.assertRaises(QuotaExhaustedError):
+                po._fix_frame_via_image_edit({}, self.TITLE, 1, 'new prompt')
+
+    def test_chat_transport_is_recorded_and_cleared_on_edits_rerender(self):
+        """定向修复落进「同模型换传输通道」的兜底时（网关 /images/edits 号池墙，见
+        frame_generator.CHAT_TRANSPORT）：模型没换所以构图不会被重画，但那条通道固定
+        出 1K 档——请求 2K 就是降档，manifest 必须如实标注；之后走 /images/edits 重渲过，
+        过期的留痕必须清掉。"""
+        from PIL import Image
+        Image.new('RGB', (768, 1376), (10, 20, 30)).save(po._frame_path(self.TITLE, 1), format='WEBP')
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 1, 'quality_gate': 'sequence_review_flagged', 'vlm_qa_reason': 'bad'},
+        ]})
+        events = []
+
+        with patch.object(po, '_generate_image_edit', return_value=po.CHAT_TRANSPORT), \
+             patch.object(po, '_image_edit_model', return_value='gemini-3.1-flash-image'):
+            po._fix_frame_via_image_edit({'imageQuality': '2K'}, self.TITLE, 1, 'new prompt',
+                                         on_progress=lambda s, d: events.append((s, d)))
+
+        frame = self._read_manifest()['frames'][0]
+        self.assertEqual(frame['transport'], po.CHAT_TRANSPORT)
+        self.assertIn('分辨率降档', frame['degraded_reason'])
+        self.assertEqual(frame['actual_pixels'], '768x1376')
+        announced = [d for s, d in events if s == 'transport_fallback']
+        self.assertTrue(announced and announced[0]['degraded'])
+
+        # 本单请求就是 1K 时同一条通道并没有损失画质，不许扣"降档"帽子
+        with patch.object(po, '_generate_image_edit', return_value=po.CHAT_TRANSPORT), \
+             patch.object(po, '_image_edit_model', return_value='gemini-3.1-flash-image'):
+            po._fix_frame_via_image_edit({'imageQuality': '1K'}, self.TITLE, 1, 'new prompt')
+        frame = self._read_manifest()['frames'][0]
+        self.assertEqual(frame['transport'], po.CHAT_TRANSPORT)
+        self.assertNotIn('degraded_reason', frame)
+
+        # 额度恢复后再修一次：走 /images/edits，通道留痕不许留在原地误导人
+        with patch.object(po, '_generate_image_edit', return_value=None), \
+             patch.object(po, '_image_edit_model', return_value='gemini-3.1-flash-image'):
+            po._fix_frame_via_image_edit({}, self.TITLE, 1, 'newer prompt')
+
+        frame = self._read_manifest()['frames'][0]
+        for key in ('transport', 'degraded_reason', 'actual_pixels'):
+            self.assertNotIn(key, frame)
+
+    def test_google_fx_backend_rejected_with_clear_error(self):
+        self._touch_frame(1)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 1, 'quality_gate': 'sequence_review_flagged', 'vlm_qa_reason': 'bad'},
+        ]})
+        with patch.object(po, '_generate_image_edit',
+                          side_effect=AssertionError('不该打到直连网关')):
+            with self.assertRaises(RuntimeError):
+                po._fix_frame_via_image_edit({'imageBackend': 'google_fx'}, self.TITLE, 1, 'new prompt')
+
+
+class TestManualFrameIssue(_TmpProjectCase):
+    """人工主动描述某一帧的问题：描述记进 manifest 的 manual_issue（quality_gate 标
+    manual_flagged），与机器判定的 vlm_qa_reason 并存，随后由 fix_frame_issue 一起
+    交给提示词改写。"""
+
+    def setUp(self):
+        super().setUp()
+        patcher = patch.object(po, '_verify_review_violation', return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_flag_records_description_and_remembers_previous_gate(self):
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 2, 'quality_gate': 'sequence_reviewed_pass', 'vlm_qa_reason': None},
+        ]})
+        frame = po.set_manual_frame_issue(self.TITLE, 2, '  塔吊凭空消失了  ')
+
+        self.assertEqual(frame['manual_issue'], '塔吊凭空消失了')  # 两端空白已剥掉
+        stored = self._read_manifest()['frames'][0]
+        self.assertEqual(stored['manual_issue'], '塔吊凭空消失了')
+        self.assertEqual(stored['quality_gate'], 'manual_flagged')
+        self.assertEqual(stored['manual_flag_prev_gate'], 'sequence_reviewed_pass')
+
+    def test_empty_description_clears_flag_and_restores_previous_gate(self):
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 2, 'quality_gate': 'sequence_reviewed_pass'},
+        ]})
+        po.set_manual_frame_issue(self.TITLE, 2, '塔吊凭空消失了')
+        po.set_manual_frame_issue(self.TITLE, 2, '   ')
+
+        stored = self._read_manifest()['frames'][0]
+        self.assertNotIn('manual_issue', stored)
+        self.assertNotIn('manual_flag_prev_gate', stored)
+        self.assertEqual(stored['quality_gate'], 'sequence_reviewed_pass')
+
+    def test_reflagging_does_not_overwrite_remembered_previous_gate(self):
+        # 改描述（manual_flagged -> manual_flagged）时若把 prev_gate 覆盖成
+        # manual_flagged，撤销后 gate 就永远回不去原值了
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 2, 'quality_gate': 'sequence_reviewed_pass'},
+        ]})
+        po.set_manual_frame_issue(self.TITLE, 2, '第一版描述')
+        po.set_manual_frame_issue(self.TITLE, 2, '第二版描述')
+        po.set_manual_frame_issue(self.TITLE, 2, '')
+
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'sequence_reviewed_pass')
+
+    def test_clear_without_remembered_gate_falls_back_by_vlm_reason(self):
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 2, 'quality_gate': 'manual_flagged', 'manual_issue': '旧描述',
+             'vlm_qa_reason': '天花板未随墙面一起封板'},
+        ]})
+        po.set_manual_frame_issue(self.TITLE, 2, '')
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'sequence_review_flagged')
+
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 2, 'quality_gate': 'manual_flagged', 'manual_issue': '旧描述'},
+        ]})
+        po.set_manual_frame_issue(self.TITLE, 2, '')
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'pending_manual_review')
+
+    def test_missing_manifest_or_frame_raises(self):
+        with self.assertRaises(RuntimeError):
+            po.set_manual_frame_issue(self.TITLE, 2, '描述')
+        server_common.write_manifest(self.project_dir, {'frames': [{'sequence': 1}]})
+        with self.assertRaises(RuntimeError):
+            po.set_manual_frame_issue(self.TITLE, 2, '描述')
+
+    def test_fix_uses_manual_issue_when_review_never_flagged_it(self):
+        """一致性审查没标记过的帧，只要人工描述过问题就能修——这正是本功能要解决的
+        缺口（此前只有被审查标记的帧才有修复入口）。"""
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'sequence_reviewed_pass', 'vlm_qa_reason': None}
+            for s in (1, 2, 3)
+        ]})
+        po.set_manual_frame_issue(self.TITLE, 2, '塔吊凭空消失了')
+
+        with patch.object(po, 'fix_beat_from_sequence_review',
+                          return_value=('fixed video 1', 'fixed image 2')) as mock_fix, \
+             patch.object(po, 'generate_frame_sequence'):
+            result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
+
+        mock_fix.assert_called_once_with({}, 'video one', 'second frame', ['塔吊凭空消失了'])
+        self.assertEqual(result['reason'], '塔吊凭空消失了')
+        # 修完清掉描述，否则帧网格会一直显示「人工标记」看着像没修
+        stored = [f for f in self._read_manifest()['frames'] if f['sequence'] == 2][0]
+        self.assertNotIn('manual_issue', stored)
+        self.assertNotEqual(stored['quality_gate'], 'manual_flagged')
+
+    def test_fix_merges_manual_description_with_machine_verdict(self):
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 2, 'quality_gate': 'sequence_review_flagged',
+             'vlm_qa_reason': '天花板未随墙面一起封板'},
+        ]})
+        po.set_manual_frame_issue(self.TITLE, 2, '塔吊凭空消失了')
+
+        with patch.object(po, 'fix_beat_from_sequence_review',
+                          return_value=('fixed video 1', 'fixed image 2')) as mock_fix, \
+             patch.object(po, 'generate_frame_sequence'):
+            result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
+
+        # 人工描述排在机器判定前面，两份都交给改写
+        mock_fix.assert_called_once_with({}, 'video one', 'second frame',
+                                         ['塔吊凭空消失了', '天花板未随墙面一起封板'])
+        self.assertEqual(result['reason'], '塔吊凭空消失了；天花板未随墙面一起封板')
+
+    def test_fix_accepts_manual_reason_argument_and_persists_it_first(self):
+        """在修复对话框里现场写的描述：先落盘再修，中途失败描述也不会丢。"""
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 2, 'quality_gate': 'sequence_reviewed_pass'},
+        ]})
+        seen = {}
+
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            seen['gate'] = self._read_manifest()['frames'][0]['quality_gate']
+            seen['issue'] = self._read_manifest()['frames'][0].get('manual_issue')
+            raise RuntimeError('上游炸了')
+
+        with patch.object(po, 'fix_beat_from_sequence_review',
+                          return_value=('fixed video 1', 'fixed image 2')), \
+             patch.object(po, 'generate_frame_sequence', side_effect=fake_render):
+            with self.assertRaises(RuntimeError):
+                po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2,
+                                   manual_reason='塔吊凭空消失了')
+
+        self.assertEqual(seen['gate'], 'manual_flagged')
+        self.assertEqual(seen['issue'], '塔吊凭空消失了')
+        # 重渲抛错后描述仍留在 manifest 上，人不用重写一遍
+        stored = self._read_manifest()['frames'][0]
+        self.assertEqual(stored['manual_issue'], '塔吊凭空消失了')
+
+    def test_duplicate_manual_and_machine_text_is_not_sent_twice(self):
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 2, 'quality_gate': 'sequence_review_flagged', 'vlm_qa_reason': '同一句话'},
+        ]})
+        po.set_manual_frame_issue(self.TITLE, 2, '同一句话')
+
+        with patch.object(po, 'fix_beat_from_sequence_review',
+                          return_value=('v', 'i')) as mock_fix, \
+             patch.object(po, 'generate_frame_sequence'):
+            po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
+
+        self.assertEqual(mock_fix.call_args.args[3], ['同一句话'])
+
+    def test_first_frame_manual_issue_goes_through_image_edit(self):
+        self._touch_frame(1)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 1, 'quality_gate': 'sequence_reviewed_pass'},
+        ]})
+        po.set_manual_frame_issue(self.TITLE, 1, '首帧地面太干净，不像废墟')
+
+        with patch.object(po, 'fix_image_prompt_with_vlm_feedback',
+                          return_value='fixed first frame') as mock_fix, \
+             patch.object(po, '_fix_frame_via_image_edit') as mock_edit, \
+             patch.object(po, 'generate_frame_sequence',
+                          side_effect=AssertionError('首帧修复不该走 generate_frame_sequence')):
+            po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 1)
+
+        mock_fix.assert_called_once_with({}, 'first frame', '首帧地面太干净，不像废墟')
+        mock_edit.assert_called_once()
 
 
 if __name__ == '__main__':

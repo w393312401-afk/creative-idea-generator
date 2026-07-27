@@ -145,11 +145,6 @@
             percent = Math.max(state.percent, 5);
             label = slot ? `IMG ${String(slot).padStart(3, '0')} 质检判定中` : '质检判定中';
             status = 'active';
-        } else if (stage === 'model_fallback') {
-            const fbModel = details && details.to;
-            percent = Math.max(state.percent, 5);
-            label = `主模型配额耗尽，兜底模型${fbModel ? ` ${fbModel}` : ''}渲染中`;
-            status = 'retrying';
         } else if (stage === 'frame') {
             current = Number(details && details.current) || 0;
             total = Number(details && details.total) || state.total || 0;

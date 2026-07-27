@@ -11,6 +11,15 @@
 
 /* Base Reset — box-sizing/margin/padding already declared in tokens.css */
 
+/* hidden 属性必须真的隐藏。本项目多处用 el.hidden = true/false 当显隐开关
+   （搜索方向面板、归档案例列表、案例正文、主题徽标……），但这些元素自己的类
+   规则里写了 display:flex，特异性相同又排在后面，把浏览器默认的
+   [hidden]{display:none} 顶掉了——于是「默认折叠」从来没生效过，搜索方向面板
+   一直摊开占着半屏，点开关也毫无反应。这里统一兜底，新组件不会再踩同一个坑。 */
+[hidden] {
+    display: none !important;
+}
+
 /* Background Particle Canvas */
 #particle-canvas {
     position: absolute;
@@ -147,51 +156,9 @@
     letter-spacing: 0.5px;
 }
 
-/* Theme Selector Grid */
-.theme-grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 12px;
-}
-
-.theme-btn {
-    background: var(--bg-card);
-    border: 1px solid var(--border-color);
-    border-radius: 12px;
-    padding: 16px 12px;
-    cursor: pointer;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 8px;
-    transition: var(--transition-fast);
-}
-
-.theme-btn:hover {
-    background: var(--bg-card-hover);
-    transform: translateY(-2px);
-    border-color: rgba(var(--ink-rgb), 0.12);
-}
-
-.theme-btn.active {
-    background: rgba(176, 123, 82, 0.04);
-    border-color: var(--neon-cyan);
-    box-shadow: 0 0 15px rgba(176, 123, 82, 0.12);
-}
-
-.theme-icon {
-    font-size: 22px;
-}
-
-.theme-name {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text-primary);
-}
-
-.theme-btn.active .theme-name {
-    color: var(--neon-cyan);
-}
+/* 固定基础场景主题选择器（.theme-grid / .theme-btn / .theme-icon / .theme-name）的样式
+   已随该选择器一并删除——HTML 与 JS 里都不再有任何元素使用这几个类。场景主题现在由
+   灵感卡片 + 联网参考库决定，不再是一组固定按钮。 */
 
 /* Anchor Flex Selection */
 .anchor-flex {
@@ -637,7 +604,7 @@ html[data-theme="dark"] .segment-btn.active {
 .live-beats-panel {
     width: 100%;
     max-width: 550px;
-    background: rgba(4, 6, 12, 0.85);
+    background: rgba(var(--ink-rgb), 0.06);
     border: 1px solid var(--neon-cyan-glow);
     border-radius: 10px;
     margin-top: 16px;
@@ -700,7 +667,7 @@ html[data-theme="dark"] .segment-btn.active {
 .live-terminal-panel {
     width: 100%;
     max-width: 550px;
-    background: rgba(4, 6, 12, 0.85);
+    background: rgba(var(--ink-rgb), 0.06);
     border: 1px solid var(--neon-cyan-glow);
     border-radius: 10px;
     margin-top: 20px;
@@ -849,6 +816,33 @@ html[data-theme="dark"] .segment-btn.active {
     overflow-wrap: anywhere;
 }
 
+/* 标题整行拆成主标题 + 话题串两段（renderIdeaTitles）：桌面端两段都在，只是话题串
+   压暗一档，让"这单叫什么"先跳出来；手机折叠态直接把话题串整段藏掉。 */
+.social-title-tags {
+    font-weight: 600;
+    color: var(--text-muted);
+}
+
+#idea-title .social-title-tags {
+    font-size: 0.82em;
+}
+
+/* 标题区折叠开关：只在手机上出现（见 panels-tabs.css 移动端块）。
+   写成两级选择器压过后加载的 .mini-icon-btn{display:flex}，否则桌面端也会露出来。 */
+.tiktok-title-line .idea-meta-toggle {
+    display: none;
+    width: 30px;
+    height: 30px;
+    flex: 0 0 30px;
+    align-self: start;
+    border-radius: 8px;
+    color: var(--text-secondary);
+}
+
+.idea-meta-toggle svg {
+    transition: transform 0.2s ease;
+}
+
 .tiktok-copy-btn {
     width: 34px;
     height: 34px;
@@ -870,6 +864,9 @@ html[data-theme="dark"] .segment-btn.active {
     display: flex;
     gap: 8px;
 }
+
+/* 注：主题/尺度两枚徽标在 DOM 里带 hidden（引入 TikTok 双行标题时就作废了），
+   靠文件顶部的全局 [hidden] 兜底真正隐藏；想让它们回来就删掉 HTML 上的 hidden。 */
 
 .tag-badge {
     background: rgba(var(--ink-rgb), 0.04);
@@ -1164,7 +1161,7 @@ html[data-theme="dark"] .segment-btn.active {
     color: var(--neon-cyan);
     word-break: break-all;
     line-height: 1.6;
-    background: rgba(0, 0, 0, 0.15);
+    background: rgba(var(--ink-rgb), 0.06);
     border-bottom-left-radius: 12px;
     border-bottom-right-radius: 12px;
 }
@@ -1189,7 +1186,7 @@ html[data-theme="dark"] .segment-btn.active {
     z-index: 100;
     display: flex;
     flex-direction: column;
-    box-shadow: -10px 0 30px rgba(0, 0, 0, 0.5);
+    box-shadow: -10px 0 30px rgba(var(--ink-rgb), 0.12);
     /* Use transform instead of right for GPU compositing (no layout recalc) */
     transform: translateX(100%);
     transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
@@ -1329,7 +1326,7 @@ html[data-theme="dark"] .segment-btn.active {
     background: rgba(var(--ink-rgb), 0.38);
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
-    z-index: 1100; /* 必须高于日志抽屉(1000)：否则日志展开时设置弹窗被压在下面 */
+    z-index: 1100; /* 高于日志 dock(900)：否则日志展开时设置弹窗被压在下面 */
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1352,7 +1349,13 @@ html[data-theme="dark"] .segment-btn.active {
        header/footer（含关闭按钮/保存按钮）用 flex-shrink:0 钉在可见区域内。 */
     max-height: 90vh;
     max-height: 90dvh;
-    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+    box-shadow: 0 20px 50px rgba(var(--ink-rgb), 0.16);
+}
+
+/* 宽版弹窗（如联网参考案例库管理）：内容是带筛选/排序/批量操作的表格式列表，
+   480px 的表单宽度装不下,给个更宽的上限 */
+.modal-content.modal-wide {
+    max-width: 760px;
 }
 
 .modal .modal-content.glass-panel {
@@ -1414,9 +1417,16 @@ html[data-theme="dark"] .segment-btn.active {
     box-shadow: 0 0 10px var(--neon-cyan-glow);
 }
 
-select option {
-    background-color: var(--bg-panel-solid);
-    color: var(--text-primary);
+select option,
+select optgroup {
+    background-color: var(--bg-panel-solid, #FBF8F1);
+    color: var(--text-primary, #2E2A24);
+}
+
+html[data-theme="dark"] select option,
+html[data-theme="dark"] select optgroup {
+    background-color: var(--bg-panel-solid, #221B14);
+    color: var(--text-primary, #ECE4D7);
 }
 
 .password-input-wrapper {
@@ -1488,7 +1498,7 @@ select option {
     border-radius: 10px;
     font-size: 13px;
     font-weight: 500;
-    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 10px 20px rgba(var(--ink-rgb), 0.10);
     display: flex;
     align-items: center;
     gap: 8px;

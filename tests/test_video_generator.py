@@ -4,6 +4,8 @@ import shutil
 import tempfile
 import unittest
 
+from unittest.mock import patch
+
 from video_generator import (
     rewrite_prompt_for_two_card_ui,
     load_slot_frames,
@@ -12,7 +14,17 @@ from video_generator import (
     _ManifestWriter,
     _video_info,
     _BatchBridge,
+    _merge_skip_missing,
+    merge_project_videos,
+    PartialMergeBlocked,
+    _select_pool_account,
+    _account_rotation_ring,
+    _account_switch_interval,
+    _next_unused_account,
+    plan_generation_legs,
 )
+
+from datetime import datetime, timedelta
 
 
 class TestPromptRewrite(unittest.TestCase):
@@ -154,6 +166,46 @@ class TestPlanVideoSlots(_TmpDirCase):
                                   gate_level='off')
         self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
 
+    def test_override_flagged_bypasses_sequence_review_block(self):
+        """2026-07-23：前端"确认风险，强制生成"必须真正让后端放行——此前 UI 弹窗确认
+        了也没用，plan_video_slots 仍按 quality_gate 硬拦，等于白问用户一遍。"""
+        frames = self._make_frames(4)
+        quality = {3: 'sequence_review_flagged'}
+        plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                  gate_level='standard', override_flagged=True)
+        self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
+        self.assertIn('确认风险强制生成', plans[1]['warning'])
+        self.assertNotIn('warning', plans[0])
+        # override_flagged=False（默认）仍照旧拦截，不能悄悄放宽默认行为
+        plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                  gate_level='standard')
+        self.assertEqual([p['action'] for p in plans], ['generate', 'blocked', 'blocked'])
+        # 降级帧（i2i_fallback_degraded）等其它独立门禁不受 override_flagged 影响
+        quality2 = {3: 'i2i_fallback_degraded'}
+        plans = plan_video_slots(self.VIDEOS, frames, quality2, self.videos_dir,
+                                  gate_level='standard', override_flagged=True)
+        self.assertEqual([p['action'] for p in plans], ['generate', 'blocked', 'blocked'])
+
+    def test_manually_flagged_frame_blocks_like_review_flagged(self):
+        """人工主动描述过问题、还没修的帧（manual_flagged，见
+        pipeline_orchestrator.set_manual_frame_issue）：与机器判定的坏帧同等对待，
+        不烧视频生成额度；用户确认风险后可 override 放行。"""
+        frames = self._make_frames(4)
+        quality = {3: 'manual_flagged'}
+        plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                  gate_level='standard')
+        self.assertEqual([p['action'] for p in plans], ['generate', 'blocked', 'blocked'])
+        self.assertIn('被人工标记存在问题', plans[1]['reason'])
+        # off 档整体停用质检时不做事后拦截，与其它 gate 一致
+        plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                  gate_level='off')
+        self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
+        # 确认风险后放行，但带警告
+        plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                  gate_level='standard', override_flagged=True)
+        self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
+        self.assertIn('被人工标记存在问题', plans[1]['warning'])
+
     def test_stale_lineage_blocks_standard_warns_lenient(self):
         frames = self._make_frames(4)
         stale = {3}
@@ -163,6 +215,19 @@ class TestPlanVideoSlots(_TmpDirCase):
         self.assertIn('血统过期', plans[1]['reason'])
         plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
                                   gate_level='lenient', stale_slots=stale)
+        self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
+        self.assertIn('旧 i2i 链', plans[1]['warning'])
+        self.assertNotIn('warning', plans[0])
+
+    def test_override_flagged_bypasses_stale_lineage_block(self):
+        """2026-07-24 修复：override_flagged 此前只豁免 vlm_qa_failed/
+        sequence_review_flagged 这一道硬拦，血统过期这道独立门禁仍照旧拦截——
+        用户在前端确认过风险，标准档下受影响的帧仍然不会被提交生成（不会上传
+        到视频后端），等于确认没有全部生效。"""
+        frames = self._make_frames(4)
+        stale = {3}
+        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
+                                  gate_level='standard', stale_slots=stale, override_flagged=True)
         self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
         self.assertIn('旧 i2i 链', plans[1]['warning'])
         self.assertNotIn('warning', plans[0])
@@ -185,6 +250,19 @@ class TestPlanVideoSlots(_TmpDirCase):
         plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
                                   gate_level='off', drift_slots=drift)
         self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
+
+    def test_override_flagged_bypasses_chain_drift_block(self):
+        """2026-07-24 修复：链回望空间断裂（chain_drift）此前不受 override_flagged
+        影响——实录案例：用户确认风险后 sequence_review_flagged 帧对应的视频被放行
+        了，但同一批里被链回望标记为 FAIL 段的槽位（4-12）仍然全部 blocked，锚点帧
+        从未被提交生成/上传到视频后端，用户的"确认风险"只对一部分槽位生效。"""
+        frames = self._make_frames(4)
+        drift = {2, 3}
+        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
+                                  gate_level='standard', drift_slots=drift, override_flagged=True)
+        self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
+        self.assertIn('空间断裂', plans[1]['warning'])
+        self.assertNotIn('warning', plans[0])
 
     def test_stale_and_drift_warnings_are_both_kept_on_lenient(self):
         frames = self._make_frames(4)
@@ -374,6 +452,405 @@ class TestVideoProgressEvents(unittest.TestCase):
         self.assertEqual(error[1]['total'], 5)
         self.assertEqual(error[1]['message'], 'boom')
         self.assertEqual(records[0]['slot'], 7)
+
+
+class TestMergeSkipMissing(unittest.TestCase):
+    """2026-07-22 改版：强制合并不再用起始锚点帧定格+「缺失」标注填充缺口，改成直接
+    跳过缺失/串片槽位、只拼接可用片段、2x 加速（用户要的"视频不全也能合成"）。同时
+    覆盖前一天踩到的 bug：project_dir 本身是相对路径（server_common.OUTPUT_ROOT=
+    'outputs'），output_path 必须是绝对路径，不能依赖 ffmpeg 子进程的 cwd。"""
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp()
+        self.orig_cwd = os.getcwd()
+        os.chdir(self.base)
+        # 相对路径项目目录，复刻 server_common._get_project_dir 的真实返回形态
+        self.rel_project_dir = os.path.join('outputs', 'test_project')
+        os.makedirs(os.path.join(self.rel_project_dir, 'videos'))
+        self.good_video = os.path.abspath(
+            os.path.join(self.rel_project_dir, 'videos', 'vid_001.mp4'))
+        with open(self.good_video, 'wb') as f:
+            f.write(b'fake')
+
+    def tearDown(self):
+        os.chdir(self.orig_cwd)
+        shutil.rmtree(self.base, ignore_errors=True)
+
+    def _fake_run(self, captured):
+        def fake_run(cmd, cwd=None, **kwargs):
+            captured.setdefault('calls', []).append(cmd)
+            if cmd[0] == 'ffprobe':
+                class Probe:
+                    returncode = 0
+                    stderr = ''
+                    stdout = '5.0'
+                return Probe()
+            # 主合并调用：复刻真实 ffmpeg 行为——相对路径参数按子进程 cwd 解析，
+            # 目标目录不存在就报错，不会自动创建目录
+            out_arg = cmd[-1]
+            resolved = out_arg if os.path.isabs(out_arg) else os.path.normpath(
+                os.path.join(cwd or os.getcwd(), out_arg))
+            if not os.path.isdir(os.path.dirname(resolved)):
+                class Fail:
+                    returncode = 1
+                    stderr = f'Error opening output {out_arg}: No such file or directory'
+                return Fail()
+            with open(resolved, 'wb') as f:
+                f.write(b'fake-mp4')
+            class Ok:
+                returncode = 0
+                stderr = ''
+            return Ok()
+        return fake_run
+
+    def test_skips_missing_slot_and_output_path_is_absolute(self):
+        captured = {}
+        with patch('video_generator.subprocess.run', side_effect=self._fake_run(captured)):
+            result = _merge_skip_missing(
+                self.rel_project_dir, {'title': 'Test Project'},
+                expected_slots=[1, 2], good={1: self.good_video},
+                missing=[2], mismatched=[])
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['status'], 'success')
+        self.assertTrue(result['partial'])
+        self.assertEqual(result['skipped_slots'], [2])
+        ffmpeg_cmd = next(c for c in captured['calls'] if c[0] == 'ffmpeg')
+        self.assertTrue(os.path.isabs(ffmpeg_cmd[-1]),
+                        f"ffmpeg output arg must be absolute: {ffmpeg_cmd[-1]}")
+        # 跳过模式不应再生成任何占位/字幕相关的临时文件
+        self.assertFalse(any('_ph_' in c for call in captured['calls'] for c in call))
+
+    def test_no_good_slots_returns_none(self):
+        result = _merge_skip_missing(
+            self.rel_project_dir, {'title': 'Test Project'},
+            expected_slots=[1, 2], good={}, missing=[1, 2], mismatched=[])
+        self.assertIsNone(result)
+
+
+class TestMergeManualUploadTrust(unittest.TestCase):
+    """2026-07-23 修复：手动上传（/api/upload_video）落盘前已经做过 verify_video_anchors
+    校验，且首尾帧不符时要求用户显式 force=true 确认覆盖——merge_project_videos 之前
+    对所有槽位一视同仁地重跑同一套锚点校验，等于把用户已经确认过的 force 覆盖再拦一次
+    （'合成识别不了手动上传的视频'）。手动上传的槽位现在直接信任，不重新验锚点；
+    自动生成（非 manual_upload）的槽位仍然照常校验，安全网没有被整体拆掉。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.videos_dir = os.path.join(self.tmp, 'videos')
+        self.frames_dir = os.path.join(self.tmp, 'frames')
+        os.makedirs(self.videos_dir)
+        os.makedirs(self.frames_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _touch(self, path):
+        with open(path, 'wb') as f:
+            f.write(b'x')
+        return path
+
+    def _write_manifest(self, frames_n, videos_entries, title='Manual Upload Trust Test'):
+        frames = []
+        for i in range(1, frames_n + 1):
+            frame_path = os.path.join(self.frames_dir, f'img_{i:03d}.webp')
+            self._touch(frame_path)
+            frames.append({'slot': i, 'sequence': i,
+                           'file': os.path.relpath(frame_path, self.tmp).replace('\\', '/')})
+        manifest = {'title': title, 'frames': frames, 'videos': videos_entries}
+        with open(os.path.join(self.tmp, 'manifest.json'), 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+
+    def _fake_run_factory(self, captured):
+        def fake_run(cmd, cwd=None, **kwargs):
+            captured.setdefault('calls', []).append(cmd)
+            if cmd[0] == 'ffprobe':
+                class Probe:
+                    returncode = 0
+                    stderr = ''
+                    stdout = '5.0'
+                return Probe()
+            i_idx = cmd.index('-i')
+            with open(cmd[i_idx + 1], 'r', encoding='utf-8') as f:
+                captured['concat_list'] = f.read()
+            out_path = cmd[-1]
+            os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+            with open(out_path, 'wb') as f:
+                f.write(b'fake-merged-mp4')
+
+            class Ok:
+                returncode = 0
+                stderr = ''
+            return Ok()
+        return fake_run
+
+    def test_manual_upload_slot_bypasses_anchor_mismatch(self):
+        self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
+        self._write_manifest(2, [
+            {'slot': 1, 'status': 'success', 'file': 'videos/vid_001.mp4',
+             'start_anchor_slot': 1, 'source': 'manual_upload'},
+        ])
+        captured = {}
+        # 即便锚点校验会判定不匹配（模拟用户已经 force 确认过的场景），手动上传的
+        # 槽位也不应该被 merge 再次拦下。
+        with patch('video_generator.verify_video_anchors', return_value=(False, 'forced mismatch')), \
+             patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+            result = merge_project_videos(self.tmp)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['status'], 'success')
+        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
+        self.assertEqual(len(concat_lines), 1)
+
+    def test_auto_generated_slot_still_blocked_on_anchor_mismatch(self):
+        """对照组：非手动上传的槽位没有被这次修复连带放松——安全网仍然有效。"""
+        self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
+        self._write_manifest(2, [
+            {'slot': 1, 'status': 'success', 'file': 'videos/vid_001.mp4',
+             'start_anchor_slot': 1, 'model': 'i2v'},
+        ])
+        with patch('video_generator.verify_video_anchors', return_value=(False, 'real mismatch')):
+            with self.assertRaises(PartialMergeBlocked) as ctx:
+                merge_project_videos(self.tmp)
+        self.assertIn(1, ctx.exception.mismatched)
+
+    def test_manual_upload_hero_clip_bypasses_anchor_mismatch(self):
+        self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
+        self._touch(os.path.join(self.videos_dir, 'vid_002.mp4'))
+        self._write_manifest(2, [
+            {'slot': 1, 'status': 'success', 'file': 'videos/vid_001.mp4', 'start_anchor_slot': 1},
+            {'slot': 2, 'status': 'success', 'file': 'videos/vid_002.mp4', 'start_anchor_slot': 2,
+             'meta': 'HERO', 'is_hero': True, 'source': 'manual_upload'},
+        ])
+        captured = {}
+        # 只让"英雄片段"这一路锚点判定为不匹配，验证正片槽位（非手动上传）走的仍是
+        # 真实校验结果、没有被这次修复连带放松。
+        def fake_verify(video_path, start_frame_path, end_frame_path, strict=False):
+            if 'vid_002' in video_path:
+                return False, 'forced mismatch'
+            return True, 'ok'
+        with patch('video_generator.verify_video_anchors', side_effect=fake_verify), \
+             patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+            result = merge_project_videos(self.tmp)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['status'], 'success')
+        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
+        self.assertEqual(len(concat_lines), 2, "手动上传的英雄片段应该照样拼进成片")
+
+
+class _FakeAccountPool:
+    """duck-typed 假号池，避免依赖真实的 AdsPower 动态 import。"""
+
+    def __init__(self, accounts=None, chosen=None):
+        self._accounts = accounts or []
+        self._chosen = chosen
+        self.pick_calls = []
+        self.mark_exhausted_calls = []
+
+    def list_accounts(self):
+        return self._accounts
+
+    def pick_account(self, min_credit=1):
+        self.pick_calls.append(min_credit)
+        return self._chosen
+
+    def mark_exhausted(self, user_id, cooldown_hours=24.0):
+        self.mark_exhausted_calls.append(user_id)
+
+
+class TestSelectPoolAccount(unittest.TestCase):
+    """号池自动选号钩子：池子为空/手动覆盖时完全不介入（向后兼容现有单选行为），
+    非空且未手动指定时才自动选号并写回 config。"""
+
+    def test_manual_override_skips_pool_entirely(self):
+        pool = _FakeAccountPool(accounts=[{'user_id': 'a'}], chosen={'user_id': 'a'})
+        config = {'googleFxUserId': 'manual_user'}
+        result = _select_pool_account(config, pool)
+        self.assertIsNone(result)
+        self.assertEqual(config['googleFxUserId'], 'manual_user')
+        self.assertEqual(pool.pick_calls, [])  # 完全没碰池子
+
+    def test_empty_pool_is_noop(self):
+        pool = _FakeAccountPool(accounts=[])
+        config = {'googleFxUserId': ''}
+        result = _select_pool_account(config, pool)
+        self.assertIsNone(result)
+        self.assertEqual(config.get('googleFxUserId'), '')
+        self.assertEqual(pool.pick_calls, [])
+
+    def test_picks_account_and_writes_back_to_config(self):
+        pool = _FakeAccountPool(accounts=[{'user_id': 'a'}], chosen={'user_id': 'a', 'credit': 500})
+        config = {}
+        result = _select_pool_account(config, pool)
+        self.assertEqual(result, 'a')
+        self.assertEqual(config['googleFxUserId'], 'a')
+        self.assertEqual(pool.pick_calls, [1])  # 默认 min_credit=1
+
+    def test_custom_min_credit_threshold_is_forwarded(self):
+        pool = _FakeAccountPool(accounts=[{'user_id': 'a'}], chosen={'user_id': 'a'})
+        config = {'videoAccountPoolMinCredit': 50}
+        _select_pool_account(config, pool)
+        self.assertEqual(pool.pick_calls, [50])
+
+    def test_no_eligible_account_raises_clear_error(self):
+        pool = _FakeAccountPool(accounts=[{'user_id': 'a'}], chosen=None)
+        config = {}
+        with self.assertRaises(RuntimeError) as ctx:
+            _select_pool_account(config, pool)
+        self.assertIn('号池', str(ctx.exception))
+
+
+class TestBatchBridgeCreditExhaustedDetection(unittest.TestCase):
+    """账号池自动选号生成失败时，命中"积分耗尽"关键词应标记该账号冷却；
+    手动单选/池子未参与本次生成时（pool_account_id 为 None）不应触碰账号池。"""
+
+    class _Writer:
+        def record(self, info):
+            pass
+
+    def _make_bridge(self, account_pool=None, pool_account_id=None):
+        plan = {'slot': 1, 'seq': 1, 'prompt': 'p',
+                'dest_path': os.path.join(os.getcwd(), 'vid_001.mp4')}
+        return _BatchBridge(
+            pending=[{'plan': plan}],
+            total=1,
+            video_model='veo',
+            writer=self._Writer(),
+            on_progress=lambda stage, payload: None,
+            account_pool=account_pool,
+            pool_account_id=pool_account_id,
+        )
+
+    def test_credit_exhausted_message_marks_account(self):
+        pool = _FakeAccountPool()
+        bridge = self._make_bridge(account_pool=pool, pool_account_id='acc_1')
+        fake_helpers = type('FakeHelpers', (), {'is_credit_exhausted_message': staticmethod(lambda msg: True)})()
+        with patch('video_generator._get_credit_helpers', return_value=fake_helpers):
+            bridge(0, 'video_error', {'message': 'Insufficient credits'})
+        self.assertEqual(pool.mark_exhausted_calls, ['acc_1'])
+
+    def test_non_credit_failure_does_not_mark_account(self):
+        pool = _FakeAccountPool()
+        bridge = self._make_bridge(account_pool=pool, pool_account_id='acc_1')
+        fake_helpers = type('FakeHelpers', (), {'is_credit_exhausted_message': staticmethod(lambda msg: False)})()
+        with patch('video_generator._get_credit_helpers', return_value=fake_helpers):
+            bridge(0, 'video_error', {'message': '生成失败：网络超时'})
+        self.assertEqual(pool.mark_exhausted_calls, [])
+
+    def test_no_pool_account_id_never_touches_pool(self):
+        """手动单选/池子为空时 pool_account_id 为 None，不应尝试判定/标记。"""
+        pool = _FakeAccountPool()
+        bridge = self._make_bridge(account_pool=pool, pool_account_id=None)
+        bridge(0, 'video_error', {'message': 'Insufficient credits'})
+        self.assertEqual(pool.mark_exhausted_calls, [])
+
+
+class TestAccountRotationRing(unittest.TestCase):
+    """换号不换 IP 阶梯的轮转环：只收当前真正可用的号，本次已选中的号排最前。"""
+
+    def _pool(self, accounts):
+        return _FakeAccountPool(accounts=accounts)
+
+    def test_orders_current_account_first(self):
+        pool = self._pool([{'user_id': 'a'}, {'user_id': 'b'}, {'user_id': 'c'}])
+        self.assertEqual(_account_rotation_ring({}, pool, 'b'), ['b', 'a', 'c'])
+
+    def test_excludes_disabled_and_low_credit(self):
+        pool = self._pool([
+            {'user_id': 'a', 'credit': 100},
+            {'user_id': 'b', 'disabled': True, 'credit': 100},
+            {'user_id': 'c', 'credit': 0},
+            {'user_id': 'd'},  # 积分未知：不排除
+        ])
+        self.assertEqual(_account_rotation_ring({}, pool, 'a'), ['a', 'd'])
+
+    def test_excludes_cooling_down_account(self):
+        future = (datetime.now() + timedelta(hours=2)).isoformat()
+        past = (datetime.now() - timedelta(hours=2)).isoformat()
+        pool = self._pool([
+            {'user_id': 'a'},
+            {'user_id': 'b', 'cooldown_until': future},
+            {'user_id': 'c', 'cooldown_until': past},
+            {'user_id': 'd', 'cooldown_until': 'garbage'},  # 解析不了不当冷却
+        ])
+        self.assertEqual(_account_rotation_ring({}, pool, 'a'), ['a', 'c', 'd'])
+
+    def test_pool_read_failure_falls_back_to_single_account(self):
+        class _Broken:
+            def list_accounts(self):
+                raise RuntimeError('AdsPower 不在线')
+        self.assertEqual(_account_rotation_ring({}, _Broken(), 'a'), ['a'])
+
+
+class TestPlanGenerationLegs(unittest.TestCase):
+    """切腿：每 switch_interval 个请求换一个号，全程同一个 IP（换 IP 已全局关停）。"""
+
+    def _items(self, n):
+        return [{'plan': {'slot': i}} for i in range(n)]
+
+    def test_single_account_pool_keeps_one_leg(self):
+        """可换的号 ≤1 个时不切腿。"""
+        for ring in ([], ['a']):
+            legs = plan_generation_legs(self._items(12), ring, 5)
+            self.assertEqual(len(legs), 1)
+            self.assertEqual(len(legs[0]['items']), 12)
+            self.assertIsNone(legs[0]['user_id'])
+
+    def test_switches_account_every_interval(self):
+        legs = plan_generation_legs(self._items(12), ['a', 'b', 'c'], 5)
+        self.assertEqual([len(l['items']) for l in legs], [5, 5, 2])
+        self.assertEqual([l['user_id'] for l in legs], ['a', 'b', 'c'])
+
+    def test_account_ring_wraps_around(self):
+        legs = plan_generation_legs(self._items(20), ['a', 'b'], 5)
+        self.assertEqual([l['user_id'] for l in legs], ['a', 'b', 'a', 'b'])
+
+    def test_never_emits_rotate_ip(self):
+        """换 IP 已关停：腿计划里不该再出现任何换 IP 指示。"""
+        for ring in ([], ['a'], ['a', 'b']):
+            for leg in plan_generation_legs(self._items(20), ring, 5):
+                self.assertNotIn('rotate_ip', leg)
+
+
+class TestRotationKnobs(unittest.TestCase):
+    """换号节拍的取值口径（配置键沿用历史名 googleFxIpRotateRequests）。"""
+
+    def test_switch_interval_defaults_and_sanitizes(self):
+        self.assertEqual(_account_switch_interval({}), 5)
+        self.assertEqual(_account_switch_interval({'googleFxIpRotateRequests': 8}), 8)
+        self.assertEqual(_account_switch_interval({'googleFxIpRotateRequests': 0}), 5)
+        self.assertEqual(_account_switch_interval({'googleFxIpRotateRequests': 'x'}), 5)
+        self.assertEqual(_account_switch_interval({'googleFxIpRotateRequests': -3}), 1)
+
+
+class TestIpRotationDisabled(unittest.TestCase):
+    """换 IP 全局关停的唯一出口：MIYA_ROTATE_THRESHOLD 恒定写成够不到的阈值。"""
+
+    def test_threshold_pinned_regardless_of_config(self):
+        import os
+        from server_common import apply_google_fx_runtime_overrides, _IP_ROTATE_DISABLED
+        for cfg in ({}, {'googleFxIpRotateRequests': 5}, {'googleFxIpRotateRequests': 1}):
+            os.environ['MIYA_ROTATE_THRESHOLD'] = '5'
+            apply_google_fx_runtime_overrides(cfg)
+            self.assertEqual(os.environ['MIYA_ROTATE_THRESHOLD'], str(_IP_ROTATE_DISABLED))
+
+
+class TestNextUnusedAccount(unittest.TestCase):
+    """登录失效补跑时挑号：先在环里找没用过的，环里没了再回头问号池。"""
+
+    def test_prefers_unused_ring_member(self):
+        pool = _FakeAccountPool(chosen={'user_id': 'z'})
+        self.assertEqual(_next_unused_account({}, pool, ['a', 'b', 'c'], {'a', 'b'}), 'c')
+        self.assertEqual(pool.pick_calls, [])  # 环里够用就不打扰号池
+
+    def test_falls_back_to_pool_pick(self):
+        pool = _FakeAccountPool(chosen={'user_id': 'z'})
+        self.assertEqual(_next_unused_account({}, pool, ['a'], {'a'}), 'z')
+
+    def test_returns_none_when_everything_used(self):
+        pool = _FakeAccountPool(chosen={'user_id': 'a'})
+        self.assertIsNone(_next_unused_account({}, pool, ['a'], {'a'}))
 
 
 if __name__ == '__main__':

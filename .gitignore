@@ -1,5 +1,9 @@
 # ── 私密:服务端模型密钥与访问码,绝不提交 ──
 server_config.json
+.env
+
+# ── 内置 Google FX 运行时状态（账号名、积分、代理计数等）──
+runtime/
 
 # ── Python 缓存 ──
 __pycache__/
@@ -29,10 +33,14 @@ library.json
 library.rebuilt.json
 topic_ledger.json
 trend_refs.json
+trend_refs.archive.json
 outputs/
 tasks/
 tasks.json
+# scratch/ 是目录形态；调试时更常见的是散落在仓库根的 scratch_xxx.json/.txt/.py
+# 单文件（一次性核对脚本与其输出），此前没被忽略，长期挂在 git status 的未跟踪列表里。
 scratch/
+scratch_*
 
 # ── 工具 / 编辑器目录 ──
 .claude/

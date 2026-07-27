@@ -191,55 +191,43 @@ class TestPromptFixes(unittest.TestCase):
         self.assertIn("Locked anchors: sliding door frame sill at Grid B2, metal support beam at Grid A1", fixed)
 
     def test_threshold_bridge_stage_validation(self):
-        # 1. Valid Threshold beat ladder
+        # TBCP v4: the entire crossing is ONE beat (bridge_stage=1), and it must not land
+        # earlier than index 3 (>= 2 ordinary exterior beats must precede it).
+        _MIN_PRE_THRESHOLD_BEATS = 2
+
+        def _bridge_1_idx(ladder):
+            idx = -1
+            for i, b in enumerate(ladder):
+                if b.get('bridge_stage') == 1 and idx < 0:
+                    idx = i
+            return idx
+
+        # 1. Valid: single bridge_stage=1 beat, at index >= _MIN_PRE_THRESHOLD_BEATS.
         valid_ladder = [
             {"index": 1, "operation": "clearing", "description": "Clear site", "bridge_stage": None},
-            {"index": 2, "operation": "threshold", "description": "Approach doorway", "bridge_stage": 1},
-            {"index": 3, "operation": "threshold", "description": "Cross doorway sill", "bridge_stage": 2},
+            {"index": 2, "operation": "repair", "description": "Patch exterior", "bridge_stage": None},
+            {"index": 3, "operation": "threshold", "description": "Cross doorway", "bridge_stage": 1},
             {"index": 4, "operation": "reward", "description": "Finished room", "bridge_stage": None}
         ]
-        
+        b1 = _bridge_1_idx(valid_ladder)
         violations = []
-        has_bridge_1 = False
-        has_bridge_2 = False
-        bridge_1_idx = -1
-        bridge_2_idx = -1
-        for idx, b in enumerate(valid_ladder):
-            bs = b.get('bridge_stage')
-            if bs == 1:
-                has_bridge_1 = True
-                bridge_1_idx = idx
-            elif bs == 2:
-                has_bridge_2 = True
-                bridge_2_idx = idx
-        if not (has_bridge_1 and has_bridge_2 and bridge_2_idx == bridge_1_idx + 1):
-            violations.append("In Threshold mode, there must be exactly two consecutive beats with bridge_stage=1 and bridge_stage=2.")
-        
+        if b1 < 0:
+            violations.append("In Threshold mode, there must be exactly one beat with bridge_stage=1 carrying the entire crossing.")
+        elif b1 < _MIN_PRE_THRESHOLD_BEATS:
+            violations.append("The threshold crossing beat (bridge_stage=1) must be at index 3 or later.")
         self.assertEqual(len(violations), 0)
 
-        # 2. Invalid Threshold beat ladder (non-consecutive bridge stages)
+        # 2. Invalid: crossing beat placed too early (Beat 1), no run-up at all.
         invalid_ladder = [
-            {"index": 1, "operation": "clearing", "description": "Clear site", "bridge_stage": 1},
-            {"index": 2, "operation": "threshold", "description": "Approach doorway", "bridge_stage": None},
-            {"index": 3, "operation": "threshold", "description": "Cross doorway sill", "bridge_stage": 2},
-            {"index": 4, "operation": "reward", "description": "Finished room", "bridge_stage": None}
+            {"index": 1, "operation": "threshold", "description": "Cross doorway", "bridge_stage": 1},
+            {"index": 2, "operation": "reward", "description": "Finished room", "bridge_stage": None}
         ]
+        b1 = _bridge_1_idx(invalid_ladder)
         violations = []
-        has_bridge_1 = False
-        has_bridge_2 = False
-        bridge_1_idx = -1
-        bridge_2_idx = -1
-        for idx, b in enumerate(invalid_ladder):
-            bs = b.get('bridge_stage')
-            if bs == 1:
-                has_bridge_1 = True
-                bridge_1_idx = idx
-            elif bs == 2:
-                has_bridge_2 = True
-                bridge_2_idx = idx
-        if not (has_bridge_1 and has_bridge_2 and bridge_2_idx == bridge_1_idx + 1):
-            violations.append("In Threshold mode, there must be exactly two consecutive beats with bridge_stage=1 and bridge_stage=2.")
-        
+        if b1 < 0:
+            violations.append("In Threshold mode, there must be exactly one beat with bridge_stage=1 carrying the entire crossing.")
+        elif b1 < _MIN_PRE_THRESHOLD_BEATS:
+            violations.append("The threshold crossing beat (bridge_stage=1) must be at index 3 or later.")
         self.assertEqual(len(violations), 1)
 
     def test_parse_and_format_prompt_slots_metadata(self):
@@ -293,7 +281,6 @@ Video prompt 8 here.
         beat_ladder = [
             {"operation": "demo", "bridge_stage": None},
             {"operation": "cross", "bridge_stage": 1},
-            {"operation": "cross", "bridge_stage": 2},
         ]
 
         # After only IMAGE 1 (the anchor) is compiled.
@@ -305,17 +292,28 @@ Video prompt 8 here.
         self.assertEqual(parsed_videos, {})
 
         # After beat 1 (VIDEO 1 + IMAGE 2) and beat 2 (bridge_stage=1, so IMAGE 3 is BRIDGE).
+        # TBCP v4: the single crossing beat's own VIDEO is the real, visible merged clip —
+        # also tagged BRIDGE (never discarded/HOLD).
         compiled_images = {1: "trauma state", 2: "beat 1 result", 3: "bridge entry"}
         compiled_videos = {1: "video 1", 2: "bridge video 2"}
         images, videos, block = _build_partial_prompt_block(compiled_images, compiled_videos, beat_ladder)
         self.assertEqual(images[3]['meta'], "BRIDGE")  # IMAGE 3 follows beat_ladder[1] (bridge_stage=1)
-        # VIDEO 2 is beat_ladder[1] itself (bridge_stage=1, TBCP v3 HOLD — discarded
-        # internal placeholder, never assembled into the final film).
-        self.assertEqual(videos[2]['meta'], "BRIDGE HOLD")
+        self.assertEqual(videos[2]['meta'], "BRIDGE")  # VIDEO 2 is beat_ladder[1] itself
         self.assertEqual(images[2]['meta'], "")
         self.assertEqual(videos[1]['meta'], "")
         self.assertIn("图片 3 [BRIDGE]:", block)
-        self.assertIn("视频 2 [BRIDGE HOLD]:", block)
+        self.assertIn("视频 2 [BRIDGE]:", block)
+
+        # Pan variant: the same single beat carries turn_direction -> VIDEO meta is
+        # "BRIDGE TURN" (IMAGE meta stays plain "BRIDGE" — the IMAGE side never changed).
+        pan_ladder = [
+            {"operation": "demo", "bridge_stage": None},
+            {"operation": "cross", "bridge_stage": 1, "turn_direction": "left"},
+        ]
+        images, videos, block = _build_partial_prompt_block(compiled_images, compiled_videos, pan_ladder)
+        self.assertEqual(images[3]['meta'], "BRIDGE")
+        self.assertEqual(videos[2]['meta'], "BRIDGE TURN")
+        self.assertIn("视频 2 [BRIDGE TURN]:", block)
 
     def test_checkpoint_is_failed_terminal_detects_poisoned_resume(self):
         """A checkpoint whose fallback_count already exceeds the quality gate is a failed-terminal
@@ -416,6 +414,40 @@ class TestPacketShapeNormalization(unittest.TestCase):
         self.assertIsInstance(ladder[1]["operation"], str)
         self.assertEqual(ladder[1]["bridge_stage"], 1)
 
+    def test_normalize_beat_ladder_fills_missing_operation_and_description(self):
+        # 回归：description/operation 不在 milestone 门禁的必填清单里，threshold/reward/
+        # 桥接拍还整段跳过那道门禁 —— LLM 漏给这两个键时，坏账一路漏到下游的字面取值
+        # (beats_desc / beat_user) 才炸成 KeyError('description')，用户侧只看到一句
+        # 「合成失败：'description'」。归一化必须在收口处补齐。
+        ladder = normalize_beat_ladder([
+            {"index": 1, "operation": "threshold", "bridge_stage": 1},
+            {"index": 2, "description": "  ", "milestone_name": "interior cleared",
+             "after_state": "the floor is swept back to bare boards"},
+            {"index": 3, "operation": "", "description": None, "milestone_name": "roof panelled"},
+            {"index": 4, "operation": "reward"},
+        ])
+        for beat in ladder:
+            self.assertIsInstance(beat["description"], str)
+            self.assertTrue(beat["description"].strip())
+            self.assertIsInstance(beat["operation"], str)
+            self.assertTrue(beat["operation"].strip())
+        self.assertEqual(ladder[0]["operation"], "threshold")
+        self.assertIn("interior cleared", ladder[1]["description"])
+        self.assertIn("bare boards", ladder[1]["description"])
+        self.assertEqual(ladder[2]["description"], "roof panelled")
+        self.assertEqual(ladder[2]["operation"], "repair")
+        # 下游的字面取值形态本身必须不再抛 KeyError
+        "\n".join(f"Beat {b['index']}: {b['operation']} - {b['description']}" for b in ladder)
+
+    def test_normalize_beat_ladder_keeps_declared_operation_and_description(self):
+        # 补齐逻辑只填空缺，绝不覆盖 LLM 已经给出的真实内容
+        ladder = normalize_beat_ladder([
+            {"index": 1, "operation": "clearing", "description": "haul the debris out",
+             "milestone_name": "site cleared"},
+        ])
+        self.assertEqual(ladder[0]["operation"], "clearing")
+        self.assertEqual(ladder[0]["description"], "haul the debris out")
+
     def test_normalize_beat_ladder_anchor_keywords(self):
         # SIGNATURE ANCHOR RULE (2026-07-20): the reward beat's anchor_keywords must
         # survive normalization as a clean list of non-empty strings, defaulting to []
@@ -464,22 +496,20 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
     LADDER = [
         {'index': 1, 'operation': 'clearing', 'description': 'clear debris', 'bridge_stage': None},
         {'index': 2, 'operation': 'framing', 'description': 'frame walls', 'bridge_stage': None},
-        {'index': 3, 'operation': 'threshold', 'description': 'approach to sill', 'bridge_stage': 1},
-        {'index': 4, 'operation': 'threshold', 'description': 'cross the sill', 'bridge_stage': 2},
-        {'index': 5, 'operation': 'paneling', 'description': 'panel interior', 'bridge_stage': None},
-        {'index': 6, 'operation': 'reward', 'description': 'final reveal', 'bridge_stage': None},
+        {'index': 3, 'operation': 'threshold', 'description': 'cross the sill', 'bridge_stage': 1},
+        {'index': 4, 'operation': 'paneling', 'description': 'panel interior', 'bridge_stage': None},
+        {'index': 5, 'operation': 'reward', 'description': 'final reveal', 'bridge_stage': None},
     ]
 
     def test_beat_space_family_hands_off_at_bridge(self):
         from prompt_pipeline import beat_space_family
         self.assertEqual(beat_space_family(self.LADDER, 1), 'exterior')
         self.assertEqual(beat_space_family(self.LADDER, 2), 'exterior')
-        self.assertEqual(beat_space_family(self.LADDER, 3), 'sill')
+        self.assertEqual(beat_space_family(self.LADDER, 3), 'interior')
         self.assertEqual(beat_space_family(self.LADDER, 4), 'interior')
         self.assertEqual(beat_space_family(self.LADDER, 5), 'interior')
-        self.assertEqual(beat_space_family(self.LADDER, 6), 'interior')
         no_bridge = [dict(b, bridge_stage=None) for b in self.LADDER]
-        for i in range(1, 7):
+        for i in range(1, 6):
             self.assertEqual(beat_space_family(no_bridge, i), 'exterior')
 
     def test_fix_primary_landmarks_dedupes_and_locks_scale(self):
@@ -512,14 +542,16 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
         self.assertIn('heartwood ridge at Grid B2 holding 60 percent of frame height', fixed)
         self.assertIn('mossy root shelf at Grid C2 holding 30 percent of frame height', fixed)
 
-    def test_fix_primary_landmarks_sill_strips_exterior_stanza(self):
+    def test_fix_primary_landmarks_interior_without_registered_set_strips_exterior_stanza(self):
         from prompt_pipeline import fix_primary_landmarks
+        packet_no_interior = dict(self.PACKET)
+        packet_no_interior.pop('interior_primary_landmarks', None)
         prompt = (
             "The threshold edges hug the left and right boundaries. "
             "Locked anchors: decaying trunk base opening at Grid C2, curved interior cavity wall at "
             "Grid B2, misty forest canopy at Grid A2."
         )
-        fixed = fix_primary_landmarks(prompt, self.PACKET, family='sill')
+        fixed = fix_primary_landmarks(prompt, packet_no_interior, family='interior')
         self.assertNotIn('locked anchors', fixed.lower())
         self.assertIn('threshold edges hug', fixed)
 
@@ -541,8 +573,21 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
             "The horizon line remains perfectly level at exactly 50-percent height of the frame."
         )
         self.assertEqual(check_anchor_scale_lock(good, self.PACKET, family='exterior'), [])
-        # 桥接帧豁免（TBCP 要求比例跨桥递增）
-        self.assertEqual(check_anchor_scale_lock(drifted, self.PACKET, family='sill'), [])
+
+    def test_check_worker_scale_lock_catches_mismatch(self):
+        from prompt_pipeline import check_worker_scale_lock
+        packet = dict(self.PACKET, worker_scale_percent='18%')
+        drifted = ("At t=0s, one lone worker enters the frame from the Grid C1 edge, standing "
+                   "roughly 40 percent of frame height; the worker hammers beams into place.")
+        errs = check_worker_scale_lock(drifted, packet)
+        self.assertEqual(len(errs), 1)
+        self.assertIn('18 percent', errs[0])
+        good = ("At t=0s, one lone worker enters the frame from the Grid C1 edge, standing "
+               "roughly 18 percent of frame height; the worker hammers beams into place.")
+        self.assertEqual(check_worker_scale_lock(good, packet), [])
+        # No worker present -> never flags; no packet scale locked -> never flags either
+        self.assertEqual(check_worker_scale_lock('A clean empty frame with no agents.', packet), [])
+        self.assertEqual(check_worker_scale_lock(drifted, self.PACKET), [])
 
     def test_check_shot_family_leakage(self):
         from prompt_pipeline import check_shot_family_leakage
@@ -565,7 +610,7 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
     def test_bridge_image_keeps_a_camera_declaration(self):
         # 实际产出的图5/6形状：旧逻辑把静态相机句整句删除且不补任何相机声明
         from prompt_pipeline import apply_proactive_fixes
-        beat = self.LADDER[2]  # bridge_stage 1
+        beat = self.LADDER[2]  # bridge_stage 1 — the single threshold beat, family 'interior'
         image = (
             "Static wide-angle eighteen-millimeter tripod shot at one-point-five meters height, "
             "locked eye-level perspective facing the hollow oak trunk. Backlit by overcast daylight, "
@@ -578,10 +623,10 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
             "Camera executes a coaxial forward push-in toward the doorway."
         )
         v, img = apply_proactive_fixes(3, video, image, self.PACKET, 'Threshold', False, True,
-                                       beat=beat, config=None, family='sill')
+                                       beat=beat, config=None, family='interior')
         self.assertNotIn('facing the hollow oak trunk', img)
         self.assertIn('vanishing axis', img.lower())
-        self.assertIn('sill', img.lower())
+        self.assertIn('rear cavity wall', img.lower())
 
     def test_pan_tilt_ban_is_negation_aware(self):
         from prompt_pipeline import check_camera_contradictions, fix_camera_contradictions

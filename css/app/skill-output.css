@@ -14,12 +14,12 @@
 .repair-banner.ok {
     background: rgba(122, 139, 111, 0.08);
     border-color: var(--neon-green-glow);
-    color: #c8f7c5;
+    color: var(--color-success);
 }
 .repair-banner.fixed {
     background: rgba(255, 170, 0, 0.10);
     border-color: rgba(255, 170, 0, 0.35);
-    color: #ffe2ad;
+    color: var(--color-warning);
 }
 
 .prompt-pre {
@@ -334,6 +334,13 @@
     line-height: 1.6;
 }
 
+/* 拖拽操作说明：比主说明再弱一档，属于"知道就好"的提示 */
+.frames-dnd-hint {
+    color: var(--text-muted);
+    font-size: 11.5px;
+    margin-top: 4px;
+}
+
 .frames-meta {
     color: var(--text-muted);
     font-size: 11.5px;
@@ -379,6 +386,39 @@
     border-color: var(--neon-cyan);
     color: var(--text-primary);
     transform: translateY(-2px);
+}
+
+/* 拖拽放置态（帧/视频网格）：拖文件进来上传、或把视频卡片拖到别的槽位换位时，
+   目标卡片整块罩上一层提示。提示文案由 JS 写进 data-drop-hint（"与 VID 003 换位" /
+   "上传到 IMG 005" 等），随 Alt 键实时变化，因此这里只负责画，不写死文案。 */
+.frame-card.dnd-drop-target {
+    border-color: var(--neon-cyan);
+    box-shadow: 0 0 0 2px rgba(0, 242, 254, 0.45), 0 0 14px rgba(0, 242, 254, 0.25);
+    transform: translateY(-2px);
+}
+
+.frame-card.dnd-drop-target::after {
+    content: attr(data-drop-hint);
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 4px;
+    border-radius: 8px;
+    background: rgba(3, 5, 12, 0.72);
+    color: #fff;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1.35;
+    pointer-events: none; /* 罩层不能吃掉 drop 事件 */
+    z-index: 20;
+}
+
+/* 正在被拖走的源卡片：淡出以示"这一格的内容正在搬家" */
+.frame-card.dnd-dragging {
+    opacity: 0.45;
 }
 
 /* Frame Retry and Actions */
@@ -577,6 +617,70 @@
 
 @media (max-width: 768px) {
     .frames-model-picker {
+        margin-left: 0;
+    }
+}
+
+/* ── 帧序列/视频序列调试模式：仅生成前 N 条 ──────────────────────────── */
+.debug-limit-picker {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+    flex-shrink: 0;
+    padding: 5px 10px;
+    border-radius: 8px;
+    border: 1px dashed rgba(217, 119, 6, 0.4);
+    background: rgba(217, 119, 6, 0.07);
+}
+
+.debug-limit-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+}
+
+.debug-limit-toggle input[type="checkbox"] {
+    cursor: pointer;
+}
+
+.debug-limit-picker input[type="number"] {
+    width: 46px;
+    padding: 4px 6px;
+    font-size: 0.8rem;
+    border-radius: 6px;
+    border: 1px solid rgba(var(--ink-rgb), 0.18);
+    background: rgba(var(--panel-rgb), 0.7);
+    color: var(--text-primary);
+    text-align: center;
+}
+
+.debug-limit-picker input[type="number"]:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.debug-limit-picker span {
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+/* 帧序列区已有 .frames-model-picker 占用右侧 auto-margin：调试控件跟在它右边即可，
+   自己不再抢第二份 auto margin（两个 auto margin 会被 flex 平分可用空间，把两者拉开
+   一段空隙，而不是紧挨着显示）。视频区没有模型选择器，调试控件保留自己的 auto margin。 */
+.frames-model-picker + .debug-limit-picker {
+    margin-left: 0;
+}
+
+@media (max-width: 768px) {
+    .debug-limit-picker {
         margin-left: 0;
     }
 }

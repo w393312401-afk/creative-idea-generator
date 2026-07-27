@@ -63,8 +63,8 @@ class TestQaGateLevelResolution(unittest.TestCase):
             self.assertEqual(qa_gate_level({'qaGateLevel': ' LENIENT '}), 'lenient')
 
     def test_effective_config_passes_level_through_in_managed_mode(self):
-        """服务端托管模式的白名单透传：漏掉这项就会复刻 imageEditFallbackModel
-        当年『配置了但从未生效』的静默失效 bug。"""
+        """服务端托管模式的白名单透传：这份白名单是唯一的透传口，漏掉一项就是
+        『配置了但从未生效』的静默失效（qaGateLevel 曾经就这么丢过一次）。"""
         with _gate_sources(), patch.object(server_common, 'SERVER_MANAGED', True):
             merged = effective_config({'qaGateLevel': 'lenient'})
             self.assertEqual(merged.get('qaGateLevel'), 'lenient')

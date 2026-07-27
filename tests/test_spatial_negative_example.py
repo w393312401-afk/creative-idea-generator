@@ -89,7 +89,7 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
 
     def test_slot_meta_family_mapping(self):
         expected = {1: 'exterior', 2: 'exterior', 3: 'exterior', 4: 'exterior',
-                    5: 'sill', 6: 'interior', 7: 'interior', 8: 'interior',
+                    5: 'interior', 6: 'interior', 7: 'interior', 8: 'interior',
                     9: 'interior', 10: 'interior'}
         got = {seq: image_space_family(VIDEOS, seq) for seq in IMAGES}
         self.assertEqual(got, expected)
@@ -158,6 +158,25 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         self.assertEqual(check_pbisp_peek(
             "Through the open trunk base, the heartwood ridge is already visible and sharp.",
             packet_with_interior), [])
+
+    def test_pbisp_peek_video_side_flagged_as_structural(self):
+        # 2026-07-22 森林瞭望塔实测单：图片3有门内预告室内锚点，视频2全篇没提，
+        # 造成视频末尾跟静态末帧对不上（"结尾跳变"）。label='VIDEO' 让同一条
+        # 检查也能查视频文本，且命中的错误文案要落进结构性硬伤标记表以触发回炉。
+        from prompt_pipeline import check_pbisp_peek, _STRUCTURAL_VIDEO_ERROR_MARKERS
+        packet_with_interior = dict(PACKET, interior_primary_landmarks=[
+            {'name': 'heartwood ridge', 'grid': 'Grid B2', 'z_depth_scale': '60%'},
+        ])
+        video_missing_peek = (
+            "Use the provided first frame and last frame as exact composition anchors. "
+            "The worker repairs the stairs and railings throughout the clip."
+        )
+        errs = check_pbisp_peek(video_missing_peek, packet_with_interior, label='VIDEO')
+        self.assertTrue(any('heartwood ridge' in e for e in errs))
+        self.assertTrue(any(any(m in e for m in _STRUCTURAL_VIDEO_ERROR_MARKERS) for e in errs))
+        self.assertEqual(check_pbisp_peek(
+            "Through the open trunk base, the heartwood ridge stays visible and sharp across the clip.",
+            packet_with_interior, label='VIDEO'), [])
 
     def test_video_process_content_contract(self):
         # 2026-07-12 17:18 实测单：IMAGE 对是全画幅大变化，VIDEO 却空心
@@ -258,6 +277,30 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         # 服装截断落在词边界，不再出现 "solid dark enters"
         self.assertNotIn('solid dark enters', out)
 
+    def test_out_and_in_injects_locked_worker_scale(self):
+        from prompt_pipeline import fix_out_and_in
+        beat = {'operation': 'framing', 'description': 'timber frame erected inside the cavity.'}
+        packet = {'worker_choreography': 'one lone worker in a solid bright-neon-yellow safety vest',
+                  'worker_scale_percent': '18%'}
+        out = fix_out_and_in('A lone worker hammers beams into place inside the cavity.',
+                             False, beat=beat, packet=packet)
+        self.assertIn('standing roughly 18 percent of frame height', out)
+        self.assertNotIn(',,', out)
+        # No worker_scale_percent locked on the packet -> clause degrades gracefully, no
+        # stray punctuation left behind where the clause would have been.
+        out_no_scale = fix_out_and_in('A lone worker hammers beams into place inside the cavity.',
+                                      False, beat=beat,
+                                      packet={'worker_choreography': packet['worker_choreography']})
+        self.assertNotIn('percent of frame height', out_no_scale)
+        self.assertNotIn(',,', out_no_scale)
+
+    def test_out_and_in_multi_worker_injects_scale(self):
+        from prompt_pipeline import fix_out_and_in
+        packet = {'worker_scale_percent': '22%'}
+        out = fix_out_and_in('Two workers assemble the frame together.', False, beat=None, packet=packet)
+        self.assertIn('each standing roughly 22 percent of frame height', out)
+        self.assertNotIn(',,', out)
+
     def test_sound_design_hum_hear_detected(self):
         # 实测单视频6形状："We hear sliding, clicks, and room hum." 曾被再贴一份棚内音底
         body = "We hear sliding, clicks, and room hum."
@@ -309,7 +352,7 @@ class TestNegativeExampleIsRepaired(unittest.TestCase):
                                 f"beat {i} {family} image has no camera attitude lock")
             # 4) 视频不再含未经许可的横摇/俯仰
             allow_sweep = LADDER[i - 1]['operation'] == 'reward'
-            errs = check_camera_contradictions(v_fixed, LADDER[i - 1]['bridge_stage'] in (1, 2),
+            errs = check_camera_contradictions(v_fixed, LADDER[i - 1]['bridge_stage'] == 1,
                                                ban_pan_tilt=not allow_sweep)
             self.assertEqual(errs, [], f"beat {i} video camera errors survived: {errs}")
 
@@ -322,7 +365,7 @@ class TestNegativeExampleIsRepaired(unittest.TestCase):
     def test_bridge_image5_regains_camera(self):
         _, (v, img) = self._fixed_beat(4)
         self.assertIn('vanishing axis', img.lower())
-        self.assertIn('sill', img.lower())
+        self.assertIn('enclosed interior', img.lower())
 
     def test_video5_pan_stripped_work_kept(self):
         _, (v, img) = self._fixed_beat(5)

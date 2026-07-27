@@ -42,17 +42,21 @@
     })();</script>
     <!-- Preload critical CSS for faster first paint -->
     <link rel="preload" href="css/tokens.css?v=1.1.1" as="style">
-    <link rel="preload" href="css/app/base.css?v=1.2.5" as="style">
+    <link rel="preload" href="css/app/base.css?v=1.3.0" as="style">
     <link rel="stylesheet" href="css/tokens.css?v=1.1.1">
     <!-- style.css split into ordered contiguous slices (concatenation == original); load order = cascade order -->
-    <link rel="stylesheet" href="css/app/base.css?v=1.2.5">
+    <link rel="stylesheet" href="css/app/base.css?v=1.3.0">
     <link rel="stylesheet" href="css/app/skill-output.css?v=1.2.2">
     <link rel="stylesheet" href="css/app/efficiency.css?v=1.2.2">
-    <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.2.8">
+    <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.6.8">
+    <!-- 激发结果页的极简布局（管线条 / 折叠标题 / section 弹层 / 宽屏分栏）。
+         必须排在 panels-tabs.css 之后：它要覆盖那里的桌面端 .content-header 与
+         移动端 .action-row 规则。见 docs/spark_result_minimal_layout_plan.md -->
+    <link rel="stylesheet" href="css/app/result-minimal.css?v=1.0.0">
     <link rel="stylesheet" href="css/image_studio.css?v=1.1.1">
     <link rel="stylesheet" href="css/gallery.css?v=1.1.0">
     <link rel="stylesheet" href="css/ledger.css?v=1.1.0">
-    <link rel="stylesheet" href="css/shared/lightbox.css?v=1.2.0">
+    <link rel="stylesheet" href="css/shared/lightbox.css?v=1.2.1">
 </head>
 <body>
     <!-- Background Canvas for Interactive Particles -->
@@ -110,6 +114,16 @@
             </div>
         </header>
 
+        <!-- Manual Intervention Banner: 登录失效/验证码/安全拦截需要人工在 AdsPower
+             浏览器窗口处理时常驻显示（不像 toast 那样自动消失），跨所有主标签页可见 -->
+        <div id="manual-intervention-banner" class="manual-intervention-banner" style="display: none;" role="alert">
+            <div class="banner-content">
+                <span class="banner-icon">🛑</span>
+                <span class="banner-text" id="manual-intervention-text">需要人工处理...</span>
+            </div>
+            <button id="manual-intervention-dismiss-btn" class="banner-btn" title="我已处理/暂时不管">知道了</button>
+        </div>
+
         <!-- Top-level workspace tabs: exclusive single-panel view at every screen size -->
         <div class="mobile-nav-tabs">
             <button id="main-tab-config" class="mobile-nav-btn active" onclick="switchMainTab('config')">
@@ -149,14 +163,29 @@
                         <div class="control-group">
                             <div class="preset-header-row">
                                 <label class="group-title">1. 联网参考案例库</label>
-                                <button type="button" id="trend-refs-search-btn" class="preset-header-action">🔍 搜一批新参考</button>
+                                <div class="trend-refs-header-actions">
+                                    <button type="button" id="trend-refs-direction-toggle" class="preset-header-action" title="自定义联网搜索方向，就在这里改，不用去配置中心">🎯 搜索方向</button>
+                                    <button type="button" id="trend-refs-search-btn" class="preset-header-action">🔍 搜一批新参考</button>
+                                </div>
+                            </div>
+                            <div class="trend-refs-direction-panel" id="trend-refs-direction-panel" hidden>
+                                <label for="trend-refs-search-query">搜索方向（留空用默认：最新爆款延时摄影改造视频）</label>
+                                <input type="text" id="trend-refs-search-query" placeholder="例如：AI 宠物拟人化改造视频 趋势">
+                                <label for="trend-refs-trend-urls">参考网址（每行一个，最多取前 5 个，可选）</label>
+                                <textarea id="trend-refs-trend-urls" rows="2" placeholder="https://..."></textarea>
+                                <p class="trend-refs-direction-hint">改这里会同步「配置中心」里的同一项设置，下次点「搜一批新参考」立即生效——换个方向搜，案例库才不会越搜越像。</p>
                             </div>
                             <p class="trend-refs-hint">勾选参考后，灵感推荐将直接从这些已验证案例中取材；不勾选则每批自动联网搜索（结果也会沉淀进本库）。</p>
+                            <div class="trend-refs-toolbar">
+                                <input type="text" id="trend-refs-filter" class="trend-refs-filter" placeholder="筛选案例库…" hidden>
+                                <span class="trend-refs-selected-note" id="trend-refs-selected-note"></span>
+                            </div>
                             <div class="trend-refs-list" id="trend-refs-list">
                                 <div class="trend-refs-empty">正在载入联网参考案例库...</div>
                             </div>
                             <div class="trend-refs-archive-bar">
                                 <span class="trend-refs-cap-note" id="trend-refs-cap-note"></span>
+                                <button type="button" id="trend-refs-manage-open-btn" class="trend-refs-archive-toggle">🗂️ 管理全部</button>
                                 <button type="button" id="trend-refs-archive-toggle" class="trend-refs-archive-toggle" hidden>查看归档</button>
                             </div>
                             <div class="trend-refs-list trend-refs-archive-list" id="trend-refs-archive-list" hidden></div>
@@ -180,7 +209,7 @@
                              letting the theme-conditioned ideation cards / composer decide them. -->
                         <div class="control-group">
                             <div class="slider-labels">
-                                <span>施工节拍数 (Beat Count)</span>
+                                <span id="beat-count-label">最多施工节拍数 (Milestone Cap)</span>
                                 <span id="val-beats">15 拍</span>
                             </div>
                             <div class="slider-track-row">
@@ -191,6 +220,13 @@
                                 </datalist>
                                 <button type="button" class="slider-step-btn" data-target="slider-beats" data-step="1" aria-label="增加节拍数">+</button>
                             </div>
+                            <label class="field-row" for="beat-count-mode" style="margin-top:10px; display:flex; align-items:center; justify-content:space-between; gap:12px;">
+                                <span>节拍规划模式</span>
+                                <select id="beat-count-mode" aria-label="节拍规划模式">
+                                    <option value="adaptive" selected>自适应 · 删除填充拍</option>
+                                    <option value="fixed">固定 · 严格按所选拍数</option>
+                                </select>
+                            </label>
                         </div>
 
                         <!-- Fixed-value data holders for complexity/budget/ratio/creativity — no
@@ -217,10 +253,16 @@
                             <span class="summary-label">配置摘要：</span>
                             <span id="config-summary-text" class="summary-text">正在计算...</span>
                         </div>
-                        <div class="ideation-model-picker">
+                        <!-- picker-collapsed：手机上默认只留「LLM 模型 · 使用中 xxx」一行，
+                             芯片组点开才展开——整组芯片在窄屏要占 200 多像素，等于把上方
+                             真正要操作的案例库/灵感卡挤成一条缝。桌面端忽略该 class。 -->
+                        <div class="ideation-model-picker picker-collapsed" id="ideation-model-picker">
                             <div class="model-picker-head">
                                 <span class="model-picker-label">LLM 模型</span>
                                 <span id="ideation-llm-model-active-hint" class="model-active-hint"></span>
+                                <button type="button" id="ideation-llm-toggle" class="model-picker-toggle" aria-expanded="false" aria-controls="ideation-llm-groups" title="展开模型选择">
+                                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                                </button>
                             </div>
                             <div id="ideation-llm-groups" class="model-family-groups"></div>
                         </div>
@@ -248,7 +290,7 @@
                 <div class="output-placeholder active" id="output-placeholder-view">
                     <div class="placeholder-icon">☄️</div>
                     <h3>等待引燃创意星火...</h3>
-                    <p>在左侧勾选联网参考案例、从灵感推荐卡片「载入维度」选定选题并调整节拍数，点击“激发”。后端会把该选题送入 <b>restoration-prompt-composer</b> skill，按其连续性契约合成完整的「图片 1–N+1 + 视频 1–N」提示词集，并附质量审核报告。</p>
+                    <p>在左侧勾选联网参考案例、点选灵感推荐卡片（卡片上的「🔨 节拍简介」可看全部节拍并同时载入维度）选定选题并调整节拍数，点击“激发”。后端会把该选题送入 <b>restoration-prompt-composer</b> skill，按其连续性契约合成完整的「图片 1–N+1 + 视频 1–N」提示词集，并附质量审核报告。</p>
                 </div>
 
                 <!-- Loading State View -->
@@ -324,12 +366,17 @@
 
                 <!-- Idea Content View -->
                 <div class="output-content" id="output-content-view">
-                    <div class="content-header">
+                    <!-- meta-collapsed：手机上默认只留一行主标题，话题串与中文标题行收起，
+                         把首屏让给封面/帧序列；桌面端忽略该 class（见 panels-tabs.css 移动端块） -->
+                    <div class="content-header meta-collapsed" id="idea-content-header">
                         <div class="idea-title-row">
                             <div class="tiktok-title-line">
                                 <h2 id="idea-title">Secret Floating Treehouse Build #TinyHome #Renovation #Restoration #DIYBuild #BeforeAndAfter #OddlySatisfying</h2>
                                 <button id="copy-tiktok-meta-btn" class="mini-icon-btn tiktok-copy-btn" title="复制 TikTok 标题和 tags">
                                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                                </button>
+                                <button id="idea-meta-toggle" class="mini-icon-btn idea-meta-toggle" type="button" aria-expanded="false" aria-controls="idea-content-header" title="展开完整标题与话题">
+                                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
                                 </button>
                             </div>
                             <div class="tiktok-title-line tiktok-title-line-cn">
@@ -343,56 +390,122 @@
                                 <span class="tag-badge" id="tag-creativity">脑洞大开</span>
                             </div>
                         </div>
-                        <div class="action-row header-sticky-actions">
-                            <button id="copy-prompt-btn-all" class="action-btn text-btn primary">
-                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                                <span>复制全部提示词</span>
+                    </div>
+
+                    <!-- ==========================================================
+                         管线条 (Pipeline Bar)
+                         取代原来 7 枚等权平铺按钮。左边 4 枚步骤芯片就是原来的
+                         封面/帧序列/视频/合并按钮本体——id 原样保留，所以 app.js
+                         与 media_renderer.js 里既有的 btn.disabled 控制、
+                         mergeVideos 的 innerHTML 换文案全部照常生效，生成逻辑零改动。
+                         芯片的状态文字与三态样式由 app.js 的 updatePipelineBar() 刷新。
+                         中间那枚主按钮永远指向"当前该做的下一步"，右边 ⋯ 收纳
+                         复制/收藏/导出三个随手工具。
+                         见 docs/spark_result_minimal_layout_plan.md
+                         ========================================================== -->
+                    <div class="pipeline-bar" id="pipeline-bar">
+                        <div class="pipeline-steps">
+                            <button type="button" id="make-cover-btn" class="pipeline-step" data-step="cover" data-section="cover-section">
+                                <span class="step-num">1</span>
+                                <span class="step-body">
+                                    <span class="step-label">封面</span>
+                                    <span class="step-stat">未生成</span>
+                                </span>
                             </button>
-                            <button id="make-cover-btn" class="action-btn text-btn">
-                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
-                                <span>生成封面图</span>
+                            <span class="pipeline-arrow" aria-hidden="true">›</span>
+                            <button type="button" id="generate-frames-btn" class="pipeline-step" data-step="frames" data-section="frames-section">
+                                <span class="step-num">2</span>
+                                <span class="step-body">
+                                    <span class="step-label">帧序列</span>
+                                    <span class="step-stat">未生成</span>
+                                </span>
                             </button>
-                            <button id="generate-frames-btn" class="action-btn text-btn">
-                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
-                                <span>生成帧序列</span>
+                            <span class="pipeline-arrow" aria-hidden="true">›</span>
+                            <button type="button" id="generate-videos-btn" class="pipeline-step" data-step="videos" data-section="videos-section">
+                                <span class="step-num">3</span>
+                                <span class="step-body">
+                                    <span class="step-label">视频</span>
+                                    <span class="step-stat">未生成</span>
+                                </span>
                             </button>
-                            <button id="generate-videos-btn" class="action-btn text-btn">
-                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"></rect><line x1="7" y1="2" x2="7" y2="22"></line><line x1="17" y1="2" x2="17" y2="22"></line><line x1="2" y1="12" x2="22" y2="12"></line><line x1="2" y1="7" x2="7" y2="7"></line><line x1="2" y1="17" x2="7" y2="17"></line><line x1="17" y1="17" x2="22" y2="17"></line><line x1="17" y1="7" x2="22" y2="7"></line></svg>
-                                <span>生成视频序列</span>
+                            <span class="pipeline-arrow" aria-hidden="true">›</span>
+                            <button type="button" id="merge-videos-btn" class="pipeline-step" data-step="merge" data-section="videos-section">
+                                <span class="step-num">4</span>
+                                <span class="step-body">
+                                    <span class="step-label">成片</span>
+                                    <span class="step-stat">未合并</span>
+                                </span>
                             </button>
-                            <button id="merge-videos-btn" class="action-btn text-btn">
-                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15V9a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v6M6 12h12M15 8l-3 4 3 4M9 16l3-4-3-4"></path></svg>
-                                <span>合并并加速视频</span>
+                        </div>
+                        <div class="pipeline-tail">
+                            <button type="button" id="pipeline-next-btn" class="pipeline-next">
+                                <span id="pipeline-next-text">生成封面图</span>
+                                <span class="pipeline-next-arrow" aria-hidden="true">→</span>
                             </button>
-                            <button id="save-idea-btn" class="action-btn text-btn">
-                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
-                                <span id="save-idea-btn-text">收藏点子</span>
-                            </button>
-                            <button id="export-idea-btn" class="action-btn text-btn">
-                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-                                <span>导出 Markdown</span>
-                            </button>
+                            <div class="pipeline-more-wrap">
+                                <button type="button" id="pipeline-more-btn" class="pipeline-more-btn" aria-haspopup="true" aria-expanded="false" title="更多操作">⋯</button>
+                                <div class="pipeline-more-menu" id="pipeline-more-menu" hidden>
+                                    <button id="copy-prompt-btn-all" class="action-btn text-btn menu-item">
+                                        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                                        <span>复制全部提示词</span>
+                                    </button>
+                                    <button id="save-idea-btn" class="action-btn text-btn menu-item">
+                                        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
+                                        <span id="save-idea-btn-text">收藏点子</span>
+                                    </button>
+                                    <button id="export-idea-btn" class="action-btn text-btn menu-item">
+                                        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                                        <span>导出 Markdown</span>
+                                    </button>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
-                    <!-- Navigation Tabs -->
+                    <!-- Navigation Tabs（原「校验与质量审核」页已并入概览页顶部的状态条） -->
                     <div class="result-tabs-bar">
                         <button class="tab-btn active" data-tab="overview" id="tab-btn-overview">
                             <span>📊 结果概览</span>
                             <span class="tab-status-dot" id="overview-status-dot" style="display: none;"></span>
                         </button>
                         <button class="tab-btn" data-tab="prompts" id="tab-btn-prompts">📋 提示词</button>
-                        <button class="tab-btn" data-tab="audit" id="tab-btn-audit">✅ 校验与质量审核</button>
                     </div>
 
                     <div class="content-scroll-area">
                         <!-- Tab 1: Overview -->
                         <div class="tab-panel active" id="tab-panel-overview">
+                            <!-- 质量审核状态条（原独立的「校验与质量审核」tab）：
+                                 平时只是一行"通过 / 有修复建议"，点开才展开完整报告。
+                                 有修复建议时 renderIdea 会自动展开并加 warning-highlight。 -->
+                            <div class="audit-strip" id="audit-strip">
+                                <div class="repair-banner" id="idea-repair" style="display:none;"></div>
+                                <details id="audit-details" class="audit-details">
+                                    <summary class="audit-details-summary">
+                                        <div class="summary-summary-title">
+                                            <span class="section-icon" id="audit-status-icon">✅</span>
+                                            <h3>提示词质量审核</h3>
+                                            <span class="audit-status-text" id="audit-status-text">通过</span>
+                                        </div>
+                                        <span class="fold-indicator">展开报告</span>
+                                    </summary>
+                                    <div class="audit-panel card-dark" id="idea-audit" style="margin-top: 12px;"></div>
+                                </details>
+                            </div>
+
                             <!-- Cover Section -->
                             <div class="idea-section" id="cover-section">
                                 <div class="section-title">
                                     <span class="section-icon">🖼️</span>
                                     <h3>TikTok 9:16 视频封面</h3>
+                                    <div class="section-tools">
+                                        <button type="button" class="section-tool-btn" data-pop="cover-info-pop" title="说明">ⓘ</button>
+                                    </div>
+                                </div>
+                                <!-- 说明文字从卡片里挪进这个弹层：它每次都一模一样，
+                                     常驻显示只是把封面预览往下推。span 的 id 不变，
+                                     app.js 里更新模型/画幅/画质的代码照旧生效。 -->
+                                <div class="section-pop" id="cover-info-pop" hidden>
+                                    <p class="cover-desc-text">使用 <b id="cover-desc-model">gemini-3.1-flash-image</b> 图像生成模型制作 <b id="cover-desc-ratio">9:16</b> 规格 (<b id="cover-desc-quality">2K</b>) 封面图。采用<b>左右柔和过渡前后对比</b>形式，画面偏写实，文字风格固定且惊艳。</p>
                                 </div>
                                 <div class="cover-wrapper card-dark">
                                     <div class="cover-content">
@@ -410,8 +523,6 @@
                                             </div>
                                         </div>
                                         <div class="cover-info-controls">
-                                            <p class="cover-desc-text">使用 <b id="cover-desc-model">gemini-3.1-flash-image</b> 图像生成模型制作 <b id="cover-desc-ratio">9:16</b> 规格 (<b id="cover-desc-quality">2K</b>) 封面图。采用<b>左右柔和过渡前后对比</b>形式，画面偏写实，文字风格固定且惊艳。</p>
-
                                             <!-- TikTok 英文文案展示（media_renderer.renderCoversForIdea 填充；之前该块被误删导致功能失联） -->
                                             <div id="cover-hook-display" class="cover-hook-box" style="display: none;">
                                                 <span class="hook-label">TikTok US 英文文案</span>
@@ -439,17 +550,37 @@
                                 <div class="section-title">
                                     <span class="section-icon">🎞️</span>
                                     <h3>连续帧序列生成</h3>
+                                    <div class="section-tools">
+                                        <button type="button" class="section-tool-btn" data-pop="frames-settings-pop" title="生成设置：生图模型 / 调试限帧 / 一致性审查">⚙️</button>
+                                        <button type="button" class="section-tool-btn" data-pop="frames-info-pop" title="说明">ⓘ</button>
+                                    </div>
+                                </div>
+                                <!-- 次级控件收进 ⚙ 弹层、常驻说明收进 ⓘ 弹层：两者原本挤在
+                                     .frames-controls 一行里，把真正要看的帧网格推到折叠线以下。
+                                     控件 id 全部不变（app.js 的 computeDebugTargets / 模型选择器
+                                     初始化照旧按 id 取元素）。 -->
+                                <div class="section-pop" id="frames-settings-pop" hidden>
+                                    <div class="frames-model-picker">
+                                        <label for="frames-image-model">生图模型</label>
+                                        <select id="frames-image-model"></select>
+                                    </div>
+                                    <div class="debug-limit-picker" title="调试模式：只生成前 N 帧，快速验证提示词是否值得往下做，不用等整单跑完">
+                                        <label class="debug-limit-toggle">
+                                            <input type="checkbox" id="frames-debug-enabled">
+                                            <span>调试：仅生成前</span>
+                                        </label>
+                                        <input type="number" id="frames-debug-count" min="1" max="99" value="3" disabled>
+                                        <span>帧</span>
+                                    </div>
+                                    <button id="run-sequence-review-btn" class="action-btn text-btn mini-btn" title="整套序列渲染完成后，手动检查跨帧施工顺序/空间一致性（不会自动运行，也不会阻塞视频生成）">🔍 一致性审查</button>
+                                </div>
+                                <div class="section-pop" id="frames-info-pop" hidden>
+                                    <p class="frames-desc">将生成的所有图片提示词连成单链帧序列：第一帧进行文本生成图像，后续每一帧均以前一帧为唯一参考进行图生图（img2img）修改。</p>
+                                    <p class="frames-desc frames-dnd-hint">拖拽：格子之间互拖＝两帧换位（拖到空格＝搬过去，按住 Alt/⌥ 放手＝复制一份）；把本地图片拖进某一格＝替换该帧（按本单画幅裁剪），一次拖多张＝从落点起按文件名顺序依次填；把格子拖到桌面＝导出这张图。帧号始终不变，换位后其后各帧会标记为血统过期。</p>
                                 </div>
                                 <div class="frames-wrapper card-dark">
                                     <div class="frames-controls">
-                                        <div>
-                                            <p class="frames-desc">将生成的所有图片提示词连成单链帧序列：第一帧进行文本生成图像，后续每一帧均以前一帧为唯一参考进行图生图（img2img）修改。</p>
-                                            <p class="frames-meta" id="frames-meta">尚未生成任何帧序列。</p>
-                                        </div>
-                                        <div class="frames-model-picker">
-                                            <label for="frames-image-model">生图模型</label>
-                                            <select id="frames-image-model"></select>
-                                        </div>
+                                        <p class="frames-meta" id="frames-meta">尚未生成任何帧序列。</p>
                                     </div>
                                     <div class="frames-progress" id="frames-progress" style="display:none; align-items: center; gap: 12px; justify-content: center; flex-wrap: wrap;">
                                         <div class="cover-spinner"></div>
@@ -480,13 +611,31 @@
                                 <div class="section-title">
                                     <span class="section-icon">🎬</span>
                                     <h3>本地 UI 自动化视频生成</h3>
+                                    <div class="section-tools">
+                                        <button type="button" class="section-tool-btn" data-pop="videos-settings-pop" title="生成设置：调试限段">⚙️</button>
+                                        <button type="button" class="section-tool-btn" data-pop="videos-info-pop" title="说明">ⓘ</button>
+                                    </div>
+                                </div>
+                                <div class="section-pop" id="videos-settings-pop" hidden>
+                                    <div class="debug-limit-picker" title="调试模式：只生成前 N 段视频，快速验证提示词是否值得往下做，不用等整单跑完（注意每段视频需要对应的首尾帧已生成）">
+                                        <label class="debug-limit-toggle">
+                                            <input type="checkbox" id="videos-debug-enabled">
+                                            <span>调试：仅生成前</span>
+                                        </label>
+                                        <input type="number" id="videos-debug-count" min="1" max="99" value="3" disabled>
+                                        <span>段</span>
+                                    </div>
+                                </div>
+                                <div class="section-pop" id="videos-info-pop" hidden>
+                                    <p class="frames-desc">利用本地 UI 自动化 (Playwright + Adspower)，将图片帧序列与对应的视频提示词结合，插值生成连续的视频剪辑。</p>
+                                    <p class="frames-desc frames-dnd-hint">拖拽：卡片之间互拖＝两段视频换位（拖到空槽位＝搬过去，按住 Alt/⌥ 放手＝复制一份）；把本地视频文件拖进某一格＝上传覆盖该槽位。槽位编号始终不变。</p>
                                 </div>
                                 <div class="frames-wrapper card-dark">
                                     <div class="frames-controls">
-                                        <div>
-                                            <p class="frames-desc">利用本地 UI 自动化 (Playwright + Adspower)，将图片帧序列与对应的视频提示词结合，插值生成连续的视频剪辑。</p>
-                                            <p class="frames-meta" id="videos-meta">尚未生成任何视频序列。</p>
-                                        </div>
+                                        <!-- videos-meta 留在正文里（不进 ⓘ 弹层）：合并被门禁拦截时
+                                             renderMergeBlocked 会把「重试缺口 / 跳过合并」两个可操作
+                                             按钮渲染进这里，收进弹层就等于把出口藏起来了。 -->
+                                        <p class="frames-meta" id="videos-meta">尚未生成任何视频序列。</p>
                                     </div>
                                     <div class="frames-progress" id="videos-progress" style="display:none; align-items: center; gap: 12px; justify-content: center; flex-wrap: wrap;">
                                         <div class="cover-spinner"></div>
@@ -501,7 +650,10 @@
                                         </div>
                                         <button id="cancel-videos-btn" class="action-btn text-btn secondary mini-btn" style="margin-left: 12px; margin-top: 0; padding: 4px 10px; font-size: 11px;">取消</button>
                                     </div>
-                                    
+                                    <!-- 手动上传视频覆盖某个槽位用的隐藏文件选择器，由 media_renderer.js 里各槽位卡片的
+                                         「上传」按钮共用触发（点击时先记下目标槽位号，见 app.js 里的 change 监听）。 -->
+                                    <input type="file" id="video-upload-input" accept="video/*" style="display:none">
+
                                     <!-- Merged finished video player -->
                                     <div id="merged-video-container" style="display: none; margin-bottom: 20px; padding: 15px; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px;">
                                         <h4 style="margin-top: 0; margin-bottom: 12px; color: var(--text-primary); font-size: 14px; display: flex; align-items: center; gap: 8px;">
@@ -554,23 +706,7 @@
                             </div>
                         </div>
 
-                        <!-- Tab 3: Audit -->
-                        <div class="tab-panel" id="tab-panel-audit">
-                            <!-- Second-pass construction-order / causality / spatial-consistency verdict -->
-                            <div class="repair-banner" id="idea-repair" style="display:none;"></div>
-
-                            <!-- Quality audit report (skill output) wrapped in details -->
-                            <details id="audit-details" class="audit-details" open>
-                                <summary class="audit-details-summary">
-                                    <div class="summary-summary-title">
-                                        <span class="section-icon">✅</span>
-                                        <h3>提示词质量审核报告 (Quality Audit)</h3>
-                                    </div>
-                                    <span class="fold-indicator">展开/折叠</span>
-                                </summary>
-                                <div class="audit-panel card-dark" id="idea-audit" style="margin-top: 12px;"></div>
-                            </details>
-                        </div>
+                        <!-- （原 Tab 3「校验与质量审核」已并入概览页顶部的 #audit-strip） -->
                     </div>
                 </div>
             </section>
@@ -954,18 +1090,12 @@
             <div class="search-input-wrapper">
                 <input type="text" id="library-search" placeholder="搜索标题、主题或提示词...">
             </div>
+            <!-- 「所有场景主题」下拉框已移除：它硬编码着固定主题选择器时代的 8 个主题名,
+                 而筛选逻辑是 idea.theme 精确匹配。主题选择器移除后 idea.theme 变成了整句
+                 一键输入串(「做一个废弃乡村石砌烤烟房改造成山谷离网避世睡眠小屋」),永远
+                 匹配不上那 8 个值,这个筛选器已彻底筛不出东西;且每条创意的 theme 都各不
+                 相同,主题作为分类维度本身就不成立。上面的搜索框已覆盖 theme 的模糊匹配。 -->
             <div class="filter-dropdowns">
-                <select id="library-filter-theme">
-                    <option value="">所有场景主题</option>
-                    <option value="百年空心橡树">百年空心橡树</option>
-                    <option value="蓝冰冰川洞">蓝冰冰川洞</option>
-                    <option value="退役潜艇舱">退役潜艇舱</option>
-                    <option value="废弃水塔">废弃水塔</option>
-                    <option value="搁浅货轮船体">搁浅货轮船体</option>
-                    <option value="废弃导弹井">废弃导弹井</option>
-                    <option value="河畔树皮小屋">河畔树皮小屋</option>
-                    <option value="海蚀洞穴">海蚀洞穴</option>
-                </select>
                 <select id="library-filter-time">
                     <option value="newest">按保存时间：最新</option>
                     <option value="oldest">按保存时间：最早</option>
@@ -1040,13 +1170,6 @@
                     </select>
                 </div>
                 <div class="form-group">
-                    <label for="settings-supervised-mode">Supervised Mode (关键点监修模式)</label>
-                    <select id="settings-supervised-mode">
-                        <option value="off" selected>🤖 关闭 — 全自动</option>
-                        <option value="on">🧑‍⚖️ 开启 — 首帧/换族锚点帧暂停人工确认（10 分钟无操作自动采用）</option>
-                    </select>
-                </div>
-                <div class="form-group">
                     <label for="settings-ideation-search-query">Ideation Search Query (激发联网搜索词，可选)</label>
                     <input type="text" id="settings-ideation-search-query" placeholder="留空使用默认：最新 爆款 延时摄影 废墟改造成居所 视频 趋势…">
                     <small style="opacity:.65;display:block;margin-top:4px;">随机创意激发前联网搜索用的查询词；改词立即生效，按搜索词分别缓存 6 小时</small>
@@ -1061,7 +1184,7 @@
                     <select id="settings-fx-image-model">
                         <option value="Nano Banana Pro">Nano Banana Pro</option>
                         <option value="Nano Banana 2" selected>🍌 Nano Banana 2</option>
-                        <option value="Imagen 4">Imagen 4</option>
+                        <option value="Nano Banana 2 Lite">🍌 Nano Banana 2 Lite</option>
                     </select>
                 </div>
                 <div class="form-group" id="fx-video-model-group" style="display: none;">
@@ -1085,14 +1208,27 @@
                     </select>
                     <small style="opacity:.65;display:block;margin-top:4px;">仅 Omni Flash 模型面板提供该时长切换；Veo 系列时长固定，切到 Veo 模型时本项自动隐藏且不生效</small>
                 </div>
-                <div class="form-group" id="fx-ip-rotate-requests-group" style="display: none;">
-                    <label for="settings-fx-ip-rotate-requests">Auto-rotate IP Frequency (自动轮换 IP 频率，单位：次请求)</label>
-                    <input type="number" id="settings-fx-ip-rotate-requests" min="1" max="100" placeholder="默认 5 次">
+                <div class="form-group" id="fx-account-switch-group" style="display: none;">
+                    <label for="settings-fx-account-switch-requests">Account Switch Frequency (换号频率，单位：次请求)</label>
+                    <input type="number" id="settings-fx-account-switch-requests" min="1" max="100" placeholder="默认 5 次">
+                    <small style="opacity:.65;display:block;margin-top:4px;">帧序列 / 视频序列生成里每这么多个请求换一次号池账号（帧序列按最近的链式批次边界换）。<strong>换 IP 已全局关停</strong>：换 IP 会把 Flow 登录 token 打失效、还会让画布追踪串片，现在全程保持同一个 IP，只换号</small>
                 </div>
                 <div class="form-group" id="fx-browser-id-group" style="display: none;">
                     <label for="settings-fx-browser-id">AdsPower Browser No. (浏览器编号 / User ID)</label>
-                    <input type="text" id="settings-fx-browser-id" placeholder="留空使用服务端默认浏览器">
-                    <small style="opacity:.65;display:block;margin-top:4px;">多开/多账号场景下切换本次帧序列 / 视频生成实际驱动哪个 AdsPower 窗口（对应 AdsPower 里该浏览器的 user_id/编号）；改动即存，下次生成生效，同进程内其他仍在跑的 FX 任务也会切到新窗口</small>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <select id="settings-fx-browser-id" style="flex:1;min-width:0;">
+                            <option value="">留空 = 号池自动选号 / 服务端默认浏览器</option>
+                        </select>
+                        <button type="button" id="settings-fx-browser-id-refresh" class="text-btn secondary" title="重新读取号池里的环境编号">🔄</button>
+                    </div>
+                    <small style="opacity:.65;display:block;margin-top:4px;">选项来自「生成号池」里的环境编号（打开配置或点 🔄 时刷新）。选了本项 = 这一次临时指定用哪个 AdsPower 窗口，跳过号池自动选号（也一并关掉换号轮转）；留「号池自动选号」且号池非空时，帧序列 / 视频生成会自动挑一个还有积分的账号</small>
+                </div>
+                <!-- 视频生成始终走 AdsPower/google_fx（跟上面"生图后端"的 api/google_fx
+                     切换无关，那个开关只管生图路径），所以号池入口不跟着 fx-browser-id-group
+                     一起被 imageBackend!=='google_fx' 隐藏——否则生图走 api 后端的人永远看不到 -->
+                <div class="form-group">
+                    <button type="button" id="account-pool-manage-open-btn" class="text-btn secondary">🎬 生成号池管理</button>
+                    <small style="opacity:.65;display:block;margin-top:4px;">管理用于帧序列 / 视频生成的多个 AdsPower/Flow 账号，发起生成前自动挑一个还有积分的账号</small>
                 </div>
                 <div class="form-group">
                     <label for="settings-image-ratio">Image Aspect Ratio (生图宽高比)</label>
@@ -1132,37 +1268,155 @@
         </div>
     </div>
 
+    <!-- Beat Outline Modal — 灵感卡片的「节拍简介」完整视图。卡片轨道是横向定宽卡片，
+         十几拍的清单在卡片里只能截断/内嵌滚动（用户看不全），所以全量清单统一放到这里：
+         modal-body 自己滚动，节拍一条不落。内容由 js/prompt_pipeline.js 的
+         openBeatOutlineModal 用 DOM/textContent 注入（LLM 文本不走 innerHTML）。 -->
+    <div class="modal" id="beat-outline-modal">
+        <div class="modal-content glass-panel">
+            <div class="modal-header">
+                <h3 id="beat-outline-modal-title">🔨 节拍简介</h3>
+                <button id="beat-outline-modal-close-btn" class="close-btn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-info" id="beat-outline-modal-info"></div>
+                <ol class="ideation-card-outline-list beat-outline-modal-list" id="beat-outline-modal-list"></ol>
+            </div>
+        </div>
+    </div>
+
+    <!-- Trend Refs Library Management Modal — full-page browse/sort/filter/bulk-delete
+         view for trend_refs.json, modeled on 创意台账 tab's toolbar/bulk-bar pattern
+         (css/ledger.css classes reused directly for visual consistency). The compact
+         sidebar list stays for pick-before-generate; this is for library housekeeping. -->
+    <div class="modal" id="trend-refs-manage-modal">
+        <div class="modal-content glass-panel modal-wide">
+            <div class="modal-header">
+                <h3>🗂️ 管理联网参考案例库</h3>
+                <button id="trend-refs-manage-close-btn" class="close-btn">&times;</button>
+            </div>
+            <div class="modal-body trend-refs-manage-body">
+                <div class="ledger-toolbar trend-refs-manage-toolbar">
+                    <div class="ledger-filters" id="trend-refs-manage-scope">
+                        <button class="ledger-filter-chip active" data-scope="main">主库</button>
+                        <button class="ledger-filter-chip" data-scope="archive">归档</button>
+                    </div>
+                    <div class="ledger-search-sort">
+                        <input type="search" id="trend-refs-manage-filter" class="ledger-search-input" placeholder="🔍 搜索 label / 正文" autocomplete="off">
+                        <select id="trend-refs-manage-sort" class="ledger-sort-select" title="排序方式">
+                            <option value="created_desc" selected>最新优先</option>
+                            <option value="created_asc">最旧优先</option>
+                            <option value="used_desc">曾用次数高优先</option>
+                            <option value="label_asc">按 label 字母/拼音</option>
+                        </select>
+                    </div>
+                    <div class="ledger-toolbar-right">
+                        <span class="ledger-stats" id="trend-refs-manage-stats"></span>
+                    </div>
+                </div>
+                <div class="ledger-bulk-bar">
+                    <button type="button" id="trend-refs-manage-select-all-btn" class="ledger-tool-btn">☑️ 全选</button>
+                    <span class="ledger-bulk-count" id="trend-refs-manage-bulk-count"></span>
+                    <div class="ledger-bulk-spacer"></div>
+                    <button type="button" id="trend-refs-manage-bulk-delete-btn" class="ledger-tool-btn danger" disabled>🗑️ 批量删除所选</button>
+                </div>
+                <div class="trend-refs-list trend-refs-manage-list" id="trend-refs-manage-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Account Pool Management Modal — 生成号池：用户名下几个 Flow 账号
+         的标签/已知积分/启用状态，发起生成前自动挑一个还有额度的账号使用。
+         帧序列与视频序列共用同一个池子（都是 labs.google Flow 的额度）。
+         规模小（几个账号），不需要 trend-refs 那套搜索/排序/批量选择基础设施，
+         就是一个简单列表 + 添加行。 -->
+    <div class="modal" id="account-pool-manage-modal">
+        <div class="modal-content glass-panel modal-wide">
+            <div class="modal-header">
+                <h3>🎬 生成号池管理</h3>
+                <button id="account-pool-manage-close-btn" class="close-btn">&times;</button>
+            </div>
+            <div class="modal-body account-pool-manage-body">
+                <div class="modal-info">
+                    <p>💡 池子为空时完全不影响现有行为（沿用上面「AdsPower Browser No.」单选）。
+                    积分只信「刷新积分」按钮的真实探测结果——打开一次浏览器读 Flow 页面，比较慢；
+                    发起视频生成时如果缓存已超过 30 分钟也会自动刷新一次。</p>
+                </div>
+                <div class="account-pool-sort-row">
+                    <label for="account-pool-sort-select">↕ 排序方式：</label>
+                    <select id="account-pool-sort-select" class="account-pool-sort-select">
+                        <option value="serial_asc">按环境编号 (升序)</option>
+                        <option value="credit_desc">按积分余额 (高 → 低)</option>
+                        <option value="credit_asc">按积分余额 (低 → 高)</option>
+                        <option value="tasks_desc">按任务总数 (多 → 少)</option>
+                        <option value="image_desc">按图片任务数 (多 → 少)</option>
+                        <option value="video_desc">按视频任务数 (多 → 少)</option>
+                        <option value="name_asc">按账号命名 (A → Z)</option>
+                    </select>
+                </div>
+                <div class="account-pool-list" id="account-pool-list"></div>
+                <div class="account-pool-bulk-row">
+                    <button type="button" id="account-pool-import-all-btn" class="ledger-tool-btn"
+                            title="把本机 AdsPower 里所有浏览器环境一次性加进号池，已在池子里的跳过（不覆盖已改过的命名/备注）">📥 一键添加全部 AdsPower 环境</button>
+                    <small style="opacity:.65;">环境多的时候不用一个一个加；命名默认用环境的邮箱地址，加完可以逐个禁用不想用的。</small>
+                </div>
+                <div class="account-pool-add-row">
+                    <select id="account-pool-add-select">
+                        <option value="">-- 从 AdsPower 环境里选一个 --</option>
+                    </select>
+                    <input type="text" id="account-pool-add-name" placeholder="账号命名（留空默认用邮箱地址）">
+                    <input type="text" id="account-pool-add-note" placeholder="备注（选填）">
+                    <button type="button" id="account-pool-add-btn" class="ledger-tool-btn">➕ 添加</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast Notification Container -->
     <!-- Toast Notification Container -->
     <div id="toast-container" class="toast-container"></div>
 
-    <!-- Floating Log Panel -->
+    <!-- 日志静息态：右下角状态胶囊。日志 90% 的时间只需要回答"有没有出问题"，
+         不值一条 45px 全宽横栏(旧版)；出问题时胶囊上直接顶出 ERROR/WARN 计数，
+         比埋在横栏里的一颗小圆点显眼得多。点击展开右侧 dock。 -->
+    <button type="button" class="log-pill" id="log-pill" title="打开本地服务工作日志">
+        <span class="log-panel-status-dot"></span>
+        <span class="log-pill-label">日志</span>
+        <span class="log-pill-badge" id="log-pill-badge" hidden>0</span>
+    </button>
+
+    <!-- 本地服务工作日志：右侧全高 dock（展开态） -->
     <div class="log-panel-drawer" id="log-panel-drawer">
+        <div class="log-dock-resizer" id="log-dock-resizer" title="拖动调整日志面板宽度"></div>
         <div class="log-panel-header" id="log-panel-header">
             <div class="log-panel-title">
                 <span class="log-panel-status-dot"></span>
                 <span>🖥️ 本地服务工作日志</span>
             </div>
             <div class="log-panel-actions">
+                <button id="toggle-log-btn" class="log-action-btn" title="收起日志面板">收起</button>
+            </div>
+        </div>
+        <div class="log-panel-filters" id="log-panel-filters">
+            <div class="log-filter-row">
+                <button type="button" id="log-problems-only-btn" class="log-action-btn" title="只看 WARN 及以上级别，再点一次恢复">只看问题</button>
+                <div class="log-level-chips" id="log-level-chips">
+                    <button type="button" class="log-level-chip lvl-ERROR active" data-level="ERROR">ERROR</button>
+                    <button type="button" class="log-level-chip lvl-WARN active" data-level="WARN">WARN</button>
+                    <button type="button" class="log-level-chip lvl-INFO active" data-level="INFO">INFO</button>
+                    <button type="button" class="log-level-chip lvl-DEBUG" data-level="DEBUG">DEBUG</button>
+                    <button type="button" class="log-level-chip lvl-OTHER active" data-level="OTHER" title="未套用新格式的旧日志行">其他</button>
+                </div>
+            </div>
+            <input type="text" id="log-task-filter" class="log-filter-input" placeholder="按任务 id 过滤（点行内任务标签快速填入）" spellcheck="false">
+            <input type="text" id="log-search-input" class="log-filter-input" placeholder="搜索关键词..." spellcheck="false">
+            <div class="log-filter-row log-filter-row-foot">
                 <label class="log-panel-checkbox-label">
                     <input type="checkbox" id="log-autoscroll-chk" checked> 自动滚动
                 </label>
                 <button id="clear-log-btn" class="log-action-btn" title="清空日志面板">清空</button>
-                <button id="toggle-log-btn" class="log-action-btn" title="展开/收起日志">展开</button>
+                <span class="log-filter-count" id="log-filter-count"></span>
             </div>
-        </div>
-        <div class="log-panel-filters" id="log-panel-filters">
-            <button type="button" id="log-problems-only-btn" class="log-action-btn" title="只看 WARN 及以上级别，再点一次恢复">只看问题</button>
-            <div class="log-level-chips" id="log-level-chips">
-                <button type="button" class="log-level-chip lvl-ERROR active" data-level="ERROR">ERROR</button>
-                <button type="button" class="log-level-chip lvl-WARN active" data-level="WARN">WARN</button>
-                <button type="button" class="log-level-chip lvl-INFO active" data-level="INFO">INFO</button>
-                <button type="button" class="log-level-chip lvl-DEBUG" data-level="DEBUG">DEBUG</button>
-                <button type="button" class="log-level-chip lvl-OTHER active" data-level="OTHER" title="未套用新格式的旧日志行">其他</button>
-            </div>
-            <input type="text" id="log-task-filter" class="log-filter-input" placeholder="按任务 id 过滤（点行内任务标签快速填入）" spellcheck="false">
-            <input type="text" id="log-search-input" class="log-filter-input" placeholder="搜索关键词..." spellcheck="false">
-            <span class="log-filter-count" id="log-filter-count"></span>
         </div>
         <div class="log-panel-body" id="log-panel-body">
             <div id="log-output-lines"><div class="log-line lvl-OTHER" data-level="OTHER">正在连接本地服务日志流...</div></div>
@@ -1170,20 +1424,21 @@
     </div>
 
     <!-- Modular JS: defer so they never block HTML parsing. Order preserved. -->
-    <script src="js/state.js?v=1.1.10" defer></script>
-    <script src="js/utils.js?v=1.1.2" defer></script>
+    <script src="js/state.js?v=1.1.12" defer></script>
+    <script src="js/utils.js?v=1.2.2" defer></script>
     <script src="js/theme_toggle.js?v=1.1.0" defer></script>
-    <script src="js/config.js?v=1.2.2" defer></script>
-    <script src="js/trend_refs.js?v=1.1.0" defer></script>
+    <script src="js/config.js?v=1.2.8" defer></script>
+    <script src="js/trend_refs.js?v=1.3.0" defer></script>
+    <script src="js/account_pool.js?v=1.1.0" defer></script>
     <script src="js/progress_model.js?v=1.2.3" defer></script>
-    <script src="js/api_client.js?v=1.1.8" defer></script>
-    <script src="js/prompt_pipeline.js?v=1.1.7" defer></script>
+    <script src="js/api_client.js?v=1.3.1" defer></script>
+    <script src="js/prompt_pipeline.js?v=1.2.2" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
-    <script src="js/media_renderer.js?v=1.1.6" defer></script>
-    <script src="app.js?v=1.3.8" defer></script>
+    <script src="js/media_renderer.js?v=1.3.1" defer></script>
+    <script src="app.js?v=1.3.24" defer></script>
     <script src="js/image_studio.js?v=1.0.4" defer></script>
     <script src="js/gallery.js?v=1.1.2" defer></script>
-    <script src="js/ledger.js?v=1.1.0" defer></script>
+    <script src="js/ledger.js?v=1.1.1" defer></script>
     <!-- 旧「移动端标签切换」内联脚本已删除：它指向早已不存在的 mobile-tab-left/right，
          MutationObserver 永远空转；自动切换结果面板改由 app.js 的 switchMainTab('results') 完成 -->
 
@@ -1199,18 +1454,5 @@
         <button class="lightbox-nav lightbox-next" id="next-lightbox-btn" title="下一张 (Right Arrow)">▶</button>
     </div>
 
-    <!-- 监修模式审阅面板：review_pause 事件弹出，采用/重渲回传决策，超时自动采用 -->
-    <div class="lightbox-overlay" id="review-modal" style="display: none;">
-        <div class="review-panel">
-            <h3 class="review-title" id="review-title">🧑‍⚖️ 监修确认</h3>
-            <img id="review-img" src="" alt="待审帧" style="display: none;">
-            <p class="review-context" id="review-context"></p>
-            <div class="review-actions">
-                <button type="button" class="review-btn review-btn-adopt" id="review-adopt-btn">✅ 采用并继续</button>
-                <button type="button" class="review-btn review-btn-rerender" id="review-rerender-btn">🔁 重渲此帧</button>
-            </div>
-            <p class="review-countdown" id="review-countdown"></p>
-        </div>
-    </div>
 </body>
 </html>

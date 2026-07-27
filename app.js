@@ -54,6 +54,17 @@ async function initServerMode() {
                 }
             }
         }
+        // 技能契约缺失只劣化生成质量、不影响接口可用性，过去仅写进启动日志——
+        // 从浏览器用的人看不到那个终端，等于没有告知。这里提示一次。
+        const sc = m && m.skill_contract;
+        if (sc && Array.isArray(sc.missing) && sc.missing.length > 0) {
+            console.warn('skill contract missing', sc.dir, sc.source, sc.missing);
+            showToast(
+                `⚠️ 技能契约缺失 ${sc.missing.length}/${sc.total} 个文件，生成质量将降级。`
+                + `当前技能包目录：${sc.dir}。`
+                + `请在 server_config.json 里把 skillDir 指向技能包所在目录（改完不用重启）`,
+                'error', 10000);
+        }
     } catch (e) {
         console.warn('mode check failed', e);
     }
@@ -92,10 +103,12 @@ document.addEventListener('DOMContentLoaded', () => {
     checkApiStatus();
     setupEventListeners();
     setupDragAndDrop();
+    initDebugLimitControls();
     resumeActiveTaskIfExists();
     resumeActiveBackgroundTasksIfExists();
     startGlobalTasksBadgePolling();
     loadIdeationCards();
+    initBeatOutlineModal();
     updateDrawerTopOffset();
     window.addEventListener('resize', window._debounce(updateDrawerTopOffset, 150));
     const refreshBtn = document.getElementById('ideate-refresh-btn');
@@ -113,9 +126,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Function updateConfigSummary moved to modular JS file
 
+// 各预设原本还带一个 theme 字段（glacier_cave / water_tower / submarine_cabin /
+// hollow_oak），指向已移除的固定基础场景主题选择器里的按钮 id。#theme-selector 不在
+// DOM 里之后 applyPreset 里那段选中逻辑必然空转，字段本身也就成了纯死数据，一并删掉。
 const PRESETS = {
     nature_wonder: {
-        theme: 'glacier_cave',
         anchors: ['water_glass_floor', 'bioluminescent_moss'],
         complexity: 2,
         budget: 2,
@@ -124,7 +139,6 @@ const PRESETS = {
         beats: 5
     },
     industrial_relic: {
-        theme: 'water_tower',
         anchors: ['single_slab_counter', 'living_wood_stair'],
         complexity: 3,
         budget: 2,
@@ -133,7 +147,6 @@ const PRESETS = {
         beats: 8
     },
     retired_vehicle: {
-        theme: 'submarine_cabin',
         anchors: ['carrier_cutout_window', 'single_slab_counter'],
         complexity: 3,
         budget: 3,
@@ -142,7 +155,6 @@ const PRESETS = {
         beats: 10
     },
     contrast_novelty: {
-        theme: 'hollow_oak',
         anchors: ['bark_camouflaged_hatch', 'rerouted_waterfall_shower'],
         complexity: 2,
         budget: 1,
@@ -159,6 +171,19 @@ const PRESETS = {
 // Function parsePromptBlock moved to modular JS file
 
 // Function renderParsedPrompts moved to modular JS file
+
+// 页脚 LLM 芯片组收回折叠态（仅窄屏有意义；桌面端 picker-collapsed 不生效，
+// 调了也不会有视觉变化）。config.js 选完模型后回调这里，见 syncIdeationLlmPicker。
+function collapseIdeationPickerOnMobile() {
+    if (!window.matchMedia || !window.matchMedia('(max-width: 768px)').matches) return;
+    const picker = document.getElementById('ideation-model-picker');
+    if (picker) picker.classList.add('picker-collapsed');
+    const toggle = document.getElementById('ideation-llm-toggle');
+    if (toggle) {
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.title = '展开模型选择';
+    }
+}
 
 // Top-level workspace switch: exclusive single-panel view (config / results / image studio),
 // used at every screen size. 'left'/'right' are accepted as aliases of 'config'/'results' for
@@ -203,7 +228,12 @@ function switchMainTab(tabName) {
     }
 }
 
+// 结果页的 tab 白名单。「校验与质量审核」页已并入概览页顶部的状态条，但老用户的
+// localStorage 里可能还存着 'audit'；不回退的话会出现三个都不高亮、内容区全空的死状态。
+const RESULT_TAB_IDS = ['overview', 'prompts'];
+
 function switchTab(tabId) {
+    if (!RESULT_TAB_IDS.includes(tabId)) tabId = 'overview';
     localStorage.setItem('spark_active_tab', tabId);
     document.querySelectorAll('.result-tabs-bar .tab-btn').forEach(btn => {
         if (btn.dataset.tab === tabId) {
@@ -551,6 +581,7 @@ function initSliders() {
     const ratio = document.getElementById('slider-ratio');
     const creativity = document.getElementById('slider-creativity');
     const beats = document.getElementById('slider-beats');
+    const beatCountMode = document.getElementById('beat-count-mode');
 
     const complexityLabels = { 1: '轻量级改造', 2: '中等重工', 3: '硬核结构性改建' };
     const budgetLabels = { 1: '平民精简版', 2: '轻奢设计师级', 3: '顶奢艺术级定制' };
@@ -641,6 +672,16 @@ function initSliders() {
         document.getElementById('val-beats').textContent = `${e.target.value} 拍`;
         updateFill(e.target);
     });
+    const syncBeatModeLabel = () => {
+        const adaptive = !beatCountMode || beatCountMode.value !== 'fixed';
+        const label = document.getElementById('beat-count-label');
+        if (label) label.textContent = adaptive ? '最多施工节拍数 (Milestone Cap)' : '固定施工节拍数 (Beat Count)';
+        updateConfigSummary();
+    };
+    if (beatCountMode) {
+        beatCountMode.addEventListener('input', syncBeatModeLabel);
+        beatCountMode.addEventListener('change', syncBeatModeLabel);
+    }
 
     // Fire initial displays
     complexity.dispatchEvent(new Event('input'));
@@ -648,6 +689,7 @@ function initSliders() {
     ratio.dispatchEvent(new Event('input'));
     creativity.dispatchEvent(new Event('input'));
     beats.dispatchEvent(new Event('input'));
+    syncBeatModeLabel();
 }
 
 // Theme & Anchor Selection Handling
@@ -805,6 +847,8 @@ function openLibraryDrawer() {
     const libraryDrawer = document.getElementById('library-drawer');
     if (!libraryDrawer) return;
     closeTasksDrawer();
+    // 日志 dock 也停靠右侧，三者互斥（见 api_client.js setLogDockOpen）
+    if (typeof window.collapseLogDock === 'function') window.collapseLogDock();
     libraryDrawer.classList.add('active');
     setDrawerToggleOpenState('toggle-library-btn', true);
     renderLibrary();
@@ -821,6 +865,7 @@ function openTasksDrawer() {
     const tasksDrawer = document.getElementById('tasks-drawer');
     if (!tasksDrawer) return;
     closeLibraryDrawer();
+    if (typeof window.collapseLogDock === 'function') window.collapseLogDock();
     tasksDrawer.classList.add('active');
     setDrawerToggleOpenState('toggle-tasks-btn', true);
     renderTasks();
@@ -1024,6 +1069,13 @@ function setupEventListeners() {
         });
     }
 
+    // Manual Intervention Banner dismiss（人工已经处理完/暂时不想管了，先手动关掉；
+    // 如果脚本仍在等待，检测到清除状态或超时时后端事件还是会再次驱动它）
+    const manualInterventionDismissBtn = document.getElementById('manual-intervention-dismiss-btn');
+    if (manualInterventionDismissBtn) {
+        manualInterventionDismissBtn.addEventListener('click', () => hideManualInterventionBanner());
+    }
+
     // Generation Action
     document.getElementById('generate-btn').addEventListener('click', () => generateIdea());
     document.getElementById('retry-btn').addEventListener('click', () => retryGeneration());
@@ -1088,6 +1140,21 @@ function setupEventListeners() {
         });
     }
 
+    // 手动上传视频覆盖槽位：各卡片的「上传」按钮点击时先把目标槽位存进
+    // input.dataset.slot 再触发这个共用的隐藏 <input type=file>，选完文件后这里
+    // 统一读取并调用 uploadVideoToSlot；选完清空 value，允许连续两次选同一个文件。
+    const videoUploadInput = document.getElementById('video-upload-input');
+    if (videoUploadInput) {
+        videoUploadInput.addEventListener('change', (e) => {
+            const file = e.target.files && e.target.files[0];
+            const slot = parseInt(videoUploadInput.dataset.slot, 10);
+            videoUploadInput.value = '';
+            if (file && Number.isFinite(slot)) {
+                uploadVideoToSlot(slot, file);
+            }
+        });
+    }
+
     // Keyboard Hotkeys
     document.addEventListener('keydown', (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -1128,7 +1195,7 @@ function setupEventListeners() {
             });
         }
     };
-    ['slider-complexity', 'slider-budget', 'slider-ratio', 'slider-creativity', 'slider-beats'].forEach(id => {
+    ['slider-complexity', 'slider-budget', 'slider-ratio', 'slider-creativity', 'slider-beats', 'beat-count-mode'].forEach(id => {
         const el = document.getElementById(id);
         if (el) {
             el.addEventListener('input', rafConfigSummary);
@@ -1145,6 +1212,11 @@ function setupEventListeners() {
         });
     });
 
+    // 管线条与 section 弹层：必须排在下面那批按钮监听之前绑定，管线条用的是
+    // 捕获阶段拦截，绑定先后本身不影响，但放这里读起来跟 tab 一组更顺。
+    initPipelineBar();
+    initSectionPops();
+
     // Idea Interaction Buttons
     document.getElementById('save-idea-btn').addEventListener('click', saveCurrentIdea);
     document.getElementById('export-idea-btn').addEventListener('click', exportIdeaMarkdown);
@@ -1152,8 +1224,34 @@ function setupEventListeners() {
     document.getElementById('copy-prompt-btn-all').addEventListener('click', copyPromptToClipboard);
     document.getElementById('copy-tiktok-meta-btn').addEventListener('click', copyTikTokMetaToClipboard);
     document.getElementById('copy-tiktok-meta-cn-btn').addEventListener('click', copyTikTokMetaCnToClipboard);
+    // 手机端标题区折叠开关：折叠态只留一行英文主标题（话题串与中文标题行藏起来），
+    // 让封面/帧序列能上首屏。class 常驻 DOM，桌面端的 CSS 不理会它，所以按钮本身
+    // 也只在 ≤768px 显示。
+    const ideaMetaToggle = document.getElementById('idea-meta-toggle');
+    if (ideaMetaToggle) {
+        ideaMetaToggle.addEventListener('click', () => {
+            const header = document.getElementById('idea-content-header');
+            if (!header) return;
+            const collapsed = header.classList.toggle('meta-collapsed');
+            ideaMetaToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+            ideaMetaToggle.title = collapsed ? '展开完整标题与话题' : '收起标题与话题';
+        });
+    }
+    // 手机端页脚 LLM 模型选择器的折叠开关：折叠态只留「LLM 模型 · 使用中 xxx」一行，
+    // 展开才铺开全部芯片。桌面端 CSS 不理会 picker-collapsed，按钮本身也不显示。
+    const llmToggle = document.getElementById('ideation-llm-toggle');
+    if (llmToggle) {
+        llmToggle.addEventListener('click', () => {
+            const picker = document.getElementById('ideation-model-picker');
+            if (!picker) return;
+            const collapsed = picker.classList.toggle('picker-collapsed');
+            llmToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+            llmToggle.title = collapsed ? '展开模型选择' : '收起模型选择';
+        });
+    }
     document.getElementById('make-cover-btn').addEventListener('click', () => generateCover());
     document.getElementById('generate-frames-btn').addEventListener('click', () => generateFrames());
+    document.getElementById('run-sequence-review-btn').addEventListener('click', () => runSequenceReview());
     document.getElementById('generate-videos-btn').addEventListener('click', () => generateVideos());
     document.getElementById('merge-videos-btn').addEventListener('click', () => mergeVideos());
     const copyHookBtn = document.getElementById('copy-hook-btn');
@@ -1173,7 +1271,6 @@ function setupEventListeners() {
 
     // Library search & filters
     const libSearch = document.getElementById('library-search');
-    const libFilterTheme = document.getElementById('library-filter-theme');
     const libFilterTime = document.getElementById('library-filter-time');
     let searchTimeout = null;
     if (libSearch) {
@@ -1182,7 +1279,6 @@ function setupEventListeners() {
             searchTimeout = setTimeout(renderLibrary, 200);
         });
     }
-    if (libFilterTheme) libFilterTheme.addEventListener('change', renderLibrary);
     if (libFilterTime) libFilterTime.addEventListener('change', renderLibrary);
 
     // Library Drawer buttons
@@ -1207,6 +1303,34 @@ let tasksFilterType = '';
 const MEDIA_TASK_TYPES = new Set(['frames', 'staged_render', 'videos', 'cover']);
 const isIdeationTask = (t) => !MEDIA_TASK_TYPES.has((t.dimensions && t.dimensions.type) || 'idea');
 
+function formatTaskDuration(totalSeconds) {
+    const seconds = Number(totalSeconds);
+    if (!Number.isFinite(seconds) || seconds < 0) return '';
+    if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} 秒`;
+    const wholeSeconds = Math.round(seconds);
+    const minutes = Math.floor(wholeSeconds / 60);
+    const remainder = wholeSeconds % 60;
+    if (minutes < 60) return `${minutes} 分 ${remainder} 秒`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours} 小时 ${minutes % 60} 分`;
+}
+
+function taskModelOptions(selectedModel) {
+    const selected = selectedModel || config.model || DEFAULT_CONFIG.model;
+    return LLM_MODEL_PICKER_FAMILIES.map(family => {
+        const models = (LLM_MODEL_GROUPS[family.key] || []).slice();
+        if (!models.some(model => model.value === selected)
+            && !Object.values(LLM_MODEL_GROUPS).flat().some(model => model.value === selected)
+            && family.key === 'gpt') {
+            models.push({ value: selected, label: `${selected}（历史模型）` });
+        }
+        const options = models.map(model => `
+            <option value="${escapeHtml(model.value)}"${model.value === selected ? ' selected' : ''}>${escapeHtml(model.label)}</option>
+        `).join('');
+        return `<optgroup label="${escapeHtml(family.label)}">${options}</optgroup>`;
+    }).join('');
+}
+
 async function renderTasks() {
     const tasksListContainer = document.getElementById('tasks-list');
     if (!tasksListContainer) return;
@@ -1225,7 +1349,13 @@ async function renderTasks() {
         let filteredTasks = tasks.filter(task => {
             // 任务名优先用灵感卡片选题名（task_label），回退基础场景主题
             const theme = task.dimensions ? (task.dimensions.task_label || task.dimensions.theme || '未命名主题') : '未命名主题';
-            const beats = (task.dimensions && task.dimensions.beats_count) ? ` (${task.dimensions.beats_count} 镜)` : '';
+            // 完成任务以实际解析出的 VIDEO 数为准。beats_count 是规划阶段的
+            // 施工拍数参数，流水线还可能追加 reward/HERO，直接展示它会少算。
+            const actualBeats = Number(task.result && task.result.video_count);
+            const beats = Number.isFinite(actualBeats) && actualBeats > 0
+                ? ` (${actualBeats} 镜)`
+                : ((task.dimensions && task.dimensions.beats_count)
+                    ? ` (${task.dimensions.beat_count_mode === 'fixed' ? '' : '最多 '}${task.dimensions.beats_count} 镜)` : '');
             const taskTitle = `${theme}${beats}`;
 
             if (tasksSearchQuery) {
@@ -1257,7 +1387,11 @@ async function renderTasks() {
                 : (task.last_active ? new Date(task.last_active * 1000).toLocaleString() : '—');
             // 任务名优先用灵感卡片选题名（task_label），回退基础场景主题
             const theme = task.dimensions ? (task.dimensions.task_label || task.dimensions.theme || '未命名主题') : '未命名主题';
-            const beats = (task.dimensions && task.dimensions.beats_count) ? ` (${task.dimensions.beats_count} 镜)` : '';
+            const actualBeats = Number(task.result && task.result.video_count);
+            const beats = Number.isFinite(actualBeats) && actualBeats > 0
+                ? ` (${actualBeats} 镜)`
+                : ((task.dimensions && task.dimensions.beats_count)
+                    ? ` (${task.dimensions.beat_count_mode === 'fixed' ? '' : '最多 '}${task.dimensions.beats_count} 镜)` : '');
             const taskTitle = `${theme}${beats}`;
 
             let statusLabel = '';
@@ -1266,6 +1400,7 @@ async function renderTasks() {
             let progressHtml = '';
             let errorHtml = '';
             let tokenInfoHtml = '';
+            let taskDetailsHtml = '';
             
             if (task.status === 'running') {
                 statusLabel = '运行中';
@@ -1301,6 +1436,23 @@ async function renderTasks() {
             } else if (task.status === 'completed') {
                 statusLabel = '已完成';
                 statusClass = 'completed';
+                const timings = task.result && task.result.timings;
+                const durationText = formatTaskDuration(timings && timings.total_duration_seconds);
+                const usedModel = (task.result && task.result.model) || config.model || DEFAULT_CONFIG.model;
+                taskDetailsHtml = `
+                    <div class="task-completed-details">
+                        <div class="task-duration-info">
+                            <span>激发总时间</span>
+                            <strong>${escapeHtml(durationText || '暂无记录')}</strong>
+                        </div>
+                        <label class="task-rerun-model">
+                            <span>换模型再跑</span>
+                            <select class="task-rerun-model-select" aria-label="选择重新激发使用的模型">
+                                ${taskModelOptions(usedModel)}
+                            </select>
+                        </label>
+                    </div>
+                `;
                 if (task.result && task.result.token_usage) {
                     const usage = task.result.token_usage;
                     tokenInfoHtml = `
@@ -1311,6 +1463,7 @@ async function renderTasks() {
                 }
                 footerButtons = `
                     <button class="task-action-btn view" onclick="loadCompletedTask('${task.id}')">查看</button>
+                    <button class="task-action-btn retry" onclick="rerunCompletedTask('${task.id}', ${JSON.stringify(task.dimensions).replace(/"/g, '&quot;')}, event)">再跑一遍</button>
                     <button class="task-action-btn delete" onclick="deleteTask('${task.id}', event)">删除</button>
                 `;
             } else if (task.status === 'failed') {
@@ -1341,6 +1494,7 @@ async function renderTasks() {
                         </div>
                         <span class="task-status-badge ${statusClass}">${escapeHtml(statusLabel)}</span>
                     </div>
+                    ${taskDetailsHtml}
                     ${tokenInfoHtml}
                     ${progressHtml}
                     ${errorHtml}
@@ -1475,7 +1629,8 @@ async function loadCompletedTask(taskId) {
                 english_title: data.english_title || '',
                 social_title_en: data.social_title_en || '',
                 social_title_cn: data.social_title_cn || '',
-                collage_url: data.collage_url || ''
+                collage_url: data.collage_url || '',
+                project_key: data.project_key || null
             };
             
             currentIdea = result;
@@ -1496,7 +1651,9 @@ async function loadCompletedTask(taskId) {
             }
             
             updateActiveGenerationBanner();
-            switchTab('prompts');
+            // 从任务卡片查看历史成功任务时，优先展示封面、帧与视频等结果概览；
+            // 提示词仍可通过相邻标签进入。新任务刚生成完成时的落点保持不变。
+            switchTab('overview');
             showToast("历史生成任务结果已载入！", "success");
         } else {
             showToast("该任务未完成或数据损坏", "error");
@@ -1603,6 +1760,31 @@ async function retryTask(taskId, dimensions, event) {
     }
 }
 
+async function rerunCompletedTask(taskId, dimensions, event) {
+    if (event) event.stopPropagation();
+    const card = document.querySelector(`.task-card[data-task-id="${CSS.escape(String(taskId))}"]`);
+    const modelSelect = card && card.querySelector('.task-rerun-model-select');
+    const selectedModel = (modelSelect && modelSelect.value) || config.model || DEFAULT_CONFIG.model;
+
+    // 卡片内的模型选择同时成为后续激发的全局模型，保证在线检测、页脚当前模型提示
+    // 和本次请求使用同一条网关；新任务不复用旧 id，保留原成功结果供对比。
+    config.model = selectedModel;
+    localStorage.setItem('spark_config', JSON.stringify(config));
+    if (typeof syncIdeationLlmPicker === 'function') syncIdeationLlmPicker();
+    closeTasksDrawer();
+    showToast(`正在使用 ${selectedModel} 重新激发，原结果已保留...`, 'info');
+
+    try {
+        await generateIdea({
+            dimensions: { ...dimensions },
+            config: { ...config }
+        });
+    } catch (e) {
+        console.error('Rerun completed task failed:', e);
+        showToast(`重新激发失败: ${e.message}`, 'error');
+    }
+}
+
 async function clearTasks(statusGroup) {
     let msg = "";
     if (statusGroup === "completed") {
@@ -1673,6 +1855,7 @@ window.loadCompletedTask = loadCompletedTask;
 window.cancelTask = cancelTask;
 window.deleteTask = deleteTask;
 window.retryTask = retryTask;
+window.rerunCompletedTask = rerunCompletedTask;
 window.generateIdea = generateIdea;
 window.clearTasks = clearTasks;
 
@@ -1697,11 +1880,12 @@ async function generateIdea(retryParams = null) {
         }
     }
 
-    // 基础场景主题选择器已移除：非重试路径的选题只能来自「载入维度」过的灵感
-    // 卡片（联网参考驱动）。没载入过就没有可合成的主题，在切换视图前先拦下。
+    // 基础场景主题选择器已移除：非重试路径的选题只能来自选中过的灵感卡片（联网参考
+    // 驱动，点卡片或点卡片上的「🔨 节拍简介」都会载入维度）。没载入过就没有可合成的
+    // 主题，在切换视图前先拦下。
     const loadedIdea = (typeof loadedIdeationCover !== 'undefined' && loadedIdeationCover) ? loadedIdeationCover : null;
     if (!retryParams && (!loadedIdea || !loadedIdea.input_str)) {
-        showToast('请先在灵感推荐卡片点「载入维度」选定选题（或直接在卡片上一键合成）', 'error');
+        showToast('请先点选灵感推荐卡片（或卡片上的「🔨 节拍简介」）选定选题，也可直接在卡片上一键合成', 'error');
         return;
     }
 
@@ -1742,12 +1926,17 @@ async function generateIdea(retryParams = null) {
             // 与卡片「一键合成」路径对齐：封面与英文标题一并带给后端（有则复用）
             cover_url: loadedIdea.cover_url || null,
             english_title: loadedIdea.english_title || null,
+            // 联网参考案例库使用计次：与卡片「一键合成」路径对齐透传，让选中卡片载入维度
+            // 后走主生成按钮的合成同样能在真正借鉴时计次（见 server.py /api/compose）
+            trend_ref: loadedIdea.trend_ref || null,
+            trend_ref_ids: loadedIdea.trend_ref_ids || [],
             anchors: activeAnchors,
             complexity: document.getElementById('val-complexity').textContent,
             budget: document.getElementById('val-budget').textContent,
             ratio: document.getElementById('val-ratio').textContent,
             creativity: document.getElementById('val-creativity').textContent,
-            beats_count: parseInt(document.getElementById('slider-beats').value, 10)
+            beats_count: parseInt(document.getElementById('slider-beats').value, 10),
+            beat_count_mode: (document.getElementById('beat-count-mode') || {}).value || 'adaptive'
         };
         currentConf = { ...config };
     }
@@ -1859,16 +2048,10 @@ async function streamProgress(taskId, dimensions) {
                 } else if (type === 'text_chunk') {
                     appendLiveTerminal(data);
                     applyComposeProgress(type, data);
-                } else if (type === 'review_pause') {
-                    // auto_run 任务（自治管线）的监修暂停也走同一块审阅面板
-                    showFrameReviewPanel(taskId, data);
-                } else if (type === 'review_resume') {
-                    hideFrameReviewPanel();
                 } else if (type === 'reconnecting') {
                     const stageText = document.getElementById('loading-stage-text');
                     if (stageText) stageText.textContent = `与服务的连接中断，正在自动重连（第 ${data.attempt} 次）...`;
                 } else if (type === 'result' || type === 'error') {
-                    hideFrameReviewPanel();
                     applyComposeProgress(type, data);
                 }
             }
@@ -1924,7 +2107,8 @@ async function streamProgress(taskId, dimensions) {
             frameRun: data.frameRun || null,
             english_title: data.english_title || '',
             social_title_en: data.social_title_en || '',
-            social_title_cn: data.social_title_cn || ''
+            social_title_cn: data.social_title_cn || '',
+            project_key: data.project_key || null
         };
 
         currentIdea = result;
@@ -2264,7 +2448,10 @@ function framesFeedQualityLine(ideaId, f, isIsolatedRetry) {
     } else if (gate === 'auto_approved_degraded') {
         framesFeedLine(ideaId, `⚠️ IMG ${seq} 已放行（判定服务异常 fail-open：帧已渲染但未经核验，可单帧重试复检）`, 'warn');
     } else if (gate === 'vlm_qa_failed' || gate === 'sequence_review_flagged') {
-        framesFeedLine(ideaId, `❌ IMG ${seq} 一致性审查未通过（${reason || '原因未知'}），已保留末次渲染结果，可单帧重试`, 'err');
+        framesFeedLine(ideaId, `❌ IMG ${seq} 一致性审查未通过（${reason || '原因未知'}），已保留末次渲染结果，可点击「修复此帧问题」定向修复`, 'err');
+    } else if (gate === 'manual_flagged') {
+        const manual = typeof f.manual_issue === 'string' ? f.manual_issue : '';
+        framesFeedLine(ideaId, `📝 IMG ${seq} 已被人工标记问题（${manual || '未填写描述'}），可点击「修复此帧问题」定向修复`, 'warn');
     } else if (gate === 'sequence_reviewed_pass') {
         framesFeedLine(ideaId, `✅ IMG ${seq} 完成（一致性审查通过）`, 'ok');
     } else if (gate === 'pending_manual_review') {
@@ -2278,7 +2465,7 @@ function framesFeedQualityLine(ideaId, f, isIsolatedRetry) {
     }
 }
 
-async function streamFramesProgress(taskId, ownerIdea) {
+async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
     ownerIdea = ownerIdea || currentIdea;
     if (!ownerIdea) return;
     const ownerId = ownerIdea.id;
@@ -2296,6 +2483,10 @@ async function streamFramesProgress(taskId, ownerIdea) {
     }
     const controller = new AbortController();
     const rec = beginIdeaTask(ownerId, 'frames', taskId, controller);
+    // 调试模式（仅生成前 N 帧）：标记本次任务的目标槽位范围，renderFramesForIdea
+    // 靠这个字段区分"还没轮到（等待中）"和"这次任务压根没请求（正常缺帧）"，
+    // 见 retrySingleFrame 里的同款说明与 2026-07-20 的事故复盘。
+    if (targetSequences && targetSequences.length) rec.targetSequences = targetSequences;
     const isCurrent = () => isIdeaTaskCurrent(ownerId, 'frames', taskId);
     const isViewing = () => isViewingIdea(ownerId);
     const setMeta = (text) => { rec.meta = text; if (isViewing()) meta.textContent = text; };
@@ -2388,29 +2579,36 @@ async function streamFramesProgress(taskId, ownerIdea) {
                     const m = (data && data.max_attempts) || '?';
                     const tail = data && data.retry_in
                         ? `，${data.retry_in}s 后自动重试（第 ${a}/${m} 次）`
-                        : `（第 ${a}/${m} 次，此路终止——若有兜底/收尾会紧随其后，否则任务即将报错结束）`;
+                        : `（第 ${a}/${m} 次，此路终止，任务即将报错结束）`;
                     framesFeedLine(ownerId, `⚠️ 上游报错：${(data && data.error) || '未知错误'}${tail}`, 'warn');
                     setMeta(`上游报错，自动重试中（第 ${a}/${m} 次）...`);
-                } else if (type === 'model_fallback') {
-                    const to = (data && data.to) || '兜底模型';
-                    const seqNo = data && (data.sequence || data.slot);
-                    framesFeedLine(ownerId, `🔀 主模型配额耗尽，切换兜底模型 ${to} 继续渲染 IMG ${String(seqNo || 0).padStart(3, '0')}…`, 'warn');
-                    setMeta(`主模型配额耗尽，兜底模型 ${to} 渲染中...`);
-                } else if (type === 'review_pause') {
-                    // 监修模式：关键点暂停，弹出审阅面板等待 采用/重渲。
-                    // 面板是模态弹窗，只在正看着这个创意时弹出；不在时靠动态流留痕+
-                    // 后端超时自动采用兜底（不阻塞用户查看别的创意）。
-                    if (isViewing()) showFrameReviewPanel(taskId, data);
-                    setMeta((data && data.message) || '监修暂停，等待人工确认...');
-                    framesFeedLine(ownerId, `⏸️ ${(data && data.message) || '监修暂停，等待人工确认…'}`, 'warn');
-                } else if (type === 'review_resume') {
-                    if (isViewing()) hideFrameReviewPanel();
-                    framesFeedLine(ownerId, `▶️ ${(data && data.message) || '监修继续'}`);
-                } else if (type === 'anchor_inertia' || type === 'door_clearance') {
-                    // 换族锚点惯性卡死 / 门框清除兜底：动态流留痕（含自动 t2i 重渲播报）
+                } else if (type === 'manual_intervention_detected' || type === 'manual_intervention_cleared'
+                           || type === 'manual_intervention_timeout') {
+                    handleManualInterventionEvent(type, data);
+                    if (data && data.reason) {
+                        framesFeedLine(ownerId, `🛑 ${type === 'manual_intervention_detected' ? '需要人工处理' : type === 'manual_intervention_cleared' ? '人工处理已完成，继续生成' : '人工处理等待超时'}：${data.reason}`,
+                                       type === 'manual_intervention_cleared' ? undefined : 'warn');
+                    }
+                } else if (type === 'anchor_inertia' || type === 'door_clearance' || type === 'raw_state') {
+                    // 换族锚点惯性卡死 / 门框清除兜底 / 过门帧原始度兜底：动态流留痕
+                    // （含自动 t2i 重渲、定向状态修正的播报）
                     if (data && data.message) {
-                        framesFeedLine(ownerId, `${type === 'anchor_inertia' ? '🧲' : '🚪'} ${data.message}`,
+                        const icon = type === 'anchor_inertia' ? '🧲' : type === 'door_clearance' ? '🚪' : '🕸️';
+                        framesFeedLine(ownerId, `${icon} ${data.message}`,
                                        (type === 'anchor_inertia' || data.passed === false) ? 'warn' : undefined);
+                    }
+                } else if (type === 'account_switch') {
+                    // 这一批换了号池账号（IP 全程不动，换 IP 已全局关停）。
+                    // 属于正常轮换，不是告警，所以不标 warn。
+                    if (data && data.message) {
+                        framesFeedLine(ownerId, `🔀 ${data.message}`);
+                    }
+                } else if (type === 'transport_fallback') {
+                    // 图生图端点号池无额度、同模型改走 chat 通道续渲：帧能接着渲。
+                    // 只有请求 2K/4K 时才是真降档（该通道固定出 1K 档）——按 degraded
+                    // 标警示色，1K 单不吓人。manifest 里也记了 transport/actual_pixels。
+                    if (data && data.message) {
+                        framesFeedLine(ownerId, `🔀 ${data.message}`, data.degraded ? 'warn' : undefined);
                     }
                 } else if (type === 'chain_drift_check' || type === 'anchor_recalibrated' || type === 'reanchor') {
                     // 检查点现实同步/链回望/重锚定：动态流留痕
@@ -2431,22 +2629,19 @@ async function streamFramesProgress(taskId, ownerIdea) {
                     setMeta(`连接中断，正在重连（第 ${data.attempt} 次）...`);
                     framesFeedLine(ownerId, `⚠️ 连接中断，正在重连（第 ${data.attempt} 次）…`, 'warn');
                 } else if (type === 'result' || type === 'error') {
-                    if (isViewing()) hideFrameReviewPanel();
                     applyFramesProgress(type, data);
                 }
             }
         });
 
         if (!isCurrent()) return;
-        if (isViewing()) hideFrameReviewPanel();
 
         if (watch.status === 'cancelled') {
             throw Object.assign(new Error('已取消'), { name: 'AbortError' });
         }
         if (watch.status === 'disconnected') {
             // 与服务器失联 ≠ 任务失败：后端渲染线程是独立线程，不知道客户端已经
-            // 放弃，会一直跑到底（监修模式的暂停点也会因为没人看事件流而只能
-            // 靠 600s 超时自动采用）。绝不能在这里当成失败收尾——那样 finally
+            // 放弃，会一直跑到底。绝不能在这里当成失败收尾——那样 finally
             // 会 endIdeaTask 清掉任务登记，这条任务从此在客户端没人认领，用户
             // 还可能对同一帧再点一次"生成"，跟后台线程并发写同一张图。
             disconnectedFrames = true;
@@ -2502,7 +2697,7 @@ async function streamFramesProgress(taskId, ownerIdea) {
     }
 }
 
-async function streamVideosProgress(taskId, ownerIdea) {
+async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
     ownerIdea = ownerIdea || currentIdea;
     if (!ownerIdea) return;
     const ownerId = ownerIdea.id;
@@ -2518,6 +2713,10 @@ async function streamVideosProgress(taskId, ownerIdea) {
     }
     const controller = new AbortController();
     const rec = beginIdeaTask(ownerId, 'videos', taskId, controller);
+    // 调试模式（仅生成前 N 段）：标记本次任务的目标槽位范围，renderVideosForIdea
+    // 靠这个字段区分"还没轮到（等待中）"和"这次任务压根没请求（正常缺段）"，
+    // 同 streamFramesProgress/retrySingleFrame 的同款契约。
+    if (targetSlots && targetSlots.length) rec.targetSlots = targetSlots;
     const isCurrent = () => isIdeaTaskCurrent(ownerId, 'videos', taskId);
     const isViewing = () => isViewingIdea(ownerId);
     const setMeta = (text) => { rec.meta = text; if (isViewing()) meta.textContent = text; };
@@ -2615,6 +2814,9 @@ async function streamVideosProgress(taskId, ownerIdea) {
                     if (isViewing()) showToast(`自动合并失败: ${(data && data.message) || '未知错误'}`, "warning");
                 } else if (type === 'reconnecting') {
                     setMeta(`连接中断，正在重连（第 ${data.attempt} 次）...`);
+                } else if (type === 'manual_intervention_detected' || type === 'manual_intervention_cleared'
+                           || type === 'manual_intervention_timeout') {
+                    handleManualInterventionEvent(type, data);
                 } else if (type === 'result' || type === 'error') {
                     applyVideoProgress(type, data);
                 }
@@ -2860,25 +3062,19 @@ function renderLibrary() {
     list.innerHTML = '';
     
     const query = (document.getElementById('library-search')?.value || '').trim().toLowerCase();
-    const themeFilter = document.getElementById('library-filter-theme')?.value || '';
     const timeSort = document.getElementById('library-filter-time')?.value || 'newest';
-    
+
     let filtered = [...savedIdeas];
-    
-    // Search filter
+
+    // Search filter（也覆盖 theme 的模糊匹配——固定场景主题下拉框已移除，见 index.html）
     if (query) {
-        filtered = filtered.filter(idea => 
+        filtered = filtered.filter(idea =>
             (idea.title || '').toLowerCase().includes(query) ||
             (idea.theme || '').toLowerCase().includes(query) ||
             (idea.prompt_block || '').toLowerCase().includes(query)
         );
     }
-    
-    // Theme filter
-    if (themeFilter) {
-        filtered = filtered.filter(idea => idea.theme === themeFilter);
-    }
-    
+
     // Time sorting
     if (timeSort === 'oldest') {
         filtered.reverse();
@@ -2953,7 +3149,7 @@ async function deleteFromLibrary(id) {
             await fetch('/api/library/delete_item', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ title: idea.title, covers: idea.covers || [] })
+                body: JSON.stringify({ title: getIdeaSaveTitle(idea), covers: idea.covers || [] })
             });
         } catch (e) {
             console.error("Delete idea output files request failed:", e);
@@ -3124,7 +3320,68 @@ function copyPromptToClipboard() {
 // Toast Alert System
 // Function showToast moved to modular JS file
 
+// ── 调试模式：帧序列/视频序列可选只生成前 N 条 ──────────────────────────
+// 用于快速验证一套提示词是否值得往下整单生成，以及方便反复迭代提示词时不用
+// 每次都等全量跑完。勾选状态与数量按浏览器持久化（同一创意反复调试不用重设）。
+function initDebugLimitControls() {
+    ['frames', 'videos'].forEach(kind => {
+        const enabledEl = document.getElementById(`${kind}-debug-enabled`);
+        const countEl = document.getElementById(`${kind}-debug-count`);
+        if (!enabledEl || !countEl) return;
+
+        const storageKey = `spark_${kind}_debug_limit`;
+        try {
+            const stored = JSON.parse(localStorage.getItem(storageKey) || 'null');
+            if (stored) {
+                enabledEl.checked = !!stored.enabled;
+                if (stored.count) countEl.value = stored.count;
+            }
+        } catch (e) { /* 存档损坏则忽略，维持控件默认值 */ }
+        countEl.disabled = !enabledEl.checked;
+
+        const persist = () => {
+            localStorage.setItem(storageKey, JSON.stringify({
+                enabled: enabledEl.checked,
+                count: Math.max(1, parseInt(countEl.value, 10) || 3)
+            }));
+        };
+
+        enabledEl.addEventListener('change', () => {
+            countEl.disabled = !enabledEl.checked;
+            persist();
+        });
+        countEl.addEventListener('change', () => {
+            countEl.value = Math.max(1, parseInt(countEl.value, 10) || 3);
+            persist();
+        });
+    });
+}
+
+// 调试模式未勾选时返回 null（等价于原有整单生成语义）；勾选时返回该创意提示词块
+// 里前 N 个真实槽位号（帧序列用 image 槽位、视频序列用 video 槽位）——用槽位号
+// 本身而非枚举位置，与 resolvePromptSlots 的既有约定一致，避免槽位号不连续时错位。
+function computeDebugTargets(kind, idea, slotType) {
+    const enabledEl = document.getElementById(`${kind}-debug-enabled`);
+    const countEl = document.getElementById(`${kind}-debug-count`);
+    if (!enabledEl || !countEl || !enabledEl.checked) return null;
+
+    const n = Math.max(1, parseInt(countEl.value, 10) || 3);
+    const slots = resolvePromptSlots(idea)
+        .filter(s => s.type === slotType)
+        .map(s => s.index)
+        .sort((a, b) => a - b);
+    if (!slots.length) return null;
+    return slots.slice(0, n);
+}
+
 // Generate the complete IMAGE prompt chain as ordered still frames.
+function withCoverReference(baseConfig, idea) {
+    const covers = (idea && idea.covers) || [];
+    const chosen = (idea && idea.activeCoverUrl) || covers[covers.length - 1];
+    if (!chosen) return baseConfig;
+    return Object.assign({}, baseConfig, { coverReferencePath: chosen });
+}
+
 async function generateFrames() {
     if (!currentIdea || !currentIdea.prompt_block) {
         showToast("请先激发一个创意点子！", "error");
@@ -3141,19 +3398,27 @@ async function generateFrames() {
     const meta = document.getElementById('frames-meta');
     if (!btn || !progress || !meta) return;
 
+    const targetSequences = computeDebugTargets('frames', ownerIdea, 'image');
+
     btn.disabled = true;
     progress.style.display = 'flex';
-    meta.textContent = '准备生成帧序列...';
+    meta.textContent = targetSequences
+        ? `准备生成帧序列（调试模式：仅前 ${targetSequences.length} 帧）...`
+        : '准备生成帧序列...';
 
     try {
+        const body = {
+            config: withCoverReference(config, ownerIdea),
+            title: getIdeaSaveTitle(ownerIdea),
+            display_title: ownerIdea.title,
+            prompt_block: ownerIdea.prompt_block
+        };
+        if (targetSequences) body.target_sequences = targetSequences;
+
         const response = await fetch('/api/generate_frames', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                config,
-                title: getIdeaSaveTitle(ownerIdea),
-                prompt_block: ownerIdea.prompt_block
-            })
+            body: JSON.stringify(body)
         });
 
         if (!response.ok) {
@@ -3167,7 +3432,7 @@ async function generateFrames() {
         // streamFramesProgress 内部会登记 ideaTasksById 并接管所有 UI/数据合并；
         // 不 await 它——generateFrames 只负责发起任务，让它在后台独立运行，
         // 这样切换到别的创意不会挂起这个 async 调用链。
-        streamFramesProgress(taskId, ownerIdea);
+        streamFramesProgress(taskId, ownerIdea, targetSequences);
     } catch (e) {
         console.error("Failed to generate frames:", e);
         if (isViewingIdea(ownerIdea.id)) {
@@ -3203,16 +3468,8 @@ async function generateVideos() {
     }
 
     // Check for frames that failed the post-render sequence consistency review
-    if (ownerIdea.frameRun && ownerIdea.frameRun.frames) {
-        const failedFrames = ownerIdea.frameRun.frames.filter(f => f.quality_gate === 'vlm_qa_failed' || f.quality_gate === 'sequence_review_flagged');
-        if (failedFrames.length > 0) {
-            const frameSeqs = failedFrames.map(f => f.sequence).join(', ');
-            const confirmed = await customConfirm(`⚠️ 警告：检测到第 ${frameSeqs} 帧未通过一致性审查。\n\n如果强行生成视频，对应的视频分段可能存在跳变、无动作或动作不一致的缺陷。\n\n确定要强制继续生成视频吗？`);
-            if (!confirmed) {
-                return;
-            }
-        }
-    }
+    const reviewCheck = await confirmSequenceReviewOverride(ownerIdea, null);
+    if (!reviewCheck.proceed) return;
 
     const btn = document.getElementById('generate-videos-btn');
     const progress = document.getElementById('videos-progress');
@@ -3220,19 +3477,28 @@ async function generateVideos() {
     const grid = document.getElementById('videos-grid');
     if (!btn || !progress || !meta || !grid) return;
 
+    const targetSlots = computeDebugTargets('videos', ownerIdea, 'video');
+
     btn.disabled = true;
     progress.style.display = 'flex';
-    meta.textContent = '准备生成视频序列...';
+    meta.textContent = targetSlots
+        ? `准备生成视频序列（调试模式：仅前 ${targetSlots.length} 段）...`
+        : '准备生成视频序列...';
 
     try {
+        const body = {
+            config,
+            title: getIdeaSaveTitle(ownerIdea),
+            display_title: ownerIdea.title,
+            prompt_block: ownerIdea.prompt_block,
+            override_flagged: reviewCheck.override
+        };
+        if (targetSlots) body.target_slots = targetSlots;
+
         const response = await fetch('/api/generate_videos', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                config,
-                title: getIdeaSaveTitle(ownerIdea),
-                prompt_block: ownerIdea.prompt_block
-            })
+            body: JSON.stringify(body)
         });
 
         if (!response.ok) {
@@ -3244,7 +3510,7 @@ async function generateVideos() {
         const taskId = data.task_id;
 
         // 同 generateFrames：不 await，交给 streamVideosProgress 在后台独立跑完。
-        streamVideosProgress(taskId, ownerIdea);
+        streamVideosProgress(taskId, ownerIdea, targetSlots);
     } catch (e) {
         console.error("Failed to generate videos:", e);
         showToast(`视频生成失败: ${e.message}`, "error");
@@ -3290,12 +3556,15 @@ async function mergeVideos(force = false) {
 
     const originalText = mergeBtn.innerHTML;
     mergeBtn.disabled = true;
+    // 合并不走 ideaTasksById 登记，管线条的「成片 · 合并中…」只能靠这个标志位
+    mergeInFlight = true;
+    updatePipelineBar();
     mergeBtn.innerHTML = `
         <div class="cover-spinner" style="width:14px; height:14px; border-width:2px; margin-bottom:0; display:inline-block; vertical-align:middle; margin-right:6px;"></div>
-        <span>${force ? '正在占位合并中...' : '正在合并中...'}</span>
+        <span>${force ? '正在跳过缺口合并中...' : '正在合并中...'}</span>
     `;
     videosMeta.textContent = force
-        ? "正在用占位帧填充缺口并合并预览片，请稍候..."
+        ? "正在跳过缺失/串片片段并按2倍速合并，请稍候..."
         : "正在调用 FFmpeg 合并并加速视频，此过程可能需要几秒钟，请稍候...";
 
     try {
@@ -3337,9 +3606,9 @@ async function mergeVideos(force = false) {
 
             const mv = data.merged_video || {};
             if (mv.partial) {
-                const slots = (mv.placeholder_slots || []).join(', ');
-                showToast("已生成占位预览片（缺口用起始帧填充）", "success");
-                videosMeta.innerHTML = `⚠️ 占位预览已生成：槽位 <b>${escapeHtml(slots)}</b> 为「缺失/串片」占位帧，成片仅供预览（无音轨）。建议重试这些片段后重新合并以获得完整成片。`;
+                const slots = (mv.skipped_slots || []).join(', ');
+                showToast("已生成跳过缺口的合成片（2倍速）", "success");
+                videosMeta.innerHTML = `⚠️ 已合成：槽位 <b>${escapeHtml(slots)}</b> 因缺失/串片被跳过（该处为硬切），其余片段正常拼接、2倍速。建议重试这些片段后重新合并以获得完整成片。`;
             } else {
                 showToast("视频合并并加速成功！", "success");
                 videosMeta.textContent = "视频合并已完成！";
@@ -3353,12 +3622,16 @@ async function mergeVideos(force = false) {
         videosMeta.textContent = `合并视频失败: ${e.message}`;
     } finally {
         mergeBtn.disabled = false;
+        // innerHTML 还原后芯片里的 .step-stat 会带着合并前的旧文字回来，
+        // 所以必须在还原之后再刷一次管线条
         mergeBtn.innerHTML = originalText;
+        mergeInFlight = false;
+        updatePipelineBar();
     }
 }
 
 // 合成被门禁拦截时，在 videos-meta 区域渲染可操作面板：
-//   ① 重试缺失/串片片段并自动重合   ② 强制合并（占位帧填充预览）
+//   ① 重试缺失/串片片段并自动重合   ② 跳过这些片段直接合并（2倍速）
 function renderMergeBlocked(data) {
     const videosMeta = document.getElementById('videos-meta');
     if (!videosMeta) return;
@@ -3376,7 +3649,7 @@ function renderMergeBlocked(data) {
             <div style="color:#f6c453; margin-bottom:8px;">⚠️ 已拦截合并（避免成片硬跳/串片）：${parts.join('；')}。</div>
             <div style="display:flex; gap:8px; flex-wrap:wrap;">
                 <button type="button" class="action-btn text-btn" id="merge-retry-missing-btn">🔁 重试这些片段并合并 (${all.length})</button>
-                <button type="button" class="action-btn text-btn" id="merge-force-btn">⛰️ 强制合并（占位预览）</button>
+                <button type="button" class="action-btn text-btn" id="merge-force-btn">⚡ 跳过缺口合并（2倍速）</button>
             </div>
         </div>`;
 
@@ -3391,7 +3664,7 @@ function renderMergeBlocked(data) {
 
     const forceBtn = document.getElementById('merge-force-btn');
     if (forceBtn) forceBtn.addEventListener('click', async () => {
-        const ok = await customConfirm('强制合并会把缺失/串片的片段用「起始帧定格 + 缺失标注」填充，生成的成片仅供预览（无音轨），缺口不会被静默丢弃。确定继续吗？');
+        const ok = await customConfirm('将跳过缺失/串片的片段，把其余可用片段按原顺序直接拼接、2倍速合成（跳过处为硬切，不再用占位帧填充）。确定继续吗？');
         if (ok) mergeVideos(true);
     });
 }
@@ -3484,14 +3757,12 @@ async function saveCustomPreset() {
         return;
     }
 
-    const activeThemeBtn = document.querySelector('#theme-selector .theme-btn.active');
-    const selectedTheme = activeThemeBtn ? activeThemeBtn.dataset.value : 'hollow_oak';
-    
+    // 自定义预设不再存 theme：#theme-selector 已移除，原逻辑必然取不到激活按钮、
+    // 于是每条新预设都被写死成 'hollow_oak' 这个假值，applyCustomPreset 读它也是空转。
     const activeAnchors = Array.from(document.querySelectorAll('#anchor-selector .anchor-node.active'))
         .map(node => node.dataset.value);
 
     customPresets[trimmedName] = {
-        theme: selectedTheme,
         anchors: activeAnchors,
         complexity: parseInt(document.getElementById('slider-complexity').value, 10),
         budget: parseInt(document.getElementById('slider-budget').value, 10),
@@ -3534,9 +3805,24 @@ async function deleteCustomPreset(name, event) {
 // Drag & Drop and Hotkeys Setup
 // =====================================================================
 function setupDragAndDrop() {
+    // 全局兜底：拖文件进来时手一抖没落在放置区（帧/视频卡片、素材抽屉、图生图上传区）
+    // 上，浏览器默认行为是直接打开这个文件、把整个页面连同进行中的任务一起冲掉。
+    // 只拦文件拖拽（types 含 'Files'），纯文本拖拽照常——否则往提示词文本框里拖选中
+    // 文字也会失灵。落在放置区里的拖放已被各自 preventDefault，冒泡到这里时
+    // defaultPrevented 为真，直接放行不重复处理。
+    ['dragover', 'drop'].forEach(eventName => {
+        document.addEventListener(eventName, (e) => {
+            if (e.defaultPrevented) return;
+            const types = (e.dataTransfer && e.dataTransfer.types) || [];
+            if (Array.prototype.indexOf.call(types, 'Files') === -1) return;
+            e.preventDefault();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
+        }, false);
+    });
+
     const drawer = document.getElementById('library-drawer');
     if (!drawer) return;
-    
+
     ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
         drawer.addEventListener(eventName, preventDefaults, false);
     });
@@ -3636,7 +3922,19 @@ function handleGlobalHotkeys(e) {
             const closeSettingsBtn = settingsModal.querySelector('.close-btn');
             if (closeSettingsBtn) closeSettingsBtn.click();
         }
-        
+
+        const trendRefsManageModal = document.getElementById('trend-refs-manage-modal');
+        if (trendRefsManageModal && trendRefsManageModal.classList.contains('active')) {
+            const closeBtn = trendRefsManageModal.querySelector('.close-btn');
+            if (closeBtn) closeBtn.click();
+        }
+
+        const beatOutlineModal = document.getElementById('beat-outline-modal');
+        if (beatOutlineModal && beatOutlineModal.classList.contains('active')) {
+            const closeBtn = beatOutlineModal.querySelector('.close-btn');
+            if (closeBtn) closeBtn.click();
+        }
+
         // Close drawer
         const libraryDrawer = document.getElementById('library-drawer');
         if (libraryDrawer && libraryDrawer.classList.contains('active')) {
@@ -3650,9 +3948,253 @@ function handleGlobalHotkeys(e) {
 }
 
 // =====================================================================
+// 管线条 (Pipeline Bar)
+// ---------------------------------------------------------------------
+// 「封面 → 帧序列 → 视频 → 成片」四步的状态展示，外加一枚永远指向"当前该
+// 做的下一步"的主按钮，取代原来 7 枚等权平铺按钮。
+//
+// 关键约定：四枚芯片就是原来那四个生成按钮本体（id 未变），所以这里
+//   ① 只读状态、只写 class 与状态文字；
+//   ② 绝不去写 disabled —— 那个属性归各自的生成流程所有（generateFrames /
+//      hydrateFramesPanel / mergeVideos 都在写它），两边都写必然打架。
+// 见 docs/spark_result_minimal_layout_plan.md
+// =====================================================================
+
+const PIPELINE_STEPS = ['cover', 'frames', 'videos', 'merge'];
+
+const PIPELINE_STEP_NAME = {
+    cover: '封面',
+    frames: '帧序列',
+    videos: '视频序列',
+    merge: '成片',
+};
+
+const PIPELINE_NEXT_LABEL = {
+    cover: '生成封面图',
+    frames: '生成帧序列',
+    videos: '生成视频序列',
+    merge: '合并并加速视频',
+};
+
+// 已完成的步骤被再次点击时先确认——芯片摆在一条"看起来像导航"的条上，
+// 而这两步动辄十几分钟且会覆盖已有结果。封面会保留历史记录、合并本身可
+// 反复执行，都不拦。
+const PIPELINE_RERUN_CONFIRM = {
+    frames: '这一单的帧序列已全部生成，重新生成会覆盖现有全部帧图。确定重跑吗？',
+    videos: '这一单的视频序列已全部生成，重新生成会覆盖现有全部片段。确定重跑吗？',
+};
+
+// mergeVideos 不走 ideaTasksById 登记（它是一次同步请求，不是流式任务），
+// 合并期间的"进行中"只能靠这个标志位告诉管线条。
+let mergeInFlight = false;
+
+function computePipelineState(idea) {
+    const blank = () => ({ done: false, busy: false, locked: true, have: 0, stat: '—' });
+    if (!idea) {
+        return { cover: blank(), frames: blank(), videos: blank(), merge: blank() };
+    }
+
+    const slots = (typeof resolvePromptSlots === 'function') ? resolvePromptSlots(idea) : [];
+    const imageTotal = slots.filter(s => s.type === 'image').length;
+    const videoTotal = slots.filter(s => s.type === 'video').length;
+
+    const run = idea.frameRun || {};
+    const framesHave = (run.frames || []).filter(f => f.url || f.file).length;
+    const videosHave = (run.videos || []).filter(v => v.url || v.file).length;
+    const coversHave = (idea.covers || []).length;
+    const mergedOk = !!(run.merged_video && run.merged_video.status === 'success');
+
+    const busy = (type) => !!(typeof isIdeaTaskActive === 'function' && isIdeaTaskActive(idea.id, type));
+    // 槽位数解析不出来时（极旧的库存条目没有 prompt_slots 也没有 prompt_block）
+    // 退回"有就算数"，总比画一个 3/0 的假分母强。
+    const ratio = (have, total) => `${have}/${total || have || '?'}`;
+
+    return {
+        cover: {
+            done: coversHave > 0,
+            busy: busy('cover'),
+            locked: false,
+            have: coversHave,
+            stat: busy('cover') ? '生成中…' : (coversHave ? `${coversHave} 张` : '未生成'),
+        },
+        frames: {
+            done: imageTotal > 0 ? framesHave >= imageTotal : framesHave > 0,
+            busy: busy('frames'),
+            locked: false,
+            have: framesHave,
+            stat: (busy('frames') || framesHave) ? ratio(framesHave, imageTotal) : '未生成',
+        },
+        videos: {
+            done: videoTotal > 0 ? videosHave >= videoTotal : videosHave > 0,
+            busy: busy('videos'),
+            locked: framesHave === 0,
+            have: videosHave,
+            stat: (busy('videos') || videosHave)
+                ? ratio(videosHave, videoTotal)
+                : (framesHave === 0 ? '待帧序列' : '未生成'),
+        },
+        merge: {
+            done: mergedOk,
+            busy: mergeInFlight,
+            locked: videosHave === 0,
+            have: mergedOk ? 1 : 0,
+            stat: mergeInFlight ? '合并中…'
+                : (mergedOk ? '已合成' : (videosHave === 0 ? '待视频' : '未合并')),
+        },
+    };
+}
+
+/** 当前第一个未完成的步骤；全部完成返回 null。 */
+function resolveNextPipelineStep(state) {
+    return PIPELINE_STEPS.find(step => !state[step].done) || null;
+}
+
+function updatePipelineBar() {
+    const bar = document.getElementById('pipeline-bar');
+    if (!bar) return;
+
+    const state = computePipelineState(typeof currentIdea !== 'undefined' ? currentIdea : null);
+    const next = resolveNextPipelineStep(state);
+
+    PIPELINE_STEPS.forEach(step => {
+        const chip = bar.querySelector(`.pipeline-step[data-step="${step}"]`);
+        if (!chip) return;
+        const st = state[step];
+        chip.classList.toggle('is-done', st.done && !st.busy);
+        chip.classList.toggle('is-busy', st.busy);
+        chip.classList.toggle('is-locked', st.locked && !st.done && !st.busy);
+        chip.classList.toggle('is-next', step === next && !st.busy);
+        chip.title = `${PIPELINE_STEP_NAME[step]} · ${st.stat}`;
+        // 合并期间 mergeVideos 会整块换掉按钮的 innerHTML（转圈 + 文案），
+        // 那段时间这个 span 不存在；跳过即可，合并结束后会再刷一次。
+        const statEl = chip.querySelector('.step-stat');
+        if (statEl) statEl.textContent = st.stat;
+    });
+
+    const nextBtn = document.getElementById('pipeline-next-btn');
+    const nextText = document.getElementById('pipeline-next-text');
+    if (!nextBtn || !nextText) return;
+
+    const busyStep = PIPELINE_STEPS.find(step => state[step].busy);
+    if (busyStep) {
+        nextBtn.dataset.action = '';
+        nextBtn.disabled = true;
+        nextText.textContent = `${PIPELINE_STEP_NAME[busyStep]}生成中…`;
+    } else if (!next) {
+        nextBtn.dataset.action = 'download';
+        nextBtn.disabled = false;
+        nextText.textContent = '下载成品视频';
+    } else {
+        nextBtn.dataset.action = next;
+        nextBtn.disabled = false;
+        // 跑了一半（调试限量、中途取消、部分重试）时文案改成"继续"，
+        // 免得看着像要从头再来一遍
+        const partial = state[next].have > 0 && (next === 'frames' || next === 'videos');
+        nextText.textContent = partial ? `继续${PIPELINE_NEXT_LABEL[next]}` : PIPELINE_NEXT_LABEL[next];
+    }
+}
+
+/** 概览页以外（例如停在提示词页）先切回概览，否则目标 section 在隐藏面板里，滚动无效。 */
+function scrollToPipelineSection(sectionId) {
+    if (!sectionId) return;
+    const overview = document.getElementById('tab-panel-overview');
+    if (overview && !overview.classList.contains('active')) switchTab('overview');
+    const el = document.getElementById(sectionId);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+/** 主按钮：把点击转交给"下一步"对应的那枚芯片（也就是原来的生成按钮）。 */
+function runPipelineNext() {
+    const btn = document.getElementById('pipeline-next-btn');
+    const action = btn && btn.dataset.action;
+    if (!action) return;
+    if (action === 'download') {
+        const link = document.getElementById('merged-video-download');
+        scrollToPipelineSection('videos-section');
+        if (link && link.getAttribute('href') && link.getAttribute('href') !== '#') link.click();
+        return;
+    }
+    const chip = document.querySelector(`.pipeline-step[data-step="${action}"]`);
+    if (chip) chip.click();
+}
+
+function initPipelineBar() {
+    const bar = document.getElementById('pipeline-bar');
+    if (!bar) return;
+
+    // 捕获阶段拦一道：芯片本体就是生成按钮，点下去会真的重跑一遍。
+    // 在祖先节点的捕获阶段 stopImmediatePropagation 能拦住按钮自己的 click 监听。
+    bar.addEventListener('click', (e) => {
+        const chip = e.target && e.target.closest ? e.target.closest('.pipeline-step') : null;
+        if (!chip) return;
+        const step = chip.dataset.step;
+        const confirmText = PIPELINE_RERUN_CONFIRM[step];
+        if (confirmText && chip.classList.contains('is-done') && !confirm(confirmText)) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return;
+        }
+        scrollToPipelineSection(chip.dataset.section);
+    }, true);
+
+    const nextBtn = document.getElementById('pipeline-next-btn');
+    if (nextBtn) nextBtn.addEventListener('click', runPipelineNext);
+
+    const moreBtn = document.getElementById('pipeline-more-btn');
+    const moreMenu = document.getElementById('pipeline-more-menu');
+    if (moreBtn && moreMenu) {
+        const closeMenu = () => {
+            moreMenu.hidden = true;
+            moreBtn.setAttribute('aria-expanded', 'false');
+        };
+        moreBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const willOpen = moreMenu.hidden;
+            moreMenu.hidden = !willOpen;
+            moreBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+        });
+        // 菜单项的监听绑在按钮自己身上（冒泡先到它们），所以这里收菜单不会吞掉动作
+        moreMenu.addEventListener('click', closeMenu);
+        document.addEventListener('click', (e) => {
+            if (moreMenu.hidden) return;
+            if (moreBtn.contains(e.target) || moreMenu.contains(e.target)) return;
+            closeMenu();
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && !moreMenu.hidden) closeMenu();
+        });
+    }
+
+    updatePipelineBar();
+}
+
+/** section 标题栏的 ⚙ / ⓘ 弹层：同一个 section 里同时只展开一个。 */
+function initSectionPops() {
+    document.querySelectorAll('.section-tool-btn[data-pop]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const pop = document.getElementById(btn.dataset.pop);
+            if (!pop) return;
+            const willOpen = pop.hidden;
+            const section = btn.closest('.idea-section');
+            if (section) {
+                section.querySelectorAll('.section-pop').forEach(p => { if (p !== pop) p.hidden = true; });
+                section.querySelectorAll('.section-tool-btn').forEach(b => { if (b !== btn) b.classList.remove('active'); });
+            }
+            pop.hidden = !willOpen;
+            btn.classList.toggle('active', willOpen);
+        });
+    });
+}
+
+// =====================================================================
 // Tab Loading Dot Progress Perception
 // =====================================================================
 function updateTabStatusDot() {
+    // 任务开始/结束都会走到这里（beginIdeaTask / endIdeaTask），顺手把管线条
+    // 的三态刷一遍——这是"生成中/已完成"切换最可靠的那个时机。
+    updatePipelineBar();
+
     const dot = document.getElementById('overview-status-dot');
     if (!dot) return;
 
@@ -3697,6 +4239,10 @@ function updateActiveGenerationBanner() {
 // Upstream Topic Ideation Engine (P2)
 // --------------------------------------------------------------------------
 let currentIdeatedIdeas = [];
+// 缓存版本随「卡片上要展示的字段」一起变：3-beat-outline 起每条 idea 都带
+// beat_outline（节拍简介）。上一版缓存里的卡片没有这个字段，点「🔨 节拍简介」
+// 只会得到一句“没有节拍简介”——所以直接判过期，下次进页面重新激发一批。
+const IDEATION_CACHE_VERSION = '3-beat-outline';
 
 async function loadIdeationCards(force = false) {
     const container = document.getElementById('ideation-cards-container');
@@ -3712,7 +4258,8 @@ async function loadIdeationCards(force = false) {
         // 缓存与生成时勾选的联网参考集合绑定：勾选变了缓存即视为过期重新生成，
         // 不能把按别的参考取材的灵感当成这批参考的
         const cachedSel = localStorage.getItem('ideation_cached_trend_sel');
-        if (cached && cachedSel === selKey) {
+        const cachedVersion = localStorage.getItem('ideation_cache_version');
+        if (cached && cachedSel === selKey && cachedVersion === IDEATION_CACHE_VERSION) {
             try {
                 const parsed = JSON.parse(cached);
                 if (parsed && Array.isArray(parsed) && parsed.length > 0) {
@@ -3733,7 +4280,7 @@ async function loadIdeationCards(force = false) {
 
     container.innerHTML = selIds.length > 0
         ? `<div class="ideation-loading">正在从选中的 ${selIds.length} 条联网参考案例中取材激发灵感，请稍候...</div>`
-        : `<div class="ideation-loading">正在自动联网搜索趋势并寻找灵感中，请稍候...</div>`;
+        : `<div class="ideation-loading">正在从案例库自动挑选参考激发灵感中，请稍候...</div>`;
 
     try {
         const response = await fetch('/api/ideate', {
@@ -3755,9 +4302,11 @@ async function loadIdeationCards(force = false) {
             localStorage.setItem('ideation_cached_ideas', JSON.stringify(data.ideas));
             localStorage.setItem('ideation_cached_trend_refs', JSON.stringify(currentIdeationTrendRefs));
             localStorage.setItem('ideation_cached_trend_sel', selKey);
+            localStorage.setItem('ideation_cache_version', IDEATION_CACHE_VERSION);
             renderIdeationCards(data.ideas);
-            // 自动搜索路径会往案例库沉淀新参考，让左侧列表跟上
-            if (selIds.length === 0 && typeof loadTrendRefs === 'function') loadTrendRefs();
+            // 无论走哪条来源分支，used_count 都可能变化、命中自动归档阈值的条目会从
+            // 主库消失，每次生成后都要刷新左侧列表，避免残留已归档条目可勾选
+            if (typeof loadTrendRefs === 'function') loadTrendRefs();
         } else {
             container.innerHTML = `<div class="ideation-error">加载失败: ${data.message || '未知错误'}</div>`;
         }

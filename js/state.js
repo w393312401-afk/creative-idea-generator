@@ -16,12 +16,15 @@ const DEFAULT_CONFIG = {
     // backend supplies the key from server_config.json. For local self-use, enter your key
     // once in the ⚙️ 配置中心 (it persists in this browser's localStorage).
     apiKey: '',
-    model: 'gemini-3-flash-agent',
+    model: 'gemini-3.6-flash-high',
     imageModel: 'nano-banana-2',
     // 帧序列生成方式: 'api'（LLM 网关）| 'google_fx'（AdsPower 浏览器 UI 自动化）
     imageBackend: 'api',
     googleFxImageModel: 'Nano Banana 2',
     videoModel: 'Veo 3.1 - Lite [Lower Priority]',
+    // 换号节拍：每多少个请求换一个号池账号。键名是历史遗留（原本是「自动轮换 IP 频率」）
+    // ——换 IP 已全局关停（会把 Flow 登录 token 打失效、还会让画布追踪串片），全程保持
+    // 同一个 IP，这个值现在只管换号；键名保留是为了不动用户已存的配置
     googleFxIpRotateRequests: 5,
     // AdsPower 浏览器编号（profile 的 user_id）：留空则使用服务端 .env 里的默认浏览器；
     // 多开/多账号场景下可在此切换本次帧序列/视频生成实际驱动哪个 AdsPower 窗口
@@ -31,8 +34,6 @@ const DEFAULT_CONFIG = {
     videoDuration: '',
     imageAspectRatio: '9:16',
     imageQuality: '2K',
-    // 关键点监修模式: 首帧/镜头族交接锚点帧渲染后暂停等人工确认（采用/重渲，超时自动采用）
-    supervisedMode: false,
     // 激发参考网址（可选）: 换行/逗号分隔,最多取 5 个;后端抓取正文→aux 模型压成
     // 中文要点注入激发 prompt,与联网搜索趋势通道叠加,6 小时缓存
     ideationTrendUrls: '',
@@ -59,7 +60,10 @@ const LLM_MODEL_GROUPS = {
         { value: 'gpt-5.6-luna', label: 'gpt-5.6-luna' }
     ],
     gemini: [
-        { value: 'gemini-3-flash-agent', label: 'gemini-3-flash-agent', recommended: true }
+        { value: 'gemini-3.6-flash-high', label: 'gemini-3.6-flash-high', recommended: true },
+        // 2026-07-26 实测：8046 网关直接认这个模型名（内部落到 gemini-pro-agent），
+        // 回包带 reasoning_content，正文仍在 choices[0].message.content，链路无需改动。
+        { value: 'gemini-3.1-pro-high', label: 'gemini-3.1-pro-high' }
     ],
     claude: [
         { value: 'claude-sonnet-4-6', label: 'claude-sonnet-4-6' },
@@ -68,7 +72,13 @@ const LLM_MODEL_GROUPS = {
 };
 
 // 生图模型清单（与 LLM 模型解耦：resolve_gateway 会按模型名自动路由网关，
-// gemini LLM + gpt-image-2 生图这类混搭是合法且常用的组合——配额兜底正是这么跑的）
+// gemini LLM + gpt-image-2 生图这类混搭是合法组合）。
+// 注意：这里选 gpt-image-2 是「人明确要它」；系统不会再自己切过去——主模型配额
+// 耗尽时自动降级到 gpt-image-2 的机制已整体取消。配额耗尽时系统只会换传输通道、
+// 绝不换模型：图生图撞上网关 /images/edits 的号池墙时，同一个模型改走
+// /chat/completions 续渲（见 frame_generator.CHAT_TRANSPORT），该帧在 manifest 里
+// 标 transport/actual_pixels 留痕（请求 2K/4K 时才另记 degraded_reason，chat 通道
+// 固定出 1K 档）；连这条通道也没额度才就地报错。
 const IMAGE_MODELS = [
     { value: 'nano-banana-2', label: '🍌 Nano Banana 2 (Gemini)' },
     { value: 'gpt-image-2', label: 'gpt-image-2 (GPT / codex 通道)' }
@@ -78,8 +88,16 @@ const IMAGE_MODELS = [
 const FX_IMAGE_MODELS = [
     { value: 'Nano Banana Pro', label: 'Nano Banana Pro' },
     { value: 'Nano Banana 2', label: '🍌 Nano Banana 2' },
-    { value: 'Imagen 4', label: 'Imagen 4' }
+    { value: 'Nano Banana 2 Lite', label: '🍌 Nano Banana 2 Lite' }
 ];
+
+const LEGACY_FX_IMAGE_MODELS = new Set(['imagen 4', 'imagen4', 'image 4', 'image4']);
+function normalizeGoogleFxImageModel(value) {
+    const current = String(value || '').trim();
+    if (LEGACY_FX_IMAGE_MODELS.has(current.toLowerCase())) return 'Nano Banana 2 Lite';
+    const matched = FX_IMAGE_MODELS.find(item => item.value.toLowerCase() === current.toLowerCase());
+    return matched ? matched.value : DEFAULT_CONFIG.googleFxImageModel;
+}
 
 // Global State
 let config = { ...DEFAULT_CONFIG };

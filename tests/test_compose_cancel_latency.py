@@ -96,6 +96,8 @@ class TestCancelEndpointImmediateFinalize:
             assert json.load(f)["status"] == "cancelled"
 
     def test_fx_capable_task_is_not_force_finalized(self, monkeypatch):
+        """FX 任务现在也立即终态化（和非 FX 一致），worker 的 except
+        ConnectionError 凭 status 守卫不再重复写。"""
         import builtins
         monkeypatch.setattr(builtins, "google_fx_cancelled", False, raising=False)
         t = _seed_running("frames_123", {"type": "frames"})
@@ -105,8 +107,8 @@ class TestCancelEndpointImmediateFinalize:
 
         assert sent == [({"status": "ok"}, 200)]
         assert t["cancel_event"].is_set()
-        # FX 任务要正确收尾共享浏览器，仍由 worker 协作式退出
-        assert t["status"] == "running"
+        # FX 任务现在也由 cancel 端点立即终态化
+        assert t["status"] == "cancelled"
 
     def test_terminal_task_is_left_untouched(self):
         t = _seed_running("1720000000001")

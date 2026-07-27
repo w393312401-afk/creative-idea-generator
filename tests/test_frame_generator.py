@@ -9,13 +9,18 @@ from unittest.mock import patch
 
 from frame_generator import (
     plan_fx_chunks,
+    plan_frame_chunk_accounts,
     _fx_extract_uuid,
     _fx_find_ref_for,
     _fx_store_frame,
     generate_frame_sequence,
     _execute_request_with_retry,
+    _generate_image_edit,
     _image_size_to_api_size,
+    CHAT_TRANSPORT,
+    reset_edits_pool_state,
     QuotaExhaustedError,
+    _match_color_lab,
 )
 import server_common
 from server_common import gpt_image_pixel_size
@@ -23,6 +28,22 @@ from prompt_pipeline import _parse_prompt_slots, _format_prompt_block, parse_sec
 
 _UUID_A = '11111111-2222-3333-4444-555555555555'
 _UUID_B = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+
+
+def _write_test_image(path, size):
+    """写一张真实可解码的图：降档通道的取证靠真实像素尺寸，假字节顶不了。"""
+    from PIL import Image
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    Image.new('RGB', size, (90, 110, 130)).save(
+        path, format='WEBP' if path.lower().endswith('.webp') else 'PNG')
+
+
+def _test_image_data_url(size):
+    import base64
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new('RGB', size, (120, 100, 80)).save(buf, format='JPEG')
+    return 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode('ascii')
 
 
 class TestPlanFxChunks(unittest.TestCase):
@@ -43,6 +64,49 @@ class TestPlanFxChunks(unittest.TestCase):
     def test_unsorted_input_and_empty(self):
         self.assertEqual(plan_fx_chunks([5, 3, 4]), [[3, 4, 5]])
         self.assertEqual(plan_fx_chunks([]), [])
+
+
+class TestPlanFrameChunkAccounts(unittest.TestCase):
+    """只换号、不换 IP：每批绑一个号池账号，IP 全程不动（换 IP 已全局关停）。"""
+
+    def test_single_account_pool_changes_nothing(self):
+        """可换的号 ≤1 个时不介入——账号沿用调用方设好的。"""
+        chunks = [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]]
+        for ring in ([], ['a']):
+            plans = plan_frame_chunk_accounts(chunks, ring, 5)
+            self.assertEqual(plans, [{'user_id': None}] * 2)
+
+    def test_switches_account_per_batch(self):
+        chunks = [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10], [11, 12]]
+        plans = plan_frame_chunk_accounts(chunks, ['a', 'b', 'c'], 5)
+        self.assertEqual([p['user_id'] for p in plans], ['a', 'b', 'c'])
+
+    def test_ring_wraps_around(self):
+        chunks = [[1, 2, 3, 4, 5]] * 4
+        plans = plan_frame_chunk_accounts(chunks, ['a', 'b'], 5)
+        self.assertEqual([p['user_id'] for p in plans], ['a', 'b', 'a', 'b'])
+
+    def test_interval_larger_than_batch_keeps_account_across_batches(self):
+        """节拍 10 帧 + 每批 5 帧 = 两批共用一个号。"""
+        chunks = [[1, 2, 3, 4, 5]] * 4
+        plans = plan_frame_chunk_accounts(chunks, ['a', 'b'], 10)
+        self.assertEqual([p['user_id'] for p in plans], ['a', 'a', 'b', 'b'])
+
+    def test_never_emits_rotate_ip(self):
+        """换 IP 已关停：计划里不该再出现任何换 IP 指示。"""
+        chunks = [[1, 2, 3, 4, 5]] * 4
+        for ring in ([], ['a'], ['a', 'b', 'c']):
+            for plan in plan_frame_chunk_accounts(chunks, ring, 5):
+                self.assertNotIn('rotate_ip', plan)
+
+    def test_short_chunks_from_cut_heads_still_accumulate_to_interval(self):
+        """硬切把批次切碎（1 帧、2 帧）时，按累计帧数而不是按批数换号。"""
+        chunks = [[1], [2, 3], [4, 5, 6], [7, 8]]
+        plans = plan_frame_chunk_accounts(chunks, ['a', 'b'], 5)
+        self.assertEqual([p['user_id'] for p in plans], ['a', 'a', 'a', 'b'])
+
+    def test_no_chunks(self):
+        self.assertEqual(plan_frame_chunk_accounts([], ['a', 'b'], 5), [])
 
 
 class TestFxUuidExtract(unittest.TestCase):
@@ -94,6 +158,38 @@ class TestFxSrcArchive(unittest.TestCase):
         _fx_store_frame(self._make_fx_jpg(_UUID_A), self.frames_dir, 4)
         ref = _fx_find_ref_for(self.frames_dir, 5)
         self.assertIn('img_004_', os.path.basename(ref))
+
+
+class TestLabColorMatching(unittest.TestCase):
+    """LAB matching must use OpenCV's uint8 channel ranges without cooling images."""
+
+    def setUp(self):
+        try:
+            import cv2  # noqa: F401
+            import numpy  # noqa: F401
+        except ImportError:
+            self.skipTest('OpenCV/numpy are not installed')
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        if hasattr(self, 'tmp'):
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_identical_warm_image_preserves_white_balance(self):
+        from PIL import Image, ImageChops
+
+        source = os.path.join(self.tmp, 'warm-source.png')
+        output = os.path.join(self.tmp, 'warm-output.png')
+        # RGB with a clear warm balance. The old -127..127 a/b clipping removes
+        # its yellow component and makes this image substantially cooler.
+        original = Image.new('RGB', (32, 32), (230, 200, 170))
+        original.save(source)
+
+        _match_color_lab(source, source, output)
+
+        result = Image.open(output).convert('RGB')
+        extrema = ImageChops.difference(original, result).getextrema()
+        self.assertLessEqual(max(high for _low, high in extrema), 3)
 
 
 class TestFrameProgressEvents(unittest.TestCase):
@@ -156,8 +252,11 @@ visible construction change
 
 
 class TestQuotaFallback(unittest.TestCase):
-    """当主模型(Gemini)图片额度耗尽时，必须切到 config['imageEditFallbackModel']
-    （effective_config 现在会透传这项），而不是让整个帧序列任务崩溃。"""
+    """主模型图片额度耗尽 = 就地明确失败。
+
+    自动降级到兜底模型（曾配 gpt-image-2）已整体取消：换模型渲出来的帧会丢
+    材质做旧风格、还会凭空发明提示词没提过的结构件，并因图生图链式编辑被下一
+    帧当"已确认事实"继承。已渲好的帧由断点续传保住，补额度后重试即可接着渲。"""
 
     _PROMPT_BLOCK = """图片 1:
 first frame prompt
@@ -189,9 +288,9 @@ second frame prompt
                     return json.load(f)
         return None
 
-    def test_fallback_model_used_when_primary_quota_exhausted_without_degrade_mark(self):
-        """兜底模型仍走图生图且挂同一张参考帧：链路不断，绝不能再打
-        i2i_fallback_degraded——那个标记会让下游视频门禁拦掉相邻两段视频。"""
+    def test_quota_exhaustion_aborts_instead_of_switching_models(self):
+        """配额耗尽必须原样抛 QuotaExhaustedError，且绝不试第二个模型：
+        配了 imageEditFallbackModel 也一样（该键已不再透传，留在这里是防回归）。"""
         edit_calls = []
 
         def fake_text_image(config, prompt, target_path, *a, **kw):
@@ -208,22 +307,20 @@ second frame prompt
         events = []
         with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
-            generate_frame_sequence(config, 'quota_fallback', self._PROMPT_BLOCK,
-                                     on_progress=lambda stage, details: events.append((stage, details)))
+            with self.assertRaises(QuotaExhaustedError):
+                generate_frame_sequence(config, 'quota_fallback', self._PROMPT_BLOCK,
+                                         on_progress=lambda stage, details: events.append((stage, details)))
 
-        self.assertEqual(edit_calls, ['primary-model', 'fallback-model'])
+        # 只打了主模型一枪，没有第二个模型的重试
+        self.assertEqual(edit_calls, ['primary-model'])
+        self.assertEqual([s for s, _d in events if s == 'model_fallback'], [])
+        # 第 1 帧已落盘：补额度后重试靠断点续传直接复用，不白烧
         manifest = self._read_manifest('quota_fallback')
-        frame2 = next(f for f in manifest['frames'] if f['sequence'] == 2)
-        self.assertNotEqual(frame2['quality_gate'], 'i2i_fallback_degraded')
-        self.assertIn('fallback-model', frame2['model'])  # 真实使用的模型留痕
-        # 切换兜底必须显式广播：否则前端刚看到"此路终止"下一秒又见转圈，读起来像卡死
-        fb = next(details for stage, details in events if stage == 'model_fallback')
-        self.assertEqual(fb['sequence'], 2)
-        self.assertEqual(fb['to'], 'fallback-model')
+        self.assertTrue(any(f['sequence'] == 1 for f in manifest['frames']))
 
-    def test_no_silent_text_image_fallback_when_both_edit_models_fail(self):
-        """主模型与兜底模型的图生图都失败时：必须整帧明确报错等用户重试，
-        绝不静默丢参考图改文生图重画——那会产出真正断链的帧（构图跳变根源）。"""
+    def test_no_silent_text_image_fallback_when_edit_quota_exhausted(self):
+        """图生图配额耗尽时绝不静默丢参考图改文生图重画——那会产出真正断链的
+        帧（构图跳变根源）。只有第 1 帧（本就没有参考帧）允许文生图。"""
         text_calls = []
 
         def fake_text_image(config, prompt, target_path, *a, **kw):
@@ -231,23 +328,396 @@ second frame prompt
             self._write(target_path, f'image:{prompt}')
 
         def fake_image_edit(config, prompt, reference_path, target_path, *a, **kw):
-            # Both primary and fallback edit attempts are quota-exhausted.
             raise QuotaExhaustedError('exhausted')
 
-        config = {'imageModel': 'primary-model', 'imageEditFallbackModel': 'fallback-model'}
+        config = {'imageModel': 'primary-model'}
 
         with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
-            with self.assertRaises(RuntimeError) as ctx:
+            with self.assertRaises(QuotaExhaustedError):
                 generate_frame_sequence(config, 'quota_fallback_full', self._PROMPT_BLOCK,
                                          on_progress=lambda stage, details: None)
 
-        self.assertIn('兜底模型', str(ctx.exception))
-        # 只有第 1 帧（本就没有参考帧）允许文生图；第 2 帧绝不允许退到文生图
         self.assertEqual(text_calls, ['primary-model'])
-        # 第 1 帧已落盘，重试时断点续传直接复用
         manifest = self._read_manifest('quota_fallback_full')
         self.assertTrue(any(f['sequence'] == 1 for f in manifest['frames']))
+
+
+class TestChatTransportFallback(unittest.TestCase):
+    """网关的 /images/edits 被写死路由到 gemini-3-pro-image 号池：请求里写哪个图像模型
+    都一样，号池没额度就一律 502「No accounts available with quota for model:
+    gemini-3-pro-image」——第 1 帧走 /images/generations（flash-image 号池）没事、第 2 帧
+    起必挂就是这个原因。同一个网关的 /chat/completions 用同一个模型名带参考图能正常
+    图生图，所以撞这堵墙时换通道续渲（模型不变，链上一致性不受影响）。这条通道固定出
+    1K 档，请求 2K/4K 时才是降档——留痕按实际情况标，不乱扣帽子。"""
+
+    _BROKER_BODY = ('Max retries exhausted. Last error: Token error: No accounts '
+                    'available with quota for model: gemini-3-pro-image')
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.ref_path = os.path.join(self.tmp, 'img_001.webp')
+        self.target_path = os.path.join(self.tmp, 'img_002.webp')
+        _write_test_image(self.ref_path, (720, 1280))
+        self.chat_payloads = []
+        reset_edits_pool_state()
+
+    def tearDown(self):
+        reset_edits_pool_state()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _fake_transport(self, chat_result='image'):
+        """/images/edits 一律撞号池墙；/chat/completions 按 chat_result 表现。"""
+        import json
+
+        def fake_execute(req, *args, **kwargs):
+            url = req.full_url if hasattr(req, 'full_url') else str(req)
+            if '/images/edits' in url:
+                raise QuotaExhaustedError(f'您的图片生成配额已耗尽 (QUOTA_EXHAUSTED)。 {self._BROKER_BODY}')
+            if '/chat/completions' not in url:
+                raise AssertionError(f'unexpected upstream call: {url}')
+            self.chat_payloads.append(json.loads(req.data.decode('utf-8')))
+            if chat_result == 'quota':
+                raise QuotaExhaustedError(f'您的图片生成配额已耗尽 (QUOTA_EXHAUSTED)。 {self._BROKER_BODY}')
+            if chat_result == 'no_image':
+                content = '抱歉，我无法生成这张图片。'
+            else:
+                content = f'![image]({_test_image_data_url((768, 1376))})'
+            return json.dumps({'choices': [{'message': {'role': 'assistant', 'content': content}}]}).encode('utf-8')
+
+        return fake_execute
+
+    def test_edit_quota_wall_is_served_by_chat_transport_with_the_same_model(self):
+        config = {'imageModel': 'nano-banana-2', 'imageAspectRatio': '9:16',
+                  'imageQuality': '2K', 'apiKey': 'k'}
+
+        with patch('frame_generator._execute_request_with_retry', side_effect=self._fake_transport()):
+            transport = _generate_image_edit(config, 'second frame prompt',
+                                             self.ref_path, self.target_path)
+
+        self.assertEqual(transport, CHAT_TRANSPORT)
+        self.assertTrue(os.path.getsize(self.target_path) > 0)
+        self.assertEqual(len(self.chat_payloads), 1)
+        payload = self.chat_payloads[0]
+        # 模型不变：界面别名换算后的裸模型名，绝不带比例/画质魔法后缀（带后缀上游判 404）
+        self.assertEqual(payload['model'], 'gemini-3.1-flash-image')
+        # 出图比例只有顶层 size 能控（aspect_ratio/image_size/提示词都无效）
+        self.assertEqual(payload['size'], '9:16')
+        # 参考图必须内联进去——否则这就不是图生图，而是断链的文生图
+        blocks = payload['messages'][0]['content']
+        self.assertEqual([b['type'] for b in blocks], ['text', 'image_url'])
+        self.assertTrue(blocks[1]['image_url']['url'].startswith('data:image/png;base64,'))
+        self.assertIn('second frame prompt', blocks[0]['text'])
+
+    def test_codex_routed_model_has_no_chat_transport_and_still_fails_fast(self):
+        """gpt-image-2 走的是另一个网关(codex)，没有这条等价通道——不许拿 gemini
+        的 chat 通道去顶，那就是换模型了。"""
+        config = {'imageModel': 'gpt-image-2', 'imageAspectRatio': '9:16', 'codexApiKey': 'k'}
+
+        with patch('frame_generator._execute_request_with_retry', side_effect=self._fake_transport()):
+            with self.assertRaises(QuotaExhaustedError):
+                _generate_image_edit(config, 'p', self.ref_path, self.target_path)
+
+        self.assertEqual(self.chat_payloads, [])
+
+    def test_transport_edits_never_falls_back(self):
+        config = {'imageModel': 'nano-banana-2', 'imageAspectRatio': '9:16',
+                  'imageEditTransport': 'edits', 'apiKey': 'k'}
+
+        with patch('frame_generator._execute_request_with_retry', side_effect=self._fake_transport()):
+            with self.assertRaises(QuotaExhaustedError):
+                _generate_image_edit(config, 'p', self.ref_path, self.target_path)
+
+        self.assertEqual(self.chat_payloads, [])
+
+    def test_transport_chat_never_sends_the_doomed_edits_request(self):
+        """网关补丁缺失的机器上直接指定 chat 通道：那一枪必挂（~1s + 一整张参考图
+        上传），一次都不该发。"""
+        config = {'imageModel': 'nano-banana-2', 'imageAspectRatio': '9:16',
+                  'imageEditTransport': 'chat', 'apiKey': 'k'}
+        edits_calls = []
+
+        def fake_execute(req, *args, **kwargs):
+            url = req.full_url if hasattr(req, 'full_url') else str(req)
+            if '/images/edits' in url:
+                edits_calls.append(url)
+                raise AssertionError('imageEditTransport=chat 时不许打 /images/edits')
+            return self._fake_transport()(req, *args, **kwargs)
+
+        with patch('frame_generator._execute_request_with_retry', side_effect=fake_execute):
+            transport = _generate_image_edit(config, 'p', self.ref_path, self.target_path)
+
+        self.assertEqual(transport, CHAT_TRANSPORT)
+        self.assertEqual(edits_calls, [])
+        self.assertEqual(len(self.chat_payloads), 1)
+
+    def test_pool_wall_is_remembered_so_later_frames_skip_the_doomed_request(self):
+        """撞过一次墙就够了：熔断后同一网关的后续帧直接走 chat 通道，不再每帧都
+        白发一次必挂的 /images/edits（那一枪要 ~1s，还要把整张参考图传上去）。"""
+        config = {'imageModel': 'nano-banana-2', 'imageAspectRatio': '9:16', 'apiKey': 'k'}
+        edits_attempts = []
+
+        def fake_execute(req, *args, **kwargs):
+            url = req.full_url if hasattr(req, 'full_url') else str(req)
+            if '/images/edits' in url:
+                edits_attempts.append(url)
+            return self._fake_transport()(req, *args, **kwargs)
+
+        with patch('frame_generator._execute_request_with_retry', side_effect=fake_execute):
+            for _ in range(3):
+                self.assertEqual(
+                    _generate_image_edit(config, 'p', self.ref_path, self.target_path),
+                    CHAT_TRANSPORT)
+
+        self.assertEqual(len(edits_attempts), 1)   # 只有第一帧探了一次路
+        self.assertEqual(len(self.chat_payloads), 3)
+
+        # 熔断只活在进程内：网关补好后重启服务（= 清状态）会重新探路
+        reset_edits_pool_state()
+        with patch('frame_generator._execute_request_with_retry', side_effect=fake_execute):
+            _generate_image_edit(config, 'p', self.ref_path, self.target_path)
+        self.assertEqual(len(edits_attempts), 2)
+
+    def test_codex_gateway_is_not_short_circuited_by_the_gemini_pool_wall(self):
+        """熔断按网关记：gemini 网关的 edits 死了，不该让走 codex 网关的
+        gpt-image-2 也跳过它自己的 edits 请求。
+
+        两个网关地址都在 config 里写死：resolve_gateway 的取值链是
+        config.codexBaseUrl → SERVER_CONFIG.codexBaseUrl → 默认 65038，此前这里靠
+        默认值、断言里硬编码 '65038'，于是任何在 server_config.json 里改过
+        codexBaseUrl 的开发机上这条测试都必然失败（实测本机配的是 52692）——
+        测试不该依赖开发机的真实配置。"""
+        gemini_base = 'http://127.0.0.1:8046/v1'
+        codex_base = 'http://127.0.0.1:65038/v1'
+        gemini_cfg = {'imageModel': 'nano-banana-2', 'imageAspectRatio': '9:16', 'apiKey': 'k',
+                      'baseUrl': gemini_base}
+        codex_cfg = {'imageModel': 'gpt-image-2', 'imageAspectRatio': '9:16', 'codexApiKey': 'k',
+                     'codexBaseUrl': codex_base}
+        codex_edits = []
+
+        def fake_execute(req, *args, **kwargs):
+            url = req.full_url if hasattr(req, 'full_url') else str(req)
+            if url.startswith(codex_base):
+                codex_edits.append(url)
+                raise RuntimeError('codex gateway down')
+            return self._fake_transport()(req, *args, **kwargs)
+
+        with patch('frame_generator._execute_request_with_retry', side_effect=fake_execute), \
+             patch('time.sleep'):
+            _generate_image_edit(gemini_cfg, 'p', self.ref_path, self.target_path)
+            with self.assertRaises(RuntimeError):
+                _generate_image_edit(codex_cfg, 'p', self.ref_path, self.target_path)
+
+        self.assertTrue(codex_edits)  # codex 那条路照打，没被 gemini 的熔断带累
+
+    def test_chat_transport_failure_keeps_quota_exhaustion_as_the_reported_cause(self):
+        """兜底通道也没救时，报出去的必须还是"配额耗尽"这个真因，chat 通道自己的
+        失败只作为附注——否则用户会去排查一个假问题。"""
+        config = {'imageModel': 'nano-banana-2', 'imageAspectRatio': '9:16', 'apiKey': 'k'}
+
+        # chat 通道也撞配额墙：真因原样上抛（断点续传据此保住已渲好的帧）
+        with patch('frame_generator._execute_request_with_retry',
+                   side_effect=self._fake_transport('quota')):
+            with self.assertRaises(QuotaExhaustedError) as ctx:
+                _generate_image_edit(config, 'p', self.ref_path, self.target_path)
+        self.assertIn('QUOTA_EXHAUSTED', str(ctx.exception))
+
+        # chat 通道回包里没有图（不是配额问题）：这是另一种失败，报错要说它自己的事，
+        # 别硬套成"配额耗尽"——但也照样烧完外层重试才放弃。
+        reset_edits_pool_state()
+        with patch('frame_generator._execute_request_with_retry',
+                   side_effect=self._fake_transport('no_image')), \
+             patch('time.sleep'):
+            with self.assertRaises(RuntimeError) as ctx:
+                _generate_image_edit(config, 'p', self.ref_path, self.target_path)
+        self.assertNotIsInstance(ctx.exception, QuotaExhaustedError)
+        self.assertIn('没有图片', str(ctx.exception))
+
+    def test_recoverable_pool_wall_is_not_broadcast_as_an_upstream_failure(self):
+        """探路那一枪撞墙 = 换条路接着渲，不是"任务要挂了"。前端把 upstream 事件
+        一律渲成「⚠️ 上游报错…此路终止，任务即将报错结束」，而这一帧其实好好地在
+        chat 通道上渲完了——播报这句话就是撒谎吓人。换通道由调用方的
+        transport_fallback 事件如实播报，这里一个 upstream 事件都不许推。"""
+        from frame_generator import set_upstream_event_sink
+        config = {'imageModel': 'nano-banana-2', 'imageAspectRatio': '9:16', 'apiKey': 'k'}
+        edits_kwargs = []
+
+        def fake_execute(req, *args, **kwargs):
+            url = req.full_url if hasattr(req, 'full_url') else str(req)
+            if '/images/edits' in url:
+                edits_kwargs.append(kwargs)
+            return self._fake_transport()(req, *args, **kwargs)
+
+        events = []
+        set_upstream_event_sink(events.append)
+        try:
+            with patch('frame_generator._execute_request_with_retry', side_effect=fake_execute):
+                transport = _generate_image_edit(config, 'p', self.ref_path, self.target_path)
+        finally:
+            set_upstream_event_sink(None)
+
+        self.assertEqual(transport, CHAT_TRANSPORT)
+        self.assertEqual(events, [])
+        # 那一枪自己也不许把配额耗尽播出去：有等价通道可换时它不是终点
+        self.assertEqual(edits_kwargs[0].get('emit_quota_failure'), False)
+
+    def test_dead_end_pool_wall_is_still_broadcast(self):
+        """反过来：换不了通道时（transport=edits / 没有等价 chat 模型），撞墙就是
+        真终点，必须照旧广播——不能为了不吓人把真failure也一起吞了。"""
+        edits_kwargs = []
+
+        def fake_execute(req, *args, **kwargs):
+            url = req.full_url if hasattr(req, 'full_url') else str(req)
+            if '/images/edits' in url:
+                edits_kwargs.append(kwargs)
+            return self._fake_transport()(req, *args, **kwargs)
+
+        with patch('frame_generator._execute_request_with_retry', side_effect=fake_execute):
+            with self.assertRaises(QuotaExhaustedError):
+                _generate_image_edit({'imageModel': 'nano-banana-2', 'imageAspectRatio': '9:16',
+                                      'imageEditTransport': 'edits', 'apiKey': 'k'},
+                                     'p', self.ref_path, self.target_path)
+            with self.assertRaises(QuotaExhaustedError):
+                _generate_image_edit({'imageModel': 'gpt-image-2', 'imageAspectRatio': '9:16',
+                                      'codexApiKey': 'k'},
+                                     'p', self.ref_path, self.target_path)
+
+        self.assertEqual([kw.get('emit_quota_failure') for kw in edits_kwargs], [True, True])
+
+    def test_managed_mode_actually_honours_the_transport_switch(self):
+        """`imageEditTransport` 写在 server_config.json 里、托管模式下却被
+        effective_config 的白名单丢掉，等于"配了但从未生效"：配 chat 的机器每个
+        进程照样先打一枪必挂的 edits。同一个口子漏过的第二个键（第一个是
+        qaGateLevel），所以这里钉死它。"""
+        from server_common import effective_config
+        with patch.object(server_common, 'SERVER_MANAGED', True), \
+             patch.dict(server_common.SERVER_CONFIG,
+                        {'imageEditTransport': 'chat'}, clear=False):
+            merged = effective_config({})
+        self.assertEqual(merged.get('imageEditTransport'), 'chat')
+
+        edits_calls = []
+
+        def fake_execute(req, *args, **kwargs):
+            url = req.full_url if hasattr(req, 'full_url') else str(req)
+            if '/images/edits' in url:
+                edits_calls.append(url)
+            return self._fake_transport()(req, *args, **kwargs)
+
+        merged.update({'imageModel': 'nano-banana-2', 'imageAspectRatio': '9:16', 'apiKey': 'k'})
+        with patch('frame_generator._execute_request_with_retry', side_effect=fake_execute):
+            self.assertEqual(
+                _generate_image_edit(merged, 'p', self.ref_path, self.target_path),
+                CHAT_TRANSPORT)
+        self.assertEqual(edits_calls, [])
+
+    def test_resume_keeps_the_degradation_mark_on_reused_frames(self):
+        """断点续传复用盘上已有的降档帧时，留痕必须跟着沿用——重放一次 manifest
+        不能把上一轮那张 768x1376 的图洗成"正常帧"。"""
+        old_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+        prompt_block = "图片 1:\nfirst frame prompt\n\n图片 2:\nsecond frame prompt\n"
+
+        def fake_text_image(config, prompt, target_path, *a, **kw):
+            _write_test_image(target_path, (1536, 2752))
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *a, **kw):
+            _write_test_image(target_path, (768, 1376))
+            return CHAT_TRANSPORT
+
+        try:
+            with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
+                 patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+                generate_frame_sequence({}, 'chat_transport_resume', prompt_block,
+                                        on_progress=lambda s, d: None)
+            # 第二轮：两帧都已在盘上，一枪不打，纯复用 manifest
+            with patch('frame_generator._generate_text_image',
+                       side_effect=AssertionError('续传不该重渲已有帧')), \
+                 patch('frame_generator._generate_image_edit',
+                       side_effect=AssertionError('续传不该重渲已有帧')):
+                manifest = generate_frame_sequence({}, 'chat_transport_resume', prompt_block,
+                                                   on_progress=lambda s, d: None)
+        finally:
+            server_common.OUTPUT_ROOT = old_root
+
+        frames = {f['sequence']: f for f in manifest['frames']}
+        self.assertEqual(frames[2]['transport'], CHAT_TRANSPORT)
+        self.assertEqual(frames[2]['actual_pixels'], '768x1376')
+        self.assertNotIn('transport', frames[1])
+
+    def test_degraded_frames_are_recorded_in_manifest_and_announced_live(self):
+        """降档帧绝不伪装成正常帧：manifest 记 transport/degraded_reason/真实像素，
+        进度流当场播报——补额度后可对这些帧定向重渲换回全分辨率。"""
+        import json
+        old_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+        events = []
+
+        def fake_text_image(config, prompt, target_path, *a, **kw):
+            _write_test_image(target_path, (1536, 2752))
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *a, **kw):
+            _write_test_image(target_path, (768, 1376))
+            return CHAT_TRANSPORT
+
+        try:
+            with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
+                 patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+                manifest = generate_frame_sequence(
+                    {'imageQuality': '2K'}, 'chat_transport_trace',
+                    "图片 1:\nfirst frame prompt\n\n图片 2:\nsecond frame prompt\n",
+                    on_progress=lambda stage, details: events.append((stage, details)))
+        finally:
+            server_common.OUTPUT_ROOT = old_root
+
+        frames = {f['sequence']: f for f in manifest['frames']}
+        self.assertNotIn('transport', frames[1])       # 首帧走的是正常 t2i 通道
+        self.assertEqual(frames[2]['transport'], CHAT_TRANSPORT)
+        self.assertIn('分辨率降档', frames[2]['degraded_reason'])
+        self.assertEqual(frames[2]['actual_pixels'], '768x1376')
+        self.assertEqual(frames[2]['image_size'], '2K')  # 请求的档位如实保留
+
+        announced = [d for s, d in events if s == 'transport_fallback']
+        self.assertEqual([d['sequence'] for d in announced], [2])
+        self.assertIn('IMG 002', announced[0]['message'])
+        self.assertTrue(announced[0]['degraded'])
+        # manifest 落盘的内容与返回值一致（前端读的是盘上那份）
+        with open(os.path.join(manifest['project_dir'], 'manifest.json'), encoding='utf-8') as f:
+            on_disk = {f_['sequence']: f_ for f_ in json.load(f)['frames']}
+        self.assertEqual(on_disk[2]['transport'], CHAT_TRANSPORT)
+
+    def test_one_k_request_is_not_marked_degraded(self):
+        """chat 通道固定出 1K 档（9:16 → 768x1376，与 /images/edits 的 image_size=1K
+        逐像素同档）：本单请求就是 1K 时画质没有任何损失，不许扣"降档"帽子——否则
+        每一帧都挂个假警告，真降档的单子反而看不出来。"""
+        old_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+        events = []
+
+        def fake_text_image(config, prompt, target_path, *a, **kw):
+            _write_test_image(target_path, (768, 1376))
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *a, **kw):
+            _write_test_image(target_path, (768, 1376))
+            return CHAT_TRANSPORT
+
+        try:
+            with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
+                 patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+                manifest = generate_frame_sequence(
+                    {'imageQuality': '1K'}, 'chat_transport_1k',
+                    "图片 1:\nfirst frame prompt\n\n图片 2:\nsecond frame prompt\n",
+                    on_progress=lambda stage, details: events.append((stage, details)))
+        finally:
+            server_common.OUTPUT_ROOT = old_root
+
+        frame = {f['sequence']: f for f in manifest['frames']}[2]
+        self.assertEqual(frame['transport'], CHAT_TRANSPORT)   # 通道照样留痕
+        self.assertEqual(frame['actual_pixels'], '768x1376')
+        self.assertNotIn('degraded_reason', frame)             # 但不是降档
+        announced = [d for s, d in events if s == 'transport_fallback']
+        self.assertFalse(announced[0]['degraded'])
+        self.assertIn('画质无损失', announced[0]['message'])
 
 
 class TestQuotaSignalDetection(unittest.TestCase):
@@ -256,9 +726,8 @@ class TestQuotaSignalDetection(unittest.TestCase):
       "Max retries exhausted. Last error: Token error: No accounts available with
        quota for model: gemini-3-pro-image"
     This must still be classified as quota exhaustion (raise QuotaExhaustedError on
-    the first attempt) so imageEditFallbackModel switch-over fires, instead of being
-    treated as a generic retryable 502 that burns through all retry attempts and
-    then fails the whole frame."""
+    the first attempt) so the run stops on the real cause, instead of being treated
+    as a generic retryable 502 that burns through all retry attempts first."""
 
     class _FakeOpener:
         def __init__(self, code, body_text):
@@ -335,6 +804,24 @@ class TestQuotaSignalDetection(unittest.TestCase):
         self.assertIn('HTTP 502', events[0]['error'])
         self.assertIsNotNone(events[0]['retry_in'])   # 第一次失败：还会重试
         self.assertIsNone(events[1]['retry_in'])      # 最后一次失败：已放弃
+
+    def test_emit_quota_failure_false_silences_the_broadcast_but_not_the_error(self):
+        """探路请求专用：调用方有等价通道可换时，配额墙不是终点——异常照抛（调用
+        方据此换路），但不往进度流推那句「此路终止，任务即将报错结束」。"""
+        from frame_generator import set_upstream_event_sink
+        body = ("Max retries exhausted. Last error: Token error: No accounts "
+                "available with quota for model: gemini-3-pro-image")
+        opener = self._FakeOpener(502, body)
+        events = []
+        set_upstream_event_sink(events.append)
+        try:
+            with self.assertRaises(QuotaExhaustedError):
+                _execute_request_with_retry(self._make_request(), opener=opener, timeout=1,
+                                            emit_quota_failure=False)
+        finally:
+            set_upstream_event_sink(None)
+        self.assertEqual(events, [])
+        self.assertEqual(opener.calls, 1)   # 照旧 fail-fast，不烧重试
 
     def test_upstream_sink_fires_on_quota_failfast_and_is_thread_local(self):
         """配额类 fail-fast 也要广播一次；sink 是线程本地的，别的线程不受影响。"""
@@ -480,9 +967,12 @@ class TestGptImagePixelSize(unittest.TestCase):
 
 
 class TestAnchorInertiaQuotaFallback(unittest.TestCase):
-    """P1 惯性兜底的 t2i 重渲同样要吃 imageEditFallbackModel：2026-07-17 拱渡槽单
-    实锤——主模型配额耗尽（重置要 30h+）时这条兜底直接放弃、保留 i2i 复读帧，
-    下游必然空间断裂；主渲染路径早就会切兜底模型，这里必须走同一套切换。"""
+    """P1 惯性兜底的 t2i 重渲与主渲染路径共用同一套配额处置：配额耗尽原样上抛。
+
+    2026-07-17 拱渡槽单曾因这里把配额错误咽成"t2i 兜底失败"、保留 i2i 复读帧
+    继续往下渲，造成下游空间断裂。自动切兜底模型已整体取消，现在的正确行为是
+    就地停在配额耗尽这个真因上——反正下一帧也会撞同一堵墙。
+    非配额原因的 t2i 失败仍然只留痕、保留 i2i 原帧（不因一帧优化失败炸掉整单）。"""
 
     _PROMPT_BLOCK = """图片 1:
 exterior prompt
@@ -524,44 +1014,38 @@ bridge video
                 on_progress=lambda stage, details: events.append((stage, details)))
         return manifest, events
 
-    def test_inertia_t2i_switches_to_fallback_model_on_quota_exhaustion(self):
+    def test_inertia_t2i_quota_exhaustion_aborts_the_run(self):
+        """惯性重渲撞上配额耗尽：原样上抛，不切模型、不留复读帧继续往下渲。"""
         text_calls = []
 
         def fake_text_image(cfg, prompt, target_path, *a, **kw):
             text_calls.append(cfg.get('imageModel'))
-            # 首帧 t2i 用主模型正常成功；惯性兜底重渲时主模型配额已尽，兜底模型成功
-            if len(text_calls) > 1 and cfg.get('imageModel') == 'primary-model':
+            # 首帧 t2i 用主模型正常成功；惯性重渲时主模型配额已尽
+            if len(text_calls) > 1:
                 raise QuotaExhaustedError('primary exhausted')
             self._write(target_path, f'text:{cfg.get("imageModel")}')
 
+        # 配了兜底键也一样（该键已不再透传，留在这里是防回归）
         config = {'imageModel': 'primary-model', 'imageEditFallbackModel': 'fallback-model'}
-        manifest, events = self._run(config, fake_text_image)
+        with self.assertRaises(QuotaExhaustedError):
+            self._run(config, fake_text_image)
 
-        self.assertEqual(text_calls, ['primary-model', 'primary-model', 'fallback-model'])
-        frame2 = next(f for f in manifest['frames'] if f['sequence'] == 2)
-        self.assertTrue(frame2['model_fallback'])
-        self.assertIsNone(frame2['reference'])       # t2i 新链头，如实脱链
-        self.assertEqual(frame2['parent_hash'], '')  # 血统断开，不记上一帧哈希
-        self.assertIsNone(frame2['vlm_qa_reason'])   # 兜底成功，不该再留失败痕
-        fb = next(details for stage, details in events if stage == 'model_fallback')
-        self.assertEqual(fb['sequence'], 2)
-        self.assertEqual(fb['to'], 'fallback-model')
-        with open(po_frame_path('inertia_quota_fallback', 2), 'rb') as f:
-            self.assertEqual(f.read(), b'text:fallback-model')
+        # 只打了主模型：首帧 t2i + 惯性重渲，没有第三次换模型的尝试
+        self.assertEqual(text_calls, ['primary-model', 'primary-model'])
 
-    def test_inertia_t2i_without_fallback_model_keeps_frame_with_reason(self):
+    def test_inertia_t2i_non_quota_failure_keeps_frame_with_reason(self):
+        """非配额原因的 t2i 重渲失败：保留 i2i 原帧并留痕，不炸掉整单。"""
         text_calls = []
 
         def fake_text_image(cfg, prompt, target_path, *a, **kw):
             text_calls.append(cfg.get('imageModel'))
             if len(text_calls) > 1:
-                raise QuotaExhaustedError('primary exhausted')
+                raise RuntimeError('t2i upstream boom')
             self._write(target_path, 'text:first-frame')
 
-        config = {'imageModel': 'primary-model'}  # 未配置兜底模型
+        config = {'imageModel': 'primary-model'}
         manifest, _ = self._run(config, fake_text_image)
 
-        # 只有主模型被尝试过（首帧 + 惯性重渲各一次），失败后保留 i2i 原帧并留痕
         self.assertEqual(text_calls, ['primary-model', 'primary-model'])
         frame2 = next(f for f in manifest['frames'] if f['sequence'] == 2)
         self.assertIn('anchor_inertia', frame2['vlm_qa_reason'])
@@ -622,13 +1106,13 @@ class TestDoorClearancePushTargeting(unittest.TestCase):
 exterior prompt
 
 图片 2:
-sill prompt
+exterior prompt 2
 
 图片 3:
 interior prompt
 
-视频 1 [BRIDGE]:
-bridge video 1
+视频 1:
+ordinary video 1
 
 视频 2 [BRIDGE]:
 bridge video 2
@@ -645,8 +1129,10 @@ bridge video 2
 
     def test_retry_control_prompt_carries_the_reported_failure_location(self):
         edit_calls = []
+        text_calls = []
 
         def fake_text_image(config, prompt, target_path, *a, **kw):
+            text_calls.append({'prompt': prompt})
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
             with open(target_path, 'wb') as f:
                 f.write(b'text')
@@ -673,18 +1159,111 @@ bridge video 2
                                                 on_progress=lambda *a: None)
 
         push_calls = [c for c in edit_calls if 'doorpush' in (c['reference'] or '')]
-        self.assertEqual(len(push_calls), 2)
-        # Each push must be told exactly what the audit just found wrong on THIS frame —
-        # not a copy of the previous round's instruction.
+        # Only the first extra push still edits from the (stuck) reference frame — it must
+        # be told exactly what the audit just found wrong on THIS frame, not a copy of the
+        # previous round's instruction, and must not yet claim to be the last attempt.
+        self.assertEqual(len(push_calls), 1)
         self.assertIn('画面左侧可见生锈门框边缘', push_calls[0]['control_prompt'])
-        self.assertIn('画面右下角残留门槛踏板', push_calls[1]['control_prompt'])
-        self.assertNotEqual(push_calls[0]['control_prompt'], push_calls[1]['control_prompt'])
-        # The final budgeted push must escalate urgency instead of repeating the first ask.
         self.assertNotIn('last correction attempt', push_calls[0]['control_prompt'])
-        self.assertIn('last correction attempt', push_calls[1]['control_prompt'])
+
+        # i2i editing twice from the same stuck reference can't break a locked composition
+        # (2026-07-22 confirmed live 2/2): the final budgeted push abandons the reference
+        # entirely and re-renders frame 3 via t2i instead of pushing it a second time.
+        frame3_text_calls = [c for c in text_calls if c['prompt'] == 'interior prompt']
+        self.assertEqual(len(frame3_text_calls), 1)
 
         frame3 = next(f for f in manifest['frames'] if f['sequence'] == 3)
         self.assertIn('门洞轮廓仍框住整个画面', frame3['vlm_qa_reason'])
+        self.assertIsNone(frame3['reference'])
+
+
+
+class TestFirstInteriorRevealRawState(unittest.TestCase):
+    """过门帧原始度兜底（2026-07-26 用户实测："过门帧有人工痕迹、不够原始"）：门框
+    出画了不代表这一帧对了——i2i 进到室内后普遍渲成被布景过的样子。渲后对真实像素
+    判定，未通过则以该帧自身为参考做一次定向状态修正（镜头不动、只改内容），修完
+    仍不过只留痕，绝不拦渲染。"""
+
+    _PROMPT_BLOCK = """图片 1:
+exterior prompt
+
+图片 2:
+exterior prompt 2
+
+图片 3:
+interior prompt
+
+视频 1:
+ordinary video 1
+
+视频 2 [BRIDGE]:
+bridge video 2
+"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_output_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+
+    def tearDown(self):
+        server_common.OUTPUT_ROOT = self.old_output_root
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, title, raw_state_results):
+        edit_calls = []
+        events = []
+        results = iter(raw_state_results)
+
+        def fake_text_image(config, prompt, target_path, *a, **kw):
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            with open(target_path, 'wb') as f:
+                f.write(b'text')
+
+        def fake_image_edit(config, prompt, reference_path, target_path, control_prompt=None, *a, **kw):
+            edit_calls.append({'reference': reference_path, 'control_prompt': control_prompt})
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            with open(target_path, 'wb') as f:
+                f.write(b'edit')
+
+        with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
+             patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
+             patch('prompt_pipeline.check_door_clearance_frame', return_value=(True, 'PASS')), \
+             patch('prompt_pipeline.check_first_interior_reveal_raw_state',
+                   side_effect=lambda *a, **kw: next(results)):
+            manifest = generate_frame_sequence(
+                {}, title, self._PROMPT_BLOCK,
+                on_progress=lambda stage, details: events.append((stage, details)))
+        return manifest, edit_calls, events
+
+    def test_touched_looking_frame_is_re_edited_with_the_reported_reason(self):
+        manifest, edit_calls, events = self._run(
+            'raw_state_fix',
+            [(False, 'FAIL: 地面被扫干净，角落码着整齐的木料'), (True, 'PASS')])
+
+        fix_calls = [c for c in edit_calls if 'rawstate' in (c['reference'] or '')]
+        self.assertEqual(len(fix_calls), 1)
+        # 泛化指令对已经渲成这样的模型没有纠正力：必须点名 VLM 报回来的具体问题
+        self.assertIn('地面被扫干净，角落码着整齐的木料', fix_calls[0]['control_prompt'])
+        self.assertIn('RAW STATE CORRECTION', fix_calls[0]['control_prompt'])
+        # 修完通过就不再留痕
+        frame3 = next(f for f in manifest['frames'] if f['sequence'] == 3)
+        self.assertIsNone(frame3['vlm_qa_reason'])
+        self.assertTrue(any(stage == 'raw_state' for stage, _ in events))
+
+    def test_still_touched_after_the_budgeted_fix_keeps_the_frame_and_records_it(self):
+        manifest, edit_calls, _ = self._run(
+            'raw_state_giveup',
+            [(False, 'FAIL: 墙面看着像刚粉刷过'), (False, 'FAIL: 墙面仍然太干净')])
+
+        self.assertEqual(len([c for c in edit_calls if 'rawstate' in (c['reference'] or '')]), 1)
+        frame3 = next(f for f in manifest['frames'] if f['sequence'] == 3)
+        self.assertIn('墙面仍然太干净', frame3['vlm_qa_reason'])
+        # 渲染不被拦下：这一帧照常落盘进 manifest
+        self.assertTrue(os.path.exists(po_frame_path('raw_state_giveup', 3)))
+
+    def test_passing_frame_is_left_alone(self):
+        _, edit_calls, _ = self._run('raw_state_pass', [(True, 'PASS')])
+        self.assertEqual([c for c in edit_calls if 'rawstate' in (c['reference'] or '')], [])
 
 
 if __name__ == '__main__':

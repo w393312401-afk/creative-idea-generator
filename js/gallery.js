@@ -7,7 +7,6 @@
    项目 manifest。依赖宿主应用的 escapeHtml / showToast / openLightbox。
    ========================================================================== */
 
-let galleryLoaded = false;          // 首次进入画廊标签页才扫描（app.js 调 galleryTabEntered）
 let galleryLoading = false;
 let galleryData = null;             // /api/gallery 的原始返回
 let galleryFilter = 'all';          // all | cover | frame | video | studio | orphan
@@ -36,7 +35,11 @@ const GALLERY_KIND_LABELS = {
 const GALLERY_GROUP_ICONS = { covers: '🖼️', studio: '🎨', project: '📁' };
 
 function galleryTabEntered() {
-    if (!galleryLoaded && !galleryLoading) refreshGallery();
+    // 每次切进画廊都重新扫描（不再只扫一次）：磁盘上的帧序列/视频会在其他
+    // 标签页里被重试、修复、重渲，画廊若只信"本会话扫过一次"的旧结果，
+    // 切回来也看不到这些原地覆盖的新文件。扫描本身是轻量的目录遍历，
+    // galleryLoading 仍防止同时并发发起第二次。
+    if (!galleryLoading) refreshGallery();
 }
 
 function galleryFmtSize(bytes) {
@@ -59,6 +62,13 @@ function galleryEncodeUrl(url) {
     return encodeURI(url).replace(/#/g, '%23').replace(/\?/g, '%3F');
 }
 
+// 同名文件被原地覆盖（帧重试/修复等）时，浏览器仍会把旧字节当缓存命中——
+// /api/gallery 每次都是新扫描出的磁盘真值 mtime，拿它当版本号做 cache-bust
+// 最可靠（不依赖前端别处是否记得给这张图 bump 过版本）。
+function galleryVersionedUrl(it) {
+    return galleryEncodeUrl(it.url) + '?v=' + (it.mtime || 0);
+}
+
 async function refreshGallery() {
     if (galleryLoading) return;
     galleryLoading = true;
@@ -72,7 +82,6 @@ async function refreshGallery() {
         const data = await res.json();
         if (data && data.error) throw new Error(data.error);
         galleryData = data;
-        galleryLoaded = true;
         // 清掉磁盘上已不存在的勾选项，避免"删除所选"携带幽灵路径
         const alive = new Set();
         (galleryData.groups || []).forEach(g => (g.items || []).forEach(it => alive.add(it.path)));
@@ -236,7 +245,7 @@ function renderGallery() {
 
 function galleryCardHtml(it) {
     const sel = gallerySelected.has(it.path);
-    const url = galleryEncodeUrl(it.url);
+    const url = galleryVersionedUrl(it);
     const badge = GALLERY_KIND_LABELS[it.kind] || '';
     const inUseBadge = (it.kind === 'cover' && it.in_use === true)
         ? '<span class="gallery-inuse-badge" title="正被点子库或任务引用，删除会导致卡片破图">🔗 使用中</span>' : '';
@@ -341,7 +350,7 @@ function galleryOpenPreview(path) {
         if (idx !== -1) {
             const items = g.items.map(it => ({
                 type: it.type === 'video' ? 'video' : 'image',
-                url: galleryEncodeUrl(it.url),
+                url: galleryVersionedUrl(it),
                 caption: `${escapeHtml(g.title)} / ${escapeHtml(it.name)}`,
             }));
             if (typeof openLightbox === 'function') openLightbox(items, idx);

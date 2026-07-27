@@ -16,7 +16,10 @@ import os
 
 import pytest
 
-from server_common import read_ledger, write_ledger, parse_legacy_ledger_md, delete_ledger_entries
+from server_common import (
+    read_ledger, write_ledger, parse_legacy_ledger_md, delete_ledger_entries,
+    register_ledger_candidates,
+)
 
 
 @pytest.fixture
@@ -95,6 +98,39 @@ class TestWriteLedger:
         ok, msg = write_ledger({'not': 'a list'}, ledger_path)
         assert ok is False
         assert not os.path.exists(ledger_path)
+
+
+class TestRegisterLedgerCandidates:
+    def test_atomically_adds_generated_ideas_as_candidates(self, ledger_path):
+        result = register_ledger_candidates([
+            {'dna': 'natural / refuge / window', 'title': '冰洞住宅', 'score': 24},
+            {'dna': 'vehicle / micro-home / brass', 'title': '潜艇小屋', 'score': 22},
+        ], ledger_path)
+
+        assert result['added'] == 2
+        assert result['duplicates'] == 0
+        rows = read_ledger(ledger_path)
+        assert [row['status'] for row in rows] == ['candidate', 'candidate']
+        assert [row['one_line'] for row in rows] == ['冰洞住宅', '潜艇小屋']
+
+    def test_dedupes_existing_and_same_batch_dna_case_insensitively(self, ledger_path):
+        write_ledger([_entry(topic_dna='Natural / Refuge / Window')], ledger_path)
+        result = register_ledger_candidates([
+            {'dna': ' natural / refuge / window ', 'title': '重复一'},
+            {'dna': 'VEHICLE / HOME / BRASS', 'title': '新创意'},
+            {'dna': 'vehicle / home / brass', 'title': '批内重复'},
+        ], ledger_path)
+
+        assert result['added'] == 1
+        assert result['duplicates'] == 2
+        assert len(read_ledger(ledger_path)) == 2
+
+    def test_corrupt_ledger_fails_closed(self, ledger_path):
+        with open(ledger_path, 'w', encoding='utf-8') as f:
+            f.write('{broken')
+
+        with pytest.raises(RuntimeError, match='创意台账读取失败'):
+            register_ledger_candidates([{'dna': 'a / b / c', 'title': '不会写入'}], ledger_path)
 
 
 class TestParseLegacyLedgerMd:

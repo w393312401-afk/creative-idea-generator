@@ -289,7 +289,7 @@ with open("direct_edit.png", "wb") as file:
 
 3. 若请求超时：确认没有仍指向旧端口 `8045` 或 `8082`。
 
-4. 若返回图与参考图完全无关：确认使用的是 `/api/image/edits` 或底层 `/v1/images/edits`，不要用 `/v1/chat/completions` 做图生图。
+4. 若返回图与参考图完全无关：确认使用的是 `/api/image/edits` 或底层 `/v1/images/edits`。注意 `/v1/images/generations` 会**静默丢掉** `image` 字段——照样返回 200 和一张全分辨率的图，但那是纯文生图的产物，与参考图毫无关系（2026-07-25 实测），拿它做图生图等于制造断链帧。`/v1/chat/completions` 带 `image_url` 是可用的图生图通道，但只作降档兜底用，见第 7 条。
 
 5. 若返回 `503 No accounts available with quota` 或 `429 All accounts exhausted`，这是账号配额 / 限流问题，不是上传参数问题，稍后重试。
 
@@ -304,8 +304,31 @@ with open("direct_edit.png", "wb") as file:
      4. 关闭当前正在运行的 app，并强杀残留的 8046 端口进程，确保端口释放。
      5. 将新编译生成的 `src-tauri/target/release/antigravity_tools.exe` 覆盖复制到 `D:\Antigravity-Manager\antigravity_tools.exe`。
      6. 重启服务。*注意：若启动后 cloudflared 隧道未正常拉起，需在命令行手动运行 `cloudflared tunnel run --token <gui_config.cloudflared.token> --protocol http2` 重新建立外网映射通道。*
+   - **macOS 机器上没有这条修复路径**：网关是官方包 `/Applications/Antigravity Tools.app`，本机没有 `src-tauri` 源码树可重编，上面那套 `D:\Antigravity-Manager` 的流程只适用于原 Windows 机器。所以这台机器上 edits 接口的硬编码一直是未修补状态。
+   - **应用侧的兜底（2026-07-25 起）**：帧序列的图生图撞上这堵墙时不再整单失败，也绝不换模型——`frame_generator._generate_image_edit` 会用**同一个模型**改走 `/chat/completions`（参考图内联成 data URL）把这一帧渲完，实测是忠实续帧（同场景/同材质/同光照）。代价与留痕：
+     - 这条通道只有**顶层 `size` 字段**能控出图比例；`aspect_ratio`、`image_size` 和写在提示词里的 "9:16" 全部无效（会出 1024x1024 方图）。
+     - 分辨率控不了，固定出 **1K 档**（9:16 为 `768x1376`）。注意这与 `/images/edits` 的 `image_size=1K` 逐像素同档——**本单请求本来就是 1K 时画质没有任何损失**，只有请求 2K（`1536x2752`）/4K 才是真降档。
+     - 走过这条通道的帧一律在 manifest 里记 `transport: "chat_completions"` 和 `actual_pixels`；只有确实降档（请求 2K/4K）时才额外记 `degraded_reason`，动态流播报也只在真降档时标警示色（`transport_fallback` 事件带 `degraded` 布尔）。号池额度恢复后对降档帧定向重渲即可换回全分辨率。
+     - **不重复发那一枪**：撞墙一次后本进程就记住这个网关的 edits 已死（`_EDITS_POOL_DRY`），后续帧直接走 chat 通道——那一枪实测 ~1010ms，还要把整张参考图（~830KB）上传一遍，每帧白烧一次没有意义。熔断只活在进程内，网关补好补丁后**重启服务**即重新探路，不需要改配置。
+     - 通道开关 `server_config.json` → `imageEditTransport`：`auto`（默认，先探 edits 再熔断换 chat）/ `chat`（从不发 edits，网关补丁缺失的机器上连第一枪都省掉）/ `edits`（只发 edits，撞墙就地报错绝不换通道）。**本机（macOS，无重编补丁的路子）已设为 `chat`**——网关哪天补好了改回 `auto` 即恢复探路。
+     - 这个键从前只写在配置文件里、实际从未生效：托管模式（`server_config.json` 配了 `apiKey`）下 `server_common.effective_config` 用白名单重建 config，`imageEditTransport` 不在名单里被整个丢掉，于是配了 `chat` 的机器每个进程照样先打一枪必挂的 edits（2026-07-26 修）。改这份白名单时记得同批加新键，这是同一个口子第二次漏（第一次是 `qaGateLevel`）。
+     - 探路那一枪撞墙**不再播报成上游报错**：auto 模式下它后面还有 chat 通道接着渲，把它推进度流会被前端渲成「⚠️ 上游报错…此路终止，任务即将报错结束」——一句吓人的假话。换通道由 `transport_fallback` 事件如实播报，配额耗尽仍写 WARN 日志；真正走投无路（没有等价 chat 模型、或 `transport=edits`）的那一枪照报（`_execute_request_with_retry(emit_quota_failure=...)`）。
+     - 图像站（`/api/image/edits`）走的是原样透传，**不带**这条兜底，撞墙时仍会直接报错。
 
 ## 九、已验证基线
+
+2026-07-25 macOS 机器（网关 `/Applications/Antigravity Tools.app`，端口 `8046`）逐一实测：
+
+| 请求 | 结果 |
+| --- | --- |
+| `/v1/chat/completions` + `gemini-3.1-flash-image`（裸名） | `200`，正常出图 |
+| `/v1/chat/completions` + `gemini-3.1-flash-image-9-16`（带后缀） | 上游 `404 Requested entity was not found`，被号池包装成 `429 All accounts exhausted` |
+| `/v1/images/generations` + `gemini-3.1-flash-image` | `200`，`1536x2752`；带 `image` 字段也一样是纯文生图，参考图被静默丢弃 |
+| `/v1/images/edits` + 任意图像模型名 | `502 No accounts available with quota for model: gemini-3-pro-image`（硬编码 bug，见第八节第 7 条） |
+| `/v1/chat/completions` + `gemini-3.1-flash-image` + `image_url` 参考图 | `200`，忠实续帧；`size: "9:16"` 生效得 `768x1376`，`aspect_ratio`/`image_size`/提示词均无效（不给 `size` 就出 `1024x1024`） |
+| `/v1/images/generations` 的档位对照 | `image_size=1K` → `768x1376`；`image_size=2K` → `1536x2752`（即 chat 通道等于 1K 档） |
+
+结论：这台机器上图生图的唯一可用通道是 chat + `image_url`（降档），已作为帧序列的自动兜底接入。
 
 2026-06-30 当前机器验证：
 

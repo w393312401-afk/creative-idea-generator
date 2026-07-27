@@ -10,6 +10,7 @@ from pipeline_orchestrator import (
     _prompt_fingerprint,
     _retry_frame_until_pass,
     render_and_gate_single_frame,
+    render_frames_for_task,
     run_autonomous_pipeline,
     run_staged_frame_rendering,
 )
@@ -124,16 +125,16 @@ class TestRunAutonomousPipeline(unittest.TestCase):
         mock_video.assert_called_once()
         self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved')
 
-    def test_frame_1_is_never_gated_and_uses_no_gate_judge(self):
-        """The IMAGE-1 Anchor Acceptance Gate has been removed from the GUI/API path:
-        run_autonomous_pipeline renders frame 1 unconditionally via _no_gate_judge and
-        never calls check_anchor_frame_compliance, so a 'needs_human_review' dead end
-        for frame 1 is no longer reachable from this entry point."""
+    def test_frame_1_uses_real_anchor_gate_with_packet_and_parsed_brief(self):
+        """IMAGE 1 now goes through the real Anchor Acceptance Gate instead of the old
+        always-pass _no_gate_judge: check_anchor_frame_compliance must be called with
+        the composed state's packet/parsed_brief so its 'raw enough' checks (intervention
+        evidence, damage severity, genre tone) have real context to judge against."""
         state = self._fake_state()
+        original_packet = state['packet']
+        original_parsed_brief = state['parsed_brief']
 
         def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
-            # Preserve whatever's already on disk (e.g. the gate step's 'auto_approved'
-            # write for frame 1) instead of clobbering it on the later full-sequence call.
             manifest_path = os.path.join(self.project_dir, 'manifest.json')
             frames = []
             if os.path.exists(manifest_path):
@@ -149,18 +150,61 @@ class TestRunAutonomousPipeline(unittest.TestCase):
 
         with patch('pipeline_orchestrator.compose_anchor_and_packet', return_value=state), \
              patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
-             patch('pipeline_orchestrator.check_anchor_frame_compliance') as mock_gate, \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(True, 'PASS')) as mock_gate, \
              patch('pipeline_orchestrator.refine_packet_from_accepted_anchor', return_value={'camera_dna': 'refined'}) as mock_refine, \
              patch('pipeline_orchestrator.compose_remaining_beats', return_value='FULL PROMPT BLOCK') as mock_phase2, \
              patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}) as mock_video:
             result = run_autonomous_pipeline({}, {'theme': 'x'})
 
         self.assertEqual(result['status'], 'completed')
-        mock_gate.assert_not_called()
+        mock_gate.assert_called_once()
+        # state['packet'] gets reassigned (to a NEW dict) by refine_packet_from_accepted_anchor
+        # right after the gate call, so compare against what was captured before the call,
+        # not against state['packet'] as it reads now.
+        call_args = mock_gate.call_args[0]
+        self.assertEqual(call_args[3], original_packet)
+        self.assertEqual(call_args[4], original_parsed_brief)
         mock_refine.assert_called_once()
         mock_phase2.assert_called_once()
         mock_video.assert_called_once()
         self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved')
+
+    def test_frame_1_persistent_gate_failure_never_dead_ends(self):
+        """A frame 1 that never passes the Anchor Acceptance Gate (e.g. it keeps reading
+        as too clean / carrying intervention evidence even after every VLM-feedback
+        retry) must not leave run_autonomous_pipeline in 'needs_human_review' — the GUI/
+        API path proceeds with the best attempt, recorded auto_approved_degraded, same
+        as a judge-unavailable skip. This is what keeps this entry point dead-end-free."""
+        state = self._fake_state()
+
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            manifest_path = os.path.join(self.project_dir, 'manifest.json')
+            frames = []
+            if os.path.exists(manifest_path):
+                with open(manifest_path, 'r', encoding='utf-8') as f:
+                    frames = json.load(f).get('frames', [])
+            existing_seqs = {f['sequence'] for f in frames}
+            wanted = target_sequences if target_sequences is not None else [1]
+            for seq in wanted:
+                if seq not in existing_seqs:
+                    frames.append({'sequence': seq, 'quality_gate': 'pending_manual_review'})
+            self._write_manifest(frames)
+            return {'title': title}
+
+        with patch('pipeline_orchestrator.compose_anchor_and_packet', return_value=state), \
+             patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(False, 'FAIL: still too clean')), \
+             patch('pipeline_orchestrator.fix_image_prompt_with_vlm_feedback', side_effect=lambda c, p, r: p + '!'), \
+             patch('pipeline_orchestrator.refine_packet_from_accepted_anchor', return_value={'camera_dna': 'refined'}) as mock_refine, \
+             patch('pipeline_orchestrator.compose_remaining_beats', return_value='FULL PROMPT BLOCK') as mock_phase2, \
+             patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}) as mock_video:
+            result = run_autonomous_pipeline({}, {'theme': 'x'})
+
+        self.assertEqual(result['status'], 'completed')
+        mock_refine.assert_called_once()
+        mock_phase2.assert_called_once()
+        mock_video.assert_called_once()
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved_degraded')
 
 
 class TestRunStagedFrameRendering(unittest.TestCase):
@@ -415,6 +459,115 @@ class TestRenderAndGateSingleFrame(unittest.TestCase):
         frame_1 = self._read_manifest()['frames'][0]
         self.assertEqual(frame_1['quality_gate'], 'auto_approved_degraded')
         self.assertEqual(frame_1['anchor_prompt_sha256'], _prompt_fingerprint('a prompt'))
+
+    def test_hard_fail_status_override_avoids_needs_human_review(self):
+        """GUI/API callers (run_autonomous_pipeline, render_frames_for_task) pass
+        hard_fail_status='auto_approved_degraded' so a persistent gate failure never
+        surfaces as 'needs_human_review' — only conversational/staged callers keep the
+        default dead-end status."""
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
+            return {'title': title}
+
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(False, 'still generic')), \
+             patch('pipeline_orchestrator.fix_image_prompt_with_vlm_feedback', side_effect=lambda c, p, r: p + '!'):
+            result = render_and_gate_single_frame({}, self.title, 1, 'a prompt',
+                                                  hard_fail_status='auto_approved_degraded')
+
+        self.assertEqual(result['status'], 'auto_approved_degraded')
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved_degraded')
+
+
+class TestRenderFramesForTask(unittest.TestCase):
+    """render_frames_for_task: the /api/generate_frames entry point behind the main
+    "帧序列" button — the actual path an ideation-triggered generation runs through.
+    IMAGE 1 previously reached this function with zero authenticity gating at all (not
+    even the neutered _no_gate_judge — this path never called render_and_gate_single_frame
+    or check_anchor_frame_compliance in any form), which is why a not-raw-enough anchor
+    could reach the screen unchecked. It now gates frame 1 first, before the rest of the
+    sequence renders."""
+
+    PROMPT_BLOCK = (
+        "图片提示词\n图片 1:\nfirst frame prompt\n\n图片 2:\nsecond frame prompt\n\n"
+        "视频提示词\n视频 1:\nvideo one\n"
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_output_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+        self.title = 'test_render_frames_for_task_project'
+        self.project_dir = server_common._get_project_dir(self.title)
+        os.makedirs(os.path.join(self.project_dir, 'frames'), exist_ok=True)
+
+    def tearDown(self):
+        server_common.OUTPUT_ROOT = self.old_output_root
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_frame_file(self, sequence):
+        path = os.path.join(self.project_dir, 'frames', f'img_{sequence:03d}.webp')
+        with open(path, 'wb') as f:
+            f.write(b'fake webp bytes')
+
+    def _write_manifest(self, frames):
+        with open(os.path.join(self.project_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
+            json.dump({'frames': frames}, f)
+
+    def _read_manifest(self):
+        with open(os.path.join(self.project_dir, 'manifest.json'), 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def test_gates_frame_1_before_the_rest_when_missing_from_disk(self):
+        def fake_gate_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
+            return {'title': title}
+
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_gate_render), \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(True, 'PASS')) as mock_gate, \
+             patch('pipeline_orchestrator._render_frames_with_checkpoints', return_value=self.PROMPT_BLOCK) as mock_rest, \
+             patch('pipeline_orchestrator._chain_drift_lookback'), \
+             patch('pipeline_orchestrator._sequence_consistency_review', return_value=self.PROMPT_BLOCK):
+            render_frames_for_task({}, self.title, self.PROMPT_BLOCK)
+
+        mock_gate.assert_called_once()
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved')
+        # the rest of the sequence still renders through the normal checkpointed path
+        mock_rest.assert_called_once()
+
+    def test_skips_gate_when_frame_1_already_rendered(self):
+        """Resuming/retrying a subset that doesn't include a fresh frame 1 (it's already
+        on disk) must not re-gate it a second time."""
+        self._write_frame_file(1)
+
+        with patch('pipeline_orchestrator.check_anchor_frame_compliance') as mock_gate, \
+             patch('pipeline_orchestrator._render_frames_with_checkpoints', return_value=self.PROMPT_BLOCK) as mock_rest, \
+             patch('pipeline_orchestrator._chain_drift_lookback'), \
+             patch('pipeline_orchestrator._sequence_consistency_review', return_value=self.PROMPT_BLOCK):
+            render_frames_for_task({}, self.title, self.PROMPT_BLOCK)
+
+        mock_gate.assert_not_called()
+        mock_rest.assert_called_once()
+
+    def test_persistent_gate_failure_never_dead_ends(self):
+        """A frame 1 that never convinces the Anchor Acceptance Gate must still let
+        render_frames_for_task proceed to render the rest of the sequence — the main
+        帧序列 button must never dead-end past IMAGE 1."""
+        def fake_gate_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
+            return {'title': title}
+
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_gate_render), \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(False, 'FAIL: still too clean')), \
+             patch('pipeline_orchestrator.fix_image_prompt_with_vlm_feedback', side_effect=lambda c, p, r: p + '!'), \
+             patch('pipeline_orchestrator._render_frames_with_checkpoints', return_value=self.PROMPT_BLOCK) as mock_rest, \
+             patch('pipeline_orchestrator._chain_drift_lookback'), \
+             patch('pipeline_orchestrator._sequence_consistency_review', return_value=self.PROMPT_BLOCK):
+            result = render_frames_for_task({}, self.title, self.PROMPT_BLOCK)
+
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved_degraded')
+        mock_rest.assert_called_once()
+        self.assertIn('project_dir', result)
 
 
 if __name__ == '__main__':

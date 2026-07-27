@@ -497,3 +497,156 @@
   box-shadow: 0 0 15px rgba(239, 68, 68, 0.2);
 }
 
+/* ==========================================================================
+   DASHBOARD MOBILE RESPONSIVE OPTIMIZATIONS
+   ========================================================================== */
+
+/* Horizontal scroll gradient hint for tables — nudges user that content is scrollable */
+.table-container {
+  position: relative;
+}
+.table-container::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 28px;
+  background: linear-gradient(to left, var(--bg-glass-card, rgba(255,255,255,0.6)), transparent);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s;
+  border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
+  z-index: 3;
+}
+
+@media (max-width: 768px) {
+  /* Compress tab content spacing */
+  .tab-content {
+    padding: 14px;
+  }
+
+  /* Panel header compression */
+  .panel-header {
+    padding: 14px 16px 10px;
+  }
+  .panel-header h2 {
+    font-size: 15px;
+  }
+  .panel-header p {
+    font-size: 11px;
+  }
+  #page-title-desc {
+    font-size: 11px;
+    line-height: 1.4;
+  }
+
+  /* Dashboard grid cards */
+  .dashboard-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    margin-bottom: 20px;
+  }
+  .glass-card {
+    padding: 14px;
+    border-radius: 12px;
+  }
+  .glass-card:hover {
+    transform: none; /* Disable hover lift on touch devices */
+  }
+  .card-icon {
+    width: 36px;
+    height: 36px;
+    margin-bottom: 12px;
+    border-radius: 9px;
+  }
+  .card-icon svg {
+    width: 18px;
+    height: 18px;
+  }
+  .card-value {
+    font-size: 22px;
+    letter-spacing: -0.5px;
+    margin-bottom: 4px;
+  }
+  .card-label {
+    font-size: 10.5px;
+    letter-spacing: 0.3px;
+  }
+
+  /* Section title compact */
+  .section-title {
+    font-size: 14px;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .section-title span.sync-time,
+  #task-monitor-sync-time {
+    font-size: 10.5px;
+  }
+
+  /* Table optimizations */
+  .table-container::after {
+    opacity: 1; /* Show scroll hint on mobile */
+  }
+  .custom-table th, .custom-table td {
+    padding: 10px 8px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .custom-table th {
+    font-size: 10px;
+    letter-spacing: 0.5px;
+  }
+
+  /* Buttons touch-friendly */
+  .btn {
+    min-height: 40px;
+    padding: 10px 16px;
+    font-size: 13px;
+  }
+  .btn-sm {
+    min-height: 34px;
+    padding: 7px 12px;
+    font-size: 11.5px;
+  }
+
+  /* Alert banner compact */
+  .alert-info {
+    padding: 10px;
+    font-size: 12px;
+    border-radius: 10px;
+    margin-bottom: 16px;
+    gap: 8px;
+  }
+}
+
+@media (max-width: 576px) {
+  .tab-content {
+    padding: 10px;
+  }
+  .panel-header {
+    padding: 10px 12px 8px;
+  }
+
+  /* Stack dashboard cards single column on tiny screens */
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  .glass-card {
+    padding: 12px;
+  }
+  .card-value {
+    font-size: 20px;
+  }
+  .card-label {
+    font-size: 10px;
+  }
+  .section-title {
+    font-size: 13px;
+  }
+}
+

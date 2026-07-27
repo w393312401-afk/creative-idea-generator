@@ -575,9 +575,6 @@ textarea.form-input {
   .page-title {
     font-size: 16.5px;
   }
-  .tab-content {
-    padding: 16px;
-  }
 
   /* Alert announcement banner stacking */
   .alert-info {
@@ -591,37 +588,55 @@ textarea.form-input {
     justify-content: center;
   }
 
-  /* Stats cards stacking */
-  .dashboard-grid {
-    grid-template-columns: 1fr;
-    gap: 16px;
-  }
-  .glass-card {
-    padding: 18px;
-  }
-
-  /* Table compact spacing */
-  .custom-table th, .custom-table td {
-    padding: 12px 10px;
-    font-size: 12.5px;
-  }
-
   /* Suffix Generator Stacking */
   .generator-panel {
     grid-template-columns: 1fr;
-    gap: 20px;
+    gap: 16px;
   }
 
   /* Sandbox Playground Layout Stacking */
   .playground-layout {
     grid-template-columns: 1fr;
-    gap: 20px;
+    gap: 16px;
+  }
+  /* Console terminal compact */
+  .console-body {
+    min-height: 180px;
+    max-height: 320px;
+    padding: 14px;
+    font-size: 11.5px;
+  }
+  .console-header {
+    padding: 8px 14px;
+    height: 38px;
+  }
+  /* Image uploader compact */
+  .image-uploader-zone {
+    padding: 18px 14px;
+  }
+  .uploader-icon {
+    width: 28px;
+    height: 28px;
+    margin-bottom: 8px;
+  }
+  .uploader-text {
+    font-size: 13px;
+  }
+  .uploader-sub {
+    font-size: 11px;
+  }
+  /* Preview box compact */
+  .preview-box {
+    min-height: 160px;
+  }
+  .preview-box img, .preview-box video {
+    max-height: 280px;
   }
 
   /* API Interactive Docs Menu - Horizontal Scrollable Row */
   .docs-layout {
     grid-template-columns: 1fr;
-    gap: 20px;
+    gap: 16px;
   }
   .docs-menu {
     flex-direction: row;
@@ -629,8 +644,11 @@ textarea.form-input {
     padding-bottom: 8px;
     scrollbar-width: none;
     position: static;
-    gap: 8px;
+    gap: 6px;
     border-bottom: 1px solid var(--border-glass);
+    /* Horizontal scroll gradient mask hint */
+    -webkit-mask-image: linear-gradient(to right, #000 85%, transparent 100%);
+    mask-image: linear-gradient(to right, #000 85%, transparent 100%);
   }
   .docs-menu::-webkit-scrollbar {
     display: none;
@@ -642,17 +660,49 @@ textarea.form-input {
     flex-shrink: 0;
     white-space: nowrap;
     justify-content: flex-start;
-    gap: 8px;
+    gap: 6px;
     padding: 8px 12px;
-    font-size: 12.5px;
+    font-size: 12px;
+    min-height: 40px; /* Touch-friendly */
+  }
+  .docs-menu-link {
+    flex-shrink: 0;
+    white-space: nowrap;
+    min-height: 40px;
+    padding: 8px 12px;
+    font-size: 12px;
+  }
+
+  /* Code blocks compact */
+  .code-block {
+    padding: 14px;
+    font-size: 11.5px;
+    line-height: 1.5;
+  }
+  .code-tab-header {
+    padding: 0 10px;
+    height: 38px;
+  }
+  .code-tab-btn {
+    padding: 0 10px;
+    height: 38px;
+    font-size: 11.5px;
+  }
+  .endpoint-url {
+    font-size: 11.5px;
+    word-break: break-all;
+  }
+  .endpoint-url-box {
+    flex-wrap: wrap;
+    gap: 6px;
   }
 
   /* Model Marketplace Action Bar Stacking */
   .market-action-bar {
     flex-direction: column;
     align-items: stretch;
-    gap: 12px;
-    padding: 12px;
+    gap: 10px;
+    padding: 10px;
   }
   .search-box-container {
     width: 100%;
@@ -664,6 +714,24 @@ textarea.form-input {
   .mobile-filter-toggle {
     width: 100%;
     justify-content: center;
+    min-height: 40px;
+  }
+
+  /* Horizontal scroll hint for fx-table-wrap */
+  .fx-table-wrap {
+    position: relative;
+  }
+  .fx-table-wrap::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 24px;
+    background: linear-gradient(to left, var(--bg-glass-card, rgba(255,255,255,0.6)), transparent);
+    pointer-events: none;
+    border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
+    z-index: 3;
   }
 }
 
@@ -688,6 +756,27 @@ textarea.form-input {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* Even more compact playground */
+  .console-body {
+    min-height: 140px;
+    max-height: 240px;
+    padding: 10px;
+    font-size: 11px;
+  }
+  .image-uploader-zone {
+    padding: 14px 10px;
+  }
+  .code-block {
+    padding: 10px;
+    font-size: 11px;
+  }
+  .endpoint-url {
+    font-size: 10.5px;
+  }
+  .glass-panel {
+    border-radius: 12px;
   }
 }
 
