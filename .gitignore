@@ -19,6 +19,7 @@ server.log.*
 server.pid
 out.txt
 stderr_crash.txt
+server_boot_error.txt
 packet_cache.json
 process_brief_cache.json
 compose_checkpoints.json

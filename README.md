@@ -19,6 +19,44 @@
 
 ---
 
+## 🏁 新机器上从零开始（Windows / macOS）
+
+克隆下来直接双击启动脚本即可，首次运行会自动完成引导：
+
+```
+git clone https://github.com/w393312401-afk/creative-idea-generator.git
+cd creative-idea-generator
+```
+
+*   **Windows**：双击 `run.bat`
+*   **macOS**：双击 `run.command`
+
+首次运行脚本会依次做四件事，之后每次启动都会跳过：
+
+1.  **定位 Python**（Windows 依次找 `py` 启动器 → PATH 上的 `python` → 默认安装路径）。
+    找不到会直接告诉你去装，而不是留一个看不懂的报错。
+    需要 **Python 3.11+**，Windows 安装时务必勾选 *Add Python to PATH*。
+2.  **创建 `.venv` 并安装依赖**（`pip install -r requirements.txt`，首次约 1–3 分钟）。
+3.  **生成 `server_config.json`**（由 `tools/bootstrap_config.py` 从模板生成，
+    会把模板里那几项中文占位说明清成空值——直接拷模板会让 `accessCode` 变成
+    一句非空的说明文字，等于给界面上了一把没人知道口令的锁）。
+4.  **启动前自检**：先用带控制台的 `python.exe` 试跑一次导入，依赖损坏 / 语法错误
+    在这里就会打印出人话；通过后才用 `pythonw.exe` 后台起服务。
+
+跑完这一步，`http://127.0.0.1:8085/` 已经可以打开，界面、画廊、台账、已有 `outputs/`
+素材都能正常浏览。
+
+**还需要你自己补的两样**（不补也能启动，只是对应功能不可用）：
+
+| 要补的东西 | 不补的后果 | 怎么补 |
+|---|---|---|
+| `server_config.json` 里的 `apiKey`（以及 `baseUrl` 指向你的 LLM 网关） | 无法「激发创意」与合成提示词 | 记事本打开填好，重启服务 |
+| 技能包 `restoration-prompt-composer` | 提示词合成按空契约降级（创意维度变窄、一致性约束消失），启动日志与前端横幅会喊出缺失清单 | 见下方「技能包路径（skillDir）」 |
+
+Google FX 的视频生成还需要本机装好 AdsPower，见下方说明；不装不影响前面所有功能。
+
+---
+
 ## 🚀 服务管理
 
 根目录下提供了统一的批处理脚本来运行与管理服务：
@@ -43,10 +81,10 @@
 
 ## ⚙️ 配置说明
 
-*   **Python 依赖**：首次部署请先执行 `pip install -r requirements.txt`（包含 Pillow、Playwright、Pydantic 等）。
+*   **Python 依赖**：`run.bat` / `run.sh` 首次运行会自动建 `.venv` 并安装；手动装是 `pip install -r requirements.txt`（包含 Pillow、Playwright、Pydantic 等）。
 *   **配置文件**：`server_config.json`（实际运行配置，已加入 `.gitignore` 避免密钥泄露）
 *   **配置模板**：[server_config.example.json](file:///c:/Users/video/Desktop/creative-idea-generator/server_config.example.json)
-    *   包含 API 密钥、访问密码以及各类服务端参数配置。首次部署时请参考模板新建 `server_config.json` / [server_config.json](file:///c:/Users/video/Desktop/creative-idea-generator/server_config.json)。
+    *   包含 API 密钥、访问密码以及各类服务端参数配置。首次运行时由 `tools/bootstrap_config.py` 自动生成一份（占位说明会被清成空值），你只需要补 `apiKey`。
     *   `skillDir`：技能包（`restoration-prompt-composer`）的本地目录，换机部署时最容易漏配的一项（见下方「技能包路径」）。
     *   `adsPowerPort`：AdsPower 本地 API 端口（默认 `50325`）。Google FX 运行时已内置在 `integrations/google_fx/`，换机不再需要配置外部源码路径。
     *   `accessCode` 设置后，除 `/api/mode` 外的全部 API（含任务/日志/清单读取）都需要访问码；静态路由永不吐出配置、日志、任务与服务端源码。

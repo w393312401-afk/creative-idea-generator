@@ -75,6 +75,30 @@ start_service() {
         fi
     fi
 
+    # 配置文件：server_config.json 含密钥，不在仓库里（.gitignore）。新机器上从
+    # 模板生成一份，让服务能起来。不能直接 cp 模板——模板里 accessCode/apiKey
+    # 填的是中文说明文字，原样拷过去等于开着一个谁也不知道口令的门禁，
+    # 见 tools/bootstrap_config.py。与 run.bat 对齐。
+    if [ ! -f "server_config.json" ]; then
+        echo ""
+        $PYTHON_CMD tools/bootstrap_config.py
+        echo ""
+        sleep 4
+    fi
+
+    # 启动前先做一次可见的导入自检：语法错误、依赖损坏、配置文件写坏这类
+    # "连日志系统都没来得及初始化就死掉"的情况，在这里就能报出人话。
+    if ! $PYTHON_CMD -c "import server_common" 2>/tmp/spark_boot_error.txt; then
+        echo ""
+        echo "[错误] 服务启动自检失败，错误信息："
+        echo "------------------------------------------------"
+        cat /tmp/spark_boot_error.txt
+        echo "------------------------------------------------"
+        echo ""
+        read -p "按回车键退出..." _
+        return 1
+    fi
+
     # 后台启动服务。
     # fd1/fd2 直接追加进 server.log（不是另开一个 server_nohup.log）：日志只留
     # 一个落点。Python 侧的 _console_stream 探到这不是终端就不再往 fd1 重复写
