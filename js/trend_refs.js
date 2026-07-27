@@ -29,6 +29,8 @@ function updateTrendRefsSelectedNote() {
     note.textContent = n > 0
         ? `已选 ${n} 条（本批优先用你选的）`
         : '未勾选：本批将自动从案例库加权随机挑 1 条';
+    // 这行同时是取材抽屉折叠态的摘要；勾选变化要让激发轨的 ① 芯片跟着变
+    if (typeof updateSparkRail === 'function') updateSparkRail();
 }
 
 function getSelectedTrendRefIds() {
@@ -393,6 +395,11 @@ function renderTrendRefs() {
 
     const filterInput = document.getElementById('trend-refs-filter');
     if (filterInput) filterInput.hidden = trendRefsCache.length === 0;
+
+    // 空库时把取材抽屉摊开一次当引导（见 js/spark_rail.js）
+    if (typeof maybeGuideEmptyRefLibrary === 'function') {
+        maybeGuideEmptyRefLibrary(trendRefsCache.length);
+    }
 
     if (trendRefsCache.length === 0) {
         const empty = document.createElement('div');

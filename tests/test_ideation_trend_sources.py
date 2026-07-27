@@ -230,8 +230,39 @@ class TestRunIdeateReturnShape(unittest.TestCase):
 
         self.assertEqual([idea['title'] for idea in result['ideas']], ['真正的新创意'])
 
+    def test_ledger_remix_uses_seed_and_skips_unrelated_trends(self):
+        captured = {}
+
+        def fake_chat(config, system_prompt, user_prompt, **kwargs):
+            captured['system'] = system_prompt
+            return json.dumps([{
+                'title': '谷仓黄铜隐居屋·雨林版',
+                'dna': 'grain-silo / rainforest-refuge / rain-chain-wall',
+                'beat_outline': ['清空锈蚀内壁', '点亮雨链墙'],
+            }], ensure_ascii=False)
+
+        seed = {
+            'topic_dna': 'grain-silo / refuge / brass',
+            'one_line': '谷仓黄铜隐居屋',
+            'creative_seed': {'carrier': 'grain silo', 'twist_zh': '黄铜机械夹层'},
+        }
+        with patch.object(pp, 'read_ledger', return_value=[seed]), \
+             patch.object(pp, 'fetch_trend_snippet') as fetch_trend, \
+             patch.object(pp, 'fetch_custom_url_snippet') as fetch_urls, \
+             patch.object(pp, '_chat', side_effect=fake_chat):
+            result = pp.run_ideate({}, count=1, remix_seed=seed)
+
+        self.assertEqual(result['ideas'][0]['title'], '谷仓黄铜隐居屋·雨林版')
+        self.assertEqual(result['trend_refs'], [])
+        fetch_trend.assert_not_called()
+        fetch_urls.assert_not_called()
+        self.assertIn('REMIX SEED (PRIMARY CREATIVE SOURCE)', captured['system'])
+        self.assertIn('谷仓黄铜隐居屋', captured['system'])
+        self.assertIn('ONLY exception', captured['system'])
+
     def test_llm_failure_falls_back_with_new_fields(self):
-        with patch.object(pp, 'fetch_trend_snippet', return_value='· 趋势要点'), \
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value='· 趋势要点'), \
              patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
              patch.object(pp, '_chat', side_effect=RuntimeError('down')):
             result = pp.run_ideate({}, count=3)
@@ -240,6 +271,7 @@ class TestRunIdeateReturnShape(unittest.TestCase):
             self.assertIn('recommended_beats', idea)
             self.assertTrue(5 <= idea['recommended_beats'] <= 15)
             self.assertIn('trend_ref', idea)
+            self.assertIn(idea['pacing_skeleton'], ('linear_milestone', 'dual_payoff'))
             # 兜底列表也要带逐拍工序简介(卡片上的「工序预览」),长度 = 推荐拍数 + 1
             # (末条是 reward 揭示拍),否则 LLM 全挂时卡片会退化成没有工序的空壳
             self.assertEqual(len(idea['beat_outline']), idea['recommended_beats'] + 1)
@@ -280,6 +312,113 @@ class TestRunIdeateReturnShape(unittest.TestCase):
         # 逐拍工序简介的产出契约
         self.assertIn('"beat_outline"', system)
         self.assertIn('recommended_beats + 1', system)
+
+    def test_selected_pacing_skeletons_are_prompted_and_missing_ids_are_balanced(self):
+        """GUI 默认同时启用新旧两套；模型漏写归属时后端也要轮询补齐，
+        避免四张卡又全部退回原单线节拍。"""
+        captured = {}
+        payload = json.dumps([
+            {'title': 'A', 'dna': 'a / refuge / x', 'beat_outline': ['立柱', '亮灯']},
+            {'title': 'B', 'dna': 'b / refuge / x', 'beat_outline': [
+                '立柱搭建外部框架', '完成外部入口门面', '推镜穿过门口进入原始室内',
+                '清空室内积渣', '铺设防潮基层', '架设墙顶龙骨',
+                '填充墙顶保温', '封装内衬面板', '铺装成品地板',
+                '布置床铺软装', '点亮灯光入住',
+            ]},
+        ], ensure_ascii=False)
+
+        def fake_chat(config, system_prompt, user_prompt, **kwargs):
+            captured['system'] = system_prompt
+            return payload
+
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', side_effect=fake_chat):
+            result = pp.run_ideate({}, count=2,
+                                   pacing_skeleton_ids=['linear_milestone', 'dual_payoff'])
+
+        self.assertIn('PACING SKELETON REFERENCES', captured['system'])
+        self.assertIn('linear_milestone', captured['system'])
+        self.assertIn('dual_payoff', captured['system'])
+        self.assertIn('visible, continuous doorway-crossing video', captured['system'])
+        self.assertEqual([idea['pacing_skeleton'] for idea in result['ideas']],
+                         ['linear_milestone', 'dual_payoff'])
+
+    def test_single_selected_pacing_skeleton_rejects_unselected_model_value(self):
+        payload = json.dumps([{
+            'title': 'T', 'dna': 't / refuge / x',
+            'pacing_skeleton': 'linear_milestone',
+            'beat_outline': [
+                '立柱搭建外部框架', '完成外部入口门面', '推镜穿过门口进入原始室内',
+                '清空室内积渣', '铺设防潮基层', '架设墙顶龙骨',
+                '填充墙顶保温', '封装内衬面板', '铺装成品地板',
+                '布置床铺软装', '点亮灯光入住',
+            ],
+        }], ensure_ascii=False)
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', return_value=payload):
+            result = pp.run_ideate({}, count=1, pacing_skeleton_ids=['dual_payoff'])
+        self.assertEqual(result['ideas'][0]['pacing_skeleton'], 'dual_payoff')
+
+    def test_dual_payoff_deterministically_requires_a_visible_crossing_video(self):
+        brief = {
+            'mode': 'Threshold',
+            'threshold_variant': 'coaxial',
+            'threshold_elevated': True,
+        }
+        out = pp.apply_pacing_skeleton_to_brief(brief, 'dual_payoff')
+        self.assertEqual(out['mode'], 'Threshold')
+        self.assertEqual(out['threshold_variant'], 'coaxial')
+        self.assertTrue(out['threshold_elevated'])
+        self.assertTrue(out['require_visible_threshold_video'])
+
+        accidental_cut = {'mode': 'Threshold', 'threshold_variant': 'hard_cut'}
+        fixed = pp.apply_pacing_skeleton_to_brief(accidental_cut, 'dual_payoff')
+        self.assertEqual(fixed['threshold_variant'], 'coaxial')
+        self.assertTrue(fixed['require_visible_threshold_video'])
+
+        old = {'mode': 'Standard', 'threshold_variant': 'coaxial'}
+        self.assertEqual(pp.apply_pacing_skeleton_to_brief(old.copy(), 'linear_milestone'), old)
+
+    def test_dual_payoff_label_cannot_pass_with_a_linear_outline(self):
+        idea = {
+            'pacing_skeleton': 'dual_payoff',
+            'beat_outline': [
+                '清理外部', '修复外壳', '过门进入室内', '清理室内',
+                '铺装地板', '安装灯具', '布置家具', '点亮入住',
+            ],
+        }
+        errors = pp.pacing_skeleton_outline_violations(idea)
+        self.assertTrue(errors)
+        self.assertTrue(any('completed exterior mini-payoff' in err for err in errors))
+
+    def test_dual_payoff_rejects_hard_cut_even_when_other_structure_is_valid(self):
+        idea = {
+            'pacing_skeleton': 'dual_payoff',
+            'beat_outline': [
+                '立柱搭建外部框架', '完成外部入口门面', '硬切原始室内',
+                '清空室内积渣', '铺设防潮基层', '架设墙顶龙骨',
+                '填充墙顶保温', '封装内衬面板', '铺装成品地板',
+                '布置床铺软装', '点亮灯光入住',
+            ],
+        }
+        errors = pp.pacing_skeleton_outline_violations(idea)
+        self.assertTrue(any('forbids a hard cut' in err for err in errors))
+
+    def test_dual_payoff_outline_passes_only_with_both_arcs_and_layered_rebuild(self):
+        idea = {
+            'pacing_skeleton': 'dual_payoff',
+            'beat_outline': [
+                '立柱搭建外部框架', '完成外部入口门面', '推镜穿过门口进入原始室内',
+                '清空室内积渣', '铺设防潮基层', '架设墙顶龙骨',
+                '填充墙顶保温', '封装内衬面板', '铺装成品地板',
+                '布置床铺软装', '点亮灯光入住',
+            ],
+        }
+        self.assertEqual(pp.pacing_skeleton_outline_violations(idea), [])
 
     def test_selected_theme_still_locks_one_carrier_for_the_whole_batch(self):
         """GUI 已选定基础主题时仍然锁死同一个载体——这条不受「同批载体互不重复」影响,

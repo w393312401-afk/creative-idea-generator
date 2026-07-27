@@ -125,6 +125,25 @@ class TestRegisterLedgerCandidates:
         assert result['duplicates'] == 2
         assert len(read_ledger(ledger_path)) == 2
 
+    def test_preserves_whitelisted_creative_seed_for_remix(self, ledger_path):
+        register_ledger_candidates([{
+            'dna': 'silo / refuge / brass',
+            'title': '谷仓黄铜隐居屋',
+            'creative_seed': {
+                'input_str': '把废弃谷仓改成黄铜隐居屋',
+                'carrier': 'grain silo',
+                'twist_zh': '黄铜机械夹层',
+                'unexpected': '不应持久化',
+            },
+        }], ledger_path)
+
+        row = read_ledger(ledger_path)[0]
+        assert row['creative_seed'] == {
+            'input_str': '把废弃谷仓改成黄铜隐居屋',
+            'carrier': 'grain silo',
+            'twist_zh': '黄铜机械夹层',
+        }
+
     def test_corrupt_ledger_fails_closed(self, ledger_path):
         with open(ledger_path, 'w', encoding='utf-8') as f:
             f.write('{broken')

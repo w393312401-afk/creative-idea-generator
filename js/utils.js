@@ -243,7 +243,10 @@ function customConfirm(message) {
 
 // duration：可选停留毫秒数，默认 3 秒。少数"配置层面出了问题、需要人真的读完
 // 一句话才能修"的提示（如技能契约缺失）3 秒不够看完。
-function showToast(message, type = 'success', duration = 3000) {
+// action：可选的行动按钮 { label, onClick }。用于"刚做完、可能想马上反悔"的
+// 操作（目前是删除整拍后的「撤销」）——把出口放在结果通知上，比让人事后去菜单里
+// 找一个恢复入口更贴近当时的心理状态。点过一次即隐藏，避免重复触发。
+function showToast(message, type = 'success', duration = 3000, action = null) {
     const container = document.getElementById('toast-container');
     if (!container) return;
     const toast = document.createElement('div');
@@ -259,10 +262,26 @@ function showToast(message, type = 'success', duration = 3000) {
     msgEl.textContent = message;
     toast.append(iconEl, ' ', msgEl);
 
+    let timer = null;
+    if (action && action.label && typeof action.onClick === 'function') {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'toast-action';
+        btn.textContent = action.label;
+        btn.addEventListener('click', () => {
+            btn.disabled = true;
+            if (timer) clearTimeout(timer);
+            toast.classList.add('hiding');
+            setTimeout(() => toast.remove(), 200);
+            action.onClick();
+        });
+        toast.appendChild(btn);
+    }
+
     container.appendChild(toast);
 
     // Use CSS class for exit (avoids JS writing style.opacity/transform → forced layout)
-    setTimeout(() => {
+    timer = setTimeout(() => {
         toast.classList.add('hiding');
         setTimeout(() => toast.remove(), 200);
     }, Number.isFinite(+duration) && +duration > 0 ? +duration : 3000);

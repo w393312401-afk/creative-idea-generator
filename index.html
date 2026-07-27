@@ -53,6 +53,11 @@
          必须排在 panels-tabs.css 之后：它要覆盖那里的桌面端 .content-header 与
          移动端 .action-row 规则。见 docs/spark_result_minimal_layout_plan.md -->
     <link rel="stylesheet" href="css/app/result-minimal.css?v=1.0.0">
+    <!-- 激发维度页的极简布局（激发轨 / 取材抽屉 / 灵感卡网格 / 单行页脚）。
+         同样必须排在 panels-tabs.css 之后：要覆盖那里的 .panel-footer、
+         .ideation-cards-container 与整段移动端补丁。
+         见 docs/spark_dimension_minimal_layout_plan.md -->
+    <link rel="stylesheet" href="css/app/dimension-minimal.css?v=1.0.0">
     <link rel="stylesheet" href="css/image_studio.css?v=1.1.1">
     <link rel="stylesheet" href="css/gallery.css?v=1.1.0">
     <link rel="stylesheet" href="css/ledger.css?v=1.1.0">
@@ -146,11 +151,43 @@
 
         <!-- Main Workspace Grid -->
         <main class="app-main">
-            <!-- Left Workspace: Brainstorming Panel -->
-            <section class="panel-left glass-panel mobile-active">
+            <!-- Left Workspace: Brainstorming Panel
+                 极简布局（激发轨 / 取材抽屉 / 灵感卡网格 / 单行页脚）：
+                 方案与取舍见 docs/spark_dimension_minimal_layout_plan.md。
+                 所有控件 id 与既有监听保持不变，只换外壳与位置。 -->
+            <section class="panel-left glass-panel mobile-active spark-minimal">
                 <div class="panel-header">
                     <h2>概念设定与维度映射</h2>
                     <p>配置您想激发的改造或建造项目的核心维度</p>
+                </div>
+
+                <!-- 激发轨：① 取材 → ② 选题 → ③ 合成 三段状态一目了然，并指出下一步。
+                     状态由 updateSparkRail()（js/spark_rail.js）从参考勾选 /
+                     loadedIdeationCover / currentIdea 推出，不参与任何请求逻辑。 -->
+                <div class="spark-rail" id="spark-rail" role="group" aria-label="激发流程">
+                    <button type="button" class="spark-stage" id="spark-stage-source" data-stage="source" title="取材：联网参考案例 + 推进节拍骨架，点此展开设置">
+                        <span class="stage-idx">1</span>
+                        <span class="stage-copy">
+                            <strong>取材</strong>
+                            <small id="spark-stage-source-note">读取参考…</small>
+                        </span>
+                    </button>
+                    <span class="spark-rail-link" aria-hidden="true"></span>
+                    <button type="button" class="spark-stage" id="spark-stage-topic" data-stage="topic" title="选题：点一张灵感卡把它的维度载入本次激发">
+                        <span class="stage-idx">2</span>
+                        <span class="stage-copy">
+                            <strong>选题</strong>
+                            <small id="spark-stage-topic-note">未选定</small>
+                        </span>
+                    </button>
+                    <span class="spark-rail-link" aria-hidden="true"></span>
+                    <button type="button" class="spark-stage" id="spark-stage-compose" data-stage="compose" title="合成：把选定选题送入 restoration-prompt-composer 合成完整提示词集">
+                        <span class="stage-idx">3</span>
+                        <span class="stage-copy">
+                            <strong>合成</strong>
+                            <small id="spark-stage-compose-note">待激发</small>
+                        </span>
+                    </button>
                 </div>
 
                 <div class="panel-body">
@@ -159,74 +196,90 @@
                         <!-- Trend Reference Library — replaces the removed fixed six-theme
                              selector: ideation is now driven by user-selected persisted
                              web-search references (verified viral cases, trend_refs.json)
-                             to break out of the fixed-theme information cocoon. -->
-                        <div class="control-group">
-                            <div class="preset-header-row">
-                                <label class="group-title">1. 联网参考案例库</label>
+                             to break out of the fixed-theme information cocoon.
+                             折叠成一行抽屉：折叠态摘要直接复用 #trend-refs-selected-note
+                             （trend_refs.js 一直在实时更新它）。 -->
+                        <div class="control-group spark-drawer" id="spark-drawer-refs" data-drawer="refs">
+                            <div class="spark-drawer-head">
+                                <button type="button" class="spark-drawer-toggle" aria-expanded="false" aria-controls="spark-drawer-refs-body">
+                                    <svg class="spark-drawer-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                                    <span class="group-title">🌐 联网参考案例库</span>
+                                    <span class="trend-refs-selected-note spark-drawer-note" id="trend-refs-selected-note"></span>
+                                </button>
                                 <div class="trend-refs-header-actions">
                                     <button type="button" id="trend-refs-direction-toggle" class="preset-header-action" title="自定义联网搜索方向，就在这里改，不用去配置中心">🎯 搜索方向</button>
                                     <button type="button" id="trend-refs-search-btn" class="preset-header-action">🔍 搜一批新参考</button>
                                 </div>
                             </div>
-                            <div class="trend-refs-direction-panel" id="trend-refs-direction-panel" hidden>
-                                <label for="trend-refs-search-query">搜索方向（留空用默认：最新爆款延时摄影改造视频）</label>
-                                <input type="text" id="trend-refs-search-query" placeholder="例如：AI 宠物拟人化改造视频 趋势">
-                                <label for="trend-refs-trend-urls">参考网址（每行一个，最多取前 5 个，可选）</label>
-                                <textarea id="trend-refs-trend-urls" rows="2" placeholder="https://..."></textarea>
-                                <p class="trend-refs-direction-hint">改这里会同步「配置中心」里的同一项设置，下次点「搜一批新参考」立即生效——换个方向搜，案例库才不会越搜越像。</p>
+                            <div class="spark-drawer-body" id="spark-drawer-refs-body">
+                                <div class="trend-refs-direction-panel" id="trend-refs-direction-panel" hidden>
+                                    <label for="trend-refs-search-query">搜索方向（留空用默认：最新爆款延时摄影改造视频）</label>
+                                    <input type="text" id="trend-refs-search-query" placeholder="例如：AI 宠物拟人化改造视频 趋势">
+                                    <label for="trend-refs-trend-urls">参考网址（每行一个，最多取前 5 个，可选）</label>
+                                    <textarea id="trend-refs-trend-urls" rows="2" placeholder="https://..."></textarea>
+                                    <p class="trend-refs-direction-hint">改这里会同步「配置中心」里的同一项设置，下次点「搜一批新参考」立即生效——换个方向搜，案例库才不会越搜越像。</p>
+                                </div>
+                                <p class="trend-refs-hint">勾选参考后，灵感推荐将直接从这些已验证案例中取材；不勾选则每批自动联网搜索（结果也会沉淀进本库）。</p>
+                                <div class="trend-refs-toolbar">
+                                    <input type="text" id="trend-refs-filter" class="trend-refs-filter" placeholder="筛选案例库…" hidden>
+                                </div>
+                                <div class="trend-refs-list" id="trend-refs-list">
+                                    <div class="trend-refs-empty">正在载入联网参考案例库...</div>
+                                </div>
+                                <div class="trend-refs-archive-bar">
+                                    <span class="trend-refs-cap-note" id="trend-refs-cap-note"></span>
+                                    <button type="button" id="trend-refs-manage-open-btn" class="trend-refs-archive-toggle">🗂️ 管理全部</button>
+                                    <button type="button" id="trend-refs-archive-toggle" class="trend-refs-archive-toggle" hidden>查看归档</button>
+                                </div>
+                                <div class="trend-refs-list trend-refs-archive-list" id="trend-refs-archive-list" hidden></div>
                             </div>
-                            <p class="trend-refs-hint">勾选参考后，灵感推荐将直接从这些已验证案例中取材；不勾选则每批自动联网搜索（结果也会沉淀进本库）。</p>
-                            <div class="trend-refs-toolbar">
-                                <input type="text" id="trend-refs-filter" class="trend-refs-filter" placeholder="筛选案例库…" hidden>
-                                <span class="trend-refs-selected-note" id="trend-refs-selected-note"></span>
-                            </div>
-                            <div class="trend-refs-list" id="trend-refs-list">
-                                <div class="trend-refs-empty">正在载入联网参考案例库...</div>
-                            </div>
-                            <div class="trend-refs-archive-bar">
-                                <span class="trend-refs-cap-note" id="trend-refs-cap-note"></span>
-                                <button type="button" id="trend-refs-manage-open-btn" class="trend-refs-archive-toggle">🗂️ 管理全部</button>
-                                <button type="button" id="trend-refs-archive-toggle" class="trend-refs-archive-toggle" hidden>查看归档</button>
-                            </div>
-                            <div class="trend-refs-list trend-refs-archive-list" id="trend-refs-archive-list" hidden></div>
                         </div>
 
-                        <!-- Topic Ideation Engine (P2) — fed by the selected trend
-                             references above (or auto web search when none selected). -->
-                        <div class="control-group">
+                        <!-- Pacing skeleton references: both are enabled by default so one
+                             ideation batch can deliberately spread candidates across the
+                             established linear ladder and the new two-payoff exterior/interior
+                             ladder instead of silently collapsing every topic onto one rhythm. -->
+                        <div class="control-group pacing-skeleton-control spark-drawer" id="pacing-skeleton-control" data-drawer="pacing">
+                            <div class="spark-drawer-head">
+                                <button type="button" class="spark-drawer-toggle" aria-expanded="false" aria-controls="spark-drawer-pacing-body">
+                                    <svg class="spark-drawer-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                                    <span class="group-title">🦴 推进节拍骨架</span>
+                                    <span class="pacing-skeleton-selected-note spark-drawer-note" id="pacing-skeleton-selected-note">已启用 2 套</span>
+                                </button>
+                            </div>
+                            <div class="spark-drawer-body" id="spark-drawer-pacing-body">
+                                <p class="pacing-skeleton-hint">勾选的骨架会参与下一批灵感规划；同时启用时，候选会尽量均分使用。修改后点「换一批灵感」生效。</p>
+                                <div class="pacing-skeleton-options" role="group" aria-label="推进节拍骨架参考">
+                                    <label class="pacing-skeleton-option">
+                                        <input type="checkbox" name="pacing-skeleton" value="linear_milestone" checked>
+                                        <span class="pacing-skeleton-copy">
+                                            <strong>单线里程碑推进</strong>
+                                            <small>原骨架 · 外部清障/修复 → 过门 → 内部墙顶/地面/机电 → 家具 → 最终奖励</small>
+                                        </span>
+                                    </label>
+                                    <label class="pacing-skeleton-option">
+                                        <input type="checkbox" name="pacing-skeleton" value="dual_payoff" checked>
+                                        <span class="pacing-skeleton-copy">
+                                            <strong>内外双重完工</strong>
+                                            <small>新骨架 · 外部门面先完工小高潮 → 连续推镜过门进入原始室内 → 基层/隐蔽层/封板/饰面 → 家具终局</small>
+                                        </span>
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Topic Ideation Engine (P2) — fed by both the selected trend
+                             references and pacing skeletons above. 这是本页的主体：卡片区
+                             在宽屏铺成网格、窄屏纵向单列，不再横向滚。
+                             「🎲 换一批灵感」按钮已移到页脚与主激发按钮并排。 -->
+                        <div class="control-group spark-cards-group">
                             <div class="preset-header-row">
-                                <label class="group-title">💡 智能灵感推荐 (点击卡片一键载入并生成)</label>
-                                <button type="button" id="ideate-refresh-btn" class="preset-header-action">🎲 换一批灵感</button>
+                                <label class="group-title">💡 灵感推荐 · 点卡片选定选题</label>
+                                <span class="spark-cards-note" id="spark-cards-note"></span>
                             </div>
                             <div class="ideation-cards-container" id="ideation-cards-container">
                                 <div class="ideation-loading">正在载入灵感引擎...</div>
                             </div>
-                        </div>
-
-                        <!-- Beat Count — the one dimension kept manually tunable (it directly
-                             controls how many construction beats get generated); anchors and the
-                             other 4 dimension sliders were removed per user request in favor of
-                             letting the theme-conditioned ideation cards / composer decide them. -->
-                        <div class="control-group">
-                            <div class="slider-labels">
-                                <span id="beat-count-label">最多施工节拍数 (Milestone Cap)</span>
-                                <span id="val-beats">15 拍</span>
-                            </div>
-                            <div class="slider-track-row">
-                                <button type="button" class="slider-step-btn" data-target="slider-beats" data-step="-1" aria-label="减少节拍数">−</button>
-                                <input type="range" id="slider-beats" min="5" max="15" step="1" value="15" class="neon-slider" list="beats-ticks">
-                                <datalist id="beats-ticks">
-                                    <option value="5"></option><option value="6"></option><option value="7"></option><option value="8"></option><option value="9"></option><option value="10"></option><option value="11"></option><option value="12"></option><option value="13"></option><option value="14"></option><option value="15"></option>
-                                </datalist>
-                                <button type="button" class="slider-step-btn" data-target="slider-beats" data-step="1" aria-label="增加节拍数">+</button>
-                            </div>
-                            <label class="field-row" for="beat-count-mode" style="margin-top:10px; display:flex; align-items:center; justify-content:space-between; gap:12px;">
-                                <span>节拍规划模式</span>
-                                <select id="beat-count-mode" aria-label="节拍规划模式">
-                                    <option value="adaptive" selected>自适应 · 删除填充拍</option>
-                                    <option value="fixed">固定 · 严格按所选拍数</option>
-                                </select>
-                            </label>
                         </div>
 
                         <!-- Fixed-value data holders for complexity/budget/ratio/creativity — no
@@ -246,31 +299,75 @@
                     </div>
                 </div>
 
-                <!-- Sticky Footer at the bottom of panel-left -->
+                <!-- Sticky Footer at the bottom of panel-left：一行细调条 + 一行按钮。
+                     #config-summary 保留在 DOM 里（config.js 仍往里写文本）但不再显示：
+                     它 7 项里有 4 项是上面那组永久固定的隐藏值，会变的三项已上到激发轨。 -->
                 <div class="panel-footer">
                     <div id="footer-pane-text" class="footer-pane active">
                         <div id="config-summary" class="config-summary-box">
                             <span class="summary-label">配置摘要：</span>
                             <span id="config-summary-text" class="summary-text">正在计算...</span>
                         </div>
-                        <!-- picker-collapsed：手机上默认只留「LLM 模型 · 使用中 xxx」一行，
-                             芯片组点开才展开——整组芯片在窄屏要占 200 多像素，等于把上方
-                             真正要操作的案例库/灵感卡挤成一条缝。桌面端忽略该 class。 -->
-                        <div class="ideation-model-picker picker-collapsed" id="ideation-model-picker">
-                            <div class="model-picker-head">
-                                <span class="model-picker-label">LLM 模型</span>
-                                <span id="ideation-llm-model-active-hint" class="model-active-hint"></span>
-                                <button type="button" id="ideation-llm-toggle" class="model-picker-toggle" aria-expanded="false" aria-controls="ideation-llm-groups" title="展开模型选择">
-                                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
-                                </button>
+
+                        <!-- 细调条：节拍数 / 规划模式 / LLM 模型三项折进一行，点开才展开。
+                             折叠态摘要由 updateSparkRail() 写入 #spark-tune-summary-text。 -->
+                        <div class="spark-tune tune-collapsed" id="spark-tune">
+                            <button type="button" class="spark-tune-head" id="spark-tune-toggle" aria-expanded="false" aria-controls="spark-tune-body" title="展开节拍与模型细调">
+                                <span class="spark-tune-summary" id="spark-tune-summary-text">15 拍 · 自适应</span>
+                                <svg class="spark-tune-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"></polyline></svg>
+                            </button>
+                            <div class="spark-tune-body" id="spark-tune-body">
+                                <!-- Beat Count — the one dimension kept manually tunable (it directly
+                                     controls how many construction beats get generated). -->
+                                <div class="control-group spark-beats">
+                                    <div class="slider-labels">
+                                        <span id="beat-count-label">最多施工节拍数 (Milestone Cap)</span>
+                                        <span id="val-beats">15 拍</span>
+                                    </div>
+                                    <div class="slider-track-row">
+                                        <button type="button" class="slider-step-btn" data-target="slider-beats" data-step="-1" aria-label="减少节拍数">−</button>
+                                        <input type="range" id="slider-beats" min="5" max="15" step="1" value="15" class="neon-slider" list="beats-ticks">
+                                        <datalist id="beats-ticks">
+                                            <option value="5"></option><option value="6"></option><option value="7"></option><option value="8"></option><option value="9"></option><option value="10"></option><option value="11"></option><option value="12"></option><option value="13"></option><option value="14"></option><option value="15"></option>
+                                        </datalist>
+                                        <button type="button" class="slider-step-btn" data-target="slider-beats" data-step="1" aria-label="增加节拍数">+</button>
+                                    </div>
+                                    <label class="field-row" for="beat-count-mode">
+                                        <span>节拍规划模式</span>
+                                        <select id="beat-count-mode" aria-label="节拍规划模式">
+                                            <option value="adaptive" selected>自适应 · 删除填充拍</option>
+                                            <option value="fixed">固定 · 严格按所选拍数</option>
+                                        </select>
+                                    </label>
+                                </div>
+                                <!-- picker-collapsed 只在手机窄屏起作用；在细调条里它已经是
+                                     二级展开内容，芯片组常驻铺开（见 dimension-minimal.css）。 -->
+                                <div class="ideation-model-picker picker-collapsed" id="ideation-model-picker">
+                                    <div class="model-picker-head">
+                                        <span class="model-picker-label">LLM 模型</span>
+                                        <span id="ideation-llm-model-active-hint" class="model-active-hint"></span>
+                                        <button type="button" id="ideation-llm-toggle" class="model-picker-toggle" aria-expanded="false" aria-controls="ideation-llm-groups" title="展开模型选择">
+                                            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                                        </button>
+                                    </div>
+                                    <div id="ideation-llm-groups" class="model-family-groups"></div>
+                                </div>
                             </div>
-                            <div id="ideation-llm-groups" class="model-family-groups"></div>
                         </div>
-                        <button id="generate-btn" class="pulse-btn">
-                            <div class="btn-glow"></div>
-                            <span class="btn-text">⚡ 激发核心创意点子 ⚡</span>
-                            <span class="btn-shortcut-hint">Ctrl + Enter</span>
-                        </button>
+
+                        <!-- 两枚激发入口并排，主次由状态决定（updateSparkRail）：还没选定
+                             选题时 🎲 为主、⚡ 置灰；选定后互换。 -->
+                        <div class="spark-actions">
+                            <!-- 标签直接写在按钮里，刻意不套 .btn-text：那个类被
+                                 base.css 强制成 color:#fff !important（给 .pulse-btn
+                                 的深色渐变用的），套上去在浅色底上就是白字看不见。 -->
+                            <button type="button" id="ideate-refresh-btn" class="spark-secondary-btn" title="让 LLM 重新激发一批候选选题">🎲 换一批灵感</button>
+                            <button id="generate-btn" class="pulse-btn">
+                                <div class="btn-glow"></div>
+                                <span class="btn-text">⚡ 激发核心创意点子 ⚡</span>
+                                <span class="btn-shortcut-hint">Ctrl + Enter</span>
+                            </button>
+                        </div>
                     </div>
                 </div>
             </section>
@@ -573,6 +670,10 @@
                                         <span>帧</span>
                                     </div>
                                     <button id="run-sequence-review-btn" class="action-btn text-btn mini-btn" title="整套序列渲染完成后，手动检查跨帧施工顺序/空间一致性（不会自动运行，也不会阻塞视频生成）">🔍 一致性审查</button>
+                                    <!-- 删除整拍时服务端会落一份完整快照；删除后的一次性「撤销」
+                                         在 toast 上（30 秒），过了窗口从这里恢复。见
+                                         docs/spark_result_slots_plan.md 与 /api/restore_slot -->
+                                    <button id="deleted-slots-btn" class="action-btn text-btn mini-btn" title="查看本单删除过哪些拍，并把它们恢复回来（删除时已保存完整快照）">↩️ 已删除的拍</button>
                                 </div>
                                 <div class="section-pop" id="frames-info-pop" hidden>
                                     <p class="frames-desc">将生成的所有图片提示词连成单链帧序列：第一帧进行文本生成图像，后续每一帧均以前一帧为唯一参考进行图生图（img2img）修改。</p>
@@ -602,6 +703,35 @@
                                         </div>
                                         <div class="gen-live-feed-lines" id="frames-live-feed-lines"></div>
                                     </div>
+                                    <!-- 槽位工具条：计数 / 筛选 / 多选批量操作 / 尺寸档。
+                                         行为在 js/slot_toolbar.js，筛选与计数只读卡片上的
+                                         data-kind/data-badges（renderSlotCard 按 slot_model
+                                         的判定写下的），不另算一套状态。 -->
+                                    <div class="slot-toolbar" data-slot-type="image">
+                                        <span class="slot-count"></span>
+                                        <span class="slot-toolbar-group">
+                                            <button type="button" class="slot-filter-btn is-active" data-filter="all">全部</button>
+                                            <button type="button" class="slot-filter-btn" data-filter="flagged">只看有问题</button>
+                                            <button type="button" class="slot-filter-btn" data-filter="missing">未生成</button>
+                                        </span>
+                                        <button type="button" class="slot-jump-btn" title="滚到第一个有问题的槽位" hidden>⚠ 跳到第一个问题</button>
+                                        <button type="button" class="slot-merge-btn" aria-pressed="false" title="一拍一列：第 N 列＝第 N 拍，上行 IMG N、下行 VID N，一眼看出哪一段接不上">◧ 合并视图</button>
+                                        <span class="slot-bulk" hidden>
+                                            <button type="button" class="action-btn text-btn mini-btn" data-bulk="retry">重试所选</button>
+                                            <button type="button" class="action-btn text-btn mini-btn" data-bulk="delete">删除所选</button>
+                                            <button type="button" class="slot-bulk-clear" data-bulk="clear" title="取消选择">×</button>
+                                        </span>
+                                        <span class="slot-toolbar-group slot-size-group" title="缩略图大小">
+                                            <button type="button" class="slot-size-btn" data-size="S">S</button>
+                                            <button type="button" class="slot-size-btn" data-size="M">M</button>
+                                            <button type="button" class="slot-size-btn" data-size="L">L</button>
+                                        </span>
+                                        <span class="slot-filter-empty" hidden>当前筛选下没有槽位</span>
+                                    </div>
+                                    <!-- 合并视图（一拍一列）的共用容器：开启时两个渲染器
+                                         都往这里 append，并按槽位号写 grid-column/grid-row。
+                                         关闭时它是空的、由 CSS 隐藏。见 js/slot_toolbar.js -->
+                                    <div class="frames-grid beats-grid" id="beats-grid"></div>
                                     <div class="frames-grid" id="frames-grid"></div>
                                 </div>
                             </div>
@@ -636,6 +766,14 @@
                                              renderMergeBlocked 会把「重试缺口 / 跳过合并」两个可操作
                                              按钮渲染进这里，收进弹层就等于把出口藏起来了。 -->
                                         <p class="frames-meta" id="videos-meta">尚未生成任何视频序列。</p>
+                                        <label for="merge-speed-select" style="display:inline-flex; align-items:center; gap:8px; margin-left:auto; color:var(--text-secondary); font-size:12px; white-space:nowrap;">
+                                            <span>合并速率</span>
+                                            <select id="merge-speed-select" aria-label="视频合并速率" style="padding:6px 10px; color:var(--text-primary); background:var(--surface, #111827); border:1px solid var(--border-color); border-radius:6px;">
+                                                <option value="1">无加速</option>
+                                                <option value="1.5">1.5 倍</option>
+                                                <option value="2" selected>2 倍</option>
+                                            </select>
+                                        </label>
                                     </div>
                                     <div class="frames-progress" id="videos-progress" style="display:none; align-items: center; gap: 12px; justify-content: center; flex-wrap: wrap;">
                                         <div class="cover-spinner"></div>
@@ -657,12 +795,12 @@
                                     <!-- Merged finished video player -->
                                     <div id="merged-video-container" style="display: none; margin-bottom: 20px; padding: 15px; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px;">
                                         <h4 style="margin-top: 0; margin-bottom: 12px; color: var(--text-primary); font-size: 14px; display: flex; align-items: center; gap: 8px;">
-                                            <span>🎬 2倍速合并成品视频 (Merged Finished Video)</span>
+                                            <span id="merged-video-heading">🎬 合并成品视频 (Merged Finished Video)</span>
                                         </h4>
                                         <div style="display: flex; gap: 15px; align-items: flex-start; flex-wrap: wrap;">
                                             <video id="merged-video-player" controls style="width: 180px; aspect-ratio: 9/16; object-fit: cover; border-radius: 6px; background: #03050c; border: 1px solid var(--border-color);"></video>
                                             <div style="flex: 1; min-width: 200px; display: flex; flex-direction: column; gap: 8px;">
-                                                <p style="margin: 0; font-size: 12px; color: var(--text-secondary); line-height: 1.5;">所有生成的视频片段已按顺序合并，并已调整为2倍速度进行快进展示（呈现出顺畅的时空转换建造过程）。</p>
+                                                <p id="merged-video-description" style="margin: 0; font-size: 12px; color: var(--text-secondary); line-height: 1.5;">所有生成的视频片段已按顺序合并。</p>
                                                 <p id="merged-video-info" style="margin: 0; font-size: 12px; color: var(--neon-cyan); font-family: monospace;"></p>
                                                 <div style="margin-top: 8px;">
                                                     <a id="merged-video-download" href="#" download class="action-btn text-btn mini-btn" style="display: inline-flex; align-items: center; gap: 6px; text-decoration: none; padding: 6px 12px; font-size: 12px; color: var(--text-primary); background: rgba(var(--ink-rgb), 0.08); border: 1px solid var(--border-color); border-radius: 4px;">
@@ -674,6 +812,32 @@
                                         </div>
                                     </div>
 
+                                    <!-- 槽位工具条：计数 / 筛选 / 多选批量操作 / 尺寸档。
+                                         行为在 js/slot_toolbar.js，筛选与计数只读卡片上的
+                                         data-kind/data-badges（renderSlotCard 按 slot_model
+                                         的判定写下的），不另算一套状态。 -->
+                                    <div class="slot-toolbar" data-slot-type="video">
+                                        <span class="slot-count"></span>
+                                        <span class="slot-toolbar-group">
+                                            <button type="button" class="slot-filter-btn is-active" data-filter="all">全部</button>
+                                            <button type="button" class="slot-filter-btn" data-filter="flagged">只看有问题</button>
+                                            <button type="button" class="slot-filter-btn" data-filter="missing">未生成</button>
+                                        </span>
+                                        <button type="button" class="slot-jump-btn" title="滚到第一个有问题的槽位" hidden>⚠ 跳到第一个问题</button>
+                                        <button type="button" class="slot-merge-btn" aria-pressed="false" title="一拍一列：第 N 列＝第 N 拍，上行 IMG N、下行 VID N，一眼看出哪一段接不上">◧ 合并视图</button>
+                                        <span class="slot-bulk" hidden>
+                                            <button type="button" class="action-btn text-btn mini-btn" data-bulk="retry">重试所选</button>
+                                            <button type="button" class="action-btn text-btn mini-btn" data-bulk="delete">删除所选</button>
+                                            <button type="button" class="slot-bulk-clear" data-bulk="clear" title="取消选择">×</button>
+                                        </span>
+                                        <span class="slot-toolbar-group slot-size-group" title="缩略图大小">
+                                            <button type="button" class="slot-size-btn" data-size="S">S</button>
+                                            <button type="button" class="slot-size-btn" data-size="M">M</button>
+                                            <button type="button" class="slot-size-btn" data-size="L">L</button>
+                                        </span>
+                                        <span class="slot-filter-empty" hidden>当前筛选下没有槽位</span>
+                                    </div>
+                                    <p class="slot-merged-note">视频槽位已并入上方「连续帧序列生成」的拍轨（合并视图）。</p>
                                     <div class="frames-grid" id="videos-grid"></div>
                                 </div>
                             </div>
@@ -1032,7 +1196,7 @@
                 <div class="ledger-shell">
                     <div class="panel-header">
                         <h2>创意台账</h2>
-                        <p>管理已用/候选选题的状态与表现打分，为后续放量提供方向参考（激发时仍会读取完整历史规避重复）</p>
+                        <p>管理已用/候选选题的状态与表现打分，也可拎出历史创意作为母题继续二创</p>
                     </div>
 
                     <div class="ledger-toolbar">
@@ -1425,20 +1589,26 @@
 
     <!-- Modular JS: defer so they never block HTML parsing. Order preserved. -->
     <script src="js/state.js?v=1.1.12" defer></script>
-    <script src="js/utils.js?v=1.2.2" defer></script>
+    <script src="js/utils.js?v=1.3.0" defer></script>
     <script src="js/theme_toggle.js?v=1.1.0" defer></script>
-    <script src="js/config.js?v=1.2.8" defer></script>
-    <script src="js/trend_refs.js?v=1.3.0" defer></script>
+    <script src="js/config.js?v=1.2.9" defer></script>
+    <script src="js/spark_rail.js?v=1.0.0" defer></script>
+    <script src="js/trend_refs.js?v=1.3.1" defer></script>
     <script src="js/account_pool.js?v=1.1.0" defer></script>
     <script src="js/progress_model.js?v=1.2.3" defer></script>
-    <script src="js/api_client.js?v=1.3.1" defer></script>
-    <script src="js/prompt_pipeline.js?v=1.2.2" defer></script>
+    <!-- 槽位状态模型（纯函数）与卡片渲染器：必须排在 api_client / media_renderer /
+         app.js 之前——那三处的槽位渲染全部转调这里。见 docs/spark_result_slots_plan.md -->
+    <script src="js/slot_model.js?v=1.0.0" defer></script>
+    <script src="js/slot_card.js?v=1.2.0" defer></script>
+    <script src="js/slot_toolbar.js?v=1.1.0" defer></script>
+    <script src="js/api_client.js?v=1.5.1" defer></script>
+    <script src="js/prompt_pipeline.js?v=1.2.5" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
-    <script src="js/media_renderer.js?v=1.3.1" defer></script>
-    <script src="app.js?v=1.3.24" defer></script>
+    <script src="js/media_renderer.js?v=1.6.0" defer></script>
+    <script src="app.js?v=1.3.32" defer></script>
     <script src="js/image_studio.js?v=1.0.4" defer></script>
     <script src="js/gallery.js?v=1.1.2" defer></script>
-    <script src="js/ledger.js?v=1.1.1" defer></script>
+    <script src="js/ledger.js?v=1.1.2" defer></script>
     <!-- 旧「移动端标签切换」内联脚本已删除：它指向早已不存在的 mobile-tab-left/right，
          MutationObserver 永远空转；自动切换结果面板改由 app.js 的 switchMainTab('results') 完成 -->
 

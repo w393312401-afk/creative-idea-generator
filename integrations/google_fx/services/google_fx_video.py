@@ -11,9 +11,15 @@ import re
 import requests
 from playwright.sync_api import sync_playwright
 
-from ..config import MAX_WAIT_SECONDS, OUTPUT_DIR, get_runtime_max_wait_seconds
+from ..config import (
+    MAX_WAIT_SECONDS,
+    OUTPUT_DIR,
+    get_runtime_default_user_id,
+    get_runtime_max_wait_seconds,
+)
 from ..models import VideoRequest
 from ..utils.logger import log
+from ..utils import account_binding
 from ..utils.browser import (
     random_sleep,
     clean_path,
@@ -1435,10 +1441,21 @@ def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=N
     successful = [r for r in results if r and isinstance(r, dict) and r.get("status") == "success" and r.get("video_url")]
     if successful:
         try:
-            current_uid = account_binding.resolve_account()
-            if current_uid:
+            current_uid = account_binding.resolve_account(
+                fallback=get_runtime_default_user_id()
+            )
+            if not current_uid:
+                log("⚠️ 视频已生成，但无法解析实际 AdsPower 账号，任务数未记录", "GoogleFX-Video")
+            else:
                 from ..utils.account_pool import AccountPool
-                AccountPool().record_task_count(current_uid, video_count=len(successful))
+                entry = AccountPool().record_task_count(
+                    current_uid, video_count=len(successful)
+                )
+                if entry is None:
+                    log(
+                        f"⚠️ 视频已生成，但账号 {current_uid} 不在账号池中，任务数未记录",
+                        "GoogleFX-Video",
+                    )
         except Exception as _e:
             log(f"⚠️ 记录账号视频任务数失败: {_e}", "GoogleFX-Video")
 

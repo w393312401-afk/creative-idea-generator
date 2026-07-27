@@ -15,6 +15,8 @@ from video_generator import (
     _video_info,
     _BatchBridge,
     _merge_skip_missing,
+    _normalize_merge_speed,
+    _merge_filter,
     merge_project_videos,
     PartialMergeBlocked,
     _select_pool_account,
@@ -520,6 +522,29 @@ class TestMergeSkipMissing(unittest.TestCase):
                         f"ffmpeg output arg must be absolute: {ffmpeg_cmd[-1]}")
         # 跳过模式不应再生成任何占位/字幕相关的临时文件
         self.assertFalse(any('_ph_' in c for call in captured['calls'] for c in call))
+
+    def test_applies_selected_1_5x_speed(self):
+        captured = {}
+        with patch('video_generator.subprocess.run', side_effect=self._fake_run(captured)):
+            result = _merge_skip_missing(
+                self.rel_project_dir, {'title': 'Test Project'},
+                expected_slots=[1, 2], good={1: self.good_video},
+                missing=[2], mismatched=[], speed=1.5)
+
+        ffmpeg_cmd = next(c for c in captured['calls'] if c[0] == 'ffmpeg')
+        filter_value = ffmpeg_cmd[ffmpeg_cmd.index('-filter_complex') + 1]
+        self.assertIn('setpts=0.6666666667*PTS', filter_value)
+        self.assertTrue(ffmpeg_cmd[-1].endswith('_partial_1_5x.mp4'))
+        self.assertEqual(result['speed'], 1.5)
+
+    def test_merge_speed_validation_and_filters(self):
+        self.assertEqual(_normalize_merge_speed('1'), 1.0)
+        self.assertEqual(_normalize_merge_speed(1.5), 1.5)
+        self.assertEqual(_normalize_merge_speed(2), 2.0)
+        self.assertEqual(_merge_filter(1.0, True),
+                         '[0:v]setpts=1*PTS[v];[0:a]atempo=1[a]')
+        with self.assertRaises(ValueError):
+            _normalize_merge_speed(3)
 
     def test_no_good_slots_returns_none(self):
         result = _merge_skip_missing(

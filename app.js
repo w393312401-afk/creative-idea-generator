@@ -107,6 +107,7 @@ document.addEventListener('DOMContentLoaded', () => {
     resumeActiveTaskIfExists();
     resumeActiveBackgroundTasksIfExists();
     startGlobalTasksBadgePolling();
+    initPacingSkeletonSelector();
     loadIdeationCards();
     initBeatOutlineModal();
     updateDrawerTopOffset();
@@ -1252,6 +1253,8 @@ function setupEventListeners() {
     document.getElementById('make-cover-btn').addEventListener('click', () => generateCover());
     document.getElementById('generate-frames-btn').addEventListener('click', () => generateFrames());
     document.getElementById('run-sequence-review-btn').addEventListener('click', () => runSequenceReview());
+    const deletedSlotsBtn = document.getElementById('deleted-slots-btn');
+    if (deletedSlotsBtn) deletedSlotsBtn.addEventListener('click', () => openDeletedSlotsPanel());
     document.getElementById('generate-videos-btn').addEventListener('click', () => generateVideos());
     document.getElementById('merge-videos-btn').addEventListener('click', () => mergeVideos());
     const copyHookBtn = document.getElementById('copy-hook-btn');
@@ -1926,10 +1929,23 @@ async function generateIdea(retryParams = null) {
             // 与卡片「一键合成」路径对齐：封面与英文标题一并带给后端（有则复用）
             cover_url: loadedIdea.cover_url || null,
             english_title: loadedIdea.english_title || null,
+            topic_dna: loadedIdea.topic_dna || null,
+            llm_score: loadedIdea.llm_score ?? null,
+            // 台账登记跟随真正的激发请求；仅浏览/载入灵感卡片不会入账。
+            ledger_candidate: {
+                dna: loadedIdea.topic_dna || null,
+                title: loadedIdea.task_label || null,
+                score: loadedIdea.llm_score ?? null,
+                creative_seed: loadedIdea.creative_seed || null
+            },
             // 联网参考案例库使用计次：与卡片「一键合成」路径对齐透传，让选中卡片载入维度
             // 后走主生成按钮的合成同样能在真正借鉴时计次（见 server.py /api/compose）
             trend_ref: loadedIdea.trend_ref || null,
             trend_ref_ids: loadedIdea.trend_ref_ids || [],
+            beat_outline: Array.isArray(loadedIdea.beat_outline)
+                ? loadedIdea.beat_outline.slice()
+                : [],
+            pacing_skeleton: loadedIdea.pacing_skeleton || 'linear_milestone',
             anchors: activeAnchors,
             complexity: document.getElementById('val-complexity').textContent,
             budget: document.getElementById('val-budget').textContent,
@@ -2310,50 +2326,19 @@ async function resumeActiveTaskIfExists() {
 
 /**
  * 把一个已生成的帧渲染进对应槽位卡片。
- * 事件重放/重连会对同一槽位重复触发，所以这里用 on* 赋值（幂等）而不是
- * addEventListener（旧实现每次事件都往同一元素堆叠一套新监听器）。
+ * 事件重放/重连会对同一槽位重复触发——renderSlotCard 是幂等的整格重画，
+ * 且卡片上不绑任何 click（点击走网格级委托，见 js/slot_card.js），
+ * 所以重复调用不会像旧实现那样往同一元素上堆叠监听器。
+ *
+ * 缓存版本已由 applyFrameEventToIdea（数据合并的唯一入口）在本次渲染前递增，
+ * renderSlotCard 内部用 bust=false 直接取到新版本号；两处各自 bust 会让同一
+ * 张新图被拉两次。
  */
 function updateFrameSlotCard(f) {
     if (!f) return;
-    const slot = document.getElementById(`frame-slot-${f.sequence}`);
-    if (!slot) return;
-    slot.className = 'frame-card';
-    slot.style.cursor = 'pointer';
-    slot.title = `打开第 ${f.sequence} 帧`;
-    slot.innerHTML = `
-        <img src="" alt="Frame ${f.sequence}" loading="lazy">
-        <div class="frame-card-actions" style="position: absolute; top: 5px; right: 5px; display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s;">
-            <button class="action-btn text-btn mini-btn retry-frame-btn" data-seq="${f.sequence}" style="background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.3); padding: 2px 6px; font-size: 10px;">重试</button>
-        </div>
-        <span>IMG ${String(f.sequence).padStart(3, '0')}</span>
-    `;
-    // 缓存版本已由 applyFrameEventToIdea（数据合并的唯一入口）在本次渲染前递增，
-    // 这里用 bust=false 直接取到新版本号；两处各自 bust 会让同一新图被拉两次。
-    safeSetImageSrc(slot.querySelector('img'), f.url, false);
-
-    slot.onmouseenter = () => {
-        const actions = slot.querySelector('.frame-card-actions');
-        if (actions) actions.style.opacity = '1';
-    };
-    slot.onmouseleave = () => {
-        const actions = slot.querySelector('.frame-card-actions');
-        if (actions) actions.style.opacity = '0';
-    };
-    slot.onclick = (e) => {
-        if (e.target.classList.contains('retry-frame-btn')) return;
-        const validFrames = (currentIdea && currentIdea.frameRun && currentIdea.frameRun.frames) || [];
-        const mediaList = validFrames.map((frame) => ({
-            type: 'image',
-            url: frame.url || frame.file,
-            caption: `<strong>第 ${frame.sequence} 帧 / 共 ${validFrames.length} 帧</strong>`
-        }));
-        const clickedIndex = validFrames.findIndex(frame => frame.sequence === f.sequence);
-        openLightbox(mediaList, clickedIndex >= 0 ? clickedIndex : 0);
-    };
-    slot.querySelector('.retry-frame-btn').addEventListener('click', (e) => {
-        e.stopPropagation();
-        retrySingleFrame(f.sequence);
-    });
+    const busy = typeof isIdeaTaskActive === 'function' && currentIdea
+        ? isIdeaTaskActive(currentIdea.id, 'frames') : false;
+    renderSlotById('image', f.sequence, frameSlotState(f, { seq: f.sequence, busy }));
 }
 
 /* ── 帧序列实时生成动态 ─────────────────────────────────────────────
@@ -2472,7 +2457,7 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
     const btn = document.getElementById('generate-frames-btn');
     const progress = document.getElementById('frames-progress');
     const meta = document.getElementById('frames-meta');
-    const grid = document.getElementById('frames-grid');
+    const grid = slotRenderTarget('image');
     if (!btn || !progress || !meta || !grid) return;
 
     // 同一个创意若已有一条帧序列监听在跑（理论上不该发生，generateFrames 已挡住），
@@ -2520,31 +2505,24 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                     applyFramesProgress('start', data);
                     const total = (data && data.total) || 0;
                     rec.total = total;
-                    setMeta(`开始生成共 ${total} 帧序列图...`);
+                    const startMeta = `开始生成共 ${total} 帧序列图...`;
+                    setMeta(startMeta);
                     framesFeedLine(ownerId, `🚀 开始生成，共 ${total} 帧（首帧文生图，后续逐帧图生图链式推进）`);
 
-                    if (!ownerIdea.frameRun) {
-                        ownerIdea.frameRun = { title: ownerIdea.title, frames: [] };
-                    }
-                    ownerIdea.frameRun.frames = [];
+                    // 编排层会在“首帧验收”和“剩余帧分段渲染”各发一次 start。
+                    // start 只代表内部阶段开始，不代表之前已经完成的帧作废；保留并
+                    // 重画现有 frameRun，确保 IMG 001 一生成就持续留在界面上。
+                    ensureFrameRunForStart(ownerIdea);
                     if (currentIdea && currentIdea.id === ownerId) saveCurrentIdeaState();
                     const existingIdx = savedIdeas.findIndex(item => item.id === ownerId);
                     if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = ownerIdea.frameRun;
 
                     if (isViewing()) {
-                        grid.innerHTML = '';
-                        for (let i = 1; i <= total; i++) {
-                            const placeholderCard = document.createElement('div');
-                            placeholderCard.className = 'frame-card placeholder-frame-card';
-                            placeholderCard.id = `frame-slot-${i}`;
-                            placeholderCard.innerHTML = `
-                                <div class="frame-placeholder-spinner">
-                                    <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-                                </div>
-                                <span>第 ${String(i).padStart(3, '0')} 帧 (等待中)</span>
-                            `;
-                            grid.appendChild(placeholderCard);
-                        }
+                        // renderFramesForIdea 按完整 prompt_slots 补齐等待槽位，同时保留
+                        // 已完成卡片；不能在这里 grid.innerHTML=''，否则重复 start 会
+                        // 把首帧重新画回“等待中”。该函数会改 meta，随后恢复阶段文案。
+                        renderFramesForIdea(ownerIdea);
+                        setMeta(startMeta);
                     }
                 } else if (type === 'frame') {
                     applyFramesProgress('frame', data);
@@ -2704,7 +2682,7 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
     const btn = document.getElementById('generate-videos-btn');
     const progress = document.getElementById('videos-progress');
     const meta = document.getElementById('videos-meta');
-    const grid = document.getElementById('videos-grid');
+    const grid = slotRenderTarget('video');
     if (!btn || !progress || !meta || !grid) return;
 
     const existingRec = getIdeaTaskRecord(ownerId, 'videos');
@@ -2761,14 +2739,17 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
                     rec.total = total;
                     setMeta(`开始生成共 ${total} 段视频...`);
                     if (isViewing()) {
-                        grid.innerHTML = '';
+                        clearSlotGrid(grid, 'video');
                         const slotsToRender = slots.length ? slots : Array.from({ length: total }, (_, i) => i + 1);
                         slotsToRender.forEach(slotIdx => {
                             const placeholderCard = document.createElement('div');
-                            placeholderCard.className = 'frame-card placeholder-frame-card';
                             placeholderCard.id = `video-slot-${slotIdx}`;
+                            // 生成期间新建的占位卡此前漏了这一步，导致整单跑完
+                            // 之前这些格子接不住拖拽（上传/换位）——补上
+                            enableVideoSlotDnd(placeholderCard, slotIdx);
+                            renderSlotCard(placeholderCard, slotPendingState('video', slotIdx, '等待中'));
+                            placeSlotCard(placeholderCard, 'video', slotIdx);
                             grid.appendChild(placeholderCard);
-                            renderVideoSlotPending(slotIdx, '等待中');
                         });
                     }
                 } else if (type === 'video_start') {
@@ -3474,7 +3455,7 @@ async function generateVideos() {
     const btn = document.getElementById('generate-videos-btn');
     const progress = document.getElementById('videos-progress');
     const meta = document.getElementById('videos-meta');
-    const grid = document.getElementById('videos-grid');
+    const grid = slotRenderTarget('video');
     if (!btn || !progress || !meta || !grid) return;
 
     const targetSlots = computeDebugTargets('videos', ownerIdea, 'video');
@@ -3491,7 +3472,8 @@ async function generateVideos() {
             title: getIdeaSaveTitle(ownerIdea),
             display_title: ownerIdea.title,
             prompt_block: ownerIdea.prompt_block,
-            override_flagged: reviewCheck.override
+            override_flagged: reviewCheck.override,
+            merge_speed: getMergeSpeed()
         };
         if (targetSlots) body.target_slots = targetSlots;
 
@@ -3517,31 +3499,25 @@ async function generateVideos() {
 
         if (isViewingIdea(ownerIdea.id)) {
             meta.textContent = `视频生成失败: ${e.message}`;
-            const placeholders = grid.querySelectorAll('.placeholder-frame-card');
-            placeholders.forEach(card => {
+            grid.querySelectorAll('.placeholder-frame-card').forEach(card => {
                 const slotMatch = card.id && card.id.match(/video-slot-(\d+)/);
-                const slotIdx = slotMatch ? parseInt(slotMatch[1]) : null;
-                if (slotIdx !== null) {
-                    card.className = 'frame-card video-failed-card';
-                    card.innerHTML = `
-                        <div class="video-failed-placeholder">
-                            <span class="error-icon">⚠️</span>
-                            <span class="error-text" title="${e.message || '生成失败'}">生成失败</span>
-                            <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${slotIdx}">重试</button>
-                        </div>
-                        <span>VID ${String(slotIdx).padStart(3, '0')}</span>
-                    `;
-                    card.querySelector('.retry-video-btn').addEventListener('click', (ev) => {
-                        ev.stopPropagation();
-                        retrySingleVideo(slotIdx);
-                    });
-                }
+                if (slotMatch) renderVideoSlotFailed(parseInt(slotMatch[1], 10), e.message);
             });
 
             progress.style.display = 'none';
             btn.disabled = false;
         }
     }
+}
+
+function getMergeSpeed() {
+    const select = document.getElementById('merge-speed-select');
+    const speed = Number(select && select.value);
+    return [1, 1.5, 2].includes(speed) ? speed : 2;
+}
+
+function mergeSpeedLabel(speed = getMergeSpeed()) {
+    return Number(speed) === 1 ? '无加速' : `${Number(speed)}倍速`;
 }
 
 async function mergeVideos(force = false) {
@@ -3555,6 +3531,8 @@ async function mergeVideos(force = false) {
     if (!mergeBtn || !videosMeta) return;
 
     const originalText = mergeBtn.innerHTML;
+    const speed = getMergeSpeed();
+    const speedLabel = mergeSpeedLabel(speed);
     mergeBtn.disabled = true;
     // 合并不走 ideaTasksById 登记，管线条的「成片 · 合并中…」只能靠这个标志位
     mergeInFlight = true;
@@ -3564,8 +3542,8 @@ async function mergeVideos(force = false) {
         <span>${force ? '正在跳过缺口合并中...' : '正在合并中...'}</span>
     `;
     videosMeta.textContent = force
-        ? "正在跳过缺失/串片片段并按2倍速合并，请稍候..."
-        : "正在调用 FFmpeg 合并并加速视频，此过程可能需要几秒钟，请稍候...";
+        ? `正在跳过缺失/串片片段并以${speedLabel}合并，请稍候...`
+        : `正在调用 FFmpeg 以${speedLabel}合并视频，此过程可能需要几秒钟，请稍候...`;
 
     try {
         const response = await fetch('/api/merge_videos', {
@@ -3573,7 +3551,8 @@ async function mergeVideos(force = false) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 title: getIdeaSaveTitle(currentIdea),
-                force: !!force
+                force: !!force,
+                speed
             })
         });
 
@@ -3605,13 +3584,14 @@ async function mergeVideos(force = false) {
             renderVideosForIdea(currentIdea);
 
             const mv = data.merged_video || {};
+            const mergedSpeedLabel = mergeSpeedLabel(mv.speed || speed);
             if (mv.partial) {
                 const slots = (mv.skipped_slots || []).join(', ');
-                showToast("已生成跳过缺口的合成片（2倍速）", "success");
-                videosMeta.innerHTML = `⚠️ 已合成：槽位 <b>${escapeHtml(slots)}</b> 因缺失/串片被跳过（该处为硬切），其余片段正常拼接、2倍速。建议重试这些片段后重新合并以获得完整成片。`;
+                showToast(`已生成跳过缺口的合成片（${mergedSpeedLabel}）`, "success");
+                videosMeta.innerHTML = `⚠️ 已合成：槽位 <b>${escapeHtml(slots)}</b> 因缺失/串片被跳过（该处为硬切），其余片段正常拼接、${mergedSpeedLabel}。建议重试这些片段后重新合并以获得完整成片。`;
             } else {
-                showToast("视频合并并加速成功！", "success");
-                videosMeta.textContent = "视频合并已完成！";
+                showToast(`视频合并成功（${mergedSpeedLabel}）！`, "success");
+                videosMeta.textContent = `视频合并已完成（${mergedSpeedLabel}）！`;
             }
         } else {
             throw new Error(data.message || '合并失败');
@@ -3631,7 +3611,7 @@ async function mergeVideos(force = false) {
 }
 
 // 合成被门禁拦截时，在 videos-meta 区域渲染可操作面板：
-//   ① 重试缺失/串片片段并自动重合   ② 跳过这些片段直接合并（2倍速）
+//   ① 重试缺失/串片片段并自动重合   ② 按当前所选速率跳过这些片段直接合并
 function renderMergeBlocked(data) {
     const videosMeta = document.getElementById('videos-meta');
     if (!videosMeta) return;
@@ -3649,7 +3629,7 @@ function renderMergeBlocked(data) {
             <div style="color:#f6c453; margin-bottom:8px;">⚠️ 已拦截合并（避免成片硬跳/串片）：${parts.join('；')}。</div>
             <div style="display:flex; gap:8px; flex-wrap:wrap;">
                 <button type="button" class="action-btn text-btn" id="merge-retry-missing-btn">🔁 重试这些片段并合并 (${all.length})</button>
-                <button type="button" class="action-btn text-btn" id="merge-force-btn">⚡ 跳过缺口合并（2倍速）</button>
+                <button type="button" class="action-btn text-btn" id="merge-force-btn">⚡ 跳过缺口合并（${escapeHtml(mergeSpeedLabel())}）</button>
             </div>
         </div>`;
 
@@ -3664,7 +3644,7 @@ function renderMergeBlocked(data) {
 
     const forceBtn = document.getElementById('merge-force-btn');
     if (forceBtn) forceBtn.addEventListener('click', async () => {
-        const ok = await customConfirm('将跳过缺失/串片的片段，把其余可用片段按原顺序直接拼接、2倍速合成（跳过处为硬切，不再用占位帧填充）。确定继续吗？');
+        const ok = await customConfirm(`将跳过缺失/串片的片段，把其余可用片段按原顺序直接拼接、以${mergeSpeedLabel()}合成（跳过处为硬切，不再用占位帧填充）。确定继续吗？`);
         if (ok) mergeVideos(true);
     });
 }
@@ -4239,27 +4219,91 @@ function updateActiveGenerationBanner() {
 // Upstream Topic Ideation Engine (P2)
 // --------------------------------------------------------------------------
 let currentIdeatedIdeas = [];
-// 缓存版本随「卡片上要展示的字段」一起变：3-beat-outline 起每条 idea 都带
-// beat_outline（节拍简介）。上一版缓存里的卡片没有这个字段，点「🔨 节拍简介」
-// 只会得到一句“没有节拍简介”——所以直接判过期，下次进页面重新激发一批。
-const IDEATION_CACHE_VERSION = '3-beat-outline';
+// 缓存版本随卡片输出契约变化：4 起每条 idea 除 beat_outline
+// 外还带 pacing_skeleton，旧缓存不能冒充成「已按骨架参考规划」的新卡。
+// v5 作废「只带骨架标签、未经内容验收」时期产出的旧卡：那些卡可能
+// 在仅勾 dual_payoff 时仍保存了单线 outline，服务端修好后也不能继续命中它们。
+const IDEATION_CACHE_VERSION = '5-pacing-skeleton-gated';
+const DEFAULT_PACING_SKELETON_IDS = ['linear_milestone', 'dual_payoff'];
 
-async function loadIdeationCards(force = false) {
+function getSelectedPacingSkeletonIds() {
+    const checked = Array.from(document.querySelectorAll('input[name="pacing-skeleton"]:checked'))
+        .map(el => String(el.value || '').trim())
+        .filter(id => DEFAULT_PACING_SKELETON_IDS.includes(id));
+    return checked.length > 0 ? checked : DEFAULT_PACING_SKELETON_IDS.slice();
+}
+
+function initPacingSkeletonSelector() {
+    const inputs = Array.from(document.querySelectorAll('input[name="pacing-skeleton"]'));
+    if (inputs.length === 0) return;
+
+    let stored = [];
+    try {
+        const parsed = JSON.parse(localStorage.getItem('ideation_pacing_skeleton_ids') || '[]');
+        if (Array.isArray(parsed)) {
+            stored = parsed.filter(id => DEFAULT_PACING_SKELETON_IDS.includes(id));
+        }
+    } catch (e) {
+        stored = [];
+    }
+    if (stored.length > 0) {
+        inputs.forEach(input => { input.checked = stored.includes(input.value); });
+    }
+
+    const updateNote = () => {
+        const selected = inputs.filter(input => input.checked);
+        const note = document.getElementById('pacing-skeleton-selected-note');
+        if (!note) return;
+        // 这行是骨架抽屉折叠态的唯一露出处，顺带点名启用了哪几套，
+        // 不用展开就知道下一批灵感按什么节奏规划
+        const names = (typeof pacingSkeletonLabel === 'function')
+            ? selected.map(item => pacingSkeletonLabel(item.value)).join(' / ')
+            : '';
+        note.textContent = names
+            ? `已启用 ${selected.length} 套 · ${names}`
+            : `已启用 ${selected.length} 套`;
+    };
+
+    inputs.forEach(input => input.addEventListener('change', () => {
+        let selected = inputs.filter(item => item.checked);
+        if (selected.length === 0) {
+            input.checked = true;
+            selected = [input];
+            showToast('至少保留一套推进节拍骨架', 'info');
+        }
+        const ids = selected.map(item => item.value);
+        localStorage.setItem('ideation_pacing_skeleton_ids', JSON.stringify(ids));
+        // 选择变了不立即发起昂贵的 LLM 请求；下次「换一批」/重载时
+        // 由缓存绑定键自动判旧批次过期。
+        updateNote();
+        updateConfigSummary();
+    }));
+    updateNote();
+}
+
+async function loadIdeationCards(force = false, options = {}) {
     const container = document.getElementById('ideation-cards-container');
     if (!container) return;
+    const remixSeed = options && options.remixSeed ? options.remixSeed : null;
 
     // 灵感推荐由联网参考案例库驱动（js/trend_refs.js）：勾选了参考就直接从选中
     // 案例取材；没勾选则后端自动联网搜索（结果沉淀回案例库）
-    const selIds = (typeof getSelectedTrendRefIds === 'function') ? getSelectedTrendRefIds() : [];
+    const selIds = remixSeed
+        ? []
+        : ((typeof getSelectedTrendRefIds === 'function') ? getSelectedTrendRefIds() : []);
     const selKey = selIds.slice().sort().join(',');
+    const pacingSkeletonIds = getSelectedPacingSkeletonIds();
+    const pacingSkeletonKey = pacingSkeletonIds.slice().sort().join(',');
 
-    if (!force) {
+    if (!force && !remixSeed) {
         const cached = localStorage.getItem('ideation_cached_ideas');
         // 缓存与生成时勾选的联网参考集合绑定：勾选变了缓存即视为过期重新生成，
         // 不能把按别的参考取材的灵感当成这批参考的
         const cachedSel = localStorage.getItem('ideation_cached_trend_sel');
+        const cachedSkeletons = localStorage.getItem('ideation_cached_pacing_skeletons');
         const cachedVersion = localStorage.getItem('ideation_cache_version');
-        if (cached && cachedSel === selKey && cachedVersion === IDEATION_CACHE_VERSION) {
+        if (cached && cachedSel === selKey && cachedSkeletons === pacingSkeletonKey
+                && cachedVersion === IDEATION_CACHE_VERSION) {
             try {
                 const parsed = JSON.parse(cached);
                 if (parsed && Array.isArray(parsed) && parsed.length > 0) {
@@ -4278,9 +4322,15 @@ async function loadIdeationCards(force = false) {
         }
     }
 
-    container.innerHTML = selIds.length > 0
-        ? `<div class="ideation-loading">正在从选中的 ${selIds.length} 条联网参考案例中取材激发灵感，请稍候...</div>`
-        : `<div class="ideation-loading">正在从案例库自动挑选参考激发灵感中，请稍候...</div>`;
+    // 激发中不再把整块卡片区清空成一行文案：上一批还能看、还能点（选中态也留着），
+    // 进度与秒表由激发轨的 ② 芯片承担（见 js/spark_rail.js）。空库时才铺骨架占位。
+    const pendingMsg = remixSeed
+        ? `正在以「${remixSeed.one_line || remixSeed.topic_dna || '台账创意'}」为母题激发二创方案`
+        : selIds.length > 0
+        ? `正在从选中的 ${selIds.length} 条联网参考案例中取材激发灵感`
+        : `正在从案例库自动挑选参考激发灵感中`;
+    renderIdeationPending(container, pendingMsg);
+    if (typeof setSparkIdeating === 'function') setSparkIdeating(true);
 
     try {
         const response = await fetch('/api/ideate', {
@@ -4291,7 +4341,9 @@ async function loadIdeationCards(force = false) {
             body: JSON.stringify({
                 config: config,
                 count: 4,
-                trend_ref_ids: selIds
+                trend_ref_ids: selIds,
+                pacing_skeleton_ids: pacingSkeletonIds,
+                remix_seed: remixSeed
             })
         });
 
@@ -4299,10 +4351,13 @@ async function loadIdeationCards(force = false) {
         if (data.status === 'ok' && data.ideas) {
             currentIdeatedIdeas = data.ideas;
             currentIdeationTrendRefs = Array.isArray(data.trend_refs) ? data.trend_refs : [];
-            localStorage.setItem('ideation_cached_ideas', JSON.stringify(data.ideas));
-            localStorage.setItem('ideation_cached_trend_refs', JSON.stringify(currentIdeationTrendRefs));
-            localStorage.setItem('ideation_cached_trend_sel', selKey);
-            localStorage.setItem('ideation_cache_version', IDEATION_CACHE_VERSION);
+            if (!remixSeed) {
+                localStorage.setItem('ideation_cached_ideas', JSON.stringify(data.ideas));
+                localStorage.setItem('ideation_cached_trend_refs', JSON.stringify(currentIdeationTrendRefs));
+                localStorage.setItem('ideation_cached_trend_sel', selKey);
+                localStorage.setItem('ideation_cached_pacing_skeletons', pacingSkeletonKey);
+                localStorage.setItem('ideation_cache_version', IDEATION_CACHE_VERSION);
+            }
             renderIdeationCards(data.ideas);
             // 无论走哪条来源分支，used_count 都可能变化、命中自动归档阈值的条目会从
             // 主库消失，每次生成后都要刷新左侧列表，避免残留已归档条目可勾选
@@ -4313,7 +4368,34 @@ async function loadIdeationCards(force = false) {
     } catch (e) {
         console.error("Failed to load ideated cards:", e);
         container.innerHTML = `<div class="ideation-error">加载失败，请检查网络或配置</div>`;
+    } finally {
+        if (typeof setSparkIdeating === 'function') setSparkIdeating(false);
     }
+}
+
+// 激发中的卡片区占位：已有卡片就原样留着（只加 .is-ideating 让它整体后退一层），
+// 一张都没有时铺 4 张骨架卡，避免"点了按钮页面一片空白"。
+function renderIdeationPending(container, message) {
+    if (!container) return;
+    const keepOld = !!container.querySelector('.ideation-card');
+    const text = keepOld ? `${message}…（下方是上一批，仍可点选）` : `${message}…`;
+
+    let strip = container.querySelector('.ideation-pending-strip');
+    if (!keepOld) {
+        container.innerHTML = '';
+        strip = null;
+        for (let i = 0; i < 4; i++) {
+            const sk = document.createElement('div');
+            sk.className = 'ideation-card-skeleton';
+            container.appendChild(sk);
+        }
+    }
+    if (!strip) {
+        strip = document.createElement('div');
+        strip.className = 'ideation-pending-strip';
+        container.insertBefore(strip, container.firstChild);
+    }
+    strip.textContent = text;
 }
 
 // Function renderIdeationCards moved to modular JS file

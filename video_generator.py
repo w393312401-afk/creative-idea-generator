@@ -864,23 +864,26 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
 
         def _run_leg(items, account_id):
             """跑一条腿：绑定这一腿的号池账号，再交给批量脚本。返回 bridge。"""
-            if account_id:
-                config['googleFxUserId'] = account_id
+            actual_account_id = account_id or pool_account_id or config.get('googleFxUserId')
+            if actual_account_id:
+                config['googleFxUserId'] = actual_account_id
                 apply_google_fx_runtime_overrides(config)
             leg_bridge = _BatchBridge(items, len(plans), video_model, writer, on_progress,
                                       strict=strict_gates_enabled(config),
                                       process_check_fn=_process_gate,
                                       account_pool=account_pool,
-                                      pool_account_id=(account_id or pool_account_id) if pool_account_id else None)
-            try:
-                google_fx_video.generate_videos_batch_google_fx(
-                    [it['req'] for it in items],
-                    on_progress=leg_bridge,
-                    cancel_check=cancel_check_cb
-                )
-            finally:
-                for it in items:
-                    shutil.rmtree(it['temp_out_dir'], ignore_errors=True)
+                                      pool_account_id=actual_account_id)
+            from integrations.google_fx.utils import account_binding
+            with account_binding.bound_task_account(actual_account_id):
+                try:
+                    google_fx_video.generate_videos_batch_google_fx(
+                        [it['req'] for it in items],
+                        on_progress=leg_bridge,
+                        cancel_check=cancel_check_cb
+                    )
+                finally:
+                    for it in items:
+                        shutil.rmtree(it['temp_out_dir'], ignore_errors=True)
             return leg_bridge
 
         # 换号（不换 IP）：号池自动选号且可用账号 ≥2 个时才切腿，否则退化为单批次
@@ -972,7 +975,7 @@ class PartialMergeBlocked(RuntimeError):
             parts.append(f"缺失/失败片段（槽位 {', '.join(map(str, self.missing))}）")
         if self.mismatched:
             parts.append(f"内容与锚点不符、疑似串片（槽位 {', '.join(map(str, self.mismatched))}）")
-        return "存在" + "；".join(parts) + "，已拒绝合并。请重试这些片段，或选择「跳过缺口合并（2倍速）」。"
+        return "存在" + "；".join(parts) + "，已拒绝合并。请重试这些片段，或选择「跳过缺口合并」。"
 
 
 def _ffprobe_video_params(path):
@@ -1026,7 +1029,30 @@ def _project_display_name(title):
     return chinese_name
 
 
-def merge_project_videos(project_dir, allow_partial=False):
+def _normalize_merge_speed(speed):
+    """只接受 UI 暴露的合并速率，避免任意值进入 FFmpeg filter。"""
+    try:
+        value = float(speed)
+    except (TypeError, ValueError):
+        value = 2.0
+    if value not in (1.0, 1.5, 2.0):
+        raise ValueError("视频合并速率仅支持 1、1.5 或 2 倍")
+    return value
+
+
+def _merge_speed_slug(speed):
+    return '1_5x' if speed == 1.5 else f'{int(speed)}x'
+
+
+def _merge_filter(speed, has_audio):
+    pts_factor = 1.0 / speed
+    video_filter = f'[0:v]setpts={pts_factor:.10g}*PTS[v]'
+    if has_audio:
+        return f'{video_filter};[0:a]atempo={speed:g}[a]'
+    return video_filter
+
+
+def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
     """合并项目内全部视频片段。
 
     2026-07-04 复盘：之前失败/缺失的槽位会被静默跳过（loft 任务缺 6、7 两段仍合出了
@@ -1035,6 +1061,7 @@ def merge_project_videos(project_dir, allow_partial=False):
     2) 锚点一致性 —— 每段首尾帧须与对应锚点图匹配，不匹配即拒绝合并。
     allow_partial=True 时跳过两道门禁（用户显式确认后强制合并）。
     """
+    speed = _normalize_merge_speed(speed)
     manifest_path = os.path.join(project_dir, 'manifest.json')
     if not os.path.exists(manifest_path):
         return None
@@ -1147,7 +1174,7 @@ def merge_project_videos(project_dir, allow_partial=False):
     # 具体缺了哪些槽位，不是背地里丢弃）
     if allow_partial and (missing or mismatched):
         return _merge_skip_missing(
-            project_dir, manifest_data, expected_slots, good, missing, mismatched,
+            project_dir, manifest_data, expected_slots, good, missing, mismatched, speed=speed,
         )
 
     # 无缺口/无串片：走原有干净合并路径
@@ -1193,7 +1220,7 @@ def merge_project_videos(project_dir, allow_partial=False):
     if not chinese_name:
         chinese_name = _safe_project_name(title)
         
-    output_filename = f"{chinese_name}_2x.mp4"
+    output_filename = f"{chinese_name}_{_merge_speed_slug(speed)}.mp4"
     output_path = os.path.join(project_dir, output_filename)
 
     # Clean up any old merged files in the project root to prevent duplicate files
@@ -1235,14 +1262,14 @@ def merge_project_videos(project_dir, allow_partial=False):
     
     if has_audio:
         cmd.extend([
-            "-filter_complex", "[0:v]setpts=0.5*PTS[v];[0:a]atempo=2.0[a]",
+            "-filter_complex", _merge_filter(speed, True),
             "-map", "[v]",
             "-map", "[a]",
             "-c:a", "aac"
         ])
     else:
         cmd.extend([
-            "-filter_complex", "[0:v]setpts=0.5*PTS[v]",
+            "-filter_complex", _merge_filter(speed, False),
             "-map", "[v]"
         ])
         
@@ -1252,7 +1279,7 @@ def merge_project_videos(project_dir, allow_partial=False):
         output_path
     ])
     
-    print(f"[INFO] Merging {len(video_files)} videos to {output_path} (has_audio={has_audio})...")
+    print(f"[INFO] Merging {len(video_files)} videos to {output_path} (speed={speed:g}x, has_audio={has_audio})...")
     # encoding must be explicit: ffmpeg emits UTF-8, but Windows text-mode default is GBK,
     # which crashes the subprocess stderr reader thread mid-merge
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -1286,6 +1313,7 @@ def merge_project_videos(project_dir, allow_partial=False):
             'url': '/' + rel_path,
             'size_bytes': file_size,
             'duration_seconds': round(duration, 2),
+            'speed': speed,
             'status': 'success'
         }
     else:
@@ -1293,12 +1321,13 @@ def merge_project_videos(project_dir, allow_partial=False):
         raise RuntimeError(f"FFmpeg merge failed: {res.stderr}")
 
 
-def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missing, mismatched):
+def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missing, mismatched, speed=2.0):
     """强制合并（allow_partial）：2026-07-22 改版——不再用起始锚点帧定格+「缺失」标注
     填充缺口（占位预览这套 filter_complex/drawtext 太重，且冻结帧撑时长的观感也不好），
-    直接跳过缺失/串片的槽位，把仍然可用的片段按原顺序拼接、2x 加速，跳过处是硬切。
+    直接跳过缺失/串片的槽位，把仍然可用的片段按原顺序和所选速率拼接，跳过处是硬切。
     不是背地里丢弃缺口——门禁提示里用户已经看到具体缺了哪些槽位，这里把 skipped_slots
     带回给调用方展示，只是不再用假帧撑时长。"""
+    speed = _normalize_merge_speed(speed)
     base_dir = os.path.dirname(os.path.abspath(__file__))
     video_files = [good[s] for s in expected_slots if s in good]
     if not video_files:
@@ -1315,7 +1344,8 @@ def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missin
     # 绝对路径：见 2026-07-22 的踩坑记录——project_dir 本身是相对路径（server_common.
     # OUTPUT_ROOT='outputs'），若 output_path 沿用相对拼接，一旦后续改动又把 ffmpeg 子
     # 进程的 cwd 切到 project_dir，就会被当成"project_dir 下再嵌一层 project_dir"解析。
-    output_path = os.path.abspath(os.path.join(project_dir, f"{chinese_name}_partial_2x.mp4"))
+    output_path = os.path.abspath(os.path.join(
+        project_dir, f"{chinese_name}_partial_{_merge_speed_slug(speed)}.mp4"))
 
     # 清理项目根下旧 mp4（保持单一成片）
     for fname in os.listdir(project_dir):
@@ -1337,13 +1367,13 @@ def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missin
 
     cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path]
     if has_audio:
-        cmd += ["-filter_complex", "[0:v]setpts=0.5*PTS[v];[0:a]atempo=2.0[a]",
+        cmd += ["-filter_complex", _merge_filter(speed, True),
                 "-map", "[v]", "-map", "[a]", "-c:a", "aac"]
     else:
-        cmd += ["-filter_complex", "[0:v]setpts=0.5*PTS[v]", "-map", "[v]"]
+        cmd += ["-filter_complex", _merge_filter(speed, False), "-map", "[v]"]
     cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", output_path]
 
-    print(f"[INFO] Skip-merge: {len(video_files)} segments, skipped {skipped_slots} -> {output_path}")
+    print(f"[INFO] Skip-merge: {len(video_files)} segments, skipped {skipped_slots}, speed={speed:g}x -> {output_path}")
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, encoding='utf-8', errors='replace')
     try:
@@ -1371,6 +1401,7 @@ def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missin
         'url': '/' + rel_path,
         'size_bytes': os.path.getsize(output_path),
         'duration_seconds': round(duration, 2),
+        'speed': speed,
         'status': 'success',
         'partial': True,
         'skipped_slots': skipped_slots,

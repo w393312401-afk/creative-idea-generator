@@ -42,7 +42,11 @@ tasks.json
 scratch/
 scratch_*
 
+# ── 一次性事故恢复留底(整份 manifest/创意库/媒体快照,体积大且是用户内容)──
+.recovery/
+
 # ── 工具 / 编辑器目录 ──
 .claude/
 .gemini/
 .pytest_cache/
+.DS_Store

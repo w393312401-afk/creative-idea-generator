@@ -19,6 +19,7 @@ utils/account_pool.switch_to_next_account 的旧注释）。这是进程级副�
 4. 进程默认值（ADSPOWER_DEFAULT_USER_ID / config.DEFAULT_USER_ID）。
 """
 
+import contextlib
 import contextvars
 
 _TASK_ACCOUNT = contextvars.ContextVar("google_fx_task_account", default=None)
@@ -37,6 +38,21 @@ def reset_task_account(token):
     except (ValueError, LookupError):
         # token 来自别的上下文（跨线程传递）时忽略：绑定本身随上下文一起消失。
         pass
+
+
+@contextlib.contextmanager
+def bound_task_account(user_id):
+    """在一个生成批次内绑定实际 AdsPower 账号，并在结束后可靠还原。
+
+    视频/图片链会把一项大任务拆成多个账号腿；只修改进程环境变量既会串任务，
+    也无法让批次结束时的计数知道本腿实际用了谁。这个作用域把账号归属限制在
+    当前同步执行上下文中，异常、取消或正常返回都会还原上一层绑定。
+    """
+    token = set_task_account(user_id)
+    try:
+        yield current_task_account()
+    finally:
+        reset_task_account(token)
 
 
 def current_task_account():

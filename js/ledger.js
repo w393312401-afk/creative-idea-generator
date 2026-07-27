@@ -23,7 +23,7 @@ const LEDGER_STATUS_LABELS = { candidate: '候选', used: '已用', published: '
 
 function ledgerTabEntered() {
     // 台账体量小（纯 JSON），不像画廊要扫描文件系统——每次进入都重新拉取，
-    // 这样从激发卡片"存入备选"后立刻切回本页也能看到最新数据
+    // 这样某条创意启动激发后立刻切回本页也能看到最新数据
     if (!ledgerLoading) refreshLedger();
 }
 
@@ -130,7 +130,7 @@ function renderLedger() {
     if (!rows.length) {
         container.innerHTML = ledgerData.length
             ? '<div class="ledger-status">🗂️ 这个分类下暂时没有匹配的条目</div>'
-            : '<div class="ledger-status">📒 台账还是空的——从激发卡片点「存入备选」开始积累</div>';
+            : '<div class="ledger-status">📒 台账还是空的——真正启动激发的创意会自动收录到这里</div>';
         ledgerUpdateBulkBar();
         return;
     }
@@ -175,6 +175,7 @@ function renderLedger() {
                 </td>
                 <td class="l-col-source" title="${escapeHtml(r.source || '')}">${escapeHtml(r.source || '')}</td>
                 <td class="l-col-actions">
+                    <button type="button" class="ledger-tool-btn small l-remix-btn" title="以这条创意为母题激发一批二创方案">♻️ 二创</button>
                     <button type="button" class="ledger-tool-btn small danger l-delete-btn" title="删除本条">🗑️</button>
                 </td>
             </tr>`).join('')}
@@ -286,6 +287,13 @@ function initLedger() {
             ledgerUpdateBulkBar();
             return;
         }
+        if (e.target.closest('.l-remix-btn')) {
+            const tr = e.target.closest('tr[data-id]');
+            const row = tr && ledgerFindRow(tr.dataset.id);
+            if (!row) return;
+            startLedgerRemix(row);
+            return;
+        }
         if (e.target.closest('.l-delete-btn')) {
             const tr = e.target.closest('tr[data-id]');
             const row = tr && ledgerFindRow(tr.dataset.id);
@@ -293,6 +301,17 @@ function initLedger() {
             ledgerDeleteIds([row.id], `「${row.one_line || row.topic_dna}」这条台账记录`);
         }
     });
+}
+
+async function startLedgerRemix(row) {
+    if (typeof loadIdeationCards !== 'function' || typeof switchMainTab !== 'function') {
+        showToast('二创工作区尚未加载完成，请稍后重试', 'error');
+        return;
+    }
+    switchMainTab('config');
+    showToast(`正在以「${row.one_line || row.topic_dna || '该创意'}」为母题激发二创方案`, 'info');
+    await loadIdeationCards(true, { remixSeed: row });
+    document.getElementById('ideation-cards-container')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 // 按 id 列表删除（单条删除按钮 / 批量删除所选都走这里），命中服务端专用的

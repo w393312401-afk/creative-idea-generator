@@ -14,12 +14,17 @@ from collections import deque
 import requests
 from playwright.sync_api import sync_playwright
 
-from ..config import MAX_WAIT_SECONDS, OUTPUT_DIR, get_runtime_max_wait_seconds
+from ..config import (
+    MAX_WAIT_SECONDS,
+    OUTPUT_DIR,
+    get_runtime_default_user_id,
+    get_runtime_max_wait_seconds,
+)
 from ..models import ImageBatchRequest
 from ..utils.logger import log
 from ..utils.browser import random_sleep, clean_path
 from ..utils.ui_helpers import inject_batch_image_observer
-from ..utils import cancel_flag
+from ..utils import account_binding, cancel_flag
 
 # L1 DOM 原语
 from .google_fx_dom import _click_first_visible, _find_first_visible, _safe_press_escape
@@ -741,10 +746,21 @@ def _generate_images_batch_google_fx_unlocked(req: ImageBatchRequest):
                 images = result.get("image_urls") or []
                 if images:
                     try:
-                        current_uid = account_binding.resolve_account()
-                        if current_uid:
+                        current_uid = account_binding.resolve_account(
+                            fallback=get_runtime_default_user_id()
+                        )
+                        if not current_uid:
+                            log("⚠️ 图片已生成，但无法解析实际 AdsPower 账号，任务数未记录", "GoogleFX")
+                        else:
                             from ..utils.account_pool import AccountPool
-                            AccountPool().record_task_count(current_uid, image_count=len(images))
+                            entry = AccountPool().record_task_count(
+                                current_uid, image_count=len(images)
+                            )
+                            if entry is None:
+                                log(
+                                    f"⚠️ 图片已生成，但账号 {current_uid} 不在账号池中，任务数未记录",
+                                    "GoogleFX",
+                                )
                     except Exception as _e:
                         log(f"⚠️ 记录账号图片任务数失败: {_e}", "GoogleFX")
                 return result
@@ -778,5 +794,3 @@ def _generate_images_batch_google_fx_unlocked(req: ImageBatchRequest):
 
     log(f"❌ 图片生成在 {max_retries} 次尝试后全部失败。", "GoogleFX")
     return {"status": "failed", "image_urls": [], "message": f"All attempts failed. Last error: {last_err}"}
-
-

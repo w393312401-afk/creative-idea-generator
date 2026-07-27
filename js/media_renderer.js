@@ -287,7 +287,7 @@ function hydrateVideosPanel(idea) {
     const btn = document.getElementById('generate-videos-btn');
     const progress = document.getElementById('videos-progress');
     const meta = document.getElementById('videos-meta');
-    const grid = document.getElementById('videos-grid');
+    const grid = slotRenderTarget('video');
     renderVideosForIdea(idea);
     if (rec) {
         if (btn) btn.disabled = true;
@@ -299,11 +299,11 @@ function hydrateVideosPanel(idea) {
             for (let i = 1; i <= rec.total; i++) {
                 if (!document.getElementById(`video-slot-${i}`)) {
                     const placeholderCard = document.createElement('div');
-                    placeholderCard.className = 'frame-card placeholder-frame-card';
                     placeholderCard.id = `video-slot-${i}`;
-                    enableVideoSlotDnd(placeholderCard, i, false);
+                    enableVideoSlotDnd(placeholderCard, i);
+                    renderSlotCard(placeholderCard, slotPendingState('video', i, '等待中'));
+                    placeSlotCard(placeholderCard, 'video', i);
                     grid.appendChild(placeholderCard);
-                    if (typeof renderVideoSlotPending === 'function') renderVideoSlotPending(i, '等待中');
                 }
             }
         }
@@ -404,23 +404,25 @@ function bindDropZone(card, { accepts, hint, onDrop }) {
     });
 }
 
-function enableVideoSlotDnd(card, slotNum, hasVideo) {
+// 拖拽监听绑在卡片元素本身、只绑一次，之后 renderSlotCard 反复重写 innerHTML
+// 都不会冲掉它。「这一格现在有没有内容」不再是绑定时刻的入参（旧实现按当时
+// 有没有视频决定 draggable，重渲后就失灵了），改为每次渲染由 renderSlotCard
+// 写进 card.draggable / card.dataset.url，拖拽时现读。
+function enableVideoSlotDnd(card, slotNum) {
     if (!card || !Number.isFinite(Number(slotNum))) return;
+    if (card.dataset.dndBound === '1') return;
+    card.dataset.dndBound = '1';
     const slot = Number(slotNum);
 
-    // 拖出：只有真的有视频的槽位才能当换位的源
-    if (hasVideo) {
-        card.draggable = true;
-        card.addEventListener('dragstart', (e) => {
-            if (!e.dataTransfer) return;
-            e.dataTransfer.effectAllowed = 'copyMove';
-            e.dataTransfer.setData(VIDEO_SLOT_DND_MIME, String(slot));
-            // text/plain 兜底：个别浏览器对自定义 MIME 支持不全
-            e.dataTransfer.setData('text/plain', `vid-slot:${slot}`);
-            card.classList.add('dnd-dragging');
-        });
-        card.addEventListener('dragend', () => card.classList.remove('dnd-dragging'));
-    }
+    card.addEventListener('dragstart', (e) => {
+        if (!e.dataTransfer || !card.dataset.url) return;
+        e.dataTransfer.effectAllowed = 'copyMove';
+        e.dataTransfer.setData(VIDEO_SLOT_DND_MIME, String(slot));
+        // text/plain 兜底：个别浏览器对自定义 MIME 支持不全
+        e.dataTransfer.setData('text/plain', `vid-slot:${slot}`);
+        card.classList.add('dnd-dragging');
+    });
+    card.addEventListener('dragend', () => card.classList.remove('dnd-dragging'));
 
     bindDropZone(card, {
         accepts: (e) => dndHasFiles(e) || dndHasVideoSlot(e),
@@ -448,29 +450,28 @@ function enableVideoSlotDnd(card, slotNum, hasVideo) {
     });
 }
 
-function enableFrameSlotDnd(card, seq, frame) {
+function enableFrameSlotDnd(card, seq) {
     if (!card || !Number.isFinite(Number(seq))) return;
+    if (card.dataset.dndBound === '1') return;
+    card.dataset.dndBound = '1';
     const sequence = Number(seq);
-    const imgUrl = frame && (frame.url || frame.file);
 
     // 拖出：有图的帧格既能拖到别的格子换位，也能直接拖到 Finder/桌面导出这张图
     // （DownloadURL 是 Chromium 系的扩展，其它浏览器忽略它、换位照常工作）。
-    if (imgUrl) {
-        card.draggable = true;
-        card.addEventListener('dragstart', (e) => {
-            if (!e.dataTransfer) return;
-            e.dataTransfer.effectAllowed = 'copyMove';
-            e.dataTransfer.setData(FRAME_SLOT_DND_MIME, String(sequence));
-            e.dataTransfer.setData('text/plain', `img-slot:${sequence}`);
-            try {
-                const abs = new URL(imgUrl, window.location.href).href;
-                e.dataTransfer.setData('DownloadURL',
-                    `image/webp:img_${String(sequence).padStart(3, '0')}.webp:${abs}`);
-            } catch (err) { /* 导出是附赠能力，拼不出绝对地址就算了 */ }
-            card.classList.add('dnd-dragging');
-        });
-        card.addEventListener('dragend', () => card.classList.remove('dnd-dragging'));
-    }
+    card.addEventListener('dragstart', (e) => {
+        const imgUrl = card.dataset.url;
+        if (!e.dataTransfer || !imgUrl) return;
+        e.dataTransfer.effectAllowed = 'copyMove';
+        e.dataTransfer.setData(FRAME_SLOT_DND_MIME, String(sequence));
+        e.dataTransfer.setData('text/plain', `img-slot:${sequence}`);
+        try {
+            const abs = new URL(imgUrl, window.location.href).href;
+            e.dataTransfer.setData('DownloadURL',
+                `image/webp:img_${String(sequence).padStart(3, '0')}.webp:${abs}`);
+        } catch (err) { /* 导出是附赠能力，拼不出绝对地址就算了 */ }
+        card.classList.add('dnd-dragging');
+    });
+    card.addEventListener('dragend', () => card.classList.remove('dnd-dragging'));
 
     bindDropZone(card, {
         accepts: (e) => dndHasFiles(e) || dndHasFrameSlot(e),
@@ -513,49 +514,10 @@ function isImageFileLike(file) {
     return /\.(png|jpe?g|webp|bmp|gif)$/i.test(file.name || '');
 }
 
-// 把一张帧卡片置为「未生成/已失效」占位态。除了正常的缺帧渲染，也用于
-// img 加载失败（onerror）——磁盘文件已被删除但本地清单还没同步时，别让
-// 卡片继续挂着一张死图/浏览器缓存里的旧图。
-// busy=true 时该创意的帧序列任务正在跑（同一浏览器会话有串行锁，同时只能
-// 有一个渲染在飞）——按钮画成禁用态，而不是让用户点了才弹"已在生成中"的
-// 错误提示（2026-07-21 用户实机复现：依次点生成按钮，除第一个外全部报错，
-// 根因是这些按钮从未随任务状态被禁用过）。
-function markFrameCardMissing(card, seq, busy) {
-    card.className = 'frame-card video-failed-card';
-    card.style.cursor = 'default';
-    card.dataset.missing = '1'; // 已绑定的 lightbox 点击回调据此短路
-    card.innerHTML = `
-        <div class="video-failed-placeholder">
-            <span class="error-icon">⚠️</span>
-            <span class="error-text" style="font-size: 11px; color: var(--text-secondary);">未生成/已失效</span>
-            <div style="display:flex; gap:4px;">
-                <button class="action-btn text-btn mini-btn retry-frame-btn" data-seq="${seq}"${busy ? ' disabled' : ''}>生成</button>
-                <button class="action-btn text-btn mini-btn secondary delete-slot-btn" data-seq="${seq}"${busy ? ' disabled' : ''}>删除</button>
-            </div>
-        </div>
-        <span>IMG ${String(seq).padStart(3, '0')}</span>
-    `;
-    const delBtn = card.querySelector('.delete-slot-btn');
-    delBtn.title = busy ? '该创意的帧序列正在生成/重试中，请稍候'
-                        : '删除这一整拍：图片与视频提示词、文件一并删除，其后整体前移一位';
-    delBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        deleteSlotBeat(seq);
-    });
-    const btn = card.querySelector('.retry-frame-btn');
-    // 监听器必须无条件绑定——disabled 属性本身已经在 busy 时挡掉点击，
-    // 若把绑定也塞进 `if (!busy)`，之后 setFrameGridButtonsBusy(false) 只是
-    // 摘掉 disabled 属性，从未补绑监听器，按钮会变成"看着能点、点了没反应"的死按钮
-    // （2026-07-22 用户实机复现：连续手动生成帧序列，第 2 帧起点击无响应）。
-    btn.title = busy ? '该创意的帧序列正在生成/重试中，请稍候' : '';
-    btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        retrySingleFrame(seq);
-    });
-}
-
 function renderFramesForIdea(idea) {
-    const grid = document.getElementById('frames-grid');
+    // 容器由 slotRenderTarget 决定：合并视图（一拍一列）下两类卡片共用
+    // #beats-grid，拆分视图下各回各的网格。见 js/slot_toolbar.js。
+    const grid = slotRenderTarget('image');
     const meta = document.getElementById('frames-meta');
     if (!grid || !meta) return;
 
@@ -565,7 +527,7 @@ function renderFramesForIdea(idea) {
 
     const frameRun = idea && idea.frameRun;
     const frames = (frameRun && frameRun.frames) || [];
-    grid.innerHTML = '';
+    clearSlotGrid(grid, 'image');
 
     // If there are no frames, and no prompt_block, show empty
     if (!frames.length && (!idea || !idea.prompt_block)) {
@@ -610,249 +572,77 @@ function renderFramesForIdea(idea) {
             frame: f
           }));
 
+    // 该创意的帧序列任务正在跑时，哪些槽位算"还没轮到"：单帧重试的任务记录带
+    // targetSequences（如 [3]），此时其余槽位服务端压根没碰，画"等待中"会让人
+    // 误以为整套序列正在自动续渲（2026-07-20 实机截图复现：重试 IMG 003 时
+    // 004-012 全部显示等待中，但 server.log 证实那次任务子集只有 [3]）。
+    // targetSequences 为空/未设置＝整单任务，范围覆盖全部。
+    const framesRec = (typeof getIdeaTaskRecord === 'function' && idea)
+        ? getIdeaTaskRecord(idea.id, 'frames') : null;
+    const isFramePending = (seq) =>
+        !!(framesRec && (!framesRec.targetSequences || framesRec.targetSequences.includes(seq)));
+
     itemsToRender.forEach(item => {
         const seq = item.sequence;
-        const frame = item.frame;
-        
         const card = document.createElement('div');
         card.id = `frame-slot-${seq}`;
-        // 任何形态的帧卡片（已出图/等待中/未生成）都能接住拖进来的本地图片与别的帧格；
-        // 监听绑在卡片元素本身，后续各分支只改写 innerHTML，不会把它冲掉。
-        enableFrameSlotDnd(card, seq, frame);
-
-        const hasImage = frame && (frame.url || frame.file);
-        
-        if (hasImage) {
-            const isDegraded = frame.quality_gate === 'i2i_fallback_degraded';
-            // 'vlm_qa_failed' 是旧逐帧质检门的终态，逐帧质检门已停用，仅为兼容展示旧 manifest 保留；
-            // 'sequence_review_flagged' 是新的整套序列一致性审查修复轮次耗尽仍有问题的终态
-            const isVlmFailed = frame.quality_gate === 'vlm_qa_failed' || frame.quality_gate === 'sequence_review_flagged';
-            // 人工主动描述的问题（见 describeFrameIssue）：与机器判定分开存放在
-            // manual_issue，可以在没跑过一致性审查的帧上单独成立，也可以和机器判定
-            // 并存。两者任一成立都要给出「修复此帧问题」入口。
-            const manualIssue = typeof frame.manual_issue === 'string' ? frame.manual_issue : '';
-            const isManualFlagged = !!manualIssue;
-            const isFixable = isVlmFailed || isManualFlagged;
-            const isUnverified = frame.quality_gate === 'auto_approved_degraded';
-            // 整套序列一致性审查两次（常规+降级）都没跑成时后端如实标 skipped，
-            // 不再盖 sequence_reviewed_pass 假章——这里对应亮黄色"未审查"徽标
-            const isReviewSkipped = frame.quality_gate === 'sequence_review_skipped';
-            // stale_lineage 是后端唯一真正会写的血统过期标记（部分重生、手动上传帧
-            // 都写它，见 update_manifest_stale_status / /api/upload_frame）；
-            // quality_gate==='stale' / frame.stale 是更早的写法，留着兼容旧 manifest。
-            const isStale = frame.stale_lineage || frame.quality_gate === 'stale' || frame.stale;
-            // 宽松档软性瑕疵放行：quality_gate 仍是 auto_approved，告警留在 vlm_qa_reason
-            const isWarned = frame.quality_gate === 'auto_approved' && typeof frame.vlm_qa_reason === 'string' && frame.vlm_qa_reason.indexOf('WARN') === 0;
-            card.className = 'frame-card' + (isDegraded ? ' degraded-card' : '') + (isVlmFailed ? ' vlm-failed-card' : '') + (isManualFlagged ? ' manual-flagged-card' : '') + ((isUnverified || isReviewSkipped) ? ' degraded-card' : '') + (isStale ? ' stale-card' : '');
-            card.style.cursor = 'pointer';
-
-            let hoverTitle = `打开第 ${seq} 帧`;
-            if (isDegraded) hoverTitle += ' (降级为文生图)';
-            if (isVlmFailed) hoverTitle += ` (一致性审查未通过: ${frame.vlm_qa_reason || '跳变或无变化'})`;
-            // 结构化违规（2026-07-25）：哪一层检出的、涉及哪几帧都留了下来，
-            // 悬浮提示按条列出，比一根 '；' 拼接的字符串好读
-            if (Array.isArray(frame.review_issues) && frame.review_issues.length) {
-                hoverTitle += '\n' + frame.review_issues.map(i =>
-                    `· [${i.layer === 'global' ? '跨帧' : (i.layer === 'manual' ? '人工' : '本拍')}] `
-                    + `${i.text}（涉及 IMG ${(i.frames || []).map(s => String(s).padStart(3, '0')).join('/')}）`
-                ).join('\n');
-            }
-            if (isManualFlagged) hoverTitle += ` (人工标记的问题: ${manualIssue})`;
-            if (isUnverified) hoverTitle += ' (VLM 判定服务异常，此帧未经核验被放行)';
-            if (isReviewSkipped) hoverTitle += ` (${frame.vlm_qa_reason || '一致性审查服务不可用，此帧未经整套序列审查'})`;
-            if (isWarned) hoverTitle += ` (宽松档放行: ${frame.vlm_qa_reason})`;
-            if (isStale) hoverTitle += ' (过期：父帧已被重新生成，此帧与父帧血统不一致)';
-            if (Number.isFinite(Number(frame.swapped_from_sequence))) {
-                hoverTitle += ` (人工从 IMG ${String(frame.swapped_from_sequence).padStart(3, '0')} 拖过来)`;
-            }
-            if (frame.source === 'manual_upload') hoverTitle += ' (人工上传的本地图片)';
-            card.title = hoverTitle;
-
-            card.innerHTML = `
-                <img src="" alt="Frame ${seq}" loading="lazy">
-                ${isDegraded ? '<div class="degraded-badge">降级</div>' : ''}
-                ${isManualFlagged
-                    ? '<div class="manual-flagged-badge" title="' + (isVlmFailed ? manualIssue + '（一致性审查另判定：' + (frame.vlm_qa_reason || '') + '）' : manualIssue).replace(/"/g, '&quot;') + '">人工标记</div>'
-                    : (isVlmFailed ? '<div class="vlm-failed-badge" title="' + (frame.vlm_qa_reason || '').replace(/"/g, '&quot;') + '">审查未过</div>' : '')}
-                ${isUnverified ? '<div class="degraded-badge" title="' + (frame.vlm_qa_reason || 'VLM 判定服务异常，未经核验').replace(/"/g, '&quot;') + '">未核验</div>' : ''}
-                ${isReviewSkipped ? '<div class="degraded-badge" title="' + (frame.vlm_qa_reason || '一致性审查服务不可用，此帧未经整套序列审查').replace(/"/g, '&quot;') + '">未审查</div>' : ''}
-                ${isWarned ? '<div class="degraded-badge" title="' + frame.vlm_qa_reason.replace(/"/g, '&quot;') + '">留痕</div>' : ''}
-                ${isStale ? `<div class="stale-badge" ${isDegraded || isFixable || isUnverified || isWarned ? 'style="left: 45px;"' : ''} title="此帧派生自已被替换的旧帧，建议重新生成">Stale</div>` : ''}
-                <div class="frame-card-actions" style="position: absolute; top: 5px; right: 5px; display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s;">
-                    ${isFixable ? `<button class="action-btn text-btn mini-btn fix-frame-btn" data-seq="${seq}" style="background: rgba(180,40,40,0.75); border: 1px solid rgba(255,255,255,0.3); padding: 2px 6px; font-size: 10px;"${framesBusy ? ' disabled title="该创意的帧序列正在生成/重试中，请稍候"' : ' title="依据问题描述优化提示词后图生图重渲此帧"'}>修复此帧问题</button>` : ''}
-                    <button class="action-btn text-btn mini-btn describe-frame-btn" data-seq="${seq}" style="background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.3); padding: 2px 6px; font-size: 10px;"${framesBusy ? ' disabled title="该创意的帧序列正在生成/重试中，请稍候"' : ' title="人工描述这一帧哪里不对，作为定向修复的依据"'}>${isManualFlagged ? '改描述' : '描述问题'}</button>
-                    <button class="action-btn text-btn mini-btn retry-frame-btn" data-seq="${seq}" style="background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.3); padding: 2px 6px; font-size: 10px;"${framesBusy ? ' disabled title="该创意的帧序列正在生成/重试中，请稍候"' : ''}>重试</button>
-                    <button class="action-btn text-btn mini-btn delete-slot-btn" data-seq="${seq}" style="background: rgba(150,30,30,0.75); border: 1px solid rgba(255,255,255,0.3); padding: 2px 6px; font-size: 10px;"${framesBusy ? ' disabled title="该创意的帧序列正在生成/重试中，请稍候"' : ' title="删除这一整拍：图片与视频提示词、文件一并删除，其后整体前移一位"'}>删除</button>
-                </div>
-                <span>IMG ${String(seq).padStart(3, '0')}</span>
-            `;
-
-            const frameImgEl = card.querySelector('img');
-            // 图自身可拖会抢走卡片的拖拽源身份（浏览器默认拖的是这张图，带不上换位
-            // 需要的槽位号）——关掉它，改由卡片统一发起拖拽（导出到 Finder 的能力
-            // 由 dragstart 里的 DownloadURL 补上）。
-            frameImgEl.draggable = false;
-            frameImgEl.onerror = () => markFrameCardMissing(card, seq, framesBusy);
-            safeSetImageSrc(frameImgEl, frame.url || frame.file);
-            
-            // Hover effect to show action buttons
-            card.addEventListener('mouseenter', () => {
-                const actions = card.querySelector('.frame-card-actions');
-                if (actions) actions.style.opacity = '1';
-            });
-            card.addEventListener('mouseleave', () => {
-                const actions = card.querySelector('.frame-card-actions');
-                if (actions) actions.style.opacity = '0';
-            });
-            
-            // Click on the card opens lightbox (excluding the retry/fix buttons)
-            card.addEventListener('click', (e) => {
-                if (e.target.classList.contains('retry-frame-btn')) return;
-                if (e.target.classList.contains('fix-frame-btn')) return;
-                if (e.target.classList.contains('describe-frame-btn')) return;
-                if (e.target.classList.contains('delete-slot-btn')) return;
-                if (card.dataset.missing) return; // 图已失效被降级成占位卡，别开死图 lightbox
-                
-                // Get all valid frames for the lightbox
-                const validFrames = itemsToRender
-                    .filter(i => i.frame && (i.frame.url || i.frame.file))
-                    .map(i => i.frame);
-                
-                const mediaList = validFrames.map((f) => ({
-                    type: 'image',
-                    url: f.url || f.file,
-                    caption: `<strong>第 ${f.sequence} 帧 / 共 ${validFrames.length} 帧</strong>`
-                }));
-                
-                const clickedIndex = validFrames.findIndex(f => f.sequence === seq);
-                openLightbox(mediaList, clickedIndex >= 0 ? clickedIndex : 0);
-            });
-            
-            card.querySelector('.retry-frame-btn').addEventListener('click', (e) => {
-                e.stopPropagation();
-                retrySingleFrame(seq);
-            });
-            const fixBtn = card.querySelector('.fix-frame-btn');
-            if (fixBtn) {
-                fixBtn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    fixFrameIssue(seq);
-                });
-            }
-            card.querySelector('.describe-frame-btn').addEventListener('click', (e) => {
-                e.stopPropagation();
-                describeFrameIssue(seq, manualIssue);
-            });
-            card.querySelector('.delete-slot-btn').addEventListener('click', (e) => {
-                e.stopPropagation();
-                deleteSlotBeat(seq);
-            });
-        } else if ((() => {
-            // 只有这个槽位真的在当前后台任务的目标范围内，才画"等待中"——
-            // 单帧重试的任务记录会带 targetSequences（如 [3]），此时其余槽位
-            // 服务端压根没碰，画"等待中"会让人误以为整套序列正在自动续渲
-            // （2026-07-20 用户实机截图复现：重试 IMG 003 时 004-012 全部显示
-            // 等待中，但 server.log 证实那次任务子集只有 [3]，其余槽位从未
-            // 被请求过）。targetSequences 为空/未设置＝整单任务，范围覆盖全部。
-            const rec = (typeof getIdeaTaskRecord === 'function' && idea) ? getIdeaTaskRecord(idea.id, 'frames') : null;
-            return rec && (!rec.targetSequences || rec.targetSequences.includes(seq));
-        })()) {
-            // 该创意的帧序列任务正在后台跑，这个槽位只是还没轮到——画等待中占位而不是"已失效"重试卡
-            card.className = 'frame-card placeholder-frame-card';
-            card.innerHTML = `
-                <div class="frame-placeholder-spinner">
-                    <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-                </div>
-                <span>第 ${String(seq).padStart(3, '0')} 帧 (等待中)</span>
-            `;
-        } else {
-            // Missing or failed frame
-            markFrameCardMissing(card, seq, framesBusy);
-        }
-
+        // 任何形态的帧卡片（已出图/等待中/未生成）都能接住拖进来的本地图片与别的
+        // 帧格；监听绑在卡片元素本身，renderSlotCard 重写 innerHTML 不会冲掉它。
+        enableFrameSlotDnd(card, seq);
+        renderSlotCard(card, frameSlotState(item.frame, {
+            seq,
+            busy: framesBusy,
+            pending: isFramePending(seq),
+        }));
+        placeSlotCard(card, 'image', seq);
         grid.appendChild(card);
     });
-}
 
-// 视频卡片上的「删除」按钮：删的是这一整拍（图片 N + 视频 N 的提示词与文件），
-// 不是只删这一段视频——槽位号是契约，视频 N 恒等于 IMG N → IMG N+1，单删视频会让
-// 提示词条数与格子数对不上（见 api_client.deleteSlotBeat / server /api/delete_slot）。
-// 同各处按钮的教训：监听器无条件绑定，busy 只影响 disabled/title。
-function bindDeleteSlotButton(card, slotNum, busy) {
-    const btn = card.querySelector('.delete-slot-btn');
-    if (!btn) return;
-    btn.title = busy ? '该创意的视频序列正在生成/重试中，请稍候'
-                     : '删除这一整拍：图片与视频提示词、文件一并删除，其后整体前移一位';
-    btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        deleteSlotBeat(slotNum);
-    });
-}
-
-// 视频槽位从未生成过（不同于"生成失败"——没有 error 原因可展示）：给「生成」
-// 「上传」两个出口，同 markFrameCardMissing 一样监听器无条件绑定，busy 只影响
-// disabled/title，否则 setVideoGridButtonsBusy(false) 之后按钮会变成看着能点、
-// 点了没反应的死按钮。
-function markVideoCardMissing(card, slotNum, busy) {
-    card.className = 'frame-card video-failed-card';
-    card.style.cursor = 'default';
-    card.innerHTML = `
-        <div class="video-failed-placeholder">
-            <span class="error-icon">⚠️</span>
-            <span class="error-text" style="font-size: 11px; color: var(--text-secondary);">未生成</span>
-            <div style="display:flex; gap:4px; flex-wrap:wrap; justify-content:center;">
-                <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${slotNum}"${busy ? ' disabled' : ''}>生成</button>
-                <button class="action-btn text-btn mini-btn secondary upload-video-btn" data-slot="${slotNum}"${busy ? ' disabled' : ''}>上传</button>
-                <button class="action-btn text-btn mini-btn secondary delete-slot-btn" data-slot="${slotNum}"${busy ? ' disabled' : ''}>删除</button>
-            </div>
-        </div>
-        <span>VID ${String(slotNum).padStart(3, '0')}</span>
-    `;
-    bindDeleteSlotButton(card, slotNum, busy);
-    const genBtn = card.querySelector('.retry-video-btn');
-    const uploadBtn = card.querySelector('.upload-video-btn');
-    genBtn.title = busy ? '该创意的视频序列正在生成/重试中，请稍候' : '';
-    genBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        retrySingleVideo(slotNum);
-    });
-    uploadBtn.title = busy ? '该创意的视频序列正在生成/重试中，请稍候' : '手动上传本地视频文件覆盖此槽位';
-    uploadBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        triggerVideoUpload(slotNum);
-    });
+    // 整格重渲会换掉所有卡片：让工具条复原选中态、重新套用筛选、刷新计数
+    if (typeof syncSlotToolbar === 'function') syncSlotToolbar('image');
 }
 
 function renderVideosForIdea(idea) {
-    const grid = document.getElementById('videos-grid');
+    const grid = slotRenderTarget('video');
     const meta = document.getElementById('videos-meta');
     if (!grid || !meta) return;
 
     const frameRun = idea && idea.frameRun;
     const videos = (frameRun && frameRun.videos) || [];
-    grid.innerHTML = '';
+    clearSlotGrid(grid, 'video');
 
     const mergedContainer = document.getElementById('merged-video-container');
     const mergedPlayer = document.getElementById('merged-video-player');
     const mergedInfo = document.getElementById('merged-video-info');
     const mergedDownload = document.getElementById('merged-video-download');
+    const mergedHeading = document.getElementById('merged-video-heading');
+    const mergedDescription = document.getElementById('merged-video-description');
 
     if (mergedContainer) {
         if (frameRun && frameRun.merged_video && frameRun.merged_video.status === 'success') {
             const mv = frameRun.merged_video;
+            const speed = [1, 1.5, 2].includes(Number(mv.speed)) ? Number(mv.speed) : 2;
+            const speedLabel = speed === 1 ? '无加速' : `${speed}倍速`;
+            const speedSlug = speed === 1.5 ? '1_5x' : `${speed}x`;
             mergedContainer.style.display = 'block';
+            if (mergedHeading) mergedHeading.textContent = `🎬 ${speedLabel}合并成品视频 (Merged Finished Video)`;
+            if (mergedDescription) {
+                mergedDescription.textContent = speed === 1
+                    ? '所有生成的视频片段已按顺序合并，并保留原始播放速度。'
+                    : `所有生成的视频片段已按顺序合并，并调整为${speed}倍速度播放。`;
+            }
             if (mergedPlayer) {
                 // 重新合成会原地覆盖同一个成片文件，同样要带版本号才看得到新的
                 mergedPlayer.src = cacheBustedUrl(mv.url);
             }
             if (mergedDownload) {
                 mergedDownload.href = mv.url;
-                mergedDownload.download = `${idea.title || 'video'}_merged_2x.mp4`;
+                mergedDownload.download = `${idea.title || 'video'}_merged_${speedSlug}.mp4`;
             }
             if (mergedInfo) {
                 const sizeMB = mv.size_bytes ? (mv.size_bytes / (1024 * 1024)).toFixed(2) + ' MB' : '未知大小';
                 const durationSec = mv.duration_seconds ? mv.duration_seconds + ' 秒' : '未知时长';
-                mergedInfo.textContent = `文件大小: ${sizeMB} | 视频时长: ${durationSec}`;
+                mergedInfo.textContent = `速率: ${speedLabel} | 文件大小: ${sizeMB} | 视频时长: ${durationSec}`;
             }
         } else {
             mergedContainer.style.display = 'none';
@@ -900,160 +690,31 @@ function renderVideosForIdea(idea) {
           }))
         : videos.map((v) => ({ slotNum: v.slot, video: v }));
 
+    // 该槽位从未处理过时：若正处在当前后台任务的目标范围内（整单任务，或
+    // target_slots 显式包含它），画"等待中"；否则说明这次任务压根没碰它，
+    // 画"未生成"+生成/上传出口。同 renderFramesForIdea 的同款判断。
+    const videosRec = (typeof getIdeaTaskRecord === 'function' && idea)
+        ? getIdeaTaskRecord(idea.id, 'videos') : null;
+    const isVideoPending = (slotNum) =>
+        !!(videosRec && (!videosRec.targetSlots || videosRec.targetSlots.includes(slotNum)));
+
     itemsToRender.forEach(item => {
         const slotNum = item.slotNum;
-        const video = item.video;
         const card = document.createElement('div');
         card.id = `video-slot-${slotNum}`;
-        // 拖拽：卡片本身既是放置区（接文件上传 / 接别的槽位换位过来），
-        // 有视频时也是拖拽源。同帧卡片，监听绑在卡片元素上，不随 innerHTML 重写丢失。
-        enableVideoSlotDnd(card, slotNum, !!(video && (video.url || video.file)));
-
-        if (!video) {
-            // 该槽位从未处理过：若正处在当前后台任务的目标范围内（整单任务，或
-            // target_slots 显式包含它），画"等待中"；否则说明这次任务压根没碰它，
-            // 画"未生成"+生成/上传出口。同 renderFramesForIdea 的同款判断。
-            const rec = (typeof getIdeaTaskRecord === 'function' && idea) ? getIdeaTaskRecord(idea.id, 'videos') : null;
-            const isPending = rec && (!rec.targetSlots || rec.targetSlots.includes(slotNum));
-            if (isPending) {
-                card.className = 'frame-card placeholder-frame-card';
-                card.innerHTML = `
-                    <div class="frame-placeholder-spinner">
-                        <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-                    </div>
-                    <span>第 ${String(slotNum).padStart(3, '0')} 段视频 (等待中)</span>
-                `;
-            } else {
-                markVideoCardMissing(card, slotNum, videosBusy);
-            }
-            grid.appendChild(card);
-            return;
-        }
-
-        const isFailed = video.status === 'failed' || (!video.url && !video.file);
-        // 英雄展示视频（默认收尾步骤）：只上传首帧完工图，没有"下一张"图可以指向——
-        // 标签用专属文案，不套用其余槽位的 IMG N ➔ IMG N+1 箭头写法。
-        const isHero = !!(video.is_hero || (video.meta && String(video.meta).toUpperCase().includes('HERO')));
-
-        const startImg = String(video.slot).padStart(3, '0');
-        const endImg = String(video.slot + 1).padStart(3, '0');
-        const labelText = isHero
-            ? `VID ${String(video.slot).padStart(3, '0')} (英雄展示 · 完工全景)`
-            : `VID ${String(video.slot).padStart(3, '0')} (IMG ${startImg} ➔ IMG ${endImg})`;
-
-        if (isFailed) {
-            card.className = 'frame-card video-failed-card';
-            card.style.cursor = 'default';
-            card.innerHTML = `
-                <div class="video-failed-placeholder">
-                    <span class="error-icon">⚠️</span>
-                    <span class="error-text" title="${video.error || '生成失败'}">生成失败</span>
-                    <div style="display:flex; gap:4px; flex-wrap:wrap; justify-content:center;">
-                        <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${video.slot}"${videosBusy ? ' disabled' : ''}>重试</button>
-                        <button class="action-btn text-btn mini-btn secondary upload-video-btn" data-slot="${video.slot}"${videosBusy ? ' disabled' : ''}>上传</button>
-                        <button class="action-btn text-btn mini-btn secondary delete-slot-btn" data-slot="${video.slot}"${videosBusy ? ' disabled' : ''}>删除</button>
-                    </div>
-                </div>
-                <span>${labelText}</span>
-            `;
-            bindDeleteSlotButton(card, video.slot, videosBusy);
-            const retryBtn = card.querySelector('.retry-video-btn');
-            const uploadBtn = card.querySelector('.upload-video-btn');
-            // 监听器无条件绑定，同 markFrameCardMissing 的教训——busy 只应影响
-            // disabled 属性/title，不能连带跳过 addEventListener。
-            retryBtn.title = videosBusy ? '该创意的视频序列正在生成/重试中，请稍候' : '';
-            retryBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                retrySingleVideo(video.slot);
-            });
-            uploadBtn.title = videosBusy ? '该创意的视频序列正在生成/重试中，请稍候' : '手动上传本地视频文件覆盖此槽位';
-            uploadBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                triggerVideoUpload(video.slot);
-            });
-        } else {
-            const isManualUpload = video.source === 'manual_upload';
-            // 手动换位/复制过来的片段：首尾帧未重新校验，徽标上标出它原本在哪个槽位，
-            // 免得事后看着一格格视频想不起来自己调过顺序。
-            const swappedFrom = Number.isFinite(Number(video.swapped_from_slot))
-                ? Number(video.swapped_from_slot) : null;
-            card.className = 'frame-card';
-            card.style.cursor = 'pointer';
-            card.innerHTML = `
-                <div class="video-preview-wrapper" style="position: relative; width: 100%; aspect-ratio: 9/16; border-radius: 5px; overflow: hidden; background: #03050c;">
-                    <video src="${cacheBustedUrl(video.url)}" loop muted playsinline style="width:100%; height:100%; object-fit: cover; display: block;"></video>
-                    <div class="video-play-overlay" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.25); transition: all 0.2s ease;">
-                        <span class="play-icon" style="font-size: 2rem; color: #fff; opacity: 0.85; transition: all 0.2s ease;">▶</span>
-                    </div>
-                    ${isManualUpload ? '<div class="degraded-badge" title="此片段由用户手动上传覆盖，非本地 UI 自动化产出">手动</div>' : ''}
-                    ${swappedFrom !== null ? `<div class="degraded-badge" title="此片段由人工从 VID ${String(swappedFrom).padStart(3, '0')} 拖过来，首尾帧未按本槽位锚点重新校验">换位</div>` : ''}
-                    <div class="video-card-actions" style="position: absolute; top: 5px; right: 5px; display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s;">
-                        <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${video.slot}" style="background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.3); padding: 2px 6px; font-size: 10px;"${videosBusy ? ' disabled' : ''}>重试</button>
-                        <button class="action-btn text-btn mini-btn upload-video-btn" data-slot="${video.slot}" style="background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.3); padding: 2px 6px; font-size: 10px;"${videosBusy ? ' disabled' : ''}>上传</button>
-                        <button class="action-btn text-btn mini-btn delete-slot-btn" data-slot="${video.slot}" style="background: rgba(150,30,30,0.75); border: 1px solid rgba(255,255,255,0.3); padding: 2px 6px; font-size: 10px;"${videosBusy ? ' disabled' : ''}>删除</button>
-                    </div>
-                </div>
-                <span>${labelText}</span>
-            `;
-            
-            const videoEl = card.querySelector('video');
-            const playOverlay = card.querySelector('.video-play-overlay');
-            const playIcon = card.querySelector('.play-icon');
-            const cardActions = card.querySelector('.video-card-actions');
-
-            card.addEventListener('mouseenter', () => {
-                videoEl.play().catch(() => {});
-                if (playOverlay) playOverlay.style.background = 'rgba(0,0,0,0)';
-                if (playIcon) playIcon.style.opacity = '0';
-                if (cardActions) cardActions.style.opacity = '1';
-            });
-            card.addEventListener('mouseleave', () => {
-                videoEl.pause();
-                if (playOverlay) playOverlay.style.background = 'rgba(0,0,0,0.25)';
-                if (playIcon) playIcon.style.opacity = '0.85';
-                if (cardActions) cardActions.style.opacity = '0';
-            });
-
-            const successRetryBtn = card.querySelector('.retry-video-btn');
-            successRetryBtn.title = videosBusy ? '该创意的视频序列正在生成/重试中，请稍候' : '重新生成此槽位视频（覆盖当前片段）';
-            successRetryBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                retrySingleVideo(video.slot);
-            });
-            const successUploadBtn = card.querySelector('.upload-video-btn');
-            successUploadBtn.title = videosBusy ? '该创意的视频序列正在生成/重试中，请稍候' : '手动上传本地视频文件覆盖此槽位';
-            successUploadBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                triggerVideoUpload(video.slot);
-            });
-            bindDeleteSlotButton(card, video.slot, videosBusy);
-
-            card.addEventListener('click', (e) => {
-                if (e.target.classList.contains('retry-video-btn')
-                    || e.target.classList.contains('upload-video-btn')
-                    || e.target.classList.contains('delete-slot-btn')) return;
-                const validVideos = videos.filter(v => v.url || v.file);
-                const mediaList = validVideos.map((v, idx) => {
-                    const vIsHero = !!(v.is_hero || (v.meta && String(v.meta).toUpperCase().includes('HERO')));
-                    const startImg = String(v.slot).padStart(3, '0');
-                    const endImg = String(v.slot + 1).padStart(3, '0');
-                    const cap = vIsHero
-                        ? `VID ${String(v.slot).padStart(3, '0')} (英雄展示 · 完工全景)`
-                        : `VID ${String(v.slot).padStart(3, '0')} (IMG ${startImg} ➔ IMG ${endImg})`;
-                    return {
-                        type: 'video',
-                        // 换位/覆盖过的片段路径没变、内容变了，lightbox 也得回源，
-                        // 否则大图里放的还是缓存里的旧片
-                        url: cacheBustedUrl(v.url || v.file),
-                        caption: `<strong>${cap}</strong>`
-                    };
-                });
-                const clickedIndex = validVideos.indexOf(video);
-                openLightbox(mediaList, clickedIndex);
-            });
-        }
+        // 拖拽：卡片本身既是放置区（接文件上传 / 接别的槽位换位过来），有内容时
+        // 也是拖拽源。监听绑在卡片元素上，renderSlotCard 重写 innerHTML 不会丢。
+        enableVideoSlotDnd(card, slotNum);
+        renderSlotCard(card, videoSlotState(item.video, {
+            seq: slotNum,
+            busy: videosBusy,
+            pending: isVideoPending(slotNum),
+        }));
+        placeSlotCard(card, 'video', slotNum);
         grid.appendChild(card);
     });
+
+    if (typeof syncSlotToolbar === 'function') syncSlotToolbar('video');
 }
 
 function renderCoversForIdea(idea, activeIndex = 0) {
@@ -1175,4 +836,3 @@ function extractImageUrl(content) {
 
 // --- LIGHTBOX 通用控制器已抽出到 js/lightbox.js(双前端共享的全局函数)---
 // 本文件其余处的 openLightbox(mediaList, idx) 调用点保持不变,直接调用该共享模块的全局函数。
-

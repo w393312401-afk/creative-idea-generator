@@ -5117,6 +5117,9 @@ def compose_anchor_and_packet(config, dimensions, on_progress=None):
     beat_count_mode = str(dimensions.get('beat_count_mode') or 'adaptive').strip().lower()
     if beat_count_mode not in ('adaptive', 'fixed'):
         beat_count_mode = 'adaptive'
+    pacing_skeleton_id = normalize_pacing_skeleton_ids(
+        dimensions.get('pacing_skeleton'), default_all=False)[0]
+    pacing_skeleton = PACING_SKELETONS[pacing_skeleton_id]
     # beats_count is the construction-beat cap in adaptive mode; the final reward is
     # appended inside the ladder.  total_beats begins as the maximum and is replaced by
     # len(beat_ladder) as soon as planning succeeds.
@@ -5205,6 +5208,7 @@ Required JSON keys:
 - Budget Level: {budget}
 - Raw-Shell vs Refined-Interior Contrast Intensity (higher = bolder before/after clash): {ratio}
 - Creativity Scale: {creativity}
+- Pacing Skeleton Reference: {pacing_skeleton_id} ({pacing_skeleton['label_zh']}) — {pacing_skeleton['summary']}
 """
     
     _brief_fallback = {
@@ -5242,6 +5246,11 @@ Required JSON keys:
         parsed_brief = {}
     for k, v in _brief_fallback.items():
         parsed_brief.setdefault(k, v)
+
+    # 「内外双重完工」的第二幕依赖明确硬切：外部先交付一个可用门面，
+    # 再把视觉状态归零到从未施工的室内。这不能由 brief LLM 自由改成 coaxial/pan，
+    # 否则会悄然退回原单线骨架。激发层只会把该骨架分配给有可读外门面+独立内部的载体。
+    parsed_brief = apply_pacing_skeleton_to_brief(parsed_brief, pacing_skeleton_id)
 
     # 核心创意锚点(dimensions.anchors，如一键合成灵感卡片时的 idea.twist_zh)是
     # Python 侧已经拿到手的确定性输入——不经过这次 Step 1 解析 LLM 的输出 schema
@@ -5361,6 +5370,25 @@ Required JSON keys:
     else:
         _outline_plan_block = ""
 
+    if pacing_skeleton_id == 'dual_payoff':
+        _pacing_plan_block = (
+            "\nSelected pacing skeleton (MANDATORY narrative structure, while physical construction "
+            "order remains authoritative): dual_payoff / 内外双重完工. The ordinary beat "
+            "immediately BEFORE the threshold hard cut must complete a genuinely usable exterior "
+            "entrance/frontage (not a partial repair) and read as the first mini-payoff. Then HARD CUT "
+            "to the untouched raw interior, reset visual progress, clean it out, and rebuild bottom-up "
+            "through base/hidden layers -> grid framing and cavity fill -> board closure -> finish "
+            "surfaces -> core furniture -> fast soft-furnishing closeout -> final worker-free reward. "
+            "Do not move all exterior utility/platform/finish work after the cut, and do not turn the "
+            "exterior mini-payoff into a reward operation; only the final beat is reward.\n"
+        )
+    else:
+        _pacing_plan_block = (
+            "\nSelected pacing skeleton (narrative reference): linear_milestone / 单线里程碑推进. "
+            "Preserve one monotonic construction arc from exterior clearing/repair through the crossing, "
+            "interior construction, furnishing, and the single final reward.\n"
+        )
+
     if beat_count_mode == 'fixed':
         count_contract = f"exactly {max_total_beats} elements ({beats_count} construction beats plus one final reward beat)"
     else:
@@ -5404,6 +5432,7 @@ General Rules:
 - The final array element must be the reward/reveal motion: {parsed_brief['reward']}.
 {_anchor_reward_rule}
 {threshold_split_rules}
+{_pacing_plan_block}
 - CEILING/ROOF COVERAGE RULE: For any enclosed space (fuselage, cabin, room, container, vault, bunker, etc.), the ceiling/roof/top surface must be treated as a construction surface just like the walls and floor. When the beat ladder includes framing, paneling, insulating, or painting walls, the SAME operation MUST also explicitly cover the ceiling/roof/top curve. A renovation that covers walls but leaves the ceiling as raw exposed structure is physically incorrect.
 - FIXTURE INSTALLATION RULE: If the beat ladder includes a wiring/electrical rough-in beat, there MUST be a subsequent "lighting" or "fixture install" beat BEFORE the furnishing/staging beat and BEFORE the reward beat. Light fixtures cannot appear in the final reward if they were never installed.
 - DOOR LEAF RULE: If a door frame is installed in one beat, a subsequent beat MUST include installing a door panel/leaf/sash unless the design explicitly calls for an open archway.
@@ -5417,7 +5446,8 @@ Trauma: {parsed_brief['trauma']}
 Destiny: {parsed_brief['destiny']}
 Mode: {parsed_brief['mode']}
 Space Type: {space_type}
-{_outline_plan_block}"""
+{_outline_plan_block}
+{_pacing_plan_block}"""
 
     beat_ladder = None
     beat_ladder_accepted = False
@@ -7934,7 +7964,127 @@ def _attach_trend_ref_ids(ideas, trend_refs):
     return ideas
 
 
-def run_ideate(config, count=8, theme=None, theme_label=None, trend_ref_ids=None):
+PACING_SKELETONS = {
+    'linear_milestone': {
+        'label_zh': '单线里程碑推进',
+        'summary': (
+            'Established skeleton: exterior clearing and carrier-specific structural/envelope repair; '
+            'one threshold crossing into the raw interior; interior cleanout; framing/services and '
+            'surface closure; finish floor; lighting/heating; furnishing and signature-anchor '
+            'realization; one final reward reveal.'
+        ),
+    },
+    'dual_payoff': {
+        'label_zh': '内外双重完工',
+        'summary': (
+            'New two-payoff skeleton: start immediately with large exterior structural placement; '
+            'complete a genuinely usable entrance/frontage through frame, infill, door, exterior '
+            'utility or platform finish; give that exterior a mini-payoff; then use ONE visible, '
+            'continuous doorway-crossing video to enter an untouched raw interior and reset the '
+            'construction state; rebuild bottom-up through base preparation, '
+            'membrane/hidden layers, grid framing, cavity fill, board closure, finish surfaces; then '
+            'install the core furniture, accelerate through soft furnishing, and end on a clean '
+            'worker-free final interior reward.'
+        ),
+    },
+}
+
+
+def normalize_pacing_skeleton_ids(raw, default_all=True):
+    """Normalize the GUI multi-select without allowing arbitrary prompt text through.
+
+    Ideation defaults to both references so a four-card batch can split across rhythms.  Compose
+    callers use default_all=False and preserve the historical linear skeleton when an old task has
+    no pacing_skeleton field.
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    values = []
+    for item in raw if isinstance(raw, (list, tuple)) else []:
+        value = str(item or '').strip()
+        if value in PACING_SKELETONS and value not in values:
+            values.append(value)
+    if values:
+        return values
+    return list(PACING_SKELETONS) if default_all else ['linear_milestone']
+
+
+def apply_pacing_skeleton_to_brief(parsed_brief, pacing_skeleton_id):
+    """Apply only the camera/space transition implied by a selected narrative skeleton."""
+    if not isinstance(parsed_brief, dict):
+        parsed_brief = {}
+    if pacing_skeleton_id == 'dual_payoff':
+        parsed_brief['mode'] = 'Threshold'
+        # 双重完工需要「外部小高潮 -> 过门 -> 原始室内」，不等于可以把
+        # 过门片段省掉。旧逻辑在这里无条件改成 hard_cut，导致每个该骨架
+        # 的项目都缺一段过门视频。现在保留 LLM 判定的 coaxial/pan 几何；
+        # 即使上游返回 hard_cut，也降级为可见的直线穿门镜头。
+        variant = threshold_variant(parsed_brief)
+        parsed_brief['threshold_variant'] = 'coaxial' if variant == 'hard_cut' else variant
+        parsed_brief['require_visible_threshold_video'] = True
+    return parsed_brief
+
+
+def pacing_skeleton_outline_violations(idea):
+    """Deterministic acceptance gate for the new two-payoff rhythm.
+
+    A model can echo pacing_skeleton="dual_payoff" while still returning the old linear outline.
+    The card label would then lie to the user.  Require the three narrative state changes that make
+    the reference structurally distinct, plus several post-reset layer families; wording may vary,
+    but merely relabelling a linear ladder no longer passes.
+    """
+    if not isinstance(idea, dict) or idea.get('pacing_skeleton') != 'dual_payoff':
+        return []
+    outline = [str(x or '').strip() for x in (idea.get('beat_outline') or []) if str(x or '').strip()]
+    if len(outline) < 7:
+        return ['dual_payoff needs at least seven outline entries to express two completed arcs']
+
+    if any(re.search(r'硬切|跳切|直接切(?:入|到)', text) for text in outline):
+        return ['dual_payoff forbids a hard cut because the doorway crossing must generate a visible video']
+    crossing_indices = [
+        i for i, text in enumerate(outline)
+        if re.search(r'过门|穿过.{0,8}(?:门|舱口|洞口|入口)|'
+                     r'(?:推镜|镜头).{0,12}(?:进入|推入|室内|内部)|'
+                     r'进入.{0,8}(?:室内|内部|舱内|井内|洞内|屋内)', text)
+    ]
+    if len(crossing_indices) != 1:
+        return ['dual_payoff must contain exactly one visible doorway-crossing entry']
+    crossing_idx = crossing_indices[0]
+    errors = []
+    if crossing_idx < 2 or crossing_idx >= len(outline) - 3:
+        errors.append('doorway crossing must sit between a substantial exterior arc and interior rebuild')
+
+    if crossing_idx > 0:
+        mini_payoff = outline[crossing_idx - 1]
+        has_exterior = re.search(r'外|入口|门面|门廊|立面|平台|甲板|洞口|地表', mini_payoff)
+        has_completion = re.search(r'完成|完工|点亮|建成|铺满|封闭', mini_payoff)
+        if not (has_exterior and has_completion):
+            errors.append('the entry immediately before the doorway crossing must be a completed exterior mini-payoff')
+
+    crossing_text = outline[crossing_idx]
+    if not re.search(r'室内|内部|舱内|井内|洞内|屋内', crossing_text):
+        errors.append('doorway-crossing entry must land explicitly inside')
+    if not re.search(r'原始|未修|未施工|毛坯|废墟|裸|积渣|锈蚀', crossing_text):
+        errors.append('doorway-crossing entry must land on an untouched/raw interior state')
+
+    post_text = ' '.join(outline[crossing_idx + 1:-1])
+    layer_families = [
+        r'基底|基层|找平|清空|清运',
+        r'防水|防潮|隔汽|膜|隐蔽|管线|电路',
+        r'龙骨|框架|格栅',
+        r'保温|填充|隔音',
+        r'封板|封装|面板|内衬',
+        r'饰面|地板|涂料|墙面|顶面',
+        r'家具|床|卧榻|软装|储物柜',
+    ]
+    realized_layers = sum(bool(re.search(pattern, post_text)) for pattern in layer_families)
+    if realized_layers < 4:
+        errors.append('post-crossing interior arc must realize at least four bottom-up layer/furnishing families')
+    return errors
+
+
+def run_ideate(config, count=8, theme=None, theme_label=None, trend_ref_ids=None,
+                remix_seed=None, pacing_skeleton_ids=None):
     # 形态矩阵与历史选题台账在每次激发时按当前 skillDir 现读（load_reference_file 走
     # skill_dir()，配置改了不用重启）。此前这里是 open() 裸读：文件不在就静默当空串，
     # 一次「skill 包路径没配对」的激发和一次正常激发在日志上长得一模一样。
@@ -7959,6 +8109,35 @@ def run_ideate(config, count=8, theme=None, theme_label=None, trend_ref_ids=None
         f"- {row.get('topic_dna') or '(no DNA)'} | {row.get('one_line') or ''} | status={row.get('status') or 'candidate'}"
         for row in managed_ledger if isinstance(row, dict)
     ) or '(empty)'
+
+    # 台账二创模式：母题是唯一允许做相邻变体的历史条目。只把白名单字段放进
+    # prompt，并限制长度；客户端传来的其余内容一律忽略。
+    remix_data = {}
+    if isinstance(remix_seed, dict):
+        for field in ('topic_dna', 'one_line', 'input_str', 'carrier', 'env', 'trauma',
+                      'destiny', 'twist', 'twist_zh'):
+            value = remix_seed.get(field)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                remix_data[field] = str(value).strip()[:500]
+        nested = remix_seed.get('creative_seed')
+        if isinstance(nested, dict):
+            for field in ('input_str', 'carrier', 'env', 'trauma', 'destiny', 'twist', 'twist_zh'):
+                value = nested.get(field)
+                if field not in remix_data and isinstance(value, (str, int, float)) and str(value).strip():
+                    remix_data[field] = str(value).strip()[:500]
+
+    remix_block = ''
+    if remix_data:
+        remix_block = (
+            "\n==================== REMIX SEED (PRIMARY CREATIVE SOURCE) ====================\n"
+            + json.dumps(remix_data, ensure_ascii=False, indent=2)
+            + f"\nREMIX MODE: Generate {count} recognizable but genuinely distinct derivatives of this seed. "
+              "This seed is the ONLY exception to the managed-ledger one-edit-step exclusion. "
+              "Every derivative must preserve at least TWO recognizable core elements from the seed, "
+              "change at least TWO of Environment, Trauma, Destiny, and Signature Twist, and must not "
+              "repeat the seed's exact title or Topic DNA. All other managed-ledger rows remain strict "
+              "exclusion history. Do not introduce unrelated trend references.\n"
+        )
 
     def _dedupe_generated_ideas(ideas):
         """Hard exact-match guard after the LLM's semantic/near-match prompt guard."""
@@ -8028,12 +8207,15 @@ def run_ideate(config, count=8, theme=None, theme_label=None, trend_ref_ids=None
     # 才算一次真实使用。这里只把本批候选案例的 id 原样带在每条 idea 上
     # (idea['trend_ref_ids']),供合成时按需回填计次。
     selected_refs = []
-    if trend_ref_ids:
+    if trend_ref_ids and not remix_data:
         stored = load_trend_refs() or []
         by_id = {e.get('id'): e for e in stored if isinstance(e, dict)}
         selected_refs = [by_id[i] for i in trend_ref_ids if i in by_id]
 
-    if selected_refs:
+    if remix_data:
+        # 二创母题本身就是首要来源，不再叠加联网趋势，避免衍生方向被无关热点带跑。
+        trend_refs, trend_block = [], ''
+    elif selected_refs:
         trend_refs, trend_block = _format_primary_trend_block(selected_refs)
     else:
         # 性价比联网搜索(便宜 aux 模型搜一次、6 小时缓存复用)+自定义网址摘要——正式的
@@ -8084,6 +8266,33 @@ def run_ideate(config, count=8, theme=None, theme_label=None, trend_ref_ids=None
             "different candidates are anchored in different points rather than all mining the same one."
         )
 
+    selected_pacing_ids = normalize_pacing_skeleton_ids(pacing_skeleton_ids, default_all=True)
+    pacing_lines = '\n'.join(
+        f'- "{sid}" ({PACING_SKELETONS[sid]["label_zh"]}): {PACING_SKELETONS[sid]["summary"]}'
+        for sid in selected_pacing_ids
+    )
+    if len(selected_pacing_ids) == 1:
+        pacing_assignment_rule = (
+            f'Every candidate MUST use pacing_skeleton="{selected_pacing_ids[0]}" and its beat_outline '
+            'must visibly follow that reference rhythm.'
+        )
+    else:
+        pacing_assignment_rule = (
+            f'Distribute the {count} candidates as evenly as possible across these pacing skeletons; '
+            'do not assign the same skeleton to every candidate when more than one candidate is returned. '
+            'Each beat_outline must visibly embody its assigned skeleton, not merely label it.'
+        )
+    pacing_block = f"""
+==================== PACING SKELETON REFERENCES ====================
+These are narrative pacing references, not permission to violate physical construction order.
+{pacing_lines}
+{pacing_assignment_rule}
+For dual_payoff, only assign it to a carrier with a readable exterior frontage/entrance and a distinct
+interior. Its outline must include an exterior completed-state mini-payoff immediately before the hard
+cut/reset, followed by the raw-interior bottom-up layer sequence. The mini-payoff is an ordinary visible
+milestone; the only operation named reward remains the final array item.
+"""
+
     system_prompt = f"""You are the Upstream Ideation Layer for the `restoration-prompt-composer` skill.
 Your task is to generate a ranked list of {count} highly novel, realistic, buildable time-lapse renovation topic seeds.
 You must combine axes from the Morphological Matrix in `idea-engine.md` and filter them to ensure quality.
@@ -8098,9 +8307,12 @@ Here is the current `used-topic-ledger.md` showing already used/burned topic DNA
 
 Here is the managed creative ledger containing every previously surfaced candidate.
 All rows are exclusion history regardless of workflow status. Do not reuse their
-Topic DNA, title concept, or a one-edit-step variant:
+Topic DNA, title concept, or a one-edit-step variant, except for the single seed
+explicitly identified by REMIX MODE below:
 ==================== MANAGED CREATIVE LEDGER ====================
 {managed_ledger_content}
+{remix_block}
+{pacing_block}
 
 ==================== GENERATION INSTRUCTIONS ====================
 1. Combine Axis 1 (Carrier), Axis 2 (Environment), Axis 3 (Trauma), Axis 4 (Destiny), and Axis 5 (Signature Twist) to form candidates.
@@ -8131,29 +8343,58 @@ Each object in the JSON array must have EXACTLY these keys:
 - "score": (number) Total score out of 25.
 - "recommended_beats": (integer, 5 to 15) Recommended construction beat count for this topic's time-lapse. Judge by transformation complexity: light single-space refit → 5-8; medium multi-stage build → 9-12; heavy structural conversion with many distinct visible stages → 13-15.
 - "beats_reason": (string) Chinese, at most 15 characters, why this beat count, e.g. "结构重建阶段多"
+- "pacing_skeleton": (string) Exactly one of: {', '.join(selected_pacing_ids)}. It declares which selected pacing reference this candidate's beat_outline actually follows.
 - "beat_outline": (array of strings) A Chinese one-line summary of EVERY construction beat, in order, with EXACTLY "recommended_beats" entries plus ONE final reward/reveal entry (so the array length is recommended_beats + 1). Each entry is at most 16 Chinese characters, names ONE visible terminal milestone, and starts with a verb, e.g. "清空洞内碎冰与积雪". Respect real-world construction order: structural stabilization and hazard removal before finishes, wiring/piping rough-in before surfaces are closed, surfaces closed and primed before painting, floor finish before heavy anchored objects, lighting installed before anything glows. The LAST entry is the reward reveal, e.g. "点亮灯带,人物入住". Never write vague entries like "开始施工" or "继续完善".
 - "trend_ref": (string) If (and ONLY if) trend references are provided at the end of this prompt AND this idea clearly draws on one of those points, cite the borrowed point in one short Chinese sentence (which reference & what was borrowed). Otherwise it MUST be an empty string "". Never invent a reference.
 """ + trend_block
 
     user_prompt = f"Generate {count} top-quality unique renovation ideas following the instructions."
+    user_prompt_current = user_prompt
 
     for attempt in range(3):
         try:
             # 150s(而非本文件其它调用点常用的 90s)：claude-*-thinking 这类扩展推理模型
             # 在这份 system_prompt(含完整 idea-engine.md)上实测要 78~90s+ 才出结果,
             # 90s 会被反复判超时、白白重试三次后掉进静态兜底列表。
-            resp = _chat(config, system_prompt, user_prompt, temperature=0.8, timeout=150)
+            resp = _chat(config, system_prompt, user_prompt_current, temperature=0.8, timeout=150)
             cleaned = _strip_code_fences(resp).strip()
             ideas = json.loads(cleaned)
             if isinstance(ideas, list) and len(ideas) > 0:
                 novel_ideas = _dedupe_generated_ideas(ideas)
                 if novel_ideas:
+                    # 模型偶尔漏字段/返回未选 id：不让卡片与下游合成失去骨架归属。
+                    # 多选时按卡片序号轮询补齐，至少确保默认四卡不会全部退化成旧骨架。
+                    for idea_idx, idea in enumerate(novel_ideas):
+                        pacing_id = str(idea.get('pacing_skeleton') or '').strip()
+                        if pacing_id not in selected_pacing_ids:
+                            has_outline = bool(idea.get('beat_outline'))
+                            if not has_outline and len(selected_pacing_ids) > 1 \
+                                    and 'linear_milestone' in selected_pacing_ids:
+                                # 一条连 outline 都没产出的旧/异常卡不能被补成 dual 标签；
+                                # 它没有任何内容能证明双完工骨架，只能保守归到原单线。
+                                idea['pacing_skeleton'] = 'linear_milestone'
+                            else:
+                                idea['pacing_skeleton'] = selected_pacing_ids[idea_idx % len(selected_pacing_ids)]
+                    with_outline = _normalize_beat_outlines(novel_ideas)
+
+                    pacing_errors = []
+                    for idea_idx, idea in enumerate(novel_ideas, 1):
+                        for err in pacing_skeleton_outline_violations(idea):
+                            pacing_errors.append(f'Candidate {idea_idx} ({idea.get("title") or "untitled"}): {err}.')
+                    if pacing_errors:
+                        if sys.stdout:
+                            print(f"[DEBUG] run_ideate attempt {attempt+1}: 节拍骨架验收失败，重试: {pacing_errors}")
+                        # 三次都写成旧单线骨架时也不收货；最后让调用落到下方经过
+                        # 同一验收要素手工编排的 fallback，避免用 dual 标签冒充单线清单。
+                        user_prompt_current = user_prompt + "\n\nThe previous response failed the selected pacing skeleton acceptance gate:\n" + \
+                            "\n".join(f'- {err}' for err in pacing_errors) + \
+                            "\nRegenerate the full batch and visibly repair every listed structural defect."
+                        continue
                     # 卡片上的「🔨 节拍简介」全靠 beat_outline。整批一条都没带 =
                     # 模型整个忽略了这个字段(而不是个别条目偷懒),这种响应重试一次
                     # 通常就能拿到合规结果,别把没有节拍简介的卡片直接推给用户。
                     # 部分条目缺失则照收:为个别条目重跑整批不划算,前端对这类卡片
                     # 会退回「载入维度」按钮(见 js/prompt_pipeline.js)。
-                    with_outline = _normalize_beat_outlines(novel_ideas)
                     if with_outline == 0 and attempt < 2:
                         if sys.stdout:
                             print(f"[DEBUG] run_ideate attempt {attempt+1}: 整批缺 beat_outline，重试")
@@ -8259,7 +8500,35 @@ Each object in the JSON array must have EXACTLY these keys:
             "trend_ref": ""
         }
     ]
-    return {'ideas': _attach_trend_ref_ids(_dedupe_generated_ideas(fallback_ideas), trend_refs), 'trend_refs': trend_refs}
+    fallback_ideas = _dedupe_generated_ideas(fallback_ideas)
+    dual_fallback_outlines = {
+        'glacier-ice-cave / refuge-den / self-material-window': [
+            '清理洞口积雪与落石', '加固外部蓝冰拱口', '嵌装气密入口门框',
+            '搭建洞口防风门廊', '挂装太阳能完成外观', '推镜过门进入原始冰洞内部',
+            '清空洞内碎冰与积雪', '凿平并找平内部基底', '铺设龙骨与羊毛保温',
+            '封装内衬木饰面墙', '布设电路并安装暖炉', '布置床铺与羊毛软装',
+            '点亮暖灯,人物入住',
+        ],
+        'retired-submarine / micro-home / porthole-lighting': [
+            '清理潜艇外甲板锈屑', '焊补外壳与入口围护', '安装水密门与护栏',
+            '挂装太阳能板与风管', '点亮舱外灯完成门面', '推镜过门进入锈蚀原始舱内',
+            '清空舱内废弃管线设备', '打磨除锈整片舱壁', '铺设舱底龙骨与保温',
+            '布设电路与生活水管', '封装桦木内饰与地板', '安装舷窗背光灯具',
+            '嵌装折叠床与储物柜', '通电亮灯,人物入住',
+        ],
+        'missile-silo / burrow-dwelling / roof-hatch': [
+            '清理地表舱门与积渣', '修复混凝土入口圈梁', '翻新滑动舱门机构',
+            '搭建地表平台与护栏', '安装太阳能与通风帽', '点亮入口灯完成地表',
+            '推镜过门进入积渣原始井内', '清运井内积渣与鸟粪', '涂布井壁防水封闭层',
+            '浇筑起居层混凝土板', '架设钢制旋梯与护栏', '布设电路与通风管道',
+            '封装内墙并完成饰面', '布置卧榻卫浴与软装', '舱门滑开,天光落入',
+        ],
+    }
+    for idea_idx, idea in enumerate(fallback_ideas):
+        idea['pacing_skeleton'] = selected_pacing_ids[idea_idx % len(selected_pacing_ids)]
+        if idea['pacing_skeleton'] == 'dual_payoff':
+            idea['beat_outline'] = dual_fallback_outlines.get(idea.get('dna'), idea['beat_outline'])
+    return {'ideas': _attach_trend_ref_ids(fallback_ideas, trend_refs), 'trend_refs': trend_refs}
 
 
 def check_adjacent_frame_semantics_batch(config, images):

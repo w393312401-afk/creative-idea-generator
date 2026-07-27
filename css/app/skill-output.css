@@ -365,10 +365,230 @@
     max-width: 520px;
 }
 
+/* --slot-min 由工具条的 S/M/L 档写入（js/slot_toolbar.js，存 localStorage）。
+   默认 70px 在 1600px 桌面上会排出 ~20 列、缩略图只有 124px 高，看不清画面。 */
 .frames-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(70px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(var(--slot-min, 88px), 1fr));
     gap: 10px;
+}
+
+/* ── 槽位工具条 ────────────────────────────────────────────────── */
+.slot-toolbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 10px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.slot-count {
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.slot-toolbar-group {
+    display: inline-flex;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.slot-size-group {
+    margin-left: auto;
+}
+
+.slot-filter-btn,
+.slot-size-btn {
+    padding: 3px 10px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: none;
+    border-right: 1px solid var(--border-color);
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+.slot-toolbar-group > :last-child {
+    border-right: none;
+}
+
+.slot-filter-btn:hover,
+.slot-size-btn:hover {
+    background: rgba(var(--ink-rgb), 0.06);
+    color: var(--text-main);
+}
+
+.slot-filter-btn.is-active,
+.slot-size-btn.is-active {
+    background: rgba(var(--ink-rgb), 0.10);
+    color: var(--text-main);
+    font-weight: 700;
+}
+
+.slot-jump-btn {
+    padding: 3px 10px;
+    font-size: 11.5px;
+    color: #f59e0b;
+    background: rgba(245, 158, 11, 0.10);
+    border: 1px solid rgba(245, 158, 11, 0.45);
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.slot-jump-btn:hover {
+    background: rgba(245, 158, 11, 0.18);
+}
+
+.slot-bulk {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.slot-bulk-clear {
+    padding: 2px 8px;
+    font-size: 13px;
+    line-height: 1;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.slot-filter-empty {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+/* 被筛掉的卡片只是不显示，DOM 与选中集都不动——于是"筛完再选、清掉筛选后
+   选中仍在"是自然行为，不需要额外维护。 */
+.slot-card.slot-filtered-out {
+    display: none;
+}
+
+/* ── 多选 ──────────────────────────────────────────────────────── */
+.slot-select {
+    position: absolute;
+    top: 4px;
+    left: 4px;
+    z-index: 12;
+    display: flex;
+    padding: 2px;
+    border-radius: 4px;
+    background: rgba(3, 5, 12, 0.55);
+    opacity: 0;
+    transition: opacity 0.15s;
+    cursor: pointer;
+}
+
+/* 平时藏起来（徽标要占左上角），hover、已选中、或这个网格里已经有选中项时露出 */
+.frame-card:hover .slot-select,
+.slot-card.is-selected .slot-select,
+.frames-grid.has-selection .slot-select {
+    opacity: 1;
+}
+
+.slot-select-box {
+    width: 13px;
+    height: 13px;
+    margin: 0;
+    cursor: pointer;
+    accent-color: var(--neon-cyan);
+}
+
+.slot-card.is-selected {
+    outline: 2px solid var(--neon-cyan);
+    outline-offset: -2px;
+}
+
+/* 有选中项时，徽标让开左上角，免得和勾选框叠在一起 */
+.frames-grid.has-selection .slot-badges {
+    left: 26px;
+}
+
+/* ── 合并视图（一拍一列）────────────────────────────────────────
+   第 N 列＝第 N 拍：上行 IMG N、下行 VID N。列位由 JS 按槽位号写在卡片上
+   （grid-column/grid-row，见 placeSlotCard）——CSS 读不到 data-seq 的数值，
+   这是唯一必须由脚本写的定位。列宽走 grid-auto-columns，因此拍数变化时
+   不需要同步任何模板。 */
+.beats-grid {
+    display: none;
+}
+
+body.slot-merged-view .beats-grid {
+    display: grid;
+    grid-template-columns: none;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(var(--slot-min, 88px), 1fr);
+    align-items: start;
+    overflow-x: auto;
+    padding-bottom: 6px;
+}
+
+/* 合并视图下，两个原网格空着——藏起来，别在页面上留两片空白 */
+body.slot-merged-view #frames-grid,
+body.slot-merged-view #videos-grid {
+    display: none;
+}
+
+.slot-merged-note {
+    display: none;
+    margin: 0;
+    padding: 12px;
+    font-size: 12px;
+    color: var(--text-muted);
+    border: 1px dashed var(--border-color);
+    border-radius: 8px;
+    text-align: center;
+}
+
+body.slot-merged-view .slot-merged-note {
+    display: block;
+}
+
+/* 视频模块的工具条在合并视图下仍然管用（筛选/多选作用于视频那一行），
+   但尺寸与合并开关是全局的，藏掉重复的那份 */
+body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-size-group,
+body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-merge-btn {
+    display: none;
+}
+
+.slot-merge-btn {
+    padding: 3px 10px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+.slot-merge-btn:hover {
+    background: rgba(var(--ink-rgb), 0.06);
+    color: var(--text-main);
+}
+
+.slot-merge-btn.is-active {
+    background: rgba(var(--ink-rgb), 0.10);
+    border-color: var(--neon-cyan);
+    color: var(--text-main);
+    font-weight: 700;
+}
+
+@keyframes slotFlash {
+    0%, 100% { box-shadow: none; }
+    50% { box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.75); }
+}
+
+.slot-card.slot-flash {
+    animation: slotFlash 0.6s ease-in-out 2;
 }
 
 .frame-card {
@@ -421,8 +641,12 @@
     opacity: 0.45;
 }
 
-/* Frame Retry and Actions */
-.frame-card-actions {
+/* ── 槽位卡片：结构与操作区 ──────────────────────────────────────────
+   卡片由 js/slot_card.js 的 renderSlotCard 独家渲染，那边只写 class 与
+   data-*，不写任何行内样式——所以这一节是槽位卡片外观的唯一出处。
+   （历史上 JS 把 background/border/padding/font-size/opacity 全写成行内，
+   这里的规则等于死代码，移动端只能整段 !important 压回来。） */
+.slot-actions {
     position: absolute;
     top: 5px;
     right: 5px;
@@ -433,8 +657,128 @@
     z-index: 10;
 }
 
-.frame-card:hover .frame-card-actions {
+.frame-card:hover .slot-actions,
+.frame-card:focus-within .slot-actions {
     opacity: 1;
+}
+
+/* 失败/未生成卡片的按钮常驻可见：这类卡片没有图，遮不住谁，藏起来只会让
+   「生成 / 上传 / 删除」三个出口在触屏上彻底失联。 */
+.frame-card.video-failed-card .slot-actions {
+    position: static;
+    opacity: 1;
+    flex-wrap: wrap;
+    justify-content: center;
+}
+
+.slot-action-btn {
+    background: rgba(0, 0, 0, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    color: #fff;
+    padding: 2px 6px;
+    font-size: 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.slot-action-btn[data-variant="danger"] {
+    background: rgba(150, 30, 30, 0.75);
+}
+
+.slot-action-btn[data-act="fix-frame"] {
+    background: rgba(180, 40, 40, 0.75);
+}
+
+.slot-action-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.18);
+    border-color: #fff;
+    box-shadow: 0 0 8px rgba(0, 242, 254, 0.3);
+}
+
+.slot-action-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+/* 徽标横排：同时成立的徽标可能有 6 枚以上（降级/审查未过/人工标记/未核验/
+   未审查/留痕/过期/手动/换位），旧实现靠第二枚硬编码 left:45px 挪位，第三枚
+   就没地方放了。这里改成 flex 容器，加多少枚都自动排。 */
+.slot-badges {
+    position: absolute;
+    top: 5px;
+    left: 5px;
+    /* 给右上角操作区让位。默认网格一列只有 70px 宽，这里不能用 right 撑成
+       一个极窄的盒子——那会让徽标逐字折行、把卡片撑得老高（实测「人工标记」
+       会竖成四行）。改为限宽 + 徽标自身 nowrap：排不下就整枚换行。 */
+    max-width: calc(100% - 46px);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+    z-index: 10;
+    pointer-events: none;
+}
+
+/* 徽标配色仍由各自的 *-badge class 提供（panels-tabs.css），
+   这里只把它们从各自的绝对定位收回到 flex 流里。 */
+.slot-badges > .slot-badge {
+    position: static;
+    top: auto;
+    left: auto;
+    white-space: nowrap;
+    flex: 0 0 auto;
+}
+
+.slot-spinner {
+    width: 20px;
+    height: 20px;
+    margin-bottom: 0;
+}
+
+.slot-card .video-preview-wrapper {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 9 / 16;
+    border-radius: 5px;
+    overflow: hidden;
+    background: #03050c;
+}
+
+.slot-card .video-play-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.25);
+    transition: all 0.2s ease;
+    pointer-events: none;
+}
+
+.slot-card .play-icon {
+    font-size: 2rem;
+    color: #fff;
+    opacity: 0.85;
+    transition: all 0.2s ease;
+}
+
+.slot-card.is-hovered .video-play-overlay {
+    background: rgba(0, 0, 0, 0);
+}
+
+.slot-card.is-hovered .play-icon {
+    opacity: 0;
+}
+
+.slot-card[data-kind="ready"] {
+    cursor: pointer;
+}
+
+.slot-card[data-kind="missing"],
+.slot-card[data-kind="failed"],
+.slot-card[data-kind="cut"],
+.slot-card[data-kind="pending"] {
+    cursor: default;
 }
 
 .retry-frame-btn {

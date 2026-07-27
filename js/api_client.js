@@ -223,6 +223,21 @@ function applyFrameEventToIdea(f, ownerIdea) {
     if (existingIdx !== -1) savedIdeas[existingIdx].frameRun = ownerIdea.frameRun;
 }
 
+/**
+ * 确保帧任务有可增量合并的本地清单，但绝不清空已有帧。
+ *
+ * 一个整单任务可能有多个内部阶段，每个阶段都会广播 `start`：例如先单独生成并
+ * 验收 IMG 001，再分段生成 IMG 002..N。`start` 是进度阶段事件，不是“此前结果
+ * 作废”的信号；若每次收到它都把 frames 置空，首帧会在第二阶段开始时从 UI 消失，
+ * 且因为后续阶段不会再次广播已完成的首帧，只能等任务终态读取 manifest 才恢复。
+ */
+function ensureFrameRunForStart(ownerIdea) {
+    if (!ownerIdea) return null;
+    if (!ownerIdea.frameRun) ownerIdea.frameRun = { title: ownerIdea.title, frames: [] };
+    if (!Array.isArray(ownerIdea.frameRun.frames)) ownerIdea.frameRun.frames = [];
+    return ownerIdea.frameRun;
+}
+
 /** 任务终态时把 manifest 同步进 ownerIdea 与创意库（含服务端持久化）。 */
 async function syncFrameRunToLibrary(manifestData, ownerIdea) {
     ownerIdea = ownerIdea || currentIdea;
@@ -255,76 +270,35 @@ async function reloadManifestIntoIdea(ownerIdea) {
 }
 
 /** 视频槽位卡片渲染（等待中/生成中/完成/失败），供事件流与重试路径共用。 */
+// 生成过程中的实时槽位回调。四个函数名与签名保持不变（app.js 的事件流按名调用），
+// 实现全部转调 js/slot_card.js 的统一渲染器——此前 renderVideoSlotDone 是另写的
+// 一套模板，画出来的卡片没有重试/上传/删除按钮、没有 IMG N ➔ IMG N+1 标签、
+// 不认英雄展示、也不设 draggable，与整格重渲出来的同状态卡片不是一回事。
 function renderVideoSlotPending(slotIdx, text) {
-    const el = document.getElementById(`video-slot-${slotIdx}`);
-    if (!el) return;
-    el.className = 'frame-card placeholder-frame-card';
-    el.innerHTML = `
-        <div class="frame-placeholder-spinner">
-            <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-        </div>
-        <span>第 ${String(slotIdx).padStart(3, '0')} 段视频 (${text})</span>
-    `;
+    renderSlotPending('video', slotIdx, text);
 }
 
 function renderVideoSlotDone(idx, video) {
-    const el = document.getElementById(`video-slot-${idx}`);
-    if (!el || !video) return;
-    el.className = 'frame-card';
-    el.style.cursor = 'default';
-    el.innerHTML = `
-        <video controls style="width:100%; aspect-ratio: 9/16; object-fit: cover; border-radius: 5px; display: block; background: #03050c;"></video>
-        <span>VID ${String(video.slot || idx).padStart(3, '0')}</span>
-    `;
-    // 重试会原地覆盖同一个 vid_NNN.mp4：不带缓存版本号的话播的还是旧片
-    bustImageCache(video.url || video.file);
-    el.querySelector('video').src = cacheBustedUrl(video.url);
+    if (!video) return;
+    const busy = isIdeaTaskActive(currentIdea && currentIdea.id, 'videos');
+    renderSlotById('video', idx, videoSlotState(video, { seq: Number(video.slot) || idx, busy }));
 }
 
 // busy=true：该创意的视频序列任务仍在跑（批量重试里其它槽位还没处理完）——
 // 这个刚失败的槽位重新画出来的按钮也要保持禁用，否则用户点了又是一次
 // "已在生成中" 的错误提示。
 function renderVideoSlotFailed(idx, message, labelText = '生成失败', busy = false) {
-    const el = document.getElementById(`video-slot-${idx}`);
-    if (!el) return;
-    el.className = 'frame-card video-failed-card';
-    el.innerHTML = `
-        <div class="video-failed-placeholder">
-            <span class="error-icon">⚠️</span>
-            <span class="error-text"></span>
-            <button class="action-btn text-btn mini-btn retry-video-btn" data-slot="${idx}"${busy ? ' disabled' : ''}>重试</button>
-        </div>
-        <span>VID ${String(idx).padStart(3, '0')}</span>
-    `;
-    const errText = el.querySelector('.error-text');
-    errText.textContent = labelText;
-    errText.title = message || labelText;
-    const btn = el.querySelector('.retry-video-btn');
-    // 监听器无条件绑定——同一 busy-skip-addEventListener 的坑在此文件的
-    // markFrameCardMissing / renderVideosForIdea 里都出现过，这里一并修。
-    btn.title = busy ? '该创意的视频序列正在生成/重试中，请稍候' : '';
-    btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        retrySingleVideo(idx);
-    });
+    const st = videoSlotState({ slot: idx, status: 'failed', error: message }, { seq: idx, busy });
+    st.statusText = labelText;
+    st.title = message || labelText;
+    renderSlotById('video', idx, st);
 }
 
 // 声明式硬切槽位（[CUT]，TBCP v2 hard_cut 变体）：该槽不生成视频，成片在此处直接
 // 硬切拼接——画中性卡片而不是失败卡（无重试按钮，重试它没有意义）
 function renderVideoSlotSkippedCut(idx, message) {
-    const el = document.getElementById(`video-slot-${idx}`);
-    if (!el) return;
-    el.className = 'frame-card video-failed-card';
-    el.innerHTML = `
-        <div class="video-failed-placeholder">
-            <span class="error-icon">✂️</span>
-            <span class="error-text"></span>
-        </div>
-        <span>VID ${String(idx).padStart(3, '0')}</span>
-    `;
-    const txt = el.querySelector('.error-text');
-    txt.textContent = '声明式硬切（无片段）';
-    txt.title = message || '声明式硬切槽位：不生成视频片段，成片在此处直接硬切。';
+    renderSlotById('video', idx, videoSlotState(
+        { slot: idx, status: 'skipped_cut', message }, { seq: idx }));
 }
 
 function startTasksPolling(interval = 2500) {
@@ -897,6 +871,10 @@ function initLocalServiceLogs() {
 // 才生效——否则用户依次连续点击时，第一下之后的每一下都会先命中
 // isIdeaTaskActive 的错误提示（2026-07-21 实机复现）。
 function setFrameGridButtonsBusy(busy) {
+    // 网格上的 .is-busy 是"当前忙态"的单一真相：期间被重画的卡片（例如图加载
+    // 失败就地降级成占位卡）据此把自己的按钮也画成禁用态，见 slotGridIsBusy。
+    const grid = slotRenderTarget('image');
+    if (grid) grid.classList.toggle('is-busy', !!busy);
     document.querySelectorAll('#frames-grid .retry-frame-btn, #frames-grid .fix-frame-btn, #frames-grid .describe-frame-btn, #frames-grid .delete-slot-btn').forEach(btn => {
         btn.disabled = busy;
         btn.title = busy ? '该创意的帧序列正在生成/重试中，请稍候' : '';
@@ -919,13 +897,7 @@ async function retrySingleFrame(seq) {
     const slotCard = document.getElementById(`frame-slot-${seq}`);
     if (!progress || !meta || !slotCard) return;
 
-    slotCard.className = 'frame-card placeholder-frame-card';
-    slotCard.innerHTML = `
-        <div class="frame-placeholder-spinner">
-            <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-        </div>
-        <span>第 ${String(seq).padStart(3, '0')} 帧 (重试中...)</span>
-    `;
+    renderSlotPending('image', seq, '重试中...');
 
     progress.style.display = 'flex';
     meta.textContent = `正在重试生成第 ${seq} 帧...`;
@@ -1128,13 +1100,7 @@ async function fixFrameIssue(seq, manualReason) {
     const slotCard = document.getElementById(`frame-slot-${seq}`);
     if (!progress || !meta || !slotCard) return;
 
-    slotCard.className = 'frame-card placeholder-frame-card';
-    slotCard.innerHTML = `
-        <div class="frame-placeholder-spinner">
-            <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-        </div>
-        <span>第 ${String(seq).padStart(3, '0')} 帧 (修复中...)</span>
-    `;
+    renderSlotPending('image', seq, '修复中...');
 
     progress.style.display = 'flex';
     meta.textContent = `正在依据问题描述修复第 ${seq} 帧...`;
@@ -1415,6 +1381,8 @@ async function runSequenceReview() {
 // 与 setFrameGridButtonsBusy 同理：视频序列同一创意同时只能有一个任务在跑，
 // 点击「重试」后立即禁用网格里其余按钮，不等下一次事件驱动的重渲。
 function setVideoGridButtonsBusy(busy) {
+    const grid = slotRenderTarget('video');
+    if (grid) grid.classList.toggle('is-busy', !!busy);
     document.querySelectorAll('#videos-grid .retry-video-btn, #videos-grid .delete-slot-btn').forEach(btn => {
         btn.disabled = busy;
         btn.title = busy ? '该创意的视频序列正在生成/重试中，请稍候' : '';
@@ -1467,13 +1435,7 @@ async function retrySingleVideo(slot) {
     const slotCard = document.getElementById(`video-slot-${slot}`);
     if (!progress || !meta || !slotCard) return;
 
-    slotCard.className = 'frame-card placeholder-frame-card';
-    slotCard.innerHTML = `
-        <div class="frame-placeholder-spinner">
-            <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-        </div>
-        <span>第 ${String(slot).padStart(3, '0')} 段视频 (重试中...)</span>
-    `;
+    renderSlotPending('video', slot, '重试中...');
 
     progress.style.display = 'flex';
     meta.textContent = `正在重试生成第 ${slot} 段视频...`;
@@ -1498,7 +1460,8 @@ async function retrySingleVideo(slot) {
                 display_title: ownerIdea.title,
                 prompt_block: ownerIdea.prompt_block,
                 target_slots: [slot],
-                override_flagged: reviewCheck.override
+                override_flagged: reviewCheck.override,
+                merge_speed: typeof getMergeSpeed === 'function' ? getMergeSpeed() : 2
             }),
             signal: controller.signal
         });
@@ -1601,6 +1564,153 @@ function endSlotMutation() {
     _slotMutationBusy = false;
 }
 
+// request() 返回它表示"这次操作已经由调用方自行了结了"（例如 409 之后弹确认框、
+// 用户点了取消，或确认后带 force 重新走了一遍）：外壳跳过 apply 与成功提示，
+// 只负责把闸门和忙态收干净。
+const SLOT_MUTATION_HANDLED = Symbol('slot-mutation-handled');
+
+function _slotScopeFlags(scope) {
+    return {
+        frames: scope === 'frames' || scope === 'both',
+        videos: scope === 'videos' || scope === 'both',
+    };
+}
+
+function _setSlotScopeBusy(scope, busy) {
+    const t = _slotScopeFlags(scope);
+    if (t.frames) setFrameGridButtonsBusy(busy);
+    if (t.videos) {
+        setVideoGridButtonsBusy(busy);
+        setVideoUploadButtonsBusy(busy);
+    }
+}
+
+function _renderSlotScope(ownerIdea, scope) {
+    if (!isViewingIdea(ownerIdea.id)) return;
+    const t = _slotScopeFlags(scope);
+    if (t.frames) renderFramesForIdea(ownerIdea);
+    if (t.videos) renderVideosForIdea(ownerIdea);
+}
+
+/**
+ * 槽位改动的统一事务外壳。
+ *
+ * 六个入口（上传帧 / 上传视频 / 帧换位 / 视频换位 / 删除整拍 / 恢复整拍）此前
+ * 各自手写同一套流程：查前置条件 → 抢闸门 → 画乐观占位 → 请求 → 就地 patch →
+ * 重渲 → 拉权威清单 → 再重渲 → toast → finally 放闸门 + 解忙态。六份拷贝里
+ * 任何一处漏掉 endSlotMutation() 就是一次静默卡死，漏掉 isViewingIdea() 判断
+ * 就是把 A 创意的结果画进正看着的 B 创意。收成一处之后这两类错误没有地方再犯。
+ *
+ * opts：
+ *   what          闸门冲突提示里的操作名
+ *   ownerIdea     本次操作归属的创意——异步回来后据它判断还该不该写 DOM
+ *   scope         'frames' | 'videos' | 'both'：重渲涉及哪些网格
+ *   busyScope     忙态涉及哪些网格，默认同 scope
+ *   blockOn       哪些后台任务在跑时不许改动（数组），默认按 scope 推
+ *   guard         false＝闸门已由外层持有（批量上传、二次确认后的续跑）
+ *   requireIdea   需要 currentIdea（默认 true）
+ *   requirePrompt 需要 prompt_block（上传/删除类）
+ *   meta          请求期间写进 meta 行的文案
+ *   pending       乐观 UI（画转圈占位等），在请求前调用
+ *   request       async () => data —— 唯一各不相同的那一段；抛错即失败
+ *   bust          (data) => [清单项] 需要作废浏览器缓存的条目
+ *   beforeApply   async (data) => void，写 manifest patch 之前（如落回提示词块）
+ *   patch         (data) => manifest patch；不给就跳过整套 apply 流程
+ *   success       (data) => string|null 成功提示
+ *   extraToasts   (data) => [[文案, 类型]] 附加提示
+ *   failure       (e) => string 失败提示
+ *
+ * 返回 true＝成功，false＝失败/前置条件不满足/被调用方自行了结。
+ */
+async function mutateSlot(opts) {
+    const {
+        what = '槽位改动', scope = 'both', guard = true,
+        requireIdea = true, requirePrompt = false,
+        meta, pending, request, bust, beforeApply, patch,
+        success, extraToasts, failure,
+    } = opts;
+    const busyScope = opts.busyScope || scope;
+
+    const ownerIdea = opts.ownerIdea || currentIdea;
+    if (requireIdea && !ownerIdea) {
+        showToast('请先激发一个创意点子！', 'error');
+        return false;
+    }
+    if (requirePrompt && !(ownerIdea && ownerIdea.prompt_block)) {
+        showToast('请先激发一个创意点子！', 'error');
+        return false;
+    }
+
+    const blockOn = opts.blockOn || Object.entries(_slotScopeFlags(scope))
+        .filter(([, on]) => on).map(([k]) => k);
+    for (const type of blockOn) {
+        if (isIdeaTaskActive(ownerIdea.id, type)) {
+            showToast(type === 'frames'
+                ? '该创意的帧序列正在生成/修复中，请稍候'
+                : '该创意的视频序列正在生成/重试中，请稍候', 'error');
+            return false;
+        }
+    }
+
+    if (guard && !beginSlotMutation(what)) return false;
+
+    const metaEl = document.getElementById(
+        scope === 'frames' ? 'frames-meta' : 'videos-meta');
+    if (meta && metaEl && isViewingIdea(ownerIdea.id)) metaEl.textContent = meta;
+    if (pending && isViewingIdea(ownerIdea.id)) pending();
+    _setSlotScopeBusy(busyScope, true);
+
+    try {
+        const data = await request();
+        if (data === SLOT_MUTATION_HANDLED) return false;
+
+        if (bust) (bust(data) || []).forEach(e => e && bustImageCache(e.url || e.file));
+        if (beforeApply) await beforeApply(data);
+
+        if (patch) {
+            // 服务端已经落盘、也把新记录回给我们了：先就地更新本地清单让界面立刻
+            // 反映结果，随后的 reloadManifestIntoIdea 再拉一次权威清单（它同时
+            // 负责把创意库持久化到服务端）——界面不该干等那一次网络往返。
+            applyManifestPatchToIdea(ownerIdea, patch(data));
+            _renderSlotScope(ownerIdea, scope);
+            await reloadManifestIntoIdea(ownerIdea);
+            _renderSlotScope(ownerIdea, scope);
+        }
+
+        const msg = success ? success(data) : null;
+        if (msg) showToast(msg, 'success');
+        (extraToasts ? extraToasts(data) || [] : []).forEach(
+            ([text, type]) => showToast(text, type || 'info'));
+        return true;
+    } catch (e) {
+        console.error(`[slot] ${what} 失败:`, e);
+        showToast(failure ? failure(e) : `${what}失败: ${e.message}`, 'error');
+        _renderSlotScope(ownerIdea, scope);
+        return false;
+    } finally {
+        if (guard) endSlotMutation();
+        if (isViewingIdea(ownerIdea.id)) _setSlotScopeBusy(busyScope, false);
+    }
+}
+
+/** 统一的 JSON 请求 + 错误归一：非 2xx 或回包里带 error/status=error 都算失败。 */
+async function slotRequestJson(url, init) {
+    const resp = await fetch(url, init);
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || data.status === 'error' || data.error) {
+        throw new Error(data.error || data.message || `HTTP ${resp.status}`);
+    }
+    return data;
+}
+
+function slotPostJson(url, payload) {
+    return slotRequestJson(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+}
+
 // 手动上传/换位改的都是同名文件（img_NNN.webp、vid_NNN.mp4）：路径不变、内容变了，
 // 浏览器凭路径命中缓存，重渲出来的还是旧图/旧片——必须把受影响槽位的缓存版本推进
 // 一格，下一次渲染才会回源。entries 是后端回的清单，keyName 是槽位字段名
@@ -1633,108 +1743,58 @@ function applyManifestPatchToIdea(ownerIdea, patch) {
     if (patch.dropMerged) delete run.merged_video;
 }
 
-function bustSlotMedia(entries, keyName, wanted) {
-    const targets = (wanted || []).map(Number);
-    (entries || []).forEach(entry => {
-        if (!entry) return;
-        if (targets.indexOf(Number(entry[keyName])) === -1) return;
-        bustImageCache(entry.url || entry.file);
-    });
-}
-
 // 手动上传本地视频文件覆盖某个槽位（例如外部渠道单独补的片段，或对自动化产出
 // 不满意想换一版）。上传前后端会用与自动生成同一套 verify_video_anchors 校验
 // 首尾帧是否匹配该槽位期望的锚点图——不匹配时先返回 409，这里弹确认框，用户
 // 确认"仍要覆盖"后带 force=true 重新提交才会真正落盘，防止选错文件误覆盖好片段。
 async function uploadVideoToSlot(slot, file, force = false) {
-    if (!currentIdea || !currentIdea.prompt_block) {
-        showToast("请先激发一个创意点子！", "error");
-        return;
-    }
     const ownerIdea = currentIdea;
-    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
-        showToast("该创意的视频序列已在生成/重试中，请稍候", "error");
-        return;
-    }
-    // force=true 是同一次用户操作在 409 确认后的续跑，闸门已经在外层那次调用手里
-    const guarded = !force;
-    if (guarded && !beginSlotMutation('槽位改动')) return;
-
     const progress = document.getElementById('videos-progress');
-    const meta = document.getElementById('videos-meta');
-    const slotCard = document.getElementById(`video-slot-${slot}`);
-    if (!slotCard) {
-        if (guarded) endSlotMutation();
-        return;
-    }
+    if (ownerIdea && !document.getElementById(`video-slot-${slot}`)) return;
 
-    slotCard.className = 'frame-card placeholder-frame-card';
-    slotCard.innerHTML = `
-        <div class="frame-placeholder-spinner">
-            <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-        </div>
-        <span>第 ${String(slot).padStart(3, '0')} 段视频 (上传中...)</span>
-    `;
-    if (progress) progress.style.display = 'flex';
-    if (meta) meta.textContent = `正在上传第 ${slot} 段视频...`;
-    setVideoGridButtonsBusy(true);
-    setVideoUploadButtonsBusy(true);
+    return mutateSlot({
+        what: `第 ${slot} 段视频上传`,
+        ownerIdea, scope: 'videos', requirePrompt: true,
+        // force=true 是同一次用户操作在 409 确认后的续跑，闸门在外层那次调用手里
+        guard: !force,
+        meta: `正在上传第 ${slot} 段视频...`,
+        pending: () => {
+            renderSlotPending('video', slot, '上传中...');
+            if (progress) progress.style.display = 'flex';
+        },
+        request: async () => {
+            const formData = new FormData();
+            formData.append('title', getIdeaSaveTitle(ownerIdea));
+            formData.append('slot', String(slot));
+            formData.append('prompt_block', ownerIdea.prompt_block || '');
+            if (force) formData.append('force', 'true');
+            formData.append('video', file, file.name);
 
-    try {
-        const formData = new FormData();
-        formData.append('title', getIdeaSaveTitle(ownerIdea));
-        formData.append('slot', String(slot));
-        formData.append('prompt_block', ownerIdea.prompt_block || '');
-        if (force) formData.append('force', 'true');
-        formData.append('video', file, file.name);
-
-        const response = await fetch('/api/upload_video', {
-            method: 'POST',
-            body: formData
-        });
-
-        if (response.status === 409) {
-            const data = await response.json().catch(() => ({}));
-            if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
-            const proceed = await customConfirm(escapeHtml(data.error || '上传视频的首/尾帧与该槽位期望的锚点帧不符，疑似传错文件。是否仍要强制覆盖？'));
-            if (proceed) {
-                await uploadVideoToSlot(slot, file, true);
-            } else {
-                showToast('已取消上传。', 'info');
+            const resp = await fetch('/api/upload_video', { method: 'POST', body: formData });
+            if (resp.status === 409) {
+                // 首尾帧与该槽位期望的锚点图不符，疑似传错文件：先退回原样，
+                // 由用户确认后带 force 重来，防止误覆盖一段好片子
+                const data = await resp.json().catch(() => ({}));
+                _renderSlotScope(ownerIdea, 'videos');
+                const proceed = await customConfirm(escapeHtml(
+                    data.error || '上传视频的首/尾帧与该槽位期望的锚点帧不符，疑似传错文件。是否仍要强制覆盖？'));
+                if (proceed) await uploadVideoToSlot(slot, file, true);
+                else showToast('已取消上传。', 'info');
+                return SLOT_MUTATION_HANDLED;
             }
-            return;
-        }
-
-        if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errText}`);
-        }
-
-        const data = await response.json();
-        if (data.status !== 'ok' || !data.video) {
-            throw new Error(data.message || data.error || '上传失败');
-        }
-
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok || data.status !== 'ok' || !data.video) {
+                throw new Error(data.message || data.error || `HTTP ${resp.status}`);
+            }
+            return data;
+        },
         // 覆盖的是同名 vid_NNN.mp4：不推进缓存版本，卡片会继续播旧片
-        bustImageCache(data.video.url || data.video.file);
-
-        applyManifestPatchToIdea(ownerIdea, { video: data.video, dropMerged: true });
-        if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
-        await reloadManifestIntoIdea(ownerIdea);
-        if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
-        showToast(`第 ${slot} 段视频已手动覆盖成功。`, "success");
-    } catch (e) {
-        console.error(`Failed to upload video for slot ${slot}:`, e);
-        showToast(`第 ${slot} 段视频上传失败: ${e.message}`, "error");
-        if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
-    } finally {
-        if (guarded) endSlotMutation();
-        if (isViewingIdea(ownerIdea.id)) {
-            if (progress) progress.style.display = 'none';
-            setVideoGridButtonsBusy(false);
-            setVideoUploadButtonsBusy(false);
-        }
-    }
+        bust: (d) => [d.video],
+        patch: (d) => ({ video: d.video, dropMerged: true }),
+        success: () => `第 ${slot} 段视频已手动覆盖成功。`,
+    }).finally(() => {
+        if (progress && ownerIdea && isViewingIdea(ownerIdea.id)) progress.style.display = 'none';
+    });
 }
 
 // 视频槽位之间的手动换位/复制（拖拽一张视频卡片到另一张卡片上时调用，见
@@ -1744,131 +1804,57 @@ async function uploadVideoToSlot(slot, file, force = false) {
 // 换位后首尾帧多半不再对应新槽位期望的锚点图，后端会把 anchor_check 标成"未重新
 // 校验"，这里额外提示一句，免得事后误以为它验过了。
 async function swapVideoSlots(fromSlot, toSlot, mode = 'swap') {
-    if (!currentIdea) {
-        showToast("请先激发一个创意点子！", "error");
-        return;
-    }
-    const ownerIdea = currentIdea;
-    if (isIdeaTaskActive(ownerIdea.id, 'videos')) {
-        showToast("该创意的视频序列正在生成/重试中，请稍候", "error");
-        return;
-    }
-    if (!Number.isFinite(fromSlot) || !Number.isFinite(toSlot) || fromSlot === toSlot) return;
-    if (!beginSlotMutation('槽位改动')) return;
-
-    const meta = document.getElementById('videos-meta');
-    if (meta) meta.textContent = mode === 'copy'
-        ? `正在把第 ${fromSlot} 段视频复制到第 ${toSlot} 段...`
-        : `正在把第 ${fromSlot} 段与第 ${toSlot} 段视频换位...`;
-    setVideoGridButtonsBusy(true);
-    setVideoUploadButtonsBusy(true);
-
-    try {
-        const resp = await fetch('/api/swap_video_slots', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                title: getIdeaSaveTitle(ownerIdea),
-                from_slot: fromSlot,
-                to_slot: toSlot,
-                mode
-            })
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok || data.status === 'error') {
-            throw new Error(data.error || data.message || `HTTP ${resp.status}`);
-        }
-
+    if (!Number.isFinite(fromSlot) || !Number.isFinite(toSlot) || fromSlot === toSlot) return false;
+    return mutateSlot({
+        what: '视频换位',
+        scope: 'videos',
+        meta: mode === 'copy'
+            ? `正在把第 ${fromSlot} 段视频复制到第 ${toSlot} 段...`
+            : `正在把第 ${fromSlot} 段与第 ${toSlot} 段视频换位...`,
+        request: () => slotPostJson('/api/swap_video_slots', {
+            title: getIdeaSaveTitle(currentIdea),
+            from_slot: fromSlot, to_slot: toSlot, mode,
+        }),
         // 换位是"文件名不变、内容互换"——不推进缓存版本的话，重渲出来的两张卡片
         // 会原样播浏览器缓存里的旧片，界面看着像什么都没发生。
-        bustSlotMedia(data.videos, 'slot', [fromSlot, toSlot]);
-
-        // 先用后端回的清单立刻重渲，再去拉权威清单/持久化创意库
-        applyManifestPatchToIdea(ownerIdea, { videos: data.videos, dropMerged: true });
-        if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
-        await reloadManifestIntoIdea(ownerIdea);
-        if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
-
-        const action = mode === 'copy' ? '复制' : (data.moved ? '搬运' : '换位');
-        showToast(`已把第 ${fromSlot} 段视频${action}到第 ${toSlot} 段（首尾帧未重新校验，必要时重跑该槽位）。`, "success");
-    } catch (e) {
-        console.error(`Failed to swap video slots ${fromSlot} -> ${toSlot}:`, e);
-        showToast(`视频换位失败: ${e.message}`, "error");
-        if (isViewingIdea(ownerIdea.id)) renderVideosForIdea(ownerIdea);
-    } finally {
-        endSlotMutation();
-        if (isViewingIdea(ownerIdea.id)) {
-            setVideoGridButtonsBusy(false);
-            setVideoUploadButtonsBusy(false);
-        }
-    }
+        bust: (d) => (d.videos || []).filter(
+            v => v && [fromSlot, toSlot].includes(Number(v.slot))),
+        patch: (d) => ({ videos: d.videos, dropMerged: true }),
+        success: (d) => `已把第 ${fromSlot} 段视频`
+            + `${mode === 'copy' ? '复制' : (d.moved ? '搬运' : '换位')}`
+            + `到第 ${toSlot} 段（首尾帧未重新校验，必要时重跑该槽位）。`,
+    });
 }
 
 // 帧槽位之间的手动换位/复制（拖一张帧卡片到另一张帧卡片上时调用）。与视频换位同构，
 // 多出来的是 i2i 血统：帧序列是单链，任何一格的图被换掉，较小那个槽位之后的帧就都还
 // 派生自旧链——后端统一标 stale_lineage，前端据此显示 Stale 徽标。
 async function swapFrameSlots(fromSeq, toSeq, mode = 'swap') {
-    if (!currentIdea) {
-        showToast("请先激发一个创意点子！", "error");
-        return;
-    }
-    const ownerIdea = currentIdea;
-    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
-        showToast("该创意的帧序列正在生成/修复中，请稍候", "error");
-        return;
-    }
-    if (!Number.isFinite(fromSeq) || !Number.isFinite(toSeq) || fromSeq === toSeq) return;
-    if (!beginSlotMutation('槽位改动')) return;
-
-    const meta = document.getElementById('frames-meta');
-    if (meta) meta.textContent = mode === 'copy'
-        ? `正在把第 ${fromSeq} 帧复制到第 ${toSeq} 帧...`
-        : `正在把第 ${fromSeq} 帧与第 ${toSeq} 帧换位...`;
-    setFrameGridButtonsBusy(true);
-
-    try {
-        const resp = await fetch('/api/swap_frame_slots', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                title: getIdeaSaveTitle(ownerIdea),
-                from_sequence: fromSeq,
-                to_sequence: toSeq,
-                mode
-            })
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok || data.status === 'error' || data.error) {
-            throw new Error(data.error || data.message || `HTTP ${resp.status}`);
-        }
-
-        // 同视频换位：两格的文件名没变、内容互换了，缓存版本不推进就看不出变化
-        bustSlotMedia(data.frames, 'sequence', [fromSeq, toSeq]);
-
-        applyManifestPatchToIdea(ownerIdea, { frames: data.frames, dropMerged: true });
-        if (isViewingIdea(ownerIdea.id)) {
-            renderFramesForIdea(ownerIdea);
-            renderVideosForIdea(ownerIdea);
-        }
-        await reloadManifestIntoIdea(ownerIdea);
-        if (isViewingIdea(ownerIdea.id)) {
-            renderFramesForIdea(ownerIdea);
-            renderVideosForIdea(ownerIdea);
-        }
-        const action = mode === 'copy' ? '复制' : (data.moved ? '搬运' : '换位');
-        showToast(`已把第 ${fromSeq} 帧${action}到第 ${toSeq} 帧。`, "success");
-        const affected = data.affected_video_slots || [];
-        if (affected.length) {
-            showToast(`受影响的视频片段：VID ${affected.map(s => String(s).padStart(3, '0')).join(' / ')}，建议重跑。`, "info");
-        }
-    } catch (e) {
-        console.error(`Failed to swap frames ${fromSeq} -> ${toSeq}:`, e);
-        showToast(`帧换位失败: ${e.message}`, "error");
-        if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
-    } finally {
-        endSlotMutation();
-        if (isViewingIdea(ownerIdea.id)) setFrameGridButtonsBusy(false);
-    }
+    if (!Number.isFinite(fromSeq) || !Number.isFinite(toSeq) || fromSeq === toSeq) return false;
+    return mutateSlot({
+        what: '帧换位',
+        // 帧换位会让视频锚点失效，两个网格都要重渲；但只有帧网格在跑任务时才该
+        // 拦住这次操作，忙态也只落在帧网格上（与改造前一致）
+        scope: 'both', busyScope: 'frames', blockOn: ['frames'],
+        meta: mode === 'copy'
+            ? `正在把第 ${fromSeq} 帧复制到第 ${toSeq} 帧...`
+            : `正在把第 ${fromSeq} 帧与第 ${toSeq} 帧换位...`,
+        request: () => slotPostJson('/api/swap_frame_slots', {
+            title: getIdeaSaveTitle(currentIdea),
+            from_sequence: fromSeq, to_sequence: toSeq, mode,
+        }),
+        bust: (d) => (d.frames || []).filter(
+            f => f && [fromSeq, toSeq].includes(Number(f.sequence))),
+        patch: (d) => ({ frames: d.frames, dropMerged: true }),
+        success: (d) => `已把第 ${fromSeq} 帧`
+            + `${mode === 'copy' ? '复制' : (d.moved ? '搬运' : '换位')}到第 ${toSeq} 帧。`,
+        extraToasts: (d) => {
+            const affected = d.affected_video_slots || [];
+            return affected.length
+                ? [[`受影响的视频片段：VID ${affected.map(padSlot).join(' / ')}，建议重跑。`, 'info']]
+                : [];
+        },
+    });
 }
 
 // 一次拖进来多张图片：从落点那一格起按文件名顺序往后依次填。文件多于剩余槽位时
@@ -1907,34 +1893,41 @@ async function uploadFramesFromDrop(startSeq, files) {
         return;
     }
 
-    if (!beginSlotMutation('槽位改动')) return;
-    try {
-        for (let i = 0; i < batch.length; i++) {
-            // 闸门已经由这次批量操作持有，逐张调用时不再重复抢
-            await uploadFrameToSlot(startSeq + i, batch[i], true);
-        }
-        showToast(`已批量覆盖 IMG ${String(startSeq).padStart(3, '0')} – IMG ${String(endSeq).padStart(3, '0')}（共 ${batch.length} 张）。`, "success");
-    } finally {
-        endSlotMutation();
-    }
+    // 批量整体持有闸门，逐张调用时不再重复抢；每张各自完成 patch/重渲，
+    // 所以这里不给 patch，外壳只负责闸门与忙态。
+    await mutateSlot({
+        what: '批量上传',
+        scope: 'frames', requirePrompt: true,
+        request: async () => {
+            for (let i = 0; i < batch.length; i++) {
+                await uploadFrameToSlot(startSeq + i, batch[i], true);
+            }
+            return {};
+        },
+        success: () => `已批量覆盖 IMG ${padSlot(startSeq)} – IMG ${padSlot(endSeq)}`
+            + `（共 ${batch.length} 张）。`,
+    });
 }
 
 // 删除一整拍：图片 N 与视频 N 的提示词、落盘文件、manifest 记录一起消失，其后所有
 // 图片/视频整体前移一位（槽位号是契约不是标签——视频 N 恒等于 IMG N → IMG N+1，
 // 留空洞会让配对/合成的每一处都得学会跳过它，见 server.py /api/delete_slot）。
-// 删除不可撤销（文件直接从磁盘移除），因此确认框里逐条列清会消失什么。
-async function deleteSlotBeat(seq) {
+// 服务端会在重新编号前强制保存 .deleted_slots 恢复快照；确认框仍逐条
+// 列清当前任务中会消失什么，但不再误导用户认为磁盘上永久不可恢复。
+// opts.skipConfirm：批量删除时用——那条路径已经一次性列清了要删哪几拍，
+// 每拍再弹一次确认只会让人机械点确定。返回 true/false 供批量循环判断要不要继续。
+async function deleteSlotBeat(seq, opts = {}) {
     if (!currentIdea || !currentIdea.prompt_block) {
         showToast("请先激发一个创意点子！", "error");
-        return;
+        return false;
     }
     const ownerIdea = currentIdea;
     if (isIdeaTaskActive(ownerIdea.id, 'frames') || isIdeaTaskActive(ownerIdea.id, 'videos')) {
         showToast("该创意的帧/视频序列正在生成中，请等它结束后再删除", "error");
-        return;
+        return false;
     }
     const sequence = Number(seq);
-    if (!Number.isFinite(sequence) || sequence < 1) return;
+    if (!Number.isFinite(sequence) || sequence < 1) return false;
 
     const slots = (typeof resolvePromptSlots === 'function' ? resolvePromptSlots(ownerIdea) : []) || [];
     const imageSlots = slots.filter(s => s.type === 'image');
@@ -1942,7 +1935,7 @@ async function deleteSlotBeat(seq) {
     const imageCount = imageSlots.length;
     if (imageCount <= 1) {
         showToast("本单只剩最后一张图片，删掉就没有序列了", "error");
-        return;
+        return false;
     }
 
     const label = String(sequence).padStart(3, '0');
@@ -1952,77 +1945,204 @@ async function deleteSlotBeat(seq) {
     const seam = sequence > 1
         ? `<li>VID ${String(sequence - 1).padStart(3, '0')} 的尾锚点会换成另一张图，标记为待重跑</li>`
         : '';
-    const proceed = await customConfirm(
-        `<b>删除第 ${sequence} 拍</b>（不可撤销，文件直接从磁盘删除）：`
-        + '<ul style="margin:8px 0 0 18px; line-height:1.7;">'
-        + `<li>提示词「图片 ${sequence}」${videoSlot ? `与「视频 ${sequence}」` : ''}从提示词块中删除</li>`
-        + `<li>IMG ${label}${videoSlot ? ` 与 VID ${label}` : ''} 的文件删除</li>`
-        + tail + seam
-        + '</ul>'
-    );
-    if (!proceed) {
-        showToast('已取消删除。', 'info');
+    if (!opts.skipConfirm) {
+        const proceed = await customConfirm(
+            `<b>删除第 ${sequence} 拍</b>（会先自动保存恢复快照）：`
+            + '<ul style="margin:8px 0 0 18px; line-height:1.7;">'
+            + `<li>提示词「图片 ${sequence}」${videoSlot ? `与「视频 ${sequence}」` : ''}从提示词块中删除</li>`
+            + `<li>IMG ${label}${videoSlot ? ` 与 VID ${label}` : ''} 的文件删除</li>`
+            + tail + seam
+            + '</ul>'
+        );
+        if (!proceed) {
+            showToast('已取消删除。', 'info');
+            return false;
+        }
+    }
+    return mutateSlot({
+        what: `删除第 ${sequence} 拍`,
+        ownerIdea, scope: 'both', requirePrompt: true,
+        blockOn: [],   // 前置检查在上面做过了（要同时拦帧与视频任务）
+        request: () => slotPostJson('/api/delete_slot', {
+            title: getIdeaSaveTitle(ownerIdea),
+            sequence,
+            prompt_block: ownerIdea.prompt_block || '',
+        }),
+        // 整体前移＝一大批同名文件换了内容，逐个作废缓存版本，否则网格拿旧图重排
+        bust: (d) => [].concat(d.frames || [], d.videos || []),
+        // 提示词块是这一切的源头（槽位总数按它算），必须先落到创意对象上再重渲
+        beforeApply: async (d) => {
+            if (d.prompt_block) {
+                await applyPromptBlockToIdea(ownerIdea, d.prompt_block, d.prompt_slots);
+            }
+        },
+        patch: (d) => ({ frames: d.frames, videos: d.videos, dropMerged: true }),
+        success: (d) => `已删除第 ${sequence} 拍，其后整体前移一位（现有 ${d.image_count} 张图片）。`,
+        extraToasts: (d) => {
+            const out = [];
+            // 撤销入口紧跟着删除出现：快照就在手边，此刻是最可能想反悔的时候。
+            // 过了这一会儿仍可从 ⚙「已删除的拍」里恢复，见 openDeletedSlotsPanel。
+            const snapshotId = String(d.recovery_snapshot || '')
+                .split(/[\\/]/).filter(Boolean).pop();
+            if (snapshotId && !opts.skipConfirm) offerSlotRestore(ownerIdea, snapshotId, sequence);
+            const affected = d.affected_video_slots || [];
+            if (affected.length) {
+                out.push([`VID ${affected.map(padSlot).join(' / ')} 的尾锚点已改变，建议重跑这一段。`, 'info']);
+            }
+            return out;
+        },
+    });
+}
+
+// =====================================================================
+// 撤销删除整拍
+//   删除侧一直在写 .deleted_slots/<id>/ 快照（删除前的整份 manifest 与
+//   prompt_block ＋ 所有被物理删除的媒体文件），但读回那一半此前从未实现，
+//   一次误删只能靠手写一次性脚本捞回来（tools/recover_ice_cave_slot3.py）。
+//   这里补上读回：紧跟删除的一次性「撤销」，以及 ⚙ 弹层里的「已删除的拍」列表。
+// =====================================================================
+
+/** 删除成功后立刻给一个限时撤销出口。30 秒是"还在看着这一格"的窗口。 */
+function offerSlotRestore(ownerIdea, snapshotId, sequence) {
+    showToast(`第 ${sequence} 拍已删除`, 'info', 30000, {
+        label: '撤销',
+        onClick: () => restoreSlotSnapshot(ownerIdea, snapshotId),
+    });
+}
+
+/**
+ * 恢复一份删除快照。走与 deleteSlotBeat 同一套流程：抢闸门 → 请求 → 提示词块
+ * 落回创意对象 → 乐观 patch → 重渲 → 拉权威清单 → 再重渲。
+ *
+ * 服务端可能回 409 status='diverged'：删除之后这单又被改动过（重新生成/重试/
+ * 上传等），恢复会把清单整份还原成删除前那一版、丢掉之后新产生的记录。这种
+ * 情况必须由用户确认后带 force=true 重来，不能默默覆盖。
+ */
+async function restoreSlotSnapshot(ownerIdea, snapshotId, force = false) {
+    if (!ownerIdea) return false;
+    return mutateSlot({
+        what: '恢复整拍',
+        ownerIdea, scope: 'both',
+        // force=true 是同一次用户操作在 409 确认后的续跑，闸门在外层那次调用手里
+        guard: !force,
+        request: async () => {
+            const resp = await fetch('/api/restore_slot', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    title: getIdeaSaveTitle(ownerIdea),
+                    snapshot_id: snapshotId,
+                    // 当前提示词块一并交给服务端存进"恢复点"，让恢复本身也可回头
+                    prompt_block: ownerIdea.prompt_block || '',
+                    force: !!force,
+                }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (resp.status === 409 && data.status === 'diverged') {
+                // 删除之后这单又被改动过：恢复会把清单整份还原成删除前那一版、
+                // 丢掉之后新产生的记录，必须由用户确认后带 force 重来
+                const proceed = await customConfirm(escapeHtml(
+                    data.error || '这单在删除之后被改动过，仍要恢复吗？'));
+                if (proceed) await restoreSlotSnapshot(ownerIdea, snapshotId, true);
+                else showToast('已取消恢复。', 'info');
+                return SLOT_MUTATION_HANDLED;
+            }
+            if (!resp.ok || data.status === 'error' || data.error) {
+                throw new Error(data.error || data.message || `HTTP ${resp.status}`);
+            }
+            return data;
+        },
+        // 整体后移＝一大批同名文件换了内容，逐个作废缓存版本
+        bust: (d) => [].concat(d.frames || [], d.videos || []),
+        beforeApply: async (d) => {
+            if (d.prompt_block) {
+                await applyPromptBlockToIdea(ownerIdea, d.prompt_block, d.prompt_slots);
+            }
+        },
+        patch: (d) => ({ frames: d.frames, videos: d.videos, dropMerged: true }),
+        success: (d) => `已恢复第 ${d.sequence} 拍，其后整体后移一位（现有 ${d.image_count} 张图片）。`,
+        failure: (e) => `恢复失败: ${e.message}`,
+    });
+}
+
+async function fetchDeletedSlots(ownerIdea) {
+    const resp = await fetch('/api/deleted_slots?title='
+        + encodeURIComponent(getIdeaSaveTitle(ownerIdea)));
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+    return data.snapshots || [];
+}
+
+/** ⚙ 弹层里的「已删除的拍」：撤销窗口过去之后仍能从这里恢复。 */
+async function openDeletedSlotsPanel() {
+    if (!currentIdea) {
+        showToast('请先打开一个创意', 'error');
         return;
     }
-    if (!beginSlotMutation('槽位改动')) return;
-
-    setFrameGridButtonsBusy(true);
-    setVideoGridButtonsBusy(true);
+    const ownerIdea = currentIdea;
+    let snapshots;
     try {
-        const resp = await fetch('/api/delete_slot', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                title: getIdeaSaveTitle(ownerIdea),
-                sequence,
-                prompt_block: ownerIdea.prompt_block || ''
-            })
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok || data.status === 'error' || data.error) {
-            throw new Error(data.error || data.message || `HTTP ${resp.status}`);
-        }
-
-        // 整体前移＝一大批同名文件换了内容，逐个作废缓存版本，否则网格会拿旧图重排
-        (data.frames || []).forEach(f => bustImageCache(f.url || f.file));
-        (data.videos || []).forEach(v => bustImageCache(v.url || v.file));
-
-        // 提示词块是这一切的源头（槽位总数按它算），必须先落到创意对象上再重渲
-        if (data.prompt_block) {
-            await applyPromptBlockToIdea(ownerIdea, data.prompt_block, data.prompt_slots);
-        }
-        applyManifestPatchToIdea(ownerIdea, {
-            frames: data.frames, videos: data.videos, dropMerged: true
-        });
-        if (isViewingIdea(ownerIdea.id)) {
-            renderFramesForIdea(ownerIdea);
-            renderVideosForIdea(ownerIdea);
-        }
-        await reloadManifestIntoIdea(ownerIdea);
-        if (isViewingIdea(ownerIdea.id)) {
-            renderFramesForIdea(ownerIdea);
-            renderVideosForIdea(ownerIdea);
-        }
-
-        showToast(`已删除第 ${sequence} 拍，其后整体前移一位（现有 ${data.image_count} 张图片）。`, "success");
-        const affected = data.affected_video_slots || [];
-        if (affected.length) {
-            showToast(`VID ${affected.map(s => String(s).padStart(3, '0')).join(' / ')} 的尾锚点已改变，建议重跑这一段。`, "info");
-        }
+        snapshots = await fetchDeletedSlots(ownerIdea);
     } catch (e) {
-        console.error(`Failed to delete slot ${sequence}:`, e);
-        showToast(`删除第 ${sequence} 拍失败: ${e.message}`, "error");
-        if (isViewingIdea(ownerIdea.id)) {
-            renderFramesForIdea(ownerIdea);
-            renderVideosForIdea(ownerIdea);
-        }
-    } finally {
-        endSlotMutation();
-        if (isViewingIdea(ownerIdea.id)) {
-            setFrameGridButtonsBusy(false);
-            setVideoGridButtonsBusy(false);
-        }
+        showToast(`读取已删除的拍失败: ${e.message}`, 'error');
+        return;
     }
+    const pending = snapshots.filter(s => !s.restored_at);
+    if (!pending.length) {
+        showToast('这单没有可恢复的删除记录。', 'info');
+        return;
+    }
+
+    const modal = document.createElement('div');
+    modal.className = 'modal active';
+    modal.style.zIndex = '1100';
+    modal.innerHTML = `
+        <div class="modal-content glass-panel" style="max-width: 520px;">
+            <div class="modal-header">
+                <h3>已删除的拍</h3>
+                <button class="close-btn" type="button">&times;</button>
+            </div>
+            <div class="modal-body deleted-slots-body"></div>
+        </div>`;
+    const body = modal.querySelector('.deleted-slots-body');
+    pending.forEach(s => {
+        const row = document.createElement('div');
+        row.className = 'deleted-slot-row';
+        const info = document.createElement('div');
+        info.className = 'deleted-slot-info';
+        const head = document.createElement('strong');
+        head.textContent = `第 ${s.sequence} 拍`
+            + (s.created_at ? ` · ${s.created_at.replace('T', ' ')}` : '');
+        const desc = document.createElement('span');
+        // 提示词原文来自 LLM，一律 textContent
+        desc.textContent = s.image_prompt || '（无图片提示词记录）';
+        info.append(head, desc);
+        if (s.diverged) {
+            const warn = document.createElement('span');
+            warn.className = 'deleted-slot-warn';
+            warn.textContent = '删除之后这单又被改动过，恢复会覆盖那些改动';
+            info.appendChild(warn);
+        }
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'action-btn text-btn mini-btn';
+        btn.textContent = '恢复';
+        btn.addEventListener('click', async () => {
+            btn.disabled = true;
+            const ok = await restoreSlotSnapshot(ownerIdea, s.id);
+            if (ok) close(); else btn.disabled = false;
+        });
+        row.append(info, btn);
+        body.appendChild(row);
+    });
+
+    const close = () => {
+        modal.classList.remove('active');
+        setTimeout(() => modal.remove(), 200);
+    };
+    modal.querySelector('.close-btn').addEventListener('click', close);
+    modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+    document.body.appendChild(modal);
 }
 
 // 提示词块被服务端改写后落回创意对象：currentIdea、localStorage 快照、创意库、
@@ -2065,73 +2185,35 @@ function countPromptImageSlots(idea) {
 // 其后各帧标为 stale_lineage（i2i 血统在这一帧断开）。
 // skipGuard：批量上传（uploadFramesFromDrop）时用——闸门由那次批量操作整体持有。
 async function uploadFrameToSlot(seq, file, skipGuard = false) {
-    if (!currentIdea || !currentIdea.prompt_block) {
-        showToast("请先激发一个创意点子！", "error");
-        return;
-    }
     const ownerIdea = currentIdea;
-    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
-        showToast("该创意的帧序列正在生成/修复中，请稍候", "error");
-        return;
-    }
-    const guarded = !skipGuard;
-    if (guarded && !beginSlotMutation('槽位改动')) return;
-
-    const slotCard = document.getElementById(`frame-slot-${seq}`);
-    if (slotCard) {
-        slotCard.className = 'frame-card placeholder-frame-card';
-        slotCard.innerHTML = `
-            <div class="frame-placeholder-spinner">
-                <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-            </div>
-            <span>第 ${String(seq).padStart(3, '0')} 帧 (上传中...)</span>
-        `;
-    }
-    setFrameGridButtonsBusy(true);
-
-    try {
-        const formData = new FormData();
-        formData.append('title', getIdeaSaveTitle(ownerIdea));
-        formData.append('sequence', String(seq));
-        formData.append('prompt_block', ownerIdea.prompt_block || '');
-        formData.append('image', file, file.name);
-
-        const resp = await fetch('/api/upload_frame', { method: 'POST', body: formData });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok || data.status === 'error' || data.error) {
-            throw new Error(data.error || data.message || `HTTP ${resp.status}`);
-        }
-
+    return mutateSlot({
+        what: `第 ${seq} 帧上传`,
+        ownerIdea, scope: 'both', busyScope: 'frames',
+        blockOn: ['frames'], requirePrompt: true,
+        // skipGuard：批量上传时闸门由那次批量操作整体持有
+        guard: !skipGuard,
+        pending: () => renderSlotPending('image', seq, '上传中...'),
+        request: async () => {
+            const formData = new FormData();
+            formData.append('title', getIdeaSaveTitle(ownerIdea));
+            formData.append('sequence', String(seq));
+            formData.append('prompt_block', ownerIdea.prompt_block || '');
+            formData.append('image', file, file.name);
+            return slotRequestJson('/api/upload_frame', { method: 'POST', body: formData });
+        },
         // 覆盖的是同名 img_NNN.webp：不推进缓存版本，卡片会继续显示旧图
-        const uploaded = data.frame || {};
-        bustImageCache(uploaded.url || uploaded.file);
-
-        applyManifestPatchToIdea(ownerIdea, { frame: data.frame, dropMerged: true });
-        if (isViewingIdea(ownerIdea.id)) {
-            renderFramesForIdea(ownerIdea);
-            renderVideosForIdea(ownerIdea);
-        }
-        await reloadManifestIntoIdea(ownerIdea);
-        if (isViewingIdea(ownerIdea.id)) {
-            renderFramesForIdea(ownerIdea);
-            renderVideosForIdea(ownerIdea);
-        }
+        bust: (d) => [d.frame],
+        patch: (d) => ({ frame: d.frame, dropMerged: true }),
         // 批量上传时逐张弹提示会刷屏，收尾由 uploadFramesFromDrop 统一报一次
-        if (guarded) {
-            showToast(`第 ${seq} 帧已用本地图片覆盖。`, "success");
-            const affected = data.affected_video_slots || [];
-            if (affected.length) {
-                showToast(`这张图是 VID ${affected.map(s => String(s).padStart(3, '0')).join(' / ')} 的首尾锚点，建议重跑这些片段。`, "info");
-            }
-        }
-    } catch (e) {
-        console.error(`Failed to upload frame ${seq}:`, e);
-        showToast(`第 ${seq} 帧上传失败: ${e.message}`, "error");
-        if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
-    } finally {
-        if (guarded) endSlotMutation();
-        if (isViewingIdea(ownerIdea.id)) setFrameGridButtonsBusy(false);
-    }
+        success: () => skipGuard ? null : `第 ${seq} 帧已用本地图片覆盖。`,
+        extraToasts: (d) => {
+            const affected = (!skipGuard && d.affected_video_slots) || [];
+            return affected.length
+                ? [[`这张图是 VID ${affected.map(padSlot).join(' / ')} 的首尾锚点，建议重跑这些片段。`, 'info']]
+                : [];
+        },
+        failure: (e) => `第 ${seq} 帧上传失败: ${e.message}`,
+    });
 }
 
 // 批量重试缺失/串片的视频槽位（供「合并被拦截」时一键重试用）。
@@ -2159,13 +2241,7 @@ async function retryMissingVideos(slots) {
     slots.forEach(slot => {
         const slotCard = document.getElementById(`video-slot-${slot}`);
         if (slotCard) {
-            slotCard.className = 'frame-card placeholder-frame-card';
-            slotCard.innerHTML = `
-                <div class="frame-placeholder-spinner">
-                    <div class="cover-spinner" style="width:20px; height:20px; margin-bottom:0;"></div>
-                </div>
-                <span>第 ${String(slot).padStart(3, '0')} 段视频 (重试中...)</span>
-            `;
+            renderSlotPending('video', slot, '重试中...');
         }
     });
 
@@ -2189,7 +2265,8 @@ async function retryMissingVideos(slots) {
                 display_title: ownerIdea.title,
                 prompt_block: ownerIdea.prompt_block,
                 target_slots: slots,
-                override_flagged: reviewCheck.override
+                override_flagged: reviewCheck.override,
+                merge_speed: typeof getMergeSpeed === 'function' ? getMergeSpeed() : 2
             }),
             signal: controller.signal
         });

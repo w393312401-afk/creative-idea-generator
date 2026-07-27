@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import hashlib
 import socket
 import contextlib
 import shutil
@@ -323,9 +324,21 @@ RATE_WINDOW = _int_setting('SPARK_RATE_WINDOW', 'rateWindow', 3600)
 # 把这个改回 true（或删掉这一项，默认就是 true）即可原样启用。
 RATE_LIMIT_ENABLED = SERVER_CONFIG.get('rateLimitEnabled', True) is not False
 
+def _path_setting(env_key, cfg_key, default):
+    """可被环境变量/配置覆盖的数据文件路径；不设置就是仓库根目录下那一份。
+
+    留这个口子是因为自动化测试必须能把真实创意库隔离开：测试驱动真实页面时，
+    页面的 saveLibrary() 会把它当时的 savedIdeas 整份 POST 回 /api/library，
+    指向真库就是一次整库覆盖（2026-07-27 实际发生过一次，靠 .recovery 快照
+    与 tools/recover_ice_cave_all.py 的确定性重建捞回）。
+    """
+    raw = os.environ.get(env_key) or SERVER_CONFIG.get(cfg_key) or default
+    return str(raw)
+
+
 PORT = _int_setting('PORT', 'port', 8085)
-DB_FILE = 'library.json'
-LEDGER_FILE = 'topic_ledger.json'
+DB_FILE = _path_setting('SPARK_DB_FILE', 'dbFile', 'library.json')
+LEDGER_FILE = _path_setting('SPARK_LEDGER_FILE', 'ledgerFile', 'topic_ledger.json')
 OUTPUT_ROOT = 'outputs'
 # 2026-07-12: 旧版要求 "smallest localized edit"，与"每拍必须有全画幅阶段变化"的产品方向
 # 直接对抗——提示词写了大变换、控制指令又叫模型最小化改动，结果就是整单"挤牙膏"式微小
@@ -1485,7 +1498,7 @@ def register_ledger_candidates(ideas, path=None, source='Ideation Pool'):
                 continue
 
             score = idea.get('score', idea.get('llm_score'))
-            entries.append({
+            entry = {
                 'id': str(_uuid.uuid4()),
                 'date': today,
                 'topic_dna': dna,
@@ -1496,7 +1509,20 @@ def register_ledger_candidates(ideas, path=None, source='Ideation Pool'):
                 'llm_score': score if isinstance(score, (int, float)) and not isinstance(score, bool) else None,
                 'user_score': None,
                 'performance_note': '',
-            })
+            }
+            # 新入账创意保留二创所需的原始要素；旧台账没有该字段时，前端仍可用
+            # one_line + topic_dna 作为精简母题。只收白名单并限制长度，避免把整份
+            # 客户端 dimensions 或异常大 payload 永久塞进台账。
+            raw_seed = idea.get('creative_seed')
+            if isinstance(raw_seed, dict):
+                seed = {}
+                for field in ('input_str', 'carrier', 'env', 'trauma', 'destiny', 'twist', 'twist_zh'):
+                    value = raw_seed.get(field)
+                    if isinstance(value, (str, int, float)) and str(value).strip():
+                        seed[field] = str(value).strip()[:500]
+                if seed:
+                    entry['creative_seed'] = seed
+            entries.append(entry)
             if dna_key:
                 dna_keys.add(dna_key)
             if title_key:
@@ -1698,6 +1724,39 @@ def drop_stale_review_verdicts(manifest, project_dir):
     if changed:
         manifest.pop('chain_drift', None)
     return [s for s in changed if isinstance(s, int)]
+
+
+def manifest_fingerprint(manifest):
+    """一份 manifest 的内容指纹，用于判断"这单在某次操作之后有没有被继续改动过"。
+
+    只取真正代表"这单当前有哪些内容"的字段：帧号 + 帧文件 + 质检结论、视频槽位 +
+    文件 + 状态、以及有没有成片。刻意不含时间戳/耗时/重试次数这类每次写 manifest
+    都会变、却不代表内容变化的字段——否则撤销删除永远会被判成"已被改动过"。
+
+    见 /api/delete_slot 写快照与 /api/restore_slot 的分歧检查。
+    """
+    m = manifest or {}
+    frames = sorted(
+        (
+            f.get('sequence') or f.get('slot'),
+            f.get('file') or f.get('url') or '',
+            f.get('quality_gate') or '',
+        )
+        for f in (m.get('frames') or []) if isinstance(f, dict)
+    )
+    videos = sorted(
+        (
+            v.get('slot'),
+            v.get('file') or v.get('url') or '',
+            v.get('status') or '',
+        )
+        for v in (m.get('videos') or []) if isinstance(v, dict)
+    )
+    payload = json.dumps(
+        {'frames': frames, 'videos': videos,
+         'merged': bool((m.get('merged_video') or {}).get('url'))},
+        ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
 def read_manifest(project_dir):

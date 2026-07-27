@@ -1284,12 +1284,14 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
     def _run_chunk_batch(chunk_prompts, ref_path, leg):
         """跑一批：先绑这一批的号池账号，再交给外部批量脚本。"""
-        user_id = (leg or {}).get('user_id')
+        user_id = (leg or {}).get('user_id') or pool_account_id or config.get('googleFxUserId')
         if user_id:
             config['googleFxUserId'] = user_id
             apply_google_fx_runtime_overrides(config)
-        return _fx_generate_batch(google_fx, fx_models, config, chunk_prompts, ref_path,
-                                  cancel_fn=cancel_fn)
+        from integrations.google_fx.utils import account_binding
+        with account_binding.bound_task_account(user_id):
+            return _fx_generate_batch(google_fx, fx_models, config, chunk_prompts, ref_path,
+                                      cancel_fn=cancel_fn)
 
     manifest_path = os.path.join(project_dir, 'manifest.json')
     manifest = {

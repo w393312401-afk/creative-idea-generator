@@ -94,13 +94,22 @@ function updateConfigSummary() {
     const beatsVal = document.getElementById('slider-beats').value;
     const beatMode = ((document.getElementById('beat-count-mode') || {}).value || 'adaptive') === 'fixed'
         ? '固定' : '自适应上限';
+    const pacingId = (typeof loadedIdeationCover !== 'undefined' && loadedIdeationCover
+        && loadedIdeationCover.pacing_skeleton) || '';
+    const pacingText = pacingId === 'dual_payoff' ? '内外双重完工'
+        : (pacingId === 'linear_milestone' ? '单线里程碑' : '未载入');
     
-    const summaryText = `${themeText}${anchorsStr} | 复杂度:${complexityText}, 预算:${budgetText}, 反差:${ratioVal}%, 尺度:${creativityText}, ${beatMode}:${beatsVal}拍`;
+    const summaryText = `${themeText}${anchorsStr} | 骨架:${pacingText}, 复杂度:${complexityText}, 预算:${budgetText}, 反差:${ratioVal}%, 尺度:${creativityText}, ${beatMode}:${beatsVal}拍`;
     
     const summaryEl = document.getElementById('config-summary-text');
     if (summaryEl) {
         summaryEl.textContent = summaryText;
     }
+
+    // 摘要框本身在极简布局里不显示了（7 项里 4 项是永久固定的隐藏值），会变的
+    // 三项改由激发轨呈现。这里搭车刷新——本函数已覆盖初始化 / 滑杆变更 /
+    // 卡片载入 / 骨架勾选 / 面板切换这几乎全部时机。见 js/spark_rail.js
+    if (typeof updateSparkRail === 'function') updateSparkRail();
 }
 
 function applyPreset(presetName) {

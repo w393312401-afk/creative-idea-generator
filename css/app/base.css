@@ -1514,6 +1514,71 @@ html[data-theme="dark"] select optgroup {
     transform: translateY(10px);
 }
 
+/* toast 上的行动按钮（目前只有删除整拍后的「撤销」）：贴右侧，
+   与正文之间留出明确的分隔，免得看着像正文的一部分。 */
+.toast-action {
+    margin-left: auto;
+    flex: 0 0 auto;
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--text-main);
+    background: rgba(var(--ink-rgb), 0.06);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+.toast-action:hover:not(:disabled) {
+    background: rgba(var(--ink-rgb), 0.14);
+    border-color: var(--neon-cyan);
+}
+
+.toast-action:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+/* 「已删除的拍」列表 */
+.deleted-slots-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-top: 10px;
+}
+
+.deleted-slot-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: rgba(var(--ink-rgb), 0.03);
+}
+
+.deleted-slot-info {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+    flex: 1;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.deleted-slot-info span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.deleted-slot-warn {
+    color: #f59e0b;
+    font-weight: 600;
+}
+
 /* 变体：色彩水洗层叠在不透明面板底之上，两种主题下都保持可读 */
 .toast.success {
     border-color: rgba(16, 185, 129, 0.45);

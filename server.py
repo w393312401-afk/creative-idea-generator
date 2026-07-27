@@ -1401,9 +1401,10 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
             else:
                 # Try to automatically merge videos
                 try:
-                    progress_cb('merge_start', {'message': '正在自动合并并加速视频...'})
+                    merge_speed = config.get('_merge_speed', 2)
+                    progress_cb('merge_start', {'message': f'正在自动以 {merge_speed}x 速率合并视频...'})
                     project_dir = _get_project_dir(title)
-                    merged_info = merge_project_videos(project_dir)
+                    merged_info = merge_project_videos(project_dir, speed=merge_speed)
                     if merged_info:
                         result['merged_video'] = merged_info
                         # Also update manifest file on disk (locked read-modify-write)
@@ -1895,6 +1896,60 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'error': str(e)}, status=500)
             else:
                 self._send_json({'error': 'Not found'}, status=404)
+        elif path == '/api/deleted_slots':
+            # 这单删过哪些拍、哪些还能撤销。数据源是 /api/delete_slot 写下的
+            # .deleted_slots/<id>/ 快照目录，见 /api/restore_slot。
+            if not self._gate():
+                return
+            title = query.get('title', [''])[0]
+            if not title:
+                self._send_json({'error': 'Missing title'}, status=400)
+                return
+            project_dir = _get_project_dir(title)
+            root = os.path.join(project_dir, '.deleted_slots')
+            items = []
+            try:
+                if os.path.isdir(root):
+                    current_fp = manifest_fingerprint(read_manifest(project_dir) or {})
+                    for name in sorted(os.listdir(root), reverse=True):
+                        # 恢复点（*_restorepoint_of_*）是恢复操作自己留的底，
+                        # 不是可撤销的删除，不列进来
+                        if not re.fullmatch(r'\d{8}_\d{6}_\d+_slot_\d{3}', name):
+                            continue
+                        d = os.path.join(root, name)
+                        if not os.path.isdir(d):
+                            continue
+                        state, removed = {}, {}
+                        for fname, target in (('state.json', 'state'), ('removed.json', 'removed')):
+                            fp = os.path.join(d, fname)
+                            if os.path.isfile(fp):
+                                try:
+                                    with open(fp, 'r', encoding='utf-8') as f:
+                                        loaded = json.load(f) or {}
+                                except (json.JSONDecodeError, OSError):
+                                    loaded = {}
+                                if target == 'state':
+                                    state = loaded
+                                else:
+                                    removed = loaded
+                        expected_fp = state.get('manifest_after_fingerprint')
+                        items.append({
+                            'id': name,
+                            'sequence': state.get('sequence') or removed.get('sequence'),
+                            'created_at': state.get('created_at'),
+                            'restored_at': state.get('restored_at'),
+                            # 早于本次改造的快照没有 state.json，恢复仍可进行，
+                            # 只是没法判断这单在删除之后有没有被改动过
+                            'has_fingerprint': bool(expected_fp),
+                            'diverged': bool(expected_fp) and expected_fp != current_fp,
+                            'image_prompt': (removed.get('image_prompt') or '')[:160],
+                            'video_prompt': (removed.get('video_prompt') or '')[:160],
+                            'archived_frame_slots': state.get('archived_frame_slots') or [],
+                            'archived_video_slots': state.get('archived_video_slots') or [],
+                        })
+                self._send_json({'status': 'ok', 'snapshots': items})
+            except OSError as e:
+                self._send_json({'error': str(e)}, status=500)
         elif path == '/api/logs/stream':
             # 服务日志包含内部路径/任务详情，必须过门禁（EventSource 用 ?access_code= 传码）
             if not self._gate():
@@ -2466,6 +2521,41 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                             'status': 'rejected',
                             'message': f'拒绝将非空创意库（{existing_count} 条）覆盖为空：客户端库状态疑似错乱，'
                                        f'请刷新页面重新加载库后再操作；如确要清空请逐条删除。'
+                        }, status=409)
+                        return
+                    # 同一创意内部也必须自洽：浏览器旧页曾把 9 格 prompt_slots 与
+                    # 10 帧 frameRun 一起回写，随后删除接口按较小的提示词编号操作，
+                    # 最终误删了另一拍。带 frameRun 的记录若两边数量不同，说明页面
+                    # 已过期或局部状态错位，整条写入必须失败并要求刷新。
+                    inconsistent = []
+                    if isinstance(data, list):
+                        for idea in data:
+                            if not isinstance(idea, dict):
+                                continue
+                            slots = idea.get('prompt_slots') or {}
+                            slot_images = slots.get('images') if isinstance(slots, dict) else None
+                            frame_run = idea.get('frameRun') or {}
+                            run_frames = frame_run.get('frames') if isinstance(frame_run, dict) else None
+                            if not isinstance(slot_images, list) or not isinstance(run_frames, list):
+                                continue
+                            prompt_count = len({item.get('index') for item in slot_images
+                                                if isinstance(item, dict) and
+                                                isinstance(item.get('index'), int)})
+                            frame_count = len({item.get('sequence') or item.get('slot')
+                                               for item in run_frames if isinstance(item, dict) and
+                                               isinstance(item.get('sequence') or item.get('slot'), int)})
+                            if prompt_count and frame_count and prompt_count != frame_count:
+                                inconsistent.append({
+                                    'id': idea.get('id'),
+                                    'prompt_count': prompt_count,
+                                    'frame_count': frame_count,
+                                })
+                    if inconsistent:
+                        self._send_json({
+                            'status': 'rejected',
+                            'message': '创意页面槽位状态已过期，已阻止覆盖；请刷新页面后重试。',
+                            'refresh_required': True,
+                            'inconsistent_ideas': inconsistent,
                         }, status=409)
                         return
                     if existing_count > 0:
@@ -3164,18 +3254,15 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 theme = body.get('theme')
                 theme_label = body.get('theme_label')
                 trend_ref_ids = body.get('trend_ref_ids') or []
+                pacing_skeleton_ids = body.get('pacing_skeleton_ids') or []
+                remix_seed = body.get('remix_seed')
 
                 result = run_ideate(config, count, theme=theme, theme_label=theme_label,
-                                    trend_ref_ids=trend_ref_ids)
-                # 激发成功即自动入账，而不是依赖用户逐张点“存入备选”。服务端原子
-                # 追加保证并发请求不会通过“GET + 整表 POST”互相覆盖；若台账损坏则
-                # 整个请求失败，避免把未受后续去重保护的创意交给前端。
-                ledger_result = register_ledger_candidates(result['ideas'])
+                                    trend_ref_ids=trend_ref_ids, remix_seed=remix_seed,
+                                    pacing_skeleton_ids=pacing_skeleton_ids)
                 self._send_json({
                     'status': 'ok',
                     'ideas': result['ideas'],
-                    'ledger_registered': ledger_result['added'],
-                    'ledger_duplicates': ledger_result['duplicates'],
                     # 本批注入过灵感 prompt 的联网参考(搜索词摘要/自定义网址摘要),
                     # 前端展示成可折叠面板,让用户能看到"搜到了什么"
                     'trend_refs': result.get('trend_refs') or [],
@@ -3197,6 +3284,15 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 task_id = body.get('task_id')
                 if not task_id:
                     task_id = str(int(time.time() * 1000))
+
+                # 灵感推荐只负责展示候选，不再整批入账。只有用户真正启动激发/合成
+                # 的那一条，前端才会随 dimensions 带上 ledger_candidate；在创建后台
+                # 任务前原子登记，确保未被激发的卡片不会污染台账及后续去重范围。
+                # 这是请求级持久化元数据，不属于创意维度；取走后再交给合成器，避免
+                # 它进入 LLM prompt、任务快照或断点续传指纹。
+                ledger_candidate = dimensions.pop('ledger_candidate', None)
+                if isinstance(ledger_candidate, dict):
+                    register_ledger_candidates([ledger_candidate], source='Creative Activation')
 
                 # Start background thread
                 cleanup_old_tasks()
@@ -3705,6 +3801,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 project_key = body.get('title', '')
                 title = body.get('display_title') or project_key
                 config['_project_key'] = project_key
+                config['_merge_speed'] = body.get('merge_speed', 2)
                 prompt_block = body.get('prompt_block', '')
                 target_slots = body.get('target_slots')
                 override_flagged = bool(body.get('override_flagged'))
@@ -3744,7 +3841,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 # Run the merge. force/allow_partial=True 时用占位帧填充缺口（强制合并）。
                 force = bool(body.get('force') or body.get('allow_partial'))
                 try:
-                    merged_info = merge_project_videos(project_dir, allow_partial=force)
+                    merged_info = merge_project_videos(
+                        project_dir,
+                        allow_partial=force,
+                        speed=body.get('speed', 2),
+                    )
                 except PartialMergeBlocked as blocked:
                     self._send_json({
                         'status': 'blocked',
@@ -4353,7 +4454,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
         elif path == '/api/delete_slot':
             # 删除一整拍（帧/视频卡片上的「删除」按钮）：图片 N 与视频 N 的提示词、落盘
-            # 文件、manifest 记录一起消失，其后所有图片/视频整体前移一位。
+            # 文件、manifest 记录一起从当前任务移除，其后所有图片/视频整体前移一位。
+            # 真正动文件前必须先写 .deleted_slots 恢复快照；这是与编号压缩同一个
+            # 临界区内的强制步骤，快照失败则整次删除失败，不允许降级成不可恢复删除。
             #
             # 为什么必须重新编号而不是留空洞：槽位号不是标签而是契约——视频 N 恒等于
             # IMG N → IMG N+1、视频数恒等于图片数-1，帧网格、配对门禁、合成成片全按这个
@@ -4397,6 +4500,27 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'error': f'找不到项目目录: {title}'}, status=404)
                     return
 
+                # 浏览器可能仍握着刷新前的旧 prompt_block。若它比磁盘 manifest 少一格，
+                # 继续按旧编号删除会把另一拍误当成目标，并再次压缩整个序列。删除属于
+                # 不可凭客户端旧状态猜测的操作：两边槽位数不一致时要求刷新后重试。
+                manifest_guard = read_manifest(project_dir) or {}
+                manifest_frame_slots = {
+                    item.get('sequence') or item.get('slot')
+                    for item in (manifest_guard.get('frames') or [])
+                    if isinstance(item.get('sequence') or item.get('slot'), int)
+                }
+                manifest_image_count = len(manifest_frame_slots)
+                if manifest_image_count and manifest_image_count != image_count:
+                    self._send_json({
+                        'status': 'rejected',
+                        'error': (f'页面槽位状态已过期（页面 {image_count} 张，磁盘 '
+                                  f'{manifest_image_count} 张）。已阻止删除，请刷新页面后再试。'),
+                        'refresh_required': True,
+                        'client_image_count': image_count,
+                        'manifest_image_count': manifest_image_count,
+                    }, status=409)
+                    return
+
                 import uuid
                 claim_id = f"delslot_{uuid.uuid4().hex}"
                 holder = claim_frame_run(project_dir, claim_id)
@@ -4433,6 +4557,62 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         'video_prompt': (videos.get(sequence) or {}).get('body', ''),
                     }
 
+                    frames_dir = os.path.join(project_dir, 'frames')
+                    videos_dir = os.path.join(project_dir, 'videos')
+                    fx_src_dir = os.path.join(frames_dir, 'fx_src')
+
+                    # 槽位换号表先算出来：快照要据此判断"哪些文件这次会被真的删掉"，
+                    # 所以必须排在归档之前。
+                    frame_targets = {k: _image_target(k) for k in range(1, image_count + 1)}
+                    video_slots = set(range(1, image_count + 1)) | set(videos)
+                    video_targets = {k: _video_target(k) for k in sorted(video_slots)}
+
+                    # --- 可恢复快照：必须在任何 os.remove/os.replace 之前完成 ---
+                    # 除了被删那一格，还保留整份删除前 manifest 和 prompt_block，
+                    # 因为后续整体前移会改掉所有槽位号，单留一个媒体文件不足以可靠回滚。
+                    archive_stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+                    archive_dir = os.path.join(
+                        project_dir, '.deleted_slots',
+                        f'{archive_stamp}_slot_{sequence:03d}',
+                    )
+                    os.makedirs(archive_dir, exist_ok=False)
+                    manifest_before = os.path.join(project_dir, 'manifest.json')
+                    if os.path.isfile(manifest_before):
+                        shutil.copy2(manifest_before, os.path.join(archive_dir, 'manifest.before.json'))
+                    with open(os.path.join(archive_dir, 'prompt_block.before.txt'),
+                              'w', encoding='utf-8') as f:
+                        f.write(prompt_block)
+                    with open(os.path.join(archive_dir, 'removed.json'),
+                              'w', encoding='utf-8') as f:
+                        json.dump({'title': title, 'sequence': sequence, **removed},
+                                  f, ensure_ascii=False, indent=2)
+
+                    # 归档"这次会被物理删除"的全部文件，而不只是第 sequence 拍：
+                    # 删最后一拍时，跨过删除点的那一段视频（老槽位 image_count-1）
+                    # 前移后会超出"视频数=图片数-1"而被一并删除——它此前不在快照里，
+                    # 于是那种情况下的删除是不可逆的。
+                    archived_frame_slots = []
+                    archived_video_slots = []
+                    for old, target in sorted(frame_targets.items()):
+                        if target is not None:
+                            continue
+                        src = os.path.join(frames_dir, f'img_{old:03d}.webp')
+                        if os.path.isfile(src):
+                            shutil.copy2(src, os.path.join(archive_dir, os.path.basename(src)))
+                            archived_frame_slots.append(old)
+                        if os.path.isdir(fx_src_dir):
+                            for name in os.listdir(fx_src_dir):
+                                if name.startswith(f'img_{old:03d}_'):
+                                    shutil.copy2(os.path.join(fx_src_dir, name),
+                                                 os.path.join(archive_dir, name))
+                    for old, target in sorted(video_targets.items()):
+                        if target is not None:
+                            continue
+                        src = os.path.join(videos_dir, f'vid_{old:03d}.mp4')
+                        if os.path.isfile(src):
+                            shutil.copy2(src, os.path.join(archive_dir, os.path.basename(src)))
+                            archived_video_slots.append(old)
+
                     # --- 提示词块：重新编号后回写 ---
                     images_new = {}
                     for k, item in images.items():
@@ -4447,9 +4627,6 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     new_prompt_block = _format_prompt_block(images_new, videos_new)
 
                     # --- 磁盘文件：删除目标、其余整体前移 ---
-                    frames_dir = os.path.join(project_dir, 'frames')
-                    videos_dir = os.path.join(project_dir, 'videos')
-
                     def _apply_moves(dir_path, name_of, targets):
                         """targets: {老槽位号: 新槽位号|None}。新号恒 <= 老号，因此按老号
                         升序处理时目标文件名必然已经腾空，不需要中转文件。"""
@@ -4463,16 +4640,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                             elif new != old:
                                 os.replace(src, os.path.join(dir_path, name_of(new)))
 
-                    frame_targets = {k: _image_target(k) for k in range(1, image_count + 1)}
-                    video_slots = set(range(1, image_count + 1)) | set(videos)
-                    video_targets = {k: _video_target(k) for k in sorted(video_slots)}
-
                     _apply_moves(frames_dir, lambda n: f'img_{n:03d}.webp', frame_targets)
                     _apply_moves(videos_dir, lambda n: f'vid_{n:03d}.mp4', video_targets)
 
                     # FX 路径给每帧留档的原始 jpg（frames/fx_src/img_NNN_<uuid>.jpg）跟着
                     # 一起改名：留在原位会让重试时按前缀找参考命中另一帧的旧图。
-                    fx_src_dir = os.path.join(frames_dir, 'fx_src')
                     if os.path.isdir(fx_src_dir):
                         for fname in sorted(os.listdir(fx_src_dir)):
                             m = re.match(r'^img_(\d+)_(.*)$', fname)
@@ -4543,6 +4715,22 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                             del mdata['merged_video']
                         write_manifest(project_dir, mdata)
 
+                    # 删除后的状态指纹：撤销时据此判断这单在删除之后有没有被继续
+                    # 改动过（又生成/重试/上传/再删了别的拍）。指纹对不上仍可恢复，
+                    # 但要用户明确确认会丢弃删除之后的新内容，见 /api/restore_slot。
+                    with open(os.path.join(archive_dir, 'state.json'), 'w', encoding='utf-8') as f:
+                        json.dump({
+                            'title': title,
+                            'sequence': sequence,
+                            'created_at': datetime.now().isoformat(timespec='seconds'),
+                            'image_count_before': image_count,
+                            'image_count_after': new_image_count,
+                            'hero_slot_before': hero_idx,
+                            'archived_frame_slots': archived_frame_slots,
+                            'archived_video_slots': archived_video_slots,
+                            'manifest_after_fingerprint': manifest_fingerprint(mdata),
+                        }, f, ensure_ascii=False, indent=2)
+
                     affected = [sequence - 1] if any(
                         v.get('slot') == sequence - 1 for v in videos_new_entries) else []
                     log('INFO', 'FRAMES',
@@ -4560,7 +4748,257 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                      'image_count': new_image_count,
                                      'affected_video_slots': affected,
                                      'dropped_review_frames': dropped,
-                                     'removed': removed})
+                                     'removed': removed,
+                                     'recovery_snapshot': archive_dir})
+                finally:
+                    release_frame_run(project_dir, claim_id)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/restore_slot':
+            # 撤销一次「删除整拍」。删除时已在 .deleted_slots/<id>/ 落下完整快照
+            # （删除前的 manifest 与 prompt_block ＋ 所有被物理删除的媒体文件），
+            # 这里做它的逆操作：当前编号整体后移一位、归档文件放回原位、
+            # manifest 与 prompt_block 还原成删除前那一份。
+            #
+            # 为什么是「整单回滚」而不是「把那一格插回去」：删除会给其后每一格
+            # 重新编号，逐格插回等于重新推导每一格的来历；快照里存着整份删除前
+            # manifest，直接还原它才是可靠语义——当初把整份 manifest 存进快照就是
+            # 为了这一步（此前只有写快照的那一半，读回那一半从来没有实现，代价是
+            # 一次误删要靠手写脚本捞回来，见 tools/recover_ice_cave_slot3.py）。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                title = body.get('title', '')
+                snapshot_id = str(body.get('snapshot_id') or '')
+                force = bool(body.get('force'))
+                current_prompt_block = body.get('prompt_block') or ''
+
+                # snapshot_id 直接来自请求体、又要拼进路径：只允许快照目录的固定形状，
+                # 挡掉 ../ 之类的穿越
+                if not re.fullmatch(r'\d{8}_\d{6}_\d+_slot_\d{3}', snapshot_id):
+                    self._send_json({'error': 'snapshot_id 格式不合法'}, status=400)
+                    return
+
+                project_dir = _get_project_dir(title)
+                archive_dir = os.path.join(project_dir, '.deleted_slots', snapshot_id)
+                if not os.path.isdir(archive_dir):
+                    self._send_json({'error': f'找不到恢复快照: {snapshot_id}'}, status=404)
+                    return
+
+                prompt_before_path = os.path.join(archive_dir, 'prompt_block.before.txt')
+                manifest_before_path = os.path.join(archive_dir, 'manifest.before.json')
+                if not os.path.isfile(prompt_before_path):
+                    self._send_json({'error': '快照缺少 prompt_block.before.txt，无法恢复'},
+                                    status=422)
+                    return
+
+                import uuid
+                claim_id = f"restoreslot_{uuid.uuid4().hex}"
+                holder = claim_frame_run(project_dir, claim_id)
+                if holder:
+                    self._send_json({'status': 'error',
+                                     'message': '该创意的帧序列正在生成/修复中，请等它结束后再恢复'},
+                                    status=409)
+                    return
+                try:
+                    with open(prompt_before_path, 'r', encoding='utf-8') as f:
+                        old_prompt_block = f.read()
+                    images_old, videos_old = _parse_prompt_slots(old_prompt_block)
+                    if not images_old:
+                        self._send_json({'error': '快照里的提示词块解析不出图片槽位'}, status=422)
+                        return
+                    image_count_old = max(images_old)
+
+                    state = {}
+                    state_path = os.path.join(archive_dir, 'state.json')
+                    if os.path.isfile(state_path):
+                        with open(state_path, 'r', encoding='utf-8') as f:
+                            state = json.load(f) or {}
+                    if state.get('restored_at'):
+                        self._send_json({'error': '这份快照已经恢复过了'}, status=409)
+                        return
+
+                    removed_meta = {}
+                    removed_path = os.path.join(archive_dir, 'removed.json')
+                    if os.path.isfile(removed_path):
+                        with open(removed_path, 'r', encoding='utf-8') as f:
+                            removed_meta = json.load(f) or {}
+                    sequence = int(state.get('sequence') or removed_meta.get('sequence') or 0)
+                    if sequence < 1:
+                        self._send_json({'error': '快照里没有记录被删除的拍号'}, status=422)
+                        return
+
+                    # 删除之后这单有没有被继续改动过（又生成/重试/上传/再删了别的拍）。
+                    # 对不上仍可恢复，但必须由用户明确确认——恢复会把 manifest 整份
+                    # 还原成删除前那一份，删除之后新产生的记录会随之丢失。
+                    current_manifest = read_manifest(project_dir) or {}
+                    expected_fp = state.get('manifest_after_fingerprint')
+                    actual_fp = manifest_fingerprint(current_manifest)
+                    diverged = bool(expected_fp) and expected_fp != actual_fp
+                    if diverged and not force:
+                        self._send_json({
+                            'status': 'diverged',
+                            'error': ('删除之后这单又被改动过（重新生成/重试/上传等）。'
+                                      '继续恢复会把清单整份还原成删除前那一版，'
+                                      '删除之后新产生的记录会丢失。'),
+                            'snapshot_id': snapshot_id,
+                        }, status=409)
+                        return
+
+                    # 与 /api/delete_slot 同一套换号规则，反过来用
+                    new_image_count = image_count_old - 1
+                    hero_idx = state.get('hero_slot_before')
+                    if hero_idx is None:
+                        hero_idx = next((i for i, item in videos_old.items()
+                                         if 'HERO' in str((item or {}).get('meta', '')).upper()),
+                                        None)
+
+                    def _image_target_old(k):
+                        if k == sequence:
+                            return None
+                        return k - 1 if k > sequence else k
+
+                    def _video_target_old(k):
+                        if hero_idx is not None and k == hero_idx:
+                            return new_image_count if new_image_count >= 1 else None
+                        if k == sequence:
+                            return None
+                        t = k - 1 if k > sequence else k
+                        return t if t <= new_image_count - 1 else None
+
+                    frames_dir = os.path.join(project_dir, 'frames')
+                    videos_dir = os.path.join(project_dir, 'videos')
+                    fx_src_dir = os.path.join(frames_dir, 'fx_src')
+
+                    # 反向换号表：{当前槽位: 应还原到的老槽位}。老号恒 >= 当前号，
+                    # 所以按老号降序处理时目标文件名必然已经腾空，不需要中转文件。
+                    frame_back = {}
+                    for k in range(1, image_count_old + 1):
+                        t = _image_target_old(k)
+                        if t is not None:
+                            frame_back[t] = k
+                    video_back = {}
+                    for k in sorted(set(range(1, image_count_old + 1)) | set(videos_old)):
+                        t = _video_target_old(k)
+                        if t is not None:
+                            video_back[t] = k
+
+                    def _plan_moves(dir_path, name_of, back_map):
+                        """先整体校验再执行：目标位置已被占用就整次拒绝，绝不半途改到
+                        一半、留下一个既不是删除前也不是删除后的状态。
+
+                        占用判断要按"执行到这一步时"的名字集合来算，而不是当前磁盘的
+                        静态快照——按老号降序处理时，前一步已经把 img_003 搬去 img_004，
+                        img_003 这个名字对下一步来说是空的。"""
+                        occupied = set(os.listdir(dir_path)) if os.path.isdir(dir_path) else set()
+                        moves = []
+                        for cur, old in sorted(back_map.items(), key=lambda kv: -kv[1]):
+                            if cur == old:
+                                continue
+                            src_name, dst_name = name_of(cur), name_of(old)
+                            if src_name not in occupied:
+                                continue
+                            if dst_name in occupied:
+                                raise RuntimeError(f'恢复目标位置已被占用: {dst_name}')
+                            occupied.discard(src_name)
+                            occupied.add(dst_name)
+                            moves.append((os.path.join(dir_path, src_name),
+                                          os.path.join(dir_path, dst_name)))
+                        return moves
+
+                    frame_moves = _plan_moves(
+                        frames_dir, lambda n: f'img_{n:03d}.webp', frame_back)
+                    video_moves = _plan_moves(
+                        videos_dir, lambda n: f'vid_{n:03d}.mp4', video_back)
+
+                    fx_moves = []
+                    if os.path.isdir(fx_src_dir):
+                        for cur, old in sorted(frame_back.items(), key=lambda kv: -kv[1]):
+                            if cur == old:
+                                continue
+                            for fname in os.listdir(fx_src_dir):
+                                m = re.match(r'^img_(\d+)_(.*)$', fname)
+                                if not m or int(m.group(1)) != cur:
+                                    continue
+                                fx_moves.append((
+                                    os.path.join(fx_src_dir, fname),
+                                    os.path.join(fx_src_dir, f'img_{old:03d}_{m.group(2)}')))
+
+                    # 恢复前先给「当前状态」也留一份快照：恢复本身不删除任何媒体
+                    # 文件（只重命名 + 把归档文件放回空出来的位置），会被覆盖的只有
+                    # manifest 与提示词块，所以存这两样就够回到恢复前。
+                    restore_stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+                    restore_point = os.path.join(
+                        project_dir, '.deleted_slots',
+                        f'{restore_stamp}_restorepoint_of_{snapshot_id}')
+                    os.makedirs(restore_point, exist_ok=True)
+                    cur_manifest_path = os.path.join(project_dir, 'manifest.json')
+                    if os.path.isfile(cur_manifest_path):
+                        shutil.copy2(cur_manifest_path,
+                                     os.path.join(restore_point, 'manifest.before.json'))
+                    if current_prompt_block:
+                        with open(os.path.join(restore_point, 'prompt_block.before.txt'),
+                                  'w', encoding='utf-8') as f:
+                            f.write(current_prompt_block)
+
+                    for src, dst in frame_moves + video_moves + fx_moves:
+                        os.replace(src, dst)
+
+                    # 归档的媒体文件放回原位（文件名本身带的就是老槽位号）
+                    restored_files = []
+                    for fname in sorted(os.listdir(archive_dir)):
+                        if re.fullmatch(r'img_\d{3}\.webp', fname):
+                            dst_dir = frames_dir
+                        elif re.fullmatch(r'vid_\d{3}\.mp4', fname):
+                            dst_dir = videos_dir
+                        elif re.match(r'^img_\d{3}_.+', fname):
+                            dst_dir = fx_src_dir
+                        else:
+                            continue
+                        os.makedirs(dst_dir, exist_ok=True)
+                        shutil.copy2(os.path.join(archive_dir, fname),
+                                     os.path.join(dst_dir, fname))
+                        restored_files.append(fname)
+
+                    # manifest 还原成删除前那一份
+                    with manifest_lock(project_dir):
+                        if os.path.isfile(manifest_before_path):
+                            with open(manifest_before_path, 'r', encoding='utf-8') as f:
+                                mdata = json.load(f)
+                        else:
+                            mdata = current_manifest
+                        write_manifest(project_dir, mdata)
+
+                    # 标记这份快照已消费，避免同一份被恢复两次（第二次的换号前提
+                    # 已经不成立，会把好好的一单推乱）
+                    state.update({
+                        'restored_at': datetime.now().isoformat(timespec='seconds'),
+                        'restored_forced': bool(diverged and force),
+                        'restore_point': restore_point,
+                    })
+                    with open(state_path, 'w', encoding='utf-8') as f:
+                        json.dump(state, f, ensure_ascii=False, indent=2)
+
+                    log('INFO', 'FRAMES',
+                        f'恢复第 {sequence} 拍（快照 {snapshot_id}），'
+                        f'其后整体后移一位；现有图片 {image_count_old} 张'
+                        + ('；已确认覆盖删除之后的改动' if diverged else ''),
+                        title=title)
+                    self._send_json({
+                        'status': 'ok',
+                        'sequence': sequence,
+                        'prompt_block': old_prompt_block,
+                        'prompt_slots': prompt_slots_list(old_prompt_block),
+                        'frames': mdata.get('frames') or [],
+                        'videos': mdata.get('videos') or [],
+                        'image_count': image_count_old,
+                        'restored_files': restored_files,
+                        'forced': bool(diverged and force),
+                        'restore_point': restore_point,
+                    })
                 finally:
                     release_frame_run(project_dir, claim_id)
             except Exception as e:

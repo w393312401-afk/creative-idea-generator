@@ -1,0 +1,601 @@
+/* =====================================================================
+   激发维度页 · 极简布局
+   ---------------------------------------------------------------------
+   方案与取舍见 docs/spark_dimension_minimal_layout_plan.md。
+   本文件只管"长什么样、摆在哪"，不参与任何激发/合成逻辑；被它重新排布的
+   控件 id 全部保持不变，app.js / js/config.js / js/trend_refs.js /
+   js/prompt_pipeline.js 里按 id 取元素的代码不受影响。
+
+   加载顺序：必须排在 panels-tabs.css 之后（index.html 里已如此），因为要覆盖
+   那里的 .panel-footer、.ideation-cards-container 与整段
+   「激发维度面板 · 移动端精简」补丁（panels-tabs.css:2742 起）。
+
+   全部样式挂在 .spark-minimal（= .panel-left）下，不外溢到画廊/台账/图像工坊。
+   ===================================================================== */
+
+/* ── 1. 标题区整块让位给激发轨 ───────────────────────────────────────
+   「概念设定与维度映射 / 配置您想激发的…核心维度」这两行是纯静态装饰：顶部
+   工作区 tab 已经高亮着「激发维度」，而下面那条激发轨是同一位置上更准确、
+   还带实时状态的说明。腾出的 ≈50px 直接给灵感卡。
+   （想找回标题：把这条规则删掉即可，DOM 里原样留着。） */
+.spark-minimal .panel-header {
+    display: none;
+}
+
+/* ── 2. 激发轨（Spark Rail）─────────────────────────────────────────
+   ① 取材 → ② 选题 → ③ 合成。三态：stage-idle（灰）/ stage-active（转圈+秒表）/
+   stage-ready（✓）。状态由 updateSparkRail() 写 class，见 js/spark_rail.js。 */
+.spark-rail {
+    display: flex;
+    align-items: stretch;
+    gap: 4px;
+    flex-shrink: 0;
+    padding: 14px 20px 12px 20px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.spark-stage {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: rgba(var(--ink-rgb), 0.02);
+    text-align: left;
+    cursor: pointer;
+    transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.spark-stage:hover {
+    border-color: var(--border-glow);
+    background: rgba(var(--ink-rgb), 0.04);
+}
+
+.stage-idx {
+    position: relative;
+    flex: 0 0 20px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    box-sizing: border-box;
+    font-size: 11px;
+    font-weight: 700;
+    background: rgba(var(--ink-rgb), 0.08);
+    color: var(--text-secondary);
+}
+
+.stage-copy {
+    display: grid;
+    gap: 1px;
+    min-width: 0;
+}
+
+.stage-copy strong {
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.25;
+    color: var(--text-main);
+}
+
+.stage-copy small {
+    font-size: 10.5px;
+    line-height: 1.3;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 已就绪：序号位换成 ✓（用 ::after 覆盖，数字本体留在 DOM 里给读屏软件） */
+.spark-stage.stage-ready {
+    border-color: rgba(176, 123, 82, 0.42);
+    background: var(--primary-glow);
+}
+
+.spark-stage.stage-ready .stage-idx {
+    background: var(--primary);
+    color: transparent;
+}
+
+.spark-stage.stage-ready .stage-idx::after {
+    content: '✓';
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    font-size: 12px;
+    color: #FBF8F1;
+}
+
+.spark-stage.stage-ready .stage-copy small {
+    color: var(--primary);
+    font-weight: 600;
+}
+
+/* 进行中：序号位换成转圈，小字里带秒表（updateSparkRail 每秒刷新） */
+.spark-stage.stage-active {
+    border-color: rgba(176, 123, 82, 0.42);
+}
+
+.spark-stage.stage-active .stage-idx {
+    background: transparent;
+    color: transparent;
+    border: 2px solid rgba(var(--ink-rgb), 0.14);
+    border-top-color: var(--primary);
+    animation: sparkStageSpin 0.8s linear infinite;
+}
+
+.spark-stage.stage-active .stage-copy small {
+    color: var(--primary);
+    font-weight: 600;
+}
+
+@keyframes sparkStageSpin {
+    to { transform: rotate(360deg); }
+}
+
+.spark-rail-link {
+    flex: 0 0 14px;
+    align-self: center;
+    height: 1px;
+    background: rgba(var(--ink-rgb), 0.18);
+}
+
+/* ── 3. 取材两组压成抽屉行 ──────────────────────────────────────────
+   折叠态一行 = 图标 + 组名 + 摘要 + 该组动作按钮。摘要复用现成的
+   #trend-refs-selected-note / #pacing-skeleton-selected-note（一直在实时更新）。
+   常驻的三段 hint 移进展开态——那是省下的最大一块高度。 */
+.spark-minimal .panel-body {
+    padding: 16px 20px 20px 20px;
+}
+
+.spark-minimal .input-pane {
+    gap: 12px;
+}
+
+.spark-minimal .spark-drawer {
+    gap: 0;
+    padding: 0;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: rgba(var(--ink-rgb), 0.015);
+}
+
+/* .pacing-skeleton-control 原本靠 border-top + padding-top 跟上一组分隔，
+   现在两组都是独立的抽屉卡片，不需要那条线了 */
+.spark-minimal .pacing-skeleton-control {
+    border-top: 0;
+    padding-top: 0;
+}
+
+.spark-drawer-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    flex-wrap: wrap;
+}
+
+.spark-drawer-toggle {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0;
+    border: 0;
+    background: none;
+    text-align: left;
+    cursor: pointer;
+}
+
+.spark-drawer-chevron {
+    flex: 0 0 12px;
+    color: var(--text-muted);
+    transition: transform 0.2s ease;
+}
+
+.spark-drawer.drawer-open .spark-drawer-chevron {
+    transform: rotate(90deg);
+}
+
+/* 抽屉标题不再是全大写的分组标签（编号已由激发轨承担） */
+.spark-drawer-toggle .group-title {
+    flex: 0 0 auto;
+    font-size: 12px;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text-main);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.spark-drawer-note {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.spark-drawer-body {
+    display: none;
+    flex-direction: column;
+    gap: 10px;
+    padding: 0 10px 10px 10px;
+}
+
+.spark-drawer.drawer-open .spark-drawer-body {
+    display: flex;
+}
+
+/* 抽屉里这几段原本自带外边距，交给 .spark-drawer-body 的 gap 统一管 */
+.spark-drawer-body .trend-refs-hint,
+.spark-drawer-body .pacing-skeleton-hint,
+.spark-drawer-body .trend-refs-toolbar,
+.spark-drawer-body .trend-refs-direction-panel,
+.spark-drawer-body .trend-refs-archive-bar {
+    margin: 0;
+}
+
+/* 工具条现在只剩筛选框（选中摘要已上到折叠态那一行）：条目少到不露筛选框时
+   （trend_refs.js 给 input 挂 hidden）整条不占位 */
+.spark-drawer-body .trend-refs-toolbar:has(> input[hidden]) {
+    display: none;
+}
+
+/* ── 4. 灵感卡区成为页面主体 ────────────────────────────────────────
+   横滑轨 → 自适应网格；窄屏回落成纵向单列（横向滚动跟外层面板抢手势，
+   panels-tabs.css:2783 起那段"压低封面/加宽卡片"的补丁因此可以退役）。 */
+.spark-minimal .ideation-cards-container {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 12px;
+    overflow-x: visible;
+    scroll-snap-type: none;
+    padding: 4px 0 0 0;
+    margin-top: 8px;
+}
+
+/* 网格里的卡片比原来的横滑轨条目宽（≈340px vs 260px），封面按 16:9 的观感压到
+   150px 就够看，省下的 30px 让卡底那排「🔨 节拍简介 / 复制选题 / 一键合成」
+   更容易落在首屏里——那三个按钮是选题环节真正要点的东西。 */
+.spark-minimal .ideation-card-cover {
+    height: 150px;
+}
+
+/* 卡底三枚按钮回到一行：原来的 2×2 换行是为 260px 定宽轨道条目定的，网格里卡片
+   宽 ≈290px（手机单列 ≈336px），三个按钮一行绰绰有余。省下的一行 ≈34px，正好让
+   最关键的「一键合成」落进首屏，而不是躲在第二行外面。 */
+.spark-minimal .ideation-card-actions {
+    flex-wrap: nowrap;
+}
+
+.spark-minimal .ideation-card-btn {
+    flex: 1 1 0;
+    min-width: 0;
+}
+
+/* 整行元素：本批联网参考面板、加载/报错提示、激发中的状态条 */
+.spark-minimal .ideation-trend-panel,
+.spark-minimal .ideation-loading,
+.spark-minimal .ideation-error,
+.spark-minimal .ideation-pending-strip {
+    grid-column: 1 / -1;
+}
+
+.spark-minimal .ideation-trend-panel {
+    margin-top: 0;
+}
+
+.spark-cards-note {
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 激发中：上一批卡片退到背景层但仍可点选（选中态也留着），
+   不再"点了按钮页面一片空白"。 */
+.spark-minimal .ideation-cards-container.is-ideating .ideation-card {
+    opacity: 0.45;
+    filter: saturate(0.6);
+}
+
+.ideation-pending-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border: 1px dashed rgba(176, 123, 82, 0.35);
+    border-radius: 8px;
+    background: var(--primary-glow);
+    font-size: 11.5px;
+    color: var(--primary);
+    font-weight: 600;
+}
+
+.ideation-pending-strip::before {
+    content: '';
+    flex: 0 0 12px;
+    width: 12px;
+    height: 12px;
+    box-sizing: border-box;
+    border-radius: 50%;
+    border: 2px solid rgba(176, 123, 82, 0.25);
+    border-top-color: var(--primary);
+    animation: sparkStageSpin 0.8s linear infinite;
+}
+
+/* 空库首次激发时的骨架卡：撑住版式，让人看出"这里马上会有几张卡" */
+.ideation-card-skeleton {
+    height: 360px;
+    border-radius: 8px;
+    border: 1px solid rgba(var(--ink-rgb), 0.08);
+    background: linear-gradient(100deg,
+        rgba(var(--ink-rgb), 0.03) 30%,
+        rgba(var(--ink-rgb), 0.07) 50%,
+        rgba(var(--ink-rgb), 0.03) 70%);
+    background-size: 220% 100%;
+    animation: sparkSkeletonSweep 1.4s ease-in-out infinite;
+}
+
+@keyframes sparkSkeletonSweep {
+    from { background-position: 120% 0; }
+    to { background-position: -20% 0; }
+}
+
+/* 选中的灵感卡 = 激发轨 ② 亮起的那一条：右上角补一枚与轨同色的 ✓ */
+.spark-minimal .ideation-card.selected {
+    position: relative;
+}
+
+.spark-minimal .ideation-card.selected::after {
+    content: '✓ 已选定';
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 2;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    color: #FBF8F1;
+    background: var(--primary);
+}
+
+/* ── 5. 页脚：摘要框出局，细调进一行 ────────────────────────────────
+   #config-summary 留在 DOM 里（updateConfigSummary 继续往里写文本），但不再
+   显示：它 7 项里有 4 项是 index.html 里那组永久固定的隐藏值，会变的三项
+   （选题 / 骨架 / 拍数）已经上到激发轨。 */
+.spark-minimal .panel-footer {
+    padding: 10px 20px 14px 20px;
+}
+
+.spark-minimal #config-summary {
+    display: none;
+}
+
+.spark-tune {
+    margin-bottom: 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: rgba(var(--ink-rgb), 0.02);
+}
+
+.spark-tune-head {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 7px 12px;
+    border: 0;
+    background: none;
+    cursor: pointer;
+}
+
+.spark-tune-summary {
+    min-width: 0;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.spark-tune-chevron {
+    flex: 0 0 12px;
+    color: var(--text-muted);
+    transition: transform 0.2s ease;
+}
+
+.spark-tune.tune-collapsed .spark-tune-chevron {
+    transform: rotate(180deg);
+}
+
+.spark-tune-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 2px 12px 12px 12px;
+}
+
+.spark-tune.tune-collapsed .spark-tune-body {
+    display: none;
+}
+
+.spark-beats .field-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+/* 细调条里的 LLM 芯片组已经是二级展开内容，不该再套一层折叠：
+   隐掉它自己的开关并强制铺开（app.js collapseIdeationPickerOnMobile 仍会挂
+   .picker-collapsed，这里让那个 class 在细调条内不产生视觉效果）。 */
+.spark-tune .ideation-model-picker {
+    margin-bottom: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+}
+
+.spark-tune .model-picker-toggle {
+    display: none !important;
+}
+
+.spark-tune .ideation-model-picker.picker-collapsed .model-family-groups {
+    display: flex !important;
+}
+
+/* 两枚激发入口并排：主次由 updateSparkRail() 加的 .is-next / .is-muted 决定。
+   注意这里只调视觉权重，不动 #generate-btn 的 disabled —— 那是 app.js 在生成
+   生命周期里管的，抢着改会把"生成中禁用"的状态弄乱。 */
+.spark-actions {
+    display: flex;
+    align-items: stretch;
+    gap: 10px;
+}
+
+.spark-secondary-btn {
+    flex: 0 0 auto;
+    padding: 0 16px;
+    border: 1px solid var(--border-color);
+    border-radius: 14px;
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+.spark-secondary-btn:hover {
+    border-color: var(--border-glow);
+    color: var(--text-main);
+}
+
+.spark-secondary-btn.is-next {
+    border-color: var(--primary);
+    background: var(--primary-glow);
+    color: var(--primary);
+}
+
+.spark-secondary-btn.is-muted {
+    opacity: 0.7;
+}
+
+.spark-actions .pulse-btn {
+    flex: 1 1 auto;
+    margin-top: 0;
+}
+
+/* 还没选定选题：主激发按钮点下去只会得到"请先点选灵感卡"的 toast，
+   所以先按下去一档，把注意力让给 🎲。仍然可点（toast 本身就是提示）。 */
+.spark-actions .pulse-btn.is-muted {
+    opacity: 0.5;
+    filter: grayscale(0.45);
+}
+
+.spark-actions .pulse-btn.is-muted .btn-glow {
+    display: none;
+}
+
+/* =====================================================================
+   移动端 (max-width: 768px)
+   目标：进入本页不滚动就能看到 激发轨 + 两条抽屉 + 第一张灵感卡 + 两枚按钮。
+   ===================================================================== */
+@media (max-width: 768px) {
+    .spark-rail {
+        gap: 3px;
+        padding: 12px 12px 10px 12px;
+    }
+
+    .spark-stage {
+        gap: 6px;
+        padding: 6px 7px;
+        border-radius: 9px;
+    }
+
+    .stage-idx {
+        flex: 0 0 18px;
+        width: 18px;
+        height: 18px;
+        font-size: 10px;
+    }
+
+    .stage-copy strong {
+        font-size: 11px;
+    }
+
+    .stage-copy small {
+        font-size: 10px;
+    }
+
+    .spark-rail-link {
+        flex: 0 0 6px;
+    }
+
+    .spark-minimal .panel-body {
+        padding: 12px 14px 16px 14px !important;
+        gap: 12px !important;
+    }
+
+    /* 折叠态一行放不下「组名 + 摘要 + 两枚动作按钮」时，按钮整排换到第二行，
+       而不是把摘要挤成一个字 */
+    .spark-minimal .trend-refs-header-actions {
+        flex: 1 1 100%;
+        justify-content: flex-end;
+    }
+
+    /* 卡片改纵向单列：跟外层面板同向滚，不再有横向手势冲突。
+       这也让 panels-tabs.css 里 .ideation-card{flex:0 0 300px} /
+       .ideation-card-cover{height:130px} 那组补丁失去意义（grid 项忽略 flex）。 */
+    .spark-minimal .ideation-cards-container {
+        grid-template-columns: 1fr;
+    }
+
+    .spark-minimal .ideation-card-cover {
+        height: 160px;
+    }
+
+    .ideation-card-skeleton {
+        height: 300px;
+    }
+
+    .spark-minimal .panel-footer {
+        padding: 8px 12px 10px 12px !important;
+    }
+
+    .spark-tune {
+        margin-bottom: 8px;
+    }
+
+    .spark-tune-body {
+        padding: 2px 10px 10px 10px;
+    }
+
+    /* 页脚两枚按钮各占一半：手机上「换一批灵感」是高频动作，不该被挤成小角标 */
+    .spark-secondary-btn {
+        flex: 1 1 0;
+        padding: 10px 8px;
+        font-size: 12px;
+    }
+
+    .spark-actions .pulse-btn {
+        flex: 1.4 1 0;
+    }
+}

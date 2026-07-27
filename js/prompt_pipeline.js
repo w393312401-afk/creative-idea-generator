@@ -224,6 +224,15 @@ function ideaBeatOutline(idea) {
         : [];
 }
 
+const PACING_SKELETON_LABELS = {
+    linear_milestone: '单线里程碑',
+    dual_payoff: '内外双重完工'
+};
+
+function pacingSkeletonLabel(id) {
+    return PACING_SKELETON_LABELS[String(id || '').trim()] || '单线里程碑';
+}
+
 // 节拍简介入口只有一个:卡片底部的「🔨 节拍简介」按钮(见 renderIdeationCards)。
 // 卡片正文里原本还有一行计数+首拍的入口,和按钮重复,已删。
 
@@ -320,6 +329,7 @@ function renderIdeationCards(ideas) {
                 ${Number.isFinite(+idea.recommended_beats) && +idea.recommended_beats > 0
                     ? `<span class="ideation-card-tag beats" title="${idea.beats_reason || ''}">⏱ 推荐 ${idea.recommended_beats} 拍</span>`
                     : ''}
+                <span class="ideation-card-tag pacing-skeleton" title="这张卡的节拍简介所采用的推进骨架">🦴 ${pacingSkeletonLabel(idea.pacing_skeleton)}</span>
             </div>
             <div class="ideation-card-body">
                 <div>载体: ${idea.carrier} (${idea.env})</div>
@@ -333,7 +343,6 @@ function renderIdeationCards(ideas) {
                     // 这一条没产出节拍简介时退回按钮的原职责，别给一个点开是空的入口
                     : `<button type="button" class="ideation-card-btn select-action-btn" title="这张卡激发时未产出节拍简介，点击仅载入维度">载入维度</button>`}
                 <button type="button" class="ideation-card-btn copy-action-btn">复制选题</button>
-                <button type="button" class="ideation-card-btn ledger-action-btn" title="激发成功后已自动存入创意台账候选池" disabled>📒 已自动入账</button>
                 <button type="button" class="ideation-card-btn primary compose-action-btn">一键合成</button>
             </div>
         `;
@@ -392,6 +401,9 @@ function renderIdeationCards(ideas) {
 
         container.appendChild(card);
     });
+
+    // 新一批卡片就位：激发轨的 ② 芯片改口播"N 张待选"
+    if (typeof updateSparkRail === 'function') updateSparkRail();
 }
 
 function selectIdeationCard(index) {
@@ -413,7 +425,22 @@ function selectIdeationCard(index) {
         input_str: idea.input_str || null,
         cover_url: idea.cover_url || null,
         english_title: idea.english_title || null,
+        topic_dna: idea.dna || null,
+        llm_score: Number.isFinite(+idea.score) ? +idea.score : null,
+        creative_seed: {
+            input_str: idea.input_str || null,
+            carrier: idea.carrier || null,
+            env: idea.env || null,
+            trauma: idea.trauma || null,
+            destiny: idea.destiny || null,
+            twist: idea.twist || null,
+            twist_zh: idea.twist_zh || null
+        },
         task_label: idea.title || null,
+        // 载入卡片后走页脚主「激发」按钮时也要带上同一份节拍计划和骨架；
+        // 此前只有卡片上的「一键合成」路径会透传 beat_outline。
+        beat_outline: ideaBeatOutline(idea),
+        pacing_skeleton: String(idea.pacing_skeleton || 'linear_milestone'),
         // 随卡片一并载入，供「载入维度」后走主生成按钮时也能在合成时计次
         // 联网参考案例库使用次数（见 app.js generateIdea 与 server.py /api/compose）
         trend_ref: idea.trend_ref || null,
@@ -466,9 +493,26 @@ function composeIdeationCard(index) {
         beat_outline: Array.isArray(idea.beat_outline)
             ? idea.beat_outline.map(s => String(s == null ? '' : s).trim()).filter(Boolean)
             : [],
+        pacing_skeleton: String(idea.pacing_skeleton || 'linear_milestone'),
         cover_url: idea.cover_url || null,
         english_title: idea.english_title || null,
         topic_dna: idea.dna || null,
+        llm_score: Number.isFinite(+idea.score) ? +idea.score : null,
+        // 只有真正点击一键合成/激发时才随请求送到后端入账；生成灵感卡片本身不入账。
+        ledger_candidate: {
+            dna: idea.dna || null,
+            title: idea.title || null,
+            score: Number.isFinite(+idea.score) ? +idea.score : null,
+            creative_seed: {
+                input_str: idea.input_str || null,
+                carrier: idea.carrier || null,
+                env: idea.env || null,
+                trauma: idea.trauma || null,
+                destiny: idea.destiny || null,
+                twist: idea.twist || null,
+                twist_zh: idea.twist_zh || null
+            }
+        },
         // 联网参考案例库使用计次：后端只在这条 idea 确实借鉴过参考（trend_ref
         // 非空）时才对 trend_ref_ids 计次一次，浏览/激发阶段不算数
         trend_ref: idea.trend_ref || null,
@@ -482,4 +526,3 @@ function composeIdeationCard(index) {
         config: { ...config }
     });
 }
-

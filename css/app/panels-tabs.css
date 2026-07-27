@@ -530,6 +530,78 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
     cursor: help;
 }
 
+.ideation-card-tag.pacing-skeleton {
+    background: rgba(92, 116, 134, 0.12);
+    color: #4A6475;
+}
+
+/* 激发维度·推进节拍骨架参考：这是激发 prompt 的真实输入，
+   不是展示用说明卡，所以使用原生 checkbox 保留清晰的多选语义。 */
+.pacing-skeleton-control {
+    border-top: 1px solid rgba(var(--ink-rgb), 0.06);
+    padding-top: 14px;
+}
+
+.pacing-skeleton-selected-note {
+    color: #4A6475;
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.pacing-skeleton-hint {
+    margin: 7px 0 10px;
+    color: var(--text-secondary, #6B6256);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.pacing-skeleton-options {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+}
+
+.pacing-skeleton-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    padding: 10px;
+    border: 1px solid rgba(var(--ink-rgb), 0.1);
+    border-radius: 8px;
+    background: rgba(var(--ink-rgb), 0.025);
+    cursor: pointer;
+    transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.pacing-skeleton-option:has(input:checked) {
+    border-color: rgba(176, 123, 82, 0.42);
+    background: rgba(176, 123, 82, 0.07);
+}
+
+.pacing-skeleton-option input {
+    margin: 3px 0 0;
+    accent-color: var(--neon-blue, #B07B52);
+    flex: 0 0 auto;
+}
+
+.pacing-skeleton-copy {
+    display: grid;
+    gap: 4px;
+    min-width: 0;
+}
+
+.pacing-skeleton-copy strong {
+    color: var(--text-main, #2B2723);
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.pacing-skeleton-copy small {
+    color: var(--text-secondary, #6B6256);
+    font-size: 10.5px;
+    line-height: 1.5;
+}
+
 /* 逐拍清单(只在节拍简介弹窗内:卡片轨道装不下,卡片上只留底部那个按钮入口) */
 .ideation-card-outline-list {
     margin: 0;
@@ -1615,28 +1687,27 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
     /* — 帧/视频卡片操作按钮：桌面靠 hover 浮现，触屏没有 hover 就永远点不到
          （重试 / 描述问题 / 修复 / 上传在手机上等于失联）。这里常驻显示，并让它
          横跨卡片宽度自动换行——单列只有 90 来像素，三个按钮排不下一行。
-         行内 style 写死了 opacity:0，只有 !important 压得住；背景色不动，
-         保留行内那份（修复按钮是红底，用来跟其它按钮区分）。— */
+         槽位卡片改由 renderSlotCard 独家渲染、不再写行内样式（见
+         docs/spark_result_slots_plan.md），所以这里退回普通规则，不用再 !important
+         去压行内的 opacity:0。配色仍走 .slot-action-btn 那份。— */
     .frames-grid {
         grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
         gap: 8px;
     }
 
-    .frame-card-actions,
-    .video-card-actions {
-        opacity: 1 !important;
-        left: 4px !important;
-        right: 4px !important;
-        flex-wrap: wrap !important;
-        justify-content: flex-end !important;
-        gap: 3px !important;
+    .slot-actions {
+        opacity: 1;
+        left: 4px;
+        right: 4px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 3px;
     }
 
-    .frame-card-actions .action-btn,
-    .video-card-actions .action-btn {
-        padding: 3px 6px !important;
-        font-size: 9.5px !important;
-        color: #fff !important;
+    .slot-actions .slot-action-btn {
+        padding: 3px 6px;
+        font-size: 9.5px;
+        color: #fff;
     }
 }
 
@@ -2719,6 +2790,14 @@ body.log-expanded .log-pill {
     .ideation-card-cover {
         height: 130px;
         margin-bottom: 10px;
+    }
+
+    .pacing-skeleton-options {
+        grid-template-columns: 1fr;
+    }
+
+    .pacing-skeleton-option {
+        padding: 9px;
     }
 
     /* — 粘性页脚瘦身 — */

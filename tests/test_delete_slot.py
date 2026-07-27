@@ -148,6 +148,45 @@ class TestDeleteMiddleBeat:
         assert _video_bytes(project, 2) == b'VIDEO-3'
         assert not os.path.exists(os.path.join(project['videos_dir'], 'vid_003.mp4'))
 
+    def test_recovery_snapshot_preserves_deleted_slot_and_predelete_state(self, project, monkeypatch):
+        monkeypatch.setattr(server, '_get_project_dir', lambda title: project['dir'])
+        h, sent = _delete_handler({'title': 'delete_slot_test', 'sequence': 2,
+                                   'prompt_block': _prompt_block()})
+        server.SparkRequestHandler.do_POST(h)
+
+        body, status = sent[0]
+        assert status == 200, body
+        snapshot = body['recovery_snapshot']
+        assert os.path.isdir(snapshot)
+        assert os.path.isfile(os.path.join(snapshot, 'manifest.before.json'))
+        assert os.path.isfile(os.path.join(snapshot, 'prompt_block.before.txt'))
+        assert os.path.isfile(os.path.join(snapshot, 'removed.json'))
+        assert os.path.isfile(os.path.join(snapshot, 'img_002.webp'))
+        assert os.path.isfile(os.path.join(snapshot, 'vid_002.mp4'))
+        with open(os.path.join(snapshot, 'manifest.before.json'), encoding='utf-8') as f:
+            before = json.load(f)
+        assert [item['sequence'] for item in before['frames']] == [1, 2, 3, 4]
+        with open(os.path.join(snapshot, 'removed.json'), encoding='utf-8') as f:
+            removed = json.load(f)
+        assert removed['sequence'] == 2
+        assert removed['image_prompt'] == 'image prompt 2'
+        assert removed['video_prompt'] == 'video prompt 2'
+
+    def test_stale_prompt_block_is_rejected_before_any_delete(self, project, monkeypatch):
+        monkeypatch.setattr(server, '_get_project_dir', lambda title: project['dir'])
+        stale = _prompt_block().replace('图片 4:\nimage prompt 4\n', '')
+        h, sent = _delete_handler({'title': 'delete_slot_test', 'sequence': 2,
+                                   'prompt_block': stale})
+        server.SparkRequestHandler.do_POST(h)
+
+        body, status = sent[0]
+        assert status == 409, body
+        assert body['refresh_required'] is True
+        assert body['client_image_count'] == 3
+        assert body['manifest_image_count'] == 4
+        assert os.path.isfile(os.path.join(project['frames_dir'], 'img_002.webp'))
+        assert not os.path.exists(os.path.join(project['dir'], '.deleted_slots'))
+
     def test_manifest_entries_follow_the_files(self, project, monkeypatch):
         monkeypatch.setattr(server, '_get_project_dir', lambda title: project['dir'])
         h, sent = _delete_handler({'title': 'delete_slot_test', 'sequence': 2,
