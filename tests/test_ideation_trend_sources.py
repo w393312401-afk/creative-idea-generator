@@ -14,6 +14,27 @@ from unittest.mock import patch
 
 import prompt_pipeline as pp
 
+# 一份合格的「内外双重完工」工序清单，本文件多处复用。
+# 2026-07-28 起 dual 门禁按骨架自己的账收紧（外部 >=4 条且落实 >=3 个外部族、其中必须
+# 有一条外部设备/平台；过门后 >=6 条；整单 >=11 条），旧样例那种「外部 2 条 + 内部 2 条」
+# 的 7~11 条清单不再合格——它把骨架点名的 17 个状态压进 6 个施工拍，每拍近 3 个变化，
+# 而每拍的 IMAGE 是从上一帧续写的，一拍改多处画面必飘。见 _DUAL_MIN_OUTLINE_ENTRIES。
+DUAL_OK_OUTLINE = [
+    '立柱搭建外部框架',          # 0  大结构就位
+    '封装外墙木饰面',            # 1  围护/外立面
+    '安装双开谷仓门',            # 2  门扇
+    '铺设门前碎石车道',          # 3  外部平台
+    '挂装太阳能板与风管',        # 4  外部设备
+    '完成外部入口门面',          # 5  外部小完工（mini-payoff）
+    '推镜穿过门口进入原始室内',  # 6  过门
+    '清空室内积渣',              # 7  清运
+    '铺设防潮基层',              # 8
+    '架设墙顶龙骨',              # 9
+    '填充墙顶保温',              # 10
+    '封装内衬面板',              # 11
+    '点亮灯光,人物入住',         # 12 reward
+]
+
 
 class TestParseTrendUrls(unittest.TestCase):
     def test_empty_and_non_dict(self):
@@ -326,12 +347,7 @@ class TestRunIdeateReturnShape(unittest.TestCase):
                 '立柱搭建外部框架', '封装外墙木饰面', '铺装成品木地板',
                 '布置床铺与软装', '点亮灯光,人物入住',
             ]},
-            {'title': 'B', 'dna': 'b / refuge / x', 'beat_outline': [
-                '立柱搭建外部框架', '完成外部入口门面', '推镜穿过门口进入原始室内',
-                '清空室内积渣', '铺设防潮基层', '架设墙顶龙骨',
-                '填充墙顶保温', '封装内衬面板', '铺装成品地板',
-                '布置床铺软装', '点亮灯光入住',
-            ]},
+            {'title': 'B', 'dna': 'b / refuge / x', 'beat_outline': list(DUAL_OK_OUTLINE)},
         ], ensure_ascii=False)
 
         def fake_chat(config, system_prompt, user_prompt, **kwargs):
@@ -357,10 +373,7 @@ class TestRunIdeateReturnShape(unittest.TestCase):
             'title': 'T', 'dna': 't / refuge / x',
             'pacing_skeleton': 'linear_milestone',
             'beat_outline': [
-                '立柱搭建外部框架', '完成外部入口门面', '推镜穿过门口进入原始室内',
-                '清空室内积渣', '铺设防潮基层', '架设墙顶龙骨',
-                '填充墙顶保温', '封装内衬面板', '铺装成品地板',
-                '布置床铺软装', '点亮灯光入住',
+                *DUAL_OK_OUTLINE,
             ],
         }], ensure_ascii=False)
         with patch.object(pp, 'read_ledger', return_value=[]), \
@@ -391,11 +404,14 @@ class TestRunIdeateReturnShape(unittest.TestCase):
         self.assertEqual(pp.apply_pacing_skeleton_to_brief(old.copy(), 'linear_milestone'), old)
 
     def test_dual_payoff_label_cannot_pass_with_a_linear_outline(self):
+        """长度、过门位置、外部族、内部层族全都合格，只是外部幕从来没有"完工"过——
+        这样的清单挂 dual_payoff 的牌子仍然是在骗人，必须被 mini-payoff 那条拦下。"""
         idea = {
             'pacing_skeleton': 'dual_payoff',
             'beat_outline': [
-                '清理外部', '修复外壳', '过门进入室内', '清理室内',
-                '铺装地板', '安装灯具', '布置家具', '点亮入住',
+                *DUAL_OK_OUTLINE[:5],
+                '打磨外墙石缝接口',      # 本该是外部小完工,却没有任何完工语义
+                *DUAL_OK_OUTLINE[6:],
             ],
         }
         errors = pp.pacing_skeleton_outline_violations(idea)
@@ -406,10 +422,7 @@ class TestRunIdeateReturnShape(unittest.TestCase):
         idea = {
             'pacing_skeleton': 'dual_payoff',
             'beat_outline': [
-                '立柱搭建外部框架', '完成外部入口门面', '硬切原始室内',
-                '清空室内积渣', '铺设防潮基层', '架设墙顶龙骨',
-                '填充墙顶保温', '封装内衬面板', '铺装成品地板',
-                '布置床铺软装', '点亮灯光入住',
+                *DUAL_OK_OUTLINE[:6], '硬切原始室内', *DUAL_OK_OUTLINE[7:],
             ],
         }
         errors = pp.pacing_skeleton_outline_violations(idea)
@@ -419,10 +432,7 @@ class TestRunIdeateReturnShape(unittest.TestCase):
         idea = {
             'pacing_skeleton': 'dual_payoff',
             'beat_outline': [
-                '立柱搭建外部框架', '完成外部入口门面', '推镜穿过门口进入原始室内',
-                '清空室内积渣', '铺设防潮基层', '架设墙顶龙骨',
-                '填充墙顶保温', '封装内衬面板', '铺装成品地板',
-                '布置床铺软装', '点亮灯光入住',
+                *DUAL_OK_OUTLINE,
             ],
         }
         self.assertEqual(pp.pacing_skeleton_outline_violations(idea), [])
@@ -556,22 +566,27 @@ class TestDualPayoffCrossingDetection(unittest.TestCase):
         self.assertEqual(self._errs(outline), [])
 
     def test_missing_and_duplicated_crossings_are_reported_distinguishably(self):
+        # 两份样例都要够长，否则先撞上长度下界、看不到过门计数的判定（见 DUAL_OK_OUTLINE）
         linear = ['清空洞内碎冰与积雪', '凿平起居区冰面地坪', '锚固钢制支撑框架',
-                  '喷涂洞壁隔热封闭层', '铺设架空木龙骨地台', '填充羊毛保温层',
-                  '铺装成品木地板', '布置床铺与软装', '点亮灯带,人物入住']
+                  '喷涂洞壁隔热封闭层', '铺设防潮膜与电路管线', '铺设架空木龙骨地台',
+                  '填充羊毛保温层', '封装内衬松木板', '铺装成品木地板',
+                  '布置床铺与软装', '点亮灯带,人物入住']
         self.assertIn('found 0', self._errs(linear)[0])
 
-        twice = ['清理外墙藤蔓', '完成外部入口门面', '推镜过门进入原始仓内',
+        twice = ['清理外墙藤蔓', '加固砖砌山墙', '安装谷仓木门框',
+                 '铺设门前碎石车道', '完成外部入口门面', '推镜过门进入原始仓内',
                  '清空仓内朽木', '再次过门进入原始阁楼', '铺设防潮基层',
                  '架设墙顶龙骨', '封装内衬面板', '布置床铺软装', '点亮灯光入住']
         self.assertIn('found 2', self._errs(twice)[0])
 
     def test_interior_vocabulary_is_shared_by_detection_and_verification(self):
         """用 仓内 认出过门拍，就不能反过来判它"没落进室内"——两处词表必须是同一份。"""
-        outline = ['清理外墙藤蔓', '点亮壁灯完成外立面', '推镜过门进入原始仓内',
+        # 清单要够长才走得到落点判定这一步，否则先被长度下界挡回、这条断言会变成空转
+        outline = ['清理外墙藤蔓', '加固砖砌山墙', '安装谷仓木门框',
+                   '铺设门前碎石车道', '点亮壁灯完成外立面', '推镜过门进入原始仓内',
                    '清空仓内朽木', '铺设防潮基层', '架设墙顶龙骨',
-                   '封装内衬面板', '布置床铺软装', '点亮灯光入住']
-        self.assertNotIn('doorway-crossing entry must land explicitly inside', self._errs(outline))
+                   '填充墙顶保温', '封装内衬面板', '布置床铺软装', '点亮灯光入住']
+        self.assertEqual(self._errs(outline), [])
 
 
 class TestPacingGateDoesNotDiscardPassingCards(unittest.TestCase):
@@ -582,12 +597,7 @@ class TestPacingGateDoesNotDiscardPassingCards(unittest.TestCase):
     灵感」转几分钟然后一句「暂无灵感推荐」。
     """
 
-    GOOD_OUTLINE = [
-        '立柱搭建外部框架', '完成外部入口门面', '推镜穿过门口进入原始室内',
-        '清空室内积渣', '铺设防潮基层', '架设墙顶龙骨',
-        '填充墙顶保温', '封装内衬面板', '铺装成品地板',
-        '布置床铺软装', '点亮灯光入住',
-    ]
+    GOOD_OUTLINE = list(DUAL_OK_OUTLINE)
     LINEAR_OUTLINE = [
         '清空洞内碎冰与积雪', '凿平起居区冰面地坪', '锚固钢制支撑框架',
         '喷涂洞壁隔热封闭层', '铺设架空木龙骨地台', '填充羊毛保温层',

@@ -549,6 +549,63 @@ wiring / lighting / furnishing / threshold / reward`。
 
 ---
 
+## 8.5 P0-C：dual_payoff 的两幕结构成本（2026-07-28 追加，已实施）
+
+> 起因：用户提问「内外双重完工的节拍数是不是太少了，一个节拍包含多重变化，
+> 也没看到有装太阳能板的」。三条观察是同一个根因的三个表征。
+
+### 根因：门禁只给内部幕计数，外部幕不计数；长度下界照单线骨架配
+
+`PACING_SKELETONS['dual_payoff']['summary']` 逐项点名 **17 个必须发生的状态变化**
+（外部 6 + 过门 1 + 内部 10），三条 dual 兜底清单也一致落在 13~15 条。而旧门禁：
+
+| 项 | 旧值 | 后果 |
+|---|---|---|
+| `len(outline)` | ≥ 7 | 17 个状态压进 6 个施工拍 ≈ 每拍 2.8 个变化 |
+| 过门位置 | `2 ≤ idx ≤ len-4` | 7 条时外部只剩 2~3 条、内部只剩 1~2 条，两幕都摊不开 |
+| 外部幕内容 | 只查过门前**最后一条**的措辞 | 「外部设备/平台」是骨架里唯一没人计数的必需项，拍数一紧第一个被砍 |
+| `compute_beats_floor` 的 `structural` | 4（单线的账：室外 x2 + 过门 + 清理） | 11 条的双完工卡算出 floor=7，ladder 可以合法地把一幕压没 |
+
+两道门禁在最小长度下**互相矛盾**：7 条时内部只剩 1~2 条要独自补齐「≥4 个层族」，
+即一拍塞 防水+龙骨+封板——正是合成侧 `_INCOMPATIBLE_PACKAGE_FAMILIES` 明文否决的
+组合。于是 ladder 结构校验三次重排 → 掉进兜底 ladder（:5611，用 `min_total_beats`）
+→ 拍数被进一步压缩。**这个失败路径自我强化。**
+
+画面不稳的机制是确定的：每拍的 IMAGE 从上一帧续写（Step 4 "continue directly from
+the IMAGE you just wrote"），一拍同时改多处时模型会重排整幅而不是叠加 delta；VIDEO
+侧一段固定时长要走完 3 个工序，尾帧与下一拍 IMAGE 声明的起始状态对不上。
+
+### 落地
+
+| 改动 | 位置 |
+|---|---|
+| `_DUAL_MIN_OUTLINE_ENTRIES=11` / `_DUAL_MIN_EXTERIOR_ENTRIES=4` / `_DUAL_MIN_POST_CROSSING_ENTRIES=6` / `_DUAL_MIN_EXTERIOR_FAMILIES=3` / `_DUAL_STRUCTURAL_FLOOR=9` | `prompt_pipeline/__init__.py`，紧挨 `_DUAL_THRESHOLD_CUE` |
+| 外部族词表 `_DUAL_EXTERIOR_FAMILIES` + `_DUAL_EXTERIOR_UTILITY`（与内部 `layer_families` 对称） | 同上 |
+| 过门位置改成两端各自计数；新增外部族计数 + 外部设备/平台必需 | `pacing_skeleton_outline_violations` |
+| dual 走 `_DUAL_STRUCTURAL_FLOOR`，其余骨架行为不变 | `compute_beats_floor` |
+| 激发 prompt 的 dual 编号规则 5 条 → 6 条，外部幕写进枚举 | `pacing_block` |
+| 合成 prompt 补一条**正向**约束（旧的 "Do not move all exterior utility work after the cut" 在清单没有外部设备时恒真） | `_pacing_plan_block` |
+
+**门禁与 prompt 必须同改**：只收紧门禁而不告诉模型新规则 = 整批返工 150s。
+
+### 防误判
+
+`_DUAL_EXTERIOR_FAMILIES` 的门扇一族不能写裸 `门`（`点亮门廊灯`、`完成入口门面`
+都会算进来，这一族就废了），改成固定词 + 「动词 + …门」。词表按真实样例放宽过一轮：
+`安装双开谷仓门`、`铺设门前碎石车道` 起初被漏判，已补 `车道|步道|台基|散水` 与动词式门规则。
+
+回归锁：`tests/test_outline_skeleton_gate.py::TestOutlineSkeletonGateAcceptsGoodCards::
+test_shipped_dual_fallback_outlines_pass_the_dual_gate`（三条 dual 兜底清单必须全过）
+与 `test_minimum_legal_dual_outline_passes_both_gates`（恰好卡在下界上的卡必须放行，
+否则下界等于事实上禁用了这个骨架）。
+
+### 未做
+
+内部层族仍是 ≥4，没跟着抬到 5。过门后已强制 ≥6 条，更多条目摊同样的族数**正是想要的
+结果**（每拍变化更少），再抬只增加误判风险。
+
+---
+
 ## 9. 明确不做的事
 
 ### 9.1 工序顺序单调性校验 —— 本期不做
