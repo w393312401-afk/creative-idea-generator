@@ -29,18 +29,47 @@ _SLATE_EDITOR_SELECTOR = "[data-slate-editor='true']"
 
 
 # ── _click_new_project_button ──
-def _click_new_project_button(page):
-    """点击 New project，兼容 add_2 图标 and 纯文本按钮。"""
+def _click_new_project_button(page, confirm_timeout=10.0):
+    """点击新建项目，并以进入新的 ``/project/`` URL 作为成功条件。
+
+    ``add_2`` 同时用于项目内的“创建/添加媒体”按钮，所以 Playwright 的 click
+    没抛异常并不代表新项目已创建。中英文 UI 都必须通过导航结果确认，避免假阳性。
+    """
+    try:
+        before_url = str(page.url or "")
+    except Exception:
+        before_url = ""
+
+    def _project_navigation_confirmed():
+        try:
+            current_url = str(page.url or "")
+        except Exception:
+            return False
+        if "/project/" not in current_url:
+            return False
+        return "/project/" not in before_url or current_url != before_url
+
     for sel in UI_SELECTORS["google_fx"].get("new_project_btn", []):
         try:
             btn = page.locator(sel).first
             if btn.is_visible(timeout=1500):
-                btn.click(force=True)
-                random_sleep(3, 5)
-                log(f"🆕 点击 'New project' 成功 (sel={sel!r})", "GoogleFX")
-                return True
-        except Exception:
-            pass
+                btn.click(timeout=5000)
+                deadline = time.monotonic() + max(0.0, float(confirm_timeout))
+                while True:
+                    if _project_navigation_confirmed():
+                        random_sleep(2, 4)
+                        log(f"🆕 新建项目成功，已确认进入项目页 (sel={sel!r}, url={page.url})", "GoogleFX")
+                        return True
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.2)
+                log(f"⚠️ 新建项目点击未生效，未进入新的项目页 (sel={sel!r})", "GoogleFX")
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"  ⚠️ 新建项目候选点击失败 (sel={sel!r}): {type(e).__name__}", "GoogleFX")
     return False
 
 
@@ -835,93 +864,18 @@ def _wait_for_prompt_reference_change(page, previous_refs=None, expected_uuid: s
 # (JS dispatchEvent 单趟 vs Playwright locator + max_rounds 循环)，分别被视频/图片
 # 生成流程实际调用。拆分搬移时按用户决定改名共存，不合并逻辑，避免真机行为回归。
 def _clear_prompt_reference_chips_video(page):
-    """清空提示词输入区已挂入的参考图，用于顺序重试。（视频生成流程使用）"""
-    try:
-        removed = page.evaluate("""() => {
-            const isVisible = (el) => !!el && el.offsetParent !== null;
-            const buttons = Array.from(document.querySelectorAll('button'))
-                .filter((btn) => {
-                    if (!isVisible(btn)) return false;
-                    const rect = btn.getBoundingClientRect();
-                    if (rect.top < window.innerHeight - 420) return false;
-                    const texts = Array.from(btn.querySelectorAll('i, span'))
-                        .map((node) => (node.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase());
-                    const blob = ((btn.innerText || '') + ' ' + (btn.getAttribute('aria-label') || '')).toLowerCase();
-                    return texts.includes('cancel') || blob.includes('remove');
-                });
-            for (const btn of buttons.reverse()) {
-                btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-            }
-            return buttons.length;
-        }""")
-        if removed:
-            log(f"🧹 已清空 {removed} 个 Prompt 参考图", "GoogleFX")
-            random_sleep(0.4, 0.8)
-        return removed
-    except Exception as e:
-        log(f"⚠️ 清空 Prompt 参考图失败: {type(e).__name__}", "GoogleFX")
-        return 0
+    """只清空 Prompt bar 内的历史文字和参考图，不扫描或点击画布卡片。"""
+    return _clear_prompt_reference_chips_image(page)
 
 
 # ── _clear_existing_uploaded_frame ──
 def _clear_existing_uploaded_frame(page, label: str):
-    """如果 Start/End 槽位已经有上传的图片，点击其 cancel/remove 按钮将其清空，保证重新进入时精确选择。"""
-    labels_to_try = {
-        "Start": ["Start", "起始"],
-        "End":   ["End",   "结束"],
-    }.get(label, [label])
-
-    try:
-        cleared = page.evaluate("""(labelsToTry) => {
-            const containers = Array.from(document.querySelectorAll(
-                'div[type="button"][aria-haspopup="dialog"], [aria-haspopup="dialog"], .jekiem, .EGCPj'
-            ));
-
-            for (const container of containers) {
-                const text = (container.innerText || container.textContent || '').trim();
-                if (labelsToTry.includes(text)) {
-                    continue;
-                }
-
-                const closeBtn = container.querySelector('button, i, [role="button"]');
-                if (closeBtn) {
-                    const btnText = (closeBtn.innerText || closeBtn.textContent || '').trim().toLowerCase();
-                    const btnLabel = (closeBtn.getAttribute('aria-label') || '').toLowerCase();
-                    if (btnText.includes('cancel') || btnText.includes('close') ||
-                        btnLabel.includes('remove') || btnLabel.includes('clear') || btnLabel.includes('delete')) {
-                        closeBtn.click();
-                        return true;
-                    }
-                }
-
-                const parent = container.parentElement;
-                if (parent) {
-                    const parentClose = Array.from(parent.querySelectorAll('button, i, [role="button"]')).find(el => {
-                        const t = (el.innerText || el.textContent || '').trim().toLowerCase();
-                        const l = (el.getAttribute('aria-label') || '').toLowerCase();
-                        return t.includes('cancel') || t.includes('close') || l.includes('remove') || l.includes('clear') || l.includes('delete');
-                    });
-                    if (parentClose) {
-                        parentClose.click();
-                        return true;
-                    }
-                }
-            }
-            return false;
-        }""", labels_to_try)
-        if cleared:
-            log(f"🧹 检测到 {label} 帧槽位已有旧图片，已自动清空", "GoogleFX")
-            random_sleep(0.6, 1.2)
-            return True
-    except Exception as e:
-        log(f"⚠️ 清除 {label} 帧槽位图片异常: {type(e).__name__}: {e}", "GoogleFX")
+    """兼容旧调用的安全空操作；清理只允许发生在 Prompt bar 内。"""
     return False
 
 
 def _upload_to_slot_directly(page, label: str, file_path: str) -> bool:
     """直接将本地图片上传到指定帧槽位 (Start/End)。"""
-    _clear_existing_uploaded_frame(page, label)
-
     selector = 'div[type="button"][aria-haspopup="dialog"], [aria-haspopup="dialog"], .jekiem, .EGCPj'
     containers = page.locator(selector)
     count = containers.count()
@@ -3546,10 +3500,8 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None):
 
     return browser, page
 
-def _prepare_fx_canvas(page, has_refs, delete_failed_cards=True):
-    """清理画布：删除失败卡片 + 条件性打开最新历史项目/新建项目 + 等待工具栏。"""
-    if delete_failed_cards:
-        _delete_failed_cards(page)
+def _prepare_fx_canvas(page, has_refs):
+    """准备 Flow 画布并等待工具栏；绝不删除或清理画布上的媒体卡片。"""
 
     # 如果当前没有打开任何项目（即输入框/工具栏不存在），优先尝试打开最新历史项目，找不到再新建项目
     toolbar_exists = _find_fx_prompt_input(page, announce=False) is not None
@@ -3654,62 +3606,8 @@ def _count_error_cards(page):
         return 0
 
 def _delete_failed_cards(page):
-    """批量删除页面中可见的 Failed 卡片，避免旧失败结果干扰当前轮次。
-    🔧 2026-05-16: 只删除 warning/error icon 确认的失败卡片，不触发自动重试。
-    """
-    try:
-        deleted = page.evaluate("""() => {
-            const cards = Array.from(document.querySelectorAll('div[data-tile-id]'));
-            let count = 0;
-
-            function isVisible(el) {
-                let cur = el;
-                while (cur) {
-                    const style = window.getComputedStyle(cur);
-                    if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) {
-                        return false;
-                    }
-                    cur = cur.parentElement;
-                }
-                return true;
-            }
-
-            for (const card of cards) {
-                const text = (card.innerText || '').toLowerCase();
-                if (!text.includes('failed') && !text.includes('something went wrong') && !text.includes('unusual activity') && !text.includes('help center') && !text.includes('失败') && !text.includes('出错了') && !text.includes('生成失败')) continue;
-
-                // 额外校验: 必须有 warning/error icon 才认定为真正失败
-                const icons = Array.from(card.querySelectorAll('i'));
-                const hasWarningIcon = icons.some(i => {
-                    const t = (i.innerText || i.textContent || '').trim().toLowerCase();
-                    const isWarning = t === 'warning' || t === 'error' || t === 'error_outline';
-                    return isWarning && isVisible(i);
-                });
-                const btns = Array.from(card.querySelectorAll('button'));
-                if (!hasWarningIcon) continue;
-
-                const deleteBtn = btns.find((btn) => {
-                    const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-                    const btnText = (btn.innerText || '').toLowerCase();
-                    const icon = (btn.querySelector('i')?.innerText || '').trim().toLowerCase();
-                    return label.includes('delete') || btnText.includes('delete_forever') || icon === 'delete_forever';
-                });
-
-                if (deleteBtn) {
-                    deleteBtn.click();
-                    count += 1;
-                }
-            }
-
-            return count;
-        }""")
-        if deleted:
-            log(f"🧹 删除 {deleted} 个失败卡片", "GoogleFX")
-            random_sleep(0.6, 1.0)
-        return deleted
-    except Exception as e:
-        log(f"  ⚠️ _delete_failed_cards 失败: {type(e).__name__}", "GoogleFX")
-        return 0
+    """兼容旧调用的安全空操作：媒体生成永远不删除 Flow 画布卡片。"""
+    return 0
 
 # ── 输入区（prompt bar）的结构定位 ──
 # 2026-07-26 用只读探针 dump 真机 DOM 后重写。此前所有定位都靠

@@ -37,7 +37,7 @@ assert.strictEqual(s.kind, 'ready');
 assert.strictEqual(s.label, 'IMG 003');
 assert.deepStrictEqual(badges(s), []);
 // 无问题的帧没有「修复此帧问题」出口
-assert.deepStrictEqual(acts(s), ['describe-frame', 'retry-frame', 'delete-slot']);
+assert.deepStrictEqual(acts(s), ['describe-frame', 'retry-frame', 'upload-frame', 'delete-slot']);
 
 s = ready({ quality_gate: 'i2i_fallback_degraded' });
 assert.deepStrictEqual(badges(s), ['degraded']);
@@ -94,7 +94,7 @@ assert.ok(s.title.includes('人工上传的本地图片'));
 s = frameSlotState(null, { seq: 5, pending: false });
 assert.strictEqual(s.kind, 'missing');
 assert.strictEqual(s.statusText, '未生成/已失效');
-assert.deepStrictEqual(acts(s), ['retry-frame', 'delete-slot']);
+assert.deepStrictEqual(acts(s), ['retry-frame', 'upload-frame', 'delete-slot']);
 assert.strictEqual(s.actions[0].label, '生成');
 
 s = frameSlotState(null, { seq: 5, pending: true });

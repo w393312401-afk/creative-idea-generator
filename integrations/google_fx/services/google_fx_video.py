@@ -351,15 +351,9 @@ def _generate_video_google_fx(req: VideoRequest):
                 random_sleep(1, 2)
             ensure_flow_workspace(page)
 
-            # 🛠️ 0. 点击 "New project" 按钮
-            try:
-                new_project_btn = page.locator("button").filter(has_text="New project").first
-                if new_project_btn.is_visible():
-                    log("🆕 点击 'New project' 按钮...", "GoogleFX-Video")
-                    new_project_btn.click()
-                    random_sleep(3, 5)
-            except Exception as e:
-                log(f"⚠️ 点击 'New project' 失败: {e}", "GoogleFX-Video")
+            # 🛠️ 0. 新建项目（中英文 UI 共用，并验证确实进入新的项目 URL）
+            if not _click_new_project_button(page):
+                log("⚠️ 未能确认新项目已创建，将在当前页面继续", "GoogleFX-Video")
 
             # 🛠️ 1. 等待底部工具栏
             log("📍 等待底部工具栏...", "GoogleFX-Video")
@@ -852,17 +846,6 @@ class _ChunkRunner:
                 log(f"⚠️ 导航到 Flow 首页失败: {nav_err}", "GoogleFX-Video")
             ensure_flow_workspace(page)
             clicked_new = _click_new_project_button(page)
-            if not clicked_new:
-                # 兜底：老的文本匹配方式
-                try:
-                    new_project_btn = page.locator("button").filter(has_text="New project").first
-                    if new_project_btn.is_visible():
-                        log("🆕 点击 'New project' 按钮 (文本匹配兜底)...", "GoogleFX-Video")
-                        new_project_btn.click()
-                        random_sleep(3, 5)
-                        clicked_new = True
-                except Exception as e:
-                    log(f"⚠️ 点击 'New project' 失败: {e}", "GoogleFX-Video")
             if not clicked_new:
                 log("⚠️ 未能新建项目，将在当前页面继续（画布可能残留历史卡片）", "GoogleFX-Video")
 

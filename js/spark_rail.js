@@ -244,7 +244,11 @@ function updateSparkRail() {
 
     const tuneSummary = document.getElementById('spark-tune-summary-text');
     if (tuneSummary) {
-        const text = `${beats} 拍 · ${beatModeFixed ? '固定' : '自适应'}${model ? ` · ${model}` : ''}`;
+        // 自适应下滑块是上限而非承诺，载入过卡片时把卡片给的下界一并写出来，
+        // 免得芯片上那个数字被当成成片拍数（见 docs/beat_count_skeleton_plan.md §1.5）。
+        const floor = (!beatModeFixed && loaded && Number.isFinite(+loaded.beats_floor)
+            && +loaded.beats_floor > 0) ? `≥${loaded.beats_floor} ` : '';
+        const text = `${floor}${beats} 拍 · ${beatModeFixed ? '固定' : '自适应上限'}${model ? ` · ${model}` : ''}`;
         if (tuneSummary.textContent !== text) tuneSummary.textContent = text;
     }
 

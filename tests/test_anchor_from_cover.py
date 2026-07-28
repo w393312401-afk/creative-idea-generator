@@ -39,7 +39,7 @@ class TestFirstFrameUsesImageOnePrompt(unittest.TestCase):
             self._write(target_path)
 
         def fake_edit(config, prompt, reference_path, target_path, **kwargs):
-            self.edit_calls.append((prompt, reference_path))
+            self.edit_calls.append((prompt, reference_path, kwargs.get('control_prompt')))
             self._write(target_path)
 
         prompt_block = "图片 1:\nuntouched first frame\n\n图片 2:\nfirst construction stage\n"
@@ -52,12 +52,53 @@ class TestFirstFrameUsesImageOnePrompt(unittest.TestCase):
         self.assertEqual(len(self.edit_calls), 2)
         self.assertEqual(self.edit_calls[0][0], 'untouched first frame')
         self.assertEqual(os.path.abspath(self.edit_calls[0][1]), os.path.abspath(self.cover))
+        self.assertEqual(self.edit_calls[0][2], '')
         self.assertEqual(self.edit_calls[1][0], 'first construction stage')
         self.assertTrue(self.edit_calls[1][1].endswith('img_001.webp'))
         first = next(frame for frame in manifest['frames'] if frame['sequence'] == 1)
         self.assertTrue(first['reference'].endswith(os.path.basename(self.cover)))
         self.assertEqual(first['prompt'], 'untouched first frame')
         self.assertEqual(first['anchor_reference'], 'cover')
+
+    def test_missing_cover_rejects_frame_generation_without_calling_t2i(self):
+        os.remove(self.cover)
+        prompt_block = "图片 1:\nuntouched first frame\n"
+
+        with patch('frame_generator._generate_text_image') as text_image, \
+             patch('frame_generator._generate_image_edit') as image_edit:
+            with self.assertRaisesRegex(RuntimeError, '必须先生成或选择封面图'):
+                generate_frame_sequence({}, 'project_without_cover', prompt_block)
+
+        text_image.assert_not_called()
+        image_edit.assert_not_called()
+
+    def test_first_frame_edit_failure_never_falls_back_to_t2i(self):
+        prompt_block = "图片 1:\nuntouched first frame\n"
+
+        with patch('frame_generator._generate_text_image') as text_image, \
+             patch('frame_generator._generate_image_edit', side_effect=RuntimeError('edit failed')):
+            with self.assertRaisesRegex(RuntimeError, '第 1 帧图生图失败'):
+                generate_frame_sequence({'coverReferencePath': self.cover}, 'project', prompt_block)
+
+        text_image.assert_not_called()
+
+    def test_cut_frame_still_uses_previous_frame_as_reference(self):
+        def fake_edit(config, prompt, reference_path, target_path, **kwargs):
+            self.edit_calls.append((prompt, reference_path, kwargs.get('control_prompt')))
+            self._write(target_path)
+
+        prompt_block = (
+            "图片 1:\nexterior frame\n\n"
+            "图片 2:\ninterior frame\n\n"
+            "视频 1 [CUT]:\nhard cut indoors\n"
+        )
+        with patch('frame_generator._generate_text_image') as text_image, \
+             patch('frame_generator._generate_image_edit', side_effect=fake_edit):
+            generate_frame_sequence({'coverReferencePath': self.cover}, 'project', prompt_block)
+
+        text_image.assert_not_called()
+        self.assertEqual(len(self.edit_calls), 2)
+        self.assertTrue(self.edit_calls[1][1].endswith('img_001.webp'))
 
 
 if __name__ == '__main__':

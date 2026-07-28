@@ -3543,6 +3543,13 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 prompt_block = body.get('prompt_block', '')
                 target_sequences = body.get('target_sequences')
 
+                if not resolve_cover_reference(config, title):
+                    self._send_json({
+                        'status': 'error',
+                        'message': '请先生成或选择封面图；第一帧必须以封面图进行图生图。',
+                    }, status=400)
+                    return
+
                 import uuid
                 task_id = f"frames_{uuid.uuid4().hex}"
 
@@ -4200,11 +4207,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
                 try:
                     frames_dir = os.path.join(project_dir, 'frames')
+                    from frame_generator import _fx_relocate_frame_reference, _fx_extract_uuid
 
                     def _frame_path(seq):
                         return os.path.join(frames_dir, f'img_{seq:03d}.webp')
 
-                    def _rebase_frame(entry, seq, origin_seq):
+                    def _rebase_frame(entry, seq, origin_seq, fx_sidecars):
                         """把一条帧记录搬到另一格：描述这张图本身的字段（prompt / model /
                         质检结论…）跟着图走，只有槽位号与落盘路径属于新格子。血统在这里
                         断开（它不再派生自新位置的上一帧），parent_hash 清空。"""
@@ -4219,6 +4227,17 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         moved['reference'] = None
                         moved['swapped_from_sequence'] = origin_seq
                         moved.pop('stale_lineage', None)
+                        # FX 留档已经跟着图改名，记录里的 fx_src/fx_uuid 必须指向新文件；
+                        # 这一格换上来的是没有画布 UUID 的图（手动上传/API 产出）就清干净，
+                        # 免得留个指向别人留档的 UUID。
+                        sidecar = fx_sidecars.get(seq)
+                        if sidecar:
+                            moved['fx_src'] = os.path.relpath(
+                                sidecar, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+                            moved['fx_uuid'] = _fx_extract_uuid(sidecar) or moved.get('fx_uuid')
+                        else:
+                            moved.pop('fx_src', None)
+                            moved.pop('fx_uuid', None)
                         return moved
 
                     with manifest_lock(project_dir):
@@ -4250,13 +4269,19 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         else:
                             os.replace(src_path, dst_path)
 
+                        # FX 留档（frames/fx_src/img_NNN_<uuid>.jpg）跟着图一起换格：下一帧
+                        # 挂参考只认这个文件名里的画布 UUID，留在原位就等于让后续生成继续
+                        # 拿换位前的老图当参考。
+                        fx_sidecars = _fx_relocate_frame_reference(
+                            frames_dir, from_seq, to_seq, mode)
+
                         others = [f for f in frames_list
                                   if (f.get('sequence') or f.get('slot')) not in (from_seq, to_seq)]
-                        new_entries = [_rebase_frame(src_entry, to_seq, from_seq)]
+                        new_entries = [_rebase_frame(src_entry, to_seq, from_seq, fx_sidecars)]
                         if mode == 'copy':
                             new_entries.append(dict(src_entry))  # 源格原样留下
                         elif dst_has_file and dst_entry is not None:
-                            new_entries.append(_rebase_frame(dst_entry, from_seq, to_seq))
+                            new_entries.append(_rebase_frame(dst_entry, from_seq, to_seq, fx_sidecars))
                         # else：搬运，源格的记录随图一起离开
 
                         frames_list = others + new_entries
@@ -4385,6 +4410,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         self._send_json({'error': f'图片解析失败，可能不是合法的图片文件: {e}'}, status=400)
                         return
 
+                    # The uploaded WebP has no Flow canvas UUID. Remove the old slot's UUID
+                    # sidecar and any converted-reference cache; otherwise generation of the
+                    # next frame mounts the pre-upload image instead of this new file.
+                    from frame_generator import _fx_clear_frame_reference
+                    cleared_fx_refs = _fx_clear_frame_reference(frames_dir, sequence)
+
                     rel_path = os.path.relpath(
                         dest_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
 
@@ -4422,6 +4453,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         # i2i 血统在这一帧断开：它不派生自任何上一帧
                         target['parent_hash'] = ''
                         target['reference'] = None
+                        # Manual uploads are local files, not the old Google FX canvas asset.
+                        # Drop every field that could advertise or reuse the replaced asset.
+                        for key in ('fx_uuid', 'fx_src', 'backend', 'transport', 'actual_pixels',
+                                    'degraded_reason', 'anchor_reference'):
+                            target.pop(key, None)
 
                         frames_list.sort(key=lambda f: f.get('sequence', 0))
                         # 其后的帧仍派生自被换掉的那张旧图——标 stale_lineage，
@@ -4442,6 +4478,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                              if s >= 1 and s in existing_video_slots)
                     log('INFO', 'FRAMES',
                         f'手动上传第 {sequence} 帧图片，覆盖 {rel_path}'
+                        + (f'；已清理 {len(cleared_fx_refs)} 个旧 FX 参考留档' if cleared_fx_refs else '')
                         + (f'；受影响的视频槽位 {affected_videos}' if affected_videos else ''),
                         title=title)
                     self._send_json({'status': 'ok', 'frame': dict(target),

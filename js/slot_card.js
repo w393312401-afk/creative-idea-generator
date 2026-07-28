@@ -172,6 +172,7 @@ const SLOT_ACTION_HANDLERS = {
     'retry-frame': seq => retrySingleFrame(seq),
     'fix-frame': seq => fixFrameIssue(seq),
     'describe-frame': seq => describeFrameIssue(seq, currentFrameManualIssue(seq)),
+    'upload-frame': seq => triggerFrameUpload(seq),
     'retry-video': seq => retrySingleVideo(seq),
     'upload-video': seq => triggerVideoUpload(seq),
     'delete-slot': seq => deleteSlotBeat(seq),

@@ -259,10 +259,14 @@ function openBeatOutlineModal(index) {
         const recBeats = Number.isFinite(+idea.recommended_beats) && +idea.recommended_beats > 0
             ? `推荐 ${idea.recommended_beats} 拍${idea.beats_reason ? `（${idea.beats_reason}）` : ''} · `
             : '';
-        // 卡片上的清单只是软计划:合成阶段的硬规则（真实施工顺序、单里程碑包、
-        // Threshold 拆分等）优先级更高,可能改写/合并/增删,这里如实说明避免误解。
-        info.textContent = `${recBeats}共 ${beats.length} 条（含末条 reward 揭示）。这是激发阶段的工序草案，`
-            + '正式合成时会按施工顺序等硬规则微调，最终节拍以合成结果为准。';
+        const floor = Number.isFinite(+idea.beats_floor) && +idea.beats_floor > 0
+            ? `其中「不少于 ${idea.beats_floor} 拍」是强制的，合成时压不下去；`
+            : '';
+        // 改造后拍数区间是强制的（beats_floor 一路传到合成侧的 _beat_count_is_valid），
+        // 只有清单内容会被硬规则改写——这里的文案要和那个事实对齐，不能再笼统地说
+        // 「最终节拍以合成结果为准」，那会让卡片上的推进密度看起来像个空头承诺。
+        info.textContent = `${recBeats}共 ${beats.length} 条（含末条 reward 揭示）。${floor}`
+            + '清单本身是工序草案，正式合成时会按真实施工顺序等硬规则改写/合并/增删。';
     }
 
     const list = document.getElementById('beat-outline-modal-list');
@@ -327,7 +331,9 @@ function renderIdeationCards(ideas) {
             <div class="ideation-card-metadata">
                 <span class="ideation-card-tag">反差强度: ${idea.score >= 23 ? '极高' : '高'}</span>
                 ${Number.isFinite(+idea.recommended_beats) && +idea.recommended_beats > 0
-                    ? `<span class="ideation-card-tag beats" title="${idea.beats_reason || ''}">⏱ 推荐 ${idea.recommended_beats} 拍</span>`
+                    ? `<span class="ideation-card-tag beats" title="${idea.beats_reason || ''}">⏱ ${idea.recommended_beats} 拍${
+                        Number.isFinite(+idea.beats_floor) && +idea.beats_floor > 0
+                            ? `（不少于 ${idea.beats_floor}）` : ''}</span>`
                     : ''}
                 <span class="ideation-card-tag pacing-skeleton" title="这张卡的节拍简介所采用的推进骨架">🦴 ${pacingSkeletonLabel(idea.pacing_skeleton)}</span>
             </div>
@@ -441,17 +447,21 @@ function selectIdeationCard(index) {
         // 此前只有卡片上的「一键合成」路径会透传 beat_outline。
         beat_outline: ideaBeatOutline(idea),
         pacing_skeleton: String(idea.pacing_skeleton || 'linear_milestone'),
+        // 施工拍下界：后端在激发时按这张卡的工序清单算好（compute_beats_floor），
+        // 前端只原样带走。合成时它替掉与项目重量无关的全局常量下界，
+        // 让「载入 → 手动生成」和卡片「一键合成」落在同一个拍数区间里。
+        beats_floor: Number.isFinite(+idea.beats_floor) ? +idea.beats_floor : null,
         // 随卡片一并载入，供「载入维度」后走主生成按钮时也能在合成时计次
         // 联网参考案例库使用次数（见 app.js generateIdea 与 server.py /api/compose）
         trend_ref: idea.trend_ref || null,
         trend_ref_ids: idea.trend_ref_ids || []
     };
 
-    // Populate slider values
-    document.getElementById('slider-complexity').value = 3;
-    document.getElementById('slider-budget').value = 2;
-    document.getElementById('slider-ratio').value = 50;
-    document.getElementById('slider-creativity').value = 3;
+    // 只同步这张卡真正申报过的维度。复杂度/预算/反差/尺度以前会被重置成硬编码的
+    // 3/2/50/3，和「载入这张卡」的语义矛盾（卡片并没有申报这四项），用户手调过的值
+    // 会被静静抹掉；现在一律保留当前值。
+    // 节拍滑块在改造后只是**额度上限**：卡片给的推荐拍数就是这一单的上限，
+    // 下界由 idea.beats_floor 带给后端，滑块压不动它。
     const recBeats = clampRecommendedBeats(idea.recommended_beats);
     if (recBeats !== null) {
         document.getElementById('slider-beats').value = recBeats;
@@ -487,6 +497,9 @@ function composeIdeationCard(index) {
         ratio: "50% (外壳粗野 ↔ 内里精致)",
         creativity: "脑洞大开",
         beats_count: clampRecommendedBeats(idea.recommended_beats) || 15,
+        // 拍数下界（后端按这张卡的工序清单算好，见 compute_beats_floor）。
+        // beats_count 是上限、beats_floor 是下界，合成侧的 ladder 只能在这个区间里挑。
+        beats_floor: Number.isFinite(+idea.beats_floor) ? +idea.beats_floor : null,
         beat_count_mode: 'adaptive',
         // 卡片上展示的工序预览作为软计划传给后端节拍规划(硬规则优先,冲突时会被改写),
         // 让用户挑卡时看到的工序和最终成片大体对得上

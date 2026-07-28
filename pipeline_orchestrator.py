@@ -777,9 +777,7 @@ def run_sequence_consistency_review(config, title, prompt_block, on_progress=Non
 
 
 def _fix_frame_via_image_edit(config, title, sequence, new_prompt, on_progress=None):
-    """首帧修复的专用通道：generate_frame_sequence 对 seq==1 恒定走文生图（那是
-    "整链视觉基因"的推倒重来语义，见其 use_text_generation 判定），但"修复"要的是
-    纠正被指出的具体问题、保留已确认的构图——只能是图生图，拿首帧自己已渲出的图
+    """首帧定向修复通道：拿首帧自己已渲出的图
     当参考做自编辑（reference_path 与 target_path 相同；_generate_image_edit 会
     先把参考图整个读进内存再写目标文件，同路径自编辑不会读到被截断的半成品）。
     非首帧不需要这条路：seq>1 时 generate_frame_sequence 天然走图生图链式编辑，

@@ -81,6 +81,8 @@ class MergeRequest(BaseModel):
 class ImageBatchRequest(BrowserEnvLockedRequest):
     prompts: List[str] = []
     images: List[str] = []  # 参考图路径列表 (图生图 / 多图参考)
+    excluded_media_uuids: List[str] = []  # 当前项目已用过的 Flow 媒体，不得当作新结果
+    excluded_image_paths: List[str] = []  # 已有槽位图，用于下载后的近重复硬校验
     ratio: Optional[str] = None
     # 可选: "Nano Banana Pro" | "Nano Banana 2" | "Nano Banana 2 Lite"
     model: str = Field(default_factory=get_runtime_google_fx_image_model)

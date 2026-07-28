@@ -360,18 +360,6 @@ IMG2IMG_CONTROL_PROMPT = (
     "letters, numbers, percentages, captions, text, watermarks, extra people, or active "
     "machinery. Return one clean edited image only."
 )
-# Frame 1 uses the cover only as an image reference. The actual edit instruction that follows
-# this control text is always the parsed `图片 1` prompt; no cover-generation prompt enters the
-# frame-sequence request.
-IMG2IMG_COVER_REFERENCE_CONTROL_PROMPT = (
-    "IMAGE EDITING MODE. The attached image is only a visual identity reference for the "
-    "project's subject and environment; it is not the text instruction and not a previous "
-    "sequence frame. Render the scene required by the IMAGE 1 prompt below. Follow IMAGE 1 for "
-    "the scene state, camera, composition, contents, and all exclusions. Preserve only useful "
-    "subject identity, materials, terrain, and lighting continuity from the reference. Do not "
-    "copy cover titles, captions, logos, poster layouts, split screens, borders, or finished-state "
-    "details that conflict with IMAGE 1. Return one clean image only."
-)
 IMG2IMG_BRIDGE_CONTROL_PROMPT = (
     "IMAGE EDITING MODE (CAMERA MOVEMENT ACTIVE). The attached previous frame is the authoritative "
     "source image. Maintain extreme consistency of all physical landmarks, geometry, colors, "

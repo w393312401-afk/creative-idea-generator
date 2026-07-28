@@ -160,8 +160,9 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
         check(frames[2]["badges"] == ["人工标记", "Stale"],
               "IMG 003 应同时挂人工标记与 Stale（旧实现第 3 枚没地方放）")
         check("fix-frame" in frames[2]["acts"], "IMG 003 应给出修复入口")
-        check(frames[3]["kind"] == "missing" and frames[3]["acts"] == ["retry-frame", "delete-slot"],
-              "IMG 004 缺失应给生成/删除两个出口")
+        check(frames[3]["kind"] == "missing"
+              and frames[3]["acts"] == ["retry-frame", "upload-frame", "delete-slot"],
+              "IMG 004 缺失应给生成/上传/删除三个出口，实得 %s" % frames[3]["acts"])
         check("人工从 IMG 002 拖过来" in frames[4]["title"], "IMG 005 的换位来源应进 hover")
 
         check(videos[0]["kind"] == "ready", "VID 001 应为出片卡")

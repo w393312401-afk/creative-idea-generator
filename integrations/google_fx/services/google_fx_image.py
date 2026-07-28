@@ -43,7 +43,6 @@ from .google_fx_helpers import (
     _prepare_fx_canvas,
     _get_panel_uuids,
     _count_error_cards,
-    _delete_failed_cards,
     _make_response_handler,
     _ensure_output_dir,
     _clear_prompt_reference_chips_image,
@@ -59,6 +58,51 @@ from .google_fx_helpers import (
     fx_pacing_bounds,
     note_fx_submit,
 )
+
+
+_MEDIA_UUID_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.I,
+)
+_MIN_GENERATED_RESULT_AGE_SECONDS = 8.0
+
+
+def _extract_media_uuid(value):
+    """Return the Flow media UUID embedded in a redirect URL or local filename."""
+    match = _MEDIA_UUID_RE.search(str(value or ""))
+    return match.group(1).lower() if match else ""
+
+
+def _is_blocked_media_candidate(url, blocked_uuids):
+    """Reject media that existed before submit or is mounted as a prompt reference."""
+    media_uuid = _extract_media_uuid(url)
+    blocked = {str(value).lower() for value in (blocked_uuids or ()) if value}
+    return bool(media_uuid and media_uuid in blocked)
+
+
+def _images_are_near_duplicates(candidate_path, reference_paths, threshold=3.0):
+    """Last-resort guard against accepting a recompressed prompt reference as output."""
+    try:
+        from PIL import Image, ImageChops, ImageStat
+
+        with Image.open(candidate_path) as candidate_image:
+            candidate = candidate_image.convert("RGB")
+            for reference_path in reference_paths or ():
+                if not reference_path or not os.path.exists(reference_path):
+                    continue
+                with Image.open(reference_path) as reference_image:
+                    reference = reference_image.convert("RGB")
+                    if reference.size != candidate.size:
+                        reference = reference.resize(candidate.size)
+                    channel_means = ImageStat.Stat(
+                        ImageChops.difference(candidate, reference)
+                    ).mean
+                    mean_abs_difference = sum(channel_means) / max(len(channel_means), 1)
+                    if mean_abs_difference <= threshold:
+                        return True, mean_abs_difference, reference_path
+    except Exception as exc:
+        log(f"  ⚠️ 参考图近重复校验失败: {type(exc).__name__}: {exc}", "GoogleFX")
+    return False, None, None
 
 # ── _generate_images_batch_google_fx_unlocked ──
 def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
@@ -408,7 +452,10 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
 
             def _wait_for_net_url(submit_ts_this, timeout=None, known_tile_ids_before_submit=None,
                                    _current_prompt_text=None, _current_prompt_idx=None,
-                                   _has_ref_for_this_prompt=False):
+                                   _has_ref_for_this_prompt=False,
+                                   known_net_urls_before_submit=None,
+                                   known_dom_srcs_before_submit=None,
+                                   blocked_media_uuids=None):
                 """
                 双路并行检测新图片 URL:
                   路径A — 网络拦截 captured_data (被动等待)
@@ -418,23 +465,100 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                 """
                 timeout = timeout or get_runtime_max_wait_seconds()
                 deadline = time.time() + timeout
-                known_net = set(url for ts, url in captured_data if ts < submit_ts_this)
+                # These baselines must be frozen before clicking Send.  Capturing them here
+                # used to race Flow's lazy-loaded reference tile: chain_ref_NNN could gain a
+                # redirect src immediately after submit and be mistaken for the generated image.
+                known_net = set(known_net_urls_before_submit or ())
+                if known_net_urls_before_submit is None:
+                    known_net = set(url for ts, url in captured_data if ts < submit_ts_this)
 
                 # 记录提交前页面上已有的 getMediaUrlRedirect img srcs（Canvas + 其他区域）
-                try:
-                    known_dom_srcs = set(page.evaluate("""() => {
-                        return Array.from(document.querySelectorAll('img[src*="getMediaUrlRedirect"]'))
-                            .map(img => img.getAttribute('src') || '');
-                    }"""))
-                except Exception as e:
-                    log(f"  ⚠️ 初始化 known_dom_srcs 失败: {type(e).__name__}", "GoogleFX")
-                    known_dom_srcs = set()
+                known_dom_srcs = set(known_dom_srcs_before_submit or ())
+                if known_dom_srcs_before_submit is None:
+                    try:
+                        known_dom_srcs = set(page.evaluate("""() => {
+                            return Array.from(document.querySelectorAll('img[src*="getMediaUrlRedirect"]'))
+                                .map(img => img.getAttribute('src') || '');
+                        }"""))
+                    except Exception as e:
+                        log(f"  ⚠️ 初始化 known_dom_srcs 失败: {type(e).__name__}", "GoogleFX")
+                        known_dom_srcs = set()
 
-                def _scan_captured():
+                blocked_media_uuids = {
+                    str(value).lower() for value in (blocked_media_uuids or ()) if value
+                }
+                known_tile_ids_before_submit = set(known_tile_ids_before_submit or ())
+                ignored_candidates = set()
+                pending_unconfirmed_candidates = set()
+                early_candidate_logs = set()
+
+                def _acceptable_candidate(url, source):
+                    if not url or url in ignored_candidates:
+                        return False
+                    if time.time() < submit_ts_this + _MIN_GENERATED_RESULT_AGE_SECONDS:
+                        if url not in early_candidate_logs:
+                            early_candidate_logs.add(url)
+                            media_uuid = _extract_media_uuid(url)
+                            # Anything already surfacing during the stabilization window is
+                            # canvas hydration/history, not the just-submitted generation.
+                            # Block the UUID permanently so an alternate redirect form cannot
+                            # become eligible after the clock passes the minimum age.
+                            if media_uuid:
+                                blocked_media_uuids.add(media_uuid)
+                            else:
+                                ignored_candidates.add(url)
+                            log(
+                                f"  🚫 {source}候选出现过早，已列入历史媒体黑名单: "
+                                f"{media_uuid[:16] if media_uuid else 'no-uuid'}...",
+                                "GoogleFX",
+                            )
+                        return False
+                    if _is_blocked_media_candidate(url, blocked_media_uuids):
+                        ignored_candidates.add(url)
+                        media_uuid = _extract_media_uuid(url)
+                        log(
+                            f"  🚫 {source}忽略参考/历史媒体 UUID: {media_uuid[:16]}...",
+                            "GoogleFX",
+                        )
+                        return False
+                    return True
+
+                def _scan_new_result_tile_media():
+                    """Return media that belongs to a tile created by the current submit."""
+                    try:
+                        rows = page.evaluate("""(beforeIds) => {
+                            const before = new Set(beforeIds || []);
+                            const rows = [];
+                            for (const tile of document.querySelectorAll('div[data-tile-id]')) {
+                                const tileId = tile.getAttribute('data-tile-id') || '';
+                                if (!tileId || before.has(tileId)) continue;
+                                for (const img of tile.querySelectorAll('img[src*="getMediaUrlRedirect"]')) {
+                                    const src = img.getAttribute('src') || img.currentSrc || '';
+                                    if (src) rows.push({tileId, src});
+                                }
+                            }
+                            return rows;
+                        }""", list(known_tile_ids_before_submit))
+                    except Exception as e:
+                        log(f"  ⚠️ 新结果 tile 扫描失败: {type(e).__name__}", "GoogleFX")
+                        return []
+                    return rows or []
+
+                def _scan_captured(confirmed_new_tile_uuids):
                     """路径A：纯内存 deque 扫描，不碰浏览器，可以随便高频调用。"""
                     for ts, url in reversed(captured_data):
-                        if ts >= submit_ts_this - 1 and url not in known_net:
-                            return url
+                        if (ts >= submit_ts_this - 1 and url not in known_net
+                                and _acceptable_candidate(url, "路径A")):
+                            media_uuid = _extract_media_uuid(url)
+                            if media_uuid and media_uuid in confirmed_new_tile_uuids:
+                                return url
+                            if url not in pending_unconfirmed_candidates:
+                                pending_unconfirmed_candidates.add(url)
+                                log(
+                                    f"  ⏳ 路径A候选尚未关联本次新结果 tile，继续等待: "
+                                    f"{media_uuid[:16] if media_uuid else 'no-uuid'}...",
+                                    "GoogleFX",
+                                )
                     return None
 
                 poll_count = 0
@@ -442,27 +566,42 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     _check_cancelled()
                     poll_count += 1
 
+                    # Only media inside a tile created after this submit is eligible.  Flow
+                    # frequently lazy-loads historical canvas tiles after Send; a global DOM
+                    # diff cannot distinguish those from the current generation.
+                    new_tile_rows = _scan_new_result_tile_media()
+                    confirmed_new_tile_uuids = {
+                        _extract_media_uuid(row.get("src"))
+                        for row in new_tile_rows
+                        if _extract_media_uuid(row.get("src"))
+                    }
+
                     # ── 路径A: 网络拦截 ──
-                    hit = _scan_captured()
+                    hit = _scan_captured(confirmed_new_tile_uuids)
                     if hit:
                         log(f"  📡 路径A 网络捕获: {hit[:80]}...", "GoogleFX")
                         return hit
 
-                    # ── 路径B: DOM 扫描 Canvas 上新出现的图片 ──
-                    try:
-                        cur_dom_srcs = set(page.evaluate("""() => {
-                            return Array.from(document.querySelectorAll('img[src*="getMediaUrlRedirect"]'))
-                                .map(img => img.getAttribute('src') || '');
-                        }"""))
-                        new_srcs = cur_dom_srcs - known_dom_srcs
-                        if new_srcs:
-                            new_src = next(iter(new_srcs))
-                            # 转为绝对 URL
-                            full_url = new_src if new_src.startswith("http") else f"https://labs.google{new_src}"
-                            log(f"  🖼️  路径B DOM扫描捕获: {new_src[:80]}...", "GoogleFX")
-                            return full_url
-                    except Exception as e:
-                        log(f"  ⚠️ 路径B DOM扫描: {type(e).__name__}", "GoogleFX")
+                    # ── 路径B: 仅扫描本次提交新增 tile 内的图片 ──
+                    acceptable_rows = sorted(
+                        (
+                            row for row in new_tile_rows
+                            if row.get("src")
+                            and row.get("src") not in known_dom_srcs
+                            and _acceptable_candidate(row.get("src"), "路径B")
+                        ),
+                        key=lambda row: (row.get("tileId", ""), row.get("src", "")),
+                    )
+                    if acceptable_rows:
+                        new_src = acceptable_rows[0]["src"]
+                        # 转为绝对 URL
+                        full_url = new_src if new_src.startswith("http") else f"https://labs.google{new_src}"
+                        log(
+                            f"  🖼️  路径B新结果tile捕获: "
+                            f"tile={acceptable_rows[0]['tileId'][:16]}... {new_src[:80]}...",
+                            "GoogleFX",
+                        )
+                        return full_url
 
                     # ── 路径C: 检测新提交卡片是否已报错失败 ──
                     try:
@@ -525,7 +664,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                         except Exception:
                             time.sleep(0.25)   # 页面已关等：交给下一轮的路径B/C 报错
                             break
-                        hit = _scan_captured()
+                        hit = _scan_captured(confirmed_new_tile_uuids)
                         if hit:
                             log(f"  📡 路径A 网络捕获: {hit[:80]}...", "GoogleFX")
                             return hit
@@ -537,10 +676,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                 _check_cancelled()
                 log(f"\n{'─'*40}", "GoogleFX")
                 log(f"🖼️  Step {idx+1}/{len(prompts)}: '{prompt_text[:50]}...'", "GoogleFX")
-                # 第一张不用再扫一遍：进函数时 _prepare_fx_canvas 已经清过失败卡片，
-                # 这中间没有任何新提交，不可能冒出新的失败卡。
                 if idx > 0:
-                    _delete_failed_cards(page)
                     # ── 链式续图必须先摘掉上一拍的参考图（2026-07-26）──
                     # 素材槽里的 chip 活在编辑器之外，下面 _fill_text_only(has_ref=False)
                     # 的 fill() 只清得掉编辑器里的文字，碰不到它们；而 Step B 的
@@ -655,6 +791,29 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     if cancel_flag.is_cancelled:
                         raise
 
+                # Freeze every relevant baseline before Send.  Prompt references are blocked
+                # explicitly because their redirect src may be assigned lazily after this point.
+                pre_submit_known_net_urls = {url for _ts, url in captured_data}
+                try:
+                    pre_submit_dom_srcs = set(page.evaluate("""() => {
+                        return Array.from(document.querySelectorAll('img[src*="getMediaUrlRedirect"]'))
+                            .map(img => img.getAttribute('src') || '')
+                            .filter(Boolean);
+                    }"""))
+                except Exception as e:
+                    log(f"  ⚠️ 记录提交前 DOM 媒体基线失败: {type(e).__name__}", "GoogleFX")
+                    pre_submit_dom_srcs = set()
+                prompt_reference_uuids = set(_get_prompt_reference_uuids(page, limit=8))
+                pre_submit_media_uuids = (
+                    set(_get_panel_uuids(page))
+                    | prompt_reference_uuids
+                    | {
+                        str(value).lower()
+                        for value in (getattr(req, "excluded_media_uuids", None) or [])
+                        if value
+                    }
+                )
+
                 click_fx_send_button(page, input_el)
                 note_fx_submit()   # 提交节奏闸门的参照点
                 log(f"✅ 第 {idx+1}/{len(prompts)} 个 prompt 已提交", "GoogleFX")
@@ -670,6 +829,9 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     _current_prompt_text=prompt_text,
                     _current_prompt_idx=idx,
                     _has_ref_for_this_prompt=has_ref_for_this_prompt,
+                    known_net_urls_before_submit=pre_submit_known_net_urls,
+                    known_dom_srcs_before_submit=pre_submit_dom_srcs,
+                    blocked_media_uuids=pre_submit_media_uuids,
                 )
 
                 if not img_url:
@@ -681,6 +843,31 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                 local_path = _download_image(img_url, idx)
 
                 if local_path:
+                    active_reference_paths = []
+                    if has_ref_for_this_prompt:
+                        if idx == 0:
+                            active_reference_paths = list(valid_refs)
+                        elif local_paths:
+                            active_reference_paths = [local_paths[-1]]
+                    active_reference_paths.extend(
+                        path
+                        for path in (getattr(req, "excluded_image_paths", None) or [])
+                        if path not in active_reference_paths
+                    )
+                    duplicate, duplicate_mad, duplicate_ref = _images_are_near_duplicates(
+                        local_path,
+                        active_reference_paths,
+                    )
+                    if duplicate:
+                        try:
+                            os.remove(local_path)
+                        except OSError:
+                            pass
+                        raise RuntimeError(
+                            "所有 prompt 均未捕获到图片："
+                            f"候选结果与参考图近乎相同 (MAD={duplicate_mad:.2f}, "
+                            f"ref={os.path.basename(duplicate_ref or '')})"
+                        )
                     local_paths.append(local_path)
                     all_result_urls.append(img_url)
                     log(f"✅ 第 {idx+1} 张图下载完成，准备处理下一张", "GoogleFX")

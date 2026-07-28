@@ -38,6 +38,12 @@ def _write_test_image(path, size):
         path, format='WEBP' if path.lower().endswith('.webp') else 'PNG')
 
 
+def _make_test_cover(root, name='test_cover.webp'):
+    path = os.path.join(root, 'covers', name)
+    _write_test_image(path, (72, 128))
+    return path
+
+
 def _test_image_data_url(size):
     import base64
     from PIL import Image
@@ -197,6 +203,7 @@ class TestFrameProgressEvents(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.old_output_root = server_common.OUTPUT_ROOT
         server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
 
     def tearDown(self):
         server_common.OUTPUT_ROOT = self.old_output_root
@@ -234,7 +241,7 @@ visible construction change
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
              patch('prompt_pipeline.run_vlm_qa_check', side_effect=AssertionError('per-frame QA gate should no longer be called')):
             manifest = generate_frame_sequence(
-                {},
+                {'coverReferencePath': self.cover},
                 'progress_contract',
                 prompt_block,
                 on_progress=lambda stage, details: events.append((stage, details)),
@@ -269,6 +276,7 @@ second frame prompt
         self.tmp = tempfile.mkdtemp()
         self.old_output_root = server_common.OUTPUT_ROOT
         server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
 
     def tearDown(self):
         server_common.OUTPUT_ROOT = self.old_output_root
@@ -298,11 +306,12 @@ second frame prompt
 
         def fake_image_edit(config, prompt, reference_path, target_path, *a, **kw):
             edit_calls.append(config.get('imageModel'))
-            if config.get('imageModel') == 'primary-model':
+            if len(edit_calls) > 1:
                 raise QuotaExhaustedError('primary exhausted')
             self._write(target_path, f'edit:{prompt}')
 
-        config = {'imageModel': 'primary-model', 'imageEditFallbackModel': 'fallback-model'}
+        config = {'imageModel': 'primary-model', 'imageEditFallbackModel': 'fallback-model',
+                  'coverReferencePath': self.cover}
 
         events = []
         with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
@@ -312,7 +321,7 @@ second frame prompt
                                          on_progress=lambda stage, details: events.append((stage, details)))
 
         # 只打了主模型一枪，没有第二个模型的重试
-        self.assertEqual(edit_calls, ['primary-model'])
+        self.assertEqual(edit_calls, ['primary-model', 'primary-model'])
         self.assertEqual([s for s, _d in events if s == 'model_fallback'], [])
         # 第 1 帧已落盘：补额度后重试靠断点续传直接复用，不白烧
         manifest = self._read_manifest('quota_fallback')
@@ -320,7 +329,7 @@ second frame prompt
 
     def test_no_silent_text_image_fallback_when_edit_quota_exhausted(self):
         """图生图配额耗尽时绝不静默丢参考图改文生图重画——那会产出真正断链的
-        帧（构图跳变根源）。只有第 1 帧（本就没有参考帧）允许文生图。"""
+        帧（构图跳变根源）。第一帧也必须使用封面图生图。"""
         text_calls = []
 
         def fake_text_image(config, prompt, target_path, *a, **kw):
@@ -330,7 +339,7 @@ second frame prompt
         def fake_image_edit(config, prompt, reference_path, target_path, *a, **kw):
             raise QuotaExhaustedError('exhausted')
 
-        config = {'imageModel': 'primary-model'}
+        config = {'imageModel': 'primary-model', 'coverReferencePath': self.cover}
 
         with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
@@ -338,9 +347,9 @@ second frame prompt
                 generate_frame_sequence(config, 'quota_fallback_full', self._PROMPT_BLOCK,
                                          on_progress=lambda stage, details: None)
 
-        self.assertEqual(text_calls, ['primary-model'])
+        self.assertEqual(text_calls, [])
         manifest = self._read_manifest('quota_fallback_full')
-        self.assertTrue(any(f['sequence'] == 1 for f in manifest['frames']))
+        self.assertFalse(manifest and manifest.get('frames'))
 
 
 class TestChatTransportFallback(unittest.TestCase):
@@ -356,6 +365,7 @@ class TestChatTransportFallback(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        self.cover = _make_test_cover(self.tmp)
         self.ref_path = os.path.join(self.tmp, 'img_001.webp')
         self.target_path = os.path.join(self.tmp, 'img_002.webp')
         _write_test_image(self.ref_path, (720, 1280))
@@ -628,14 +638,14 @@ class TestChatTransportFallback(unittest.TestCase):
         try:
             with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
                  patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
-                generate_frame_sequence({}, 'chat_transport_resume', prompt_block,
+                generate_frame_sequence({'coverReferencePath': self.cover}, 'chat_transport_resume', prompt_block,
                                         on_progress=lambda s, d: None)
             # 第二轮：两帧都已在盘上，一枪不打，纯复用 manifest
             with patch('frame_generator._generate_text_image',
                        side_effect=AssertionError('续传不该重渲已有帧')), \
                  patch('frame_generator._generate_image_edit',
                        side_effect=AssertionError('续传不该重渲已有帧')):
-                manifest = generate_frame_sequence({}, 'chat_transport_resume', prompt_block,
+                manifest = generate_frame_sequence({'coverReferencePath': self.cover}, 'chat_transport_resume', prompt_block,
                                                    on_progress=lambda s, d: None)
         finally:
             server_common.OUTPUT_ROOT = old_root
@@ -643,7 +653,7 @@ class TestChatTransportFallback(unittest.TestCase):
         frames = {f['sequence']: f for f in manifest['frames']}
         self.assertEqual(frames[2]['transport'], CHAT_TRANSPORT)
         self.assertEqual(frames[2]['actual_pixels'], '768x1376')
-        self.assertNotIn('transport', frames[1])
+        self.assertEqual(frames[1]['transport'], CHAT_TRANSPORT)
 
     def test_degraded_frames_are_recorded_in_manifest_and_announced_live(self):
         """降档帧绝不伪装成正常帧：manifest 记 transport/degraded_reason/真实像素，
@@ -664,22 +674,22 @@ class TestChatTransportFallback(unittest.TestCase):
             with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
                  patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
                 manifest = generate_frame_sequence(
-                    {'imageQuality': '2K'}, 'chat_transport_trace',
+                    {'imageQuality': '2K', 'coverReferencePath': self.cover}, 'chat_transport_trace',
                     "图片 1:\nfirst frame prompt\n\n图片 2:\nsecond frame prompt\n",
                     on_progress=lambda stage, details: events.append((stage, details)))
         finally:
             server_common.OUTPUT_ROOT = old_root
 
         frames = {f['sequence']: f for f in manifest['frames']}
-        self.assertNotIn('transport', frames[1])       # 首帧走的是正常 t2i 通道
+        self.assertEqual(frames[1]['transport'], CHAT_TRANSPORT)
         self.assertEqual(frames[2]['transport'], CHAT_TRANSPORT)
         self.assertIn('分辨率降档', frames[2]['degraded_reason'])
         self.assertEqual(frames[2]['actual_pixels'], '768x1376')
         self.assertEqual(frames[2]['image_size'], '2K')  # 请求的档位如实保留
 
         announced = [d for s, d in events if s == 'transport_fallback']
-        self.assertEqual([d['sequence'] for d in announced], [2])
-        self.assertIn('IMG 002', announced[0]['message'])
+        self.assertEqual([d['sequence'] for d in announced], [1, 2])
+        self.assertIn('IMG 001', announced[0]['message'])
         self.assertTrue(announced[0]['degraded'])
         # manifest 落盘的内容与返回值一致（前端读的是盘上那份）
         with open(os.path.join(manifest['project_dir'], 'manifest.json'), encoding='utf-8') as f:
@@ -705,7 +715,7 @@ class TestChatTransportFallback(unittest.TestCase):
             with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
                  patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
                 manifest = generate_frame_sequence(
-                    {'imageQuality': '1K'}, 'chat_transport_1k',
+                    {'imageQuality': '1K', 'coverReferencePath': self.cover}, 'chat_transport_1k',
                     "图片 1:\nfirst frame prompt\n\n图片 2:\nsecond frame prompt\n",
                     on_progress=lambda stage, details: events.append((stage, details)))
         finally:
@@ -967,12 +977,7 @@ class TestGptImagePixelSize(unittest.TestCase):
 
 
 class TestAnchorInertiaQuotaFallback(unittest.TestCase):
-    """P1 惯性兜底的 t2i 重渲与主渲染路径共用同一套配额处置：配额耗尽原样上抛。
-
-    2026-07-17 拱渡槽单曾因这里把配额错误咽成"t2i 兜底失败"、保留 i2i 复读帧
-    继续往下渲，造成下游空间断裂。自动切兜底模型已整体取消，现在的正确行为是
-    就地停在配额耗尽这个真因上——反正下一帧也会撞同一堵墙。
-    非配额原因的 t2i 失败仍然只留痕、保留 i2i 原帧（不因一帧优化失败炸掉整单）。"""
+    """P1 惯性加强重试始终保持 i2i，且与主路径共用配额处置。"""
 
     _PROMPT_BLOCK = """图片 1:
 exterior prompt
@@ -988,6 +993,7 @@ bridge video
         self.tmp = tempfile.mkdtemp()
         self.old_output_root = server_common.OUTPUT_ROOT
         server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
 
     def tearDown(self):
         server_common.OUTPUT_ROOT = self.old_output_root
@@ -999,57 +1005,42 @@ bridge video
         with open(target_path, 'wb') as f:
             f.write(content.encode('utf-8'))
 
-    def _run(self, config, text_image_side_effect):
+    def _run(self, config, retry_error=None):
         events = []
+        edit_calls = []
 
         def fake_image_edit(cfg, prompt, reference_path, target_path, *a, **kw):
+            edit_calls.append(reference_path)
+            if len(edit_calls) == 3 and retry_error:
+                raise retry_error
             self._write(target_path, 'edit:stuck-duplicate')
 
-        with patch('frame_generator._generate_text_image', side_effect=text_image_side_effect), \
+        config = dict(config, coverReferencePath=self.cover)
+        with patch('frame_generator._generate_text_image') as text_image, \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
              patch('frame_generator.detect_anchor_inertia', return_value=(True, 1.5)), \
              patch('prompt_pipeline.check_door_clearance_frame', return_value=(True, 'PASS')):
             manifest = generate_frame_sequence(
                 config, 'inertia_quota_fallback', self._PROMPT_BLOCK,
                 on_progress=lambda stage, details: events.append((stage, details)))
-        return manifest, events
+        text_image.assert_not_called()
+        return manifest, events, edit_calls
 
-    def test_inertia_t2i_quota_exhaustion_aborts_the_run(self):
+    def test_inertia_i2i_quota_exhaustion_aborts_the_run(self):
         """惯性重渲撞上配额耗尽：原样上抛，不切模型、不留复读帧继续往下渲。"""
-        text_calls = []
-
-        def fake_text_image(cfg, prompt, target_path, *a, **kw):
-            text_calls.append(cfg.get('imageModel'))
-            # 首帧 t2i 用主模型正常成功；惯性重渲时主模型配额已尽
-            if len(text_calls) > 1:
-                raise QuotaExhaustedError('primary exhausted')
-            self._write(target_path, f'text:{cfg.get("imageModel")}')
-
-        # 配了兜底键也一样（该键已不再透传，留在这里是防回归）
         config = {'imageModel': 'primary-model', 'imageEditFallbackModel': 'fallback-model'}
         with self.assertRaises(QuotaExhaustedError):
-            self._run(config, fake_text_image)
+            self._run(config, QuotaExhaustedError('primary exhausted'))
 
-        # 只打了主模型：首帧 t2i + 惯性重渲，没有第三次换模型的尝试
-        self.assertEqual(text_calls, ['primary-model', 'primary-model'])
-
-    def test_inertia_t2i_non_quota_failure_keeps_frame_with_reason(self):
-        """非配额原因的 t2i 重渲失败：保留 i2i 原帧并留痕，不炸掉整单。"""
-        text_calls = []
-
-        def fake_text_image(cfg, prompt, target_path, *a, **kw):
-            text_calls.append(cfg.get('imageModel'))
-            if len(text_calls) > 1:
-                raise RuntimeError('t2i upstream boom')
-            self._write(target_path, 'text:first-frame')
-
+    def test_inertia_i2i_non_quota_failure_keeps_frame_with_reason(self):
+        """非配额原因的 i2i 加强重试失败：保留原帧并留痕，不炸掉整单。"""
         config = {'imageModel': 'primary-model'}
-        manifest, _ = self._run(config, fake_text_image)
+        manifest, _, edit_calls = self._run(config, RuntimeError('i2i upstream boom'))
 
-        self.assertEqual(text_calls, ['primary-model', 'primary-model'])
+        self.assertEqual(len(edit_calls), 3)
         frame2 = next(f for f in manifest['frames'] if f['sequence'] == 2)
         self.assertIn('anchor_inertia', frame2['vlm_qa_reason'])
-        self.assertIn('t2i 兜底失败', frame2['vlm_qa_reason'])
+        self.assertIn('i2i 加强重试失败', frame2['vlm_qa_reason'])
         with open(po_frame_path('inertia_quota_fallback', 2), 'rb') as f:
             self.assertEqual(f.read(), b'edit:stuck-duplicate')
 
@@ -1122,6 +1113,7 @@ bridge video 2
         self.tmp = tempfile.mkdtemp()
         self.old_output_root = server_common.OUTPUT_ROOT
         server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
 
     def tearDown(self):
         server_common.OUTPUT_ROOT = self.old_output_root
@@ -1155,26 +1147,24 @@ bridge video 2
         with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
              patch('prompt_pipeline.check_door_clearance_frame', side_effect=fake_door_clearance):
-            manifest = generate_frame_sequence({}, 'door_push_targeting', self._PROMPT_BLOCK,
+            manifest = generate_frame_sequence({'coverReferencePath': self.cover}, 'door_push_targeting', self._PROMPT_BLOCK,
                                                 on_progress=lambda *a: None)
 
         push_calls = [c for c in edit_calls if 'doorpush' in (c['reference'] or '')]
-        # Only the first extra push still edits from the (stuck) reference frame — it must
-        # be told exactly what the audit just found wrong on THIS frame, not a copy of the
-        # previous round's instruction, and must not yet claim to be the last attempt.
-        self.assertEqual(len(push_calls), 1)
+        # The first extra push must be told exactly what the audit just found wrong on THIS
+        # frame, not a copy of the previous round's instruction.
+        self.assertEqual(len(push_calls), 2)
         self.assertIn('画面左侧可见生锈门框边缘', push_calls[0]['control_prompt'])
         self.assertNotIn('last correction attempt', push_calls[0]['control_prompt'])
 
-        # i2i editing twice from the same stuck reference can't break a locked composition
-        # (2026-07-22 confirmed live 2/2): the final budgeted push abandons the reference
-        # entirely and re-renders frame 3 via t2i instead of pushing it a second time.
+        # The final budgeted push also remains i2i; no frame-sequence t2i is allowed.
         frame3_text_calls = [c for c in text_calls if c['prompt'] == 'interior prompt']
-        self.assertEqual(len(frame3_text_calls), 1)
+        self.assertEqual(len(frame3_text_calls), 0)
+        self.assertEqual(len(push_calls), 2)
 
         frame3 = next(f for f in manifest['frames'] if f['sequence'] == 3)
         self.assertIn('门洞轮廓仍框住整个画面', frame3['vlm_qa_reason'])
-        self.assertIsNone(frame3['reference'])
+        self.assertTrue(frame3['reference'].endswith('img_002.webp'))
 
 
 
@@ -1204,6 +1194,7 @@ bridge video 2
         self.tmp = tempfile.mkdtemp()
         self.old_output_root = server_common.OUTPUT_ROOT
         server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
 
     def tearDown(self):
         server_common.OUTPUT_ROOT = self.old_output_root
@@ -1231,7 +1222,7 @@ bridge video 2
              patch('prompt_pipeline.check_first_interior_reveal_raw_state',
                    side_effect=lambda *a, **kw: next(results)):
             manifest = generate_frame_sequence(
-                {}, title, self._PROMPT_BLOCK,
+                {'coverReferencePath': self.cover}, title, self._PROMPT_BLOCK,
                 on_progress=lambda stage, details: events.append((stage, details)))
         return manifest, edit_calls, events
 

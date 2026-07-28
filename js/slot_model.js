@@ -165,10 +165,19 @@ function frameActions(state, ctx) {
         list.push(slotAction('retry-frame', '生成', { cls: 'retry-frame-btn', disabled: busy, title: tip }));
     }
     if (state.kind === 'ready' || state.kind === 'missing') {
+        // 与视频槽位的「上传」同位置同语义：拖拽之外再给一个点选出口
+        // （触摸板/远程桌面下拖文件进浏览器并不总是可行）。占位卡是浅色底，
+        // 沿用 secondary 的浅色描边。
+        const sub = state.kind === 'ready' ? '' : ' secondary';
+        list.push(slotAction('upload-frame', '上传', {
+            cls: 'upload-frame-btn' + sub,
+            disabled: busy,
+            title: busy ? tip : '手动上传本地图片覆盖此帧（可多选＝从这一帧起依次填）',
+        }));
         // 出图卡是深色底、红底删除键用来跟其余按钮区分；占位卡是浅色底，
         // 沿用 secondary 的浅色描边（两种底色下的既有外观）
         list.push(slotAction('delete-slot', '删除', {
-            cls: state.kind === 'ready' ? 'delete-slot-btn' : 'delete-slot-btn secondary',
+            cls: 'delete-slot-btn' + sub,
             variant: state.kind === 'ready' ? 'danger' : 'default',
             disabled: busy,
             title: busy ? tip : DELETE_TIP,

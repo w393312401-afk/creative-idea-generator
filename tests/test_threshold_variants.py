@@ -430,21 +430,21 @@ class TestMergeGateCut(_TmpDirCase):
         self.assertIn(3, ctx.exception.missing)
 
 
-class TestStaleLineageSegments(_TmpDirCase):
+class TestContinuousStaleLineage(_TmpDirCase):
     def _frames(self, metas):
         return [{'sequence': i, 'slot': i, 'meta': metas.get(i, '')} for i in sorted(set(list(metas) + list(range(1, 7))))]
 
-    def test_regen_before_cut_does_not_stale_after_cut(self):
+    def test_regen_before_cut_stales_after_cut_too(self):
         manifest = {'frames': self._frames({4: 'CUT'})}
         update_manifest_stale_status(manifest, self.tmp, regenerated_sequences=[2], finalize=True)
         by_seq = {f['sequence']: f for f in manifest['frames']}
         self.assertTrue(by_seq[3].get('stale_lineage'))
-        # 切点帧（t2i 新链头）及其后不派生自旧链，不得被标 stale
-        self.assertFalse(by_seq[4].get('stale_lineage'))
-        self.assertFalse(by_seq[5].get('stale_lineage'))
-        self.assertFalse(by_seq[6].get('stale_lineage'))
+        # CUT 仍以上一帧图生图，因此切点及其后也属于同一条派生链。
+        self.assertTrue(by_seq[4].get('stale_lineage'))
+        self.assertTrue(by_seq[5].get('stale_lineage'))
+        self.assertTrue(by_seq[6].get('stale_lineage'))
 
-    def test_regen_after_cut_stales_only_its_segment(self):
+    def test_regen_after_cut_stales_only_downstream_frames(self):
         manifest = {'frames': self._frames({4: 'CUT'})}
         update_manifest_stale_status(manifest, self.tmp, regenerated_sequences=[5], finalize=True)
         by_seq = {f['sequence']: f for f in manifest['frames']}

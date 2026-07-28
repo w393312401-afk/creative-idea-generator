@@ -22,7 +22,7 @@ from server_common import (
     SERVER_CONFIG, SERVER_MANAGED, resolve_gateway, effective_config,
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
     IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT, IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT,
-    IMG2IMG_RAW_STATE_CONTROL_PROMPT, IMG2IMG_COVER_REFERENCE_CONTROL_PROMPT,
+    IMG2IMG_RAW_STATE_CONTROL_PROMPT,
     resolve_cover_reference,
     IMAGE_TASKS, IMAGE_TASKS_LOCK,
     apply_google_fx_runtime_overrides, fx_cancel_context,
@@ -301,28 +301,8 @@ def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=No
             continue
     if not regen:
         return
-    # i2i 链在声明式硬切帧（meta 含 CUT 的图片槽位 = t2i 新链头）处断开：血统标记按
-    # 链段独立计算——重生切点前的帧不会让切点后的帧过期（它们不派生自旧链），反之亦然。
-    cut_head_seqs = sorted({
-        fr.get('sequence') for fr in frames
-        if isinstance(fr, dict) and isinstance(fr.get('sequence'), int)
-        and 'CUT' in str(fr.get('meta', '')).upper()
-        and 'BRIDGE' not in str(fr.get('meta', '')).upper()
-    })
-
-    def _segment_head(seq):
-        head = 1
-        for h in cut_head_seqs:
-            if seq >= h:
-                head = h
-            else:
-                break
-        return head
-
-    regen_start_by_segment = {}
-    for r in regen:
-        seg = _segment_head(r)
-        regen_start_by_segment[seg] = min(r, regen_start_by_segment.get(seg, r))
+    # Every frame belongs to one continuous i2i lineage, including CUT beats.
+    regen_start = min(regen)
     for fr in frames:
         if not isinstance(fr, dict):
             continue
@@ -332,8 +312,7 @@ def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=No
         if seq in regen:
             fr.pop('stale_lineage', None)
             continue
-        seg_start = regen_start_by_segment.get(_segment_head(seq))
-        if seg_start is not None and seq > seg_start:
+        if seq > regen_start:
             fr['stale_lineage'] = True
 
 
@@ -1154,6 +1133,96 @@ def _fx_cover_ref_jpg(cover_path, frames_dir):
     return target
 
 
+def _fx_local_frame_ref_jpg(frame_path, frames_dir, seq):
+    """Convert a rendered frame into a Flow-uploadable i2i reference."""
+    target = os.path.join(_fx_src_dir(frames_dir), f'chain_ref_{seq:03d}.jpg')
+    with Image.open(frame_path) as img:
+        img.convert('RGB').save(target, format='JPEG', quality=92)
+    return target
+
+
+def _fx_clear_frame_reference(frames_dir, seq):
+    """Remove every cached FX reference for one replaced frame slot.
+
+    A manual upload replaces ``img_NNN.webp`` but has no Flow canvas UUID.  Keeping the old
+    ``img_NNN_<uuid>.jpg`` would make the next frame silently mount the pre-upload image.
+    The local ``chain_ref_NNN.jpg`` conversion is equally stale and must be rebuilt too.
+    """
+    src_dir = os.path.join(frames_dir, 'fx_src')
+    if not os.path.isdir(src_dir):
+        return []
+    prefixes = (f'img_{int(seq):03d}_', f'chain_ref_{int(seq):03d}.jpg')
+    removed = []
+    for name in os.listdir(src_dir):
+        if not (name.startswith(prefixes[0]) or name == prefixes[1]):
+            continue
+        path = os.path.join(src_dir, name)
+        if not os.path.isfile(path):
+            continue
+        os.remove(path)
+        removed.append(path)
+    return removed
+
+
+def _fx_slot_reference_files(src_dir, seq):
+    """该槽位现存的 UUID 留档文件名（正常只有一个，多了也按序返回）。"""
+    prefix = f'img_{int(seq):03d}_'
+    return [n for n in sorted(os.listdir(src_dir))
+            if n.startswith(prefix) and n.lower().endswith('.jpg')]
+
+
+def _fx_relocate_frame_reference(frames_dir, from_seq, to_seq, mode='swap'):
+    """图换格之后，把 fx_src 里的 UUID 留档跟着搬到新格。
+
+    ``_fx_find_ref_for`` 是靠 ``fx_src/img_NNN_<uuid>.jpg`` 给第 NNN+1 帧挂参考的。
+    img_NNN.webp 换了格而留档留在原位，下一次生成就会照着换位前的那张老图续链。
+
+    mode='copy' 时目标格拿到源格留档的副本（两格是同一张图，UUID 也该是同一个），
+    源格原样保留；swap / 搬运则两格互换留档（空的一边把另一边也换空）。
+    返回 {槽位号: 该格现在的留档绝对路径或 None}。
+    """
+    from_seq, to_seq = int(from_seq), int(to_seq)
+    result = {from_seq: None, to_seq: None}
+    src_dir = os.path.join(frames_dir, 'fx_src')
+    if not os.path.isdir(src_dir):
+        return result
+
+    def _renamed(name, seq):
+        m = re.match(r'^img_\d+_(.+)$', name)
+        return f'img_{seq:03d}_{m.group(1)}' if m else name
+
+    src_names = _fx_slot_reference_files(src_dir, from_seq)
+    dst_names = _fx_slot_reference_files(src_dir, to_seq)
+
+    if mode == 'copy':
+        for name in dst_names:
+            os.remove(os.path.join(src_dir, name))
+        for name in src_names:
+            shutil.copyfile(os.path.join(src_dir, name),
+                            os.path.join(src_dir, _renamed(name, to_seq)))
+    else:
+        # 两格互换：先全部挪进临时名，避免 img_002_x → img_003_x 覆盖掉还没挪走的对家
+        staged = []
+        for name, seq in ([(n, to_seq) for n in src_names]
+                          + [(n, from_seq) for n in dst_names]):
+            tmp = os.path.join(src_dir, name + '.relocate.tmp')
+            os.replace(os.path.join(src_dir, name), tmp)
+            staged.append((tmp, os.path.join(src_dir, _renamed(name, seq))))
+        for tmp, final in staged:
+            os.replace(tmp, final)
+
+    # chain_ref_NNN.jpg 只是该格 webp 的本地转档缓存，画面换了就作废（用时按新图重建）
+    for seq in ((to_seq,) if mode == 'copy' else (from_seq, to_seq)):
+        cached = os.path.join(src_dir, f'chain_ref_{seq:03d}.jpg')
+        if os.path.isfile(cached):
+            os.remove(cached)
+
+    for seq in (from_seq, to_seq):
+        found = _fx_slot_reference_files(src_dir, seq)
+        result[seq] = os.path.join(src_dir, found[0]) if found else None
+    return result
+
+
 def _fx_store_frame(src_path, frames_dir, seq):
     """外部脚本下载的原始 jpg → frames/img_NNN.webp，原始文件按
     img_NNN_<uuid>.jpg 留档到 frames/fx_src/（同槽位旧档先清掉，防止
@@ -1202,7 +1271,8 @@ def _fx_cancelled_result(result):
     return '任务已取消' in str((result or {}).get('message') or '')
 
 
-def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel_fn=None):
+def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel_fn=None,
+                       excluded_media_uuids=None, excluded_image_paths=None):
     """调用外部批量生图脚本一次，返回 (本地文件路径列表, 临时目录)。
 
     ref_path：上一帧留档 jpg（首帧/无续链传 None）。
@@ -1217,6 +1287,8 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel
     req = models.ImageBatchRequest(
         prompts=list(prompt_texts),
         images=[ref_path] if ref_path else [],
+        excluded_media_uuids=list(excluded_media_uuids or []),
+        excluded_image_paths=list(excluded_image_paths or []),
         ratio=config.get('imageAspectRatio') or '9:16',
         model=_fx_image_model(config),
         output_path=temp_out,  # 每次唯一，绕开外部 dedupe 缓存（同提示词重试不会拿到旧图）
@@ -1289,9 +1361,21 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             config['googleFxUserId'] = user_id
             apply_google_fx_runtime_overrides(config)
         from integrations.google_fx.utils import account_binding
+        excluded_media_uuids = {
+            str(frame.get('fx_uuid')).lower()
+            for frame in manifest_frames_by_seq.values()
+            if isinstance(frame, dict) and frame.get('fx_uuid')
+        }
+        excluded_image_paths = [
+            _webp_path(seq)
+            for seq in all_seqs
+            if _frame_exists(seq)
+        ]
         with account_binding.bound_task_account(user_id):
             return _fx_generate_batch(google_fx, fx_models, config, chunk_prompts, ref_path,
-                                      cancel_fn=cancel_fn)
+                                      cancel_fn=cancel_fn,
+                                      excluded_media_uuids=excluded_media_uuids,
+                                      excluded_image_paths=excluded_image_paths)
 
     manifest_path = os.path.join(project_dir, 'manifest.json')
     manifest = {
@@ -1399,8 +1483,8 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         _emit_frame(frame_info)
 
     chunks = plan_fx_chunks(gen_seqs)
-    # 声明式硬切（[CUT] 视频槽）：切点后的首帧是新链头——FX 链上表现为该帧必须
-    # 另起一批且不带上一帧参考（否则 Flow UI 链式参考把切点前的外部画面串进室内）。
+    # 声明式硬切（[CUT] 视频槽）另起一批，便于让提示词主导场景变化；新批仍会显式
+    # 挂载上一帧作为参考，因此不会退化成文生图或断开血统。
     cut_heads = set()
     for _v_idx, _v in (videos or {}).items():
         _vm = str(_v.get('meta', '') if isinstance(_v, dict) else '').upper()
@@ -1461,31 +1545,23 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         _check_cancel()
 
         cover_ref_src = None
-        if chunk[0] in cut_heads:
-            # 硬切新链头：刻意不带参考起链（一致性靠提示词里的 Scene DNA 复述）
-            ref_path = None
-            if sys.stdout:
-                print(f"[FRAME SEQUENCE][FX] 第 {chunk[0]} 帧是声明式硬切新链头，本批以无参考模式起链（既定语义）")
-        else:
-            ref_path = _fx_find_ref_for(frames_dir, chunk[0])
-            if chunk[0] > 1 and not ref_path and sys.stdout:
-                print(
-                    f"[FRAME SEQUENCE][FX] 第 {chunk[0]} 帧找不到上一帧的 UUID 留档 "
-                    f"(frames/fx_src/img_{chunk[0]-1:03d}_*.jpg)，本批将以无参考模式起链，画面连续性可能下降"
-                )
+        ref_path = _fx_find_ref_for(frames_dir, chunk[0])
 
         chunk_prompts = [prompts_by_seq[s]['prompt'] for s in chunk]
-        if chunk[0] == 1 and not ref_path:
+        if chunk[0] == 1:
             cover_src = resolve_cover_reference(config, title)
-            if cover_src:
-                ref_path = _fx_cover_ref_jpg(cover_src, frames_dir)
-                cover_ref_src = cover_src
-                # The appended instruction remains the parsed 图片 1 prompt. The cover never
-                # contributes its generation prompt; it is only the uploaded reference image.
-                chunk_prompts[0] = (
-                    f"{IMG2IMG_COVER_REFERENCE_CONTROL_PROMPT}\n\n"
-                    f"IMAGE 1 PROMPT:\n{chunk_prompts[0]}"
+            if not cover_src:
+                raise RuntimeError('生成帧序列前必须先生成或选择封面图；第一帧只能以封面图进行图生图')
+            ref_path = _fx_cover_ref_jpg(cover_src, frames_dir)
+            cover_ref_src = cover_src
+            # The cover is the image reference only. Send the parsed IMAGE 1 prompt verbatim.
+        elif not ref_path:
+            previous_webp = _webp_path(chunk[0] - 1)
+            if not _frame_exists(chunk[0] - 1):
+                raise RuntimeError(
+                    f'无法生成第 {chunk[0]} 帧：缺少上一帧参考图，帧序列禁止退回文生图'
                 )
+            ref_path = _fx_local_frame_ref_jpg(previous_webp, frames_dir, chunk[0] - 1)
         leg = leg_by_chunk_start.get(chunk[0])
         if leg and leg.get('user_id') and leg['user_id'] != current_account_id:
             current_account_id = leg['user_id']
@@ -1534,8 +1610,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                         _match_color_lab(target_path, first_frame_path, target_path)
                 prev_ref = _fx_find_ref_for(frames_dir, s)
                 quality_gate, vlm_reason = _run_vlm_qa(s, item, is_bridge, prev_ref)
-                # P1 换族锚点惯性检测（FX 链路只留痕不自动重渲：本批后续帧已链在该帧
-                # 上，中途按 t2i 重渲会与同批链式产物脱节；API 路径有全自动 t2i 兜底）
+                # P1 换族锚点惯性检测（FX 链路只留痕不自动重渲：本批后续帧已链在该帧上）。
                 if is_bridge and s > 1 and not vlm_reason:
                     _stuck, _inertia_mad = detect_anchor_inertia(_webp_path(s), _webp_path(s - 1))
                     if _stuck:
@@ -1712,7 +1787,7 @@ def _raw_state_fix_prompt(rs_reason):
 # 换族/桥接锚点帧的 i2i 惯性判据（2026-07-15 盐湖贝壳单标定）：桥接帧与其参考帧的
 # 64px 灰度缩略 MAD——被参考惯性卡死渲成复制帧的 img_005/img_006 为 1.56/2.17，
 # 正常施工推进对最低 4.8，真实换族 47。i2i 参考惯性压过"进入新空间"文本指令时，
-# 提示词修辞救不了，只能丢参考按 t2i 新链头重渲（TBCP 硬切同款语义）。
+# Near-copy detection triggers another i2i push; frame rendering never drops its reference.
 _ANCHOR_INERTIA_MAD = 3.0
 
 
@@ -1844,18 +1919,18 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         )
         # pan 变体的单一过门拍：合并镜头（推进+转向）用合并版控制指令
         is_turn = 'TURN' in incoming_meta
-        # 声明式硬切（[CUT]）：本帧是切点后的室内首帧——不拿上一帧当参考，走 t2i
-        # 新链头（一致性靠提示词里的 Scene DNA 复述），之后的帧从这帧继续 i2i 链
+        # CUT changes the edit instruction, but does not break the image-reference chain.
         is_cut_head = ('CUT' in incoming_meta) and ('BRIDGE' not in incoming_meta)
         cover_ref = (resolve_cover_reference(config, title)
                      if seq == 1 and not skip_api_call else None)
         if not skip_api_call:
             cover_anchor = bool(cover_ref)
-            use_text_generation = (not cover_anchor) and (
-                seq == 1 or is_cut_head
-                or not previous_path or not os.path.exists(previous_path))
-            model = _image_generation_model(config) if use_text_generation else _image_edit_model(config)
-            reference = cover_ref if cover_anchor else (previous_path if not use_text_generation else None)
+            if seq == 1 and not cover_ref:
+                raise RuntimeError('生成帧序列前必须先生成或选择封面图；第一帧只能以封面图进行图生图')
+            reference = cover_ref if cover_anchor else previous_path
+            if not reference or not os.path.exists(reference):
+                raise RuntimeError(f'无法生成第 {seq} 帧：缺少上一帧参考图，帧序列禁止退回文生图')
+            model = _image_edit_model(config)
             if on_progress:
                 on_progress('frame_start', {
                     'slot': item['index'],
@@ -1865,26 +1940,24 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
 
             ctrl_prompt = IMG2IMG_CONTROL_PROMPT
             try:
-                if use_text_generation:
-                    _generate_text_image(config, item['prompt'], target_path)
+                if cover_anchor:
+                    # No generic prefix or label: send the parsed IMAGE 1 prompt verbatim.
+                    ctrl_prompt = ''
+                elif is_turn:
+                    ctrl_prompt = IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT
+                elif is_bridge or is_cut_head:
+                    ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT
                 else:
-                    if cover_anchor:
-                        ctrl_prompt = IMG2IMG_COVER_REFERENCE_CONTROL_PROMPT
-                    elif is_turn:
-                        ctrl_prompt = IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT
-                    elif is_bridge:
-                        ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT
-                    else:
-                        ctrl_prompt = IMG2IMG_CONTROL_PROMPT
-                    transport = _generate_image_edit(config, item['prompt'], reference,
-                                                     target_path, control_prompt=ctrl_prompt)
-                    if transport == CHAT_TRANSPORT and on_progress:
-                        # 换了通道就当场说清楚，不能只在 manifest 里留个字段等人去翻
-                        on_progress('transport_fallback', {
-                            'sequence': seq, 'transport': transport,
-                            'degraded': not _chat_transport_is_full_quality(config),
-                            'message': f"IMG {seq:03d} {chat_transport_note(config)}",
-                        })
+                    ctrl_prompt = IMG2IMG_CONTROL_PROMPT
+                transport = _generate_image_edit(config, item['prompt'], reference,
+                                                 target_path, control_prompt=ctrl_prompt)
+                if transport == CHAT_TRANSPORT and on_progress:
+                    # This is a transport fallback; the request remains image-to-image.
+                    on_progress('transport_fallback', {
+                        'sequence': seq, 'transport': transport,
+                        'degraded': not _chat_transport_is_full_quality(config),
+                        'message': f"IMG {seq:03d} {chat_transport_note(config)}",
+                    })
             except QuotaExhaustedError:
                 # 主模型图片配额耗尽 = 明确失败，直接抛给上层。
                 # 曾经这里会自动切到 imageEditFallbackModel（实配 gpt-image-2）继续渲：
@@ -1899,16 +1972,8 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                 # 的逻辑吞掉——否则用户点了取消，这里却把它当成一次普通生成失败去重试。
                 if isinstance(gen_err, GenerationCancelled):
                     raise
-                if use_text_generation or cover_anchor:
-                    retries += 1
-                    log('WARN', 'FRAME_SEQ', f"首帧生成失败，重试文生图: {gen_err}")
-                    _generate_text_image(config, item['prompt'], target_path)
-                    cover_anchor = False
-                    reference = None
-                    model = _image_generation_model(config)
-                else:
-                    log('ERROR', 'FRAME_SEQ', f"第 {seq} 帧图生图失败（后续帧无法回退成文生图）: {gen_err}")
-                    raise RuntimeError(f"第 {seq} 帧图生图失败: {gen_err}")
+                log('ERROR', 'FRAME_SEQ', f"第 {seq} 帧图生图失败（禁止回退文生图）: {gen_err}")
+                raise RuntimeError(f"第 {seq} 帧图生图失败: {gen_err}")
 
             # Apply LAB color matching to prevent pink drift
             if seq > 1 and os.path.exists(target_path):
@@ -1921,38 +1986,39 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             # P1 换族锚点惯性兜底（2026-07-15 盐湖贝壳单）：桥接帧由 i2i 生成时，
             # 参考惯性可能压过"进入新空间"的文本指令，渲出上一帧的近似复制帧——
             # 规划好的过门没执行，新空间在下一帧硬现身造成空间断裂。渲后与参考帧
-            # 本地比对，近乎相同 = 惯性卡死 → 丢参考按 t2i 新链头重渲一次（TBCP
-            # 硬切同款语义，一致性靠提示词里的场景 DNA 复述）；t2i 失败保留原帧留痕。
-            if not use_text_generation and is_bridge:
+            # 本地比对，近乎相同 = 惯性卡死，再以同一参考图做一次更强的 i2i 推进。
+            if is_bridge:
                 stuck, inertia_mad = detect_anchor_inertia(target_path, previous_path)
                 if stuck:
                     if sys.stdout:
                         print(f"[ANCHOR INERTIA] Frame {seq} 与参考帧近乎相同（MAD={inertia_mad:.2f} < "
-                              f"{_ANCHOR_INERTIA_MAD}），i2i 惯性未执行换族——改以 t2i 新链头重渲")
+                              f"{_ANCHOR_INERTIA_MAD}），i2i 惯性未执行换族——加强图生图指令重渲")
                     if on_progress:
                         on_progress('anchor_inertia', {
                             'sequence': seq, 'mad': round(inertia_mad, 2),
                             'message': (f"IMG {seq:03d} 桥接帧被 i2i 参考惯性卡死"
-                                        f"（与参考帧 MAD={inertia_mad:.2f}），正以 t2i 新链头重渲…"),
+                                        f"（与参考帧 MAD={inertia_mad:.2f}），正加强图生图指令重渲…"),
                         })
                     try:
-                        _generate_text_image(config, item['prompt'], target_path)
-                        model = _image_generation_model(config)
+                        transport = _generate_image_edit(
+                            config, item['prompt'], previous_path, target_path,
+                            control_prompt=IMG2IMG_BRIDGE_CONTROL_PROMPT)
+                        model = _image_edit_model(config)
                         retries += 1
-                        reference = None  # 本帧已脱链成 t2i 新链头，如实记录
+                        reference = previous_path
                         first_frame_path = os.path.join(frames_dir, 'img_001.webp')
                         if os.path.exists(first_frame_path):
                             _match_color_lab(target_path, first_frame_path, target_path)
                     except QuotaExhaustedError:
                         # 配额耗尽原样上抛，与主渲染路径同一套处置：不再切兜底模型，
-                        # 也不咽成"t2i 兜底失败"留个复读帧继续往下渲——下一帧照样会
+                        # 也不吞掉失败后继续往下渲——下一帧照样会
                         # 撞同一堵墙，不如就地停在真因上。
                         raise
                     except Exception as inertia_err:
                         vlm_qa_reason = (f"anchor_inertia: 与参考帧近乎相同（MAD={inertia_mad:.2f}）"
-                                         f"且 t2i 兜底失败（{inertia_err}），保留 i2i 原帧待人工重试")
+                                         f"且 i2i 加强重试失败（{inertia_err}），保留原帧待人工重试")
                         if sys.stdout:
-                            print(f"[ANCHOR INERTIA] Frame {seq} t2i 兜底失败（{inertia_err}），保留原帧并留痕")
+                            print(f"[ANCHOR INERTIA] Frame {seq} i2i 加强重试失败（{inertia_err}），保留原帧并留痕")
 
             # P0 门框清除兜底：单一过门拍产出的室内定格帧由 i2i 保守编辑生成——上一张
             # 外部参考帧门框占满画面时，编辑模型经常只做保守裁切，门框残留导致室内
@@ -1960,7 +2026,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             # 参考、用推进版控制指令再推一步（把"过门"拆成两次连续推进），最多
             # _DOOR_CLEARANCE_MAX_PUSHES 次；推完仍不过只留痕，绝不拦渲染（终审交给
             # 整套序列一致性审查）。
-            if (not use_text_generation and is_bridge
+            if (is_bridge
                     and image_space_family(videos, seq) == 'interior'):
                 for _push in range(_DOOR_CLEARANCE_MAX_PUSHES + 1):
                     dc_passed, dc_reason = check_door_clearance_frame(config, target_path)
@@ -1989,18 +2055,22 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                             # 前一轮 i2i 加推已经证实推不动——它仍然是拿同一张已经卡死
                             # 构图的参考帧去编辑，模型只会给出同样保守的结果（2026-07-22
                             # 喀斯特洞穴/沙漠花岗岩两单实测：2/2 次门框清除加推全部失败，
-                            # 画面构图几乎原地不动）。最后一次不再编辑卡死的参考图，改成
-                            # 丢参考按 t2i 新链头重渲（一致性靠提示词里的场景 DNA 复述，
-                            # 与 anchor_inertia 卡死兜底同款语义），才有机会真正跳出锁死
-                            # 的构图；t2i 失败会落进下面的 except，保留当前帧并留痕。
+                            # 画面构图几乎原地不动）。最后一次仍使用当前画面作为参考，
+                            # 但换成更强的 i2i 指令推进。
                             if sys.stdout:
                                 print(f"[DOOR CLEARANCE] Frame {seq} failed door clearance twice "
                                       f"({dc_reason}); i2i pushes from the same stuck reference can't "
-                                      f"break the locked composition — final attempt drops the "
-                                      f"reference and re-renders via t2i.")
-                            _generate_text_image(config, item['prompt'], target_path)
-                            model = _image_generation_model(config)
-                            reference = None
+                                      f"break the locked composition — final attempt uses a "
+                                      f"stronger i2i edit instruction.")
+                            push_transport = _generate_image_edit(
+                                config, item['prompt'], push_ref, target_path,
+                                control_prompt=_door_clearance_push_prompt(
+                                    dc_reason, final_attempt=True))
+                            if push_transport == CHAT_TRANSPORT:
+                                transport = push_transport
+                            model = _image_edit_model(config)
+                            # Keep the durable chain parent in the manifest; push_ref is temporary.
+                            reference = previous_path
                         else:
                             if sys.stdout:
                                 print(f"[DOOR CLEARANCE] Frame {seq} failed door clearance "
@@ -2042,7 +2112,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             # 提示词，这里对真实像素把关：未通过则以该帧自身为参考做定向状态修正（镜头
             # 不动，只改内容），最多 _RAW_STATE_MAX_FIXES 次；修完仍不过只留痕，绝不拦
             # 渲染（终审交给整套序列一致性审查）。
-            if (not use_text_generation and is_bridge
+            if (is_bridge
                     and image_space_family(videos, seq) == 'interior'):
                 for _fix in range(_RAW_STATE_MAX_FIXES + 1):
                     rs_passed, rs_reason = check_first_interior_reveal_raw_state(config, target_path)
@@ -2125,8 +2195,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             if skip_api_call and existing_frame and existing_frame.get('parent_hash'):
                 p_hash = existing_frame['parent_hash']
             elif reference and previous_path and os.path.exists(previous_path):
-                # t2i 链头（首帧/硬切/惯性兜底重渲）reference=None：血统在此断开，
-                # 不记上一帧哈希——parent_hash 只描述真实的 i2i 派生关系
+                # parent_hash records the durable previous-frame link in the i2i chain.
                 p_hash = _get_file_hash(previous_path)
 
         frame_info = {

@@ -238,7 +238,11 @@ class TestRunIdeateReturnShape(unittest.TestCase):
             return json.dumps([{
                 'title': '谷仓黄铜隐居屋·雨林版',
                 'dna': 'grain-silo / rainforest-refuge / rain-chain-wall',
-                'beat_outline': ['清空锈蚀内壁', '点亮雨链墙'],
+                # 通用骨架门禁（outline_skeleton_violations）对所有骨架生效，
+                # 这里的清单必须是结构合法的（≥4 条、末条是 reward 揭示），
+                # 否则这张卡会被当成硬失败丢掉，本用例要断言的 remix 行为就无从验证。
+                'beat_outline': ['清空锈蚀内壁', '焊补穿孔钢板', '封装内衬木饰面',
+                                 '铺装成品木地板', '点亮雨链墙,人物入住'],
             }], ensure_ascii=False)
 
         seed = {
@@ -318,7 +322,10 @@ class TestRunIdeateReturnShape(unittest.TestCase):
         避免四张卡又全部退回原单线节拍。"""
         captured = {}
         payload = json.dumps([
-            {'title': 'A', 'dna': 'a / refuge / x', 'beat_outline': ['立柱', '亮灯']},
+            {'title': 'A', 'dna': 'a / refuge / x', 'beat_outline': [
+                '立柱搭建外部框架', '封装外墙木饰面', '铺装成品木地板',
+                '布置床铺与软装', '点亮灯光,人物入住',
+            ]},
             {'title': 'B', 'dna': 'b / refuge / x', 'beat_outline': [
                 '立柱搭建外部框架', '完成外部入口门面', '推镜穿过门口进入原始室内',
                 '清空室内积渣', '铺设防潮基层', '架设墙顶龙骨',
@@ -470,26 +477,29 @@ class TestBeatOutlineDelivery(unittest.TestCase):
         """数组里混进 null/数字/空白项要被清掉,数字要转成字符串,顺序不能变。"""
         payload = json.dumps([{
             'title': 'T', 'dna': 'a / b / c',
-            'beat_outline': ['  清运积渣  ', None, '', 5, '点亮灯带,人物入住'],
+            'beat_outline': ['  清运积渣  ', None, '', 5, '架设墙顶龙骨',
+                             '铺装成品地板', '点亮灯带,人物入住'],
         }], ensure_ascii=False)
         result, _ = self._run(lambda *a, **k: payload)
         self.assertEqual(result['ideas'][0]['beat_outline'],
-                         ['清运积渣', '5', '点亮灯带,人物入住'])
+                         ['清运积渣', '5', '架设墙顶龙骨', '铺装成品地板', '点亮灯带,人物入住'])
+        # 拍数一律由清单长度派生,模型申报的数字不再有话语权(见 §1.3)
+        self.assertEqual(result['ideas'][0]['recommended_beats'], 4)
 
     def test_outline_returned_as_one_string_is_split_into_beats(self):
         payload = json.dumps([{
             'title': 'T', 'dna': 'a / b / c',
-            'beat_outline': '清运积渣\n架设龙骨\n点亮灯带,人物入住',
+            'beat_outline': '清运积渣\n架设龙骨\n铺装地板\n点亮灯带,人物入住',
         }], ensure_ascii=False)
         result, _ = self._run(lambda *a, **k: payload)
         self.assertEqual(result['ideas'][0]['beat_outline'],
-                         ['清运积渣', '架设龙骨', '点亮灯带,人物入住'])
+                         ['清运积渣', '架设龙骨', '铺装地板', '点亮灯带,人物入住'])
 
     def test_batch_with_no_outline_at_all_is_retried(self):
         """整批一条 beat_outline 都没有 = 模型整个忽略了这个字段,重试后用合规的那批。"""
         good = json.dumps([{
             'title': '带简介', 'dna': 'a / b / c',
-            'beat_outline': ['清运积渣', '点亮灯带,人物入住'],
+            'beat_outline': ['清运积渣', '架设墙顶龙骨', '铺装成品地板', '点亮灯带,人物入住'],
         }], ensure_ascii=False)
         responses = ['[{"title": "无简介", "dna": "x / y / z"}]', good]
         result, mock_chat = self._run(lambda *a, **k: responses.pop(0))
@@ -499,12 +509,13 @@ class TestBeatOutlineDelivery(unittest.TestCase):
     def test_partial_outlines_are_kept_without_burning_a_retry(self):
         """只是个别条目没写:为一条重跑整批不划算,照收即可(前端对这类卡片退回「载入维度」)。"""
         payload = json.dumps([
-            {'title': '有', 'dna': 'a / b / c', 'beat_outline': ['清运积渣', '点亮灯带']},
+            {'title': '有', 'dna': 'a / b / c',
+             'beat_outline': ['清运积渣', '架设墙顶龙骨', '铺装成品地板', '点亮灯带,人物入住']},
             {'title': '无', 'dna': 'x / y / z'},
         ], ensure_ascii=False)
         result, mock_chat = self._run(lambda *a, **k: payload)
         self.assertEqual(mock_chat.call_count, 1)
-        self.assertEqual([len(i['beat_outline']) for i in result['ideas']], [2, 0])
+        self.assertEqual([len(i['beat_outline']) for i in result['ideas']], [4, 0])
 
     def test_persistently_missing_outline_still_returns_ideas(self):
         """模型三次都不写:宁可给没有节拍简介的卡片,也不能把整批灵感丢掉(退回静态兜底)。"""
@@ -513,6 +524,151 @@ class TestBeatOutlineDelivery(unittest.TestCase):
         self.assertEqual(mock_chat.call_count, 3)
         self.assertEqual(result['ideas'][0]['title'], '无简介')
         self.assertEqual(result['ideas'][0]['beat_outline'], [])
+
+
+class TestDualPayoffCrossingDetection(unittest.TestCase):
+    """过门拍的识别口径。原来只要一拍里同时出现「进入」和「室内」就算一次过门，
+    于是室内工序段里正常的「搬入家具进入室内布置」被算成第二次过门，整批合格的
+    卡片一起被否掉——server.log 里刷屏的 "exactly one" 多数是这么来的。"""
+
+    def _errs(self, outline):
+        return pp.pacing_skeleton_outline_violations(
+            {'pacing_skeleton': 'dual_payoff', 'beat_outline': outline})
+
+    def test_ordinary_interior_beat_is_not_counted_as_a_second_crossing(self):
+        outline = [
+            '清理谷仓外墙藤蔓', '加固石砌墙体与梁架', '安装双开谷仓门',
+            '铺装门前碎石车道', '点亮外墙壁灯完成门面', '推镜穿过谷仓门进入原始仓内',
+            '清空仓内朽木与粪土', '浇筑并找平室内地坪', '铺设防潮层与电路管线',
+            '架设木龙骨与保温棉', '封装内衬板与饰面', '搬入家具进入室内布置',
+            '点亮吊灯,人物入住',
+        ]
+        self.assertEqual(self._errs(outline), [])
+
+    def test_crossing_without_door_or_camera_cue_still_counts_when_raw_state_named(self):
+        outline = [
+            '清理石屋周边灌木与碎石', '修补外墙石缝与拱券', '安装实木入户门与五金',
+            '铺设入口石板平台', '点亮门廊灯完成外立面', '进入未修的屋内查看',
+            '清运屋内塌落瓦砾', '找平夯实室内地基', '铺设防潮膜与管线',
+            '架设木龙骨隔墙', '封装松木内衬板', '布置床铺与软装',
+            '炉火点亮,人物入住',
+        ]
+        self.assertEqual(self._errs(outline), [])
+
+    def test_missing_and_duplicated_crossings_are_reported_distinguishably(self):
+        linear = ['清空洞内碎冰与积雪', '凿平起居区冰面地坪', '锚固钢制支撑框架',
+                  '喷涂洞壁隔热封闭层', '铺设架空木龙骨地台', '填充羊毛保温层',
+                  '铺装成品木地板', '布置床铺与软装', '点亮灯带,人物入住']
+        self.assertIn('found 0', self._errs(linear)[0])
+
+        twice = ['清理外墙藤蔓', '完成外部入口门面', '推镜过门进入原始仓内',
+                 '清空仓内朽木', '再次过门进入原始阁楼', '铺设防潮基层',
+                 '架设墙顶龙骨', '封装内衬面板', '布置床铺软装', '点亮灯光入住']
+        self.assertIn('found 2', self._errs(twice)[0])
+
+    def test_interior_vocabulary_is_shared_by_detection_and_verification(self):
+        """用 仓内 认出过门拍，就不能反过来判它"没落进室内"——两处词表必须是同一份。"""
+        outline = ['清理外墙藤蔓', '点亮壁灯完成外立面', '推镜过门进入原始仓内',
+                   '清空仓内朽木', '铺设防潮基层', '架设墙顶龙骨',
+                   '封装内衬面板', '布置床铺软装', '点亮灯光入住']
+        self.assertNotIn('doorway-crossing entry must land explicitly inside', self._errs(outline))
+
+
+class TestPacingGateDoesNotDiscardPassingCards(unittest.TestCase):
+    """节拍验收从「整批连坐」改成「按张处理」。
+
+    旧行为：四张里一张没过 → 整批丢掉重来，三次 150s 调用烧完还是掉进静态兜底，
+    而静态兜底又要过台账去重，用久了只剩一两条甚至零条，用户看到的就是「换一批
+    灵感」转几分钟然后一句「暂无灵感推荐」。
+    """
+
+    GOOD_OUTLINE = [
+        '立柱搭建外部框架', '完成外部入口门面', '推镜穿过门口进入原始室内',
+        '清空室内积渣', '铺设防潮基层', '架设墙顶龙骨',
+        '填充墙顶保温', '封装内衬面板', '铺装成品地板',
+        '布置床铺软装', '点亮灯光入住',
+    ]
+    LINEAR_OUTLINE = [
+        '清空洞内碎冰与积雪', '凿平起居区冰面地坪', '锚固钢制支撑框架',
+        '喷涂洞壁隔热封闭层', '铺设架空木龙骨地台', '填充羊毛保温层',
+        '铺装成品木地板', '布置床铺与软装', '点亮灯带,人物入住',
+    ]
+
+    def setUp(self):
+        self._tmp_dir = tempfile.mkdtemp()
+        self._patches = [
+            patch.object(pp, 'SEARCH_SNIPPET_CACHE_PATH',
+                         os.path.join(self._tmp_dir, 'search_snippet_cache.json')),
+            patch.object(pp, 'TREND_REFS_PATH', os.path.join(self._tmp_dir, 'trend_refs.json')),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+    def _payload(self):
+        return json.dumps([
+            {'title': '合格卡', 'dna': 'a / refuge / x',
+             'pacing_skeleton': 'dual_payoff', 'beat_outline': self.GOOD_OUTLINE},
+            {'title': '写成单线的卡', 'dna': 'b / refuge / y',
+             'pacing_skeleton': 'dual_payoff', 'beat_outline': self.LINEAR_OUTLINE},
+        ], ensure_ascii=False)
+
+    def _run(self, pacing_ids):
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', return_value=self._payload()) as mock_chat:
+            return pp.run_ideate({}, count=2, pacing_skeleton_ids=pacing_ids), mock_chat
+
+    def test_failing_card_is_downgraded_not_dropped_when_linear_is_selected(self):
+        result, mock_chat = self._run(['linear_milestone', 'dual_payoff'])
+        self.assertEqual([i['title'] for i in result['ideas']], ['合格卡', '写成单线的卡'])
+        # 标签必须诚实：内容是单线清单，就不能继续挂 dual_payoff 的牌子
+        self.assertEqual([i['pacing_skeleton'] for i in result['ideas']],
+                         ['dual_payoff', 'linear_milestone'])
+        # 已经有卡片过关时最多再补一次，不再把三次机会全烧完
+        self.assertEqual(mock_chat.call_count, 2)
+
+    def test_dual_only_selection_drops_the_failing_card_but_keeps_the_rest(self):
+        result, mock_chat = self._run(['dual_payoff'])
+        self.assertEqual([i['title'] for i in result['ideas']], ['合格卡'])
+        self.assertEqual(result['ideas'][0]['pacing_skeleton'], 'dual_payoff')
+        self.assertEqual(mock_chat.call_count, 2)
+
+    def test_whole_batch_failing_uses_all_three_attempts_then_still_delivers(self):
+        payload = json.dumps([{
+            'title': '写成单线的卡', 'dna': 'b / refuge / y',
+            'pacing_skeleton': 'dual_payoff', 'beat_outline': self.LINEAR_OUTLINE,
+        }], ensure_ascii=False)
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', return_value=payload) as mock_chat:
+            result = pp.run_ideate({}, count=1,
+                                   pacing_skeleton_ids=['linear_milestone', 'dual_payoff'])
+        self.assertEqual(mock_chat.call_count, 3)
+        self.assertEqual([i['title'] for i in result['ideas']], ['写成单线的卡'])
+        self.assertEqual(result['ideas'][0]['pacing_skeleton'], 'linear_milestone')
+
+    def test_exhausted_fallback_raises_instead_of_returning_an_empty_batch(self):
+        """兜底选题被台账全部认领时，以前静静返回空数组，前端只显示「暂无灵感推荐」,
+        分不清是模型挂了还是兜底用完了。现在必须报出可执行的原因。"""
+        burned = [
+            {'topic_dna': 'glacier-ice-cave / refuge-den / self-material-window'},
+            {'topic_dna': 'retired-submarine / micro-home / porthole-lighting'},
+            {'topic_dna': 'missile-silo / burrow-dwelling / roof-hatch'},
+        ]
+        with patch.object(pp, 'read_ledger', return_value=burned), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', side_effect=RuntimeError('proxy down')):
+            with self.assertRaises(RuntimeError) as ctx:
+                pp.run_ideate({}, count=3)
+        self.assertIn('没有产出任何新卡片', str(ctx.exception))
 
 
 if __name__ == '__main__':

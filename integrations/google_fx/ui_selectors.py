@@ -25,9 +25,8 @@ UI_SELECTORS = {
     "google_fx": {
         # --- 导航 ---
         "new_project_btn": [
-            # 语言无关主选择器：Google Symbols 的业务图标名稳定，覆盖中/英/印尼语。
-            "button:has(i.google-symbols:text-is('add_2'))",
-            "button:has(i:text-is('add_2'))",
+            # 先用明确文案定位。项目内的“创建媒体”按钮也使用 add_2，裸图标
+            # 选择器会误点它，并把一次无效 click 误报成“新建项目成功”。
             "button:has(i.google-symbols:text-is('add_2')):has-text('New project')",
             "button:has(i:text-is('add_2')):has-text('New project')",
             "button:has-text('New project')",
@@ -37,6 +36,9 @@ UI_SELECTORS = {
             "button:has-text('新建项目')",
             "button[aria-label*='新建项目']",
             "button:has-text('Project baru')",
+            # 未知语言兜底：排除项目内带 popup 的“创建/添加媒体”按钮。
+            "button:not([aria-haspopup]):has(i.google-symbols:text-is('add_2'))",
+            "button:not([aria-haspopup]):has(i:text-is('add_2'))",
         ],
 
         # --- 输入 ---

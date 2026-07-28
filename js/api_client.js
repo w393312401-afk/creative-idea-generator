@@ -875,10 +875,19 @@ function setFrameGridButtonsBusy(busy) {
     // 失败就地降级成占位卡）据此把自己的按钮也画成禁用态，见 slotGridIsBusy。
     const grid = slotRenderTarget('image');
     if (grid) grid.classList.toggle('is-busy', !!busy);
-    document.querySelectorAll('#frames-grid .retry-frame-btn, #frames-grid .fix-frame-btn, #frames-grid .describe-frame-btn, #frames-grid .delete-slot-btn').forEach(btn => {
+    document.querySelectorAll('#frames-grid .retry-frame-btn, #frames-grid .fix-frame-btn, #frames-grid .describe-frame-btn, #frames-grid .upload-frame-btn, #frames-grid .delete-slot-btn').forEach(btn => {
         btn.disabled = busy;
         btn.title = busy ? '该创意的帧序列正在生成/重试中，请稍候' : '';
     });
+}
+
+// 由各帧卡片的「上传」按钮调用：记下目标帧号，触发共用的隐藏文件选择器
+// （见 index.html #frame-upload-input 与 app.js 里的 change 监听）。
+function triggerFrameUpload(seq) {
+    const input = document.getElementById('frame-upload-input');
+    if (!input) return;
+    input.dataset.seq = String(seq);
+    input.click();
 }
 
 async function retrySingleFrame(seq) {
@@ -1007,6 +1016,10 @@ async function retrySingleFrame(seq) {
         if (isViewingIdea(ownerIdea.id) && !disconnected) {
             progress.style.display = 'none';
             setFrameGridButtonsBusy(false);
+            // 清掉任务登记后再重渲一次：renderFramesForIdea 的 isFramePending 读的
+            // 就是这条登记，上面 catch/成功分支那次重渲发生在登记还在的时候，没出图
+            // 的槽位会继续画成「等待中」转圈——取消/失败后界面看起来还在跑。
+            renderFramesForIdea(ownerIdea);
         }
     }
 }
@@ -1229,6 +1242,10 @@ async function fixFrameIssue(seq, manualReason) {
         if (isViewingIdea(ownerIdea.id) && !disconnected) {
             progress.style.display = 'none';
             setFrameGridButtonsBusy(false);
+            // 清掉任务登记后再重渲一次：renderFramesForIdea 的 isFramePending 读的
+            // 就是这条登记，上面 catch/成功分支那次重渲发生在登记还在的时候，没出图
+            // 的槽位会继续画成「等待中」转圈——取消/失败后界面看起来还在跑。
+            renderFramesForIdea(ownerIdea);
         }
     }
 }

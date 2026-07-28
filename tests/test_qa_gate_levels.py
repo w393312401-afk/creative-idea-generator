@@ -343,6 +343,11 @@ visible construction change
         self.tmp = tempfile.mkdtemp()
         self.old_output_root = server_common.OUTPUT_ROOT
         server_common.OUTPUT_ROOT = self.tmp
+        from PIL import Image
+        covers_dir = os.path.join(self.tmp, 'covers')
+        os.makedirs(covers_dir, exist_ok=True)
+        self.cover = os.path.join(covers_dir, 'qa_gate_cover.webp')
+        Image.new('RGB', (36, 64), (100, 110, 120)).save(self.cover, format='WEBP')
 
     def tearDown(self):
         server_common.OUTPUT_ROOT = self.old_output_root
@@ -372,7 +377,7 @@ visible construction change
              patch('prompt_pipeline.run_vlm_qa_check',
                    side_effect=AssertionError('per-frame QA gate should no longer be called')):
             generate_frame_sequence(
-                {'qaGateLevel': 'lenient'},
+                {'qaGateLevel': 'lenient', 'coverReferencePath': self.cover},
                 'qa_gate_warn_contract',
                 self._PROMPT_BLOCK,
                 on_progress=lambda stage, details: events.append((stage, details)),

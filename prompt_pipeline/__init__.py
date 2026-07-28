@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import re
+import math
 import time
 import random
 import socket
@@ -82,8 +83,15 @@ _MILESTONE_TEXT_FIELDS = (
 )
 
 
-def _beat_count_is_valid(candidate_total, max_total, mode='adaptive'):
-    """Public-contract helper: adaptive accepts a shorter viable ladder; fixed does not."""
+def _beat_count_is_valid(candidate_total, max_total, mode='adaptive', floor=None):
+    """Public-contract helper: adaptive accepts a shorter viable ladder; fixed does not.
+
+    floor 是**本项目**的施工拍下界（不含 reward 拍），由灵感卡片的工序清单推出
+    （见 compute_beats_floor）。不传时回落到全局常量 = 完全保持旧行为。
+    这个形参必须存在：min_total_beats 只出现在 prompt 文案与兜底路径里，
+    真正裁定 LLM 返回的 ladder 长度合不合格的是这里——只改 min_total_beats
+    而不把 floor 传进来的话，一份 6 拍 ladder 在 floor=9 的重型单里照样被判合格。
+    """
     try:
         candidate_total = int(candidate_total)
         max_total = int(max_total)
@@ -91,7 +99,11 @@ def _beat_count_is_valid(candidate_total, max_total, mode='adaptive'):
         return False
     if str(mode).lower() == 'fixed':
         return candidate_total == max_total
-    minimum = min(max_total, _MIN_ADAPTIVE_CONSTRUCTION_BEATS + 1)
+    try:
+        base = _MIN_ADAPTIVE_CONSTRUCTION_BEATS if floor is None else int(floor)
+    except (TypeError, ValueError):
+        base = _MIN_ADAPTIVE_CONSTRUCTION_BEATS
+    minimum = min(max_total, base + 1)
     return minimum <= candidate_total <= max_total
 
 # Thread-local storage for LLM usage accounting
@@ -2087,6 +2099,14 @@ _WEAK_MILESTONE_PHRASES = (
     'begins to', 'starts to', 'one small section', 'a small section', 'one corner',
     'small corner', 'tiny area', 'narrow strip', 'narrow seam', 'single patch',
     'partially completed', 'partial progress', 'localized patch', 'minor change',
+)
+# 同一条「可见里程碑」规则的中文一侧：合成侧的节拍梯是英文（milestone_ladder_violations
+# 查 _WEAK_MILESTONE_PHRASES），激发侧的 beat_outline 是中文（outline_skeleton_violations
+# 查这一份）。改一边时务必想到另一边，否则两侧的宽严会静静地漂开。
+# 只做**开头匹配**：「开始/继续」这类词在合法语境里也会出现（如"继续墙面到顶"），
+# 整条扫描的误伤代价是 150s 重试白烧 + 掉进静态兜底，宁可漏判不可误判。
+_WEAK_MILESTONE_PREFIXES_ZH = (
+    '开始', '继续', '逐步', '初步', '局部', '部分', '尝试', '推进', '持续', '进一步',
 )
 _INCOMPATIBLE_PACKAGE_FAMILIES = (
     ({'clearing', 'demolition', 'excavation'}, {'priming', 'painting', 'furnishing', 'lighting'}),
@@ -5124,7 +5144,20 @@ def compose_anchor_and_packet(config, dimensions, on_progress=None):
     # appended inside the ladder.  total_beats begins as the maximum and is replaced by
     # len(beat_ladder) as soon as planning succeeds.
     max_total_beats = beats_count + 1
-    min_total_beats = min(max_total_beats, _MIN_ADAPTIVE_CONSTRUCTION_BEATS + 1)
+    # beats_floor：本项目的施工拍下界，由灵感卡片的工序清单推出（见 compute_beats_floor），
+    # 前端原样透传。它替掉了原来那个与项目重量无关的全局常量下界——旧行为下 count_contract
+    # 要求 ladder 挑「能表达全部必要里程碑的最小拍数」，而验收只看 [5+1, max]，于是一张
+    # 推荐 13 拍的重型改造单塌回 6 拍完全合法，用户挑卡时看到的推进密度和成片对不上。
+    # 缺省（老任务/老断点/手动输入主题）回落到全局常量 = 完全保持旧行为。
+    beats_floor = dimensions.get('beats_floor')
+    try:
+        beats_floor = int(beats_floor)
+    except (TypeError, ValueError):
+        beats_floor = _MIN_ADAPTIVE_CONSTRUCTION_BEATS
+    # 下界只能抬高不能降低（卡片给个 2 也不会破坏既有保底）；且不能超过上限，
+    # 否则 _beat_count_is_valid 恒假、每次都掉进兜底 ladder。
+    beats_floor = max(_MIN_ADAPTIVE_CONSTRUCTION_BEATS, min(beats_floor, beats_count))
+    min_total_beats = min(max_total_beats, beats_floor + 1)
     total_beats = max_total_beats
 
     # 断点续传:同一份 dimensions(按 brief_fingerprint 哈希)若留有上一次未完成的合成
@@ -5373,7 +5406,10 @@ Required JSON keys:
     if pacing_skeleton_id == 'dual_payoff':
         _pacing_plan_block = (
             "\nSelected pacing skeleton (MANDATORY narrative structure, while physical construction "
-            "order remains authoritative): dual_payoff / 内外双重完工. The ordinary beat "
+            "order remains authoritative): dual_payoff / 内外双重完工. The exterior act needs its own "
+            "utility/platform beat — solar array, vent/flue, water tank, deck/platform, railing, porch "
+            "or stairs — installed BEFORE the mini-payoff; the ideation card is gated on it, so never "
+            "drop it when rewriting the draft plan. The ordinary beat "
             "immediately BEFORE the threshold hard cut must complete a genuinely usable exterior "
             "entrance/frontage (not a partial repair) and read as the first mini-payoff. Then HARD CUT "
             "to the untouched raw interior, reset visual progress, clean it out, and rebuild bottom-up "
@@ -5464,7 +5500,10 @@ Space Type: {space_type}
             beat_text_cleaned = _strip_code_fences(beat_text)
             beat_ladder = normalize_beat_ladder(json.loads(beat_text_cleaned))
             candidate_total = len(beat_ladder) if isinstance(beat_ladder, list) else 0
-            count_ok = _beat_count_is_valid(candidate_total, max_total_beats, beat_count_mode)
+            # floor=beats_floor 必须传：min_total_beats 只影响 prompt 文案与兜底路径，
+            # 真正裁定返回的 ladder 长度合不合格的是这里。
+            count_ok = _beat_count_is_valid(
+                candidate_total, max_total_beats, beat_count_mode, floor=beats_floor)
             if isinstance(beat_ladder, list) and count_ok:
                 idxs = [b.get('index') for b in beat_ladder]
                 if idxs == list(range(1, candidate_total + 1)):
@@ -5536,6 +5575,12 @@ Space Type: {space_type}
                     if not violations:
                         total_beats = candidate_total
                         beat_ladder_accepted = True
+                        # 灰度期观测点：卡片声称的推进密度 vs ladder 实际产出的密度。
+                        # 改造前这个差值无上界（推荐 13 拍的单塌回 6 拍完全合法），
+                        # 改造后应收敛到 _OUTLINE_SHRINK_TOLERANCE 定义的范围内。
+                        if sys.stdout:
+                            print(f"[DEBUG] beat ladder accepted: {candidate_total - 1} 施工拍 "
+                                  f"(卡片上限 {beats_count} / 下界 {beats_floor} / 模式 {beat_count_mode})")
                         break
                     if sys.stdout:
                         print(f"[DEBUG] Beat ladder attempt {attempt+1} broke threshold-bridge structure: {violations}")
@@ -5543,6 +5588,22 @@ Space Type: {space_type}
                         beat_user_current = beat_user + "\n\n" + "==================== PRIOR STRUCTURE VIOLATIONS ====================\n" + \
                             "The previous beat ladder broke these structural requirements. Fix them:\n" + \
                             "\n".join(f"- {v}" for v in violations)
+            elif isinstance(beat_ladder, list) and not count_ok:
+                # 拍数不合格以前是静静地重跑同一份 beat_user：模型没有任何理由改变
+                # 主意，三次白跑之后掉进兜底 ladder。beats_floor 上线后「太短」会比
+                # 以前常见得多，必须把区间明确回喂过去。
+                _count_err = (
+                    f"The previous ladder returned {candidate_total} elements, which is outside the "
+                    f"required range of {min_total_beats} to {max_total_beats} elements."
+                    if beat_count_mode != 'fixed' else
+                    f"The previous ladder returned {candidate_total} elements instead of exactly "
+                    f"{max_total_beats}.")
+                if sys.stdout:
+                    print(f"[DEBUG] Beat ladder attempt {attempt+1} rejected on count: {_count_err}")
+                if attempt < 2:
+                    beat_user_current = beat_user + "\n\n" + \
+                        "==================== PRIOR COUNT VIOLATION ====================\n" + \
+                        _count_err + "\nReturn " + count_contract + "."
         except GenerationCancelled:
             raise
         except Exception as e:
@@ -7955,12 +8016,26 @@ def _pick_auto_trend_ref(stored):
 def _attach_trend_ref_ids(ideas, trend_refs):
     """把本批候选参考案例的 id 原样带在每条 idea 上(idea['trend_ref_ids']),
     供「一键合成」时(server.py /api/compose)按需回填 mark_trend_refs_used 计次
-    ——是否真的计次还要看该 idea 的 trend_ref 字段是否非空(LLM 确认借鉴过)。"""
+    ——是否真的计次还要看该 idea 的 trend_ref 字段是否非空(LLM 确认借鉴过)。
+
+    顺带挂上 idea['beats_floor']：这张卡的施工拍下界由它自己的工序清单推出,
+    前端只负责原样透传给合成(见 js/prompt_pipeline.js composeIdeationCard)。
+    **计算只放后端**——它必须和 _beat_count_is_valid 的验收同源,搬去前端必然漂移。
+    本函数是 run_ideate 全部三条返回路径(正常/历次最佳/静态兜底)的共同出口,
+    所以挂在这里能保证每张发出去的卡都带着这个字段。"""
     ids = [r['id'] for r in trend_refs if isinstance(r, dict) and r.get('id')]
-    if ids:
-        for idea in ideas:
-            if isinstance(idea, dict):
-                idea['trend_ref_ids'] = ids
+    for idea in ideas:
+        if not isinstance(idea, dict):
+            continue
+        if ids:
+            idea['trend_ref_ids'] = ids
+        idea['beats_floor'] = compute_beats_floor(idea)
+    # 灰度期观测点（另一半在合成侧 ladder 接受处）：卡片声称的拍数与它的下界。
+    if sys.stdout:
+        print("[DEBUG] run_ideate 交付卡片拍数区间: " + '、'.join(
+            f"{(idea.get('title') or 'untitled')[:12]}={idea.get('recommended_beats')}"
+            f"(≥{idea.get('beats_floor')})"
+            for idea in ideas if isinstance(idea, dict)))
     return ideas
 
 
@@ -7978,8 +8053,9 @@ PACING_SKELETONS = {
         'label_zh': '内外双重完工',
         'summary': (
             'New two-payoff skeleton: start immediately with large exterior structural placement; '
-            'complete a genuinely usable entrance/frontage through frame, infill, door, exterior '
-            'utility or platform finish; give that exterior a mini-payoff; then use ONE visible, '
+            'complete a genuinely usable entrance/frontage through frame, infill, door, and one '
+            'dedicated exterior utility/platform beat (solar array, vent/flue, water tank, deck, '
+            'railing, porch); give that exterior a mini-payoff; then use ONE visible, '
             'continuous doorway-crossing video to enter an untouched raw interior and reset the '
             'construction state; rebuild bottom-up through base preparation, '
             'membrane/hidden layers, grid framing, cavity fill, board closure, finish surfaces; then '
@@ -8025,6 +8101,212 @@ def apply_pacing_skeleton_to_brief(parsed_brief, pacing_skeleton_id):
     return parsed_brief
 
 
+# 过门拍的三套词表：认定"哪一拍是过门"和事后校验"这一拍是否落在原始室内"必须
+# 用同一套词，否则会出现「按 仓内 认出了过门拍，又因为词表里没有 仓内 判它没落进
+# 室内」这种自相矛盾的否决。
+_DUAL_INTERIOR_CUE = r'室内|内部|舱内|井内|洞内|屋内|仓内|窑内'
+_DUAL_RAW_CUE = r'原始|未修|未施工|毛坯|废墟|裸|积渣|锈蚀|荒废|破败'
+_DUAL_THRESHOLD_CUE = (r'过门|进门|穿门|跨过.{0,4}门槛|'
+                       r'穿(?:过|越).{0,8}(?:门|舱口|洞口|入口|门洞|门口)|'
+                       r'(?:推镜|镜头|运镜|一镜).{0,12}(?:进入|推入|穿|室内|内部)')
+
+# 「内外双重完工」的结构成本（2026-07-28）。这个骨架的 summary 逐项点名了 17 个必须
+# 发生的状态变化（外部 6 + 过门 1 + 内部 10），仓库自带的三条 dual 兜底清单也一致
+# 落在 13~15 条——那才是它的自然尺寸。而旧门禁只要 7 条、过门只需 idx>=2，于是
+# compute_beats_floor 给出 5、ladder 合法地交付 6 拍成片：17 个状态压进 6 拍 ≈ 每拍
+# 2.8 个变化。每拍的 IMAGE 是从上一帧续写的（见 Step 4 的 "continue directly from the
+# IMAGE you just wrote"），一拍同时改多处时模型会重排整幅而不是叠加 delta，画面就是
+# 这么飘的；而且这种卡在合成侧只有违规写法能实现（一拍塞 防水+龙骨+封板 正好撞上
+# _INCOMPATIBLE_PACKAGE_FAMILIES），三次重排后掉进兜底 ladder、拍数被进一步压缩。
+# 下面这组数字就是把 summary 那份账写成可执行的下界。
+_DUAL_MIN_OUTLINE_ENTRIES = 11        # = 外部 4 + 过门 1 + 过门后 6
+_DUAL_MIN_EXTERIOR_ENTRIES = 4        # 过门前：普通室外 x2 + 外部设备/平台 + 外部小完工
+_DUAL_MIN_POST_CROSSING_ENTRIES = 6   # 过门后：清运 1 + 分层重建 >=4 + reward 1
+_DUAL_MIN_EXTERIOR_FAMILIES = 3       # 外部幕至少落实三族（与内部幕的七族计数对称）
+# 施工拍下界（不含 reward）：室外 2 + 设备/平台 1 + 小完工 1 + 过门 1 + 清运 1 + 重建 3
+_DUAL_STRUCTURAL_FLOOR = 9
+
+# 外部设备/平台族。骨架 summary 把它列为必需项，但此前**没有任何一处检查它**：
+# 激发侧门禁只看过门前最后一条的措辞，合成侧只有一句否定式约束（"Do not move all
+# exterior utility/platform work after the cut"——清单里压根没有外部设备时它恒真）。
+# 于是它成了整个骨架里唯一没人计数的必需项，拍数一紧就第一个被砍掉：三条兜底清单
+# 里都有的太阳能板，模型生成的卡片里一张也见不到。词表给宽（设备 + 平台 + 附属结构），
+# 因为这是**正向**判定，漏一个词就是一次 150s 的重试白烧。
+_DUAL_EXTERIOR_UTILITY = (
+    r'太阳能|光伏|风机|风力|风管|通风|排烟|烟囱|水箱|集水|蓄电|电池|天线|管井|'
+    r'平台|甲板|栈道|台阶|踏步|阶梯|楼梯|护栏|栏杆|扶手|门廊|雨棚|遮阳|檐|露台|坡道'
+)
+# 外部幕的族表：内部幕早有 layer_families 七族计数，外部幕此前一族都不数。
+_DUAL_EXTERIOR_FAMILIES = (
+    r'结构|拱|梁|柱|框架|骨架|加固|锚固|焊补|浇筑|支撑|基座|修复|翻新|夯实',   # 大结构就位/修复
+    r'围护|外壳|外墙|外壁|立面|屋面|顶棚|覆面|抹面|封堵|嵌缝|防风|挡雪|挡风',  # 围护/外立面封闭
+    r'门框|门扇|舱门|水密门|气密|门洞|入口门|卷帘|窗',                          # 门扇与洞口
+    _DUAL_EXTERIOR_UTILITY,                                                     # 外部设备/平台
+)
+
+
+def _outline_crossing_indices(outline):
+    """挑出「过门镜头」那一拍的候选下标。
+
+    这里必须比「出现了进入+室内」严格：室内重建段里正常会出现「搬入家具进入室内
+    布置」这类拍，旧实现把它也算成一次过门，于是整批因为"过门拍不止一处"被否掉
+    ——server.log 里那一长串 "must contain exactly one visible doorway-crossing
+    entry" 绝大多数是这么来的，不是模型真写错了。
+    判定改成：有门/镜头线索(过门、穿过木门、推镜进入)的算过门拍；只写「进入…室内」
+    而没有门与镜头线索的，只有同时点名了未施工状态才算——因为骨架要求的过门拍
+    本来就必须落在原始室内，正常的室内工序拍不会这么写。
+    """
+    indices = []
+    for i, text in enumerate(outline):
+        if re.search(_DUAL_THRESHOLD_CUE, text):
+            indices.append(i)
+        elif re.search(rf'进入.{{0,8}}(?:{_DUAL_INTERIOR_CUE})', text) \
+                and re.search(_DUAL_RAW_CUE, text):
+            indices.append(i)
+    return indices
+
+
+# dual_payoff 专属门禁沿用的旧名字：判定逻辑对所有骨架都一样，两份正则必然漂移，
+# 所以这里只保留一个别名，绝不复制实现。
+_dual_payoff_crossing_indices = _outline_crossing_indices
+
+
+# 末拍必须是 reward 揭示（schema 明文要求「The LAST entry is the reward reveal」）。
+# 这几条词表都用于**反向**判定（一条都没命中才报错），所以给得越宽越安全：
+# 漏判只是放过一张写得含糊的卡，误判则是把合格卡整批打回重烧 150s。
+_OUTLINE_REWARD_CUE = (
+    r'点亮|亮起|亮灯|通电|点灯|入住|住进|走进|迎来|完工|竣工|落成|建成|成品|'
+    r'揭晓|揭幕|亮相|收尾|交付|完成|天光|阳光|日光|月光|灯光|光线|落入|洒入|'
+    r'滑开|推开|打开|开启|启用|全景|成景'
+)
+# 过门后第一拍必须是清理（对齐合成侧 _post_crossing_cleanup_rule 与它的确定性校验）
+_OUTLINE_CLEANUP_CUE = (
+    r'清空|清运|清理|清除|清出|清扫|清淤|腾空|搬空|搬出|搬离|扫除|打扫|'
+    r'铲除|铲出|拆除|拆解|剥除|剔除|除锈|除尘|冲洗|排空|挖出|运出|外运'
+)
+# ladder 相对卡片工序清单最多收缩多少。调高 → 更贴卡片、ladder 自由度更小、
+# 结构校验失败重排概率上升；调低 → 更宽松、更接近改造前的现状。
+_OUTLINE_SHRINK_TOLERANCE = 0.7
+# 通用骨架门禁的灰度开关：False = 只打日志不打回，用于先观察一批真实激发的通过率。
+# 打回的代价是一次 150s 的大模型重跑，误判率没摸清之前可以先关掉强制。
+_OUTLINE_GATE_ENFORCING = True
+
+
+def outline_skeleton_violations(idea):
+    """所有 pacing_skeleton 共用的确定性骨架验收（激发侧）。
+
+    与 pacing_skeleton_outline_violations 的分工：
+    - 本函数：所有骨架都必须满足的通用结构（长度、末拍 reward、过门唯一性与位置、
+      过门后清理、弱里程碑措辞、条目重复）；
+    - 原函数：dual_payoff 独有的双完工叙事结构，一个字符都不动。
+
+    返回英文错误串列表——这些串会被回喂给 LLM 当返工说明（见 run_ideate），
+    所以沿用原函数的英文风格。
+
+    注意：激发阶段拿不到 space_type / threshold_variant（那是 compose Step 1 的 brief
+    解析才产出的），所以这里只能从中文 outline 文本自行推断。每条规则都按
+    「宁可漏判、不可误判」取舍。
+    """
+    if not isinstance(idea, dict):
+        return []
+    outline = [str(x or '').strip() for x in (idea.get('beat_outline') or []) if str(x or '').strip()]
+    if not outline:
+        # 整条没有 outline 是另一个问题（run_ideate 的 with_outline 分支管），
+        # 不在这里当结构违规打回。
+        return []
+
+    errors = []
+    # 规则 1 · 长度下界：再少就凑不出「起手 + 推进 + 收尾 + reward」
+    if len(outline) < 4:
+        errors.append(
+            f'beat_outline needs at least four entries to express a build arc plus the reward '
+            f'(found {len(outline)})')
+
+    # 规则 2 · 末拍必须是 reward 揭示
+    if not re.search(_OUTLINE_REWARD_CUE, outline[-1]):
+        errors.append(
+            f'the LAST beat_outline entry must be the reward reveal (lights on / person moves in / '
+            f'daylight floods in), but it is "{outline[-1]}"')
+
+    crossing = _outline_crossing_indices(outline)
+    # 规则 3 · 过门拍唯一性——只有「多于一处」才是错。零处是合法的：Standard 载体
+    # （纯外立面、庭院、道路改造）本来就没有内外过门。这是相对 dual_payoff 门禁
+    # （要求恰好一处）的关键放宽，那条只对定义上必有过门的骨架成立。
+    if len(crossing) > 1:
+        hit_text = '、'.join(outline[i] for i in crossing)
+        errors.append(
+            f'beat_outline must not contain more than one doorway-crossing entry '
+            f'(found {len(crossing)}: {hit_text})')
+
+    if crossing:
+        cross_idx = crossing[0]
+        # 规则 4 · 过门前留够室外拍（对齐合成侧 _MIN_PRE_THRESHOLD_BEATS = 2）
+        if cross_idx < 2:
+            errors.append(
+                'the doorway-crossing entry must come after at least two ordinary exterior entries; '
+                f'it currently sits at position {cross_idx + 1}')
+        # 规则 5 · 过门后第一拍必须是清理（过门帧按契约就是没人碰过的废墟）
+        if cross_idx + 1 < len(outline):
+            nxt = outline[cross_idx + 1]
+            if not re.search(_OUTLINE_CLEANUP_CUE, nxt):
+                errors.append(
+                    'the entry right after the doorway crossing must be the interior cleanout '
+                    f'(hauling out the debris the crossing just revealed), but it is "{nxt}"')
+
+    # 规则 6 · 弱里程碑措辞（只查开头，见 _WEAK_MILESTONE_PREFIXES_ZH 的注释）
+    for text in outline:
+        weak = next((p for p in _WEAK_MILESTONE_PREFIXES_ZH if text.startswith(p)), None)
+        if weak:
+            errors.append(
+                f'beat_outline entry "{text}" opens with vague/partial-progress wording "{weak}"; '
+                f'every entry must name ONE visibly completed milestone')
+            break
+
+    # 规则 7 · 里程碑重复（对齐 milestone_ladder_violations 的 seen_names 逻辑）
+    seen = set()
+    for text in outline:
+        key = re.sub(r'[\s,，、。.;；:：]', '', text)
+        head = key[:6] if len(key) >= 6 else key
+        if head and head in seen:
+            errors.append(
+                f'beat_outline repeats a milestone ("{text}"); adjacent stages need distinct '
+                f'terminal products')
+            break
+        seen.add(head)
+
+    return errors
+
+
+def compute_beats_floor(idea):
+    """由灵感卡片的骨架推出该项目的施工拍下界（不含 reward 拍）。
+
+    两个来源取大：
+      1) 结构必备拍 —— dual_payoff 为 _DUAL_STRUCTURAL_FLOOR（两幕的账），
+         其余骨架有过门时 4（室外 x2 + 过门 + 过门后清理），无过门时 2；
+      2) 清单收缩容忍 —— ceil(施工拍数 * _OUTLINE_SHRINK_TOLERANCE)。
+
+    取大而非取小：结构必备是物理下限，清单容忍是密度下限，两者都要满足。
+    outline 缺失/畸形时回落到全局常量 = 完全保持改造前的行为。
+    """
+    if not isinstance(idea, dict):
+        return _MIN_ADAPTIVE_CONSTRUCTION_BEATS
+    outline = [str(x or '').strip() for x in (idea.get('beat_outline') or []) if str(x or '').strip()]
+    if len(outline) < 2:
+        return _MIN_ADAPTIVE_CONSTRUCTION_BEATS
+    if idea.get('pacing_skeleton') == 'dual_payoff':
+        # 双完工比单线多一整幕外部（设备/平台 + 小完工），沿用单线那个 4 会让一张
+        # 11 条的双完工卡算出 floor=7，ladder 于是可以合法地把两幕之一压没。
+        # 不依赖 _outline_crossing_indices 是否命中：过门是这个骨架的定义，正则没认出来
+        # 只说明这张卡本来就过不了 pacing_skeleton_outline_violations。
+        # 下界超过卡片上限时由 compose 侧的 min(beats_floor, beats_count) 夹回，不会永假。
+        structural = _DUAL_STRUCTURAL_FLOOR
+    else:
+        structural = 4 if _outline_crossing_indices(outline) else 2
+    construction_beats = len(outline) - 1  # 末条是 reward，不算施工拍
+    density = int(math.ceil(construction_beats * _OUTLINE_SHRINK_TOLERANCE))
+    return max(structural, density)
+
+
 def pacing_skeleton_outline_violations(idea):
     """Deterministic acceptance gate for the new two-payoff rhythm.
 
@@ -8036,23 +8318,53 @@ def pacing_skeleton_outline_violations(idea):
     if not isinstance(idea, dict) or idea.get('pacing_skeleton') != 'dual_payoff':
         return []
     outline = [str(x or '').strip() for x in (idea.get('beat_outline') or []) if str(x or '').strip()]
-    if len(outline) < 7:
-        return ['dual_payoff needs at least seven outline entries to express two completed arcs']
+    if len(outline) < _DUAL_MIN_OUTLINE_ENTRIES:
+        # 旧下界是 7。7 条时过门只能落在 idx 2/3，室内重建就只剩 1~2 条要独自补齐
+        # 「至少四个层族」——防水+龙骨+封板挤进一拍，正好是合成侧
+        # _INCOMPATIBLE_PACKAGE_FAMILIES 明文否决的组合。见 _DUAL_MIN_OUTLINE_ENTRIES。
+        return [f'dual_payoff needs at least {_DUAL_MIN_OUTLINE_ENTRIES} outline entries to express two '
+                f'completed arcs without packing several unrelated construction phases into one beat '
+                f'(found {len(outline)})']
 
     if any(re.search(r'硬切|跳切|直接切(?:入|到)', text) for text in outline):
         return ['dual_payoff forbids a hard cut because the doorway crossing must generate a visible video']
-    crossing_indices = [
-        i for i, text in enumerate(outline)
-        if re.search(r'过门|穿过.{0,8}(?:门|舱口|洞口|入口)|'
-                     r'(?:推镜|镜头).{0,12}(?:进入|推入|室内|内部)|'
-                     r'进入.{0,8}(?:室内|内部|舱内|井内|洞内|屋内)', text)
-    ]
+    crossing_indices = _dual_payoff_crossing_indices(outline)
     if len(crossing_indices) != 1:
-        return ['dual_payoff must contain exactly one visible doorway-crossing entry']
+        # 把命中的原文一并带上：0 处和 2 处是两种完全不同的毛病，日志里只写
+        # "exactly one" 时根本分不出该修哪一头（这也是喂回给模型的返工说明）。
+        hit_text = '、'.join(outline[i] for i in crossing_indices) or '(none)'
+        return ['dual_payoff must contain exactly one visible doorway-crossing entry '
+                f'(found {len(crossing_indices)}: {hit_text})']
     crossing_idx = crossing_indices[0]
     errors = []
-    if crossing_idx < 2 or crossing_idx >= len(outline) - 3:
-        errors.append('doorway crossing must sit between a substantial exterior arc and interior rebuild')
+    # 过门位置改成两端各自计数（旧写法是一条 `< 2 or >= len-3` 的合并判据）：最小长度下
+    # 它允许「外部 2 条 + 内部 2 条」，两幕都摊不开，模型只能一拍塞多个变化。
+    if crossing_idx < _DUAL_MIN_EXTERIOR_ENTRIES:
+        errors.append(
+            f'the doorway crossing must come after at least {_DUAL_MIN_EXTERIOR_ENTRIES} exterior entries '
+            f'(structural placement, envelope/door closure, one exterior utility/platform beat, then the '
+            f'mini-payoff); it currently sits at position {crossing_idx + 1}')
+    post_entries = len(outline) - 1 - crossing_idx
+    if post_entries < _DUAL_MIN_POST_CROSSING_ENTRIES:
+        errors.append(
+            f'the interior rebuild needs at least {_DUAL_MIN_POST_CROSSING_ENTRIES} entries after the '
+            f'doorway crossing (cleanout, then bottom-up layers, then the final reward); found {post_entries}')
+
+    # 外部幕的族计数。此前外部幕唯一被检查的是下面那条 mini-payoff 的措辞，中间几条
+    # 一律不查——「外部设备/平台」于是成了骨架里唯一没人计数的必需项（见
+    # _DUAL_EXTERIOR_UTILITY 的注释）。这里把内部幕那套七族计数补给外部幕。
+    exterior_text = ' '.join(outline[:crossing_idx])
+    exterior_hits = sum(bool(re.search(pattern, exterior_text)) for pattern in _DUAL_EXTERIOR_FAMILIES)
+    if exterior_hits < _DUAL_MIN_EXTERIOR_FAMILIES:
+        errors.append(
+            f'the exterior arc before the crossing must realize at least {_DUAL_MIN_EXTERIOR_FAMILIES} '
+            f'exterior families: structural placement · envelope/facade closure · door/opening · '
+            f'exterior utility or platform (found {exterior_hits})')
+    if not re.search(_DUAL_EXTERIOR_UTILITY, exterior_text):
+        errors.append(
+            'the exterior arc must contain one exterior utility/platform beat (solar array, vent/flue, '
+            'water tank, deck/platform, railing, porch, stairs) before the mini-payoff; without it the '
+            'first act collapses into "fix the door, switch on a lamp" and stops being a payoff')
 
     if crossing_idx > 0:
         mini_payoff = outline[crossing_idx - 1]
@@ -8062,9 +8374,9 @@ def pacing_skeleton_outline_violations(idea):
             errors.append('the entry immediately before the doorway crossing must be a completed exterior mini-payoff')
 
     crossing_text = outline[crossing_idx]
-    if not re.search(r'室内|内部|舱内|井内|洞内|屋内', crossing_text):
+    if not re.search(_DUAL_INTERIOR_CUE, crossing_text):
         errors.append('doorway-crossing entry must land explicitly inside')
-    if not re.search(r'原始|未修|未施工|毛坯|废墟|裸|积渣|锈蚀', crossing_text):
+    if not re.search(_DUAL_RAW_CUE, crossing_text):
         errors.append('doorway-crossing entry must land on an untouched/raw interior state')
 
     post_text = ' '.join(outline[crossing_idx + 1:-1])
@@ -8188,6 +8500,13 @@ def run_ideate(config, count=8, theme=None, theme_label=None, trend_ref_ids=None
             idea['beat_outline'] = items
             if len(items) >= 2:
                 with_outline += 1
+                # recommended_beats 一律由清单长度派生,不再信任模型独立申报的那个数。
+                # 两个字段并列存在时它们必然漂移(模型报 12、清单只给 8 条,卡片照样
+                # 显示「⏱ 推荐 12 拍」,而合成时传下去的也是那个 12)。清单是用户在
+                # 卡片上真正看到的东西,它才是事实来源。派生比「不一致就打回」好:
+                # 零重试成本,且 100% 消除不一致。清单为空时不改写,避免把没有 outline
+                # 的卡片写成 0 拍。
+                idea['recommended_beats'] = len(items) - 1
         return with_outline
 
     # 2026-07-25 起「联网主导」:联网信息是创意的第一驱动,skill 只保留过滤器职责。
@@ -8288,9 +8607,32 @@ These are narrative pacing references, not permission to violate physical constr
 {pacing_lines}
 {pacing_assignment_rule}
 For dual_payoff, only assign it to a carrier with a readable exterior frontage/entrance and a distinct
-interior. Its outline must include an exterior completed-state mini-payoff immediately before the hard
-cut/reset, followed by the raw-interior bottom-up layer sequence. The mini-payoff is an ordinary visible
-milestone; the only operation named reward remains the final array item.
+interior. It is by definition a HEAVY two-act build — never plan one under {_DUAL_MIN_OUTLINE_ENTRIES - 1}
+construction beats, and give each entry ONE change: an entry that bundles several unrelated construction
+phases cannot be filmed as one stable shot. Its beat_outline is checked by a deterministic acceptance gate
+and must satisfy ALL of the following, otherwise the candidate is rejected:
+1. At least {_DUAL_MIN_OUTLINE_ENTRIES} entries (typically 13-15).
+2. At least {_DUAL_MIN_EXTERIOR_ENTRIES} entries come BEFORE the crossing and build the EXTERIOR only.
+   Together they must realize at least {_DUAL_MIN_EXTERIOR_FAMILIES} of these exterior families:
+   大结构就位/加固/焊补/浇筑 · 围护/外壳/外立面/屋面封闭 · 门框/门扇/舱门/洞口 ·
+   外部设备或平台. ONE of them MUST be the 外部设备/平台 beat — 太阳能/光伏 · 通风帽/风管/烟囱 ·
+   水箱/集水 · 平台/甲板/露台 · 护栏/栏杆 · 门廊/雨棚 · 台阶/坡道 — e.g. "挂装太阳能板与风管".
+   Without it the first act collapses into "fix the door, switch on a lamp" and stops being a payoff.
+3. The entry immediately before the crossing is the exterior mini-payoff and must name both an exterior
+   element (外/入口/门面/门廊/立面/平台/甲板/洞口/地表) and a completion word (完成/完工/点亮/建成/
+   铺满/封闭), e.g. "点亮门廊灯完成外立面".
+   The mini-payoff is an ordinary visible milestone; the only operation named reward stays the final entry.
+4. EXACTLY ONE entry is the doorway crossing, written as a continuous camera move through the door that
+   lands in an untouched interior. It must contain a doorway/camera cue (过门 / 穿过木门 / 推镜进入), an
+   interior word (室内/内部/舱内/井内/洞内/屋内) and a raw-state word (原始/未修/毛坯/积渣/锈蚀/废墟),
+   e.g. "推镜过门进入原始舱内". NEVER write 硬切/跳切/直接切入 — the crossing must be a filmable video,
+   not an edit. No other entry may combine 进入 with an interior word plus a raw-state word, or it counts
+   as a second crossing and the candidate is rejected.
+5. At least {_DUAL_MIN_POST_CROSSING_ENTRIES} entries come AFTER the crossing: the interior cleanout first,
+   then the bottom-up rebuild, then the final reward.
+6. Those post-crossing entries rebuild the interior bottom-up and must visibly realize at least FOUR of
+   these families: 基底/找平/清运 · 防水/隐蔽管线/电路 · 龙骨/框架/格栅 · 保温/填充/隔音 ·
+   封板/内衬/面板 · 饰面/地板/涂料/墙面 · 家具/床/软装/储物柜.
 """
 
     system_prompt = f"""You are the Upstream Ideation Layer for the `restoration-prompt-composer` skill.
@@ -8341,15 +8683,60 @@ Each object in the JSON array must have EXACTLY these keys:
 - "twist_zh": (string) Chinese display description of the signature twist, e.g. "窗户直接切穿半透明蓝冰"
 - "dna": (string) Topic DNA in the format "carrier-slug / destiny / twist-family", where carrier-slug is THIS candidate's own concrete carrier in lowercase hyphenated English (not a category name), e.g., "glacier-ice-cave / refuge-den / self-material-window"
 - "score": (number) Total score out of 25.
-- "recommended_beats": (integer, 5 to 15) Recommended construction beat count for this topic's time-lapse. Judge by transformation complexity: light single-space refit → 5-8; medium multi-stage build → 9-12; heavy structural conversion with many distinct visible stages → 13-15.
+- "recommended_beats": (integer, 5 to 15) Planning aid only — the delivered beat count is ALWAYS derived from the actual length of "beat_outline" (outline length minus the final reward entry), so put your real effort into the outline itself. Judge by transformation complexity: light single-space refit → 5-8; medium multi-stage build → 9-12; heavy structural conversion with many distinct visible stages → 13-15.
 - "beats_reason": (string) Chinese, at most 15 characters, why this beat count, e.g. "结构重建阶段多"
 - "pacing_skeleton": (string) Exactly one of: {', '.join(selected_pacing_ids)}. It declares which selected pacing reference this candidate's beat_outline actually follows.
-- "beat_outline": (array of strings) A Chinese one-line summary of EVERY construction beat, in order, with EXACTLY "recommended_beats" entries plus ONE final reward/reveal entry (so the array length is recommended_beats + 1). Each entry is at most 16 Chinese characters, names ONE visible terminal milestone, and starts with a verb, e.g. "清空洞内碎冰与积雪". Respect real-world construction order: structural stabilization and hazard removal before finishes, wiring/piping rough-in before surfaces are closed, surfaces closed and primed before painting, floor finish before heavy anchored objects, lighting installed before anything glows. The LAST entry is the reward reveal, e.g. "点亮灯带,人物入住". Never write vague entries like "开始施工" or "继续完善".
+- "beat_outline": (array of strings) A Chinese one-line summary of EVERY construction beat, in order, with EXACTLY "recommended_beats" entries plus ONE final reward/reveal entry (so the array length is recommended_beats + 1). Each entry is at most 16 Chinese characters, names ONE visible terminal milestone, and starts with a verb, e.g. "清空洞内碎冰与积雪". Respect real-world construction order: structural stabilization and hazard removal before finishes, wiring/piping rough-in before surfaces are closed, surfaces closed and primed before painting, floor finish before heavy anchored objects, lighting installed before anything glows. The LAST entry is the reward reveal, e.g. "点亮灯带,人物入住". Never write vague entries like "开始施工" or "继续完善", and never repeat a milestone. If the build crosses from exterior to interior, describe that crossing in AT MOST ONE entry, place it no earlier than the third entry (at least two ordinary exterior entries come first), and make the entry right after it the interior cleanout (hauling out the debris the crossing just revealed).
 - "trend_ref": (string) If (and ONLY if) trend references are provided at the end of this prompt AND this idea clearly draws on one of those points, cite the borrowed point in one short Chinese sentence (which reference & what was borrowed). Otherwise it MUST be an empty string "". Never invent a reference.
 """ + trend_block
 
+    def _salvage_pacing_failures(ideas, failures, hard_failures=None):
+        """把没通过验收的卡片按「标签必须诚实」的原则落地，返回留下的卡片。
+
+        原来这里是整批连坐：四张卡里一张没过，另外三张合格的也一起丢掉重来，三次
+        150s 调用烧完还是掉进静态兜底——而静态兜底又要过一遍台账去重，用久了只剩
+        一两条甚至零条，用户看到的就是「换一批灵感」转七分钟然后「暂无灵感推荐」。
+        现在只处理没过的那几张：勾了单线骨架就把标签降级成 linear_milestone（内容
+        本来就是单线清单，改标签之后标签不再骗人）；只勾了 dual_payoff 时没有诚实
+        的标签可用，才丢掉那一张，合格的卡照常交付。
+
+        hard_failures 是命中通用骨架门禁（outline_skeleton_violations）的那些卡：
+        降级救不了它们——「末拍不是 reward 揭示」这类毛病**没有任何标签能让它变诚实**，
+        换个骨架名字之后卡片照样在骗人。这类只能整张丢弃。
+        """
+        hard_failures = hard_failures or {}
+        if not failures and not hard_failures:
+            return list(ideas)
+        can_downgrade = 'linear_milestone' in selected_pacing_ids
+        kept = []
+        for idx, idea in enumerate(ideas):
+            if idx in hard_failures:
+                continue
+            if idx not in failures:
+                kept.append(idea)
+            elif can_downgrade:
+                idea['pacing_skeleton'] = 'linear_milestone'
+                kept.append(idea)
+        return kept
+
     user_prompt = f"Generate {count} top-quality unique renovation ideas following the instructions."
     user_prompt_current = user_prompt
+    # 历次尝试里通过数最高的那批，供三次都没能全过时兜底交付（含最后一次抛异常的情况）
+    best_batch = None
+
+    def _deliver_best_batch():
+        """交付历次最好的那批（合格的原样、不合格的按上面的规则降级或丢弃）。
+        一张都留不下时返回 None，交给调用点继续重试或落静态兜底。"""
+        if not best_batch:
+            return None
+        passed_count, ideas, failures, hard_failures = best_batch
+        kept = _salvage_pacing_failures(ideas, failures, hard_failures)
+        if not kept:
+            return None
+        if sys.stdout:
+            print(f"[DEBUG] run_ideate: 交付历次最佳的一批（{passed_count}/{len(ideas)} "
+                  f"张通过节拍验收，共交付 {len(kept)} 张）")
+        return {'ideas': _attach_trend_ref_ids(kept, trend_refs), 'trend_refs': trend_refs}
 
     for attempt in range(3):
         try:
@@ -8377,18 +8764,55 @@ Each object in the JSON array must have EXACTLY these keys:
                                 idea['pacing_skeleton'] = selected_pacing_ids[idea_idx % len(selected_pacing_ids)]
                     with_outline = _normalize_beat_outlines(novel_ideas)
 
-                    pacing_errors = []
-                    for idea_idx, idea in enumerate(novel_ideas, 1):
-                        for err in pacing_skeleton_outline_violations(idea):
-                            pacing_errors.append(f'Candidate {idea_idx} ({idea.get("title") or "untitled"}): {err}.')
-                    if pacing_errors:
+                    # 验收分两层：
+                    # - 硬失败（通用骨架门禁）：卡片本身的结构就不成立，降级救不了，
+                    #   只能丢弃（见 _salvage_pacing_failures）；
+                    # - 软失败（dual_payoff 专属门禁）：内容是合法的单线清单，只是
+                    #   标签认领错了骨架，降级成 linear_milestone 之后标签不再骗人。
+                    failures = {}
+                    hard_failures = {}
+                    for idea_idx, idea in enumerate(novel_ideas):
+                        hard_errs = outline_skeleton_violations(idea)
+                        soft_errs = pacing_skeleton_outline_violations(idea)
+                        if hard_errs and not _OUTLINE_GATE_ENFORCING:
+                            # 灰度观察态：只记录通用门禁的判定，不参与打回/丢弃，
+                            # 便于先看一批真实激发的通过率再决定要不要真的强制。
+                            if sys.stdout:
+                                print(f"[DEBUG] run_ideate: 通用骨架门禁（未强制）命中 "
+                                      f"{novel_ideas[idea_idx].get('title') or 'untitled'}: {hard_errs}")
+                            hard_errs = []
+                        if hard_errs:
+                            hard_failures[idea_idx] = hard_errs
+                        if hard_errs or soft_errs:
+                            failures[idea_idx] = hard_errs + soft_errs
+                    passed = len(novel_ideas) - len(failures)
+                    if best_batch is None or passed > best_batch[0]:
+                        best_batch = (passed, novel_ideas, failures, hard_failures)
+
+                    if failures:
+                        pacing_errors = [
+                            f'Candidate {idx + 1} ({novel_ideas[idx].get("title") or "untitled"}): {err}.'
+                            for idx, errs in failures.items() for err in errs
+                        ]
                         if sys.stdout:
-                            print(f"[DEBUG] run_ideate attempt {attempt+1}: 节拍骨架验收失败，重试: {pacing_errors}")
-                        # 三次都写成旧单线骨架时也不收货；最后让调用落到下方经过
-                        # 同一验收要素手工编排的 fallback，避免用 dual 标签冒充单线清单。
-                        user_prompt_current = user_prompt + "\n\nThe previous response failed the selected pacing skeleton acceptance gate:\n" + \
-                            "\n".join(f'- {err}' for err in pacing_errors) + \
-                            "\nRegenerate the full batch and visibly repair every listed structural defect."
+                            print(f"[DEBUG] run_ideate attempt {attempt+1}: 节拍骨架验收 "
+                                  f"{passed}/{len(novel_ideas)} 通过，未通过项: {pacing_errors}")
+                        # 已经有卡片过关时最多再补一次就收工：每次重试都是一次 150s 的
+                        # 大模型调用，为凑齐"整批全过"把三次机会用满，换来的常常只是同一
+                        # 个毛病再犯两遍。一张都没过才值得用满三次。
+                        last_chance = attempt >= 2 or (passed > 0 and attempt >= 1)
+                        if not last_chance:
+                            user_prompt_current = user_prompt + "\n\nThe previous response failed the selected pacing skeleton acceptance gate:\n" + \
+                                "\n".join(f'- {err}' for err in pacing_errors) + \
+                                "\nRegenerate the full batch and visibly repair every listed structural defect."
+                            continue
+                        delivered = _deliver_best_batch()
+                        if delivered:
+                            return delivered
+                        if attempt < 2:
+                            user_prompt_current = user_prompt + "\n\nThe previous response failed the selected pacing skeleton acceptance gate:\n" + \
+                                "\n".join(f'- {err}' for err in pacing_errors) + \
+                                "\nRegenerate the full batch and visibly repair every listed structural defect."
                         continue
                     # 卡片上的「🔨 节拍简介」全靠 beat_outline。整批一条都没带 =
                     # 模型整个忽略了这个字段(而不是个别条目偷懒),这种响应重试一次
@@ -8403,6 +8827,12 @@ Each object in the JSON array must have EXACTLY these keys:
         except Exception as e:
             if sys.stdout:
                 print(f"[DEBUG] run_ideate attempt {attempt+1} failed: {e}")
+
+    # 三次都没能干净收货，但只要历次里还有能诚实交付的卡片，就不该退回静态兜底：
+    # 兜底那三条是写死的老选题，用过之后会被台账去重清空，交付它们不如交付这批。
+    delivered = _deliver_best_batch()
+    if delivered:
+        return delivered
 
     # Fallback if LLM fails (shelter-only destinies, per SHELTER-ONLY POLICY)
     fallback_ideas = [
@@ -8501,6 +8931,14 @@ Each object in the JSON array must have EXACTLY these keys:
         }
     ]
     fallback_ideas = _dedupe_generated_ideas(fallback_ideas)
+    if not fallback_ideas:
+        # 兜底列表被台账去重清空过：以前这里静静地 return 一个空数组，
+        # 前端只会显示一句「暂无灵感推荐」，看不出到底是模型挂了、验收全否
+        # 还是兜底选题用完了。宁可报错，也不要让用户对着空白面板猜。
+        raise RuntimeError(
+            '本次激发没有产出任何新卡片：模型三次都没能返回可用结果，'
+            '静态兜底选题也已全部被创意台账记为用过。请稍后重试；'
+            '若反复出现，检查 LLM 代理是否可用，或在细调条里同时勾选「单线里程碑推进」骨架。')
     dual_fallback_outlines = {
         'glacier-ice-cave / refuge-den / self-material-window': [
             '清理洞口积雪与落石', '加固外部蓝冰拱口', '嵌装气密入口门框',

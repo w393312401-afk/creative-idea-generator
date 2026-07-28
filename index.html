@@ -313,7 +313,7 @@
                              折叠态摘要由 updateSparkRail() 写入 #spark-tune-summary-text。 -->
                         <div class="spark-tune tune-collapsed" id="spark-tune">
                             <button type="button" class="spark-tune-head" id="spark-tune-toggle" aria-expanded="false" aria-controls="spark-tune-body" title="展开节拍与模型细调">
-                                <span class="spark-tune-summary" id="spark-tune-summary-text">15 拍 · 自适应</span>
+                                <span class="spark-tune-summary" id="spark-tune-summary-text">15 拍 · 自适应上限</span>
                                 <svg class="spark-tune-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"></polyline></svg>
                             </button>
                             <div class="spark-tune-body" id="spark-tune-body">
@@ -321,7 +321,11 @@
                                      controls how many construction beats get generated). -->
                                 <div class="control-group spark-beats">
                                     <div class="slider-labels">
-                                        <span id="beat-count-label">最多施工节拍数 (Milestone Cap)</span>
+                                        <!-- 自适应下这个滑块只是**额度闸门**（15 拍 ≈ 16 张 IMAGE + 15 段
+                                             VIDEO 的真实额度），不再定义施工骨架：骨架（拍数下界、工序清单）
+                                             整体归灵感卡片，滑块只能在卡片给的上限之下再压。
+                                             value="15" 保留——那是没载卡片、纯手动路径的缺省。 -->
+                                        <span id="beat-count-label" title="自适应模式下这是额度上限（最多生成多少拍），不是承诺的拍数；拍数下界由灵感卡片的工序清单决定">节拍上限 · 额度闸门 (Budget Cap)</span>
                                         <span id="val-beats">15 拍</span>
                                     </div>
                                     <div class="slider-track-row">
@@ -677,7 +681,7 @@
                                 </div>
                                 <div class="section-pop" id="frames-info-pop" hidden>
                                     <p class="frames-desc">将生成的所有图片提示词连成单链帧序列：第一帧进行文本生成图像，后续每一帧均以前一帧为唯一参考进行图生图（img2img）修改。</p>
-                                    <p class="frames-desc frames-dnd-hint">拖拽：格子之间互拖＝两帧换位（拖到空格＝搬过去，按住 Alt/⌥ 放手＝复制一份）；把本地图片拖进某一格＝替换该帧（按本单画幅裁剪），一次拖多张＝从落点起按文件名顺序依次填；把格子拖到桌面＝导出这张图。帧号始终不变，换位后其后各帧会标记为血统过期。</p>
+                                    <p class="frames-desc frames-dnd-hint">拖拽：格子之间互拖＝两帧换位（拖到空格＝搬过去，按住 Alt/⌥ 放手＝复制一份）；把本地图片拖进某一格＝替换该帧（按本单画幅裁剪），一次拖多张＝从落点起按文件名顺序依次填（不便拖拽时用卡片上的「上传」按钮，可多选，语义相同）；把格子拖到桌面＝导出这张图。帧号始终不变，换位后其后各帧会标记为血统过期。</p>
                                 </div>
                                 <div class="frames-wrapper card-dark">
                                     <div class="frames-controls">
@@ -733,6 +737,10 @@
                                          关闭时它是空的、由 CSS 隐藏。见 js/slot_toolbar.js -->
                                     <div class="frames-grid beats-grid" id="beats-grid"></div>
                                     <div class="frames-grid" id="frames-grid"></div>
+                                    <!-- 手动上传图片覆盖某一帧用的隐藏文件选择器，由 slot_model.js 画出的各帧
+                                         「上传」按钮共用触发（点击时先记下目标帧号，见 app.js 里的 change 监听）。
+                                         multiple：与拖多张图同款语义——从目标帧起按文件名顺序依次填。 -->
+                                    <input type="file" id="frame-upload-input" accept="image/*" multiple style="display:none">
                                 </div>
                             </div>
 
@@ -1598,14 +1606,14 @@
     <script src="js/progress_model.js?v=1.2.3" defer></script>
     <!-- 槽位状态模型（纯函数）与卡片渲染器：必须排在 api_client / media_renderer /
          app.js 之前——那三处的槽位渲染全部转调这里。见 docs/spark_result_slots_plan.md -->
-    <script src="js/slot_model.js?v=1.0.0" defer></script>
-    <script src="js/slot_card.js?v=1.2.0" defer></script>
+    <script src="js/slot_model.js?v=1.1.0" defer></script>
+    <script src="js/slot_card.js?v=1.3.0" defer></script>
     <script src="js/slot_toolbar.js?v=1.1.0" defer></script>
-    <script src="js/api_client.js?v=1.5.1" defer></script>
+    <script src="js/api_client.js?v=1.6.0" defer></script>
     <script src="js/prompt_pipeline.js?v=1.2.5" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
     <script src="js/media_renderer.js?v=1.6.0" defer></script>
-    <script src="app.js?v=1.3.32" defer></script>
+    <script src="app.js?v=1.3.33" defer></script>
     <script src="js/image_studio.js?v=1.0.4" defer></script>
     <script src="js/gallery.js?v=1.1.2" defer></script>
     <script src="js/ledger.js?v=1.1.2" defer></script>

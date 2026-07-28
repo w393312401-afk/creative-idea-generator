@@ -676,7 +676,9 @@ function initSliders() {
     const syncBeatModeLabel = () => {
         const adaptive = !beatCountMode || beatCountMode.value !== 'fixed';
         const label = document.getElementById('beat-count-label');
-        if (label) label.textContent = adaptive ? '最多施工节拍数 (Milestone Cap)' : '固定施工节拍数 (Beat Count)';
+        // adaptive 下滑块只是额度闸门（骨架由灵感卡片定义，滑块压不动它的下界）；
+        // fixed 下它才真的定义拍数。两态文案必须分开，否则用户会把上限读成承诺。
+        if (label) label.textContent = adaptive ? '节拍上限 · 额度闸门 (Budget Cap)' : '固定施工节拍数 (Beat Count)';
         updateConfigSummary();
     };
     if (beatCountMode) {
@@ -1153,6 +1155,26 @@ function setupEventListeners() {
             if (file && Number.isFinite(slot)) {
                 uploadVideoToSlot(slot, file);
             }
+        });
+    }
+
+    // 手动上传图片覆盖帧槽位：同上的共用隐藏 <input type=file>，由各帧卡片的
+    // 「上传」按钮触发。多选时走与"拖多张图进来"同一条路径（uploadFramesFromDrop：
+    // 按文件名顺序从目标帧起依次填、超出槽位的丢弃并告知），不另起一套语义。
+    const frameUploadInput = document.getElementById('frame-upload-input');
+    if (frameUploadInput) {
+        frameUploadInput.addEventListener('change', (e) => {
+            const files = Array.from((e.target && e.target.files) || []);
+            const seq = parseInt(frameUploadInput.dataset.seq, 10);
+            frameUploadInput.value = '';
+            if (!files.length || !Number.isFinite(seq)) return;
+            // accept="image/*" 只是筛选器，部分系统的文件对话框允许绕过它选任意文件
+            const images = files.filter(isImageFileLike);
+            if (!images.length) {
+                showToast(`「${files[0].name}」不是图片文件，帧槽位只接受图片`, 'error');
+                return;
+            }
+            uploadFramesFromDrop(seq, images);
         });
     }
 
@@ -1952,6 +1974,10 @@ async function generateIdea(retryParams = null) {
             ratio: document.getElementById('val-ratio').textContent,
             creativity: document.getElementById('val-creativity').textContent,
             beats_count: parseInt(document.getElementById('slider-beats').value, 10),
+            // 载入卡片后走主生成按钮的这条路径也要带上拍数下界，否则它和卡片
+            // 「一键合成」会落在两个不同的区间里（同一张卡走两条路拿到不同拍数）。
+            // 滑块只压上限；下界由卡片的工序清单决定，见 compute_beats_floor。
+            beats_floor: Number.isFinite(+(loadedIdea.beats_floor)) ? +loadedIdea.beats_floor : null,
             beat_count_mode: (document.getElementById('beat-count-mode') || {}).value || 'adaptive'
         };
         currentConf = { ...config };
@@ -2669,6 +2695,13 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                 if (isViewing()) {
                     progress.style.display = 'none';
                     btn.disabled = false;
+                    // 必须在 endIdeaTask 之后再重渲一次：renderFramesForIdea 的
+                    // isFramePending 读的就是这条任务登记，catch/成功分支里那次重渲
+                    // 发生在登记还在的时候，没轮到的槽位会继续画成「等待中」并一直
+                    // 转圈——用户点了取消、后台 4 秒后就停了，界面却满屏 spinner，
+                    // 看起来像"取消了任务还在跑"（2026-07-28 实机截图）。清掉登记后
+                    // 这些槽位落到「未生成/已失效」态，并重新带上生成/上传出口。
+                    renderFramesForIdea(ownerIdea);
                 }
             }
         }
@@ -3369,6 +3402,11 @@ async function generateFrames() {
         return;
     }
     const ownerIdea = currentIdea;
+    const selectedCover = ownerIdea.activeCoverUrl || (ownerIdea.covers || []).slice(-1)[0];
+    if (!selectedCover) {
+        showToast("请先生成或选择封面图；第一帧必须以封面图进行图生图。", "error");
+        return;
+    }
     if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
         showToast("该创意的帧序列已在生成中，请稍候", "error");
         return;
@@ -3982,6 +4020,7 @@ function computePipelineState(idea) {
     const framesHave = (run.frames || []).filter(f => f.url || f.file).length;
     const videosHave = (run.videos || []).filter(v => v.url || v.file).length;
     const coversHave = (idea.covers || []).length;
+    const hasCover = coversHave > 0 || !!idea.activeCoverUrl;
     const mergedOk = !!(run.merged_video && run.merged_video.status === 'success');
 
     const busy = (type) => !!(typeof isIdeaTaskActive === 'function' && isIdeaTaskActive(idea.id, type));
@@ -3991,7 +4030,7 @@ function computePipelineState(idea) {
 
     return {
         cover: {
-            done: coversHave > 0,
+            done: hasCover,
             busy: busy('cover'),
             locked: false,
             have: coversHave,
@@ -4000,9 +4039,11 @@ function computePipelineState(idea) {
         frames: {
             done: imageTotal > 0 ? framesHave >= imageTotal : framesHave > 0,
             busy: busy('frames'),
-            locked: false,
+            locked: !hasCover,
             have: framesHave,
-            stat: (busy('frames') || framesHave) ? ratio(framesHave, imageTotal) : '未生成',
+            stat: (busy('frames') || framesHave)
+                ? ratio(framesHave, imageTotal)
+                : (!hasCover ? '待封面' : '未生成'),
         },
         videos: {
             done: videoTotal > 0 ? videosHave >= videoTotal : videosHave > 0,
@@ -4281,9 +4322,17 @@ function initPacingSkeletonSelector() {
     updateNote();
 }
 
+// 一次激发是一串 LLM 调用（失败重试时可能跑上几分钟）。按钮上没有 disabled，
+// 用户等不及连点几下就会并发出几路同样昂贵的请求，回来还互相覆盖卡片区。
+let ideationInFlight = false;
+
 async function loadIdeationCards(force = false, options = {}) {
     const container = document.getElementById('ideation-cards-container');
     if (!container) return;
+    if (ideationInFlight) {
+        if (typeof showToast === 'function') showToast('正在激发中，请稍候…', 'info');
+        return;
+    }
     const remixSeed = options && options.remixSeed ? options.remixSeed : null;
 
     // 灵感推荐由联网参考案例库驱动（js/trend_refs.js）：勾选了参考就直接从选中
@@ -4330,6 +4379,7 @@ async function loadIdeationCards(force = false, options = {}) {
         ? `正在从选中的 ${selIds.length} 条联网参考案例中取材激发灵感`
         : `正在从案例库自动挑选参考激发灵感中`;
     renderIdeationPending(container, pendingMsg);
+    ideationInFlight = true;
     if (typeof setSparkIdeating === 'function') setSparkIdeating(true);
 
     try {
@@ -4348,7 +4398,9 @@ async function loadIdeationCards(force = false, options = {}) {
         });
 
         const data = await response.json();
-        if (data.status === 'ok' && data.ideas) {
+        // ideas 为空数组时 data.ideas 仍然是真值：以前会当成功走下去，把空批次写进
+        // 缓存、渲染成一句「暂无灵感推荐」，用户看不出后端到底出了什么事。
+        if (data.status === 'ok' && Array.isArray(data.ideas) && data.ideas.length > 0) {
             currentIdeatedIdeas = data.ideas;
             currentIdeationTrendRefs = Array.isArray(data.trend_refs) ? data.trend_refs : [];
             if (!remixSeed) {
@@ -4363,12 +4415,14 @@ async function loadIdeationCards(force = false, options = {}) {
             // 主库消失，每次生成后都要刷新左侧列表，避免残留已归档条目可勾选
             if (typeof loadTrendRefs === 'function') loadTrendRefs();
         } else {
-            container.innerHTML = `<div class="ideation-error">加载失败: ${data.message || '未知错误'}</div>`;
+            renderIdeationFailure(container,
+                data.message || (data.status === 'ok' ? '本次没有产出新的灵感卡片' : '未知错误'));
         }
     } catch (e) {
         console.error("Failed to load ideated cards:", e);
-        container.innerHTML = `<div class="ideation-error">加载失败，请检查网络或配置</div>`;
+        renderIdeationFailure(container, '请检查网络或配置');
     } finally {
+        ideationInFlight = false;
         if (typeof setSparkIdeating === 'function') setSparkIdeating(false);
     }
 }
@@ -4396,6 +4450,26 @@ function renderIdeationPending(container, message) {
         container.insertBefore(strip, container.firstChild);
     }
     strip.textContent = text;
+}
+
+/* 激发失败：上一批还在就留着（那是用户仅有的可点内容），只把顶部那条进度提示换成
+   失败原因；一张都没有时才把骨架占位替换成错误块。以前这里无条件 innerHTML 覆写，
+   等于失败一次就把上一批也一并抹掉。 */
+function renderIdeationFailure(container, message) {
+    if (!container) return;
+    const keepOld = !!container.querySelector('.ideation-card');
+    if (!keepOld) {
+        container.innerHTML = `<div class="ideation-error">加载失败: ${message}</div>`;
+        return;
+    }
+    let strip = container.querySelector('.ideation-pending-strip');
+    if (!strip) {
+        strip = document.createElement('div');
+        strip.className = 'ideation-pending-strip';
+        container.insertBefore(strip, container.firstChild);
+    }
+    strip.textContent = `激发失败: ${message}（下方仍是上一批，可继续点选）`;
+    if (typeof showToast === 'function') showToast(`激发失败: ${message}`, 'error');
 }
 
 // Function renderIdeationCards moved to modular JS file
