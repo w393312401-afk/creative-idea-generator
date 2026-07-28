@@ -200,6 +200,26 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
         check(all(r["w"] > 0 and r["h"] > 0 for r in boxes["rects"]) and not overlap,
               "两枚徽标不得重叠，实得 %s" % boxes["rects"])
 
+        # 操作按钮必须待在自己的卡片里。S 档一列只有 88px，出图卡上最多五枚按钮：
+        # 旧规则不换行也不限左边界，「修复此帧问题」「描述问题」会被压成 24px 宽的
+        # 竖排汉字并整枚落到隔壁格上——看着是按钮，实际点到的是别人（2026-07-28 实机）
+        page.evaluate("() => applySlotSize('S')")
+        btn_box = page.evaluate("""() => {
+            const c = document.getElementById('frame-slot-3');
+            c.querySelector('.slot-actions').style.opacity = 1;
+            const r = c.getBoundingClientRect();
+            return { card: { l: r.left, w: r.width },
+                     btns: Array.from(c.querySelectorAll('.slot-action-btn')).map(b => {
+                         const q = b.getBoundingClientRect();
+                         return { act: b.dataset.act, l: q.left, w: q.width };
+                     }) };
+        }""")
+        outside = [b["act"] for b in btn_box["btns"]
+                   if b["l"] < btn_box["card"]["l"] - 1
+                   or b["l"] + b["w"] > btn_box["card"]["l"] + btn_box["card"]["w"] + 1]
+        check(len(btn_box["btns"]) == 5, "IMG 003 应有五枚操作按钮，实得 %d" % len(btn_box["btns"]))
+        check(not outside, "操作按钮不得溢出卡片，越界的有 %s" % outside)
+
         # 事件委托：点按钮应触发对应处理函数，且不触发 lightbox
         page.evaluate("""() => {
             window.__calls = [];
@@ -235,6 +255,72 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
         page.eval_on_selector('#frame-slot-4 [data-act="retry-frame"]', "el => el.click()")
         check(page.evaluate("() => window.__calls.length") == 1,
               "解除 busy 后按钮必须恢复可点（旧实现此处是死按钮）")
+
+        # 解除 busy 还要把"不忙时该说什么"还回去：旧实现一律 title=''，跑完一轮之后
+        # 每枚按钮的悬浮说明就永久消失了
+        tip = page.evaluate(
+            "() => document.querySelector('#frame-slot-4 [data-act=\"upload-frame\"]').title")
+        check("手动上传本地图片" in tip, "解除 busy 后应恢复空闲提示，实得 %r" % tip)
+
+        # 合并视图下的忙态往返：卡片画在 #beats-grid 里，旧实现却按 #frames-grid
+        # 硬选按钮——解禁整个是空操作，任务跑完网格永远停在禁用态
+        # （2026-07-28 实机：一致性审查跑完后整格帧按钮全点不动）
+        page.evaluate("() => setSlotMergedView(true)")
+        page.wait_for_timeout(300)
+        merged = page.evaluate("""() => {
+            setFrameGridButtonsBusy(true);
+            const st = t => Array.from(document.querySelectorAll(
+                `#beats-grid .slot-card[data-type="${t}"] .slot-action-btn`));
+            const busy = { img: st('image').every(b => b.disabled),
+                           vid: st('video').some(b => b.disabled),
+                           imgN: st('image').length, vidN: st('video').length };
+            setFrameGridButtonsBusy(false);
+            busy.freed = st('image').every(b => !b.disabled);
+            busy.tip = (st('image').find(b => b.dataset.act === 'upload-frame') || {}).title;
+            return busy;
+        }""")
+        check(merged["imgN"] > 0 and merged["vidN"] > 0,
+              "合并视图应把两类卡片都画进 #beats-grid，实得 img=%s vid=%s"
+              % (merged["imgN"], merged["vidN"]))
+        check(merged["img"], "合并视图下 busy 必须禁用帧卡片按钮")
+        check(not merged["vid"], "帧网格的忙态不该顺手禁掉视频卡片的按钮")
+        check(merged["freed"], "合并视图下解除 busy 必须真的解禁（旧实现是空操作，死按钮）")
+        check("手动上传本地图片" in (merged["tip"] or ""),
+              "合并视图下也要还回空闲提示，实得 %r" % merged["tip"])
+
+        # 实机那次事故的完整复现：任务在跑时整格重渲（slot_model 按 busy 画出一整格
+        # 禁用按钮）→ 任务结束、登记清掉 → 收尾只做 DOM 级解禁。合并视图下这一步
+        # 选不中任何按钮，网格就永远停在禁用态。
+        stuck = page.evaluate("""() => {
+            const btns = () => Array.from(document.querySelectorAll(
+                '#beats-grid .slot-card[data-type="image"] .slot-action-btn'));
+            ideaTasksById['smoke1'] = { frames: { taskId: 't1' }, videos: null, cover: null };
+            renderFramesForIdea(currentIdea);
+            const during = btns().every(b => b.disabled);
+            ideaTasksById = {};
+            refreshSlotGridBusy('image');
+            return { during, after: btns().every(b => !b.disabled) };
+        }""")
+        check(stuck["during"], "任务在跑时整格重渲应画成禁用态")
+        check(stuck["after"],
+              "任务结束后收尾解禁必须在合并视图下也生效（实机：审查跑完整格点不动）")
+
+        # 收尾用的 refreshSlotGridBusy：忙不忙按"当前创意此刻还有没有同类任务在跑"
+        # 现算，而不是由调用方硬写 false——网格 DOM 是跨创意共用的
+        page.evaluate("() => setSlotMergedView(false)")
+        page.wait_for_timeout(300)
+        refreshed = page.evaluate("""() => {
+            const btns = () => Array.from(
+                document.querySelectorAll('#frames-grid .slot-action-btn'));
+            ideaTasksById['smoke1'] = { frames: { taskId: 't1' }, videos: null, cover: null };
+            refreshSlotGridBusy('image');
+            const during = btns().every(b => b.disabled);
+            ideaTasksById = {};
+            refreshSlotGridBusy('image');
+            return { during, after: btns().every(b => !b.disabled) };
+        }""")
+        check(refreshed["during"], "还有帧任务在跑时 refreshSlotGridBusy 必须保持禁用")
+        check(refreshed["after"], "任务登记清空后 refreshSlotGridBusy 必须解禁")
 
         # 实时回调路径：renderVideoSlotDone 画出的卡片必须与整格重渲一致
         page.evaluate("""() => renderVideoSlotDone(4,

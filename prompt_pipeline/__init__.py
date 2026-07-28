@@ -1536,6 +1536,13 @@ def check_first_interior_reveal_raw_state(config, image_path):
             "wreckage and decay distributed naturally where gravity and time left it. Do NOT fail a "
             "frame merely for being dim, empty of furniture, or plainly built — only for the four "
             "conditions above.\n\n"
+            "SCOPE — condition 3 and the decay count in condition 4 apply ONLY to surfaces nobody "
+            "has worked on. The exterior beats before this crossing may already have sealed the "
+            "roof, shell, or windows on camera; that element is the same physical element seen "
+            "from its other face here, so it correctly reads as CLOSED with a raw unfinished "
+            "inner face (bare decking, exposed rafters or ribs, fastener rows, unpainted new "
+            "material). Never fail a frame for that, and never demand the roof/wall be open to "
+            "the sky — a sealed element rendered open again is the opposite error.\n\n"
             "Response format (exactly one line):\n"
             "- PASS\n"
             "- FAIL: <一句中文原因，点名画面里的人工痕迹/过于整洁之处，或缺哪类衰败痕迹>"
@@ -4926,6 +4933,12 @@ def rework_first_interior_reveal_decay_beat(config, i, image_prompt, decay_errs,
         "has entered this space yet. If the original text named one, state its absence explicitly "
         "(e.g. \"no ladders, no tools, no staged materials anywhere in frame\") rather than just "
         "dropping the word.\n"
+        "- NEVER source that decay from an envelope element an earlier beat already sealed on "
+        "camera (roof/ceiling, exterior wall or shell, window/glazing, door): the crossing reset "
+        "the camera, not the construction progress, so that element stays closed here — no sky, "
+        "ridge, daylight shaft, rain, or snow through it and no hole, gap, or missing section in "
+        "it. Its inner face may read raw and unfinished (bare decking, exposed rafters, fastener "
+        "rows); put the required decay on the floor, lower walls, fittings, and contents instead.\n"
         "- Do not invent new landmarks, change the camera, or contradict the established "
         "structural state. Keep the full prompt under 250 words.\n"
         "Output ONLY the corrected prompt text itself. Do not prefix it with any label, heading, "
@@ -4952,6 +4965,219 @@ def rework_first_interior_reveal_decay_beat(config, i, image_prompt, decay_errs,
     except Exception as e:
         if sys.stdout:
             print(f"[DIRECT] Beat {i} 首现衰败措辞回炉调用失败（保留原文）: {e}")
+        return image_prompt, False
+
+
+# ============================================================================
+# 包络体跨视角状态单调性（Shared-Boundary / Envelope Cross-View Monotonicity）
+# ----------------------------------------------------------------------------
+# 屋顶/天花、外墙外壳、门窗都是「一个构件、两张面」：外景拍把它封上之后，任何一张
+# 室内帧看到的都是同一个构件的背面，只能是「已封闭、里面这层还没装修」，绝不可能
+# 又变回破洞透天。2026-07-28 实测：IMAGE 4 塔楼顶部已完工并封闭黑钢金属屋顶，
+# IMAGE 5 室内视角顶部仍呈破损开裂并直接透出蓝天与山脊，审查判「施工状态未单调
+# 递增（状态倒退）」。
+#
+# 根因不在审查漏判（它抓到了），在生成侧两条契约互相打架：
+#   1. 首现帧「未被触碰的创伤状态」条款硬性要求至少三类衰败可见，其中一类正是
+#      「结构性破损（裂缝、下陷、破洞、缺失段）」——最顺手的落点就是头顶；
+#   2. 过门/硬切重置了「镜头」，模型顺手把「施工进度」也一起重置了。
+# 修法是给这两条划范围：重置的是镜头不是工程，未被触碰的是没人动过的那些面，
+# 已经从外面封好的构件不在其列——外面封好、里面毛坯才是对的写法。文字契约管到
+# 提示词，这里再补一道确定性兜底，逮住漏网的那一稿。
+#
+# 两种叙事骨架都走同一套判定：linear_milestone（单线里程碑推进）在过门桥接处跨面，
+# dual_payoff（内外双重完工）在硬切处跨面，倒退形态一模一样。
+# ----------------------------------------------------------------------------
+# 只收「气候包络」三类构件：屋面/外壳/门窗——「从外面封好 → 从里面就不可能再透天
+# 透雨」是物理硬蕴含，误报率最低。楼板和内门不进词表（内门本来就被出画条款挡在
+# 画外，楼板开洞常是合法的室内工序），它们交给契约正文按语义判断。
+_ENVELOPE_ELEMENT_KEYWORDS = {
+    'roof/ceiling': ('roof', 'roofing', 'rooftop', 'ceiling', 'canopy', 'cupola', 'dome',
+                     'skylight', 'overhead shell', 'top shell'),
+    'exterior wall/shell': ('exterior wall', 'external wall', 'outer wall', 'facade', 'façade',
+                            'cladding', 'siding', 'outer shell', 'building envelope', 'hull'),
+    'window/glazing': ('window', 'glazing', 'glazed', 'windowpane', 'window pane', 'sash'),
+}
+# 早前某拍把该构件「封上」的措辞。'complete'/'installed' 这类词单独看太宽（几乎每条
+# milestone_name 都带），所以判定按邻近窗口做：必须和构件词挨得够近才算数。
+_ENVELOPE_SEAL_MARKERS = (
+    'seal', 'sealed', 'sealing', 'weathertight', 'watertight', 'weatherproof', 'weather-tight',
+    'enclosed', 'closed off', 'capped', 'capping', 'covered', 'covering', 'clad', 'cladding',
+    'sheathed', 'sheathing', 'membrane', 'roofed', 'reroofed', 're-roofed', 'glazed', 'panelled',
+    'paneled', 'installed', 'install', 'complete', 'completed', 'replaced', 'patched', 'repaired',
+)
+# 骨架/龙骨限定词：装完椽条、龙骨、桁架是「结构立起来了」，不是「封上了」——这时头顶
+# 依然合法地敞着，之后的室内帧写成透天完全正确，不能算倒退。命中这些词就否掉本次封闭
+# 判定，宁可漏判也不能把合法的裸骨架帧判死。
+_ENVELOPE_SKELETAL_QUALIFIERS = (
+    'joist', 'rafter', 'stud', 'batten', 'purlin', 'truss', 'framing', 'frame', 'skeleton',
+    'ribs', 'lath', 'furring', 'strapping',
+)
+# 构件词与封闭词必须落在同一个子句里才算同一件事。纯按字符距离判会把同一拍里另一件事
+# 的封闭词算到屋面头上（"…sealed watertight with bitumen membrane and backfilled, while
+# overhead the roof is left exactly as found" 里 membrane 离 roof 只有三十几个字符）；
+# 逗号/分号/while/but 这些边界正好把「这件事」和「那件事」分开。
+_CLAUSE_SPLIT_PATTERN = re.compile(
+    r'[,;.:]|\bwhile\b|\bwhereas\b|\bbut\b|\balthough\b|\bthough\b|\bexcept\b', re.IGNORECASE)
+# 室内帧里出现即「这个构件还开着」的措辞。刻意不收裸 'crack'/'cracks'：只封了外面
+# 一层时，里面那层留着旧裂纹和锈迹是合法的，透天才是倒退。
+_ENVELOPE_OPEN_MARKERS = (
+    'sky', 'blue sky', 'clouds', 'cloud cover', 'horizon', 'ridge', 'ridgeline', 'mountain',
+    'treetops', 'tree tops', 'open to the sky', 'open sky', 'open air', 'daylight streams through',
+    'daylight pours through', 'daylight spills through', 'light streams through', 'shaft of daylight',
+    'shafts of daylight', 'sunbeam', 'sunbeams', 'hole', 'holes', 'gap', 'gaps', 'gaping',
+    'breach', 'torn open', 'ripped open', 'split open', 'cracked open', 'missing section',
+    'missing sections', 'missing panel', 'missing panels', 'collapsed', 'caved in', 'cave-in',
+    'punctured', 'rain falls through', 'snow drifts in', 'exposed to the weather',
+)
+_SENTENCE_SPLIT_PATTERN = re.compile(r'(?<=[.;!?])\s+')
+
+# 生成侧共用的契约条文（批量直出 + 单拍兜底两个指令块各引一次，避免两份手抄本漂移）。
+# 与骨架无关：单线里程碑推进在过门桥接处跨面，内外双重完工在硬切处跨面，同一条管两种。
+ENVELOPE_CROSS_VIEW_RULE = (
+    "- SHARED-BOUNDARY (ENVELOPE) CROSS-VIEW MONOTONICITY: the roof/ceiling, exterior walls or "
+    "shell, windows/glazing, doors, and floor/deck slabs are each ONE physical element with TWO "
+    "faces — an outside face and an inside face. Once any beat seals, closes, re-clads, patches, "
+    "glazes, or completes such an element from EITHER side, every later IMAGE shot from the "
+    "OPPOSITE side shows that same element and must describe it as already closed: no sky, "
+    "clouds, distant ridge, horizon, treetops, daylight shaft, rain, or snow may show through it, "
+    "and no hole, gap, breach, missing section, or collapse may reappear in it. Its far face is "
+    "still allowed — and expected — to be raw and unfinished: bare new decking, exposed rafters "
+    "or ribs, fastener rows, fresh seam lines, unpainted underside of the new material. "
+    "Unfinished never means still open. A viewpoint change — an exterior-to-interior crossing, a "
+    "declared hard cut, or a reverse dolly back outside — resets the CAMERA, never the "
+    "construction state; a later frame may only ever show the same element at the same stage or a "
+    "more advanced one."
+)
+
+
+def sealed_envelope_elements(beat_ladder, before_index):
+    """Envelope element groups that a beat STRICTLY BEFORE 1-based `before_index` already
+    closed on camera, as {group_label: milestone_name_that_closed_it}. Read off the beat
+    ladder's own declared text (operation / milestone_name / after_state / completion_extent
+    / description) — a group counts as sealed only when one beat's text carries both an
+    element keyword and a seal marker in the SAME CLAUSE, which keeps the broad markers
+    ('installed', 'complete') from firing on a beat that merely mentions the roof in passing or
+    seals something else entirely. A skeletal qualifier in that clause ('ceiling joists
+    complete') vetoes the match: erecting structure is not closing the envelope, and the roof
+    above it is still legitimately open. Fields are joined with a clause break so one field's
+    wording can never bleed into the next."""
+    sealed = {}
+    if not beat_ladder or before_index is None:
+        return sealed
+    for beat in beat_ladder[:max(0, int(before_index) - 1)]:
+        if not isinstance(beat, dict):
+            continue
+        text = '. '.join(str(beat.get(k) or '') for k in (
+            'operation', 'milestone_name', 'after_state', 'completion_extent', 'description')).lower()
+        clauses = [c for c in _CLAUSE_SPLIT_PATTERN.split(text) if c and c.strip()]
+        for group, keywords in _ENVELOPE_ELEMENT_KEYWORDS.items():
+            if group in sealed:
+                continue
+            if any(_clause_seals_element(c, keywords) for c in clauses):
+                sealed[group] = str(beat.get('milestone_name') or beat.get('operation') or '').strip()
+    return sealed
+
+
+def _clause_seals_element(clause, element_keywords):
+    """True when one clause declares an element of this group CLOSED: the clause names the
+    element AND carries a seal marker, with no skeletal qualifier in it."""
+    if not any(kw in clause for kw in element_keywords):
+        return False
+    if any(q in clause for q in _ENVELOPE_SKELETAL_QUALIFIERS):
+        return False
+    return any(marker in clause for marker in _ENVELOPE_SEAL_MARKERS)
+
+
+def check_envelope_seal_regression(image_prompt, i, beat_ladder, family='exterior'):
+    """确定性兜底：室内帧不得把「早前已经从外面封好的包络构件」重新写成敞开的。
+
+    只对 family == 'interior' 的帧生效（外景帧看到的是同一构件的外面那层，本来就该是
+    封好的，另有里程碑校验管）。判定按句子作用域：同一句里既点了某个已封构件、又点了
+    敞开/透天措辞，才算命中——跨句共现（顶部已封成一句、地面碎裂成另一句）是完全合法
+    的写法，不能算违规。否定式澄清句（"no gaps", "no daylight through the roof"）走
+    _mentions_without_negation 绕开。
+
+    beat_ladder 缺失或本拍之前没封过任何包络构件时返回 []。"""
+    errors = []
+    if family != 'interior' or not image_prompt:
+        return errors
+    sealed = sealed_envelope_elements(beat_ladder, i)
+    if not sealed:
+        return errors
+    for sentence in _SENTENCE_SPLIT_PATTERN.split(image_prompt):
+        low = sentence.lower()
+        open_hits = _mentions_without_negation(low, _ENVELOPE_OPEN_MARKERS)
+        if not open_hits:
+            continue
+        for group, milestone in sealed.items():
+            hit_element = next((kw for kw in _ENVELOPE_ELEMENT_KEYWORDS[group] if kw in low), None)
+            if not hit_element:
+                continue
+            errors.append(
+                f"Envelope regression: an earlier beat already closed the {group} "
+                f"(\"{milestone}\"), but this interior IMAGE still describes it as open — "
+                f"'{hit_element}' together with '{open_hits[0]}' in: \"{sentence.strip()}\". "
+                f"The same physical element cannot be sealed from outside and open from inside. "
+                f"Rewrite it as closed from underneath (bare new decking, exposed structure, "
+                f"fasteners, unfinished inner face) and move any required decay onto surfaces no "
+                f"earlier beat has touched."
+            )
+            break
+    return errors
+
+
+def rework_envelope_seal_regression_beat(config, i, image_prompt, envelope_errs, beat=None,
+                                         beat_ladder=None):
+    """Single-shot IMAGE rework (max one round) for check_envelope_seal_regression hits, on the
+    same conservative contract as the other IMAGE reworks: camera/geometry/locked-anchor
+    sentences survive verbatim, only the offending sentence(s) get rewritten, and the rewrite is
+    adopted only if it re-passes the check. Returns (image_prompt, adopted)."""
+    system = (
+        "You are repairing ONE physical-continuity error in a still-frame construction IMAGE "
+        "prompt from a restoration time-lapse. An earlier beat already sealed a building-envelope "
+        "element (roof/ceiling, exterior wall or shell, window/glazing) on camera, but this "
+        "interior frame still describes that same element as open — a state regression, since one "
+        "physical element cannot be closed from the outside and open from the inside. Hard rules:\n"
+        "- KEEP every sentence describing camera position, lens, geometry, locked anchors, grid "
+        "coordinates, or frame-height percentages EXACTLY VERBATIM.\n"
+        "- REWRITE only the offending sentence(s) so the sealed element reads as CLOSED from "
+        "underneath/inside: no sky, clouds, distant ridge, horizon, daylight shaft, rain, or snow "
+        "coming through it, and no hole, gap, breach, missing section, or collapse in it.\n"
+        "- Its inner face is still allowed to be raw and unfinished — bare new decking, exposed "
+        "rafters or ribs, fastener rows, seam lines, fresh underside of the new material — that is "
+        "the correct way to show 'sealed outside, not yet finished inside'. Unfinished never means "
+        "still open.\n"
+        "- If the removed wording was the frame's decay content, replace it with decay on surfaces "
+        "no earlier beat has touched (floor, lower walls, fittings, debris) — never by reopening "
+        "the sealed element.\n"
+        "- Do not invent new landmarks, change the camera, or alter any other beat's work. Keep the "
+        "full prompt under 250 words.\n"
+        "Output ONLY the corrected prompt text itself. Do not prefix it with any label, heading, "
+        "quotation marks, or repetition of these instructions, and do not add commentary or "
+        "markdown fences."
+    )
+    user = (
+        f"Here is the image prompt for beat {i}"
+        + (f" ({beat.get('operation', '')})" if isinstance(beat, dict) else "")
+        + f", delimited by triple quotes:\n\"\"\"\n{image_prompt}\n\"\"\"\n\n"
+        "Problems to fix (rewrite only the offending sentence(s), change nothing else):\n- "
+        + "\n- ".join(envelope_errs)
+    )
+    try:
+        resp = _chat(config, system, user, temperature=0.6, timeout=90)
+        fixed = _strip_markdown_fences_only(resp).strip()
+        fixed = _strip_leading_label_line(fixed)
+        if not fixed or len(fixed.split()) > 300:
+            return image_prompt, False
+        if check_envelope_seal_regression(fixed, i, beat_ladder, family='interior'):
+            return image_prompt, False
+        return fixed, True
+    except GenerationCancelled:
+        raise
+    except Exception as e:
+        if sys.stdout:
+            print(f"[DIRECT] Beat {i} 包络体状态倒退回炉调用失败（保留原文）: {e}")
         return image_prompt, False
 
 
@@ -5412,7 +5638,12 @@ Required JSON keys:
             "drop it when rewriting the draft plan. The ordinary beat "
             "immediately BEFORE the threshold hard cut must complete a genuinely usable exterior "
             "entrance/frontage (not a partial repair) and read as the first mini-payoff. Then HARD CUT "
-            "to the untouched raw interior, reset visual progress, clean it out, and rebuild bottom-up "
+            "to the untouched raw interior — the cut resets the CAMERA and the INTERIOR work queue "
+            "only, never the exterior work already completed on camera: every envelope element the "
+            "exterior act sealed (roof, shell/facade, windows, entrance) stays sealed when seen from "
+            "inside, with at most a raw unfinished inner face, so the interior beats never plan a "
+            "before_state that reopens it. Reset visual progress on interior surfaces and contents, "
+            "clean it out, and rebuild bottom-up "
             "through base/hidden layers -> grid framing and cavity fill -> board closure -> finish "
             "surfaces -> core furniture -> fast soft-furnishing closeout -> final worker-free reward. "
             "Do not move all exterior utility/platform/finish work after the cut, and do not turn the "
@@ -5422,7 +5653,10 @@ Required JSON keys:
         _pacing_plan_block = (
             "\nSelected pacing skeleton (narrative reference): linear_milestone / 单线里程碑推进. "
             "Preserve one monotonic construction arc from exterior clearing/repair through the crossing, "
-            "interior construction, furnishing, and the single final reward.\n"
+            "interior construction, furnishing, and the single final reward. The crossing is a camera "
+            "move inside that one arc, not a restart: every envelope element the exterior beats sealed "
+            "(roof, shell/facade, windows, entrance) is still sealed when the camera turns around and "
+            "sees its inner face, which may be raw and unfinished but never open again.\n"
         )
 
     if beat_count_mode == 'fixed':
@@ -5470,6 +5704,7 @@ General Rules:
 {threshold_split_rules}
 {_pacing_plan_block}
 - CEILING/ROOF COVERAGE RULE: For any enclosed space (fuselage, cabin, room, container, vault, bunker, etc.), the ceiling/roof/top surface must be treated as a construction surface just like the walls and floor. When the beat ladder includes framing, paneling, insulating, or painting walls, the SAME operation MUST also explicitly cover the ceiling/roof/top curve. A renovation that covers walls but leaves the ceiling as raw exposed structure is physically incorrect.
+- SHARED-BOUNDARY (ENVELOPE) TWO-FACE RULE (mandatory): the roof/ceiling, exterior walls or shell, windows/glazing, doors, and floor/deck slabs are each ONE physical element with an outside face and an inside face. Once a beat seals or completes such an element from either side, EVERY later beat — including the first interior beat after the crossing or hard cut — must treat it as closed, and its own before_state/after_state/preserve_state must say so. Never plan a later beat whose before_state reopens it (a roof still torn open to the sky after a roofing beat, a wall still breached after the shell was re-clad, a window still empty after glazing). If the interior face of that element still needs finishing, plan that as its own forward step, with before_state "sealed from outside, inner face raw and unfinished" — never as "still open". The crossing resets the camera, not the construction progress.
 - FIXTURE INSTALLATION RULE: If the beat ladder includes a wiring/electrical rough-in beat, there MUST be a subsequent "lighting" or "fixture install" beat BEFORE the furnishing/staging beat and BEFORE the reward beat. Light fixtures cannot appear in the final reward if they were never installed.
 - DOOR LEAF RULE: If a door frame is installed in one beat, a subsequent beat MUST include installing a door panel/leaf/sash unless the design explicitly calls for an open archway.
 - FLOORING-BEFORE-HEAVY-OBJECTS RULE: Floor finish (hardwood, tile, etc.) MUST be installed BEFORE any heavy anchored objects (fireplace, stove, workbench) are placed on it. The correct order is: subfloor -> finish floor -> anchor heavy objects onto the finished floor.
@@ -5897,9 +6132,20 @@ Hard Rules:
 
 # 声明式硬切拍的 VIDEO 槽位占位声明：确定性覆盖 LLM 输出——该槽不生成视频、不送
 # i2v，配对/门禁按"预期缺失"处理（见 video_generator.plan_video_slots / merge 门禁）。
+# 2026-07-28：剪辑上允许硬切，但物理推进不能跟着断——占位声明本身要把"门被推开、
+# 镜头进入内部空间"这一步用文字说满。此前它只写"不生成片段、成片直接切"，切点前的
+# 那张外部帧因此在读者和审查模型眼里都成了"门关着、进不去"的死局（一致性审查曾据此
+# 把封闭木门报成违规，见 _local_beat_review_system_prompt 的 DECLARED HARD CUT 豁免）。
 HARD_CUT_VIDEO_PLACEHOLDER = (
     "DECLARED HARD CUT - no video clip is generated for this slot; the final film cuts directly "
-    "from the previous IMAGE to this beat's resulting IMAGE, and the story resumes inside."
+    "from the previous IMAGE to this beat's resulting IMAGE, and the story resumes inside. "
+    "The crossing itself is carried in words here: the sealed entry seen in the previous IMAGE "
+    "is pushed open and the camera moves through it into the interior space, so the cut reads as "
+    "one continuous walk-in rather than a teleport. Because nothing of the interior can be seen "
+    "before crossing in this variant, that previous exterior IMAGE keeps its entry CLOSED and "
+    "opaque by design - that is the required state, never a defect. Construction progress does "
+    "not reset across the cut: everything an earlier exterior beat sealed or repaired stays "
+    "sealed and repaired on its inner face."
 )
 
 
@@ -5973,7 +6219,14 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
             + "; (2) the same material palette, weathering and decay severity as established "
             "outside; (3) the same daylight direction and colour temperature, entering through "
             "the carrier's own openings; (4) the interior's untouched pre-construction trauma "
-            "state. The door frame, entry opening, and threshold must NOT appear in frame — the "
+            "state — but the cut resets the CAMERA ONLY, never the construction progress: every "
+            "envelope element (roof/ceiling, exterior wall or shell, window/glazing, door) that "
+            "an earlier exterior beat sealed or repaired on camera is the SAME physical element "
+            "seen from its other face here and must read as already closed — no sky, clouds, "
+            "distant ridge, horizon, daylight shaft, rain, or snow through it and no hole, gap, "
+            "breach, or missing section in it, only a raw unfinished inner face (bare new "
+            "decking, exposed rafters or ribs, fastener rows, fresh seam lines). The door frame, "
+            "entry opening, and threshold must NOT appear in frame — the "
             "camera faces straight down the interior's long axis, and never restate the exterior "
             "anchors, exterior boundaries, horizon, or sky."
         )
@@ -6006,7 +6259,20 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
             "of wreckage lies exactly where gravity and time dropped it — debris scattered "
             "unevenly, dirt drifted into corners, growth following cracks and moisture; never "
             "swept, never gathered into neat piles, never aligned or set-dressed. The floor must "
-            "NOT read as cleared — that is the very next beat's job, not this one's."
+            "NOT read as cleared — that is the very next beat's job, not this one's. "
+            "SCOPE OF 'UNTOUCHED' (mandatory): the crossing reset the CAMERA, not the "
+            "construction progress. 'Untouched' covers only what no earlier beat worked on — "
+            "the floor, contents, fittings, and any surface still in its found state. Any "
+            "building-envelope element the exterior beats already sealed or repaired on camera "
+            "(roof/ceiling, exterior wall or shell, window/glazing, door) is seen here from its "
+            "OTHER FACE and must read as already CLOSED: no sky, clouds, distant ridge, horizon, "
+            "daylight shaft, rain, or snow may show through it, and it may carry no hole, gap, "
+            "breach, missing section, or collapse. Its inner face is expected to be raw and "
+            "unfinished — bare new decking, exposed rafters or ribs, fastener rows, fresh seam "
+            "lines on the underside of the new material — which is exactly how 'sealed outside, "
+            "not yet finished inside' should read; unfinished never means still open. Source the "
+            "three required decay categories from surfaces earlier beats did NOT touch, never by "
+            "reopening something already closed."
         ) if is_first_interior_reveal else ""
         if family_landmarks:
             _int_names = ", ".join(
@@ -6066,7 +6332,10 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
             "categories), with zero intervention evidence (no tools, ladders, scaffolding, tarps, "
             "work lights, or stacked materials) and nothing swept, piled, or arranged; never a "
             "clean or staged room. This applies ONLY here, not to later interior beats, which "
-            "follow STAGE SCOPE instead.")
+            "follow STAGE SCOPE instead. It also does NOT reset construction progress: any "
+            "envelope element (roof/ceiling, exterior wall or shell, window/glazing) the exterior "
+            "beats already sealed on camera stays closed when seen from inside — raw and "
+            "unfinished on its inner face, but never open to sky, weather, or a distant ridge.")
     if is_post_reveal_cleanup:
         family_contract_lines.append(
             "- Post-crossing cleanout (mandatory, this beat only): this is the FIRST work done "
@@ -6290,6 +6559,7 @@ Write the beats IN ORDER. Each beat's resulting IMAGE must continue directly and
 - REALISM rule (mandatory): strictly documentary photorealism. Every material, fixture, tool, and technique must be real-world and present-day (wood, stone, brass, wool, glass, leather, standard trade tools). NO sci-fi, futuristic, cyberpunk, holographic, glowing-tech-panel, LED-neon, or spacecraft-style elements anywhere in the scene.
 - SINGLE CONTINUOUS PHOTOGRAPH rule (mandatory): each IMAGE is one real photograph of one moment — never a grid of multiple panels, a collage, a storyboard, a comparison/before-after split, or a multi-view composite. The "Grid A1-C3" notation used elsewhere in this contract is an internal composition-registration convention for you the writer — never describe or render literal grid lines, panel borders, or divided frames in the image itself.
 - FULL-ENCLOSURE COVERAGE: When a beat involves framing, insulating, paneling, or painting walls, its IMAGE prompt MUST explicitly include the ceiling/roof/top surface as well. For example, if walls in Grid B1, B3, C1, C3 are paneled, the ceiling curve in Grid A1, A2, A3 must ALSO be described as paneled. Never treat wall coverage as complete without ceiling coverage in any enclosed space (cabin, room, fuselage, container, vault, etc.).
+{ENVELOPE_CROSS_VIEW_RULE}
 - CAMERA VIEWPOINT CONTINUITY: If the previous IMAGE was shot from an interior viewpoint (camera inside the space, entry behind camera), the next IMAGE MUST maintain the same interior viewpoint UNLESS an explicit camera-pullback VIDEO is inserted between them. You CANNOT jump from interior to exterior viewpoint without a transition. If a beat requires switching back to an exterior view, generate its VIDEO as a reverse dolly pulling back through the doorway, and describe the exposure transition accordingly.
 - EXTERIOR WORK VISIBILITY: If a beat involves work on the EXTERIOR surface of the structure (e.g., exterior insulation, exterior membrane), and the camera is positioned INSIDE looking out, the VIDEO must show the worker operating at the boundary edges visible from inside (e.g., working at seam lines visible in Grid B1/B3 from the interior). Do not describe exterior work that would be invisible from the current camera position.
 - ZONE-APPROPRIATE PROTECTIVE LAYERS: only describe waterproofing membrane, tar/bitumen coating, or vapor barrier material on a surface with real moisture/weather exposure (below-grade wall/floor, roof, exterior envelope, bathroom/kitchen/pool). Never describe these on an ordinary dry interior wall, floor, or ceiling — use plain primer/paint finish there instead.
@@ -6570,6 +6840,7 @@ Instructions:
 - REALISM rule (mandatory): strictly documentary photorealism. Every material, fixture, tool, and technique must be real-world and present-day (wood, stone, brass, wool, glass, leather, standard trade tools). NO sci-fi, futuristic, cyberpunk, holographic, glowing-tech-panel, LED-neon, or spacecraft-style elements anywhere in the scene.
 - SINGLE CONTINUOUS PHOTOGRAPH rule (mandatory): each IMAGE is one real photograph of one moment — never a grid of multiple panels, a collage, a storyboard, a comparison/before-after split, or a multi-view composite. The "Grid A1-C3" notation used elsewhere in this contract is an internal composition-registration convention for you the writer — never describe or render literal grid lines, panel borders, or divided frames in the image itself.
 - FULL-ENCLOSURE COVERAGE: When the beat involves framing, insulating, paneling, or painting walls, the IMAGE prompt MUST explicitly include the ceiling/roof/top surface as well. For example, if walls in Grid B1, B3, C1, C3 are paneled, the ceiling curve in Grid A1, A2, A3 must ALSO be described as paneled. Never treat wall coverage as complete without ceiling coverage in any enclosed space (cabin, room, fuselage, container, vault, etc.).
+{ENVELOPE_CROSS_VIEW_RULE}
 - CAMERA VIEWPOINT CONTINUITY: If the previous IMAGE was shot from an interior viewpoint (camera inside the space, entry behind camera), the next IMAGE MUST maintain the same interior viewpoint UNLESS an explicit camera-pullback VIDEO is inserted between them. You CANNOT jump from interior to exterior viewpoint without a transition. If the beat requires switching back to an exterior view, generate the VIDEO as a reverse dolly pulling back through the doorway, and describe the exposure transition accordingly.
 - EXTERIOR WORK VISIBILITY: If the beat involves work on the EXTERIOR surface of the structure (e.g., exterior insulation, exterior membrane), and the camera is positioned INSIDE looking out, the VIDEO must show the worker operating at the boundary edges visible from inside (e.g., working at seam lines visible in Grid B1/B3 from the interior). Do not describe exterior work that would be invisible from the current camera position.
 - ZONE-APPROPRIATE PROTECTIVE LAYERS: only describe waterproofing membrane, tar/bitumen coating, or vapor barrier material on a surface with real moisture/weather exposure (below-grade wall/floor, roof, exterior envelope, bathroom/kitchen/pool). Never describe these on an ordinary dry interior wall, floor, or ceiling — use plain primer/paint finish there instead.
@@ -6724,6 +6995,16 @@ Instructions:
                         print(f"[DIRECT] Beat {i} 首现衰败措辞回炉{'成功，已采用重写稿' if decay_reworked else '未通过，保留原稿（仅留痕）'}")
                     style_errs = style_errs + decay_errs
                     image_reworked = decay_reworked if image_reworked is None else (image_reworked or decay_reworked)
+                envelope_errs = check_envelope_seal_regression(i_p, i, beat_ladder, family=family)
+                if envelope_errs:
+                    if sys.stdout:
+                        print(f"[DIRECT] Beat {i} 包络体状态倒退（已封构件又写成敞开），定向回炉一轮: {envelope_errs}")
+                    i_p, envelope_reworked = rework_envelope_seal_regression_beat(
+                        config, i, i_p, envelope_errs, beat=beat, beat_ladder=beat_ladder)
+                    if sys.stdout:
+                        print(f"[DIRECT] Beat {i} 包络体状态倒退回炉{'成功，已采用重写稿' if envelope_reworked else '未通过，保留原稿（仅留痕）'}")
+                    style_errs = style_errs + envelope_errs
+                    image_reworked = envelope_reworked if image_reworked is None else (image_reworked or envelope_reworked)
                 remaining_milestone_errors = (
                     check_milestone_video_prompt(v_p, beat) + check_milestone_image_prompt(i_p, beat))
                 if remaining_milestone_errors:
@@ -6994,6 +7275,16 @@ Instructions:
                     print(f"[DIRECT] Batch beat {i} 首现衰败措辞回炉{'成功，已采用重写稿' if decay_reworked else '未通过，保留原稿（仅留痕）'}")
                 style_errs = style_errs + decay_errs
                 image_reworked = decay_reworked if image_reworked is None else (image_reworked or decay_reworked)
+            envelope_errs = check_envelope_seal_regression(i_p, i, beat_ladder, family=contract['family'])
+            if envelope_errs:
+                if sys.stdout:
+                    print(f"[DIRECT] Batch beat {i} 包络体状态倒退（已封构件又写成敞开），定向回炉一轮: {envelope_errs}")
+                i_p, envelope_reworked = rework_envelope_seal_regression_beat(
+                    config, i, i_p, envelope_errs, beat=contract['beat'], beat_ladder=beat_ladder)
+                if sys.stdout:
+                    print(f"[DIRECT] Batch beat {i} 包络体状态倒退回炉{'成功，已采用重写稿' if envelope_reworked else '未通过，保留原稿（仅留痕）'}")
+                style_errs = style_errs + envelope_errs
+                image_reworked = envelope_reworked if image_reworked is None else (image_reworked or envelope_reworked)
             remaining_milestone_errors = (
                 check_milestone_video_prompt(v_p, contract['beat'])
                 + check_milestone_image_prompt(i_p, contract['beat']))
@@ -7142,7 +7433,15 @@ def _local_beat_review_system_prompt():
     2026-07-25：拍号从这里整体移进 user turn（规则正文改用 IMAGE A / IMAGE B 这两个
     稳定别名指代"送审的第一张/第二张图"）。此前每一拍都内插自己的编号，11 拍就是
     11 份互不相同的几千 token 系统提示词，prompt 缓存全程零命中；改成常量后整单
-    （乃至跨单）所有逐拍调用共用同一份前缀。规则文本本身一字未改。"""
+    （乃至跨单）所有逐拍调用共用同一份前缀。规则文本本身一字未改。
+
+    2026-07-28：补 DECLARED HARD CUT 豁免。硬切变体的前提就是"过门前看不见任何室内"
+    （见 threshold_variant 的 hard_cut 定义），切点前那张外部帧的门本来就该是封死的；
+    但局部审查只有一条按桥接变体写死的 THRESHOLD PEEK 规则，于是把"拱门处木门完全封闭、
+    无法透过门洞预览室内"当成违规报了出来——纯误杀，还会把定向重写引去给硬切帧硬加
+    peek。现在 peek 规则显式排除 [CUT] 槽，并单列一条硬切规则说明该槽不是片段、
+    过门由文字承载（HARD_CUT_VIDEO_PLACEHOLDER），同时点名硬切只重置机位、不重置施工
+    进度——施工顺序/封套密闭/单调性照查不误。"""
     return f"""You are a strict construction-sequence and physical-causality auditor for a restoration / renovation time-lapse. You are judging ONLY ONE beat of a longer sequence: its VIDEO takes the space from IMAGE A to IMAGE B. You are shown the two actual RENDERED images for this beat only (IMAGE A first, IMAGE B second), alongside the complete IMAGE/VIDEO prompt text set for the whole sequence — use the full text only for context on what earlier/later beats established (e.g. when wiring/exterior/excavation happened), but only report a violation if it is visible IN THESE TWO IMAGES. Judge the real images, not just the prompt text — a prompt can describe the right thing and still have rendered wrong. Do NOT redesign, restyle, re-theme, or otherwise "improve" anything; you are reporting violations, not fixing them.
 
 Most of the rules below will not apply to this specific beat — skip inapplicable ones quickly. Only report a rule as violated if you can point to a CONCRETE visible detail in one of the two images that clearly contradicts it. If a potential issue is subtle, ambiguous, debatable, or you are not confident, do NOT report it — under-reporting is far cheaper than a false accusation here; a second reviewer will independently re-check anything you do report before it counts.
@@ -7155,7 +7454,7 @@ Hard vetoes to check against these two images:
 - No covering wet or uncured material (mortar, concrete, glue, paint) with the next layer before it has cured.
 - No service (wiring / plumbing / waterproofing) installed after the panel that would hide it.
 - ZONE-INAPPROPRIATE WATERPROOFING: flag any waterproofing membrane, tar/bitumen coating, or vapor barrier applied to a surface with no plausible moisture/weather exposure (an ordinary dry interior wall/floor/ceiling in a bedroom, living room, or workshop). Below-grade, roof, exterior envelope, and wet-use rooms (bathroom, kitchen, pool, cellar) are legitimate; anywhere else is a violation.
-- Construction state must be monotonic: cleaned stays clean, installed stays installed, dried stays dried — no regression to an earlier state. EXEMPTION: declared temporary works (scaffolding, formwork, shoring, cribbing, protection sheets, portable work lights) MAY be removed in a beat that explicitly shows the strike/carry-out with removal traces (foot pads, compression marks, patched tie holes); never flag such a declared strike as regression, and never "repair" it away. Undeclared blink-out of temporary plant between anchors IS a violation — add the strike action, do not delete the plant.
+- Construction state must be monotonic: cleaned stays clean, installed stays installed, dried stays dried — no regression to an earlier state. A change of viewpoint is NEVER an excuse for a regression: the roof/ceiling, exterior walls or shell, windows/glazing, doors, and floor/deck slabs are each ONE element with two faces, so if an earlier beat sealed one from the outside, the interior view of it must be closed too — sky, clouds, a distant ridge, rain, or a daylight shaft coming through a roof or wall that was already sealed is a regression, as is a hole, gap, breach, or missing section reappearing in it. Its inner face being raw and unfinished (bare decking, exposed rafters, fastener rows) is correct and NOT a violation. EXEMPTION: declared temporary works (scaffolding, formwork, shoring, cribbing, protection sheets, portable work lights) MAY be removed in a beat that explicitly shows the strike/carry-out with removal traces (foot pads, compression marks, patched tie holes); never flag such a declared strike as regression, and never "repair" it away. Undeclared blink-out of temporary plant between anchors IS a violation — add the strike action, do not delete the plant.
 - PERSISTENT SITE PLANT: scaffolding, formwork, shoring, and cribbing erected in one beat must stay visible in every later IMAGE anchor until their declared strike beat; an anchor showing freshly poured, unset concrete must still show the formwork supporting it.
 - CEILING/ROOF COVERAGE: No enclosed space (room, cabin, fuselage, container, vault) may have walls paneled/insulated/painted while the ceiling/roof is left as raw exposed structure. If walls are covered, the ceiling must also be covered in the same or a subsequent beat. If ceiling coverage is missing, add it to the wall-coverage beat.
 - CEILING-BEFORE-WALL ORDER: when both overhead/ceiling boarding and wall paneling occur in an enclosed space, the ceiling/overhead beat must come BEFORE the wall paneling beat (wall panels support and hide the ceiling-board edges); reorder if the walls close first.
@@ -7181,7 +7480,8 @@ Hard vetoes to check against these two images:
 - PERSPECTIVE ISOLATION: Do not flip camera facing directions (e.g. turning 180 degrees from looking out to looking in) in the same spatial axis without a clean separate phase or TBCP transition.
 - BI-DIRECTIONAL AGENT FLOW: Workers in video prompts must enter from a specific coordinate edge at t=0s and walk out through the same edge by t={WORKER_EXIT_TIME}s, leaving the frame completely empty of active agents at t={int(VIDEO_DURATION)}s. No teleportation or instant popping.
 - RIGID CONTAINER ENCAPSULATION: All loose materials, debris, fasteners, and liquids must be stored and tracked inside rigid, quantifiable containers (e.g. buckets, parts trays, boxes), and their volumes must be described as continuously increasing or decreasing.
-- THRESHOLD PEEK ANCHOR QUALIFICATION & SCALE (only applies if this beat is the threshold/bridge crossing beat): the two interior landmarks pre-visualized through the doorway before a threshold bridge must plausibly ALREADY EXIST at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. NEVER future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures). Each peeked anchor's declared frame-height scale must strictly INCREASE from the exterior peek IMAGE to the interior-settled IMAGE; a constant scale across the crossing is a violation — fix the scales, keep the objects.
+- THRESHOLD PEEK ANCHOR QUALIFICATION & SCALE (only applies if this beat is the threshold/bridge crossing beat AND its VIDEO slot is NOT tagged [CUT]): the two interior landmarks pre-visualized through the doorway before a threshold bridge must plausibly ALREADY EXIST at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. NEVER future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures). Each peeked anchor's declared frame-height scale must strictly INCREASE from the exterior peek IMAGE to the interior-settled IMAGE; a constant scale across the crossing is a violation — fix the scales, keep the objects.
+- DECLARED HARD CUT SLOT (only applies if this beat's VIDEO slot is tagged [CUT]): this crossing is a sanctioned hard cut, and its whole premise is that NOTHING of the interior is visible before crossing. A shut door, closed hatch, sealed shell, or pitch-black opening in the exterior IMAGE is the REQUIRED state here — never report it as a missing interior peek, an unopened/unfinished entry, a blocked crossing, or a reason the next frame cannot be interior. There is no peek, no anchor scale-up, and no on-camera door-opening action to look for in these two images; the slot's own text carries the crossing in words (the entry is opened and the camera moves inside). That slot is also a placeholder declaration, not a filmed clip, so never judge it against the clip rules (single milestone package, dual progress, worker entry/exit and agent flow, kinetic climax motion) and never report it as a static, actionless, or missing VIDEO. What still applies across a hard cut: construction order, envelope-seal continuity, and state monotonicity — the cut resets the camera only, so anything an earlier exterior beat sealed or repaired must read as still sealed and repaired on its inner face in the interior first frame.
 - BRIDGE WHITE-BALANCE DIRECTION (only applies if this beat is the threshold/bridge crossing beat): the single threshold/bridge beat's merged crossing clip VIDEO prose must describe ONE consistent, gradual colour-temperature direction across its full arc, attributed to the same light source throughout. A mid-clip reversal is a violation.
 - DOOR-FRAME CLEARANCE (only applies if IMAGE A or IMAGE B is a post-crossing interior frame): the rendered frame must be FULLY INSIDE the space — no door frame, door jamb, door leaf, threshold/sill edge, or entry-opening silhouette may remain visible anywhere in frame, and the interior walls/ceiling/floor must fill the frame edge to edge.
 - INTERIOR OCCUPANCY: post-crossing interior frames must be dominated by the interior space itself — walls, ceiling, and floor reaching the frame edges — never a small bright interior rectangle surrounded by exterior or dark margins.
@@ -7212,6 +7512,7 @@ Check only these cross-frame rules:
 - Ghost Clause: Occluded landmarks must be preserved (not silently dropped) once established, even while hidden behind another object.
 - CARRIER IDENTITY: post-crossing interior frames must still read as the inside of THIS specific carrier — its fixed identity features (e.g. a bus's side window band, ribbed roof curve, wheel arches; a boat's rib frames and portholes) stay visible unless a declared beat explicitly covers or removes them on camera. An interior that has degraded into a generic room/box with no carrier-specific feature visible is a violation.
 - NO INVENTED OPENINGS: interior frames must not grow windows, skylights, doors, or other openings that the carrier does not physically have and that no earlier beat installed on camera; the interior's light must come from the carrier's own established openings, an installed practical light, or entry daylight from behind the camera.
+- ENVELOPE SEAL PERSISTENCE (cross-view, cross-frame): the roof/ceiling, exterior walls or shell, windows/glazing, doors, and floor/deck slabs are each ONE physical element with an outside face and an inside face. Once ANY earlier frame shows such an element sealed, re-clad, glazed, or completed, every later frame — including ones shot from the opposite side, after a threshold crossing or a hard cut — must still show it closed. Sky, clouds, a distant ridge, treetops, rain, snow, or a daylight shaft coming through a roof or wall that an earlier frame already sealed is a violation, and so is a hole, gap, breach, missing section, or collapse reappearing in it. A raw, unfinished INNER face (bare decking, exposed rafters or ribs, fastener rows, unpainted new material) is correct and is NOT a violation — only reopening is. Report it against the beat index where the sealed element first appears open again, naming both the frame that sealed it and the frame that reopened it.
 
 Respond with STRICT JSON only, no markdown fences, mapping each beat index (as a stringified integer, 1-based, matching the VIDEO N / IMAGE N+1 pair where the drift becomes visible) to a list of short Chinese violation descriptions, each naming the concrete visible detail that grounds it. Only include beats that have at least one real violation — if the whole sequence is clean, respond with exactly {{}}. Example:
 {{"5": ["载体身份丢失：IMAGE 6 起室内不再可见船体肋骨结构，退化成普通房间"]}}"""
@@ -7669,12 +7970,25 @@ def frame_review_status(sequences, review_result):
     return out
 
 
-def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, family=None):
+def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, family=None,
+                                  video_meta=''):
     """整套序列审查标记某一拍有问题后，定向重写该拍的 VIDEO/IMAGE 提示词。issues 是
     check_full_sequence_consistency 给出的该拍中文违规描述列表。失败时原样返回输入，
-    调用方据此判断本轮是否有实际改动（未变化就不用重渲）。"""
+    调用方据此判断本轮是否有实际改动（未变化就不用重渲）。
+
+    video_meta：该拍 VIDEO 槽的 meta 标签。声明式硬切槽（[CUT]）的正文是确定性占位
+    声明（HARD_CUT_VIDEO_PLACEHOLDER），不是可改写的镜头描述——放给改写 LLM 只会把
+    "不生成片段 + 门开后进入内部空间"这段声明改成一条真镜头描述，而该槽根本不送 i2v。
+    这一拍只改 IMAGE，VIDEO 原样保留。"""
     if not issues:
         return video_prompt, image_prompt
+    _meta = str(video_meta or '').upper()
+    _is_cut_slot = 'CUT' in _meta and 'BRIDGE' not in _meta
+    _cut_note = (
+        " NOTE: this beat's VIDEO slot is a DECLARED HARD CUT placeholder — no clip is "
+        "generated for it and the crossing is carried in words there. Return its text "
+        "character-for-character unchanged and fix the IMAGE prompt only."
+        if _is_cut_slot else "")
     system_prompt = (
         "You are an expert prompt engineering assistant fixing a construction-sequence "
         "time-lapse VIDEO+IMAGE prompt pair based on violations found by reviewing the "
@@ -7683,8 +7997,8 @@ def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, fa
         "and a list of specific violations (in Chinese) found in this beat. Rewrite "
         "ONLY what is necessary to fix those violations — keep everything else "
         "(camera DNA, landmark restatements, style, structure) character-for-character "
-        "identical. Output STRICT JSON only, no markdown fences, exactly this shape: "
-        '{"video": "...", "image": "..."}'
+        "identical." + _cut_note + " Output STRICT JSON only, no markdown fences, exactly "
+        'this shape: {"video": "...", "image": "..."}'
     )
     user_prompt = (
         f"Current VIDEO prompt:\n{video_prompt}\n\n"
@@ -7699,6 +8013,9 @@ def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, fa
         new_image = str(data.get('image') or '').strip()
         if not new_video or not new_image:
             return video_prompt, image_prompt
+        # 提示词里已经关照过了，但这是确定性兜底：硬切槽的正文不接受任何改写。
+        if _is_cut_slot:
+            new_video = video_prompt
         # 收尾走一遍与其它改写路径同款的确定性修复
         new_image = clean_prompt_text(new_image)
         new_image = fix_image_clean_frame_proactive(new_image)

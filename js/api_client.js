@@ -286,8 +286,10 @@ function renderVideoSlotDone(idx, video) {
 
 // busy=true：该创意的视频序列任务仍在跑（批量重试里其它槽位还没处理完）——
 // 这个刚失败的槽位重新画出来的按钮也要保持禁用，否则用户点了又是一次
-// "已在生成中" 的错误提示。
-function renderVideoSlotFailed(idx, message, labelText = '生成失败', busy = false) {
+// "已在生成中" 的错误提示。不传就按任务登记现算（同 renderVideoSlotDone），
+// 免得各调用点各自记得传。
+function renderVideoSlotFailed(idx, message, labelText = '生成失败', busy) {
+    if (busy === undefined) busy = isIdeaTaskActive(currentIdea && currentIdea.id, 'videos');
     const st = videoSlotState({ slot: idx, status: 'failed', error: message }, { seq: idx, busy });
     st.statusText = labelText;
     st.title = message || labelText;
@@ -866,19 +868,57 @@ function initLocalServiceLogs() {
 }
 
 
-// 帧序列渲染有串行锁（同一创意同时只能有一个帧任务在跑），点击某帧的
-// 「生成/重试」后立即把网格里其余按钮禁用，别等下一次事件驱动的整格重渲
+// 帧/视频序列渲染都有串行锁（同一创意同时只能有一个同类任务在跑），点击某个
+// 槽位的「生成/重试」后立即把网格里其余按钮禁用，别等下一次事件驱动的整格重渲
 // 才生效——否则用户依次连续点击时，第一下之后的每一下都会先命中
 // isIdeaTaskActive 的错误提示（2026-07-21 实机复现）。
-function setFrameGridButtonsBusy(busy) {
-    // 网格上的 .is-busy 是"当前忙态"的单一真相：期间被重画的卡片（例如图加载
-    // 失败就地降级成占位卡）据此把自己的按钮也画成禁用态，见 slotGridIsBusy。
-    const grid = slotRenderTarget('image');
-    if (grid) grid.classList.toggle('is-busy', !!busy);
-    document.querySelectorAll('#frames-grid .retry-frame-btn, #frames-grid .fix-frame-btn, #frames-grid .describe-frame-btn, #frames-grid .upload-frame-btn, #frames-grid .delete-slot-btn').forEach(btn => {
-        btn.disabled = busy;
-        btn.title = busy ? '该创意的帧序列正在生成/重试中，请稍候' : '';
+const SLOT_BUSY_TIP = {
+    image: '该创意的帧序列正在生成/重试中，请稍候',
+    video: '该创意的视频序列正在生成/重试中，请稍候',
+};
+
+/**
+ * 把某一类槽位网格上的操作按钮整体切成禁用/可用态。
+ *
+ * 此前"标记忙态"和"找按钮"用的是两套口径：class 标在 slotRenderTarget()（合并
+ * 视图下是 #beats-grid），按钮却按 #frames-grid / #videos-grid 硬选。合并视图下
+ * 这一条选不中任何按钮，于是**解禁整个是空操作**——任务跑完、任务登记也清了，
+ * 网格却永远停在禁用态，hover 上去还写着"正在生成/重试中，请稍候"
+ * （2026-07-28 实机截图：一致性审查跑完后整格帧按钮全点不动）。
+ *
+ * 现在：忙态 class 恒定标在该类自己的网格上（slotGridIsBusy 读的就是它），
+ * 按钮去卡片真正所在的容器里按 data-type 找——两种视图下都成立，也不会在合并
+ * 视图下顺手把另一类的按钮一起禁掉。
+ */
+function setSlotGridButtonsBusy(type, busy) {
+    const kind = type === 'video' ? 'video' : 'image';
+    const flagGrid = document.getElementById(kind === 'video' ? 'videos-grid' : 'frames-grid');
+    if (flagGrid) flagGrid.classList.toggle('is-busy', !!busy);
+    const host = slotRenderTarget(kind);
+    if (!host) return;
+    host.querySelectorAll(`.slot-card[data-type="${kind}"] .slot-action-btn`).forEach(btn => {
+        btn.disabled = !!busy;
+        // 解禁时把"不忙时该说什么"还回去（renderSlotCard 写在 data-idle-title 上），
+        // 而不是一律置空
+        btn.title = busy ? SLOT_BUSY_TIP[kind] : (btn.dataset.idleTitle || '');
     });
+}
+
+function setFrameGridButtonsBusy(busy) {
+    setSlotGridButtonsBusy('image', busy);
+}
+
+/**
+ * 任务收尾时用它取代 setXxxGridButtonsBusy(false)：忙态是画在**跨创意共用的
+ * DOM** 上的，不能按"发起任务的那个创意"来清——用户切到别的创意再切回来，
+ * 或任务结束时人已经不在这一页，都会把禁用态永久留在网格上。这里按"此刻正看着
+ * 的创意还有没有同类任务在跑"现算一遍，切没切走都安全。
+ */
+function refreshSlotGridBusy(type) {
+    const kind = type === 'video' ? 'video' : 'image';
+    const taskType = kind === 'video' ? 'videos' : 'frames';
+    setSlotGridButtonsBusy(kind,
+        !!(currentIdea && isIdeaTaskActive(currentIdea.id, taskType)));
 }
 
 // 由各帧卡片的「上传」按钮调用：记下目标帧号，触发共用的隐藏文件选择器
@@ -1013,9 +1053,10 @@ async function retrySingleFrame(seq) {
         if (!disconnected) {
             endIdeaTask(ownerIdea.id, 'frames');
         }
+        // 忙态按"当前正看着的创意此刻还有没有帧任务"现算，不受失联/切走影响
+        refreshSlotGridBusy('image');
         if (isViewingIdea(ownerIdea.id) && !disconnected) {
             progress.style.display = 'none';
-            setFrameGridButtonsBusy(false);
             // 清掉任务登记后再重渲一次：renderFramesForIdea 的 isFramePending 读的
             // 就是这条登记，上面 catch/成功分支那次重渲发生在登记还在的时候，没出图
             // 的槽位会继续画成「等待中」转圈——取消/失败后界面看起来还在跑。
@@ -1239,9 +1280,9 @@ async function fixFrameIssue(seq, manualReason) {
         if (!disconnected) {
             endIdeaTask(ownerIdea.id, 'frames');
         }
+        refreshSlotGridBusy('image');
         if (isViewingIdea(ownerIdea.id) && !disconnected) {
             progress.style.display = 'none';
-            setFrameGridButtonsBusy(false);
             // 清掉任务登记后再重渲一次：renderFramesForIdea 的 isFramePending 读的
             // 就是这条登记，上面 catch/成功分支那次重渲发生在登记还在的时候，没出图
             // 的槽位会继续画成「等待中」转圈——取消/失败后界面看起来还在跑。
@@ -1387,9 +1428,14 @@ async function runSequenceReview() {
         if (!disconnected) {
             endIdeaTask(ownerIdea.id, 'frames');
         }
+        refreshSlotGridBusy('image');
         if (isViewingIdea(ownerIdea.id) && !disconnected) {
             progress.style.display = 'none';
-            setFrameGridButtonsBusy(false);
+            // 与重试/修复两条路径同款收尾：审查过程中那次重渲（上面拉完 manifest 那句）
+            // 发生在任务登记还在的时候，画出来的是一整格禁用按钮；不在清掉登记之后
+            // 再重渲一次，审查跑完的网格就一直点不动——hover 上去还写着"正在生成/
+            // 重试中，请稍候"，而实际上什么都没在跑（2026-07-28 实机截图）。
+            renderFramesForIdea(ownerIdea);
         }
         if (reviewBtn) reviewBtn.disabled = false;
     }
@@ -1398,12 +1444,7 @@ async function runSequenceReview() {
 // 与 setFrameGridButtonsBusy 同理：视频序列同一创意同时只能有一个任务在跑，
 // 点击「重试」后立即禁用网格里其余按钮，不等下一次事件驱动的重渲。
 function setVideoGridButtonsBusy(busy) {
-    const grid = slotRenderTarget('video');
-    if (grid) grid.classList.toggle('is-busy', !!busy);
-    document.querySelectorAll('#videos-grid .retry-video-btn, #videos-grid .delete-slot-btn').forEach(btn => {
-        btn.disabled = busy;
-        btn.title = busy ? '该创意的视频序列正在生成/重试中，请稍候' : '';
-    });
+    setSlotGridButtonsBusy('video', busy);
 }
 
 // 一致性审查确认风险后放行：提交视频生成/重试请求前，检查涉及的锚点帧是否带
@@ -1537,21 +1578,21 @@ async function retrySingleVideo(slot) {
     } finally {
         if (!disconnected) {
             endIdeaTask(ownerIdea.id, 'videos');
-            if (isViewingIdea(ownerIdea.id)) {
-                progress.style.display = 'none';
-                setVideoGridButtonsBusy(false);
-            }
+        }
+        // 清掉登记之后再解一次忙态：成功分支那次重渲发生在登记还在的时候，画出来
+        // 的是一整格禁用按钮，不解就一直点不动。这里不整格重渲——本次只有被重试的
+        // 那一格画过转圈，成功/失败两条路都已各自把它落定，重渲只会把失败原因洗掉。
+        refreshSlotGridBusy('video');
+        if (!disconnected && isViewingIdea(ownerIdea.id)) {
+            progress.style.display = 'none';
         }
     }
 }
 
-// 与 setVideoGridButtonsBusy 同理，管的是每张卡片上的「上传」按钮。
-function setVideoUploadButtonsBusy(busy) {
-    document.querySelectorAll('#videos-grid .upload-video-btn').forEach(btn => {
-        btn.disabled = busy;
-        btn.title = busy ? '该创意的视频序列正在生成/重试中，请稍候' : '手动上传本地视频文件覆盖此槽位';
-    });
-}
+// setVideoUploadButtonsBusy 已并入 setSlotGridButtonsBusy：忙态一次覆盖卡片上
+// 全部操作按钮。此前「上传」要靠单独一个函数补禁用，而收尾只调了
+// setVideoGridButtonsBusy(false)——重试期间被重渲过的卡片，上传键就一直停在
+// 禁用态（与帧网格那次事故同一类漏网）。
 
 // 由各视频槽位卡片的「上传」按钮调用：记下目标槽位，触发共用的隐藏文件选择器
 // （见 index.html #video-upload-input 与 app.js 里的 change 监听）。
@@ -1595,10 +1636,13 @@ function _slotScopeFlags(scope) {
 
 function _setSlotScopeBusy(scope, busy) {
     const t = _slotScopeFlags(scope);
-    if (t.frames) setFrameGridButtonsBusy(busy);
+    // 解除时按"此刻正看着的创意有没有同类任务在跑"现算：改动可能在用户切走之后
+    // 才落地，硬写 false 会把别的创意正在跑的任务的禁用态一起抹掉。
+    if (t.frames) {
+        if (busy) setFrameGridButtonsBusy(true); else refreshSlotGridBusy('image');
+    }
     if (t.videos) {
-        setVideoGridButtonsBusy(busy);
-        setVideoUploadButtonsBusy(busy);
+        if (busy) setVideoGridButtonsBusy(true); else refreshSlotGridBusy('video');
     }
 }
 
@@ -1706,7 +1750,10 @@ async function mutateSlot(opts) {
         return false;
     } finally {
         if (guard) endSlotMutation();
-        if (isViewingIdea(ownerIdea.id)) _setSlotScopeBusy(busyScope, false);
+        // 不能因为"用户已经切走"就不收拾忙态：网格是跨创意共用的那几个 DOM 节点，
+        // 留下的禁用态会原样罩在下一个创意的卡片上。_setSlotScopeBusy 解除时按
+        // 当前创意的任务登记现算，切没切走都安全。
+        _setSlotScopeBusy(busyScope, false);
     }
 }
 
@@ -2338,10 +2385,14 @@ async function retryMissingVideos(slots) {
     } finally {
         if (!disconnected) {
             endIdeaTask(ownerIdea.id, 'videos');
-            if (isViewingIdea(ownerIdea.id)) {
-                progress.style.display = 'none';
-                setVideoGridButtonsBusy(false);
-            }
+        }
+        refreshSlotGridBusy('video');
+        if (!disconnected && isViewingIdea(ownerIdea.id)) {
+            progress.style.display = 'none';
+            // 与 streamFramesProgress 同款收尾：这里一次画了多格「重试中…」，失败
+            // 分支并不会逐格把它们落定；不在清掉登记之后重渲一次，那些格子就会一直
+            // 转圈（看起来像"任务还在跑"），按钮也停在禁用态。
+            renderVideosForIdea(ownerIdea);
         }
     }
 }

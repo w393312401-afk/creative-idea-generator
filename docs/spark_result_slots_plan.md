@@ -115,6 +115,14 @@ grid.addEventListener('click', (e) => {
 **结构上不可能再出现"摘掉 disabled 却没补绑监听"**。`setFrameGridButtonsBusy` /
 `setVideoGridButtonsBusy` 简化为在 grid 上切一个 `.is-busy` class + 批量写 `disabled`。
 
+> 2026-07-28 补：两者已收成一个 `setSlotGridButtonsBusy(type, busy)`。忙态 class 恒定
+> 标在该类自己的网格上（`slotGridIsBusy` 读的就是它），按钮则去卡片**真正所在的容器**
+> （合并视图下是 `#beats-grid`）按 `data-type` 找。此前两处口径分裂：class 走
+> `slotRenderTarget()`、按钮按 `#frames-grid` 硬选，合并视图下"解禁"选不中任何按钮，
+> 任务跑完网格永远停在禁用态。任务收尾一律改调 `refreshSlotGridBusy(type)`——忙不忙按
+> "当前正看着的创意此刻还有没有同类任务在跑"现算，网格 DOM 是跨创意共用的，不能由
+> 调用方硬写 `false`。
+
 ### C. 行内样式清零
 
 `.slot-*` 全部进 `css/app/skill-output.css`，JS 只写 class 与 `data-*`。

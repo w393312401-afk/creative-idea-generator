@@ -903,8 +903,15 @@ function setupEventListeners() {
     const closeSettings = document.getElementById('settings-modal').querySelector('.close-btn');
     const settingsModal = document.getElementById('settings-modal');
     
+    // 配置中心的分区导航 + 改动即存的委托绑定（见 js/config.js）
+    if (typeof initSettingsCenter === 'function') initSettingsCenter();
+
     openSettings.addEventListener('click', () => {
         settingsModal.classList.add('active');
+        // 回到上次停留的分区；进「生成号池」时顺带重读池子
+        if (typeof switchSettingsSection === 'function') {
+            switchSettingsSection(localStorage.getItem('spark_settings_section') || 'backend');
+        }
         updateCacheSizeInfo();
     });
     closeSettings.addEventListener('click', () => settingsModal.classList.remove('active'));
@@ -2692,6 +2699,8 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
             // 才有机会重新接上这条任务的事件流，而不是让它在客户端彻底失踪。
             if (!disconnectedFrames) {
                 endIdeaTask(ownerId, 'frames');
+                // 忙态画在跨创意共用的网格 DOM 上，按当前正看着的创意现算一遍
+                if (typeof refreshSlotGridBusy === 'function') refreshSlotGridBusy('image');
                 if (isViewing()) {
                     progress.style.display = 'none';
                     btn.disabled = false;
@@ -2886,9 +2895,14 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
             // 失联分支保留任务登记，供下次刷新页面重新接上事件流。
             if (!disconnectedVideos) {
                 endIdeaTask(ownerId, 'videos');
+                if (typeof refreshSlotGridBusy === 'function') refreshSlotGridBusy('video');
                 if (isViewing()) {
                     progress.style.display = 'none';
                     btn.disabled = false;
+                    // 与 streamFramesProgress 同款收尾：必须在 endIdeaTask 之后再重渲
+                    // 一次——上面成功/失败分支那次重渲发生在登记还在的时候，没轮到的
+                    // 槽位会继续画成「等待中」转圈、卡片按钮也停在禁用态。
+                    renderVideosForIdea(ownerIdea);
                 }
             }
         }

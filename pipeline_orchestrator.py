@@ -907,7 +907,7 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
         video_body = video_item['body'] if isinstance(video_item, dict) else video_item
         video_meta = video_item.get('meta', '') if isinstance(video_item, dict) else ''
         new_video_body, new_image_body = fix_beat_from_sequence_review(
-            config, video_body, image_body, issues)
+            config, video_body, image_body, issues, video_meta=video_meta)
         if new_video_body != video_body:
             videos[video_beat] = {'body': new_video_body, 'meta': video_meta}
     else:

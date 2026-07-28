@@ -123,7 +123,12 @@ function renderSlotCard(cardEl, state) {
 
     (state.actions || []).forEach(a => {
         const el = cardEl.querySelector(`.slot-action-btn[data-act="${a.act}"]`);
-        if (el && a.title) el.title = a.title;
+        if (!el) return;
+        if (a.title) el.title = a.title;
+        // 网格级的忙态开关（setSlotGridButtonsBusy）不重新推导状态、只改 disabled
+        // 与 title，解禁时要有地方把"不忙时该说什么"读回来——否则跑完一轮之后
+        // 每枚按钮的悬浮说明都变成空的。
+        el.dataset.idleTitle = a.idleTitle || '';
     });
 
     if (state.kind === 'ready') {

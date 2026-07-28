@@ -69,6 +69,22 @@ class TestSequenceReviewSystemPromptMilestones(unittest.TestCase):
         self.assertIn('CONCRETE visible detail', prompt)
         self.assertIn('do NOT report it', prompt)
 
+    def test_hard_cut_slot_is_exempt_from_the_threshold_peek_rule(self):
+        """2026-07-28 误杀回归：硬切变体的前提就是过门前看不见室内，切点前那张外部帧的
+        门本该封死；局部审查此前只有一条按桥接变体写死的 peek 规则，把「拱门处木门完全
+        封闭、无法透过门洞预览室内」报成了违规。"""
+        prompt = pp._local_beat_review_system_prompt()
+        peek_rule = next(line for line in prompt.splitlines()
+                         if line.startswith('- THRESHOLD PEEK ANCHOR QUALIFICATION'))
+        self.assertIn('NOT tagged [CUT]', peek_rule)
+
+        cut_rule = next(line for line in prompt.splitlines()
+                        if line.startswith('- DECLARED HARD CUT SLOT'))
+        self.assertIn('REQUIRED state', cut_rule)
+        self.assertIn('never report it as a missing interior peek', cut_rule)
+        # 硬切只重置机位，不重置施工进度——封套密闭/施工顺序照查
+        self.assertIn('resets the camera only', cut_rule)
+
     def test_global_prompt_only_has_cross_frame_rules(self):
         prompt = pp._global_review_system_prompt(10)
         self.assertIn('NGCS coordinate lock', prompt)
@@ -530,6 +546,28 @@ class TestFixBeatFromSequenceReview(unittest.TestCase):
         self.assertEqual(v, 'new video body')
         self.assertEqual(i, 'new image body')
 
+    def test_hard_cut_slot_video_body_is_never_rewritten(self):
+        """硬切槽的正文是确定性占位声明（不送 i2v），改写 LLM 只会把它写成一条真镜头
+        描述。IMAGE 照常修，VIDEO 原样保留。"""
+        raw = json.dumps({'video': 'a sweeping dolly through the doorway', 'image': 'new image body'})
+        with patch.object(pp, '_chat', return_value=raw), \
+             patch.object(pp, 'clean_prompt_text', side_effect=lambda s: s), \
+             patch.object(pp, 'fix_image_clean_frame_proactive', side_effect=lambda s: s):
+            v, i = pp.fix_beat_from_sequence_review(
+                {}, pp.HARD_CUT_VIDEO_PLACEHOLDER, 'old image', ['木门封闭'], video_meta='CUT')
+        self.assertEqual(v, pp.HARD_CUT_VIDEO_PLACEHOLDER)
+        self.assertEqual(i, 'new image body')
+
+    def test_bridge_slot_video_body_stays_rewritable(self):
+        """单一过门拍的 VIDEO 是真实可见片段，不受硬切豁免影响，照常可改写。"""
+        raw = json.dumps({'video': 'new video body', 'image': 'new image body'})
+        with patch.object(pp, '_chat', return_value=raw), \
+             patch.object(pp, 'clean_prompt_text', side_effect=lambda s: s), \
+             patch.object(pp, 'fix_image_clean_frame_proactive', side_effect=lambda s: s):
+            v, _ = pp.fix_beat_from_sequence_review(
+                {}, 'old video', 'old image', ['issue'], video_meta='BRIDGE TURN')
+        self.assertEqual(v, 'new video body')
+
     def test_malformed_response_returns_inputs_unchanged(self):
         with patch.object(pp, '_chat', return_value='not json'):
             v, i = pp.fix_beat_from_sequence_review({}, 'old video', 'old image', ['issue'])
@@ -930,7 +968,8 @@ class TestFixFrameIssue(_TmpProjectCase):
              patch.object(po, 'generate_frame_sequence', side_effect=fake_render):
             result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
 
-        mock_fix.assert_called_once_with({}, 'video one', 'second frame', ['天花板未随墙面一起封板'])
+        mock_fix.assert_called_once_with({}, 'video one', 'second frame', ['天花板未随墙面一起封板'],
+                                         video_meta='')
         self.assertEqual(render_calls, [[2]])  # 只重渲第 2 帧，图生图链式编辑
         self.assertIn('fixed image 2', result['prompt_block'])
         self.assertIn('fixed video 1', result['prompt_block'])
@@ -1343,7 +1382,8 @@ class TestManualFrameIssue(_TmpProjectCase):
              patch.object(po, 'generate_frame_sequence'):
             result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
 
-        mock_fix.assert_called_once_with({}, 'video one', 'second frame', ['塔吊凭空消失了'])
+        mock_fix.assert_called_once_with({}, 'video one', 'second frame', ['塔吊凭空消失了'],
+                                         video_meta='')
         self.assertEqual(result['reason'], '塔吊凭空消失了')
         # 修完清掉描述，否则帧网格会一直显示「人工标记」看着像没修
         stored = [f for f in self._read_manifest()['frames'] if f['sequence'] == 2][0]
@@ -1366,7 +1406,8 @@ class TestManualFrameIssue(_TmpProjectCase):
 
         # 人工描述排在机器判定前面，两份都交给改写
         mock_fix.assert_called_once_with({}, 'video one', 'second frame',
-                                         ['塔吊凭空消失了', '天花板未随墙面一起封板'])
+                                         ['塔吊凭空消失了', '天花板未随墙面一起封板'],
+                                         video_meta='')
         self.assertEqual(result['reason'], '塔吊凭空消失了；天花板未随墙面一起封板')
 
     def test_fix_accepts_manual_reason_argument_and_persists_it_first(self):

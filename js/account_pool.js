@@ -529,24 +529,21 @@ async function populateFxBrowserIdSelect(knownAccounts) {
     select.value = desired;
 }
 
-async function openAccountPoolManageModal() {
-    const modal = document.getElementById('account-pool-manage-modal');
+// 号池不再有自己的弹窗（原 #account-pool-manage-modal 已并入 API 配置中心的
+// 「生成号池」分区）：这里只负责打开配置中心并切到那个分区，池子数据由
+// switchSettingsSection('pool') 顺带刷新。留给其它入口（快捷键/别处按钮）调用。
+function openAccountPoolManageModal() {
+    const modal = document.getElementById('settings-modal');
     if (!modal) return;
-    modal.classList.add('active');
-    await loadAccountPool();
-    await loadAccountPoolAdspowerProfiles();
-}
-
-function closeAccountPoolManageModal() {
-    const modal = document.getElementById('account-pool-manage-modal');
-    if (modal) modal.classList.remove('active');
+    if (!modal.classList.contains('active')) {
+        const openBtn = document.getElementById('open-settings-btn');
+        if (openBtn) openBtn.click();
+        else modal.classList.add('active');
+    }
+    if (typeof switchSettingsSection === 'function') switchSettingsSection('pool');
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    const openBtn = document.getElementById('account-pool-manage-open-btn');
-    if (openBtn) openBtn.addEventListener('click', openAccountPoolManageModal);
-    const closeBtn = document.getElementById('account-pool-manage-close-btn');
-    if (closeBtn) closeBtn.addEventListener('click', closeAccountPoolManageModal);
     const addBtn = document.getElementById('account-pool-add-btn');
     if (addBtn) addBtn.addEventListener('click', addAccountPoolAccount);
     const importAllBtn = document.getElementById('account-pool-import-all-btn');

@@ -120,6 +120,29 @@ class TestImageSpaceFamily(unittest.TestCase):
         self.assertEqual(image_space_family(videos, 6), 'interior')
 
 
+class TestHardCutPlaceholderText(unittest.TestCase):
+    """剪辑上允许硬切，但物理推进要由占位声明的文字稳住：门被推开、镜头进入内部空间。
+    切点前那张外部帧的门保持封闭是硬切变体的既定状态，不是缺陷（2026-07-28）。"""
+
+    def test_placeholder_still_declares_no_clip(self):
+        self.assertIn('DECLARED HARD CUT', HARD_CUT_VIDEO_PLACEHOLDER)
+        self.assertIn('no video clip is generated', HARD_CUT_VIDEO_PLACEHOLDER)
+
+    def test_placeholder_carries_the_physical_crossing_in_words(self):
+        body = HARD_CUT_VIDEO_PLACEHOLDER.lower()
+        self.assertIn('pushed open', body)
+        self.assertIn('into the interior space', body)
+        self.assertIn('rather than a teleport', body)
+
+    def test_placeholder_states_the_sealed_entry_is_by_design(self):
+        body = HARD_CUT_VIDEO_PLACEHOLDER.lower()
+        self.assertIn('closed', body)
+        self.assertIn('never a defect', body)
+
+    def test_placeholder_does_not_reset_construction_progress(self):
+        self.assertIn('does not reset across the cut', HARD_CUT_VIDEO_PLACEHOLDER)
+
+
 class TestFamilyAnchorSeq(unittest.TestCase):
     def test_cut_counts_as_family_boundary(self):
         videos = {3: {'body': 'v', 'meta': ''}, 4: {'body': 'v', 'meta': 'CUT'},

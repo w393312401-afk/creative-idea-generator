@@ -114,6 +114,19 @@ assert.ok(busy.actions.every(a => a.disabled));
 assert.ok(idle.actions.every(a => !a.disabled));
 assert.ok(busy.actions.every(a => a.title.includes('请稍候')));
 
+// 忙态下也要留着"不忙时该说什么"：网格解禁（setSlotGridButtonsBusy）不重新推导
+// 状态、只改 disabled 与 title，没有 idleTitle 就只能把提示一律置空——跑完一轮
+// 之后每枚按钮的悬浮说明就永久消失了。
+assert.deepStrictEqual(busy.actions.map(a => a.idleTitle), idle.actions.map(a => a.title),
+    'busy 与 idle 的 idleTitle 必须是同一份说明');
+assert.ok(busy.actions.find(a => a.act === 'fix-frame').idleTitle.includes('图生图重渲'));
+assert.ok(idle.actions.every(a => a.idleTitle === a.title), '不忙时 title 就是 idleTitle');
+
+const busyVideo = videoSlotState({ slot: 3, url: '/o/vid_003.mp4' }, { seq: 3, busy: true });
+assert.ok(busyVideo.actions.every(a => a.disabled && a.title.includes('请稍候')));
+assert.strictEqual(busyVideo.actions.find(a => a.act === 'upload-video').idleTitle,
+    '手动上传本地视频文件覆盖此槽位');
+
 // ── 视频槽位 ────────────────────────────────────────────────────────
 assert.strictEqual(videoSlotLabel(3, false), 'VID 003 (IMG 003 ➔ IMG 004)');
 assert.strictEqual(videoSlotLabel(11, true), 'VID 011 (英雄展示 · 完工全景)');

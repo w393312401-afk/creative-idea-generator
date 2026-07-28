@@ -402,17 +402,23 @@ function loadConfig() {
     syncIdeationLlmPicker();
 }
 
+// 显隐一律用空串还原（而不是写死 'block'）：配置中心的字段行是 CSS grid
+// （.settings-field），内联 display:block 会把 label/控件/说明拍回竖排。
 function updateFxImageModelVisibility() {
     const backendSelect = document.getElementById('settings-image-backend');
     const fxImageGroup = document.getElementById('fx-image-model-group');
     const fxVideoGroup = document.getElementById('fx-video-model-group');
     const fxAccountSwitchGroup = document.getElementById('fx-account-switch-group');
     const fxBrowserIdGroup = document.getElementById('fx-browser-id-group');
+    // 号池分区里包着上面两项的折叠块：两项都藏起来时它自己也得藏，
+    // 不然号池顶上会剩一条点开是空的「选号策略」
+    const fxPoolStrategyGroup = document.getElementById('fx-pool-strategy-group');
     const showFx = backendSelect && backendSelect.value === 'google_fx';
-    if (fxImageGroup) fxImageGroup.style.display = showFx ? 'block' : 'none';
-    if (fxVideoGroup) fxVideoGroup.style.display = showFx ? 'block' : 'none';
-    if (fxAccountSwitchGroup) fxAccountSwitchGroup.style.display = showFx ? 'block' : 'none';
-    if (fxBrowserIdGroup) fxBrowserIdGroup.style.display = showFx ? 'block' : 'none';
+    if (fxPoolStrategyGroup) fxPoolStrategyGroup.style.display = showFx ? '' : 'none';
+    if (fxImageGroup) fxImageGroup.style.display = showFx ? '' : 'none';
+    if (fxVideoGroup) fxVideoGroup.style.display = showFx ? '' : 'none';
+    if (fxAccountSwitchGroup) fxAccountSwitchGroup.style.display = showFx ? '' : 'none';
+    if (fxBrowserIdGroup) fxBrowserIdGroup.style.display = showFx ? '' : 'none';
     updateFxVideoDurationVisibility();
 }
 
@@ -425,12 +431,14 @@ function updateFxVideoDurationVisibility() {
     if (!durationGroup) return;
     const showFx = backendSelect && backendSelect.value === 'google_fx';
     const isOmni = fxVideoModelSelect && fxVideoModelSelect.value === 'Omni Flash';
-    durationGroup.style.display = (showFx && isOmni) ? 'block' : 'none';
+    durationGroup.style.display = (showFx && isOmni) ? '' : 'none';
 }
 
-function saveConfig() {
+// 把配置中心表单里的值收进 config 对象（不落盘）。saveConfig 与
+// autoSaveConfig 共用，避免两条写入路径读的字段集合漂移。
+function applySettingsFormToConfig() {
     // config.model / config.imageModel 不再从本弹窗读取：由激发页脚与帧序列卡片的
-    // 内嵌选择器直接维护（改动即存），这里只负责其余生成参数并整体持久化
+    // 内嵌选择器直接维护（改动即存），这里只负责其余生成参数
     const imageBackendSelect = document.getElementById('settings-image-backend');
     if (imageBackendSelect) {
         config.imageBackend = imageBackendSelect.value;
@@ -464,15 +472,43 @@ function saveConfig() {
     if (searchQueryInput) {
         config.ideationSearchQuery = searchQueryInput.value.trim();
     }
-    config.imageAspectRatio = document.getElementById('settings-image-ratio').value.trim();
-    config.imageQuality = document.getElementById('settings-image-quality').value.trim();
+    const ratioSelect = document.getElementById('settings-image-ratio');
+    if (ratioSelect) config.imageAspectRatio = ratioSelect.value.trim();
+    const qualitySelect = document.getElementById('settings-image-quality');
+    if (qualitySelect) config.imageQuality = qualitySelect.value.trim();
+}
 
+function saveConfig() {
+    applySettingsFormToConfig();
     localStorage.setItem('spark_config', JSON.stringify(config));
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
     syncIdeationLlmPicker();
     showToast("API 配置保存成功！", "success");
     checkApiStatus();
+}
+
+/* ── 改动即存 ─────────────────────────────────────────────────────────
+   配置中心的每个控件 change 即落盘，用户不必记得回头按保存按钮（和激发页脚
+   的模型选择器、帧序列卡片的生图模型选择器是同一套约定）。反馈只在弹窗头部
+   闪一个「✓ 已保存」——每改一项弹一次 toast 太吵。
+   不在这里调 checkApiStatus()：本表单没有一项会改变 LLM 网关路由。 */
+let settingsSavedFlagTimer = null;
+
+function flashSettingsSaved() {
+    const flag = document.getElementById('settings-saved-flag');
+    if (!flag) return;
+    flag.hidden = false;
+    if (settingsSavedFlagTimer) clearTimeout(settingsSavedFlagTimer);
+    settingsSavedFlagTimer = setTimeout(() => { flag.hidden = true; }, 1600);
+}
+
+function autoSaveConfig() {
+    applySettingsFormToConfig();
+    localStorage.setItem('spark_config', JSON.stringify(config));
+    updateCoverModelDisplay();
+    syncFramesImageModelPicker();
+    flashSettingsSaved();
 }
 
 function resetConfig() {
@@ -517,8 +553,76 @@ function resetConfig() {
     document.getElementById('settings-image-quality').value = DEFAULT_CONFIG.imageQuality;
     updateFxImageModelVisibility();
     updateFxVideoDurationVisibility();
+    // 表单已经全部改成「改动即存」，恢复默认自然也得当场落盘，否则关掉弹窗
+    // 就悄悄回滚了（旧版靠底部「保存配置」兜底，那个按钮现在只是「完成」）。
+    // 必须先把刚写回表单的默认值收回 config——上面几段只改了 DOM，
+    // 直接持久化 config 会把用户的旧值原样存回去。
+    applySettingsFormToConfig();
+    localStorage.setItem('spark_config', JSON.stringify(config));
+    updateCoverModelDisplay();
     syncFramesImageModelPicker();
     syncIdeationLlmPicker();
+    showToast('已恢复默认配置', 'success');
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   配置中心 · 分区导航
+   左栏 nav 与右栏 section 用 data-section 配对，一次只显示一个。
+   记住上次停留的分区（多数改动是回同一个地方微调）。
+   ══════════════════════════════════════════════════════════════════════ */
+const SETTINGS_SECTION_KEY = 'spark_settings_section';
+
+function switchSettingsSection(name) {
+    const nav = document.getElementById('settings-nav');
+    const pane = document.getElementById('settings-pane');
+    if (!nav || !pane) return;
+
+    const sections = Array.from(pane.querySelectorAll('.settings-section'));
+    const target = sections.some(s => s.dataset.section === name)
+        ? name : (sections[0] ? sections[0].dataset.section : null);
+    if (!target) return;
+
+    nav.querySelectorAll('.settings-nav-item').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.section === target);
+    });
+    sections.forEach(sec => {
+        sec.classList.toggle('active', sec.dataset.section === target);
+    });
+    pane.scrollTop = 0;
+    localStorage.setItem(SETTINGS_SECTION_KEY, target);
+
+    // 号池分区：每次进来重读一次池子和 AdsPower 环境列表（别人可能在
+    // AdsPower 里新建了环境，或者积分刚被别的任务扣过）。
+    if (target === 'pool') {
+        if (typeof loadAccountPool === 'function') loadAccountPool();
+        if (typeof loadAccountPoolAdspowerProfiles === 'function') loadAccountPoolAdspowerProfiles();
+    }
+}
+
+function initSettingsCenter() {
+    const nav = document.getElementById('settings-nav');
+    if (nav && !nav.dataset.bound) {
+        nav.dataset.bound = '1';
+        nav.addEventListener('click', (e) => {
+            const btn = e.target.closest('.settings-nav-item');
+            if (btn) switchSettingsSection(btn.dataset.section);
+        });
+    }
+
+    // 改动即存：整个右栏做事件委托，新增字段自动纳入，不用再补绑定。
+    // 号池分区的控件自己有更专门的处理（增删改直接打服务端），排除在外。
+    const pane = document.getElementById('settings-pane');
+    if (pane && !pane.dataset.bound) {
+        pane.dataset.bound = '1';
+        pane.addEventListener('change', (e) => {
+            const el = e.target;
+            if (!el.matches('input, select, textarea')) return;
+            if (el.closest('.account-pool-manage-body')) return;
+            autoSaveConfig();
+        });
+    }
+
+    switchSettingsSection(localStorage.getItem(SETTINGS_SECTION_KEY) || 'backend');
 }
 
 function updateCoverModelDisplay() {

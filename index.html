@@ -58,6 +58,10 @@
          .ideation-cards-container 与整段移动端补丁。
          见 docs/spark_dimension_minimal_layout_plan.md -->
     <link rel="stylesheet" href="css/app/dimension-minimal.css?v=1.0.0">
+    <!-- API 配置中心的极简两栏布局（左分区导航 + 右单区表单，号池并入同一窗口）。
+         必须排在 base.css 之后：要覆盖那里的 .form-group 竖排规则与 .modal-content 宽度。
+         见 docs/spark_settings_center_layout_plan.md -->
+    <link rel="stylesheet" href="css/app/settings-center.css?v=1.0.0">
     <link rel="stylesheet" href="css/image_studio.css?v=1.1.1">
     <link rel="stylesheet" href="css/gallery.css?v=1.1.0">
     <link rel="stylesheet" href="css/ledger.css?v=1.1.0">
@@ -1326,116 +1330,218 @@
         </div>
     </div>
 
-    <!-- Settings Modal -->
+    <!-- Settings Modal — API 配置中心 · 极简两栏布局
+         旧版是一条 10 项的长滚动表单，且「号池」还要再点开一个嵌套弹窗（modal 叠 modal）；
+         改一个参数要先滚着找、改完还得记得按「保存配置」。现在：
+           · 左侧分区导航（后端 / 生图 / 号池 / 激发参考 / 系统），右侧一次只显示一个分区；
+           · 号池整块并入本窗口的「生成号池」分区（原 #account-pool-manage-modal 已删除，
+             内部 id 一个没改，js/account_pool.js 的渲染逻辑原样可用），选号策略
+             （换号频率 / 浏览器编号）跟号池列表放在同一屏；
+           · 所有控件改动即存（silent autoSaveConfig + 头部「已保存」提示），底部只留
+             测试连接 / 恢复默认 / 完成。
+         见 docs/spark_settings_center_layout_plan.md -->
     <div class="modal" id="settings-modal">
-        <div class="modal-content glass-panel">
-            <div class="modal-header">
+        <div class="modal-content glass-panel settings-center">
+            <div class="modal-header settings-center-header">
                 <h3>⚙️ API 配置中心</h3>
-                <button id="close-settings-btn" class="close-btn">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="form-group">
-                    <label for="settings-image-backend">Frame Sequence Backend (帧序列生成方式)</label>
-                    <select id="settings-image-backend">
-                        <option value="api" selected>🔌 API 接口（LLM 网关）</option>
-                        <option value="google_fx">🤖 Google FX UI 自动化（AdsPower 浏览器）</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label for="settings-ideation-search-query">Ideation Search Query (激发联网搜索词，可选)</label>
-                    <input type="text" id="settings-ideation-search-query" placeholder="留空使用默认：最新 爆款 延时摄影 废墟改造成居所 视频 趋势…">
-                    <small style="opacity:.65;display:block;margin-top:4px;">随机创意激发前联网搜索用的查询词；改词立即生效，按搜索词分别缓存 6 小时</small>
-                </div>
-                <div class="form-group">
-                    <label for="settings-ideation-trend-urls">Ideation Reference URLs (激发参考网址，可选)</label>
-                    <textarea id="settings-ideation-trend-urls" rows="3" placeholder="每行一个网址（最多取前 5 个），例如：&#10;https://www.tiktok.com/tag/renovation&#10;留空则只用联网搜索趋势"></textarea>
-                    <small style="opacity:.65;display:block;margin-top:4px;">随机创意激发时抓取这些页面正文，压成要点作为灵感参考注入（6 小时缓存，与联网搜索趋势叠加）</small>
-                </div>
-                <div class="form-group" id="fx-image-model-group" style="display: none;">
-                    <label for="settings-fx-image-model">Google FX Image Model (FX 生图模型)</label>
-                    <select id="settings-fx-image-model">
-                        <option value="Nano Banana Pro">Nano Banana Pro</option>
-                        <option value="Nano Banana 2" selected>🍌 Nano Banana 2</option>
-                        <option value="Nano Banana 2 Lite">🍌 Nano Banana 2 Lite</option>
-                    </select>
-                </div>
-                <div class="form-group" id="fx-video-model-group" style="display: none;">
-                    <label for="settings-fx-video-model">Google FX Video Model (FX 视频模型)</label>
-                    <select id="settings-fx-video-model">
-                        <option value="Veo 3.1 - Lite">Veo 3.1 - Lite</option>
-                        <option value="Veo 3.1 - Fast">Veo 3.1 - Fast</option>
-                        <option value="Veo 3.1 - Quality">Veo 3.1 - Quality</option>
-                        <option value="Omni Flash">Omni Flash</option>
-                        <option value="Veo 3.1 - Lite [Lower Priority]" selected>Veo 3.1 - Lite [Lower Priority]</option>
-                    </select>
-                </div>
-                <div class="form-group" id="fx-video-duration-group" style="display: none;">
-                    <label for="settings-fx-video-duration">Omni Flash Duration (Omni Flash 视频时长)</label>
-                    <select id="settings-fx-video-duration">
-                        <option value="" selected>不指定（沿用 Flow 面板当前时长）</option>
-                        <option value="4">4s</option>
-                        <option value="6">6s</option>
-                        <option value="8">8s</option>
-                        <option value="10">10s</option>
-                    </select>
-                    <small style="opacity:.65;display:block;margin-top:4px;">仅 Omni Flash 模型面板提供该时长切换；Veo 系列时长固定，切到 Veo 模型时本项自动隐藏且不生效</small>
-                </div>
-                <div class="form-group" id="fx-account-switch-group" style="display: none;">
-                    <label for="settings-fx-account-switch-requests">Account Switch Frequency (换号频率，单位：次请求)</label>
-                    <input type="number" id="settings-fx-account-switch-requests" min="1" max="100" placeholder="默认 5 次">
-                    <small style="opacity:.65;display:block;margin-top:4px;">帧序列 / 视频序列生成里每这么多个请求换一次号池账号（帧序列按最近的链式批次边界换）。<strong>换 IP 已全局关停</strong>：换 IP 会把 Flow 登录 token 打失效、还会让画布追踪串片，现在全程保持同一个 IP，只换号</small>
-                </div>
-                <div class="form-group" id="fx-browser-id-group" style="display: none;">
-                    <label for="settings-fx-browser-id">AdsPower Browser No. (浏览器编号 / User ID)</label>
-                    <div style="display:flex;gap:8px;align-items:center;">
-                        <select id="settings-fx-browser-id" style="flex:1;min-width:0;">
-                            <option value="">留空 = 号池自动选号 / 服务端默认浏览器</option>
-                        </select>
-                        <button type="button" id="settings-fx-browser-id-refresh" class="text-btn secondary" title="重新读取号池里的环境编号">🔄</button>
-                    </div>
-                    <small style="opacity:.65;display:block;margin-top:4px;">选项来自「生成号池」里的环境编号（打开配置或点 🔄 时刷新）。选了本项 = 这一次临时指定用哪个 AdsPower 窗口，跳过号池自动选号（也一并关掉换号轮转）；留「号池自动选号」且号池非空时，帧序列 / 视频生成会自动挑一个还有积分的账号</small>
-                </div>
-                <!-- 视频生成始终走 AdsPower/google_fx（跟上面"生图后端"的 api/google_fx
-                     切换无关，那个开关只管生图路径），所以号池入口不跟着 fx-browser-id-group
-                     一起被 imageBackend!=='google_fx' 隐藏——否则生图走 api 后端的人永远看不到 -->
-                <div class="form-group">
-                    <button type="button" id="account-pool-manage-open-btn" class="text-btn secondary">🎬 生成号池管理</button>
-                    <small style="opacity:.65;display:block;margin-top:4px;">管理用于帧序列 / 视频生成的多个 AdsPower/Flow 账号，发起生成前自动挑一个还有积分的账号</small>
-                </div>
-                <div class="form-group">
-                    <label for="settings-image-ratio">Image Aspect Ratio (生图宽高比)</label>
-                    <select id="settings-image-ratio">
-                        <option value="9:16">9:16 (纵向视频封面 / TikTok / 抖音)</option>
-                        <option value="16:9">16:9 (横向视频封面 / B站 / YouTube)</option>
-                        <option value="1:1">1:1 (方形比例)</option>
-                        <option value="3:2">3:2 (摄影经典比例)</option>
-                        <option value="2:3">2:3 (纵向比例)</option>
-                        <option value="21:9">21:9 (电影宽屏幕比例)</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label for="settings-image-quality">Image Clarity / Resolution (生图清晰度)</label>
-                    <select id="settings-image-quality">
-                        <option value="1K">1K (标准画质)</option>
-                        <option value="2K">2K (中等清晰 / 推荐)</option>
-                        <option value="4K">4K (高清画质)</option>
-                    </select>
-                </div>
-                <div class="modal-info">
-                    <p>💡 <b>提示:</b> 服务端托管模式 —— 网关地址与 API 密钥由服务端 <b>server_config.json</b> 统一管理，浏览器无需（也无法）配置。<b>模型选择已移至使用现场</b>：LLM 模型在激发按钮上方切换，生图模型在帧序列卡片右上角切换，改动即存。端口永久固定：应用入口 <b>8085</b>，LLM 代理 <b>8046</b>（gpt-5.5 / gpt-image-2 由服务端自动路由）。</p>
-                </div>
-                <div class="form-group cache-group" style="margin-top: 15px; padding-top: 15px; border-top: 1px solid var(--border-color, rgba(255,255,255,0.1));">
-                    <label>系统缓存管理</label>
-                    <div style="display: flex; gap: 12px; align-items: center; margin-top: 6px;">
-                        <button id="clear-cache-btn" class="text-btn danger" style="flex: 1; margin: 0; justify-content: center; height: 38px;">🧹 清理系统缓存</button>
-                        <span id="cache-size-info" style="font-size: 12.5px; color: var(--text-secondary); white-space: nowrap; font-family: monospace;">计算中...</span>
-                    </div>
+                <div class="settings-header-right">
+                    <span class="settings-saved-flag" id="settings-saved-flag" hidden>✓ 已保存</span>
+                    <button id="close-settings-btn" class="close-btn">&times;</button>
                 </div>
             </div>
+
+            <div class="settings-center-body">
+                <!-- 左栏：分区导航。移动端由 CSS 转成横向滚动的芯片行 -->
+                <nav class="settings-nav" id="settings-nav">
+                    <button type="button" class="settings-nav-item active" data-section="backend">
+                        <span class="settings-nav-icon">🔌</span><span class="settings-nav-label">生成后端</span>
+                    </button>
+                    <button type="button" class="settings-nav-item" data-section="image">
+                        <span class="settings-nav-icon">🖼️</span><span class="settings-nav-label">生图参数</span>
+                    </button>
+                    <button type="button" class="settings-nav-item" data-section="pool">
+                        <span class="settings-nav-icon">🎬</span><span class="settings-nav-label">生成号池</span>
+                    </button>
+                    <button type="button" class="settings-nav-item" data-section="ideation">
+                        <span class="settings-nav-icon">🌐</span><span class="settings-nav-label">激发参考</span>
+                    </button>
+                    <button type="button" class="settings-nav-item" data-section="system">
+                        <span class="settings-nav-icon">🧩</span><span class="settings-nav-label">系统</span>
+                    </button>
+                </nav>
+
+                <!-- 右栏：分区内容，一次只显示一个（.active） -->
+                <div class="settings-pane" id="settings-pane">
+
+                    <!-- ① 生成后端 -->
+                    <section class="settings-section active" data-section="backend">
+                        <h4 class="settings-section-title">生成后端</h4>
+                        <p class="settings-section-desc">帧序列走哪条生成链路，以及 Google FX 侧用哪个模型。</p>
+                        <div class="form-group settings-field">
+                            <label for="settings-image-backend">帧序列生成方式</label>
+                            <select id="settings-image-backend">
+                                <option value="api" selected>🔌 API 接口（LLM 网关）</option>
+                                <option value="google_fx">🤖 Google FX UI 自动化（AdsPower 浏览器）</option>
+                            </select>
+                        </div>
+                        <div class="form-group settings-field" id="fx-image-model-group" style="display: none;">
+                            <label for="settings-fx-image-model">FX 生图模型</label>
+                            <select id="settings-fx-image-model">
+                                <option value="Nano Banana Pro">Nano Banana Pro</option>
+                                <option value="Nano Banana 2" selected>🍌 Nano Banana 2</option>
+                                <option value="Nano Banana 2 Lite">🍌 Nano Banana 2 Lite</option>
+                            </select>
+                        </div>
+                        <div class="form-group settings-field" id="fx-video-model-group" style="display: none;">
+                            <label for="settings-fx-video-model">FX 视频模型</label>
+                            <select id="settings-fx-video-model">
+                                <option value="Veo 3.1 - Lite">Veo 3.1 - Lite</option>
+                                <option value="Veo 3.1 - Fast">Veo 3.1 - Fast</option>
+                                <option value="Veo 3.1 - Quality">Veo 3.1 - Quality</option>
+                                <option value="Omni Flash">Omni Flash</option>
+                                <option value="Veo 3.1 - Lite [Lower Priority]" selected>Veo 3.1 - Lite [Lower Priority]</option>
+                            </select>
+                        </div>
+                        <div class="form-group settings-field" id="fx-video-duration-group" style="display: none;">
+                            <label for="settings-fx-video-duration">Omni Flash 视频时长</label>
+                            <select id="settings-fx-video-duration">
+                                <option value="" selected>不指定（沿用 Flow 面板当前时长）</option>
+                                <option value="4">4s</option>
+                                <option value="6">6s</option>
+                                <option value="8">8s</option>
+                                <option value="10">10s</option>
+                            </select>
+                            <small class="settings-hint">仅 Omni Flash 模型面板提供该时长切换；Veo 系列时长固定，切到 Veo 模型时本项自动隐藏且不生效</small>
+                        </div>
+                        <p class="settings-inline-note">模型选择已移至使用现场：LLM 模型在激发按钮上方切换，生图模型在帧序列卡片右上角切换，改动即存。</p>
+                    </section>
+
+                    <!-- ② 生图参数 -->
+                    <section class="settings-section" data-section="image">
+                        <h4 class="settings-section-title">生图参数</h4>
+                        <p class="settings-section-desc">封面与帧序列共用的画幅与清晰度。</p>
+                        <div class="form-group settings-field">
+                            <label for="settings-image-ratio">生图宽高比</label>
+                            <select id="settings-image-ratio">
+                                <option value="9:16">9:16 (纵向视频封面 / TikTok / 抖音)</option>
+                                <option value="16:9">16:9 (横向视频封面 / B站 / YouTube)</option>
+                                <option value="1:1">1:1 (方形比例)</option>
+                                <option value="3:2">3:2 (摄影经典比例)</option>
+                                <option value="2:3">2:3 (纵向比例)</option>
+                                <option value="21:9">21:9 (电影宽屏幕比例)</option>
+                            </select>
+                        </div>
+                        <div class="form-group settings-field">
+                            <label for="settings-image-quality">生图清晰度</label>
+                            <select id="settings-image-quality">
+                                <option value="1K">1K (标准画质)</option>
+                                <option value="2K">2K (中等清晰 / 推荐)</option>
+                                <option value="4K">4K (高清画质)</option>
+                            </select>
+                        </div>
+                    </section>
+
+                    <!-- ③ 生成号池 — 选号策略 + 池子本身，同一屏搞定
+                         视频生成始终走 AdsPower/google_fx（跟「帧序列生成方式」的 api/google_fx
+                         切换无关，那个开关只管生图路径），所以号池列表本身永远可见，
+                         只有「换号频率 / 浏览器编号」两项跟着 imageBackend 显隐 -->
+                    <section class="settings-section" data-section="pool">
+                        <h4 class="settings-section-title">生成号池</h4>
+                        <p class="settings-section-desc">帧序列 / 视频生成共用的 AdsPower + Flow 账号池，发起生成前自动挑一个还有积分的账号。</p>
+
+                        <!-- 选号策略默认折起：常看的是池子本身（谁还有积分、谁禁用了），
+                             这两项属于"设一次就不动"的策略参数，摊开会把列表和「添加账号」
+                             挤到折叠线以下 -->
+                        <details class="settings-subgroup" id="fx-pool-strategy-group" style="display: none;">
+                        <summary>选号策略 · 换号频率 / 指定浏览器编号</summary>
+                        <div class="form-group settings-field" id="fx-account-switch-group" style="display: none;">
+                            <label for="settings-fx-account-switch-requests">换号频率（次请求）</label>
+                            <input type="number" id="settings-fx-account-switch-requests" min="1" max="100" placeholder="默认 5 次">
+                            <small class="settings-hint">帧序列 / 视频序列生成里每这么多个请求换一次号池账号（帧序列按最近的链式批次边界换）。<strong>换 IP 已全局关停</strong>：换 IP 会把 Flow 登录 token 打失效、还会让画布追踪串片，现在全程保持同一个 IP，只换号</small>
+                        </div>
+                        <div class="form-group settings-field" id="fx-browser-id-group" style="display: none;">
+                            <label for="settings-fx-browser-id">指定浏览器编号</label>
+                            <div class="settings-field-inline">
+                                <select id="settings-fx-browser-id">
+                                    <option value="">留空 = 号池自动选号 / 服务端默认浏览器</option>
+                                </select>
+                                <button type="button" id="settings-fx-browser-id-refresh" class="text-btn secondary" title="重新读取号池里的环境编号">🔄</button>
+                            </div>
+                            <small class="settings-hint">选项来自下面的号池（打开配置或点 🔄 时刷新）。选了本项 = 这一次临时指定用哪个 AdsPower 窗口，跳过号池自动选号（也一并关掉换号轮转）；留「号池自动选号」且号池非空时，帧序列 / 视频生成会自动挑一个还有积分的账号</small>
+                        </div>
+                        </details>
+
+                        <div class="account-pool-manage-body">
+                            <div class="account-pool-sort-row">
+                                <label for="account-pool-sort-select">↕ 排序方式：</label>
+                                <select id="account-pool-sort-select" class="account-pool-sort-select">
+                                    <option value="serial_asc">按环境编号 (升序)</option>
+                                    <option value="credit_desc">按积分余额 (高 → 低)</option>
+                                    <option value="credit_asc">按积分余额 (低 → 高)</option>
+                                    <option value="tasks_desc">按任务总数 (多 → 少)</option>
+                                    <option value="image_desc">按图片任务数 (多 → 少)</option>
+                                    <option value="video_desc">按视频任务数 (多 → 少)</option>
+                                    <option value="name_asc">按账号命名 (A → Z)</option>
+                                </select>
+                            </div>
+                            <div class="account-pool-list" id="account-pool-list"></div>
+                            <div class="account-pool-bulk-row">
+                                <button type="button" id="account-pool-import-all-btn" class="ledger-tool-btn"
+                                        title="把本机 AdsPower 里所有浏览器环境一次性加进号池，已在池子里的跳过（不覆盖已改过的命名/备注）">📥 一键添加全部 AdsPower 环境</button>
+                                <small>命名默认用环境的邮箱地址，加完可逐个禁用不想用的。</small>
+                            </div>
+                            <div class="account-pool-add-row">
+                                <select id="account-pool-add-select">
+                                    <option value="">-- 从 AdsPower 环境里选一个 --</option>
+                                </select>
+                                <input type="text" id="account-pool-add-name" placeholder="账号命名（留空默认用邮箱地址）">
+                                <input type="text" id="account-pool-add-note" placeholder="备注（选填）">
+                                <button type="button" id="account-pool-add-btn" class="ledger-tool-btn">➕ 添加</button>
+                            </div>
+                            <p class="settings-inline-note" title="池子为空时完全不影响现有行为：沿用「选号策略」里的「指定浏览器编号」单选。">积分只信「刷新积分」的真实探测结果（要开一次浏览器读 Flow 页面，较慢）；发起视频生成时缓存超过 30 分钟会自动刷一次。</p>
+                        </div>
+                    </section>
+
+                    <!-- ④ 激发参考 -->
+                    <section class="settings-section" data-section="ideation">
+                        <h4 class="settings-section-title">激发参考</h4>
+                        <p class="settings-section-desc">随机创意激发前联网取材用的搜索词与固定参考网址。</p>
+                        <div class="form-group settings-field stack">
+                            <label for="settings-ideation-search-query">联网搜索词（可选）</label>
+                            <input type="text" id="settings-ideation-search-query" placeholder="留空使用默认：最新 爆款 延时摄影 废墟改造成居所 视频 趋势…">
+                            <small class="settings-hint">随机创意激发前联网搜索用的查询词；改词立即生效，按搜索词分别缓存 6 小时</small>
+                        </div>
+                        <div class="form-group settings-field stack">
+                            <label for="settings-ideation-trend-urls">参考网址（可选）</label>
+                            <textarea id="settings-ideation-trend-urls" rows="4" placeholder="每行一个网址（最多取前 5 个），例如：&#10;https://www.tiktok.com/tag/renovation&#10;留空则只用联网搜索趋势"></textarea>
+                            <small class="settings-hint">随机创意激发时抓取这些页面正文，压成要点作为灵感参考注入（6 小时缓存，与联网搜索趋势叠加）</small>
+                        </div>
+                    </section>
+
+                    <!-- ⑤ 系统 -->
+                    <section class="settings-section" data-section="system">
+                        <h4 class="settings-section-title">系统</h4>
+                        <p class="settings-section-desc">托管模式说明与本地缓存维护。</p>
+                        <div class="modal-info">
+                            <p>💡 <b>服务端托管模式</b>：网关地址与 API 密钥由服务端 <b>server_config.json</b> 统一管理，浏览器无需（也无法）配置。端口永久固定：应用入口 <b>8085</b>，LLM 代理 <b>8046</b>（gpt-5.5 / gpt-image-2 由服务端自动路由）。</p>
+                        </div>
+                        <div class="form-group settings-field" id="cache-group">
+                            <label>系统缓存</label>
+                            <div class="settings-field-inline">
+                                <button id="clear-cache-btn" class="text-btn danger">🧹 清理系统缓存</button>
+                                <span id="cache-size-info">计算中...</span>
+                            </div>
+                            <small class="settings-hint">清理的是 packet_cache.json（已缓存的 LLM 激发数据），不影响点子库与已生成的素材。</small>
+                        </div>
+                    </section>
+
+                </div>
+            </div>
+
             <div class="modal-footer">
                 <button id="test-settings-btn" class="action-btn text-btn secondary" style="margin-right: auto;">测试连接</button>
                 <button id="reset-settings-btn" class="action-btn text-btn secondary">恢复默认</button>
-                <button id="save-settings-btn" class="action-btn text-btn primary">保存配置</button>
+                <button id="save-settings-btn" class="action-btn text-btn primary">完成</button>
             </div>
         </div>
     </div>
@@ -1497,52 +1603,9 @@
         </div>
     </div>
 
-    <!-- Account Pool Management Modal — 生成号池：用户名下几个 Flow 账号
-         的标签/已知积分/启用状态，发起生成前自动挑一个还有额度的账号使用。
-         帧序列与视频序列共用同一个池子（都是 labs.google Flow 的额度）。
-         规模小（几个账号），不需要 trend-refs 那套搜索/排序/批量选择基础设施，
-         就是一个简单列表 + 添加行。 -->
-    <div class="modal" id="account-pool-manage-modal">
-        <div class="modal-content glass-panel modal-wide">
-            <div class="modal-header">
-                <h3>🎬 生成号池管理</h3>
-                <button id="account-pool-manage-close-btn" class="close-btn">&times;</button>
-            </div>
-            <div class="modal-body account-pool-manage-body">
-                <div class="modal-info">
-                    <p>💡 池子为空时完全不影响现有行为（沿用上面「AdsPower Browser No.」单选）。
-                    积分只信「刷新积分」按钮的真实探测结果——打开一次浏览器读 Flow 页面，比较慢；
-                    发起视频生成时如果缓存已超过 30 分钟也会自动刷新一次。</p>
-                </div>
-                <div class="account-pool-sort-row">
-                    <label for="account-pool-sort-select">↕ 排序方式：</label>
-                    <select id="account-pool-sort-select" class="account-pool-sort-select">
-                        <option value="serial_asc">按环境编号 (升序)</option>
-                        <option value="credit_desc">按积分余额 (高 → 低)</option>
-                        <option value="credit_asc">按积分余额 (低 → 高)</option>
-                        <option value="tasks_desc">按任务总数 (多 → 少)</option>
-                        <option value="image_desc">按图片任务数 (多 → 少)</option>
-                        <option value="video_desc">按视频任务数 (多 → 少)</option>
-                        <option value="name_asc">按账号命名 (A → Z)</option>
-                    </select>
-                </div>
-                <div class="account-pool-list" id="account-pool-list"></div>
-                <div class="account-pool-bulk-row">
-                    <button type="button" id="account-pool-import-all-btn" class="ledger-tool-btn"
-                            title="把本机 AdsPower 里所有浏览器环境一次性加进号池，已在池子里的跳过（不覆盖已改过的命名/备注）">📥 一键添加全部 AdsPower 环境</button>
-                    <small style="opacity:.65;">环境多的时候不用一个一个加；命名默认用环境的邮箱地址，加完可以逐个禁用不想用的。</small>
-                </div>
-                <div class="account-pool-add-row">
-                    <select id="account-pool-add-select">
-                        <option value="">-- 从 AdsPower 环境里选一个 --</option>
-                    </select>
-                    <input type="text" id="account-pool-add-name" placeholder="账号命名（留空默认用邮箱地址）">
-                    <input type="text" id="account-pool-add-note" placeholder="备注（选填）">
-                    <button type="button" id="account-pool-add-btn" class="ledger-tool-btn">➕ 添加</button>
-                </div>
-            </div>
-        </div>
-    </div>
+    <!-- （原 #account-pool-manage-modal 已并入 API 配置中心的「生成号池」分区：
+         modal 叠 modal 的嵌套弹窗去掉了，选号策略和池子列表现在同屏可见。
+         内部 id 全部保留在上面那段 markup 里，js/account_pool.js 无需改渲染逻辑。） -->
 
     <!-- Toast Notification Container -->
     <!-- Toast Notification Container -->
@@ -1599,10 +1662,10 @@
     <script src="js/state.js?v=1.1.12" defer></script>
     <script src="js/utils.js?v=1.3.0" defer></script>
     <script src="js/theme_toggle.js?v=1.1.0" defer></script>
-    <script src="js/config.js?v=1.2.9" defer></script>
+    <script src="js/config.js?v=1.3.0" defer></script>
     <script src="js/spark_rail.js?v=1.0.0" defer></script>
     <script src="js/trend_refs.js?v=1.3.1" defer></script>
-    <script src="js/account_pool.js?v=1.1.0" defer></script>
+    <script src="js/account_pool.js?v=1.2.0" defer></script>
     <script src="js/progress_model.js?v=1.2.3" defer></script>
     <!-- 槽位状态模型（纯函数）与卡片渲染器：必须排在 api_client / media_renderer /
          app.js 之前——那三处的槽位渲染全部转调这里。见 docs/spark_result_slots_plan.md -->
@@ -1613,7 +1676,7 @@
     <script src="js/prompt_pipeline.js?v=1.2.5" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
     <script src="js/media_renderer.js?v=1.6.0" defer></script>
-    <script src="app.js?v=1.3.33" defer></script>
+    <script src="app.js?v=1.3.34" defer></script>
     <script src="js/image_studio.js?v=1.0.4" defer></script>
     <script src="js/gallery.js?v=1.1.2" defer></script>
     <script src="js/ledger.js?v=1.1.2" defer></script>

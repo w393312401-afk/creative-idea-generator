@@ -646,11 +646,18 @@ body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-merge-btn {
    data-*，不写任何行内样式——所以这一节是槽位卡片外观的唯一出处。
    （历史上 JS 把 background/border/padding/font-size/opacity 全写成行内，
    这里的规则等于死代码，移动端只能整段 !important 压回来。） */
+/* 一行排不下就换行，别把每枚按钮挤成竖排文字。S 档一列只有 88px 宽，出图卡上
+   最多有五枚按钮（修复/描述/重试/上传/删除）——不限左边界、不许换行时，它们会
+   被压成一列一列的竖排汉字并溢出到隔壁格上，看着是按钮、实际点不准
+   （2026-07-28 实机截图）。移动端那份规则早就是这么写的，这里把桌面对齐。 */
 .slot-actions {
     position: absolute;
     top: 5px;
     right: 5px;
+    left: 5px;
     display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 4px;
     opacity: 0;
     transition: opacity 0.2s;
@@ -680,6 +687,8 @@ body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-merge-btn {
     border-radius: 3px;
     cursor: pointer;
     transition: all 0.2s;
+    /* 逐字折行的按钮既读不出来也点不准：宁可整枚换到下一行（见 .slot-actions） */
+    white-space: nowrap;
 }
 
 .slot-action-btn[data-variant="danger"] {

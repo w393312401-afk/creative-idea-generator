@@ -133,54 +133,60 @@ const BUSY_TIP_FRAMES = '该创意的帧序列正在生成/重试中，请稍候
 const BUSY_TIP_VIDEOS = '该创意的视频序列正在生成/重试中，请稍候';
 const DELETE_TIP = '删除这一整拍：先保存恢复快照，再将其后图片/视频整体前移一位';
 
+/**
+ * opts.idle 是「不忙时这枚按钮该说什么」，opts.busy/busyTip 决定此刻画成哪一面。
+ * 两者都留在状态里：解禁网格时要靠 idleTitle 把说明还回去——此前忙态一解除，
+ * DOM 上的 title 一律被置空，跑完一轮之后所有按钮的悬浮说明就永久消失了。
+ */
 function slotAction(act, label, opts) {
     const o = opts || {};
+    const idle = o.idle || '';
     return {
         act,
         label,
         cls: o.cls || '',
         variant: o.variant || 'default',
-        disabled: !!o.disabled,
-        title: o.title || '',
+        disabled: !!o.busy,
+        idleTitle: idle,
+        title: o.busy ? (o.busyTip || '') : idle,
     };
 }
 
 function frameActions(state, ctx) {
     const busy = !!ctx.busy;
-    const tip = busy ? BUSY_TIP_FRAMES : '';
+    const mk = (act, label, opts) => slotAction(act, label,
+        Object.assign({ busy, busyTip: BUSY_TIP_FRAMES }, opts));
     const list = [];
     if (state.kind === 'ready') {
         if (state.flags.fixable) {
-            list.push(slotAction('fix-frame', '修复此帧问题', {
-                cls: 'fix-frame-btn', variant: 'danger', disabled: busy,
-                title: busy ? tip : '依据问题描述优化提示词后图生图重渲此帧',
+            list.push(mk('fix-frame', '修复此帧问题', {
+                cls: 'fix-frame-btn', variant: 'danger',
+                idle: '依据问题描述优化提示词后图生图重渲此帧',
             }));
         }
-        list.push(slotAction('describe-frame', state.flags.manualFlagged ? '改描述' : '描述问题', {
-            cls: 'describe-frame-btn', disabled: busy,
-            title: busy ? tip : '人工描述这一帧哪里不对，作为定向修复的依据',
+        list.push(mk('describe-frame', state.flags.manualFlagged ? '改描述' : '描述问题', {
+            cls: 'describe-frame-btn',
+            idle: '人工描述这一帧哪里不对，作为定向修复的依据',
         }));
-        list.push(slotAction('retry-frame', '重试', { cls: 'retry-frame-btn', disabled: busy, title: tip }));
+        list.push(mk('retry-frame', '重试', { cls: 'retry-frame-btn' }));
     } else if (state.kind === 'missing') {
-        list.push(slotAction('retry-frame', '生成', { cls: 'retry-frame-btn', disabled: busy, title: tip }));
+        list.push(mk('retry-frame', '生成', { cls: 'retry-frame-btn' }));
     }
     if (state.kind === 'ready' || state.kind === 'missing') {
         // 与视频槽位的「上传」同位置同语义：拖拽之外再给一个点选出口
         // （触摸板/远程桌面下拖文件进浏览器并不总是可行）。占位卡是浅色底，
         // 沿用 secondary 的浅色描边。
         const sub = state.kind === 'ready' ? '' : ' secondary';
-        list.push(slotAction('upload-frame', '上传', {
+        list.push(mk('upload-frame', '上传', {
             cls: 'upload-frame-btn' + sub,
-            disabled: busy,
-            title: busy ? tip : '手动上传本地图片覆盖此帧（可多选＝从这一帧起依次填）',
+            idle: '手动上传本地图片覆盖此帧（可多选＝从这一帧起依次填）',
         }));
         // 出图卡是深色底、红底删除键用来跟其余按钮区分；占位卡是浅色底，
         // 沿用 secondary 的浅色描边（两种底色下的既有外观）
-        list.push(slotAction('delete-slot', '删除', {
+        list.push(mk('delete-slot', '删除', {
             cls: 'delete-slot-btn' + sub,
             variant: state.kind === 'ready' ? 'danger' : 'default',
-            disabled: busy,
-            title: busy ? tip : DELETE_TIP,
+            idle: DELETE_TIP,
         }));
     }
     return list;
@@ -188,26 +194,26 @@ function frameActions(state, ctx) {
 
 function videoActions(state, ctx) {
     const busy = !!ctx.busy;
-    const tip = busy ? BUSY_TIP_VIDEOS : '';
+    const mk = (act, label, opts) => slotAction(act, label,
+        Object.assign({ busy, busyTip: BUSY_TIP_VIDEOS }, opts));
     if (state.kind === 'pending' || state.kind === 'cut') return [];
     const isReady = state.kind === 'ready';
     // 占位卡是浅色底，上传/删除沿用 secondary 的浅色描边；出图卡是深色底，
     // 删除用红底跟其余按钮区分（两种底色下的既有外观）
     const sub = isReady ? '' : ' secondary';
     return [
-        slotAction('retry-video', state.kind === 'missing' ? '生成' : '重试', {
-            cls: 'retry-video-btn', disabled: busy,
-            title: busy ? tip : (isReady ? '重新生成此槽位视频（覆盖当前片段）' : ''),
+        mk('retry-video', state.kind === 'missing' ? '生成' : '重试', {
+            cls: 'retry-video-btn',
+            idle: isReady ? '重新生成此槽位视频（覆盖当前片段）' : '',
         }),
-        slotAction('upload-video', '上传', {
-            cls: 'upload-video-btn' + sub, disabled: busy,
-            title: busy ? tip : '手动上传本地视频文件覆盖此槽位',
+        mk('upload-video', '上传', {
+            cls: 'upload-video-btn' + sub,
+            idle: '手动上传本地视频文件覆盖此槽位',
         }),
-        slotAction('delete-slot', '删除', {
+        mk('delete-slot', '删除', {
             cls: 'delete-slot-btn' + sub,
             variant: isReady ? 'danger' : 'default',
-            disabled: busy,
-            title: busy ? tip : DELETE_TIP,
+            idle: DELETE_TIP,
         }),
     ];
 }
