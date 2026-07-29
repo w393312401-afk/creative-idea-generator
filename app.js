@@ -118,6 +118,14 @@ document.addEventListener('DOMContentLoaded', () => {
             loadIdeationCards(true);
         });
     }
+    const countSelect = document.getElementById('ideation-count-select');
+    if (countSelect) {
+        const savedCount = localStorage.getItem('ideation_card_count');
+        if (savedCount) countSelect.value = savedCount;
+        countSelect.addEventListener('change', () => {
+            localStorage.setItem('ideation_card_count', countSelect.value);
+        });
+    }
     initLocalServiceLogs();
 });
 
@@ -4278,7 +4286,10 @@ let currentIdeatedIdeas = [];
 // 外还带 pacing_skeleton，旧缓存不能冒充成「已按骨架参考规划」的新卡。
 // v5 作废「只带骨架标签、未经内容验收」时期产出的旧卡：那些卡可能
 // 在仅勾 dual_payoff 时仍保存了单线 outline，服务端修好后也不能继续命中它们。
-const IDEATION_CACHE_VERSION = '6-nested-space-payoff';
+// v8 作废「双空间重置兑现」用自然/原地载体（冰洞、竖井、地窖）产出的旧卡：
+// 该骨架现在要求人工运输载体（集装箱/校车/大巴/机身）在第一拍被装备运到现场落位，
+// 旧缓存卡的第一拍是「清理」，与新契约对不上。
+const IDEATION_CACHE_VERSION = '8-nested-space-transported-carrier';
 const DEFAULT_PACING_SKELETON_IDS = ['linear_milestone', 'dual_payoff', 'nested_space_payoff'];
 
 function getSelectedPacingSkeletonIds() {
@@ -4340,6 +4351,24 @@ function initPacingSkeletonSelector() {
 // 用户等不及连点几下就会并发出几路同样昂贵的请求，回来还互相覆盖卡片区。
 let ideationInFlight = false;
 
+// 缓存绑定用的「生成数设置」原值（'5' / 'random' …）。用原值而不是解析出来的张数：
+// random 每次解析都不同，用解析值会让缓存永远失效；而交付张数可能少于请求张数，
+// 用交付数比对又会每次进页面都重新激发一批。
+function getIdeationCountKey() {
+    const select = document.getElementById('ideation-count-select');
+    return String((select && select.value) || localStorage.getItem('ideation_card_count') || '5');
+}
+
+function getRequestedIdeationCount() {
+    const select = document.getElementById('ideation-count-select');
+    let val = select ? select.value : (localStorage.getItem('ideation_card_count') || '5');
+    if (val === 'random') {
+        return Math.floor(Math.random() * 6) + 3; // 随机 3~8 张
+    }
+    const parsed = parseInt(val, 10);
+    return (Number.isFinite(parsed) && parsed >= 1 && parsed <= 15) ? parsed : 5;
+}
+
 async function loadIdeationCards(force = false, options = {}) {
     const container = document.getElementById('ideation-cards-container');
     if (!container) return;
@@ -4348,6 +4377,7 @@ async function loadIdeationCards(force = false, options = {}) {
         return;
     }
     const remixSeed = options && options.remixSeed ? options.remixSeed : null;
+    const requestedCount = getRequestedIdeationCount();
 
     // 灵感推荐由联网参考案例库驱动（js/trend_refs.js）：勾选了参考就直接从选中
     // 案例取材；没勾选则后端自动联网搜索（结果沉淀回案例库）
@@ -4358,14 +4388,19 @@ async function loadIdeationCards(force = false, options = {}) {
     const pacingSkeletonIds = getSelectedPacingSkeletonIds();
     const pacingSkeletonKey = pacingSkeletonIds.slice().sort().join(',');
 
+    const countKey = getIdeationCountKey();
+
     if (!force && !remixSeed) {
         const cached = localStorage.getItem('ideation_cached_ideas');
-        // 缓存与生成时勾选的联网参考集合绑定：勾选变了缓存即视为过期重新生成，
-        // 不能把按别的参考取材的灵感当成这批参考的
+        // 缓存与生成时勾选的联网参考集合、骨架、以及「生成数」设置绑定。
+        // 生成数此前没进绑定键：改成 10 张之后不点「换一批」就还是那批旧卡，
+        // 看起来就像「选了生成数也没用」。
         const cachedSel = localStorage.getItem('ideation_cached_trend_sel');
         const cachedSkeletons = localStorage.getItem('ideation_cached_pacing_skeletons');
+        const cachedCount = localStorage.getItem('ideation_cached_count');
         const cachedVersion = localStorage.getItem('ideation_cache_version');
         if (cached && cachedSel === selKey && cachedSkeletons === pacingSkeletonKey
+                && cachedCount === countKey
                 && cachedVersion === IDEATION_CACHE_VERSION) {
             try {
                 const parsed = JSON.parse(cached);
@@ -4390,9 +4425,9 @@ async function loadIdeationCards(force = false, options = {}) {
     const pendingMsg = remixSeed
         ? `正在以「${remixSeed.one_line || remixSeed.topic_dna || '台账创意'}」为母题激发二创方案`
         : selIds.length > 0
-        ? `正在从选中的 ${selIds.length} 条联网参考案例中取材激发灵感`
-        : `正在从案例库自动挑选参考激发灵感中`;
-    renderIdeationPending(container, pendingMsg);
+        ? `正在从选中的 ${selIds.length} 条联网参考案例中取材激发灵感 (${requestedCount} 张)`
+        : `正在从案例库自动挑选参考激发灵感中 (${requestedCount} 张)`;
+    renderIdeationPending(container, pendingMsg, requestedCount);
     ideationInFlight = true;
     if (typeof setSparkIdeating === 'function') setSparkIdeating(true);
 
@@ -4404,7 +4439,7 @@ async function loadIdeationCards(force = false, options = {}) {
             },
             body: JSON.stringify({
                 config: config,
-                count: 4,
+                count: requestedCount,
                 trend_ref_ids: selIds,
                 pacing_skeleton_ids: pacingSkeletonIds,
                 remix_seed: remixSeed
@@ -4412,8 +4447,6 @@ async function loadIdeationCards(force = false, options = {}) {
         });
 
         const data = await response.json();
-        // ideas 为空数组时 data.ideas 仍然是真值：以前会当成功走下去，把空批次写进
-        // 缓存、渲染成一句「暂无灵感推荐」，用户看不出后端到底出了什么事。
         if (data.status === 'ok' && Array.isArray(data.ideas) && data.ideas.length > 0) {
             currentIdeatedIdeas = data.ideas;
             currentIdeationTrendRefs = Array.isArray(data.trend_refs) ? data.trend_refs : [];
@@ -4422,11 +4455,17 @@ async function loadIdeationCards(force = false, options = {}) {
                 localStorage.setItem('ideation_cached_trend_refs', JSON.stringify(currentIdeationTrendRefs));
                 localStorage.setItem('ideation_cached_trend_sel', selKey);
                 localStorage.setItem('ideation_cached_pacing_skeletons', pacingSkeletonKey);
+                localStorage.setItem('ideation_cached_count', countKey);
                 localStorage.setItem('ideation_cache_version', IDEATION_CACHE_VERSION);
             }
             renderIdeationCards(data.ideas);
-            // 无论走哪条来源分支，used_count 都可能变化、命中自动归档阈值的条目会从
-            // 主库消失，每次生成后都要刷新左侧列表，避免残留已归档条目可勾选
+            // 交付张数少于请求张数时说清原因：后端把没通过节拍骨架验收的候选丢掉了，
+            // 不说的话用户只看到「选了 5 张却只回来 2 张」，只能怀疑生成数没生效。
+            if (!remixSeed && data.ideas.length < requestedCount && typeof showToast === 'function') {
+                showToast(`本批只产出 ${data.ideas.length} 张（请求 ${requestedCount} 张）：`
+                    + '其余候选没通过所选节拍骨架的验收已被丢弃。想更容易凑齐可在细调条里'
+                    + '同时勾上「单线里程碑推进」。', 'info');
+            }
             if (typeof loadTrendRefs === 'function') loadTrendRefs();
         } else {
             renderIdeationFailure(container,
@@ -4441,9 +4480,8 @@ async function loadIdeationCards(force = false, options = {}) {
     }
 }
 
-// 激发中的卡片区占位：已有卡片就原样留着（只加 .is-ideating 让它整体后退一层），
-// 一张都没有时铺 4 张骨架卡，避免"点了按钮页面一片空白"。
-function renderIdeationPending(container, message) {
+// 激发中的卡片区占位：已有卡片就原样留着，空库时按 requestedCount 铺骨架卡。
+function renderIdeationPending(container, message, requestedCount = 5) {
     if (!container) return;
     const keepOld = !!container.querySelector('.ideation-card');
     const text = keepOld ? `${message}…（下方是上一批，仍可点选）` : `${message}…`;
@@ -4452,7 +4490,8 @@ function renderIdeationPending(container, message) {
     if (!keepOld) {
         container.innerHTML = '';
         strip = null;
-        for (let i = 0; i < 4; i++) {
+        const count = Math.max(1, requestedCount || 5);
+        for (let i = 0; i < count; i++) {
             const sk = document.createElement('div');
             sk.className = 'ideation-card-skeleton';
             container.appendChild(sk);

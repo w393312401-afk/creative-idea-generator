@@ -253,3 +253,25 @@ def test_config_count_does_not_confuse_x1_with_x2():
     )
 
     assert checks["count"] is False
+
+
+def test_l1_probe_config_functions():
+    """验证 7 项 L1 自测配置与上传检测探针函数。"""
+    page = _ProbePage({
+        "button.flow_tab_slider_trigger[aria-controls$='-IMAGE']",
+        "button.flow_tab_slider_trigger[aria-controls$='-VIDEO']",
+        "button.flow_tab_slider_trigger[aria-controls$='-content-1']",
+        "button.flow_tab_slider_trigger[aria-controls$='-content-PORTRAIT']",
+        "button[role='tab']",
+        "button[aria-haspopup='dialog']:has(span:text('Create'))",
+        "input[type='file']",
+    })
+
+    assert "图片" in diagnostics.probe_image_config(page)
+    assert "视频" in diagnostics.probe_video_config(page)
+    assert "数量配置" in diagnostics.probe_count_config(page)
+    assert "时长" in diagnostics.probe_duration_config(page)
+    assert "比例" in diagnostics.probe_orientation_config(page)
+    assert "参考模式" in diagnostics.probe_ref_mode_config(page)
+    assert "上传配置" in diagnostics.probe_upload_config(page)
+

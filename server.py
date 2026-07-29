@@ -1234,8 +1234,8 @@ def render_staged_worker(task_id, config, title, prompt_block):
 _FX_SERIAL_LOCK = threading.Lock()
 
 # 兜底互斥锁的最长等待：正常情况下 FX_CONTROL 已保证单活跃，走到超时说明有调用方
-# 绕过了队列（回归测试 tests/test_fx_serial_lock_guard.py 覆盖这个场景）。
-_FX_GUARD_LOCK_TIMEOUT_SECONDS = 300
+# 绕过了队列。设为 10s 避免孤儿锁挂住整个 FX_CONTROL 队列。
+_FX_GUARD_LOCK_TIMEOUT_SECONDS = 10
 
 
 @contextlib.contextmanager
@@ -2829,6 +2829,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     except Exception:
                         pass
                     count = FX_CONTROL.force_release_active(task_id=tid, actor=actor)
+                    try:
+                        if _FX_SERIAL_LOCK.locked():
+                            _FX_SERIAL_LOCK.release()
+                    except RuntimeError:
+                        pass
                     if tid and tid in ACTIVE_TASKS:
                         with ACTIVE_TASKS_LOCK:
                             t = ACTIVE_TASKS[tid]
@@ -3517,7 +3522,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
                 body = self._read_json_body()
                 config = effective_config(body.get('config'))
-                count = body.get('count', 8)
+                count = body.get('count', 5)
                 # 基础场景主题选择器已移除；theme/theme_label 仅为旧客户端兼容保留。
                 # trend_ref_ids=用户在联网参考案例库勾选的条目 id：非空时本批灵感
                 # 以选中案例为首要创意来源(不再自动联网搜索)

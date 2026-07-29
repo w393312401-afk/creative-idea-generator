@@ -401,8 +401,13 @@ class TestRunIdeateReturnShape(unittest.TestCase):
         self.assertEqual(fixed['threshold_variant'], 'coaxial')
         self.assertTrue(fixed['require_visible_threshold_video'])
 
+        # 单线骨架不动过门几何；只额外落两个说明性字段（骨架名 + 载体是否开拍后才运到）
         old = {'mode': 'Standard', 'threshold_variant': 'coaxial'}
-        self.assertEqual(pp.apply_pacing_skeleton_to_brief(old.copy(), 'linear_milestone'), old)
+        linear = pp.apply_pacing_skeleton_to_brief(old.copy(), 'linear_milestone')
+        self.assertEqual(linear['mode'], 'Standard')
+        self.assertEqual(linear['threshold_variant'], 'coaxial')
+        self.assertEqual(linear['pacing_skeleton'], 'linear_milestone')
+        self.assertFalse(pp.carrier_arrives_on_camera(linear))
 
     def test_dual_payoff_label_cannot_pass_with_a_linear_outline(self):
         """长度、过门位置、外部族、内部层族全都合格，只是外部幕从来没有"完工"过——
@@ -641,16 +646,23 @@ class TestPacingGateDoesNotDiscardPassingCards(unittest.TestCase):
         # 标签必须诚实：内容是单线清单，就不能继续挂 dual_payoff 的牌子
         self.assertEqual([i['pacing_skeleton'] for i in result['ideas']],
                          ['dual_payoff', 'linear_milestone'])
-        # 已经有卡片过关时最多再补一次，不再把三次机会全烧完
-        self.assertEqual(mock_chat.call_count, 2)
+        # 两张都能诚实交付 = 已经凑够用户要的 2 张，不必再烧一次 150s 调用
+        self.assertEqual(mock_chat.call_count, 1)
 
-    def test_dual_only_selection_drops_the_failing_card_but_keeps_the_rest(self):
+    def test_short_batch_spends_the_remaining_attempts_topping_up_to_count(self):
+        """用户在 GUI 选的生成数是硬要求：本轮少收了卡就用掉剩下的尝试补齐。
+
+        旧行为是「有一张过关 + 本轮有失败」就直接收工，于是选 5 张只回来 1~2 张
+        （只勾 dual/nested 时更是一张不剩，掉进静态兜底）。现在按缺口继续要卡，
+        上限仍是原来的 3 次调用。
+        """
         result, mock_chat = self._run(['dual_payoff'])
+        # 三次都只给得出同一张合格卡（补的那两次全被去重/门禁拦下）
         self.assertEqual([i['title'] for i in result['ideas']], ['合格卡'])
         self.assertEqual(result['ideas'][0]['pacing_skeleton'], 'dual_payoff')
-        self.assertEqual(mock_chat.call_count, 2)
+        self.assertEqual(mock_chat.call_count, 3)
 
-    def test_whole_batch_failing_uses_all_three_attempts_then_still_delivers(self):
+    def test_whole_batch_failing_delivers_the_downgraded_card_without_extra_calls(self):
         payload = json.dumps([{
             'title': '写成单线的卡', 'dna': 'b / refuge / y',
             'pacing_skeleton': 'dual_payoff', 'beat_outline': self.LINEAR_OUTLINE,
@@ -661,9 +673,31 @@ class TestPacingGateDoesNotDiscardPassingCards(unittest.TestCase):
              patch.object(pp, '_chat', return_value=payload) as mock_chat:
             result = pp.run_ideate({}, count=1,
                                    pacing_skeleton_ids=['linear_milestone', 'dual_payoff'])
-        self.assertEqual(mock_chat.call_count, 3)
+        # 降级后的卡本身就在用户勾选的骨架里，已经凑够 count：重试只会拿回同一张
+        self.assertEqual(mock_chat.call_count, 1)
         self.assertEqual([i['title'] for i in result['ideas']], ['写成单线的卡'])
         self.assertEqual(result['ideas'][0]['pacing_skeleton'], 'linear_milestone')
+
+    def test_nested_only_batch_downgrades_instead_of_falling_back_to_stale_topics(self):
+        """只勾了 nested 且整批没过它的专属门禁时，以前一张都留不下 → 退回三条写死的
+        静态兜底选题，再被台账去重砍成一两张：用户看到的就是「每次只出一张卡」。
+        现在最后一步把这些本来就是单线清单的卡降级成 linear_milestone 诚实交付。"""
+        payload = json.dumps([
+            {'title': '单线卡一', 'dna': 'p / refuge / x',
+             'pacing_skeleton': 'nested_space_payoff', 'beat_outline': self.LINEAR_OUTLINE},
+            {'title': '单线卡二', 'dna': 'q / refuge / y',
+             'pacing_skeleton': 'nested_space_payoff',
+             'beat_outline': list(self.LINEAR_OUTLINE[:-1]) + ['通电亮灯,人物入住']},
+        ], ensure_ascii=False)
+        with patch.object(pp, 'read_ledger', return_value=[]), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', return_value=payload):
+            result = pp.run_ideate({}, count=2,
+                                   pacing_skeleton_ids=['nested_space_payoff'])
+        self.assertEqual([i['title'] for i in result['ideas']], ['单线卡一', '单线卡二'])
+        self.assertEqual([i['pacing_skeleton'] for i in result['ideas']],
+                         ['linear_milestone', 'linear_milestone'])
 
     def test_exhausted_fallback_raises_instead_of_returning_an_empty_batch(self):
         """兜底选题被台账全部认领时，以前静静返回空数组，前端只显示「暂无灵感推荐」,

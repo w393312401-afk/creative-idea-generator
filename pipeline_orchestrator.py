@@ -1086,7 +1086,8 @@ def run_autonomous_pipeline(config, dimensions, on_progress=None):
 
     if on_progress:
         on_progress('packet_refine_start', {'message': '正在依据已确认的首帧修正 Drift Lock 数据包...'})
-    state['packet'] = refine_packet_from_accepted_anchor(config, gate['image_path'], state['packet'])
+    state['packet'] = refine_packet_from_accepted_anchor(
+        config, gate['image_path'], state['packet'], state.get('parsed_brief'))
     if on_progress:
         on_progress('packet_refined', {'message': 'Drift Lock 数据包已依据实际渲染结果修正。'})
 

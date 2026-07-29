@@ -1600,6 +1600,33 @@ def check_anchor_frame_compliance(config, image_path, image_1_prompt, packet, pa
     level = qa_gate_level(config)
     if level == 'off':
         return _QA_OFF_VERDICT
+    # 载体后到的项目（双空间重置兑现）：首帧按契约就是**没有载体**的空场地，载体在 Beat 1
+    # 被吊装进来。不给门禁换口径的话，它会拿 brief 里的载体去比对首帧，把完全正确的空场地
+    # 判成「与题材无关」/「壳体不够宏大」，逼着一直重画到画出载体为止——正好把我们要消除的
+    # 「第一帧就出现载体」重新逼回来。
+    _delivered = carrier_arrives_on_camera(parsed_brief)
+    _premise_carrier = (parsed_brief or {}).get('carrier', 'the carrier')
+    _premise_env = (parsed_brief or {}).get('env', 'its environment')
+    _premise_trauma = (parsed_brief or {}).get('trauma', 'a ruined state')
+    if _delivered:
+        _premise_line = (
+            f"the EMPTY, untouched site in \"{_premise_env}\" that will later receive "
+            f"\"{_premise_carrier}\". The carrier is delivered by machinery in the FIRST beat, so it must "
+            f"NOT be visible here — bare wild ground is the correct subject, and a frame that already "
+            f"contains the carrier (or the truck, trailer, or crane that brings it) is a FAILURE"
+        )
+        _tone_line = (
+            "The SITE should read as wild, raw and striking — an improbable place to drop a shelter "
+            "into — not a tidy, prepared, or suburban-looking building plot. Judge the ground, terrain "
+            "and surroundings; do not expect any structure in frame"
+        )
+    else:
+        _premise_line = f"\"{_premise_carrier}\" in \"{_premise_env}\" in a ruined state (\"{_premise_trauma}\")"
+        _tone_line = (
+            "The shell should read as monumental, improbable, and visually striking — a raw, "
+            "wild-looking structure nobody would expect to be habitable — not a small, mundane, or "
+            "generic-looking space"
+        )
     if level == 'lenient':
         try:
             system_prompt = (
@@ -1610,10 +1637,13 @@ def check_anchor_frame_compliance(config, image_path, image_1_prompt, packet, pa
                 "H1. PEOPLE/MACHINERY: any person, worker, or active machine visible in the image.\n"
                 "H2. TEXT ARTIFACTS: readable text, captions, watermarks, or UI glyphs rendered into the scene.\n"
                 "H3. TOTALLY OFF-PREMISE: the image has clearly nothing to do with this project's premise: "
-                f"\"{parsed_brief.get('carrier', 'the carrier')}\" in \"{parsed_brief.get('env', 'its environment')}\" "
-                f"in a ruined state (\"{parsed_brief.get('trauma', 'a ruined state')}\") — e.g. a portrait, a product "
+                f"{_premise_line} — e.g. a portrait, a product "
                 "photo, or an unrelated scene. A plausible but imperfect rendition of the premise must NOT fail.\n"
-                "H4. INTERVENTION EVIDENCE: any tool, ladder, scaffolding, paint can, tarp, staged/stacked fresh "
+                + (f"H3b. CARRIER ALREADY PRESENT: {_premise_carrier} (or any large vehicle, container, "
+                   "hull, fuselage, or shell that reads as it) is visible in the frame. It is delivered on "
+                   "camera in the first beat, so its presence here breaks the opening beat.\n"
+                   if _delivered else "")
+                + "H4. INTERVENTION EVIDENCE: any tool, ladder, scaffolding, paint can, tarp, staged/stacked fresh "
                 "construction material, work light, safety cone, or any surface/patch that reads as "
                 "already-repaired, already-cleaned, or already-painted. Nobody has touched this space yet.\n"
                 "H5. INSUFFICIENT DAMAGE (a lenient threshold, lower than the strict gate's): the scene must "
@@ -1630,7 +1660,7 @@ def check_anchor_frame_compliance(config, image_path, image_1_prompt, packet, pa
                 "Response format:\n"
                 "- No hard failure and nothing notable: respond EXACTLY with: PASS\n"
                 "- No hard failure but something is worth recording: respond with: PASS_WITH_WARNINGS: <one short note in Chinese>\n"
-                "- A hard failure H1-H5 is present: respond with: FAIL: <reason in Chinese, at most 2 sentences>"
+                "- Any hard failure above is present: respond with: FAIL: <reason in Chinese, at most 2 sentences>"
             )
             user_text = f"IMAGE 1 prompt that was used to generate this image:\n{image_1_prompt}\n\nPlease audit the attached image."
             response = _multimodal_chat(config, system_prompt, user_text, [image_path])
@@ -1672,12 +1702,14 @@ def check_anchor_frame_compliance(config, image_path, image_1_prompt, packet, pa
             "faded, or covered in light dust WITHOUT at least three of these categories present must FAIL — "
             "generic mild weathering is not sufficient severity for a trauma anchor.\n"
             "6. GENRE TONE (most important): this project's premise is "
-            f"\"{parsed_brief.get('carrier', 'the carrier')}\" in \"{parsed_brief.get('env', 'its environment')}\", "
-            f"currently in this ruined state: \"{parsed_brief.get('trauma', 'a ruined state')}\". The shell "
-            "should read as monumental, improbable, and visually striking — a raw, wild-looking structure "
-            "nobody would expect to be habitable — not a small, mundane, or generic-looking space. Fail this "
+            f"{_premise_line}. {_tone_line}. Fail this "
             "check if the image looks like an ordinary interior/exterior with none of that scale or wildness.\n"
-            "7. NO TEXT ARTIFACTS: no readable text, captions, watermarks, or UI glyphs rendered into the scene.\n\n"
+            + (f"6b. CARRIER MUST BE ABSENT: {_premise_carrier} is hauled in and set down by machinery in "
+               "the FIRST beat, so this anchor frame must show the bare receiving ground only. FAIL if the "
+               "carrier — or any large vehicle, container, hull, fuselage, cabin or shell that reads as it, "
+               "or the truck/trailer/crane delivering it — is visible anywhere in the frame.\n"
+               if _delivered else "")
+            + "7. NO TEXT ARTIFACTS: no readable text, captions, watermarks, or UI glyphs rendered into the scene.\n\n"
             "Response format:\n"
             "- If all checks pass, respond EXACTLY with: PASS\n"
             "- Otherwise respond with: FAIL: <reason in Chinese, at most 2 sentences, name the single most "
@@ -1696,14 +1728,25 @@ def check_anchor_frame_compliance(config, image_path, image_1_prompt, packet, pa
         return _judge_unavailable_verdict(config, 'ANCHOR QA', e)
 
 
-def refine_packet_from_accepted_anchor(config, image_path, packet):
+def refine_packet_from_accepted_anchor(config, image_path, packet, parsed_brief=None):
     """
     After IMAGE 1 passes the Anchor Acceptance Gate, reconcile the Drift Lock packet
     (written by an LLM before any image ever existed) against what the image model
     actually rendered, so beats 2..N+1 are written against confirmed reality instead
     of the pre-visualized spec. Falls back to the original packet unchanged on any
     parse/API failure — this is a refinement pass, not a required generation step.
+
+    parsed_brief is optional context: when the carrier is delivered on camera in Beat 1,
+    it is legitimately absent from IMAGE 1, and "reconcile against what is visible" must
+    not be read as "delete the carrier from the ledger".
     """
+    _delivered_note = (
+        "\n\nIMPORTANT CONTEXT: in this project the carrier is hauled onto the site by machinery "
+        "during Beat 1, so IMAGE 1 deliberately shows the empty receiving ground with no carrier in "
+        "it. Any object_ledger entry describing the carrier itself is CORRECT even though it is not "
+        "visible here — keep it verbatim, and do not add it to the primary landmarks."
+        if carrier_arrives_on_camera(parsed_brief) else ""
+    )
     system_prompt = (
         "You are a spatial consistency supervisor reconciling a Drift Lock & SCUP packet against "
         "the ACTUAL rendered anchor image (IMAGE 1) for a restoration time-lapse project. The packet "
@@ -1717,7 +1760,7 @@ def refine_packet_from_accepted_anchor(config, image_path, packet):
         "primary_landmarks / frame_boundaries / object_ledger entries that clearly contradict what is "
         "visible (e.g. a landmark that isn't there, a grid position that's obviously wrong, a lens/height "
         "that doesn't match the visible framing). Do not invent new landmarks or objects that are not "
-        "visible in the image. No markdown, no code fences, no other text."
+        "visible in the image. No markdown, no code fences, no other text." + _delivered_note
     )
     user_text = f"Current packet:\n{json.dumps(packet, indent=2, ensure_ascii=False)}\n\nReconcile this packet against the attached IMAGE 1."
 
@@ -5652,17 +5695,36 @@ Required JSON keys:
     elif pacing_skeleton_id == 'nested_space_payoff':
         _pacing_plan_block = (
             "\nSelected pacing skeleton (MANDATORY narrative structure, while physical construction "
-            "order remains authoritative): nested_space_payoff / 双空间重置兑现. Treat the first "
-            "functional zone as a complete act: establish the extreme placement or concealment hook, "
-            "then progress through clearly visible material states and finish by stocking/furnishing "
+            "order remains authoritative): nested_space_payoff / 双空间重置兑现. This skeleton's carrier "
+            "is a MAN-MADE TRANSPORTABLE shell (shipping container, retired school bus/coach, aircraft "
+            "fuselage, rail car, tanker, boat hull, trailer/module), so BEAT ONE is its delivery: heavy "
+            "equipment visibly present in frame — mobile crane, flatbed/lowboy truck, excavator — hauls "
+            "the whole shell onto the site and sets it into its final position (pit, pad, "
+            "trench). Do not open on cleaning or repairing a shell that is already in place. "
+            "THE STARTING POINT IMAGE (IMAGE 1) FOR THIS PROJECT IS THE EMPTY SITE WITH NO CARRIER IN IT, "
+            "so Beat 1's \"before_state\" must say exactly that — bare ground/terrain, the carrier nowhere "
+            "in frame — and its \"after_state\" is the whole shell resting in its final seated position, "
+            "with the machinery gone and its delivery traces left behind (fresh spoil ridge, track ruts, "
+            "sling scuffs, crushed vegetation). That beat may package the seat excavation together with "
+            "the placement, since both serve the one terminal product \"shell seated in the ground\"; its "
+            "\"changed_grid_cells\" cover where the shell lands, and no later beat may re-place or re-seat "
+            "it. Treat the first "
+            "functional zone as a complete act: follow the delivery with the burial/concealment work and "
+            "visibly resolve the exterior into a usable entrance, then progress through cleanout -> "
+            "membrane/hidden layer -> framing -> cavity fill -> board closure -> finish surfaces and "
+            "finish by stocking/furnishing "
             "that zone until its function is unmistakable. The beat immediately before the reset is "
             "the primary-space mini-payoff, not a partial surface milestone. Then make EXACTLY ONE "
-            "DECLARED HARD CUT to a distinct, untouched secondary raw space. This cut resets the camera "
+            "DECLARED HARD CUT to a distinct, untouched secondary raw space — another compartment/section "
+            "of the delivered shell, or a second unit set beside it, never a natural cavity. "
+            "This cut resets the camera "
             "and the secondary-space work queue only; the completed primary space remains complete. "
             "Rebuild the secondary space bottom-up: clean/base -> membrane or hidden services -> grid "
             "framing -> cavity fill -> board closure -> finish surfaces -> core furniture. Reveal a "
-            "different function from the first zone, accelerate through useful contents/value stacking, "
-            "and end with a clean worker-free wide reward. Do not turn the reset into a doorway travel "
+            "different function from the first zone, accelerate the cadence once core furniture appears "
+            "through soft furnishing and useful-content/value stacking, and end with a brief clean "
+            "worker-free wide reward. Every beat must produce one obvious visible result change. Do not "
+            "turn the reset into a doorway travel "
             "shot, do not revisit or regress the first zone, and do not merge the two payoffs.\n"
         )
     else:
@@ -5921,6 +5983,31 @@ Space Type: {space_type}
     if not beat_ladder_accepted:
         raise RuntimeError('Beat ladder generation failed the visible-milestone planning gate after three attempts.')
     total_beats = len(beat_ladder)
+    # 载体后到的项目：Beat 1 就是「装备把整只壳体运到现场并落位」。确定性地打在梯子上
+    # （而不是让下游各处再猜一次），后续的拍级提示词、机械豁免、断点续传都从这一个标记读。
+    if carrier_arrives_on_camera(parsed_brief) and isinstance(beat_ladder[0], dict):
+        beat_ladder[0]['carrier_delivery'] = True
+        # 兜底 ladder 的第 1 拍是通用的「stage 1 清障」文案，它与「首帧是空场地」互相矛盾
+        # （没有载体可清）。兜底路径也要说得通，否则 LLM 规划一失败就退回一条自相矛盾的梯子。
+        # 注：上面那条 `if not beat_ladder_accepted: raise` 目前会先一步抛错，确定性兜底
+        # ladder 因此是**当前不可达**的分支（beat_ladder_accepted 只在 LLM 路径通过验收时
+        # 置真）。这里照样把它写对，等哪天决定"规划失败要不要降级交付"时不必再补一遍。
+        if str(beat_ladder[0].get('milestone_name') or '').startswith('stage 1'):
+            _carrier_label = parsed_brief.get('carrier') or 'the carrier'
+            beat_ladder[0].update({
+                'operation': 'repair',
+                'description': (f'Heavy equipment hauls {_carrier_label} onto the empty site and lowers '
+                                f'it into its final seated position'),
+                'milestone_name': 'carrier seated on site',
+                'before_state': 'the site is empty ground; the carrier is nowhere in frame',
+                'after_state': (f'{_carrier_label} rests in its final seated position with all machinery '
+                                f'gone and delivery traces left in the ground'),
+                'completion_extent': 'the whole carrier, fully landed on its final footprint',
+                'package_operations': ['placement'],
+                'primary_progress': 'the carrier descends from suspended to fully seated',
+                'secondary_progress': 'the bare ground turns into a seated footprint ringed with spoil',
+                'persistent_traces': ['track ruts', 'spoil ridge', 'sling scuff marks'],
+            })
     import hashlib
     milestone_cache_basis = json.dumps(
         [{'name': b.get('milestone_name'), 'after': b.get('after_state')}
@@ -5968,6 +6055,16 @@ Space Type: {space_type}
 12. "interior_primary_landmarks": A list of 2-3 INTERIOR landmarks that become the post-crossing primary anchors. {_peek_clause} CARRIER IDENTITY (mandatory): at least ONE (prefer TWO) of them must be a fixed identity feature of THIS carrier's interior that makes the space unmistakably this carrier and no generic room — e.g. a school bus's side window band, ribbed roof curve, or wheel arches; a boat's rib frames or portholes; an aircraft's window row or overhead bins; this carrier's own equivalents. Each is a JSON object with "name", "grid" (their settled post-crossing Grid cell), and "z_depth_scale" (their settled frame-height percentage).
 13. "interior_light_source": One sentence naming the interior's main light source for post-crossing IMAGEs, chosen in this priority order: (a) the carrier's own existing openings (window band, portholes, skylight) if it has any; (b) a practical/work light installed in an earlier on-camera beat; (c) directional entry daylight from BEHIND the camera (a bright wedge across the floor — never a visible doorway in frame). NEVER invent windows or openings the carrier does not have."""
 
+        # 载体后到的项目：外部族的三个 primary_landmarks 是**每一张外部 IMAGE**（含还没有
+        # 载体的 IMAGE 1）都要逐字复述的锚点。把载体本身登记成锚点，IMAGE 1 就必须描述一个
+        # 尚未运到的东西——首帧要么画出载体（钩子作废），要么漏掉锚点（后续每拍的
+        # check_primary_landmarks_exact_match 全线报错）。所以锚点只能取场地自身的特征。
+        _delivered_carrier_packet_rule = ""
+        if carrier_arrives_on_camera(parsed_brief):
+            _delivered_carrier_packet_rule = """
+DELIVERED-CARRIER ANCHOR RULE (mandatory for this project): the carrier is hauled onto the site by heavy equipment during Beat 1, so IMAGE 1 shows the EMPTY receiving site and the carrier only enters the frame from Beat 1's resulting IMAGE onward. Therefore all three "primary_landmarks" (and the exterior "frame_boundaries") MUST be permanent features of the SITE that are already there before the delivery and stay visible after it — terrain edges, a rock outcrop or boulder, a slope/bank line, a tree line, a derelict retaining wall or slab corner, a fence run. NEVER register the carrier itself, any part of it (its shell, roof, door, windows, hull), or anything built later as an exterior primary landmark. "geometry_lock" likewise describes the site's fixed geometry, and "object_ledger" may list the carrier with an "initial_state" that says plainly it is absent from IMAGE 1 and arrives in Beat 1.
+"""
+
         packet_system = f"""You are a spatial consistency supervisor for a time-lapse renovation prompt composer.
 Your job is to generate a comprehensive Drift Lock & SCUP Packet for the project.
 You must output ONLY a valid JSON object matching the keys below, with no other text, no markdown, and no code fences.
@@ -5986,7 +6083,7 @@ Required JSON keys:
 8. "lighting_phase_ladder": A mapping of IMAGE indices (1 to {total_beats + 1}) to lighting phases (e.g. "ambient only", "temporary work light active", etc.). Shadow and exposure progression must be monotonic.
 9. "passive_environment": Direction and elements for passive layers (e.g. clouds, watercaustics).
 10. "interest_budget": A dictionary with keys "clip_hooks", "sequence_reveal", and "final_reward".{interior_family_keys}
-
+{_delivered_carrier_packet_rule}
 ==================== REFERENCE GUIDES ====================
 {assembly_ref}
 {scup_ref}
@@ -6067,6 +6164,34 @@ Beat Ladder:
             f"small (about one-fifth of frame height); never leave the opening dark or blank."
         )
 
+    # 「载体是被运来的」这一类项目（双空间重置兑现）：Beat 1 的动作就是吊车/平板车把
+    # 整只壳体送到现场，所以 IMAGE 1 必须是**载体尚未到场的空场地**。首帧一旦已经画出
+    # 载体，Beat 1 的视频就没有可交付的状态变化（壳体已经在那儿了），运输钩子当场作废
+    # ——这正是用户看到的「第一帧就出现载体」。下面这条改写规则 5/7 的取景对象，并明令
+    # 载体不得入镜；rule 1 已经禁掉了机械，卡车/吊车同样不会出现在首帧。
+    _img1_delivery_rule = ""
+    _img1_subject = "carrier"
+    if carrier_arrives_on_camera(parsed_brief):
+        _img1_subject = "receiving site"
+        _carrier_name = parsed_brief.get('carrier') or 'the carrier'
+        # 编号跟着 PBISP 那条走：两条理论上互斥（PBISP 要求 Beat 1 是桥接拍，本骨架是
+        # hard_cut），但重复的"9."会让整份规则表读起来像少了一条。
+        _delivery_rule_no = 10 if _img1_pbisp_rule else 9
+        _img1_delivery_rule = (
+            f"\n{_delivery_rule_no}. CARRIER NOT YET ON SITE (mandatory; this rule overrides the framing subject of rules 5 "
+            f"and 7): in this project the carrier — {_carrier_name} — is hauled in and set down by heavy "
+            f"equipment during Beat 1, so IMAGE 1 is the EMPTY RECEIVING SITE photographed before anything "
+            f"arrives. The carrier must NOT appear anywhere in this frame, not even partially, distantly, "
+            f"or as a silhouette, and neither must the truck, trailer, crane, or any other vehicle. "
+            f"Compose the wide establishing shot around the untouched ground that will receive it — the "
+            f"clearing, slope, yard, quarry floor, or hollow, its terrain, edges, and surrounding "
+            f"landscape — and satisfy rule 5's damage categories from THAT GROUND's own neglect: collapsed "
+            f"retaining stones, eroded gullies and slumped banks, a cracked derelict slab, rusted scrap and "
+            f"sagging fence wire, weeds and saplings taking the ground, scattered rubble. The site must "
+            f"read as a wild, striking, monumental place — the improbable spot someone would drop a shelter "
+            f"into — never a tidy prepared building plot."
+        )
+
     image_1_system = f"""You are a professional prompt composer. Your job is to generate the very first IMAGE prompt (IMAGE 1 / Trauma State) for the renovation project.
 You must output ONLY the prompt text, with no other text, no title, no labels. The prompt must be in English.
 
@@ -6084,10 +6209,16 @@ Hard Rules:
 4. Natural-Language Visual-Only Translation Rule (NLVTR): No '%', no numeric ranges, no acronyms (HAL, NGCS, OSPL, etc.) in the text.
 5. GENUINE DAMAGE SEVERITY (mandatory, a positive threshold — not just "not clean"): describe clear, specific evidence from AT LEAST THREE of these four independent categories: (a) structural damage — cracks, collapse, sagging, holes, missing sections; (b) surface decay — rust, water stains, peeling paint, mold/mildew, corrosion; (c) biological/vegetation intrusion — moss, vines, roots, weeds growing through gaps or across surfaces; (d) debris/clutter accumulation — rubble, fallen materials, scattered trash, collapsed fixtures. Name concrete materials and locations for each (e.g. "rust streaks down the west wall", "moss spreading across the collapsed roof section") — light dust or generic "aged" wording alone does not satisfy this rule. Set the whole scene as this initial trauma state.
 6. REALISM (mandatory): strictly documentary photorealism — a real place captured on a real camera. Only real-world, present-day materials and weathering (wood, stone, rust, moss, dust, standard building debris). NO sci-fi, futuristic, cyberpunk, holographic, glowing-tech, LED-neon, or spacecraft-style elements.
-7. WIDE ESTABLISHING SHOT (mandatory): this is the viewer's first impression of the WHOLE scene/carrier at once — a wide establishing view, never a close-up or detail crop of one small area. Frame it so the full extent of the carrier and its immediate surroundings is visible in one shot. Even at this wide scale, the damage from rule 5 must stay unmistakably legible — call out decayed surfaces/materials large enough to read clearly at this distance (a whole collapsed section, a wide rust-streaked panel, a spreading moss patch), not just small details that would vanish at this framing; the shot must read as a monumental, striking find, not a small or mundane-looking space.
-8. SINGLE CONTINUOUS PHOTOGRAPH (mandatory): this is one real photograph of one moment — never a grid of multiple panels, a collage, a storyboard, a comparison/before-after split, or a multi-view composite. The "Grid A1-C3" notation used elsewhere in this contract is an internal composition-registration convention for you the writer — never describe or render literal grid lines, panel borders, or divided frames in the image itself.{_img1_pbisp_rule}
+7. WIDE ESTABLISHING SHOT (mandatory): this is the viewer's first impression of the WHOLE scene/{_img1_subject} at once — a wide establishing view, never a close-up or detail crop of one small area. Frame it so the full extent of the {_img1_subject} and its immediate surroundings is visible in one shot. Even at this wide scale, the damage from rule 5 must stay unmistakably legible — call out decayed surfaces/materials large enough to read clearly at this distance (a whole collapsed section, a wide rust-streaked panel, a spreading moss patch), not just small details that would vanish at this framing; the shot must read as a monumental, striking find, not a small or mundane-looking space.
+8. SINGLE CONTINUOUS PHOTOGRAPH (mandatory): this is one real photograph of one moment — never a grid of multiple panels, a collage, a storyboard, a comparison/before-after split, or a multi-view composite. The "Grid A1-C3" notation used elsewhere in this contract is an internal composition-registration convention for you the writer — never describe or render literal grid lines, panel borders, or divided frames in the image itself.{_img1_pbisp_rule}{_img1_delivery_rule}
 """
-    image_1_user = f"Generate IMAGE 1 prompt for theme: {theme}."
+    if carrier_arrives_on_camera(parsed_brief):
+        image_1_user = (
+            f"Generate IMAGE 1 prompt for theme: {theme}. Remember: this is the empty site BEFORE the "
+            f"carrier is delivered — describe the ground and landscape only, never the carrier itself."
+        )
+    else:
+        image_1_user = f"Generate IMAGE 1 prompt for theme: {theme}."
     
     # skill 直出模式：IMAGE 1 一次生成即采纳——确定性修复（clean/clean-frame/camera DNA）
     # 照常兜住硬伤，结构校验只记录不再触发整次重生成；重试仅针对传输/代理故障。
@@ -6109,6 +6240,20 @@ Hard Rules:
                 errs.extend(check_anchor_scale_lock(image_1_prompt, packet))
                 if _img1_is_pre_bridge:
                     errs.extend(check_pbisp_peek(image_1_prompt, packet))
+                # 唯一一条在直出模式下仍然重生成的首帧硬伤：载体提前入镜。
+                # 其余校验是「画面质量瑕疵」，改不改都还是同一场戏；而载体入镜会让
+                # Beat 1（把载体运到现场）没有任何可交付的状态变化，整条叙事从第一
+                # 帧就散了。把违规原文回喂进 user 消息重来，三次都不行才带伤放行。
+                carrier_errs = check_image_1_carrier_absent(image_1_prompt, parsed_brief)
+                if carrier_errs and attempt < 2:
+                    if sys.stdout:
+                        print(f"[DEBUG] IMAGE 1 载体提前入镜，重生成（第 {attempt + 1} 次）: {carrier_errs}")
+                    image_1_user += (
+                        f"\n\nThe previous attempt was rejected: {carrier_errs[0]}. "
+                        f"Rewrite it describing the empty ground and landscape only."
+                    )
+                    continue
+                errs.extend(carrier_errs)
                 if errs and sys.stdout:
                     print(f"[DIRECT] IMAGE 1 校验有瑕疵（直出模式仅记录，不重生成）: {errs}")
                 break
@@ -6119,7 +6264,10 @@ Hard Rules:
                 print(f"[DEBUG] IMAGE 1 generation attempt {attempt+1} failed: {e}")
     
     if not image_1_prompt:
-        image_1_prompt = f"A static ultra-wide 14mm tripod shot at 1.6m height: initial ruined empty state of {theme}; horizon line remains level; no workers."
+        # 兜底首帧也要分口径：载体后到的项目，这里画出载体就等于把 Beat 1 的活儿提前干完了。
+        _fallback_subject = (f"the empty overgrown site that will receive {theme}, no structure present yet"
+                             if carrier_arrives_on_camera(parsed_brief) else f"initial ruined empty state of {theme}")
+        image_1_prompt = f"A static ultra-wide 14mm tripod shot at 1.6m height: {_fallback_subject}; horizon line remains level; no workers."
 
     compiled_images[1] = image_1_prompt
 
@@ -6367,6 +6515,27 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
             "(shovel, rake, wheelbarrow, or debris sack), the cleared area sweeping progressively "
             "across the floor while the spoil container/pile outside the frame edge fills — the "
             "two independently observable progress lines for this beat.")
+    # 载体到场拍（Beat 1，仅「双空间重置兑现」有）。这一拍与其余拍的口径不同，必须单独说：
+    # 起始帧里根本没有载体（IMAGE 1 是空场地），动作主体是机械而不是「一个工人 + 一把手工
+    # 工具」，而载体自身的破败状态是在这一拍第一次进入画面的——不写清楚，模型会按通用规则
+    # 把它写成「工人用手工工具在已经就位的壳体上干活」，运输钩子照样没了。
+    if beat.get('carrier_delivery'):
+        family_contract_lines.append(
+            f"- CARRIER DELIVERY (mandatory, this beat only): IMAGE {i} is the EMPTY SITE — the carrier "
+            f"is not in it. THIS BEAT'S VIDEO brings it in: a flatbed/lowboy truck backing in and a "
+            f"mobile crane (or excavator) lifting the whole shell off the bed, swinging it over the "
+            f"site and lowering it onto its final seat, with the lone worker on the ground rigging the "
+            f"slings and guiding it down by hand. This is the ONE beat where heavy equipment is the "
+            f"main agent, so the usual single-manual-tool rule does not apply to it — name the truck, "
+            f"the crane, the slings/chains, and the worker's own hand signals and guide rope instead, "
+            f"and keep both progress lines readable (the shell descending to seated, the site's bare "
+            f"ground turning into a seated footprint with spoil pushed up around it). IMAGE {i+1} shows "
+            f"the shell resting in its final position with all machinery gone from frame and its own "
+            f"pre-existing decay now readable up close (dents, rust runs, cracked glazing, faded "
+            f"paint, whatever this carrier's real trauma is), plus the delivery traces: fresh spoil "
+            f"ridge, track ruts, sling scuff marks, crushed vegetation. The site's locked anchors and "
+            f"boundaries stay exactly where IMAGE {i} put them — the shell lands among them, it does "
+            f"not replace them.")
     if is_bridge:
         _turn_dir = str(beat.get('turn_direction') or '').strip().lower()
         _turn_step = (
@@ -8399,14 +8568,21 @@ PACING_SKELETONS = {
     'nested_space_payoff': {
         'label_zh': '双空间重置兑现',
         'summary': (
-            'Reference distilled from the buried-bus shelter case: open on an extreme carrier-placement '
-            'or concealment hook; rebuild one primary functional zone through visible material-state '
-            'milestones and fully stock or furnish it for a readable mini-payoff; then make ONE declared '
-            'hard cut to a distinct untouched secondary raw space, visibly resetting that space only; '
-            'repeat the bottom-up membrane, framing, cavity-fill, board-closure and finish ladder; reveal '
-            'the secondary function through core furniture; finish with rapid value-stacking and a clean '
-            'wide final reward. The two spaces must have different functions and neither payoff may be a '
-            'partial construction state.'
+            'Reference distilled from the 73.5-second buried-bus shelter case. Preserve its four-act '
+            'progression rhythm AND its carrier class — a MAN-MADE TRANSPORTABLE shell (shipping '
+            'container, retired school bus or coach, aircraft fuselage, rail car, tanker, boat hull, '
+            'trailer/module) that heavy equipment hauls to the site — while never copying the school-bus '
+            'subject itself: (1) beat one delivers that shell by crane/flatbed/excavator and sets it '
+            'into position, then a short concealment/burial hook that '
+            'visibly resolves into a usable entrance; (2) a longer primary-space build, moving from '
+            'cleanout through membrane, framing, cavity fill, board closure and finish into a fully '
+            'furnished functional mini-payoff; (3) ONE declared hard cut to a distinct untouched secondary '
+            'raw space, followed by a clearly readable second pass through the same bottom-up material '
+            'ladder; (4) accelerated core furniture, soft furnishing and useful-content stacking, ending '
+            'on a brief clean worker-free wide reveal. Spend most beats on irreversible construction-state '
+            'changes, shorten beats as furnishing begins, and require a visible result change every beat. '
+            'The two spaces must have different functions and neither payoff may be a partial construction '
+            'state.'
         ),
     },
 }
@@ -8431,10 +8607,58 @@ def normalize_pacing_skeleton_ids(raw, default_all=True):
     return list(PACING_SKELETONS) if default_all else ['linear_milestone']
 
 
+def carrier_arrives_on_camera(parsed_brief):
+    """载体是不是「片子开拍后才被运到现场」。
+
+    这是 IMAGE 1 的构图前提：为真时首帧是**还没有载体**的空场地，载体在 Beat 1 由
+    吊车/平板车运进来。合成侧有三处要按它改口径（首帧提示词、Drift Lock 的外部锚点、
+    渲染后的 Anchor 验收门禁），所以判定只写一次，全部从 brief 上读。
+    """
+    if not isinstance(parsed_brief, dict):
+        return False
+    return bool(parsed_brief.get('carrier_delivered_on_camera'))
+
+
+# 载体名里不该拿来做「载体是否入镜」判据的修饰词：这些词单独出现在场地描述里
+# （"an old slab"、"rusted fence wire"）完全正常，拿它们判定会把干净的空场地首帧
+# 误伤成违规、白烧一次 60s 的首帧生成。
+_CARRIER_NAME_STOPWORDS = {
+    'the', 'and', 'with', 'old', 'aged', 'rusted', 'rusty', 'retired', 'abandoned', 'derelict',
+    'disused', 'decommissioned', 'scrapped', 'wrecked', 'ruined', 'vintage', 'former', 'large',
+    'small', 'steel', 'metal', 'wooden', 'concrete',
+}
+
+
+def check_image_1_carrier_absent(image_prompt, parsed_brief):
+    """载体在开拍后才被运来的项目：IMAGE 1 里不能出现载体本身。
+
+    只用**这个项目自己的** carrier 词做判据，不用整族词表——场地上一截报废车轴、
+    一个锈油罐都是合理的荒废景物，用族表会把它们判成「载体入镜」。
+    """
+    if not image_prompt or not carrier_arrives_on_camera(parsed_brief):
+        return []
+    carrier = str(parsed_brief.get('carrier') or '').lower()
+    tokens = [t for t in re.findall(r'[a-z]+', carrier)
+              if len(t) > 3 and t not in _CARRIER_NAME_STOPWORDS]
+    low = image_prompt.lower()
+    hits = [t for t in dict.fromkeys(tokens) if re.search(rf'\b{re.escape(t)}s?\b', low)]
+    if not hits:
+        return []
+    return [
+        f"IMAGE 1 describes the carrier itself ({', '.join(hits)}), but this project delivers the "
+        f"carrier on camera in Beat 1 — the anchor frame must show ONLY the empty receiving site "
+        f"(ground, terrain, surrounding landscape), with no shell, hull, body, truck, or trailer in view"
+    ]
+
+
 def apply_pacing_skeleton_to_brief(parsed_brief, pacing_skeleton_id):
     """Apply only the camera/space transition implied by a selected narrative skeleton."""
     if not isinstance(parsed_brief, dict):
         parsed_brief = {}
+    parsed_brief['pacing_skeleton'] = pacing_skeleton_id
+    # 只有「双空间重置兑现」把载体的到场当成第一拍；其余骨架的载体开拍前就在原地。
+    # 显式写 False 而不是只在为真时落键：同一份 brief 可能被换骨架后复用。
+    parsed_brief['carrier_delivered_on_camera'] = (pacing_skeleton_id == 'nested_space_payoff')
     if pacing_skeleton_id == 'dual_payoff':
         parsed_brief['mode'] = 'Threshold'
         # 双重完工需要「外部小高潮 -> 过门 -> 原始室内」，不等于可以把
@@ -8479,24 +8703,155 @@ _DUAL_MIN_EXTERIOR_FAMILIES = 3       # 外部幕至少落实三族（与内部�
 # 施工拍下界（不含 reward）：室外 2 + 设备/平台 1 + 小完工 1 + 过门 1 + 清运 1 + 重建 3
 _DUAL_STRUCTURAL_FLOOR = 9
 
-# 「双空间重置兑现」来自埋地校车案例：第一空间先做到可使用的小完工，随后唯一一次
-# 硬切把第二空间重置成毛坯，再走一轮分层施工。最小账本是第一幕 4 拍 + 重置 1 拍 +
-# 第二幕 5 拍 + reward；施工拍下界取 9，防止两轮基层/龙骨/封板被压成一拍。
+# 「双空间重置兑现」来自埋地校车案例：载体先被装备运到现场落位，第一空间做到可使用的
+# 小完工，随后唯一一次硬切把第二空间重置成毛坯，再走一轮分层施工。
+# 2026-07-29 载体运输拍并入之后，第一幕的账多了一拍：运输落位 1 + 掩埋/入口 1 +
+# 清理 1 + 分层 1 + 小完工 1 = 5；加重置 1 拍 + 第二幕 5 拍（分层 4 + reward 1）= 11 条。
+# 施工拍下界随之从 9 抬到 10（= 11 条减去末条 reward），否则 ladder 可以合法地把
+# 运输拍和掩埋拍压成一拍——那正好又把「第一帧就出现载体」放回来了。
 _NESTED_MIN_OUTLINE_ENTRIES = 11
-_NESTED_MIN_PRIMARY_ENTRIES = 4
+_NESTED_MIN_PRIMARY_ENTRIES = 5
 _NESTED_MIN_SECONDARY_ENTRIES = 5
-_NESTED_STRUCTURAL_FLOOR = 9
+_NESTED_STRUCTURAL_FLOOR = 10
+# 重置拍的词表（2026-07-29 放宽）。旧版三条分支**都**要求出现「第二/另一/新/附属/相邻」
+# 这类序数/指示词，而 GENERATION INSTRUCTIONS 同时要求每条 ≤16 字、以动词开头、点名具体
+# 里程碑——模型自然会写「硬切进入毛坯后舱」「跳切至未施工地窖」，一个序数词都没有，于是
+# 整批 0 通过（server.log 里成片的 "found 0: (none)"），降级又无诚实标签可用，最后掉进
+# 静态兜底、被台账去重剩一两张：用户看到的就是「每次只出一张卡」。
+# 现在认三种写法，任一即可：
+#   1) 明确的剪辑术语（硬切/跳切/转场…）+ 空间名词 —— 这些词在施工拍里不会出现，单独成立；
+#   2) 切/转/进入 + （序数词 或 毛坯状态词）+ 空间名词；
+#   3) 旧写法：序数词 + 空间名词 + 毛坯状态词。
+# 空间名词放宽到具体舱室（后舱/地窖/阁楼/井室…），但第 1 条的动词表保持窄，避免
+# 「切入洞壁开窗」这类真实施工拍被误判成第二次重置（多于一处一样会被否掉）。
+_NESTED_HARD_CUT_VERB = r'硬切|跳切|直切|快切|转场|镜头切|画面切|切镜'
+_NESTED_SPACE_NOUN = (
+    r'空间|房间|舱室|内舱|后舱|前舱|舱|洞室|洞|井室|井|地窖|窖|阁楼|隔间|'
+    r'库房|储藏室|工作间|区域|房|室'
+)
+_NESTED_RAW_STATE = r'原始|毛坯|未修|未施工|未动工|未开工|裸露|荒废'
 _NESTED_RESET_CUE = (
-    r'(?:硬切|切入|切到|转入|转到|进入).{0,10}(?:第二|另一|新|附属|相邻).{0,8}'
-    r'(?:空间|房间|舱室|洞室|井室|地窖|内舱|区域)|'
-    r'(?:第二|另一|新|附属|相邻).{0,8}(?:空间|房间|舱室|洞室|井室|地窖|内舱|区域).{0,10}'
-    r'(?:原始|毛坯|未修|未施工|裸露)'
+    rf'(?:{_NESTED_HARD_CUT_VERB}).{{0,12}}(?:{_NESTED_SPACE_NOUN})|'
+    rf'(?:硬切|切入|切进|切至|切到|转入|转到|进入).{{0,10}}'
+    rf'(?:(?:第二|另一|新|附属|相邻|另)|(?:{_NESTED_RAW_STATE})).{{0,8}}'
+    rf'(?:{_NESTED_SPACE_NOUN})|'
+    rf'(?:第二|另一|新|附属|相邻).{{0,8}}(?:{_NESTED_SPACE_NOUN}).{{0,10}}'
+    rf'(?:{_NESTED_RAW_STATE})'
 )
 _NESTED_FUNCTION_CUE = (
     r'厨房|储藏|储备|餐厨|工作间|起居|卧室|睡眠|住宿|休息|卫生间|浴室|'
     r'装备|工具|医疗|通信|供电|水处理|功能区|生活区'
 )
 _NESTED_COMPLETION_CUE = r'完成|完工|建成|布满|装满|填满|备齐|陈列|投入使用|可用'
+
+# 「双空间重置兑现」的载体族（2026-07-29）。埋地校车案例的第一拍钩子是**人工运输载体
+# 被装备运到现场**：平板车拉来、吊车把一整只成品壳体放进基坑——这是自然载体给不出的
+# 大位移开场。此前骨架只写了 "extreme placement/concealment hook"，没有任何一处约束载体
+# 本身，于是模型照着仓库里那三条静态兜底的口味挑冰川洞/导弹井/岩缝：这些壳体本来就在
+# 原地，第一拍只能写成「清理积渣」，钩子直接消失，用户看到的就是「节拍不对」。
+# 现在把载体族与第一拍一起写成硬要求（正向判定，词表给宽——漏一个词就是一次 150s 白烧）。
+_NESTED_TRANSPORT_CARRIER_ZH = (
+    r'集装箱|货柜|箱体|方舱|模块箱|活动板房|校车|大巴|巴士|客车|公交|车厢|车身|车皮|'
+    r'卧铺车|房车|拖挂|挂车|拖车|罐车|油罐|储罐|罐体|罐身|机身|机舱|机体|机尾|客机|'
+    r'飞机|货机|直升机|舱段|舱体|船体|艇身|驳船|渔船|游艇|缆车|吊舱|电车|地铁车|轻轨车'
+)
+_NESTED_TRANSPORT_CARRIER_EN = (
+    r'container|school\s*bus|\bbus(?:es)?\b|coach|fuselage|aircraft|airplane|airliner|\bjet\b|'
+    r'helicopter|rail\s*car|railcar|train\s*car|carriage|boxcar|wagon|caboose|tram|'
+    r'subway\s*car|metro\s*car|tanker|tank\s*trailer|trailer|caravan|camper|motorhome|\brv\b|'
+    r'truck|lorry|\bvan\b|barge|\bboat\b|\bship\b|hull|yacht|ferry|gondola|cable\s*car|'
+    r'capsule|\bpod\b|module'
+)
+# 运输/吊装落位的动作与装备。第一拍只有 16 个字，不强求同时点名动词和机械——
+# 命中其一 + 载体名词即可，"名字里要有吊车/平板车" 交给提示词去争取。
+_NESTED_DELIVERY_CUE = (
+    r'吊装|吊放|吊入|吊落|吊下|吊运|吊移|吊送|起吊|吊车|吊机|起重机|履带吊|汽车吊|塔吊|'
+    r'平板车|拖车|板车|挂车|叉车|铲车|挖掘机|运抵|运入|运送|运来|运到|拖运|拖入|牵引|'
+    r'卸放|卸车|卸入|落位|就位|安放|沉放|放入|埋入|埋设|下放|填埋'
+)
+
+
+def _nested_carrier_is_transportable(idea):
+    """载体是不是「可整体运输的人造壳体」。中英文都查：carrier/dna 是英文，标题是中文。"""
+    text = ' '.join(
+        str(idea.get(key) or '') for key in ('carrier', 'dna', 'title', 'input_str', 'twist_zh'))
+    return bool(re.search(_NESTED_TRANSPORT_CARRIER_EN, text, re.IGNORECASE)
+                or re.search(_NESTED_TRANSPORT_CARRIER_ZH, text))
+
+
+# 这个骨架专属的静态兜底选题。run_ideate 原来的三条兜底（冰川洞/退役潜艇/导弹井）都是
+# 原地载体：给它们套 nested 清单，第一拍只能写成「清理」，卡片会当场违反上面的门禁。
+# 兜底路径本来就是「模型三次都没回来」的最后一道，交付一张自相矛盾的卡不如换整张选题。
+_NESTED_TRANSPORT_FALLBACK_IDEAS = [
+    {
+        "title": "废弃集装箱埋入山坡改造成双舱避难所",
+        "input_str": "做一个废弃集装箱埋入山坡改造成双舱避难所",
+        "carrier": "shipping container",
+        "env": "forested hillside",
+        "trauma": "dented & rust-streaked",
+        "destiny": "buried two-room shelter",
+        "twist": "hatch-periscope",
+        "twist_zh": "竖井舱盖顶部保留潜望观景窗",
+        "dna": "shipping-container / buried-shelter / hatch-periscope",
+        "score": 23,
+        "recommended_beats": 14,
+        "beats_reason": "吊装掩埋加双舱重建",
+        "beat_outline": [
+            "吊车吊装集装箱入基坑", "回填土方掩埋箱体外壳", "焊接切口装配竖井入口",
+            "清空箱内残留货架碎屑", "铺设第一段防潮膜与电路", "架设墙顶木龙骨框架",
+            "封装保温与内衬面板", "备齐储备厨房完成使用", "硬切进入毛坯第二舱室",
+            "清运第二舱室积水碎屑", "铺设隐蔽管线与防潮层", "架设龙骨并填充保温",
+            "封装内衬与成品地板", "布置卧榻与软装织物", "点亮灯带,人物入住",
+        ],
+        "trend_ref": "",
+    },
+    {
+        "title": "退役校车埋进牧场改造成地下双区居所",
+        "input_str": "做一个退役校车埋进牧场改造成地下双区居所",
+        "carrier": "retired school bus",
+        "env": "open prairie ranch",
+        "trauma": "gutted & paint-faded",
+        "destiny": "underground two-zone dwelling",
+        "twist": "window-skylight",
+        "twist_zh": "原车窗翻转朝上成为地面天窗带",
+        "dna": "retired-school-bus / underground-dwelling / window-skylight",
+        "score": 23,
+        "recommended_beats": 15,
+        "beats_reason": "车身运输掩埋工序密",
+        "beat_outline": [
+            "平板车运抵退役校车落位", "挖机回填土方掩埋车身", "切开车顶焊接竖井舱口",
+            "清空车厢座椅与残渣", "除锈打磨并焊补车厢壁", "铺设车厢底防潮基层",
+            "架设龙骨并填充保温棉", "封装桦木内衬与地板", "装满储备食品完成餐厨",
+            "硬切进入毛坯后舱隔间", "清运后舱残余线束碎屑", "铺设隐蔽电路与水管",
+            "架设墙顶轻钢龙骨", "填充保温并封装面板", "嵌装折叠床与储物柜",
+            "通电亮灯,人物入住",
+        ],
+        "trend_ref": "",
+    },
+    {
+        "title": "退役客机机身落位荒原改造成双舱基地",
+        "input_str": "做一个退役客机机身落位荒原改造成双舱基地",
+        "carrier": "airliner fuselage",
+        "env": "high desert flats",
+        "trauma": "stripped & sand-scoured",
+        "destiny": "off-grid two-cabin base",
+        "twist": "porthole-lightwell",
+        "twist_zh": "成排舷窗改成侧向采光带",
+        "dna": "airliner-fuselage / two-cabin-base / porthole-lightwell",
+        "score": 24,
+        "recommended_beats": 15,
+        "beats_reason": "机身运输与两舱分层多",
+        "beat_outline": [
+            "吊车吊装退役机身落位", "培土掩埋机身并压实", "切割舱门装配入口梯",
+            "清空客舱座椅与线束", "铺设舱底防潮膜与电路", "架设舱壁龙骨与保温",
+            "封装内衬桦木饰面板", "备齐装备工作区完成使用", "硬切进入毛坯尾段舱室",
+            "清运尾段积尘与旧管线", "铺设隐蔽水管与地暖", "架设墙顶格栅框架",
+            "填充隔音棉并封板", "铺装成品地板与涂料", "布置卧榻与软装织物",
+            "点亮全景,人物入住",
+        ],
+        "trend_ref": "",
+    },
+]
 
 # 外部设备/平台族。骨架 summary 把它列为必需项，但此前**没有任何一处检查它**：
 # 激发侧门禁只看过门前最后一条的措辞，合成侧只有一句否定式约束（"Do not move all
@@ -8692,16 +9047,50 @@ def _nested_space_payoff_violations(idea, outline):
             f'complete two distinct functional spaces without phase packing (found {len(outline)})'
         ]
 
-    reset_indices = [i for i, text in enumerate(outline) if re.search(_NESTED_RESET_CUE, text)]
+    # 重置拍必须是「宣告式硬切」，写成过门运镜的不算：那是 dual_payoff 的过门拍，
+    # 而这个骨架的 threshold_variant 就是 hard_cut（见 apply_pacing_skeleton_to_brief）。
+    # 分开统计是为了给出说得清的错误——「你把重置写成了推镜过门」比「found 0」有用得多。
+    reset_indices, travel_resets = [], []
+    for i, text in enumerate(outline):
+        if not re.search(_NESTED_RESET_CUE, text):
+            continue
+        (travel_resets if re.search(_DUAL_THRESHOLD_CUE, text) else reset_indices).append(i)
     if len(reset_indices) != 1:
         hit_text = '、'.join(outline[i] for i in reset_indices) or '(none)'
+        if not reset_indices and travel_resets:
+            return [
+                'nested_space_payoff resets with a DECLARED HARD CUT (硬切/跳切/转场), not a doorway '
+                'travel shot; rewrite "' + outline[travel_resets[0]] + '" as e.g. "硬切进入毛坯的第二舱室"'
+            ]
         return [
             'nested_space_payoff must contain exactly one declared reset into a distinct untouched '
-            f'second space (found {len(reset_indices)}: {hit_text})'
+            f'second space (found {len(reset_indices)}: {hit_text}), written as a cut word '
+            f'(硬切/跳切/转场) + a raw-state word (原始/毛坯/未施工) + the second space, '
+            f'e.g. "硬切进入毛坯的第二舱室"'
         ]
 
     reset_idx = reset_indices[0]
     errors = []
+
+    # 第一拍必须是「装备把人工运输载体运到现场并落位」。这是这个骨架的开场钩子本身，
+    # 不是可选的修辞：自然载体（洞/井/岩缝）永远写不出这一拍，所以载体族和第一拍
+    # 一起查——只查其中一个都能被绕开（挑了集装箱却从"清理内部"开场，或者第一拍写
+    # 「吊装」但载体是冰洞）。
+    if not _nested_carrier_is_transportable(idea):
+        errors.append(
+            'nested_space_payoff requires a MAN-MADE TRANSPORTABLE carrier that machinery hauls to '
+            'the site (shipping container, retired school bus/coach, aircraft fuselage, rail car, '
+            'tanker, boat hull, trailer/module), not an in-situ natural or fixed shell '
+            f'(cave/silo/well/cellar); this candidate\'s carrier is "{idea.get("carrier") or "?"}"')
+    first_entry = outline[0]
+    if not (re.search(_NESTED_DELIVERY_CUE, first_entry)
+            and re.search(_NESTED_TRANSPORT_CARRIER_ZH, first_entry)):
+        errors.append(
+            'the FIRST beat_outline entry must deliver the carrier itself — heavy equipment '
+            '(吊车/起重机/平板车/挖掘机) hauling the manufactured shell in and setting it into '
+            f'position — naming both the equipment/placement action and the carrier, e.g. '
+            f'"吊车吊装集装箱入基坑" or "平板车运抵退役校车落位"; it is currently "{first_entry}"')
+
     if reset_idx < _NESTED_MIN_PRIMARY_ENTRIES:
         errors.append(
             f'the second-space reset must follow at least {_NESTED_MIN_PRIMARY_ENTRIES} primary-space '
@@ -8721,7 +9110,7 @@ def _nested_space_payoff_violations(idea, outline):
                 'space function (for example a stocked kitchen/storage/work zone), not a partial finish')
 
     reset_text = outline[reset_idx]
-    if not re.search(r'原始|毛坯|未修|未施工|裸露', reset_text):
+    if not re.search(_NESTED_RAW_STATE, reset_text):
         errors.append('the second-space reset must explicitly reveal an untouched/raw state')
 
     post_text = ' '.join(outline[reset_idx + 1:-1])
@@ -8833,7 +9222,7 @@ def pacing_skeleton_outline_violations(idea):
     return errors
 
 
-def run_ideate(config, count=8, theme=None, theme_label=None, trend_ref_ids=None,
+def run_ideate(config, count=5, theme=None, theme_label=None, trend_ref_ids=None,
                 remix_seed=None, pacing_skeleton_ids=None):
     # 形态矩阵与历史选题台账在每次激发时按当前 skillDir 现读（load_reference_file 走
     # skill_dir()，配置改了不用重启）。此前这里是 open() 裸读：文件不在就静默当空串，
@@ -8889,7 +9278,7 @@ def run_ideate(config, count=8, theme=None, theme_label=None, trend_ref_ids=None
               "exclusion history. Do not introduce unrelated trend references.\n"
         )
 
-    def _dedupe_generated_ideas(ideas):
+    def _dedupe_generated_ideas(ideas, extra_pool=None):
         """Hard exact-match guard after the LLM's semantic/near-match prompt guard."""
         norm = lambda value: re.sub(r'\s+', ' ', str(value or '').strip()).casefold()
         seen_dnas = {
@@ -8900,6 +9289,15 @@ def run_ideate(config, count=8, theme=None, theme_label=None, trend_ref_ids=None
             norm(row.get('one_line')) for row in managed_ledger
             if isinstance(row, dict) and norm(row.get('one_line'))
         }
+        if extra_pool:
+            for row in extra_pool:
+                if isinstance(row, dict):
+                    dna = norm(row.get('dna') or row.get('topic_dna'))
+                    title = norm(row.get('title') or row.get('one_line'))
+                    if dna:
+                        seen_dnas.add(dna)
+                    if title:
+                        seen_titles.add(title)
         novel = []
         for idea in ideas if isinstance(ideas, list) else []:
             if not isinstance(idea, dict):
@@ -9072,15 +9470,53 @@ and must satisfy ALL of the following, otherwise the candidate is rejected:
    these families: 基底/找平/清运 · 防水/隐蔽管线/电路 · 龙骨/框架/格栅 · 保温/填充/隔音 ·
    封板/内衬/面板 · 饰面/地板/涂料/墙面 · 家具/床/软装/储物柜.
 
-For nested_space_payoff, use the buried-bus reference as a RHYTHM, never as a subject to copy. Start with
-an extreme placement/concealment hook, then build a primary functional zone to a fully usable, stocked or
-furnished mini-payoff. The entry immediately before the reset must name that completed function. Make
+For nested_space_payoff, use the buried-bus reference as a RHYTHM and as a CARRIER CLASS, never as a
+subject to copy. Its Axis-1 carrier MUST be a man-made shell that can be transported to the site whole and
+placed by machinery — shipping container, retired school bus / coach / city bus, aircraft or helicopter
+fuselage, rail car or boxcar, tanker/tank body, boat hull, trailer, cable-car cabin, prefab module. NEVER
+give this skeleton an in-situ natural or fixed carrier (cave, ice cave, rock cleft, well, missile silo,
+cellar, bunker, mine adit): those cannot produce this skeleton's opening hook and the candidate is
+rejected. Vary WHICH manufactured shell across the batch instead of repeating the reference's school bus.
+The FIRST entry is that hook: heavy equipment (吊车/起重机/平板车/拖车/挖掘机) hauls the shell in and sets
+it into position — name both the equipment or placement action and the carrier, e.g. "吊车吊装集装箱入基坑"
+or "平板车运抵退役校车落位". The film's opening frame is therefore the EMPTY receiving site with no carrier
+in it, so pick an Axis-2 Environment that is already striking while still bare (a derelict quarry floor, an
+eroded gully, an overgrown yard, a collapsed foundation) — the arrival is the hook, not the scenery.
+Follow it with the burial/concealment and entrance work that visibly resolves
+into a usable entrance, then build a primary
+functional zone through cleanout, membrane/hidden layer, framing, cavity fill, board closure and finish to
+a fully usable, stocked or furnished mini-payoff. The entry immediately before the reset must name that
+completed function. The second space belongs to the same delivered shell (another compartment/section) or
+to a second unit placed alongside it — never a natural cavity. Make
 EXACTLY ONE declared hard cut into a DISTINCT second space and explicitly call it 原始/毛坯/未施工; the
 reset changes that second room only and never erases the first room's completed state. Rebuild the second
 space bottom-up through at least FOUR layer/furnishing families, reveal a different function through its
-core furniture, then rapidly stack useful contents and end on a clean wide final reward. Use at least
+core furniture, then shorten the cadence through rapid soft-furnishing/useful-content stacking and end on
+a brief, clean, worker-free wide final reward. Every entry must create one obvious visible result change;
+spend more entries on irreversible construction states than on the final reveal. Use at least
 {_NESTED_MIN_OUTLINE_ENTRIES} entries; give each entry one visible state change and never compress two
 rooms into one generic furnishing montage.
+Its carrier and beat_outline are checked by a deterministic acceptance gate, so the carrier must be one of
+the manufactured transportable shells above and THREE entries have mandatory wording:
+a. THE FIRST ENTRY — the delivery/placement hook. It MUST contain the carrier itself (集装箱 / 货柜 /
+   校车 / 大巴 / 客车 / 车厢 / 机身 / 舱段 / 罐体 / 船体 / 房车 / 方舱) plus a transport or placement
+   action (吊装 / 吊车 / 起重机 / 平板车 / 拖运 / 运抵 / 落位 / 就位 / 沉放 / 埋入), e.g.
+   "吊车吊装集装箱入基坑". An opening entry such as "清理洞内落石" gets the candidate rejected.
+b. THE RESET ENTRY — write it as an edit-room cut word (硬切 / 跳切 / 转场), plus a raw-state word
+   (原始 / 毛坯 / 未施工 / 未动工), plus the second space itself (第二空间 / 舱室 / 后舱 / 前舱 / 隔间 /
+   第二集装箱 / 车厢尾段), e.g. "硬切进入毛坯的第二舱室" or "跳切至未施工的后舱". EXACTLY ONE entry may
+   read like this — no other entry may pair a cut/进入 word with a raw-state word and a room noun, or the
+   candidate is rejected for declaring two resets. Never write the reset as a camera move through a door.
+c. THE ENTRY IMMEDIATELY BEFORE THE RESET — the primary-space mini-payoff. It MUST name the finished
+   function (厨房 / 储藏 / 储备 / 餐厨 / 工作间 / 起居 / 卧室 / 睡眠 / 卫生间 / 浴室 / 装备 / 工具 /
+   医疗 / 通信 / 供电 / 水处理 / 功能区 / 生活区) AND a completion word (完成 / 完工 / 建成 / 布满 /
+   装满 / 填满 / 备齐 / 陈列 / 投入使用 / 可用), e.g. "备齐储备厨房完成使用". A surface milestone such
+   as "封装内衬木饰面墙" there gets the candidate rejected.
+At least {_NESTED_MIN_PRIMARY_ENTRIES} entries come before the reset and at least
+{_NESTED_MIN_SECONDARY_ENTRIES} after it (its layered rebuild plus the final reward), and those
+post-reset entries must realize at least FOUR of these families: 清空/清运/基底/找平 · 防水/防潮/膜/管线/
+电路 · 龙骨/框架/格栅 · 保温/填充/隔音 · 封板/封装/面板/内衬 · 饰面/地板/涂料/墙面 · 家具/床/卧榻/软装/
+储物柜.
 """
 
     system_prompt = f"""You are the Upstream Ideation Layer for the `restoration-prompt-composer` skill.
@@ -9138,7 +9574,8 @@ Each object in the JSON array must have EXACTLY these keys:
 - "trend_ref": (string) If (and ONLY if) trend references are provided at the end of this prompt AND this idea clearly draws on one of those points, cite the borrowed point in one short Chinese sentence (which reference & what was borrowed). Otherwise it MUST be an empty string "". Never invent a reference.
 """ + trend_block
 
-    def _salvage_pacing_failures(ideas, failures, hard_failures=None):
+    def _salvage_pacing_failures(ideas, failures, hard_failures=None,
+                                 allow_unselected_downgrade=False):
         """把没通过验收的卡片按「标签必须诚实」的原则落地，返回留下的卡片。
 
         原来这里是整批连坐：四张卡里一张没过，另外三张合格的也一起丢掉重来，三次
@@ -9151,11 +9588,18 @@ Each object in the JSON array must have EXACTLY these keys:
         hard_failures 是命中通用骨架门禁（outline_skeleton_violations）的那些卡：
         降级救不了它们——「末拍不是 reward 揭示」这类毛病**没有任何标签能让它变诚实**，
         换个骨架名字之后卡片照样在骗人。这类只能整张丢弃。
+
+        allow_unselected_downgrade 是最后一道保险（只在「否则整批交付为空、只能退回
+        静态兜底选题」时才打开）：静态兜底是三条写死的老选题，还要再过一遍台账去重，
+        用久了只剩一两条——用户看到的就是「选了 5 张只回来 1 张」。这时把软失败的卡
+        降级成 linear_milestone 仍然诚实（它的清单本来就是单线的，卡片上的 🦴 标签会
+        如实显示「单线里程碑推进」），只是没能兑现用户勾的那个骨架，比交付一张陈年
+        兜底卡强。硬失败照旧丢弃。
         """
         hard_failures = hard_failures or {}
         if not failures and not hard_failures:
             return list(ideas)
-        can_downgrade = 'linear_milestone' in selected_pacing_ids
+        can_downgrade = allow_unselected_downgrade or 'linear_milestone' in selected_pacing_ids
         kept = []
         for idx, idea in enumerate(ideas):
             if idx in hard_failures:
@@ -9167,26 +9611,34 @@ Each object in the JSON array must have EXACTLY these keys:
                 kept.append(idea)
         return kept
 
-    user_prompt = f"Generate {count} top-quality unique renovation ideas following the instructions."
-    user_prompt_current = user_prompt
-    # 历次尝试里通过数最高的那批，供三次都没能全过时兜底交付（含最后一次抛异常的情况）
-    best_batch = None
+    def _user_prompt_for(n):
+        return f"Generate {n} top-quality unique renovation ideas following the instructions."
 
-    def _deliver_best_batch():
+    user_prompt = _user_prompt_for(count)
+    user_prompt_current = user_prompt
+    best_batch = None
+    accumulated_ideas = []
+
+    def _deliver_best_batch(allow_unselected_downgrade=False):
         """交付历次最好的那批（合格的原样、不合格的按上面的规则降级或丢弃）。
         一张都留不下时返回 None，交给调用点继续重试或落静态兜底。"""
         if not best_batch:
             return None
         passed_count, ideas, failures, hard_failures = best_batch
-        kept = _salvage_pacing_failures(ideas, failures, hard_failures)
+        kept = _salvage_pacing_failures(ideas, failures, hard_failures,
+                                        allow_unselected_downgrade=allow_unselected_downgrade)
         if not kept:
             return None
         if sys.stdout:
-            print(f"[DEBUG] run_ideate: 交付历次最佳的一批（{passed_count}/{len(ideas)} "
+            note = '（末路降级成单线里程碑）' if allow_unselected_downgrade else ''
+            print(f"[DEBUG] run_ideate: 交付历次最佳的一批{note}（{passed_count}/{len(ideas)} "
                   f"张通过节拍验收，共交付 {len(kept)} 张）")
         return {'ideas': _attach_trend_ref_ids(kept, trend_refs), 'trend_refs': trend_refs}
 
     for attempt in range(3):
+        needed = count - len(accumulated_ideas)
+        if needed <= 0:
+            break
         try:
             # 150s(而非本文件其它调用点常用的 90s)：claude-*-thinking 这类扩展推理模型
             # 在这份 system_prompt(含完整 idea-engine.md)上实测要 78~90s+ 才出结果,
@@ -9195,36 +9647,34 @@ Each object in the JSON array must have EXACTLY these keys:
             cleaned = _strip_code_fences(resp).strip()
             ideas = json.loads(cleaned)
             if isinstance(ideas, list) and len(ideas) > 0:
-                novel_ideas = _dedupe_generated_ideas(ideas)
+                novel_ideas = _dedupe_generated_ideas(ideas, accumulated_ideas)
                 if novel_ideas:
                     # 模型偶尔漏字段/返回未选 id：不让卡片与下游合成失去骨架归属。
-                    # 多选时按卡片序号轮询补齐，至少确保默认四卡不会全部退化成旧骨架。
+                    # 多选时按卡片序号轮询补齐，至少确保默认卡片不会全部退化成旧骨架。
                     for idea_idx, idea in enumerate(novel_ideas):
                         pacing_id = str(idea.get('pacing_skeleton') or '').strip()
                         if pacing_id not in selected_pacing_ids:
                             has_outline = bool(idea.get('beat_outline'))
                             if not has_outline and len(selected_pacing_ids) > 1 \
                                     and 'linear_milestone' in selected_pacing_ids:
-                                # 一条连 outline 都没产出的旧/异常卡不能被补成 dual 标签；
-                                # 它没有任何内容能证明双完工骨架，只能保守归到原单线。
                                 idea['pacing_skeleton'] = 'linear_milestone'
                             else:
                                 idea['pacing_skeleton'] = selected_pacing_ids[idea_idx % len(selected_pacing_ids)]
                     with_outline = _normalize_beat_outlines(novel_ideas)
 
-                    # 验收分两层：
-                    # - 硬失败（通用骨架门禁）：卡片本身的结构就不成立，降级救不了，
-                    #   只能丢弃（见 _salvage_pacing_failures）；
-                    # - 软失败（dual_payoff 专属门禁）：内容是合法的单线清单，只是
-                    #   标签认领错了骨架，降级成 linear_milestone 之后标签不再骗人。
+                    # 整批一条 beat_outline 都没有，重试后用合规的那批（最后一次尝试例外）
+                    if with_outline == 0 and attempt < 2 and len(accumulated_ideas) == 0:
+                        if sys.stdout:
+                            print(f"[DEBUG] run_ideate attempt {attempt+1}: 整批缺 beat_outline，重试")
+                        user_prompt_current = user_prompt + "\n\nPlease ensure every candidate includes a non-empty beat_outline array with valid construction beats."
+                        continue
+
                     failures = {}
                     hard_failures = {}
                     for idea_idx, idea in enumerate(novel_ideas):
                         hard_errs = outline_skeleton_violations(idea)
                         soft_errs = pacing_skeleton_outline_violations(idea)
                         if hard_errs and not _OUTLINE_GATE_ENFORCING:
-                            # 灰度观察态：只记录通用门禁的判定，不参与打回/丢弃，
-                            # 便于先看一批真实激发的通过率再决定要不要真的强制。
                             if sys.stdout:
                                 print(f"[DEBUG] run_ideate: 通用骨架门禁（未强制）命中 "
                                       f"{novel_ideas[idea_idx].get('title') or 'untitled'}: {hard_errs}")
@@ -9233,10 +9683,12 @@ Each object in the JSON array must have EXACTLY these keys:
                             hard_failures[idea_idx] = hard_errs
                         if hard_errs or soft_errs:
                             failures[idea_idx] = hard_errs + soft_errs
+
                     passed = len(novel_ideas) - len(failures)
                     if best_batch is None or passed > best_batch[0]:
                         best_batch = (passed, novel_ideas, failures, hard_failures)
 
+                    pacing_errors = []
                     if failures:
                         pacing_errors = [
                             f'Candidate {idx + 1} ({novel_ideas[idx].get("title") or "untitled"}): {err}.'
@@ -9245,40 +9697,57 @@ Each object in the JSON array must have EXACTLY these keys:
                         if sys.stdout:
                             print(f"[DEBUG] run_ideate attempt {attempt+1}: 节拍骨架验收 "
                                   f"{passed}/{len(novel_ideas)} 通过，未通过项: {pacing_errors}")
-                        # 已经有卡片过关时最多再补一次就收工：每次重试都是一次 150s 的
-                        # 大模型调用，为凑齐"整批全过"把三次机会用满，换来的常常只是同一
-                        # 个毛病再犯两遍。一张都没过才值得用满三次。
-                        last_chance = attempt >= 2 or (passed > 0 and attempt >= 1)
-                        if not last_chance:
-                            user_prompt_current = user_prompt + "\n\nThe previous response failed the selected pacing skeleton acceptance gate:\n" + \
+
+                    # 先把这一轮能诚实交付的卡收进兜里再决定要不要重试。旧实现在
+                    # 「本轮有任何一张没过」时直接 continue，把同一轮里已经过关的卡
+                    # 一起扔掉重来——三轮下来常常一张都没攒下，最后落到静态兜底。
+                    salvaged = _salvage_pacing_failures(novel_ideas, failures, hard_failures)
+                    accumulated_ideas.extend(salvaged)
+
+                    if len(accumulated_ideas) >= count:
+                        # 不截到 count：模型多给的那张也是干净卡，丢掉纯属浪费一次调用的产出。
+                        return {'ideas': _attach_trend_ref_ids(accumulated_ideas, trend_refs),
+                                'trend_refs': trend_refs}
+
+                    # 还差卡：把「缺口张数 + 本轮验收意见」一起回喂，用掉剩下的尝试补齐。
+                    # 用户在 GUI 里选的生成数是硬要求，不能因为第一轮少收了两张就收工
+                    # ——旧实现在 attempt>=1 且本轮有失败时直接返回，于是「选 5 张只回 1 张」。
+                    if attempt < 2:
+                        missing = count - len(accumulated_ideas)
+                        # 只要 missing 张的话，补批里再掉一张就又短了；明说可以多给，
+                        # 反正是同一次调用，多出来的干净卡照收（见上面的不截断）。
+                        user_prompt_current = _user_prompt_for(missing) + \
+                            f"\nReturning one or two more than {missing} is welcome."
+                        if pacing_errors:
+                            user_prompt_current += \
+                                "\n\nThe previous response failed the selected pacing skeleton acceptance gate:\n" + \
                                 "\n".join(f'- {err}' for err in pacing_errors) + \
-                                "\nRegenerate the full batch and visibly repair every listed structural defect."
-                            continue
-                        delivered = _deliver_best_batch()
-                        if delivered:
-                            return delivered
-                        if attempt < 2:
-                            user_prompt_current = user_prompt + "\n\nThe previous response failed the selected pacing skeleton acceptance gate:\n" + \
-                                "\n".join(f'- {err}' for err in pacing_errors) + \
-                                "\nRegenerate the full batch and visibly repair every listed structural defect."
-                        continue
-                    # 卡片上的「🔨 节拍简介」全靠 beat_outline。整批一条都没带 =
-                    # 模型整个忽略了这个字段(而不是个别条目偷懒),这种响应重试一次
-                    # 通常就能拿到合规结果,别把没有节拍简介的卡片直接推给用户。
-                    # 部分条目缺失则照收:为个别条目重跑整批不划算,前端对这类卡片
-                    # 会退回「载入维度」按钮(见 js/prompt_pipeline.js)。
-                    if with_outline == 0 and attempt < 2:
-                        if sys.stdout:
-                            print(f"[DEBUG] run_ideate attempt {attempt+1}: 整批缺 beat_outline，重试")
-                        continue
-                    return {'ideas': _attach_trend_ref_ids(novel_ideas, trend_refs), 'trend_refs': trend_refs}
+                                "\nVisibly repair every listed structural defect in this batch."
+                        if accumulated_ideas:
+                            kept_titles = '、'.join(
+                                str(row.get('title') or '').strip() for row in accumulated_ideas
+                                if str(row.get('title') or '').strip())
+                            user_prompt_current += (
+                                f"\n\nThese candidates are already delivered in this batch — return "
+                                f"{missing} NEW ones that repeat neither their Topic DNA nor their "
+                                f"concept: {kept_titles}")
         except Exception as e:
             if sys.stdout:
                 print(f"[DEBUG] run_ideate attempt {attempt+1} failed: {e}")
 
-    # 三次都没能干净收货，但只要历次里还有能诚实交付的卡片，就不该退回静态兜底：
-    # 兜底那三条是写死的老选题，用过之后会被台账去重清空，交付它们不如交付这批。
+    # 如果有累积到的合格卡片，交付累积的卡片
+    if len(accumulated_ideas) > 0:
+        return {'ideas': _attach_trend_ref_ids(accumulated_ideas, trend_refs), 'trend_refs': trend_refs}
+
+    # 三次都没能干净收货且未累积到卡片，交付历次最佳那批（按规则降级或丢弃）
     delivered = _deliver_best_batch()
+    if delivered:
+        return delivered
+
+    # 连一张都留不下（典型：只勾了 dual/nested，本轮全批没过它的专属门禁）。
+    # 与其退回三条写死的兜底选题（再被台账去重砍成一两张），不如把这批本来就是
+    # 单线清单的卡诚实地降级成 linear_milestone 交付：卡片上的 🦴 标签会如实显示。
+    delivered = _deliver_best_batch(allow_unselected_downgrade=True)
     if delivered:
         return delivered
 
@@ -9410,36 +9879,27 @@ Each object in the JSON array must have EXACTLY these keys:
             '封装内墙并完成饰面', '布置卧榻卫浴与软装', '舱门滑开,天光落入',
         ],
     }
-    nested_fallback_outlines = {
-        'glacier-ice-cave / refuge-den / self-material-window': [
-            '清空第一冰洞碎冰落石', '铺设第一空间防潮层', '架设木龙骨与保温层',
-            '封装储备区木饰面墙', '安装货架与操作台', '备齐储备厨房完成使用',
-            '硬切进入第二毛坯洞室', '清运第二洞室碎冰', '铺设防潮膜与电路',
-            '架设墙顶龙骨保温', '封装内衬与成品地板', '布置卧榻与羊毛软装',
-            '点亮暖灯,人物入住',
-        ],
-        'retired-submarine / micro-home / porthole-lighting': [
-            '清空第一舱废弃设备', '打磨除锈并焊补舱壁', '铺设舱底防潮基层',
-            '架设龙骨并填充保温', '封装桦木内衬与地板', '安装储物架与操作台',
-            '备齐餐厨储藏区完成使用', '硬切进入第二毛坯舱室', '清运第二舱锈屑管线',
-            '铺设电路与生活水管', '架设舱壁保温龙骨', '封装内衬饰面板',
-            '嵌装折叠床与储物柜', '通电亮灯,人物入住',
-        ],
-        'missile-silo / burrow-dwelling / roof-hatch': [
-            '清运第一井室积渣鸟粪', '修补混凝土结构裂缝', '涂布井壁防水封闭层',
-            '浇筑设备区混凝土板', '布设通风电路与水管', '安装设备柜与工作台',
-            '备齐供电通信区完成使用', '硬切进入第二毛坯井室', '清运第二井室塌落瓦砾',
-            '铺设防潮膜与隐蔽管线', '架设墙顶龙骨框架', '填充保温并封装内墙',
-            '铺装橡木地板与涂料', '布置卧榻卫浴与软装', '点亮全景,人物入住',
-        ],
-    }
+    # nested 的三条兜底载体（冰洞/潜艇/导弹井）都在原地，套不上「装备把载体运到现场」的
+    # 第一拍，所以这个骨架整张换成人工运输载体的选题，而不是只替换清单。台账去重照走；
+    # 三条都被用过时仍按原样交付（兜底本来就是最后一道，宁可重复也不要空手）。
+    nested_pool = [json.loads(json.dumps(row)) for row in _NESTED_TRANSPORT_FALLBACK_IDEAS]
+    nested_pool = _dedupe_generated_ideas(nested_pool) or nested_pool
+    prepared, nested_cursor = [], 0
     for idea_idx, idea in enumerate(fallback_ideas):
-        idea['pacing_skeleton'] = selected_pacing_ids[idea_idx % len(selected_pacing_ids)]
-        if idea['pacing_skeleton'] == 'dual_payoff':
+        skeleton = selected_pacing_ids[idea_idx % len(selected_pacing_ids)]
+        if skeleton == 'nested_space_payoff':
+            if nested_cursor >= len(nested_pool):
+                continue  # 池子用尽：宁可少一张，也不要把同一张卡交付两次
+            row = nested_pool[nested_cursor]
+            nested_cursor += 1
+            row['pacing_skeleton'] = skeleton
+            prepared.append(row)
+            continue
+        idea['pacing_skeleton'] = skeleton
+        if skeleton == 'dual_payoff':
             idea['beat_outline'] = dual_fallback_outlines.get(idea.get('dna'), idea['beat_outline'])
-        elif idea['pacing_skeleton'] == 'nested_space_payoff':
-            idea['beat_outline'] = nested_fallback_outlines.get(idea.get('dna'), idea['beat_outline'])
-    return {'ideas': _attach_trend_ref_ids(fallback_ideas, trend_refs), 'trend_refs': trend_refs}
+        prepared.append(idea)
+    return {'ideas': _attach_trend_ref_ids(prepared, trend_refs), 'trend_refs': trend_refs}
 
 
 def check_adjacent_frame_semantics_batch(config, images):
