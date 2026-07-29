@@ -34,28 +34,207 @@ from ..utils.logger import log
 # 探针检查的族里，这些属于"只在特定弹窗/面板打开后才存在"，页面静止时缺失是正常的，
 # 不该报成选择器失效。探针会把它们标成 conditional 而不是 missing。
 _CONDITIONAL_FAMILIES = {
-    "media_picker_ready",
-    "close_history_btn",
     "close_popup_btns",
     "credit_display",
-    "menu_add_to_prompt",
-    "upload_image_btn",
 }
 
+# 静止的 Flow 项目页上必须存在的族。其余族属于落地页、配置/模型菜单、上传对话框、
+# 生成结果卡片、错误态或 onboarding，仍然进探测报告，但当前页面状态下缺失属于
+# 信息而非故障。
+#
+# 入选条件有两条，缺一不可：① 生产代码真的通过 UI_SELECTORS 读它；② 它在静止
+# 工作台页上确实应该存在。历史上这里放过 create_btn / add_media_btn，前者已被删除
+# （生产代码从不读它），后者由 _find_add2_btn 消费——这两条件必须同时核对，否则
+# 探针会拿一个没人用的族去判定"服务是否可用"。
+_REQUIRED_WORKSPACE_FAMILIES = {
+    "prompt_input",
+    "add_media_btn",
+    "account_menu_trigger",
+}
 
-def probe_selectors(page, groups=None):
+# 这些族存的是文本关键词（模型名、aria-label 文案），不是 CSS 选择器。
+# 交给 page.locator() 会被当成元素名解析（locator("Banana") → <banana>），
+# 永远 count=0，于是每次探针都白报一条"全 N 层均未命中"。直接跳过，不进报告。
+# 注意不能用"是否含 CSS 语法字符"自动判别：prompt_input 的首层就是裸 "textarea"。
+_NON_SELECTOR_FAMILIES = {
+    "config_btn_keywords",
+}
+
+# ⚠️ 探针的覆盖边界（别把"探针全绿"当成"选择器全好"）
+#
+# 探针只覆盖 UI_SELECTORS 里的扁平选择器列表。helpers 里还有几条定位逻辑不是
+# 选择器列表，而是"选择器 + 运行期过滤"的算法，无法用 count() 探测：
+#
+#   fx_tab                —— 层是 [role='tab'] / button，靠 .filter(has_text=) 和
+#                            aria-controls/data-state 的文本 blob 二次判定
+#   fx_model_dropdown     —— 兜底层含裸 button，靠 _looks_like_model_button() 判定
+#   fx_config_panel       —— 靠 aria-labelledby / aria-controls 关联关系定位
+#   fx_menu_item          —— 选择器由运行期 label 拼成 f-string
+#   fx_orientation_option —— 同上，按 pattern 拼
+#
+# 把这些塞进 UI_SELECTORS 让探针 count() 一遍是**有害的**：裸 button 永远命中，
+# 探针会报绿而实际定位早就失败了。它们的健康度只能看 selector_stats 的运行期
+# 命中层级（族名就是上面这几个），那是真实任务跑出来的数据。
+# add_media_btn 是唯一一张能统一的扁平表，已经统一：helpers._find_add2_btn 直接读
+# UI_SELECTORS，统计族名也对齐成 add_media_btn，所以探针和运行期统计说的是同一件事。
+
+
+def _open_account_menu(page):
+    from .google_fx_credit import _try_click_once, _account_menu_is_open, _wait_for_account_menu
+
+    if _account_menu_is_open(page):
+        return True
+    triggers = UI_SELECTORS.get("google_fx", {}).get("account_menu_trigger", [])
+    if not _try_click_once(page, triggers):
+        raise RuntimeError("账号菜单触发器点不动（account_menu_trigger 可能已失效）")
+    if not _wait_for_account_menu(page):
+        raise RuntimeError("点了账号菜单触发器但菜单没打开")
+    return True
+
+
+def _open_config_panel(page):
+    from .google_fx_helpers import find_fx_config_button
+
+    # find_fx_config_button() returns (locator, status_text).  The deep probe
+    # only needs the locator; treating the pair itself as a locator used to
+    # fail every run with: AttributeError: 'tuple' object has no attribute
+    # 'click'.
+    btn, _status_text = find_fx_config_button(page)
+    if not btn:
+        raise RuntimeError("找不到底部配置按钮，无法打开配置面板")
+    btn.click()
+    time.sleep(0.8)
+    return True
+
+
+# deep 模式的场景表：每项 = (场景名, 打开动作, 该场景下才存在的目标族)。
+# 只收录**一键可达且非破坏性**的场景。故意不收：
+#   - flow_entry_btn / flow_onboarding_* —— 只在未初始化账号上出现，已初始化的
+#     账号物理上无法复现这个状态，导航不过去。
+#   - 裁剪对话框 / 下载按钮 —— 必须真的传图或真的跑完一次生成才会出现，那是 L2
+#     自检的职责，且要烧积分。
+_DEEP_PROBE_SCENARIOS = (
+    ("账号菜单", _open_account_menu, ("account_menu_surface", "credit_display")),
+    ("配置面板", _open_config_panel, ("config_panel_root",)),
+)
+
+
+def _run_deep_probe(page, rows):
+    """依次打开各场景，就地重探该场景下的目标族，覆盖静态那一遍的结论。
+
+    每个场景独立 try/收尾：一个场景打不开不影响后面的场景，收尾一律按 Escape，
+    避免把页面留在弹窗打开的状态上。
+    """
+    from .google_fx_dom import _safe_press_escape
+
+    by_family = {row["family"]: row for row in rows}
+    report = []
+    fx = UI_SELECTORS.get("google_fx", {})
+
+    for name, opener, targets in _DEEP_PROBE_SCENARIOS:
+        entry = {"scenario": name, "opened": False, "families": [], "error": ""}
+        try:
+            opener(page)
+            entry["opened"] = True
+            for family in targets:
+                selectors = fx.get(family)
+                if not selectors:
+                    continue
+                row = by_family.get(family)
+                if row is None:
+                    continue
+                fresh = _probe_family(page, "google_fx", family, selectors)
+                # 场景已经打开了，这时候还未命中就是真失效，不再降级成 conditional。
+                row.update(fresh)
+                row["probed_via"] = name
+                entry["families"].append({"family": family, "state": row["state"]})
+        except Exception as exc:
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                _safe_press_escape(page, f"deep_probe:{name}")
+            except Exception:
+                pass
+        report.append(entry)
+
+    return report
+
+
+def _probe_family(page, group, family, selectors):
+    """单族逐层探测，返回未分类的 row（state 只有 primary/fallback/missing）。"""
+    row = {
+        "group": group,
+        "family": family,
+        "total_layers": len(selectors),
+        "hit_index": -1,
+        "hit_selector": "",
+        "visible": False,
+        "state": "missing",
+    }
+    for index, selector in enumerate(selectors):
+        try:
+            locator = page.locator(selector)
+            count = locator.count()
+        except Exception:
+            continue
+        if not count:
+            continue
+        row["hit_index"] = index
+        row["hit_selector"] = str(selector)[:200]
+        row["match_count"] = count
+        try:
+            row["visible"] = bool(locator.first.is_visible(timeout=800))
+        except Exception:
+            row["visible"] = False
+        row["state"] = "primary" if index == 0 else "fallback"
+        break
+    return row
+
+
+def _classify_missing(row):
+    """把"当前页面状态下本就不存在"的未命中降级成 conditional。"""
+    if row["state"] != "missing":
+        return row
+    group, family = row["group"], row["family"]
+    is_contextual = family in _CONDITIONAL_FAMILIES
+    if group == "google_fx" and family not in _REQUIRED_WORKSPACE_FAMILIES:
+        is_contextual = True
+    if group == "common":
+        is_contextual = True
+    if is_contextual:
+        row["state"] = "conditional"
+    return row
+
+
+def _summarize(families):
+    return {
+        "total": len(families),
+        "primary": sum(1 for r in families if r["state"] == "primary"),
+        "fallback": sum(1 for r in families if r["state"] == "fallback"),
+        "missing": sum(1 for r in families if r["state"] == "missing"),
+        "conditional": sum(1 for r in families if r["state"] == "conditional"),
+    }
+
+
+def probe_selectors(page, groups=None, deep=False):
     """对 UI_SELECTORS 逐族逐层探测当前页面的命中情况。
 
     返回 {version, checked_at, url, families: [...]}，families 里每项：
       group/family/total_layers/hit_index/hit_selector/visible/state
     state: primary(主选择器命中) / fallback(靠兜底命中) / missing(全未命中)
            / conditional(条件性元素，未命中不算故障)
+
+    deep=False（默认）是**只读**的：只 count/is_visible，不点击任何东西，所以
+    可以随时对生产页面跑。deep=True 会额外打开账号菜单和配置面板去验证弹窗态的
+    族（见 _DEEP_PROBE_SCENARIOS），会真的点击页面并按 Escape 收尾——这是有副作用
+    的，必须由调用方显式要求。
     """
     result = {
         "selector_version": SELECTOR_VERSION,
         "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "url": "",
         "families": [],
+        "deep": bool(deep),
     }
     try:
         result["url"] = page.url
@@ -70,43 +249,15 @@ def probe_selectors(page, groups=None):
         for family, selectors in families.items():
             if not isinstance(selectors, (list, tuple)):
                 continue
-            row = {
-                "group": group,
-                "family": family,
-                "total_layers": len(selectors),
-                "hit_index": -1,
-                "hit_selector": "",
-                "visible": False,
-                "state": "missing",
-            }
-            for index, selector in enumerate(selectors):
-                try:
-                    locator = page.locator(selector)
-                    count = locator.count()
-                except Exception:
-                    continue
-                if not count:
-                    continue
-                row["hit_index"] = index
-                row["hit_selector"] = str(selector)[:200]
-                row["match_count"] = count
-                try:
-                    row["visible"] = bool(locator.first.is_visible(timeout=800))
-                except Exception:
-                    row["visible"] = False
-                row["state"] = "primary" if index == 0 else "fallback"
-                break
-            if row["state"] == "missing" and family in _CONDITIONAL_FAMILIES:
-                row["state"] = "conditional"
-            result["families"].append(row)
+            if family in _NON_SELECTOR_FAMILIES:
+                continue
+            result["families"].append(
+                _classify_missing(_probe_family(page, group, family, selectors)))
 
-    result["summary"] = {
-        "total": len(result["families"]),
-        "primary": sum(1 for r in result["families"] if r["state"] == "primary"),
-        "fallback": sum(1 for r in result["families"] if r["state"] == "fallback"),
-        "missing": sum(1 for r in result["families"] if r["state"] == "missing"),
-        "conditional": sum(1 for r in result["families"] if r["state"] == "conditional"),
-    }
+    if deep:
+        result["deep_scenarios"] = _run_deep_probe(page, result["families"])
+
+    result["summary"] = _summarize(result["families"])
     return result
 
 
@@ -144,6 +295,41 @@ class _Steps:
         }
 
 
+def _ensure_flow_project_open(page, toolbar_timeout=30):
+    """Make the Flow prompt workspace available for browser diagnostics.
+
+    The Flow landing page is a valid, fully loaded page, but it intentionally has
+    no prompt editor.  L1 used to probe that landing page directly and therefore
+    reported a selector failure on fresh accounts.  Enter an existing project
+    when one is already open; otherwise create the project requested by the
+    landing page, then wait for its toolbar before probing selectors.
+    """
+    from .google_fx_helpers import (
+        _click_new_project_button,
+        _find_fx_prompt_input,
+        _wait_for_fx_toolbar,
+    )
+
+    try:
+        in_project = "/project/" in str(page.url or "")
+    except Exception:
+        in_project = False
+
+    # Flow may restore the browser directly into a usable generation workspace
+    # whose current route does not contain /project/.  In that state there is a
+    # visible prompt editor and intentionally no "New project" button.  Treat
+    # the actual workspace UI as authoritative; use the URL only as a loading
+    # hint for a conventional project route.
+    workspace_visible = _find_fx_prompt_input(page, announce=False) is not None
+    if not in_project and not workspace_visible and not _click_new_project_button(page):
+        raise RuntimeError(
+            "当前 Flow 页面既未检测到可见的提示词输入框，"
+            "也没有可用的新建项目入口")
+
+    _wait_for_fx_toolbar(page, timeout=toolbar_timeout)
+    return page.url
+
+
 def _selftest_l0(steps):
     def check_runtime():
         from .. import config as _cfg
@@ -174,11 +360,14 @@ def _selftest_l0(steps):
     def check_rotation():
         from ..utils.proxy_rotator import ProxyRotator
         rotator = ProxyRotator()
+        # 代理来源要说清楚：现在它可能来自控制台的代理号池，也可能来自 MIYA_* 环境
+        # 变量。只说"已配置"的话，用户在两个地方都要翻一遍才知道用的是哪份。
+        source = "代理号池" if ProxyRotator._pool_has_usable_proxy() else "MIYA_* 环境变量"
         if not rotator.is_configured:
-            return "IP 轮换未配置（不会换 IP）"
+            return "IP 轮换未配置（代理号池为空且 MIYA_PROXY_HOST/PORT 未设，不会换 IP）"
         if not rotator.auto_rotate:
-            return "IP 轮换已配置但自动轮换关闭"
-        return (f"IP 轮换已配置，阈值 {rotator.rotate_threshold}"
+            return f"代理已配置（来源：{source}）但自动轮换关闭"
+        return (f"代理已配置（来源：{source}），轮换阈值 {rotator.rotate_threshold}"
                 f"（≥100000 表示实际永不触发）")
 
     steps.run("运行时导入", check_runtime)
@@ -186,6 +375,27 @@ def _selftest_l0(steps):
     steps.run("号池状态文件", check_pool)
     steps.run("runtime 目录可写", check_writable)
     steps.run("IP 轮换配置", check_rotation, critical=False)
+
+
+def _submit_minimal_image(user_id=None):
+    """Run the destructive L2 probe after the diagnostics browser has closed."""
+    from ..models import ImageBatchRequest
+    from ..utils.account_binding import bound_task_account
+    from .google_fx_image import _generate_images_batch_google_fx_unlocked
+
+    # BrowserEnvLockedRequest intentionally rejects user_id/port in request
+    # bodies. Bind the selected diagnostics account through per-task context.
+    request = ImageBatchRequest(
+        prompts=["a plain light grey background, minimal, test render"],
+    )
+    with bound_task_account(user_id):
+        outcome = _generate_images_batch_google_fx_unlocked(request)
+
+    status = (outcome or {}).get("status")
+    image_urls = (outcome or {}).get("image_urls") or []
+    if status != "success" or not image_urls:
+        raise RuntimeError(f"最小提交失败: {(outcome or {}).get('message') or outcome}")
+    return {"status": status, "results": len(image_urls)}
 
 
 def _selftest_browser(steps, level, user_id=None, cancel_check=None):
@@ -214,6 +424,9 @@ def _selftest_browser(steps, level, user_id=None, cancel_check=None):
         ensure_flow_workspace(holder["page"])
         return holder["page"].url
 
+    def enter_project():
+        return _ensure_flow_project_open(holder["page"])
+
     def locate_prompt():
         el = _find_fx_prompt_input(holder["page"], announce=False)
         if el is None:
@@ -221,7 +434,7 @@ def _selftest_browser(steps, level, user_id=None, cancel_check=None):
         return "prompt 输入框可定位"
 
     def locate_config_button():
-        btn = find_fx_config_button(holder["page"])
+        btn, _status_text = find_fx_config_button(holder["page"])
         if not btn:
             raise RuntimeError("找不到底部配置按钮")
         return "配置按钮可定位"
@@ -243,36 +456,29 @@ def _selftest_browser(steps, level, user_id=None, cancel_check=None):
             raise RuntimeError("账号菜单读积分失败")
         return f"当前账号积分 {credit}"
 
-    def submit_minimal():
-        from ..models import ImageBatchRequest
-        request = ImageBatchRequest(
-            prompts=["a plain light grey background, minimal, test render"],
-            user_id=user_id or get_runtime_default_user_id() or "",
-        )
-        from .google_fx_image import _generate_images_batch_google_fx_unlocked
-        outcome = _generate_images_batch_google_fx_unlocked(request)
-        status = (outcome or {}).get("status")
-        if status == "failed":
-            raise RuntimeError(f"最小提交失败: {(outcome or {}).get('message') or outcome}")
-        return {"status": status, "results": len((outcome or {}).get("results") or [])}
-
     with sync_playwright() as pw:
         holder["pw"] = pw
         ok = steps.run("连接 AdsPower 浏览器", connect)
         if ok:
             ok = steps.run("打开 Flow 页面", open_flow)
         if ok:
+            ok = steps.run("进入 Flow 项目", enter_project)
+        if ok:
             steps.run("定位 prompt 输入框", locate_prompt)
             steps.run("定位配置按钮", locate_config_button)
             steps.run("选择器探针", run_selector_probe)
             steps.run("读取账号积分", read_credit, critical=False)
-            if level >= 2:
-                steps.run("最小真实提交", submit_minimal)
         if not ok or any(r["status"] == "failed" for r in steps.rows):
             path = capture(holder.get("page"), "selftest", "自检存在失败步骤",
                            bucket="selftest")
             if path:
                 steps.note("失败现场已保存", "warn", path)
+
+    # The production generator owns its own sync_playwright() lifecycle.  Run
+    # it only after the read-only diagnostics connection above has closed;
+    # nesting two sync Playwright managers in one thread is unsupported.
+    if level >= 2 and not any(r["status"] == "failed" for r in steps.rows):
+        steps.run("最小真实提交", lambda: _submit_minimal_image(user_id))
     if holder.get("selectors"):
         steps.note("选择器探针摘要", "ok", holder["selectors"]["summary"])
 
@@ -296,8 +502,11 @@ def run_selftest(level=0, user_id=None, cancel_check=None):
     return outcome
 
 
-def probe_selectors_live(user_id=None, cancel_check=None):
-    """连一次浏览器只跑选择器探针（不提交、不改配置）。"""
+def probe_selectors_live(user_id=None, cancel_check=None, deep=False):
+    """连一次浏览器只跑选择器探针（不提交、不改配置）。
+
+    deep=True 会额外点开账号菜单和配置面板来验证弹窗态的族，收尾按 Escape。
+    """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -312,7 +521,9 @@ def probe_selectors_live(user_id=None, cancel_check=None):
             page = find_or_create_page(browser.contexts[0], "labs.google",
                                        fallback_url="https://labs.google/fx/tools/flow")
             ensure_flow_workspace(page)
-            probe = probe_selectors(page)
+            if deep:
+                _ensure_flow_project_open(page)
+            probe = probe_selectors(page, deep=deep)
     probe["status"] = "ok"
     return probe
 

@@ -20,6 +20,16 @@ class DummyWriter:
     def flush(self, *args, **kwargs):
         pass
 
+# fx_console 用 ANSI 转义给控制台上色/画框。那些字节原样落进 server.log 之后，
+# 前端日志面板（纯文本渲染，没有终端解释器）把它们当普通字符显示出来——面板里
+# 那些 "[0m" 和半截框线就是这么来的。落盘这一路统一剥掉，控制台那一路不动，
+# 终端里的彩色输出照旧。
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+
+
+def strip_ansi(text):
+    return _ANSI_RE.sub('', text) if isinstance(text, str) else text
+
 class RotatingFileStream:
     def __init__(self, filepath, max_bytes=2*1024*1024, backup_count=3, encoding='utf-8'):
         self.filepath = filepath
@@ -65,6 +75,9 @@ class RotatingFileStream:
         return len(data)
 
     def _write_line(self, line):
+        # 只在落盘这一路剥 ANSI：这里拿到的一定是完整一行（write() 已按 "\n" 切好），
+        # 转义序列不会横跨两次调用被切断。
+        line = strip_ansi(line)
         with self.lock:
             if not self.file:
                 return
@@ -275,6 +288,20 @@ def log_exception(tag, prefix='', task_id=None):
 SERVER_MANAGED = bool(SERVER_CONFIG.get('apiKey'))
 ALLOW_CLIENT_MODEL = SERVER_CONFIG.get('allowClientModel', True) is not False
 ACCESS_CODE = (SERVER_CONFIG.get('accessCode') or '').strip()
+
+
+def http_access_logging():
+    """是否把正常的 HTTP 往返也记进日志：2xx/3xx，以及 /outputs 下"文件还没生成"
+    的 404 探测（帧文件名是确定性的，前端会在生成完成前就来取，那个 404 是预期
+    行为不是故障）。4xx/5xx 里真正的异常不受这个开关影响，永远留痕。
+
+    默认关闭。实测这类行占 server.log 的 81%（43,284 行里 35,249 行），把真正
+    有用的行冲得找不到。
+
+    刻意不挂在 DEBUG_MODE 上——"我要看异常堆栈"和"我要看每一个 304"是两个不同
+    的需求，绑在一起正是日志一开 debug 就彻底没法读的原因。要看访问日志时单独
+    打开 logHttpAccess / SPARK_LOG_HTTP_ACCESS。"""
+    return bool(SERVER_CONFIG.get('logHttpAccess') or os.environ.get('SPARK_LOG_HTTP_ACCESS'))
 
 
 def strict_gates_enabled(config=None):
@@ -686,17 +713,48 @@ def _get_account_pool_service():
     return account_pool.AccountPool()
 
 
+def sequence_default_account(config):
+    """控制台配的「序列生成默认浏览器环境」（googleFxSequenceUserId）。留空返回 ''。"""
+    return str(config.get('googleFxSequenceUserId') or '').strip()
+
+
+def sequence_account_locked(config):
+    """默认环境是否被锁定（锁定 = 整条序列不按节拍换号）。"""
+    return bool(config.get('googleFxSequenceUserLock')) and bool(sequence_default_account(config))
+
+
 def _select_pool_account(config, pool):
     """池子非空且未手动指定账号时，自动选一个还有额度的账号写回 config；
     手动填了 googleFxUserId 单字段 = 这一次的临时覆盖，跳过自动挑选；
     池子为空（还没添加任何账号）= 完全不介入，行为与手动单选时代一致。
-    返回被自动选中的 user_id（未触发自动选号则返回 None）。"""
+    返回被自动选中的 user_id（未触发自动选号则返回 None）。
+
+    优先级：手动 googleFxUserId > 序列生成默认环境（googleFxSequenceUserId，
+    仅当它此刻确实可用）> 号池自动选号。默认环境不可用时如实降级到自动选号并
+    打一行原因——静默换号会让用户以为序列一直跑在他钉的那个环境上。"""
     manual_override = str(config.get('googleFxUserId') or '').strip()
     if manual_override:
         return None
-    if not pool.list_accounts():
+    accounts = pool.list_accounts()
+    if not accounts:
         return None
     min_credit = config.get('videoAccountPoolMinCredit', 1)
+
+    preferred = sequence_default_account(config)
+    if preferred:
+        match = next((a for a in accounts if str(a.get('user_id')) == preferred), None)
+        if match is None:
+            print(f"Warning: 序列生成默认环境 {preferred} 不在号池里，改为自动选号")
+        elif match.get('disabled'):
+            print(f"Warning: 序列生成默认环境 {preferred} 已禁用，改为自动选号")
+        elif _account_in_cooldown(match):
+            print(f"Warning: 序列生成默认环境 {preferred} 处于冷却期，改为自动选号")
+        elif not _account_has_credit(match, min_credit):
+            print(f"Warning: 序列生成默认环境 {preferred} 积分不足 {min_credit}，改为自动选号")
+        else:
+            config['googleFxUserId'] = preferred
+            return preferred
+
     chosen = pool.pick_account(min_credit=min_credit)
     if chosen is None:
         raise RuntimeError('号池所有账号积分不足或被禁用，请在「号池管理」里检查/刷新后重试')
@@ -739,8 +797,15 @@ def _account_has_credit(account, min_credit):
 def _account_rotation_ring(config, pool, first_user_id):
     """号池里当前可用的账号排成轮转顺序，本次已选中的账号排最前。
 
-    可用 = 未禁用 + 不在冷却 + 积分未知或 ≥ min_credit（与 pick_account 同一口径）。"""
+    可用 = 未禁用 + 不在冷却 + 积分未知或 ≥ min_credit（与 pick_account 同一口径）。
+
+    「锁定默认环境」且本次确实选中了那个环境时返回单元素环：plan_frame_chunk_accounts /
+    plan_generation_legs 见到 len(ring)<=1 就不切腿，整条序列留在同一个环境上。
+    默认环境没被选中（不可用而降级了）时不锁——那样锁住的是降级后的替补账号，
+    不是用户钉的那个。"""
     min_credit = config.get('videoAccountPoolMinCredit', 1)
+    if sequence_account_locked(config) and first_user_id == sequence_default_account(config):
+        return [first_user_id]
     try:
         accounts = pool.list_accounts() or []
     except Exception as e:
@@ -772,10 +837,18 @@ def _next_unused_account(config, pool, ring, exclude):
 
 
 def effective_config(client_config):
-    client_config = client_config or {}
+    client_config = dict(client_config or {})
+    # 默认环境与换号节拍只有一个权威来源：Google FX 服务管理中心写入的服务端配置。
+    # 即使浏览器还缓存着旧前端，也不能再让历史字段覆盖统一配置。
+    client_config.pop('googleFxUserId', None)
+    client_config.pop('googleFxIpRotateRequests', None)
     from integrations.google_fx.model_catalog import normalize_google_fx_image_model
     if not SERVER_MANAGED:
         merged = dict(client_config)
+        for key in ('googleFxIpRotateRequests', 'googleFxSequenceUserId',
+                    'googleFxSequenceUserLock'):
+            if key in SERVER_CONFIG:
+                merged[key] = SERVER_CONFIG[key]
         if 'googleFxImageModel' in merged:
             merged['googleFxImageModel'] = normalize_google_fx_image_model(
                 merged.get('googleFxImageModel'))
@@ -809,10 +882,14 @@ def effective_config(client_config):
         for k in ('cheapModel', 'auxModel'):
             if client_config.get(k):
                 merged[k] = client_config[k]
-    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'videoDuration', 'googleFxIpRotateRequests', 'googleFxUserId', 'adsPowerPort', 'videoAccountPoolMinCredit', 'qaGateLevel', 'realityCheckpointInterval', 'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath'):
+    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'videoDuration', 'adsPowerPort', 'videoAccountPoolMinCredit', 'qaGateLevel', 'realityCheckpointInterval', 'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath'):
         if k in client_config:
             merged[k] = client_config[k]
         elif k in SERVER_CONFIG:
+            merged[k] = SERVER_CONFIG[k]
+    for k in ('googleFxIpRotateRequests', 'googleFxSequenceUserId',
+              'googleFxSequenceUserLock'):
+        if k in SERVER_CONFIG:
             merged[k] = SERVER_CONFIG[k]
     if 'googleFxImageModel' in merged:
         merged['googleFxImageModel'] = normalize_google_fx_image_model(

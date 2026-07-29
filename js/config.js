@@ -97,7 +97,8 @@ function updateConfigSummary() {
     const pacingId = (typeof loadedIdeationCover !== 'undefined' && loadedIdeationCover
         && loadedIdeationCover.pacing_skeleton) || '';
     const pacingText = pacingId === 'dual_payoff' ? '内外双重完工'
-        : (pacingId === 'linear_milestone' ? '单线里程碑' : '未载入');
+        : (pacingId === 'nested_space_payoff' ? '双空间重置兑现'
+        : (pacingId === 'linear_milestone' ? '单线里程碑' : '未载入'));
     
     const summaryText = `${themeText}${anchorsStr} | 骨架:${pacingText}, 复杂度:${complexityText}, 预算:${budgetText}, 反差:${ratioVal}%, 尺度:${creativityText}, ${beatMode}:${beatsVal}拍`;
     
@@ -304,6 +305,16 @@ function loadConfig() {
     if (stored) {
         try {
             config = { ...DEFAULT_CONFIG, ...JSON.parse(stored) };
+
+            // 旧版 API 配置中心曾把“临时指定浏览器”和“换号频率”存在本地。
+            // 两项现已统一由 Google FX 服务管理中心维护；删掉旧值，防止它们继续
+            // 随每个请求覆盖服务端设置。
+            if (Object.prototype.hasOwnProperty.call(config, 'googleFxUserId')
+                    || Object.prototype.hasOwnProperty.call(config, 'googleFxIpRotateRequests')) {
+                delete config.googleFxUserId;
+                delete config.googleFxIpRotateRequests;
+                localStorage.setItem('spark_config', JSON.stringify(config));
+            }
             
             // Auto-migrate legacy port 65038 defaults to new port 8045 defaults.
             // 只按 baseUrl + 密钥前缀识别旧默认值——绝不能在前端源码里内联完整密钥
@@ -361,17 +372,6 @@ function loadConfig() {
     if (fxVideoDurationSelect) {
         fxVideoDurationSelect.value = config.videoDuration || '';
     }
-    const fxAccountSwitchInput = document.getElementById('settings-fx-account-switch-requests');
-    if (fxAccountSwitchInput) {
-        fxAccountSwitchInput.value = config.googleFxIpRotateRequests !== undefined ? config.googleFxIpRotateRequests : 5;
-    }
-    // 浏览器编号是号池环境编号的下拉（选项由 account_pool.js 的
-    // populateFxBrowserIdSelect 异步填），这里赋值可能早于选项到位——
-    // 那边会拿 config.googleFxUserId 再选一次，不会丢已保存的值。
-    const fxBrowserIdSelect = document.getElementById('settings-fx-browser-id');
-    if (fxBrowserIdSelect) {
-        fxBrowserIdSelect.value = config.googleFxUserId || '';
-    }
     const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
     if (trendUrlsInput) {
         trendUrlsInput.value = config.ideationTrendUrls || '';
@@ -408,17 +408,9 @@ function updateFxImageModelVisibility() {
     const backendSelect = document.getElementById('settings-image-backend');
     const fxImageGroup = document.getElementById('fx-image-model-group');
     const fxVideoGroup = document.getElementById('fx-video-model-group');
-    const fxAccountSwitchGroup = document.getElementById('fx-account-switch-group');
-    const fxBrowserIdGroup = document.getElementById('fx-browser-id-group');
-    // 号池分区里包着上面两项的折叠块：两项都藏起来时它自己也得藏，
-    // 不然号池顶上会剩一条点开是空的「选号策略」
-    const fxPoolStrategyGroup = document.getElementById('fx-pool-strategy-group');
     const showFx = backendSelect && backendSelect.value === 'google_fx';
-    if (fxPoolStrategyGroup) fxPoolStrategyGroup.style.display = showFx ? '' : 'none';
     if (fxImageGroup) fxImageGroup.style.display = showFx ? '' : 'none';
     if (fxVideoGroup) fxVideoGroup.style.display = showFx ? '' : 'none';
-    if (fxAccountSwitchGroup) fxAccountSwitchGroup.style.display = showFx ? '' : 'none';
-    if (fxBrowserIdGroup) fxBrowserIdGroup.style.display = showFx ? '' : 'none';
     updateFxVideoDurationVisibility();
 }
 
@@ -454,15 +446,6 @@ function applySettingsFormToConfig() {
     const fxVideoDurationSelect = document.getElementById('settings-fx-video-duration');
     if (fxVideoDurationSelect) {
         config.videoDuration = fxVideoDurationSelect.value;
-    }
-    const fxAccountSwitchInput = document.getElementById('settings-fx-account-switch-requests');
-    if (fxAccountSwitchInput) {
-        const val = parseInt(fxAccountSwitchInput.value.trim(), 10);
-        config.googleFxIpRotateRequests = isNaN(val) ? 5 : val;
-    }
-    const fxBrowserIdSelect = document.getElementById('settings-fx-browser-id');
-    if (fxBrowserIdSelect) {
-        config.googleFxUserId = fxBrowserIdSelect.value.trim();
     }
     const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
     if (trendUrlsInput) {
@@ -532,14 +515,6 @@ function resetConfig() {
     const fxVideoDurationSelect = document.getElementById('settings-fx-video-duration');
     if (fxVideoDurationSelect) {
         fxVideoDurationSelect.value = DEFAULT_CONFIG.videoDuration;
-    }
-    const fxAccountSwitchInput = document.getElementById('settings-fx-account-switch-requests');
-    if (fxAccountSwitchInput) {
-        fxAccountSwitchInput.value = DEFAULT_CONFIG.googleFxIpRotateRequests;
-    }
-    const fxBrowserIdSelect = document.getElementById('settings-fx-browser-id');
-    if (fxBrowserIdSelect) {
-        fxBrowserIdSelect.value = DEFAULT_CONFIG.googleFxUserId;
     }
     const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
     if (trendUrlsInput) {

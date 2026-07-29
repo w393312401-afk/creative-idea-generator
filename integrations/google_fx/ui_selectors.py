@@ -47,73 +47,23 @@ UI_SELECTORS = {
             "[contenteditable='true']",
         ],
 
-        # --- 历史参考图清理 ---
-        "close_history_btn": [
-            "button:has(i:has-text('close'))",
-            "button[data-state='closed'] i",
-            "button[aria-label*='Close']",
-        ],
-
         # --- 图片上传 (通用入口) ---
-        # ✅ 2026-04-05 基于实测 DOM 验证
-        # 路径: 底部输入框左侧 [+] → Media Picker 面板 → Upload image
+        # + 按钮 (底部输入框左侧，触发 Media Picker)。这份列表就是
+        # google_fx_helpers._find_add2_btn 实际在用的那份，两边共用同一个源，
+        # 所以选择器探针探的和生产代码点的是同一批选择器。
         "add_media_btn": [
-            # + 按钮 (底部输入框左侧，触发 Media Picker)
+            "button[aria-haspopup='dialog']:has(span:text('Create'))",
+            "button[aria-haspopup='dialog']:has(i.google-symbols:text('add_2'))",
+            "button[aria-haspopup='dialog']:has(i:text('add_2'))",
             "button[aria-haspopup='dialog']",
-        ],
-        "media_picker_ready": [
-            # Media Picker 面板已打开的等待条件
-            "input[placeholder='Search for Assets']",
-        ],
-        "upload_image_trigger": [
-            # Upload image 可点击区域 (有 onclick，含 upload icon)
-            # 实测: <div class='sc-70a6bd2c-10 fxheTi'><i>upload</i><div>Upload image</div></div>
-            "div.sc-70a6bd2c-10.fxheTi",
-            # 后备: 包含 upload icon 的 div
-            "div:has(> i.google-symbols)",
-        ],
-        "file_input": [
-            # ✅ 实测: input[type='file'][accept='image/*'] 已挂载 DOM，可直接 set_input_files
-            "input[type='file'][accept='image/*']",
-            "input[type='file']",
-        ],
-        "agree_btn": ["button:has-text('I agree')", "button:has-text('我同意')"],
-        "crop_and_save_btn": [
-            "button:has-text('Crop and Save')",
-            "button:has-text('Save')",
-            "button[aria-label*='Crop']",
-            "button:has-text('裁剪并保存')",
-            "button:has-text('保存')",
-            "button[aria-label*='裁剪']",
-        ],
-        "crop_ratio_combobox": ["button[role='combobox']"],
-        "portrait_opt": [
-            "div[role='option']:has-text('Portrait')",
-            "li:has-text('Portrait')",
-            "div:has-text('9:16')",
-            "div[role='option']:has-text('纵向')",
-            "li:has-text('纵向')",
-        ],
-        "first_frame_indicator": ["span:has-text('First Frame')", "span:has-text('第一帧')", "span:has-text('首帧')"],
-        "upload_indicator": [
-            "span:has-text('This is your ingredient, it can used to effect the outcome')",
-            "span:has-text('This is your ingredient')",
-            "span:has-text('First Frame')",
-            "button:has(i:has-text('close'))",
-            "span:has-text('这是您的原料')",
-            "span:has-text('首帧')",
+            "button[aria-haspopup='menu']:has(span:text('Create'))",
+            "button[aria-haspopup='menu']:has(span:text('添加媒体'))",
+            "button[aria-haspopup='menu']:has(i:text('add'))",
+            "button[aria-haspopup='menu']",
         ],
 
-        # --- 配置面板: 模式/比例/数量/模型 Tab 按钮 ---
+        # --- 配置面板: 比例/数量/模型 Tab 按钮 ---
         # ✅ 2026-04-05 基于实测: 所有 tab 按钮含稳定 class flow_tab_slider_trigger
-        "mode_tab_image": [
-            # Image 模式 Tab
-            "button.flow_tab_slider_trigger[aria-controls$='-content-IMAGE']",
-        ],
-        "mode_tab_video": [
-            # Video 模式 Tab
-            "button.flow_tab_slider_trigger[aria-controls$='-content-VIDEO']",
-        ],
         "ratio_tab": {
             # 比例选择 Tab (aria-controls 末尾为比例 key)
             "9:16":  "button.flow_tab_slider_trigger[aria-controls$='-content-PORTRAIT']",
@@ -129,77 +79,17 @@ UI_SELECTORS = {
             "x3": "button.flow_tab_slider_trigger[aria-controls$='-content-3']",
             "x4": "button.flow_tab_slider_trigger[aria-controls$='-content-4']",
         },
-        "model_dropdown_trigger": [
-            # 配置面板内打开模型列表的触发器
-            "button[aria-haspopup='menu']:has(i.google-symbols:text-is('arrow_drop_down'))",
-            ".DropdownMenuContent button[aria-haspopup='menu']",
-        ],
         "config_panel_root": [
             ".DropdownMenuContent[role='menu'][data-state='open']",
             "[role='menu'].DropdownMenuContent[data-state='open']",
             "[role='menu'][data-state='open']",
         ],
-        "model_menu_root": [
-            "[role='menu'][data-state='open'][aria-labelledby]",
-            "[data-radix-menu-content][data-state='open'][aria-labelledby]",
-        ],
-        "model_menu_item": [
-            # 模型菜单各选项: 包含模型名的 button
-            # 用法: '[role="menuitem"] button:has-text("Nano Banana 2")'
-            '[role="menuitem"] button',
-        ],
-
-        # --- 上传对话框 (旧路径兼容) ---
-        "upload_dialog_btn": [
-            "div:has-text('Upload'):has(i:has-text('upload'))",
-            "div:has-text('上传'):has(i:has-text('upload'))",
-        ],
-
-        # --- 错误检测 ---
-        "something_went_wrong": [
-            # \u5b9e\u6d4b\u6709\u6548 (2026-03-25): \u9519\u8bef\u5361\u7247 DOM \u7ed3\u6784
-            "div[class*='sc-25d34a31-1']:has-text('Failed')",
-            "div[class*='sc-25d34a31-2']:has-text('something went wrong')",
-            "div[class*='sc-2a857f86-1']:has-text('Failed')",
-            # \u6587\u5b57\u517c\u5bb9\u517c\u5bb9
-            "text='Something went wrong'",
-            "text='Something went wrong.'",
-            "text='Oops, something went wrong!'",
-            # \u5c55\u5f00\u6210\u542b\u6709\u6587\u5b57\u7684\u5143\u7d20
-            ":has-text('Oops, something went wrong!')",
-        ],
-        "send_feedback": ["text='Send app feedback'"],
-
-        # --- 下载 ---
-        "download_btn": [
-            "button:has-text('Download')",
-            "button[aria-label*='Download']",
-            "button:has-text('下载')",
-            "button[aria-label*='下载']",
-        ],
-        "done_btn": [
-            "button:has-text('Done')",
-            "button[aria-label*='Done']",
-            "button:has-text('完成')",
-            "button[aria-label*='完成']",
-        ],
 
         # --- 配置按钮 (底部工具栏) ---
         # Video 模式: Veo 3.1 - Fast / Veo 3.1 - Quality
         # Image 模式: Nano Banana Pro / Nano Banana 2 / Nano Banana 2 Lite
+        # ⚠️ 非选择器：这是文本关键词表，不能当 CSS 选择器用（选择器探针会跳过）。
         "config_btn_keywords": ["Banana", "Nano", "Imagen", "Video", "Veo", "Pro"],
-        "config_btn_count_keywords": ["x1", "x2", "x3", "x4"],
-
-        # --- 发送 ---
-        "send_btn_icon_texts": ["arrow_forward", "send", "arrow_upward"],
-        "send_btn_aria_labels": ["Send", "send", "Submit", "submit", "Create"],
-        "create_btn": ["button:has-text('Create')", "button:has-text('创建')", "button:has-text('生成')"],
-
-        # --- 上传对话框 ---
-        "upload_dialog_btn": [
-            "div:has-text('Upload'):has(i:has-text('upload'))",
-            "div:has-text('上传'):has(i:has-text('upload'))",
-        ],
 
         # --- 积分余额 ---
         # 首次/未完成初始化的账号会停在产品介绍落地页；必须先点击 CTA 才会

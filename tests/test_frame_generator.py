@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import shutil
 import tempfile
@@ -16,6 +17,7 @@ from frame_generator import (
     generate_frame_sequence,
     _execute_request_with_retry,
     _generate_image_edit,
+    _image_edit_api_size,
     _image_size_to_api_size,
     CHAT_TRANSPORT,
     reset_edits_pool_state,
@@ -439,6 +441,43 @@ class TestChatTransportFallback(unittest.TestCase):
                 _generate_image_edit(config, 'p', self.ref_path, self.target_path)
 
         self.assertEqual(self.chat_payloads, [])
+
+    def test_windows_edits_uses_verified_pixel_size_and_quality_fields(self):
+        """Windows 8046 edits 走已实测成功的 size + image_size，不再发旧 aspect_ratio。"""
+        requests = []
+
+        def fake_execute(req, *args, **kwargs):
+            requests.append(req)
+            data_url = _test_image_data_url((768, 1376))
+            b64 = data_url.split(',', 1)[1]
+            return json.dumps({'data': [{'b64_json': b64}]}).encode('utf-8')
+
+        config = {
+            'imageModel': 'nano-banana-2',
+            'imageAspectRatio': '9:16',
+            'imageQuality': '2K',
+            'imageEditTransport': 'edits',
+            'apiKey': 'k',
+        }
+        with patch('frame_generator._execute_request_with_retry', side_effect=fake_execute):
+            transport = _generate_image_edit(config, 'p', self.ref_path, self.target_path)
+
+        self.assertIsNone(transport)
+        self.assertEqual(len(requests), 1)
+        body = requests[0].data.decode('latin-1')
+        self.assertIn('name="model"\r\n\r\ngemini-3.1-flash-image\r\n', body)
+        self.assertIn('name="size"\r\n\r\n720x1280\r\n', body)
+        self.assertIn('name="image_size"\r\n\r\n2K\r\n', body)
+        self.assertIn('name="response_format"\r\n\r\nb64_json\r\n', body)
+        self.assertIn('name="image"; filename="reference.png"', body)
+        self.assertNotIn('name="aspect_ratio"', body)
+
+    def test_windows_edits_size_mapping(self):
+        self.assertEqual(_image_edit_api_size('1:1'), '1024x1024')
+        self.assertEqual(_image_edit_api_size('9:16'), '720x1280')
+        self.assertEqual(_image_edit_api_size('16:9'), '1280x720')
+        self.assertEqual(_image_edit_api_size('4:3'), '1216x896')
+        self.assertEqual(_image_edit_api_size('720x1280'), '720x1280')
 
     def test_transport_chat_never_sends_the_doomed_edits_request(self):
         """网关补丁缺失的机器上直接指定 chat 通道：那一枪必挂（~1s + 一整张参考图

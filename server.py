@@ -359,6 +359,12 @@ def _get_account_pool():
     return account_pool.AccountPool()
 
 
+def _get_proxy_pool():
+    """Google FX 代理号池服务（出口代理，与账号池对称）。"""
+    from integrations.google_fx.utils import proxy_pool
+    return proxy_pool.ProxyPool()
+
+
 def _require_fx_admission(handler, required=True):
     if not required:
         return True
@@ -482,6 +488,20 @@ def google_fx_status_snapshot(force=False):
     return value
 
 
+def _inert_config_notes(config):
+    """列出"存进去了、也热生效了，但被别的配置项压住跑不起来"的字段。
+
+    保存接口用它给出如实回执。此前这类冲突只有一个后果：控制台弹"已保存并热生效"，
+    实际行为一点没变，而唯一的解释写在手册第 4.1 节里。
+    """
+    notes = []
+    if config.get('googleFxSequenceUserLock') and str(config.get('googleFxSequenceUserId') or '').strip():
+        notes.append(
+            f'换号节拍（每 {_account_switch_interval(config)} 个请求换一个号）：'
+            '「锁定默认环境」开着时整条序列固定在同一个号上，这个节拍不会被用到')
+    return notes
+
+
 def _google_fx_status_snapshot():
     """返回控制台所需的非敏感 FX 运维快照；不启动或关闭任何浏览器。
 
@@ -593,6 +613,49 @@ def _google_fx_status_snapshot():
     if probe_failed:
         diagnostics.append({'level': 'warn', 'code': 'accounts_probe_failed',
                             'message': f'{probe_failed} 个账号最近一次积分探测失败，请检查登录或选择器'})
+
+    # 代理号池摘要：只读一个本地 JSON，不做连通性检测（检测要走网络，秒级轮询扛不住）
+    proxies = {'total': 0, 'enabled': 0, 'disabled': 0, 'ok': 0, 'failed': 0,
+               'unchecked': 0, 'bound': 0}
+    try:
+        proxies = _get_proxy_pool().summary()
+    except Exception as e:
+        diagnostics.append({'level': 'warn', 'code': 'proxy_pool_unavailable',
+                            'message': f'代理号池读取失败：{e}'})
+    if proxies.get('failed'):
+        diagnostics.append({
+            'level': 'warn', 'code': 'proxies_failed',
+            'message': f'{proxies["failed"]} 条代理最近一次连通性检测失败，不会参与轮换',
+        })
+
+    # 序列生成默认环境：钉了一个不在池子里/已禁用的环境，生成时会静默降级成自动
+    # 选号——那正是最难自查的一类"配了但没生效"，在这里先报出来。
+    sequence_user_id = str(cfg.get('googleFxSequenceUserId') or '').strip()
+    sequence_locked = bool(cfg.get('googleFxSequenceUserLock')) and bool(sequence_user_id)
+    if sequence_user_id:
+        picked = next((a for a in accounts if str(a.get('user_id')) == sequence_user_id), None)
+        if picked is None:
+            diagnostics.append({
+                'level': 'warn', 'code': 'sequence_account_missing',
+                'message': (f'序列生成默认浏览器环境 {sequence_user_id} 不在号池里，'
+                            '生成时会退回自动选号'),
+            })
+        elif picked.get('disabled'):
+            diagnostics.append({
+                'level': 'warn', 'code': 'sequence_account_disabled',
+                'message': f'序列生成默认浏览器环境 {sequence_user_id} 已禁用，生成时会退回自动选号',
+            })
+    # 「锁定默认环境」会把轮转环压成单元素（_account_rotation_ring），于是切腿逻辑
+    # 整个退化成单腿，换号节拍那个数字一次都不会被用到。这是设计如此，但此前只写在
+    # 手册里：控制台照旧显示「换号节拍 每 N 次请求」并在保存时说「已热生效」，
+    # 用户改了半天节拍却一次号都不换，正是最难自查的"配了但没生效"。
+    if sequence_locked:
+        diagnostics.append({
+            'level': 'warn', 'code': 'switch_interval_inert',
+            'message': (f'「锁定默认环境」已开启：整条序列固定跑在 {sequence_user_id} 上，'
+                        f'换号节拍（每 {_account_switch_interval(cfg)} 个请求换一个号）不生效。'
+                        '想按节拍轮转号池，请到「运行配置 → 号池」取消勾选锁定'),
+        })
 
     selector_warnings = [row for row in selector_rows
                          if row.get('miss', 0) > 0 or row.get('primary_ratio', 1) < 0.8]
@@ -717,7 +780,12 @@ def _google_fx_status_snapshot():
             'video_model': cfg.get('videoModel') or 'Veo 3.1 - Lite [Lower Priority]',
             'video_duration': cfg.get('videoDuration') or '',
             'account_switch_requests': _account_switch_interval(cfg),
+            # 锁定默认环境时轮转环只剩一个号，节拍值形同虚设——如实标出来，
+            # 别让状态条把一个死设置显示成正在生效
+            'account_switch_effective': not sequence_locked,
             'selected_user_id': selected_user_id,
+            'sequence_user_id': sequence_user_id,
+            'sequence_user_locked': sequence_locked,
             'ip_rotation_enabled': rotation['effective'],
             'ip_rotation': rotation,
             'dry_run': os.environ.get('FX_DRY_RUN', '0') in ('1', 'true', 'yes'),
@@ -735,6 +803,7 @@ def _google_fx_status_snapshot():
             'login_required': login_required,
             'ready': ready,
         },
+        'proxies': proxies,
         'tasks': fx_tasks[:20],
         'queue': queue_snapshot,
         'recent_failures': recent_failures,
@@ -1593,7 +1662,25 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
         set_log_context(None)
 
 
-class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
+class _QuietConnResetMixin:
+    """把"客户端悄悄掐掉空闲 keep-alive 连接"这类噪音从满屏 traceback 降成一行。
+
+    HTTP/1.1 之后浏览器会留着若干条空闲连接备用，用完/离开页面时直接 RST。服务端
+    正阻塞在 handle_one_request 的 readline 上，于是收到 WinError 10054/10053，
+    socketserver 默认把它当成"处理请求时出异常"打整段 traceback——server.log 里
+    实测 42 段全是这一种，纯噪音，却把真正的报错顶出了视野。
+    """
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError, TimeoutError)):
+            log('DEBUG', 'HTTP', f'客户端断开空闲连接: {type(exc).__name__}')
+            return
+        super().handle_error(request, client_address)
+
+
+class DualStackHTTPServer(_QuietConnResetMixin, ThreadingMixIn, HTTPServer):
     # ThreadingMixIn so a long-running /api/compose call (the skill can take 60-180s)
     # does not block static file serving or library reads in the same browser session.
     address_family = socket.AF_INET6
@@ -1601,6 +1688,12 @@ class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
     # “重复实例越积越多”的根源；显式 False + SO_EXCLUSIVEADDRUSE 让第二次启动立刻报错。
     allow_reuse_address = (sys.platform != 'win32')
     daemon_threads = True
+    # listen backlog：基类默认只有 5。一次页面加载要并发拉 20 个 js + 8 个 css，
+    # Chromium 每源开 6 条连接，再叠上 SSE 与另一个标签页，瞬时未 accept 的连接很容易
+    # 超过 5，超出的会被内核直接拒掉，表现就是随机某个 <script> 加载失败。
+    # tests/test_slot_grid_render.py 和 test_frames_cancel_settles_slots.py 里的静态
+    # 桩服务早就按同样理由写了 128，唯独真正对外服务的这两个类一直漏掉。
+    request_queue_size = 128
 
     def server_bind(self):
         if self.address_family == socket.AF_INET6:
@@ -1610,11 +1703,12 @@ class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
         super().server_bind()
 
 
-class IPv4HTTPServer(ThreadingMixIn, HTTPServer):
+class IPv4HTTPServer(_QuietConnResetMixin, ThreadingMixIn, HTTPServer):
     """IPv4 回退：本机禁用 IPv6 时 DualStackHTTPServer 无法启动。"""
     address_family = socket.AF_INET
     allow_reuse_address = (sys.platform != 'win32')
     daemon_threads = True
+    request_queue_size = 128  # 同 DualStackHTTPServer，理由见那边注释
 
     def server_bind(self):
         if sys.platform == 'win32' and hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
@@ -1697,12 +1791,54 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
     # 补齐；SSE 是无边界流，改为显式 close_connection 避免连接复用歧义。
     protocol_version = 'HTTP/1.1'
 
+    # 访问日志此前无差别 print(f"LOG: ...")：实测 server.log 里 81% 的行是它产生的
+    # （43,284 行中 35,249 行），且绝大多数是 "GET /outputs/xxx.mp4 304"——播放器
+    # 反复回源验证缓存的正常往返，对"生成得怎么样"零信息量，却把真正有用的行冲得
+    # 找不到。现在按状态码分级：4xx/5xx 里真正的异常照常留痕，正常往返只在显式
+    # 打开 logHttpAccess 时才记（见 server_common.http_access_logging）。
+    def _log_access(self, msg):
+        if http_access_logging():
+            log('INFO', 'HTTP', msg)
+
+    def log_request(self, code='-', size='-'):
+        try:
+            status = int(code)
+        except (TypeError, ValueError):
+            status = 0
+        path = (self.path or '').split('?')[0]
+        line = f'"{getattr(self, "requestline", "-")}" {code} {size}'
+        if status >= 500:
+            log('ERROR', 'HTTP', line)
+        elif status >= 400 and not (status == 404 and path.startswith('/outputs/')):
+            # /outputs 下的 404 例外：帧/视频文件名是确定性的，前端会在文件生成
+            # 之前就来取，那个 404 是预期中的"还没好"，不是故障（end_headers 里
+            # 那段缓存压制注释说的是同一件事）。
+            log('WARN', 'HTTP', line)
+        else:
+            self._log_access(line)
+
+    def log_error(self, format, *args):
+        # send_error() 会先 log_error("code %d, message %s") 再走 send_response()，
+        # 而后者已经经由 log_request 记过一条带状态码、且分好级的了——原样保留等于
+        # 同一个 404 记两遍。"Request timed out" 同理：HTTP/1.1 持久连接到点自然
+        # 过期，不是故障（实测 328 次全是这个）。这两类并进访问日志，其余按 WARN。
+        try:
+            msg = format % args
+        except Exception:
+            msg = str(format)
+        if msg.startswith('code ') or msg.startswith('Request timed out'):
+            self._log_access(msg)
+        else:
+            log('WARN', 'HTTP', msg)
+
     def log_message(self, format, *args):
-        if sys.stdout:
-            try:
-                sys.stdout.write(f"LOG: {format % args}\n")
-            except Exception:
-                pass
+        # http.server 里只有 log_request/log_error 会调到这里，两者都已单独覆盖。
+        # 留一个兜底覆盖，是为了不让基类实现把无级别的裸文本直接甩给 stderr。
+        try:
+            msg = format % args
+        except Exception:
+            msg = str(format)
+        self._log_access(msg)
 
     def send_response(self, code, message=None):
         # 记住本次响应状态码，供 end_headers 判断是否要压制 404 的隐式缓存
@@ -2290,6 +2426,17 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({'status': 'ok', 'accounts': pool.list_accounts(sort_by=sort_by, sort_order=sort_order)})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
+        elif path == '/api/proxy-pool':
+            # 代理号池：出口代理列表（密码只报 has_password，不回传明文）。
+            # 与 /api/account-pool 对称：那个是"用哪个号"，这个是"从哪个出口走"。
+            if not self._gate():
+                return
+            try:
+                pool = _get_proxy_pool()
+                self._send_json({'status': 'ok', 'proxies': pool.list_proxies(),
+                                 'summary': pool.summary()})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
         elif path == '/api/account-pool/adspower-profiles':
             # 本机 AdsPower 里所有浏览器环境,供"添加账号"下拉框选择候选 user_id
             if not self._gate():
@@ -2726,6 +2873,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     'restart_required': sorted(
                         key for key in (outcome.get('changed') or {})
                         if not FX_CONFIG_SPEC[key].get('hot')),
+                    # 写进去了、也热生效了，但被别的配置项压住跑不起来的字段
+                    'inert': _inert_config_notes(outcome.get('config') or {}),
                 })
             except KeyError as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=404)
@@ -2776,7 +2925,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 FX_CONTROL.audit('diagnostics.selector_probe', actor=_client_ip(self))
                 from integrations.google_fx.services import google_fx_diagnostics
                 self._send_json(google_fx_diagnostics.probe_selectors_live(
-                    user_id=(body.get('user_id') or '').strip() or None))
+                    user_id=(body.get('user_id') or '').strip() or None,
+                    deep=bool(body.get('deep'))))
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -2971,6 +3121,126 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'status': 'error', 'message': msg}, status=500)
                     return
                 self._send_json({'status': 'ok', 'message': msg, 'user_id': user_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/proxy-pool':
+            # 代理号池新增/编辑：{proxy_id?, host, port, proxy_type, user, password,
+            # label, note}。带 proxy_id 即编辑；编辑时不传 password 表示沿用原密码
+            # （列表接口从不回传明文，否则改个备注就会把密码清空）。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                pool = _get_proxy_pool()
+                entry = pool.add_proxy(
+                    host=body.get('host'), port=body.get('port'),
+                    proxy_type=body.get('proxy_type') or 'http',
+                    user=body.get('user') or '', password=body.get('password') or '',
+                    label=body.get('label') or '', note=body.get('note') or '',
+                    proxy_id=body.get('proxy_id') or '',
+                    keep_password=bool(body.get('proxy_id')),
+                )
+                self._send_json({'status': 'ok', 'proxy': entry})
+            except (ValueError, KeyError) as e:
+                self._send_json({'status': 'error', 'message': str(e).strip("'")}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/proxy-pool/delete':
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                proxy_id = str(body.get('proxy_id') or '').strip()
+                if not proxy_id:
+                    self._send_json({'status': 'error', 'message': '缺少 proxy_id'}, status=400)
+                    return
+                if not _get_proxy_pool().remove_proxy(proxy_id):
+                    self._send_json({'status': 'error', 'message': '代理不存在'}, status=404)
+                    return
+                self._send_json({'status': 'ok'})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/proxy-pool/toggle':
+            # 启用/禁用代理：{proxy_id, disabled}。禁用的不参与轮换，也不能下发。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                proxy_id = str(body.get('proxy_id') or '').strip()
+                if not proxy_id:
+                    self._send_json({'status': 'error', 'message': '缺少 proxy_id'}, status=400)
+                    return
+                entry = _get_proxy_pool().set_disabled(proxy_id, bool(body.get('disabled')))
+                if entry is None:
+                    self._send_json({'status': 'error', 'message': '代理不存在'}, status=404)
+                    return
+                self._send_json({'status': 'ok', 'proxy': entry})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/proxy-pool/check':
+            # 走这条代理拿一次真实出口 IP。纯网络请求，不开浏览器、不排 FX 队列，
+            # 所以不像 /api/account-pool/refresh 那样要看队列忙不忙。
+            if not self._gate(with_rate=True, rate_action='proxy_check'):
+                return
+            try:
+                body = self._read_json_body()
+                proxy_id = str(body.get('proxy_id') or '').strip()
+                if not proxy_id:
+                    self._send_json({'status': 'error', 'message': '缺少 proxy_id'}, status=400)
+                    return
+                entry = _get_proxy_pool().check_proxy(proxy_id)
+                if entry is None:
+                    self._send_json({'status': 'error', 'message': '代理不存在'}, status=404)
+                    return
+                if entry.get('last_check_status') != 'ok':
+                    self._send_json({
+                        'status': 'error', 'code': 'PROXY_CHECK_FAILED',
+                        'message': entry.get('last_check_error') or '代理不通',
+                        'proxy': entry,
+                    }, status=422)
+                    return
+                self._send_json({'status': 'ok', 'proxy': entry})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/proxy-pool/apply':
+            # 把代理写进某个 AdsPower 环境的 userProxyConfig：{proxy_id, user_id}。
+            # AdsPower 在浏览器启动时读代理，已开着的窗口要关掉重开才换出口。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                proxy_id = str(body.get('proxy_id') or '').strip()
+                user_id = str(body.get('user_id') or '').strip()
+                if not proxy_id or not user_id:
+                    self._send_json({'status': 'error',
+                                     'message': '缺少 proxy_id 或 user_id'}, status=400)
+                    return
+                entry = _get_proxy_pool().apply_to_profile(proxy_id, user_id)
+                self._send_json({
+                    'status': 'ok', 'proxy': entry,
+                    'message': f'已写入环境 {user_id}，该浏览器下次启动时生效',
+                })
+            except KeyError as e:
+                self._send_json({'status': 'error', 'message': str(e).strip("'")}, status=404)
+            except ValueError as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/proxy-pool/import-legacy':
+            # 把老的 runtime/proxy_pool.txt（proxy_rotator list 模式那份纯文本）
+            # 并入代理号池，已存在的同 host:port 跳过。
+            if not self._gate():
+                return
+            try:
+                pool = _get_proxy_pool()
+                result = pool.import_legacy_txt()
+                self._send_json({'status': 'ok', 'proxies': pool.list_proxies(), **result})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 

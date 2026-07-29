@@ -22,13 +22,6 @@ const DEFAULT_CONFIG = {
     imageBackend: 'api',
     googleFxImageModel: 'Nano Banana 2',
     videoModel: 'Veo 3.1 - Lite [Lower Priority]',
-    // 换号节拍：每多少个请求换一个号池账号。键名是历史遗留（原本是「自动轮换 IP 频率」）
-    // ——换 IP 已全局关停（会把 Flow 登录 token 打失效、还会让画布追踪串片），全程保持
-    // 同一个 IP，这个值现在只管换号；键名保留是为了不动用户已存的配置
-    googleFxIpRotateRequests: 5,
-    // AdsPower 浏览器编号（profile 的 user_id）：留空则使用服务端 .env 里的默认浏览器；
-    // 多开/多账号场景下可在此切换本次帧序列/视频生成实际驱动哪个 AdsPower 窗口
-    googleFxUserId: '',
     // 视频时长（仅 Omni Flash 模型面板提供 4s/6s/8s/10s 时长 tab；Veo 系列时长固定，
     // 该项对其无效）：留空则不主动切换，沿用 Flow 面板当前时长
     videoDuration: '',

@@ -5649,6 +5649,22 @@ Required JSON keys:
             "Do not move all exterior utility/platform/finish work after the cut, and do not turn the "
             "exterior mini-payoff into a reward operation; only the final beat is reward.\n"
         )
+    elif pacing_skeleton_id == 'nested_space_payoff':
+        _pacing_plan_block = (
+            "\nSelected pacing skeleton (MANDATORY narrative structure, while physical construction "
+            "order remains authoritative): nested_space_payoff / 双空间重置兑现. Treat the first "
+            "functional zone as a complete act: establish the extreme placement or concealment hook, "
+            "then progress through clearly visible material states and finish by stocking/furnishing "
+            "that zone until its function is unmistakable. The beat immediately before the reset is "
+            "the primary-space mini-payoff, not a partial surface milestone. Then make EXACTLY ONE "
+            "DECLARED HARD CUT to a distinct, untouched secondary raw space. This cut resets the camera "
+            "and the secondary-space work queue only; the completed primary space remains complete. "
+            "Rebuild the secondary space bottom-up: clean/base -> membrane or hidden services -> grid "
+            "framing -> cavity fill -> board closure -> finish surfaces -> core furniture. Reveal a "
+            "different function from the first zone, accelerate through useful contents/value stacking, "
+            "and end with a clean worker-free wide reward. Do not turn the reset into a doorway travel "
+            "shot, do not revisit or regress the first zone, and do not merge the two payoffs.\n"
+        )
     else:
         _pacing_plan_block = (
             "\nSelected pacing skeleton (narrative reference): linear_milestone / 单线里程碑推进. "
@@ -8380,13 +8396,26 @@ PACING_SKELETONS = {
             'worker-free final interior reward.'
         ),
     },
+    'nested_space_payoff': {
+        'label_zh': '双空间重置兑现',
+        'summary': (
+            'Reference distilled from the buried-bus shelter case: open on an extreme carrier-placement '
+            'or concealment hook; rebuild one primary functional zone through visible material-state '
+            'milestones and fully stock or furnish it for a readable mini-payoff; then make ONE declared '
+            'hard cut to a distinct untouched secondary raw space, visibly resetting that space only; '
+            'repeat the bottom-up membrane, framing, cavity-fill, board-closure and finish ladder; reveal '
+            'the secondary function through core furniture; finish with rapid value-stacking and a clean '
+            'wide final reward. The two spaces must have different functions and neither payoff may be a '
+            'partial construction state.'
+        ),
+    },
 }
 
 
 def normalize_pacing_skeleton_ids(raw, default_all=True):
     """Normalize the GUI multi-select without allowing arbitrary prompt text through.
 
-    Ideation defaults to both references so a four-card batch can split across rhythms.  Compose
+    Ideation defaults to all references so a multi-card batch can split across rhythms.  Compose
     callers use default_all=False and preserve the historical linear skeleton when an old task has
     no pacing_skeleton field.
     """
@@ -8415,6 +8444,13 @@ def apply_pacing_skeleton_to_brief(parsed_brief, pacing_skeleton_id):
         variant = threshold_variant(parsed_brief)
         parsed_brief['threshold_variant'] = 'coaxial' if variant == 'hard_cut' else variant
         parsed_brief['require_visible_threshold_video'] = True
+    elif pacing_skeleton_id == 'nested_space_payoff':
+        # 该骨架的留存点就是「第一空间完整兑现后，剪辑重置到第二个原始空间」。
+        # 它不是一镜过门；声明成 hard_cut 才会让第二空间首帧成为新的 t2i 链头，
+        # 避免第一空间已经完工的墙面/家具被 i2i 惯性带进第二空间。
+        parsed_brief['mode'] = 'Threshold'
+        parsed_brief['threshold_variant'] = 'hard_cut'
+        parsed_brief['require_visible_threshold_video'] = False
     return parsed_brief
 
 
@@ -8442,6 +8478,25 @@ _DUAL_MIN_POST_CROSSING_ENTRIES = 6   # 过门后：清运 1 + 分层重建 >=4 
 _DUAL_MIN_EXTERIOR_FAMILIES = 3       # 外部幕至少落实三族（与内部幕的七族计数对称）
 # 施工拍下界（不含 reward）：室外 2 + 设备/平台 1 + 小完工 1 + 过门 1 + 清运 1 + 重建 3
 _DUAL_STRUCTURAL_FLOOR = 9
+
+# 「双空间重置兑现」来自埋地校车案例：第一空间先做到可使用的小完工，随后唯一一次
+# 硬切把第二空间重置成毛坯，再走一轮分层施工。最小账本是第一幕 4 拍 + 重置 1 拍 +
+# 第二幕 5 拍 + reward；施工拍下界取 9，防止两轮基层/龙骨/封板被压成一拍。
+_NESTED_MIN_OUTLINE_ENTRIES = 11
+_NESTED_MIN_PRIMARY_ENTRIES = 4
+_NESTED_MIN_SECONDARY_ENTRIES = 5
+_NESTED_STRUCTURAL_FLOOR = 9
+_NESTED_RESET_CUE = (
+    r'(?:硬切|切入|切到|转入|转到|进入).{0,10}(?:第二|另一|新|附属|相邻).{0,8}'
+    r'(?:空间|房间|舱室|洞室|井室|地窖|内舱|区域)|'
+    r'(?:第二|另一|新|附属|相邻).{0,8}(?:空间|房间|舱室|洞室|井室|地窖|内舱|区域).{0,10}'
+    r'(?:原始|毛坯|未修|未施工|裸露)'
+)
+_NESTED_FUNCTION_CUE = (
+    r'厨房|储藏|储备|餐厨|工作间|起居|卧室|睡眠|住宿|休息|卫生间|浴室|'
+    r'装备|工具|医疗|通信|供电|水处理|功能区|生活区'
+)
+_NESTED_COMPLETION_CUE = r'完成|完工|建成|布满|装满|填满|备齐|陈列|投入使用|可用'
 
 # 外部设备/平台族。骨架 summary 把它列为必需项，但此前**没有任何一处检查它**：
 # 激发侧门禁只看过门前最后一条的措辞，合成侧只有一句否定式约束（"Do not move all
@@ -8614,18 +8669,76 @@ def compute_beats_floor(idea):
     outline = [str(x or '').strip() for x in (idea.get('beat_outline') or []) if str(x or '').strip()]
     if len(outline) < 2:
         return _MIN_ADAPTIVE_CONSTRUCTION_BEATS
-    if idea.get('pacing_skeleton') == 'dual_payoff':
+    if idea.get('pacing_skeleton') in ('dual_payoff', 'nested_space_payoff'):
         # 双完工比单线多一整幕外部（设备/平台 + 小完工），沿用单线那个 4 会让一张
         # 11 条的双完工卡算出 floor=7，ladder 于是可以合法地把两幕之一压没。
         # 不依赖 _outline_crossing_indices 是否命中：过门是这个骨架的定义，正则没认出来
         # 只说明这张卡本来就过不了 pacing_skeleton_outline_violations。
         # 下界超过卡片上限时由 compose 侧的 min(beats_floor, beats_count) 夹回，不会永假。
-        structural = _DUAL_STRUCTURAL_FLOOR
+        structural = (_DUAL_STRUCTURAL_FLOOR if idea.get('pacing_skeleton') == 'dual_payoff'
+                      else _NESTED_STRUCTURAL_FLOOR)
     else:
         structural = 4 if _outline_crossing_indices(outline) else 2
     construction_beats = len(outline) - 1  # 末条是 reward，不算施工拍
     density = int(math.ceil(construction_beats * _OUTLINE_SHRINK_TOLERANCE))
     return max(structural, density)
+
+
+def _nested_space_payoff_violations(idea, outline):
+    """Validate the two-room reset rhythm without treating its declared cut as a doorway crossing."""
+    if len(outline) < _NESTED_MIN_OUTLINE_ENTRIES:
+        return [
+            f'nested_space_payoff needs at least {_NESTED_MIN_OUTLINE_ENTRIES} outline entries to '
+            f'complete two distinct functional spaces without phase packing (found {len(outline)})'
+        ]
+
+    reset_indices = [i for i, text in enumerate(outline) if re.search(_NESTED_RESET_CUE, text)]
+    if len(reset_indices) != 1:
+        hit_text = '、'.join(outline[i] for i in reset_indices) or '(none)'
+        return [
+            'nested_space_payoff must contain exactly one declared reset into a distinct untouched '
+            f'second space (found {len(reset_indices)}: {hit_text})'
+        ]
+
+    reset_idx = reset_indices[0]
+    errors = []
+    if reset_idx < _NESTED_MIN_PRIMARY_ENTRIES:
+        errors.append(
+            f'the second-space reset must follow at least {_NESTED_MIN_PRIMARY_ENTRIES} primary-space '
+            f'construction entries; it currently sits at position {reset_idx + 1}')
+    post_entries = len(outline) - 1 - reset_idx
+    if post_entries < _NESTED_MIN_SECONDARY_ENTRIES:
+        errors.append(
+            f'the secondary-space arc needs at least {_NESTED_MIN_SECONDARY_ENTRIES} entries after '
+            f'the reset, including its layered rebuild and the final reward (found {post_entries})')
+
+    if reset_idx > 0:
+        mini_payoff = outline[reset_idx - 1]
+        if not (re.search(_NESTED_FUNCTION_CUE, mini_payoff)
+                and re.search(_NESTED_COMPLETION_CUE, mini_payoff)):
+            errors.append(
+                'the entry immediately before the reset must fully complete and name the primary '
+                'space function (for example a stocked kitchen/storage/work zone), not a partial finish')
+
+    reset_text = outline[reset_idx]
+    if not re.search(r'原始|毛坯|未修|未施工|裸露', reset_text):
+        errors.append('the second-space reset must explicitly reveal an untouched/raw state')
+
+    post_text = ' '.join(outline[reset_idx + 1:-1])
+    layer_families = (
+        r'清空|清运|基底|基层|找平',
+        r'防水|防潮|隔汽|膜|管线|电路',
+        r'龙骨|框架|格栅',
+        r'保温|填充|隔音',
+        r'封板|封装|面板|内衬',
+        r'饰面|地板|涂料|墙面|顶面',
+        r'家具|床|卧榻|软装|储物柜|装备板',
+    )
+    realized_layers = sum(bool(re.search(pattern, post_text)) for pattern in layer_families)
+    if realized_layers < 4:
+        errors.append(
+            'the secondary-space arc must realize at least four bottom-up layer/furnishing families')
+    return errors
 
 
 def pacing_skeleton_outline_violations(idea):
@@ -8636,9 +8749,13 @@ def pacing_skeleton_outline_violations(idea):
     the reference structurally distinct, plus several post-reset layer families; wording may vary,
     but merely relabelling a linear ladder no longer passes.
     """
-    if not isinstance(idea, dict) or idea.get('pacing_skeleton') != 'dual_payoff':
+    if not isinstance(idea, dict):
         return []
     outline = [str(x or '').strip() for x in (idea.get('beat_outline') or []) if str(x or '').strip()]
+    if idea.get('pacing_skeleton') == 'nested_space_payoff':
+        return _nested_space_payoff_violations(idea, outline)
+    if idea.get('pacing_skeleton') != 'dual_payoff':
+        return []
     if len(outline) < _DUAL_MIN_OUTLINE_ENTRIES:
         # 旧下界是 7。7 条时过门只能落在 idx 2/3，室内重建就只剩 1~2 条要独自补齐
         # 「至少四个层族」——防水+龙骨+封板挤进一拍，正好是合成侧
@@ -8954,6 +9071,16 @@ and must satisfy ALL of the following, otherwise the candidate is rejected:
 6. Those post-crossing entries rebuild the interior bottom-up and must visibly realize at least FOUR of
    these families: 基底/找平/清运 · 防水/隐蔽管线/电路 · 龙骨/框架/格栅 · 保温/填充/隔音 ·
    封板/内衬/面板 · 饰面/地板/涂料/墙面 · 家具/床/软装/储物柜.
+
+For nested_space_payoff, use the buried-bus reference as a RHYTHM, never as a subject to copy. Start with
+an extreme placement/concealment hook, then build a primary functional zone to a fully usable, stocked or
+furnished mini-payoff. The entry immediately before the reset must name that completed function. Make
+EXACTLY ONE declared hard cut into a DISTINCT second space and explicitly call it 原始/毛坯/未施工; the
+reset changes that second room only and never erases the first room's completed state. Rebuild the second
+space bottom-up through at least FOUR layer/furnishing families, reveal a different function through its
+core furniture, then rapidly stack useful contents and end on a clean wide final reward. Use at least
+{_NESTED_MIN_OUTLINE_ENTRIES} entries; give each entry one visible state change and never compress two
+rooms into one generic furnishing montage.
 """
 
     system_prompt = f"""You are the Upstream Ideation Layer for the `restoration-prompt-composer` skill.
@@ -9283,10 +9410,35 @@ Each object in the JSON array must have EXACTLY these keys:
             '封装内墙并完成饰面', '布置卧榻卫浴与软装', '舱门滑开,天光落入',
         ],
     }
+    nested_fallback_outlines = {
+        'glacier-ice-cave / refuge-den / self-material-window': [
+            '清空第一冰洞碎冰落石', '铺设第一空间防潮层', '架设木龙骨与保温层',
+            '封装储备区木饰面墙', '安装货架与操作台', '备齐储备厨房完成使用',
+            '硬切进入第二毛坯洞室', '清运第二洞室碎冰', '铺设防潮膜与电路',
+            '架设墙顶龙骨保温', '封装内衬与成品地板', '布置卧榻与羊毛软装',
+            '点亮暖灯,人物入住',
+        ],
+        'retired-submarine / micro-home / porthole-lighting': [
+            '清空第一舱废弃设备', '打磨除锈并焊补舱壁', '铺设舱底防潮基层',
+            '架设龙骨并填充保温', '封装桦木内衬与地板', '安装储物架与操作台',
+            '备齐餐厨储藏区完成使用', '硬切进入第二毛坯舱室', '清运第二舱锈屑管线',
+            '铺设电路与生活水管', '架设舱壁保温龙骨', '封装内衬饰面板',
+            '嵌装折叠床与储物柜', '通电亮灯,人物入住',
+        ],
+        'missile-silo / burrow-dwelling / roof-hatch': [
+            '清运第一井室积渣鸟粪', '修补混凝土结构裂缝', '涂布井壁防水封闭层',
+            '浇筑设备区混凝土板', '布设通风电路与水管', '安装设备柜与工作台',
+            '备齐供电通信区完成使用', '硬切进入第二毛坯井室', '清运第二井室塌落瓦砾',
+            '铺设防潮膜与隐蔽管线', '架设墙顶龙骨框架', '填充保温并封装内墙',
+            '铺装橡木地板与涂料', '布置卧榻卫浴与软装', '点亮全景,人物入住',
+        ],
+    }
     for idea_idx, idea in enumerate(fallback_ideas):
         idea['pacing_skeleton'] = selected_pacing_ids[idea_idx % len(selected_pacing_ids)]
         if idea['pacing_skeleton'] == 'dual_payoff':
             idea['beat_outline'] = dual_fallback_outlines.get(idea.get('dna'), idea['beat_outline'])
+        elif idea['pacing_skeleton'] == 'nested_space_payoff':
+            idea['beat_outline'] = nested_fallback_outlines.get(idea.get('dna'), idea['beat_outline'])
     return {'ideas': _attach_trend_ref_ids(fallback_ideas, trend_refs), 'trend_refs': trend_refs}
 
 

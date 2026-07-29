@@ -160,6 +160,69 @@ def test_status_snapshot_reports_unprobed_and_login_required(monkeypatch):
     assert 'accounts_unprobed' in codes and 'accounts_login_required' in codes
 
 
+def test_locked_default_account_marks_switch_interval_inert(monkeypatch):
+    """「锁定默认环境」会把轮转环压成单元素，换号节拍那个数字一次都用不上。
+
+    回归的是一个纯粹的"配了但没生效"：控制台状态条照旧显示「换号节拍 每 15 次请求」、
+    保存时还回一句"已保存并热生效"，而 _account_rotation_ring 早就退化成 [默认账号]，
+    两条链的切腿逻辑都走单腿分支，整条序列一个号跑到底。
+    """
+    monkeypatch.setattr(server, 'effective_config', lambda _: {
+        'adsPowerPort': '50325',
+        'googleFxIpRotateRequests': 15,
+        'googleFxSequenceUserId': 'pinned',
+        'googleFxSequenceUserLock': True,
+    })
+    monkeypatch.setattr(server.socket, 'create_connection', _connected_socket)
+    monkeypatch.setattr(server, '_get_account_pool', lambda: _Pool([
+        {'user_id': 'pinned', 'credit': 100, 'disabled': False, 'cooldown_until': None},
+        {'user_id': 'other', 'credit': 100, 'disabled': False, 'cooldown_until': None},
+    ]))
+
+    snapshot = server._google_fx_status_snapshot()
+    assert snapshot['configuration']['account_switch_requests'] == 15
+    assert snapshot['configuration']['account_switch_effective'] is False
+    assert 'switch_interval_inert' in {item['code'] for item in snapshot['diagnostics']}
+
+
+def test_switch_interval_not_flagged_when_default_account_is_unlocked(monkeypatch):
+    """只是钉了默认环境、没勾锁定时，后续仍按节拍轮转——不该误报成不生效。"""
+    monkeypatch.setattr(server, 'effective_config', lambda _: {
+        'adsPowerPort': '50325',
+        'googleFxIpRotateRequests': 15,
+        'googleFxSequenceUserId': 'pinned',
+        'googleFxSequenceUserLock': False,
+    })
+    monkeypatch.setattr(server.socket, 'create_connection', _connected_socket)
+    monkeypatch.setattr(server, '_get_account_pool', lambda: _Pool([
+        {'user_id': 'pinned', 'credit': 100, 'disabled': False, 'cooldown_until': None},
+    ]))
+
+    snapshot = server._google_fx_status_snapshot()
+    assert snapshot['configuration']['account_switch_effective'] is True
+    assert 'switch_interval_inert' not in {item['code'] for item in snapshot['diagnostics']}
+
+
+def test_inert_config_notes_cover_locked_switch_interval():
+    """保存回执：热生效不等于跑得起来，被压住的字段要如实说出来。"""
+    assert server._inert_config_notes({
+        'googleFxIpRotateRequests': 15,
+        'googleFxSequenceUserId': 'pinned',
+        'googleFxSequenceUserLock': True,
+    }), '锁定 + 指定环境时换号节拍必须被标为不生效'
+    # 勾了锁定却没指定环境是被 validate_patch 拦下的空承诺，行为仍是自动选号轮转
+    assert server._inert_config_notes({
+        'googleFxIpRotateRequests': 15,
+        'googleFxSequenceUserId': '',
+        'googleFxSequenceUserLock': True,
+    }) == []
+    assert server._inert_config_notes({
+        'googleFxIpRotateRequests': 15,
+        'googleFxSequenceUserId': 'pinned',
+        'googleFxSequenceUserLock': False,
+    }) == []
+
+
 def test_status_endpoint_is_gated_and_returns_snapshot(monkeypatch):
     handler = object.__new__(server.SparkRequestHandler)
     handler.path = '/api/google-fx/status'

@@ -296,7 +296,8 @@ class TestRunIdeateReturnShape(unittest.TestCase):
             self.assertIn('recommended_beats', idea)
             self.assertTrue(5 <= idea['recommended_beats'] <= 15)
             self.assertIn('trend_ref', idea)
-            self.assertIn(idea['pacing_skeleton'], ('linear_milestone', 'dual_payoff'))
+            self.assertIn(idea['pacing_skeleton'],
+                          ('linear_milestone', 'dual_payoff', 'nested_space_payoff'))
             # 兜底列表也要带逐拍工序简介(卡片上的「工序预览」),长度 = 推荐拍数 + 1
             # (末条是 reward 揭示拍),否则 LLM 全挂时卡片会退化成没有工序的空壳
             self.assertEqual(len(idea['beat_outline']), idea['recommended_beats'] + 1)

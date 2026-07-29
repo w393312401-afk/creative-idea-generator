@@ -226,7 +226,8 @@ function ideaBeatOutline(idea) {
 
 const PACING_SKELETON_LABELS = {
     linear_milestone: '单线里程碑',
-    dual_payoff: '内外双重完工'
+    dual_payoff: '内外双重完工',
+    nested_space_payoff: '双空间重置兑现'
 };
 
 function pacingSkeletonLabel(id) {

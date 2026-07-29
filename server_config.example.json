@@ -23,12 +23,14 @@
   "_codexBaseUrl_comment": "Codex 网关(gpt-5/gpt-image-2/codex 系列模型)的请求地址;留空或删掉此行则使用默认 http://127.0.0.1:65038/v1",
   "codexApiKey": "在这里填你本机 Codex API Service 的密钥(agt_codex_ 开头)",
   "imageEditTransport": "auto",
-  "_imageEditTransport_comment": "帧序列图生图走哪条通道:auto=先打网关 /images/edits,撞上 gemini-3-pro-image 号池墙(网关硬编码bug,见 docs/image_generation_guide.md 第八节)就换同模型的 /chat/completions 续渲,并记住该网关已死、本进程后续帧不再重发那一枪;chat=从不打 /images/edits(网关补丁缺失的机器上直接省掉这次必挂请求,每帧省约1s+一张参考图上传);edits=只打 /images/edits,撞墙就地报错绝不换通道。注意 chat 通道固定出 1K 档(9:16 为 768x1376),请求 2K/4K 时是降档,帧会在 manifest 里记 transport/actual_pixels/degraded_reason 留痕",
+  "_imageEditTransport_comment": "帧序列图生图通道:auto=先走 multipart /images/edits,失败后才尝试同模型 /chat/completions;chat=只走 chat;edits=只走 edits。Windows 当前推荐 auto，edits 请求使用干净模型名+image 文件+像素 size（9:16 为 720x1280）+image_size；macOS 已确认 chat+image_url 有效，若 edits 仍受 Pro 图片池硬编码影响可设 chat。chat 通道固定出 1K 档，2K/4K 请求会在 manifest 留下降档记录",
   "strictGates": false,
   "_strictGates_comment": "true=视觉门禁(VLM判定/视频锚点校验)服务异常时按判定失败处理(fail-closed,走重试直至needs_human_review);false=异常时跳过放行,但manifest会记为auto_approved_degraded留痕,不再伪装成正常通过",
   "qaGateLevel": "standard",
   "_qaGateLevel_comment": "帧质检门档位:standard=全量严检(逐帧10项+跨帧漂移复查);lenient=只拦硬伤(无变化/换场景/出现人物机械/文字水印),构图视角漂移等WARN放行留痕且停用跨帧漂移复查;off=视觉门全部跳过(manifest记auto_approved_degraded)。注意:浏览器每次请求都携带配置中心的档位并覆盖本项——UI用户请直接在⚙️配置中心切换;本项只对不带config的无头/脚本调用生效",
   "reviewConcurrency": 4,
   "_reviewConcurrency_comment": "整套序列一致性审查的逐拍并发度(1~8,默认4)。逐拍审查彼此独立,串行跑12帧要十几次多模态调用、几分钟不出声;并发后耗时约按并发度下降。上游网关按并发限流时调小,设1退回串行",
-  "debug": false
+  "debug": false,
+  "logHttpAccess": false,
+  "_logHttpAccess_comment": "是否把正常的 HTTP 往返(2xx/3xx,以及 /outputs 下\"帧文件还没生成\"的 404 探测)也写进 server.log。默认 false:实测这类行占日志的 81%,把真正有用的行冲得找不到。4xx/5xx 里真正的异常不受本项影响,永远留痕。刻意独立于 debug——\"我要看异常堆栈\"和\"我要看每一个 304\"是两回事。排查前端到底请求了什么时临时打开,或设环境变量 SPARK_LOG_HTTP_ACCESS=1"
 }

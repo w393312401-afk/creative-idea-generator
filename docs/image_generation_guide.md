@@ -15,7 +15,8 @@
 ```json
 {
   "baseUrl": "http://127.0.0.1:8046/v1",
-  "imageModel": "gemini-3.1-flash-image"
+  "imageModel": "gemini-3.1-flash-image",
+  "imageEditTransport": "auto"
 }
 ```
 
@@ -32,13 +33,14 @@
 - 支持比例：`1:1`、`9:16`、`16:9`、`3:2`、`2:3`、`21:9` 等。
 - 支持清晰度：`1K`、`2K`、`4K`。
 
-**当前实测基线（2026-06-30，antigravity_tools v4.2.9）：**
+**当前实测基线（2026-07-29，Windows，Antigravity Tools 端口 8046）：**
 
-- 底层 `/v1/images/edits` multipart 图生图已恢复可用，实测 `200 OK`，返回 `data[0].b64_json`。
+- 底层 `/v1/images/edits` multipart 图生图连续两次返回 `200 OK`，返回 `data[0].b64_json`；方图和 9:16 竖图均已验证成功。
 - SPARK 应用层仍统一暴露 `/api/image/edits`，请求格式是 multipart 表单；服务端会根据配置转发到底层图像接口。
-- 底层 `/v1/images/generations` 仍用于文生图；SPARK 内部部分帧序列流程也会用 JSON `image` 字段做兼容图生图。
-- 不建议用 `/v1/chat/completions` 做图生图；多模态聊天路径容易丢失参考图或变成纯文生图。
-- 直接调用底层 `/v1/images/edits` 时，模型名使用干净名 `gemini-3.1-flash-image`，不要带 `-2k`、`-9-16` 等魔法后缀；比例和清晰度通过 `aspect_ratio`、`image_size` 字段传递。
+- 底层 `/v1/images/generations` 只用于文生图。不要通过给 generations JSON 增加 `image` 字段来模拟图生图；该字段可能被静默忽略。
+- 当前 Windows 网关的 `/v1/chat/completions` 图生图不可用：裸模型名和 `-1-1` 后缀模型名均返回上游 `404 Requested entity was not found`，随后被账号池包装成 `429 All accounts exhausted`。macOS 网关已确认 chat + 裸模型名 + `image_url` 有效，不能将 Windows 结论外推到 macOS。
+- 直接调用底层 `/v1/images/edits` 时，模型名使用干净名 `gemini-3.1-flash-image`，不要带 `-2k`、`-9-16`、`-1-1` 等魔法后缀。
+- Windows 当前推荐 `imageEditTransport: "auto"`：优先使用已验证成功的 edits；只有网关以后再次出现 edits 号池故障时才尝试回退。macOS 若 `/images/edits` 仍命中 Pro 图片池硬编码问题，则使用 `imageEditTransport: "chat"`。
 
 ## 三、调用 SPARK 应用接口
 
@@ -219,9 +221,8 @@ with open("reference.png", "rb") as reference:
         },
         data={
             "model": "gemini-3.1-flash-image",
-            "prompt": "将场景光线改为清晨，只修改光线，保持参考图的内容、人物、物体、视角和构图不变。",
-            "aspect_ratio": "9:16",
-            "image_size": "2K",
+            "prompt": "改为雨夜霓虹氛围，保持参考图的主体、视角、透视和建筑布局；向上下自然扩展为竖版构图，不要文字。",
+            "size": "720x1280",
             "response_format": "b64_json"
         },
         timeout=300,
@@ -236,7 +237,8 @@ with open("direct_edit.png", "wb") as file:
 
 - `model` 使用 `gemini-3.1-flash-image` 干净名。
 - `image` 是 multipart 文件字段；多图可追加 `image[]`。
-- `aspect_ratio` 和 `image_size` 使用独立表单字段，不要写进模型名后缀。
+- 底层接口当前已验证 `size="1024x1024"` 和 `size="720x1280"`。其中 `720x1280` 会输出网关原生 1K 竖图 `768x1376`，这是正常的尺寸归一化。
+- SPARK 应用层仍可使用 `aspect_ratio` 和 `image_size`；直接调用 8046 时优先使用本节已验证的 `size` 写法。
 - 不要手动设置 `Content-Type: multipart/form-data`；让 HTTP 客户端自动生成 boundary。
 
 ## 五、参考图上传规则
@@ -272,6 +274,8 @@ with open("direct_edit.png", "wb") as file:
 
 对于图生图，若希望最大程度保持构图，建议选择与参考图一致的宽高比。
 
+2026-07-29 竖版实测：请求 `size="720x1280"`，实际返回 JPEG `768x1376`。实际比例约为 1:1.792，与标准 9:16 的 1:1.778 接近；这是网关的原生输出尺寸，不应在请求成功后误判为比例失败。
+
 ## 八、排错清单
 
 1. 检查 `server_config.json`：
@@ -289,7 +293,7 @@ with open("direct_edit.png", "wb") as file:
 
 3. 若请求超时：确认没有仍指向旧端口 `8045` 或 `8082`。
 
-4. 若返回图与参考图完全无关：确认使用的是 `/api/image/edits` 或底层 `/v1/images/edits`。注意 `/v1/images/generations` 会**静默丢掉** `image` 字段——照样返回 200 和一张全分辨率的图，但那是纯文生图的产物，与参考图毫无关系（2026-07-25 实测），拿它做图生图等于制造断链帧。`/v1/chat/completions` 带 `image_url` 是可用的图生图通道，但只作降档兜底用，见第 7 条。
+4. 若返回图与参考图完全无关：确认使用的是 `/api/image/edits` 或底层 `/v1/images/edits`。注意 `/v1/images/generations` 会**静默丢掉** `image` 字段——照样返回 200 和一张全分辨率的图，但那是纯文生图的产物，与参考图毫无关系（2026-07-25 实测），拿它做图生图等于制造断链帧。2026-07-29 当前 Windows 网关的 `/v1/chat/completions` 图片输入路径会返回 404/429，不能作为 Windows 兜底；macOS 上该 chat 路径有效。
 
 5. 若返回 `503 No accounts available with quota` 或 `429 All accounts exhausted`，这是账号配额 / 限流问题，不是上传参数问题，稍后重试。
 
@@ -305,32 +309,46 @@ with open("direct_edit.png", "wb") as file:
      5. 将新编译生成的 `src-tauri/target/release/antigravity_tools.exe` 覆盖复制到 `D:\Antigravity-Manager\antigravity_tools.exe`。
      6. 重启服务。*注意：若启动后 cloudflared 隧道未正常拉起，需在命令行手动运行 `cloudflared tunnel run --token <gui_config.cloudflared.token> --protocol http2` 重新建立外网映射通道。*
    - **macOS 机器上没有这条修复路径**：网关是官方包 `/Applications/Antigravity Tools.app`，本机没有 `src-tauri` 源码树可重编，上面那套 `D:\Antigravity-Manager` 的流程只适用于原 Windows 机器。所以这台机器上 edits 接口的硬编码一直是未修补状态。
-   - **应用侧的兜底（2026-07-25 起）**：帧序列的图生图撞上这堵墙时不再整单失败，也绝不换模型——`frame_generator._generate_image_edit` 会用**同一个模型**改走 `/chat/completions`（参考图内联成 data URL）把这一帧渲完，实测是忠实续帧（同场景/同材质/同光照）。代价与留痕：
+   - **应用侧的跨平台兜底（2026-07-25 起接入）**：帧序列的图生图撞上这堵墙时会用**同一个模型**改走 `/chat/completions`（参考图内联成 data URL）。macOS 已确认该路径有效；2026-07-29 当前 Windows 网关上 chat 图片路径实测失败。因此它是平台相关兜底，不能假设所有机器都可用；两条通道都失败时应如实结束任务并保留原始错误。其代价与留痕如下：
      - 这条通道只有**顶层 `size` 字段**能控出图比例；`aspect_ratio`、`image_size` 和写在提示词里的 "9:16" 全部无效（会出 1024x1024 方图）。
      - 分辨率控不了，固定出 **1K 档**（9:16 为 `768x1376`）。注意这与 `/images/edits` 的 `image_size=1K` 逐像素同档——**本单请求本来就是 1K 时画质没有任何损失**，只有请求 2K（`1536x2752`）/4K 才是真降档。
      - 走过这条通道的帧一律在 manifest 里记 `transport: "chat_completions"` 和 `actual_pixels`；只有确实降档（请求 2K/4K）时才额外记 `degraded_reason`，动态流播报也只在真降档时标警示色（`transport_fallback` 事件带 `degraded` 布尔）。号池额度恢复后对降档帧定向重渲即可换回全分辨率。
      - **不重复发那一枪**：撞墙一次后本进程就记住这个网关的 edits 已死（`_EDITS_POOL_DRY`），后续帧直接走 chat 通道——那一枪实测 ~1010ms，还要把整张参考图（~830KB）上传一遍，每帧白烧一次没有意义。熔断只活在进程内，网关补好补丁后**重启服务**即重新探路，不需要改配置。
-     - 通道开关 `server_config.json` → `imageEditTransport`：`auto`（默认，先探 edits 再熔断换 chat）/ `chat`（从不发 edits，网关补丁缺失的机器上连第一枪都省掉）/ `edits`（只发 edits，撞墙就地报错绝不换通道）。**本机（macOS，无重编补丁的路子）已设为 `chat`**——网关哪天补好了改回 `auto` 即恢复探路。
+     - 通道开关 `server_config.json` → `imageEditTransport`：`auto`（默认，先探 edits 再尝试 chat）/ `chat`（从不发 edits）/ `edits`（只发 edits）。**2026-07-29 当前 Windows 机器推荐 `auto`**；固定为 `chat` 会绕开已经恢复的 `/images/edits`。**macOS 若 edits 仍受硬编码号池问题影响，则推荐 `chat`**，因为该平台的 chat + `image_url` 已确认有效。
      - 这个键从前只写在配置文件里、实际从未生效：托管模式（`server_config.json` 配了 `apiKey`）下 `server_common.effective_config` 用白名单重建 config，`imageEditTransport` 不在名单里被整个丢掉，于是配了 `chat` 的机器每个进程照样先打一枪必挂的 edits（2026-07-26 修）。改这份白名单时记得同批加新键，这是同一个口子第二次漏（第一次是 `qaGateLevel`）。
      - 探路那一枪撞墙**不再播报成上游报错**：auto 模式下它后面还有 chat 通道接着渲，把它推进度流会被前端渲成「⚠️ 上游报错…此路终止，任务即将报错结束」——一句吓人的假话。换通道由 `transport_fallback` 事件如实播报，配额耗尽仍写 WARN 日志；真正走投无路（没有等价 chat 模型、或 `transport=edits`）的那一枪照报（`_execute_request_with_retry(emit_quota_failure=...)`）。
      - 图像站（`/api/image/edits`）走的是原样透传，**不带**这条兜底，撞墙时仍会直接报错。
 
 ## 九、已验证基线
 
-2026-07-25 macOS 机器（网关 `/Applications/Antigravity Tools.app`，端口 `8046`）逐一实测：
+### 2026-07-29 Windows 最新实测
 
 | 请求 | 结果 |
 | --- | --- |
-| `/v1/chat/completions` + `gemini-3.1-flash-image`（裸名） | `200`，正常出图 |
-| `/v1/chat/completions` + `gemini-3.1-flash-image-9-16`（带后缀） | 上游 `404 Requested entity was not found`，被号池包装成 `429 All accounts exhausted` |
-| `/v1/images/generations` + `gemini-3.1-flash-image` | `200`，`1536x2752`；带 `image` 字段也一样是纯文生图，参考图被静默丢弃 |
-| `/v1/images/edits` + 任意图像模型名 | `502 No accounts available with quota for model: gemini-3-pro-image`（硬编码 bug，见第八节第 7 条） |
-| `/v1/chat/completions` + `gemini-3.1-flash-image` + `image_url` 参考图 | `200`，忠实续帧；`size: "9:16"` 生效得 `768x1376`，`aspect_ratio`/`image_size`/提示词均无效（不给 `size` 就出 `1024x1024`） |
-| `/v1/images/generations` 的档位对照 | `image_size=1K` → `768x1376`；`image_size=2K` → `1536x2752`（即 chat 通道等于 1K 档） |
+| `/v1/images/generations` + `gemini-3.1-flash-image-1-1` | `200`，成功生成 1024x1024 PNG 文生图参考图 |
+| `/v1/images/edits` + `gemini-3.1-flash-image` + multipart `image` + `size=1024x1024` | 连续两轮 `200`；成功保留城市布局并完成雨夜霓虹改绘，输出 1024x1024 JPEG |
+| `/v1/images/edits` + `gemini-3.1-flash-image` + multipart `image` + `size=720x1280` | `200`；成功生成竖版延展构图，实际输出 768x1376 JPEG |
+| `/v1/chat/completions` + 裸模型名 + `image_url` | 上游 `404 Requested entity was not found`，被包装成 `429 All accounts exhausted` |
+| `/v1/chat/completions` + `gemini-3.1-flash-image-1-1` + `image_url` | 同样返回上游 404/包装后 429；模型后缀不能修复当前 chat 路由 |
+| `/v1/chat/completions` + `gemini-3-pro-image` | `503 No accounts available with quota for model` |
 
-结论：这台机器上图生图的唯一可用通道是 chat + `image_url`（降档），已作为帧序列的自动兜底接入。
+本轮测试文件：
 
-2026-06-30 当前机器验证：
+- 文生图参考图：`outputs/img2img_source.png`
+- 方形图生图：`outputs/img2img_result.jpg`
+- 9:16 竖版图生图：`outputs/img2img_result_9x16.jpg`
+
+Windows 结论：当前可靠图生图通道是标准 multipart `/v1/images/edits`，推荐 `imageEditTransport: "auto"`；当前 Windows chat + `image_url` 不可用。
+
+### macOS 平台基线
+
+- macOS 机器上 `/v1/images/edits` 可能被硬编码路由到 `gemini-3-pro-image` 无额度池，而 `/v1/chat/completions` + 裸模型名 + `image_url` 已确认有效。
+- macOS 推荐 `imageEditTransport: "chat"`；chat 通道使用顶层 `size` 控制比例，9:16 输出为 1K 档 `768x1376`。
+- Windows 与 macOS 使用不同网关构建和账号路由，两套结论并存，不能互相覆盖。
+
+### 更早历史记录
+
+2026-06-30 历史验证：
 
 - Antigravity Tools `4.2.9`
 - 底层端口 `8046`

@@ -650,7 +650,7 @@ class _ChunkRunner:
         self.chunk_slices = {s: all_slices.get(chunk_start + s, '') for s in range(len(chunk))}
         self.completed = set()       # 已成功下载并通过校验的 sub_idx
         self.results = {}            # sub_idx -> item_result dict
-        self.project_url = None      # 本 chunk 固定使用的 Flow 项目页 URL
+        self.project_url = None      # 整批任务共享的 Flow 项目页 URL（由主流程在 chunk 间传递）
         # 跨轮缓存：本地路径 → 画布 UUID。参考图是项目级资产，重试轮回到同一
         # 项目页后仍在画布上，无需重复上传（之前每次 IP/失败重试都整批重传，
         # 一轮白耗 ~1 分钟且推高风控）。使用前会对照画布 DOM 逐个验证，
@@ -1373,7 +1373,8 @@ def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=N
     """
     批量视频生成主流程（SPARK 图生视频的唯一入口）。
 
-    将请求按 VIDEO_CHUNK_SIZE 个一组分批，每批由一个 _ChunkRunner 执行：
+    将请求按 VIDEO_CHUNK_SIZE 个一组分批，每批由一个 _ChunkRunner 执行；同一次
+    调用里的所有 chunk 固定复用首批进入的 Flow 项目，不能在任务中途重复新建项目：
     项目导航 → （重试轮）认领历史卡片 → 分组上传参考图 → 依次提交（不等待）
     → 并行等待 → 下载并逐个上报。
 
@@ -1408,6 +1409,10 @@ def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=N
     # 供 tile 归属核对与断点认领使用。单任务 chunk 也能拿到有区分度的切片。
     all_slices = _distinct_slices({i: r.prompt for i, r in enumerate(reqs)})
 
+    # _ChunkRunner 过去把 project_url 存在实例里，但每 5 个视频都会新建一个 runner，
+    # 导致 14 段任务在第 1/6/11 段各点一次“新建项目”。换号节拍恰好设成 15 时，
+    # 这尤其像是换号触发了重建。项目 URL 必须属于整次批量调用，而不是单个 chunk。
+    batch_project_url = None
     for chunk_start in range(0, len(reqs), VIDEO_CHUNK_SIZE):
         chunk = reqs[chunk_start : chunk_start + VIDEO_CHUNK_SIZE]
         log(f"📦 开始处理第 {chunk_start // VIDEO_CHUNK_SIZE + 1} 批视频请求 ({len(chunk)} 个)...", "GoogleFX-Video")
@@ -1419,7 +1424,10 @@ def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=N
             on_progress=on_progress,
             cancel_check=cancel_check,
         )
+        runner.project_url = batch_project_url
         results.extend(runner.run())
+        if runner.project_url:
+            batch_project_url = runner.project_url
 
     successful = [r for r in results if r and isinstance(r, dict) and r.get("status") == "success" and r.get("video_url")]
     if successful:

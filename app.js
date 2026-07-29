@@ -4278,8 +4278,8 @@ let currentIdeatedIdeas = [];
 // 外还带 pacing_skeleton，旧缓存不能冒充成「已按骨架参考规划」的新卡。
 // v5 作废「只带骨架标签、未经内容验收」时期产出的旧卡：那些卡可能
 // 在仅勾 dual_payoff 时仍保存了单线 outline，服务端修好后也不能继续命中它们。
-const IDEATION_CACHE_VERSION = '5-pacing-skeleton-gated';
-const DEFAULT_PACING_SKELETON_IDS = ['linear_milestone', 'dual_payoff'];
+const IDEATION_CACHE_VERSION = '6-nested-space-payoff';
+const DEFAULT_PACING_SKELETON_IDS = ['linear_milestone', 'dual_payoff', 'nested_space_payoff'];
 
 function getSelectedPacingSkeletonIds() {
     const checked = Array.from(document.querySelectorAll('input[name="pacing-skeleton"]:checked'))

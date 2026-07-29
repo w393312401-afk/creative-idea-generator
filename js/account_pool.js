@@ -125,10 +125,6 @@ function prefillAccountPoolNameFromSelection() {
 }
 
 function renderAccountPoolList() {
-    // 号池是「浏览器编号」下拉的唯一数据源：这里是所有增删改的公共出口，
-    // 顺手把下拉同步掉，池子里加/删/改名的号不用重开配置弹窗就能看到。
-    populateFxBrowserIdSelect(accountPoolCache);
-
     const list = document.getElementById('account-pool-list');
     if (!list) return;
     list.textContent = '';
@@ -136,7 +132,7 @@ function renderAccountPoolList() {
     if (accountPoolCache.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'trend-refs-empty';
-        empty.textContent = '号池还是空的——添加至少一个账号后，视频生成会自动按额度选号；空池子完全不影响现有的手动单选行为。';
+        empty.textContent = '号池还是空的——添加至少一个账号后，帧序列 / 视频生成会自动按额度选号。';
         list.appendChild(empty);
         return;
     }
@@ -463,72 +459,6 @@ async function deleteAccountPoolAccount(userId) {
     }
 }
 
-/* ── API 配置里的「AdsPower 浏览器编号」下拉 ──────────────────────────────
-   选项就是号池里的环境编号（不是 AdsPower 全量环境）：手动指定的目的是"这次
-   固定用池子里的某个号"，列出没在池子里的环境只会选出一个后端选号逻辑不认识
-   的 user_id。每次打开配置弹窗都重读一次，号池里新增/删掉的号立刻反映出来。 */
-async function populateFxBrowserIdSelect(knownAccounts) {
-    const select = document.getElementById('settings-fx-browser-id');
-    if (!select) return;
-    // 已保存的值优先于 DOM 当前值：页面刚加载时 loadConfig() 可能已经写过一次
-    // select.value，但那时候选项还没拉回来，赋值会被浏览器丢掉。
-    const desired = (typeof config !== 'undefined' && config.googleFxUserId) || select.value || '';
-
-    // 号池管理弹窗里改完账号会带着最新缓存调进来，省一次往返；不带就自己拉一次。
-    let accounts = Array.isArray(knownAccounts) ? knownAccounts : null;
-    if (accounts === null) {
-        try {
-            const resp = await fetch('/api/account-pool');
-            const data = await resp.json();
-            if (data && data.status === 'ok' && Array.isArray(data.accounts)) {
-                accounts = data.accounts;
-                accountPoolCache = data.accounts;
-            }
-        } catch (e) {
-            console.error('Failed to load account pool for browser-id select:', e);
-        }
-    }
-
-    select.textContent = '';
-    const blank = document.createElement('option');
-    blank.value = '';
-    blank.textContent = '留空 = 号池自动选号 / 服务端默认浏览器';
-    select.appendChild(blank);
-
-    if (accounts === null) {
-        // 读不到号池（本地服务没起/接口报错）：只保留空选项 + 已保存的那个值，
-        // 免得一次网络抖动把用户存好的浏览器编号从下拉里抹掉。
-        const failed = document.createElement('option');
-        failed.value = '__load_failed__';
-        failed.textContent = '（号池读取失败，点 🔄 重试）';
-        failed.disabled = true;
-        select.appendChild(failed);
-    } else {
-        accounts.forEach(account => {
-            const opt = document.createElement('option');
-            opt.value = account.user_id;
-            const marks = [];
-            if (account.disabled) marks.push('已禁用');
-            else if (isAccountPoolCoolingDown(account)) marks.push('冷却中');
-            if (account.credit !== undefined && account.credit !== null) marks.push(`积分 ${account.credit}`);
-            const serialPrefix = account.serial_number ? `[#${account.serial_number}] ` : '';
-            opt.textContent = `${serialPrefix}${account.name || '(未命名)'} — ${account.user_id}`
-                + (marks.length ? `（${marks.join('，')}）` : '');
-            select.appendChild(opt);
-        });
-    }
-
-    if (desired && !Array.from(select.options).some(o => o.value === desired)) {
-        // 已保存的编号不在号池里（号被移除了，或早年手填的）：单独列出来并标注，
-        // 保持"配置里存的是什么就选中什么"，不静默改成自动选号。
-        const orphan = document.createElement('option');
-        orphan.value = desired;
-        orphan.textContent = `${desired}（不在号池）`;
-        select.appendChild(orphan);
-    }
-    select.value = desired;
-}
-
 // 号池不再有自己的弹窗（原 #account-pool-manage-modal 已并入 API 配置中心的
 // 「生成号池」分区）：这里只负责打开配置中心并切到那个分区，池子数据由
 // switchSettingsSection('pool') 顺带刷新。留给其它入口（快捷键/别处按钮）调用。
@@ -560,20 +490,4 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // 「浏览器编号」下拉：打开 API 配置时重读一次号池，另给一个手动刷新按钮
-    //（在配置弹窗里加完号池账号后不用关掉重开）。
-    const settingsBtn = document.getElementById('open-settings-btn');
-    if (settingsBtn) settingsBtn.addEventListener('click', () => populateFxBrowserIdSelect());
-    const browserIdRefreshBtn = document.getElementById('settings-fx-browser-id-refresh');
-    if (browserIdRefreshBtn) {
-        browserIdRefreshBtn.addEventListener('click', async () => {
-            browserIdRefreshBtn.disabled = true;
-            try {
-                await populateFxBrowserIdSelect();
-            } finally {
-                browserIdRefreshBtn.disabled = false;
-            }
-        });
-    }
-    populateFxBrowserIdSelect();
 });

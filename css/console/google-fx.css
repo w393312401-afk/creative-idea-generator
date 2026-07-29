@@ -100,9 +100,11 @@ html[data-theme="dark"] .fx-select optgroup {
   color: var(--text-main, #ECE4D7);
 }
 
+/* auto-fit 而非固定列数：状态卡是会增减的（运行时/AdsPower/队列/账号/代理…），
+   写死 4 列的话加第 5 张卡就会孤零零掉到第二行占满整行。 */
 .fx-status-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 14px;
 }
 
@@ -163,7 +165,7 @@ html[data-theme="dark"] .fx-select optgroup {
 
 .fx-config-strip {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 1px;
   overflow: hidden;
   border: 1px solid var(--border-glass);
@@ -266,6 +268,26 @@ html[data-theme="dark"] .fx-select optgroup {
 .fx-task-id { display: block; margin-top: 3px; color: var(--text-dark); font-family: var(--font-mono, monospace); font-size: 10px; }
 .fx-row-actions { display: flex; flex-wrap: wrap; gap: 5px; }
 .fx-row-actions .fx-button { min-height: 27px; padding: 4px 7px; font-size: 10.5px; }
+
+/* 代理号池：新增/编辑表单默认收起，展开后与运行配置表单同一套栅格 */
+.fx-proxy-form { margin-bottom: 16px; }
+.fx-proxy-form[hidden] { display: none; }
+.fx-proxy-form-actions {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+.fx-proxy-endpoint {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-dark);
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+}
 
 .fx-badge,
 .fx-lock-badge {
@@ -505,6 +527,13 @@ html[data-theme="dark"] .fx-select optgroup {
   font-size: 12px;
 }
 .fx-probe-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.fx-probe-conditional { margin-top: 8px; }
+.fx-probe-conditional > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  padding: 4px 0;
+}
 
 /* ── 阶段时间线 ── */
 .fx-task-flag {

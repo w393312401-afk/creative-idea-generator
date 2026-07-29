@@ -9,29 +9,69 @@
        scope (no bundler). If any 404s, or throws while executing, everything after it
        is silently undefined and the UI looks broken with no clue why. Surface it instead. -->
   <script>(function(){
-      var issues = [];
+      // 两类故障要分开记：加载失败（资源没拉下来，重载有救）与运行出错（脚本拉到了
+      // 但自己抛了，重载没救）。旧实现把两者塞进同一个数组、红条却恒写"部分脚本加载
+      // 失败"——一个未捕获的运行时异常会被报成"脚本没下载下来"，把排查方向整个带偏。
+      var issues = [], loadFails = [], runtimeErrs = [];
+      var RETRY_KEY = 'spark_console_script_retry';
       window.addEventListener('error', function(e){
           var t = e.target;
           if (t && t !== window && t.tagName === 'SCRIPT') {
-              issues.push('脚本加载失败: ' + (t.src || t.getAttribute('src') || '未知文件'));
+              var src = String(t.src || t.getAttribute('src') || '未知文件');
+              issues.push('脚本加载失败: ' + src);
+              loadFails.push(src.split('/').pop().split('?')[0]);
           } else if (!t || t === window) {
-              issues.push('脚本运行出错: ' + (e.message || '未知错误') + (e.filename ? ' (' + String(e.filename).split('/').pop() + ':' + e.lineno + ')' : ''));
+              var where = e.filename ? ' (' + String(e.filename).split('/').pop().split('?')[0] + ':' + e.lineno + ')' : '';
+              issues.push('脚本运行出错: ' + (e.message || '未知错误') + where);
+              runtimeErrs.push((e.message || '未知错误') + where);
           }
       }, true);
       window.addEventListener('DOMContentLoaded', function(){
-          if (!issues.length) return;
+          var retried = null;
+          try { retried = sessionStorage.getItem(RETRY_KEY); } catch (err) {}
+          if (!issues.length) {
+              // 干净加载就把重试额度还回去，让下一次偶发中断仍能自动重载一次
+              try { if (retried) sessionStorage.removeItem(RETRY_KEY); } catch (err) {}
+              return;
+          }
           if (window.console) console.error('SPARK 前端加载异常:', issues);
+          // 纯加载失败、且本会话还没自动重载过：多半是 Windows 回环连接被杀软/防火墙
+          // 瞬时中断（server.py 里 HTTP/1.1 那段注释记录的 WinError 10053/10054），
+          // 重载一次就好。这几个脚本共享同一份全局作用域且严格按文档顺序执行，事后单独
+          // 补插失败的那一个救不回来——整页重载才是唯一真能修好的恢复路径。掺了运行
+          // 出错就不自动重载：确定性的代码异常重载救不了，只会让用户白等一轮。
+          if (loadFails.length && !runtimeErrs.length && !retried) {
+              try { sessionStorage.setItem(RETRY_KEY, '1'); } catch (err) {}
+              location.reload();
+              return;
+          }
+          var head;
+          if (loadFails.length && runtimeErrs.length) {
+              head = '页面部分脚本加载失败，且有脚本运行出错，界面可能无法正常工作。';
+          } else if (loadFails.length) {
+              head = '页面部分脚本加载失败，界面可能无法正常工作。';
+          } else {
+              head = '页面脚本运行出错，界面可能无法正常工作。';
+          }
           var bar = document.createElement('div');
           bar.setAttribute('style', 'position:fixed;top:0;left:0;right:0;z-index:999999;' +
               'background:#b91c1c;color:#fff;font:14px/1.5 -apple-system,Segoe UI,sans-serif;' +
               'padding:10px 16px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.3);');
-          bar.textContent = '页面部分脚本加载失败，界面可能无法正常工作。';
+          bar.appendChild(document.createTextNode(head));
           var btn = document.createElement('button');
           btn.textContent = '点击刷新';
           btn.setAttribute('style', 'margin-left:8px;padding:4px 12px;border:1px solid #fff;' +
               'border-radius:4px;background:transparent;color:#fff;cursor:pointer;font-weight:600;');
           btn.onclick = function(){ location.reload(); };
           bar.appendChild(btn);
+          // 具体是哪个文件、报了什么，直接摆在红条上：否则用户只看到一句笼统的
+          // "可能无法正常工作"，唯一的线索埋在 devtools 控制台里，等于没有线索。
+          var detail = document.createElement('div');
+          detail.setAttribute('style', 'margin-top:4px;font-size:12px;opacity:.9;' +
+              'white-space:pre-wrap;word-break:break-all;');
+          detail.textContent = loadFails.concat(runtimeErrs).slice(0, 3).join('  |  ') +
+              (issues.length > 3 ? '  …等 ' + issues.length + ' 项' : '');
+          bar.appendChild(detail);
           document.body.insertBefore(bar, document.body.firstChild);
       });
   })();</script>
@@ -303,6 +343,10 @@
               <div class="fx-status-icon">◎</div>
               <div><span>可用账号</span><strong id="fx-account-state">检测中</strong><small id="fx-account-sub">等待号池</small></div>
             </article>
+            <article class="fx-status-card" data-tone="neutral">
+              <div class="fx-status-icon">⇄</div>
+              <div><span>可用代理</span><strong id="fx-proxy-state">检测中</strong><small id="fx-proxy-sub">等待代理号池</small></div>
+            </article>
           </div>
 
           <div class="fx-config-strip">
@@ -310,6 +354,7 @@
             <div><span>视频模型</span><strong id="fx-config-video-model">—</strong></div>
             <div><span>换号节拍</span><strong id="fx-config-switch">—</strong></div>
             <div><span>当前环境</span><strong id="fx-config-account">自动选择</strong></div>
+            <div><span>序列默认环境</span><strong id="fx-config-sequence-account">自动选择</strong></div>
             <div><span>IP 轮换</span><strong class="fx-safe-value" id="fx-config-rotation">检测中</strong></div>
             <div><span>提交模式</span><strong class="fx-safe-value" id="fx-config-dryrun">检测中</strong></div>
           </div>
@@ -382,6 +427,8 @@
               <h5>选择器探针</h5>
               <div class="fx-inline-actions">
                 <button class="fx-button" id="fx-run-probe" type="button">连浏览器探测选择器</button>
+                <button class="fx-button" id="fx-run-deep-probe" type="button"
+                        title="额外点开账号菜单和配置面板，验证弹窗态的选择器。会真的点击页面。">深度探测（会点击页面）</button>
                 <button class="fx-button" id="fx-reset-selector-stats" type="button">清空命中统计</button>
               </div>
             </div>
@@ -468,6 +515,54 @@
               </div>
             </article>
           </div>
+
+          <article class="fx-panel fx-proxy-panel" id="fx-proxy-panel">
+            <div class="fx-panel-header">
+              <div>
+                <h4>代理号池</h4>
+                <p>出口代理清单。检测只走网络拿真实出口 IP，不开浏览器；下发是把代理写进 AdsPower 环境，该浏览器<strong>下次启动</strong>时才换出口。</p>
+              </div>
+              <div class="fx-inline-actions">
+                <button class="fx-button" id="fx-proxy-import" type="button"
+                        title="把旧的 runtime/proxy_pool.txt 并入代理号池">导入 proxy_pool.txt</button>
+                <button class="fx-button" id="fx-proxy-refresh" type="button">刷新</button>
+                <button class="fx-button fx-button-primary" id="fx-proxy-toggle-form" type="button">添加代理</button>
+              </div>
+            </div>
+            <div class="fx-config-form fx-proxy-form" id="fx-proxy-form" hidden>
+              <label class="fx-config-field"><span>协议</span>
+                <select id="fx-proxy-type">
+                  <option value="http">http</option>
+                  <option value="https">https</option>
+                  <option value="socks5">socks5</option>
+                </select></label>
+              <label class="fx-config-field"><span>地址（host）</span>
+                <input id="fx-proxy-host" type="text" placeholder="proxy.example.com" autocomplete="off"></label>
+              <label class="fx-config-field"><span>端口</span>
+                <input id="fx-proxy-port" type="number" min="1" max="65535" placeholder="8080"></label>
+              <label class="fx-config-field"><span>用户名（可留空）</span>
+                <input id="fx-proxy-user" type="text" autocomplete="off"></label>
+              <label class="fx-config-field"><span>密码（可留空）</span>
+                <input id="fx-proxy-password" type="password" autocomplete="new-password"></label>
+              <label class="fx-config-field"><span>标签</span>
+                <input id="fx-proxy-label" type="text" placeholder="留空则用 host:port"></label>
+              <label class="fx-config-field"><span>备注（可留空）</span>
+                <input id="fx-proxy-note" type="text"></label>
+              <div class="fx-config-field fx-proxy-form-actions">
+                <span id="fx-proxy-form-mode">新增代理</span>
+                <div class="fx-inline-actions">
+                  <button class="fx-button" id="fx-proxy-cancel" type="button">取消</button>
+                  <button class="fx-button fx-button-primary" id="fx-proxy-save" type="button">保存</button>
+                </div>
+              </div>
+            </div>
+            <div class="fx-table-wrap">
+              <table class="fx-table">
+                <thead><tr><th>代理</th><th>出口 IP</th><th>状态</th><th>绑定环境</th><th>最后检测</th><th>操作</th></tr></thead>
+                <tbody id="fx-proxy-table-body"><tr><td colspan="6" class="fx-empty">正在读取代理号池…</td></tr></tbody>
+              </table>
+            </div>
+          </article>
 
           <article class="fx-panel fx-tasks-panel">
             <div class="fx-panel-header">

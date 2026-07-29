@@ -378,6 +378,28 @@ def _image_size_to_api_size(aspect_ratio, model=None):
     return aspect_ratio or '9:16'
 
 
+def _image_edit_api_size(aspect_ratio):
+    """Windows 8046 `/images/edits` 已验证的顶层 size 参数。
+
+    generations/chat 接口可接受比例字符串，但当前 Windows edits 路由用像素尺寸最稳定：
+    2026-07-29 实测 720x1280 + image_size=2K 返回 1536x2752。未知比例保留原值，
+    避免把调用方已经传入的网关扩展比例静默改成方图。
+    """
+    value = str(aspect_ratio or '9:16').strip().lower()
+    if re.fullmatch(r'\d+x\d+', value):
+        return value
+    return {
+        '1:1': '1024x1024',
+        '16:9': '1280x720',
+        '9:16': '720x1280',
+        '4:3': '1216x896',
+        '3:4': '896x1216',
+        '3:2': '1264x848',
+        '2:3': '848x1264',
+        '21:9': '1584x672',
+    }.get(value, value)
+
+
 def _measure_image_pixels(path):
     """返回落盘图的真实像素尺寸字符串（如 '768x1376'）；读不出来就返回空串。"""
     try:
@@ -920,7 +942,10 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
             fields = {
                 'model': clean_model,
                 'prompt': full_prompt,
-                'aspect_ratio': aspect_ratio,
+                # Windows 8046 的 multipart edits 路由实测认顶层像素 size；继续发旧的
+                # aspect_ratio 会让比例控制依赖网关版本。image_size 独立控制 1K/2K/4K：
+                # size=720x1280 + image_size=2K 实际返回 1536x2752。
+                'size': _image_edit_api_size(aspect_ratio),
                 'image_size': _image_quality_to_label(config.get('imageQuality')),
                 'response_format': 'b64_json',
             }
@@ -942,7 +967,8 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
             if sys.stdout:
                 print(
                     f"[FRAME SEQUENCE] Image-to-Image edit via /images/edits (multipart) (attempt {attempt_no}/{max_attempts}): "
-                    f"{os.path.basename(reference_path)} ({len(ref_bytes)} bytes) -> {clean_model}"
+                    f"{os.path.basename(reference_path)} ({len(ref_bytes)} bytes) -> {clean_model} "
+                    f"size={fields['size']} image_size={fields['image_size']}"
                 )
 
             req = urllib.request.Request(
@@ -1642,6 +1668,11 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
     return manifest
 
 
+# 已经报过的调色失败原因（见 _match_color_lab 末尾的去重）。进程级，不用加锁：
+# 最坏情况是两个线程同时撞上第一次失败、各报一行，比漏报安全得多。
+_COLOR_MATCH_WARNED = set()
+
+
 def _match_color_lab(source_path, reference_path, output_path):
     """
     Adjusts the color statistics of source to match reference in LAB color space.
@@ -1726,8 +1757,13 @@ def _match_color_lab(source_path, reference_path, output_path):
         result_bgr = cv2.cvtColor(merged.astype(np.uint8), cv2.COLOR_LAB2BGR)
         _imwrite_unicode(output_path, result_bgr)
     except Exception as e:
-        if sys.stdout:
-            print(f"[COLOR MATCH] Warning: LAB color matching failed: {e}")
+        # 缺 cv2/numpy 是进程级的环境问题，不是"这一帧"的问题：原样每帧报一次，
+        # 一次生成就刷 41 条一模一样的告警（实测），把日志冲满却只承载一个事实。
+        # 按消息去重，同一种失败原因一个进程只报第一次。
+        key = f"{type(e).__name__}:{e}"
+        if key not in _COLOR_MATCH_WARNED:
+            _COLOR_MATCH_WARNED.add(key)
+            log('WARN', 'FRAMES', f"帧间调色不可用，已跳过（本进程仅提示一次）: {e}")
 
 
 # P0 门框清除兜底的最大额外推进次数：换族室内侧帧渲出后若门框仍在画面里，

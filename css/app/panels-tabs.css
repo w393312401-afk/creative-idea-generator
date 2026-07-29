@@ -2004,6 +2004,17 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
    改成右侧 dock 后主工作区只让出宽度、高度一行不动；纵向可见行数从 ~14 行涨
    到 40+（日志的关键信息是时序，不是行宽）。 */
 .log-panel-drawer {
+    /* dock 局部色板。这里必须自带一套、不能用全局的 --text-* ——dock 是硬编码
+       的深色面（#080a0f 一路到底），而全局那套是跟随主题的：浅色主题下
+       --text-primary 是 #2E2A24（近黑），压在近黑底上对比度只有 ~1.1:1，字直接
+       糊成一片。原来只有等宽日志行用写死的 #f8f8f2，所以没暴露；一旦 dock 里
+       出现按主题取色的组件（按钮、输入框、事件卡）就全线不可读。
+       这套值与主题无关，深浅两种主题下 dock 的观感一致。 */
+    --log-fg: #e8eaef;
+    --log-fg-dim: #a8b0bd;
+    --log-fg-mute: #79818f;
+    --log-accent: #4dd4f7;
+    --log-edge: rgba(255, 255, 255, 0.13);
     position: fixed;
     /* 与保存/任务抽屉共用同一个顶部让位偏移（见 app.js updateDrawerTopOffset），
        不遮住页头的 tab 栏 */
@@ -2013,7 +2024,7 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
     width: var(--log-dock-width, 420px);
     max-width: 100vw;
     background: #0b0e14;
-    border-left: 1px solid var(--border-color);
+    border-left: 1px solid var(--log-edge);
     /* 从 1000 降到 900，把主栈层让回给弹窗(1100)/灯箱(2000)/toast(3000)——
        它们此前都是为了压过这个日志抽屉才被迫抬高的 */
     z-index: 900;
@@ -2024,7 +2035,8 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
     transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     will-change: transform;
     box-shadow: -4px 0 20px rgba(0, 0, 0, 0.3);
-    font-family: 'Consolas', 'Courier New', Courier, monospace;
+    /* 等宽字体只在「明细」那一半用（见 .log-pane-detail）。概览讲的是人话，
+       用等宽排出来既不好看也没有对齐可言。 */
 }
 
 .log-panel-drawer.expanded {
@@ -2046,7 +2058,7 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
 
 .log-dock-resizer:hover,
 .log-dock-resizer.dragging {
-    background: var(--neon-cyan);
+    background: var(--log-accent);
     opacity: 0.5;
 }
 
@@ -2069,12 +2081,23 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
     gap: 8px;
     font-size: 13px;
     font-weight: 600;
-    color: var(--text-secondary);
+    color: var(--log-fg-dim);
+    min-width: 0; /* 让下面那行长标题能省略，而不是把「收起」按钮挤出去 */
+}
+
+/* 状态条那句结论。旧版这里是写死的「🖥️ 本地服务工作日志」——一个只告诉你
+   "这是什么面板"、不告诉你"现在怎么样"的标题。 */
+.log-panel-headline {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--log-fg);
 }
 
 .log-panel-status-dot {
     width: 8px;
     height: 8px;
+    flex-shrink: 0;
     border-radius: 50%;
     background: #ff4b4b; /* red when disconnected, green when connected */
     transition: background 0.3s;
@@ -2085,6 +2108,18 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
     box-shadow: 0 0 8px #a6e22e;
 }
 
+/* 连上之后，状态点跟着"有没有事"走，而不是只表示"连着没有"——连接正常但
+   有三个错误在等你处理时，一颗绿灯是误导。tone 由 renderOverview 写在 dock 上。 */
+.log-panel-drawer[data-tone="warn"] .log-panel-status-dot.connected {
+    background: #d97706;
+    box-shadow: 0 0 8px #d97706;
+}
+
+.log-panel-drawer[data-tone="error"] .log-panel-status-dot.connected {
+    background: #ef4444;
+    box-shadow: 0 0 8px #ef4444;
+}
+
 .log-panel-actions {
     display: flex;
     align-items: center;
@@ -2093,7 +2128,7 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
 
 .log-panel-checkbox-label {
     font-size: 11px;
-    color: var(--text-muted);
+    color: var(--log-fg-mute);
     display: flex;
     align-items: center;
     gap: 4px;
@@ -2103,7 +2138,7 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
 .log-action-btn {
     background: rgba(255, 255, 255, 0.05);
     border: 1px solid rgba(255, 255, 255, 0.1);
-    color: var(--text-secondary);
+    color: var(--log-fg-dim);
     padding: 3px 10px;
     font-size: 11px;
     border-radius: 4px;
@@ -2113,22 +2148,222 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
 
 .log-action-btn:hover {
     background: rgba(255, 255, 255, 0.1);
-    color: var(--text-primary);
-    border-color: var(--neon-cyan);
+    color: var(--log-fg);
+    border-color: var(--log-accent);
 }
 
-/* dock 是全高的，不必再像横栏时代那样为省高度把筛选区藏起来（旧版折叠时
-   display:none、展开时才出现）——这里常显，纵向堆叠适应 420px 的窄栏宽度。 */
-.log-panel-filters {
+/* ── 模式切：概览 / 明细 ─────────────────────────────────────────── */
+.log-mode-tabs {
+    display: flex;
+    flex-shrink: 0;
+    padding: 0 12px;
+    background: #0d1018;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.log-mode-tab {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--log-fg-mute);
+    padding: 8px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.log-mode-tab:hover { color: var(--log-fg-dim); }
+
+.log-mode-tab.active {
+    color: var(--log-fg);
+    border-bottom-color: var(--log-accent);
+}
+
+/* 两个 pane 都是 flex 列并占满剩余高度；非激活的直接不参与布局 */
+.log-pane {
+    display: none;
+    flex: 1;
+    min-height: 0;
+    flex-direction: column;
+}
+
+.log-pane.active { display: flex; }
+
+/* 等宽字体只留给逐行明细：这里的对齐（时间戳/级别/正文成列）确实靠它 */
+.log-pane-detail {
+    font-family: 'Consolas', 'Courier New', Courier, monospace;
+}
+
+/* ── 概览：事件卡 ───────────────────────────────────────────────── */
+.log-pane-overview {
+    overflow-y: auto;
+    background: #080a0f;
+}
+
+.log-event-list {
     display: flex;
     flex-direction: column;
-    align-items: stretch;
-    gap: 6px;
+    gap: 10px;
+    padding: 12px;
+}
+
+.log-event-card {
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-left-width: 3px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.025);
+    padding: 10px 12px;
+    font-size: 12.5px;
+    line-height: 1.55;
+}
+
+.log-event-card.sev-error { border-left-color: #ef4444; }
+.log-event-card.sev-warn { border-left-color: #d97706; }
+
+.log-event-head {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+}
+
+.log-event-icon {
+    flex-shrink: 0;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.sev-error .log-event-icon { color: #ef4444; }
+.sev-warn .log-event-icon { color: #d97706; }
+
+.log-event-title {
+    flex: 1;
+    min-width: 0;
+    font-weight: 600;
+    color: var(--log-fg);
+}
+
+/* 同一件事重复了多少次。折叠成一张卡是为了不刷屏，但"重复了 12 次"本身
+   是有用的信号（偶发一次 vs 一直在撞），不能连同折叠一起丢掉。 */
+.log-event-count {
+    flex-shrink: 0;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--log-fg-mute);
+}
+
+.log-event-meta {
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--log-fg-mute);
+}
+
+.log-event-hint {
+    margin-top: 6px;
+    color: var(--log-fg-dim);
+}
+
+.log-event-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    margin-top: 9px;
+}
+
+.log-event-link {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    font-size: 11.5px;
+    color: var(--log-accent);
+    cursor: pointer;
+    text-decoration: none;
+}
+
+.log-event-link:hover { text-decoration: underline; }
+
+/* 一切正常时是这个，不是一屏滚动的字 */
+.log-event-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 48px 20px;
+    text-align: center;
+}
+
+.log-event-empty-mark {
+    font-size: 28px;
+    color: #a6e22e;
+    line-height: 1;
+}
+
+.log-event-empty-title {
+    font-size: 13px;
+    color: var(--log-fg-dim);
+}
+
+/* ── 页脚统计 ───────────────────────────────────────────────────── */
+.log-panel-foot {
+    flex-shrink: 0;
+    padding: 7px 12px;
+    font-size: 11px;
+    color: var(--log-fg-mute);
+    background: #0d1018;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* ── 明细的筛选区 ───────────────────────────────────────────────── */
+/* 旧版是常驻四行（只看问题+5 个级别芯片 / 任务过滤 / 搜索 / 自动滚动+清空+计数），
+   约 110px 高，而这四行全是开发者词汇。现在默认只留搜索和「只看问题」这两个
+   真正高频的，其余收进「筛选 ▾」浮层——省下的高度全部还给日志正文。 */
+.log-panel-filters {
+    position: relative;
     padding: 8px 12px;
     background: #0d1018;
     border-bottom: 1px solid rgba(255, 255, 255, 0.05);
     flex-shrink: 0;
 }
+
+.log-filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.log-filter-bar .log-filter-input {
+    flex: 1;
+}
+
+.log-filter-bar .log-action-btn {
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+
+.log-action-btn.active {
+    border-color: var(--log-accent);
+    color: var(--log-fg);
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.log-filter-popover {
+    position: absolute;
+    top: calc(100% - 4px);
+    right: 12px;
+    left: 12px;
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--log-edge);
+    border-radius: 8px;
+    background: #111520;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.log-filter-popover[hidden] { display: none; }
 
 .log-filter-row {
     display: flex;
@@ -2149,7 +2384,7 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
 .log-level-chip {
     background: transparent;
     border: 1px solid rgba(255, 255, 255, 0.12);
-    color: var(--text-muted);
+    color: var(--log-fg-mute);
     padding: 2px 8px;
     font-size: 10px;
     font-weight: 700;
@@ -2170,7 +2405,7 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
 .log-filter-input {
     background: rgba(255, 255, 255, 0.04);
     border: 1px solid rgba(255, 255, 255, 0.1);
-    color: var(--text-primary);
+    color: var(--log-fg);
     padding: 3px 8px;
     font-size: 11px;
     border-radius: 5px;
@@ -2183,18 +2418,21 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
 
 .log-filter-input:focus {
     outline: none;
-    border-color: var(--neon-cyan);
+    border-color: var(--log-accent);
 }
 
 .log-filter-count {
     font-size: 10px;
-    color: var(--text-muted);
+    color: var(--log-fg-mute);
     margin-left: auto;
     white-space: nowrap;
 }
 
 .log-panel-body {
     flex: 1;
+    /* 现在它嵌在 .log-pane-detail 这个 flex 列里：没有 min-height:0，flex 子项
+       的最小尺寸是内容高度，容器会被撑高而不是让这里自己滚。 */
+    min-height: 0;
     overflow-y: auto;
     padding: 12px 16px;
     background: #080a0f;
@@ -2207,10 +2445,26 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
     color: #f8f8f2;
 }
 
+/* break-all 会在中文词和标识符中间任意断字，长 URL 行糊成一坨；
+   break-word 只在整词放不下时才断，正常文字照常按词换行。
+   overflow-wrap 负责"超长无空格串（URL/哈希）必须断，不许撑破 dock"。 */
 .log-line {
     white-space: pre-wrap;
-    word-break: break-all;
+    word-break: break-word;
+    overflow-wrap: anywhere;
     padding: 1px 0;
+}
+
+/* 从概览的事件卡跳过来时，闪一下被定位到的那一行——否则滚过去只是"某处"，
+   看不出到底是哪条。 */
+.log-line-flash {
+    animation: log-line-flash 1.6s ease-out;
+    border-radius: 3px;
+}
+
+@keyframes log-line-flash {
+    0%, 55% { background: rgba(56, 189, 248, 0.28); }
+    100% { background: transparent; }
 }
 
 .log-line.log-line-hidden { display: none; }
@@ -2265,7 +2519,7 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
     padding: 0 6px;
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.08);
-    color: var(--text-muted);
+    color: var(--log-fg-mute);
     font-size: 10px;
     cursor: pointer;
     user-select: none;
@@ -2273,7 +2527,7 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
 
 .log-line-repeat-badge:hover {
     background: rgba(255, 255, 255, 0.16);
-    color: var(--text-primary);
+    color: var(--log-fg);
 }
 
 .log-line-repeat-detail {

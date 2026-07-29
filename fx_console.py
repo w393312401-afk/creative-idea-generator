@@ -57,6 +57,16 @@ FX_CONFIG_SPEC = {
         'type': 'integer', 'min': 0, 'max': 100000, 'default': 1, 'hot': True,
         'group': '号池', 'label': '选号最低积分',
     },
+    # 'account' 类型的候选项来自号池（前端用 /api/account-pool 的结果渲染下拉），
+    # 不写进 spec 的 options：号池是会变的运行时数据，固化进配置 schema 只会过期。
+    'googleFxSequenceUserId': {
+        'type': 'account', 'default': '', 'hot': True, 'group': '号池',
+        'label': '序列生成默认浏览器环境（留空=按号池自动选）',
+    },
+    'googleFxSequenceUserLock': {
+        'type': 'bool', 'default': False, 'hot': True, 'group': '号池',
+        'label': '锁定默认环境：整条序列不按节拍换号',
+    },
 
     # ── 超时与预算 ──────────────────────────────────────
     'googleFxMaxWaitSeconds': {
@@ -180,6 +190,12 @@ def validate_patch(patch):
             if isinstance(value, str):
                 value = value.strip().lower() in ('1', 'true', 'yes', 'on')
             value = bool(value)
+        elif spec['type'] == 'account':
+            # AdsPower user_id 是一串短标识；这里只做形态校验，不去号池里核对存在性——
+            # 校验一次配置不该打 AdsPower 本地 API，而且账号可能是刚加进池子的。
+            value = str(value or '').strip()
+            if len(value) > 64:
+                raise ValueError(f'{key} 不是合法的 AdsPower 环境编号')
         elif value not in spec['options']:
             raise ValueError(f'{key} 不是允许的选项')
         clean[key] = value
@@ -188,6 +204,12 @@ def validate_patch(patch):
     high = clean.get('googleFxPacingMaxSeconds')
     if low is not None and high is not None and low > high:
         raise ValueError('提交最小间隔不能大于最大间隔')
+    # 「锁定默认环境」而没指定环境是个空承诺：保存后行为仍是自动选号，但界面上
+    # 那个勾是打上的，用户会以为序列被钉住了。两个字段同时提交时直接拦下来。
+    if (clean.get('googleFxSequenceUserLock')
+            and 'googleFxSequenceUserId' in clean
+            and not clean['googleFxSequenceUserId']):
+        raise ValueError('勾选「锁定默认环境」前请先选择序列生成默认浏览器环境')
     return clean
 
 

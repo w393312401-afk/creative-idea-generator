@@ -75,17 +75,19 @@ def _click_new_project_button(page, confirm_timeout=10.0):
 
 # ── _find_add2_btn ──
 def _find_add2_btn(page):
-    """多策略定位 add_2 (Create) 按钮，返回 Locator 或 None"""
-    return _find_first_visible(page, [
-        "button[aria-haspopup='dialog']:has(span:text('Create'))",
-        "button[aria-haspopup='dialog']:has(i.google-symbols:text('add_2'))",
-        "button[aria-haspopup='dialog']:has(i:text('add_2'))",
-        "button[aria-haspopup='dialog']",
-        "button[aria-haspopup='menu']:has(span:text('Create'))",
-        "button[aria-haspopup='menu']:has(span:text('添加媒体'))",
-        "button[aria-haspopup='menu']:has(i:text('add'))",
-        "button[aria-haspopup='menu']",
-    ], family="fx_add2_btn")
+    """多策略定位 add_2 (Create) 按钮，返回 Locator 或 None
+
+    选择器来自 UI_SELECTORS['google_fx']['add_media_btn']，不再内联一份。
+    以前这里自带 8 条选择器、按 family='fx_add2_btn' 记统计，而选择器探针探的是
+    UI_SELECTORS 里另一份只有 1 条的 add_media_btn——两边测的根本不是同一个东西，
+    探针报绿不代表生产路径能点得到。统一成一个源后，探针命中层级和运行期统计
+    才对得上。
+    """
+    return _find_first_visible(
+        page,
+        UI_SELECTORS["google_fx"]["add_media_btn"],
+        family="add_media_btn",
+    )
 
 
 # ── _wait_for_fx_toolbar ──
@@ -2048,6 +2050,21 @@ def _matches_orientation_text(text, orientation):
     haystack = (text or "").lower()
     return any(token.lower() in haystack for token in _orientation_tokens(orientation))
 
+
+def _matches_generation_count(text, count):
+    """Match both Flow count spellings (legacy ``1x`` and current ``x1``)."""
+    if not count:
+        return True
+    clean = _normalize_fx_status_text(text)
+    target = _normalize_fx_status_text(count).replace(" ", "")
+    match = re.fullmatch(r"(?:x(\d+)|(\d+)x)", target)
+    aliases = {target}
+    if match:
+        number = match.group(1) or match.group(2)
+        aliases.update({f"x{number}", f"{number}x"})
+    tokens = set(re.findall(r"(?<!\w)(?:x\d+|\d+x)(?!\w)", clean))
+    return bool(tokens & aliases)
+
 def _click_orientation_option(page, orientation, scope=None):
     root = scope or page
     tokens = _orientation_tokens(orientation)
@@ -2149,7 +2166,7 @@ def check_fx_config(status_text, model="Nano Banana 2", orientation="Portrait", 
     model_source = resolved_model_text if (want_video and resolved_model_text) else status_text
     checks["model"] = _matches_model_status(model_source, model)
     checks["orientation"] = _matches_orientation_text(clean, orientation) if orientation else True
-    checks["count"] = count.lower() in clean if count else True
+    checks["count"] = _matches_generation_count(clean, count)
     if want_video and duration:
         duration_label = _normalize_video_duration_label(duration)
         checks["duration"] = (duration_label in clean) if duration_label else True

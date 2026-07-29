@@ -14,29 +14,71 @@
          scope (no bundler). If any 404s, or throws while executing, everything after it
          is silently undefined and the UI looks broken with no clue why. Surface it instead. -->
     <script>(function(){
-        var issues = [];
+        // 两类故障要分开记：加载失败（资源没拉下来，重载有救）与运行出错（脚本拉到了
+        // 但自己抛了，重载没救）。旧实现把两者塞进同一个数组、红条却恒写"部分脚本加载
+        // 失败"——一个未捕获的运行时异常会被报成"脚本没下载下来"，把排查方向整个带偏
+        // （实测踩过：照着这条去查 404 和连接重置，查了一圈根本不存在）。
+        var issues = [], loadFails = [], runtimeErrs = [];
+        var RETRY_KEY = 'spark_script_retry';
         window.addEventListener('error', function(e){
             var t = e.target;
             if (t && t !== window && t.tagName === 'SCRIPT') {
-                issues.push('脚本加载失败: ' + (t.src || t.getAttribute('src') || '未知文件'));
+                var src = String(t.src || t.getAttribute('src') || '未知文件');
+                issues.push('脚本加载失败: ' + src);
+                loadFails.push(src.split('/').pop().split('?')[0]);
             } else if (!t || t === window) {
-                issues.push('脚本运行出错: ' + (e.message || '未知错误') + (e.filename ? ' (' + String(e.filename).split('/').pop() + ':' + e.lineno + ')' : ''));
+                var where = e.filename ? ' (' + String(e.filename).split('/').pop().split('?')[0] + ':' + e.lineno + ')' : '';
+                issues.push('脚本运行出错: ' + (e.message || '未知错误') + where);
+                runtimeErrs.push((e.message || '未知错误') + where);
             }
         }, true);
         window.addEventListener('DOMContentLoaded', function(){
-            if (!issues.length) return;
+            var retried = null;
+            try { retried = sessionStorage.getItem(RETRY_KEY); } catch (err) {}
+            if (!issues.length) {
+                // 干净加载就把重试额度还回去，让下一次偶发中断仍能自动重载一次
+                try { if (retried) sessionStorage.removeItem(RETRY_KEY); } catch (err) {}
+                return;
+            }
             if (window.console) console.error('SPARK 前端加载异常:', issues);
+            // 纯加载失败、且本会话还没自动重载过：多半是 Windows 回环连接被杀软/防火墙
+            // 瞬时中断（server.py 里 HTTP/1.1 那段注释记录的 WinError 10053/10054），
+            // 重载一次就好。注意不能只把失败的那个脚本补插回去：这些 defer 脚本共享同一
+            // 份全局作用域且严格按文档顺序执行，事后补插时，依赖它、早已跑过并抛错的后续
+            // 脚本不会重来——整页重载才是唯一真能修好的恢复路径。掺了运行出错就不自动
+            // 重载：确定性的代码异常重载救不了，只会让用户白等一轮。
+            if (loadFails.length && !runtimeErrs.length && !retried) {
+                try { sessionStorage.setItem(RETRY_KEY, '1'); } catch (err) {}
+                location.reload();
+                return;
+            }
+            var head;
+            if (loadFails.length && runtimeErrs.length) {
+                head = '页面部分脚本加载失败，且有脚本运行出错，界面可能无法正常工作。';
+            } else if (loadFails.length) {
+                head = '页面部分脚本加载失败，界面可能无法正常工作。';
+            } else {
+                head = '页面脚本运行出错，界面可能无法正常工作。';
+            }
             var bar = document.createElement('div');
             bar.setAttribute('style', 'position:fixed;top:0;left:0;right:0;z-index:999999;' +
                 'background:#b91c1c;color:#fff;font:14px/1.5 -apple-system,Segoe UI,sans-serif;' +
                 'padding:10px 16px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.3);');
-            bar.textContent = '页面部分脚本加载失败，界面可能无法正常工作。';
+            bar.appendChild(document.createTextNode(head));
             var btn = document.createElement('button');
             btn.textContent = '点击刷新';
             btn.setAttribute('style', 'margin-left:8px;padding:4px 12px;border:1px solid #fff;' +
                 'border-radius:4px;background:transparent;color:#fff;cursor:pointer;font-weight:600;');
             btn.onclick = function(){ location.reload(); };
             bar.appendChild(btn);
+            // 具体是哪个文件、报了什么，直接摆在红条上：否则用户只看到一句笼统的
+            // "可能无法正常工作"，唯一的线索埋在 devtools 控制台里，等于没有线索。
+            var detail = document.createElement('div');
+            detail.setAttribute('style', 'margin-top:4px;font-size:12px;opacity:.9;' +
+                'white-space:pre-wrap;word-break:break-all;');
+            detail.textContent = loadFails.concat(runtimeErrs).slice(0, 3).join('  |  ') +
+                (issues.length > 3 ? '  …等 ' + issues.length + ' 项' : '');
+            bar.appendChild(detail);
             document.body.insertBefore(bar, document.body.firstChild);
         });
     })();</script>
@@ -239,16 +281,16 @@
                             </div>
                         </div>
 
-                        <!-- Pacing skeleton references: both are enabled by default so one
+                        <!-- Pacing skeleton references: all are enabled by default so one
                              ideation batch can deliberately spread candidates across the
-                             established linear ladder and the new two-payoff exterior/interior
-                             ladder instead of silently collapsing every topic onto one rhythm. -->
+                             established linear ladder and the two payoff variants instead of
+                             silently collapsing every topic onto one rhythm. -->
                         <div class="control-group pacing-skeleton-control spark-drawer" id="pacing-skeleton-control" data-drawer="pacing">
                             <div class="spark-drawer-head">
                                 <button type="button" class="spark-drawer-toggle" aria-expanded="false" aria-controls="spark-drawer-pacing-body">
                                     <svg class="spark-drawer-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
                                     <span class="group-title">🦴 推进节拍骨架</span>
-                                    <span class="pacing-skeleton-selected-note spark-drawer-note" id="pacing-skeleton-selected-note">已启用 2 套</span>
+                                    <span class="pacing-skeleton-selected-note spark-drawer-note" id="pacing-skeleton-selected-note">已启用 3 套</span>
                                 </button>
                             </div>
                             <div class="spark-drawer-body" id="spark-drawer-pacing-body">
@@ -266,6 +308,13 @@
                                         <span class="pacing-skeleton-copy">
                                             <strong>内外双重完工</strong>
                                             <small>新骨架 · 外部门面先完工小高潮 → 连续推镜过门进入原始室内 → 基层/隐蔽层/封板/饰面 → 家具终局</small>
+                                        </span>
+                                    </label>
+                                    <label class="pacing-skeleton-option">
+                                        <input type="checkbox" name="pacing-skeleton" value="nested_space_payoff" checked>
+                                        <span class="pacing-skeleton-copy">
+                                            <strong>双空间重置兑现</strong>
+                                            <small>视频参考 · 极端设定钩子 → 第一功能区完整小兑现 → 硬切第二毛坯空间 → 分层重建 → 功能揭露与终局陈列</small>
                                         </span>
                                     </label>
                                 </div>
@@ -1335,8 +1384,8 @@
          改一个参数要先滚着找、改完还得记得按「保存配置」。现在：
            · 左侧分区导航（后端 / 生图 / 号池 / 激发参考 / 系统），右侧一次只显示一个分区；
            · 号池整块并入本窗口的「生成号池」分区（原 #account-pool-manage-modal 已删除，
-             内部 id 一个没改，js/account_pool.js 的渲染逻辑原样可用），选号策略
-             （换号频率 / 浏览器编号）跟号池列表放在同一屏；
+             js/account_pool.js 继续负责池子渲染）；默认环境和换号节拍只在 Google FX
+             服务管理中心配置；
            · 所有控件改动即存（silent autoSaveConfig + 头部「已保存」提示），底部只留
              测试连接 / 恢复默认 / 完成。
          见 docs/spark_settings_center_layout_plan.md -->
@@ -1441,35 +1490,13 @@
                         </div>
                     </section>
 
-                    <!-- ③ 生成号池 — 选号策略 + 池子本身，同一屏搞定
+                    <!-- ③ 生成号池 — 这里只管理池子成员。
                          视频生成始终走 AdsPower/google_fx（跟「帧序列生成方式」的 api/google_fx
-                         切换无关，那个开关只管生图路径），所以号池列表本身永远可见，
-                         只有「换号频率 / 浏览器编号」两项跟着 imageBackend 显隐 -->
+                         切换无关，那个开关只管生图路径）。默认环境和换号节拍统一在
+                         Google FX 服务管理中心配置，避免两个入口互相覆盖。 -->
                     <section class="settings-section" data-section="pool">
                         <h4 class="settings-section-title">生成号池</h4>
                         <p class="settings-section-desc">帧序列 / 视频生成共用的 AdsPower + Flow 账号池，发起生成前自动挑一个还有积分的账号。</p>
-
-                        <!-- 选号策略默认折起：常看的是池子本身（谁还有积分、谁禁用了），
-                             这两项属于"设一次就不动"的策略参数，摊开会把列表和「添加账号」
-                             挤到折叠线以下 -->
-                        <details class="settings-subgroup" id="fx-pool-strategy-group" style="display: none;">
-                        <summary>选号策略 · 换号频率 / 指定浏览器编号</summary>
-                        <div class="form-group settings-field" id="fx-account-switch-group" style="display: none;">
-                            <label for="settings-fx-account-switch-requests">换号频率（次请求）</label>
-                            <input type="number" id="settings-fx-account-switch-requests" min="1" max="100" placeholder="默认 5 次">
-                            <small class="settings-hint">帧序列 / 视频序列生成里每这么多个请求换一次号池账号（帧序列按最近的链式批次边界换）。<strong>换 IP 已全局关停</strong>：换 IP 会把 Flow 登录 token 打失效、还会让画布追踪串片，现在全程保持同一个 IP，只换号</small>
-                        </div>
-                        <div class="form-group settings-field" id="fx-browser-id-group" style="display: none;">
-                            <label for="settings-fx-browser-id">指定浏览器编号</label>
-                            <div class="settings-field-inline">
-                                <select id="settings-fx-browser-id">
-                                    <option value="">留空 = 号池自动选号 / 服务端默认浏览器</option>
-                                </select>
-                                <button type="button" id="settings-fx-browser-id-refresh" class="text-btn secondary" title="重新读取号池里的环境编号">🔄</button>
-                            </div>
-                            <small class="settings-hint">选项来自下面的号池（打开配置或点 🔄 时刷新）。选了本项 = 这一次临时指定用哪个 AdsPower 窗口，跳过号池自动选号（也一并关掉换号轮转）；留「号池自动选号」且号池非空时，帧序列 / 视频生成会自动挑一个还有积分的账号</small>
-                        </div>
-                        </details>
 
                         <div class="account-pool-manage-body">
                             <div class="account-pool-sort-row">
@@ -1603,9 +1630,7 @@
         </div>
     </div>
 
-    <!-- （原 #account-pool-manage-modal 已并入 API 配置中心的「生成号池」分区：
-         modal 叠 modal 的嵌套弹窗去掉了，选号策略和池子列表现在同屏可见。
-         内部 id 全部保留在上面那段 markup 里，js/account_pool.js 无需改渲染逻辑。） -->
+    <!-- （原 #account-pool-manage-modal 已并入 API 配置中心的「生成号池」分区。） -->
 
     <!-- Toast Notification Container -->
     <!-- Toast Notification Container -->
@@ -1620,59 +1645,88 @@
         <span class="log-pill-badge" id="log-pill-badge" hidden>0</span>
     </button>
 
-    <!-- 本地服务工作日志：右侧全高 dock（展开态） -->
+    <!-- 本地服务工作日志：右侧全高 dock（展开态）
+         两个模式：「概览」把日志行归成人话事件卡（见 js/log_semantics.js），只在
+         真出事时才有内容；「明细」是原来那个逐行面板，能力一条没减，只是四行常驻
+         筛选控件收进了「筛选 ▾」浮层。见 docs/spark_log_panel_layout_plan.md -->
     <div class="log-panel-drawer" id="log-panel-drawer">
         <div class="log-dock-resizer" id="log-dock-resizer" title="拖动调整日志面板宽度"></div>
+
+        <!-- 状态条：一句话结论，而不是一个只有开发者看得懂的标题 -->
         <div class="log-panel-header" id="log-panel-header">
             <div class="log-panel-title">
                 <span class="log-panel-status-dot"></span>
-                <span>🖥️ 本地服务工作日志</span>
+                <span class="log-panel-headline" id="log-headline">正在连接本地服务…</span>
             </div>
             <div class="log-panel-actions">
                 <button id="toggle-log-btn" class="log-action-btn" title="收起日志面板">收起</button>
             </div>
         </div>
-        <div class="log-panel-filters" id="log-panel-filters">
-            <div class="log-filter-row">
-                <button type="button" id="log-problems-only-btn" class="log-action-btn" title="只看 WARN 及以上级别，再点一次恢复">只看问题</button>
-                <div class="log-level-chips" id="log-level-chips">
-                    <button type="button" class="log-level-chip lvl-ERROR active" data-level="ERROR">ERROR</button>
-                    <button type="button" class="log-level-chip lvl-WARN active" data-level="WARN">WARN</button>
-                    <button type="button" class="log-level-chip lvl-INFO active" data-level="INFO">INFO</button>
-                    <button type="button" class="log-level-chip lvl-DEBUG" data-level="DEBUG">DEBUG</button>
-                    <button type="button" class="log-level-chip lvl-OTHER active" data-level="OTHER" title="未套用新格式的旧日志行">其他</button>
+
+        <div class="log-mode-tabs" id="log-mode-tabs" role="tablist">
+            <button type="button" class="log-mode-tab active" data-mode="overview" role="tab" aria-selected="true">概览</button>
+            <button type="button" class="log-mode-tab" data-mode="detail" role="tab" aria-selected="false">明细</button>
+        </div>
+
+        <!-- 概览 -->
+        <div class="log-pane log-pane-overview active" id="log-pane-overview" role="tabpanel">
+            <div class="log-event-list" id="log-event-list"></div>
+        </div>
+
+        <!-- 明细：原逐行面板 -->
+        <div class="log-pane log-pane-detail" id="log-pane-detail" role="tabpanel">
+            <div class="log-panel-filters" id="log-panel-filters">
+                <div class="log-filter-bar">
+                    <input type="text" id="log-search-input" class="log-filter-input" placeholder="搜索关键词..." spellcheck="false">
+                    <button type="button" id="log-problems-only-btn" class="log-action-btn" title="只看 WARN 及以上级别，再点一次恢复">只看问题</button>
+                    <button type="button" id="log-filter-more-btn" class="log-action-btn" aria-expanded="false" title="级别、任务、自动滚动等">筛选 ▾</button>
+                </div>
+                <!-- 低频控件收进浮层：它们从"常驻四行"变成"要用时点一下"，
+                     省出的高度全部还给日志正文。id 全部原样保留。 -->
+                <div class="log-filter-popover" id="log-filter-popover" hidden>
+                    <div class="log-level-chips" id="log-level-chips">
+                        <button type="button" class="log-level-chip lvl-ERROR active" data-level="ERROR">ERROR</button>
+                        <button type="button" class="log-level-chip lvl-WARN active" data-level="WARN">WARN</button>
+                        <button type="button" class="log-level-chip lvl-INFO active" data-level="INFO">INFO</button>
+                        <button type="button" class="log-level-chip lvl-DEBUG" data-level="DEBUG">DEBUG</button>
+                        <button type="button" class="log-level-chip lvl-OTHER active" data-level="OTHER" title="未套用新格式的旧日志行">其他</button>
+                    </div>
+                    <input type="text" id="log-task-filter" class="log-filter-input" placeholder="按任务 id 过滤（点行内任务标签快速填入）" spellcheck="false">
+                    <div class="log-filter-row log-filter-row-foot">
+                        <label class="log-panel-checkbox-label">
+                            <input type="checkbox" id="log-autoscroll-chk" checked> 自动滚动
+                        </label>
+                        <button id="clear-log-btn" class="log-action-btn" title="清空日志面板">清空</button>
+                        <span class="log-filter-count" id="log-filter-count"></span>
+                    </div>
                 </div>
             </div>
-            <input type="text" id="log-task-filter" class="log-filter-input" placeholder="按任务 id 过滤（点行内任务标签快速填入）" spellcheck="false">
-            <input type="text" id="log-search-input" class="log-filter-input" placeholder="搜索关键词..." spellcheck="false">
-            <div class="log-filter-row log-filter-row-foot">
-                <label class="log-panel-checkbox-label">
-                    <input type="checkbox" id="log-autoscroll-chk" checked> 自动滚动
-                </label>
-                <button id="clear-log-btn" class="log-action-btn" title="清空日志面板">清空</button>
-                <span class="log-filter-count" id="log-filter-count"></span>
+            <div class="log-panel-body" id="log-panel-body">
+                <div id="log-output-lines"><div class="log-line lvl-OTHER" data-level="OTHER">正在连接本地服务日志流...</div></div>
             </div>
         </div>
-        <div class="log-panel-body" id="log-panel-body">
-            <div id="log-output-lines"><div class="log-line lvl-OTHER" data-level="OTHER">正在连接本地服务日志流...</div></div>
-        </div>
+
+        <div class="log-panel-foot" id="log-panel-foot"></div>
     </div>
 
     <!-- Modular JS: defer so they never block HTML parsing. Order preserved. -->
-    <script src="js/state.js?v=1.1.12" defer></script>
+    <script src="js/state.js?v=1.1.14" defer></script>
     <script src="js/utils.js?v=1.3.0" defer></script>
     <script src="js/theme_toggle.js?v=1.1.0" defer></script>
-    <script src="js/config.js?v=1.3.0" defer></script>
+    <script src="js/config.js?v=1.3.2" defer></script>
     <script src="js/spark_rail.js?v=1.0.0" defer></script>
     <script src="js/trend_refs.js?v=1.3.1" defer></script>
-    <script src="js/account_pool.js?v=1.2.0" defer></script>
+    <script src="js/account_pool.js?v=1.2.1" defer></script>
     <script src="js/progress_model.js?v=1.2.3" defer></script>
     <!-- 槽位状态模型（纯函数）与卡片渲染器：必须排在 api_client / media_renderer /
          app.js 之前——那三处的槽位渲染全部转调这里。见 docs/spark_result_slots_plan.md -->
     <script src="js/slot_model.js?v=1.1.0" defer></script>
     <script src="js/slot_card.js?v=1.3.0" defer></script>
     <script src="js/slot_toolbar.js?v=1.1.0" defer></script>
-    <script src="js/api_client.js?v=1.6.0" defer></script>
+    <!-- 日志语义规则表（纯函数）：必须排在 api_client 之前——日志面板的概览模式
+         转调这里把日志行归成人话事件。见 docs/spark_log_panel_layout_plan.md -->
+    <script src="js/log_semantics.js?v=1.0.0" defer></script>
+    <script src="js/api_client.js?v=1.7.1" defer></script>
     <script src="js/prompt_pipeline.js?v=1.2.5" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
     <script src="js/media_renderer.js?v=1.6.0" defer></script>

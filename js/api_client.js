@@ -394,6 +394,15 @@ function initLocalServiceLogs() {
     const taskFilterEl = document.getElementById('log-task-filter');
     const searchInputEl = document.getElementById('log-search-input');
     const countEl = document.getElementById('log-filter-count');
+    // 概览模式（把日志行归成人话事件卡）
+    const modeTabsEl = document.getElementById('log-mode-tabs');
+    const overviewPane = document.getElementById('log-pane-overview');
+    const detailPane = document.getElementById('log-pane-detail');
+    const eventListEl = document.getElementById('log-event-list');
+    const headlineEl = document.getElementById('log-headline');
+    const footEl = document.getElementById('log-panel-foot');
+    const filterMoreBtn = document.getElementById('log-filter-more-btn');
+    const filterPopover = document.getElementById('log-filter-popover');
 
     if (!drawer || !header || !linesEl) return;
 
@@ -401,6 +410,12 @@ function initLocalServiceLogs() {
         statusDots.forEach(dot => {
             dot.className = ok ? 'log-panel-status-dot connected' : 'log-panel-status-dot';
         });
+        // 断线时状态条不能继续挂着"运行正常"——那时候我们其实什么都不知道。
+        if (!ok) {
+            const headline = document.getElementById('log-headline');
+            if (headline) headline.textContent = '与本地服务断开，正在重连…';
+            drawer.dataset.tone = 'offline';
+        }
     }
 
     // ── 静息态未读计数 ────────────────────────────────────────────────
@@ -563,7 +578,15 @@ function initLocalServiceLogs() {
 
     function appendLine(raw) {
         if (!raw) return;
-        appendEntry(parseLine(raw));
+        // 行尾 \r 必须先去掉，否则 _LOG_LINE_RE 对每一行都匹配不上：JS 的 `.`
+        // 不匹配 \r，末尾的 `$` 也不会停在 \r 前面。而 server.log 在 Windows 上
+        // 是 100% CRLF（RotatingFileStream 以文本模式打开，\n 被翻译成 \r\n），
+        // SSE 又是按二进制读、按 \n 切——于是每行都留着一个 \r，解析全线失败，
+        // 所有日志统统退化成 OTHER 级别：级别徽标、任务过滤、按级别着色、
+        // 「只看问题」在 Windows 上全部形同虚设。
+        const line = raw.charCodeAt(raw.length - 1) === 13 ? raw.slice(0, -1) : raw;
+        if (!line) return;
+        appendEntry(parseLine(line));
     }
 
     // 增量 'log' 事件送来的是任意长度的文本块（服务端从文件末尾增量 read()），
@@ -598,6 +621,193 @@ function initLocalServiceLogs() {
         pendingPartial = '';
         linesEl.innerHTML = '';
         updateCount();
+        scheduleOverviewRender();
+    }
+
+    // ── 概览模式 ──────────────────────────────────────────────────────
+    // 日志 90% 的时间不需要逐行读，需要的只是"有没有出事、出的什么事、我要不要
+    // 管"。概览把日志行按 js/log_semantics.js 的规则表归成事件卡，一切正常时是
+    // 一个空状态而不是一屏滚动的字。逐行面板原样保留在「明细」里。
+    const LOG_MODE_KEY = 'spark_log_dock_mode';
+    const SEV_ICON = { error: '✕', warn: '⚠' };
+    let logMode = 'overview';
+    // scrollToBottom 的 rAF 节流标志。必须声明在这里，不能跟着 scrollToBottom
+    // 的定义放到下面：那个函数是声明式的（会提升），而这个 let 不会——恢复
+    // 上次面板状态时 setLogMode/setLogDockOpen 会在"明细"模式下直接调用
+    // scrollToBottom，那时若声明还在下方，就会踩进暂时性死区抛
+    // ReferenceError，整个 initLocalServiceLogs 中断，它后面定义的函数
+    // 全部不存在（表现为整个界面失灵）。默认的"概览"模式走 renderOverview
+    // 这条分支，碰不到它——所以这个坑只在读到 spark_log_dock_mode=detail
+    // 的浏览器上才会炸，全新配置文件复现不出来。
+    let _logScrollPending = false;
+    try {
+        const saved = localStorage.getItem(LOG_MODE_KEY);
+        if (saved === 'detail' || saved === 'overview') logMode = saved;
+    } catch (e) {}
+
+    function semantics() {
+        return (typeof window !== 'undefined' && window.SparkLogSemantics) || null;
+    }
+
+    function renderEventCard(ev) {
+        const card = document.createElement('div');
+        card.className = `log-event-card sev-${ev.severity}`;
+        card.dataset.key = ev.key;
+
+        const when = ev.lastTime ? String(ev.lastTime).slice(0, 5) : '';
+        const meta = [when, ev.task ? `任务 ${ev.task}` : ''].filter(Boolean).join(' · ');
+
+        let html =
+            '<div class="log-event-head">' +
+                `<span class="log-event-icon">${SEV_ICON[ev.severity] || '•'}</span>` +
+                `<span class="log-event-title">${escapeHtml(ev.title || '')}</span>` +
+                (ev.count > 1 ? `<span class="log-event-count">×${ev.count}</span>` : '') +
+            '</div>';
+        if (meta) html += `<div class="log-event-meta">${escapeHtml(meta)}</div>`;
+        if (ev.hint) html += `<div class="log-event-hint">${escapeHtml(ev.hint)}</div>`;
+
+        let actions = '<button type="button" class="log-event-link" data-act="detail">查看明细 ›</button>';
+        const act = ev.action;
+        if (act && act.section) {
+            actions += `<button type="button" class="log-event-link" data-act="section" data-section="${escapeHtml(act.section)}">${escapeHtml(act.label)} ›</button>`;
+        } else if (act && act.href) {
+            actions += `<a class="log-event-link" href="${escapeHtml(act.href)}" target="_blank" rel="noopener">${escapeHtml(act.label)} ›</a>`;
+        }
+        html += `<div class="log-event-actions">${actions}</div>`;
+
+        card.innerHTML = html;
+        return card;
+    }
+
+    function renderOverview() {
+        const sem = semantics();
+        if (!eventListEl || !sem) return;
+
+        const events = sem.aggregate(entries);
+        const stat = sem.summarize(entries, events);
+
+        if (headlineEl) headlineEl.textContent = stat.headline;
+        drawer.dataset.tone = stat.tone;
+        if (footEl) {
+            footEl.textContent =
+                `本次运行 · 完成 ${stat.done} · 需处理 ${stat.error} · 会自愈 ${stat.warn}`;
+        }
+
+        eventListEl.innerHTML = '';
+        if (!events.length) {
+            const empty = document.createElement('div');
+            empty.className = 'log-event-empty';
+            empty.innerHTML =
+                '<div class="log-event-empty-mark">✓</div>' +
+                '<div class="log-event-empty-title">服务运行正常，没有需要你处理的事</div>' +
+                '<button type="button" class="log-event-link" data-act="detail-all">查看完整日志 ›</button>';
+            eventListEl.appendChild(empty);
+            return;
+        }
+        events.forEach(ev => eventListEl.appendChild(renderEventCard(ev)));
+    }
+
+    // 日志是流式进来的，每行都重算一遍全量聚合会在刷屏时明显卡顿。折叠时完全不
+    // 算（看不见），展开时最多 400ms 算一次。
+    let overviewTimer = null;
+    function scheduleOverviewRender() {
+        if (overviewTimer) return;
+        if (!drawer.classList.contains('expanded') || logMode !== 'overview') return;
+        overviewTimer = setTimeout(() => {
+            overviewTimer = null;
+            renderOverview();
+        }, 400);
+    }
+
+    function setLogMode(mode) {
+        logMode = mode === 'detail' ? 'detail' : 'overview';
+        try { localStorage.setItem(LOG_MODE_KEY, logMode); } catch (e) {}
+        if (overviewPane) overviewPane.classList.toggle('active', logMode === 'overview');
+        if (detailPane) detailPane.classList.toggle('active', logMode === 'detail');
+        if (modeTabsEl) {
+            modeTabsEl.querySelectorAll('.log-mode-tab').forEach(tab => {
+                const on = tab.dataset.mode === logMode;
+                tab.classList.toggle('active', on);
+                tab.setAttribute('aria-selected', on ? 'true' : 'false');
+            });
+        }
+        if (logMode === 'overview') renderOverview();
+        else scrollToBottom();
+    }
+
+    if (modeTabsEl) {
+        modeTabsEl.addEventListener('click', (e) => {
+            const tab = e.target.closest('.log-mode-tab');
+            if (tab) setLogMode(tab.dataset.mode);
+        });
+    }
+
+    // 从事件卡跳进明细：靠 eventKeyOf 反查这张卡对应的最后一行，直接滚到它并
+    // 高亮，而不是往搜索框里塞关键词猜。
+    function focusEventInDetail(key) {
+        const sem = semantics();
+        setLogMode('detail');
+        if (!sem || !key) return;
+        let idx = -1;
+        for (let i = entries.length - 1; i >= 0; i--) {
+            if (sem.eventKeyOf(entries[i]) === key) { idx = i; break; }
+        }
+        if (idx < 0) return;
+        // 目标行可能正被当前筛选隐藏着（例如「只看问题」关掉了 WARN），
+        // 那就先把筛选放开，否则跳过去是一片空白。
+        const target = linesEl.children[idx];
+        if (!target) return;
+        if (target.classList.contains('log-line-hidden')) {
+            activeLevels.add(entries[idx].level);
+            if (levelChipsEl) {
+                levelChipsEl.querySelectorAll('.log-level-chip').forEach(chip => {
+                    chip.classList.toggle('active', activeLevels.has(chip.dataset.level));
+                });
+            }
+            reapplyVisibility();
+        }
+        if (autoscrollChk) autoscrollChk.checked = false; // 否则马上被自动滚动拽回底部
+        target.scrollIntoView({ block: 'center' });
+        target.classList.add('log-line-flash');
+        setTimeout(() => target.classList.remove('log-line-flash'), 1600);
+    }
+
+    if (eventListEl) {
+        eventListEl.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-act]');
+            if (!btn) return;
+            const act = btn.dataset.act;
+            if (act === 'detail') {
+                const card = btn.closest('.log-event-card');
+                focusEventInDetail(card && card.dataset.key);
+            } else if (act === 'detail-all') {
+                setLogMode('detail');
+            } else if (act === 'section') {
+                // 「打开号池 / 打开配置」：走用户平时那条路径（打开配置中心再切分区），
+                // 不复制一份它的打开逻辑。
+                const openBtn = document.getElementById('open-settings-btn');
+                if (openBtn) openBtn.click();
+                const section = btn.dataset.section;
+                const navItem = document.querySelector(`#settings-nav [data-section="${section}"]`);
+                if (navItem) navItem.click();
+            }
+        });
+    }
+
+    // 「筛选 ▾」浮层：级别芯片/任务过滤/自动滚动/清空这些低频控件收在这里，
+    // 从常驻四行（约 110px）变成要用时点一下。
+    if (filterMoreBtn && filterPopover) {
+        const setPopover = (open) => {
+            filterPopover.hidden = !open;
+            filterMoreBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+            filterMoreBtn.classList.toggle('active', open);
+        };
+        filterMoreBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            setPopover(filterPopover.hidden);
+        });
+        filterPopover.addEventListener('click', (e) => e.stopPropagation());
+        document.addEventListener('click', () => setPopover(false));
     }
 
     if (levelChipsEl) {
@@ -702,7 +912,9 @@ function initLocalServiceLogs() {
             if (typeof closeLibraryDrawer === 'function') closeLibraryDrawer();
             if (typeof closeTasksDrawer === 'function') closeTasksDrawer();
             clearUnread();
-            scrollToBottom();
+            // 折叠期间概览是不算的（省掉看不见的全量聚合），展开这一下补上
+            if (logMode === 'overview') renderOverview();
+            else scrollToBottom();
         }
     }
 
@@ -773,6 +985,7 @@ function initLocalServiceLogs() {
         const savedWidth = parseInt(localStorage.getItem(LOG_DOCK_WIDTH_KEY), 10);
         if (savedWidth > 0) applyDockWidth(savedWidth);
     } catch (e) {}
+    setLogMode(logMode);
     try {
         if (localStorage.getItem(LOG_DOCK_OPEN_KEY) === '1') setLogDockOpen(true);
     } catch (e) {}
@@ -782,7 +995,7 @@ function initLocalServiceLogs() {
 
     // ── rAF-throttled scroll: reading scrollHeight causes forced layout,
     //    batch to at most one DOM read per animation frame ──
-    let _logScrollPending = false;
+    //    （节流标志 _logScrollPending 声明在本函数作用域顶部，原因见那里的注释）
     function scrollToBottom() {
         if (autoscrollChk && autoscrollChk.checked) {
             if (!_logScrollPending) {
@@ -828,11 +1041,12 @@ function initLocalServiceLogs() {
                     clearAll();
                     replayingHistory = true;
                     try {
-                        payload.lines.forEach(line => appendLine(line.replace(/\n$/, '')));
+                        payload.lines.forEach(line => appendLine(line.replace(/\r?\n$/, '')));
                     } finally {
                         replayingHistory = false;
                     }
                     scrollToBottom();
+                    scheduleOverviewRender();
                 }
             } catch (err) {
                 console.error("Failed to parse log history", err);
@@ -848,6 +1062,7 @@ function initLocalServiceLogs() {
                     appendChunk(payload.text);
                     updateCount();
                     scrollToBottom();
+                    scheduleOverviewRender();
                 }
             } catch (err) {
                 console.error("Failed to parse log line", err);

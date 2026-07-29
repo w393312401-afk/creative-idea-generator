@@ -56,9 +56,25 @@ class ProxyRotator:
         except ValueError:
             self.rotate_threshold = 5
 
+    @staticmethod
+    def _pool_has_usable_proxy() -> bool:
+        """控制台的代理号池（runtime/proxy_pool.json）里有没有可用条目。"""
+        try:
+            from .proxy_pool import ProxyPool
+            return bool(ProxyPool().usable_proxies())
+        except Exception:
+            return False
+
     @property
     def is_configured(self) -> bool:
-        """检查是否已配置 Miya 代理（或者在 list 模式下已填充 IP 列表）"""
+        """检查是否已配置代理。
+
+        优先级：控制台的代理号池 > MIYA_PROXY_* 环境变量 > list 模式的
+        proxy_pool.txt。号池是有界面、有连通性记录的那一份，用户在控制台里加了
+        代理就应该按它走，而不是继续读只有他自己知道的 .env。
+        """
+        if self._pool_has_usable_proxy():
+            return True
         if self.rotate_mode == "list":
             pool_file = AI_DIR / "runtime" / "proxy_pool.txt"
             if pool_file.exists():
@@ -80,18 +96,38 @@ class ProxyRotator:
         """生成随机 session ID，用于 session 模式换 IP"""
         return ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
 
+    def _proxy_config_from_pool(self) -> dict:
+        """从控制台代理号池按游标取一条，转成 userProxyConfig。取不到返回 {}。"""
+        try:
+            from .proxy_pool import ProxyPool, to_adspower_config
+            entry = ProxyPool().pick_proxy()
+        except Exception as e:
+            log(f"⚠️ 读取代理号池失败，回退到环境变量配置: {type(e).__name__}: {e}", "代理轮换")
+            return {}
+        if not entry:
+            return {}
+        log(f"🔄 代理号池轮换: {entry.get('label')} "
+            f"({entry.get('host')}:{entry.get('port')})", "代理轮换")
+        return to_adspower_config(entry)
+
     def get_proxy_config(self) -> dict:
         """
         生成 AdsPower userProxyConfig 格式的代理配置。
-        根据 rotate_mode 生成不同的用户名/IP端口：
+
+        控制台代理号池（runtime/proxy_pool.json）里有可用条目时优先按它轮换；
+        否则回落到 rotate_mode 决定的老路径：
           - session: username-session-{random}
           - gateway: username（固定，每次连接自动换 IP）
           - api:     从 API 提取新 IP:Port（覆盖 host/port）
           - list:    从 runtime/proxy_pool.txt 轮换读取 IP:Port:User:Pass
         """
         if not self.is_configured:
-            log("⚠️ Miya 代理未配置（MIYA_PROXY_HOST / MIYA_PROXY_PORT 为空），跳过", "代理轮换")
+            log("⚠️ 代理未配置（代理号池为空且 MIYA_PROXY_HOST / MIYA_PROXY_PORT 为空），跳过", "代理轮换")
             return {}
+
+        pool_config = self._proxy_config_from_pool()
+        if pool_config:
+            return pool_config
 
         proxy_host = self.host
         proxy_port = self.port
@@ -152,6 +188,13 @@ class ProxyRotator:
             session_id = self._generate_session_id()
             if proxy_user:
                 proxy_user = f"{self.user}-{self.session_prefix}-{session_id}"
+
+        # 号池"有可用条目"和"真取到一条"之间可能有窗口（并发禁用/删除），
+        # 落到这里时环境变量那一份可能压根没配——地址不全就如实跳过，
+        # 不要把空 host/port 下发给 AdsPower（那会把环境的代理配成坏值）。
+        if not proxy_host or not proxy_port:
+            log("⚠️ 代理地址不完整（号池取号落空且 MIYA_PROXY_HOST/PORT 为空），跳过", "代理轮换")
+            return {}
 
         # 构造 AdsPower userProxyConfig 格式
         config = {

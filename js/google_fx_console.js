@@ -14,6 +14,8 @@
     configVersions: [],
     lastTasks: [],
     lastQueue: {},
+    proxies: [],
+    proxyEditingId: '',
     selftestRunning: false,
     logTaskFilter: '',
     logKeyword: '',
@@ -53,6 +55,17 @@
     if (account && account.credit_stale) return { key: 'stale', label: '缓存过期', tone: 'warn' };
     if (Number(account.credit) <= 0) return { key: 'empty', label: '额度不足', tone: 'bad' };
     return { key: 'ready', label: '可用', tone: 'good' };
+  }
+
+  // 代理状态判定：禁用 > 检测失败 > 未检测 > 可用。「未检测」不能显示成"可用"——
+  // 一条从没连通过的代理和一条刚验过出口 IP 的代理是两回事（同 accountState 里
+  // credit=null 不等于 0 的道理）。
+  function proxyState(proxy) {
+    if (!proxy) return { key: 'unknown', label: '未知', tone: 'warn' };
+    if (proxy.disabled) return { key: 'disabled', label: '已禁用', tone: 'bad' };
+    if (proxy.last_check_status === 'failed') return { key: 'failed', label: '检测失败', tone: 'bad' };
+    if (proxy.last_check_status !== 'ok') return { key: 'unchecked', label: '未检测', tone: 'warn' };
+    return { key: 'ok', label: '可用', tone: 'good' };
   }
 
   function creditLabel(account) {
@@ -150,10 +163,42 @@
     setCard('fx-account', `${available} / ${accounts.total || 0}`, accountSub.join(' · '),
       available > 0 ? 'good' : ((accounts.total || 0) ? 'bad' : 'warn'));
 
+    const proxies = data.proxies || {};
+    const proxyTotal = proxies.total || 0;
+    const proxySub = [`${proxies.ok || 0} 已验证`, `${proxies.unchecked || 0} 未检测`];
+    if (proxies.failed) proxySub.push(`${proxies.failed} 失败`);
+    if (proxies.disabled) proxySub.push(`${proxies.disabled} 禁用`);
+    // 代理号池为空 = 走 AdsPower 环境自带的代理设置，是合法状态，不该报红。
+    setCard('fx-proxy', proxyTotal ? `${proxies.enabled || 0} / ${proxyTotal}` : '未配置',
+      proxyTotal ? proxySub.join(' · ') : '生成走 AdsPower 环境自带的代理设置',
+      proxyTotal ? ((proxies.enabled || 0) > 0 ? 'good' : 'bad') : 'neutral');
+
     if ($('fx-config-image-model')) $('fx-config-image-model').textContent = config.image_model || '—';
     if ($('fx-config-video-model')) $('fx-config-video-model').textContent = config.video_model || '—';
-    if ($('fx-config-switch')) $('fx-config-switch').textContent = `每 ${config.account_switch_requests || 5} 次请求`;
+    // 锁定默认环境时轮转环只剩一个号，节拍值一次都用不上。状态条以前照样把它
+    // 显示成正在生效的样子，用户只能靠翻手册才知道自己改的数字是死的。
+    const switchEl = $('fx-config-switch');
+    if (switchEl) {
+      const switchInert = config.account_switch_effective === false;
+      switchEl.textContent = `每 ${config.account_switch_requests || 5} 次请求`
+        + (switchInert ? ' · 不生效' : '');
+      switchEl.className = switchInert ? 'fx-danger-value' : '';
+      switchEl.title = switchInert
+        ? '「锁定默认环境」开着，整条序列固定在同一个号上，这个节拍不会被用到；取消锁定后才按节拍轮转号池'
+        : '每这么多个请求换一个号池账号（IP 始终不变）';
+    }
     if ($('fx-config-account')) $('fx-config-account').textContent = config.selected_user_id || '自动选择';
+    const sequenceEl = $('fx-config-sequence-account');
+    if (sequenceEl) {
+      const seqId = config.sequence_user_id || '';
+      const seqAccount = seqId && state.accounts.find((a) => String(a.user_id) === String(seqId));
+      sequenceEl.textContent = seqId
+        ? `${(seqAccount && (seqAccount.name || seqAccount.user_id)) || seqId}${config.sequence_user_locked ? ' · 已锁定' : ''}`
+        : '自动选择';
+      sequenceEl.title = seqId
+        ? `序列生成默认浏览器环境：${seqId}${config.sequence_user_locked ? '（整条序列不换号）' : '（后续仍按换号节拍轮转）'}`
+        : '未指定：按号池自动选号';
+    }
     if ($('fx-sync-time')) $('fx-sync-time').textContent = `同步于 ${formatTime(data.checked_at)}`;
 
     // IP 轮换如实反映后端读到的真实配置，不再是写死的"已关闭"
@@ -442,6 +487,164 @@
     }).join('');
   }
 
+  function renderProxies(proxies) {
+    state.proxies = Array.isArray(proxies) ? proxies : [];
+    const body = $('fx-proxy-table-body');
+    if (!body) return;
+    if (!state.proxies.length) {
+      body.innerHTML = '<tr><td colspan="6" class="fx-empty">'
+        + '代理号池为空：生成任务走 AdsPower 环境自带的代理设置。点右上角「添加代理」录入出口。'
+        + '</td></tr>';
+      return;
+    }
+    body.innerHTML = state.proxies.map((proxy) => {
+      const status = proxyState(proxy);
+      const id = esc(proxy.proxy_id);
+      const auth = proxy.user
+        ? `${esc(proxy.user)}${proxy.has_password ? ':***' : ''}@` : '';
+      const note = proxy.note ? `<span class="fx-account-id">${esc(proxy.note)}</span>` : '';
+      const latency = proxy.latency_ms != null ? ` · ${esc(proxy.latency_ms)}ms` : '';
+      const exit = proxy.exit_ip
+        ? `${esc(proxy.exit_ip)}<span class="fx-account-id">${esc(proxy.exit_location || '')}${latency}</span>`
+        : '—';
+      const bound = proxy.bound_user_id
+        ? `${esc(proxy.bound_user_id)}<span class="fx-account-id">${esc(formatTime(proxy.applied_at))} 下发</span>`
+        : '未下发';
+      return `<tr>
+        <td><span class="fx-account-name">${esc(proxy.label || proxy.endpoint)}</span>
+          <span class="fx-proxy-endpoint">${esc(proxy.proxy_type)}://${auth}${esc(proxy.endpoint)}</span>${note}</td>
+        <td>${exit}</td>
+        <td><span class="fx-badge fx-badge-${status.tone}" title="${esc(proxy.last_check_error || '')}">${status.label}</span></td>
+        <td>${bound}</td>
+        <td title="${esc(proxy.last_check_error || '')}">${esc(proxy.last_check_at ? formatTime(proxy.last_check_at) : '尚未检测')}</td>
+        <td><div class="fx-row-actions">
+          <button class="fx-button" data-proxy-action="check" data-proxy-id="${id}">检测</button>
+          <button class="fx-button" data-proxy-action="apply" data-proxy-id="${id}" title="把这条代理写进某个 AdsPower 环境">下发</button>
+          <button class="fx-button" data-proxy-action="toggle" data-proxy-id="${id}">${proxy.disabled ? '启用' : '禁用'}</button>
+          <button class="fx-button" data-proxy-action="edit" data-proxy-id="${id}">编辑</button>
+          <button class="fx-button fx-button-danger" data-proxy-action="delete" data-proxy-id="${id}">移除</button>
+        </div></td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function loadProxies() {
+    try {
+      const data = await api('/api/proxy-pool');
+      renderProxies(data.proxies || []);
+    } catch (error) {
+      const body = $('fx-proxy-table-body');
+      if (body) body.innerHTML = `<tr><td colspan="6" class="fx-empty">代理号池读取失败：${esc(error.message)}</td></tr>`;
+    }
+  }
+
+  function proxyFormFields() {
+    return {
+      type: $('fx-proxy-type'), host: $('fx-proxy-host'), port: $('fx-proxy-port'),
+      user: $('fx-proxy-user'), password: $('fx-proxy-password'),
+      label: $('fx-proxy-label'), note: $('fx-proxy-note')
+    };
+  }
+
+  function openProxyForm(proxy) {
+    const form = $('fx-proxy-form');
+    if (!form) return;
+    const fields = proxyFormFields();
+    state.proxyEditingId = proxy ? String(proxy.proxy_id) : '';
+    if (fields.type) fields.type.value = (proxy && proxy.proxy_type) || 'http';
+    if (fields.host) fields.host.value = (proxy && proxy.host) || '';
+    if (fields.port) fields.port.value = (proxy && proxy.port) || '';
+    if (fields.user) fields.user.value = (proxy && proxy.user) || '';
+    // 密码从不回传明文，编辑时留空即表示"沿用原密码"（后端 keep_password）。
+    if (fields.password) {
+      fields.password.value = '';
+      fields.password.placeholder = (proxy && proxy.has_password) ? '留空 = 沿用原密码' : '';
+    }
+    if (fields.label) fields.label.value = (proxy && proxy.label) || '';
+    if (fields.note) fields.note.value = (proxy && proxy.note) || '';
+    const mode = $('fx-proxy-form-mode');
+    if (mode) mode.textContent = proxy ? `编辑：${proxy.label || proxy.endpoint}` : '新增代理';
+    form.hidden = false;
+    if (fields.host) fields.host.focus();
+  }
+
+  function closeProxyForm() {
+    state.proxyEditingId = '';
+    const form = $('fx-proxy-form');
+    if (form) form.hidden = true;
+  }
+
+  async function saveProxy() {
+    const fields = proxyFormFields();
+    const body = {
+      proxy_id: state.proxyEditingId || '',
+      proxy_type: fields.type ? fields.type.value : 'http',
+      host: fields.host ? fields.host.value.trim() : '',
+      port: fields.port ? fields.port.value.trim() : '',
+      user: fields.user ? fields.user.value.trim() : '',
+      password: fields.password ? fields.password.value : '',
+      label: fields.label ? fields.label.value.trim() : '',
+      note: fields.note ? fields.note.value.trim() : ''
+    };
+    if (!body.host || !body.port) { showToast('请填写代理地址和端口', true); return; }
+    await post('/api/proxy-pool', body);
+    closeProxyForm();
+    await Promise.all([loadProxies(), refresh(true)]);
+    showToast(body.proxy_id ? '代理已更新' : '代理已加入号池');
+  }
+
+  async function handleProxyAction(button) {
+    const action = button.dataset.proxyAction;
+    const proxyId = button.dataset.proxyId;
+    const proxy = state.proxies.find((row) => String(row.proxy_id) === proxyId);
+    if (!proxy) return;
+
+    if (action === 'edit') { openProxyForm(proxy); return; }
+    if (action === 'delete'
+      && !global.confirm(`从代理号池移除「${proxy.label || proxy.endpoint}」？\n已下发到 AdsPower 环境的代理配置不会被回滚。`)) return;
+
+    let path;
+    const body = { proxy_id: proxyId };
+    if (action === 'check') path = '/api/proxy-pool/check';
+    if (action === 'toggle') { path = '/api/proxy-pool/toggle'; body.disabled = !proxy.disabled; }
+    if (action === 'delete') path = '/api/proxy-pool/delete';
+    if (action === 'apply') {
+      const options = state.accounts.map((a) => `${a.user_id} (${a.name || '未命名'})`).join('\n');
+      const value = global.prompt(
+        '把这条代理下发到哪个 AdsPower 环境？（填 user_id）\n'
+        + '注意：AdsPower 在浏览器启动时读代理，已经开着的窗口要关掉重开才换出口。\n\n'
+        + `号池里的环境：\n${options || '（号池为空）'}`,
+        proxy.bound_user_id || '');
+      if (value === null) return;
+      const userId = value.trim().split(' ')[0];
+      if (!userId) { showToast('请填写要下发到的环境 user_id', true); return; }
+      path = '/api/proxy-pool/apply';
+      body.user_id = userId;
+    }
+    if (!path) return;
+
+    const original = button.textContent;
+    button.disabled = true;
+    if (action === 'check') button.textContent = '检测中…';
+    try {
+      const res = await post(path, body);
+      await Promise.all([loadProxies(), refresh(true)]);
+      if (action === 'check') {
+        showToast(`代理可用，出口 IP ${(res.proxy || {}).exit_ip || '未知'}`);
+      } else if (action === 'apply') {
+        showToast(res.message || '代理已下发');
+      } else {
+        showToast('代理号池已更新');
+      }
+    } catch (error) {
+      if (action === 'check') await loadProxies();  // 失败原因已写进池子，重新拉一次展示
+      showToast(`操作失败：${error.message}`, true);
+    } finally {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+
   function renderTimeline(task) {
     const rows = task.timeline || [];
     if (!rows.length) return '<div class="fx-empty">暂无阶段记录</div>';
@@ -500,6 +703,13 @@
     }).join('');
   }
 
+  // renderAccounts 之后必须补一次：配置表单和号池是两条独立的加载链（loadConfig /
+  // refresh），先到的那条渲染时另一条的数据可能还没回来。
+  function renderAccountsAndSyncConfig(accounts) {
+    renderAccounts(accounts);
+    syncAccountConfigFields();
+  }
+
   async function refresh(silent) {
     if (state.loading) return;
     state.loading = true;
@@ -510,8 +720,9 @@
         api('/api/google-fx/status'),
         api('/api/account-pool')
       ]);
+      // 账号先渲染：renderStatus 里的「序列默认环境」要拿号池的命名来显示
+      renderAccountsAndSyncConfig(pool.accounts || []);
       renderStatus(status);
-      renderAccounts(pool.accounts || []);
       if (!silent) showToast('Google FX 状态已刷新');
     } catch (error) {
       setCard('fx-runtime', '读取失败', error.message, 'bad');
@@ -524,8 +735,37 @@
 
   // ── 运行配置（按 schema 分组渲染，如实标注需重启的字段）──────────────────
 
+  // 'account' 型配置（如序列生成默认浏览器环境）的候选来自号池，不是 schema 里的
+  // 固定 options——号池是会变的运行时数据。已存的值若已不在池子里也要留在列表里
+  // 并标出来，否则一次保存就会把用户配的环境静默清空。
+  function accountOptionsHtml(selected) {
+    const current = String(selected ?? '');
+    const rows = (state.accounts || []).map((account) => {
+      const uid = String(account.user_id);
+      const serial = account.serial_number ? `[#${esc(account.serial_number)}] ` : '';
+      return `<option value="${esc(uid)}"${uid === current ? ' selected' : ''}>`
+        + `${serial}${esc(account.name || uid)}</option>`;
+    });
+    if (current && !(state.accounts || []).some((a) => String(a.user_id) === current)) {
+      rows.push(`<option value="${esc(current)}" selected>${esc(current)}（已不在号池）</option>`);
+    }
+    return `<option value=""${current ? '' : ' selected'}>自动（按号池选号）</option>` + rows.join('');
+  }
+
+  function syncAccountConfigFields() {
+    if (typeof document === 'undefined') return;
+    document.querySelectorAll('select[data-config-account]').forEach((select) => {
+      if (document.activeElement === select) return;  // 用户正在选，别把它重建掉
+      select.innerHTML = accountOptionsHtml(select.value);
+    });
+  }
+
   function configFieldHtml(key, spec, value) {
     const label = `${esc(spec.label || key)}${spec.hot ? '' : ' <span class="fx-restart-tag">需重启</span>'}`;
+    if (spec.type === 'account') {
+      return `<label class="fx-config-field"><span>${label}</span>
+        <select data-config-key="${esc(key)}" data-config-account="1">${accountOptionsHtml(value)}</select></label>`;
+    }
     if (spec.type === 'bool') {
       return `<label class="fx-config-field"><span>${label}</span>
         <input type="checkbox" data-config-key="${esc(key)}" ${value ? 'checked' : ''}></label>`;
@@ -600,6 +840,11 @@
       versions: result.versions, audit: []
     });
     await refresh(true);
+    // 被别的配置项压住的字段排在"需重启"前面报：重启能解决，互相打架不能。
+    if ((result.inert || []).length) {
+      showToast(`已保存，但当前配置下跑不起来 —— ${result.inert.join('；')}`, true);
+      return;
+    }
     if ((result.restart_required || []).length) {
       showToast(`已保存，但这些字段要重启服务才生效：${result.restart_required.join('、')}`, true);
       return;
@@ -656,27 +901,57 @@
     const host = $('fx-probe-result');
     if (!host) return;
     const summary = probe.summary || {};
-    const broken = (probe.families || []).filter((row) => row.state === 'missing');
-    const fallback = (probe.families || []).filter((row) => row.state === 'fallback');
+    const rows = probe.families || [];
+    const broken = rows.filter((row) => row.state === 'missing');
+    const fallback = rows.filter((row) => row.state === 'fallback');
+    // conditional = 只在弹窗/菜单/落地页等其它页面状态才存在的族。探针是单页快照，
+    // 它们在工作台页未命中属于正常。折叠展示而不是丢掉——静默吞掉的话，这些族真
+    // 坏了也看不出来。
+    const conditional = rows.filter((row) => row.state === 'conditional');
     host.innerHTML = `
       <div class="fx-probe-summary">
         <span class="fx-badge fx-badge-${broken.length ? 'bad' : 'good'}">失效 ${summary.missing || 0}</span>
         <span class="fx-badge fx-badge-${fallback.length ? 'warn' : 'good'}">靠兜底 ${summary.fallback || 0}</span>
         <span class="fx-badge fx-badge-good">主选择器 ${summary.primary || 0}</span>
+        <span class="fx-badge fx-badge-muted">条件性 ${summary.conditional || 0}</span>
         <span>选择器版本 ${esc(probe.selector_version || '—')}</span>
       </div>
       ${broken.length ? `<div class="fx-probe-list">${broken.map((row) =>
         `<div class="fx-diagnostic" data-level="error">${esc(row.group)}.${esc(row.family)} 全 ${row.total_layers} 层均未命中</div>`).join('')}</div>` : ''}
       ${fallback.length ? `<div class="fx-probe-list">${fallback.map((row) =>
-        `<div class="fx-diagnostic" data-level="warn">${esc(row.group)}.${esc(row.family)} 命中第 ${row.hit_index + 1} 层兜底</div>`).join('')}</div>` : ''}`;
+        `<div class="fx-diagnostic" data-level="warn">${esc(row.group)}.${esc(row.family)} 命中第 ${row.hit_index + 1} 层兜底</div>`).join('')}</div>` : ''}
+      ${conditional.length ? `<details class="fx-probe-conditional">
+        <summary>条件性未命中 ${conditional.length} 项（当前页面状态下本就不存在，非故障）</summary>
+        <div class="fx-probe-list">${conditional.map((row) =>
+          `<div class="fx-diagnostic">${esc(row.group)}.${esc(row.family)}${
+            row.probed_via ? ` 在「${esc(row.probed_via)}」下仍未命中` : ` 全 ${row.total_layers} 层均未命中`}</div>`).join('')}</div>
+      </details>` : ''}
+      ${renderDeepScenarios(probe.deep_scenarios)}`;
   }
 
-  async function runSelectorProbe() {
+  // deep 模式下每个场景的开关结果。场景打不开本身就是信号（比如账号菜单触发器
+  // 失效），必须显示出来，不能只看族的命中状态。
+  function renderDeepScenarios(scenarios) {
+    if (!scenarios || !scenarios.length) return '';
+    return `<div class="fx-probe-list">${scenarios.map((entry) => {
+      if (entry.error || !entry.opened) {
+        return `<div class="fx-diagnostic" data-level="error">场景「${esc(entry.scenario)}」没能打开：${esc(entry.error || '未知原因')}</div>`;
+      }
+      const detail = (entry.families || [])
+        .map((f) => `${esc(f.family)}=${esc(f.state)}`).join('，') || '无目标族';
+      const bad = (entry.families || []).some((f) => f.state === 'missing');
+      return `<div class="fx-diagnostic" data-level="${bad ? 'error' : 'ok'}">场景「${esc(entry.scenario)}」已打开 · ${detail}</div>`;
+    }).join('')}</div>`;
+  }
+
+  async function runSelectorProbe(deep) {
     triggerHighFreq(30000);
     const host = $('fx-probe-result');
-    if (host) host.innerHTML = '<div class="fx-empty">正在连接浏览器跑选择器探针…</div>';
+    if (host) {
+      host.innerHTML = `<div class="fx-empty">正在连接浏览器跑${deep ? '深度' : ''}选择器探针…</div>`;
+    }
     try {
-      renderSelectorProbe(await post('/api/google-fx/selector-probe', {}));
+      renderSelectorProbe(await post('/api/google-fx/selector-probe', deep ? { deep: true } : {}));
     } catch (error) {
       if (host) host.innerHTML = `<div class="fx-diagnostic" data-level="error">${esc(error.message)}</div>`;
       showToast(`选择器探针失败：${error.message}`, true);
@@ -1078,42 +1353,50 @@
       finally { button.disabled = false; }
     });
 
+    // ⚠️ 这四个（以及下面「应用限额」）过去在 finally 里写 event.currentTarget：
+    // 事件派发结束后 currentTarget 会被置空，而这些处理器一 await 就已经"结束"了，
+    // 于是 finally 抛 TypeError、按钮永远停在 disabled——保存一次配置之后「保存配置」
+    // 就再也点不动了。改成进函数时先把按钮引用存下来。
     $('fx-config-save')?.addEventListener('click', async (event) => {
-      event.currentTarget.disabled = true;
+      const button = event.currentTarget;
+      button.disabled = true;
       try { await saveConfig(); }
       catch (error) { showToast(`保存失败：${error.message}`, true); }
-      finally { event.currentTarget.disabled = false; }
+      finally { button.disabled = false; }
     });
     $('fx-config-rollback')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
       if (!global.confirm('回滚到上一个配置版本？可以连续回滚，也可以重做。')) return;
-      event.currentTarget.disabled = true;
+      button.disabled = true;
       try {
         await post('/api/google-fx/config', { action: 'rollback' });
         await Promise.all([loadConfig(), refresh(true)]);
         showToast('已回滚一个版本');
       } catch (error) { showToast(`回滚失败：${error.message}`, true); }
-      finally { event.currentTarget.disabled = false; }
+      finally { button.disabled = false; }
     });
     $('fx-config-redo')?.addEventListener('click', async (event) => {
-      event.currentTarget.disabled = true;
+      const button = event.currentTarget;
+      button.disabled = true;
       try {
         await post('/api/google-fx/config', { action: 'redo' });
         await Promise.all([loadConfig(), refresh(true)]);
         showToast('已重做一个版本');
       } catch (error) { showToast(`重做失败：${error.message}`, true); }
-      finally { event.currentTarget.disabled = false; }
+      finally { button.disabled = false; }
     });
     $('fx-config-restore')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
       const select = $('fx-config-versions');
       if (!select || !select.value) { showToast('请先选择一个版本', true); return; }
       if (!global.confirm('恢复到选中的配置版本？')) return;
-      event.currentTarget.disabled = true;
+      button.disabled = true;
       try {
         await post('/api/google-fx/config', { action: 'restore', version_id: select.value });
         await Promise.all([loadConfig(), refresh(true)]);
         showToast('已恢复到选中版本');
       } catch (error) { showToast(`恢复失败：${error.message}`, true); }
-      finally { event.currentTarget.disabled = false; }
+      finally { button.disabled = false; }
     });
 
     [0, 1, 2].forEach((level) => {
@@ -1123,7 +1406,12 @@
         runSelftest(level);
       });
     });
-    $('fx-run-probe')?.addEventListener('click', runSelectorProbe);
+    $('fx-run-probe')?.addEventListener('click', () => runSelectorProbe(false));
+    $('fx-run-deep-probe')?.addEventListener('click', () => {
+      // 深度探测会真的点击线上页面（开账号菜单、开配置面板），先问一句。
+      if (!confirm('深度探测会在浏览器里点开账号菜单和配置面板，随后按 Escape 收尾。确认继续？')) return;
+      runSelectorProbe(true);
+    });
     $('fx-reset-selector-stats')?.addEventListener('click', async () => {
       if (!global.confirm('清空选择器命中统计？修好选择器后清一次，漂移警告才会消失。')) return;
       try {
@@ -1194,6 +1482,38 @@
     $('fx-account-table-body')?.addEventListener('click', (event) => {
       const button = event.target.closest('button[data-action]');
       if (button) handleAccountAction(button);
+    });
+    $('fx-proxy-table-body')?.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-proxy-action]');
+      if (button) handleProxyAction(button);
+    });
+    $('fx-proxy-refresh')?.addEventListener('click', async () => {
+      await loadProxies();
+      showToast('代理号池已刷新');
+    });
+    $('fx-proxy-toggle-form')?.addEventListener('click', () => {
+      const form = $('fx-proxy-form');
+      if (form && !form.hidden && !state.proxyEditingId) closeProxyForm();
+      else openProxyForm(null);
+    });
+    $('fx-proxy-cancel')?.addEventListener('click', closeProxyForm);
+    $('fx-proxy-save')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try { await saveProxy(); }
+      catch (error) { showToast(`保存失败：${error.message}`, true); }
+      finally { button.disabled = false; }
+    });
+    $('fx-proxy-import')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const result = await post('/api/proxy-pool/import-legacy', {});
+        await Promise.all([loadProxies(), refresh(true)]);
+        showToast(result.message
+          || `导入完成：新增 ${result.added || 0} 条，跳过 ${result.skipped || 0} 条`);
+      } catch (error) { showToast(`导入失败：${error.message}`, true); }
+      finally { button.disabled = false; }
     });
     $('fx-task-table-body')?.addEventListener('click', (event) => {
       const button = event.target.closest('[data-task-action]');
@@ -1320,6 +1640,7 @@
     refresh(true);
     loadConfig();
     loadProfiles(false);
+    loadProxies();
     loadCaptures();
     loadAudit();
     loadLogs();
@@ -1333,9 +1654,9 @@
   }
 
   const apiObject = {
-    init, activate, deactivate, refresh, accountState, taskTypeLabel,
+    init, activate, deactivate, refresh, accountState, proxyState, taskTypeLabel,
     creditLabel, formatDuration, runSelftest, runSelectorProbe,
-    renderMarkdown, openManual, closeManual
+    renderMarkdown, openManual, closeManual, loadProxies
   };
   global.GoogleFxConsole = apiObject;
   if (typeof module !== 'undefined' && module.exports) module.exports = apiObject;

@@ -69,6 +69,44 @@ def test_selector_probe_marks_conditional_families_as_not_broken():
     assert all(row['family'] != 'prompt_input' for row in conditional)
 
 
+def test_selector_probe_does_not_fail_idle_page_for_dialog_only_controls():
+    """配置面板/落地页等只在别的页面状态存在的族，缺失不应让 L1 静止页自检失败。"""
+    probe = probe_selectors(FakePage())
+    contextual = {
+        row['family']: row['state'] for row in probe['families']
+        if row['family'] in {'config_panel_root', 'flow_entry_btn', 'credit_display'}
+    }
+    assert contextual == {
+        'config_panel_root': 'conditional',
+        'flow_entry_btn': 'conditional',
+        'credit_display': 'conditional',
+    }
+    assert probe['summary']['missing'] == 0
+
+
+def test_probed_families_are_all_consumed_by_production_code():
+    """探针只该探生产代码真读的族。
+
+    历史上 UI_SELECTORS 攒了一堆没有任何消费者的族（旧上传路径、旧错误横幅、
+    甚至几张被当成选择器探测的文本关键词表），探针把它们一并报成"失效"，把
+    面板变成了噪音。这条用例把"字典里的族"和"代码里读的族"钉在一起，防止再漂。
+    """
+    import re
+    from pathlib import Path
+    from integrations.google_fx.ui_selectors import UI_SELECTORS
+    from integrations.google_fx.services.google_fx_diagnostics import _NON_SELECTOR_FAMILIES
+
+    root = Path(__file__).resolve().parent.parent / 'integrations' / 'google_fx'
+    sources = [p for p in root.rglob('*.py')
+               if p.name not in {'ui_selectors.py', 'google_fx_diagnostics.py'}]
+    blob = '\n'.join(p.read_text(encoding='utf-8', errors='ignore') for p in sources)
+
+    probed = [f for f, v in UI_SELECTORS['google_fx'].items()
+              if isinstance(v, (list, tuple)) and f not in _NON_SELECTOR_FAMILIES]
+    orphans = [f for f in probed if not re.search(r'\b%s\b' % re.escape(f), blob)]
+    assert not orphans, f'这些族没有任何生产消费者，应该删掉或接上：{orphans}'
+
+
 # ── D2：失败取证 ─────────────────────────────────────────────────────────────
 
 def test_capture_writes_screenshot_dom_and_meta(tmp_path, monkeypatch):
