@@ -56,10 +56,28 @@ def clean_path(path_str):
                 log(f"⚠️ 路径不存在，已按文件名自动纠偏: '{normalized}' -> '{matches[0]}'", "路径修复")
                 return matches[0]
             if len(matches) > 1:
-                preferred = [m for m in matches if normalized.endswith(os.sep + os.path.basename(os.path.dirname(m)) + os.sep + basename)]
-                picked = preferred[0] if preferred else matches[0]
-                log(f"⚠️ 路径不存在，发现 {len(matches)} 个同名文件，已选用: '{picked}'", "路径修复")
-                return picked
+                # 🚨 纠偏必须锁定到同一个项目目录。每个项目的帧都叫 img_001.webp，
+                # 只按 basename（甚至只按「上一级目录叫 frames」）去挑，等于在几十个
+                # 项目里随手抓一张同名图——视频链会把**别的项目的帧**当成本段的首尾
+                # 锚点传上去，生成一段跟本片毫无关系的片段（下载后靠锚点 MAD 才被
+                # 拒收，重试还会再抓同一张，永远修不好）。
+                # 所以这里只认「项目目录/子目录/文件名」三段尾巴完全一致的候选；
+                # 认不出来就如实返回原路径（= 文件缺失），交给上游的缺帧闸门处理。
+                tail = os.path.join(
+                    os.path.basename(os.path.dirname(os.path.dirname(normalized))),
+                    os.path.basename(os.path.dirname(normalized)),
+                    basename,
+                )
+                preferred = [m for m in matches if m.endswith(os.sep + tail)] if os.sep in tail else []
+                if len(preferred) == 1:
+                    log(f"⚠️ 路径不存在，已按项目内同名文件纠偏: '{normalized}' -> '{preferred[0]}'", "路径修复")
+                    return preferred[0]
+                log(
+                    f"⚠️ 路径不存在，且 {len(matches)} 个同名文件分属不同项目，"
+                    f"无法安全纠偏（拒绝随手挑一张，避免张冠李戴）: '{normalized}'",
+                    "路径修复",
+                )
+                return normalized
     except Exception as e:
         log(f"⚠️ 路径自动纠偏失败: {e}", "路径修复")
 
@@ -502,12 +520,43 @@ def _browser_session_is_closed(page) -> bool:
     return False
 
 
-def ensure_flow_workspace(page, timeout_seconds: float = 30.0) -> bool:
+def attempt_auto_login(page, user_id=None, context_label="Flow导航", cancel_check=None):
+    """掉登录时先试一次自动登录，成功返回 True。
+
+    薄封装，存在的理由是"惰性 import + 异常隔离"这两件事在三个调用点重复：
+    - 惰性 import：utils.auto_login 反过来要 import 本模块的 is_google_login_page，
+      模块级互相 import 会成环。
+    - 异常隔离：自动登录是**附加**能力，它自己炸掉绝不能把调用方的主流程带崩——
+      调用方原本的行为（退回等人工）必须原样保留。
+
+    没配凭据 / 熔断中 / 登录失败一律返回 False，调用方照旧走既有的人工处理路径。
+    """
+    try:
+        from . import auto_login as _auto_login
+    except Exception as e:
+        log(f"⚠️ 自动登录模块不可用（{type(e).__name__}: {e}），按需人工处理", context_label)
+        return False
+    try:
+        if not _auto_login.auto_login_available(user_id):
+            return False
+        return bool(_auto_login.try_auto_login(
+            page, user_id=user_id, cancel_check=cancel_check,
+            context_label=context_label))
+    except Exception as e:
+        log(f"⚠️ 自动登录过程异常（{type(e).__name__}: {e}），退回等待人工处理", context_label)
+        return False
+
+
+def ensure_flow_workspace(page, timeout_seconds: float = 30.0, user_id=None) -> bool:
     """若账号停在 Flow 产品介绍页，点击首屏 CTA 进入真正工作台。
 
     页面同时渲染首屏和页尾两个同文案按钮；不能盲点 `.first`。这里选择纵坐标
     最小的可见按钮（即用户截图红框处），点击后必须看到可见输入框或“新建项目”
     才算成功。已经在工作台时为幂等空操作。
+
+    user_id：撞上登录页时用它去取凭据自动重登。**积分探针这类显式指定账号的
+    调用方必须传**——省略时按 account_binding 解析当前上下文，而探针并不绑定
+    上下文账号，会拿到进程默认账号的凭据去登另一个号。
     """
     try:
         from ..ui_selectors import UI_SELECTORS
@@ -517,11 +566,20 @@ def ensure_flow_workspace(page, timeout_seconds: float = 30.0) -> bool:
 
     deadline = time.monotonic() + max(1.0, float(timeout_seconds))
     clicked = False
+    auto_login_tried = False
     while time.monotonic() < deadline:
         if _browser_session_is_closed(page):
             raise BrowserSessionClosedError(
                 "AdsPower 浏览器或 Flow 标签页已关闭，积分探测已立即停止")
         if is_google_login_page(page):
+            # 每次 ensure_flow_workspace 只自动登录一次：失败了在同一个循环里
+            # 反复重试等于绕开 auto_login 内部那套"最多提交一次密码"的护栏。
+            if not auto_login_tried:
+                auto_login_tried = True
+                if attempt_auto_login(page, user_id=user_id, context_label="Flow导航"):
+                    # 登录成功后页面通常已经跳回 Flow，但可能落在产品介绍页，
+                    # 所以不直接 return True，交给下一轮循环照常判定工作台。
+                    continue
             log("🔒 检测到 Google 登录页面，无法自动进入工作台，提示人工处理登录", "Flow导航")
             return False
         if flow_onboarding_required(page):

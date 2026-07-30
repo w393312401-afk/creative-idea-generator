@@ -263,6 +263,7 @@
           'credit_probe': '账号积分探针 (credit_probe)',
           'selector_probe': '选择器探针 (selector_probe)',
           'selftest': '环境自检 (selftest)',
+          'auto_login': '账号自动登录 (auto_login)',
           'frames': '图片/帧序列生成 (frames)',
           'videos': '视频生成 (videos)',
         };

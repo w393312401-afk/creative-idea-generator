@@ -49,6 +49,8 @@ from .google_fx_helpers import (
     click_fx_send_button,
     _ensure_output_dir,
     _get_panel_uuids,
+    _get_panel_uuid_order,
+    _fill_prompt_text,
     _normalize_model_name,
     wait_out_manual_intervention,
     _ManualInterventionTimeoutError,
@@ -74,6 +76,9 @@ from .google_fx_helpers import (
 # 记忆文档；确认 Flow 严格保序后，可将此常量改回 True 以恢复打包上传的速度。
 _ENABLE_BULK_CANVAS_UPLOAD = False
 
+# 采信"去重上传 UUID"之前必须等待的宽限秒数，见 _upload_image_to_canvas 第 3 步注释。
+_DEDUP_ATTRIBUTION_GRACE_SECONDS = 12
+
 
 def _upload_image_to_canvas(page, local_path, timeout=45, extra_known_uuids=None):
     """
@@ -94,9 +99,11 @@ def _upload_image_to_canvas(page, local_path, timeout=45, extra_known_uuids=None
         log(f"  ❌ Canvas 上传: 点击 Create 失败: {e}", "GoogleFX")
         return None
 
-    known_uuids = _get_panel_uuids(page)
-    if extra_known_uuids:
-        known_uuids = known_uuids.union(extra_known_uuids)
+    # assigned = 本轮已经被别的本地文件占用的 UUID。它和"画布上本来就有的 UUID"
+    # 必须分开记：前者一旦被当成本次上传的结果，就是明确的张冠李戴（两张不同的
+    # 帧图指向同一张画布图）；后者有可能是 Flow 按内容去重返回的合法结果。
+    assigned_uuids = {u for u in (extra_known_uuids or []) if u}
+    known_uuids = _get_panel_uuids(page).union(assigned_uuids)
 
     file_input = None
     for _fi_sel in ["input[type='file']", "input[accept*='image']"]:
@@ -155,7 +162,9 @@ def _upload_image_to_canvas(page, local_path, timeout=45, extra_known_uuids=None
 
         log("  ⏳ 等待上传图片出现在画布...", "GoogleFX")
         new_uuid = None
-        deadline = time.time() + timeout
+        started = time.time()
+        deadline = started + timeout
+        ambiguity_logged = False
         while time.time() < deadline:
             # 1. 优先从网络拦截中寻找新 UUID
             dedup_candidate = None
@@ -167,26 +176,49 @@ def _upload_image_to_canvas(page, local_path, timeout=45, extra_known_uuids=None
                         new_uuid = uuid_cand
                         log(f"  🎉 通过网络捕获到新上传图片 UUID={new_uuid[:16]}...", "GoogleFX")
                         break
-                    else:
+                    if uuid_cand not in assigned_uuids:
+                        # 只有"画布上本来就有、且没被本轮别的文件占用"的 UUID 才有资格
+                        # 当去重候选。被占用的直接丢弃：那是别人的图。
                         dedup_candidate = uuid_cand
             if new_uuid:
                 break
-            if dedup_candidate:
+
+            # 2. 兜底通过 DOM 扫描（文档顺序）找本次新增的卡片
+            fresh = [u for u in _get_panel_uuid_order(page) if u not in known_uuids]
+            if len(fresh) == 1:
+                new_uuid = fresh[0]
+                log(f"  🎉 通过 DOM 扫描到上传图片: UUID={new_uuid[:16]}...", "GoogleFX")
+                break
+            if len(fresh) > 1 and not ambiguity_logged:
+                ambiguity_logged = True
+                # 同一次上传期间冒出多张新卡片（常见于上一张图的卡片渲染迟到）：
+                # 无法判断哪一张才是刚传上去的这一张。这里绝不猜——猜错就是把别的
+                # 帧安到这个槽位上，最后生成一段首尾帧完全对不上的视频。
+                log(
+                    f"  ⚠️ 画布同时出现 {len(fresh)} 张新图，无法确定 "
+                    f"{os.path.basename(abs_path)} 对应哪一张，继续等待稳定...",
+                    "GoogleFX",
+                )
+
+            # 3. 最后才考虑去重候选：必须等够宽限期、确认不会再有新 UUID 出现。
+            # 上传等待期间画布已有缩略图随时可能被重新拉取一次，那条响应和真正的
+            # 上传响应长得一模一样——之前无条件采信它，就是"img_002 被安上 img_001
+            # 的 UUID"这类首尾帧错乱的根因。
+            if dedup_candidate and not fresh \
+                    and time.time() - started >= _DEDUP_ATTRIBUTION_GRACE_SECONDS:
                 new_uuid = dedup_candidate
                 log(f"  🎉 通过网络捕获到去重上传图片 UUID={new_uuid[:16]}...", "GoogleFX")
-                break
-
-            # 2. 兜底通过 DOM 扫描对比 UUID 集合
-            cur_uuids = _get_panel_uuids(page)
-            new_uuids = cur_uuids - known_uuids
-            if new_uuids:
-                new_uuid = next(iter(new_uuids))
-                log(f"  🎉 通过 DOM 扫描到上传图片: UUID={new_uuid[:16]}...", "GoogleFX")
                 break
             time.sleep(1)
     finally:
         page.remove_listener("response", handle_response)
 
+    if not new_uuid:
+        log(
+            f"  ❌ Canvas 上传: 无法确定 {os.path.basename(abs_path)} 的画布 UUID"
+            f"（超时或归属不明），按上传失败处理",
+            "GoogleFX",
+        )
     _safe_press_escape(page, "Canvas 上传关闭对话框")
     return new_uuid
 
@@ -448,28 +480,14 @@ def _generate_video_google_fx(req: VideoRequest):
             if not input_el:
                 raise RuntimeError("无法找到视频提示词输入框")
 
-            # 填充提示词
-            input_el.click()
-            random_sleep(0.3, 0.5)
-            page.keyboard.press("ControlOrMeta+a")
-            random_sleep(0.1, 0.2)
-            page.keyboard.press("Backspace")
-            random_sleep(0.2, 0.3)
-
-            page.evaluate("""(text) => {
-                const editor = document.querySelector('[data-slate-editor="true"]');
-                if (editor) {
-                    editor.focus();
-                    const event = new InputEvent('beforeinput', {
-                        inputType: 'insertText',
-                        data: text,
-                        bubbles: true,
-                        cancelable: true,
-                        composed: true
-                    });
-                    editor.dispatchEvent(event);
-                }
-            }""", req.prompt)
+            # 填充提示词。
+            # 🚨 这里原本是「Ctrl+A → Backspace → 再写入」——在 Slate 编辑器里，
+            # 刚挂上的首尾帧 chip 和文本是同一棵树，全选删除会把 chip 一起删掉，
+            # 于是提交出去的是一个没有参考图的纯文本请求，Flow 安静地按文生视频
+            # 生成一段无关片段。改走与批量链同一个 _fill_prompt_text：有参考图时
+            # 只在末尾追加，不清空。
+            if not _fill_prompt_text(page, input_el, req.prompt, has_refs=prompt_has_refs):
+                raise RuntimeError("视频提示词输入失败")
             random_sleep(0.5, 0.8)
 
             log("🔍 准备生成并扫描资源...", "GoogleFX-Video")
@@ -658,6 +676,8 @@ class _ChunkRunner:
         self.path_to_uuid = {}
         self.gen_retry_used = 0
         self.ip_retry = 0
+        # 内容校验拒收过的画布卡片：重试轮认领时必须跳过（见 _adopt_completed_tiles）
+        self.rejected_tile_ids = set()
         # 失败换号重试：本 chunk 已经试过（并被判过封）的号池账号，换号时排除，
         # 免得在同一批里换回刚被判异常活动的那个号。
         self.tried_accounts = set()
@@ -933,6 +953,14 @@ class _ChunkRunner:
         canvas_tiles = _scan_canvas_tiles(page)
         if not canvas_tiles:
             return [], remaining
+        # 被锚点校验拒收过的卡片留在画布上，提示词切片当然还匹配得上——不排除的话
+        # 重试轮会把同一段废片重新认领、重新下载、重新被拒，整轮重试等于空转。
+        if self.rejected_tile_ids:
+            canvas_tiles = [
+                t for t in canvas_tiles
+                if t.get('tileId') not in self.rejected_tile_ids
+                and (t.get('originalTileId') or t.get('tileId')) not in self.rejected_tile_ids
+            ]
 
         adopted = []
         still_remaining = []
@@ -1025,8 +1053,10 @@ class _ChunkRunner:
                 f"仍需上传 {len(unique_images)} 张", "GoogleFX-Video")
         if not unique_images:
             log("✅ 本轮参考图全部复用画布已有资产，无需上传", "GoogleFX-Video")
+            self._drop_colliding_uuid_mappings(path_to_uuid)
             return path_to_uuid
 
+        wanted_total = len(path_to_uuid) + len(unique_images)
         total_images = len(unique_images)
         total_groups = (total_images + UPLOAD_GROUP_SIZE - 1) // UPLOAD_GROUP_SIZE
         log(f"📤 开始分组上传该批次共 {total_images} 张参考图（每组最多 {UPLOAD_GROUP_SIZE} 张，共 {total_groups} 组）...", "GoogleFX-Video")
@@ -1073,7 +1103,16 @@ class _ChunkRunner:
                     extra_known = set(path_to_uuid.values()) if path_to_uuid else None
                     uuid = _upload_image_to_canvas(page, real_path, extra_known_uuids=extra_known)
                     if not uuid:
-                        raise RuntimeError(f"图片 {os.path.basename(real_path)} 上传到画布失败")
+                        # 上传失败 / UUID 归属不明：不写映射，也不炸整批。缺哪张帧
+                        # 就只拦下用到那张帧的片段（见 _submit_tasks 的锚点闸门），
+                        # 其余片段照常提交；重试轮会重新上传这一张。
+                        log(
+                            f"❌ 参考图 {os.path.basename(real_path)} 未能取得可信的画布 UUID，"
+                            f"本轮不建立映射——用到这张帧的片段会被拦下重试，"
+                            f"不会退化成没有首尾帧的文生视频",
+                            "GoogleFX-Video",
+                        )
+                        continue
                     path_to_uuid[img_path] = uuid
                     # 即时写回跨轮缓存：即使本轮中途被封中止，已传的图下一轮也能复用
                     self.path_to_uuid[img_path] = uuid
@@ -1088,8 +1127,35 @@ class _ChunkRunner:
             if group_start + UPLOAD_GROUP_SIZE < total_images:
                 random_sleep(1.0, 2.0)
 
-        log("✅ 当前批次所有参考图已成功上传并就绪", "GoogleFX-Video")
+        self._drop_colliding_uuid_mappings(path_to_uuid)
+        log(
+            f"✅ 当前批次参考图上传完毕（{len(path_to_uuid)}/{wanted_total} 张已建立可信映射）",
+            "GoogleFX-Video",
+        )
         return path_to_uuid
+
+    def _drop_colliding_uuid_mappings(self, path_to_uuid):
+        """归属自检：两张不同的本地图不允许映射到同一个画布 UUID。
+
+        起止帧复用同一张图的任务也走两个独立 UUID（见 _DUP_END_REF_KEY_SUFFIX），
+        所以映射表里的 UUID 本就应当两两不同。一旦撞车，说明某一张图的归属判错了，
+        但撞车本身分不出是哪一张错——两条都作废（并清掉跨轮缓存，免得下一轮继续
+        复用这个错误映射），让用到它们的片段走"锚点未就绪"闸门重试。"""
+        counts = {}
+        for uid in path_to_uuid.values():
+            counts[uid] = counts.get(uid, 0) + 1
+        collided = {uid for uid, n in counts.items() if n > 1}
+        if not collided:
+            return
+        for key in [k for k, uid in path_to_uuid.items() if uid in collided]:
+            path_to_uuid.pop(key, None)
+            self.path_to_uuid.pop(key, None)
+        log(
+            f"🚨 检测到 {len(collided)} 个画布 UUID 被多张参考图共用（上传归属出错），"
+            f"已作废相关映射并清除跨轮缓存；受影响的片段会被拦下重试，"
+            f"绝不带着错误的首尾帧提交",
+            "GoogleFX-Video",
+        )
 
     # ── 相位 4: 依次提交任务（不等待生成完成） ──
 
@@ -1161,6 +1227,38 @@ class _ChunkRunner:
                 f"尾帧={os.path.basename(_end_path) if _end_path else '无'}→{(_end_uuid or '未匹配')[:12]}",
                 "GoogleFX-Video",
             )
+
+            # 🚧 锚点闸门：声明了锚点帧的片段，必须带着锚点帧提交。
+            # Flow 对"没有参考图的视频请求"不会报错——它会安静地按纯文本生成一段
+            # 内容完全无关的片段（文生视频），一路走到下载后做锚点比对才被拒收，
+            # 白烧一次生成额度、白等十几分钟。所以帧映射不完整时就地判失败，
+            # 交给失败重试轮重新上传重来，绝不提交。
+            anchor_err = ""
+            if _start_path and not _start_uuid:
+                anchor_err = f"首帧 {os.path.basename(_start_path)} 没有可信的画布 UUID"
+            elif _end_path and not _end_uuid:
+                anchor_err = f"尾帧 {os.path.basename(_end_path)} 没有可信的画布 UUID"
+            elif _start_path and _end_path and _start_path != _end_path \
+                    and _start_uuid and _start_uuid == _end_uuid:
+                anchor_err = (
+                    f"首尾帧（{os.path.basename(_start_path)} / {os.path.basename(_end_path)}）"
+                    f"映射到了同一个画布 UUID，上传归属出错"
+                )
+            if anchor_err:
+                message = f"锚点帧未就绪，拒绝提交（避免退化成无首尾帧的文生视频）: {anchor_err}"
+                log(f"🚫 任务 {idx + 1} {message}", "GoogleFX-Video")
+                submitted.append({
+                    "sub_idx": sub_idx,
+                    "idx": idx,
+                    "req": req,
+                    "tile_id": None,
+                    "click_time": time.time(),
+                    "status": "failed",
+                    "video_url": None,
+                    "message": message,
+                })
+                self._notify(idx, 'video_error', {'message': message})
+                continue
 
             try:
                 task_info = _submit_video_to_canvas(
@@ -1322,6 +1420,8 @@ class _ChunkRunner:
                 if cb_ret == 'rejected':
                     log(f"🚫 任务 {idx + 1} 下载内容未通过锚点校验，标记失败待重试", "GoogleFX-Video")
                     self.completed.discard(sub_idx)
+                    if task.get("tile_id"):
+                        self.rejected_tile_ids.add(task["tile_id"])
                     item_result = {
                         "status": "failed",
                         "video_url": None,

@@ -11,6 +11,10 @@
 let accountPoolCache = [];
 let accountPoolProfileCache = []; // list_adspower_profiles() 结果，供选环境时把邮箱预填进"账号命名"
 let accountPoolSortKey = 'serial_asc';
+// 当前展开着凭据表单的 user_id（同时只允许一个）。存在这里而不是 DOM 里，是因为
+// renderAccountPoolList() 会把整个列表重建一遍（保存凭据后必然触发一次），
+// 状态放 DOM 上会在重建时丢失，表现为"一点保存表单就自己收起来了"。
+let accountPoolOpenCredentialId = null;
 
 function formatAccountPoolTimestamp(iso) {
     if (!iso) return '从未检查';
@@ -195,7 +199,32 @@ function renderAccountPoolList() {
         meta.textContent = `${serialText}user_id: ${account.user_id} · 积分 ${creditText}${taskText} · 上次成功: ${formatAccountPoolTimestamp(account.last_checked_at)}${probeText}${coolBadge}`;
         main.appendChild(meta);
 
+        // 只有配过凭据（或熔断了）才多占一行。号池可能有几十个账号，给每一行都挂上
+        // 「自动登录：未配置」是纯噪音——没用这个功能的人不需要被提醒 40 次，
+        // 「🔑 登录凭据」按钮的高亮状态已经把"配没配"说清楚了。
+        const loginText = describeAccountAutoLogin(account);
+        if (loginText) {
+            const loginMeta = document.createElement('div');
+            loginMeta.className = 'account-pool-meta account-pool-login-meta';
+            loginMeta.textContent = loginText;
+            main.appendChild(loginMeta);
+        }
+
         row.appendChild(main);
+
+        const credBtn = document.createElement('button');
+        credBtn.type = 'button';
+        credBtn.className = 'account-pool-mini-btn'
+            + (account.auto_login_ready ? ' is-on' : '')
+            + (account.auto_login_blocked ? ' danger' : '');
+        credBtn.textContent = '🔑 登录凭据';
+        credBtn.title = '配置掉登录后自动重新登录用的邮箱 / 密码 / 2FA 密钥';
+        credBtn.addEventListener('click', () => {
+            accountPoolOpenCredentialId =
+                accountPoolOpenCredentialId === account.user_id ? null : account.user_id;
+            renderAccountPoolList();
+        });
+        row.appendChild(credBtn);
 
         const refreshBtn = document.createElement('button');
         refreshBtn.type = 'button';
@@ -222,7 +251,261 @@ function renderAccountPoolList() {
         row.appendChild(deleteBtn);
 
         list.appendChild(row);
+
+        // 凭据表单是行的兄弟节点而不是子节点：.account-pool-row 是
+        // display:flex + align-items:center 的单行布局，把一个多行表单塞进去会把
+        // 那一行的垂直对齐全部搞乱。
+        if (accountPoolOpenCredentialId === account.user_id) {
+            list.appendChild(buildAccountCredentialForm(account));
+        }
     });
+}
+
+// ============================================================
+// 自动登录凭据
+// —— 号池账号掉登录后，用这里存的邮箱/密码/2FA 密钥自己登回去，不再停下来等人工
+//    （后端：integrations/google_fx/utils/auto_login.py）。
+//    密码与 2FA 密钥明文存在服务端 runtime/account_credentials.json，接口从不
+//    回传明文，所以前端永远只知道"有没有"，输入框留空一律表示"不修改"。
+// ============================================================
+
+// 返回空串 = 这一行不值得多占一行（没配过凭据，行为跟以前完全一样）。
+function describeAccountAutoLogin(account) {
+    if (account.auto_login_blocked) {
+        return `⛔ 自动登录已熔断（连续凭据失败）：${account.auto_login_error || '原因未记录'} — 核对凭据后可解除`;
+    }
+    if (!account.auto_login_ready) {
+        return '';
+    }
+    const parts = [`🔓 自动登录：已就绪（${account.login_email || '邮箱未知'}`
+        + `${account.has_totp ? ' · 含 2FA' : ' · 无 2FA'}）`];
+    if (account.auto_login_status === 'ok') {
+        parts.push(`上次成功 ${formatAccountPoolTimestamp(account.auto_login_at)}`);
+    } else if (account.auto_login_status === 'failed') {
+        parts.push(`⚠️ 上次失败：${account.auto_login_error || '未知原因'}`);
+    }
+    return parts.join(' · ');
+}
+
+function buildAccountCredentialForm(account) {
+    const form = document.createElement('div');
+    form.className = 'account-pool-cred-form';
+
+    const title = document.createElement('div');
+    title.className = 'account-pool-cred-title';
+    title.textContent = `🔑 ${account.name || account.user_id} 的自动登录凭据`;
+    form.appendChild(title);
+
+    const fields = document.createElement('div');
+    fields.className = 'account-pool-cred-fields';
+
+    const emailInput = document.createElement('input');
+    emailInput.type = 'text';
+    emailInput.autocomplete = 'off';
+    emailInput.placeholder = 'Google 邮箱';
+    // 邮箱是唯一会回传原文的字段。没配过凭据时用账号命名兜底——号池的命名默认就是
+    // AdsPower 环境名，而那通常正是邮箱，省掉一次手输。
+    emailInput.value = account.login_email
+        || (String(account.name || '').includes('@') ? account.name : '');
+    fields.appendChild(emailInput);
+
+    const passwordInput = document.createElement('input');
+    passwordInput.type = 'password';
+    passwordInput.autocomplete = 'new-password';
+    passwordInput.placeholder = account.has_password ? '密码（已保存，留空=不修改）' : 'Google 密码';
+    fields.appendChild(passwordInput);
+
+    const totpInput = document.createElement('input');
+    totpInput.type = 'password';
+    totpInput.autocomplete = 'new-password';
+    totpInput.placeholder = account.has_totp
+        ? '2FA 密钥（已保存，留空=不修改）'
+        : '2FA 密钥（base32，选填）';
+    totpInput.title = '在 Google 两步验证里绑定「身份验证器 App」时，二维码下方那串'
+        + ' base32 密钥（形如 abcd efgh ijkl mnop）。填了才能全自动过两步验证。';
+    fields.appendChild(totpInput);
+
+    form.appendChild(fields);
+
+    // 只有已经存了 2FA 密钥时才给"移除"入口。留空表示"不修改"，所以单靠输入框
+    // 没法表达"我要删掉已存的密钥"——需要一个显式动作。
+    let dropTotp = null;
+    if (account.has_totp) {
+        const label = document.createElement('label');
+        label.className = 'account-pool-cred-check';
+        dropTotp = document.createElement('input');
+        dropTotp.type = 'checkbox';
+        label.appendChild(dropTotp);
+        label.appendChild(document.createTextNode(' 移除已保存的 2FA 密钥（该账号已关闭两步验证时勾选）'));
+        form.appendChild(label);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'account-pool-cred-actions';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.className = 'account-pool-mini-btn';
+    saveBtn.textContent = '💾 保存';
+    saveBtn.addEventListener('click', () => saveAccountCredentials(account.user_id, {
+        email: emailInput.value,
+        password: passwordInput.value,
+        totpSecret: totpInput.value,
+        dropTotp: Boolean(dropTotp && dropTotp.checked),
+    }, saveBtn));
+    actions.appendChild(saveBtn);
+
+    const testBtn = document.createElement('button');
+    testBtn.type = 'button';
+    testBtn.className = 'account-pool-mini-btn';
+    testBtn.textContent = '🔓 测试登录';
+    testBtn.title = '立刻开一次浏览器，用存好的凭据把这个号登进去。比较慢（要走完整个登录表单）。';
+    testBtn.disabled = !account.auto_login_ready;
+    testBtn.addEventListener('click', () => testAccountLogin(account.user_id, testBtn));
+    actions.appendChild(testBtn);
+
+    if (account.auto_login_blocked) {
+        const unblockBtn = document.createElement('button');
+        unblockBtn.type = 'button';
+        unblockBtn.className = 'account-pool-mini-btn';
+        unblockBtn.textContent = '♻️ 解除熔断';
+        unblockBtn.title = '确认凭据没问题（上次失败是网络/环境原因）时点这里恢复自动登录';
+        unblockBtn.addEventListener('click', () => resetAccountLoginBreaker(account.user_id, unblockBtn));
+        actions.appendChild(unblockBtn);
+    }
+
+    if (account.auto_login_ready || account.has_totp) {
+        const clearBtn = document.createElement('button');
+        clearBtn.type = 'button';
+        clearBtn.className = 'account-pool-mini-btn danger';
+        clearBtn.textContent = '🗑️ 清除凭据';
+        clearBtn.addEventListener('click', () => deleteAccountCredentials(account.user_id, clearBtn));
+        actions.appendChild(clearBtn);
+    }
+
+    form.appendChild(actions);
+
+    const hint = document.createElement('div');
+    hint.className = 'account-pool-cred-hint';
+    hint.textContent = '密码与 2FA 密钥明文保存在本机 runtime/account_credentials.json'
+        + '（已排除出 git，文件权限收到仅本人可读），接口不会把明文回传给浏览器。'
+        + '连续 2 次凭据失败会自动熔断停止重试，避免撞错密码把账号锁掉。';
+    form.appendChild(hint);
+
+    return form;
+}
+
+async function saveAccountCredentials(userId, values, btnEl) {
+    const email = String(values.email || '').trim();
+    if (!email) {
+        showToast('邮箱不能为空', 'error');
+        return;
+    }
+    // 只把用户实际动过的字段发上去。密码/2FA 留空 = 不修改，这跟后端
+    // /api/account-pool/credentials 的「字段缺省 = 不改」约定是同一件事：
+    // 列表接口不回传明文，输入框天生是空的，把空当成清空会让人改个邮箱就丢密码。
+    const payload = { user_id: userId, email };
+    if (String(values.password || '')) payload.password = values.password;
+    if (values.dropTotp) {
+        payload.totp_secret = '';
+    } else if (String(values.totpSecret || '').trim()) {
+        payload.totp_secret = values.totpSecret;
+    }
+
+    const originalText = btnEl ? btnEl.textContent : '';
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ 保存中...'; }
+    try {
+        const resp = await fetch('/api/account-pool/credentials', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await resp.json();
+        if (data && data.status === 'ok') {
+            await loadAccountPool();
+            showToast('凭据已保存，掉登录时会自动重新登录', 'success');
+        } else if (resp.status === 404) {
+            showToast('本地服务没有这个接口——请重启本地服务后再试', 'error');
+        } else {
+            showToast(`保存失败：${(data && (data.message || data.error)) || `HTTP ${resp.status}`}`, 'error');
+        }
+    } catch (e) {
+        showToast('保存失败，请检查本地服务', 'error');
+    } finally {
+        if (btnEl) { btnEl.disabled = false; btnEl.textContent = originalText; }
+    }
+}
+
+async function testAccountLogin(userId, btnEl) {
+    const originalText = btnEl ? btnEl.textContent : '';
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ 登录中...'; }
+    try {
+        const resp = await fetch('/api/account-pool/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: userId })
+        });
+        const data = await resp.json();
+        await loadAccountPool();
+        if (data && data.status === 'ok') {
+            showToast(data.message || '登录成功', 'success');
+        } else if (resp.status === 409) {
+            // 浏览器忙 / 队列暂停：账号本身没问题，等会儿再点就行，
+            // 报成失败会让用户跑去改凭据。
+            showToast((data && data.message) || '浏览器忙，请稍后再试', 'warning');
+        } else {
+            showToast(`登录失败：${(data && (data.message || data.error)) || `HTTP ${resp.status}`}`, 'error');
+        }
+    } catch (e) {
+        showToast('测试登录失败，请检查本地服务', 'error');
+    } finally {
+        if (btnEl) { btnEl.disabled = false; btnEl.textContent = originalText; }
+    }
+}
+
+async function resetAccountLoginBreaker(userId, btnEl) {
+    if (btnEl) btnEl.disabled = true;
+    try {
+        const resp = await fetch('/api/account-pool/reset-breaker', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: userId })
+        });
+        const data = await resp.json();
+        if (data && data.status === 'ok') {
+            await loadAccountPool();
+            showToast('已解除熔断，下次掉登录会重新尝试自动登录', 'success');
+        } else {
+            showToast(`解除失败：${(data && data.message) || '未知错误'}`, 'error');
+        }
+    } catch (e) {
+        showToast('解除失败，请检查本地服务', 'error');
+    } finally {
+        if (btnEl) btnEl.disabled = false;
+    }
+}
+
+async function deleteAccountCredentials(userId, btnEl) {
+    if (!confirm('确定要清除这个账号的登录凭据吗？清除后掉登录会重新变成停下来等人工处理。')) return;
+    if (btnEl) btnEl.disabled = true;
+    try {
+        const resp = await fetch('/api/account-pool/credentials/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: userId })
+        });
+        const data = await resp.json();
+        if (data && data.status === 'ok') {
+            await loadAccountPool();
+            showToast('凭据已清除', 'success');
+        } else {
+            showToast(`清除失败：${(data && data.message) || '未知错误'}`, 'error');
+        }
+    } catch (e) {
+        showToast('清除失败，请检查本地服务', 'error');
+    } finally {
+        if (btnEl) btnEl.disabled = false;
+    }
 }
 
 async function addAccountPoolAccount() {

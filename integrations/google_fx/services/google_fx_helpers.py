@@ -876,8 +876,29 @@ def _clear_existing_uploaded_frame(page, label: str):
     return False
 
 
-def _upload_to_slot_directly(page, label: str, file_path: str) -> bool:
-    """直接将本地图片上传到指定帧槽位 (Start/End)。"""
+def _slot_container_has_thumbnail(container) -> bool:
+    """帧槽位容器里是否已经出现缩略图（= 图片真的挂上去了）。"""
+    for sel in ("img", "video", "canvas"):
+        try:
+            if container.locator(sel).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _upload_to_slot_directly(page, label: str, file_path: str, refs_before=None,
+                             verify_timeout: int = 20) -> bool:
+    """直接将本地图片上传到指定帧槽位 (Start/End)。
+
+    ⚠️ set_input_files 成功 ≠ 图片挂上了槽位：这里定位槽位容器靠的是文案匹配、
+    file input 拿的是页面上第一个 input[type=file]，两者都可能指错对象，而错了
+    不会抛异常。之前这个函数只要 set_input_files 没报错就返回 True，调用方据此
+    报"挂载完成 (2/2)"，接着提交一个**根本没有首尾帧**的请求——Flow 照单全收，
+    按纯文本生成一段无关片段（文生视频），直到下载后锚点比对才被拒收。
+    所以上传后必须实测槽位里出现了缩略图（或提示词区参考图数量确实变多），
+    验不到就如实返回 False，让调用方走挂载失败的既有失败/重试路径。
+    """
     selector = 'div[type="button"][aria-haspopup="dialog"], [aria-haspopup="dialog"], .jekiem, .EGCPj'
     containers = page.locator(selector)
     count = containers.count()
@@ -926,23 +947,51 @@ def _upload_to_slot_directly(page, label: str, file_path: str) -> bool:
         file_input.set_input_files(abs_path)
         log(f"  ✅ {label} 槽位已设置输入文件: {os.path.basename(file_path)}", "GoogleFX")
         random_sleep(4.0, 6.0)  # 等待上传并就绪
-        return True
     except Exception as e:
         log(f"  ❌ {label} 槽位上传文件异常: {e}", "GoogleFX")
         return False
 
+    before_count = len([u for u in (refs_before or []) if u])
+    deadline = time.time() + max(verify_timeout, 1)
+    while time.time() < deadline:
+        if _slot_container_has_thumbnail(target_container):
+            log(f"  ✅ {label} 槽位已确认出现缩略图", "GoogleFX")
+            return True
+        if len(_get_prompt_reference_uuids(page, limit=max(before_count + 2, 2))) > before_count:
+            log(f"  ✅ {label} 槽位上传后提示词区参考图数量已增加，判定挂载成功", "GoogleFX")
+            return True
+        time.sleep(1)
+
+    log(
+        f"  ❌ {label} 槽位上传后 {verify_timeout}s 内未见缩略图/参考图变化，"
+        f"判定未真正挂载（不能带着空首尾帧提交）",
+        "GoogleFX",
+    )
+    return False
+
 
 # ── _mount_video_prompt_refs ──
-def _mount_video_prompt_refs(page, start_ref: str = "", end_ref: str = "", start_path: str = "", end_path: str = ""):
+def _mount_video_prompt_refs(page, start_ref: str = "", end_ref: str = "", start_path: str = "",
+                             end_path: str = "", result_meta=None):
     """
     视频参考图的语义顺序固定为 Start -> End。
     Flow 当前 UI 保持插入顺序（先添加的在前），因此直接按语义顺序
     (Start→End) 挂载即可。仅在首选策略失败时才回退到反序尝试。
+
+    result_meta: 可选 dict，回填本次挂载的实况供调用方在点 Generate 前复核：
+      strategy —— 'prompt_chips'（画布卡片 Add to Prompt）/ 'frame_slots'
+                  （回退：直接把本地文件传进 Start/End 槽位）/ ''（失败）
+      expected —— 期望的画布 UUID 顺序（frame_slots 回退路径下不适用）
+      refs     —— 挂载完成瞬间提示词区实际读到的参考图 UUID 顺序
     """
+    meta = result_meta if isinstance(result_meta, dict) else {}
+    meta.update({"strategy": "", "expected": [], "refs": []})
+
     _clear_prompt_reference_chips_video(page)
 
     semantic_refs = [ref for ref in [start_ref, end_ref] if str(ref or "").strip()]
     expected_uuids = [_extract_flow_image_uuid(ref) for ref in semantic_refs if _extract_flow_image_uuid(ref)]
+    meta["expected"] = list(expected_uuids)
     if not semantic_refs:
         return []
 
@@ -978,8 +1027,10 @@ def _mount_video_prompt_refs(page, start_ref: str = "", end_ref: str = "", start
 
         if len(expected_uuids) == 1:
             if actual_order[:1] == expected_uuids[:1]:
+                meta.update({"strategy": "prompt_chips", "refs": list(actual_order)})
                 return mounted
         elif actual_order[:len(expected_uuids)] == expected_uuids:
+            meta.update({"strategy": "prompt_chips", "refs": list(actual_order)})
             return mounted
 
     log(
@@ -988,21 +1039,34 @@ def _mount_video_prompt_refs(page, start_ref: str = "", end_ref: str = "", start
     )
     _clear_prompt_reference_chips_video(page)
 
+    # 回退路径要传几张、就必须验到几张。少验一张就等于放一段没有首尾帧的请求过去。
+    wanted_slots = [
+        ("Start", start_path, start_ref),
+        ("End", end_path, end_ref),
+    ]
+    wanted_slots = [(lbl, p, ref) for lbl, p, ref in wanted_slots if p and os.path.exists(p)]
+
     slot_mounted = []
-    if start_path and os.path.exists(start_path):
-        ok1 = _upload_to_slot_directly(page, "Start", start_path)
-        if ok1:
-            slot_mounted.append(_extract_flow_image_uuid(start_ref) or "start_uploaded")
+    for label, path_, ref in wanted_slots:
+        refs_before = _get_prompt_reference_uuids(page, limit=4)
+        if _upload_to_slot_directly(page, label, path_, refs_before=refs_before):
+            slot_mounted.append(_extract_flow_image_uuid(ref) or f"{label.lower()}_uploaded")
 
-    if end_path and os.path.exists(end_path):
-        ok2 = _upload_to_slot_directly(page, "End", end_path)
-        if ok2:
-            slot_mounted.append(_extract_flow_image_uuid(end_ref) or "end_uploaded")
-
-    if slot_mounted:
+    if wanted_slots and len(slot_mounted) == len(wanted_slots):
         log(f"✅ 槽位直接上传成功: {slot_mounted}", "GoogleFX")
+        meta.update({
+            "strategy": "frame_slots",
+            "refs": _get_prompt_reference_uuids(page, limit=max(len(slot_mounted), 2)),
+        })
         return slot_mounted
 
+    if slot_mounted:
+        # 只成了一半：宁可整段判失败重来，也不能提交一个只有首帧（或只有尾帧）的
+        # 请求——Flow 会自行脑补另一端，产出的片段接不上相邻镜头。
+        log(
+            f"❌ 槽位直接上传只成功 {len(slot_mounted)}/{len(wanted_slots)} 张，判定挂载失败",
+            "GoogleFX",
+        )
     return []
 
 
@@ -1401,6 +1465,36 @@ def _fill_prompt_text(page, input_el, prompt, has_refs=False):
     return filled
 
 
+def _video_refs_still_attached(page, mount_meta):
+    """点 Generate 之前的最后一道复核：首尾帧是不是还挂在提示词框上。
+
+    挂载成功和真正提交之间还隔着「关残留弹窗 → 写提示词 → 同步 React state」几步，
+    每一步都可能把参考图 chip 挤掉（Slate 编辑器里 chip 和文本是同一棵树）。
+    而 Flow 对"没有参考图的视频请求"不报错，它会安静地按纯文本生成一段无关片段。
+    与其等下载后靠锚点 MAD 拒收（额度已经烧掉了），不如提交前再读一次 DOM。
+    """
+    meta = mount_meta or {}
+    expected = [u for u in (meta.get("expected") or []) if u]
+    if meta.get("strategy") == "prompt_chips" and expected:
+        actual = _get_prompt_reference_uuids(page, limit=max(len(expected), 2))
+        if actual[:len(expected)] == expected:
+            return True
+        log(f"🚨 提交前复核：提示词区参考图已变化 | expected={expected} | actual={actual}", "GoogleFX")
+        return False
+
+    refs = [u for u in (meta.get("refs") or []) if u]
+    if refs:
+        actual = _get_prompt_reference_uuids(page, limit=max(len(refs), 2))
+        if len(actual) >= len(refs):
+            return True
+        log(f"🚨 提交前复核：提示词区参考图数量减少 | 挂载时={len(refs)} | 现在={len(actual)}", "GoogleFX")
+        return False
+
+    # frame_slots 回退路径下槽位缩略图不一定落在提示词区选择器的取值范围内，
+    # 拿不到可比对的依据就不做二次判定（该路径的落地已在上传时逐张验过）。
+    return True
+
+
 # ── _submit_video_to_canvas ──
 def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
     """
@@ -1414,6 +1508,17 @@ def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
     end_img_path = clean_path(req.end_image) if (hasattr(req, "end_image") and req.end_image) else ""
     has_start = bool(img_path)
     has_end = bool(end_img_path)
+
+    # 声明了锚点帧却没有可挂载的画布引用 = 这一提交会变成纯文生视频。上游
+    # (_submit_tasks 的锚点闸门) 已经拦过一道，这里是最后一道，防止将来新增调用方
+    # 绕过闸门又把这个坑踩回来。
+    declared_start = str(getattr(req, "original_image", "") or "").strip()
+    declared_end = str(getattr(req, "original_end_image", "") or "").strip()
+    if (declared_start and not has_start) or (declared_end and not has_end):
+        raise RuntimeError(
+            "CANVAS_MOUNT_FAILED:该片段声明了锚点帧但没有可挂载的画布引用，"
+            "拒绝按无首尾帧的文生视频提交"
+        )
 
     log(f"📤 提交任务: {req.prompt[:40]}... | 首帧={has_start} | 尾帧={has_end}", "GoogleFX")
 
@@ -1450,6 +1555,7 @@ def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
     random_sleep(0.3, 0.5)
 
     prompt_has_refs = False
+    mount_meta = {}
     if has_start or has_end:
         start_ref = req.image or img_path if has_start else ""
         end_ref = req.end_image or end_img_path if has_end else ""
@@ -1479,7 +1585,8 @@ def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
             start_ref=start_ref,
             end_ref=end_ref,
             start_path=start_local,
-            end_path=end_local
+            end_path=end_local,
+            result_meta=mount_meta,
         )
         expected = min(len([r for r in [start_ref, end_ref] if str(r or "").strip()]), 2)
         prompt_has_refs = expected > 0 and len(mounted) >= expected
@@ -1508,6 +1615,14 @@ def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
             random_sleep(0.2, 0.3)
     except Exception as e:
         log(f"⚠️ React state 同步失败: {type(e).__name__}", "GoogleFX")
+
+    # 🚧 提交前最后一道锚点复核（见 _video_refs_still_attached）。放在节奏闸门之前：
+    # 复核不过就没必要再等那几秒的提交间隔了。
+    if prompt_has_refs and not _video_refs_still_attached(page, mount_meta):
+        raise RuntimeError(
+            "CANVAS_MOUNT_FAILED:提交前复核发现首尾帧已从提示词框丢失，"
+            "拒绝按无首尾帧的文生视频提交"
+        )
 
     # 提交节奏闸门（2026-07-26 补齐）：两条链都会 note_fx_submit()，但此前只有图片链
     # 调 fx_pacing_wait()，视频批量的连续提交完全没有最小间隔约束。风控看的是**两次
@@ -2806,6 +2921,25 @@ def wait_out_manual_intervention(page, context_label="Google FX", cancel_check=N
         except Exception as e:
             log(f"⚠️ 人工接管事件回调失败: {type(e).__name__}: {e}", "GoogleFX")
 
+    # ── 等人工之前：能自己登回去就别叫人（2026-07-30）──────────────
+    # 只对 login_required 生效。验证码/安全检查/设备验证本来就自动化不了，在那些
+    # 情况上调自动登录纯属浪费时间——auto_login 自己也会立刻放弃，但那要先付一次
+    # 页面探测的开销，还会在日志里留一行没有意义的"自动登录未成功"。
+    #
+    # 成功时**不发 detected 事件**：前端横幅是给人看的"快来处理"信号，自动恢复了
+    # 却弹一个又立刻撤掉的横幅，只会让用户以为出了事故。整段自愈只留日志。
+    if code == "login_required":
+        from ..utils.browser import attempt_auto_login
+        if attempt_auto_login(page, context_label=context_label, cancel_check=cancel_check):
+            recheck = _probe_manual_intervention(page, context_label)
+            if not recheck:
+                log(f"✅ {context_label}掉登录已自动恢复，无需人工介入", "GoogleFX")
+                return True
+            # 登录动作报成功但页面还是被拦（比如登完立刻撞上验证码）：
+            # 按新的拦截原因继续走等人工，不要沿用旧的 login_required。
+            code, reason = recheck
+            log(f"⚠️ {context_label}自动登录后页面仍被拦截 ({code}: {reason})", "GoogleFX")
+
     log(f"🛑 {context_label}检测到需要人工处理 ({code}: {reason})，"
         f"暂停等待人工在 AdsPower 浏览器窗口处理，最长 {max_wait_secs}s", "GoogleFX")
     _emit("detected")
@@ -2986,21 +3120,35 @@ def _dismiss_unexpected_overlays(page, log_tag="GoogleFX"):
     return dismissed
 
 
-def _get_panel_uuids(page):
-    """纯 DOM 扫描页面中现有图片缓存，不主动打开/关闭 add_2 面板。"""
-    uuids = set()
+def _get_panel_uuid_order(page):
+    """同 _get_panel_uuids，但按 DOM 文档顺序返回**列表**（去重，保留首次出现的位置）。
+
+    上传归属判定需要回答"这一批新冒出来的卡片里，哪一张是刚刚传上去的那一张"。
+    集合的迭代顺序是哈希序，跟新旧毫无关系——用 next(iter(set)) 去挑就是在掷骰子，
+    掷错的后果是这张本地图被安上别人的 UUID，随后整条 path→uuid 映射错位，
+    生成出一批挂着错误首尾帧的视频。所以凡是要判新旧/判唯一性的地方都必须用它。
+    """
+    ordered = []
+    seen = set()
     try:
         srcs = page.evaluate("""() => {
             return Array.from(document.querySelectorAll('img[src*="getMediaUrlRedirect"]'))
                 .map(img => img.getAttribute('src') || '');
         }""")
-        for src in srcs:
-            m = re.search(r'name=([0-9a-f\-]{30,})', src)
-            if m:
-                uuids.add(m.group(1))
     except Exception as e:
-        log(f"  ⚠️ _get_panel_uuids 失败: {e}", "GoogleFX")
-    return uuids
+        log(f"  ⚠️ _get_panel_uuid_order 失败: {e}", "GoogleFX")
+        return ordered
+    for src in srcs or []:
+        m = re.search(r'name=([0-9a-f\-]{30,})', src)
+        if m and m.group(1) not in seen:
+            seen.add(m.group(1))
+            ordered.append(m.group(1))
+    return ordered
+
+
+def _get_panel_uuids(page):
+    """纯 DOM 扫描页面中现有图片缓存，不主动打开/关闭 add_2 面板。"""
+    return set(_get_panel_uuid_order(page))
 
 def _find_fx_prompt_input(page, announce=False):
     """定位 Google FX 底部输入框，优先 Slate.js 编辑器。"""

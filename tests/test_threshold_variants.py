@@ -30,6 +30,8 @@ from prompt_pipeline import (
     _parse_prompt_slots,
     _stage_scope_ladder_violations,
     HARD_CUT_VIDEO_PLACEHOLDER,
+    is_legacy_hard_cut_placeholder,
+    beat_is_crossing_clip,
     _beat_contract,
     fix_video_opening,
     check_video_opening,
@@ -120,27 +122,21 @@ class TestImageSpaceFamily(unittest.TestCase):
         self.assertEqual(image_space_family(videos, 6), 'interior')
 
 
-class TestHardCutPlaceholderText(unittest.TestCase):
-    """剪辑上允许硬切，但物理推进要由占位声明的文字稳住：门被推开、镜头进入内部空间。
-    切点前那张外部帧的门保持封闭是硬切变体的既定状态，不是缺陷（2026-07-28）。"""
+class TestLegacyHardCutPlaceholder(unittest.TestCase):
+    """2026-07-30：[CUT] 槽改为真实生成的跨越片段，占位声明只作为「识别旧单」的常量保留
+    （旧单的 prompt_block 里仍是这段正文，那些单继续跳过生成）。"""
 
-    def test_placeholder_still_declares_no_clip(self):
-        self.assertIn('DECLARED HARD CUT', HARD_CUT_VIDEO_PLACEHOLDER)
-        self.assertIn('no video clip is generated', HARD_CUT_VIDEO_PLACEHOLDER)
+    def test_placeholder_is_recognized_as_legacy(self):
+        self.assertTrue(is_legacy_hard_cut_placeholder(HARD_CUT_VIDEO_PLACEHOLDER))
+        # 前后空白/大小写不影响识别（正文经过格式化回读）
+        self.assertTrue(is_legacy_hard_cut_placeholder('\n  declared hard cut - no video clip...'))
 
-    def test_placeholder_carries_the_physical_crossing_in_words(self):
-        body = HARD_CUT_VIDEO_PLACEHOLDER.lower()
-        self.assertIn('pushed open', body)
-        self.assertIn('into the interior space', body)
-        self.assertIn('rather than a teleport', body)
-
-    def test_placeholder_states_the_sealed_entry_is_by_design(self):
-        body = HARD_CUT_VIDEO_PLACEHOLDER.lower()
-        self.assertIn('closed', body)
-        self.assertIn('never a defect', body)
-
-    def test_placeholder_does_not_reset_construction_progress(self):
-        self.assertIn('does not reset across the cut', HARD_CUT_VIDEO_PLACEHOLDER)
+    def test_real_crossing_prompt_is_not_legacy(self):
+        body = ('Use the provided first frame and last frame as exact composition anchors. '
+                'The sealed hatch is pushed open and the camera pushes through into the interior.')
+        self.assertFalse(is_legacy_hard_cut_placeholder(body))
+        self.assertFalse(is_legacy_hard_cut_placeholder(''))
+        self.assertFalse(is_legacy_hard_cut_placeholder(None))
 
 
 class TestFamilyAnchorSeq(unittest.TestCase):
@@ -154,6 +150,21 @@ class TestFamilyAnchorSeq(unittest.TestCase):
         videos = {4: {'body': 'v', 'meta': 'BRIDGE TURN'}, 5: {'body': 'v', 'meta': ''}}
         # The single merged crossing beat (pan variant) is the new family anchor.
         self.assertEqual(family_anchor_seq(videos, 7), 5)
+
+
+class TestCrossingClipPredicate(unittest.TestCase):
+    """视频侧「是不是跨越镜头」的唯一判据：bridge_stage==1 或 hard_cut。漏掉 hard_cut
+    就会把切入拍当普通静止施工拍处理（运镜句被删、动作正文清空）。"""
+
+    def test_bridge_and_cut_both_count(self):
+        self.assertTrue(beat_is_crossing_clip({'bridge_stage': 1}))
+        self.assertTrue(beat_is_crossing_clip({'hard_cut': True}))
+        self.assertTrue(beat_is_crossing_clip({'bridge_stage': 1, 'turn_direction': 'left'}))
+
+    def test_ordinary_beats_do_not(self):
+        self.assertFalse(beat_is_crossing_clip({'operation': 'repair', 'bridge_stage': None}))
+        self.assertFalse(beat_is_crossing_clip({'hard_cut': False}))
+        self.assertFalse(beat_is_crossing_clip(None))
 
 
 class TestThresholdVariantHelpers(unittest.TestCase):
@@ -327,13 +338,44 @@ class TestTurnVideoProcessCheck(unittest.TestCase):
 class TestValidateBeatPromptsVariants(unittest.TestCase):
     PACKET = {'camera_dna': '', 'primary_landmarks': [], 'frame_boundaries': {}}
 
-    def test_hard_cut_beat_skips_video_checks(self):
+    CUT_IMAGE = ('Static tripod shot inside; camera pitch locked level; the central vanishing '
+                 'axis stays centered.')
+
+    def test_hard_cut_beat_is_validated_as_a_crossing_clip(self):
+        """[CUT] 槽是真实生成的跨越片段：一条正常的过门镜头描述必须通过全套视频侧校验。"""
         beat = {'index': 4, 'operation': 'threshold', 'hard_cut': True, 'bridge_stage': None}
+        video = ('Use the provided first frame and last frame as exact composition anchors. Use '
+                 'IMAGE 4 as the actual first-frame image and IMAGE 5 as the actual last-frame '
+                 'image; every visible action must interpolate between those two frame images '
+                 'without inventing a third layout. The closed hatch is pushed open on camera and '
+                 'the camera pushes forward in one continuous coaxial move through the opening, '
+                 'settling fully inside; the frame stays completely sterile of workers throughout.')
         errs = validate_beat_prompts(
-            4, HARD_CUT_VIDEO_PLACEHOLDER,
-            'Static tripod shot inside; camera pitch locked level; the central vanishing axis stays centered.',
+            4, video, self.CUT_IMAGE,
             self.PACKET, 'Threshold', False, True, beat=beat, family='interior')
         self.assertEqual([e for e in errs if 'VIDEO' in e or 'video' in e], [])
+
+    def test_hard_cut_beat_without_any_camera_move_is_flagged(self):
+        """回归护栏：占位声明式的正文（没有锚定开场、没有运镜动作）不再被静默放行——
+        它正是"过门镜头不生成"的那种正文。"""
+        beat = {'index': 4, 'operation': 'threshold', 'hard_cut': True, 'bridge_stage': None}
+        errs = validate_beat_prompts(
+            4, HARD_CUT_VIDEO_PLACEHOLDER, self.CUT_IMAGE,
+            self.PACKET, 'Threshold', False, True, beat=beat, family='interior')
+        # 占位声明没有插值锚定开场，也没有绑定首尾帧 —— 现在会被报出来
+        self.assertTrue(any('missing required opening sentence' in e for e in errs))
+        self.assertTrue(any('must bind IMAGE 4 (first frame) to IMAGE 5' in e for e in errs))
+
+        # 一段完全静止、没有任何运镜的正文同样被报（跨越片段必须写出推进动作）
+        static_body = (
+            'Use the provided first frame and last frame as exact composition anchors. Use '
+            'IMAGE 4 as the actual first-frame image and IMAGE 5 as the actual last-frame image; '
+            'every visible action must interpolate between those two frame images without '
+            'inventing a third layout. Dust hangs in the still air and the light shifts slowly.')
+        errs = validate_beat_prompts(
+            4, static_body, self.CUT_IMAGE,
+            self.PACKET, 'Threshold', False, True, beat=beat, family='interior')
+        self.assertTrue(any('camera-translation' in e for e in errs))
 
     def test_turn_beat_allows_pan_wording(self):
         # The single threshold/bridge beat (bridge_stage=1) with turn_direction set —
@@ -409,7 +451,20 @@ class _TmpDirCase(unittest.TestCase):
 
 
 class TestPlanVideoSlotsCut(_TmpDirCase):
-    def test_cut_slot_skipped_others_generate(self):
+    def test_cut_slot_now_generates_like_any_other(self):
+        """2026-07-30：[CUT] 槽照常生成视频（正文是普通的跨越镜头描述），起止帧绑定
+        与普通拍一致。此前它被无条件跳过，成片过门处只有两张静帧硬拼。"""
+        frames = self._make_frames(4)
+        videos = {1: {'body': 'v1', 'meta': ''},
+                  2: {'body': 'the hatch is pushed open and the camera pushes through', 'meta': 'CUT'},
+                  3: {'body': 'v3', 'meta': ''}}
+        plans = plan_video_slots(videos, frames, {}, self.videos_dir)
+        self.assertEqual([p['action'] for p in plans], ['generate', 'generate', 'generate'])
+        self.assertEqual(plans[1]['start_anchor_slot'], 2)
+        self.assertTrue(plans[1]['start_frame'] and plans[1]['end_frame'])
+
+    def test_legacy_placeholder_body_is_still_skipped(self):
+        """旧单（正文仍是占位声明）继续按预期缺失跳过——按正文识别，不按 [CUT] 标签。"""
         frames = self._make_frames(4)
         videos = {1: {'body': 'v1', 'meta': ''},
                   2: {'body': HARD_CUT_VIDEO_PLACEHOLDER, 'meta': 'CUT'},
@@ -549,6 +604,24 @@ class TestBeatContractBridgeFlags(unittest.TestCase):
         later = self._contract(ladder, 5)  # ordinary interior beat, not first reveal
         self.assertNotIn('DOOR CLEARANCE', later['anchor_rule'])
         self.assertEqual(later['family_contract'].count('Door clearance (mandatory)'), 1)
+
+    def test_cut_beat_contract_demands_a_real_generated_crossing_clip(self):
+        """2026-07-30 回归护栏：切入拍的 VIDEO 契约必须要求一段真实片段（普通视频提示词、
+        门在片段里被推开、绑定 IMAGE i -> i+1），不得再出现"占位声明/不生成片段"的口径。"""
+        ladder = _ladder_cut(n=6, t=3)
+        cut = self._contract(ladder, 3)
+        contract = cut['family_contract']
+        self.assertTrue(cut['is_cut'])
+        self.assertIn('a real clip IS generated for this slot', contract)
+        self.assertIn('pushed open on camera', contract)
+        self.assertIn('IMAGE 3', contract)
+        self.assertIn('IMAGE 4', contract)
+        self.assertNotIn('placeholder', contract.lower())
+        self.assertNotIn('no video clip', contract.lower())
+        # 跨越片段的三条硬条款（纯运镜/全程废墟/一镜到底）与 bridge 同权
+        self.assertIn('sterile of workers', contract)
+        self.assertIn('untouched ruin', contract)
+        self.assertIn('one unbroken take', contract.lower())
 
     def test_minimum_run_up_beat_ladder_helper_never_places_crossing_at_1_or_2(self):
         # Sanity check on the test helpers themselves — mirrors the real minimum

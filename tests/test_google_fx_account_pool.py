@@ -228,6 +228,97 @@ def test_refresh_credit_marks_login_required_on_login_page(monkeypatch):
     assert result["cooldown_until"] is not None
 
 
+def test_successful_probe_releases_the_login_cooldown(monkeypatch):
+    """掉登录冷却必须随"探测成功"一起解开，不能只清 reason 留着 cooldown_until。
+
+    自动登录让这个疏漏变得要命：探针撞上登录页 → 自动登进去 → 读到积分 →
+    账号明明已经可用，却因为冷却时间没到，pick_account 继续跳过它整整两小时。
+    """
+    pool = ap.AccountPool()
+    pool.add_account("user_login")
+    pool.mark_login_required("user_login", cooldown_hours=2.0)
+    assert pool.list_accounts(heal=False)[0]["cooldown_until"] is not None
+
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: 800)
+
+    result = pool.refresh_credit("user_login", force=True)
+    assert result["credit"] == 800
+    assert result["cooldown_until"] is None
+    assert result.get("cooldown_reason") is None
+    assert pool.pick_account() is not None, "登录恢复后账号应立刻可被选中"
+
+
+def test_exhaustion_cooldown_survives_a_successful_probe(monkeypatch):
+    """额度耗尽的 24h 冷却有它自己的语义，不该被一次积分探测顺手撤掉——
+    只有 login_required 那把锁才随探测成功一起解。"""
+    pool = ap.AccountPool()
+    pool.add_account("user_dry")
+    pool.mark_exhausted("user_dry", cooldown_hours=24.0)
+
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: 5)
+
+    result = pool.refresh_credit("user_dry", force=True)
+    assert result["cooldown_until"] is not None
+
+
+# ── 自动登录凭据在号池里的呈现 ────────────────────────────────────────────────
+
+def test_list_accounts_reports_credential_presence_without_leaking_plaintext(tmp_path, monkeypatch):
+    """list_accounts() 的结果会被 /api/account-pool 整份发给浏览器。
+    密码/2FA 密钥漏进去 = 把 Google 密码发给了前端。"""
+    from integrations.google_fx.utils import account_credentials as creds
+    monkeypatch.setattr(creds, "_STATE_FILE", tmp_path / "account_credentials.json")
+
+    pool = ap.AccountPool()
+    pool.add_account("user_a", "配了凭据的号")
+    pool.add_account("user_b", "没配凭据的号")
+    creds.save("user_a", email="me@example.com", password="hunter2",
+               totp_secret="GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
+
+    rows = {a["user_id"]: a for a in pool.list_accounts(heal=False)}
+
+    assert rows["user_a"]["auto_login_ready"] is True
+    assert rows["user_a"]["has_totp"] is True
+    assert rows["user_a"]["login_email"] == "me@example.com"
+    assert rows["user_b"]["auto_login_ready"] is False
+    assert rows["user_b"]["has_password"] is False
+
+    serialized = json.dumps(list(rows.values()), ensure_ascii=False, default=str)
+    assert "hunter2" not in serialized
+    assert "GEZDGNBVGY3TQOJQ" not in serialized
+
+
+def test_email_only_credentials_are_not_reported_as_ready(tmp_path, monkeypatch):
+    """只填了邮箱的号自动登录会在密码页原地卡死。报成"已就绪"会让用户以为
+    配好了，直到某天夜里掉登录才发现没用。"""
+    from integrations.google_fx.utils import account_credentials as creds
+    monkeypatch.setattr(creds, "_STATE_FILE", tmp_path / "account_credentials.json")
+
+    pool = ap.AccountPool()
+    pool.add_account("user_a")
+    creds.save("user_a", email="me@example.com")
+
+    assert pool.list_accounts(heal=False)[0]["auto_login_ready"] is False
+
+
+def test_removing_an_account_also_deletes_its_stored_password(tmp_path, monkeypatch):
+    """不跟着删就会在 runtime/ 下留一条谁也看不见、谁也不会再清理的明文密码：
+    号池里已经没有这个账号，控制台自然也不会再显示它还存着凭据。"""
+    from integrations.google_fx.utils import account_credentials as creds
+    cred_file = tmp_path / "account_credentials.json"
+    monkeypatch.setattr(creds, "_STATE_FILE", cred_file)
+
+    pool = ap.AccountPool()
+    pool.add_account("user_a")
+    creds.save("user_a", email="me@example.com", password="hunter2")
+
+    pool.remove_account("user_a")
+
+    assert creds.get("user_a") is None
+    assert "hunter2" not in cred_file.read_text(encoding="utf-8")
+
 
 # ── AdsPower 本地 API 限频重试 ────────────────────────────────────────────────
 # 背景（2026-07-26 server.log）：撞上 "Too many request per second" 时原代码直接

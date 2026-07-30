@@ -2821,7 +2821,7 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
                     setMeta(`视频 ${data.index} 生成失败: ${msg}`);
                     if (isViewing()) renderVideoSlotFailed(data.index, msg);
                 } else if (type === 'video_skipped') {
-                    // 声明式硬切槽位（[CUT]）：不生成片段，按已完成计入进度
+                    // 硬切占位槽（旧单专属，新单的 [CUT] 槽照常生成）：不生成片段，按已完成计入进度
                     applyVideoProgress('video_done', data);
                     setMeta(`视频 ${data.index} 为声明式硬切槽位，已跳过生成`);
                     if (isViewing() && typeof renderVideoSlotSkippedCut === 'function') {
@@ -3198,22 +3198,110 @@ async function deleteFromLibrary(id) {
     updateFavoriteButtonState();
 }
 
-function loadSavedIdea(idea) {
+function loadSavedIdea(idea, options = {}) {
     currentIdea = idea;
     saveCurrentIdeaState();
     renderIdea(idea);
-    
+
     document.getElementById('output-placeholder-view').classList.remove('active');
     document.getElementById('output-loading-view').classList.remove('active');
-    
+
     const errorView = document.getElementById('output-error-view');
     if (errorView) errorView.style.display = 'none';
-    
+
     document.getElementById('output-content-view').classList.add('active');
-    
+
     switchTab('overview');
-    showToast("已载入收藏的创意", "success");
+    showToast(options.toast || "已载入收藏的创意", "success");
     updateActiveGenerationBanner();
+}
+
+/* ==========================================================================
+   台账 / 画廊 →「激发项目」直达入口
+   一条创意合成出来的成片有两个落点：收藏进点子库的记录（首选，提示词/封面/
+   帧视频清单最全），以及后台任务记录（没收藏，或收藏前就想回看时的兜底——
+   画廊里 outputs/run_<task_id>_… 那些目录多半只有任务记录）。台账行与画廊
+   项目组都走下面这一套解析：先查点子库，再回落到已完成的任务。
+   ========================================================================== */
+
+function sparkNormKey(v) {
+    return String(v == null ? '' : v).replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+// 点子库里找这条创意的记录。theme 存的就是灵感卡片的一键输入串
+// （台账 creative_seed.input_str 同源），是最稳的一条；标题只给旧记录兜底。
+// savedIdeas 按新→旧排列，find 天然取最近一次合成。
+function findSavedIdeaForSpark({ ideaId = null, seed = '', title = '' } = {}) {
+    if (!Array.isArray(savedIdeas) || !savedIdeas.length) return null;
+    if (ideaId) {
+        const byId = savedIdeas.find(i => String(i.id) === String(ideaId));
+        if (byId) return byId;
+    }
+    const seedKey = sparkNormKey(seed);
+    const titleKey = sparkNormKey(title);
+    return (seedKey && savedIdeas.find(i => sparkNormKey(i.theme) === seedKey))
+        || (titleKey && savedIdeas.find(i => sparkNormKey(i.title) === titleKey
+                                          || sparkNormKey(i.theme) === titleKey))
+        || null;
+}
+
+// 任务侧兜底。projectKey 传画廊的项目目录名：目录名以 run_<task_id>_ 开头
+// （见 server_common.make_idea_project_key），拿它做前缀匹配比反解目录名更稳
+// （task_id 自身可能带下划线，反解会切错）。
+async function findCompletedTaskForSpark({ dna = '', seed = '', title = '', projectKey = '' } = {}) {
+    let tasks = [];
+    try {
+        const res = await fetch('/api/tasks');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        tasks = Array.isArray(data) ? data : (data.tasks || []);
+    } catch (e) {
+        console.warn('Failed to load tasks while resolving spark project', e);
+        return null;
+    }
+    // 只认创意激发任务：帧/分步渲染/视频/封面这些子任务的 dimensions 里也带着
+    // 同一个选题名，误配上去 loadCompletedTask 会载入一份没有提示词的空壳结果
+    const done = tasks.filter(t => t && t.status === 'completed' && t.result && isIdeationTask(t));
+    const dims = t => t.dimensions || {};
+
+    if (projectKey) {
+        const hit = done.find(t => {
+            const safeId = String(t.id || '').replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '');
+            return safeId && projectKey.startsWith(`run_${safeId}_`);
+        });
+        if (hit) return hit;
+    }
+    const dnaKey = sparkNormKey(dna);
+    const seedKey = sparkNormKey(seed);
+    const titleKey = sparkNormKey(title);
+    return (dnaKey && done.find(t => sparkNormKey((dims(t).ledger_candidate || {}).dna
+                                                  || dims(t).topic_dna) === dnaKey))
+        || (seedKey && done.find(t => sparkNormKey(dims(t).theme) === seedKey))
+        || (titleKey && done.find(t => sparkNormKey(dims(t).task_label) === titleKey
+                                    || sparkNormKey(dims(t).theme) === titleKey))
+        || null;
+}
+
+// 打开一条创意对应的激发项目，落到「激发结果」工作区。找不到时给出明确提示
+// 并返回 false（调用方不需要自己再报错）。
+async function openSparkProject({ ideaId = null, dna = '', seed = '', title = '', projectKey = '', label = '' } = {}) {
+    const name = label || title || '该创意';
+    const idea = findSavedIdeaForSpark({ ideaId, seed, title });
+    if (idea) {
+        closeLibraryDrawer();
+        switchMainTab('results');
+        loadSavedIdea(idea, { toast: `已打开激发项目「${idea.title || name}」` });
+        return true;
+    }
+    const task = await findCompletedTaskForSpark({ dna, seed, title, projectKey });
+    if (task) {
+        closeLibraryDrawer();
+        switchMainTab('results');
+        await loadCompletedTask(task.id);
+        return true;
+    }
+    showToast(`没找到「${name}」对应的激发项目——它可能还没合成成功，或历史记录已被清理`, 'error');
+    return false;
 }
 
 // Export Library to JSON

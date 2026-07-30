@@ -365,6 +365,17 @@ def load_drift_break_slots(manifest_data):
     return slots
 
 
+# 旧单硬切占位声明的正文前缀（与 prompt_pipeline.HARD_CUT_PLACEHOLDER_PREFIX 同一常量，
+# 这里复制一份字面量是为了让 plan_video_slots 保持零依赖可单测；该字符串已冻结，新单不再
+# 产生这种正文，见 prompt_pipeline.HARD_CUT_VIDEO_PLACEHOLDER 的说明）。
+_LEGACY_HARD_CUT_PLACEHOLDER_PREFIX = 'DECLARED HARD CUT'
+
+
+def _is_legacy_hard_cut_placeholder(body):
+    """该 VIDEO 正文是不是 2026-07-30 之前落盘的硬切占位声明（那种槽位不生成视频）。"""
+    return str(body or '').strip().upper().startswith(_LEGACY_HARD_CUT_PLACEHOLDER_PREFIX)
+
+
 def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, target_slots=None,
                       strict=False, verify_fn=None, gate_level='standard', stale_slots=None,
                       drift_slots=None, override_flagged=False):
@@ -407,6 +418,8 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
         item = video_slots[slot]
         prompt = item['body'] if isinstance(item, dict) else item
         meta = str(item.get('meta', '') if isinstance(item, dict) else '').upper()
+        # 旧单的硬切占位声明按原始正文识别（改写 IMAGE 编号之前），见下方 skip_cut 分支。
+        is_legacy_cut_placeholder = _is_legacy_hard_cut_placeholder(prompt)
         # 英雄展示视频（[HERO]，默认收尾步骤）：唯一来源锚点是帧序列最后一张整体
         # 完工图，没有独立的"下一张"结束帧可绑定——只上传首帧，走单图生视频
         # （见 prompt_pipeline._compose_hero_showcase_video），不设结束锚点。
@@ -433,12 +446,18 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
             'meta': meta,
         }
 
-        # 声明式硬切槽位（[CUT]，TBCP v2 hard_cut 变体）：切点两侧的帧不是同一机位的
-        # 首尾帧对，送 i2v 只会在两张无关构图之间硬插值出扭曲变形——该槽不生成片段，
-        # 合成时按"预期缺失"直接硬拼（见 merge_project_videos）。
-        if 'CUT' in meta and 'BRIDGE' not in meta:
+        # 声明式切入槽位（[CUT]，TBCP v2 hard_cut 变体）现在照常生成视频：正文是一段
+        # 普通的过门跨越镜头（门在片段里被推开、镜头推进入内），起止帧绑定与普通拍一致。
+        # 2026-07-30 之前该槽被无条件跳过，成片在过门处只有两张静帧硬拼，用户看到的就是
+        # "过门硬切镜头不生成"。
+        #
+        # 唯一仍然跳过的是切换前落盘的旧单：它们的正文是占位声明本身
+        # （prompt_pipeline.HARD_CUT_VIDEO_PLACEHOLDER，开头即 'DECLARED HARD CUT'），
+        # 拿这段声明去送 i2v 只会得到一段照读声明的废片。按正文识别而不是按 [CUT] 标签
+        # 识别——标签在新单里保留着别的用途（帧渲染的 t2i 新链头、族锚、审查豁免）。
+        if is_legacy_cut_placeholder:
             plan['action'] = 'skip_cut'
-            plan['reason'] = f"视频 {slot} 是声明式硬切槽位（[CUT]）：不生成视频片段，成片在此处直接硬切。"
+            plan['reason'] = f"视频 {slot} 是旧单的硬切占位槽位（[CUT] 占位声明）：不生成视频片段，成片在此处直接硬切。"
             plans.append(plan)
             continue
 
@@ -792,8 +811,8 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     pending_items = []
     for plan in plans:
         if plan['action'] == 'skip_cut':
-            # 声明式硬切：记入 manifest（status='skipped_cut'）供合成门禁识别为预期缺失，
-            # 不提交生成、不算失败
+            # 旧单的硬切占位槽：记入 manifest（status='skipped_cut'）供合成门禁识别为
+            # 预期缺失，不提交生成、不算失败（新单的 [CUT] 槽走上面的正常生成分支）
             writer.record(_video_info(plan, video_model, status='skipped_cut'))
             if on_progress:
                 on_progress('video_skipped', {
@@ -1097,7 +1116,7 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
     expected_slots = []
 
     if frames:
-        # 声明式硬切槽位（status='skipped_cut'）是"预期缺失"：不算缺口、不占位填充，
+        # 旧单的硬切占位槽位（status='skipped_cut'）是"预期缺失"：不算缺口、不占位填充，
         # 相邻两段直接相接（成片在此处硬切）。'skipped_bridge_hold' 已停用（单一过门拍
         # 收编后不再有需要跳过的 HOLD 槽位），仅为兼容旧 manifest 保留识别。
         skipped_cut = {v.get('slot') for v in videos

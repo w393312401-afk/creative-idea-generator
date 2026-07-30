@@ -2784,6 +2784,24 @@ def threshold_elevated(parsed_brief):
     return bool((parsed_brief or {}).get('threshold_elevated'))
 
 
+def beat_is_crossing_clip(beat):
+    """本拍的 VIDEO 是不是「过门跨越镜头」——单一过门拍（bridge_stage == 1）与声明式
+    切入拍（hard_cut）都算。
+
+    2026-07-30：hard_cut 槽此前是确定性占位声明（不生成片段、不送 i2v），成片里那一步
+    过门只能靠文字交代，用户侧的表现就是「过门硬切镜头不生成」。现在它与 bridge 一样
+    是一段真实的 i2v 片段（起帧 = 切点前的外部帧，止帧 = 室内首帧），因此视频侧的一切
+    ——proactive 修复、validators、契约文案、兜底稿、审查豁免——都必须按跨越镜头处理，
+    绝不能再按普通施工拍或占位文本处理。两个变体在视频侧的差别只有两点：pan 变体多一个
+    收尾摇镜（turn_direction），hard_cut 变体的起帧门是封闭的、须在片段里被推开。
+
+    新增任何「跨越镜头才有/才没有」的分支时一律调这个函数，不要再各处手写
+    bridge_stage == 1——漏掉 hard_cut 正是上面那次回归的成因。"""
+    if not isinstance(beat, dict):
+        return False
+    return beat.get('bridge_stage') == 1 or bool(beat.get('hard_cut'))
+
+
 def beat_space_family(beat_ladder, i):
     """Spatial shot family of beat `i` (1-based) — i.e. of the IMAGE i+1 it produces.
 
@@ -3250,12 +3268,15 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
     video_prompt = compress_prompt_to_budget(video_prompt, 270, config, is_video=True)
 
     bridge_stage = beat.get('bridge_stage') if beat else None
-    is_bridge = (bridge_stage == 1)
+    # 跨越镜头（单一过门拍 + 声明式切入拍）：两者的 VIDEO 都是真实的推进片段，运镜措辞
+    # 必须保住——按 bridge_stage 单独判定会把 hard_cut 拍当静止拍，fix_camera_contradictions
+    # 会直接删掉「镜头推进穿过门」这句唯一的动作正文。见 beat_is_crossing_clip。
+    is_crossing = beat_is_crossing_clip(beat)
     if family is None:
         # Callers that know the full beat ladder pass the real family (post-crossing beats
         # are 'interior' even with bridge_stage None); standalone callers fall back to the
-        # beat's own bridge_stage.
-        family = 'interior' if bridge_stage == 1 else 'exterior'
+        # beat's own crossing declaration.
+        family = 'interior' if is_crossing else 'exterior'
 
     # 3. Apply proactive fixes post-compression to guarantee mandatory quality requirements
     image_prompt = fix_image_clean_frame_proactive(image_prompt)
@@ -3270,8 +3291,8 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
     # pan/tilt/orbit between two identically-framed anchor stills is a physical impossibility
     # the video model resolves by inventing a new layout. 放行严格按声明限定，不从正文反推。
     allow_camera_sweep = (bool(beat) and beat.get('operation', '').lower() == 'reward') \
-        or (is_bridge and bool(beat.get('turn_direction')))
-    video_prompt = fix_camera_contradictions(video_prompt, is_bridge, ban_pan_tilt=not allow_camera_sweep)
+        or (is_crossing and bool(beat.get('turn_direction')))
+    video_prompt = fix_camera_contradictions(video_prompt, is_crossing, ban_pan_tilt=not allow_camera_sweep)
 
     # IMAGE camera handling: strip contradictions FIRST, inject the family DNA AFTER.
     # (The old order injected first — skipped because the stale line already said 'tripod' —
@@ -4212,13 +4233,20 @@ def rework_structural_video_beat(config, i, video_prompt, structural_errs, packe
     """
     _bridge_stage = beat.get('bridge_stage') if beat else None
     is_bridge = (_bridge_stage == 1)
+    # 声明式切入拍与单一过门拍同属跨越镜头：回炉时要求补的是运镜正文，不是施工正文。
+    is_crossing = beat_is_crossing_clip(beat)
+    _is_cut = bool(beat.get('hard_cut')) if beat else False
     is_turn = is_bridge and bool(beat.get('turn_direction')) if beat else False
     is_reveal = (str(beat.get('operation', '')).lower() == 'reward') if beat else False
-    if is_bridge:
+    if is_crossing:
         action_rule = (
-            "- This is the single threshold-bridge clip: the added sentences must describe the "
+            "- This is the single threshold-crossing clip: the added sentences must describe the "
             "camera's own motion as the clip's action — "
-            + ("a slow coaxial dolly push through the threshold that ends in one smooth pan "
+            + ("the sealed entry seen in the first frame swinging open and a slow coaxial dolly "
+               "push straight through it into the interior, settling with the doorway fully "
+               "behind the camera"
+               if _is_cut else
+               "a slow coaxial dolly push through the threshold that ends in one smooth pan "
                "locking onto the interior's long axis"
                if is_turn else
                "a slow coaxial dolly push toward/through the threshold")
@@ -4281,7 +4309,7 @@ def rework_structural_video_beat(config, i, video_prompt, structural_errs, packe
             if len(fixed.split()) > 400:
                 rejection_reason = "the rewrite was too long (over 400 words) — keep the full prompt under 380 words."
                 continue
-            proc_errs = check_video_process_content(fixed, is_bridge=is_bridge, is_reveal=is_reveal, is_turn=is_turn)
+            proc_errs = check_video_process_content(fixed, is_bridge=is_crossing, is_reveal=is_reveal, is_turn=is_turn)
             if proc_errs:
                 rejection_reason = "it still failed these checks: " + "; ".join(proc_errs)
                 continue
@@ -5336,22 +5364,25 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
             if "blurred" not in image_prompt.lower() and "diffused" not in image_prompt.lower():
                 errors.append("Final IMAGE with polished/reflective floor missing RHMA-Blur diffused reflection description")
 
-    # 声明式硬切拍（hard_cut）：VIDEO 槽是确定性占位声明（不生成片段、不送 i2v），
-    # 全部视频侧校验对它没有意义，跳过。单一过门拍（bridge_stage=1）的 VIDEO 现在
-    # 是真实可见片段，全套视频侧校验照常生效。
-    if not _is_cut:
-        errors.extend(check_nlvtr_violations(video_prompt))
-        errors.extend(check_colon_label_style(video_prompt))
-        errors.extend(check_video_opening(i, video_prompt))
-        errors.extend(check_out_and_in(video_prompt, is_threshold_or_reveal))
-        errors.extend(check_worker_scale_lock(video_prompt, packet))
-        errors.extend(check_transition_shortcuts(video_prompt))
-        errors.extend(check_pacing_control(video_prompt, is_threshold_or_reveal))
+    # 2026-07-30：声明式切入拍（hard_cut）的 VIDEO 不再是占位声明，而是与单一过门拍
+    # （bridge_stage=1）同类的真实跨越片段（送 i2v，起帧=切点前外部帧，止帧=室内首帧），
+    # 因此全套视频侧校验对它一律生效——此前整段跳过，占位文本从不受检，是「过门镜头
+    # 不生成」既没被拦下也没被察觉的原因之一。
+    errors.extend(check_nlvtr_violations(video_prompt))
+    errors.extend(check_colon_label_style(video_prompt))
+    errors.extend(check_video_opening(i, video_prompt))
+    errors.extend(check_out_and_in(video_prompt, is_threshold_or_reveal))
+    errors.extend(check_worker_scale_lock(video_prompt, packet))
+    errors.extend(check_transition_shortcuts(video_prompt))
+    errors.extend(check_pacing_control(video_prompt, is_threshold_or_reveal))
 
     # Check camera contradictions
     op = beat.get('operation', '').lower() if beat else ''
 
     is_bridge = (_bridge_stage == 1)
+    # 跨越镜头 = 单一过门拍 或 声明式切入拍：两者的 VIDEO 都按「纯运镜穿越」判定
+    # （允许推进运镜、必须写出运镜动作、必须无工人），而不是按施工拍判定。
+    is_crossing = is_bridge or _is_cut
     is_turn = is_bridge and bool(beat.get('turn_direction')) if beat else False
 
     # Reward reveals and the single threshold/bridge beat's in-clip turn (pan variant,
@@ -5360,12 +5391,11 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
     # bridge clips translate coaxially[, optionally ending in one declared pan] only — 'no
     # pan, no tilt, no roll' otherwise). 放行严格按声明限定。
     allow_camera_sweep = (op == 'reward') or is_turn
-    if not _is_cut:
-        errors.extend(check_camera_contradictions(video_prompt, is_bridge, ban_pan_tilt=not allow_camera_sweep))
-        if is_bridge:
-            errors.extend(check_bridge_sterile(video_prompt))
-        errors.extend(check_video_process_content(video_prompt, is_bridge=is_bridge,
-                                                  is_reveal=(op == 'reward'), is_turn=is_turn))
+    errors.extend(check_camera_contradictions(video_prompt, is_crossing, ban_pan_tilt=not allow_camera_sweep))
+    if is_crossing:
+        errors.extend(check_bridge_sterile(video_prompt))
+    errors.extend(check_video_process_content(video_prompt, is_bridge=is_crossing,
+                                              is_reveal=(op == 'reward'), is_turn=is_turn))
     errors.extend(check_post_reveal_cleanup_prompts(image_prompt, video_prompt,
                                                     is_post_reveal_cleanup))
     # An IMAGE is always a still frame regardless of family — it must never contain
@@ -5500,7 +5530,7 @@ Required JSON keys:
 10. "threshold_variant": HOW the exterior-to-interior crossing is filmed (only meaningful when mode is "Threshold"; set "coaxial" for "Standard"). Must be exactly one of:
    - "coaxial": the open entry looks straight down the interior's long axis — a straight push through the doorway lands the camera on the interior's main view.
    - "pan_left" / "pan_right": the entry sits on the side or end of the space, so the interior's long axis runs perpendicular or offset to the door axis (buses, train cars, boats, aircraft, containers entered from an end door). After stepping inside, the camera must TURN toward where the interior depth actually lies; pick the direction of that turn.
-   - "hard_cut": NOTHING of the interior can be seen before crossing (sealed shell, pitch-black behind the hatch, no openable view in) — the sequence will cut once from outside to inside instead of physically walking the camera through.
+   - "hard_cut": NOTHING of the interior can be seen before crossing (sealed shell, pitch-black behind the hatch, no openable view in) — the crossing clip therefore opens the entry on camera first and the interior is established from scratch on the other side, instead of being pre-visualized through an open doorway beforehand.
 11. "threshold_elevated": true or false — true when the crossing door/hatch sits clearly ABOVE the exterior ground-level camera height so reaching it needs steps, a ladder, or a climb (lookout-tower cabin, silo hatch, school bus with high floor and entry steps, cable-car cabin). false otherwise, and always false for "hard_cut".
 """
     brief_user = f"""Design dimensions to parse:
@@ -5623,7 +5653,7 @@ Required JSON keys:
     )
     if _variant == 'hard_cut':
         threshold_split_rules = f"""- If mode is "Threshold", this project uses the DECLARED HARD CUT crossing variant (nothing of the interior is visible before crossing): do NOT create any bridge beats (no bridge_stage anywhere). Instead create exactly ONE crossing beat:
-  - Beat T: "threshold", "hard_cut": true — The sequence cuts once from outside to inside. This beat's video slot is a placeholder declaration (no clip); its resulting image is the interior first frame, re-establishing the interior from scratch in its untouched pre-construction state.
+  - Beat T: "threshold", "hard_cut": true — The single crossing beat. Its VIDEO is a normal generated clip: the closed entry is pushed open on camera and the camera pushes straight through it into the interior. Its resulting image is the interior first frame, re-establishing the interior from scratch in its untouched pre-construction state (it is rendered without the previous frame as a visual reference, which is what makes this variant different — not a missing clip).
   - Beat T must be at index {_MIN_PRE_THRESHOLD_BEATS + 1} or LATER — the first {_MIN_PRE_THRESHOLD_BEATS} beats must be ordinary exterior beats that establish the overall environment and show exterior cleanup/repair progress; NEVER place the crossing at Beat 1 or Beat 2.
 {_post_crossing_cleanup_rule}
   - All subsequent beats (through Beat {beats_count}) must be interior construction operations. Use "hard_cut": true on exactly this one beat and never elsewhere; a hard cut is only allowed for the threshold crossing, never as a generic transition."""
@@ -6294,12 +6324,15 @@ Hard Rules:
     }
 
 
-# 声明式硬切拍的 VIDEO 槽位占位声明：确定性覆盖 LLM 输出——该槽不生成视频、不送
-# i2v，配对/门禁按"预期缺失"处理（见 video_generator.plan_video_slots / merge 门禁）。
-# 2026-07-28：剪辑上允许硬切，但物理推进不能跟着断——占位声明本身要把"门被推开、
-# 镜头进入内部空间"这一步用文字说满。此前它只写"不生成片段、成片直接切"，切点前的
-# 那张外部帧因此在读者和审查模型眼里都成了"门关着、进不去"的死局（一致性审查曾据此
-# 把封闭木门报成违规，见 _local_beat_review_system_prompt 的 DECLARED HARD CUT 豁免）。
+# 【历史遗留，新单不再产生】声明式切入拍的 VIDEO 槽位占位声明。
+#
+# 2026-07-30 起废弃：占位声明的直接后果就是「过门镜头不生成」——成片在过门处只有两张
+# 静帧硬拼，那一步跨越只存在于文字里。现在该槽和单一过门拍一样是真实 i2v 片段，正文由
+# LLM 按普通视频提示词写（见 _beat_contract 的 is_cut 契约与 beat_is_crossing_clip）。
+#
+# 常量保留的唯一用途是识别旧单：切换前已经落盘的 prompt_block 里仍带着这段正文，
+# video_generator.plan_video_slots 按正文（而不是按 [CUT] 标签）识别它们并继续跳过生成，
+# 否则旧单会拿这段声明去送 i2v。新单的 [CUT] 槽照常生成视频。
 HARD_CUT_VIDEO_PLACEHOLDER = (
     "DECLARED HARD CUT - no video clip is generated for this slot; the final film cuts directly "
     "from the previous IMAGE to this beat's resulting IMAGE, and the story resumes inside. "
@@ -6311,6 +6344,16 @@ HARD_CUT_VIDEO_PLACEHOLDER = (
     "not reset across the cut: everything an earlier exterior beat sealed or repaired stays "
     "sealed and repaired on its inner face."
 )
+
+# 旧单识别用的正文前缀（占位声明的开头，历史上从未变过）。按正文识别而不是按 [CUT]
+# 标签识别，是这次改动的关键：标签在新单里仍然要保留（帧渲染据它把室内首帧当 t2i
+# 新链头、族锚计算与审查豁免也都认它），只有"正文是占位声明"才代表这一槽不该生成视频。
+HARD_CUT_PLACEHOLDER_PREFIX = 'DECLARED HARD CUT'
+
+
+def is_legacy_hard_cut_placeholder(body):
+    """这段 VIDEO 正文是不是 2026-07-30 之前留下的硬切占位声明（该槽不生成视频）。"""
+    return str(body or '').strip().upper().startswith(HARD_CUT_PLACEHOLDER_PREFIX)
 
 
 def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
@@ -6583,11 +6626,43 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw):
             "leaving the frame as the camera passes it. Do NOT describe this beat as a "
             "construction time-lapse — nothing is being built here.")
     if is_cut:
+        # 2026-07-30：切入拍的 VIDEO 不再是占位声明，而是一段普通的跨越镜头提示词——
+        # 契约按 bridge 的合并跨越镜头同款写满（锚定开场由 fix_video_opening 兜底），
+        # 差别只在起帧的门是封闭的，得先在片段里被推开。
         family_contract_lines.append(
-            "- DECLARED HARD CUT: this beat's VIDEO slot is a placeholder declaration only (no video "
-            "clip is generated; the final film hard-cuts from the previous IMAGE to this beat's "
-            "resulting IMAGE). The real content of this beat is its resulting IMAGE — the interior "
-            "first frame described per the anchor rule.")
+            f"- Crossing clip (this beat's VIDEO): write this as an ORDINARY video prompt — a real "
+            f"clip IS generated for this slot, bound normally from IMAGE {i} (first frame) to IMAGE "
+            f"{i+1} (last frame) like any other beat. It must depict, as ONE continuous, unbroken "
+            f"camera move, in this order, without ever stopping or holding on the doorway as a "
+            f"composition: (1) the closed/sealed entry seen in IMAGE {i} is pushed open on camera "
+            f"(the leaf swinging inward, the hatch lifting, the panel sliding back — whatever this "
+            f"carrier's own entry actually does), revealing the dark interior beyond for the first "
+            f"time; (2) the camera pushes coaxially forward through that opening; (3) the door-frame "
+            f"edges slide symmetrically outward past the left/right boundaries in one continuous "
+            f"wipe as the camera passes them; (4) exposure and white balance roll smoothly from "
+            f"exterior daylight to the interior's dimmer tone across the whole clip, attributed to "
+            f"the same light source throughout; (5) the clip ends with the camera fully inside, the "
+            f"door frame and threshold completely behind it and out of frame, matching IMAGE {i+1}. "
+            f"No pan, tilt, roll, or orbit — the move is a straight push in only.")
+        family_contract_lines.append(
+            "- Crossing clip — no interior preview before the opening (mandatory, this variant): "
+            "nothing of the interior is visible until the entry is opened inside this clip. Do NOT "
+            "write a peek through the doorway, an already-open entry, or interior anchors visible "
+            f"at the start — IMAGE {i} keeps its entry CLOSED and opaque by design, and the reveal "
+            "happens on camera here.")
+        family_contract_lines.append(
+            "- Crossing clip — raw interior throughout (mandatory): the space this clip enters is "
+            "an untouched ruin at EVERY frame from the moment it becomes visible — debris lying "
+            "where it fell, dirt drifts, rust/water stains, growth through the cracks. Nothing may "
+            "be cleaned, cleared, tidied, repaired, or installed during this clip, and no tool, "
+            "ladder, scaffolding, tarp, work light, or stacked material may appear at any point; "
+            "the clip is sterile of workers (the entry opens on camera without a figure entering "
+            "frame), and the cleanout is the NEXT beat's work.")
+        family_contract_lines.append(
+            "- Crossing clip — one unbroken take (mandatory): a single continuous take at one "
+            "steady speed. No cut, no fade, no dissolve, no wipe transition, no speed ramp, no "
+            "freeze, no re-framing jump. Do NOT describe this beat as a construction time-lapse — "
+            "nothing is being built here.")
     if is_pre_bridge:
         _peek = _family_landmarks(packet, 'interior') or []
         _peek_names = ", ".join(str(lm.get('name')) for lm in _peek if isinstance(lm, dict)) \
@@ -6739,7 +6814,7 @@ Write the beats IN ORDER. Each beat's resulting IMAGE must continue directly and
 - THIS BEAT'S resulting IMAGE must be a clean frame with ZERO workers/machinery. Do NOT use the words 'worker', 'builder', 'carpenter', 'laborer', 'person', 'man', 'woman', or 'people' under any circumstances, even to state that they are absent or not present. Describe only static objects, surfaces, and traces. For every ordinary construction beat, follow its VISIBLE MILESTONE CONTRACT exactly: name the milestone anchor, state its completed full extent/count, preserve inherited and not-yet-worked state, and include at least two declared persistent contact traces. Never reduce the delta to a local patch, a beginning, or vague incremental progress.
 - THIS BEAT'S VIDEO must execute the same visible milestone from its exact before_state to after_state. It must include TWO independently observable progress lines: the main product growing to its complete extent/count, plus stock/container/spoil movement or a tightly coupled second component. Show first contact, repeated cycles, material source and movement path, and a clean terminal frame. Prior installed/finished features stay present and unchanged.
 - A construction package may contain up to three tightly related actions only when all actions occur in the same zone and jointly create the one named milestone. Do not leak unrelated demolition, rough-in, finish, lighting, or furnishing work into that package.
-- For threshold bridge beats (if a beat is a threshold bridge, per its own section below), follow the TBCP rules: the ENTIRE exterior-to-interior crossing is ONE single beat (bridge_stage 1) — there is no separate hold/sill/vestibule/turn beat. Its VIDEO is the ONLY visible clip for the crossing, bound normally from the previous beat's IMAGE to this beat's own IMAGE, and must depict the full exterior-to-settle arc (plus, in the PAN variant, ending in a stationary pan locking onto the interior's long axis) in one continuous shot, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it. For a DECLARED HARD CUT beat, its VIDEO is a placeholder declaration and its IMAGE re-establishes the interior from scratch per its anchor rule. The crossing clip enters an untouched ruin and stays that way for its whole length — nothing is cleaned, cleared, tidied, repaired, or installed while the camera moves, and no tool, ladder, scaffolding, tarp, work light, or stacked material appears in it; write it as one unbroken take at a steady speed (no cut, fade, dissolve, speed ramp, or freeze), and never call it a construction time-lapse. The cleanout of that mess is the NEXT beat.
+- For threshold bridge beats (if a beat is a threshold bridge, per its own section below), follow the TBCP rules: the ENTIRE exterior-to-interior crossing is ONE single beat (bridge_stage 1) — there is no separate hold/sill/vestibule/turn beat. Its VIDEO is the ONLY visible clip for the crossing, bound normally from the previous beat's IMAGE to this beat's own IMAGE, and must depict the full exterior-to-settle arc (plus, in the PAN variant, ending in a stationary pan locking onto the interior's long axis) in one continuous shot, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it. A DECLARED CUT-IN beat works the same way on the video side — its VIDEO is a real generated crossing clip, written as an ordinary video prompt bound from the previous beat's IMAGE to this beat's own IMAGE, except that the entry starts CLOSED and is pushed open on camera inside that clip (no peek, no anchor scale-up before it) — while its IMAGE re-establishes the interior from scratch per its anchor rule. The crossing clip enters an untouched ruin and stays that way for its whole length — nothing is cleaned, cleared, tidied, repaired, or installed while the camera moves, and no tool, ladder, scaffolding, tarp, work light, or stacked material appears in it; write it as one unbroken take at a steady speed (no cut, fade, dissolve, speed ramp, or freeze), and never call it a construction time-lapse. The cleanout of that mess is the NEXT beat.
 - NLVTR visual-only rule: No '%' symbols, no numeric ranges, no acronyms (HAL, SCUP, NGCS, VMFP, RCE, GCTR, RPL, OSPL, RHMA, PBISP, HCL, NLVTR, MTAL, TSPA) in the prompts.
 - REALISM rule (mandatory): strictly documentary photorealism. Every material, fixture, tool, and technique must be real-world and present-day (wood, stone, brass, wool, glass, leather, standard trade tools). NO sci-fi, futuristic, cyberpunk, holographic, glowing-tech-panel, LED-neon, or spacecraft-style elements anywhere in the scene.
 - SINGLE CONTINUOUS PHOTOGRAPH rule (mandatory): each IMAGE is one real photograph of one moment — never a grid of multiple panels, a collage, a storyboard, a comparison/before-after split, or a multi-view composite. The "Grid A1-C3" notation used elsewhere in this contract is an internal composition-registration convention for you the writer — never describe or render literal grid lines, panel borders, or divided frames in the image itself.
@@ -7020,7 +7095,7 @@ Instructions:
 - IMAGE {i+1} must be a clean frame with ZERO workers/machinery. Do NOT use the words 'worker', 'builder', 'carpenter', 'laborer', 'person', 'man', 'woman', or 'people' under any circumstances, even to state that they are absent or not present. Describe only static objects, surfaces, and traces. {contract['anchor_rule']} Then describe this beat's state delta following its own STAGE SCOPE TIER (see the STAGE SCOPE FOR THIS BEAT instruction below). Also include a FEW (2-3, not exhaustive) PERSISTENT physical traces that prove the work happened (scrape marks, fastener heads, sawdust, membrane wrinkles, displaced soil, etc.).
 - {_milestone_beat_directive(beat, img_before=f"IMAGE {i}", img_after=f"IMAGE {i+1}") or 'This is a threshold/bridge/reward beat — follow its dedicated camera/reward rules instead of the ordinary milestone package contract.'}
   Prior MAJOR installed/finished features (panels, walls, floors, fixtures, primary landmarks) stay present and unchanged (monotonic state) — but you do NOT need to re-list every minor trace from every earlier beat; it is fine and expected for small cosmetic details to fade from the description as new ones accumulate.
-- For threshold bridge beats (if beat is a threshold bridge), follow the TBCP rules: the ENTIRE exterior-to-interior crossing is ONE single beat (bridge_stage 1) — there is no separate hold/sill/vestibule/turn beat. Its VIDEO is the ONLY visible clip for the crossing, bound normally from the previous beat's IMAGE to this beat's own IMAGE, and must depict the full exterior-to-settle arc (plus, in the PAN variant, ending in a stationary pan locking onto the interior's long axis) in one continuous shot, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it. For a DECLARED HARD CUT beat, its VIDEO is a placeholder declaration and its IMAGE re-establishes the interior from scratch per its anchor rule. The crossing clip enters an untouched ruin and stays that way for its whole length — nothing is cleaned, cleared, tidied, repaired, or installed while the camera moves, and no tool, ladder, scaffolding, tarp, work light, or stacked material appears in it; write it as one unbroken take at a steady speed (no cut, fade, dissolve, speed ramp, or freeze), and never call it a construction time-lapse. The cleanout of that mess is the NEXT beat.
+- For threshold bridge beats (if beat is a threshold bridge), follow the TBCP rules: the ENTIRE exterior-to-interior crossing is ONE single beat (bridge_stage 1) — there is no separate hold/sill/vestibule/turn beat. Its VIDEO is the ONLY visible clip for the crossing, bound normally from the previous beat's IMAGE to this beat's own IMAGE, and must depict the full exterior-to-settle arc (plus, in the PAN variant, ending in a stationary pan locking onto the interior's long axis) in one continuous shot, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it. A DECLARED CUT-IN beat works the same way on the video side — its VIDEO is a real generated crossing clip, written as an ordinary video prompt bound from the previous beat's IMAGE to this beat's own IMAGE, except that the entry starts CLOSED and is pushed open on camera inside that clip (no peek, no anchor scale-up before it) — while its IMAGE re-establishes the interior from scratch per its anchor rule. The crossing clip enters an untouched ruin and stays that way for its whole length — nothing is cleaned, cleared, tidied, repaired, or installed while the camera moves, and no tool, ladder, scaffolding, tarp, work light, or stacked material appears in it; write it as one unbroken take at a steady speed (no cut, fade, dissolve, speed ramp, or freeze), and never call it a construction time-lapse. The cleanout of that mess is the NEXT beat.
 - NLVTR visual-only rule: No '%' symbols, no numeric ranges, no acronyms (HAL, SCUP, NGCS, VMFP, RCE, GCTR, RPL, OSPL, RHMA, PBISP, HCL, NLVTR, MTAL, TSPA) in the prompts.
 - REALISM rule (mandatory): strictly documentary photorealism. Every material, fixture, tool, and technique must be real-world and present-day (wood, stone, brass, wool, glass, leather, standard trade tools). NO sci-fi, futuristic, cyberpunk, holographic, glowing-tech-panel, LED-neon, or spacecraft-style elements anywhere in the scene.
 - SINGLE CONTINUOUS PHOTOGRAPH rule (mandatory): each IMAGE is one real photograph of one moment — never a grid of multiple panels, a collage, a storyboard, a comparison/before-after split, or a multi-view composite. The "Grid A1-C3" notation used elsewhere in this contract is an internal composition-registration convention for you the writer — never describe or render literal grid lines, panel borders, or divided frames in the image itself.
@@ -7066,10 +7141,9 @@ Instructions:
 
                 # Apply proactive fixes
                 v_p, i_p = apply_proactive_fixes(i, v_p, i_p, packet, mode, is_last, is_threshold_or_reveal, beat=beat, config=config, family=family)
-                # 声明式硬切拍：VIDEO 槽确定性覆盖成占位声明（不生成片段、不送 i2v）。
-                # 单一过门拍（bridge_stage=1）的 VIDEO 是真实可见的合并跨越镜头，不覆盖。
-                if contract['is_cut']:
-                    v_p = HARD_CUT_VIDEO_PLACEHOLDER
+                # 2026-07-30：声明式切入拍的 VIDEO 不再被占位声明覆盖——它和单一过门拍
+                # 一样是真实可见的跨越片段，正文一律走 LLM 稿 + 确定性修复 + 校验 + 回炉
+                # 的普通通路（占位覆盖正是「过门镜头不生成」的根因）。
 
                 # skill 直出模式：风格瑕疵只记录不拦截——确定性修复已经兜住会直接
                 # 破坏渲染的硬伤，剩余瑕疵交给帧渲染后的真实画面审查
@@ -7082,7 +7156,7 @@ Instructions:
                                              is_post_reveal_cleanup=contract['is_post_reveal_cleanup'])
                 structural, style_errs = split_structural_video_errors(errs)
                 reworked = None
-                if structural and not contract['is_cut']:
+                if structural:
                     if sys.stdout:
                         print(f"[DIRECT] Beat {i} 结构性硬伤，定向回炉一轮: {structural}")
                     v_p, reworked = rework_structural_video_beat(config, i, v_p, structural, packet, beat=beat)
@@ -7222,7 +7296,13 @@ Instructions:
             desc = beat.get('description', 'performing restoration work').strip().rstrip('.')
 
             if contract['is_cut']:
-                vid_prompt = HARD_CUT_VIDEO_PLACEHOLDER
+                # 声明式切入拍的兜底稿：与 bridge 兜底同款的真实跨越镜头，只多一步
+                # 「封闭的门在片段里被推开」——绝不再回落成占位声明。
+                vid_prompt = (
+                    f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {i} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout. "
+                    f"The closed entry seen in the first frame is pushed open on camera, revealing the dark interior beyond, and the camera pushes forward in one continuous coaxial move straight through the opening, the door frame sliding fully out of frame, settling fully inside by the last frame with the threshold completely behind the camera. Exposure and white balance roll from exterior daylight to the interior's dimmer tone across the clip. "
+                    f"The interior it enters is an untouched ruin at every moment of the clip — debris lying where it fell, dirt drifts, stained and corroded surfaces — and nothing is cleaned, cleared, or repaired during the crossing; the frame stays sterile of workers and no tools, ladders, or staged materials appear at any point. One unbroken take at a steady speed: no cut, no fade, no dissolve, no speed ramp."
+                )
             elif contract['is_bridge']:
                 _turn_dir = str(beat.get('turn_direction') or '').strip().lower()
                 _turn_txt = (
@@ -7339,10 +7419,7 @@ Instructions:
                 v_p, i_p = apply_proactive_fixes(
                     i, v_p, i_p, packet, mode, contract['is_last'], contract['is_threshold_or_reveal'],
                     beat=contract['beat'], config=config, family=contract['family'])
-                # 声明式硬切拍：VIDEO 槽确定性覆盖成占位声明（不生成片段、不送 i2v）。
-                # 单一过门拍（bridge_stage=1）的 VIDEO 是真实可见的合并跨越镜头，不覆盖。
-                if contract['is_cut']:
-                    v_p = HARD_CUT_VIDEO_PLACEHOLDER
+                # 2026-07-30：声明式切入拍的 VIDEO 不再被占位声明覆盖（同单拍通路的注释）。
                 prev_v = compiled_videos.get(i - 1) if i > 1 else None
                 prev_i = compiled_images.get(i) if i > 1 else None
                 errs = validate_beat_prompts(
@@ -7384,7 +7461,7 @@ Instructions:
             # 会让 i2v 无画面可拍，对命中的拍定向回炉一轮（只重写 VIDEO，失败保留原稿）。
             structural, style_errs = split_structural_video_errors(errs)
             reworked = None
-            if structural and not contract['is_cut']:
+            if structural:
                 if sys.stdout:
                     print(f"[DIRECT] Batch beat {i} 结构性硬伤，定向回炉一轮: {structural}")
                 v_p, reworked = rework_structural_video_beat(config, i, v_p, structural, packet, beat=contract['beat'])
@@ -7624,9 +7701,13 @@ def _local_beat_review_system_prompt():
     （见 threshold_variant 的 hard_cut 定义），切点前那张外部帧的门本来就该是封死的；
     但局部审查只有一条按桥接变体写死的 THRESHOLD PEEK 规则，于是把"拱门处木门完全封闭、
     无法透过门洞预览室内"当成违规报了出来——纯误杀，还会把定向重写引去给硬切帧硬加
-    peek。现在 peek 规则显式排除 [CUT] 槽，并单列一条硬切规则说明该槽不是片段、
-    过门由文字承载（HARD_CUT_VIDEO_PLACEHOLDER），同时点名硬切只重置机位、不重置施工
-    进度——施工顺序/封套密闭/单调性照查不误。"""
+    peek。现在 peek 规则显式排除 [CUT] 槽，并单列一条切入规则说明门在片段里才被推开，
+    同时点名切入只重置机位、不重置施工进度——施工顺序/封套密闭/单调性照查不误。
+
+    2026-07-30：[CUT] 槽已改为真实生成的跨越片段（不再是占位声明），因此该条规则里
+    "不是片段、不按片段规则judge" 的措辞一并撤掉——它现在照常按跨越片段judge（纯运镜、
+    无工人、室内全程未被动工），只保留"起帧门封闭不是缺陷、没有 peek/无 scale-up"这部分
+    豁免。"""
     return f"""You are a strict construction-sequence and physical-causality auditor for a restoration / renovation time-lapse. You are judging ONLY ONE beat of a longer sequence: its VIDEO takes the space from IMAGE A to IMAGE B. You are shown the two actual RENDERED images for this beat only (IMAGE A first, IMAGE B second), alongside the complete IMAGE/VIDEO prompt text set for the whole sequence — use the full text only for context on what earlier/later beats established (e.g. when wiring/exterior/excavation happened), but only report a violation if it is visible IN THESE TWO IMAGES. Judge the real images, not just the prompt text — a prompt can describe the right thing and still have rendered wrong. Do NOT redesign, restyle, re-theme, or otherwise "improve" anything; you are reporting violations, not fixing them.
 
 Most of the rules below will not apply to this specific beat — skip inapplicable ones quickly. Only report a rule as violated if you can point to a CONCRETE visible detail in one of the two images that clearly contradicts it. If a potential issue is subtle, ambiguous, debatable, or you are not confident, do NOT report it — under-reporting is far cheaper than a false accusation here; a second reviewer will independently re-check anything you do report before it counts.
@@ -7645,7 +7726,7 @@ Hard vetoes to check against these two images:
 - CEILING-BEFORE-WALL ORDER: when both overhead/ceiling boarding and wall paneling occur in an enclosed space, the ceiling/overhead beat must come BEFORE the wall paneling beat (wall panels support and hide the ceiling-board edges); reorder if the walls close first.
 - ENCLOSED-SPACE PROVENANCE: any interior chamber revealed behind a newly opened shell (carved portal, cut opening, excavated mouth) must be physically accounted for — either the opening beat explicitly states the space is pre-existing (a natural cavity, an original room), or dedicated excavation/mucking-out beats appear before any interior finishing. A finished or large unexplained chamber behind a fresh opening is a violation, and the interior volume must plausibly fit inside the exterior shell.
 - VOLUME CONSERVATION: container scale, trip count, or a visibly growing spoil pile must plausibly account for the material removed or delivered in each beat. Room-scale debris or a passable cut opening cannot disappear into one or two hand crates; cubic-metre-scale removals need mechanical containers (excavator buckets, skips, chutes) or repeated trips feeding a growing spoil pile. Any cut-out slab, panel, or door-sized solid piece needs its own pry-out and carry-out action — crumbs in buckets never account for a large solid piece.
-- CAMERA VIEWPOINT CONTINUITY: No sudden camera viewpoint jumps. If IMAGE A is interior (camera inside the space, entry behind camera), IMAGE B cannot be exterior (camera outside looking in) without an intervening reverse-dolly VIDEO that pulls the camera back through the doorway. If this occurs, either keep the viewpoint consistent or insert a camera-pullback transition in the VIDEO. EXEMPTION — DECLARED HARD CUT: a VIDEO slot tagged [CUT] (its body declares a hard cut with no clip) is a sanctioned one-time exterior-to-interior scene cut; never flag the viewpoint change across that slot, and never "repair" it by adding a transition. A single threshold/bridge clip whose pan variant ends in a turn ([BRIDGE TURN], bridge_stage 1 with turn_direction set — a push through the threshold that ends in one stationary pan onto the interior's long axis) is likewise a sanctioned viewpoint rotation between its two IMAGEs — judge those two frames as 'same space, different facing', not as a composition drift.
+- CAMERA VIEWPOINT CONTINUITY: No sudden camera viewpoint jumps. If IMAGE A is interior (camera inside the space, entry behind camera), IMAGE B cannot be exterior (camera outside looking in) without an intervening reverse-dolly VIDEO that pulls the camera back through the doorway. If this occurs, either keep the viewpoint consistent or insert a camera-pullback transition in the VIDEO. EXEMPTION — DECLARED CUT-IN: a VIDEO slot tagged [CUT] (the single crossing clip of the sealed-entry variant, whose interior frame is re-established from scratch) is a sanctioned one-time exterior-to-interior viewpoint change; never flag the viewpoint change across that slot, and never "repair" it by adding an extra transition beat. A single threshold/bridge clip whose pan variant ends in a turn ([BRIDGE TURN], bridge_stage 1 with turn_direction set — a push through the threshold that ends in one stationary pan onto the interior's long axis) is likewise a sanctioned viewpoint rotation between its two IMAGEs — judge those two frames as 'same space, different facing', not as a composition drift.
 - FLOOR-BEFORE-HEAVY-OBJECTS: Floor finish must be installed BEFORE heavy anchored objects (fireplace, stove) are placed on it. If a heavy object is installed on a bare subfloor and then the finished floor appears under it, reorder the beats so flooring comes first.
 - FIXTURE COMPLETENESS: If wiring/electrical rough-in is present, light fixture installation must occur BEFORE the reward beat. Fixtures cannot appear in the final reward without an installation beat.
 - DOOR COMPLETENESS: If a door frame is installed, a door panel/leaf must be installed in a subsequent beat unless the design explicitly specifies an open archway.
@@ -7666,7 +7747,7 @@ Hard vetoes to check against these two images:
 - BI-DIRECTIONAL AGENT FLOW: Workers in video prompts must enter from a specific coordinate edge at t=0s and walk out through the same edge by t={WORKER_EXIT_TIME}s, leaving the frame completely empty of active agents at t={int(VIDEO_DURATION)}s. No teleportation or instant popping.
 - RIGID CONTAINER ENCAPSULATION: All loose materials, debris, fasteners, and liquids must be stored and tracked inside rigid, quantifiable containers (e.g. buckets, parts trays, boxes), and their volumes must be described as continuously increasing or decreasing.
 - THRESHOLD PEEK ANCHOR QUALIFICATION & SCALE (only applies if this beat is the threshold/bridge crossing beat AND its VIDEO slot is NOT tagged [CUT]): the two interior landmarks pre-visualized through the doorway before a threshold bridge must plausibly ALREADY EXIST at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. NEVER future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures). Each peeked anchor's declared frame-height scale must strictly INCREASE from the exterior peek IMAGE to the interior-settled IMAGE; a constant scale across the crossing is a violation — fix the scales, keep the objects.
-- DECLARED HARD CUT SLOT (only applies if this beat's VIDEO slot is tagged [CUT]): this crossing is a sanctioned hard cut, and its whole premise is that NOTHING of the interior is visible before crossing. A shut door, closed hatch, sealed shell, or pitch-black opening in the exterior IMAGE is the REQUIRED state here — never report it as a missing interior peek, an unopened/unfinished entry, a blocked crossing, or a reason the next frame cannot be interior. There is no peek, no anchor scale-up, and no on-camera door-opening action to look for in these two images; the slot's own text carries the crossing in words (the entry is opened and the camera moves inside). That slot is also a placeholder declaration, not a filmed clip, so never judge it against the clip rules (single milestone package, dual progress, worker entry/exit and agent flow, kinetic climax motion) and never report it as a static, actionless, or missing VIDEO. What still applies across a hard cut: construction order, envelope-seal continuity, and state monotonicity — the cut resets the camera only, so anything an earlier exterior beat sealed or repaired must read as still sealed and repaired on its inner face in the interior first frame.
+- DECLARED CUT-IN SLOT (only applies if this beat's VIDEO slot is tagged [CUT]): this is the sanctioned single crossing beat of the variant whose whole premise is that NOTHING of the interior is visible before crossing. A shut door, closed hatch, sealed shell, or pitch-black opening in the exterior IMAGE is the REQUIRED state here — never report it as a missing interior peek, an unopened/unfinished entry, a blocked crossing, or a reason the next frame cannot be interior. There is no peek and no anchor scale-up to look for between these two images: the entry is opened and passed through INSIDE this beat's own clip, so judge that slot as a crossing clip (a pure camera move through an untouched ruin, sterile of workers) and never against the construction-clip rules (single milestone package, dual progress, worker entry/exit and agent flow, kinetic climax motion). The interior IMAGE is also deliberately re-established from scratch rather than matched frame-to-frame against the exterior one, so do not report its different composition, framing, or camera position as a defect. What still applies across this crossing: construction order, envelope-seal continuity, and state monotonicity — it resets the camera only, so anything an earlier exterior beat sealed or repaired must read as still sealed and repaired on its inner face in the interior first frame.
 - BRIDGE WHITE-BALANCE DIRECTION (only applies if this beat is the threshold/bridge crossing beat): the single threshold/bridge beat's merged crossing clip VIDEO prose must describe ONE consistent, gradual colour-temperature direction across its full arc, attributed to the same light source throughout. A mid-clip reversal is a violation.
 - DOOR-FRAME CLEARANCE (only applies if IMAGE A or IMAGE B is a post-crossing interior frame): the rendered frame must be FULLY INSIDE the space — no door frame, door jamb, door leaf, threshold/sill edge, or entry-opening silhouette may remain visible anywhere in frame, and the interior walls/ceiling/floor must fill the frame edge to edge.
 - INTERIOR OCCUPANCY: post-crossing interior frames must be dominated by the interior space itself — walls, ceiling, and floor reaching the frame edges — never a small bright interior rectangle surrounded by exterior or dark margins.
@@ -8161,19 +8242,28 @@ def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, fa
     check_full_sequence_consistency 给出的该拍中文违规描述列表。失败时原样返回输入，
     调用方据此判断本轮是否有实际改动（未变化就不用重渲）。
 
-    video_meta：该拍 VIDEO 槽的 meta 标签。声明式硬切槽（[CUT]）的正文是确定性占位
-    声明（HARD_CUT_VIDEO_PLACEHOLDER），不是可改写的镜头描述——放给改写 LLM 只会把
-    "不生成片段 + 门开后进入内部空间"这段声明改成一条真镜头描述，而该槽根本不送 i2v。
-    这一拍只改 IMAGE，VIDEO 原样保留。"""
+    video_meta：该拍 VIDEO 槽的 meta 标签，用于识别过门跨越槽（[BRIDGE]/[BRIDGE TURN]/
+    [CUT]）——这三种槽的正文是纯运镜片段，收尾的确定性修复必须按「运动镜头」跑，否则
+    fix_camera_contradictions 会把"镜头推进穿过门"这类句子当成静止机位下的矛盾句删掉，
+    把唯一的动作正文清空。
+
+    2026-07-30：[CUT] 槽不再是不可改写的占位声明（它现在是真实生成的跨越片段），改写
+    照常进行；只有切换前落盘的旧单正文（HARD_CUT_VIDEO_PLACEHOLDER）仍然冻结——它描述
+    的是"不生成片段"，让 LLM 去改它只会得到一条与该单实际渲染行为不符的镜头描述。"""
     if not issues:
         return video_prompt, image_prompt
     _meta = str(video_meta or '').upper()
-    _is_cut_slot = 'CUT' in _meta and 'BRIDGE' not in _meta
+    _is_crossing_slot = 'BRIDGE' in _meta or 'CUT' in _meta
+    _is_legacy_cut_placeholder = is_legacy_hard_cut_placeholder(video_prompt)
     _cut_note = (
-        " NOTE: this beat's VIDEO slot is a DECLARED HARD CUT placeholder — no clip is "
-        "generated for it and the crossing is carried in words there. Return its text "
-        "character-for-character unchanged and fix the IMAGE prompt only."
-        if _is_cut_slot else "")
+        " NOTE: this beat's VIDEO slot is a legacy DECLARED HARD CUT placeholder — no clip is "
+        "generated for it in this project and the crossing is carried in words there. Return its "
+        "text character-for-character unchanged and fix the IMAGE prompt only."
+        if _is_legacy_cut_placeholder else
+        " NOTE: this beat's VIDEO is the single exterior-to-interior crossing clip (a pure camera "
+        "move through an untouched ruin, sterile of workers). Keep its camera-motion sentences — "
+        "never turn it into a static-camera or construction-work clip."
+        if _is_crossing_slot else "")
     system_prompt = (
         "You are an expert prompt engineering assistant fixing a construction-sequence "
         "time-lapse VIDEO+IMAGE prompt pair based on violations found by reviewing the "
@@ -8198,15 +8288,18 @@ def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, fa
         new_image = str(data.get('image') or '').strip()
         if not new_video or not new_image:
             return video_prompt, image_prompt
-        # 提示词里已经关照过了，但这是确定性兜底：硬切槽的正文不接受任何改写。
-        if _is_cut_slot:
+        # 提示词里已经关照过了，但这是确定性兜底：旧单的占位声明不接受任何改写。
+        if _is_legacy_cut_placeholder:
             new_video = video_prompt
         # 收尾走一遍与其它改写路径同款的确定性修复
         new_image = clean_prompt_text(new_image)
         new_image = fix_image_clean_frame_proactive(new_image)
         if family:
             new_image = fix_horizon_line(new_image, family=family)
-            new_video = fix_camera_contradictions(new_video)
+            # 过门跨越槽按运动镜头修（is_moving=True）：默认的静止机位口径会把
+            # "camera pushes forward through the threshold" 整句删掉，跨越片段就没
+            # 动作正文了。
+            new_video = fix_camera_contradictions(new_video, is_moving=_is_crossing_slot)
         return new_video, new_image
     except Exception as e:
         # 取消不能被吞成"这一拍没改动"——那样调用方会拿着未改写的提示词照样重渲一遍
@@ -8361,7 +8454,10 @@ def _build_partial_prompt_block(compiled_images, compiled_videos, beat_ladder):
                 # 所有既有 is_bridge 检测不受影响。
                 meta = "BRIDGE TURN" if beat.get('turn_direction') else "BRIDGE"
             elif beat.get('hard_cut'):
-                # 声明式硬切：不生成视频片段、不送 i2v；帧渲染据此把下一帧当 t2i 新链头
+                # 声明式切入拍：本拍视频照常生成（正文是普通的跨越镜头，见 _beat_contract
+                # 的 is_cut 契约）。'CUT' 标签管的是别的三件事——帧渲染据它把下一帧另起
+                # 一批（提示词主导场景变化）、族锚/族计算据它换族、一致性审查据它豁免
+                # peek 与视点跳变。它不再代表"这一槽不生成视频"。
                 meta = "CUT"
         formatted_videos[idx] = {"body": vid, "meta": meta}
 

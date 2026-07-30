@@ -1154,9 +1154,14 @@ def gallery_collect_references(library_items=None, tasks=None):
     theme、所有命名方案变体都算引用——宁可漏标孤儿，绝不能把在用资产标成孤儿
     （孤儿标记是画廊批量清理的入口，误标的代价是用户删掉活资产）。
     library_items/tasks 传 None 时从真实数据源读取；测试传显式列表。
+
+    返回值里的 project_owners 是"项目目录名 → 点子库条目（id/标题）"的反查表，
+    给画廊每个项目组挂上"回到激发项目"的直达入口。它只认点子库条目——运行中的
+    任务还没落库，前端也没有可载入的记录。
     """
     cover_paths = set()
     project_names = set()
+    project_owners = {}
 
     def add_cover(u):
         if not isinstance(u, str):
@@ -1165,32 +1170,40 @@ def gallery_collect_references(library_items=None, tasks=None):
         if rel.startswith(OUTPUT_ROOT + '/'):
             cover_paths.add(rel)
 
-    def add_title(t):
-        project_names.update(_gallery_title_names(t))
+    def add_title(t, sink=None):
+        names = _gallery_title_names(t)
+        project_names.update(names)
+        if sink is not None:
+            sink.update(names)
 
-    def add_path_project(p):
+    def add_path_project(p, sink=None):
         if not isinstance(p, str):
             return
         parts = p.replace('\\', '/').lstrip('/').split('/')
         if len(parts) >= 2 and parts[0] == OUTPUT_ROOT and parts[1] not in GALLERY_SPECIAL_DIRS:
             project_names.add(parts[1])
+            if sink is not None:
+                sink.add(parts[1])
 
-    def eat_record(rec):
+    def eat_record(rec, sink=None):
         if not isinstance(rec, dict):
             return
         for u in (rec.get('covers') or []):
             add_cover(u)
         add_cover(rec.get('collage_url'))
-        add_title(rec.get('title'))
-        add_title(rec.get('english_title'))
+        add_title(rec.get('title'), sink)
+        add_title(rec.get('english_title'), sink)
+        # 每次合成独占的媒体命名空间（run_<task_id>__<标题>）才是真正的目录名来源，
+        # 标题派生的那几个变体只对早期没有 project_key 的记录管用
+        add_title(rec.get('project_key'), sink)
         fr = rec.get('frameRun')
         if isinstance(fr, dict):
-            add_title(fr.get('title'))
+            add_title(fr.get('title'), sink)
             for coll in ('frames', 'videos'):
                 for e in (fr.get(coll) or []):
                     if isinstance(e, dict):
-                        add_path_project(e.get('url'))
-                        add_path_project(e.get('file'))
+                        add_path_project(e.get('url'), sink)
+                        add_path_project(e.get('file'), sink)
 
     if library_items is None:
         library_items = []
@@ -1204,7 +1217,17 @@ def gallery_collect_references(library_items=None, tasks=None):
                 except Exception:
                     pass
     for item in (library_items or []):
-        eat_record(item)
+        owned = set()
+        eat_record(item, owned)
+        if not isinstance(item, dict):
+            continue
+        idea_id = str(item.get('id') or '').strip()
+        if not idea_id:
+            continue
+        owner = {'idea_id': idea_id, 'idea_title': str(item.get('title') or '')}
+        for name in owned:
+            # 同名目录归最靠前的那条（点子库按新→旧排列，重复合成时优先认新记录）
+            project_owners.setdefault(name, owner)
 
     if tasks is None:
         with ACTIVE_TASKS_LOCK:
@@ -1222,7 +1245,11 @@ def gallery_collect_references(library_items=None, tasks=None):
             # 场景主题，多收一个引用无害（从宽原则）
             add_title(dims.get('theme'))
 
-    return {'cover_paths': cover_paths, 'project_names': project_names}
+    return {
+        'cover_paths': cover_paths,
+        'project_names': project_names,
+        'project_owners': project_owners,
+    }
 
 
 def scan_gallery(base_dir=None, refs=None):
@@ -1233,8 +1260,9 @@ def scan_gallery(base_dir=None, refs=None):
     产物目录（*_frames，成百上千张 jpg）不属于用户资产，不进画廊。
 
     refs 传 gallery_collect_references() 的返回值时做引用标注：封面 item 加
-    in_use（被点子库/任务引用），项目组加 orphan（无任何引用且超过活跃宽限期）。
-    refs=None 时不加任何标注字段（前端按无标注降级展示）。
+    in_use（被点子库/任务引用），项目组加 orphan（无任何引用且超过活跃宽限期），
+    能反查到点子库归属的项目组再加 idea_id/idea_title（画廊上"回到激发项目"的
+    直达入口）。refs=None 时不加任何标注字段（前端按无标注降级展示）。
     """
     base_dir = base_dir or os.path.dirname(os.path.abspath(__file__))
     out_dir = os.path.join(base_dir, OUTPUT_ROOT)
@@ -1303,6 +1331,10 @@ def scan_gallery(base_dir=None, refs=None):
             g = groups[-1]
             g['orphan'] = (name not in refs['project_names']
                            and g['latest_mtime'] < now - GALLERY_ORPHAN_GRACE_SECONDS)
+            owner = (refs.get('project_owners') or {}).get(name)
+            if owner:
+                g['idea_id'] = owner['idea_id']
+                g['idea_title'] = owner['idea_title']
 
     # 最近有动静的组排最前（covers/image-station 也参与排序）
     groups.sort(key=lambda g: g['latest_mtime'], reverse=True)

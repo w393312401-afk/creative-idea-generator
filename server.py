@@ -1317,7 +1317,8 @@ def _fx_serial_lock_for(config, task_id=None, kind='frames', cancel_event=None):
 
 # 自带墙钟预算的旁路动作：它们占用浏览器的时间是有界的，所以别的旁路动作可以安心
 # 排在它们后面，不必像遇到生成任务那样直接拒绝（见 /api/account-pool/refresh）。
-FX_BOUNDED_BYPASS_KINDS = {'credit_probe', 'selector_probe', 'selftest'}
+# auto_login 的预算是 auto_login.DEFAULT_TIMEOUT_SECONDS（180s），同样有界。
+FX_BOUNDED_BYPASS_KINDS = {'credit_probe', 'selector_probe', 'selftest', 'auto_login'}
 
 
 def _fx_browser_gate(kind, cancel_check=None, priority=0, task_id=None):
@@ -1458,9 +1459,9 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
                 if slot not in manifest_video_slots:
                     has_failures = True
                     break
-                # 'skipped_cut'（声明式硬切槽位）是预期缺失，不算失败——合并门禁
-                # （merge_project_videos）同样按预期缺失处理；'skipped_bridge_hold'
-                # 已停用，仅为兼容旧 manifest 保留
+                # 'skipped_cut'（旧单的硬切占位槽位；2026-07-30 起新单的 [CUT] 槽照常
+                # 生成视频）是预期缺失，不算失败——合并门禁（merge_project_videos）同样
+                # 按预期缺失处理；'skipped_bridge_hold' 已停用，仅为兼容旧 manifest 保留
                 if manifest_video_slots[slot].get('status') not in ('success', 'skipped_cut', 'skipped_bridge_hold'):
                     has_failures = True
                     break
@@ -3126,6 +3127,124 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'status': 'error', 'message': msg}, status=500)
                     return
                 self._send_json({'status': 'ok', 'message': msg, 'user_id': user_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/account-pool/credentials':
+            # 保存账号的自动登录凭据: {user_id, email?, password?, totp_secret?}
+            #
+            # ⚠️ 字段缺省 = "这一项不改"，传空字符串 = "清空这一项"。这个区分不能
+            # 简化：列表接口从不回传密码明文，前端编辑表单里的密码框天然是空的，
+            # 若把"空"一律当成"清空"，用户改个邮箱就会把密码抹掉（而且是静默的：
+            # 下一次掉登录直接退回等人工，用户以为凭据还在）。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                user_id = str(body.get('user_id') or '').strip()
+                if not user_id:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
+                    return
+                from integrations.google_fx.utils import account_credentials
+                entry = account_credentials.save(
+                    user_id,
+                    email=body.get('email') if 'email' in body else None,
+                    password=body.get('password') if 'password' in body else None,
+                    totp_secret=body.get('totp_secret') if 'totp_secret' in body else None,
+                )
+                self._send_json({'status': 'ok', 'credentials': entry})
+            except ValueError as e:
+                # TOTP 密钥格式错误走这里（TotpSecretError 是 ValueError 子类）。
+                # 400 而不是 500：是用户填错了，不是服务故障，文案能直接照着改。
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/account-pool/credentials/delete':
+            # 删除某账号的登录凭据（账号本身留在号池，只是不再自动登录）
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                user_id = str(body.get('user_id') or '').strip()
+                if not user_id:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
+                    return
+                from integrations.google_fx.utils import account_credentials
+                removed = account_credentials.remove(user_id)
+                self._send_json({'status': 'ok', 'removed': removed})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/account-pool/reset-breaker':
+            # 人工解除自动登录熔断。改凭据会自动清零计数，这个入口是给"确认凭据
+            # 没问题、上次失败是环境原因"的情况用的。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                user_id = str(body.get('user_id') or '').strip()
+                if not user_id:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
+                    return
+                from integrations.google_fx.utils import account_credentials
+                entry = account_credentials.reset_breaker(user_id)
+                if entry is None:
+                    self._send_json({'status': 'error', 'message': '这个账号没有凭据记录'}, status=404)
+                    return
+                self._send_json({'status': 'ok', 'credentials': entry})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/account-pool/login':
+            # 现在就用存好的凭据登一次（控制台「测试登录」）。开浏览器、走完整
+            # 登录表单，很慢，前端必须有 loading 态。
+            #
+            # 忙碌判定照抄 /api/account-pool/refresh：两者抢的是同一个 AdsPower
+            # profile，生成任务占着浏览器时直接回 409 让用户稍后再点，而不是让这个
+            # HTTP 请求静默长挂几分钟。
+            if not self._gate(with_rate=True, rate_action='account_refresh'):
+                return
+            try:
+                body = self._read_json_body()
+                user_id = str(body.get('user_id') or '').strip()
+                if not user_id:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
+                    return
+                queue = FX_CONTROL.snapshot()
+                if queue.get('processing_paused'):
+                    self._send_json({
+                        'status': 'error', 'code': 'FX_PAUSED',
+                        'message': 'Google FX 队列处于暂停模式，测试登录拿不到浏览器；请先在控制台恢复处理',
+                    }, status=409)
+                    return
+                active_rows = queue.get('active_list') or []
+                blocking = [row for row in active_rows
+                            if str(row.get('kind')) not in FX_BOUNDED_BYPASS_KINDS]
+                if blocking:
+                    busy = blocking[0].get('task_id') or '其它任务'
+                    self._send_json({
+                        'status': 'error', 'code': 'FX_BUSY',
+                        'message': f'浏览器正被 {busy} 占用，测试登录需要同一个浏览器，请等它结束后再试',
+                    }, status=409)
+                    return
+
+                from integrations.google_fx.utils import auto_login
+                result = auto_login.run_standalone_login(user_id)
+                pool = _get_account_pool()
+                account = next((a for a in pool.list_accounts(heal=False)
+                                if a.get('user_id') == user_id), None)
+                if result.ok:
+                    self._send_json({'status': 'ok', 'reason': result.reason,
+                                     'message': result.message, 'account': account})
+                    return
+                # 409 = "现在不行，可以再试"；422 = "凭据/账号本身有问题，再点多少
+                # 次都一样"。前端据此决定是提示稍后重试还是提示去改凭据。
+                retryable = ('browser_busy', 'cancelled', 'browser_gone', 'timeout')
+                self._send_json(
+                    {'status': 'error', 'code': result.reason.upper(),
+                     'message': result.message, 'account': account},
+                    status=409 if result.reason in retryable else 422)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 

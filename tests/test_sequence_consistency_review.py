@@ -79,11 +79,15 @@ class TestSequenceReviewSystemPromptMilestones(unittest.TestCase):
         self.assertIn('NOT tagged [CUT]', peek_rule)
 
         cut_rule = next(line for line in prompt.splitlines()
-                        if line.startswith('- DECLARED HARD CUT SLOT'))
+                        if line.startswith('- DECLARED CUT-IN SLOT'))
         self.assertIn('REQUIRED state', cut_rule)
         self.assertIn('never report it as a missing interior peek', cut_rule)
-        # 硬切只重置机位，不重置施工进度——封套密闭/施工顺序照查
+        # 切入只重置机位，不重置施工进度——封套密闭/施工顺序照查
         self.assertIn('resets the camera only', cut_rule)
+        # 2026-07-30：该槽现在是真实生成的跨越片段，规则不得再说它「不是片段」
+        # ——否则审查会把这段真片段当占位声明放过（也是当年不生成的同一套说法）。
+        self.assertIn('judge that slot as a crossing clip', cut_rule)
+        self.assertNotIn('placeholder', cut_rule.lower())
 
     def test_global_prompt_only_has_cross_frame_rules(self):
         prompt = pp._global_review_system_prompt(10)
@@ -546,9 +550,9 @@ class TestFixBeatFromSequenceReview(unittest.TestCase):
         self.assertEqual(v, 'new video body')
         self.assertEqual(i, 'new image body')
 
-    def test_hard_cut_slot_video_body_is_never_rewritten(self):
-        """硬切槽的正文是确定性占位声明（不送 i2v），改写 LLM 只会把它写成一条真镜头
-        描述。IMAGE 照常修，VIDEO 原样保留。"""
+    def test_legacy_hard_cut_placeholder_body_is_never_rewritten(self):
+        """旧单遗留的占位声明（该单确实不生成这段视频）不接受改写：把它改成一条真镜头
+        描述，会与这一单实际的渲染行为不符。IMAGE 照常修，VIDEO 原样保留。"""
         raw = json.dumps({'video': 'a sweeping dolly through the doorway', 'image': 'new image body'})
         with patch.object(pp, '_chat', return_value=raw), \
              patch.object(pp, 'clean_prompt_text', side_effect=lambda s: s), \
@@ -557,6 +561,32 @@ class TestFixBeatFromSequenceReview(unittest.TestCase):
                 {}, pp.HARD_CUT_VIDEO_PLACEHOLDER, 'old image', ['木门封闭'], video_meta='CUT')
         self.assertEqual(v, pp.HARD_CUT_VIDEO_PLACEHOLDER)
         self.assertEqual(i, 'new image body')
+
+    def test_new_cut_slot_video_body_stays_rewritable(self):
+        """2026-07-30：[CUT] 槽的正文现在是真实跨越片段的普通镜头描述，与 BRIDGE 同权，
+        照常可改写——只有旧单的占位声明才冻结。"""
+        raw = json.dumps({'video': 'new crossing body', 'image': 'new image body'})
+        with patch.object(pp, '_chat', return_value=raw), \
+             patch.object(pp, 'clean_prompt_text', side_effect=lambda s: s), \
+             patch.object(pp, 'fix_image_clean_frame_proactive', side_effect=lambda s: s):
+            v, _ = pp.fix_beat_from_sequence_review(
+                {}, 'the camera pushes through the opened hatch', 'old image', ['issue'],
+                video_meta='CUT')
+        self.assertEqual(v, 'new crossing body')
+
+    def test_crossing_slot_keeps_its_camera_motion_sentence(self):
+        """收尾的确定性修复必须按运动镜头跑：默认的静止机位口径会把跨越片段唯一的
+        动作句（镜头推进穿过门）当矛盾句删掉，槽位就又变成"没有镜头"了。"""
+        motion = ('The camera pushes forward through the opened hatch and settles inside. '
+                  'Dust hangs in the light.')
+        raw = json.dumps({'video': motion, 'image': 'new image body'})
+        with patch.object(pp, '_chat', return_value=raw), \
+             patch.object(pp, 'clean_prompt_text', side_effect=lambda s: s), \
+             patch.object(pp, 'fix_image_clean_frame_proactive', side_effect=lambda s: s), \
+             patch.object(pp, 'fix_horizon_line', side_effect=lambda s, **kw: s):
+            v, _ = pp.fix_beat_from_sequence_review(
+                {}, 'old video', 'old image', ['issue'], family='interior', video_meta='CUT')
+        self.assertIn('pushes forward through the opened hatch', v)
 
     def test_bridge_slot_video_body_stays_rewritable(self):
         """单一过门拍的 VIDEO 是真实可见片段，不受硬切豁免影响，照常可改写。"""

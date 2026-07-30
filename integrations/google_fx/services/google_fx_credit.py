@@ -29,7 +29,7 @@ from typing import Optional
 from ..utils.browser import (
     get_ads_ws_url, find_or_create_page, ensure_flow_workspace,
     flow_onboarding_required, is_google_login_page, random_sleep,
-    BrowserSessionClosedError, _browser_session_is_closed,
+    attempt_auto_login, BrowserSessionClosedError, _browser_session_is_closed,
 )
 from ..utils.browser_gate import browser_slot
 from ..utils.logger import log, set_task_label, reset_task_label
@@ -315,11 +315,19 @@ def probe_flow_credit(
 
                     _checkpoint()
                     if is_google_login_page(page):
-                        _set_probe_error(user_id, "🔒 遇到 Google 登录页面，请人工打开 AdsPower 完成登录")
-                        log(f"🔒 账号 {user_id} 积分探测终止：检测到 Google 登录页面，提醒人工处理", "积分探针")
-                        return None
+                        # 配了凭据就先自己登一次再说。探针是选号的前置动作，
+                        # 一个"只是掉了登录"的好账号不该因此被跳过。
+                        # user_id 必须显式传：探针不绑定 account_binding 上下文。
+                        if not attempt_auto_login(page, user_id=user_id,
+                                                  context_label="积分探针",
+                                                  cancel_check=_cancelled):
+                            _set_probe_error(user_id, "🔒 遇到 Google 登录页面，请人工打开 AdsPower 完成登录")
+                            log(f"🔒 账号 {user_id} 积分探测终止：检测到 Google 登录页面，提醒人工处理", "积分探针")
+                            return None
+                        _checkpoint()
 
-                    if not ensure_flow_workspace(page, timeout_seconds=_step_timeout(25.0)):
+                    if not ensure_flow_workspace(page, timeout_seconds=_step_timeout(25.0),
+                                                 user_id=user_id):
                         if is_google_login_page(page):
                             _set_probe_error(user_id, "🔒 遇到 Google 登录页面，请人工打开 AdsPower 完成登录")
                             log(f"🔒 账号 {user_id} 积分探测终止：检测到 Google 登录页面，提醒人工处理", "积分探针")

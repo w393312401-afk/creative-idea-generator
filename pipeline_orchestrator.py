@@ -1047,7 +1047,8 @@ def _render_videos_with_recovery(config, title, prompt_block, on_progress=None):
     back rejected/blocked (e.g. a failed Google FX anchor-match) instead of leaving it
     for a human to notice and re-trigger manually."""
     video_result = generate_video_sequence(config, title, prompt_block, on_progress=on_progress)
-    # 'skipped_cut'（声明式硬切槽位）是预期缺失，不进恢复重试轮；'skipped_bridge_hold'
+    # 'skipped_cut'（旧单的硬切占位槽位，新单的 [CUT] 槽照常生成）是预期缺失，
+    # 不进恢复重试轮；'skipped_bridge_hold'
     # 已停用（单一过门拍收编后不再有需要跳过的 HOLD 槽位），仅为兼容旧 manifest 保留
     failed_slots = [v['slot'] for v in video_result.get('videos', [])
                     if v.get('status') not in ('success', 'skipped_cut', 'skipped_bridge_hold')]

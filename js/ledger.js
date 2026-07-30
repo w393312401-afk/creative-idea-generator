@@ -175,6 +175,7 @@ function renderLedger() {
                 </td>
                 <td class="l-col-source" title="${escapeHtml(r.source || '')}">${escapeHtml(r.source || '')}</td>
                 <td class="l-col-actions">
+                    <button type="button" class="ledger-tool-btn small l-open-project-btn" title="打开这条创意合成出来的激发项目（提示词/封面/帧与视频）">🎬 激发项目</button>
                     <button type="button" class="ledger-tool-btn small l-remix-btn" title="以这条创意为母题激发一批二创方案">♻️ 二创</button>
                     <button type="button" class="ledger-tool-btn small danger l-delete-btn" title="删除本条">🗑️</button>
                 </td>
@@ -287,6 +288,13 @@ function initLedger() {
             ledgerUpdateBulkBar();
             return;
         }
+        if (e.target.closest('.l-open-project-btn')) {
+            const tr = e.target.closest('tr[data-id]');
+            const row = tr && ledgerFindRow(tr.dataset.id);
+            if (!row) return;
+            openLedgerSparkProject(row);
+            return;
+        }
         if (e.target.closest('.l-remix-btn')) {
             const tr = e.target.closest('tr[data-id]');
             const row = tr && ledgerFindRow(tr.dataset.id);
@@ -300,6 +308,23 @@ function initLedger() {
             if (!row) return;
             ledgerDeleteIds([row.id], `「${row.one_line || row.topic_dna}」这条台账记录`);
         }
+    });
+}
+
+// 「🎬 激发项目」：从台账这一行跳回它合成出来的项目（点子库记录优先，其次
+// 已完成的任务记录）。入账时 one_line 取的是灵感卡片选题名、creative_seed
+// .input_str 取的是同一张卡的一键输入串——两者正好对上点子库的 title/theme
+// 与任务 dimensions 的 task_label/theme，解析细节见 app.js openSparkProject。
+async function openLedgerSparkProject(row) {
+    if (typeof openSparkProject !== 'function') {
+        showToast('激发结果工作区尚未加载完成，请稍后重试', 'error');
+        return;
+    }
+    await openSparkProject({
+        dna: row.topic_dna || '',
+        seed: (row.creative_seed && row.creative_seed.input_str) || '',
+        title: row.one_line || '',
+        label: row.one_line || row.topic_dna || '该创意',
     });
 }
 

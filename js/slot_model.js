@@ -330,8 +330,9 @@ function videoSlotState(video, ctx) {
     const label = videoSlotLabel(Number(video.slot) || seq, isHero);
     const url = video.url || video.file;
 
-    // 声明式硬切（[CUT]，TBCP v2 hard_cut）：该槽不生成视频，成片在此处直接硬切。
-    // 画中性卡片而不是失败卡——重试它没有意义。合并门禁把 skipped_cut /
+    // 硬切占位槽（旧单专属）：2026-07-30 起 [CUT] 槽照常生成视频（正文是普通的过门
+    // 跨越镜头），只有切换前落盘的旧单仍会回 skipped_cut——该槽不生成视频，成片在此处
+    // 直接硬切。画中性卡片而不是失败卡——重试它没有意义。合并门禁把 skipped_cut /
     // skipped_bridge_hold 都当"预期缺失"（server.py:1395），这里口径必须一致：
     // 此前重渲清单时它们没有 url，会被当成 status==='failed' 画成带重试按钮的
     // 失败卡，与服务端判定相反。

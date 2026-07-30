@@ -308,3 +308,20 @@ hard_cut 切点两侧的帧**不得组成首尾帧对送 i2v**（否则视频模
 **测试**：`tests/test_threshold_variants.py` 新增 `TestPostRevealCleanupContract`（清理拍标记/契约文本、过门拍与后续普通室内拍不误命中、Standard 模式不命中、首现帧 3 类+零人工痕迹、过门片段两条新契约）、`TestBridgeClipWorkContentCheck`（穿越途中施工/清理命中 + 纯运镜措辞不误报）、`TestPostRevealCleanupPromptCheck`、`TestPostCrossingCleanupLadderGate`（节拍梯结构校验打回 + 违规回写重试提示 + 合规一次通过）；`tests/test_structural_beat_rework.py` 新增 2 类被判不合格、3 类通过、人工痕迹命中/否定式放行/非首现拍跳过；`tests/test_frame_generator.py` 新增 `TestFirstInteriorRevealRawState`（定向修正带上 VLM 原因、修完仍不过保留帧并留痕、通过则不动帧）。全量 pytest 除 2 项与本次无关的既有失败（`test_ideation_trend_sources` 两例，命中的是外部 skill 的 `idea-engine.md` 文案与 run_ideate 兜底，改动前后一致）外全绿。
 
 **Rollout 注意**：外部 skill 参考文档 `threshold-bridge-consistency-protocol.md`（Rule 1 补"穿越途中不干活/一镜到底"、Rule 6 改写为三条强制项+像素门禁说明、新增 §9 Post-Crossing Cleanout、审计表改一行加两行）与 `prompt-templates.md`（首现帧说明改写、Interior IMAGE exemplar 补零人工痕迹措辞、三条过门 VIDEO exemplar 补全程原始+一镜到底、总检查清单补三项）一并更新，因为它们会被 `load_reference_file` 逐字注入生成 LLM 的 system prompt。`packet_cache.json` 无需清理（未改 packet 字段）；`MILESTONE_POLICY_VERSION` 已从 `visible-milestones-v1` 换代为 `visible-milestones-v2-post-crossing-cleanout`：它进 `get_brief_fingerprint`，所以全部存量 `compose_checkpoints.json` 断点与 `packet_cache.json` 条目自动失效、整单重排（存量断点的节拍梯没有清理拍，续传会绕过新的结构校验产出旧形态，只能靠指纹换代逼它重来），无需手工清文件。改动全部在 `refactor/structure` 分支，未提交；需重启 :8085 生效。未做实机生成验证（本次仅代码+单测层面）。
+
+## 14. TBCP v6 — 硬切槽位改为真实生成的跨越片段（2026-07-30）
+
+**触发**：用户实测反馈——「过门硬切镜头不生成」。根因就是 §2.3/§6 当年的设计选择：`hard_cut` 变体的 VIDEO T 槽位不送 i2v，正文被确定性覆盖成固定占位声明（`HARD_CUT_VIDEO_PLACEHOLDER`），成片在过门处直接 concat 硬拼。于是这一单的过门只存在于文字里，用户在结果面板看到的就是一个不生成、也无法重试的空槽。
+
+**修订**：`[CUT]` 槽位照常生成视频，正文就是一段普通的过门跨越镜头提示词（"就当正常描述视频提示词"）。
+
+- **视频侧一律按跨越镜头处理**：新增单一判据 `beat_is_crossing_clip(beat)`（`bridge_stage == 1` 或 `hard_cut`）。`apply_proactive_fixes`（`fix_camera_contradictions` 的 is_moving 口径）、`validate_beat_prompts`（`check_camera_contradictions` / `check_bridge_sterile` / `check_video_process_content`）、`rework_structural_video_beat`（回炉时要求补运镜正文而不是施工正文）全部改走这个判据——此前它们按 `bridge_stage` 单独判定，会把切入拍当静止施工拍，运镜句直接被删。
+- **契约文案**：`_beat_contract` 的 `is_cut` 分支从"占位声明、本拍真实内容是 IMAGE"改成与 bridge 同款的完整跨越镜头契约（绑定 IMAGE i → i+1；门在片段里被推开→推进→门框擦出画→曝光/白平衡滚动→完全入内），外加本变体独有的一条"片段开始前不得预览室内"（起帧的门是封闭的，揭示发生在片段内）。批量/单拍两条生成链的规则文本、`threshold_split_rules` 的 hard_cut 分支、brief 阶段的变体定义同步改写。
+- **占位覆盖与豁免全部撤掉**：三处 `v_p = HARD_CUT_VIDEO_PLACEHOLDER`（批量、单拍、兜底）删除，兜底稿换成与 bridge 兜底同款的真实跨越镜头；结构性回炉不再跳过切入拍；视频侧校验不再整段跳过（§5.2 的"[CUT] 槽位跳过全部视频词汇校验"作废）。
+- **审查规则**：`_local_beat_review_system_prompt` 的 `DECLARED CUT-IN SLOT` 条目保留"起帧门封闭是既定状态、没有 peek/无 scale-up、构图不必与外部帧对齐"这部分豁免，撤掉"不是片段、不按片段规则judge"——现在它按跨越片段judge（纯运镜、无工人、室内全程未被动工）。定向重写（`fix_beat_from_sequence_review`）对 `[CUT]` 正文解冻，并按运动镜头跑收尾的确定性修复（此前 `fix_camera_contradictions` 默认静止口径会把跨越片段唯一的动作句删掉，BRIDGE 槽也受此影响，一并修）。
+- **旧单兼容按正文识别，不按标签识别**：`[CUT]` 标签在新单里仍然有用（帧渲染据它把室内首帧当新批链头、`family_anchor_seq`/`image_space_family` 据它换族、审查据它豁免 peek），所以不能拿标签判断"要不要生成"。改由 `plan_video_slots` 检查正文是否以 `DECLARED HARD CUT` 开头（`HARD_CUT_PLACEHOLDER_PREFIX` / `is_legacy_hard_cut_placeholder`）：只有切换前落盘的旧单继续 `skip_cut`，`skipped_cut` 相关的合成门禁/恢复轮/前端中性卡片全部原样保留，仅退化为旧单专属路径。
+- **帧侧不变**：切点后的室内首帧仍是新批链头 + bridge 版 i2i 控制指令（§4.3 不受影响）；`frame_pair_contract` 的"两端差异过大"只是警告，不拦截，切点这一对帧照常提交。
+
+**范围**：只动 hard_cut 变体的视频侧；coaxial/pan 行为不变（除定向重写的运动镜头口径修正，对它们是修 bug）。
+
+**测试**：`tests/test_threshold_variants.py` — `TestCrossingClipPredicate`、`TestLegacyHardCutPlaceholder`、`test_hard_cut_beat_is_validated_as_a_crossing_clip`、`test_hard_cut_beat_without_any_camera_move_is_flagged`（占位式正文现在会被校验报出来，不再静默放行）、`test_cut_beat_contract_demands_a_real_generated_crossing_clip`（契约不得再出现 placeholder/no video clip 口径）、`TestPlanVideoSlotsCut`（新单生成 / 旧单占位仍跳过）；`tests/test_sequence_consistency_review.py` — 审查规则口径、[CUT] 正文解冻、跨越片段运镜句不被删。全量 pytest 1355 passed。

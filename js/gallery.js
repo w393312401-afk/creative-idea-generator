@@ -210,6 +210,12 @@ function renderGallery() {
         const shown = collapsed ? [] : (expanded ? g.items : g.items.slice(0, GALLERY_TRUNCATE));
         const gBytes = g.items.reduce((s, it) => s + (it.size || 0), 0);
         const orphanBadge = g.orphan === true ? '<span class="g-orphan-badge" title="未被任何点子/任务引用的历史遗留项目">⚠ 孤儿</span>' : '';
+        // 只有项目组才谈得上"回到激发项目"——封面池与图像工坊不属于任何一单合成。
+        // idea_id 是服务端按目录命名反查到的点子库归属（见 gallery_collect_references）；
+        // 没反查到也照样给按钮，前端还能按目录名里的 run_<task_id> 落到任务记录上。
+        const openProjectBtn = g.kind === 'project'
+            ? `<button type="button" class="gallery-tool-btn small g-group-open-project" title="打开这批素材所属的激发项目（提示词/封面/帧与视频）">🎬 激发项目</button>`
+            : '';
 
         let gridHtml = '';
         if (!collapsed) {
@@ -232,6 +238,7 @@ function renderGallery() {
                     <span class="g-count">${g.items.length} 项 · ${galleryFmtSize(gBytes)}</span>
                 </h3>
                 <div class="gallery-group-actions">
+                    ${openProjectBtn}
                     <button type="button" class="gallery-tool-btn small g-group-select">全选本组</button>
                     <button type="button" class="gallery-tool-btn small danger g-group-delete">删除本组</button>
                 </div>
@@ -359,6 +366,23 @@ function galleryOpenPreview(path) {
     }
 }
 
+// 「🎬 激发项目」：从项目组跳回产出这批素材的那一单激发。服务端已按目录命名
+// 反查过点子库（idea_id/idea_title），反查不到时把目录名当 project_key 交给
+// openSparkProject，让它按 run_<task_id>_ 前缀落到任务记录上（合成完但没收藏
+// 进点子库的项目只有任务记录）。
+async function galleryOpenSparkProject(group) {
+    if (typeof openSparkProject !== 'function') {
+        showToast('激发结果工作区尚未加载完成，请稍后重试', 'error');
+        return;
+    }
+    await openSparkProject({
+        ideaId: group.idea_id || null,
+        title: group.idea_title || group.title || '',
+        projectKey: group.key || '',
+        label: group.idea_title || group.title || '该项目',
+    });
+}
+
 function galleryDownload(it) {
     const a = document.createElement('a');
     a.href = galleryEncodeUrl(it.url);
@@ -459,6 +483,12 @@ function initGallery() {
     container.addEventListener('click', (e) => {
         const groupEl = e.target.closest('.gallery-group');
 
+        if (e.target.closest('.g-group-open-project')) {
+            const key = groupEl?.dataset.group;
+            const group = galleryVisibleGroups().find(g => g.key === key);
+            if (group) galleryOpenSparkProject(group);
+            return;
+        }
         if (e.target.closest('.g-group-select')) {
             const key = groupEl?.dataset.group;
             const group = galleryVisibleGroups().find(g => g.key === key);

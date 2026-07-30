@@ -5,7 +5,8 @@
 - 插帧中间产物目录（项目根下 frames/videos 以外的子目录）不进画廊；
 - 删除接口的安全边界：越界路径、非媒体文件、目录一律拒绝；
 - 项目内媒体删空后整个项目目录被清理，否则上报 affected_project_dirs
-  让调用方重同步 manifest。
+  让调用方重同步 manifest；
+- 项目目录能反查回点子库条目（画廊「激发项目」入口的数据来源）。
 """
 import os
 import time
@@ -16,6 +17,7 @@ from server_common import (
     scan_gallery,
     gallery_delete_files,
     gallery_collect_references,
+    make_idea_project_key,
     _safe_project_name,
     _legacy_ascii_project_name,
 )
@@ -226,3 +228,59 @@ class TestGalleryReferences:
         data = scan_gallery(base_dir=media_tree)
         assert 'orphan' not in _group(data, '树屋项目')
         assert 'in_use' not in _group(data, 'covers')['items'][0]
+
+
+class TestGalleryProjectOwners:
+    """项目目录 → 点子库条目的反查（画廊「激发项目」直达入口的数据来源）。"""
+
+    def test_owner_covers_project_key_title_and_paths(self):
+        lib = [{
+            'id': '1785381906330',
+            'title': '树屋项目',
+            'project_key': make_idea_project_key('1785381906330', '树屋项目'),
+            'frameRun': {'frames': [{'url': '/outputs/别名目录/frames/img_001.webp'}]},
+        }]
+        refs = gallery_collect_references(library_items=lib, tasks=[])
+        owners = refs['project_owners']
+        expected = {'idea_id': '1785381906330', 'idea_title': '树屋项目'}
+
+        # 每次合成独占的媒体命名空间（run_<task_id>_<标题>）才是真实目录名
+        assert owners[_safe_project_name(lib[0]['project_key'])] == expected
+        # 早期没有 project_key 的记录仍按标题的历代命名方案反查
+        assert owners[_safe_project_name('树屋项目')] == expected
+        # frameRun 里的文件路径直接给出目录名
+        assert owners['别名目录'] == expected
+        # project_key 派生的目录名同样算"被引用"，不会被误标孤儿
+        assert _safe_project_name(lib[0]['project_key']) in refs['project_names']
+
+    def test_owner_needs_an_id_and_first_record_wins(self):
+        refs = gallery_collect_references(library_items=[
+            {'title': '树屋项目', 'covers': []},                    # 无 id：认不出是哪条创意
+            {'id': 'new', 'title': '灯塔改造'},                     # 点子库按新→旧排列
+            {'id': 'old', 'title': '灯塔改造'},                     # 同名旧记录不覆盖新的
+        ], tasks=[])
+        owners = refs['project_owners']
+        assert _safe_project_name('树屋项目') not in owners
+        assert owners[_safe_project_name('灯塔改造')]['idea_id'] == 'new'
+
+    def test_tasks_never_claim_ownership(self):
+        refs = gallery_collect_references(
+            library_items=[],
+            tasks=[{'dimensions': {'theme': '飞机残骸小屋'}, 'result': {'title': '灯塔改造'}}])
+        # 任务只贡献引用（不标孤儿），但前端没有可载入的点子库记录
+        assert _safe_project_name('飞机残骸小屋') in refs['project_names']
+        assert refs['project_owners'] == {}
+
+    def test_scan_annotates_owner_on_project_group(self, media_tree):
+        refs = gallery_collect_references(
+            library_items=[{'id': 'idea-1', 'title': '树屋项目'}], tasks=[])
+        data = scan_gallery(base_dir=media_tree, refs=refs)
+        proj = _group(data, '树屋项目')
+        assert (proj['idea_id'], proj['idea_title']) == ('idea-1', '树屋项目')
+        # 封面池/图像工坊不是项目，永远不带归属字段
+        assert 'idea_id' not in _group(data, 'covers')
+
+    def test_scan_without_owner_leaves_group_unannotated(self, media_tree):
+        data = scan_gallery(base_dir=media_tree,
+                            refs={'cover_paths': set(), 'project_names': set()})
+        assert 'idea_id' not in _group(data, '树屋项目')

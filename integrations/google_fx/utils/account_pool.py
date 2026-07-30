@@ -25,7 +25,7 @@ from typing import Optional
 import requests
 
 from ..config import AI_DIR, get_runtime_default_port
-from . import account_binding
+from . import account_binding, account_credentials
 from .logger import log
 
 _STATE_FILE = AI_DIR / "runtime" / "account_pool.json"
@@ -156,6 +156,16 @@ class AccountPool:
                     # 命名自愈纯属显示优化，写不下去就下次再补，不要冒泡打断列表读取。
                     pass
 
+        # 登录凭据存在另一个文件（runtime/account_credentials.json）里，这里只
+        # 并入它的"有没有"视图。明文密码/TOTP 密钥永远不会进这个返回值——
+        # 本方法的结果会被 /api/account-pool 整份 JSON 发给浏览器。
+        # 一次性取全量而不是每行查一次：号池可能有几十个账号。
+        try:
+            credentials = account_credentials.presence_map()
+        except Exception as e:
+            log(f"⚠️ 读取账号凭据状态失败，号池列表按「都没配凭据」显示: {e}", "账号池")
+            credentials = {}
+
         accounts = []
         for user_id, info in state.items():
             entry = dict(info)
@@ -165,6 +175,17 @@ class AccountPool:
             entry["video_task_count"] = int(info.get("video_task_count", 0))
             entry["task_count"] = entry["image_task_count"] + entry["video_task_count"]
             entry["credit_probed"] = entry.get("last_checked_at") is not None
+            cred = credentials.get(user_id) or {}
+            entry["login_email"] = cred.get("email") or ""
+            entry["has_password"] = bool(cred.get("has_password"))
+            entry["has_totp"] = bool(cred.get("has_totp"))
+            # 能不能真的自动登录 = 邮箱和密码都齐了。TOTP 可选（有的号没开两步
+            # 验证）；只填了邮箱不算，那会在密码页原地卡死。
+            entry["auto_login_ready"] = bool(cred.get("email")) and bool(cred.get("has_password"))
+            entry["auto_login_status"] = cred.get("auto_login_status")
+            entry["auto_login_error"] = cred.get("auto_login_error")
+            entry["auto_login_at"] = cred.get("auto_login_at")
+            entry["auto_login_blocked"] = bool(cred.get("auto_login_blocked"))
             checked = _parse_iso(entry.get("last_checked_at"))
             if STALE_AFTER_SECONDS is not None and checked is not None:
                 entry["credit_stale"] = (_now() - checked).total_seconds() >= STALE_AFTER_SECONDS
@@ -275,6 +296,14 @@ class AccountPool:
             if user_id in state:
                 del state[user_id]
                 _write_state(state)
+        # 凭据存在另一个文件里，不跟着删就会在 runtime/ 下留一条谁也看不见、
+        # 谁也不会再清理的明文密码——号池里已经没有这个账号，控制台自然也不会
+        # 再显示"它还存着凭据"。
+        try:
+            account_credentials.remove(user_id)
+        except Exception as e:
+            log(f"⚠️ 移除账号 {user_id} 时未能清理其登录凭据（明文仍留在 "
+                f"runtime/account_credentials.json）: {type(e).__name__}: {e}", "账号池")
         log(f"➖ 账号池移除账号: {user_id}", "账号池")
 
     def set_disabled(self, user_id: str, disabled: bool) -> Optional[dict]:
@@ -452,7 +481,14 @@ class AccountPool:
                 state[user_id]["last_checked_at"] = attempted_at
                 state[user_id]["last_probe_status"] = "ok"
                 state[user_id]["last_probe_error"] = None
-                state[user_id].pop("cooldown_reason", None)
+                # 探测成功说明登录是好的，所以「登录失效」那把冷却锁必须一起解开，
+                # 不能只清 reason 留着 cooldown_until。自动登录让这个疏漏变得要命：
+                # 探针撞上登录页 → 自动登进去 → 读到积分 → 账号明明已经可用，却因为
+                # 冷却时间还没到，pick_account 继续跳过它整整两小时。
+                # 只解 login_required 这一种：额度耗尽的 24h 冷却有它自己的语义，
+                # 不该被一次积分探测顺手撤掉。
+                if state[user_id].pop("cooldown_reason", None) == "login_required":
+                    state[user_id]["cooldown_until"] = None
                 log(f"🔎 账号 {user_id} 积分探测结果: {credit}", "账号池")
             elif blocked:
                 err_msg = get_last_probe_error(user_id) or "浏览器忙，未能开始积分探测"

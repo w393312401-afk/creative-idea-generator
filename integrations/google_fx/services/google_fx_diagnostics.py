@@ -53,6 +53,17 @@ _REQUIRED_WORKSPACE_FAMILIES = {
     "account_menu_trigger",
 }
 
+# 整组都是"只在别的域名上才存在"的族，探针跑在 Flow 工作台页上，它们必然全部
+# 缺失——那是正常状态，不是选择器失效。
+#
+# google_login：accounts.google.com 的登录表单（utils/auto_login.py 用）。
+# 这组的健康度没法靠静止页探针判断，只能看 auto_login 的真实运行结果
+# （号池行上的"上次自动登录"状态）。不豁免的话，探针从此永远报 8 个 missing，
+# "探针全绿"这个信号就废了。
+_CONTEXTUAL_GROUPS = {
+    "google_login",
+}
+
 # 这些族存的是文本关键词（模型名、aria-label 文案），不是 CSS 选择器。
 # 交给 page.locator() 会被当成元素名解析（locator("Banana") → <banana>），
 # 永远 count=0，于是每次探针都白报一条"全 N 层均未命中"。直接跳过，不进报告。
@@ -200,7 +211,7 @@ def _classify_missing(row):
     is_contextual = family in _CONDITIONAL_FAMILIES
     if group == "google_fx" and family not in _REQUIRED_WORKSPACE_FAMILIES:
         is_contextual = True
-    if group == "common":
+    if group == "common" or group in _CONTEXTUAL_GROUPS:
         is_contextual = True
     if is_contextual:
         row["state"] = "conditional"

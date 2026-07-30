@@ -155,6 +155,92 @@ UI_SELECTORS = {
     },
 
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 🔐 Google 账号登录页 (accounts.google.com) — 供 utils/auto_login.py 使用
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 掉登录后自动重新登进去要走「选号 → 邮箱 → 密码 → 两步验证」几步表单。
+    # Google 这几页的 class 名是构建期混淆产物（每次发版都变），所以这里一律
+    # 只用**语义属性**定位：input 的 type/name/autocomplete、以及 Google 十几年
+    # 没换过的 id（#identifierId / #totpPin）。文案兜底放最后，且中英都列。
+    #
+    # 新增于 2026-07-30。不涉及本文件顶部 LOCKED 声明的三项
+    # (config_btn_keywords / ORIENT_ICON_MAP / RATIO_MAP)。
+    "google_login": {
+        # 邮箱输入页 (signin/identifier)
+        "email_input": [
+            "input#identifierId",
+            "input[name='identifier']",
+            "input[type='email']",
+        ],
+        # 密码页 (signin/challenge/pwd)。autocomplete 属性比 name 稳。
+        "password_input": [
+            "input[type='password'][name='Passwd']",
+            "input[name='Passwd']",
+            "input[type='password'][autocomplete='current-password']",
+            "input[type='password']:not([aria-hidden='true'])",
+        ],
+        # 两步验证的动态码输入框 (challenge/totp)。Google 的备用码输入框
+        # (challenge/backup-code) 用的是 name='backupCodePin'，故意不列——
+        # 备用码是一次性的，自动填等于烧掉用户的应急手段。
+        "totp_input": [
+            "input#totpPin",
+            "input[name='totpPin']",
+            "input[type='tel'][autocomplete='one-time-code']",
+            "input[autocomplete='one-time-code']",
+        ],
+        # 「下一步 / Next」。Google 把它渲染成 div[role=button] 已经很多年，
+        # 但 #identifierNext / #passwordNext 这两个容器 id 一直在。
+        "next_btn": [
+            "#identifierNext button",
+            "#passwordNext button",
+            "#totpNext button",
+            "#identifierNext",
+            "#passwordNext",
+            "#totpNext",
+            "button:has-text('Next')",
+            "button:has-text('下一步')",
+            "button:has-text('Berikutnya')",
+            "div[role='button']:has-text('Next')",
+            "div[role='button']:has-text('下一步')",
+        ],
+        # 账号选择页 (signin/accountchooser) 上的「使用其他账号」。
+        # 目标邮箱本身在列表里时优先直接点它（auto_login 动态构造选择器），
+        # 只有找不到才退到这个入口重新走邮箱流程。
+        "use_another_account": [
+            "li:has-text('Use another account')",
+            "li:has-text('使用其他账号')",
+            "li:has-text('使用其他帳戶')",
+            "div[role='link']:has-text('Use another account')",
+            "div[role='link']:has-text('使用其他账号')",
+            "*:has-text('Gunakan akun lain')",
+        ],
+        # 「换一种验证方式」页上通往身份验证器 App 的那一项。Google 默认可能
+        # 先推手机点确认（Tap Yes），那种自动化处理不了，必须切到 TOTP。
+        "try_another_way": [
+            "button:has-text('Try another way')",
+            "button:has-text('尝试其他方式')",
+            "div[role='button']:has-text('Try another way')",
+            "div[role='button']:has-text('尝试其他方式')",
+            "*[jsname]:has-text('More ways to verify')",
+        ],
+        "authenticator_option": [
+            "li:has-text('Google Authenticator')",
+            "li:has-text('authenticator app')",
+            "li:has-text('身份验证器')",
+            "li:has-text('验证码应用')",
+            "div[role='link']:has-text('Google Authenticator')",
+            "div[role='link']:has-text('身份验证器')",
+        ],
+        # 登录页上表示「这一步出错了」的提示区。用来把「密码错」跟「网络慢
+        # 还没跳转」区分开——分不清就会在密码错的情况下不停重试，把号锁掉。
+        "error_text": [
+            "div[aria-live='assertive']",
+            "div[jsname='B34EJ'] span",
+            "div.o6cuMc",
+            "span.OyEIQ",
+        ],
+    },
+
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 🌐 通用 (跨平台弹窗等)

@@ -129,6 +129,17 @@ def test_probe_reports_contextual_families_as_conditional():
     assert states["flow_entry_btn"] == "conditional"
 
 
+def test_login_page_selectors_never_count_as_missing_on_the_workspace():
+    """google_login 组是 accounts.google.com 上的登录表单（utils/auto_login.py 用）。
+    探针跑在 Flow 工作台页，这一整组必然全缺——报成 missing 会让探针从此永远
+    亮红灯，"探针全绿"这个信号就废了。"""
+    probe = diagnostics.probe_selectors(_ProbePage(_WORKSPACE_HITS))
+
+    login_rows = [row for row in probe["families"] if row["group"] == "google_login"]
+    assert login_rows, "登录页选择器应当仍然进探测报告（只是不算故障）"
+    assert all(row["state"] == "conditional" for row in login_rows)
+
+
 def test_deep_probe_is_opt_in_and_default_stays_read_only(monkeypatch):
     """默认探针不许点任何东西——它会对着生产页面跑。"""
     called = []

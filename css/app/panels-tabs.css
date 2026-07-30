@@ -2959,6 +2959,85 @@ body.log-expanded .log-pill {
     cursor: default;
 }
 
+/* 已配好自动登录凭据的账号，「🔑 登录凭据」按钮常亮，一眼扫得出哪些号还没配 */
+.account-pool-mini-btn.is-on {
+    border-color: rgba(90, 150, 110, 0.45);
+    color: #3F7A52;
+    background: rgba(90, 150, 110, 0.08);
+}
+
+/* ── 自动登录凭据表单 ────────────────────────────────────────────
+   作为 .account-pool-row 的兄弟节点插在它下面（行本身是 align-items:center
+   的单行 flex，塞不进多行表单）。负 margin + 左侧竖线把它在视觉上重新
+   绑回上面那一行。 */
+.account-pool-cred-form {
+    margin: -2px 0 4px 26px;
+    padding: 10px 12px;
+    border: 1px solid rgba(var(--ink-rgb), 0.1);
+    border-left: 2px solid rgba(176, 123, 82, 0.45);
+    border-radius: 0 8px 8px 0;
+    background: rgba(var(--ink-rgb), 0.035);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.account-pool-cred-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-main, #3A342C);
+}
+
+.account-pool-cred-fields {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.account-pool-cred-fields input {
+    flex: 1;
+    min-width: 160px;
+    font-size: 11px;
+    padding: 5px 8px;
+    border: 1px solid rgba(var(--ink-rgb), 0.15);
+    border-radius: 4px;
+    background: var(--surface-raised, rgba(255, 255, 255, 0.6));
+    color: var(--text-main, #3A342C);
+}
+
+.account-pool-cred-fields input:focus {
+    outline: none;
+    border-color: rgba(176, 123, 82, 0.6);
+}
+
+.account-pool-cred-check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 10px;
+    color: var(--text-secondary, #6B6256);
+    cursor: pointer;
+}
+
+.account-pool-cred-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.account-pool-cred-hint {
+    font-size: 10px;
+    line-height: 1.5;
+    color: var(--text-secondary, #6B6256);
+    opacity: 0.85;
+}
+
+/* 自动登录状态那行可能很长（含失败原因），不像上面的 meta 行那样单行截断 */
+.account-pool-login-meta {
+    white-space: normal;
+    overflow: visible;
+}
+
 .account-pool-bulk-row {
     display: flex;
     align-items: center;

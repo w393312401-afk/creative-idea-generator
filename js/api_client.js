@@ -296,8 +296,8 @@ function renderVideoSlotFailed(idx, message, labelText = '生成失败', busy) {
     renderSlotById('video', idx, st);
 }
 
-// 声明式硬切槽位（[CUT]，TBCP v2 hard_cut 变体）：该槽不生成视频，成片在此处直接
-// 硬切拼接——画中性卡片而不是失败卡（无重试按钮，重试它没有意义）
+// 硬切占位槽（旧单专属，2026-07-30 起新单的 [CUT] 槽照常生成视频）：该槽不生成视频，
+// 成片在此处直接硬切拼接——画中性卡片而不是失败卡（无重试按钮，重试它没有意义）
 function renderVideoSlotSkippedCut(idx, message) {
     renderSlotById('video', idx, videoSlotState(
         { slot: idx, status: 'skipped_cut', message }, { seq: idx }));
