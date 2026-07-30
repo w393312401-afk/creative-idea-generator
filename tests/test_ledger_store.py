@@ -79,11 +79,35 @@ class TestWriteLedger:
         # 拒绝时原文件必须原封不动
         assert read_ledger(ledger_path) == [_entry()]
 
-    def test_allows_shrinking_nonempty_to_nonempty(self, ledger_path):
-        write_ledger([_entry(), _entry(topic_dna='b')], ledger_path)
-        ok, msg = write_ledger([_entry()], ledger_path)
-        assert ok is True
-        assert read_ledger(ledger_path) == [_entry()]
+    def test_rejects_undeclared_shrink_of_nonempty(self, ledger_path):
+        """2026-07-30 收紧：非空 → 非空的缩量也拦。此前只堵"覆盖成空"这一头，中间
+        那一大片"少一条"完全没人管——而整表回写只用于编辑（状态/评分/备注），删除
+        一律走 /api/ledger/delete 的按 id 删，所以这条路径上的缩量都是状态错乱。
+
+        真实触发路径：合成流程用 register_ledger_candidates 在服务端追加候选，一个在
+        那之前打开的页面手里是短一截的表，此后任何一次改评分都会把新登记的候选整批
+        抹掉——与 library.json 那两次事故同一个机制。"""
+        write_ledger([_entry(id='a'), _entry(id='b', topic_dna='b')], ledger_path)
+        ok, msg = write_ledger([_entry(id='a')], ledger_path)
+        assert ok is False
+        assert '已阻止' in msg and '创意台账' in msg
+        # 拒绝时原文件必须原封不动
+        assert len(read_ledger(ledger_path)) == 2
+
+    def test_allows_edits_that_keep_every_row(self, ledger_path):
+        """编辑（改状态/评分/备注）才是整表回写的正当用途，不能被这道防护误伤。"""
+        write_ledger([_entry(id='a'), _entry(id='b', topic_dna='b')], ledger_path)
+        ok, msg = write_ledger(
+            [_entry(id='a', user_score=9), _entry(id='b', topic_dna='b')], ledger_path)
+        assert ok is True and msg is None
+        assert read_ledger(ledger_path)[0]['user_score'] == 9
+
+    def test_delete_by_id_still_bypasses_the_guard(self, ledger_path):
+        """按 id 删除天然带着"确有意图"的证据，不吃这道防护——否则台账就没法删了。"""
+        write_ledger([_entry(id='a'), _entry(id='b', topic_dna='b')], ledger_path)
+        result = delete_ledger_entries(['b'], ledger_path)
+        assert result['deleted'] == 1
+        assert [e['id'] for e in read_ledger(ledger_path)] == ['a']
 
     def test_creates_bak_before_overwriting_nonempty(self, ledger_path):
         write_ledger([_entry()], ledger_path)

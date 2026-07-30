@@ -214,7 +214,7 @@ function renderGallery() {
         // idea_id 是服务端按目录命名反查到的点子库归属（见 gallery_collect_references）；
         // 没反查到也照样给按钮，前端还能按目录名里的 run_<task_id> 落到任务记录上。
         const openProjectBtn = g.kind === 'project'
-            ? `<button type="button" class="gallery-tool-btn small g-group-open-project" title="打开这批素材所属的激发项目（提示词/封面/帧与视频）">🎬 激发项目</button>`
+            ? `<button type="button" class="gallery-tool-btn small g-group-open-project" title="打开这批素材所属的激发项目（提示词/封面/帧与视频）">🎬 打开项目</button>`
             : '';
 
         let gridHtml = '';

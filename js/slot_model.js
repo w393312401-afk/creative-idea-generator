@@ -89,6 +89,16 @@ const FRAME_BADGE_DEFS = [
         tip: () => '此帧派生自已被替换的旧帧，建议重新生成',
         hover: () => ' (过期：父帧已被重新生成，此帧与父帧血统不一致)',
     },
+    {
+        // 降档通道产出（2026-07-30 补）：/images/edits 号池无额度时同模型改走
+        // chat 通道，该通道固定出 1K——本单请求 2K/4K 时这一帧就是实打实的降档。
+        // frame_generator 一直把 degraded_reason 写进 manifest，却没有任何一处读它：
+        // 唯一的信号是渲染当时一条会滚走的 toast，事后完全看不出这一单混进过 1K 帧。
+        id: 'downscaled', text: '降档', cls: 'degraded-badge',
+        test: f => !!(f && f.degraded_reason),
+        tip: f => f.degraded_reason || '',
+        hover: f => ` (降档通道产出: ${f.degraded_reason || ''})`,
+    },
 ];
 
 const VIDEO_BADGE_DEFS = [

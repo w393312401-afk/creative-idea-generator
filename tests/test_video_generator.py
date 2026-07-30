@@ -208,15 +208,25 @@ class TestPlanVideoSlots(_TmpDirCase):
         self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
         self.assertIn('被人工标记存在问题', plans[1]['warning'])
 
-    def test_stale_lineage_blocks_standard_warns_lenient(self):
+    def test_stale_lineage_blocks_unless_gate_off(self):
+        """2026-07-30：血统过期从"standard 拦 / lenient 警告"改成"除 off 档一律拦"。
+
+        它和其它门禁不同类——一致性审查的判定有主观成分（宽松档放行是合理档位），
+        血统过期是确定性事实：上游帧被单独换过，这一对锚点帧确实来自两条不同的 i2i
+        链。lenient 档那条警告会和其它十几条混在一起滚过去，实际等于没拦（2026-07-27
+        ice_cave slot3 事故就是这么走到成片的）。要放行走 override_flagged 或 off 档。
+        """
         frames = self._make_frames(4)
         stale = {3}
+        for level in ('standard', 'lenient'):
+            plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
+                                      gate_level=level, stale_slots=stale)
+            self.assertEqual([p['action'] for p in plans],
+                             ['generate', 'blocked', 'blocked'], level)
+            self.assertIn('血统过期', plans[1]['reason'])
+        # off = 整体停用质检，与其它门禁一致地不做事后拦截
         plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='standard', stale_slots=stale)
-        self.assertEqual([p['action'] for p in plans], ['generate', 'blocked', 'blocked'])
-        self.assertIn('血统过期', plans[1]['reason'])
-        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='lenient', stale_slots=stale)
+                                  gate_level='off', stale_slots=stale)
         self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
         self.assertIn('旧 i2i 链', plans[1]['warning'])
         self.assertNotIn('warning', plans[0])
@@ -266,13 +276,19 @@ class TestPlanVideoSlots(_TmpDirCase):
         self.assertIn('空间断裂', plans[1]['warning'])
         self.assertNotIn('warning', plans[0])
 
-    def test_stale_and_drift_warnings_are_both_kept_on_lenient(self):
+    def test_stale_and_drift_warnings_are_both_kept_when_released(self):
+        """同一个槽位同时命中血统过期与空间断裂时，放行后两条警告都要在——报一条
+        就会让人以为只有一个问题。血统过期自 2026-07-30 起在 lenient 档也拦
+        （见 test_stale_lineage_blocks_unless_gate_off），所以"放行"只剩两条路径：
+        用户确认风险强制生成，或整体停用质检。两条都验。"""
         frames = self._make_frames(4)
-        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='lenient', stale_slots={2}, drift_slots={2})
-        w = plans[1]['warning']
-        self.assertIn('旧 i2i 链', w)
-        self.assertIn('空间断裂', w)
+        for kwargs in ({'gate_level': 'standard', 'override_flagged': True},
+                       {'gate_level': 'off'}):
+            plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
+                                      stale_slots={2}, drift_slots={2}, **kwargs)
+            w = plans[1]['warning']
+            self.assertIn('旧 i2i 链', w, kwargs)
+            self.assertIn('空间断裂', w, kwargs)
 
 
 class TestLoadDriftBreakSlots(unittest.TestCase):

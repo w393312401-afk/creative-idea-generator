@@ -149,6 +149,142 @@ class TestCheckEnvelopeSealRegression(unittest.TestCase):
             pp.check_envelope_seal_regression('', 5, self.LADDER, family='interior'), [])
 
 
+def _ladder_with_floor_sealed():
+    """楼板/甲板组用的节拍梯：第 3 拍铺好底板（封住脚下那一面），第 4 拍硬切进室内。
+
+    2026-07-30 之前楼板刻意不进词表，理由是「楼板开洞常是合法的室内工序」——理由没错，
+    代价是踩穿地面这一整类倒退全交给偏向 under-report 的 LLM 审查。现在收进来，另配
+    一套窄判据（只认结构性破口）+ 声明式开洞豁免。"""
+    return [
+        {'index': 1, 'operation': 'clearing', 'milestone_name': 'site cleared'},
+        {'index': 2, 'operation': 'structure', 'milestone_name': 'floor joists sistered',
+         'after_state': 'new sistered floor joists span the full bay, still open between them'},
+        {'index': 3, 'operation': 'flooring', 'milestone_name': 'subfloor deck complete',
+         'after_state': 'new plywood subfloor decking installed over the floor joists, screwed down'},
+        {'index': 4, 'operation': 'threshold', 'hard_cut': True,
+         'milestone_name': 'interior revealed'},
+        {'index': 5, 'operation': 'clearing', 'milestone_name': 'interior cleared'},
+    ]
+
+
+class TestFloorSlabGroup(unittest.TestCase):
+    """楼板/甲板组（2026-07-30 新增）。"""
+
+    LADDER = _ladder_with_floor_sealed()
+
+    def _check(self, prompt, i=5, ladder=None):
+        return pp.check_envelope_seal_regression(
+            prompt, i, self.LADDER if ladder is None else ladder, family='interior')
+
+    def test_decking_over_joists_counts_as_sealed(self):
+        """铺板句里几乎必然带 'joist'。骨架否决不给例外，这一组等于白加——
+        盖板一铺上，脚下那一面就实了。"""
+        sealed = pp.sealed_envelope_elements(self.LADDER, 5)
+        self.assertIn('floor/deck slab', sealed)
+        self.assertIn('subfloor deck complete', sealed['floor/deck slab'])
+
+    def test_bare_joists_alone_do_not_count_as_sealed(self):
+        """只把龙骨对齐/加固不是封楼板——这时脚下依然合法地是空的。"""
+        ladder = [
+            {'index': 1, 'operation': 'structure', 'milestone_name': 'floor joists sistered',
+             'after_state': 'new sistered floor joists installed across the bay'},
+            {'index': 2, 'operation': 'clearing', 'milestone_name': 'cleared'},
+        ]
+        self.assertNotIn('floor/deck slab', pp.sealed_envelope_elements(ladder, 2))
+
+    def test_flags_a_reopened_floor_deck(self):
+        prompt = ('Camera pitch locked level. '
+                  'Underfoot the new floor deck shows a gaping hole with boards missing, '
+                  'dropping into the dark below.')
+        errs = self._check(prompt)
+        self.assertEqual(len(errs), 1)
+        self.assertIn('floor/deck slab', errs[0])
+
+    def test_declared_opening_is_not_a_regression(self):
+        """楼梯井/检修口/吊装口是合法的室内工序，正是当初把楼板排除在外的原因。"""
+        for prompt in (
+            'A framed opening is cut through the new floor deck for the stair.',
+            'The floor deck carries a hatch opening with a gap around its frame.',
+            'An access opening in the floor decking exposes the riser below.',
+        ):
+            self.assertEqual(self._check(prompt), [], prompt)
+
+    def test_sky_wording_does_not_fire_on_the_floor(self):
+        """透天透雨那套词对楼板没有物理意义：透过屋顶的天光洒在地板上是完全正常的
+        写法，用宽表会把它算到楼板头上。"""
+        prompt = 'A shaft of daylight from the still-open roof falls across the new floor deck.'
+        self.assertEqual(self._check(prompt), [])
+
+    def test_correct_raw_floor_underside_is_not_a_violation(self):
+        prompt = ('Underfoot the new subfloor decking is bare unpainted plywood with '
+                  'rows of screw heads, unfinished.')
+        self.assertEqual(self._check(prompt), [])
+
+
+class TestEnvelopeAdjacentSentencePair(unittest.TestCase):
+    """相邻句对作用域（2026-07-30 新增）：把同一个陈述拆成两句、第二句用回指词接着
+    说，是绕过逐句判定最顺手的写法。"""
+
+    LADDER = _ladder_with_roof_sealed_before_cut()
+
+    def _check(self, prompt):
+        return pp.check_envelope_seal_regression(prompt, 5, self.LADDER, family='interior')
+
+    def test_backref_split_is_caught(self):
+        """逐句看两句都干净，合起来就是把已封的屋面写成了透天。"""
+        prompt = ('Overhead the new black steel roof is complete and weathertight. '
+                  'Beyond it, blue sky and the distant mountain ridge fill the frame above.')
+        errs = self._check(prompt)
+        self.assertEqual(len(errs), 1)
+        self.assertIn('roof/ceiling', errs[0])
+
+    def test_pronoun_backref_is_caught(self):
+        prompt = ('The tower ceiling was closed with steel panels in an earlier beat. '
+                  'It is torn open again right above the hearth.')
+        self.assertEqual(len(self._check(prompt)), 1)
+
+    def test_pair_scope_allows_the_group_naming_itself_in_the_second_sentence(self):
+        """句对作用域按组分别判：下一句点到**本组**不否决（补语落在下一句正是这层
+        判定要抓的形态），点到**别的**组才否决。"""
+        prompt = ('A gaping hole is torn open overhead. '
+                  'It is in the ceiling right above the workbench.')
+        errs = self._check(prompt)
+        self.assertEqual(len(errs), 1)
+        self.assertIn('roof/ceiling', errs[0])
+
+    def test_other_group_in_the_second_sentence_vetoes_conservatively(self):
+        """下一句点到别的构件组一律否决，哪怕那个词只是顺带提到（"…show above the
+        floor"）。这是明知会漏判的取舍：分不清敞开措辞到底属于哪个构件时，漏一条
+        远好过把违规挂到错的构件上——回炉会照着错的判定去改对的句子。"""
+        prompt = ('Overhead the new black steel roof is complete and weathertight. '
+                  'Beyond it, blue sky and the distant ridge show above the floor.')
+        self.assertEqual(self._check(prompt), [])
+
+    def test_no_backref_opener_means_no_pair(self):
+        """下一句不是回指式开头，就是在说另一件事——顶部已封写成一句、地面碎裂写成
+        另一句仍然必须是合法写法（这条是原始口径，不能被相邻句对吃掉）。"""
+        prompt = ('Overhead the new roof decking is closed and unpainted. '
+                  'Rubble lies across the room where a collapsed shelf fell, '
+                  'and a gaping hole opens in the old hearth surround.')
+        self.assertEqual(self._check(prompt), [])
+
+    def test_next_sentence_naming_another_element_is_not_paired(self):
+        """下一句自己点了包络构件 → 它在说那件事，逐句判定已经覆盖，不跨句拼。"""
+        prompt = ('Overhead the new roof is complete and weathertight. '
+                  'Below it, the exterior wall stands unfinished with gaps between the stones.')
+        # 外墙这一组本单没封过，所以正确结果是"无违规"；关键是不能把屋面判成违规
+        self.assertNotIn('roof/ceiling', ' '.join(self._check(prompt)))
+
+    def test_one_error_per_group_even_when_written_open_twice(self):
+        """同一个构件在一稿里被写敞开两次，回炉要修的是同一件事，报两条只会让
+        采纳门与日志噪声翻倍。"""
+        prompt = ('Overhead the ceiling is torn open with a gaping hole. '
+                  'Dirt lies in the corners. '
+                  'The ceiling still shows blue sky through a missing section.')
+        errs = self._check(prompt)
+        self.assertEqual(len(errs), 1)
+
+
 class TestReworkEnvelopeSealRegression(unittest.TestCase):
     LADDER = _ladder_with_roof_sealed_before_cut()
 
@@ -258,14 +394,14 @@ class TestEnvelopeReviewRules(unittest.TestCase):
         self.assertIn('NOT a violation', prompt)
 
     def test_global_review_covers_the_non_adjacent_case(self):
-        prompt = pp._global_review_system_prompt(10)
+        prompt = pp._global_review_system_prompt()
         self.assertIn('ENVELOPE SEAL PERSISTENCE', prompt)
         self.assertIn('after a threshold crossing or a hard cut', prompt)
 
     def test_global_review_stays_cross_frame_only(self):
         """全局审查刻意只留跨帧规则（规则数量会稀释判断力）——新增这条不能把逐拍
         审查的工序/因果规则也带进来。"""
-        prompt = pp._global_review_system_prompt(10)
+        prompt = pp._global_review_system_prompt()
         for local_only in ('SINGLE MILESTONE PACKAGE RULE', 'FLOOR-BEFORE-HEAVY-OBJECTS',
                            'DOOR COMPLETENESS'):
             self.assertNotIn(local_only, prompt)

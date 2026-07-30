@@ -75,6 +75,17 @@ assert.deepStrictEqual(badges(s), ['warned']);
 s = ready({ quality_gate: 'auto_approved', vlm_qa_reason: '通过，无 WARN' });
 assert.deepStrictEqual(badges(s), []);
 
+// 降档通道产出（2026-07-30）：manifest 里一直写着 degraded_reason，此前没有任何
+// 一处读它——唯一的信号是渲染当时一条会滚走的 toast，事后完全看不出这一单混进过
+// 分辨率更低的帧。
+s = ready({ degraded_reason: 'chat 通道续渲；该通道只出 1K 档，本单请求的是 2K 档' });
+assert.deepStrictEqual(badges(s), ['downscaled']);
+assert.ok(s.badges[0].tip.includes('2K 档'), '徽标要说清降到了什么档');
+assert.ok(s.title.includes('降档通道产出'));
+// 画质无损失时 frame_generator 不写这个字段，自然也不该有徽标
+s = ready({ transport: 'chat', actual_pixels: '768x1376' });
+assert.deepStrictEqual(badges(s), []);
+
 // 多枚徽标同时成立：旧实现靠第二枚硬编码 left:45px，第三枚就没地方放
 s = ready({ quality_gate: 'i2i_fallback_degraded', manual_issue: '透视歪', stale_lineage: true });
 assert.deepStrictEqual(badges(s), ['degraded', 'manual-flagged', 'stale']);

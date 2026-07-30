@@ -238,7 +238,12 @@ function ensureFrameRunForStart(ownerIdea) {
     return ownerIdea.frameRun;
 }
 
-/** 任务终态时把 manifest 同步进 ownerIdea 与创意库（含服务端持久化）。 */
+/** 任务终态时把 manifest 同步进 ownerIdea 与创意库（含服务端持久化）。
+ *
+ * 这里写进去的是服务端 manifest 原件——删除一拍之后它就是比库里那份少一帧的
+ * 权威结果，所以必须向缩量闸门声明"这条创意的帧记录会变少是我有意为之"
+ * （见 app.js saveLibrary / server_common.library_shrink_verdict）。声明范围收在
+ * 这一条创意上：别的创意少了帧，照样该被拦住。 */
 async function syncFrameRunToLibrary(manifestData, ownerIdea) {
     ownerIdea = ownerIdea || currentIdea;
     if (!ownerIdea || !manifestData) return;
@@ -247,7 +252,7 @@ async function syncFrameRunToLibrary(manifestData, ownerIdea) {
     const existingIdx = savedIdeas.findIndex(item => item.id === ownerIdea.id);
     if (existingIdx !== -1) {
         savedIdeas[existingIdx].frameRun = manifestData;
-        await saveLibrary();
+        await saveLibrary({ frameShrinkIds: [ownerIdea.id] });
     }
 }
 
@@ -1671,6 +1676,10 @@ function setVideoGridButtonsBusy(busy) {
 // 数组时只检查这些槽位涉及的锚点帧对（slot 与 slot+1，与 plan_video_slots 的判断
 // 范围一致）。返回 {proceed, override}：proceed=false 表示用户取消，调用方应直接
 // return，不要发起请求。
+// 2026-07-30 补：血统过期（stale_lineage）也进这道确认框。后端已把它升级为除 off 档
+// 一律硬拦（见 video_generator.plan_video_slots），前端如果还只按 quality_gate 弹窗，
+// 用户点了「生成视频」只会收到一串"已拦截"——确认框问不到点子上，人只能去翻日志。
+// 两类风险合并成一次确认：确认后统一带 override_flagged，后端三道门一起豁免。
 async function confirmSequenceReviewOverride(ownerIdea, slots) {
     const frames = (ownerIdea.frameRun && ownerIdea.frameRun.frames) || [];
     if (!frames.length) return { proceed: true, override: false };
@@ -1683,9 +1692,34 @@ async function confirmSequenceReviewOverride(ownerIdea, slots) {
         candidates = frames;
     }
     const failedFrames = candidates.filter(f => f.quality_gate === 'vlm_qa_failed' || f.quality_gate === 'sequence_review_flagged');
-    if (!failedFrames.length) return { proceed: true, override: false };
-    const frameSeqs = failedFrames.map(f => f.sequence).join(', ');
-    const confirmed = await customConfirm(`⚠️ 警告：检测到第 ${frameSeqs} 帧未通过一致性审查。\n\n如果强行生成视频，对应的视频分段可能存在跳变、无动作或动作不一致的缺陷。\n\n确定要强制继续生成视频吗？`);
+    // slotIsStale 认三种写法（stale_lineage 是后端现在唯一会写的，另两个是旧 manifest）
+    const staleFrames = candidates.filter(f => typeof slotIsStale === 'function'
+        ? slotIsStale(f) : !!f.stale_lineage);
+    if (!failedFrames.length && !staleFrames.length) {
+        return { proceed: true, override: false };
+    }
+
+    // customConfirm 把文案塞进 <p> 的 innerHTML：换行必须是 <br>，'\n' 会被渲染成
+    // 一个空格（历史遗留：原本那句 '\n\n' 从来没换过行）。这里的内容全部由帧号与
+    // 固定文案拼成，不含用户/模型文本，可以安全走 innerHTML。
+    const risks = [];
+    if (failedFrames.length) {
+        risks.push(`· 第 <b>${failedFrames.map(f => f.sequence).join(', ')}</b> 帧未通过一致性审查`);
+    }
+    if (staleFrames.length) {
+        risks.push(
+            `· 第 <b>${staleFrames.map(f => f.sequence).join(', ')}</b> 帧血统过期：`
+            + '上游帧被单独重渲过，这些帧仍派生自旧的 i2i 链');
+    }
+    // 血统过期不是"可能有问题"，是确定性事实——话要说到位，否则用户会把它当成
+    // 又一条随手点掉的警告（这正是它此前在 lenient 档形同虚设的原因）。
+    const consequence = staleFrames.length
+        ? '血统过期的帧与其相邻帧来自两条不同的 i2i 链，送去生成视频<b>必然</b>出现跨链的'
+          + '色彩/内容漂移。正确做法是从最早那一帧起顺序重渲，而不是强推。'
+        : '强行生成的话，对应视频分段可能存在跳变、无动作或动作不一致的缺陷。';
+    const confirmed = await customConfirm(
+        ['⚠️ 这单在生成视频前有以下风险：', '', ...risks, '', consequence, '',
+         '确定要确认风险并强制继续生成视频吗？'].join('<br>'));
     return { proceed: confirmed, override: confirmed };
 }
 
@@ -2252,7 +2286,8 @@ async function deleteSlotBeat(seq, opts = {}) {
         // 提示词块是这一切的源头（槽位总数按它算），必须先落到创意对象上再重渲
         beforeApply: async (d) => {
             if (d.prompt_block) {
-                await applyPromptBlockToIdea(ownerIdea, d.prompt_block, d.prompt_slots);
+                // deferSave：紧随其后的 reloadManifestIntoIdea 会带声明把库写掉
+                await applyPromptBlockToIdea(ownerIdea, d.prompt_block, d.prompt_slots, true);
             }
         },
         patch: (d) => ({ frames: d.frames, videos: d.videos, dropMerged: true }),
@@ -2335,7 +2370,8 @@ async function restoreSlotSnapshot(ownerIdea, snapshotId, force = false) {
         bust: (d) => [].concat(d.frames || [], d.videos || []),
         beforeApply: async (d) => {
             if (d.prompt_block) {
-                await applyPromptBlockToIdea(ownerIdea, d.prompt_block, d.prompt_slots);
+                // deferSave：紧随其后的 reloadManifestIntoIdea 会带声明把库写掉
+                await applyPromptBlockToIdea(ownerIdea, d.prompt_block, d.prompt_slots, true);
             }
         },
         patch: (d) => ({ frames: d.frames, videos: d.videos, dropMerged: true }),
@@ -2427,7 +2463,13 @@ async function openDeletedSlotsPanel() {
 // 提示词块被服务端改写后落回创意对象：currentIdea、localStorage 快照、创意库、
 // 提示词页展示的原始 Markdown 四处必须一起更新——只改其中一处，下一次生成/重试
 // 读到的还是旧提示词（同 fixFrameIssue 里改写提示词后的那套处理）。
-async function applyPromptBlockToIdea(ownerIdea, promptBlock, promptSlots) {
+//
+// deferSave=true：调用方紧接着就会走 reloadManifestIntoIdea → syncFrameRunToLibrary
+// 把权威清单连库一起写掉，这里不必（也不能）先写一次。删除/恢复一拍的路径必须传它：
+// 那一刻本地 prompt_slots 已经是 N-1 条、frameRun 还留着 N 帧，服务端的"同一条创意
+// 内部必须自洽"检查会 409 拒掉这次写入（见 server.py /api/library）——过去这个拒绝
+// 被 saveLibrary 静默吞掉，现在拒绝会弹提示，就更不该发这次注定失败的请求。
+async function applyPromptBlockToIdea(ownerIdea, promptBlock, promptSlots, deferSave = false) {
     if (!ownerIdea || !promptBlock) return;
     ownerIdea.prompt_block = promptBlock;
     // 结构化槽位契约必须跟着换：resolvePromptSlots 优先用它，留着删除前那一份
@@ -2440,7 +2482,7 @@ async function applyPromptBlockToIdea(ownerIdea, promptBlock, promptSlots) {
         savedIdeas[existingIdx].prompt_block = promptBlock;
         if (promptSlots) savedIdeas[existingIdx].prompt_slots = promptSlots;
         else delete savedIdeas[existingIdx].prompt_slots;
-        await saveLibrary();
+        if (!deferSave) await saveLibrary();
     }
     if (isViewingIdea(ownerIdea.id)) {
         const blockEl = document.getElementById('idea-prompt-block');

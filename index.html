@@ -1731,20 +1731,20 @@
     <script src="js/progress_model.js?v=1.2.3" defer></script>
     <!-- 槽位状态模型（纯函数）与卡片渲染器：必须排在 api_client / media_renderer /
          app.js 之前——那三处的槽位渲染全部转调这里。见 docs/spark_result_slots_plan.md -->
-    <script src="js/slot_model.js?v=1.1.0" defer></script>
+    <script src="js/slot_model.js?v=1.2.0" defer></script>
     <script src="js/slot_card.js?v=1.3.0" defer></script>
     <script src="js/slot_toolbar.js?v=1.1.0" defer></script>
     <!-- 日志语义规则表（纯函数）：必须排在 api_client 之前——日志面板的概览模式
          转调这里把日志行归成人话事件。见 docs/spark_log_panel_layout_plan.md -->
     <script src="js/log_semantics.js?v=1.0.0" defer></script>
-    <script src="js/api_client.js?v=1.7.1" defer></script>
+    <script src="js/api_client.js?v=1.8.0" defer></script>
     <script src="js/prompt_pipeline.js?v=1.2.5" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
-    <script src="js/media_renderer.js?v=1.6.0" defer></script>
-    <script src="app.js?v=1.3.34" defer></script>
+    <script src="js/media_renderer.js?v=1.8.0" defer></script>
+    <script src="app.js?v=1.4.0" defer></script>
     <script src="js/image_studio.js?v=1.0.4" defer></script>
     <script src="js/gallery.js?v=1.1.2" defer></script>
-    <script src="js/ledger.js?v=1.1.2" defer></script>
+    <script src="js/ledger.js?v=1.2.0" defer></script>
     <!-- 旧「移动端标签切换」内联脚本已删除：它指向早已不存在的 mobile-tab-left/right，
          MutationObserver 永远空转；自动切换结果面板改由 app.js 的 switchMainTab('results') 完成 -->
 

@@ -180,7 +180,7 @@ _UNSET = object()
 
 
 def _set_manifest_quality_gate(project_dir, sequence, quality_gate, reason=None, prompt_fingerprint=None,
-                               review_issues=_UNSET):
+                               review_issues=_UNSET, respect_manual_flag=False):
     """Overwrite one frame's recorded quality_gate/vlm_qa_reason in manifest.json.
     Needed because generate_frame_sequence's own per-frame QA never produces a real
     verdict for frame 1 (it has no prior frame to compare motion against), so the
@@ -190,7 +190,19 @@ def _set_manifest_quality_gate(project_dir, sequence, quality_gate, reason=None,
     prompt_pipeline.check_full_sequence_consistency）。vlm_qa_reason 只是给人看的摘要，
     '；'.join 之后哪一层检出的、涉及哪几帧、复核确认没有全丢了——修完也没法验证这一条
     到底解决没有。默认 _UNSET＝不碰这个字段（锚点门等其它调用方与审查无关）；传 None
-    表示显式清空。"""
+    表示显式清空。
+
+    respect_manual_flag=True（一致性审查的两个写入点专用）：该帧当前是 'manual_flagged'
+    时不夺走这个标记，只把机器判定存进 manual_flag_prev_gate（撤销人工标记时回落到最新
+    的机器结论）。
+
+    2026-07-30 修复：此前这里无条件覆盖 quality_gate，于是"用户描述了这一帧的问题 →
+    随后跑一次一致性审查 → 机器没看出那个问题"就会把 manual_flagged 洗成
+    sequence_reviewed_pass。视频门禁看的正是 quality_gate（见
+    video_generator._FLAGGED_QUALITY_GATES），那道硬拦就此消失；而 manual_issue 字段
+    还留着，帧网格照旧显示「人工标记」徽标——界面说标了、门禁说没标，是最坏的一种
+    不一致。set_manual_frame_issue 的注释早就写明两者应当并存（机器判定进
+    vlm_qa_reason，人的描述进 manual_issue），只是审查的写入端没有遵守。"""
     # read_manifest/write_manifest：同一把项目级锁 + 原子替换（读改写不再互相覆盖）
     with manifest_lock(project_dir):
         manifest = read_manifest(project_dir)
@@ -198,7 +210,10 @@ def _set_manifest_quality_gate(project_dir, sequence, quality_gate, reason=None,
             return
         for frame in manifest.get('frames', []):
             if frame.get('sequence') == sequence:
-                frame['quality_gate'] = quality_gate
+                if respect_manual_flag and frame.get('quality_gate') == 'manual_flagged':
+                    frame['manual_flag_prev_gate'] = quality_gate
+                else:
+                    frame['quality_gate'] = quality_gate
                 frame['vlm_qa_reason'] = reason
                 if prompt_fingerprint is not None:
                     frame['anchor_prompt_sha256'] = prompt_fingerprint
@@ -677,7 +692,12 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
         # 部分没审成：只降级重跑这几拍（外加没跑成的跨帧层），不再把已经审干净的
         # 整批重来一遍——一次网络抖动此前会让整单多烧一遍全部调用。
         retry_beats = list(final_result.get('unreviewed_beats') or [])
-        skip_global = bool(final_result.get('global_reviewed'))
+        # 跨帧层现在按窗口分批（prompt_pipeline.global_review_windows）：个别窗口没跑成
+        # 时 global_reviewed 仍是 True（其余窗口有判定），只看它就会跳过补跑，那几拍在
+        # 重试后反而被洗成"已审"——比不重试更糟。只有"跑过且一个窗口都没漏"才允许跳过；
+        # 有漏的窗口就带着 global_only_beats 精确补跑那几个窗口，不整层重来。
+        global_unreviewed = list(final_result.get('global_unreviewed_beats') or [])
+        skip_global = bool(final_result.get('global_reviewed')) and not global_unreviewed
         if on_progress:
             scope = (f"第 {'、'.join(str(b) for b in retry_beats)} 拍" if retry_beats else '')
             scope += ('' if skip_global else ('与跨帧审查' if scope else '跨帧审查'))
@@ -686,6 +706,7 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
             })
         retry = check_full_sequence_consistency(config, prompt_block, frame_paths, degraded=True,
                                                 only_beats=retry_beats, skip_global=skip_global,
+                                                global_only_beats=(global_unreviewed or None),
                                                 on_progress=on_progress)
         final_result = merge_review_results(final_result, retry)
 
@@ -701,7 +722,8 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
                 kept += 1
                 continue
             _set_manifest_quality_gate(project_dir, seq, 'sequence_review_skipped',
-                                       '一致性审查服务不可用（降级重试仍失败），此帧未经整套序列审查')
+                                       '一致性审查服务不可用（降级重试仍失败），此帧未经整套序列审查',
+                                       respect_manual_flag=True)
         if on_progress:
             tail = f'（{kept} 帧保留了上一轮的审查结论）' if kept else ''
             on_progress('sequence_review_result', {
@@ -722,8 +744,11 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
         issues_by_seq.setdefault(issue.get('beat', 0) + 1, []).append(issue)
     for seq in rendered:
         status, reason = statuses.get(seq, ('unreviewed', '未参与本轮审查'))
+        # respect_manual_flag：机器没看出人已经指出来的问题，不代表那个问题不存在。
+        # 人工标记必须活过一次审查，否则视频门禁的硬拦会被静默摘掉。
         _set_manifest_quality_gate(project_dir, seq, gate_by_status[status], reason,
-                                   review_issues=issues_by_seq.get(seq) or None)
+                                   review_issues=issues_by_seq.get(seq) or None,
+                                   respect_manual_flag=True)
     # 把"本轮看的是哪几张图"钉进 manifest：之后任何一帧被重渲，
     # invalidate_stale_review_verdicts 就能据此让相关结论自动作废
     _record_review_fingerprints(project_dir, title,

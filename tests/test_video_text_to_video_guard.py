@@ -434,6 +434,38 @@ def test_frame_slot_strategy_checks_reference_count(monkeypatch):
     assert H._video_refs_still_attached(object(), meta) is False
 
 
+def test_prompt_reference_scan_is_structural_when_long_prompt_expands_upward():
+    """长提示词会把输入条顶到视口上方，不能再用 bottom-420 坐标门槛判丢图。"""
+
+    class _P:
+        def __init__(self):
+            self.script = ""
+
+        def evaluate(self, script):
+            self.script = script
+            return [UUID_A, UUID_B]
+
+    page = _P()
+    assert H._get_prompt_reference_uuids(page, limit=2) == [UUID_A, UUID_B]
+    assert "arrow_forward" in page.script
+    assert "bar.querySelectorAll" in page.script
+    assert "innerHeight" not in page.script
+
+
+def test_long_prompt_reference_scan_does_not_block_submit_guard():
+    class _P:
+        def evaluate(self, _script):
+            # 模拟输入条已经因长提示词扩展到页面较高位置，但结构扫描仍能读到 refs。
+            return [UUID_A, UUID_B]
+
+    meta = {
+        "strategy": "prompt_chips",
+        "expected": [UUID_A, UUID_B],
+        "refs": [UUID_A, UUID_B],
+    }
+    assert H._video_refs_still_attached(_P(), meta) is True
+
+
 def test_declared_anchor_without_canvas_ref_never_submits(monkeypatch):
     """最后一道防线：req 声明了锚点帧但 image/end_image 是空 UUID。"""
 

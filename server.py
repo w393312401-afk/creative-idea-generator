@@ -2645,7 +2645,16 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             if not self._gate():
                 return
             try:
-                data = self._read_json_body()
+                raw_body = self._read_json_body()
+                # 裸数组（历史契约）与 {'ideas': [...], 'intent': {...}}（带删除声明）
+                # 都收，见 server_common.parse_library_payload
+                data, write_intent = parse_library_payload(raw_body)
+                if data is None:
+                    self._send_json({
+                        'status': 'error',
+                        'message': '请求体必须是创意数组，或 {"ideas": [...], "intent": {...}}',
+                    }, status=400)
+                    return
                 # 加锁 + 原子替换：直接 open('w') 在写一半崩溃时会留下半截 JSON
                 with LIBRARY_LOCK:
                     # 2026-07-12 整库清零事故（library.json 被某个 savedIdeas 为空的客户端
@@ -2654,10 +2663,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     #    的全量回写永远至少剩 0..N-1 条，只有状态错乱的客户端才会 POST []；
                     # 2) 任何成功覆盖前把现有非空库轮换到 library.json.bak，误写可回滚一版。
                     existing_count = 0
+                    existing_library = None
                     if os.path.exists(DB_FILE):
                         try:
                             with open(DB_FILE, 'r', encoding='utf-8') as f:
                                 _old = json.load(f)
+                            existing_library = _old
                             existing_count = len(_old) if isinstance(_old, list) else 1
                         except Exception:
                             existing_count = 1  # 读不出来按“非空”保守处理
@@ -2704,6 +2715,21 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                             'message': '创意页面槽位状态已过期，已阻止覆盖；请刷新页面后重试。',
                             'refresh_required': True,
                             'inconsistent_ideas': inconsistent,
+                        }, status=409)
+                        return
+                    # 第三道：非空 → 非空的「缩量覆盖」。少一条创意、某条少几帧都算，
+                    # 除非客户端声明了这是哪次删除造成的（intent）。见
+                    # server_common.library_shrink_verdict 的事故说明。
+                    shrink_ok, shrink_msg, shrink_detail = library_shrink_verdict(
+                        existing_library, data, write_intent)
+                    if not shrink_ok:
+                        if sys.stdout:
+                            print(f"[LIBRARY GUARD] 拒绝未声明的缩量覆盖: {shrink_detail}")
+                        self._send_json({
+                            'status': 'rejected',
+                            'message': shrink_msg,
+                            'refresh_required': True,
+                            'shrink': shrink_detail,
                         }, status=409)
                         return
                     if existing_count > 0:

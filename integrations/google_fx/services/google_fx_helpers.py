@@ -3235,12 +3235,32 @@ def _wait_for_flow_reference_ready(page, timeout_seconds=30, settle_range=None):
     return False, ""
 
 def _get_prompt_reference_uuids(page, limit=4):
-    """读取提示词输入区中已挂入的参考图顺序，按视觉顺序返回 UUID 列表。"""
+    """读取提示词输入区中已挂入的参考图顺序，按视觉顺序返回 UUID 列表。
+
+    提示词很长时输入条会向上扩展，参考图的 ``rect.top`` 可能落到视口底部
+    420px 之外。旧实现把这种正常布局误判成「参考图已脱落」，视频链随后放弃
+    提交；下一槽位开始时又会清理输入条，于是用户看到的就是「提示词被清空但
+    没有提交」。这里和清理逻辑一样，按 Slate 编辑器 + ``arrow_forward`` 的
+    DOM 结构锁定输入条，不再用窗口坐标猜测。
+    """
     try:
         rows = page.evaluate("""() => {
             const uuidRegex = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
-            const imgs = Array.from(document.querySelectorAll(
-                "button[data-card-open] img, div[data-slate-editor='true'] img, div[contenteditable='true'] img, img[alt*='present in your collection']"
+            const editor = document.querySelector("[data-slate-editor='true']");
+            let bar = null;
+            if (editor) {
+                let candidate = editor.parentElement;
+                for (let depth = 0; candidate && depth < 8; depth++) {
+                    const icons = Array.from(candidate.querySelectorAll('i'))
+                        .map((i) => (i.textContent || '').trim());
+                    if (icons.includes('arrow_forward')) { bar = candidate; break; }
+                    candidate = candidate.parentElement;
+                }
+            }
+            if (!bar) return [];
+
+            const imgs = Array.from(bar.querySelectorAll(
+                "button[data-card-open] img, [data-slate-editor='true'] img"
             ));
             const seen = new Set();
             const rows = [];
@@ -3248,7 +3268,6 @@ def _get_prompt_reference_uuids(page, limit=4):
                 if (!img || img.offsetParent === null) continue;
                 const rect = img.getBoundingClientRect();
                 if ((rect.width || 0) < 20 || (rect.height || 0) < 20) continue;
-                if (rect.top < window.innerHeight - 420) continue;
                 const src = img.currentSrc || img.src || '';
                 const match = src.match(uuidRegex);
                 if (!match) continue;

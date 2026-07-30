@@ -8,7 +8,11 @@ import server_common
 
 
 @pytest.fixture(autouse=True)
-def _isolated(monkeypatch):
+def _isolated(tmp_path, monkeypatch):
+    # 这些用例走的是真实 /api/compose 处理函数，会把任务记录落到 CWD 下的 tasks/。
+    # 不切工作目录就是往项目根目录里写真实任务文件（并触发孤儿清理），见
+    # test_task_history_not_wiped.py 记录的 2026-07-31 事故。
+    monkeypatch.chdir(tmp_path)
     server_common.ACTIVE_TASKS.clear()
     monkeypatch.setattr(server, 'access_ok', lambda handler: True)
     monkeypatch.setattr(server, 'rate_ok', lambda ip, action='default': True)

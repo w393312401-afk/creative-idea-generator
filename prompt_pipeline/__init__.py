@@ -2875,6 +2875,18 @@ def select_camera_dna(beat, base_camera_dna, packet=None, family=None):
     return cleaned_base
 
 
+# The bare phrases check_camera_contradictions flags. The fixer's own lists MUST be supersets
+# of these (see test_camera_phrase_lists_do_not_drift): anything the audit reports but the fixer
+# does not strip becomes a permanent finding that survives every rework round — the fixer used to
+# know only 'static tripod shot' while the audit flagged bare 'static tripod'.
+_STATIC_CAMERA_AUDIT_PHRASES = [
+    'static tripod', 'camera remains locked', 'locked eye-level', 'locked camera',
+]
+_MOVING_CAMERA_AUDIT_PHRASES = [
+    'dollying forward', 'dolly-in', 'forward-pushing', 'camera actively advances',
+    'crosses the sill', 'crosses the threshold',
+]
+
 _STATIC_CAMERA_PHRASES = [
     r'camera remains locked in a static tripod shot',
     r'camera remains locked in a static tripod',
@@ -2884,7 +2896,7 @@ _STATIC_CAMERA_PHRASES = [
     r'locked eye-level perspective',
     r'locked tripod shot',
     r'locked tripod'
-]
+] + [re.escape(p) for p in _STATIC_CAMERA_AUDIT_PHRASES]
 _MOVING_CAMERA_PHRASES = [
     r'coaxial forward-pushing camera',
     r'coaxial forward-pushing',
@@ -2896,7 +2908,7 @@ _MOVING_CAMERA_PHRASES = [
     r'optical flow radiates symmetrically from the doorway sill',
     r'crossing the threshold',
     r'crosses the sill'
-]
+] + [re.escape(p) for p in _MOVING_CAMERA_AUDIT_PHRASES]
 # TBCP allows the bridge camera to translate coaxially ONLY — "no pan, no tilt, no roll" —
 # and a static-tripod beat must not sweep at all. Detection is sentence-level and
 # negation-aware so the mandated guardrail wording ("with no yaw, tilt, roll, or
@@ -2940,13 +2952,11 @@ def check_camera_contradictions(prompt, is_moving, ban_pan_tilt=False):
     errors = []
     low = prompt.lower()
     if is_moving:
-        static_words = ['static tripod', 'camera remains locked', 'locked eye-level', 'locked camera']
-        for sw in static_words:
+        for sw in _STATIC_CAMERA_AUDIT_PHRASES:
             if sw in low:
                 errors.append(f"Moving camera prompt contains contradictory static clause '{sw}'")
     else:
-        moving_words = ['dollying forward', 'dolly-in', 'forward-pushing', 'camera actively advances', 'crosses the sill', 'crosses the threshold']
-        for mw in moving_words:
+        for mw in _MOVING_CAMERA_AUDIT_PHRASES:
             if mw in low:
                 errors.append(f"Static camera prompt contains contradictory moving clause '{mw}'")
     if ban_pan_tilt:
@@ -3434,15 +3444,28 @@ def check_out_and_in(prompt, is_threshold_or_reveal=False):
 
 def check_transition_shortcuts(prompt):
     """Reject abstract / causal-shortcut phrasing that skips concrete physical action — the exact
-    failure mode of the placeholder fallback. Forces the model toward observable build actions."""
+    failure mode of the placeholder fallback. Forces the model toward observable build actions.
+
+    Negation-aware, mirroring clean_prompt_text(): the pipeline's own boilerplate bans these very
+    phrases ("... or jump cuts are strictly forbidden"), so a phrase governed by a prohibition in
+    its own sentence is a rule statement, not a shortcut, and must not be flagged."""
     errors = []
-    low = prompt.lower()
     lazy_phrases = ['transformation progresses', 'magically', 'instantly transform',
                     'jump cut', 'time skip', 'suddenly appears', 'teleport',
                     'as if by magic', 'out of nowhere']
-    for p in lazy_phrases:
-        if p in low:
-            errors.append(f"VIDEO uses abstract/causal-shortcut phrase '{p}'; describe concrete, traceable physical actions instead")
+    negation_words = ['forbid', 'forbidden', 'avoid', 'no', 'without', 'never', 'not',
+                      'stop', 'prevent', 'strictly', 'prohibit', 'prohibited']
+    neg_re = re.compile(r'\b(' + '|'.join(negation_words) + r')\b')
+
+    seen = set()
+    for sentence in re.split(r'(?<=[.!?])\s+', str(prompt or '')):
+        low_sent = sentence.lower()
+        if neg_re.search(low_sent):
+            continue
+        for p in lazy_phrases:
+            if p in low_sent and p not in seen:
+                seen.add(p)
+                errors.append(f"VIDEO uses abstract/causal-shortcut phrase '{p}'; describe concrete, traceable physical actions instead")
     return errors
 
 
@@ -5059,15 +5082,22 @@ def rework_first_interior_reveal_decay_beat(config, i, image_prompt, decay_errs,
 # 两种叙事骨架都走同一套判定：linear_milestone（单线里程碑推进）在过门桥接处跨面，
 # dual_payoff（内外双重完工）在硬切处跨面，倒退形态一模一样。
 # ----------------------------------------------------------------------------
-# 只收「气候包络」三类构件：屋面/外壳/门窗——「从外面封好 → 从里面就不可能再透天
-# 透雨」是物理硬蕴含，误报率最低。楼板和内门不进词表（内门本来就被出画条款挡在
-# 画外，楼板开洞常是合法的室内工序），它们交给契约正文按语义判断。
+# 「气候包络」三类构件：屋面/外壳/门窗——「从外面封好 → 从里面就不可能再透天透雨」
+# 是物理硬蕴含，误报率最低。内门仍不进词表（本来就被出画条款挡在画外）。
+#
+# 2026-07-30 补进第四类：楼板/甲板。此前刻意不收，理由是「楼板开洞常是合法的室内
+# 工序」——理由本身没错，但代价是踩穿地面这一整类倒退全靠 LLM 审查，而它偏向
+# under-report。现在改为收进来、另配一套更窄的判据（见 _ENVELOPE_GROUP_OPEN_MARKERS
+# 与 _ENVELOPE_DECLARED_OPENING_CUES）：只认结构性破口，且本拍自己声明要开的洞
+# （楼梯井、检修口、吊装口）一律豁免。
 _ENVELOPE_ELEMENT_KEYWORDS = {
     'roof/ceiling': ('roof', 'roofing', 'rooftop', 'ceiling', 'canopy', 'cupola', 'dome',
                      'skylight', 'overhead shell', 'top shell'),
     'exterior wall/shell': ('exterior wall', 'external wall', 'outer wall', 'facade', 'façade',
                             'cladding', 'siding', 'outer shell', 'building envelope', 'hull'),
     'window/glazing': ('window', 'glazing', 'glazed', 'windowpane', 'window pane', 'sash'),
+    'floor/deck slab': ('floor', 'flooring', 'floorboard', 'floorboards', 'subfloor',
+                        'sub-floor', 'deck slab', 'decking', 'floor slab', 'floor deck'),
 }
 # 早前某拍把该构件「封上」的措辞。'complete'/'installed' 这类词单独看太宽（几乎每条
 # milestone_name 都带），所以判定按邻近窗口做：必须和构件词挨得够近才算数。
@@ -5083,6 +5113,12 @@ _ENVELOPE_SEAL_MARKERS = (
 _ENVELOPE_SKELETAL_QUALIFIERS = (
     'joist', 'rafter', 'stud', 'batten', 'purlin', 'truss', 'framing', 'frame', 'skeleton',
     'ribs', 'lath', 'furring', 'strapping',
+)
+# 楼板的「覆盖层」构件词：这些一铺上，脚下那一面就实了。见 _clause_seals_element
+# 里的楼板例外——铺板句里几乎必然带 'joist'，不给例外这一组等于白加。
+_FLOOR_COVERING_KEYWORDS = (
+    'subfloor', 'sub-floor', 'decking', 'floorboard', 'floorboards', 'floor slab',
+    'deck slab', 'floor deck', 'plywood', 'osb', 'sheathing', 'screed',
 )
 # 构件词与封闭词必须落在同一个子句里才算同一件事。纯按字符距离判会把同一拍里另一件事
 # 的封闭词算到屋面头上（"…sealed watertight with bitumen membrane and backfilled, while
@@ -5102,6 +5138,33 @@ _ENVELOPE_OPEN_MARKERS = (
     'punctured', 'rain falls through', 'snow drifts in', 'exposed to the weather',
 )
 _SENTENCE_SPLIT_PATTERN = re.compile(r'(?<=[.;!?])\s+')
+# 楼板专用的敞开判据：透天透雨那套词对楼板没有物理意义（脚下看见天空说明破了个洞，
+# 而「洞」本身已经在词表里），留着只会把「透过屋顶的天光洒在地板上」这种完全正常的
+# 写法算到楼板头上。这里只认结构性破口。
+_ENVELOPE_GROUP_OPEN_MARKERS = {
+    'floor/deck slab': (
+        'hole', 'holes', 'gap', 'gaps', 'gaping', 'breach', 'missing section',
+        'missing sections', 'missing panel', 'missing panels', 'missing board',
+        'missing boards', 'collapsed', 'caved in', 'cave-in', 'punctured',
+        'rotted through', 'rotted out', 'gives way', 'void below', 'open void',
+    ),
+}
+# 本拍自己要开的洞不算倒退：楼梯井/检修口/吊装口/管井是合法的室内工序，正是当初
+# 把楼板排除在词表外的原因。命中这些措辞就否掉本句的判定——同 _ENVELOPE_SKELETAL_
+# QUALIFIERS 的思路，宁可漏判也不能把合法工序判死。
+_ENVELOPE_DECLARED_OPENING_CUES = (
+    'cut', 'cutting', 'opening for', 'new opening', 'framed opening', 'rough opening',
+    'stair', 'stairwell', 'staircase', 'ladder', 'hatch', 'trapdoor', 'trap door',
+    'access panel', 'access opening', 'chase', 'penetration', 'duct', 'riser',
+    'skylight well', 'lift', 'hoist', 'inspection',
+)
+# 「这句接着上句在说同一个构件」的回指开头：把一句话拆成两句正是绕过逐句判定最
+# 顺手的写法（"Overhead the new roof is complete. Beyond it, blue sky and the distant
+# ridge." ——逐句看两句都干净）。只认以回指词开头、且没有点到别的包络构件的下一句，
+# 避免把"顶部已封成一句、地面碎裂成另一句"这种完全合法的跨句共现判成违规。
+_ENVELOPE_BACKREF_PATTERN = re.compile(
+    r'^\W*(it|its|it\'s|they|their|them|this|that|these|those|above|overhead|beyond|'
+    r'through it|through them|there|underfoot|below|beneath|behind it)\b', re.IGNORECASE)
 
 # 生成侧共用的契约条文（批量直出 + 单拍兜底两个指令块各引一次，避免两份手抄本漂移）。
 # 与骨架无关：单线里程碑推进在过门桥接处跨面，内外双重完工在硬切处跨面，同一条管两种。
@@ -5145,29 +5208,100 @@ def sealed_envelope_elements(beat_ladder, before_index):
         for group, keywords in _ENVELOPE_ELEMENT_KEYWORDS.items():
             if group in sealed:
                 continue
-            if any(_clause_seals_element(c, keywords) for c in clauses):
+            if any(_clause_seals_element(c, keywords, group) for c in clauses):
                 sealed[group] = str(beat.get('milestone_name') or beat.get('operation') or '').strip()
     return sealed
 
 
-def _clause_seals_element(clause, element_keywords):
+def _clause_seals_element(clause, element_keywords, group=None):
     """True when one clause declares an element of this group CLOSED: the clause names the
-    element AND carries a seal marker, with no skeletal qualifier in it."""
+    element AND carries a seal marker, with no skeletal qualifier in it.
+
+    楼板例外（group == 'floor/deck slab'）：骨架否决表里有 'joist'，而"在楼板龙骨上
+    铺好底板/面板"恰恰是封楼板最标准的写法（"subfloor decking laid over the floor
+    joists"），一律否决会让楼板这一组几乎永不生效、白加。所以这一组在同一子句里
+    出现覆盖层构件词时不吃骨架否决——铺上了盖板就是盖住了，脚下不可能再是空的。
+    其它组保持原样：椽条/桁架立起来不等于屋面封上了。"""
     if not any(kw in clause for kw in element_keywords):
         return False
     if any(q in clause for q in _ENVELOPE_SKELETAL_QUALIFIERS):
-        return False
+        if not (group == 'floor/deck slab'
+                and any(kw in clause for kw in _FLOOR_COVERING_KEYWORDS)):
+            return False
     return any(marker in clause for marker in _ENVELOPE_SEAL_MARKERS)
+
+
+def _group_open_markers(group):
+    """该构件组的「敞开」判据。默认是透天透雨那一整套；楼板另配窄表，见
+    _ENVELOPE_GROUP_OPEN_MARKERS。"""
+    return _ENVELOPE_GROUP_OPEN_MARKERS.get(group, _ENVELOPE_OPEN_MARKERS)
+
+
+def _envelope_hit_in_scope(scope_low, group):
+    """在一段文字（单句或相邻句对）里找「这个构件 + 敞开措辞」的共现，返回
+    (element_keyword, open_marker) 或 None。
+
+    否定式澄清句（"no gaps", "no daylight through the roof"）由
+    _mentions_without_negation 排除；本拍自己声明要开的洞（楼梯井/检修口/吊装口）由
+    _ENVELOPE_DECLARED_OPENING_CUES 否掉——那是合法工序，不是倒退。"""
+    hit_element = next((kw for kw in _ENVELOPE_ELEMENT_KEYWORDS[group] if kw in scope_low), None)
+    if not hit_element:
+        return None
+    open_hits = _mentions_without_negation(scope_low, _group_open_markers(group))
+    if not open_hits:
+        return None
+    if any(cue in scope_low for cue in _ENVELOPE_DECLARED_OPENING_CUES):
+        return None
+    return hit_element, open_hits[0]
+
+
+def _names_other_group(text_low, group):
+    """这段文字里点到了别的构件组（不是 group 自己）。"""
+    return any(kw in text_low
+               for other, kws in _ENVELOPE_ELEMENT_KEYWORDS.items() if other != group
+               for kw in kws)
+
+
+def _envelope_scopes(image_prompt, group):
+    """针对某个构件组的判定作用域序列：先每个单句，再每个「回指式相邻句对」。
+    逐条 yield (原文, 小写文本)。
+
+    单句是原始口径（同一句里共现才算数）：跨句共现完全合法——"顶部已封"成一句、
+    "地面碎裂"成另一句是正确写法。但把同一个陈述拆成两句、第二句用回指词接着说，
+    是绕过逐句判定最顺手的写法（"Overhead the new roof is complete. Beyond it, blue
+    sky and the distant ridge."——逐句看两句都干净）。相邻句对因此只在两个条件同时
+    成立时才成为作用域：
+
+      1. 下一句以回指词开头（It / Its / Beyond it / Above / Overhead / Underfoot …）；
+      2. 下一句没点到**别的**构件组——点了就说明那句的敞开措辞可能属于那个构件，跨句
+         拼过来会把违规挂到错的构件上（"Overhead the roof is closed. Below it, the
+         exterior wall still shows gaps." 里的 gaps 是外墙的事）。点到本组自己是允许
+         的：那种写法逐句判定要么已经命中，要么正是"补语在下一句"的形态。
+
+    第 2 条是明知会漏判的取舍：别的构件词只是顺带提到时（"…show above the floor"）
+    也照样否决。分不清敞开措辞属于哪个构件时，漏一条远好过挂错——回炉会照着错的判定
+    去改对的句子，那比不修更糟。判定因此按组分别做，而不是一次算出一份全局作用域。"""
+    sentences = [s for s in _SENTENCE_SPLIT_PATTERN.split(image_prompt or '') if s.strip()]
+    for s in sentences:
+        yield s, s.lower()
+    for first, second in zip(sentences, sentences[1:]):
+        if not _ENVELOPE_BACKREF_PATTERN.match(second):
+            continue
+        if _names_other_group(second.lower(), group):
+            continue
+        pair = f'{first.strip()} {second.strip()}'
+        yield pair, pair.lower()
 
 
 def check_envelope_seal_regression(image_prompt, i, beat_ladder, family='exterior'):
     """确定性兜底：室内帧不得把「早前已经从外面封好的包络构件」重新写成敞开的。
 
     只对 family == 'interior' 的帧生效（外景帧看到的是同一构件的外面那层，本来就该是
-    封好的，另有里程碑校验管）。判定按句子作用域：同一句里既点了某个已封构件、又点了
-    敞开/透天措辞，才算命中——跨句共现（顶部已封成一句、地面碎裂成另一句）是完全合法
-    的写法，不能算违规。否定式澄清句（"no gaps", "no daylight through the roof"）走
+    封好的，另有里程碑校验管）。作用域见 _envelope_scopes：逐句 + 「下一句用回指词
+    接着说」的相邻句对。否定式澄清句（"no gaps", "no daylight through the roof"）走
     _mentions_without_negation 绕开。
+
+    每个构件组最多报一条：同一个构件在一稿里被写敞开三次，回炉要修的是同一件事。
 
     beat_ladder 缺失或本拍之前没封过任何包络构件时返回 []。"""
     errors = []
@@ -5176,25 +5310,22 @@ def check_envelope_seal_regression(image_prompt, i, beat_ladder, family='exterio
     sealed = sealed_envelope_elements(beat_ladder, i)
     if not sealed:
         return errors
-    for sentence in _SENTENCE_SPLIT_PATTERN.split(image_prompt):
-        low = sentence.lower()
-        open_hits = _mentions_without_negation(low, _ENVELOPE_OPEN_MARKERS)
-        if not open_hits:
-            continue
-        for group, milestone in sealed.items():
-            hit_element = next((kw for kw in _ENVELOPE_ELEMENT_KEYWORDS[group] if kw in low), None)
-            if not hit_element:
+    for group, milestone in sealed.items():
+        for scope_text, scope_low in _envelope_scopes(image_prompt, group):
+            hit = _envelope_hit_in_scope(scope_low, group)
+            if not hit:
                 continue
+            hit_element, open_marker = hit
             errors.append(
                 f"Envelope regression: an earlier beat already closed the {group} "
                 f"(\"{milestone}\"), but this interior IMAGE still describes it as open — "
-                f"'{hit_element}' together with '{open_hits[0]}' in: \"{sentence.strip()}\". "
+                f"'{hit_element}' together with '{open_marker}' in: \"{scope_text.strip()}\". "
                 f"The same physical element cannot be sealed from outside and open from inside. "
                 f"Rewrite it as closed from underneath (bare new decking, exposed structure, "
                 f"fasteners, unfinished inner face) and move any required decay onto surfaces no "
                 f"earlier beat has touched."
             )
-            break
+            break   # 每个构件组最多一条：报三遍也是同一件事要修
     return errors
 
 
@@ -6756,6 +6887,14 @@ def _milestone_beat_directive(beat, img_before="this beat's starting IMAGE",
     This supersedes the old small/default incremental tiers while leaving
     _stage_scope_beat_directive available for checkpoint/test compatibility.
     Threshold and reward beats keep their purpose-built directives.
+
+    The IMAGE/VIDEO requirement checklists below are written to mirror the deterministic
+    post-generation audits 1:1 — check_milestone_image_prompt, check_stage_scope_wording,
+    check_image_realizes_traces, check_milestone_video and check_worker_passage. Any rule
+    the audit enforces must be stated here in the same vocabulary the audit matches on, so
+    a beat passes on the first pass instead of via a rework round (a 2026-07-30 live run
+    hit 6/11 beats missing the material source noun and 6/11 large beats missing their own
+    full-coverage claim, all of which the old two-sentence phrasing merely implied).
     """
     if not isinstance(beat, dict):
         return ''
@@ -6773,6 +6912,57 @@ def _milestone_beat_directive(beat, img_before="this beat's starting IMAGE",
         'traces': ', '.join(beat.get('persistent_traces') or []),
         'preserve': beat.get('preserve_state'),
     }
+
+    # Coverage wording is tier-directional and is graded per sentence: a full-coverage phrase
+    # sitting in a carried-over-state sentence counts for neither tier (see
+    # _stage_scope_full_coverage_sentences), so name the split, tersely.
+    scope = beat.get('stage_scope')
+    if scope == 'large':
+        coverage_rule = (
+            'Put a full-coverage phrase ("the entire", "all interior/visible", "every wall/surface", '
+            '"fully covered") INSIDE the sentence describing THIS beat\'s own new work; a sentence '
+            'containing remains/stays/unchanged/already/previously/prior reads as inherited state and '
+            'does not count — write the two as separate sentences.'
+        )
+    elif scope in ('small', 'default'):
+        coverage_rule = (
+            'NO full-coverage phrase ("entire", "all", "every", "fully covered") in the sentence '
+            'describing THIS beat\'s own new work — describe partial progress; such a phrase inside an '
+            'inherited-state sentence (remains/already/previously) is fine.'
+        )
+    else:
+        coverage_rule = ''
+
+    # The numbered items deliberately do NOT repeat the field values — the contract block above
+    # already carries them verbatim, and echoing each one a second time is what pushed this
+    # directive to 3728 chars per beat (x11 beats in one batched call), where per-item compliance
+    # measurably dropped. Each item carries only what the block cannot: the checker's vocabulary.
+    image_rules = [
+        f'Name the "{fields["name"]} anchor", its completed state, and its extent/count, in words.',
+        'Name every feature you list in this beat\'s ===TRACES=== section — anything the VIDEO '
+        'installs must be visible by name here.',
+        'Include at least TWO of the contact traces above, and preserve the unchanged state above.',
+        'No begins / starts to / one small section / a local patch / vague progress.',
+    ]
+    if coverage_rule:
+        image_rules.insert(1, coverage_rule)
+
+    video_rules = [
+        'Open on the start state above; first tool/material contact in the opening moment — use the '
+        'word "first".',
+        'Repeated cycles across the whole clip — "repeatedly" / "cycle by cycle" / "one by one" / '
+        '"course by course" / "row by row". One action is not a cycle.',
+        'Name the material source as a stack / crate / bundle / bucket / rack / tray / barrow / bag / '
+        'pile standing at a stated spot, and trace the movement path from it to the work face.',
+        'Both progress markers above developing continuously and independently.',
+        'The same lone worker enters at the start and exits before the final frame — no ghost work.',
+        f'Land on the clean terminal frame matching {img_after} — the completed state above, with '
+        'worker, tools, and empty containers gone.',
+    ]
+
+    image_block = '\n'.join(f'{n}. {rule}' for n, rule in enumerate(image_rules, 1))
+    video_block = '\n'.join(f'{n}. {rule}' for n, rule in enumerate(video_rules, 1))
+
     return f"""VISIBLE MILESTONE CONTRACT FOR THIS BEAT (mandatory):
 - Terminal stage product: {fields['name']}.
 - Visible start state in {img_before}: {fields['before']}.
@@ -6783,8 +6973,10 @@ def _milestone_beat_directive(beat, img_before="this beat's starting IMAGE",
 - Secondary progress marker: {fields['secondary']}.
 - Persistent contact traces in {img_after}: {fields['traces']}.
 - Preserve unchanged: {fields['preserve']}.
-IMAGE REQUIREMENT: call the resulting scene the \"{fields['name']} anchor\" and state the full completed extent/count directly. The adjacent anchors must be distinguishable at a glance; never write begins, one small section, a local patch, or vague progress. Include at least two listed contact traces and explicitly preserve prior/not-yet-worked state.
-VIDEO REQUIREMENT: state the visible transition from the exact start state to the exact completed state. Show the first tool contact, repeated work cycles, source and movement path, BOTH progress markers developing continuously, and the clean final handoff matching {img_after}."""
+IMAGE REQUIREMENTS (each one is machine-checked after generation):
+{image_block}
+VIDEO REQUIREMENTS (each one is machine-checked after generation):
+{video_block}"""
 
 
 def _batch_shared_system_prompt(packet, scup_ref, tbcp_ref):
@@ -7762,12 +7954,22 @@ Respond with STRICT JSON only, no markdown fences: a flat list of short Chinese 
 ["天花板未随墙面一起封板：IMAGE 6 中天花板仍是裸露龙骨", "IMAGE 6 出现了未在本拍视频提示词中出现过的门扇"]"""
 
 
-def _global_review_system_prompt(total_beats):
+def _global_review_system_prompt():
     """跨帧一致性稀疏审查用的系统提示词：这几条规则本质上要求比较不相邻的帧（背景/
     地标/材质/载体身份是否在全序列里保持一致），局部逐拍审查看不到这么远，只能放在
-    这里对着全套已渲染帧图单独查一次——但规则数从原来的30余条收窄到这里的6条，避免
-    和局部审查一样被规则数量稀释判断力。"""
-    return f"""You are a strict spatial-consistency (SCUP) auditor for a restoration / renovation time-lapse. You are shown all {total_beats + 1} actual RENDERED frame images, in sequence order (IMAGE 1 first, IMAGE {total_beats + 1} last), alongside the full IMAGE/VIDEO prompt text set. You are checking ONLY cross-frame identity/continuity — NOT construction order, causality, or single-beat composition (a separate reviewer already checks those per-beat). Do NOT redesign, restyle, re-theme, or otherwise "improve" anything; you are reporting violations, not fixing them.
+    这里对着已渲染帧图单独查——但规则数从原来的30余条收窄到这里的6条，避免和局部
+    审查一样被规则数量稀释判断力。
+
+    2026-07-30 分批改造：规则数收窄了，图片数却没有——一单 13 帧仍是一次调用喂 14 张
+    图，正是拆出逐拍审查时要避开的那种注意力稀释（见 _local_beat_review_system_prompt
+    顶部注释），只是这次稀释来自图片而不是规则。现在改成按 global_review_windows 切成
+    若干重叠窗口、每窗最多 6 张图，每个窗口都带 IMAGE 1 作链头基准（"还是不是同一个
+    空间/同一个载体"没有基准无从判断）。
+
+    随之把拍数从提示词正文里挪走（旧版内插 total_beats，每单一份不同的系统提示词，
+    prompt 缓存零命中；分批之后一单还会调用多次，浪费翻倍）。本函数因此成为常量，
+    窗口里到底是哪几帧、允许报哪几拍，全部由 user turn 逐次说明。规则文本一字未改。"""
+    return f"""You are a strict spatial-consistency (SCUP) auditor for a restoration / renovation time-lapse. You are shown a BATCH of this sequence's actual RENDERED frame images, in sequence order, alongside the full IMAGE/VIDEO prompt text set. The user turn tells you the real IMAGE number of every attached image and which beat indices you may report — the batch is a subset of a longer sequence, so always use those real numbers and never renumber the attachments from 1. The first attached image is always IMAGE 1, the chain-head baseline (the untouched original state), included in every batch so scene/carrier identity can be judged against it. You are checking ONLY cross-frame identity/continuity — NOT construction order, causality, or single-beat composition (a separate reviewer already checks those per-beat). Do NOT redesign, restyle, re-theme, or otherwise "improve" anything; you are reporting violations, not fixing them.
 
 Only report a violation if you can point to a CONCRETE visible detail across specific images that clearly contradicts the rule. If a potential drift is subtle, ambiguous, gradual lighting/color variance, or you are not confident, do NOT report it — under-reporting is far cheaper than a false accusation here; a second reviewer will independently re-check anything you do report before it counts.
 
@@ -7780,7 +7982,7 @@ Check only these cross-frame rules:
 - NO INVENTED OPENINGS: interior frames must not grow windows, skylights, doors, or other openings that the carrier does not physically have and that no earlier beat installed on camera; the interior's light must come from the carrier's own established openings, an installed practical light, or entry daylight from behind the camera.
 - ENVELOPE SEAL PERSISTENCE (cross-view, cross-frame): the roof/ceiling, exterior walls or shell, windows/glazing, doors, and floor/deck slabs are each ONE physical element with an outside face and an inside face. Once ANY earlier frame shows such an element sealed, re-clad, glazed, or completed, every later frame — including ones shot from the opposite side, after a threshold crossing or a hard cut — must still show it closed. Sky, clouds, a distant ridge, treetops, rain, snow, or a daylight shaft coming through a roof or wall that an earlier frame already sealed is a violation, and so is a hole, gap, breach, missing section, or collapse reappearing in it. A raw, unfinished INNER face (bare decking, exposed rafters or ribs, fastener rows, unpainted new material) is correct and is NOT a violation — only reopening is. Report it against the beat index where the sealed element first appears open again, naming both the frame that sealed it and the frame that reopened it.
 
-Respond with STRICT JSON only, no markdown fences, mapping each beat index (as a stringified integer, 1-based, matching the VIDEO N / IMAGE N+1 pair where the drift becomes visible) to a list of short Chinese violation descriptions, each naming the concrete visible detail that grounds it. Only include beats that have at least one real violation — if the whole sequence is clean, respond with exactly {{}}. Example:
+Respond with STRICT JSON only, no markdown fences, mapping each beat index (as a stringified integer, 1-based, matching the VIDEO N / IMAGE N+1 pair where the drift becomes visible) to a list of short Chinese violation descriptions, each naming the concrete visible detail that grounds it. Only include beats that have at least one real violation, and only beats the user turn says you may report on — if this batch is clean, respond with exactly {{}}. Example:
 {{"5": ["载体身份丢失：IMAGE 6 起室内不再可见船体肋骨结构，退化成普通房间"]}}"""
 
 
@@ -7918,14 +8120,97 @@ def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_
         return None
 
 
+# 跨帧稀疏审查的分批口径。窗口 6 张图（含 IMAGE 1 基准，即每窗实际推进 5 帧）是按
+# 逐拍审查的经验取的：那一层每次只看 2 张就把判断力从"默认没问题"里救了回来，跨帧
+# 规则又确实需要一段跨度才有比较对象，6 是两者之间能覆盖 5 拍的最小档。重叠 1 帧保证
+# 每一对相邻帧至少完整落在一个窗口里，窗口接缝处不会漏掉一拍。
+_GLOBAL_REVIEW_WINDOW = 6
+_GLOBAL_REVIEW_OVERLAP = 1
+
+
+def global_review_windows(sequences, window=_GLOBAL_REVIEW_WINDOW,
+                          overlap=_GLOBAL_REVIEW_OVERLAP):
+    """把整套帧号切成若干重叠的送审窗口，每窗形如 [1, k, k+1, ..., k+n]。
+
+    链头帧（序列里的第一张，通常是 IMAGE 1）进每一个窗口：跨帧规则问的是"还是不是
+    同一个空间/同一个载体/同一套材质"，没有未被触碰的原始状态作基准就无从判断。
+
+    帧数不超过 window 时返回单个窗口（= 分批改造前的原样行为，短单不受影响）。
+    纯函数，可单测。"""
+    seqs = sorted({int(s) for s in sequences})
+    if not seqs:
+        return []
+    if len(seqs) <= window:
+        return [seqs]
+    head, body = seqs[0], seqs[1:]
+    capacity = max(2, window - 1)          # 扣掉恒定占位的链头帧
+    step = max(1, capacity - overlap)
+    windows, i = [], 0
+    while i < len(body):
+        chunk = body[i:i + capacity]
+        if not chunk:
+            break
+        windows.append([head] + [s for s in chunk if s != head])
+        if i + capacity >= len(body):
+            break
+        i += step
+    return windows
+
+
+def _global_window_user_text(prompt_block, window_seqs, reportable_beats):
+    """一个窗口的 user turn：点明每张附图的真实 IMAGE 号与本窗允许上报的拍号。
+
+    系统提示词已改成常量（跨窗口/跨单共用同一前缀吃 prompt 缓存），"这批是哪几帧"
+    因此必须由这里说清楚——否则模型会把附件从 1 重新编号，报出来的拍号全是错的。"""
+    labels = ', '.join(f'IMAGE {s}' for s in window_seqs)
+    if reportable_beats:
+        beats_txt = ', '.join(str(b) for b in reportable_beats)
+        scope = (f"You may report violations ONLY for these beat indices: {beats_txt} "
+                 f"(beat N = the IMAGE N → IMAGE N+1 pair; both frames of the pair are "
+                 f"attached above). Drift you can only see against IMAGE 1 should be "
+                 f"reported against the earliest listed beat where it is visible.")
+    else:
+        # 理论上不会发生（窗口至少含一对相邻帧），保险起见给个明确指令而不是空话
+        scope = "This batch contains no complete adjacent pair; respond with exactly {}."
+    return (
+        f"Here is the complete generated prompt set:\n{prompt_block}\n\n"
+        f"Attached are {len(window_seqs)} rendered frames of this sequence, in this order: "
+        f"{labels}. The first one (IMAGE {window_seqs[0]}) is the chain-head baseline.\n"
+        f"{scope}\n"
+        f"Report cross-frame violations as JSON keyed by real beat index."
+    )
+
+
+def _reportable_beats(window_seqs, total_beats):
+    """本窗口能判的拍：拍 N 需要 IMAGE N 与 IMAGE N+1 同在窗口里。"""
+    present = set(window_seqs)
+    return [b for b in sorted(present)
+            if 1 <= b <= total_beats and (b + 1) in present]
+
+
 def check_global_sequence_consistency(config, prompt_block, frame_image_paths, degraded=False,
-                                      timeout=None, prepared_paths=None):
-    """跨帧一致性稀疏审查：只查 6 条真正需要跨帧比较的规则（场景/材质/地标/载体身份），
-    但仍需面对全套已渲染帧图。返回 {beat_index: [violation, ...]}；空字典 = 跑成且无
-    违规；None = 没跑成（超时/网关异常/响应不可解析），调用方不能当"通过"处理。
+                                      timeout=None, prepared_paths=None,
+                                      unreviewed_beats_out=None, only_beats=None):
+    """跨帧一致性稀疏审查：只查 6 条真正需要跨帧比较的规则（场景/材质/地标/载体身份/
+    封套密闭）。返回 {beat_index: [violation, ...]}；空字典 = 跑成且无违规；
+    None = 整层都没跑成（每个窗口都超时/网关异常/响应不可解析），调用方不能当"通过"处理。
+
+    2026-07-30 分批：不再一次调用喂全套帧图，按 global_review_windows 切成重叠窗口
+    逐窗审（并发度同逐拍层）。规则数早就收窄到 6 条，图片数却一直没收窄，一单 13 帧
+    仍是 14 张图一次性喂进去——那正是当初拆出逐拍审查要避开的注意力稀释，只是这次
+    来自图片而非规则。
+
+    部分窗口没跑成时不再整层判失败（那会把已经查出来的违规一起扔掉），而是把这些
+    窗口覆盖的拍号写进 unreviewed_beats_out：那些帧因此拿不到"已审查通过"的章，跑成
+    的窗口的发现照常保留。**这是这道门的 fail-safe 关键**——绝不能出现"跨帧层返回了
+    结果，于是所有帧都算查过"的假通过（2026-07-15 盐湖贝壳单事故的同款）。
 
     prepared_paths: 调用方已按序备好的送审图路径（降级档下是整轮共用的那份压缩图，
-    见 _review_frame_cache）；给了就不再自己压一遍。"""
+    见 _review_frame_cache）；给了就不再自己压一遍。顺序须与 sorted(frame_image_paths)
+    一致。
+
+    only_beats: 只重跑「覆盖这些拍」的窗口（None = 全部窗口）。降级重试靠它只补跑上
+    一轮没跑成的那几个窗口，而不是把已经审干净的窗口整批再烧一遍。"""
     if not prompt_block or not frame_image_paths:
         return {}
     total_beats = len(frame_image_paths) - 1
@@ -7933,38 +8218,79 @@ def check_global_sequence_consistency(config, prompt_block, frame_image_paths, d
         return {}
     if timeout is None:
         timeout = 180 if degraded else 90
+    ordered_seqs = sorted(frame_image_paths)
     if prepared_paths is not None:
-        ordered_paths = list(prepared_paths)
+        path_for = dict(zip(ordered_seqs, prepared_paths))
     else:
-        ordered_paths = [frame_image_paths[seq] for seq in sorted(frame_image_paths)]
+        ordered_paths = [frame_image_paths[seq] for seq in ordered_seqs]
         if degraded:
             ordered_paths = _compress_frames_for_review(ordered_paths)
-    system_prompt = _global_review_system_prompt(total_beats)
-    user_text = (
-        f"Here is the complete generated prompt set:\n{prompt_block}\n\n"
-        f"Review the {len(ordered_paths)} attached images (in sequence order, IMAGE 1 "
-        f"first) against this prompt set and report cross-frame violations as JSON."
-    )
-    try:
-        response = _multimodal_chat(config, system_prompt, user_text, ordered_paths,
-                                    max_tokens=3000, timeout=timeout)
-        data = json.loads(_strip_code_fences(response))
-        if not isinstance(data, dict):
+        path_for = dict(zip(ordered_seqs, ordered_paths))
+
+    system_prompt = _global_review_system_prompt()
+    windows = global_review_windows(ordered_seqs)
+    if only_beats is not None:
+        wanted = {int(b) for b in only_beats}
+        windows = [w for w in windows
+                   if wanted & set(_reportable_beats(w, total_beats))]
+        if not windows:
+            return {}
+
+    def _run_window(window_seqs):
+        """一个窗口的判定：{beat: [violations]}，或 None（这一窗没跑成）。"""
+        beats = _reportable_beats(window_seqs, total_beats)
+        user_text = _global_window_user_text(prompt_block, window_seqs, beats)
+        try:
+            response = _multimodal_chat(
+                config, system_prompt, user_text,
+                [path_for[s] for s in window_seqs],
+                max_tokens=3000, timeout=timeout)
+            data = json.loads(_strip_code_fences(response))
+            if not isinstance(data, dict):
+                return None
+            allowed = set(beats)
+            failures = {}
+            for k, v in data.items():
+                try:
+                    beat = int(k)
+                except (TypeError, ValueError):
+                    continue
+                # 只收本窗口真的能看见的拍：窗口外的拍号是模型按附件重新编号
+                # 编出来的，收下就是把违规挂到无关的帧上
+                if beat in allowed and isinstance(v, list) and v:
+                    failures[beat] = [str(item) for item in v]
+            return failures
+        except Exception as e:
+            _reraise_if_cancelled(e)
+            if sys.stdout:
+                print(f"[SEQUENCE REVIEW][GLOBAL] 窗口 IMAGE {window_seqs} 未完成"
+                      f"（该窗无判定，不视为通过）: {e}")
             return None
-        failures = {}
-        for k, v in data.items():
-            try:
-                beat = int(k)
-            except (TypeError, ValueError):
-                continue
-            if 1 <= beat <= total_beats and isinstance(v, list) and v:
-                failures[beat] = [str(item) for item in v]
-        return failures
-    except Exception as e:
-        _reraise_if_cancelled(e)
-        if sys.stdout:
-            print(f"[SEQUENCE REVIEW][GLOBAL] check_global_sequence_consistency 未完成（本轮无判定，不视为通过）: {e}")
+
+    results = _map_parallel(
+        _run_window,
+        [(idx, tuple(win)) for idx, win in enumerate(windows)],
+        review_concurrency(config))
+
+    merged, ran, failed_beats = {}, 0, set()
+    for idx, win in enumerate(windows):
+        window_result = results.get(idx)
+        if window_result is None:
+            failed_beats.update(_reportable_beats(win, total_beats))
+            continue
+        ran += 1
+        for beat, issues in window_result.items():
+            for issue in issues:
+                if issue not in merged.setdefault(beat, []):
+                    merged[beat].append(issue)
+    if not ran:
         return None
+    # 被别的窗口成功审过的拍不算漏审（重叠帧正是为此存在）
+    if unreviewed_beats_out is not None:
+        unreviewed_beats_out.extend(sorted(failed_beats - {
+            b for idx, win in enumerate(windows) if results.get(idx) is not None
+            for b in _reportable_beats(win, total_beats)}))
+    return merged
 
 
 def _verify_review_violation(config, violation_text, image_paths, timeout=30):
@@ -8001,7 +8327,8 @@ def _verify_review_violation(config, violation_text, image_paths, timeout=30):
 
 
 def check_full_sequence_consistency(config, prompt_block, frame_image_paths, degraded=False,
-                                    only_beats=None, skip_global=False, on_progress=None):
+                                    only_beats=None, skip_global=False, on_progress=None,
+                                    global_only_beats=None):
     """整套序列渲染完成后的一致性审查，取代原来盲文本的逐轮全量审核（见
     prompt_pipeline_refactor 里去掉的 validate_and_repair / 审核表)。
 
@@ -8021,8 +8348,15 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
     返回 dict：
       {'failures': {beat_index: [violation, ...]},   # 复核确认的违规
        'unreviewed_beats': [beat_index, ...],        # 本轮没能拿到判定的拍
-       'global_reviewed': bool}                      # 跨帧层是否跑成
+       'global_unreviewed_beats': [beat_index, ...], # 其中因跨帧窗口没跑成而漏的
+       'global_reviewed': bool,                      # 跨帧层是否跑成（哪怕只有部分窗口）
+       'global_attempted': bool}                     # 本轮有没有跑跨帧层（skip_global 的反面）
     **None = 一拍都没审成且跨帧层也没跑成**（整轮彻底没跑起来）。
+
+    global_unreviewed_beats 与 global_attempted 是给降级重试用的：跨帧层部分窗口失败
+    时 global_reviewed 仍是 True，只看它会让调用方以为"跨帧层已经查过了"而跳过补跑，
+    那几拍在重试后反而被洗成"已审"——比不重试还糟。见
+    pipeline_orchestrator._sequence_consistency_review 的 skip_global 判定。
 
     2026-07-25 返回形状改造（此前是裸 {beat: [issues]}）：旧形状把"这一拍审过且干净"
     和"这一拍压根没审成"压成了同一件事——只要跨帧层跑成，任何单拍的 None 都不会阻止
@@ -8034,8 +8368,11 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
     degraded=True 为降级重试档：帧图压小 + 超时放宽，用判定精度换可用性。
     only_beats: 只审这些拍（None=全部，[]=一拍都不审）。降级重试靠它只重跑上一轮没
     审成的拍，而不是把已经审干净的整批再来一遍。
-    skip_global: 跳过跨帧层（上一轮它已经跑成了就没必要重来）；跳过时结果里
-    global_reviewed=False，由调用方与上一轮的结果合并（见 merge_review_results）。
+    skip_global: 跳过跨帧层（上一轮它**每个窗口**都跑成了才该跳）；跳过时结果里
+    global_reviewed=False、global_attempted=False，由调用方与上一轮的结果合并
+    （见 merge_review_results）。
+    global_only_beats: 不跳过跨帧层时，只重跑覆盖这些拍的窗口（None = 全部窗口）。
+    降级重试用它补跑上一轮失败的那几个窗口，而不是整层重来。
     on_progress: 每审完一拍在**父线程**回调一次 ('sequence_review_beat', {...})，
     整段审查因此不再是几分钟的静默黑洞；回调抛异常（取消）会立刻中止剩余的拍。"""
     if not prompt_block or not frame_image_paths:
@@ -8094,13 +8431,20 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
                     {'text': issue, 'layer': 'local', 'beat': beat,
                      'frames': [beat, beat + 1], 'images': list(pair)})
 
+        global_unreviewed = []
         if not skip_global:
             global_timeout = 180 if degraded else 90
             global_paths = [paths_for(s) for s in sorted(frame_image_paths)]
+            # 跨帧层现在是多个窗口（见 global_review_windows）：个别窗口没跑成时它仍
+            # 返回其余窗口的发现，没跑成的那几拍从这里带回来并入 unreviewed_beats，
+            # 于是那些帧拿不到"已审查通过"的章。绝不能因为"整层返回了结果"就给全部
+            # 帧盖通过（2026-07-15 fail-open 事故的同款）。
             global_result = check_global_sequence_consistency(
                 config, prompt_block, frame_image_paths, degraded=degraded,
-                timeout=global_timeout, prepared_paths=global_paths)
+                timeout=global_timeout, prepared_paths=global_paths,
+                unreviewed_beats_out=global_unreviewed, only_beats=global_only_beats)
             global_reviewed = global_result is not None
+            unreviewed_beats.extend(global_unreviewed)
             if global_reviewed:
                 for beat, issues in global_result.items():
                     for issue in issues:
@@ -8136,15 +8480,23 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
             continue
         failures.setdefault(beat, []).append(cand['text'])
     return {'failures': failures, 'issues': issues,
-            'unreviewed_beats': sorted(unreviewed_beats),
-            'global_reviewed': global_reviewed}
+            # 去重：一拍可能既在逐拍层没审成、又落在没跑成的跨帧窗口里
+            'unreviewed_beats': sorted(set(unreviewed_beats)),
+            'global_unreviewed_beats': sorted(set(global_unreviewed)),
+            'global_reviewed': global_reviewed,
+            'global_attempted': not skip_global}
 
 
 def merge_review_results(first, second):
     """把"降级只重跑没审成的那几拍"的结果合并回上一轮。
 
-    second 只覆盖被重跑的拍（可能还补跑了跨帧层）：违规取并集；unreviewed 以 second
-    为准（重跑后仍没审成的才算漏审）；跨帧层任一轮跑成即算查过。"""
+    second 只覆盖被重跑的拍（可能还补跑了跨帧窗口）：违规取并集；跨帧层任一轮跑成
+    即算查过。
+
+    unreviewed 以 second 为准（重跑后仍没审成的才算漏审），但**跨帧窗口那部分只有在
+    second 真的跑过跨帧层时才以它为准**：second 跳过跨帧层（skip_global）时，上一轮
+    那几个失败窗口根本没被补跑，把它们从 unreviewed 里抹掉就是凭空发通过章——那几帧
+    的跨帧规则至今没人查过。"""
     if first is None:
         return second
     if second is None:
@@ -8157,11 +8509,17 @@ def merge_review_results(first, second):
                 failures[beat].append(issue)
     kept = [i for i in (first.get('issues') or [])
             if i.get('beat') not in {j.get('beat') for j in (second.get('issues') or [])}]
+    # second 没跑跨帧层 → 上一轮的窗口漏审原样留着（没人补跑过，不能当查过）
+    carried_global = ([] if second.get('global_attempted')
+                      else list(first.get('global_unreviewed_beats') or []))
+    global_unreviewed = sorted(set(second.get('global_unreviewed_beats') or []) | set(carried_global))
     return {
         'failures': failures,
         'issues': kept + list(second.get('issues') or []),
-        'unreviewed_beats': sorted(second.get('unreviewed_beats') or []),
+        'unreviewed_beats': sorted(set(second.get('unreviewed_beats') or []) | set(global_unreviewed)),
+        'global_unreviewed_beats': global_unreviewed,
         'global_reviewed': bool(first.get('global_reviewed') or second.get('global_reviewed')),
+        'global_attempted': bool(first.get('global_attempted') or second.get('global_attempted')),
     }
 
 
@@ -8199,7 +8557,9 @@ def _review_frame_cache(frame_image_paths, degraded):
 
 def _empty_review_result():
     """空序列（没有提示词/没有帧/只有一帧）的"无事可审"结果：没有违规、没有漏审。"""
-    return {'failures': {}, 'issues': [], 'unreviewed_beats': [], 'global_reviewed': True}
+    return {'failures': {}, 'issues': [], 'unreviewed_beats': [],
+            'global_unreviewed_beats': [], 'global_reviewed': True,
+            'global_attempted': True}
 
 
 def frame_review_status(sequences, review_result):

@@ -529,28 +529,65 @@ async function loadLibrary() {
 }
 
 // Save library to both API (server file) and localStorage (browser backup)
-async function saveLibrary() {
+//
+// intent（可选）：声明这次回写是哪次删除造成的缩量，服务端的缩量闸门据此放行
+// （见 server_common.library_shrink_verdict）。不声明就写"少了东西"的库一律被
+// 409 拒绝——这是 2026-07-12 整库清零与 2026-07-27 真库被测试覆盖两次事故之后
+// 补的第三道防线。合法缩量只有三处，都在下面注明：
+//   · deleteFromLibrary        → { removedIds: [id] }
+//   · syncFrameRunToLibrary    → { frameShrinkIds: [id] }（服务端 manifest 为准）
+//   · media_renderer 幽灵清理  → { frameShrinkIds: [id] }
+// 返回 true/false 表示服务端是否真的接受了这次写入。
+async function saveLibrary(intent) {
     // 1. Always write to localStorage as a fallback backup
     localStorage.setItem('spark_library', JSON.stringify(savedIdeas));
-    
+
     // 2. Attempt saving to server file database
+    let ok = false;
     try {
+        const removedIds = (intent && intent.removedIds) || [];
+        const frameShrinkIds = (intent && intent.frameShrinkIds) || [];
+        // 无声明时仍发裸数组：历史契约不变，服务端两种形态都收
+        const body = (removedIds.length || frameShrinkIds.length)
+            ? JSON.stringify({
+                ideas: savedIdeas,
+                intent: {
+                    removed_ids: removedIds.map(String),
+                    frame_shrink_ids: frameShrinkIds.map(String),
+                },
+            })
+            : JSON.stringify(savedIdeas);
         const response = await fetch('/api/library', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify(savedIdeas)
+            body
         });
+        // 409 = 服务端主动拒写（空库覆盖/槽位不自洽/未声明缩量）。这类拒绝必须
+        // 说出来：被静默吞掉的防护等于没有防护，用户会以为改动已经存下来了。
+        if (response.status === 409) {
+            const data = await response.json().catch(() => ({}));
+            console.warn('[library] 服务端拒绝了这次库覆盖:', data);
+            if (typeof showToast === 'function') {
+                showToast(data.message || '服务器拒绝了这次创意库保存，请刷新页面后重试。', 'error');
+            }
+            return false;
+        }
         if (!response.ok) {
             throw new Error(`Server returned HTTP ${response.status}`);
         }
         console.log("Successfully persisted library to local server file.");
+        ok = true;
     } catch (e) {
         console.warn("Failed to persist library to server, backed up in localStorage only", e);
+        if (typeof showToast === 'function') {
+            showToast('创意库暂时只存到了浏览器本地（服务器写入失败），请检查服务是否在运行。', 'error');
+        }
     }
-    
+
     renderLibrary();
+    return ok;
 }
 
 // Check API status via the server-side ping (the server reaches the local proxy
@@ -3193,7 +3230,8 @@ async function deleteFromLibrary(id) {
     }
 
     savedIdeas = savedIdeas.filter(item => item.id !== id);
-    saveLibrary();
+    // 这是合法缩量：把删掉的 id 声明给服务端，否则缩量闸门会拒写（见 saveLibrary）
+    saveLibrary({ removedIds: [id] });
     showToast("已从点子库删除，生成的图片/视频文件已一并清理", "success");
     updateFavoriteButtonState();
 }

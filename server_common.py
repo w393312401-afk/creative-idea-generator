@@ -581,6 +581,97 @@ def skill_contract_report():
         'total': len(SKILL_CONTRACT_FILES),
     }
 
+# ============================================================================
+# 运行时能力探针（Runtime Capability Report）
+# ----------------------------------------------------------------------------
+# 这一层存在的唯一理由：把「悄悄劣化」变成「清单上写着」。
+#
+# 两处已知的静默失效：
+#   · numpy 缺失 → 本地视觉探针（防串片的首尾帧锚点比对、i2v 帧对契约、冻结片段
+#     检测、换族惯性检测）全部走 except 分支静默返回 'skipped'/False。设计如此
+#     （探针不该拖垮主流程），后果是整套内容级校验消失而日志上看不出异常。
+#   · 技能包契约文件缺失 → load_reference_file 返回空串，合成按空契约跑完，创意维度
+#     变窄、一致性约束消失。启动日志与 /api/mode 会喊，但那是**服务级**信号，翻不到
+#     具体某一单上：三天后看着一单成片，无从知道它当初是不是在缺契约的状态下合成的。
+#
+# 所以除了服务级告警，还要把当时的能力状态写进每一单的 manifest（见
+# frame_generator.stamp_manifest_capabilities）。"这单的内容级校验根本没跑" 必须是
+# 清单上的一行，而不是要靠人回忆环境。
+def _module_available(name):
+    """只探"能不能 import"，不真正持有模块引用——探针本身不该把 numpy 常驻进来。"""
+    import importlib.util
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def runtime_capability_report():
+    """{'degraded': [...], 'numpy': bool, 'pillow': bool, 'ffmpeg': bool,
+        'skill_contract_missing': [...]}。
+
+    degraded 是给人看的中文短句列表，空列表 = 能力齐全。判定全部即时进行，不做缓存：
+    这几样都可能在服务运行期间被装上/删掉（换 venv、改 skillDir），缓存只会让清单
+    记录当年那一刻的假象。"""
+    numpy_ok = _module_available('numpy')
+    pillow_ok = _module_available('PIL')
+    ffmpeg_ok = bool(shutil.which('ffmpeg'))
+    missing_skill = missing_skill_contract_files()
+    degraded = []
+    if not numpy_ok:
+        degraded.append(
+            'numpy 缺失：本地视觉探针（首尾帧防串片、i2v 帧对契约、冻结检测、'
+            '换族惯性检测）全部静默跳过，本单未做任何内容级校验')
+    if not pillow_ok:
+        degraded.append('Pillow 缺失：帧转档/封面合成/审查前压图不可用')
+    if not ffmpeg_ok:
+        degraded.append('ffmpeg 不在 PATH：视频抽帧类校验（防串片、冻结检测）无法进行')
+    if missing_skill:
+        degraded.append(
+            f'技能契约缺 {len(missing_skill)}/{len(SKILL_CONTRACT_FILES)} 个文件'
+            f'（{", ".join(missing_skill)}）：提示词合成按空契约降级，'
+            f'创意维度变窄、一致性约束消失')
+    return {
+        'degraded': degraded,
+        'numpy': numpy_ok,
+        'pillow': pillow_ok,
+        'ffmpeg': ffmpeg_ok,
+        'skill_contract_missing': missing_skill,
+    }
+
+
+def stamp_manifest_capabilities(manifest, stage):
+    """把当时的运行时能力状态盖进 manifest（就地修改，不落盘——调用方紧接着会写）。
+
+    形态：manifest['capability_degraded'] = {stage: {'at': 时间戳, 'issues': [中文短句]}}。
+    某阶段能力齐全时删掉它自己那一条（环境补好后重渲，旗标必须能消失，否则清单会
+    永久挂着一条早已修好的告警）；整个字典空了就把键删掉。
+
+    stage: 'frames' | 'videos'。分阶段记是因为两个阶段可能跨越环境变化（装上 numpy、
+    改了 skillDir），而且劣化后果不同：帧阶段丢的是换族惯性检测，视频阶段丢的是
+    防串片与冻结检测。"""
+    if not isinstance(manifest, dict):
+        return
+    issues = runtime_capability_report()['degraded']
+    stamps = manifest.get('capability_degraded')
+    if not isinstance(stamps, dict):
+        stamps = {}
+    if issues:
+        stamps[stage] = {
+            'at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'issues': issues,
+        }
+        if sys.stdout:
+            print(f"[CAPABILITY] {stage} 阶段在能力劣化状态下运行，已写入 manifest: "
+                  f"{'; '.join(issues)}")
+    else:
+        stamps.pop(stage, None)
+    if stamps:
+        manifest['capability_degraded'] = stamps
+    else:
+        manifest.pop('capability_degraded', None)
+
+
 def get_fx_cancel_flag():
     from integrations.google_fx.utils import cancel_flag
     return cancel_flag
@@ -1426,6 +1517,9 @@ PACKET_CACHE_LOCK = threading.RLock()
 COMPOSE_CHECKPOINT_LOCK = threading.RLock()
 ACTIVE_TASKS = {}
 ACTIVE_TASKS_LOCK = threading.RLock()
+# True 仅当本进程成功跑完一次 load_tasks_from_disk——即 ACTIVE_TASKS 确实代表磁盘上的
+# 全部任务。save_tasks_to_disk 的孤儿清理以此为授权前提，见那里的 2026-07-31 注释。
+TASKS_LOADED_FROM_DISK = False
 
 # library.json 读写共用一把锁：Windows 上 os.replace 会因并发打开的读句柄抛
 # PermissionError，读路径也必须串行化，否则存在整库清零风险
@@ -1463,6 +1557,148 @@ def write_json_atomic(path, data, indent=2):
             except OSError:
                 pass
             raise
+
+
+# ============================================================================
+# 创意库「缩量覆盖」闸门（Library Shrink Guard）
+# ----------------------------------------------------------------------------
+# /api/library 的契约是"客户端始终持有完整数组、整份 POST 回来覆盖"，所以任何一次
+# 状态错乱的写入都是一次静默的数据丢失。此前只有两道防护：
+#   1) 空列表覆盖非空库 → 拒绝（2026-07-12 整库清零事故）；
+#   2) 同一条创意内部 prompt_slots 与 frameRun 数量不自洽 → 拒绝。
+# 中间那一大片"非空 → 非空，但少了一条创意 / 某条少了几帧"完全没人管——2026-07-27
+# 自动化测试驱动真实页面把真库整份覆盖，就是从这个缺口掉下去的（靠 .recovery 快照
+# 与 tools/recover_ice_cave_all.py 捞回）。
+#
+# 补法不是"一律拒绝缩量"：删除单条创意（deleteFromLibrary）与删除某一拍
+# （/api/delete_slot 之后的 frameRun 回写）都是合法缩量，它们本来就该少。区别在于
+# 合法缩量知道自己在删什么，于是这里要求**声明意图**：客户端把 removed_ids /
+# frame_shrink_ids 一并 POST 上来，声明与实际差异一致才放行。没声明的缩量一律 409，
+# 页面刷新后重来——刷新的代价是几秒钟，静默丢失的代价是那两次事故。
+_LIBRARY_INTENT_KEYS = ('removed_ids', 'frame_shrink_ids')
+
+
+def _library_index(ideas):
+    """{id: idea} 映射。无 id 的记录（历史遗留数据里确实存在）与重复 id 的记录都无法
+    按身份比对，它们由 library_shrink_verdict 里的条数兜底负责，这里直接跳过/折叠。"""
+    index = {}
+    for idea in ideas:
+        if not isinstance(idea, dict):
+            continue
+        ident = idea.get('id')
+        if ident is None or ident == '':
+            continue
+        index[str(ident)] = idea
+    return index
+
+
+def _idea_frame_count(idea):
+    """一条创意当前挂着多少帧记录（frameRun.frames）。没有 frameRun 记 0——
+    "从没生成过帧"与"帧被清空"在这里必须是同一个数，否则 media_renderer 清理幽灵
+    frameRun（项目目录已被删）时会被误判成缩量。那条路径照样要声明意图，见下。"""
+    if not isinstance(idea, dict):
+        return 0
+    run = idea.get('frameRun')
+    if not isinstance(run, dict):
+        return 0
+    frames = run.get('frames')
+    return len(frames) if isinstance(frames, list) else 0
+
+
+def library_shrink_verdict(existing, incoming, intent=None, label='创意库',
+                           delete_hint='界面上的删除入口（它会带上删除声明）'):
+    """这次整表覆盖是不是「未声明的缩量」。返回 (ok, message, detail)。
+
+    existing: 磁盘上现有的表（非 list 时视为无法比对，直接放行——上游已按"非空"
+      保守处理过空列表那道防护）
+    incoming: 即将写入的表
+    intent: {'removed_ids': [...], 'frame_shrink_ids': [...]}，客户端声明"我知道
+      这次会少掉这些"。声明多了不算错（用户可能连点两次删除，第二次那条已经不在
+      库里了），声明少了才拦——判定只看"实际少了但没声明"这个方向。
+    label / delete_hint: 报文用词。同一套判定给两张整表回写的表共用——创意库
+      （/api/library）与创意台账（/api/ledger），它们是同一个契约、同一类事故。
+
+    detail 里带上具体差异，前端据此提示用户刷新；调用方回 409。
+    """
+    if not isinstance(existing, list) or not isinstance(incoming, list):
+        return True, None, {}
+    intent = intent if isinstance(intent, dict) else {}
+    declared_removed = {str(x) for x in (intent.get('removed_ids') or [])}
+    declared_shrink = {str(x) for x in (intent.get('frame_shrink_ids') or [])}
+
+    old_index = _library_index(existing)
+    new_index = _library_index(incoming)
+
+    removed = [i for i in old_index if i not in new_index and i not in declared_removed]
+    frame_shrunk = []
+    for ident, old_idea in old_index.items():
+        if ident not in new_index or ident in declared_shrink:
+            continue
+        before = _idea_frame_count(old_idea)
+        after = _idea_frame_count(new_index[ident])
+        if after < before:
+            frame_shrunk.append({
+                'id': ident,
+                'title': str(old_idea.get('title') or ''),
+                'before': before,
+                'after': after,
+            })
+    # 条数兜底：按身份比对会漏掉两类真实缩量——无 id 的历史记录（没有身份可比），
+    # 以及重复 id（两条同 id 的记录在索引里折叠成一条，删掉其中一条看不出来）。
+    # 所以除了身份差异，总条数也要对得上：少掉的条数超过"已声明且确实消失的 id 数"
+    # 就算未声明缩量。
+    explained = len([i for i in declared_removed if i in old_index and i not in new_index])
+    count_lost = max(0, len(existing) - len(incoming) - explained)
+    # removed 里的每一条本来就会体现在条数上，别把同一件事报两遍
+    count_lost = max(0, count_lost - len(removed))
+
+    if not removed and not frame_shrunk and not count_lost:
+        return True, None, {}
+
+    parts = []
+    if removed:
+        titles = ', '.join(
+            f'「{old_index[i].get("title") or old_index[i].get("one_line") or i}」'
+            for i in removed[:5])
+        parts.append(f'{len(removed)} 条会消失（{titles}{"…" if len(removed) > 5 else ""}）')
+    if frame_shrunk:
+        detail_txt = ', '.join(
+            f'「{f["title"] or f["id"]}」{f["before"]}→{f["after"]} 帧' for f in frame_shrunk[:5])
+        parts.append(f'{len(frame_shrunk)} 条创意的帧记录会减少（{detail_txt}'
+                     f'{"…" if len(frame_shrunk) > 5 else ""}）')
+    if count_lost:
+        parts.append(f'另有 {count_lost} 条记录按条数比对整体消失'
+                     f'（无 id 的历史记录，或 id 重复的记录）')
+
+    message = (
+        f'已阻止这次{label}覆盖：客户端提交的数据比服务器上的少，且没有声明是哪次删除造成的——'
+        + '；'.join(parts)
+        + f'。这通常意味着页面状态已过期（另一个标签页/另一台设备改过{label}，'
+          f'或本页开着的时间里发生过删除/新增）。'
+          f'请刷新页面重新加载后再操作；确实要删除请用{delete_hint}。'
+    )
+    return False, message, {
+        'removed_ids': removed,
+        'frame_shrunk': frame_shrunk,
+        'count_lost': count_lost,
+    }
+
+
+def parse_library_payload(data):
+    """/api/library 的请求体拆成 (ideas, intent)。
+
+    两种形态都收：
+      · 裸数组 —— 历史契约，无意图声明，任何缩量都会被 library_shrink_verdict 拦下；
+      · {'ideas': [...], 'intent': {...}} —— 带删除声明的写入（前端 saveLibrary 的
+        第二个参数）。
+    信封形态下 ideas 缺失或不是数组时返回 (None, intent)，由调用方回 400。
+    """
+    if isinstance(data, dict) and 'ideas' in data:
+        ideas = data.get('ideas')
+        intent = data.get('intent')
+        return (ideas if isinstance(ideas, list) else None,
+                intent if isinstance(intent, dict) else {})
+    return data, {}
 
 
 LEDGER_STATUSES = {'candidate', 'used', 'published', 'discarded'}
@@ -1518,10 +1754,12 @@ def write_ledger(entries, path=None):
         return False, '台账数据必须是数组'
     with LEDGER_LOCK:
         existing_count = 0
+        existing_data = None
         if os.path.exists(path):
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     _old = json.load(f)
+                existing_data = _old
                 existing_count = len(_old) if isinstance(_old, list) else 1
             except Exception:
                 existing_count = 1  # 读不出来按"非空"保守处理
@@ -1533,6 +1771,20 @@ def write_ledger(entries, path=None):
                 f'拒绝将非空创意台账（{existing_count} 条）覆盖为空：客户端状态疑似错乱，'
                 f'请刷新页面重新加载后再操作；如确要清空请用批量删除。'
             )
+        # 2026-07-30：补上与 /api/ledger 同源的第二道——非空 → 非空的缩量。台账的整表
+        # 回写只用于编辑（状态/评分/备注），删除一律走 delete_ledger_entries 的按 id 删，
+        # 所以这条路径上的任何缩量都是状态错乱，无需 intent 声明。
+        #
+        # 这不是假想：合成流程会用 register_ledger_candidates 在服务端**追加**候选，
+        # 一个在那之前打开的页面手里是短一截的表，此后任何一次改评分都会把新登记的
+        # 候选整批抹掉——和 library.json 那两次事故是同一个机制。
+        ok, message, detail = library_shrink_verdict(
+            existing_data if isinstance(existing_data, list) else None, entries, {},
+            label='创意台账', delete_hint='台账列表里的删除/批量删除（按 id 删，不吃这道防护）')
+        if not ok:
+            if sys.stdout:
+                print(f"[LEDGER GUARD] 拒绝未声明的缩量覆盖: {detail}")
+            return False, message
         _write_ledger_file(entries, path)
         return True, None
 
@@ -1815,6 +2067,12 @@ def drop_stale_review_verdicts(manifest, project_dir):
         frame.pop('review_frames_sha256', None)
         frame.pop('reviewed_at', None)
         frame.pop('review_issues', None)
+        # 人工标记压着机器判定时，那份判定被暂存在 manual_flag_prev_gate（见
+        # pipeline_orchestrator._set_manifest_quality_gate 的 respect_manual_flag）。
+        # 帧图变了它同样不再成立——留着的话，用户之后撤销人工标记会回落到一个针对
+        # 旧画面的"审查通过"。
+        if frame.get('manual_flag_prev_gate') in REAL_REVIEW_VERDICTS:
+            frame['manual_flag_prev_gate'] = 'pending_manual_review'
         if frame.get('quality_gate') in REAL_REVIEW_VERDICTS:
             frame['quality_gate'] = 'pending_manual_review'
             frame['vlm_qa_reason'] = None
@@ -1910,6 +2168,13 @@ def save_tasks_to_disk():
         # “孤儿清理”会把全部任务历史当垃圾删光（实际发生过一次，tasks/ 被整目录清空）。
         if not active_ids:
             return
+        # 2026-07-31 防呆二段：非空内存表同样不足以授权删除。只要本进程没有成功跑完
+        # 一次 load_tasks_from_disk，内存里那几条就不是"全部任务"，而是某个调用方刚
+        # 塞进来的子集——此时做孤儿清理，等于拿一条新任务把整部历史判成垃圾。
+        # （实际发生过：一个直接打 /api/compose 处理函数的测试建了 1 条内存任务，
+        # 落盘时把 tasks/ 里 5 个真实任务记录全删了。）
+        if not TASKS_LOADED_FROM_DISK:
+            return
         try:
             for filename in os.listdir("tasks"):
                 if filename.endswith(".json"):
@@ -1978,6 +2243,8 @@ def load_tasks_from_disk():
                     except Exception as e:
                         if sys.stdout:
                             print(f"Error loading task file {filename}: {e}")
+        global TASKS_LOADED_FROM_DISK
+        TASKS_LOADED_FROM_DISK = True
     except Exception as e:
         if sys.stdout:
             print(f"Error reading tasks directory: {e}")

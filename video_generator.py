@@ -15,6 +15,7 @@ from server_common import (
     notify_listeners, save_tasks_to_disk,
     apply_google_fx_runtime_overrides,
     read_manifest, write_manifest, strict_gates_enabled, qa_gate_level,
+    stamp_manifest_capabilities,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
     _get_account_pool_service, _select_pool_account,
     _account_switch_interval, _account_in_cooldown,
@@ -393,8 +394,9 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
       已确认风险的帧仍不会被提交生成（不会上传到视频后端）。降级帧
       （i2i_fallback_degraded）是唯一保持不受影响、始终硬拦的独立门禁——降级帧
       本身已是明确的生成失败兜底产物，不属于"一致性审查有疑虑但帧本身完好"的
-      范畴，强推只会浪费视频生成额度。True 时改判 'generate' 并落一条 warning
-      说明是人工确认风险后强制放行的。
+      范畴，强推只会浪费视频生成额度。（2026-07-30 核实：这个值自 f5a003b 起已无
+      生产方，该门禁如今只对旧 manifest 生效，见下方分支上的注释。）True 时改判
+      'generate' 并落一条 warning 说明是人工确认风险后强制放行的。
 
     返回按槽位升序的计划列表，每项：
       slot / seq / prompt（已改写 IMAGE 1/2）/ dest_path
@@ -482,6 +484,11 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
         elif not is_hero and (not end_p or not os.path.exists(end_p)):
             plan['action'] = 'blocked'
             plan['reason'] = f"视频 {slot} 所需的结束帧 IMAGE {slot + 1} 不存在。请重新生成该帧！"
+        # 注意：'i2i_fallback_degraded' 自 f5a003b 起已无生产方——当年产生它的是
+        # "参考图缺失就退回文生图"那条静默降级路径，现在那里直接抛
+        # RuntimeError('帧序列禁止退回文生图')，不再产出脱链帧。所以这一条如今只对
+        # 旧 manifest 生效，留着是为了让那些老单仍被拦住。今天真正活着的降级信号是
+        # 帧上的 degraded_reason（chat 通道降档），它按设计只做提示不拦截。
         elif slot_to_quality.get(start_slot) == 'i2i_fallback_degraded' \
                 or slot_to_quality.get(slot + 1) == 'i2i_fallback_degraded':
             plan['action'] = 'blocked'
@@ -502,14 +509,21 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                 f"（{_bad_gate}），已拦截该段视频生成。"
                 f"请重渲或修复该帧（或将质检档位调为 off 放行）后重试。"
             )
-        elif not override_flagged and stale_slots and gate_level == 'standard' \
+        elif not override_flagged and stale_slots and gate_level != 'off' \
                 and (start_slot in stale_slots or (slot + 1) in stale_slots):
+            # 2026-07-30：血统过期从"standard 拦 / lenient 只警告"改成"除 off 档一律拦"。
+            # 理由是它和其它门禁不同类：一致性审查的判定有主观成分（可能误报，宽松档
+            # 放行是合理档位），而血统过期是确定性事实——上游帧被单独换过，这一对锚点
+            # 帧确实来自两条不同的 i2i 链，送 i2v 必然是跨链漂移。lenient 档只发一条
+            # 警告，实际使用中等于没拦（警告和其它十几条混在一起滚过去），2026-07-27
+            # 的 ice_cave slot3 事故就是这么走到成片的。要放行请走 override_flagged
+            # （前端确认风险，见 confirmSequenceReviewOverride）或把档位调成 off。
             _stale = start_slot if start_slot in stale_slots else slot + 1
             plan['action'] = 'blocked'
             plan['reason'] = (
                 f"视频 {slot} 的锚点帧 IMAGE {_stale} 派生自旧的 i2i 链（上游帧已被单独重渲，"
                 f"血统过期），已拦截以防跨链跳变。请顺序重渲 IMAGE {_stale} 及其后续帧，"
-                f"或将质检档位调为 lenient 带警告放行。"
+                f"或在确认风险后强制生成。"
             )
         elif not override_flagged and drift_slots and gate_level == 'standard' \
                 and (slot in drift_slots or start_slot in drift_slots):
@@ -613,6 +627,10 @@ class _ManifestWriter:
         for v in self.results:
             by_slot[v['slot']] = v
         self.data['videos'] = [by_slot[s] for s in self.all_slots if s in by_slot]
+        # 视频阶段的能力印章：numpy/ffmpeg 缺失时防串片的首尾帧锚点校验、i2v 帧对
+        # 契约、冻结检测全都静默跳过（返回 'skipped'/False，不拦截也不报错）。每次
+        # 落盘都重盖一次，环境中途变化也能如实反映（stamp 内部按阶段覆盖，不累积）。
+        stamp_manifest_capabilities(self.data, 'videos')
         try:
             # 项目级锁 + 原子替换（write_manifest 内部处理 Windows 句柄占用重试）
             write_manifest(os.path.dirname(self.path), self.data)

@@ -73,6 +73,14 @@ async function saveLedgerToServer() {
             body: JSON.stringify(ledgerData || []),
         });
         const data = await res.json().catch(() => ({}));
+        // 409 = 服务端主动拒写（空表覆盖 / 未声明的缩量，见 server_common.write_ledger）。
+        // 这类拒绝几乎总是"本页开着的这段时间里服务端追加了候选"，重新加载就能解决，
+        // 所以原文报出服务端的解释，再拉一次最新数据——别让用户以为改动已经存下来了。
+        if (res.status === 409) {
+            showToast(data.message || '服务器拒绝了这次台账保存，已重新加载最新数据。', 'error');
+            await refreshLedger();
+            return false;
+        }
         if (!res.ok || data.status !== 'success') {
             throw new Error(data.message || `HTTP ${res.status}`);
         }
@@ -175,7 +183,7 @@ function renderLedger() {
                 </td>
                 <td class="l-col-source" title="${escapeHtml(r.source || '')}">${escapeHtml(r.source || '')}</td>
                 <td class="l-col-actions">
-                    <button type="button" class="ledger-tool-btn small l-open-project-btn" title="打开这条创意合成出来的激发项目（提示词/封面/帧与视频）">🎬 激发项目</button>
+                    <button type="button" class="ledger-tool-btn small l-open-project-btn" title="打开这条创意合成出来的激发项目（提示词/封面/帧与视频）">🎬 打开项目</button>
                     <button type="button" class="ledger-tool-btn small l-remix-btn" title="以这条创意为母题激发一批二创方案">♻️ 二创</button>
                     <button type="button" class="ledger-tool-btn small danger l-delete-btn" title="删除本条">🗑️</button>
                 </td>

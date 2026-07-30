@@ -74,6 +74,9 @@ function summarizeRunQuality(manifest) {
     // 合成前提醒一次，避免把"没查过"读成"查过没问题"
     const neverReviewed = count(f => f.quality_gate === 'pending_manual_review');
     const degraded = count(f => f.quality_gate === 'i2i_fallback_degraded' || f.quality_gate === 'auto_approved_degraded');
+    // 降档通道产出：manifest 里一直有 degraded_reason，但此前没有任何一处读它——
+    // 合成前必须知道这一单混进过分辨率更低的帧（见 frame_generator.chat_transport_note）
+    const downscaled = count(f => !!f.degraded_reason);
     const stale = count(f => f.stale_lineage);
     const inertia = count(f => typeof f.vlm_qa_reason === 'string' && f.vlm_qa_reason.indexOf('anchor_inertia') !== -1);
     const driftFails = (manifest.chain_drift || []).filter(d => d && d.passed === false).length;
@@ -82,6 +85,7 @@ function summarizeRunQuality(manifest) {
     if (skipped) risks.push(`${skipped} 帧未经整套审查（审查服务不可用）`);
     if (neverReviewed) risks.push(`${neverReviewed} 帧尚未跑过一致性审查`);
     if (degraded) risks.push(`${degraded} 帧降级/未核验`);
+    if (downscaled) risks.push(`${downscaled} 帧走降档通道渲出（分辨率低于本单档位，建议补额度后定向重渲）`);
     if (stale) risks.push(`${stale} 帧血统过期`);
     if (inertia) risks.push(`${inertia} 帧疑似换族惯性卡死`);
     if (driftFails) risks.push(`${driftFails} 个镜头族存在空间断裂（链回望 FAIL）`);
@@ -90,6 +94,15 @@ function summarizeRunQuality(manifest) {
     const vWarned = videos.filter(v => v.process_warned).length;
     if (vFailed) risks.push(`${vFailed} 段视频失败/被门禁拦截`);
     if (vWarned) risks.push(`${vWarned} 段视频过程检测告警（冻结/空心等，宽松档放行）`);
+    // 运行时能力劣化（numpy/ffmpeg/技能契约缺失，见 server_common.stamp_manifest_capabilities）：
+    // 这一类最危险的地方在于"看起来什么都没发生"——探针静默跳过，日志上一片安静，
+    // 而整套内容级校验（防串片、帧对契约、冻结检测）其实根本没跑。必须原文报出来。
+    const stamps = manifest.capability_degraded || {};
+    const stageLabel = { frames: '帧阶段', videos: '视频阶段' };
+    Object.keys(stamps).forEach(stage => {
+        const issues = (stamps[stage] && stamps[stage].issues) || [];
+        issues.forEach(text => risks.push(`${stageLabel[stage] || stage}能力劣化：${text}`));
+    });
     return risks.length ? risks : null;
 }
 
@@ -141,18 +154,17 @@ function renderIdea(result) {
     // 提示词槽位卡片已移除：本页仅展示原始 Markdown 提示词块（#idea-prompt-block，见上）。
     // 注意 parsePromptBlock 仍被帧序列渲染用于推算图片槽位，切勿删除其定义。
 
-    // 质量审核状态条（原独立 tab，现为概览页顶部一行）：默认收起，只有真的有
-    // 修复建议时才自动展开并高亮——平时它就该是一行"通过"，不占地方。
+    // 质量审核状态条（原独立 tab，现为概览页顶部一行）：默认收起，不占地方。
+    // 有修复建议时提示文字切换为"有修复建议"并高亮，但仍保持默认收起状态，用户点击可自由展开。
     const auditDetails = document.getElementById('audit-details');
     const hasRepairs = result.repair_md && result.repair_md.trim() &&
                         !/^PASS/i.test(result.repair_md.trim()) &&
                         !result.repair_md.includes('未发现违规');
     if (auditDetails) {
+        auditDetails.open = false;
         if (hasRepairs) {
-            auditDetails.open = true;
             auditDetails.classList.add('warning-highlight');
         } else {
-            auditDetails.open = false;
             auditDetails.classList.remove('warning-highlight');
         }
     }
@@ -215,6 +227,9 @@ function renderIdea(result) {
             throw new Error(`manifest fetch failed: HTTP ${resp.status}`);
         })
         .then(manifest => {
+            // 两条分支写进库里的都是"服务端此刻的真实状态"（幽灵清理是删光，
+            // 刷新是按 manifest 原件覆盖），帧记录变少都属于有意为之——必须向
+            // 缩量闸门声明这一条创意，否则回写会被 409 拒绝（见 app.js saveLibrary）。
             if (manifest === null) {
                 if (result.frameRun) {
                     delete result.frameRun;
@@ -222,7 +237,7 @@ function renderIdea(result) {
                     const existingIdx = savedIdeas.findIndex(item => item.id === result.id);
                     if (existingIdx !== -1 && savedIdeas[existingIdx].frameRun) {
                         delete savedIdeas[existingIdx].frameRun;
-                        saveLibrary();
+                        saveLibrary({ frameShrinkIds: [result.id] });
                     }
                 }
             } else {
@@ -231,7 +246,7 @@ function renderIdea(result) {
                 const existingIdx = savedIdeas.findIndex(item => item.id === result.id);
                 if (existingIdx !== -1) {
                     savedIdeas[existingIdx].frameRun = manifest;
-                    saveLibrary();
+                    saveLibrary({ frameShrinkIds: [result.id] });
                 }
             }
             // 这是个异步回调：等待期间用户可能已经切到别的创意，此时不该把这份

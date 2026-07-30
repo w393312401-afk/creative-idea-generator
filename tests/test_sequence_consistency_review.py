@@ -90,7 +90,7 @@ class TestSequenceReviewSystemPromptMilestones(unittest.TestCase):
         self.assertNotIn('placeholder', cut_rule.lower())
 
     def test_global_prompt_only_has_cross_frame_rules(self):
-        prompt = pp._global_review_system_prompt(10)
+        prompt = pp._global_review_system_prompt()
         self.assertIn('NGCS coordinate lock', prompt)
         self.assertIn('Consistent Scene & Layout', prompt)
         self.assertIn('Material Continuity', prompt)
@@ -609,11 +609,14 @@ class TestFixBeatFromSequenceReview(unittest.TestCase):
         self.assertEqual((v, i), ('old video', 'old image'))
 
 
-def _review(failures=None, unreviewed_beats=None, global_reviewed=True):
+def _review(failures=None, unreviewed_beats=None, global_reviewed=True,
+            global_unreviewed_beats=None, global_attempted=True):
     """构造 check_full_sequence_consistency 的新形状返回值（见其 docstring）。"""
     return {'failures': failures or {},
             'unreviewed_beats': list(unreviewed_beats or []),
-            'global_reviewed': global_reviewed}
+            'global_unreviewed_beats': list(global_unreviewed_beats or []),
+            'global_reviewed': global_reviewed,
+            'global_attempted': global_attempted}
 
 
 class _TmpProjectCase(unittest.TestCase):
@@ -915,18 +918,21 @@ class TestSequenceConsistencyReview(_TmpProjectCase):
         calls = []
 
         def fake_check(config, prompt_block, frame_paths, degraded=False,
-                       only_beats=None, skip_global=False, on_progress=None):
+                       only_beats=None, skip_global=False, on_progress=None,
+                       global_only_beats=None):
             calls.append({'degraded': degraded, 'only_beats': only_beats,
-                          'skip_global': skip_global})
+                          'skip_global': skip_global, 'global_only_beats': global_only_beats})
             if not degraded:
                 return _review({}, unreviewed_beats=[1], global_reviewed=True)
-            return _review({1: ['补审出的问题']}, unreviewed_beats=[], global_reviewed=False)
+            return _review({1: ['补审出的问题']}, unreviewed_beats=[], global_reviewed=False,
+                           global_attempted=False)
 
         with patch.object(po, 'check_full_sequence_consistency', side_effect=fake_check):
             po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
 
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1], {'degraded': True, 'only_beats': [1], 'skip_global': True})
+        self.assertEqual(calls[1], {'degraded': True, 'only_beats': [1], 'skip_global': True,
+                                    'global_only_beats': None})
         frames = {f['sequence']: f for f in self._read_manifest()['frames']}
         # 补审出的问题落到 IMG 002；其余帧因两轮合计已审完，正常盖通过
         self.assertEqual(frames[2]['quality_gate'], 'sequence_review_flagged')
@@ -1498,6 +1504,372 @@ class TestManualFrameIssue(_TmpProjectCase):
 
         mock_fix.assert_called_once_with({}, 'first frame', '首帧地面太干净，不像废墟')
         mock_edit.assert_called_once()
+
+
+class TestGlobalReviewWindows(unittest.TestCase):
+    """跨帧稀疏审查的分批口径（2026-07-30）。
+
+    规则数早在 2026-07-23 就从 30 余条收窄到 6 条，图片数却一直没收窄：一单 13 帧仍是
+    14 张图一次性喂进一次调用——正是当初拆出逐拍审查要避开的注意力稀释，只是这次来自
+    图片而不是规则。现在切成重叠窗口，每窗最多 6 张（含恒定作基准的链头帧）。"""
+
+    def test_short_sequence_stays_one_window(self):
+        """帧数不超过窗口容量时必须与分批前完全一致，短单不该被改动波及。"""
+        self.assertEqual(pp.global_review_windows([1, 2, 3]), [[1, 2, 3]])
+        self.assertEqual(pp.global_review_windows([1, 2, 3, 4, 5, 6]), [[1, 2, 3, 4, 5, 6]])
+
+    def test_long_sequence_is_split_with_head_in_every_window(self):
+        windows = pp.global_review_windows(list(range(1, 15)))
+        self.assertEqual(windows, [
+            [1, 2, 3, 4, 5, 6],
+            [1, 6, 7, 8, 9, 10],
+            [1, 10, 11, 12, 13, 14],
+        ])
+        # 链头帧进每一个窗口：跨帧规则问的是"还是不是同一个空间/载体"，没有未被触碰
+        # 的原始状态作基准就无从判断
+        for win in windows:
+            self.assertEqual(win[0], 1)
+            self.assertLessEqual(len(win), 6)
+
+    def test_every_beat_is_covered_by_some_window(self):
+        """窗口接缝处不能漏拍：拍 N 需要 IMAGE N 与 N+1 同在一个窗口里，重叠 1 帧
+        就是为此存在。任一拍没人管＝那一段的跨帧漂移永远查不出来。"""
+        for total_frames in range(2, 40):
+            seqs = list(range(1, total_frames + 1))
+            total_beats = total_frames - 1
+            covered = set()
+            for win in pp.global_review_windows(seqs):
+                covered.update(pp._reportable_beats(win, total_beats))
+            self.assertEqual(covered, set(range(1, total_beats + 1)), total_frames)
+
+    def test_non_contiguous_sequences_are_handled(self):
+        """帧号不连续（某几拍被删过）时也不能崩，且不会凭空补出不存在的拍。"""
+        windows = pp.global_review_windows([1, 2, 5, 6, 9, 10, 11, 12])
+        for win in windows:
+            self.assertEqual(win[0], 1)
+        self.assertEqual(pp._reportable_beats([1, 2, 5, 6], 11), [1, 5])
+
+    def test_empty_input(self):
+        self.assertEqual(pp.global_review_windows([]), [])
+
+
+class TestGlobalReviewBatchedCalls(unittest.TestCase):
+    """分批之后 check_global_sequence_consistency 的调用与合并契约。"""
+
+    FRAMES = {s: f'img_{s:03d}.webp' for s in range(1, 15)}
+
+    def test_each_call_gets_only_its_window_images(self):
+        calls = []
+
+        def fake_chat(config, system, user, paths, **kw):
+            calls.append((paths, user))
+            return '{}'
+
+        with patch.object(pp, '_multimodal_chat', side_effect=fake_chat):
+            failures = pp.check_global_sequence_consistency({}, 'prompt', self.FRAMES)
+
+        self.assertEqual(failures, {})
+        self.assertEqual(len(calls), 3)
+        for paths, user in calls:
+            self.assertLessEqual(len(paths), 6)
+            self.assertEqual(paths[0], 'img_001.webp')
+            # user turn 必须点明真实 IMAGE 号，否则模型会把附件从 1 重新编号
+            self.assertIn('IMAGE 1', user)
+
+    def test_system_prompt_is_constant_across_windows(self):
+        """系统提示词不再内插拍数：跨窗口/跨单共用同一前缀才吃得到 prompt 缓存，
+        否则分批之后浪费翻倍（同 _local_beat_review_system_prompt 的 2026-07-25 改造）。"""
+        systems = []
+        with patch.object(pp, '_multimodal_chat',
+                          side_effect=lambda c, s, u, p, **kw: systems.append(s) or '{}'):
+            pp.check_global_sequence_consistency({}, 'prompt', self.FRAMES)
+        self.assertEqual(len(set(systems)), 1)
+
+    def test_violations_from_all_windows_are_merged(self):
+        def fake_chat(config, system, user, paths, **kw):
+            if 'IMAGE 2' in user:
+                return json.dumps({'3': ['材质突变']})
+            if 'IMAGE 12' in user:
+                return json.dumps({'11': ['载体身份丢失']})
+            return '{}'
+
+        with patch.object(pp, '_multimodal_chat', side_effect=fake_chat):
+            failures = pp.check_global_sequence_consistency({}, 'prompt', self.FRAMES)
+        self.assertEqual(failures, {3: ['材质突变'], 11: ['载体身份丢失']})
+
+    def test_beats_outside_the_window_are_dropped(self):
+        """窗口只看得见自己那几帧，报窗口外的拍号只能是模型按附件重新编号编出来的
+        ——收下就是把违规挂到无关的帧上。"""
+        def fake_chat(config, system, user, paths, **kw):
+            # 第一窗（IMAGE 1..6）谎报第 12 拍
+            if 'IMAGE 2' in user:
+                return json.dumps({'12': ['窗口外的拍'], '2': ['窗口内的拍']})
+            return '{}'
+
+        with patch.object(pp, '_multimodal_chat', side_effect=fake_chat):
+            failures = pp.check_global_sequence_consistency({}, 'prompt', self.FRAMES)
+        self.assertEqual(failures, {2: ['窗口内的拍']})
+
+    def test_partial_window_failure_keeps_findings_and_reports_unreviewed(self):
+        """一个窗口没跑成时不再整层判失败（那会把已查出的违规一起扔掉），而是把
+        该窗覆盖的拍号带回给调用方——那些帧因此拿不到"已审查通过"的章。"""
+        def fake_chat(config, system, user, paths, **kw):
+            if 'IMAGE 12' in user:
+                raise RuntimeError('gateway down')
+            if 'IMAGE 2' in user:
+                return json.dumps({'2': ['材质突变']})
+            return '{}'
+
+        unreviewed = []
+        with patch.object(pp, '_multimodal_chat', side_effect=fake_chat):
+            failures = pp.check_global_sequence_consistency(
+                {}, 'prompt', self.FRAMES, unreviewed_beats_out=unreviewed)
+        self.assertEqual(failures, {2: ['材质突变']})
+        # 第三窗 [1,10,11,12,13,14] → 拍 10..13
+        self.assertEqual(unreviewed, [10, 11, 12, 13])
+
+    def test_failed_window_does_not_taint_its_neighbours(self):
+        """漏审只记在失败那一窗自己覆盖的拍上。
+
+        默认 overlap=1 下每一拍恰好归属一个窗口（重叠的是帧不是拍：IMAGE 6 同时进
+        第一、第二窗，好让拍 5 = 5→6 与拍 6 = 6→7 各自完整落在一窗内）。所以第二窗
+        失败时，第一窗审干净的拍 1..5 必须原样保持"已审"。"""
+        def fake_chat(config, system, user, paths, **kw):
+            if 'IMAGE 7' in user:      # 第二窗失败
+                raise RuntimeError('gateway down')
+            return '{}'
+
+        unreviewed = []
+        with patch.object(pp, '_multimodal_chat', side_effect=fake_chat):
+            pp.check_global_sequence_consistency(
+                {}, 'prompt', self.FRAMES, unreviewed_beats_out=unreviewed)
+        self.assertEqual(unreviewed, [6, 7, 8, 9])
+
+    def test_wider_overlap_lets_a_neighbour_rescue_a_beat(self):
+        """overlap 调大时同一拍会被多窗覆盖，任一窗审成就不算漏审——这条是
+        unreviewed 计算里"减去别窗已审过的拍"那一步的契约（默认口径下用不到，
+        但把 overlap 调宽是排查漂移时的常规手段，那时它必须成立）。"""
+        windows = pp.global_review_windows(list(range(1, 15)), window=6, overlap=3)
+        beat_windows = [w for w in windows if 6 in pp._reportable_beats(w, 13)]
+        self.assertGreaterEqual(len(beat_windows), 2, windows)
+
+        def fake_chat(config, system, user, paths, **kw):
+            # 只让其中一个覆盖拍 6 的窗口失败
+            if user.count('IMAGE 6') and 'IMAGE 4' in user:
+                raise RuntimeError('gateway down')
+            return '{}'
+
+        unreviewed = []
+        with patch.object(pp, '_multimodal_chat', side_effect=fake_chat), \
+             patch.object(pp, 'global_review_windows', return_value=windows):
+            pp.check_global_sequence_consistency(
+                {}, 'prompt', self.FRAMES, unreviewed_beats_out=unreviewed)
+        self.assertNotIn(6, unreviewed)
+
+    def test_all_windows_failing_returns_none(self):
+        """整层都没跑成仍必须返回 None：调用方绝不能把它当"通过"。"""
+        with patch.object(pp, '_multimodal_chat', side_effect=RuntimeError('down')):
+            self.assertIsNone(pp.check_global_sequence_consistency({}, 'prompt', self.FRAMES))
+
+    def test_full_review_merges_global_unreviewed_beats(self):
+        """窗口漏审必须并进 check_full_sequence_consistency 的 unreviewed_beats，
+        否则 frame_review_status 会给那些帧盖上"已审查通过"（2026-07-15 fail-open
+        事故的同款）。"""
+        def fake_global(config, prompt_block, frames, **kw):
+            out = kw.get('unreviewed_beats_out')
+            if out is not None:
+                out.extend([10, 11])
+            return {}
+
+        with patch.object(pp, 'check_beat_consistency', return_value=[]), \
+             patch.object(pp, 'check_global_sequence_consistency', side_effect=fake_global):
+            result = pp.check_full_sequence_consistency({}, 'prompt', self.FRAMES)
+        self.assertTrue(result['global_reviewed'])
+        self.assertEqual(result['unreviewed_beats'], [10, 11])
+
+
+class TestGlobalWindowFailureIsNotWashedAwayByRetry(_TmpProjectCase):
+    """回归防护（2026-07-30，跨帧分批改造自带的坑）：跨帧层按窗口分批之后，个别窗口
+    没跑成时 global_reviewed 仍然是 True（其余窗口有判定）。降级重试若只看这个布尔值
+    就会 skip_global=True，于是那几个失败的窗口根本没被补跑；而重试的**本地层**对那
+    几拍是成功的，merge 又以重试结果为准——那几帧最后拿到了 sequence_reviewed_pass。
+
+    净效果比不重试还糟：一次网关抖动把"跨帧规则没查过"洗成了"查过且通过"。这正是
+    2026-07-15 盐湖贝壳单 fail-open 的同款形态，只是粒度从整批缩到了窗口。"""
+
+    def setUp(self):
+        super().setUp()
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
+        ]})
+
+    def _run(self, retry_result):
+        calls = []
+
+        def fake_check(config, prompt_block, frame_paths, degraded=False,
+                       only_beats=None, skip_global=False, on_progress=None,
+                       global_only_beats=None):
+            calls.append({'degraded': degraded, 'only_beats': only_beats,
+                          'skip_global': skip_global, 'global_only_beats': global_only_beats})
+            if not degraded:
+                # 第一轮：本地层全成，但覆盖第 2 拍的跨帧窗口没跑成
+                return _review({}, unreviewed_beats=[2], global_reviewed=True,
+                               global_unreviewed_beats=[2])
+            return retry_result
+
+        with patch.object(po, 'check_full_sequence_consistency', side_effect=fake_check):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
+        return calls, {f['sequence']: f for f in self._read_manifest()['frames']}
+
+    def test_retry_reruns_the_failed_window_instead_of_skipping_global(self):
+        calls, _ = self._run(_review({}, unreviewed_beats=[], global_unreviewed_beats=[]))
+        self.assertEqual(len(calls), 2)
+        # 有窗口漏审 → 必须补跑跨帧层，且只补跑覆盖第 2 拍的那个窗口
+        self.assertFalse(calls[1]['skip_global'])
+        self.assertEqual(calls[1]['global_only_beats'], [2])
+
+    def test_beats_pass_only_after_the_window_actually_reran(self):
+        _, frames = self._run(_review({}, unreviewed_beats=[], global_unreviewed_beats=[]))
+        for seq in (1, 2, 3):
+            self.assertEqual(frames[seq]['quality_gate'], 'sequence_reviewed_pass', seq)
+
+    def test_window_failing_again_keeps_the_frames_unreviewed(self):
+        """补跑仍然失败 → 那几帧必须保持"未经审查"，绝不能盖通过章。"""
+        _, frames = self._run(_review({}, unreviewed_beats=[2], global_unreviewed_beats=[2],
+                                       global_reviewed=False))
+        # 第 2 拍覆盖 IMG 002 与 IMG 003
+        self.assertNotEqual(frames[2]['quality_gate'], 'sequence_reviewed_pass')
+        self.assertNotEqual(frames[3]['quality_gate'], 'sequence_reviewed_pass')
+
+    def test_merge_carries_window_gaps_when_retry_skipped_global(self):
+        """merge 的契约：second 没跑跨帧层时，上一轮的窗口漏审必须原样留着。
+        把它抹掉就是凭空发通过章——那几帧的跨帧规则至今没人查过。"""
+        first = _review({}, unreviewed_beats=[2], global_reviewed=True,
+                        global_unreviewed_beats=[2])
+        second = _review({}, unreviewed_beats=[], global_reviewed=False,
+                         global_unreviewed_beats=[], global_attempted=False)
+        merged = pp.merge_review_results(first, second)
+        self.assertEqual(merged['unreviewed_beats'], [2])
+        self.assertEqual(merged['global_unreviewed_beats'], [2])
+
+    def test_merge_clears_window_gaps_when_retry_did_rerun_global(self):
+        first = _review({}, unreviewed_beats=[2], global_reviewed=True,
+                        global_unreviewed_beats=[2])
+        second = _review({}, unreviewed_beats=[], global_reviewed=True,
+                         global_unreviewed_beats=[], global_attempted=True)
+        merged = pp.merge_review_results(first, second)
+        self.assertEqual(merged['unreviewed_beats'], [])
+        self.assertEqual(merged['global_unreviewed_beats'], [])
+
+
+class TestGlobalWindowRestriction(unittest.TestCase):
+    """check_global_sequence_consistency 的 only_beats：补跑时只重跑覆盖这些拍的窗口，
+    不把已经审干净的窗口整批再烧一遍。"""
+
+    FRAMES = {s: f'img_{s:03d}.webp' for s in range(1, 15)}
+
+    def test_only_beats_restricts_which_windows_run(self):
+        users = []
+        with patch.object(pp, '_multimodal_chat',
+                          side_effect=lambda c, s, u, p, **kw: users.append(u) or '{}'):
+            pp.check_global_sequence_consistency(
+                {}, 'prompt', self.FRAMES, only_beats=[11])
+        # 14 帧共 3 个窗口，只有第三窗 [1,10..14] 覆盖第 11 拍
+        self.assertEqual(len(users), 1)
+        self.assertIn('IMAGE 11', users[0])
+
+    def test_only_beats_none_runs_every_window(self):
+        users = []
+        with patch.object(pp, '_multimodal_chat',
+                          side_effect=lambda c, s, u, p, **kw: users.append(u) or '{}'):
+            pp.check_global_sequence_consistency({}, 'prompt', self.FRAMES, only_beats=None)
+        self.assertEqual(len(users), 3)
+
+
+class TestManualFlagSurvivesReview(_TmpProjectCase):
+    """回归防护（2026-07-30）：一致性审查不得把人工标记洗掉。
+
+    实测链路：用户在帧网格描述了 IMG 002 的问题（「门开反了」）→ quality_gate 变成
+    manual_flagged，视频门禁据此硬拦；随后跑一次一致性审查，机器没看出这个问题 →
+    审查主循环无条件覆盖 quality_gate 为 sequence_reviewed_pass → 那道硬拦消失，
+    用户明确说有问题的帧会被拿去烧视频额度。
+
+    最坏的地方在于 manual_issue 字段还留着：帧网格照旧显示「人工标记」徽标，界面说
+    标了、门禁说没标。set_manual_frame_issue 的注释早写明两者应当并存（机器判定进
+    vlm_qa_reason，人的描述进 manual_issue），只是审查的写入端没有遵守。"""
+
+    def setUp(self):
+        super().setUp()
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
+        ]})
+        po.set_manual_frame_issue(self.TITLE, 2, '门开反了')
+
+    def _review(self, result):
+        with patch.object(po, 'check_full_sequence_consistency', return_value=result):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
+        return {f['sequence']: f for f in self._read_manifest()['frames']}
+
+    def test_clean_review_does_not_clear_the_manual_flag(self):
+        frames = self._review(_review())
+        self.assertEqual(frames[2]['quality_gate'], 'manual_flagged')
+        self.assertEqual(frames[2]['manual_issue'], '门开反了')
+        # 未被标记的帧照常拿到审查结论
+        self.assertEqual(frames[1]['quality_gate'], 'sequence_reviewed_pass')
+
+    def test_video_gate_still_blocks_the_flagged_frame(self):
+        """这条才是要害：门禁看的是 quality_gate。"""
+        import video_generator as vg
+        frames = self._review(_review())
+        self.assertIn(frames[2]['quality_gate'], vg._FLAGGED_QUALITY_GATES)
+
+    def test_machine_verdict_is_kept_for_undo(self):
+        """人工标记压着机器判定，但那份判定不能丢：撤销标记时要回落到**最新**的机器
+        结论，而不是被标记之前那个过期的。"""
+        frames = self._review(_review())
+        self.assertEqual(frames[2]['manual_flag_prev_gate'], 'sequence_reviewed_pass')
+        self.assertIn('未发现', frames[2]['vlm_qa_reason'] or '未发现')
+
+        restored = po.set_manual_frame_issue(self.TITLE, 2, '')
+        self.assertEqual(restored['quality_gate'], 'sequence_reviewed_pass')
+
+    def test_review_finding_its_own_problem_still_records_it(self):
+        """机器也检出问题时，人工标记继续压在上面（两者都是"有问题"，门禁照拦），
+        但审查结论必须照常落进 vlm_qa_reason/review_issues，不能因为压着就不记。"""
+        frames = self._review(_review(
+            {1: ['材质突变']},
+            ))
+        self.assertEqual(frames[2]['quality_gate'], 'manual_flagged')
+        self.assertIn('材质突变', frames[2]['vlm_qa_reason'])
+        self.assertEqual(frames[2]['manual_flag_prev_gate'], 'sequence_review_flagged')
+
+    def test_review_service_down_does_not_clear_the_manual_flag_either(self):
+        """审查服务不可用那条路径（标 sequence_review_skipped）同样不能覆盖人工标记。"""
+        with patch.object(po, 'check_full_sequence_consistency', return_value=None):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        self.assertEqual(frames[2]['quality_gate'], 'manual_flagged')
+        self.assertEqual(frames[1]['quality_gate'], 'sequence_review_skipped')
+
+    def test_stashed_verdict_is_invalidated_when_the_frame_changes(self):
+        """帧图变了，被压在下面的机器判定同样不再成立——留着的话，之后撤销人工标记
+        会回落到一个针对旧画面的"审查通过"。"""
+        self._review(_review())
+        manifest = self._read_manifest()
+        target = next(f for f in manifest['frames'] if f['sequence'] == 2)
+        self.assertEqual(target['manual_flag_prev_gate'], 'sequence_reviewed_pass')
+        # 伪造"这一帧此后被重渲过"：记下的指纹与磁盘上的内容对不上
+        target['review_frames_sha256'] = {'2': 'deadbeef'}
+        server_common.write_manifest(self.project_dir, manifest)
+
+        server_common.drop_stale_review_verdicts(manifest, self.project_dir)
+        target = next(f for f in manifest['frames'] if f['sequence'] == 2)
+        self.assertEqual(target['manual_flag_prev_gate'], 'pending_manual_review')
+        self.assertEqual(target['quality_gate'], 'manual_flagged')   # 人工标记本身还在
 
 
 if __name__ == '__main__':

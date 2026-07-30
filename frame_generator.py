@@ -27,7 +27,7 @@ from server_common import (
     IMAGE_TASKS, IMAGE_TASKS_LOCK,
     apply_google_fx_runtime_overrides, fx_cancel_context,
     read_manifest, write_manifest, GenerationCancelled, log,
-    gpt_image_pixel_size, drop_stale_review_verdicts,
+    gpt_image_pixel_size, drop_stale_review_verdicts, stamp_manifest_capabilities,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
     _get_account_pool_service, _select_pool_account,
     _account_switch_interval, _account_rotation_ring,
@@ -274,16 +274,20 @@ def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=No
     识别；被本轮重生的帧清除标记。整单全量重生（regenerated_sequences=None）时链条
     重新连续，清空全部标记。
 
-    finalize 时还会顺手作废"所看帧图已经变过"的一致性审查结论
-    （server_common.drop_stale_review_verdicts）：这是所有渲染路径的共同收尾点，放在
-    这里才能保证单帧重试/定向修复/整单重渲都不会在 manifest 上留下过期的
-    sequence_reviewed_pass。"""
+    finalize 时还会顺手做两件同属"收尾"的事——这是所有渲染路径的共同收尾点，放在这里
+    才能保证单帧重试/定向修复/整单重渲都不漏：
+      1. 作废"所看帧图已经变过"的一致性审查结论（server_common.drop_stale_review_verdicts），
+         否则 manifest 上会留下过期的 sequence_reviewed_pass；
+      2. 盖上运行时能力印章（server_common.stamp_manifest_capabilities）：numpy/ffmpeg/
+         技能契约缺失时本地视觉探针整套静默跳过，"这单压根没做内容级校验"必须是清单上
+         的一行，而不是靠人回忆当时的环境。"""
     if 'merged_video' in manifest:
         del manifest['merged_video']
     if 'videos' in manifest:
         manifest['videos'] = []
     if not finalize:
         return
+    stamp_manifest_capabilities(manifest, 'frames')
     dropped = drop_stale_review_verdicts(manifest, project_dir)
     if dropped and sys.stdout:
         print(f"[REVIEW] 帧内容已变化，IMG {dropped} 的一致性审查结论已作废")
