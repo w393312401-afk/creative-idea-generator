@@ -569,6 +569,28 @@ class TestRenderFramesForTask(unittest.TestCase):
         mock_rest.assert_called_once()
         self.assertIn('project_dir', result)
 
+    def test_google_fx_does_not_regenerate_rejected_first_frame(self):
+        """Google FX IMAGE 1 always starts from the same cover reference.  A gate
+        failure must be recorded as degraded and continue to the remaining frames,
+        not repeatedly submit IMG 001 from the same source."""
+        def fake_gate_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
+            return {'title': title}
+
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_gate_render) as mock_render, \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(False, 'FAIL: cover contains text')), \
+             patch('pipeline_orchestrator.fix_image_prompt_with_vlm_feedback') as mock_fix, \
+             patch('pipeline_orchestrator._render_frames_with_checkpoints', return_value=self.PROMPT_BLOCK) as mock_rest, \
+             patch('pipeline_orchestrator._chain_drift_lookback'):
+            render_frames_for_task(
+                {'imageBackend': 'google_fx'}, self.title, self.PROMPT_BLOCK,
+            )
+
+        self.assertEqual(mock_render.call_count, 1)
+        mock_fix.assert_not_called()
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved_degraded')
+        mock_rest.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

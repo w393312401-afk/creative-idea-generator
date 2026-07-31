@@ -207,6 +207,16 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
         self.assertEqual(reward_beat['operation'], 'reward')
         self.assertEqual(reward_beat['anchor_keywords'], ['cast-iron valve stove'])
 
+    def test_rhythm_advice_cannot_fail_an_otherwise_valid_ladder(self):
+        """Rhythm retries are best-effort when the beat-count ceiling prevents a split."""
+        with patch.object(
+                pp, 'rhythm_ladder_violations',
+                return_value=['Beat 2 is heavier than its neighbour.']):
+            state = pp.compose_anchor_and_packet({}, self.dimensions)
+
+        self.assertEqual(len(state['beat_ladder']), 3)
+        self.assertEqual(state['beat_ladder'][-1]['operation'], 'reward')
+
     def test_no_declared_anchor_leaves_signature_anchor_empty(self):
         self.dimensions['anchors'] = []
         state = pp.compose_anchor_and_packet({}, self.dimensions)

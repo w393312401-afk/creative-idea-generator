@@ -102,7 +102,17 @@ def test_compose_registers_only_the_activated_candidate(monkeypatch):
     server.SparkRequestHandler.do_POST(handler)
 
     assert sent[0][0]['status'] == 'ok'
-    register.assert_called_once_with([candidate], source='Creative Activation')
+    register.assert_called_once()
+    (registered,), kwargs = register.call_args
+    assert kwargs == {'source': 'Creative Activation'}
+    assert len(registered) == 1
+    # 原候选字段一字不改地带过去
+    assert {k: registered[0][k] for k in candidate} == candidate
+    # 2026-07-31（P3）：登记时必须带上这条选题激发出来的项目主键。有了它，台账
+    # 「回到激发项目」就是一次直查，不再靠 DNA/一句话选题去撞标题。
+    assert registered[0]['project_key'] == 'run_ledger-activation__prompt input'
+    # 登记发生在 prepare_task_for_run 之前，主键要在那之前就写进 dimensions
+    assert candidate.get('project_key') is None, 'candidate 不该被就地改写'
 
 
 def test_compose_without_ledger_candidate_does_not_register(monkeypatch):

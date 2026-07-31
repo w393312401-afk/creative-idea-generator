@@ -224,12 +224,17 @@ UI_SELECTORS = {
             "*[jsname]:has-text('More ways to verify')",
         ],
         "authenticator_option": [
+            # challenge picker 的稳定语义属性；6 是 Google 的 TOTP challenge type。
+            "[data-challengetype='6']",
             "li:has-text('Google Authenticator')",
             "li:has-text('authenticator app')",
             "li:has-text('身份验证器')",
             "li:has-text('验证码应用')",
             "div[role='link']:has-text('Google Authenticator')",
+            "div[role='button']:has-text('Google Authenticator')",
+            "div[role='button']:has-text('authenticator app')",
             "div[role='link']:has-text('身份验证器')",
+            "div[role='button']:has-text('身份验证器')",
         ],
         # 登录页上表示「这一步出错了」的提示区。用来把「密码错」跟「网络慢
         # 还没跳转」区分开——分不清就会在密码错的情况下不停重试，把号锁掉。

@@ -23,7 +23,7 @@ from server_common import (
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
     IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT, IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT,
     IMG2IMG_RAW_STATE_CONTROL_PROMPT,
-    resolve_cover_reference,
+    resolve_cover_reference, project_cover_path,
     IMAGE_TASKS, IMAGE_TASKS_LOCK,
     apply_google_fx_runtime_overrides, fx_cancel_context,
     read_manifest, write_manifest, GenerationCancelled, log,
@@ -555,10 +555,11 @@ def _persist_data_url_image(data_url, title, prefix='cover'):
     if ext == 'jpeg':
         ext = 'jpg'
 
-    out_dir = os.path.join(OUTPUT_ROOT, 'covers')
-    os.makedirs(out_dir, exist_ok=True)
-    filename = f"{_safe_project_name(title)}_{prefix}_{int(time.time() * 1000)}.{ext}"
-    target_path = os.path.join(out_dir, filename)
+    # 与封面任务同一处落盘（项目目录内），不再进全局封面池
+    target_path = project_cover_path(title, ext=ext)
+    if prefix != 'cover':
+        target_path = os.path.join(os.path.dirname(target_path),
+                                   f"{prefix}_{int(time.time() * 1000)}.{ext}")
     with open(target_path, 'wb') as f:
         f.write(base64.b64decode(encoded))
 
@@ -1302,7 +1303,8 @@ def _fx_cancelled_result(result):
 
 
 def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel_fn=None,
-                       excluded_media_uuids=None, excluded_image_paths=None):
+                       excluded_media_uuids=None, excluded_image_paths=None,
+                       canvas_session=None):
     """调用外部批量生图脚本一次，返回 (本地文件路径列表, 临时目录)。
 
     ref_path：上一帧留档 jpg（首帧/无续链传 None）。
@@ -1322,9 +1324,13 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel
         ratio=config.get('imageAspectRatio') or '9:16',
         model=_fx_image_model(config),
         output_path=temp_out,  # 每次唯一，绕开外部 dedupe 缓存（同提示词重试不会拿到旧图）
+        project_url=(canvas_session or {}).get('project_url'),
     )
     with fx_cancel_context(cancel_fn):
         result = google_fx._generate_images_batch_google_fx(req)
+    returned_project_url = (result or {}).get('project_url') if isinstance(result, dict) else None
+    if returned_project_url and canvas_session is not None:
+        canvas_session['project_url'] = returned_project_url
     if not isinstance(result, dict) or result.get('status') != 'success':
         shutil.rmtree(temp_out, ignore_errors=True)
         if _fx_cancelled_result(result) or (cancel_fn and cancel_fn()):
@@ -1384,6 +1390,8 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
     if pool_account_id:
         apply_google_fx_runtime_overrides(config)
 
+    canvas_session = {}
+
     def _run_chunk_batch(chunk_prompts, ref_path, leg):
         """跑一批：先绑这一批的号池账号，再交给外部批量脚本。"""
         user_id = (leg or {}).get('user_id') or pool_account_id or config.get('googleFxUserId')
@@ -1405,7 +1413,8 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             return _fx_generate_batch(google_fx, fx_models, config, chunk_prompts, ref_path,
                                       cancel_fn=cancel_fn,
                                       excluded_media_uuids=excluded_media_uuids,
-                                      excluded_image_paths=excluded_image_paths)
+                                      excluded_image_paths=excluded_image_paths,
+                                      canvas_session=canvas_session)
 
     manifest_path = os.path.join(project_dir, 'manifest.json')
     manifest = {
@@ -1433,6 +1442,9 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                         manifest[_k] = _v
         except Exception:
             pass
+
+    if manifest.get('google_fx_project_url'):
+        canvas_session['project_url'] = manifest['google_fx_project_url']
 
     manifest_frames_by_seq = {f['sequence']: f for f in manifest['frames']}
     # 按提示词块里的真实槽位号建索引（与 API 路径同一修复）：
@@ -1621,6 +1633,10 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             _check_cancel()
             time.sleep(3.0)
             local_paths, temp_out = _run_chunk_batch(chunk_prompts, ref_path, leg)
+
+        if canvas_session.get('project_url'):
+            manifest['google_fx_project_url'] = canvas_session['project_url']
+            _save_manifest()
 
         try:
             for offset, s in enumerate(chunk):

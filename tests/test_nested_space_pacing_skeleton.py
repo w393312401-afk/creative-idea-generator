@@ -57,11 +57,31 @@ def test_nested_space_reference_demands_a_delivered_man_made_carrier():
     assert 'crane/flatbed/excavator' in summary
 
 
-def test_nested_space_reference_declares_one_hard_cut_chain_reset():
+def test_nested_space_declares_two_separate_discontinuities():
+    """这个骨架有两处不连续，缺一不可：
+
+    T1 进主空间 = 一镜过门（有真实过门片段）；T2 主空间完工后重置到第二毛坯空间 = 硬切。
+    2026-07-31 之前 threshold_variant 直接写成 hard_cut，指望那唯一一次硬切就是 T2；
+    但 hard_cut 变体的 schema 文案把它定义成「进室内的过门拍」，模型只能花在 T1 上，
+    第二空间于是永远不存在（run_1785463152800：12 张图里 4~12 全是同一个空间）。
+    """
     brief = pp.apply_pacing_skeleton_to_brief({'mode': 'Standard'}, 'nested_space_payoff')
     assert brief['mode'] == 'Threshold'
-    assert brief['threshold_variant'] == 'hard_cut'
-    assert brief['require_visible_threshold_video'] is False
+    assert brief['threshold_variant'] == 'coaxial'
+    assert brief['require_visible_threshold_video'] is True
+    assert pp.space_reset_cut_required(brief) is True
+    # 上游 brief 已经判成 pan 时保留它的几何，只有 hard_cut 才被改写成 coaxial
+    panned = pp.apply_pacing_skeleton_to_brief(
+        {'mode': 'Standard', 'threshold_variant': 'pan_left'}, 'nested_space_payoff')
+    assert panned['threshold_variant'] == 'pan_left'
+
+
+def test_space_reset_cut_is_scoped_to_this_skeleton():
+    """换骨架复用同一份 brief 时必须翻回 False，不能留着上一次的 True。"""
+    nested = pp.apply_pacing_skeleton_to_brief({'mode': 'Standard'}, 'nested_space_payoff')
+    for other in ('linear_milestone', 'dual_payoff'):
+        brief = pp.apply_pacing_skeleton_to_brief(dict(nested), other)
+        assert pp.space_reset_cut_required(brief) is False
 
 
 def test_nested_space_outline_passes_with_two_complete_functional_arcs():
@@ -131,6 +151,35 @@ def test_nested_reset_accepts_concrete_second_space_wording():
         outline[6] = reset_entry
         errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
         assert errors == [], f'{reset_entry} 应被认成合法重置拍，实际: {errors}'
+
+
+def test_nested_reset_accepts_a_declared_cut_without_a_raw_state_word():
+    """毛坯态词只对「切入/进入/转到 + …」那两支要求（那些动词普通施工拍里也有）。
+
+    分支 1 用的是明确的剪辑术语，术语本身已经把「这是一次宣告式重置」说死了。旧版对三支
+    一律复查，而清单每条 ≤16 字、还要动词开头 + 点名里程碑，硬塞「毛坯」经常挤掉空间名或
+    动词——「硬切进入第二舱室」这种完全正确的写法被判掉，整张卡跟着被降级成单线。
+    """
+    for reset_entry in ['硬切进入第二舱室', '跳切至隔壁储藏室', '转场进入后舱']:
+        outline = list(GOOD_NESTED_OUTLINE)
+        outline[6] = reset_entry
+        errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
+        assert errors == [], f'{reset_entry} 应被认成合法重置拍，实际: {errors}'
+
+
+def test_nested_reset_still_needs_a_raw_state_word_without_a_cut_term():
+    """反向护栏：没有剪辑术语时，「切入/进入」这类动词在施工拍里也会出现，
+    缺了毛坯态词就分不出这到底是不是一次重置——那一支必须继续查。"""
+    outline = list(GOOD_NESTED_OUTLINE)
+    outline[6] = '进入第二舱室继续施工'
+    errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
+    assert any('untouched/raw state' in e or 'exactly one declared reset' in e for e in errors)
+
+
+def test_nested_cards_are_never_relabelled_into_another_skeleton():
+    """降级救不了这个骨架：标签改成单线之后确实不骗人，但交付的是另一种片子
+    ——用户勾的第二毛坯空间那一幕压根不存在。"""
+    assert 'nested_space_payoff' in pp._NO_DOWNGRADE_SKELETONS
 
 
 def test_nested_reset_written_as_a_doorway_travel_shot_is_named_as_such():

@@ -188,3 +188,58 @@ def test_find_or_create_page_reuses_tab_and_closes_extras(monkeypatch):
     assert selected2 == p_blank2
     assert selected2.navigated_to == "https://labs.google/fx/tools/flow"
     assert len(ctx2.pages) == 1  # 没有产生新页面
+
+
+def test_find_or_create_page_attempts_login_immediately(monkeypatch):
+    """所有 FX 服务共用入口：拿到登录页时不等后续控件超时，立刻自动登录。"""
+    from integrations.google_fx.utils import browser as browser_utils
+
+    calls = []
+    monkeypatch.setattr(browser_utils, "is_google_login_page", lambda page: True)
+    monkeypatch.setattr(
+        browser_utils, "attempt_auto_login",
+        lambda page, **kwargs: calls.append((page, kwargs)) or True,
+    )
+
+    class DummyPage:
+        url = "https://accounts.google.com/v3/signin/identifier"
+
+        def bring_to_front(self):
+            pass
+
+    class DummyContext:
+        pages = [DummyPage()]
+
+    page = browser_utils.find_or_create_page(
+        DummyContext(), "accounts.google.com", user_id="fx-user-1",
+        auto_login_timeout_seconds=25, context_label="测试浏览器启动")
+
+    assert calls == [(page, {
+        "user_id": "fx-user-1",
+        "context_label": "测试浏览器启动",
+        "cancel_check": None,
+        "timeout_seconds": 25,
+    })]
+
+
+def test_find_or_create_page_can_disable_eager_login(monkeypatch):
+    """测试登录入口需要自己返回详细结果，可以显式关闭公共入口的前置尝试。"""
+    from integrations.google_fx.utils import browser as browser_utils
+
+    monkeypatch.setattr(browser_utils, "is_google_login_page", lambda page: True)
+    monkeypatch.setattr(
+        browser_utils, "attempt_auto_login",
+        lambda *args, **kwargs: pytest.fail("auto_login=False 时不应自动登录"),
+    )
+
+    class DummyPage:
+        url = "https://accounts.google.com/v3/signin/identifier"
+
+        def bring_to_front(self):
+            pass
+
+    class DummyContext:
+        pages = [DummyPage()]
+
+    browser_utils.find_or_create_page(
+        DummyContext(), "accounts.google.com", auto_login=False)

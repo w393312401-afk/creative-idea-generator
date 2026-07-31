@@ -249,8 +249,19 @@ def get_ads_ws_url(user_id=None, port=None, auto_rotate_proxy=True,
     )
 
 
-def find_or_create_page(context, url_pattern, fallback_url=None):
-    """🔍 查找/复用标签页，清理多余页面，确保浏览器标签栏始终保持单个 Flow 窗口/标签页。"""
+def find_or_create_page(context, url_pattern, fallback_url=None, *, user_id=None,
+                        auto_login=True, auto_login_timeout_seconds=None,
+                        cancel_check=None, context_label="Google FX 浏览器启动"):
+    """🔍 获取 Google FX 标签页，并在落到登录页时立即尝试自动登录。
+
+    这是生图、视频、积分探针和诊断服务共用的浏览器入口。把自动登录放在这里，
+    可以保证服务刚打开/接管 AdsPower 浏览器就处理掉登录，而不是等到后续找不到
+    Flow 控件后才进入人工接管分支。
+
+    自动登录失败不会在这里抛错；页面保持原状交给调用方原有的人工处理逻辑。
+    user_id 对积分探针、诊断等非任务绑定调用必须显式传入，防止拿默认账号凭据
+    登录另一个 AdsPower profile。
+    """
     if not fallback_url and ("labs.google" in url_pattern or "/fx" in url_pattern):
         fallback_url = "https://labs.google/fx/tools/flow"
 
@@ -307,6 +318,18 @@ def find_or_create_page(context, url_pattern, fallback_url=None):
         target_page.bring_to_front()
     except Exception:
         pass
+
+    # fallback 导航可能被 Google 重定向到 accounts.google.com。此处统一前置
+    # 自愈；ensure_flow_workspace / wait_out_manual_intervention 仍保留二次兜底，
+    # 用于登录重定向在本函数返回后才发生的慢页面。
+    if auto_login and is_google_login_page(target_page):
+        attempt_auto_login(
+            target_page,
+            user_id=user_id,
+            context_label=context_label,
+            cancel_check=cancel_check,
+            timeout_seconds=auto_login_timeout_seconds,
+        )
 
     return target_page
 
@@ -520,7 +543,8 @@ def _browser_session_is_closed(page) -> bool:
     return False
 
 
-def attempt_auto_login(page, user_id=None, context_label="Flow导航", cancel_check=None):
+def attempt_auto_login(page, user_id=None, context_label="Flow导航", cancel_check=None,
+                       timeout_seconds=None):
     """掉登录时先试一次自动登录，成功返回 True。
 
     薄封装，存在的理由是"惰性 import + 异常隔离"这两件事在三个调用点重复：
@@ -531,6 +555,14 @@ def attempt_auto_login(page, user_id=None, context_label="Flow导航", cancel_ch
 
     没配凭据 / 熔断中 / 登录失败一律返回 False，调用方照旧走既有的人工处理路径。
     """
+    # 普通生图/视频服务通常依赖当前任务绑定，不显式传 user_id；服务刚启动且尚未
+    # 建立任务绑定时，则必须回退到控制台配置的默认 AdsPower 环境。旧逻辑只做
+    # 前半段，导致“默认环境打开即掉登录”看得到登录页却永远找不到对应凭据。
+    user_id = account_binding.resolve_account(
+        explicit=user_id,
+        fallback=get_runtime_default_user_id() or DEFAULT_USER_ID,
+    )
+
     try:
         from . import auto_login as _auto_login
     except Exception as e:
@@ -541,7 +573,7 @@ def attempt_auto_login(page, user_id=None, context_label="Flow导航", cancel_ch
             return False
         return bool(_auto_login.try_auto_login(
             page, user_id=user_id, cancel_check=cancel_check,
-            context_label=context_label))
+            context_label=context_label, timeout_seconds=timeout_seconds))
     except Exception as e:
         log(f"⚠️ 自动登录过程异常（{type(e).__name__}: {e}），退回等待人工处理", context_label)
         return False

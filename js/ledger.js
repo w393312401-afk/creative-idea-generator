@@ -329,6 +329,9 @@ async function openLedgerSparkProject(row) {
         return;
     }
     await openSparkProject({
+        // 2026-07-31（P3）起台账行带着它激发出来的项目主键，这是一次直查；
+        // 下面那三个是老台账行（没有 project_key）的回落线索
+        projectKey: row.project_key || '',
         dna: row.topic_dna || '',
         seed: (row.creative_seed && row.creative_seed.input_str) || '',
         title: row.one_line || '',

@@ -302,7 +302,13 @@ def probe_flow_credit(
                     browser = p.chromium.connect_over_cdp(ws_url, timeout=int(_step_timeout(20.0) * 1000))
                     context = browser.contexts[0]
                     flow_url = "https://labs.google/fx/tools/flow"
-                    page = find_or_create_page(context, "/fx/tools/flow", fallback_url=flow_url)
+                    page = find_or_create_page(
+                        context, "/fx/tools/flow", fallback_url=flow_url,
+                        user_id=user_id,
+                        auto_login_timeout_seconds=_step_timeout(45.0),
+                        cancel_check=_cancelled,
+                        context_label="积分探针浏览器启动",
+                    )
                     _checkpoint()
                     if "/fx/tools/flow" not in str(getattr(page, "url", "")):
                         page.goto(flow_url, timeout=int(_step_timeout(45.0) * 1000),

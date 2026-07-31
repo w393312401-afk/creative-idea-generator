@@ -83,14 +83,14 @@
         });
     })();</script>
     <!-- Preload critical CSS for faster first paint -->
-    <link rel="preload" href="css/tokens.css?v=1.1.1" as="style">
-    <link rel="preload" href="css/app/base.css?v=1.3.0" as="style">
-    <link rel="stylesheet" href="css/tokens.css?v=1.1.1">
+    <link rel="preload" href="css/tokens.css?v=1.3.0" as="style">
+    <link rel="preload" href="css/app/base.css?v=1.5.0" as="style">
+    <link rel="stylesheet" href="css/tokens.css?v=1.3.0">
     <!-- style.css split into ordered contiguous slices (concatenation == original); load order = cascade order -->
-    <link rel="stylesheet" href="css/app/base.css?v=1.3.0">
+    <link rel="stylesheet" href="css/app/base.css?v=1.5.0">
     <link rel="stylesheet" href="css/app/skill-output.css?v=1.2.2">
-    <link rel="stylesheet" href="css/app/efficiency.css?v=1.2.2">
-    <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.6.8">
+    <link rel="stylesheet" href="css/app/efficiency.css?v=1.4.0">
+    <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.8.0">
     <!-- 激发结果页的极简布局（管线条 / 折叠标题 / section 弹层 / 宽屏分栏）。
          必须排在 panels-tabs.css 之后：它要覆盖那里的桌面端 .content-header 与
          移动端 .action-row 规则。见 docs/spark_result_minimal_layout_plan.md -->
@@ -104,9 +104,12 @@
          必须排在 base.css 之后：要覆盖那里的 .form-group 竖排规则与 .modal-content 宽度。
          见 docs/spark_settings_center_layout_plan.md -->
     <link rel="stylesheet" href="css/app/settings-center.css?v=1.0.0">
-    <link rel="stylesheet" href="css/image_studio.css?v=1.1.1">
-    <link rel="stylesheet" href="css/gallery.css?v=1.1.0">
-    <link rel="stylesheet" href="css/ledger.css?v=1.1.0">
+    <link rel="stylesheet" href="css/image_studio.css?v=1.2.0">
+    <link rel="stylesheet" href="css/gallery.css?v=1.3.0">
+    <link rel="stylesheet" href="css/ledger.css?v=1.2.0">
+    <!-- 项目工作台（任务列表 + 点子库合并后的主页面）。刻意排在 gallery/ledger 之后：
+         它复用那两张表的工具栏/芯片视觉语言，只补自己的列表与详情栏。 -->
+    <link rel="stylesheet" href="css/projects.css?v=1.2.0">
     <link rel="stylesheet" href="css/shared/lightbox.css?v=1.2.1">
 </head>
 <body>
@@ -142,21 +145,17 @@
                     <span class="status-dot"></span>
                     <span class="status-text">检测 API 连接中...</span>
                 </div>
-                <button id="toggle-tasks-btn" class="icon-btn" title="任务列表">
+                <!-- 「任务列表」「点子库」两个抽屉切换按钮已合并成这一个入口：
+                     两者的内容现在都在「📁 项目」主标签页里（见 #panel-projects）。
+                     角标 id 保持 active-task-count 不变，updateTasksBadge 与那路
+                     后台轮询原样复用。抽屉本身的 DOM/函数暂时保留（P4 才删），
+                     这样出问题时把这两个按钮加回来即可回滚。 -->
+                <button id="open-projects-btn" class="icon-btn" title="项目工作台（任务与点子库）">
                     <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <line x1="8" y1="6" x2="21" y2="6"></line>
-                        <line x1="8" y1="12" x2="21" y2="12"></line>
-                        <line x1="8" y1="18" x2="21" y2="18"></line>
-                        <line x1="3" y1="6" x2="3.01" y2="6"></line>
-                        <line x1="3" y1="12" x2="3.01" y2="12"></line>
-                        <line x1="3" y1="18" x2="3.01" y2="18"></line>
+                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                     </svg>
-                    <span>任务列表</span>
+                    <span>项目</span>
                     <span class="task-badge" id="active-task-count" style="display: none;">0</span>
-                </button>
-                <button id="toggle-library-btn" class="icon-btn" title="我的点子库">
-                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
-                    <span>点子库</span>
                 </button>
                 <button id="theme-toggle-btn" class="icon-btn" title="切换暗夜模式"><span id="theme-toggle-icon" style="font-size:18px;line-height:1;">🌙</span></button>
                 <button id="open-settings-btn" class="icon-btn" title="配置中心">
@@ -184,6 +183,10 @@
             <button id="main-tab-results" class="mobile-nav-btn" onclick="switchMainTab('results')">
                 <span class="btn-icon">☄️</span>
                 <span class="btn-text">激发结果</span>
+            </button>
+            <button id="main-tab-projects" class="mobile-nav-btn" onclick="switchMainTab('projects')">
+                <span class="btn-icon">📁</span>
+                <span class="btn-text">项目</span>
             </button>
             <button id="main-tab-gallery" class="mobile-nav-btn" onclick="switchMainTab('gallery')">
                 <span class="btn-icon">🖼️</span>
@@ -1222,6 +1225,57 @@
                 </div>
             </section>
 
+            <!-- Project Workbench: 「激发任务列表」+「我的点子库」合并后的主页面。
+                 一行 = 一个创意项目（选题 → 激发任务 → 结果收藏 → 成片资产），四路
+                 数据在服务端按 project_key 合流（GET /api/projects），左列表 + 右详情
+                 双栏取代原先两个互斥的 380px 抽屉。见 js/projects.js 与
+                 docs/project_workbench_refactor_plan.md -->
+            <section class="panel-projects glass-panel" id="panel-projects">
+                <div class="projects-shell">
+                    <div class="panel-header">
+                        <h2>项目工作台</h2>
+                        <p>激发任务与收藏的点子合成一张表：跑起来的、跑完的、收藏的、连同它们的成片资产与台账记录</p>
+                    </div>
+
+                    <div class="projects-toolbar">
+                        <div class="projects-filters" id="projects-filters">
+                            <button class="projects-filter-chip active" data-filter="all">全部</button>
+                            <button class="projects-filter-chip" data-filter="running">运行中</button>
+                            <button class="projects-filter-chip" data-filter="completed">已完成</button>
+                            <button class="projects-filter-chip" data-filter="saved">已收藏</button>
+                            <button class="projects-filter-chip warn" data-filter="failed" title="含媒体子作业失败的项目——这类失败在旧任务列表里被整类过滤掉了">失败/取消</button>
+                        </div>
+                        <div class="projects-search-sort">
+                            <input type="search" id="projects-search" class="projects-search-input" placeholder="🔍 搜索标题 / 主题 / 任务 ID" autocomplete="off">
+                            <select id="projects-sort" class="projects-sort-select" title="排序方式">
+                                <option value="newest" selected>最近活动优先</option>
+                                <option value="oldest">最旧优先</option>
+                                <option value="title">按标题</option>
+                            </select>
+                        </div>
+                        <div class="projects-toolbar-right">
+                            <span class="projects-stats" id="projects-stats"></span>
+                            <button type="button" id="projects-refresh-btn" class="projects-tool-btn" title="重新汇总（含 outputs/ 资产统计）">🔄 刷新</button>
+                            <!-- 原先挂在「我的点子库」抽屉里，抽屉删除后搬到这里 -->
+                            <button type="button" id="import-btn" class="projects-tool-btn" title="从 JSON 文件导入创意">导入 JSON</button>
+                            <button type="button" id="export-all-btn" class="projects-tool-btn" title="把整个点子库导出成 JSON">全部导出</button>
+                            <input type="file" id="import-file" style="display: none;" accept=".json">
+                            <button type="button" id="projects-clear-completed-btn" class="projects-tool-btn" title="删除所有已完成的任务记录（不影响已收藏的创意与磁盘素材）">🧹 清空已完成</button>
+                            <button type="button" id="projects-clear-failed-btn" class="projects-tool-btn danger" title="删除所有失败/已取消的任务记录">🗑️ 清空失败</button>
+                        </div>
+                    </div>
+
+                    <div class="projects-body">
+                        <div class="projects-list" id="projects-list">
+                            <div class="projects-status">📡 正在汇总项目…</div>
+                        </div>
+                        <aside class="projects-detail" id="projects-detail">
+                            <div class="projects-detail-empty">选中左侧任一项目查看详情</div>
+                        </aside>
+                    </div>
+                </div>
+            </section>
+
             <!-- Gallery Workspace: 本地历史媒体资产（封面/帧序列/视频/图像工坊）总览与管理 -->
             <section class="panel-gallery glass-panel" id="panel-gallery">
                 <div class="gallery-shell">
@@ -1316,79 +1370,10 @@
         </main>
     </div>
 
-    <!-- Saved Library Drawer -->
-    <div class="drawer" id="library-drawer">
-        <div class="drawer-header">
-            <h3>我的点子库</h3>
-            <button id="close-library-btn" class="close-btn">&times;</button>
-        </div>
-        <div class="drawer-search-filter">
-            <div class="search-input-wrapper">
-                <input type="text" id="library-search" placeholder="搜索标题、主题或提示词...">
-            </div>
-            <!-- 「所有场景主题」下拉框已移除：它硬编码着固定主题选择器时代的 8 个主题名,
-                 而筛选逻辑是 idea.theme 精确匹配。主题选择器移除后 idea.theme 变成了整句
-                 一键输入串(「做一个废弃乡村石砌烤烟房改造成山谷离网避世睡眠小屋」),永远
-                 匹配不上那 8 个值,这个筛选器已彻底筛不出东西;且每条创意的 theme 都各不
-                 相同,主题作为分类维度本身就不成立。上面的搜索框已覆盖 theme 的模糊匹配。 -->
-            <div class="filter-dropdowns">
-                <select id="library-filter-time">
-                    <option value="newest">按保存时间：最新</option>
-                    <option value="oldest">按保存时间：最早</option>
-                </select>
-            </div>
-        </div>
-        <div class="drawer-actions">
-            <button id="import-btn" class="action-btn text-btn secondary">导入 JSON</button>
-            <button id="export-all-btn" class="action-btn text-btn secondary">全部导出</button>
-            <input type="file" id="import-file" style="display: none;" accept=".json">
-        </div>
-        <div class="drawer-body" id="library-list">
-            <!-- Saved items will populate here -->
-            <div class="library-empty">
-                暂无保存的点子，快去生成并点击“收藏点子”吧！
-            </div>
-        </div>
-    </div>
-
-    <!-- Tasks Drawer -->
-    <div class="drawer" id="tasks-drawer">
-        <div class="drawer-header">
-            <h3>激发任务列表</h3>
-            <button id="close-tasks-btn" class="close-btn">&times;</button>
-        </div>
-        
-        <div class="drawer-actions" style="display: flex; gap: 8px; padding: 10px 20px; border-bottom: 1px solid var(--border-color); background: rgba(var(--panel-rgb), 0.1);">
-            <button id="clear-completed-btn" class="action-btn text-btn secondary" style="flex: 1; font-size: 11px; padding: 6px; margin: 0; justify-content: center; height: auto;">🧹 清空已完成</button>
-            <button id="clear-failed-btn" class="action-btn text-btn secondary" style="flex: 1; font-size: 11px; padding: 6px; margin: 0; justify-content: center; height: auto;">🗑️ 清空失败/已取消</button>
-        </div>
-
-        <div class="drawer-search-filter">
-            <div class="search-input-wrapper">
-                <input type="text" id="tasks-search" placeholder="搜索主题或任务标题...">
-            </div>
-            <div class="filter-dropdowns">
-                <select id="tasks-filter-status">
-                    <option value="">所有状态</option>
-                    <option value="running">运行中</option>
-                    <option value="completed">已完成</option>
-                    <option value="failed">已失败</option>
-                    <option value="cancelled">已取消</option>
-                </select>
-                <select id="tasks-filter-type">
-                    <option value="">所有类型</option>
-                    <option value="idea">创意激发</option>
-                </select>
-            </div>
-        </div>
-
-        <div class="drawer-body" id="tasks-list">
-            <!-- Tasks will populate here -->
-            <div class="tasks-empty">
-                暂无生成任务
-            </div>
-        </div>
-    </div>
+    <!-- 「我的点子库」与「激发任务列表」两个右侧抽屉已于 2026-07-31 删除：
+         内容合并进「📁 项目」主标签页（#panel-projects，见 js/projects.js）。
+         抽屉里原有的「导入 JSON / 全部导出」已搬到工作台工具栏。
+         见 docs/project_workbench_refactor_plan.md -->
 
     <!-- Settings Modal — API 配置中心 · 极简两栏布局
          旧版是一条 10 项的长滚动表单，且「号池」还要再点开一个嵌套弹窗（modal 叠 modal）；
@@ -1722,7 +1707,7 @@
 
     <!-- Modular JS: defer so they never block HTML parsing. Order preserved. -->
     <script src="js/state.js?v=1.1.14" defer></script>
-    <script src="js/utils.js?v=1.3.0" defer></script>
+    <script src="js/utils.js?v=1.4.0" defer></script>
     <script src="js/theme_toggle.js?v=1.1.0" defer></script>
     <script src="js/config.js?v=1.3.2" defer></script>
     <script src="js/spark_rail.js?v=1.0.0" defer></script>
@@ -1737,14 +1722,17 @@
     <!-- 日志语义规则表（纯函数）：必须排在 api_client 之前——日志面板的概览模式
          转调这里把日志行归成人话事件。见 docs/spark_log_panel_layout_plan.md -->
     <script src="js/log_semantics.js?v=1.0.0" defer></script>
-    <script src="js/api_client.js?v=1.8.0" defer></script>
+    <script src="js/api_client.js?v=1.9.0" defer></script>
     <script src="js/prompt_pipeline.js?v=1.2.5" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
-    <script src="js/media_renderer.js?v=1.8.0" defer></script>
-    <script src="app.js?v=1.4.0" defer></script>
+    <script src="js/media_renderer.js?v=1.9.0" defer></script>
+    <script src="app.js?v=1.6.0" defer></script>
     <script src="js/image_studio.js?v=1.0.4" defer></script>
     <script src="js/gallery.js?v=1.1.2" defer></script>
-    <script src="js/ledger.js?v=1.2.0" defer></script>
+    <script src="js/ledger.js?v=1.3.0" defer></script>
+    <!-- 项目工作台：必须排在 app.js 之后（依赖它的 openSparkProject / viewTask /
+         retryTask / deleteFromLibrary 等宿主函数） -->
+    <script src="js/projects.js?v=1.1.0" defer></script>
     <!-- 旧「移动端标签切换」内联脚本已删除：它指向早已不存在的 mobile-tab-left/right，
          MutationObserver 永远空转；自动切换结果面板改由 app.js 的 switchMainTab('results') 完成 -->
 

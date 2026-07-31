@@ -102,6 +102,22 @@ _MAX_ANCHOR_ATTEMPTS = 3
 _MAX_RECOVERY_ATTEMPTS = 2
 
 
+def _anchor_attempt_limit(config):
+    """Return the number of IMAGE 1 gate renders appropriate for the backend.
+
+    The API backend can cheaply revise the prompt and render another independent
+    edit.  Google FX is different: IMAGE 1 is always regenerated from the same
+    cover reference.  When the gate rejects an artifact already baked into that
+    cover (the common case is title text), prompt-only retries keep submitting
+    IMG 001 from the same poisoned source and make the frame-sequence UI look as
+    if it is stuck in an endless first-frame loop.  Render it once, keep the real
+    gate verdict, then let the GUI/API fail-open path continue the sequence with
+    an explicit degraded marker.
+    """
+    backend = str((config or {}).get('imageBackend') or 'api').strip().lower()
+    return 1 if backend == 'google_fx' else _MAX_ANCHOR_ATTEMPTS
+
+
 def _frame_path(title, sequence):
     return os.path.join(_get_project_dir(title), 'frames', f'img_{sequence:03d}.webp')
 
@@ -330,7 +346,7 @@ def _retry_frame_until_pass(config, title, sequence, images, videos, judge, on_p
 
 
 def render_and_gate_single_frame(config, title, sequence, prompt, meta='', judge=None, on_progress=None,
-                                 hard_fail_status='needs_human_review'):
+                                 hard_fail_status='needs_human_review', max_attempts=None):
     """Render exactly one frame and run it through an acceptance gate synchronously,
     returning the final verdict directly (no task_id/polling) so a caller — including a
     conversational agent mid-turn — can decide what to do next before composing anything
@@ -352,7 +368,12 @@ def render_and_gate_single_frame(config, title, sequence, prompt, meta='', judge
             return check_anchor_frame_compliance(config, image_path, current_prompt, {}, {})
 
     images = {sequence: {'body': prompt, 'meta': meta}}
-    passed, reason = _retry_frame_until_pass(config, title, sequence, images, {}, judge, on_progress=on_progress)
+    if max_attempts is None:
+        max_attempts = _anchor_attempt_limit(config)
+    passed, reason = _retry_frame_until_pass(
+        config, title, sequence, images, {}, judge,
+        on_progress=on_progress, max_attempts=max_attempts,
+    )
     project_dir = _get_project_dir(title)
     if passed:
         status = 'auto_approved_degraded' if is_skipped_verdict(reason) else 'auto_approved'

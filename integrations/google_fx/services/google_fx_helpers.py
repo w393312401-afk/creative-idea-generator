@@ -20,7 +20,7 @@ from ..utils.browser import (
     random_sleep, clean_path, get_ads_ws_url, find_or_create_page, ensure_flow_workspace,
 )
 from ..ui_selectors import UI_SELECTORS, RATIO_MAP, ORIENT_ICON_MAP
-from ..model_catalog import GOOGLE_FX_IMAGE_MODELS
+from ..model_catalog import DEFAULT_GOOGLE_FX_IMAGE_MODEL, GOOGLE_FX_IMAGE_MODELS
 from ..utils import selector_stats
 from ..utils import cancel_flag
 from .google_fx_dom import _click_first_visible, _find_first_visible, _safe_press_escape
@@ -2556,7 +2556,7 @@ def _normalize_model_name(model: str, is_video: bool = False) -> str:
     - 完全未知的名称使用对应模式的默认值
     """
     if not model:
-        default = _VALID_VIDEO_MODELS[0] if is_video else _VALID_IMAGE_MODELS[0]
+        default = _VALID_VIDEO_MODELS[0] if is_video else DEFAULT_GOOGLE_FX_IMAGE_MODEL
         log(f"  ⚠️ model 为空，使用默认值 '{default}'", "GoogleFX")
         return default
 
@@ -2787,6 +2787,16 @@ def _verify_and_fix_fx_config(page, model, ratio, want_video, context_label, mod
                              mode_label=mode_label, video_submode=video_submode)
     initially_failed = [k for k, v in checks.items() if not v]
     fixed_keys = set((fix_info or {}).get("clicked_keys") or []) | set((fix_info or {}).get("resolved_keys") or [])
+    # A click only proves that Playwright found and clicked a menu item; it does not prove
+    # that Flow applied the model.  The menu can close without changing the selection while
+    # the page is still rendering.  Never submit a generation request until the dropdown's
+    # post-click text confirms the requested model.
+    if "model" in initially_failed:
+        resolved_model_text = (fix_info or {}).get("resolved_model_text") or ""
+        if _matches_model_status(resolved_model_text, model):
+            fixed_keys.add("model")
+        else:
+            fixed_keys.discard("model")
     unconfirmed = [key for key in initially_failed if key not in fixed_keys]
     if unconfirmed:
         raise RuntimeError(
@@ -3558,7 +3568,8 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None):
     """连接 Adspower 浏览器并导航到 Google FX 页面。返回 (browser, page)。
 
     增强:
-    1. 如果连接 CDP 失败 (比如 profile 卡死导致调试端口未开启)，自动换号池账号并重启重试，最多重试 3 次。
+    1. 如果连接 CDP 失败 (比如 profile 卡死导致调试端口未开启)，重启当前 profile
+       后重试，最多重试 3 次；本地连接故障不触发账号切换。
     2. 检测到 Google 安全拦截 (unusual activity / security check) 时，
        自动关闭浏览器 → 换号 → 重启浏览器 → 重试导航，最多重试 1 次。
     3. 检测到登录失效 / 验证码 / 二次验证（换号/换 IP 都解决不了、只能人工在 AdsPower
@@ -3569,10 +3580,10 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None):
     """
     max_conn_attempts = 3
     browser = None
-    tried_accounts = set()   # 本次连接已经试过的号池账号，换号时排除
+    tried_accounts = set()   # Google 安全拦截后换号时，避免换回已失败的账号
 
     for attempt in range(1, max_conn_attempts + 1):
-        # 连接阶段（含 profile 卡死 → stop → 换号 → 重开浏览器）一轮就要几十秒，
+        # 连接阶段（含 profile 卡死 → stop → 重开浏览器）一轮就要几十秒，
         # 中途点的取消原来要等这三轮全跑完才可能生效。
         _check_cancelled()
         try:
@@ -3591,27 +3602,28 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None):
             # 关闭可能处于残留状态的浏览器
             try:
                 from ..config import get_runtime_default_user_id, get_runtime_default_port, DEFAULT_USER_ID, DEFAULT_PORT
-                user_id = get_runtime_default_user_id() or DEFAULT_USER_ID
+                from ..utils import account_binding
+                user_id = account_binding.resolve_account(
+                    fallback=get_runtime_default_user_id() or DEFAULT_USER_ID,
+                )
                 port = get_runtime_default_port() or DEFAULT_PORT
                 url = f"http://127.0.0.1:{port}/api/v1/browser/stop?user_id={user_id}"
                 requests.get(url, timeout=10)
-                if user_id:
-                    tried_accounts.add(user_id)
             except Exception:
                 pass
 
-            # 连不上这个 profile 的调试端口：换号 = 换 AdsPower profile，下一次
-            # get_ads_ws_url() 会去开新 profile 的浏览器（旧的上面刚 stop 过）。
-            # 没号可换就原地再试一次，行为跟换号失败时一致。
-            log("🚨 检测到连接失败，正在切换号池账号后重试...", "GoogleFX")
-            switched = _switch_account_on_failure(force_switch=True, exclude=tried_accounts)
-            if switched:
-                tried_accounts.add(switched)
+            # AdsPower/CDP failure only describes the local browser/profile state.
+            # It is not evidence of a Google generation/card/account failure.  The
+            # profile was stopped above, so get_ads_ws_url() will restart the same
+            # profile on the next attempt.  Do not force an account rotation here.
+            log("🔄 AdsPower/CDP 连接失败，正在重启当前浏览器配置后重试（不换号）...", "GoogleFX")
 
             time.sleep(2)
 
     context = browser.contexts[0]
-    page = find_or_create_page(context, "labs.google")
+    page = find_or_create_page(
+        context, "labs.google", cancel_check=cancel_check,
+        context_label="Google FX 页面初始化")
     page.bring_to_front()
     if "labs.google" not in page.url:
         # 2026-07-19 复盘：这里曾经是唯一一处不带 try/except 的 Flow 导航——
@@ -3660,7 +3672,9 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None):
             ws_url = get_ads_ws_url(auto_rotate_proxy=False)
             browser = _connect_over_cdp_with_retry(playwright_ctx, ws_url)
             context = browser.contexts[0]
-            page = find_or_create_page(context, "labs.google")
+            page = find_or_create_page(
+                context, "labs.google", cancel_check=cancel_check,
+                context_label="Google FX 换号后浏览器启动")
             page.bring_to_front()
             try:
                 page.goto("https://labs.google/fx/tools/flow", timeout=60000)

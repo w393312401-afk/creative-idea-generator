@@ -89,6 +89,30 @@ def test_force_switch_bypasses_classification(monkeypatch):
     assert "classified" not in seen
 
 
+def test_cdp_connection_failure_retries_same_account_without_switch(monkeypatch):
+    """A local AdsPower/CDP startup failure must not be labeled as account failure."""
+    starts = []
+    switches = []
+
+    def fail_start(*args, **kwargs):
+        starts.append(1)
+        raise RuntimeError("AdsPower websocket port is not open")
+
+    monkeypatch.setattr(H, "get_ads_ws_url", fail_start)
+    monkeypatch.setattr(H, "_switch_account_on_failure",
+                        lambda *a, **k: switches.append((a, k)))
+    monkeypatch.setattr(H.requests, "get", lambda *a, **k: None)
+    monkeypatch.setattr(H.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(H, "log", lambda *a, **k: None)
+    monkeypatch.setattr(H.cancel_flag, "is_cancelled", False)
+
+    with pytest.raises(RuntimeError, match="websocket port is not open"):
+        H._connect_fx_page(object())
+
+    assert len(starts) == 3
+    assert switches == []
+
+
 # ── 底部配置按钮自愈恢复 ──────────────────────────────────────────────────────
 
 class _FakePage:

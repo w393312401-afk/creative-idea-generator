@@ -9,9 +9,9 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+    /* 不加 backdrop-filter：与父面板同色且同尺寸，模糊是空操作。
+       理由与实测数据见 css/tokens.css 的 .glass-panel。 */
     background: var(--bg-panel);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
     border: 1px solid var(--border-color);
     border-radius: 20px;
     overflow: hidden;
@@ -302,6 +302,15 @@
     overflow: hidden;
     background: rgba(var(--panel-rgb), 0.4);
     transition: var(--transition-fast);
+
+    /* 屏幕外的卡片直接跳过布局与绘制。画廊一页能有两百多项（实测 #panel-gallery
+       子树 1685 个节点），而可视区一次只放得下十几张；img 上的 loading="lazy"
+       只推迟了下载，布局/绘制该做的一样不少 —— 切到画廊页时 TaskDuration 实测
+       802ms，是修完毛玻璃之后剩下的最大一处卡顿。
+       contain-intrinsic-size 给未渲染的卡片一个占位尺寸（列宽下限 150px + 卡片
+       正文一行），没有它滚动条会随着卡片进出视口来回跳。 */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 186px;
 }
 
 #panel-gallery .gallery-card:hover {

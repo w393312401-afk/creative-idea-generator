@@ -331,6 +331,43 @@ def load_slot_frames(manifest_data, frames_dir, image_count):
     return slot_to_path, slot_to_quality
 
 
+def load_frame_canvas_uuids(manifest_data, slot_to_path):
+    """帧文件绝对路径 → 该帧在 Flow 画布上的媒体 UUID（manifest.frames[].fx_uuid）。
+
+    帧序列是在项目绑定的 Flow 画布上生成的，那张图本身就是画布资产。带上 UUID，
+    视频阶段回到同一画布即可直接挂载，不必把整批帧再上传一轮。
+
+    UUID 与本地文件的对应关系由写入方维持：手动换图会清掉 fx_uuid（server 的上传
+    帧分支），交换槽位时 fx_uuid 跟着图一起搬（swap_frame_slots）。所以这里读到
+    UUID 就意味着"该槽位当前这张本地图 == 画布上那张图"。同一路径出现两个不同
+    UUID（异常状态）时两条都丢掉，宁可重传也不挂错帧。
+    """
+    slot_to_uuid = {}
+    for frame in (manifest_data or {}).get('frames', []):
+        if not isinstance(frame, dict):
+            continue
+        fx_uuid = str(frame.get('fx_uuid') or '').strip()
+        if not fx_uuid:
+            continue
+        try:
+            slot_to_uuid[int(frame['slot'])] = fx_uuid
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    uuid_by_path = {}
+    conflicted = set()
+    for slot, path in (slot_to_path or {}).items():
+        fx_uuid = slot_to_uuid.get(slot)
+        if not path or not fx_uuid:
+            continue
+        if uuid_by_path.get(path, fx_uuid) != fx_uuid:
+            conflicted.add(path)
+        uuid_by_path[path] = fx_uuid
+    for path in conflicted:
+        uuid_by_path.pop(path, None)
+    return uuid_by_path
+
+
 def load_stale_slots(manifest_data):
     """manifest.frames 里被标为 stale_lineage 的槽位集合：部分重生后仍派生自旧 i2i 链
     的帧（见 frame_generator.update_manifest_stale_status）。"""
@@ -602,6 +639,10 @@ def _video_info(plan, video_model, status, error=None):
         # 英雄展示视频（默认收尾步骤）：只上传首帧、无独立结束锚点，前端据此选用
         # 不同的槽位标签/文案，merge_project_videos 据此把它当可选附加片段处理。
         'is_hero': 'HERO' in str(plan.get('meta', '')).upper(),
+        # 本段在成片里的时间缩放（按拍重分配，见 _paced_merge_filter）。显式落盘而不是
+        # 每次合并时重新从 meta 解析：没有留痕的时间缩放不可复现，出了观感问题无法定位
+        # 是哪一段的系数不对。
+        'clip_speed': _clip_speed_from_meta(plan.get('meta', '')),
     }
     if error:
         info['error'] = error
@@ -800,6 +841,8 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     slot_to_path, slot_to_quality = load_slot_frames(manifest_data, frames_dir, len(images))
     if not slot_to_path:
         raise RuntimeError('未找到已生成的帧图像。请先生成帧序列！')
+    frame_canvas_uuids = load_frame_canvas_uuids(manifest_data, slot_to_path)
+    canvas_project_url = str(manifest_data.get('google_fx_project_url') or '').strip()
 
     plans = plan_video_slots(videos, slot_to_path, slot_to_quality, videos_dir, target_slots,
                               strict=strict_gates_enabled(config),
@@ -873,12 +916,23 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
             prompt=plan['prompt'],
             image=plan['start_frame'],
             end_image=plan['end_frame'] or '',
+            image_uuid=frame_canvas_uuids.get(plan['start_frame'] or '', ''),
+            end_image_uuid=frame_canvas_uuids.get(plan['end_frame'] or '', ''),
             model=video_model,
             ratio=config.get('imageAspectRatio') or '9:16',
             duration=video_duration,
             output_path=temp_out_dir
         )
         pending_items.append({'plan': plan, 'req': req, 'temp_out_dir': temp_out_dir})
+
+    # 项目绑定的 Flow 画布由 _run_leg 统一挂到每个 req 上（google_fx_project_url）。
+    # 这里只报一下有多少段任务的锚点帧能直接认领画布资产、免掉重复上传那一轮。
+    known_canvas_frames = sum(
+        1 for it in pending_items
+        if it['req'].image_uuid or it['req'].end_image_uuid
+    )
+    if canvas_project_url and known_canvas_frames:
+        print(f"[VIDEO] 帧序列就在绑定的 Flow 画布上，{known_canvas_frames} 段任务的锚点帧免重复上传")
 
     if pending_items:
         account_pool = _get_account_pool_service()
@@ -911,13 +965,24 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                                       account_pool=account_pool,
                                       pool_account_id=actual_account_id)
             from integrations.google_fx.utils import account_binding
+            flow_project_url = writer.data.get('google_fx_project_url')
+            for item in items:
+                item['req'].project_url = flow_project_url
             with account_binding.bound_task_account(actual_account_id):
                 try:
-                    google_fx_video.generate_videos_batch_google_fx(
+                    fx_results = google_fx_video.generate_videos_batch_google_fx(
                         [it['req'] for it in items],
                         on_progress=leg_bridge,
                         cancel_check=cancel_check_cb
                     )
+                    returned_url = next(
+                        (r.get('project_url') for r in (fx_results or [])
+                         if isinstance(r, dict) and r.get('project_url')),
+                        None,
+                    )
+                    if returned_url:
+                        writer.data['google_fx_project_url'] = returned_url
+                        writer.save()
                 finally:
                     for it in items:
                         shutil.rmtree(it['temp_out_dir'], ignore_errors=True)
@@ -986,6 +1051,7 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                     old_req = it['req']
                     new_req = models.VideoRequest(
                         prompt=old_req.prompt, image=old_req.image, end_image=old_req.end_image,
+                        image_uuid=old_req.image_uuid, end_image_uuid=old_req.end_image_uuid,
                         model=old_req.model, ratio=old_req.ratio, duration=old_req.duration,
                         output_path=new_temp_dir,
                     )
@@ -1087,6 +1153,75 @@ def _merge_filter(speed, has_audio):
     if has_audio:
         return f'{video_filter};[0:a]atempo={speed:g}[a]'
     return video_filter
+
+
+# ── 节奏时间分配（docs/pacing_rhythm_balance_plan.md 第 3 层） ─────────────────
+# 每段固定 8 秒的 i2v 输出装的信息量差着几倍，观感上就是同一条片子里既有跟不上的
+# 段落也有拖沓的段落。合成侧把每拍的拍重换算成一个 setpts 系数，写进提示词块的
+# meta（"PACE 1.21"），一路经 plan -> manifest 流到这里，在合并时兑现成屏幕时间。
+# 拿不到标签的片段（老项目、手动上传、运镜拍）一律 1.0，行为与改造前完全一致。
+_PACE_META_RE = re.compile(r'\bPACE\s+([0-9]*\.?[0-9]+)\b', re.IGNORECASE)
+# 单段相对基准时长的缩放上限，兜住上游给出畸形系数的情况（prompt_pipeline 侧已经
+# 夹逼在 4~11 秒 / 8 秒 = 0.5~1.375，这里是第二道保险，不是主约束）。
+_CLIP_SPEED_MIN, _CLIP_SPEED_MAX = 0.5, 2.0
+
+
+def _clip_speed_from_meta(meta):
+    """从槽位 meta 里取 PACE 系数；没有标签或值非法时返回 1.0（= 不改变时长）。"""
+    match = _PACE_META_RE.search(str(meta or ''))
+    if not match:
+        return 1.0
+    try:
+        value = float(match.group(1))
+    except (TypeError, ValueError):
+        return 1.0
+    if value <= 0:
+        return 1.0
+    return min(_CLIP_SPEED_MAX, max(_CLIP_SPEED_MIN, value))
+
+
+def _atempo_chain(tempo):
+    """atempo 单次只接受 0.5~2.0，超出范围必须拆成链式。
+
+    全局倍速 2.0 叠上一个 0.59 的慢速段时 tempo 会到 3.4，直接写 atempo=3.4 会让
+    整次合并失败——而失败信息埋在 ffmpeg 的 stderr 里，很难定位回节奏分配这一步。
+    """
+    parts = []
+    remaining = float(tempo)
+    while remaining > 2.0:
+        parts.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        parts.append(0.5)
+        remaining /= 0.5
+    parts.append(remaining)
+    return ','.join(f'atempo={p:.6g}' for p in parts)
+
+
+def _paced_merge_filter(clip_speeds, speed, has_audio):
+    """多输入 concat filter：每段用自己的 setpts，再整体套上全局倍速。
+
+    走多输入而不是 concat demuxer 的 outpoint：outpoint 只能截短不能拉长，而截短会
+    砍掉片尾工人退场的收尾（Out-and-In 契约的观感前提）。变速也比截断更符合
+    「时间流速」的语义。
+
+    全局倍速与每段系数是**相乘**关系：setpts 用 clip/speed，atempo 用 speed/clip。
+    并列处理会让两套时间缩放互相打架。
+    """
+    video_parts, audio_parts, concat_inputs = [], [], []
+    for i, clip in enumerate(clip_speeds):
+        pts = float(clip) / speed
+        video_parts.append(f'[{i}:v]setpts={pts:.6g}*PTS[v{i}]')
+        concat_inputs.append(f'[v{i}]')
+        if has_audio:
+            audio_parts.append(f'[{i}:a]{_atempo_chain(speed / float(clip))}[a{i}]')
+            concat_inputs.append(f'[a{i}]')
+    n = len(clip_speeds)
+    if has_audio:
+        concat = f"{''.join(concat_inputs)}concat=n={n}:v=1:a=1[v][a]"
+        return ';'.join(video_parts + audio_parts + [concat])
+    concat = f"{''.join(concat_inputs)}concat=n={n}:v=1:a=0[v]"
+    return ';'.join(video_parts + [concat])
 
 
 def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
@@ -1290,43 +1425,66 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
             print(f"[DEBUG] ffprobe check failed: {probe_err}")
             
     import subprocess
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concat_list_path
-    ]
-    
-    if has_audio:
-        cmd.extend([
-            "-filter_complex", _merge_filter(speed, True),
-            "-map", "[v]",
-            "-map", "[a]",
-            "-c:a", "aac"
-        ])
+
+    def _build_concat_demuxer_cmd():
+        """改造前的原路径：concat demuxer + 一个全局 setpts。所有片段等长通过。"""
+        base = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path]
+        if has_audio:
+            base.extend(["-filter_complex", _merge_filter(speed, True),
+                         "-map", "[v]", "-map", "[a]", "-c:a", "aac"])
+        else:
+            base.extend(["-filter_complex", _merge_filter(speed, False), "-map", "[v]"])
+        base.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", output_path])
+        return base
+
+    # 节奏时间分配：只要有任何一段带了 PACE 标签就走多输入路径；一段都没有时
+    # （老项目、手动上传、prompt_pipeline._RHYTHM_CLIP_TIMING=False）**原样走旧路径**，
+    # 行为与改造前逐字节一致。
+    def _slot_clip_speed(slot):
+        entry = by_slot.get(slot) or {}
+        declared = entry.get('clip_speed')
+        if isinstance(declared, (int, float)) and not isinstance(declared, bool) and declared > 0:
+            return min(_CLIP_SPEED_MAX, max(_CLIP_SPEED_MIN, float(declared)))
+        # 旧 manifest 没有 clip_speed 字段，但 meta 里可能已经有 PACE 标签
+        return _clip_speed_from_meta(entry.get('meta'))
+
+    clip_speeds = [_slot_clip_speed(s) for s in sorted(good)]
+    paced = any(abs(k - 1.0) >= 0.01 for k in clip_speeds)
+
+    if paced:
+        cmd = ["ffmpeg", "-y"]
+        for vf in video_files:
+            cmd.extend(["-i", vf])
+        cmd.extend(["-filter_complex", _paced_merge_filter(clip_speeds, speed, has_audio),
+                    "-map", "[v]"])
+        if has_audio:
+            cmd.extend(["-map", "[a]", "-c:a", "aac"])
+        cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", output_path])
+        print(f"[INFO] Merging {len(video_files)} videos to {output_path} "
+              f"(speed={speed:g}x, has_audio={has_audio}, pace={[round(k, 2) for k in clip_speeds]})...")
     else:
-        cmd.extend([
-            "-filter_complex", _merge_filter(speed, False),
-            "-map", "[v]"
-        ])
-        
-    cmd.extend([
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        output_path
-    ])
-    
-    print(f"[INFO] Merging {len(video_files)} videos to {output_path} (speed={speed:g}x, has_audio={has_audio})...")
+        cmd = _build_concat_demuxer_cmd()
+        print(f"[INFO] Merging {len(video_files)} videos to {output_path} (speed={speed:g}x, has_audio={has_audio})...")
+
     # encoding must be explicit: ffmpeg emits UTF-8, but Windows text-mode default is GBK,
     # which crashes the subprocess stderr reader thread mid-merge
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                          encoding='utf-8', errors='replace')
 
+    if paced and res.returncode != 0:
+        # 多输入 concat filter 要求所有输入的流布局一致；has_audio 只探了第一段，
+        # 若后面某段没有音轨，整次合并会失败。这种情况下退回等长的旧路径——
+        # 宁可丢掉节奏分配，也不能让用户拿不到成片。
+        print(f"[WARN] 按拍重变速的合并失败，回退等长拼接: {res.stderr[-400:]}")
+        res = subprocess.run(_build_concat_demuxer_cmd(), stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True,
+                             encoding='utf-8', errors='replace')
+
     try:
         os.remove(concat_list_path)
     except:
         pass
-        
+
     if res.returncode == 0:
         rel_path = os.path.relpath(output_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
         file_size = os.path.getsize(output_path)

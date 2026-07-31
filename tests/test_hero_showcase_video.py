@@ -1,4 +1,4 @@
-"""英雄展示视频（默认收尾步骤，2026-07-22，2026-07-23 改为只上传首帧）：帧序列生成
+"""英雄展示视频（收尾步骤，2026-07-22，2026-07-23 改为只上传首帧）：帧序列生成
 完毕后，额外用最后一张整体完工图作为唯一来源锚点（只作首帧，不设结束锚点），生成
 一条手持展示视频提示词（视频 total_beats+1 [HERO]），并接入实际的视频生成/合成
 管线。三层覆盖：
@@ -9,6 +9,13 @@
    "下一张"结束帧（end_frame 为 None），且不应触发"首尾近乎相同"的误报警告。
 3. video_generator.merge_project_videos —— HERO 片段是可选附加片段，不参与主体序列
    的完整性门禁；成功时追加在成片末尾，失败/缺失时静默跳过、不阻塞主体合并。
+
+2026-07-31：`_HERO_SHOWCASE_ENABLED` 默认改为 False（收尾不再连放两条完工镜头，
+见 docs/pacing_rhythm_balance_plan.md §7）。第 1 层的用例因此显式把开关打开再跑——
+它们锁的是「开关打开时这条管线仍然完好」，这正是选择关开关而不是删代码的前提；
+关闭态本身由 TestHeroShowcaseDisabledByDefault 单独锁。第 2、3 层是纯下游逻辑，
+不读这个开关（存量项目的 manifest 里还有 HERO 槽位，且手动上传路径仍需可用），
+所以保持原样运行。
 """
 import json
 import os
@@ -23,12 +30,22 @@ from PIL import Image
 import prompt_pipeline as pp
 from video_generator import plan_video_slots, merge_project_videos, PartialMergeBlocked
 
+# 导入期快照：下面的用例会 patch 这个常量，快照让「仓库默认值」这条锁不受 patch 影响。
+_HERO_ENABLED_DEFAULT = pp._HERO_SHOWCASE_ENABLED
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # 1. prompt_pipeline: 提示词生成本身
 # ─────────────────────────────────────────────────────────────────────────
 
-class TestComposeHeroShowcaseVideo(unittest.TestCase):
+class _HeroComposeFixture:
+    """开关两态共用的夹具（不是 TestCase，所以不会把用例也继承过去）。
+
+    子类用 HERO_ENABLED 声明自己要跑在哪一态上。
+    """
+
+    HERO_ENABLED = True
+
     def setUp(self):
         self._tmp_dir = tempfile.mkdtemp()
         self._path_patch = patch.object(pp, 'COMPOSE_CHECKPOINT_PATH', os.path.join(self._tmp_dir, 'compose_checkpoints.json'))
@@ -36,6 +53,7 @@ class TestComposeHeroShowcaseVideo(unittest.TestCase):
         self.fingerprint = 'fp-hero-showcase-test'
 
         patches = [
+            patch.object(pp, '_HERO_SHOWCASE_ENABLED', self.HERO_ENABLED),
             patch.object(pp, 'load_reference_file', return_value=''),
             patch.object(pp, 'get_cropped_templates', return_value=''),
             patch.object(pp, 'apply_proactive_fixes', side_effect=lambda i, v, im, *a, **k: (v, im)),
@@ -94,6 +112,13 @@ class TestComposeHeroShowcaseVideo(unittest.TestCase):
             )
         return fake_chat
 
+
+class TestComposeHeroShowcaseVideo(_HeroComposeFixture, unittest.TestCase):
+    """开关打开时的行为。锁的是「HERO 管线本身没被拆掉」——这正是 2026-07-31
+    选择关开关而不是删代码的前提（存量项目的 manifest 里还有 HERO 槽位）。"""
+
+    HERO_ENABLED = True
+
     def test_hero_video_appended_after_normal_beats_succeed(self):
         state = self._make_state(total_beats=3)
         calls = []
@@ -134,6 +159,40 @@ class TestComposeHeroShowcaseVideo(unittest.TestCase):
         self.assertNotIn('[HERO]', output)
         self.assertIn('视频 3:', output)  # 主体序列照常交付
         self.assertIsNone(pp.load_compose_checkpoint(self.fingerprint))
+
+
+class TestHeroShowcaseDisabledByDefault(_HeroComposeFixture, unittest.TestCase):
+    """关闭态（2026-07-31 起的默认）：收尾不再追加第二条完工镜头。
+
+    整个 HERO 步骤——包括那次 LLM 调用——都必须消失，主体序列则完全不受影响。
+    """
+
+    HERO_ENABLED = False
+
+    def test_default_is_disabled(self):
+        # 读的是导入期快照，不是 setUp 里 patch 过的值——这条锁的是仓库里的默认值本身。
+        self.assertFalse(
+            _HERO_ENABLED_DEFAULT,
+            "英雄展示视频应默认关闭（docs/pacing_rhythm_balance_plan.md §7）")
+
+    def test_no_hero_slot_and_no_llm_call_when_disabled(self):
+        state = self._make_state(total_beats=3)
+        calls = []
+        with patch.object(pp, '_chat', side_effect=self._fake_chat(calls)):
+            output = pp.compose_remaining_beats({}, state)
+
+        self.assertNotIn('hero', calls, "关闭时不应再为 HERO 发起 LLM 调用")
+        self.assertNotIn('[HERO]', output)
+        self.assertNotIn('视频 4', output, "视频槽位应止于 reward 拍（视频 3）")
+        # 主体序列与最终揭示图照常交付
+        self.assertIn('视频 3:', output)
+        self.assertIn('图片 4:', output)
+
+    def test_compose_hero_returns_empty_without_touching_state(self):
+        state = self._make_state(total_beats=3)
+        state['compiled_images'][4] = 'IMAGE 4 finished reveal'
+        with patch.object(pp, '_chat', side_effect=AssertionError('不应被调用')):
+            self.assertEqual(pp._compose_hero_showcase_video({}, state), '')
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -646,8 +646,10 @@ class TestPacingGateDoesNotDiscardPassingCards(unittest.TestCase):
         # 标签必须诚实：内容是单线清单，就不能继续挂 dual_payoff 的牌子
         self.assertEqual([i['pacing_skeleton'] for i in result['ideas']],
                          ['dual_payoff', 'linear_milestone'])
-        # 两张都能诚实交付 = 已经凑够用户要的 2 张，不必再烧一次 150s 调用
-        self.assertEqual(mock_chat.call_count, 1)
+        # 降级卡不再计入「凑够 count」：它兑现的是单线，而用户勾的是 dual/nested。
+        # 剩下的尝试要先拿去争取一张真正的 dual 卡，补不到才用降级卡填缺口
+        # （本用例的模型每次只会回同一批，于是三次跑满、最终仍交付这两张）。
+        self.assertEqual(mock_chat.call_count, 3)
 
     def test_short_batch_spends_the_remaining_attempts_topping_up_to_count(self):
         """用户在 GUI 选的生成数是硬要求：本轮少收了卡就用掉剩下的尝试补齐。
@@ -662,7 +664,7 @@ class TestPacingGateDoesNotDiscardPassingCards(unittest.TestCase):
         self.assertEqual(result['ideas'][0]['pacing_skeleton'], 'dual_payoff')
         self.assertEqual(mock_chat.call_count, 3)
 
-    def test_whole_batch_failing_delivers_the_downgraded_card_without_extra_calls(self):
+    def test_whole_batch_failing_delivers_the_downgraded_card_after_using_up_retries(self):
         payload = json.dumps([{
             'title': '写成单线的卡', 'dna': 'b / refuge / y',
             'pacing_skeleton': 'dual_payoff', 'beat_outline': self.LINEAR_OUTLINE,
@@ -673,15 +675,19 @@ class TestPacingGateDoesNotDiscardPassingCards(unittest.TestCase):
              patch.object(pp, '_chat', return_value=payload) as mock_chat:
             result = pp.run_ideate({}, count=1,
                                    pacing_skeleton_ids=['linear_milestone', 'dual_payoff'])
-        # 降级后的卡本身就在用户勾选的骨架里，已经凑够 count：重试只会拿回同一张
-        self.assertEqual(mock_chat.call_count, 1)
+        # 降级卡不算凑够 count：先把剩下两次尝试用掉去争取一张真正的 dual 卡，
+        # 都没争取到才拿它填缺口——标签仍然诚实，只是没兑现用户勾的那个骨架。
+        self.assertEqual(mock_chat.call_count, 3)
         self.assertEqual([i['title'] for i in result['ideas']], ['写成单线的卡'])
         self.assertEqual(result['ideas'][0]['pacing_skeleton'], 'linear_milestone')
 
-    def test_nested_only_batch_downgrades_instead_of_falling_back_to_stale_topics(self):
-        """只勾了 nested 且整批没过它的专属门禁时，以前一张都留不下 → 退回三条写死的
-        静态兜底选题，再被台账去重砍成一两张：用户看到的就是「每次只出一张卡」。
-        现在最后一步把这些本来就是单线清单的卡降级成 linear_milestone 诚实交付。"""
+    def test_nested_only_batch_falls_back_to_honest_nested_topics_not_a_downgrade(self):
+        """双空间卡永不降级（见 _NO_DOWNGRADE_SKELETONS）。
+
+        降级成 linear_milestone 之后标签确实不骗人了，但交付的是完全另一种片子——
+        用户勾的第二毛坯空间那一幕压根不存在，现象就是「勾了双空间，出来的全是单线」。
+        这个骨架有自己的静态兜底选题池（都是人工运输载体 + 双舱清单），走那条路
+        交付的仍是真正的双空间卡，比改个名字的单线卡更接近用户勾的东西。"""
         payload = json.dumps([
             {'title': '单线卡一', 'dna': 'p / refuge / x',
              'pacing_skeleton': 'nested_space_payoff', 'beat_outline': self.LINEAR_OUTLINE},
@@ -695,9 +701,14 @@ class TestPacingGateDoesNotDiscardPassingCards(unittest.TestCase):
              patch.object(pp, '_chat', return_value=payload):
             result = pp.run_ideate({}, count=2,
                                    pacing_skeleton_ids=['nested_space_payoff'])
-        self.assertEqual([i['title'] for i in result['ideas']], ['单线卡一', '单线卡二'])
-        self.assertEqual([i['pacing_skeleton'] for i in result['ideas']],
-                         ['linear_milestone', 'linear_milestone'])
+        # 那两张写成单线的卡一张都不许交付
+        self.assertNotIn('单线卡一', [i['title'] for i in result['ideas']])
+        self.assertNotIn('单线卡二', [i['title'] for i in result['ideas']])
+        # 静态兜底按池子整批交付（不截到 count，和其它兜底路径一致）
+        self.assertGreaterEqual(len(result['ideas']), 2)
+        for idea in result['ideas']:
+            self.assertEqual(idea['pacing_skeleton'], 'nested_space_payoff')
+            self.assertEqual(pp.pacing_skeleton_outline_violations(idea), [])
 
     def test_exhausted_fallback_raises_instead_of_returning_an_empty_batch(self):
         """兜底选题被台账全部认领时，以前静静返回空数组，前端只显示「暂无灵感推荐」,

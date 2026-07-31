@@ -29,3 +29,27 @@ def test_batch_reuses_first_chunk_project_for_all_later_chunks(monkeypatch):
         "https://labs.google/fx/tools/flow/project/task-project",
         "https://labs.google/fx/tools/flow/project/task-project",
     ]
+
+
+def test_batch_starts_from_local_project_canvas_and_returns_binding(monkeypatch):
+    seen_initial_urls = []
+
+    class _Runner:
+        def __init__(self, chunk, **_kwargs):
+            self.chunk = chunk
+
+        def run(self):
+            seen_initial_urls.append(self.project_url)
+            return [{"status": "failed", "video_url": None} for _ in self.chunk]
+
+    monkeypatch.setattr(video, "_ChunkRunner", _Runner)
+    bound = "https://labs.google/fx/tools/flow/project/local-project"
+    reqs = [
+        SimpleNamespace(prompt=f"prompt {i}", model="veo-3.1", project_url=bound)
+        for i in range(7)
+    ]
+
+    results = video.generate_videos_batch_google_fx(reqs)
+
+    assert seen_initial_urls == [bound, bound]
+    assert {item["project_url"] for item in results} == {bound}

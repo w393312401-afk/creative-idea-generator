@@ -1099,53 +1099,86 @@ def _get_project_dir(title):
     return new_dir
 
 
-def resolve_cover_reference(config, title):
+# 封面图与帧/视频/成片一样住在项目目录里：outputs/<项目目录>/cover_<毫秒时间戳>.webp。
+# 它以前落在全局池 outputs/covers/ 下，文件名靠 <安全标题>_cover_ 前缀反查归属——
+# 于是删项目删不掉封面（要靠 delete_idea_output_files 拿着 URL 单独再删一遍）、
+# 标题一改就认不回来、画廊里还得单开一个「封面图片」组。现在它跟项目打包在一起。
+COVER_FILENAME_PREFIX = 'cover_'
+# 迁移前的历史封面仍留在这个全局池里（见 tools/migrate_covers.py），只读不写。
+LEGACY_COVERS_DIRNAME = 'covers'
+
+
+def _is_cover_filename(name):
+    """项目目录里的这张图是不是封面（与 project_cover_path 的命名一一对应）。"""
+    return (isinstance(name, str)
+            and name.startswith(COVER_FILENAME_PREFIX)
+            and _gallery_media_type(name) == 'image')
+
+
+def project_cover_path(project_key, ext='webp'):
+    """新封面图的落盘路径，并确保项目目录已存在。
+
+    封面通常是一个项目最先产出的文件（第一帧必须以它图生图），所以这里往往就是
+    项目目录被创建出来的那一刻。
+    """
+    pdir = _get_project_dir(project_key)
+    os.makedirs(pdir, exist_ok=True)
+    return os.path.join(pdir, f"{COVER_FILENAME_PREFIX}{int(time.time() * 1000)}.{ext}")
+
+
+def resolve_cover_reference(config, title, project_key=None):
     """Resolve the cover used only as frame 1's image reference.
 
     A client-selected cover wins; headless callers fall back to this project's newest cover.
-    Request paths are restricted to outputs/covers so arbitrary local files cannot be uploaded.
+    Request paths are restricted to outputs/ so arbitrary local files cannot be uploaded.
+
+    回落查找顺序：项目目录里的 cover_*（新布局）→ 全局封面池里以 <安全标题>_cover_
+    开头的那批（迁移前的历史封面）。两处都按 mtime 取最新的一张。
     """
     root = os.path.dirname(os.path.abspath(__file__))
-    covers_dir = os.path.abspath(os.path.join(root, OUTPUT_ROOT, 'covers'))
+    outputs_dir = os.path.abspath(os.path.join(root, OUTPUT_ROOT))
     named = (config or {}).get('coverReferencePath') if isinstance(config, dict) else None
     if isinstance(named, str) and named.strip():
         raw = named.strip().split('?', 1)[0]
         candidate = raw if os.path.isabs(raw) else os.path.join(root, raw.lstrip('/\\'))
         candidate = os.path.abspath(candidate)
         try:
-            inside = os.path.commonpath([candidate, covers_dir]) == covers_dir
+            # 放宽到整个 outputs/：封面现在住在项目目录里，不再只有 covers/ 一处。
+            # 边界仍然是 outputs/——外部本地文件依旧不可能被当成参考图送进模型。
+            inside = os.path.commonpath([candidate, outputs_dir]) == outputs_dir
         except ValueError:
             inside = False
         if inside and os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
             return candidate
 
-    if not os.path.isdir(covers_dir):
-        return None
-    prefix = f"{_safe_project_name(title)}_cover_"
-    found = [os.path.join(covers_dir, name) for name in os.listdir(covers_dir)
-             if name.startswith(prefix)]
+    found = []
+
+    project_dir = _get_project_dir(project_key or title)
+    project_dir = (project_dir if os.path.isabs(project_dir)
+                   else os.path.join(root, project_dir))
+    if os.path.isdir(project_dir):
+        found += [os.path.join(project_dir, name) for name in os.listdir(project_dir)
+                  if _is_cover_filename(name)]
+
+    legacy_dir = os.path.abspath(os.path.join(outputs_dir, LEGACY_COVERS_DIRNAME))
+    if os.path.isdir(legacy_dir):
+        prefix = f"{_safe_project_name(title)}_cover_"
+        found += [os.path.join(legacy_dir, name) for name in os.listdir(legacy_dir)
+                  if name.startswith(prefix)]
+
     found = [path for path in found if os.path.isfile(path) and os.path.getsize(path) > 0]
     return max(found, key=os.path.getmtime) if found else None
-
-    # 2. Try old naming scheme (unreachable legacy tail, kept as-is)
-    old_raw = (title or 'spark_frames').strip()
-    old_raw = re.sub(r'[\\/:*?"<>|]+', '_', old_raw)
-    old_raw = re.sub(r'\s+', '_', old_raw)
-    old_name = old_raw.strip('._-')[:60] or 'spark_frames'
-    old_dir = os.path.join(OUTPUT_ROOT, old_name)
-    if os.path.exists(old_dir):
-        return old_dir
-
-    # 3. Default to new naming scheme path if neither exists (for creation)
-    return new_dir
 
 
 def delete_idea_output_files(title, covers=None):
     """Best-effort purge of everything a generated idea left on disk: its whole
-    project directory (frames/videos/manifest under outputs/<project>/) plus any
+    project directory (frames/videos/manifest/cover under outputs/<project>/) plus any
     standalone cover images (outputs/covers/*.webp) referenced by a saved idea.
     Deleting the task/library record alone leaves these behind as orphan files,
     so this must be called from both the task-delete and library-delete endpoints.
+
+    新布局下封面就在项目目录里，第一步的 rmtree 已经把它带走；covers 参数只对
+    迁移前留在全局封面池里的历史封面还有用（清不掉的 URL 会被静默跳过）。
     """
     deleted = {"project_dir": None, "covers": []}
 
@@ -1188,9 +1221,10 @@ def delete_idea_output_files(title, covers=None):
 GALLERY_IMAGE_EXTS = ('.webp', '.png', '.jpg', '.jpeg', '.gif', '.bmp')
 GALLERY_VIDEO_EXTS = ('.mp4', '.webm', '.mov', '.m4v')
 
-# outputs/ 下这两个一级目录不是"项目"：covers 是全局封面池，image-station 是
-# 图像工坊的出图历史。它们没有 manifest，删除后也不做项目级清理/同步。
-GALLERY_SPECIAL_DIRS = ('covers', 'image-station')
+# outputs/ 下这两个一级目录不是"项目"：covers 是**历史**全局封面池（新封面已改为
+# 落进项目目录，见 project_cover_path），image-station 是图像工坊的出图历史。
+# 它们没有 manifest，删除后也不做项目级清理/同步。
+GALLERY_SPECIAL_DIRS = (LEGACY_COVERS_DIRNAME, 'image-station')
 
 
 def _gallery_media_type(name):
@@ -1297,28 +1331,31 @@ def gallery_collect_references(library_items=None, tasks=None):
                         add_path_project(e.get('file'), sink)
 
     if library_items is None:
-        library_items = []
-        with LIBRARY_LOCK:
-            if os.path.exists(DB_FILE):
-                try:
-                    with open(DB_FILE, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    if isinstance(data, list):
-                        library_items = data
-                except Exception:
-                    pass
-    for item in (library_items or []):
-        owned = set()
-        eat_record(item, owned)
-        if not isinstance(item, dict):
-            continue
-        idea_id = str(item.get('id') or '').strip()
-        if not idea_id:
-            continue
-        owner = {'idea_id': idea_id, 'idea_title': str(item.get('title') or '')}
-        for name in owned:
-            # 同名目录归最靠前的那条（点子库按新→旧排列，重复合成时优先认新记录）
-            project_owners.setdefault(name, owner)
+        # 必须走 read_library()：创意库现在存在拆分库 library/ 里，直接读
+        # library.json 拿到的是迁移前的旧快照（收藏后新增的项目会被判成孤儿）
+        library_items = read_library() or []
+
+    # 归属反查分两趟。第一趟只认 project_key 派生出的目录名——它是每次合成独占的
+    # 命名空间（run_<task_id>__<标题>），一个目录只可能属于一条创意，是硬证据。
+    # 第二趟才用标题变体补齐没被认领的目录：标题会重名、会被截断，拿它当第一优先
+    # 级会让后合成的项目被先前那条同名创意抢走归属。
+    library_items = [i for i in (library_items or []) if isinstance(i, dict)]
+    for pass_no in (1, 2):
+        for item in library_items:
+            owned = set()
+            eat_record(item, owned)
+            idea_id = str(item.get('id') or '').strip()
+            if not idea_id:
+                continue
+            owner = {'idea_id': idea_id, 'idea_title': str(item.get('title') or '')}
+            if pass_no == 1:
+                key = str(item.get('project_key') or '').strip()
+                names = {_safe_project_name(key)} if key else set()
+            else:
+                names = owned
+            for name in names:
+                # 同名目录归最靠前的那条（点子库按新→旧排列，重复合成时优先认新记录）
+                project_owners.setdefault(name, owner)
 
     if tasks is None:
         with ACTIVE_TASKS_LOCK:
@@ -1332,6 +1369,9 @@ def gallery_collect_references(library_items=None, tasks=None):
         eat_record(t.get('result'))
         dims = t.get('dimensions')
         if isinstance(dims, dict):
+            # 帧/视频/封面子作业现在也带着母项目的 project_key（P3），它是这些
+            # 任务产出目录的精确来源，比 theme 那条从宽匹配可靠得多
+            add_title(dims.get('project_key'))
             # staged_render 任务的 theme 就是项目标题；compose 任务的 theme 是
             # 场景主题，多收一个引用无害（从宽原则）
             add_title(dims.get('theme'))
@@ -1346,9 +1386,10 @@ def gallery_collect_references(library_items=None, tasks=None):
 def scan_gallery(base_dir=None, refs=None):
     """扫描 outputs/ 下全部历史媒体资产，按来源分组返回（画廊页数据源）。
 
-    分组：covers（封面池）、image-station（图像工坊出图）、以及每个项目目录一组
-    （frames/ 帧序列 + videos/ 分段视频 + 项目根的合成视频）。项目根下的插帧中间
-    产物目录（*_frames，成百上千张 jpg）不属于用户资产，不进画廊。
+    分组：image-station（图像工坊出图）、每个项目目录一组（frames/ 帧序列 +
+    videos/ 分段视频 + 项目根的合成视频与封面），以及 covers（历史全局封面池，
+    迁移干净后自然消失——新封面已经跟着项目走了）。项目根下的插帧中间产物目录
+    （*_frames，成百上千张 jpg）不属于用户资产，不进画廊。
 
     refs 传 gallery_collect_references() 的返回值时做引用标注：封面 item 加
     in_use（被点子库/任务引用），项目组加 orphan（无任何引用且超过活跃宽限期），
@@ -1397,11 +1438,12 @@ def scan_gallery(base_dir=None, refs=None):
     if not os.path.isdir(out_dir):
         return {'groups': [], 'totals': totals}
 
-    cover_items = collect_dir(os.path.join(out_dir, 'covers'), 'cover', only_type='image')
+    cover_items = collect_dir(os.path.join(out_dir, LEGACY_COVERS_DIRNAME),
+                              'cover', only_type='image')
     if refs is not None:
         for it in cover_items:
             it['in_use'] = it['path'] in refs['cover_paths']
-    add_group('covers', '封面图片', 'covers', cover_items)
+    add_group(LEGACY_COVERS_DIRNAME, '封面图片', 'covers', cover_items)
     add_group('image-station', '图像工坊', 'studio',
               collect_dir(os.path.join(out_dir, 'image-station'), 'studio', only_type='image'))
 
@@ -1416,7 +1458,15 @@ def scan_gallery(base_dir=None, refs=None):
         items += collect_dir(os.path.join(pdir, 'videos'), 'video', only_type='video')
         # 项目根：合成视频（含 _2x/_配音字幕 等成品）与零散图片
         items += collect_dir(pdir, 'merged', only_type='video')
-        items += collect_dir(pdir, 'other', only_type='image')
+        # 项目根的图片里，cover_* 是这个项目的封面——单独标出 kind='cover'，
+        # 画廊的「封面」筛选与「在用」角标才能照常认得它（前端按 item.kind 分类）
+        root_images = collect_dir(pdir, 'other', only_type='image')
+        for it in root_images:
+            if _is_cover_filename(it['name']):
+                it['kind'] = 'cover'
+                if refs is not None:
+                    it['in_use'] = it['path'] in refs['cover_paths']
+        items += root_images
         add_group(name, name, 'project', items)
         if refs is not None and items:
             g = groups[-1]
@@ -1523,7 +1573,12 @@ TASKS_LOADED_FROM_DISK = False
 
 # library.json 读写共用一把锁：Windows 上 os.replace 会因并发打开的读句柄抛
 # PermissionError，读路径也必须串行化，否则存在整库清零风险
-LIBRARY_LOCK = threading.Lock()
+#
+# 2026-07-31 改成 RLock：拆分存储把创意库拆成"索引 + 逐条正文"后，写入路径天然是
+# 嵌套的（写一条要先 _ensure_library_split 惰性迁移、再读索引、再落盘，每一层都想
+# 自己拿锁），普通 Lock 在同线程二次获取就是死锁。RLock 对**跨线程**的互斥性完全
+# 一致，只是允许同一线程重入——正是这里需要的。
+LIBRARY_LOCK = threading.RLock()
 
 # topic_ledger.json（创意台账管理库）读写锁，同一套整库清零教训 → 同一套防护
 LEDGER_LOCK = threading.Lock()
@@ -1684,24 +1739,307 @@ def library_shrink_verdict(existing, incoming, intent=None, label='创意库',
     }
 
 
-def parse_library_payload(data):
-    """/api/library 的请求体拆成 (ideas, intent)。
+def _read_library_file(path=None):
+    """直接读单文件形态的 library.json（调用方须已持有 LIBRARY_LOCK）。"""
+    path = path or DB_FILE
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        if sys.stdout:
+            print(f"[WARN] {path} 读取失败: {e}")
+        return None
+    return data if isinstance(data, list) else None
 
-    两种形态都收：
-      · 裸数组 —— 历史契约，无意图声明，任何缩量都会被 library_shrink_verdict 拦下；
-      · {'ideas': [...], 'intent': {...}} —— 带删除声明的写入（前端 saveLibrary 的
-        第二个参数）。
-    信封形态下 ideas 缺失或不是数组时返回 (None, intent)，由调用方回 400。
+
+def read_library(path=None):
+    """读取整个创意库（数组）。缺失返回 []；损坏返回 None（与 read_ledger 同一套约定）。
+
+    调用方**不能**把 None 静默降级成 []：读不出来时回空库，客户端拿到空库后的
+    任何一次写入都可能把它当成"库本来就是空的"——那正是 2026-07-12 整库清零事故
+    的触发路径。只读用途（如 build_projects_index）可以按"少一列信息"处理，
+    写路径必须让请求失败。
+
+    path 显式传入时读那个单文件（测试与迁移用）；不传则走当前生效的存储形态：
+    library/ 拆分库已建立就从拆分库重组，否则读老的 library.json。
     """
-    if isinstance(data, dict) and 'ideas' in data:
-        ideas = data.get('ideas')
-        intent = data.get('intent')
-        return (ideas if isinstance(ideas, list) else None,
-                intent if isinstance(intent, dict) else {})
-    return data, {}
+    if path is not None:
+        with LIBRARY_LOCK:
+            return _read_library_file(path)
+    with LIBRARY_LOCK:
+        if _library_store_ready():
+            return _read_library_split()
+        return _read_library_file(DB_FILE)
 
 
-LEDGER_STATUSES = {'candidate', 'used', 'published', 'discarded'}
+# ============================================================================
+# 点子库拆分存储（Library Split Store）
+# ----------------------------------------------------------------------------
+# 老形态是单个 library.json + "客户端始终持有完整数组、整份 POST 回来覆盖"的契约。
+# 代价：实测 2 条创意就 208KB（单条 164KB——prompt_block / prompt_slots / audit_md
+# / repair_md / frameRun 正文全塞在条目里），改一个字段要上传并重写全库；而"整表
+# 覆盖"这个动作本身引发过两次数据事故，逼出了三道防线（空库拒写、缩量闸门 409、
+# .bak 轮换），用户日常看到的就是"保存失败，请刷新页面后重试"。
+#
+# 新形态把一条创意拆成两半：
+#   library/index.json        —— 轻量索引数组，列表渲染/搜索/排序只需要它（几 KB）
+#   library/items/<id>.json   —— 正文，点开某条才读
+# 于是"改一条"就只写一个文件，不再有任何一次写入能碰到别的记录——那三道防线堵的
+# 洞在结构上消失了（它们仍保留在整表兼容层上，见 server.py 的 POST /api/library）。
+#
+# 迁移是惰性的：第一次访问时若只有 library.json，就地拆开并把原文件备份成
+# library.json.pre-split，此后拆分库为唯一真相源。
+# ============================================================================
+
+LIBRARY_DIR = _path_setting('SPARK_LIBRARY_DIR', 'libraryDir', 'library')
+
+# 索引里保留的字段：列表卡片要显示的 + 合流索引要用的。正文字段
+# （prompt_block / prompt_slots / audit_md / repair_md / frameRun / covers）
+# 一律不进索引——它们正是让单条膨胀到 164KB 的东西。
+LIBRARY_INDEX_FIELDS = (
+    'id', 'project_key', 'title', 'theme', 'english_title',
+    'social_title_cn', 'social_title_en', 'timestamp', 'creativity',
+    'image_count', 'video_count', 'activeCoverUrl', 'collage_url',
+    'status', 'tags', 'note', 'updated_at',
+)
+
+
+def _library_paths(library_dir=None):
+    root = library_dir or LIBRARY_DIR
+    return root, os.path.join(root, 'index.json'), os.path.join(root, 'items')
+
+
+def _library_item_path(item_id, library_dir=None):
+    """条目文件路径。id 直接进文件名，必须先消毒——历史 id 有 '1784...' 这种
+    时间戳，也有 importLibrary 生成的 '1784684845170.123' 带小数点的，还可能是
+    别处导入的任意字符串。越界字符一律折成下划线，空 id 拒绝。"""
+    _, _, items_dir = _library_paths(library_dir)
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', str(item_id or '')).strip('._-')
+    if not safe:
+        raise ValueError('创意条目缺少可用的 id')
+    return os.path.join(items_dir, f'{safe}.json')
+
+
+def library_index_entry(item):
+    """完整条目 → 索引条目。frameRun 的帧数折成一个计数，正文全部丢弃。"""
+    entry = {k: item.get(k) for k in LIBRARY_INDEX_FIELDS if k in item}
+    entry['id'] = item.get('id')
+    covers = item.get('covers')
+    entry['cover'] = (item.get('activeCoverUrl')
+                      or (covers[0] if isinstance(covers, list) and covers else None))
+    entry['cover_count'] = len(covers) if isinstance(covers, list) else 0
+    frame_run = item.get('frameRun')
+    frames = frame_run.get('frames') if isinstance(frame_run, dict) else None
+    entry['frame_count'] = len(frames) if isinstance(frames, list) else 0
+    return entry
+
+
+def _library_store_ready(library_dir=None):
+    _, index_path, _ = _library_paths(library_dir)
+    return os.path.exists(index_path)
+
+
+def _read_library_index(library_dir=None):
+    """索引数组。缺失返回 []，损坏返回 None（同 read_library 的约定）。"""
+    _, index_path, _ = _library_paths(library_dir)
+    if not os.path.exists(index_path):
+        return []
+    try:
+        with open(index_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        if sys.stdout:
+            print(f"[WARN] {index_path} 读取失败: {e}")
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _read_library_split(library_dir=None):
+    """拆分库 → 完整数组（整表兼容层用）。
+
+    索引在、正文文件丢了的条目**不跳过**：回退成"只有索引字段的残条"。跳过等于
+    在整表回写路径上凭空缩量一条，会被缩量闸门当成客户端状态错乱拦下来，用户看到
+    的是一句莫名其妙的 409；残条至少让那条创意还在库里、标题还看得见。
+    """
+    index = _read_library_index(library_dir)
+    if index is None:
+        return None
+    items = []
+    for entry in index:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            path = _library_item_path(entry.get('id'), library_dir)
+        except ValueError:
+            items.append(dict(entry))
+            continue
+        if not os.path.exists(path):
+            if sys.stdout:
+                print(f"[WARN] 创意正文缺失，按索引残条返回: {entry.get('id')}")
+            items.append(dict(entry))
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            if sys.stdout:
+                print(f"[WARN] {path} 读取失败，按索引残条返回: {e}")
+            items.append(dict(entry))
+            continue
+        items.append(data if isinstance(data, dict) else dict(entry))
+    return items
+
+
+def _write_library_index(index, library_dir=None):
+    root, index_path, _ = _library_paths(library_dir)
+    os.makedirs(root, exist_ok=True)
+    write_json_atomic(index_path, index)
+
+
+def read_library_index(library_dir=None):
+    """列表渲染用的轻量索引。拆分库还没建立时就地迁移一次。"""
+    with LIBRARY_LOCK:
+        _ensure_library_split(library_dir)
+        return _read_library_index(library_dir)
+
+
+def read_library_item(item_id, library_dir=None):
+    """单条正文。不存在返回 None。"""
+    with LIBRARY_LOCK:
+        _ensure_library_split(library_dir)
+        try:
+            path = _library_item_path(item_id, library_dir)
+        except ValueError:
+            return None
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            if sys.stdout:
+                print(f"[WARN] {path} 读取失败: {e}")
+            return None
+        return data if isinstance(data, dict) else None
+
+
+def write_library_item(item, library_dir=None):
+    """写入/覆盖单条创意，并同步索引。返回写进索引的那条轻量记录。
+
+    这是新契约的核心：一次保存只碰**一个**正文文件加索引，绝不重写别的记录，
+    因此不存在"整表覆盖"能引发的整库清零/未声明缩量，也就不需要在这条路径上
+    挂那三道防线。已存在的 id 视为更新（原地覆盖并保持它在索引里的位置）。
+    """
+    if not isinstance(item, dict):
+        raise ValueError('创意条目必须是对象')
+    with LIBRARY_LOCK:
+        _ensure_library_split(library_dir)
+        root, _, items_dir = _library_paths(library_dir)
+        path = _library_item_path(item.get('id'), library_dir)
+        os.makedirs(items_dir, exist_ok=True)
+
+        item = dict(item)
+        item['updated_at'] = time.time()
+        write_json_atomic(path, item)
+
+        index = _read_library_index(library_dir)
+        if index is None:
+            raise RuntimeError('创意库索引损坏，已停止写入（请从 library.json.pre-split 恢复）')
+        entry = library_index_entry(item)
+        ident = str(item.get('id'))
+        for i, row in enumerate(index):
+            if isinstance(row, dict) and str(row.get('id')) == ident:
+                index[i] = entry
+                break
+        else:
+            index.insert(0, entry)      # 与前端 savedIdeas.unshift 同序：新的在最前
+        _write_library_index(index, library_dir)
+        return entry
+
+
+def delete_library_item(item_id, library_dir=None):
+    """按 id 删除单条（正文文件 + 索引行）。返回是否真的删掉了东西。
+
+    按 id 删天然带着"确有意图"的证据，不吃缩量闸门——与创意台账的
+    delete_ledger_entries 同一个道理（见 write_ledger 的说明）。
+    """
+    with LIBRARY_LOCK:
+        _ensure_library_split(library_dir)
+        index = _read_library_index(library_dir)
+        if index is None:
+            raise RuntimeError('创意库索引损坏，已停止删除（请从 library.json.pre-split 恢复）')
+        ident = str(item_id)
+        remaining = [r for r in index if not (isinstance(r, dict) and str(r.get('id')) == ident)]
+        removed = len(remaining) != len(index)
+        if removed:
+            _write_library_index(remaining, library_dir)
+        try:
+            path = _library_item_path(item_id, library_dir)
+        except ValueError:
+            return removed
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                removed = True
+            except OSError as e:
+                if sys.stdout:
+                    print(f"[WARN] 删除创意正文 {path} 失败: {e}")
+        return removed
+
+
+def _ensure_library_split(library_dir=None, db_file=None):
+    """惰性迁移：只有 library.json、还没有 library/index.json 时就地拆开。
+    调用方须已持有 LIBRARY_LOCK。返回迁移报告，未发生迁移时返回 None。"""
+    if _library_store_ready(library_dir):
+        return None
+    db_file = db_file or DB_FILE
+    root, _, items_dir = _library_paths(library_dir)
+    legacy = _read_library_file(db_file)
+    if legacy is None:
+        # 老库损坏：绝不能"当成空库"建一个空的拆分库——那会把损坏固化成清零
+        raise RuntimeError(f'{db_file} 读取失败，已停止迁移到拆分库（请人工修复或从 .bak 恢复）')
+
+    os.makedirs(items_dir, exist_ok=True)
+    index = []
+    migrated = 0
+    for item in legacy:
+        if not isinstance(item, dict):
+            continue
+        if item.get('id') is None or item.get('id') == '':
+            # 历史遗留的无 id 记录：补一个稳定 id，否则没法落成文件
+            item = dict(item)
+            item['id'] = f"legacy-{hashlib.md5(json.dumps(item, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()[:12]}"
+        write_json_atomic(_library_item_path(item.get('id'), library_dir), item)
+        index.append(library_index_entry(item))
+        migrated += 1
+    _write_library_index(index, library_dir)
+
+    # 备份原文件而不是删除：出问题时这是唯一一份完整的老数据
+    backup = None
+    if os.path.exists(db_file):
+        backup = db_file + '.pre-split'
+        try:
+            shutil.copyfile(db_file, backup)
+        except Exception as e:
+            if sys.stdout:
+                print(f"[LIBRARY] 备份 {backup} 失败（迁移继续）: {e}")
+            backup = None
+    if sys.stdout:
+        print(f"[LIBRARY] 已迁移 {migrated} 条创意到拆分库 {root}/（原文件备份：{backup}）")
+    return {'migrated': migrated, 'backup': backup, 'dir': root}
+
+
+def migrate_library_to_split(library_dir=None, db_file=None, force=False):
+    """显式迁移入口（tools/migrate_library.py 用）。force=True 时即使拆分库
+    已存在也重新从 library.json 拆一遍——只有确知拆分库有问题时才该这么做。"""
+    with LIBRARY_LOCK:
+        if force:
+            _, index_path, _ = _library_paths(library_dir)
+            if os.path.exists(index_path):
+                os.remove(index_path)
+        return _ensure_library_split(library_dir, db_file)
 
 
 def read_ledger(path=None):
@@ -1859,6 +2197,13 @@ def register_ledger_candidates(ideas, path=None, source='Ideation Pool'):
                 'user_score': None,
                 'performance_note': '',
             }
+            # 这条选题激发出来的项目主键。台账行以前只有 DNA 与一句话选题，
+            # 要回到它合成出来的项目只能靠标题模糊匹配（app.js openSparkProject
+            # 那一串 sparkNormKey 比对）。/api/compose 登记候选时把 project_key
+            # 一并带上，此后台账 ↔ 项目就是一条硬链接。
+            project_key = str(idea.get('project_key') or '').strip()
+            if project_key:
+                entry['project_key'] = project_key
             # 新入账创意保留二创所需的原始要素；旧台账没有该字段时，前端仍可用
             # one_line + topic_dna 作为精简母题。只收白名单并限制长度，避免把整份
             # 客户端 dimensions 或异常大 payload 永久塞进台账。
@@ -2139,66 +2484,274 @@ def write_manifest(project_dir, data):
             # 下一次写入（每帧后都会写）会自然补上
             pass
 
-def save_tasks_to_disk():
-    # Save individual tasks to tasks/ folder
-    os.makedirs("tasks", exist_ok=True)
-    with ACTIVE_TASKS_LOCK:
-        active_ids = set(ACTIVE_TASKS.keys())
-        for tid, t in ACTIVE_TASKS.items():
-            task_data = {
-                "id": t["id"],
-                "status": t["status"],
-                "events": t["events"],
-                "dimensions": t["dimensions"],
-                "result": t.get("result"),
-                "error": t.get("error"),
-                "last_active": t["last_active"]
-            }
-            try:
-                # 原子替换：任务文件写一半崩溃会留下半截 JSON，重启加载时整个任务丢失
-                write_json_atomic(os.path.join("tasks", f"{tid}.json"), task_data)
-            except Exception as e:
-                if sys.stdout:
-                    print(f"Error saving task {tid} to disk: {e}")
+# ============================================================================
+# 任务持久层（Task Store）
+# ----------------------------------------------------------------------------
+# 老形态：单个 tasks/<id>.json 装下 meta + events + result 全部内容，而
+# save_tasks_to_disk() 每次调用都把**内存里所有任务整份重写一遍**，再扫一遍目录
+# 删孤儿。实测单个任务文件 523 KB（events 375 KB + result 132 KB），server.py 里
+# 有 15 处调用（建任务、每个终态落点、结果回填…），于是同时挂着 3 个任务时，
+# 一次状态变更 ≈ 1.5 MB 的同步磁盘写。
+#
+# 更要命的是"整目录重写 + 孤儿清理"这个动作本身：它引发过两次真实事故（tasks/
+# 被整目录清空；一个只建了 1 条内存任务的测试把 5 个真实任务记录删光），逼出了
+# 两段防呆补丁。
+#
+# 新形态把一条任务拆成三份，并且**只写这一条**：
+#   tasks/<id>.json          —— meta（id/status/dimensions/error/last_active）
+#   tasks/events/<id>.jsonl  —— 事件流，追加写（运行中只 append 新增的那几条）
+#   tasks/results/<id>.json  —— 结果全文，只在有结果时写
+# 删除是显式的 delete_task_files()，不再靠"谁不在内存里就删谁"的目录扫描。
+#
+# 迁移是惰性的：load_tasks_from_disk 读到老格式（meta 里内联着 events/result）
+# 就照读，并就地重写成新格式。
+# ============================================================================
 
-        # 清理必须留在同一把锁内：旧写法在锁外用过期快照删文件，
-        # 期间其他线程新建的任务文件会被当成孤儿误删
-        # 2026-07-12 防呆：内存任务表为空时一律跳过清理——空内存 + 磁盘有任务文件
-        # 意味着本实例没有(或还没)加载历史任务（启动竞态/加载失败/幽灵实例），此时
-        # “孤儿清理”会把全部任务历史当垃圾删光（实际发生过一次，tasks/ 被整目录清空）。
-        if not active_ids:
-            return
-        # 2026-07-31 防呆二段：非空内存表同样不足以授权删除。只要本进程没有成功跑完
-        # 一次 load_tasks_from_disk，内存里那几条就不是"全部任务"，而是某个调用方刚
-        # 塞进来的子集——此时做孤儿清理，等于拿一条新任务把整部历史判成垃圾。
-        # （实际发生过：一个直接打 /api/compose 处理函数的测试建了 1 条内存任务，
-        # 落盘时把 tasks/ 里 5 个真实任务记录全删了。）
-        if not TASKS_LOADED_FROM_DISK:
-            return
+# 与 DB_FILE / LEDGER_FILE / LIBRARY_DIR 同一套可覆盖机制。留这个口子的理由和那几个
+# 一样，而且是被真事故教出来的：想起第二个服务实例做验证时，光靠切工作目录隔离不掉
+# ——run() 第一行就 os.chdir 到仓库目录，于是那个"隔离"实例直接操作了真实的 tasks/，
+# 把 4 个正在跑的任务记录当孤儿删了（见 prune_orphan_task_files 的第三段防呆）。
+TASKS_DIR = _path_setting('SPARK_TASKS_DIR', 'tasksDir', 'tasks')
+_TASK_TERMINAL_STATUSES = ('completed', 'failed', 'cancelled')
+
+# tid -> 已经落盘的事件条数。运行中每次保存只把新增的那几条 append 到 .jsonl，
+# 不重新序列化整条事件流（compose 的 text_chunk 能堆到 375 KB）。
+_TASK_FLUSHED_EVENTS = {}
+# 文件写入串行化。不用 ACTIVE_TASKS_LOCK 是为了不在持锁期间做磁盘 I/O——
+# 那会让所有 worker 线程卡在事件广播上。
+_TASK_IO_LOCK = threading.RLock()
+
+
+def _task_file_id(task_id):
+    """task_id → 安全文件名。
+
+    task_id 是客户端传上来的（/api/compose 等接口的请求体里就有），直接拼进路径
+    等于把路径穿越开给外部输入。真实 id 的形态是时间戳与 frames_/videos_/cover_/
+    seqreview_ + hex，全在白名单内，所以这层消毒对现有文件是恒等的，不会把已有
+    任务文件孤立掉。
+    """
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', str(task_id or '')).strip('._-')
+    if not safe:
+        raise ValueError('任务缺少可用的 id')
+    return safe
+
+
+def _task_paths(task_id, tasks_dir=None):
+    root = tasks_dir or TASKS_DIR
+    fid = _task_file_id(task_id)
+    return (os.path.join(root, f'{fid}.json'),
+            os.path.join(root, 'events', f'{fid}.jsonl'),
+            os.path.join(root, 'results', f'{fid}.json'))
+
+
+def _write_task_events(events_path, events, start_index):
+    """把 events[start_index:] 追加到 .jsonl；start_index=0 表示整份重写。"""
+    os.makedirs(os.path.dirname(events_path), exist_ok=True)
+    mode = 'w' if start_index == 0 else 'a'
+    with open(events_path, mode, encoding='utf-8') as f:
+        for evt in events[start_index:]:
+            # 事件是 (type, payload) 元组；JSON 里存成两元数组，读回来再转元组
+            f.write(json.dumps(list(evt) if isinstance(evt, (list, tuple)) else [evt, None],
+                               ensure_ascii=False, default=str) + '\n')
+
+
+def save_task_to_disk(task_id, tasks_dir=None):
+    """落盘**单个**任务。返回是否真的写了东西。
+
+    这是替代 save_tasks_to_disk() 的日常写入路径：一次只碰一个任务的文件，
+    绝不触及其他任务，也绝不删除任何东西。
+    """
+    with ACTIVE_TASKS_LOCK:
+        t = ACTIVE_TASKS.get(task_id)
+        if t is None:
+            return False
+        # 在锁内取快照，锁外做 I/O
+        meta = {
+            'id': t['id'],
+            'status': t['status'],
+            'dimensions': t['dimensions'],
+            'error': t.get('error'),
+            'last_active': t['last_active'],
+            'format': 2,
+        }
+        events = list(t['events'])
+        result = t.get('result')
+
+    try:
+        meta_path, events_path, result_path = _task_paths(task_id, tasks_dir)
+    except ValueError as e:
+        if sys.stdout:
+            print(f"Error saving task to disk: {e}")
+        return False
+
+    with _TASK_IO_LOCK:
         try:
-            for filename in os.listdir("tasks"):
-                if filename.endswith(".json"):
-                    tid = filename[:-5]
-                    if tid not in active_ids:
-                        try:
-                            os.remove(os.path.join("tasks", filename))
-                        except OSError:
-                            pass
+            os.makedirs(os.path.dirname(meta_path) or '.', exist_ok=True)
+            # 原子替换：写一半崩溃会留下半截 JSON，重启加载时整个任务丢失
+            write_json_atomic(meta_path, meta)
+
+            flushed = _TASK_FLUSHED_EVENTS.get(task_id, 0)
+            # 整份重写的两种情形：
+            #   · 事件流变短了 —— prepare_task_for_run 重跑时清空，或终态化时
+            #     滤掉 text_chunk，此时磁盘上那份已经对不上了；
+            #   · 终态 —— 只发生一次，且此时 text_chunk 多半已被滤掉，代价很小，
+            #     换来"落盘内容与内存严格一致"。
+            full_rewrite = len(events) < flushed or meta['status'] in _TASK_TERMINAL_STATUSES
+            if full_rewrite:
+                _write_task_events(events_path, events, 0)
+            elif len(events) > flushed:
+                _write_task_events(events_path, events, flushed)
+            _TASK_FLUSHED_EVENTS[task_id] = len(events)
+
+            if result is not None:
+                os.makedirs(os.path.dirname(result_path), exist_ok=True)
+                write_json_atomic(result_path, result)
+        except Exception as e:
+            if sys.stdout:
+                print(f"Error saving task {task_id} to disk: {e}")
+            return False
+    return True
+
+
+def delete_task_files(task_id, tasks_dir=None):
+    """显式删除一个任务的三份文件。
+
+    老实现没有这个函数——删除任务是"把它从 ACTIVE_TASKS 里摘掉，然后靠
+    save_tasks_to_disk 的孤儿扫描顺手把文件删了"。那个隐式耦合正是两次
+    误删事故的机制本身。
+    """
+    try:
+        paths = _task_paths(task_id, tasks_dir)
+    except ValueError:
+        return False
+    removed = False
+    with _TASK_IO_LOCK:
+        for path in paths:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                    removed = True
+                except OSError as e:
+                    if sys.stdout:
+                        print(f"Error deleting task file {path}: {e}")
+        _TASK_FLUSHED_EVENTS.pop(task_id, None)
+    return removed
+
+
+def save_tasks_to_disk(tasks_dir=None):
+    """把内存里所有任务刷一遍盘。
+
+    保留它是为了退出前 flush、迁移、以及少数确实要全量落盘的场合。**日常写入
+    请用 save_task_to_disk(tid)**——这个函数是 O(任务数 × 文件大小)。
+
+    与老版本的关键差异：不再做孤儿清理。删文件现在是 delete_task_files() 的
+    显式动作，目录扫描式删除请用 prune_orphan_task_files()。
+    """
+    with ACTIVE_TASKS_LOCK:
+        ids = list(ACTIVE_TASKS.keys())
+    for tid in ids:
+        save_task_to_disk(tid, tasks_dir)
+
+
+# 孤儿任务文件的"新鲜度"宽限期。刚写下来的任务文件一律不动，理由见
+# prune_orphan_task_files 的第三段防呆。与画廊的 GALLERY_ORPHAN_GRACE_SECONDS 同值、
+# 同理由（"正在生成中的项目，引用关系可能还没落到 library/tasks 里"）。
+TASK_ORPHAN_GRACE_SECONDS = 24 * 3600
+
+
+def prune_orphan_task_files(tasks_dir=None, grace_seconds=None):
+    """删除内存里已经没有对应记录的任务文件。只该在启动加载完成后跑一次。
+
+    这个函数是整个持久层里唯一还会做"目录扫描式删除"的地方，也是历史上出事最多的
+    地方，所以三段防呆缺一不可：
+
+      1) 内存任务表为空时一律跳过：空内存 + 磁盘有任务文件意味着本实例没有（或
+         还没）加载历史任务（启动竞态/加载失败/幽灵实例），此时"孤儿清理"会把
+         全部任务历史当垃圾删光（实际发生过，tasks/ 被整目录清空）。
+      2) 本进程没成功跑完一次 load_tasks_from_disk 时同样跳过：内存里那几条不是
+         "全部任务"，而是某个调用方刚塞进来的子集（实际发生过：一个直接打
+         /api/compose 处理函数的测试建了 1 条内存任务，落盘时把 5 个真实任务删了）。
+      3) 2026-07-31 新增——**只删够旧的文件**。前两段防呆都假设"本进程的内存 =
+         磁盘应有的全部"，但只要有第二个写者，这个前提就不成立：另一个服务实例
+         （或本次启动加载之后、prune 之前刚落盘的新任务）写下的文件，在本进程眼里
+         就是凭空冒出来的孤儿。实际发生过：一个指向同一 tasks/ 的第二实例启动，
+         把 4 个正在跑的真实任务记录当孤儿删了（内存里还在，一重启就没了）。
+         宽限期让"刚写下来的"永远安全，代价只是过期文件晚一天被清掉。
+
+    返回真正删掉的任务条数。
+    """
+    root = tasks_dir or TASKS_DIR
+    grace = TASK_ORPHAN_GRACE_SECONDS if grace_seconds is None else grace_seconds
+    with ACTIVE_TASKS_LOCK:
+        active_ids = {_task_file_id(tid) for tid in ACTIVE_TASKS}
+    if not active_ids or not TASKS_LOADED_FROM_DISK:
+        return 0
+    now = time.time()
+    removed = 0
+    with _TASK_IO_LOCK:
+        try:
+            for filename in os.listdir(root):
+                if not filename.endswith('.json'):
+                    continue
+                if filename[:-5] in active_ids:
+                    continue
+                meta_path = os.path.join(root, filename)
+                try:
+                    if now - os.path.getmtime(meta_path) < grace:
+                        continue      # 太新，可能是别的写者刚落的盘
+                except OSError:
+                    continue
+                for path in (meta_path,
+                             os.path.join(root, 'events', filename[:-5] + '.jsonl'),
+                             os.path.join(root, 'results', filename)):
+                    try:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    except OSError:
+                        pass
+                removed += 1
+                if sys.stdout:
+                    print(f"[TASKS] 清理孤儿任务文件: {filename[:-5]}")
         except Exception as e:
             if sys.stdout:
                 print(f"Error cleaning up task files: {e}")
+    return removed
 
 
-def load_tasks_from_disk():
+def _read_task_events(events_path):
+    """读回 .jsonl 事件流。半截行（写到一半崩溃）跳过而不是让整个任务加载失败——
+    事件流是诊断数据，丢最后一行远好过丢掉整条任务记录。"""
+    if not os.path.exists(events_path):
+        return []
+    events = []
+    try:
+        with open(events_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except ValueError:
+                    continue
+                events.append(tuple(evt) if isinstance(evt, list) else evt)
+    except Exception as e:
+        if sys.stdout:
+            print(f"[WARN] 任务事件流 {events_path} 读取失败（按空事件流继续）: {e}")
+    return events
+
+
+def load_tasks_from_disk(tasks_dir=None):
     global ACTIVE_TASKS
+    root = tasks_dir or TASKS_DIR
     # Backward compatibility: migrate monolithic tasks.json if present
-    if os.path.exists("tasks.json") and not os.path.exists("tasks"):
+    if os.path.exists("tasks.json") and not os.path.exists(root):
         try:
             with open("tasks.json", "r", encoding="utf-8") as f:
                 data = json.load(f)
-            os.makedirs("tasks", exist_ok=True)
+            os.makedirs(root, exist_ok=True)
             for tid, t in data.items():
-                filepath = os.path.join("tasks", f"{tid}.json")
+                filepath = os.path.join(root, f"{tid}.json")
                 with open(filepath, "w", encoding="utf-8") as f:
                     json.dump(t, f, ensure_ascii=False, indent=2)
             os.remove("tasks.json")
@@ -2206,29 +2759,54 @@ def load_tasks_from_disk():
             if sys.stdout:
                 print(f"Error migrating tasks.json to tasks/ folder: {e}")
 
-    if not os.path.exists("tasks"):
+    if not os.path.exists(root):
         return
 
+    legacy_ids = []
     try:
         with ACTIVE_TASKS_LOCK:
-            for filename in os.listdir("tasks"):
+            for filename in os.listdir(root):
                 if filename.endswith(".json"):
                     tid = filename[:-5]
-                    filepath = os.path.join("tasks", filename)
+                    filepath = os.path.join(root, filename)
                     try:
                         with open(filepath, "r", encoding="utf-8") as f:
                             t = json.load(f)
-                        
+
+                        # format 2 = 拆分形态：events 在 .jsonl、result 在 results/。
+                        # 老文件把两者内联在 meta 里，这里照读，读完记下来重写成新格式。
+                        _, events_path, result_path = _task_paths(tid, root)
+                        is_legacy = 'events' in t or 'result' in t
+                        if is_legacy:
+                            legacy_ids.append(tid)
+                            events = t.get("events", [])
+                            result = t.get("result")
+                        else:
+                            events = _read_task_events(events_path)
+                            result = None
+                            if os.path.exists(result_path):
+                                try:
+                                    with open(result_path, "r", encoding="utf-8") as f:
+                                        result = json.load(f)
+                                except Exception as e:
+                                    if sys.stdout:
+                                        print(f"[WARN] 任务结果 {result_path} 读取失败: {e}")
+
+                        # 磁盘上现有的事件条数（老格式一律记 0：它们的事件还内联在
+                        # meta 里，.jsonl 根本不存在，下一次保存必须整份重写）
+                        on_disk_events = 0 if is_legacy else len(events)
+
                         status = t["status"]
                         error = t.get("error")
-                        events = t.get("events", [])
                         if status == "running":
                             status = "failed"
                             error = "服务已重启，生成中断。"
                             # Append error event if not already present
                             if not any(isinstance(evt, (list, tuple)) and len(evt) > 0 and evt[0] == 'error' for evt in events):
                                 events.append(['error', {'message': error}])
-                        
+                                # 这条是刚补的，磁盘上没有——保持 on_disk_events 不变，
+                                # 下次保存会把它 append 上去
+
                         ACTIVE_TASKS[tid] = {
                             "id": t["id"],
                             "status": status,
@@ -2236,10 +2814,11 @@ def load_tasks_from_disk():
                             "listeners": set(),
                             "cancel_event": threading.Event(),
                             "dimensions": t["dimensions"],
-                            "result": t.get("result"),
+                            "result": result,
                             "error": error,
                             "last_active": t["last_active"]
                         }
+                        _TASK_FLUSHED_EVENTS[tid] = on_disk_events
                     except Exception as e:
                         if sys.stdout:
                             print(f"Error loading task file {filename}: {e}")
@@ -2248,9 +2827,45 @@ def load_tasks_from_disk():
     except Exception as e:
         if sys.stdout:
             print(f"Error reading tasks directory: {e}")
+        return
+
+    # 惰性迁移：把老格式的任务就地重写成拆分形态。放在加载完成之后做，这样即使
+    # 中途出错，内存里也已经是一份完整的任务表（TASKS_LOADED_FROM_DISK 已置位）。
+    if legacy_ids:
+        for tid in legacy_ids:
+            _TASK_FLUSHED_EVENTS[tid] = 0      # 强制整份重写事件流
+            save_task_to_disk(tid, root)
+        if sys.stdout:
+            print(f"[TASKS] 已把 {len(legacy_ids)} 个任务记录迁移到拆分形态"
+                  f"（meta / events.jsonl / results）")
+
+
+def ensure_task_project_key(task_id, dimensions):
+    """在 dimensions 里就位 project_key，并返回它。
+
+    project_key 是「同一条创意」在 任务 / 点子库 / 台账 / 画廊 四处的硬主键
+    （见 build_projects_index）。它以前要等到**结果阶段**才生成，于是运行中的任务
+    没有主键可用，四个界面只能靠标题模糊匹配互相反查。这里把它提前到任务创建那一刻。
+
+    标题取 task_label（灵感卡片的选题名）优先、theme 兜底。刻意**不用**结果里那个
+    LLM 生成的 title：那要等合成跑完才有，而且自治管线（auto_run_worker）本来就是
+    用 task_label 建键的——两条路径此前建出的键不一样，现在统一。
+    """
+    if not isinstance(dimensions, dict):
+        return None
+    existing = dimensions.get('project_key')
+    if existing:
+        return existing
+    label = dimensions.get('task_label') or dimensions.get('theme')
+    if not label:
+        return None
+    key = make_idea_project_key(task_id, label)
+    dimensions['project_key'] = key
+    return key
 
 
 def get_or_create_task(task_id, dimensions=None):
+    ensure_task_project_key(task_id, dimensions)
     save_on_create = False
     with ACTIVE_TASKS_LOCK:
         if task_id not in ACTIVE_TASKS:
@@ -2271,7 +2886,7 @@ def get_or_create_task(task_id, dimensions=None):
                 ACTIVE_TASKS[task_id]["dimensions"] = dimensions
                 save_on_create = True
     if save_on_create:
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
     return ACTIVE_TASKS[task_id]
 
 
@@ -2288,6 +2903,7 @@ def prepare_task_for_run(task_id, dimensions=None):
     - 记录存在且终态 → 清空 events/result/error、换新 cancel_event 后复用；
       listeners 保留，仍挂着的旁观流会直接收到新一轮运行的事件
     """
+    ensure_task_project_key(task_id, dimensions)
     with ACTIVE_TASKS_LOCK:
         t = ACTIVE_TASKS.get(task_id)
         if t is not None and t["status"] == "running":
@@ -2314,7 +2930,9 @@ def prepare_task_for_run(task_id, dimensions=None):
             t["last_active"] = time.time()
             if dimensions is not None:
                 t["dimensions"] = dimensions
-    save_tasks_to_disk()
+    # 重跑会把 events 清空，落盘的 .jsonl 必须跟着整份重写而不是继续追加
+    _TASK_FLUSHED_EVENTS[task_id] = 0
+    save_task_to_disk(task_id)
     return t, False
 
 
@@ -2472,16 +3090,450 @@ def notify_listeners(task_id, event_type, data):
 
 
 def cleanup_old_tasks():
+    """删除 7 天前的终态任务。
+
+    老实现是"从内存里摘掉 → 调 save_tasks_to_disk() 靠孤儿扫描顺手删文件"。
+    现在显式删这几条自己的文件，不再让一次清理动作有能力扫掉整个目录。
+    """
     now = time.time()
     to_delete = []
     with ACTIVE_TASKS_LOCK:
         for tid, t in ACTIVE_TASKS.items():
-            if t["status"] in ("completed", "failed", "cancelled") and now - t["last_active"] > 604800:
+            if t["status"] in _TASK_TERMINAL_STATUSES and now - t["last_active"] > 604800:
                 to_delete.append(tid)
         for tid in to_delete:
             del ACTIVE_TASKS[tid]
-    if to_delete:
-        save_tasks_to_disk()
+    for tid in to_delete:
+        delete_task_files(tid)
+
+
+# ============================================================================
+# 项目工作台（Project Workbench）合流索引
+# ----------------------------------------------------------------------------
+# 任务列表 / 点子库 / 创意台账 / 画廊 描述的其实是同一条创意的四个生命周期切面
+# （选题 → 激发任务 → 结果收藏 → 成片资产），但历史上它们之间没有共同主键，只能
+# 靠标题模糊匹配互相反查——gallery_collect_references 那句"判定刻意从宽…宁可漏标
+# 孤儿"就是被这个逼出来的，前端还另有 findSavedIdeaForSpark/findCompletedTaskForSpark
+# 两套猜法。这里把四路数据按 project_key 合成一张项目表，/api/projects 直接回它，
+# 前端不必再并发拉三个源自己 join。
+#
+# project_key 的来源优先级（make_idea_project_key 生成的 run_<task_id>__<title>）：
+#   1) 激发任务的 result.project_key / dimensions.project_key —— 唯一权威来源；
+#   2) 点子库条目的 project_key；
+#   3) 两者都没有（历史数据确实存在，实测 2 条点子库记录里就有 1 条没有）时，
+#      按 make_idea_project_key(id, title) 用同一个公式重建。
+# 之外再挂两组别名兜底：
+#   · task:<task_id> —— 点子库条目 id 与激发任务 id 同源（实测一致）；
+#   · title:<归一化标题> —— 帧/视频/封面这些媒体子作业的 dimensions 里只有 theme，
+#     既没有 id 也没有 project_key，只能靠标题挂回母项目。
+# ============================================================================
+
+# 帧序列/分步渲染/视频/封面：它们不是独立项目，而是某个激发项目下的子作业。
+# 与 app.js 的 MEDIA_TASK_TYPES 同口径（那边用它把媒体任务整类挡在任务列表外，
+# 结果是失败的媒体任务完全不可见；这里改成挂成子作业，失败照样看得到）。
+MEDIA_TASK_TYPES = frozenset({'frames', 'staged_render', 'videos', 'cover'})
+
+_PROJECT_TITLE_PREFIXES = ('做一个', '做个', '设计一个', '设计个')
+
+
+def _proj_norm(value):
+    """标题/主题的归一化匹配键。与 app.js 的 sparkNormKey 同口径。"""
+    return re.sub(r'\s+', ' ', str(value or '')).strip().casefold()
+
+
+def _proj_title_variants(*values):
+    """一条记录可用来撞标题的全部写法。
+
+    "做一个X" 与 "X" 必须撞得上：合成任务的 dimensions.theme 是用户输入的整句
+    （带"做一个"前缀），而它派生出的帧/视频子作业 dimensions.theme 却是去掉前缀的
+    成品标题（实测数据如此）。不脱前缀的话子作业永远挂不回母项目。
+    """
+    out = []
+    for value in values:
+        key = _proj_norm(value)
+        if not key:
+            continue
+        out.append(key)
+        for prefix in _PROJECT_TITLE_PREFIXES:
+            if key.startswith(prefix) and len(key) > len(prefix):
+                out.append(key[len(prefix):])
+    return list(dict.fromkeys(out))
+
+
+def _proj_epoch(timestamp):
+    """点子库的 'YYYY-MM-DD HH:MM:SS' 字符串 → epoch 秒；解析不了返回 0。"""
+    text = str(timestamp or '').strip()
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+        try:
+            return time.mktime(time.strptime(text, fmt))
+        except (ValueError, OverflowError):
+            continue
+    return 0.0
+
+
+_PROJ_ASSET_STATS_CACHE = {}  # pdir -> (cached_mtimes, cached_stats, cached_time)
+
+def _proj_asset_stats(project_key, title, base_dir):
+    """项目目录下的资产统计（文件数 / 字节数 / 最近产出时间 / 封面）。
+
+    目录名不是 project_key 原文——_safe_project_name 会把 '__' 折成 '_'
+    （outputs/ 下实际是 run_<id>_<title>）；更老的项目还可能是另外两套历史命名。
+    顺着 project_key 撞不上时回落到 _get_project_dir(title)，它本来就负责认全三套。
+    收集范围与 scan_gallery 的项目组一致：frames/ + videos/ + 项目根。
+    """
+    rel_candidates = []
+    if project_key:
+        rel_candidates.append(os.path.join(OUTPUT_ROOT, _safe_project_name(project_key)))
+    if title:
+        rel_candidates.append(_get_project_dir(title))
+
+    for rel in rel_candidates:
+        pdir = rel if os.path.isabs(rel) else os.path.join(base_dir, rel)
+        if not os.path.isdir(pdir):
+            continue
+
+        # 获取目录以及子目录（frames, videos）的最近修改时间，以判断是否需要重新扫描
+        mtimes = {}
+        for sub in ('', 'frames', 'videos'):
+            dpath = os.path.join(pdir, sub) if sub else pdir
+            if os.path.isdir(dpath):
+                try:
+                    mtimes[sub] = os.path.getmtime(dpath)
+                except OSError:
+                    mtimes[sub] = 0.0
+
+        now = time.time()
+        cached = _PROJ_ASSET_STATS_CACHE.get(pdir)
+        if cached:
+            cached_mtimes, cached_stats, cached_time = cached
+            # 如果目录修改时间完全没变，或者缓存距离现在不超过 3 秒（防短时间频繁重入），直接返回缓存
+            if cached_mtimes == mtimes or now - cached_time < 3.0:
+                return cached_stats
+
+        file_count = 0
+        total_bytes = 0
+        latest = 0
+        cover_rel = None
+        cover_mtime = -1
+        for sub in ('frames', 'videos', ''):
+            dpath = os.path.join(pdir, sub) if sub else pdir
+            if not os.path.isdir(dpath):
+                continue
+            try:
+                names = os.listdir(dpath)
+            except OSError:
+                continue
+            for fname in names:
+                fpath = os.path.join(dpath, fname)
+                if _gallery_media_type(fname) is None or not os.path.isfile(fpath):
+                    continue
+                try:
+                    st = os.stat(fpath)
+                except OSError:
+                    continue
+                file_count += 1
+                total_bytes += st.st_size
+                latest = max(latest, int(st.st_mtime))
+                # 封面就在项目根里（cover_*），顺手挑出最新的一张——项目行的缩略图
+                # 因此不再只能靠"已收藏"的点子库条目供图，没收藏的项目也有封面看
+                if not sub and _is_cover_filename(fname) and st.st_mtime > cover_mtime:
+                    cover_mtime = st.st_mtime
+                    cover_rel = '/' + os.path.relpath(fpath, base_dir).replace('\\', '/')
+
+        stats = {
+            'dir': os.path.relpath(pdir, base_dir).replace('\\', '/'),
+            'file_count': file_count,
+            'bytes': total_bytes,
+            'latest_mtime': latest,
+            'cover': cover_rel,
+        }
+        _PROJ_ASSET_STATS_CACHE[pdir] = (mtimes, stats, now)
+        return stats
+
+    return {'dir': None, 'file_count': 0, 'bytes': 0, 'latest_mtime': 0, 'cover': None}
+
+
+def _proj_blank(project_key, kind='project'):
+    return {
+        'project_key': project_key,
+        'kind': kind,              # project | job（挂不回母项目的孤立媒体作业）
+        'title': '',
+        'theme': '',
+        'cover': None,
+        'state': 'unknown',
+        'saved': False,
+        'has_failed_jobs': False,
+        'image_count': None,
+        'video_count': None,
+        'timestamp': '',
+        'updated_at': 0.0,
+        'task': None,
+        'library': None,
+        'ledger': None,
+        'sub_jobs': [],
+        'assets': None,
+    }
+
+
+def _proj_task_view(task):
+    """任务在项目行上的投影：只留列表要用的字段，绝不带 events/result 全文——
+    /api/tasks 已经因为整包回传结果被 2.5s 轮询反复下载而做过一次瘦身
+    （见 server.py 那段注释），这里从一开始就别把它放进来。"""
+    dims = task.get('dimensions') if isinstance(task.get('dimensions'), dict) else {}
+    result = task.get('result') if isinstance(task.get('result'), dict) else {}
+    timeline = task_stage_timeline(task.get('id'))
+    return {
+        'id': task.get('id'),
+        'status': task.get('status'),
+        'error': task.get('error'),
+        'last_active': task.get('last_active') or 0,
+        'stage': (timeline[-1].get('stage') if timeline else None),
+        'model': result.get('model'),
+        # 重试/再跑一遍/跟进都要把原样的 dimensions 交回去（retryTask /
+        # rerunCompletedTask / viewTask 的既有签名），所以这一份必须原样带上。
+        # 它是纯参数（实测 ~800 字节），不是 events/result 那种大块正文。
+        'dimensions': dims,
+        'beats_count': dims.get('beats_count'),
+        'beat_count_mode': dims.get('beat_count_mode'),
+        'duration_seconds': ((result.get('timings') or {}).get('total_duration_seconds')
+                             if isinstance(result.get('timings'), dict) else None),
+        'token_usage': result.get('token_usage'),
+    }
+
+
+def _proj_state(entry):
+    """项目行的主状态（工作台顶部 chips 的分桶依据）。
+
+    运行中 > 失败/取消 > 已收藏 > 已完成。收藏排在失败之后是因为：compose 失败时
+    根本没有结果可收藏，两者几乎不会同时成立；真同时成立时"失败"更需要被看见。
+    媒体子作业的失败不改主状态（母项目本身是好的），只置 has_failed_jobs 让 UI 打旗。
+
+    孤立媒体作业行（kind='job'，母项目的任务记录已被 7 天清理规则删掉）没有 task，
+    主状态取它自己那批作业里最重的一档——否则它们会全部落进 'unknown'，
+    连"失败"筛选都捞不出来，等于白挂了一行。
+    """
+    task = entry.get('task') or {}
+    status = task.get('status')
+    if status == 'running' or any(j.get('status') == 'running' for j in entry['sub_jobs']):
+        return 'running'
+    if status in ('failed', 'cancelled'):
+        return status
+    if entry['saved']:
+        return 'saved'
+    if status == 'completed':
+        return 'completed'
+    if not task and entry['sub_jobs']:
+        job_states = {j.get('status') for j in entry['sub_jobs']}
+        for candidate in ('failed', 'cancelled', 'completed'):
+            if candidate in job_states:
+                return candidate
+    return status or 'unknown'
+
+
+def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
+                         base_dir=None, with_assets=True):
+    """把 任务 / 点子库 / 台账 / outputs 四路数据合流成一张项目表。
+
+    参数传 None 时从真实数据源读取（ACTIVE_TASKS / library.json / topic_ledger.json）；
+    测试传显式列表。任一路缺失或损坏都不能让整张表失败——工作台是用户找回自己项目的
+    唯一入口，宁可少一列信息，不能整页空白。
+
+    返回 list[dict]，按 updated_at 新 → 旧排序。
+    """
+    base_dir = base_dir or os.path.dirname(os.path.abspath(__file__))
+
+    if tasks is None:
+        with ACTIVE_TASKS_LOCK:
+            tasks = [
+                {k: v for k, v in t.items() if k not in ('listeners', 'cancel_event')}
+                for t in ACTIVE_TASKS.values()
+            ]
+    if library_items is None:
+        library_items = read_library()
+        if library_items is None:      # 读失败：宁可少一列，不整页失败
+            library_items = []
+    if ledger_rows is None:
+        ledger_rows = read_ledger() or []
+
+    tasks = [t for t in (tasks or []) if isinstance(t, dict)]
+    library_items = [i for i in (library_items or []) if isinstance(i, dict)]
+    ledger_rows = [r for r in (ledger_rows or []) if isinstance(r, dict)]
+
+    projects = {}
+    alias = {}
+
+    def bind(project_key, *keys):
+        for key in keys:
+            if key:
+                alias.setdefault(key, project_key)
+
+    def lookup(*keys):
+        for key in keys:
+            hit = alias.get(key)
+            if hit:
+                return hit
+        return None
+
+    def dims_of(task):
+        return task.get('dimensions') if isinstance(task.get('dimensions'), dict) else {}
+
+    def result_of(task):
+        return task.get('result') if isinstance(task.get('result'), dict) else {}
+
+    # ── 1. 激发任务：项目表的脊柱，project_key 由它产生 ──────────────────
+    for task in tasks:
+        dims = dims_of(task)
+        if dims.get('type') in MEDIA_TASK_TYPES:
+            continue
+        result = result_of(task)
+        title = result.get('title') or dims.get('task_label') or dims.get('theme') or ''
+        key = (result.get('project_key') or dims.get('project_key')
+               or make_idea_project_key(task.get('id'), title))
+        entry = projects.setdefault(key, _proj_blank(key))
+        entry['title'] = entry['title'] or title
+        entry['theme'] = entry['theme'] or dims.get('theme') or ''
+        entry['task'] = _proj_task_view(task)
+        if result.get('image_count') is not None:
+            entry['image_count'] = result.get('image_count')
+        if result.get('video_count') is not None:
+            entry['video_count'] = result.get('video_count')
+        entry['updated_at'] = max(entry['updated_at'], float(task.get('last_active') or 0))
+        bind(key, f"task:{task.get('id')}",
+             *[f"title:{v}" for v in _proj_title_variants(
+                 title, dims.get('theme'), dims.get('task_label'))])
+
+    # ── 2. 点子库：收藏态 ────────────────────────────────────────────────
+    for item in library_items:
+        title = item.get('title') or ''
+        key = (item.get('project_key')
+               or lookup(f"task:{item.get('id')}",
+                         *[f"title:{v}" for v in _proj_title_variants(title, item.get('theme'))])
+               or make_idea_project_key(item.get('id'), title))
+        entry = projects.setdefault(key, _proj_blank(key))
+        entry['title'] = entry['title'] or title
+        entry['theme'] = entry['theme'] or item.get('theme') or ''
+        entry['saved'] = True
+        entry['timestamp'] = item.get('timestamp') or entry['timestamp']
+        covers = item.get('covers') if isinstance(item.get('covers'), list) else []
+        entry['cover'] = item.get('activeCoverUrl') or (covers[0] if covers else None) or entry['cover']
+        if item.get('image_count') is not None:
+            entry['image_count'] = item.get('image_count')
+        if item.get('video_count') is not None:
+            entry['video_count'] = item.get('video_count')
+        frame_run = item.get('frameRun') if isinstance(item.get('frameRun'), dict) else {}
+        entry['library'] = {
+            'id': item.get('id'),
+            'timestamp': item.get('timestamp'),
+            'english_title': item.get('english_title'),
+            'social_title_cn': item.get('social_title_cn'),
+            'frame_count': len(frame_run.get('frames')) if isinstance(frame_run.get('frames'), list) else 0,
+        }
+        entry['updated_at'] = max(entry['updated_at'], _proj_epoch(item.get('timestamp')))
+        bind(key, f"task:{item.get('id')}",
+             *[f"title:{v}" for v in _proj_title_variants(title, item.get('theme'))])
+
+    # ── 3. 媒体子作业：挂回母项目；挂不上的自成一行（否则失败的帧/视频任务
+    #      像现在的任务抽屉那样被整类过滤掉，用户永远看不见）──────────────
+    for task in tasks:
+        dims = dims_of(task)
+        job_type = dims.get('type')
+        if job_type not in MEDIA_TASK_TYPES:
+            continue
+        job = {
+            'id': task.get('id'),
+            'type': job_type,
+            'status': task.get('status'),
+            'error': task.get('error'),
+            'last_active': task.get('last_active') or 0,
+            'theme': dims.get('theme') or '',
+        }
+        variants = _proj_title_variants(dims.get('theme'))
+        # 2026-07-31（P3）起子作业创建时就带着母项目的 project_key，这是精确挂接；
+        # 标题撞名只是老任务的回落（那时候子作业 dimensions 里只有一个 theme）
+        key = dims.get('project_key')
+        if not key or key not in projects:
+            key = lookup(*[f"title:{v}" for v in variants])
+        if key and key in projects:
+            entry = projects[key]
+        else:
+            # 孤立作业按**标题**分组而不是按任务 id：同一个母项目跑过 3 次帧序列
+            # 加 1 次封面时，按 id 建行会得到 4 行长得一模一样的记录。variants[-1]
+            # 是脱掉「做一个」前缀的写法，帧任务（无前缀）与封面任务（有前缀）
+            # 因此会落到同一行。
+            group = variants[-1] if variants else str(task.get('id'))
+            key = f"job:{group}"
+            entry = projects.setdefault(key, _proj_blank(key, kind='job'))
+            entry['title'] = entry['title'] or dims.get('theme') or job_type
+            entry['theme'] = entry['theme'] or dims.get('theme') or ''
+        entry['sub_jobs'].append(job)
+        entry['updated_at'] = max(entry['updated_at'], float(task.get('last_active') or 0))
+
+    # ── 4. 创意台账：选题与投放表现。台账里没被激发过的候选不进工作台
+    #      （那是台账页自己的领域，工作台只管"已经跑过的项目"）───────────
+    for row in ledger_rows:
+        seed = row.get('creative_seed') if isinstance(row.get('creative_seed'), dict) else {}
+        key = (row.get('project_key')
+               or lookup(*[f"title:{v}" for v in _proj_title_variants(
+                   seed.get('input_str'), row.get('one_line'))]))
+        if not key or key not in projects:
+            continue
+        projects[key]['ledger'] = {
+            'id': row.get('id'),
+            'status': row.get('status'),
+            'topic_dna': row.get('topic_dna'),
+            'llm_score': row.get('llm_score'),
+            'user_score': row.get('user_score'),
+            'date': row.get('date'),
+        }
+
+    # ── 5. 资产统计 + 主状态 + 排序 ──────────────────────────────────────
+    rows = []
+    for key, entry in projects.items():
+        if with_assets:
+            # 孤立作业行的 key 是 job:<标题>，不是合法 project_key——只能靠标题
+            # 回落到 _get_project_dir 的三套历史命名去找目录
+            entry['assets'] = _proj_asset_stats(
+                key if entry['kind'] == 'project' else None, entry['title'], base_dir)
+            entry['updated_at'] = max(entry['updated_at'], float(entry['assets']['latest_mtime']))
+            # 点子库记的封面优先（用户可能在多张里选过一张 activeCoverUrl），
+            # 没收藏过的项目才用磁盘上那张兜底
+            entry['cover'] = entry['cover'] or entry['assets'].get('cover')
+        entry['has_failed_jobs'] = any(j.get('status') == 'failed' for j in entry['sub_jobs'])
+        entry['sub_jobs'].sort(key=lambda j: j.get('last_active') or 0, reverse=True)
+        entry['state'] = _proj_state(entry)
+        rows.append(entry)
+
+    rows.sort(key=lambda r: r.get('updated_at') or 0, reverse=True)
+    return rows
+
+
+def filter_projects(rows, state=None, query=None, sort='newest'):
+    """工作台的服务端筛选/排序。点子库现在是全量渲染无分页，项目一多必然卡；
+    分页交给调用方对返回值切片。"""
+    out = list(rows or [])
+    if state and state != 'all':
+        if state == 'saved':
+            out = [r for r in out if r.get('saved')]
+        elif state == 'failed':
+            # "失败"这一档要连带媒体子作业的失败一起捞出来——那正是现在完全看不见的那批
+            out = [r for r in out if r.get('state') in ('failed', 'cancelled') or r.get('has_failed_jobs')]
+        else:
+            out = [r for r in out if r.get('state') == state]
+    key = _proj_norm(query)
+    if key:
+        def hit(row):
+            haystack = ' '.join(str(x or '') for x in (
+                row.get('title'), row.get('theme'), row.get('project_key'),
+                (row.get('task') or {}).get('id'), (row.get('ledger') or {}).get('topic_dna')))
+            return key in _proj_norm(haystack)
+        out = [r for r in out if hit(r)]
+    if sort == 'oldest':
+        out.sort(key=lambda r: r.get('updated_at') or 0)
+    elif sort == 'title':
+        out.sort(key=lambda r: _proj_norm(r.get('title')))
+    else:
+        out.sort(key=lambda r: r.get('updated_at') or 0, reverse=True)
+    return out
 
 
 def ping_proxy(config):

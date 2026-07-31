@@ -23,7 +23,8 @@
    之后除非用户改凭据或手动解除，一律不再自动尝试。
 3. 只填身份验证器的动态码，**绝不碰备用码输入框**——备用码是一次性的应急
    手段，自动填等于把用户的后路烧掉。
-4. 遇到验证码/手机点确认/设备验证一律立即放弃，不做任何点击尝试。
+4. 遇到验证码/设备验证一律立即放弃；手机点确认页仅在账号已配置 TOTP 时，
+   点击「Try another way」并切到身份验证器 App，不尝试代替用户确认手机通知。
 5. 失败时不落 forensics 快照。别处失败都会存页面 HTML 帮排查，但这里的页面是
    登录表单，快照有把凭据写进 runtime 文件的风险，不值得。
 """
@@ -134,9 +135,11 @@ _HARD_STOP_MARKERS = (
 def _detect_step(page) -> tuple:
     """判断登录流程当前停在哪一步，返回 (step, detail)。
 
-    顺序有讲究：先判"已经登进去了"（最常见的退出条件），再判硬停条件，最后才
-    按输入框判具体表单步骤。密码框排在邮箱框前面——账号选择页跳到密码页时，
-    DOM 里可能还残留着隐藏的邮箱 input。
+    顺序有讲究：先判"已经登进去了"（最常见的退出条件），再识别可自动处理的
+    TOTP/验证方式切换入口，然后才判硬停条件。否则手机确认页里的
+    "2-Step Verification / Tap Yes" 会在「Try another way」被看到前就提前退出。
+    密码框排在邮箱框前面——账号选择页跳到密码页时，DOM 里可能还残留着隐藏的
+    邮箱 input。
     """
     if _browser_gone(page):
         return "browser_gone", ""
@@ -147,6 +150,15 @@ def _detect_step(page) -> tuple:
     url = _current_url(page)
     text = _page_text(page)
 
+    # Google 默认把不少账号推到手机通知确认页；只要页面明确提供「换一种方式」
+    # 或已经展示身份验证器选项，就交给 challenge_picker 分支。这里必须位于
+    # HARD_STOP_MARKERS 前面，因为同一页正文必然含有 "2-Step Verification"。
+    if _first_visible(page, _SEL.get("totp_input")):
+        return "totp", ""
+    if (_first_visible(page, _SEL.get("authenticator_option")) or
+            _first_visible(page, _SEL.get("try_another_way"))):
+        return "challenge_picker", ""
+
     for needle, reason, message in _HARD_STOP_MARKERS:
         if needle in text:
             # "2-step verification" 只是标题时不算硬停——TOTP 输入页也叫这个名字。
@@ -155,16 +167,12 @@ def _detect_step(page) -> tuple:
                 continue
             return "hard_stop", (reason, message)
 
-    if _first_visible(page, _SEL.get("totp_input")):
-        return "totp", ""
     if _first_visible(page, _SEL.get("password_input")):
         return "password", ""
     if "accountchooser" in url or "selectaccount" in url:
         return "chooser", ""
     if _first_visible(page, _SEL.get("email_input")):
         return "email", ""
-    if _first_visible(page, _SEL.get("try_another_way")):
-        return "challenge_picker", ""
     return "unknown", ""
 
 
@@ -274,14 +282,27 @@ def _pick_account_from_chooser(page, email: str) -> bool:
 
 def _switch_to_authenticator(page) -> bool:
     """两步验证停在别的方式（短信/手机点确认）时，切到身份验证器 App 那一项。"""
-    trigger = _first_visible(page, _SEL.get("try_another_way"))
-    if trigger is not None:
+    # 图二的方式列表本身也有一项叫「Try another way」。因此必须先找
+    # Authenticator；如果反过来，会在已经进入列表后又点一次底部入口，跳离目标页。
+    option = _first_visible(page, _SEL.get("authenticator_option"))
+    if option is None:
+        trigger = _first_visible(page, _SEL.get("try_another_way"))
+        if trigger is None:
+            return False
         try:
             trigger.click(timeout=5000)
-            time.sleep(1.5)
+            log("🔓 自动登录：手机确认页点击「Try another way」", "自动登录")
         except Exception:
             return False
-    option = _first_visible(page, _SEL.get("authenticator_option"))
+
+        # 慢代理下方式列表不会立即出现，轮询等待，而不是固定睡 1.5 秒后误判失败。
+        wait_deadline = time.monotonic() + _STEP_SETTLE_SECONDS
+        while time.monotonic() < wait_deadline:
+            time.sleep(_STEP_POLL_SECONDS)
+            option = _first_visible(page, _SEL.get("authenticator_option"))
+            if option is not None:
+                break
+
     if option is None:
         return False
     try:
@@ -510,7 +531,11 @@ def run_standalone_login(user_id: str, port=None,
             with sync_playwright() as p:
                 browser = p.chromium.connect_over_cdp(ws_url, timeout=30000)
                 context = browser.contexts[0]
-                page = find_or_create_page(context, "/fx/tools/flow", fallback_url=flow_url)
+                # 这里要返回 try_auto_login 的详细结果，禁用公共浏览器入口的
+                # bool 型前置尝试，避免同一次“测试登录”被执行两遍。
+                page = find_or_create_page(
+                    context, "/fx/tools/flow", fallback_url=flow_url,
+                    user_id=user_id, auto_login=False)
                 try:
                     page.wait_for_load_state("domcontentloaded", timeout=20000)
                 except Exception:

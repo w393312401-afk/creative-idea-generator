@@ -340,6 +340,24 @@ function handleManualInterventionEvent(type, data) {
  * Null-safe by design: a missing DOM node or malformed info must never be able
  * to crash a stream-consumer loop.
  */
+// 管线条刷新按帧合批。上面那句"代价与这里的 DOM 写入同量级"是错的：
+// updatePipelineBar 会走 computePipelineState → resolvePromptSlots，后者每次都
+// 重建全部槽位对象（旧条目还要逐行正则解析整段 prompt_block），再对 4 枚芯片
+// 各做一次 querySelector + 4 次 classList.toggle。而 setProgressBar 挂在 compose
+// 的 text_chunk 上——也就是**每个流式 token 跑一遍**。生成期间这条路径能把主线程
+// 吃满，点击/切页/滚动全部被推到它后面排队，这正是"UI 交互延迟高"的主因。
+// 进度条本身的三个写入很便宜，保持同步（数字要跟手）；重的那部分一帧一次。
+let _pipelineBarPending = false;
+function schedulePipelineBarUpdate() {
+    if (_pipelineBarPending) return;
+    if (typeof updatePipelineBar !== 'function') return;
+    _pipelineBarPending = true;
+    requestAnimationFrame(() => {
+        _pipelineBarPending = false;
+        updatePipelineBar();
+    });
+}
+
 function setProgressBar(prefix, info) {
     if (!prefix) return;
     const label = document.getElementById(`${prefix}-progress-label`);
@@ -350,10 +368,8 @@ function setProgressBar(prefix, info) {
     if (percentEl) percentEl.textContent = `${Math.round(pct)}%`;
     if (fill) fill.style.width = `${pct}%`;
 
-    // 帧/视频每推进一格，管线条上的「3/16」也跟着走一格（app.js 提供；
-    // 生成流程里这个函数调用得很频繁，updatePipelineBar 本身是纯读 + 改几个
-    // class/文本，代价与这里已有的 DOM 写入同量级）。
-    if (typeof updatePipelineBar === 'function') updatePipelineBar();
+    // 帧/视频每推进一格，管线条上的「3/16」也跟着走一格（app.js 提供）。
+    schedulePipelineBarUpdate();
 }
 
 function mapEnglishCarrierToValue(carrier) {

@@ -9,9 +9,9 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+    /* 不加 backdrop-filter：与父面板同色且同尺寸，模糊是空操作。
+       理由与实测数据见 css/tokens.css 的 .glass-panel。 */
     background: var(--bg-panel);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
     border: 1px solid var(--border-color);
     border-radius: 20px;
     overflow: hidden;

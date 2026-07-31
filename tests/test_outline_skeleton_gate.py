@@ -276,12 +276,19 @@ class TestDualPayoffGateRejectsCompressedCards(unittest.TestCase):
 class TestComputeBeatsFloor(unittest.TestCase):
 
     def test_heavy_threshold_card_keeps_most_of_its_density(self):
-        """13 条清单（12 施工拍 + reward）→ ceil(12 * 0.7) = 9，ladder 不能再塌到 9 拍以下。"""
-        self.assertEqual(compute_beats_floor(_idea(DUAL_OK)), 9)
+        """13 条清单（12 施工拍 + reward）→ ceil(13.0 * 0.7) = 10。
+
+        2026-07-31：密度下界改由**按族跨度加权后的条数**派生，不再是裸条数
+        （docs/pacing_rhythm_balance_plan.md §4.5）。这份清单里
+        「铺设龙骨与羊毛保温」「封装内衬木饰面墙」各跨两个材料层族，各记 1.5 条，
+        12 条因此加权成 13.0，下界从 9 抬到 10 —— 加权是有区分度的，不是全表 +1：
+        只跨一族的条目仍然记 1 条。
+        """
+        self.assertEqual(compute_beats_floor(_idea(DUAL_OK)), 10)
 
     def test_light_card_falls_back_to_the_structural_minimum(self):
-        """8 条清单（7 施工拍）→ max(2, ceil(7*0.7)) = 5。"""
-        self.assertEqual(compute_beats_floor(_idea(LINEAR_OK)), 5)
+        """8 条清单（7 施工拍，其中一条跨两族）→ max(2, ceil(7.5*0.7)) = 6。"""
+        self.assertEqual(compute_beats_floor(_idea(LINEAR_OK)), 6)
 
     def test_crossing_forces_four_structural_beats(self):
         """有过门时结构必备 4 拍（室外 x2 + 过门 + 过门后清理），即使清单本身很短。"""
@@ -297,12 +304,13 @@ class TestComputeBeatsFloor(unittest.TestCase):
         合法地把两幕之一压没。同一份清单挂在单线骨架上仍是旧行为。
         """
         self.assertEqual(compute_beats_floor(_idea(DUAL_MIN_OK, pacing_skeleton='dual_payoff')), 9)
-        self.assertEqual(compute_beats_floor(_idea(DUAL_MIN_OK)), 7)
+        # 挂在单线骨架上走密度下界：10 条施工条目里两条跨两族 → 加权 11.0 → ceil(7.7)=8
+        self.assertEqual(compute_beats_floor(_idea(DUAL_MIN_OK)), 8)
 
     def test_dual_density_floor_still_wins_when_it_is_higher(self):
-        """15 条的重型双完工单：密度下界 ceil(14*0.7)=10 高于结构必备 9，取大。"""
+        """15 条的重型双完工单：密度下界 ceil(15.0*0.7)=11 高于结构必备 9，取大。"""
         heavy = DUAL_OK + ['铺装成品木地板', '安装舷窗背光灯具']
-        self.assertEqual(compute_beats_floor(_idea(heavy, pacing_skeleton='dual_payoff')), 10)
+        self.assertEqual(compute_beats_floor(_idea(heavy, pacing_skeleton='dual_payoff')), 11)
 
     def test_missing_or_malformed_outline_falls_back_to_the_global_constant(self):
         self.assertEqual(compute_beats_floor(_idea([])), _MIN_ADAPTIVE_CONSTRUCTION_BEATS)
@@ -392,7 +400,7 @@ class TestRecommendedBeatsIsDerivedFromTheOutline(unittest.TestCase):
         }], ensure_ascii=False)
         idea = self._run(payload)['ideas'][0]
         self.assertEqual(idea['beats_floor'], compute_beats_floor(idea))
-        self.assertEqual(idea['beats_floor'], 9)
+        self.assertEqual(idea['beats_floor'], 10)
 
 
 class TestHardFailuresAreDroppedNotDowngraded(unittest.TestCase):

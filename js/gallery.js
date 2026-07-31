@@ -1,7 +1,8 @@
 /* ==========================================================================
    Gallery (画廊) — 本地历史媒体资产总览与管理。
-   数据源是服务端 /api/gallery（实时扫描 outputs/：封面池 covers/、图像工坊
-   image-station/、各项目的 frames/ + videos/ + 根目录合成视频），并带引用标注：
+   数据源是服务端 /api/gallery（实时扫描 outputs/：图像工坊 image-station/、
+   各项目的 frames/ + videos/ + 根目录的合成视频与封面 cover_*，以及迁移前的
+   历史封面池 covers/——新封面已跟着项目走），并带引用标注：
    封面 item.in_use（被点子库/任务引用）、项目组 group.orphan（无引用且超过
    24h 活跃宽限）。删除走 /api/gallery/delete，会真正移除本地磁盘文件并重同步
    项目 manifest。依赖宿主应用的 escapeHtml / showToast / openLightbox。

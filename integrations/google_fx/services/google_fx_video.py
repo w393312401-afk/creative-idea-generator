@@ -628,6 +628,10 @@ try:
 except (TypeError, ValueError):
     MAX_IP_RETRIES = 10
 
+# 打开"帧序列所在画布"后等工作区就绪的上限。等不到就判定这个画布不可用（换了
+# 账号 / 项目已删），当场退回新建项目，不把整批任务耗在一个回不去的画布上。
+_BOUND_CANVAS_READY_TIMEOUT = 20
+
 
 class _UuidRefRequest:
     """提交画布时用的请求视图：image/end_image 换成画布 UUID，保留原始路径备查。"""
@@ -674,6 +678,15 @@ class _ChunkRunner:
         # 一轮白耗 ~1 分钟且推高风控）。使用前会对照画布 DOM 逐个验证，
         # 画布上找不到的自动重新上传，验证不过不会错挂。
         self.path_to_uuid = {}
+        # 调用方指定的"帧序列所在的那个 Flow 项目"URL（区别于本批自建的项目）。
+        # 只有确认当前页就是它时，才敢把 manifest 带来的画布 UUID 当作本画布资产
+        # 认领（见 _seed_known_canvas_uuids / _prepare_page）。
+        self.bound_project_url = None
+        self.canvas_is_bound = False
+        # 绑定画布上本来就有的卡片（帧图 + 历次视频）：重试轮认领时必须排除，
+        # 否则显式重试会认领回上一次生成的那段旧片，等于这次重试没发生。
+        self.preexisting_tile_ids = set()
+        self._preexisting_scanned = False
         self.gen_retry_used = 0
         self.ip_retry = 0
         # 内容校验拒收过的画布卡片：重试轮认领时必须跳过（见 _adopt_completed_tiles）
@@ -843,22 +856,56 @@ class _ChunkRunner:
           labs.google 时才导航，而项目页 URL 同样含 labs.google —— 静默沿用旧项目
           导致画布堆满历史/其他任务的卡片，是"下载到无关视频"（跨任务串片）的
           直接温床（2026-07-04 复盘确诊）。
+          例外：调用方显式绑定了项目（bound_project_url，即本地项目的帧序列所在
+          画布）时走该项目页——那批帧已经是这个画布的资产，回到这里才能免上传
+          （串片风险由提交前的 tile 基线 + 提示词切片核对 + 下载后锚点比对兜住，
+          历史卡片另由 preexisting_tile_ids 挡在认领之外）。
         - 重试轮：回到本 chunk 固定的项目页，保留此前提交的卡片供认领复用。
         然后等待底部工具栏就绪；超时则主动刷新一次页面再等（换 IP 后页面可能
         卡在空白状态，光等不会自愈——2026-07-01 实测这样丢过整批任务）。"""
         if self.project_url:
+            navigated = True
             try:
                 if page.url != self.project_url:
                     page.goto(self.project_url, timeout=60000)
                     random_sleep(2, 3)
-                log("📌 已回到本批次项目页（重试轮，保留历史卡片）", "GoogleFX-Video")
             except Exception as nav_err:
                 log(f"⚠️ 回到项目页失败: {nav_err}，改为新建项目", "GoogleFX-Video")
+                navigated = False
+
+            is_bound_canvas = bool(
+                navigated and self.bound_project_url
+                and self.project_url == self.bound_project_url
+            )
+            if is_bound_canvas:
+                # 绑定画布来自本地项目 manifest，可能属于号池里的另一个账号、也可能
+                # 早被删了：那种地址打得开却没有工作区，光在下面干等只会把整批任务
+                # 拖死在一个根本回不去的画布上。先确认工作区真的可用，不可用就当场
+                # 放弃绑定、退回"新建项目 + 上传参考图"的老路（慢，但一定能跑完）。
+                _dismiss_unexpected_overlays(page, "GoogleFX-Video")
+                if self._wait_toolbar_ready(page, _BOUND_CANVAS_READY_TIMEOUT):
+                    self.canvas_is_bound = True
+                    log("📌 已进入本地项目绑定的 Flow 画布（帧序列就在这张画布上）",
+                        "GoogleFX-Video")
+                else:
+                    log(
+                        f"⚠️ 绑定画布 {_BOUND_CANVAS_READY_TIMEOUT}s 内打不开工作区"
+                        f"（可能属于另一个账号或已被删除），改为新建项目并照旧上传参考图",
+                        "GoogleFX-Video",
+                    )
+                    navigated = False
+                    self.canvas_is_bound = False
+                    self.bound_project_url = None  # 后续轮次/分批不再重试这个画布
+            elif navigated:
+                log("📌 已回到本批次项目页（重试轮，保留历史卡片）", "GoogleFX-Video")
+
+            if not navigated:
                 self.project_url = None
 
         if not self.project_url:
             # 新建项目 = 全新画布，上一个项目里传的参考图不在这里，缓存全部失效
             self.path_to_uuid = {}
+            self.canvas_is_bound = False
             try:
                 page.goto("https://labs.google/fx/tools/flow", timeout=60000)
                 random_sleep(1, 2)
@@ -897,6 +944,32 @@ class _ChunkRunner:
                     self.project_url = page.url
             except Exception:
                 pass
+
+        self._snapshot_preexisting_tiles(page)
+
+    def _snapshot_preexisting_tiles(self, page):
+        """绑定画布首次就位时，记下画布上本来就有的卡片 id。
+
+        绑定的是帧序列所在的项目画布，上面除了帧图，还可能有这个本地项目历次
+        视频生成留下的成品卡片——提示词切片当然对得上。不排除的话，显式重试
+        （用户删掉旧片要求重生）会在重试轮把上一次那张旧卡片认领回来，用户看到
+        的还是同一段视频。自建的新项目画布本来就是空的，不受影响。"""
+        if self._preexisting_scanned or not self.canvas_is_bound:
+            return
+        self._preexisting_scanned = True
+        tiles = _scan_canvas_tiles(page) or []
+        self.preexisting_tile_ids = {
+            tile_id
+            for tile in tiles
+            for tile_id in (tile.get('tileId'), tile.get('originalTileId'))
+            if tile_id
+        }
+        if self.preexisting_tile_ids:
+            log(
+                f"📋 绑定画布上已有 {len(tiles)} 张历史卡片，重试轮认领时一律跳过"
+                f"（只认本次提交产生的卡片）",
+                "GoogleFX-Video",
+            )
 
     def _wait_toolbar_ready(self, page, max_wait_secs):
         agent_dismiss_tried = False
@@ -955,11 +1028,13 @@ class _ChunkRunner:
             return [], remaining
         # 被锚点校验拒收过的卡片留在画布上，提示词切片当然还匹配得上——不排除的话
         # 重试轮会把同一段废片重新认领、重新下载、重新被拒，整轮重试等于空转。
-        if self.rejected_tile_ids:
+        # 绑定画布上本来就有的卡片（历次生成的旧片）同理，见 _snapshot_preexisting_tiles。
+        skip_tile_ids = set(self.rejected_tile_ids) | set(self.preexisting_tile_ids)
+        if skip_tile_ids:
             canvas_tiles = [
                 t for t in canvas_tiles
-                if t.get('tileId') not in self.rejected_tile_ids
-                and (t.get('originalTileId') or t.get('tileId')) not in self.rejected_tile_ids
+                if t.get('tileId') not in skip_tile_ids
+                and (t.get('originalTileId') or t.get('tileId')) not in skip_tile_ids
             ]
 
         adopted = []
@@ -1016,6 +1091,41 @@ class _ChunkRunner:
             time.sleep(1)
         return {p: u for p, u in wanted.items() if u in found}
 
+    def _seed_known_canvas_uuids(self, remaining):
+        """把请求自带的"这张帧在画布上的 UUID"播种进跨轮缓存，返回播种条数。
+
+        帧序列本来就是在绑定的那个 Flow 项目画布上生成的，每张帧的画布 UUID 记在
+        manifest.frames[].fx_uuid 里（video_generator 透传成 req.image_uuid /
+        end_image_uuid）。回到同一画布时这些图仍是项目资产，直接挂载即可——此前
+        无论如何都要把同一批图整批重新上传一轮（十几张图起步 ~1 分钟，还平白多
+        一轮上传流量推高风控）。
+
+        安全性由两道既有关卡保证，这里只负责"提议"：
+        1) 只在确认当前页就是绑定画布时播种（自建新项目上这些 UUID 根本不存在）；
+        2) 播种的映射一律要过 _verify_cached_uploads 的画布 DOM 校验，画布上找不到
+           的照旧走上传——不会凭 manifest 一面之词就挂一张不在画布上的图。
+        """
+        if not self.canvas_is_bound:
+            return 0
+        seeded = 0
+        for _sub_idx, req in remaining:
+            for path_attr, uuid_attr in (("image", "image_uuid"), ("end_image", "end_image_uuid")):
+                path = clean_path(getattr(req, path_attr, "") or "")
+                uuid = str(getattr(req, uuid_attr, "") or "").strip().lower()
+                if not path or not uuid or path in self.path_to_uuid:
+                    continue
+                if not os.path.exists(path):
+                    continue
+                self.path_to_uuid[path] = uuid
+                seeded += 1
+        if seeded:
+            log(
+                f"📎 本地项目记录了 {seeded} 张帧的画布 UUID，先按已在画布认领"
+                f"（画布校验不过的仍会重新上传）",
+                "GoogleFX-Video",
+            )
+        return seeded
+
     def _upload_references(self, page, remaining):
         """收集本轮任务的全部参考图（首/尾帧去重），分组上传到画布。
         返回 {本地路径（或 _DUP_END_REF_KEY_SUFFIX 标记的第二份）: 画布 UUID}。
@@ -1043,6 +1153,9 @@ class _ChunkRunner:
         path_to_uuid = {}
         if not unique_images:
             return path_to_uuid
+
+        # ── 帧序列阶段就在这个画布上生成过的图：先按已有资产认领（免整轮上传）──
+        self._seed_known_canvas_uuids(remaining)
 
         # ── 跨轮复用：先认领画布上已有的，再决定还需要传哪些 ──
         reused = self._verify_cached_uploads(page, unique_images)
@@ -1512,7 +1625,15 @@ def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=N
     # _ChunkRunner 过去把 project_url 存在实例里，但每 5 个视频都会新建一个 runner，
     # 导致 14 段任务在第 1/6/11 段各点一次“新建项目”。换号节拍恰好设成 15 时，
     # 这尤其像是换号触发了重建。项目 URL 必须属于整次批量调用，而不是单个 chunk。
-    batch_project_url = None
+    batch_project_url = next(
+        (str(getattr(r, "project_url", "") or "").strip() for r in reqs
+         if str(getattr(r, "project_url", "") or "").strip()),
+        None,
+    )
+    # 调用方绑定的画布（= 本地项目帧序列所在的 Flow 项目）。与 batch_project_url
+    # 分开保存：后者跑完第一个 chunk 后会被本批自建的项目 URL 顶掉，那种画布上
+    # 没有帧图，不能据此认领 manifest 带来的画布 UUID。
+    external_project_url = batch_project_url
     for chunk_start in range(0, len(reqs), VIDEO_CHUNK_SIZE):
         chunk = reqs[chunk_start : chunk_start + VIDEO_CHUNK_SIZE]
         log(f"📦 开始处理第 {chunk_start // VIDEO_CHUNK_SIZE + 1} 批视频请求 ({len(chunk)} 个)...", "GoogleFX-Video")
@@ -1525,9 +1646,19 @@ def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=N
             cancel_check=cancel_check,
         )
         runner.project_url = batch_project_url
+        runner.bound_project_url = external_project_url
         results.extend(runner.run())
         if runner.project_url:
             batch_project_url = runner.project_url
+        # runner 把绑定画布判为不可用（打不开工作区）时会清掉它——后面的分批
+        # 不必再去撞同一堵墙。
+        if not getattr(runner, "bound_project_url", None):
+            external_project_url = None
+
+    if batch_project_url:
+        for item in results:
+            if isinstance(item, dict):
+                item["project_url"] = batch_project_url
 
     successful = [r for r in results if r and isinstance(r, dict) and r.get("status") == "success" and r.get("video_url")]
     if successful:

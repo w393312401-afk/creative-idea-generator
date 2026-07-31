@@ -27,8 +27,12 @@ from prompt_pipeline import *
 
 # Explicitly import private functions that are not imported by wildcard '*'
 from server_common import (
-    _get_project_dir, _safe_project_name, _LOG_PATH, _account_switch_interval,
+    _get_project_dir, _LOG_PATH, _account_switch_interval,
     _IP_ROTATE_DISABLED,
+    # 点子库拆分存储的内部读取路径：POST /api/library 的三道防护要在**已持有**
+    # LIBRARY_LOCK 的情况下读一次现有库，读-判定-写这一串必须是原子的。
+    # （LIBRARY_LOCK 已改为 RLock，同线程重入是安全的。）
+    _ensure_library_split, _read_library_split, _library_store_ready, _read_library_file,
 )
 
 # 日志历史回放最多从文件末尾回读这么多字节（够装远超 100 行了）
@@ -162,7 +166,13 @@ def background_worker(task_id, config, dimensions):
         # 最后一段模型调用。model 跟随任务结果落盘，之后即使全局模型切换，历史
         # 卡片仍能正确默认选中本次实际使用的模型。
         result['model'] = config.get('model') if isinstance(config, dict) else None
-        result['project_key'] = make_idea_project_key(task_id, result.get('title'))
+        # project_key 在任务创建时就已定下（ensure_task_project_key，用的是灵感卡片
+        # 的选题名 task_label）。这里只是把它抄进结果里，不再用 LLM 生成的 title
+        # 重算一遍——重算会得到与运行中那个键不一样的值，工作台/画廊按主键关联时
+        # 就会把同一条创意拆成两份。dimensions 缺 label 的老调用路径回落到旧算法。
+        result['project_key'] = (
+            (dimensions or {}).get('project_key')
+            or make_idea_project_key(task_id, result.get('title')))
         result['timings'] = {
             'total_duration_seconds': round(time.time() - start_time, 2)
         }
@@ -179,7 +189,7 @@ def background_worker(task_id, config, dimensions):
             t["events"].append(('result', result))
 
         notify_listeners(task_id, 'result', result)
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
 
     except ConnectionError:
         # GenerationCancelled 走这里（其子类）。/api/compose-cancel 通常已抢先把
@@ -195,7 +205,7 @@ def background_worker(task_id, config, dimensions):
                 finalize = True
         if finalize:
             notify_listeners(task_id, 'error', {'message': '用户取消了生成任务'})
-            save_tasks_to_disk()
+            save_task_to_disk(task_id)
     except Exception as e:
         if sys.stdout:
             print(f"[DEBUG] background task {task_id} failed: {e}")
@@ -214,7 +224,7 @@ def background_worker(task_id, config, dimensions):
                 t["events"].append(('error', {'message': error_msg}))
         if error_msg is not None:
             notify_listeners(task_id, 'error', {'message': error_msg})
-            save_tasks_to_disk()
+            save_task_to_disk(task_id)
 
 
 def auto_run_worker(task_id, config, dimensions):
@@ -223,10 +233,14 @@ def auto_run_worker(task_id, config, dimensions):
     reusing the same ACTIVE_TASKS/SSE plumbing as the three manual stages."""
     t = get_or_create_task(task_id, dimensions)
     start_time = time.time()
-    project_label = None
-    if isinstance(dimensions, dict):
-        project_label = dimensions.get('task_label') or dimensions.get('theme')
-    project_key = make_idea_project_key(task_id, project_label)
+    # 与 compose 走同一个键：get_or_create_task 已经通过 ensure_task_project_key
+    # 把它写进 dimensions 了，这里直接取，不再各算各的
+    project_key = (dimensions or {}).get('project_key')
+    if not project_key:
+        project_label = None
+        if isinstance(dimensions, dict):
+            project_label = dimensions.get('task_label') or dimensions.get('theme')
+        project_key = make_idea_project_key(task_id, project_label)
     set_project_key_context(project_key)
     set_log_context(task_id)
     log('INFO', 'AUTORUN', "开始自治管线任务")
@@ -283,7 +297,7 @@ def auto_run_worker(task_id, config, dimensions):
         notify_listeners(task_id, 'error', {'message': str(e)})
         log('ERROR', 'AUTORUN', f"自治管线任务失败: {e}")
     finally:
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
 
@@ -1000,7 +1014,7 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
         log('ERROR', 'FRAMES', f"帧序列任务失败: {e}", title=title)
     finally:
         release_frame_run(_get_project_dir(title), task_id)
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
 
@@ -1072,7 +1086,7 @@ def fix_frame_issue_worker(task_id, config, title, prompt_block, sequence, manua
         log('ERROR', 'FRAMES', f"第 {sequence} 帧修复失败: {e}", title=title)
     finally:
         release_frame_run(_get_project_dir(title), task_id)
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
 
@@ -1142,7 +1156,7 @@ def sequence_review_worker(task_id, config, title, prompt_block):
         log('ERROR', 'FRAMES', f"一致性审查失败: {e}", title=title)
     finally:
         release_frame_run(_get_project_dir(title), task_id)
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
 
@@ -1214,7 +1228,7 @@ def render_staged_worker(task_id, config, title, prompt_block):
         log('ERROR', 'STAGED', f"分步渲染任务失败: {e}", title=title)
     finally:
         release_frame_run(_get_project_dir(title), task_id)
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
 
@@ -1358,7 +1372,7 @@ def _cancel_fx_task(task_id, reason, actor='local'):
                 finalized = True
     if finalized:
         notify_listeners(task_id, 'error', {'message': reason})
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
     hit = False
     try:
         hit = bool(get_fx_cancel_flag().cancel_request(task_id))
@@ -1518,14 +1532,18 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
         notify_listeners(task_id, 'error', {'message': str(e)})
         log('ERROR', 'VIDEOS', f"视频任务失败: {e}", title=title)
     finally:
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
         set_log_context(None)
         set_project_key_context(None)
 
 
-def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_block):
+def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_block,
+                          project_key=None):
     t = get_or_create_task(task_id)
     set_log_context(task_id)
+    # 封面落进项目自己的目录（outputs/<项目>/cover_*.webp），跟帧/视频/成片同住：
+    # 与帧任务同款的线程级命名空间，标题只用于提示词与日志。
+    set_project_key_context(project_key or None)
     log('INFO', 'COVER', "开始封面任务", title=title)
     try:
         # Generate a catchy, viral English title/hook for TikTok US cover
@@ -1602,11 +1620,8 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
             f"- Keep the font style clean, simple, and standard. Avoid messy, irregular, hand-drawn, graffiti, or low-contrast text styles. The layout must be perfectly centered and balanced."
         )
         
-        out_dir = os.path.join(OUTPUT_ROOT, 'covers')
-        os.makedirs(out_dir, exist_ok=True)
-        filename = f"{_safe_project_name(title)}_cover_{int(time.time() * 1000)}.webp"
-        target_path = os.path.join(out_dir, filename)
-        
+        target_path = project_cover_path(project_key or title)
+
         if sys.stdout:
             print(f"[DEBUG] Generating cover image via _generate_text_image to {target_path}...")
 
@@ -1659,8 +1674,9 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
         notify_listeners(task_id, 'error', {'message': str(e)})
         log('ERROR', 'COVER', f"封面任务失败: {e}", title=title)
     finally:
-        save_tasks_to_disk()
+        save_task_to_disk(task_id)
         set_log_context(None)
+        set_project_key_context(None)
 
 
 class _QuietConnResetMixin:
@@ -1993,23 +2009,54 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         query = parse_qs(parsed.query)
 
         if path == '/api/library':
-            if not self._gate():
-                return
+            # 整表兼容层：老前端（saveLibrary/loadLibrary 与 api_client.js 里
+            # 十几处调用）仍按"始终持有完整数组"的契约工作。数据现在存在拆分库
+            # library/ 里，这里重组回一个完整数组给它们。
             # 读失败必须报 500 而不是静默返回 []：前端拿到空列表后一次保存
             # 就会把整个创意库覆盖成空——这是真实存在过的整库清零路径
-            with LIBRARY_LOCK:
-                if not os.path.exists(DB_FILE):
-                    self._send_json([])
-                    return
-                try:
-                    with open(DB_FILE, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                except Exception as e:
-                    if sys.stdout:
-                        print(f"Error reading {DB_FILE}: {e}")
-                    self._send_json({'error': f'创意库文件读取失败: {e}'}, status=500)
-                    return
+            if not self._gate():
+                return
+            try:
+                data = read_library()
+            except Exception as e:
+                if sys.stdout:
+                    print(f"Error reading library: {e}")
+                self._send_json({'error': f'创意库读取失败: {e}'}, status=500)
+                return
+            if data is None:
+                self._send_json({'error': '创意库文件读取失败（格式损坏）'}, status=500)
+                return
             self._send_json(data)
+        elif path == '/api/library/index':
+            # 新契约：列表渲染只要索引（几 KB），正文按需单条拉。
+            # 老接口一次回的是全库正文——实测 2 条创意就 208KB。
+            if not self._gate():
+                return
+            try:
+                index = read_library_index()
+            except Exception as e:
+                self._send_json({'error': f'创意库索引读取失败: {e}'}, status=500)
+                return
+            if index is None:
+                self._send_json({'error': '创意库索引损坏'}, status=500)
+                return
+            self._send_json({'items': index, 'count': len(index)})
+        elif path == '/api/library/item':
+            if not self._gate():
+                return
+            item_id = query.get('id', [''])[0]
+            if not item_id:
+                self._send_json({'error': '缺少 id'}, status=400)
+                return
+            try:
+                item = read_library_item(item_id)
+            except Exception as e:
+                self._send_json({'error': f'创意读取失败: {e}'}, status=500)
+                return
+            if item is None:
+                self._send_json({'error': 'Not found'}, status=404)
+                return
+            self._send_json(item)
         elif path == '/api/get_manifest':
             if not self._gate():
                 return
@@ -2218,6 +2265,53 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 "tasks": sliced,
                 "total_count": total_count
             })
+        elif path == '/api/projects':
+            # 项目工作台的唯一数据源：任务/点子库/台账/outputs 四路按 project_key
+            # 合流成一张项目表（见 server_common.build_projects_index）。前端不再
+            # 并发拉三个源自己 join，也不再靠标题模糊匹配互相反查。
+            # 参数：state=all|running|completed|saved|failed  q=搜索  sort=newest|oldest|title
+            #      limit/offset=分页（默认 60 条，点子库现在是全量渲染无分页）
+            #      assets=0 跳过 outputs/ 目录统计（轮询用，省掉每次的文件系统扫描）
+            if not self._gate():
+                return
+            cleanup_old_tasks()
+            try:
+                with_assets = query.get('assets', ['1'])[0] not in ('0', 'false', 'no')
+                rows = build_projects_index(with_assets=with_assets)
+                filtered = filter_projects(
+                    rows,
+                    state=query.get('state', [''])[0],
+                    query=query.get('q', [''])[0],
+                    sort=query.get('sort', ['newest'])[0],
+                )
+                try:
+                    limit = int(query.get('limit', ['60'])[0])
+                except ValueError:
+                    limit = 60
+                try:
+                    offset = max(0, int(query.get('offset', ['0'])[0]))
+                except ValueError:
+                    offset = 0
+                sliced = filtered[offset:offset + limit] if limit > 0 else filtered[offset:]
+                self._send_json({
+                    'projects': sliced,
+                    'total_count': len(rows),
+                    'filtered_count': len(filtered),
+                    'offset': offset,
+                    # chips 上的角标：在完整表上统计，不受当前筛选影响
+                    'counts': {
+                        'all': len(rows),
+                        'running': len([r for r in rows if r.get('state') == 'running']),
+                        'completed': len([r for r in rows if r.get('state') == 'completed']),
+                        'saved': len([r for r in rows if r.get('saved')]),
+                        'failed': len([r for r in rows if r.get('state') in ('failed', 'cancelled')
+                                       or r.get('has_failed_jobs')]),
+                    },
+                })
+            except Exception as e:
+                if sys.stdout:
+                    print(f"Error building projects index: {e}")
+                self._send_json({'error': f'项目索引构建失败: {e}'}, status=500)
         elif path == '/api/compose-stream':
             if not self._gate():
                 return
@@ -2424,7 +2518,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 pool = _get_account_pool()
                 sort_by = query.get('sort_by', [None])[0] if 'sort_by' in query else None
                 sort_order = query.get('sort_order', ['desc'])[0] if 'sort_order' in query else 'desc'
-                self._send_json({'status': 'ok', 'accounts': pool.list_accounts(sort_by=sort_by, sort_order=sort_order)})
+                self._send_json({'status': 'ok', 'accounts': pool.list_accounts(heal=False, sort_by=sort_by, sort_order=sort_order)})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
         elif path == '/api/proxy-pool':
@@ -2641,108 +2735,76 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         content_length = int(self.headers.get('Content-Length', 0) or 0) if hasattr(self, 'headers') else 0
         self._body_bytes = self.rfile.read(content_length) if content_length else b''
 
-        if path == '/api/library':
+        # 整表覆盖写（POST /api/library）已于 2026-07-31 移除。
+        #
+        # 它的契约是"客户端始终持有完整数组、整份 POST 回来覆盖"，因此任何一次
+        # 状态错乱的写入都是一次静默的数据丢失——为此曾经挂着三道闸门（空库拒写、
+        # 同一条创意内部 prompt_slots/frameRun 数量自洽、未声明的缩量 409）。那三道
+        # 防线是对的，但它们防的是"整份覆盖"这个动作本身；现在所有写入都走下面的
+        # /api/library/item（一次只碰一条记录的正文文件 + 索引行），这个动作不存在
+        # 了，闸门也就没有了要守的门。
+        #
+        # 读路径 GET /api/library 保留：全量导出与外部脚本还在用它。
+        # 判定函数 library_shrink_verdict 也保留——创意台账的整表回写仍在用
+        # （见 server_common.write_ledger）。
+        if path == '/api/library/item':
+            # 新契约：写一条创意只碰它自己的正文文件 + 索引，绝不重写别的记录。
+            # 因此这条路径上没有"整表覆盖"可言，也就不需要空库/缩量/槽位自洽
+            # 那三道防线——它们防的是整份覆盖这个动作本身。
             if not self._gate():
                 return
             try:
-                raw_body = self._read_json_body()
-                # 裸数组（历史契约）与 {'ideas': [...], 'intent': {...}}（带删除声明）
-                # 都收，见 server_common.parse_library_payload
-                data, write_intent = parse_library_payload(raw_body)
-                if data is None:
+                body = self._read_json_body()
+                item = body.get('item') if isinstance(body, dict) and 'item' in body else body
+                if not isinstance(item, dict) or item.get('id') in (None, ''):
                     self._send_json({
                         'status': 'error',
-                        'message': '请求体必须是创意数组，或 {"ideas": [...], "intent": {...}}',
+                        'message': '请求体必须是带 id 的创意对象，或 {"item": {...}}',
                     }, status=400)
                     return
-                # 加锁 + 原子替换：直接 open('w') 在写一半崩溃时会留下半截 JSON
-                with LIBRARY_LOCK:
-                    # 2026-07-12 整库清零事故（library.json 被某个 savedIdeas 为空的客户端
-                    # 会话全量覆盖成 []）后的双保险：
-                    # 1) 空列表覆盖非空库一律拒绝——删除单条走 /api/library/delete_item 后
-                    #    的全量回写永远至少剩 0..N-1 条，只有状态错乱的客户端才会 POST []；
-                    # 2) 任何成功覆盖前把现有非空库轮换到 library.json.bak，误写可回滚一版。
-                    existing_count = 0
-                    existing_library = None
-                    if os.path.exists(DB_FILE):
-                        try:
-                            with open(DB_FILE, 'r', encoding='utf-8') as f:
-                                _old = json.load(f)
-                            existing_library = _old
-                            existing_count = len(_old) if isinstance(_old, list) else 1
-                        except Exception:
-                            existing_count = 1  # 读不出来按“非空”保守处理
-                    incoming_count = len(data) if isinstance(data, list) else 0
-                    if incoming_count == 0 and existing_count > 0:
-                        if sys.stdout:
-                            print(f"[LIBRARY GUARD] 拒绝空列表覆盖非空创意库（现有 {existing_count} 条）")
-                        self._send_json({
-                            'status': 'rejected',
-                            'message': f'拒绝将非空创意库（{existing_count} 条）覆盖为空：客户端库状态疑似错乱，'
-                                       f'请刷新页面重新加载库后再操作；如确要清空请逐条删除。'
-                        }, status=409)
-                        return
-                    # 同一创意内部也必须自洽：浏览器旧页曾把 9 格 prompt_slots 与
-                    # 10 帧 frameRun 一起回写，随后删除接口按较小的提示词编号操作，
-                    # 最终误删了另一拍。带 frameRun 的记录若两边数量不同，说明页面
-                    # 已过期或局部状态错位，整条写入必须失败并要求刷新。
-                    inconsistent = []
-                    if isinstance(data, list):
-                        for idea in data:
-                            if not isinstance(idea, dict):
-                                continue
-                            slots = idea.get('prompt_slots') or {}
-                            slot_images = slots.get('images') if isinstance(slots, dict) else None
-                            frame_run = idea.get('frameRun') or {}
-                            run_frames = frame_run.get('frames') if isinstance(frame_run, dict) else None
-                            if not isinstance(slot_images, list) or not isinstance(run_frames, list):
-                                continue
-                            prompt_count = len({item.get('index') for item in slot_images
-                                                if isinstance(item, dict) and
-                                                isinstance(item.get('index'), int)})
-                            frame_count = len({item.get('sequence') or item.get('slot')
-                                               for item in run_frames if isinstance(item, dict) and
-                                               isinstance(item.get('sequence') or item.get('slot'), int)})
-                            if prompt_count and frame_count and prompt_count != frame_count:
-                                inconsistent.append({
-                                    'id': idea.get('id'),
-                                    'prompt_count': prompt_count,
-                                    'frame_count': frame_count,
-                                })
-                    if inconsistent:
-                        self._send_json({
-                            'status': 'rejected',
-                            'message': '创意页面槽位状态已过期，已阻止覆盖；请刷新页面后重试。',
-                            'refresh_required': True,
-                            'inconsistent_ideas': inconsistent,
-                        }, status=409)
-                        return
-                    # 第三道：非空 → 非空的「缩量覆盖」。少一条创意、某条少几帧都算，
-                    # 除非客户端声明了这是哪次删除造成的（intent）。见
-                    # server_common.library_shrink_verdict 的事故说明。
-                    shrink_ok, shrink_msg, shrink_detail = library_shrink_verdict(
-                        existing_library, data, write_intent)
-                    if not shrink_ok:
-                        if sys.stdout:
-                            print(f"[LIBRARY GUARD] 拒绝未声明的缩量覆盖: {shrink_detail}")
-                        self._send_json({
-                            'status': 'rejected',
-                            'message': shrink_msg,
-                            'refresh_required': True,
-                            'shrink': shrink_detail,
-                        }, status=409)
-                        return
-                    if existing_count > 0:
-                        try:
-                            shutil.copyfile(DB_FILE, DB_FILE + '.bak')
-                        except Exception as _bak_err:
-                            if sys.stdout:
-                                print(f"[LIBRARY GUARD] 备份 {DB_FILE}.bak 失败（继续写入）: {_bak_err}")
-                    write_json_atomic(DB_FILE, data)
-                self._send_json({'status': 'success'})
+                entry = write_library_item(item)
+                self._send_json({'status': 'success', 'entry': entry})
             except Exception as e:
                 if sys.stdout:
-                    print(f"Error writing {DB_FILE}: {e}")
+                    print(f"Error writing library item: {e}")
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/library/item/delete':
+            # 按 id 删单条。与创意台账的 /api/ledger/delete 同一个道理：按 id 删
+            # 天然带着"确有意图"的证据，不吃缩量闸门，删到最后一条也不会被 409。
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                item_id = body.get('id') if isinstance(body, dict) else None
+                if item_id in (None, ''):
+                    self._send_json({'status': 'error', 'message': '缺少 id'}, status=400)
+                    return
+                # 顺带清掉这条创意生成的图片/视频文件（与老的
+                # /api/library/delete_item 同一套清理，前端不必再多打一次请求）
+                item = read_library_item(item_id)
+                deleted_files = None
+                # 传给 delete_idea_output_files 的必须是**项目目录键**而不是展示
+                # 标题：新记录的产物落在 outputs/<project_key>/ 下（前端
+                # getIdeaSaveTitle 也是 project_key || title 这个顺序）。传错的
+                # 后果是删了记录、产物却留在磁盘上变成孤儿。
+                title = (body.get('title')
+                         or (item or {}).get('project_key')
+                         or (item or {}).get('title'))
+                covers = body.get('covers')
+                if covers is None:
+                    covers = (item or {}).get('covers') or []
+                if title:
+                    try:
+                        deleted_files = delete_idea_output_files(title, covers)
+                    except Exception as e:
+                        if sys.stdout:
+                            print(f"[LIBRARY] 删除创意产物失败（记录仍会删除）: {e}")
+                removed = delete_library_item(item_id)
+                self._send_json({'status': 'ok', 'removed': removed, 'deleted': deleted_files})
+            except Exception as e:
+                if sys.stdout:
+                    print(f"Error deleting library item: {e}")
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/ledger':
@@ -2866,7 +2928,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                             t = ACTIVE_TASKS[tid]
                             t["status"] = "cancelled"
                             t["error"] = "用户强行释放了底层任务槽位"
-                        save_tasks_to_disk()
+                        save_task_to_disk(tid)
                     snapshot = FX_CONTROL.snapshot()
                 else:
                     snapshot = FX_CONTROL.set_mode(action, actor=actor)
@@ -3712,6 +3774,10 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 # 它进入 LLM prompt、任务快照或断点续传指纹。
                 ledger_candidate = dimensions.pop('ledger_candidate', None)
                 if isinstance(ledger_candidate, dict):
+                    # 主键要在登记之前就位：台账行带上 project_key 之后，「回到激发
+                    # 项目」就是一次直查，不必再拿 DNA/一句话选题去撞标题。
+                    ledger_candidate = dict(ledger_candidate)
+                    ledger_candidate['project_key'] = ensure_task_project_key(task_id, dimensions)
                     register_ledger_candidates([ledger_candidate], source='Creative Activation')
 
                 # Start background thread
@@ -3817,7 +3883,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                             finalized = True
                     if finalized:
                         notify_listeners(task_id, 'error', {'message': '用户取消了生成任务'})
-                        save_tasks_to_disk()
+                        save_task_to_disk(task_id)
                     if is_fx_capable:
                         import builtins
                         # 纯 SPARK 内部旗标（video_generator 在腿边界读它）；外部 AdsPower
@@ -3868,7 +3934,10 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                             del ACTIVE_TASKS[task_id]
                     if title:
                         delete_idea_output_files(title)
-                    save_tasks_to_disk()
+                    # 显式删这条任务自己的三份文件。老实现是"从内存摘掉 →
+                    # save_tasks_to_disk() 靠孤儿扫描顺手删"，那个隐式耦合正是
+                    # 两次误删事故的机制本身（见 server_common 的 P2 说明）。
+                    delete_task_files(task_id)
                 self._send_json({'status': 'ok'})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
@@ -3940,7 +4009,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     for tid in to_delete:
                         ACTIVE_TASKS[tid]["cancel_event"].set()
                         del ACTIVE_TASKS[tid]
-                save_tasks_to_disk()
+                # 逐条显式删除，而不是靠一次全目录扫描"谁不在内存里就删谁"
+                for tid in to_delete:
+                    delete_task_files(tid)
                 self._send_json({'status': 'ok', 'count': len(to_delete)})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
@@ -3963,7 +4034,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 prompt_block = body.get('prompt_block', '')
                 target_sequences = body.get('target_sequences')
 
-                if not resolve_cover_reference(config, title):
+                if not resolve_cover_reference(config, title, project_key):
                     self._send_json({
                         'status': 'error',
                         'message': '请先生成或选择封面图；第一帧必须以封面图进行图生图。',
@@ -3988,7 +4059,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 cleanup_old_tasks()
                 # userId：本次使用的 AdsPower 浏览器编号，供 /api/compose-cancel 取消时
                 # 关闭正确的窗口（仅 google_fx 后端相关，api 后端留 None 无影响）
-                get_or_create_task(task_id, {"type": "frames", "theme": title, "userId": config.get('googleFxUserId') or None})
+                get_or_create_task(task_id, {"type": "frames", "theme": title, "project_key": project_key,
+                                             "userId": config.get('googleFxUserId') or None})
 
                 threading.Thread(
                     target=generate_frames_worker,
@@ -4035,7 +4107,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
 
                 cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "frames", "theme": title, "userId": config.get('googleFxUserId') or None})
+                get_or_create_task(task_id, {"type": "frames", "theme": title, "project_key": project_key,
+                                             "userId": config.get('googleFxUserId') or None})
 
                 threading.Thread(
                     target=fix_frame_issue_worker,
@@ -4118,7 +4191,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
 
                 cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "frames", "theme": title})
+                get_or_create_task(task_id, {"type": "frames", "theme": title, "project_key": project_key})
 
                 threading.Thread(
                     target=sequence_review_worker,
@@ -4237,7 +4310,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 task_id = f"videos_{uuid.uuid4().hex}"
 
                 cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "videos", "theme": title, "userId": config.get('googleFxUserId') or None})
+                get_or_create_task(task_id, {"type": "videos", "theme": title, "project_key": project_key,
+                                             "userId": config.get('googleFxUserId') or None})
 
                 threading.Thread(
                     target=generate_videos_worker,
@@ -5475,16 +5549,22 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 theme = body.get('theme', '')
                 prompt_block = body.get('prompt_block', '')
                 parent_task_id = body.get('id') or body.get('task_id')
+                # 与 /api/generate_frames 同款分工：project_key 定磁盘命名空间，
+                # title 只进提示词与日志。老客户端不发 project_key 时回落到标题
+                # （_get_project_dir 认得标题派生的那三套历史目录名）。
+                project_key = body.get('project_key') or title
 
                 import uuid
                 task_id = f"cover_{uuid.uuid4().hex}"
 
                 cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "cover", "theme": theme})
+                get_or_create_task(task_id, {"type": "cover", "theme": theme,
+                                             "project_key": project_key or None})
 
                 threading.Thread(
                     target=generate_cover_worker,
-                    args=(task_id, config, parent_task_id, title, theme, prompt_block),
+                    args=(task_id, config, parent_task_id, title, theme, prompt_block,
+                          project_key),
                     daemon=True
                 ).start()
 
@@ -6067,6 +6147,11 @@ def run():
         pass
     run_migrations()
     load_tasks_from_disk()
+    # 孤儿任务文件的清理只在这里跑一次，且只在 load_tasks_from_disk 真的成功之后
+    # （prune_orphan_task_files 自己也会复核 TASKS_LOADED_FROM_DISK）。它以前挂在
+    # save_tasks_to_disk 里、每次落盘都扫一遍全目录，那正是两次任务历史被清空的
+    # 事故路径。
+    prune_orphan_task_files()
     bootstrap_fx_runtime()
     # sys.stdout is None under pythonw (no console); guard prints so the server
     # also runs cleanly headless, while still logging when launched with python.exe.

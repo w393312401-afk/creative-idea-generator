@@ -83,16 +83,10 @@
 }
 
 /* --- Tasks Drawer Custom Styles --- */
-.tasks-empty {
-    font-size: 13px;
-    color: var(--text-muted);
-    text-align: center;
-    padding: 40px 0;
-    line-height: 1.6;
-}
-
-/* Header badge for active tasks */
-#toggle-tasks-btn {
+/* Header badge for active tasks（承载它的按钮从 #toggle-tasks-btn 换成了
+   #open-projects-btn —— 任务列表/点子库两个抽屉合并成项目工作台后 header 只剩
+   一个入口。角标本身的 id 与 updateTasksBadge 都没变。） */
+#open-projects-btn {
     position: relative;
 }
 .task-badge {
@@ -114,59 +108,35 @@
     animation: badgePulse 2s infinite;
 }
 
+/* 这枚角标挂在 .app-header 里，而 header 带 backdrop-filter: blur(16px)：角标
+   每帧的重绘都会脏掉 header 那块区域，逼浏览器把背景模糊重算一遍。而它恰好只在
+   「有任务在跑」时出现——也就是交互最需要跟手的时候一直在跑。
+   扩散光圈原本动的是 box-shadow（扩散半径 0 → 6px），属于绘制属性。改成一个绝对
+   定位的伪元素，只动 transform + opacity：视觉一样（红圈从贴边扩散到 6px 后淡出），
+   但这两个属性由合成器处理，不产生重绘，也就不会再触发 header 的重新模糊。 */
+.task-badge::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    box-shadow: 0 0 0 6px rgba(239, 68, 68, 0.7);
+    animation: badgeRing 2s infinite;
+    pointer-events: none;
+}
+
 @keyframes badgePulse {
-    0% {
-        transform: scale(1);
-        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
-    }
-    70% {
-        transform: scale(1.1);
-        box-shadow: 0 0 0 6px rgba(239, 68, 68, 0);
-    }
-    100% {
-        transform: scale(1);
-        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
-    }
+    0%   { transform: scale(1); }
+    70%  { transform: scale(1.1); }
+    100% { transform: scale(1); }
+}
+
+@keyframes badgeRing {
+    0%   { transform: scale(0.72); opacity: 1; }
+    70%  { transform: scale(1);    opacity: 0; }
+    100% { transform: scale(1);    opacity: 0; }
 }
 
 /* Task Cards inside drawer */
-.task-card {
-    background: rgba(var(--ink-rgb), 0.03);
-    border: 1px solid var(--border-color);
-    border-radius: 12px;
-    padding: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    transition: var(--transition-fast);
-}
-
-.task-card:hover {
-    background: rgba(var(--ink-rgb), 0.04);
-    border-color: rgba(var(--ink-rgb), 0.18);
-}
-
-.task-card-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 10px;
-}
-
-.task-card-title {
-    font-size: 13.5px;
-    font-weight: 600;
-    color: var(--text-main);
-    line-height: 1.4;
-    word-break: break-all;
-}
-
-.task-card-date {
-    font-size: 10px;
-    color: var(--text-muted);
-    margin-top: 2px;
-}
-
 /* Task Badge Statuses */
 .task-status-badge {
     font-size: 10px;
@@ -176,11 +146,25 @@
     white-space: nowrap;
 }
 
+/* 「运行中」徽标每行一个，项目工作台上同时跑几条时就是几条常驻动画。原来
+   statusPulse 同时动 opacity 和 box-shadow，后者每帧都触发重绘；辉光改由伪元素
+   承担，本体只留 opacity（合成器属性）。 */
 .task-status-badge.running {
     color: var(--neon-cyan);
     background: rgba(176, 123, 82, 0.08);
     border: 1px solid rgba(176, 123, 82, 0.3);
+    position: relative;
     animation: statusPulse 1.5s infinite alternate;
+}
+
+.task-status-badge.running::after {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    box-shadow: 0 0 8px rgba(176, 123, 82, 0.5);
+    animation: statusGlow 1.5s infinite alternate;
+    pointer-events: none;
 }
 
 .task-status-badge.completed {
@@ -202,181 +186,20 @@
 }
 
 @keyframes statusPulse {
-    0% {
-        opacity: 0.7;
-        box-shadow: 0 0 2px rgba(176, 123, 82, 0.2);
-    }
-    100% {
-        opacity: 1;
-        box-shadow: 0 0 8px rgba(176, 123, 82, 0.5);
-    }
+    0%   { opacity: 0.7; }
+    100% { opacity: 1; }
 }
 
-/* Mini Progress Bar inside running tasks */
-.task-progress-container {
-    width: 100%;
-    margin-top: 4px;
+@keyframes statusGlow {
+    0%   { opacity: 0.25; }
+    100% { opacity: 1; }
 }
 
-.task-progress-text {
-    font-size: 11px;
-    color: var(--text-secondary);
-    display: flex;
-    justify-content: space-between;
-    margin-bottom: 4px;
-}
-
-.task-progress-bar {
-    height: 4px;
-    background: rgba(var(--ink-rgb), 0.06);
-    border-radius: 2px;
-    overflow: hidden;
-}
-
-.task-progress-fill {
-    height: 100%;
-    border-radius: inherit;
-    background: linear-gradient(90deg, var(--neon-cyan), var(--neon-magenta));
-    box-shadow: 0 0 6px var(--neon-cyan-glow);
-    width: 0%;
-    transition: width 0.4s ease-out;
-}
-
-/* Error message inside failed tasks */
-.task-error-text {
-    font-size: 11px;
-    color: #f87171;
-    background: rgba(239, 68, 68, 0.05);
-    padding: 6px 10px;
-    border-radius: 6px;
-    border: 1px solid rgba(239, 68, 68, 0.1);
-    word-break: break-all;
-}
-
-.task-completed-details {
-    display: grid;
-    gap: 8px;
-    padding: 9px 10px;
-    border: 1px solid rgba(16, 185, 129, 0.32);
-    border-radius: 8px;
-    background: rgba(16, 185, 129, 0.08);
-}
-
-.task-duration-info,
-.task-rerun-model {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    font-size: 11px;
-    color: var(--text-secondary);
-}
-
-.task-duration-info strong {
-    color: var(--text-main);
-    font-family: var(--font-mono, monospace);
-    font-size: 11px;
-}
-
-.task-rerun-model-select {
-    min-width: 0;
-    max-width: 72%;
-    height: 28px;
-    padding: 0 24px 0 8px;
-    border: 1px solid rgba(var(--ink-rgb), 0.24);
-    border-radius: 6px;
-    background-color: var(--bg-panel-solid);
-    color: var(--text-primary);
-    font-size: 10.5px;
-    cursor: pointer;
-}
-
-.task-rerun-model-select option,
-.task-rerun-model-select optgroup {
-    background-color: var(--bg-panel-solid);
-    color: var(--text-primary);
-}
-
-.task-rerun-model-select:hover {
-    border-color: rgba(var(--ink-rgb), 0.42);
-}
-
-.task-rerun-model-select:focus {
-    outline: none;
-    border-color: var(--neon-cyan);
-    box-shadow: 0 0 0 2px rgba(176, 123, 82, 0.1);
-}
-
-/* Task card buttons */
-.task-card-footer {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    margin-top: 4px;
-}
-
-.task-action-btn {
-    font-size: 11px;
-    padding: 4px 10px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-weight: 500;
-    transition: var(--transition-fast);
-    border: 1px solid transparent;
-}
-
-.task-action-btn.view {
-    background: rgba(176, 123, 82, 0.1);
-    color: var(--neon-cyan);
-    border-color: rgba(176, 123, 82, 0.2);
-}
-
-.task-action-btn.view:hover {
-    background: rgba(176, 123, 82, 0.2);
-    border-color: var(--neon-cyan);
-}
-
-.task-action-btn.cancel {
-    background: rgba(239, 68, 68, 0.1);
-    color: #f87171;
-    border-color: rgba(239, 68, 68, 0.2);
-}
-
-.task-action-btn.cancel:hover {
-    background: rgba(239, 68, 68, 0.2);
-    border-color: #ef4444;
-}
-
-.task-action-btn.delete {
-    background: rgba(var(--ink-rgb), 0.04);
-    color: var(--text-secondary);
-    border-color: rgba(var(--ink-rgb), 0.08);
-}
-
-.task-action-btn.delete:hover {
-    background: rgba(239, 68, 68, 0.15);
-    color: #ef4444;
-    border-color: rgba(239, 68, 68, 0.2);
-}
-
-.task-action-btn.retry {
-    background: rgba(16, 185, 129, 0.1);
-    color: #047857;
-    border-color: rgba(5, 150, 105, 0.38);
-}
-
-.task-action-btn.retry:hover {
-    background: rgba(16, 185, 129, 0.18);
-    border-color: #047857;
-}
-
-html[data-theme="dark"] .task-status-badge.completed,
-html[data-theme="dark"] .task-action-btn.retry {
+/* 任务卡（.task-card / .task-action-btn / .task-rerun-model-select）的样式已随
+   「激发任务列表」抽屉于 2026-07-31（P4）删除，改由 css/projects.css 承担。
+   .task-status-badge 保留：js/image_studio.js 的实时生成动态还在复用它。 */
+html[data-theme="dark"] .task-status-badge.completed {
     color: #6ee7b7;
-}
-
-html[data-theme="dark"] .task-action-btn.retry:hover {
-    border-color: #6ee7b7;
 }
 
 /* Topic Ideation Styles */
@@ -1366,7 +1189,7 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
     }
     
     .header-controls .icon-btn span:not(#theme-toggle-icon):not(.task-badge) {
-        display: none !important; /* Hide "任务列表", "点子库" text, but keep the theme emoji and task-count badge */
+        display: none !important; /* Hide the "项目" label, but keep the theme emoji and task-count badge */
     }
 
     /* API Status Badge on mobile: show only status dot, hide text to save space */
@@ -1465,28 +1288,7 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
     /* 6.（原结果页头部横滑按钮条已被管线条取代：手机上的两行布局
           ——横滑步骤芯片 + 撑满的主按钮——见 css/app/result-minimal.css） */
 
-    /* 7. Drawers on mobile: full screen width, use transform for GPU compositing */
-    .drawer {
-        width: 100vw !important;
-        right: 0 !important;
-        transform: translateX(100%) !important;
-    }
-    
-    .drawer.active {
-        transform: translateX(0) !important;
-    }
-    
-    .drawer-header {
-        padding: 16px 20px !important;
-    }
-    
-    .drawer-actions {
-        padding: 10px 20px !important;
-    }
-    
-    .drawer-body {
-        padding: 16px 20px !important;
-    }
+    /* 7.（两个右侧抽屉的移动端规则已随抽屉本体于 P4 删除） */
 
     /* 8. Modals on mobile: full width with margins, scrollable settings */
     .modal-content {
@@ -1553,8 +1355,9 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
      3. 收紧内容区留白、藏掉触屏上无意义的拖拽说明。
    ===================================================================== */
 @media (max-width: 768px) {
-    /* — 顶部工作区切换条：4 个「图标 + 两字词」标签在 390px 宽屏里会折成两行，
-         白吃掉 60 多像素高度；压到一行显示 — */
+    /* — 顶部工作区切换条：标签在 390px 宽屏里会折成两行，白吃掉 60 多像素高度；
+         压到一行显示。2026-07-31 起是 5 个（新增「📁 项目」），比原先的 4 个更挤，
+         字号与内边距再收一档，并允许标签文字在极窄屏下省略而不是把整条撑折。 — */
     .mobile-nav-tabs {
         padding: 3px;
         margin-bottom: 8px;
@@ -1562,11 +1365,17 @@ html[data-theme="dark"] .task-action-btn.retry:hover {
     }
 
     .mobile-nav-btn {
-        padding: 8px 4px;
-        font-size: 11.5px;
-        gap: 4px;
+        padding: 8px 3px;
+        font-size: 11px;
+        gap: 3px;
         white-space: nowrap;
         min-width: 0;
+        overflow: hidden;
+    }
+
+    .mobile-nav-btn .btn-text {
+        overflow: hidden;
+        text-overflow: ellipsis;
     }
 
     .mobile-nav-btn .btn-icon {
@@ -2772,32 +2581,6 @@ body.log-expanded .log-pill {
     color: #f472b6;
     border: 1px solid rgba(236, 72, 153, 0.3);
 }
-.task-error-text.collapsible-error {
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-    cursor: pointer;
-    position: relative;
-    transition: max-height 0.2s ease-out;
-    max-height: 2.8em;
-}
-.task-error-text.collapsible-error.expanded {
-    display: block;
-    max-height: none;
-    overflow: visible;
-}
-.task-error-text.collapsible-error::after {
-    content: " ↙ 点击展开全部";
-    font-size: 9px;
-    color: var(--text-muted);
-    display: inline-block;
-    margin-left: 4px;
-}
-.task-error-text.collapsible-error.expanded::after {
-    content: " ↖ 点击收起";
-}
-
 /* （批量删除相关样式已删除：#tasks-batch-actions-bar/.task-select-checkbox
    对应的功能从未接线，DOM 已随本次重构一并移除） */
 
@@ -2809,7 +2592,6 @@ body.log-expanded .log-pill {
 /* Isolate scroll containers so off-screen content is excluded from paint */
 .panel-body,
 .content-scroll-area,
-.drawer-body,
 .terminal-body {
     contain: layout style;
     /* Smooth momentum scrolling on touch/trackpad */
@@ -2820,12 +2602,6 @@ body.log-expanded .log-pill {
    This prevents card hover-transforms from dirtying sibling elements. */
 .anchor-node,
 .ideation-card,
-.saved-card,
-.task-card {
-    transform: translateZ(0);
-    backface-visibility: hidden;
-}
-
 /* Reduce the paint cost of the glass-panel hover: only animate border-color,
    not the full box-shadow composite. The shadow is already statically defined. */
 .glass-panel {

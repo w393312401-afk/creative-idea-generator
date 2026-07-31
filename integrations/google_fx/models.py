@@ -38,11 +38,17 @@ class VideoRequest(BrowserEnvLockedRequest):
     prompt: str = ""
     image: str = ""       # 首帧 (Start frame) 本地路径
     end_image: str = ""   # 尾帧 (End frame) 本地路径，可选
+    # 首/尾帧在 Flow 画布上的媒体 UUID。帧序列本来就是在 project_url 那个画布上
+    # 生成的（manifest.frames[].fx_uuid），带上 UUID 就能直接挂载画布已有资产，
+    # 不必把同一张图再上传一轮。留空 = 未知，照旧上传本地文件。
+    image_uuid: str = ""
+    end_image_uuid: str = ""
     ratio: Optional[str] = None
     # 可选: "Veo 3.1 - Fast" | "Veo 3.1 - Quality"
     model: str = Field(default_factory=get_runtime_google_fx_video_model)
     duration: Optional[str] = None
     output_path: str = ""
+    project_url: Optional[str] = None  # Bound Flow canvas for the local project.
 
 
 
@@ -87,6 +93,7 @@ class ImageBatchRequest(BrowserEnvLockedRequest):
     # 可选: "Nano Banana Pro" | "Nano Banana 2" | "Nano Banana 2 Lite"
     model: str = Field(default_factory=get_runtime_google_fx_image_model)
     output_path: str = ""
+    project_url: Optional[str] = None  # Reuse across five-item submission chunks.
 
 
 class GoogleFxRunRequest(BrowserEnvLockedRequest):

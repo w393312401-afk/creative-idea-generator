@@ -118,29 +118,12 @@
 /* Custom Scrollbar for panel body */
 .panel-body::-webkit-scrollbar,
 .content-scroll-area::-webkit-scrollbar,
-.drawer-body::-webkit-scrollbar {
-    width: 6px;
-}
-
 .panel-body::-webkit-scrollbar-track,
 .content-scroll-area::-webkit-scrollbar-track,
-.drawer-body::-webkit-scrollbar-track {
-    background: transparent;
-}
-
 .panel-body::-webkit-scrollbar-thumb,
 .content-scroll-area::-webkit-scrollbar-thumb,
-.drawer-body::-webkit-scrollbar-thumb {
-    background: rgba(var(--ink-rgb), 0.06);
-    border-radius: 4px;
-}
-
 .panel-body::-webkit-scrollbar-thumb:hover,
 .content-scroll-area::-webkit-scrollbar-thumb:hover,
-.drawer-body::-webkit-scrollbar-thumb:hover {
-    background: rgba(176, 123, 82, 0.3);
-}
-
 /* Control Group elements */
 .control-group {
     display: flex;
@@ -1172,52 +1155,6 @@ html[data-theme="dark"] .segment-btn.active {
 }
 
 /* Saved Drawer */
-.drawer {
-    position: fixed;
-    /* Docks below the header/tab bar (see updateDrawerTopOffset in app.js) so a
-       persistent drawer never covers its own header toggle/collapse button. */
-    top: var(--drawer-top-offset, 100px);
-    right: 0;
-    width: 380px;
-    height: calc(100vh - var(--drawer-top-offset, 100px));
-    height: calc(100dvh - var(--drawer-top-offset, 100px)); /* mobile URL-bar-aware */
-    background: var(--bg-panel-solid);
-    border-left: 1px solid var(--border-color);
-    z-index: 100;
-    display: flex;
-    flex-direction: column;
-    box-shadow: -10px 0 30px rgba(var(--ink-rgb), 0.12);
-    /* Use transform instead of right for GPU compositing (no layout recalc) */
-    transform: translateX(100%);
-    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    will-change: transform;
-}
-
-.drawer.active {
-    transform: translateX(0);
-}
-
-.drawer-header {
-    padding: 24px 28px;
-    border-bottom: 1px solid var(--border-color);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-}
-
-.drawer-header h3 {
-    font-family: 'Outfit', sans-serif;
-    font-size: 18px;
-    font-weight: 700;
-}
-
-.drawer-actions {
-    display: flex;
-    gap: 10px;
-    padding: 12px 28px;
-    border-bottom: 1px solid var(--border-color);
-}
-
 .close-btn {
     background: transparent;
     border: none;
@@ -1230,89 +1167,6 @@ html[data-theme="dark"] .segment-btn.active {
 
 .close-btn:hover {
     color: var(--text-main);
-}
-
-.drawer-body {
-    padding: 24px 28px;
-    overflow-y: auto;
-    flex-grow: 1;
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-}
-
-.library-empty {
-    font-size: 13px;
-    color: var(--text-muted);
-    text-align: center;
-    padding: 40px 0;
-    line-height: 1.6;
-}
-
-.saved-card {
-    background: rgba(var(--ink-rgb), 0.03);
-    border: 1px solid var(--border-color);
-    border-radius: 12px;
-    padding: 16px;
-    cursor: pointer;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    transition: var(--transition-fast);
-}
-
-.saved-card:hover {
-    background: rgba(var(--ink-rgb), 0.04);
-    border-color: var(--neon-cyan);
-    transform: translateX(-4px);
-}
-
-.saved-card-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-}
-
-.saved-card-header h4 {
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--text-main);
-}
-
-.saved-card-date {
-    font-size: 10px;
-    color: var(--text-muted);
-}
-
-.saved-card-footer {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-top: 4px;
-}
-
-.saved-card-theme {
-    font-size: 10.5px;
-    color: var(--neon-cyan);
-    background: rgba(176, 123, 82, 0.05);
-    padding: 2px 8px;
-    border-radius: 10px;
-    border: 1px solid rgba(176, 123, 82, 0.15);
-}
-
-.delete-saved-btn {
-    background: transparent;
-    border: none;
-    color: var(--text-muted);
-    cursor: pointer;
-    padding: 4px;
-    border-radius: 4px;
-    transition: var(--transition-fast);
-}
-
-.delete-saved-btn:hover {
-    color: var(--neon-magenta);
-    background: rgba(176, 101, 78, 0.05);
 }
 
 /* Modals - GPU animated fade (no display toggle = smooth) */
@@ -1332,13 +1186,22 @@ html[data-theme="dark"] .segment-btn.active {
     justify-content: center;
     opacity: 0;
     pointer-events: none;
-    transition: opacity 0.2s ease;
-    will-change: opacity;
+    /* 关键：没有 visibility 的话，opacity:0 的弹窗仍然留在渲染树里参与合成——
+       而每个弹窗都是 100vw×100vh 且带 backdrop-filter: blur(8px)，页面上有 3 个，
+       等于常年挂着三层全屏背景模糊。原来还写了 will-change: opacity，把它们
+       长期钉成独立合成层，让浏览器更没机会把这三层优化掉。
+       visibility 加进过渡链（收起时延迟到淡出结束再切 hidden）既保住淡入淡出，
+       又让关着的弹窗彻底退出渲染。will-change 交给浏览器自己判断——它只该在
+       真正要变的那一小段时间内出现，常驻反而是负担。 */
+    visibility: hidden;
+    transition: opacity 0.2s ease, visibility 0s linear 0.2s;
 }
 
 .modal.active {
     opacity: 1;
     pointer-events: auto;
+    visibility: visible;
+    transition: opacity 0.2s ease, visibility 0s linear 0s;
 }
 
 .modal-content {

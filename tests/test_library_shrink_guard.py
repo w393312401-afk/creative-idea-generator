@@ -12,7 +12,7 @@
 """
 import pytest
 
-from server_common import library_shrink_verdict, parse_library_payload
+from server_common import library_shrink_verdict
 
 
 def _idea(ident, title='某个创意', frames=None):
@@ -147,26 +147,6 @@ class TestNonShrinkingWrites:
         old = [_idea('a')]
         ok, _, _ = library_shrink_verdict(old, list(old), None)
         assert ok is True
-
-
-class TestPayloadParsing:
-    def test_bare_array_is_legacy_contract(self):
-        ideas, intent = parse_library_payload([_idea('a')])
-        assert len(ideas) == 1 and intent == {}
-
-    def test_envelope_carries_intent(self):
-        ideas, intent = parse_library_payload(
-            {'ideas': [_idea('a')], 'intent': {'removed_ids': ['b']}})
-        assert len(ideas) == 1
-        assert intent == {'removed_ids': ['b']}
-
-    def test_envelope_without_valid_ideas_is_rejected(self):
-        ideas, intent = parse_library_payload({'ideas': 'nope'})
-        assert ideas is None and intent == {}
-
-    def test_envelope_intent_may_be_absent(self):
-        ideas, intent = parse_library_payload({'ideas': []})
-        assert ideas == [] and intent == {}
 
 
 def test_ids_are_compared_as_strings():

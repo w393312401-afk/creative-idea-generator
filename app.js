@@ -205,6 +205,7 @@ function switchMainTab(tabName) {
         config: document.querySelector('.panel-left'),
         results: document.querySelector('.panel-right'),
         image: document.getElementById('panel-image-studio'),
+        projects: document.getElementById('panel-projects'),
         gallery: document.getElementById('panel-gallery'),
         ledger: document.getElementById('panel-ledger'),
     };
@@ -212,6 +213,7 @@ function switchMainTab(tabName) {
         config: document.getElementById('main-tab-config'),
         results: document.getElementById('main-tab-results'),
         image: document.getElementById('main-tab-image'),
+        projects: document.getElementById('main-tab-projects'),
         gallery: document.getElementById('main-tab-gallery'),
         ledger: document.getElementById('main-tab-ledger'),
     };
@@ -234,6 +236,13 @@ function switchMainTab(tabName) {
     // 这样"存入备选"后立刻切回台账页也能看到最新数据，无需手动点刷新
     if (tab === 'ledger' && typeof ledgerTabEntered === 'function') {
         ledgerTabEntered();
+    }
+    // 项目工作台：进入时拉一次并开始轮询，离开时立刻停表。轮询节奏由
+    // js/projects.js 按"有没有项目在跑"自己决定（4s / 30s），离开页面还接着
+    // 空转就是旧任务抽屉那种恒定 2.5s 全量轮询的老毛病。
+    if (typeof projectsTabEntered === 'function') {
+        if (tab === 'projects') projectsTabEntered();
+        else if (typeof projectsTabLeft === 'function') projectsTabLeft();
     }
 }
 
@@ -261,34 +270,6 @@ function switchTab(tabId) {
     });
 }
 
-function showDeleteConfirm(card, ideaId) {
-    document.querySelectorAll('.delete-confirm-overlay').forEach(overlay => overlay.remove());
-    
-    const overlay = document.createElement('div');
-    overlay.className = 'delete-confirm-overlay';
-    overlay.innerHTML = `
-        <span class="delete-confirm-text">确定删除此点子？</span>
-        <button class="delete-confirm-btn yes">删除</button>
-        <button class="delete-confirm-btn no">取消</button>
-    `;
-    
-    overlay.querySelector('.yes').addEventListener('click', (e) => {
-        e.stopPropagation();
-        deleteFromLibrary(ideaId);
-    });
-    
-    overlay.querySelector('.no').addEventListener('click', (e) => {
-        e.stopPropagation();
-        overlay.remove();
-    });
-    
-    overlay.addEventListener('click', (e) => {
-        e.stopPropagation();
-    });
-    
-    card.appendChild(overlay);
-}
-
 function updateFavoriteButtonState() {
     const saveBtn = document.getElementById('save-idea-btn');
     const saveBtnText = document.getElementById('save-idea-btn-text');
@@ -304,25 +285,51 @@ function updateFavoriteButtonState() {
     }
 }
 
-let _scrollPending = false;
-function appendLiveTerminal(chunk) {
+// 实况终端的写入必须按帧合批，不能按 chunk 直写。compose 是流式的，
+// text_chunk 事件在一次激发里能来几千到上万条（LLM 逐 token 推），每条都
+// createTextNode + insertBefore 的话：① 主线程在整个生成期间被 DOM 写入占满，
+// 点按钮/切标签/滚动全部排在后面，就是"交互延迟高"的直接来源；② 文本节点
+// 只增不减，跑到后半程终端里挂着几万个节点，之后每次滚动都要重新布局这一大坨。
+// 现在：chunk 先进字符串缓冲，一帧最多落一次 DOM；同时把终端内容裁到
+// LIVE_TERMINAL_MAX_CHARS，只留最近的一段（往上翻的是完整日志 dock 的活，
+// 这里本来就只是"看着它在动"）。
+const LIVE_TERMINAL_MAX_CHARS = 20000;
+let _terminalBuffer = '';
+let _terminalFlushPending = false;
+let _terminalText = '';
+
+function flushLiveTerminal() {
+    _terminalFlushPending = false;
     const body = document.getElementById('live-terminal-body');
-    if (!body) return;
-    const cursor = body.querySelector('.terminal-cursor');
-    if (cursor) {
-        const textNode = document.createTextNode(chunk);
-        body.insertBefore(textNode, cursor);
-    } else {
-        body.textContent += chunk;
+    if (!body) { _terminalBuffer = ''; return; }
+    if (_terminalBuffer) {
+        _terminalText += _terminalBuffer;
+        _terminalBuffer = '';
+        if (_terminalText.length > LIVE_TERMINAL_MAX_CHARS) {
+            // 从行首截断，别把一行劈成半截
+            const cut = _terminalText.length - LIVE_TERMINAL_MAX_CHARS;
+            const nl = _terminalText.indexOf('\n', cut);
+            _terminalText = _terminalText.slice(nl >= 0 ? nl + 1 : cut);
+        }
+        const cursor = body.querySelector('.terminal-cursor');
+        body.textContent = _terminalText;
+        if (cursor) body.appendChild(cursor);
     }
-    // Throttle auto-scroll with rAF to avoid forced layout on every chunk
-    if (!_scrollPending) {
-        _scrollPending = true;
-        requestAnimationFrame(() => {
-            body.scrollTop = body.scrollHeight;
-            _scrollPending = false;
-        });
+    body.scrollTop = body.scrollHeight;
+}
+
+function appendLiveTerminal(chunk) {
+    if (!chunk) return;
+    _terminalBuffer += chunk;
+    if (!_terminalFlushPending) {
+        _terminalFlushPending = true;
+        requestAnimationFrame(flushLiveTerminal);
     }
+}
+
+function resetLiveTerminal() {
+    _terminalBuffer = '';
+    _terminalText = '';
 }
 
 function startLoadingTimer(startTimeOverride = null) {
@@ -339,6 +346,7 @@ function startLoadingTimer(startTimeOverride = null) {
     const terminalBody = document.getElementById('live-terminal-body');
     if (terminalBody) {
         terminalBody.innerHTML = '<span class="terminal-cursor"></span>';
+        resetLiveTerminal();
         appendLiveTerminal("[SYSTEM] Initializing creative idea engine...\n[SYSTEM] Loading restoration-prompt-composer contract...\n");
     }
 
@@ -525,69 +533,83 @@ async function loadLibrary() {
             }
         }
     }
-    renderLibrary();
+    if (typeof refreshProjects === 'function') refreshProjects({ assets: false });
 }
 
-// Save library to both API (server file) and localStorage (browser backup)
-//
-// intent（可选）：声明这次回写是哪次删除造成的缩量，服务端的缩量闸门据此放行
-// （见 server_common.library_shrink_verdict）。不声明就写"少了东西"的库一律被
-// 409 拒绝——这是 2026-07-12 整库清零与 2026-07-27 真库被测试覆盖两次事故之后
-// 补的第三道防线。合法缩量只有三处，都在下面注明：
-//   · deleteFromLibrary        → { removedIds: [id] }
-//   · syncFrameRunToLibrary    → { frameShrinkIds: [id] }（服务端 manifest 为准）
-//   · media_renderer 幽灵清理  → { frameShrinkIds: [id] }
-// 返回 true/false 表示服务端是否真的接受了这次写入。
-async function saveLibrary(intent) {
-    // 1. Always write to localStorage as a fallback backup
-    localStorage.setItem('spark_library', JSON.stringify(savedIdeas));
+/* ==========================================================================
+   创意库写入路径
+   --------------------------------------------------------------------------
+   历史上这里是 saveLibrary()：「整表覆盖」——客户端持有完整数组、整份 POST 回
+   /api/library。代价是每次改动都要上传全库（实测单条创意 164KB），而且服务端
+   为了防住这个动作本身挂了三道闸门（空库拒写 / 槽位不自洽 / 未声明缩量 409），
+   用户日常撞到的就是那句"保存失败，请刷新页面后重试"。
 
-    // 2. Attempt saving to server file database
-    let ok = false;
-    try {
-        const removedIds = (intent && intent.removedIds) || [];
-        const frameShrinkIds = (intent && intent.frameShrinkIds) || [];
-        // 无声明时仍发裸数组：历史契约不变，服务端两种形态都收
-        const body = (removedIds.length || frameShrinkIds.length)
-            ? JSON.stringify({
-                ideas: savedIdeas,
-                intent: {
-                    removed_ids: removedIds.map(String),
-                    frame_shrink_ids: frameShrinkIds.map(String),
-                },
-            })
-            : JSON.stringify(savedIdeas);
-        const response = await fetch('/api/library', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body
-        });
-        // 409 = 服务端主动拒写（空库覆盖/槽位不自洽/未声明缩量）。这类拒绝必须
-        // 说出来：被静默吞掉的防护等于没有防护，用户会以为改动已经存下来了。
-        if (response.status === 409) {
-            const data = await response.json().catch(() => ({}));
-            console.warn('[library] 服务端拒绝了这次库覆盖:', data);
-            if (typeof showToast === 'function') {
-                showToast(data.message || '服务器拒绝了这次创意库保存，请刷新页面后重试。', 'error');
-            }
-            return false;
-        }
-        if (!response.ok) {
-            throw new Error(`Server returned HTTP ${response.status}`);
-        }
-        console.log("Successfully persisted library to local server file.");
-        ok = true;
-    } catch (e) {
-        console.warn("Failed to persist library to server, backed up in localStorage only", e);
-        if (typeof showToast === 'function') {
-            showToast('创意库暂时只存到了浏览器本地（服务器写入失败），请检查服务是否在运行。', 'error');
-        }
+   2026-07-31（P1/P4）整表写入已彻底移除，全部改走 /api/library/item 与
+   /api/library/item/delete：一次只碰一条记录，服务端只写它自己的正文文件 +
+   索引行。因此：
+     · 不会碰到别的记录，"整库清零 / 未声明缩量"在结构上不可能发生；
+     · 删掉库里最后一条也不会被 409（老路径会撞上"空列表覆盖非空库"防护）；
+     · 调用方不必再声明"这次缩量是我有意为之"。
+   见 docs/project_workbench_refactor_plan.md
+   ========================================================================== */
+
+// 单条写入服务端。返回 true/false 表示服务端是否接受。
+async function persistIdeaItem(idea) {
+    if (!idea || idea.id === undefined || idea.id === null || idea.id === '') {
+        console.warn('[library] 缺少 id，无法单条写入', idea);
+        return false;
     }
+    // localStorage 仍留一份整库镜像作为服务器写失败时的兜底
+    try {
+        localStorage.setItem('spark_library', JSON.stringify(savedIdeas));
+    } catch (e) {
+        console.warn('[library] localStorage 镜像写入失败（不影响服务器写入）', e);
+    }
+    try {
+        const res = await fetch('/api/library/item', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ item: idea }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.status !== 'success') {
+            throw new Error(data.message || `HTTP ${res.status}`);
+        }
+        return true;
+    } catch (e) {
+        console.warn('[library] 单条写入失败', e);
+        if (typeof showToast === 'function') {
+            showToast(`收藏只存到了浏览器本地（服务器写入失败：${e.message}）`, 'error');
+        }
+        return false;
+    }
+}
 
-    renderLibrary();
-    return ok;
+// 单条删除。服务端顺带清掉这条创意生成的图片/视频文件，所以不必再单独打一次
+// /api/library/delete_item。
+async function deleteIdeaItem(idea) {
+    try {
+        const res = await fetch('/api/library/item/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                id: idea.id,
+                title: getIdeaSaveTitle(idea),
+                covers: idea.covers || [],
+            }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.status !== 'ok') {
+            throw new Error(data.message || `HTTP ${res.status}`);
+        }
+        return true;
+    } catch (e) {
+        console.error('[library] 单条删除失败', e);
+        if (typeof showToast === 'function') {
+            showToast(`删除失败：${e.message}`, 'error');
+        }
+        return false;
+    }
 }
 
 // Check API status via the server-side ping (the server reaches the local proxy
@@ -871,67 +893,12 @@ async function updateCacheSizeInfo() {
     }
 }
 
-// --- Persistent panel (tasks/library) helpers -----------------------------
-// Both drawers stay open once opened (no auto-close on outside click) so they
-// can be used as a reference alongside the rest of the workspace; the header
-// toggle button doubles as the "收起" (collapse) control, its label swapping
-// to make that discoverable.
-const DRAWER_TOGGLE_LABELS = {
-    'toggle-tasks-btn': '任务列表',
-    'toggle-library-btn': '点子库',
-};
+// 「任务列表」「点子库」两个右侧抽屉及其开合函数已于 2026-07-31（P4）删除，
+// 内容合并进「📁 项目」主标签页（js/projects.js）。右侧现在只剩日志 dock 一个
+// 停靠物，不再需要三者互斥的那套协调逻辑。
 
-function setDrawerToggleOpenState(btnId, isOpen) {
-    const btn = document.getElementById(btnId);
-    if (!btn) return;
-    const label = DRAWER_TOGGLE_LABELS[btnId] || '';
-    const labelSpan = btn.querySelector('span:not(.task-badge)');
-    btn.classList.toggle('panel-open', isOpen);
-    btn.title = isOpen ? `收起${label}` : label;
-    if (labelSpan) labelSpan.textContent = isOpen ? '收起' : label;
-}
-
-function openLibraryDrawer() {
-    const libraryDrawer = document.getElementById('library-drawer');
-    if (!libraryDrawer) return;
-    closeTasksDrawer();
-    // 日志 dock 也停靠右侧，三者互斥（见 api_client.js setLogDockOpen）
-    if (typeof window.collapseLogDock === 'function') window.collapseLogDock();
-    libraryDrawer.classList.add('active');
-    setDrawerToggleOpenState('toggle-library-btn', true);
-    renderLibrary();
-}
-
-function closeLibraryDrawer() {
-    const libraryDrawer = document.getElementById('library-drawer');
-    if (!libraryDrawer) return;
-    libraryDrawer.classList.remove('active');
-    setDrawerToggleOpenState('toggle-library-btn', false);
-}
-
-function openTasksDrawer() {
-    const tasksDrawer = document.getElementById('tasks-drawer');
-    if (!tasksDrawer) return;
-    closeLibraryDrawer();
-    if (typeof window.collapseLogDock === 'function') window.collapseLogDock();
-    tasksDrawer.classList.add('active');
-    setDrawerToggleOpenState('toggle-tasks-btn', true);
-    renderTasks();
-    startTasksPolling();
-}
-
-function closeTasksDrawer() {
-    const tasksDrawer = document.getElementById('tasks-drawer');
-    if (!tasksDrawer) return;
-    tasksDrawer.classList.remove('active');
-    setDrawerToggleOpenState('toggle-tasks-btn', false);
-    stopTasksPolling();
-}
-
-// The persistent drawers are position:fixed siblings of .app-container, so a plain
-// `top: 0` box would paint over the header (and its own collapse button) rather than
-// under it. Anchor the drawer below the real header+tab-bar height instead of a
-// hardcoded pixel value, since that height differs across breakpoints.
+// 日志 dock 是 position:fixed 的，`top: 0` 会盖住 header（含它自己的收起按钮）。
+// 这里按真实的 header+标签栏高度锚定它，而不是写死像素——那个高度随断点变化。
 function updateDrawerTopOffset() {
     const anchor = document.querySelector('.mobile-nav-tabs') || document.querySelector('.app-header');
     if (!anchor) return;
@@ -1042,63 +1009,23 @@ function setupEventListeners() {
         });
     }
 
-    // Library Drawer
-    const openLibrary = document.getElementById('toggle-library-btn');
-    const closeLibrary = document.getElementById('close-library-btn');
-    const libraryDrawer = document.getElementById('library-drawer');
-    const tasksDrawer = document.getElementById('tasks-drawer');
-
-    openLibrary.addEventListener('click', () => {
-        if (libraryDrawer.classList.contains('active')) {
-            closeLibraryDrawer();
-        } else {
-            openLibraryDrawer();
-        }
-    });
-    closeLibrary.addEventListener('click', closeLibraryDrawer);
-
-    // Tasks Drawer
-    const openTasks = document.getElementById('toggle-tasks-btn');
-    const closeTasks = document.getElementById('close-tasks-btn');
-
-    if (openTasks && closeTasks && tasksDrawer) {
-        openTasks.addEventListener('click', () => {
-            if (tasksDrawer.classList.contains('active')) {
-                closeTasksDrawer();
-            } else {
-                openTasksDrawer();
-            }
-        });
-        closeTasks.addEventListener('click', closeTasksDrawer);
-    }
-
-    // Tasks Drawer filter inputs and clear buttons
-    const tasksSearchInput = document.getElementById('tasks-search');
-    const tasksStatusSelect = document.getElementById('tasks-filter-status');
-    const tasksTypeSelect = document.getElementById('tasks-filter-type');
-    const clearCompletedBtn = document.getElementById('clear-completed-btn');
-    const clearFailedBtn = document.getElementById('clear-failed-btn');
-
-    if (tasksSearchInput) {
-        // Debounce: avoid firing a network fetch on every single keystroke
-        const debouncedSearch = _debounce((e) => {
-            tasksSearchQuery = e.target.value;
-            renderTasks();
-        }, 300);
-        tasksSearchInput.addEventListener('input', debouncedSearch);
-    }
-    if (tasksStatusSelect) {
-        tasksStatusSelect.addEventListener('change', (e) => {
-            tasksFilterStatus = e.target.value;
-            renderTasks();
+    // 项目工作台入口。header 上原先是「任务列表」「点子库」两个抽屉切换按钮，
+    // 现在合并成这一个（见 index.html #open-projects-btn）——两个抽屉的内容都
+    // 搬进了 #panel-projects 主标签页。点它时若已有任务在跑就直接落到"运行中"
+    // 筛选，那正是用户点角标时想看的东西。
+    const openProjectsBtn = document.getElementById('open-projects-btn');
+    if (openProjectsBtn && typeof openProjectsWorkbench === 'function') {
+        openProjectsBtn.addEventListener('click', () => {
+            const badge = document.getElementById('active-task-count');
+            const hasRunning = badge && badge.style.display !== 'none';
+            openProjectsWorkbench(hasRunning ? 'running' : 'all');
         });
     }
-    if (tasksTypeSelect) {
-        tasksTypeSelect.addEventListener('change', (e) => {
-            tasksFilterType = e.target.value;
-            renderTasks();
-        });
-    }
+
+    // 抽屉里那两个「清空已完成 / 清空失败」搬到了项目工作台工具栏；筛选与搜索
+    // 由 js/projects.js 的 chips 接管，不再需要这里的三个绑定。
+    const clearCompletedBtn = document.getElementById('projects-clear-completed-btn');
+    const clearFailedBtn = document.getElementById('projects-clear-failed-btn');
     if (clearCompletedBtn) {
         clearCompletedBtn.addEventListener('click', () => clearTasks('completed'));
     }
@@ -1347,19 +1274,9 @@ function setupEventListeners() {
     }
 
     // Library search & filters
-    const libSearch = document.getElementById('library-search');
-    const libFilterTime = document.getElementById('library-filter-time');
-    let searchTimeout = null;
-    if (libSearch) {
-        libSearch.addEventListener('input', () => {
-            clearTimeout(searchTimeout);
-            searchTimeout = setTimeout(renderLibrary, 200);
-        });
-    }
-    if (libFilterTime) libFilterTime.addEventListener('change', renderLibrary);
-
-    // Library Drawer buttons
-    document.getElementById('export-all-btn').addEventListener('click', exportAllLibrary);
+    // 点子库的搜索/排序已由项目工作台的 chips + 搜索框接管（js/projects.js）
+    const exportBtn = document.getElementById('export-all-btn');
+    if (exportBtn) exportBtn.addEventListener('click', exportAllLibrary);
     
     const importBtn = document.getElementById('import-btn');
     const importFile = document.getElementById('import-file');
@@ -1367,246 +1284,16 @@ function setupEventListeners() {
     importFile.addEventListener('change', importLibrary);
 }
 
-// --- Tasks Drawer Functions & Polling ---
-let tasksPollTimeout = null;
-let currentPollInterval = 2500;
-let tasksSearchQuery = '';
-let tasksFilterStatus = '';
-let tasksFilterType = '';
-
-// 图片/视频生成类任务一律不进激发任务列表（2026-07-12 用户要求）：帧序列、
-// 分步渲染、视频、封面的全过程都在各自模块内直播（含取消/重试入口），
-// 激发任务列表只保留创意激发（compose / auto_run）任务
+// --- 任务状态：只剩 header 角标这一路 -------------------------------------
+// renderTasks / 抽屉筛选状态 / _lastTasksRenderHtml / taskModelOptions /
+// formatTaskDuration 已于 2026-07-31（P4）随「激发任务列表」抽屉一并删除，
+// 任务的展示与操作全部由「📁 项目」主标签页承担（js/projects.js）。
+// 这里只保留两样别处还在用的东西：
+//   · MEDIA_TASK_TYPES / isIdeationTask —— openSparkProject 解析激发任务时要用它
+//     排除帧/视频/封面子作业（误配上去会载入一份没有提示词的空壳结果）；
+//   · 下面的 header 角标轮询 —— 它跟当前在哪个标签页无关，必须独立跑。
 const MEDIA_TASK_TYPES = new Set(['frames', 'staged_render', 'videos', 'cover']);
 const isIdeationTask = (t) => !MEDIA_TASK_TYPES.has((t.dimensions && t.dimensions.type) || 'idea');
-
-function formatTaskDuration(totalSeconds) {
-    const seconds = Number(totalSeconds);
-    if (!Number.isFinite(seconds) || seconds < 0) return '';
-    if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} 秒`;
-    const wholeSeconds = Math.round(seconds);
-    const minutes = Math.floor(wholeSeconds / 60);
-    const remainder = wholeSeconds % 60;
-    if (minutes < 60) return `${minutes} 分 ${remainder} 秒`;
-    const hours = Math.floor(minutes / 60);
-    return `${hours} 小时 ${minutes % 60} 分`;
-}
-
-function taskModelOptions(selectedModel) {
-    const selected = selectedModel || config.model || DEFAULT_CONFIG.model;
-    return LLM_MODEL_PICKER_FAMILIES.map(family => {
-        const models = (LLM_MODEL_GROUPS[family.key] || []).slice();
-        if (!models.some(model => model.value === selected)
-            && !Object.values(LLM_MODEL_GROUPS).flat().some(model => model.value === selected)
-            && family.key === 'gpt') {
-            models.push({ value: selected, label: `${selected}（历史模型）` });
-        }
-        const options = models.map(model => `
-            <option value="${escapeHtml(model.value)}"${model.value === selected ? ' selected' : ''}>${escapeHtml(model.label)}</option>
-        `).join('');
-        return `<optgroup label="${escapeHtml(family.label)}">${options}</optgroup>`;
-    }).join('');
-}
-
-async function renderTasks() {
-    const tasksListContainer = document.getElementById('tasks-list');
-    if (!tasksListContainer) return;
-
-    try {
-        const response = await fetch('/api/tasks');
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const resData = await response.json();
-        const tasks = (Array.isArray(resData) ? resData : (resData.tasks || []))
-            .filter(isIdeationTask);
-
-        // Update badge count
-        updateTasksBadge(tasks);
-        
-        // Local filtering
-        let filteredTasks = tasks.filter(task => {
-            // 任务名优先用灵感卡片选题名（task_label），回退基础场景主题
-            const theme = task.dimensions ? (task.dimensions.task_label || task.dimensions.theme || '未命名主题') : '未命名主题';
-            // 完成任务以实际解析出的 VIDEO 数为准。beats_count 是规划阶段的
-            // 施工拍数参数，流水线还可能追加 reward/HERO，直接展示它会少算。
-            const actualBeats = Number(task.result && task.result.video_count);
-            const beats = Number.isFinite(actualBeats) && actualBeats > 0
-                ? ` (${actualBeats} 镜)`
-                : ((task.dimensions && task.dimensions.beats_count)
-                    ? ` (${task.dimensions.beat_count_mode === 'fixed' ? '' : '最多 '}${task.dimensions.beats_count} 镜)` : '');
-            const taskTitle = `${theme}${beats}`;
-
-            if (tasksSearchQuery) {
-                const q = tasksSearchQuery.toLowerCase();
-                if (!taskTitle.toLowerCase().includes(q) && !String(task.id).includes(q)) {
-                    return false;
-                }
-            }
-            if (tasksFilterStatus) {
-                if (task.status !== tasksFilterStatus) return false;
-            }
-            if (tasksFilterType) {
-                const resolvedType = (task.dimensions && task.dimensions.type) || 'idea';
-                if (resolvedType !== tasksFilterType) return false;
-            }
-            return true;
-        });
-        
-        let html = '';
-        if (filteredTasks.length === 0) {
-            html = `<div class="tasks-empty">暂无符合筛选条件的任务</div>`;
-        }
-        // (loop body is skipped naturally when there are no filtered tasks)
-        filteredTasks.forEach(task => {
-            // frames_/videos_/cover_ 前缀的任务 ID 不是时间戳，直接 parseInt 会显示 Invalid Date
-            const idMs = parseInt(task.id, 10);
-            const dateStr = Number.isFinite(idMs) && String(idMs) === String(task.id)
-                ? new Date(idMs).toLocaleString()
-                : (task.last_active ? new Date(task.last_active * 1000).toLocaleString() : '—');
-            // 任务名优先用灵感卡片选题名（task_label），回退基础场景主题
-            const theme = task.dimensions ? (task.dimensions.task_label || task.dimensions.theme || '未命名主题') : '未命名主题';
-            const actualBeats = Number(task.result && task.result.video_count);
-            const beats = Number.isFinite(actualBeats) && actualBeats > 0
-                ? ` (${actualBeats} 镜)`
-                : ((task.dimensions && task.dimensions.beats_count)
-                    ? ` (${task.dimensions.beat_count_mode === 'fixed' ? '' : '最多 '}${task.dimensions.beats_count} 镜)` : '');
-            const taskTitle = `${theme}${beats}`;
-
-            let statusLabel = '';
-            let statusClass = '';
-            let footerButtons = '';
-            let progressHtml = '';
-            let errorHtml = '';
-            let tokenInfoHtml = '';
-            let taskDetailsHtml = '';
-            
-            if (task.status === 'running') {
-                statusLabel = '运行中';
-                statusClass = 'running';
-
-                // Reuse the same ProgressModel the main loading view drives itself with, so the
-                // drawer's mini progress bar tracks the real backend stages (outline/batch/audit/
-                // repair, or the frames/videos/cover equivalents) instead of a stale, hand-rolled
-                // stage list that no longer matches what the backend actually emits.
-                const taskType = window.ProgressModel ? ProgressModel.inferTaskType(task.dimensions) : 'compose';
-                const progressInfo = window.ProgressModel
-                    ? ProgressModel.progressFromEvents(task.events || [], taskType, null)
-                    : null;
-                const progressPercent = progressInfo ? progressInfo.percent : 0;
-                const currentStage = (progressInfo && progressInfo.label) || '准备中...';
-
-                progressHtml = `
-                    <div class="task-progress-container">
-                        <div class="task-progress-text">
-                            <span>${escapeHtml(currentStage)}</span>
-                            <span>${progressPercent}%</span>
-                        </div>
-                        <div class="task-progress-bar">
-                            <div class="task-progress-fill" style="width: ${progressPercent}%;"></div>
-                        </div>
-                    </div>
-                `;
-                
-                footerButtons = `
-                    <button class="task-action-btn view" onclick="viewTask('${task.id}', ${JSON.stringify(task.dimensions).replace(/"/g, '&quot;')})">查看</button>
-                    <button class="task-action-btn cancel" onclick="cancelTask('${task.id}', event)">取消</button>
-                `;
-            } else if (task.status === 'completed') {
-                statusLabel = '已完成';
-                statusClass = 'completed';
-                const timings = task.result && task.result.timings;
-                const durationText = formatTaskDuration(timings && timings.total_duration_seconds);
-                const usedModel = (task.result && task.result.model) || config.model || DEFAULT_CONFIG.model;
-                taskDetailsHtml = `
-                    <div class="task-completed-details">
-                        <div class="task-duration-info">
-                            <span>激发总时间</span>
-                            <strong>${escapeHtml(durationText || '暂无记录')}</strong>
-                        </div>
-                        <label class="task-rerun-model">
-                            <span>换模型再跑</span>
-                            <select class="task-rerun-model-select" aria-label="选择重新激发使用的模型">
-                                ${taskModelOptions(usedModel)}
-                            </select>
-                        </label>
-                    </div>
-                `;
-                if (task.result && task.result.token_usage) {
-                    const usage = task.result.token_usage;
-                    tokenInfoHtml = `
-                        <div class="task-token-info" style="font-size: 11px; color: var(--text-secondary, #94a3b8); margin-top: 8px; font-family: var(--font-mono, monospace);">
-                            Tokens: ${usage.total_tokens} (I:${usage.prompt_tokens} O:${usage.completion_tokens}) | Calls: ${usage.api_calls}
-                        </div>
-                    `;
-                }
-                footerButtons = `
-                    <button class="task-action-btn view" onclick="loadCompletedTask('${task.id}')">查看</button>
-                    <button class="task-action-btn retry" onclick="rerunCompletedTask('${task.id}', ${JSON.stringify(task.dimensions).replace(/"/g, '&quot;')}, event)">再跑一遍</button>
-                    <button class="task-action-btn delete" onclick="deleteTask('${task.id}', event)">删除</button>
-                `;
-            } else if (task.status === 'failed') {
-                statusLabel = '已失败';
-                statusClass = 'failed';
-                const errorMsg = task.error || '未知错误';
-                errorHtml = `<div class="task-error-text">❌ 错误: ${escapeHtml(errorMsg)}</div>`;
-                footerButtons = `
-                    <button class="task-action-btn retry" onclick="retryTask('${task.id}', ${JSON.stringify(task.dimensions).replace(/"/g, '&quot;')}, event)">重试</button>
-                    <button class="task-action-btn delete" onclick="deleteTask('${task.id}', event)">删除</button>
-                `;
-            } else if (task.status === 'cancelled') {
-                statusLabel = '已取消';
-                statusClass = 'cancelled';
-                const errorMsg = task.error || '用户已取消';
-                errorHtml = `<div class="task-error-text" style="color: var(--text-secondary, #94a3b8);">⚪ ${escapeHtml(errorMsg)}</div>`;
-                footerButtons = `
-                    <button class="task-action-btn delete" onclick="deleteTask('${task.id}', event)">删除</button>
-                `;
-            }
-            
-            html += `
-                <div class="task-card" data-task-id="${task.id}">
-                    <div class="task-card-header">
-                        <div>
-                            <div class="task-card-title">${escapeHtml(taskTitle)}</div>
-                            <div class="task-card-date">${escapeHtml(dateStr)}</div>
-                        </div>
-                        <span class="task-status-badge ${statusClass}">${escapeHtml(statusLabel)}</span>
-                    </div>
-                    ${taskDetailsHtml}
-                    ${tokenInfoHtml}
-                    ${progressHtml}
-                    ${errorHtml}
-                    <div class="task-card-footer">
-                        ${footerButtons}
-                    </div>
-                </div>
-            `;
-        });
-        
-        // Skip the DOM teardown when the rendered output is byte-identical to the last poll.
-        // `html` reflects only visible state (status, bucketed progress %, stage text, buttons) —
-        // not the raw growing events array — so identical html means an identical view. This turns
-        // most 2.5s poll ticks into a no-op and stops the drawer from snapping to the top and
-        // dropping hover/focus while a task runs. When it does change, scroll position is preserved.
-        if (html === _lastTasksRenderHtml) return;
-        _lastTasksRenderHtml = html;
-        const _prevScroll = tasksListContainer.scrollTop;
-        tasksListContainer.innerHTML = html;
-        tasksListContainer.scrollTop = _prevScroll;
-    } catch (e) {
-        console.error("Failed to render tasks list:", e);
-        _lastTasksRenderHtml = null; // force a real re-render on the next successful poll
-        tasksListContainer.innerHTML = `<div class="tasks-empty" style="color: #f87171;">加载任务列表失败: ${escapeHtml(e.message)}</div>`;
-    }
-}
-
-// Function startTasksPolling moved to modular JS file
-
-// Function stopTasksPolling moved to modular JS file
-
-// Function updateTasksBadge moved to modular JS file
-
-// Last rendered tasks-list markup; used to skip no-op re-renders (see renderTasks).
-let _lastTasksRenderHtml = null;
 
 let globalBadgeTimeout = null;
 
@@ -1757,7 +1444,7 @@ async function cancelTask(taskId, event) {
                 currentGenerationController.abort();
                 currentGenerationController = null;
             }
-            setTimeout(renderTasks, 500);
+            setTimeout(() => { if (typeof refreshProjects === 'function') refreshProjects({ assets: false }); }, 500);
         } else {
             showToast("取消任务失败", "error");
         }
@@ -1806,7 +1493,7 @@ async function deleteTask(taskId, event) {
                 }
             }
             
-            renderTasks();
+            if (typeof refreshProjects === 'function') refreshProjects();
         } else {
             showToast("删除任务记录失败", "error");
         }
@@ -1819,8 +1506,7 @@ async function deleteTask(taskId, event) {
 async function retryTask(taskId, dimensions, event) {
     if (event) event.stopPropagation();
 
-    closeTasksDrawer();
-
+    switchMainTab('results');
     showToast("正在重新提交该生成任务...", "info");
 
     try {
@@ -1839,16 +1525,17 @@ async function retryTask(taskId, dimensions, event) {
 
 async function rerunCompletedTask(taskId, dimensions, event) {
     if (event) event.stopPropagation();
-    const card = document.querySelector(`.task-card[data-task-id="${CSS.escape(String(taskId))}"]`);
-    const modelSelect = card && card.querySelector('.task-rerun-model-select');
+    // 模型选择器现在长在项目工作台的详情栏里（原先是任务抽屉的成功卡，
+    // 抽屉已随 P4 删除）。取不到就退回当前全局模型。
+    const modelSelect = document.getElementById('projects-rerun-model');
     const selectedModel = (modelSelect && modelSelect.value) || config.model || DEFAULT_CONFIG.model;
 
-    // 卡片内的模型选择同时成为后续激发的全局模型，保证在线检测、页脚当前模型提示
+    // 这里的模型选择同时成为后续激发的全局模型，保证在线检测、页脚当前模型提示
     // 和本次请求使用同一条网关；新任务不复用旧 id，保留原成功结果供对比。
     config.model = selectedModel;
     localStorage.setItem('spark_config', JSON.stringify(config));
     if (typeof syncIdeationLlmPicker === 'function') syncIdeationLlmPicker();
-    closeTasksDrawer();
+    switchMainTab('results');
     showToast(`正在使用 ${selectedModel} 重新激发，原结果已保留...`, 'info');
 
     try {
@@ -1914,7 +1601,7 @@ async function clearTasks(statusGroup) {
                     }
                 }
             }
-            renderTasks();
+            if (typeof refreshProjects === 'function') refreshProjects();
         } else {
             showToast("清空任务失败", "error");
         }
@@ -1924,9 +1611,7 @@ async function clearTasks(statusGroup) {
     }
 }
 
-window.renderTasks = renderTasks;
-window.startTasksPolling = startTasksPolling;
-window.stopTasksPolling = stopTasksPolling;
+// renderTasks / startTasksPolling / stopTasksPolling 已随任务抽屉删除（P4）
 window.viewTask = viewTask;
 window.loadCompletedTask = loadCompletedTask;
 window.cancelTask = cancelTask;
@@ -2127,6 +1812,18 @@ async function streamProgress(taskId, dimensions) {
         progressState = info.state;
         setProgressBar('generation', info);
     };
+    // text_chunk 是逐 token 来的，但它对进度只贡献"还活着"这一个信息，百分比
+    // 在整个流式阶段基本不动。每个 token 都跑一遍 normalizeGenerationProgress
+    // （克隆一次 state）+ 三次 DOM 写入纯属浪费，一帧一次足够。
+    let composeChunkTick = false;
+    const applyComposeChunkProgress = () => {
+        if (composeChunkTick) return;
+        composeChunkTick = true;
+        requestAnimationFrame(() => {
+            composeChunkTick = false;
+            if (isCurrent()) applyComposeProgress('text_chunk', null);
+        });
+    };
     applyComposeProgress('init', null);
 
     try {
@@ -2141,7 +1838,7 @@ async function streamProgress(taskId, dimensions) {
                     applyComposeProgress(type, data);
                 } else if (type === 'text_chunk') {
                     appendLiveTerminal(data);
-                    applyComposeProgress(type, data);
+                    applyComposeChunkProgress();
                 } else if (type === 'reconnecting') {
                     const stageText = document.getElementById('loading-stage-text');
                     if (stageText) stageText.textContent = `与服务的连接中断，正在自动重连（第 ${data.attempt} 次）...`;
@@ -3036,7 +2733,7 @@ async function streamCoverProgress(taskId, ownerIdea) {
             if (ownerIdea.social_title_cn) {
                 savedIdeas[existingIdx].social_title_cn = ownerIdea.social_title_cn;
             }
-            await saveLibrary();
+            await persistIdeaItem(savedIdeas[existingIdx]);
         }
 
         if (isViewing()) renderCoversForIdea(ownerIdea, ownerIdea.covers.length - 1);
@@ -3111,129 +2808,44 @@ function setupLoadingSteps() {
 // plain paragraphs, escaping all HTML.
 // Function renderAuditMarkdown moved to modular JS file
 
-// Save currently active idea to Local Storage Library
-function saveCurrentIdea() {
+// Save currently active idea to the library.
+// 走单条写入（/api/library/item）：只写这一条的正文文件 + 索引行，不再把整个
+// 创意库上传一遍，也就不会撞上整表覆盖的那三道闸门。
+async function saveCurrentIdea() {
     if (!currentIdea) return;
-    
+
     // Check if already saved
     if (savedIdeas.some(item => item.title === currentIdea.title)) {
         showToast("该创意已存在于点子库中", "error");
         return;
     }
-    
-    savedIdeas.unshift({ ...currentIdea });
-    saveLibrary();
+
+    const idea = { ...currentIdea };
+    savedIdeas.unshift(idea);
     updateFavoriteButtonState();
-    showToast("成功保存至点子库！", "success");
-}
+    if (typeof refreshProjects === 'function') refreshProjects({ assets: false });
 
-// Populate Saved Ideas Library Sidebar
-function renderLibrary() {
-    const list = document.getElementById('library-list');
-    if (!list) return;
-    
-    list.innerHTML = '';
-    
-    const query = (document.getElementById('library-search')?.value || '').trim().toLowerCase();
-    const timeSort = document.getElementById('library-filter-time')?.value || 'newest';
-
-    let filtered = [...savedIdeas];
-
-    // Search filter（也覆盖 theme 的模糊匹配——固定场景主题下拉框已移除，见 index.html）
-    if (query) {
-        filtered = filtered.filter(idea =>
-            (idea.title || '').toLowerCase().includes(query) ||
-            (idea.theme || '').toLowerCase().includes(query) ||
-            (idea.prompt_block || '').toLowerCase().includes(query)
-        );
-    }
-
-    // Time sorting
-    if (timeSort === 'oldest') {
-        filtered.reverse();
-    }
-    
-    if (filtered.length === 0) {
-        list.innerHTML = `
-            <div class="library-empty">
-                没有找到匹配的点子。
-            </div>
-        `;
-        return;
-    }
-    
-    filtered.forEach(idea => {
-        const card = document.createElement('div');
-        card.className = 'saved-card';
-        card.setAttribute('data-id', idea.id);
-        
-        let thumbHtml = `<div class="saved-card-thumb-icon">💡</div>`;
-        if (idea.covers && idea.covers.length > 0) {
-            const coverUrl = idea.covers[0];
-            const isSafe = coverUrl.startsWith('http://') || 
-                           coverUrl.startsWith('https://') || 
-                           coverUrl.startsWith('data:image/') ||
-                           coverUrl.startsWith('/') ||
-                           coverUrl.startsWith('outputs/');
-            if (isSafe) {
-                thumbHtml = `<img src="${coverUrl}" alt="Thumbnail" onerror="this.onerror=null; this.outerHTML='<div class=&quot;saved-card-thumb-icon&quot;>💡</div>';">`;
-            }
-        }
-        
-        card.innerHTML = `
-            <div class="saved-card-thumb">
-                ${thumbHtml}
-            </div>
-            <div class="saved-card-info-content">
-                <div class="saved-card-header">
-                    <h4 class="safe-title"></h4>
-                    <span class="saved-card-date">${idea.timestamp ? idea.timestamp.split(' ')[0] : '未知时间'}</span>
-                </div>
-                <div class="saved-card-footer">
-                    <span class="saved-card-theme safe-theme"></span>
-                    <button class="delete-saved-btn" title="删除">
-                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
-                    </button>
-                </div>
-            </div>
-        `;
-        
-        card.querySelector('.safe-title').textContent = idea.title || '未命名创意';
-        card.querySelector('.safe-theme').textContent = idea.theme || '未命名主题';
-        
-        card.addEventListener('click', (e) => {
-            if (e.target.closest('.delete-saved-btn') || e.target.closest('.delete-confirm-overlay')) {
-                e.stopPropagation();
-                showDeleteConfirm(card, idea.id);
-                return;
-            }
-            loadSavedIdea(idea);
-        });
-        
-        list.appendChild(card);
-    });
+    const ok = await persistIdeaItem(idea);
+    if (ok) showToast("成功保存至点子库！", "success");
 }
 
 async function deleteFromLibrary(id) {
     const idea = savedIdeas.find(item => item.id === id);
+    if (!idea) return;
 
-    if (idea && idea.title) {
-        try {
-            await fetch('/api/library/delete_item', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ title: getIdeaSaveTitle(idea), covers: idea.covers || [] })
-            });
-        } catch (e) {
-            console.error("Delete idea output files request failed:", e);
-        }
-    }
+    const ok = await deleteIdeaItem(idea);
+    if (!ok) return;   // 服务端没删成功就别动本地状态，否则两边会不一致
 
     savedIdeas = savedIdeas.filter(item => item.id !== id);
-    // 这是合法缩量：把删掉的 id 声明给服务端，否则缩量闸门会拒写（见 saveLibrary）
-    saveLibrary({ removedIds: [id] });
+    try {
+        localStorage.setItem('spark_library', JSON.stringify(savedIdeas));
+    } catch (e) {
+        console.warn('[library] localStorage 镜像写入失败', e);
+    }
+    if (typeof refreshProjects === 'function') refreshProjects({ assets: false });
     showToast("已从点子库删除，生成的图片/视频文件已一并清理", "success");
     updateFavoriteButtonState();
+    if (typeof refreshProjects === 'function') refreshProjects();
 }
 
 function loadSavedIdea(idea, options = {}) {
@@ -3255,26 +2867,51 @@ function loadSavedIdea(idea, options = {}) {
 }
 
 /* ==========================================================================
-   台账 / 画廊 →「激发项目」直达入口
-   一条创意合成出来的成片有两个落点：收藏进点子库的记录（首选，提示词/封面/
-   帧视频清单最全），以及后台任务记录（没收藏，或收藏前就想回看时的兜底——
-   画廊里 outputs/run_<task_id>_… 那些目录多半只有任务记录）。台账行与画廊
-   项目组都走下面这一套解析：先查点子库，再回落到已完成的任务。
+   台账 / 画廊 / 项目工作台 →「激发项目」直达入口
+
+   2026-07-31（P3）之前这里是三套标题模糊匹配：把一句话选题、场景主题、任务
+   task_label、Topic DNA 各归一化一遍互相撞。撞不上就"找不到"，撞错了就打开
+   另一条创意——因为那时候根本没有主键：project_key 要等合成跑完才生成。
+
+   现在 project_key 从**任务创建那一刻**就定下（server_common.ensure_task_project_key），
+   并且写进任务 dimensions、点子库条目、台账行三处，所以这里是一次直查。
+   标题匹配只作为历史数据（没有 project_key 的老记录）的回落分支保留。
    ========================================================================== */
 
 function sparkNormKey(v) {
     return String(v == null ? '' : v).replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
-// 点子库里找这条创意的记录。theme 存的就是灵感卡片的一键输入串
-// （台账 creative_seed.input_str 同源），是最稳的一条；标题只给旧记录兜底。
+// 画廊传上来的是**目录名**，它是 _safe_project_name(project_key) 的结果：
+// '__' 会被折成 '_'，且截断到 60 字符。所以目录名与 project_key 不能直接相等
+// 比较，这里做同样的归一化再比。
+function sparkProjectDirKey(v) {
+    return String(v == null ? '' : v).replace(/_+/g, '_').trim().toLowerCase();
+}
+
+function sparkProjectKeyMatches(a, b) {
+    if (!a || !b) return false;
+    if (String(a) === String(b)) return true;
+    const ka = sparkProjectDirKey(a);
+    const kb = sparkProjectDirKey(b);
+    if (!ka || !kb) return false;
+    // 截断：短的那个是长的那个的前缀就算命中
+    return ka === kb || ka.startsWith(kb) || kb.startsWith(ka);
+}
+
+// 点子库里找这条创意的记录。project_key 优先（硬主键），其余是老记录的回落。
 // savedIdeas 按新→旧排列，find 天然取最近一次合成。
-function findSavedIdeaForSpark({ ideaId = null, seed = '', title = '' } = {}) {
+function findSavedIdeaForSpark({ ideaId = null, seed = '', title = '', projectKey = '' } = {}) {
     if (!Array.isArray(savedIdeas) || !savedIdeas.length) return null;
     if (ideaId) {
         const byId = savedIdeas.find(i => String(i.id) === String(ideaId));
         if (byId) return byId;
     }
+    if (projectKey) {
+        const byKey = savedIdeas.find(i => sparkProjectKeyMatches(i.project_key, projectKey));
+        if (byKey) return byKey;
+    }
+    // ── 以下仅供没有 project_key 的历史记录回落 ──
     const seedKey = sparkNormKey(seed);
     const titleKey = sparkNormKey(title);
     return (seedKey && savedIdeas.find(i => sparkNormKey(i.theme) === seedKey))
@@ -3283,9 +2920,7 @@ function findSavedIdeaForSpark({ ideaId = null, seed = '', title = '' } = {}) {
         || null;
 }
 
-// 任务侧兜底。projectKey 传画廊的项目目录名：目录名以 run_<task_id>_ 开头
-// （见 server_common.make_idea_project_key），拿它做前缀匹配比反解目录名更稳
-// （task_id 自身可能带下划线，反解会切错）。
+// 任务侧兜底（这条创意还没收藏，或收藏前就想回看）。
 async function findCompletedTaskForSpark({ dna = '', seed = '', title = '', projectKey = '' } = {}) {
     let tasks = [];
     try {
@@ -3297,18 +2932,25 @@ async function findCompletedTaskForSpark({ dna = '', seed = '', title = '', proj
         console.warn('Failed to load tasks while resolving spark project', e);
         return null;
     }
-    // 只认创意激发任务：帧/分步渲染/视频/封面这些子任务的 dimensions 里也带着
-    // 同一个选题名，误配上去 loadCompletedTask 会载入一份没有提示词的空壳结果
+    // 只认创意激发任务：帧/分步渲染/视频/封面这些子任务现在也带着同一个
+    // project_key（P3），误配上去 loadCompletedTask 会载入一份没有提示词的空壳结果
     const done = tasks.filter(t => t && t.status === 'completed' && t.result && isIdeationTask(t));
     const dims = t => t.dimensions || {};
 
     if (projectKey) {
-        const hit = done.find(t => {
+        // 主键直查：任务创建时就写进 dimensions 了
+        const byKey = done.find(t => sparkProjectKeyMatches(dims(t).project_key, projectKey)
+                                  || sparkProjectKeyMatches((t.result || {}).project_key, projectKey));
+        if (byKey) return byKey;
+        // 老任务没有 project_key：目录名以 run_<task_id>_ 开头，拿它做前缀匹配
+        // 比反解目录名更稳（task_id 自身可能带下划线，反解会切错）
+        const byPrefix = done.find(t => {
             const safeId = String(t.id || '').replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '');
             return safeId && projectKey.startsWith(`run_${safeId}_`);
         });
-        if (hit) return hit;
+        if (byPrefix) return byPrefix;
     }
+    // ── 以下仅供没有 project_key 的历史记录回落 ──
     const dnaKey = sparkNormKey(dna);
     const seedKey = sparkNormKey(seed);
     const titleKey = sparkNormKey(title);
@@ -3324,16 +2966,14 @@ async function findCompletedTaskForSpark({ dna = '', seed = '', title = '', proj
 // 并返回 false（调用方不需要自己再报错）。
 async function openSparkProject({ ideaId = null, dna = '', seed = '', title = '', projectKey = '', label = '' } = {}) {
     const name = label || title || '该创意';
-    const idea = findSavedIdeaForSpark({ ideaId, seed, title });
+    const idea = findSavedIdeaForSpark({ ideaId, seed, title, projectKey });
     if (idea) {
-        closeLibraryDrawer();
         switchMainTab('results');
         loadSavedIdea(idea, { toast: `已打开激发项目「${idea.title || name}」` });
         return true;
     }
     const task = await findCompletedTaskForSpark({ dna, seed, title, projectKey });
     if (task) {
-        closeLibraryDrawer();
         switchMainTab('results');
         await loadCompletedTask(task.id);
         return true;
@@ -3364,25 +3004,33 @@ function importLibrary(e) {
     if (!file) return;
     
     const reader = new FileReader();
-    reader.onload = function(evt) {
+    reader.onload = async function(evt) {
         try {
             const imported = JSON.parse(evt.target.result);
-            if (Array.isArray(imported)) {
-                // Merge without duplicates based on title
-                const existingTitles = new Set(savedIdeas.map(item => item.title));
-                let count = 0;
-                imported.forEach(item => {
-                    if (item.title && !existingTitles.has(item.title)) {
-                        if (!item.id) item.id = Date.now().toString() + Math.random();
-                        savedIdeas.push(item);
-                        count++;
-                    }
-                });
-                saveLibrary();
-                showToast(`成功导入 ${count} 个新创意点子！`, "success");
-            } else {
-                throw new Error("Invalid file structure");
+            if (!Array.isArray(imported)) throw new Error("Invalid file structure");
+
+            // Merge without duplicates based on title
+            const existingTitles = new Set(savedIdeas.map(item => item.title));
+            const fresh = [];
+            imported.forEach(item => {
+                if (item.title && !existingTitles.has(item.title)) {
+                    if (!item.id) item.id = Date.now().toString() + Math.random();
+                    existingTitles.add(item.title);
+                    savedIdeas.push(item);
+                    fresh.push(item);
+                }
+            });
+            if (typeof refreshProjects === 'function') refreshProjects({ assets: false });
+            // 逐条写入而不是整表回写：导入 50 条时老写法要把「原有全库 + 50 条新
+            // 记录」整份上传一遍，而且中途失败就是全有或全无。
+            let saved = 0;
+            for (const item of fresh) {
+                if (await persistIdeaItem(item)) saved++;
             }
+            showToast(saved === fresh.length
+                ? `成功导入 ${saved} 个新创意点子！`
+                : `导入 ${fresh.length} 条，其中 ${saved} 条已存到服务器（其余仅存在浏览器本地）`,
+                saved === fresh.length ? "success" : "error");
         } catch (err) {
             showToast("导入失败，文件格式有误", "error");
             console.error(err);
@@ -3764,7 +3412,7 @@ async function mergeVideos(force = false) {
             const existingIdx = savedIdeas.findIndex(item => item.id === currentIdea.id);
             if (existingIdx !== -1) {
                 savedIdeas[existingIdx].frameRun = currentIdea.frameRun;
-                await saveLibrary();
+                await persistIdeaItem(savedIdeas[existingIdx]);
             }
 
             renderVideosForIdea(currentIdea);
@@ -3872,6 +3520,9 @@ async function generateCover() {
                 config,
                 id: ownerIdea.id,
                 title: ownerIdea.title,
+                // 封面图跟项目打包在一起（outputs/<项目>/cover_*.webp），所以这里
+                // 必须把磁盘命名空间一起交上去——与 generateFrames 的 title 字段同源
+                project_key: getIdeaSaveTitle(ownerIdea),
                 theme: ownerIdea.theme,
                 prompt_block: ownerIdea.prompt_block
             })
@@ -3986,11 +3637,12 @@ function setupDragAndDrop() {
         }, false);
     });
 
-    const drawer = document.getElementById('library-drawer');
-    if (!drawer) return;
+    // 拖放靶区从「点子库」抽屉搬到项目工作台列表（抽屉已于 P4 删除）
+    const dropZone = document.getElementById('projects-list');
+    if (!dropZone) return;
 
     ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
-        drawer.addEventListener(eventName, preventDefaults, false);
+        dropZone.addEventListener(eventName, preventDefaults, false);
     });
     
     function preventDefaults(e) {
@@ -3999,14 +3651,14 @@ function setupDragAndDrop() {
     }
     
     ['dragenter', 'dragover'].forEach(eventName => {
-        drawer.addEventListener(eventName, () => drawer.classList.add('dragover'), false);
+        dropZone.addEventListener(eventName, () => dropZone.classList.add('dragover'), false);
     });
-    
+
     ['dragleave', 'drop'].forEach(eventName => {
-        drawer.addEventListener(eventName, () => drawer.classList.remove('dragover'), false);
+        dropZone.addEventListener(eventName, () => dropZone.classList.remove('dragover'), false);
     });
-    
-    drawer.addEventListener('drop', handleDrop, false);
+
+    dropZone.addEventListener('drop', handleDrop, false);
     
     function handleDrop(e) {
         const dt = e.dataTransfer;
@@ -4032,35 +3684,13 @@ function handleGlobalHotkeys(e) {
         if (randBtn) randBtn.click();
     }
     
-    // Alt + L: Toggle My Library Drawer
-    if (e.altKey && e.key.toLowerCase() === 'l') {
+    // Alt + L / Alt + T：原本各自开合「点子库」与「任务列表」两个抽屉，两者合并
+    // 进项目工作台后改为跳到工作台的对应筛选——快捷键的肌肉记忆保住，落点变成
+    // 同一个页面的两档 chips。
+    if (e.altKey && (e.key.toLowerCase() === 'l' || e.key.toLowerCase() === 't')) {
         e.preventDefault();
-        const toggleLibBtn = document.getElementById('toggle-library-btn');
-        const closeLibBtn = document.getElementById('close-library-btn');
-        const libraryDrawer = document.getElementById('library-drawer');
-        
-        if (libraryDrawer) {
-            if (libraryDrawer.classList.contains('active')) {
-                if (closeLibBtn) closeLibBtn.click();
-            } else {
-                if (toggleLibBtn) toggleLibBtn.click();
-            }
-        }
-    }
-    
-    // Alt + T: Toggle Tasks Drawer
-    if (e.altKey && e.key.toLowerCase() === 't') {
-        e.preventDefault();
-        const toggleTasksBtn = document.getElementById('toggle-tasks-btn');
-        const closeTasksBtn = document.getElementById('close-tasks-btn');
-        const tasksDrawer = document.getElementById('tasks-drawer');
-        
-        if (tasksDrawer) {
-            if (tasksDrawer.classList.contains('active')) {
-                if (closeTasksBtn) closeTasksBtn.click();
-            } else {
-                if (toggleTasksBtn) toggleTasksBtn.click();
-            }
+        if (typeof openProjectsWorkbench === 'function') {
+            openProjectsWorkbench(e.key.toLowerCase() === 'l' ? 'saved' : 'running');
         }
     }
     
@@ -4101,15 +3731,9 @@ function handleGlobalHotkeys(e) {
             if (closeBtn) closeBtn.click();
         }
 
-        // Close drawer
-        const libraryDrawer = document.getElementById('library-drawer');
-        if (libraryDrawer && libraryDrawer.classList.contains('active')) {
-            const closeLibBtn = document.getElementById('close-library-btn');
-            if (closeLibBtn) closeLibBtn.click();
-        }
-        
-        // Close delete confirmation overlays
-        document.querySelectorAll('.delete-confirm-overlay').forEach(overlay => overlay.remove());
+        // 收起项目工作台的详情栏（两个右侧抽屉与卡片删除确认浮层已随 P4 删除）
+        const detailClose = document.querySelector('#projects-detail .projects-detail-close');
+        if (detailClose) detailClose.click();
     }
 }
 

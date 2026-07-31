@@ -5,10 +5,12 @@
 真的接通了（卡片按钮 → deleteSlotBeat → 撤销 toast → restoreSlotSnapshot →
 两个网格重渲）。
 
-**创意库隔离**：本用例通过 SPARK_DB_FILE / SPARK_LEDGER_FILE 把 server 指向
-临时文件。页面的 saveLibrary() 会把它当时的 savedIdeas 整份 POST 回
-/api/library，指向真库就是一次整库覆盖（2026-07-27 实际发生过一次）。
-除此之外还在页面里把 saveLibrary 也短路掉，两道保险。
+**数据隔离**：本用例起的是真实 server 进程，会真的读写创意库与任务记录，所以
+四个路径开关必须全部指向 tmp_path——SPARK_DB_FILE / SPARK_LEDGER_FILE /
+SPARK_LIBRARY_DIR / SPARK_TASKS_DIR。历史上这里只隔离了前两个：2026-07-27 页面的
+整表回写把真库整份覆盖过一次；2026-07-31 拆分存储上线后又漏掉 SPARK_LIBRARY_DIR，
+往真库里写进了一条 e2e_restore_demo 垃圾记录。页面里另外把写库函数短路掉作为第二
+道保险。
 """
 import json
 import os
@@ -96,7 +98,13 @@ def live_server(tmp_path):
     env = dict(os.environ,
                PORT=str(port),
                SPARK_DB_FILE=str(tmp_path / "library.json"),
-               SPARK_LEDGER_FILE=str(tmp_path / "topic_ledger.json"))
+               SPARK_LEDGER_FILE=str(tmp_path / "topic_ledger.json"),
+               # 2026-07-31：创意库改成拆分存储（library/）、任务改成拆分持久层
+               # （tasks/），两者各有自己的路径开关。只隔离 SPARK_DB_FILE 已经不够
+               # ——实测漏掉 SPARK_LIBRARY_DIR 时，这个用例往真实创意库里写进了一条
+               # 名为 e2e_restore_demo 的垃圾记录。
+               SPARK_LIBRARY_DIR=str(tmp_path / "library"),
+               SPARK_TASKS_DIR=str(tmp_path / "tasks"))
     proc = subprocess.Popen([sys.executable, "server.py"], cwd=ROOT, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     base = "http://127.0.0.1:%d" % port
@@ -141,7 +149,8 @@ def test_delete_then_undo_from_the_ui(live_server):
             // 确认框在这条路径上只是二次确认，自动放行
             window.customConfirm = () => Promise.resolve(true);
             // 第二道保险：即便服务端没被隔离，也不让页面写创意库
-            window.saveLibrary = () => Promise.resolve();
+            // （saveLibrary 已随 P4 删除，现在的写入口是 persistIdeaItem）
+            window.persistIdeaItem = () => Promise.resolve(true);
         }""", {"title": TITLE, "pb": _prompt_block()})
         page.evaluate(
             "() => fetch('/api/get_manifest?title=' + encodeURIComponent(currentIdea.title))"

@@ -57,6 +57,7 @@ from .google_fx_helpers import (
     fx_pacing_wait,
     fx_pacing_bounds,
     note_fx_submit,
+    _click_new_project_button,
 )
 
 
@@ -65,6 +66,43 @@ _MEDIA_UUID_RE = re.compile(
     re.I,
 )
 _MIN_GENERATED_RESULT_AGE_SECONDS = 8.0
+
+
+def _open_image_flow_canvas(page, requested_project_url=None):
+    """Open a usable Flow image workspace and return its bindable project URL.
+
+    Current Flow accounts can expose the generation workspace directly at
+    ``/tools/flow`` without changing the address to a ``/project/...`` route.
+    The prompt workspace is the source of truth in that case.  Requiring a
+    project-shaped URL made L2 click the landing-page ``New project`` control
+    even though a fully usable workspace was already open, then reject the
+    successful route-less workspace as a failed click.
+    """
+    requested_project_url = str(requested_project_url or "").strip()
+    target_url = requested_project_url or "https://labs.google/fx/tools/flow"
+    try:
+        page.goto(target_url, timeout=60000)
+        random_sleep(1, 2)
+    except Exception as nav_err:
+        if requested_project_url:
+            raise RuntimeError(
+                f"Cannot open the Flow canvas bound to this project: "
+                f"{requested_project_url}: {nav_err}"
+            ) from nav_err
+        raise RuntimeError(f"Cannot open the Flow workspace: {nav_err}") from nav_err
+
+    # A visible prompt editor means Flow has already restored a generation
+    # workspace.  This is also how the L1 diagnostics identify the current UI.
+    if _find_fx_prompt_input(page, announce=False) is None:
+        created = _click_new_project_button(page)
+        # Some Flow variants create the workspace in-place and retain the same
+        # URL.  Re-check the actual UI before treating the URL-only confirmation
+        # failure as a real creation failure.
+        if not created and _find_fx_prompt_input(page, announce=False) is None:
+            raise RuntimeError("Cannot create or open a usable Flow canvas")
+
+    current_url = str(getattr(page, "url", "") or "")
+    return current_url if "/project/" in current_url else None
 
 
 def _extract_media_uuid(value):
@@ -109,7 +147,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
     _check_cancelled()
     browser = None
     captured_data = deque(maxlen=_CAPTURED_DATA_MAXLEN)
-    result = {"status": "failed", "image_urls": [], "message": ""}
+    result = {"status": "failed", "image_urls": [], "message": "", "project_url": None}
 
     # Check max limitation
     prompts = req.prompts[:5]
@@ -126,9 +164,16 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
         with sync_playwright() as p:
             browser, page = _connect_fx_page(p)
 
+            project_url = _open_image_flow_canvas(
+                page, getattr(req, "project_url", None)
+            )
+
             # 🛠️ 0. 新建/清理画布
             _has_ref_images = bool([r for r in (req.images or []) if r and os.path.exists(clean_path(str(r)))])
             _prepare_fx_canvas(page, has_refs=_has_ref_images)
+            if project_url:
+                result["project_url"] = project_url
+                req.project_url = project_url
 
 
             # 🛠️ 2. 验证配置 (Image 模式)

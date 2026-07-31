@@ -17,9 +17,10 @@
 }
 
 #panel-image-studio .imgstudio-card {
+    /* 不加 backdrop-filter：这两张卡（控制栏 460×792、画廊 1067×792）铺满图像
+       工坊面板，背景色与父面板同为 var(--bg-panel)，模糊是空操作。
+       理由与实测数据见 css/tokens.css 的 .glass-panel。 */
     background: var(--bg-panel);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
     border: 1px solid var(--border-color);
     border-radius: 20px;
     display: flex;
@@ -903,13 +904,17 @@
 
 #panel-image-studio .task-card {
     display: flex;
-    /* 显式恢复行布局：宿主 style.css 的 .task-card（任务抽屉卡片）设了 column，
-       会顺着通用类名泄漏进来把队列卡片竖着摆 */
+    /* 显式声明行布局。宿主曾有一条通用 .task-card（任务抽屉卡片）设了 column，
+       会顺着同名类泄漏进来把队列卡片竖着摆；那条规则已随抽屉于 P4 删除，这里
+       仍显式写死，免得以后再冒出同名规则时又踩一次。 */
     flex-direction: row;
     align-items: center;
     gap: 12px;
+    /* 不加 backdrop-filter：这张卡按队列里的任务数重复，而它背后一路上去
+       （.imgstudio-card → .glass-panel → body）全是纯色平铺，模糊出来还是同一个
+       颜色，代价却是每张卡各占一个合成层。同 .glass-panel，实测数据见
+       css/tokens.css。 */
     background: rgba(var(--panel-rgb), 0.4);
-    backdrop-filter: blur(8px);
     border: 1px solid var(--border-color);
     border-radius: 12px;
     padding: 10px 14px;

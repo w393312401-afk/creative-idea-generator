@@ -31,6 +31,10 @@ search_snippet_cache.json
 
 # ── 用户数据(默认不提交)──
 library.json
+# 拆分存储形态的创意库(library/index.json + library/items/<id>.json),
+# 与 library.json 同属用户数据;library.json.pre-split 是迁移前的原文件备份
+library/
+library.json.pre-split
 library.rebuilt.json
 topic_ledger.json
 trend_refs.json

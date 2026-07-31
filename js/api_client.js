@@ -241,9 +241,9 @@ function ensureFrameRunForStart(ownerIdea) {
 /** 任务终态时把 manifest 同步进 ownerIdea 与创意库（含服务端持久化）。
  *
  * 这里写进去的是服务端 manifest 原件——删除一拍之后它就是比库里那份少一帧的
- * 权威结果，所以必须向缩量闸门声明"这条创意的帧记录会变少是我有意为之"
- * （见 app.js saveLibrary / server_common.library_shrink_verdict）。声明范围收在
- * 这一条创意上：别的创意少了帧，照样该被拦住。 */
+ * 权威结果。老实现走整表回写，必须额外向缩量闸门"声明"这次缩量是有意为之，
+ * 否则 409；2026-07-31（P1）改成单条写之后，一次写入只碰这一条创意自己的文件，
+ * 缩量闸门那条路径根本不经过，声明也就不需要了。 */
 async function syncFrameRunToLibrary(manifestData, ownerIdea) {
     ownerIdea = ownerIdea || currentIdea;
     if (!ownerIdea || !manifestData) return;
@@ -252,7 +252,7 @@ async function syncFrameRunToLibrary(manifestData, ownerIdea) {
     const existingIdx = savedIdeas.findIndex(item => item.id === ownerIdea.id);
     if (existingIdx !== -1) {
         savedIdeas[existingIdx].frameRun = manifestData;
-        await saveLibrary({ frameShrinkIds: [ownerIdea.id] });
+        await persistIdeaItem(savedIdeas[existingIdx]);
     }
 }
 
@@ -308,29 +308,9 @@ function renderVideoSlotSkippedCut(idx, message) {
         { slot: idx, status: 'skipped_cut', message }, { seq: idx }));
 }
 
-function startTasksPolling(interval = 2500) {
-    stopTasksPolling();
-    currentPollInterval = interval;
-    const poll = async () => {
-        await renderTasks();
-        const tasksListContainer = document.getElementById('tasks-list');
-        const hasRunning = tasksListContainer && tasksListContainer.querySelector('.task-card-header .running') !== null;
-        const nextInterval = hasRunning ? 2500 : 10000;
-        
-        const tasksDrawer = document.getElementById('tasks-drawer');
-        if (tasksDrawer && tasksDrawer.classList.contains('active')) {
-            tasksPollTimeout = setTimeout(poll, nextInterval);
-        }
-    };
-    tasksPollTimeout = setTimeout(poll, interval);
-}
-
-function stopTasksPolling() {
-    if (tasksPollTimeout) {
-        clearTimeout(tasksPollTimeout);
-        tasksPollTimeout = null;
-    }
-}
+// startTasksPolling / stopTasksPolling 已于 2026-07-31（P4）随「激发任务列表」
+// 抽屉一并删除。任务进度现在由项目工作台自适应轮询（js/projects.js：有任务在跑
+// 时 4s，静止时 30s，且离开标签页就停表），不再是恒定 2.5s 的全量轮询。
 
 /** 持久化"当前挂着哪些后台任务"，供刷新页面后重连。改为一份按创意 id 登记的列表
  *（旧格式每种任务只有一个全局槽位，无法区分任务属于哪个创意）。 */
@@ -476,6 +456,15 @@ function initLocalServiceLogs() {
     // 又是每加一行就要遍历一遍全部子节点——量一大就是明显的卡顿。WeakMap 不
     // 关心行在数组里的位置，淘汰旧行时旧节点自然被 GC，完全不用重新编号。
     const elToEntry = new WeakMap();
+    // 明细最多有 3000 行。日志抽屉收起、或停在「概览」时仍为每条 SSE 日志
+    // 创建隐藏 DOM，会持续触发样式计算并拖慢标签切换、滚动和输入。entries 才是
+    // 数据源；明细不可见时只记脏，用户真正打开明细时再一次性挂载。
+    let detailDomDirty = false;
+    let countDirty = true;
+
+    function isDetailDomVisible() {
+        return drawer.classList.contains('expanded') && logMode === 'detail';
+    }
 
     function escapeRegExp(s) {
         return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -547,11 +536,30 @@ function initLocalServiceLogs() {
         return div;
     }
 
-    function updateCount() {
-        if (!countEl) return;
+    function updateCount(force = false) {
+        countDirty = true;
+        if (!countEl || (!force && !isDetailDomVisible())) return;
         let visible = 0;
         for (const entry of entries) { if (passesFilter(entry)) visible++; }
         countEl.textContent = `${visible}/${entries.length} 行（含折叠重复）`;
+        countDirty = false;
+    }
+
+    function ensureDetailDom() {
+        if (!detailDomDirty && linesEl.children.length === entries.length) {
+            if (countDirty) updateCount(true);
+            return;
+        }
+        const fragment = document.createDocumentFragment();
+        entries.forEach(entry => fragment.appendChild(renderLineEl(entry)));
+        linesEl.replaceChildren(fragment);
+        detailDomDirty = false;
+        updateCount(true);
+    }
+
+    function suspendDetailDom() {
+        if (linesEl.childElementCount) linesEl.replaceChildren();
+        detailDomDirty = entries.length > 0;
     }
 
     function appendEntry(entry) {
@@ -566,19 +574,31 @@ function initLocalServiceLogs() {
             if (last.repeatItems.length < MAX_REPEAT_ITEMS) {
                 last.repeatItems.push({ time: entry.time, raw: entry.raw });
             }
-            const newEl = renderLineEl(last);
-            if (linesEl.lastChild) linesEl.replaceChild(newEl, linesEl.lastChild);
-            else linesEl.appendChild(newEl);
+            if (isDetailDomVisible() && !detailDomDirty) {
+                const newEl = renderLineEl(last);
+                if (linesEl.lastChild) linesEl.replaceChild(newEl, linesEl.lastChild);
+                else linesEl.appendChild(newEl);
+            } else {
+                detailDomDirty = true;
+            }
+            countDirty = true;
             return;
         }
         entry.repeatCount = 1;
         entry.repeatItems = [];
         entries.push(entry);
-        linesEl.appendChild(renderLineEl(entry));
+        if (isDetailDomVisible() && !detailDomDirty) {
+            linesEl.appendChild(renderLineEl(entry));
+        } else {
+            detailDomDirty = true;
+        }
         while (entries.length > MAX_LINES) {
             entries.shift();
-            if (linesEl.firstChild) linesEl.removeChild(linesEl.firstChild);
+            if (isDetailDomVisible() && !detailDomDirty && linesEl.firstChild) {
+                linesEl.removeChild(linesEl.firstChild);
+            }
         }
+        countDirty = true;
     }
 
     function appendLine(raw) {
@@ -606,6 +626,7 @@ function initLocalServiceLogs() {
     }
 
     function reapplyVisibility() {
+        ensureDetailDom();
         entries.forEach((entry, i) => {
             const el = linesEl.children[i];
             if (el) el.classList.toggle('log-line-hidden', !passesFilter(entry));
@@ -618,13 +639,16 @@ function initLocalServiceLogs() {
     function rerenderAll() {
         linesEl.innerHTML = '';
         entries.forEach(entry => linesEl.appendChild(renderLineEl(entry)));
-        updateCount();
+        detailDomDirty = false;
+        updateCount(true);
     }
 
     function clearAll() {
         entries.length = 0;
         pendingPartial = '';
         linesEl.innerHTML = '';
+        detailDomDirty = false;
+        countDirty = true;
         updateCount();
         scheduleOverviewRender();
     }
@@ -736,8 +760,14 @@ function initLocalServiceLogs() {
                 tab.setAttribute('aria-selected', on ? 'true' : 'false');
             });
         }
-        if (logMode === 'overview') renderOverview();
-        else scrollToBottom();
+        if (logMode === 'overview') {
+            suspendDetailDom();
+            renderOverview();
+        }
+        else {
+            ensureDetailDom();
+            scrollToBottom();
+        }
     }
 
     if (modeTabsEl) {
@@ -911,15 +941,17 @@ function initLocalServiceLogs() {
         if (toggleBtn) toggleBtn.textContent = open ? '收起' : '展开';
         try { localStorage.setItem(LOG_DOCK_OPEN_KEY, open ? '1' : '0'); } catch (e) {}
         if (open) {
-            // 日志 dock 与保存/任务抽屉同样停靠在右侧，同时打开会叠在一起；
-            // 而且 420+380 在 1440 屏上只给主内容剩 640px，两边都难用——所以
-            // 三者互斥，跟 openLibraryDrawer/openTasksDrawer 之间的关系一致。
-            if (typeof closeLibraryDrawer === 'function') closeLibraryDrawer();
-            if (typeof closeTasksDrawer === 'function') closeTasksDrawer();
+            // 右侧原本还停靠着「点子库」「任务列表」两个抽屉，三者互斥。那两个
+            // 抽屉已随 P4 删除，日志 dock 现在是右侧唯一的停靠物。
             clearUnread();
             // 折叠期间概览是不算的（省掉看不见的全量聚合），展开这一下补上
             if (logMode === 'overview') renderOverview();
-            else scrollToBottom();
+            else {
+                ensureDetailDom();
+                scrollToBottom();
+            }
+        } else {
+            suspendDetailDom();
         }
     }
 
@@ -1469,7 +1501,7 @@ async function fixFrameIssue(seq, manualReason) {
                 const existingIdx = savedIdeas.findIndex(item => item.id === ownerIdea.id);
                 if (existingIdx !== -1) {
                     savedIdeas[existingIdx].prompt_block = watch.result.prompt_block;
-                    await saveLibrary();
+                    await persistIdeaItem(savedIdeas[existingIdx]);
                 }
                 if (isViewingIdea(ownerIdea.id)) {
                     const blockEl = document.getElementById('idea-prompt-block');
@@ -2465,10 +2497,9 @@ async function openDeletedSlotsPanel() {
 // 读到的还是旧提示词（同 fixFrameIssue 里改写提示词后的那套处理）。
 //
 // deferSave=true：调用方紧接着就会走 reloadManifestIntoIdea → syncFrameRunToLibrary
-// 把权威清单连库一起写掉，这里不必（也不能）先写一次。删除/恢复一拍的路径必须传它：
-// 那一刻本地 prompt_slots 已经是 N-1 条、frameRun 还留着 N 帧，服务端的"同一条创意
-// 内部必须自洽"检查会 409 拒掉这次写入（见 server.py /api/library）——过去这个拒绝
-// 被 saveLibrary 静默吞掉，现在拒绝会弹提示，就更不该发这次注定失败的请求。
+// 把权威清单连库一起写掉，这里不必先写一次。删除/恢复一拍的路径必须传它：那一刻
+// 本地 prompt_slots 已经是 N-1 条、frameRun 还留着 N 帧，写一份自相矛盾的中间态
+// 进库没有意义（老整表接口会直接 409 拒掉；单条写虽然不再拦，但存一份错的照样是错的）。
 async function applyPromptBlockToIdea(ownerIdea, promptBlock, promptSlots, deferSave = false) {
     if (!ownerIdea || !promptBlock) return;
     ownerIdea.prompt_block = promptBlock;
@@ -2482,7 +2513,7 @@ async function applyPromptBlockToIdea(ownerIdea, promptBlock, promptSlots, defer
         savedIdeas[existingIdx].prompt_block = promptBlock;
         if (promptSlots) savedIdeas[existingIdx].prompt_slots = promptSlots;
         else delete savedIdeas[existingIdx].prompt_slots;
-        if (!deferSave) await saveLibrary();
+        if (!deferSave) await persistIdeaItem(savedIdeas[existingIdx]);
     }
     if (isViewingIdea(ownerIdea.id)) {
         const blockEl = document.getElementById('idea-prompt-block');

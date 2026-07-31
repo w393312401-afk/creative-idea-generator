@@ -44,7 +44,7 @@ def test_creates_new_task_when_absent():
     t, already_running = prepare_task_for_run("100", {"theme": "新主题"})
     assert already_running is False
     assert t["status"] == "running"
-    assert t["dimensions"] == {"theme": "新主题"}
+    assert t["dimensions"]["theme"] == "新主题"
     assert list(server_common.ACTIVE_TASKS) == ["100"]
     assert os.path.exists(os.path.join("tasks", "100.json"))
 
@@ -67,7 +67,7 @@ def test_terminal_record_is_overwritten_in_place(status):
     assert t["events"] == []
     assert t["error"] is None
     assert t["result"] is None
-    assert t["dimensions"] == {"theme": "新主题"}
+    assert t["dimensions"]["theme"] == "新主题"
     # cancel_event 必须换新：旧事件已被 set，复用会让新 worker 一启动就自杀
     assert t["cancel_event"] is not old_cancel
     assert not t["cancel_event"].is_set()
@@ -76,14 +76,27 @@ def test_terminal_record_is_overwritten_in_place(status):
 
 
 def test_terminal_reset_is_persisted_to_disk():
+    """重试复用旧 task_id 时，上一轮的痕迹必须在磁盘上也被清掉。
+
+    2026-07-31 拆分存储（P2）之后 events 不再内联在 meta 里，而是单独的
+    tasks/events/<id>.jsonl —— 重置必须把它整份重写成空，不能继续往后追加，
+    否则重启后新一轮会带着上一轮的事件流复活。
+    """
     _seed("300", "failed")
     prepare_task_for_run("300", {"theme": "新主题"})
+
     with open(os.path.join("tasks", "300.json"), encoding="utf-8") as f:
         on_disk = json.load(f)
     assert on_disk["status"] == "running"
-    assert on_disk["events"] == []
     assert on_disk["error"] is None
-    assert on_disk["dimensions"] == {"theme": "新主题"}
+    assert on_disk["dimensions"]["theme"] == "新主题"
+
+    events_path = os.path.join("tasks", "events", "300.jsonl")
+    on_disk_events = []
+    if os.path.exists(events_path):
+        with open(events_path, encoding="utf-8") as f:
+            on_disk_events = [line for line in f.read().splitlines() if line.strip()]
+    assert on_disk_events == []
 
 
 def test_running_task_is_not_reset():
@@ -98,10 +111,10 @@ def test_running_task_is_not_reset():
     # 运行中的记录原样保留：事件、cancel_event、维度都不动
     assert t["events"] == old_events
     assert t["cancel_event"] is old_cancel
-    assert t["dimensions"] == {"theme": "旧主题"}
+    assert t["dimensions"]["theme"] == "旧主题"
 
 
 def test_dimensions_kept_when_not_provided():
     _seed("500", "failed")
     t, _ = prepare_task_for_run("500")
-    assert t["dimensions"] == {"theme": "旧主题"}
+    assert t["dimensions"]["theme"] == "旧主题"

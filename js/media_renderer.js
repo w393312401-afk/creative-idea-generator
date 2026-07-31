@@ -228,8 +228,8 @@ function renderIdea(result) {
         })
         .then(manifest => {
             // 两条分支写进库里的都是"服务端此刻的真实状态"（幽灵清理是删光，
-            // 刷新是按 manifest 原件覆盖），帧记录变少都属于有意为之——必须向
-            // 缩量闸门声明这一条创意，否则回写会被 409 拒绝（见 app.js saveLibrary）。
+            // 刷新是按 manifest 原件覆盖），帧记录变少都属于有意为之。走单条写
+            // （persistIdeaItem）之后不再经过整表缩量闸门，无需声明意图。
             if (manifest === null) {
                 if (result.frameRun) {
                     delete result.frameRun;
@@ -237,7 +237,7 @@ function renderIdea(result) {
                     const existingIdx = savedIdeas.findIndex(item => item.id === result.id);
                     if (existingIdx !== -1 && savedIdeas[existingIdx].frameRun) {
                         delete savedIdeas[existingIdx].frameRun;
-                        saveLibrary({ frameShrinkIds: [result.id] });
+                        persistIdeaItem(savedIdeas[existingIdx]);
                     }
                 }
             } else {
@@ -246,7 +246,7 @@ function renderIdea(result) {
                 const existingIdx = savedIdeas.findIndex(item => item.id === result.id);
                 if (existingIdx !== -1) {
                     savedIdeas[existingIdx].frameRun = manifest;
-                    saveLibrary({ frameShrinkIds: [result.id] });
+                    persistIdeaItem(savedIdeas[existingIdx]);
                 }
             }
             // 这是个异步回调：等待期间用户可能已经切到别的创意，此时不该把这份

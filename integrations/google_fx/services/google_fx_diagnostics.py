@@ -650,8 +650,9 @@ def _selftest_browser(steps, level, user_id=None, cancel_check=None):
     def open_flow():
         context = holder["browser"].contexts[0]
         holder["page"] = find_or_create_page(
-            context, "labs.google", fallback_url="https://labs.google/fx/tools/flow")
-        ensure_flow_workspace(holder["page"])
+            context, "labs.google", fallback_url="https://labs.google/fx/tools/flow",
+            user_id=user_id, cancel_check=cancel_check, context_label="Google FX 自检浏览器启动")
+        ensure_flow_workspace(holder["page"], user_id=user_id)
         return holder["page"].url
 
     def enter_project():
@@ -777,8 +778,10 @@ def probe_selectors_live(user_id=None, cancel_check=None, deep=False):
             ws_url = get_ads_ws_url(user_id=user_id, auto_rotate_proxy=False)
             browser = pw.chromium.connect_over_cdp(ws_url, timeout=20000)
             page = find_or_create_page(browser.contexts[0], "labs.google",
-                                       fallback_url="https://labs.google/fx/tools/flow")
-            ensure_flow_workspace(page)
+                                       fallback_url="https://labs.google/fx/tools/flow",
+                                       user_id=user_id, cancel_check=cancel_check,
+                                       context_label="选择器探针浏览器启动")
+            ensure_flow_workspace(page, user_id=user_id)
             if deep:
                 _ensure_flow_project_open(page)
             probe = probe_selectors(page, deep=deep)

@@ -101,6 +101,27 @@ class _NextButton:
         self.page.submit_current()
 
 
+class _Action:
+    def __init__(self, page, name, next_step):
+        self.page = page
+        self.name = name
+        self.next_step = next_step
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return 1
+
+    def is_visible(self, timeout=None):
+        return True
+
+    def click(self, timeout=None):
+        self.page.clicks.append(self.name)
+        self.page.step = self.next_step
+
+
 class _FakeLoginPage:
     """step 取 email / password / totp / chooser / captcha / done。"""
 
@@ -120,6 +141,7 @@ class _FakeLoginPage:
         self.expect_totp = expect_totp
         self.error_text = error_text
         self.submissions = []
+        self.clicks = []
         self._pending = None
 
     # -- Playwright Page 接口 --
@@ -145,9 +167,18 @@ class _FakeLoginPage:
         return {
             "captcha": "Verify you're not a robot — captcha",
             "chooser": "Choose an account Use another account",
+            "phone_prompt": "2-Step Verification Check your phone and tap Yes",
+            "challenge_picker": "2-Step Verification Choose how you want to sign in",
         }.get(self.step, f"Sign in step {self.step}")
 
     def locator(self, selector):
+        if self.step == "phone_prompt" and selector == "button:has-text('Try another way')":
+            return _Action(self, "try_another_way", "challenge_picker")
+        if self.step == "challenge_picker" and selector == "[data-challengetype='6']":
+            return _Action(self, "authenticator", "totp")
+        # 图二底部仍有 Try another way；用于验证实现不会误点第二次。
+        if self.step == "challenge_picker" and selector == "button:has-text('Try another way')":
+            return _Action(self, "try_another_way_again", "unknown-interstitial")
         selector_field = self._FIELDS.get(self.step)
         if selector_field and selector == selector_field[0]:
             field = _Field(self, selector_field[1])
@@ -279,6 +310,36 @@ def test_two_factor_flow_fills_the_generated_code():
 
     assert result.ok is True
     assert page.submissions[-1] == ("totp", expected_code)
+
+
+def test_phone_prompt_switches_to_authenticator_then_fills_totp():
+    """手机通知确认页应按图一→图二→TOTP 输入框的顺序自动切换。"""
+    _configure(with_totp=True)
+    expected_code = totp.generate(_SECRET)
+    page = _FakeLoginPage(step="phone_prompt", expect_totp=expected_code, script={
+        ("totp", "ok"): "done",
+    })
+
+    result = auto_login.try_auto_login(page, user_id="u1")
+
+    assert result.ok is True
+    assert page.clicks == ["try_another_way", "authenticator"]
+    assert page.submissions == [("totp", expected_code)]
+
+
+def test_challenge_picker_selects_authenticator_before_bottom_try_another_way():
+    """已经在图二时直接选 Authenticator，不能再点底部同名入口。"""
+    _configure(with_totp=True)
+    expected_code = totp.generate(_SECRET)
+    page = _FakeLoginPage(step="challenge_picker", expect_totp=expected_code, script={
+        ("totp", "ok"): "done",
+    })
+
+    result = auto_login.try_auto_login(page, user_id="u1")
+
+    assert result.ok is True
+    assert page.clicks == ["authenticator"]
+    assert page.submissions == [("totp", expected_code)]
 
 
 def test_success_records_ok_and_clears_previous_error():
@@ -417,3 +478,24 @@ def test_attempt_auto_login_skips_quietly_when_nothing_is_configured():
     page = _FakeLoginPage(step="email")
     assert attempt_auto_login(page, user_id="unconfigured") is False
     assert page.submissions == []
+
+
+def test_attempt_auto_login_uses_runtime_default_account_when_user_id_is_omitted(monkeypatch):
+    """Google FX 主服务不显式传账号时，也必须使用当前默认 AdsPower 环境凭据。"""
+    from integrations.google_fx.utils import browser as browser_utils
+
+    _configure(user_id="default-fx")
+    monkeypatch.setattr(browser_utils, "get_runtime_default_user_id", lambda: "default-fx")
+    # 本模块的 autouse fixture 为其它状态机用例把共享解析器收紧成“只认显式值”；
+    # 这条用例专门验证 fallback，因此恢复与生产一致的优先级语义。
+    monkeypatch.setattr(
+        browser_utils.account_binding, "resolve_account",
+        lambda explicit=None, fallback=None: str(explicit or fallback or "").strip(),
+    )
+    page = _FakeLoginPage(step="email", script={
+        ("email", "ok"): "password",
+        ("password", "ok"): "done",
+    })
+
+    assert browser_utils.attempt_auto_login(page, user_id=None) is True
+    assert page.submissions == [("email", "me@example.com"), ("password", "pw")]
