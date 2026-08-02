@@ -1,3 +1,5 @@
+import inspect
+
 from integrations.google_fx.services import google_fx_diagnostics as diagnostics
 from integrations.google_fx.services import google_fx_helpers as helpers
 from integrations.google_fx.services import google_fx_image
@@ -266,6 +268,13 @@ def test_config_count_does_not_confuse_x1_with_x2():
     assert checks["count"] is False
 
 
+def test_current_flow_count_control_uses_x_prefix_and_stable_aria_suffix():
+    """Current Flow labels the tab x1 even though callers request legacy 1x."""
+    source = inspect.getsource(helpers.fix_fx_config)
+    assert "aria-controls$='-content-{_count_number}'" in source
+    assert 'f"x{_count_number}"' in source
+
+
 def test_l1_probe_config_functions():
     """验证 7 项 L1 自测配置与上传检测探针函数。"""
     page = _ProbePage({
@@ -285,4 +294,3 @@ def test_l1_probe_config_functions():
     assert "比例" in diagnostics.probe_orientation_config(page)
     assert "参考模式" in diagnostics.probe_ref_mode_config(page)
     assert "上传配置" in diagnostics.probe_upload_config(page)
-

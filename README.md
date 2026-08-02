@@ -51,7 +51,7 @@ cd creative-idea-generator
 | 要补的东西 | 不补的后果 | 怎么补 |
 |---|---|---|
 | `server_config.json` 里的 `apiKey`（以及 `baseUrl` 指向你的 LLM 网关） | 无法「激发创意」与合成提示词 | 记事本打开填好，重启服务 |
-| 技能包 `restoration-prompt-composer` | 提示词合成按空契约降级（创意维度变窄、一致性约束消失），启动日志与前端横幅会喊出缺失清单 | 见下方「技能包路径（skillDir）」 |
+| 技能包 `gemini-veo-restoration-composer` | 提示词合成按空契约降级（创意维度变窄、一致性约束消失），启动日志与前端横幅会喊出缺失清单 | 见下方「技能包路径（skillDir）」 |
 
 Google FX 的视频生成还需要本机装好 AdsPower，见下方说明；不装不影响前面所有功能。
 
@@ -85,25 +85,65 @@ Google FX 的视频生成还需要本机装好 AdsPower，见下方说明；不�
 *   **配置文件**：`server_config.json`（实际运行配置，已加入 `.gitignore` 避免密钥泄露）
 *   **配置模板**：[server_config.example.json](file:///c:/Users/video/Desktop/creative-idea-generator/server_config.example.json)
     *   包含 API 密钥、访问密码以及各类服务端参数配置。首次运行时由 `tools/bootstrap_config.py` 自动生成一份（占位说明会被清成空值），你只需要补 `apiKey`。
-    *   `skillDir`：技能包（`restoration-prompt-composer`）的本地目录，换机部署时最容易漏配的一项（见下方「技能包路径」）。
+    *   `skillProfile` / `skillProfiles`：做哪个模型的提示词就读哪个技能包（两个包已随仓库内置，通常不用配；见下方「技能包与 profile」）。`skillDir` 是 base 包路径的历史别名。
     *   `adsPowerPort`：AdsPower 本地 API 端口（默认 `50325`）。Google FX 运行时已内置在 `integrations/google_fx/`，换机不再需要配置外部源码路径。
     *   `accessCode` 设置后，除 `/api/mode` 外的全部 API（含任务/日志/清单读取）都需要访问码；静态路由永不吐出配置、日志、任务与服务端源码。
 
-### 技能包路径（skillDir）
+### 技能包与 profile（做哪个模型的提示词，就读哪个包）
 
-激发创意与提示词合成都要现读技能包里的 8 个契约文件（`SKILL.md` 与 `references/` 下的形态矩阵 `idea-engine.md`、提示词模板 `prompt-templates.md`、历史选题台账 `used-topic-ledger.md`、三份一致性协议、空间工序表）。**这些文件缺失不会报错**，只会让合成按空契约降级——创意维度变窄、模板与一致性约束整段消失。所以启动日志与前端横幅都会把缺失清单喊出来。
+两个技能包已随代码放进仓库的 [skills/](skills/)，不配任何东西也能跑：
 
-在 `server_config.json` 里指定路径即可：
+| profile | 技能包 | 面向的视频模型 | 契约文件 |
+| --- | --- | --- | --- |
+| `base` | `skills/gemini-veo-restoration-composer` | Veo 系列 / 通用 | 8 个 |
+| `omni` | `skills/gemini-omni-restoration-composer` | Gemini Omni / Omni Flash（强制多镜头组接） | 12 个 |
+
+激发创意与提示词合成都要**现读**这些契约文件（`SKILL.md` 与 `references/` 下的形态矩阵、提示词模板、一致性协议、空间工序表等）。**这些文件缺失不会报错**，只会让合成按空契约降级——创意维度变窄、模板与一致性约束整段消失。所以启动日志与前端横幅都会把缺失清单喊出来，**两个 profile 一次报全**（只报当前激活的那个，等于把「另一个包没装好」留到切模型那一刻才炸）。
+
+**选哪个包**：UI 入口在**激发按钮上方的「提示词链路」芯片组**（排在 LLM 模型之前——链路决定提示词写成什么样，模型只决定谁来写），三选一：`自动` / `Veo · 单镜延时`(base) / `Omni · 六镜头`(omni)。停在「自动」时徽标会直接显示当前实际走哪条（规则表由 `/api/mode` 的 `skill_profile_rules` 下发，前端只按表匹配、不自带一份 `omni` 判断）。
+
+`skillProfile` 默认 `auto`，按 `videoModel` 推断——模型名里含 `omni` 走 omni 包，其余走 base 包。也可以在配置文件里钉死：
 
 ```json
-{ "skillDir": "~/.codex/skills/restoration-prompt-composer" }
+{ "skillProfile": "omni" }
 ```
 
-*   支持 `~`、环境变量，以及相对本项目根目录的相对路径（如 `skills/restoration-prompt-composer`）。
+钉死的用处是把两件事解耦：只想换渲染档位的人不该被顺手改掉提示词语法，反过来只想换提示词语法的人也不该被迫去改视频模型下拉框。取值优先级：环境变量 `SKILL_PROFILE` > `skillProfile` > 按 `videoModel` 推断。
+
+**两条按 profile 分 / 不分的线**：形态矩阵 `idea-engine.md` 按 profile 走（两个包各带一份）；历史选题台账**全局共享一份**，落在 `runtime/used-topic-ledger.md`（首次使用从技能包里的种子整份拷贝，历史不丢）。台账不按 profile 分裂是刻意的——同一个选题换个分镜语法重做一遍不是新选题，去重记忆劈成两半等于没有。技能包 `references/` 里那份从此只是**只读种子**，运行时不再往包内追加（否则技能包进了 git 就会每合成一次脏一次）。
+
+**改包路径**（换机部署、或想指回自己在 `~/.codex` 下那份工作副本时）：
+
+```json
+{ "skillProfiles": { "base": "~/.codex/skills/gemini-veo-restoration-composer" } }
+```
+
+*   支持 `~`、环境变量，以及相对本项目根目录的相对路径。`skillDir` 是 base 的历史别名，等价于 `skillProfiles.base`。
 *   **改完不用重启**：服务会在配置文件 mtime 变化时重算，下一次「激发创意」/合成即按新路径读取。
-*   取值优先级：环境变量 `SKILL_DIR` > `skillDir` > 内置默认 `~/.codex/skills/restoration-prompt-composer` > 自动探测。
-*   自动探测只在前三项都没有契约文件时兜底：扫 `~/.codex/skills`、`~/.claude/skills`、`~/.agents/skills`、`<项目>/skills` 的一级子目录，挑契约命中最多（≥2 个）的那个包——技能包被改名或装到别的 agent 目录时能自动捡回来。
-*   显式配了 `skillDir`/`SKILL_DIR` 就绝不再自动探测：路径写错要在启动日志里看得见地报缺失，而不是被悄悄换成另一个技能包。
+*   取值优先级：环境变量（`SKILL_DIR` / `SKILL_DIR_OMNI`）> `skillProfiles.<profile>` / `skillDir` > 仓库内置 `skills/<包名>` > 旧默认 `~/.codex/skills/<包名>` > 自动探测。
+*   自动探测只在前面几项都没有契约文件时兜底：扫 `~/.codex/skills`、`~/.claude/skills`、`~/.agents/skills`、`<项目>/skills` 的一级子目录，挑该 profile 契约命中最多（≥2 个）的那个包。
+*   显式配了路径就绝不再自动探测：路径写错要在启动日志里看得见地报缺失，而不是被悄悄换成另一个技能包。
+*   omni 包里没有 base 的 `prompt-templates.md` 这类文件，切到 omni 时这些读取会**回落到 base 包**（并在日志里说明），避免切个视频模型就把现有合成链路整段读空。
+
+### 合成实现按 profile 分派（composer）
+
+提示词合成是两段式：`compose_anchor_and_packet`（Phase 1：brief / 工序梯 / Drift Lock 包 / IMAGE 1）+ `compose_remaining_beats`（Phase 2：逐拍撰写与装配），中间插一道首帧验收门。**只有 Phase 2 按 profile 分派**，实现在 [prompt_pipeline/composers/](prompt_pipeline/composers/)：`get_composer(profile)` 给出实现，未知 profile 一律回落 base。
+
+| | base | omni |
+| --- | --- | --- |
+| VIDEO | 一条连续的施工延时 | 剪辑过的多镜头序列，镜头数由片长决定（10s=六镜 远景/全景/中景/近景/特写/结果远景，8s=五镜，6s=四镜，4s=三镜），正文带一句把切点钉到秒的**时间线句**，默认 UGC 手机拍摄质感（可用光、轻微过曝、压缩噪点、不稳定构图），**无例外**禁止 one-take / oner / single continuous take 一类措辞 |
+| IMAGE、Phase 1、槽位格式、断点续传 | —— 全 profile 同一套，omni 一律委托 base，不存在第二份实现 —— | |
+
+omni 侧只覆写四类钩子：撰写指令（在 base 那份 system prompt 之后追加一段 OMNI VIDEO OVERRIDE，IMAGE 规则原样保留）、VIDEO 的确定性修复（按镜头数缩放的字数预算、多镜头版节奏声明、切点时间线的确定性注入与覆写、数字折成英文单词）、审计（镜头梯缺失/多出梯外景别/时间线缺失或与片长不符/一镜到底措辞算**结构性硬伤**，接进既有的「校验 → 定向回炉一轮 → 审核面板留痕」通路；记号类瑕疵只留痕不回炉）、占位符兜底稿的收尾。必读契约按 `SKILL.md §Required Reference Loading` 声明的 7 个走 `load_reference_file(name, 'omni')`，过门契约按需加载。
+
+**镜头梯随片长伸缩，切点写进提示词**（2026-08-01）。Omni Flash 是唯一提供 4/6/8/10s 时长切换的模型，而六个镜头塞进 4 秒等于每镜 0.67 秒——模型只能丢镜头或整体加速，两者都表现为观感上的跳变。现在：
+
+*   **镜头数由片长决定**（10/8/6/4s → 6/5/4/3 镜，约束是平均每镜 ≥1.3 秒、主工作镜 ≥1.9 秒）。远景（首帧锚）/ 中景（唯一携带推进量的镜头）/ 结果远景（尾帧锚）三镜任何长度下都不裁；回补优先级 近景 → 全景 → 特写；被裁那一级的职责并进相邻镜头，不是随之消失。过门桥拍与最终兑现拍走各自的三工位梯。
+*   **切点用一句时间线钉在秒上**（`Cut this ten-second clip on these marks and hold no other cuts — an establishing long shot from 0.0 to 1.6, ...`），由 composer 确定性注入并覆写模型自编的版本。这是正文里**唯一**允许出现阿拉伯数字的地方（技能包 §Notation Ban 为此开了一条 Timecode exemption），其余计数一律折成英文单词。
+*   **时长不再允许"沿用面板当前时长"**：提示词按 N 秒排切点、生成时却用了面板上残留的另一个时长，切点表当场作废。合成端与生成端统一走 `server_common.resolve_video_duration()`，默认 10s（排满六镜所需的长度）。
+*   顺带清掉两处与 base 契约的硬冲突：base 的 even-rate 句（"每一刻都在推进、不许把改动推迟后一次兑现"）与镜头级进度锁直接对撞，换成约束到**镜内**的连续性声明；base 的 out-and-in 兜底会塞进按 8 秒写死的时间戳与 Grid 记号，omni 下整条跳过。
+
+**断点续传指纹含 profile**：`get_brief_fingerprint(dimensions, profile)` 把 profile 一起哈希（`packet_cache_key` 由它派生，自动跟着分家）。一单在 base 下合成到一半、把视频模型切成 Omni Flash 再点合成，会**重排而不是续传**——否则命中旧断点续出来的是半 base 半 omni 的混合提示词集。代价是这次改动让**存量断点存档整体失效**，未完成的单子重试时从 Phase 1 重跑；已交付的整单不受影响（交付即清档）。
 
 ### 合成节拍输入
 

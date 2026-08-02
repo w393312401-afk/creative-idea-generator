@@ -16,6 +16,7 @@
 
 import pytest
 from integrations.google_fx.services import google_fx_helpers as H
+from integrations.google_fx.services import google_fx_image as I
 
 
 # ── 换 IP 判定 ────────────────────────────────────────────────────────────────
@@ -30,6 +31,7 @@ from integrations.google_fx.services import google_fx_helpers as H
     "请求超时：超出时间预算 (request budget exceeded)",
     "MANUAL_REQUIRED: 检测到需要人工处理",
     "AttributeError: 'NoneType' object has no attribute 'click'",
+    "FLOW_CANVAS_UNAVAILABLE: 无法创建或打开可用的 Google Flow 画布",
     "",
 ])
 def test_ui_automation_failures_do_not_switch_account(message):
@@ -50,6 +52,35 @@ def test_generation_side_failures_switch_account(message):
     """确实指向出口 IP / 账号风控的失败：照旧换 IP。"""
     should_switch, verdict = H._classify_failure_for_switch(message)
     assert should_switch is True, verdict
+
+
+@pytest.mark.parametrize("message", [
+    "MANUAL_REQUIRED:login_required: Google FX 页面初始化需要人工处理 (sign in)",
+    "检测到 Google 登录页面，无法自动进入工作台",
+    "ACCOUNT_LOGIN_REQUIRED: sign in to Google",
+])
+def test_account_login_failures_switch_account(message):
+    should_switch, verdict = H._classify_failure_for_switch(message)
+    assert should_switch is True, verdict
+    assert "登录" in verdict
+
+
+def test_login_failure_cools_the_current_bound_account(monkeypatch):
+    seen = []
+
+    class _Pool:
+        def mark_login_required(self, user_id):
+            seen.append(user_id)
+
+    monkeypatch.setattr(I.account_binding, "resolve_account", lambda **_k: "acct-bad")
+    monkeypatch.setattr(
+        "integrations.google_fx.utils.account_pool.AccountPool",
+        lambda: _Pool(),
+    )
+    monkeypatch.setattr(I, "log", lambda *_a, **_k: None)
+
+    assert I._cooldown_current_login_account("sign in") == "acct-bad"
+    assert seen == ["acct-bad"]
 
 
 def test_unknown_error_defaults_to_no_switch(monkeypatch):
@@ -84,6 +115,12 @@ def test_force_switch_bypasses_classification(monkeypatch):
 
     monkeypatch.setattr(H, "_classify_failure_for_switch", fake_classify)
     monkeypatch.setattr(H, "log", lambda *a, **k: None)
+    # Never touch the real local account pool/context from this pure classifier
+    # test; doing so leaks a task account into later tests in the same thread.
+    monkeypatch.setattr(
+        "integrations.google_fx.utils.account_pool.switch_to_next_account",
+        lambda **_k: None,
+    )
     # 号池为空时换号会走到「没有可换的账号」分支返回 None，这里只关心没被分类拦下
     H._switch_account_on_failure(reason="批量生图部分失败 (1/3)", force_switch=True)
     assert "classified" not in seen

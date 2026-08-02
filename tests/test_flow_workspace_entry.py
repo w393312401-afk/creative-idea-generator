@@ -101,6 +101,33 @@ def test_landing_page_clicks_the_top_visible_cta_and_waits_for_workspace():
     assert page.clicked_y == 700
 
 
+def test_landing_page_opens_target_blank_cta_in_the_existing_tab():
+    class _LinkElement(_Element):
+        def evaluate(self, script):
+            if "closest('a[href]')" in script:
+                return "https://labs.google/fx/tools/flow"
+            return None
+
+        def click(self, timeout=None):
+            raise AssertionError("target=_blank CTA must not be clicked")
+
+    class _TargetBlankLandingPage(_LandingPage):
+        def __init__(self):
+            super().__init__()
+            self.navigated_to = None
+            self.hero = _LinkElement(self, y=700)
+
+        def goto(self, url, timeout=None, **kwargs):
+            self.navigated_to = url
+            self.ready = True
+
+    page = _TargetBlankLandingPage()
+
+    assert ensure_flow_workspace(page, timeout_seconds=0.01) is True
+    assert page.navigated_to == "https://labs.google/fx/tools/flow"
+    assert page.clicked_y is None
+
+
 def test_workspace_recovery_is_idempotent_when_already_entered():
     page = _LandingPage(already_ready=True)
     assert ensure_flow_workspace(page, timeout_seconds=0.01) is True
@@ -148,7 +175,7 @@ def test_find_or_create_page_reuses_tab_and_closes_extras(monkeypatch):
             self.brought_to_front = False
             self.navigated_to = None
 
-        def goto(self, url, timeout=None):
+        def goto(self, url, timeout=None, **kwargs):
             self.navigated_to = url
             self.url = url
 
@@ -188,6 +215,30 @@ def test_find_or_create_page_reuses_tab_and_closes_extras(monkeypatch):
     assert selected2 == p_blank2
     assert selected2.navigated_to == "https://labs.google/fx/tools/flow"
     assert len(ctx2.pages) == 1  # 没有产生新页面
+
+
+def test_find_or_create_page_handles_frame_detached():
+    """测试在跳转 fallback_url 触发 Frame has been detached 时能安全恢复页面而不挂掉。"""
+    from integrations.google_fx.utils.browser import find_or_create_page
+
+    class DetachedPage:
+        def __init__(self):
+            self.url = "about:blank"
+
+        def goto(self, url, timeout=None, **kwargs):
+            self.url = "https://labs.google/fx/tools/flow"
+            raise Exception("Page.goto: Frame has been detached.")
+
+        def bring_to_front(self):
+            pass
+
+    class DummyContext:
+        def __init__(self):
+            self.pages = [DetachedPage()]
+
+    ctx = DummyContext()
+    page = find_or_create_page(ctx, "/fx/tools/flow", fallback_url="https://labs.google/fx/tools/flow", auto_login=False)
+    assert page.url == "https://labs.google/fx/tools/flow"
 
 
 def test_find_or_create_page_attempts_login_immediately(monkeypatch):

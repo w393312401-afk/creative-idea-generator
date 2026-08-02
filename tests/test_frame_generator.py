@@ -259,6 +259,34 @@ visible construction change
         for frame in manifest['frames']:
             self.assertEqual(frame['quality_gate'], 'pending_manual_review')
 
+    def test_subset_prompt_keeps_its_real_slot_and_uses_durable_parent(self):
+        """A prompt block containing only IMAGE 3 must render slot 3, never slot 1."""
+        frames_dir = os.path.join(server_common._get_project_dir('subset_slot_3'), 'frames')
+        os.makedirs(frames_dir, exist_ok=True)
+        parent = os.path.join(frames_dir, 'img_002.webp')
+        _write_test_image(parent, (72, 128))
+        calls = []
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            calls.append((prompt, reference_path, target_path))
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+            manifest = generate_frame_sequence(
+                {'coverReferencePath': self.cover},
+                'subset_slot_3',
+                '图片 3:\nthird-slot prompt\n',
+                on_progress=lambda *args: None,
+                target_sequences=[3],
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], 'third-slot prompt')
+        self.assertEqual(calls[0][1], parent)
+        self.assertTrue(calls[0][2].endswith('img_003.webp'))
+        self.assertEqual([(f['sequence'], f['slot']) for f in manifest['frames']], [(3, 3)])
+
 
 class TestQuotaFallback(unittest.TestCase):
     """主模型图片额度耗尽 = 就地明确失败。

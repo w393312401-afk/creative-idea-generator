@@ -14,10 +14,11 @@ import time
 import random
 import requests
 
-from ..config import MAX_WAIT_SECONDS, OUTPUT_DIR
+from ..config import OUTPUT_DIR, get_runtime_max_wait_seconds
 from ..utils.logger import log
 from ..utils.browser import (
     random_sleep, clean_path, get_ads_ws_url, find_or_create_page, ensure_flow_workspace,
+    _page_is_alive,
 )
 from ..ui_selectors import UI_SELECTORS, RATIO_MAP, ORIENT_ICON_MAP
 from ..model_catalog import DEFAULT_GOOGLE_FX_IMAGE_MODEL, GOOGLE_FX_IMAGE_MODELS
@@ -157,14 +158,9 @@ def _extract_flow_image_uuid(image_ref: str):
     return matches[-1] if matches else None
 
 
-# ── _get_recent_flow_image_uuids ──
-def _get_recent_flow_image_uuids(page, limit=2):
-    """
-    获取画布里最近的一批图片 UUID。
-    Flow 新图通常会被插到画布顶部，因此按视觉位置从左上到右下排序后取前几个。
-    """
-    cards = _get_recent_flow_image_cards(page, limit=limit)
-    return [item.get("uuid") for item in cards if item.get("uuid")]
+# 2026-08-01 清理：这里原有 _get_recent_flow_image_uuids()，是下面 _get_recent_flow_image_cards()
+# 的一层"只取 uuid 列"的薄包装，全 repo 零调用者。需要 UUID 的地方走的是
+# _get_panel_uuid_order() / _get_prompt_reference_uuids()。
 
 
 # ── _get_recent_flow_image_cards ──
@@ -772,24 +768,35 @@ def _mount_flow_images_to_prompt(page, image_refs, context_label="参考图"):
     desired_count = min(len(requested), 2)
     ordered_cards = []
     seen_tiles = set()
-    visible_cards = _get_recent_flow_image_cards(page, limit=desired_count)
-    cards_by_uuid = {
-        item.get("uuid"): item
-        for item in visible_cards
-        if item.get("uuid") and item.get("tile_id")
-    }
+    # 视频请求通常携带精确 UUID。先用 img[src*=UUID] 定位，避免每个槽位都遍历
+    # 整张历史画布（长项目可有 90+ 卡片，扫描会越来越慢且增加 hover 串卡风险）。
+    visible_cards = []
     missing_requested = []
 
     for ref in requested:
         uuid = _extract_flow_image_uuid(str(ref))
-        matched = cards_by_uuid.get(uuid) if uuid else None
+        matched = _find_tile_by_uuid_js(page, uuid) if uuid else None
         if matched and matched.get("tile_id") not in seen_tiles:
             ordered_cards.append(matched)
             seen_tiles.add(matched.get("tile_id"))
         elif uuid:
             missing_requested.append(uuid)
 
-    log(f"🧭 {context_label}: 画布扫描到 {len(visible_cards)} 张卡片，命中 {len(ordered_cards)} 张", "GoogleFX")
+    # 非 UUID 的旧调用方才需要扫描最近卡片；多参考图不做随意回退。
+    if not any(_extract_flow_image_uuid(str(ref)) for ref in requested):
+        visible_cards = _get_recent_flow_image_cards(page, limit=desired_count)
+        for card in visible_cards:
+            if card.get('tile_id') and card.get('tile_id') not in seen_tiles:
+                ordered_cards.append(card)
+                seen_tiles.add(card.get('tile_id'))
+                if len(ordered_cards) >= desired_count:
+                    break
+
+    log(
+        f"🧭 {context_label}: UUID 精确定位命中 {len(ordered_cards)}/{desired_count}"
+        + (f"；兼容扫描 {len(visible_cards)} 张卡片" if visible_cards else "；跳过全画布扫描"),
+        "GoogleFX",
+    )
 
     if missing_requested:
         log(f"🔍 {context_label}: 尝试通过 img[src*=UUID] 精确定位 {len(missing_requested)} 张未命中卡片", "GoogleFX")
@@ -1465,6 +1472,24 @@ def _fill_prompt_text(page, input_el, prompt, has_refs=False):
     return filled
 
 
+def _read_prompt_refs_settled(page, limit, attempts=3, settle=0.6):
+    """复核专用读数：一次读空不算数，稳定读空才算数。
+
+    写完提示词（视频链动辄两千多字）之后 Slate 会整棵重建，chip 与文本在同一棵树上，
+    重建中途读到的空列表是**渲染过程**，不是「参考图掉了」。而这道复核的判负代价是
+    整个片段作废重试，所以宁可多花一秒复读几次：只要任一次读到了参考图就以它为准，
+    连着几次都读不到才认账。返回最后一次（或首个非空的）读数。
+    """
+    state = {"uuids": [], "scope": "", "ok": False}
+    for attempt in range(max(attempts, 1)):
+        state = read_prompt_reference_state(page, limit=limit)
+        if state["uuids"]:
+            return state
+        if attempt < max(attempts, 1) - 1:
+            time.sleep(settle)
+    return state
+
+
 def _video_refs_still_attached(page, mount_meta):
     """点 Generate 之前的最后一道复核：首尾帧是不是还挂在提示词框上。
 
@@ -1472,22 +1497,39 @@ def _video_refs_still_attached(page, mount_meta):
     每一步都可能把参考图 chip 挤掉（Slate 编辑器里 chip 和文本是同一棵树）。
     而 Flow 对"没有参考图的视频请求"不报错，它会安静地按纯文本生成一段无关片段。
     与其等下载后靠锚点 MAD 拒收（额度已经烧掉了），不如提交前再读一次 DOM。
+
+    ⚠️ 判负必须建立在「确实读到了输入区、里面确实没有参考图」之上。读数本身失败
+    （page.evaluate 抛异常）时既不能放行也不能当成掉图——放行会提交一段没有首尾帧的
+    片段，当掉图则会把好好的片段判死。这种情况下只重试，读不出来就保持沉默地放行，
+    交给下载后的锚点校验兜底：那是唯一还能拿到真实证据的环节。
     """
     meta = mount_meta or {}
     expected = [u for u in (meta.get("expected") or []) if u]
     if meta.get("strategy") == "prompt_chips" and expected:
-        actual = _get_prompt_reference_uuids(page, limit=max(len(expected), 2))
+        state = _read_prompt_refs_settled(page, limit=max(len(expected), 2))
+        actual = state["uuids"]
         if actual[:len(expected)] == expected:
             return True
-        log(f"🚨 提交前复核：提示词区参考图已变化 | expected={expected} | actual={actual}", "GoogleFX")
+        if not state["ok"]:
+            log(f"⚠️ 提交前复核：读不到输入区（DOM 扫描失败），按挂载时的校验结果放行，"
+                f"改由下载后的锚点校验兜底 | expected={expected}", "GoogleFX")
+            return True
+        log(f"🚨 提交前复核：提示词区参考图已变化 | expected={expected} | actual={actual}"
+            f" | scope={state['scope']}", "GoogleFX")
         return False
 
     refs = [u for u in (meta.get("refs") or []) if u]
     if refs:
-        actual = _get_prompt_reference_uuids(page, limit=max(len(refs), 2))
+        state = _read_prompt_refs_settled(page, limit=max(len(refs), 2))
+        actual = state["uuids"]
         if len(actual) >= len(refs):
             return True
-        log(f"🚨 提交前复核：提示词区参考图数量减少 | 挂载时={len(refs)} | 现在={len(actual)}", "GoogleFX")
+        if not state["ok"]:
+            log(f"⚠️ 提交前复核：读不到输入区，按挂载时的校验结果放行，"
+                f"改由下载后的锚点校验兜底 | 挂载时={len(refs)}", "GoogleFX")
+            return True
+        log(f"🚨 提交前复核：提示词区参考图数量减少 | 挂载时={len(refs)} | 现在={len(actual)}"
+            f" | scope={state['scope']}", "GoogleFX")
         return False
 
     # frame_slots 回退路径下槽位缩略图不一定落在提示词区选择器的取值范围内，
@@ -1688,17 +1730,26 @@ def _normalize_video_duration_label(duration):
     return f"{number}s"
 
 def _click_video_duration_tab(page, panel_scope, duration_label):
-    """Click a video duration tab such as 4s, 6s, or 8s."""
-    try:
-        _dur_btn = panel_scope.locator("button[role='tab']").filter(
-            has_text=re.compile(f"^{re.escape(duration_label)}$", re.I)
-        ).first
-        if _dur_btn.is_visible(timeout=2000):
-            _dur_btn.click(force=True)
-            random_sleep(0.4, 0.8)
-            return "role=tab + 精确匹配"
-    except Exception:
-        pass
+    """Click a video duration tab such as 4s, 6s, 8s, or 10s."""
+    root = panel_scope or page
+    duration_label = _normalize_video_duration_label(duration_label) or str(duration_label)
+    selectors = [
+        "button[role='tab']",
+        "button[aria-controls*='DURATION']",
+        "button[aria-controls*='duration']",
+        "button",
+    ]
+    for sel in selectors:
+        try:
+            _dur_btn = root.locator(sel).filter(
+                has_text=re.compile(f"^{re.escape(duration_label)}$", re.I)
+            ).first
+            if _dur_btn.is_visible(timeout=1500):
+                _dur_btn.click(force=True)
+                random_sleep(0.4, 0.8)
+                return f"{sel} + 精确匹配 ({duration_label})"
+        except Exception:
+            pass
 
     if _click_fx_tab(page, duration_label, scope=panel_scope):
         return "tab fallback"
@@ -2166,17 +2217,24 @@ def _matches_orientation_text(text, orientation):
     return any(token.lower() in haystack for token in _orientation_tokens(orientation))
 
 
+def _generation_count_aliases(count):
+    """Return the stable numeric key and every UI spelling for a count value."""
+    target = _normalize_fx_status_text(count).replace(" ", "")
+    match = re.fullmatch(r"(?:x(\d+)|(\d+)x)", target)
+    aliases = {target}
+    number = ""
+    if match:
+        number = match.group(1) or match.group(2)
+        aliases.update({f"x{number}", f"{number}x"})
+    return number, aliases
+
+
 def _matches_generation_count(text, count):
     """Match both Flow count spellings (legacy ``1x`` and current ``x1``)."""
     if not count:
         return True
     clean = _normalize_fx_status_text(text)
-    target = _normalize_fx_status_text(count).replace(" ", "")
-    match = re.fullmatch(r"(?:x(\d+)|(\d+)x)", target)
-    aliases = {target}
-    if match:
-        number = match.group(1) or match.group(2)
-        aliases.update({f"x{number}", f"{number}x"})
+    _, aliases = _generation_count_aliases(count)
     tokens = set(re.findall(r"(?<!\w)(?:x\d+|\d+x)(?!\w)", clean))
     return bool(tokens & aliases)
 
@@ -2347,14 +2405,29 @@ def fix_fx_config(page, cfg_btn, checks, model="Nano Banana 2", orientation="Por
     if not checks.get("count", True):
         log(f"  → 切换到 {count}", "GoogleFX")
         try:
-            # 优先: role=tab + 文字精确匹配（比模糊匹配更安全，避免误点其他 tab）
-            _count_btn = panel_scope.locator("button[role='tab']").filter(
-                has_text=re.compile(f"^{re.escape(count)}$", re.I)
-            ).first
-            if _count_btn.is_visible(timeout=2000):
+            # Flow 当前 UI 把数量写作 x1/x2，旧 UI 写作 1x/2x；调用方仍使用
+            # 兼容参数 1x。优先按 aria-controls 的稳定业务值定位，避免拿 "1x"
+            # 去精确匹配当前的 "x1" 而永远找不到。
+            _count_number, _count_aliases = _generation_count_aliases(count)
+            _count_btn = None
+            if _count_number:
+                _by_control = panel_scope.locator(
+                    f"button[role='tab'][aria-controls$='-content-{_count_number}']"
+                ).first
+                if _by_control.is_visible(timeout=2000):
+                    _count_btn = _by_control
+            if _count_btn is None:
+                for _label in _count_aliases:
+                    _candidate = panel_scope.locator("button[role='tab']").filter(
+                        has_text=re.compile(f"^{re.escape(_label)}$", re.I)
+                    ).first
+                    if _candidate.is_visible(timeout=1000):
+                        _count_btn = _candidate
+                        break
+            if _count_btn is not None:
                 _count_btn.click(force=True)
                 random_sleep(0.4, 0.8)
-                log(f"  ✅ {count} 已点击 (role=tab + 精确匹配)", "GoogleFX")
+                log(f"  ✅ {count} 已点击 (数量 tab: x{_count_number or '?'})", "GoogleFX")
                 fix_info["clicked_keys"].append("count")
             elif _click_fx_tab(page, count, scope=panel_scope):
                 log(f"  ✅ {count} 已点击 (tab fallback)", "GoogleFX")
@@ -2695,7 +2768,7 @@ def _recover_missing_fx_config_button(page, context_label):
             f"底部工具栏判定为假阳性，重新进入项目...", "GoogleFX")
         if not _click_latest_flow_project(page):
             try:
-                page.goto("https://labs.google/fx/tools/flow", timeout=60000)
+                page.goto("https://labs.google/fx/tools/flow", timeout=60000, wait_until="domcontentloaded")
                 random_sleep(2, 4)
             except Exception as e:
                 log(f"  ⚠️ 导航到 Flow 首页失败: {type(e).__name__}", "GoogleFX")
@@ -2736,22 +2809,10 @@ def _safe_page_url(page):
         return "<不可读>"
 
 
-def _raise_if_config_invalid(status_text, checks, context_label, page=None):
-    failed = [k for k, v in checks.items() if not v]
-    if failed:
-        # 配置项没选对基本都是面板 DOM 变了。留一份现场，否则只能靠 status_text
-        # 这一行文字猜面板长什么样。
-        if page is not None:
-            try:
-                from ..utils.forensics import capture
-                capture(page, "config_invalid",
-                        f"{context_label}配置未通过: {', '.join(failed)}",
-                        extra={"status_text": str(status_text or "")[:500], "checks": checks})
-            except Exception:
-                pass
-        raise RuntimeError(
-            f"{context_label}配置未选对，停止生成。当前状态: {status_text or '<空>'}；未通过项: {', '.join(failed)}"
-        )
+# 2026-08-01 清理：这里原有 _raise_if_config_invalid()，全 repo 零调用者。名字看着像
+# "配置校验的统一出口"，实际早被 _verify_and_fix_fx_config() 末尾那段 unconfirmed 判定
+# 取代了（那里才是真正会 raise 的地方）。它顺带带走了一处 forensics.capture("config_invalid")
+# ——那个 capture 标签因此从来没产生过现场文件，别再去 Errors 目录里找它。
 
 def _verify_and_fix_fx_config(page, model, ratio, want_video, context_label, mode_label="", duration=None, video_submode=None):
     """统一的配置校验→面板修复确认流程 (三个生成函数共用)。
@@ -3244,17 +3305,29 @@ def _wait_for_flow_reference_ready(page, timeout_seconds=30, settle_range=None):
         time.sleep(1)
     return False, ""
 
-def _get_prompt_reference_uuids(page, limit=4):
-    """读取提示词输入区中已挂入的参考图顺序，按视觉顺序返回 UUID 列表。
+def read_prompt_reference_state(page, limit=4):
+    """读取提示词输入区里参考图的视觉顺序，并说明这次读数**可不可信**。
+
+    返回 {"uuids": [...], "scope": "bar"|"document"|"", "ok": bool}。
+    ``ok=False`` 只表示"没读到"，不表示"没有参考图"——两者必须分开，见下。
 
     提示词很长时输入条会向上扩展，参考图的 ``rect.top`` 可能落到视口底部
     420px 之外。旧实现把这种正常布局误判成「参考图已脱落」，视频链随后放弃
     提交；下一槽位开始时又会清理输入条，于是用户看到的就是「提示词被清空但
     没有提交」。这里和清理逻辑一样，按 Slate 编辑器 + ``arrow_forward`` 的
     DOM 结构锁定输入条，不再用窗口坐标猜测。
+
+    2026-08-02：结构定位本身也会落空——写完两千字提示词后 Flow 会把编辑器再包一层
+    滚动容器，``arrow_forward`` 于是被顶出 8 层祖先之外；页面上残留另一个更靠前的
+    Slate 编辑器时，走的更是从头就错的那条链。旧实现此时 ``return []``，把「我没找到
+    输入条」说成了「输入条里一张参考图都没有」，调用方（尤其是提交前的锚点复核）
+    只能当成首尾帧掉了，于是整场 24 个片段全部拒绝提交、反复重试反复失败。
+    ``_PROMPT_BAR_JS`` 早就是 ``scope = bar || document`` 的写法，这里对齐它：
+    定位不到输入条就退回全文档扫 chip 签名（``button[data-card-open]`` 里的缩略图，
+    画布卡片不带这个属性），并把 scope 如实报给调用方。
     """
     try:
-        rows = page.evaluate("""() => {
+        state = page.evaluate("""() => {
             const uuidRegex = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
             const editor = document.querySelector("[data-slate-editor='true']");
             let bar = null;
@@ -3267,11 +3340,14 @@ def _get_prompt_reference_uuids(page, limit=4):
                     candidate = candidate.parentElement;
                 }
             }
-            if (!bar) return [];
+            // 定位不到输入条时退回全文档，但只认 chip 签名：画布卡片不是
+            // button[data-card-open]，不会混进来冒充参考图。
+            const scope = bar || document;
+            const selector = bar
+                ? "button[data-card-open] img, [data-slate-editor='true'] img"
+                : "button[data-card-open] img";
 
-            const imgs = Array.from(bar.querySelectorAll(
-                "button[data-card-open] img, [data-slate-editor='true'] img"
-            ));
+            const imgs = Array.from(scope.querySelectorAll(selector));
             const seen = new Set();
             const rows = [];
             for (const img of imgs) {
@@ -3290,12 +3366,27 @@ def _get_prompt_reference_uuids(page, limit=4):
                 if (a.top !== b.top) return a.top - b.top;
                 return a.left - b.left;
             });
-            return rows.map((row) => row.uuid);
+            return {uuids: rows.map((row) => row.uuid), scope: bar ? 'bar' : 'document'};
         }""")
     except Exception as e:
         log(f"⚠️ 读取 Prompt 参考图顺序失败: {type(e).__name__}", "GoogleFX")
-        return []
-    return rows[:max(limit, 1)]
+        return {"uuids": [], "scope": "", "ok": False}
+    state = state or {}
+    uuids = list(state.get("uuids") or [])
+    return {
+        "uuids": uuids[:max(limit, 1)],
+        "scope": state.get("scope") or "",
+        "ok": bool(state.get("scope")),
+    }
+
+
+def _get_prompt_reference_uuids(page, limit=4):
+    """提示词输入区里参考图的视觉顺序（UUID 列表）。
+
+    读数是否可信要用 read_prompt_reference_state()：本函数把「读不到」压成了空列表，
+    只适合那些「拿到几张算几张」的调用点。凡是要据此判定失败的地方都不能用它。
+    """
+    return read_prompt_reference_state(page, limit=limit)["uuids"]
 
 def click_fx_send_button(page, input_el=None):
     """点击发送按钮 (新版 UI: arrow icon / aria-label / Create / Enter)
@@ -3564,7 +3655,8 @@ def _connect_over_cdp_with_retry(playwright_ctx, ws_url, max_attempts=10, delay_
                 time.sleep(delay_secs)
     raise last_err
 
-def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None):
+def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None,
+                     allow_account_switch=True):
     """连接 Adspower 浏览器并导航到 Google FX 页面。返回 (browser, page)。
 
     增强:
@@ -3624,6 +3716,20 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None):
     page = find_or_create_page(
         context, "labs.google", cancel_check=cancel_check,
         context_label="Google FX 页面初始化")
+
+    # 快速探活：find_or_create_page 在 Frame detached 后尽力恢复了页面，
+    # 但恢复后的 page 仍可能不可用（比如 CDP 连接已断、浏览器已被关闭）。
+    # 此处做一次 2s 探活，不可用时立即新建页面并导航，避免后续操作静默挂死。
+    if not _page_is_alive(page):
+        log("⚠️ find_or_create_page 返回的页面不可用，新建页面并导航", "GoogleFX")
+        try:
+            page = context.new_page()
+            page.goto("https://labs.google/fx/tools/flow", timeout=60000, wait_until="domcontentloaded")
+            random_sleep(1, 2)
+        except Exception as new_page_err:
+            log(f"⚠️ 新建页面也失败: {type(new_page_err).__name__}: {new_page_err}", "GoogleFX")
+            raise
+
     page.bring_to_front()
     if "labs.google" not in page.url:
         # 2026-07-19 复盘：这里曾经是唯一一处不带 try/except 的 Flow 导航——
@@ -3634,7 +3740,7 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None):
         # run() 的通用 except，被记成"批量生成过程发生致命错误"直接放弃
         # ——整个 chunk（最多 5 段视频）连一次重试机会都没有就全部判失败。
         try:
-            page.goto("https://labs.google/fx/tools/flow", timeout=60000)
+            page.goto("https://labs.google/fx/tools/flow", timeout=60000, wait_until="domcontentloaded")
             random_sleep(1, 2)
         except Exception as nav_err:
             log(f"⚠️ 导航到 Flow 首页超时/失败: {type(nav_err).__name__}: {nav_err}，继续尝试后续步骤...", "GoogleFX")
@@ -3657,6 +3763,11 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None):
                     f"Google FX 页面初始化需要人工处理，等待超时: {e}"
                 )
         elif "security_check" in err_msg or "unusual" in err_msg or "captcha" in err_msg:
+            if not allow_account_switch:
+                raise RuntimeError(
+                    "PINNED_CANVAS_ACCOUNT_UNAVAILABLE: 原画布所属账号触发安全验证，"
+                    "为避免迭代落入其他账号的新画布，已停止自动换号"
+                ) from e
             log("⚠️ 检测到 Google 安全拦截，尝试换号后重试...", "GoogleFX")
             # 关闭当前浏览器
             try:
@@ -3677,7 +3788,7 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None):
                 context_label="Google FX 换号后浏览器启动")
             page.bring_to_front()
             try:
-                page.goto("https://labs.google/fx/tools/flow", timeout=60000)
+                page.goto("https://labs.google/fx/tools/flow", timeout=60000, wait_until="domcontentloaded")
                 random_sleep(2, 4)
             except Exception as nav_err:
                 log(f"⚠️ 换 IP 后导航到 Flow 首页超时/失败: {type(nav_err).__name__}: {nav_err}，继续尝试后续步骤...", "GoogleFX")
@@ -3731,7 +3842,7 @@ def _prepare_fx_canvas(page, has_refs):
             try:
                 if not _click_new_project_button(page):
                     log("⚠️ 未能通过标准按钮新建项目，尝试直接导航到 Flow URL 刷新并新建项目", "GoogleFX")
-                    page.goto("https://labs.google/fx/tools/flow", timeout=60000)
+                    page.goto("https://labs.google/fx/tools/flow", timeout=60000, wait_until="domcontentloaded")
                     random_sleep(2, 4)
                     project_clicked_retry = page.evaluate("""() => {
                         const links = Array.from(document.querySelectorAll('a'));
@@ -3761,7 +3872,10 @@ def _prepare_fx_canvas(page, has_refs):
             log("✅ 画布图片卡片已加载", "GoogleFX")
         except Exception:
             log("⚠️ 等待画布图片卡片超时，可能画布为空，将继续后续流程", "GoogleFX")
-    _wait_for_fx_toolbar(page, timeout=MAX_WAIT_SECONDS)
+    # 现读而不是用 import 时冻结的 MAX_WAIT_SECONDS：控制台改「单张/单条最长等待」
+    # 后本轮就该跟着变（理由见 config.get_runtime_max_wait_seconds 的 docstring）。
+    # 这是 config 里点名"一律走 get_runtime_*"之后唯一漏掉的等待点。
+    _wait_for_fx_toolbar(page, timeout=get_runtime_max_wait_seconds())
 
 def _count_error_cards(page):
     """用 JS 数唯一 Failed 卡片 DOM 元素，避免多选择器重复计数。
@@ -3878,9 +3992,10 @@ def read_prompt_bar_state(page):
     return st or {"chips": 0, "has_clear": False, "editor_empty": True, "bar": False}
 
 
-def _count_prompt_reference_chips(page):
-    """输入区当前还挂着几个参考图 chip。"""
-    return int(read_prompt_bar_state(page).get("chips") or 0)
+# 2026-08-01 清理：这里原有 _count_prompt_reference_chips()，一行包装
+# read_prompt_bar_state(page)["chips"]，全 repo 零调用者——所有调用点都是直接读
+# read_prompt_bar_state() 的返回（那样一次调用能同时拿到 chips / editor_empty / has_clear，
+# 走包装反而要多打一次 DOM）。
 
 
 def _dump_prompt_bar_for_diagnosis(page, why):
@@ -4167,9 +4282,18 @@ _RISK_CONTROL_ERROR_TOKENS = (
 _AUTOMATION_ERROR_TOKENS = (
     "未找到底部配置按钮", "无法找到输入框", "配置未选对", "配置未完成",
     "等待底部工具栏超时", "浏览器/标签页已关闭", "manual_required", "需要人工处理",
+    "flow_canvas_unavailable", "usable flow canvas", "flow workspace",
     "任务已取消", "超出时间预算", "request budget exceeded",
     "no prompts provided", "timeout", "not found", "locator",
     "attributeerror", "typeerror", "keyerror", "importerror", "modulenotfounderror",
+)
+
+_ACCOUNT_LOGIN_ERROR_TOKENS = (
+    "manual_required:login_required",
+    "google 登录页面",
+    "google login page",
+    "sign in to google",
+    "account_login_required",
 )
 
 
@@ -4178,6 +4302,11 @@ def _classify_failure_for_switch(reason):
     text = (str(reason) or "").lower()
     if not text.strip():
         return False, "无错误信息"
+    # 登录页是账号自身状态，不是选择器/脚本故障。必须先于通用
+    # manual_required 自动化词判断，否则会在同一失效账号上反复重试。
+    for token in _ACCOUNT_LOGIN_ERROR_TOKENS:
+        if token in text:
+            return True, f"账号登录失效（命中 '{token}'）"
     # 自动化类先判：'timeout'/'not found' 这类词在两边都可能出现，
     # 但"UI 元素超时/找不到"远比风控类超时常见，误判成换号的代价更大。
     for token in _AUTOMATION_ERROR_TOKENS:

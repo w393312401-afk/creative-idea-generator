@@ -45,7 +45,7 @@ from frame_generator import (
     _run_async_image_generation,
     _run_async_image_edit
 )
-from fx_control import FX_CONTROL, FxQueueCancelled, FxQueueTimeout
+from fx_control import FX_CONTROL, FxQueueCancelled, FxQueueTimeout, holds_fx_slot
 from fx_console import FX_CONFIG_SPEC, FxConfigStore, apply_direct_env
 
 # Per-IP sliding-window rate-limit state used by rate_ok() (managed mode only)
@@ -793,6 +793,7 @@ def _google_fx_status_snapshot():
             'image_model': cfg.get('googleFxImageModel') or 'Nano Banana 2',
             'video_model': cfg.get('videoModel') or 'Veo 3.1 - Lite [Lower Priority]',
             'video_duration': cfg.get('videoDuration') or '',
+            'video_ref_mode': cfg.get('videoRefMode') or 'VIDEO_FRAMES',
             'account_switch_requests': _account_switch_interval(cfg),
             # 锁定默认环境时轮转环只剩一个号，节拍值形同虚设——如实标出来，
             # 别让状态条把一个死设置显示成正在生效
@@ -1091,17 +1092,21 @@ def fix_frame_issue_worker(task_id, config, title, prompt_block, sequence, manua
         set_project_key_context(None)
 
 
-def sequence_review_worker(task_id, config, title, prompt_block):
+def sequence_review_worker(task_id, config, title, prompt_block, full=False):
     """人工在帧网格点击「运行一致性审查」后台工作线程：2026-07-24 起该审查不再随
     帧序列渲染自动触发，改成用户确认整套序列已渲染完成后手动点按钮才跑
     （pipeline_orchestrator.run_sequence_consistency_review）。与
     generate_frames_worker/fix_frame_issue_worker 共用同一个项目级互斥
     （claim_frame_run）——都会整体改写同一份 manifest.json，不能并发跑。只标记
-    quality_gate，不改 prompt_block、不生成图片，故不需要 FX 串行锁。"""
+    quality_gate，不改 prompt_block、不生成图片，故不需要 FX 串行锁。
+
+    full=True＝前端点的是「全量重审」：不复用任何既有结论。默认走增量，只重审
+    结论已失效的那几拍。"""
     t = get_or_create_task(task_id)
     set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
     set_log_context(task_id)
-    log('INFO', 'FRAMES', "开始整套序列一致性审查", title=title)
+    log('INFO', 'FRAMES', "开始整套序列一致性审查（全量重审）" if full else "开始整套序列一致性审查",
+        title=title)
     try:
         from prompt_pipeline import start_accounting, stop_and_get_accounting
         start_accounting()
@@ -1120,7 +1125,8 @@ def sequence_review_worker(task_id, config, title, prompt_block):
         set_cancel_check_sink(lambda: t["cancel_event"].is_set())
         try:
             from pipeline_orchestrator import run_sequence_consistency_review
-            reviewed_prompt_block = run_sequence_consistency_review(config, title, prompt_block, on_progress=progress_cb)
+            reviewed_prompt_block = run_sequence_consistency_review(
+                config, title, prompt_block, on_progress=progress_cb, full=full)
         finally:
             set_upstream_event_sink(None)
             set_cancel_check_sink(None)
@@ -1292,9 +1298,17 @@ def _fx_browser_slot(task_id, kind, cancel_event=None, priority=0, cancel_check=
     from integrations.google_fx.utils.logger import set_task_label, reset_task_label
     log_token = set_task_label(task_id)
     try:
+        # FX_CONTROL.slot 对同一执行上下文是可重入的；底层 threading.Lock 不是。
+        # 视频/图片任务在持锁期间调用 pick_account()，会嵌套做 stale 积分探测。
+        # 旧代码虽然让控制面直接放行，却又在这里二次 acquire 同一把锁，最终把
+        # 自锁超时误报成“浏览器被其它 FX 任务占用、排队 100s”。外层已经持有
+        # admission 槽位和兜底锁时，嵌套调用只需复用它们。
+        already_inside = holds_fx_slot()
         with FX_CONTROL.slot(task_id, kind, cancel_check=cancel_check,
                              priority=priority, account_pin=account_pin):
-            with _fx_guard_lock(f'{kind}:{task_id}', cancel_check=cancel_check):
+            guard = (contextlib.nullcontext() if already_inside else
+                     _fx_guard_lock(f'{kind}:{task_id}', cancel_check=cancel_check))
+            with guard:
                 yield
     finally:
         reset_task_label(log_token)
@@ -1351,6 +1365,7 @@ def _fx_queue_account_pin():
 
 
 _FX_WATCHDOG_STARTED = threading.Event()
+_FX_HARD_STUCK_REPORTED = set()
 
 
 def _cancel_fx_task(task_id, reason, actor='local'):
@@ -1384,7 +1399,14 @@ def _cancel_fx_task(task_id, reason, actor='local'):
 
 
 def _fx_timeout_watchdog():
-    """执行超时踢出：发取消信号；若超限过久线程硬卡死，强行释班 Slot 保障号池可用。"""
+    """执行超时看门狗：发取消信号，但不伪造槽位已经释放。
+
+    Python 无法安全杀掉持有 Playwright/CDP 与全局浏览器锁的线程。旧逻辑在超时
+    10 秒后只从 FX_CONTROL.active 删除记录；底层线程和 _FX_SERIAL_LOCK 仍活着，
+    下一任务会被控制面放行后堵在第二层锁上，控制台却错误显示旧任务已经结束。
+    现在槽位由真实 worker 的 context-manager finally 释放；持续硬卡死如实告警，
+    由关闭对应 AdsPower profile/重启服务处理，不允许两个任务同时碰同一画布。
+    """
     while True:
         time.sleep(5)
         try:
@@ -1399,10 +1421,20 @@ def _fx_timeout_watchdog():
                                  {'elapsed_seconds': elapsed,
                                   'kind': row.get('kind')}, actor='watchdog')
                 _cancel_fx_task(task_id, reason, actor='watchdog')
-                # 超过限额 10 秒后底层仍未能放行槽位，判定为底线硬卡死，强制剔除以防全号池自锁
+                # 超过限额 10 秒仍未退出：保留 active 租约并告警。不能仅删除控制面
+                # 记录，因为那不会终止底层线程，也不会释放全局浏览器锁。
                 if limit > 0 and elapsed > limit + 10:
-                    log('WARN', 'FX_WATCHDOG', f"任务 {task_id} 超时后 10s 内未自行退出临界区，看门狗执行强行槽位释放")
-                    FX_CONTROL.force_release_active(task_id=task_id, actor='watchdog')
+                    if task_id in _FX_HARD_STUCK_REPORTED:
+                        continue
+                    _FX_HARD_STUCK_REPORTED.add(task_id)
+                    log('ERROR', 'FX_WATCHDOG',
+                        f"任务 {task_id} 超时后 10s 内未退出；槽位仍保持占用以防并发污染。"
+                        "请关闭对应 AdsPower 环境或重启服务，勿强行放行下一任务")
+                    FX_CONTROL.audit('queue.hard_stuck', task_id, {
+                        'elapsed_seconds': elapsed,
+                        'kind': row.get('kind'),
+                        'lease_retained': True,
+                    }, actor='watchdog')
         except Exception:
             continue
 
@@ -1480,6 +1512,14 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
                     has_failures = True
                     break
 
+            has_quality_warnings = any(
+                bool(v.get('process_warned') or v.get('anchor_mismatch_overridden'))
+                for v in manifest_videos if isinstance(v, dict)
+            )
+            completion_state = 'partial_failed' if has_failures else (
+                'completed_with_warnings' if has_quality_warnings else 'completed'
+            )
+
             if has_failures:
                 progress_cb('merge_skip', {'message': '检测到存在生成失败或缺失的视频片段，已跳过自动合并视频。'})
             else:
@@ -1504,9 +1544,16 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
                 except Exception as merge_err:
                     log('ERROR', 'VIDEOS', f"自动合并视频失败: {merge_err}", title=title)
                     progress_cb('merge_error', {'message': f'自动合并视频失败: {str(merge_err)}'})
+                    completion_state = 'partial_failed'
+
+            result['completion_state'] = completion_state
+            result['has_failures'] = has_failures
+            result['has_quality_warnings'] = has_quality_warnings
 
         with ACTIVE_TASKS_LOCK:
             t["status"] = "completed"
+            # status 保持兼容现有轮询协议；outcome 提供准确的业务终态。
+            t["outcome"] = result.get('completion_state', 'completed')
             t["result"] = result
             t["events"].append(('result', result))
         notify_listeners(task_id, 'result', result)
@@ -2388,10 +2435,22 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             # Public: tells the frontend whether to hide the API settings and prompt for an access code.
             # 技能契约缺失也在这里上报：它只影响生成质量、不影响接口可用性，因此过去
             # 只写进启动日志——而日常从浏览器用的人根本不看那个终端，等于没有告知。
+            # skill_contract 保持"当前激活的那个 profile"的形状（前端横幅按它渲染）；
+            # skill_contracts 是全部 profile 的清单——只报激活的那个，等于把"另一个
+            # 包没装好"留到用户切模型的那一刻才炸。
+            # skill_profile_rules：「视频模型名含哪个子串 → 走哪个 profile」的规则表
+            # 原样下发。激发页脚的链路选择器停在 auto 时要显示"现在实际会走哪条"，
+            # 前端照这张表匹配即可——在前端硬编码一份 'omni' 判断，就是给同一件事
+            # 留了第二个会漂移的真相源（服务端那份见 SKILL_PROFILE_VIDEO_MODEL_RULES）。
+            _active = active_skill_profile()
             self._send_json({
                 'server_managed': SERVER_MANAGED,
                 'needs_access_code': bool(ACCESS_CODE),
-                'skill_contract': skill_contract_report(),
+                'skill_profile': _active,
+                'skill_profile_default': DEFAULT_SKILL_PROFILE,
+                'skill_profile_rules': [list(r) for r in SKILL_PROFILE_VIDEO_MODEL_RULES],
+                'skill_contract': skill_contract_report(_active),
+                'skill_contracts': skill_contract_reports(),
             })
         elif path == '/api/image/task/status':
             if not self._gate():
@@ -2539,6 +2598,17 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             try:
                 pool = _get_account_pool()
                 self._send_json({'status': 'ok', 'profiles': pool.list_adspower_profiles()})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+        elif path == '/api/account-pool/export':
+            # 导出号池配置（可选是否包含明文凭据 include_credentials=1）
+            if not self._gate():
+                return
+            try:
+                inc = query.get('include_credentials', ['0'])[0] in ('1', 'true', 'True')
+                pool = _get_account_pool()
+                export_data = pool.export_config(include_credentials=inc)
+                self._send_json(export_data)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
         elif path == '/api/google-fx/status':
@@ -3071,6 +3141,26 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     'skipped': len(result.get('skipped') or []),
                     'total': result.get('total', 0),
                     'accounts': pool.list_accounts(),
+                })
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/account-pool/import':
+            # 导入号池配置 JSON 报文（含环境、状态及凭据）
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                overwrite = bool(body.get('overwrite', False))
+                pool = _get_account_pool()
+                result = pool.import_config(body, overwrite=overwrite)
+                self._send_json({
+                    'status': 'ok',
+                    'added': result['added'],
+                    'updated': result['updated'],
+                    'credentials_saved': result['credentials_saved'],
+                    'errors': result['errors'],
+                    'accounts': result['accounts'],
                 })
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
@@ -4120,6 +4210,45 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/undo_frame_fix':
+            # 撤销这一帧最近一次定向修复：把修复前存下的帧图、manifest 条目与两段
+            # 提示词正文原样放回（pipeline_orchestrator.undo_frame_fix）。纯文件+manifest
+            # 操作、不跑模型也不渲图，因此同步返回、不建后台任务（同 flag_frame_issue）。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                title = body.get('title', '')
+                sequence = body.get('sequence')
+                if not isinstance(sequence, int):
+                    self._send_json({'status': 'error', 'message': 'sequence 必须是整数'}, status=400)
+                    return
+                prompt_block = body.get('prompt_block', '')
+
+                # 与渲染/修复/审查 worker 同款项目级互斥：它们会拿着自己的 manifest
+                # 快照整体回写，此刻插进去的回滚会被覆盖掉。
+                import uuid
+                project_dir = _get_project_dir(title)
+                claim_id = f"undofix_{uuid.uuid4().hex}"
+                holder = claim_frame_run(project_dir, claim_id)
+                if holder:
+                    self._send_json({'status': 'error',
+                                     'message': '该创意的帧序列正在生成/修复中，请等它结束后再撤销'},
+                                    status=409)
+                    return
+                try:
+                    from pipeline_orchestrator import undo_frame_fix
+                    result = undo_frame_fix(title, sequence, prompt_block)
+                finally:
+                    release_frame_run(project_dir, claim_id)
+
+                log('INFO', 'FRAMES', f"撤销第 {sequence} 帧的定向修复（回到 {result.get('at')} 的版本）",
+                    title=title)
+                self._send_json({'status': 'ok', **result})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/flag_frame_issue':
             # 人工主动描述某一帧的问题：把描述记进 manifest（quality_gate 标成
             # manual_flagged），供随后的「修复此帧问题」当作待修问题使用。纯 manifest
@@ -4178,6 +4307,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 title = body.get('display_title') or project_key
                 config['_project_key'] = project_key
                 prompt_block = body.get('prompt_block', '')
+                # scope='full'＝前端的「全量重审」：不复用任何既有结论。默认增量，
+                # 只重审帧图变过、结论已失效的那几拍（见 _sequence_consistency_review）。
+                full = str(body.get('scope') or '').strip().lower() == 'full'
 
                 import uuid
                 task_id = f"seqreview_{uuid.uuid4().hex}"
@@ -4195,7 +4327,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
                 threading.Thread(
                     target=sequence_review_worker,
-                    args=(task_id, config, title, prompt_block),
+                    args=(task_id, config, title, prompt_block, full),
                     daemon=True
                 ).start()
 
@@ -4790,6 +4922,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
                         # 图变了，按内容哈希记账的一致性审查结论自动作废
                         dropped = drop_stale_review_verdicts(mdata, project_dir)
+                        # 换位/搬运的两格：图整个换了人家，按帧号存的修复快照对不上了
+                        from pipeline_orchestrator import drop_fix_snapshots
+                        drop_fix_snapshots(project_dir, mdata, sorted(touched))
                         if 'merged_video' in mdata:
                             del mdata['merged_video']
                         write_manifest(project_dir, mdata)
@@ -4944,6 +5079,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         for key in ('manual_issue', 'manual_flag_prev_gate', 'review_issues',
                                     'review_frames_sha256', 'stale_lineage'):
                             target.pop(key, None)
+                        # 这一格的画面已经被人工上传的图整个换掉：上一次修复前的那版
+                        # 快照不再是"这张图的上一版"，退回去等于把用户刚传的图静默抹掉
+                        from pipeline_orchestrator import drop_fix_snapshots
+                        drop_fix_snapshots(project_dir, None, [sequence])
+                        target.pop('fix_backup', None)
                         # i2i 血统在这一帧断开：它不派生自任何上一帧
                         target['parent_hash'] = ''
                         target['reference'] = None
@@ -5242,6 +5382,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         # 帧图整体换过位置：按帧号记账的审查结论与链回望结果全部失效
                         dropped = drop_stale_review_verdicts(mdata, project_dir)
                         mdata.pop('chain_drift', None)
+                        # 修复快照同样按帧号记账（.frame_fixes/005/）：编号整体前移之后，
+                        # fix_backup 记号跟着条目挪到 004，而 .frame_fixes/004 里躺的是
+                        # 另一帧的旧图——点「撤销修复」就会退回一张张冠李戴的画面。
+                        from pipeline_orchestrator import drop_fix_snapshots
+                        drop_fix_snapshots(project_dir, mdata)
                         if 'merged_video' in mdata:
                             del mdata['merged_video']
                         write_manifest(project_dir, mdata)
@@ -5501,6 +5646,10 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                 mdata = json.load(f)
                         else:
                             mdata = current_manifest
+                        # 槽位号又换了一轮（这次是反过来后移）：修复快照按帧号存，
+                        # 留着就会把别的帧的旧图退回到这一格（同 /api/delete_slot）
+                        from pipeline_orchestrator import drop_fix_snapshots
+                        drop_fix_snapshots(project_dir, mdata)
                         write_manifest(project_dir, mdata)
 
                     # 标记这份快照已消费，避免同一份被恢复两次（第二次的换号前提
@@ -6162,16 +6311,26 @@ def run():
         # 启动时显式列出缺失文件，便于第一时间发现。清单是 server_common 里
         # SKILL_CONTRACT_FILES（合成真正会读的全部 8 个文件），此前这里只查了
         # 其中 2 个，另外 6 个缺失时全程无声。
-        _skill = skill_contract_report()
-        print(f"Skill contract source: {_skill['dir']} (来源: {_skill['source']})")
-        if _skill['missing']:
-            print(f"[WARN] 技能契约文件缺失 {len(_skill['missing'])}/{_skill['total']} 个，"
-                  f"提示词合成将降级运行（形态矩阵/提示词模板/一致性协议按空契约处理）：")
-            for rel in _skill['missing']:
-                print(f"[WARN]   缺失: {os.path.join(_skill['dir'], rel)}")
-            print('[WARN] 修复：在 server_config.json 里加一行 "skillDir": "技能包目录的本地路径"'
-                  "（支持 ~ 与相对路径，改完不用重启，下一次激发/合成即生效），"
-                  "或设环境变量 SKILL_DIR（优先级更高），或直接把契约文件补进上面这个目录。")
+        _active_profile = active_skill_profile()
+        for _skill in skill_contract_reports():
+            _mark = '←当前' if _skill['profile'] == _active_profile else '      '
+            print(f"Skill contract [{_skill['profile']}]{_mark} {_skill['label']}: "
+                  f"{_skill['dir']} (来源: {_skill['source']}, "
+                  f"契约 {_skill['total'] - len(_skill['missing'])}/{_skill['total']})")
+            if _skill['missing']:
+                print(f"[WARN] [{_skill['profile']}] 技能契约文件缺失 "
+                      f"{len(_skill['missing'])}/{_skill['total']} 个，该 profile 下的"
+                      f"激发/合成将降级运行（形态矩阵/提示词模板/一致性协议按空契约处理）：")
+                for rel in _skill['missing']:
+                    print(f"[WARN]   缺失: {os.path.join(_skill['dir'], rel)}")
+                print(f'[WARN] 修复：在 server_config.json 里写 "skillProfiles": '
+                      f'{{"{_skill["profile"]}": "技能包目录的本地路径"}}'
+                      "（支持 ~ 与相对路径，改完不用重启，下一次激发/合成即生效），"
+                      f"或设环境变量 {SKILL_PROFILES[_skill['profile']]['env']}（优先级更高），"
+                      "或直接把契约文件补进上面这个目录。")
+        print(f"Skill profile: {_active_profile}"
+              f"（videoModel={SERVER_CONFIG.get('videoModel') or '未设置'}，"
+              f"skillProfile={SERVER_CONFIG.get('skillProfile') or 'auto'}）")
     server_address = ('', PORT)
     try:
         httpd = DualStackHTTPServer(server_address, SparkRequestHandler)

@@ -32,6 +32,9 @@ def skill_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(server_common, 'SKILL_DIR', str(d))
     monkeypatch.setattr(pp, 'SKILL_DIR', str(d))
     monkeypatch.setattr(server, 'SKILL_DIR', str(d), raising=False)
+    monkeypatch.setattr(server_common, 'active_skill_profile', lambda *a, **kw: server_common.DEFAULT_SKILL_PROFILE)
+    monkeypatch.setattr(server, 'active_skill_profile', lambda *a, **kw: server_common.DEFAULT_SKILL_PROFILE, raising=False)
+    monkeypatch.setitem(server_common._SKILL_DIRS, 'base', (str(d), 'test'))
     return d
 
 

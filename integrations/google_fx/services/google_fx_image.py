@@ -15,14 +15,13 @@ import requests
 from playwright.sync_api import sync_playwright
 
 from ..config import (
-    MAX_WAIT_SECONDS,
     OUTPUT_DIR,
     get_runtime_default_user_id,
     get_runtime_max_wait_seconds,
 )
 from ..models import ImageBatchRequest
 from ..utils.logger import log
-from ..utils.browser import random_sleep, clean_path
+from ..utils.browser import random_sleep, clean_path, ensure_flow_workspace
 from ..utils.ui_helpers import inject_batch_image_observer
 from ..utils import account_binding, cancel_flag
 
@@ -66,6 +65,77 @@ _MEDIA_UUID_RE = re.compile(
     re.I,
 )
 _MIN_GENERATED_RESULT_AGE_SECONDS = 8.0
+# How long a network candidate may stay un-corroborated before it is accepted on
+# its own evidence.  Flow's canvas is virtualized: a result tile that lands
+# outside the current viewport is never mounted, so waiting for DOM confirmation
+# forever means waiting until the timeout.
+_UNCONFIRMED_CANDIDATE_GRACE_SECONDS = 30.0
+
+
+class ReferenceMountError(RuntimeError):
+    """A requested i2i reference could not be proven mounted in Flow.
+
+    Frame-sequence callers must never silently fall back to text-to-image: one
+    unreferenced submission breaks the lineage for every later frame in the
+    chunk.  Keep a stable machine-readable prefix so the orchestration layer
+    can choose a page-reset retry without mistaking this for account quota or
+    risk control.
+    """
+
+
+def _reference_mount_error(message):
+    return ReferenceMountError(f"REFERENCE_MOUNT_FAILED: {message}")
+
+
+def _is_login_required_failure(reason):
+    text = str(reason or "").lower()
+    return any(token in text for token in (
+        "manual_required:login_required",
+        "google 登录页面",
+        "google login page",
+        "sign in to google",
+        "account_login_required",
+    ))
+
+
+def _cooldown_current_login_account(reason):
+    """Persist account-specific login failure before switching away from it."""
+    user_id = account_binding.resolve_account(fallback=get_runtime_default_user_id())
+    if not user_id:
+        return None
+    try:
+        from ..utils.account_pool import AccountPool
+        AccountPool().mark_login_required(user_id)
+        log(f"🔒 账号 {user_id} 登录失效，已进入冷却并准备换号: {reason}", "GoogleFX")
+        return user_id
+    except Exception as exc:
+        log(f"⚠️ 账号 {user_id} 登录冷却写入失败: {exc}", "GoogleFX")
+        return None
+
+
+def _is_quota_failure(reason):
+    text = str(reason or "").lower()
+    return any(token in text for token in (
+        "quota", "配额", "额度耗尽", "credits exhausted",
+        "insufficient credits", "not enough credits", "resource_exhausted",
+    ))
+
+
+def _record_current_generation_failure(reason):
+    user_id = account_binding.resolve_account(fallback=get_runtime_default_user_id())
+    if not user_id:
+        return None
+    try:
+        from ..utils.account_pool import AccountPool
+        pool = AccountPool()
+        if _is_quota_failure(reason):
+            pool.mark_exhausted(user_id)
+        else:
+            pool.record_generation_failure(user_id, reason)
+        return user_id
+    except Exception as exc:
+        log(f"⚠️ 账号 {user_id} 生成失败状态写入失败: {exc}", "GoogleFX")
+        return None
 
 
 def _open_image_flow_canvas(page, requested_project_url=None):
@@ -80,16 +150,85 @@ def _open_image_flow_canvas(page, requested_project_url=None):
     """
     requested_project_url = str(requested_project_url or "").strip()
     target_url = requested_project_url or "https://labs.google/fx/tools/flow"
+    current_url = str(getattr(page, "url", "") or "")
+    # AdsPower keeps the browser/page alive between chunks.  Reconnecting CDP
+    # does not require navigating again when the requested workspace is already
+    # open and its prompt editor is usable; avoiding goto preserves canvas state
+    # and removes a repeated page-load timeout from every five-frame chunk.
+    same_project = bool(requested_project_url and current_url == requested_project_url)
+    restored_workspace = bool(
+        not requested_project_url
+        and "/fx/tools/flow" in current_url
+    )
+    if (same_project or restored_workspace) and _find_fx_prompt_input(page, announce=False) is not None:
+        return current_url if "/project/" in current_url else None
+
+    # _connect_fx_page() has already entered the Flow workspace.  The normal
+    # workspace home has a visible "New project" button but no prompt editor.
+    # Reloading the same /tools/flow URL here used to tear down that ready DOM;
+    # one or two seconds later the button had not hydrated yet, so all three
+    # attempts failed in ~4s with "Cannot create or open a usable Flow canvas".
+    # Reuse the loaded page first and create the canvas from its current state.
+    if restored_workspace:
+        created = _click_new_project_button(page)
+        if created or _find_fx_prompt_input(page, announce=False) is not None:
+            current_url = str(getattr(page, "url", "") or "")
+            return current_url if "/project/" in current_url else None
+
+        # The page may still be a product landing/onboarding screen.  Let the
+        # shared workspace entry routine finish that transition, then retry the
+        # project action once without a destructive reload.
+        if ensure_flow_workspace(page, timeout_seconds=30):
+            if _find_fx_prompt_input(page, announce=False) is not None:
+                current_url = str(getattr(page, "url", "") or "")
+                return current_url if "/project/" in current_url else None
+            created = _click_new_project_button(page)
+            if created or _find_fx_prompt_input(page, announce=False) is not None:
+                current_url = str(getattr(page, "url", "") or "")
+                return current_url if "/project/" in current_url else None
+        raise RuntimeError(
+            "FLOW_CANVAS_UNAVAILABLE: Flow 工作台已打开，但无法进入或新建可用画布"
+        )
     try:
-        page.goto(target_url, timeout=60000)
+        page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
         random_sleep(1, 2)
     except Exception as nav_err:
-        if requested_project_url:
+        if not requested_project_url:
+            raise RuntimeError(f"Cannot open the Flow workspace: {nav_err}") from nav_err
+        # A persisted project can be deleted, expire, or become inaccessible to
+        # the same account.  The local reference files are durable and will be
+        # uploaded into a replacement canvas below, so a dead project URL must
+        # not permanently brick the whole frame sequence.
+        log(
+            f"⚠️ 已绑定 Flow 项目无法打开，准备回到项目列表新建画布: {nav_err}",
+            "GoogleFX",
+        )
+
+    workspace_ready = ensure_flow_workspace(page, timeout_seconds=30)
+    if not workspace_ready and requested_project_url:
+        log(
+            "⚠️ 已绑定 Flow 项目不可用，回到项目列表创建替代画布；"
+            "本地参考图将在新画布重新上传",
+            "GoogleFX",
+        )
+        try:
+            page.goto(
+                "https://labs.google/fx/tools/flow",
+                timeout=60000,
+                wait_until="domcontentloaded",
+            )
+            random_sleep(1, 2)
+            workspace_ready = ensure_flow_workspace(page, timeout_seconds=30)
+        except Exception as recovery_err:
             raise RuntimeError(
-                f"Cannot open the Flow canvas bound to this project: "
-                f"{requested_project_url}: {nav_err}"
-            ) from nav_err
-        raise RuntimeError(f"Cannot open the Flow workspace: {nav_err}") from nav_err
+                "FLOW_CANVAS_UNAVAILABLE: 已绑定项目失效，且无法返回 Flow 项目列表: "
+                f"{recovery_err}"
+            ) from recovery_err
+
+    if not workspace_ready:
+        raise RuntimeError(
+            "FLOW_CANVAS_UNAVAILABLE: 未能从当前页面进入 Google Flow 工作台"
+        )
 
     # A visible prompt editor means Flow has already restored a generation
     # workspace.  This is also how the L1 diagnostics identify the current UI.
@@ -99,7 +238,9 @@ def _open_image_flow_canvas(page, requested_project_url=None):
         # URL.  Re-check the actual UI before treating the URL-only confirmation
         # failure as a real creation failure.
         if not created and _find_fx_prompt_input(page, announce=False) is None:
-            raise RuntimeError("Cannot create or open a usable Flow canvas")
+            raise RuntimeError(
+                "FLOW_CANVAS_UNAVAILABLE: 无法创建或打开可用的 Google Flow 画布"
+            )
 
     current_url = str(getattr(page, "url", "") or "")
     return current_url if "/project/" in current_url else None
@@ -116,6 +257,61 @@ def _is_blocked_media_candidate(url, blocked_uuids):
     media_uuid = _extract_media_uuid(url)
     blocked = {str(value).lower() for value in (blocked_uuids or ()) if value}
     return bool(media_uuid and media_uuid in blocked)
+
+
+def _absolute_media_url(src):
+    """把 tile 扫描拿到的 img src 转成服务端可下载的绝对 URL；取不到就返回 ""。
+
+    只有两种 src 能下载：已经是绝对的 http(s)，以及「/」开头的 labs.google 站内相对
+    路径。`blob:` / `data:image/` 是页面内存对象，_download_image 那边的 requests /
+    browser fetch 都取不到——而 tile 扫描的 looksLikeMedia 现在恰恰会放它们进来。
+    """
+    src = str(src or "").strip()
+    if not src:
+        return ""
+    lowered = src.lower()
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        return src
+    if src.startswith("/"):
+        return f"https://labs.google{src}"
+    return ""
+
+
+def _is_generated_candidate_stable(submit_ts, *, now=None, confirmed_new_tile=False):
+    """Whether a candidate has enough evidence to belong to this submission.
+
+    A media URL inside a tile that did not exist before Send is already tied to
+    the current submission.  Applying the generic hydration grace period to
+    that URL used to permanently blacklist genuinely fast results: the image
+    was visible in Flow, but the worker kept logging ``等待图片 URL`` until its
+    timeout.  The age guard remains useful only for unassociated global/network
+    candidates.
+
+    ⚠️ This is a *deferral* signal, never a rejection: Nano Banana Lite returns
+    in 6–10s, i.e. right across this threshold, so "arrived early" says nothing
+    about whether the media is history.  Only the pre-submit baselines
+    (panel UUIDs / prompt references / caller exclusions) may block a candidate.
+    """
+    if confirmed_new_tile:
+        return True
+    current_time = time.time() if now is None else now
+    return current_time >= submit_ts + _MIN_GENERATED_RESULT_AGE_SECONDS
+
+
+def _unconfirmed_candidate_is_acceptable(first_seen_ts, *, now=None,
+                                         grace=_UNCONFIRMED_CANDIDATE_GRACE_SECONDS):
+    """Whether a never-corroborated network candidate may be accepted anyway.
+
+    Requiring DOM corroboration for every candidate assumes the generated tile
+    always reaches the DOM.  It does not: Flow virtualizes the canvas, so a
+    result dropped outside the viewport stays unmounted and the worker times
+    out on an image that Flow finished minutes ago.  A candidate that survived
+    every pre-submit baseline, first appeared after Send and still stands after
+    this grace period is the best evidence available — and the near-duplicate
+    guard downstream still rejects an accidentally captured reference.
+    """
+    current_time = time.time() if now is None else now
+    return current_time - first_seen_ts >= grace
 
 
 def _images_are_near_duplicates(candidate_path, reference_paths, threshold=3.0):
@@ -162,7 +358,12 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
 
     try:
         with sync_playwright() as p:
-            browser, page = _connect_fx_page(p)
+            browser, page = _connect_fx_page(
+                p,
+                allow_account_switch=bool(
+                    getattr(req, "allow_account_switch", True)
+                ),
+            )
 
             project_url = _open_image_flow_canvas(
                 page, getattr(req, "project_url", None)
@@ -181,45 +382,9 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                 page, model=req.model, ratio=req.ratio,
                 want_video=False, context_label="图片生成",
             )
-            # 🛠️ 2.5 参考图挂载 (图生图: 从文件名提取 UUID → canvas tile → Add to Prompt)
-            # 要求参考图是此 project 内曾生成的图片，UUID 在画布中可见。
-            def _wait_for_new_panel_image(known_uuids, timeout=None):
-                """
-                轮询 add_2 面板，直到出现 known_uuids 中没有的新 UUID，返回该 UUID。
-                ⚡ 快捷退出: 若编辑器内已检测到 cancel chip（挂载成功标志），
-                              立即返回哨兵值 '__chip_mounted__'，避免空等 UUID。
-                timeout=None 时现读运行时配置（控制台可热调等待上限）。
-                """
-                timeout = timeout or get_runtime_max_wait_seconds()
-                _CHIP_SENTINEL = "__chip_mounted__"
-                _chip_sels = [
-                    "div[contenteditable='true'] i.google-symbols:text-is('cancel')",
-                    "div[contenteditable='true'] i:text-is('cancel')",
-                ]
-                deadline = time.time() + timeout
-                while time.time() < deadline:
-                    _check_cancelled()
-                    # ── UUID 检测 ──
-                    cur_uuids = _get_panel_uuids(page)  # 使用模块级函数
-                    new_uuids = cur_uuids - known_uuids
-                    if new_uuids:
-                        new_uuid = next(iter(new_uuids))
-                        log(f"  🎉 面板出现新图 UUID: {new_uuid[:16]}...", "GoogleFX")
-                        return new_uuid
-                    # ── cancel chip 早退：chip 已在编辑器内，无需等 UUID ──
-                    for _cs in _chip_sels:
-                        try:
-                            if page.locator(_cs).first.is_visible(timeout=200):
-                                log("  ⚡ 检测到 cancel chip，跳过 UUID 等待", "GoogleFX")
-                                return _CHIP_SENTINEL
-                        except Exception:
-                            pass
-                    elapsed = int(deadline - time.time())
-                    if elapsed % 10 == 0 and elapsed > 0:
-                        log(f"  ⏳ 等待新图出现... 剩余 {elapsed}s", "GoogleFX")
-                    time.sleep(3)
-                return None
-
+            # 2026-08-01 清理：此处原有一个 36 行的 _wait_for_new_panel_image() 闭包
+            # （轮询 add_2 面板等新 UUID、带 cancel chip 早退哨兵）。它定义了但从未被
+            # 调用过——参考图就绪判定实际走的是 _wait_for_flow_reference_ready()。
 
             # 🛠️ 2.4 准备并彻底清空编辑器，删除所有历史文本与历史参考图
             input_el = _find_fx_prompt_input(page, announce=True)
@@ -288,14 +453,17 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                         log(f"  ❌ 参考图挂载失败，UUID 与上传回退均未成功: "
                             f"{os.path.basename(local_path)}", "GoogleFX")
 
-                if mounted_count == 0:
-                    log("⚠️ 所有参考图均未成功挂载，以无参考模式生成", "GoogleFX")
-                    valid_refs = []
-                else:
-                    log(f"✅ 参考图处理完毕 ({mounted_count}/{len(valid_refs)} 张成功)", "GoogleFX")
+                if mounted_count != len(valid_refs):
+                    raise _reference_mount_error(
+                        f"请求挂载 {len(valid_refs)} 张参考图，实际仅确认 {mounted_count} 张；"
+                        "已禁止降级为无参考生成"
+                    )
+                log(f"✅ 参考图处理完毕 ({mounted_count}/{len(valid_refs)} 张成功)", "GoogleFX")
 
             elif ref_image_refs:
-                log(f"⚠️ 参考图本地文件不存在，跳过挂载: {ref_image_refs}", "GoogleFX")
+                raise _reference_mount_error(
+                    f"参考图本地文件不存在: {ref_image_refs}"
+                )
 
             # 🛠️ 3. 准备 Slate.js 编辑器
             # input_el 是 Locator（惰性解析），上面 2.4 节已经取过一次，中间的清 chip /
@@ -314,7 +482,8 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
             # ━━━ 网络拦截: 监听图片生成相关的网络响应 ━━━
             handle_response = _make_response_handler(captured_data, mode="image")
             page.on("response", handle_response)
-            submit_ts = time.time()
+            # （这里原有一个 submit_ts = time.time()，赋值后从未被读取——每轮真正用的是
+            #   循环里各自的 submit_ts_this。已删。）
 
             # 🛠️ 4+5. 串行提交 + 等待 + 参考图链式挂载
             # 流程: 提交 prompt[0] → 等第0张图出现在 add_2 面板 → 选中它 → 提交 prompt[1] → ...
@@ -496,8 +665,6 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                         return None
 
             def _wait_for_net_url(submit_ts_this, timeout=None, known_tile_ids_before_submit=None,
-                                   _current_prompt_text=None, _current_prompt_idx=None,
-                                   _has_ref_for_this_prompt=False,
                                    known_net_urls_before_submit=None,
                                    known_dom_srcs_before_submit=None,
                                    blocked_media_uuids=None):
@@ -507,6 +674,11 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                   路径B — DOM 扫描页面上新出现的 img[src*='getMediaUrlRedirect'] (主动探测)
                 哪路先出结果就返回，不需要打开面板。
                 timeout=None 时现读运行时配置（控制台可热调等待上限）。
+
+                2026-08-01：删掉了 _current_prompt_text / _current_prompt_idx /
+                _has_ref_for_this_prompt 三个参数。调用方一直认真传值，函数体一次都没读过
+                （归属判定实际靠 known_tile_ids_before_submit 的 tile 基线 +
+                blocked_media_uuids 黑名单）。留着会让人以为本函数会按 prompt 内容做校验。
                 """
                 timeout = timeout or get_runtime_max_wait_seconds()
                 deadline = time.time() + timeout
@@ -517,13 +689,19 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                 if known_net_urls_before_submit is None:
                     known_net = set(url for ts, url in captured_data if ts < submit_ts_this)
 
-                # 记录提交前页面上已有的 getMediaUrlRedirect img srcs（Canvas + 其他区域）
+                # 记录提交前页面上已有的媒体 img srcs（Canvas + 其他区域）
                 known_dom_srcs = set(known_dom_srcs_before_submit or ())
                 if known_dom_srcs_before_submit is None:
                     try:
                         known_dom_srcs = set(page.evaluate("""() => {
-                            return Array.from(document.querySelectorAll('img[src*="getMediaUrlRedirect"]'))
-                                .map(img => img.getAttribute('src') || '');
+                            const isMediaSrc = (lower) => lower.includes('getmediaurlredirect')
+                                || lower.includes('flow-content.google')
+                                || lower.includes('storage.googleapis.com')
+                                || lower.includes('googleusercontent.com')
+                                || lower.includes('ggpht.com');
+                            return Array.from(document.querySelectorAll('img'))
+                                .map(img => img.currentSrc || img.getAttribute('src') || '')
+                                .filter(src => src && isMediaSrc(src.toLowerCase()));
                         }"""))
                     except Exception as e:
                         log(f"  ⚠️ 初始化 known_dom_srcs 失败: {type(e).__name__}", "GoogleFX")
@@ -537,27 +715,12 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                 pending_unconfirmed_candidates = set()
                 early_candidate_logs = set()
 
-                def _acceptable_candidate(url, source):
+                def _acceptable_candidate(url, source, *, confirmed_new_tile=False):
                     if not url or url in ignored_candidates:
                         return False
-                    if time.time() < submit_ts_this + _MIN_GENERATED_RESULT_AGE_SECONDS:
-                        if url not in early_candidate_logs:
-                            early_candidate_logs.add(url)
-                            media_uuid = _extract_media_uuid(url)
-                            # Anything already surfacing during the stabilization window is
-                            # canvas hydration/history, not the just-submitted generation.
-                            # Block the UUID permanently so an alternate redirect form cannot
-                            # become eligible after the clock passes the minimum age.
-                            if media_uuid:
-                                blocked_media_uuids.add(media_uuid)
-                            else:
-                                ignored_candidates.add(url)
-                            log(
-                                f"  🚫 {source}候选出现过早，已列入历史媒体黑名单: "
-                                f"{media_uuid[:16] if media_uuid else 'no-uuid'}...",
-                                "GoogleFX",
-                            )
-                        return False
+                    # Hard evidence first.  Only media that already existed before Send
+                    # (canvas history, mounted prompt references, caller exclusions) is
+                    # provably not this result; that check owns every permanent rejection.
                     if _is_blocked_media_candidate(url, blocked_media_uuids):
                         ignored_candidates.add(url)
                         media_uuid = _extract_media_uuid(url)
@@ -566,37 +729,138 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                             "GoogleFX",
                         )
                         return False
+                    if not _is_generated_candidate_stable(
+                        submit_ts_this,
+                        confirmed_new_tile=confirmed_new_tile,
+                    ):
+                        # 2026-08-02 事故：这里原本会把「出现过早」的 UUID 永久写进
+                        # blocked_media_uuids。Nano Banana 2 Lite 实测 6–10s 就出图，
+                        # 正好横跨这条 8s 线，于是三次生成的成品（d5b9144b / 6dd6aa35 /
+                        # f07d50ca）刚被网络捕获就被自己拉黑，之后连「新 tile 内确认」
+                        # 这种最强证据都救不回来——Flow 画布上明明有图，worker 却一路
+                        # 等到 120s 超时，还被上层判成风控去换号。
+                        # 早到不是历史媒体的证据，只是证据还不够：这里只延后判定，
+                        # 下一轮拿到 tile/DOM 佐证或过了最小年龄后仍可重新参评。
+                        if url not in early_candidate_logs:
+                            early_candidate_logs.add(url)
+                            media_uuid = _extract_media_uuid(url)
+                            log(
+                                f"  ⏳ {source}候选出现过早，暂缓判定（等待新 tile/DOM 佐证）: "
+                                f"{media_uuid[:16] if media_uuid else 'no-uuid'}...",
+                                "GoogleFX",
+                            )
+                        return False
                     return True
 
-                def _scan_new_result_tile_media():
-                    """Return media that belongs to a tile created by the current submit."""
+                def _scan_new_result_tiles():
+                    """一次 evaluate 同时取回「新 tile 里的媒体」「全页媒体 src」「新 tile 是否已报错」。
+
+                    2026-08-01 合并：路径B 和路径C 原本是两次独立的 page.evaluate，各自
+                    完整遍历一遍 div[data-tile-id]，2s 一轮各跑一次。除了白花一次 CDP 往返
+                    和一遍全表遍历，两次扫描之间 DOM 还可能变（tile 在两次扫描的间隙拿到
+                    媒体），判定依据于是来自两个不同快照。合并后两路共用同一快照。
+
+                    返回 {"rows": [...], "mediaSrcs": [...], "failed": {text} | None}。
+                    mediaSrcs 是全页（不限 tile、不限尺寸）的媒体 img src：新结果并不总能
+                    落进一个新 data-tile-id 里——画布是虚拟化的，视口外的结果 tile 根本不
+                    挂载。它用来给路径A 的候选做「提交后才出现的媒体」佐证。
+                    """
                     try:
-                        rows = page.evaluate("""(beforeIds) => {
+                        result = page.evaluate("""(beforeIds) => {
                             const before = new Set(beforeIds || []);
                             const rows = [];
+                            const mediaSrcs = [];
+                            let failed = null;
+
+                            const isMediaSrc = (lower) => lower.includes('getmediaurlredirect')
+                                || lower.includes('flow-content.google')
+                                || lower.includes('storage.googleapis.com')
+                                || lower.includes('googleusercontent.com')
+                                || lower.includes('ggpht.com');
+
+                            for (const img of document.querySelectorAll('img')) {
+                                const src = img.currentSrc || img.getAttribute('src') || '';
+                                if (src && isMediaSrc(src.toLowerCase())) mediaSrcs.push(src);
+                            }
+
+                            const isVisible = (el) => {
+                                let cur = el;
+                                while (cur) {
+                                    const style = window.getComputedStyle(cur);
+                                    if (style.display === 'none' || style.visibility === 'hidden'
+                                        || parseFloat(style.opacity) === 0) {
+                                        return false;
+                                    }
+                                    cur = cur.parentElement;
+                                }
+                                return true;
+                            };
+
                             for (const tile of document.querySelectorAll('div[data-tile-id]')) {
                                 const tileId = tile.getAttribute('data-tile-id') || '';
                                 if (!tileId || before.has(tileId)) continue;
-                                for (const img of tile.querySelectorAll('img[src*="getMediaUrlRedirect"]')) {
-                                    const src = img.getAttribute('src') || img.currentSrc || '';
-                                    if (src) rows.push({tileId, src});
+
+                                for (const img of tile.querySelectorAll('img')) {
+                                    const src = img.currentSrc || img.getAttribute('src') || '';
+                                    if (!src) continue;
+                                    const lower = src.toLowerCase();
+                                    const looksLikeMedia = isMediaSrc(lower)
+                                        || lower.startsWith('blob:')
+                                        || lower.startsWith('data:image/');
+                                    // Exclude avatars/icons while still accepting current Flow
+                                    // variants that render a direct GCS URL instead of the old
+                                    // getMediaUrlRedirect URL.
+                                    const largeEnough = img.naturalWidth >= 128 && img.naturalHeight >= 128;
+                                    if (looksLikeMedia && largeEnough) rows.push({tileId, src});
                                 }
+
+                                if (failed) continue;
+                                const t = (tile.innerText || '').toLowerCase();
+                                const hasFailText = t.includes('failed') || t.includes('something went wrong')
+                                                 || t.includes('unusual activity') || t.includes('help center')
+                                                 || t.includes('出错了') || t.includes('生成失败')
+                                                 || t.includes('失败') || t.includes('使用人数过多');
+                                if (!hasFailText) continue;
+                                const hasWarningIcon = Array.from(tile.querySelectorAll('i')).some((i) => {
+                                    const txt = (i.innerText || i.textContent || '').trim().toLowerCase();
+                                    const isWarning = txt === 'warning' || txt === 'error' || txt === 'error_outline';
+                                    return isWarning && isVisible(i);
+                                });
+                                if (hasWarningIcon) failed = {text: tile.innerText};
                             }
-                            return rows;
-                        }""", list(known_tile_ids_before_submit))
+                            return {rows, mediaSrcs, failed};
+                        }""", list(known_tile_ids_before_submit or []))
                     except Exception as e:
                         log(f"  ⚠️ 新结果 tile 扫描失败: {type(e).__name__}", "GoogleFX")
-                        return []
-                    return rows or []
+                        return {"rows": [], "mediaSrcs": [], "failed": None}
+                    return result or {"rows": [], "mediaSrcs": [], "failed": None}
 
-                def _scan_captured(confirmed_new_tile_uuids):
-                    """路径A：纯内存 deque 扫描，不碰浏览器，可以随便高频调用。"""
+                def _scan_captured(confirmed_new_tile_uuids, post_submit_dom_uuids=()):
+                    """路径A：纯内存 deque 扫描，不碰浏览器，可以随便高频调用。
+
+                    佐证分两档：新 tile 内的媒体（最强，可越过最小年龄）与「提交后才在
+                    页面上出现的媒体」（次强）。两档都拿不到时，候选不会被丢弃，而是挂起
+                    计时——熬过宽限期仍然只有它一个干净候选，就按它落盘。
+                    """
+                    fallback = None
                     for ts, url in reversed(captured_data):
+                        media_uuid = _extract_media_uuid(url)
+                        in_new_tile = bool(
+                            media_uuid and media_uuid in confirmed_new_tile_uuids
+                        )
+                        confirmed = in_new_tile or bool(
+                            media_uuid and media_uuid in post_submit_dom_uuids
+                        )
                         if (ts >= submit_ts_this - 1 and url not in known_net
-                                and _acceptable_candidate(url, "路径A")):
-                            media_uuid = _extract_media_uuid(url)
-                            if media_uuid and media_uuid in confirmed_new_tile_uuids:
+                                and _acceptable_candidate(
+                                    url,
+                                    "路径A",
+                                    confirmed_new_tile=in_new_tile,
+                                )):
+                            if confirmed:
                                 return url
+                            if fallback is None:
+                                fallback = (url, ts, media_uuid)
                             if url not in pending_unconfirmed_candidates:
                                 pending_unconfirmed_candidates.add(url)
                                 log(
@@ -604,6 +868,15 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                                     f"{media_uuid[:16] if media_uuid else 'no-uuid'}...",
                                     "GoogleFX",
                                 )
+                    if fallback and _unconfirmed_candidate_is_acceptable(fallback[1]):
+                        url, captured_ts, media_uuid = fallback
+                        log(
+                            f"  ⚠️ 路径A候选已挂起 {int(time.time() - captured_ts)}s 仍无 tile/DOM 佐证"
+                            f"（画布虚拟化未挂载该结果），按提交后新增媒体接受: "
+                            f"{media_uuid[:16] if media_uuid else 'no-uuid'}...",
+                            "GoogleFX",
+                        )
+                        return url
                     return None
 
                 poll_count = 0
@@ -611,18 +884,26 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     _check_cancelled()
                     poll_count += 1
 
-                    # Only media inside a tile created after this submit is eligible.  Flow
-                    # frequently lazy-loads historical canvas tiles after Send; a global DOM
-                    # diff cannot distinguish those from the current generation.
-                    new_tile_rows = _scan_new_result_tile_media()
+                    # Media inside a tile created after this submit is the strongest
+                    # association evidence.  Flow also lazy-loads historical canvas tiles
+                    # after Send, so page-wide media is only ever used to corroborate a
+                    # network candidate that already survived the pre-submit baselines.
+                    tile_scan = _scan_new_result_tiles()
+                    new_tile_rows = tile_scan.get("rows") or []
+                    new_failed_tile = tile_scan.get("failed")
                     confirmed_new_tile_uuids = {
                         _extract_media_uuid(row.get("src"))
                         for row in new_tile_rows
                         if _extract_media_uuid(row.get("src"))
                     }
+                    post_submit_dom_uuids = {
+                        _extract_media_uuid(src)
+                        for src in (tile_scan.get("mediaSrcs") or [])
+                        if src and src not in known_dom_srcs and _extract_media_uuid(src)
+                    }
 
                     # ── 路径A: 网络拦截 ──
-                    hit = _scan_captured(confirmed_new_tile_uuids)
+                    hit = _scan_captured(confirmed_new_tile_uuids, post_submit_dom_uuids)
                     if hit:
                         log(f"  📡 路径A 网络捕获: {hit[:80]}...", "GoogleFX")
                         return hit
@@ -633,63 +914,48 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                             row for row in new_tile_rows
                             if row.get("src")
                             and row.get("src") not in known_dom_srcs
-                            and _acceptable_candidate(row.get("src"), "路径B")
+                            and _acceptable_candidate(
+                                row.get("src"),
+                                "路径B",
+                                confirmed_new_tile=True,
+                            )
                         ),
                         key=lambda row: (row.get("tileId", ""), row.get("src", "")),
                     )
-                    if acceptable_rows:
-                        new_src = acceptable_rows[0]["src"]
-                        # 转为绝对 URL
-                        full_url = new_src if new_src.startswith("http") else f"https://labs.google{new_src}"
+                    # 转为绝对 URL 后才算数。
+                    # ⚠️ 只有「/」开头的站内相对路径才能拼前缀。tile 扫描的 looksLikeMedia
+                    # 现在也认 blob: / data:image/，这两种既非 http 开头、也不是相对路径，
+                    # 原来那句 `else f"https://labs.google{new_src}"` 会拼出
+                    # https://labs.googleblob:https://... 这种垃圾地址，_download_image 必然
+                    # 失败，进而把整批按「已生成但下载落盘失败」截断。blob:/data: 是页面内存
+                    # 对象、服务端取不到，只能跳过；同一张图稍后通常会以真正的 http(s) src
+                    # 再出现一次，所以这里不 return、继续往下走本轮的路径C 和等待。
+                    for row in acceptable_rows:
+                        new_src = row["src"]
+                        full_url = _absolute_media_url(new_src)
+                        if not full_url:
+                            if new_src not in ignored_candidates:
+                                ignored_candidates.add(new_src)
+                                log(
+                                    f"  ⏭️ 路径B 跳过不可下载的 src ({new_src[:32]}...)，"
+                                    f"等待同一结果的 http(s) 地址",
+                                    "GoogleFX",
+                                )
+                            continue
                         log(
                             f"  🖼️  路径B新结果tile捕获: "
-                            f"tile={acceptable_rows[0]['tileId'][:16]}... {new_src[:80]}...",
+                            f"tile={row.get('tileId', '')[:16]}... {new_src[:80]}...",
                             "GoogleFX",
                         )
                         return full_url
 
-                    # ── 路径C: 检测新提交卡片是否已报错失败 ──
-                    try:
-                        has_new_failed = page.evaluate("""(beforeIds) => {
-                            const beforeSet = new Set(beforeIds || []);
-                            const cards = Array.from(document.querySelectorAll('div[data-tile-id]'));
-
-                            function isVisible(el) {
-                                let cur = el;
-                                while (cur) {
-                                    const style = window.getComputedStyle(cur);
-                                    if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) {
-                                        return false;
-                                    }
-                                    cur = cur.parentElement;
-                                }
-                                return true;
-                            }
-
-                            for (const card of cards) {
-                                const tid = card.getAttribute('data-tile-id');
-                                if (!tid || beforeSet.has(tid)) continue;
-                                const t = (card.innerText || '').toLowerCase();
-                                const hasFailText = t.includes('failed') || t.includes('something went wrong')
-                                                 || t.includes('unusual activity') || t.includes('help center')
-                                                 || t.includes('出错了') || t.includes('生成失败')
-                                                 || t.includes('失败') || t.includes('使用人数过多');
-                                if (!hasFailText) continue;
-                                const icons = Array.from(card.querySelectorAll('i'));
-                                const hasWarningIcon = icons.some(i => {
-                                    const txt = (i.innerText || i.textContent || '').trim().toLowerCase();
-                                    const isWarning = txt === 'warning' || txt === 'error' || txt === 'error_outline';
-                                    return isWarning && isVisible(i);
-                                });
-                                if (hasWarningIcon) return {failed: true, text: card.innerText};
-                            }
-                            return null;
-                        }""", list(known_tile_ids_before_submit or []))
-                        if has_new_failed:
-                            log(f"  ❌ 检测到新提交卡片已报错失败: {has_new_failed['text'][:100]}", "GoogleFX")
-                            return None
-                    except Exception as e:
-                        log(f"  ⚠️ 路径C 卡片报错检测失败: {type(e).__name__}", "GoogleFX")
+                    # ── 路径C: 新提交卡片已报错失败（与路径B 同一次扫描的结果）──
+                    # 顺序仍是先 B 后 C：同一轮里既拿到媒体又检测到报错时，媒体优先，
+                    # 与合并前的行为一致。
+                    if new_failed_tile:
+                        log(f"  ❌ 检测到新提交卡片已报错失败: "
+                            f"{str(new_failed_tile.get('text') or '')[:100]}", "GoogleFX")
+                        return None
 
                     elapsed = int(deadline - time.time())
                     if poll_count % 5 == 0 and elapsed > 0:
@@ -709,13 +975,38 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                         except Exception:
                             time.sleep(0.25)   # 页面已关等：交给下一轮的路径B/C 报错
                             break
-                        hit = _scan_captured(confirmed_new_tile_uuids)
+                        hit = _scan_captured(confirmed_new_tile_uuids, post_submit_dom_uuids)
                         if hit:
                             log(f"  📡 路径A 网络捕获: {hit[:80]}...", "GoogleFX")
                             return hit
                         _check_cancelled()
 
                 return None
+
+            def _halt_batch_keeping_prefix(exc, idx):
+                """本批到此为止：已成功的前缀能留就留，留不下就把原异常抛出去。
+
+                返回 True 表示调用方应当 break（前缀已记进 result）。
+
+                批内每张图都是前一张的 i2i 续链，所以任何一张失败都必须**停在这一张**，
+                不能跳过它继续跑——那会把 prompt[idx+1] 接到 prompt[idx-1] 的图上，
+                整批 prompt↔帧 的对应关系全体错位。
+                但"停下"不等于"作废"：前 idx 张已经真实生成、下载、扣过积分，且它们的
+                血统仍然精确。超时（_wait_for_net_url 返回空）和下载落盘失败两条路早就
+                是 break 保前缀，而参考图挂载失败 / 近重复判定这两条却是 raise ——
+                异常会跳过下面那句 result["image_urls"] = local_paths，让 except 返回
+                image_urls=[]，把这几张图连同积分一起丢掉，上层重试再从头生成一遍。
+                统一成同一套语义（2026-08-02）。
+                """
+                if not local_paths:
+                    # 一张都没成，没有前缀可保；交给原异常，保留它的分类前缀
+                    # （REFERENCE_MOUNT_FAILED / 近重复文案）供上层判定。
+                    raise exc
+                result["failed_index"] = idx
+                result["message"] = str(exc)
+                log(f"⚠️ {result['message']}，停止本批并保留前 {len(local_paths)} 张成功结果",
+                    "GoogleFX")
+                return True
 
             for idx, prompt_text in enumerate(prompts):
                 _check_cancelled()
@@ -801,8 +1092,13 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
 
                     if mounted:
                         has_ref_for_this_prompt = True
-                    else:
-                        log(f"  ❌ 第 {idx+1} 张未能挂上参考图，本帧将脱链以无参考模式生成", "Error")
+                    elif _halt_batch_keeping_prefix(
+                        _reference_mount_error(
+                            f"第 {idx+1} 张未能挂载上一张生成结果，已在提交前终止以保护 i2i 血统"
+                        ),
+                        idx,
+                    ):
+                        break
 
                 # ── Step C: 触发 React state 同步，然后发送 ──
                 # ⚠️ 有参考图时禁止 Backspace（光标可能停在 chip 上，会把 chip 删掉）
@@ -840,10 +1136,18 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                 # explicitly because their redirect src may be assigned lazily after this point.
                 pre_submit_known_net_urls = {url for _ts, url in captured_data}
                 try:
+                    # Must use the same predicate/accessor as the in-wait scan, otherwise
+                    # pre-existing media reads as "appeared after Send" and corroborates
+                    # the wrong candidate.
                     pre_submit_dom_srcs = set(page.evaluate("""() => {
-                        return Array.from(document.querySelectorAll('img[src*="getMediaUrlRedirect"]'))
-                            .map(img => img.getAttribute('src') || '')
-                            .filter(Boolean);
+                        const isMediaSrc = (lower) => lower.includes('getmediaurlredirect')
+                            || lower.includes('flow-content.google')
+                            || lower.includes('storage.googleapis.com')
+                            || lower.includes('googleusercontent.com')
+                            || lower.includes('ggpht.com');
+                        return Array.from(document.querySelectorAll('img'))
+                            .map(img => img.currentSrc || img.getAttribute('src') || '')
+                            .filter(src => src && isMediaSrc(src.toLowerCase()));
                     }"""))
                 except Exception as e:
                     log(f"  ⚠️ 记录提交前 DOM 媒体基线失败: {type(e).__name__}", "GoogleFX")
@@ -871,17 +1175,21 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     submit_ts_this,
                     timeout=get_runtime_max_wait_seconds(),
                     known_tile_ids_before_submit=pre_submit_tile_ids,
-                    _current_prompt_text=prompt_text,
-                    _current_prompt_idx=idx,
-                    _has_ref_for_this_prompt=has_ref_for_this_prompt,
                     known_net_urls_before_submit=pre_submit_known_net_urls,
                     known_dom_srcs_before_submit=pre_submit_dom_srcs,
                     blocked_media_uuids=pre_submit_media_uuids,
                 )
 
                 if not img_url:
-                    log(f"⚠️ 第 {idx+1} 张图超时未捕获到 URL，跳过", "GoogleFX")
-                    continue
+                    # Batch prompts form one strict i2i lineage.  Continuing with
+                    # prompt idx+1 after idx timed out would bind it to the last
+                    # successful image and shift every remaining prompt↔frame
+                    # mapping.  Stop here and return the durable successful prefix;
+                    # the SPARK layer resumes from this exact index.
+                    result["failed_index"] = idx
+                    result["message"] = f"第 {idx+1} 张图超时未捕获到 URL"
+                    log(f"⚠️ {result['message']}，停止本批并保留前 {len(local_paths)} 张成功结果", "GoogleFX")
+                    break
 
                 # ── 立即下载到本地 (下载完成 = 图已就绪) ──
                 log(f"⬇️  开始下载第 {idx+1} 张图...", "GoogleFX")
@@ -908,31 +1216,41 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                             os.remove(local_path)
                         except OSError:
                             pass
-                        raise RuntimeError(
-                            "所有 prompt 均未捕获到图片："
-                            f"候选结果与参考图近乎相同 (MAD={duplicate_mad:.2f}, "
-                            f"ref={os.path.basename(duplicate_ref or '')})"
-                        )
+                        if _halt_batch_keeping_prefix(
+                            RuntimeError(
+                                "所有 prompt 均未捕获到图片："
+                                f"候选结果与参考图近乎相同 (MAD={duplicate_mad:.2f}, "
+                                f"ref={os.path.basename(duplicate_ref or '')})"
+                            ),
+                            idx,
+                        ):
+                            break
                     local_paths.append(local_path)
                     all_result_urls.append(img_url)
                     log(f"✅ 第 {idx+1} 张图下载完成，准备处理下一张", "GoogleFX")
                 else:
-                    log(f"⚠️ 第 {idx+1} 张图下载失败，使用原始 URL", "GoogleFX")
-                    local_paths.append(img_url)
-                    all_result_urls.append(img_url)
+                    result["failed_index"] = idx
+                    result["message"] = f"第 {idx+1} 张图已生成但下载落盘失败"
+                    log(f"⚠️ {result['message']}，停止本批并保留成功前缀", "GoogleFX")
+                    break
 
             if not local_paths:
                 raise Exception("所有 prompt 均未捕获到图片")
 
             if len(local_paths) < len(prompts):
-                # 图确实提交出去了但没全回来 = 生成侧失败，这是换号的正当理由，
-                # 跳过错误分类直接换（force_switch）。
-                log(f"⚠️ 批量生图未完全成功 ({len(local_paths)}/{len(prompts)} 成功)，触发换号", "GoogleFX")
-                _switch_account_on_failure(
-                    reason=f"批量生图部分失败 ({len(local_paths)}/{len(prompts)})", force_switch=True,
+                # Keep the account binding stable while returning the successful
+                # prefix: its project URL/UUID ownership belongs to this account.
+                # The remainder consumes the shared retry budget and switches only
+                # if a later full failed attempt is classified as account-side.
+                log(f"⚠️ 批量生图未完全成功 ({len(local_paths)}/{len(prompts)} 成功)，返回成功前缀", "GoogleFX")
+                result["status"] = "partial"
+                result.setdefault("failed_index", len(local_paths))
+                result.setdefault(
+                    "message",
+                    f"批量生图部分成功 ({len(local_paths)}/{len(prompts)})",
                 )
-
-            result["status"] = "success"
+            else:
+                result["status"] = "success"
             result["image_urls"] = local_paths
 
     except Exception as e:
@@ -942,10 +1260,8 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
         else:
             log(f"❌ generate_images_batch 内部错误: {e}", "Error")
             result["message"] = str(e)
-            # 只有确实指向账号/出口风控的失败才换号。UI 自动化自己的毛病（找不到配置
-            # 按钮/输入框、配置没点对、脚本 Bug）换号既救不了，还会关浏览器重连、
-            # 把登录 token 打失效——2026-07-25 之前这里是无条件换 IP。
-            _switch_account_on_failure(reason=e)
+            # 换号与重试只由外层统一处理。这里过去也判一次，导致每次失败打印两份
+            # 判定日志；最后一次则只留下内层的“未知错误”，真正原因很容易被埋掉。
     finally:
         # 清理 response 事件监听器，防止复用 page 时 handler 堆积泄漏
         try:
@@ -966,7 +1282,10 @@ def _generate_images_batch_google_fx_unlocked(req: ImageBatchRequest):
     # 只补齐距上次真实提交还差的那段间隔，而不是无条件干睡 15~25s
     # （理由与实测数据见 helpers.fx_pacing_wait）。
     fx_pacing_wait(*fx_pacing_bounds())
-    max_retries = 4
+    try:
+        max_retries = max(1, min(6, int(getattr(req, "max_attempts", 3) or 3)))
+    except (TypeError, ValueError):
+        max_retries = 3
     last_err = None
     tried_accounts = set()   # 本次已经试过的号池账号，换号时排除，免得换回刚失败的号
     for attempt in range(1, max_retries + 1):
@@ -974,7 +1293,8 @@ def _generate_images_batch_google_fx_unlocked(req: ImageBatchRequest):
         log(f"🔄 开始第 {attempt}/{max_retries} 次图片生成尝试...", "GoogleFX")
         try:
             result = _generate_images_batch_google_fx_single_attempt(req)
-            if result.get("status") == "success":
+            if result.get("status") in ("success", "partial"):
+                result["attempts_used"] = attempt
                 images = result.get("image_urls") or []
                 if images:
                     try:
@@ -997,9 +1317,14 @@ def _generate_images_batch_google_fx_unlocked(req: ImageBatchRequest):
                         log(f"⚠️ 记录账号图片任务数失败: {_e}", "GoogleFX")
                 return result
             err_msg = result.get("message", "")
-            if "异常活动" in err_msg or "unusual activity" in err_msg or "所有 prompt 均未捕获到图片" in err_msg:
-                raise RuntimeError(err_msg)
-            return result
+            if _is_login_required_failure(err_msg):
+                _cooldown_current_login_account(err_msg)
+                raise RuntimeError(f"ACCOUNT_LOGIN_REQUIRED: {err_msg}")
+            if not err_msg:
+                err_msg = "Google FX 图片生成失败（未返回原因）"
+            # Failed attempts are retried only here.  The frame orchestration
+            # layer no longer adds another whole-batch retry loop.
+            raise RuntimeError(err_msg)
         except Exception as e:
             last_err = e
             if cancel_flag.is_cancelled or "任务已取消" in str(e):
@@ -1007,22 +1332,38 @@ def _generate_images_batch_google_fx_unlocked(req: ImageBatchRequest):
                 # 三轮浏览器。直接按取消收摊，与 single_attempt 内部同形。
                 log("🛑 任务已取消，停止重试", "GoogleFX")
                 return {"status": "failed", "image_urls": [], "message": "任务已取消"}
+            should_switch, verdict = _classify_failure_for_switch(e)
+            _record_current_generation_failure(e)
             if attempt == max_retries:
+                log(
+                    f"⚠️ 第 {attempt} 次图片生成失败（重试已用尽）: {e}；分类：{verdict}",
+                    "GoogleFX",
+                )
                 break
             # 换不换号由错误类型决定（2026-07-25）：此前每次尝试失败都无条件强制
             # 干预一次，一个"未找到底部配置按钮"就能连打 4 次，而整个过程一张图都
             # 没提交过。UI 自动化类失败只冷却后原地重试即可——换号救不了，反而
             # 每次都要关浏览器重连、把 Flow 登录 token 越打越松。
-            should_switch, verdict = _classify_failure_for_switch(e)
             log(f"⚠️ 第 {attempt} 次图片生成失败: {e}，"
                 f"{'准备换号重试' if should_switch else '原地冷却重试（不换号）'}：{verdict}", "GoogleFX")
-            cooldown_time = 15 * attempt
-            log(f"🕐 冷却等待 {cooldown_time} 秒...", "GoogleFX")
-            _cancellable_sleep(cooldown_time)
-            if should_switch:
+            cooldown_time = 0 if _is_login_required_failure(e) else 15 * attempt
+            if cooldown_time:
+                log(f"🕐 冷却等待 {cooldown_time} 秒...", "GoogleFX")
+                _cancellable_sleep(cooldown_time)
+            if should_switch and not bool(getattr(req, "allow_account_switch", True)):
+                log(
+                    "📌 本次为原画布迭代，账号已锁定；不换号，避免脱离原 Flow 项目",
+                    "GoogleFX",
+                )
+            elif should_switch:
                 switched = _switch_account_on_failure(force_switch=True, exclude=tried_accounts)
                 if switched:
                     tried_accounts.add(switched)
 
     log(f"❌ 图片生成在 {max_retries} 次尝试后全部失败。", "GoogleFX")
-    return {"status": "failed", "image_urls": [], "message": f"All attempts failed. Last error: {last_err}"}
+    return {
+        "status": "failed",
+        "image_urls": [],
+        "message": f"All attempts failed. Last error: {last_err}",
+        "attempts_used": max_retries,
+    }

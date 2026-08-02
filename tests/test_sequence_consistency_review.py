@@ -1134,6 +1134,328 @@ class TestReviewVerdictInvalidation(_TmpProjectCase):
         self.assertIn('review_frames_sha256', frames[3])
 
 
+class TestUndoFrameFix(_TmpProjectCase):
+    """修复快照与撤销（2026-08-02）：定向修复是**覆盖写同一个帧文件**，旧图此前不留档
+    ——修坏了只能盲重渲碰运气，也没法拿前后两张对比。删除整拍早有 .deleted_slots 快照，
+    修复没有。现在每次修复动手前存一份（帧图 + manifest 条目 + 两段提示词正文），
+    可一键退回。"""
+
+    FIXED_BLOCK = (
+        "图片提示词\n图片 1:\nfirst frame\n\n图片 2:\nsecond frame 改过\n\n图片 3:\nthird frame\n\n"
+        "视频提示词\n视频 1:\nvideo one 改过\n\n视频 2:\nvideo two\n"
+    )
+
+    def _entry(self, **over):
+        base = {'sequence': 2, 'quality_gate': 'sequence_review_flagged',
+                'vlm_qa_reason': '塔吊消失', 'prompt': 'second frame',
+                'url': '/outputs/x/frames/img_002.webp',
+                'review_issues': [{'text': '塔吊消失', 'layer': 'local', 'beat': 1,
+                                   'frames': [1, 2]}]}
+        base.update(over)
+        return base
+
+    def _snapshot(self, **over):
+        """按 fix_frame_issue 的调用方式存一份修复前快照。"""
+        images, videos = po._parse_prompt_slots(self.PROMPT_BLOCK)
+        return po.save_fix_snapshot(self.project_dir, self.TITLE, 2, self._entry(**over),
+                                    images[2], 1, videos[1])
+
+    def test_snapshot_keeps_the_frame_image_entry_and_both_prompt_bodies(self):
+        self._touch_frame(2)
+        meta = self._snapshot()
+        snap_dir = po._fix_snapshot_dir(self.project_dir, 2)
+        self.assertTrue(os.path.exists(os.path.join(snap_dir, 'img_002.webp')))
+        self.assertEqual(meta['frame']['vlm_qa_reason'], '塔吊消失')
+        self.assertIn('second frame', meta['image']['body'])
+        self.assertIn('video one', meta['video']['body'])
+        self.assertEqual(meta['video_beat'], 1)
+        self.assertNotIn('url', meta['frame'])   # url 由渲染路径现算，与快照无关
+
+    def test_undo_restores_image_prompt_bodies_and_the_recorded_problem(self):
+        self._touch_frame(2)
+        self._snapshot()
+        # 修复发生了：帧图被覆盖、问题被清掉、两段提示词被改写
+        with open(po._frame_path(self.TITLE, 2), 'wb') as f:
+            f.write(b'fixed frame bytes')
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 1}, {'sequence': 2, 'quality_gate': 'pending_manual_review',
+                              'vlm_qa_reason': None, 'prompt': 'second frame 改过',
+                              'url': '/outputs/x/frames/img_002.webp',
+                              'fix_backup': {'at': 'T', 'reason': '塔吊消失'}},
+            {'sequence': 3},
+        ]})
+
+        result = po.undo_frame_fix(self.TITLE, 2, self.FIXED_BLOCK)
+
+        with open(po._frame_path(self.TITLE, 2), 'rb') as f:
+            self.assertEqual(f.read(), b'fake webp bytes')      # 旧图回来了
+        self.assertIn('second frame\n', result['prompt_block'])  # 图片正文回到修复前
+        self.assertIn('video one\n', result['prompt_block'])     # 那条视频过渡也回来了
+        frame = {f['sequence']: f for f in self._read_manifest()['frames']}[2]
+        self.assertEqual(frame['quality_gate'], 'sequence_review_flagged')
+        self.assertEqual(frame['vlm_qa_reason'], '塔吊消失')     # 问题回来了，可以重修
+        self.assertEqual(frame['url'], '/outputs/x/frames/img_002.webp')
+        self.assertNotIn('fix_backup', frame)                    # 快照已用掉
+
+    def test_undo_only_rolls_back_its_own_slots(self):
+        """修完 002 又修了 003 之后撤销 002：整体还原 prompt_block 会把 003 的修复
+        一起吞掉，所以只换回这一帧涉及的那两个槽位。"""
+        self._touch_frame(2)
+        self._snapshot()
+        server_common.write_manifest(self.project_dir, {'frames': [{'sequence': 2}]})
+        later = self.FIXED_BLOCK.replace('third frame', 'third frame 后来也改过')
+
+        result = po.undo_frame_fix(self.TITLE, 2, later)
+
+        self.assertIn('third frame 后来也改过', result['prompt_block'])
+        self.assertIn('second frame\n', result['prompt_block'])
+
+    def test_undo_runs_the_shared_finalize(self):
+        """撤销也是一次"这一帧的画面变了"：下游血统、相邻审查结论、成片都要作废。"""
+        for s in (1, 2, 3):
+            self._touch_frame(s)
+        self._snapshot()
+        with open(po._frame_path(self.TITLE, 2), 'wb') as f:
+            f.write(b'fixed frame bytes')
+        server_common.write_manifest(self.project_dir, {
+            'frames': [{'sequence': 1}, self._entry(), {'sequence': 3}],
+            'merged_video': {'file': 'merged.mp4'},
+            'videos': [{'slot': 1}],
+        })
+
+        po.undo_frame_fix(self.TITLE, 2, self.FIXED_BLOCK)
+
+        manifest = self._read_manifest()
+        frames = {f['sequence']: f for f in manifest['frames']}
+        self.assertTrue(frames[3]['stale_lineage'])
+        self.assertNotIn('stale_lineage', frames[1])
+        self.assertNotIn('merged_video', manifest)
+        self.assertEqual(manifest['videos'], [])
+
+    def test_undo_without_a_snapshot_raises_instead_of_pretending(self):
+        self._touch_frame(2)
+        with self.assertRaises(RuntimeError):
+            po.undo_frame_fix(self.TITLE, 2, self.PROMPT_BLOCK)
+
+    def test_a_second_fix_replaces_the_snapshot_and_does_not_claim_a_stale_one(self):
+        """只留最近一次：连修两轮之后人想回到的是"上一版"。快照里存的条目不能带着
+        上一轮的 fix_backup——那枚记号指向的正是这份刚被覆盖掉的快照。"""
+        self._touch_frame(2)
+        self._snapshot()
+        meta = self._snapshot(fix_backup={'at': '旧', 'reason': '旧问题'})
+        self.assertNotIn('fix_backup', meta['frame'])
+        server_common.write_manifest(self.project_dir, {'frames': [{'sequence': 2}]})
+        restored = po.undo_frame_fix(self.TITLE, 2, self.FIXED_BLOCK)['frame']
+        self.assertNotIn('fix_backup', restored)
+
+    def test_snapshots_can_be_dropped_when_slot_numbers_move(self):
+        """快照按帧号存（.frame_fixes/005/）。删除整拍会把其后的帧整体前移，
+        fix_backup 记号跟着条目挪到 004，而 .frame_fixes/004 里躺的是另一帧的旧图
+        ——不清掉就会"撤销"出一张张冠李戴的画面。"""
+        self._touch_frame(2)
+        self._snapshot()
+        manifest = {'frames': [{'sequence': 2, 'fix_backup': {'at': 'T', 'reason': 'x'}},
+                               {'sequence': 3, 'fix_backup': {'at': 'T', 'reason': 'y'}}]}
+
+        po.drop_fix_snapshots(self.project_dir, manifest)
+
+        self.assertFalse(os.path.exists(po._fix_snapshot_dir(self.project_dir, 2)))
+        self.assertTrue(all('fix_backup' not in f for f in manifest['frames']))
+
+    def test_dropping_one_slots_snapshot_leaves_the_others_alone(self):
+        """手动上传只换掉这一格的图，别的格子的可撤销性不受影响。"""
+        self._touch_frame(2)
+        self._snapshot()
+        manifest = {'frames': [{'sequence': 2, 'fix_backup': {'at': 'T', 'reason': 'x'}},
+                               {'sequence': 3, 'fix_backup': {'at': 'T', 'reason': 'y'}}]}
+
+        po.drop_fix_snapshots(self.project_dir, manifest, [2])
+
+        self.assertFalse(os.path.exists(po._fix_snapshot_dir(self.project_dir, 2)))
+        frames = {f['sequence']: f for f in manifest['frames']}
+        self.assertNotIn('fix_backup', frames[2])
+        self.assertIn('fix_backup', frames[3])
+
+    def test_fix_marks_the_frame_as_undoable_only_after_the_rerender(self):
+        """记号必须在重渲之后盖：重渲会整体改写这条 manifest 条目，写在前面会被冲掉；
+        重渲抛错时也不该留记号——那次修复没落地，没有新版本需要退回。"""
+        self._touch_frame(1)
+        self._touch_frame(2)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 1}, self._entry(), {'sequence': 3}]})
+
+        with patch.object(po, 'fix_beat_from_sequence_review',
+                          return_value=('video one 改过', 'second frame 改过')), \
+             patch.object(po, 'generate_frame_sequence',
+                          side_effect=RuntimeError('上游炸了')), \
+             patch.object(po, '_reverify_frame_issues', return_value=None):
+            with self.assertRaises(RuntimeError):
+                po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
+        frame = {f['sequence']: f for f in self._read_manifest()['frames']}[2]
+        self.assertNotIn('fix_backup', frame)
+
+        with patch.object(po, 'fix_beat_from_sequence_review',
+                          return_value=('video one 改过', 'second frame 改过')), \
+             patch.object(po, 'generate_frame_sequence', return_value=None), \
+             patch.object(po, '_reverify_frame_issues', return_value=None):
+            result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
+
+        self.assertTrue(result['undoable'])
+        frame = {f['sequence']: f for f in self._read_manifest()['frames']}[2]
+        self.assertEqual(frame['fix_backup']['reason'], '塔吊消失')
+        # 快照里存的是修复前的那份正文
+        snap = po._read_fix_snapshot(self.project_dir, 2)
+        self.assertIn('second frame', snap['image']['body'])
+
+
+class TestIncrementalReview(_TmpProjectCase):
+    """增量审查（2026-08-02）：只重审"结论已经失效"的那几拍，仍然成立的结论原样保留。
+
+    此前每次都是全量——修完三帧再审一遍要把已经审干净的十来拍连同跨帧窗口整批重烧，
+    几分钟起步，于是"修完就重审"这个本该最顺手的动作反而没人愿意做。判定材料
+    （review_frames_sha256）与送审收窄的开关（only_beats / global_only_beats）早就都有。"""
+
+    PROMPT_BLOCK_7 = (
+        "图片提示词\n" + "".join(f"图片 {i}:\nframe {i}\n\n" for i in range(1, 8))
+        + "视频提示词\n" + "".join(f"视频 {i}:\nvideo {i}\n\n" for i in range(1, 7))
+    )
+
+    def _write_frame(self, seq, color):
+        Image.new('RGB', (16, 16), color).save(po._frame_path(self.TITLE, seq), format='WEBP')
+
+    def _all_reviewed(self, n=7):
+        for s in range(1, n + 1):
+            self._write_frame(s, (s * 10, 0, 0))
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'sequence_reviewed_pass'} for s in range(1, n + 1)
+        ]})
+        po._record_review_fingerprints(self.project_dir, self.TITLE, list(range(1, n + 1)))
+
+    def _run(self, result=None, full=False):
+        """跑一轮审查，回报 check_full_sequence_consistency 收到的送审范围。"""
+        calls = []
+
+        def fake_check(config, prompt_block, frame_paths, **kw):
+            calls.append(kw)
+            return result if result is not None else _review({})
+
+        with patch.object(po, 'check_full_sequence_consistency', side_effect=fake_check):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK_7,
+                                            self.project_dir, full=full)
+        return calls
+
+    def test_nothing_changed_means_no_model_calls_at_all(self):
+        self._all_reviewed()
+        events = []
+        with patch.object(po, 'check_full_sequence_consistency',
+                          side_effect=AssertionError('没有帧变过就不该再烧一次审查')):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK_7, self.project_dir,
+                                            on_progress=lambda s, d: events.append((s, d)))
+        result = [d for s, d in events if s == 'sequence_review_result'][0]
+        self.assertTrue(result['passed'])
+        self.assertEqual(result['reused_beats'], 6)
+        self.assertIn('仍然成立', result['message'])
+
+    def test_only_the_beats_around_a_changed_frame_are_resubmitted(self):
+        self._all_reviewed()
+        self._write_frame(4, (200, 200, 200))     # 只有 IMG 004 被重渲/修复过
+
+        calls = self._run()
+
+        # IMG 004 变了 → 003/004/005 的结论作废 → 覆盖它们的 beat 2..5 重审，
+        # beat 1（001→002）与 beat 6（006→007）两头没被碰过，直接沿用
+        self.assertEqual(calls[0]['only_beats'], [2, 3, 4, 5])
+        self.assertEqual(calls[0]['global_only_beats'], [2, 3, 4, 5])
+
+    def test_untouched_frames_keep_their_verdicts_and_timestamps(self):
+        self._all_reviewed()
+        before = {f['sequence']: f.get('reviewed_at')
+                  for f in self._read_manifest()['frames']}
+        self._write_frame(4, (200, 200, 200))
+
+        self._run()
+
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        for seq in (1, 2, 6, 7):
+            self.assertEqual(frames[seq]['quality_gate'], 'sequence_reviewed_pass')
+            self.assertEqual(frames[seq].get('reviewed_at'), before[seq],
+                             '没重审的帧不该被刷新成"刚审过"')
+        for seq in (3, 4, 5):
+            self.assertEqual(frames[seq]['quality_gate'], 'sequence_reviewed_pass')
+
+    def test_an_unfixed_problem_from_an_earlier_round_is_not_washed_away(self):
+        """一拍被选中重审，可能只是因为它**另一头**的帧变了；这一头上一轮判出来、
+        还没修的问题不能被这一轮的"通过"洗掉——那条问题这轮压根没人复查过。
+
+        场景：IMG 004 上一轮被 beat 3 判出问题、还没修；随后 IMG 006 被重渲。
+        beat 4（004→005）因此要重审，但 beat 3 不用——IMG 004 的结论仍然成立。"""
+        self._all_reviewed()
+        with server_common.manifest_lock(self.project_dir):
+            m = server_common.read_manifest(self.project_dir)
+            for f in m['frames']:
+                if f['sequence'] == 4:
+                    f['quality_gate'] = 'sequence_review_flagged'
+                    f['vlm_qa_reason'] = '层数对不上'
+            server_common.write_manifest(self.project_dir, m)
+        before = {f['sequence']: f.get('reviewed_at') for f in self._read_manifest()['frames']}
+        self._write_frame(6, (200, 200, 200))
+
+        calls = self._run()
+
+        self.assertEqual(calls[0]['only_beats'], [4, 5, 6])   # IMG 004 参与的 beat 4 在内
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        self.assertEqual(frames[4]['quality_gate'], 'sequence_review_flagged')
+        self.assertEqual(frames[4]['vlm_qa_reason'], '层数对不上')
+        self.assertEqual(frames[4].get('reviewed_at'), before[4])
+
+    def test_full_scope_reviews_everything_again(self):
+        self._all_reviewed()
+        calls = self._run(full=True)
+        self.assertIsNone(calls[0]['only_beats'])
+        self.assertIsNone(calls[0]['global_only_beats'])
+
+    def test_result_reports_remaining_problems_even_when_nothing_was_rereviewed(self):
+        """这一趟没发现新问题 ≠ 这套序列干净：上几轮标出来、还没修的问题必须照报。"""
+        self._all_reviewed()
+        with server_common.manifest_lock(self.project_dir):
+            m = server_common.read_manifest(self.project_dir)
+            m['frames'][2]['quality_gate'] = 'sequence_review_flagged'
+            m['frames'][2]['vlm_qa_reason'] = '层数对不上'
+            server_common.write_manifest(self.project_dir, m)
+        events = []
+        with patch.object(po, 'check_full_sequence_consistency',
+                          side_effect=AssertionError('没有帧变过就不该再烧一次审查')):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK_7, self.project_dir,
+                                            on_progress=lambda s, d: events.append((s, d)))
+        result = [d for s, d in events if s == 'sequence_review_result'][0]
+        self.assertFalse(result['passed'])
+        self.assertIn('IMG 003', result['message'])
+
+    def test_newly_rendered_frames_pull_in_only_the_beats_they_touch(self):
+        """续渲：前 5 帧早就审过，新渲出 006/007 时只需审接上去的那两拍。"""
+        self._all_reviewed(n=5)
+        for s in (6, 7):
+            self._write_frame(s, (s * 10, 0, 0))
+
+        calls = self._run()
+
+        self.assertEqual(calls[0]['only_beats'], [5, 6])
+
+    def test_fingerprints_of_boundary_frames_cover_their_unreviewed_neighbour(self):
+        """增量下边界帧的邻居这轮没被重审，但结论依然依赖那张图——指纹漏记的话，
+        邻居之后被重渲时这条结论不会作废，增量会一直认为它有效、永远不再复查。"""
+        self._all_reviewed()
+        self._write_frame(4, (200, 200, 200))
+        self._run()
+
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        # IMG 003 这轮被重审，它的结论同时依赖 002/003/004
+        self.assertEqual(set(frames[3]['review_frames_sha256']), {'2', '3', '4'})
+        # 于是之后 IMG 002 被重渲，IMG 003 的结论会跟着作废
+        self._write_frame(2, (7, 7, 7))
+        self.assertIn(3, po.invalidate_stale_review_verdicts(self.project_dir))
+
+
 class TestReverifyAfterFix(_TmpProjectCase):
     """修复闭环（2026-07-25）：重渲之后对着新画面把刚才那几条问题逐条再验一遍，
     直接回答"到底修好没有"。此前修复是开环的——重渲完把 gate 设回 pending_manual_review
@@ -1251,6 +1573,50 @@ class TestFixFrameViaImageEdit(_TmpProjectCase):
         self.assertIsNone(frame['vlm_qa_reason'])
         self.assertEqual(frame['prompt'], 'new prompt')
         self.assertEqual(frame['retry_count'], 1)
+
+    def test_self_edit_runs_the_shared_finalize(self):
+        """首帧被改画之后必须走与其它渲染路径同一个收尾：其后各帧仍派生自旧图
+        → stale_lineage；看过这张图的审查结论作废；已合并成片与视频清单作废。
+
+        此前这条通道自己开锁写 manifest、绕过了整个收尾——「重试首帧」会标记下游、
+        「修复首帧」不会，同一件事两种结果；成片也会原样留在清单里，看着像还对得上。"""
+        for s in (1, 2, 3):
+            self._touch_frame(s)
+        hashes = {s: server_common.frame_content_hash(po._frame_path(self.TITLE, s))
+                  for s in (1, 2, 3)}
+        server_common.write_manifest(self.project_dir, {
+            'frames': [
+                {'sequence': 1, 'quality_gate': 'sequence_reviewed_pass',
+                 'review_frames_sha256': {'1': hashes[1], '2': hashes[2]}},
+                {'sequence': 2, 'quality_gate': 'sequence_reviewed_pass',
+                 'review_frames_sha256': {str(s): hashes[s] for s in (1, 2, 3)}},
+                # 第 3 帧看的是 2/3，与首帧无关：它的结论不该被这次修复牵连
+                {'sequence': 3, 'quality_gate': 'sequence_reviewed_pass',
+                 'review_frames_sha256': {'2': hashes[2], '3': hashes[3]}},
+            ],
+            'merged_video': {'file': 'merged.mp4'},
+            'videos': [{'slot': 1, 'file': 'vid_001.mp4'}],
+        })
+
+        def fake_edit(config, prompt, reference_path, target_path, control_prompt=None):
+            with open(target_path, 'wb') as f:
+                f.write(b'edited webp bytes')   # 画面真的变了，哈希才会对不上
+
+        with patch.object(po, '_generate_image_edit', side_effect=fake_edit), \
+             patch.object(po, '_image_edit_model', return_value='edit-model'):
+            po._fix_frame_via_image_edit({}, self.TITLE, 1, 'new prompt')
+
+        manifest = self._read_manifest()
+        frames = {f['sequence']: f for f in manifest['frames']}
+        self.assertNotIn('stale_lineage', frames[1])          # 本轮重生的那帧不标
+        self.assertTrue(frames[2]['stale_lineage'])           # 其后各帧仍派生自旧首帧
+        self.assertTrue(frames[3]['stale_lineage'])
+        self.assertEqual(frames[2]['quality_gate'], 'pending_manual_review')
+        self.assertNotIn('review_frames_sha256', frames[2])
+        self.assertEqual(frames[3]['quality_gate'], 'sequence_reviewed_pass',
+                         '没看过首帧的结论不该被这次修复牵连')
+        self.assertNotIn('merged_video', manifest)
+        self.assertEqual(manifest['videos'], [])
 
     def test_quota_exhausted_never_switches_models(self):
         """定向修复撞上配额耗尽：原样上抛，配了 imageEditFallbackModel 也不换模型。

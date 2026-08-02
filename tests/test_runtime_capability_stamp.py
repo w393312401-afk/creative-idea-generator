@@ -22,7 +22,8 @@ def all_capable(monkeypatch):
     """一个"什么都齐全"的环境。"""
     monkeypatch.setattr(server_common, '_module_available', lambda name: True)
     monkeypatch.setattr(server_common.shutil, 'which', lambda name: '/usr/bin/' + name)
-    monkeypatch.setattr(server_common, 'missing_skill_contract_files', lambda: [])
+    # 签名带 profile：能力印章要按本单实际用的技能包查契约
+    monkeypatch.setattr(server_common, 'missing_skill_contract_files', lambda profile=None: [])
 
 
 class TestRuntimeCapabilityReport:
@@ -49,7 +50,7 @@ class TestRuntimeCapabilityReport:
 
     def test_missing_skill_contract_lists_the_files(self, all_capable, monkeypatch):
         monkeypatch.setattr(server_common, 'missing_skill_contract_files',
-                            lambda: ['SKILL.md', 'references/idea-engine.md'])
+                            lambda profile=None: ['SKILL.md', 'references/idea-engine.md'])
         report = runtime_capability_report()
         assert report['skill_contract_missing'] == ['SKILL.md', 'references/idea-engine.md']
         text = next(t for t in report['degraded'] if '技能契约' in t)
@@ -60,7 +61,7 @@ class TestRuntimeCapabilityReport:
         monkeypatch.setattr(server_common, '_module_available', lambda name: False)
         monkeypatch.setattr(server_common.shutil, 'which', lambda name: None)
         monkeypatch.setattr(server_common, 'missing_skill_contract_files',
-                            lambda: ['SKILL.md'])
+                            lambda profile=None: ['SKILL.md'])
         assert len(runtime_capability_report()['degraded']) == 4
 
     def test_report_is_not_cached(self, all_capable, monkeypatch):

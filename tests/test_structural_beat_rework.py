@@ -79,6 +79,17 @@ class TestVisibleMilestonePlanningGate(unittest.TestCase):
         errors = pp.milestone_ladder_violations([beat])
         self.assertTrue(any('weak/local' in error for error in errors))
 
+    def test_single_cell_terminal_component_milestone_passes(self):
+        beat = _milestone_beat(
+            operation='framing',
+            milestone_name='bulkhead doorway framing complete',
+            after_state='the steel bulkhead doorway is framed and sealed',
+            completion_extent='doorway framing finished from sill to lintel',
+            changed_grid_cells=['B2'],
+            package_operations=['framing'],
+        )
+        self.assertEqual(pp.milestone_ladder_violations([beat]), [])
+
     def test_coherent_closeout_package_is_allowed(self):
         beat = _milestone_beat(
             operation='repair',
@@ -94,6 +105,112 @@ class TestVisibleMilestonePlanningGate(unittest.TestCase):
         beat = _milestone_beat(package_operations=['demolition', 'painting'])
         errors = pp.milestone_ladder_violations([beat])
         self.assertTrue(any('incompatible construction phases' in error for error in errors))
+
+    # ── 材料层跨阶段判据只看「这一拍干了什么」（2026-08-01 run 1785597123956 修复）
+    # before_state / description 按 schema 必然点名被覆盖的那一层，扫进去等于把
+    # 「起点层 -> 终点层」误判成「一拍跨两层」，覆盖拍全灭。
+    def test_covering_beat_may_name_the_layer_it_conceals(self):
+        """封板/饰面/家具覆盖拍在场景状态里点名既有下层不算跨阶段。"""
+        for label, overrides in (
+            ('board closure over rough-in', dict(
+                operation='drywall',
+                description='crews screw plasterboard over the exposed wiring and vapour barrier',
+                milestone_name='full wall plasterboard closure complete',
+                before_state='the vapour barrier and wiring runs sit exposed between the open studs',
+                after_state='plasterboard fully closes the entire wall',
+                package_operations=['drywall'])),
+            ('finish over framing', dict(
+                operation='painting',
+                description='rollers lay two coats of finish paint across the boarded walls',
+                milestone_name='all four walls painted',
+                before_state='bare battens and furring strips are still visible at the ceiling line',
+                after_state='painting is complete across all four walls',
+                package_operations=['painting'])),
+            ('furnishing onto a finished floor', dict(
+                operation='furnishing',
+                description='the galley cabinetry is carried onto the finished flooring and bolted down',
+                milestone_name='all six cabinetry units installed',
+                before_state='the tiling and flooring are complete and the room stands empty',
+                after_state='all six cabinetry units stand on the already finished flooring',
+                package_operations=['furnishing'])),
+        ):
+            with self.subTest(label):
+                errors = pp.milestone_ladder_violations([_milestone_beat(**overrides)])
+                self.assertEqual(
+                    [e for e in errors if 'material-layer' in e], [],
+                    f'{label} 是合格的单层覆盖拍，不该被跨阶段判据打回：{errors}')
+
+    def test_genuine_multi_layer_bundle_still_rejected(self):
+        """真·一拍打包隐蔽层+封板+饰面仍要拦下（package 明确申报，扫得到）。"""
+        beat = _milestone_beat(
+            operation='drywall',
+            description='crews staple the vapour barrier, panel over it and roll on finish paint',
+            milestone_name='wall membrane, panelling and painting complete',
+            before_state='the bare shell stands open',
+            after_state='the vapour barrier is stapled, the panelling closed and the paint rolled on',
+            package_operations=['rough-in', 'drywall', 'painting'])
+        errors = pp.milestone_ladder_violations([beat])
+        self.assertTrue(any('material-layer' in error for error in errors), errors)
+
+    # ── milestone_name 同理（2026-08-02）：它按 schema 第 10 条是「这一拍**终结在
+    # 什么产物上**」，不是「干了什么」。产物名天然要带上它所依附/覆盖的基层，
+    # 扫进去与扫 before_state 是同一个误判。实测这是压垮第 4 次重排的头号原因。
+    def test_milestone_name_may_name_the_substrate_it_sits_on(self):
+        for label, overrides in (
+            ('finish floor over the framed cavity', dict(
+                operation='flooring',
+                milestone_name='plank flooring laid over the insulated joists',
+                package_operations=['flooring'])),
+            ('board closure over the services', dict(
+                operation='drywall',
+                milestone_name='wall lining screwed over the wiring runs',
+                package_operations=['drywall'])),
+            ('furniture anchored to the finished floor', dict(
+                operation='furnishing',
+                milestone_name='built-in bunk anchored to the finished flooring',
+                package_operations=['furnishing'])),
+            # nested_space_payoff 的 summary 自己点名要求的那一拍：'fixture' 在
+            # 清运拍里是**被拆掉的对象**，不是软装相位。
+            ('strip-out of seats and fixtures', dict(
+                operation='clearing',
+                milestone_name='seat and fixture strip-out complete',
+                package_operations=['clearing'])),
+        ):
+            with self.subTest(label):
+                errors = pp.milestone_ladder_violations([_milestone_beat(**overrides)])
+                self.assertEqual(
+                    [e for e in errors if 'material-layer' in e], [],
+                    f'{label} 是合格的单层拍，不该被跨阶段判据打回：{errors}')
+
+
+class TestMilestoneViolationSeverity(unittest.TestCase):
+    """硬（合成侧依赖）/ 软（质量评判）分级。最后一次重排只有硬违规才让整单失败。"""
+
+    def test_missing_fields_are_hard(self):
+        beat = _milestone_beat()
+        beat.pop('completion_extent')
+        errors = pp.milestone_ladder_violations([beat])
+        self.assertTrue(pp.hard_milestone_violations(errors), errors)
+
+    def test_quality_only_violations_are_soft(self):
+        for label, overrides in (
+            ('cross-phase package', dict(package_operations=['demolition', 'painting'])),
+            ('too many grid cells', dict(
+                changed_grid_cells=['Grid A1', 'Grid B1', 'Grid C1', 'Grid D1'])),
+            ('weak wording', dict(
+                milestone_name='one small section begins to receive rafters',
+                completion_extent='one small section')),
+        ):
+            with self.subTest(label):
+                errors = pp.milestone_ladder_violations([_milestone_beat(**overrides)])
+                self.assertTrue(errors, f'{label} 本身仍要报出来')
+                self.assertEqual(
+                    pp.hard_milestone_violations(errors), [],
+                    f'{label} 只是质量问题，不该让整单硬失败：{errors}')
+
+    def test_clean_ladder_has_neither(self):
+        self.assertEqual(pp.milestone_ladder_violations([_milestone_beat()]), [])
+        self.assertEqual(pp.hard_milestone_violations([]), [])
 
 
 class TestMilestonePromptSkeleton(unittest.TestCase):

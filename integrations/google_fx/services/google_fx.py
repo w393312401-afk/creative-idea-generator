@@ -2,9 +2,25 @@
 """
 🎨 Google FX 服务 (Veo 视频生成 + Imagen/Nano Banana 图片批量生成) — L3 媒介编排层
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-职责: 取消检测、网络响应捕获、去重锁、以及视频/图片批量生成的三个顶层入口。
+职责: 取消检测、网络响应捕获、去重锁、以及图片批量生成的顶层入口。
 不含任何 DOM 操作或 FX 页面语义 —— 那些都在 google_fx_dom.py (L1) /
 google_fx_helpers.py (L2) 里；本文件只编排，不碰页面。
+
+📌 串行化归属（2026-08-01 厘清）—— 本文件的 _GOOGLE_FX_RUN_LOCK **不是**全局唯一
+   的串行点，别再照着"三个顶层入口都要过这把锁"去改：
+
+   - 有 SPARK 宿主时：真正的串行点是宿主的 FX 控制面队列
+     （server._fx_browser_slot / fx_control.FxControlPlane，max_concurrent 被
+     硬钳在 1，见 fx_control.LIMIT_SPEC）。frames 走 server.py 的
+     _fx_serial_lock_for、videos 走 _fx_browser_slot(task_id, 'videos')，
+     两条链因此已经互斥。队列层比这把裸 RLock 强的地方：可取消、有排队/执行
+     超时、状态落盘、控制台可见。
+   - 独立跑（无宿主、n8n 直连）时：browser_gate 未安装、队列不存在，
+     _GOOGLE_FX_RUN_LOCK 才是唯一兜底。
+
+   所以视频批量（google_fx_video.generate_videos_batch_google_fx，它自己的
+   docstring 写明是「SPARK 图生视频的唯一入口」）不经过本文件的锁是**正确**的，
+   不是漏网：它只在有宿主的场景下被调用，队列已经管住了。
 
 🔒 LOCKED 2026-03-25 — find_fx_config_button / check_fx_config / fix_fx_config
    的定义已整体搬至 services/google_fx_helpers.py (函数体逐字未改动)。
@@ -18,65 +34,32 @@ import copy
 import hashlib
 import json
 
-from ..config import MAX_WAIT_SECONDS, OUTPUT_DIR
-from ..models import VideoRequest, ImageBatchRequest
+from ..config import get_runtime_max_wait_seconds
+from ..models import ImageBatchRequest
 from ..utils.logger import log
 
 # L2 (取消检测，本文件自身的去重锁代码需要用到；正常的 L3→L2 向下依赖，不构成循环)
 from .google_fx_helpers import _check_cancelled
 
-
-# ── 已知有效模型名 (2026-05-05) ──────────────────────────────────────────────
-
-# ── 模型名简写 → 真实模型名 ────────────────────────────────────────────────
-
-
-# ── aria-controls 结尾值 → 比例 Tab (Radix UI 固定业务值, 2026-05-05) ────────────
-# ⚠️ 绝对不能用 id="radix-:rXX:" (每次刷新都变)，aria-controls 尾值由开发者定义不变
-
-# ── 视频子模式 aria-controls 尾值 (2026-05-05 新增) ────────────────────────────
-# 面板中 VIDEO 模式下的子 tab: 帧 (VIDEO_FRAMES) / 素材 (VIDEO_REFERENCES)
-_ARIA_CONTROLS_VIDEO_SUBMODE_MAP = {
-    "frames":          "VIDEO_FRAMES",
-    "帧":              "VIDEO_FRAMES",
-    "video_frames":    "VIDEO_FRAMES",
-    "references":      "VIDEO_REFERENCES",
-    "素材":            "VIDEO_REFERENCES",
-    "video_references":"VIDEO_REFERENCES",
-}
-
-# ── 视频时长 aria-controls 尾值 (2026-05-05 新增，2026-07-19 补 10s) ─────────
-# 面板中 VIDEO 模式下的时长选项: 4s / 6s / 8s / 10s（10s 仅 Omni Flash 模型提供，
-# Veo 系列模型面板不显示该 tab，_click_video_duration_tab 找不到会跳过并留痕警告）
-_VALID_VIDEO_DURATIONS = ["4", "6", "8", "10"]
-
-
-# ==============================================================================
-# 🔧 提取的模块级辅助函数 (原内部闭包，已提到模块级以支持独立测试/复用)
-# ==============================================================================
-
-
-# ==============================================================================
-# 🔧 Google FX 底部工具栏配置工具函数 (适配 UI 大改版)
-# ==============================================================================
-
-
-# ==============================================================================
-# 🖼️ 图生图：将已有 Flow 图片加为 Prompt 参考
-# ==============================================================================
+# 2026-08-01 清理：这里原有 _ARIA_CONTROLS_VIDEO_SUBMODE_MAP / _VALID_VIDEO_DURATIONS
+# 两个常量和 4 段空的注释标题（函数体搬去 helpers.py 后留下的壳）。两个常量在全 repo
+# 无引用——真正在用的同名口径在 google_fx_helpers.py 里，改这份不会有任何效果，
+# 留着只会让人改错地方。
 
 
 # ==============================================================================
 # 🎬 Google FX (Veo 3.1) 视频生成
 # ==============================================================================
-
-def _generate_video_google_fx(req: VideoRequest):
-    return _run_with_google_fx_dedupe("single_video", req, _generate_video_google_fx_unlocked)
-
-
-# ==============================================================================
-# 🎬 Google FX (Veo 3.1) 批量视频 — 多任务并行提交 & 统一监听
-# ==============================================================================
+# 这里曾有两个加锁/去重包装：_generate_video_google_fx（单条）与
+# _generate_videos_batch_google_fx（批量）。两个都已删除（2026-08-01），因为：
+#   1. 全 repo 零调用者。视频的真实入口是 SPARK →
+#      google_fx_video.generate_videos_batch_google_fx(reqs, on_progress, cancel_check)。
+#   2. 批量那个的签名已经和被包装函数对不上：_run_with_google_fx_dedupe 只往下传
+#      单个 req，on_progress / cancel_check 会被丢掉——真接上去反而会让进度上报
+#      和取消一起失效。它是 n8n VideoBatchRequest 端点时代的残留，而
+#      VideoBatchRequest 本身也已无人使用。
+#   3. 串行化本来就不归它管，见本文件顶部「串行化归属」。
+# 视频生成的实现仍在 google_fx_video.py，未改动。
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -166,6 +149,12 @@ def _run_with_google_fx_dedupe(label: str, req, fn):
 
     ⚠️ 命中缓存的返回值会被 _mark_deduped 打上 `deduped` 元数据。想彻底关掉这层
     缓存把 GOOGLE_FX_DEDUP_TTL_SECONDS 设为 0（控制台的运行配置里可以热调）。
+
+    entry["error"] 的约定（2026-08-01 补）：首个任务失败时**必须**写它。此前两条
+    失败路径（抛异常 / 返回 status=failed）都只 pop key 不写 error，而 error 字段
+    在全文件从未被赋值过——等待方于是醒来后 error/result 双 None，把 None 当结果
+    返回。上层 isinstance 守卫会把它降级成"未知错误"，真实失败原因丢失，
+    _classify_failure_for_switch 也因此拿到空串判成"无错误信息"、永不换号。
     """
     if _GOOGLE_FX_DEDUP_TTL_SECONDS <= 0:
         return _run_with_google_fx_lock(label, fn, req)
@@ -201,7 +190,9 @@ def _run_with_google_fx_dedupe(label: str, req, fn):
             log(f"♻️ 检测到重复 Google FX 请求，等待首个任务完成: {label} key={short_key}", "GoogleFX")
 
     if not owner:
-        wait_timeout = _GOOGLE_FX_RUN_LOCK_WAIT_SECONDS + MAX_WAIT_SECONDS + 60
+        # 现读等待上限：控制台调大「单张最长等待」后，重复请求的等待窗口要跟着放大，
+        # 否则先到的那个还在正常生成、后到的却先超时报错。
+        wait_timeout = _GOOGLE_FX_RUN_LOCK_WAIT_SECONDS + get_runtime_max_wait_seconds() + 60
         if not entry["event"].wait(timeout=wait_timeout):
             raise RuntimeError(f"Duplicate Google FX request wait timeout: {label} key={short_key}")
         if entry.get("error"):
@@ -213,6 +204,10 @@ def _run_with_google_fx_dedupe(label: str, req, fn):
         result = _run_with_google_fx_lock(label, fn, req)
         with _GOOGLE_FX_DEDUP_LOCK:
             if isinstance(result, dict) and result.get("status") == "failed":
+                # 失败结果不进缓存（同指纹的下一次请求必须真的重跑），但**必须**把失败
+                # 原因写进 entry：等待方持有的是同一个 entry 对象，只 pop 不写 error 的话
+                # 它醒来时 error/result 双 None，于是把 None 当成结果返给上层。
+                entry["error"] = result.get("message") or f"Google FX 请求失败: {label}"
                 _GOOGLE_FX_INFLIGHT_REQUESTS.pop(key, None)
             else:
                 entry["result"] = copy.deepcopy(result)
@@ -220,19 +215,17 @@ def _run_with_google_fx_dedupe(label: str, req, fn):
         return result
     except Exception as e:
         with _GOOGLE_FX_DEDUP_LOCK:
+            entry["error"] = str(e) or type(e).__name__
             _GOOGLE_FX_INFLIGHT_REQUESTS.pop(key, None)
         raise
     finally:
         entry["event"].set()
 
 
-def _generate_videos_batch_google_fx(req):
-    return _run_with_google_fx_dedupe("video_batch", req, _generate_videos_batch_google_fx_unlocked)
-
-
 # ==============================================================================
 # 🖼️ Google FX (Nano Banana 系列) 图片批量生成
 # ==============================================================================
+# 本文件仅剩这一个真实入口（frame_generator._fx_generate_batch 调用它）。
 
 def _generate_images_batch_google_fx(req: ImageBatchRequest):
     return _run_with_google_fx_dedupe("image_batch", req, _generate_images_batch_google_fx_unlocked)
@@ -241,11 +234,8 @@ def _generate_images_batch_google_fx(req: ImageBatchRequest):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 📦 子模块入口向下兼容路由 (Route and Re-export)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-from .google_fx_video import (
-    _generate_video_google_fx_unlocked,
-    _generate_videos_batch_google_fx_unlocked,
-)
+# google_fx_video 的两个 _unlocked 别名不再从这里 re-export：它们此前只被上面那两个
+# 已删除的包装用到，视频链的调用方一直是直接 import google_fx_video。
 
 from .google_fx_image import (
     _generate_images_batch_google_fx_unlocked,

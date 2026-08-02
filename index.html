@@ -316,8 +316,8 @@
                                     <label class="pacing-skeleton-option">
                                         <input type="checkbox" name="pacing-skeleton" value="nested_space_payoff" checked>
                                         <span class="pacing-skeleton-copy">
-                                            <strong>双空间重置兑现</strong>
-                                            <small>埋地校车案例 · 首帧是空场地 → 第一拍吊车/平板车把人工运输载体（集装箱/校车/大巴/机身）运到现场落位 → 掩埋与入口钩子 → 主空间分层施工兑现 → 硬切第二毛坯空间 → 重复材料层级 → 软装加速 → 无人成片</small>
+                                            <strong>双空间一比一复刻</strong>
+                                            <small>73.5 秒埋地校车原片 · 空基坑 → 吊装载体落位 → 覆土铺草 → 木质入口井/楼梯 → 过门进入原始主空间 → 拆空 → 防潮膜 → 地面龙骨 → 保温 → 木地板 → 墙顶龙骨/保温/封板/饰面 → 厨房家具小完工 → 打开尽头门并硬切第二毛坯空间 → 原样重复基层/膜/龙骨/保温/封板/饰面 → 核心家具 → 软装灯光加速 → 人物退出后的无人大广角。先复制施工顺序，再发散载体、环境、功能与风格。</small>
                                         </span>
                                     </label>
                                 </div>
@@ -410,6 +410,20 @@
                                             <option value="fixed">固定 · 严格按所选拍数</option>
                                         </select>
                                     </label>
+                                </div>
+                                <!-- 提示词链路：做哪个视频模型的提示词，就读哪个技能包、走哪套
+                                     镜头语法（base=Veo 单镜延时 / omni=Gemini Omni 多镜头组接）。
+                                     排在 LLM 模型之前是刻意的——链路决定"写成什么样"，模型只决定
+                                     "谁来写"，前者是更上位的选择。auto 停在跟随视频模型下拉框。 -->
+                                <div class="ideation-model-picker picker-collapsed" id="ideation-skill-profile-picker">
+                                    <div class="model-picker-head">
+                                        <span class="model-picker-label">提示词链路</span>
+                                        <span id="ideation-skill-profile-active-hint" class="model-active-hint"></span>
+                                        <button type="button" id="ideation-skill-profile-toggle" class="model-picker-toggle" aria-expanded="false" aria-controls="ideation-skill-profile-groups" title="展开链路选择">
+                                            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                                        </button>
+                                    </div>
+                                    <div id="ideation-skill-profile-groups" class="model-family-groups"></div>
                                 </div>
                                 <!-- picker-collapsed 只在手机窄屏起作用；在细调条里它已经是
                                      二级展开内容，芯片组常驻铺开（见 dimension-minimal.css）。 -->
@@ -740,7 +754,11 @@
                                         <input type="number" id="frames-debug-count" min="1" max="99" value="3" disabled>
                                         <span>帧</span>
                                     </div>
-                                    <button id="run-sequence-review-btn" class="action-btn text-btn mini-btn" title="整套序列渲染完成后，手动检查跨帧施工顺序/空间一致性（不会自动运行，也不会阻塞视频生成）">🔍 一致性审查</button>
+                                    <button id="run-sequence-review-btn" class="action-btn text-btn mini-btn" title="整套序列渲染完成后，手动检查跨帧施工顺序/空间一致性（不会自动运行，也不会阻塞视频生成）。增量：帧图自上次审查后没变的拍直接沿用结论，只重审变过的那几拍">🔍 一致性审查</button>
+                                    <!-- 全量重审：跨帧层是按窗口切的，某一帧的改动理论上可能影响别的
+                                         窗口里的判断；增量只重跑覆盖失效拍的那几个窗口，这个入口留给
+                                         "想让整链重新互相比一遍"的时候。 -->
+                                    <button id="run-full-sequence-review-btn" class="action-btn text-btn mini-btn secondary" title="不复用任何既有结论，把每一拍与跨帧层整个重审一遍（慢、调用多；一般用增量的那个按钮就够）">🔁 全量重审</button>
                                     <!-- 删除整拍时服务端会落一份完整快照；删除后的一次性「撤销」
                                          在 toast 上（30 秒），过了窗口从这里恢复。见
                                          docs/spark_result_slots_plan.md 与 /api/restore_slot -->
@@ -786,6 +804,9 @@
                                             <button type="button" class="slot-filter-btn" data-filter="missing">未生成</button>
                                         </span>
                                         <button type="button" class="slot-jump-btn" title="滚到第一个有问题的槽位" hidden>⚠ 跳到第一个问题</button>
+                                        <!-- 一键全部修复：把所有画着「修复此帧问题」的格子（一致性审查未过
+                                             或人工标记）按帧号依次走一遍定向修复。没有待修帧时自动隐藏。 -->
+                                        <button type="button" class="slot-fix-all-btn" title="按帧号依次修复所有带待修问题的帧（一致性审查未过 + 人工标记）：逐帧优化提示词后图生图重渲，并对着新画面复核" hidden>🛠 全部修复</button>
                                         <button type="button" class="slot-merge-btn" aria-pressed="false" title="一拍一列：第 N 列＝第 N 拍，上行 IMG N、下行 VID N，一眼看出哪一段接不上">◧ 合并视图</button>
                                         <span class="slot-bulk" hidden>
                                             <button type="button" class="action-btn text-btn mini-btn" data-bulk="retry">重试所选</button>
@@ -1450,15 +1471,14 @@
                         <div class="form-group settings-field" id="fx-video-duration-group" style="display: none;">
                             <label for="settings-fx-video-duration">Omni Flash 视频时长</label>
                             <select id="settings-fx-video-duration">
-                                <option value="" selected>不指定（沿用 Flow 面板当前时长）</option>
-                                <option value="4">4s</option>
-                                <option value="6">6s</option>
-                                <option value="8">8s</option>
-                                <option value="10">10s</option>
+                                <option value="4">4s（三镜：远景/中景/结果远景）</option>
+                                <option value="6">6s（四镜：+近景）</option>
+                                <option value="8">8s（五镜：+全景）</option>
+                                <option value="10" selected>10s（六镜：+特写）</option>
                             </select>
-                            <small class="settings-hint">仅 Omni Flash 模型面板提供该时长切换；Veo 系列时长固定，切到 Veo 模型时本项自动隐藏且不生效</small>
+                            <small class="settings-hint">仅 Omni Flash 模型面板提供该时长切换；Veo 系列时长固定，切到 Veo 模型时本项自动隐藏且不生效。Omni 提示词按这个时长排镜头切点时间线，短片长会按镜头梯自动裁镜头（远景/中景/结果远景三镜任何长度下都保留）</small>
                         </div>
-                        <p class="settings-inline-note">模型选择已移至使用现场：LLM 模型在激发按钮上方切换，生图模型在帧序列卡片右上角切换，改动即存。</p>
+                        <p class="settings-inline-note">模型选择已移至使用现场：LLM 模型在激发按钮上方切换，生图模型在帧序列卡片右上角切换，改动即存。<b>提示词链路</b>（Veo 单镜延时 / Omni 多镜头）也在激发按钮上方切换，默认「自动」跟随此处的 FX 视频模型。</p>
                     </section>
 
                     <!-- ② 生图参数 -->
@@ -1511,6 +1531,11 @@
                             <div class="account-pool-bulk-row">
                                 <button type="button" id="account-pool-import-all-btn" class="ledger-tool-btn"
                                         title="把本机 AdsPower 里所有浏览器环境一次性加进号池，已在池子里的跳过（不覆盖已改过的命名/备注）">📥 一键添加全部 AdsPower 环境</button>
+                                <button type="button" id="account-pool-export-btn" class="ledger-tool-btn"
+                                        title="导出当前号池配置及状态（可选是否包含明文凭据与 2FA 密钥）">📤 导出号池配置</button>
+                                <button type="button" id="account-pool-import-btn" class="ledger-tool-btn"
+                                        title="从 JSON 配置文件导入号池配置">📥 导入号池配置</button>
+                                <input type="file" id="account-pool-import-file-input" accept=".json" style="display:none;">
                                 <small>命名默认用环境的邮箱地址，加完可逐个禁用不想用的。</small>
                             </div>
                             <div class="account-pool-add-row">

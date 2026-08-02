@@ -184,12 +184,45 @@ class TestDeliveredCarrierAnchor(unittest.TestCase):
         packet_system = self._system_containing('spatial consistency supervisor')
         self.assertIn('DELIVERED-CARRIER ANCHOR RULE', packet_system)
         self.assertIn('NEVER register the carrier itself', packet_system)
+        self.assertIn('OPENING SUBJECT SCALE LOCK', packet_system)
+        self.assertIn('never an ultra-wide, aerial, high-angle, or distant panorama', packet_system)
+        self.assertIn('MOUNTAIN-AND-WATER SCENE LOCK', packet_system)
+        self.assertIn('BOTH the registered mountain landform and the registered natural water body',
+                      packet_system)
+        self.assertIn('Keep the footprint safely above the waterline', packet_system)
+
+    def test_empty_anchor_reserves_a_large_central_footprint(self):
+        """首帧虽然还没有载体，也不能拍成大景观里的一小块空地；否则同机位落位后的
+        载体必然还是远处小物体。"""
+        self._run()
+        img1_system = self._system_containing('the very first IMAGE prompt')
+        self.assertIn('OPENING SCALE LOCK', img1_system)
+        self.assertIn('footprint fills the central majority', img1_system)
+        self.assertIn('roughly two-thirds of the frame', img1_system)
+        self.assertIn('MOUNTAIN AND WATER LOCK', img1_system)
+        self.assertIn('both a real mountain or steep mountain ridge', img1_system)
+        self.assertIn('a real river, lake, stream, reservoir, fjord, or sheltered coastal inlet',
+                      img1_system)
+        self.assertIn('secondary framing layers around the large central footprint', img1_system)
 
     def test_beat_one_is_stamped_as_the_carrier_delivery(self):
         state = self._run()
         self.assertTrue(state['beat_ladder'][0].get('carrier_delivery'))
         self.assertFalse(any(b.get('carrier_delivery') for b in state['beat_ladder'][1:]))
         self.assertTrue(pp.carrier_arrives_on_camera(state['parsed_brief']))
+
+    def test_fifteen_slot_budget_uses_the_container_creative_reference_form(self):
+        """14 个施工节拍 + 1 个 reward 时，规划器要逐槽参考当前成功集装箱创意，
+        不能只拿一句笼统的“双空间”让模型自由分配阶段。"""
+        self.dimensions['beats_count'] = 14
+        self._ladder = _ladder_json(total=15, bridge_at=3, cut_at=10)
+        self._run()
+        beat_system = self._system_containing('construction planner')
+        self.assertIn('CANONICAL 15-SLOT REFERENCE FORM', beat_system)
+        self.assertIn('Beat 1 carrier delivery/landing', beat_system)
+        self.assertIn('Beat 9 primary core furniture and function-complete mini-payoff', beat_system)
+        self.assertIn('Beat 10 declared reset into the untouched secondary space', beat_system)
+        self.assertIn('Beat 15 worker exit and sole final reward', beat_system)
 
     def test_other_skeletons_keep_the_carrier_in_the_anchor_frame(self):
         self.dimensions['pacing_skeleton'] = 'linear_milestone'

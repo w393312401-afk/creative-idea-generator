@@ -13,8 +13,9 @@ from server_common import (
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
     ACTIVE_TASKS_LOCK, ACTIVE_TASKS, get_or_create_task,
     notify_listeners, save_tasks_to_disk,
-    apply_google_fx_runtime_overrides,
+    apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
     read_manifest, write_manifest, strict_gates_enabled, qa_gate_level,
+    resolve_video_duration,
     stamp_manifest_capabilities,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
     _get_account_pool_service, _select_pool_account,
@@ -76,13 +77,34 @@ def _load_gray_thumb(path, size=(64, 114)):
 # 阈值留了余量：<3 判"将无变化"、>35 判"疑似空间断裂"。纯本地计算，零 LLM 成本。
 _PAIR_TOO_SIMILAR_MAD = 3.0
 _PAIR_TOO_DIFFERENT_MAD = 35.0
+# 2026-07-31：22~35 这一带此前静默通过——够不上"疑似空间断裂"，却已经超出 8 秒 i2v
+# 能连续插值的跨度。实测这一带的片段全都是"匀速推进→停滞→突进补足"的形态：模型
+# 交不出连续过程，只能停一会儿再跳一步把差量补齐，观感就是推进过程中的跳变。
+# 与 prompt_pipeline 的拍重门禁（rhythm_ladder_violations）分工：那道门看的是 ladder
+# **声明**的变化量（工序数/格位/层族），是估算；这里看的是两张**已渲染**帧之间的
+# 实测差量，是地面真相。声明得再规矩，帧渲出来跨度过大照样会跳。
+_PAIR_TOO_WIDE_MAD = 22.0
+# i2v 模型的单段基准输出时长。prompt_pipeline.VIDEO_DURATION 是同一个数的权威来源，
+# 但这里不 import：video_generator 与 prompt_pipeline 互相引用，模块级 import 会成环
+# （现有的 run_video_process_check 也是在函数体内延迟导入的）。只用于文案。
+_CLIP_BASE_SECONDS = 8.0
+# 运镜拍标签：这些拍的锚点跨度由镜头位移决定，不受"施工增量"类判据管辖。
+_CAMERA_MOVE_META = ('HERO', 'BRIDGE', 'CUT')
+
+
+def _is_camera_move_slot(meta):
+    """槽位 meta 是否属于运镜拍（[HERO]/[BRIDGE]/[BRIDGE TURN]/[CUT]）。"""
+    upper = str(meta or '').upper()
+    return any(tag in upper for tag in _CAMERA_MOVE_META)
 
 
 def frame_pair_contract(start_frame_path, end_frame_path):
     """i2v 提交前对首尾锚点帧做本地相似度双向检查。
 
-    返回 (verdict, mad)，verdict ∈ 'ok' | 'too_similar' | 'too_different' | 'skipped'
-    （环境异常/文件缺失时 'skipped'，不拦截——这只是提示性契约，硬拦截由质量门负责）。"""
+    返回 (verdict, mad)，verdict ∈ 'ok' | 'too_similar' | 'too_wide' | 'too_different'
+    | 'skipped'（环境异常/文件缺失时 'skipped'，不拦截——这只是提示性契约，硬拦截由
+    质量门负责）。'too_wide' 介于 ok 与 too_different 之间：空间没断，但一段 8 秒
+    片段承载不下这个差量，需要在两帧之间补一张中间帧把这一拍拆成两拍。"""
     try:
         if not (start_frame_path and end_frame_path
                 and os.path.exists(start_frame_path) and os.path.exists(end_frame_path)):
@@ -93,19 +115,25 @@ def frame_pair_contract(start_frame_path, end_frame_path):
             return 'too_similar', mad
         if mad > _PAIR_TOO_DIFFERENT_MAD:
             return 'too_different', mad
+        if mad > _PAIR_TOO_WIDE_MAD:
+            return 'too_wide', mad
         return 'ok', mad
     except Exception:
         return 'skipped', None
 
 
-def _extract_video_frame(video_path, out_png, position):
-    """position: 'first' | 'last'。返回 True 表示抽帧成功。"""
+def _extract_video_frame(video_path, out_png, position, sseof_offset=0.3):
+    """position: 'first' | 'last'。返回 True 表示抽帧成功。
+
+    sseof_offset 是 'last' 的取帧窗口（从片尾往回数的秒数），取窗口内的**第一**帧。
+    默认 0.3 秒是锚点校验/冻结检测标定过的口径，不要改；节奏采样要的是真正的末帧，
+    自己传更小的偏移（见 clip_step_profile）。"""
     if position == 'first':
         cmd = ["ffmpeg", "-y", "-v", "error", "-i", video_path,
                "-frames:v", "1", out_png]
     else:
-        cmd = ["ffmpeg", "-y", "-v", "error", "-sseof", "-0.3", "-i", video_path,
-               "-frames:v", "1", "-update", "1", out_png]
+        cmd = ["ffmpeg", "-y", "-v", "error", "-sseof", f"-{sseof_offset:.3f}",
+               "-i", video_path, "-frames:v", "1", "-update", "1", out_png]
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, encoding='utf-8', errors='replace', timeout=60)
@@ -211,29 +239,206 @@ def detect_frozen_clip(video_path, mid_frame_paths, tmp_dir):
         return False, f'skipped:{type(e).__name__}'
 
 
-# 2026-07-22：用户明确要求视频阶段暂停这道内容复审——画面走向在帧序列阶段已经定稿，
-# 视频只管生成，不应该因为这道门的误判（如第9槽把地毯消失误判为"空心片段"）被删片
-# 重来。改回 False 即可恢复 qa_gate_level 档位映射（standard 拒收/lenient 警告/off 跳过）。
-_VIDEO_PROCESS_GATE_DISABLED = True
+# ── 段内推进节奏检测（2026-07-31 "视频推进跳变"复盘）─────────────────────────
+# detect_frozen_clip 判的是「整段冻住」（max 相邻 MAD < 3），而实测下来真正让人看到
+# 跳变的不是冻结，是**速度不匀**：片段先匀速推进、中途停滞 1 秒左右、再突进一步把
+# 差量补齐。那种片段的 max MAD 有 20+，冻结检测一路放行。
+#
+# 判据（16 步等距抽样，纯本地、零 LLM 成本、确定性）：
+#   S1 停滞：≥2 个**连续**步长 < 0.35×中位步长 —— 推进中途停住了
+#   S2 突进：峰值步长 ≥ 3.0×中位步长        —— 差量被压在一个窗口里补完
+# 任一命中即判「推进不匀」。两条都用中位数做基准而不是绝对阈值：片段之间的总变化量
+# 本来就差好几倍（实测 8~101），绝对阈值只会把大变化量的片段全部误报。
+#
+# 首末各 2 步（片头/片尾各 12.5%）不参与停滞判定：Out-and-In 契约要求工人退场后画面
+# 静置成干净的交接帧，片尾本来就该停下来；片头是**同一条接缝的另一端**——i2v 起步时
+# 会先保持一小段输入锚点帧再开始动，这段静置同样是设计内的。
+# 2026-08-01 复盘：此前只豁免了片尾，于是片头静置被系统性地判成停滞——实测 36 个片段
+# 里 5 次 S1 命中有 4 次落在 stall_at==0（片头第一格）。短片更严重：同一条片子裁到 4 秒
+# 时片头连续 5 个采样步低于停滞线、6 秒时 3 个（片头静置的绝对时长不变，格子却变短了）。
+_PACE_SAMPLES = 17            # 采样帧数（= 16 个步长），8 秒片段约 0.5 秒一格
+_PACE_STALL_RATIO = 0.35      # 低于中位步长这个比例即算一个停滞步
+_PACE_STALL_RUN = 2           # 连续停滞步达到这个数才判 S1
+_PACE_HEAD_EXEMPT = 2         # 片头豁免的步数（起步静置），与片尾对称
+_PACE_TAIL_EXEMPT = 2         # 末尾豁免的步数（收尾静置）
+_PACE_PEAK_RATIO = 3.0        # 峰值/中位步长达到这个倍数即判 S2
 
 
-def check_video_process(config, video_path, start_frame, end_frame, prompt):
+def clip_step_profile(video_path, tmp_dir, samples=_PACE_SAMPLES):
+    """等距抽样求片段的「推进速度曲线」。
+
+    返回 (steps, duration, error)：steps 是 samples-1 个相邻采样帧的 MAD（numpy 数组），
+    error 为 None 表示成功；失败时返回 (None, 0.0, 'skipped:...')。节奏检测与合并侧的
+    时间重映射共用这一份测量，避免同一条片子被抽两遍帧。"""
+    try:
+        import numpy as np
+        params = _ffprobe_video_params(video_path)
+        duration = (params or {}).get('duration') or 0.0
+        if duration <= 0:
+            return None, 0.0, 'skipped:no_duration'
+        # 末样本必须落在**最后一帧**上。其余 16 个采样点都在 duration/(samples-1) 的
+        # 等距网格上，而 _extract_video_frame 默认的 0.3 秒回退窗口与网格无关：8 秒片
+        # 的网格步是 0.5 秒，末样本却落在 7.7 秒（第 15 个采样点在 7.5 秒），末步实测
+        # 只跨 0.2 秒——被系统性压低，污染中位步长和 steps.sum()（后者是重映射的归一化
+        # 分母）。4 秒片直接出错：网格步 0.25 秒，0.3 秒偏移落到第 15 个采样点**之前**
+        # （3.700 < 3.750），末步测的是一段倒着的区间（实测 -0.05 秒）。
+        # 改成按帧率留两帧余量：窗口里稳定有帧可取，落点即片尾最后一两帧。
+        fps = (params or {}).get('fps') or 0
+        tail_off = min(0.3, 2.0 / fps) if fps > 0 else 0.3
+        grays = []
+        for i in range(samples):
+            png = os.path.join(tmp_dir, f'pace_{i}.png')
+            if i == samples - 1:
+                # 末帧走 -sseof 的专用抽帧：按时间戳定位 duration 附近会落到最后一个
+                # 有效帧之后（24fps 下最后一帧在 duration-0.042），抽不出任何东西。
+                ok = _extract_video_frame(video_path, png, 'last', sseof_offset=tail_off)
+            else:
+                t = duration * i / (samples - 1)
+                res = subprocess.run(
+                    ["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.3f}", "-i", video_path,
+                     "-frames:v", "1", png],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding='utf-8', errors='replace', timeout=60)
+                ok = (res.returncode == 0 and os.path.exists(png)
+                      and os.path.getsize(png) > 0)
+            if not ok:
+                return None, 0.0, f'skipped:sample_{i}_failed'
+            grays.append(_load_gray_thumb(png))
+        steps = np.array([float(np.abs(grays[i + 1] - grays[i]).mean())
+                          for i in range(len(grays) - 1)])
+        return steps, duration, None
+    except Exception as e:
+        return None, 0.0, f'skipped:{type(e).__name__}'
+
+
+def pace_verdict(steps, duration):
+    """由速度曲线判「推进是否不匀」。返回 (broken: bool, reason: str)。
+
+    与 detect_pace_break 分开是因为合并侧的时间重映射也要这个判定，且必须与检测侧
+    **同一套判据**：重映射只对判定为跳变的片段动手，本来就匀的片子一律不碰——
+    实测过"无差别重映射"会把个别本来通过的片子拉出新的停滞窗口，得不偿失。"""
+    try:
+        import numpy as np
+        seconds_per_step = duration / len(steps)
+
+        # S0 全程冻结：绝对判据，必须在相对判据之前。冻结片段的每一步都接近 0，
+        # 中位数也接近 0，相对判据（步长/中位数）会算出"完美匀速"把它放行——
+        # detect_frozen_clip 用的就是这条绝对阈值，这里沿用同一个常数。
+        if float(steps.max()) < _FROZEN_CLIP_MAD:
+            return True, (f'本地节奏检测：整段几乎无变化（峰值步长 {steps.max():.2f} < '
+                          f'{_FROZEN_CLIP_MAD}）—— i2v 没有可执行的动作，产出了静止片段。')
+
+        median = float(np.median(steps))
+        if median <= 0:
+            # 大半程冻死、只在个别窗口跳一下：中位数为 0，比值判据除不了。
+            return True, ('本地节奏检测：过半采样步完全静止，全部变化压在个别窗口里完成 '
+                          f'—— 观感是定格后的跳变。峰值步长={steps.max():.2f}')
+        peak_ratio = float(steps.max()) / median
+        detail = (f'中位步长={median:.2f} 峰值={steps.max():.2f} '
+                  f'峰值/中位={peak_ratio:.1f}x')
+
+        # S1 停滞：连续低于中位步长 35% **且**绝对变化量也确实小的步数（不含首尾豁免区）。
+        # 两个条件缺一不可。只用相对判据时，一条整体很"猛"的片子里 MAD 3.3 的一步会被
+        # 判成停滞——可它在绝对量上仍在正常推进。绝对下限沿用冻结检测的同一个常数：
+        # 低于它才叫"没在动"。这条也让判据在时间重映射前后可比：重映射会抬高中位步长，
+        # 纯相对判据会因此在一条**变得更匀**的片子上凭空报出停滞。
+        stall_cut = min(_PACE_STALL_RATIO * median, _FROZEN_CLIP_MAD)
+        body = steps[_PACE_HEAD_EXEMPT:max(0, len(steps) - _PACE_TAIL_EXEMPT)]
+        longest_run = run = 0
+        stall_at = None
+        for i, value in enumerate(body):
+            if value < stall_cut:
+                run += 1
+                if run > longest_run:
+                    longest_run, stall_at = run, i - run + 1
+            else:
+                run = 0
+
+        if longest_run >= _PACE_STALL_RUN:
+            # stall_at 是 body 内的下标，报秒数要加回片头豁免的偏移
+            start_s = (stall_at + _PACE_HEAD_EXEMPT) * seconds_per_step
+            return True, (
+                f'本地节奏检测：推进在第 {start_s:.1f}~{start_s + longest_run * seconds_per_step:.1f} 秒'
+                f'停滞（连续 {longest_run} 个采样步低于中位步长的 {_PACE_STALL_RATIO:.0%}），'
+                f'差量被压到后面补完 —— 观感是推进过程中的跳变。{detail}')
+        if peak_ratio >= _PACE_PEAK_RATIO:
+            peak_s = int(steps.argmax()) * seconds_per_step
+            return True, (
+                f'本地节奏检测：第 {peak_s:.1f} 秒处有一次突进（该步变化量是中位步长的 '
+                f'{peak_ratio:.1f} 倍，阈值 {_PACE_PEAK_RATIO:.1f}），推进速度严重不匀 —— '
+                f'观感是推进过程中的跳变。{detail}')
+        return False, f'pace_ok:{detail}'
+    except Exception as e:
+        return False, f'skipped:{type(e).__name__}'
+
+
+def detect_pace_break(video_path, tmp_dir):
+    """本地推进节奏检测：抽样 + 判定。返回 (broken: bool, reason: str)。
+
+    抽帧/环境异常一律返回 (False, 'skipped:...') —— 与 detect_frozen_clip 同款
+    fail-open 语义，这是提示性判据，不该因为环境退化去拦截生成。"""
+    steps, duration, error = clip_step_profile(video_path, tmp_dir)
+    if error:
+        return False, error
+    return pace_verdict(steps, duration)
+
+
+# 2026-08-02：恢复视频 VLM 内容复审。仍可通过 config.videoProcessVlmReview=false
+# 针对单次任务关闭；qaGateLevel=off 继续作为整套质检的总开关。
+#
+# 2026-07-31 补充：这个开关此前在 check_video_process 的函数首行 return，把本地的
+# detect_frozen_clip 也一起关掉了——那是纯本地、确定性、零成本的判据，没有误判风险，
+# 属于误伤。用户当初反对的是 **VLM 误判导致删片重来**，不是反对知情。现在本地判据
+# （冻结 + 推进节奏）恒定运行且**最高只到 warn 永不 reject**，被这个开关关掉的仅剩
+# VLM 那一段。
+_VIDEO_PROCESS_GATE_DISABLED = False
+
+
+def _video_process_vlm_enabled(config):
+    value = (config or {}).get('videoProcessVlmReview', True)
+    if isinstance(value, str):
+        value = value.strip().lower() not in ('0', 'false', 'no', 'off')
+    return bool(value) and not _VIDEO_PROCESS_GATE_DISABLED
+
+
+def check_video_process(config, video_path, start_frame, end_frame, prompt, meta=''):
     """段内过程门：verify_video_anchors 只钉住首尾两端，段内 8 秒是盲区（空心视频/
-    幽灵内容的来源）。这里抽出中段帧交给 VLM（prompt_pipeline.run_video_process_check）
-    判定"两锚点之间是否真的发生了描述的施工过程"，并把判定映射为动作：
+    幽灵内容 / 推进跳变的来源）。分两段：
+
+    A. **本地判据**（冻结 + 推进节奏）——确定性、零 LLM 成本、恒定运行，
+       **最高只到 'warn'，永不 'reject'**。这一段不受 _VIDEO_PROCESS_GATE_DISABLED
+       管辖：那个开关关的是 VLM 复审的误判风险，不该连带把免费的客观测量一起关掉。
+    B. **VLM 复审**（prompt_pipeline.run_video_process_check）——判"两锚点之间是否
+       真的发生了描述的施工过程"，按档位映射拒收/告警；可由
+       videoProcessVlmReview=false 对单次任务显式关闭。
+
+    运镜拍（[HERO]/[BRIDGE]/[CUT]）跳过节奏判据：它们的速度曲线由镜头调度决定，
+    推进/缓入缓出都是设计内的，用施工推进的匀速标准去量必然误报。
 
     返回 (action, reason)，action ∈：
       'accept' —— 通过 / off 档跳过 / 环境·判定服务异常 fail-open 放行（reason 留痕）
-      'warn'   —— lenient 档下检出硬伤：不拒收（重试要再烧一整段视频额度，宽松档
-                   保留成片交用户决策），发 video_warning + manifest 留痕
-      'reject' —— standard 档检出硬伤，或 strictGates 开启时环境/判定异常：删片重试
+      'warn'   —— 检出本地硬伤，或 lenient 档下 VLM 检出硬伤：不拒收（重试要再烧
+                   一整段视频额度），发 video_warning + manifest 留痕
+      'reject' —— standard 档 VLM 检出硬伤，或 strictGates 开启时环境/判定异常
     """
-    if _VIDEO_PROCESS_GATE_DISABLED:
-        return 'accept', 'Skipped (视频段内过程复审已按用户要求暂停 2026-07-22)'
     level = qa_gate_level(config)
     if level == 'off':
         return 'accept', 'Skipped (qaGateLevel=off: 质检门已关闭)'
+
     with tempfile.TemporaryDirectory() as td:
+        # ── A. 本地判据（恒定运行，只告警）──
+        if _is_camera_move_slot(meta):
+            pace_reason = 'skipped:camera_move_slot（运镜拍不适用施工推进的匀速判据）'
+        else:
+            broken, pace_reason = detect_pace_break(video_path, td)
+            if broken:
+                return 'warn', pace_reason
+
+        if not _video_process_vlm_enabled(config):
+            return 'accept', ('Skipped VLM 复审 (videoProcessVlmReview=false)；'
+                              f'本地节奏检测: {pace_reason}')
+
+        # ── B. VLM 复审 ──
         mids = _extract_video_mid_frames(video_path, td)
         if not mids:
             if strict_gates_enabled(config):
@@ -414,6 +619,26 @@ def _is_legacy_hard_cut_placeholder(body):
     return str(body or '').strip().upper().startswith(_LEGACY_HARD_CUT_PLACEHOLDER_PREFIX)
 
 
+def _is_declared_editorial_cut(body, meta=''):
+    """识别真正的剪辑硬切，而不是 ``[CUT]`` 标签下的推门过门镜头。
+
+    ``CUT`` 仍可表示一段真实的跨越运镜；只有正文明确声明 editorial/hard cut，
+    并同时否定插值/过渡画面时，才应跳过 I2V、交给合并器直接拼接相邻片段。
+    """
+    if 'CUT' not in str(meta or '').upper():
+        return False
+    text = ' '.join(str(body or '').lower().split())
+    declares_cut = any(token in text for token in (
+        'intentional editorial cut', 'declared hard cut', 'hard cut',
+        '直接硬切', '编辑硬切', '剪辑硬切', '直切',
+    ))
+    forbids_interpolation = any(token in text for token in (
+        'not an interpolated transformation', 'no generated in-between',
+        'no morphing', 'no camera travel', '不做插值', '禁止插值', '不生成过渡',
+    ))
+    return declares_cut and forbids_interpolation
+
+
 def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, target_slots=None,
                       strict=False, verify_fn=None, gate_level='standard', stale_slots=None,
                       drift_slots=None, override_flagged=False):
@@ -459,6 +684,7 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
         meta = str(item.get('meta', '') if isinstance(item, dict) else '').upper()
         # 旧单的硬切占位声明按原始正文识别（改写 IMAGE 编号之前），见下方 skip_cut 分支。
         is_legacy_cut_placeholder = _is_legacy_hard_cut_placeholder(prompt)
+        is_editorial_cut = _is_declared_editorial_cut(prompt, meta)
         # 英雄展示视频（[HERO]，默认收尾步骤）：唯一来源锚点是帧序列最后一张整体
         # 完工图，没有独立的"下一张"结束帧可绑定——只上传首帧，走单图生视频
         # （见 prompt_pipeline._compose_hero_showcase_video），不设结束锚点。
@@ -494,9 +720,10 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
         # （prompt_pipeline.HARD_CUT_VIDEO_PLACEHOLDER，开头即 'DECLARED HARD CUT'），
         # 拿这段声明去送 i2v 只会得到一段照读声明的废片。按正文识别而不是按 [CUT] 标签
         # 识别——标签在新单里保留着别的用途（帧渲染的 t2i 新链头、族锚、审查豁免）。
-        if is_legacy_cut_placeholder:
+        if is_legacy_cut_placeholder or is_editorial_cut:
             plan['action'] = 'skip_cut'
-            plan['reason'] = f"视频 {slot} 是旧单的硬切占位槽位（[CUT] 占位声明）：不生成视频片段，成片在此处直接硬切。"
+            cut_kind = '声明式剪辑硬切' if is_editorial_cut else '旧单的硬切占位槽位'
+            plan['reason'] = f"视频 {slot} 是{cut_kind}：不提交 I2V，成片在此处直接硬切。"
             plans.append(plan)
             continue
 
@@ -602,6 +829,7 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
             # 结束锚点（end_p 为 None），frame_pair_contract 内部会自动跳过，
             # 不需要在这里额外特判。
             verdict, mad = frame_pair_contract(start_p, end_p)
+            plan['pair_contract'] = {'verdict': verdict, 'mad': mad}
             if verdict == 'too_similar':
                 warnings.append(
                     f"视频 {slot} 的首尾锚点帧近乎相同（MAD={mad:.1f}），i2v 大概率产出"
@@ -612,6 +840,23 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                     f"视频 {slot} 的首尾锚点帧差异过大（MAD={mad:.1f}），疑似空间断裂，"
                     f"i2v 只能冻结闪切或自造画面过渡——建议改为 [CUT] 硬切或重渲帧。"
                 )
+            elif verdict == 'too_wide' and not _is_camera_move_slot(meta):
+                # 运镜拍（[BRIDGE]/[CUT]/[HERO]）不报：它们的大跨度来自镜头位移本身，
+                # 是设计内的，补一张中间帧既无意义也无处可插。
+                warnings.append(
+                    f"视频 {slot} 的首尾锚点帧跨度偏大（MAD={mad:.1f}，连续插值上限约"
+                    f"{_PAIR_TOO_WIDE_MAD:.0f}），一段 {_CLIP_BASE_SECONDS:.0f} 秒 i2v 装不下这个差量，"
+                    f"大概率产出「推进→停滞→突进补足」的跳变片段——建议在 IMAGE {start_slot} 与 "
+                    f"IMAGE {slot + 1} 之间补一张中间帧，把这一拍拆成两拍。"
+                )
+                plan['split_recommendation'] = {
+                    'required': True,
+                    'between_images': [start_slot, slot + 1],
+                    'reason': 'anchor_span_too_wide',
+                    'suggested_midpoint': (
+                        f"在 IMAGE {start_slot} 与 IMAGE {slot + 1} 之间增加只完成约一半施工量的中间锚点"
+                    ),
+                }
             if warnings:
                 plan['warning'] = ' '.join(warnings)
         plans.append(plan)
@@ -644,6 +889,10 @@ def _video_info(plan, video_model, status, error=None):
         # 是哪一段的系数不对。
         'clip_speed': _clip_speed_from_meta(plan.get('meta', '')),
     }
+    if plan.get('pair_contract'):
+        info['pair_contract'] = plan['pair_contract']
+    if plan.get('split_recommendation'):
+        info['split_recommendation'] = plan['split_recommendation']
     if error:
         info['error'] = error
     return info
@@ -679,6 +928,38 @@ class _ManifestWriter:
             print(f"Warning: could not write updated manifest.json ({e})")
 
 
+def _adapt_prompt_after_anchor_rejection(prompt, reason):
+    """根据首/尾锚点偏差生成一次性的重试约束，避免原样盲重试。"""
+    text = str(prompt or '')
+    if 'ANCHOR_RETRY_ADAPTATION:' in text:
+        return text
+    values = {}
+    for key, raw in re.findall(r'\b(first|last)\s*=\s*([0-9.]+)', str(reason or ''), re.I):
+        try:
+            values[key.lower()] = float(raw)
+        except ValueError:
+            pass
+    first = values.get('first', 999.0)
+    last = values.get('last', 999.0)
+    if first <= 18 and last > 18:
+        guidance = (
+            'Preserve the opening composition, then reserve the final 20% of duration for a smooth '
+            'settle into the provided last-frame geometry. The final frame must match IMAGE 2 literally.'
+        )
+    elif last <= 18 and first > 18:
+        guidance = (
+            'Begin with a one-second locked hold matching IMAGE 1 literally before any action starts; '
+            'do not redesign, crop, relight, or move objects at the opening.'
+        )
+    else:
+        guidance = (
+            'Treat both supplied images as literal camera and layout constraints. Do not redesign, '
+            'reframe, crop, relight, or invent a third composition; distribute the transformation '
+            'uniformly and settle exactly on IMAGE 2.'
+        )
+    return f"{text.rstrip()}\n\nANCHOR_RETRY_ADAPTATION: {guidance}"
+
+
 class _BatchBridge:
     """把 google_fx_video 批量脚本的回调 (batch_idx, stage, details) 翻译成 SPARK
     进度事件并落盘 manifest。下载落盘后做锚点内容校验：视频首尾帧与该槽位锚点图
@@ -686,7 +967,8 @@ class _BatchBridge:
     标记失败进入重试轮。"""
 
     def __init__(self, pending, total, video_model, writer, on_progress, strict=False,
-                 process_check_fn=None, account_pool=None, pool_account_id=None):
+                 process_check_fn=None, account_pool=None, pool_account_id=None,
+                 allow_anchor_mismatch=False):
         self.pending = pending          # [{'plan':..., 'req':..., 'temp_out_dir':...}]
         self.total = total
         self.video_model = video_model
@@ -701,12 +983,23 @@ class _BatchBridge:
         # None），用于把"积分耗尽"的生成失败反馈给号池标记冷却。
         self.account_pool = account_pool
         self.pool_account_id = pool_account_id
+        # 只在调用方显式确认风险（override_flagged）时启用。默认路径仍会删除锚点
+        # 不匹配的视频；覆盖路径保留文件并留下结构化告警，供人工补片/硬切槽收尾。
+        self.allow_anchor_mismatch = allow_anchor_mismatch
         # 本次批次是否观测到"登录失效等待人工处理超时"——generate_video_sequence
         # 据此判断要不要自动切换号池账号重试剩余失败槽位。
         self.saw_login_required_timeout = False
         # 批量脚本在风控失败重试时自己换掉的号池账号（account_switched 事件）。
         # 批次跑完后并入 used_account_ids，免得补跑那一轮又挑回刚被判过的号。
         self.switched_accounts = []
+        self.stats = {
+            'submitted_requests': 0,
+            'downloaded_results': 0,
+            'accepted_results': 0,
+            'anchor_rejections': 0,
+            'process_rejections': 0,
+            'adaptive_retries': 0,
+        }
 
     def _emit(self, stage, payload):
         if self.on_progress:
@@ -755,7 +1048,13 @@ class _BatchBridge:
             self._emit('video_start', {
                 'index': plan['slot'], 'current': plan['seq'], 'total': self.total,
             })
+        elif stage == 'request_submitted':
+            self.stats['submitted_requests'] += 1
+            self._emit('request_submitted', {
+                'index': plan['slot'], 'current': plan['seq'], 'total': self.total,
+            })
         elif stage == 'video_done':
+            self.stats['downloaded_results'] += 1
             generated_path = (details or {}).get('video_url')
             if not (generated_path and os.path.exists(generated_path)):
                 self._fail(plan, '生成的视频文件不存在')
@@ -763,19 +1062,42 @@ class _BatchBridge:
             shutil.move(generated_path, plan['dest_path'])
             ok, reason = verify_video_anchors(plan['dest_path'], plan['start_frame'], plan['end_frame'], strict=self.strict)
             if not ok:
-                try:
-                    os.remove(plan['dest_path'])
-                except Exception:
-                    pass
-                self._fail(plan, (
-                    f"下载的视频内容与槽位 {plan['slot']} 的首尾锚点帧不符 (MAD {reason})，"
-                    f"疑似画布串片/错误下载，已拦截并删除。请重试该片段。"
-                ))
-                return 'rejected'  # 通知批量脚本该片段实际失败，可参与失败重试
+                if not self.allow_anchor_mismatch:
+                    self.stats['anchor_rejections'] += 1
+                    req = self.pending[batch_idx].get('req')
+                    if req is not None:
+                        adapted = _adapt_prompt_after_anchor_rejection(
+                            getattr(req, 'prompt', ''), reason)
+                        if adapted != getattr(req, 'prompt', ''):
+                            req.prompt = adapted
+                            plan['prompt'] = adapted
+                            self.stats['adaptive_retries'] += 1
+                            self._emit('video_retry_adapted', {
+                                'index': plan['slot'], 'current': plan['seq'],
+                                'total': self.total,
+                                'message': f"槽位 {plan['slot']} 已根据锚点偏差改写重试约束。",
+                            })
+                    try:
+                        os.remove(plan['dest_path'])
+                    except Exception:
+                        pass
+                    self._fail(plan, (
+                        f"下载的视频内容与槽位 {plan['slot']} 的首尾锚点帧不符 (MAD {reason})，"
+                        f"疑似画布串片/错误下载，已拦截并删除。请重试该片段。"
+                    ))
+                    return 'rejected'  # 通知批量脚本该片段实际失败，可参与失败重试
+                self._emit('video_warning', {
+                    'index': plan['slot'], 'current': plan['seq'], 'total': self.total,
+                    'message': (
+                        f"槽位 {plan['slot']} 锚点校验未通过 (MAD {reason})；"
+                        "已按显式风险覆盖保留该片段。"
+                    ),
+                })
             process_reason = None
             if self.process_check_fn is not None:
                 action, process_reason = self.process_check_fn(plan)
                 if action == 'reject':
+                    self.stats['process_rejections'] += 1
                     try:
                         os.remove(plan['dest_path'])
                     except Exception:
@@ -788,6 +1110,8 @@ class _BatchBridge:
             info = _video_info(plan, self.video_model, status='success')
             # 校验结果留痕：skipped:* 表示该片段其实没经过锚点核验（环境异常被放行）
             info['anchor_check'] = reason
+            if not ok:
+                info['anchor_mismatch_overridden'] = True
             if process_reason is not None:
                 # 段内过程检测留痕：PASS / WARN:... / Skipped(...) / skipped:...
                 info['process_check'] = process_reason
@@ -795,6 +1119,7 @@ class _BatchBridge:
                     # 结构化告警标记：终态质量风险汇总据此计数，不用猜留痕文本语义
                     info['process_warned'] = True
             self.writer.record(info)
+            self.stats['accepted_results'] += 1
             if self.process_check_fn is not None and process_reason and action == 'warn':
                 self._emit('video_warning', {
                     'index': plan['slot'], 'current': plan['seq'], 'total': self.total,
@@ -863,10 +1188,17 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     # 这个 tab，误传会导致自动化脚本在那边找不到目标 tab、把 duration 判为未确认项而
     # 直接拒绝生成（见 google_fx.py 的 _verify_and_fix_fx_config）。这里按模型收窄，
     # 避免用户切换模型后配置面板里残留的旧时长值影响非 Omni 模型的生成。
-    video_duration = config.get('videoDuration') or None
-    if video_duration and str(video_model).strip().lower() != 'omni flash':
+    #
+    # 2026-08-01：Omni 侧改成**总是显式传时长**，不再允许"沿用面板当前时长"这个不可知态。
+    # omni 的时间线提示词把镜头切点钉在秒上（见 composers/omni.py），提示词按 N 秒排的
+    # 切点表，生成时却用了面板上残留的另一个时长，切点表当场作废。两边同走
+    # server_common.resolve_video_duration，保证是同一个数。
+    if 'omni' in str(video_model).strip().lower():
+        video_duration = str(resolve_video_duration(config))
+    else:
         video_duration = None
     writer = _ManifestWriter(manifest_path, manifest_data, videos.keys())
+    run_bridges = []
 
     # 按计划分流：复用/拦截立即出结果，待生成的装配为批量请求
     pending_items = []
@@ -942,7 +1274,8 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
 
         def _process_gate(plan):
             return check_video_process(config, plan['dest_path'], plan['start_frame'],
-                                       plan['end_frame'], plan['prompt'])
+                                       plan['end_frame'], plan['prompt'],
+                                       meta=plan.get('meta', ''))
 
         def cancel_check_cb():
             if on_progress:
@@ -963,12 +1296,22 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                                       strict=strict_gates_enabled(config),
                                       process_check_fn=_process_gate,
                                       account_pool=account_pool,
-                                      pool_account_id=actual_account_id)
+                                      pool_account_id=actual_account_id,
+                                      allow_anchor_mismatch=override_flagged)
+            run_bridges.append(leg_bridge)
             from integrations.google_fx.utils import account_binding
             flow_project_url = writer.data.get('google_fx_project_url')
             for item in items:
                 item['req'].project_url = flow_project_url
-            with account_binding.bound_task_account(actual_account_id):
+            # fx_cancel_context 必须包住这次调用：cancel_check 只有 _ChunkRunner 自己的
+            # _check_cancel() 在读，而 L2 helpers 里那 10 处 _check_cancelled() 走的是
+            # per-request 的 CancelState contextvar。视频链此前从不建这个上下文，于是
+            # 那些检查在视频链上全是空转——最典型的是 _connect_fx_page 的 CDP 重连循环
+            # （3 轮 ×（45s 启动超时 + 10×2s 重试）），它只认 contextvar，传进去的
+            # cancel_check 只往下透给 find_or_create_page，重试循环本身读不到。
+            # 帧链一直是对的（frame_generator._fx_generate_batch），这里对齐它。
+            with account_binding.bound_task_account(actual_account_id), \
+                    fx_cancel_context(cancel_check_cb, deadline=fx_request_deadline()):
                 try:
                     fx_results = google_fx_video.generate_videos_batch_google_fx(
                         [it['req'] for it in items],
@@ -1059,6 +1402,20 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
 
                 _run_leg(retry_items, next_account_id)
 
+    stat_keys = (
+        'submitted_requests', 'downloaded_results', 'accepted_results',
+        'anchor_rejections', 'process_rejections', 'adaptive_retries',
+    )
+    run_stats = {key: sum(b.stats.get(key, 0) for b in run_bridges) for key in stat_keys}
+    run_stats['planned_slots'] = len(plans)
+    run_stats['generated_slots'] = sum(1 for p in plans if p.get('action') == 'generate')
+    run_stats['skipped_cut_slots'] = [p['slot'] for p in plans if p.get('action') == 'skip_cut']
+    previous = writer.data.get('video_generation_stats') or {}
+    cumulative = {
+        key: int(previous.get('cumulative', {}).get(key, 0) or 0) + int(run_stats.get(key, 0) or 0)
+        for key in stat_keys
+    }
+    writer.data['video_generation_stats'] = {'last_run': run_stats, 'cumulative': cumulative}
     writer.save()
     manifest_data['manifest'] = '/' + os.path.relpath(manifest_path, _BASE_DIR).replace('\\', '/')
     manifest_data['project_dir'] = os.path.abspath(project_dir)
@@ -1198,6 +1555,241 @@ def _atempo_chain(tempo):
     return ','.join(f'atempo={p:.6g}' for p in parts)
 
 
+# ── 段内时间重映射（2026-07-31 "视频推进跳变"复盘，第 4 层兜底）────────────────
+# 上面的 PACE 系数解决的是**段与段之间**的时间分配（哪一拍该占更多屏幕时间）。
+# 它对**段内部**的速度不匀无能为力：一段"推进→停滞→突进"的片子整体拉长或压缩之后，
+# 停滞和突进只是等比例缩放，跳变照旧。
+#
+# 这里做的是段内重分配：把测得的变化量曲线当作"这段时间里发生了多少事"，让屏幕时间
+# 跟着变化量走——停滞窗口压短、突进窗口拉长，**总时长严格不变**。总时长不变有三个
+# 直接好处：① 音轨原样透传，不需要 atempo 切碎重拼；② 上游 PACE 的 setpts 系数照旧
+# 生效，两套时间缩放不打架；③ 首尾帧原样保留，verify_video_anchors 的锚点校验不受影响。
+#
+# 这是**兜底**不是根治：它改的是观感，不会让模型真的把差量匀开。真正的根治在上游
+# （帧对跨度 too_wide → 补帧拆拍）和提示词（匀速正向约束）。
+# Disabled by design: the video stage must realize the two approved anchors, not reinterpret
+# missing construction causality after generation.  Global pixel MAD also confuses Omni's planned
+# hard cuts with progress jumps, so retiming those peaks can only distort the edit.  Keep the helper
+# for diagnostics/experiments, but production merges use the original clips unchanged.
+_RETIME_ENABLED = False
+_RETIME_SEGMENTS = 16          # 与 _PACE_SAMPLES-1 对齐，直接复用同一份曲线
+_RETIME_STRENGTH = 0.6         # 向"按变化量分配"矫正的强度；1.0 = 完全按变化量
+_RETIME_MIN_FACTOR = 0.5       # 单段时长相对等分时长的下限
+_RETIME_MAX_FACTOR = 2.0       # 上限
+# 矫正幅度低于这个倍数就不动手：省掉一次整段转码，也避免给本来就匀速的片子引入
+# 无谓的重编码损失。
+_RETIME_TRIGGER = 1.25
+_RETIME_BALANCE_ITERS = 8      # 夹逼↔归一的迭代轮数，见 compute_retime_factors
+
+
+def compute_retime_factors(steps, strength=_RETIME_STRENGTH):
+    """由速度曲线算出每段的时长缩放系数（相对等分时长）。
+
+    返回长度与 steps 相同的列表，元素为 out_dur / (T/N)，且**加权后总和恒等于 N**
+    （总时长不变）。曲线退化（全零/长度不足）时返回 None。
+
+    阻尼（strength<1）是刻意的：完全按变化量分配会把一个近乎静止的窗口压到接近零帧，
+    观感从"停顿"变成"卡帧"，反而更糟。0.6 表示只把六成的不均衡矫正掉。
+    """
+    try:
+        import numpy as np
+        steps = np.asarray(steps, dtype=float)
+        n = len(steps)
+        if n < 2:
+            return None
+        total = float(steps.sum())
+        if total <= 0:
+            return None
+        uniform = 1.0 / n
+        target = (1.0 - strength) * uniform + strength * (steps / total)
+        factors = target / uniform
+        # 首末两段恒为 1.0，绝不缩放。片尾静置段（工人退场后的干净交接帧）在曲线上就是
+        # 一个低变化窗口，按变化量分配必然把它压到下限——而那一段正是与下一段拼接的
+        # 接缝。实测压缩后成片尾帧与原锚点帧 MAD 从 ~2 升到 6.0：段内跳变治好了，
+        # 却在每个拼接点制造出新的跳变。这一段的"低变化"是设计内的，不是缺陷。
+        #
+        # 2026-08-01 复盘：片头是同一条接缝的**另一端**（本段片头静置接的是上一段的
+        # 片尾静置），此前却没钉死，于是被同一套逻辑压到底——实测 23 个被重映射的片段
+        # 里 factors[0] 中位 0.54、9 个直接顶到 0.5 下限，等于把每个剪辑点的缓冲砍掉
+        # 一半。与 _PACE_HEAD_EXEMPT 是同一件事的两面：那边不把片头静置判成缺陷，
+        # 这边就不该按缺陷去压它。
+        factors[0] = 1.0
+        factors[-1] = 1.0
+
+        # 夹逼与钉桩都会破坏总和，而"先夹逼再一次性归一"会把没触底的段整体抬上去，
+        # 抬过头就成了过度拉伸——实测一条本来判通过的片子被拉出了新的停滞窗口。
+        # 改成夹逼↔归一交替迭代：每轮只把违约量摊到仍有余量的段上，几轮即收敛到
+        # 「既落在 [min,max] 内、总和又等于 n」的解。两端已钉死，可调的只有中间段，
+        # 它们的目标和相应地是 n-2（两端各占 1.0），总时长仍然严格不变。
+        for _ in range(_RETIME_BALANCE_ITERS):
+            factors = np.clip(factors, _RETIME_MIN_FACTOR, _RETIME_MAX_FACTOR)
+            factors[0] = factors[-1] = 1.0
+            mid = factors[1:-1]
+            if not len(mid):
+                break
+            mid_sum = float(mid.sum())
+            if mid_sum <= 0:
+                return None
+            deficit = (n - 2.0) - mid_sum
+            if abs(deficit) < 1e-6:
+                break
+            # 只调整还没顶到相应边界的段，顶死的段再摊也摊不动
+            room = ((mid < _RETIME_MAX_FACTOR) if deficit > 0
+                    else (mid > _RETIME_MIN_FACTOR))
+            if not room.any():
+                break
+            mid[room] += deficit / float(room.sum())
+            factors[1:-1] = mid
+        factors = np.clip(factors, _RETIME_MIN_FACTOR, _RETIME_MAX_FACTOR)
+        factors[0] = 1.0
+        factors[-1] = 1.0
+        return [float(x) for x in factors]
+    except Exception:
+        return None
+
+
+def _retime_filter(factors, duration, fps=None):
+    """把时长系数编成 split+trim+setpts+concat 的 filter_complex（仅视频流）。
+
+    末尾的 fps 滤镜不是可选项（2026-08-01 复盘）：setpts 只改时间戳，既不生成也不
+    丢弃帧，于是压缩段（factor<1）的原帧挤进更短的时间、拉伸段（factor>1）的原帧被
+    拉长驻留，concat 出来是一条**变帧率**的流。再交给 libx264 时输出帧率由 ffmpeg
+    自己猜，实测 24fps 的 8 秒片段猜成 19.1fps（avg_frame_rate=153/8）——压缩段的真实
+    帧被直接丢弃：192 帧掉到 153 帧（少了 20% 的画面内容），帧间隔从单一的 41.7ms
+    劣化成 41.7/83.3ms 双峰，完全重复帧占比从 10.5% 升到 27.1%。也就是说这一层本来
+    要修的「推进跳变」，恰恰被它自己制造了出来。锁回源帧率后帧数与 CFR 都回到原样。
+
+    注意：拉伸段仍然只能靠复帧（没有光流插值），所以重复帧占比只降到 23% 左右、回不到
+    源片水平。这是重映射的固有代价，也是它只该对判定为跳变的片段动手的原因之一。
+    """
+    n = len(factors)
+    seg = duration / n
+    outs = ''.join(f'[s{i}]' for i in range(n))
+    parts = [f'[0:v]split={n}{outs}']
+    for i, factor in enumerate(factors):
+        start, end = i * seg, (i + 1) * seg
+        # 末段的 end 不写死：浮点误差下写死会切掉最后一帧，而最后一帧就是锚点尾帧。
+        trim = (f'trim=start={start:.6f}' if i == n - 1
+                else f'trim=start={start:.6f}:end={end:.6f}')
+        parts.append(f'[s{i}]{trim},setpts=(PTS-STARTPTS)*{factor:.6f}[t{i}]')
+    concat = ''.join(f'[t{i}]' for i in range(n)) + f'concat=n={n}:v=1:a=0'
+    # fps 探测失败时退回不加滤镜：宁可保留旧行为，也不要用猜出来的帧率去重采样。
+    parts.append(f'{concat},fps={fps:g}[vout]' if fps else f'{concat}[vout]')
+    return ';'.join(parts)
+
+
+def retime_clip_even(src, dst, tmp_dir=None):
+    """把片段内部的时间重新分配成"变化量随时间均匀"，总时长不变。
+
+    返回 (ok: bool, reason: str)。ok=False 表示未改写（不需要 / 测不了 / 转码失败），
+    调用方一律原样使用 src —— 这是观感优化，任何一步出问题都不该让合并失败。
+    """
+    if not _RETIME_ENABLED:
+        return False, 'disabled'
+    own_tmp = None
+    try:
+        if tmp_dir is None:
+            own_tmp = tempfile.TemporaryDirectory()
+            tmp_dir = own_tmp.name
+        steps, duration, error = clip_step_profile(src, tmp_dir, samples=_RETIME_SEGMENTS + 1)
+        if error:
+            return False, error
+        # 只对判定为跳变的片段动手。无差别重映射实测会把个别本来匀速的片子拉出新的
+        # 停滞窗口（夹逼+归一把上界推过头），修 5 伤 1 不划算；本来就匀的片子不碰，
+        # 顺带也省掉一次整段转码。
+        broken, verdict_reason = pace_verdict(steps, duration)
+        if not broken:
+            return False, f'skipped:pace_ok（{verdict_reason}）'
+        factors = compute_retime_factors(steps)
+        if not factors:
+            return False, 'skipped:degenerate_profile'
+        spread = max(factors) / min(factors)
+        if spread < _RETIME_TRIGGER:
+            return False, f'skipped:already_even(spread={spread:.2f})'
+
+        has_audio = _clip_has_audio(src)
+        # 源帧率要锁回输出，否则 setpts 产出的变帧率流会在编码时被丢帧（见 _retime_filter）。
+        src_fps = (_ffprobe_video_params(src) or {}).get('fps') or 0
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", src,
+               "-filter_complex", _retime_filter(factors, duration, src_fps), "-map", "[vout]"]
+        if has_audio:
+            # 总时长不变 → 音轨原样拷贝即可，不需要变速。段内 A/V 会有亚秒级偏移，
+            # 而 i2v 的音轨是环境底噪，没有需要对齐的音画事件。
+            cmd.extend(["-map", "0:a", "-c:a", "copy"])
+        # -t 钉死总时长：分段 setpts 会在每个切点上按帧取整，误差累加到片尾能多出
+        # 2~3 帧（实测 8.0 → 8.08）。单段无所谓，但 12 段拼起来音轨（原样拷贝、仍是
+        # 8.0）就会累积出接近一秒的音画偏移。多出来的那几帧落在片尾静置区，是重复帧，
+        # 截掉不损失任何内容。
+        cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-t", f"{duration:.6f}", dst])
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding='utf-8', errors='replace', timeout=300)
+        if res.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
+            return False, f'ffmpeg_failed:{(res.stderr or "").strip()[:200]}'
+        return True, (f'retimed(spread={spread:.2f}, '
+                      f'factors={[round(f, 2) for f in factors]})')
+    except Exception as e:
+        return False, f'skipped:{type(e).__name__}'
+    finally:
+        if own_tmp is not None:
+            own_tmp.cleanup()
+
+
+def _clip_has_audio(path):
+    try:
+        res = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding='utf-8', errors='replace', timeout=60)
+        return 'audio' in (res.stdout or '').lower()
+    except Exception:
+        return False
+
+
+def slot_meta_map(manifest_data):
+    """槽位 -> meta 文案。
+
+    is_hero 本来是 'HERO' in meta 的派生字段，但 server.py 在重生成时会从上一版
+    manifest 继承它（见 4507 行附近），于是存在"只剩 is_hero、meta 里没有 HERO"的
+    条目。这里反向把标签补回去，保证 _is_camera_move_slot 认得出来。"""
+    out = {}
+    for v in (manifest_data or {}).get('videos') or []:
+        if not isinstance(v, dict):
+            continue
+        meta = str(v.get('meta') or '')
+        if v.get('is_hero') and 'HERO' not in meta.upper():
+            meta = f'{meta} [HERO]'.strip()
+        out[v.get('slot')] = meta
+    return out
+
+
+def retime_clips_for_merge(video_files, tmp_dir, metas=None):
+    """合并前逐段做内部时间重映射。返回 (paths, notes)。
+
+    运镜拍（[HERO]/[BRIDGE]/[CUT]）整段跳过，与 check_video_process 的节奏判据共用
+    同一条豁免（2026-08-01 补齐）：这些拍的速度曲线由镜头调度决定，推进/缓入缓出都是
+    设计内的，用施工推进的匀速标准去量必然误报。此前检测门豁免了、重映射层却拿不到
+    meta（只收到一串路径），于是照着误报把设计好的运镜节奏重新摊匀——一道门放行、
+    另一道门动手改，正是两层判据必须同口径的反例。
+
+    metas 缺省（历史调用方/无 manifest）时一律按普通拍处理，与改造前行为一致。
+    任何一段失败都退回该段原文件——重映射是观感优化，不是正确性前提。"""
+    paths, notes = [], []
+    for idx, src in enumerate(video_files):
+        meta = metas[idx] if metas and idx < len(metas) else ''
+        if _is_camera_move_slot(meta):
+            paths.append(src)
+            notes.append(f'{os.path.basename(src)}: '
+                         'skipped:camera_move_slot（运镜拍不适用施工推进的匀速判据）')
+            continue
+        dst = os.path.join(tmp_dir, f'retimed_{idx:03d}.mp4')
+        ok, reason = retime_clip_even(src, dst, tmp_dir=tmp_dir)
+        paths.append(dst if ok else src)
+        notes.append(f'{os.path.basename(src)}: {reason}')
+    return paths, notes
+
+
 def _paced_merge_filter(clip_speeds, speed, has_audio):
     """多输入 concat filter：每段用自己的 setpts，再整体套上全局倍速。
 
@@ -1284,11 +1876,9 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
             if not os.path.exists(abs_path):
                 missing.append(slot)
                 continue
-            # 手动上传（/api/upload_video）在落盘前已经做过同一套锚点校验，且不匹配时
-            # 要求用户显式 force 确认覆盖——这里再复查一遍会让 force 形同虚设（用户
-            # 明知不匹配还是选择了这个文件，合并时却被当"串片"拦下）。手动上传的槽位
-            # 直接信任，不重新跑锚点门禁。
-            if v.get('source') == 'manual_upload':
+            # 手动上传和显式风险覆盖在落盘前都已经得到用户确认。这里再复查会让 force
+            # 形同虚设（下载阶段保留，合并阶段却再次拦下），因此直接信任并保留审计字段。
+            if v.get('source') == 'manual_upload' or v.get('anchor_mismatch_overridden'):
                 good[slot] = abs_path
                 continue
             # start_anchor_slot 现在总是等于 slot（单一过门拍起止帧绑定和普通拍一样）；
@@ -1350,9 +1940,23 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
         )
 
     # 无缺口/无串片：走原有干净合并路径
-    video_files = [good[s] for s in sorted(good)]
+    merge_slots = sorted(good)
+    video_files = [good[s] for s in merge_slots]
     if not video_files:
         return None
+
+    # 段内时间重映射：把每段内部"停滞→突进"的速度曲线摊匀（总时长不变，故不影响
+    # 下面的 PACE 系数与音轨处理）。逐段 fail-open，失败的段原样进入合并。临时目录
+    # 必须活到 ffmpeg 跑完，所以显式管理而不是用 with。
+    retime_tmp = tempfile.TemporaryDirectory()
+    try:
+        meta_by_slot = slot_meta_map(manifest_data)
+        video_files, retime_notes = retime_clips_for_merge(
+            video_files, retime_tmp.name,
+            metas=[meta_by_slot.get(s, '') for s in merge_slots])
+        print(f"[INFO] 段内节奏重映射: {'; '.join(retime_notes)}")
+    except Exception as retime_err:
+        print(f"[WARN] 段内节奏重映射整体跳过（{retime_err}），按原片合并")
 
     # Write concat list to project directory
     concat_list_path = os.path.join(project_dir, 'concat_list.txt')
@@ -1484,6 +2088,10 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
         os.remove(concat_list_path)
     except:
         pass
+    try:
+        retime_tmp.cleanup()
+    except Exception:
+        pass
 
     if res.returncode == 0:
         rel_path = os.path.relpath(output_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
@@ -1524,10 +2132,23 @@ def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missin
     带回给调用方展示，只是不再用假帧撑时长。"""
     speed = _normalize_merge_speed(speed)
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    video_files = [good[s] for s in expected_slots if s in good]
+    merge_slots = [s for s in expected_slots if s in good]
+    video_files = [good[s] for s in merge_slots]
     if not video_files:
         return None
     skipped_slots = sorted(set(missing) | set(mismatched))
+
+    # 段内时间重映射：与干净合并路径同款处理（见 merge_project_videos）。缺口合并
+    # 本来就是降级产物，但每一段自己的推进节奏该匀还是要匀。
+    retime_tmp = tempfile.TemporaryDirectory()
+    try:
+        meta_by_slot = slot_meta_map(manifest_data)
+        video_files, retime_notes = retime_clips_for_merge(
+            video_files, retime_tmp.name,
+            metas=[meta_by_slot.get(s, '') for s in merge_slots])
+        print(f"[INFO] 段内节奏重映射: {'; '.join(retime_notes)}")
+    except Exception as retime_err:
+        print(f"[WARN] 段内节奏重映射整体跳过（{retime_err}），按原片合并")
 
     concat_list_path = os.path.join(project_dir, 'concat_list.txt')
     with open(concat_list_path, 'w', encoding='utf-8') as f:
@@ -1573,6 +2194,10 @@ def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missin
                          text=True, encoding='utf-8', errors='replace')
     try:
         os.remove(concat_list_path)
+    except Exception:
+        pass
+    try:
+        retime_tmp.cleanup()
     except Exception:
         pass
 

@@ -62,7 +62,11 @@ class TestBeatDeltaWeight(unittest.TestCase):
             self.assertIsNone(pp.beat_delta_weight(beat), beat)
 
     def test_reference_weights_from_the_plan(self):
-        """方案 §3.2 的拍重落点表——这张表就是三个权重常量的回归锁。"""
+        """方案 §3.2 的拍重落点表——这张表就是四个权重常量的回归锁。
+
+        2026-08-02：打包项由线性改成边际计价（见 _PACKAGE_MARGINAL_WEIGHT），
+        单工序的三个落点原样保留，双/三工序两个落点按新公式重算。
+        """
         light = _beat(1, operation='lighting', scope='default',
                       ops=['lighting'], grids=['B2'], milestone='pendant lamp hung')
         self.assertAlmostEqual(pp.beat_delta_weight(light), 0.60)
@@ -74,16 +78,18 @@ class TestBeatDeltaWeight(unittest.TestCase):
                         milestone='wall studs erected')
         self.assertAlmostEqual(pp.beat_delta_weight(framing), 1.90)
 
+        # 1.5×1.6 + 0.3(格) + 0.4(族)
         two_layers = _beat(3, operation='drywall', ops=['drywall', 'priming'],
                            grids=['A1', 'B1'], milestone='walls boarded and primed')
-        self.assertAlmostEqual(pp.beat_delta_weight(two_layers), 3.90)
+        self.assertAlmostEqual(pp.beat_delta_weight(two_layers), 3.10)
 
+        # 2.0×1.6 + 0.6(格) + 0.4(族)
         three_ops = _beat(4, operation='drywall', ops=['drywall', 'priming', 'painting'],
                           grids=['A1', 'B1', 'C1'], milestone='walls closed and painted')
-        self.assertAlmostEqual(pp.beat_delta_weight(three_ops), 5.80)
+        self.assertAlmostEqual(pp.beat_delta_weight(three_ops), 4.20)
 
     def test_real_data_spread_is_the_problem_being_measured(self):
-        """§1.2 说明真实数据里 stage_scope 恒为 large。在那个形态下最重/最轻 ≈ 3.6 倍，
+        """§1.2 说明真实数据里 stage_scope 恒为 large。在那个形态下最重/最轻仍差 2.6 倍，
         而两者的屏幕时间完全相同——这个比值就是用户观感问题的量化表达。"""
         lightest = pp.beat_delta_weight(
             _beat(1, operation='lighting', ops=['lighting'], grids=['B2'],
@@ -91,7 +97,36 @@ class TestBeatDeltaWeight(unittest.TestCase):
         heaviest = pp.beat_delta_weight(
             _beat(2, operation='drywall', ops=['drywall', 'priming', 'painting'],
                   grids=['A1', 'B1', 'C1'], milestone='walls closed and painted'))
-        self.assertGreater(heaviest / lightest, 3.5)
+        self.assertGreater(heaviest / lightest, 2.5)
+
+    def test_package_pricing_keeps_the_gates_satisfiable(self):
+        """线性计价时这套门禁在数值上自相矛盾：prompt 明写「允许最多三道紧密工序」，
+        而 3 工序拍恒为 4.80 > hard_ceiling 3.20；且任何单工序拍挨着双工序拍的比值
+        恒为 2.00 > neighbor_ratio 1.80。nested 的 FIXED SLOT BLUEPRINT 又把拍数钉死、
+        材料层数多于槽位，打包是结构刚需——「必须打包」与「打包必违规」对撞，
+        前两次重排被稳定烧在这上面。这条用例锁的就是「门禁必须有解」。"""
+        nested = pp.skeleton_rhythm('nested_space_payoff')
+        ceiling = nested['hard_ceiling']
+        cap = nested['neighbor_ratio']
+
+        # 同一区域、同一材料层内的紧凑打包（prompt 允许的上限形态）必须合法
+        tight_three = _beat(1, operation='drywall',
+                            ops=['drywall', 'taping', 'sanding'], grids=['A1'],
+                            milestone='wall board closure complete')
+        self.assertLessEqual(pp.beat_delta_weight(tight_three), ceiling)
+
+        # 单工序拍与双工序拍相邻必须合法（否则唯一解是全序列同工序数）
+        single = pp.beat_delta_weight(_beat(1, ops=['framing'], grids=['A1']))
+        double = pp.beat_delta_weight(
+            _beat(2, operation='drywall', ops=['drywall', 'taping'], grids=['A1']))
+        self.assertLessEqual(double / single, cap)
+
+        # 但摊开到多格位/多材料层的三工序拍仍要被打回——放宽的是计价方式，不是尺度
+        sprawling = _beat(3, operation='drywall',
+                          ops=['drywall', 'priming', 'painting'],
+                          grids=['A1', 'B1', 'C1'],
+                          milestone='walls closed and painted')
+        self.assertGreater(pp.beat_delta_weight(sprawling), ceiling)
 
     def test_malformed_beat_does_not_raise(self):
         self.assertIsNone(pp.beat_delta_weight(None))
@@ -117,6 +152,19 @@ class TestBeatDeltaWeight(unittest.TestCase):
         self.assertEqual(pp._layer_family_span(
             _beat(1, operation='framing', ops=['framing', 'insulation'],
                   milestone='studs and batts')), 2)
+
+    def test_layer_family_span_ignores_the_substrate_named_in_milestone_name(self):
+        """milestone_name 是「终结在什么产物上」，产物名天然要带上它覆盖的基层。
+        把它算进族跨度 = 给每个正确的覆盖拍白加 0.4 拍重，一路顶到 R1 天花板
+        （改造前这是 server.log 里 "packs too much visible change" 的头号来源）。"""
+        covering = _beat(1, operation='flooring', ops=['flooring'],
+                         milestone='plank flooring laid over the insulated joists')
+        self.assertEqual(pp._layer_family_span(covering), 1)
+        self.assertAlmostEqual(pp.beat_delta_weight(covering), 1.90)
+        # 真·两层打包必须申报在 package_operations 上，那里照常计族
+        self.assertEqual(pp._layer_family_span(
+            _beat(1, operation='flooring', ops=['flooring', 'furnishing'],
+                  milestone='floor laid')), 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -367,6 +415,16 @@ class TestOutlineWeight(unittest.TestCase):
         """取 3 而不是 2：同相位串联在卡片粒度上是合理表述，拦它必然误伤。"""
         idea = {'beat_outline': ['铺设防水膜与龙骨', '点亮灯带,人物入住']}
         self.assertEqual(pp.outline_weight_violations(idea), [])
+
+    def test_two_layer_cross_phase_entry_is_flagged(self):
+        """两族也不能跨越因果边界：饰面完成与家具备齐必须各有到达锚点。"""
+        idea = {'beat_outline': [
+            '清空舱内碎冰与积雪',
+            '批刮微水泥饰面并安装储备厨房备齐',
+            '点亮灯带,人物入住',
+        ]}
+        errors = pp.outline_weight_violations(idea)
+        self.assertTrue(any('批刮微水泥' in e and '6->7' in e for e in errors), errors)
 
     def test_reward_entry_is_never_weighed(self):
         idea = {'beat_outline': ['清空舱内碎冰', '铺地板刷涂料并布置家具软装']}

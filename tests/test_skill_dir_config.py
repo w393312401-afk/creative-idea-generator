@@ -36,12 +36,20 @@ def cfg_file(tmp_path, monkeypatch):
     path.write_text('{}', encoding='utf-8')
     monkeypatch.setattr(server_common, 'SERVER_CONFIG_FILE', str(path))
     monkeypatch.delenv('SKILL_DIR', raising=False)
+    monkeypatch.delenv('SKILL_DIR_OMNI', raising=False)
     monkeypatch.delitem(server_common.SERVER_CONFIG, 'skillDir', raising=False)
+    monkeypatch.delitem(server_common.SERVER_CONFIG, 'skillProfiles', raising=False)
     # 自动探测不许扫到开发机上真实存在的技能目录，否则断言随机器而变
     monkeypatch.setattr(server_common, '_SKILL_ROOT_CANDIDATES', ())
+    # 仓库内置的 skills/ 同理：这组测试断言的是"没有内置包时的优先级"，
+    # 内置层单独在 test_skill_profiles.py 里验。
+    monkeypatch.setattr(server_common, '_VENDORED_SKILL_ROOT', str(tmp_path / 'no-vendored'))
     monkeypatch.setattr(server_common, '_DEFAULT_SKILL_DIR', str(tmp_path / 'default-skill'))
     monkeypatch.setattr(server_common, 'SKILL_DIR', str(tmp_path / 'default-skill'))
     monkeypatch.setattr(server_common, 'SKILL_DIR_SOURCE', 'default')
+    # 按 profile 的路径表是就地改的字典，必须换成副本，否则一条用例的解析结果
+    # 会顺着同一个 dict 泄漏给同批次的其他测试。
+    monkeypatch.setattr(server_common, '_SKILL_DIRS', dict(server_common._SKILL_DIRS))
     monkeypatch.setattr(server_common, '_SKILL_CONFIG_MTIME',
                         server_common._skill_config_mtime())
     return path

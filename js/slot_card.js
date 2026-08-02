@@ -61,8 +61,11 @@ function renderSlotCard(cardEl, state) {
     cardEl.dataset.type = state.type;
     cardEl.dataset.seq = String(state.seq);
     cardEl.dataset.url = state.url || '';
-    // 工具条按这些 data-* 做筛选与计数，不必自己再推一遍状态（见 js/slot_toolbar.js）
+    // 工具条按这些 data-* 做筛选与计数，不必自己再推一遍状态（见 js/slot_toolbar.js）。
+    // fixable＝这一格有待修复的问题（审查未过或人工标记），也就是画着「修复此帧
+    // 问题」的那些格子；工具条的「全部修复」按它取帧，与卡片按钮同源。
     cardEl.dataset.badges = String((state.badges || []).length);
+    cardEl.dataset.fixable = (state.flags && state.flags.fixable) ? '1' : '0';
     // 拖出能力随状态走：只有真的有内容的格子能当换位的源。
     // （旧实现只在首次 enable 时按当时有没有内容设一次，重渲后就失灵了）
     cardEl.draggable = !!state.draggable;
@@ -176,6 +179,7 @@ function slotGridIsBusy(type) {
 const SLOT_ACTION_HANDLERS = {
     'retry-frame': seq => retrySingleFrame(seq),
     'fix-frame': seq => fixFrameIssue(seq),
+    'undo-fix': seq => undoFrameFix(seq),
     'describe-frame': seq => describeFrameIssue(seq, currentFrameManualIssue(seq)),
     'upload-frame': seq => triggerFrameUpload(seq),
     'retry-video': seq => retrySingleVideo(seq),

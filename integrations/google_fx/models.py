@@ -94,6 +94,13 @@ class ImageBatchRequest(BrowserEnvLockedRequest):
     model: str = Field(default_factory=get_runtime_google_fx_image_model)
     output_path: str = ""
     project_url: Optional[str] = None  # Reuse across five-item submission chunks.
+    # One orchestration owner, one retry budget.  Callers that resume a partial
+    # prefix pass the remaining budget instead of each layer inventing its own
+    # four-attempt loop.
+    max_attempts: int = Field(default=3, ge=1, le=6)
+    # Targeted frame iteration must stay with the account that owns project_url.
+    # A quota/risk retry on another account cannot open that account-scoped canvas.
+    allow_account_switch: bool = True
 
 
 class GoogleFxRunRequest(BrowserEnvLockedRequest):
@@ -111,7 +118,5 @@ class GoogleFxRunRequest(BrowserEnvLockedRequest):
     output_path: str = ""
 
 
-class UploadNotionVideoRequest(BaseModel):
-    page_id: str
-    video_path: str
-    status: Optional[str] = "完成"
+# 2026-08-01 清理：这里原有 UploadNotionVideoRequest（page_id / video_path / status），
+# 全 repo 零引用——Notion 上传端点早已不在本服务里。

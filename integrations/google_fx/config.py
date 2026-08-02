@@ -159,6 +159,11 @@ def get_runtime_google_fx_video_model() -> str:
     return runtime_env_or_default("GOOGLE_FX_VIDEO_MODEL", DEFAULT_GOOGLE_FX_VIDEO_MODEL)
 
 
+def get_runtime_google_fx_video_ref_mode() -> str:
+    """返回当前视频参考模式: 'VIDEO_FRAMES' 或 'VIDEO_REFERENCES'。"""
+    return runtime_env_or_default("GOOGLE_FX_VIDEO_REF_MODE", "VIDEO_FRAMES")
+
+
 def get_runtime_google_fx_image_model() -> str:
     return normalize_google_fx_image_model(
         runtime_env_or_default("GOOGLE_FX_IMAGE_MODEL", DEFAULT_GOOGLE_FX_IMAGE_MODEL)

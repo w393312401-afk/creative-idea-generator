@@ -249,6 +249,57 @@ def get_ads_ws_url(user_id=None, port=None, auto_rotate_proxy=True,
     )
 
 
+_PAGE_ALIVE_PROBE_TIMEOUT_MS = 2000
+
+
+def _page_is_alive(page, timeout_ms=_PAGE_ALIVE_PROBE_TIMEOUT_MS) -> bool:
+    """快速探活：能在 timeout_ms 内于页面上下文里跑通一次求值即视为可用。
+
+    ⚠️ 必须用 wait_for_function 而不是 evaluate：sync 版 `Page.evaluate()` 的签名是
+    `evaluate(expression, arg=None)`，**没有 timeout 参数**（只有 `Locator.evaluate()`
+    有）。`page.evaluate("1", timeout=2000)` 会抛 TypeError，被本函数的 except 吞掉，
+    于是任何页面——包括完全健康的——都被判成"已死"。那正是 2026-08-02 之前的行为：
+    _connect_fx_page 每次都据此新建标签页并重新导航，标签页逐次累积，
+    _recover_valid_page 也永远走不到"复用已有活页"分支。
+    `Page.wait_for_function(expression, *, timeout=...)` 才是带真超时的等价物。
+    """
+    try:
+        if callable(getattr(page, "is_closed", None)) and page.is_closed():
+            return False
+        page.wait_for_function("1", timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+
+def _recover_valid_page(context, broken_page):
+    """从 context.pages 中找到一个可用的 page 对象；都不行就新建。
+
+    detached frame / target closed 后原 page 对象可能处于"未关闭但不可用"
+    的状态（is_closed() 返回 False，但所有 locator / evaluate 调用都会
+    超时挂死）。本函数用 _page_is_alive 做快速探活，筛掉这些僵尸页面。
+    """
+    candidates = [
+        p for p in getattr(context, "pages", [])
+        if not (callable(getattr(p, "is_closed", None)) and p.is_closed())
+    ]
+    # 优先选不是 broken_page 的其他活页
+    for pg in reversed(candidates):
+        if pg is broken_page:
+            continue
+        if _page_is_alive(pg):
+            return pg
+    # 其次看 broken_page 自己是否其实还活着
+    if broken_page in candidates and _page_is_alive(broken_page):
+        return broken_page
+    # 全部不可用，新建
+    try:
+        return context.new_page()
+    except Exception as e:
+        log(f"⚠️ 恢复页面时新建标签页也失败: {e}", "浏览器管理")
+        raise
+
+
 def find_or_create_page(context, url_pattern, fallback_url=None, *, user_id=None,
                         auto_login=True, auto_login_timeout_seconds=None,
                         cancel_check=None, context_label="Google FX 浏览器启动"):
@@ -300,10 +351,37 @@ def find_or_create_page(context, url_pattern, fallback_url=None, *, user_id=None
         try:
             curr_url = str(getattr(target_page, "url", ""))
             if url_pattern not in curr_url:
-                target_page.goto(fallback_url, timeout=PAGE_LOAD_TIMEOUT)
+                try:
+                    target_page.goto(fallback_url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
+                except Exception as goto_err:
+                    err_text = str(goto_err)
+                    # 如果因页面重定向或 frame 替换导致 "Frame has been detached" 或 "Target closed"
+                    if "detached" in err_text.lower() or "target closed" in err_text.lower():
+                        # 不论 is_closed 状态如何，都尝试恢复一个可用页面
+                        # （detached frame != closed：page 对象可能仍 open 但 frame 已不可用，
+                        #   导致后续所有 locator/evaluate 操作静默挂死）
+                        target_page = _recover_valid_page(context, target_page)
+                        curr_url = str(getattr(target_page, "url", ""))
+                        if url_pattern in curr_url or "labs.google" in curr_url or "accounts.google" in curr_url:
+                            log(f"ℹ️ 标签页跳转 fallback_url 触发重定向/Frame解绑，恢复后页面已就绪: {curr_url}", "浏览器管理")
+                        else:
+                            # 恢复后的页面 URL 仍不对，重新导航一次
+                            log("⚠️ 标签页跳转 fallback_url 触发 Frame 解绑，尝试恢复页面后重新导航", "浏览器管理")
+                            try:
+                                target_page.goto(fallback_url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
+                            except Exception as retry_err:
+                                log(f"⚠️ 恢复页面后重新导航仍失败: {type(retry_err).__name__}: {retry_err}", "浏览器管理")
+                    else:
+                        raise goto_err
                 random_sleep(1, 2)
         except Exception as e:
-            log(f"⚠️ 标签页跳转 fallback_url ({fallback_url}) 异常: {e}", "浏览器管理")
+            err_str = str(e).lower()
+            if "detached" in err_str or "target closed" in err_str:
+                # 外层也可能因为 getattr(target_page, "url") 等操作在 detached page 上抛异常
+                target_page = _recover_valid_page(context, target_page)
+                log(f"⚠️ 标签页跳转 fallback_url ({fallback_url}) 异常（已恢复页面）: {e}", "浏览器管理")
+            else:
+                log(f"⚠️ 标签页跳转 fallback_url ({fallback_url}) 异常: {e}", "浏览器管理")
 
     # 5. 【核心修复】：清理并关闭除 target_page 外的所有多余标签页，保证浏览器标签栏始终保持一个 Flow 窗口
     remaining_pages = list(getattr(context, "pages", []))
@@ -515,6 +593,36 @@ def is_google_login_page(page) -> bool:
         return False
 
 
+def _open_flow_entry_in_current_page(page, entry) -> bool:
+    """Open the landing-page CTA without letting it create a duplicate tab.
+
+    Flow currently renders the CTA as a link that may use ``target=_blank``.
+    A normal Playwright click therefore leaves the landing tab open and creates
+    a second Flow tab after ``find_or_create_page`` has already cleaned the
+    context.  Resolve the link's absolute URL from the DOM and navigate the
+    page we already own instead.  Non-link/button variants fall back to the
+    normal click path.
+    """
+    try:
+        href = entry.evaluate("""element => {
+            const link = element.closest && element.closest('a[href]');
+            return link ? link.href : '';
+        }""")
+    except Exception:
+        href = ""
+
+    if isinstance(href, str) and href.strip():
+        page.goto(
+            href.strip(),
+            timeout=PAGE_LOAD_TIMEOUT,
+            wait_until="domcontentloaded",
+        )
+        return True
+
+    entry.click(timeout=5000)
+    return True
+
+
 def _browser_session_is_closed(page) -> bool:
     """Return True when either the page or its CDP browser is definitively gone.
 
@@ -644,7 +752,7 @@ def ensure_flow_workspace(page, timeout_seconds: float = 30.0, user_id=None) -> 
                 _, _, entry = min(candidates, key=lambda row: (row[0], row[1]))
                 log("🚪 检测到 Google Flow 产品介绍页，点击首屏 Create with Google Flow 进入工作台", "Flow导航")
                 try:
-                    entry.click(timeout=5000)
+                    _open_flow_entry_in_current_page(page, entry)
                     clicked = True
                 except Exception as e:
                     log(f"⚠️ 点击 Flow 工作台入口失败: {type(e).__name__}: {e}", "Flow导航")

@@ -756,6 +756,68 @@ function openAccountPoolManageModal() {
     if (typeof switchSettingsSection === 'function') switchSettingsSection('pool');
 }
 
+async function exportAccountPoolConfig() {
+    const includeCreds = confirm("导出提示：\n是否同时导出明文密码与 2FA TOTP 密钥？\n\n【确定】导出包含账号密码与 2FA 密钥的完整配置\n【取消】仅导出号池环境列表与备注配置（不含明文凭据）");
+    try {
+        const resp = await fetch(`/api/account-pool/export?include_credentials=${includeCreds ? 1 : 0}`);
+        const data = await resp.json();
+        const jsonStr = JSON.stringify(data, null, 2);
+        const blob = new Blob([jsonStr], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const nowStr = new Date().toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '_');
+        a.href = url;
+        a.download = `account_pool_export_${nowStr}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        showToast(includeCreds ? '已导出完整号池配置（含凭据与 2FA）' : '已导出号池配置（不含敏感凭据）', 'success');
+    } catch (e) {
+        showToast(`导出失败: ${e.message || e}`, 'error');
+    }
+}
+
+async function handleAccountPoolImportFile(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    event.target.value = '';
+
+    try {
+        const text = await file.text();
+        const json = JSON.parse(text);
+        if (!json || !Array.isArray(json.accounts)) {
+            showToast('导入失败：文件格式错误，未包含有效的 accounts 数组', 'error');
+            return;
+        }
+
+        const count = json.accounts.length;
+        const hasCreds = json.accounts.some(a => a.email || a.password || a.totp_secret || a.secret);
+        const msg = `确认导入该号池配置文件？\n包含账号数：${count} 个\n包含登录凭据与 2FA：${hasCreds ? '是' : '否'}\n\n点击【确定】进行增量导入合并，系统会自动校验 2FA 密钥格式。`;
+        if (!confirm(msg)) return;
+
+        const resp = await fetch('/api/account-pool/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(json)
+        });
+        const result = await resp.json();
+        if (result && result.status === 'ok') {
+            if (Array.isArray(result.accounts)) {
+                accountPoolCache = result.accounts;
+            } else {
+                await loadAccountPool();
+            }
+            renderAccountPoolList();
+            showToast(`导入成功：新增 ${result.added}，更新 ${result.updated}，更新凭据 ${result.credentials_saved}`, 'success');
+        } else {
+            showToast(`导入失败：${result.message || '未知错误'}`, 'error');
+        }
+    } catch (e) {
+        showToast(`导入失败：JSON 解析错误 (${e.message || e})`, 'error');
+    }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     const addBtn = document.getElementById('account-pool-add-btn');
     if (addBtn) addBtn.addEventListener('click', addAccountPoolAccount);
@@ -763,6 +825,16 @@ document.addEventListener('DOMContentLoaded', () => {
     if (importAllBtn) importAllBtn.addEventListener('click', () => importAllAccountPoolProfiles(importAllBtn));
     const addSelect = document.getElementById('account-pool-add-select');
     if (addSelect) addSelect.addEventListener('change', prefillAccountPoolNameFromSelection);
+
+    const exportBtn = document.getElementById('account-pool-export-btn');
+    if (exportBtn) exportBtn.addEventListener('click', exportAccountPoolConfig);
+
+    const importBtn = document.getElementById('account-pool-import-btn');
+    const importFileInput = document.getElementById('account-pool-import-file-input');
+    if (importBtn && importFileInput) {
+        importBtn.addEventListener('click', () => importFileInput.click());
+        importFileInput.addEventListener('change', handleAccountPoolImportFile);
+    }
 
     const sortSelect = document.getElementById('account-pool-sort-select');
     if (sortSelect) {

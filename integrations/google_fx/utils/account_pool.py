@@ -7,9 +7,8 @@
 user_id"的用法（config.py 的 ADSPOWER_DEFAULT_USER_ID）。
 
 积分数字只信 services.google_fx_credit.probe_flow_credit() 的真实探测结果
-（打开 Flow 页面读 UI），本模块只做状态缓存/选号/持久化，不做"每条视频扣多少
-积分"的估算记账——具体耗费因模型档位而异且未知（比如 "Lite [Lower Priority]"
-干脆免积分），硬编码扣费只会引入假数据。
+（打开 Flow 页面读 UI）。本模块不伪造单张扣费，但会让旧探测值过期，并记录任务成功/
+失败用于同余额账号之间的负载均衡；明确 quota 错误会把账号持久冷却。
 
 状态文件 runtime/account_pool.json，跟 proxy_rotator.py 的
 runtime/generation_counter.json 同一目录、同样的"读 JSON → 改 → 写"风格。
@@ -38,7 +37,11 @@ _LOCK = threading.Lock()
 UNPROBED_CREDIT = None
 # 旧版 DEFAULT_CREDIT。只用于识别并清理历史状态文件里那个编造值（见 _read_state）。
 _LEGACY_FABRICATED_CREDIT = 1000
-STALE_AFTER_SECONDS = None  # 缓存不设固定超时期限，长期有效，直至进入不了 Flow 界面或显式刷新
+try:
+    _stale_seconds = int(os.environ.get("GOOGLE_FX_CREDIT_STALE_SECONDS", "21600"))
+except (TypeError, ValueError):
+    _stale_seconds = 21600
+STALE_AFTER_SECONDS = _stale_seconds if _stale_seconds > 0 else None
 
 # 选号排序时"未探测"账号的位置：排在已探测且有额度的账号之后、明确耗尽的之前。
 # 它们会在 pick_account 里被强制真实探测一次，所以不需要乐观值来抢先。
@@ -94,6 +97,10 @@ def _read_state() -> dict:
             info["credit"] = UNPROBED_CREDIT
         info.setdefault("image_task_count", 0)
         info.setdefault("video_task_count", 0)
+        info.setdefault("last_success_at", None)
+        info.setdefault("last_generation_error", None)
+        info.setdefault("last_generation_error_at", None)
+        info.setdefault("consecutive_failures", 0)
     return data
 
 
@@ -263,6 +270,10 @@ class AccountPool:
                 "last_probe_at": existing.get("last_probe_at"),
                 "last_probe_status": existing.get("last_probe_status"),
                 "last_probe_error": existing.get("last_probe_error"),
+                "last_success_at": existing.get("last_success_at"),
+                "last_generation_error": existing.get("last_generation_error"),
+                "last_generation_error_at": existing.get("last_generation_error_at"),
+                "consecutive_failures": int(existing.get("consecutive_failures", 0)),
             }
             _write_state(state)
             entry = dict(state[user_id])
@@ -283,11 +294,33 @@ class AccountPool:
             info = state[user_id]
             info["image_task_count"] = max(0, int(info.get("image_task_count", 0)) + int(image_count))
             info["video_task_count"] = max(0, int(info.get("video_task_count", 0)) + int(video_count))
+            info["last_success_at"] = _now_iso()
+            info["last_generation_error"] = None
+            info["last_generation_error_at"] = None
+            info["consecutive_failures"] = 0
             _write_state(state)
             entry = dict(info)
         entry["user_id"] = user_id
         log(f"📊 账号 {user_id} 任务计数增加: 图片 +{image_count}, 视频 +{video_count} "
             f"(累计: 图片 {entry['image_task_count']}, 视频 {entry['video_task_count']})", "账号池")
+        return entry
+
+    def record_generation_failure(self, user_id: str, reason) -> Optional[dict]:
+        """Persist a generation failure so selection/diagnostics do not forget it."""
+        user_id = (user_id or "").strip()
+        if not user_id:
+            return None
+        with _LOCK:
+            state = _read_state()
+            if user_id not in state:
+                return None
+            info = state[user_id]
+            info["last_generation_error"] = str(reason or "")[:500]
+            info["last_generation_error_at"] = _now_iso()
+            info["consecutive_failures"] = int(info.get("consecutive_failures", 0)) + 1
+            _write_state(state)
+            entry = dict(info)
+        entry["user_id"] = user_id
         return entry
 
     def remove_account(self, user_id: str):
@@ -339,7 +372,127 @@ class AccountPool:
         from .browser import close_ads_browser
         return close_ads_browser(user_id=user_id.strip(), port=port)
 
+    def export_config(self, include_credentials: bool = False) -> dict:
+        """导出号池配置（环境 ID、命名、备注、序号、禁用状态）。
+
+        include_credentials 为 True 时，会包含明文登录邮箱、密码和 2FA TOTP 密钥。
+        """
+        accounts = self.list_accounts(heal=False)
+        export_accounts = []
+        for acc in accounts:
+            item = {
+                "user_id": acc["user_id"],
+                "name": acc.get("name") or "",
+                "note": acc.get("note") or "",
+                "serial_number": str(acc.get("serial_number") or ""),
+                "disabled": bool(acc.get("disabled", False)),
+            }
+            if include_credentials:
+                cred = account_credentials.get(acc["user_id"]) or {}
+                item["email"] = cred.get("email") or ""
+                item["password"] = cred.get("password") or ""
+                item["totp_secret"] = cred.get("totp_secret") or ""
+            export_accounts.append(item)
+        return {
+            "version": "1.0",
+            "exported_at": _now_iso(),
+            "include_credentials": include_credentials,
+            "total": len(export_accounts),
+            "accounts": export_accounts,
+        }
+
+    def import_config(self, data: dict, overwrite: bool = False) -> dict:
+        """导入号池配置。
+
+        data 必须包含 accounts 列表。
+        overwrite=True 时覆盖现有配置，overwrite=False 时平滑合并。
+        如果条目中带 email / password / totp_secret，会同时更新登录凭据。
+        """
+        if not isinstance(data, dict) or not isinstance(data.get("accounts"), list):
+            raise ValueError("导入数据格式错误，缺失 accounts 列表")
+
+        accounts_to_import = data.get("accounts", [])
+        added = 0
+        updated = 0
+        credentials_saved = 0
+        errors = []
+
+        with _LOCK:
+            state = _read_state()
+
+        for idx, item in enumerate(accounts_to_import):
+            if not isinstance(item, dict):
+                errors.append(f"第 {idx + 1} 条数据格式不是对象，已跳过")
+                continue
+            user_id = str(item.get("user_id") or item.get("userId") or "").strip()
+            if not user_id:
+                errors.append(f"第 {idx + 1} 条数据缺少 user_id，已跳过")
+                continue
+
+            name = str(item.get("name") or "").strip()
+            note = str(item.get("note") or "").strip()
+            serial_number = str(item.get("serial_number") or item.get("serialNumber") or "").strip()
+            disabled = bool(item.get("disabled", False))
+
+            is_new = user_id not in state
+            if is_new:
+                added += 1
+                # 本地快照要跟着更新，否则同一份 payload 里重复出现的 user_id
+                # 会被反复计成"新增"。
+                state[user_id] = {}
+            else:
+                updated += 1
+
+            target_name = name if (overwrite or name) else ""
+            target_serial = serial_number if (overwrite or serial_number) else ""
+            # note 不能照搬 name/serial 那套写法：add_account 对这三个字段的语义并不一样，
+            # 只有 name/serial 留空时会"沿用旧值"，note 是**留空即清空备注**（见其 docstring）。
+            # 于是 overwrite=False + 条目不带 note 时，原来的 `else ""` 会把线上已有的备注
+            # 全部抹掉——与本函数承诺的"平滑合并"正好相反。合并模式下没带 note 就保持原样。
+            if overwrite:
+                target_note = note
+            elif note:
+                target_note = note
+            else:
+                target_note = str((state.get(user_id) or {}).get("note") or "")
+
+            self.add_account(
+                user_id=user_id,
+                name=target_name,
+                note=target_note,
+                serial_number=target_serial,
+            )
+            if "disabled" in item:
+                self.set_disabled(user_id, disabled)
+
+            email = item.get("email") or item.get("login_email") or item.get("accountName")
+            password = item.get("password")
+            totp_secret = item.get("totp_secret") or item.get("secret")
+
+            if email is not None or password is not None or totp_secret is not None:
+                try:
+                    account_credentials.save(
+                        user_id=user_id,
+                        email=str(email).strip() if email is not None else None,
+                        password=str(password) if password is not None else None,
+                        totp_secret=str(totp_secret) if totp_secret is not None else None,
+                    )
+                    credentials_saved += 1
+                except Exception as e:
+                    errors.append(f"账号 {user_id} 凭据保存失败: {e}")
+
+        log(f"📥 导入号池配置完成: 新增 {added}，更新 {updated}，凭据更新 {credentials_saved}，错误 {len(errors)}", "账号池")
+        return {
+            "added": added,
+            "updated": updated,
+            "credentials_saved": credentials_saved,
+            "errors": errors,
+            "total": added + updated,
+            "accounts": self.list_accounts(),
+        }
+
     # ── AdsPower 环境发现 ────────────────────────
+
 
     _PROFILE_PAGE_SIZE = 100
     _RATE_LIMIT_RETRIES = 4
@@ -485,9 +638,12 @@ class AccountPool:
                 # 不能只清 reason 留着 cooldown_until。自动登录让这个疏漏变得要命：
                 # 探针撞上登录页 → 自动登进去 → 读到积分 → 账号明明已经可用，却因为
                 # 冷却时间还没到，pick_account 继续跳过它整整两小时。
-                # 只解 login_required 这一种：额度耗尽的 24h 冷却有它自己的语义，
-                # 不该被一次积分探测顺手撤掉。
-                if state[user_id].pop("cooldown_reason", None) == "login_required":
+                # A successful probe proves login is healthy, but a model-specific
+                # quota failure may coexist with a positive general Flow balance.
+                # Clear only login cooldown; preserve quota cooldown and its reason.
+                cooldown_reason = state[user_id].get("cooldown_reason")
+                if cooldown_reason == "login_required":
+                    state[user_id].pop("cooldown_reason", None)
                     state[user_id]["cooldown_until"] = None
                 log(f"🔎 账号 {user_id} 积分探测结果: {credit}", "账号池")
             elif blocked:
@@ -521,6 +677,12 @@ class AccountPool:
             cooldown_until = (_now() + timedelta(hours=cooldown_hours)).isoformat()
             state[user_id]["credit"] = 0
             state[user_id]["cooldown_until"] = cooldown_until
+            state[user_id]["cooldown_reason"] = "quota_exhausted"
+            state[user_id]["last_generation_error"] = "quota_exhausted"
+            state[user_id]["last_generation_error_at"] = _now_iso()
+            state[user_id]["consecutive_failures"] = int(
+                state[user_id].get("consecutive_failures", 0)
+            ) + 1
             _write_state(state)
         log(f"🧊 账号 {user_id} 标记为额度耗尽，冷却至 {cooldown_until}", "账号池")
 
@@ -572,7 +734,13 @@ class AccountPool:
         # 探测一次，不该靠一个编造的乐观值抢到队首。
         def _sort_key(item):
             credit = item[1].get("credit")
-            return _UNPROBED_SORT_KEY if credit is None else credit
+            task_count = (int(item[1].get("image_task_count", 0))
+                          + int(item[1].get("video_task_count", 0)))
+            failures = int(item[1].get("consecutive_failures", 0))
+            # Higher measured balance first; ties prefer healthier, less-used
+            # accounts without pretending to know per-model credit cost.
+            return (_UNPROBED_SORT_KEY if credit is None else credit,
+                    -failures, -task_count)
 
         candidates.sort(key=_sort_key, reverse=True)
 

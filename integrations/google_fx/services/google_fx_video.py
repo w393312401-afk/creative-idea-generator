@@ -12,10 +12,10 @@ import requests
 from playwright.sync_api import sync_playwright
 
 from ..config import (
-    MAX_WAIT_SECONDS,
     OUTPUT_DIR,
     get_runtime_default_user_id,
     get_runtime_max_wait_seconds,
+    get_runtime_google_fx_video_ref_mode,
 )
 from ..models import VideoRequest
 from ..utils.logger import log
@@ -379,7 +379,7 @@ def _generate_video_google_fx(req: VideoRequest):
             page.bring_to_front()
 
             if "labs.google" not in page.url:
-                page.goto("https://labs.google/fx/tools/flow", timeout=60000)
+                page.goto("https://labs.google/fx/tools/flow", timeout=60000, wait_until="domcontentloaded")
                 random_sleep(1, 2)
             ensure_flow_workspace(page)
 
@@ -431,15 +431,18 @@ def _generate_video_google_fx(req: VideoRequest):
                     if not end_uuid:
                         raise RuntimeError("尾帧图片上传到画布失败")
 
-            # 🛠️ 2. 验证并切换配置到 Video 模式 + 指定模型 + VIDEO_FRAMES 视频子模式
-            log("⚙️ 切换配置到 Video / 帧 模式...", "GoogleFX-Video")
+            # 🛠️ 2. 验证并切换配置到 Video 模式 + 指定模型 + 视频参考子模式
+            _video_ref_mode = get_runtime_google_fx_video_ref_mode()
+            _ref_mode_label = '帧' if _video_ref_mode == 'VIDEO_FRAMES' else '素材'
+            log(f"⚙️ 切换配置到 Video / {_ref_mode_label} 模式...", "GoogleFX-Video")
             _verify_and_fix_fx_config(
                 page,
                 model=req.model,
                 ratio=req.ratio,
                 want_video=True,
                 context_label="切换Video",
-                video_submode="VIDEO_FRAMES"
+                duration=req.duration,
+                video_submode=_video_ref_mode
             )
 
             # 🛠️ 3. 挂载参考图到提示词框（Start -> End 顺序）
@@ -691,6 +694,9 @@ class _ChunkRunner:
         self.ip_retry = 0
         # 内容校验拒收过的画布卡片：重试轮认领时必须跳过（见 _adopt_completed_tiles）
         self.rejected_tile_ids = set()
+        # 只统计真正点击 Generate 并取得新 tile 的请求；历史卡片认领、挂载失败和
+        # 本地拒收都不冒充新提交。用于真实额度/重试成本核算。
+        self.submitted_count = 0
         # 失败换号重试：本 chunk 已经试过（并被判过封）的号池账号，换号时排除，
         # 免得在同一批里换回刚被判异常活动的那个号。
         self.tried_accounts = set()
@@ -867,7 +873,7 @@ class _ChunkRunner:
             navigated = True
             try:
                 if page.url != self.project_url:
-                    page.goto(self.project_url, timeout=60000)
+                    page.goto(self.project_url, timeout=60000, wait_until="domcontentloaded")
                     random_sleep(2, 3)
             except Exception as nav_err:
                 log(f"⚠️ 回到项目页失败: {nav_err}，改为新建项目", "GoogleFX-Video")
@@ -907,7 +913,7 @@ class _ChunkRunner:
             self.path_to_uuid = {}
             self.canvas_is_bound = False
             try:
-                page.goto("https://labs.google/fx/tools/flow", timeout=60000)
+                page.goto("https://labs.google/fx/tools/flow", timeout=60000, wait_until="domcontentloaded")
                 random_sleep(1, 2)
             except Exception as nav_err:
                 log(f"⚠️ 导航到 Flow 首页失败: {nav_err}", "GoogleFX-Video")
@@ -1278,9 +1284,15 @@ class _ChunkRunner:
         若 (model, ratio) 未变则跳过——提交动作本身不会改变模式/模型，重复打开
         面板纯属浪费（2026-07-01 实测 16 段任务约浪费 80s）。会话重建/页面刷新
         时 _confirmed_config 被重置，自动恢复完整校验。"""
-        wanted = (req.model, req.ratio)
+        # ⚠️ 参考模式必须在早退判断**之前**读，并且进缓存键：它同样是现读运行时配置
+        # （控制台可热调 GOOGLE_FX_VIDEO_REF_MODE 在「帧 / 素材」之间切换）。漏掉它的话，
+        # 只要模型/比例/时长没变，切换模式后整段配置校验都会被跳过，新模式永远不生效
+        # ——正是当初把 duration 补进缓存键要修的同一类问题。
+        _video_ref_mode = get_runtime_google_fx_video_ref_mode()
+        wanted = (req.model, req.ratio, req.duration, _video_ref_mode)
         if self._confirmed_config == wanted:
-            log("⚙️ 本会话已确认过相同配置（模型/比例未变），跳过重复校验", "GoogleFX-Video")
+            log("⚙️ 本会话已确认过相同配置（模型/比例/时长/参考模式未变），跳过重复校验",
+                "GoogleFX-Video")
             return
         _verify_and_fix_fx_config(
             page,
@@ -1288,7 +1300,8 @@ class _ChunkRunner:
             ratio=req.ratio,
             want_video=True,
             context_label="切换Video",
-            video_submode="VIDEO_FRAMES"
+            duration=req.duration,
+            video_submode=_video_ref_mode
         )
         self._confirmed_config = wanted
 
@@ -1406,6 +1419,8 @@ class _ChunkRunner:
                 continue
 
             tile_id = task_info["tile_id"]
+            self.submitted_count += 1
+            self._notify(idx, 'request_submitted', {'tile_id': tile_id})
             submitted.append({
                 "sub_idx": sub_idx,
                 "idx": idx,
@@ -1634,6 +1649,7 @@ def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=N
     # 分开保存：后者跑完第一个 chunk 后会被本批自建的项目 URL 顶掉，那种画布上
     # 没有帧图，不能据此认领 manifest 带来的画布 UUID。
     external_project_url = batch_project_url
+    submitted_count = 0
     for chunk_start in range(0, len(reqs), VIDEO_CHUNK_SIZE):
         chunk = reqs[chunk_start : chunk_start + VIDEO_CHUNK_SIZE]
         log(f"📦 开始处理第 {chunk_start // VIDEO_CHUNK_SIZE + 1} 批视频请求 ({len(chunk)} 个)...", "GoogleFX-Video")
@@ -1647,7 +1663,15 @@ def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=N
         )
         runner.project_url = batch_project_url
         runner.bound_project_url = external_project_url
-        results.extend(runner.run())
+        chunk_results = runner.run()
+        results.extend(chunk_results)
+        runner_submitted = getattr(runner, 'submitted_count', None)
+        if runner_submitted is None:  # 测试桩/第三方兼容 runner 的保守回退
+            runner_submitted = sum(
+                1 for item in chunk_results
+                if isinstance(item, dict) and item.get('status') == 'success' and item.get('video_url')
+            )
+        submitted_count += int(runner_submitted or 0)
         if runner.project_url:
             batch_project_url = runner.project_url
         # runner 把绑定画布判为不可用（打不开工作区）时会清掉它——后面的分批
@@ -1661,7 +1685,7 @@ def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=N
                 item["project_url"] = batch_project_url
 
     successful = [r for r in results if r and isinstance(r, dict) and r.get("status") == "success" and r.get("video_url")]
-    if successful:
+    if submitted_count:
         try:
             current_uid = account_binding.resolve_account(
                 fallback=get_runtime_default_user_id()
@@ -1671,7 +1695,7 @@ def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=N
             else:
                 from ..utils.account_pool import AccountPool
                 entry = AccountPool().record_task_count(
-                    current_uid, video_count=len(successful)
+                    current_uid, video_count=submitted_count
                 )
                 if entry is None:
                     log(

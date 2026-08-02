@@ -118,7 +118,7 @@ function syncSlotToolbar(type) {
         if (!present.has(seq)) st.selected.delete(seq);
     });
 
-    let shown = 0, ready = 0, flagged = 0, missing = 0;
+    let shown = 0, ready = 0, flagged = 0, missing = 0, fixable = 0;
     cards.forEach(card => {
         const seq = Number(card.dataset.seq);
         const match = slotMatchesFilter(card, st.filter);
@@ -126,6 +126,7 @@ function syncSlotToolbar(type) {
         if (match) shown += 1;
         if (card.dataset.kind === 'ready') ready += 1;
         if (Number(card.dataset.badges || 0) > 0) flagged += 1;
+        if (card.dataset.fixable === '1') fixable += 1;
         if (['missing', 'failed'].includes(card.dataset.kind)) missing += 1;
 
         const picked = st.selected.has(seq);
@@ -164,6 +165,13 @@ function syncSlotToolbar(type) {
     }
     const jumpBtn = bar.querySelector('.slot-jump-btn');
     if (jumpBtn) jumpBtn.hidden = flagged === 0;
+    // 「全部修复」只在真有待修帧时露面，并把条数写在按钮上——⚠ 计数里还混着
+    // 降级/过期这类修不了的徽标，光看它判断不出"有几帧可以一键修"
+    const fixAllBtn = bar.querySelector('.slot-fix-all-btn');
+    if (fixAllBtn) {
+        fixAllBtn.hidden = fixable === 0;
+        fixAllBtn.textContent = `🛠 全部修复 (${fixable})`;
+    }
 }
 
 function setSlotFilter(type, filter) {
@@ -240,6 +248,114 @@ async function bulkDeleteSlots(type) {
     showToast(`已删除 ${done} 整拍。`, done === seqs.length ? 'success' : 'warning');
 }
 
+/** 当前网格里"有待修问题"的槽位号（升序）。只读卡片上的 data-fixable——
+    那是 renderSlotCard 按 slot_model.frameIsFixable 写下的，与卡片上「修复此帧
+    问题」按钮的出现条件同源。 */
+function fixableSlotSequences(type) {
+    const { grid } = slotToolbarEls(type);
+    if (!grid) return [];
+    return Array.from(grid.querySelectorAll(
+        `.slot-card[data-type="${type}"][data-fixable="1"]`))
+        .map(c => Number(c.dataset.seq))
+        .filter(n => Number.isFinite(n))
+        .sort((a, b) => a - b);
+}
+
+function slotCardIsFixable(type, seq) {
+    const card = document.getElementById(`${type === 'video' ? 'video' : 'frame'}-slot-${seq}`);
+    return !!card && card.dataset.fixable === '1';
+}
+
+// 一轮批量修复是否正在进行：帧与帧之间有一段没有任务登记的空隙（回读 manifest、
+// 弹确认框），此时 isIdeaTaskActive 是假的，再点一次按钮就会有两轮批量交错着修。
+let fixAllRunning = false;
+
+/**
+ * 「一键全部修复」：把所有带待修问题的帧（一致性审查未过 + 人工标记）按帧号
+ * 从小到大依次走一遍定向修复（fixFrameIssue，与卡片上那枚按钮同一条路径）。
+ * 此前审查一次标出七八帧问题，只能一格一格点、点完还得盯着每一次复核结论。
+ *
+ * 为什么串行且升序：服务端是项目级串行锁，并发提交只会让后来的直接吃到"已在
+ * 生成中"；而非首帧走图生图链式编辑，修完 IMG 003 再修 IMG 005 时后者读到的
+ * 已经是新的 IMG 004——升序才让每一次修复都建立在前面已修好的画面上。
+ *
+ * 每修完一帧回读一次 manifest：修复后的复核结论（问题到底解决没有）只写在
+ * 服务端 manifest 上，事件流里没有对应的 frame 事件；不回读的话下一轮"这帧还
+ * 要不要修"与网格徽标读到的都还是修复前的旧判定。轮到某帧时它已经没有待修
+ * 问题就跳过——对着一张没有记录问题的帧，后端 fix_frame_issue 会直接报错。
+ */
+async function bulkFixFlaggedFrames() {
+    const idea = (typeof currentIdea !== 'undefined' && currentIdea) || null;
+    if (!idea) {
+        showToast('请先激发一个创意点子！', 'error');
+        return;
+    }
+    if (fixAllRunning || isIdeaTaskActive(idea.id, 'frames')) {
+        showToast('该创意的帧序列正在生成/修复中，请稍候', 'error');
+        return;
+    }
+    const seqs = fixableSlotSequences('image');
+    if (!seqs.length) {
+        showToast('当前没有待修复的帧。', 'info');
+        return;
+    }
+
+    fixAllRunning = true;
+    try {
+        const proceed = await customConfirm(
+            `将按帧号依次修复 ${seqs.length} 帧：${seqs.map(s => 'IMG ' + padSlot(s)).join('、')}<br><br>`
+            + '每一帧都会先按已记录的问题（一致性审查判定 + 人工描述）定向重写提示词，'
+            + '再图生图重渲，并对着新画面复核问题是否已解决。<br>'
+            + '一帧一帧来，中途可点进度条旁的「取消」停下，已经修好的帧保留。');
+        if (!proceed) return;
+
+        const feed = (text, cls) => {
+            if (typeof framesFeedLine === 'function') framesFeedLine(idea.id, text, cls);
+        };
+        feed(`🛠 一键全部修复：共 ${seqs.length} 帧待修，按帧号依次处理…`);
+
+        let fixed = 0, unresolved = 0, skipped = 0;
+        let stopped = '', stoppedKind = '';
+        for (const seq of seqs) {
+            if (!slotCardIsFixable('image', seq)) {
+                // 前面几帧的修复把这一帧的问题一并带掉了（或人工描述已被撤销）
+                skipped += 1;
+                feed(`⏭️ IMG ${padSlot(seq)} 轮到时已无待修问题，跳过`, 'ok');
+                continue;
+            }
+            const r = (await fixFrameIssue(seq)) || {};
+            if (r.status === 'ok') {
+                if ((r.remaining || []).length) unresolved += 1; else fixed += 1;
+            } else if (r.status === 'cancelled') {
+                stopped = '已取消'; stoppedKind = 'cancelled'; break;
+            } else if (r.status === 'disconnected') {
+                stopped = '与服务的连接中断，后台可能仍在继续'; stoppedKind = 'failed'; break;
+            } else {
+                stopped = r.error || '修复失败'; stoppedKind = 'failed'; break;
+            }
+            if (typeof reloadManifestIntoIdea === 'function') await reloadManifestIntoIdea(idea);
+            if (typeof renderFramesForIdea === 'function'
+                && typeof isViewingIdea === 'function' && isViewingIdea(idea.id)) {
+                renderFramesForIdea(idea);
+            }
+        }
+
+        const parts = [];
+        if (fixed) parts.push(`${fixed} 帧已修复`);
+        if (unresolved) parts.push(`${unresolved} 帧重渲后复核仍有问题`);
+        if (skipped) parts.push(`${skipped} 帧无需修复`);
+        const summary = parts.join('，') || '没有帧被改动';
+        const tail = stopped ? `，随后中止（${stopped}）` : '';
+        feed(`🛠 一键全部修复结束：${summary}${tail}`,
+             stoppedKind === 'failed' ? 'err' : ((unresolved || stopped) ? 'warn' : 'ok'));
+        showToast(`全部修复：${summary}${tail}。`,
+                  stoppedKind === 'failed' ? 'error'
+                      : ((unresolved || stopped) ? 'warning' : 'success'));
+    } finally {
+        fixAllRunning = false;
+    }
+}
+
 // ── 绑定 ────────────────────────────────────────────────────────────
 
 function bindSlotToolbar(type) {
@@ -253,6 +369,8 @@ function bindSlotToolbar(type) {
         const sizeBtn = e.target.closest('.slot-size-btn');
         if (sizeBtn) { applySlotSize(sizeBtn.dataset.size); return; }
         if (e.target.closest('.slot-jump-btn')) { jumpToFirstFlagged(type); return; }
+        // 「全部修复」只有图片工具条有这枚按钮（视频槽位没有"待修问题"这一说）
+        if (e.target.closest('.slot-fix-all-btn')) { bulkFixFlaggedFrames(); return; }
         if (e.target.closest('.slot-merge-btn')) { setSlotMergedView(!slotMergedView); return; }
         const bulk = e.target.closest('[data-bulk]');
         if (!bulk) return;

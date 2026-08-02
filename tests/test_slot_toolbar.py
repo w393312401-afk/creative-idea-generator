@@ -38,6 +38,30 @@ IDEA = {
     },
 }
 
+# 「全部修复」用的单子：3 帧带待修问题（审查未过 ×2 + 人工标记 ×1），
+# 另有一帧只是降级——降级修不了，不该进一键修复的名单。
+FIX_IDEA = {
+    "id": "fixall1",
+    "title": "全部修复",
+    "prompt_block": "x",
+    "prompt_slots": {"images": [{"index": i} for i in range(1, 6)],
+                     "videos": [{"index": i} for i in range(1, 5)]},
+    "frameRun": {
+        "frames": [
+            {"sequence": 1, "url": "/outputs/t/frames/img_001.webp"},
+            {"sequence": 2, "url": "/outputs/t/frames/img_002.webp",
+             "quality_gate": "sequence_review_flagged", "vlm_qa_reason": "塔吊消失"},
+            {"sequence": 3, "url": "/outputs/t/frames/img_003.webp",
+             "quality_gate": "i2i_fallback_degraded"},
+            {"sequence": 4, "url": "/outputs/t/frames/img_004.webp",
+             "manual_issue": "门开反了"},
+            {"sequence": 5, "url": "/outputs/t/frames/img_005.webp",
+             "quality_gate": "sequence_review_flagged", "vlm_qa_reason": "层数对不上"},
+        ],
+        "videos": [],
+    },
+}
+
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d494844520000000100000001080600000"
     "01f15c4890000000a49444154789c6300010000050001"
@@ -223,3 +247,176 @@ class TestSizeAndJump:
             '.slot-toolbar[data-slot-type="image"] .slot-jump-btn', "el => el.click()")
         assert page.eval_on_selector(
             "#frame-slot-2", "el => el.classList.contains('slot-flash')")
+
+
+class TestUndoFixEntry:
+    """「撤销修复」：修复是覆盖写同一个帧文件，只有真的存下过快照（manifest 上的
+    fix_backup）的帧才给这个出口——不能画一枚点了必然报错的按钮。"""
+
+    def test_button_only_shows_on_frames_with_a_snapshot(self, page):
+        page.evaluate("""() => {
+            currentIdea.frameRun.frames[0].fix_backup = { at: 'T1', reason: '塔吊消失' };
+            renderFramesForIdea(currentIdea);
+        }""")
+        assert page.evaluate(
+            """() => !!document.querySelector('#frame-slot-1 [data-act="undo-fix"]')""")
+        assert page.evaluate(
+            """() => !document.querySelector('#frame-slot-2 [data-act="undo-fix"]')"""), \
+            "没修过的帧不该有撤销入口"
+
+    def test_click_goes_to_undo_with_that_sequence(self, page):
+        page.evaluate("""() => {
+            window.__undone = [];
+            window.undoFrameFix = (seq) => { window.__undone.push(seq); return Promise.resolve(); };
+            currentIdea.frameRun.frames[0].fix_backup = { at: 'T1', reason: '塔吊消失' };
+            renderFramesForIdea(currentIdea);
+        }""")
+        page.eval_on_selector('#frame-slot-1 [data-act="undo-fix"]', "el => el.click()")
+        page.wait_for_function("() => window.__undone.length === 1", timeout=5000)
+        assert page.evaluate("() => window.__undone") == [1]
+
+
+class TestReviewScopeEntries:
+    """一致性审查分两个入口：默认增量（只重审帧图变过的那几拍）与全量重审。
+    全量会烧掉整套调用，点之前必须先说清代价。"""
+
+    def test_full_review_button_confirms_then_asks_for_the_full_scope(self, page):
+        page.evaluate("""() => {
+            window.__scopes = [];
+            window.__confirmed = 0;
+            window.customConfirm = () => { window.__confirmed++; return Promise.resolve(true); };
+            window.runSequenceReview = (scope) => { window.__scopes.push(scope); };
+        }""")
+        page.eval_on_selector("#run-full-sequence-review-btn", "el => el.click()")
+        page.wait_for_function("() => window.__scopes.length === 1", timeout=5000)
+        assert page.evaluate("() => window.__confirmed") == 1
+        assert page.evaluate("() => window.__scopes") == ["full"]
+
+    def test_declining_the_confirmation_runs_nothing(self, page):
+        page.evaluate("""() => {
+            window.__scopes = [];
+            window.customConfirm = () => Promise.resolve(false);
+            window.runSequenceReview = (scope) => { window.__scopes.push(scope); };
+        }""")
+        page.eval_on_selector("#run-full-sequence-review-btn", "el => el.click()")
+        page.wait_for_timeout(300)
+        assert page.evaluate("() => window.__scopes") == []
+
+    def test_plain_review_button_uses_the_incremental_default(self, page):
+        page.evaluate("""() => {
+            window.__scopes = [];
+            window.runSequenceReview = (scope) => { window.__scopes.push(scope); };
+        }""")
+        page.eval_on_selector("#run-sequence-review-btn", "el => el.click()")
+        page.wait_for_function("() => window.__scopes.length === 1", timeout=5000)
+        assert page.evaluate("() => window.__scopes") == [None]
+
+
+FIX_ALL_BTN = '.slot-toolbar[data-slot-type="image"] .slot-fix-all-btn'
+
+
+class TestFixAll:
+    """「一键全部修复」：把所有画着「修复此帧问题」的格子依次走一遍定向修复。
+
+    名单必须与卡片按钮同源（data-fixable，由 slot_model.frameIsFixable 判定），
+    顺序必须升序（非首帧走图生图链式编辑，后面的帧要读到前面已修好的画面），
+    并且每一帧都在轮到它的那一刻重新确认还要不要修。
+    """
+
+    def _load(self, page, idea=FIX_IDEA):
+        page.evaluate("""idea => {
+            currentIdea = idea; savedIdeas = [idea];
+            renderFramesForIdea(idea);
+        }""", idea)
+
+    def _stub(self, page, script="return { status: 'ok', remaining: [] };"):
+        page.evaluate("""body => {
+            window.__fixed = [];
+            window.customConfirm = () => Promise.resolve(true);
+            // 回读 manifest 走的是真 fetch，静态服务下没有这个接口
+            window.reloadManifestIntoIdea = () => Promise.resolve();
+            window.fixFrameIssue = new Function('seq', 'window.__fixed.push(seq);' + body);
+        }""", script)
+
+    def _click(self, page):
+        page.eval_on_selector(FIX_ALL_BTN, "el => el.click()")
+
+    def test_button_counts_only_frames_that_have_something_to_fix(self, page):
+        self._load(page)
+        assert page.eval_on_selector(FIX_ALL_BTN, "el => !el.hidden")
+        # 5 帧里 2/4/5 有待修问题；第 3 帧只是降级——降级修不了，不进名单
+        assert page.eval_on_selector(FIX_ALL_BTN, "el => el.textContent") == "🛠 全部修复 (3)"
+
+    def test_button_hides_when_nothing_needs_fixing(self, page):
+        clean = json.loads(json.dumps(FIX_IDEA))
+        for f in clean["frameRun"]["frames"]:
+            f.pop("quality_gate", None)
+            f.pop("manual_issue", None)
+        self._load(page, clean)
+        assert page.eval_on_selector(FIX_ALL_BTN, "el => el.hidden")
+
+    def test_video_toolbar_has_no_fix_all_entry(self, page):
+        assert page.evaluate(
+            """() => !document.querySelector(
+                '.slot-toolbar[data-slot-type="video"] .slot-fix-all-btn')"""), \
+            "视频槽位没有「待修问题」这一说，不该给一键修复入口"
+
+    def test_fixes_every_flagged_frame_in_ascending_order(self, page):
+        self._load(page)
+        self._stub(page)
+        self._click(page)
+        page.wait_for_function("() => window.__fixed.length === 3", timeout=5000)
+        assert page.evaluate("() => window.__fixed") == [2, 4, 5]
+
+    def test_skips_frames_whose_issue_is_already_gone(self, page):
+        """前面几帧的修复可能把后面那条问题一并带掉：轮到它时要现取一次，
+        对着一张没有记录问题的帧调修复接口，后端会直接报错。"""
+        self._load(page)
+        self._stub(page, """
+            if (seq === 2) {
+                currentIdea.frameRun.frames[3].manual_issue = '';
+                renderFramesForIdea(currentIdea);
+            }
+            return { status: 'ok', remaining: [] };""")
+        self._click(page)
+        page.wait_for_function("() => window.__fixed.length === 2", timeout=5000)
+        page.wait_for_timeout(200)
+        assert page.evaluate("() => window.__fixed") == [2, 5]
+
+    def test_a_cancel_stops_the_rest(self, page):
+        """取消是对整轮批量的取消：继续去修下一帧等于点了取消什么也没发生。"""
+        self._load(page)
+        self._stub(page, "return { status: 'cancelled' };")
+        self._click(page)
+        page.wait_for_function("() => window.__fixed.length === 1", timeout=5000)
+        page.wait_for_timeout(300)
+        assert page.evaluate("() => window.__fixed") == [2]
+
+    def test_a_failure_stops_the_rest(self, page):
+        self._load(page)
+        self._stub(page, "return { status: 'failed', error: '上游报错' };")
+        self._click(page)
+        page.wait_for_function("() => window.__fixed.length === 1", timeout=5000)
+        page.wait_for_timeout(300)
+        assert page.evaluate("() => window.__fixed") == [2]
+
+    def test_a_second_click_cannot_start_an_overlapping_round(self, page):
+        """帧与帧之间有一段没有任务登记的空隙（回读 manifest、弹确认框），
+        光靠 isIdeaTaskActive 挡不住第二次点击。"""
+        self._load(page)
+        self._stub(page)
+        page.evaluate("""() => {
+            const b = document.querySelector('%s');
+            b.click(); b.click();
+        }""" % FIX_ALL_BTN)
+        page.wait_for_function("() => window.__fixed.length === 3", timeout=5000)
+        page.wait_for_timeout(300)
+        assert page.evaluate("() => window.__fixed") == [2, 4, 5]
+
+    def test_declining_the_confirmation_fixes_nothing(self, page):
+        self._load(page)
+        self._stub(page)
+        page.evaluate("() => { window.customConfirm = () => Promise.resolve(false); }")
+        self._click(page)
+        page.wait_for_timeout(300)
+        assert page.evaluate("() => window.__fixed") == []

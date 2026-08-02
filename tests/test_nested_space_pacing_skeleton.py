@@ -1,3 +1,5 @@
+import re
+
 import prompt_pipeline as pp
 
 
@@ -11,6 +13,9 @@ GOOD_NESTED_IDEA_FIELDS = {
 
 GOOD_NESTED_OUTLINE = [
     '吊车吊装集装箱入基坑',
+    # 落位之后必须紧跟掩埋拍：这才是埋地校车案例的钩子本体（壳体消失进地形，
+    # 只剩一个入口）。没有它，开场就只是「一只摆在空地上的箱子」。
+    '回填土方掩埋箱体外壳',
     '清空第一功能区残留物',
     '铺设第一空间防潮膜',
     '架设第一空间木龙骨',
@@ -34,18 +39,24 @@ def nested_idea(outline=None, **overrides):
 
 
 def test_nested_space_reference_is_registered_and_normalized():
-    assert pp.PACING_SKELETONS['nested_space_payoff']['label_zh'] == '双空间重置兑现'
+    assert pp.PACING_SKELETONS['nested_space_payoff']['label_zh'] == '双空间一比一复刻'
     assert pp.normalize_pacing_skeleton_ids(['nested_space_payoff']) == ['nested_space_payoff']
 
 
-def test_nested_space_reference_preserves_the_case_rhythm_not_its_subject():
+def test_nested_space_reference_copies_stage_order_before_diverging_subject():
     summary = pp.PACING_SKELETONS['nested_space_payoff']['summary']
-    assert 'four-act progression rhythm' in summary
-    assert 'usable entrance' in summary
-    assert 'second pass through the same bottom-up material ladder' in summary
-    assert 'soft furnishing' in summary
+    assert 'LITERAL STAGE-ORDER REPLICA' in summary
+    assert 'COPY THE CONSTRUCTION ORDER FIRST' in summary
+    assert 'CANONICAL 15-SLOT RHYTHM REFERENCE' in summary
+    assert 'buried shipping-container dual-cabin creative' in summary
+    assert '10 declared reset into untouched secondary space' in summary
+    assert 'earth backfill and turf concealment' in summary
+    assert 'timber entrance shaft and stairs' in summary
+    assert 'floor membrane -> floor grid -> cavity insulation -> finished floor' in summary
+    assert 'open the end divider' in summary
+    assert 'repeat the same base/membrane/grid/insulation/board/finish ladder' in summary
+    assert 'soft furnishing and warm lighting' in summary
     assert 'worker-free wide reveal' in summary
-    assert 'never copying the school-bus' in summary
 
 
 def test_nested_space_reference_demands_a_delivered_man_made_carrier():
@@ -129,14 +140,14 @@ def test_nested_space_requires_the_first_beat_to_deliver_the_carrier():
 
 def test_nested_space_outline_rejects_a_partial_first_space_payoff():
     outline = list(GOOD_NESTED_OUTLINE)
-    outline[5] = '继续安装第一空间墙板'
+    outline[6] = '继续安装第一空间墙板'
     errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
     assert any('primary space function' in error for error in errors)
 
 
 def test_nested_space_outline_requires_exactly_one_raw_second_space_reset():
     outline = list(GOOD_NESTED_OUTLINE)
-    outline[6] = '继续完善室内布局'
+    outline[7] = '继续完善室内布局'
     errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
     assert any('exactly one declared reset' in error for error in errors)
 
@@ -148,7 +159,7 @@ def test_nested_reset_accepts_concrete_second_space_wording():
     for reset_entry in ['硬切进入毛坯后舱', '跳切至未施工的隔间', '硬切转入原始前舱',
                         '转场至毛坯储藏室', '硬切进入未修舱室']:
         outline = list(GOOD_NESTED_OUTLINE)
-        outline[6] = reset_entry
+        outline[7] = reset_entry
         errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
         assert errors == [], f'{reset_entry} 应被认成合法重置拍，实际: {errors}'
 
@@ -162,7 +173,7 @@ def test_nested_reset_accepts_a_declared_cut_without_a_raw_state_word():
     """
     for reset_entry in ['硬切进入第二舱室', '跳切至隔壁储藏室', '转场进入后舱']:
         outline = list(GOOD_NESTED_OUTLINE)
-        outline[6] = reset_entry
+        outline[7] = reset_entry
         errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
         assert errors == [], f'{reset_entry} 应被认成合法重置拍，实际: {errors}'
 
@@ -171,7 +182,7 @@ def test_nested_reset_still_needs_a_raw_state_word_without_a_cut_term():
     """反向护栏：没有剪辑术语时，「切入/进入」这类动词在施工拍里也会出现，
     缺了毛坯态词就分不出这到底是不是一次重置——那一支必须继续查。"""
     outline = list(GOOD_NESTED_OUTLINE)
-    outline[6] = '进入第二舱室继续施工'
+    outline[7] = '进入第二舱室继续施工'
     errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
     assert any('untouched/raw state' in e or 'exactly one declared reset' in e for e in errors)
 
@@ -186,7 +197,7 @@ def test_nested_reset_written_as_a_doorway_travel_shot_is_named_as_such():
     """这个骨架的重置按定义是硬切（threshold_variant=hard_cut）。写成推镜过门时要说清
     是「写法不对」，而不是含糊的 found 0——错误串会被回喂给模型当返工说明。"""
     outline = list(GOOD_NESTED_OUTLINE)
-    outline[6] = '推镜过门进入原始舱内'
+    outline[7] = '推镜过门进入原始舱内'
     errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
     assert any('DECLARED HARD CUT' in error for error in errors)
 
@@ -194,7 +205,8 @@ def test_nested_reset_written_as_a_doorway_travel_shot_is_named_as_such():
 def test_nested_reset_stays_unique_across_an_ordinary_two_room_outline():
     """放宽词表不能把普通施工拍也算成重置：多于一处一样会被否掉。"""
     idea = nested_idea([
-        '吊车吊装集装箱入基坑', '清空第一空间碎屑落尘', '铺设第一空间防潮膜',
+        '吊车吊装集装箱入基坑', '覆土堆坡遮蔽箱体外壳', '清空第一空间碎屑落尘',
+        '铺设第一空间防潮膜',
         '架设木龙骨与保温层', '封装储备区木饰面墙', '备齐储备厨房完成使用',
         '硬切进入毛坯后舱', '清运后舱锈屑与积渣', '铺设防潮膜与电路',
         '架设墙顶木龙骨', '封装保温内衬面板', '铺装成品地板与涂料',
@@ -264,10 +276,74 @@ def test_delivery_beat_contract_names_the_machinery_and_the_empty_start_frame():
     assert 'IMAGE 1 is the EMPTY SITE' in text
     assert 'crane' in text and 'flatbed' in text
     assert 'single-manual-tool rule does not apply' in text
+    assert 'SUBJECT SCALE LOCK' in text
+    assert 'silhouette fills the central majority' in text
+    assert 'roughly two-thirds of the frame' in text
+    assert 'Preserve the registered mountain and real water body visibly' in text
+    assert 'dry footprint above the waterline' in text
 
     # 没有这个标记的拍一个字都不该多出来
     plain = pp._beat_contract(2, 3, ladder, 'Threshold', {'camera_dna': 'static shot'}, '')
     assert 'CARRIER DELIVERY' not in plain['family_contract']
+    assert 'SUBJECT SCALE LOCK' not in plain['family_contract']
+
+
+def test_delivery_scale_is_deterministically_preserved_in_final_prompts():
+    """长契约偶发漏听时，确定性修复仍要把主体尺度写回最终 IMAGE/VIDEO 提示词。"""
+    beat = {'index': 1, 'operation': 'repair', 'carrier_delivery': True}
+    video, image = pp.apply_proactive_fixes(
+        1,
+        'A crane lowers the shell onto the site.',
+        'The rusted shell rests on the quarry floor.',
+        {'camera_dna': 'static grounded wide shot; horizon line remains level',
+         'primary_landmarks': []},
+        'Threshold', False, False, beat=beat, family='exterior')
+    assert 'dominant near-midground scale' in video
+    assert 'never reading as a distant miniature' in video
+    assert 'silhouette fills the central majority' in image
+    assert 'roughly two-thirds of the frame' in image
+
+    plain_video, plain_image = pp.apply_proactive_fixes(
+        2, 'A hand tool repairs the shell.', 'The repaired shell remains on site.',
+        {'camera_dna': 'static grounded wide shot; horizon line remains level',
+         'primary_landmarks': []},
+        'Threshold', False, False,
+        beat={'index': 2, 'operation': 'repair'}, family='exterior')
+    assert 'dominant near-midground scale' not in plain_video
+    assert 'silhouette fills the central majority' not in plain_image
+
+
+def test_nested_opening_environment_is_mountain_water_or_residential():
+    scenic = pp.apply_pacing_skeleton_to_brief(
+        {'carrier': 'school bus', 'env': 'remote lakeside slope'}, 'nested_space_payoff')
+    residential = pp.apply_pacing_skeleton_to_brief(
+        {'carrier': 'rail car', 'env': 'old residential neighbourhood street'},
+        'nested_space_payoff')
+    explicit_residential = pp.apply_pacing_skeleton_to_brief(
+        {'carrier': 'shipping container', 'env': 'surrounding environment',
+         'opening_environment_type': 'residential'}, 'nested_space_payoff')
+
+    assert scenic['opening_environment_type'] == 'mountain_water'
+    assert residential['opening_environment_type'] == 'residential'
+    assert explicit_residential['opening_environment_type'] == 'residential'
+
+    ladder = [
+        {'index': 1, 'operation': 'repair', 'description': 'deliver the shell',
+         'bridge_stage': None, 'carrier_delivery': True},
+        {'index': 2, 'operation': 'reward', 'description': 'reveal', 'bridge_stage': None},
+    ]
+    scenic_contract = pp._beat_contract(
+        1, 2, ladder, 'Threshold', {'camera_dna': 'static shot'}, '', parsed_brief=scenic)
+    residential_contract = pp._beat_contract(
+        1, 2, ladder, 'Threshold', {'camera_dna': 'static shot'}, '',
+        parsed_brief=residential)
+    assert 'registered mountain and real water body' in scenic_contract['family_contract']
+    assert 'registered residential street, existing homes' in residential_contract['family_contract']
+    assert 'mountain and real water body' not in residential_contract['family_contract']
+
+    plain = pp.apply_pacing_skeleton_to_brief(
+        {'carrier': 'rail car', 'env': 'residential neighbourhood'}, 'linear_milestone')
+    assert 'opening_environment_type' not in plain
 
 
 def test_nested_only_static_fallbacks_keep_an_honest_nested_outline(monkeypatch):
@@ -290,3 +366,58 @@ def test_nested_only_static_fallbacks_keep_an_honest_nested_outline(monkeypatch)
         assert pp._nested_carrier_is_transportable(idea)
         seen_titles.add(idea['title'])
     assert len(seen_titles) == 3
+
+
+def test_nested_outline_requires_the_burial_beat_after_the_delivery():
+    """只查落位不查掩埋时，卡片可以「吊装落位」之后直接进舱清理：开场就只是一只
+    摆在空地上的箱子，埋地校车案例的钩子（壳体消失进地形）整条不见——这正是
+    「从来没出过掩埋类开场创意」的最后一环。"""
+    outline = list(GOOD_NESTED_OUTLINE)
+    outline[1] = '打磨除锈整片箱壁'          # 落位之后直接开始修壳体，没有掩埋
+    errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
+    assert any('BURIAL/CONCEALMENT beat' in error for error in errors)
+
+
+def test_nested_outline_accepts_the_common_ways_to_write_the_burial_beat():
+    """门禁一旦比模型能写出来的更严，整批就会被否掉、掉进兜底——这个骨架又不许降级，
+    用户侧立刻变成「一张卡都没有」。常见写法必须全认。"""
+    for burial_entry in ['回填土方掩埋箱体外壳', '培土掩埋箱体并压实', '覆土堆坡遮蔽箱体',
+                         '挖机回填并覆草皮', '堆土护坡半掩箱体', '沉入基坑并覆土封顶']:
+        outline = list(GOOD_NESTED_OUTLINE)
+        outline[1] = burial_entry
+        errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
+        assert errors == [], f'{burial_entry} 应被认成合法掩埋拍，实际: {errors}'
+
+
+def test_nested_burial_beat_may_follow_a_seat_excavation_beat():
+    """有些载体要先挖坑/找平再回填，掩埋拍会落到第 3~4 条：窗口不能只认第 2 条。"""
+    outline = list(GOOD_NESTED_OUTLINE)
+    outline[1] = '挖机开挖基坑并找平'
+    outline.insert(2, '回填土方掩埋箱体外壳')
+    assert pp.pacing_skeleton_outline_violations(nested_idea(outline)) == []
+
+
+def test_buried_fallback_topics_survive_the_generic_pool_being_burned(monkeypatch):
+    """埋地兜底选题是这个骨架唯一的兜底来源，不能挂在另一组选题的存活数上。
+
+    旧实现按通用兜底列表（冰洞/潜艇/导弹井）的长度循环发卡：那三条被台账认领之后
+    循环一次都不执行，埋地选题哪怕全新也永远发不出来——甚至在取它之前就先抛了
+    「静态兜底选题也已全部被用过」。"""
+    burned = [
+        {'topic_dna': 'glacier-ice-cave / refuge-den / self-material-window'},
+        {'topic_dna': 'retired-submarine / micro-home / porthole-lighting'},
+        {'topic_dna': 'missile-silo / burrow-dwelling / roof-hatch'},
+    ]
+    monkeypatch.setattr(pp, 'read_ledger', lambda: burned)
+    monkeypatch.setattr(pp, 'fetch_trend_snippet', lambda *args, **kwargs: '')
+    monkeypatch.setattr(pp, 'fetch_custom_url_snippet', lambda *args, **kwargs: '')
+    monkeypatch.setattr(pp, '_chat', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('offline')))
+
+    result = pp.run_ideate({}, count=3, pacing_skeleton_ids=['nested_space_payoff'])
+    assert len(result['ideas']) == 3
+    for idea in result['ideas']:
+        assert pp.pacing_skeleton_outline_violations(idea) == []
+        # 开场必须是「运过来 + 埋起来」
+        assert re.search(pp._NESTED_DELIVERY_CUE, idea['beat_outline'][0])
+        assert any(re.search(pp._NESTED_CONCEALMENT_CUE, entry)
+                   for entry in idea['beat_outline'][1:5])

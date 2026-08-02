@@ -471,6 +471,78 @@ class TestVideoProgressEvents(unittest.TestCase):
         self.assertEqual(error[1]['message'], 'boom')
         self.assertEqual(records[0]['slot'], 7)
 
+    def test_explicit_override_keeps_anchor_mismatch_with_warning(self):
+        records = []
+        events = []
+
+        class Writer:
+            def record(self, info):
+                records.append(info)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            generated = os.path.join(tmp, 'generated.mp4')
+            destination = os.path.join(tmp, 'vid_008.mp4')
+            with open(generated, 'wb') as f:
+                f.write(b'video')
+            plan = {
+                'slot': 8, 'seq': 1, 'prompt': 'p', 'dest_path': destination,
+                'start_frame': os.path.join(tmp, 'img_008.webp'),
+                'end_frame': os.path.join(tmp, 'img_009.webp'),
+            }
+            bridge = _BatchBridge(
+                pending=[{'plan': plan}], total=1, video_model='omni',
+                writer=Writer(),
+                on_progress=lambda stage, payload: events.append((stage, payload)),
+                allow_anchor_mismatch=True,
+            )
+            with patch('video_generator.verify_video_anchors',
+                       return_value=(False, 'first=26.0, last=32.6')):
+                result = bridge(0, 'video_done', {'video_url': generated})
+
+            self.assertIsNone(result)
+            self.assertTrue(os.path.exists(destination))
+            self.assertEqual(records[0]['status'], 'success')
+            self.assertTrue(records[0]['anchor_mismatch_overridden'])
+            self.assertTrue(any(stage == 'video_warning' for stage, _ in events))
+
+    def test_anchor_rejection_adapts_prompt_before_retry(self):
+        records = []
+        events = []
+
+        class Writer:
+            def record(self, info):
+                records.append(info)
+
+        class Req:
+            prompt = 'Build the cabinets evenly.'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            generated = os.path.join(tmp, 'generated.mp4')
+            destination = os.path.join(tmp, 'vid_011.mp4')
+            with open(generated, 'wb') as f:
+                f.write(b'video')
+            req = Req()
+            plan = {
+                'slot': 11, 'seq': 1, 'prompt': req.prompt, 'dest_path': destination,
+                'start_frame': os.path.join(tmp, 'img_011.webp'),
+                'end_frame': os.path.join(tmp, 'img_012.webp'),
+            }
+            bridge = _BatchBridge(
+                pending=[{'plan': plan, 'req': req}], total=1, video_model='omni',
+                writer=Writer(),
+                on_progress=lambda stage, payload: events.append((stage, payload)),
+            )
+            with patch('video_generator.verify_video_anchors',
+                       return_value=(False, 'first=4.3, last=27.3')):
+                result = bridge(0, 'video_done', {'video_url': generated})
+
+            self.assertEqual(result, 'rejected')
+            self.assertIn('ANCHOR_RETRY_ADAPTATION:', req.prompt)
+            self.assertIn('last-frame geometry', req.prompt)
+            self.assertEqual(bridge.stats['anchor_rejections'], 1)
+            self.assertEqual(bridge.stats['adaptive_retries'], 1)
+            self.assertTrue(any(stage == 'video_retry_adapted' for stage, _ in events))
+
 
 class TestMergeSkipMissing(unittest.TestCase):
     """2026-07-22 改版：强制合并不再用起始锚点帧定格+「缺失」标注填充缺口，改成直接
@@ -634,6 +706,23 @@ class TestMergeManualUploadTrust(unittest.TestCase):
         captured = {}
         # 即便锚点校验会判定不匹配（模拟用户已经 force 确认过的场景），手动上传的
         # 槽位也不应该被 merge 再次拦下。
+        with patch('video_generator.verify_video_anchors', return_value=(False, 'forced mismatch')), \
+             patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+            result = merge_project_videos(self.tmp)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['status'], 'success')
+        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
+        self.assertEqual(len(concat_lines), 1)
+
+    def test_explicit_generated_override_bypasses_merge_recheck(self):
+        self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
+        self._write_manifest(2, [
+            {'slot': 1, 'status': 'success', 'file': 'videos/vid_001.mp4',
+             'start_anchor_slot': 1, 'model': 'omni',
+             'anchor_mismatch_overridden': True},
+        ])
+        captured = {}
         with patch('video_generator.verify_video_anchors', return_value=(False, 'forced mismatch')), \
              patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
             result = merge_project_videos(self.tmp)

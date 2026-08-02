@@ -25,7 +25,7 @@ from server_common import (
     IMG2IMG_RAW_STATE_CONTROL_PROMPT,
     resolve_cover_reference, project_cover_path,
     IMAGE_TASKS, IMAGE_TASKS_LOCK,
-    apply_google_fx_runtime_overrides, fx_cancel_context,
+    apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
     read_manifest, write_manifest, GenerationCancelled, log,
     gpt_image_pixel_size, drop_stale_review_verdicts, stamp_manifest_capabilities,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
@@ -1107,6 +1107,52 @@ def plan_fx_chunks(seqs, chunk_size=_FX_CHUNK_SIZE):
     return chunks
 
 
+def _fx_frame_canvas_binding(frame, manifest=None):
+    """Return the account/project pair that owns an existing Flow frame.
+
+    Targeted regeneration is an *iteration of an existing frame*, not a new
+    generation leg.  Re-selecting the richest pool account here opens that
+    account's newest/empty canvas and loses the original frame's Flow history.
+    New manifests stamp the ownership on every frame; older manifests fall
+    back to the project-level binding.
+    """
+    frame = frame if isinstance(frame, dict) else {}
+    manifest = manifest if isinstance(manifest, dict) else {}
+    account_id = str(
+        frame.get('fx_account_id')
+        or manifest.get('google_fx_project_account_id')
+        or ''
+    ).strip()
+    project_url = str(
+        frame.get('fx_project_url')
+        or (manifest.get('google_fx_projects') or {}).get(account_id)
+        or manifest.get('google_fx_project_url')
+        or ''
+    ).strip()
+    return account_id, project_url
+
+
+def split_fx_chunks_by_canvas(chunks, existing_frames, manifest=None):
+    """Split targeted chunks whenever adjacent frames belong to different canvases."""
+    result = []
+    for chunk in chunks:
+        current = []
+        current_binding = None
+        for seq in chunk:
+            binding = _fx_frame_canvas_binding(existing_frames.get(seq), manifest)
+            # Missing ownership is allowed to share the caller-selected leg.  A
+            # known binding, however, must never be batched across another one.
+            binding_key = binding if any(binding) else None
+            if current and binding_key != current_binding:
+                result.append(current)
+                current = []
+            current.append(seq)
+            current_binding = binding_key
+        if current:
+            result.append(current)
+    return result
+
+
 def plan_frame_chunk_accounts(chunks, ring, switch_interval):
     """给每个链式批次分配号池账号（纯函数，可单测）。
 
@@ -1304,7 +1350,8 @@ def _fx_cancelled_result(result):
 
 def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel_fn=None,
                        excluded_media_uuids=None, excluded_image_paths=None,
-                       canvas_session=None):
+                       canvas_session=None, max_attempts=3, attempt_state=None,
+                       allow_account_switch=True):
     """调用外部批量生图脚本一次，返回 (本地文件路径列表, 临时目录)。
 
     ref_path：上一帧留档 jpg（首帧/无续链传 None）。
@@ -1316,6 +1363,20 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel
     调用方负责在把图片转存后 shutil.rmtree 临时目录。
     """
     temp_out = tempfile.mkdtemp(prefix='spark_fx_img_')
+    from integrations.google_fx.utils import account_binding
+    account_id = account_binding.resolve_account(
+        fallback=config.get('googleFxUserId') if isinstance(config, dict) else None
+    )
+    projects_by_account = (
+        canvas_session.setdefault('projects_by_account', {})
+        if isinstance(canvas_session, dict) and account_id
+        else ((canvas_session or {}).get('projects_by_account') or {})
+    )
+    project_url = projects_by_account.get(account_id)
+    if not project_url and isinstance(canvas_session, dict):
+        legacy_owner = canvas_session.get('project_account_id')
+        if not legacy_owner or legacy_owner == account_id:
+            project_url = canvas_session.get('project_url')
     req = models.ImageBatchRequest(
         prompts=list(prompt_texts),
         images=[ref_path] if ref_path else [],
@@ -1324,24 +1385,46 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel
         ratio=config.get('imageAspectRatio') or '9:16',
         model=_fx_image_model(config),
         output_path=temp_out,  # 每次唯一，绕开外部 dedupe 缓存（同提示词重试不会拿到旧图）
-        project_url=(canvas_session or {}).get('project_url'),
+        project_url=project_url,
+        max_attempts=max(1, int(max_attempts or 1)),
+        allow_account_switch=bool(allow_account_switch),
     )
-    with fx_cancel_context(cancel_fn):
+    # deadline 必须显式传：不传的话 CancelState.deadline 是 None，脚本里那些
+    # deadline_exceeded() 检查恒为 False（见 server_common.fx_request_deadline）。
+    with fx_cancel_context(cancel_fn, deadline=fx_request_deadline()):
         result = google_fx._generate_images_batch_google_fx(req)
+    actual_account_id = account_binding.resolve_account(
+        fallback=config.get('googleFxUserId') if isinstance(config, dict) else None
+    )
     returned_project_url = (result or {}).get('project_url') if isinstance(result, dict) else None
+    if isinstance(attempt_state, dict):
+        try:
+            attempt_state['used'] = max(1, int((result or {}).get('attempts_used') or 1))
+        except (TypeError, ValueError):
+            attempt_state['used'] = 1
+        attempt_state['account_id'] = actual_account_id
     if returned_project_url and canvas_session is not None:
         canvas_session['project_url'] = returned_project_url
-    if not isinstance(result, dict) or result.get('status') != 'success':
+        if actual_account_id:
+            canvas_session['project_account_id'] = actual_account_id
+            projects_by_account[actual_account_id] = returned_project_url
+    result_status = result.get('status') if isinstance(result, dict) else None
+    if result_status not in ('success', 'partial'):
         shutil.rmtree(temp_out, ignore_errors=True)
         if _fx_cancelled_result(result) or (cancel_fn and cancel_fn()):
             raise ImageTaskCancelled("帧序列生成已被用户取消（外部批量生图脚本已停）")
         raise RuntimeError(f"Google FX 批量生图失败: {(result or {}).get('message') or '未知错误'}")
     paths = [p for p in (result.get('image_urls') or []) if isinstance(p, str) and os.path.exists(p)]
-    if len(paths) < len(prompt_texts):
+    if result_status == 'success' and len(paths) < len(prompt_texts):
         shutil.rmtree(temp_out, ignore_errors=True)
         raise RuntimeError(
-            f"Google FX 批量生图不完整: 期望 {len(prompt_texts)} 张，实际落盘 {len(paths)} 张，"
-            f"已放弃本批结果（批内链式对应关系无法修复）"
+            f"Google FX 批量生图返回成功但数量不完整: 期望 {len(prompt_texts)} 张，"
+            f"实际落盘 {len(paths)} 张"
+        )
+    if result_status == 'partial' and not paths:
+        shutil.rmtree(temp_out, ignore_errors=True)
+        raise RuntimeError(
+            f"Google FX 批量生图从首张即失败: {(result or {}).get('message') or '未知错误'}"
         )
     return paths, temp_out
 
@@ -1392,8 +1475,17 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
     canvas_session = {}
 
-    def _run_chunk_batch(chunk_prompts, ref_path, leg):
-        """跑一批：先绑这一批的号池账号，再交给外部批量脚本。"""
+    checkpointed_seqs = set()
+    generated_account_by_path = {}
+
+    def _run_chunk_batch(chunk_prompts, ref_path, leg, chunk_sequences=None,
+                         cover_reference=None):
+        """跑一批并保存成功前缀，再从首个失败 prompt 精确续跑。
+
+        google_fx_image 会在第一张未捕获/未落盘时停止本批并返回已经成功的严格前缀。
+        这里把前缀搬进一个聚合临时目录，再以上一张成功图为参考继续剩余 prompts；
+        因而不会为了末尾一张失败而重复生成、重复计费整个五张批次。
+        """
         user_id = (leg or {}).get('user_id') or pool_account_id or config.get('googleFxUserId')
         if user_id:
             config['googleFxUserId'] = user_id
@@ -1409,12 +1501,86 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             for seq in all_seqs
             if _frame_exists(seq)
         ]
-        with account_binding.bound_task_account(user_id):
-            return _fx_generate_batch(google_fx, fx_models, config, chunk_prompts, ref_path,
-                                      cancel_fn=cancel_fn,
-                                      excluded_media_uuids=excluded_media_uuids,
-                                      excluded_image_paths=excluded_image_paths,
-                                      canvas_session=canvas_session)
+        aggregate_out = tempfile.mkdtemp(prefix='spark_fx_chunk_')
+        aggregate_paths = []
+        remaining = list(chunk_prompts)
+        next_ref = ref_path
+        retry_budget = 3
+        try:
+            with account_binding.bound_task_account(user_id):
+                while remaining:
+                    if retry_budget <= 0:
+                        raise RuntimeError('Google FX 本批共享重试预算已耗尽')
+                    remaining_before = len(remaining)
+                    aggregate_before = len(aggregate_paths)
+                    attempt_state = {}
+                    prefix_paths, attempt_out = _fx_generate_batch(
+                        google_fx, fx_models, config, remaining, next_ref,
+                        cancel_fn=cancel_fn,
+                        excluded_media_uuids=excluded_media_uuids,
+                        excluded_image_paths=excluded_image_paths + aggregate_paths,
+                        canvas_session=canvas_session,
+                        max_attempts=retry_budget,
+                        attempt_state=attempt_state,
+                        allow_account_switch=not bool(
+                            target_sequences is not None
+                            and chunk_sequences
+                            and any(_fx_frame_canvas_binding(
+                                manifest_frames_by_seq.get(chunk_sequences[0]), manifest
+                            ))
+                        ),
+                    )
+                    retry_budget -= max(1, int(attempt_state.get('used') or 1))
+                    try:
+                        for src in prefix_paths:
+                            suffix = os.path.basename(src)
+                            dest = os.path.join(
+                                aggregate_out,
+                                f'{len(aggregate_paths):03d}_{suffix}',
+                            )
+                            shutil.move(src, dest)
+                            aggregate_paths.append(dest)
+                            generated_account_by_path[dest] = attempt_state.get('account_id') or user_id
+                    finally:
+                        shutil.rmtree(attempt_out, ignore_errors=True)
+
+                    completed = len(prefix_paths)
+                    if completed <= 0:
+                        raise RuntimeError('Google FX 批次未产生可恢复的成功前缀')
+                    remaining = remaining[completed:]
+                    next_ref = aggregate_paths[-1]
+                    # A partial result is already paid for and its prompt↔frame
+                    # mapping is still exact.  Persist it immediately so a later
+                    # remainder failure/process restart resumes from this prefix
+                    # instead of regenerating it.  The final normal processing
+                    # loop skips these checkpointed sequences.
+                    if completed < remaining_before and chunk_sequences:
+                        new_paths = aggregate_paths[aggregate_before:]
+                        for rel_idx, saved_path in enumerate(new_paths):
+                            seq = int(chunk_sequences[aggregate_before + rel_idx])
+                            item = prompts_by_seq[seq]
+                            _, fx_src_path, fx_uuid = _fx_store_frame(saved_path, frames_dir, seq)
+                            if seq > 1 and _frame_exists(1):
+                                _match_color_lab(_webp_path(seq), _webp_path(1), _webp_path(seq))
+                            _record_frame(
+                                seq, item, fx_src_path, fx_uuid,
+                                'pending_manual_review', None,
+                                cover_reference=(cover_reference if seq == 1 else None),
+                                fx_account_id=generated_account_by_path.get(saved_path),
+                            )
+                            checkpointed_seqs.add(seq)
+                    if remaining and on_progress:
+                        on_progress('fx_batch_resume', {
+                            'completed_prefix': len(aggregate_paths),
+                            'remaining': len(remaining),
+                            'retry_budget_remaining': retry_budget,
+                            'message': (f'Google FX 本批已保留前 {len(aggregate_paths)} 张成功结果，'
+                                        f'从下一张继续剩余 {len(remaining)} 张'),
+                        })
+            return aggregate_paths, aggregate_out
+        except Exception:
+            shutil.rmtree(aggregate_out, ignore_errors=True)
+            raise
 
     manifest_path = os.path.join(project_dir, 'manifest.json')
     manifest = {
@@ -1443,10 +1609,22 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         except Exception:
             pass
 
+    if isinstance(manifest.get('google_fx_projects'), dict):
+        canvas_session['projects_by_account'] = dict(manifest['google_fx_projects'])
     if manifest.get('google_fx_project_url'):
         canvas_session['project_url'] = manifest['google_fx_project_url']
+        canvas_session['project_account_id'] = manifest.get('google_fx_project_account_id')
 
     manifest_frames_by_seq = {f['sequence']: f for f in manifest['frames']}
+    # Per-frame ownership is the authoritative map for later iteration.  Fold
+    # it back into the session as well so manifests written before
+    # google_fx_projects existed can still reopen the exact original canvas.
+    for _frame in manifest_frames_by_seq.values():
+        _account_id, _project_url = _fx_frame_canvas_binding(_frame, manifest)
+        if _account_id and _project_url:
+            canvas_session.setdefault('projects_by_account', {}).setdefault(
+                _account_id, _project_url
+            )
     # 按提示词块里的真实槽位号建索引（与 API 路径同一修复）：
     # 枚举位置在子集渲染时与槽位号错位，目标帧会静默漏渲
     prompts_by_seq = {int(item['index']): item for item in prompts}
@@ -1492,7 +1670,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         return 'pending_manual_review', None
 
     def _record_frame(seq, item, fx_src_path, fx_uuid, quality_gate, vlm_reason,
-                      cover_reference=None):
+                      cover_reference=None, fx_account_id=None):
         webp = _webp_path(seq)
         rel_path = os.path.relpath(webp, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
         prev_path = _webp_path(seq - 1) if seq > 1 else None
@@ -1518,6 +1696,11 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             'vlm_qa_reason': vlm_reason,
             'parent_hash': "" if cover_reference else (_get_file_hash(reference) if reference else ""),
         }
+        if fx_account_id:
+            frame_info['fx_account_id'] = fx_account_id
+            frame_project = (canvas_session.get('projects_by_account') or {}).get(fx_account_id)
+            if frame_project:
+                frame_info['fx_project_url'] = frame_project
         if cover_reference:
             frame_info['anchor_reference'] = 'cover'
         manifest_frames_by_seq[seq] = frame_info
@@ -1525,6 +1708,8 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         _emit_frame(frame_info)
 
     chunks = plan_fx_chunks(gen_seqs)
+    if target_sequences is not None:
+        chunks = split_fx_chunks_by_canvas(chunks, manifest_frames_by_seq, manifest)
     # 声明式硬切（[CUT] 视频槽）另起一批，便于让提示词主导场景变化；新批仍会显式
     # 挂载上一帧作为参考，因此不会退化成文生图或断开血统。
     cut_heads = set()
@@ -1551,6 +1736,20 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         c[0]: leg for c, leg in zip(chunks, plan_frame_chunk_accounts(
             chunks, ring, _account_switch_interval(config)))
     }
+    if target_sequences is not None:
+        for _chunk in chunks:
+            _owner_account, _owner_project = _fx_frame_canvas_binding(
+                manifest_frames_by_seq.get(_chunk[0]), manifest
+            )
+            if _owner_account:
+                # Iteration must run as the account that owns the target frame;
+                # Flow project URLs are account-scoped and cannot be reopened by
+                # whichever pool account happens to have the highest balance.
+                leg_by_chunk_start[_chunk[0]] = {'user_id': _owner_account}
+            if _owner_account and _owner_project:
+                canvas_session.setdefault('projects_by_account', {})[
+                    _owner_account
+                ] = _owner_project
     current_account_id = pool_account_id
     done_seqs = set()
 
@@ -1624,22 +1823,39 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         if sys.stdout:
             print(f"[FRAME SEQUENCE][FX] Google FX 批量生图: 帧 {chunk[0]}~{chunk[-1]} ({len(chunk)} 张), ref={'有' if ref_path else '无'}")
         try:
-            local_paths, temp_out = _run_chunk_batch(chunk_prompts, ref_path, leg)
+            local_paths, temp_out = _run_chunk_batch(
+                chunk_prompts, ref_path, leg, chunk_sequences=chunk,
+                cover_reference=cover_ref_src,
+            )
         except ConnectionError:
             raise
         except Exception as e:
-            if sys.stdout:
-                print(f"[FRAME SEQUENCE][FX] 批量生图失败，3 秒后整批重试一次: {e}")
-            _check_cancel()
-            time.sleep(3.0)
-            local_paths, temp_out = _run_chunk_batch(chunk_prompts, ref_path, leg)
+            saved_prefix = [s for s in chunk if s in checkpointed_seqs]
+            if saved_prefix:
+                raise RuntimeError(
+                    f"Google FX 本批已保存成功前缀 IMG "
+                    f"{'、'.join(f'{s:03d}' for s in saved_prefix)}，"
+                    f"剩余帧生成失败；下次重试会从首个缺失帧继续: {e}"
+                ) from e
+            # Retry ownership lives in google_fx_image and consumes the shared
+            # budget passed by _run_chunk_batch.  Retrying the whole chunk here
+            # used to multiply four service attempts into as many as eight and
+            # regenerated already-paid prefix frames.
+            raise
 
         if canvas_session.get('project_url'):
             manifest['google_fx_project_url'] = canvas_session['project_url']
+            manifest['google_fx_project_account_id'] = canvas_session.get('project_account_id')
+        if canvas_session.get('projects_by_account'):
+            manifest['google_fx_projects'] = dict(canvas_session['projects_by_account'])
+        if canvas_session.get('project_url') or canvas_session.get('projects_by_account'):
             _save_manifest()
 
         try:
             for offset, s in enumerate(chunk):
+                if s in checkpointed_seqs:
+                    done_seqs.add(s)
+                    continue
                 item = prompts_by_seq[s]
                 # Only VIDEO slots carry [BRIDGE] tags per the delivery contract; the
                 # incoming transition (VIDEO s-1) is the real signal for IMAGE s.
@@ -1675,7 +1891,8 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                 if cur_ref:
                     fx_src_path, fx_uuid = cur_ref, _fx_extract_uuid(cur_ref)
                 _record_frame(s, item, fx_src_path, fx_uuid, quality_gate, vlm_reason,
-                              cover_reference=(cover_ref_src if s == 1 else None))
+                              cover_reference=(cover_ref_src if s == 1 else None),
+                              fx_account_id=generated_account_by_path.get(local_paths[offset]))
                 done_seqs.add(s)
         finally:
             shutil.rmtree(temp_out, ignore_errors=True)
@@ -1984,6 +2201,15 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             if seq == 1 and not cover_ref:
                 raise RuntimeError('生成帧序列前必须先生成或选择封面图；第一帧只能以封面图进行图生图')
             reference = cover_ref if cover_anchor else previous_path
+            # A targeted/subset prompt block may contain only ``IMAGE N``.  In
+            # that case the loop never visits IMAGE N-1, but the durable chain
+            # parent is still available on disk.  Resolve it by the real slot
+            # number instead of silently treating the subset's first item as
+            # frame 1 (or rejecting a valid retry for lack of ``previous_path``).
+            if not reference and seq > 1:
+                durable_parent = os.path.join(frames_dir, f'img_{seq - 1:03d}.webp')
+                if os.path.exists(durable_parent) and os.path.getsize(durable_parent) > 0:
+                    reference = durable_parent
             if not reference or not os.path.exists(reference):
                 raise RuntimeError(f'无法生成第 {seq} 帧：缺少上一帧参考图，帧序列禁止退回文生图')
             model = _image_edit_model(config)

@@ -431,11 +431,15 @@ IMG2IMG_RAW_STATE_CONTROL_PROMPT = (
     "and fallen wreckage across the floor. Do not add people, machinery, furniture, or any new "
     "built object. Return one clean edited image only."
 )
-# 提示词合成真正会去读的技能契约文件全集（相对 SKILL_DIR）。缺任何一个都不会报错：
-# load_reference_file 返回空串、run_ideate 拿到空的形态矩阵/台账，合成照样跑完，只是
-# 质量悄悄劣化——所以这份清单存在的意义就是让"悄悄"变成"吵闹"（启动日志 + /api/mode
-# 上报给前端）。此前启动检查只覆盖其中 2 个，另外 6 个缺失时全程无声。
-SKILL_CONTRACT_FILES = (
+# ── 技能 profile：目标视频模型 → 技能包 的注册表 ──
+# 一个 profile = 一个技能包 + 它自己的契约清单。清单必须按包分开声明：两个包的
+# references/ 文件名完全不重叠（base 是 prompt-templates/spatial-consistency…，
+# omni 是 omni-*.md），拿 base 的清单去查 omni 包会报"缺 8 个文件"——包明明是全的。
+#
+# 每份清单存在的意义都一样：契约文件缺失不会报错，load_reference_file 返回空串、
+# run_ideate 拿到空的形态矩阵/台账，合成照样跑完，只是质量悄悄劣化。清单就是把
+# "悄悄"变成"吵闹"（启动日志 + /api/mode 上报给前端）。
+_BASE_CONTRACT_FILES = (
     'SKILL.md',
     'references/prompt-templates.md',
     'references/idea-engine.md',
@@ -445,14 +449,65 @@ SKILL_CONTRACT_FILES = (
     'references/drift-lock-assembly-guide.md',
     'references/threshold-bridge-consistency-protocol.md',
 )
+# omni 包自己的 SKILL.md §Required Reference Loading 声明了 7 个"每次必读" + 4 个
+# "按需读"，全都算契约：按需的那几个（过门、样例梯、Tier 0 的形态矩阵与台账）缺失
+# 同样是无声降级，只是触发条件更窄。
+_OMNI_CONTRACT_FILES = (
+    'SKILL.md',
+    'references/omni-scene-skeleton.md',
+    'references/omni-multishot-language.md',
+    'references/omni-restoration-continuity.md',
+    'references/omni-beat-skeleton.md',
+    'references/omni-damage-vocabulary.md',
+    'references/omni-lighting-environment-audio.md',
+    'references/omni-output-templates.md',
+    'references/omni-threshold-bridge.md',
+    'references/omni-worked-ladders.md',
+    'references/idea-engine.md',
+    'references/used-topic-ledger.md',
+)
+
+DEFAULT_SKILL_PROFILE = 'base'
+SKILL_PROFILES = {
+    'base': {
+        'package': 'gemini-veo-restoration-composer',
+        'label': '修复延时合成器（Veo / 通用）',
+        'contracts': _BASE_CONTRACT_FILES,
+        # 环境变量与配置键保持历史名字：这一层在多 profile 之前就存在，改名会让
+        # 已经配好的机器在升级后静默回到默认路径。
+        'env': 'SKILL_DIR',
+        'config_key': 'skillDir',
+    },
+    'omni': {
+        'package': 'gemini-omni-restoration-composer',
+        'label': 'Gemini Omni 多镜头合成器',
+        'contracts': _OMNI_CONTRACT_FILES,
+        'env': 'SKILL_DIR_OMNI',
+        'config_key': None,  # 只认 skillProfiles.omni，不再给每个包发一个顶层键
+    },
+}
+# 旧名保留：外部（测试、frame_generator）按这个名字引用 base 的契约清单。
+SKILL_CONTRACT_FILES = _BASE_CONTRACT_FILES
+SKILL_PACKAGE_NAME = SKILL_PROFILES[DEFAULT_SKILL_PROFILE]['package']
+
+# 「做哪个模型的提示词 → 读哪个技能包」。匹配 videoModel（配置或前端请求里带的那个）
+# 的小写子串，命中即用对应 profile；都不命中回到 base。用子串而不是全等，是因为
+# 视频模型名带档位后缀（'Omni Flash'、'Veo 3.1 - Lite [Lower Priority]'）。
+SKILL_PROFILE_VIDEO_MODEL_RULES = (
+    ('omni', 'omni'),
+)
 
 # ── 技能包（skill）本地路径的解析 ──
-# 取值优先级：环境变量 SKILL_DIR > server_config.json 的 skillDir > 内置默认路径 >
-# 常见技能根目录下的自动探测。skillDir 这个配置项是 2026-07-26 补的：缺失告警一直
-# 写着"用环境变量 SKILL_DIR / server_config.json 指向技能所在位置"，但代码只读环境
-# 变量，照着提示往 server_config.json 里写是没有任何效果的。
-SKILL_PACKAGE_NAME = 'restoration-prompt-composer'
+# 取值优先级：环境变量 > server_config.json（skillProfiles.<profile> 或 base 的
+# skillDir）> 仓库内置 skills/<包名> > 旧的 ~/.codex 默认路径 > 常见技能根目录下的
+# 自动探测。skillDir 这个配置项是 2026-07-26 补的：缺失告警一直写着"用环境变量
+# SKILL_DIR / server_config.json 指向技能所在位置"，但代码只读环境变量，照着提示往
+# server_config.json 里写是没有任何效果的。
+# 仓库内置那一层是 2026-08-01 补的：此前两个技能包都只存在于开发机的 ~/.codex 下，
+# clone 下来的机器靠 _autodetect 去扫"碰巧装了哪些技能"，行为随机器而变，而失败是
+# 无声的。契约随代码一起版本化之后，不配任何东西也有确定行为。
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_VENDORED_SKILL_ROOT = os.path.join(_PROJECT_ROOT, 'skills')
 _DEFAULT_SKILL_DIR = os.path.join(
     os.path.expanduser('~'), '.codex', 'skills', SKILL_PACKAGE_NAME)
 # 自动探测只在"没有任何显式配置、默认路径也没有契约文件"时兜底，扫这几个技能根目录
@@ -469,11 +524,25 @@ _SKILL_ROOT_CANDIDATES = (
 _SKILL_AUTODETECT_MIN_HITS = 2
 
 
-def _skill_contract_hits(directory):
-    """directory 下命中了几个契约文件（用于挑"最像本项目技能包"的那个目录）。"""
+def _normalize_skill_profile(profile):
+    """把 None / 未知名字归一到已注册的 profile；未知名字回落到 base 而不是抛错。
+
+    这条路径上的输入有一部分来自前端配置（skillProfile、videoModel），拼错一个字母
+    不该让激发/合成整条链路 500——回落到 base 再把这件事喊出来即可。"""
+    name = str(profile or '').strip().lower() or DEFAULT_SKILL_PROFILE
+    return name if name in SKILL_PROFILES else DEFAULT_SKILL_PROFILE
+
+
+def skill_contract_files(profile=None):
+    """某个 profile 的契约清单（相对该包根目录）。"""
+    return SKILL_PROFILES[_normalize_skill_profile(profile)]['contracts']
+
+
+def _skill_contract_hits(directory, profile=None):
+    """directory 下命中了几个契约文件（用于挑"最像这个 profile 的技能包"的目录）。"""
     if not directory or not os.path.isdir(directory):
         return 0
-    return sum(1 for rel in SKILL_CONTRACT_FILES
+    return sum(1 for rel in skill_contract_files(profile)
                if os.path.exists(os.path.join(directory, *rel.split('/'))))
 
 
@@ -487,8 +556,8 @@ def _expand_local_path(raw):
     return os.path.normpath(p)
 
 
-def _autodetect_skill_dir():
-    """在常见技能根目录里挑契约覆盖最全的那个包；都不够格时返回空串。"""
+def _autodetect_skill_dir(profile=None):
+    """在常见技能根目录里挑该 profile 契约覆盖最全的那个包；都不够格时返回空串。"""
     best, best_hits = '', 0
     for root in _SKILL_ROOT_CANDIDATES:
         try:
@@ -497,29 +566,60 @@ def _autodetect_skill_dir():
             continue
         for name in entries:
             candidate = os.path.join(root, name)
-            hits = _skill_contract_hits(candidate)
+            hits = _skill_contract_hits(candidate, profile)
             if hits > best_hits:
                 best, best_hits = candidate, hits
     return best if best_hits >= _SKILL_AUTODETECT_MIN_HITS else ''
 
 
-def _resolve_skill_dir():
-    """返回 (路径, 来源)，来源取值 env / config / default / autodetect。
+def _configured_skill_dir(profile):
+    """server_config.json 里为该 profile 显式写的路径（未写返回空串）。
 
-    显式指定（环境变量或 skillDir）时绝不二次猜测：路径写错了就该在启动日志和前端
-    横幅上看见"这个目录缺 8 个文件"，而不是被自动探测悄悄换成另一个包。"""
-    env_raw = os.environ.get('SKILL_DIR')
+    两个来源：通用的 skillProfiles.<profile>，以及 base 保留的历史顶层键 skillDir。
+    前者优先——写了更明确的那个就该赢。"""
+    profiles_cfg = SERVER_CONFIG.get('skillProfiles')
+    if isinstance(profiles_cfg, dict):
+        raw = profiles_cfg.get(profile)
+        if raw and str(raw).strip():
+            return str(raw)
+    legacy_key = SKILL_PROFILES[profile].get('config_key')
+    if legacy_key:
+        raw = SERVER_CONFIG.get(legacy_key)
+        if raw and str(raw).strip():
+            return str(raw)
+    return ''
+
+
+def _resolve_skill_dir(profile=None):
+    """返回 (路径, 来源)，来源取值 env / config / vendored / default / autodetect。
+
+    显式指定（环境变量或配置）时绝不二次猜测：路径写错了就该在启动日志和前端横幅上
+    看见"这个目录缺 N 个文件"，而不是被自动探测悄悄换成另一个包。"""
+    profile = _normalize_skill_profile(profile)
+    spec = SKILL_PROFILES[profile]
+
+    env_raw = os.environ.get(spec['env'])
     if env_raw and env_raw.strip():
         return _expand_local_path(env_raw), 'env'
-    cfg_raw = SERVER_CONFIG.get('skillDir')
-    if cfg_raw and str(cfg_raw).strip():
+    cfg_raw = _configured_skill_dir(profile)
+    if cfg_raw:
         return _expand_local_path(cfg_raw), 'config'
-    if _skill_contract_hits(_DEFAULT_SKILL_DIR):
-        return _DEFAULT_SKILL_DIR, 'default'
-    found = _autodetect_skill_dir()
+    vendored = os.path.join(_VENDORED_SKILL_ROOT, spec['package'])
+    if _skill_contract_hits(vendored, profile):
+        return vendored, 'vendored'
+    legacy_default = os.path.join(
+        os.path.dirname(_DEFAULT_SKILL_DIR), spec['package'])
+    if _skill_contract_hits(legacy_default, profile):
+        return legacy_default, 'default'
+    found = _autodetect_skill_dir(profile)
     if found:
         return found, 'autodetect'
-    return _DEFAULT_SKILL_DIR, 'default'
+    # 一个都没找到：把 base 指回历史默认路径（既有告警文案与测试都按这个来），其余
+    # profile 指向仓库内该包应该在的位置——缺失清单指着一个"本该由 git 管起来"的
+    # 目录，比指着某台机器的 ~/.codex 更好修。
+    if profile == DEFAULT_SKILL_PROFILE:
+        return _DEFAULT_SKILL_DIR, 'default'
+    return vendored, 'vendored'
 
 
 def _skill_config_mtime():
@@ -529,57 +629,211 @@ def _skill_config_mtime():
         return None
 
 
-SKILL_DIR, SKILL_DIR_SOURCE = _resolve_skill_dir()
+# base 的路径同时暴露成模块全局（历史接口：frame_generator / video_generator 直接
+# import SKILL_DIR，测试也直接 patch 它）；其余 profile 只存在这张表里。
+_SKILL_DIRS = {name: _resolve_skill_dir(name) for name in SKILL_PROFILES}
+SKILL_DIR, SKILL_DIR_SOURCE = _SKILL_DIRS[DEFAULT_SKILL_PROFILE]
 _SKILL_CONFIG_MTIME = _skill_config_mtime()
 
 
-def skill_dir():
-    """技能文件的实际读取路径——激发/合成每次要读契约文件时都走这里。
+def _refresh_skill_dirs_if_config_changed():
+    """server_config.json 的 mtime 变了就把所有 profile 的路径重算一遍。
 
-    顺带做热更新：server_config.json 的 mtime 变了就重算一次 skillDir，所以改完配置
-    下一次「激发创意」立即用新路径，不必重启服务。除 skillDir 外的键不在这里回灌，
-    免得把启动时就固化成模块常量的那些配置（端口、频控…）搞成半新半旧。"""
+    所以改完配置下一次「激发创意」立即用新路径，不必重启服务。除技能路径相关的键
+    外一律不回灌，免得把启动时就固化成模块常量的那些配置（端口、频控…）搞成半新半旧。"""
     global SKILL_DIR, SKILL_DIR_SOURCE, _SKILL_CONFIG_MTIME
     mtime = _skill_config_mtime()
-    if mtime != _SKILL_CONFIG_MTIME:
-        _SKILL_CONFIG_MTIME = mtime
-        try:
-            fresh = _load_server_config()
-        except Exception:
-            fresh = SERVER_CONFIG
-        if fresh.get('skillDir'):
-            SERVER_CONFIG['skillDir'] = fresh.get('skillDir')
+    if mtime == _SKILL_CONFIG_MTIME:
+        return
+    _SKILL_CONFIG_MTIME = mtime
+    try:
+        fresh = _load_server_config()
+    except Exception:
+        fresh = SERVER_CONFIG
+    for key in ('skillDir', 'skillProfiles', 'skillProfile', 'videoModel'):
+        if fresh.get(key):
+            SERVER_CONFIG[key] = fresh.get(key)
         else:
-            SERVER_CONFIG.pop('skillDir', None)
-        SKILL_DIR, SKILL_DIR_SOURCE = _resolve_skill_dir()
-    return SKILL_DIR
+            SERVER_CONFIG.pop(key, None)
+    for name in SKILL_PROFILES:
+        _SKILL_DIRS[name] = _resolve_skill_dir(name)
+    SKILL_DIR, SKILL_DIR_SOURCE = _SKILL_DIRS[DEFAULT_SKILL_PROFILE]
 
 
-def skill_reference_path(name):
+def skill_dir(profile=None):
+    """技能文件的实际读取路径——激发/合成每次要读契约文件时都走这里。"""
+    profile = _normalize_skill_profile(profile)
+    _refresh_skill_dirs_if_config_changed()
+    # base 一律读模块全局：测试与旧代码会直接 patch server_common.SKILL_DIR，
+    # 从表里取会把那种 patch 静默吃掉。
+    if profile == DEFAULT_SKILL_PROFILE:
+        return SKILL_DIR
+    return _SKILL_DIRS[profile][0]
+
+
+def skill_dir_source(profile=None):
+    profile = _normalize_skill_profile(profile)
+    _refresh_skill_dirs_if_config_changed()
+    if profile == DEFAULT_SKILL_PROFILE:
+        return SKILL_DIR_SOURCE
+    return _SKILL_DIRS[profile][1]
+
+
+def skill_reference_path(name, profile=None):
     """技能包 references/ 下某个文件的绝对路径（每次都按当前 skill_dir() 拼）。"""
-    return os.path.join(skill_dir(), 'references', name)
+    return os.path.join(skill_dir(profile), 'references', name)
 
 
-def missing_skill_contract_files():
-    """SKILL_CONTRACT_FILES 里当前不存在的那些（返回相对路径列表，保持声明顺序）。"""
-    base = skill_dir()
-    return [rel for rel in SKILL_CONTRACT_FILES
+def missing_skill_contract_files(profile=None):
+    """该 profile 契约清单里当前不存在的那些（相对路径，保持声明顺序）。"""
+    base = skill_dir(profile)
+    return [rel for rel in skill_contract_files(profile)
             if not os.path.exists(os.path.join(base, *rel.split('/')))]
 
 
-def skill_contract_report():
-    """技能契约现状的单一事实来源：{'dir', 'source', 'missing', 'total'}。
+def skill_contract_report(profile=None):
+    """技能契约现状的单一事实来源：{'profile','label','package','dir','source',
+    'missing','total'}。
 
     调用方（启动检查、/api/mode）一律走这个函数而不是自己拼 SKILL_DIR——server.py 是
     `from server_common import *` 进来的，那份 SKILL_DIR 是导入时的**副本**，之后改
     server_common.SKILL_DIR 它不会跟着变（测试里改路径、配置热切换时都会踩到）。
     dir 在本函数内取值，才保证和 missing 的判定基于同一个路径。"""
+    profile = _normalize_skill_profile(profile)
+    spec = SKILL_PROFILES[profile]
     return {
-        'dir': skill_dir(),
-        'source': SKILL_DIR_SOURCE,
-        'missing': missing_skill_contract_files(),
-        'total': len(SKILL_CONTRACT_FILES),
+        'profile': profile,
+        'label': spec['label'],
+        'package': spec['package'],
+        'dir': skill_dir(profile),
+        'source': skill_dir_source(profile),
+        'missing': missing_skill_contract_files(profile),
+        'total': len(spec['contracts']),
     }
+
+
+def skill_contract_reports():
+    """全部 profile 的契约现状，按注册顺序。启动日志与 /api/mode 用它一次报全：
+    只报当前激活的那个，等于把"另一个包没装好"留到用户切模型的那一刻才炸。"""
+    return [skill_contract_report(name) for name in SKILL_PROFILES]
+
+
+def profile_for_video_model(video_model):
+    """「做哪个模型的提示词」→「读哪个技能包」。不认识的模型名一律回 base。"""
+    haystack = str(video_model or '').lower()
+    for needle, profile in SKILL_PROFILE_VIDEO_MODEL_RULES:
+        if needle in haystack:
+            return profile
+    return DEFAULT_SKILL_PROFILE
+
+
+_SKILL_PROFILE_OVERRIDE_WARNED = set()
+
+
+def active_skill_profile(config=None):
+    """本次请求该用哪个 profile。
+
+    优先级：环境变量 SKILL_PROFILE > 配置 skillProfile > 按 videoModel 推断。
+    显式覆盖存在的意义：换提示词风格不该只能靠改视频模型下拉框——反过来，只想换
+    渲染档位的人也不该被顺手改掉提示词语法。两个值都取 'auto' 时才走推断。
+
+    config 是本次请求带上来的前端配置（run_ideate/合成都会收到），没带就退回
+    服务端 server_config.json。"""
+    _refresh_skill_dirs_if_config_changed()
+    cfg = config if isinstance(config, dict) else SERVER_CONFIG
+    raw = os.environ.get('SKILL_PROFILE') or cfg.get('skillProfile') \
+        or SERVER_CONFIG.get('skillProfile') or 'auto'
+    raw = str(raw).strip().lower()
+    if raw and raw != 'auto':
+        if raw in SKILL_PROFILES:
+            return raw
+        if raw not in _SKILL_PROFILE_OVERRIDE_WARNED:
+            _SKILL_PROFILE_OVERRIDE_WARNED.add(raw)
+            if sys.stdout:
+                print(f"[WARN] 未知的 skillProfile '{raw}'，本次按 videoModel 推断；"
+                      f"可选值：auto/{'/'.join(SKILL_PROFILES)}")
+    return profile_for_video_model(cfg.get('videoModel') or SERVER_CONFIG.get('videoModel'))
+
+
+# ── 单段视频时长 ──
+# omni 的时间线提示词把镜头切点钉在秒上，所以**合成端与生成端必须对同一个数达成一致**。
+# 这就是 videoDuration 不能再留空的原因：空值原本表示"沿用 Flow 面板当前时长"，那是个
+# 不可知态——提示词侧不知道该按几秒排镜头，生成端也不知道面板上残留的是什么值。
+# 只有 Omni Flash 的 Flow 面板提供 4/6/8/10s 时长 tab；其余模型时长固定 8 秒
+# （video_generator._CLIP_BASE_SECONDS 同款口径）。
+FIXED_VIDEO_DURATION = 8
+OMNI_VIDEO_DURATIONS = (4, 6, 8, 10)
+OMNI_DEFAULT_VIDEO_DURATION = 10  # 满六镜所需的时长，见 omni composer 的镜头梯表
+
+
+def resolve_video_duration(config=None):
+    """本次生成的单段视频时长（秒，int）。永远返回一个确定的数，不返回 None。
+
+    非 Omni 系列模型一律 8 秒（面板固定，不可调）；Omni 系列模型取 videoDuration/video_duration，
+    缺失/非法值回落到 10 秒。"""
+    cfg = config if isinstance(config, dict) else SERVER_CONFIG
+    model = str(cfg.get('videoModel') or cfg.get('video_model') or SERVER_CONFIG.get('videoModel') or '').strip().lower()
+    if 'omni' not in model:
+        return FIXED_VIDEO_DURATION
+    raw = cfg.get('videoDuration') if 'videoDuration' in cfg else cfg.get('video_duration')
+    if raw in (None, ''):
+        raw = SERVER_CONFIG.get('videoDuration')
+    try:
+        value = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return OMNI_DEFAULT_VIDEO_DURATION
+    return value if value in OMNI_VIDEO_DURATIONS else OMNI_DEFAULT_VIDEO_DURATION
+
+
+
+# ── 历史选题台账（used-topic-ledger.md）的可写位置 ──
+# 这份文件是**运行时被追加写**的（每选中一个选题就落一行），却长在技能包的
+# references/ 下。技能包进了 git 之后，它会变成"每合成一次就脏一次"的跟踪文件；
+# 而且它按 profile 分裂就等于把去重记忆劈成两半——同一个选题在 Veo 侧用过、在
+# Omni 侧还能再被激发出来，那是同一条视频换个分镜语法，不是新选题。
+# 所以：写入统一去 runtime/（已整目录 gitignore），包内那份降级为只读种子，
+# 首次使用时整份拷过去，历史记录不丢。
+USED_TOPIC_LEDGER_FILE = _path_setting(
+    'SPARK_USED_TOPIC_LEDGER_FILE', 'usedTopicLedgerFile',
+    os.path.join('runtime', 'used-topic-ledger.md'))
+USED_TOPIC_LEDGER_SEED = 'used-topic-ledger.md'
+
+
+def used_topic_ledger_path():
+    """可写台账的绝对路径（相对路径按项目根解析）。"""
+    p = USED_TOPIC_LEDGER_FILE
+    if not os.path.isabs(p):
+        p = os.path.join(_PROJECT_ROOT, p)
+    return os.path.normpath(p)
+
+
+def ensure_used_topic_ledger(profile=None):
+    """返回可写台账路径；首次调用时从技能包里的种子整份拷贝。
+
+    种子按 profile 取，取不到再退到 base——两个包的台账是同一份语料（omni 那份是
+    从 base 继承来的，只多一段 provenance 说明），所以谁先播种都不影响去重。"""
+    path = used_topic_ledger_path()
+    if os.path.exists(path):
+        return path
+    seeds = [skill_reference_path(USED_TOPIC_LEDGER_SEED, profile)]
+    if _normalize_skill_profile(profile) != DEFAULT_SKILL_PROFILE:
+        seeds.append(skill_reference_path(USED_TOPIC_LEDGER_SEED, DEFAULT_SKILL_PROFILE))
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        for seed in seeds:
+            if os.path.exists(seed):
+                shutil.copyfile(seed, path)
+                if sys.stdout:
+                    print(f"[LEDGER] 已从技能包种子初始化可写台账: {seed} → {path}")
+                return path
+        # 种子也缺：建一个空文件，让后续追加有落点（去重能力这次确实是降级的，
+        # 契约缺失清单里会把 references/used-topic-ledger.md 报出来）。
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('# Used Topic Ledger\n\n')
+    except Exception as e:
+        if sys.stdout:
+            print(f"Warning: could not initialize used-topic-ledger at {path} ({e})")
+    return path
 
 # ============================================================================
 # 运行时能力探针（Runtime Capability Report）
@@ -606,17 +860,22 @@ def _module_available(name):
         return False
 
 
-def runtime_capability_report():
+def runtime_capability_report(config=None):
     """{'degraded': [...], 'numpy': bool, 'pillow': bool, 'ffmpeg': bool,
-        'skill_contract_missing': [...]}。
+        'skill_profile': str, 'skill_contract_missing': [...]}。
 
     degraded 是给人看的中文短句列表，空列表 = 能力齐全。判定全部即时进行，不做缓存：
     这几样都可能在服务运行期间被装上/删掉（换 venv、改 skillDir），缓存只会让清单
-    记录当年那一刻的假象。"""
+    记录当年那一刻的假象。
+
+    契约按**本单实际用的那个 profile**查（config 是本次请求的配置）：这一层存在的
+    全部理由就是"三天后看着一单成片，能知道它当初是在哪个包、缺不缺契约的状态下
+    合成的"——固定查 base 的话，一单 omni 成片的记录就是错的。"""
     numpy_ok = _module_available('numpy')
     pillow_ok = _module_available('PIL')
     ffmpeg_ok = bool(shutil.which('ffmpeg'))
-    missing_skill = missing_skill_contract_files()
+    profile = active_skill_profile(config)
+    missing_skill = missing_skill_contract_files(profile)
     degraded = []
     if not numpy_ok:
         degraded.append(
@@ -628,14 +887,15 @@ def runtime_capability_report():
         degraded.append('ffmpeg 不在 PATH：视频抽帧类校验（防串片、冻结检测）无法进行')
     if missing_skill:
         degraded.append(
-            f'技能契约缺 {len(missing_skill)}/{len(SKILL_CONTRACT_FILES)} 个文件'
-            f'（{", ".join(missing_skill)}）：提示词合成按空契约降级，'
+            f'技能契约缺 {len(missing_skill)}/{len(skill_contract_files(profile))} 个文件'
+            f'（{profile} 包：{", ".join(missing_skill)}）：提示词合成按空契约降级，'
             f'创意维度变窄、一致性约束消失')
     return {
         'degraded': degraded,
         'numpy': numpy_ok,
         'pillow': pillow_ok,
         'ffmpeg': ffmpeg_ok,
+        'skill_profile': profile,
         'skill_contract_missing': missing_skill,
     }
 
@@ -698,6 +958,9 @@ def fx_cancel_context(cancel_fn, deadline=None, poll_interval=0.5):
     progress_cb('cancel_check') / cancel_event.is_set 都满足）。
 
     deadline：绝对时刻（time.time() 秒），FX 运行时的 deadline_exceeded() 兜底用；None 不限时。
+    调用方应传 fx_request_deadline()——2026-08-01 之前所有生产调用点都漏传了它，
+    于是 CancelState.deadline 恒为 None、deadline_exceeded() 恒为 False，
+    GOOGLE_FX_REQUEST_BUDGET_SECONDS 这个控制台旋钮从头到尾没接线（详见该函数）。
     FX 依赖不可用（纯 API 后端、依赖未安装）时安静降级成 no-op。
     """
     if cancel_fn is None:
@@ -749,6 +1012,36 @@ def fx_cancel_context(cancel_fn, deadline=None, poll_interval=0.5):
         # 这里留着已置位的旧状态反而能让收尾路上的 _check_cancelled() 继续短路。
 
 
+def fx_request_deadline(budget_seconds=None):
+    """本次 FX 请求的绝对超时时刻（time.time() 秒），喂给 fx_cancel_context(deadline=...)。
+
+    FX 侧一直备好了整套预算机制——config.GOOGLE_FX_REQUEST_BUDGET_SECONDS、
+    get_runtime_request_budget_seconds()、helpers._check_cancelled() 与
+    _ChunkRunner._check_cancel() 里的 deadline_exceeded() 检查、以及 fx_console
+    里那个「单请求总时间预算」输入框——唯独没人把 deadline 传进 CancelState。
+    结果 remaining_seconds() 恒返 None、deadline_exceeded() 恒返 False，用户在控制台
+    改这个值不会有任何效果。本函数就是那根缺失的接线。
+
+    走 get_runtime_request_budget_seconds() 而不是模块常量：控制台热调后立刻生效。
+    返回 None 表示不限时（读不到配置时的安全降级——宁可不限时，也不要凭空给正在
+    跑的批次安一个假预算把它掐掉）。
+    """
+    if budget_seconds is None:
+        try:
+            from integrations.google_fx.config import get_runtime_request_budget_seconds
+            budget_seconds = get_runtime_request_budget_seconds()
+        except Exception as e:
+            print(f"Warning: 读取 Google FX 请求预算失败，本次不限时 ({e})")
+            return None
+    try:
+        budget_seconds = float(budget_seconds)
+    except (TypeError, ValueError):
+        return None
+    if budget_seconds <= 0:
+        return None
+    return time.time() + budget_seconds
+
+
 # ── 换 IP 已全局关停（2026-07-26）──
 # 历史：AdsPower 侧原本每 googleFxIpRotateRequests（默认 5）个请求换一次 IP；后来改成
 # 「先在同一个 IP 上把号池轮一圈，轮满 googleFxAccountsPerIp 个号才放行一次换 IP」来压
@@ -796,6 +1089,9 @@ def apply_google_fx_runtime_overrides(config):
     video_model = str(config.get('videoModel') or '').strip()
     if video_model:
         os.environ['GOOGLE_FX_VIDEO_MODEL'] = video_model
+    video_ref_mode = str(config.get('videoRefMode') or '').strip()
+    if video_ref_mode:
+        os.environ['GOOGLE_FX_VIDEO_REF_MODE'] = video_ref_mode
 
 
 def _get_account_pool_service():
@@ -927,6 +1223,14 @@ def _next_unused_account(config, pool, ring, exclude):
     return None
 
 
+# FX 模型设置（视频模型 / 图片模型 / 视频时长）由 FX 服务管理中心统一管理，
+# server_config.json 是唯一权威源。浏览器 localStorage 可能缓着旧模型——让它
+# 覆盖服务端就会出现"在控制台改了模型但不生效"的静默失效。
+_SERVER_AUTHORITATIVE_KEYS = frozenset({
+    'videoModel', 'googleFxImageModel', 'videoDuration',
+})
+
+
 def effective_config(client_config):
     client_config = dict(client_config or {})
     # 默认环境与换号节拍只有一个权威来源：Google FX 服务管理中心写入的服务端配置。
@@ -938,6 +1242,10 @@ def effective_config(client_config):
         merged = dict(client_config)
         for key in ('googleFxIpRotateRequests', 'googleFxSequenceUserId',
                     'googleFxSequenceUserLock'):
+            if key in SERVER_CONFIG:
+                merged[key] = SERVER_CONFIG[key]
+        # FX 模型设置：服务端配置优先，防止浏览器旧缓存覆盖控制台的改动
+        for key in _SERVER_AUTHORITATIVE_KEYS:
             if key in SERVER_CONFIG:
                 merged[key] = SERVER_CONFIG[key]
         if 'googleFxImageModel' in merged:
@@ -973,8 +1281,18 @@ def effective_config(client_config):
         for k in ('cheapModel', 'auxModel'):
             if client_config.get(k):
                 merged[k] = client_config[k]
-    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'videoDuration', 'adsPowerPort', 'videoAccountPoolMinCredit', 'qaGateLevel', 'realityCheckpointInterval', 'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath'):
-        if k in client_config:
+    # skillProfile 同批（2026-08-01）：激发页脚的「提示词链路」选择器就是靠它把
+    # base/omni 送到服务端的（active_skill_profile 读的正是 config['skillProfile']）。
+    # 不进这份白名单，托管模式下前端选了哪条链路会被整个丢掉——用户以为切了，
+    # 实际永远按 videoModel 推断，和 qaGateLevel / imageEditTransport 当年是同一个口子。
+    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'videoDuration', 'adsPowerPort', 'videoAccountPoolMinCredit', 'qaGateLevel', 'realityCheckpointInterval', 'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile'):
+        if k in _SERVER_AUTHORITATIVE_KEYS:
+            # FX 模型设置：服务端配置优先，防止浏览器旧缓存覆盖控制台的改动
+            if k in SERVER_CONFIG:
+                merged[k] = SERVER_CONFIG[k]
+            elif k in client_config:
+                merged[k] = client_config[k]
+        elif k in client_config:
             merged[k] = client_config[k]
         elif k in SERVER_CONFIG:
             merged[k] = SERVER_CONFIG[k]

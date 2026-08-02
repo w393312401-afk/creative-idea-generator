@@ -710,21 +710,37 @@ class TestPacingGateDoesNotDiscardPassingCards(unittest.TestCase):
             self.assertEqual(idea['pacing_skeleton'], 'nested_space_payoff')
             self.assertEqual(pp.pacing_skeleton_outline_violations(idea), [])
 
+    GENERIC_BURNED = [
+        {'topic_dna': 'glacier-ice-cave / refuge-den / self-material-window'},
+        {'topic_dna': 'retired-submarine / micro-home / porthole-lighting'},
+        {'topic_dna': 'missile-silo / burrow-dwelling / roof-hatch'},
+    ]
+
     def test_exhausted_fallback_raises_instead_of_returning_an_empty_batch(self):
-        """兜底选题被台账全部认领时，以前静静返回空数组，前端只显示「暂无灵感推荐」,
-        分不清是模型挂了还是兜底用完了。现在必须报出可执行的原因。"""
-        burned = [
-            {'topic_dna': 'glacier-ice-cave / refuge-den / self-material-window'},
-            {'topic_dna': 'retired-submarine / micro-home / porthole-lighting'},
-            {'topic_dna': 'missile-silo / burrow-dwelling / roof-hatch'},
-        ]
-        with patch.object(pp, 'read_ledger', return_value=burned), \
+        """兜底池被台账认领干净时，以前静静返回空数组，前端只显示「暂无灵感推荐」,
+        分不清是模型挂了还是兜底用完了。现在必须报出可执行的原因。
+
+        用单线选择来测：nested 的埋地池按设计「用光了也照原样再发一遍」（见
+        run_ideate 里的 `or nested_pool`），那条路永远不会空手。"""
+        with patch.object(pp, 'read_ledger', return_value=list(self.GENERIC_BURNED)), \
              patch.object(pp, 'fetch_trend_snippet', return_value=''), \
              patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
              patch.object(pp, '_chat', side_effect=RuntimeError('proxy down')):
             with self.assertRaises(RuntimeError) as ctx:
-                pp.run_ideate({}, count=3)
+                pp.run_ideate({}, count=3, pacing_skeleton_ids=['linear_milestone'])
         self.assertIn('没有产出任何新卡片', str(ctx.exception))
+
+    def test_burned_generic_pool_does_not_take_the_buried_topics_down_with_it(self):
+        """两个兜底池各自独立：通用三条（冰洞/潜艇/导弹井）被用光时，埋地选题
+        照样要发得出来——它是「双空间重置兑现」唯一的兜底来源。"""
+        with patch.object(pp, 'read_ledger', return_value=list(self.GENERIC_BURNED)), \
+             patch.object(pp, 'fetch_trend_snippet', return_value=''), \
+             patch.object(pp, 'fetch_custom_url_snippet', return_value=''), \
+             patch.object(pp, '_chat', side_effect=RuntimeError('proxy down')):
+            result = pp.run_ideate({}, count=3)
+        titles = [i['title'] for i in result['ideas']]
+        self.assertTrue(titles, '通用池用光不该把埋地兜底一起带走')
+        self.assertTrue(all(i['pacing_skeleton'] == 'nested_space_payoff' for i in result['ideas']))
 
 
 if __name__ == '__main__':

@@ -115,6 +115,19 @@ def test_nested_slot_is_reentrant(control):
     assert holds_fx_slot() is False
 
 
+def test_nested_server_browser_slot_reuses_non_reentrant_guard(monkeypatch, control):
+    """回归：生成任务内的 stale 积分探测不能二次获取同一把 threading.Lock。"""
+    monkeypatch.setattr(server, 'FX_CONTROL', control)
+    with server._fx_browser_slot('videos_1', 'videos'):
+        assert server._FX_SERIAL_LOCK.locked()
+        started = time.time()
+        with server._fx_browser_slot('credit_probe_x', 'credit_probe'):
+            assert control.snapshot()['active']['task_id'] == 'videos_1'
+            assert server._FX_SERIAL_LOCK.locked()
+        assert time.time() - started < 0.5
+    assert not server._FX_SERIAL_LOCK.locked()
+
+
 def test_probe_waits_instead_of_stealing_the_browser(control):
     """探针不在任务上下文里时必须排队，不能和生成任务同时进浏览器。"""
     holding = threading.Event()
@@ -165,8 +178,9 @@ def test_browser_gate_is_noop_when_not_installed():
 
 # ── C2 ───────────────────────────────────────────────────────────────────────
 
-def test_max_concurrent_can_be_raised(control):
+def test_max_concurrent_is_clamped_to_real_global_browser_capacity(control):
     control.set_limits({'max_concurrent': 2})
+    assert control.limits()['max_concurrent'] == 1
     entered = threading.Event()
     second = threading.Event()
     release = threading.Event()
@@ -185,17 +199,18 @@ def test_max_concurrent_can_be_raised(control):
     for thread in threads:
         thread.start()
     try:
-        assert entered.wait(2) and second.wait(2), '并发度 2 时两个任务应同时在跑'
-        assert control.snapshot()['active_count'] == 2
+        assert entered.wait(2)
+        time.sleep(0.2)
+        assert not second.is_set(), '全局浏览器锁存在时第二个任务不得被伪放行为 active'
+        assert control.snapshot()['active_count'] == 1
     finally:
         release.set()
         for thread in threads:
             thread.join(3)
 
 
-def test_kind_limit_blocks_same_kind_but_lets_other_kinds_through(control):
-    """分类配额不能造成队首阻塞：某类配额用满时其它类必须还能走。"""
-    control.set_limits({'max_concurrent': 2, 'kind_limits': {'videos': 1}})
+def test_kind_limit_cannot_bypass_global_single_browser_capacity(control):
+    control.set_limits({'max_concurrent': 1, 'kind_limits': {'videos': 1}})
     release = threading.Event()
     marks = {}
 
@@ -216,7 +231,7 @@ def test_kind_limit_blocks_same_kind_but_lets_other_kinds_through(control):
     time.sleep(0.2)
     threads[2].start()
     try:
-        assert f1_in.wait(2), 'videos 配额满时 frames 仍应放行'
+        assert not f1_in.wait(0.3), '全局单浏览器容量满时 frames 也必须等待'
         assert not v2_in.is_set(), '第二个 videos 必须被配额挡住'
     finally:
         release.set()
@@ -298,7 +313,7 @@ def test_queue_state_and_limits_survive_restart(tmp_path):
     first.set_mode('pause')
 
     second = FxControlPlane(state, audit)
-    assert second.limits()['max_concurrent'] == 3
+    assert second.limits()['max_concurrent'] == 1
     assert second.limits()['task_timeout_seconds'] == 42
     assert second.snapshot()['mode'] == 'paused'
 

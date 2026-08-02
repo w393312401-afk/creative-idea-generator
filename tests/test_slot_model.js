@@ -5,7 +5,7 @@
 // 跑法：node tests/test_slot_model.js
 const assert = require('assert');
 const {
-    padSlot, slotIsStale, slotIsHero,
+    padSlot, slotIsStale, slotIsHero, frameIsFixable,
     frameSlotState, videoSlotState, slotPendingState,
     videoSlotLabel, summarizeSlotStates,
 } = require('../js/slot_model.js');
@@ -64,6 +64,33 @@ assert.ok(s.actions.find(a => a.act === 'describe-frame').label === '改描述')
 s = ready({ manual_issue: '墙面材质不对' });
 assert.deepStrictEqual(badges(s), ['manual-flagged']);
 assert.ok(acts(s).includes('fix-frame'));
+
+// ── 撤销修复：只有真的存下过快照的帧才给这个出口 ─────────────────────
+// 修复是覆盖写同一个帧文件，没有快照就真的退不回去——不能画一枚点了会报错的按钮。
+s = ready({ quality_gate: 'pending_manual_review',
+            fix_backup: { at: '2026-08-02T10:00:00', reason: '塔吊消失' } });
+assert.ok(acts(s).includes('undo-fix'), '有快照就该给撤销入口');
+assert.ok(s.actions.find(a => a.act === 'undo-fix').idleTitle.includes('2026-08-02T10:00:00'),
+          '悬浮说明要写清退回到哪一版');
+assert.ok(!acts(ready({})).includes('undo-fix'), '没修过的帧不给撤销入口');
+assert.ok(!acts(ready({ fix_backup: 'not-an-object' })).includes('undo-fix'));
+
+// ── 待修判定收口：卡片按钮与工具条的「全部修复」必须读同一条 ──────────
+// 工具条不能自己再推一遍"哪些帧要修"，否则一键修出来的名单与画着修复按钮的
+// 格子迟早对不上（见 js/slot_toolbar.js 的 fixableSlotSequences）。
+assert.ok(frameIsFixable({ quality_gate: 'sequence_review_flagged' }));
+assert.ok(frameIsFixable({ quality_gate: 'vlm_qa_failed' }), '旧质检门终态也要认');
+assert.ok(frameIsFixable({ manual_issue: '门开反了' }));
+assert.ok(!frameIsFixable({ quality_gate: 'auto_approved' }));
+assert.ok(!frameIsFixable({ manual_issue: '   ' }), '空白描述不算人工标记');
+assert.ok(!frameIsFixable(null));
+// flags.fixable 与卡片上的 fix-frame 按钮同进同出
+[{ quality_gate: 'sequence_review_flagged' }, { manual_issue: '门开反了' },
+ { quality_gate: 'auto_approved' }, { quality_gate: 'i2i_fallback_degraded' }].forEach(over => {
+    const st = ready(over);
+    assert.strictEqual(st.flags.fixable, frameIsFixable(Object.assign({ sequence: 3 }, over)));
+    assert.strictEqual(st.flags.fixable, acts(st).includes('fix-frame'));
+});
 
 s = ready({ quality_gate: 'auto_approved_degraded' });
 assert.deepStrictEqual(badges(s), ['unverified']);

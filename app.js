@@ -54,16 +54,38 @@ async function initServerMode() {
                 }
             }
         }
+        // 「视频模型名 → 提示词链路」的规则表由服务端下发，前端只按表匹配显示
+        // （见 js/config.js resolveAutoSkillProfile）。在前端硬编码一份 omni 判断，
+        // 就是给同一件事留了第二个会漂移的真相源。拿到后重刷一次链路选择器：
+        // initServerMode 是异步的，首帧渲染时 auto 的徽标还没有规则可用。
+        if (m && Array.isArray(m.skill_profile_rules)) {
+            window.SKILL_PROFILE_RULES = m.skill_profile_rules;
+        }
+        if (m && m.skill_profile_default) {
+            window.SKILL_PROFILE_DEFAULT = m.skill_profile_default;
+        }
+        if (typeof syncIdeationSkillProfilePicker === 'function') {
+            syncIdeationSkillProfilePicker();
+        }
         // 技能契约缺失只劣化生成质量、不影响接口可用性，过去仅写进启动日志——
         // 从浏览器用的人看不到那个终端，等于没有告知。这里提示一次。
-        const sc = m && m.skill_contract;
-        if (sc && Array.isArray(sc.missing) && sc.missing.length > 0) {
-            console.warn('skill contract missing', sc.dir, sc.source, sc.missing);
+        // 两个 profile（base / omni）都要查：只查当前激活的那个，等于把"另一个包
+        // 没装好"留到用户切视频模型的那一刻才炸。缺失的那个是不是当前激活的，
+        // 决定文案是"生成质量正在降级"还是"切过去就会降级"。
+        const reports = (m && Array.isArray(m.skill_contracts) && m.skill_contracts.length)
+            ? m.skill_contracts
+            : (m && m.skill_contract ? [m.skill_contract] : []);
+        for (const sc of reports) {
+            if (!sc || !Array.isArray(sc.missing) || sc.missing.length === 0) continue;
+            const isActive = !m.skill_profile || sc.profile === m.skill_profile || !sc.profile;
+            console.warn('skill contract missing', sc.profile, sc.dir, sc.source, sc.missing);
             showToast(
-                `⚠️ 技能契约缺失 ${sc.missing.length}/${sc.total} 个文件，生成质量将降级。`
-                + `当前技能包目录：${sc.dir}。`
-                + `请在 server_config.json 里把 skillDir 指向技能包所在目录（改完不用重启）`,
-                'error', 10000);
+                `⚠️ 技能契约缺失 ${sc.missing.length}/${sc.total} 个文件`
+                + `（${sc.label || sc.profile || ''}${isActive ? '，当前正在用' : '，切到该模型时才会用'}）`
+                + `${isActive ? '，生成质量将降级' : ''}。`
+                + `技能包目录：${sc.dir}。`
+                + `请在 server_config.json 的 skillProfiles 里把 "${sc.profile || 'base'}" 指向技能包所在目录（改完不用重启）`,
+                isActive ? 'error' : 'warning', 10000);
         }
     } catch (e) {
         console.warn('mode check failed', e);
@@ -1254,6 +1276,17 @@ function setupEventListeners() {
     document.getElementById('make-cover-btn').addEventListener('click', () => generateCover());
     document.getElementById('generate-frames-btn').addEventListener('click', () => generateFrames());
     document.getElementById('run-sequence-review-btn').addEventListener('click', () => runSequenceReview());
+    const fullReviewBtn = document.getElementById('run-full-sequence-review-btn');
+    if (fullReviewBtn) {
+        fullReviewBtn.addEventListener('click', async () => {
+            // 全量重审要烧掉整套调用，先说清代价再跑
+            const ok = await customConfirm(
+                '全量重审会把每一拍与跨帧层整个重跑一遍，不复用任何既有结论——'
+                + '十几帧的单子通常是几分钟、几十次模型调用。<br><br>'
+                + '日常修完帧之后用「🔍 一致性审查」就够：它只重审帧图变过的那几拍。');
+            if (ok) runSequenceReview('full');
+        });
+    }
     const deletedSlotsBtn = document.getElementById('deleted-slots-btn');
     if (deletedSlotsBtn) deletedSlotsBtn.addEventListener('click', () => openDeletedSlotsPanel());
     document.getElementById('generate-videos-btn').addEventListener('click', () => generateVideos());
@@ -4039,7 +4072,9 @@ let currentIdeatedIdeas = [];
 // v8 作废「双空间重置兑现」用自然/原地载体（冰洞、竖井、地窖）产出的旧卡：
 // 该骨架现在要求人工运输载体（集装箱/校车/大巴/机身）在第一拍被装备运到现场落位，
 // 旧缓存卡的第一拍是「清理」，与新契约对不上。
-const IDEATION_CACHE_VERSION = '8-nested-space-transported-carrier';
+// v9 把该参考从“只借四幕结构”升级为埋地校车原片的施工顺序一比一复刻；旧卡缺少
+// 入口井、逐层地面/墙顶和开门重置等明确阶段，不能继续冒充新骨架产物。
+const IDEATION_CACHE_VERSION = '9-nested-space-literal-stage-order';
 const DEFAULT_PACING_SKELETON_IDS = ['linear_milestone', 'dual_payoff', 'nested_space_payoff'];
 
 function getSelectedPacingSkeletonIds() {

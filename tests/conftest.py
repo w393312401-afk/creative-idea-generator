@@ -52,3 +52,21 @@ def _isolate_repo_root_state_files(tmp_path_factory, monkeypatch):
         ('COMPOSE_CHECKPOINT_PATH', 'compose_checkpoints.json'),
     ):
         monkeypatch.setattr(prompt_pipeline, attr, str(state_dir / filename), raising=True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_used_topic_ledger(tmp_path_factory, monkeypatch):
+    """把可写的历史选题台账（runtime/used-topic-ledger.md）也重定向到临时目录。
+
+    同上一条 fixture 的理由，只是方向更危险：这份台账是**会被追加写**的去重记忆
+    （每选中一个选题落一行）。不隔离的话，任何一个跑到 append_to_used_topic_ledger
+    的测试都会往开发者的真实台账里塞桩数据，之后真实激发会把这些桩当成"已用选题"
+    永久回避掉——一次静默的创意面缩窄，而且没人会想到去台账里翻。
+    需要断言台账路径行为的测试（test_skill_profiles.py）自行 patch 覆盖本 fixture。"""
+    import server_common
+    path = tmp_path_factory.mktemp('ledger') / 'used-topic-ledger.md'
+    # 先建成空文件：否则首次读取会从真实技能包里整份播种，把开发机上几百行真实
+    # 选题喂进 run_ideate 的 system prompt——大量 ideate 测试（此前靠 patch
+    # load_reference_file 拿到空台账）会因为这些真实内容而断言反转。
+    path.write_text('', encoding='utf-8')
+    monkeypatch.setattr(server_common, 'USED_TOPIC_LEDGER_FILE', str(path))

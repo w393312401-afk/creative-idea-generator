@@ -104,7 +104,12 @@ def live_server(tmp_path):
                # ——实测漏掉 SPARK_LIBRARY_DIR 时，这个用例往真实创意库里写进了一条
                # 名为 e2e_restore_demo 的垃圾记录。
                SPARK_LIBRARY_DIR=str(tmp_path / "library"),
-               SPARK_TASKS_DIR=str(tmp_path / "tasks"))
+               SPARK_TASKS_DIR=str(tmp_path / "tasks"),
+               # 2026-08-01：历史选题台账改成写 runtime/used-topic-ledger.md（技能包
+               # 里那份降级为只读种子）。conftest 的隔离 fixture 是进程内 monkeypatch，
+               # 穿不透这里 Popen 出来的真服务——不带这一项，这个用例会往开发者真实的
+               # 去重记忆里塞 e2e 桩选题，之后真实激发会永久回避它。
+               SPARK_USED_TOPIC_LEDGER_FILE=str(tmp_path / "used-topic-ledger.md"))
     proc = subprocess.Popen([sys.executable, "server.py"], cwd=ROOT, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     base = "http://127.0.0.1:%d" % port

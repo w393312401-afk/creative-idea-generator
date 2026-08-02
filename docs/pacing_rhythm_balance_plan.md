@@ -218,29 +218,57 @@ def beat_delta_weight(beat):
             or beat.get('bridge_stage') or beat.get('hard_cut'):
         return None
     ops = len(beat.get('package_operations') or []) or 1
-    w = ops * _SCOPE_WEIGHT.get(beat.get('stage_scope'), 0.6)
+    package_factor = 1.0 + _PACKAGE_MARGINAL_WEIGHT * (ops - 1)   # 边际计价，见 §3.2
+    w = package_factor * _SCOPE_WEIGHT.get(beat.get('stage_scope'), 0.6)
     w += _GRID_SPAN_WEIGHT * max(0, len(set(beat.get('changed_grid_cells') or [])) - 1)
     w += _FAMILY_SPAN_WEIGHT * max(0, _layer_family_span(beat) - 1)
     return round(w, 2)
 ```
 
-`_layer_family_span(beat)` 数这一拍的 `package_operations` + `milestone_name` 跨了几个材料层族，
+`_layer_family_span(beat)` 数这一拍的 `operation` + `package_operations` 跨了几个材料层族，
 **复用 §1.5 提到的那份七族词表**——同时把 `:9691` / `:9784` 的两份内联副本收编成一个
 模块级常量 `_LAYER_FAMILIES`，顺手还掉那笔技术债。
 
-### 3.2 拍重的实际落点（用来校准常量）
+> **2026-08-02 修正**：`milestone_name` 已从取字段口径里摘掉。它按 schema 第 10 条是
+> 「这一拍**终结在什么产物上**」，产物名天然要带上所依附/覆盖的基层
+> （`plank flooring laid over the insulated joists`），算进族跨度等于给每个正确的
+> 覆盖拍白加 0.4 拍重。同一个漏改点还让 `milestone_ladder_violations` 的相位跨越
+> 判据把覆盖拍全判成违规——那是 server.log 里 36% 整单硬失败的根因。
+
+### 3.2 拍重的实际落点（2026-08-02 用真实单校准）
+
+打包项是**边际计价**而不是线性计价：第 1 道工序算满额，之后每道只算半个基准
+（`_PACKAGE_MARGINAL_WEIGHT = 0.5`）。理由是 `beat_system` 的 SINGLE MILESTONE
+PACKAGE RULE 本身就规定打包的前提是「同一区域内、共同读出**同一个**终端产物」的
+紧密工序——观众看到的仍然是一个里程碑。线性计价把「一个里程碑用了几道工序」
+当成了「几个里程碑」，而「摊得多广、穿了几层」已经由格位跨度和材料层跨度两项
+独立表达了，不该由工序条数再重复计一遍。
 
 | 拍 | 派生 | 拍重 |
 |---|---|---|
-| 装一盏吊灯（1 op，1 格，1 族，default） | 1×0.6 | **0.60** |
-| 装一盏吊灯（同上但 `large`，即真实数据的常态形态） | 1×1.6 | **1.60** |
-| 铺完整面墙的龙骨（1 op，2 格，1 族，large） | 1×1.6 + 0.3 | **1.90** |
-| 封板 + 批腻子（2 op，2 格，跨 2 族，large） | 2×1.6 + 0.3 + 0.4 | **3.90** |
-| 封板 + 批腻子 + 刷漆（3 op，3 格，跨 2 族，large） | 3×1.6 + 0.6 + 0.4 | **5.80** |
+| 装一盏吊灯（1 op，1 格，1 族，default） | 1.0×0.6 | **0.60** |
+| 装一盏吊灯（同上但 `large`，即真实数据的常态形态） | 1.0×1.6 | **1.60** |
+| 铺完整面墙的龙骨（1 op，2 格，1 族，large） | 1.0×1.6 + 0.3 | **1.90** |
+| 单区紧凑打包（3 op，1 格，1 族，large） | 2.0×1.6 | **3.20** |
+| 封板 + 批腻子（2 op，2 格，跨 2 族，large） | 1.5×1.6 + 0.3 + 0.4 | **3.10** |
+| 封板 + 批腻子 + 刷漆（3 op，3 格，跨 2 族，large） | 2.0×1.6 + 0.6 + 0.4 | **4.20** |
 
 **在 §1.2 说明的真实数据形态下（`stage_scope` 恒为 `large`），实际跨度是
-1.60 ~ 5.80，约 3.6 倍**；把 `default` 拍也算进来的理论跨度是 9.7 倍。
-两者屏幕时间完全相同——这个比值就是用户观感问题的量化表达，也是本方案要收敛的目标量。
+1.60 ~ 4.20，约 2.6 倍**——这个比值就是用户观感问题的量化表达，也是本方案要收敛的目标量。
+
+线性计价那一版（1.60 ~ 5.80）与 §4 的带宽在数值上**自相矛盾**，实测会把前两次重排
+稳定烧光：
+
+- 3 工序拍恒为 `3×1.6 = 4.80`，而 `dual`/`nested` 的 `hard_ceiling` 是 `3.20`
+  → prompt 明写「允许最多三道紧密工序」，门禁却一律打回；
+- 1 工序拍 `1.60` 挨着 2 工序拍 `3.20`，比值恒为 `2.00 > neighbor_ratio 1.80`
+  → **任何**单工序拍与双工序拍相邻都违规，唯一合法解是全序列同工序数。
+
+而 `nested_space_payoff` 的 FIXED SLOT BLUEPRINT 把拍数钉死、材料层数多于槽位，
+打包是结构上的刚需。「必须打包」与「打包必违规」对撞，模型只能反复整条重写。
+改成边际计价后：单工序三个落点原样保留，双工序相邻比值降到 1.50（合法），
+紧凑三工序拍 3.20 刚好压线合法，一旦摊开格位/材料层仍会超顶被打回——
+**放宽的是计价方式，不是尺度。**
 
 ### 3.3 先只观测，不打回
 
@@ -593,7 +621,9 @@ Google FX 不暴露它（§5.2）。所有时长调度都在合并阶段做。
 
 **`beat_delta_weight`**
 - 运镜拍（threshold / reward / bridge_stage=1 / hard_cut=True）四种各返回 `None`
-- §3.2 表里四个落点逐一对上（这张表就是常量的回归锁）
+- §3.2 表里六个落点逐一对上（这张表就是常量的回归锁）
+- 门禁必须有解：单区紧凑三工序拍 ≤ `hard_ceiling`，单工序拍挨着双工序拍
+  ≤ `neighbor_ratio`（`test_package_pricing_keeps_the_gates_satisfiable`）
 - 缺字段的畸形 beat 不抛异常，落到最小权重
 
 **`rhythm_ladder_violations`**

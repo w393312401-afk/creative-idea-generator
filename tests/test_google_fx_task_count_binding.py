@@ -52,3 +52,25 @@ def test_video_count_falls_back_to_runtime_default_when_unbound(tmp_path, monkey
         ])
 
     assert _counts() == {"default": 1}
+
+
+def test_video_count_records_real_submissions_including_retries(tmp_path, monkeypatch):
+    class _RetriedRunner:
+        def __init__(self, **_kwargs):
+            self.submitted_count = 3
+
+        def run(self):
+            return [{"status": "success", "video_url": "https://example.test/video.mp4"}]
+
+    monkeypatch.setattr(ap, "_STATE_FILE", tmp_path / "accounts.json")
+    monkeypatch.setattr(ap.AccountPool, "_profile_name_map", lambda self: {})
+    monkeypatch.setattr(video, "_ChunkRunner", _RetriedRunner)
+    monkeypatch.setattr(video, "get_runtime_default_user_id", lambda: "actual")
+    ap.AccountPool().add_account("actual")
+
+    with account_binding.bound_task_account("actual"):
+        video.generate_videos_batch_google_fx([
+            SimpleNamespace(prompt="one", model="veo-3.1")
+        ])
+
+    assert _counts() == {"actual": 3}

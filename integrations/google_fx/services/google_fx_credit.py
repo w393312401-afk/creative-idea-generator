@@ -282,6 +282,7 @@ def probe_flow_credit(
     credit = None
     page_text_snippet = ""
     entered_slot = False
+    slot_wait_started = time.monotonic()
     try:
         # 探针优先级高于生成任务：它很短，且选号要靠它的结果，不该排在长任务后面。
         with browser_slot('credit_probe', cancel_check=_slot_cancel,
@@ -371,11 +372,23 @@ def probe_flow_credit(
         # 还没进临界区就抛出 = 卡在队列上（控制面的 FxQueueCancelled/FxQueueTimeout）。
         # 这跟"探测本身失败"是两回事，报错文案要能让用户看出该等还是该查账号。
         if not entered_slot:
-            message = ("浏览器被其它 FX 任务占用，"
-                       f"排队等待 {queue_wait:.0f}s 仍未拿到浏览器，请稍后再试")
-            if _cancelled():
+            waited = max(0.0, time.monotonic() - slot_wait_started)
+            # 只有等待谓词真的到期，才把失败称为“排队超时”。闸门内部异常（例如
+            # 底层互斥锁不一致）过去也被硬编码成“排队 100s”，既掩盖根因，实际
+            # 等待时长也往往只有几秒。
+            queue_timed_out = time.monotonic() >= wait_deadline
+            if queue_timed_out:
+                message = ("浏览器被其它 FX 任务占用，"
+                           f"排队等待 {waited:.0f}s 仍未拿到浏览器，请稍后再试")
+            else:
+                message = f"浏览器闸门进入失败: {type(e).__name__}: {e}"
+            cancelled_before_start = _cancelled()
+            if cancelled_before_start:
                 message = "探测在排队时被取消"
-            _set_probe_error(user_id, message, kind='queue')
+            _set_probe_error(
+                user_id, message,
+                kind='queue' if (queue_timed_out or cancelled_before_start) else 'probe',
+            )
             log(f"⏳ 账号 {user_id} 积分探测未能进入浏览器队列: {message}", "积分探针")
             return None
         if isinstance(e, CreditProbeCancelled):

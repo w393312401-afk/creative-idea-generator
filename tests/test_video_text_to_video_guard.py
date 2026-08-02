@@ -409,27 +409,59 @@ def test_partial_slot_fallback_is_reported_as_mount_failure(monkeypatch, tmp_pat
 
 # ── 5. 点 Generate 前的最后复核 ─────────────────────────────────────────
 
+def _stub_ref_state(monkeypatch, *reads, scope="bar", ok=True):
+    """按顺序喂给复核的读数（最后一个会一直重复），并掐掉复读之间的等待。"""
+    seq = list(reads)
+    monkeypatch.setattr(H.time, "sleep", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        H, "read_prompt_reference_state",
+        lambda *a, **k: {"uuids": list(seq.pop(0) if len(seq) > 1 else seq[0]),
+                         "scope": scope, "ok": ok},
+    )
+
+
 def test_refs_lost_before_generate_is_detected(monkeypatch):
-    monkeypatch.setattr(H, "_get_prompt_reference_uuids", lambda *a, **k: [])
+    _stub_ref_state(monkeypatch, [])
     meta = {"strategy": "prompt_chips", "expected": [UUID_A, UUID_B], "refs": [UUID_A, UUID_B]}
     assert H._video_refs_still_attached(object(), meta) is False
 
 
 def test_refs_reordered_before_generate_is_detected(monkeypatch):
     """顺序错了就是首尾帧对调，生成的是一段倒放的过渡。"""
-    monkeypatch.setattr(H, "_get_prompt_reference_uuids", lambda *a, **k: [UUID_B, UUID_A])
+    _stub_ref_state(monkeypatch, [UUID_B, UUID_A])
     meta = {"strategy": "prompt_chips", "expected": [UUID_A, UUID_B], "refs": [UUID_A, UUID_B]}
     assert H._video_refs_still_attached(object(), meta) is False
 
 
 def test_refs_intact_before_generate_passes(monkeypatch):
-    monkeypatch.setattr(H, "_get_prompt_reference_uuids", lambda *a, **k: [UUID_A, UUID_B])
+    _stub_ref_state(monkeypatch, [UUID_A, UUID_B])
     meta = {"strategy": "prompt_chips", "expected": [UUID_A, UUID_B], "refs": [UUID_A, UUID_B]}
     assert H._video_refs_still_attached(object(), meta) is True
 
 
+def test_transient_empty_read_after_prompt_insert_does_not_fail_the_task(monkeypatch):
+    """写完两千字提示词那一瞬 Slate 正在重建，读到的空列表是渲染过程不是掉图。
+
+    真实事故（2026-08-02 日志 videos_e2ef1c63）：挂载校验刚读到两张 chip，1s 后
+    插入 2062 字提示词，复核读回空 → 24 个片段全部拒绝提交、重试轮轮失败。
+    """
+    _stub_ref_state(monkeypatch, [], [UUID_A, UUID_B])
+    meta = {"strategy": "prompt_chips", "expected": [UUID_A, UUID_B], "refs": [UUID_A, UUID_B]}
+    assert H._video_refs_still_attached(object(), meta) is True
+
+
+def test_unreadable_prompt_bar_is_not_treated_as_lost_anchors(monkeypatch):
+    """读数本身失败 ≠ 参考图掉了：判死片段要有证据，没读到就交给下载后的锚点校验。"""
+    _stub_ref_state(monkeypatch, [], scope="", ok=False)
+    meta = {"strategy": "prompt_chips", "expected": [UUID_A, UUID_B], "refs": [UUID_A, UUID_B]}
+    assert H._video_refs_still_attached(object(), meta) is True
+
+    meta_slots = {"strategy": "frame_slots", "expected": [], "refs": [UUID_A, UUID_B]}
+    assert H._video_refs_still_attached(object(), meta_slots) is True
+
+
 def test_frame_slot_strategy_checks_reference_count(monkeypatch):
-    monkeypatch.setattr(H, "_get_prompt_reference_uuids", lambda *a, **k: [UUID_A])
+    _stub_ref_state(monkeypatch, [UUID_A])
     meta = {"strategy": "frame_slots", "expected": [], "refs": [UUID_A, UUID_B]}
     assert H._video_refs_still_attached(object(), meta) is False
 
@@ -443,20 +475,41 @@ def test_prompt_reference_scan_is_structural_when_long_prompt_expands_upward():
 
         def evaluate(self, script):
             self.script = script
-            return [UUID_A, UUID_B]
+            return {"uuids": [UUID_A, UUID_B], "scope": "bar"}
 
     page = _P()
     assert H._get_prompt_reference_uuids(page, limit=2) == [UUID_A, UUID_B]
     assert "arrow_forward" in page.script
-    assert "bar.querySelectorAll" in page.script
+    assert "scope.querySelectorAll" in page.script
     assert "innerHeight" not in page.script
+
+
+def test_prompt_reference_scan_falls_back_to_document_when_bar_is_unreachable():
+    """定位不到输入条时必须退回全文档扫 chip，而不是谎报「一张参考图都没有」。
+
+    提示词一长，Flow 会给编辑器再套一层滚动容器，arrow_forward 被顶出 8 层祖先，
+    ``if (!bar) return []`` 于是把「没找到输入条」说成了「没有参考图」。
+    """
+    scripts = []
+
+    class _P:
+        def evaluate(self, script):
+            scripts.append(script)
+            return {"uuids": [UUID_A, UUID_B], "scope": "document"}
+
+    state = H.read_prompt_reference_state(_P(), limit=2)
+    assert state == {"uuids": [UUID_A, UUID_B], "scope": "document", "ok": True}
+    # 退回全文档时只认 chip 签名，画布卡片不带 data-card-open，不会混进来。
+    assert "const scope = bar || document" in scripts[0]
+    assert '"button[data-card-open] img"' in scripts[0]
+    assert "if (!bar) return []" not in scripts[0]
 
 
 def test_long_prompt_reference_scan_does_not_block_submit_guard():
     class _P:
         def evaluate(self, _script):
             # 模拟输入条已经因长提示词扩展到页面较高位置，但结构扫描仍能读到 refs。
-            return [UUID_A, UUID_B]
+            return {"uuids": [UUID_A, UUID_B], "scope": "bar"}
 
     meta = {
         "strategy": "prompt_chips",

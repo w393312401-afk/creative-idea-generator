@@ -14,11 +14,13 @@
 4. 契约/审查正文里的条文（两个骨架、两个指令块、两个审查提示词都必须带上）。
 """
 import ast
+import os
 import unittest
 from unittest.mock import patch
 
 import prompt_pipeline as pp
 from prompt_pipeline import _beat_contract
+from prompt_pipeline.composers import base as pp_base_composer
 
 
 def _ladder_with_roof_sealed_before_cut():
@@ -373,13 +375,27 @@ class TestEnvelopeContractText(unittest.TestCase):
 
     def test_both_instruction_blocks_interpolate_the_same_constant(self):
         """批量直出和单拍兜底是两份手抄的指令块——这条规则只加到其中一份就会漂移，
-        而单拍兜底恰恰是批量那拍失败后走的路径，最需要它。"""
-        src = open(pp.__file__, encoding='utf-8').read()
-        sites = [node.lineno for node in ast.walk(ast.parse(src))
-                 if isinstance(node, ast.JoinedStr)
-                 for v in node.values
-                 if isinstance(v, ast.FormattedValue) and isinstance(v.value, ast.Name)
-                 and v.value.id == 'ENVELOPE_CROSS_VIEW_RULE']
+        而单拍兜底恰恰是批量那拍失败后走的路径，最需要它。
+
+        2026-08-01 起两份指令块分居两个文件：批量那份仍在 prompt_pipeline/__init__.py
+        （_batch_shared_system_prompt），单拍兜底那份随 Phase 2 一起搬进了
+        prompt_pipeline/composers/base.py，在那边写作 pp.ENVELOPE_CROSS_VIEW_RULE。
+        两处合计仍必须恰好两次——两份手抄件的漂移风险一点没变。"""
+        sources = [pp.__file__, pp_base_composer.__file__]
+        sites = []
+        for path in sources:
+            tree = ast.parse(open(path, encoding='utf-8').read())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.JoinedStr):
+                    continue
+                for v in node.values:
+                    if not isinstance(v, ast.FormattedValue):
+                        continue
+                    target = v.value
+                    named = (isinstance(target, ast.Name) and target.id == 'ENVELOPE_CROSS_VIEW_RULE') or \
+                            (isinstance(target, ast.Attribute) and target.attr == 'ENVELOPE_CROSS_VIEW_RULE')
+                    if named:
+                        sites.append((os.path.basename(path), node.lineno))
         self.assertEqual(len(set(sites)), 2, f'期望两个指令块各引一次，实际 {sites}')
 
 

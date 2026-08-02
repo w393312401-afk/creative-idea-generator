@@ -474,6 +474,21 @@ class TestPlanVideoSlotsCut(_TmpDirCase):
         # 切槽不因缺帧/降级被误判为 blocked
         self.assertIn('硬切', plans[1]['reason'])
 
+    def test_explicit_editorial_cut_is_skipped_without_i2v(self):
+        frames = self._make_frames(4)
+        videos = {
+            1: {'body': 'v1', 'meta': ''},
+            2: {
+                'body': ('This slot is an intentional editorial cut, not an interpolated '
+                         'transformation. No generated in-between image or camera travel.'),
+                'meta': 'CUT',
+            },
+            3: {'body': 'v3', 'meta': ''},
+        }
+        plans = plan_video_slots(videos, frames, {}, self.videos_dir)
+        self.assertEqual([p['action'] for p in plans], ['generate', 'skip_cut', 'generate'])
+        self.assertIn('剪辑硬切', plans[1]['reason'])
+
     def test_bridge_turn_slot_not_mistaken_for_cut(self):
         frames = self._make_frames(3)
         videos = {1: {'body': 'v1', 'meta': 'BRIDGE TURN'}, 2: {'body': 'v2', 'meta': ''}}

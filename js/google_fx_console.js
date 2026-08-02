@@ -175,6 +175,11 @@
 
     if ($('fx-config-image-model')) $('fx-config-image-model').textContent = config.image_model || '—';
     if ($('fx-config-video-model')) $('fx-config-video-model').textContent = config.video_model || '—';
+    const refModeEl = $('fx-config-video-ref-mode');
+    if (refModeEl) {
+      const refModeMap = { 'VIDEO_FRAMES': '帧（首尾帧）', 'VIDEO_REFERENCES': '素材' };
+      refModeEl.textContent = refModeMap[config.video_ref_mode] || config.video_ref_mode || '—';
+    }
     // 锁定默认环境时轮转环只剩一个号，节拍值一次都用不上。状态条以前照样把它
     // 显示成正在生效的样子，用户只能靠翻手册才知道自己改的数字是死的。
     const switchEl = $('fx-config-switch');
@@ -834,6 +839,33 @@
     return patch;
   }
 
+  // 把 FX 控制台保存的模型设置同步到主界面的 localStorage（spark_config），
+  // 避免主界面仍然发送旧模型覆盖服务端的最新选择。两个页面（index.html /
+  // console.html）共享 localStorage，主页面刷新或跨标签页 storage 事件都会
+  // 自动加载新值。
+  const _FX_MODEL_SYNC_KEYS = ['videoModel', 'googleFxImageModel', 'videoDuration'];
+
+  function syncFxModelToMainConfig(serverConfig) {
+    if (!serverConfig) return;
+    try {
+      const raw = localStorage.getItem('spark_config');
+      if (!raw) return;
+      const mainConfig = JSON.parse(raw);
+      let dirty = false;
+      for (const key of _FX_MODEL_SYNC_KEYS) {
+        if (key in serverConfig && mainConfig[key] !== serverConfig[key]) {
+          mainConfig[key] = serverConfig[key];
+          dirty = true;
+        }
+      }
+      if (dirty) {
+        localStorage.setItem('spark_config', JSON.stringify(mainConfig));
+      }
+    } catch (e) {
+      // localStorage 读写失败不阻塞控制台保存
+    }
+  }
+
   async function saveConfig() {
     const result = await post('/api/google-fx/config', { patch: collectConfigPatch() });
     renderConfig({
@@ -841,6 +873,8 @@
       versions: result.versions, audit: []
     });
     await refresh(true);
+    // 同步模型设置到主界面的 localStorage
+    syncFxModelToMainConfig(result.config);
     // 被别的配置项压住的字段排在"需重启"前面报：重启能解决，互相打架不能。
     if ((result.inert || []).length) {
       showToast(`已保存，但当前配置下跑不起来 —— ${result.inert.join('；')}`, true);
@@ -1370,7 +1404,8 @@
       if (!global.confirm('回滚到上一个配置版本？可以连续回滚，也可以重做。')) return;
       button.disabled = true;
       try {
-        await post('/api/google-fx/config', { action: 'rollback' });
+        const result = await post('/api/google-fx/config', { action: 'rollback' });
+        syncFxModelToMainConfig(result.config);
         await Promise.all([loadConfig(), refresh(true)]);
         showToast('已回滚一个版本');
       } catch (error) { showToast(`回滚失败：${error.message}`, true); }
@@ -1380,7 +1415,8 @@
       const button = event.currentTarget;
       button.disabled = true;
       try {
-        await post('/api/google-fx/config', { action: 'redo' });
+        const result = await post('/api/google-fx/config', { action: 'redo' });
+        syncFxModelToMainConfig(result.config);
         await Promise.all([loadConfig(), refresh(true)]);
         showToast('已重做一个版本');
       } catch (error) { showToast(`重做失败：${error.message}`, true); }
@@ -1393,7 +1429,8 @@
       if (!global.confirm('恢复到选中的配置版本？')) return;
       button.disabled = true;
       try {
-        await post('/api/google-fx/config', { action: 'restore', version_id: select.value });
+        const result = await post('/api/google-fx/config', { action: 'restore', version_id: select.value });
+        syncFxModelToMainConfig(result.config);
         await Promise.all([loadConfig(), refresh(true)]);
         showToast('已恢复到选中版本');
       } catch (error) { showToast(`恢复失败：${error.message}`, true); }

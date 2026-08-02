@@ -1387,24 +1387,99 @@ async function describeFrameIssue(seq, existingIssue) {
     }
 }
 
-// manualReason：可选，人工在别处现场写的问题描述；后端会先把它落盘再参与改写
-// （见 pipeline_orchestrator.fix_frame_issue）。走 describeFrameIssue 记录过的
-// 描述已经在 manifest 上，无需从这里再传一次。
-async function fixFrameIssue(seq, manualReason) {
+// 「撤销修复」——定向修复是**覆盖写同一个帧文件**，修坏了此前只能盲重渲碰运气。
+// 后端在每次修复动手前把帧图 + 该帧的 manifest 条目 + 这一帧与前一拍视频的提示词
+// 正文整份存进 .frame_fixes/（见 pipeline_orchestrator.save_fix_snapshot），这里把
+// 它整份放回去（/api/undo_frame_fix）。只保留最近一次，撤销之后快照即删除。
+// 只回滚这一帧涉及的槽位，不整体还原 prompt_block——修完 003 又修了 005 之后撤销
+// 003，整体还原会把 005 的修复一起吞掉。
+async function undoFrameFix(seq) {
     if (!currentIdea || !currentIdea.prompt_block) {
         showToast("请先激发一个创意点子！", "error");
         return;
     }
     const ownerIdea = currentIdea;
     if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
-        showToast("该创意的帧序列已在生成/重试中，请稍候", "error");
+        showToast("该创意的帧序列正在生成/修复中，请稍候", "error");
         return;
+    }
+    const seqLabel = String(seq).padStart(3, '0');
+    const proceed = await customConfirm(
+        `将把 IMG ${seqLabel} 退回上一次修复<b>之前</b>的画面与提示词。<br><br>`
+        + '当时记录的问题描述与审查结论会一并回来（可以重新修一次）。'
+        + '快照只保留最近一次，撤销之后这一版就没有了。');
+    if (!proceed) return;
+
+    try {
+        const resp = await fetch('/api/undo_frame_fix', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                title: getIdeaSaveTitle(ownerIdea),
+                display_title: ownerIdea.title,
+                sequence: seq,
+                prompt_block: ownerIdea.prompt_block
+            })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data.status === 'error') throw new Error(data.message || `HTTP ${resp.status}`);
+
+        // 提示词被换回修复前的版本：与 fixFrameIssue 同款写回（后续重试/再修/生成
+        // 视频读的都是这份文本，不写回就会拿着改写后的提示词去渲"撤销过"的帧）
+        if (data.prompt_block) {
+            ownerIdea.prompt_block = data.prompt_block;
+            if (currentIdea && currentIdea.id === ownerIdea.id) saveCurrentIdeaState();
+            const existingIdx = savedIdeas.findIndex(item => item.id === ownerIdea.id);
+            if (existingIdx !== -1) {
+                savedIdeas[existingIdx].prompt_block = data.prompt_block;
+                await persistIdeaItem(savedIdeas[existingIdx]);
+            }
+            if (isViewingIdea(ownerIdea.id)) {
+                const blockEl = document.getElementById('idea-prompt-block');
+                if (blockEl) blockEl.textContent = ownerIdea.prompt_block;
+            }
+        }
+        // 帧文件被原地换回旧图：路径没变、内容变了，不回源就还是浏览器缓存里那张
+        // 修复后的图。URL 取服务端回的那条条目，不在前端拼路径。
+        const restoredUrl = (data.frame && (data.frame.url || data.frame.file)) || '';
+        if (restoredUrl) bustImageCache(restoredUrl);
+        await reloadManifestIntoIdea(ownerIdea);
+        if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
+
+        if (typeof framesFeedLine === 'function') {
+            framesFeedLine(ownerIdea.id, `↩️ IMG ${seqLabel} 已退回修复前的版本`, 'warn');
+        }
+        showToast(`第 ${seq} 帧已退回修复前的版本。`, "success");
+    } catch (e) {
+        console.error(`Failed to undo fix for frame ${seq}:`, e);
+        showToast(`撤销第 ${seq} 帧的修复失败: ${e.message}`, "error");
+    }
+}
+
+// manualReason：可选，人工在别处现场写的问题描述；后端会先把它落盘再参与改写
+// （见 pipeline_orchestrator.fix_frame_issue）。走 describeFrameIssue 记录过的
+// 描述已经在 manifest 上，无需从这里再传一次。
+//
+// 返回 {status, ...}：'ok'（remaining＝复核后仍未解决的问题）/ 'cancelled' /
+// 'disconnected' / 'failed'（error）/ 'skipped'（前置条件不满足，什么都没做）。
+// 单帧点击不关心返回值；「全部修复」（slot_toolbar.bulkFixFlaggedFrames）靠它
+// 决定这一轮算不算修好、以及要不要接着修下一帧——用户点了取消却继续往下修，
+// 或者一帧失败后剩下的照跑不误，都是不能接受的。
+async function fixFrameIssue(seq, manualReason) {
+    if (!currentIdea || !currentIdea.prompt_block) {
+        showToast("请先激发一个创意点子！", "error");
+        return { status: 'skipped', error: '尚未激发创意' };
+    }
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
+        showToast("该创意的帧序列已在生成/重试中，请稍候", "error");
+        return { status: 'skipped', error: '该创意的帧序列已在生成/重试中' };
     }
 
     const progress = document.getElementById('frames-progress');
     const meta = document.getElementById('frames-meta');
     const slotCard = document.getElementById(`frame-slot-${seq}`);
-    if (!progress || !meta || !slotCard) return;
+    if (!progress || !meta || !slotCard) return { status: 'skipped', error: '帧网格尚未就绪' };
 
     renderSlotPending('image', seq, '修复中...');
 
@@ -1486,8 +1561,11 @@ async function fixFrameIssue(seq, manualReason) {
             disconnected = true;
             feedLine(`⚠️ ${watch.error}`, 'warn');
             showToast(`第 ${seq} 帧：${watch.error}`, "warning");
-            return;
+            return { status: 'disconnected', error: watch.error };
         }
+        // 取消是用户的明确意图，不是失败：与整套序列审查同款处理，走 AbortError
+        // 那条分支（否则批量修复会把它当成一次普通报错，接着去修下一帧）
+        if (watch.status === 'cancelled') throw Object.assign(new Error('已取消'), { name: 'AbortError' });
         if (watch.status === 'failed') throw new Error(watch.error || '未知错误');
 
         if (watch.result) {
@@ -1520,13 +1598,21 @@ async function fixFrameIssue(seq, manualReason) {
                 showToast(`第 ${seq} 帧已修复。`, "success");
             }
         }
+        return { status: 'ok', remaining: (reverify && reverify.remaining) || [] };
     } catch (e) {
-        console.error(`Failed to fix frame ${seq}:`, e);
-        feedLine(`❌ IMG ${String(seq).padStart(3, '0')} 修复失败：${e.message}`, 'err');
-        showToast(`第 ${seq} 帧修复失败: ${e.message}`, "error");
+        if (e.name === 'AbortError') {
+            feedLine(`⏹️ IMG ${String(seq).padStart(3, '0')} 修复已取消`, 'warn');
+        } else {
+            console.error(`Failed to fix frame ${seq}:`, e);
+            feedLine(`❌ IMG ${String(seq).padStart(3, '0')} 修复失败：${e.message}`, 'err');
+            showToast(`第 ${seq} 帧修复失败: ${e.message}`, "error");
+        }
 
         await reloadManifestIntoIdea(ownerIdea);
         if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
+        return e.name === 'AbortError'
+            ? { status: 'cancelled' }
+            : { status: 'failed', error: e.message };
     } finally {
         if (isViewingIdea(ownerIdea.id) && typeof framesFeedSetLive === 'function') framesFeedSetLive(ownerIdea.id, false);
         if (!disconnected) {
@@ -1550,7 +1636,10 @@ async function fixFrameIssue(seq, manualReason) {
 // 结果只把 manifest 里对应帧的 quality_gate 标记成 sequence_review_flagged /
 // sequence_reviewed_pass，真正的改写要等用户看过原因后点「修复此帧问题」
 // （fixFrameIssue）。整套序列还没渲完时后端会直接跳过并说明原因，不算错误。
-async function runSequenceReview() {
+// scope：'incremental'（默认，只重审帧图变过、结论已失效的那几拍）或 'full'
+// （全量重审，不复用任何既有结论）。增量是常态——修完几帧再审一遍此前要把已经
+// 审干净的十来拍连同跨帧窗口整批重烧，于是"修完就重审"这个动作没人愿意做。
+async function runSequenceReview(scope) {
     if (!currentIdea || !currentIdea.prompt_block) {
         showToast("请先激发一个创意点子！", "error");
         return;
@@ -1561,22 +1650,26 @@ async function runSequenceReview() {
         return;
     }
 
+    const full = scope === 'full';
     const progress = document.getElementById('frames-progress');
     const meta = document.getElementById('frames-meta');
     const reviewBtn = document.getElementById('run-sequence-review-btn');
+    const fullBtn = document.getElementById('run-full-sequence-review-btn');
     if (!progress || !meta) return;
 
     progress.style.display = 'flex';
-    meta.textContent = '正在对整套序列做一致性审查...';
+    meta.textContent = full ? '正在全量重审整套序列...' : '正在对整套序列做一致性审查...';
 
     const controller = new AbortController();
     beginIdeaTask(ownerIdea.id, 'frames', null, controller);
     setFrameGridButtonsBusy(true);
     if (reviewBtn) reviewBtn.disabled = true;
+    if (fullBtn) fullBtn.disabled = true;
 
     const feedLine = (text, cls) => { if (typeof framesFeedLine === 'function') framesFeedLine(ownerIdea.id, text, cls); };
     if (typeof framesFeedSetLive === 'function') framesFeedSetLive(ownerIdea.id, true);
-    feedLine('🔍 开始整套序列一致性审查…');
+    feedLine(full ? '🔍 开始全量重审整套序列（不复用既有结论）…'
+                  : '🔍 开始整套序列一致性审查（只重审结论已失效的拍）…');
 
     let disconnected = false;
 
@@ -1588,7 +1681,8 @@ async function runSequenceReview() {
                 config,
                 title: getIdeaSaveTitle(ownerIdea),
                 display_title: ownerIdea.title,
-                prompt_block: ownerIdea.prompt_block
+                prompt_block: ownerIdea.prompt_block,
+                scope: full ? 'full' : 'incremental'
             }),
             signal: controller.signal
         });
@@ -1659,10 +1753,17 @@ async function runSequenceReview() {
         await reloadManifestIntoIdea(ownerIdea);
         if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
         feedLine('✅ 一致性审查已完成', 'ok');
+        // 复用了多少拍要说出来：跑得快不是因为"这次没查出问题"，而是那几拍的帧图
+        // 自上次审查后压根没变、结论直接沿用（全量重审入口在 ⚙ 里）
+        const reused = (reviewSummary && reviewSummary.reused_beats) || 0;
+        if (reused) feedLine(`♻️ 其中 ${reused} 拍的帧图未变化，沿用了上一轮的结论`, 'ok');
         // 只审了已渲染前缀、或有帧没审成时给一条明确 toast——这两种情况下"审查完成"
         // 不等于"整单都查过了"，光看绿色徽标会误判
         if (reviewSummary && reviewSummary.partial) {
-            const n = (reviewSummary.reviewed_sequences || []).length;
+            // rendered_count＝已渲染前缀的帧数；不能拿本轮 reviewed_sequences 的长度
+            // 顶替它——增量审查下那只是"本轮重审到的几帧"
+            const n = reviewSummary.rendered_count
+                || (reviewSummary.reviewed_sequences || []).length;
             showToast(`一致性审查只覆盖了已渲染的前 ${n} 帧，其余帧渲完后请再跑一次。`, "warning");
         } else if (reviewSummary && (reviewSummary.unreviewed_sequences || []).length) {
             showToast(`有 ${reviewSummary.unreviewed_sequences.length} 帧未审完，已标记为「未审查」。`, "warning");
@@ -1690,6 +1791,7 @@ async function runSequenceReview() {
             renderFramesForIdea(ownerIdea);
         }
         if (reviewBtn) reviewBtn.disabled = false;
+        if (fullBtn) fullBtn.disabled = false;
     }
 }
 

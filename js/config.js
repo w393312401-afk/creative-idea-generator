@@ -97,7 +97,7 @@ function updateConfigSummary() {
     const pacingId = (typeof loadedIdeationCover !== 'undefined' && loadedIdeationCover
         && loadedIdeationCover.pacing_skeleton) || '';
     const pacingText = pacingId === 'dual_payoff' ? '内外双重完工'
-        : (pacingId === 'nested_space_payoff' ? '双空间重置兑现'
+        : (pacingId === 'nested_space_payoff' ? '双空间一比一复刻'
         : (pacingId === 'linear_milestone' ? '单线里程碑' : '未载入'));
     
     const summaryText = `${themeText}${anchorsStr} | 骨架:${pacingText}, 复杂度:${complexityText}, 预算:${budgetText}, 反差:${ratioVal}%, 尺度:${creativityText}, ${beatMode}:${beatsVal}拍`;
@@ -154,6 +154,108 @@ function applyPreset(presetName) {
 
 // updateImageModelOptions 已删除（2026-07-12）：配置中心的 LLM/生图模型下拉整体移除，
 // 模型选择完全由激发页脚 #ideation-llm-model 与帧序列卡片 #frames-image-model 承担。
+
+/* ── 激发维度内嵌「提示词链路」选择器 ─────────────────────────────────
+   做哪个视频模型的提示词，就读哪个技能包、走哪套镜头语法：
+     · base —— restoration-prompt-composer，Veo 系列，一条连续的施工延时；
+     · omni —— gemini-omni-restoration-composer，Gemini Omni，多镜头组接（镜头数随片长）
+       （远景/全景/中景/近景/特写/结果远景）+ UGC 手机拍摄质感，禁一镜到底。
+   停在 auto 时由服务端按视频模型名推断（active_skill_profile）。UI 排在 LLM 模型
+   之前：链路决定"提示词写成什么样"，模型只决定"谁来写"，前者更上位。
+
+   ⚠️ 前端不自己判断"omni 该走哪条"：那张规则表由 /api/mode 的 skill_profile_rules
+   下发（服务端 SKILL_PROFILE_VIDEO_MODEL_RULES 原样），这里只负责按表匹配显示。
+   在这里硬编码一份 /omni/ 判断，就是给同一件事留了第二个会漂移的真相源。
+   拿不到规则表（/api/mode 还没回、或旧服务端）时不猜：auto 的徽标退回只报视频
+   模型名，让用户自己对照，而不是显示一个可能是错的链路名。 */
+const SKILL_PROFILE_CHOICES = [
+    { value: 'auto', label: '自动', hint: '跟随视频模型' },
+    { value: 'base', label: 'Veo · 单镜延时', hint: 'restoration-prompt-composer' },
+    { value: 'omni', label: 'Omni · 多镜头', hint: 'gemini-omni-restoration-composer' },
+];
+
+// /api/mode 下发的链路信息（app.js initServerMode 填）。规则表形如
+// [['omni','omni']]：视频模型名（小写）含 needle 即用该 profile，都不命中回 default。
+window.SKILL_PROFILE_RULES = window.SKILL_PROFILE_RULES || null;
+window.SKILL_PROFILE_DEFAULT = window.SKILL_PROFILE_DEFAULT || 'base';
+
+/** auto 模式下当前实际会走哪条链路；规则表还没到手时返回 null（不猜）。 */
+function resolveAutoSkillProfile() {
+    const rules = window.SKILL_PROFILE_RULES;
+    if (!Array.isArray(rules) || !rules.length) return null;
+    const haystack = String(config.videoModel || '').toLowerCase();
+    for (const rule of rules) {
+        const needle = String((rule && rule[0]) || '').toLowerCase();
+        if (needle && haystack.includes(needle)) return String(rule[1] || '');
+    }
+    return window.SKILL_PROFILE_DEFAULT || 'base';
+}
+
+function syncIdeationSkillProfilePicker() {
+    const wrap = document.getElementById('ideation-skill-profile-groups');
+    if (!wrap) return;
+    const current = config.skillProfile || 'auto';
+
+    wrap.innerHTML = '';
+    const group = document.createElement('div');
+    group.className = 'model-family-group active';
+    group.dataset.family = 'skill-profile';
+
+    const tag = document.createElement('span');
+    tag.className = 'model-family-tag';
+    tag.textContent = '链路';
+    group.appendChild(tag);
+
+    const row = document.createElement('div');
+    row.className = 'model-chip-row';
+    SKILL_PROFILE_CHOICES.forEach(choice => {
+        const isSelected = choice.value === current;
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'model-chip' + (isSelected ? ' selected' : '');
+        chip.title = choice.value === 'auto'
+            ? '跟随「FX 视频模型」下拉框：选 Omni Flash 走 Omni 链路，选 Veo 系列走 Veo 链路'
+            : `${choice.hint}（钉死这条链路，不再跟随视频模型）`;
+
+        const name = document.createElement('span');
+        name.className = 'model-chip-name';
+        name.textContent = choice.label;
+        chip.appendChild(name);
+
+        chip.addEventListener('click', () => {
+            if ((config.skillProfile || 'auto') === choice.value) return;
+            config.skillProfile = choice.value;
+            localStorage.setItem('spark_config', JSON.stringify(config));
+            const effective = choice.value === 'auto' ? resolveAutoSkillProfile() : choice.value;
+            showToast(
+                `提示词链路已切换：${choice.label}`
+                + (choice.value === 'auto' && effective ? `（当前实际走 ${effective}）` : '')
+                + '（下次激发/合成生效）',
+                'success');
+            syncIdeationSkillProfilePicker();
+            if (typeof collapseIdeationPickerOnMobile === 'function') {
+                collapseIdeationPickerOnMobile();
+            }
+        });
+        row.appendChild(chip);
+    });
+    group.appendChild(row);
+    wrap.appendChild(group);
+
+    const hint = document.getElementById('ideation-skill-profile-active-hint');
+    if (!hint) return;
+    if (current !== 'auto') {
+        const picked = SKILL_PROFILE_CHOICES.find(c => c.value === current);
+        hint.textContent = `使用中 · ${picked ? picked.label : current}`;
+        return;
+    }
+    const effective = resolveAutoSkillProfile();
+    const effectiveLabel = effective
+        && (SKILL_PROFILE_CHOICES.find(c => c.value === effective) || {}).label;
+    hint.textContent = effectiveLabel
+        ? `使用中 · ${effectiveLabel}（跟随 ${config.videoModel || '视频模型'}）`
+        : `跟随视频模型 · ${config.videoModel || '未设置'}`;
+}
 
 /* ── 激发维度内嵌 LLM 模型选择器 ─────────────────────────────────────
    LLM 主模型（激发/合成/审核/质检判定共用 config.model）的唯一 UI 入口：
@@ -370,7 +472,9 @@ function loadConfig() {
     }
     const fxVideoDurationSelect = document.getElementById('settings-fx-video-duration');
     if (fxVideoDurationSelect) {
-        fxVideoDurationSelect.value = config.videoDuration || '';
+        // 老配置里可能存着空串（"沿用 Flow 面板当前时长"，2026-08-01 已取消）——空值在
+        // 下拉框里已经没有对应项，会显示成一个空白选项，回落到默认时长。
+        fxVideoDurationSelect.value = config.videoDuration || DEFAULT_CONFIG.videoDuration;
     }
     const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
     if (trendUrlsInput) {
@@ -400,6 +504,7 @@ function loadConfig() {
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
     syncIdeationLlmPicker();
+    syncIdeationSkillProfilePicker();
 }
 
 // 显隐一律用空串还原（而不是写死 'block'）：配置中心的字段行是 CSS grid
@@ -467,6 +572,7 @@ function saveConfig() {
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
     syncIdeationLlmPicker();
+    syncIdeationSkillProfilePicker();
     showToast("API 配置保存成功！", "success");
     checkApiStatus();
 }
@@ -486,11 +592,40 @@ function flashSettingsSaved() {
     settingsSavedFlagTimer = setTimeout(() => { flag.hidden = true; }, 1600);
 }
 
+// FX 模型设置由服务端 server_config.json 统一管理：前端改了之后要同步推到
+// 服务端，否则 effective_config 会采用 SERVER_CONFIG 里的旧值（服务端优先）。
+// 静默调用，失败不弹 toast——下一次生成请求仍然会把最新 config 带过去。
+const _FX_SERVER_SYNC_KEYS = ['videoModel', 'googleFxImageModel', 'videoDuration'];
+let _fxSyncPending = null;
+
+function syncFxModelToServer() {
+    const patch = {};
+    for (const key of _FX_SERVER_SYNC_KEYS) {
+        if (key in config) patch[key] = config[key];
+    }
+    if (!Object.keys(patch).length) return;
+    // 防抖：快速连续切换模型时只发最后一次
+    if (_fxSyncPending) clearTimeout(_fxSyncPending);
+    _fxSyncPending = setTimeout(() => {
+        _fxSyncPending = null;
+        fetch('/api/google-fx/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ patch }),
+        }).catch(() => {});  // 静默失败
+    }, 300);
+}
+
 function autoSaveConfig() {
     applySettingsFormToConfig();
     localStorage.setItem('spark_config', JSON.stringify(config));
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
+    // 链路选择器停在 auto 时，徽标显示的是"跟着视频模型现在实际走哪条"——
+    // 改了 FX 视频模型下拉框却不重刷，徽标就会停在旧链路上，看起来像没生效。
+    syncIdeationSkillProfilePicker();
+    // 同步 FX 模型设置到服务端 server_config.json
+    syncFxModelToServer();
     flashSettingsSaved();
 }
 
@@ -537,6 +672,7 @@ function resetConfig() {
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
     syncIdeationLlmPicker();
+    syncIdeationSkillProfilePicker();
     showToast('已恢复默认配置', 'success');
 }
 
@@ -598,6 +734,36 @@ function initSettingsCenter() {
     }
 
     switchSettingsSection(localStorage.getItem(SETTINGS_SECTION_KEY) || 'backend');
+}
+
+// 跨标签页同步：FX 控制台（console.html）在另一个标签页修改了 spark_config
+// 中的模型设置后，storage 事件会触发这里的重载——主页面不用手动刷新就能感知
+// 到控制台的改动（选择器自动跟新值、下一次生成发的就是新模型）。
+if (typeof window !== 'undefined') {
+    window.addEventListener('storage', (e) => {
+        if (e.key !== 'spark_config' || !e.newValue) return;
+        try {
+            const updated = JSON.parse(e.newValue);
+            let dirty = false;
+            for (const key of ['videoModel', 'googleFxImageModel', 'videoDuration']) {
+                if (key in updated && config[key] !== updated[key]) {
+                    config[key] = updated[key];
+                    dirty = true;
+                }
+            }
+            if (dirty) {
+                // 刷新主界面的相关 UI 选择器
+                const fxVideoModelSelect = document.getElementById('settings-fx-video-model');
+                if (fxVideoModelSelect) fxVideoModelSelect.value = config.videoModel || '';
+                const fxImageModelSelect = document.getElementById('settings-fx-image-model');
+                if (fxImageModelSelect) fxImageModelSelect.value = config.googleFxImageModel || '';
+                const fxDurationSelect = document.getElementById('settings-fx-video-duration');
+                if (fxDurationSelect) fxDurationSelect.value = config.videoDuration || DEFAULT_CONFIG.videoDuration;
+                if (typeof syncIdeationSkillProfilePicker === 'function') syncIdeationSkillProfilePicker();
+                if (typeof updateFxVideoDurationVisibility === 'function') updateFxVideoDurationVisibility();
+            }
+        } catch (_) {}
+    });
 }
 
 function updateCoverModelDisplay() {

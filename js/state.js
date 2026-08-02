@@ -22,9 +22,18 @@ const DEFAULT_CONFIG = {
     imageBackend: 'api',
     googleFxImageModel: 'Nano Banana 2',
     videoModel: 'Veo 3.1 - Lite [Lower Priority]',
+    // 提示词链路（做哪个视频模型的提示词，就读哪个技能包）：
+    // 'auto' = 跟随 videoModel 推断（服务端 active_skill_profile 判定，规则表由
+    // /api/mode 的 skill_profile_rules 下发）；也可钉死 'base'（Veo 单镜延时）或
+    // 'omni'（Gemini Omni 多镜头组接，镜头数随片长）。钉死的用处是把两件事解耦：只想换渲染档位
+    // 的人不该被顺手改掉提示词语法，反过来也一样。
+    skillProfile: 'auto',
     // 视频时长（仅 Omni Flash 模型面板提供 4s/6s/8s/10s 时长 tab；Veo 系列时长固定，
-    // 该项对其无效）：留空则不主动切换，沿用 Flow 面板当前时长
-    videoDuration: '',
+    // 该项对其无效）。默认 10s：omni 的时间线提示词按秒排镜头切点，10 秒是排满六镜
+    // （远景/全景/中景/近景/特写/结果远景）所需的长度，更短要按 composers/omni.py 的
+    // 镜头梯表裁镜头。此项**不再允许留空**——"沿用面板当前时长"是个不可知态，会让
+    // 提示词里的切点表与实际生成时长对不上。
+    videoDuration: '10',
     imageAspectRatio: '9:16',
     imageQuality: '2K',
     // 激发参考网址（可选）: 换行/逗号分隔,最多取 5 个;后端抓取正文→aux 模型压成

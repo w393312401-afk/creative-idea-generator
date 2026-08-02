@@ -127,6 +127,16 @@ function frameManualIssue(frame) {
         ? frame.manual_issue : '';
 }
 
+/**
+ * 这一帧有没有"待修复的问题"——机器判定未过、或人工标记了问题，两者任一成立。
+ * 卡片上的「修复此帧问题」按钮与工具条的「全部修复」按同一条判定取帧
+ * （见 frameActions 与 js/slot_toolbar.js 的 bulkFixFlaggedFrames），
+ * 也正是后端 fix_frame_issue 认可的待修问题来源（vlm_qa_reason / manual_issue）。
+ */
+function frameIsFixable(frame) {
+    return !!frame && (frameIsReviewFailed(frame) || !!frameManualIssue(frame));
+}
+
 function collectBadges(defs, entry) {
     return defs.filter(d => d.test(entry)).map(d => ({
         id: d.id,
@@ -178,6 +188,14 @@ function frameActions(state, ctx) {
             cls: 'describe-frame-btn',
             idle: '人工描述这一帧哪里不对，作为定向修复的依据',
         }));
+        if (state.flags.fixBackup) {
+            // 修复越修越糟时的退路：修复覆盖写同一个文件，没有这个入口就只能盲重渲
+            list.push(mk('undo-fix', '撤销修复', {
+                cls: 'undo-fix-btn',
+                idle: `退回这一帧上一次修复前的画面与提示词`
+                    + (state.flags.fixBackup.at ? `（快照时间 ${state.flags.fixBackup.at}）` : ''),
+            }));
+        }
         list.push(mk('retry-frame', '重试', { cls: 'retry-frame-btn' }));
     } else if (state.kind === 'missing') {
         list.push(mk('retry-frame', '生成', { cls: 'retry-frame-btn' }));
@@ -274,8 +292,13 @@ function frameSlotState(frame, ctx) {
         swappedFrom: slotSwappedFrom(frame, 'swapped_from_sequence'),
         manualIssue,
     };
-    // 「修复此帧问题」的出口条件：机器判定未过、或人工标记了问题，两者任一成立
-    flags.fixable = flags.reviewFailed || flags.manualFlagged;
+    // 「修复此帧问题」的出口条件（判定收口在 frameIsFixable，工具条的「全部修复」
+    // 读的是同一条）
+    flags.fixable = frameIsFixable(frame);
+    // 上一次定向修复留下的快照（后端 fix_frame_issue 修复前存的帧图+提示词+条目）：
+    // 有它才给「撤销修复」入口。修复是覆盖写同一个文件，没有快照就真的退不回去了。
+    flags.fixBackup = (frame.fix_backup && typeof frame.fix_backup === 'object')
+        ? frame.fix_backup : null;
 
     const st = {
         type: 'image', seq, kind: 'ready', label, url,
@@ -399,7 +422,7 @@ function summarizeSlotStates(states) {
 // Node 下单测用；浏览器里各函数已是全局，这段不执行。
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
-        padSlot, slotIsStale, slotIsHero,
+        padSlot, slotIsStale, slotIsHero, frameIsFixable,
         frameSlotState, videoSlotState, slotPendingState,
         videoSlotLabel, summarizeSlotStates,
         FRAME_BADGE_DEFS, VIDEO_BADGE_DEFS,

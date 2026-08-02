@@ -40,9 +40,10 @@ AUDIT_MAX_BYTES = int(os.environ.get('SPARK_FX_AUDIT_MAX_BYTES', str(4 * 1024 * 
 AUDIT_BACKUP_COUNT = int(os.environ.get('SPARK_FX_AUDIT_BACKUP_COUNT', '3'))
 
 LIMIT_SPEC = {
-    # 同时进入浏览器临界区的任务数。Flow 画布不是并发安全的，默认 1；
-    # 调大只在"多 AdsPower profile 并行"验证过之后才有意义。
-    'max_concurrent': {'min': 1, 'max': 8, 'default': 1},
+    # 当前执行层仍有全局 _FX_SERIAL_LOCK / Google FX run lock；开放大于 1
+    # 只会让控制面显示多个 active，实际全堵在第二层锁上，并可能被看门狗误杀。
+    # 真正按 AdsPower profile 分片锁之前，控制面如实固定为 1。
+    'max_concurrent': {'min': 1, 'max': 1, 'default': 1},
     # 单个任务在浏览器里的最长执行时间（秒），0 = 不限。超时由外部看门狗取消。
     'task_timeout_seconds': {'min': 0, 'max': 86400, 'default': 300},
     # 单个任务排队等待的最长时间（秒），0 = 不限。超时抛 FxQueueTimeout。

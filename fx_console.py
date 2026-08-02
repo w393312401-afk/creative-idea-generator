@@ -44,8 +44,13 @@ FX_CONFIG_SPEC = {
         'group': '模型', 'label': '视频模型',
     },
     'videoDuration': {
-        'type': 'enum', 'options': ['', '4', '6', '8', '10'], 'default': '', 'hot': True,
+        'type': 'enum', 'options': ['4', '6', '8', '10'], 'default': '10', 'hot': True,
         'group': '模型', 'label': 'Omni 视频时长（秒）',
+    },
+    'videoRefMode': {
+        'type': 'enum', 'options': ['VIDEO_FRAMES', 'VIDEO_REFERENCES'],
+        'default': 'VIDEO_FRAMES', 'hot': True,
+        'group': '模型', 'label': '视频参考模式（帧 / 素材）',
     },
 
     # ── 号池与换号 ──────────────────────────────────────
