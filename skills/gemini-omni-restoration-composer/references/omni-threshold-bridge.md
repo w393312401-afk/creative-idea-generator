@@ -1,151 +1,111 @@
-# Omni Threshold Bridge
+# Omni Adaptive Threshold and Secondary-Space Protocol
 
-Load this file whenever the story moves from an exterior shell into an interior space
-through a real opening (a doorway, hatch, tunnel mouth, garage opening, carved portal).
+This file is the sole Omni rule source for physical space entry. A transition consumes
+additional IMAGE/VIDEO slots; it never steals, merges, or compresses construction milestones.
+Every VIDEO still uses the Omni multi-shot grammar, but each transition slot performs only its
+declared stage.
 
-The exterior→interior crossing is the only moment in a pack that flips lighting domain,
-camera family, and the entire landmark set at once. Attempting it in one video is the
-single most reliable way to make Gemini Omni replace the layout instead of traversing it.
+## Frozen ledgers before entry
 
----
+Carry four records through every prompt and manifest:
 
-## Rule 1 — Split the crossing into two videos
+- `world_lock`: exact terrain contour, foreground/mid/background landmarks, sky, water,
+  vegetation, weather, exposure and key-light direction. After IMAGE 1 acceptance, rendered
+  reality replaces the previsualized description.
+- `carrier_envelope`: real external proportions and orientation, maximum clear interior and
+  the volume no room may exceed.
+- `entrance_topology`: opening plane, main/auxiliary role, leaf/cover, hinges, latch/lock,
+  gasket, first rung/tread, shaft or steps, landing, depth, turn, gravity, drainage and venting.
+- `space_graph`: named site/primary/secondary nodes and visible connecting edges. Never invent
+  an unregistered room.
 
-Never render the crossing as one video. The structure is always:
+## Topology-adaptive primary entry
 
-```
-IMAGE T      (exterior, opening visible, interior peeked)
-  ↓ VIDEO Bridge-1  — approach to the sill
-IMAGE T+1    (sill handoff — standing at the threshold)
-  ↓ VIDEO Bridge-2  — cross and settle
-IMAGE T+2    (interior, settled)
-```
+### Vertical axial door — three slots
 
-`IMAGE T+1` is literally Bridge-1's last frame **and** Bridge-2's first frame. Declare that
-handoff explicitly in both videos. Each bridge video changes at most one and a half
-systems, not three.
+1. `door_hardware_open`: open the registered leaf and show hinges, latch, gasket and sill.
+2. `threshold_partial`: cross the sill locally; retain frame and shared floor line.
+3. `interior_establish`: deliver the raw interior from a three-quarter oblique axis.
 
----
+### Vertical side door — four slots
 
-## Rule 2 — Anchor inheritance and anchor qualification
+1. `door_hardware_open`.
+2. `threshold_partial`.
+3. `orientation_turn`: visibly turn after crossing toward the real long axis.
+4. `interior_establish`.
 
-The two interior landmarks glimpsed through the opening in `IMAGE T` must be the **exact
-same objects** that become the interior midground and background landmarks in `IMAGE T+2`.
-They scale up continuously across both bridge videos. They never reposition, never
-re-render as something else, and no interior landmark may appear in `IMAGE T+2` that was
-not pre-visualised through the opening.
+### Horizontal top hatch — five slots
 
-**Anchor qualification (mandatory).** A peeked landmark must plausibly already exist at
-crossing time:
+1. `hatch_hardware_open`: hand/pry-bar close detail; cover, hinges, latch, gasket and falling
+   dust are readable; show the first rung.
+2. `shaft_descent`: descend past fixed rungs with entry daylight above and landing below.
+3. `landing_turn`: land, keep gravity vertical, then make the registered ninety-degree turn.
+4. `partial_first_look`: reveal only one rust wall, a short rail/floor segment or one old device;
+   keep the far wall occluded.
+5. `interior_establish`: only now reveal the complete raw room.
 
-- ✅ original structure — a rib, a beam, a rock shelf, a stair already cut
-- ✅ natural formations — rock faces, root masses, ice, mineral seams
-- ✅ pre-existing wreckage — collapsed fittings, old furniture, debris piles
-- ✅ items visibly installed in an earlier on-camera beat
-- ❌ future construction products — an uncarved staircase, unplaced furniture, uninstalled
-  fixtures, a wall that has not been built
+The opening size never directly implies room size. A small hatch may connect to a large carrier
+interior only through the registered shaft, landing and turn.
 
-The bridge always precedes interior construction. Peeking at something the pack has not
-built yet forces an object to exist before the beat that creates it, and every downstream
-anchor then inherits an impossible state.
+## Entry hardware is a P0 fact
 
-**Monotonic scale-up.** Each peeked landmark's frame share must strictly increase across
-the three bridge anchors, described in words:
+An enterable opening is never a bare square/round hole or a decorative timber frame. It must
+show the relevant leaf/cover, hinges, latch/lock, gasket, first rung/tread, landing and necessary
+drain/vent hardware. Missing hardware fails the anchor and triggers targeted regeneration.
 
-`about a fifth of the opening` → `roughly two fifths of the frame` → `filling three fifths of the frame`
+## Light continuity
 
-A constant scale across the crossing contradicts the forward move and reads as a fake
-digital zoom.
+First entry allows only doorway/hatch daylight and a carried portable work light. A neglected
+space may not have glowing fixed ceiling lights. Fixed practicals turn on only after an earlier
+beat visibly installs power source, wiring and fixtures. Entry/back light keeps the same direction
+and colour across the threshold.
 
----
+## Reveal budget
 
-## Rule 3 — Single-variable bridge camera
+Partial stages retain orientation evidence and hide the far wall. The full room overview is a
+later establish stage. Do not use a centered one-point overview for both. In 9:16 long-axis
+spaces, default to a three-quarter oblique establish; reserve centered one-point perspective for
+one establish or final payoff.
 
-The exterior and interior shot families must share **identical lens feel and identical
-camera height**, so the only variable the bridge changes is forward translation.
+## Scale and camera families
 
-Bridge camera wording:
+Use entrance detail, shaft axis, landed partial, oblique establish, floor/rail low angle, wall
+graze and far-wall reverse. Within a construction anchor family the camera stays locked. A family
+change requires a visible no-work reframe. The same centered family may cover at most three
+consecutive construction milestones. At least once per new space, a transition VIDEO briefly
+shows an anonymous worker silhouette together with a standard door, rung/tread or known-size
+device; IMAGE anchors remain worker-free.
 
-`the same phone camera at the same height moves straight forward along its own axis; no pan, no tilt, no roll, no change of lens feel`
+## Secondary-space traversal — never reset from scratch
 
-This still sits inside the UGC layer — handheld sway, small framing corrections, and
-footstep bounce are expected and welcome. What is banned is a *deliberate* camera-family
-change mid-crossing.
+The primary act continuously shows its concrete divider. If a door already exists, keep it shut
+until entry. If no door exists, an earlier construction beat cuts and frames a passable opening
+and fits a door/panel. Then allocate four additive slots:
 
----
+1. `divider_open`: open the named divider in the finished primary space.
+2. `secondary_threshold`: cross it while retaining divider edge, primary-space return light and
+   a shared floor rail/pipe/cable run.
+3. `secondary_partial_first_look`: local raw view; far wall hidden.
+4. `secondary_establish`: establish the registered secondary node from a distinct oblique axis.
 
-## Rule 4 — Exposure and white-balance soft roll
+The first secondary image must retain the divider edge or primary-space return light. Only after
+secondary establishment may the entrance leave frame. Construction state is monotonic per
+`space_id`: raw secondary material is not a regression of the finished primary space, which stays
+finished through the visible connection.
 
-Attribute the lighting change to physics, not to a grade:
+## Hard failures
 
-`the bright outdoor glare rolls off gently as the door shade takes over, and the frame settles into the cooler dim interior, still lit mainly by daylight spilling back through the opening behind; the shift is gradual across the whole video, never a sudden brightness snap`
+- exterior terrain, sky, water, vegetation, exposure or light direction drifts before entry;
+- carrier appears without access route, ruts/prints and proportional spoil evidence;
+- bare opening lacks required hardware;
+- interior exceeds the carrier envelope or an unregistered room appears;
+- hatch/shaft/landing/turn/gravity chain is incomplete;
+- shared sill/rail/utility or motivated light disappears across the boundary;
+- partial-first-look gives away the full room;
+- second space arrives by hard cut, teleport or `reset from scratch`;
+- fixed lights glow before power/wiring/fixture installation;
+- one centered camera family repeats for more than three construction milestones.
 
-The phone's auto-exposure hunting through the crossing is a UGC asset — describe it as the
-camera catching up to the darker interior, with shadow noise rising as it does. Do not use
-percentages or colour-temperature numbers.
-
----
-
-## Rule 5 — Door-frame wipe and cross-threshold tether
-
-At the sill, the opening's edges slide symmetrically outward past the frame margins like a
-vertical wipe, completing the exposure shift behind them.
-
-At least one material or light source must continue **unbroken** across the sill:
-
-- the same floor material continues inside
-- the exterior daylight becomes the interior's backlight
-- the same rock face continues from outside wall to inside wall
-- a cable, rail, or pipe runs through the opening
-
-The tether is what proves the interior is behind the exterior rather than being a different
-location.
-
----
-
-## Rule 6 — Isolation from construction
-
-A threshold bridge beat carries **no construction work**. No debris clearing, no
-installation, no coating happens during either bridge video. The bridge's entire job is
-traversal. Construction resumes in the beat after `IMAGE T+2`.
-
-Correspondingly, neither bridge video needs a worker. If one appears, they walk the path
-and carry nothing that gets installed.
-
----
-
-## Six-Shot Adaptation
-
-Both bridge videos still obey the mandatory six-shot cycle. The scales are the same; the
-*content* of each shot changes to serve traversal.
-
-### Bridge-1 — approach to the sill
-
-1. **Establishing long shot** — exterior, matching `IMAGE T`, all three exterior landmarks, the opening reading as a dark rectangle in the shell.
-2. **Full shot** — the walk begins; full-body scale moving toward the opening; the exterior landmarks start to slide outward at frame edges.
-3. **Medium shot** — the opening grows; the two peeked interior landmarks resolve from dark shapes into identifiable objects; exposure begins its roll.
-4. **Close-up** — the sill itself: material, threshold edge, the tether material crossing it.
-5. **Extreme close-up** — sill texture and the exact point where the tether material continues inward.
-6. **Wide outro shot** — standing at the sill, matching `IMAGE T+1` exactly; peeked landmarks now at their middle declared scale.
-
-### Bridge-2 — cross and settle
-
-1. **Establishing long shot** — from the sill, matching `IMAGE T+1`; the door-frame edges already at the frame margins.
-2. **Full shot** — the frame edges wipe outward past the margins; the interior volume opens.
-3. **Medium shot** — the two inherited landmarks scale to their final declared share and settle into their `IMAGE T+2` positions.
-4. **Close-up** — an interior surface, showing the interior's true material state (which is the *unrestored* interior — construction has not started here).
-5. **Extreme close-up** — the tether material on its interior side, proving continuity across the sill.
-6. **Wide outro shot** — matching `IMAGE T+2` exactly; the opening now behind the camera as a bright rectangle of backlight.
-
----
-
-## Audit Hooks
-
-- **P0** — a crossing rendered in one video instead of two.
-- **P0** — an interior landmark in `IMAGE T+2` that was not peeked through the opening in `IMAGE T`.
-- **P0** — a peeked landmark that is a future construction product.
-- **P0** — peeked landmark scale that holds constant or decreases across the three bridge anchors.
-- **P0** — a bridge video that also performs construction work.
-- **P1** — a brightness snap instead of a gradual exposure roll.
-- **P1** — no material or light source continuing across the sill.
-- **P1** — the sill handoff not declared as Bridge-1's last frame and Bridge-2's first frame.
+Any failure rewrites only the implicated beat and redraws only its target frame. Allow the initial
+render plus two targeted repair attempts. If still failing, mark `needs_human_review` and stop all
+dependent downstream generation.

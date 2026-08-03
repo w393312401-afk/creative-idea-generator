@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import server_common
+import pipeline_orchestrator
 from pipeline_orchestrator import (
     _prompt_fingerprint,
     _retry_frame_until_pass,
@@ -169,12 +170,13 @@ class TestRunAutonomousPipeline(unittest.TestCase):
         mock_video.assert_called_once()
         self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved')
 
-    def test_frame_1_persistent_gate_failure_never_dead_ends(self):
-        """A frame 1 that never passes the Anchor Acceptance Gate (e.g. it keeps reading
-        as too clean / carrying intervention evidence even after every VLM-feedback
-        retry) must not leave run_autonomous_pipeline in 'needs_human_review' — the GUI/
-        API path proceeds with the best attempt, recorded auto_approved_degraded, same
-        as a judge-unavailable skip. This is what keeps this entry point dead-end-free."""
+    def test_frame_1_persistent_gate_failure_blocks_the_whole_chain(self):
+        """A frame 1 that never passes the Anchor Acceptance Gate must ABORT the run.
+
+        2026-08-02 起改的口径（旧行为是 auto_approved_degraded 放行，见 pipeline_orchestrator
+        的 _ANCHOR_REJECTED 说明）：链首帧是 A_single_chain 的身份来源，后面每一帧都以它
+        为 i2i 参考。放行一张判定说"不是这个题材/不是这个空间"的锚帧，等于让整条链、
+        整批视频额度都长在错图上。不过就重抽，抽不过就整条链不开工。"""
         state = self._fake_state()
 
         def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
@@ -198,12 +200,39 @@ class TestRunAutonomousPipeline(unittest.TestCase):
              patch('pipeline_orchestrator.refine_packet_from_accepted_anchor', return_value={'camera_dna': 'refined'}) as mock_refine, \
              patch('pipeline_orchestrator.compose_remaining_beats', return_value='FULL PROMPT BLOCK') as mock_phase2, \
              patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}) as mock_video:
+            with self.assertRaises(pipeline_orchestrator.AnchorRejected) as ctx:
+                run_autonomous_pipeline({}, {'theme': 'x'})
+
+        self.assertEqual(ctx.exception.sequence, 1)
+        self.assertIn('still too clean', ctx.exception.reason)
+        # 中止必须发生在花钱的每一步之前：不再 refine 包、不再写剩下的拍、不烧视频额度
+        mock_refine.assert_not_called()
+        mock_phase2.assert_not_called()
+        mock_video.assert_not_called()
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'anchor_rejected')
+
+    def test_frame_1_gate_skipped_still_fails_open(self):
+        """判定**没跑成**（服务异常/门被关）不是"锚帧不合格"，仍按 degraded 放行——
+        否则代理一抖整单就打不开，这正是硬闸唯一的例外。"""
+        state = self._fake_state()
+
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
+            return {'title': title}
+
+        skipped = (True, 'Skipped (ANCHOR QA 判定服务异常，fail-open 放行)')
+        with patch('pipeline_orchestrator.compose_anchor_and_packet', return_value=state), \
+             patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_render), \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=skipped), \
+             patch('pipeline_orchestrator.is_skipped_verdict', return_value=True), \
+             patch('pipeline_orchestrator.refine_packet_from_accepted_anchor', return_value={'camera_dna': 'refined'}), \
+             patch('pipeline_orchestrator.compose_remaining_beats', return_value='FULL PROMPT BLOCK'), \
+             patch('pipeline_orchestrator._render_frames_with_checkpoints', return_value='FULL PROMPT BLOCK'), \
+             patch('pipeline_orchestrator._chain_drift_lookback'), \
+             patch('pipeline_orchestrator.generate_video_sequence', return_value={'videos': [{'slot': 1, 'status': 'success'}]}):
             result = run_autonomous_pipeline({}, {'theme': 'x'})
 
         self.assertEqual(result['status'], 'completed')
-        mock_refine.assert_called_once()
-        mock_phase2.assert_called_once()
-        mock_video.assert_called_once()
         self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved_degraded')
 
 
@@ -549,10 +578,11 @@ class TestRenderFramesForTask(unittest.TestCase):
         mock_gate.assert_not_called()
         mock_rest.assert_called_once()
 
-    def test_persistent_gate_failure_never_dead_ends(self):
-        """A frame 1 that never convinces the Anchor Acceptance Gate must still let
-        render_frames_for_task proceed to render the rest of the sequence — the main
-        帧序列 button must never dead-end past IMAGE 1."""
+    def test_persistent_gate_failure_blocks_the_rest_of_the_sequence(self):
+        """链首帧判定一直不过时，主界面「帧序列」按钮必须停在这里，不再往下渲。
+
+        2026-08-02 起改的口径（旧行为是 degraded 放行继续渲完整条链）：整条链都以
+        IMG001 为 i2i 参考，锚帧长错了后面每一帧都跟着错，越往下渲越贵、越难救。"""
         def fake_gate_render(config, title, prompt_block, on_progress=None, target_sequences=None):
             self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
             return {'title': title}
@@ -563,16 +593,37 @@ class TestRenderFramesForTask(unittest.TestCase):
              patch('pipeline_orchestrator._render_frames_with_checkpoints', return_value=self.PROMPT_BLOCK) as mock_rest, \
              patch('pipeline_orchestrator._chain_drift_lookback'), \
              patch('pipeline_orchestrator._sequence_consistency_review', return_value=self.PROMPT_BLOCK):
-            result = render_frames_for_task({}, self.title, self.PROMPT_BLOCK)
+            with self.assertRaises(pipeline_orchestrator.AnchorRejected) as ctx:
+                render_frames_for_task({}, self.title, self.PROMPT_BLOCK)
+
+        self.assertEqual(ctx.exception.sequence, 1)
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'anchor_rejected')
+        mock_rest.assert_not_called()
+
+    def test_anchor_hard_gate_can_be_turned_off(self):
+        """anchorHardGate=False 是排查用的逃生口：回到旧的 degraded 放行行为。"""
+        def fake_gate_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
+            return {'title': title}
+
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_gate_render), \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(False, 'FAIL: still too clean')), \
+             patch('pipeline_orchestrator.fix_image_prompt_with_vlm_feedback', side_effect=lambda c, p, r: p + '!'), \
+             patch('pipeline_orchestrator._render_frames_with_checkpoints', return_value=self.PROMPT_BLOCK) as mock_rest, \
+             patch('pipeline_orchestrator._chain_drift_lookback'), \
+             patch('pipeline_orchestrator._sequence_consistency_review', return_value=self.PROMPT_BLOCK):
+            result = render_frames_for_task(
+                {'anchorHardGate': False}, self.title, self.PROMPT_BLOCK)
 
         self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved_degraded')
         mock_rest.assert_called_once()
         self.assertIn('project_dir', result)
 
     def test_google_fx_does_not_regenerate_rejected_first_frame(self):
-        """Google FX IMAGE 1 always starts from the same cover reference.  A gate
-        failure must be recorded as degraded and continue to the remaining frames,
-        not repeatedly submit IMG 001 from the same source."""
+        """Google FX IMAGE 1 always starts from the same cover reference, so a gate
+        failure must NOT keep resubmitting IMG 001 from the same poisoned source —
+        exactly one render, no VLM-feedback rewrite. The verdict itself is now the
+        anchor hard gate's (anchor_rejected, chain does not continue)."""
         def fake_gate_render(config, title, prompt_block, on_progress=None, target_sequences=None):
             self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
             return {'title': title}
@@ -582,14 +633,15 @@ class TestRenderFramesForTask(unittest.TestCase):
              patch('pipeline_orchestrator.fix_image_prompt_with_vlm_feedback') as mock_fix, \
              patch('pipeline_orchestrator._render_frames_with_checkpoints', return_value=self.PROMPT_BLOCK) as mock_rest, \
              patch('pipeline_orchestrator._chain_drift_lookback'):
-            render_frames_for_task(
-                {'imageBackend': 'google_fx'}, self.title, self.PROMPT_BLOCK,
-            )
+            with self.assertRaises(pipeline_orchestrator.AnchorRejected):
+                render_frames_for_task(
+                    {'imageBackend': 'google_fx'}, self.title, self.PROMPT_BLOCK,
+                )
 
         self.assertEqual(mock_render.call_count, 1)
         mock_fix.assert_not_called()
-        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'auto_approved_degraded')
-        mock_rest.assert_called_once()
+        self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'anchor_rejected')
+        mock_rest.assert_not_called()
 
 
 if __name__ == '__main__':

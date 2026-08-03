@@ -138,12 +138,12 @@ Instructions:
     def validate_beat_prompts(self, i, video_prompt, image_prompt, packet, mode, is_last,
                               is_threshold_or_reveal, prev_video=None, prev_image=None,
                               beat=None, family=None, is_pre_bridge=False,
-                              is_post_reveal_cleanup=False):
-        """单拍校验。"""
+                              is_post_reveal_cleanup=False, video_word_limit=None):
+        """单拍校验。video_word_limit 缺省 = base 的一镜到底档硬顶（见 pp 侧说明）。"""
         return pp.validate_beat_prompts(
             i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
             prev_video, prev_image, beat=beat, family=family, is_pre_bridge=is_pre_bridge,
-            is_post_reveal_cleanup=is_post_reveal_cleanup)
+            is_post_reveal_cleanup=is_post_reveal_cleanup, video_word_limit=video_word_limit)
 
     def split_structural_video_errors(self, errs):
         """把校验结果分成（结构性硬伤, 其余瑕疵）——前者触发定向回炉。"""
@@ -391,16 +391,28 @@ Instructions:
                             print(f"[DIRECT] Beat {i} 包络体状态倒退回炉{'成功，已采用重写稿' if envelope_reworked else '未通过，保留原稿（仅留痕）'}")
                         style_errs = style_errs + envelope_errs
                         image_reworked = envelope_reworked if image_reworked is None else (image_reworked or envelope_reworked)
+                    # 回读校验：修没修以最终文本为准，不以每道回炉自报的布尔为准
+                    residual = pp.reverify_beat_repairs(
+                        i, v_p, i_p, beat, parsed_traces=parsed_traces,
+                        stage_scope=contract['stage_scope'],
+                        is_first_interior_reveal=contract['is_first_interior_reveal'],
+                        beat_ladder=beat_ladder, family=family)
                     remaining_milestone_errors = (
                         pp.check_milestone_video_prompt(v_p, beat) + pp.check_milestone_image_prompt(i_p, beat))
-                    if remaining_milestone_errors:
+                    # 终帧倒退是整条序列最贵的失败，和里程碑硬门同级：重试整拍而不是留痕
+                    payoff_blocking = pp.payoff_blocking_residual(residual, is_last)
+                    if remaining_milestone_errors or payoff_blocking:
                         if sys.stdout:
-                            print(f"[DIRECT] Beat {i} 显著里程碑硬门仍未通过，重试整拍: {remaining_milestone_errors}")
+                            print(f"[DIRECT] Beat {i} 硬门仍未通过，重试整拍: "
+                                  f"{remaining_milestone_errors + payoff_blocking}")
                         continue
                     if style_errs and sys.stdout:
                         print(f"[DIRECT] Beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {style_errs}")
+                    if residual and sys.stdout:
+                        print(f"[DIRECT] Beat {i} 回读校验仍有残留（回炉未真正生效）: {residual}")
                     pp.record_beat_audit(config, i, structural, style_errs, reworked, image_reworked,
-                                         milestone_name=beat.get('milestone_name'))
+                                         milestone_name=beat.get('milestone_name'),
+                                         residual=residual)
 
                     vid_prompt = v_p
                     img_prompt = i_p
@@ -679,19 +691,29 @@ Instructions:
                         print(f"[DIRECT] Batch beat {i} 包络体状态倒退回炉{'成功，已采用重写稿' if envelope_reworked else '未通过，保留原稿（仅留痕）'}")
                     style_errs = style_errs + envelope_errs
                     image_reworked = envelope_reworked if image_reworked is None else (image_reworked or envelope_reworked)
+                # 回读校验：修没修以最终文本为准（见 pp.reverify_beat_repairs）
+                residual = pp.reverify_beat_repairs(
+                    i, v_p, i_p, contract['beat'], parsed_traces=parsed_traces,
+                    stage_scope=contract['stage_scope'],
+                    is_first_interior_reveal=contract['is_first_interior_reveal'],
+                    beat_ladder=beat_ladder, family=contract['family'])
                 remaining_milestone_errors = (
                     pp.check_milestone_video_prompt(v_p, contract['beat'])
                     + pp.check_milestone_image_prompt(i_p, contract['beat']))
+                payoff_blocking = pp.payoff_blocking_residual(residual, contract['is_last'])
                 if style_errs and sys.stdout:
                     print(f"[DIRECT] Batch beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {style_errs}")
-                if not remaining_milestone_errors:
+                if not remaining_milestone_errors and not payoff_blocking:
+                    if residual and sys.stdout:
+                        print(f"[DIRECT] Batch beat {i} 回读校验仍有残留（回炉未真正生效）: {residual}")
                     pp.record_beat_audit(config, i, structural, style_errs, reworked, image_reworked,
-                                         milestone_name=contract['beat'].get('milestone_name'))
+                                         milestone_name=contract['beat'].get('milestone_name'),
+                                         residual=residual)
                     vid_prompt, img_prompt, beat_succeeded = v_p, i_p, True
                     new_ledger_items = parsed_traces
                 elif sys.stdout:
-                    print(f"[DIRECT] Batch beat {i} 显著里程碑硬门未通过，转入单拍重试: "
-                          f"{remaining_milestone_errors}")
+                    print(f"[DIRECT] Batch beat {i} 硬门未通过，转入单拍重试: "
+                          f"{remaining_milestone_errors + payoff_blocking}")
 
             if not beat_succeeded:
                 if sys.stdout:

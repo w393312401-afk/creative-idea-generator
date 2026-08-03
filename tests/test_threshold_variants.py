@@ -854,7 +854,9 @@ class TestPostCrossingCleanupLadderGate(unittest.TestCase):
     def test_non_clearing_beat_after_the_crossing_is_rejected_and_fed_back(self):
         state, beat_users = self._run([self._threshold_ladder('framing'),
                                        self._threshold_ladder('clearing')])
-        self.assertEqual(state['beat_ladder'][3]['operation'], 'clearing')
+        establish = next(i for i, b in enumerate(state['beat_ladder'])
+                         if b.get('transition_stage') == 'interior_establish')
+        self.assertEqual(state['beat_ladder'][establish + 1]['operation'], 'clearing')
         # 第二次调用必须带着上一轮的结构违规回去
         self.assertIn('PRIOR STRUCTURE VIOLATIONS', beat_users[1])
         self.assertIn('"clearing" operation', beat_users[1])
@@ -862,7 +864,9 @@ class TestPostCrossingCleanupLadderGate(unittest.TestCase):
     def test_clearing_beat_after_the_crossing_is_accepted_first_try(self):
         state, beat_users = self._run([self._threshold_ladder('clearing')])
         self.assertEqual(len(beat_users), 1)
-        self.assertEqual(state['beat_ladder'][3]['operation'], 'clearing')
+        establish = next(i for i, b in enumerate(state['beat_ladder'])
+                         if b.get('transition_stage') == 'interior_establish')
+        self.assertEqual(state['beat_ladder'][establish + 1]['operation'], 'clearing')
         # 生成侧也必须把这条硬规则写进 system prompt（这里只验证它在用户可见的契约里）
         self.assertEqual(state['beat_ladder'][2]['bridge_stage'], 1)
 

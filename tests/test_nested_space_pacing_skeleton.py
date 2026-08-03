@@ -21,7 +21,7 @@ GOOD_NESTED_OUTLINE = [
     '架设第一空间木龙骨',
     '封装第一空间内衬板',
     '备齐储备厨房完成使用',
-    '硬切进入第二毛坯舱室',
+    '打开隔断舱门穿入第二毛坯舱室',
     '清空第二舱室碎屑',
     '铺设防潮膜与电路',
     '架设墙顶木龙骨',
@@ -49,11 +49,11 @@ def test_nested_space_reference_copies_stage_order_before_diverging_subject():
     assert 'COPY THE CONSTRUCTION ORDER FIRST' in summary
     assert 'CANONICAL 15-SLOT RHYTHM REFERENCE' in summary
     assert 'buried shipping-container dual-cabin creative' in summary
-    assert '10 declared reset into untouched secondary space' in summary
+    assert '10 conceptual divider-transition marker' in summary
     assert 'earth backfill and turf concealment' in summary
     assert 'timber entrance shaft and stairs' in summary
     assert 'floor membrane -> floor grid -> cavity insulation -> finished floor' in summary
-    assert 'open the end divider' in summary
+    assert 'keep the end divider visible, open it on camera and traverse' in summary
     assert 'repeat the same base/membrane/grid/insulation/board/finish ladder' in summary
     assert 'soft furnishing and warm lighting' in summary
     assert 'worker-free wide reveal' in summary
@@ -149,33 +149,33 @@ def test_nested_space_outline_requires_exactly_one_raw_second_space_reset():
     outline = list(GOOD_NESTED_OUTLINE)
     outline[7] = '继续完善室内布局'
     errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
-    assert any('exactly one declared reset' in error for error in errors)
+    assert any('exactly one visible divider traversal' in error for error in errors)
 
 
-def test_nested_reset_accepts_concrete_second_space_wording():
+def test_nested_transition_accepts_concrete_second_space_wording():
     """门禁旧版三条分支都要求出现「第二/另一/新…」这类序数词，而 ≤16 字、动词开头、
     点名具体里程碑的清单自然写成「硬切进入毛坯后舱」——于是整批 0 通过、掉进静态兜底，
     用户侧的现象就是「每次只出一张灵感卡」。这些具体写法必须认。"""
-    for reset_entry in ['硬切进入毛坯后舱', '跳切至未施工的隔间', '硬切转入原始前舱',
-                        '转场至毛坯储藏室', '硬切进入未修舱室']:
+    for reset_entry in ['打开隔断舱门穿入毛坯后舱', '推开隔间门跨入未施工隔间',
+                        '打开舱壁门穿入原始前舱', '跨过门框进入毛坯储藏室']:
         outline = list(GOOD_NESTED_OUTLINE)
         outline[7] = reset_entry
         errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
         assert errors == [], f'{reset_entry} 应被认成合法重置拍，实际: {errors}'
 
 
-def test_nested_reset_accepts_a_declared_cut_without_a_raw_state_word():
+def test_nested_transition_rejects_missing_raw_state_word():
     """毛坯态词只对「切入/进入/转到 + …」那两支要求（那些动词普通施工拍里也有）。
 
     分支 1 用的是明确的剪辑术语，术语本身已经把「这是一次宣告式重置」说死了。旧版对三支
     一律复查，而清单每条 ≤16 字、还要动词开头 + 点名里程碑，硬塞「毛坯」经常挤掉空间名或
     动词——「硬切进入第二舱室」这种完全正确的写法被判掉，整张卡跟着被降级成单线。
     """
-    for reset_entry in ['硬切进入第二舱室', '跳切至隔壁储藏室', '转场进入后舱']:
+    for reset_entry in ['打开隔断舱门穿入第二舱室', '推开门框跨入隔壁储藏室']:
         outline = list(GOOD_NESTED_OUTLINE)
         outline[7] = reset_entry
         errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
-        assert errors == [], f'{reset_entry} 应被认成合法重置拍，实际: {errors}'
+        assert any('untouched/raw state' in error for error in errors)
 
 
 def test_nested_reset_still_needs_a_raw_state_word_without_a_cut_term():
@@ -184,7 +184,7 @@ def test_nested_reset_still_needs_a_raw_state_word_without_a_cut_term():
     outline = list(GOOD_NESTED_OUTLINE)
     outline[7] = '进入第二舱室继续施工'
     errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
-    assert any('untouched/raw state' in e or 'exactly one declared reset' in e for e in errors)
+    assert any('untouched/raw state' in e or 'visible divider traversal' in e for e in errors)
 
 
 def test_nested_cards_are_never_relabelled_into_another_skeleton():
@@ -193,13 +193,15 @@ def test_nested_cards_are_never_relabelled_into_another_skeleton():
     assert 'nested_space_payoff' in pp._NO_DOWNGRADE_SKELETONS
 
 
-def test_nested_reset_written_as_a_doorway_travel_shot_is_named_as_such():
+def test_nested_hard_cut_is_rejected_and_visible_divider_travel_is_accepted():
     """这个骨架的重置按定义是硬切（threshold_variant=hard_cut）。写成推镜过门时要说清
     是「写法不对」，而不是含糊的 found 0——错误串会被回喂给模型当返工说明。"""
     outline = list(GOOD_NESTED_OUTLINE)
-    outline[7] = '推镜过门进入原始舱内'
+    outline[7] = '硬切进入原始舱内'
     errors = pp.pacing_skeleton_outline_violations(nested_idea(outline))
-    assert any('DECLARED HARD CUT' in error for error in errors)
+    assert any('forbids hard cut' in error for error in errors)
+    outline[7] = '推开隔断舱门穿入原始后舱'
+    assert pp.pacing_skeleton_outline_violations(nested_idea(outline)) == []
 
 
 def test_nested_reset_stays_unique_across_an_ordinary_two_room_outline():
@@ -208,7 +210,7 @@ def test_nested_reset_stays_unique_across_an_ordinary_two_room_outline():
         '吊车吊装集装箱入基坑', '覆土堆坡遮蔽箱体外壳', '清空第一空间碎屑落尘',
         '铺设第一空间防潮膜',
         '架设木龙骨与保温层', '封装储备区木饰面墙', '备齐储备厨房完成使用',
-        '硬切进入毛坯后舱', '清运后舱锈屑与积渣', '铺设防潮膜与电路',
+        '打开隔断舱门穿入毛坯后舱', '清运后舱锈屑与积渣', '铺设防潮膜与电路',
         '架设墙顶木龙骨', '封装保温内衬面板', '铺装成品地板与涂料',
         '布置卧榻与羊毛软装', '点亮卧室全景,人物入住',
     ])

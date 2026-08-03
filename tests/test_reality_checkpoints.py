@@ -318,9 +318,13 @@ class TestRenderFramesWithCheckpoints(_TmpProjectCase):
 
     def test_segments_do_not_cross_bridge(self):
         # BRIDGE 在视频 6：族1 = IMG1-6，族2 = IMG7-12
+        # IMG7 是族2 的**族锚帧**：走到族2 时它先单独渲一张并过族锚门
+        # （_gate_family_anchor），之后同族其余帧才批量渲——族锚必须先于依赖它的帧成立，
+        # 否则一次批量就把族身份和挂在它上面的 4 张帧一起下注（2026-08-02「客机变大巴」
+        # 的形态）。它排在族1 渲完之后，因为它的 i2i 参考正是族1 的尾帧 IMG6。
         calls, syncs, _, _ = self._run(12, bridge_at=6)
         self.assertEqual([c['targets'] for c in calls],
-                         [[1, 2, 3, 4, 5], [6], [7, 8, 9, 10, 11], [12]])
+                         [[1, 2, 3, 4, 5], [6], [7], [8, 9, 10, 11], [12]])
         self.assertEqual(syncs, [5, 11])
 
     def test_existing_frames_excluded_from_targets(self):
@@ -346,6 +350,39 @@ class TestRenderFramesWithCheckpoints(_TmpProjectCase):
         frame_currents = [p['current'] for s, p in self.events if s == 'frame']
         self.assertEqual(frame_currents, list(range(1, 13)))   # 跨段连续递增
         self.assertTrue(all(p['total'] == 12 for s, p in self.events if s == 'frame'))
+
+    def test_family_anchor_gate_runs_on_the_head_of_each_later_family(self):
+        """族锚门只判各族头帧，且用的是那一帧自己的提示词与镜头族。"""
+        judged = []
+
+        def _judge(config, image_path, image_prompt, family=None):
+            judged.append((os.path.basename(image_path), family))
+            return True, 'PASS'
+
+        with patch.object(pipeline_orchestrator, 'check_family_anchor_compliance', _judge):
+            self._run(12, bridge_at=6)
+        self.assertEqual(judged, [('img_007.webp', 'interior')])
+
+    def test_rejected_family_anchor_blocks_the_rest_of_the_chain(self):
+        """族锚判定不过 = 整族都会长在错图上，必须中止，不做降级放行。"""
+        with patch.object(pipeline_orchestrator, 'check_family_anchor_compliance',
+                          lambda *a, **k: (False, 'FAIL: 画面是大巴内部，不是客机机身')), \
+             patch.object(pipeline_orchestrator, 'fix_image_prompt_with_vlm_feedback',
+                          side_effect=lambda c, p, r: p + '!'):
+            with self.assertRaises(pipeline_orchestrator.AnchorRejected) as ctx:
+                self._run(12, bridge_at=6)
+        self.assertEqual(ctx.exception.sequence, 7)
+
+    def test_family_anchor_gate_fails_open_when_the_judge_is_unavailable(self):
+        """判定服务异常不是"族锚不合格"：照常往下渲，只留痕。"""
+        with patch.object(pipeline_orchestrator, 'check_family_anchor_compliance',
+                          lambda *a, **k: (False, 'FAIL: 判定服务异常')), \
+             patch.object(pipeline_orchestrator, 'is_judge_unavailable_verdict',
+                          lambda reason: True), \
+             patch.object(pipeline_orchestrator, 'fix_image_prompt_with_vlm_feedback',
+                          side_effect=lambda c, p, r: p):
+            calls, _, _, _ = self._run(12, bridge_at=6)
+        self.assertIn([8, 9, 10, 11], [c['targets'] for c in calls])
 
 
 class TestSegmentProgress(unittest.TestCase):

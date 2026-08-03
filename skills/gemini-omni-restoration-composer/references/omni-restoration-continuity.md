@@ -10,6 +10,19 @@ Every VIDEO prompt must explicitly state:
 
 All shot changes must interpolate between those two anchors. Multi-shot editing is allowed; layout replacement is not.
 
+## World, envelope and space-graph locks
+
+IMAGE 1 acceptance freezes rendered reality: exact terrain contour, foreground/mid/background
+landmarks, sky/cloud cover, water colour and level, vegetation, exposure and key-light direction.
+The first three exterior states may change only the declared carrier/logistics delta. Delivery and
+excavation must preserve a real access route, ruts/prints, an irregular carrier-shaped footprint
+and proportional spoil; never a perfect circular cut.
+
+Register the carrier's external proportions/orientation and maximum clear interior. Every room
+must fit inside it. Register site, primary and secondary nodes plus their visible connecting edges;
+never invent an unregistered room. Audit state monotonicity per `space_id`, so a raw secondary
+space is not mistaken for the primary space regressing.
+
 ## Single-Operation Beat Rule
 
 One ordinary VIDEO equals one dominant physical operation.

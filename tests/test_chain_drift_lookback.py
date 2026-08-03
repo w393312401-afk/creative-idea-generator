@@ -107,8 +107,10 @@ class TestChainDriftLookback(unittest.TestCase):
                   anchor_is_first_frame=True):
             calls.append((anchor_seq, mid_seq, tail_seq, anchor_is_first_frame))
             return (True, 'PASS') if anchor_seq == 1 else (False, 'FAIL: 室内族累积漂移')
+        # 漂移 FAIL 现在会先重生成尾帧再复检（chainDriftRegen=False 关掉，本例只验取样）
         with patch.object(pipeline_orchestrator, 'run_chain_tail_drift_check', _fake):
-            _chain_drift_lookback({}, self.TITLE, self._block(8, bridge_at=4), self.tmp,
+            _chain_drift_lookback({'chainDriftRegen': False}, self.TITLE,
+                                  self._block(8, bridge_at=4), self.tmp,
                                   on_progress=self._on_progress)
         # 族1 = IMG1-4（BRIDGE 前），族2 = IMG5-8；各取 锚点/链中/链尾
         self.assertEqual(calls, [(1, 3, 4, True), (5, 7, 8, False)])
@@ -116,9 +118,48 @@ class TestChainDriftLookback(unittest.TestCase):
         self.assertEqual([e['passed'] for e in entries], [True, False])
         self.assertEqual([e['tail'] for e in entries], [4, 8])
         stages = [s for s, _ in self.events]
-        self.assertEqual(stages, ['chain_drift_check', 'chain_drift_check'])
+        self.assertEqual(stages, ['chain_drift_check', 'chain_drift_check', 'chain_drift_blocking'])
         self.assertIn('链尾回望', self.events[0][1]['message'])
         self.assertIn('检出累积漂移', self.events[1][1]['message'])
+        # 未修好的漂移家族必须阻塞视频生成，而不是只留一条记录
+        blocking = self._manifest()['chain_drift_blocking']
+        self.assertEqual([b['family_anchor'] for b in blocking], [5])
+
+    def test_drift_fail_regenerates_tail_then_clears(self):
+        """FAIL → 重生成尾帧及其下游 → 复检通过 → 不再阻塞。"""
+        self._touch_frames(6)
+        verdicts = iter([(False, 'FAIL: 累积漂移'), (True, 'PASS')])
+        rendered = []
+
+        def _fake_render(config, title, block, on_progress=None, target_sequences=None):
+            rendered.append(list(target_sequences or []))
+            return {'title': title}
+
+        with patch.object(pipeline_orchestrator, 'run_chain_tail_drift_check',
+                          lambda *a, **k: next(verdicts)), \
+             patch.object(pipeline_orchestrator, 'generate_frame_sequence', _fake_render):
+            _chain_drift_lookback({}, self.TITLE, self._block(6), self.tmp,
+                                  on_progress=self._on_progress)
+
+        self.assertEqual(rendered, [[6]])
+        entry = self._manifest()['chain_drift'][0]
+        self.assertTrue(entry['passed'])
+        self.assertEqual(entry['regen_rounds'], 1)
+        self.assertEqual(entry['regenerated'], [6])
+        self.assertNotIn('chain_drift_blocking', self._manifest())
+
+    def test_judge_unavailable_fail_never_regenerates_or_blocks(self):
+        """判定服务异常导致的 fail-closed FAIL 不是漂移：既不重渲也不阻塞。"""
+        self._touch_frames(6)
+        with patch.object(pipeline_orchestrator, 'run_chain_tail_drift_check',
+                          lambda *a, **k: (False, 'FAIL: 判定服务异常')), \
+             patch.object(pipeline_orchestrator, 'is_judge_unavailable_verdict',
+                          lambda reason: True), \
+             patch.object(pipeline_orchestrator, 'generate_frame_sequence') as mock_render:
+            _chain_drift_lookback({}, self.TITLE, self._block(6), self.tmp)
+
+        mock_render.assert_not_called()
+        self.assertNotIn('chain_drift_blocking', self._manifest())
 
     def test_single_family_without_bridge(self):
         self._touch_frames(6)

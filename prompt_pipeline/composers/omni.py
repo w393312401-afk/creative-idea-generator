@@ -191,9 +191,9 @@ _BASE_ONLY_ERROR_SNIPPETS = (
 
 # 用户明确要院线感/商业感时，才关掉 UGC 手机拍摄的默认档
 # （omni-scene-skeleton.md §1 "Optional cinematic terms, only when useful or requested"）。
-_CINEMATIC_REQUEST_PATTERN = re.compile(
-    r'院线|电影感|电影级|大片感|商业大片|广告片质感|cinematic|filmic|commercial finish|'
-    r'film look|35\s*mm|16\s*mm|胶片感', re.IGNORECASE)
+# 判据本体搬到了 pp.wants_cinematic_style —— Phase 1 的 IMAGE 1 要用同一套口径（见
+# OmniComposer.wants_cinematic）。这里保留别名，旧的模块级引用不必跟着改。
+_CINEMATIC_REQUEST_PATTERN = pp._CINEMATIC_REQUEST_PATTERN
 
 _ONE_TAKE_PATTERNS = (
     (re.compile(r'\bone takes?\b'), 'one-take'),
@@ -542,18 +542,12 @@ class OmniComposer(BaseComposer):
     # ── 风格分支 ────────────────────────────────────────────────────────────
 
     def wants_cinematic(self):
-        """用户是否明确要了院线感/商业感。默认 False = 走 UGC 手机拍摄的真实感。"""
+        """用户是否明确要了院线感/商业感。默认 False = 走 UGC 手机拍摄的真实感。
+
+        判据本体在 pp.wants_cinematic_style：Phase 1 的 IMAGE 1（模块级、profile 无关的
+        代码）要用同一套口径给首帧补拍摄质感子句，不能反向 import 本包。"""
         state = self.state or {}
-        parsed_brief = state.get('parsed_brief') or {}
-        haystack = ' '.join(str(x) for x in (
-            state.get('theme', ''),
-            parsed_brief.get('theme', ''),
-            parsed_brief.get('visual_style', ''),
-            parsed_brief.get('style', ''),
-            parsed_brief.get('brief', ''),
-            parsed_brief.get('signature_anchor', ''),
-        ) if x)
-        return bool(_CINEMATIC_REQUEST_PATTERN.search(haystack))
+        return pp.wants_cinematic_style(state.get('parsed_brief') or {}, state.get('theme', ''))
 
     def capture_style_rule(self):
         if self.wants_cinematic():
@@ -665,13 +659,17 @@ single continuous take、one continuous take、single take、unbroken take 或�
                               is_threshold_or_reveal, prev_video=None, prev_image=None,
                               beat=None, family=None, is_pre_bridge=False,
                               is_post_reveal_cleanup=False):
+        ladder = self.ladder_for_beat(beat, is_threshold_or_reveal)
+        # 字数硬顶按本 profile 的镜头梯算，不用 base 的一镜到底档 380
+        # （见 pp.validate_beat_prompts 的 video_word_limit 说明）。拍型不明时按施工梯。
+        _ceiling_ladder = ladder or ladder_for(self.clip_duration(), 'construction')
         errs = super().validate_beat_prompts(
             i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
             prev_video, prev_image, beat=beat, family=family, is_pre_bridge=is_pre_bridge,
-            is_post_reveal_cleanup=is_post_reveal_cleanup)
+            is_post_reveal_cleanup=is_post_reveal_cleanup,
+            video_word_limit=video_word_targets(len(_ceiling_ladder))[1])
         errs = [e for e in (errs or [])
                 if not any(snippet in e for snippet in _BASE_ONLY_ERROR_SNIPPETS)]
-        ladder = self.ladder_for_beat(beat, is_threshold_or_reveal)
         return errs + omni_video_violations(
             video_prompt, ladder=ladder,
             duration=self.clip_duration() if ladder else None)
@@ -739,6 +737,8 @@ single continuous take、one continuous take、single take、unbroken take 或�
                                             is_video=True)
         text = pp.fix_video_opening(i, text)
         text = pp.fix_sound_design(text, family=family or 'exterior')
+        text = ensure_ladder_out_and_in(text, ladder, packet=packet, beat=beat,
+                                        is_threshold_or_reveal=is_threshold_or_reveal)
         text = self.normalize_omni_video(
             text, is_threshold_or_reveal=is_threshold_or_reveal, beat=beat)
         return pp.compress_prompt_to_budget(text, ceiling, config, is_video=True)
@@ -815,6 +815,59 @@ Rewrite rules (additive — do not lose content):
                 print(f"[OMNI] Beat {i} 多镜头回炉稿复验未通过，保留原稿（仅留痕）")
             return video_prompt, False
         return candidate, True
+
+
+def ensure_ladder_out_and_in(video_prompt, ladder, packet=None, beat=None,
+                             is_threshold_or_reveal=False):
+    """镜头梯版的 worker out-and-in 兜底（约束前移，取代 base 的时间戳版）。
+
+    base 的 fix_out_and_in 在 omni 下整条被跳过（它会塞进按 8 秒写死的 't=0s ... by
+    t=7.5s' 和 'Grid C1 edge' —— 两者都违反本档的记号禁用与弹性时长）。跳过之后
+    进出这件事就完全没有确定性兜底了，全靠模型自觉：2026-08-02 实测一单 13/16 拍
+    在 base 的 check_out_and_in 上报"缺 worker out-and-in"，全部只留痕不回炉。
+
+    这里按镜头梯自己的语义补：工人在**全景/中景**入画、在**结果远景**出画，用镜头梯
+    自己的措辞（named path，无时间戳、无 Grid 记号），且必须能被 base 的
+    check_out_and_in 认出（它查的是 enter / exits / leaves the frame 这些词）。
+
+    以下情况原样返回：过门拍/兑现拍（契约上就没有工人）、正文已声明画面无人、
+    正文里根本没有工人、进出两侧都已经写全、梯里没有结果远景可挂。"""
+    text = video_prompt or ''
+    if is_threshold_or_reveal or not ladder:
+        return text
+    low = text.lower()
+    sterile_phrases = ('sterile of workers', 'sterile of active workers', 'sterile of any human',
+                       'no workers', 'no human presence', 'completely sterile of', 'without any human')
+    if any(p in low for p in sterile_phrases):
+        return text
+    if not any(re.search(rf'\b{w}s?\b', low) for w in ('worker', 'crew', 'person', 'builder', 'laborer')):
+        return text
+    # 出画镜是结果远景；梯里没有它（过门/兑现梯）就不该由这里补
+    if not any(rung.key in ('outro',) for rung in ladder):
+        return text
+
+    has_entry = re.search(r'\benters?\b|\bwalks in\b|\bsteps in\b|\benters the frame\b', low) is not None
+    has_exit = re.search(r'\bexits?\b|\bwalks out\b|\bleaves? the frame\b|\bsteps out\b', low) is not None
+    if has_entry and has_exit:
+        return text
+
+    costume = pp._worker_costume_from_packet(packet)
+    entry_rung = 'full shot' if any(r.key == 'full' for r in ladder) else 'medium shot'
+    clauses = []
+    if not has_entry:
+        clauses.append(
+            f"In the {entry_rung} the same lone worker{costume} enters the frame along a named "
+            f"approach path already carrying the tool and material for this beat")
+    if not has_exit:
+        clauses.append(
+            "in the wide outro shot that worker exits the frame back along the same named path "
+            "with the tool and the emptied container, leaving the frame completely empty of "
+            "workers before the clip ends")
+    if not clauses:
+        return text
+    if text and not text.rstrip().endswith(('.', '!', '?')):
+        text = text.rstrip() + '.'
+    return (text.rstrip() + ' ' + ', and '.join(clauses) + '.').strip()
 
 
 def fallback_ladder_clause(ladder):

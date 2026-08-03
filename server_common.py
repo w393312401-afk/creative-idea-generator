@@ -498,14 +498,10 @@ SKILL_PROFILE_VIDEO_MODEL_RULES = (
 )
 
 # ── 技能包（skill）本地路径的解析 ──
-# 取值优先级：环境变量 > server_config.json（skillProfiles.<profile> 或 base 的
-# skillDir）> 仓库内置 skills/<包名> > 旧的 ~/.codex 默认路径 > 常见技能根目录下的
-# 自动探测。skillDir 这个配置项是 2026-07-26 补的：缺失告警一直写着"用环境变量
-# SKILL_DIR / server_config.json 指向技能所在位置"，但代码只读环境变量，照着提示往
-# server_config.json 里写是没有任何效果的。
-# 仓库内置那一层是 2026-08-01 补的：此前两个技能包都只存在于开发机的 ~/.codex 下，
-# clone 下来的机器靠 _autodetect 去扫"碰巧装了哪些技能"，行为随机器而变，而失败是
-# 无声的。契约随代码一起版本化之后，不配任何东西也有确定行为。
+# 取值优先级：完整的仓库内置 skills/<包名> > 环境变量 >
+# server_config.json > 旧的 ~/.codex 默认路径 > 自动探测。仓库内包是与运行时
+# 代码同步版本化的契约；只要它完整，机器本地的下载目录或 ~/.codex 就不得
+# 覆盖它。显式路径仅在仓库内包缺失/契约不完整时才是灾备入口。
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 _VENDORED_SKILL_ROOT = os.path.join(_PROJECT_ROOT, 'skills')
 _DEFAULT_SKILL_DIR = os.path.join(
@@ -522,6 +518,7 @@ _SKILL_ROOT_CANDIDATES = (
 # 自动探测采纳门槛：至少命中这么多个契约文件才认。1 个太松——随便一个只有 SKILL.md
 # 的技能包都会被误认成本项目的技能包。
 _SKILL_AUTODETECT_MIN_HITS = 2
+_IGNORED_SKILL_OVERRIDE_WARNED = set()
 
 
 def _normalize_skill_profile(profile):
@@ -591,20 +588,33 @@ def _configured_skill_dir(profile):
 
 
 def _resolve_skill_dir(profile=None):
-    """返回 (路径, 来源)，来源取值 env / config / vendored / default / autodetect。
-
-    显式指定（环境变量或配置）时绝不二次猜测：路径写错了就该在启动日志和前端横幅上
-    看见"这个目录缺 N 个文件"，而不是被自动探测悄悄换成另一个包。"""
+    """返回 (路径, 来源)，来源取值 vendored / env / config / default /
+    autodetect。完整的 vendored 包始终是权威来源；显式路径是缺包时的灾备，
+    不是覆盖仓库契约的插件机制。"""
     profile = _normalize_skill_profile(profile)
     spec = SKILL_PROFILES[profile]
 
+    vendored = os.path.join(_VENDORED_SKILL_ROOT, spec['package'])
+    vendored_hits = _skill_contract_hits(vendored, profile)
+    vendored_complete = vendored_hits == len(skill_contract_files(profile))
+
     env_raw = os.environ.get(spec['env'])
+    cfg_raw = _configured_skill_dir(profile)
+    if vendored_complete:
+        ignored = env_raw or cfg_raw
+        if ignored and profile not in _IGNORED_SKILL_OVERRIDE_WARNED:
+            _IGNORED_SKILL_OVERRIDE_WARNED.add(profile)
+            if sys.stdout:
+                print(
+                    f"[WARN] {profile} skill 的外部覆盖路径 {ignored!r} 已忽略："
+                    f"仓库内置契约包完整，必须优先使用 {vendored}"
+                )
+        return vendored, 'vendored'
+
     if env_raw and env_raw.strip():
         return _expand_local_path(env_raw), 'env'
-    cfg_raw = _configured_skill_dir(profile)
     if cfg_raw:
         return _expand_local_path(cfg_raw), 'config'
-    vendored = os.path.join(_VENDORED_SKILL_ROOT, spec['package'])
     if _skill_contract_hits(vendored, profile):
         return vendored, 'vendored'
     legacy_default = os.path.join(

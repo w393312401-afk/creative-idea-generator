@@ -109,13 +109,23 @@ def background_worker(task_id, config, dimensions):
         beat_audit = config.get('_beat_audit') if isinstance(config, dict) else None
         if beat_audit:
             structural_beats = [r for r in beat_audit if r.get('structural')]
-            unfixed = [r for r in structural_beats if not r.get('reworked')]
+            # 「修没修」以回读校验为准（repair_verified，见 prompt_pipeline.reverify_beat_repairs）：
+            # 回炉自报 reworked=True、回读却仍有残留的拍必须算进未修好的那一堆，否则
+            # 「审计报了没修」这类硬伤（2026-08-02 终帧倒退事故）在面板上看着是绿的。
+            unfixed = [r for r in structural_beats
+                       if not r.get('reworked') or r.get('repair_verified') is False]
+            rework_failed = [r for r in beat_audit if r.get('milestone_status') == 'rework_failed']
             milestone_rows = [r for r in beat_audit if r.get('milestone_name')]
             milestone_ok = [r for r in milestone_rows if r.get('milestone_status') in ('passed', 'reworked')]
             lines = [f"### 直出校验留痕（{len(beat_audit)} 拍有记录）", '']
             if milestone_rows:
                 lines.append(
                     f"- **显著阶段里程碑骨架：{len(milestone_ok)}/{len(milestone_rows)} 拍通过或已回炉**")
+            if rework_failed:
+                lines.append(
+                    f"- **回炉后回读校验未通过：{len(rework_failed)} 拍**（"
+                    + '、'.join(f"第 {r['beat']} 拍" for r in rework_failed)
+                    + "）——这些拍的修复只是自报成功，最终提示词里问题仍在")
             for rec in beat_audit:
                 milestone_prefix = (f"「{rec.get('milestone_name')}」· "
                                     if rec.get('milestone_name') else '')
@@ -131,12 +141,17 @@ def background_worker(task_id, config, dimensions):
                                   else 'IMAGE 回炉未通过，保留原稿' if img_rw is False
                                   else '仅留痕')
                     lines.append(f"- 第 {rec['beat']} 拍 · {milestone_prefix}风格瑕疵（{style_note}）：" + '；'.join(rec['style']))
+                if rec.get('residual'):
+                    lines.append(f"- ⚠️ 第 {rec['beat']} 拍 · {milestone_prefix}**回读校验残留**（回炉未真正生效，"
+                                 f"最终提示词里问题仍在）：" + '；'.join(str(x) for x in rec['residual']))
             result['audit_md'] = ((result.get('audit_md') or '').rstrip() + '\n\n' + '\n'.join(lines)).strip()
-            if structural_beats:
+            if structural_beats or rework_failed:
                 summary = (f"直出校验发现 {len(structural_beats)} 拍存在结构性硬伤"
-                           f"（{len(structural_beats) - len(unfixed)} 拍已定向回炉重写"
-                           + (f"，{len(unfixed)} 拍回炉未通过保留原稿——生成帧序列前建议先处理" if unfixed else "")
-                           + "），详情见下方审核报告。")
+                           f"（{len(structural_beats) - len(unfixed)} 拍已回炉并通过回读校验"
+                           + (f"，{len(unfixed)} 拍未修好——生成帧序列前建议先处理" if unfixed else "")
+                           + "）"
+                           + (f"；另有 {len(rework_failed)} 拍回炉后回读校验未通过" if rework_failed else "")
+                           + "，详情见下方审核报告。")
                 result['repair_md'] = summary
             result['beat_audit'] = beat_audit
         result['skipped_checks_count'] = config.get('_skipped_checks', 0) if isinstance(config, dict) else 0
@@ -148,8 +163,19 @@ def background_worker(task_id, config, dimensions):
         images, videos = _parse_prompt_slots(result['prompt_block'])
         result['image_count'] = len(images)
         result['video_count'] = len(videos)
+        # 槽位数的显式契约（2026-08-02 元数据不自洽复盘）：dimensions.beats_count 是
+        # **规划期的施工拍上限**，不是交付的拍数，更不是帧数——before 帧（IMAGE 1）是
+        # 隐式插入的、不进 count。下游一律读这一份，别再拿 beats_count 做切片。
+        from prompt_pipeline import frame_slot_counts, prompt_slots_list
+        _declared = dimensions.get('beats_count') if isinstance(dimensions, dict) else None
+        result['slot_counts'] = frame_slot_counts(len(videos), declared_beats_count=_declared)
+        if result['slot_counts'].get('declared_matches_delivered') is False:
+            log('INFO', 'COMPOSE',
+                f"交付拍数与卡片声明不一致（属正常自适应收缩/扩张，仅留痕）："
+                f"beats_count={result['slot_counts'].get('declared_beats_count')} / "
+                f"施工拍={result['slot_counts']['construction_beats']} / "
+                f"帧={result['slot_counts']['image_slots']}")
         # 结构化槽位契约：前端优先消费，避免前后端双实现解析漂移（帧配对错位事故前提）
-        from prompt_pipeline import prompt_slots_list
         result['prompt_slots'] = prompt_slots_list(result['prompt_block'])
 
         # 发布用双语标题行（TikTok 英文标题+tags / 国内社媒中文标题+话题），失败不阻塞出单

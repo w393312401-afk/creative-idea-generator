@@ -269,10 +269,24 @@ def test_config_count_does_not_confuse_x1_with_x2():
 
 
 def test_current_flow_count_control_uses_x_prefix_and_stable_aria_suffix():
-    """Current Flow labels the tab x1 even though callers request legacy 1x."""
+    """Current Flow labels the tab x1 even though callers request legacy 1x.
+
+    定位策略必须是「先按 aria-controls 的稳定数字业务值，再按两种拼写兜底」——拿调用方
+    传的 "1x" 去精确匹配当前 UI 的 "x1" 会永远找不到那个 tab。
+
+    第二条断言原本 grep 源码里的 `f"x{_count_number}"`：那段字面量在 fix_fx_config 里
+    **从未存在过**（`git log -S` 查无此串），测试在提交进来的那一刻就是红的。同一个意图
+    的实现方式是 _generation_count_aliases 同时给出两种拼写，所以这里改成直接验行为——
+    grep 源码字面量本来就会被任何一次等价重写误伤。
+    """
     source = inspect.getsource(helpers.fix_fx_config)
     assert "aria-controls$='-content-{_count_number}'" in source
-    assert 'f"x{_count_number}"' in source
+
+    number, aliases = helpers._generation_count_aliases("1x")
+    assert number == "1"                      # aria-controls 用的稳定业务值
+    assert {"x1", "1x"} <= aliases            # 兜底匹配覆盖新旧两种拼写
+    assert helpers._matches_generation_count("Nano Banana 2 crop_9_16 x1", "1x")
+    assert not helpers._matches_generation_count("Nano Banana 2 crop_9_16 x2", "1x")
 
 
 def test_l1_probe_config_functions():

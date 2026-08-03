@@ -159,24 +159,23 @@ class TestResolutionPerProfile:
                 str(tmp_path), 'vendored', server_common.SKILL_PROFILES[profile]['package'])
             assert report['missing'] == []
 
-    def test_config_overrides_only_the_named_profile(self, cfg_file, tmp_path):
+    def test_complete_vendored_profile_ignores_named_config_override(self, cfg_file, tmp_path):
         _write_vendored(tmp_path, 'base', 'omni')
         elsewhere = _write_package(tmp_path / 'my-omni', 'omni')
         _set_config(cfg_file, skillProfiles={'omni': elsewhere})
 
-        assert server_common.skill_dir('omni') == elsewhere
-        assert server_common.skill_dir_source('omni') == 'config'
+        assert server_common.skill_dir('omni') != elsewhere
+        assert server_common.skill_dir_source('omni') == 'vendored'
         # base 不受影响，仍用内置那份
         assert server_common.skill_dir_source('base') == 'vendored'
 
-    def test_legacy_skill_dir_key_still_configures_base(self, cfg_file, tmp_path):
-        """已经配好 skillDir 的机器升级后不能静默回到默认路径。"""
+    def test_complete_vendored_base_ignores_legacy_skill_dir(self, cfg_file, tmp_path):
         _write_vendored(tmp_path, 'base')
         legacy = _write_package(tmp_path / 'legacy-base', 'base')
         _set_config(cfg_file, skillDir=legacy)
 
-        assert server_common.skill_dir('base') == legacy
-        assert server_common.skill_dir_source('base') == 'config'
+        assert server_common.skill_dir('base') != legacy
+        assert server_common.skill_dir_source('base') == 'vendored'
 
     def test_skill_profiles_entry_wins_over_legacy_key(self, cfg_file, tmp_path):
         precise = _write_package(tmp_path / 'precise', 'base')
@@ -184,23 +183,22 @@ class TestResolutionPerProfile:
                     skillProfiles={'base': precise})
         assert server_common.skill_dir('base') == precise
 
-    def test_env_var_per_profile(self, cfg_file, tmp_path, monkeypatch):
+    def test_complete_vendored_profile_ignores_env_override(self, cfg_file, tmp_path, monkeypatch):
         _write_vendored(tmp_path, 'omni')
         from_env = _write_package(tmp_path / 'env-omni', 'omni')
         _set_config(cfg_file, skillProfiles={'omni': str(tmp_path / 'config-omni')})
         monkeypatch.setenv('SKILL_DIR_OMNI', from_env)
 
-        assert server_common.skill_dir('omni') == from_env
-        assert server_common.skill_dir_source('omni') == 'env'
+        assert server_common.skill_dir('omni') != from_env
+        assert server_common.skill_dir_source('omni') == 'vendored'
 
-    def test_vendored_loses_to_explicit_config(self, cfg_file, tmp_path):
-        """显式配错了要看得见地报缺失，不能被内置那份悄悄顶掉。"""
+    def test_complete_vendored_wins_over_broken_explicit_config(self, cfg_file, tmp_path):
         _write_vendored(tmp_path, 'base')
         _set_config(cfg_file, skillDir=str(tmp_path / 'typo'))
 
         report = server_common.skill_contract_report('base')
-        assert report['dir'] == str(tmp_path / 'typo')
-        assert len(report['missing']) == report['total']
+        assert report['source'] == 'vendored'
+        assert report['missing'] == []
 
     def test_autodetect_matches_the_profiles_own_contracts(self, cfg_file, tmp_path, monkeypatch):
         """探测 omni 时要按 omni 的清单打分，否则会挑中隔壁的 base 包。"""

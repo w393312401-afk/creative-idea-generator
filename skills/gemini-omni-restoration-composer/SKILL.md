@@ -260,6 +260,13 @@ The image may feel casual, but it must still preserve anchor landmarks and the c
 
 Every added, removed, repaired, cleaned, painted, welded, bolted, assembled, dragged, lifted, poured, cut, drilled, wired, installed, opened, or closed element must have a source or entry path, hand/tool/machine contact, a visible movement path, and at least two persistent traces inherited by the next IMAGE anchor.
 
+Before prompt writing, create and carry `world_lock`, `carrier_envelope`, `entrance_topology`,
+and `space_graph`. After IMAGE 1 passes visual acceptance, freeze `world_lock` from that actual
+render. Every beat also carries `space_id`, `transition_stage`, `camera_family`, `reveal_scope`,
+and `light_source_state`. For any physical entry, follow the topology-adaptive additive slot
+protocol in `references/omni-threshold-bridge.md`; transition slots never consume construction
+milestones. New tasks never use a second-space hard cut or `reset from scratch`.
+
 Nothing may appear, disappear, finish, clean up, align, attach, open, close, or transform without a visible physical cause. Being occluded is not a legal way to leave an anchor — hold hidden objects explicitly.
 
 ### Construction Sequence Logic
@@ -424,7 +431,7 @@ Rules:
 - An enclosed interior prompt mentions a horizon, sky, clouds, or weather.
 - A primary landmark leaves frame in shot 1, 2, or 6, or changes its relationship to another landmark between anchors.
 - The lighting phase skips a step, regresses, or advances without an on-camera physical cause.
-- (Threshold) A crossing is rendered in one video; or an interior landmark appears in `IMAGE T+2` that was not peeked in `IMAGE T`; or a peeked landmark is a future construction product; or peeked scale fails to increase monotonically; or a bridge video performs construction work.
+- (Threshold) The topology-adaptive stage order is incomplete; entrance hardware, shaft/landing/turn, shared light/landmark tether or reveal budget fails; a transition slot performs construction work; or a second space arrives by hard cut / `reset from scratch` instead of through the visible divider.
 - (Reverse-engineering mode) Any prompt mentions an element listed in `banned_elements`; any beat-derived claim lacks `evidence_frames`; any `change_events` entry is unbound to a beat; the keyframe collage failed to generate; or fewer frames were reviewed than `analysis_plan` requires.
 
 ### P1 - Strengthen Before Delivery

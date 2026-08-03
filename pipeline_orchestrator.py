@@ -71,6 +71,7 @@ from prompt_pipeline import (
     compose_anchor_and_packet,
     compose_remaining_beats,
     check_anchor_frame_compliance,
+    check_family_anchor_compliance,
     refine_packet_from_accepted_anchor,
     fix_image_prompt_with_vlm_feedback,
     check_full_sequence_consistency,
@@ -102,6 +103,58 @@ from video_generator import generate_video_sequence
 
 _MAX_ANCHOR_ATTEMPTS = 3
 _MAX_RECOVERY_ATTEMPTS = 2
+
+# 锚帧硬闸（2026-08-02 复盘，本文件顶部那段"永不硬阻断"的旧口径到此为止）。
+#
+# 事故形态：IMG001 的提示词写的是空荒原接收基坑的 before 外景，实际出图是舱内；VLM
+# 判定明确 FAIL，quality_gate 却记成 auto_approved_degraded、retry_count=0 直接放行。
+# 这条链是 A_single_chain——slot2 参考 img_001、slot3 参考 img_002……17 帧全串在这
+# 一张上，于是主题（退役客机）在第 2 帧就丢了，后面全靠内景把观众骗回来。
+#
+# 降级放行本身没错，错在它对"链首帧/家族锚帧"和"普通中间帧"一视同仁。锚帧是整条链
+# 的身份来源，它不过就没有任何下游帧能救回来——只能是硬闸：不过就重抽，抽不过就整条
+# 链不开工。普通中间帧维持原样（degraded 放行、留痕、不拦）。
+#
+# 唯一的例外是**判定本身没跑**（qaGateLevel=off / 判定服务异常 fail-open）：那不是
+# "锚帧不合格"，是"没人看过"，继续按 degraded 放行，否则代理一抖整单就打不开。
+_ANCHOR_REJECTED = 'anchor_rejected'
+
+
+def anchor_hard_gate_enabled(config):
+    """锚帧硬闸是否生效。config['anchorHardGate'] 显式给 False 才关（留一个逃生口给
+    "我就是要看那张不合格的锚帧长什么样"的排查场景）；qaGateLevel=off 时判定压根不跑，
+    硬闸自然也无从生效（见 _anchor_gate_status）。"""
+    if not isinstance(config, dict):
+        return True
+    value = config.get('anchorHardGate')
+    return True if value is None else bool(value)
+
+
+def _anchor_gate_status(config, passed, reason, hard_fail_status):
+    """一次锚帧判定的最终 quality_gate 取值。
+
+    passed=True 时沿用既有约定（判定被跳过则记 degraded，真通过记 auto_approved）。
+    passed=False 时：判定真跑过且真说了不合格 → anchor_rejected（硬闸）；判定没跑成
+    （服务异常/被跳过）→ 回落到调用方给的 hard_fail_status（fail-open，行为不变）。"""
+    if passed:
+        return 'auto_approved_degraded' if is_skipped_verdict(reason) else 'auto_approved'
+    judge_ran = not (is_skipped_verdict(reason) or is_judge_unavailable_verdict(reason))
+    if judge_ran and anchor_hard_gate_enabled(config):
+        return _ANCHOR_REJECTED
+    return hard_fail_status
+
+
+class AnchorRejected(RuntimeError):
+    """锚帧硬闸拦下：这条链不开工。带上帧序号与 VLM 原因，供上层原样回给用户。"""
+
+    def __init__(self, sequence, reason, project_dir=None):
+        self.sequence = int(sequence)
+        self.reason = reason or '(未记录判定原因)'
+        self.project_dir = project_dir
+        super().__init__(
+            f"IMG {self.sequence:03d} 是锚帧（整条帧序列的身份来源），视觉判定未通过且"
+            f"重抽已耗尽，按锚帧硬闸中止本次帧序列——修正该帧提示词后重跑。"
+            f"判定原因：{self.reason}")
 
 
 def _anchor_attempt_limit(config):
@@ -357,7 +410,8 @@ def _retry_frame_until_pass(config, title, sequence, images, videos, judge, on_p
 
 
 def render_and_gate_single_frame(config, title, sequence, prompt, meta='', judge=None, on_progress=None,
-                                 hard_fail_status='needs_human_review', max_attempts=None):
+                                 hard_fail_status='needs_human_review', max_attempts=None,
+                                 is_anchor=False):
     """Render exactly one frame and run it through an acceptance gate synchronously,
     returning the final verdict directly (no task_id/polling) so a caller — including a
     conversational agent mid-turn — can decide what to do next before composing anything
@@ -370,10 +424,15 @@ def render_and_gate_single_frame(config, title, sequence, prompt, meta='', judge
     the autonomous GUI/API callers pass 'auto_approved_degraded' instead so a persistently
     unconvincing anchor never hard-blocks the pipeline — it proceeds with the best attempt,
     flagged in the manifest for visibility, same as any other degraded/unverified frame.
-    Returns {'status': 'auto_approved'|'auto_approved_degraded'|'needs_human_review',
-    'reason', 'prompt', 'image_path', 'project_dir'}. auto_approved_degraded 表示判定
-    服务异常被 fail-open 放行，或判定真跑过但重试耗尽仍未通过——两种情况帧都没有
-    真正过检，只是没被拦，区别只在 reason 文本。"""
+    `is_anchor=True`（链首帧与各镜头族的家族锚帧）改写上一段的结论：锚帧不适用降级放行。
+    判定真跑过、真说了不合格、且重抽耗尽时，状态一律是 'anchor_rejected'，由调用方中止
+    整条链——它是 A_single_chain 的身份来源，放行它等于让后面每一帧都长在一张错图上
+    （见 _ANCHOR_REJECTED 的事故说明）。判定没跑成仍然 fail-open 到 hard_fail_status。
+
+    Returns {'status': 'auto_approved'|'auto_approved_degraded'|'needs_human_review'
+    |'anchor_rejected', 'reason', 'prompt', 'image_path', 'project_dir'}。
+    auto_approved_degraded 表示判定服务异常被 fail-open 放行，或（非锚帧）判定真跑过但
+    重试耗尽仍未通过——两种情况帧都没有真正过检，只是没被拦，区别只在 reason 文本。"""
     if judge is None:
         def judge(image_path, current_prompt):
             return check_anchor_frame_compliance(config, image_path, current_prompt, {}, {})
@@ -386,7 +445,9 @@ def render_and_gate_single_frame(config, title, sequence, prompt, meta='', judge
         on_progress=on_progress, max_attempts=max_attempts,
     )
     project_dir = _get_project_dir(title)
-    if passed:
+    if is_anchor:
+        status = _anchor_gate_status(config, passed, reason, hard_fail_status)
+    elif passed:
         status = 'auto_approved_degraded' if is_skipped_verdict(reason) else 'auto_approved'
     else:
         status = hard_fail_status
@@ -535,6 +596,46 @@ def _checkpoint_reality_sync(config, title, images, videos, members, latest_seq,
     return changed
 
 
+def _gate_family_anchor(config, title, images, videos, fam_seq, project_dir, on_progress=None):
+    """镜头族锚帧硬闸。fam_seq 是该族的头一帧（过门/硬切之后重新立起来的那张）。
+
+    IMAGE 1 走 render_and_gate_single_frame 的锚点门，这里管的是**其余每个族**的头帧：
+    它同样是链头，同样被整族逐帧 i2i 串下去，此前却完全没有任何检查。判定不过就按
+    VLM 反馈改写提示词重抽（复用 _retry_frame_until_pass），抽不过抛 AnchorRejected
+    ——族锚不适用降级放行，理由见 _ANCHOR_REJECTED。
+
+    调用方必须按族顺序走到这一族时才调：头帧的 i2i 参考是**上一族的尾帧**，提前渲会
+    直接缺参考图。返回 True 表示这一帧已经在这里渲好并过完门（调用方不必再渲它）；
+    返回 False 表示本函数不适用（IMAGE 1 / 关门 / 缺槽位），该帧仍归批量渲染管。
+
+    qaGateLevel=off / 判定服务异常 / 硬闸被关 → 一律放行（fail-open），不拦渲染。"""
+    if fam_seq <= 1 or qa_gate_level(config) == 'off':
+        return False
+    item = images.get(fam_seq)
+    if not item:
+        return False
+    family = image_space_family(videos, fam_seq)
+
+    def _judge(image_path, current_prompt):
+        return check_family_anchor_compliance(config, image_path, current_prompt, family=family)
+
+    passed, reason = _retry_frame_until_pass(
+        config, title, fam_seq, images, videos, _judge,
+        on_progress=on_progress, max_attempts=_anchor_attempt_limit(config),
+    )
+    status = _anchor_gate_status(config, passed, reason, 'auto_approved_degraded')
+    _set_manifest_quality_gate(project_dir, fam_seq, status, reason)
+    if status == _ANCHOR_REJECTED:
+        if on_progress:
+            on_progress('anchor_rejected', {
+                'sequence': fam_seq, 'reason': reason,
+                'message': (f"镜头族锚帧 IMG {fam_seq:03d} 未通过视觉判定，已中止本次帧序列"
+                            f"（整族都会以它为参考串下去）：{reason}"),
+            })
+        raise AnchorRejected(fam_seq, reason, project_dir)
+    return True
+
+
 def _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on_progress=None):
     """分段渲染 + 检查点现实同步。把整链渲染切成每 K 帧一段（K=_checkpoint_interval，
     段不跨镜头族），段间做 _checkpoint_reality_sync。返回（可能被校准改写过的）
@@ -567,6 +668,17 @@ def _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on
     first_segment = True
     changed = False
     for _fam, members in runs:
+        # 族锚硬闸：这一族的头帧先单独渲一张并过门，之后同族其余帧才批量渲。
+        # 顺序有两层意义：(1) 族锚必须先于依赖它的帧成立，否则一次批量就把族身份和
+        # 挂在它上面的 4 张帧一起下注；(2) 头帧的 i2i 参考是**上一族的尾帧**，所以
+        # 只能在按族顺序走到这里时渲——提前到整条链之前渲会直接缺参考图。
+        head = members[0]
+        if head in missing and _gate_family_anchor(
+                config, title, images, videos, head, project_dir,
+                on_progress=_segment_progress(on_progress, offset, grand_total, first_segment)):
+            missing.discard(head)
+            offset += 1
+            first_segment = False
         segments = [members[i:i + interval] for i in range(0, len(members), interval)]
         for si, seg in enumerate(segments):
             targets = [s for s in seg if s in missing]
@@ -596,24 +708,71 @@ def _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on
     return _format_prompt_block(images, videos) if changed else prompt_block
 
 
+_MAX_DRIFT_REGEN_ROUNDS = 1
+_MAX_DRIFT_REGEN_FRAMES = 6
+
+
+def _drift_regen_enabled(config):
+    """漂移 FAIL 后是否重生成尾帧。config['chainDriftRegen'] 显式给 False 才关。"""
+    if not isinstance(config, dict):
+        return True
+    value = config.get('chainDriftRegen')
+    return True if value is None else bool(value)
+
+
+def _regenerate_from(config, title, images, videos, start_seq, all_seqs, on_progress=None):
+    """从 start_seq 起把这一帧及其**全部下游帧**重渲一遍。
+
+    下游帧是 i2i 链上的后代（img_N 参考 img_{N-1}）：只重渲尾帧会让它后面的帧仍然挂在
+    旧的那张上，manifest 与磁盘就此对不上。返回实际重渲的帧号列表；下游帧太多
+    （> _MAX_DRIFT_REGEN_FRAMES）时返回 [] 表示"重渲代价过大，跳过、直接进阻塞"。
+
+    不先删旧帧：显式传 target_sequences 时两个后端都会无条件重渲（见
+    frame_generator 的 skip_seqs 分支），先删只会在重渲失败时把还能用的旧帧一起赔掉。"""
+    targets = [s for s in all_seqs if s >= start_seq]
+    if not targets or len(targets) > _MAX_DRIFT_REGEN_FRAMES:
+        return []
+    generate_frame_sequence(config, title, _format_prompt_block(images, videos),
+                            on_progress=on_progress, target_sequences=targets)
+    return targets
+
+
 def _chain_drift_lookback(config, title, prompt_block, project_dir, on_progress=None):
     """链尾回望检查：全部帧渲染（含恢复轮）结束后，按镜头族各取 锚点/链中/链尾 三帧，
     一次 VLM 调用比对累积漂移。逐帧质检只看相邻对，每步都合格的缓慢偏移在链尾可能已
     很可观——这是"链尾对链头"组合唯一被比对的地方。
 
-    检测型门：结果写进 manifest['chain_drift'] 并广播 chain_drift_check 事件，任何档位
-    都不拦截视频生成（累积漂移无廉价自动修复，重渲链尾单帧修不了整条链）；off 档跳过。
-    整个过程对流水线非致命：任何异常只打日志，不中断任务。"""
+    2026-08-02 起不再是纯检测门。此前的口径是"检出即留痕，不拦截视频生成"，实测一单
+    4 个家族 3 个 FAIL、只做了 1 次重锚定，链照样往下长——检测跑了、结论对了、事故照
+    发生，这套检查只是在给事故写墓志铭。现在 FAIL 之后：
+      1. 重生成该族尾帧及其下游帧（_MAX_DRIFT_REGEN_ROUNDS 轮），重渲完重跑同一判据；
+      2. 仍然 FAIL 的家族记进 manifest['chain_drift_blocking']，**阻塞视频生成**
+         （调用方据此跳过视频，见 _drift_blocking_families）。
+    重渲代价过大（下游帧超过 _MAX_DRIFT_REGEN_FRAMES）时跳过第 1 步直接进第 2 步——
+    宁可停下来让人看一眼，也不要为了自动修复把半条链重烧一遍。
+    判定服务异常导致的 FAIL 不算漂移（fail-closed 的那种），既不重渲也不阻塞。
+    off 档整段跳过。任何异常只打日志，不中断任务。"""
     if qa_gate_level(config) == 'off':
         return
     try:
         images, videos = _parse_prompt_slots(prompt_block)
+        all_seqs = sorted(images)
         runs = {}
-        for seq in sorted(images):
+        for seq in all_seqs:
             # resolve_family_anchor：链中重锚定过的族在重锚点处自然分段，
             # 收尾回望的每个子链都对着自己实际生效的基线比
             runs.setdefault(resolve_family_anchor(config, videos, seq), []).append(seq)
         results = []
+        blocking = []
+
+        def _check(head, mid, tail):
+            return run_chain_tail_drift_check(
+                config,
+                _frame_path(title, head), _frame_path(title, mid), _frame_path(title, tail),
+                anchor_seq=head, mid_seq=mid, tail_seq=tail,
+                anchor_is_first_frame=(head == 1),
+            )
+
         for anchor in sorted(runs):
             members = [s for s in runs[anchor] if os.path.exists(_frame_path(title, s))]
             # 短族同样要审：运输/掩埋/过门前的外景通常只有 2~3 帧，恰恰承载载体
@@ -624,33 +783,72 @@ def _chain_drift_lookback(config, title, prompt_block, project_dir, on_progress=
                 continue
             head, tail = members[0], members[-1]
             mid = members[1] if len(members) == 2 else members[len(members) // 2]
-            passed, reason = run_chain_tail_drift_check(
-                config,
-                _frame_path(title, head), _frame_path(title, mid), _frame_path(title, tail),
-                anchor_seq=head, mid_seq=mid, tail_seq=tail,
-                anchor_is_first_frame=(head == 1),
-            )
+            passed, reason = _check(head, mid, tail)
+            regenerated = []
+            rounds = 0
+            while (not passed and not is_judge_unavailable_verdict(reason)
+                   and rounds < _MAX_DRIFT_REGEN_ROUNDS and _drift_regen_enabled(config)):
+                rounds += 1
+                if on_progress:
+                    on_progress('chain_drift_regen', {
+                        'family_anchor': head, 'tail': tail, 'round': rounds, 'reason': reason,
+                        'message': (f"IMG {head:03d}→{tail:03d} 检出累积漂移，正在重生成尾帧"
+                                    f"及其下游帧（第 {rounds} 轮）"),
+                    })
+                redone = _regenerate_from(config, title, images, videos, tail, all_seqs,
+                                          on_progress=on_progress)
+                if not redone:
+                    if on_progress:
+                        on_progress('chain_drift_regen_skipped', {
+                            'family_anchor': head, 'tail': tail,
+                            'message': (f"IMG {tail:03d} 之后的下游帧过多，重生成代价高于"
+                                        f"人工复核，跳过自动重渲，直接标记为阻塞"),
+                        })
+                    break
+                regenerated += redone
+                passed, reason = _check(head, mid, tail)
             entry = {'family_anchor': head, 'mid': mid, 'tail': tail,
-                     'passed': bool(passed), 'reason': reason}
+                     'passed': bool(passed), 'reason': reason,
+                     'regen_rounds': rounds, 'regenerated': regenerated}
             results.append(entry)
+            if not passed and not is_judge_unavailable_verdict(reason):
+                blocking.append(entry)
             if on_progress:
                 verdict = '通过' if passed else '检出累积漂移'
                 detail = f"（{reason}）" if reason and reason != 'PASS' else ''
+                retried = f"，已重生成 IMG {'、'.join(f'{s:03d}' for s in regenerated)}" if regenerated else ''
                 on_progress('chain_drift_check', {
                     **entry,
-                    'message': f"链尾回望 IMG {head:03d}→{mid:03d}→{tail:03d}：{verdict}{detail}",
+                    'message': f"链尾回望 IMG {head:03d}→{mid:03d}→{tail:03d}：{verdict}{detail}{retried}",
                 })
         if results:
             with manifest_lock(project_dir):
                 manifest = read_manifest(project_dir)
                 if manifest:
                     manifest['chain_drift'] = results
+                    if blocking:
+                        manifest['chain_drift_blocking'] = blocking
+                    else:
+                        manifest.pop('chain_drift_blocking', None)
                     write_manifest(project_dir, manifest)
+        if blocking and on_progress:
+            names = '、'.join(f"IMG {b['family_anchor']:03d}→{b['tail']:03d}" for b in blocking)
+            on_progress('chain_drift_blocking', {
+                'families': blocking,
+                'message': (f"{len(blocking)} 个镜头族重生成后仍检出累积漂移（{names}），"
+                            f"已阻断视频生成——先修这几帧，别把视频额度烧在漂了的链上"),
+            })
     except GenerationCancelled:
         # 取消不是"检查异常"：吞掉它会让整条流水线在用户点了取消之后继续往下跑
         raise
     except Exception as e:
         print(f"[CHAIN DRIFT] 链尾回望检查异常（不拦截流程）: {e}")
+
+
+def _drift_blocking_families(project_dir):
+    """manifest 里此刻仍在阻塞的漂移家族（见 _chain_drift_lookback）。"""
+    manifest = read_manifest(project_dir) or {}
+    return manifest.get('chain_drift_blocking') or []
 
 
 def _valid_verdict_sequences(project_dir, sequences):
@@ -1385,9 +1583,17 @@ def render_frames_for_task(config, title, prompt_block, on_progress=None):
         meta = item.get('meta', '') if isinstance(item, dict) else ''
         gate = render_and_gate_single_frame(
             config, title, 1, prompt, meta=meta, on_progress=on_progress,
-            hard_fail_status='auto_approved_degraded',
+            hard_fail_status='auto_approved_degraded', is_anchor=True,
         )
         images[1] = {'body': gate['prompt'], 'meta': meta}
+        if gate['status'] == _ANCHOR_REJECTED:
+            if on_progress:
+                on_progress('anchor_rejected', {
+                    'sequence': 1, 'reason': gate['reason'],
+                    'message': (f"链首锚帧未通过视觉判定，已中止整条帧序列（不再把 "
+                                f"{len(images) - 1} 帧串在一张错图上）：{gate['reason']}"),
+                })
+            raise AnchorRejected(1, gate['reason'], project_dir)
         prompt_block = _format_prompt_block(images, videos)
 
     prompt_block = _render_frames_with_checkpoints(config, title, prompt_block, project_dir,
@@ -1401,10 +1607,24 @@ def render_frames_for_task(config, title, prompt_block, on_progress=None):
     return manifest
 
 
-def _render_videos_with_recovery(config, title, prompt_block, on_progress=None):
+def _render_videos_with_recovery(config, title, prompt_block, on_progress=None,
+                                 project_dir=None):
     """Render all videos, then run one autonomous retry pass over any slot that came
     back rejected/blocked (e.g. a failed Google FX anchor-match) instead of leaving it
-    for a human to notice and re-trigger manually."""
+    for a human to notice and re-trigger manually.
+
+    重生成后仍未消除的累积漂移（manifest['chain_drift_blocking']，见 _chain_drift_lookback）
+    在这里阻断视频生成：视频是整条流水线里最贵的一步，把它烧在一条已经确认漂了的帧链上
+    是纯粹的浪费。返回一个带 blocked 标记的空结果，让上层如实报告而不是假装成功。"""
+    blocking = _drift_blocking_families(project_dir) if project_dir else []
+    if blocking:
+        names = '、'.join(f"IMG {b['family_anchor']:03d}→{b['tail']:03d}" for b in blocking)
+        message = (f"{len(blocking)} 个镜头族重生成后仍检出累积漂移（{names}），已跳过视频生成。"
+                   f"请先修这几帧（帧网格里重渲或改提示词），再单独触发视频。")
+        if on_progress:
+            on_progress('videos_blocked', {'families': blocking, 'message': message})
+        return {'videos': [], 'blocked': True, 'blocked_reason': message,
+                'chain_drift_blocking': blocking}
     video_result = generate_video_sequence(config, title, prompt_block, on_progress=on_progress)
     # 'skipped_cut'（旧单的硬切占位槽位，新单的 [CUT] 槽照常生成）是预期缺失，
     # 不进恢复重试轮；'skipped_bridge_hold'
@@ -1439,15 +1659,40 @@ def run_autonomous_pipeline(config, dimensions, on_progress=None):
 
     gate = render_and_gate_single_frame(
         config, title, 1, state['image_1_prompt'], judge=_image1_judge, on_progress=on_progress,
-        hard_fail_status='auto_approved_degraded',
+        hard_fail_status='auto_approved_degraded', is_anchor=True,
     )
     state['image_1_prompt'] = gate['prompt']
     state['compiled_images'][1] = gate['prompt']
+    if gate['status'] == _ANCHOR_REJECTED:
+        # 锚帧硬闸：这条链不开工。此处中止最省——后面还要写 N 拍提示词、渲 N 帧、
+        # 烧视频额度，全部会长在这张判定说"不是这个题材/不是这个空间"的图上。
+        if on_progress:
+            on_progress('anchor_rejected', {
+                'sequence': 1, 'reason': gate['reason'],
+                'message': f"链首锚帧未通过视觉判定，已中止本单：{gate['reason']}",
+            })
+        raise AnchorRejected(1, gate['reason'], gate['project_dir'])
 
     if on_progress:
         on_progress('packet_refine_start', {'message': '正在依据已确认的首帧修正 Drift Lock 数据包...'})
     state['packet'] = refine_packet_from_accepted_anchor(
         config, gate['image_path'], state['packet'], state.get('parsed_brief'))
+    # Persist the auditable world/topology ledger separately from prose prompts.  Unknown manifest
+    # keys are intentionally preserved by both render backends, so later per-frame writes keep it.
+    with manifest_lock(gate['project_dir']):
+        _manifest = read_manifest(gate['project_dir']) or {'title': title, 'frames': []}
+        _manifest['spatial_contract'] = {
+            key: state['packet'].get(key) or state.get('parsed_brief', {}).get(key)
+            for key in ('world_lock', 'carrier_envelope', 'entrance_topology', 'space_graph',
+                        'camera_palette')
+        }
+        _manifest['spatial_beats'] = [
+            {key: beat.get(key) for key in (
+                'index', 'space_id', 'transition_stage', 'camera_family', 'reveal_scope',
+                'light_source_state')}
+            for beat in state.get('beat_ladder', []) if isinstance(beat, dict)
+        ]
+        write_manifest(gate['project_dir'], _manifest)
     if on_progress:
         on_progress('packet_refined', {'message': 'Drift Lock 数据包已依据实际渲染结果修正。'})
 
@@ -1455,7 +1700,8 @@ def run_autonomous_pipeline(config, dimensions, on_progress=None):
     prompt_block = compose_remaining_beats(config, state, on_progress=on_progress)
     prompt_block = _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on_progress=on_progress)
     _chain_drift_lookback(config, title, prompt_block, project_dir, on_progress=on_progress)
-    video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress)
+    video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress,
+                                                project_dir=project_dir)
 
     return {
         'title': title,
@@ -1511,7 +1757,8 @@ def run_staged_frame_rendering(config, title, prompt_block, on_progress=None):
     prompt_block = _format_prompt_block(images, videos)
     prompt_block = _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on_progress=on_progress)
     _chain_drift_lookback(config, title, prompt_block, project_dir, on_progress=on_progress)
-    video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress)
+    video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress,
+                                                project_dir=project_dir)
 
     return {
         'title': title,

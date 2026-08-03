@@ -2092,7 +2092,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         )
     from prompt_pipeline import (
         _parse_prompt_slots, image_space_family, check_door_clearance_frame,
-        check_first_interior_reveal_raw_state,
+        check_first_interior_reveal_raw_state, cover_reference_is_same_layer,
     )
     images, videos = _parse_prompt_slots(prompt_block)
 
@@ -2196,9 +2196,29 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         is_cut_head = ('CUT' in incoming_meta) and ('BRIDGE' not in incoming_meta)
         cover_ref = (resolve_cover_reference(config, title)
                      if seq == 1 and not skip_api_call else None)
+        # 跨空间层守卫（2026-08-02 复盘）：首帧的图参考只能是**同层**的封面。
+        # 封面是"左 before / 右 after"的营销拼接图或用户随手选的一张内景图时，
+        # 参考图的空间语义会压过文本语义——那单 IMAGE 1 写的是空荒原接收基坑的外景，
+        # 封面是内景，出图直接变成舱内，整条 A_single_chain 从第一帧起就换了题材。
+        # 跨层/拼接一律退化为纯文本生成（首帧是链头，它可以没有图参考；后续帧不行）。
+        cover_layer_block = ''
+        if cover_ref:
+            _declared_family = image_space_family(videos, seq)
+            _usable, _layer, _why = cover_reference_is_same_layer(config, cover_ref, _declared_family)
+            if not _usable:
+                cover_layer_block = _why
+                cover_ref = None
+                if sys.stdout:
+                    print(f"[FRAME SEQUENCE] IMG 001 跳过封面参考，改走纯文本生成：{_why}")
+                if on_progress:
+                    on_progress('cover_reference_skipped', {
+                        'sequence': seq, 'cover_layer': _layer,
+                        'declared_family': _declared_family,
+                        'message': f"IMG 001 未复用封面作参考（{_why}），本帧改为纯文本生成",
+                    })
         if not skip_api_call:
             cover_anchor = bool(cover_ref)
-            if seq == 1 and not cover_ref:
+            if seq == 1 and not cover_ref and not cover_layer_block:
                 raise RuntimeError('生成帧序列前必须先生成或选择封面图；第一帧只能以封面图进行图生图')
             reference = cover_ref if cover_anchor else previous_path
             # A targeted/subset prompt block may contain only ``IMAGE N``.  In
@@ -2210,9 +2230,12 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                 durable_parent = os.path.join(frames_dir, f'img_{seq - 1:03d}.webp')
                 if os.path.exists(durable_parent) and os.path.getsize(durable_parent) > 0:
                     reference = durable_parent
-            if not reference or not os.path.exists(reference):
+            # 跨层守卫放行的首帧是唯一允许无图参考的帧（它本来就是链头）；
+            # 其余帧缺参考仍然是硬错误——退回文生图会直接断掉血统。
+            text_only_head = bool(cover_layer_block) and seq == 1
+            if not text_only_head and (not reference or not os.path.exists(reference)):
                 raise RuntimeError(f'无法生成第 {seq} 帧：缺少上一帧参考图，帧序列禁止退回文生图')
-            model = _image_edit_model(config)
+            model = _image_generation_model(config) if text_only_head else _image_edit_model(config)
             if on_progress:
                 on_progress('frame_start', {
                     'slot': item['index'],
@@ -2222,24 +2245,28 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
 
             ctrl_prompt = IMG2IMG_CONTROL_PROMPT
             try:
-                if cover_anchor:
-                    # No generic prefix or label: send the parsed IMAGE 1 prompt verbatim.
-                    ctrl_prompt = ''
-                elif is_turn:
-                    ctrl_prompt = IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT
-                elif is_bridge or is_cut_head:
-                    ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT
+                if text_only_head:
+                    # 跨层守卫：首帧无图参考，纯文本生成（唯一允许的 t2i 帧，见上）
+                    _generate_text_image(config, item['prompt'], target_path)
                 else:
-                    ctrl_prompt = IMG2IMG_CONTROL_PROMPT
-                transport = _generate_image_edit(config, item['prompt'], reference,
-                                                 target_path, control_prompt=ctrl_prompt)
-                if transport == CHAT_TRANSPORT and on_progress:
-                    # This is a transport fallback; the request remains image-to-image.
-                    on_progress('transport_fallback', {
-                        'sequence': seq, 'transport': transport,
-                        'degraded': not _chat_transport_is_full_quality(config),
-                        'message': f"IMG {seq:03d} {chat_transport_note(config)}",
-                    })
+                    if cover_anchor:
+                        # No generic prefix or label: send the parsed IMAGE 1 prompt verbatim.
+                        ctrl_prompt = ''
+                    elif is_turn:
+                        ctrl_prompt = IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT
+                    elif is_bridge or is_cut_head:
+                        ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT
+                    else:
+                        ctrl_prompt = IMG2IMG_CONTROL_PROMPT
+                    transport = _generate_image_edit(config, item['prompt'], reference,
+                                                     target_path, control_prompt=ctrl_prompt)
+                    if transport == CHAT_TRANSPORT and on_progress:
+                        # This is a transport fallback; the request remains image-to-image.
+                        on_progress('transport_fallback', {
+                            'sequence': seq, 'transport': transport,
+                            'degraded': not _chat_transport_is_full_quality(config),
+                            'message': f"IMG {seq:03d} {chat_transport_note(config)}",
+                        })
             except QuotaExhaustedError:
                 # 主模型图片配额耗尽 = 明确失败，直接抛给上层。
                 # 曾经这里会自动切到 imageEditFallbackModel（实配 gpt-image-2）继续渲：
@@ -2469,6 +2496,10 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                 existing_ref = existing_frame.get('reference')
                 if existing_ref:
                     reference = os.path.join(os.path.dirname(os.path.abspath(__file__)), existing_ref)
+            elif seq == 1 and existing_frame and existing_frame.get('anchor_reference') == 'text_only':
+                # 同上：跨层守卫的留痕在断点续传里必须跟着盘上那张图一起沿用，
+                # 否则重放一次 manifest 就把"这帧是纯文本生成的"洗没了。
+                cover_layer_block = existing_frame.get('anchor_reference_reason') or '跨空间层，未复用封面参考'
 
         rel_path = os.path.relpath(target_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
         
@@ -2498,6 +2529,11 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         }
         if cover_anchor:
             frame_info['anchor_reference'] = 'cover'
+        elif cover_layer_block:
+            # 跨层守卫命中：这一帧没有图参考，纯文本生成。留痕，让"为什么首帧没挂封面"
+            # 在 manifest 与帧网格上是显式事实，而不是一个看不出来的静默降级。
+            frame_info['anchor_reference'] = 'text_only'
+            frame_info['anchor_reference_reason'] = cover_layer_block
         if transport == CHAT_TRANSPORT:
             # 换过通道的帧如实标注。image_size 记的是"请求的档位"，这里再记一份真实
             # 像素——请求 2K/4K 时 chat 通道只给 1K，不记就会有 1K 帧混进后续挑帧/合成

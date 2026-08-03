@@ -14,6 +14,11 @@ cannot fill all nine is not a beat yet — it is a wish.
 | Field | Meaning |
 |---|---|
 | `shot_family` | `exterior_cycle` / `threshold_bridge` / `interior_cycle` / `reward_cycle` |
+| `space_id` | `site` / `primary` / `secondary`; state monotonicity is audited per space |
+| `transition_stage` | topology stage from `omni-threshold-bridge.md`, or `none` |
+| `camera_family` | entrance detail / shaft axis / landed partial / oblique / low rail / wall graze / reverse |
+| `reveal_scope` | `local` / `partial` / `full`; partial must occlude the far wall |
+| `light_source_state` | only physically installed or carried sources visible at this point |
 | `beat_type` | `removal` / `excavation` / `surface_prep` / `coating` / `rough_in` / `enclosure` / `fixture_install` / `threshold` / `interior_finish` / `furnishing` / `temporary_works_strike` |
 | `single_physical_operation` | the one named terminal milestone this whole video produces |
 | `material_source` | where the changed material or object comes from before it enters frame |

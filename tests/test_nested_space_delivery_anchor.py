@@ -168,13 +168,29 @@ class TestDeliveredCarrierAnchor(unittest.TestCase):
         # 取景对象整体换成场地，否则第 7 条还在要求「载体的全貌」
         self.assertIn('full extent of the receiving site', img1_system)
         self.assertNotIn('full extent of the carrier', img1_system)
+        # 正文原样保留在开头；omni 档会在尾部补一句拍摄质感（见 test_image_1_carries_
+        # the_profile_capture_style），所以这里比对前缀而不是全等。
+        self.assertTrue(state['image_1_prompt'].startswith(CLEAN_IMAGE_1))
+
+    def test_image_1_carries_the_profile_capture_style(self):
+        """IMAGE 1 在 Phase 1 生成，而拍摄质感契约挂在 Phase 2 的 VIDEO OVERRIDE 段上，
+        首帧因此曾是整条序列里唯一没有 UGC 手机质感的一张（2026-08-02 复盘）。
+        omni 档下它必须和 2..N 帧同一套风格。"""
+        with patch.object(pp, 'active_skill_profile', return_value='omni'):
+            state = self._run()
+        self.assertIn('smartphone', state['image_1_prompt'].lower())
+
+    def test_image_1_keeps_base_profile_style_untouched(self):
+        """base 档的拍摄质感由它自己的模板承载，不该被顺手塞一句手机质感。"""
+        with patch.object(pp, 'active_skill_profile', return_value='base'):
+            state = self._run()
         self.assertEqual(state['image_1_prompt'], CLEAN_IMAGE_1)
 
     def test_image_1_is_regenerated_when_the_carrier_leaks_into_the_anchor(self):
         """直出模式对首帧只记录不重做——唯独这条例外：载体提前入镜会让 Beat 1
         无货可交，必须带着违规原文重来。"""
         state = self._run([LEAKED_IMAGE_1, CLEAN_IMAGE_1])
-        self.assertEqual(state['image_1_prompt'], CLEAN_IMAGE_1)
+        self.assertTrue(state['image_1_prompt'].startswith(CLEAN_IMAGE_1))
         retry_users = [u for s, u in self.calls if 'the very first IMAGE prompt' in s]
         self.assertEqual(len(retry_users), 2)
         self.assertIn('describes the carrier itself', retry_users[1])
@@ -291,17 +307,20 @@ class TestSecondSpaceArcFloor(unittest.TestCase):
         self.assertEqual(len(beat_users), 2)
         self.assertIn('PRIOR STRUCTURE VIOLATIONS', beat_users[1])
         self.assertIn('SECOND space needs at least', beat_users[1])
-        cut_idx = next(i for i, b in enumerate(state['beat_ladder']) if b.get('hard_cut'))
-        ordinary_after = [b for b in state['beat_ladder'][cut_idx + 1:-1]
+        establish_idx = next(i for i, b in enumerate(state['beat_ladder'])
+                             if b.get('transition_stage') == 'secondary_establish')
+        ordinary_after = [b for b in state['beat_ladder'][establish_idx + 1:-1]
                           if b.get('operation') not in ('threshold', 'reward')]
         self.assertGreaterEqual(len(ordinary_after), pp._NESTED_MIN_SECONDARY_ARC_BEATS)
 
     def test_a_full_second_arc_is_accepted_first_try(self):
         state, beat_users = self._run([_ladder_json(total=12)])
         self.assertEqual(len(beat_users), 1)
-        # 两处不连续都在：第 3 拍一镜过门进主空间，第 7 拍硬切重置到第二空间
+        # 两处概念标记均展开为可见过门，最终梯子不保留 hard_cut。
         self.assertEqual(state['beat_ladder'][2].get('bridge_stage'), 1)
-        self.assertTrue(state['beat_ladder'][6].get('hard_cut'))
+        self.assertFalse(any(b.get('hard_cut') for b in state['beat_ladder']))
+        self.assertTrue(any(b.get('transition_stage') == 'secondary_threshold'
+                            for b in state['beat_ladder']))
         # 生成侧也要先说清楚，别让模型靠被打回来学：白烧一次 150s 规划调用
         self.assertIn('SECOND DISCONTINUITY', beat_users[0])
         self.assertIn('At least 4 ordinary construction beats must follow Beat R', beat_users[0])
@@ -319,8 +338,10 @@ class TestSecondSpaceArcFloor(unittest.TestCase):
         state, beat_users = self._run([encoded, encoded, encoded])
 
         self.assertEqual(len(beat_users), 3)
-        self.assertEqual(state['beat_ladder'][5]['operation'], 'furnishing')
-        self.assertEqual(state['beat_ladder'][5]['package_operations'], ['furnishing'])
+        repaired = next(b for b in state['beat_ladder']
+                        if b.get('operation') == 'furnishing'
+                        and b.get('transition_stage') == 'none')
+        self.assertEqual(repaired['package_operations'], ['furnishing'])
 
     def test_a_missing_reset_cut_is_rejected(self):
         """只有过门、没有重置切点 —— 这正是 run_1785463152800 的形态：
@@ -329,7 +350,8 @@ class TestSecondSpaceArcFloor(unittest.TestCase):
                                        _ladder_json(total=12)])
         self.assertEqual(len(beat_users), 2)
         self.assertIn('EXACTLY ONE space-reset beat', beat_users[1])
-        self.assertTrue(any(b.get('hard_cut') for b in state['beat_ladder']))
+        self.assertTrue(any(b.get('transition_stage') == 'secondary_threshold'
+                            for b in state['beat_ladder']))
 
     def test_a_reset_cut_that_skips_the_primary_payoff_is_rejected(self):
         """重置紧贴过门 = 主空间还没盖就切走，重置前那一拍不可能是小完工。"""
@@ -345,7 +367,7 @@ class TestSecondSpaceArcFloor(unittest.TestCase):
         state, beat_users = self._run([_ladder_json(total=12, bridge_at=10, cut_at=None)])
         self.assertEqual(len(beat_users), 1)
         self.assertNotIn('SECOND DISCONTINUITY', beat_users[0])
-        self.assertEqual(len(state['beat_ladder']), 12)
+        self.assertEqual(len(state['beat_ladder']), 14)
 
 
 class TestSpaceDividerLogic(unittest.TestCase):

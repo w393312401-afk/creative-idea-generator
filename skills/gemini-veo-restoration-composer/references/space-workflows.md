@@ -13,7 +13,7 @@
 | `backyard / landscape / pool` | 3-5 | demo/clearing → hardscape → softscape/water → lighting/furniture | Standard |
 | `luxury apartment` | 4-6 | demo → rough-in → surface finish → fixture install → staging | Standard |
 | `retail / showroom` | 3-5 | gutting → shell repair → service rough-in → fixture install → display staging | Standard |
-| `underground space` | 5-8 | excavation → structural → waterproofing → fit-out → concealment → reward | Threshold |
+| `underground space` | 8-12 | site/excavation → structural shell + end walls → drainage + waterproofing → ventilation + power rough-in → floor/wall/ceiling build-up → fixtures → concealment → reward | Threshold |
 | `custom build object` | 3-4 | raw material prep → assembly → finishing → detail | Standard |
 
 ## Beat Derivation Rules
@@ -27,6 +27,10 @@
 7. **Full enclosure**: For any enclosed space (room, cabin, fuselage, container, vault), wall paneling/painting and ceiling paneling/painting must BOTH be present. Never omit the ceiling/roof treatment when walls are covered. Board the ceiling before the walls (macro order rule 4) so wall panels support and hide the ceiling-board edges.
 8. **Fixture completeness (bidirectional)**: If wiring/electrical rough-in is run, light fixture installation must appear as a separate beat before the reward. Conversely, if any practical light, lamp, or powered fixture activates anywhere in the set, an earlier wiring/rough-in beat is mandatory — run before the panels that conceal it — plus a visible power source (solar panel, battery bank, generator) for off-grid carriers; its absence fails validation. If a door frame is built, door leaf/panel installation must appear in a subsequent beat.
 9. **Persistent plant**: Scaffolding, formwork, shoring, and cribbing erected in one beat persist across later anchors as static equipment and are removed only in a named temporary-works-strike beat with visible strike traces — they never blink in and out per clip.
+10. **Narrative origin**: Every project declares exactly one physical origin: existing restoration, delivered-shell build, or ground-up build. A ground-up build starts from ground and earns excavation, structural shell/arch assembly, end walls and portal before fit-out; a restoration starts with the named existing asset already present. Never switch premises because a title happens to say “BUILD”.
+11. **Underground engineering minimum**: Underground rooms must visibly install drainage/collection, waterproofing, ventilation, a traceable electrical feed/source, sealed entrance hardware and a usable access path before finish surfaces. Extension leads and portable work lights do not satisfy permanent services.
+12. **Surface-state ledger**: Track floor, walls, ceiling, entrance and utilities separately per registered room. Finished material never reverts to substrate or changes material without a dedicated visible removal/replacement beat. Entering a second room resets only that room's queue; the first room stays visibly complete through the connecting interface.
+13. **Temporary equipment**: A portable work light, cable reel, ladder or loose tool may support a real operation but can never be its own milestone. Its entry, inherited position and carry-out remain accounted for.
 
 ## Construction Phase → Visual Signature Map
 

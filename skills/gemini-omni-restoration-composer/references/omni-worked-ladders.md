@@ -27,8 +27,7 @@ vehicle, or small structure with a real door.
 | 7 | Roof rail and bracket installation | `fixture_install` | Prepares the solar mount. |
 | 8 | Solar panel placement and cable clipping | `fixture_install` | This is the power source the Power Chain veto requires. |
 | 9 | Work-light stabilisation | `fixture_install` | Lighting phase → `temporary work light active`. |
-| 10 | **Bridge-1** — approach to the sill | `threshold_bridge` | No construction work. |
-| 11 | **Bridge-2** — cross and settle | `threshold_bridge` | Lands on the interior anchor. |
+| 10+ | **Adaptive threshold slots** | `threshold_bridge` | Insert the 3/4/5-stage axial/side/top-hatch protocol; no construction work is displaced. |
 | 12 | Interior debris removal | `removal` | Volume must be conserved — room-scale debris needs real containers or trips. |
 | 13 | Interior wall base preparation | `surface_prep` | |
 | 14 | Floor joist and subfloor installation | `enclosure` | Creates the level working platform everything later stands on. |
@@ -39,7 +38,7 @@ vehicle, or small structure with a real door.
 | 19 | Floor surface finishing | `interior_finish` | After all overhead and wet work. |
 | 20 | Furniture reward reveal | `furnishing` / `reward_cycle` | Contains nothing not installed or carried in earlier. |
 
-Why this shape is long: the crossing costs two beats, the power chain costs two
+Why this shape is long: the crossing costs topology-dependent additive beats, the power chain costs two
 (source + wiring), and enclosure costs two (ceiling, then walls). Cutting any of those pairs
 to one beat is what produces the classic failures — a lamp with no wiring, a wall with no
 ceiling edge, a teleport through a doorway.
@@ -70,7 +69,7 @@ camera.
 
 1. Exterior clearing around the opening — `removal`
 2. Portal cutting or carving — `excavation` (this is where the shell is opened)
-3. **Bridge-1 / Bridge-2** — `threshold_bridge` ×2
+3. **Adaptive threshold sequence** — `threshold_bridge` ×3/4/5 by opening topology
 4. Interior excavation — `excavation` (**mandatory**: the chamber must be dug, or beat 2 must have explicitly declared a pre-existing natural cavity)
 5. Mucking-out — `removal` (the spoil from beat 4 has to physically leave; volume conservation applies hard here)
 6. Floor levelling and platform — `enclosure`
@@ -89,7 +88,7 @@ Provenance veto: a finished interior appears inside a shell that was never hollo
 - Fewer than three construction beats plus a reveal: the transformation will not read.
 - More than about twelve: the pack becomes unwieldy to deliver in one message; consider
   scoping to exterior-only or interior-only.
-- A threshold crossing always costs exactly two beats. Never one.
+- A threshold crossing costs three axial-door, four side-door, or five top-hatch beats. Never compress it into one, and never take those slots from construction.
 - A powered destiny always costs at least one rough-in beat, plus a source beat if off-grid.
 - Enclosure of a room costs at least two beats (ceiling, walls) unless only one surface is
   being closed.
