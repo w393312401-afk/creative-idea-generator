@@ -567,9 +567,16 @@ def is_google_login_page(page) -> bool:
                 return true;
             }
             const text = (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const providerForm = document.querySelector(
+                "form[action*='/fx/api/auth/signin/google'], form[action*='/api/auth/signin/google']"
+            );
+            if (providerForm) {
+                return true;
+            }
             const markers = [
                 'choose an account',
                 'sign in with google',
+                'try signing in with a different account',
                 'sign in to continue',
                 'use another account',
                 '选择账号',

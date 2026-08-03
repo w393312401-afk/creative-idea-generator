@@ -166,6 +166,15 @@ UI_SELECTORS = {
     # 新增于 2026-07-30。不涉及本文件顶部 LOCKED 声明的三项
     # (config_btn_keywords / ORIENT_ICON_MAP / RATIO_MAP)。
     "google_login": {
+        # labs.google 自己的 Auth.js 登录中转页。账号会话失效或当前 Google
+        # 身份无权进入 Flow 时，页面不会直接跳 accounts.google.com，而是先显示
+        # 「Try signing in with a different account. / Sign in with Google」。
+        # form action 比页面 class 和错误文案稳定，文案选择器只作兜底。
+        "provider_signin": [
+            "form[action*='/fx/api/auth/signin/google'] button[type='submit']",
+            "form[action*='/api/auth/signin/google'] button[type='submit']",
+            "button:has-text('Sign in with Google')",
+        ],
         # 邮箱输入页 (signin/identifier)
         "email_input": [
             "input#identifierId",

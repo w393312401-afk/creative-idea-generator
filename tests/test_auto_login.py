@@ -123,7 +123,7 @@ class _Action:
 
 
 class _FakeLoginPage:
-    """step 取 email / password / totp / chooser / captcha / done。"""
+    """step 取 provider / email / password / totp / chooser / captcha / done。"""
 
     # 哪一步渲染哪个输入框。选择器用 ui_selectors 里那一组的首选项。
     _FIELDS = {
@@ -147,7 +147,7 @@ class _FakeLoginPage:
     # -- Playwright Page 接口 --
     @property
     def url(self):
-        if self.step == "done":
+        if self.step in ("done", "provider"):
             return _FLOW_URL
         if self.step == "chooser":
             return "https://accounts.google.com/v3/signin/accountchooser"
@@ -165,6 +165,7 @@ class _FakeLoginPage:
         if selector != "body":
             return ""
         return {
+            "provider": "Try signing in with a different account. Sign in with Google",
             "captcha": "Verify you're not a robot — captcha",
             "chooser": "Choose an account Use another account",
             "phone_prompt": "2-Step Verification Check your phone and tap Yes",
@@ -172,6 +173,9 @@ class _FakeLoginPage:
         }.get(self.step, f"Sign in step {self.step}")
 
     def locator(self, selector):
+        if (self.step == "provider" and
+                selector == "form[action*='/fx/api/auth/signin/google'] button[type='submit']"):
+            return _Action(self, "sign_in_with_google", "email")
         if self.step == "phone_prompt" and selector == "button:has-text('Try another way')":
             return _Action(self, "try_another_way", "challenge_picker")
         if self.step == "challenge_picker" and selector == "[data-challengetype='6']":
@@ -295,6 +299,41 @@ def test_email_then_password_logs_in():
     assert result.ok is True
     assert result.reason == "logged_in"
     assert page.submissions == [("email", "me@example.com"), ("password", "pw")]
+
+
+def test_flow_auth_provider_page_continues_into_google_login():
+    """labs.google 的 Auth.js 中转页应先点 Google provider，再复用既有登录流程。"""
+    _configure()
+    page = _FakeLoginPage(step="provider", script={
+        ("email", "ok"): "password",
+        ("password", "ok"): "done",
+    })
+
+    result = auto_login.try_auto_login(page, user_id="u1")
+
+    assert result.ok is True
+    assert result.reason == "logged_in"
+    assert page.clicks == ["sign_in_with_google"]
+    assert page.submissions == [("email", "me@example.com"), ("password", "pw")]
+
+
+def test_flow_auth_provider_button_is_not_submitted_repeatedly():
+    """中转页不跳转时只提交一次，避免在网络异常下反复 POST 登录表单。"""
+    _configure()
+    page = _FakeLoginPage(step="provider")
+    original_locator = page.locator
+
+    def stuck_locator(selector):
+        if selector == "form[action*='/fx/api/auth/signin/google'] button[type='submit']":
+            return _Action(page, "sign_in_with_google", "provider")
+        return original_locator(selector)
+
+    page.locator = stuck_locator
+    result = auto_login.try_auto_login(page, user_id="u1")
+
+    assert result.ok is False
+    assert result.reason == "provider_stuck"
+    assert page.clicks == ["sign_in_with_google"]
 
 
 def test_two_factor_flow_fills_the_generated_code():

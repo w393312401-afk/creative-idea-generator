@@ -236,7 +236,8 @@ def test_is_google_login_page():
             if 'accounts.google.com' in url_lower or 'signin/accountchooser' in url_lower:
                 return True
             text = self._inner_text.lower()
-            markers = ['choose an account', 'sign in with google', 'sign in to continue', 'use another account', '选择账号']
+            markers = ['choose an account', 'sign in with google', 'try signing in with a different account',
+                       'sign in to continue', 'use another account', '选择账号']
             return any(m in text for m in markers)
 
     # 包含 Google 登录 URL（如用户截图中显示的 accounts.google.com/v3/signin/accountchooser）
@@ -250,3 +251,10 @@ def test_is_google_login_page():
     # 正常工作台页面
     p3 = DummyPage(url="https://labs.google/fx/tools/flow", inner_text="Create with Google Flow")
     assert is_google_login_page(p3) is False
+
+    # labs.google 的 Auth.js 错误中转页（尚未进入 accounts.google.com）。
+    p4 = DummyPage(
+        url="https://labs.google/fx/tools/flow",
+        inner_text="Try signing in with a different account.",
+    )
+    assert is_google_login_page(p4) is True

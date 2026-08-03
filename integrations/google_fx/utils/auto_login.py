@@ -44,7 +44,7 @@ DEFAULT_TIMEOUT_SECONDS = 180
 
 # 每一步允许提交几次。密码是 1（见护栏 1）；邮箱可以 2（第一次可能被账号选择页
 # 抢走焦点）；动态码 2（第一次撞上时间窗口边界的容错）。
-_MAX_SUBMITS = {"email": 2, "password": 1, "totp": 2}
+_MAX_SUBMITS = {"provider": 1, "email": 2, "password": 1, "totp": 2}
 
 _STEP_POLL_SECONDS = 1.0
 # 提交一步之后等页面变化的时间。Google 的表单页跳转本身很快，但慢代理下
@@ -158,6 +158,11 @@ def _detect_step(page) -> tuple:
     if (_first_visible(page, _SEL.get("authenticator_option")) or
             _first_visible(page, _SEL.get("try_another_way"))):
         return "challenge_picker", ""
+
+    # Flow 有时先落在 labs.google 自己的 Auth.js 中转页，而不是直接跳到
+    # accounts.google.com。先点这里的 provider 按钮，后续仍由同一状态机处理。
+    if _first_visible(page, _SEL.get("provider_signin")):
+        return "provider", ""
 
     for needle, reason, message in _HARD_STOP_MARKERS:
         if needle in text:
@@ -358,7 +363,7 @@ def try_auto_login(page, user_id: str = None, timeout_seconds: float = None,
     log(f"🔓 {context_label} 检测到掉登录，开始自动重新登录账号 {email}"
         f"（{user_id}，2FA={'已配置' if has_totp else '未配置'}，预算 {budget:.0f}s）", "自动登录")
 
-    submits = {"email": 0, "password": 0, "totp": 0}
+    submits = {"provider": 0, "email": 0, "password": 0, "totp": 0}
     result = _run_login_steps(page, email, password, has_totp, user_id,
                               submits, deadline, cancel_check)
 
@@ -406,6 +411,27 @@ def _run_login_steps(page, email, password, has_totp, user_id,
                 return AutoLoginResult(False, "chooser_stuck",
                                        "账号选择页上既找不到目标账号，也点不到「使用其他账号」")
             _wait_for_step_change(page, "chooser", _STEP_SETTLE_SECONDS)
+            continue
+
+        if step == "provider":
+            if submits["provider"] >= _MAX_SUBMITS["provider"]:
+                return AutoLoginResult(
+                    False, "provider_stuck",
+                    "点击 Google 登录按钮后仍停在 Flow 登录中转页")
+            provider = _first_visible(page, _SEL.get("provider_signin"))
+            if provider is None:
+                # 页面可能刚好正在跳转，交给下一轮重新判断。
+                time.sleep(_STEP_POLL_SECONDS)
+                continue
+            try:
+                submits["provider"] += 1
+                provider.click(timeout=5000)
+                log("🔓 自动登录：点击 Flow 登录中转页的「Sign in with Google」", "自动登录")
+            except Exception as e:
+                return AutoLoginResult(
+                    False, "provider_submit_failed",
+                    f"Flow 登录中转页的 Google 登录按钮点击失败（{type(e).__name__}: {e}）")
+            _wait_for_step_change(page, "provider", _STEP_SETTLE_SECONDS)
             continue
 
         if step == "challenge_picker":
