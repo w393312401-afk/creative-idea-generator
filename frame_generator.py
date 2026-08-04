@@ -28,6 +28,7 @@ from server_common import (
     apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
     read_manifest, write_manifest, GenerationCancelled, log,
     gpt_image_pixel_size, drop_stale_review_verdicts, stamp_manifest_capabilities,
+    qa_gate_level,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
     _get_account_pool_service, _select_pool_account,
     _account_switch_interval, _account_rotation_ring,
@@ -1055,6 +1056,16 @@ _FX_CHUNK_SIZE = 5  # FX 运行时单次批量上限（google_fx_image 内部 pr
 _FX_UUID_RE = re.compile(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
 
 
+def frame_chain_gate_enabled(config=None):
+    """Whether each new frame must pass before it may seed the next frame."""
+    if qa_gate_level(config) == 'off':
+        return False
+    if not isinstance(config, dict):
+        return True
+    value = config.get('frameChainGate')
+    return True if value is None else bool(value)
+
+
 def _get_google_fx_image_service():
     """导入内置 Google FX 运行时；失败时把 ImportError 翻译成能直接照做的话。
 
@@ -1664,10 +1675,22 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             on_progress('frame', {'frame': frame_info, 'current': generated_count, 'total': total_to_generate})
 
     def _run_vlm_qa(seq, item, is_bridge, ref_path):
-        """不再逐帧质检——一致性审查移到整套序列渲染完成后，对着真实画面统一跑一次
-        （见 pipeline_orchestrator._sequence_consistency_review）。'pending_manual_review'
-        是 manifest 里已有的合法值，前端对它没有特殊徽标，渲染成普通帧。"""
-        return 'pending_manual_review', None
+        """Gate IMAGE ``seq`` against IMAGE ``seq-1`` before chain continuation."""
+        if seq <= 1 or not frame_chain_gate_enabled(config):
+            return 'pending_manual_review', None
+        previous = _webp_path(seq - 1)
+        current = _webp_path(seq)
+        if not (_frame_exists(seq - 1) and _frame_exists(seq)):
+            return 'vlm_qa_failed', 'Frame-chain gate could not read both adjacent frames.'
+        from prompt_pipeline import run_vlm_qa_check, is_skipped_verdict
+        incoming = videos.get(seq - 1)
+        video_prompt = incoming.get('body', '') if isinstance(incoming, dict) else str(incoming or '')
+        passed, reason = run_vlm_qa_check(
+            config, previous, current, video_prompt, is_bridge=is_bridge)
+        if passed:
+            gate = 'auto_approved_degraded' if is_skipped_verdict(reason) else 'auto_approved'
+            return gate, reason
+        return 'vlm_qa_failed', reason or 'VLM rejected this adjacent frame transition.'
 
     def _record_frame(seq, item, fx_src_path, fx_uuid, quality_gate, vlm_reason,
                       cover_reference=None, fx_account_id=None):
@@ -1708,6 +1731,10 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         _emit_frame(frame_info)
 
     chunks = plan_fx_chunks(gen_seqs)
+    if frame_chain_gate_enabled(config):
+        # A multi-frame FX batch has already rendered descendants by the time its first
+        # image can be inspected.  Single-frame chunks make the gate a true fail-stop.
+        chunks = [[s] for chunk in chunks for s in chunk]
     if target_sequences is not None:
         chunks = split_fx_chunks_by_canvas(chunks, manifest_frames_by_seq, manifest)
     # 声明式硬切（[CUT] 视频槽）另起一批，便于让提示词主导场景变化；新批仍会显式
@@ -1894,6 +1921,20 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                               cover_reference=(cover_ref_src if s == 1 else None),
                               fx_account_id=generated_account_by_path.get(local_paths[offset]))
                 done_seqs.add(s)
+                if quality_gate == 'vlm_qa_failed' and frame_chain_gate_enabled(config):
+                    if on_progress:
+                        on_progress('frame_gate_rejected', {
+                            'sequence': s,
+                            'reason': vlm_reason,
+                            'message': (
+                                f'IMG {s:03d} did not pass the adjacent-frame VLM gate. '
+                                'The reference chain stopped before the next frame.'
+                            ),
+                        })
+                    raise RuntimeError(
+                        f'Frame-chain gate rejected IMG {s:03d}; downstream frames were not generated: '
+                        f'{vlm_reason}'
+                    )
         finally:
             shutil.rmtree(temp_out, ignore_errors=True)
 

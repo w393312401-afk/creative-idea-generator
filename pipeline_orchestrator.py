@@ -63,6 +63,7 @@ from datetime import datetime
 
 from server_common import (
     _get_project_dir, read_manifest, write_manifest, manifest_lock, qa_gate_level,
+    load_project_brief, save_project_brief,
     IMG2IMG_CONTROL_PROMPT, GenerationCancelled,
     frame_content_hash, drop_stale_review_verdicts, REAL_REVIEW_VERDICTS,
 )
@@ -97,7 +98,7 @@ from prompt_pipeline import (
 from frame_generator import (
     generate_frame_sequence, _generate_image_edit, _image_edit_model,
     _measure_image_pixels, _chat_transport_is_full_quality, chat_transport_note,
-    update_manifest_stale_status, CHAT_TRANSPORT,
+    update_manifest_stale_status, CHAT_TRANSPORT, frame_chain_gate_enabled,
 )
 from video_generator import generate_video_sequence
 
@@ -647,8 +648,12 @@ def _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on
     images, videos = _parse_prompt_slots(prompt_block)
     seqs = sorted(images)
     interval = _checkpoint_interval(config)
+    chain_gate = frame_chain_gate_enabled(config)
+    if chain_gate:
+        interval = 1
     missing = {s for s in seqs if not os.path.exists(_frame_path(title, s))}
-    if interval <= 0 or not missing or qa_gate_level(config) == 'off' or len(missing) <= interval:
+    if ((not chain_gate and (interval <= 0 or len(missing) <= interval))
+            or not missing or qa_gate_level(config) == 'off'):
         generate_frame_sequence(config, title, prompt_block, on_progress=on_progress,
                                 target_sequences=None)
         return prompt_block
@@ -1557,6 +1562,29 @@ def _reverify_frame_issues(config, title, sequence, recorded_issues, on_progress
     return {'resolved': [i['text'] for i in resolved], 'remaining': [i['text'] for i in remaining]}
 
 
+def _project_brief_judge(config, project_dir):
+    """锚帧验收门禁的判定函数，口径取自这一单落盘的 parsed_brief。
+
+    /api/generate_frames 是独立于 /api/compose 的第二个请求，此前它调
+    render_and_gate_single_frame 时不带 judge，落到默认判定的 packet={} /
+    parsed_brief={} 上——于是 carrier_arrives_on_camera() 恒为假，**载体后到**的项目
+    （IMAGE 1 按契约就是还没有载体的空场地）被按"至少三类损伤"的口径审，判成"缺乏
+    必要的损坏类别"，锚帧硬闸把整条链在第一帧就中止（2026-08-04 高山雪原货机舱段单：
+    18 帧一张没渲）。合成期现在会把 brief 落到项目目录（server_common.save_project_brief），
+    这里读回来喂给同一套 check_anchor_frame_compliance。
+
+    brief 缺失（老项目、合成期落盘失败）时返回 None，调用方退回默认判定——与修复前
+    行为一致，不引入新的失败模式。"""
+    brief = load_project_brief(project_dir)
+    if not isinstance(brief, dict) or not brief:
+        return None
+
+    def _judge(image_path, current_prompt):
+        return check_anchor_frame_compliance(config, image_path, current_prompt, {}, brief)
+
+    return _judge
+
+
 def render_frames_for_task(config, title, prompt_block, on_progress=None):
     """/api/generate_frames 整单渲染的编排入口：分段渲染 + 检查点现实同步 + 收尾链尾
     回望，与 staged/auto 流水线共享同一套机制（此前一次性端点直调
@@ -1583,6 +1611,7 @@ def render_frames_for_task(config, title, prompt_block, on_progress=None):
         meta = item.get('meta', '') if isinstance(item, dict) else ''
         gate = render_and_gate_single_frame(
             config, title, 1, prompt, meta=meta, on_progress=on_progress,
+            judge=_project_brief_judge(config, project_dir),
             hard_fail_status='auto_approved_degraded', is_anchor=True,
         )
         images[1] = {'body': gate['prompt'], 'meta': meta}
@@ -1653,6 +1682,10 @@ def run_autonomous_pipeline(config, dimensions, on_progress=None):
     """Runs the full staged pipeline autonomously, composing its own prompt text."""
     state = compose_anchor_and_packet(config, dimensions, on_progress=on_progress)
     title = state['title']
+    # 自动档自己带着 brief 判首帧（下面的 _image1_judge），落盘是给**之后**那些独立
+    # 请求用的：手动补渲、单帧修复、重跑帧序列都会回到 render_frames_for_task 的
+    # _project_brief_judge，那条路径只能从盘上读。
+    save_project_brief(_get_project_dir(title), state.get('parsed_brief'))
 
     def _image1_judge(image_path, current_prompt):
         return check_anchor_frame_compliance(config, image_path, current_prompt, state['packet'], state['parsed_brief'])

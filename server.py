@@ -28,6 +28,8 @@ from prompt_pipeline import *
 # Explicitly import private functions that are not imported by wildcard '*'
 from server_common import (
     _get_project_dir, _LOG_PATH, _account_switch_interval,
+    # 合成 worker 落 project_brief.json 时要临时借用项目键上下文，用完还原
+    _PROJECT_KEY_CONTEXT,
     _IP_ROTATE_DISABLED,
     # 点子库拆分存储的内部读取路径：POST /api/library 的三道防护要在**已持有**
     # LIBRARY_LOCK 的情况下读一次现有库，读-判定-写这一串必须是原子的。
@@ -93,6 +95,8 @@ def background_worker(task_id, config, dimensions):
         if isinstance(config, dict):
             config['_skipped_checks'] = 0
             config['_beat_audit'] = []
+            config['_frame_state_contract'] = []
+            config['_frame_state_contract_errors'] = []
         content = call_llm(config, dimensions, on_progress=on_progress)
         result = parse_sections(content)
 
@@ -154,6 +158,18 @@ def background_worker(task_id, config, dimensions):
                            + "，详情见下方审核报告。")
                 result['repair_md'] = summary
             result['beat_audit'] = beat_audit
+        frame_state_contract = (config.get('_frame_state_contract')
+                                if isinstance(config, dict) else None)
+        if frame_state_contract:
+            result['frame_state_contract'] = frame_state_contract
+            state_note = (
+                f"### Frame-state preflight\n\n"
+                f"- {len(frame_state_contract)} transitions validated before prompt writing.\n"
+                f"- Contract: one visible delta per frame; prior completed state is preserved; "
+                f"later-stage results are forbidden."
+            )
+            result['audit_md'] = ((result.get('audit_md') or '').rstrip()
+                                  + '\n\n' + state_note).strip()
         result['skipped_checks_count'] = config.get('_skipped_checks', 0) if isinstance(config, dict) else 0
         
         usage = stop_and_get_accounting()
@@ -199,6 +215,18 @@ def background_worker(task_id, config, dimensions):
         result['project_key'] = (
             (dimensions or {}).get('project_key')
             or make_idea_project_key(task_id, result.get('title')))
+        # 本单的 parsed_brief 落到项目目录：帧序列是**另一个独立请求**（前端只回传
+        # prompt_block），锚帧验收门禁此前因此永远拿不到 brief，只能按默认口径判。
+        # 2026-08-04 事故：载体后到的项目（IMAGE 1 按契约就是空场地）被按"必须有
+        # 三类损伤"的默认口径判成不合格，整条 18 帧的链在第一帧就被锚帧硬闸中止。
+        _brief = config.get('_parsed_brief') if isinstance(config, dict) else None
+        if isinstance(_brief, dict) and _brief:
+            _prev_key = getattr(_PROJECT_KEY_CONTEXT, 'value', None)
+            set_project_key_context(result['project_key'])
+            try:
+                save_project_brief(_get_project_dir(result.get('title') or ''), _brief)
+            finally:
+                set_project_key_context(_prev_key)
         result['timings'] = {
             'total_duration_seconds': round(time.time() - start_time, 2)
         }

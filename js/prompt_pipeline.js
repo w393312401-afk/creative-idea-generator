@@ -463,8 +463,12 @@ function selectIdeationCard(index) {
     // 会被静静抹掉；现在一律保留当前值。
     // 节拍滑块在改造后只是**额度上限**：卡片给的推荐拍数就是这一单的上限，
     // 下界由 idea.beats_floor 带给后端，滑块压不动它。
+    // 用户自己设过拍数就不再覆盖：卡片推荐只是**缺省**，不能反过来把用户刚拨的
+    // 滑块静静改掉（那正是「节拍数设置无效」的一半成因）。
     const recBeats = clampRecommendedBeats(idea.recommended_beats);
-    if (recBeats !== null) {
+    const beatsKeptByUser = beatsUserOverridden && recBeats !== null
+        && String(recBeats) !== String(document.getElementById('slider-beats').value);
+    if (recBeats !== null && !beatsUserOverridden) {
         document.getElementById('slider-beats').value = recBeats;
     }
 
@@ -473,7 +477,11 @@ function selectIdeationCard(index) {
         document.getElementById(id).dispatchEvent(new Event('input'));
     });
     
-    showToast(`已载入灵感: ${idea.title}。可以在下方微调维度并点击生成！`, "success");
+    // 保留了用户自己的拍数就说一声,否则卡片上写着「⏱ 13 拍」、滑块停在 8,
+    // 用户不知道该信哪个
+    showToast(beatsKeptByUser
+        ? `已载入灵感: ${idea.title}。已保留你手动设定的 ${document.getElementById('slider-beats').value} 拍（卡片推荐 ${recBeats} 拍）`
+        : `已载入灵感: ${idea.title}。可以在下方微调维度并点击生成！`, "success");
     saveSelectionState();
 }
 
@@ -484,9 +492,26 @@ function clampRecommendedBeats(v) {
     return Math.min(15, Math.max(5, n));
 }
 
+// 「一键合成」不经过「载入维度」这一步，所以它必须自己去读激发维度页上的节拍设置。
+// 此前这里整份 dimensions 都是硬编码的，节拍数与规划模式压根没读页面——用户在页面上
+// 怎么调都没用。规则：用户手动设过（beatsUserOverridden）就以页面为准，没设过才回落到
+// 这张卡的推荐拍数；规划模式恒以页面为准（缺省本来就是 adaptive）。
+function resolveCardBeatSettings(idea) {
+    const beatsEl = document.getElementById('slider-beats');
+    const modeEl = document.getElementById('beat-count-mode');
+    const sliderBeats = beatsEl ? clampRecommendedBeats(beatsEl.value) : null;
+    const cardBeats = clampRecommendedBeats(idea.recommended_beats) || 15;
+    return {
+        beats_count: (beatsUserOverridden && sliderBeats !== null) ? sliderBeats : cardBeats,
+        beat_count_mode: (modeEl && modeEl.value === 'fixed') ? 'fixed' : 'adaptive'
+    };
+}
+
 function composeIdeationCard(index) {
     const idea = currentIdeatedIdeas[index];
     if (!idea) return;
+
+    const beatSettings = resolveCardBeatSettings(idea);
 
     const dimensions = {
         theme: idea.input_str,
@@ -497,11 +522,13 @@ function composeIdeationCard(index) {
         budget: "轻奢设计师级",
         ratio: "50% (外壳粗野 ↔ 内里精致)",
         creativity: "脑洞大开",
-        beats_count: clampRecommendedBeats(idea.recommended_beats) || 15,
+        beats_count: beatSettings.beats_count,
         // 拍数下界（后端按这张卡的工序清单算好，见 compute_beats_floor）。
         // beats_count 是上限、beats_floor 是下界，合成侧的 ladder 只能在这个区间里挑。
+        // 下界高过用户设的上限时由后端夹回（min(beats_floor, beats_count)），
+        // 所以往下压拍数永远不会把验收弄成恒假。
         beats_floor: Number.isFinite(+idea.beats_floor) ? +idea.beats_floor : null,
-        beat_count_mode: 'adaptive',
+        beat_count_mode: beatSettings.beat_count_mode,
         // 卡片上展示的工序预览作为软计划传给后端节拍规划(硬规则优先,冲突时会被改写),
         // 让用户挑卡时看到的工序和最终成片大体对得上
         beat_outline: Array.isArray(idea.beat_outline)
@@ -533,7 +560,10 @@ function composeIdeationCard(index) {
         trend_ref_ids: idea.trend_ref_ids || []
     };
 
-    showToast(`🚀 开始一键合成灵感: ${idea.title}...`, "success");
+    // 拍数是这条路径上唯一会被用户改动的维度，直接报出来（含模式），
+    // 免得用户再一次怀疑页面上的设置到底进没进这一单
+    showToast(`🚀 开始一键合成灵感: ${idea.title}（${beatSettings.beats_count} 拍 · ${
+        beatSettings.beat_count_mode === 'fixed' ? '固定' : '自适应上限'}）...`, "success");
     
     generateIdea({
         dimensions: dimensions,

@@ -486,12 +486,13 @@ class TestFingerprintCarriesTheProfile(unittest.TestCase):
         base_fingerprint = self._save_base_checkpoint()
 
         # 命中存档就一次 _chat 都不会有（见 test_same_profile_still_resumes）；
-        # 这里 _chat 必须真的被调到，才说明 omni 走的是重排而不是续传。
+        # 这里 _chat 必须真的被调到，才说明 omni 走的是重排而不是续传。规划层现在有
+        # 确定性降级路径，所以代理持续报错不再是本测试应期待的终态异常。
         chat = MagicMock(side_effect=RuntimeError('Phase 1 从头跑了'))
         with patch.object(pp, '_chat', chat):
-            with self.assertRaises(RuntimeError):
-                pp.compose_anchor_and_packet(dict(OMNI_CONFIG), self.DIMENSIONS)
+            state = pp.compose_anchor_and_packet(dict(OMNI_CONFIG), self.DIMENSIONS)
         self.assertTrue(chat.called, 'omni 必须重新跑 Phase 1，而不是命中 base 的存档')
+        self.assertNotEqual(state['image_1_prompt'], 'base 语法的 IMAGE 1')
 
         # 旧存档还在（base 那一单没被动过），只是 omni 这次根本不看它。
         self.assertIsNotNone(pp.load_compose_checkpoint(base_fingerprint))

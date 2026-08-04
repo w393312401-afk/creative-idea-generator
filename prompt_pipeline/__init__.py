@@ -30,6 +30,11 @@ from server_common import (
     PACKET_CACHE_LOCK, COMPOSE_CHECKPOINT_LOCK,
     strict_gates_enabled, qa_gate_level, GenerationCancelled
 )
+from .frame_state import (
+    build_frame_state_contract,
+    validate_frame_state_contract,
+    compile_delta_image_prompt,
+)
 
 
 def _raise_if_cancelled(on_progress):
@@ -77,12 +82,24 @@ WORKER_EXIT_TIME = 7.5
 # pre-rollout ladder full of local/incremental filler beats.
 # v2（2026-07-26）：过门后第一拍恒为 clearing 清理工序。存量断点里的 Threshold 节拍梯
 # 没有这一拍，续传会绕过新的结构校验产出旧形态整单——只能靠指纹换代逼它重排。
-MILESTONE_POLICY_VERSION = "visible-milestones-v6-origin-systems-monotonicity"
+MILESTONE_POLICY_VERSION = "visible-milestones-v7-frame-state-hard-gate"
 _MIN_ADAPTIVE_CONSTRUCTION_BEATS = 5
 _MILESTONE_TEXT_FIELDS = (
     'milestone_name', 'before_state', 'after_state', 'completion_extent',
     'primary_progress', 'secondary_progress', 'preserve_state',
 )
+
+
+def strict_frame_state_contract_enabled(config=None):
+    """Whether invalid before/delta/after frame states block prompt delivery.
+
+    Reliability is the default.  The explicit escape hatch exists only for comparing
+    old prompt packs during diagnostics; it should not be used for production renders.
+    """
+    if not isinstance(config, dict):
+        return True
+    value = config.get('strictFrameStateContract')
+    return True if value is None else bool(value)
 
 
 def frame_slot_counts(total_beats, declared_beats_count=None):
@@ -2037,7 +2054,8 @@ def load_reference_file(name, profile=None):
     return ""
 
 
-def get_cropped_templates(templates_content, i, total_beats, mode, bridge_stage, family=None):
+def get_cropped_templates(templates_content, i, total_beats, mode, bridge_stage,
+                          family=None, beat=None):
     """Parse and crop the prompt-templates.md content based on the beat type (and shot
     family — post-crossing beats get the Interior IMAGE exemplars instead of the generic
     'inherits from IMAGE 1' ones) to minimize the input context size during LLM prompt
@@ -2609,6 +2627,85 @@ def repair_incompatible_package_operations(beat_ladder):
             repaired.append((beat.get('index'), package, candidate))
             beat['package_operations'] = candidate
     return repaired
+
+
+def deterministic_fallback_beat_ladder(parsed_brief, total_beats, variant=None, topology=None):
+    """Return a schema-complete ladder when every model draft is unusable.
+
+    The planning model is an enhancement, not a single point of failure.  This fallback keeps
+    the downstream beat/prompt pipeline alive with conservative one-operation milestones and
+    preserves the transition slots that downstream camera/state logic actually depends on.
+    """
+    total_beats = max(4, int(total_beats or 4))
+    parsed_brief = parsed_brief or {}
+    variant = variant or threshold_variant(parsed_brief)
+    topology = topology or threshold_topology(parsed_brief)
+    threshold_mode = parsed_brief.get('mode') == 'Threshold'
+    nested_reset = threshold_mode and space_reset_cut_required(parsed_brief)
+    crossing_idx = 3 if threshold_mode else None
+    reset_idx = None
+    if nested_reset:
+        secondary_arc = min(
+            _NESTED_MIN_SECONDARY_ARC_BEATS,
+            max(1, total_beats - crossing_idx - 3),
+        )
+        reset_idx = total_beats - secondary_arc - 1
+        if reset_idx <= crossing_idx + 1:
+            reset_idx = crossing_idx + 2
+
+    phase_cycle = ('clearing', 'repair', 'rough-in', 'framing', 'drywall',
+                   'flooring', 'painting', 'furnishing')
+    phase_cursor = 0
+    ladder = []
+    for idx in range(1, total_beats + 1):
+        op = phase_cycle[min(phase_cursor, len(phase_cycle) - 1)]
+        bridge_stage = None
+        hard_cut = False
+        turn_direction = None
+
+        if idx == total_beats:
+            op = 'reward'
+        elif threshold_mode and idx == crossing_idx:
+            op = 'threshold'
+            if variant == 'hard_cut':
+                hard_cut = True
+            else:
+                bridge_stage = 1
+                if topology.get('turn_degrees') == 90:
+                    turn_direction = topology.get('turn_direction')
+        elif nested_reset and idx == reset_idx:
+            op = 'threshold'
+            hard_cut = True
+        elif threshold_mode and idx in (crossing_idx + 1,
+                                        (reset_idx + 1) if reset_idx else -1):
+            op = 'clearing'
+            phase_cursor = 1
+        else:
+            phase_cursor += 1
+
+        entry = {
+            'index': idx,
+            'operation': op,
+            'description': f'Complete the full visible milestone for renovation stage {idx}',
+            'bridge_stage': bridge_stage,
+            'stage_scope': None if op in ('threshold', 'reward') else 'large',
+            'milestone_name': f'stage {idx} complete',
+            'before_state': f'the visible work for stage {idx} is absent',
+            'after_state': f'the full visible work for stage {idx} is completed',
+            'completion_extent': 'the entire named work zone or full declared component count',
+            'changed_grid_cells': ['Grid B2', 'Grid C2'],
+            'package_operations': [op],
+            'primary_progress': 'the main stage product grows from absent to complete',
+            'secondary_progress': 'the staged material stock drains from full to empty',
+            'persistent_traces': ['fastener marks', 'contact dust'],
+            'preserve_state': 'all earlier permanent work remains unchanged',
+        }
+        if hard_cut:
+            entry['hard_cut'] = True
+        if turn_direction:
+            entry['turn_direction'] = turn_direction
+        ladder.append(entry)
+    return normalize_beat_ladder(ladder)
 
 
 # ── delta 可见性预算 ────────────────────────────────────────────────────────
@@ -4795,6 +4892,43 @@ def fix_primary_landmarks(prompt, packet, family='exterior'):
     return f"{body} {clause}".strip()
 
 
+_DELIVERED_CARRIER_SCALE_SENTENCE = (
+    "The delivered carrier remains centered in the near midground and fully visible, with its "
+    "overall silhouette filling the central majority of the photograph and its longest visible "
+    "dimension spanning the same roughly two-thirds of the frame in every exterior image. Its "
+    "base contact line stays registered to the same receiving footprint, while its real-world "
+    "length-to-height proportions remain unchanged; do not zoom, rescale, or reposition it "
+    "relative to the surrounding terrain."
+)
+
+
+def fix_delivered_carrier_scale_lock(prompt, packet, family='exterior'):
+    """Keep a delivered carrier at one terrain-relative scale for its whole exterior family.
+
+    The delivery beat already requested a large final carrier, but later exterior beats did not
+    repeat that constraint. Image models could therefore enlarge the carrier while the locked
+    camera and site stayed put. The ground-contact and aspect-ratio cues make this stronger than
+    a frame-width instruction by itself.
+    """
+    if not prompt or family != 'exterior' or not isinstance(packet, dict):
+        return prompt
+    origin = packet.get('origin_contract') or {}
+    if not isinstance(origin, dict) or origin.get('mode') != 'carrier_delivery_build':
+        return prompt
+
+    # Replace earlier/free-written versions of this same declaration rather than accumulating
+    # contradictory sizes. Ordinary carrier-condition sentences (rust, dents, repairs) survive.
+    scale_markers = (
+        'longest visible dimension', 'silhouette fills the central majority',
+        'silhouette filling the central majority', 'distant miniature',
+        'dominant near-midground scale', 'base contact line stays registered',
+    )
+    sentences = re.split(r'(?<=[.!?])\s+', prompt.strip())
+    kept = [s for s in sentences if not any(marker in s.lower() for marker in scale_markers)]
+    body = ' '.join(s for s in kept if s).strip()
+    return (body.rstrip() + ' ' + _DELIVERED_CARRIER_SCALE_SENTENCE).strip()
+
+
 def extract_locked_anchor_stanza(prompt):
     """从提示词中取出锁定锚点句（fix_primary_landmarks 规范化后的单一句）。
     没有则返回 None。同族所有提示词经过合成期的规范化后携带完全相同的这一句，
@@ -5019,6 +5153,14 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
             image_prompt = image_prompt.rstrip() + ' ' + delivery_scale
         if 'dominant near-midground scale' not in video_prompt.lower():
             video_prompt = video_prompt.rstrip() + ' ' + delivery_landing
+
+    # Subject scale belongs to the entire exterior shot family, not just the delivery beat.
+    image_prompt = fix_delivered_carrier_scale_lock(image_prompt, packet, family=family)
+
+    # Ordinary milestone frames are compiled as a state delta after every deterministic
+    # lock/fix has run.  This keeps the camera and anchor clauses while removing prose
+    # that competes with the single visual change the renderer must execute.
+    image_prompt = compile_delta_image_prompt(image_prompt, beat, max_words=160)
 
     return video_prompt, image_prompt
 
@@ -7303,7 +7445,7 @@ def check_pbisp_peek(prompt, packet, label='IMAGE'):
 
 
 BASE_VIDEO_WORD_LIMIT = 380
-IMAGE_WORD_LIMIT = 250
+IMAGE_WORD_LIMIT = 180
 
 
 def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal, prev_video=None, prev_image=None, beat=None, family=None, is_pre_bridge=False, is_post_reveal_cleanup=False, video_word_limit=None):
@@ -7802,10 +7944,18 @@ Required JSON keys:
     # 传进来:卡片上看到的工序和最终成片大体对得上,但它只是草案——本函数下面那一整套
     # 硬规则(真实施工顺序、材质匹配修复、天花板覆盖、门扇、地板先于重物、Threshold 拆分、
     # 单里程碑包规则、自适应拍数下限)优先级永远更高,冲突时以硬规则为准、直接改写草案。
-    _outline_plan = [
+    _outline_full = [
         str(s).strip() for s in (dimensions.get('beat_outline') or [])
         if isinstance(s, (str, int, float)) and str(s).strip()
-    ][:max_total_beats]
+    ]
+    # 用户把拍数压到卡片推荐值以下时草案要裁剪，但**末条必须留住**：卡片草案的最后
+    # 一条是 reward 揭示（见激发侧 schema「array 长度 = recommended_beats + 1」），
+    # 直接 [:max_total_beats] 会把它连同尾部工序一起切掉,交给规划器的草案就成了一栋
+    # 停在半截的房子——用户调小拍数换来的不是更紧凑的推进，而是没有完工镜头的片子。
+    if len(_outline_full) > max_total_beats:
+        _outline_plan = _outline_full[:max_total_beats - 1] + [_outline_full[-1]]
+    else:
+        _outline_plan = _outline_full
     if _outline_plan:
         _outline_lines = '\n'.join(f"  {i}. {s}" for i, s in enumerate(_outline_plan, 1))
         _outline_plan_block = (
@@ -8165,8 +8315,12 @@ Space Type: {space_type}
                             print(f"[DEBUG] repaired final ladder package metadata: {_package_repairs}")
                     # 上面积累的都是 Threshold 桥接/切点的结构违规：下游
                     # _beat_contract/TBCP/帧渲染/配对全是硬依赖，任何时候都不放过。
-                    violations.extend(spatial_planning_violations(beat_ladder, parsed_brief))
+                    # Only the transition/index contract above is a downstream dependency.
+                    # Spatial checks are semantic quality diagnostics: use them to improve
+                    # retries, but do not discard a schema-complete final draft because a
+                    # material-word heuristic or engineering-plan hint stayed unresolved.
                     contract_violations = list(violations)
+                    violations.extend(spatial_planning_violations(beat_ladder, parsed_brief))
                     milestone_violations = milestone_ladder_violations(
                         beat_ladder, mode=parsed_brief.get('mode', 'Standard'))
                     violations.extend(milestone_violations)
@@ -8185,9 +8339,12 @@ Space Type: {space_type}
                     # 变成无效帧（见 delta_visibility_violations）。与节奏/契约同级：
                     # 重排两轮，仍不满足就接受并留痕。
                     delta_violations = delta_visibility_violations(beat_ladder)
+                    frame_state_violations = validate_frame_state_contract(
+                        build_frame_state_contract(beat_ladder))
                     structural_violations = list(violations)
                     rhythm_violations = (rhythm_ladder_violations(beat_ladder, pacing_skeleton_id)
-                                         + outline_violations + delta_violations)
+                                         + outline_violations + delta_violations
+                                         + frame_state_violations)
                     retry_for_rhythm = bool(rhythm_violations) and attempt < 2
                     # 最后一次重排的验收面：只剩「合成侧硬依赖」这一类才值得让整单失败。
                     # 详见 hard_milestone_violations 的分类说明。改造前，第 4 次重排上
@@ -8198,6 +8355,8 @@ Space Type: {space_type}
                     last_attempt = attempt == beat_ladder_max_attempts - 1
                     blocking_violations = (contract_violations
                                            + hard_milestone_violations(milestone_violations))
+                    if strict_frame_state_contract_enabled(config):
+                        blocking_violations += frame_state_violations
                     accept_leniently = last_attempt and not blocking_violations
 
                     if (not structural_violations and not retry_for_rhythm) or accept_leniently:
@@ -8294,69 +8453,27 @@ Space Type: {space_type}
             if sys.stdout:
                 print(f"[DEBUG] Beat ladder generation attempt {attempt+1} failed: {e}")
             if attempt == beat_ladder_max_attempts - 1:
-                beat_ladder = []
                 fallback_total = max_total_beats if beat_count_mode == 'fixed' else min_total_beats
                 total_beats = fallback_total
-                for idx in range(1, total_beats + 1):
-                    op = "repair"
-                    b_stage = None
-                    b_cut = False
-                    b_turn = None
-                    if idx == 1:
-                        op = "clearing"
-                    elif idx == total_beats:
-                        op = "reward"
-                    elif parsed_brief.get('mode') == 'Threshold':
-                        # 至少保留 _MIN_PRE_THRESHOLD_BEATS 个普通室外拍，过门收进单一拍
-                        t_idx = max(_MIN_PRE_THRESHOLD_BEATS + 1,
-                                    min(total_beats - 1, total_beats // 2))
-                        # 过门后第一拍恒为清理工序，与 LLM 路径的结构校验保持一致
-                        # （idx == total_beats 已被上面的 reward 分支接走，不会走到这里）
-                        if _variant == 'hard_cut':
-                            if idx == t_idx:
-                                op = "threshold"
-                                b_cut = True
-                            elif idx == t_idx + 1:
-                                op = "clearing"
-                        elif idx == t_idx:
-                            op = "threshold"
-                            b_stage = 1
-                            if _topology['turn_degrees'] == 90:
-                                b_turn = _topology['turn_direction']
-                            elif _variant in ('pan_left', 'pan_right'):
-                                b_turn = 'left' if _variant == 'pan_left' else 'right'
-                        elif idx == t_idx + 1:
-                            op = "clearing"
-                    entry = {
-                        "index": idx,
-                        "operation": op,
-                        "description": f"Complete the full visible milestone for renovation stage {idx}",
-                        "bridge_stage": b_stage,
-                        "stage_scope": "large",
-                        "milestone_name": f"stage {idx} complete",
-                        "before_state": f"the visible work for stage {idx} is absent",
-                        "after_state": f"the full visible work for stage {idx} is completed",
-                        "completion_extent": "the entire named work zone or full declared component count",
-                        "changed_grid_cells": ["Grid B2", "Grid C2"],
-                        "package_operations": [op],
-                        "primary_progress": "the main stage product grows from absent to complete",
-                        "secondary_progress": "the staged material stock drains from full to empty",
-                        "persistent_traces": ["fastener marks", "contact dust"],
-                        "preserve_state": "all earlier permanent work remains unchanged",
-                    }
-                    if b_cut:
-                        entry["hard_cut"] = True
-                    if b_turn:
-                        entry["turn_direction"] = b_turn
-                    beat_ladder.append(entry)
+                beat_ladder = deterministic_fallback_beat_ladder(
+                    parsed_brief, fallback_total, _variant, _topology)
+                beat_ladder_accepted = True
+                if sys.stdout:
+                    print('[DEBUG] using deterministic beat ladder after final generation error')
+                continue
 
-    # A malformed final response can leave the last attempted list in beat_ladder even
-    # though it never passed the gate.  Never let its arbitrary length leak into packet
-    # generation or slot formatting.
+    # Count/index/transition failures can exhaust the loop without throwing. Planning is
+    # still not allowed to be a single point of failure, so replace that unusable draft.
     if not beat_ladder_accepted:
-        raise RuntimeError(
-            f'Beat ladder generation failed the visible-milestone planning gate after '
-            f'{beat_ladder_max_attempts} attempts.')
+        fallback_total = max_total_beats if beat_count_mode == 'fixed' else min_total_beats
+        beat_ladder = deterministic_fallback_beat_ladder(
+            parsed_brief, fallback_total, _variant, _topology)
+        total_beats = len(beat_ladder)
+        beat_ladder_accepted = True
+        if sys.stdout:
+            print(
+                '[DEBUG] planning retries exhausted; continuing with deterministic '
+                f'{total_beats}-beat fallback ladder')
     # Transition slots are additive production beats.  Expanding only after the conceptual
     # construction ladder passes its count/order gates preserves every construction milestone.
     beat_ladder = expand_spatial_transition_beats(beat_ladder, parsed_brief)
@@ -8394,6 +8511,21 @@ Space Type: {space_type}
                 'persistent_traces': ['track ruts', 'spoil ridge', 'sling scuff marks'],
             })
     import hashlib
+    # Persist the authoritative state table beside the other compose diagnostics.  Run
+    # the hard gate again after deterministic transition expansion/carrier tagging so
+    # downstream prompt writing can never receive a ladder different from the one that
+    # was validated in the planning loop.
+    frame_state_contract = build_frame_state_contract(beat_ladder)
+    frame_state_errors = validate_frame_state_contract(frame_state_contract)
+    if isinstance(config, dict):
+        config['_frame_state_contract'] = frame_state_contract
+        config['_frame_state_contract_errors'] = frame_state_errors
+    if frame_state_errors and strict_frame_state_contract_enabled(config):
+        raise RuntimeError(
+            'Frame-state preflight rejected the beat ladder before prompt generation: '
+            + ' | '.join(frame_state_errors)
+        )
+
     milestone_cache_basis = json.dumps(
         [{'name': b.get('milestone_name'), 'after': b.get('after_state')}
          for b in beat_ladder], ensure_ascii=False, sort_keys=True)
@@ -9316,7 +9448,8 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
 
     family_contract = "\n".join(family_contract_lines)
 
-    templates_cropped = get_cropped_templates(templates_raw, i, total_beats, mode, bridge_stage, family=family)
+    templates_cropped = get_cropped_templates(
+        templates_raw, i, total_beats, mode, bridge_stage, family=family, beat=beat)
 
     img_i_lighting = packet.get("lighting_phase_ladder", {}).get(str(i), "ambient only")
     img_ip1_lighting = packet.get("lighting_phase_ladder", {}).get(str(i + 1), "ambient only")
@@ -9703,8 +9836,15 @@ def compose_remaining_beats(config, state, on_progress=None):
 
 def call_llm(config, dimensions, on_progress=None):
     """One-shot entry point preserved for existing callers (e.g. /api/compose):
-    runs both composer phases back-to-back with no anchor-frame gating in between."""
+    runs both composer phases back-to-back with no anchor-frame gating in between.
+
+    副产物：把这一单的 parsed_brief 挂回 config['_parsed_brief']（与 _beat_audit /
+    _skipped_checks 同一套「合成期回传」约定）。/api/compose 的 worker 会把它落到项目
+    目录，供之后独立请求的帧序列任务做锚帧验收（见 server_common.save_project_brief）。
+    """
     state = compose_anchor_and_packet(config, dimensions, on_progress=on_progress)
+    if isinstance(config, dict) and isinstance(state.get('parsed_brief'), dict):
+        config['_parsed_brief'] = state['parsed_brief']
     return compose_remaining_beats(config, state, on_progress=on_progress)
 
 

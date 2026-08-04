@@ -141,7 +141,9 @@ function applyPreset(presetName) {
     setVal('slider-ratio', p.ratio);
     setVal('slider-creativity', p.creativity);
     setVal('slider-beats', p.beats);
-    
+    // 预设/随机同样是用户拍板的拍数，之后载入灵感卡片不该再把它覆盖掉
+    if (typeof markBeatsUserOverridden === 'function') markBeatsUserOverridden();
+
     saveSelectionState();
     const PRESET_LABELS = {
         nature_wonder: '自然奇观',
@@ -858,7 +860,8 @@ function applyCustomPreset(name) {
     setVal('slider-ratio', p.ratio);
     setVal('slider-creativity', p.creativity);
     setVal('slider-beats', p.beats);
-    
+    if (typeof markBeatsUserOverridden === 'function') markBeatsUserOverridden();
+
     saveSelectionState();
     showToast(`已应用自定义预设：${name}`, 'success');
 }
@@ -924,7 +927,8 @@ function randomizeDimensions() {
     setRandomVal('slider-ratio', 0, 100);
     setRandomVal('slider-creativity', 1, 3);
     setRandomVal('slider-beats', 5, 15);
-    
+    if (typeof markBeatsUserOverridden === 'function') markBeatsUserOverridden();
+
     saveSelectionState();
     showToast("🎲 随机激发配比已装配！", "success");
 }

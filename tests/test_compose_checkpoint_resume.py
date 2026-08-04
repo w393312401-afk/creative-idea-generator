@@ -241,7 +241,11 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
 
     def test_outline_is_capped_at_the_beat_budget_and_absent_when_not_provided(self):
         """草案条数不该反过来把拍数预算顶穿:beats_count=2(fixed)时最多 3 条(含 reward)。
-        没传 beat_outline 时整块不出现,手工填维度直出的老路径行为不变。"""
+        没传 beat_outline 时整块不出现,手工填维度直出的老路径行为不变。
+
+        裁剪必须**留住末条**:卡片草案的最后一条是 reward 揭示(激发侧 schema 约定
+        长度 = recommended_beats + 1)。旧的 [:max_total] 直切会把它和尾部工序一起
+        切掉,用户把拍数调小换来的就是一份停在半截、没有完工镜头的草案。"""
         pp.compose_anchor_and_packet({}, self.dimensions)
         self.assertNotIn('Draft plan', self.captured_beat_user['text'])
 
@@ -249,9 +253,12 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
         pp.compose_anchor_and_packet({}, self.dimensions)
         beat_user = self.captured_beat_user['text']
         self.assertIn('Draft plan', beat_user)
-        self.assertIn('3. C封板', beat_user)
-        self.assertNotIn('D刷漆', beat_user)   # 超出 beats_count + 1 的草案条目被截掉
-        self.assertNotIn('E入住', beat_user)
+        self.assertIn('1. A清渣', beat_user)
+        self.assertIn('2. B龙骨', beat_user)
+        # 预算 3 条:前 2 条施工 + 末条 reward,中间超额的工序才是被截掉的那些
+        self.assertIn('3. E入住', beat_user)
+        self.assertNotIn('C封板', beat_user)
+        self.assertNotIn('D刷漆', beat_user)
 
 
 class TestComposeRemainingBeatsResume(unittest.TestCase):

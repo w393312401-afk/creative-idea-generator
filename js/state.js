@@ -110,6 +110,22 @@ let ACCESS_CODE = localStorage.getItem('spark_access_code') || '';
 let savedIdeas = [];
 let currentIdea = null;
 
+// 用户是否在「激发维度」页手动设过节拍数 / 节拍规划模式。
+// 置位后有两处行为改变，合起来才让这个设置真的生效：
+//   ① 载入灵感卡片不再拿卡片的 recommended_beats 覆盖滑块（旧行为把用户刚设的值
+//      静静抹掉，表现为「设了没用」）；
+//   ② 卡片上的「一键合成」不走载入维度这一步，此前整份 dimensions 都是硬编码的，
+//      节拍数/规划模式压根没读页面——现在以用户的设置为准。
+// 与 spark_selection_state 同寿命：设过就一直算数，刷新后仍然认这份设置。
+let beatsUserOverridden = localStorage.getItem('spark_beats_user_set') === '1';
+
+/** 记下「节拍数由用户自己定」。只由真实的用户交互调用（拖滑块 / ± 步进 /
+ *  切换规划模式 / 应用预设 / 随机配比），程序化回填（读档、载入卡片）绝不调用。 */
+function markBeatsUserOverridden() {
+    beatsUserOverridden = true;
+    try { localStorage.setItem('spark_beats_user_set', '1'); } catch (e) { /* 隐私模式忽略 */ }
+}
+
 // 本批灵感注入过 prompt 的联网参考(/api/ideate 返回的 trend_refs:
 // 搜索词摘要/自定义网址摘要),渲染在灵感卡片区顶部的可折叠面板
 let currentIdeationTrendRefs = [];

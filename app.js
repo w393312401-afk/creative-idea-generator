@@ -762,6 +762,11 @@ function initSliders() {
         document.getElementById('val-beats').textContent = `${e.target.value} 拍`;
         updateFill(e.target);
     });
+    // 只挂 'change'：拖动松手 / ± 步进（上面补发过 change）才算用户拍板，
+    // 读档与「载入灵感卡片」的回填只发 'input'，不会误置这个标记。
+    beats.addEventListener('change', () => {
+        if (typeof markBeatsUserOverridden === 'function') markBeatsUserOverridden();
+    });
     const syncBeatModeLabel = () => {
         const adaptive = !beatCountMode || beatCountMode.value !== 'fixed';
         const label = document.getElementById('beat-count-label');
@@ -772,7 +777,10 @@ function initSliders() {
     };
     if (beatCountMode) {
         beatCountMode.addEventListener('input', syncBeatModeLabel);
-        beatCountMode.addEventListener('change', syncBeatModeLabel);
+        beatCountMode.addEventListener('change', () => {
+            syncBeatModeLabel();
+            if (typeof markBeatsUserOverridden === 'function') markBeatsUserOverridden();
+        });
     }
 
     // Fire initial displays

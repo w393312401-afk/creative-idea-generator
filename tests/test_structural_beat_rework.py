@@ -213,6 +213,72 @@ class TestMilestoneViolationSeverity(unittest.TestCase):
         self.assertEqual(pp.hard_milestone_violations([]), [])
 
 
+class TestDeterministicBeatLadderFallback(unittest.TestCase):
+    def test_standard_fallback_is_schema_complete(self):
+        ladder = pp.deterministic_fallback_beat_ladder(
+            {'mode': 'Standard'}, 8, 'coaxial', {'turn_degrees': 0})
+        self.assertEqual([beat['index'] for beat in ladder], list(range(1, 9)))
+        self.assertEqual(ladder[-1]['operation'], 'reward')
+        self.assertEqual(pp.hard_milestone_violations(
+            pp.milestone_ladder_violations(ladder)), [])
+
+    def test_hard_cut_fallback_keeps_one_crossing_and_cleanout(self):
+        ladder = pp.deterministic_fallback_beat_ladder(
+            {'mode': 'Threshold'}, 9, 'hard_cut',
+            {'turn_degrees': 90, 'turn_direction': 'left'})
+        cuts = [i for i, beat in enumerate(ladder) if beat.get('hard_cut')]
+        self.assertEqual(cuts, [2])
+        self.assertEqual(ladder[3]['operation'], 'clearing')
+        self.assertFalse(any(beat.get('bridge_stage') for beat in ladder))
+
+    @patch('prompt_pipeline.space_reset_cut_required', return_value=True)
+    def test_nested_fallback_keeps_bridge_reset_and_second_cleanout(self, _reset):
+        ladder = pp.deterministic_fallback_beat_ladder(
+            {'mode': 'Threshold'}, 14, 'coaxial',
+            {'turn_degrees': 0, 'turn_direction': 'none'})
+        bridge = [i for i, beat in enumerate(ladder) if beat.get('bridge_stage') == 1]
+        reset = [i for i, beat in enumerate(ladder) if beat.get('hard_cut')]
+        self.assertEqual(bridge, [2])
+        self.assertEqual(len(reset), 1)
+        self.assertEqual(ladder[bridge[0] + 1]['operation'], 'clearing')
+        self.assertEqual(ladder[reset[0] + 1]['operation'], 'clearing')
+
+
+class TestTemplateCroppingBeatBinding(unittest.TestCase):
+    TEMPLATES = """
+## IMAGE 2+
+GENERIC IMAGE
+## Interior IMAGE
+INTERIOR IMAGE
+## Threshold Bridge
+BRIDGE VIDEO
+## Ordinary Construction VIDEO
+ORDINARY VIDEO
+## Final IMAGE
+FINAL IMAGE
+## Final Reward VIDEO N
+FINAL VIDEO
+## IMAGE Checklist
+IMAGE CHECKS
+## VIDEO Checklist
+VIDEO CHECKS
+"""
+
+    def test_threshold_beat_is_passed_into_crossing_detection(self):
+        cropped = pp.get_cropped_templates(
+            self.TEMPLATES, 3, 8, 'Threshold', 1,
+            family='interior', beat={'operation': 'threshold', 'bridge_stage': 1})
+        self.assertIn('BRIDGE VIDEO', cropped)
+        self.assertIn('INTERIOR IMAGE', cropped)
+
+    def test_non_crossing_threshold_mode_uses_ordinary_video(self):
+        cropped = pp.get_cropped_templates(
+            self.TEMPLATES, 4, 8, 'Threshold', None,
+            family='interior', beat={'operation': 'clearing'})
+        self.assertIn('ORDINARY VIDEO', cropped)
+        self.assertNotIn('BRIDGE VIDEO', cropped)
+
+
 class TestMilestonePromptSkeleton(unittest.TestCase):
     def test_image_requires_after_state_extent_and_two_traces(self):
         beat = _milestone_beat()

@@ -643,6 +643,76 @@ class TestRenderFramesForTask(unittest.TestCase):
         self.assertEqual(self._read_manifest()['frames'][0]['quality_gate'], 'anchor_rejected')
         mock_rest.assert_not_called()
 
+    def test_gate_judges_with_the_projects_saved_brief(self):
+        """落盘的 parsed_brief 必须喂进锚帧判定。
+
+        2026-08-04 事故：这条路径不带 judge，默认判定拿 parsed_brief={} 去审，
+        carrier_arrives_on_camera() 恒为假——载体后到的项目（IMAGE 1 按契约就是空场地）
+        被按"至少三类损伤"的口径判成"缺乏必要的损坏类别"，18 帧的链在第一帧就被硬闸
+        中止，一张都没渲。"""
+        server_common.save_project_brief(
+            self.project_dir,
+            {'carrier': '坠毁货机舱段', 'env': '高山雪原', 'carrier_delivered_on_camera': True},
+        )
+
+        def fake_gate_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
+            return {'title': title}
+
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_gate_render), \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(True, 'PASS')) as mock_gate, \
+             patch('pipeline_orchestrator._render_frames_with_checkpoints', return_value=self.PROMPT_BLOCK), \
+             patch('pipeline_orchestrator._chain_drift_lookback'), \
+             patch('pipeline_orchestrator._sequence_consistency_review', return_value=self.PROMPT_BLOCK):
+            render_frames_for_task({}, self.title, self.PROMPT_BLOCK)
+
+        brief_arg = mock_gate.call_args[0][4]
+        self.assertTrue(brief_arg.get('carrier_delivered_on_camera'))
+        self.assertEqual(brief_arg.get('carrier'), '坠毁货机舱段')
+
+    def test_gate_falls_back_to_the_default_judge_without_a_saved_brief(self):
+        """老项目/合成期落盘失败时没有 brief——判定退回默认口径，不能因此报错。"""
+        def fake_gate_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+            self._write_manifest([{'sequence': 1, 'quality_gate': 'pending_manual_review'}])
+            return {'title': title}
+
+        with patch('pipeline_orchestrator.generate_frame_sequence', side_effect=fake_gate_render), \
+             patch('pipeline_orchestrator.check_anchor_frame_compliance', return_value=(True, 'PASS')) as mock_gate, \
+             patch('pipeline_orchestrator._render_frames_with_checkpoints', return_value=self.PROMPT_BLOCK), \
+             patch('pipeline_orchestrator._chain_drift_lookback'), \
+             patch('pipeline_orchestrator._sequence_consistency_review', return_value=self.PROMPT_BLOCK):
+            render_frames_for_task({}, self.title, self.PROMPT_BLOCK)
+
+        self.assertEqual(mock_gate.call_args[0][4], {})
+
+
+class TestProjectBriefSidecar(unittest.TestCase):
+    """save_project_brief / load_project_brief：合成任务与帧序列任务之间唯一的 brief 通道。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_round_trip(self):
+        brief = {'carrier': '货机舱段', 'carrier_delivered_on_camera': True, 'nested': {'a': 1}}
+        self.assertTrue(server_common.save_project_brief(self.tmp, brief))
+        self.assertEqual(server_common.load_project_brief(self.tmp), brief)
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(server_common.load_project_brief(self.tmp))
+
+    def test_empty_or_non_dict_brief_is_not_written(self):
+        self.assertFalse(server_common.save_project_brief(self.tmp, {}))
+        self.assertFalse(server_common.save_project_brief(self.tmp, None))
+        self.assertIsNone(server_common.load_project_brief(self.tmp))
+
+    def test_creates_the_project_dir_when_composing_runs_before_any_render(self):
+        target = os.path.join(self.tmp, 'not_yet_created')
+        self.assertTrue(server_common.save_project_brief(target, {'carrier': 'x'}))
+        self.assertEqual(server_common.load_project_brief(target), {'carrier': 'x'})
+
 
 if __name__ == '__main__':
     unittest.main()

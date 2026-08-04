@@ -298,21 +298,50 @@ def test_delivery_scale_is_deterministically_preserved_in_final_prompts():
         'A crane lowers the shell onto the site.',
         'The rusted shell rests on the quarry floor.',
         {'camera_dna': 'static grounded wide shot; horizon line remains level',
-         'primary_landmarks': []},
+         'primary_landmarks': [],
+         'origin_contract': {'mode': 'carrier_delivery_build'}},
         'Threshold', False, False, beat=beat, family='exterior')
     assert 'dominant near-midground scale' in video
     assert 'never reading as a distant miniature' in video
-    assert 'silhouette fills the central majority' in image
+    assert 'silhouette filling the central majority' in image
     assert 'roughly two-thirds of the frame' in image
 
-    plain_video, plain_image = pp.apply_proactive_fixes(
+    later_video, later_image = pp.apply_proactive_fixes(
         2, 'A hand tool repairs the shell.', 'The repaired shell remains on site.',
         {'camera_dna': 'static grounded wide shot; horizon line remains level',
-         'primary_landmarks': []},
+         'primary_landmarks': [],
+         'origin_contract': {'mode': 'carrier_delivery_build'}},
         'Threshold', False, False,
         beat={'index': 2, 'operation': 'repair'}, family='exterior')
-    assert 'dominant near-midground scale' not in plain_video
-    assert 'silhouette fills the central majority' not in plain_image
+    assert 'dominant near-midground scale' not in later_video
+    assert 'silhouette filling the central majority' in later_image
+    assert 'same roughly two-thirds of the frame in every exterior image' in later_image
+    assert 'base contact line stays registered to the same receiving footprint' in later_image
+    assert 'length-to-height proportions remain unchanged' in later_image
+
+    # A conflicting free-written scale is replaced, not accumulated.
+    _, canonical = pp.apply_proactive_fixes(
+        3, 'Repairs continue.',
+        'The carrier is a distant miniature. Its longest visible dimension spans half the frame.',
+        {'camera_dna': 'static grounded wide shot; horizon line remains level',
+         'primary_landmarks': [],
+         'origin_contract': {'mode': 'carrier_delivery_build'}},
+        'Threshold', False, False,
+        beat={'index': 3, 'operation': 'repair'}, family='exterior')
+    assert 'distant miniature' not in canonical
+    assert 'half the frame' not in canonical
+    assert canonical.count('same roughly two-thirds of the frame') == 1
+
+    # The exterior scale contract stops at the threshold and never contaminates interior framing.
+    _, interior = pp.apply_proactive_fixes(
+        4, 'The camera enters.', 'The fuselage interior is visible.',
+        {'camera_dna': 'static grounded wide shot; horizon line remains level',
+         'interior_camera_dna': 'static interior shot; pitch locked level; vanishing axis centered',
+         'primary_landmarks': [], 'interior_primary_landmarks': [],
+         'origin_contract': {'mode': 'carrier_delivery_build'}},
+        'Threshold', False, True,
+        beat={'index': 4, 'operation': 'threshold', 'bridge_stage': 1}, family='interior')
+    assert 'two-thirds of the frame' not in interior
 
 
 def test_nested_opening_environment_is_mountain_water_or_residential():

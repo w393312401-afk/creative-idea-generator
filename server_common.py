@@ -1295,7 +1295,7 @@ def effective_config(client_config):
     # base/omni 送到服务端的（active_skill_profile 读的正是 config['skillProfile']）。
     # 不进这份白名单，托管模式下前端选了哪条链路会被整个丢掉——用户以为切了，
     # 实际永远按 videoModel 推断，和 qaGateLevel / imageEditTransport 当年是同一个口子。
-    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'videoDuration', 'adsPowerPort', 'videoAccountPoolMinCredit', 'qaGateLevel', 'realityCheckpointInterval', 'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile'):
+    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'videoDuration', 'adsPowerPort', 'videoAccountPoolMinCredit', 'qaGateLevel', 'realityCheckpointInterval', 'strictFrameStateContract', 'frameChainGate', 'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile'):
         if k in _SERVER_AUTHORITATIVE_KEYS:
             # FX 模型设置：服务端配置优先，防止浏览器旧缓存覆盖控制台的改动
             if k in SERVER_CONFIG:
@@ -2811,6 +2811,50 @@ def write_manifest(project_dir, data):
             # 已在 write_json_atomic 里告警；manifest 写失败不应炸掉生成任务，
             # 下一次写入（每帧后都会写）会自然补上
             pass
+
+
+PROJECT_BRIEF_FILENAME = 'project_brief.json'
+
+
+def save_project_brief(project_dir, parsed_brief):
+    """把这一单的 parsed_brief 落到项目目录的 project_brief.json 旁挂文件。
+
+    这是「合成期知道、渲染期需要」的那部分事实（载体是不是开拍后才运到现场、载体/
+    环境/损伤是什么）唯一的跨请求载体：合成任务与帧序列任务是两个独立的 HTTP 请求，
+    前端只回传 prompt_block，brief 本身此前没有任何地方落盘。锚帧验收门禁拿不到它就
+    只能按默认口径判（见 pipeline_orchestrator.render_frames_for_task）。
+
+    刻意不写进 manifest：manifest 由渲染后端整份重建，且 stale 清理会动它；brief 是
+    合成期的输入事实，与帧内容无关，分开存互不干扰。写失败只告警不抛——落不下来时
+    门禁退回默认口径，不该因此炸掉合成任务。
+    """
+    if not isinstance(parsed_brief, dict) or not parsed_brief:
+        return False
+    path = os.path.join(project_dir, PROJECT_BRIEF_FILENAME)
+    try:
+        os.makedirs(project_dir, exist_ok=True)
+        write_json_atomic(path, json.loads(json.dumps(parsed_brief, ensure_ascii=False, default=str)))
+        return True
+    except (OSError, PermissionError, TypeError, ValueError) as e:
+        if sys.stdout:
+            print(f"[WARN] project_brief.json 写入失败 ({path}): {e}")
+        return False
+
+
+def load_project_brief(project_dir):
+    """读取 save_project_brief 落下的 brief；缺失/损坏一律返回 None（调用方按默认口径降级）。"""
+    path = os.path.join(project_dir, PROJECT_BRIEF_FILENAME)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, OSError) as e:
+        if sys.stdout:
+            print(f"[WARN] project_brief.json 损坏或不可读 ({path}): {e}")
+        return None
+
 
 # ============================================================================
 # 任务持久层（Task Store）

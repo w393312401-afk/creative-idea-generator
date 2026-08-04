@@ -93,6 +93,29 @@ class TestCallLlmIsThinWrapper(unittest.TestCase):
         phase2.assert_called_once_with(config, fake_state, on_progress=on_progress)
         self.assertEqual(result, 'FINAL PROMPT BLOCK')
 
+    def test_call_llm_hands_the_brief_back_on_config(self):
+        """/api/compose 的 worker 靠这个回传把 brief 落到项目目录——帧序列任务是另一个
+        独立请求，锚帧验收门禁只能从盘上读到它（2026-08-04 锚帧硬闸误杀事故）。"""
+        brief = {'carrier': '货机舱段', 'carrier_delivered_on_camera': True}
+        fake_state = {'image_1_prompt': 'a static shot', 'packet': {}, 'parsed_brief': brief}
+        config = {}
+
+        with patch('prompt_pipeline.compose_anchor_and_packet', return_value=fake_state), \
+             patch('prompt_pipeline.compose_remaining_beats', return_value='FINAL PROMPT BLOCK'):
+            call_llm(config, {'theme': 'x'})
+
+        self.assertEqual(config['_parsed_brief'], brief)
+
+    def test_call_llm_without_a_brief_leaves_config_alone(self):
+        fake_state = {'image_1_prompt': 'a static shot', 'packet': {}}
+        config = {}
+
+        with patch('prompt_pipeline.compose_anchor_and_packet', return_value=fake_state), \
+             patch('prompt_pipeline.compose_remaining_beats', return_value='FINAL PROMPT BLOCK'):
+            call_llm(config, {'theme': 'x'})
+
+        self.assertNotIn('_parsed_brief', config)
+
 
 if __name__ == '__main__':
     unittest.main()
