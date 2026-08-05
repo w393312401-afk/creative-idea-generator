@@ -3809,12 +3809,23 @@ def _connect_fx_page(playwright_ctx, cancel_check=None, on_event=None,
 
     return browser, page
 
-def _prepare_fx_canvas(page, has_refs):
-    """准备 Flow 画布并等待工具栏；绝不删除或清理画布上的媒体卡片。"""
+def _prepare_fx_canvas(page, has_refs, require_fresh_canvas=False):
+    """准备 Flow 画布并等待工具栏；绝不删除或清理画布上的媒体卡片。
+
+    ``require_fresh_canvas``：本次任务刚拿到一块全新画布，下面那条"优先打开最新历史
+    项目"的兜底必须整条禁用——最新历史项目正是上一个任务的画布，2026-08-05 的串图
+    事故就是这么发生的。此时输入框没就绪只能新建项目，不能回历史项目里找。
+    """
 
     # 如果当前没有打开任何项目（即输入框/工具栏不存在），优先尝试打开最新历史项目，找不到再新建项目
     toolbar_exists = _find_fx_prompt_input(page, announce=False) is not None
-    if not toolbar_exists:
+    if not toolbar_exists and require_fresh_canvas:
+        log("📍 输入框未就绪；本次任务要求全新画布，直接新建项目（不回历史项目）", "GoogleFX")
+        try:
+            _click_new_project_button(page)
+        except Exception as e:
+            log(f"⚠️ 新建项目失败: {e}", "GoogleFX")
+    elif not toolbar_exists:
         log("📍 未检测到活跃项目输入框，优先尝试打开最新历史项目...", "GoogleFX")
         project_clicked = False
         try:

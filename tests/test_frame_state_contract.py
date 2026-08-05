@@ -1,4 +1,3 @@
-from frame_generator import frame_chain_gate_enabled
 from prompt_pipeline.frame_state import (
     build_frame_state_contract,
     compile_delta_image_prompt,
@@ -113,9 +112,3 @@ def test_delta_prompt_keeps_camera_anchor_and_authoritative_state_under_budget()
     assert beat["milestone_name"] in result
     assert beat["after_state"] in result
     assert "no later-stage result" in result
-
-
-def test_frame_chain_gate_defaults_on_and_respects_escape_hatches(monkeypatch):
-    assert frame_chain_gate_enabled({"qaGateLevel": "standard"}) is True
-    assert frame_chain_gate_enabled({"qaGateLevel": "standard", "frameChainGate": False}) is False
-    assert frame_chain_gate_enabled({"qaGateLevel": "off"}) is False

@@ -506,9 +506,9 @@ _FLAGGED_GATE_LABELS = {
     'manual_flagged': '被人工标记存在问题',
 }
 
-# 「从来没被判过」的帧。一致性审查自 2026-07-24 起改成手动触发（见
-# pipeline_orchestrator._sequence_consistency_review），所以"渲染继续往后跑、审查停在
-# 第 N 帧"是完全正常的路径，这些帧会一直停在初始的 pending_manual_review 上。
+# 「从来没被判过」的帧。渲染期不做任何审查（2026-08-05 起生成期一致性审查已整体
+# 移除），一致性审查只能由用户手动触发（pipeline_orchestrator._sequence_consistency_review），
+# 所以帧默认一直停在初始的 pending_manual_review 上。
 # 它们不是坏帧，不该拦截；但此前也**完全没有任何提示**，于是未经判定的锚点帧照常烧
 # 视频额度出片——实测某一单 12 帧里有 4 帧是这个状态，而汇总显示"审查通过"。
 # 这里只做一件事：在花钱那一刻把"这张没人看过"说出来。
@@ -599,28 +599,6 @@ def load_stale_slots(manifest_data):
     return stale
 
 
-def load_drift_break_slots(manifest_data):
-    """manifest.chain_drift 里 FAIL 段覆盖的视频槽位集合。
-
-    链回望（pipeline_orchestrator._chain_drift_lookback）对每个镜头族记录
-    {family_anchor, mid, tail, passed, reason}；passed=False 表示锚点帧与族尾帧之间
-    存在身份/机位断裂——断裂点落在 [anchor, tail] 区间内的某一对帧上，因此该区间内
-    所有相邻帧对（视频槽位 anchor..tail-1）都可能横跨断裂。2026-07-15 盐湖贝壳单
-    正是 anchor=6/tail=9 段 FAIL 被无视，vid_006 在室外/室内两张无关帧之间自由变形。
-    此前链回望是纯检测型（结果只写 manifest），这里把它接进视频配对门禁。"""
-    slots = set()
-    for entry in (manifest_data or {}).get('chain_drift', []):
-        if not isinstance(entry, dict) or entry.get('passed') is not False:
-            continue
-        try:
-            anchor = int(entry['family_anchor'])
-            tail = int(entry['tail'])
-        except (KeyError, TypeError, ValueError):
-            continue
-        slots.update(range(anchor, tail))
-    return slots
-
-
 # 旧单硬切占位声明的正文前缀（与 prompt_pipeline.HARD_CUT_PLACEHOLDER_PREFIX 同一常量，
 # 这里复制一份字面量是为了让 plan_video_slots 保持零依赖可单测；该字符串已冻结，新单不再
 # 产生这种正文，见 prompt_pipeline.HARD_CUT_VIDEO_PLACEHOLDER 的说明）。
@@ -654,7 +632,7 @@ def _is_declared_editorial_cut(body, meta=''):
 
 def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, target_slots=None,
                       strict=False, verify_fn=None, gate_level='standard', stale_slots=None,
-                      drift_slots=None, override_flagged=False):
+                      override_flagged=False):
     """为每个视频槽位做生成决策。只读文件系统，不做任何写操作，可单测。
 
     video_slots: _parse_prompt_slots 的 videos 输出（{slot: str 或 {'body':...}}）
@@ -662,11 +640,9 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
     strict/verify_fn: 断点续传复用判定用，见下方注释；verify_fn 默认为
       verify_video_anchors，测试可注入假实现，避免依赖真实 ffmpeg/视频文件。
     override_flagged: 前端"确认风险，强制生成"一次性确认（与全局 qaGateLevel 配置
-      无关，只对本次请求生效）。豁免的是一致性审查衍生的三道硬拦——
-      'vlm_qa_failed'/'sequence_review_flagged' 质检终态、血统过期（stale_slots）、
-      链回望空间断裂（drift_slots）——2026-07-24 修复前只豁免了第一道，用户已在
-      前端确认风险，血统过期/链回望断裂两道仍照旧拦截，等于"确认了但没全部生效"，
-      已确认风险的帧仍不会被提交生成（不会上传到视频后端）。降级帧
+      无关，只对本次请求生效）。豁免的是一致性审查衍生的两道硬拦——
+      'vlm_qa_failed'/'sequence_review_flagged' 质检终态与血统过期（stale_slots）。
+      降级帧
       （i2i_fallback_degraded）是唯一保持不受影响、始终硬拦的独立门禁——降级帧
       本身已是明确的生成失败兜底产物，不属于"一致性审查有疑虑但帧本身完好"的
       范畴，强推只会浪费视频生成额度。（2026-07-30 核实：这个值自 f5a003b 起已无
@@ -802,16 +778,6 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                 f"血统过期），已拦截以防跨链跳变。请顺序重渲 IMAGE {_stale} 及其后续帧，"
                 f"或在确认风险后强制生成。"
             )
-        elif not override_flagged and drift_slots and gate_level == 'standard' \
-                and (slot in drift_slots or start_slot in drift_slots):
-            # 链回望确认该族段存在身份/机位断裂（manifest.chain_drift FAIL）：断裂
-            # 区间内的帧对送 i2v 只会得到冻结闪切或自由变形片段，standard 档拦截。
-            plan['action'] = 'blocked'
-            plan['reason'] = (
-                f"视频 {slot} 位于链回望检测到的空间断裂族段内（chain_drift FAIL）：两端帧"
-                f"可能不属于同一空间/机位，生成只会得到跳变或变形片段。请重渲断裂族段的帧"
-                f"（或将质检档位调为 lenient 带警告放行）后重试。"
-            )
         else:
             plan['action'] = 'generate'
             warnings = []
@@ -831,11 +797,6 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                     f"视频 {slot} 的锚点帧 IMAGE {_stale} 派生自旧 i2i 链（上游帧已被单独重渲），"
                     f"两端帧可能存在跨链色彩/内容漂移。"
                 )
-            if drift_slots and (slot in drift_slots or start_slot in drift_slots):
-                warnings.append(
-                    f"视频 {slot} 位于链回望检测到的空间断裂族段内（chain_drift FAIL），"
-                    f"两端帧可能不属于同一空间/机位，片段存在跳变/变形风险。"
-                )
             # 未经判定的锚点帧：不拦（审查是手动的，没审不等于有问题），但必须说出来。
             _unjudged = [s for s in (start_slot, slot + 1)
                          if slot_to_quality.get(s) in _UNREVIEWED_QUALITY_GATES]
@@ -848,10 +809,8 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                     f"请在帧网格点「一致性审查」。"
                 )
             # i2v 帧对契约：两端锚点帧近乎相同→静止片段，差异过大→断裂/变形。
-            # 提示性警告（不拦截）：断裂的硬拦截由 chain_drift 门负责，这里兜住
-            # 链回望覆盖不到的帧对（如族内相邻帧渲成了复制帧）。英雄展示视频没有
-            # 结束锚点（end_p 为 None），frame_pair_contract 内部会自动跳过，
-            # 不需要在这里额外特判。
+            # 提示性警告（不拦截）。英雄展示视频没有结束锚点（end_p 为 None），
+            # frame_pair_contract 内部会自动跳过，不需要在这里额外特判。
             verdict, mad = frame_pair_contract(start_p, end_p)
             plan['pair_contract'] = {'verdict': verdict, 'mad': mad}
             if verdict == 'too_similar':
@@ -1197,7 +1156,6 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                               strict=strict_gates_enabled(config),
                               gate_level=qa_gate_level(config),
                               stale_slots=load_stale_slots(manifest_data),
-                              drift_slots=load_drift_break_slots(manifest_data),
                               override_flagged=override_flagged)
 
     if on_progress:

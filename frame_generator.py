@@ -22,13 +22,11 @@ from server_common import (
     SERVER_CONFIG, SERVER_MANAGED, resolve_gateway, effective_config,
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
     IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT, IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT,
-    IMG2IMG_RAW_STATE_CONTROL_PROMPT,
     resolve_cover_reference, project_cover_path,
     IMAGE_TASKS, IMAGE_TASKS_LOCK,
     apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
     read_manifest, write_manifest, GenerationCancelled, log,
     gpt_image_pixel_size, drop_stale_review_verdicts, stamp_manifest_capabilities,
-    qa_gate_level,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
     _get_account_pool_service, _select_pool_account,
     _account_switch_interval, _account_rotation_ring,
@@ -1047,23 +1045,13 @@ def _generate_image_edit(config, prompt, reference_path, target_path, control_pr
 #   · 单次批量 ≤5 张，批内自动链式图生图（第 N+1 张自动挂第 N 张为参考）；
 #   · 跨批次/单帧重试的续链：FX 运行时挂参考只认「文件名里的画布 UUID」，
 #     所以每帧除 webp 外把原始 jpg（文件名含 UUID）留档到 frames/fx_src/；
-#   · 每次调用用唯一临时 output_path，避免命中运行时的 dedupe 结果缓存；
-#   · 与 API 路径一致：逐帧 VLM QA，失败改写提示词单帧重生（≤2 次）。
+#   · 每次调用用唯一临时 output_path，避免命中运行时的 dedupe 结果缓存。
+# 渲染期不做任何视觉判定（2026-08-05 起逐帧 VLM 闸已移除），帧一律直出落盘。
 # 改动 FX 运行时或本文件都需重启 SPARK 进程。
 
 _FX_CHUNK_SIZE = 5  # FX 运行时单次批量上限（google_fx_image 内部 prompts[:5]）
 
 _FX_UUID_RE = re.compile(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
-
-
-def frame_chain_gate_enabled(config=None):
-    """Whether each new frame must pass before it may seed the next frame."""
-    if qa_gate_level(config) == 'off':
-        return False
-    if not isinstance(config, dict):
-        return True
-    value = config.get('frameChainGate')
-    return True if value is None else bool(value)
 
 
 def _get_google_fx_image_service():
@@ -1388,6 +1376,16 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel
         legacy_owner = canvas_session.get('project_account_id')
         if not legacy_owner or legacy_owner == account_id:
             project_url = canvas_session.get('project_url')
+    # 本任务在这个账号上还没开过画布 → 浏览器里停着的那块是**上一个任务**的，必须新建。
+    # AdsPower 跨任务不关浏览器，沿用它就是把新任务跑进旧任务的画布（2026-08-05 事故：
+    # 悬崖石屋任务把榕树树洞任务的 6b857588 当成自己的 IMG 001 落了盘）。
+    # 没有 project_url 不等于没开过画布：部分 Flow 变体的工作台没有 /project/ 路由，
+    # 这种账号的画布只能靠 opened_accounts 记账，否则同一任务的每个 chunk 都会重开画布、
+    # 把 i2i 续链打断成一次次重新上传。
+    opened_accounts = (canvas_session or {}).get('opened_accounts') or []
+    require_fresh_canvas = bool(
+        not project_url and account_id and account_id not in opened_accounts
+    )
     req = models.ImageBatchRequest(
         prompts=list(prompt_texts),
         images=[ref_path] if ref_path else [],
@@ -1397,6 +1395,7 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel
         model=_fx_image_model(config),
         output_path=temp_out,  # 每次唯一，绕开外部 dedupe 缓存（同提示词重试不会拿到旧图）
         project_url=project_url,
+        require_fresh_canvas=require_fresh_canvas,
         max_attempts=max(1, int(max_attempts or 1)),
         allow_account_switch=bool(allow_account_switch),
     )
@@ -1420,6 +1419,14 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel
             canvas_session['project_account_id'] = actual_account_id
             projects_by_account[actual_account_id] = returned_project_url
     result_status = result.get('status') if isinstance(result, dict) else None
+    # 画布已经为本任务开出来了：后续 chunk 只管复用，不再重开——重开会丢掉 i2i 续链的
+    # 画布上下文。只在这一批真的出了图时记账；画布都没开成的失败（FLOW_CANVAS_UNAVAILABLE）
+    # 必须让下一次重试继续要求新画布，否则重试就会退回沿用旧任务画布的老路。
+    if (isinstance(canvas_session, dict) and actual_account_id
+            and result_status in ('success', 'partial')):
+        opened = canvas_session.setdefault('opened_accounts', [])
+        if actual_account_id not in opened:
+            opened.append(actual_account_id)
     if result_status not in ('success', 'partial'):
         shutil.rmtree(temp_out, ignore_errors=True)
         if _fx_cancelled_result(result) or (cancel_fn and cancel_fn()):
@@ -1611,9 +1618,9 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             if isinstance(existing_manifest, dict) and 'frames' in existing_manifest:
                 manifest['frames'] = existing_manifest['frames']
                 manifest['created_at'] = existing_manifest.get('created_at', manifest['created_at'])
-                # 未知键保留：检查点重锚定/校准记录（reanchors、anchor_recalibrations）等
-                # 是在分段渲染的间隙写入的，重建 manifest 时丢掉它们会让下一段渲染的
-                # 逐帧落盘把这些记录抹掉（videos/merged_video 仍由 stale 逻辑显式清理）
+                # 未知键保留：spatial_contract / 手动审查留痕等由别的写入方落进 manifest
+                # 的键，重建 manifest 时丢掉它们会让本轮的逐帧落盘把它们抹掉
+                # （videos/merged_video 仍由 stale 逻辑显式清理）
                 for _k, _v in existing_manifest.items():
                     if _k not in manifest:
                         manifest[_k] = _v
@@ -1648,6 +1655,15 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         p = _webp_path(seq)
         return os.path.exists(p) and os.path.getsize(p) > 0
 
+    def _align_frame_color(seq):
+        """把刚落盘的第 seq 帧向首帧对齐色彩（首帧自己不动）。"""
+        if seq <= 1:
+            return
+        first_frame_path = _webp_path(1)
+        target_path = _webp_path(seq)
+        if os.path.exists(first_frame_path) and os.path.exists(target_path):
+            _match_color_lab(target_path, first_frame_path, target_path)
+
     # 任务分解：full run = 已有帧直接复用（断点续传），缺失帧成批生成；
     # target 模式 = 只重生指定序号，其余帧不动也不发事件（与 API 路径一致）。
     if target_sequences is not None:
@@ -1673,24 +1689,6 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         generated_count += 1
         if on_progress:
             on_progress('frame', {'frame': frame_info, 'current': generated_count, 'total': total_to_generate})
-
-    def _run_vlm_qa(seq, item, is_bridge, ref_path):
-        """Gate IMAGE ``seq`` against IMAGE ``seq-1`` before chain continuation."""
-        if seq <= 1 or not frame_chain_gate_enabled(config):
-            return 'pending_manual_review', None
-        previous = _webp_path(seq - 1)
-        current = _webp_path(seq)
-        if not (_frame_exists(seq - 1) and _frame_exists(seq)):
-            return 'vlm_qa_failed', 'Frame-chain gate could not read both adjacent frames.'
-        from prompt_pipeline import run_vlm_qa_check, is_skipped_verdict
-        incoming = videos.get(seq - 1)
-        video_prompt = incoming.get('body', '') if isinstance(incoming, dict) else str(incoming or '')
-        passed, reason = run_vlm_qa_check(
-            config, previous, current, video_prompt, is_bridge=is_bridge)
-        if passed:
-            gate = 'auto_approved_degraded' if is_skipped_verdict(reason) else 'auto_approved'
-            return gate, reason
-        return 'vlm_qa_failed', reason or 'VLM rejected this adjacent frame transition.'
 
     def _record_frame(seq, item, fx_src_path, fx_uuid, quality_gate, vlm_reason,
                       cover_reference=None, fx_account_id=None):
@@ -1729,12 +1727,9 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         manifest_frames_by_seq[seq] = frame_info
         _save_manifest()  # 浏览器批量任务动辄数分钟，逐帧落盘保证进度可恢复
         _emit_frame(frame_info)
+        return frame_info
 
     chunks = plan_fx_chunks(gen_seqs)
-    if frame_chain_gate_enabled(config):
-        # A multi-frame FX batch has already rendered descendants by the time its first
-        # image can be inspected.  Single-frame chunks make the gate a true fail-stop.
-        chunks = [[s] for chunk in chunks for s in chunk]
     if target_sequences is not None:
         chunks = split_fx_chunks_by_canvas(chunks, manifest_frames_by_seq, manifest)
     # 声明式硬切（[CUT] 视频槽）另起一批，便于让提示词主导场景变化；新批仍会显式
@@ -1891,16 +1886,15 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                     'BRIDGE' in item.get('meta', '').upper()
                     or 'BRIDGE' in (incoming_video.get('meta', '') if isinstance(incoming_video, dict) else '').upper()
                 )
-                _, fx_src_path, fx_uuid = _fx_store_frame(local_paths[offset], frames_dir, s)
-                if s > 1:
-                    first_frame_path = _webp_path(1)
-                    target_path = _webp_path(s)
-                    if os.path.exists(first_frame_path) and os.path.exists(target_path):
-                        _match_color_lab(target_path, first_frame_path, target_path)
-                prev_ref = _fx_find_ref_for(frames_dir, s)
-                quality_gate, vlm_reason = _run_vlm_qa(s, item, is_bridge, prev_ref)
-                # P1 换族锚点惯性检测（FX 链路只留痕不自动重渲：本批后续帧已链在该帧上）。
-                if is_bridge and s > 1 and not vlm_reason:
+                render_src = local_paths[offset]
+                _, fx_src_path, fx_uuid = _fx_store_frame(render_src, frames_dir, s)
+                _align_frame_color(s)
+                # 渲染期不做视觉判定：帧一律直出落盘，quality_gate 记"没人看过"。
+                quality_gate, vlm_reason = 'pending_manual_review', None
+
+                # P1 换族锚点惯性检测（本地像素 MAD，不是视觉判定）：FX 链路只留痕
+                # 不自动重渲，本批后续帧已链在该帧上。
+                if is_bridge and s > 1:
                     _stuck, _inertia_mad = detect_anchor_inertia(_webp_path(s), _webp_path(s - 1))
                     if _stuck:
                         vlm_reason = (f"anchor_inertia: 桥接帧与参考帧近乎相同"
@@ -1913,28 +1907,10 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                                 'sequence': s, 'mad': round(_inertia_mad, 2),
                                 'message': f"⚠️ IMG {s:03d} 桥接帧疑似被 i2i 惯性卡死（MAD={_inertia_mad:.2f}），已留痕",
                             })
-                # QA 重生会替换留档，重新定位当前帧的 fx_src
-                cur_ref = _fx_find_ref_for(frames_dir, s + 1)
-                if cur_ref:
-                    fx_src_path, fx_uuid = cur_ref, _fx_extract_uuid(cur_ref)
                 _record_frame(s, item, fx_src_path, fx_uuid, quality_gate, vlm_reason,
                               cover_reference=(cover_ref_src if s == 1 else None),
-                              fx_account_id=generated_account_by_path.get(local_paths[offset]))
+                              fx_account_id=generated_account_by_path.get(render_src))
                 done_seqs.add(s)
-                if quality_gate == 'vlm_qa_failed' and frame_chain_gate_enabled(config):
-                    if on_progress:
-                        on_progress('frame_gate_rejected', {
-                            'sequence': s,
-                            'reason': vlm_reason,
-                            'message': (
-                                f'IMG {s:03d} did not pass the adjacent-frame VLM gate. '
-                                'The reference chain stopped before the next frame.'
-                            ),
-                        })
-                    raise RuntimeError(
-                        f'Frame-chain gate rejected IMG {s:03d}; downstream frames were not generated: '
-                        f'{vlm_reason}'
-                    )
         finally:
             shutil.rmtree(temp_out, ignore_errors=True)
 
@@ -2044,60 +2020,6 @@ def _match_color_lab(source_path, reference_path, output_path):
             log('WARN', 'FRAMES', f"帧间调色不可用，已跳过（本进程仅提示一次）: {e}")
 
 
-# P0 门框清除兜底的最大额外推进次数：换族室内侧帧渲出后若门框仍在画面里，
-# 以该帧为参考用推进版控制指令"再往里推一步"，最多推这么多次。
-_DOOR_CLEARANCE_MAX_PUSHES = 2
-
-
-def _door_clearance_push_prompt(dc_reason, final_attempt=False):
-    """定向门框清除推进指令：把上一轮 VLM 判定的具体残留位置（dc_reason）写回
-    控制指令，而不是重复原样的 IMG2IMG_BRIDGE_CONTROL_PROMPT。根因是通用推进指令
-    对每一轮都下发同一句话，i2i 编辑模型给出同样保守的结果——2026-07-16 岩湖贝壳
-    单 img_005 连续两推、每次都换了措辞的失败原因，画面仍残留门框，印证"泛化推进"
-    对已经推不动的模型无效，必须把失败点明确点名让模型针对性纠正。"""
-    reason_text = dc_reason.split(':', 1)[-1].strip() if dc_reason else ''
-    prompt = (
-        IMG2IMG_BRIDGE_CONTROL_PROMPT +
-        "\n\nDOOR CLEARANCE CORRECTION (mandatory, overrides any timid edit): an automated visual "
-        "audit of the attached source image just found it still shows doorway/threshold remnants"
-        + (f" — specifically: {reason_text}." if reason_text else ".") +
-        " Push the camera decisively further past the threshold than the source image shows: "
-        "every door frame, door leaf, jamb, and threshold/sill edge named above must be pushed "
-        "completely out of frame this time. Do not repeat a small, partial, or timid advance — "
-        "interior walls, ceiling, and floor must fill the frame edge to edge with zero doorway "
-        "silhouette remaining anywhere in the shot."
-    )
-    if final_attempt:
-        prompt += (
-            " This is the last correction attempt budgeted for this frame: push further than "
-            "feels natural rather than risk leaving any sliver of the doorway visible."
-        )
-    return prompt
-
-
-# 过门帧「原始度」兜底的最大修正次数：室内首现帧渲出后若仍带人工痕迹/过于整洁，
-# 以该帧自身为参考做定向状态修正，最多修这么多次。比门框清除少一次——这一步不改
-# 构图只改内容，改不动通常是模型不肯加脏，多刷一轮的边际收益很低。
-_RAW_STATE_MAX_FIXES = 1
-
-
-def _raw_state_fix_prompt(rs_reason):
-    """定向「回退到未被触碰状态」指令：把上一轮 VLM 判定的具体问题（rs_reason，例如
-    "地面被扫干净/角落码着整齐的木料"）写回控制指令，而不是只下发通用的
-    IMG2IMG_RAW_STATE_CONTROL_PROMPT——与门框清除加推同一条经验：泛化指令对已经渲成
-    这样的模型没有纠正力，必须点名失败点。"""
-    reason_text = rs_reason.split(':', 1)[-1].strip() if rs_reason else ''
-    return (
-        IMG2IMG_RAW_STATE_CONTROL_PROMPT +
-        "\n\nRAW STATE CORRECTION (mandatory, overrides any timid edit): an automated visual audit "
-        "of the attached source image just found it still reads as touched or tidied"
-        + (f" — specifically: {reason_text}." if reason_text else ".") +
-        " Fix exactly that, decisively: whatever was named above must be gone or undone in the "
-        "returned image, and the space must end up visibly filthier and more derelict than the "
-        "source frame, never cleaner. Keep the camera and composition identical."
-    )
-
-
 # 换族/桥接锚点帧的 i2i 惯性判据（2026-07-15 盐湖贝壳单标定）：桥接帧与其参考帧的
 # 64px 灰度缩略 MAD——被参考惯性卡死渲成复制帧的 img_005/img_006 为 1.56/2.17，
 # 正常施工推进对最低 4.8，真实换族 47。i2i 参考惯性压过"进入新空间"文本指令时，
@@ -2132,8 +2054,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             on_progress=on_progress, target_sequences=target_sequences,
         )
     from prompt_pipeline import (
-        _parse_prompt_slots, image_space_family, check_door_clearance_frame,
-        check_first_interior_reveal_raw_state, cover_reference_is_same_layer,
+        _parse_prompt_slots, image_space_family, cover_reference_is_same_layer,
     )
     images, videos = _parse_prompt_slots(prompt_block)
 
@@ -2177,8 +2098,8 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                 if isinstance(existing_manifest, dict) and 'frames' in existing_manifest:
                     manifest['frames'] = existing_manifest['frames']
                     manifest['created_at'] = existing_manifest.get('created_at', manifest['created_at'])
-                    # 未知键保留（与 FX 路径同款）：分段渲染间隙写入的 reanchors/
-                    # anchor_recalibrations 等记录不能被逐帧落盘的重建 manifest 抹掉
+                    # 未知键保留（与 FX 路径同款）：别的写入方落进 manifest 的键
+                    # 不能被逐帧落盘的重建 manifest 抹掉
                     for _k, _v in existing_manifest.items():
                         if _k not in manifest:
                             manifest[_k] = _v
@@ -2370,155 +2291,8 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                         if sys.stdout:
                             print(f"[ANCHOR INERTIA] Frame {seq} i2i 加强重试失败（{inertia_err}），保留原帧并留痕")
 
-            # P0 门框清除兜底：单一过门拍产出的室内定格帧由 i2i 保守编辑生成——上一张
-            # 外部参考帧门框占满画面时，编辑模型经常只做保守裁切，门框残留导致室内
-            # 占比过小。渲出后立即对真实像素做单项 VLM 判定，未通过则以刚渲出的帧为
-            # 参考、用推进版控制指令再推一步（把"过门"拆成两次连续推进），最多
-            # _DOOR_CLEARANCE_MAX_PUSHES 次；推完仍不过只留痕，绝不拦渲染（终审交给
-            # 整套序列一致性审查）。
-            if (is_bridge
-                    and image_space_family(videos, seq) == 'interior'):
-                for _push in range(_DOOR_CLEARANCE_MAX_PUSHES + 1):
-                    dc_passed, dc_reason = check_door_clearance_frame(config, target_path)
-                    if on_progress:
-                        _verdict = '通过' if dc_passed else '未通过'
-                        _detail = f"（{dc_reason}）" if dc_reason and dc_reason != 'PASS' else ''
-                        on_progress('door_clearance', {
-                            'sequence': seq, 'passed': bool(dc_passed),
-                            'reason': dc_reason, 'push': _push,
-                            'message': f"门框清除检查 IMG {seq:03d}：{_verdict}{_detail}",
-                        })
-                    if dc_passed:
-                        break
-                    if _push >= _DOOR_CLEARANCE_MAX_PUSHES:
-                        vlm_qa_reason = dc_reason
-                        if sys.stdout:
-                            print(f"[DOOR CLEARANCE] Frame {seq} still shows the door frame after "
-                                  f"{_DOOR_CLEARANCE_MAX_PUSHES} extra push(es); keeping the frame "
-                                  f"and recording the reason for the sequence review.")
-                        break
-                    push_ref = target_path + '.doorpush.webp'
-                    is_final_push = (_push == _DOOR_CLEARANCE_MAX_PUSHES - 1)
-                    try:
-                        shutil.copyfile(target_path, push_ref)
-                        if is_final_push:
-                            # 前一轮 i2i 加推已经证实推不动——它仍然是拿同一张已经卡死
-                            # 构图的参考帧去编辑，模型只会给出同样保守的结果（2026-07-22
-                            # 喀斯特洞穴/沙漠花岗岩两单实测：2/2 次门框清除加推全部失败，
-                            # 画面构图几乎原地不动）。最后一次仍使用当前画面作为参考，
-                            # 但换成更强的 i2i 指令推进。
-                            if sys.stdout:
-                                print(f"[DOOR CLEARANCE] Frame {seq} failed door clearance twice "
-                                      f"({dc_reason}); i2i pushes from the same stuck reference can't "
-                                      f"break the locked composition — final attempt uses a "
-                                      f"stronger i2i edit instruction.")
-                            push_transport = _generate_image_edit(
-                                config, item['prompt'], push_ref, target_path,
-                                control_prompt=_door_clearance_push_prompt(
-                                    dc_reason, final_attempt=True))
-                            if push_transport == CHAT_TRANSPORT:
-                                transport = push_transport
-                            model = _image_edit_model(config)
-                            # Keep the durable chain parent in the manifest; push_ref is temporary.
-                            reference = previous_path
-                        else:
-                            if sys.stdout:
-                                print(f"[DOOR CLEARANCE] Frame {seq} failed door clearance "
-                                      f"({dc_reason}); pushing one more step past the threshold.")
-                            push_transport = _generate_image_edit(
-                                config, item['prompt'], push_ref, target_path,
-                                control_prompt=_door_clearance_push_prompt(
-                                    dc_reason, final_attempt=is_final_push))
-                            # 加推这一步落进降档通道，最终落盘的就是降档帧——照样留痕
-                            if push_transport == CHAT_TRANSPORT:
-                                transport = push_transport
-                        retries += 1
-                        first_frame_path = os.path.join(frames_dir, 'img_001.webp')
-                        if os.path.exists(first_frame_path):
-                            _match_color_lab(target_path, first_frame_path, target_path)
-                    except Exception as push_err:
-                        # 取消信号必须原样穿透，不能被"留痕后继续"吞掉——否则用户点了
-                        # 取消，这个门框清除的加推步骤却把它当成一次普通失败吸收掉，
-                        # 循环会继续渲下一帧，取消形同没生效。
-                        if isinstance(push_err, GenerationCancelled):
-                            raise
-                        # 再推失败：保留当前帧（已通过正常生成路径），留痕后继续
-                        vlm_qa_reason = dc_reason
-                        if sys.stdout:
-                            print(f"[DOOR CLEARANCE] Extra push for frame {seq} failed "
-                                  f"({push_err}); keeping the current frame.")
-                        break
-                    finally:
-                        try:
-                            if os.path.exists(push_ref):
-                                os.remove(push_ref)
-                        except OSError:
-                            pass
-
-            # P0 过门帧原始度兜底（2026-07-26 用户实测："过门帧有人工痕迹，不够原始"）：
-            # 门框已经出画不代表这一帧对了——i2i 编辑模型进到室内后普遍把空间渲得像被
-            # 布景过（地面扫净、杂物码整齐、表面看着刚修过），而按契约这一帧必须是没人
-            # 进来过的废墟（下一拍的清理工序才动它）。文字契约与事后文本校验都只能管到
-            # 提示词，这里对真实像素把关：未通过则以该帧自身为参考做定向状态修正（镜头
-            # 不动，只改内容），最多 _RAW_STATE_MAX_FIXES 次；修完仍不过只留痕，绝不拦
-            # 渲染（终审交给整套序列一致性审查）。
-            if (is_bridge
-                    and image_space_family(videos, seq) == 'interior'):
-                for _fix in range(_RAW_STATE_MAX_FIXES + 1):
-                    rs_passed, rs_reason = check_first_interior_reveal_raw_state(config, target_path)
-                    if on_progress:
-                        _verdict = '通过' if rs_passed else '未通过'
-                        _detail = f"（{rs_reason}）" if rs_reason and rs_reason != 'PASS' else ''
-                        on_progress('raw_state', {
-                            'sequence': seq, 'passed': bool(rs_passed),
-                            'reason': rs_reason, 'fix': _fix,
-                            'message': f"过门帧原始度检查 IMG {seq:03d}：{_verdict}{_detail}",
-                        })
-                    if rs_passed:
-                        break
-                    if _fix >= _RAW_STATE_MAX_FIXES:
-                        # 门框清除若也失败过，它的原因已经写进 vlm_qa_reason——两条都留，
-                        # 序列审查/帧网格要看到的是这一帧全部未通过的项，不是最后一项。
-                        vlm_qa_reason = '; '.join(x for x in (vlm_qa_reason, rs_reason) if x)
-                        if sys.stdout:
-                            print(f"[RAW STATE] Frame {seq} still reads as touched/tidied after "
-                                  f"{_RAW_STATE_MAX_FIXES} correction(s); keeping the frame and "
-                                  f"recording the reason for the sequence review.")
-                        break
-                    fix_ref = target_path + '.rawstate.webp'
-                    try:
-                        shutil.copyfile(target_path, fix_ref)
-                        if sys.stdout:
-                            print(f"[RAW STATE] Frame {seq} failed the raw-state audit "
-                                  f"({rs_reason}); re-editing it back to an untouched ruin.")
-                        fix_transport = _generate_image_edit(
-                            config, item['prompt'], fix_ref, target_path,
-                            control_prompt=_raw_state_fix_prompt(rs_reason))
-                        # 这一步落进降档通道，最终落盘的就是降档帧——照样留痕
-                        if fix_transport == CHAT_TRANSPORT:
-                            transport = fix_transport
-                        retries += 1
-                        first_frame_path = os.path.join(frames_dir, 'img_001.webp')
-                        if os.path.exists(first_frame_path):
-                            _match_color_lab(target_path, first_frame_path, target_path)
-                    except Exception as fix_err:
-                        # 取消信号必须原样穿透（同门框清除加推：不能被"留痕后继续"吞掉）
-                        if isinstance(fix_err, GenerationCancelled):
-                            raise
-                        vlm_qa_reason = '; '.join(x for x in (vlm_qa_reason, rs_reason) if x)
-                        if sys.stdout:
-                            print(f"[RAW STATE] Raw-state correction for frame {seq} failed "
-                                  f"({fix_err}); keeping the current frame.")
-                        break
-                    finally:
-                        try:
-                            if os.path.exists(fix_ref):
-                                os.remove(fix_ref)
-                        except OSError:
-                            pass
-
-            # 不再逐帧质检——一致性审查移到整套序列渲染完成后统一跑一次，对着真实
-            # 画面判断（见 pipeline_orchestrator._sequence_consistency_review）。
+            # 渲染期不做任何视觉判定（2026-08-05 起门框清除/原始度/逐帧质检一并移除）：
+            # 帧直出落盘，quality_gate 记"没人看过"，要不要复核由用户在帧网格上手动决定。
             current_quality_gate = 'pending_manual_review'
         else:
             reference = previous_path if seq > 1 else None

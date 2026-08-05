@@ -69,10 +69,9 @@ def fetch_prompt_from_library(server: str, title: str) -> str:
 def trigger_generation(server: str, title: str, prompt_block: str, aspect_ratio: str = "9:16", quality: str = "2K") -> str:
     """POST to /api/render_staged and return the task_id.
 
-    /api/render_staged stages the already-composed prompt_block through the backend's
-    Anchor Acceptance Gate: IMAGE 1 is rendered and AI-judged against the skill's rules
-    and genre tone before any other frame is rendered, instead of blind-batching all
-    frames at once. See SKILL.md Step 6.5 (Staged Execution Mode)."""
+    /api/render_staged renders the already-composed prompt_block, reusing any frames
+    already on disk (so the anchor rendered in Step 6.5 is not paid for twice) and then
+    generating video. No frame is judged during rendering. See SKILL.md Step 6.5."""
     url = server.rstrip("/") + "/api/render_staged"
     payload = json.dumps({
         "title": title,

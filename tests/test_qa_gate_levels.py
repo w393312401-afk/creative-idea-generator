@@ -1,3 +1,8 @@
+"""qaGateLevel 档位解析与判定回复的格式容错。
+
+2026-08-05：生成期一致性审查已整体移除，qaGateLevel 如今只作用于手动一致性审查与
+视频门禁。原先针对逐帧质检门/漂移复查/锚帧验收门的 off/lenient 用例随那些门一并删除。
+"""
 import json
 import os
 import shutil
@@ -8,14 +13,7 @@ from unittest.mock import patch
 
 import server_common
 import prompt_pipeline
-from prompt_pipeline import (
-    is_skipped_verdict,
-    is_warn_verdict,
-    run_vlm_qa_check,
-    check_landmark_drift,
-    check_anchor_frame_compliance,
-    run_frame_qa_check,
-)
+from prompt_pipeline import is_warn_verdict
 from server_common import qa_gate_level, effective_config
 
 
@@ -71,263 +69,41 @@ class TestQaGateLevelResolution(unittest.TestCase):
             self.assertEqual(qa_gate_level(merged), 'lenient')
 
 
-class TestOffLevelSkipsAllGates(unittest.TestCase):
-    """off 档：三个视觉门都不发 VLM 请求、直接放行，且带 Skipped 标记留痕
-    （manifest 会记 auto_approved_degraded，而不是伪装成真实通过）。"""
-
-    def test_all_three_gates_skip_without_calling_vlm(self):
-        config = {'qaGateLevel': 'off'}
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, '_multimodal_chat') as chat:
-            verdicts = [
-                run_vlm_qa_check(config, 'a.webp', 'b.webp', 'video prompt'),
-                check_landmark_drift(config, 'img1.webp', 'imgN.webp'),
-                check_anchor_frame_compliance(config, 'img1.webp', 'prompt', {}, {}),
-            ]
-        chat.assert_not_called()
-        for passed, reason in verdicts:
-            self.assertTrue(passed)
-            self.assertTrue(is_skipped_verdict(reason))
-
-
-class TestLenientAdjacentCheck(unittest.TestCase):
-    """lenient 档邻帧质检：换用只拦 4 类硬伤的宽松提示词；
-    PASS_WITH_WARNINGS 归一化为 WARN 放行，FAIL 仍然拦截。"""
-
-    _CONFIG = {'qaGateLevel': 'lenient'}
-
-    def test_uses_lenient_prompt(self):
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, '_multimodal_chat', return_value='PASS') as chat:
-            passed, reason = run_vlm_qa_check(self._CONFIG, 'a.webp', 'b.webp', 'video prompt')
-        self.assertTrue(passed)
-        self.assertFalse(is_warn_verdict(reason))
-        system_prompt = chat.call_args.args[1]
-        self.assertIn('LENIENT', system_prompt)
-        self.assertIn('HARD FAILURES', system_prompt)
-        self.assertNotIn('strict, professional', system_prompt)
-
-    def test_pass_with_warnings_becomes_warn_verdict(self):
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, '_multimodal_chat',
-                          return_value='PASS_WITH_WARNINGS: 构图轻微偏移'):
-            passed, reason = run_vlm_qa_check(self._CONFIG, 'a.webp', 'b.webp', 'video prompt')
-        self.assertTrue(passed)
-        self.assertTrue(is_warn_verdict(reason))
-        self.assertIn('构图轻微偏移', reason)
-        self.assertFalse(is_skipped_verdict(reason))
-
-    def test_hard_failure_still_fails(self):
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, '_multimodal_chat',
-                          return_value='FAIL: 前后帧完全相同，编辑未执行'):
-            passed, reason = run_vlm_qa_check(self._CONFIG, 'a.webp', 'b.webp', 'video prompt')
-        self.assertFalse(passed)
-        self.assertIn('完全相同', reason)
-
-    def test_api_error_still_fails_open_with_skip_marker(self):
-        config = dict(self._CONFIG)
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, '_multimodal_chat',
-                          side_effect=RuntimeError('vlm endpoint down')):
-            passed, reason = run_vlm_qa_check(config, 'a.webp', 'b.webp', 'video prompt')
-        self.assertTrue(passed)
-        self.assertTrue(is_skipped_verdict(reason))
-        self.assertEqual(config['_skipped_checks'], 1)
-
-    def test_standard_prompt_untouched_by_default(self):
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, '_multimodal_chat', return_value='PASS') as chat:
-            run_vlm_qa_check({}, 'a.webp', 'b.webp', 'video prompt')
-        system_prompt = chat.call_args.args[1]
-        self.assertIn('strict, professional', system_prompt)
-        self.assertNotIn('HARD FAILURES', system_prompt)
-
-
-class TestLenientDriftBackstopDisabled(unittest.TestCase):
-    """lenient 档停用跨帧地标漂移复查——这道门正是『构图/视角漂移』误杀的主力。"""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.img1 = os.path.join(self.tmp, 'img_001.webp')
-        self.target = os.path.join(self.tmp, 'img_005.webp')
-        for p in (self.img1, self.target):
-            with open(p, 'wb') as f:
-                f.write(b'x')
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def test_direct_call_is_skipped_in_lenient(self):
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, '_multimodal_chat') as chat:
-            passed, reason = check_landmark_drift({'qaGateLevel': 'lenient'}, self.img1, self.target)
-        chat.assert_not_called()
-        self.assertTrue(passed)
-        self.assertTrue(is_skipped_verdict(reason))
-
-    def test_combined_qa_skips_drift_and_keeps_adjacent_verdict(self):
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, 'run_vlm_qa_check',
-                          return_value=(True, 'WARN: 视角轻微偏移')), \
-             patch.object(prompt_pipeline, 'check_landmark_drift',
-                          return_value=(False, 'FAIL: 地标漂移')) as drift:
-            passed, reason = run_frame_qa_check(
-                {'qaGateLevel': 'lenient'}, self.img1, 'prev.webp', self.target,
-                'video prompt', seq=5)
-        drift.assert_not_called()
-        self.assertTrue(passed)
-        self.assertEqual(reason, 'WARN: 视角轻微偏移')
-
-    def test_standard_still_runs_drift_backstop(self):
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, 'run_vlm_qa_check', return_value=(True, 'PASS')), \
-             patch.object(prompt_pipeline, 'check_landmark_drift',
-                          return_value=(False, 'FAIL: 地标漂移')) as drift:
-            passed, reason = run_frame_qa_check(
-                {}, self.img1, 'prev.webp', self.target, 'video prompt', seq=5)
-        drift.assert_called_once()
-        self.assertFalse(passed)
-        self.assertIn('地标漂移', reason)
-
-
-class TestLenientAnchorGate(unittest.TestCase):
-    """lenient 档 IMAGE 1 锚点门：只拦人物机械/文字水印/完全跑题，
-    损伤严重度、题材气质等降为 WARN 放行。"""
-
-    _CONFIG = {'qaGateLevel': 'lenient'}
-    _BRIEF = {'carrier': '巨树太空舱', 'env': '原始森林', 'trauma': '藤蔓吞没'}
-
-    def test_uses_lenient_prompt_and_passes_warn(self):
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, '_multimodal_chat',
-                          return_value='PASS_WITH_WARNINGS: 损伤程度偏轻') as chat:
-            passed, reason = check_anchor_frame_compliance(
-                self._CONFIG, 'img1.webp', 'prompt', {}, self._BRIEF)
-        self.assertTrue(passed)
-        self.assertTrue(is_warn_verdict(reason))
-        system_prompt = chat.call_args.args[1]
-        self.assertIn('LENIENT', system_prompt)
-        self.assertIn('巨树太空舱', system_prompt)
-
-    def test_hard_failure_still_fails(self):
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, '_multimodal_chat',
-                          return_value='FAIL: 画面中出现一名工人'):
-            passed, reason = check_anchor_frame_compliance(
-                self._CONFIG, 'img1.webp', 'prompt', {}, self._BRIEF)
-        self.assertFalse(passed)
-
-    def test_api_error_fails_open(self):
-        config = dict(self._CONFIG)
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, '_multimodal_chat',
-                          side_effect=RuntimeError('boom')):
-            passed, reason = check_anchor_frame_compliance(
-                config, 'img1.webp', 'prompt', {}, self._BRIEF)
-        self.assertTrue(passed)
-        self.assertTrue(is_skipped_verdict(reason))
-
 
 class TestGateResponseFormatDrift(unittest.TestCase):
     """判定回复的格式漂移容错：备注要求用中文写，模型常输出全角冒号/空格代下划线。
-    本仓库此前在纯文本配额信号、_strip_code_fences 上都栽过同类格式漂移的真实事故。"""
+    本仓库此前在纯文本配额信号、_strip_code_fences 上都栽过同类格式漂移的真实事故。
+    判据取自仍在生产路径上的视频施工过程复审（与手动一致性审查共用 _parse_gate_response）。"""
 
-    _CONFIG = {'qaGateLevel': 'lenient'}
+    _IMGS = {'start_frame_path': 'a.webp', 'mid_frame_paths': ['m.webp'],
+             'end_frame_path': 'b.webp', 'video_prompt': 'video prompt'}
+
+    def _run(self, response):
+        with _gate_sources(), \
+             patch.object(prompt_pipeline, '_multimodal_chat', return_value=response):
+            return prompt_pipeline.run_video_process_check({}, **self._IMGS)
 
     def test_fullwidth_colon_note_is_preserved(self):
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, '_multimodal_chat',
-                          return_value='PASS_WITH_WARNINGS：镜头轻微偏移'):
-            passed, reason = run_vlm_qa_check(self._CONFIG, 'a.webp', 'b.webp', 'video prompt')
+        passed, reason = self._run('PASS_WITH_WARNINGS：镜头轻微偏移')
         self.assertTrue(passed)
         self.assertEqual(reason, 'WARN: 镜头轻微偏移')
 
     def test_space_variant_still_counts_as_warn(self):
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, '_multimodal_chat',
-                          return_value='PASS WITH WARNINGS: 视角偏移'):
-            passed, reason = run_vlm_qa_check(self._CONFIG, 'a.webp', 'b.webp', 'video prompt')
+        passed, reason = self._run('PASS WITH WARNINGS: 视角偏移')
         self.assertTrue(passed)
         self.assertTrue(is_warn_verdict(reason))
         self.assertIn('视角偏移', reason)
 
     def test_bare_pass_with_warnings_without_note(self):
-        with _gate_sources(), \
-             patch.object(prompt_pipeline, '_multimodal_chat',
-                          return_value='PASS_WITH_WARNINGS'):
-            passed, reason = run_vlm_qa_check(self._CONFIG, 'a.webp', 'b.webp', 'video prompt')
+        passed, reason = self._run('PASS_WITH_WARNINGS')
         self.assertTrue(passed)
         self.assertTrue(is_warn_verdict(reason))
 
 
-class TestOffLevelAnchorReuse(unittest.TestCase):
-    """qaGateLevel=off 下分步渲染的锚点复用：off 档过门只会得到 auto_approved_degraded
-    留痕，若照旧拒绝复用，每次续跑都会重渲一张新首帧接旧链（帧 2..N 仍挂在旧首帧上），
-    正是指纹复用机制要防的锚链错位。standard 档对 degraded 记录仍必须重新过门。"""
-
-    _PROMPT_BLOCK = (
-        "图片提示词\n图片 1:\nfirst frame prompt\n\n图片 2:\nsecond frame prompt\n\n"
-        "视频提示词\n视频 1:\nvideo one\n"
-    )
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.old_output_root = server_common.OUTPUT_ROOT
-        server_common.OUTPUT_ROOT = self.tmp
-        self.title = 'test_off_level_anchor_reuse'
-        self.project_dir = server_common._get_project_dir(self.title)
-        os.makedirs(os.path.join(self.project_dir, 'frames'), exist_ok=True)
-
-    def tearDown(self):
-        server_common.OUTPUT_ROOT = self.old_output_root
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _write_degraded_anchor(self):
-        from pipeline_orchestrator import _prompt_fingerprint
-        with open(os.path.join(self.project_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
-            json.dump({'frames': [{
-                'sequence': 1,
-                'quality_gate': 'auto_approved_degraded',
-                'vlm_qa_reason': 'Skipped (qaGateLevel=off: 质检门已关闭)',
-                'anchor_prompt_sha256': _prompt_fingerprint('first frame prompt'),
-            }]}, f)
-        with open(os.path.join(self.project_dir, 'frames', 'img_001.webp'), 'wb') as f:
-            f.write(b'fake webp bytes')
-
-    def _run_staged(self, config):
-        from pipeline_orchestrator import run_staged_frame_rendering
-        with patch('pipeline_orchestrator.generate_frame_sequence') as mock_render, \
-             patch('pipeline_orchestrator.check_anchor_frame_compliance') as mock_gate, \
-             patch('pipeline_orchestrator.generate_video_sequence',
-                   return_value={'videos': [{'slot': 1, 'status': 'success'}]}):
-            result = run_staged_frame_rendering(config, self.title, self._PROMPT_BLOCK)
-        return result, mock_gate, mock_render
-
-    def test_off_level_reuses_degraded_anchor(self):
-        self._write_degraded_anchor()
-        with _gate_sources():
-            result, mock_gate, mock_render = self._run_staged({'qaGateLevel': 'off'})
-        self.assertEqual(result['status'], 'completed')
-        mock_gate.assert_not_called()  # 复用成功：没有重新过门（也就不会重渲首帧）
-        self.assertNotIn([1], [c.kwargs.get('target_sequences') for c in mock_render.call_args_list])
-
-    def test_standard_level_still_regates_degraded_anchor(self):
-        """degraded 记录在 standard 档仍不可复用：必须重新渲染首帧（不再有锚点门可
-        "重新过"，_no_gate_judge 恒真，重渲后直接记 auto_approved）。"""
-        self._write_degraded_anchor()
-        with _gate_sources():
-            result, mock_gate, mock_render = self._run_staged({})
-        self.assertEqual(result['status'], 'completed')
-        mock_gate.assert_not_called()
-        self.assertIn([1], [c.kwargs.get('target_sequences') for c in mock_render.call_args_list])
-
-
 class TestNoPerFrameQaInGenerateFrameSequence(unittest.TestCase):
-    """API 帧生成路径逐帧质检门已停用：不再调用 run_vlm_qa_check，每帧无条件记
-    pending_manual_review——一致性审查移到整套序列渲染完成后统一进行（见
-    pipeline_orchestrator._sequence_consistency_review）。qaGateLevel 对这条路径
-    不再有任何影响。"""
+    """API 帧生成路径不做任何逐帧判定：每帧无条件记 pending_manual_review。
+    一致性审查只能由用户手动触发（见 pipeline_orchestrator._sequence_consistency_review），
+    qaGateLevel 对渲染路径没有任何影响。"""
 
     _PROMPT_BLOCK = """图片 1:
 first frame prompt
@@ -374,8 +150,8 @@ visible construction change
         with _gate_sources(), \
              patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
-             patch('prompt_pipeline.run_vlm_qa_check',
-                   side_effect=AssertionError('per-frame QA gate should no longer be called')):
+             patch.object(prompt_pipeline, '_multimodal_chat',
+                          side_effect=AssertionError('rendering must never call a visual judge')):
             generate_frame_sequence(
                 {'qaGateLevel': 'lenient', 'coverReferencePath': self.cover},
                 'qa_gate_warn_contract',

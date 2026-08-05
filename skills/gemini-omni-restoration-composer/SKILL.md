@@ -346,7 +346,7 @@ Use them only when the user explicitly asks to render, preview, gate, or archive
 
 | Script | Purpose |
 |---|---|
-| `scripts/render_and_gate_anchor.py` | Renders IMAGE 1 and blocks on an acceptance verdict before the rest of the pack is composed. |
+| `scripts/render_and_gate_anchor.py` | Renders IMAGE 1 and blocks until it is on disk, so it can be looked at before the rest of the pack is composed. |
 | `scripts/save_to_library.py` | Archives the delivered prompt block and audit table to the idea library. |
 | `scripts/generate_frames.py` | Triggers rendering of the remaining frames. |
 
@@ -357,9 +357,9 @@ python3 scripts/render_and_gate_anchor.py \
   --server "http://127.0.0.1:8085"
 ```
 
-Exit codes: `0` passed (`auto_approved`, or `auto_approved_degraded` — the latter means the judge errored and the frame was waved through **unverified**, which must be disclosed to the user plainly); `1` failed after retries, stop and ask the user how to proceed; `2` server unreachable, fall back to plain text delivery in one pass; `5` timed out while the server was still working — do not treat as unreachable.
+Exit codes: `0` rendered; `2` server unreachable, fall back to plain text delivery in one pass; `3` server error; `4` missing prompt text; `5` timed out while the server was still working — do not treat as unreachable.
 
-If the gate passes, the confirmed IMAGE 1 prompt is authoritative: deliver it verbatim and reconcile the rest of the pack against what actually rendered rather than against the pre-visualised plan.
+The server runs **no** automatic judgement on the frame (2026-08-05: all generation-time consistency review was removed). Show the user the rendered anchor, say plainly that nothing checked it automatically, and let them decide before you compose the rest. The rendered IMAGE 1 prompt is then authoritative: deliver it verbatim and reconcile the rest of the pack against what actually rendered rather than against the pre-visualised plan.
 
 `--prompt_file` is preferred over `--prompt`; prompt bodies contain characters that are painful to escape on a command line.
 

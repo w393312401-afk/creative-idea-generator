@@ -28,8 +28,6 @@ from prompt_pipeline import *
 # Explicitly import private functions that are not imported by wildcard '*'
 from server_common import (
     _get_project_dir, _LOG_PATH, _account_switch_interval,
-    # 合成 worker 落 project_brief.json 时要临时借用项目键上下文，用完还原
-    _PROJECT_KEY_CONTEXT,
     _IP_ROTATE_DISABLED,
     # 点子库拆分存储的内部读取路径：POST /api/library 的三道防护要在**已持有**
     # LIBRARY_LOCK 的情况下读一次现有库，读-判定-写这一串必须是原子的。
@@ -97,6 +95,9 @@ def background_worker(task_id, config, dimensions):
             config['_beat_audit'] = []
             config['_frame_state_contract'] = []
             config['_frame_state_contract_errors'] = []
+            config['_outline_contract'] = {}
+            config['_outline_prompt_audit'] = {}
+            config['_outline_delivery_ledger'] = []
         content = call_llm(config, dimensions, on_progress=on_progress)
         result = parse_sections(content)
 
@@ -170,6 +171,46 @@ def background_worker(task_id, config, dimensions):
             )
             result['audit_md'] = ((result.get('audit_md') or '').rstrip()
                                   + '\n\n' + state_note).strip()
+        # 卡片工序交付体检表（2026-08-05）。下面那份映射 diff 回答的是"发生了什么改写"，
+        # 回答不了用户最想问的"我照着挑的这 14 条工序，最后落实了几条、落在第几帧"——
+        # 数据散在 _outline_contract（规划期）/ _beat_audit（按拍的回炉流水）两处，谁也
+        # 拼不出按工序索引的那一张表。总账在合成收尾时已经算好并挂在
+        # config['_outline_delivery_ledger'] 上（prompt_pipeline.stash_outline_delivery_ledger），
+        # 这里只是把它接到审核面板最上方，与 _beat_audit / _outline_contract 同一套约定。
+        outline_ledger = (config.get('_outline_delivery_ledger')
+                          if isinstance(config, dict) else None)
+        if outline_ledger:
+            from prompt_pipeline import render_outline_delivery_md, outline_delivery_alert
+            result['outline_delivery_ledger'] = outline_ledger
+            ledger_md = render_outline_delivery_md(outline_ledger)
+            if ledger_md:
+                result['audit_md'] = ((result.get('audit_md') or '').rstrip()
+                                      + '\n\n' + ledger_md).strip()
+            # 一条工序都没被认领（规划耗尽重试退回通用施工序）必须顶到 repair_md 上：
+            # 那是整张卡的工序被静默换掉，混在审核报告深处等于没报。
+            ledger_alert = outline_delivery_alert(outline_ledger)
+            if ledger_alert:
+                base = (result.get('repair_md') or '').strip()
+                result['repair_md'] = (ledger_alert if base.upper().startswith('PASS')
+                                       else f"{base} {ledger_alert}")
+        # 大纲 ↔ milestone 映射 diff 可见化（2026-08-05）。合并/拆分/新增/被吞并此前
+        # 只打进 server.log 的 [OUTLINE] 行，用户在结果页上完全看不出"卡片上那条工序
+        # 去哪了"——而他正是照着那份清单挑的选题。数据早就算好并挂在
+        # config['_outline_contract'] 上（prompt_pipeline.outline_milestone_contract），
+        # 这里只是把它接到审核面板上，与 _beat_audit / _frame_state_contract 同一套约定。
+        outline_contract = (config.get('_outline_contract')
+                            if isinstance(config, dict) else None)
+        if isinstance(outline_contract, dict) and outline_contract.get('declared'):
+            from prompt_pipeline import render_outline_contract_md
+            outline_md, uncovered_note = render_outline_contract_md(outline_contract)
+            result['outline_contract'] = outline_contract
+            if outline_md:
+                result['audit_md'] = ((result.get('audit_md') or '').rstrip()
+                                      + '\n\n' + outline_md).strip()
+            if uncovered_note:
+                base = (result.get('repair_md') or '').strip()
+                result['repair_md'] = (uncovered_note if base.upper().startswith('PASS')
+                                       else f"{base} {uncovered_note}")
         result['skipped_checks_count'] = config.get('_skipped_checks', 0) if isinstance(config, dict) else 0
         
         usage = stop_and_get_accounting()
@@ -215,21 +256,21 @@ def background_worker(task_id, config, dimensions):
         result['project_key'] = (
             (dimensions or {}).get('project_key')
             or make_idea_project_key(task_id, result.get('title')))
-        # 本单的 parsed_brief 落到项目目录：帧序列是**另一个独立请求**（前端只回传
-        # prompt_block），锚帧验收门禁此前因此永远拿不到 brief，只能按默认口径判。
-        # 2026-08-04 事故：载体后到的项目（IMAGE 1 按契约就是空场地）被按"必须有
-        # 三类损伤"的默认口径判成不合格，整条 18 帧的链在第一帧就被锚帧硬闸中止。
-        _brief = config.get('_parsed_brief') if isinstance(config, dict) else None
-        if isinstance(_brief, dict) and _brief:
-            _prev_key = getattr(_PROJECT_KEY_CONTEXT, 'value', None)
-            set_project_key_context(result['project_key'])
-            try:
-                save_project_brief(_get_project_dir(result.get('title') or ''), _brief)
-            finally:
-                set_project_key_context(_prev_key)
         result['timings'] = {
             'total_duration_seconds': round(time.time() - start_time, 2)
         }
+        # 交付总账再落一份进项目 manifest：帧渲染完之后用户手动触发的一致性审查跑在
+        # 另一个任务/进程生命周期里，config 上这份到不了那边，而它正是画面层要判的
+        # 「这拍该交付哪几条卡片工序」的唯一来源（见 persist_outline_delivery_ledger）。
+        # 项目目录此刻通常还没建（封面/首帧才建），故由该函数按需创建。
+        if outline_ledger:
+            try:
+                from pipeline_orchestrator import persist_outline_delivery_ledger
+                persist_outline_delivery_ledger(
+                    _get_project_dir(result['project_key']), outline_ledger,
+                    title=result.get('title'))
+            except Exception as e:
+                log('WARN', 'COMPOSE', f"工序交付总账落盘失败（不影响本单交付）: {e}")
 
         with ACTIVE_TASKS_LOCK:
             # 终态化必须在锁内复核取消/换代：/api/compose-cancel 可能刚把记录切
@@ -996,9 +1037,8 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
             # 取消端点只撤销对应任务，不再影响队列中的其他任务。
             with _fx_serial_lock_for(config, task_id, 'frames', t['cancel_event']):
                 if target_sequences is None:
-                    # 整单渲染走编排层：分段渲染+检查点现实校准+链尾回望。
-                    # 此前一次性端点直调 generate_frame_sequence，这些机制对主界面的
-                    # 帧序列按钮完全不生效。单帧/子集重试仍走原直调路径。
+                    # 整单渲染走编排层（渲染期不做任何审查，见 pipeline_orchestrator
+                    # 模块头）；单帧/子集重试走 generate_frame_sequence 直调路径。
                     from pipeline_orchestrator import render_frames_for_task
                     result = render_frames_for_task(
                         config, title, prompt_block, on_progress=progress_cb,
@@ -1009,31 +1049,6 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
                         on_progress=progress_cb,
                         target_sequences=target_sequences
                     )
-                    # 手动逐帧/子集重试路径本不挂一致性防护（见上面「整单渲染走编排层」
-                    # 的注释）；但如果这次调用后整套序列的所有帧都已在磁盘落地，说明这
-                    # 正是逐帧点完的最后一帧——趁此机会补跑一次链尾回望+整套一致性复审，
-                    # 否则纯手动逐帧点满整个序列会永远吃不到这层保护（2026-07-22 喀斯特
-                    # 洞穴/沙漠花岗岩两单实测：全程逐帧手动生成，第4帧门框清除失败、
-                    # 第12帧严重跑偏，复审机制全程未被触发过，manifest 里所有帧的
-                    # quality_gate 停留在初始的 pending_manual_review，从未被真正复审）。
-                    try:
-                        from pipeline_orchestrator import (
-                            _frame_path, _chain_drift_lookback, _sequence_consistency_review,
-                        )
-                        images, _videos = _parse_prompt_slots(prompt_block)
-                        if images and all(os.path.exists(_frame_path(title, s)) for s in images):
-                            project_dir = _get_project_dir(title)
-                            _chain_drift_lookback(config, title, prompt_block, project_dir,
-                                                  on_progress=progress_cb)
-                            _sequence_consistency_review(config, title, prompt_block, project_dir,
-                                                         on_progress=progress_cb)
-                            result = read_manifest(project_dir) or result
-                    except ConnectionError:
-                        raise
-                    except Exception as review_err:
-                        log('WARN', 'FRAMES',
-                            f"子集/手动生成后补跑一致性复审失败（不影响已生成的帧）: {review_err}",
-                            title=title)
         finally:
             set_upstream_event_sink(None)
             set_cancel_check_sink(None)
@@ -1832,68 +1847,6 @@ class IPv4HTTPServer(_QuietConnResetMixin, ThreadingMixIn, HTTPServer):
         if sys.platform == 'win32' and hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
-
-
-def check_video_prompt_semantically(config, video_prompt, vlm_reason):
-    """
-    Use LLM to determine if the video transition prompt has semantic or logical issues
-    and is responsible for the VLM QA failure.
-    """
-    system_prompt = (
-        "You are a video transition auditor. Your job is to check if the VIDEO transition prompt "
-        "has any logical errors, contradictions, or is responsible for a VLM QA failure.\n"
-        "You will be given the VIDEO prompt and the VLM QA failure reason (in Chinese).\n\n"
-        "Determine if the video prompt itself has issues (e.g., describes impossible actions, has camera pan/zoom/tilt when it must be static, or is contradictory).\n"
-        "Response format:\n"
-        "- If the video prompt has issues, respond EXACTLY in this format: FAIL: <reason in Chinese>\n"
-        "- If the video prompt is completely fine and doesn't need to be corrected, respond EXACTLY with: PASS"
-    )
-    user_prompt = f"VIDEO prompt:\n{video_prompt}\n\nVLM Failure Reason:\n{vlm_reason}"
-    from prompt_pipeline import _chat, _aux_model
-    try:
-        response = _chat(config, system_prompt, user_prompt, temperature=0.2, timeout=45, model=_aux_model(config))
-        return response.strip()
-    except Exception as e:
-        if sys.stdout:
-            print(f"[DEBUG] check_video_prompt_semantically failed: {e}")
-        return "PASS"
-
-
-def fix_video_prompt_with_vlm_feedback(config, original_video_prompt, vlm_reason, validation_errors=None):
-    """
-    Use LLM (auxModel) to generate a corrected video prompt based on the VLM QA audit failure reason and any validation errors.
-    """
-    system_prompt = (
-        "You are an expert prompt engineering assistant. Your job is to modify a video transition prompt "
-        "to fix specific errors detected by a visual quality auditor (VLM) or rule validation errors.\n"
-        "You will be given the original video transition prompt, the VLM failure reason (in Chinese), "
-        "and optionally any rule validation errors.\n\n"
-        "Please provide a corrected video transition prompt that:\n"
-        "- Corrects the action or pacing so it matches the image changes or fixes the VLM failure.\n"
-        "- Ensures there are no forbidden camera movement instructions (like zoom, pan, tilt) if the camera must remain static.\n"
-        "- Fixes any coordinates, pacing, or rule validation errors listed.\n"
-        "- Keeps the original action intent, style, and duration constraints intact.\n"
-        "- Do NOT output any explanations, markdown code fences, or headers. Output ONLY the raw corrected prompt text in English."
-    )
-    user_prompt = (
-        f"Original VIDEO prompt:\n{original_video_prompt}\n\n"
-        f"VLM Audit Failure Reason:\n{vlm_reason}\n\n"
-    )
-    if validation_errors:
-        user_prompt += f"Rule Validation Errors:\n" + "\n".join(f"- {e}" for e in validation_errors) + "\n\n"
-    user_prompt += "Please output the corrected VIDEO prompt in English."
-
-    from prompt_pipeline import _chat, _aux_model, _strip_markdown_fences_only
-    try:
-        response = _chat(
-            config, system_prompt, user_prompt,
-            temperature=0.3, timeout=60, model=_aux_model(config)
-        )
-        return _strip_markdown_fences_only(response).strip()
-    except Exception as e:
-        if sys.stdout:
-            print(f"[DEBUG] fix_video_prompt_with_vlm_feedback failed: {e}")
-        return original_video_prompt
 
 
 class SparkRequestHandler(SimpleHTTPRequestHandler):
@@ -3655,203 +3608,6 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'online': False, 'message': str(e)})
 
-        elif path == '/api/vlm_qa':
-            if not self._gate(with_rate=True, rate_action='vlm_qa'):
-                return
-            try:
-                body = self._read_json_body()
-                config_req = effective_config(body.get('config', {}))
-                img_i_path = body.get('img_i_path')
-                img_ip1_path = body.get('img_ip1_path')
-                video_prompt = body.get('video_prompt')
-                is_bridge = bool(body.get('is_bridge', False))
-
-                # If img_i_path is empty, it means we are checking the first frame (no previous frame).
-                # In this case, we skip the check and directly return success.
-                if not img_i_path:
-                    self._send_json({
-                        'status': 'ok',
-                        'vlm_pass': True,
-                        'vlm_reason': 'First frame skipped'
-                    })
-                    return
-
-                if not img_ip1_path or not video_prompt:
-                    self._send_json({'status': 'error', 'message': 'Missing parameters: img_ip1_path and video_prompt are required'}, status=400)
-                    return
-
-                if not os.path.exists(img_i_path):
-                    self._send_json({'status': 'error', 'message': f'img_i_path does not exist: {img_i_path}'}, status=400)
-                    return
-
-                if not os.path.exists(img_ip1_path):
-                    self._send_json({'status': 'error', 'message': f'img_ip1_path does not exist: {img_ip1_path}'}, status=400)
-                    return
-
-                from prompt_pipeline import run_vlm_qa_check
-                vlm_pass, vlm_reason = run_vlm_qa_check(config_req, img_i_path, img_ip1_path, video_prompt, is_bridge=is_bridge)
-                self._send_json({
-                    'status': 'ok',
-                    'vlm_pass': bool(vlm_pass),
-                    'vlm_reason': vlm_reason
-                })
-            except Exception as e:
-                self._send_json({'status': 'error', 'message': str(e)}, status=500)
-
-        elif path == '/api/generate_image_with_vlm':
-            if not self._gate(with_rate=True, rate_action='image_vlm'):
-                return
-            try:
-                import requests
-                body = self._read_json_body()
-                config_req = effective_config(body.get('config', {}))
-                prompt = body.get('prompt')
-                reference_image = body.get('reference_image')
-                ratio = body.get('ratio', '9:16')
-                model = body.get('model', 'Nano Banana 2')
-                output_path = body.get('output_path')
-                video_prompt = body.get('video_prompt')
-                chain_index = int(body.get('chain_index', 1))
-                is_bridge = bool(body.get('is_bridge', False))
-                base_url = body.get('base_url', 'http://127.0.0.1:8000')
-
-                if reference_image and not os.path.exists(reference_image):
-                    self._send_json({'status': 'error', 'message': f'reference_image does not exist: {reference_image}'}, status=400)
-                    return
-
-                if not prompt or not output_path:
-                    self._send_json({'status': 'error', 'message': 'Missing parameters: prompt and output_path are required'}, status=400)
-                    return
-
-                current_prompt = prompt
-                last_generated_path = None
-                vlm_pass = True
-                vlm_reason = None
-                video_prompt_corrected = False
-
-                for attempt in range(3): # 1 initial + 2 retries = 3 total attempts
-                    # Prepare call to AdsPower AI service
-                    payload = {
-                        "prompts": [current_prompt],
-                        "ratio": ratio,
-                        "model": model,
-                        "output_path": output_path
-                    }
-                    if reference_image:
-                        payload["images"] = [reference_image]
-
-                    log_msg = f"[VLM QA Retry Flow] Generating image frame {chain_index} (attempt {attempt + 1}/3)..."
-                    if sys.stdout:
-                        print(log_msg)
-
-                    gen_url = f"{base_url.rstrip('/')}/generate_images_batch"
-                    headers = {"Content-Type": "application/json"}
-                    
-                    response = requests.post(gen_url, json=payload, headers=headers, timeout=600)
-                    
-                    if not response.ok:
-                        raise RuntimeError(f"AdsPower generation failed: HTTP {response.status_code} - {response.text}")
-                    
-                    res_data = response.json()
-                    img_path = None
-                    for k in ['generated_image_path', 'generated_image_url', 'image_url', 'output_path', 'local_path', 'path', 'url']:
-                        if isinstance(res_data.get(k), str) and res_data[k].strip():
-                            img_path = res_data[k].strip()
-                            break
-                    if not img_path and isinstance(res_data.get('image_urls'), list) and res_data['image_urls']:
-                        img_path = res_data['image_urls'][0]
-
-                    if not img_path or not os.path.exists(img_path):
-                        raise RuntimeError(f"Generated image path not found or does not exist: {img_path}")
-
-                    last_generated_path = img_path
-
-                    # Perform VLM Check if it's not the first frame and we have a reference image and video prompt
-                    if chain_index > 1 and reference_image and video_prompt:
-                        from prompt_pipeline import run_vlm_qa_check
-                        vlm_pass, vlm_reason = run_vlm_qa_check(config_req, reference_image, img_path, video_prompt, is_bridge=is_bridge)
-                        if vlm_pass:
-                            if sys.stdout:
-                                print(f"[VLM QA Retry Flow] Frame {chain_index} passed VLM check on attempt {attempt + 1}!")
-                            break
-                        else:
-                            if attempt < 2:
-                                if sys.stdout:
-                                    print(f"[VLM QA Retry Flow] Frame {chain_index} failed VLM check on attempt {attempt + 1}: {vlm_reason}.")
-                                
-                                # Run Quality Check on Video Prompt
-                                from prompt_pipeline import (
-                                    check_grid_coordinates,
-                                    check_nlvtr_violations,
-                                    check_video_opening,
-                                    check_out_and_in,
-                                    check_transition_shortcuts,
-                                    check_pacing_control,
-                                    check_camera_contradictions
-                                )
-                                video_errs = []
-                                video_errs.extend(check_grid_coordinates(video_prompt))
-                                video_errs.extend(check_nlvtr_violations(video_prompt))
-                                video_errs.extend(check_video_opening(chain_index - 1, video_prompt))
-                                video_errs.extend(check_out_and_in(video_prompt, is_bridge))
-                                video_errs.extend(check_transition_shortcuts(video_prompt))
-                                video_errs.extend(check_pacing_control(video_prompt, is_bridge))
-                                # 桥接段 TBCP 无条件禁 pan/tilt（reward 拍不会是桥接，无误伤面）
-                                video_errs.extend(check_camera_contradictions(video_prompt, is_bridge, ban_pan_tilt=is_bridge))
-                                
-                                vid_word_count = len(video_prompt.split())
-                                if vid_word_count > 380:
-                                    video_errs.append(f"VIDEO prompt word count ({vid_word_count}) exceeds limit of 380 words")
-                                
-                                semantic_res = check_video_prompt_semantically(config_req, video_prompt, vlm_reason)
-                                video_prompt_failed = bool(video_errs) or semantic_res.startswith("FAIL")
-                                
-                                if video_prompt_failed:
-                                    combined_errs = list(video_errs)
-                                    if semantic_res.startswith("FAIL"):
-                                        combined_errs.append(semantic_res)
-                                    if sys.stdout:
-                                        print(f"[VLM QA Retry Flow] Frame {chain_index} video prompt failed quality check. Errors: {combined_errs}")
-                                    
-                                    new_video_prompt = fix_video_prompt_with_vlm_feedback(config_req, video_prompt, vlm_reason, combined_errs)
-                                    if sys.stdout:
-                                        print(f"[VLM QA Retry Flow] Rewritten video prompt: {new_video_prompt}")
-                                    video_prompt = new_video_prompt
-                                    video_prompt_corrected = True
-                                else:
-                                    if sys.stdout:
-                                        print(f"[VLM QA Retry Flow] Frame {chain_index} video prompt passed quality check.")
-
-                                # Correct the image prompt as before
-                                from prompt_pipeline import fix_image_prompt_with_vlm_feedback
-                                current_prompt = fix_image_prompt_with_vlm_feedback(config_req, current_prompt, vlm_reason)
-                                if sys.stdout:
-                                    print(f"[VLM QA Retry Flow] Rewritten image prompt: {current_prompt}")
-                            else:
-                                if sys.stdout:
-                                    print(f"[VLM QA Retry Flow] Frame {chain_index} failed VLM check and retries exhausted.")
-                    else:
-                        vlm_pass = True
-                        break
-
-                res_payload = {
-                    'generated_image_path': last_generated_path,
-                    'vlm_pass': bool(vlm_pass)
-                }
-                if video_prompt_corrected:
-                    res_payload['corrected_video_prompt'] = video_prompt
-
-                if vlm_pass:
-                    res_payload['status'] = 'ok'
-                    self._send_json(res_payload)
-                else:
-                    res_payload['status'] = 'failed'
-                    res_payload['message'] = f"VLM QA failed: {vlm_reason}"
-                    self._send_json(res_payload)
-
-            except Exception as e:
-                self._send_json({'status': 'error', 'message': str(e)}, status=500)
-
         elif path == '/api/clear-cache':
             if not self._gate():
                 return
@@ -4450,21 +4206,21 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
 
                 # Synchronous by design: a conversational agent calls this mid-turn and
-                # needs the verdict back directly, not a task_id to poll. The server is
-                # ThreadingMixIn, so blocking here does not stall other requests.
+                # needs the rendered frame back directly, not a task_id to poll. The server
+                # is ThreadingMixIn, so blocking here does not stall other requests.
+                # 2026-08-05：本端点此前还跑锚帧验收门；渲染期审查已整体移除，现在只渲。
                 from prompt_pipeline import start_accounting, stop_and_get_accounting
-                from pipeline_orchestrator import render_and_gate_single_frame
+                from pipeline_orchestrator import render_single_frame
                 start_accounting()
-                gate = render_and_gate_single_frame(config, title, sequence, prompt, meta=meta)
+                rendered = render_single_frame(config, title, sequence, prompt, meta=meta)
                 usage = stop_and_get_accounting()
 
                 response = {
                     'status': 'ok',
-                    'gate_status': gate['status'],
-                    'reason': gate['reason'],
-                    'prompt': gate['prompt'],
-                    'image_url': '/' + os.path.relpath(gate['image_path'], os.path.dirname(os.path.abspath(__file__))).replace('\\', '/'),
-                    'project_dir': gate['project_dir'],
+                    'gate_status': rendered['status'],
+                    'prompt': rendered['prompt'],
+                    'image_url': '/' + os.path.relpath(rendered['image_path'], os.path.dirname(os.path.abspath(__file__))).replace('\\', '/'),
+                    'project_dir': rendered['project_dir'],
                 }
                 if usage:
                     response['token_usage'] = usage
@@ -5433,9 +5189,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                             v['sequence'] = idx + 1
                         mdata['videos'] = videos_new_entries
 
-                        # 帧图整体换过位置：按帧号记账的审查结论与链回望结果全部失效
+                        # 帧图整体换过位置：按帧号记账的审查结论全部失效
                         dropped = drop_stale_review_verdicts(mdata, project_dir)
-                        mdata.pop('chain_drift', None)
                         # 修复快照同样按帧号记账（.frame_fixes/005/）：编号整体前移之后，
                         # fix_backup 记号跟着条目挪到 004，而 .frame_fixes/004 里躺的是
                         # 另一帧的旧图——点「撤销修复」就会退回一张张冠李戴的画面。

@@ -79,7 +79,6 @@ function summarizeRunQuality(manifest) {
     const downscaled = count(f => !!f.degraded_reason);
     const stale = count(f => f.stale_lineage);
     const inertia = count(f => typeof f.vlm_qa_reason === 'string' && f.vlm_qa_reason.indexOf('anchor_inertia') !== -1);
-    const driftFails = (manifest.chain_drift || []).filter(d => d && d.passed === false).length;
     if (flagged) risks.push(`${flagged} 帧一致性审查未过`);
     if (manualFlagged) risks.push(`${manualFlagged} 帧被人工标记问题、尚未修复`);
     if (skipped) risks.push(`${skipped} 帧未经整套审查（审查服务不可用）`);
@@ -88,7 +87,6 @@ function summarizeRunQuality(manifest) {
     if (downscaled) risks.push(`${downscaled} 帧走降档通道渲出（分辨率低于本单档位，建议补额度后定向重渲）`);
     if (stale) risks.push(`${stale} 帧血统过期`);
     if (inertia) risks.push(`${inertia} 帧疑似换族惯性卡死`);
-    if (driftFails) risks.push(`${driftFails} 个镜头族存在空间断裂（链回望 FAIL）`);
     const videos = manifest.videos || [];
     const vFailed = videos.filter(v => v.status === 'failed').length;
     const vWarned = videos.filter(v => v.process_warned).length;

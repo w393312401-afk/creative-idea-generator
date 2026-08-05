@@ -94,6 +94,9 @@ class ImageBatchRequest(BrowserEnvLockedRequest):
     model: str = Field(default_factory=get_runtime_google_fx_image_model)
     output_path: str = ""
     project_url: Optional[str] = None  # Reuse across five-item submission chunks.
+    # 本任务还没有自己的画布：浏览器里停着的那块属于上一个任务，必须新建而不是沿用
+    # （2026-08-05 串图事故）。同一任务的后续 chunk 不再置位，继续复用已建立的画布。
+    require_fresh_canvas: bool = False
     # One orchestration owner, one retry budget.  Callers that resume a partial
     # prefix pass the remaining budget instead of each layer inventing its own
     # four-attempt loop.

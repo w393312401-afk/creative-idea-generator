@@ -140,9 +140,10 @@ class TestEveryEnforcerActuallyExists:
 class TestKnownGapsStayVisible:
     """已知缺口的清单本身就是交付物：它变了要有人知道。"""
 
-    def test_base_gaps_are_exactly_the_two_we_accepted(self):
+    def test_base_gaps_are_exactly_the_three_we_accepted(self):
         report = server_common.skill_contract_report('base')
         assert set(report['unenforced']) == {
+            'anchor-frame-compliance',     # 2026-08-05 生成期视觉判定整体移除，只剩 agent 侧口头复核
             'staged-anchor-render-gate',   # agent 侧交付节奏，服务端链路不经过
             'used-topic-ledger-dedup',     # 去重全交给 LLM，产出侧无程序化查重
         }

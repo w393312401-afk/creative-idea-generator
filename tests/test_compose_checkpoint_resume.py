@@ -223,42 +223,203 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
         self.assertEqual(state['parsed_brief']['signature_anchor'], '')
         self.assertNotIn('SIGNATURE ANCHOR RULE', self.captured_beat_system['text'])
 
-    def test_card_beat_outline_reaches_the_ladder_call_as_a_soft_plan(self):
+    def test_card_beat_outline_reaches_the_ladder_call_as_a_hard_rule(self):
         """灵感卡片上展示的工序预览(idea.beat_outline)随 dimensions 传进来后,必须出现在
-        节拍阶梯生成调用里,否则用户挑卡时看到的工序和成片对不上;同时必须明确标成软参考,
-        不能让它盖过真实施工顺序等硬规则。"""
+        节拍阶梯生成调用里,否则用户挑卡时看到的工序和成片对不上。
+
+        2026-08-05 起它是**硬规则**而不是软参考:旧文案标成 "SOFT reference" 并明说
+        "Rewrite, merge, split, or reorder any draft entry",规划器把"改写"理解成
+        "换成我认为更好的工序",用户照着挑的那几条就此静默消失(覆盖率契约只查编号,
+        查不到内容被掉包)。物理规则仍然优先,但只能让一条工序挪位/合并/拆分。"""
         self.dimensions['beat_outline'] = ['清运塔内积渣与锈屑', '架设内墙木龙骨', '点亮壁炉,人物入住']
         pp.compose_anchor_and_packet({}, self.dimensions)
 
         beat_user = self.captured_beat_user['text']
         self.assertIn('清运塔内积渣与锈屑', beat_user)
         self.assertIn('架设内墙木龙骨', beat_user)
-        self.assertIn('SOFT reference', beat_user)
-        self.assertIn('every mandatory rule in the system prompt outranks it', beat_user)
+        self.assertIn('CARD WORK PLAN (MANDATORY', beat_user)
+        self.assertNotIn('SOFT reference', beat_user)
+        # 物理规则仍然优先,但作用域被写死成"挪位/合并/拆分",不含删除与替换
+        self.assertIn('WHAT PHYSICS MAY AND MAY NOT CHANGE', beat_user)
+        self.assertIn('NEVER license you to DELETE it, REPLACE it, or SUBSTITUTE', beat_user)
+        # 顺序与内容两道新契约
+        self.assertIn('ORDER (mandatory)', beat_user)
+        self.assertIn('DELIVERY RESTATEMENT (mandatory)', beat_user)
         # 编号顺序透传,便于模型对齐用户看到的那一版工序
         self.assertIn('1. 清运塔内积渣与锈屑', beat_user)
         self.assertIn('2. 架设内墙木龙骨', beat_user)
 
-    def test_outline_is_capped_at_the_beat_budget_and_absent_when_not_provided(self):
-        """草案条数不该反过来把拍数预算顶穿:beats_count=2(fixed)时最多 3 条(含 reward)。
-        没传 beat_outline 时整块不出现,手工填维度直出的老路径行为不变。
+    def test_the_whole_draft_reaches_the_planner_even_over_budget(self):
+        """草案**不再按拍数裁剪**(2026-08-05)。没传 beat_outline 时整块不出现,
+        手工填维度直出的老路径行为不变。
 
-        裁剪必须**留住末条**:卡片草案的最后一条是 reward 揭示(激发侧 schema 约定
-        长度 = recommended_beats + 1)。旧的 [:max_total] 直切会把它和尾部工序一起
-        切掉,用户把拍数调小换来的就是一份停在半截、没有完工镜头的草案。"""
+        旧行为是 [:max_total - 1] + 末条:beats_count=2(fixed) 时 5 条草案只送 3 条,
+        中间的「C封板」「D刷漆」根本没进过提示词——规划器不知道它们存在,BINDING
+        CONTRACT 的覆盖率也就管不到它们,而用户在「🔨 节拍简介」弹窗里看到的仍是完整
+        的 5 条。现在整份送进去,超额部分由规划器合并消化(合并留 diff、宽度受
+        _max_merge_width 闸门约束),预算不足这件事改成显式告知。"""
         pp.compose_anchor_and_packet({}, self.dimensions)
-        self.assertNotIn('Draft plan', self.captured_beat_user['text'])
+        self.assertNotIn('CARD WORK PLAN', self.captured_beat_user['text'])
 
         self.dimensions['beat_outline'] = ['A清渣', 'B龙骨', 'C封板', 'D刷漆', 'E入住']
         pp.compose_anchor_and_packet({}, self.dimensions)
         beat_user = self.captured_beat_user['text']
-        self.assertIn('Draft plan', beat_user)
-        self.assertIn('1. A清渣', beat_user)
-        self.assertIn('2. B龙骨', beat_user)
-        # 预算 3 条:前 2 条施工 + 末条 reward,中间超额的工序才是被截掉的那些
-        self.assertIn('3. E入住', beat_user)
-        self.assertNotIn('C封板', beat_user)
-        self.assertNotIn('D刷漆', beat_user)
+        self.assertIn('CARD WORK PLAN', beat_user)
+        for i, text in enumerate(['A清渣', 'B龙骨', 'C封板', 'D刷漆', 'E入住'], 1):
+            self.assertIn(f'{i}. {text}', beat_user)
+        # 预算不足 → 显式要求合并而不是丢弃(beats_count=2 fixed ⇒ 上限 3 个元素)
+        self.assertIn('BUDGET COMPRESSION', beat_user)
+        self.assertIn('5 entries', beat_user)
+        self.assertIn('capped at 3', beat_user)
+
+
+class TestOutlineContractBlocksTheLadder(unittest.TestCase):
+    """节拍简介是硬规则(2026-08-05)之后,工序契约不满足必须真的挡住这版梯子。
+
+    改造前它挂在 rhythm 那一档:`retry_for_rhythm` 只在第 1、2 轮成立,于是第 3 轮
+    结构违规一清空就被立刻接受(还剩一整轮修复预算没用),最后一轮更是由
+    `accept_leniently` 无条件放行。用户在卡片上挑的工序就是这么静默消失的。
+
+    但"阻塞"不能退化成掉进确定性兜底梯子——那条梯子按 parsed_brief 生成,跟用户挑的
+    这张卡毫无关系,比一条有瑕疵但认这张卡的梯子更糟。所以耗尽后走
+    `_outline_forced_ladder`:留住最后一版 LLM 梯子并留痕。"""
+
+    OUTLINE = [{'op': 'clearing', 'text': '清运塔内积渣与锈屑'},
+               {'op': 'framing', 'text': '架设内墙木龙骨'},
+               {'op': 'reward', 'text': '点亮壁炉,人物入住'}]
+
+    def setUp(self):
+        self._tmp_dir = tempfile.mkdtemp()
+        self._path_patch = patch.object(
+            pp, 'COMPOSE_CHECKPOINT_PATH', os.path.join(self._tmp_dir, 'compose_checkpoints.json'))
+        self._path_patch.start()
+        self.addCleanup(self._path_patch.stop)
+        self.addCleanup(shutil.rmtree, self._tmp_dir, ignore_errors=True)
+        for p in (patch.object(pp, 'load_reference_file', return_value=''),
+                  patch.object(pp, 'get_cropped_templates', return_value='')):
+            p.start()
+            self.addCleanup(p.stop)
+
+        self.dimensions = {
+            'theme': '高山废弃铁路蒸汽机车注水塔改造成独居御寒暖阁', 'anchors': [],
+            'complexity': '硬核重工', 'budget': '轻奢设计师级', 'ratio': '50%',
+            'creativity': '脑洞大开', 'beats_count': 2, 'beat_count_mode': 'fixed',
+            'beat_outline': self.OUTLINE,
+        }
+        self.planner_calls = []
+
+    def _ladder(self, refs_and_delivery):
+        """两个施工拍 + 一个 reward 拍;refs_and_delivery 逐拍给 (refs, delivery)。"""
+        ops = ['clearing', 'framing', 'reward']
+        milestones = ['tower interior fully cleared', 'all interior studs standing',
+                      'the stove is lit and the room is lived in']
+        beats = []
+        for i, (op, milestone, (refs, delivery)) in enumerate(
+                zip(ops, milestones, refs_and_delivery), 1):
+            beat = {'index': i, 'operation': op, 'bridge_stage': None,
+                    'description': f'{op} work', 'milestone_name': milestone,
+                    'before_state': 'the prior state is visible',
+                    'after_state': f'the entire bay shows the finished {op} result',
+                    'completion_extent': 'the entire visible bay',
+                    'changed_grid_cells': ['Grid B2', 'Grid C2'],
+                    'package_operations': [op],
+                    'primary_progress': f'the {op} result spreads across the whole bay',
+                    'secondary_progress': 'the staged material bundle drains to zero',
+                    'persistent_traces': ['screw heads', 'sawdust bands'],
+                    'preserve_state': 'the original shell remains unchanged',
+                    'stage_scope': 'large' if op != 'reward' else None,
+                    'outline_refs': refs, 'outline_delivery': delivery}
+            if op == 'reward':
+                beat['description'] = ('the occupant moves in and the stove lights the '
+                                       'finished room')
+            beats.append(beat)
+        return json.dumps(beats)
+
+    def _run(self, ladder_responses):
+        """ladder_responses 按规划器调用次序逐个返回,用尽后重复最后一个。"""
+        brief_json = json.dumps({
+            'carrier': 'abandoned steam-locomotive water tower', 'env': 'alpine mountainside',
+            'trauma': 'rusted and frost-cracked', 'destiny': 'snug winter refuge den',
+            'destiny_zh': '独居御寒暖阁', 'reward': 'firelight fills the finished room',
+            'mode': 'Standard', 'space_type': 'abandoned property',
+            'carrier_slug': 'steam-locomotive-water-tower',
+        })
+        packet_json = json.dumps({
+            'camera_dna': 'static tripod shot, ultra-wide lens', 'geometry_lock': 'fixed',
+            'primary_landmarks': [{'name': 'tower doorway', 'grid': 'Grid B2',
+                                   'z_depth_scale': '40%'}],
+            'frame_boundaries': {'left': 'B1', 'right': 'B3', 'top': 'A2', 'bottom': 'C2'},
+            'object_ledger': [], 'worker_choreography': 'one lone worker',
+            'lighting_phase_ladder': {str(i): 'ambient only' for i in range(1, 5)},
+            'passive_environment': 'still alpine air', 'interest_budget': {},
+        })
+
+        def fake_chat(config, system, user, **kwargs):
+            if 'scene analysis agent' in system:
+                return brief_json
+            if 'construction planner' in system:
+                self.planner_calls.append(user)
+                idx = min(len(self.planner_calls) - 1, len(ladder_responses) - 1)
+                return ladder_responses[idx]
+            if 'spatial consistency supervisor' in system:
+                return packet_json
+            if 'generate the very first IMAGE prompt' in system:
+                return 'A static wide shot of the derelict water tower, rusted and untouched.'
+            raise AssertionError(f'Unexpected _chat call: {system[:80]!r}')
+
+        with patch.object(pp, '_chat', side_effect=fake_chat):
+            return pp.compose_anchor_and_packet({}, self.dimensions)
+
+    # 三拍全部认领、工序类型对得上、复述齐全 —— 这版应当一次通过
+    CLEAN = [([1], ['haul out the slag and rust scale']),
+             ([2], ['stand the timber wall studs']),
+             ([3], ['light the stove as the occupant moves in'])]
+
+    def test_a_faithful_ladder_is_accepted_on_the_first_draft(self):
+        self._run([self._ladder(self.CLEAN)])
+        self.assertEqual(len(self.planner_calls), 1)
+
+    def test_a_dropped_card_entry_is_retried_instead_of_silently_accepted(self):
+        """第 2 条工序没有任何一拍认领 —— 改造前第 3 轮就会被当作"结构没问题"接受。"""
+        broken = self._ladder([([1], ['haul out the slag and rust scale']),
+                               ([], []),
+                               ([3], ['light the stove as the occupant moves in'])])
+        state = self._run([broken, broken, broken, self._ladder(self.CLEAN)])
+        # 四轮全部用满,而不是第 1、2 轮之后就放行
+        self.assertEqual(len(self.planner_calls), 4)
+        # 违规原文回喂给了规划器,它才有机会自愈
+        self.assertIn('架设内墙木龙骨', self.planner_calls[-1])
+        self.assertEqual([b.get('outline_refs') for b in state['beat_ladder']],
+                         [[1], [2], [3]])
+
+    def test_a_missing_english_restatement_also_blocks(self):
+        broken = self._ladder([([1], []),
+                               ([2], ['stand the timber wall studs']),
+                               ([3], ['light the stove as the occupant moves in'])])
+        self._run([broken, self._ladder(self.CLEAN)])
+        self.assertEqual(len(self.planner_calls), 2)
+        self.assertIn('outline_delivery', self.planner_calls[-1])
+
+    def test_exhausted_retries_keep_the_llm_ladder_not_the_deterministic_fallback(self):
+        """阻塞不等于掉进兜底梯子:兜底梯子跟这张卡毫无关系,比有瑕疵但认卡的梯子更糟。"""
+        broken = self._ladder([([1], ['haul out the slag and rust scale']),
+                               ([], []),
+                               ([3], ['light the stove as the occupant moves in'])])
+        state = self._run([broken])
+        self.assertEqual(len(self.planner_calls), 4)
+        # 采用的是最后一版 LLM 梯子(带 outline_refs),不是 deterministic_fallback_beat_ladder
+        self.assertEqual([b.get('outline_refs') for b in state['beat_ladder']],
+                         [[1], [], [3]])
+        self.assertEqual(state['beat_ladder'][0]['milestone_name'],
+                         'tower interior fully cleared')
+
+    def test_accepted_ladders_carry_the_card_text_onto_each_beat(self):
+        """规划到合成之间此前是断的:工序原文必须钉在拍上,下游提示词才看得到。"""
+        state = self._run([self._ladder(self.CLEAN)])
+        self.assertEqual(state['beat_ladder'][0]['outline_items'],
+                         [{'index': 1, 'text': '清运塔内积渣与锈屑',
+                           'delivery': 'haul out the slag and rust scale'}])
+        self.assertTrue(state['beat_ladder'][-1]['requires_occupant'])
 
 
 class TestComposeRemainingBeatsResume(unittest.TestCase):

@@ -2262,12 +2262,9 @@ function framesFeedHydrate(ideaId) {
     if (dot) dot.classList.toggle('active', !!rec.live);
 }
 
-// isIsolatedRetry：单帧/子集重试专用——这类调用只走 generate_frame_sequence
-// 直调路径，从不经过 pipeline_orchestrator 的整套序列一致性审查（那个审查只在
-// target_sequences=None 的整单编排流程里才会跑）。'pending_manual_review' 对
-// 整单流程而言是"审查还没轮到"，但对单帧重试而言这个审查压根不会来——用同一句
-// "将在整套序列渲染完毕后统一进行"会让人误以为还有后续动作（2026-07-20 用户
-// 实测反馈：全自动配置下这句话既不弹窗也等不到审查结果，怀疑是不是卡住了）。
+// 渲染期不做任何视觉判定（2026-08-05 起生成期一致性审查已整体移除），所以新渲的帧
+// 一律是 'pending_manual_review'。其余取值只会出现在旧 manifest 或手动一致性审查/
+// 人工标记的结果里。isIsolatedRetry 保留在签名上供调用方传参，两条路径现在文案一致。
 function framesFeedQualityLine(ideaId, f, isIsolatedRetry) {
     if (!f) return;
     const seq = String(f.sequence || 0).padStart(3, '0');
@@ -2289,11 +2286,7 @@ function framesFeedQualityLine(ideaId, f, isIsolatedRetry) {
     } else if (gate === 'sequence_reviewed_pass') {
         framesFeedLine(ideaId, `✅ IMG ${seq} 完成（一致性审查通过）`, 'ok');
     } else if (gate === 'pending_manual_review') {
-        if (isIsolatedRetry) {
-            framesFeedLine(ideaId, `✅ IMG ${seq} 完成（单帧重试不会触发整套序列一致性审查，如需要请自行确认画面）`, 'ok');
-        } else {
-            framesFeedLine(ideaId, `✅ IMG ${seq} 完成（一致性审查将在整套序列渲染完毕后统一进行）`, 'ok');
-        }
+        framesFeedLine(ideaId, `✅ IMG ${seq} 完成（渲染不做审查，如需复核请在帧网格点「一致性审查」）`, 'ok');
     } else {
         framesFeedLine(ideaId, `✅ IMG ${seq} 完成`, 'ok');
     }
@@ -2416,13 +2409,10 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                         framesFeedLine(ownerId, `🛑 ${type === 'manual_intervention_detected' ? '需要人工处理' : type === 'manual_intervention_cleared' ? '人工处理已完成，继续生成' : '人工处理等待超时'}：${data.reason}`,
                                        type === 'manual_intervention_cleared' ? undefined : 'warn');
                     }
-                } else if (type === 'anchor_inertia' || type === 'door_clearance' || type === 'raw_state') {
-                    // 换族锚点惯性卡死 / 门框清除兜底 / 过门帧原始度兜底：动态流留痕
-                    // （含自动 t2i 重渲、定向状态修正的播报）
+                } else if (type === 'anchor_inertia') {
+                    // 换族锚点惯性卡死（本地像素 MAD 判据，不是视觉审查）：动态流留痕
                     if (data && data.message) {
-                        const icon = type === 'anchor_inertia' ? '🧲' : type === 'door_clearance' ? '🚪' : '🕸️';
-                        framesFeedLine(ownerId, `${icon} ${data.message}`,
-                                       (type === 'anchor_inertia' || data.passed === false) ? 'warn' : undefined);
+                        framesFeedLine(ownerId, `🧲 ${data.message}`, 'warn');
                     }
                 } else if (type === 'account_switch') {
                     // 这一批换了号池账号（IP 全程不动，换 IP 已全局关停）。
@@ -2436,12 +2426,6 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                     // 标警示色，1K 单不吓人。manifest 里也记了 transport/actual_pixels。
                     if (data && data.message) {
                         framesFeedLine(ownerId, `🔀 ${data.message}`, data.degraded ? 'warn' : undefined);
-                    }
-                } else if (type === 'chain_drift_check' || type === 'anchor_recalibrated' || type === 'reanchor') {
-                    // 检查点现实同步/链回望/重锚定：动态流留痕
-                    if (data && data.message) {
-                        framesFeedLine(ownerId, `${type === 'reanchor' ? '⚓' : '🔭'} ${data.message}`,
-                                       (type === 'reanchor' || (type === 'chain_drift_check' && data.passed === false)) ? 'warn' : undefined);
                     }
                 } else if (type === 'sequence_review') {
                     setMeta((data && data.message) || '正在对整套序列做一致性审查...');

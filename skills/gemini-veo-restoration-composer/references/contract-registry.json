@@ -60,9 +60,10 @@
       "id": "anchor-frame-compliance",
       "level": "P0",
       "scope": "image",
-      "summary": "首帧锚点渲染后必须过合规判定，未过不得继续composing 后续槽位",
+      "summary": "首帧锚点渲染后必须复核，不合格不得继续 composing 后续槽位",
       "source": "SKILL.md#Staged Delivery Contract",
-      "enforcer": "prompt_pipeline:check_anchor_frame_compliance"
+      "enforcer": null,
+      "gap": "2026-08-05 起服务端渲染期不做任何视觉判定（check_anchor_frame_compliance 连同全部生成期一致性审查一并移除）。这条契约现在只由 agent 侧兑现：scripts/render_and_gate_anchor.py 渲出首帧后交给人看，agent 按 SKILL.md 的首帧复核清单口头核对。服务端无程序化执行者，登记于此以免被误当作已执行。"
     },
     {
       "id": "camera-contradiction",
@@ -175,7 +176,7 @@
       "summary": "分阶段交付：先只出 IMAGE 1 并过渲染验收门，通过后才允许写其余槽位",
       "source": "SKILL.md#Staged Delivery Contract",
       "enforcer": null,
-      "gap": "该契约约束的是 agent 侧的交付节奏（scripts/render_and_gate_anchor.py），本服务端合成链路不经过它——服务端是一次性合成全部槽位后逐帧渲染，由 anchor-frame-compliance 覆盖「首帧必须合规」这一半意图，但「未过门不得撰写后续提示词」这一半在服务端不适用。登记于此以免被误当作已执行。"
+      "gap": "该契约约束的是 agent 侧的交付节奏（scripts/render_and_gate_anchor.py），本服务端合成链路不经过它——服务端是一次性合成全部槽位后逐帧渲染。2026-08-05 起服务端连首帧合规判定也不再跑（见 anchor-frame-compliance 的 gap），这条契约整条都只在 agent 侧成立。登记于此以免被误当作已执行。"
     },
     {
       "id": "used-topic-ledger-dedup",

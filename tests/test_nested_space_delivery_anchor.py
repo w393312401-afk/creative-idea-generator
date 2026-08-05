@@ -650,45 +650,5 @@ class TestSecondSpaceHasItsOwnAnchors(unittest.TestCase):
         self.assertNotIn('secondary_interior_primary_landmarks', packet_system)
 
 
-class TestDeliveredCarrierAnchorGate(unittest.TestCase):
-    """渲染后的 Anchor 验收门禁必须换口径：空场地是正确答案，载体入镜才是失败。"""
-
-    def _gate_system(self, level, brief):
-        captured = {}
-
-        def _fake_multimodal(config, system, user, images):
-            captured['system'] = system
-            return 'PASS'
-
-        with patch.object(pp, 'qa_gate_level', return_value=level), \
-                patch.object(pp, '_multimodal_chat', side_effect=_fake_multimodal):
-            pp.check_anchor_frame_compliance({}, 'img.webp', 'prompt', {'camera_dna': 'x'}, brief)
-        return captured['system']
-
-    def setUp(self):
-        self.delivered = pp.apply_pacing_skeleton_to_brief(
-            {'carrier': 'shipping container', 'env': 'quarry floor', 'trauma': 'rusted'},
-            'nested_space_payoff')
-        self.ordinary = pp.apply_pacing_skeleton_to_brief(
-            {'carrier': 'glacier ice cave', 'env': 'alpine cliff', 'trauma': 'frost-cracked'},
-            'linear_milestone')
-
-    def test_strict_gate_fails_a_carrier_that_should_not_be_there_yet(self):
-        system = self._gate_system('strict', self.delivered)
-        self.assertIn('CARRIER MUST BE ABSENT', system)
-        self.assertIn('EMPTY, untouched site', system)
-
-    def test_lenient_gate_also_knows_the_carrier_is_not_due_yet(self):
-        system = self._gate_system('lenient', self.delivered)
-        self.assertIn('CARRIER ALREADY PRESENT', system)
-
-    def test_ordinary_projects_keep_judging_the_carrier_itself(self):
-        for level in ('strict', 'lenient'):
-            system = self._gate_system(level, self.ordinary)
-            self.assertNotIn('CARRIER MUST BE ABSENT', system)
-            self.assertNotIn('CARRIER ALREADY PRESENT', system)
-            self.assertIn('glacier ice cave', system)
-
-
 if __name__ == '__main__':
     unittest.main()

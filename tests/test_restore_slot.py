@@ -70,7 +70,6 @@ def project(tmp_path):
              'status': 'success', 'anchor_check': f'ok-{s}'}
             for s in (1, 2, 3)
         ],
-        'chain_drift': [{'family_anchor': 1, 'tail': 4, 'passed': True}],
         'merged_video': {'file': 'outputs/x/merged.mp4', 'status': 'success'},
     }
     with open(os.path.join(project_dir, 'manifest.json'), 'w', encoding='utf-8') as f:

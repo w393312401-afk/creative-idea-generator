@@ -212,9 +212,9 @@ class TestFrameProgressEvents(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_frame_start_events_are_emitted_with_no_per_frame_qa(self):
-        """逐帧 VLM 质检门已停用：渲染只发 frame_start/frame，不再发 frame_qa/frame_retry，
-        每帧落 manifest 的 quality_gate 都是 'pending_manual_review'（一致性审查移到
-        整套序列渲染完成后统一进行，见 pipeline_orchestrator._sequence_consistency_review）。"""
+        """渲染期不做任何视觉判定：只发 frame_start/frame，不发 frame_qa/frame_retry，
+        每帧落 manifest 的 quality_gate 都是 'pending_manual_review'。一致性审查只能由
+        用户手动触发（见 pipeline_orchestrator._sequence_consistency_review）。"""
         prompt_block = """图片 1:
 first frame prompt
 
@@ -241,7 +241,8 @@ visible construction change
 
         with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
-             patch('prompt_pipeline.run_vlm_qa_check', side_effect=AssertionError('per-frame QA gate should no longer be called')):
+             patch('prompt_pipeline._multimodal_chat',
+                   side_effect=AssertionError('rendering must never call a visual judge')):
             manifest = generate_frame_sequence(
                 {'coverReferencePath': self.cover},
                 'progress_contract',
@@ -1085,8 +1086,7 @@ bridge video
         config = dict(config, coverReferencePath=self.cover)
         with patch('frame_generator._generate_text_image') as text_image, \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
-             patch('frame_generator.detect_anchor_inertia', return_value=(True, 1.5)), \
-             patch('prompt_pipeline.check_door_clearance_frame', return_value=(True, 'PASS')):
+             patch('frame_generator.detect_anchor_inertia', return_value=(True, 1.5)):
             manifest = generate_frame_sequence(
                 config, 'inertia_quota_fallback', self._PROMPT_BLOCK,
                 on_progress=lambda stage, details: events.append((stage, details)))
@@ -1152,176 +1152,6 @@ class TestDecodeImageAspectCrop(unittest.TestCase):
                                   {'imageAspectRatio': 'auto'})
         with Image.open(target) as im:
             self.assertEqual(im.size, (128, 128))
-
-
-class TestDoorClearancePushTargeting(unittest.TestCase):
-    """P0 门框清除兜底重试必须把 VLM 判定的具体残留位置喂回控制指令，而不是重复
-    上一轮已经推不动的泛化 IMG2IMG_BRIDGE_CONTROL_PROMPT 措辞——不然模型对同一句
-    "再往前推"给出同样保守的结果（2026-07-16 岩湖贝壳单 img_005 连续两推、
-    每次原因都不同，画面仍残留门框，是这条真实复现）。"""
-
-    _PROMPT_BLOCK = """图片 1:
-exterior prompt
-
-图片 2:
-exterior prompt 2
-
-图片 3:
-interior prompt
-
-视频 1:
-ordinary video 1
-
-视频 2 [BRIDGE]:
-bridge video 2
-"""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.old_output_root = server_common.OUTPUT_ROOT
-        server_common.OUTPUT_ROOT = self.tmp
-        self.cover = _make_test_cover(self.tmp)
-
-    def tearDown(self):
-        server_common.OUTPUT_ROOT = self.old_output_root
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def test_retry_control_prompt_carries_the_reported_failure_location(self):
-        edit_calls = []
-        text_calls = []
-
-        def fake_text_image(config, prompt, target_path, *a, **kw):
-            text_calls.append({'prompt': prompt})
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            with open(target_path, 'wb') as f:
-                f.write(b'text')
-
-        def fake_image_edit(config, prompt, reference_path, target_path, control_prompt=None, *a, **kw):
-            edit_calls.append({'reference': reference_path, 'control_prompt': control_prompt})
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            with open(target_path, 'wb') as f:
-                f.write(b'edit')
-
-        dc_results = iter([
-            (False, 'FAIL: 画面左侧可见生锈门框边缘'),
-            (False, 'FAIL: 画面右下角残留门槛踏板'),
-            (False, 'FAIL: 门洞轮廓仍框住整个画面'),
-        ])
-
-        def fake_door_clearance(config, image_path):
-            return next(dc_results)
-
-        with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
-             patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
-             patch('prompt_pipeline.check_door_clearance_frame', side_effect=fake_door_clearance):
-            manifest = generate_frame_sequence({'coverReferencePath': self.cover}, 'door_push_targeting', self._PROMPT_BLOCK,
-                                                on_progress=lambda *a: None)
-
-        push_calls = [c for c in edit_calls if 'doorpush' in (c['reference'] or '')]
-        # The first extra push must be told exactly what the audit just found wrong on THIS
-        # frame, not a copy of the previous round's instruction.
-        self.assertEqual(len(push_calls), 2)
-        self.assertIn('画面左侧可见生锈门框边缘', push_calls[0]['control_prompt'])
-        self.assertNotIn('last correction attempt', push_calls[0]['control_prompt'])
-
-        # The final budgeted push also remains i2i; no frame-sequence t2i is allowed.
-        frame3_text_calls = [c for c in text_calls if c['prompt'] == 'interior prompt']
-        self.assertEqual(len(frame3_text_calls), 0)
-        self.assertEqual(len(push_calls), 2)
-
-        frame3 = next(f for f in manifest['frames'] if f['sequence'] == 3)
-        self.assertIn('门洞轮廓仍框住整个画面', frame3['vlm_qa_reason'])
-        self.assertTrue(frame3['reference'].endswith('img_002.webp'))
-
-
-
-class TestFirstInteriorRevealRawState(unittest.TestCase):
-    """过门帧原始度兜底（2026-07-26 用户实测："过门帧有人工痕迹、不够原始"）：门框
-    出画了不代表这一帧对了——i2i 进到室内后普遍渲成被布景过的样子。渲后对真实像素
-    判定，未通过则以该帧自身为参考做一次定向状态修正（镜头不动、只改内容），修完
-    仍不过只留痕，绝不拦渲染。"""
-
-    _PROMPT_BLOCK = """图片 1:
-exterior prompt
-
-图片 2:
-exterior prompt 2
-
-图片 3:
-interior prompt
-
-视频 1:
-ordinary video 1
-
-视频 2 [BRIDGE]:
-bridge video 2
-"""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.old_output_root = server_common.OUTPUT_ROOT
-        server_common.OUTPUT_ROOT = self.tmp
-        self.cover = _make_test_cover(self.tmp)
-
-    def tearDown(self):
-        server_common.OUTPUT_ROOT = self.old_output_root
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _run(self, title, raw_state_results):
-        edit_calls = []
-        events = []
-        results = iter(raw_state_results)
-
-        def fake_text_image(config, prompt, target_path, *a, **kw):
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            with open(target_path, 'wb') as f:
-                f.write(b'text')
-
-        def fake_image_edit(config, prompt, reference_path, target_path, control_prompt=None, *a, **kw):
-            edit_calls.append({'reference': reference_path, 'control_prompt': control_prompt})
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            with open(target_path, 'wb') as f:
-                f.write(b'edit')
-
-        with patch('frame_generator._generate_text_image', side_effect=fake_text_image), \
-             patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
-             patch('prompt_pipeline.check_door_clearance_frame', return_value=(True, 'PASS')), \
-             patch('prompt_pipeline.check_first_interior_reveal_raw_state',
-                   side_effect=lambda *a, **kw: next(results)):
-            manifest = generate_frame_sequence(
-                {'coverReferencePath': self.cover}, title, self._PROMPT_BLOCK,
-                on_progress=lambda stage, details: events.append((stage, details)))
-        return manifest, edit_calls, events
-
-    def test_touched_looking_frame_is_re_edited_with_the_reported_reason(self):
-        manifest, edit_calls, events = self._run(
-            'raw_state_fix',
-            [(False, 'FAIL: 地面被扫干净，角落码着整齐的木料'), (True, 'PASS')])
-
-        fix_calls = [c for c in edit_calls if 'rawstate' in (c['reference'] or '')]
-        self.assertEqual(len(fix_calls), 1)
-        # 泛化指令对已经渲成这样的模型没有纠正力：必须点名 VLM 报回来的具体问题
-        self.assertIn('地面被扫干净，角落码着整齐的木料', fix_calls[0]['control_prompt'])
-        self.assertIn('RAW STATE CORRECTION', fix_calls[0]['control_prompt'])
-        # 修完通过就不再留痕
-        frame3 = next(f for f in manifest['frames'] if f['sequence'] == 3)
-        self.assertIsNone(frame3['vlm_qa_reason'])
-        self.assertTrue(any(stage == 'raw_state' for stage, _ in events))
-
-    def test_still_touched_after_the_budgeted_fix_keeps_the_frame_and_records_it(self):
-        manifest, edit_calls, _ = self._run(
-            'raw_state_giveup',
-            [(False, 'FAIL: 墙面看着像刚粉刷过'), (False, 'FAIL: 墙面仍然太干净')])
-
-        self.assertEqual(len([c for c in edit_calls if 'rawstate' in (c['reference'] or '')]), 1)
-        frame3 = next(f for f in manifest['frames'] if f['sequence'] == 3)
-        self.assertIn('墙面仍然太干净', frame3['vlm_qa_reason'])
-        # 渲染不被拦下：这一帧照常落盘进 manifest
-        self.assertTrue(os.path.exists(po_frame_path('raw_state_giveup', 3)))
-
-    def test_passing_frame_is_left_alone(self):
-        _, edit_calls, _ = self._run('raw_state_pass', [(True, 'PASS')])
-        self.assertEqual([c for c in edit_calls if 'rawstate' in (c['reference'] or '')], [])
 
 
 if __name__ == '__main__':

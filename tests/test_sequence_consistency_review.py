@@ -1087,11 +1087,10 @@ class TestReviewVerdictInvalidation(_TmpProjectCase):
         for seq in (3, 4, 5):
             self.assertEqual(frames[seq]['quality_gate'], 'sequence_reviewed_pass')
 
-    def test_invalidation_also_drops_chain_drift_and_structured_issues(self):
+    def test_invalidation_also_drops_structured_issues(self):
         self._reviewed_manifest()
         with server_common.manifest_lock(self.project_dir):
             m = server_common.read_manifest(self.project_dir)
-            m['chain_drift'] = [{'family_anchor': 1, 'passed': True}]
             for f in m['frames']:
                 f['review_issues'] = [{'text': '旧问题', 'layer': 'local', 'beat': 1,
                                        'frames': [1, 2]}]
@@ -1101,7 +1100,6 @@ class TestReviewVerdictInvalidation(_TmpProjectCase):
         po.invalidate_stale_review_verdicts(self.project_dir)
 
         manifest = self._read_manifest()
-        self.assertNotIn('chain_drift', manifest)   # 链尾回望比的也是这些帧
         frames = {f['sequence']: f for f in manifest['frames']}
         self.assertNotIn('review_issues', frames[3])
 
@@ -2236,6 +2234,83 @@ class TestManualFlagSurvivesReview(_TmpProjectCase):
         target = next(f for f in manifest['frames'] if f['sequence'] == 2)
         self.assertEqual(target['manual_flag_prev_gate'], 'pending_manual_review')
         self.assertEqual(target['quality_gate'], 'manual_flagged')   # 人工标记本身还在
+
+
+class TestOutlineFrameAuditIsGrayOnly(_TmpProjectCase):
+    """卡片工序的**画面层**交付审查（2026-08-05 P2）。
+
+    工序原文靠 manifest 里的交付总账过河（审查是用户手动触发的独立入口，跟合成那次
+    运行不在同一个进程生命周期里）。灰度期这一层的判定只回写总账、只打日志：
+    failures / quality_gate 一个字都不许变——VLM 判"这条施工工序算不算完成"的尺度
+    还是未知量，误判率没摸清之前不能让它拦单。"""
+
+    LEDGER = [
+        {'index': 1, 'text': '清空洞内碎冰与积雪', 'delivery': 'shovel out the cave ice',
+         'claimed_beats': [1], 'frame_seqs': [2], 'plan_verdict': 'claimed',
+         'prompt_verdict': 'delivered', 'frame_verdict': 'unreviewed', 'note': ''},
+        {'index': 2, 'text': '铺设隐蔽水管与地暖', 'delivery': 'run the hidden pipe circuits',
+         'claimed_beats': [2], 'frame_seqs': [3], 'plan_verdict': 'claimed',
+         'prompt_verdict': 'delivered', 'frame_verdict': 'not_applicable',
+         'note': '隐蔽工序，封盖后不可见'},
+    ]
+
+    def setUp(self):
+        super().setUp()
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {
+            'frames': [{'sequence': s, 'quality_gate': 'pending_manual_review'}
+                       for s in (1, 2, 3)],
+            'outline_delivery_ledger': [dict(row) for row in self.LEDGER],
+        })
+
+    def _run(self, result):
+        seen = {}
+
+        def fake_check(config, prompt_block, frame_paths, **kw):
+            seen['outline_items'] = kw.get('outline_items')
+            return result
+
+        with patch.object(po, 'check_full_sequence_consistency', side_effect=fake_check):
+            po._sequence_consistency_review({}, self.TITLE, self.PROMPT_BLOCK, self.project_dir)
+        manifest = self._read_manifest()
+        return seen, manifest
+
+    def test_manifest_carries_outline_items_for_the_review_stage(self):
+        seen, _ = self._run(_review())
+        self.assertEqual(sorted(seen['outline_items']), ['1', '2'])
+        self.assertEqual([i['text'] for i in seen['outline_items']['1']],
+                         ['清空洞内碎冰与积雪'])
+
+    def test_a_project_without_a_ledger_passes_no_items(self):
+        """老单：连这个入参都不传，整条审查链路的调用形状与改造前逐字相同。"""
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)]})
+        seen, _ = self._run(_review())
+        self.assertIsNone(seen['outline_items'])
+
+    def test_frame_verdict_is_observed_but_never_flags_while_gray(self):
+        result = dict(_review(), outline_frame_verdicts={'1': 'missing', '2': 'missing'})
+        _, manifest = self._run(result)
+        rows = {r['index']: r for r in manifest['outline_delivery_ledger']}
+        self.assertEqual(rows[1]['frame_verdict'], 'missing')
+        # 隐蔽工序的确定性结论不被 VLM 的"看不见"覆盖
+        self.assertEqual(rows[2]['frame_verdict'], 'not_applicable')
+        # quality_gate 与没有总账时逐字相同：这一层判定绝不外溢
+        frames = {f['sequence']: f for f in manifest['frames']}
+        self.assertEqual([frames[s]['quality_gate'] for s in (1, 2, 3)],
+                         ['sequence_reviewed_pass'] * 3)
+        self.assertTrue(all(not f.get('review_issues') for f in manifest['frames']))
+
+    def test_persisting_the_ledger_creates_the_project_manifest_if_needed(self):
+        """合成收尾时项目目录往往还没建（封面/首帧才建），落盘必须自己兜住。"""
+        fresh = os.path.join(self.tmp, 'brand_new_project')
+        self.assertTrue(po.persist_outline_delivery_ledger(fresh, self.LEDGER, title='t'))
+        self.assertEqual(po._outline_items_for_review(fresh).keys(), {'1', '2'})
+        # 空账不落盘，也不建目录
+        empty = os.path.join(self.tmp, 'never_created')
+        self.assertFalse(po.persist_outline_delivery_ledger(empty, []))
+        self.assertFalse(os.path.exists(empty))
 
 
 if __name__ == '__main__':

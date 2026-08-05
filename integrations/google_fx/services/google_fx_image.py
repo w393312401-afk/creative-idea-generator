@@ -23,7 +23,7 @@ from ..models import ImageBatchRequest
 from ..utils.logger import log
 from ..utils.browser import random_sleep, clean_path, ensure_flow_workspace
 from ..utils.ui_helpers import inject_batch_image_observer
-from ..utils import account_binding, cancel_flag
+from ..utils import account_binding, cancel_flag, media_ledger
 
 # L1 DOM 原语
 from .google_fx_dom import _click_first_visible, _find_first_visible, _safe_press_escape
@@ -138,7 +138,87 @@ def _record_current_generation_failure(reason):
         return None
 
 
-def _open_image_flow_canvas(page, requested_project_url=None):
+def _flow_project_id(url):
+    """Return the ``/project/<id>`` segment of a Flow URL, or "" when route-less."""
+    match = re.search(r"/project/([^/?#]+)", str(url or ""))
+    return match.group(1).strip().lower() if match else ""
+
+
+def _canvas_media_tile_count(page):
+    """How many media tiles the canvas currently shows; -1 when unknown."""
+    try:
+        return int(page.evaluate("""() => {
+            let count = 0;
+            for (const tile of document.querySelectorAll('div[data-tile-id]')) {
+                if (tile.querySelector('img, video')) count += 1;
+            }
+            return count;
+        }"""))
+    except Exception:
+        return -1
+
+
+def _create_fresh_flow_canvas(page, stale_url=""):
+    """Open a brand-new canvas for a task that has not bound one yet.
+
+    2026-08-05 事故的第一现场。AdsPower 的浏览器跨任务不关，新任务连上来时页面
+    通常还停在**上一个任务**的 ``/fx/tools/flow/project/<id>`` 上。调用方拿不到
+    project_url（这是新任务的正常状态）时若沿用当前页面，就等于把新任务直接跑进
+    旧任务的画布：旧图在画布历史里，而抓图那边的全部基线都是实时 DOM 采样，看不见
+    视口外没挂载的历史 tile，于是历史图会被当成本次结果落盘。
+
+    所以这里只有一条路：回项目列表 → 新建项目 → **证明**拿到的确实不是原来那块。
+    证不出来就报错中止，绝不"先跑着看"——串进去的帧要靠人眼才看得出来。
+    """
+    stale_project = _flow_project_id(stale_url)
+    try:
+        page.goto(
+            "https://labs.google/fx/tools/flow",
+            timeout=60000,
+            wait_until="domcontentloaded",
+        )
+        random_sleep(1, 2)
+    except Exception as nav_err:
+        raise RuntimeError(f"Cannot open the Flow workspace: {nav_err}") from nav_err
+
+    if not ensure_flow_workspace(page, timeout_seconds=30):
+        raise RuntimeError(
+            "FLOW_CANVAS_UNAVAILABLE: 未能从当前页面进入 Google Flow 工作台"
+        )
+
+    created = _click_new_project_button(page)
+    if not created and _find_fx_prompt_input(page, announce=False) is None:
+        raise RuntimeError(
+            "FLOW_CANVAS_UNAVAILABLE: 无法为新任务创建可用的 Google Flow 画布"
+        )
+
+    current_url = str(getattr(page, "url", "") or "")
+    fresh_project = _flow_project_id(current_url)
+    if stale_project and fresh_project == stale_project:
+        raise RuntimeError(
+            "FLOW_CANVAS_UNAVAILABLE: 新建画布后仍停在上一个任务的项目 "
+            f"({stale_project[:8]}...)，已中止以免把历史帧混入本次任务"
+        )
+
+    if fresh_project:
+        log(f"🆕 已为本次任务新建 Flow 画布: {fresh_project[:8]}...", "GoogleFX")
+        return current_url
+
+    # 路由里没有 /project/ 的 Flow 变体无法用 URL 自证。改用画布本身作证：
+    # 全新项目必然是空的，还挂着媒体卡片就说明我们仍在历史画布上。
+    for _ in range(3):
+        tile_count = _canvas_media_tile_count(page)
+        if tile_count <= 0:
+            log("🆕 已为本次任务新建 Flow 画布（无项目路由，画布为空已确认）", "GoogleFX")
+            return None
+        random_sleep(1, 2)
+    raise RuntimeError(
+        "FLOW_CANVAS_UNAVAILABLE: 新建画布后画布上仍有历史媒体卡片，"
+        "无法确认已离开上一个任务的画布，已中止以免把历史帧混入本次任务"
+    )
+
+
+def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canvas=False):
     """Open a usable Flow image workspace and return its bindable project URL.
 
     Current Flow accounts can expose the generation workspace directly at
@@ -147,18 +227,32 @@ def _open_image_flow_canvas(page, requested_project_url=None):
     project-shaped URL made L2 click the landing-page ``New project`` control
     even though a fully usable workspace was already open, then reject the
     successful route-less workspace as a failed click.
+
+    ``require_fresh_canvas`` is what a task sets on its **first** batch: it has
+    no canvas of its own yet, so whatever the shared browser is showing must be
+    treated as another task's property, never adopted.  Later chunks of the same
+    task leave it False and keep reusing the canvas they established.
     """
     requested_project_url = str(requested_project_url or "").strip()
     target_url = requested_project_url or "https://labs.google/fx/tools/flow"
     current_url = str(getattr(page, "url", "") or "")
+
+    if require_fresh_canvas and not requested_project_url:
+        return _create_fresh_flow_canvas(page, stale_url=current_url)
+
     # AdsPower keeps the browser/page alive between chunks.  Reconnecting CDP
     # does not require navigating again when the requested workspace is already
     # open and its prompt editor is usable; avoiding goto preserves canvas state
     # and removes a repeated page-load timeout from every five-frame chunk.
     same_project = bool(requested_project_url and current_url == requested_project_url)
+    # ⚠️ "/fx/tools/flow" is a prefix of every project route, so this substring
+    # test used to accept the previous task's `/fx/tools/flow/project/<id>` as a
+    # "restored workspace" and bind it to the new task (2026-08-05 事故).  Only a
+    # route-less workspace may be adopted without an explicit request.
     restored_workspace = bool(
         not requested_project_url
         and "/fx/tools/flow" in current_url
+        and "/project/" not in current_url
     )
     if (same_project or restored_workspace) and _find_fx_prompt_input(page, announce=False) is not None:
         return current_url if "/project/" in current_url else None
@@ -203,6 +297,9 @@ def _open_image_flow_canvas(page, requested_project_url=None):
             f"⚠️ 已绑定 Flow 项目无法打开，准备回到项目列表新建画布: {nav_err}",
             "GoogleFX",
         )
+        # 绑定的项目打不开时，页面上剩下的那块画布不是"替代品"而是别人的东西
+        # （多半就是上一个任务的）。只能新建，且要能证明确实换了一块。
+        return _create_fresh_flow_canvas(page, stale_url=requested_project_url)
 
     workspace_ready = ensure_flow_workspace(page, timeout_seconds=30)
     if not workspace_ready and requested_project_url:
@@ -211,19 +308,7 @@ def _open_image_flow_canvas(page, requested_project_url=None):
             "本地参考图将在新画布重新上传",
             "GoogleFX",
         )
-        try:
-            page.goto(
-                "https://labs.google/fx/tools/flow",
-                timeout=60000,
-                wait_until="domcontentloaded",
-            )
-            random_sleep(1, 2)
-            workspace_ready = ensure_flow_workspace(page, timeout_seconds=30)
-        except Exception as recovery_err:
-            raise RuntimeError(
-                "FLOW_CANVAS_UNAVAILABLE: 已绑定项目失效，且无法返回 Flow 项目列表: "
-                f"{recovery_err}"
-            ) from recovery_err
+        return _create_fresh_flow_canvas(page, stale_url=requested_project_url)
 
     if not workspace_ready:
         raise RuntimeError(
@@ -365,16 +450,30 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                 ),
             )
 
+            require_fresh_canvas = bool(
+                getattr(req, "require_fresh_canvas", False)
+                and not getattr(req, "project_url", None)
+            )
             project_url = _open_image_flow_canvas(
-                page, getattr(req, "project_url", None)
+                page, getattr(req, "project_url", None),
+                require_fresh_canvas=require_fresh_canvas,
             )
 
             # 🛠️ 0. 新建/清理画布
             _has_ref_images = bool([r for r in (req.images or []) if r and os.path.exists(clean_path(str(r)))])
-            _prepare_fx_canvas(page, has_refs=_has_ref_images)
+            # 画布刚为本次任务新建出来时，绝不允许 _prepare_fx_canvas 的"优先打开最新
+            # 历史项目"兜底把我们送回上一个任务的画布。
+            _prepare_fx_canvas(
+                page, has_refs=_has_ref_images,
+                require_fresh_canvas=require_fresh_canvas,
+            )
             if project_url:
                 result["project_url"] = project_url
                 req.project_url = project_url
+            elif require_fresh_canvas:
+                # 无 /project/ 路由的 Flow 变体：画布已经新建好了，但没有 URL 可以带回去。
+                # 就地清掉这面旗，本请求后续的重试才会复用它，而不是每次重试都重开画布。
+                req.require_fresh_canvas = False
 
 
             # 🛠️ 2. 验证配置 (Image 模式)
@@ -1008,6 +1107,17 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     "GoogleFX")
                 return True
 
+            # 跨任务台账：本账号历史上已被下载消费掉的 media UUID 一律不再是"新结果"。
+            # 提交前那几条基线（panel/DOM/tile）全都是实时 DOM 采样，Flow 画布虚拟化
+            # 之后看不见视口外的历史 tile；本集合不碰 DOM，是唯一不受虚拟化影响的证据。
+            ledger_account_id = account_binding.resolve_account(
+                fallback=get_runtime_default_user_id()
+            )
+            consumed_media_uuids = media_ledger.consumed_uuids(ledger_account_id)
+            if consumed_media_uuids:
+                log(f"  📒 已加载账号 {ledger_account_id} 的历史媒体台账: "
+                    f"{len(consumed_media_uuids)} 条", "GoogleFX")
+
             for idx, prompt_text in enumerate(prompts):
                 _check_cancelled()
                 log(f"\n{'─'*40}", "GoogleFX")
@@ -1156,6 +1266,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                 pre_submit_media_uuids = (
                     set(_get_panel_uuids(page))
                     | prompt_reference_uuids
+                    | consumed_media_uuids
                     | {
                         str(value).lower()
                         for value in (getattr(req, "excluded_media_uuids", None) or [])
@@ -1225,6 +1336,15 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                             idx,
                         ):
                             break
+                    # 落盘且通过近重复校验之后才记账：只被捕获、没能落盘的 UUID 不算
+                    # 被消费，提前记进去会把同一次生成的重试结果误伤成"历史媒体"。
+                    consumed_uuid = _extract_media_uuid(img_url)
+                    if consumed_uuid:
+                        consumed_media_uuids.add(consumed_uuid)
+                        media_ledger.record_consumed(
+                            ledger_account_id, consumed_uuid,
+                            context=os.path.basename(local_path),
+                        )
                     local_paths.append(local_path)
                     all_result_urls.append(img_url)
                     log(f"✅ 第 {idx+1} 张图下载完成，准备处理下一张", "GoogleFX")
@@ -1359,6 +1479,11 @@ def _generate_images_batch_google_fx_unlocked(req: ImageBatchRequest):
                 switched = _switch_account_on_failure(force_switch=True, exclude=tried_accounts)
                 if switched:
                     tried_accounts.add(switched)
+                    # 项目 URL 是账号私有的：换号之后那条绑定必然打不开，留着只会让
+                    # 下一次尝试走"绑定项目失效"的兜底，而兜底若沿用页面上现成的画布
+                    # 就又回到了跨任务串图的老路。直接要求新账号开一块干净画布。
+                    req.project_url = None
+                    req.require_fresh_canvas = True
 
     log(f"❌ 图片生成在 {max_retries} 次尝试后全部失败。", "GoogleFX")
     return {

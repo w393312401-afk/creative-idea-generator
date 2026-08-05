@@ -98,7 +98,7 @@ Instructions:
 - VIDEO {i} CONCRETENESS (no abstractions): describe the SAME single lone worker every beat, reusing the exact costume from the packet worker_choreography (e.g. "one lone worker in a solid pale shirt, dark pants, and dark cap"); name the ONE specific manual tool used; describe the concrete repeated work cycle in -ing verbs (e.g. scooping, lifting, pressing, fastening). NEVER write vague filler like "transformation progresses" or "the scene transforms" — show observable physical actions only.
 - VIDEO {i} must end with a PERSISTENT-TRACES clause naming the marks this beat leaves behind (e.g. scrape grooves, end-grain circles, screw heads, nail rows, sawdust trails, trimmed edges, compression tracks), followed by a natural-language description of both the near-field diegetic sound effects (2-4 specific sounds of tools, materials, or footsteps) and the steady room/environment ambient noise. Use varied phrasing for these audio descriptions rather than a single formulaic structure.
 - IMAGE {i+1} must be a clean frame with ZERO workers/machinery. Do NOT use the words 'worker', 'builder', 'carpenter', 'laborer', 'person', 'man', 'woman', or 'people' under any circumstances, even to state that they are absent or not present. Describe only static objects, surfaces, and traces. {contract['anchor_rule']} Then describe this beat's state delta following its own STAGE SCOPE TIER (see the STAGE SCOPE FOR THIS BEAT instruction below). Also include a FEW (2-3, not exhaustive) PERSISTENT physical traces that prove the work happened (scrape marks, fastener heads, sawdust, membrane wrinkles, displaced soil, etc.).
-- {pp._milestone_beat_directive(beat, img_before=f"IMAGE {i}", img_after=f"IMAGE {i+1}") or 'This is a threshold/bridge/reward beat — follow its dedicated camera/reward rules instead of the ordinary milestone package contract.'}
+- {pp._milestone_beat_directive(beat, img_before=f"IMAGE {i}", img_after=f"IMAGE {i+1}") or (pp.outline_delivery_directive(beat) + 'This is a threshold/bridge/reward beat — follow its dedicated camera/reward rules instead of the ordinary milestone package contract.')}
   Prior MAJOR installed/finished features (panels, walls, floors, fixtures, primary landmarks) stay present and unchanged (monotonic state) — but you do NOT need to re-list every minor trace from every earlier beat; it is fine and expected for small cosmetic details to fade from the description as new ones accumulate.
 - REWARD BEAT TWO-PHASE STRUCTURE (only applies if this beat's operation is "reward" — the final beat): this clip is now the sequence's ONLY closing shot, so it must carry both jobs. Its first two thirds deliver the declared reward as ACTUAL PHYSICAL MOTION — the mechanism moving through its travel, the lights coming up, the occupant walking in and using the space — never a static hold on a finished room. Its final third settles into a held, slightly tightened framing on the signature anchor with no further action, and that settle IS the closing appreciation; no separate showcase clip follows it. Keep the whole space finished, styled, and free of workers, tools, materials, and construction activity throughout.
 - For threshold bridge beats (if beat is a threshold bridge), follow the TBCP rules: the ENTIRE exterior-to-interior crossing is ONE single beat (bridge_stage 1) — there is no separate hold/sill/vestibule/turn beat. Its VIDEO is the ONLY visible clip for the crossing, bound normally from the previous beat's IMAGE to this beat's own IMAGE, and must depict the full exterior-to-settle arc (plus, in the PAN variant, ending in a stationary pan locking onto the interior's long axis) in one continuous shot, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it. A DECLARED CUT-IN beat works the same way on the video side — its VIDEO is a real generated crossing clip, written as an ordinary video prompt bound from the previous beat's IMAGE to this beat's own IMAGE, except that the entry starts CLOSED and is pushed open on camera inside that clip (no peek, no anchor scale-up before it) — while its IMAGE re-establishes the interior from scratch per its anchor rule. The crossing clip enters an untouched ruin and stays that way for its whole length — nothing is cleaned, cleared, tidied, repaired, or installed while the camera moves, and no tool, ladder, scaffolding, tarp, work light, or stacked material appears in it; write it as one unbroken take at a steady speed (no cut, fade, dissolve, speed ramp, or freeze), and never call it a construction time-lapse. The cleanout of that mess is the NEXT beat.
@@ -341,6 +341,19 @@ Instructions:
                             print(f"[DIRECT] Beat {i} 图文内容回炉{'成功，已采用重写稿' if content_reworked else '未通过，保留原稿（仅留痕）'}")
                         style_errs = style_errs + content_errs
                         image_reworked = content_reworked if image_reworked is None else (image_reworked or content_reworked)
+                    # 卡片工序（节拍简介）在成片里的收口：这拍认领的工序必须真的写进 IMAGE
+                    # 回炉**之前**的缺失编号要先留一份，否则下面记总账时区分不出
+                    # "一次过"和"回炉后通过"（见 pp.record_outline_delivery）
+                    outline_missing_before = pp.outline_missing_indices(i_p, beat)
+                    outline_errs = pp.check_outline_delivery_realized(i_p, beat)
+                    if outline_errs:
+                        if sys.stdout:
+                            print(f"[DIRECT] Beat {i} 卡片工序未交付，定向回炉一轮: {outline_errs}")
+                        i_p, outline_reworked = pp.rework_missing_outline_delivery_beat(config, i, i_p, beat=beat)
+                        if sys.stdout:
+                            print(f"[DIRECT] Beat {i} 卡片工序回炉{'成功，已采用重写稿' if outline_reworked else '未通过，保留原稿（仅留痕）'}")
+                        style_errs = style_errs + outline_errs
+                        image_reworked = outline_reworked if image_reworked is None else (image_reworked or outline_reworked)
                     wording_errs = pp.check_stage_scope_wording(i_p, contract['stage_scope'])
                     if wording_errs:
                         if sys.stdout:
@@ -413,6 +426,10 @@ Instructions:
                     pp.record_beat_audit(config, i, structural, style_errs, reworked, image_reworked,
                                          milestone_name=beat.get('milestone_name'),
                                          residual=residual)
+                    # 同一批结论按**卡片工序**再记一份（_beat_audit 是按拍组织的，
+                    # 回答不了"卡片上第 3 条最后成没成"）——见 pp.record_outline_delivery
+                    pp.record_outline_delivery(config, i, i_p, beat,
+                                               missing_before=outline_missing_before)
 
                     vid_prompt = v_p
                     img_prompt = i_p
@@ -641,6 +658,18 @@ Instructions:
                         print(f"[DIRECT] Batch beat {i} 图文内容回炉{'成功，已采用重写稿' if content_reworked else '未通过，保留原稿（仅留痕）'}")
                     style_errs = style_errs + content_errs
                     image_reworked = content_reworked if image_reworked is None else (image_reworked or content_reworked)
+                # 卡片工序（节拍简介）在成片里的收口：这拍认领的工序必须真的写进 IMAGE
+                # 回炉前的缺失编号先留一份（见上面单拍路径的同款说明）
+                outline_missing_before = pp.outline_missing_indices(i_p, contract['beat'])
+                outline_errs = pp.check_outline_delivery_realized(i_p, contract['beat'])
+                if outline_errs:
+                    if sys.stdout:
+                        print(f"[DIRECT] Batch beat {i} 卡片工序未交付，定向回炉一轮: {outline_errs}")
+                    i_p, outline_reworked = pp.rework_missing_outline_delivery_beat(config, i, i_p, beat=contract['beat'])
+                    if sys.stdout:
+                        print(f"[DIRECT] Batch beat {i} 卡片工序回炉{'成功，已采用重写稿' if outline_reworked else '未通过，保留原稿（仅留痕）'}")
+                    style_errs = style_errs + outline_errs
+                    image_reworked = outline_reworked if image_reworked is None else (image_reworked or outline_reworked)
                 wording_errs = pp.check_stage_scope_wording(i_p, contract['stage_scope'])
                 if wording_errs:
                     if sys.stdout:
@@ -709,6 +738,8 @@ Instructions:
                     pp.record_beat_audit(config, i, structural, style_errs, reworked, image_reworked,
                                          milestone_name=contract['beat'].get('milestone_name'),
                                          residual=residual)
+                    pp.record_outline_delivery(config, i, i_p, contract['beat'],
+                                               missing_before=outline_missing_before)
                     vid_prompt, img_prompt, beat_succeeded = v_p, i_p, True
                     new_ledger_items = parsed_traces
                 elif sys.stdout:
@@ -800,6 +831,12 @@ Instructions:
             # slot that only exists in this one caller.
             formatted_videos[total_beats + 1]['meta'] = 'HERO'
             reassembled_prompts_block = pp._format_prompt_block(formatted_images, formatted_videos)
+
+        # 卡片工序交付总账：规划期的认领结果（_outline_contract）与合成期的逐条交付
+        # 结果（_outline_prompt_audit）在这里按**工序**汇成一张表，run 结束由 server.py
+        # 汇入 result。纯留痕重排索引，不参与任何判定（见 pp.build_outline_delivery_ledger）。
+        pp.stash_outline_delivery_ledger(config, beat_ladder,
+                                         skeleton=parsed_brief.get('pacing_skeleton'))
 
         skipped = config.get('_skipped_checks', 0) if isinstance(config, dict) else 0
         skipped_str = f"\n\n[WARNING] 本次跳过了 {skipped} 项校验。" if skipped > 0 else ""

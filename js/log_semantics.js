@@ -97,7 +97,7 @@
         {
             id: 'upstream-retry',
             severity: 'warn',
-            match: /upstream_retry|(?:外层)?尝试 \d+\/\d+ 失败|后重试|anchor_retry/,
+            match: /upstream_retry|(?:外层)?尝试 \d+\/\d+ 失败|后重试/,
             title: '上游调用失败，正在重试',
             hint: '单次请求没成功，系统会按次数上限自动重试；只有重试全用完才会真的中断。',
         },

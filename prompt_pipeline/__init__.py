@@ -1125,263 +1125,14 @@ def _judge_unavailable_verdict(config, gate_name, exc):
     return True, f"Skipped (API Error: {exc})"
 
 
-def _lenient_vlm_qa_system_prompt():
-    """qaGateLevel=lenient 的邻帧质检提示词：只有 4 类硬伤才 FAIL，其余（含镜头构图/
-    视角跳变、进度越界、因果痕迹、体积守恒、灯光电源链、临时工程增减）一律放行，
-    最多以 PASS_WITH_WARNINGS 留痕。"""
-    return (
-        "You are a LENIENT frame-by-frame visual quality auditor for time-lapse videos. "
-        "You are comparing Image 1 (IMAGE i) and Image 2 (IMAGE i+1), the start and end frames of a "
-        "video segment whose transition action is described by the VIDEO prompt. Only catastrophic, "
-        "unusable defects may FAIL; stylistic or continuity imperfections must NOT fail.\n\n"
-        "HARD FAILURES — respond FAIL only for these four:\n"
-        "H1. NO MEANINGFUL MILESTONE: the two images are identical/nearly identical, OR the only change is a tiny local patch or subtle cosmetic nudge that does not read as a completed named stage product at a glance.\n"
-        "H2. WRONG SCENE: Image 2 is clearly a DIFFERENT location or subject — not the same space/structure at all. "
-        "Camera angle, framing, zoom, crop, orientation, or composition changes do NOT count as a wrong scene "
-        "as long as it is recognizably the same place.\n"
-        "H3. PEOPLE/MACHINERY: a person, worker, or actively operating machine is visibly present in Image 2 "
-        "(it must be a clean static handoff frame).\n"
-        "H4. TEXT ARTIFACTS: Image 2 contains readable text, captions, watermarks, or UI glyphs rendered into the scene.\n\n"
-        "Everything else is at most a WARNING and must PASS, including (non-exhaustive): camera "
-        "viewpoint/perspective/composition shifts or re-framing; horizon or background layout drift; the visual "
-        "change differing from, exceeding, or falling short of the VIDEO prompt's described action; extra or "
-        "missing progress; missing physical traces of labor; material appearing or disappearing; lights turning "
-        "on or off; scaffolding or temporary works appearing or disappearing.\n\n"
-        "Response format:\n"
-        "- No hard failure and nothing notable: respond EXACTLY with: PASS\n"
-        "- No hard failure but a continuity issue is worth recording: respond with: "
-        "PASS_WITH_WARNINGS: <one short note in Chinese>\n"
-        "- A hard failure H1-H4 is present: respond with: FAIL: <reason in Chinese, at most 2 sentences, "
-        "name which hard failure>"
-    )
 
 
-def run_vlm_qa_check(config, img_i_path, img_ip1_path, video_prompt, is_bridge=False):
-    """
-    Compare generated IMAGE i and IMAGE i+1 with the transition VIDEO i prompt.
-    Returns (pass_boolean, reason_string). qaGateLevel: off=不跑直接放行(留 Skipped 痕),
-    lenient=只拦 4 类硬伤、软性瑕疵 WARN 放行, standard=原有全量严检。
-    """
-    level = qa_gate_level(config)
-    if level == 'off':
-        return _QA_OFF_VERDICT
-    try:
-        if level == 'lenient':
-            system_prompt = _lenient_vlm_qa_system_prompt()
-            user_text = f"VIDEO transition prompt:\n{video_prompt}\n\nPlease analyze the transition from Image 1 to Image 2."
-            response = _multimodal_chat(config, system_prompt, user_text, [img_i_path, img_ip1_path])
-            return _parse_gate_response(response.strip())
-        system_prompt = (
-            "You are a strict, professional frame-by-frame visual quality auditor (VLM) for time-lapse videos. "
-            "You are comparing Image 1 (IMAGE i) and Image 2 (IMAGE i+1) which represent the start and end frames "
-            "of a video segment. The transition action is described by the VIDEO prompt.\n\n"
-            "Your task is to detect the following flaws:\n"
-            "1. NO CHANGE: The two images are identical or almost identical, meaning the image editor failed to execute the change.\n"
-        )
-        if is_bridge:
-            system_prompt += (
-                "2. CAMERA viewpoint jumps: The camera is performing a bridge transition (entering/crossing the threshold), "
-                "so the perspective/camera position is ALLOWED and REQUIRED to move forward (closer view, crossing sill). "
-                "However, the horizontal level and general alignment must still be consistent with entering the same space. "
-                "Do not fail for perspective shifts that move forward along the viewpoint axis. "
-                "The interior landmarks visible through the opening must be the SAME objects in both frames and must "
-                "appear clearly LARGER in Image 2 than in Image 1 (the camera moved closer): fail if they hold the same "
-                "apparent size (fake digital zoom), shrink, or get swapped for different objects.\n"
-            )
-        else:
-            system_prompt += (
-                "2. CAMERA perspective/viewpoint jumps: The camera position, angle, or background layout shifted or jumped. The background structure must remain locked (same viewpoint, same horizon line level, same perspective).\n"
-            )
-        system_prompt += (
-            "3. ACTION mismatch: The visual change between Image 1 and Image 2 does NOT correspond to the action described in the VIDEO prompt.\n"
-            "4. CLEAN FRAME (Image 2 only): Image 2 is a static handoff anchor, not mid-action footage — it must contain "
-            "zero workers, people, or active machinery, even though the VIDEO prompt describes them acting during the "
-            "clip. Fail if any person or machine is visibly present in Image 2 itself.\n"
-            "5. BOUNDED PROGRESS: only the change described by the VIDEO prompt should be visible. Fail if areas or "
-            "systems NOT mentioned in the VIDEO prompt also changed (uninvited bonus progress), or if the change is "
-            "far more extensive than a single short labor beat could plausibly accomplish.\n"
-            "6. CAUSAL TRACE: the resulting state in Image 2 should carry at least some visible physical evidence "
-            "consistent with labor having happened (tool marks, seams, fasteners, residue, debris, drag marks, dust), "
-            "not a perfectly clean instantaneous swap with zero trace of how the change occurred.\n"
-            "7. NO TEXT ARTIFACTS: Image 2 must contain no readable text, captions, watermarks, or UI glyphs rendered "
-            "into the scene.\n"
-            "8. VOLUME CONSERVATION: if a large amount of material (rubble, debris, soil, cut-out pieces) disappears "
-            "between Image 1 and Image 2, the frames plus the VIDEO prompt must plausibly account for it — containers "
-            "of matching scale, repeated trips, a growing spoil pile, or an explicit carry-out. Fail if room-scale "
-            "material vanishes into one or two small hand containers, or a large cut-out solid piece simply evaporates.\n"
-            "9. POWER CHAIN: if a practical light, lamp, or powered fixture is lit in Image 2 but unlit or absent in "
-            "Image 1, the VIDEO prompt must describe that fixture being installed/connected and activated on camera. "
-            "Fail if a light simply turns on with no installation or wiring action described. (A portable battery work "
-            "light carried in by a worker is fine.)\n"
-            "10. TEMPORARY WORKS: scaffolding, formwork, shoring, or cribbing visible in Image 1 may disappear in "
-            "Image 2 ONLY if the VIDEO prompt describes a strike/removal action; silent disappearance is a fail. Their "
-            "continued static presence across frames is normal — never fail for that.\n\n"
-            "11. VISIBLE MILESTONE DELTA: for an ordinary construction clip, Image 2 must read immediately as the "
-            "completed stage product promised by the VIDEO prompt — a full named region, a complete declared component "
-            "count, or one coherent closeout package. Fail if the result is merely a small corner, a subtle texture tweak, "
-            "or partial/begun work whose stage identity is not obvious side by side. A coherent package is allowed when "
-            "all of its actions serve the same terminal product in the same zone.\n\n"
-            "Response format:\n"
-            "- If all checks pass, respond EXACTLY with: PASS\n"
-            "- Otherwise respond with: FAIL: <reason in Chinese, at most 2 sentences, name the single most important "
-            "failure only>"
-        )
-
-        user_text = f"VIDEO transition prompt:\n{video_prompt}\n\nPlease analyze the transition from Image 1 to Image 2."
-
-        response = _multimodal_chat(config, system_prompt, user_text, [img_i_path, img_ip1_path])
-        response_clean = response.strip()
-
-        if response_clean.upper() == "PASS" or response_clean.upper().startswith("PASS"):
-            return True, "PASS"
-        else:
-            return False, response_clean
-    except Exception as e:
-        return _judge_unavailable_verdict(config, 'VLM QA', e)
 
 
-def check_landmark_drift(config, anchor_image_path, current_image_path, anchor_is_first_frame=True):
-    """
-    Compares the current frame directly against the CURRENT shot family's anchor frame, not just
-    the immediately preceding frame. run_vlm_qa_check only ever compares adjacent pairs, so slow
-    multi-beat drift (a landmark creeping position/scale beat by beat, or an earlier repair
-    silently reverting several beats later) can pass every individual adjacent check while
-    still having drifted badly by frame N. This is the cross-frame backstop for that gap.
-
-    `anchor_image_path` is not always the project's true IMAGE 1: family_anchor_seq() substitutes
-    the interior-settled anchor once a [BRIDGE]-tagged threshold crossing has happened, since the
-    camera family legitimately changes there and IMAGE 1's exterior framing is no longer a
-    meaningful comparison. `anchor_is_first_frame` tells the VLM prompt which case it's looking
-    at, so it isn't given a false "this is the original establishing shot" premise for a frame
-    that is actually a settled interior anchor several beats in.
-    Returns (pass_boolean, reason_string).
-
-    qaGateLevel=off/lenient 时不执行：off 是全关；lenient 下这道跨帧复查本身就是
-    最容易产生"构图/视角漂移"误杀的门，宽松档整体停用（run_frame_qa_check 一般
-    已在上游跳过调用，这里再兜一层是给 server.py/测试等直接调用者的保护）。
-    """
-    level = qa_gate_level(config)
-    if level == 'off':
-        return _QA_OFF_VERDICT
-    if level == 'lenient':
-        return True, 'Skipped (qaGateLevel=lenient: 跨帧漂移复查已停用)'
-    try:
-        if anchor_is_first_frame:
-            anchor_desc = "Image 1 is the ORIGINAL first anchor frame of the whole project (IMAGE 1)"
-        else:
-            anchor_desc = (
-                "Image 1 is the settled ANCHOR frame for the CURRENT shot family -- not the project's "
-                "original first frame. It is the interior frame immediately after a threshold crossing, "
-                "where the camera legitimately switched position/lens/height from the earlier exterior "
-                "shots. Do not flag it for looking different from an earlier exterior establishing shot; "
-                "only check it against Image 2 as its own self-consistent baseline"
-            )
-        system_prompt = (
-            "You are a strict visual consistency auditor comparing two frames from the SAME "
-            f"static-camera restoration time-lapse project: {anchor_desc}; Image 2 is a LATER frame "
-            "from the same shot family, one or more beats downstream.\n\n"
-            "Both frames should share the exact same camera position, lens, height, angle, and background "
-            "structure — only the construction/renovation state in the active work area is expected to "
-            "change between them (that is normal and correct, do not flag it). Check specifically for DRIFT "
-            "and REGRESSION, not for expected construction progress:\n"
-            "1. LANDMARK DRIFT: any fixed structural landmark visible in Image 1 (walls, columns, window/door "
-            "openings, roofline, horizon line) that has silently shifted position, changed scale, or vanished "
-            "in Image 2 without an explicit demolition/removal reason.\n"
-            "2. CAMERA DRIFT: the viewpoint, height, angle, or horizon line level has crept away from Image 1's "
-            "framing.\n"
-            "3. STATE REGRESSION: any area, surface, or object that was already repaired/cleaned/installed at "
-            "some point in this project has reverted to a more damaged or unfinished state in Image 2.\n\n"
-            "TEMPORARY WORKS EXEMPTION: scaffolding, formwork, shoring, cribbing, protection sheets, and portable "
-            "work lights are staged site plant — appearing mid-project and being removed by later frames is normal "
-            "and must NOT be flagged as drift or regression.\n"
-            "Do NOT fail for expected construction progress in the active work zone, and do NOT fail merely "
-            "because the two images look different overall — only flag unexplained structural/camera drift or "
-            "a completed element that has un-happened.\n\n"
-            "Response format:\n"
-            "- If no drift or regression is detected, respond EXACTLY with: PASS\n"
-            "- Otherwise respond with: FAIL: <reason in Chinese, at most 2 sentences>"
-        )
-        user_text = (
-            ("Image 1 = the project's original IMAGE 1 anchor." if anchor_is_first_frame
-             else "Image 1 = the current shot family's settled anchor frame (not the project's original first frame).")
-            + " Image 2 = a later frame being checked for drift/regression against it."
-        )
-
-        response = _multimodal_chat(config, system_prompt, user_text, [anchor_image_path, current_image_path])
-        response_clean = response.strip()
-
-        if response_clean.upper() == "PASS" or response_clean.upper().startswith("PASS"):
-            return True, "PASS"
-        return False, response_clean
-    except Exception as e:
-        return _judge_unavailable_verdict(config, 'LANDMARK DRIFT QA', e)
 
 
-def run_chain_tail_drift_check(config, anchor_path, mid_path, tail_path,
-                                anchor_seq=1, mid_seq=None, tail_seq=None,
-                                anchor_is_first_frame=True):
-    """链尾回望检查：整条帧链渲染完成后，把同一镜头族的 锚点帧/链中帧/链尾帧 三张图
-    一次性交给 VLM 比对累积漂移。逐帧质检（run_vlm_qa_check/check_landmark_drift）只看
-    相邻对或"锚点 vs 单帧"，每步 3% 的缓慢偏移可以帧帧合格、链尾却已不是同一个空间——
-    这道检查专门看"链尾对链头"这一从未被比对过的组合。
 
-    检测型门：只产出判定 + 留痕，任何档位下都不拦截、不触发重渲（累积漂移没有廉价的
-    自动修复手段，重渲链尾单帧修不了整条链的偏移）。因此 qaGateLevel=lenient 时照跑——
-    lenient 停用 check_landmark_drift 是因为那道门失败会触发重渲误杀，这里没有该成本；
-    off 档跳过。Returns (passed, reason)，reason 兼容 PASS / 'WARN: ...' / FAIL 文本。"""
-    level = qa_gate_level(config)
-    if level == 'off':
-        return _QA_OFF_VERDICT
-    try:
-        if anchor_is_first_frame:
-            anchor_desc = "the ORIGINAL first anchor frame of the whole project (IMAGE 1)"
-        else:
-            anchor_desc = (
-                "the settled ANCHOR frame of the CURRENT shot family -- the interior frame right "
-                "after a threshold crossing, where the camera legitimately switched from the earlier "
-                "exterior framing. Judge the three frames only against each other, never against "
-                "any imagined earlier exterior shot"
-            )
-        seq_note = ""
-        if mid_seq and tail_seq:
-            seq_note = (f" In this project they are IMAGE {anchor_seq}, IMAGE {mid_seq} and "
-                        f"IMAGE {tail_seq} respectively.")
-        system_prompt = (
-            "You are a visual consistency auditor performing a FINAL whole-chain review for one "
-            "shot family of a static-camera restoration time-lapse. You are given THREE frames in "
-            f"time order: Image 1 is {anchor_desc}; Image 2 is a frame from the MIDDLE of the chain; "
-            f"Image 3 is the LAST frame of the chain.{seq_note}\n\n"
-            "Every adjacent pair of frames in this chain has already passed its own check. Your job "
-            "is to catch SLOW CUMULATIVE DRIFT that only becomes visible when the two ends of the "
-            "chain are compared directly:\n"
-            "1. CUMULATIVE LANDMARK DRIFT: a fixed structural landmark (wall, column, window/door "
-            "opening, roofline, horizon line) that has gradually shifted position, changed scale, or "
-            "vanished across the three frames without an explicit demolition/removal reason.\n"
-            "2. CUMULATIVE CAMERA DRIFT: the viewpoint, height, angle, lens, or horizon level has "
-            "crept away from Image 1's framing when Image 3 is compared against it directly.\n"
-            "3. IDENTITY BREAK: Image 3 no longer reads as the SAME physical space/structure as "
-            "Image 1 (proportions, layout, or the carrier itself have morphed into something else).\n\n"
-            "This is a renovation time-lapse: dramatic construction progress between the frames is "
-            "EXPECTED and must never be flagged — surfaces repaired, materials added or removed, "
-            "lighting changed, the space transformed from ruined to finished. Scaffolding and other "
-            "temporary works appearing/disappearing is normal staged site plant. Only flag structure "
-            "or camera that silently MOVED/MORPHED, not work that was performed.\n\n"
-            "Response format:\n"
-            "- No cumulative drift: respond EXACTLY with: PASS\n"
-            "- Minor drift worth recording but the chain is still usable: respond with: "
-            "PASS_WITH_WARNINGS: <one short note in Chinese>\n"
-            "- Clear cumulative drift or identity break: respond with: FAIL: <reason in Chinese, "
-            "at most 2 sentences, name which frame pair shows it>"
-        )
-        user_text = (
-            "Image 1 = chain anchor frame; Image 2 = mid-chain frame; Image 3 = chain tail frame. "
-            "Compare Image 3 (and Image 2) directly against Image 1 for cumulative drift."
-        )
-        response = _multimodal_chat(config, system_prompt, user_text,
-                                    [anchor_path, mid_path, tail_path])
-        return _parse_gate_response(response.strip())
-    except Exception as e:
-        return _judge_unavailable_verdict(config, 'CHAIN DRIFT QA', e)
+
 
 
 def run_video_process_check(config, start_frame_path, mid_frame_paths, end_frame_path, video_prompt):
@@ -1436,12 +1187,9 @@ def run_video_process_check(config, start_frame_path, mid_frame_paths, end_frame
 def family_anchor_seq(videos, seq):
     """Return the sequence number of the IMAGE that anchors the CURRENT shot family for `seq`:
     1 if no threshold crossing has happened yet before `seq`, or the interior-settled anchor
-    (the image right after the most recent [BRIDGE]-tagged video) once one has. Used so the
-    landmark-drift backstop (check_landmark_drift) compares interior frames against the interior
-    settled anchor instead of always against IMAGE 1's exterior family -- comparing across a
-    legitimate threshold crossing produces a false "camera position changed" drift failure on
-    every post-crossing frame, since the whole point of TBCP is that the camera family DOES
-    change there."""
+    (the image right after the most recent [BRIDGE]-tagged video) once one has. A shot family
+    must never be compared across a legitimate threshold crossing: the whole point of TBCP is
+    that the camera family DOES change there."""
     anchor = 1
     for v_idx in sorted(videos.keys()):
         if v_idx >= seq:
@@ -1455,26 +1203,6 @@ def family_anchor_seq(videos, seq):
     return anchor
 
 
-def resolve_family_anchor(config, videos, seq):
-    """重锚定感知的族锚解析：基础族锚来自 family_anchor_seq（BRIDGE 结构性换族）；
-    若本次运行的链中检查点对该族做过就地重锚定（检出累积漂移后把最新好帧立为新基线，
-    记在 config['_reanchors']，与 config['_skipped_checks'] 同款的请求内带内通道），
-    则位于 seq 之前最近的那次重锚定序号生效。漂移既成事实且无法廉价撤销时，继续拿
-    原始族锚当基线只会让后续每帧的漂移复查连环误杀——向前重定基线，让链条的后半段
-    自洽。seq 恰为重锚定帧本身时返回 seq（调用方按"该帧即族锚"处理，无可比对象）。"""
-    base = family_anchor_seq(videos, seq)
-    marks = config.get('_reanchors') if isinstance(config, dict) else None
-    if not marks:
-        return base
-    best = base
-    for r in marks:
-        try:
-            r = int(r)
-        except (TypeError, ValueError):
-            continue
-        if base <= r <= seq and family_anchor_seq(videos, r) == base:
-            best = max(best, r)
-    return best
 
 
 def prompt_slots_list(prompt_block):
@@ -1523,268 +1251,12 @@ def image_space_family(videos, seq):
     return 'exterior' if seq <= b1 else 'interior'
 
 
-def check_door_clearance_frame(config, image_path):
-    """P0 门框清除兜底判定（对真实像素）：单一过门拍产出的室内定格帧渲染出来后，
-    检查门框/门洞是否仍框在画面里。根因是 i2i 编辑模型拿着门框占满画面的上一张外部
-    参考帧时只做保守裁切——文字契约治标，这里对渲出的像素把关，未通过时调用方用
-    推进版控制指令以该帧为参考再推一步（frame_generator）。
-    返回 (passed, reason)。qaGateLevel=off 跳过；判定服务异常走统一 fail-open/closed 出口。"""
-    if qa_gate_level(config) == 'off':
-        return _QA_OFF_VERDICT
-    try:
-        system_prompt = (
-            "You are auditing ONE rendered frame from a restoration time-lapse. This frame is supposed "
-            "to be shot from FULLY INSIDE an enclosed space, with the entry doorway completely BEHIND "
-            "the camera.\n\n"
-            "FAIL if ANY of these is visible:\n"
-            "1. A door frame, door jamb, door leaf, or threshold/sill edge anywhere in the frame.\n"
-            "2. The interior seen THROUGH an opening: the opening's edges visible at or near the frame "
-            "borders, with the interior occupying only an inner region of the frame.\n"
-            "3. Large exterior or void margins surrounding a brighter/sharper inner rectangle (the "
-            "tell-tale 'still standing outside the door' composition).\n\n"
-            "PASS if the camera is unambiguously inside: interior walls, ceiling, and floor reach all "
-            "four frame edges with no doorway silhouette framing the view. A window, porthole, or other "
-            "opening ON a far wall (not surrounding the whole view) is fine and must NOT fail.\n\n"
-            "Response format (exactly one line):\n"
-            "- PASS\n"
-            "- FAIL: <一句中文原因，说明门框/门洞残留在画面哪个位置>"
-        )
-        response = _multimodal_chat(config, system_prompt, "Audit the attached frame.", [image_path])
-        return _parse_gate_response(response.strip())
-    except Exception as e:
-        return _judge_unavailable_verdict(config, 'DOOR CLEARANCE', e)
 
 
-def check_first_interior_reveal_raw_state(config, image_path):
-    """过门帧「原始度」判定（对真实像素，紧跟门框清除之后跑）：单一过门拍产出的室内
-    首现帧必须读起来和室外已建立的废墟同源——没人碰过、没人收拾过。文字契约
-    （_beat_contract 的 is_first_interior_reveal 条款）和事后文本校验
-    （check_first_interior_reveal_decay）都只能管到提示词，管不到 i2i 编辑模型真正
-    渲出来的东西：2026-07-26 用户实测反馈"过门帧有人工痕迹、不够原始"——渲出来的
-    室内地面干净、杂物码得整齐、像已经被布景过。这里对像素把关，未通过时调用方以
-    该帧为参考做一次定向"回退到未被触碰状态"的编辑（frame_generator）。
-    返回 (passed, reason)。qaGateLevel=off 跳过；判定服务异常走统一 fail-open/closed 出口。"""
-    if qa_gate_level(config) == 'off':
-        return _QA_OFF_VERDICT
-    try:
-        system_prompt = (
-            "You are auditing ONE rendered frame from a restoration time-lapse: the FIRST interior "
-            "shot right after the camera crossed the threshold. Nobody has entered or worked in this "
-            "space yet, so it must look like an untouched, long-abandoned find — the same severity of "
-            "decay already established outside.\n\n"
-            "FAIL if ANY of these is visible:\n"
-            "1. INTERVENTION EVIDENCE: tools, toolboxes, ladders, scaffolding, paint cans, buckets, "
-            "tarps, drop cloths, work lights, safety cones, or fresh/neatly stacked construction "
-            "materials anywhere in the frame.\n"
-            "2. ALREADY-TIDIED SPACE: a swept, cleared, or mopped floor; debris gathered into neat "
-            "piles or containers; objects arranged, aligned, or styled as if set-dressed for a photo.\n"
-            "3. ALREADY-RESTORED SURFACES: any patch that reads as newly repaired, re-clad, "
-            "re-plastered, or freshly painted rather than original weathered material.\n"
-            "4. TOO CLEAN OVERALL: fewer than TWO of these decay categories clearly visible — "
-            "(a) structural damage (cracks, sagging, holes, collapse, missing sections); (b) surface "
-            "decay (rust, water stains, peeling paint, mold, corrosion); (c) vegetation/biological "
-            "intrusion (moss, vines, roots, weeds); (d) debris/clutter accumulation lying where it "
-            "fell (rubble, fallen material, scattered wreckage, dirt drifts).\n\n"
-            "PASS if the interior reads as genuinely derelict and nobody-has-been-here-yet: dirt, "
-            "wreckage and decay distributed naturally where gravity and time left it. Do NOT fail a "
-            "frame merely for being dim, empty of furniture, or plainly built — only for the four "
-            "conditions above.\n\n"
-            "SCOPE — condition 3 and the decay count in condition 4 apply ONLY to surfaces nobody "
-            "has worked on. The exterior beats before this crossing may already have sealed the "
-            "roof, shell, or windows on camera; that element is the same physical element seen "
-            "from its other face here, so it correctly reads as CLOSED with a raw unfinished "
-            "inner face (bare decking, exposed rafters or ribs, fastener rows, unpainted new "
-            "material). Never fail a frame for that, and never demand the roof/wall be open to "
-            "the sky — a sealed element rendered open again is the opposite error.\n\n"
-            "Response format (exactly one line):\n"
-            "- PASS\n"
-            "- FAIL: <一句中文原因，点名画面里的人工痕迹/过于整洁之处，或缺哪类衰败痕迹>"
-        )
-        response = _multimodal_chat(config, system_prompt, "Audit the attached frame.", [image_path])
-        return _parse_gate_response(response.strip())
-    except Exception as e:
-        return _judge_unavailable_verdict(config, 'RAW STATE', e)
 
 
-def run_frame_qa_check(config, image_1_path, prev_path, target_path, video_prompt, seq, is_bridge=False, anchor_seq=None):
-    """
-    Combined per-frame QA for IMAGE `seq`: the existing adjacent-pair check (run_vlm_qa_check)
-    plus, for seq > 2, the cross-frame landmark-drift backstop (check_landmark_drift) against the
-    current shot family's anchor. Skips the drift check for seq <= 2 since the anchor IS the
-    adjacent frame there and the adjacent check already covers it.
-
-    `image_1_path` (despite the name, kept for backward compatibility) is whatever frame path the
-    caller resolved via family_anchor_seq() -- IMAGE 1 pre-crossing, or a later interior-settled
-    anchor post-crossing. `anchor_seq` should be the sequence number that path corresponds to, so
-    check_landmark_drift's VLM prompt can be told accurately whether it's looking at the project's
-    true first frame or a substituted family anchor; omit it (or pass 1) to preserve the old
-    "this is IMAGE 1" assumption. Returns (pass_boolean, reason_string).
-    """
-    passed, reason = run_vlm_qa_check(config, prev_path, target_path, video_prompt, is_bridge=is_bridge)
-    if not passed:
-        return passed, reason
-    # lenient/off 档不跑跨帧漂移复查：直接沿用邻帧结论（含 WARN/Skipped 标记），
-    # 避免把"邻帧真实 PASS"洗成漂移门的 Skipped 痕迹
-    if qa_gate_level(config) != 'standard':
-        return passed, reason
-    if seq > 2 and image_1_path and os.path.exists(image_1_path) and os.path.exists(target_path):
-        anchor_is_first_frame = anchor_seq is None or anchor_seq == 1
-        drift_passed, drift_reason = check_landmark_drift(config, image_1_path, target_path, anchor_is_first_frame=anchor_is_first_frame)
-        if not drift_passed:
-            return drift_passed, drift_reason
-        # 邻帧动作校验若是被跳过的放行（judge 异常 fail-open），合并结论必须保留
-        # Skipped 标记——否则漂移检查的真实 PASS 会把没跑过的动作校验洗成 auto_approved
-        if is_skipped_verdict(reason):
-            return True, reason
-        return drift_passed, drift_reason
-    return passed, reason
 
 
-def check_anchor_frame_compliance(config, image_path, image_1_prompt, packet, parsed_brief):
-    """
-    Autonomous Anchor Acceptance Gate for the rendered IMAGE 1 (the anchor every
-    subsequent frame visually chains from via image-to-image reference). Unlike
-    run_vlm_qa_check (which only compares two consecutive frames' MOTION), this checks
-    the single rendered image against the SKILL's static-frame rules and Genre DNA tone,
-    since IMAGE 1 never gets any other automated check today.
-    Returns (pass_boolean, reason_string). qaGateLevel: off=跳过；lenient=只拦
-    人物/机械、文字水印、与题材完全无关三类硬伤，损伤严重度/题材气质等降为 WARN 放行。
-    """
-    level = qa_gate_level(config)
-    if level == 'off':
-        return _QA_OFF_VERDICT
-    # 载体后到的项目（双空间重置兑现）：首帧按契约就是**没有载体**的空场地，载体在 Beat 1
-    # 被吊装进来。不给门禁换口径的话，它会拿 brief 里的载体去比对首帧，把完全正确的空场地
-    # 判成「与题材无关」/「壳体不够宏大」，逼着一直重画到画出载体为止——正好把我们要消除的
-    # 「第一帧就出现载体」重新逼回来。
-    _delivered = carrier_arrives_on_camera(parsed_brief)
-    _premise_carrier = (parsed_brief or {}).get('carrier', 'the carrier')
-    _premise_env = (parsed_brief or {}).get('env', 'its environment')
-    _premise_trauma = (parsed_brief or {}).get('trauma', 'a ruined state')
-    if _delivered:
-        _premise_line = (
-            f"the EMPTY, untouched site in \"{_premise_env}\" that will later receive "
-            f"\"{_premise_carrier}\". The carrier is delivered by machinery in the FIRST beat, so it must "
-            f"NOT be visible here — bare wild ground is the correct subject, and a frame that already "
-            f"contains the carrier (or the truck, trailer, or crane that brings it) is a FAILURE"
-        )
-        _tone_line = (
-            "The SITE should read as wild, raw and striking — an improbable place to drop a shelter "
-            "into — not a tidy prepared plot. Judge terrain neglect, erosion, weeds and loose natural "
-            "debris; do not expect structural damage and FAIL any concrete tunnel, bunker, ruin, building "
-            "or competing entrance added to manufacture damage"
-        )
-    else:
-        _premise_line = f"\"{_premise_carrier}\" in \"{_premise_env}\" in a ruined state (\"{_premise_trauma}\")"
-        _tone_line = (
-            "The shell should read as monumental, improbable, and visually striking — a raw, "
-            "wild-looking structure nobody would expect to be habitable — not a small, mundane, or "
-            "generic-looking space"
-        )
-    _lenient_damage_rule = (
-        "H5. RECEIVING-SITE NEGLECT: require readable erosion/slumped soil, encroaching vegetation, "
-        "or loose natural rubble, but DO NOT require structural or surface-damage categories because "
-        "no structure is allowed in this branch.\n\n"
-        if _delivered else
-        "H5. INSUFFICIENT DAMAGE (a lenient threshold, lower than the strict gate's): the scene must "
-        "show clearly visible damage from AT LEAST TWO of these four categories: (a) structural damage "
-        "— cracks, collapse, sagging, holes; (b) surface decay — rust, water stains, peeling paint, "
-        "mold; (c) vegetation intrusion — moss, vines, roots, weeds; (d) debris/clutter — rubble, "
-        "fallen materials, scattered trash. Mild severity within a present category still passes.\n\n"
-    )
-    _strict_damage_rule = (
-        "5. EMPTY RECEIVING SITE: do not apply a building-damage quota. Require pre-existing terrain "
-        "neglect such as irregular erosion/slumping, weeds and loose natural rubble. FAIL a perfect "
-        "circular excavation, prepared pad, concrete tunnel/bunker, ruin, building or competing entrance.\n"
-        if _delivered else
-        "5. GENUINE DAMAGE: require at least three independent categories simultaneously: structural "
-        "damage; surface decay; vegetation intrusion; debris/clutter accumulation.\n"
-    )
-    if level == 'lenient':
-        try:
-            system_prompt = (
-                "You are a LENIENT visual auditor for the FIRST anchor frame (IMAGE 1 / before-state) of a "
-                "restoration/renovation time-lapse. This is the BEFORE/trauma anchor every later frame "
-                "visually chains from, so its core premise — an untouched, genuinely damaged find — must "
-                "hold even under a lenient bar. FAIL only for these:\n"
-                "H1. PEOPLE/MACHINERY: any person, worker, or active machine visible in the image.\n"
-                "H2. TEXT ARTIFACTS: readable text, captions, watermarks, or UI glyphs rendered into the scene.\n"
-                "H3. TOTALLY OFF-PREMISE: the image has clearly nothing to do with this project's premise: "
-                f"{_premise_line} — e.g. a portrait, a product "
-                "photo, or an unrelated scene. A plausible but imperfect rendition of the premise must NOT fail.\n"
-                + (f"H3b. CARRIER ALREADY PRESENT: {_premise_carrier} (or any large vehicle, container, "
-                   "hull, fuselage, or shell that reads as it) is visible in the frame. It is delivered on "
-                   "camera in the first beat, so its presence here breaks the opening beat.\n"
-                   if _delivered else "")
-                + "H4. INTERVENTION EVIDENCE: any tool, ladder, scaffolding, paint can, tarp, staged/stacked fresh "
-                "construction material, work light, safety cone, or any surface/patch that reads as "
-                "already-repaired, already-cleaned, or already-painted. Nobody has touched this space yet.\n"
-                + _lenient_damage_rule +
-                "Everything else is at most a WARNING and must PASS, including: a mundane or less monumental "
-                "look, camera/landmark deviations from the declared packet, or damage present but on the "
-                "milder end of what a strict reviewer would want.\n\n"
-                "Response format:\n"
-                "- No hard failure and nothing notable: respond EXACTLY with: PASS\n"
-                "- No hard failure but something is worth recording: respond with: PASS_WITH_WARNINGS: <one short note in Chinese>\n"
-                "- Any hard failure above is present: respond with: FAIL: <reason in Chinese, at most 2 sentences>"
-            )
-            user_text = f"IMAGE 1 prompt that was used to generate this image:\n{image_1_prompt}\n\nPlease audit the attached image."
-            response = _multimodal_chat(config, system_prompt, user_text, [image_path])
-            return _parse_gate_response(response.strip())
-        except Exception as e:
-            return _judge_unavailable_verdict(config, 'ANCHOR QA', e)
-    try:
-        landmarks = packet.get('primary_landmarks') or []
-        landmarks_str = "; ".join(
-            f"{lm.get('name', '?')} at {lm.get('grid', '?')} (scale {lm.get('z_depth_scale', '?')})"
-            for lm in landmarks if isinstance(lm, dict)
-        ) or "(none declared)"
-
-        system_prompt = (
-            "You are a strict visual quality auditor for the FIRST anchor frame (IMAGE 1 / trauma state) "
-            "of a restoration/renovation time-lapse. Every later frame in this project will be generated "
-            "using this exact image as its visual reference, so this is the only checkpoint before the "
-            "whole downstream sequence commits to it. Check the attached image against ALL of the following:\n\n"
-            "1. CLEAN FRAME: the image must contain zero workers, people, or active machinery.\n"
-            "2. ZERO INTERVENTION EVIDENCE: this is the BEFORE/trauma anchor — nobody has touched this space "
-            "yet, not even briefly. The image must contain no tools, ladders, scaffolding, paint cans, tarps, "
-            "drop cloths, staged/stacked fresh construction materials, work lights, safety cones, or any patch "
-            "of surface that reads as already-repaired, already-cleaned, or already-painted. Every object and "
-            "surface visible must look like pre-existing neglect or decay that nobody has prepared for or begun "
-            "acting on. Fail this check if ANY object implies restoration work has already started or is staged "
-            "to start, even with zero people present.\n"
-            "3. CAMERA DNA: the shot should plausibly match this declared camera description: "
-            f"\"{packet.get('camera_dna', '(none declared)')}\". Flag only a clear mismatch (e.g. declared "
-            "eye-level static shot but the image is an aerial/drone view).\n"
-            "4. PRIMARY LANDMARKS: the packet declares these 3 landmarks across foreground/mid/background: "
-            f"{landmarks_str}. At least the general idea of these features should be visible somewhere in "
-            "the frame, roughly in their declared depth zone. Do not fail for minor position drift.\n"
-            + _strict_damage_rule +
-            "6. GENRE TONE (most important): this project's premise is "
-            f"{_premise_line}. {_tone_line}. Fail this "
-            "check if the image looks like an ordinary interior/exterior with none of that scale or wildness.\n"
-            + (f"6b. CARRIER MUST BE ABSENT: {_premise_carrier} is hauled in and set down by machinery in "
-               "the FIRST beat, so this anchor frame must show the bare receiving ground only. FAIL if the "
-               "carrier — or any large vehicle, container, hull, fuselage, cabin or shell that reads as it, "
-               "or the truck/trailer/crane delivering it — is visible anywhere in the frame.\n"
-               if _delivered else "")
-            + "7. NO TEXT ARTIFACTS: no readable text, captions, watermarks, or UI glyphs rendered into the scene.\n\n"
-            "Response format:\n"
-            "- If all checks pass, respond EXACTLY with: PASS\n"
-            "- Otherwise respond with: FAIL: <reason in Chinese, at most 2 sentences, name the single most "
-            "important failure only, and if it's check 2 or check 5, explicitly name the offending object(s) "
-            "or state which damage categories are missing>"
-        )
-        user_text = f"IMAGE 1 prompt that was used to generate this image:\n{image_1_prompt}\n\nPlease audit the attached image."
-
-        response = _multimodal_chat(config, system_prompt, user_text, [image_path])
-        response_clean = response.strip()
-
-        if response_clean.upper() == "PASS" or response_clean.upper().startswith("PASS"):
-            return True, "PASS"
-        return False, response_clean
-    except Exception as e:
-        return _judge_unavailable_verdict(config, 'ANCHOR QA', e)
 
 
 def classify_image_space_layer(config, image_path):
@@ -1841,66 +1313,6 @@ def cover_reference_is_same_layer(config, cover_path, declared_family):
     return True, layer, ''
 
 
-def check_family_anchor_compliance(config, image_path, image_prompt, family=None):
-    """镜头族锚帧的验收门（IMAGE 1 之外的每个 family anchor：过门/硬切之后重新立起来的
-    那一张）。
-
-    IMAGE 1 有 check_anchor_frame_compliance 守着，但**族锚帧此前完全没有任何检查**。
-    它和 IMAGE 1 一样是链头——后面整族的帧都以它为 i2i 参考逐帧串下去，它长错了，那一族
-    就整体长错。2026-08-02 事故里 IMG002/003 长成大巴而不是退役客机机身，就是族锚身份没
-    人验的直接后果。
-
-    只查三件"错了整族都完蛋"的事，其余一律放行（这不是画质评审）：
-      1. 空间层：正文写室内就必须是室内视角，写室外就必须是室外视角；
-      2. 主体身份：正文点名的载体/空间类型与画面里的是不是同一种东西；
-      3. 点名地标：Locked anchors 句里的地标至少能大致对上。
-
-    返回 (pass_boolean, reason_string)。qaGateLevel=off / 判定异常一律 fail-open。"""
-    if qa_gate_level(config) == 'off':
-        return _QA_OFF_VERDICT
-    if not image_prompt:
-        return True, 'PASS'
-    try:
-        stanza = extract_locked_anchor_stanza(image_prompt) or '(none declared)'
-        _family = (family or '').strip() or 'unspecified'
-        system_prompt = (
-            "You are a strict visual auditor for a SHOT-FAMILY ANCHOR frame of a restoration "
-            "time-lapse. Every later frame of this shot family is generated image-to-image from "
-            "THIS exact frame, so a wrong subject or a wrong viewpoint here silently rewrites the "
-            "whole family. You are given the prompt that was supposed to produce it.\n\n"
-            "Check ONLY these three, in order:\n"
-            "1. SPACE LAYER: the prompt declares a viewpoint layer (this beat's declared family is "
-            f"\"{_family}\"). An INTERIOR frame must be shot from inside an enclosed space; an "
-            "EXTERIOR frame must be shot outdoors with the structure/site seen from outside. A frame "
-            "that is plainly the other layer is a FAILURE.\n"
-            "2. SUBJECT IDENTITY: the specific carrier/space the prompt names (e.g. an aircraft "
-            "fuselage, a bus, a shipping container, a bare receiving pit) must be the thing actually "
-            "shown. A different kind of object that merely resembles it in silhouette is a FAILURE — "
-            "name what you actually see.\n"
-            f"3. NAMED ANCHORS: the declared locked anchors are: {stanza}. At least the general idea "
-            "of them should be findable in the frame. Minor position/scale drift is NOT a failure.\n\n"
-            "4. TRANSITION TOPOLOGY (when the prompt/meta declares a transition stage): entry detail "
-            "must show real leaf/cover, hinges, latch/gasket and first rung/tread; shaft/landing/turn "
-            "stages must preserve gravity and their interface; partial-first-look must keep the far "
-            "wall occluded; cross-divider stages must retain divider edge or primary-space return "
-            "light/shared rail. A bare hole, teleport to a full room, or premature full reveal FAILS.\n"
-            "5. MOTIVATED LIGHT AND ENVELOPE: a raw first-entry space may use entry daylight or a "
-            "portable lamp, but fixed ceiling lights may not glow unless the prompt says power/wiring/"
-            "fixtures were already installed. The visible room must plausibly fit inside the named "
-            "carrier shell. Clear violations FAIL.\n\n"
-            "Everything else — styling, damage-severity nuance, composition polish and small deviations "
-            "— must PASS.\n\n"
-            "Response format:\n"
-            "- All three hold: respond EXACTLY with: PASS\n"
-            "- Otherwise: FAIL: <reason in Chinese, at most 2 sentences, naming which of the three "
-            "failed and what is actually in the frame>"
-        )
-        user_text = (f"Prompt that was supposed to produce this shot-family anchor frame:\n"
-                     f"{image_prompt}\n\nPlease audit the attached image.")
-        response = _multimodal_chat(config, system_prompt, user_text, [image_path])
-        return _parse_gate_response(response.strip())
-    except Exception as e:
-        return _judge_unavailable_verdict(config, 'FAMILY ANCHOR QA', e)
 
 
 def refine_packet_from_accepted_anchor(config, image_path, packet, parsed_brief=None):
@@ -2384,6 +1796,16 @@ def normalize_beat_ladder(beat_ladder):
                 except (ValueError, TypeError):
                     continue
             beat['outline_refs'] = out
+        # outline_delivery（每条认领工序的英文复述，见 outline_binding_violations）：
+        # 字符串列表。**位置与 outline_refs 一一对应**，所以非法项必须原地留空而不是
+        # 丢弃——丢一项会让后面所有复述整体前移，配到别的工序上去。
+        if 'outline_delivery' in beat:
+            delivery = beat['outline_delivery']
+            if delivery is not None and not isinstance(delivery, list):
+                delivery = [delivery]
+            beat['outline_delivery'] = [_flatten_to_text(d).strip() if not isinstance(d, str)
+                                        else d.strip()
+                                        for d in (delivery or [])]
         # anchor_transitions（锚点生命周期，见 anchor_lifecycle）：dict 列表，形状不对
         # 的条目丢弃（_declared_anchor_transitions 还会再做一次语义校验）。
         at = beat.get('anchor_transitions')
@@ -4478,8 +3900,8 @@ def packet_for_space(packet, space):
 #     锚点还要求原始舷窗在位。
 # 锚点与工序直接对撞，模型只能二选一 → 左墙窗带与舷窗打架、右墙反复变形。
 #
-# 既有的滚动校准（recalibrate_anchor_stanza）只改**百分比**（30%→15%、65%→20%），
-# 不改**身份**——它默认锚点还在，只是位置偏了。所以这里补的是身份维度：
+# 锚点句此前只在**百分比**维度被维护（30%→15%、65%→20%），不管**身份**——默认锚点
+# 还在，只是位置偏了。所以这里补的是身份维度：
 #   alive → transformed_into(继任锚) → retired
 # 覆盖锚点的那一拍之后，肋条自动 retire；改造锚点的那一拍之后，舷窗自动换绑成
 # 「连续侧向采光带」。
@@ -5337,31 +4759,8 @@ def fix_found_carrier_scale_lock(prompt, packet, family='exterior'):
     return (body.rstrip() + ' ' + ' '.join(locks)).strip()
 
 
-def extract_locked_anchor_stanza(prompt):
-    """从提示词中取出锁定锚点句（fix_primary_landmarks 规范化后的单一句）。
-    没有则返回 None。同族所有提示词经过合成期的规范化后携带完全相同的这一句，
-    这是滚动现实校准能用整句替换做确定性手术的前提。"""
-    for s in re.split(r'(?<=[.!?])\s+', prompt or ''):
-        if _LOCKED_ANCHOR_STANZA_PATTERN.match(s):
-            return s.strip()
-    return None
 
 
-def replace_locked_anchor_stanza(prompt, new_stanza):
-    """把提示词中的锁定锚点句整句替换为 new_stanza（多余的重复句一并吸收）。
-    返回 (new_prompt, replaced)；没有锚点句时原样返回 (prompt, False)。"""
-    sentences = re.split(r'(?<=[.!?])\s+', prompt or '')
-    out, replaced = [], False
-    for s in sentences:
-        if _LOCKED_ANCHOR_STANZA_PATTERN.match(s):
-            if not replaced:
-                out.append(new_stanza)
-                replaced = True
-            continue
-        out.append(s)
-    if not replaced:
-        return prompt, False
-    return ' '.join(x for x in out if x).strip(), True
 
 
 # 锚点名之后的位置/占比尾巴。新散文形态与旧记号形态都要能切，否则跨版本的存档
@@ -5399,83 +4798,6 @@ def _stanza_anchor_names(stanza):
     return names
 
 
-def recalibrate_anchor_stanza(config, frame_path, current_stanza):
-    """滚动现实校准的 VLM 步：对照最新真实渲染帧，核对锁定锚点句里每个地标的
-    Grid 格位与画幅占比。合成期的锚点句写在 packet 的预想值上（首帧那次
-    refine_packet_from_accepted_anchor 之后就再没对过账），链条越往后，声明与
-    现实的差距越大——图像模型每帧都被要求执行一个和参考图矛盾的构图，是缓慢
-    漂移的持续推手。
-
-    返回修正后的规范锚点句字符串；以下情况一律返回 None（调用方跳过本次校准）：
-    与现实一致（模型答 UNCHANGED）、输出不合规范格式、锚点名称集合被改动、
-    判定服务异常、qaGateLevel=off。这是 grounding 增强不是门禁，永远 fail-open。"""
-    if qa_gate_level(config) == 'off':
-        return None
-    if not current_stanza:
-        return None
-    try:
-        system_prompt = (
-            "You are a spatial consistency supervisor for a static-camera restoration time-lapse. "
-            "You are given the DECLARED locked-anchor sentence used by all remaining prompts of the "
-            "current shot family, and the LATEST actually rendered frame of the chain. The sentence "
-            "declares, for each fixed structural landmark: its name, its position on screen written "
-            "as prose ('along the mid-left of the frame', 'across the upper centre of the frame', "
-            "'at the centre of the frame', ...), and optionally the share of total frame height it "
-            "occupies, also as prose ('rising to about two thirds of the frame height').\n\n"
-            "Compare each declared position and height share against where that landmark ACTUALLY "
-            "sits in the attached frame. Rules:\n"
-            "1. Keep the SAME landmarks, the SAME names verbatim, in the SAME order. Never add, "
-            "remove, rename, or reorder landmarks — even if one is hard to see, keep its entry and "
-            "your best estimate.\n"
-            "2. Only correct positions and height shares that clearly disagree with the frame. "
-            "Small, debatable differences do not count — correct only clear mismatches (the landmark "
-            "is plainly in a different third of the frame, or plainly a different size band).\n"
-            "3. NEVER write a grid label ('Grid B2', 'cell A1') and NEVER write a numeral or a "
-            "percentage anywhere in your answer. Both are rendered into the frame as literal text by "
-            "the image model. Use only the prose vocabulary shown above.\n"
-            "   Positions: 'in the upper left / across the upper centre / in the upper right / along "
-            "the mid-left / at the centre / along the mid-right / in the lower left / across the "
-            "lower centre / in the lower right of the frame'.\n"
-            "   Height shares: 'a narrow band / about a sixth / about a quarter / about a third / "
-            "about two fifths / about half / about three fifths / about two thirds / about three "
-            "quarters / most / nearly the full ... of the frame height'.\n"
-            "4. Output EXACTLY ONE sentence in EXACTLY the same format, starting with "
-            "'Locked anchors: ' and ending with a period, anchors separated by semicolons. No "
-            "explanations, no markdown, no quotes.\n"
-            "5. If every declared position and share already matches the frame, respond EXACTLY "
-            "with: UNCHANGED"
-        )
-        user_text = (f"Declared locked-anchor sentence:\n{current_stanza}\n\n"
-                     "Compare it against the attached latest rendered frame and respond per the rules.")
-        response = _multimodal_chat(config, system_prompt, user_text, [frame_path]).strip()
-        if response.upper().startswith('UNCHANGED'):
-            return None
-        new_stanza = ' '.join(response.split())
-        # 规范性校验：不合格式宁可放弃本次校准，也不能把自由发挥写进链条剩余提示词
-        if not new_stanza.lower().startswith('locked anchors:'):
-            return None
-        if '%' in new_stanza or not new_stanza.endswith('.'):
-            return None
-        if re.search(r'\.\s+\S', new_stanza):  # 必须是单句
-            return None
-        # 记号守卫：这句会被写进链条剩余每一帧的提示词，放进一个 'Grid B2' 或一个数字，
-        # 等于把文字水印批量注入后半条链。判定模型偶尔会退回旧格式，这里直接弃用本次校准
-        # （fail-open，锚点句保持原样）而不是修补它。
-        if re.search(r'\bgrid\s+[A-Za-z]\s*\d\b|\bcell\s+[A-Za-z]\d\b|\d', new_stanza, re.IGNORECASE):
-            if sys.stdout:
-                print("[ANCHOR RECALIBRATE] 返回值含网格记号或数字，弃用本次校准")
-            return None
-        old_names = _stanza_anchor_names(current_stanza)
-        low = new_stanza.lower()
-        if old_names and not all(n in low for n in old_names):
-            return None
-        if new_stanza == current_stanza:
-            return None
-        return new_stanza
-    except Exception as e:
-        if sys.stdout:
-            print(f"[ANCHOR RECALIBRATE] failed, skipping this checkpoint: {e}")
-        return None
 
 
 def _local_trim_to_budget(prompt, target_max_words):
@@ -5717,7 +5039,7 @@ def check_occupant_delivered(image_prompt, video_prompt, beat):
     if not _OCCUPANT_PROMPT_RE.search(image_prompt or ''):
         errors.append(
             "REWARD IMAGE must show the occupant living in the finished space — this project's "
-            "draft plan delivers people moving in, so the frame is not allowed to be empty of them")
+            "card work plan delivers people moving in, so the frame is not allowed to be empty of them")
     if not _OCCUPANT_PROMPT_RE.search(video_prompt or ''):
         errors.append(
             "REWARD VIDEO must show the occupant entering and using the finished space — "
@@ -6651,6 +5973,7 @@ def reverify_beat_repairs(i, video_prompt, image_prompt, beat, parsed_traces=Non
     residual += check_milestone_video_prompt(video_prompt, beat)
     residual += check_milestone_image_prompt(image_prompt, beat)
     residual += check_image_realizes_traces(image_prompt, parsed_traces)
+    residual += check_outline_delivery_realized(image_prompt, beat)
     residual += check_stage_scope_wording(image_prompt, stage_scope)
     residual += check_signature_anchor_realized(image_prompt, beat)
     residual += check_image_decay_placeholder(image_prompt)
@@ -7212,6 +6535,161 @@ def rework_missing_content_image_beat(config, i, image_prompt, new_ledger_items,
     except Exception as e:
         if sys.stdout:
             print(f"[DIRECT] Beat {i} 缺失内容回炉调用失败（保留原文）: {e}")
+        return image_prompt, False
+
+
+def _missing_outline_items(image_prompt, beat):
+    """这一拍认领的卡片工序里，英文复述与 IMAGE 正文**零关键词交集**的那几条。
+
+    与 _missing_trace_items 同一套宽松匹配（命中一个实义词就不算缺失）：复述是规划
+    阶段写的，合成阶段换个说法很正常（"pine floorboards" → "planed pine boards"），
+    逐字比对必然假阳性。只抓 100% 没提的那种——也正是"用户在卡片上挑中的工序，成片
+    里一点痕迹都没有"这个原始事故的形态。
+
+    只用英文复述、不用中文原文匹配：IMAGE 正文恒为英文，拿中文去 in 判断永远不命中，
+    会把每一拍都判成缺失。复述缺席（老梯子/规划器没写）时这一条自动跳过。"""
+    if not image_prompt:
+        return []
+    low = image_prompt.lower()
+    missing = []
+    for item in beat_outline_items(beat):
+        words = _trace_name_keywords(item.get('delivery'))
+        if words and not any(w in low for w in words):
+            missing.append(item)
+    return missing
+
+
+def check_outline_delivery_realized(image_prompt, beat):
+    """卡片工序在成片提示词里的收口校验（2026-08-05，节拍简介升级为硬规则）。
+
+    规划侧的 outline_refs 只保证"某一拍认领了这条工序"，认领之后交付什么完全没人管
+    ——认领第 3 条却写别的工作，在覆盖率契约里是满分。这道校验把链条接到底：这拍
+    自己声明要交付的卡片工序，它的 IMAGE 正文里必须找得到。
+
+    过门/桥接/硬切拍跳过：它们按契约本就不认领工序（认领了也是过渡语义，不是实物
+    交付）。reward 拍**不跳过**——"点亮壁炉，人物入住"这类恰恰是用户最在意的一条。"""
+    if not isinstance(beat, dict) or beat.get('bridge_stage') or beat.get('hard_cut') \
+            or str(beat.get('operation') or '') == 'threshold':
+        return []
+    missing = _missing_outline_items(image_prompt, beat)
+    if not missing:
+        return []
+    names = '; '.join(f'"{m["text"]}" ({m.get("delivery")})' for m in missing)
+    return [
+        f"This beat's own claimed card work item(s) ({names}) never appear anywhere in the IMAGE "
+        f"prompt text. The user picked this creative by reading exactly these construction stages, "
+        f"and this beat declared it delivers them — the resulting IMAGE must visibly show them "
+        f"completed and name them. Rewrite the state-delta sentence(s) to do that."
+    ]
+
+
+def outline_missing_indices(image_prompt, beat):
+    """这一拍认领的工序里，IMAGE 正文完全没提的那几条的**编号**。
+
+    口径与 check_outline_delivery_realized 逐字一致（同一个 _missing_outline_items，
+    同一套过门/桥接/硬切跳过），区别只在返回编号而不是给模型看的英文错误串——
+    交付总账要按工序索引，拿错误串反查编号只会在措辞一变时静默错位。"""
+    if not isinstance(beat, dict) or beat.get('bridge_stage') or beat.get('hard_cut') \
+            or str(beat.get('operation') or '') == 'threshold':
+        return []
+    out = set()
+    for item in _missing_outline_items(image_prompt, beat):
+        try:
+            out.add(int(item.get('index')))
+        except (TypeError, ValueError):
+            continue
+    return sorted(out)
+
+
+def record_outline_delivery(config, beat_index, image_prompt, beat, missing_before=None):
+    """按**卡片工序编号**记一份合成期交付结果 → config['_outline_prompt_audit']。
+
+    交付结论本身早就有（check_outline_delivery_realized + 那一轮定向回炉），但它只
+    进 style_errs / _beat_audit——那两处都是按**拍**组织的回炉流水，回答不了"卡片上
+    第 3 条工序最后成没成"。这里不新增任何判定，只是把同一批结论按工序重新记一份，
+    供 build_outline_delivery_ledger 拼总账。
+
+    形状 {工序号: {拍号: verdict}}（键一律字符串，落盘往返后不变形）：
+      · delivered —— 一次过，IMAGE 正文里找得到；
+      · reworked  —— 首轮没写、定向回炉后写进去了；
+      · missing   —— 回炉之后正文里仍然找不到；
+      · skipped   —— 过门/桥接/硬切拍，按契约本就不做实物交付。
+    按拍分桶而不是每条工序一个值：一条工序可能被拆到两拍（split），两拍各自的结论
+    都要留着，聚合成一行的事交给总账（见 _worst_prompt_verdict）。
+
+    missing_before = 回炉**之前**那一轮的缺失编号（调用方在回炉前用
+    outline_missing_indices 取），没有它就区分不出"一次过"和"回炉后通过"。"""
+    if not isinstance(config, dict) or not isinstance(beat, dict):
+        return
+    items = beat_outline_items(beat)
+    if not items:
+        return
+    skipped = bool(beat.get('bridge_stage') or beat.get('hard_cut')
+                   or str(beat.get('operation') or '') == 'threshold')
+    before = {int(n) for n in (missing_before or [])}
+    after = set() if skipped else set(outline_missing_indices(image_prompt, beat))
+    audit = config.setdefault('_outline_prompt_audit', {})
+    for item in items:
+        try:
+            n = int(item.get('index'))
+        except (TypeError, ValueError):
+            continue
+        if skipped:
+            verdict = 'skipped'
+        elif n in after:
+            verdict = 'missing'
+        elif n in before:
+            verdict = 'reworked'
+        else:
+            verdict = 'delivered'
+        audit.setdefault(str(n), {})[str(beat_index)] = verdict
+
+
+def rework_missing_outline_delivery_beat(config, i, image_prompt, beat=None):
+    """单轮定向回炉：这拍认领的卡片工序在 IMAGE 正文里完全没交付时把它写回去。
+
+    契约与 rework_missing_content_image_beat 完全一致（相机/几何/锁定锚点句逐字保留，
+    只重写状态增量句），区别只在喂进去的缺失清单来自卡片工序而不是 TRACES。
+    返回 (image_prompt, adopted)。"""
+    missing = _missing_outline_items(image_prompt, beat)
+    if not missing:
+        return image_prompt, False
+    items_desc = "\n".join(f"- {m.get('delivery') or m['text']}" for m in missing)
+    system = (
+        "You are repairing ONE content-omission defect in a still-frame construction IMAGE "
+        "prompt. This beat is contractually responsible for delivering these construction "
+        "stages — they are what the user picked this creative for — but the IMAGE text never "
+        "describes them:\n" + items_desc + "\n"
+        "Hard rules:\n"
+        "- KEEP every sentence describing camera position, lens, geometry, locked anchors, grid "
+        "coordinates, or frame-height percentages EXACTLY VERBATIM.\n"
+        "- REWRITE the state-delta sentence(s) so the finished result of EVERY listed stage is "
+        "explicitly visible and named, with its concrete material and placement — not a generic "
+        "completion claim.\n"
+        "- Do not invent additional new landmarks, change the camera, or contradict the "
+        "established structural state. Keep the full prompt under 250 words.\n"
+        "Output ONLY the corrected prompt text itself. Do not prefix it with any label, heading, "
+        "quotation marks, or repetition of these instructions, and do not add commentary or "
+        "markdown fences."
+    )
+    user = (
+        f"Here is the image prompt for beat {i}, delimited by triple quotes:\n"
+        f"\"\"\"\n{image_prompt}\n\"\"\""
+    )
+    try:
+        resp = _chat(config, system, user, temperature=0.5, timeout=90)
+        fixed = _strip_markdown_fences_only(resp).strip()
+        fixed = _strip_leading_label_line(fixed)
+        if not fixed or len(fixed.split()) > 300:
+            return image_prompt, False
+        if _missing_outline_items(fixed, beat):
+            return image_prompt, False
+        return fixed, True
+    except GenerationCancelled:
+        raise
+    except Exception as e:
+        if sys.stdout:
+            print(f"[DIRECT] Beat {i} 卡片工序缺失回炉调用失败（保留原文）: {e}")
         return image_prompt, False
 
 
@@ -8437,57 +7915,17 @@ Required JSON keys:
     # 传进来:卡片上看到的工序和最终成片大体对得上,但它只是草案——本函数下面那一整套
     # 硬规则(真实施工顺序、材质匹配修复、天花板覆盖、门扇、地板先于重物、Threshold 拆分、
     # 单里程碑包规则、自适应拍数下限)优先级永远更高,冲突时以硬规则为准、直接改写草案。
-    _outline_raw = dimensions.get('beat_outline') or []
-    _outline_full = []
-    for entry in _outline_raw:
-        if isinstance(entry, dict):
-            text = str(entry.get('text') or '').strip()
-            op = str(entry.get('op') or '').strip() or None
-            if text:
-                _outline_full.append({'op': op, 'text': text})
-        elif isinstance(entry, (str, int, float)) and str(entry).strip():
-            _outline_full.append({'op': None, 'text': str(entry).strip()})
-    # 用户把拍数压到卡片推荐值以下时草案要裁剪，但**末条必须留住**：卡片草案的最后
-    # 一条是 reward 揭示（见激发侧 schema「array 长度 = recommended_beats + 1」），
-    # 直接 [:max_total_beats] 会把它连同尾部工序一起切掉,交给规划器的草案就成了一栋
-    # 停在半截的房子——用户调小拍数换来的不是更紧凑的推进，而是没有完工镜头的片子。
-    if len(_outline_full) > max_total_beats:
-        _outline_plan = _outline_full[:max_total_beats - 1] + [_outline_full[-1]]
-    else:
-        _outline_plan = _outline_full
-    if _outline_plan:
-        def _fmt_outline_entry(i, entry):
-            op_tag = f' [{entry["op"]}]' if entry.get('op') else ''
-            return f'  {i}. {entry["text"]}{op_tag}'
-        _outline_lines = '\n'.join(_fmt_outline_entry(i, e) for i, e in enumerate(_outline_plan, 1))
-        _outline_plan_block = (
-            "\nDraft plan (SOFT reference, shown to the user on the ideation card — follow its intent "
-            "and ordering where it is already correct, so the delivered ladder matches what the user "
-            "picked; but every mandatory rule in the system prompt outranks it. Rewrite, merge, split, "
-            "or reorder any draft entry that would violate real-world construction order, the "
-            "single-milestone package rule, the threshold split rules, or the visible-milestone rule):\n"
-            f"{_outline_lines}\n"
-            "\nThe [bracketed tags] in the draft plan are the ideation layer's suggested operation "
-            "for each entry. Use them as a strong hint for your \"operation\" field, but override "
-            "if real-world construction order requires it.\n"
-            # 大纲 ↔ milestone 的 1:1 契约（2026-08-02 复盘）。旧文案明说"不必覆盖每条
-            # 草案"，于是「切割舱门装配入口梯」「铺设隐蔽水管与地暖」这类拍被静默换掉/
-            # 吞并，用户在卡片上看到的工序成片里一点痕迹都没有。改写仍然允许，但必须
-            # **认领**：每条草案拍都要有拍声明自己交付了它。
-            "\nBINDING CONTRACT (mandatory): every beat must carry an \"outline_refs\" array listing "
-            "the 1-based indices of the draft-plan entries it actually delivers, and EVERY draft-plan "
-            "entry above must appear in at least one beat's \"outline_refs\". Merging is allowed — put "
-            "both indices on the beat that absorbs them. Splitting is allowed — put the same index on "
-            "each beat that carries part of it. What is NOT allowed is silently dropping an entry: if "
-            "you believe an entry cannot be delivered, still claim it on the nearest beat that carries "
-            "its work. Only the threshold/crossing beat and the final reward beat may carry an empty "
-            "\"outline_refs\".\n"
-        )
-    else:
-        _outline_plan_block = ""
+    _outline_plan, _outline_plan_block = build_outline_plan_block(
+        dimensions.get('beat_outline'), max_total_beats)
+    # 卡片原始清单也挂到 config 上：合成收尾算交付总账时要拿它回答"这张卡本来有几条"。
+    # 规划四轮全败退兜底时梯子上一个 outline_refs 都没有，只看梯子的话总账为空——
+    # 而那恰恰是**整张卡的工序被通用施工序整体换掉**、最该报警的一单。
+    if isinstance(config, dict):
+        config['_outline_plan'] = _outline_plan
     # 只有真的给了草案才要求这个字段——老任务/老断点/手动输入主题没有草案，
     # 凭空要求一个"引用第几条草案"的数组只会让规划器编号码。
-    _outline_refs_schema = ("""20. "outline_refs": (array of integers) The 1-based indices of the draft-plan entries THIS beat delivers, per the BINDING CONTRACT stated with the draft plan. Every draft entry must be claimed by at least one beat; only the crossing beat and the final reward beat may leave this empty."""
+    _outline_refs_schema = ("""20. "outline_refs": (array of integers) The 1-based indices of the CARD WORK PLAN entries THIS beat delivers, per the BINDING CONTRACT stated with that plan. Every entry must be claimed by at least one beat; only the crossing beat and the final reward beat may leave this empty. The indices you claim must never run backwards as the ladder advances.
+21. "outline_delivery": (array of strings, same length and order as "outline_refs") Element k restates in English the physical work and terminal product of the card entry named by "outline_refs"[k], using the concrete nouns this beat's own "milestone_name"/"after_state" use. Required whenever "outline_refs" is non-empty. These strings are enforced against the composed IMAGE prompt downstream, so write the real words, never a placeholder."""
                             if _outline_plan else "")
 
     if pacing_skeleton_id == 'dual_payoff':
@@ -8496,7 +7934,7 @@ Required JSON keys:
             "order remains authoritative): dual_payoff / 内外双重完工. The exterior act needs its own "
             "utility/platform beat — solar array, vent/flue, water tank, deck/platform, railing, porch "
             "or stairs — installed BEFORE the mini-payoff; the ideation card is gated on it, so never "
-            "drop it when rewriting the draft plan. The ordinary beat "
+            "drop it when rewriting the card work plan. The ordinary beat "
             "immediately BEFORE the threshold hard cut must complete a genuinely usable exterior "
             "entrance/frontage (not a partial repair) and read as the first mini-payoff. Then HARD CUT "
             "to the untouched raw interior — the cut resets the CAMERA and the INTERIOR work queue "
@@ -8643,6 +8081,10 @@ Space Type: {space_type}
     beat_ladder = None
     beat_ladder_accepted = False
     beat_user_current = beat_user
+    # 最后一版「结构完好、只欠卡片工序契约」的候选梯子。卡片工序清单升级为硬规则后，
+    # 这类梯子不再被当场接受（见 blocking_violations），但重排全部耗尽时它仍然是最好的
+    # 归宿——确定性兜底梯子跟用户挑的这张卡没有任何关系。
+    _outline_forced_ladder = None
     # Three drafts are often enough for rhythm-only repairs, but a nested-space ladder
     # can consume the third draft fixing cadence and still surface one last structural
     # ordering issue (for example, framing immediately after a raw-space reset instead
@@ -8836,10 +8278,13 @@ Space Type: {space_type}
                     # make an otherwise valid plan impossible at the beat-count ceiling.
                     # This matters most for nested-space plans, where "split this beat"
                     # may be impossible because every available slot is already reserved.
-                    # 大纲 ↔ milestone 契约：覆盖率必须 100%（每条草案拍至少被一拍认领），
-                    # 人物类交付物不可被"无人场景"通用规则清掉。与节奏违规同一验收类别
-                    # ——重排两轮仍不满足就接受并留痕，不让整单失败。
-                    outline_violations = outline_contract_violations(_outline_plan, beat_ladder)
+                    # 卡片工序清单 ↔ milestone 契约（2026-08-05 起是**硬规则**）：覆盖率
+                    # 必须 100%、合并宽度有上界、认领序不得倒退、认领的工序类型必须真的
+                    # 在这拍身上、每条认领都要有英文复述。人物类交付物不可被"无人场景"
+                    # 通用规则清掉。**不再与节奏违规同级**：见下面 retry_for_outline /
+                    # blocking_violations——用满全部重排轮次，且最后一轮不再无条件放行。
+                    outline_violations = (outline_contract_violations(_outline_plan, beat_ladder)
+                                          + outline_binding_violations(_outline_plan, beat_ladder))
                     # delta 可见性预算：改动只落在边角格位的拍，在锁死的静态机位下必然
                     # 变成无效帧（见 delta_visibility_violations）。与节奏/契约同级：
                     # 重排两轮，仍不满足就接受并留痕。
@@ -8859,12 +8304,28 @@ Space Type: {space_type}
                     # 是「重试两次后接受并记日志」，这里只是把同一套逻辑补齐。
                     last_attempt = attempt == beat_ladder_max_attempts - 1
                     blocking_violations = (contract_violations
-                                           + hard_milestone_violations(milestone_violations))
+                                           + hard_milestone_violations(milestone_violations)
+                                           # 卡片工序清单是硬规则（2026-08-05）：最后一轮
+                                           # 也不再无条件放行。此前它挂在 rhythm 那一档，
+                                           # 于是第 3 轮结构违规一清空就立刻被接受，明明
+                                           # 还剩一整轮修复预算没用；最后一轮更是必过。
+                                           + outline_violations)
                     if strict_frame_state_contract_enabled(config):
                         blocking_violations += frame_state_violations
                     accept_leniently = last_attempt and not blocking_violations
+                    # 重排全部耗尽时的归宿：一条只剩卡片工序违规的 LLM 梯子，仍然比
+                    # 与这张卡毫无关系的确定性兜底梯子离用户挑中的创意近得多——把工序
+                    # 契约调成阻塞级，却在耗尽时退回一条根本不认这张卡的梯子，是自相
+                    # 矛盾的。留住最后一版这样的候选，循环外优先用它。
+                    _blocking_except_outline = [v for v in blocking_violations
+                                                if v not in outline_violations]
+                    if outline_violations and not structural_violations \
+                            and not _blocking_except_outline:
+                        _outline_forced_ladder = (list(beat_ladder), candidate_total,
+                                                  list(outline_violations))
 
-                    if (not structural_violations and not retry_for_rhythm) or accept_leniently:
+                    if (not structural_violations and not retry_for_rhythm
+                            and not outline_violations) or accept_leniently:
                         total_beats = candidate_total
                         beat_ladder_accepted = True
                         if structural_violations and sys.stdout:
@@ -8876,25 +8337,9 @@ Space Type: {space_type}
                             print(
                                 "[RHYTHM] accepting structurally valid final ladder after "
                                 f"rhythm retries were exhausted: {rhythm_violations}")
-                        # 大纲 ↔ milestone 的映射事故（合并/拆分/新增/被吞并）一律留痕，
-                        # 让上游看得见"卡片上那条工序去哪了"——这正是此前完全静默的一环。
-                        _outline_contract = outline_milestone_contract(_outline_plan, beat_ladder)
-                        if isinstance(config, dict) and _outline_contract['declared']:
-                            config['_outline_contract'] = _outline_contract
-                        if _outline_contract['diff'] and sys.stdout:
-                            print(f"[OUTLINE] 大纲→milestone 映射 diff "
-                                  f"(覆盖率 {_outline_contract['coverage']:.0%}): "
-                                  f"{_outline_contract['diff']}")
-                        if outline_violations and sys.stdout:
-                            print("[OUTLINE] 契约校验未完全满足，已接受并留痕: "
-                                  f"{outline_violations}")
-                        # 人物类交付物：在 reward 拍上打标，让下游的通用"干净帧"规则给它
-                        # 让路（见 beat_requires_occupant / check_occupant_delivered）。
-                        if outline_requires_occupancy(_outline_plan):
-                            for _b in reversed(beat_ladder):
-                                if isinstance(_b, dict) and str(_b.get('operation') or '') == 'reward':
-                                    _b['requires_occupant'] = True
-                                    break
+                        # 映射留痕 + 把认领的工序原文钉到每一拍上（下游提示词合成靠它）
+                        bind_outline_to_ladder(config, _outline_plan, beat_ladder,
+                                               outline_violations)
                         # 灰度期观测点：卡片声称的推进密度 vs ladder 实际产出的密度。
                         # 改造前这个差值无上界（推荐 13 拍的单塌回 6 拍完全合法），
                         # 改造后应收敛到 _OUTLINE_SHRINK_TOLERANCE 定义的范围内。
@@ -8966,6 +8411,21 @@ Space Type: {space_type}
                 if sys.stdout:
                     print('[DEBUG] using deterministic beat ladder after final generation error')
                 continue
+
+    # 卡片工序契约是唯一没过的一关时，用最后那版 LLM 梯子，别退回确定性兜底。
+    # 那条兜底梯子是按 parsed_brief 生成的通用施工序，跟用户在卡片上挑的这份工序清单
+    # 毫无关系——把工序契约调成阻塞级、却在耗尽时交付一条根本不认这张卡的梯子，
+    # 只会让"节拍简介是硬规则"这件事变成反效果。有瑕疵但认这张卡 > 干净但换了张卡。
+    if not beat_ladder_accepted and _outline_forced_ladder:
+        beat_ladder, total_beats, _forced_violations = _outline_forced_ladder
+        beat_ladder_accepted = True
+        bind_outline_to_ladder(config, _outline_plan, beat_ladder, _forced_violations)
+        if isinstance(config, dict) and isinstance(config.get('_outline_contract'), dict):
+            # 审核面板据此把这一单标成"工序契约未满足"，而不是让它和正常单一个样
+            config['_outline_contract']['unresolved'] = list(_forced_violations)
+        if sys.stdout:
+            print('[OUTLINE] 重排耗尽，卡片工序契约仍未满足；采用最后一版 LLM 梯子（而非'
+                  f'确定性兜底）并留痕: {_forced_violations}')
 
     # Count/index/transition failures can exhaust the loop without throwing. Planning is
     # still not allowed to be a single point of failure, so replace that unusable draft.
@@ -10066,6 +9526,39 @@ def _stage_scope_beat_directive(stage_scope, img_before="this beat's starting IM
     return ''
 
 
+def beat_outline_items(beat):
+    """这一拍认领的卡片工序（原文 + 英文复述）。由 bind_outline_to_ladder 钉上。
+
+    老断点/老任务/手动填维度直出的梯子没有这个字段，一律返回空列表——所有调用方
+    据此静默跳过，行为与改造前完全一致。"""
+    items = beat.get('outline_items') if isinstance(beat, dict) else None
+    if not isinstance(items, list):
+        return []
+    return [item for item in items
+            if isinstance(item, dict) and str(item.get('text') or '').strip()]
+
+
+def outline_delivery_directive(beat):
+    """卡片工序在提示词合成阶段的硬约束段。
+
+    没有 outline_items 时返回空串，整块契约的措辞就退回改造前的样子。有的时候，
+    它排在 VISIBLE MILESTONE CONTRACT 的**最前面**：用户是照着这几行中文挑的这条创意，
+    它比这拍自己的任何字段都更接近"必须交付什么"。英文复述给模型抄词用，中文原文
+    给它对齐语义用——两个都给，模型不必自己翻译一遍。"""
+    items = beat_outline_items(beat)
+    if not items:
+        return ""
+    lines = []
+    for item in items:
+        delivery = str(item.get('delivery') or '').strip()
+        lines.append(f"  · {item['text']}" + (f" — {delivery}" if delivery else ""))
+    plural = "these card work items" if len(items) > 1 else "this card work item"
+    return ("- CARD WORK ITEM(S) THIS BEAT DELIVERS (hard requirement — the user chose this "
+            "creative by reading exactly this list, so the IMAGE must visibly show "
+            f"{plural} completed, by name):\n"
+            + '\n'.join(lines) + '\n')
+
+
 def _milestone_beat_directive(beat, img_before="this beat's starting IMAGE",
                               img_after="this beat's resulting IMAGE"):
     """Reference-case skeleton for one ordinary construction milestone.
@@ -10150,7 +9643,7 @@ def _milestone_beat_directive(beat, img_before="this beat's starting IMAGE",
     video_block = '\n'.join(f'{n}. {rule}' for n, rule in enumerate(video_rules, 1))
 
     return f"""VISIBLE MILESTONE CONTRACT FOR THIS BEAT (mandatory):
-- Terminal stage product: {fields['name']}.
+{outline_delivery_directive(beat)}- Terminal stage product: {fields['name']}.
 - Visible start state in {img_before}: {fields['before']}.
 - Visible completed state in {img_after}: {fields['after']}.
 - Completion extent/count: {fields['extent']}; changed area: {fields['grids']}.
@@ -10227,7 +9720,11 @@ def _beat_block_text(i, contract):
     varies beat-to-beat (shot family lock, cropped template exemplars, lighting phases,
     this beat's own anchor rule, operation/description)."""
     beat = contract['beat']
-    milestone_directive = _milestone_beat_directive(beat)
+    # reward / 过门拍走各自的专用契约，_milestone_beat_directive 对它们返回空串——但
+    # 「点亮壁炉，人物入住」这类恰恰是 reward 拍认领的卡片工序，也是用户最在意的一条。
+    # 里程碑契约缺席时，至少把卡片工序这一段单独发出去。
+    milestone_directive = (_milestone_beat_directive(beat)
+                           or outline_delivery_directive(beat))
     stage_scope_section = f"\n{milestone_directive}\n" if milestone_directive else ""
     return f"""==================== BEAT {i} ====================
 Operation: {beat.get('operation', '')} — {beat.get('description', '')}
@@ -10381,15 +9878,9 @@ def compose_remaining_beats(config, state, on_progress=None):
 
 def call_llm(config, dimensions, on_progress=None):
     """One-shot entry point preserved for existing callers (e.g. /api/compose):
-    runs both composer phases back-to-back with no anchor-frame gating in between.
-
-    副产物：把这一单的 parsed_brief 挂回 config['_parsed_brief']（与 _beat_audit /
-    _skipped_checks 同一套「合成期回传」约定）。/api/compose 的 worker 会把它落到项目
-    目录，供之后独立请求的帧序列任务做锚帧验收（见 server_common.save_project_brief）。
+    runs both composer phases back-to-back.
     """
     state = compose_anchor_and_packet(config, dimensions, on_progress=on_progress)
-    if isinstance(config, dict) and isinstance(state.get('parsed_brief'), dict):
-        config['_parsed_brief'] = state['parsed_brief']
     return compose_remaining_beats(config, state, on_progress=on_progress)
 
 
@@ -10639,12 +10130,157 @@ def _cached_blind_spot_block(force=False):
     return block
 
 
+# ── 画面层的「卡片工序交付」（2026-08-05） ────────────────────────────────────
+#
+# 四道关（激发骨架 / 规划契约 / 合成收口 / 渲帧）里，前三道判的全是**提示词文本**。
+# 帧渲染之后那一整套 VLM 审查的 rubric 是施工顺序、SCUP、地标、载体身份那一套，
+# 完全不知道卡片工序的存在——于是「IMAGE 正文写了躺椅、渲出来的图里没有躺椅」这一类，
+# 文本层判通过、画面层压根没在查。这一段把工序原文接到逐拍局部审查上。
+#
+# **只加在逐拍局部层，不加跨帧层。** 跨帧层刻意只保留 6 条真正需要跨帧比较的规则，
+# 2026-07-23 那次三层改版的结论就是"规则和图片一起被稀释 → 要么找不到问题、要么硬塞
+# 问题"；工序交付是**单帧可判**的，塞进跨帧层只会稀释它。
+#
+# 灰度先行：判定只进总账和日志，不进 failures、不碰 quality_gate。理由是 VLM 判
+# "这条施工工序算不算完成"的尺度是未知量，比"这个地标在不在画面里"模糊得多——一条
+# "铺设隐蔽水管"在封板后**本来就该看不见**（见 _outline_hidden_layer_beat）。摸清
+# 误判率再决定是否并入。开关惯例同 _OUTLINE_GATE_ENFORCING / _RHYTHM_ARC_ENFORCING。
+_OUTLINE_FRAME_GATE_ENFORCING = False
+
+# 工序未交付的上报格式。既是给模型的措辞约定，也是把这类判定从普通违规里摘出来的
+# 唯一抓手——两处必须共用同一个常量，改文案时不会有一侧忘了跟。
+_OUTLINE_FRAME_MISS_MARKER = 'CARD WORK NOT DELIVERED'
+
+
+def outline_frame_review_block(items):
+    """逐拍审查 user turn 里追加的「卡片工序交付」段，挂在 FOCUS RECORD 之后。
+
+    没有工序（老单/过门拍/未绑定的梯子）时返回空串，那一拍的 user turn 与改造前
+    逐字相同。"""
+    lines = []
+    for item in (items or []):
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get('text') or '').strip()
+        delivery = str(item.get('delivery') or '').strip()
+        if text and delivery:
+            lines.append(f"  · {text} — {delivery}")
+        elif text or delivery:
+            lines.append(f"  · {text or delivery}")
+    if not lines:
+        return ""
+    return (
+        "\n\nCARD WORK ITEM(S) THIS BEAT MUST DELIVER (the user chose this creative by reading "
+        "these):\n" + '\n'.join(lines) +
+        "\nJudge, in the ARRIVAL frame only: is the finished result of each item plainly "
+        "visible? Work that this beat's own construction stage necessarily buries or covers "
+        "does not count as missing. If an item's result cannot be seen at all, report: "
+        f"{_OUTLINE_FRAME_MISS_MARKER}: <item>"
+    )
+
+
+def split_outline_frame_verdicts(issues):
+    """把逐拍审查回来的违规拆成 (普通违规, 工序未交付的那几条)。"""
+    normal, outline = [], []
+    for issue in (issues or []):
+        if _OUTLINE_FRAME_MISS_MARKER.lower() in str(issue).lower():
+            outline.append(issue)
+        else:
+            normal.append(issue)
+    return normal, outline
+
+
+def outline_frame_verdicts(items, reported):
+    """把「工序未交付」的上报行映射回工序编号 → {'编号': 'missing'|'visible'}。
+
+    模型只被要求上报**没看见**的那几条，所以这一拍审过之后，没被点名的工序就是
+    visible——前提是这一拍真的审成了（没审成的拍压根走不到这里，见
+    check_beat_consistency 的 None 分支）。
+
+    映射先按原文/英文复述的整串命中，命中不了再退到复述实义词的最佳匹配，且只认
+    唯一最高分：宁可这条记不上账，也不能把 A 工序的"没交付"记到 B 头上。"""
+    items = [i for i in (items or []) if isinstance(i, dict)]
+    indexed = []
+    for item in items:
+        try:
+            indexed.append((int(item.get('index')), item))
+        except (TypeError, ValueError):
+            continue
+    if not indexed:
+        return {}
+    missing = set()
+    for line in (reported or []):
+        raw = str(line)
+        low = raw.lower()
+        hit = next((n for n, item in indexed
+                    if (str(item.get('text') or '').strip()
+                        and str(item.get('text')).strip() in raw)
+                    or (str(item.get('delivery') or '').strip()
+                        and str(item.get('delivery')).strip().lower() in low)), None)
+        if hit is None:
+            scores = {}
+            for n, item in indexed:
+                words = _trace_name_keywords(item.get('delivery'))
+                score = sum(1 for w in words if w in low)
+                if score:
+                    scores[n] = score
+            if scores:
+                best = max(scores.values())
+                winners = [n for n, s in scores.items() if s == best]
+                hit = winners[0] if len(winners) == 1 else None
+        if hit is not None:
+            missing.add(hit)
+    return {str(n): ('missing' if n in missing else 'visible') for n, _ in indexed}
+
+
+def outline_items_by_beat(ledger):
+    """交付总账 → {'拍号': [该拍要交付的工序, ...]}，帧审查层按拍取用的形状。
+
+    键统一成字符串：这份投影要过 manifest（JSON）落盘，int 键在往返里必然变字符串，
+    两侧形状不一致会让读回来的那一趟静默取不到东西。"""
+    by_beat = {}
+    for row in (ledger or []):
+        if not isinstance(row, dict):
+            continue
+        item = {'index': row.get('index'), 'text': str(row.get('text') or ''),
+                'delivery': str(row.get('delivery') or '')}
+        for beat in (row.get('claimed_beats') or []):
+            by_beat.setdefault(str(beat), []).append(item)
+    return by_beat
+
+
+def _outline_items_for_beat(outline_items, beat):
+    """{拍号: [...]} 里属于这一拍的工序（键可能是 int 也可能是落盘往返后的字符串）。"""
+    if not isinstance(outline_items, dict):
+        return []
+    items = outline_items.get(str(beat))
+    if items is None:
+        items = outline_items.get(beat)
+    return [i for i in (items or []) if isinstance(i, dict)]
+
+
+def _merge_outline_frame_verdicts(per_beat):
+    """多拍的逐条判定合成一份：同一条工序被拆到两拍时，坏消息优先。"""
+    merged = {}
+    for verdicts in (per_beat or []):
+        for key, verdict in (verdicts or {}).items():
+            if merged.get(key) != 'missing':
+                merged[key] = verdict
+    return merged
+
+
 def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_before_path,
-                            image_after_path, timeout=60):
+                            image_after_path, timeout=60, outline_items=None, outline_out=None):
     """局部逐拍一致性审查：只看该拍自己的两张锚点帧，规则见
     _local_beat_review_system_prompt 顶部注释。返回该拍的中文违规描述 list（可能为
     空 list = 判定为干净）；**None = 本拍审查没跑成**（超时/网关异常/响应不可解析），
-    调用方不能把 None 当"干净"处理。"""
+    调用方不能把 None 当"干净"处理。
+
+    outline_items: 这一拍认领的卡片工序（原文 + 英文复述，来自 manifest 里的交付总账）。
+    非空时 user turn 追加一段「卡片工序交付」审查要求（outline_frame_review_block）。
+    outline_out: 传进来的 dict 会被写入本拍的逐条判定（工序号 → visible/missing）。
+    灰度期（_OUTLINE_FRAME_GATE_ENFORCING=False）这些判定**只**进这个出参，不混进
+    返回的违规列表，因此不会流向 failures / quality_gate。"""
     system_prompt = _local_beat_review_system_prompt()
     # 拍号只出现在 user turn：system prompt 因此在所有拍之间完全一致、可被 prompt
     # 缓存复用（见 _local_beat_review_system_prompt 的 2026-07-25 说明）。
@@ -10672,6 +10308,7 @@ def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_
         f"Name the frames as IMAGE {beat_index} / IMAGE {beat_index + 1} in your descriptions. "
         f"Judge only this beat and report violations as a JSON list."
         + _declared_delta
+        + outline_frame_review_block(outline_items)
     )
     try:
         response = _multimodal_chat(config, system_prompt, user_text,
@@ -10683,7 +10320,14 @@ def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_
             data = data.get(str(beat_index)) or data.get(beat_index) or []
         if not isinstance(data, list):
             return None
-        return [str(item).strip() for item in data if str(item).strip()]
+        issues = [str(item).strip() for item in data if str(item).strip()]
+        if not outline_items:
+            return issues
+        issues, outline_hits = split_outline_frame_verdicts(issues)
+        if outline_out is not None:
+            outline_out.update(outline_frame_verdicts(outline_items, outline_hits))
+        # 灰度期这几条不回到违规列表里：不进复核、不进 failures、不影响 quality_gate
+        return (issues + outline_hits) if _OUTLINE_FRAME_GATE_ENFORCING else issues
     except Exception as e:
         _reraise_if_cancelled(e)
         if sys.stdout:
@@ -10899,7 +10543,7 @@ def _verify_review_violation(config, violation_text, image_paths, timeout=30):
 
 def check_full_sequence_consistency(config, prompt_block, frame_image_paths, degraded=False,
                                     only_beats=None, skip_global=False, on_progress=None,
-                                    global_only_beats=None):
+                                    global_only_beats=None, outline_items=None):
     """整套序列渲染完成后的一致性审查，取代原来盲文本的逐轮全量审核（见
     prompt_pipeline_refactor 里去掉的 validate_and_repair / 审核表)。
 
@@ -10945,7 +10589,10 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
     global_only_beats: 不跳过跨帧层时，只重跑覆盖这些拍的窗口（None = 全部窗口）。
     降级重试用它补跑上一轮失败的那几个窗口，而不是整层重来。
     on_progress: 每审完一拍在**父线程**回调一次 ('sequence_review_beat', {...})，
-    整段审查因此不再是几分钟的静默黑洞；回调抛异常（取消）会立刻中止剩余的拍。"""
+    整段审查因此不再是几分钟的静默黑洞；回调抛异常（取消）会立刻中止剩余的拍。
+    outline_items: {拍号: [卡片工序, ...]}（来自 manifest 的交付总账，键可为字符串）。
+    给出时逐拍层追加一条「卡片工序交付」审查，结论按工序号收进返回值的
+    outline_frame_verdicts——灰度期它是这一层判定的**唯一**去处。"""
     if not prompt_block or not frame_image_paths:
         return _empty_review_result()
     total_beats = len(frame_image_paths) - 1
@@ -10968,10 +10615,22 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
                 continue
             pending.append((beat, (paths_for(beat), paths_for(beat + 1))))
 
+        # 每拍一个独立的出参 dict，全部预先建好：审查是并发跑的，线程只写自己那一个。
+        outline_by_beat = {beat: _outline_items_for_beat(outline_items, beat)
+                           for beat, _ in pending}
+        outline_out = {beat: {} for beat, _ in pending}
+
         def _run(beat, pair):
             before, after = pair
+            items = outline_by_beat.get(beat)
+            if not items:
+                # 没有卡片工序（老单/未绑定的梯子）：调用形状与改造前逐字相同
+                return check_beat_consistency(config, prompt_block, beat, total_beats,
+                                              before, after, timeout=local_timeout)
             return check_beat_consistency(config, prompt_block, beat, total_beats,
-                                          before, after, timeout=local_timeout)
+                                          before, after, timeout=local_timeout,
+                                          outline_items=items,
+                                          outline_out=outline_out.get(beat))
 
         def _emit(beat, issues):
             if on_progress:
@@ -11055,7 +10714,8 @@ def check_full_sequence_consistency(config, prompt_block, frame_image_paths, deg
             'unreviewed_beats': sorted(set(unreviewed_beats)),
             'global_unreviewed_beats': sorted(set(global_unreviewed)),
             'global_reviewed': global_reviewed,
-            'global_attempted': not skip_global}
+            'global_attempted': not skip_global,
+            'outline_frame_verdicts': _merge_outline_frame_verdicts(outline_out.values())}
 
 
 def merge_review_results(first, second):
@@ -11091,6 +10751,10 @@ def merge_review_results(first, second):
         'global_unreviewed_beats': global_unreviewed,
         'global_reviewed': bool(first.get('global_reviewed') or second.get('global_reviewed')),
         'global_attempted': bool(first.get('global_attempted') or second.get('global_attempted')),
+        # 卡片工序的逐条判定按拍互不重叠（重跑的拍会带回自己那份新结论），合并时
+        # 仍然坏消息优先——拆到两拍的工序只要一拍说没看见就是没看见
+        'outline_frame_verdicts': _merge_outline_frame_verdicts(
+            [first.get('outline_frame_verdicts'), second.get('outline_frame_verdicts')]),
     }
 
 
@@ -11130,7 +10794,7 @@ def _empty_review_result():
     """空序列（没有提示词/没有帧/只有一帧）的"无事可审"结果：没有违规、没有漏审。"""
     return {'failures': {}, 'issues': [], 'unreviewed_beats': [],
             'global_unreviewed_beats': [], 'global_reviewed': True,
-            'global_attempted': True}
+            'global_attempted': True, 'outline_frame_verdicts': {}}
 
 
 def frame_review_status(sequences, review_result):
@@ -12231,20 +11895,51 @@ _OUTLINE_OPS = (
 _OUTLINE_OPS_SET = frozenset(_OUTLINE_OPS)
 
 
-def _outline_texts(idea):
-    """从 beat_outline（新旧形态均可）提取纯文本列表。所有现存的纯文本校验函数
-    统一走这里，不再各自做一遍 str(x or '').strip()。"""
+def _outline_entry_texts(outline):
+    """把 beat_outline 的**原始条目列表**（P1-C 的 {op,text} 新形态与纯字符串旧形态
+    可混装）收成纯文本列表。
+
+    2026-08-05：P1-C 之后仍有调用方直接 str(entry)，拿到的是
+    "{'op': 'reward', 'text': '点亮林间树洞完成最终揭示'}" 这种 dict repr。覆盖率按
+    下标算所以数值不受影响，但**回喂给规划器重排的违规文案里带着这串 repr**，模型
+    对不上说的是哪条草案，本该自愈的那一轮就白跑了（server.log 35609/35610 实证）。
+    凡是按文本工作的调用方统一走这里。"""
     result = []
-    for entry in (idea.get('beat_outline') or []):
+    for entry in (outline or []):
         if isinstance(entry, dict):
             text = str(entry.get('text') or '').strip()
-            if text:
-                result.append(text)
         elif isinstance(entry, (str, int, float)):
             text = str(entry or '').strip()
-            if text:
-                result.append(text)
+        else:
+            continue
+        if text:
+            result.append(text)
     return result
+
+
+def _outline_normalized_entries(outline):
+    """把 beat_outline 的原始条目列表收成 [{'op': str|None, 'text': str}, ...]。
+
+    与 _outline_entry_texts 同源、同顺序、同过滤条件（空文本条目一律丢弃），所以两者
+    的下标可以直接互换——契约层按下标算覆盖率，任何一边多丢一条都会让编号整体错位。"""
+    entries = []
+    for entry in (outline or []):
+        if isinstance(entry, dict):
+            text = str(entry.get('text') or '').strip()
+            op = str(entry.get('op') or '').strip() or None
+        elif isinstance(entry, (str, int, float)):
+            text, op = str(entry or '').strip(), None
+        else:
+            continue
+        if text:
+            entries.append({'op': op, 'text': text})
+    return entries
+
+
+def _outline_texts(idea):
+    """从 idea.beat_outline（新旧形态均可）提取纯文本列表。所有现存的纯文本校验函数
+    统一走这里，不再各自做一遍 str(x or '').strip()。"""
+    return _outline_entry_texts(idea.get('beat_outline'))
 
 
 def _outline_ops(idea):
@@ -12284,8 +11979,13 @@ _OCCUPANCY_OUTLINE_CUE = re.compile(
 
 
 def outline_requires_occupancy(outline):
-    """大纲里有没有"人物/入住/使用"语义的拍。有 → 人物是硬性交付物。"""
-    return any(_OCCUPANCY_OUTLINE_CUE.search(str(entry or '')) for entry in (outline or []))
+    """大纲里有没有"人物/入住/使用"语义的拍。有 → 人物是硬性交付物。
+
+    条目可能是 {op,text} 也可能是纯字符串，统一过 _outline_entry_texts：直接
+    str(entry) 会把 op 一起塞进匹配面（英文 op 撞不上这条中文正则，但文本一旦缺失
+    就会静默漏判）。"""
+    return any(_OCCUPANCY_OUTLINE_CUE.search(text)
+               for text in _outline_entry_texts(outline))
 
 
 def _beat_outline_refs(beat, outline_len):
@@ -12313,7 +12013,7 @@ def outline_milestone_contract(outline, beat_ladder):
       · dropped  —— 这条大纲拍没有任何 milestone 认领（被换掉/被吞并）
     规划器没声明 outline_refs 时 declared=False，只能给出"拍数对不对得上"这一层的
     粗粒度结论——不硬判，避免把老 ladder / 老断点一律判成违规。"""
-    outline = [str(x or '').strip() for x in (outline or []) if str(x or '').strip()]
+    outline = _outline_entry_texts(outline)
     ladder = [b for b in (beat_ladder or []) if isinstance(b, dict)]
     result = {'declared': False, 'coverage': 0.0, 'uncovered': [], 'diff': []}
     if not outline or not ladder:
@@ -12367,17 +12067,455 @@ def outline_milestone_contract(outline, beat_ladder):
     return result
 
 
+def render_outline_contract_md(contract):
+    """把大纲 ↔ milestone 的映射 diff 渲染成审核面板用的 markdown。
+
+    返回 (markdown, 未交付提示语)。第二项非空时调用方应把它顶进 repair_md——非 PASS
+    开头会让前端审核面板自动展开+高亮，否则"卡片工序没人认领"这条会和一堆正常的合并
+    记录并排躺在面板深处，等于没报。contract 未声明（老 ladder / 老断点没有
+    outline_refs）时返回 ("", "")，不硬判。"""
+    if not isinstance(contract, dict) or not contract.get('declared'):
+        return "", ""
+    diff = contract.get('diff') or []
+    lines = [f"### 灵感卡片工序 → 成片里程碑"
+             f"（覆盖率 {(contract.get('coverage') or 0.0):.0%}）", '']
+    if not diff:
+        lines.append('- 卡片上的每条工序都由一拍单独交付，无合并/拆分/新增。')
+    for rec in diff:
+        texts = '、'.join(str(t) for t in (rec.get('outline_texts') or []))
+        kind = rec.get('kind')
+        if kind == 'merged':
+            lines.append(f"- **合并** · 第 {rec.get('beat')} 拍「{rec.get('milestone')}」"
+                         f"一拍交付了 {len(rec.get('outline_refs') or [])} 条卡片工序：{texts}")
+        elif kind == 'split':
+            beats = '、'.join(str(b) for b in (rec.get('beats') or []))
+            lines.append(f"- **拆分** · 卡片工序「{texts}」摊到了第 {beats} 拍")
+        elif kind == 'added':
+            lines.append(f"- **新增** · 第 {rec.get('beat')} 拍「{rec.get('milestone')}」"
+                         f"不对应卡片上的任何一条工序")
+        elif kind == 'dropped':
+            lines.append(f"- ⚠️ **未交付** · 卡片工序「{texts}」没有任何一拍认领")
+
+    # 重排全部耗尽、契约仍未满足时采用的那版梯子（见 compose_anchor_and_packet 的
+    # _outline_forced_ladder）。这是唯一一种"卡片工序没落实、但单子照发"的情形，
+    # 必须在面板上说清楚，否则它和正常单长得一模一样。
+    unresolved = contract.get('unresolved') or []
+    if unresolved:
+        lines.append('')
+        lines.append(f"- 🚫 **工序契约未满足**（重排 {len(unresolved)} 项仍未修复，"
+                     f"已采用最后一版规划稿）：")
+        lines.extend(f"  - {item}" for item in unresolved)
+
+    uncovered = contract.get('uncovered') or []
+    note = ""
+    if uncovered:
+        # 落盘再读回来时 (idx, text) 元组会变成两元素列表，两种形态都要吃得下
+        dropped = '、'.join(str(item[-1]) for item in uncovered)
+        note = f"另有 {len(uncovered)} 条卡片工序没有任何一拍交付（{dropped}），详情见下方审核报告。"
+    return '\n'.join(lines), note
+
+
+# ── 卡片工序交付总账（outline delivery ledger） ───────────────────────────────
+#
+# 2026-08-05：三道闸门（规划期契约 / 合成期收口 / 帧审查）各自留痕，但数据散在三处，
+# 谁也回答不了用户最该看见的那一句：「卡片上第 3 条工序，最后落在第几帧、成没成」——
+#   · _outline_contract.diff —— 只到"哪一拍认领了它"（规划期）；
+#   · _beat_audit            —— 按**拍**组织，条目是回炉记录，不按工序索引；
+#   · manifest.quality_gate  —— 按**帧**组织，理由是自由文本。
+# 总账不新增任何判定，只把这三处**已有的结论**按工序重新索引成一行一条。
+#
+# 隐蔽工序（水电/保温）天然不可见：它们按施工顺序必然被后续工序盖住，到达帧判"看不见"
+# 是对的观察、错的结论。frame_verdict 因此有 not_applicable 一档，由"这拍是隐蔽层族
+# 且下一拍封盖"确定性置位（见 _outline_hidden_layer_beat）。
+#
+# 2026-08-06：封盖工序原本只写了 drywall，漏掉**地面那条路径**。实测一张 7 拍岗亭卡
+# （「铺设防潮膜与隐蔽地暖管」→「浇筑微水泥自流平地板」）时暴露：地暖管被自流平彻底
+# 埋掉，和被封板盖住是同一件事，却拿不到 not_applicable，于是被送去画面层判"没交付"
+# ——正是这一档要避免的那类误判。flooring（自流平/地板/楼板）与 priming（防水涂层/
+# 批腻子）同样构成埋没；painting 不进这个表：面漆盖的是饰面，不埋任何隐蔽层。
+_OUTLINE_HIDDEN_LAYER_OPS = ('rough-in', 'framing')
+_OUTLINE_SEALING_OPS = ('drywall', 'flooring', 'priming')
+
+
+def _beat_ops_text(beat):
+    """一拍身上所有工序类型（operation + package_operations）拼成的小写检索面。"""
+    if not isinstance(beat, dict):
+        return ''
+    return ' '.join([str(beat.get('operation') or '')]
+                    + [str(op) for op in (beat.get('package_operations') or [])]).lower()
+
+
+def _outline_hidden_layer_beat(ladder, pos):
+    """第 pos 拍（1-based）交付的东西是不是"封板后本就看不见"的隐蔽层。
+
+    条件两条同时成立：这拍自己落在隐蔽层族（rough-in / framing），且**下一拍**封板
+    （drywall）。少了后一条不算——隐蔽层做完还没封板时，到达帧里管路是看得见的。"""
+    if not (1 <= pos <= len(ladder)) or pos >= len(ladder):
+        return False
+    ops = _beat_ops_text(ladder[pos - 1])
+    if not any(op in ops for op in _OUTLINE_HIDDEN_LAYER_OPS):
+        return False
+    return any(op in _beat_ops_text(ladder[pos]) for op in _OUTLINE_SEALING_OPS)
+
+
+# 合成期一条工序可能被拆到多拍，多个结论要聚合成总账上的一行：坏消息优先。
+_OUTLINE_PROMPT_VERDICT_ORDER = ('missing', 'reworked', 'delivered', 'skipped')
+
+
+def _worst_prompt_verdict(verdicts):
+    for verdict in _OUTLINE_PROMPT_VERDICT_ORDER:
+        if verdict in verdicts:
+            return verdict
+    return ''
+
+
+def build_outline_delivery_ledger(beat_ladder, contract, prompt_audit=None, frame_verdicts=None,
+                                  outline=None):
+    """卡片工序交付总账：一条卡片工序一行，贯穿规划 / 合成 / 渲帧三个阶段。
+
+    行的形状见模块顶部注释；三个 verdict 各有明确来源，**本函数不做任何新判定**：
+      · plan_verdict   ← 谁认领了它（claimed / merged / split / dropped）
+      · prompt_verdict ← record_outline_delivery 记下的合成期结论
+      · frame_verdict  ← 帧审查回写的逐条判定（灰度期通常整列都是 unreviewed）
+
+    梯子上一条 outline_items 都没有时分两种情况，绝不能混为一谈（2026-08-06 实测暴露）：
+
+      · outline 也是空的 —— 老断点、手填维度直出、根本没有卡片清单的老单。那条
+        "节拍简介是硬规则"的链路整个没跑过，凭空拼一张"全部未交付"的表是误导，
+        返回空账；
+      · **outline 非空** —— 卡片上明明有 N 条工序，梯子却一条都没认领。现实中这只有
+        一个来源：规划四轮全败后退到 deterministic_fallback_beat_ladder，那条通用施工序
+        跟这张卡毫无关系。此时返回空账是最糟的表现：用户挑的工序被整体换掉，而本该
+        喊出来的面板一个字都没有。整表按 dropped 渲染，由 outline_delivery_alert
+        把它顶到 repair_md 上。"""
+    ladder = [b for b in (beat_ladder or []) if isinstance(b, dict)]
+    contract = contract if isinstance(contract, dict) else {}
+    if not any(beat_outline_items(b) for b in ladder):
+        fallback = _outline_normalized_entries(outline)
+        if not fallback:
+            return []
+        return [{'index': n, 'text': e['text'], 'delivery': '',
+                 'claimed_beats': [], 'frame_seqs': [],
+                 'plan_verdict': 'dropped', 'prompt_verdict': '', 'frame_verdict': '',
+                 'note': '规划未认领任何卡片工序（已退回通用施工序）'}
+                for n, e in enumerate(fallback, 1)]
+
+    rows = {}
+    for pos, beat in enumerate(ladder, 1):
+        for item in beat_outline_items(beat):
+            try:
+                n = int(item.get('index'))
+            except (TypeError, ValueError):
+                continue
+            row = rows.setdefault(n, {'index': n, 'text': str(item.get('text') or ''),
+                                      'delivery': '', 'claimed_beats': [], 'frame_seqs': []})
+            if not row['delivery']:
+                row['delivery'] = str(item.get('delivery') or '')
+            if pos not in row['claimed_beats']:
+                row['claimed_beats'].append(pos)
+                row['frame_seqs'].append(pos + 1)
+    # 没有任何一拍认领的那几条只能从契约里取——它们身上恰恰没有 outline_items。
+    # 落盘再读回来时 (idx, text) 元组会变成两元素列表，两种形态都要吃得下。
+    for entry in (contract.get('uncovered') or []):
+        try:
+            n = int(entry[0])
+        except (TypeError, ValueError, IndexError):
+            continue
+        rows.setdefault(n, {'index': n, 'text': str(entry[-1] or ''), 'delivery': '',
+                            'claimed_beats': [], 'frame_seqs': []})
+
+    claims_per_beat = {}
+    for row in rows.values():
+        for pos in row['claimed_beats']:
+            claims_per_beat[pos] = claims_per_beat.get(pos, 0) + 1
+
+    audit = prompt_audit if isinstance(prompt_audit, dict) else {}
+    frames = frame_verdicts if isinstance(frame_verdicts, dict) else {}
+    ledger = []
+    for n in sorted(rows):
+        row = rows[n]
+        beats = row['claimed_beats']
+        if not beats:
+            row['plan_verdict'] = 'dropped'
+        elif len(beats) > 1:
+            row['plan_verdict'] = 'split'
+        elif claims_per_beat.get(beats[0], 0) > 1:
+            row['plan_verdict'] = 'merged'
+        else:
+            row['plan_verdict'] = 'claimed'
+
+        if row['plan_verdict'] == 'dropped':
+            # 没落点就无从谈交付：下游两列一律留空，报成 missing 是误导
+            row['prompt_verdict'] = ''
+            row['frame_verdict'] = ''
+            row['note'] = '卡片上这条工序没有任何一拍认领'
+        else:
+            per_beat = audit.get(str(n)) or audit.get(n) or {}
+            row['prompt_verdict'] = _worst_prompt_verdict(
+                set(per_beat.values()) if isinstance(per_beat, dict) else set())
+            if all(_outline_hidden_layer_beat(ladder, pos) for pos in beats):
+                row['frame_verdict'] = 'not_applicable'
+                row['note'] = '隐蔽工序，封盖后不可见'
+            else:
+                verdict = frames.get(str(n)) or frames.get(n) or ''
+                row['frame_verdict'] = str(verdict) if verdict else 'unreviewed'
+                row['note'] = ''
+        ledger.append(row)
+    return ledger
+
+
+def outline_delivery_alert(ledger):
+    """总账里"必须顶到 repair_md 上"的那一句，没有就返回空串。
+
+    只在**一条工序都没被认领**时出声。这等价于"卡片有清单、梯子却没声明认领"——
+    规划耗尽重试后退回通用施工序的那一单（见 build_outline_delivery_ledger）。
+    部分未交付不在这里报：那种情况 contract 是 declared 的，
+    render_outline_contract_md 的 uncovered_note 已经报过一次，重复报只会互相稀释。
+
+    非 PASS 开头会让前端审核面板自动展开+高亮，这正是这条要的效果。"""
+    rows = [r for r in (ledger or []) if isinstance(r, dict)]
+    if not rows or any(r.get('plan_verdict') != 'dropped' for r in rows):
+        return ""
+    names = '、'.join(str(r.get('text') or '') for r in rows)
+    return (f"⚠️ 本单规划未采纳灵感卡片的工序清单：卡片上的 {len(rows)} 条工序"
+            f"（{names}）没有任何一拍认领，成片走的是通用施工序。"
+            f"建议重跑一次合成；详情见下方审核报告。")
+
+
+def stash_outline_delivery_ledger(config, beat_ladder, skeleton=None):
+    """整单合成收尾时把总账算出来挂在 config['_outline_delivery_ledger'] 上。
+
+    存放位置沿用 _beat_audit / _frame_state_contract / _outline_contract 那一套约定：
+    run 结束由 server.py 汇入 result。顺带打一行可累积的观测日志（见 3.5 灰度观测点）。"""
+    if not isinstance(config, dict):
+        return []
+    ledger = build_outline_delivery_ledger(
+        beat_ladder, config.get('_outline_contract'),
+        prompt_audit=config.get('_outline_prompt_audit'),
+        outline=config.get('_outline_plan'))
+    if not ledger:
+        return ledger
+    config['_outline_delivery_ledger'] = ledger
+    line = outline_delivery_log_line(ledger, skeleton)
+    if line and sys.stdout:
+        print(line)
+    return ledger
+
+
+def outline_delivery_log_line(ledger, skeleton=None):
+    """一行可累积的交付观测，口径与现有 [RHYTHM] / [OUTLINE] 一致：
+
+        [OUTLINE-AUDIT] skeleton=nested_space_payoff entries=14 plan=14/14 prompt=13/14 frame=11/14
+
+    plan/prompt/frame 三个比值就是"硬规则上线后交付率抬高了多少"的回归口径：上线前
+    丢失主要发生在 plan 分子侧（工序压根没人认领），上线后应当收敛到 frame 这一侧。
+    na= 是隐蔽工序（封板后本就不可见）的条数——灰度期先看它的实际占比，再决定
+    frame_verdict 要不要并入 failures。"""
+    total = len(ledger or [])
+    if not total:
+        return ''
+    plan = sum(1 for r in ledger if r.get('plan_verdict') != 'dropped')
+    prompt = sum(1 for r in ledger if r.get('prompt_verdict') in ('delivered', 'reworked'))
+    frame = sum(1 for r in ledger if r.get('frame_verdict') == 'visible')
+    na = sum(1 for r in ledger if r.get('frame_verdict') == 'not_applicable')
+    line = (f"[OUTLINE-AUDIT] skeleton={skeleton or '-'} entries={total} "
+            f"plan={plan}/{total} prompt={prompt}/{total} frame={frame}/{total}")
+    return line + (f" na={na}" if na else '')
+
+
+_OUTLINE_PROMPT_SYMBOLS = {
+    'delivered': '✅',
+    'reworked': '♻️ 回炉后通过',
+    'missing': '⚠️ 正文未交付',
+    'skipped': '➖ 过门拍不交付实物',
+}
+_OUTLINE_FRAME_SYMBOLS = {
+    'visible': '✅',
+    'missing': '⚠️ 画面里看不到',
+    'unreviewed': '— 未审查',
+    'not_applicable': '➖ 隐蔽工序，封盖后不可见',
+}
+
+
+def render_outline_delivery_md(ledger):
+    """总账渲染成审核面板顶上那张「逐条工序体检表」。
+
+    用户是照着卡片上那份清单挑的选题，第一眼要看的就是这张表——现有的
+    render_outline_contract_md 渲染的是映射 diff（合并/拆分/新增/未交付），
+    回答"发生了什么改写"，回答不了"我挑的 14 条，最后落实了几条"。"""
+    if not ledger:
+        return ""
+    total = len(ledger)
+    plan = sum(1 for r in ledger if r.get('plan_verdict') != 'dropped')
+    prompt = sum(1 for r in ledger if r.get('prompt_verdict') in ('delivered', 'reworked'))
+    frame = sum(1 for r in ledger if r.get('frame_verdict') == 'visible')
+    lines = [f"### 卡片工序交付体检（{total} 条）", '',
+             f"- 有拍认领 **{plan}/{total}** · 提示词正文交付 **{prompt}/{total}** · "
+             f"画面已判定 **{frame}/{total}**（其余未审查或属隐蔽工序）"]
+    if not plan:
+        # 一条都没被认领 = 规划耗尽重试后退回了通用施工序（见 build_outline_delivery_ledger）。
+        # 这一单和"正常单只是有几条被合并"完全不是一回事，表头就得说清楚。
+        lines.append(
+            "- 🚫 **规划未采纳这份清单**：四轮重排都没能产出一条满足契约的梯子，"
+            "本单已退回与这张卡无关的通用施工序，下面每一条都没有落点。")
+    lines += ['', '| # | 卡片工序 | 落点 | 提示词 | 画面 |', '|---|---|---|---|---|']
+    for row in ledger:
+        beats = row.get('claimed_beats') or []
+        if not beats:
+            landing = '⚠️ 无人认领'
+        else:
+            seqs = row.get('frame_seqs') or [b + 1 for b in beats]
+            landing = (f"第 {'、'.join(str(b) for b in beats)} 拍 → "
+                       f"帧 {'、'.join(str(s) for s in seqs)}")
+        prompt_cell = _OUTLINE_PROMPT_SYMBOLS.get(row.get('prompt_verdict'), '—')
+        frame_cell = _OUTLINE_FRAME_SYMBOLS.get(row.get('frame_verdict'), '—')
+        text = str(row.get('text') or '').replace('|', '\\|')
+        lines.append(f"| {row.get('index')} | {text} | {landing} | {prompt_cell} | {frame_cell} |")
+    return '\n'.join(lines)
+
+
+def build_outline_plan_block(beat_outline, max_total_beats):
+    """把卡片的节拍简介渲染成送进规划器的「强制工序清单 + 绑定契约」段落。
+
+    返回 (归一后的清单条目列表, 提示词段落)。清单为空时段落是空串——老任务/老断点/
+    手动输入主题本来就没有清单，凭空要求一个"引用第几条"的数组只会让规划器编号码。
+
+    **不再是软参考**（2026-08-05）。旧文案把这份清单标成 "SOFT reference"，还明说
+    "Rewrite, merge, split, or reorder any draft entry"——于是规划器把"改写"理解成
+    "换成我认为更好的工序"，用户在卡片上照着挑的那几条就此消失（覆盖率契约只查编号，
+    查不到内容被掉包）。现在措辞是强制契约：物理规则（真实施工顺序、Threshold 拆分、
+    单里程碑包、可见里程碑）仍然优先，但它们只能让一条工序**挪位/合并/拆分**，
+    不能删除、替换、掉包。
+
+    **不按拍数裁剪**（2026-08-05）。旧行为是 [:max_total_beats - 1] + 末条：卡片推荐
+    13 拍、用户把滑块拨到 8，中间那 5 条草案**根本没进过提示词**——规划器不知道它们
+    存在，BINDING CONTRACT 的覆盖率也就管不到它们，而用户在「🔨 节拍简介」弹窗里看到
+    的仍是完整的 14 条。用户调小拍数的本意是让推进更紧凑，不是让中段工序凭空消失。
+    现在整份草案都送进去，超额部分由规划器**合并**消化（合并会留 diff、宽度受
+    _max_merge_width 约束），而不是被上游静默切掉；末条 reward 揭示自然也一直在，
+    无需再特殊保留。
+    """
+    plan = _outline_normalized_entries(beat_outline)
+    if not plan:
+        return plan, ""
+
+    lines = '\n'.join(
+        f'  {i}. {e["text"]}' + (f' [{e["op"]}]' if e.get('op') else '')
+        for i, e in enumerate(plan, 1))
+    # 宣告的宽度上界按"ladder 占满上限"算，是验收时那条（真实 ladder 更短或含过门拍
+    # 时只会更宽松）的下界——宁可先说紧的，也不能让照做的模型反而撞线。
+    merge_limit = _max_merge_width(len(plan), [{}] * max(1, int(max_total_beats or 0)))
+    budget_note = ""
+    if len(plan) > max_total_beats:
+        budget_note = (
+            f"\nBUDGET COMPRESSION: this card work plan has {len(plan)} entries but the ladder is "
+            f"capped at {max_total_beats} elements, so it does NOT fit one-to-one. Merge adjacent "
+            f"entries to absorb the surplus — never drop one. Merge only entries that share a "
+            f"material phase and resolve into one visible terminal product, spread the merges "
+            f"across the ladder instead of packing them into one or two beats, and keep the final "
+            f"reward entry on its own beat. Every index must still be claimed in some beat's "
+            f"\"outline_refs\".\n")
+    block = (
+        "\nCARD WORK PLAN (MANDATORY — this is the exact list of construction stages the user read "
+        "on the ideation card when they chose this creative. It is a hard requirement of this job, "
+        "not a suggestion, and it is what the delivered film will be judged against):\n"
+        f"{lines}\n"
+        "\nThe [bracketed tags] are each entry's declared operation. The beat that delivers an "
+        "entry must carry that same operation in its own \"operation\" field or in its "
+        "\"package_operations\".\n"
+        # 物理规则仍然优先，但"优先"的作用域必须写死：旧文案的 "Rewrite ... any draft
+        # entry" 被理解成"换成我认为更好的工序"，卡片上那条就此静默消失。
+        "\nWHAT PHYSICS MAY AND MAY NOT CHANGE: real-world construction order, the threshold split "
+        "rules, the single-milestone package rule and the visible-milestone rule still outrank this "
+        "list — they are physics and they win. But they may only ever MOVE, MERGE or SPLIT an "
+        "entry; they NEVER license you to DELETE it, REPLACE it, or SUBSTITUTE different work for "
+        "it. If an entry sits at the wrong point in the sequence, relocate it to the beat where its "
+        "work physically belongs. Do not silently swap it for work you consider better — the user "
+        "picked this creative by reading these exact stages.\n"
+        # 大纲 ↔ milestone 的 1:1 契约（2026-08-02 复盘）。旧文案明说"不必覆盖每条
+        # 草案"，于是「切割舱门装配入口梯」「铺设隐蔽水管与地暖」这类拍被静默换掉/
+        # 吞并，用户在卡片上看到的工序成片里一点痕迹都没有。改写仍然允许，但必须
+        # **认领**：每条草案拍都要有拍声明自己交付了它。
+        "\nBINDING CONTRACT (mandatory): every beat must carry an \"outline_refs\" array listing "
+        "the 1-based indices of the card work plan entries it actually delivers, and EVERY card "
+        "entry above must appear in at least one beat's \"outline_refs\". Merging is allowed — put "
+        "both indices on the beat that absorbs them. Splitting is allowed — put the same index on "
+        "each beat that carries part of it. What is NOT allowed is silently dropping an entry: if "
+        "you believe an entry cannot be delivered, still claim it on the nearest beat that carries "
+        "its work. Only the threshold/crossing beat and the final reward beat may carry an empty "
+        "\"outline_refs\".\n"
+        # 顺序：清单本身已经是施工序，认领序倒退 = 悄悄重排了用户看到的工序。
+        "\nORDER (mandatory): the entries above are already in construction order. Reading the "
+        "ladder from the first beat to the last, the indices you claim must never run backwards — "
+        "a beat may repeat the index its neighbour claimed (that is a split) and may skip ahead "
+        "(that is a merge already absorbed), but it may not claim an index lower than one an "
+        "earlier beat already claimed. If physics genuinely requires two entries to swap places, "
+        "swap them and claim them in the new order rather than interleaving them.\n"
+        # 内容绑定：编号覆盖率不查内容，认领了第 3 条却交付别的东西是零成本的。
+        # 这份英文复述是唯一能跨语言（清单中文 / 提示词英文）做确定性校验的桥。
+        "\nDELIVERY RESTATEMENT (mandatory): alongside \"outline_refs\", every beat must carry an "
+        "\"outline_delivery\" array of the SAME length and in the SAME order, where element k "
+        "restates IN ENGLISH the physical work and the terminal product of the entry named by "
+        "\"outline_refs\"[k]. Use the concrete material and object nouns you will actually use in "
+        "that beat's own \"milestone_name\" / \"after_state\". These strings are carried forward "
+        "into the prompt-composition stage and are checked against the generated IMAGE prompt "
+        "afterwards, so write the real words — never a placeholder like \"entry 3\" or a generic "
+        "\"construction work\".\n"
+        # 合并宽度上界与 _max_merge_width 同源：覆盖率满分但三条挤进一拍，用户在
+        # 卡片上挑中的那几条独立工序照样看不见（见 outline_contract_violations）。
+        f"\nMERGE WIDTH LIMIT: a single beat may claim at most {merge_limit} card work plan entries. "
+        f"Beyond that the merge is rejected and sent back for repair.\n"
+        f"{budget_note}")
+    return plan, block
+
+
+def _max_merge_width(outline_len, beat_ladder):
+    """一拍最多允许认领几条草案工序。
+
+    由鸽笼下界推出：能认领的拍数（threshold 拍按契约允许留空，不计入）除不尽草案
+    条数时，必然有拍要多担一条——所以允许值取 ceil(条数/可认领拍数)，拍数被压得很紧
+    时自动放宽，闸门永远可满足，不会把整单逼进兜底 ladder。下限 2：两条相邻同族草案
+    并作一拍是激发侧 schema 就认可的粒度（见「two closely related layers in one entry
+    is the practical maximum」）。"""
+    ladder = [b for b in (beat_ladder or []) if isinstance(b, dict)]
+    carriers = sum(1 for b in ladder
+                   if str(b.get('operation') or '') != 'threshold') or len(ladder)
+    if not carriers or outline_len <= 0:
+        return 2
+    return max(2, math.ceil(outline_len / carriers))
+
+
 def outline_contract_violations(outline, beat_ladder):
-    """契约校验的违规文案（喂回重排循环）。覆盖率必须 100%：每条大纲拍至少绑定一个
-    milestone。合并/拆分/新增本身不违规——它们是合法的改写，但必须留下 diff 记录
-    （见 outline_milestone_contract），上游据此能看见"你选的那条工序去哪了"。"""
+    """契约校验的违规文案（喂回重排循环）。两道闸门：
+
+      1) 覆盖率必须 100%——每条大纲拍至少绑定一个 milestone；
+      2) 单拍合并宽度不得超过 _max_merge_width。
+
+    拆分/新增仍然不违规，合并也依旧合法，但**宽度有上界**：只查覆盖率的话，三条草案
+    压进一拍照样是满分（server.log 33623：「堆土掩埋外壳护坡 / 高压水枪冲洗舱体油污 /
+    安装加厚防风密封木门」→ 第 2 拍一拍带过，覆盖率 100%、零违规）。用户是照着卡片上
+    那几条**各自独立的**工序挑的选题，无上界的合并等于把它们悄悄换成了一拍。
+    所有改写一律留 diff 记录（见 outline_milestone_contract），上游据此能看见
+    "你选的那条工序去哪了"。"""
     contract = outline_milestone_contract(outline, beat_ladder)
     if not contract['declared']:
         return []
     errors = []
+    _max_merge = _max_merge_width(len(_outline_entry_texts(outline)), beat_ladder)
+    for entry in contract['diff']:
+        if entry['kind'] != 'merged' or len(entry['outline_refs']) <= _max_merge:
+            continue
+        errors.append(
+            f'beat {entry["beat"]} ("{entry["milestone"]}") absorbs '
+            f'{len(entry["outline_refs"])} card work plan entries at once '
+            f'({"、".join(entry["outline_texts"])}), but at this beat budget one beat may claim '
+            f'at most {_max_merge}. Full coverage is not enough — the user picked this card for '
+            f'those as DISTINCT visible milestones. Give the surplus entries their own beat, or '
+            f'move one onto an adjacent beat that currently claims fewer, instead of collapsing '
+            f'them into a single milestone.')
     for idx, text in contract['uncovered']:
         errors.append(
-            f'beat_outline entry {idx} ("{text}") is not delivered by any beat — every draft-plan '
+            f'card work plan entry {idx} ("{text}") is not delivered by any beat — every card '
             f'entry must be claimed by at least one beat\'s "outline_refs". If this beat\'s work is '
             f'genuinely absorbed by a neighbour, list its index in THAT beat\'s "outline_refs" '
             f'instead of dropping it.')
@@ -12390,12 +12528,185 @@ def outline_contract_violations(outline, beat_ladder):
             if not re.search(r'\boccupant|\bresident|\bdweller|\binhabitant|\bperson\b|\bpeople\b'
                              r'|\bmoves? in\b|\bmoving in\b|\bliving in\b|\busing the space\b', body):
                 errors.append(
-                    'the draft plan asks for people moving in / using the space, so the final '
+                    'the card work plan asks for people moving in / using the space, so the final '
                     'reward beat must deliver an OCCUPANT as a hard deliverable: its "description" '
                     'and "after_state" must name the occupant entering and using the finished '
                     'space. The zero-worker rule covers CONSTRUCTION workers only and must not '
                     'delete the occupant this project was pitched on.')
     return errors
+
+
+def _beat_outline_delivery(beat, refs):
+    """一拍为它认领的每条工序写的英文复述，按 refs 的顺序对齐。
+
+    规划器给的 outline_delivery 与 outline_refs **在原始 JSON 里**是等长同序的，但
+    _beat_outline_refs 会去重+升序，两者可能错位。所以这里按原始 outline_refs 的顺序
+    配对，再挑出 refs 里真实存在的那几条——错位的复述宁可判缺失，也不能张冠李戴地
+    喂进下游的内容校验。"""
+    if not isinstance(beat, dict):
+        return {}
+    raw_refs = beat.get('outline_refs')
+    raw_delivery = beat.get('outline_delivery')
+    if not isinstance(raw_refs, list) or not isinstance(raw_delivery, list):
+        return {}
+    paired = {}
+    for raw_ref, text in zip(raw_refs, raw_delivery):
+        try:
+            n = int(str(raw_ref).strip())
+        except (TypeError, ValueError):
+            continue
+        text = str(text or '').strip()
+        if n in refs and text:
+            paired.setdefault(n, text)
+    return paired
+
+
+# 复述里出现这些就等于没写：规划器偷懒时最常见的两种占位形态（指代编号、泛指施工）。
+_OUTLINE_DELIVERY_PLACEHOLDER = re.compile(
+    r'^\W*(?:entry|item|index|draft|plan|beat|step|stage)\s*#?\d*\W*$'
+    r'|^\W*(?:construction|renovation|building)?\s*work\W*$'
+    r'|^\W*(?:see|as)\s+(?:above|below|described)\b', re.IGNORECASE)
+
+
+def outline_binding_violations(outline, beat_ladder):
+    """认领得**忠实**吗——覆盖率之外的三道闸门（2026-08-05，节拍简介升级为硬规则）。
+
+    outline_contract_violations 只回答"每条工序都被某拍认领了吗、有没有一拍吞太多"，
+    查的全是**编号**。认领第 3 条却交付完全不相干的工作，在那套校验里是零成本的
+    ——用户在卡片上挑中的工序照样消失，只是这回连 diff 都看不出来（编号是对的）。
+    这里补上"认领是否名副其实"的三层：
+
+      1) ORDER —— 认领序不得倒退。清单本身就是施工序，倒退 = 悄悄重排了用户看到的
+         工序表。拆分（同一编号出现在相邻多拍）与合并（跳号）都不算倒退。
+      2) OPERATION —— 认领某条工序的拍，必须在自己的 operation / package_operations
+         里带上那条工序声明的 op。这是唯一能**跨语言**做的确定性内容校验：清单是中文、
+         ladder 是英文，但两边的工序类型枚举完全同源（见 _OUTLINE_OPS）。
+      3) DELIVERY —— 每条认领都要有一句英文复述（outline_delivery）。它既是内容被真正
+         读进去的证据，也是下游 check_outline_delivery_realized 唯一的英文抓手。
+
+    与 outline_contract_violations 分家而不是合并进去：那一套的语义是"映射完整性"，
+    老 ladder / 老断点没有 outline_delivery 也不该因此被判违规；这一套是新契约，
+    只在规划器真的声明了 outline_refs（contract['declared']）时才生效。
+    """
+    contract = outline_milestone_contract(outline, beat_ladder)
+    if not contract['declared']:
+        return []
+    entries = _outline_normalized_entries(outline)
+    ladder = [b for b in (beat_ladder or []) if isinstance(b, dict)]
+    errors = []
+
+    highest_claimed = 0
+    highest_beat = 0
+    for pos, beat in enumerate(ladder, 1):
+        refs = _beat_outline_refs(beat, len(entries))
+        if not refs:
+            continue
+        milestone = str(beat.get('milestone_name') or beat.get('description') or '')[:60]
+
+        # 1) 认领序不得倒退
+        backwards = [n for n in refs if n < highest_claimed]
+        if backwards:
+            errors.append(
+                f'beat {pos} ("{milestone}") claims card entry '
+                f'{"、".join(str(n) for n in backwards)} '
+                f'({"、".join(entries[n - 1]["text"] for n in backwards)}), but beat {highest_beat} '
+                f'already claimed entry {highest_claimed} further down the list. The card work plan '
+                f'is in construction order and the indices you claim must never run backwards. '
+                f'Either move this work to a beat before beat {highest_beat}, or — if physics really '
+                f'requires the swap — claim the two entries in their new order instead of '
+                f'interleaving them.')
+        if refs[-1] > highest_claimed:
+            highest_claimed, highest_beat = refs[-1], pos
+
+        # 2) 认领的工序类型必须真的在这拍身上
+        beat_ops = ' '.join([str(beat.get('operation') or '')]
+                            + [str(op) for op in (beat.get('package_operations') or [])]).lower()
+        for n in refs:
+            op = entries[n - 1]['op']
+            # op 未声明（老形态的纯字符串条目）时无从比对，跳过而不是硬判
+            if not op or op not in _OUTLINE_OPS_SET:
+                continue
+            if op in ('threshold', 'reward'):
+                # 过门/揭示拍的 operation 由 threshold 拆分规则和 reward 规则各自钉死，
+                # 认领它们的拍未必用同名 operation（过门可能被 bridge_stage/hard_cut 表达）
+                continue
+            if op not in beat_ops:
+                errors.append(
+                    f'beat {pos} ("{milestone}") claims card entry {n} '
+                    f'("{entries[n - 1]["text"]}", declared operation "{op}"), but this beat\'s '
+                    f'operation is "{beat.get("operation")}" and its package_operations are '
+                    f'{beat.get("package_operations") or []} — neither carries "{op}". A beat that '
+                    f'claims an entry must actually do that entry\'s work: either add "{op}" to '
+                    f'this beat\'s package_operations, or move the claim to the beat that really '
+                    f'delivers it.')
+
+        # 3) 每条认领都要有一句可用的英文复述
+        delivery = _beat_outline_delivery(beat, refs)
+        for n in refs:
+            text = delivery.get(n)
+            if not text:
+                errors.append(
+                    f'beat {pos} ("{milestone}") claims card entry {n} '
+                    f'("{entries[n - 1]["text"]}") but gives no matching "outline_delivery" string. '
+                    f'"outline_delivery" must have the same length and order as "outline_refs" and '
+                    f'restate each claimed entry in English, using the concrete nouns this beat\'s '
+                    f'own milestone/after_state uses.')
+            elif _OUTLINE_DELIVERY_PLACEHOLDER.match(text) or not _milestone_keywords(text):
+                # 中文复述也落在这里（_milestone_keywords 只认英文词）。这是有意的：
+                # 这串是清单(中文)与提示词(英文)之间唯一的跨语言抓手，写成中文的话
+                # 下游 check_outline_delivery_realized 拿它去 IMAGE 正文里永远匹配不上。
+                errors.append(
+                    f'beat {pos} ("{milestone}") restates card entry {n} '
+                    f'("{entries[n - 1]["text"]}") as "{text}", which carries no usable English '
+                    f'content words. "outline_delivery" must be written IN ENGLISH and name the '
+                    f'physical material and the terminal product, in the same words this beat\'s '
+                    f'own milestone/after_state uses — never a placeholder, never Chinese.')
+    return errors
+
+
+def bind_outline_to_ladder(config, outline, beat_ladder, violations=None):
+    """节拍梯验收后的收口：把卡片工序清单钉死在梯子上。
+
+    做三件事：
+      1) 映射 diff 记进 config['_outline_contract']，审核面板据此显示"卡片上那条工序
+         去哪了"（见 render_outline_contract_md）；
+      2) 每一拍挂上 beat['outline_items'] —— 它认领的那几条工序的**原文 + 英文复述**。
+         这是节拍简介从"只影响规划"变成"硬规则"的关键一步：提示词合成阶段
+         （_milestone_beat_directive）与合成后的内容校验
+         （check_outline_delivery_realized）全都从这个字段读，中间不再有断点。
+         钉在 beat 上而不是另开参数，是因为 beat 字典本来就一路流到批量/单拍两条
+         合成路径、断点存档和回炉函数里，加参数要动七八处签名还漏掉断点续传。
+      3) 人物类交付物在 reward 拍上打标，让通用的"无人干净帧"规则给它让路
+         （见 beat_requires_occupant / check_occupant_delivered）。
+    """
+    entries = _outline_normalized_entries(outline)
+    contract = outline_milestone_contract(outline, beat_ladder)
+    if isinstance(config, dict) and contract['declared']:
+        config['_outline_contract'] = contract
+    if contract['diff'] and sys.stdout:
+        print(f"[OUTLINE] 大纲→milestone 映射 diff "
+              f"(覆盖率 {contract['coverage']:.0%}): {contract['diff']}")
+    if violations and sys.stdout:
+        print(f"[OUTLINE] 契约未完全满足: {violations}")
+
+    for beat in (beat_ladder or []):
+        if not isinstance(beat, dict):
+            continue
+        refs = _beat_outline_refs(beat, len(entries))
+        if not refs:
+            continue
+        delivery = _beat_outline_delivery(beat, refs)
+        beat['outline_items'] = [{'index': n,
+                                  'text': entries[n - 1]['text'],
+                                  'delivery': delivery.get(n, '')}
+                                 for n in refs]
+
+    if outline_requires_occupancy(outline):
+        for beat in reversed(beat_ladder or []):
+            if isinstance(beat, dict) and str(beat.get('operation') or '') == 'reward':
+                beat['requires_occupant'] = True
+                break
+    return beat_ladder
 
 
 def outline_skeleton_violations(idea):

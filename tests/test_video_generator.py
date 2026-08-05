@@ -9,7 +9,6 @@ from unittest.mock import patch
 from video_generator import (
     rewrite_prompt_for_two_card_ui,
     load_slot_frames,
-    load_drift_break_slots,
     plan_video_slots,
     _ManifestWriter,
     _video_info,
@@ -244,76 +243,15 @@ class TestPlanVideoSlots(_TmpDirCase):
         self.assertIn('旧 i2i 链', plans[1]['warning'])
         self.assertNotIn('warning', plans[0])
 
-    def test_chain_drift_break_blocks_standard_warns_lenient(self):
-        """链回望 FAIL 段（manifest.chain_drift passed=False）覆盖的槽位：standard 拦、
-        lenient 警告放行、off 放行。2026-07-15 盐湖贝壳单 anchor=6/tail=9 FAIL 被无视，
-        vid_006 在室外/室内两张无关帧之间自由变形——此门即为该事故补的。"""
+    def test_unreviewed_anchor_is_warned_about_not_blocked(self):
+        """渲染期不再产生任何判定，帧默认停在 pending_manual_review。这不是坏帧，
+        不该拦；但花视频额度那一刻必须把"这张没人看过"说出来。"""
         frames = self._make_frames(4)
-        drift = {2, 3}  # 模拟 anchor=2 / tail=4 的 FAIL 段
-        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='standard', drift_slots=drift)
-        self.assertEqual([p['action'] for p in plans], ['generate', 'blocked', 'blocked'])
-        self.assertIn('空间断裂', plans[1]['reason'])
-        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='lenient', drift_slots=drift)
+        quality = {s: 'pending_manual_review' for s in (1, 2, 3, 4)}
+        plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                  gate_level='standard')
         self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
-        self.assertIn('空间断裂', plans[1]['warning'])
-        self.assertNotIn('warning', plans[0])
-        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='off', drift_slots=drift)
-        self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
-
-    def test_override_flagged_bypasses_chain_drift_block(self):
-        """2026-07-24 修复：链回望空间断裂（chain_drift）此前不受 override_flagged
-        影响——实录案例：用户确认风险后 sequence_review_flagged 帧对应的视频被放行
-        了，但同一批里被链回望标记为 FAIL 段的槽位（4-12）仍然全部 blocked，锚点帧
-        从未被提交生成/上传到视频后端，用户的"确认风险"只对一部分槽位生效。"""
-        frames = self._make_frames(4)
-        drift = {2, 3}
-        plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                  gate_level='standard', drift_slots=drift, override_flagged=True)
-        self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
-        self.assertIn('空间断裂', plans[1]['warning'])
-        self.assertNotIn('warning', plans[0])
-
-    def test_stale_and_drift_warnings_are_both_kept_when_released(self):
-        """同一个槽位同时命中血统过期与空间断裂时，放行后两条警告都要在——报一条
-        就会让人以为只有一个问题。血统过期自 2026-07-30 起在 lenient 档也拦
-        （见 test_stale_lineage_blocks_unless_gate_off），所以"放行"只剩两条路径：
-        用户确认风险强制生成，或整体停用质检。两条都验。"""
-        frames = self._make_frames(4)
-        for kwargs in ({'gate_level': 'standard', 'override_flagged': True},
-                       {'gate_level': 'off'}):
-            plans = plan_video_slots(self.VIDEOS, frames, {}, self.videos_dir,
-                                      stale_slots={2}, drift_slots={2}, **kwargs)
-            w = plans[1]['warning']
-            self.assertIn('旧 i2i 链', w, kwargs)
-            self.assertIn('空间断裂', w, kwargs)
-
-
-class TestLoadDriftBreakSlots(unittest.TestCase):
-    """manifest.chain_drift FAIL 段 → 受影响视频槽位（anchor..tail-1）。"""
-
-    def test_failed_entry_covers_anchor_to_tail_minus_one(self):
-        manifest = {'chain_drift': [
-            {'family_anchor': 1, 'mid': 3, 'tail': 4, 'passed': True, 'reason': 'PASS'},
-            {'family_anchor': 6, 'mid': 8, 'tail': 9, 'passed': False, 'reason': 'FAIL: 断裂'},
-        ]}
-        # 2026-07-15 实案：anchor=6/tail=9 FAIL → vid 6/7/8 都可能横跨断裂
-        self.assertEqual(load_drift_break_slots(manifest), {6, 7, 8})
-
-    def test_passed_and_malformed_entries_are_ignored(self):
-        manifest = {'chain_drift': [
-            {'family_anchor': 1, 'tail': 4, 'passed': True},
-            {'family_anchor': 'x', 'tail': 9, 'passed': False},
-            {'tail': 9, 'passed': False},
-            'not a dict',
-        ]}
-        self.assertEqual(load_drift_break_slots(manifest), set())
-
-    def test_missing_chain_drift_key_or_empty_manifest(self):
-        self.assertEqual(load_drift_break_slots({}), set())
-        self.assertEqual(load_drift_break_slots(None), set())
+        self.assertIn('未经过一致性审查', plans[0]['warning'])
 
 
 class TestLoadSlotFrames(_TmpDirCase):

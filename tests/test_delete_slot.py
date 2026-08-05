@@ -69,7 +69,6 @@ def project(tmp_path):
              'status': 'success', 'anchor_check': f'ok-{s}'}
             for s in (1, 2, 3)
         ],
-        'chain_drift': [{'family_anchor': 1, 'tail': 4, 'passed': True}],
         'merged_video': {'file': 'outputs/x/merged.mp4', 'status': 'success'},
     }
     with open(os.path.join(project_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
@@ -224,7 +223,7 @@ class TestDeleteMiddleBeat:
         assert '删除' in videos[1]['anchor_check']
         assert body['affected_video_slots'] == [1]
 
-    def test_merged_video_and_chain_drift_dropped(self, project, monkeypatch):
+    def test_merged_video_dropped(self, project, monkeypatch):
         monkeypatch.setattr(server, '_get_project_dir', lambda title: project['dir'])
         h, sent = _delete_handler({'title': 'delete_slot_test', 'sequence': 2,
                                    'prompt_block': _prompt_block()})
@@ -233,7 +232,6 @@ class TestDeleteMiddleBeat:
 
         mdata = _manifest(project)
         assert 'merged_video' not in mdata
-        assert 'chain_drift' not in mdata, "链回望结论按帧号记账，整体前移后全部失效"
 
     def test_fx_source_archives_are_renumbered(self, project, monkeypatch):
         """FX 路径给每帧留档的原始 jpg 按 img_NNN_ 前缀查找参考：留在原位会让重试
