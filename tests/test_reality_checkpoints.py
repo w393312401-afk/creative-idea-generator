@@ -31,10 +31,15 @@ from pipeline_orchestrator import (
     _segment_progress,
 )
 
-STANZA = ("Locked anchors: rusted silo shell at Grid B2 holding 65 percent of frame height, "
-          "concrete footing at Grid C2 holding 20 percent of frame height.")
-NEW_STANZA = ("Locked anchors: rusted silo shell at Grid B2 holding 50 percent of frame height, "
-              "concrete footing at Grid C1 holding 20 percent of frame height.")
+# 2026-08-05：锚点句改成散文形态。格位标签与数字会被图像模型渲成画面上的文字
+# （实测判废原因："画面中出现了多处异常的字母叠加渲染标记（A、A、C）"），
+# recalibrate_anchor_stanza 现在也会拒收带记号或数字的校准结果。
+STANZA = ("Locked anchors: rusted silo shell at the centre of the frame, rising to about two "
+          "thirds of the frame height; concrete footing across the lower centre of the frame, "
+          "rising to about a sixth of the frame height.")
+NEW_STANZA = ("Locked anchors: rusted silo shell at the centre of the frame, rising to about "
+              "half the frame height; concrete footing in the lower left of the frame, "
+              "rising to about a sixth of the frame height.")
 
 
 class TestStanzaSurgery(unittest.TestCase):
@@ -90,13 +95,20 @@ class TestRecalibrateAnchorStanza(unittest.TestCase):
 
     def test_format_violations_rejected(self):
         self.assertIsNone(self._call('The anchors moved a bit.'))          # 缺前缀
-        self.assertIsNone(self._call(NEW_STANZA.replace(' percent', '%')))  # % 字形
+        self.assertIsNone(self._call(f'{NEW_STANZA} 50%'))                  # % 字形
         self.assertIsNone(self._call(NEW_STANZA.rstrip('.')))               # 缺句号
         self.assertIsNone(self._call(f'{NEW_STANZA} Extra sentence.'))      # 多句
 
+    def test_notation_relapse_rejected(self):
+        """判定模型退回旧格式时必须整句弃用：这句会写进链条剩余每一帧，
+        放进去一个 Grid 标签或一个数字，等于把文字水印批量注入后半条链。"""
+        relapsed = ("Locked anchors: rusted silo shell at Grid B2 holding 50 percent of frame "
+                    "height; concrete footing at Grid C1 holding 20 percent of frame height.")
+        self.assertIsNone(self._call(relapsed))
+
     def test_dropped_anchor_name_rejected(self):
         # 名称集合守恒：少了 concrete footing 的输出不可采纳
-        bad = "Locked anchors: rusted silo shell at Grid B2 holding 50 percent of frame height."
+        bad = "Locked anchors: rusted silo shell at the centre of the frame, rising to about half the frame height."
         self.assertIsNone(self._call(bad))
 
     def test_identical_output_returns_none(self):

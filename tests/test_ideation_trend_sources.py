@@ -301,8 +301,11 @@ class TestRunIdeateReturnShape(unittest.TestCase):
             # 兜底列表也要带逐拍工序简介(卡片上的「工序预览」),长度 = 推荐拍数 + 1
             # (末条是 reward 揭示拍),否则 LLM 全挂时卡片会退化成没有工序的空壳
             self.assertEqual(len(idea['beat_outline']), idea['recommended_beats'] + 1)
-            self.assertTrue(all(isinstance(s, str) and s.strip() for s in idea['beat_outline']))
-            self.assertTrue(all(len(s) <= 16 for s in idea['beat_outline']))
+            # P1-C: normalize 后每条是 {op, text} dict
+            self.assertTrue(all(
+                isinstance(s, dict) and isinstance(s.get('text'), str) and s['text'].strip()
+                for s in idea['beat_outline']))
+            self.assertTrue(all(len(s['text']) <= 16 for s in idea['beat_outline']))
         # 兜底路径也要把已拿到的联网参考带回前端
         self.assertEqual(result['trend_refs'][0]['source'], 'web_search')
 
@@ -497,8 +500,14 @@ class TestBeatOutlineDelivery(unittest.TestCase):
                              '铺装成品地板', '点亮灯带,人物入住'],
         }], ensure_ascii=False)
         result, _ = self._run(lambda *a, **k: payload)
-        self.assertEqual(result['ideas'][0]['beat_outline'],
-                         ['清运积渣', '5', '架设墙顶龙骨', '铺装成品地板', '点亮灯带,人物入住'])
+        # P1-C: normalize 后每条是 {op: None, text} dict（旧字符串形态 op 为 None）
+        self.assertEqual(result['ideas'][0]['beat_outline'], [
+            {'op': None, 'text': '清运积渣'},
+            {'op': None, 'text': '5'},
+            {'op': None, 'text': '架设墙顶龙骨'},
+            {'op': None, 'text': '铺装成品地板'},
+            {'op': None, 'text': '点亮灯带,人物入住'},
+        ])
         # 拍数一律由清单长度派生,模型申报的数字不再有话语权(见 §1.3)
         self.assertEqual(result['ideas'][0]['recommended_beats'], 4)
 
@@ -508,8 +517,13 @@ class TestBeatOutlineDelivery(unittest.TestCase):
             'beat_outline': '清运积渣\n架设龙骨\n铺装地板\n点亮灯带,人物入住',
         }], ensure_ascii=False)
         result, _ = self._run(lambda *a, **k: payload)
-        self.assertEqual(result['ideas'][0]['beat_outline'],
-                         ['清运积渣', '架设龙骨', '铺装地板', '点亮灯带,人物入住'])
+        # P1-C: 单字符串拆分后也变成 {op: None, text} dict 列表
+        self.assertEqual(result['ideas'][0]['beat_outline'], [
+            {'op': None, 'text': '清运积渣'},
+            {'op': None, 'text': '架设龙骨'},
+            {'op': None, 'text': '铺装地板'},
+            {'op': None, 'text': '点亮灯带,人物入住'},
+        ])
 
     def test_batch_with_no_outline_at_all_is_retried(self):
         """整批一条 beat_outline 都没有 = 模型整个忽略了这个字段,重试后用合规的那批。"""

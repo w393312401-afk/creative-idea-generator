@@ -179,6 +179,9 @@ OMNI_INSHOT_MARKER = 'the only compressions in the clip fall exactly on the list
 # STYLE = 只留痕不回炉（记号类瑕疵回炉一轮也未必修得掉，还要多烧一次调用）。
 OMNI_VIDEO_ERROR_PREFIX = 'OMNI VIDEO CONTRACT: '
 OMNI_VIDEO_STYLE_PREFIX = 'OMNI VIDEO STYLE: '
+# IMAGE 侧同样只留痕：IMAGE 走的是 base 的合成链路，回炉会把 base 的 IMAGE 契约
+# 一起重跑，代价远大于一处记号瑕疵。
+OMNI_IMAGE_STYLE_PREFIX = 'OMNI IMAGE STYLE: '
 
 # base 专属、在 omni 下不再成立的校验项。只按精确文案过滤，不做模糊匹配——否则会
 # 顺手吃掉真正的瑕疵。
@@ -235,7 +238,35 @@ _SMALL_INTEGER_WORDS = {
     14: 'fourteen', 15: 'fifteen', 16: 'sixteen', 17: 'seventeen', 18: 'eighteen',
     19: 'nineteen', 20: 'twenty',
 }
-_DIGIT_COUNT_RE = re.compile(r'(?<![\d.])\b(\d{1,2})\b(?=\s+[A-Za-z])')
+_TENS_WORDS = {
+    2: 'twenty', 3: 'thirty', 4: 'forty', 5: 'fifty',
+    6: 'sixty', 7: 'seventy', 8: 'eighty', 9: 'ninety',
+}
+# 三位数才够覆盖画高比例（`45 percent of frame height`）。此前只认两位，于是二十以上
+# 的计数与**全部**比例数字都从确定性改写里漏了过去，只在 _stray_digits 里留一条记号
+# 瑕疵——记号禁用因此在二十以上的数字上形同虚设。
+_DIGIT_COUNT_RE = re.compile(r'(?<![\d.])\b(\d{1,3})\b(?=\s+[A-Za-z])')
+
+
+def _integer_to_words(n):
+    """0-100 的整数折成英文单词；超出范围返回 None（不硬改，交给门禁报）。
+
+    21-99 写成 `forty-five` 这种带连字符的形态是**有意的**：base 的
+    _PERCENT_NEAR_PATTERN 正是按 `(?:forty)(?:[-\\s](?:five))?[-\\s]?percent` 认的，
+    _parse_percent_token 也接受词形。所以把比例数字拼写出来之后，SCUP 的
+    check_anchor_scale_lock / check_worker_scale_lock 依然解析得到同一个数——
+    记号禁用与漂移门禁不必二选一。改成别的写法（`forty five`、`45`）会让其中一边失效。"""
+    if n in _SMALL_INTEGER_WORDS:
+        return _SMALL_INTEGER_WORDS[n]
+    if n == 0:
+        return 'zero'
+    if n == 100:
+        return 'one hundred'
+    if 21 <= n <= 99:
+        tens, unit = divmod(n, 10)
+        word = _TENS_WORDS[tens]
+        return word if unit == 0 else f"{word}-{_SMALL_INTEGER_WORDS[unit]}"
+    return None
 
 
 def _normalized(text):
@@ -417,6 +448,37 @@ def _stray_digits(text):
     probe = _TIMELINE_RE.sub(' ', text or '')
     probe = re.sub(r'\bimage\s+\d+', ' ', probe, flags=re.IGNORECASE)
     return sorted(set(re.findall(r'\d+(?:\.\d+)?', probe)))
+
+
+# Grid 单元格里的那位数字（`Grid B2` 的 2）不算记号违规——omni 的记号禁用确实把 Grid
+# 记法也列为违规，但 base 的 primary-landmark-restatement / anchor-scale-lock 要求 IMAGE
+# 按 packet 逐字重述 Grid 单元格，那是 SCUP 漂移门禁唯一的解析锚点。这条冲突登记在
+# contract-registry.json 的 omni-grid-notation-ban（enforcer 为 null），此处只是不把它
+# 重复报成"数字违规"，免得真正可修的数字被淹掉。
+_GRID_CELL_RE = re.compile(r'\bgrid\s+[a-z]\d\b', re.IGNORECASE)
+
+
+def _stray_digits_image(text):
+    """IMAGE 正文里的阿拉伯数字，扣除 IMAGE 编号与 Grid 单元格。"""
+    probe = _GRID_CELL_RE.sub(' ', text or '')
+    probe = re.sub(r'\bimage\s+\d+', ' ', probe, flags=re.IGNORECASE)
+    return sorted(set(re.findall(r'\d+(?:\.\d+)?', probe)))
+
+
+def omni_image_violations(image_prompt):
+    """IMAGE 正文对 omni 记号禁用的违规项。空列表 = 合规。
+
+    此前记号禁用只在 VIDEO 上有门禁（_stray_digits），IMAGE 一侧既不改写也不校验，
+    而 base 的锚点重述句恰恰会往 IMAGE 里写 `holding 45 percent of frame height`——
+    契约在文档里写着"适用于 prompt bodies"，实现上却有一半没人管。"""
+    stray = _stray_digits_image(image_prompt)
+    if not stray:
+        return []
+    return [
+        OMNI_IMAGE_STYLE_PREFIX
+        + "IMAGE 正文出现阿拉伯数字（" + ', '.join(stray)
+        + "）——记号禁用同样适用于 IMAGE，计数与画高比例一律写成英文单词"
+    ]
 
 
 def omni_video_violations(video_prompt, ladder=None, duration=None):
@@ -651,6 +713,11 @@ single continuous take、one continuous take、single take、unbroken take 或�
         _discarded_video, fixed_image = pp.apply_proactive_fixes(
             i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
             beat=beat, config=config, family=family)
+        # 记号禁用适用于两侧的 prompt body，不只 VIDEO。base 的锚点重述句会写进
+        # `holding 45 percent of frame height`，词形化之后 SCUP 的比例门禁照样解析
+        # 得到同一个数（_integer_to_words 的连字符形态就是为此选的），所以这里可以
+        # 直接折数字，不必给 IMAGE 开一个例外。
+        fixed_image = _digits_to_words(fixed_image)
         fixed_video = self.fix_omni_video(
             i, video_prompt, packet, is_threshold_or_reveal, beat=beat, config=config, family=family)
         return fixed_video, fixed_image
@@ -670,9 +737,11 @@ single continuous take、one continuous take、single take、unbroken take 或�
             video_word_limit=video_word_targets(len(_ceiling_ladder))[1])
         errs = [e for e in (errs or [])
                 if not any(snippet in e for snippet in _BASE_ONLY_ERROR_SNIPPETS)]
-        return errs + omni_video_violations(
-            video_prompt, ladder=ladder,
-            duration=self.clip_duration() if ladder else None)
+        return (errs
+                + omni_video_violations(
+                    video_prompt, ladder=ladder,
+                    duration=self.clip_duration() if ladder else None)
+                + omni_image_violations(image_prompt))
 
     def split_structural_video_errors(self, errs):
         """omni 的镜头语法违规算结构性硬伤：镜头梯缺失时 Omni 会退回一条平淡的长镜头，
@@ -917,7 +986,7 @@ def _digits_to_words(text):
         prefix = source[max(0, match.start() - 6):match.start()].lower()
         if prefix.endswith('image '):
             return match.group(0)
-        return _SMALL_INTEGER_WORDS.get(int(match.group(1)), match.group(0))
+        return _integer_to_words(int(match.group(1))) or match.group(0)
 
     return _DIGIT_COUNT_RE.sub(replace, source)
 

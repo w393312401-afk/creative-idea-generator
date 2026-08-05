@@ -81,6 +81,61 @@ def test_nested_space_has_visible_divider_traversal_and_no_hard_cut():
     assert pp.beat_space_index(expanded, threshold['index']) == 2
 
 
+def test_expanded_crossing_stages_own_their_state_and_carry_no_construction():
+    """One planner marker fans out into several stages; each must own its camera-position
+    state and inherit none of the marker's milestone/trace fields.  Cloning them shipped
+    three byte-identical beats in the 2026-08-05 petrified-cypress run."""
+    marker = {'index': 3, 'operation': 'threshold', 'description': 'primary crossing',
+              'bridge_stage': 1, 'milestone_name': 'interior threshold crossing complete',
+              'before_state': 'Camera is outside looking up at the arch.',
+              'after_state': 'Camera is fully inside the cavity.',
+              'completion_extent': 'the whole crossing',
+              'changed_grid_cells': ['B2'], 'package_operations': ['threshold'],
+              'persistent_traces': ['footprints on threshold entrance log']}
+    ladder = [b for b in _marker_ladder() if b['operation'] != 'threshold']
+    ladder.insert(2, marker)
+    stages = [b for b in pp.expand_spatial_transition_beats(copy.deepcopy(ladder),
+                                                            _brief('vertical_axial'))
+              if b['transition_stage'] != 'none']
+
+    assert len({b['before_state'] for b in stages}) == len(stages)
+    assert len({b['after_state'] for b in stages}) == len(stages)
+    for stage in stages:
+        assert stage['milestone_name'] == ''
+        assert stage['completion_extent'] == ''
+        assert stage['persistent_traces'] == []
+        assert stage['changed_grid_cells'] == []
+        assert stage['package_operations'] == []
+        assert marker['after_state'] not in (stage['before_state'], stage['after_state'])
+
+
+def test_hardware_crossing_stage_never_claims_a_door_no_beat_installed():
+    """entrance_topology.hardware is a topology ledger, not proof a leaf exists.  Asserting one
+    on a found carrier made the renderer bolt hinges onto bare shell and made the paired VIDEO
+    smuggle a full door installation into a crossing clip."""
+    ladder = _marker_ladder()
+    stage = next(b for b in pp.expand_spatial_transition_beats(copy.deepcopy(ladder),
+                                                               _brief('vertical_axial'))
+                 if b['transition_stage'] == 'door_hardware_open')
+    assert 'no door leaf, hinge, latch or gasket exists yet' in stage['description']
+    assert 'nothing is installed, delivered or mounted' in stage['description']
+
+    installed = copy.deepcopy(ladder)
+    installed[1]['description'] = 'cedar door leaf and hinges mounted in the archway'
+    fitted = next(b for b in pp.expand_spatial_transition_beats(installed, _brief('vertical_axial'))
+                  if b['transition_stage'] == 'door_hardware_open')
+    assert 'a previous beat already installed' in fitted['description']
+
+
+def test_entrance_hardware_detection_ignores_substring_lookalikes():
+    for decoy in ('the outdoor slope is regraded', 'interlocking block paving is laid'):
+        ladder = _marker_ladder()
+        ladder[1]['description'] = decoy
+        stage = next(b for b in pp.expand_spatial_transition_beats(ladder, _brief('vertical_axial'))
+                     if b['transition_stage'] == 'door_hardware_open')
+        assert 'no door leaf, hinge, latch or gasket exists yet' in stage['description']
+
+
 def test_packet_inherits_all_spatial_ledgers():
     brief = _brief('vertical_axial')
     packet = pp.merge_spatial_contract_into_packet({'camera_dna': 'locked'}, brief)

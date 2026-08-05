@@ -506,6 +506,19 @@ _FLAGGED_GATE_LABELS = {
     'manual_flagged': '被人工标记存在问题',
 }
 
+# 「从来没被判过」的帧。一致性审查自 2026-07-24 起改成手动触发（见
+# pipeline_orchestrator._sequence_consistency_review），所以"渲染继续往后跑、审查停在
+# 第 N 帧"是完全正常的路径，这些帧会一直停在初始的 pending_manual_review 上。
+# 它们不是坏帧，不该拦截；但此前也**完全没有任何提示**，于是未经判定的锚点帧照常烧
+# 视频额度出片——实测某一单 12 帧里有 4 帧是这个状态，而汇总显示"审查通过"。
+# 这里只做一件事：在花钱那一刻把"这张没人看过"说出来。
+_UNREVIEWED_QUALITY_GATES = ('pending_manual_review', 'sequence_review_skipped')
+
+_UNREVIEWED_GATE_LABELS = {
+    'pending_manual_review': '从未经过一致性审查',
+    'sequence_review_skipped': '审查服务不可用，此帧未经审查',
+}
+
 
 def load_slot_frames(manifest_data, frames_dir, image_count):
     """从 manifest.frames 建立 槽位→帧绝对路径 与 槽位→质量门标记 的映射；
@@ -822,6 +835,17 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                 warnings.append(
                     f"视频 {slot} 位于链回望检测到的空间断裂族段内（chain_drift FAIL），"
                     f"两端帧可能不属于同一空间/机位，片段存在跳变/变形风险。"
+                )
+            # 未经判定的锚点帧：不拦（审查是手动的，没审不等于有问题），但必须说出来。
+            _unjudged = [s for s in (start_slot, slot + 1)
+                         if slot_to_quality.get(s) in _UNREVIEWED_QUALITY_GATES]
+            if _unjudged:
+                _names = '、'.join(f"IMAGE {s}" for s in _unjudged)
+                _gate = slot_to_quality.get(_unjudged[0])
+                warnings.append(
+                    f"视频 {slot} 的锚点帧 {_names} {_UNREVIEWED_GATE_LABELS.get(_gate, '未经审查')}"
+                    f"（{_gate}）——这段的画面一致性没有任何判定背书。若要先审再出片，"
+                    f"请在帧网格点「一致性审查」。"
                 )
             # i2v 帧对契约：两端锚点帧近乎相同→静止片段，差异过大→断裂/变形。
             # 提示性警告（不拦截）：断裂的硬拦截由 chain_drift 门负责，这里兜住

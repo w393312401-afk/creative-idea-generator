@@ -1,0 +1,190 @@
+{
+  "contract_version": "1.0",
+  "package": "gemini-veo-restoration-composer",
+  "profile": "base",
+  "_comment": [
+    "机器可读的契约注册表：SKILL.md 与各 references/*.md 里用散文写的契约，在这里",
+    "登记成「一条契约 → 一个真实执行者」。运行时不读 SKILL.md（它只做存在性证明），",
+    "全部执行都由 Python 门禁完成，所以散文和门禁之间需要这张表来防漂移。",
+    "",
+    "enforcer 写成 '模块:函数'，由 tests/test_skill_contract_registry.py 逐条 import 校验；",
+    "写了一个不存在的名字会红，改名/删函数而忘了改契约也会红。",
+    "确实没有执行者的契约必须把 enforcer 置 null 并写 gap 说明理由——那是**登记在案的**",
+    "缺口，不是遗漏。P0 允许有 gap，但必须显式承认，不允许悄悄没人管。",
+    "",
+    "contract_version 采用 主.次：主版本与代码侧 server_common.SUPPORTED_CONTRACT_VERSION",
+    "不一致即视为技能包与运行时脱节，由 /api/mode 上报给前端。"
+  ],
+  "contracts": [
+    {
+      "id": "nlvtr-notation-ban",
+      "level": "P0",
+      "scope": "both",
+      "summary": "自然语言视觉化：正文禁止 '%' 符号、数值区间与内部缩写",
+      "source": "references/prompt-templates.md",
+      "enforcer": "prompt_pipeline:check_nlvtr_violations"
+    },
+    {
+      "id": "anchor-scale-lock",
+      "level": "P0",
+      "scope": "image",
+      "summary": "SCUP NGCS：同一静态镜头族内，主锚点的画高比例逐帧不得变动",
+      "source": "references/spatial-consistency-upgrade-protocol.md",
+      "enforcer": "prompt_pipeline:check_anchor_scale_lock"
+    },
+    {
+      "id": "primary-landmark-restatement",
+      "level": "P0",
+      "scope": "image",
+      "summary": "IMAGE 必须按 packet 原样逐个重述主地标名称，不得改写或增减",
+      "source": "references/spatial-consistency-upgrade-protocol.md",
+      "enforcer": "prompt_pipeline:check_primary_landmarks_exact_match"
+    },
+    {
+      "id": "shot-family-leakage",
+      "level": "P0",
+      "scope": "image",
+      "summary": "室内/室外镜头族不得互相渗漏（室内帧禁止出现地平线、天空、云）",
+      "source": "references/spatial-consistency-upgrade-protocol.md",
+      "enforcer": "prompt_pipeline:check_shot_family_leakage"
+    },
+    {
+      "id": "image-clean-frame",
+      "level": "P0",
+      "scope": "image",
+      "summary": "IMAGE 是静态干净帧：无人物动作、无进行中的施工姿态",
+      "source": "references/prompt-templates.md",
+      "enforcer": "prompt_pipeline:check_image_clean_frame"
+    },
+    {
+      "id": "anchor-frame-compliance",
+      "level": "P0",
+      "scope": "image",
+      "summary": "首帧锚点渲染后必须过合规判定，未过不得继续composing 后续槽位",
+      "source": "SKILL.md#Staged Delivery Contract",
+      "enforcer": "prompt_pipeline:check_anchor_frame_compliance"
+    },
+    {
+      "id": "camera-contradiction",
+      "level": "P0",
+      "scope": "both",
+      "summary": "机位 DNA 一致性：静态机位不得出现推拉摇移措辞，反之亦然",
+      "source": "references/drift-lock-assembly-guide.md",
+      "enforcer": "prompt_pipeline:check_camera_contradictions"
+    },
+    {
+      "id": "video-anchor-first-opening",
+      "level": "P0",
+      "scope": "video",
+      "summary": "VIDEO 必须以锚定开场句起头，画面等同该拍起始 IMAGE",
+      "source": "references/prompt-templates.md",
+      "enforcer": "prompt_pipeline:check_video_opening"
+    },
+    {
+      "id": "transition-shortcut-ban",
+      "level": "P0",
+      "scope": "video",
+      "summary": "禁止跳切、叠化、时间跳跃等把施工过程省略掉的转场措辞",
+      "source": "references/prompt-templates.md",
+      "enforcer": "prompt_pipeline:check_transition_shortcuts"
+    },
+    {
+      "id": "continuous-action-flow",
+      "level": "P0",
+      "scope": "video",
+      "summary": "连续动作流：动词开头的主动劳作 + 至少两个可测量的进度标记",
+      "source": "SKILL.md#VIDEO Motion Chain",
+      "enforcer": "prompt_pipeline:check_video_process_content"
+    },
+    {
+      "id": "frame-state-contract",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "帧状态机契约：槽位状态迁移必须合法，不得跳过或回退",
+      "source": "references/drift-lock-assembly-guide.md",
+      "enforcer": "prompt_pipeline.frame_state:validate_frame_state_contract"
+    },
+    {
+      "id": "threshold-bridge-continuity",
+      "level": "P0",
+      "scope": "video",
+      "summary": "过门桥接拍必须是无施工的纯净穿越，不得夹带作业内容",
+      "source": "references/threshold-bridge-consistency-protocol.md",
+      "enforcer": "prompt_pipeline:check_bridge_sterile"
+    },
+    {
+      "id": "grid-coordinate-range",
+      "level": "P1",
+      "scope": "image",
+      "summary": "Grid 坐标只允许 A1-C3 九宫格范围内的取值",
+      "source": "references/spatial-consistency-upgrade-protocol.md",
+      "enforcer": "prompt_pipeline:check_grid_coordinates"
+    },
+    {
+      "id": "worker-scale-lock",
+      "level": "P1",
+      "scope": "video",
+      "summary": "工人画高比例锁：VIDEO 重述工人比例时必须与 packet 锁定值一致",
+      "source": "references/spatial-consistency-upgrade-protocol.md",
+      "enforcer": "prompt_pipeline:check_worker_scale_lock"
+    },
+    {
+      "id": "lighting-phase-monotonicity",
+      "level": "P1",
+      "scope": "pipeline",
+      "summary": "光照阶段梯单调推进，不得在拍次之间回退",
+      "source": "references/drift-lock-assembly-guide.md",
+      "enforcer": "prompt_pipeline:check_lighting_phase_ladder_monotonicity"
+    },
+    {
+      "id": "envelope-seal-monotonicity",
+      "level": "P1",
+      "scope": "pipeline",
+      "summary": "围护封闭度单调推进：已封好的洞口不得在后续拍次重新敞开",
+      "source": "references/spatial-consistency-upgrade-protocol.md",
+      "enforcer": "prompt_pipeline:check_envelope_seal_regression"
+    },
+    {
+      "id": "interior-door-clearance",
+      "level": "P1",
+      "scope": "image",
+      "summary": "室内首帧的门洞净空必须留够，避免入口被家具/材料堵死",
+      "source": "references/threshold-bridge-consistency-protocol.md",
+      "enforcer": "prompt_pipeline:check_interior_door_clearance"
+    },
+    {
+      "id": "colon-label-style",
+      "level": "P2",
+      "scope": "both",
+      "summary": "描述句内部禁止用冒号引出取值（会被模型渲染成画面文字）",
+      "source": "references/prompt-templates.md",
+      "enforcer": "prompt_pipeline:check_colon_label_style"
+    },
+    {
+      "id": "stylistic-repetition",
+      "level": "P2",
+      "scope": "both",
+      "summary": "相邻拍次禁止复用同一套句式与修辞",
+      "source": "references/prompt-templates.md",
+      "enforcer": "prompt_pipeline:check_stylistic_repetition"
+    },
+    {
+      "id": "staged-anchor-render-gate",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "分阶段交付：先只出 IMAGE 1 并过渲染验收门，通过后才允许写其余槽位",
+      "source": "SKILL.md#Staged Delivery Contract",
+      "enforcer": null,
+      "gap": "该契约约束的是 agent 侧的交付节奏（scripts/render_and_gate_anchor.py），本服务端合成链路不经过它——服务端是一次性合成全部槽位后逐帧渲染，由 anchor-frame-compliance 覆盖「首帧必须合规」这一半意图，但「未过门不得撰写后续提示词」这一半在服务端不适用。登记于此以免被误当作已执行。"
+    },
+    {
+      "id": "used-topic-ledger-dedup",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "历史选题台账去重：已用过的 Topic DNA 不得再次产出",
+      "source": "references/idea-engine.md",
+      "enforcer": null,
+      "gap": "去重目前完全交给 LLM：台账原文塞进 run_ideate 的 system prompt，没有任何产出侧的程序化查重。managed creative ledger 读失败会硬失败（保护去重记忆不丢），但「模型是否真的避开了台账里的 DNA」无人校验。补一个产出侧 DNA 比对是独立的后续工作。"
+    }
+  ]
+}

@@ -235,7 +235,8 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         fixed = fix_primary_landmarks(prompt, packet, family='interior')
         low = fixed.lower()
         self.assertEqual(low.count('locked anchors:') + low.count('locked landmarks:'), 1)
-        self.assertIn('holding 50 percent of frame height', fixed)
+        self.assertIn('rising to about half the frame height', fixed)
+        self.assertNotRegex(fixed, r'Grid [A-C][1-3]')
         # "Locked anchors are ..."（图1形状）同样被视作 stanza 收编
         ext = ("Static shot facing the oak trunk. Locked anchors are helical screw piles at the "
                "base of the trunk at Grid C2, gaping natural opening of the hollow trunk at Grid B2, "
@@ -252,7 +253,8 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         }
         ext_fixed = fix_primary_landmarks(ext, ext_packet, family='exterior')
         self.assertEqual(ext_fixed.lower().count('locked anchors'), 1)
-        self.assertIn('holding 15 percent of frame height', ext_fixed)
+        self.assertIn('rising to about a sixth of the frame height', ext_fixed)
+        self.assertNotRegex(ext_fixed, r'Grid [A-C][1-3]')
 
     def test_state_delta_label_flagged(self):
         errs = check_colon_label_style("State delta: brass branch LED sconces are mounted in Grid B1.")
@@ -284,7 +286,9 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
                   'worker_scale_percent': '18%'}
         out = fix_out_and_in('A lone worker hammers beams into place inside the cavity.',
                              False, beat=beat, packet=packet)
-        self.assertIn('standing roughly 18 percent of frame height', out)
+        # 2026-08-05：注入的比例改成分数散文（数字会被渲成画面上的文字）
+        self.assertIn('standing about a sixth of the frame height', out)
+        self.assertNotIn('18 percent', out)
         self.assertNotIn(',,', out)
         # No worker_scale_percent locked on the packet -> clause degrades gracefully, no
         # stray punctuation left behind where the clause would have been.
@@ -298,7 +302,8 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         from prompt_pipeline import fix_out_and_in
         packet = {'worker_scale_percent': '22%'}
         out = fix_out_and_in('Two workers assemble the frame together.', False, beat=None, packet=packet)
-        self.assertIn('each standing roughly 22 percent of frame height', out)
+        self.assertIn('each standing about a quarter of the frame height', out)
+        self.assertNotIn('22 percent', out)
         self.assertNotIn(',,', out)
 
     def test_sound_design_hum_hear_detected(self):
@@ -360,7 +365,8 @@ class TestNegativeExampleIsRepaired(unittest.TestCase):
         fixed = fix_primary_landmarks(IMAGES[4]['body'], PACKET, family='exterior')
         self.assertEqual(fixed.lower().count('locked anchors:'), 1)
         self.assertNotIn('55 percent', fixed)
-        self.assertIn('decaying trunk base opening at Grid C2 holding 35 percent of frame height', fixed)
+        self.assertIn('decaying trunk base opening across the lower centre of the frame, '
+                      'rising to about a third of the frame height', fixed)
 
     def test_bridge_image5_regains_camera(self):
         _, (v, img) = self._fixed_beat(4)

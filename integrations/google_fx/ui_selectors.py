@@ -216,12 +216,47 @@ UI_SELECTORS = {
         # 目标邮箱本身在列表里时优先直接点它（auto_login 动态构造选择器），
         # 只有找不到才退到这个入口重新走邮箱流程。
         "use_another_account": [
+            # 这一项的 DOM 形状 Google 换过好几轮（li → div[role=link] → 带
+            # jsname 的按钮），文案还有简/繁/印尼三套且「账号/帐户/帳戶」三种写法
+            # 都在线上出现过。少一个变体的代价是整条自动登录死在 chooser_stuck，
+            # 所以这里宁可列全。
             "li:has-text('Use another account')",
             "li:has-text('使用其他账号')",
+            "li:has-text('使用其他帐户')",
             "li:has-text('使用其他帳戶')",
+            "li:has-text('使用其他帳號')",
             "div[role='link']:has-text('Use another account')",
             "div[role='link']:has-text('使用其他账号')",
+            "div[role='link']:has-text('使用其他帐户')",
+            "div[role='link']:has-text('使用其他帳戶')",
+            "div[role='button']:has-text('Use another account')",
+            "button:has-text('Use another account')",
+            "a[href*='AddSession']",
             "*:has-text('Gunakan akun lain')",
+        ],
+        # 账号选择页上的一行账号。data-identifier / data-email 存的是账号原文，
+        # 比行内可见文本可靠：列表里显示的邮箱可能被截断（"jia…@gmail.com"），
+        # 靠 :has-text 匹配就会漏掉本来在页面上的目标账号。
+        "account_row_attrs": ["data-identifier", "data-email"],
+        # 新版登录方式选择页（"Welcome / Choose how you want to sign in:"，
+        # 出现在**密码之前**）上的「Enter your password」。这一页也有一项叫
+        # 「Try another way」，但它是登录方式入口、不是两步验证的换方式入口；
+        # 必须先认出这一项走密码路，否则会被当成 2FA challenge picker 卡死。
+        # data-challengetype='1' 是 Google 给密码这一项的稳定语义属性。
+        "password_option": [
+            "[data-challengetype='1']",
+            "li:has-text('Enter your password')",
+            "div[role='link']:has-text('Enter your password')",
+            "div[role='button']:has-text('Enter your password')",
+            "button:has-text('Enter your password')",
+            "li:has-text('输入您的密码')",
+            "li:has-text('输入密码')",
+            "div[role='link']:has-text('输入您的密码')",
+            "div[role='button']:has-text('输入您的密码')",
+            "button:has-text('输入您的密码')",
+            "li:has-text('輸入您的密碼')",
+            "div[role='link']:has-text('輸入您的密碼')",
+            "*:has-text('Masukkan sandi Anda')",
         ],
         # 「换一种验证方式」页上通往身份验证器 App 的那一项。Google 默认可能
         # 先推手机点确认（Tap Yes），那种自动化处理不了，必须切到 TOTP。

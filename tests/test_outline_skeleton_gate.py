@@ -439,5 +439,174 @@ class TestHardFailuresAreDroppedNotDowngraded(unittest.TestCase):
         self.assertNotIn('末拍不是揭示', titles)
 
 
+# ── P1-C：结构化 beat_outline {op, text} 的新增测试 ─────────────────────────
+
+
+# 新形态的结构化清单（与 LINEAR_OK 同构，只是每条变成 {op, text}）
+LINEAR_OK_STRUCTURED = [
+    {'op': 'clearing',   'text': '清空洞内碎冰与落石'},
+    {'op': 'repair',     'text': '凿平起居区冰面地坪'},
+    {'op': 'framing',    'text': '锚固钢制支撑框架'},
+    {'op': 'framing',    'text': '铺设架空木龙骨地台'},
+    {'op': 'drywall',    'text': '封装内衬木饰面墙'},
+    {'op': 'flooring',   'text': '铺装成品木地板'},
+    {'op': 'furnishing', 'text': '布置床铺与软装'},
+    {'op': 'reward',     'text': '点亮灯带,人物入住'},
+]
+
+DUAL_OK_STRUCTURED = [
+    {'op': 'clearing',   'text': '清理洞口积雪与落石'},
+    {'op': 'framing',    'text': '加固外部蓝冰拱口'},
+    {'op': 'framing',    'text': '嵌装气密入口门框'},
+    {'op': 'furnishing', 'text': '搭建洞口防风门廊'},
+    {'op': 'furnishing', 'text': '挂装太阳能完成外观'},
+    {'op': 'threshold',  'text': '推镜过门进入原始冰洞内部'},
+    {'op': 'clearing',   'text': '清空洞内碎冰与积雪'},
+    {'op': 'repair',     'text': '凿平并找平内部基底'},
+    {'op': 'framing',    'text': '铺设龙骨与羊毛保温'},
+    {'op': 'drywall',    'text': '封装内衬木饰面墙'},
+    {'op': 'wiring',     'text': '布设电路并安装暖炉'},
+    {'op': 'furnishing', 'text': '布置床铺与羊毛软装'},
+    {'op': 'reward',     'text': '点亮暖灯,人物入住'},
+]
+
+
+class TestStructuredOutlinePassesGates(unittest.TestCase):
+    """P1-C：{op, text} 结构化清单必须通过所有现有门禁。"""
+
+    def test_structured_linear_passes(self):
+        self.assertEqual(outline_skeleton_violations(_idea(LINEAR_OK_STRUCTURED)), [])
+
+    def test_structured_dual_passes_both_gates(self):
+        idea = _idea(DUAL_OK_STRUCTURED, pacing_skeleton='dual_payoff')
+        self.assertEqual(outline_skeleton_violations(idea), [])
+        self.assertEqual(pacing_skeleton_outline_violations(idea), [])
+
+    def test_op_precise_reward_detection(self):
+        """op='reward' 直接命中规则 2，不依赖正则。"""
+        # 末拍 text 不含任何 reward 正则关键词，但 op='reward' → 放行
+        outline = [
+            {'op': 'clearing',   'text': '清空洞内碎冰与落石'},
+            {'op': 'repair',     'text': '凿平起居区冰面地坪'},
+            {'op': 'framing',    'text': '锚固钢制支撑框架'},
+            {'op': 'reward',     'text': '最终大收官'},  # text 不含 reward 关键词
+        ]
+        errs = outline_skeleton_violations(_idea(outline))
+        self.assertFalse(any('reward' in e.lower() for e in errs))
+
+    def test_op_precise_threshold_detection(self):
+        """op='threshold' 直接命中规则 3，不依赖过门正则。"""
+        outline = [
+            {'op': 'clearing',   'text': '清理外部积雪'},
+            {'op': 'repair',     'text': '加固外壁结构'},
+            {'op': 'threshold',  'text': '走进下一个空间'},  # text 不含过门正则
+            {'op': 'clearing',   'text': '清空内部碎屑'},
+            {'op': 'framing',    'text': '铺设龙骨'},
+            {'op': 'furnishing', 'text': '布置家具'},
+            {'op': 'reward',     'text': '点亮灯带,人物入住'},
+        ]
+        errs = outline_skeleton_violations(_idea(outline))
+        # 不应报「多于一处过门」或「没有过门」
+        self.assertFalse(any('doorway-crossing' in e for e in errs))
+
+    def test_op_precise_clearing_detection(self):
+        """op='clearing' 直接命中规则 5（过门后清理），不依赖清理正则。"""
+        outline = [
+            {'op': 'clearing',   'text': '清理外部积雪'},
+            {'op': 'repair',     'text': '加固外壁结构'},
+            {'op': 'threshold',  'text': '推镜过门进入原始内部'},
+            {'op': 'clearing',   'text': '搬走屋里的杂物'},  # text 不含强清理关键词
+            {'op': 'framing',    'text': '铺设龙骨'},
+            {'op': 'furnishing', 'text': '布置家具'},
+            {'op': 'reward',     'text': '点亮灯带,人物入住'},
+        ]
+        errs = outline_skeleton_violations(_idea(outline))
+        self.assertFalse(any('cleanout' in e for e in errs))
+
+    def test_wrong_reward_op_is_rejected(self):
+        """末拍 op 不是 'reward' → 规则 2 报错。"""
+        outline = [
+            {'op': 'clearing',   'text': '清空碎冰'},
+            {'op': 'repair',     'text': '修补地坪'},
+            {'op': 'framing',    'text': '锚固框架'},
+            {'op': 'furnishing', 'text': '点亮灯带,人物入住'},  # op 错了
+        ]
+        errs = outline_skeleton_violations(_idea(outline))
+        self.assertTrue(any('reward' in e.lower() for e in errs))
+
+
+class TestInvalidOpIsRejected(unittest.TestCase):
+    """P1-C 规则 8：不合法的 op 值触发报错。"""
+
+    def test_invalid_op_is_rejected(self):
+        outline = [
+            {'op': 'clearing',   'text': '清空碎冰'},
+            {'op': 'foobar',     'text': '修补地坪'},
+            {'op': 'framing',    'text': '锚固框架'},
+            {'op': 'reward',     'text': '点亮灯带,人物入住'},
+        ]
+        errs = outline_skeleton_violations(_idea(outline))
+        self.assertTrue(any('invalid' in e.lower() for e in errs))
+
+
+class TestOldStringFormatStillPasses(unittest.TestCase):
+    """P1-C 向后兼容：旧字符串格式的 beat_outline 仍通过所有门禁。"""
+
+    def test_old_linear_string_format_still_passes(self):
+        """旧格式 LINEAR_OK（纯字符串列表）在 _outline_texts fallback 路径上仍然通过。"""
+        self.assertEqual(outline_skeleton_violations(_idea(LINEAR_OK)), [])
+
+    def test_old_dual_string_format_still_passes(self):
+        idea = _idea(DUAL_OK, pacing_skeleton='dual_payoff')
+        self.assertEqual(outline_skeleton_violations(idea), [])
+        self.assertEqual(pacing_skeleton_outline_violations(idea), [])
+
+    def test_old_format_compute_beats_floor(self):
+        """compute_beats_floor 在旧格式上结果不变。"""
+        idea_old = _idea(LINEAR_OK)
+        idea_new = _idea(LINEAR_OK_STRUCTURED)
+        self.assertEqual(compute_beats_floor(idea_old), compute_beats_floor(idea_new))
+
+
+class TestMixedFormatIsNormalized(unittest.TestCase):
+    """P1-C：混合格式（部分 string、部分 dict）能被正确解析。"""
+
+    def test_mixed_format_outline_texts(self):
+        from prompt_pipeline import _outline_texts
+        idea = {'beat_outline': [
+            '清空碎冰',  # 旧字符串
+            {'op': 'repair', 'text': '修补地坪'},  # 新对象
+            42,  # 数字（旧形态边界情况）
+        ]}
+        texts = _outline_texts(idea)
+        self.assertEqual(texts, ['清空碎冰', '修补地坪', '42'])
+
+    def test_mixed_format_outline_ops(self):
+        from prompt_pipeline import _outline_ops
+        idea = {'beat_outline': [
+            '清空碎冰',
+            {'op': 'repair', 'text': '修补地坪'},
+            42,
+        ]}
+        ops = _outline_ops(idea)
+        self.assertEqual(ops, [None, 'repair', None])
+
+
+class TestFallbackCardsInNewFormatPass(unittest.TestCase):
+    """P1-C 回归锁：6 条兜底卡片在新 {op,text} 格式下全部通过门禁。"""
+
+    def test_shipped_fallback_outlines_all_pass_with_op(self):
+        """所有 fallback_ideas 的 beat_outline 都通过 outline_skeleton_violations。"""
+        import prompt_pipeline as pp
+        # 这些卡片在模块内直接定义，用到时才激活——这里直接从它们的位置拿（是 run_ideate
+        # 的 fallback 路径里的最终兜底，不在嵌套闭包里，而是模块级 fallback_ideas 列表）。
+        # 由于 fallback_ideas 在 run_ideate 内部定义，我们用 _NESTED_TRANSPORT_FALLBACK_IDEAS。
+        for card in pp._NESTED_TRANSPORT_FALLBACK_IDEAS:
+            idea = {'title': card['title'], 'pacing_skeleton': 'nested_space_payoff',
+                    'beat_outline': card['beat_outline']}
+            errs = outline_skeleton_violations(idea)
+            self.assertEqual(errs, [], f"Fallback card {card['title']} failed: {errs}")
+
+
 if __name__ == '__main__':
     unittest.main()

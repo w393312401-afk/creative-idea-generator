@@ -76,16 +76,49 @@ async function initServerMode() {
             ? m.skill_contracts
             : (m && m.skill_contract ? [m.skill_contract] : []);
         for (const sc of reports) {
-            if (!sc || !Array.isArray(sc.missing) || sc.missing.length === 0) continue;
+            if (!sc) continue;
             const isActive = !m.skill_profile || sc.profile === m.skill_profile || !sc.profile;
-            console.warn('skill contract missing', sc.profile, sc.dir, sc.source, sc.missing);
-            showToast(
-                `⚠️ 技能契约缺失 ${sc.missing.length}/${sc.total} 个文件`
-                + `（${sc.label || sc.profile || ''}${isActive ? '，当前正在用' : '，切到该模型时才会用'}）`
-                + `${isActive ? '，生成质量将降级' : ''}。`
-                + `技能包目录：${sc.dir}。`
-                + `请在 server_config.json 的 skillProfiles 里把 "${sc.profile || 'base'}" 指向技能包所在目录（改完不用重启）`,
-                isActive ? 'error' : 'warning', 10000);
+            const who = `${sc.label || sc.profile || ''}${isActive ? '，当前正在用' : '，切到该模型时才会用'}`;
+
+            if (Array.isArray(sc.missing) && sc.missing.length) {
+                console.warn('skill contract missing', sc.profile, sc.dir, sc.source, sc.missing);
+                showToast(
+                    `⚠️ 技能契约缺失 ${sc.missing.length}/${sc.total} 个文件`
+                    + `（${who}）${isActive ? '，生成质量将降级' : ''}。`
+                    + `技能包目录：${sc.dir}。`
+                    + `请在 server_config.json 的 skillProfiles 里把 "${sc.profile || 'base'}" 指向技能包所在目录（改完不用重启）`,
+                    isActive ? 'error' : 'warning', 10000);
+            }
+
+            // 文件齐全 ≠ 契约有效。注册表把「SKILL.md 里写的契约」钉到「真正在跑的
+            // Python 门禁」上，它缺失或版本对不上，意味着这个包与运行时脱节——照跑
+            // 会按错误的契约集合审计，外观上却和一次正常生成一模一样。
+            if (sc.registry_status && sc.registry_status !== 'ok') {
+                console.warn('skill contract registry', sc.profile, sc.registry_status,
+                    sc.contract_version, '->', sc.registry_expected, sc.dir);
+                const detail = {
+                    missing: `技能包里没有 ${'references/contract-registry.json'}——无法核对契约与门禁是否一致`,
+                    unreadable: '契约注册表无法解析（JSON 损坏）',
+                    version_mismatch: `契约版本 ${sc.contract_version} 与运行时期望的 ${sc.registry_expected} 不一致`,
+                }[sc.registry_status] || `契约注册表状态异常：${sc.registry_status}`;
+                showToast(
+                    `⚠️ 技能契约注册表异常（${who}）。${detail}。`
+                    + `技能包可能与当前代码版本脱节，生成结果仍会产出但审计口径未必正确。`
+                    + `技能包目录：${sc.dir}`,
+                    isActive ? 'error' : 'warning', 10000);
+            }
+
+            // 仓库内置包是与运行时代码同版本的那一份；走到 env/config/default/autodetect
+            // 说明正在用一份来源不受版本控制的包，漂移只是时间问题。只提示当前激活的，
+            // 免得两个 profile 各弹一条把真正的问题淹掉。
+            if (isActive && sc.source && sc.source !== 'vendored') {
+                console.warn('skill package is not the vendored copy', sc.profile, sc.source, sc.dir);
+                showToast(
+                    `ℹ️ 正在使用非仓库内置的技能包（${who}，来源 ${sc.source}）。`
+                    + `仓库内置那份才与当前代码同步版本化；外部目录更新不及时会让契约与门禁悄悄分叉。`
+                    + `技能包目录：${sc.dir}`,
+                    'warning', 8000);
+            }
         }
     } catch (e) {
         console.warn('mode check failed', e);

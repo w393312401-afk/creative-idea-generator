@@ -467,6 +467,21 @@ _OMNI_CONTRACT_FILES = (
     'references/used-topic-ledger.md',
 )
 
+# ── 契约注册表 ──
+# 上面那份 _*_CONTRACT_FILES 只回答"文件在不在"，回答不了"SKILL.md 里写的契约有没有
+# 人执行"。运行时从不读 SKILL.md（它只做存在性证明），全部执行都是 Python 门禁手写的
+# 一份平行实现——散文改了、门禁没跟，两边就会静默分叉，而这正是最难发现的一类劣化。
+# contract-registry.json 把每条契约钉到一个真实存在的执行者上，由
+# tests/test_skill_contract_registry.py 逐条 import 校验。
+#
+# 它**不进** _*_CONTRACT_FILES：那份清单参与 vendored 完整性判定与自动探测，加一项会
+# 让所有还没带注册表的历史技能包一夜之间"不完整"，把灾备入口也一起堵死。注册表缺失
+# 是需要单独上报的一种状态，不是"这个包坏了"。
+SKILL_REGISTRY_REL = 'references/contract-registry.json'
+# 主版本相同即视为兼容（次版本用于增补契约条目）。技能包声明的主版本与这里不一致，
+# 说明包与运行时脱节——照跑会按错误的契约集合审计，所以要一路上报到前端。
+SUPPORTED_CONTRACT_VERSION = '1.0'
+
 DEFAULT_SKILL_PROFILE = 'base'
 SKILL_PROFILES = {
     'base': {
@@ -701,9 +716,63 @@ def missing_skill_contract_files(profile=None):
             if not os.path.exists(os.path.join(base, *rel.split('/')))]
 
 
+# 注册表按 (路径, mtime) 缓存：合成逐拍调用报告，每次重读磁盘既慢又会把一个损坏的
+# JSON 刷成满屏告警。mtime 变了才重读，所以改完注册表不用重启。
+_SKILL_REGISTRY_CACHE = {}
+
+
+def _major(version):
+    return str(version or '').strip().split('.')[0]
+
+
+def skill_contract_registry(profile=None):
+    """该 profile 技能包里的契约注册表，返回 (数据, 状态)。
+
+    状态取值：ok / missing / unreadable / version_mismatch。数据在 missing 与
+    unreadable 时为 None；version_mismatch 时仍返回解析结果——调用方要拿它里面的
+    contract_version 报给用户看"包声明的是几"。"""
+    path = os.path.join(skill_dir(profile), *SKILL_REGISTRY_REL.split('/'))
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        return None, 'missing'
+
+    cached = _SKILL_REGISTRY_CACHE.get(path)
+    if not cached or cached[0] != stamp:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError('registry root is not an object')
+        except (OSError, ValueError) as e:
+            _SKILL_REGISTRY_CACHE[path] = (stamp, None, str(e))
+        else:
+            _SKILL_REGISTRY_CACHE[path] = (stamp, data, None)
+        cached = _SKILL_REGISTRY_CACHE[path]
+
+    _stamp, data, err = cached
+    if data is None:
+        return None, 'unreadable'
+    if _major(data.get('contract_version')) != _major(SUPPORTED_CONTRACT_VERSION):
+        return data, 'version_mismatch'
+    return data, 'ok'
+
+
+def skill_contract_strict():
+    """严格模式：技能契约缺失时把"静默降级"升级成"直接失败"。
+
+    默认关（历史行为：缺文件只打 WARN 照跑）。想让一次配错的部署当场炸出来、而不是
+    连续产出几十条劣化提示词的人，把它打开。环境变量优先于配置文件，便于 CI 单次开启。"""
+    raw = os.environ.get('SKILL_CONTRACT_STRICT')
+    if raw is None or not str(raw).strip():
+        raw = SERVER_CONFIG.get('strictSkillContract')
+    return str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
 def skill_contract_report(profile=None):
     """技能契约现状的单一事实来源：{'profile','label','package','dir','source',
-    'missing','total'}。
+    'missing','total','contract_version','registry_status','registry_expected',
+    'unenforced'}。
 
     调用方（启动检查、/api/mode）一律走这个函数而不是自己拼 SKILL_DIR——server.py 是
     `from server_common import *` 进来的，那份 SKILL_DIR 是导入时的**副本**，之后改
@@ -711,6 +780,9 @@ def skill_contract_report(profile=None):
     dir 在本函数内取值，才保证和 missing 的判定基于同一个路径。"""
     profile = _normalize_skill_profile(profile)
     spec = SKILL_PROFILES[profile]
+    registry, registry_status = skill_contract_registry(profile)
+    entries = (registry or {}).get('contracts')
+    entries = entries if isinstance(entries, list) else []
     return {
         'profile': profile,
         'label': spec['label'],
@@ -719,6 +791,14 @@ def skill_contract_report(profile=None):
         'source': skill_dir_source(profile),
         'missing': missing_skill_contract_files(profile),
         'total': len(spec['contracts']),
+        # 注册表侧：契约总数、包声明的版本、以及登记在案的无执行者缺口。前端据此
+        # 区分"文件缺了"（missing）和"文件在但契约与代码脱节"（registry_status）。
+        'contract_version': (registry or {}).get('contract_version'),
+        'registry_expected': SUPPORTED_CONTRACT_VERSION,
+        'registry_status': registry_status,
+        'contract_count': len(entries),
+        'unenforced': [c.get('id') for c in entries
+                       if isinstance(c, dict) and not c.get('enforcer')],
     }
 
 
@@ -2680,6 +2760,89 @@ def release_frame_run(project_dir, task_id):
 # 一致性审查真正跑出来的两种结论（区别于"没审成"/"还没轮到审"）。帧内容变了要作废的
 # 就是它们，见 drop_stale_review_verdicts。
 REAL_REVIEW_VERDICTS = ('sequence_reviewed_pass', 'sequence_review_flagged')
+
+
+# ── 审查盲区台账（operator blind spots）─────────────────────────────────────
+# 「机器判过、人判废」的那些帧就是 rubric 的缺口：判定档位已经拉满（qaGateLevel 默认
+# standard 全量严检）还是漏，说明漏掉的是**维度**而不是**严格度**——再调严一档也看不见
+# 它本来就没在查的东西。
+#
+# 数据早就在盘上，只是从没被回读过：set_manual_frame_issue 把人的描述写进 manual_issue，
+# 同时把被覆盖的机器判定存进 manual_flag_prev_gate（正是为了"事后无从对照谁看漏了什么"
+# 这句注释里的目的）。这里把它读出来，喂回逐拍审查的系统提示词。
+#
+# 只收 manual_flag_prev_gate == 'sequence_reviewed_pass' 的：机器已经报过问题的那些
+# 不是盲区，把它们混进来只会让提示词越滚越长而信息量不增。
+_BLIND_SPOT_SOURCE_GATE = 'sequence_reviewed_pass'
+
+
+def collect_operator_blind_spots(limit=12, max_chars=200, output_root=None):
+    """扫描所有项目 manifest，收「机器放行、人判废」的样本。
+
+    返回按新近度排序的 [{'text','title','sequence','at'}, ...]，最多 limit 条。
+    任何一个项目读不出来都跳过——这是增强信号，不是门禁，永远不该让一次目录异常
+    影响审查本身。"""
+    root = output_root or OUTPUT_ROOT
+    rows = []
+    try:
+        entries = sorted(os.scandir(root), key=lambda e: e.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        try:
+            manifest = read_manifest(entry.path)
+        except Exception:
+            continue
+        if not manifest:
+            continue
+        for frame in manifest.get('frames') or []:
+            if not isinstance(frame, dict):
+                continue
+            issue = str(frame.get('manual_issue') or '').strip()
+            if not issue or frame.get('manual_flag_prev_gate') != _BLIND_SPOT_SOURCE_GATE:
+                continue
+            rows.append({
+                'text': issue[:max_chars],
+                'title': manifest.get('title') or entry.name,
+                'sequence': frame.get('sequence'),
+                'at': frame.get('reviewed_at') or '',
+            })
+    # 去重：同一条描述反复出现（同一类毛病被标了很多次）只保留一条，但它出现的次数
+    # 本身是权重信号，所以按出现次数降序排在前面。
+    tally = {}
+    for row in rows:
+        key = re.sub(r'\s+', ' ', row['text']).strip().casefold()
+        if key not in tally:
+            tally[key] = dict(row, count=0)
+        tally[key]['count'] += 1
+    ranked = sorted(tally.values(), key=lambda r: (-r['count'], r['at']), reverse=False)
+    ranked.sort(key=lambda r: -r['count'])
+    return ranked[:limit]
+
+
+def operator_blind_spot_block(limit=12, output_root=None):
+    """把盲区样本渲染成一段可直接追加进审查系统提示词的英文文本；无样本时返回 ''。
+
+    **必须追加在系统提示词的末尾**：那份提示词是常量，为的是让整单（乃至跨单）所有
+    逐拍调用共用同一份缓存前缀（见 _local_beat_review_system_prompt 的 2026-07-25 说明）。
+    追加在尾部不动前缀，缓存照常命中。"""
+    spots = collect_operator_blind_spots(limit=limit, output_root=output_root)
+    if not spots:
+        return ''
+    lines = []
+    for spot in spots:
+        repeat = f" (reported {spot['count']} times)" if spot.get('count', 1) > 1 else ''
+        lines.append(f"- {spot['text']}{repeat}")
+    return (
+        "\n\n[Operator-Reported Blind Spots]\n"
+        "The following defects were found by the human operator on frames THIS AUDIT HAD ALREADY "
+        "PASSED. They are the rubric's known gaps — check for each of them explicitly, in addition "
+        "to the rules above. Report one only when it is concretely visible in these images; the "
+        "same confidence bar and second-reviewer check apply.\n"
+        + "\n".join(lines)
+    )
 
 
 def frame_content_hash(path):

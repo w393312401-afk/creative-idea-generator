@@ -187,8 +187,12 @@ class TestPromptFixes(unittest.TestCase):
         self.assertIn("height of the frame", fixed)
         self.assertIn("inspects the support beam", fixed)
         
-        # Missing/imprecise landmarks are appended at the end
-        self.assertIn("Locked anchors: sliding door frame sill at Grid B2, metal support beam at Grid A1", fixed)
+        # Missing/imprecise landmarks are appended at the end — as prose, never as grid labels
+        # (2026-08-05: grid cells in the prompt body were rendered into frames as literal letters)
+        self.assertIn("Locked anchors: sliding door frame sill at the centre of the frame; "
+                      "metal support beam in the upper left of the frame.", fixed)
+        self.assertNotIn("Grid B2", fixed)
+        self.assertNotIn("Grid A1", fixed)
 
     def test_threshold_bridge_stage_validation(self):
         # TBCP v4: the entire crossing is ONE beat (bridge_stage=1), and it must not land
@@ -525,10 +529,16 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
         )
         fixed = fix_primary_landmarks(prompt, self.PACKET, family='exterior')
         self.assertEqual(fixed.lower().count('locked anchors:'), 1)
-        self.assertIn('decaying trunk base opening at Grid C2 holding 35 percent of frame height', fixed)
-        self.assertIn('curved interior cavity wall at Grid B2 holding 65 percent of frame height', fixed)
-        self.assertIn('misty forest canopy at Grid A2 holding 45 percent of frame height', fixed)
+        self.assertIn('decaying trunk base opening across the lower centre of the frame, '
+                      'rising to about a third of the frame height', fixed)
+        self.assertIn('curved interior cavity wall at the centre of the frame, '
+                      'rising to about two thirds of the frame height', fixed)
+        self.assertIn('misty forest canopy across the upper centre of the frame, '
+                      'rising to about two fifths of the frame height', fixed)
         self.assertNotIn('55 percent', fixed)
+        # 规范锚点句本身绝不能带回记号（正文别处的旧记号由 scrub_spatial_notation 兜）
+        stanza = fixed[fixed.lower().index('locked anchors:'):]
+        self.assertNotRegex(stanza, r'Grid [A-C][1-3]|\d+ percent')
 
     def test_fix_primary_landmarks_interior_uses_interior_set(self):
         from prompt_pipeline import fix_primary_landmarks
@@ -539,8 +549,10 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
         )
         fixed = fix_primary_landmarks(prompt, self.PACKET, family='interior')
         self.assertNotIn('misty forest canopy', fixed)
-        self.assertIn('heartwood ridge at Grid B2 holding 60 percent of frame height', fixed)
-        self.assertIn('mossy root shelf at Grid C2 holding 30 percent of frame height', fixed)
+        self.assertIn('heartwood ridge at the centre of the frame, '
+                      'rising to about three fifths of the frame height', fixed)
+        self.assertIn('mossy root shelf across the lower centre of the frame, '
+                      'rising to about a third of the frame height', fixed)
 
     def test_fix_primary_landmarks_interior_without_registered_set_strips_exterior_stanza(self):
         from prompt_pipeline import fix_primary_landmarks
@@ -581,7 +593,8 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
                    "roughly 40 percent of frame height; the worker hammers beams into place.")
         errs = check_worker_scale_lock(drifted, packet)
         self.assertEqual(len(errs), 1)
-        self.assertIn('18 percent', errs[0])
+        # 判据按"桶"而不是按数字：40%（约五分之二）与 18%（约六分之一）分属不同档位
+        self.assertIn('about a sixth of the frame height', errs[0])
         good = ("At t=0s, one lone worker enters the frame from the Grid C1 edge, standing "
                "roughly 18 percent of frame height; the worker hammers beams into place.")
         self.assertEqual(check_worker_scale_lock(good, packet), [])
@@ -653,6 +666,31 @@ class TestShotFamilySpatialLocks(unittest.TestCase):
         exterior = "The decaying trunk stands in mist."
         fixed_ext = fix_horizon_line(exterior, family='exterior')
         self.assertIn('horizon line', fixed_ext.lower())
+
+    def test_found_carrier_scale_lock_holds_subject_scale_and_cavity_enclosure(self):
+        """2026-08-05 实机：找到型载体此前没有任何主体尺度锁，IMAGE 1 把前景框景当成了主体，
+        真正的载体缩成中景一粒，而那个"腔体"是穿透的——透过它能看见背景水面和树。"""
+        from prompt_pipeline import fix_found_carrier_scale_lock
+        packet = dict(self.PACKET, origin_contract={'mode': 'existing_restoration'})
+        prompt = "Static wide tripod shot facing the hollow oak trunk. Locked anchors: trunk base at Grid C2."
+
+        fixed = fix_found_carrier_scale_lock(prompt, packet, family='exterior')
+        self.assertIn('longest visible dimension spanning roughly two-thirds', fixed)
+        self.assertIn('dead-end enclosed volume', fixed)
+        self.assertIn('Locked anchors: trunk base at Grid C2.', fixed)
+        # 幂等：反复修复不得累积互相矛盾的尺度句
+        self.assertEqual(fixed, fix_found_carrier_scale_lock(fixed, packet, family='exterior'))
+
+        # 室内族、交付型载体两条都不该被这把锁碰到
+        self.assertEqual(fix_found_carrier_scale_lock(prompt, packet, family='interior'), prompt)
+        delivered = dict(packet, origin_contract={'mode': 'carrier_delivery_build'})
+        self.assertEqual(fix_found_carrier_scale_lock(prompt, delivered, family='exterior'), prompt)
+
+        # 没有登记室内的项目（纯外部修复）只锁尺度，不谈盲端腔体
+        no_interior = {k: v for k, v in packet.items() if k != 'interior_camera_dna'}
+        exterior_only = fix_found_carrier_scale_lock(prompt, no_interior, family='exterior')
+        self.assertIn('longest visible dimension spanning roughly two-thirds', exterior_only)
+        self.assertNotIn('dead-end enclosed volume', exterior_only)
 
     def test_normalize_packet_coerces_interior_fields(self):
         packet = {

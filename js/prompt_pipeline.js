@@ -215,13 +215,24 @@ function renderIdeationTrendPanel(cardsContainer) {
 }
 
 // LLM 在激发时一次性产出 idea.beat_outline,数组长度约定为 recommended_beats + 1
-// (末条是最终 reward 揭示)。它作为软计划随「一键合成」的 dimensions 一并传给后端
-// (见 composeIdeationCard),但最终节拍仍由合成阶段的节拍阶梯硬规则裁定,所以对外
-// 一律写「预览」而不是承诺。
+// (末条是最终 reward 揭示)。P1-C 后这个数组的每个元素是 {op, text} 对象,
+// 旧形态（纯字符串）通过此函数自动转成 {op: null, text} 兼容。
 function ideaBeatOutline(idea) {
-    return Array.isArray(idea && idea.beat_outline)
-        ? idea.beat_outline.map(s => String(s == null ? '' : s).trim()).filter(Boolean)
-        : [];
+    if (!Array.isArray(idea && idea.beat_outline)) return [];
+    return idea.beat_outline
+        .map(s => {
+            if (typeof s === 'object' && s !== null) {
+                const text = String(s.text == null ? '' : s.text).trim();
+                return text ? { op: s.op || null, text } : null;
+            }
+            const text = String(s == null ? '' : s).trim();
+            return text ? { op: null, text } : null;
+        })
+        .filter(Boolean);
+}
+// 纯文本辅助（供显示用，如卡片标签计数）
+function ideaBeatOutlineTexts(idea) {
+    return ideaBeatOutline(idea).map(e => e.text);
 }
 
 const PACING_SKELETON_LABELS = {
@@ -273,11 +284,13 @@ function openBeatOutlineModal(index) {
     const list = document.getElementById('beat-outline-modal-list');
     if (list) {
         list.innerHTML = '';
-        beats.forEach((text, i) => {
+        beats.forEach((entry, i) => {
             const li = document.createElement('li');
             // 末条按约定是 reward/揭示拍,单独标色以便一眼看到成片落点
             if (i === beats.length - 1) li.className = 'reward';
-            li.textContent = text;
+            const text = typeof entry === 'object' ? entry.text : String(entry);
+            const op = typeof entry === 'object' && entry.op ? entry.op : null;
+            li.textContent = op ? `[${op}] ${text}` : text;
             list.appendChild(li);
         });
     }
@@ -531,9 +544,8 @@ function composeIdeationCard(index) {
         beat_count_mode: beatSettings.beat_count_mode,
         // 卡片上展示的工序预览作为软计划传给后端节拍规划(硬规则优先,冲突时会被改写),
         // 让用户挑卡时看到的工序和最终成片大体对得上
-        beat_outline: Array.isArray(idea.beat_outline)
-            ? idea.beat_outline.map(s => String(s == null ? '' : s).trim()).filter(Boolean)
-            : [],
+        // P1-C: 保留结构化 {op, text} 对象原样透传给后端
+        beat_outline: ideaBeatOutline(idea),
         pacing_skeleton: String(idea.pacing_skeleton || 'linear_milestone'),
         cover_url: idea.cover_url || null,
         english_title: idea.english_title || null,

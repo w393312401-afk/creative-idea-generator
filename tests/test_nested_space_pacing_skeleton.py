@@ -448,7 +448,9 @@ def test_buried_fallback_topics_survive_the_generic_pool_being_burned(monkeypatc
     assert len(result['ideas']) == 3
     for idea in result['ideas']:
         assert pp.pacing_skeleton_outline_violations(idea) == []
+        # P1-C: beat_outline entries are now {op, text} dicts
+        texts = [e['text'] if isinstance(e, dict) else e for e in idea['beat_outline']]
         # 开场必须是「运过来 + 埋起来」
-        assert re.search(pp._NESTED_DELIVERY_CUE, idea['beat_outline'][0])
+        assert re.search(pp._NESTED_DELIVERY_CUE, texts[0])
         assert any(re.search(pp._NESTED_CONCEALMENT_CUE, entry)
-                   for entry in idea['beat_outline'][1:5])
+                   for entry in texts[1:5])

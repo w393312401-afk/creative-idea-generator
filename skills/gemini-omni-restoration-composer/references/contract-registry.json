@@ -1,0 +1,81 @@
+{
+  "contract_version": "1.0",
+  "package": "gemini-omni-restoration-composer",
+  "profile": "omni",
+  "_comment": [
+    "omni 包的契约注册表。格式与 base 包同构，见那一份的 _comment。",
+    "",
+    "omni 继承 base 的全部 IMAGE 契约（OmniComposer.apply_proactive_fixes 把 IMAGE 完整",
+    "委托给 base），所以这里只登记 omni 自己新增或改写的那些。base 那份仍然生效，",
+    "inherits_from 字段记下这条继承关系。"
+  ],
+  "inherits_from": "gemini-veo-restoration-composer",
+  "contracts": [
+    {
+      "id": "omni-multishot-ladder",
+      "level": "P0",
+      "scope": "video",
+      "summary": "每条 VIDEO 必须是多镜头组接，按片长对应的镜头梯依次出现且不得乱序",
+      "source": "references/omni-multishot-language.md",
+      "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
+    },
+    {
+      "id": "omni-one-take-ban",
+      "level": "P0",
+      "scope": "video",
+      "summary": "禁止一镜到底措辞，过门拍与最终兑现拍同样没有例外",
+      "source": "SKILL.md#Three Standing Conflict Resolutions",
+      "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
+    },
+    {
+      "id": "omni-timeline-cutmarks",
+      "level": "P0",
+      "scope": "video",
+      "summary": "必须原样带上把切点钉在秒上的时间线句，且与片长/镜头梯一致",
+      "source": "references/omni-multishot-language.md",
+      "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
+    },
+    {
+      "id": "omni-landmark-lock-framing-loose",
+      "level": "P0",
+      "scope": "image",
+      "summary": "地标锁死、构图放松：UGC 层可以买到手持晃动与失焦，买不到主地标离框或改变画幅占比",
+      "source": "references/omni-scene-skeleton.md",
+      "enforcer": "prompt_pipeline:check_anchor_scale_lock"
+    },
+    {
+      "id": "omni-notation-ban-video",
+      "level": "P2",
+      "scope": "video",
+      "summary": "记号禁用：VIDEO 正文除时间线秒数外不得出现阿拉伯数字，计数写成英文单词",
+      "source": "references/omni-output-templates.md#Notation Ban",
+      "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
+    },
+    {
+      "id": "omni-notation-ban-image",
+      "level": "P2",
+      "scope": "image",
+      "summary": "记号禁用同样适用于 IMAGE 正文：计数与画高比例一律写成英文单词",
+      "source": "references/omni-output-templates.md#Notation Ban",
+      "enforcer": "prompt_pipeline.composers.omni:omni_image_violations"
+    },
+    {
+      "id": "omni-grid-notation-ban",
+      "level": "P2",
+      "scope": "image",
+      "summary": "记号禁用把 Grid/坐标记法也列为违规（`Grid B2`、`x-axis 0.35`）",
+      "source": "references/omni-output-templates.md#Notation Ban",
+      "enforcer": null,
+      "gap": "与 base 的 primary-landmark-restatement / anchor-scale-lock 直接冲突：那两条要求 IMAGE 按 `<地标> at Grid A2 holding forty-five percent of frame height` 的形态逐字重述 packet，Grid 单元格是 SCUP 漂移门禁的解析锚点。omni 若剥掉 Grid，base 的两个 P0 会同时失去可校验的输入。数字部分已可安全消解（词形数字仍能被 _PERCENT_NEAR_PATTERN 解析，见 omni-notation-ban-image），Grid 部分不能——保留为登记在案的冲突，等 SCUP 支持词形坐标后再消。"
+    },
+    {
+      "id": "omni-ugc-realism-layer",
+      "level": "P2",
+      "scope": "video",
+      "summary": "默认偏 UGC 手机拍摄：真实可用光、轻微过曝、压缩噪点、不稳定构图",
+      "source": "SKILL.md#Core Job",
+      "enforcer": null,
+      "gap": "纯风格取向，靠 system prompt 里的 references 原文引导，没有确定性判定标准可写成门禁。登记为「有意不设门禁」，避免下次审计时被当成漏掉的一条。"
+    }
+  ]
+}

@@ -28,7 +28,8 @@ from server_common import (
     _get_project_dir, _safe_project_name, read_ledger,
     IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT,
     PACKET_CACHE_LOCK, COMPOSE_CHECKPOINT_LOCK,
-    strict_gates_enabled, qa_gate_level, GenerationCancelled
+    strict_gates_enabled, qa_gate_level, GenerationCancelled,
+    skill_contract_strict, operator_blind_spot_block
 )
 from .frame_state import (
     build_frame_state_contract,
@@ -3531,7 +3532,9 @@ def _worker_scale_clause_from_packet(packet, plural=False):
     if scale is None or not (0 < scale <= 100):
         return ''
     verb = "each standing" if plural else "standing"
-    return f", {verb} roughly {scale} percent of frame height,"
+    prose = scale_prose(scale)
+    # prose 自带 'about ...'，再加 'roughly' 会读成 'roughly about a sixth'。
+    return f", {verb} {prose}," if prose else ''
 
 
 def _beat_action_phrase(beat):
@@ -3588,7 +3591,8 @@ def fix_out_and_in(prompt, is_threshold_or_reveal=False, beat=None, packet=None)
         if is_multi and 'one lone worker' in low:
             # Conflict: body says multi-worker but appended template says one worker
             prompt = re.sub(
-                rf'At t=0s, one lone worker enters the frame from the Grid C1 edge;[^.]*leaving the frame completely empty at t={int(VIDEO_DURATION)}s\.',
+                rf'At t=0s, one lone worker enters the frame from the (?:Grid C1|lower left) edge[^.]*'
+                rf'leaving the frame completely empty at t={int(VIDEO_DURATION)}s\.',
                 '', prompt).strip()
             # Re-add consistent multi-worker clause if no other exit clause remains
             if not any(p in prompt.lower() for p in ['exits the frame', 'walks out', 'leaves the frame']):
@@ -3607,9 +3611,9 @@ def fix_out_and_in(prompt, is_threshold_or_reveal=False, beat=None, packet=None)
         costume = _worker_costume_from_packet(packet)
         scale_clause = _worker_scale_clause_from_packet(packet)
         action = _beat_action_phrase(beat)
-        clause = (f" At t=0s, one lone worker{costume}{scale_clause} enters the frame from the Grid C1 edge; "
+        clause = (f" At t=0s, one lone worker{costume}{scale_clause} enters the frame from the lower left edge; "
                   f"the worker {action}, and by t={WORKER_EXIT_TIME}s, walks out of the frame "
-                  f"through the Grid C1 edge, leaving the frame completely empty at t={int(VIDEO_DURATION)}s.")
+                  f"through the lower left edge, leaving the frame completely empty at t={int(VIDEO_DURATION)}s.")
 
     prompt += clause
     return prompt
@@ -3929,12 +3933,111 @@ def _transition_stage_specs(parsed_brief):
     ]
 
 
+# A crossing beat's before/after describes where the CAMERA stands, never a construction state.
+# Each expanded stage must own its own pair: the 2026-08-05 petrified-cypress run copied the
+# planner's single marker verbatim into three stages, so beats 3/4/5 carried an identical
+# milestone_name/before/after/persistent_traces and shipped three consecutive ten-second clips
+# that walked through the same door three times.
+_TRANSITION_STAGE_STATES = {
+    'hatch_hardware_open': (
+        'Camera stands outside on the registered entrance plane with the hatch still shut.',
+        'Camera still stands outside; the hatch leaf is open and the shaft mouth reads below it.'),
+    'shaft_descent': (
+        'Camera is at the open hatch mouth looking down the registered shaft.',
+        'Camera has descended inside the shaft, one daylight column above and the landing below.'),
+    'landing_turn': (
+        'Camera is on the shaft ladder just above the landing platform.',
+        'Camera stands on the landing, gravity vertical, turned onto the registered interior axis.'),
+    'door_hardware_open': (
+        'Camera stands outside the registered entrance with the opening still closed off.',
+        'Camera still stands outside; the entrance is open and the raw interior dark beyond it.'),
+    'threshold_partial': (
+        'Camera stands outside the open entrance on the site side of the sill.',
+        'Camera has crossed the sill locally; the opening edge is still inside the frame boundary.'),
+    'orientation_turn': (
+        'Camera stands just inside the sill, still facing the entrance axis.',
+        'Camera has turned onto the registered interior axis with the sill kept as orientation evidence.'),
+    'partial_first_look': (
+        'Camera has just landed inside and faces one local interior surface only.',
+        'Camera holds the landed POV; one wall, one short floor segment and one fixture are revealed.'),
+    'interior_establish': (
+        'Camera holds the partial landed view with the far interior still occluded.',
+        'Camera has settled on the interior establishing axis and the raw primary space reads whole.'),
+}
+
+# Fields that describe CONSTRUCTION work.  A crossing stage carries none of them, and inheriting
+# them from the planner's marker is what let a "door hardware" stage claim a cedar door leaf,
+# hinges and a latch that no beat in the ladder ever installs.
+_TRANSITION_CLEARED_FIELDS = (
+    'milestone_name', 'completion_extent', 'primary_progress', 'secondary_progress',
+)
+
+# Word-boundary matched: substring matching turns "outdoor", "block" and "interlocking" into
+# false claims that a door already exists, which sends the crossing back to the wrong branch.
+_ENTRANCE_HARDWARE_CUE_RE = re.compile(
+    r'\b(?:door|doors|hatch|hatches|leaf|leaves|hinge|hinges|latch|latches|'
+    r'lock|locks|gasket|gaskets|jamb|jambs|shutter|shutters)\b', re.IGNORECASE)
+
+
+def _entrance_hardware_installed_before(beat_ladder, marker):
+    """Whether any beat BEFORE the crossing marker actually installs entrance hardware.
+
+    ``entrance_topology.hardware`` is a topology ledger, not a promise that the hardware exists:
+    on a found natural carrier the crossing happens through the raw opening, because no beat has
+    fitted a leaf yet.  Asserting hardware anyway makes the renderer bolt hinges onto bare shell
+    (2026-08-05) and makes the paired VIDEO smuggle a whole door installation into a crossing clip.
+    """
+    for beat in beat_ladder if isinstance(beat_ladder, list) else []:
+        if beat is marker:
+            break
+        if not isinstance(beat, dict):
+            continue
+        text = ' '.join(str(beat.get(field) or '') for field in
+                        ('milestone_name', 'after_state', 'description'))
+        if _ENTRANCE_HARDWARE_CUE_RE.search(text):
+            return True
+    return False
+
+
+def _transition_stage_description(stage, hardware_installed):
+    """Per-stage crossing prose, with the hardware stages told what actually exists on site."""
+    if stage == 'hatch_hardware_open':
+        return (
+            'Close detail: a hand and pry bar release the already-fitted hatch lock, hinges and '
+            'gasket; dust falls while the first rung and shaft remain visible'
+            if hardware_installed else
+            'Close detail: hands clear and lift the raw unfitted top opening of the carrier itself — '
+            'no leaf, hinge, latch or gasket has been built yet, nothing is installed or carried in, '
+            'and the first rung and shaft mouth stay visible below'
+        )
+    if stage == 'door_hardware_open':
+        return (
+            'Close detail: the registered door leaf, hinges, latch, gasket and threshold that a '
+            'previous beat already installed are opened on camera without changing the surrounding site'
+            if hardware_installed else
+            'Close detail: hands pull back the last growth and loose debris from the carrier\'s own raw '
+            'entrance opening, and unlit darkness sits just inside it — no door leaf, hinge, latch or '
+            'gasket exists yet, nothing is installed, delivered or mounted, and the surrounding site is unchanged'
+        )
+    return {
+        'shaft_descent': 'Camera descends inside the registered shaft past fixed ladder rungs, with one daylight column above and the landing visible below',
+        'landing_turn': 'Camera reaches the landing platform, keeps gravity vertical, and makes the registered ninety-degree turn toward the primary space',
+        'threshold_partial': 'Camera crosses the sill locally; the opening edge and shared floor line remain visible while only a small raw interior fragment is revealed',
+        'orientation_turn': 'From just inside the threshold the camera visibly turns onto the registered interior axis, retaining the sill as orientation evidence',
+        'partial_first_look': 'First landed POV reveals only one raw wall, a short floor segment and one existing feature; the far wall stays occluded',
+        'interior_establish': 'A three-quarter oblique establishing view finally reveals the raw primary interior while preserving the carrier envelope and entrance backlight',
+    }[stage]
+
+
 def expand_spatial_transition_beats(beat_ladder, parsed_brief):
     """Expand conceptual crossing/reset markers without consuming construction milestones.
 
     The planner remains free to reason with one marker per boundary.  Runtime turns each marker into
     the physically necessary image/video slots and renumbers the ladder.  Fresh nested-space plans
     therefore contain no ``hard_cut`` and no ``reset from scratch`` discontinuity.
+
+    Each expanded stage receives its OWN camera-position state and carries no construction fields,
+    so the frame-state contract can tell the stages apart instead of seeing one beat three times.
     """
     if not isinstance(beat_ladder, list):
         return beat_ladder
@@ -3949,8 +4052,10 @@ def expand_spatial_transition_beats(beat_ladder, parsed_brief):
         is_primary_marker = beat.get('bridge_stage') == 1 and not beat.get('hard_cut')
         is_secondary_marker = bool(beat.get('hard_cut')) and parsed_brief.get('pacing_skeleton') == 'nested_space_payoff'
         if is_primary_marker:
+            hardware_installed = _entrance_hardware_installed_before(beat_ladder, source)
             for stage, space_id, camera, reveal, light in _transition_stage_specs(parsed_brief):
                 bridge_serial += 1
+                before_state, after_state = _TRANSITION_STAGE_STATES[stage]
                 item = dict(beat)
                 item.update({
                     'operation': 'threshold', 'bridge_stage': bridge_serial, 'hard_cut': False,
@@ -3959,17 +4064,19 @@ def expand_spatial_transition_beats(beat_ladder, parsed_brief):
                     'result_space_family': 'exterior' if space_id == 'site' else 'interior',
                     'turn_direction': (threshold_topology(parsed_brief)['turn_direction']
                                        if stage in ('landing_turn', 'orientation_turn') else None),
-                    'description': {
-                        'hatch_hardware_open': 'Close detail: a hand and pry bar release the hatch lock, hinges and gasket; dust falls while the first rung and shaft remain visible',
-                        'shaft_descent': 'Camera descends inside the registered shaft past fixed ladder rungs, with one daylight column above and the landing visible below',
-                        'landing_turn': 'Camera reaches the landing platform, keeps gravity vertical, and makes the registered ninety-degree turn toward the primary space',
-                        'door_hardware_open': 'Close detail: the registered door leaf, hinges, latch, gasket and threshold are opened on camera without changing the surrounding site',
-                        'threshold_partial': 'Camera crosses the sill locally; the door frame and shared floor line remain visible while only a small raw interior fragment is revealed',
-                        'orientation_turn': 'From just inside the threshold the camera visibly turns onto the registered interior axis, retaining the sill as orientation evidence',
-                        'partial_first_look': 'First landed POV reveals only one rust wall, a short rail/floor segment and one old device; the far wall stays occluded',
-                        'interior_establish': 'A three-quarter oblique establishing view finally reveals the raw primary interior while preserving the carrier envelope and entrance backlight',
-                    }[stage],
+                    'description': _transition_stage_description(stage, hardware_installed),
+                    # Own camera-position state per stage; zero construction state.
+                    'before_state': before_state,
+                    'after_state': after_state,
+                    'preserve_state': ('every construction state established before this crossing is '
+                                       'carried through unchanged; this beat builds nothing'),
+                    'changed_grid_cells': [],
+                    'package_operations': [],
+                    'persistent_traces': [],
+                    'stage_scope': 'default',
                 })
+                for field in _TRANSITION_CLEARED_FIELDS:
+                    item[field] = ''
                 expanded.append(item)
             continue
         if is_secondary_marker:
@@ -3977,15 +4084,23 @@ def expand_spatial_transition_beats(beat_ladder, parsed_brief):
             secondary = str(parsed_brief.get('secondary_space') or 'the secondary raw compartment')
             specs = [
                 ('divider_open', 'primary', 'divider_detail', 'local',
-                 f'At the finished primary-space edge, open {divider} on camera; keep its frame, shared utilities and floor line visible'),
+                 f'At the finished primary-space edge, open {divider} on camera; keep its frame, shared utilities and floor line visible',
+                 f'Camera stands in the finished primary space with {divider} still closed.',
+                 f'Camera holds in the primary space; {divider} is open and the raw secondary side reads beyond it.'),
                 ('secondary_threshold', 'secondary', 'threshold_partial', 'partial',
-                 f'Cross {divider} into {secondary}; retain the divider edge, primary-space return light and shared floor/utility line'),
+                 f'Cross {divider} into {secondary}; retain the divider edge, primary-space return light and shared floor/utility line',
+                 f'Camera stands at the open {divider} on the primary-space side.',
+                 f'Camera has crossed {divider}; its edge and the shared floor line stay in frame.'),
                 ('secondary_partial_first_look', 'secondary', 'secondary_partial', 'partial',
-                 f'First look into {secondary} shows only a local raw surface and one carrier identity feature; its far wall remains hidden'),
+                 f'First look into {secondary} shows only a local raw surface and one carrier identity feature; its far wall remains hidden',
+                 f'Camera has just landed inside {secondary} facing one local surface.',
+                 f'Camera holds the landed POV in {secondary}; its far wall stays occluded.'),
                 ('secondary_establish', 'secondary', 'oblique_secondary', 'full',
-                 f'Establish {secondary} from a three-quarter axis; the primary space remains finished behind the visible connection'),
+                 f'Establish {secondary} from a three-quarter axis; the primary space remains finished behind the visible connection',
+                 f'Camera holds the partial landed view of {secondary}.',
+                 f'Camera has settled on the establishing axis and {secondary} reads whole and raw.'),
             ]
-            for stage, space_id, camera, reveal, description in specs:
+            for stage, space_id, camera, reveal, description, before_state, after_state in specs:
                 bridge_serial += 1
                 item = dict(beat)
                 item.update({
@@ -3995,7 +4110,17 @@ def expand_spatial_transition_beats(beat_ladder, parsed_brief):
                     'light_source_state': 'primary-space return light and carried portable lamp only',
                     'result_space_family': 'interior', 'description': description,
                     'turn_direction': None,
+                    'before_state': before_state,
+                    'after_state': after_state,
+                    'preserve_state': ('every construction state established before this crossing is '
+                                       'carried through unchanged; this beat builds nothing'),
+                    'changed_grid_cells': [],
+                    'package_operations': [],
+                    'persistent_traces': [],
+                    'stage_scope': 'default',
                 })
+                for field in _TRANSITION_CLEARED_FIELDS:
+                    item[field] = ''
                 expanded.append(item)
             continue
         expanded.append(beat)
@@ -4518,7 +4643,7 @@ def _family_landmarks(packet, family='exterior'):
 _INTERIOR_IMAGE_CAMERA_DNA = (
     "Static tripod shot inside the enclosed interior, same ultra-wide lens feel and same camera "
     "height as the exterior shots, camera pitch locked level; the central vanishing axis stays "
-    "centered on the rear interior wall in Grid B2."
+    "centered on the rear interior wall at the centre of the frame."
 )
 
 
@@ -4755,7 +4880,7 @@ def dedupe_camera_declaration(prompt, camera_dna):
 
 def fix_rhma_blur(prompt, is_last):
     if is_last and ("reflection" in prompt.lower() or "polished" in prompt.lower()):
-        clause = "The highly reflective polished floor surface in Grid C1-C3 displays a heavily blurred, low-gloss, diffused reflection of the background; reflections are muted, dark, and highly out-of-focus, preventing high-frequency contrast or sharp details; realistic Fresnel falloff near the margins."
+        clause = "The highly reflective polished floor surface across the lower third of the frame displays a heavily blurred, low-gloss, diffused reflection of the background; reflections are muted, dark, and highly out-of-focus, preventing high-frequency contrast or sharp details; realistic Fresnel falloff near the margins."
         if "blurred" not in prompt.lower() and "diffused" not in prompt.lower():
             if not prompt.endswith('.'):
                 prompt += '.'
@@ -4800,30 +4925,265 @@ def fix_horizon_line(prompt, family='exterior'):
     return prompt
 
 
+# ── 记号 → 散文（NLVTR 硬化层）────────────────────────────────────────────
+# 2026-08-05 实证：一帧被判废的原因原文是「画面中出现了多处异常的字母叠加渲染标记
+# （A、A、C）」——而同一条提示词正文里写着 "at Grid A2 ... at Grid C2 ... at Grid B1"。
+# 渲出来的字母就是网格行标。Grid 是给写手的内部登记约定（代码注释一直这么说），
+# 但它此前被 check_primary_landmarks_exact_match 强制要求出现在 IMAGE 正文里，
+# 于是每一帧都在向图像模型朗读坐标记号。同一次运行的 anchor_recalibrations 还显示
+# 声明格位与真实渲染对不上（A2→B2、C2→C3），要事后回校五个 slot：这套坐标既锁不住
+# 构图，又污染画面，两份代价一份收益。
+#
+# 解法不是删掉空间约束，而是换一种模型真能执行的表述：格位翻成方位散文，占比翻成
+# 分数措辞。packet 内部继续用 Grid/percent 做推理与校验，只是不再进入正文。
+_GRID_BEARING = {
+    'A1': 'in the upper left of the frame',
+    'A2': 'across the upper centre of the frame',
+    'A3': 'in the upper right of the frame',
+    'B1': 'along the mid-left of the frame',
+    'B2': 'at the centre of the frame',
+    'B3': 'along the mid-right of the frame',
+    'C1': 'in the lower left of the frame',
+    'C2': 'across the lower centre of the frame',
+    'C3': 'in the lower right of the frame',
+}
+
+# 占比分桶。刻意粗：图像模型执行不了 5% 的精度差，而 63 与 65 之间的"漂移"过去会被
+# check_anchor_scale_lock 判成违规、触发无意义回炉。分桶之后，锁的是"看得出来的那档"。
+_SCALE_PROSE_BUCKETS = (
+    (13, 'a narrow band of the frame height'),
+    (21, 'about a sixth of the frame height'),
+    (29, 'about a quarter of the frame height'),
+    (38, 'about a third of the frame height'),
+    (47, 'about two fifths of the frame height'),
+    (57, 'about half the frame height'),
+    (63, 'about three fifths of the frame height'),
+    (72, 'about two thirds of the frame height'),
+    (82, 'about three quarters of the frame height'),
+    (93, 'most of the frame height'),
+    (101, 'nearly the full frame height'),
+)
+
+
+def _grid_bearing(cell):
+    """'B1' / 'Grid B1' -> 'along the mid-left of the frame'；无法识别时返回 ''。"""
+    if not cell:
+        return ''
+    m = re.search(r'\b([A-Ca-c])\s*([1-3])\b', str(cell))
+    if not m:
+        return ''
+    return _GRID_BEARING.get(f"{m.group(1).upper()}{m.group(2)}", '')
+
+
+def _grid_span_bearing(c1, c2):
+    """跨格区间（Grid C1-C3）翻成一句方位散文。同排 -> 'across the lower third of the
+    frame'；同列 -> 'down the left edge of the frame'；其余回落到起止两点。"""
+    a, b = (c1 or '').upper(), (c2 or '').upper()
+    if not (len(a) == 2 and len(b) == 2):
+        return ''
+    rows = {'A': 'the upper third of the frame', 'B': 'the middle band of the frame',
+            'C': 'the lower third of the frame'}
+    cols = {'1': 'the left edge of the frame', '2': 'the centre column of the frame',
+            '3': 'the right edge of the frame'}
+    if a[0] == b[0] and a[0] in rows:
+        return f"across {rows[a[0]]}"
+    if a[1] == b[1] and a[1] in cols:
+        return f"down {cols[a[1]]}"
+    s, e = _grid_bearing(a), _grid_bearing(b)
+    return f"{s} through to {e}" if s and e else ''
+
+
+def _cells_as_bearings(cells):
+    """['A2','B2'] -> 'across the upper centre of the frame and at the centre of the frame'。
+    整行/整列会收敛成区间说法。给合成期的契约文字用，同样不许把格位标签递给模型。"""
+    cells = [str(c).upper().replace('GRID', '').strip() for c in (cells or [])]
+    cells = [c for c in cells if re.fullmatch(r'[A-C][1-3]', c)]
+    if not cells:
+        return ''
+    if len(cells) >= 3 and (len({c[0] for c in cells}) == 1 or len({c[1] for c in cells}) == 1):
+        span = _grid_span_bearing(cells[0], cells[-1])
+        if span:
+            return span
+    bearings = [b for b in (_grid_bearing(c) for c in cells) if b]
+    if not bearings:
+        return ''
+    if len(bearings) == 1:
+        return bearings[0]
+    return ', '.join(bearings[:-1]) + ' and ' + bearings[-1]
+
+
+def scale_prose(scale):
+    """整数占比 -> 分数措辞。超出 1-100 时返回 ''。"""
+    scale = _parse_percent_token(scale)
+    if scale is None or not (0 < scale <= 100):
+        return ''
+    for ceiling, prose in _SCALE_PROSE_BUCKETS:
+        if scale < ceiling:
+            return prose
+    return _SCALE_PROSE_BUCKETS[-1][1]
+
+
+_GRID_SPAN_RE = re.compile(
+    r'\b(?:at|in|across|along|within|inside|from)?\s*grid\s+([A-Ca-c][1-3])\s*(?:[-–—]|\bto\b|\bthrough\b)\s*(?:grid\s+)?([A-Ca-c][1-3])\b',
+    re.IGNORECASE)
+_GRID_LIST_RE = re.compile(
+    r'\b(?:at|in|across|along|within|inside)?\s*grid\s+([A-Ca-c][1-3])((?:\s*,\s*(?:and\s+)?(?:grid\s+)?[A-Ca-c][1-3])+)\b',
+    re.IGNORECASE)
+_GRID_SINGLE_RE = re.compile(
+    r'\b(?:(at|in|across|along|within|inside|near|from|toward|towards)\s+)?grid\s+([A-Ca-c][1-3])\b',
+    re.IGNORECASE)
+_GRID_BARE_CELL_RE = re.compile(r'\bcell\s+([A-Ca-c][1-3])\b', re.IGNORECASE)
+# 'from the Grid C1 edge' —— 出入画路径的固定写法，直翻会得到 'from the in the lower
+# left of the frame edge'。单独一条规则把它整体换成 '<方位> edge of the frame'。
+_GRID_EDGE_RE = re.compile(
+    r'\b(the\s+)?grid\s+([A-Ca-c][1-3])\s+(edge|border|margin|side)\b', re.IGNORECASE)
+_GRID_EDGE_BEARING = {
+    'A1': 'upper left', 'A2': 'top', 'A3': 'upper right',
+    'B1': 'left', 'B2': 'centre', 'B3': 'right',
+    'C1': 'lower left', 'C2': 'bottom', 'C3': 'lower right',
+}
+# 覆盖度百分比（"exposed area grows from 10 percent to 90 percent"）说的是范围占比，
+# 不是画幅高度占比，所以走自己这张词表，别复用 _SCALE_PROSE_BUCKETS 的 'of the frame height'。
+_COVERAGE_BUCKETS = (
+    (13, 'a narrow strip'), (21, 'roughly a sixth'), (29, 'roughly a quarter'),
+    (38, 'roughly a third'), (47, 'roughly two fifths'), (57, 'roughly half'),
+    (63, 'roughly three fifths'), (72, 'roughly two thirds'),
+    (82, 'roughly three quarters'), (93, 'most of it'), (100, 'nearly all of it'),
+)
+_SCALE_PHRASE_RE = re.compile(
+    r'\b(holding|occupying|filling|reaching|standing|rising to)?\s*'
+    r'((?:\d{1,3})|(?:[a-z]+(?:[-\s][a-z]+)?))\s*(?:-|\s)?percent\s+of\s+(?:total\s+)?frame\s+height\b',
+    re.IGNORECASE)
+_BARE_PERCENT_RE = re.compile(
+    r'\b((?:\d{1,3})|(?:[a-z]+(?:[-\s][a-z]+)?))\s*(?:-|\s)?(?:percent|%)'
+    r'(?!\s*of\s+(?:total\s+)?frame\s+height)(\s+of\s+)?',
+    re.IGNORECASE)
+
+
+def _coverage_prose(scale):
+    """覆盖度百分比 -> 措辞。100 单独处理（调用点要顺带吃掉后面的 'of'）。"""
+    scale = _parse_percent_token(scale)
+    if scale is None or not (0 <= scale <= 100):
+        return ''
+    if scale <= 2:
+        return 'none of it'
+    for ceiling, prose in _COVERAGE_BUCKETS:
+        if scale < ceiling:
+            return prose
+    return 'the entire'
+
+
+def scrub_spatial_notation(text):
+    """把网格记号与画幅占比数字从**最终提示词正文**里剥掉，换成等义的方位/分数散文。
+
+    这是确定性修复的最后一道：不管记号是模板拼进来的、契约文档示例带进来的、还是
+    合成模型自由写出来的，一律在送去渲染之前翻译掉。packet、TRACES、changed_grid_cells
+    等内部结构不经过这里，Grid 作为内部推理坐标系原样保留。
+
+    只翻译不删除——空间约束仍然在，只是改成图像模型真能执行的表述。"""
+    if not text:
+        return text
+    out = text
+
+    # 先长后短：区间 → 枚举 → 单点，否则区间会被单点规则先啃掉一半。
+    out = _GRID_SPAN_RE.sub(
+        lambda m: _grid_span_bearing(m.group(1), m.group(2)) or 'across the frame', out)
+
+    def _list_sub(m):
+        cells = [c.upper() for c in ([m.group(1)] + re.findall(r'[A-Ca-c][1-3]', m.group(2)))]
+        # 枚举恰好覆盖一整行/一整列时收敛成区间说法，否则三格并列会写成又长又碎的一串。
+        span = _grid_span_bearing(cells[0], cells[-1]) if len(cells) >= 3 else ''
+        if span and (len({c[0] for c in cells}) == 1 or len({c[1] for c in cells}) == 1):
+            return span
+        bearings = [b for b in (_grid_bearing(c) for c in cells) if b]
+        if not bearings:
+            return 'across the frame'
+        if len(bearings) == 1:
+            return bearings[0]
+        return ', '.join(bearings[:-1]) + ' and ' + bearings[-1]
+
+    out = _GRID_LIST_RE.sub(_list_sub, out)
+
+    def _edge_sub(m):
+        bearing = _GRID_EDGE_BEARING.get(m.group(2).upper())
+        if not bearing:
+            return m.group(0)
+        return f"the {bearing} {m.group(3).lower()} of the frame"
+
+    out = _GRID_EDGE_RE.sub(_edge_sub, out)
+
+    def _single_sub(m):
+        bearing = _grid_bearing(m.group(2))
+        if not bearing:
+            return m.group(0)
+        prep = (m.group(1) or '').lower()
+        # 方位串自带介词（'in the upper left…'），把原介词吃掉避免 'at in the…'。
+        if prep in ('from', 'toward', 'towards', 'near'):
+            return f"{prep} {bearing[bearing.find(' ') + 1:]}" if ' ' in bearing else bearing
+        return bearing
+
+    out = _GRID_SINGLE_RE.sub(_single_sub, out)
+    out = _GRID_BARE_CELL_RE.sub(
+        lambda m: _grid_bearing(m.group(1)) or m.group(0), out)
+
+    # 占比：先处理带 'of frame height' 的完整短语，再兜底裸百分比。
+    def _scale_sub(m):
+        prose = scale_prose(m.group(2))
+        if not prose:
+            return m.group(0)
+        verb = (m.group(1) or '').strip()
+        return f"{verb} {prose}" if verb else f"rising to {prose}"
+
+    out = _SCALE_PHRASE_RE.sub(_scale_sub, out)
+
+    def _bare_percent_sub(m):
+        prose = _coverage_prose(m.group(1))
+        if not prose:
+            return m.group(0)
+        trailing_of = m.group(2) or ''
+        if prose == 'the entire':
+            # '100 percent of the floor' -> 'the entire floor'（吃掉 of，否则留下悬空介词）
+            return 'the entire ' if trailing_of else 'all of it'
+        if trailing_of and prose.endswith(' of it'):
+            return prose[:-len(' of it')] + trailing_of
+        return prose + trailing_of
+
+    out = _BARE_PERCENT_RE.sub(_bare_percent_sub, out)
+
+    out = re.sub(r'\s{2,}', ' ', out)
+    out = re.sub(r'\s+([,.;])', r'\1', out)
+    return out.strip()
+
+
 _LOCKED_ANCHOR_STANZA_PATTERN = re.compile(
     r'^\s*(?:locked anchors|locked landmarks|locked interior anchors|interior primary anchors)\s*'
     r'(?::|\bare\b)', re.IGNORECASE)
 
 
 def _canonical_anchor_clause(landmarks):
-    """One canonical 'Locked anchors:' sentence from a landmark list — name, grid, and the
-    packet's z_depth_scale rendered NLVTR-safe ('35 percent', never the % glyph)."""
+    """One canonical 'Locked anchors:' sentence from a landmark list — name, screen bearing,
+    and the packet's z_depth_scale, all rendered as prose.
+
+    2026-08-05: this used to emit 'name at Grid B1 holding 65 percent of frame height'. The
+    grid cell and the numeral both reached the image model verbatim and were rendered into
+    the frame as literal letters (see scrub_spatial_notation's note). The packet still stores
+    grid + percent; only their *rendering* changed."""
     parts = []
     for lm in landmarks or []:
         if not isinstance(lm, dict):
             continue
         name = str(lm.get('name', '')).strip()
-        grid = str(lm.get('grid', '')).strip()
         if not name:
             continue
-        piece = f"{name} at {grid}" if grid else name
-        scale = _parse_percent_token(lm.get('z_depth_scale'))
-        if scale is not None and 0 < scale <= 100:
-            piece += f" holding {scale} percent of frame height"
+        bearing = _grid_bearing(lm.get('grid'))
+        piece = f"{name} {bearing}" if bearing else name
+        prose = scale_prose(lm.get('z_depth_scale'))
+        if prose:
+            piece += f", rising to {prose}"
         parts.append(piece)
     if not parts:
         return ''
-    return "Locked anchors: " + ", ".join(parts) + "."
+    return "Locked anchors: " + "; ".join(parts) + "."
 
 
 def fix_primary_landmarks(prompt, packet, family='exterior'):
@@ -4929,6 +5289,54 @@ def fix_delivered_carrier_scale_lock(prompt, packet, family='exterior'):
     return (body.rstrip() + ' ' + _DELIVERED_CARRIER_SCALE_SENTENCE).strip()
 
 
+_FOUND_CARRIER_SCALE_SENTENCE = (
+    "The carrier shell stays the dominant subject at the same scale as in the anchor frame: centered "
+    "in the near midground, fully visible, its silhouette filling the central majority of the "
+    "photograph and its longest visible dimension spanning roughly two-thirds of the frame, never "
+    "shrinking into a distant detail of the surrounding landscape and never letting a foreground "
+    "framing element become the largest form."
+)
+
+# Only for carriers whose registered interior is reached through the entrance.  An exterior-only
+# restoration has no cavity to keep closed, and a room restoration legitimately has windows.
+_FOUND_CARRIER_ENCLOSURE_SENTENCE = (
+    "The space beyond its entrance stays a dead-end enclosed volume ending in solid material and "
+    "darkness — no sky, daylight gap, water, background trees or terrain is ever visible through "
+    "the opening, which is never a hole, tunnel, or see-through arch."
+)
+
+
+def fix_found_carrier_scale_lock(prompt, packet, family='exterior'):
+    """Hold a FOUND carrier's subject scale and cavity enclosure across the exterior family.
+
+    The delivered-carrier path has had a scale lock since the hauled-in shells kept resizing, but a
+    carrier that is simply found on site had none.  A 2026-08-05 run shows both failure modes it
+    leaves open: the renderer promoted the foreground root arch to protagonist and shrank the real
+    carrier to a mid-ground speck, and it rendered the cavity as a see-through hole with open swamp
+    behind it — so every later interior beat described a room that does not physically exist.
+    """
+    if not prompt or family != 'exterior' or not isinstance(packet, dict):
+        return prompt
+    origin = packet.get('origin_contract') or {}
+    if not isinstance(origin, dict) or origin.get('mode') != 'existing_restoration':
+        return prompt
+
+    scale_markers = (
+        'longest visible dimension', 'silhouette fills the central majority',
+        'silhouette filling the central majority', 'distant detail of the surrounding',
+        'dead-end enclosed volume',
+    )
+    sentences = re.split(r'(?<=[.!?])\s+', prompt.strip())
+    kept = [s for s in sentences if not any(marker in s.lower() for marker in scale_markers)]
+    body = ' '.join(s for s in kept if s).strip()
+    locks = [_FOUND_CARRIER_SCALE_SENTENCE]
+    # interior_camera_dna is only requested when the ladder actually registers a crossing, so it
+    # is the packet's own record that there is an interior behind this entrance.
+    if str(packet.get('interior_camera_dna') or '').strip():
+        locks.append(_FOUND_CARRIER_ENCLOSURE_SENTENCE)
+    return (body.rstrip() + ' ' + ' '.join(locks)).strip()
+
+
 def extract_locked_anchor_stanza(prompt):
     """从提示词中取出锁定锚点句（fix_primary_landmarks 规范化后的单一句）。
     没有则返回 None。同族所有提示词经过合成期的规范化后携带完全相同的这一句，
@@ -4956,20 +5364,36 @@ def replace_locked_anchor_stanza(prompt, new_stanza):
     return ' '.join(x for x in out if x).strip(), True
 
 
+# 锚点名之后的位置/占比尾巴。新散文形态与旧记号形态都要能切，否则跨版本的存档
+# （checkpoint、library 里的历史锚点句）解析出来会带一截方位短语，名称集合比对必失败。
+_ANCHOR_TAIL_SPLIT_RE = re.compile(
+    r'\s+(?:'
+    r'at\s+grid\b|at\s+[A-C][1-3]\b|holding\s+\d'                     # 旧记号形态
+    r'|(?:in|across|along|at|down)\s+the\s+(?:upper|lower|mid|middle|centre|center|left|right)'
+    r'|,?\s*(?:rising to|holding|occupying|filling)\s+(?:about|roughly|most|nearly|a\s|the\s)'
+    r')', re.IGNORECASE)
+
+
 def _stanza_anchor_names(stanza):
-    """从规范锚点句解析锚点名称列表（小写）。'Locked anchors: a at Grid B2 holding
-    45 percent of frame height, b at Grid C2.' -> ['a', 'b']。"""
+    """从规范锚点句解析锚点名称列表（小写）。
+
+    新形态：'Locked anchors: a along the mid-left of the frame, rising to about half the
+    frame height; b at the centre of the frame.' -> ['a', 'b']
+    旧形态（历史存档）：'Locked anchors: a at Grid B2 holding 45 percent of frame height,
+    b at Grid C2.' -> ['a', 'b']"""
     if not stanza:
         return []
     body = re.sub(r'^\s*locked anchors\s*:\s*', '', stanza.strip(), flags=re.IGNORECASE)
     body = body.rstrip('.')
+    # 新形态用 ';' 分锚点（锚点内部的 ',' 属于 'rising to' 从句）；旧形态没有 ';'，
+    # 回落到按 ',' 切。
+    pieces = body.split(';') if ';' in body else body.split(',')
     names = []
-    for piece in body.split(','):
+    for piece in pieces:
         piece = piece.strip()
         if not piece:
             continue
-        name = re.split(r'\s+at\s+grid\b|\s+at\s+[A-C][1-3]\b|\s+holding\s+\d', piece,
-                        flags=re.IGNORECASE)[0].strip()
+        name = _ANCHOR_TAIL_SPLIT_RE.split(piece, maxsplit=1)[0].strip().rstrip(',')
         if name:
             names.append(name.lower())
     return names
@@ -4994,24 +5418,31 @@ def recalibrate_anchor_stanza(config, frame_path, current_stanza):
             "You are a spatial consistency supervisor for a static-camera restoration time-lapse. "
             "You are given the DECLARED locked-anchor sentence used by all remaining prompts of the "
             "current shot family, and the LATEST actually rendered frame of the chain. The sentence "
-            "declares, for each fixed structural landmark: its name, its cell on a 3x3 composition "
-            "grid (rows A-C top to bottom, columns 1-3 left to right, e.g. 'Grid B2' is the center), "
-            "and optionally the share of total frame height it occupies "
-            "('holding N percent of frame height').\n\n"
-            "Compare each declared grid cell and frame-height percentage against where that landmark "
-            "ACTUALLY sits in the attached frame. Rules:\n"
+            "declares, for each fixed structural landmark: its name, its position on screen written "
+            "as prose ('along the mid-left of the frame', 'across the upper centre of the frame', "
+            "'at the centre of the frame', ...), and optionally the share of total frame height it "
+            "occupies, also as prose ('rising to about two thirds of the frame height').\n\n"
+            "Compare each declared position and height share against where that landmark ACTUALLY "
+            "sits in the attached frame. Rules:\n"
             "1. Keep the SAME landmarks, the SAME names verbatim, in the SAME order. Never add, "
             "remove, rename, or reorder landmarks — even if one is hard to see, keep its entry and "
             "your best estimate.\n"
-            "2. Only correct the 'Grid X#' cells and the 'holding N percent of frame height' numbers "
-            "that clearly disagree with the frame. Small, debatable differences do not count — "
-            "correct only clear mismatches (wrong cell, or off by roughly 15 percentage points or "
-            "more).\n"
-            "3. Percentages must be bare integers followed by the word 'percent' — NEVER the % "
-            "glyph.\n"
+            "2. Only correct positions and height shares that clearly disagree with the frame. "
+            "Small, debatable differences do not count — correct only clear mismatches (the landmark "
+            "is plainly in a different third of the frame, or plainly a different size band).\n"
+            "3. NEVER write a grid label ('Grid B2', 'cell A1') and NEVER write a numeral or a "
+            "percentage anywhere in your answer. Both are rendered into the frame as literal text by "
+            "the image model. Use only the prose vocabulary shown above.\n"
+            "   Positions: 'in the upper left / across the upper centre / in the upper right / along "
+            "the mid-left / at the centre / along the mid-right / in the lower left / across the "
+            "lower centre / in the lower right of the frame'.\n"
+            "   Height shares: 'a narrow band / about a sixth / about a quarter / about a third / "
+            "about two fifths / about half / about three fifths / about two thirds / about three "
+            "quarters / most / nearly the full ... of the frame height'.\n"
             "4. Output EXACTLY ONE sentence in EXACTLY the same format, starting with "
-            "'Locked anchors: ' and ending with a period. No explanations, no markdown, no quotes.\n"
-            "5. If every declared cell and percentage already matches the frame, respond EXACTLY "
+            "'Locked anchors: ' and ending with a period, anchors separated by semicolons. No "
+            "explanations, no markdown, no quotes.\n"
+            "5. If every declared position and share already matches the frame, respond EXACTLY "
             "with: UNCHANGED"
         )
         user_text = (f"Declared locked-anchor sentence:\n{current_stanza}\n\n"
@@ -5026,6 +5457,13 @@ def recalibrate_anchor_stanza(config, frame_path, current_stanza):
         if '%' in new_stanza or not new_stanza.endswith('.'):
             return None
         if re.search(r'\.\s+\S', new_stanza):  # 必须是单句
+            return None
+        # 记号守卫：这句会被写进链条剩余每一帧的提示词，放进一个 'Grid B2' 或一个数字，
+        # 等于把文字水印批量注入后半条链。判定模型偶尔会退回旧格式，这里直接弃用本次校准
+        # （fail-open，锚点句保持原样）而不是修补它。
+        if re.search(r'\bgrid\s+[A-Za-z]\s*\d\b|\bcell\s+[A-Za-z]\d\b|\d', new_stanza, re.IGNORECASE):
+            if sys.stdout:
+                print("[ANCHOR RECALIBRATE] 返回值含网格记号或数字，弃用本次校准")
             return None
         old_names = _stanza_anchor_names(current_stanza)
         low = new_stanza.lower()
@@ -5156,11 +5594,20 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
 
     # Subject scale belongs to the entire exterior shot family, not just the delivery beat.
     image_prompt = fix_delivered_carrier_scale_lock(image_prompt, packet, family=family)
+    # A found carrier needs the same hold, plus the cavity-enclosure clause its interior beats
+    # depend on (see fix_found_carrier_scale_lock). The two are mutually exclusive by origin mode.
+    image_prompt = fix_found_carrier_scale_lock(image_prompt, packet, family=family)
 
     # Ordinary milestone frames are compiled as a state delta after every deterministic
     # lock/fix has run.  This keeps the camera and anchor clauses while removing prose
     # that competes with the single visual change the renderer must execute.
     image_prompt = compile_delta_image_prompt(image_prompt, beat, max_words=160)
+
+    # 最后一道：记号 -> 散文。必须放在所有拼装/压缩/裁剪之后，因为上面每一个 fixer 都
+    # 可能重新引入 Grid 或百分比（模板常量、锚点句、出入画子句、模型自由发挥都会）。
+    # 放在这里，等于无论记号从哪条路进来，都出不了这个函数。
+    video_prompt = scrub_spatial_notation(video_prompt)
+    image_prompt = scrub_spatial_notation(image_prompt)
 
     return video_prompt, image_prompt
 
@@ -5648,15 +6095,23 @@ def check_lighting_phase_ladder_monotonicity(ladder):
 
 
 def check_grid_coordinates(prompt):
+    """网格记号出现在**最终提示词正文**里即为违规。
+
+    2026-08-05 反转：这道检查以前只校验格位落在 A1-C3 范围内，等于给记号发通行证。
+    实测代价见 scrub_spatial_notation 的说明——渲出的帧上直接出现了字母 A、A、C。
+    Grid 是内部登记坐标系，packet / TRACES / changed_grid_cells 照常使用；只有交给
+    图像与视频模型的正文不许带。scrub_spatial_notation 已在确定性修复里兜底翻译，
+    所以这里报出来的一律是"兜底之后仍然残留"，属于真漏网。"""
+    if not prompt:
+        return []
     errors = []
-    # Match patterns like Grid C1, Grid C1-C3, Grid C1 to C3, etc.
-    coord_matches = re.findall(r'Grid\s+([A-Za-z]\d)(?:\s*[-–—to\s]+\s*([A-Za-z]\d))?', prompt, re.IGNORECASE)
-    for c1, c2 in coord_matches:
-        for c in (c1, c2):
-            if c:
-                cell = c.upper()
-                if cell[0] not in ("A", "B", "C") or cell[1] not in ("1", "2", "3"):
-                    errors.append(f"Invalid Grid coordinate 'Grid {cell}' found (only A1-C3 are allowed)")
+    leaked = re.findall(r'\bGrid\s+[A-Za-z]\s*\d\b', prompt, re.IGNORECASE)
+    if leaked:
+        uniq = sorted(set(x.strip() for x in leaked))
+        errors.append(
+            f"Prompt body still contains grid notation ({', '.join(uniq)}) — coordinate labels are "
+            f"rendered into the frame as literal letters. State the position as prose instead "
+            f"(e.g. 'along the mid-left of the frame')")
     return errors
 
 
@@ -5669,21 +6124,28 @@ def check_primary_landmarks_exact_match(image_prompt, packet, family='exterior')
         # interior frames without a registered interior anchor set: nothing to hard-enforce
         # here (check_shot_family_leakage guards the negative side).
         return errors
+    low = image_prompt.lower()
     for lm in landmarks:
         if not isinstance(lm, dict):
             continue
         name = str(lm.get('name', '')).strip()
-        grid = str(lm.get('grid', '')).strip()
 
         # Landmark name check (case-insensitive exact string match)
-        if name.lower() not in image_prompt.lower():
+        if name.lower() not in low:
             errors.append(f"IMAGE prompt fails to restate primary landmark name exactly: '{name}'")
 
-        # Landmark grid check (case-insensitive)
-        if grid.lower() not in image_prompt.lower():
-            raw_coord = grid.replace("Grid", "").strip()
-            if raw_coord.lower() not in image_prompt.lower():
-                errors.append(f"IMAGE prompt fails to restate grid coordinate '{grid}' for landmark '{name}'")
+        # 方位检查（2026-08-05 起取代旧的"grid 串必须出现"）。旧判据是文字水印的直接
+        # 成因：它强制把 'Grid A2' 写进送给图像模型的正文。现在要求的是同一条空间约束
+        # 的散文形态——packet 里的格位翻成方位短语后必须出现在正文里。
+        bearing = _grid_bearing(lm.get('grid'))
+        if bearing and bearing.lower() not in low:
+            # 允许同义写法：只要方位核心词（'upper centre' / 'mid-left' …）在场即可。
+            core = re.sub(r'^(?:in|at|across|along|down)\s+the\s+', '', bearing.lower())
+            core = core.replace(' of the frame', '')
+            if core and core not in low:
+                errors.append(
+                    f"IMAGE prompt fails to state the screen position of landmark '{name}' — "
+                    f"it must read as prose ('{bearing}'), never as a grid label")
     return errors
 
 
@@ -5697,12 +6159,23 @@ _PERCENT_NEAR_PATTERN = re.compile(
     r')[-\s]?percent\b', re.IGNORECASE)
 
 
+# 画幅占比的散文形态（scrub 之后正文里就长这样）。校验按"桶"比对而不是按数字：
+# 图像模型执行不了 5% 的精度差，63 与 65 之间的"漂移"过去会被判成违规、触发无意义回炉。
+_SCALE_PROSE_ALTERNATION = re.compile(
+    '|'.join(re.escape(p) for _, p in _SCALE_PROSE_BUCKETS), re.IGNORECASE)
+
+
 def check_anchor_scale_lock(image_prompt, packet, family='exterior'):
     """SCUP NGCS: a primary anchor's declared frame-height scale must stay constant within a
     static shot family — 'if this column fluctuates in scale between frames without camera
     movement, a spatial drift is flagged'. Nothing enforced this: the composer LLM free-wrote
     the scales (35/65/45 one frame, 55/85/25 the next), so the image model re-framed the
-    composition every other frame."""
+    composition every other frame.
+
+    2026-08-05: the declared scale is now prose ('about two thirds of the frame height'), so
+    the comparison is bucket-vs-bucket. Numerals reaching the renderer were a text-artifact
+    source (see scrub_spatial_notation); a numeric lock the renderer cannot honour to the
+    percentage point was also generating rework on differences no viewer could see."""
     errors = []
     if not packet or not image_prompt:
         return errors
@@ -5738,16 +6211,27 @@ def check_anchor_scale_lock(image_prompt, packet, family='exterior'):
                 p = low.find(on, start)
                 if p != -1:
                     window_end = min(window_end, p)
-            m = _PERCENT_NEAR_PATTERN.search(low[start:window_end])
+            # 三种合法书写形态都要能读：新的分数散文（scrub 之后的规范形态）、omni 侧
+            # 拼成英文单词的百分比（_digits_to_words 的产物）、以及历史存档里的阿拉伯
+            # 数字百分比。判据统一成"落在哪个桶"——图像模型执行不了 5% 的精度差，按数字
+            # 严比会在 63 与 65 之间反复触发无意义回炉。
+            expected_prose = scale_prose(expected)
+            window = low[start:window_end]
+            declared_prose = None
+            m = _SCALE_PROSE_ALTERNATION.search(window)
             if m:
-                declared = _parse_percent_token(m.group(1))
-                if declared is not None and declared != expected:
-                    errors.append(
-                        f"IMAGE prompt declares landmark '{lm.get('name')}' at {declared} percent of "
-                        f"frame height, but the Drift Lock packet locks it at {expected} percent — "
-                        f"restate the packet scale exactly (anchors never change scale within a static shot family)"
-                    )
-                    flagged = True
+                declared_prose = m.group(0).lower()
+            else:
+                mn = _PERCENT_NEAR_PATTERN.search(window)
+                if mn:
+                    declared_prose = (scale_prose(mn.group(1)) or '').lower()
+            if declared_prose and expected_prose and declared_prose != expected_prose.lower():
+                errors.append(
+                    f"IMAGE prompt puts landmark '{lm.get('name')}' at '{declared_prose}', but the "
+                    f"Drift Lock packet locks it at '{expected_prose}' — restate the packet scale "
+                    f"(anchors never change scale within a static shot family)"
+                )
+                flagged = True
     return errors
 
 
@@ -5865,7 +6349,7 @@ def check_colon_label_style(prompt):
         if _GRID_CELL_LABEL_PATTERN.match(sentence):
             errors.append(
                 f"Telegraphic grid-cell label fragment (renders as on-screen text): '{sentence[:60]}' — "
-                f"rewrite as fluid prose (e.g. 'glowing sconces line Grid B1')"
+                f"rewrite as fluid prose (e.g. 'glowing sconces line the mid-left of the frame')"
             )
             continue
         m = _SENTENCE_LABEL_PATTERN.match(sentence)
@@ -5933,17 +6417,25 @@ def check_worker_scale_lock(video_prompt, packet):
             p = low.find(stop_ch, pos)
             if p != -1:
                 window_end = min(window_end, p)
-        pm = _PERCENT_NEAR_PATTERN.search(low[pos:window_end])
-        if pm:
-            declared = _parse_percent_token(pm.group(1))
-            if declared is not None and declared != expected:
-                errors.append(
-                    f"VIDEO prompt declares the worker at {declared} percent of frame height, "
-                    f"but the Drift Lock packet locks worker_scale_percent at {expected} percent — "
-                    f"restate the packet scale exactly (the worker's size relative to the carrier "
-                    f"must not drift between beats)"
-                )
-                flagged = True
+        # 与 check_anchor_scale_lock 同源：分数散文（scrub 之后的规范形态）与百分比
+        # （数字或英文单词）都要能读，判据统一成"落在哪个桶"。
+        window = low[pos:window_end]
+        expected_prose = scale_prose(expected)
+        declared_prose = None
+        pmp = _SCALE_PROSE_ALTERNATION.search(window)
+        if pmp:
+            declared_prose = pmp.group(0).lower()
+        else:
+            pm = _PERCENT_NEAR_PATTERN.search(window)
+            if pm:
+                declared_prose = (scale_prose(pm.group(1)) or '').lower()
+        if declared_prose and expected_prose and declared_prose != expected_prose.lower():
+            errors.append(
+                f"VIDEO prompt puts the worker at '{declared_prose}', but the Drift Lock packet "
+                f"locks worker_scale_percent at '{expected_prose}' — restate the packet scale "
+                f"(the worker's size relative to the carrier must not drift between beats)"
+            )
+            flagged = True
         start = pos
     return errors
 
@@ -6682,7 +7174,8 @@ def rework_missing_content_image_beat(config, i, image_prompt, new_ledger_items,
         return image_prompt, False
     items_desc = "\n".join(
         f"- {m.get('name')} ({m.get('material_color', 'unknown')}, "
-        f"{m.get('initial_state', 'installed')}) at {m.get('grid', 'Grid B2')}"
+        f"{m.get('initial_state', 'installed')}) "
+        f"{_grid_bearing(m.get('grid')) or 'at the centre of the frame'}"
         for m in missing
     )
     system = (
@@ -7944,10 +8437,16 @@ Required JSON keys:
     # 传进来:卡片上看到的工序和最终成片大体对得上,但它只是草案——本函数下面那一整套
     # 硬规则(真实施工顺序、材质匹配修复、天花板覆盖、门扇、地板先于重物、Threshold 拆分、
     # 单里程碑包规则、自适应拍数下限)优先级永远更高,冲突时以硬规则为准、直接改写草案。
-    _outline_full = [
-        str(s).strip() for s in (dimensions.get('beat_outline') or [])
-        if isinstance(s, (str, int, float)) and str(s).strip()
-    ]
+    _outline_raw = dimensions.get('beat_outline') or []
+    _outline_full = []
+    for entry in _outline_raw:
+        if isinstance(entry, dict):
+            text = str(entry.get('text') or '').strip()
+            op = str(entry.get('op') or '').strip() or None
+            if text:
+                _outline_full.append({'op': op, 'text': text})
+        elif isinstance(entry, (str, int, float)) and str(entry).strip():
+            _outline_full.append({'op': None, 'text': str(entry).strip()})
     # 用户把拍数压到卡片推荐值以下时草案要裁剪，但**末条必须留住**：卡片草案的最后
     # 一条是 reward 揭示（见激发侧 schema「array 长度 = recommended_beats + 1」），
     # 直接 [:max_total_beats] 会把它连同尾部工序一起切掉,交给规划器的草案就成了一栋
@@ -7957,7 +8456,10 @@ Required JSON keys:
     else:
         _outline_plan = _outline_full
     if _outline_plan:
-        _outline_lines = '\n'.join(f"  {i}. {s}" for i, s in enumerate(_outline_plan, 1))
+        def _fmt_outline_entry(i, entry):
+            op_tag = f' [{entry["op"]}]' if entry.get('op') else ''
+            return f'  {i}. {entry["text"]}{op_tag}'
+        _outline_lines = '\n'.join(_fmt_outline_entry(i, e) for i, e in enumerate(_outline_plan, 1))
         _outline_plan_block = (
             "\nDraft plan (SOFT reference, shown to the user on the ideation card — follow its intent "
             "and ordering where it is already correct, so the delivered ladder matches what the user "
@@ -7965,6 +8467,9 @@ Required JSON keys:
             "or reorder any draft entry that would violate real-world construction order, the "
             "single-milestone package rule, the threshold split rules, or the visible-milestone rule):\n"
             f"{_outline_lines}\n"
+            "\nThe [bracketed tags] in the draft plan are the ideation layer's suggested operation "
+            "for each entry. Use them as a strong hint for your \"operation\" field, but override "
+            "if real-world construction order requires it.\n"
             # 大纲 ↔ milestone 的 1:1 契约（2026-08-02 复盘）。旧文案明说"不必覆盖每条
             # 草案"，于是「切割舱门装配入口梯」「铺设隐蔽水管与地暖」这类拍被静默换掉/
             # 吞并，用户在卡片上看到的工序成片里一点痕迹都没有。改写仍然允许，但必须
@@ -8775,6 +9280,38 @@ Beat Ladder:
             f"carrier will later land at a large, readable near-midground scale. {_opening_env_img}"
         )
 
+    # 交付型载体有 OPENING SCALE LOCK 兜着主体尺度，找到型载体（existing_restoration）
+    # 此前什么都没有。2026-08-05 那单的 IMAGE 1 因此把前景树根拱当成了主体，真正的载体
+    # 缩成中景一粒、开口只占画高一成多；更要命的是那个"洞"是穿透的——透过它能看见沼泽
+    # 水面和背景树。腔体根本不存在，后面每一张室内拍都在描述一个物理上不存在的房间。
+    _img1_found_carrier_rule = ""
+    if project_origin_mode(parsed_brief) == 'existing_restoration':
+        _found_carrier_name = parsed_brief.get('carrier') or 'the carrier'
+        _found_rule_no = 10 if _img1_pbisp_rule else 9
+        # 盲端腔体只对「从外面跨进去」的项目成立：纯外部修复没有腔体，房间改造本来就有窗。
+        _found_enclosure = (
+            " The registered entrance opening must read plainly large enough for an adult to pass "
+            "through at the scale shown. ENCLOSURE (mandatory): the space beyond that opening is a "
+            "DEAD END — an enclosed volume that ends in solid material and falls away into darkness. "
+            "NOTHING may be visible THROUGH the opening: no sky, no daylight gap, no water, no "
+            "background trees, terrain, or any part of the scene standing behind the shell. Never "
+            "write the carrier as a hole, gap, tunnel, passage, or see-through arch."
+            if any(isinstance(b, dict) and (b.get('bridge_stage') or b.get('hard_cut'))
+                   for b in (beat_ladder or []))
+            else ""
+        )
+        _img1_found_carrier_rule = (
+            f"\n{_found_rule_no}. FOUND-CARRIER SCALE{' AND ENCLOSURE' if _found_enclosure else ''} LOCK "
+            f"(mandatory; overrides the framing subject of rule 7 wherever they disagree): the subject of "
+            f"this photograph is {_found_carrier_name} ITSELF, not the landscape around it. Its shell is "
+            f"the unmistakable dominant subject — centered, fully visible in the near midground, its "
+            f"overall silhouette filling the central majority of the frame and its longest visible "
+            f"dimension reaching across roughly two-thirds of the photograph. Never compose it as one "
+            f"small feature inside a wider scene, and never let a foreground framing element (overhanging "
+            f"branches, a natural arch, a rock lip, another opening) become the largest form in the frame "
+            f"or be mistaken for the carrier.{_found_enclosure}"
+        )
+
     _img1_damage_rule = (
         "5. EMPTY RECEIVING SITE CONDITION (mandatory): do NOT satisfy a building-damage quota and do "
         "NOT add any concrete tunnel, bunker, ruin, unrelated building, prepared slab, second portal or "
@@ -8806,7 +9343,7 @@ Hard Rules:
 {_img1_damage_rule}
 6. REALISM (mandatory): strictly documentary photorealism — a real place captured on a real camera. Only real-world, present-day materials and weathering (wood, stone, rust, moss, dust, standard building debris). NO sci-fi, futuristic, cyberpunk, holographic, glowing-tech, LED-neon, or spacecraft-style elements.
 7. WIDE ESTABLISHING SHOT (mandatory): this is the viewer's first impression of the WHOLE scene/{_img1_subject} at once — a wide establishing view, never a close-up or detail crop of one small area. Frame it so the full extent of the {_img1_subject} and its immediate surroundings is visible in one shot. Even at this wide scale, the damage from rule 5 must stay unmistakably legible — call out decayed surfaces/materials large enough to read clearly at this distance (a whole collapsed section, a wide rust-streaked panel, a spreading moss patch), not just small details that would vanish at this framing; the shot must read as a monumental, striking find, not a small or mundane-looking space.
-8. SINGLE CONTINUOUS PHOTOGRAPH (mandatory): this is one real photograph of one moment — never a grid of multiple panels, a collage, a storyboard, a comparison/before-after split, or a multi-view composite. The "Grid A1-C3" notation used elsewhere in this contract is an internal composition-registration convention for you the writer — never describe or render literal grid lines, panel borders, or divided frames in the image itself.{_img1_pbisp_rule}{_img1_delivery_rule}
+8. SINGLE CONTINUOUS PHOTOGRAPH (mandatory): this is one real photograph of one moment — never a grid of multiple panels, a collage, a storyboard, a comparison/before-after split, or a multi-view composite. The "Grid A1-C3" notation used elsewhere in this contract is an internal composition-registration convention for you the writer — never describe or render literal grid lines, panel borders, or divided frames in the image itself.{_img1_pbisp_rule}{_img1_delivery_rule}{_img1_found_carrier_rule}
 """
     if carrier_arrives_on_camera(parsed_brief):
         image_1_user = (
@@ -8990,18 +9527,22 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
     )
     if family == 'exterior':
         anchor_rule = (
-            "It must RESTATE the locked anchors by name, Grid cell, AND frame-height scale exactly "
-            "as given in the packet primary_landmarks (e.g. \"Locked anchors: <name> at Grid A2 "
-            "holding 45 percent of frame height, <name> at Grid B2 holding 65 percent of frame "
-            "height, ...\"; write each scale as plain digits + the word 'percent', never the '%' "
-            "glyph, and never change a scale between beats — the camera is static), and restate "
-            "the left/right/top/bottom boundaries from the packet frame_boundaries."
+            "It must RESTATE the locked anchors by name, screen position, AND frame-height share "
+            "exactly as given in the packet primary_landmarks, written as PROSE (e.g. "
+            "\"Locked anchors: <name> across the upper centre of the frame, rising to about two "
+            "fifths of the frame height; <name> at the centre of the frame, rising to about two "
+            "thirds of the frame height.\"). NEVER write a grid label ('Grid A2') or a numeric "
+            "percentage in the prompt body — coordinate labels and numerals are rendered into the "
+            "frame as literal text. Never change a landmark's stated position or share between "
+            "beats — the camera is static. Also restate the left/right/top/bottom boundaries from "
+            "the packet frame_boundaries, likewise as prose."
         )
     elif is_cut:
         # 声明式硬切的室内首帧：没有上一帧作视觉参考（t2i 新链头），一致性只能靠
         # Scene DNA 软约束清单——载体身份、材质基因、光照方向、施工进度状态逐条复述。
-        _cut_names = ", ".join(
-            f"{lm.get('name')} at {lm.get('grid')}" for lm in (family_landmarks or []) if isinstance(lm, dict))
+        _cut_names = "; ".join(
+            f"{lm.get('name')} {_grid_bearing(lm.get('grid')) or 'in frame'}"
+            for lm in (family_landmarks or []) if isinstance(lm, dict))
         anchor_rule = (
             "This IMAGE is the post-cut INTERIOR FIRST FRAME of a DECLARED HARD CUT (the camera "
             "does not physically travel through the entry; the sequence cuts exactly once from "
@@ -9009,8 +9550,8 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
             "reference, so it must re-establish the world from scratch, consistent with everything "
             "already established in the exterior beats: (1) restate this carrier's interior "
             "identity features by name"
-            + (f" — the registered interior anchors are {_cut_names}, keep their Grid cells and "
-               f"frame-height scales" if _cut_names else
+            + (f" — the registered interior anchors are {_cut_names}, keep their stated screen "
+               f"positions and frame-height shares, written as prose (never a grid label)" if _cut_names else
                " (window band, ribbed roof curve, wheel arches, rib frames, portholes, or this "
                "carrier's equivalents)")
             + "; (2) the same material palette, weathering and decay severity as established "
@@ -9072,22 +9613,26 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
             "reopening something already closed."
         ) if is_first_interior_reveal else ""
         if family_landmarks:
-            _int_names = ", ".join(
-                f"{lm.get('name')} at {lm.get('grid')}" for lm in family_landmarks if isinstance(lm, dict))
+            _int_names = "; ".join(
+                f"{lm.get('name')} {_grid_bearing(lm.get('grid')) or 'in frame'}"
+                for lm in family_landmarks if isinstance(lm, dict))
             anchor_rule = (
                 f"The camera is now INSIDE the space (post-crossing interior shot family): restate the "
-                f"INTERIOR primary anchors exactly as registered — {_int_names} — keeping their Grid "
-                f"cells and frame-height scales constant, and NEVER restate the exterior anchors, "
-                f"exterior boundaries, horizon, or sky (they are behind the camera now)."
+                f"INTERIOR primary anchors exactly as registered — {_int_names} — keeping their screen "
+                f"positions and frame-height shares constant and written as prose (never a grid label "
+                f"or a numeric percentage; both render into the frame as literal text), and NEVER "
+                f"restate the exterior anchors, exterior boundaries, horizon, or sky (they are behind "
+                f"the camera now)."
                 + _first_reveal_rule
             )
         else:
             anchor_rule = (
                 "The camera is now INSIDE the space (post-crossing interior shot family): keep "
                 "restating the SAME interior anchors established in the previous IMAGE (the objects "
-                "inherited through the opening), with constant Grid cells and frame-height scales, and "
-                "NEVER restate the exterior anchors, exterior boundaries, horizon, or sky (they are "
-                "behind the camera now)."
+                "inherited through the opening), holding their screen positions and frame-height "
+                "shares constant and written as prose (never a grid label or a numeric percentage), "
+                "and NEVER restate the exterior anchors, exterior boundaries, horizon, or sky (they "
+                "are behind the camera now)."
                 + _first_reveal_rule
             )
     # IMAGE i+1 is the exterior threshold frame (IMAGE T) when the NEXT beat is the single
@@ -9208,7 +9753,7 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
         _camera_setup = str(beat.get('camera_setup') or '').strip()
         family_contract_lines.append(
             f"- DELTA VISIBILITY BUDGET (mandatory): this beat's NEW work"
-            + (f" (Grid {', '.join(_changed_cells)})" if _changed_cells else "")
+            + (f" ({_cells_as_bearings(_changed_cells)})" if _changed_cells else "")
             + f" is the visual SUBJECT of IMAGE {i+1} — describe it first, describe it in the most "
             f"detail, and place it where it reads as the largest single change in frame. Everything "
             f"that merely stays unchanged (prior finished work, the untouched zones, the locked "
@@ -10072,6 +10617,28 @@ def _compress_frames_for_review(paths, max_side=768, quality=72):
         return paths
 
 
+_BLIND_SPOT_CACHE = {'at': 0.0, 'block': ''}
+_BLIND_SPOT_TTL_SEC = 300
+
+
+def _cached_blind_spot_block(force=False):
+    """盲区块的进程内缓存。一单十几拍会调十几次逐拍审查，每次都去扫一遍 outputs 目录树
+    是纯浪费；同一单里台账也不会变。缓存五分钟，用户标完一帧问题后下一单即刻生效。
+
+    采集失败一律返回空串——这是增强信号，不是门禁，绝不能让一次目录异常挡住审查本身。"""
+    now = time.time()
+    if not force and _BLIND_SPOT_CACHE['block'] and now - _BLIND_SPOT_CACHE['at'] < _BLIND_SPOT_TTL_SEC:
+        return _BLIND_SPOT_CACHE['block']
+    try:
+        block = operator_blind_spot_block()
+    except Exception as e:
+        if sys.stdout:
+            print(f"[BLIND SPOT] 盲区台账采集失败，本次审查按空台账跑: {e}")
+        block = ''
+    _BLIND_SPOT_CACHE.update({'at': now, 'block': block})
+    return block
+
+
 def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_before_path,
                             image_after_path, timeout=60):
     """局部逐拍一致性审查：只看该拍自己的两张锚点帧，规则见
@@ -10081,6 +10648,11 @@ def check_beat_consistency(config, prompt_block, beat_index, total_beats, image_
     system_prompt = _local_beat_review_system_prompt()
     # 拍号只出现在 user turn：system prompt 因此在所有拍之间完全一致、可被 prompt
     # 缓存复用（见 _local_beat_review_system_prompt 的 2026-07-25 说明）。
+    #
+    # 盲区回灌（2026-08-05）：把「机器判过、人判废」的历史样本追加到**尾部**。用户判废
+    # 标准比这套 rubric 严，而档位已经是 standard 全量严检——还漏，说明漏的是维度不是
+    # 严格度，再调严也看不见它本来就没在查的东西。追加在尾部不动缓存前缀。
+    system_prompt += _cached_blind_spot_block()
     is_final = beat_index >= total_beats
     _review_images, _review_videos = _parse_prompt_slots(prompt_block)
     _video_item = _review_videos.get(beat_index) or {}
@@ -11495,11 +12067,21 @@ _NESTED_TRANSPORT_FALLBACK_IDEAS = [
         "recommended_beats": 14,
         "beats_reason": "吊装掩埋加双舱重建",
         "beat_outline": [
-            "吊车吊装集装箱入基坑", "回填土方掩埋箱体外壳", "焊接切口装配竖井入口",
-            "清空箱内残留货架碎屑", "铺设第一段防潮膜与电路", "架设墙顶木龙骨框架",
-            "封装保温与内衬面板", "备齐储备厨房完成使用", "打开隔断舱门穿入毛坯第二舱室",
-            "清运第二舱室积水碎屑", "铺设隐蔽管线与防潮层", "架设龙骨并填充保温",
-            "封装内衬与成品地板", "布置卧榻与软装织物", "点亮灯带,人物入住",
+            {"op": "framing", "text": "吊车吊装集装箱入基坑"},
+            {"op": "repair", "text": "回填土方掩埋箱体外壳"},
+            {"op": "framing", "text": "焊接切口装配竖井入口"},
+            {"op": "clearing", "text": "清空箱内残留货架碎屑"},
+            {"op": "rough-in", "text": "铺设第一段防潮膜与电路"},
+            {"op": "framing", "text": "架设墙顶木龙骨框架"},
+            {"op": "drywall", "text": "封装保温与内衬面板"},
+            {"op": "furnishing", "text": "备齐储备厨房完成使用"},
+            {"op": "threshold", "text": "打开隔断舱门穿入毛坯第二舱室"},
+            {"op": "clearing", "text": "清运第二舱室积水碎屑"},
+            {"op": "rough-in", "text": "铺设隐蔽管线与防潮层"},
+            {"op": "framing", "text": "架设龙骨并填充保温"},
+            {"op": "drywall", "text": "封装内衬与成品地板"},
+            {"op": "furnishing", "text": "布置卧榻与软装织物"},
+            {"op": "reward", "text": "点亮灯带,人物入住"},
         ],
         "trend_ref": "",
     },
@@ -11517,12 +12099,22 @@ _NESTED_TRANSPORT_FALLBACK_IDEAS = [
         "recommended_beats": 15,
         "beats_reason": "车身运输掩埋工序密",
         "beat_outline": [
-            "平板车运抵退役校车落位", "挖机回填土方掩埋车身", "切开车顶焊接竖井舱口",
-            "清空车厢座椅与残渣", "除锈打磨并焊补车厢壁", "铺设车厢底防潮基层",
-            "架设龙骨并填充保温棉", "封装桦木内衬与地板", "装满储备食品完成餐厨",
-            "推开隔断舱门穿入毛坯后舱", "清运后舱残余线束碎屑", "铺设隐蔽电路与水管",
-            "架设墙顶轻钢龙骨", "填充保温并封装面板", "嵌装折叠床与储物柜",
-            "通电亮灯,人物入住",
+            {"op": "framing", "text": "平板车运抵退役校车落位"},
+            {"op": "repair", "text": "挖机回填土方掩埋车身"},
+            {"op": "framing", "text": "切开车顶焊接竖井舱口"},
+            {"op": "clearing", "text": "清空车厢座椅与残渣"},
+            {"op": "repair", "text": "除锈打磨并焊补车厢壁"},
+            {"op": "priming", "text": "铺设车厢底防潮基层"},
+            {"op": "framing", "text": "架设龙骨并填充保温棉"},
+            {"op": "drywall", "text": "封装桦木内衬与地板"},
+            {"op": "furnishing", "text": "装满储备食品完成餐厨"},
+            {"op": "threshold", "text": "推开隔断舱门穿入毛坯后舱"},
+            {"op": "clearing", "text": "清运后舱残余线束碎屑"},
+            {"op": "rough-in", "text": "铺设隐蔽电路与水管"},
+            {"op": "framing", "text": "架设墙顶轻钢龙骨"},
+            {"op": "drywall", "text": "填充保温并封装面板"},
+            {"op": "furnishing", "text": "嵌装折叠床与储物柜"},
+            {"op": "reward", "text": "通电亮灯,人物入住"},
         ],
         "trend_ref": "",
     },
@@ -11540,12 +12132,22 @@ _NESTED_TRANSPORT_FALLBACK_IDEAS = [
         "recommended_beats": 15,
         "beats_reason": "机身运输与两舱分层多",
         "beat_outline": [
-            "吊车吊装退役机身落位", "培土掩埋机身并压实", "切割舱门装配入口梯",
-            "清空客舱座椅与线束", "铺设舱底防潮膜与电路", "架设舱壁龙骨与保温",
-            "封装内衬桦木饰面板", "备齐装备工作区完成使用", "打开舱壁门穿入毛坯尾舱",
-            "清运尾段积尘与旧管线", "铺设隐蔽水管与地暖", "架设墙顶格栅框架",
-            "填充隔音棉并封板", "铺装成品地板与涂料", "布置卧榻与软装织物",
-            "点亮全景,人物入住",
+            {"op": "framing", "text": "吊车吊装退役机身落位"},
+            {"op": "repair", "text": "培土掩埋机身并压实"},
+            {"op": "framing", "text": "切割舱门装配入口梯"},
+            {"op": "clearing", "text": "清空客舱座椅与线束"},
+            {"op": "rough-in", "text": "铺设舱底防潮膜与电路"},
+            {"op": "framing", "text": "架设舱壁龙骨与保温"},
+            {"op": "drywall", "text": "封装内衬桦木饰面板"},
+            {"op": "furnishing", "text": "备齐装备工作区完成使用"},
+            {"op": "threshold", "text": "打开舱壁门穿入毛坯尾舱"},
+            {"op": "clearing", "text": "清运尾段积尘与旧管线"},
+            {"op": "rough-in", "text": "铺设隐蔽水管与地暖"},
+            {"op": "framing", "text": "架设墙顶格栅框架"},
+            {"op": "drywall", "text": "填充隔音棉并封板"},
+            {"op": "flooring", "text": "铺装成品地板与涂料"},
+            {"op": "furnishing", "text": "布置卧榻与软装织物"},
+            {"op": "reward", "text": "点亮全景,人物入住"},
         ],
         "trend_ref": "",
     },
@@ -11616,6 +12218,48 @@ _OUTLINE_CLEANUP_CUE = (
 # ladder 相对卡片工序清单最多收缩多少。调高 → 更贴卡片、ladder 自由度更小、
 # 结构校验失败重排概率上升；调低 → 更宽松、更接近改造前的现状。
 _OUTLINE_SHRINK_TOLERANCE = 0.7
+
+# beat_outline 的 op（工序类型）枚举。与合成侧 ladder schema field 2 的枚举完全同源
+# （见 :8478「"operation": One of: ...」），改一边务必同步另一边。
+# 激发侧用中文 beat_outline 里的 op 字段；合成侧用英文 ladder 里的 operation 字段。
+# 两者值域相同，就是这 13 个。
+_OUTLINE_OPS = (
+    'clearing', 'repair', 'rough-in', 'flooring', 'framing', 'drywall',
+    'priming', 'painting', 'wiring', 'lighting', 'furnishing',
+    'threshold', 'reward',
+)
+_OUTLINE_OPS_SET = frozenset(_OUTLINE_OPS)
+
+
+def _outline_texts(idea):
+    """从 beat_outline（新旧形态均可）提取纯文本列表。所有现存的纯文本校验函数
+    统一走这里，不再各自做一遍 str(x or '').strip()。"""
+    result = []
+    for entry in (idea.get('beat_outline') or []):
+        if isinstance(entry, dict):
+            text = str(entry.get('text') or '').strip()
+            if text:
+                result.append(text)
+        elif isinstance(entry, (str, int, float)):
+            text = str(entry or '').strip()
+            if text:
+                result.append(text)
+    return result
+
+
+def _outline_ops(idea):
+    """从 beat_outline 提取 op 列表（旧形态条目为 None）。"""
+    result = []
+    for entry in (idea.get('beat_outline') or []):
+        if isinstance(entry, dict):
+            text = str(entry.get('text') or '').strip()
+            if text:
+                result.append(entry.get('op') or None)
+        elif isinstance(entry, (str, int, float)):
+            text = str(entry or '').strip()
+            if text:
+                result.append(None)
+    return result
 # 通用骨架门禁的灰度开关：False = 只打日志不打回，用于先观察一批真实激发的通过率。
 # 打回的代价是一次 150s 的大模型重跑，误判率没摸清之前可以先关掉强制。
 _OUTLINE_GATE_ENFORCING = True
@@ -11771,31 +12415,39 @@ def outline_skeleton_violations(idea):
     """
     if not isinstance(idea, dict):
         return []
-    outline = [str(x or '').strip() for x in (idea.get('beat_outline') or []) if str(x or '').strip()]
-    if not outline:
+    texts = _outline_texts(idea)
+    ops = _outline_ops(idea)
+    if not texts:
         # 整条没有 outline 是另一个问题（run_ideate 的 with_outline 分支管），
         # 不在这里当结构违规打回。
         return []
 
     errors = []
     # 规则 1 · 长度下界：再少就凑不出「起手 + 推进 + 收尾 + reward」
-    if len(outline) < 4:
+    if len(texts) < 4:
         errors.append(
             f'beat_outline needs at least four entries to express a build arc plus the reward '
-            f'(found {len(outline)})')
+            f'(found {len(texts)})')
 
     # 规则 2 · 末拍必须是 reward 揭示
-    if not re.search(_OUTLINE_REWARD_CUE, outline[-1]):
+    if ops[-1] is not None:
+        is_reward = (ops[-1] == 'reward')
+    else:
+        is_reward = bool(re.search(_OUTLINE_REWARD_CUE, texts[-1]))
+    if not is_reward:
         errors.append(
             f'the LAST beat_outline entry must be the reward reveal (lights on / person moves in / '
-            f'daylight floods in), but it is "{outline[-1]}"')
+            f'daylight floods in), but it is "{texts[-1]}"')
 
-    crossing = _outline_crossing_indices(outline)
     # 规则 3 · 过门拍唯一性——只有「多于一处」才是错。零处是合法的：Standard 载体
     # （纯外立面、庭院、道路改造）本来就没有内外过门。这是相对 dual_payoff 门禁
     # （要求恰好一处）的关键放宽，那条只对定义上必有过门的骨架成立。
+    if any(op is not None for op in ops):
+        crossing = [i for i, op in enumerate(ops) if op == 'threshold']
+    else:
+        crossing = _outline_crossing_indices(texts)
     if len(crossing) > 1:
-        hit_text = '、'.join(outline[i] for i in crossing)
+        hit_text = '、'.join(texts[i] for i in crossing)
         errors.append(
             f'beat_outline must not contain more than one doorway-crossing entry '
             f'(found {len(crossing)}: {hit_text})')
@@ -11808,15 +12460,20 @@ def outline_skeleton_violations(idea):
                 'the doorway-crossing entry must come after at least two ordinary exterior entries; '
                 f'it currently sits at position {cross_idx + 1}')
         # 规则 5 · 过门后第一拍必须是清理（过门帧按契约就是没人碰过的废墟）
-        if cross_idx + 1 < len(outline):
-            nxt = outline[cross_idx + 1]
-            if not re.search(_OUTLINE_CLEANUP_CUE, nxt):
+        if cross_idx + 1 < len(texts):
+            nxt_text = texts[cross_idx + 1]
+            nxt_op = ops[cross_idx + 1]
+            if nxt_op is not None:
+                is_cleanup = (nxt_op == 'clearing')
+            else:
+                is_cleanup = bool(re.search(_OUTLINE_CLEANUP_CUE, nxt_text))
+            if not is_cleanup:
                 errors.append(
                     'the entry right after the doorway crossing must be the interior cleanout '
-                    f'(hauling out the debris the crossing just revealed), but it is "{nxt}"')
+                    f'(hauling out the debris the crossing just revealed), but it is "{nxt_text}"')
 
     # 规则 6 · 弱里程碑措辞（只查开头，见 _WEAK_MILESTONE_PREFIXES_ZH 的注释）
-    for text in outline:
+    for text in texts:
         weak = next((p for p in _WEAK_MILESTONE_PREFIXES_ZH if text.startswith(p)), None)
         if weak:
             errors.append(
@@ -11826,7 +12483,7 @@ def outline_skeleton_violations(idea):
 
     # 规则 7 · 里程碑重复（对齐 milestone_ladder_violations 的 seen_names 逻辑）
     seen = set()
-    for text in outline:
+    for text in texts:
         key = re.sub(r'[\s,，、。.;；:：]', '', text)
         head = key[:6] if len(key) >= 6 else key
         if head and head in seen:
@@ -11835,6 +12492,11 @@ def outline_skeleton_violations(idea):
                 f'terminal products')
             break
         seen.add(head)
+
+    # 规则 8 · op validity
+    invalid_ops = [op for op in ops if op is not None and op not in _OUTLINE_OPS_SET]
+    if invalid_ops:
+        errors.append(f'beat_outline contains invalid operations: {invalid_ops}')
 
     return errors
 
@@ -11880,7 +12542,7 @@ def outline_weight_violations(idea):
     """
     if not isinstance(idea, dict):
         return []
-    outline = [str(x or '').strip() for x in (idea.get('beat_outline') or []) if str(x or '').strip()]
+    outline = _outline_texts(idea)
     errors = []
     for text in outline[:-1]:  # 末条是 reward 揭示，不按施工条目算
         span = _outline_entry_family_span(text)
@@ -11912,7 +12574,7 @@ def compute_beats_floor(idea):
     """
     if not isinstance(idea, dict):
         return _MIN_ADAPTIVE_CONSTRUCTION_BEATS
-    outline = [str(x or '').strip() for x in (idea.get('beat_outline') or []) if str(x or '').strip()]
+    outline = _outline_texts(idea)
     if len(outline) < 2:
         return _MIN_ADAPTIVE_CONSTRUCTION_BEATS
     if idea.get('pacing_skeleton') in ('dual_payoff', 'nested_space_payoff'):
@@ -12047,7 +12709,7 @@ def pacing_skeleton_outline_violations(idea):
     """
     if not isinstance(idea, dict):
         return []
-    outline = [str(x or '').strip() for x in (idea.get('beat_outline') or []) if str(x or '').strip()]
+    outline = _outline_texts(idea)
     if idea.get('pacing_skeleton') == 'nested_space_payoff':
         return _nested_space_payoff_violations(idea, outline)
     if idea.get('pacing_skeleton') != 'dual_payoff':
@@ -12145,9 +12807,19 @@ def run_ideate(config, count=5, theme=None, theme_label=None, trend_ref_ids=None
         print(f"[IDEATE] 技能包: {_skill_state['label']} @ {_skill_state['dir']}"
               f"（profile {skill_profile}，来源 {_skill_state['source']}，"
               f"契约 {_skill_state['total'] - len(_skill_state['missing'])}/{_skill_state['total']}）")
-    if not engine_content and sys.stdout:
-        print("[WARN] 形态矩阵 idea-engine.md 缺失，本次激发只能靠联网摘要 + 台账去重，"
-              "创意维度会明显变窄；请在 server_config.json 里把 skillDir 指向技能包目录。")
+    if not engine_content:
+        # 严格模式把"静默降级"升级成"当场失败"。默认仍是打一条 WARN 照跑（历史行为：
+        # 缺矩阵只是创意变窄，不至于让整台服务不可用）；但一次配错路径的部署会连续
+        # 产出几十条劣化选题而外观完全正常，想让它当场炸出来的人打开这个开关。
+        _msg = ("形态矩阵 idea-engine.md 缺失（技能包 "
+                f"{_skill_state['dir']}，来源 {_skill_state['source']}）")
+        if skill_contract_strict():
+            raise RuntimeError(
+                _msg + "；已开启严格技能契约模式（strictSkillContract / "
+                "SKILL_CONTRACT_STRICT），本次激发已停止而不是降级产出")
+        if sys.stdout:
+            print(f"[WARN] {_msg}，本次激发只能靠联网摘要 + 台账去重，"
+                  "创意维度会明显变窄；请在 server_config.json 里把 skillDir 指向技能包目录。")
 
     # The managed creative ledger is the source of truth for every idea already
     # surfaced by the ideation endpoint. Include every status (candidate/used/
@@ -12228,12 +12900,15 @@ def run_ideate(config, count=5, theme=None, theme_label=None, trend_ref_ids=None
         return novel
 
     def _normalize_beat_outlines(ideas):
-        """把每条 idea 的 beat_outline 收成「非空字符串列表」,返回带 outline 的条数。
+        """把每条 idea 的 beat_outline 收成统一的结构化列表。
 
-        卡片上的「🔨 节拍简介」直接读这个字段,字段缺失/类型不对时用户点开只会看到
-        一句"没有节拍简介"。这里做两件事:
-        1) 类型归一 —— 模型偶尔返回单个字符串、或数组里混进 null/数字,统一成 list[str];
-        2) 统计有多少条真的带上了 outline,供调用方判断这次响应值不值得重试。
+        兼容三种形态：
+        1) 新形态 — [{op, text}, ...]  → 校验 op 合法性后原样保留
+        2) 旧字符串形态 — ["text1", "text2", ...]  → 转成 [{op: None, text}, ...]
+        3) 单字符串 — "text1;text2;..."  → 拆分后同 2)
+
+        旧形态的 op=None 是合法的：下游所有读 op 的地方都做 fallback，
+        确保存量任务/旧断点/旧缓存卡片不会报错。
         """
         with_outline = 0
         for idea in ideas:
@@ -12241,18 +12916,28 @@ def run_ideate(config, count=5, theme=None, theme_label=None, trend_ref_ids=None
             if isinstance(raw, str):
                 # 少数模型把整份清单塞进一个字符串(换行或中文顿号分隔)
                 raw = re.split(r'[\n;；]+', raw)
-            items = [
-                str(s).strip() for s in (raw or [])
-                if isinstance(s, (str, int, float)) and str(s).strip()
-            ] if isinstance(raw, (list, tuple)) else []
+            items = []
+            if isinstance(raw, (list, tuple)):
+                for s in raw:
+                    if isinstance(s, dict):
+                        # 新形态：{op, text}
+                        text = str(s.get('text') or '').strip()
+                        op = str(s.get('op') or '').strip() or None
+                        if op and op not in _OUTLINE_OPS_SET:
+                            op = None  # 不认识的 op 降级为 null，不打回
+                        if text:
+                            items.append({'op': op, 'text': text})
+                    elif isinstance(s, (str, int, float)) and str(s).strip():
+                        # 旧形态：纯字符串
+                        items.append({'op': None, 'text': str(s).strip()})
             idea['beat_outline'] = items
             if len(items) >= 2:
                 with_outline += 1
-                # recommended_beats 一律由清单长度派生,不再信任模型独立申报的那个数。
-                # 两个字段并列存在时它们必然漂移(模型报 12、清单只给 8 条,卡片照样
-                # 显示「⏱ 推荐 12 拍」,而合成时传下去的也是那个 12)。清单是用户在
-                # 卡片上真正看到的东西,它才是事实来源。派生比「不一致就打回」好:
-                # 零重试成本,且 100% 消除不一致。清单为空时不改写,避免把没有 outline
+                # recommended_beats 一律由清单长度派生，不再信任模型独立申报的那个数。
+                # 两个字段并列存在时它们必然漂移(模型报 12、清单只给 8 条，卡片照样
+                # 显示「⏱ 推荐 12 拍」，而合成时传下去的也是那个 12)。清单是用户在
+                # 卡片上真正看到的东西，它才是事实来源。派生比「不一致就打回」好：
+                # 零重试成本，且 100% 消除不一致。清单为空时不改写，避免把没有 outline
                 # 的卡片写成 0 拍。
                 idea['recommended_beats'] = len(items) - 1
         return with_outline
@@ -12500,7 +13185,7 @@ Each object in the JSON array must have EXACTLY these keys:
 - "recommended_beats": (integer, 5 to 15) Planning aid only — the delivered beat count is ALWAYS derived from the actual length of "beat_outline" (outline length minus the final reward entry), so put your real effort into the outline itself. Judge by transformation complexity: light single-space refit → 5-8; medium multi-stage build → 9-12; heavy structural conversion with many distinct visible stages → 13-15.
 - "beats_reason": (string) Chinese, at most 15 characters, why this beat count, e.g. "结构重建阶段多"
 - "pacing_skeleton": (string) Exactly one of: {', '.join(selected_pacing_ids)}. It declares which selected pacing reference this candidate's beat_outline actually follows.
-- "beat_outline": (array of strings) A Chinese one-line summary of EVERY construction beat, in order, with EXACTLY "recommended_beats" entries plus ONE final reward/reveal entry (so the array length is recommended_beats + 1). Each entry is at most 16 Chinese characters, names ONE visible terminal milestone, and starts with a verb, e.g. "清空洞内碎冰与积雪". Respect real-world construction order: structural stabilization and hazard removal before finishes, wiring/piping rough-in before surfaces are closed, surfaces closed and primed before painting, floor finish before heavy anchored objects, lighting installed before anything glows. The LAST entry is the reward reveal, e.g. "点亮灯带,人物入住". Never write vague entries like "开始施工" or "继续完善", and never repeat a milestone. EVEN WEIGHT: every entry gets the same amount of screen time, so entries must carry comparable amounts of work. Never pack three or more material layers (清理/基层 · 防水管线 · 龙骨框架 · 保温填充 · 封板面板 · 饰面涂料地板 · 家具软装) into one entry — "封板批腻子并刷完墙面" is three layers in one beat and must be split; two closely related layers in one entry is the practical maximum. Equally, do not spend a whole entry on something trivially small next to a heavy neighbour. If the build crosses from exterior to interior, describe that crossing in AT MOST ONE entry, place it no earlier than the third entry (at least two ordinary exterior entries come first), and make the entry right after it the interior cleanout (hauling out the debris the crossing just revealed).
+- "beat_outline": (array of objects) A structured Chinese construction outline. Each object has exactly two keys: "op" (string, one of: "clearing", "repair", "rough-in", "flooring", "framing", "drywall", "priming", "painting", "wiring", "lighting", "furnishing", "threshold", "reward" — pick the operation whose visible terminal product best matches this entry: clearing=清空/清运/拆除/搬出, repair=修补/加固/焊补/锚固/打磨除锈, rough-in=铺设隐蔽管线/电路/水管, flooring=铺装地板/找平/浇筑楼板, framing=架设龙骨/框架/支撑结构, drywall=封板/内衬面板/石膏板, priming=批腻子/刷底漆/防水涂层, painting=刷涂面漆/饰面涂料, wiring=布设明装电路/灯线/开关, lighting=安装灯具/灯带/照明, furnishing=布置家具/软装/设备/卫浴, threshold=过门/穿越入口/推镜进入, reward=最终揭示/点亮/入住) and "text" (string, Chinese, at most 16 characters, names ONE visible terminal milestone, starts with a verb, e.g. "清空洞内碎冰与积雪"). EXACTLY "recommended_beats" construction entries plus ONE final reward entry (so the array length is recommended_beats + 1). The last entry MUST have op="reward". Respect real-world construction order: structural stabilization and hazard removal before finishes, wiring/piping rough-in before surfaces are closed, surfaces closed and primed before painting, floor finish before heavy anchored objects, lighting installed before anything glows. Never write vague entries like "开始施工" or "继续完善", and never repeat a milestone. EVEN WEIGHT: every entry gets the same amount of screen time, so entries must carry comparable amounts of work. Never pack three or more material layers (清理/基层 · 防水管线 · 龙骨框架 · 保温填充 · 封板面板 · 饰面涂料地板 · 家具软装) into one entry — "封板批腻子并刷完墙面" is three layers in one beat and must be split; two closely related layers in one entry is the practical maximum. Equally, do not spend a whole entry on something trivially small next to a heavy neighbour. If the build crosses from exterior to interior, describe that crossing in AT MOST ONE entry with op="threshold", place it no earlier than the third entry (at least two ordinary exterior entries come first), and make the entry right after it op="clearing" (hauling out the debris the crossing just revealed).
 - "trend_ref": (string) If (and ONLY if) trend references are provided at the end of this prompt AND this idea clearly draws on one of those points, cite the borrowed point in one short Chinese sentence (which reference & what was borrowed). Otherwise it MUST be an empty string "". Never invent a reference.
 """ + trend_block
 
@@ -12739,19 +13424,19 @@ Each object in the JSON array must have EXACTLY these keys:
             "recommended_beats": 12,
             "beats_reason": "冰面加工与保暖层阶段多",
             "beat_outline": [
-                "清空洞内碎冰与落石",
-                "凿平起居区冰面地坪",
-                "锚固钢制支撑框架",
-                "喷涂洞壁隔热封闭层",
-                "铺设架空木龙骨地台",
-                "填充羊毛保温层",
-                "封装内衬木饰面墙",
-                "切穿蓝冰嵌装观景窗",
-                "布设电路与太阳能线管",
-                "安装暖炉与烟囱管",
-                "铺装成品木地板",
-                "布置床铺与软装",
-                "点亮灯带,人物入住"
+                {"op": "clearing", "text": "清空洞内碎冰与落石"},
+                {"op": "repair", "text": "凿平起居区冰面地坪"},
+                {"op": "framing", "text": "锚固钢制支撑框架"},
+                {"op": "priming", "text": "喷涂洞壁隔热封闭层"},
+                {"op": "framing", "text": "铺设架空木龙骨地台"},
+                {"op": "drywall", "text": "填充羊毛保温层"},
+                {"op": "drywall", "text": "封装内衬木饰面墙"},
+                {"op": "furnishing", "text": "切穿蓝冰嵌装观景窗"},
+                {"op": "wiring", "text": "布设电路与太阳能线管"},
+                {"op": "furnishing", "text": "安装暖炉与烟囱管"},
+                {"op": "flooring", "text": "铺装成品木地板"},
+                {"op": "furnishing", "text": "布置床铺与软装"},
+                {"op": "reward", "text": "点亮灯带,人物入住"}
             ],
             "trend_ref": ""
         },
@@ -12769,20 +13454,20 @@ Each object in the JSON array must have EXACTLY these keys:
             "recommended_beats": 13,
             "beats_reason": "除锈+舱内重建工序密",
             "beat_outline": [
-                "清空舱内废弃管线设备",
-                "打磨除锈整片舱壁",
-                "焊补穿孔钢板",
-                "涂刷防锈底漆",
-                "拆检并回装黄铜舷窗",
-                "铺设舱底架空龙骨",
-                "填充舱壁保温棉",
-                "布设电路与水管",
-                "封装内衬桦木饰面",
-                "铺装舱内软木地板",
-                "安装舷窗背光搁板灯",
-                "嵌装折叠床与储物柜",
-                "布置厨卫成品设备",
-                "通电亮灯,人物入住"
+                {"op": "clearing", "text": "清空舱内废弃管线设备"},
+                {"op": "repair", "text": "打磨除锈整片舱壁"},
+                {"op": "repair", "text": "焊补穿孔钢板"},
+                {"op": "priming", "text": "涂刷防锈底漆"},
+                {"op": "repair", "text": "拆检并回装黄铜舷窗"},
+                {"op": "framing", "text": "铺设舱底架空龙骨"},
+                {"op": "drywall", "text": "填充舱壁保温棉"},
+                {"op": "rough-in", "text": "布设电路与水管"},
+                {"op": "drywall", "text": "封装内衬桦木饰面"},
+                {"op": "flooring", "text": "铺装舱内软木地板"},
+                {"op": "lighting", "text": "安装舷窗背光搁板灯"},
+                {"op": "furnishing", "text": "嵌装折叠床与储物柜"},
+                {"op": "furnishing", "text": "布置厨卫成品设备"},
+                {"op": "reward", "text": "通电亮灯,人物入住"}
             ],
             "trend_ref": ""
         },
@@ -12800,21 +13485,21 @@ Each object in the JSON array must have EXACTLY these keys:
             "recommended_beats": 14,
             "beats_reason": "清淤到封顶阶段跨度大",
             "beat_outline": [
-                "清运井内积渣与鸟粪",
-                "高压水枪冲洗混凝土壁",
-                "注浆修补结构裂缝",
-                "涂布井壁防水膜",
-                "浇筑起居层混凝土楼板",
-                "架设钢制旋梯",
-                "翻新屋顶滑动舱门机构",
-                "布设电路与通风管道",
-                "砌筑并封闭内隔墙",
-                "抹灰打磨墙面",
-                "刷涂饰面涂料",
-                "铺装橡木地板",
-                "安装灯具与卫浴",
-                "布置卧榻与软装",
-                "舱门滑开,天光落入"
+                {"op": "clearing", "text": "清运井内积渣与鸟粪"},
+                {"op": "clearing", "text": "高压水枪冲洗混凝土壁"},
+                {"op": "repair", "text": "注浆修补结构裂缝"},
+                {"op": "priming", "text": "涂布井壁防水膜"},
+                {"op": "flooring", "text": "浇筑起居层混凝土楼板"},
+                {"op": "framing", "text": "架设钢制旋梯"},
+                {"op": "repair", "text": "翻新屋顶滑动舱门机构"},
+                {"op": "rough-in", "text": "布设电路与通风管道"},
+                {"op": "framing", "text": "砌筑并封闭内隔墙"},
+                {"op": "priming", "text": "抹灰打磨墙面"},
+                {"op": "painting", "text": "刷涂饰面涂料"},
+                {"op": "flooring", "text": "铺装橡木地板"},
+                {"op": "lighting", "text": "安装灯具与卫浴"},
+                {"op": "furnishing", "text": "布置卧榻与软装"},
+                {"op": "reward", "text": "舱门滑开,天光落入"}
             ],
             "trend_ref": ""
         }
@@ -12822,25 +13507,52 @@ Each object in the JSON array must have EXACTLY these keys:
     fallback_ideas = _dedupe_generated_ideas(fallback_ideas)
     dual_fallback_outlines = {
         'glacier-ice-cave / refuge-den / self-material-window': [
-            '清理洞口积雪与落石', '加固外部蓝冰拱口', '嵌装气密入口门框',
-            '搭建洞口防风门廊', '挂装太阳能完成外观', '推镜过门进入原始冰洞内部',
-            '清空洞内碎冰与积雪', '凿平并找平内部基底', '铺设龙骨与羊毛保温',
-            '封装内衬木饰面墙', '布设电路并安装暖炉', '布置床铺与羊毛软装',
-            '点亮暖灯,人物入住',
+            {'op': 'clearing',   'text': '清理洞口积雪与落石'},
+            {'op': 'framing',    'text': '加固外部蓝冰拱口'},
+            {'op': 'framing',    'text': '嵌装气密入口门框'},
+            {'op': 'furnishing', 'text': '搭建洞口防风门廊'},
+            {'op': 'furnishing', 'text': '挂装太阳能完成外观'},
+            {'op': 'threshold',  'text': '推镜过门进入原始冰洞内部'},
+            {'op': 'clearing',   'text': '清空洞内碎冰与积雪'},
+            {'op': 'repair',     'text': '凿平并找平内部基底'},
+            {'op': 'framing',    'text': '铺设龙骨与羊毛保温'},
+            {'op': 'drywall',    'text': '封装内衬木饰面墙'},
+            {'op': 'wiring',     'text': '布设电路并安装暖炉'},
+            {'op': 'furnishing', 'text': '布置床铺与羊毛软装'},
+            {'op': 'reward',     'text': '点亮暖灯,人物入住'},
         ],
         'retired-submarine / micro-home / porthole-lighting': [
-            '清理潜艇外甲板锈屑', '焊补外壳与入口围护', '安装水密门与护栏',
-            '挂装太阳能板与风管', '点亮舱外灯完成门面', '推镜过门进入锈蚀原始舱内',
-            '清空舱内废弃管线设备', '打磨除锈整片舱壁', '铺设舱底龙骨与保温',
-            '布设电路与生活水管', '封装桦木内饰与地板', '安装舷窗背光灯具',
-            '嵌装折叠床与储物柜', '通电亮灯,人物入住',
+            {'op': 'clearing',   'text': '清理潜艇外甲板锈屑'},
+            {'op': 'repair',     'text': '焊补外壳与入口围护'},
+            {'op': 'framing',    'text': '安装水密门与护栏'},
+            {'op': 'furnishing', 'text': '挂装太阳能板与风管'},
+            {'op': 'furnishing', 'text': '点亮舱外灯完成门面'},
+            {'op': 'threshold',  'text': '推镜过门进入锈蚀原始舱内'},
+            {'op': 'clearing',   'text': '清空舱内废弃管线设备'},
+            {'op': 'repair',     'text': '打磨除锈整片舱壁'},
+            {'op': 'framing',    'text': '铺设舱底龙骨与保温'},
+            {'op': 'rough-in',   'text': '布设电路与生活水管'},
+            {'op': 'drywall',    'text': '封装桦木内饰与地板'},
+            {'op': 'lighting',   'text': '安装舷窗背光灯具'},
+            {'op': 'furnishing', 'text': '嵌装折叠床与储物柜'},
+            {'op': 'reward',     'text': '通电亮灯,人物入住'},
         ],
         'missile-silo / burrow-dwelling / roof-hatch': [
-            '清理地表舱门与积渣', '修复混凝土入口圈梁', '翻新滑动舱门机构',
-            '搭建地表平台与护栏', '安装太阳能与通风帽', '点亮入口灯完成地表',
-            '推镜过门进入积渣原始井内', '清运井内积渣与鸟粪', '涂布井壁防水封闭层',
-            '浇筑起居层混凝土板', '架设钢制旋梯与护栏', '布设电路与通风管道',
-            '封装内墙并完成饰面', '布置卧榻卫浴与软装', '舱门滑开,天光落入',
+            {'op': 'clearing',   'text': '清理地表舱门与积渣'},
+            {'op': 'repair',     'text': '修复混凝土入口圈梁'},
+            {'op': 'repair',     'text': '翻新滑动舱门机构'},
+            {'op': 'furnishing', 'text': '搭建地表平台与护栏'},
+            {'op': 'furnishing', 'text': '安装太阳能与通风帽'},
+            {'op': 'furnishing', 'text': '点亮入口灯完成地表'},
+            {'op': 'threshold',  'text': '推镜过门进入积渣原始井内'},
+            {'op': 'clearing',   'text': '清运井内积渣与鸟粪'},
+            {'op': 'priming',    'text': '涂布井壁防水封闭层'},
+            {'op': 'flooring',   'text': '浇筑起居层混凝土板'},
+            {'op': 'framing',    'text': '架设钢制旋梯与护栏'},
+            {'op': 'rough-in',   'text': '布设电路与通风管道'},
+            {'op': 'drywall',    'text': '封装内墙并完成饰面'},
+            {'op': 'furnishing', 'text': '布置卧榻卫浴与软装'},
+            {'op': 'reward',     'text': '舱门滑开,天光落入'},
         ],
     }
     # nested 的三条兜底载体（冰洞/潜艇/导弹井）都在原地，套不上「装备把载体运到现场」的

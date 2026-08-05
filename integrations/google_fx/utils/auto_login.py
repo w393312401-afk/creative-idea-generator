@@ -44,12 +44,20 @@ DEFAULT_TIMEOUT_SECONDS = 180
 
 # 每一步允许提交几次。密码是 1（见护栏 1）；邮箱可以 2（第一次可能被账号选择页
 # 抢走焦点）；动态码 2（第一次撞上时间窗口边界的容错）。
-_MAX_SUBMITS = {"provider": 1, "email": 2, "password": 1, "totp": 2}
+_MAX_SUBMITS = {"provider": 1, "email": 2, "password": 1, "totp": 2,
+                # 登录方式选择页只是点一下「用密码登录」，不提交任何凭据；给 2 次
+                # 是容忍一次点击没生效，再多就是这一页根本走不通。
+                "method_picker": 2}
 
 _STEP_POLL_SECONDS = 1.0
 # 提交一步之后等页面变化的时间。Google 的表单页跳转本身很快，但慢代理下
 # 首字节可能要好几秒。
 _STEP_SETTLE_SECONDS = 12.0
+
+# 账号选择页上等账号列表渲染出来的时间。这一页的列表是 JS 渲染的，DOM 里还
+# 没有元素时 `locator.count()` 立刻返回 0，不轮询就会在页面刚跳过来的瞬间
+# 误判成"这页上既没有目标账号也没有使用其他账号"。
+_CHOOSER_RENDER_SECONDS = 10.0
 
 
 class AutoLoginResult:
@@ -93,6 +101,117 @@ def _page_text(page) -> str:
         return ""
 
 
+# 在页面上按可见文本找一个可点的行，返回它的中心点坐标。
+# 为什么不继续堆 CSS 选择器：Google 这几页的 DOM 形状换得很勤（li →
+# div[role=link] → 只带 jsname 的自定义容器），每换一次就要追一次，而追不上的
+# 代价是整条自动登录卡死。文本是这页上最稳定的东西。
+#
+# 两个关键点：
+#  · 取**最内层**匹配元素。`*:has-text()` 这类写法会把 body/html 一起匹配上，
+#    点 body 什么都不会发生——这正是"选择器看着匹配了却没反应"的经典坑。
+#  · 返回坐标交给 Playwright 真点，而不是在 JS 里 el.click()。Google 用 jsaction
+#    绑事件，合成事件有时不触发，真实鼠标事件一定触发。
+_CLICKABLE_TEXT_SCRIPT = r"""(needles) => {
+  const wanted = (needles || []).map(s => s.toLowerCase());
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  // 粗筛用 textContent 而不是 innerText：innerText 每次都会触发一次布局，
+  // 这一页有几千个节点，逐个取会明显拖慢。可见性另外用 rect 判。
+  const matches = (el) => {
+    const t = norm(el.textContent);
+    return t && t.length <= 80 && wanted.some(w => t === w || t.startsWith(w));
+  };
+  const visible = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) return false;
+    const st = window.getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0') return false;
+    return true;
+  };
+
+  for (const el of document.querySelectorAll('body *')) {
+    const tag = el.tagName;
+    if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE') continue;
+    if (!matches(el)) continue;
+    // 最内层优先：文档序里祖先排在前面，后代若也匹配同一段文本就让给后代。
+    let deeper = false;
+    for (const child of el.querySelectorAll('*')) {
+      if (matches(child)) { deeper = true; break; }
+    }
+    if (deeper) continue;
+    if (!visible(el)) continue;
+    // 文本所在的节点本身常常不可点，向上找最近的可点容器。BOQ 页面上这层
+    // 通常是带 jsaction / jsname 的 div，没有 role 也没有语义标签。
+    let target = el;
+    for (let i = 0; i < 4 && target.parentElement; i++) {
+      if (target.matches('a,button,li,[role],[jsaction],[jsname],[tabindex]')) break;
+      target = target.parentElement;
+    }
+    // 先滚到视野中央再量坐标：page.mouse.click 用的是视口坐标，元素在视口外
+    // 时量出来的坐标点不到。
+    try { target.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
+    const r = target.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) continue;
+    return {x: r.left + r.width / 2, y: r.top + r.height / 2,
+            text: norm(el.textContent).slice(0, 60)};
+  }
+  return null;
+}"""
+
+
+def _click_by_text(page, needles, what: str) -> bool:
+    """按可见文本点击页面上的一行。选择器链走不通时的兜底。"""
+    try:
+        hit = page.evaluate(_CLICKABLE_TEXT_SCRIPT, list(needles))
+    except Exception:
+        return False
+    if not hit:
+        return False
+    try:
+        page.mouse.click(float(hit["x"]), float(hit["y"]))
+    except Exception as e:
+        log(f"⚠️ 自动登录：按文本点击{what}失败 {type(e).__name__}: {e}", "自动登录")
+        return False
+    log(f"🔓 自动登录：按文本点中{what}（“{hit.get('text', '')}”）", "自动登录")
+    return True
+
+
+# 页面卡住时，把这页上到底有哪些可点的东西打进日志。没有这行，"卡在某个页面"
+# 只能靠截图来回猜选择器。只取可见控件的短文本，不碰任何输入框的值。
+_VISIBLE_OPTIONS_SCRIPT = r"""() => {
+  const out = [];
+  const seen = new Set();
+  for (const el of document.querySelectorAll(
+      'a,button,li,[role="link"],[role="button"],input[type="submit"]')) {
+    const r = el.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) continue;
+    const t = (el.innerText || el.value || '').replace(/\s+/g, ' ').trim();
+    if (!t || t.length > 60 || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+    if (out.length >= 10) break;
+  }
+  return out;
+}"""
+
+
+def _describe_options(page) -> str:
+    try:
+        options = page.evaluate(_VISIBLE_OPTIONS_SCRIPT)
+    except Exception:
+        return ""
+    if not isinstance(options, (list, tuple)):
+        return ""
+    options = [str(o) for o in options if str(o).strip()]
+    return "｜".join(options[:10])
+
+
+def _log_stuck_page(page, step: str):
+    options = _describe_options(page)
+    url = _current_url(page)[:160]
+    log(f"🔎 自动登录：停在 {step} 这一步，URL={url or '未知'}；"
+        f"页面上可见的可点项 = [{options or '无'}]", "自动登录")
+
+
 def _current_url(page) -> str:
     try:
         return str(getattr(page, "url", "") or "").lower()
@@ -113,6 +232,46 @@ def _browser_gone(page) -> bool:
 
 # 这些文案出现 = 这一步自动化处理不了，必须立刻交回人工。放弃比乱点安全：
 # 在设备验证页上乱点可能把账号推进更难恢复的状态。
+# 登录方式选择页的**标题**。判定必须用标题而不是选项文案：
+# "Enter your password" 在真正的密码页上也会出现（Material 的浮动 label 就是
+# 这几个字，会进 innerText），拿它判定会把密码页也当成选择页，然后在 label 上
+# 反复点。"Choose how you want to sign in" 只出现在选择页，没有这个歧义。
+#
+# 也**不能**靠"页面上有没有密码框"来区分：Flow 的登录是 BOQ 单页应用，选择页
+# 往往已经把密码框预渲染在 DOM 里，点选项只是把它显示出来。用密码框做前提，
+# 会让整段识别在真机上直接失效——2026-08-05 现场就是这么退回 challenge_picker
+# 分支、最后报 no_authenticator_option 的。
+_METHOD_PICKER_HEADINGS = (
+    "choose how you want to sign in",
+    "how do you want to sign in",
+    "选择您要使用的登录方式",
+    "选择登录方式",
+    "選擇你要使用的登入方式",
+    "pilih cara login",
+)
+
+# 但这句标题**两页都有**：两步验证的方式列表同样写着 "Choose how you want to
+# sign in"，只是多一个 "2-Step Verification" 抬头。所以两者的真正分界是这组词，
+# 而不是标题本身。判反了的后果是对称的：把 2FA 页当选择页会去点密码（点不到，
+# 白耗两次），把选择页当 2FA 页则是现场那条 no_authenticator_option 死路。
+_TWO_STEP_MARKERS = (
+    "2-step verification",
+    "two-step verification",
+    "2 步验证",
+    "两步验证",
+    "兩步驗證",
+)
+
+# 选择页上「用密码登录」那一项的文案。只用于点击，不用于判定。
+_PASSWORD_OPTION_TEXTS = (
+    "enter your password",
+    "输入您的密码",
+    "输入密码",
+    "輸入您的密碼",
+    "masukkan sandi",
+)
+
+
 _HARD_STOP_MARKERS = (
     ("captcha", "captcha_required", "登录页出现了图形验证码"),
     ("not a robot", "captcha_required", "登录页出现了人机验证"),
@@ -155,9 +314,29 @@ def _detect_step(page) -> tuple:
     # HARD_STOP_MARKERS 前面，因为同一页正文必然含有 "2-Step Verification"。
     if _first_visible(page, _SEL.get("totp_input")):
         return "totp", ""
-    if (_first_visible(page, _SEL.get("authenticator_option")) or
-            _first_visible(page, _SEL.get("try_another_way"))):
-        return "challenge_picker", ""
+    # 新版登录方式选择页（"Choose how you want to sign in: Enter your password /
+    # Use your passkey / Try another way"）必须排在 challenge_picker 前面：它上面
+    # 那个「Try another way」是登录方式入口，不是两步验证的换方式入口。反过来的
+    # 顺序会把这一页当成 2FA picker，去找永远不存在的身份验证器选项，然后在
+    # 「Try another way」的下级页里空转到超时。
+    #
+    # 判定以**标题文案**为准、选择器只作快路：这一页的行没有稳定的标签或 role，
+    # 只按选择器认会漏掉，漏掉就退回上面那条卡死路径。
+    if not any(marker in text for marker in _TWO_STEP_MARKERS):
+        if (any(heading in text for heading in _METHOD_PICKER_HEADINGS)
+                or _first_visible(page, _SEL.get("password_option"))):
+            return "method_picker", ""
+    # 「Try another way」**不是**两步验证页的专属标志：普通密码页底部就挂着一个
+    # 同名链接（真机验证，2026-08-05：/v3/signin/challenge/pwd 上 password_input、
+    # next_btn、try_another_way 三者同时命中）。只凭它判定，会把密码页当成 2FA
+    # 页，然后我们自己点掉「Try another way」跳去登录方式选择页，再报
+    # no_authenticator_option——用户看到的"卡在 Welcome 页"就是这么来的。
+    # 所以：页面上只要有能填的密码框/邮箱框，就绝不是验证方式选择页。
+    if not (_first_visible(page, _SEL.get("password_input"))
+            or _first_visible(page, _SEL.get("email_input"))):
+        if (_first_visible(page, _SEL.get("authenticator_option")) or
+                _first_visible(page, _SEL.get("try_another_way"))):
+            return "challenge_picker", ""
 
     # Flow 有时先落在 labs.google 自己的 Auth.js 中转页，而不是直接跳到
     # accounts.google.com。先点这里的 provider 按钮，后续仍由同一状态机处理。
@@ -175,6 +354,11 @@ def _detect_step(page) -> tuple:
     if _first_visible(page, _SEL.get("password_input")):
         return "password", ""
     if "accountchooser" in url or "selectaccount" in url:
+        # URL 停在账号选择页，但渲染出来的其实是邮箱表单：环境里的会话全部过期
+        # 时 Google 会就地把列表换成 identifier 表单，URL 不跟着变。此时按
+        # chooser 处理会卡在"找不到账号行"上直接放弃，而实际上填邮箱就能走完。
+        if _first_visible(page, _SEL.get("email_input")):
+            return "email", ""
         return "chooser", ""
     if _first_visible(page, _SEL.get("email_input")):
         return "email", ""
@@ -254,35 +438,88 @@ def _visible_error(page) -> str:
         return ""
 
 
+def _click_account_row_by_attribute(page, email: str) -> bool:
+    """按 data-identifier / data-email 属性精确匹配账号行并点击。
+
+    比 :has-text 稳两点：属性里是账号原文（列表里的可见文本可能被截断成
+    "jia…@gmail.com"），且属性比较可以大小写不敏感（Google 显示的邮箱大小写
+    未必和用户在号池里填的一致）。
+    """
+    target = (email or "").strip().lower()
+    if not target:
+        return False
+
+    for attr in _SEL.get("account_row_attrs") or ():
+        try:
+            rows = page.locator(f"[{attr}]")
+            count = min(int(rows.count()), 20)
+        except Exception:
+            continue
+        for index in range(count):
+            try:
+                row = rows.nth(index)
+                if (row.get_attribute(attr) or "").strip().lower() != target:
+                    continue
+                if not row.is_visible(timeout=600):
+                    continue
+                row.click(timeout=5000)
+                log(f"🔓 自动登录：在账号选择页按 {attr} 选中 {email}", "自动登录")
+                return True
+            except Exception:
+                continue
+    return False
+
+
 def _pick_account_from_chooser(page, email: str) -> bool:
     """账号选择页：优先直接点目标邮箱那一行，找不到再点「使用其他账号」。
 
     直接点目标邮箱能少走一整步（不用再填邮箱），而且能避免一个真实的坑：
     环境里如果登过多个号，点「使用其他账号」重新填邮箱，Google 有时会把新号
     追加成第二个登录身份而不是替换，Flow 之后用的还是旧号。
-    """
-    if email:
-        # 邮箱里可能有需要转义的字符，用 Playwright 的 :has-text 传入原文即可。
-        for selector in (f"li:has-text('{email}')", f"div[role='link']:has-text('{email}')",
-                         f"[data-identifier='{email}']"):
-            try:
-                locator = page.locator(selector).first
-                if locator.count() and locator.is_visible(timeout=600):
-                    locator.click(timeout=5000)
-                    log(f"🔓 自动登录：在账号选择页直接选中 {email}", "自动登录")
-                    return True
-            except Exception:
-                continue
 
-    another = _first_visible(page, _SEL.get("use_another_account"))
-    if another is not None:
-        try:
-            another.click(timeout=5000)
-            log("🔓 自动登录：账号选择页未列出目标账号，点「使用其他账号」", "自动登录")
+    整段要**轮询等待**而不是扫一遍就下结论：账号列表是 JS 渲染的，元素还没
+    进 DOM 时 `count()` 立刻返回 0（连 is_visible 的 600ms 都等不到），单次
+    扫描会在页面刚跳过来的那一瞬间就误判成"这页上什么都没有"。线上真实事故
+    （2026-08-05，账号 k1anmo58）就是检测到掉登录后 1 秒内报 chooser_stuck。
+    """
+    deadline = time.monotonic() + _CHOOSER_RENDER_SECONDS
+
+    while True:
+        if _click_account_row_by_attribute(page, email):
             return True
-        except Exception:
-            pass
-    return False
+
+        if email:
+            # 邮箱里可能有需要转义的字符，用 Playwright 的 :has-text 传入原文即可。
+            for selector in (f"li:has-text('{email}')",
+                             f"div[role='link']:has-text('{email}')",
+                             f"div[role='button']:has-text('{email}')"):
+                try:
+                    locator = page.locator(selector).first
+                    if locator.count() and locator.is_visible(timeout=600):
+                        locator.click(timeout=5000)
+                        log(f"🔓 自动登录：在账号选择页直接选中 {email}", "自动登录")
+                        return True
+                except Exception:
+                    continue
+
+        another = _first_visible(page, _SEL.get("use_another_account"))
+        if another is not None:
+            try:
+                another.click(timeout=5000)
+                log("🔓 自动登录：账号选择页未列出目标账号，点「使用其他账号」", "自动登录")
+                return True
+            except Exception:
+                pass
+
+        # 等待期间页面可能自己走掉（列表渲染完直接跳密码页，或 URL 变成邮箱
+        # 表单）。这不是失败，交回主状态机按新的一步继续。
+        step, _ = _detect_step(page)
+        if step != "chooser":
+            return True
+
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_STEP_POLL_SECONDS)
 
 
 def _switch_to_authenticator(page) -> bool:
@@ -363,7 +600,8 @@ def try_auto_login(page, user_id: str = None, timeout_seconds: float = None,
     log(f"🔓 {context_label} 检测到掉登录，开始自动重新登录账号 {email}"
         f"（{user_id}，2FA={'已配置' if has_totp else '未配置'}，预算 {budget:.0f}s）", "自动登录")
 
-    submits = {"provider": 0, "email": 0, "password": 0, "totp": 0}
+    submits = {"provider": 0, "email": 0, "password": 0, "totp": 0,
+               "method_picker": 0}
     result = _run_login_steps(page, email, password, has_totp, user_id,
                               submits, deadline, cancel_check)
 
@@ -408,8 +646,11 @@ def _run_login_steps(page, email, password, has_totp, user_id,
 
         if step == "chooser":
             if not _pick_account_from_chooser(page, email):
-                return AutoLoginResult(False, "chooser_stuck",
-                                       "账号选择页上既找不到目标账号，也点不到「使用其他账号」")
+                _log_stuck_page(page, "账号选择页")
+                return AutoLoginResult(
+                    False, "chooser_stuck",
+                    f"账号选择页等了 {_CHOOSER_RENDER_SECONDS:.0f}s，既没出现目标账号那一行，"
+                    "也没出现「使用其他账号」入口")
             _wait_for_step_change(page, "chooser", _STEP_SETTLE_SECONDS)
             continue
 
@@ -434,12 +675,51 @@ def _run_login_steps(page, email, password, has_totp, user_id,
             _wait_for_step_change(page, "provider", _STEP_SETTLE_SECONDS)
             continue
 
+        if step == "method_picker":
+            if submits["method_picker"] >= _MAX_SUBMITS["method_picker"]:
+                _log_stuck_page(page, "登录方式选择页")
+                return AutoLoginResult(
+                    False, "method_picker_stuck",
+                    "点了登录方式选择页上的「用密码登录」，页面仍停在原处")
+
+            submits["method_picker"] += 1
+            clicked = False
+            option = _first_visible(page, _SEL.get("password_option"))
+            if option is not None:
+                try:
+                    option.click(timeout=5000)
+                    log("🔓 自动登录：登录方式选择页选择「用密码登录」", "自动登录")
+                    clicked = True
+                except Exception as e:
+                    log(f"⚠️ 自动登录：「用密码登录」按选择器点击失败 "
+                        f"{type(e).__name__}: {e}，改按文本点", "自动登录")
+            # 选择器没命中就按文本点。这一页的行没有稳定标签/role，选择器链
+            # 追不上 Google 改版是常态，文本兜底才是这里真正靠得住的一层。
+            if not clicked:
+                clicked = _click_by_text(page, _PASSWORD_OPTION_TEXTS, "「用密码登录」")
+            if not clicked:
+                _log_stuck_page(page, "登录方式选择页")
+                return AutoLoginResult(
+                    False, "method_picker_click_failed",
+                    "登录方式选择页上点不到「用密码登录」（选择器和文本定位都没命中）")
+            _wait_for_step_change(page, "method_picker", _STEP_SETTLE_SECONDS)
+            continue
+
         if step == "challenge_picker":
             if not has_totp:
                 return AutoLoginResult(
                     False, "totp_not_configured",
                     "Google 要求两步验证，但这个账号没配 TOTP 密钥")
             if not _switch_to_authenticator(page):
+                # 找不到身份验证器时，先看看这页上是不是有「用密码登录」——说明
+                # 我们其实落在了登录方式列表而不是两步验证列表（真正的 2FA 列表
+                # 里不会有这一项，所以点不到就照旧失败，不会误伤）。
+                if (submits["method_picker"] < _MAX_SUBMITS["method_picker"]
+                        and _click_by_text(page, _PASSWORD_OPTION_TEXTS, "「用密码登录」")):
+                    submits["method_picker"] += 1
+                    _wait_for_step_change(page, "challenge_picker", _STEP_SETTLE_SECONDS)
+                    continue
+                _log_stuck_page(page, "两步验证方式列表")
                 return AutoLoginResult(
                     False, "no_authenticator_option",
                     "两步验证页上找不到「身份验证器 App」选项（可能只开了短信或手机确认）")
@@ -497,6 +777,7 @@ def _run_login_steps(page, email, password, has_totp, user_id,
         # 不乱点，等它自己跳转（有些是纯过场页），等不动就交回人工。
         idle_rounds += 1
         if idle_rounds > 15:
+            _log_stuck_page(page, "无法识别的页面")
             return AutoLoginResult(
                 False, "unknown_page",
                 "登录流程停在一个无法识别的页面，需要人工在 AdsPower 窗口里处理")
@@ -545,7 +826,8 @@ def run_standalone_login(user_id: str, port=None,
 
     from playwright.sync_api import sync_playwright
 
-    from .browser import find_or_create_page, get_ads_ws_url
+    from .browser import (find_or_create_page, get_ads_ws_url,
+                          wait_for_login_redirect)
     from .browser_gate import browser_slot
 
     flow_url = "https://labs.google/fx/tools/flow"
@@ -567,7 +849,9 @@ def run_standalone_login(user_id: str, port=None,
                 except Exception:
                     pass
 
-                if not is_google_login_page(page):
+                # 必须等重定向稳定再判：Flow 的会话失效重定向发生在
+                # domcontentloaded 之后，抢答会把掉登录报成"已是登录状态"。
+                if not wait_for_login_redirect(page):
                     # 已经是登录状态。这不是"测试失败"——用户想确认的正是"这个号能
                     # 用"，而它现在就能用。但也别谎称"自动登录成功"（压根没登）。
                     return AutoLoginResult(True, "already_logged_in",

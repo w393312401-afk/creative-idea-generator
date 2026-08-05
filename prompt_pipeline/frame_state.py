@@ -90,12 +90,28 @@ def validate_frame_state_contract(
     """
     errors: list[str] = []
     seen_after: dict[str, str] = {}
+    seen_transitions: dict[tuple[str, str], int] = {}
 
     for expected, item in enumerate(contracts or [], start=1):
         idx = item.get("beat") or expected
         if idx != expected:
             errors.append(f"Beat {idx} is out of sequence; expected beat {expected}.")
         if item.get("transition"):
+            # A transition carries no construction state, so the milestone checks below do not
+            # apply — but it must still be a distinct step.  Expanding one crossing marker into
+            # several stages used to clone the marker's state fields verbatim, and skipping the
+            # whole loop body meant the identical stages passed clean and shipped as several
+            # consecutive clips of the same crossing.
+            signature = (_text(item.get("delta")).lower(), _text(item.get("after")).lower())
+            if any(signature):
+                first = seen_transitions.get(signature)
+                if first is not None:
+                    errors.append(
+                        f"Beat {idx} is a transition that repeats beat {first} verbatim; every "
+                        f"crossing stage needs its own camera-position state."
+                    )
+                else:
+                    seen_transitions[signature] = idx
             continue
 
         missing = [name for name in ("before", "delta", "after", "preserve") if not item.get(name)]

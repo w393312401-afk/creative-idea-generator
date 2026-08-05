@@ -50,6 +50,55 @@ def test_state_contract_rejects_overpacked_and_regressing_beat():
     assert any("explicitly regresses" in error for error in errors)
 
 
+def _crossing(index, stage, *, before, after):
+    return {
+        "index": index,
+        "space_id": "primary",
+        "operation": "threshold",
+        "bridge_stage": index,
+        "transition_stage": stage,
+        "milestone_name": "",
+        "before_state": before,
+        "after_state": after,
+        "preserve_state": "this beat builds nothing",
+        "changed_grid_cells": [],
+        "package_operations": [],
+        "persistent_traces": [],
+    }
+
+
+def test_state_contract_rejects_crossing_stages_cloned_from_one_marker():
+    """Expanding one crossing marker used to copy its state fields into every stage, and the
+    validator skipped transitions wholesale — so three identical beats shipped as three
+    consecutive clips walking through the same door (2026-08-05 petrified-cypress run)."""
+    cloned = "Camera is fully positioned inside the petrified root cavity."
+    ladder = [
+        _beat(1, "clearing"),
+        _crossing(2, "door_hardware_open", before="Camera is outside the arch.", after=cloned),
+        _crossing(3, "threshold_partial", before="Camera is outside the arch.", after=cloned),
+        _crossing(4, "interior_establish", before="Camera is outside the arch.", after=cloned),
+    ]
+    errors = validate_frame_state_contract(build_frame_state_contract(ladder))
+    assert [e for e in errors if "repeats beat 2 verbatim" in e]
+    assert sum("transition that repeats" in e for e in errors) == 2
+
+
+def test_state_contract_accepts_crossing_stages_with_their_own_camera_states():
+    ladder = [
+        _beat(1, "clearing"),
+        _crossing(2, "door_hardware_open",
+                  before="Camera stands outside with the opening still closed off.",
+                  after="Camera still stands outside; the entrance is open and dark beyond it."),
+        _crossing(3, "threshold_partial",
+                  before="Camera stands outside the open entrance on the site side of the sill.",
+                  after="Camera has crossed the sill locally; the opening edge stays in frame."),
+        _crossing(4, "interior_establish",
+                  before="Camera holds the partial landed view with the far interior occluded.",
+                  after="Camera has settled on the establishing axis and the raw space reads whole."),
+    ]
+    assert validate_frame_state_contract(build_frame_state_contract(ladder)) == []
+
+
 def test_delta_prompt_keeps_camera_anchor_and_authoritative_state_under_budget():
     beat = _beat(2, "framing")
     original = (

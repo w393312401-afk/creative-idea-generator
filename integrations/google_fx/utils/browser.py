@@ -600,6 +600,28 @@ def is_google_login_page(page) -> bool:
         return False
 
 
+def wait_for_login_redirect(page, timeout_seconds: float = 8.0) -> bool:
+    """等页面稳定下来再回答"是不是掉登录了"。
+
+    Flow 是 SPA：导航回来时 domcontentloaded 已经触发，但会话失效的重定向
+    （labs.google → accounts.google.com）还要几百毫秒到几秒才发生。这个空档里
+    问 is_google_login_page 一定得到 False，于是**掉登录被当成已登录**——
+    2026-08-05 真机验证时，一个明明停在账号选择页的环境，「测试登录」回的是
+    "这个账号当前已是登录状态"。
+
+    已经进了工作台就立刻返回 False，不白等满整个预算。
+    """
+    deadline = time.monotonic() + max(0.5, float(timeout_seconds))
+    while True:
+        if is_google_login_page(page):
+            return True
+        if _flow_workspace_ready(page):
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
 def _open_flow_entry_in_current_page(page, entry) -> bool:
     """Open the landing-page CTA without letting it create a duplicate tab.
 

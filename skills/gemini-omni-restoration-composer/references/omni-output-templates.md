@@ -59,6 +59,27 @@ numbers: `from bare concrete across the left third, to covering the whole floor`
 Rationale: digits and symbols in a prompt are a leading cause of the model rendering
 literal text overlays into the frame.
 
+The ban covers **both** prompt bodies. IMAGE anchors are not exempt: the locked-anchor
+restatement writes its frame-height scales as English words too — `holding forty-five
+percent of frame height`, never `holding 45 percent`. Hyphenated tens (`forty-five`,
+`sixty-five`) are the required form, because the upstream drift gates parse that exact
+shape; see the Scale Restatement note below.
+
+### Scale Restatement
+
+The locked-anchor sentence restates each primary landmark's frame-height scale so the
+spatial drift gate can verify it beat to beat. Write those scales as hyphenated English
+words (`forty-five percent of frame height`). This is not a carve-out from the notation
+ban — it satisfies it. The word form is deliberately chosen so both contracts hold at
+once: the drift gate accepts word-form scales, so nothing is lost by spelling them out.
+
+Grid cells (`Grid B2`) are the one notation this ban does **not** currently reach in IMAGE
+bodies. The locked-anchor restatement must carry them verbatim because they are the drift
+gate's only positional anchor, and that gate cannot yet read word-form coordinates. This
+is a known, registered conflict — see `omni-grid-notation-ban` in
+`references/contract-registry.json` — not an oversight, and not licence to add other
+notation.
+
 ### Timecode Exemption
 
 The shot timeline sentence is the **only** place in a prompt body where arabic digits may

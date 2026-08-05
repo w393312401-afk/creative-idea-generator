@@ -5,7 +5,12 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const source = fs.readFileSync(path.join(__dirname, '..', 'js', 'api_client.js'), 'utf8');
+// api_client.js 是浏览器端 classic script，整份跑进 vm 会缺一堆全局量，所以只切出
+// 这一个函数。切口按行首 `}` 找，必须先把行尾统一成 LF：仓库里存的是 LF，但
+// core.autocrlf=true 的 Windows 检出是 CRLF，直接找 '\n}\n' 永远找不到，本用例会在
+// 代码完全正确的情况下报"helper must exist"。
+const source = fs.readFileSync(path.join(__dirname, '..', 'js', 'api_client.js'), 'utf8')
+    .replace(/\r\n/g, '\n');
 const start = source.indexOf('function ensureFrameRunForStart');
 const end = source.indexOf('\n}\n', start) + 3;
 assert.ok(start >= 0 && end > start, 'ensureFrameRunForStart helper must exist');

@@ -98,7 +98,7 @@ from prompt_pipeline import (
 from frame_generator import (
     generate_frame_sequence, _generate_image_edit, _image_edit_model,
     _measure_image_pixels, _chat_transport_is_full_quality, chat_transport_note,
-    update_manifest_stale_status, CHAT_TRANSPORT, frame_chain_gate_enabled,
+    update_manifest_stale_status, CHAT_TRANSPORT,
 )
 from video_generator import generate_video_sequence
 
@@ -644,16 +644,20 @@ def _render_frames_with_checkpoints(config, title, prompt_block, project_dir, on
 
     qaGateLevel=off、间隔关闭、或本次待渲染帧数不超过一段时，退回原有的单次全量
     调用（target_sequences=None 自带断点续传跳已有帧 + 清全部血统标记的语义）。
-    分段调用显式传 target_sequences 会禁用帧级续传跳过，故段目标里只放缺失帧。"""
+    分段调用显式传 target_sequences 会禁用帧级续传跳过，故段目标里只放缺失帧。
+
+    frameChainGate 与这里的段长是两码事，别再把它接到 interval 上：帧链闸是
+    generate_frame_sequence 内部的事（FX 拆成单帧批 + 判定不过当场截断，见
+    frame_generator.plan_fx_chunks 之后那段），不管这里怎么分段都照常成立。把
+    interval 压成 1 换不来任何额外保护，却让每渲一帧就跑一次检查点（两次 VLM：
+    链中回望 + 锚点句校准），并且把用户显式设的 realityCheckpointInterval 连同
+    「0=关闭检查点」一起吃掉。"""
     images, videos = _parse_prompt_slots(prompt_block)
     seqs = sorted(images)
     interval = _checkpoint_interval(config)
-    chain_gate = frame_chain_gate_enabled(config)
-    if chain_gate:
-        interval = 1
     missing = {s for s in seqs if not os.path.exists(_frame_path(title, s))}
-    if ((not chain_gate and (interval <= 0 or len(missing) <= interval))
-            or not missing or qa_gate_level(config) == 'off'):
+    if (interval <= 0 or not missing or qa_gate_level(config) == 'off'
+            or len(missing) <= interval):
         generate_frame_sequence(config, title, prompt_block, on_progress=on_progress,
                                 target_sequences=None)
         return prompt_block
@@ -884,21 +888,34 @@ def _manifest_review_summary(project_dir, sequences):
     {'flagged': {seq: 原因}, 'unreviewed': [seq, ...]}。
 
     增量审查下本轮只审了几拍，光按本轮结果汇总会把上几轮标出来、还没修的问题说没了。
-    人工标记压着机器判定时真实结论在 manual_flag_prev_gate 里，一并算进来。"""
+    人工标记压着机器判定时真实结论在 manual_flag_prev_gate 里，一并算进来。
+
+    2026-08-05 修正"未审"的口径：以前只把 sequence_review_skipped（审查跑过但失败）
+    算未审，于是 pending_manual_review——**从来没被审过**的初始态——既不进 flagged 也不进
+    unreviewed，在所有汇总里静默读作"没问题"。实测代价：某一单 12 帧里 4 帧是这个状态、
+    vlm_qa_reason 全空，而汇总报的是"审查通过"。审查是手动触发的（见
+    _sequence_consistency_review 的 2026-07-24 变更），渲染继续往后跑而审查停在第 8 帧
+    是完全正常的路径，所以这个状态很常见，不是异常。
+    现在的口径只有一条：**没有真实结论（REAL_REVIEW_VERDICTS）就是未审**——manifest 里
+    没有这一帧的记录同样算未审，而不是当它不存在。"""
     wanted = {int(s) for s in sequences}
     manifest = read_manifest(project_dir) or {}
     flagged, unreviewed = {}, []
+    seen = set()
     for frame in manifest.get('frames') or []:
         seq = frame.get('sequence')
         if seq not in wanted:
             continue
+        seen.add(seq)
         gate = frame.get('quality_gate')
         prev = frame.get('manual_flag_prev_gate')
         if 'sequence_review_flagged' in (gate, prev):
             flagged[seq] = frame.get('vlm_qa_reason') or '（未记录原因）'
-        elif gate == 'sequence_review_skipped':
+        elif gate not in REAL_REVIEW_VERDICTS and prev not in REAL_REVIEW_VERDICTS:
             unreviewed.append(seq)
-    return {'flagged': flagged, 'unreviewed': sorted(unreviewed)}
+    # manifest 里根本没有记录的帧也是未审——漏记不等于通过
+    unreviewed.extend(sorted(wanted - seen))
+    return {'flagged': flagged, 'unreviewed': sorted(set(unreviewed))}
 
 
 def _beats_needing_review(rendered, valid_seqs):
