@@ -1756,6 +1756,19 @@ def normalize_beat_ladder(beat_ladder):
                 beat[key] = [str(value)]
             else:
                 beat[key] = [str(item).strip() for item in value if str(item).strip()]
+        # introduced_objects/removed_objects：与上面那组不同,**缺失这个键**本身就是
+        # milestone_ladder_violations 要拦的硬伤(见该函数),这里绝不能像上面一样替
+        # 缺失的键补一个 []——那会在校验读到之前就把"没声明"悄悄改写成"声明了空",
+        # 物体生命周期校验直接失去用武之地。只在键**存在**时做形状归一化。
+        for key in ('introduced_objects', 'removed_objects'):
+            if key in beat:
+                value = beat.get(key)
+                if value is None:
+                    beat[key] = []
+                elif not isinstance(value, list):
+                    beat[key] = [str(value)]
+                else:
+                    beat[key] = [str(item).strip() for item in value if str(item).strip()]
         bs = beat.get('bridge_stage')
         if bs is not None and not isinstance(bs, int):
             try:
@@ -1936,6 +1949,13 @@ def milestone_ladder_violations(beat_ladder, mode='Standard'):
         for field in ('changed_grid_cells', 'package_operations', 'persistent_traces'):
             if not beat.get(field):
                 missing.append(field)
+        # introduced_objects/removed_objects：空数组是合法答案(这一拍没有新增/拆除
+        # 任何可数物体),但**完全不声明**这个键不是——那等于场景状态表压根没有数据可
+        # 校验,物体提前出生/已拆除复活这类硬伤就无从查起(见 scene_state.py)。所以只
+        # 检查键在不在,不检查是否非空——与上面那三个字段"空即缺"的口径刻意不同。
+        for field in ('introduced_objects', 'removed_objects'):
+            if field not in beat:
+                missing.append(field)
         if missing:
             errors.append(f'Beat {idx} is missing visible-milestone fields: {", ".join(missing)}.')
             continue
@@ -2080,16 +2100,30 @@ def repair_incompatible_package_operations(beat_ladder):
     return repaired
 
 
-def compile_outline_fallback_ladder(parsed_brief, total_beats, variant=None, topology=None):
+def compile_outline_fallback_ladder(parsed_brief, total_beats, variant=None, topology=None,
+                                     allow_generic=True):
     """Compile a declared card outline without replacing it with generic construction stages.
 
     Every source row keeps its operation, text and stable one-based outline reference.  We only
     borrow deterministic structural fields from the legacy ladder.  An unusable source row is a
     hard failure because inventing its missing state would silently change the selected card.
+
+    allow_generic=False turns "there is no card outline to compile from" into a planning-stage
+    ComposeFailure instead of silently emitting deterministic_fallback_beat_ladder's placeholder
+    milestones ("stage N complete", "fastener marks, contact dust" — the exact hollow text a
+    2026-08-06 incident traced back to this fallback firing in production). Diagnostic runs may
+    still opt into the old permissive behaviour for side-by-side comparison.
     """
     outline = (parsed_brief or {}).get('beat_outline') or (parsed_brief or {}).get('outline') or []
     entries = [x for x in outline if isinstance(x, dict)]
     if not entries:
+        if not allow_generic:
+            raise ComposeFailure(
+                'Planning failed before prompt generation: no card outline is available to '
+                'compile a beat ladder from, and production mode forbids the generic '
+                '"stage N complete" fallback ladder that would otherwise replace it.',
+                'PLANNING_NO_OUTLINE',
+            )
         return deterministic_fallback_beat_ladder(parsed_brief, total_beats, variant, topology)
     if any(not str(x.get('op') or '').strip() or not str(x.get('text') or '').strip() for x in entries):
         raise ComposeFailure(
@@ -2196,6 +2230,10 @@ def deterministic_fallback_beat_ladder(parsed_brief, total_beats, variant=None, 
             'secondary_progress': 'the staged material stock drains from full to empty',
             'persistent_traces': ['fastener marks', 'contact dust'],
             'preserve_state': 'all earlier permanent work remains unchanged',
+            # 兜底梯子自己也得满足 milestone_ladder_violations 现在要求的物体生命周期
+            # 声明——它不认识任何具体物体，老实报空，而不是漏掉这个键让梯子自己不合规。
+            'introduced_objects': [],
+            'removed_objects': [],
         }
         if hard_cut:
             entry['hard_cut'] = True
@@ -8151,6 +8189,11 @@ Required JSON keys:
     _outline_refs_schema = ("""20. "outline_refs": (array of integers) The 1-based indices of the CARD WORK PLAN entries THIS beat delivers, per the BINDING CONTRACT stated with that plan. Every entry must be claimed by at least one beat; only the crossing beat and the final reward beat may leave this empty. The indices you claim must never run backwards as the ladder advances.
 21. "outline_delivery": (array of strings, same length and order as "outline_refs") Element k restates in English the physical work and terminal product of the card entry named by "outline_refs"[k], using the concrete nouns this beat's own "milestone_name"/"after_state" use. Required whenever "outline_refs" is non-empty. These strings are enforced against the composed IMAGE prompt downstream, so write the real words, never a placeholder."""
                             if _outline_plan else "")
+    # 物体生命周期声明：与上面两个可选 schema 不同,这两条对**每一拍**都是必填
+    # (哪怕是空数组)——它们是场景状态表(scene_state.py)校验"有没有东西提前出生/
+    # 已拆除又复活"的唯一数据来源,模型不填这个键,那道校验就无据可查。
+    _object_lifecycle_schema = """22. "introduced_objects": (array of strings, REQUIRED on every beat — use an empty array [] when this beat introduces no new object) Concrete, countable, named objects/fixtures/furniture pieces that first become visible by this beat's after_state (e.g. "cast-iron stove", "queen bed frame", "brass porthole window"). Do NOT list bulk surface materials (paint, drywall sheeting, flooring boards) here — only discrete objects a viewer could point at and count.
+23. "removed_objects": (array of strings, REQUIRED on every beat — use an empty array [] when nothing is removed) Objects named in an earlier beat's "introduced_objects" (or present in the original trauma/found state) that this beat permanently removes, demolishes, or hauls off-camera. Never name an object here that has not already appeared — an object cannot be removed before it was introduced."""
 
     if pacing_skeleton_id == 'dual_payoff':
         _pacing_plan_block = (
@@ -8267,8 +8310,10 @@ Each beat object in the JSON array must have:
 {_anchor_keywords_schema}
 {_anchor_transitions_schema}
 {_outline_refs_schema}
+{_object_lifecycle_schema}
 
 General Rules:
+- OBJECT LIFECYCLE RULE (mandatory): every beat declares "introduced_objects" and "removed_objects", even as empty arrays. An object cannot be removed in a beat before some earlier beat introduced it (or it was part of the original trauma/found state) — never invent an object's removal without its prior introduction, and never let an object you removed reappear later without a fresh, separate introduction.
 - PROJECT ORIGIN CONTRACT (mandatory): this project is "{project_origin_mode(parsed_brief)}". Keep that physical premise from IMAGE 1 through reward. existing_restoration starts with the named damaged asset already present; carrier_delivery_build starts with an empty receiving site and visibly delivers the whole shell; ground_up_build starts from ground and must show excavation, structural shell/arch assembly and end-wall/portal closure before interior fit-out. Never borrow the rusty pre-existing room of a restoration story for a ground-up build.
 - ENGINEERING SYSTEM CONTRACT (mandatory): the required visible systems are {', '.join(parsed_brief.get('engineering_requirements') or []) or 'none beyond the selected workflow'}. Give every listed system a legible installation/rough-in and test state before drywall, panel closure, finished flooring, practical-light activation or furnishing conceals it. Underground work must visibly resolve water through drainage plus waterproofing and enclosed habitable work must visibly resolve ventilation and a traceable power source/feed.
 - SURFACE-STATE MONOTONICITY (mandatory): track floor, walls, ceiling, entrance and utilities separately inside each registered space. Once a surface reaches a finished material, it cannot revert to raw substrate, framing, rough-in or a different finish material unless a dedicated on-camera removal/replacement beat explicitly earns that rollback. Switching to a registered second room changes the space queue, not the completed first room.
@@ -8305,6 +8350,15 @@ Space Type: {space_type}
     beat_ladder = None
     beat_ladder_accepted = False
     beat_user_current = beat_user
+    # 规划四轮全败又没有卡片工序可编译时,兜底梯子该不该退到"stage N complete"式的
+    # 通用施工序——生产模式不允许(那正是本该反映选中卡片的成片,却整段换成空洞占位
+    # 文本的根因);诊断模式保留旧的宽松行为,供对照排查。口径与 composers/base.py
+    # 的 allow_placeholders 完全一致,只是这里管的是规划期而不是逐拍生成期。
+    _diagnostic_mode = bool((config or {}).get('diagnostic_mode') or (config or {}).get('diagnosticMode'))
+    _strict_v2 = (config or {}).get('strictPromptPipelineV2', True) is not False
+    _allow_generic_fallback_ladder = (
+        (_diagnostic_mode and bool((config or {}).get('allowPlaceholderPrompts', False)))
+        or not _strict_v2)
     # 最后一版「结构完好、只欠卡片工序契约」的候选梯子。卡片工序清单升级为硬规则后，
     # 这类梯子不再被当场接受（见 blocking_violations），但重排全部耗尽时它仍然是最好的
     # 归宿——确定性兜底梯子跟用户挑的这张卡没有任何关系。
@@ -8638,7 +8692,8 @@ Space Type: {space_type}
                 fallback_total = max_total_beats if beat_count_mode == 'fixed' else min_total_beats
                 total_beats = fallback_total
                 beat_ladder = compile_outline_fallback_ladder(
-                    parsed_brief, fallback_total, _variant, _topology)
+                    parsed_brief, fallback_total, _variant, _topology,
+                    allow_generic=_allow_generic_fallback_ladder)
                 beat_ladder_accepted = True
                 if sys.stdout:
                     print('[DEBUG] using deterministic beat ladder after final generation error')
@@ -8664,7 +8719,8 @@ Space Type: {space_type}
     if not beat_ladder_accepted:
         fallback_total = max_total_beats if beat_count_mode == 'fixed' else min_total_beats
         beat_ladder = compile_outline_fallback_ladder(
-            parsed_brief, fallback_total, _variant, _topology)
+            parsed_brief, fallback_total, _variant, _topology,
+            allow_generic=_allow_generic_fallback_ladder)
         total_beats = len(beat_ladder)
         beat_ladder_accepted = True
         if sys.stdout:

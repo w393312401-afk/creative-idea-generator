@@ -488,9 +488,13 @@ class TestFingerprintCarriesTheProfile(unittest.TestCase):
         # 命中存档就一次 _chat 都不会有（见 test_same_profile_still_resumes）；
         # 这里 _chat 必须真的被调到，才说明 omni 走的是重排而不是续传。规划层现在有
         # 确定性降级路径，所以代理持续报错不再是本测试应期待的终态异常。
+        # DIMENSIONS 没有卡片 beat_outline，生产模式下"规划全败+无大纲"现在是硬失败
+        # （见 compile_outline_fallback_ladder 的 allow_generic 门禁）——这个测试关心
+        # 的是指纹/续传行为而不是这道新门禁，所以显式开诊断口子，保留旧的降级期望。
+        omni_config = {**OMNI_CONFIG, 'diagnosticMode': True, 'allowPlaceholderPrompts': True}
         chat = MagicMock(side_effect=RuntimeError('Phase 1 从头跑了'))
         with patch.object(pp, '_chat', chat):
-            state = pp.compose_anchor_and_packet(dict(OMNI_CONFIG), self.DIMENSIONS)
+            state = pp.compose_anchor_and_packet(omni_config, self.DIMENSIONS)
         self.assertTrue(chat.called, 'omni 必须重新跑 Phase 1，而不是命中 base 的存档')
         self.assertNotEqual(state['image_1_prompt'], 'base 语法的 IMAGE 1')
 

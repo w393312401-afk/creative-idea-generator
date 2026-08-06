@@ -157,7 +157,8 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
              'package_operations': ['clearing', 'demolition'], 'primary_progress': 'clear ground expands across the full approach',
              'secondary_progress': 'two debris crates fill from empty to full',
              'persistent_traces': ['rake grooves', 'crate drag marks'],
-             'preserve_state': 'the tower shell remains rusted and untouched'},
+             'preserve_state': 'the tower shell remains rusted and untouched',
+             'introduced_objects': [], 'removed_objects': []},
             {'index': 2, 'operation': 'framing', 'description': 'framing interior walls', 'bridge_stage': None, 'stage_scope': 'large',
              'milestone_name': 'all interior framing complete', 'before_state': 'the interior shell has no studs',
              'after_state': 'all declared wall and ceiling studs are installed',
@@ -166,7 +167,8 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
              'package_operations': ['framing', 'insulation'], 'primary_progress': 'stud count grows from zero to twelve',
              'secondary_progress': 'the staged timber bundle drains from twelve to zero',
              'persistent_traces': ['screw heads', 'sawdust bands'],
-             'preserve_state': 'the cleared floor and original shell remain unchanged'},
+             'preserve_state': 'the cleared floor and original shell remain unchanged',
+             'introduced_objects': [], 'removed_objects': []},
             {'index': 3, 'operation': 'reward', 'bridge_stage': None,
              'description': 'The cast-iron valve stove hangs suspended above the hearth as warm light fills the finished room.',
              'anchor_keywords': ['cast-iron valve stove']},
@@ -338,6 +340,7 @@ class TestOutlineContractBlocksTheLadder(unittest.TestCase):
                     'persistent_traces': ['screw heads', 'sawdust bands'],
                     'preserve_state': 'the original shell remains unchanged',
                     'stage_scope': 'large' if op != 'reward' else None,
+                    'introduced_objects': [], 'removed_objects': [],
                     'outline_refs': refs, 'outline_delivery': delivery}
             if op == 'reward':
                 beat['description'] = ('the occupant moves in and the stove lights the '

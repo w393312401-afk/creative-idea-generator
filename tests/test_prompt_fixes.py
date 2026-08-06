@@ -452,6 +452,24 @@ class TestPacketShapeNormalization(unittest.TestCase):
         self.assertEqual(ladder[0]["operation"], "clearing")
         self.assertEqual(ladder[0]["description"], "haul the debris out")
 
+    def test_normalize_beat_ladder_object_lifecycle_keys(self):
+        # 与 anchor_keywords 那组"缺失就补 []"的口径刻意相反：introduced_objects /
+        # removed_objects 缺失时**必须保持缺失**，milestone_ladder_violations 要靠这个
+        # 区分"没声明"（硬伤）和"声明了空数组"（合法）。只在键本来就存在时做形状归一化。
+        ladder = normalize_beat_ladder([
+            {"index": 1, "operation": "clearing", "description": "d1"},
+            {"index": 2, "operation": "framing", "description": "d2",
+             "introduced_objects": "single string form", "removed_objects": None},
+            {"index": 3, "operation": "drywall", "description": "d3",
+             "introduced_objects": ["cast-iron stove", "  ", 42]},
+        ])
+        self.assertNotIn("introduced_objects", ladder[0])
+        self.assertNotIn("removed_objects", ladder[0])
+        self.assertEqual(ladder[1]["introduced_objects"], ["single string form"])
+        self.assertEqual(ladder[1]["removed_objects"], [])
+        self.assertEqual(ladder[2]["introduced_objects"], ["cast-iron stove", "42"])
+        self.assertNotIn("removed_objects", ladder[2])
+
     def test_normalize_beat_ladder_anchor_keywords(self):
         # SIGNATURE ANCHOR RULE (2026-07-20): the reward beat's anchor_keywords must
         # survive normalization as a clean list of non-empty strings, defaulting to []

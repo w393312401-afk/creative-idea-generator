@@ -67,6 +67,19 @@ async function initServerMode() {
         if (typeof syncIdeationSkillProfilePicker === 'function') {
             syncIdeationSkillProfilePicker();
         }
+        // 服务代码已过期：这个进程仍在跑旧代码，磁盘上已经有更新的核心文件没生效——
+        // 常见于"改完代码就直接复跑同一个任务，忘了先重启服务"。不区分改动是否与
+        // 本次任务相关：宁可偶尔提示一次不必要的重启，也不要让"修复已经落盘但没生效"
+        // 悄悄发生而没人知道（见 server_common.code_staleness_report）。
+        if (m && m.runtime_version && m.runtime_version.stale) {
+            const rv = m.runtime_version;
+            const files = Array.isArray(rv.stale_files) ? rv.stale_files : [];
+            const preview = files.slice(0, 5).join('、') + (files.length > 5 ? ` 等 ${files.length} 个文件` : '');
+            showToast(
+                `⚠️ 服务代码已过期：${preview || '核心文件'}在本次服务启动后被修改过，`
+                + `当前进程仍在用旧代码运行。请重启后端服务后再生成，否则可能拿到"看似已修复、实际未生效"的结果。`,
+                'error', 15000);
+        }
         // 技能契约缺失只劣化生成质量、不影响接口可用性，过去仅写进启动日志——
         // 从浏览器用的人看不到那个终端，等于没有告知。这里提示一次。
         // 两个 profile（base / omni）都要查：只查当前激活的那个，等于把"另一个包

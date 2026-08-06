@@ -76,6 +76,8 @@ def prompt_delivery_block_reason(payload):
 
 def background_worker(task_id, config, dimensions):
     t = get_or_create_task(task_id, dimensions)
+    if isinstance(t.get('runtime_version'), dict):
+        t['runtime_version']['policy_version'] = MILESTONE_POLICY_VERSION
     start_time = time.time()
     # 本轮运行的身份令牌：重试复用 task_id 时 prepare_task_for_run 会换新
     # cancel_event。取消已被 /api/compose-cancel 立即终态化，旧线程可能还卡在
@@ -432,6 +434,8 @@ def auto_run_worker(task_id, config, dimensions):
     packet -> remaining beats -> remaining frames -> videos) as one background task,
     reusing the same ACTIVE_TASKS/SSE plumbing as the three manual stages."""
     t = get_or_create_task(task_id, dimensions)
+    if isinstance(t.get('runtime_version'), dict):
+        t['runtime_version']['policy_version'] = MILESTONE_POLICY_VERSION
     start_time = time.time()
     # 与 compose 走同一个键：get_or_create_task 已经通过 ensure_task_project_key
     # 把它写进 dimensions 了，这里直接取，不再各算各的
@@ -2552,6 +2556,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     "timings": task.get("timings") or {},
                     "last_client_poll_at": task.get("last_client_poll_at"),
                     "last_worker_progress_at": task.get("last_worker_progress_at"),
+                    "runtime_version": task.get("runtime_version"),
                 }
             self._send_json(res)
         elif path == '/api/mode':
@@ -2566,6 +2571,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             # 前端照这张表匹配即可——在前端硬编码一份 'omni' 判断，就是给同一件事
             # 留了第二个会漂移的真相源（服务端那份见 SKILL_PROFILE_VIDEO_MODEL_RULES）。
             _active = active_skill_profile()
+            # runtime_version：这个进程从哪个 git 状态/什么时候启动，磁盘上现在是否
+            # 已经有比它更新的核心代码。前端据此判断"眼前这次失败是不是代码已经修好、
+            # 只是服务还没重启"（见 server_common.runtime_version_report）。
+            _runtime_version = runtime_version_report()
+            _runtime_version['policy_version'] = MILESTONE_POLICY_VERSION
             self._send_json({
                 'server_managed': SERVER_MANAGED,
                 'needs_access_code': bool(ACCESS_CODE),
@@ -2574,6 +2584,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 'skill_profile_rules': [list(r) for r in SKILL_PROFILE_VIDEO_MODEL_RULES],
                 'skill_contract': skill_contract_report(_active),
                 'skill_contracts': skill_contract_reports(),
+                'runtime_version': _runtime_version,
             })
         elif path == '/api/image/task/status':
             if not self._gate():

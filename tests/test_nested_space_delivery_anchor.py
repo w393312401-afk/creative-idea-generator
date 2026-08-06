@@ -47,6 +47,8 @@ def _ladder_json(total=12, bridge_at=3, cut_at=7):
             'secondary_progress': 'the staged stock drains from full to empty',
             'persistent_traces': ['fastener marks', 'contact dust'],
             'preserve_state': 'all earlier permanent work remains unchanged',
+            'introduced_objects': [],
+            'removed_objects': [],
         }
         if bridge_at and i == bridge_at:
             beat.update(operation='threshold', bridge_stage=1)

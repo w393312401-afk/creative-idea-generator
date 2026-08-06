@@ -57,6 +57,18 @@ def build_scene_states(beat_ladder: list[dict[str, Any]]) -> list[dict[str, Any]
         before = deepcopy(permanent)
         introduced = [str(x) for x in (beat.get("introduced_objects") or []) if _text(x)]
         removed = [str(x) for x in (beat.get("removed_objects") or []) if _text(x)]
+        # 豁免范围必须与 milestone_ladder_violations 的规划环校验完全一致:那道校验
+        # 在 operation 属于 TRANSITIONS 或 bridge_stage/hard_cut 为真时整段跳过(它们
+        # 有自己的契约,不走"缺可见里程碑字段"这条),给模型的反馈回路只覆盖到这个范围。
+        # 这里是最终收口前不会再重排的硬闸——豁免更窄就会拒收一个模型从未被要求补全、
+        # 也没有机会补全的字段(尤其是 expand_spatial_transition_beats 展开出的运镜/
+        # reframe 拍,它们直接起手就没有这两个键)。空数组与"没声明"的区别才是本函数
+        # 存在的意义:后者会让下面的物体生命周期校验失去数据来源。
+        requires_declaration = (
+            operation not in TRANSITIONS
+            and not beat.get("bridge_stage")
+            and not beat.get("hard_cut")
+        )
         delta = {
             "milestone": _text(beat.get("milestone_name") or beat.get("description")),
             "terminal_state": _text(beat.get("after_state")),
@@ -80,6 +92,8 @@ def build_scene_states(beat_ladder: list[dict[str, Any]]) -> list[dict[str, Any]
             "preserve": [_text(beat.get("preserve_state"))] if _text(beat.get("preserve_state")) else [],
             "introduced_objects": introduced,
             "removed_objects": removed,
+            "introduced_declared": (not requires_declaration) or "introduced_objects" in beat,
+            "removed_declared": (not requires_declaration) or "removed_objects" in beat,
             "persistent_traces": [_text(x) for x in (beat.get("persistent_traces") or []) if _text(x)],
             "material_flow": deepcopy(beat.get("material_flow") or default_material_flow(operation)),
             "anchor_camera": {
@@ -115,6 +129,14 @@ def validate_scene_states(states: list[dict[str, Any]]) -> list[str]:
             errors.append(f"Beat {idx} is out of sequence; expected {expected}.")
         if state.get("before") != previous_after:
             errors.append(f"Beat {idx} before state does not equal the preceding validated after state.")
+        if not state.get("introduced_declared", True):
+            errors.append(
+                f"Beat {idx} does not declare introduced_objects (required even if empty; "
+                f"use [] when this beat introduces no new object).")
+        if not state.get("removed_declared", True):
+            errors.append(
+                f"Beat {idx} does not declare removed_objects (required even if empty; "
+                f"use [] when this beat removes nothing).")
         for name in state.get("removed_objects") or []:
             if name.lower() not in known:
                 errors.append(f"Beat {idx} removes undeclared object '{name}'.")

@@ -1002,6 +1002,92 @@ def stamp_manifest_capabilities(manifest, stage):
         manifest.pop('capability_degraded', None)
 
 
+# ============================================================================
+# 运行时版本指纹（Runtime Version Fingerprint）
+# ----------------------------------------------------------------------------
+# 2026-08-06 复盘：一次失败任务跑在 9:40 启动的旧进程上，而修复它的代码 14:28 才
+# 落盘——旧进程仍在内存里跑着没重启，用户看到的"失败"其实是"还没生效的修复"。
+# 这层只做一件事：把"这个进程现在跑的是不是磁盘上最新的代码"变成一个可读字段，
+# 而不是要靠人去猜"我是不是忘记重启了"。与上面 runtime_capability_report() 同一个
+# "悄悄劣化 → 清单上写着"的思路，只是这里劣化的是代码本身，不是依赖/契约。
+SERVICE_START_TIME = time.time()
+
+_CORE_SOURCE_GLOBS = (
+    'server.py', 'server_common.py', 'frame_generator.py', 'frame_continuity.py',
+    'pipeline_orchestrator.py', 'video_generator.py',
+    os.path.join('prompt_pipeline', '*.py'),
+    os.path.join('prompt_pipeline', 'composers', '*.py'),
+)
+
+
+def _git_head_info():
+    """服务启动那一刻的 git 提交与工作区脏状态，只在 import 时算一次——它回答的是
+    "这个进程当初从哪个代码状态启动"，不是"磁盘现在是什么状态"（那是下面
+    code_staleness_report() 按 mtime 比对的事）。非 git 环境/git 不在 PATH 时静默
+    返回全 None，不影响服务启动。"""
+    import subprocess
+    info = {'commit': None, 'commit_short': None, 'dirty': None}
+    try:
+        commit = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'], cwd=_PROJECT_ROOT, capture_output=True,
+            text=True, timeout=5, check=False).stdout.strip()
+        if commit:
+            info['commit'] = commit
+            info['commit_short'] = commit[:12]
+    except Exception:
+        pass
+    try:
+        status = subprocess.run(
+            ['git', 'status', '--porcelain'], cwd=_PROJECT_ROOT, capture_output=True,
+            text=True, timeout=5, check=False).stdout
+        info['dirty'] = bool(status.strip())
+    except Exception:
+        pass
+    return info
+
+
+_GIT_HEAD_INFO = _git_head_info()
+
+
+def _core_source_files():
+    import glob
+    files = []
+    for pattern in _CORE_SOURCE_GLOBS:
+        files.extend(glob.glob(os.path.join(_PROJECT_ROOT, pattern)))
+    return files
+
+
+def code_staleness_report():
+    """本次调用时刻，磁盘上是否存在比"服务启动时间"更晚修改过的核心源文件。
+
+    命中说明这个运行中的进程仍在跑旧代码——修复已经落盘，但没有生效，必须重启
+    才能带上它。每次调用都现读 mtime（不缓存）：这几个文件随时可能被编辑，缓存
+    只会让这个信号本身过期。"""
+    stale = []
+    for path in _core_source_files():
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if mtime > SERVICE_START_TIME:
+            stale.append(os.path.relpath(path, _PROJECT_ROOT).replace(os.sep, '/'))
+    return {'stale': bool(stale), 'stale_files': sorted(stale)}
+
+
+def runtime_version_report(config=None):
+    """任务记录 / `/api/mode` 共用的运行时指纹：这个进程是从哪个 git 状态、什么
+    时候启动的，以及磁盘上现在是否已经有比它更新的核心代码。"""
+    report = {
+        'git_commit': _GIT_HEAD_INFO.get('commit'),
+        'git_commit_short': _GIT_HEAD_INFO.get('commit_short'),
+        'git_dirty': _GIT_HEAD_INFO.get('dirty'),
+        'service_start_time': SERVICE_START_TIME,
+        'skill_profile': active_skill_profile(config),
+    }
+    report.update(code_staleness_report())
+    return report
+
+
 def get_fx_cancel_flag():
     from integrations.google_fx.utils import cancel_flag
     return cancel_flag
@@ -3050,6 +3136,7 @@ def save_task_to_disk(task_id, tasks_dir=None):
             'last_worker_progress_at': t.get('last_worker_progress_at'),
             'failure_code': t.get('failure_code'),
             'timings': t.get('timings') or {},
+            'runtime_version': t.get('runtime_version'),
             'format': 2,
         }
         events = list(t['events'])
@@ -3298,7 +3385,10 @@ def load_tasks_from_disk(tasks_dir=None):
                             "last_client_poll_at": t.get("last_client_poll_at"),
                             "last_worker_progress_at": t.get("last_worker_progress_at", t["last_active"]),
                             "failure_code": t.get("failure_code"),
-                            "timings": t.get("timings") or {"batch_durations": []}
+                            "timings": t.get("timings") or {"batch_durations": []},
+                            # 老记录没有这个字段——留 None 而不是伪造一份"当前进程"的
+                            # 指纹，那会让一条真正的旧任务看起来像是刚才这次启动生成的。
+                            "runtime_version": t.get("runtime_version"),
                         }
                         _TASK_FLUSHED_EVENTS[tid] = on_disk_events
                     except Exception as e:
@@ -3364,7 +3454,10 @@ def get_or_create_task(task_id, dimensions=None):
                 "last_client_poll_at": None,
                 "last_worker_progress_at": time.time(),
                 "failure_code": None,
-                "timings": {"batch_durations": []}
+                "timings": {"batch_durations": []},
+                # 这个任务由哪个进程/哪份代码创建——排查"结果为什么还是老样子"时，
+                # 先看这个是不是已经过期（stale=True），不用去猜有没有忘记重启。
+                "runtime_version": runtime_version_report(),
             }
             save_on_create = True
         else:
@@ -3408,7 +3501,8 @@ def prepare_task_for_run(task_id, dimensions=None):
                 "last_client_poll_at": None,
                 "last_worker_progress_at": time.time(),
                 "failure_code": None,
-                "timings": {"batch_durations": []}
+                "timings": {"batch_durations": []},
+                "runtime_version": runtime_version_report(),
             }
             ACTIVE_TASKS[task_id] = t
         else:
@@ -3422,6 +3516,9 @@ def prepare_task_for_run(task_id, dimensions=None):
             t["last_worker_progress_at"] = time.time()
             t["failure_code"] = None
             t["timings"] = {"batch_durations": []}
+            # 重跑复用旧记录时也刷新一份——重试很可能就是在"先重启服务"之后点的，
+            # 旧记录上的版本指纹不刷新，前端还是会照着上一次失败时的旧指纹判断。
+            t["runtime_version"] = runtime_version_report()
             if dimensions is not None:
                 t["dimensions"] = dimensions
     # 重跑会把 events 清空，落盘的 .jsonl 必须跟着整份重写而不是继续追加

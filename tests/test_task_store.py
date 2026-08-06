@@ -82,6 +82,7 @@ def test_save_splits_into_three_files():
     assert set(meta) == {
         'id', 'status', 'dimensions', 'error', 'last_active', 'format',
         'last_client_poll_at', 'last_worker_progress_at', 'failure_code', 'timings',
+        'runtime_version',
     }
     # 正文绝不能留在 meta 里——那正是单文件 523 KB 的来源
     assert 'events' not in meta and 'result' not in meta

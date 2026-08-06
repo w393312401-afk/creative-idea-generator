@@ -827,6 +827,8 @@ class TestPostCrossingCleanupLadderGate(unittest.TestCase):
                 'secondary_progress': 'the staged stock drains from full to empty',
                 'persistent_traces': ['fastener marks', 'contact dust'],
                 'preserve_state': 'all earlier permanent work remains unchanged',
+                'introduced_objects': [],
+                'removed_objects': [],
             }
         ladder = [_milestone(1, 'clearing'), _milestone(2, 'repair')]
         ladder.append({'index': 3, 'operation': 'threshold', 'bridge_stage': 1,

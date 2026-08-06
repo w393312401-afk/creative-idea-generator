@@ -57,6 +57,8 @@ def _milestone_beat(**overrides):
         'secondary_progress': 'the leaned timber bundle drains from eight pieces to none',
         'persistent_traces': ['sunk nail heads', 'pale sawdust bands'],
         'preserve_state': 'the five-course stone wall and doorway remain unchanged',
+        'introduced_objects': [],
+        'removed_objects': [],
     }
     beat.update(overrides)
     return beat
@@ -107,6 +109,20 @@ class TestVisibleMilestonePlanningGate(unittest.TestCase):
         beat = _milestone_beat(package_operations=['demolition', 'painting'])
         errors = pp.milestone_ladder_violations([beat])
         self.assertTrue(any('incompatible construction phases' in error for error in errors))
+
+    def test_missing_object_lifecycle_keys_are_a_hard_violation(self):
+        """空数组是合法答案（这一拍没有新增/拆除任何可数物体），但**完全不声明**这个键
+        不是——那等于场景状态表压根没有数据可校验（见 scene_state.py）。"""
+        beat = _milestone_beat()
+        del beat['introduced_objects']
+        del beat['removed_objects']
+        errors = pp.milestone_ladder_violations([beat])
+        self.assertTrue(any('introduced_objects' in e and 'removed_objects' in e for e in errors))
+        self.assertEqual(pp.hard_milestone_violations(errors), errors)
+
+    def test_declared_empty_object_lifecycle_lists_are_not_a_violation(self):
+        beat = _milestone_beat(introduced_objects=[], removed_objects=[])
+        self.assertEqual(pp.milestone_ladder_violations([beat]), [])
 
     # ── 材料层跨阶段判据只看「这一拍干了什么」（2026-08-01 run 1785597123956 修复）
     # before_state / description 按 schema 必然点名被覆盖的那一层，扫进去等于把
