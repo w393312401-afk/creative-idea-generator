@@ -295,12 +295,37 @@ def construction_shot_count(duration):
     return max(3, min(6, int(seconds // _MIN_SHOT_SECONDS)))
 
 
+def is_expanded_transition_stage_beat(beat):
+    """这一拍是不是 expand_spatial_transition_beats 展开出来的原子级过门/空间重置子拍。
+
+    2026-08-06：这类子拍每个只装得下一个镜头动作，不该被套任何镜头梯（既不该被要求
+    写出整套 traversal 3 镜，也不该落回 construction 默认梯）。ladder_kind 与
+    omni_video_violations 的调用方都要认这同一个信号，否则镜头梯选型改对了、违规检查
+    那边的默认兜底又会把同一个要求悄悄塞回来。
+
+    'camera_reframe' 排除在外：那是同一个展开函数为长内景每三拍插的纯运镜换角度拍
+    （operation == 'reframe'，不是过门），跟 prompt_pipeline.beat_is_crossing_clip
+    判定"是不是过门跨越镜头"时排除它是同一个理由。"""
+    return bool(isinstance(beat, dict)
+                and beat.get('transition_stage') not in (None, '', 'none', 'camera_reframe'))
+
+
 def ladder_kind(beat=None, is_threshold_or_reveal=None, is_crossing=False):
     """这一拍走哪套镜头梯：'construction' / 'traversal' / 'reward'。
 
-    返回 None 表示**拍型不明**（回炉通路里只拿到一段文本）。此时调用方只做与拍型无关的
-    清洗，不注入时间线——猜错等于给一段穿门镜头硬塞一张施工切点表。"""
+    返回 None 表示**拍型不明**（回炉通路里只拿到一段文本），或本拍不该套任何镜头梯。
+    此时调用方只做与拍型无关的清洗，不注入时间线——猜错等于给一段穿门镜头硬塞一张
+    施工切点表。
+
+    transition_stage 豁免：expand_spatial_transition_beats 会把规划期唯一的
+    bridge_stage=1 过门标记展开成 3~5 个原子级子拍（见 prompt_pipeline __init__.py），
+    每个子拍只装得下一个镜头动作。展开后的子拍仍带着 operation == 'threshold'，如果
+    照旧走 'traversal' 分支，就是要求每个子拍单独交付「逼近远景+门槛+落定」整套 3
+    镜——不可能完成，首稿必炸。只有还没被展开、仍是规划期原始标记的整段过门拍
+    （bridge_stage/hard_cut 但没有 transition_stage）才需要整套 traversal 镜头梯。"""
     if beat:
+        if is_expanded_transition_stage_beat(beat):
+            return None
         operation = str(beat.get('operation') or '').strip().lower()
         if operation == 'reward':
             return 'reward'
@@ -443,11 +468,26 @@ def _body_without_timeline(text):
     return re.sub(r'\s{2,}', ' ', _TIMELINE_RE.sub(' ', text or '')).strip()
 
 
+# 一个数字记号：可选小数部分 + 紧贴其后的字母（单位）。必须把单位一起吃进来再判断，
+# 不能靠 `\d+(?:\.\d+)?(?![A-Za-z])` 这种"后面不许跟字母"的否定预查——正则会回溯：
+# "14mm" 先试 "14"（后面是 m，预查失败），退成 "1"（后面是 4，不是字母，预查通过），
+# 于是照样报出一个根本不存在的残留数字 "1"。实测 35/35 条真实 IMAGE 提示词都因为
+# camera_dna 里的 "14mm"/"18mm" 被判违规（2026-08-06）。
+_NUMBER_TOKEN_RE = re.compile(r'(?<![A-Za-z0-9.])(\d+(?:\.\d+)*)([A-Za-z]*)')
+
+
+def _bare_numbers(probe):
+    """probe 里没有紧贴单位的阿拉伯数字。贴单位的（14mm / 1.6m）按 _digits_to_words
+    的口径豁免——它刻意不折这类写法，检查器必须放行同一批，否则修复器认定合规的文本
+    会被检查器原样打回，形成无解的回炉死循环。"""
+    return sorted({m.group(1) for m in _NUMBER_TOKEN_RE.finditer(probe or '') if not m.group(2)})
+
+
 def _stray_digits(text):
     """时间线句与 IMAGE 编号之外的阿拉伯数字（记号禁用的残留）。"""
     probe = _TIMELINE_RE.sub(' ', text or '')
     probe = re.sub(r'\bimage\s+\d+', ' ', probe, flags=re.IGNORECASE)
-    return sorted(set(re.findall(r'\d+(?:\.\d+)?', probe)))
+    return _bare_numbers(probe)
 
 
 # Grid 单元格里的那位数字（`Grid B2` 的 2）不算记号违规——omni 的记号禁用确实把 Grid
@@ -459,10 +499,12 @@ _GRID_CELL_RE = re.compile(r'\bgrid\s+[a-z]\d\b', re.IGNORECASE)
 
 
 def _stray_digits_image(text):
-    """IMAGE 正文里的阿拉伯数字，扣除 IMAGE 编号与 Grid 单元格。"""
+    """IMAGE 正文里的阿拉伯数字，扣除 IMAGE 编号、Grid 单元格与贴单位数字（14mm /
+    1.6m —— 与 _stray_digits 同理，_digits_to_words 刻意不碰这类写法，检查器必须
+    对齐同一条放行规则，否则 camera_dna 里正常的 "camera height 1.6m" 会被每拍打回）。"""
     probe = _GRID_CELL_RE.sub(' ', text or '')
     probe = re.sub(r'\bimage\s+\d+', ' ', probe, flags=re.IGNORECASE)
-    return sorted(set(re.findall(r'\d+(?:\.\d+)?', probe)))
+    return _bare_numbers(probe)
 
 
 def omni_image_violations(image_prompt):
@@ -481,18 +523,29 @@ def omni_image_violations(image_prompt):
     ]
 
 
-def omni_video_violations(video_prompt, ladder=None, duration=None):
+def omni_video_violations(video_prompt, ladder=None, duration=None, skip_shot_list=False):
     """VIDEO 正文对 omni 镜头语法的违规项。空列表 = 合规。
 
     ladder 缺省按满六镜施工梯判（模块级调用方与旧测试的口径）。duration 给了才查
     时间线——回炉通路拿不到拍型时不该凭空要求一张切点表。
-    节奏声明不在这里查：它由 _ensure_pacing 确定性注入，查了也只会是死代码。"""
-    ladder = ladder or _CONSTRUCTION_LADDERS[6]
-    errors = []
-    body = _body_without_timeline(video_prompt)
-    expected = ' / '.join(rung.label.split()[0] for rung in ladder)
+    节奏声明不在这里查：它由 _ensure_pacing 确定性注入，查了也只会是死代码。
 
-    missing = _missing_shot_rungs(body, ladder)
+    skip_shot_list（2026-08-06）：调用方已经用 is_expanded_transition_stage_beat 判定
+    这一拍是展开后的原子级过门/空间重置子拍、传了 ladder=None 时才该置 True——这类拍
+    根本不该套任何镜头梯。不加这个开关的话，下面 `ladder or _CONSTRUCTION_LADDERS[6]`
+    这行会在 ladder=None 时悄悄换成六镜施工梯，一样保证首稿必炸，只是换了个错误的
+    期望镜头梯而已。"""
+    if skip_shot_list:
+        missing = extras = []
+        ladder = ladder or _CONSTRUCTION_LADDERS[6]
+    else:
+        ladder = ladder or _CONSTRUCTION_LADDERS[6]
+        body = _body_without_timeline(video_prompt)
+        expected = ' / '.join(rung.label.split()[0] for rung in ladder)
+        missing = _missing_shot_rungs(body, ladder)
+        extras = _extra_shot_rungs(body, ladder)
+    errors = []
+
     if missing:
         errors.append(
             OMNI_VIDEO_ERROR_PREFIX
@@ -501,7 +554,6 @@ def omni_video_violations(video_prompt, ladder=None, duration=None):
             + f"。必须按 {expected} 的顺序写成 {len(ladder)} 个镜头，镜头之间用 clean cut / match cut 衔接"
         )
 
-    extras = _extra_shot_rungs(body, ladder)
     if extras:
         errors.append(
             OMNI_VIDEO_ERROR_PREFIX
@@ -740,7 +792,8 @@ single continuous take、one continuous take、single take、unbroken take 或�
         return (errs
                 + omni_video_violations(
                     video_prompt, ladder=ladder,
-                    duration=self.clip_duration() if ladder else None)
+                    duration=self.clip_duration() if ladder else None,
+                    skip_shot_list=is_expanded_transition_stage_beat(beat))
                 + omni_image_violations(image_prompt))
 
     def split_structural_video_errors(self, errs):
@@ -767,7 +820,8 @@ single continuous take、one continuous take、single take、unbroken take 或�
 
         residual = omni_video_violations(
             video_prompt, ladder=ladder,
-            duration=self.clip_duration() if ladder else None)
+            duration=self.clip_duration() if ladder else None,
+            skip_shot_list=is_expanded_transition_stage_beat(beat))
         if omni_errs or [e for e in residual if e.startswith(OMNI_VIDEO_ERROR_PREFIX)]:
             video_prompt, omni_reworked = self.rework_omni_multishot(
                 config, i, video_prompt, packet, beat=beat)
@@ -878,7 +932,8 @@ Rewrite rules (additive — do not lose content):
         # 节奏声明；beat 缺失时拍型不明，只做清洗，不硬塞一份可能违约的切点表。
         candidate = self.normalize_omni_video(candidate, beat=beat)
         residual = omni_video_violations(
-            candidate, ladder=ladder, duration=duration if beat else None)
+            candidate, ladder=ladder, duration=duration if beat else None,
+            skip_shot_list=is_expanded_transition_stage_beat(beat))
         if [e for e in residual if e.startswith(OMNI_VIDEO_ERROR_PREFIX)]:
             if sys.stdout:
                 print(f"[OMNI] Beat {i} 多镜头回炉稿复验未通过，保留原稿（仅留痕）")

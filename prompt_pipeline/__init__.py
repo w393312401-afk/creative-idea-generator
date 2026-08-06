@@ -2100,6 +2100,124 @@ def repair_incompatible_package_operations(beat_ladder):
     return repaired
 
 
+# 2026-08-06 复盘：compile_outline_fallback_ladder 把 milestone_name/operation/description
+# 换成卡片真实工序后，before_state/after_state/completion_extent/primary_progress/
+# secondary_progress/persistent_traces 仍原样留着 deterministic_fallback_beat_ladder 那份
+# 按 index 编的通用占位文本（"the main stage product grows from absent to complete" 之类，
+# 跟这一拍真正在做什么毫无关系）。check_milestone_video_prompt/check_milestone_image_prompt
+# 拿这些占位字段去跟模型写出的真实提示词做关键词命中——占位词和真实工序根本不相交，这道
+# 门禁因此变成不可能通过：Beat 2 连续 3 轮"定向回炉"都卡在同一组 MILESTONE 报错上，正是
+# 因为每次重写喂给模型的仍是同一份跟这拍无关的占位契约。按工序类型给出的模板至少让占位词
+# 和这一拍真正被要求描述的内容同源，门禁才有可能被写对的提示词满足。
+_FALLBACK_OP_MILESTONE_TEMPLATES = {
+    'clearing': {
+        'before_state': 'the zone is still choked with the original debris, collapsed material, and overgrowth',
+        'after_state': 'the entire zone is swept down to bare structural surface with every loose fragment and pile of debris hauled away',
+        'completion_extent': 'the full floor area and every corner of the cleared zone',
+        'primary_progress': 'the debris pile shrinks from a full heap blocking the space down to bare, swept ground',
+        'secondary_progress': 'the hauled-out spoil bags fill from empty to overflowing as the pile disappears',
+        'persistent_traces': ['scrape marks on the bare floor', 'a faint dust outline where debris once sat'],
+    },
+    'repair': {
+        'before_state': 'the structural surface is still cracked, sagging, or damaged and unrepaired',
+        'after_state': 'the entire structural surface is patched, reinforced, and solid across its full extent',
+        'completion_extent': 'every crack, gap, and weak section of the structural surface',
+        'primary_progress': 'the damaged structure grows from exposed and failing to fully patched and solid',
+        'secondary_progress': 'the stacked repair material shrinks from a full supply to a nearly empty pile',
+        'persistent_traces': ['fresh mortar seams', 'patch-edge tool marks'],
+    },
+    'rough-in': {
+        'before_state': 'the walls and floor are still solid with no wiring, plumbing, or conduit visible',
+        'after_state': 'the electrical conduit and plumbing lines are fully routed, embedded, and secured across the entire zone before any cover is added',
+        'completion_extent': 'every run of conduit and pipe across the full zone',
+        'primary_progress': 'the embedded conduit run grows from a single stub to a complete routed network',
+        'secondary_progress': 'the coiled cable and pipe stock shrinks from a full spool to nearly spent',
+        'persistent_traces': ['conduit clip marks on the framing', 'chalk routing lines on the surface'],
+    },
+    'framing': {
+        'before_state': 'the space is still open with no structural framing members in place',
+        'after_state': 'the full framing structure of studs, joists, or trusses stands complete and fastened across the entire span',
+        'completion_extent': 'every stud, joist, or truss across the full span',
+        'primary_progress': 'the framing skeleton grows from a single member to a complete fastened structure',
+        'secondary_progress': 'the stacked lumber supply shrinks from a full bundle to a few leftover pieces',
+        'persistent_traces': ['fastener heads along the framing', 'sawdust at the cut lines'],
+    },
+    'drywall': {
+        'before_state': 'the framing or insulation is still exposed with no panel covering it',
+        'after_state': 'the panels fully cover every framed surface across the entire wall or ceiling with seams taped and finished',
+        'completion_extent': 'every panel and seam across the full wall or ceiling',
+        'primary_progress': 'the panel coverage grows from a single sheet to the entire surface sealed',
+        'secondary_progress': 'the stacked panel stock shrinks from a full stack to the last few sheets',
+        'persistent_traces': ['taped seam lines', 'screw dimples across the surface'],
+    },
+    'flooring': {
+        'before_state': 'the subfloor is still bare with no finish surface laid',
+        'after_state': 'the finish flooring fully covers the entire floor area edge to edge with no bare subfloor left exposed',
+        'completion_extent': 'the entire floor area from wall to wall',
+        'primary_progress': 'the finished floor coverage grows from a single laid row to the whole room',
+        'secondary_progress': 'the stacked flooring material shrinks from a full pallet to the last few pieces',
+        'persistent_traces': ['seam lines between flooring units', 'trim scuffs along the edge'],
+    },
+    'painting': {
+        'before_state': 'the surface is still bare, primed, or showing the previous unfinished material',
+        'after_state': 'the entire surface is coated in even, fully dry finish paint with no bare patches remaining',
+        'completion_extent': 'every wall and surface across the entire zone',
+        'primary_progress': 'the painted coverage grows from a single brushed patch to the entire surface',
+        'secondary_progress': 'the paint supply in the open can shrinks from full to nearly empty',
+        'persistent_traces': ['faint roller texture on the surface', 'a thin paint line along the trim edge'],
+    },
+    'wiring': {
+        'before_state': 'the fixtures and outlets are still absent with only bare wiring points visible',
+        'after_state': 'the full fixture and outlet layout is installed, wired, and mounted across the entire zone',
+        'completion_extent': 'every fixture and outlet point across the full zone',
+        'primary_progress': 'the fixture installation grows from a single mounted unit to the complete layout',
+        'secondary_progress': 'the coiled fixture-wire supply shrinks from a full spool to a short remaining length',
+        'persistent_traces': ['mounting screw marks around each fixture', 'a coiled wire tail tucked at the housing'],
+    },
+    'lighting': {
+        'before_state': 'the ceiling or wall run is still dark with no light fixtures mounted',
+        'after_state': 'the light fixtures are fully mounted and wired along the entire run with every housing secured',
+        'completion_extent': 'every fixture along the full run',
+        'primary_progress': 'the mounted fixture count grows from a single unit to the complete run',
+        'secondary_progress': 'the boxed fixture stock shrinks from a full case to the last few units',
+        'persistent_traces': ['mounting bracket marks', 'a short coiled wire tail at each housing'],
+    },
+    'furnishing': {
+        'before_state': 'the room is still empty of furniture with only bare finished surfaces visible',
+        'after_state': 'the furniture and soft-goods are fully placed and arranged across the entire room',
+        'completion_extent': 'every piece of furniture across the full room',
+        'primary_progress': 'the furnished area grows from a single placed piece to the fully arranged room',
+        'secondary_progress': 'the stacked furniture crates shrink from a full delivery down to empty packaging',
+        'persistent_traces': ['floor protector marks under the furniture legs', 'crate-corner dents on the packaging left aside'],
+    },
+}
+_FALLBACK_OP_MILESTONE_DEFAULT = {
+    'before_state': 'the visible work for this stage has not yet started',
+    'after_state': 'the full visible work for this stage is completed across its entire declared extent',
+    'completion_extent': 'the entire named work zone or full declared component count',
+    'primary_progress': 'the main stage product grows from a bare start to a fully finished state',
+    'secondary_progress': 'the staged material stock shrinks from a full supply to a nearly spent pile',
+    'persistent_traces': ['fresh tool marks on the worked surface', 'material residue left at the work edge'],
+}
+
+
+def _fallback_preserve_state(prior_compiled):
+    """Cumulative, position-specific 'what stays unchanged' text for a compiled fallback beat.
+
+    2026-08-06 复盘：旧版对每一拍都写死同一句 'all earlier permanent work remains unchanged'。
+    写提示词的模型拿到的"要保留的状态"指令逐拍完全相同，自然把继承状态句写成逐字相同的
+    模板句（IMAGE 相似度检查判过 1.00，连续判了三轮）。改成点出前面几拍真正完成了什么，
+    模型才有具体、逐拍不同的内容可写。"""
+    if not prior_compiled:
+        return 'the site retains its established starting condition; nothing has been built yet'
+    names = [str(b.get('milestone_name') or '').strip() for b in prior_compiled[-2:]]
+    names = [n for n in names if n]
+    if not names:
+        return 'all earlier permanent work remains unchanged'
+    return ('the completed prior work — ' + '; '.join(names) + ' — remains fully unchanged in the '
+            'frame; all earlier permanent construction stays exactly as before')
+
+
 def compile_outline_fallback_ladder(parsed_brief, total_beats, variant=None, topology=None,
                                      allow_generic=True):
     """Compile a declared card outline without replacing it with generic construction stages.
@@ -2136,6 +2254,7 @@ def compile_outline_fallback_ladder(parsed_brief, total_beats, variant=None, top
     for pos, entry in enumerate(entries, 1):
         beat = dict(ladder[pos - 1])
         op, text = str(entry['op']).strip(), str(entry['text']).strip()
+        template = _FALLBACK_OP_MILESTONE_TEMPLATES.get(op, _FALLBACK_OP_MILESTONE_DEFAULT)
         beat.update({
             'index': pos,
             'operation': op,
@@ -2144,6 +2263,21 @@ def compile_outline_fallback_ladder(parsed_brief, total_beats, variant=None, top
             'outline_refs': list(entry.get('outline_refs') or [pos]),
             'package_operations': list(entry.get('package_operations') or beat.get('package_operations') or [op]),
         })
+        if op not in ('threshold', 'reward'):
+            beat.update({
+                'before_state': template['before_state'],
+                # 模板按工序取，同一道工序在一张卡里出现两次（两拍清理、两拍封板）
+                # 就会拿到**逐字相同**的 after_state，被 validate_frame_state_contract
+                # 的"重复终态"闸判死——那道闸没判错，错的是这里发出了两份一样的终态。
+                # 钉上这一拍自己认领的卡片工序，终态既唯一又真的指向本拍的产物。
+                # （_milestone_keywords 只取 ASCII 词，中文工序名不改变任何关键词门禁口径。）
+                'after_state': f"{template['after_state']}；本拍认领的卡片工序终产物：{text}",
+                'completion_extent': template['completion_extent'],
+                'primary_progress': template['primary_progress'],
+                'secondary_progress': template['secondary_progress'],
+                'persistent_traces': list(template['persistent_traces']),
+                'preserve_state': _fallback_preserve_state(compiled),
+            })
         compiled.append(beat)
     return compiled
 
@@ -5476,8 +5610,14 @@ def check_stylistic_repetition(curr_prompt, prev_prompt, packet, is_video=True):
     
     # Check for sentence-level exact/near-exact duplicates
     # Split by common sentence endings
-    curr_sentences = [s.strip() for s in re.split(r'[.!?]', curr_prompt) if len(s.strip()) > 20]
-    prev_sentences = [s.strip() for s in re.split(r'[.!?]', prev_prompt) if len(s.strip()) > 20]
+    # 只在"句末标点 + 空白"处断句。按裸 [.!?] 断会被小数点切碎：omni 的切点表
+    # "cut this at 1.5, a full shot from 1.9 to 3.2…" 会碎成 "5, a full shot from 1"
+    # 这类残片，而切点表是逐拍逐字相同的契约结构件，于是几乎每一拍都报一条
+    # "相似度 1.00"（2026-08-06 实测一单里 8/11 拍都是它），把真正的语义复读淹掉。
+    # 下面 is_mostly_boilerplate 的 "cut this"/"hold no other cuts" 白名单本来就是
+    # 按整句写的，断句修对了才真的生效。
+    curr_sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', curr_prompt) if len(s.strip()) > 20]
+    prev_sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', prev_prompt) if len(s.strip()) > 20]
     
     def is_mostly_boilerplate(sentence):
         sentence_low = sentence.lower()
@@ -5515,7 +5655,12 @@ def check_stylistic_repetition(curr_prompt, prev_prompt, packet, is_video=True):
                         "held in frame", "entryway", "door sill", "rear wall", "door frame", "ceiling beam",
                         "sustain continuous action", "enters the frame", "exits the frame", "leaves the frame",
                         "worker in a", "grid", "percent", "scale", "restored", "seconds", "empty",
-                        "walks out", "leaves the", "do not redesign", "camera remains", "coaxial", "interpolat"]
+                        "walks out", "leaves the", "do not redesign", "camera remains", "coaxial", "interpolat",
+                        # _PITCH_LOCK_CLAUSE / interior_camera_dna 原文用词（2026-08-06）：
+                        # 这句是契约要求逐拍原样复用的相机不变量，跟上面那批 DNA 关键词是
+                        # 同一类白名单，只是措辞（"pitch locked" / "vanishing axis"）跟现有
+                        # 词条都对不上，导致它被当成抄前一拍的重复内容打回重写。
+                        "pitch locked", "vanishing axis"]
         if any(dk in sentence_low for dk in dna_keywords):
             return True
         # 文字渲染政策句（固定尾句，契约要求逐字复用）
@@ -6985,12 +7130,18 @@ def check_milestone_image_prompt(image_prompt, beat):
             break
     if weak:
         errors.append(f'MILESTONE IMAGE regressed to weak/local progress wording: "{weak}".')
-    trace_hits = 0
-    for trace in beat.get('persistent_traces') or []:
-        if _field_has_keyword_overlap(image_prompt, trace):
-            trace_hits += 1
-    if trace_hits < 2:
-        errors.append('MILESTONE IMAGE must visibly name at least two declared persistent contact traces.')
+    # 门槛按**本拍实际声明了几条**取，不能无条件写死 2：只声明了 1 条（或 0 条）痕迹的
+    # 拍，无论重写多少轮都凑不出 2 个命中，这道门就成了死门——2026-08-06 实测一单卡在
+    # Beat 9 上连"整拍重试"都用同一句报错原地打转，最后整单 BEAT_GENERATION_FAILED。
+    # 报错也必须点名**哪几条**痕迹没写进去：只说"至少两条"，回炉的模型无从下手。
+    declared_traces = [t for t in (beat.get('persistent_traces') or []) if str(t).strip()]
+    missing_traces = [t for t in declared_traces if not _field_has_keyword_overlap(image_prompt, t)]
+    required_traces = min(2, len(declared_traces))
+    if len(declared_traces) - len(missing_traces) < required_traces:
+        errors.append(
+            f'MILESTONE IMAGE must visibly name at least {required_traces} declared persistent '
+            f'contact traces. These declared traces appear nowhere in the IMAGE text — name and '
+            f'place each of them in the scene: ' + '；'.join(str(t) for t in missing_traces) + '.')
     return errors
 
 
@@ -7398,7 +7549,11 @@ ENVELOPE_CROSS_VIEW_RULE = (
     "Unfinished never means still open. A viewpoint change — an exterior-to-interior crossing, a "
     "declared hard cut, or a reverse dolly back outside — resets the CAMERA, never the "
     "construction state; a later frame may only ever show the same element at the same stage or a "
-    "more advanced one."
+    "more advanced one. SHAPE, not just open/closed state, is also locked: the roofline's pitch "
+    "and silhouette and each doorway/archway's opening width-to-height ratio and curvature are "
+    "physical facts fixed at IMAGE 1 — a beat may finish, panel, patch, or re-clad that surface, "
+    "but never redraw it as a different roof style or a differently proportioned opening, whether "
+    "or not a crossing or hard cut sits between the two frames."
 )
 
 
@@ -8881,7 +9036,7 @@ You must output ONLY a valid JSON object matching the keys below, with no other 
 
 Required JSON keys:
 1. "camera_dna": A single camera sentence (~25-30 words) describing shot type, lens feel, camera height, perspective axis, and boundaries. Include horizon pinning (e.g., "horizon line remains perfectly level at exactly 50-percent height of the frame; all optical flow lines radiate symmetrically from the optical center of Grid B2").
-2. "geometry_lock": A description of structural facts that cannot change (doors, windows, columns, wall lines).
+2. "geometry_lock": A description of structural facts that cannot change (doors, windows, columns, wall lines, and — critically — the roofline/roof pitch silhouette and the exact opening shape/proportions of every door or archway as established in IMAGE 1; these two are easy to silently redraw between beats because no operation ever declares them as its target, so name their concrete shape here, e.g. "gabled roof holds its triangular ridge and pitch angle unchanged; the arched doorway keeps its current width-to-height ratio and curvature").
 3. "primary_landmarks": A list of exactly 3 landmarks (Foreground, Mid-depth, Background). Each landmark must be a JSON object with:
    - "name": The exact name (e.g. "cracked floor seam")
    - "grid": Grid coordinate (from Grid A1 to Grid C3)

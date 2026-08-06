@@ -112,3 +112,24 @@ class TestImageSideGate:
 
     def test_image_reference_numbers_do_not_trip_the_gate(self):
         assert omni.omni_image_violations('identical to IMAGE 2 in every respect') == []
+
+    @pytest.mark.parametrize('text', [
+        'ultra-wide 14mm lens feel, camera height 1.6m',
+        'a static tripod shot, wide-angle 18mm lens feel',
+        'shot at 1.6m with a 24mm lens',
+    ])
+    def test_measurements_glued_to_units_do_not_trip_the_gate(self, text):
+        """检查器必须和 _digits_to_words 放行同一批贴单位写法（14mm / 1.6m）。
+
+        2026-08-06：修复稿写成 `\\d+(?:\\.\\d+)?(?![A-Za-z])`，被正则回溯绕开——
+        "14mm" 先试 "14"（后面是 m，预查失败），退成 "1"（后面是 4，不是字母，预查
+        通过），照样报出一个不存在的残留数字 "1"。实测 35/35 条真实 IMAGE 提示词
+        都因为 camera_dna 里的镜头焦距被判违规，而确定性修复器根本不会去动它，
+        于是回炉永远修不好。
+        """
+        assert omni._stray_digits_image(text) == []
+        assert omni.omni_image_violations(text) == []
+
+    def test_real_digits_next_to_a_glued_measurement_are_still_flagged(self):
+        """放行贴单位写法不等于放行整句：同句里的裸计数必须照样报出来。"""
+        assert omni._stray_digits_image('a 14mm lens above 3 stacked crates') == ['3']

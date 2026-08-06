@@ -58,6 +58,37 @@ def test_state_contract_rejects_overpacked_and_regressing_beat():
     assert any("explicitly regresses" in error for error in errors)
 
 
+def test_state_contract_does_not_read_a_negated_mention_as_a_regression():
+    """"…with no bare subfloor left exposed" 是**完工**的说法，不是回退。
+
+    2026-08-06：回退判据只按字面找 bare/raw/absent，而兜底梯子的 flooring / painting
+    两档 after_state 恰好都带 "no bare …"；跟在任何一条含 complete/finished 的前序
+    状态后面就被判成"显式回退"，整单直接 QUALITY_GATE_FAILED，且这道闸在循环外，
+    没有任何回炉通路能救。
+    """
+    for after in (
+        "the finish flooring fully covers the entire floor area edge to edge with no bare "
+        "subfloor left exposed",
+        "the entire surface is coated in even, fully dry finish paint with no bare patches remaining",
+        "every framed surface is panelled with no seams left raw",
+    ):
+        ladder = [
+            _beat(1, "drywall", after="the panel run is completed and sealed across the span"),
+            _beat(2, "flooring", after=after),
+        ]
+        errors = validate_frame_state_contract(build_frame_state_contract(ladder))
+        assert not any("explicitly regresses" in error for error in errors), after
+
+
+def test_state_contract_still_rejects_a_positively_asserted_regression():
+    ladder = [
+        _beat(1, "drywall", after="the panel run is completed and sealed across the span"),
+        _beat(2, "flooring", after="that same completed wall is bare framing again"),
+    ]
+    errors = validate_frame_state_contract(build_frame_state_contract(ladder))
+    assert any("explicitly regresses" in error for error in errors)
+
+
 def test_state_contract_rejects_a_single_operation_beat():
     """下限 2：一道工序的拍不再合规。这条与 milestone_ladder_violations 和 ladder
     schema 第 13 条是同一口径——三处任意一处漂开，梯子就会通过规划验收后被这道

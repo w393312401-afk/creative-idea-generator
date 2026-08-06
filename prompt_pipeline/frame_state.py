@@ -14,6 +14,23 @@ from typing import Any
 
 TRANSITION_OPERATIONS = {"threshold", "reward", "reframe"}
 
+# "这个面又变回生料/裸露了" 的措辞。只认字面词是不够的：一句完工描述里出现这些词，
+# 十有八九是被否定掉的（"…with no bare subfloor left exposed"、"…with no bare patches
+# remaining"），那恰恰是**完工**的说法，不是回退。2026-08-06 实测：兜底梯子的
+# flooring / painting 两档 after_state 都带 "no bare …"，跟在任何一条含
+# complete/finished 的前序状态后面就被这道闸判成"显式回退"，整单直接 QUALITY_GATE_FAILED。
+_REGRESSION_WORDS = r"(?:absent|missing|removed|bare|raw|open again)"
+_NEGATED_REGRESSION_RE = re.compile(
+    rf"\b(?:no|not|never|without|zero|free of)\b(?:\W+\w+){{0,3}}?\W+{_REGRESSION_WORDS}\b",
+    re.IGNORECASE,
+)
+_REGRESSION_RE = re.compile(rf"\b{_REGRESSION_WORDS}\b", re.IGNORECASE)
+
+
+def _asserts_regression(after: str) -> bool:
+    """after_state 是否**正面主张**某个面回到了生料/缺失状态（否定式说法不算）。"""
+    return bool(_REGRESSION_RE.search(_NEGATED_REGRESSION_RE.sub(" ", after or "")))
+
 # Coarse construction phases.  These are deliberately conservative: equal ranks are
 # allowed, forward movement is allowed, and a lower rank is only allowed for an
 # explicit clearing/removal operation or a registered new space.
@@ -150,7 +167,7 @@ def validate_frame_state_contract(
 
         # Catch explicit wording of a completed surface becoming raw/absent again.  This
         # complements the operation-rank check without trying to understand all materials.
-        if previous_after and re.search(r"\b(?:absent|missing|removed|bare|raw|open again)\b", after):
+        if previous_after and _asserts_regression(after):
             if op not in {"clearing", "demolition", "repair"} and any(
                 word in previous_after for word in ("complete", "completed", "finished", "sealed", "installed")
             ):

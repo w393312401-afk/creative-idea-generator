@@ -297,8 +297,17 @@ def background_worker(task_id, config, dimensions):
         _declared = dimensions.get('beats_count') if isinstance(dimensions, dict) else None
         result['slot_counts'] = frame_slot_counts(len(videos), declared_beats_count=_declared)
         if result['slot_counts'].get('declared_matches_delivered') is False:
+            # beats_count/beat_count_mode 从来只约束施工拍；过门/穿越运镜由
+            # expand_spatial_transition_beats 按拓扑另外展开 3~5 个子拍，不占用这个
+            # 额度，adaptive 和 fixed 两态都一样。旧文案统一写"属正常自适应收缩/扩张"，
+            # fixed 模式下这么说不准确——差额本来就不是"收缩/扩张"，而是过门子拍展开
+            # 带来的（2026-08-06）。
+            _mode = (dimensions.get('beat_count_mode') if isinstance(dimensions, dict) else None) or 'adaptive'
+            _reason = ('施工拍已按 fixed 声明值交付，差额来自过门子拍展开，仅留痕'
+                      if str(_mode).lower() == 'fixed' else
+                      '属正常自适应收缩/扩张，仅留痕')
             log('INFO', 'COMPOSE',
-                f"交付拍数与卡片声明不一致（属正常自适应收缩/扩张，仅留痕）："
+                f"交付拍数与卡片声明不一致（{_reason}）："
                 f"beats_count={result['slot_counts'].get('declared_beats_count')} / "
                 f"施工拍={result['slot_counts']['construction_beats']} / "
                 f"帧={result['slot_counts']['image_slots']}")

@@ -1,6 +1,10 @@
 import pytest
 
 import prompt_pipeline as pp
+from prompt_pipeline.frame_state import (
+    build_frame_state_contract,
+    validate_frame_state_contract,
+)
 from prompt_pipeline.scene_state import (
     build_scene_states,
     classify_material_flow,
@@ -43,11 +47,35 @@ def test_scene_state_chain_is_monotonic_and_material_flow_is_compiled():
     assert {x["store"] for x in states[1]["material_flow"]} >= {"offsite_inventory", "installed_components"}
 
 
-def test_scene_state_rejects_removing_an_undeclared_object():
+def test_scene_state_allows_removing_an_original_trauma_object_without_prior_introduction():
+    """2026-08-06 修复：系统提示词承诺 removed_objects 可以是原始现场自带、从未被
+    introduced_objects 声明过的物体（翻新题材早期清理拍的常态）。校验器之前对此
+    无条件报错，跟提示词矛盾，导致真实合成 6/6 次全部倒在这道闸上。"""
     beat = _beat(1, "clearing")
-    beat["removed_objects"] = ["mystery cabinet"]
+    beat["removed_objects"] = ["original salvage debris"]
     errors = validate_scene_states(build_scene_states([beat]))
-    assert any("undeclared object" in error for error in errors)
+    assert not any("undeclared object" in error for error in errors)
+    assert not any("again without a fresh introduction" in error for error in errors)
+
+
+def test_scene_state_rejects_removing_the_same_object_twice_without_reintroduction():
+    beat1 = _beat(1, "clearing")
+    beat1["removed_objects"] = ["mystery cabinet"]
+    beat2 = _beat(2, "clearing")
+    beat2["removed_objects"] = ["mystery cabinet"]
+    errors = validate_scene_states(build_scene_states([beat1, beat2]))
+    assert any("again without a fresh introduction" in error for error in errors)
+
+
+def test_scene_state_allows_removal_after_a_fresh_reintroduction():
+    beat1 = _beat(1, "clearing")
+    beat1["removed_objects"] = ["salvage crate"]
+    beat2 = _beat(2, "furnishing")
+    beat2["introduced_objects"] = ["salvage crate"]
+    beat3 = _beat(3, "clearing")
+    beat3["removed_objects"] = ["salvage crate"]
+    errors = validate_scene_states(build_scene_states([beat1, beat2, beat3]))
+    assert not any("again without a fresh introduction" in error for error in errors)
 
 
 def test_outline_fallback_preserves_every_source_row_and_reference():
@@ -64,6 +92,30 @@ def test_outline_fallback_preserves_every_source_row_and_reference():
         ("framing", "frame the original alcove"),
     ]
     assert [x["outline_refs"] for x in ladder] == [[1], [2]]
+
+
+def test_outline_fallback_gives_every_beat_its_own_terminal_state():
+    """同一道工序在一张卡里出现两次，兜底梯子不能发出逐字相同的 after_state。
+
+    2026-08-06：状态字段按 operation 从模板取，两拍清理 / 两拍封板就拿到完全一样的
+    终态，被 validate_frame_state_contract 的"重复终态"闸判死。那道闸没判错——它读到
+    的确实是两个一模一样的终态；错的是这里发出了两份。
+    """
+    brief = {
+        "mode": "Standard",
+        "beat_outline": [
+            {"op": "clearing", "text": "清理石屋内积渣与残破废铁"},
+            {"op": "clearing", "text": "清运室外杂草与碎石堆"},
+            {"op": "drywall", "text": "钉装环保欧松板封闭内衬"},
+            {"op": "drywall", "text": "封装屋顶保温欧松板"},
+        ],
+    }
+    ladder = pp.compile_outline_fallback_ladder(brief, 4)
+    assert len({x["after_state"] for x in ladder}) == len(ladder)
+    for beat, entry in zip(ladder, brief["beat_outline"]):
+        assert entry["text"] in beat["after_state"]
+    errors = validate_frame_state_contract(build_frame_state_contract(ladder))
+    assert not any("repeats the preceding terminal state" in error for error in errors)
 
 
 def test_outline_fallback_without_a_card_outline_fails_planning_by_default():

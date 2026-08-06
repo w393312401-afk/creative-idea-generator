@@ -309,6 +309,40 @@ class TestMilestonePromptSkeleton(unittest.TestCase):
         bad = 'One small section begins to show a timber change while everything else remains.'
         self.assertTrue(pp.check_milestone_image_prompt(bad, beat))
 
+    def test_trace_requirement_never_exceeds_what_the_beat_declared(self):
+        """门槛按本拍**实际声明了几条**痕迹取，不能无条件写死 2。
+
+        2026-08-06：只声明 1 条（或 0 条）痕迹的拍，无论重写多少轮都凑不出 2 个命中，
+        这道硬门就成了死门——实测一单卡在 Beat 9 上连"整拍重试"都用同一句报错原地
+        打转，最后整单 BEAT_GENERATION_FAILED。
+        """
+        one_trace = _milestone_beat(persistent_traces=['sunk nail heads'])
+        good = (
+            'The scene is the eight-rafter roof skeleton complete anchor. All eight timber rafters '
+            'meet at the central roof hub across the full roof circle. The five-course stone wall '
+            'and doorway remain unchanged. Sunk nail heads remain visible.'
+        )
+        self.assertEqual(pp.check_milestone_image_prompt(good, one_trace), [])
+
+        no_traces = _milestone_beat(persistent_traces=[])
+        self.assertEqual(
+            [e for e in pp.check_milestone_image_prompt(good, no_traces)
+             if 'persistent contact traces' in e], [])
+
+    def test_missing_trace_error_names_the_traces_that_are_absent(self):
+        """回炉的模型必须知道**哪几条**痕迹没写进去；只说"至少两条"它无从下手。"""
+        beat = _milestone_beat()
+        partial = (
+            'The scene is the eight-rafter roof skeleton complete anchor. All eight timber rafters '
+            'meet at the central roof hub across the full roof circle. The five-course stone wall '
+            'and doorway remain unchanged. Sunk nail heads remain visible.'
+        )
+        errors = [e for e in pp.check_milestone_image_prompt(partial, beat)
+                  if 'persistent contact traces' in e]
+        self.assertTrue(errors)
+        self.assertIn('pale sawdust bands', errors[0])
+        self.assertNotIn('sunk nail heads', errors[0])
+
     def test_video_requires_both_progress_lines_and_material_path(self):
         beat = _milestone_beat()
         good = (

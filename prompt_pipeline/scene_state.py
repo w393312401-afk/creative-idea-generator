@@ -123,6 +123,15 @@ def validate_scene_states(states: list[dict[str, Any]]) -> list[str]:
     errors: list[str] = []
     previous_after: dict[str, Any] = {}
     known: set[str] = set()
+    # 2026-08-06 修复：系统提示词（__init__.py 的 object-lifecycle 字段说明与
+    # OBJECT LIFECYCLE RULE）明确许诺 removed_objects 可以是"原始现场/trauma 状态"
+    # 自带、从未被任何一拍 introduced_objects 声明过的物体——这类物体在翻新题材里
+    # 几乎每单都有（早期清理拍扫掉的残垣碎石、锈蚀五金）。这里原先无条件要求先声明
+    # 引入才能移除，跟提示词的承诺互相矛盾：模型照契约写、校验按另一套口径拒收，
+    # 实测自本闸上线以来 6/6 次真实合成全部倒在这条报错上。真正该拦的缺陷不是
+    # "移除一个没声明过的物体"（那多半就是合法的原始现场物），而是"同一个物体被
+    # 移除了两次、中间没有重新引入"——那才是状态账对不上的信号。
+    ever_removed: set[str] = set()
     for expected, state in enumerate(states or [], 1):
         idx = state.get("beat") or expected
         if idx != expected:
@@ -138,8 +147,12 @@ def validate_scene_states(states: list[dict[str, Any]]) -> list[str]:
                 f"Beat {idx} does not declare removed_objects (required even if empty; "
                 f"use [] when this beat removes nothing).")
         for name in state.get("removed_objects") or []:
-            if name.lower() not in known:
-                errors.append(f"Beat {idx} removes undeclared object '{name}'.")
+            key = name.lower()
+            if key in ever_removed and key not in known:
+                errors.append(
+                    f"Beat {idx} removes object '{name}' again without a fresh introduction "
+                    f"since it was last removed.")
+            ever_removed.add(key)
         for name in state.get("introduced_objects") or []:
             known.add(name.lower())
         for name in state.get("removed_objects") or []:

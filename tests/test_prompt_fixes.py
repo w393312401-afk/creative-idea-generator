@@ -406,6 +406,33 @@ class TestPacketShapeNormalization(unittest.TestCase):
         errors = check_stylistic_repetition(curr, prev, packet, is_video=True)
         self.assertIsInstance(errors, list)
 
+    def test_omni_cut_table_does_not_shatter_into_repeated_sentence_fragments(self):
+        """切点表是逐拍逐字相同的契约结构件，不能被当成"抄了上一拍"。
+
+        2026-08-06：句级去重按裸 [.!?] 断句，小数点把切点表切成 "5, a full shot from 1"
+        这类残片；残片当然逐拍相同，于是几乎每一拍都报一条"相似度 1.00"，把真正的
+        语义复读淹掉（实测一单 8/11 拍都是它）。is_mostly_boilerplate 里针对切点表的
+        白名单本来就是按整句写的，断句修对了才真的生效。
+        """
+        cut_table = (
+            'Cut this eight-second clip on these marks and hold no other cuts — an establishing '
+            'long shot from 0.0 to 1.5, a full shot from 1.5 to 2.9, a medium shot from 2.9 to '
+            '4.9, a close-up from 4.9 to 6.4, and a wide outro shot from 6.4 to 8.0 seconds.'
+        )
+        curr = cut_table + ' The worker lays grey stone tiles across the floor in pressing cycles.'
+        prev = cut_table + ' The worker hoists timber studs into place and drives nails home.'
+        errors = check_stylistic_repetition(curr, prev, {}, is_video=True)
+        self.assertEqual([e for e in errors if 'sentence is too similar' in e], [])
+
+    def test_genuinely_duplicated_sentences_are_still_caught(self):
+        # 句子里不能带 is_mostly_boilerplate 的环境/材料白名单词（tile、dust、seam…），
+        # 否则它会被正当地当成"逐拍应当保持一致"的内容而豁免掉。
+        repeated = 'The lone builder lifts each heavy granite slab onto the raised platform.'
+        curr = repeated + ' A hush settles over the alcove.'
+        prev = repeated + ' Rain taps against the shutters.'
+        errors = check_stylistic_repetition(curr, prev, {}, is_video=True)
+        self.assertTrue([e for e in errors if 'sentence is too similar' in e])
+
     def test_normalize_beat_ladder(self):
         ladder = [
             {"index": "1", "operation": "clearing", "description": {"text": "remove debris"}, "bridge_stage": None},

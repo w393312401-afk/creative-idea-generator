@@ -818,7 +818,16 @@ function initSliders() {
         const label = document.getElementById('beat-count-label');
         // adaptive 下滑块只是额度闸门（骨架由灵感卡片定义，滑块压不动它的下界）；
         // fixed 下它才真的定义拍数。两态文案必须分开，否则用户会把上限读成承诺。
-        if (label) label.textContent = adaptive ? '节拍上限 · 额度闸门 (Budget Cap)' : '固定施工节拍数 (Beat Count)';
+        // 无论哪一态，这个数字都只管施工拍——过门/穿越运镜由后端按拓扑展开成
+        // 3~5 个额外的子拍，不占用这里设置的额度（2026-08-06，之前 title 只在
+        // HTML 里写死了 adaptive 的说明，切到 fixed 也不会跟着换，文案和实际
+        // 交付的总拍数对不上）。
+        if (label) {
+            label.textContent = adaptive ? '节拍上限 · 额度闸门 (Budget Cap)' : '固定施工节拍数 (Beat Count)';
+            label.title = adaptive
+                ? '自适应模式下这是额度上限（最多生成多少施工拍），不是承诺的拍数；拍数下界由灵感卡片的工序清单决定。过门/穿越运镜另计，不占用这个额度。'
+                : '固定模式下这是施工拍的精确拍数。过门/穿越运镜由过门逻辑按入口/出口拓扑另外展开成 3~5 个子拍，不占用这里设置的施工拍数，所以最终交付的总拍数会比这个数字多。';
+        }
         updateConfigSummary();
     };
     if (beatCountMode) {
