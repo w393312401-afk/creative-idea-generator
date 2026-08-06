@@ -55,6 +55,14 @@ class ResponseTruncated(RuntimeError):
     写不下"被误报成基础设施故障、还触发整批降级重跑。"""
 
 
+class ComposeFailure(RuntimeError):
+    """Typed compose failure while preserving the existing public task status enum."""
+
+    def __init__(self, message, failure_code="COMPOSE_FAILED"):
+        super().__init__(message)
+        self.failure_code = failure_code
+
+
 def _reraise_if_cancelled(exc):
     """在"宽口径兜底"的 except Exception 里第一时间把取消放行出去。
 
@@ -83,7 +91,7 @@ WORKER_EXIT_TIME = 7.5
 # pre-rollout ladder full of local/incremental filler beats.
 # v2（2026-07-26）：过门后第一拍恒为 clearing 清理工序。存量断点里的 Threshold 节拍梯
 # 没有这一拍，续传会绕过新的结构校验产出旧形态整单——只能靠指纹换代逼它重排。
-MILESTONE_POLICY_VERSION = "visible-milestones-v7-frame-state-hard-gate"
+MILESTONE_POLICY_VERSION = "visible-milestones-v8-scene-state-batches"
 _MIN_ADAPTIVE_CONSTRUCTION_BEATS = 5
 _MILESTONE_TEXT_FIELDS = (
     'milestone_name', 'before_state', 'after_state', 'completion_extent',
@@ -1829,6 +1837,16 @@ _WEAK_MILESTONE_PHRASES = (
 _WEAK_MILESTONE_PREFIXES_ZH = (
     '开始', '继续', '逐步', '初步', '局部', '部分', '尝试', '推进', '持续', '进一步',
 )
+# 一个普通施工拍能申报几道工序。全库唯一口径，读它的有：
+#   - milestone_ladder_violations（规划验收）
+#   - repair_incompatible_package_operations（末轮修复的裁剪上限/下限）
+#   - deterministic_fallback_beat_ladder（兜底梯子自己也得合规）
+#   - ladder schema 第 13 条（给规划模型的措辞）
+#   - frame_state.validate_frame_state_contract（循环外硬闸，签名默认值同此）
+# 运镜拍（threshold/reward/bridge/hard_cut）不承载施工增量，上述各处一律跳过。
+_MIN_PACKAGE_OPERATIONS = 2
+_MAX_PACKAGE_OPERATIONS = 3
+
 _INCOMPATIBLE_PACKAGE_FAMILIES = (
     ({'clearing', 'demolition', 'excavation'}, {'priming', 'painting', 'furnishing', 'lighting'}),
     ({'rough-in', 'wiring', 'plumbing'}, {'drywall', 'paneling', 'painting', 'furnishing'}),
@@ -1951,8 +1969,13 @@ def milestone_ladder_violations(beat_ladder, mode='Standard'):
                 f'Beat {idx} changes only {grids or "an unspecified local area"} without a countable/full-coverage result; the delta will not read clearly at a glance.')
 
         package = [str(x).strip().lower().replace('_', '-') for x in (beat.get('package_operations') or [])]
-        if not 1 <= len(package) <= 3:
-            errors.append(f'Beat {idx} package_operations must contain one to three tightly related operations.')
+        # 2~3 道是全库统一口径（另见 ladder schema 第 13 条与 frame_state.
+        # validate_frame_state_contract 的 min/max_package_operations）。这三处
+        # 必须同时改：任何一处放宽都会让梯子通过规划验收后再被循环外硬闸判死。
+        if not _MIN_PACKAGE_OPERATIONS <= len(package) <= _MAX_PACKAGE_OPERATIONS:
+            errors.append(
+                f'Beat {idx} package_operations must contain '
+                f'{_MIN_PACKAGE_OPERATIONS} to {_MAX_PACKAGE_OPERATIONS} tightly related operations.')
         package_set = set(package)
         for early, late in _INCOMPATIBLE_PACKAGE_FAMILIES:
             if package_set & early and package_set & late:
@@ -2044,12 +2067,51 @@ def repair_incompatible_package_operations(beat_ladder):
             trial = set(candidate + [item])
             incompatible = any(trial & early and trial & late
                                for early, late in _INCOMPATIBLE_PACKAGE_FAMILIES)
-            if not incompatible and len(candidate) < 3:
+            if not incompatible and len(candidate) < _MAX_PACKAGE_OPERATIONS:
                 candidate.append(item)
+        # 裁到下限以下就别裁了：这拍本来就要因为「工序条数不合规」被报一次，把它从
+        # 「相位冲突」换成「只剩一道工序」既没修好什么，又丢掉了模型原本的申报内容。
+        # 这里不凭空补工序——补出来的那道不对应任何真实施工，下游提示词会照着写。
+        if len(candidate) < _MIN_PACKAGE_OPERATIONS:
+            continue
         if candidate and candidate != package:
             repaired.append((beat.get('index'), package, candidate))
             beat['package_operations'] = candidate
     return repaired
+
+
+def compile_outline_fallback_ladder(parsed_brief, total_beats, variant=None, topology=None):
+    """Compile a declared card outline without replacing it with generic construction stages.
+
+    Every source row keeps its operation, text and stable one-based outline reference.  We only
+    borrow deterministic structural fields from the legacy ladder.  An unusable source row is a
+    hard failure because inventing its missing state would silently change the selected card.
+    """
+    outline = (parsed_brief or {}).get('beat_outline') or (parsed_brief or {}).get('outline') or []
+    entries = [x for x in outline if isinstance(x, dict)]
+    if not entries:
+        return deterministic_fallback_beat_ladder(parsed_brief, total_beats, variant, topology)
+    if any(not str(x.get('op') or '').strip() or not str(x.get('text') or '').strip() for x in entries):
+        raise ComposeFailure(
+            'Declared beat outline cannot be compiled because an item is missing op or text.',
+            'OUTLINE_FALLBACK_INVALID',
+        )
+    ladder = deterministic_fallback_beat_ladder(
+        parsed_brief, max(int(total_beats or 0), len(entries)), variant, topology)
+    compiled = []
+    for pos, entry in enumerate(entries, 1):
+        beat = dict(ladder[pos - 1])
+        op, text = str(entry['op']).strip(), str(entry['text']).strip()
+        beat.update({
+            'index': pos,
+            'operation': op,
+            'description': text,
+            'milestone_name': text,
+            'outline_refs': list(entry.get('outline_refs') or [pos]),
+            'package_operations': list(entry.get('package_operations') or beat.get('package_operations') or [op]),
+        })
+        compiled.append(beat)
+    return compiled
 
 
 def deterministic_fallback_beat_ladder(parsed_brief, total_beats, variant=None, topology=None):
@@ -2078,6 +2140,18 @@ def deterministic_fallback_beat_ladder(parsed_brief, total_beats, variant=None, 
 
     phase_cycle = ('clearing', 'repair', 'rough-in', 'framing', 'drywall',
                    'flooring', 'painting', 'furnishing')
+    # 每个相位的伴随工序，用来把兜底梯子的 package_operations 补到下限 2 道。
+    # 挑选口径：与主工序同一材料层族（或干脆不属于任何族），因此
+    #   - 过得了 _INCOMPATIBLE_PACKAGE_FAMILIES；
+    #   - _forbidden_layer_pair 恒为空（族跨度 0 或 1，不落在 _FORBIDDEN_LAYER_PAIRS）；
+    #   - 不给 beat_delta_weight 平白加 _FAMILY_SPAN_WEIGHT。
+    # framing + insulation 是唯一一对跨族的（2->3），它正是 schema 第 13 条点名的
+    # 参考组合「joists + insulation batts」，(2,3) 也不在禁止对里。
+    phase_companion = {
+        'clearing': 'demolition', 'repair': 'placement', 'rough-in': 'wiring',
+        'framing': 'insulation', 'drywall': 'paneling', 'flooring': 'painting',
+        'painting': 'priming', 'furnishing': 'lighting',
+    }
     phase_cursor = 0
     ladder = []
     for idx in range(1, total_beats + 1):
@@ -2117,7 +2191,7 @@ def deterministic_fallback_beat_ladder(parsed_brief, total_beats, variant=None, 
             'after_state': f'the full visible work for stage {idx} is completed',
             'completion_extent': 'the entire named work zone or full declared component count',
             'changed_grid_cells': ['Grid B2', 'Grid C2'],
-            'package_operations': [op],
+            'package_operations': [op] + ([phase_companion[op]] if op in phase_companion else []),
             'primary_progress': 'the main stage product grows from absent to complete',
             'secondary_progress': 'the staged material stock drains from full to empty',
             'persistent_traces': ['fastener marks', 'contact dust'],
@@ -2339,6 +2413,123 @@ def ladder_delta_weights(beat_ladder):
     if not isinstance(beat_ladder, list):
         return []
     return [beat_delta_weight(b) for b in beat_ladder]
+
+
+_STABILITY_OCCLUSION_WORDS = (
+    'cover', 'hide', 'enclose', 'seal over', 'behind', 'conceal',
+    '覆盖', '遮挡', '封闭', '隐藏',
+)
+from .scene_state import build_scene_states, validate_scene_states, compile_video_skeleton
+_STABILITY_CAMERA_WORDS = ('reframe', 'push-in', 'push in', 'pan', 'turn', 'cross', '穿过', '转向')
+
+
+def beat_stability_risk(beat):
+    """Return an inspectable visual-complexity score for one planned beat.
+
+    This is intentionally independent from ``beat_delta_weight``: pacing weight answers how
+    much screen time a beat deserves, while stability risk answers whether one image/video
+    generation can preserve the scene while performing that change.
+    """
+    if not isinstance(beat, dict):
+        return 0.0
+    text = _beat_semantic_text(beat).lower()
+    score = 0.0
+    grids = list(dict.fromkeys(beat.get('changed_grid_cells') or []))
+    score += max(0, len(grids) - 1) * 0.8
+    package = [x for x in (beat.get('package_operations') or []) if str(x).strip()]
+    score += max(0, len(package) - 2) * 1.0
+    introduced = (beat.get('introduced_objects') or beat.get('new_objects')
+                  or beat.get('object_additions') or [])
+    if isinstance(introduced, str):
+        introduced = [x for x in re.split(r'[,;，；]', introduced) if x.strip()]
+    score += min(2.0, len(introduced) * 0.45) if isinstance(introduced, list) else 0.0
+    if any(word in text for word in _STABILITY_OCCLUSION_WORDS):
+        score += 1.0
+    if any(word in text for word in _STABILITY_CAMERA_WORDS):
+        score += 1.4
+    if beat.get('bridge_stage') or beat.get('hard_cut'):
+        score += 2.0
+    tools = beat.get('tools') or beat.get('tool_flow') or []
+    materials = beat.get('materials') or beat.get('material_flow') or []
+    for collection in (tools, materials):
+        if isinstance(collection, str):
+            collection = [x for x in re.split(r'[,;，；]', collection) if x.strip()]
+        if isinstance(collection, list):
+            score += min(0.8, max(0, len(collection) - 1) * 0.25)
+    return round(score, 2)
+
+
+def split_high_risk_beats(beat_ladder, threshold=3.4):
+    """Split deterministically splittable high-risk beats into two formal anchor beats.
+
+    Only ordinary beats with exactly three package operations are eligible.  Transition/reward
+    beats and beats without authoritative before/after/preserve state stay untouched.  The
+    middle operation overlaps both halves as the physical handoff, while terminal states never
+    repeat.  This keeps each half compatible with the existing 2–3 tightly-coupled-operation
+    contract without inventing a hidden frame or a fourth operation.
+    """
+    if not isinstance(beat_ladder, list):
+        return beat_ladder
+    expanded = []
+    for source in beat_ladder:
+        beat = dict(source) if isinstance(source, dict) else source
+        package = list(beat.get('package_operations') or []) if isinstance(beat, dict) else []
+        required = all(str(beat.get(k) or '').strip()
+                       for k in ('before_state', 'after_state', 'preserve_state', 'milestone_name')) \
+            if isinstance(beat, dict) else False
+        eligible = bool(
+            isinstance(beat, dict) and required and len(package) == 3
+            and not beat.get('bridge_stage') and not beat.get('hard_cut')
+            and str(beat.get('operation') or '').lower() not in ('threshold', 'reward', 'reframe')
+            and beat_stability_risk(beat) >= float(threshold)
+        )
+        if not eligible:
+            expanded.append(beat)
+            continue
+
+        original_after = str(beat.get('after_state'))
+        original_milestone = str(beat.get('milestone_name'))
+        handoff = (
+            f"stability checkpoint after {package[0]} and the first complete pass of {package[1]}; "
+            f"{package[2]} has not started"
+        )
+        traces = [x for x in (beat.get('persistent_traces') or []) if str(x).strip()]
+        if len(traces) < 2:
+            traces = traces + [f"visible contact evidence from {package[0]}",
+                               f"alignment evidence from {package[1]}"]
+        grids = list(dict.fromkeys(beat.get('changed_grid_cells') or []))
+        cut = max(1, (len(grids) + 1) // 2) if grids else 0
+
+        first = dict(beat)
+        first.update({
+            'package_operations': package[:2],
+            'milestone_name': f'{original_milestone} — controlled first half',
+            'after_state': handoff,
+            'completion_extent': handoff,
+            'changed_grid_cells': grids[:cut] if grids else grids,
+            'persistent_traces': traces[:2],
+            'stability_split': 'first',
+            'stability_risk': beat_stability_risk(beat),
+        })
+        second = dict(beat)
+        second.update({
+            'package_operations': package[1:],
+            'before_state': handoff,
+            'milestone_name': f'{original_milestone} — controlled completion',
+            'after_state': original_after,
+            'preserve_state': (f'{beat.get("preserve_state")}; preserve the completed first-half '
+                               'checkpoint unchanged'),
+            'changed_grid_cells': ((grids[cut:] or grids[-1:]) if grids else grids),
+            'persistent_traces': traces[-2:],
+            'stability_split': 'second',
+            'stability_risk': beat_stability_risk(beat),
+        })
+        expanded.extend((first, second))
+
+    for index, beat in enumerate(expanded, 1):
+        if isinstance(beat, dict):
+            beat['index'] = index
+    return normalize_beat_ladder(expanded)
 
 
 # 规则 R1（硬天花板）+ R2（相邻比值）的开关。两条都是低误判风险的局部判据，默认强制。
@@ -2657,14 +2848,13 @@ def clear_compose_checkpoint(fingerprint):
 
 
 def _checkpoint_is_failed_terminal(checkpoint, total_beats):
-    """A compose checkpoint whose saved fallback_count already exceeds the quality gate
-    (max(2, total_beats//3)) is a FAILED-terminal snapshot, not a resumable interruption:
+    """A compose checkpoint with any placeholder is a FAILED-terminal diagnostic snapshot:
     resuming it would mark the flagged beats 'done', skip regenerating them, and instantly
     re-trip the gate — turning every retry into a zero-work no-op ('出错任务重试不了'). Callers
     should discard its beat-level resume state and regenerate fresh instead."""
     if not isinstance(checkpoint, dict):
         return False
-    return int(checkpoint.get('fallback_count') or 0) > max(2, int(total_beats or 0) // 3)
+    return int(checkpoint.get('fallback_count') or 0) > 0
 
 
 def _checkpoint_encode_slots(d):
@@ -4924,6 +5114,14 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
     # lock/fix has run.  This keeps the camera and anchor clauses while removing prose
     # that competes with the single visual change the renderer must execute.
     image_prompt = compile_delta_image_prompt(image_prompt, beat, max_words=160)
+    if isinstance(config, dict) and isinstance(beat, dict):
+        beat_index = int(beat.get('index') or 0)
+        scene_state = next((x for x in (config.get('_scene_states') or [])
+                            if int(x.get('beat') or 0) == beat_index), None)
+        if scene_state:
+            # IMAGE and VIDEO now consume one authoritative before/delta/after record. The
+            # model remains responsible for action/material prose, never for scene facts.
+            video_prompt = f"{video_prompt.rstrip()} {compile_video_skeleton(scene_state)}"
 
     # 最后一道：记号 -> 散文。必须放在所有拼装/压缩/裁剪之后，因为上面每一个 fixer 都
     # 可能重新引入 Grid 或百分比（模板常量、锚点句、出入画子句、模型自由发挥都会）。
@@ -5614,31 +5812,41 @@ def check_shot_family_leakage(image_prompt, packet, family='exterior'):
 # 明确把它写在镜头身后/画面之外（合法的方向光光绳写法）。
 _DOOR_ELEMENT_PATTERN = re.compile(
     r'\b(door\s*-?\s*frame|door\s+leaf|door\s+jamb|doorway|door\s+opening|entry\s+opening|'
-    r'entrance\s+opening|threshold|sill)\b', re.IGNORECASE)
+    r'entrance\s+opening|archway|arch|portal|entrance|threshold|sill)\b', re.IGNORECASE)
 _DOOR_BEHIND_PATTERN = re.compile(
     r'\b(behind the camera|behind the viewer|behind and out of frame|out of frame|outside the frame|'
     r'fully behind|at the camera\'s back|from behind)\b', re.IGNORECASE)
 
 
 def check_interior_door_clearance(image_prompt, family='exterior'):
-    """Post-crossing interior IMAGE prompts must keep every entry element (door frame / leaf /
-    jamb / doorway / threshold / sill) out of frame: a sentence that mentions one without
-    placing it behind the camera / out of frame re-invites the 'interior seen through the
-    doorway' composition this whole protocol exists to kill."""
+    """Post-crossing interior IMAGE prompts must positively place the entrance behind camera.
+
+    Merely omitting doorway vocabulary is not evidence of a cleared threshold: it lets the image
+    model inherit a visible arch/portal from the previous i2i frame without contradicting the
+    prompt.  At least one sentence must therefore name the entrance and explicitly put it behind
+    the camera/out of frame; every other entrance mention must do the same.
+    """
     errors = []
     if family != 'interior' or not image_prompt:
         return errors
+    has_positive_clearance = False
     for raw in re.split(r'(?<=[.!?])\s+', image_prompt):
         m = _DOOR_ELEMENT_PATTERN.search(raw)
         if not m:
             continue
         if _DOOR_BEHIND_PATTERN.search(raw):
+            has_positive_clearance = True
             continue
         errors.append(
             f"Post-crossing interior IMAGE places entry element '{m.group(0)}' in frame — the door "
             f"frame/threshold/entry opening must be FULLY BEHIND the camera (interior surfaces fill "
             f"the frame edge to edge); write entry daylight as directional light from behind the "
             f"camera, never as a visible opening: '{raw.strip()[:80]}'"
+        )
+    if not has_positive_clearance:
+        errors.append(
+            "Post-crossing interior IMAGE must positively state that the entrance/archway/portal "
+            "is fully behind the camera and out of frame; silence does not prove door clearance."
         )
     return errors
 
@@ -7452,7 +7660,19 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
     errors.extend(check_primary_landmarks_exact_match(image_prompt, packet, family))
     errors.extend(check_anchor_scale_lock(image_prompt, packet, family))
     errors.extend(check_shot_family_leakage(image_prompt, packet, family))
-    errors.extend(check_interior_door_clearance(image_prompt, family))
+    # Adaptive partial-crossing stages intentionally retain the rim/sill as orientation
+    # evidence.  Door clearance becomes mandatory only on the establish settle-frame and
+    # ordinary interior beats after it; applying it to threshold_partial would make the two
+    # contracts mutually impossible.
+    _transition_stage = str((beat or {}).get('transition_stage') or 'none').strip().lower()
+    _is_adaptive_bridge = bool((beat or {}).get('bridge_stage')) and _transition_stage != 'none'
+    _requires_door_clearance = (
+        family == 'interior'
+        and (not _is_adaptive_bridge
+             or _transition_stage in ('interior_establish', 'secondary_establish'))
+    )
+    errors.extend(check_interior_door_clearance(
+        image_prompt, family if _requires_door_clearance else 'exterior'))
 
     errors.extend(check_nlvtr_violations(image_prompt))
     _wants_occupant = beat_requires_occupant(beat)
@@ -7917,6 +8137,10 @@ Required JSON keys:
     # 单里程碑包规则、自适应拍数下限)优先级永远更高,冲突时以硬规则为准、直接改写草案。
     _outline_plan, _outline_plan_block = build_outline_plan_block(
         dimensions.get('beat_outline'), max_total_beats)
+    if _outline_plan:
+        # Keep the authoritative card plan on the parsed brief so planning fallbacks and
+        # checkpoints can compile it without reaching back into the request object.
+        parsed_brief['beat_outline'] = [dict(x) for x in _outline_plan]
     # 卡片原始清单也挂到 config 上：合成收尾算交付总账时要拿它回答"这张卡本来有几条"。
     # 规划四轮全败退兜底时梯子上一个 outline_refs 都没有，只看梯子的话总账为空——
     # 而那恰恰是**整张卡的工序被通用施工序整体换掉**、最该报警的一单。
@@ -8035,7 +8259,7 @@ Each beat object in the JSON array must have:
 11. "completion_extent": The full named surface/region or explicit final count that makes the change instantly readable side by side.
 12. "changed_grid_cells": Array of one to three Grid A1-C3 cells containing the main visible change. A one-cell result is allowed only when it is a large/countable hero object. DELTA VISIBILITY BUDGET: under a locked static camera the frame's primary region is the centre cross (A2, B1, B2, B3, C2). A beat whose change lands only in corner cells reads as identical to the previous frame, because the area it must hold unchanged is larger than the area it changes — either merge that work into the neighbouring beat on the same material layer, or give the beat its own "camera_setup".
 12b. "camera_setup": (string, optional) Only when this beat's work genuinely sits at the frame's edge (ceiling/high wall, floor/low level) and cannot be moved into the centre cross — declare the alternative angle that puts it mid-frame, e.g. "low upward angle onto the ceiling ribs" or "high downward angle across the floor". Omit on every beat that works the centre cross.
-13. "package_operations": Array of one to three tightly related operations that all serve this ONE milestone in the SAME zone. A single operation is normal. A package is allowed for reference-case closeout groups such as roof panels + door + threshold path, or joists + insulation batts, when they share one terminal product. Never mix demolition/clearing with finish paint/furnishing, or hidden rough-in with the surface that conceals it.
+13. "package_operations": Array of two or three tightly related operations that all serve this ONE milestone in the SAME zone. Two is the normal size; three is allowed for reference-case closeout groups such as roof panels + door + threshold path, or joists + insulation batts, when they share one terminal product. Exactly one operation is NOT accepted: pair the primary operation with the adjacent operation that finishes the same terminal product (for example clearing + demolition, rough-in + wiring, framing + insulation batts, drywall + panelling, painting + priming, furnishing + lighting). Never mix demolition/clearing with finish paint/furnishing, or hidden rough-in with the surface that conceals it.
 14. "primary_progress": Natural-language first-to-last progress marker for the main product, using coverage or an explicit count.
 15. "secondary_progress": A second independently visible progress marker using stock depletion, container fill/drain, spoil growth, or a second tightly coupled component of the same milestone.
 16. "persistent_traces": Array of at least two contact traces that remain in the resulting IMAGE.
@@ -8324,8 +8548,16 @@ Space Type: {space_type}
                         _outline_forced_ladder = (list(beat_ladder), candidate_total,
                                                   list(outline_violations))
 
+                    # frame-state 契约挂在 rhythm 那一档（软），但循环外还有一道
+                    # **同规则的硬闸**（见 compose 末尾的 frame_state preflight）。
+                    # 少了下面这个 `and not blocking_violations`，第 3 轮起
+                    # retry_for_rhythm 恒为 False，一条只剩 frame-state 违规的梯子会从
+                    # 第一个分支被直接接受（accept_leniently 那半边根本走不到），出了
+                    # 循环再被硬闸判死——用户等满整轮规划只拿到一句 RuntimeError。
+                    # 软闸放行、硬闸击杀是自相矛盾的：strict 打开时它就该继续重排。
                     if (not structural_violations and not retry_for_rhythm
-                            and not outline_violations) or accept_leniently:
+                            and not outline_violations
+                            and not blocking_violations) or accept_leniently:
                         total_beats = candidate_total
                         beat_ladder_accepted = True
                         if structural_violations and sys.stdout:
@@ -8405,7 +8637,7 @@ Space Type: {space_type}
             if attempt == beat_ladder_max_attempts - 1:
                 fallback_total = max_total_beats if beat_count_mode == 'fixed' else min_total_beats
                 total_beats = fallback_total
-                beat_ladder = deterministic_fallback_beat_ladder(
+                beat_ladder = compile_outline_fallback_ladder(
                     parsed_brief, fallback_total, _variant, _topology)
                 beat_ladder_accepted = True
                 if sys.stdout:
@@ -8431,7 +8663,7 @@ Space Type: {space_type}
     # still not allowed to be a single point of failure, so replace that unusable draft.
     if not beat_ladder_accepted:
         fallback_total = max_total_beats if beat_count_mode == 'fixed' else min_total_beats
-        beat_ladder = deterministic_fallback_beat_ladder(
+        beat_ladder = compile_outline_fallback_ladder(
             parsed_brief, fallback_total, _variant, _topology)
         total_beats = len(beat_ladder)
         beat_ladder_accepted = True
@@ -8442,6 +8674,8 @@ Space Type: {space_type}
     # Transition slots are additive production beats.  Expanding only after the conceptual
     # construction ladder passes its count/order gates preserves every construction milestone.
     beat_ladder = expand_spatial_transition_beats(beat_ladder, parsed_brief)
+    if bool((config or {}).get('autoSplitHighRiskBeats')):
+        beat_ladder = split_high_risk_beats(beat_ladder)
     total_beats = len(beat_ladder)
     # The brief owns physical topology.  Do not let a ladder response silently omit the turn
     # required by a roof hatch or side entry; every downstream formatter keys off this marker.
@@ -8470,7 +8704,7 @@ Space Type: {space_type}
                 'after_state': (f'{_carrier_label} rests in its final seated position with all machinery '
                                 f'gone and delivery traces left in the ground'),
                 'completion_extent': 'the whole carrier, fully landed on its final footprint',
-                'package_operations': ['placement'],
+                'package_operations': ['placement', 'repair'],
                 'primary_progress': 'the carrier descends from suspended to fully seated',
                 'secondary_progress': 'the bare ground turns into a seated footprint ringed with spoil',
                 'persistent_traces': ['track ruts', 'spoil ridge', 'sling scuff marks'],
@@ -8482,13 +8716,18 @@ Space Type: {space_type}
     # was validated in the planning loop.
     frame_state_contract = build_frame_state_contract(beat_ladder)
     frame_state_errors = validate_frame_state_contract(frame_state_contract)
+    scene_states = build_scene_states(beat_ladder)
+    scene_state_errors = validate_scene_states(scene_states)
     if isinstance(config, dict):
         config['_frame_state_contract'] = frame_state_contract
         config['_frame_state_contract_errors'] = frame_state_errors
-    if frame_state_errors and strict_frame_state_contract_enabled(config):
-        raise RuntimeError(
-            'Frame-state preflight rejected the beat ladder before prompt generation: '
-            + ' | '.join(frame_state_errors)
+        config['_scene_states'] = scene_states
+        config['_scene_state_errors'] = scene_state_errors
+    if (frame_state_errors or scene_state_errors) and strict_frame_state_contract_enabled(config):
+        raise ComposeFailure(
+            'Structured scene-state preflight rejected the beat ladder before prompt generation: '
+            + ' | '.join(frame_state_errors + scene_state_errors),
+            'QUALITY_GATE_FAILED',
         )
 
     milestone_cache_basis = json.dumps(
@@ -9147,7 +9386,9 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
         if not is_bridge or _transition_stage in ('interior_establish', 'secondary_establish'):
             family_contract_lines.append(
                 "- Door clearance (mandatory): only after the landing/partial-first-look "
-                "stages, the entry may leave frame; interior walls, ceiling and floor then fill the frame.")
+                "stages, the entry MUST leave frame. IMAGE正文 must positively state that the entrance, "
+                "archway or portal is fully behind the camera and out of frame; interior walls, ceiling "
+                "and floor fill the frame edge to edge. Omitting the entrance is not sufficient evidence.")
         else:
             family_contract_lines.append(
                 "- Transition orientation evidence (mandatory): retain the declared hatch/door rim, sill, "
@@ -9295,6 +9536,11 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
                 "one old device only. Keep the far wall and full room volume occluded; no complete centered "
                 "one-point overview is allowed in this slot.")
         if _transition_stage in ('interior_establish', 'secondary_establish'):
+            family_contract_lines.append(
+                "- SETTLED INSIDE END-STATE (mandatory): the clip ends with the camera fully inside; "
+                "the crossed entrance/divider, its frame and threshold are completely behind the camera "
+                "and out of frame. The resulting IMAGE must say this positively and show only interior "
+                "surfaces edge to edge; never compose the room through an archway, portal or entrance.")
             family_contract_lines.append(
                 "- SCALE ANCHOR IN VIDEO ONLY: include one anonymous worker silhouette briefly at the "
                 "threshold/landing together with a standard door, rung/tread or known-size device. The "
@@ -13903,7 +14149,14 @@ Each object in the JSON array must have EXACTLY these keys:
             '本次激发没有产出任何新卡片：模型三次都没能返回可用结果，'
             '静态兜底选题也已全部被创意台账记为用过。请稍后重试；'
             '若反复出现，检查 LLM 代理是否可用，或在细调条里同时勾选「单线里程碑推进」骨架。')
-    return {'ideas': _attach_trend_ref_ids(prepared, trend_refs), 'trend_refs': trend_refs}
+    ideas = _attach_trend_ref_ids(prepared, trend_refs)
+    for idea in ideas:
+        idea['generation_source'] = 'static_fallback'
+        idea['degraded'] = True
+    return {
+        'ideas': ideas, 'trend_refs': trend_refs,
+        'generation_source': 'static_fallback', 'degraded': True,
+    }
 
 
 def check_adjacent_frame_semantics_batch(config, images):

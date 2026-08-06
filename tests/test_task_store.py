@@ -79,7 +79,10 @@ def test_save_splits_into_three_files():
 
     meta_path, events_path, result_path = _task_paths('t1')
     meta = json.load(open(meta_path, encoding='utf-8'))
-    assert set(meta) == {'id', 'status', 'dimensions', 'error', 'last_active', 'format'}
+    assert set(meta) == {
+        'id', 'status', 'dimensions', 'error', 'last_active', 'format',
+        'last_client_poll_at', 'last_worker_progress_at', 'failure_code', 'timings',
+    }
     # 正文绝不能留在 meta 里——那正是单文件 523 KB 的来源
     assert 'events' not in meta and 'result' not in meta
     assert len(_events_lines('t1')) == 2

@@ -40,6 +40,16 @@ from video_generator import plan_video_slots, merge_project_videos, PartialMerge
 from frame_generator import update_manifest_stale_status
 
 
+# 每个相位的同族伴随工序，用来把夹具梯子的 package_operations 补到下限 2 道
+# （prompt_pipeline._MIN_PACKAGE_OPERATIONS）。与 deterministic_fallback_beat_ladder
+# 里的 phase_companion 同源；同族配对不会额外触发相位冲突/材料层跨越判据。
+_COMPANION = {
+    'clearing': 'demolition', 'repair': 'placement', 'rough-in': 'wiring',
+    'framing': 'insulation', 'drywall': 'paneling', 'flooring': 'painting',
+    'painting': 'priming', 'furnishing': 'lighting',
+}
+
+
 def _ladder_coaxial(n=8, t=4):
     """Coaxial variant: the entire crossing is ONE beat (bridge_stage=1) at index t."""
     ladder = []
@@ -304,9 +314,37 @@ class TestDoorClearanceCheck(unittest.TestCase):
             'the door frame is fully behind the camera and out of frame.', family='interior')
         self.assertEqual(errs, [])
 
+    def test_silence_is_not_positive_clearance_evidence(self):
+        errs = check_interior_door_clearance(
+            'Interior stone walls, ceiling and floor fill the frame edge to edge.',
+            family='interior')
+        self.assertTrue(any('positively state' in err for err in errs))
+
+    def test_archway_portal_and_entrance_are_covered(self):
+        for label in ('arch', 'archway', 'portal', 'entrance'):
+            with self.subTest(label=label):
+                errs = check_interior_door_clearance(
+                    f'The {label} frames the room from the foreground.', family='interior')
+                self.assertTrue(errs)
+
     def test_exterior_exempt(self):
         p = 'The open doorway sits in Grid B2 with the sill line crossing the lower third.'
         self.assertEqual(check_interior_door_clearance(p, family='exterior'), [])
+
+    def test_partial_transition_is_exempt_but_establish_is_not(self):
+        common = dict(
+            i=3, video_prompt='',
+            image_prompt=('Camera pitch locked level; the archway rim and sill remain visible '
+                          'around the partial first look.'),
+            packet={}, mode='Standard', is_last=False,
+            is_threshold_or_reveal=True, family='interior')
+        partial = validate_beat_prompts(
+            **common, beat={'bridge_stage': 2, 'transition_stage': 'threshold_partial'})
+        self.assertFalse(any('Post-crossing interior IMAGE' in err for err in partial))
+
+        establish = validate_beat_prompts(
+            **common, beat={'bridge_stage': 3, 'transition_stage': 'interior_establish'})
+        self.assertTrue(any('Post-crossing interior IMAGE' in err for err in establish))
 
 
 class TestTurnVideoProcessCheck(unittest.TestCase):
@@ -783,7 +821,8 @@ class TestPostCrossingCleanupLadderGate(unittest.TestCase):
                 'after_state': f'the entire stage {idx} surface is complete',
                 'completion_extent': 'the entire named zone',
                 'changed_grid_cells': ['Grid B2', 'Grid C2'],
-                'package_operations': [op],
+                # 普通施工拍要申报 2~3 道紧密工序；同族伴随工序不触发相位冲突判据。
+                'package_operations': [op, _COMPANION[op]] if op in _COMPANION else [op],
                 'primary_progress': 'coverage grows from zero to the full zone',
                 'secondary_progress': 'the staged stock drains from full to empty',
                 'persistent_traces': ['fastener marks', 'contact dust'],

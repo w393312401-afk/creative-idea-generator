@@ -167,6 +167,17 @@ class TestPlanVideoSlots(_TmpDirCase):
                                   gate_level='off')
         self.assertEqual([p['action'] for p in plans], ['generate'] * 3)
 
+    def test_frame_continuity_failed_blocks_both_adjacent_videos(self):
+        frames = self._make_frames(4)
+        quality = {3: 'frame_continuity_failed'}
+        plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                 gate_level='standard')
+        self.assertEqual([p['action'] for p in plans], ['generate', 'blocked', 'blocked'])
+        self.assertIn('场景连续性检查失败', plans[1]['reason'])
+        off_plans = plan_video_slots(self.VIDEOS, frames, quality, self.videos_dir,
+                                     gate_level='off')
+        self.assertEqual([p['action'] for p in off_plans], ['generate', 'blocked', 'blocked'])
+
     def test_override_flagged_bypasses_sequence_review_block(self):
         """2026-07-23：前端"确认风险，强制生成"必须真正让后端放行——此前 UI 弹窗确认
         了也没用，plan_video_slots 仍按 quality_gate 硬拦，等于白问用户一遍。"""

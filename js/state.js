@@ -36,6 +36,20 @@ const DEFAULT_CONFIG = {
     videoDuration: '10',
     imageAspectRatio: '9:16',
     imageQuality: '2K',
+    // 本地生成期连续性门：只对高置信度几何漂移自动重试/阻断，语义问题仍由整套审查处理。
+    frameContinuityMode: 'balanced',
+    frameContinuityMaxRetries: 1,
+    frameContinuityLocalEdit: 'off',
+    // 高风险拍自动拆分先作为可控发布项；服务端启用后会在提示词交付前增加正式锚点拍。
+    autoSplitHighRiskBeats: false,
+    strictPromptPipelineV2: true,
+    composeBatchSize: 3,
+    composeRequestTimeoutSeconds: 120,
+    composeBatchRetryCount: 1,
+    composeNoProgressTimeoutSeconds: 180,
+    composeTaskSoftTimeoutSeconds: 480,
+    composeTaskHardTimeoutSeconds: 720,
+    allowPlaceholderPrompts: false,
     // 激发参考网址（可选）: 换行/逗号分隔,最多取 5 个;后端抓取正文→aux 模型压成
     // 中文要点注入激发 prompt,与联网搜索趋势通道叠加,6 小时缓存
     ideationTrendUrls: '',

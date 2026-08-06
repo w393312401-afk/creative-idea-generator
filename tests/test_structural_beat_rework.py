@@ -50,7 +50,9 @@ def _milestone_beat(**overrides):
         'after_state': 'all eight timber rafters meet at the central roof hub',
         'completion_extent': 'all eight rafters across the full roof circle',
         'changed_grid_cells': ['Grid A2', 'Grid B2'],
-        'package_operations': ['framing'],
+        # 一个普通施工拍申报 2~3 道紧密工序（_MIN/_MAX_PACKAGE_OPERATIONS）。
+        # framing + insulation 正是 schema 第 13 条点名的参考组合。
+        'package_operations': ['framing', 'insulation'],
         'primary_progress': 'the radial skeleton grows from zero to all eight rafters',
         'secondary_progress': 'the leaned timber bundle drains from eight pieces to none',
         'persistent_traces': ['sunk nail heads', 'pale sawdust bands'],
@@ -86,7 +88,7 @@ class TestVisibleMilestonePlanningGate(unittest.TestCase):
             after_state='the steel bulkhead doorway is framed and sealed',
             completion_extent='doorway framing finished from sill to lintel',
             changed_grid_cells=['B2'],
-            package_operations=['framing'],
+            package_operations=['framing', 'insulation'],
         )
         self.assertEqual(pp.milestone_ladder_violations([beat]), [])
 

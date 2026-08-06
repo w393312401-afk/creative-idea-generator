@@ -195,6 +195,15 @@ Instructions:
         _checkpoint = pp.load_compose_checkpoint(brief_fingerprint) or {}
         pass_beats_done = set(int(x) for x in (_checkpoint.get('pass_beats_done') or []))
         fallback_count = int(_checkpoint.get('fallback_count') or 0)
+        slot_states = dict(_checkpoint.get('slot_states') or {})
+        for i in range(1, total_beats + 1):
+            slot_states[str(i)] = 'validated' if i in pass_beats_done else 'pending'
+        diagnostic_mode = bool(config.get('diagnostic_mode') or config.get('diagnosticMode'))
+        strict_v2 = config.get('strictPromptPipelineV2', True) is not False
+        allow_placeholders = (
+            diagnostic_mode and bool(config.get('allowPlaceholderPrompts', False))) or not strict_v2
+        if isinstance(config, dict):
+            config['_compose_slot_states'] = slot_states
 
         # 自愈:若存档里的 fallback_count 已超过质量门禁上限,这份 checkpoint 是一次「合成失败」的终态
         # (而非可续的中断)——继续按它续传只会把那几拍当"已完成"跳过、fallback_count 一进门禁就再挂,
@@ -220,6 +229,7 @@ Instructions:
                 'compiled_videos': pp._checkpoint_encode_slots(compiled_videos),
                 'pass_beats_done': sorted(pass_beats_done),
                 'fallback_count': fallback_count,
+                'slot_states': dict(slot_states),
             })
 
         # 落盘一次起点(Phase 1 的产出，或已被上游 gate/refine 过的版本):即便第一拍就崩，
@@ -254,10 +264,16 @@ Instructions:
             img_prompt = ""
             new_ledger_items = None
 
-            for attempt in range(3):
+            for attempt in range(max(0, int(config.get('composeBatchRetryCount', 1))) + 1):
+                request_started = pp.time.time()
                 try:
                     pp._raise_if_cancelled(on_progress)
                     resp = pp._chat(config, beat_system, beat_user, temperature=0.8, timeout=90)
+                    config.setdefault('_compose_request_timings', []).append({
+                        'kind': 'single', 'beat': i, 'attempt': attempt + 1,
+                        'started_at': request_started, 'ended_at': pp.time.time(),
+                        'failure_reason': None,
+                    })
                     secs = pp._extract_marked(resp, ['===VIDEO===', '===IMAGE===', '===TRACES==='])
                     v_p = secs.get('===VIDEO===', '').strip()
                     i_p = secs.get('===IMAGE===', '').strip()
@@ -414,7 +430,9 @@ Instructions:
                         pp.check_milestone_video_prompt(v_p, beat) + pp.check_milestone_image_prompt(i_p, beat))
                     # 终帧倒退是整条序列最贵的失败，和里程碑硬门同级：重试整拍而不是留痕
                     payoff_blocking = pp.payoff_blocking_residual(residual, is_last)
-                    if remaining_milestone_errors or payoff_blocking:
+                    hard_gate_errors = list(dict.fromkeys(
+                        remaining_milestone_errors + payoff_blocking + list(residual or [])))
+                    if hard_gate_errors:
                         if sys.stdout:
                             print(f"[DIRECT] Beat {i} 硬门仍未通过，重试整拍: "
                                   f"{remaining_milestone_errors + payoff_blocking}")
@@ -443,11 +461,23 @@ Instructions:
                         f"shipping placeholder output. Fix the bug rather than retrying."
                     ) from e
                 except Exception as e:
+                    config.setdefault('_compose_request_timings', []).append({
+                        'kind': 'single', 'beat': i, 'attempt': attempt + 1,
+                        'started_at': request_started, 'ended_at': pp.time.time(),
+                        'failure_reason': str(e),
+                    })
                     if sys.stdout:
                         print(f"[DEBUG] Beat {i} attempt {attempt+1} error: {e}")
 
             beat_succeeded = bool(vid_prompt and img_prompt)
             if not beat_succeeded:
+                slot_states[str(i)] = 'failed'
+                _save_checkpoint()
+                if not allow_placeholders:
+                    raise pp.ComposeFailure(
+                        f"Beat {i} failed prompt generation; validated checkpoint retained. "
+                        "Production mode forbids placeholder IMAGE/VIDEO prompts.",
+                        'BEAT_GENERATION_FAILED')
                 fallback_count += 1
                 desc = beat.get('description', 'performing restoration work').strip().rstrip('.')
 
@@ -518,21 +548,80 @@ Instructions:
         batch_secs = {}
         tbcp_ref = ''
         if beats_to_generate:
-            if any(contracts[i]['is_bridge'] or contracts[i]['is_cut'] for i in beats_to_generate):
+            # Keep model context bounded. Beats omitted from this first rolling window follow
+            # the existing per-beat path below and are checkpointed independently.
+            batch_size = max(1, int(config.get('composeBatchSize', 3)))
+            batch_beats = beats_to_generate[:batch_size]
+            if any(contracts[i]['is_bridge'] or contracts[i]['is_cut'] for i in batch_beats):
                 tbcp_ref = pp.load_reference_file('threshold-bridge-consistency-protocol.md',
                                                   _profile)
             batch_system = self.batch_system_prompt(config, packet, scup_ref, tbcp_ref)
-            first_anchor_image = compiled_images.get(beats_to_generate[0], '')
-            batch_user = pp._build_batch_user_message(beats_to_generate, contracts, first_anchor_image)
+            first_anchor_image = compiled_images.get(batch_beats[0], '')
+            batch_user = pp._build_batch_user_message(batch_beats, contracts, first_anchor_image)
             markers = []
-            for i in beats_to_generate:
+            for i in batch_beats:
                 markers += [f'===BEAT {i} VIDEO===', f'===BEAT {i} IMAGE===', f'===BEAT {i} TRACES===']
 
             if on_progress:
-                on_progress('batch_generating', {'total': total_beats, 'count': len(beats_to_generate)})
+                on_progress('batch_generating', {
+                    'batch_index': 1, 'batch_total': max(1, (len(beats_to_generate) + batch_size - 1) // batch_size),
+                    'beat_start': batch_beats[0], 'beat_end': batch_beats[-1],
+                    'attempt': 1, 'attempt_total': 2,
+                    'elapsed_seconds': 0,
+                    'deadline_remaining_seconds': int(config.get('composeRequestTimeoutSeconds', 120)),
+                })
             if sys.stdout:
                 print(f"[DEBUG] Step 5: Batch-composing {len(beats_to_generate)} beat(s) of {total_beats} in one call: {beats_to_generate}...")
             pp._raise_if_cancelled(on_progress)
+            def _request_batch():
+                retry_count = max(0, int(config.get('composeBatchRetryCount', 1)))
+                timeout_seconds = int(config.get('composeRequestTimeoutSeconds', 120))
+                last_error = None
+                for attempt in range(retry_count + 1):
+                    started = pp.time.time()
+                    try:
+                        pp._raise_if_cancelled(on_progress)
+                        response = pp._chat(
+                            config, batch_system, batch_user, temperature=0.8,
+                            timeout=timeout_seconds)
+                        config.setdefault('_compose_request_timings', []).append({
+                            'kind': 'batch', 'beats': list(batch_beats), 'attempt': attempt + 1,
+                            'started_at': started, 'ended_at': pp.time.time(),
+                            'failure_reason': None,
+                        })
+                        if on_progress:
+                            on_progress('batch_generated', {
+                                'batch_index': 1,
+                                'batch_total': max(1, (len(beats_to_generate) + batch_size - 1) // batch_size),
+                                'beat_start': batch_beats[0], 'beat_end': batch_beats[-1],
+                                'attempt': attempt + 1, 'attempt_total': retry_count + 1,
+                                'elapsed_seconds': round(pp.time.time() - started, 2),
+                                'deadline_remaining_seconds': max(
+                                    0, round(timeout_seconds - (pp.time.time() - started), 2)),
+                            })
+                        return response
+                    except pp.GenerationCancelled:
+                        raise
+                    except (NameError, AttributeError, TypeError, ImportError, KeyError, IndexError):
+                        raise
+                    except Exception as exc:
+                        last_error = exc
+                        config.setdefault('_compose_request_timings', []).append({
+                            'kind': 'batch', 'beats': list(batch_beats), 'attempt': attempt + 1,
+                            'started_at': started, 'ended_at': pp.time.time(),
+                            'failure_reason': str(exc),
+                        })
+                        if on_progress:
+                            on_progress('batch_retry' if attempt < retry_count else 'batch_failed', {
+                                'batch_index': 1,
+                                'batch_total': max(1, (len(beats_to_generate) + batch_size - 1) // batch_size),
+                                'beat_start': batch_beats[0], 'beat_end': batch_beats[-1],
+                                'attempt': attempt + 1, 'attempt_total': retry_count + 1,
+                                'elapsed_seconds': round(pp.time.time() - started, 2),
+                                'deadline_remaining_seconds': 0,
+                                'failure_reason': str(exc),
+                            })
+                raise last_error
             # Same fail-fast-on-code-bugs philosophy as the single-beat retry loop: a
             # NameError/AttributeError/etc from this call (including inside _chat itself)
             # means real code is broken, not that the LLM/proxy hiccuped — abort rather than
@@ -541,8 +630,7 @@ Instructions:
             # errors, malformed API responses) IS treated as a transient/flaky-proxy issue
             # and falls back to per-beat retry below, exactly what that path exists for.
             try:
-                resp = pp._chat(config, batch_system, batch_user, temperature=0.8,
-                                timeout=max(90, 30 * len(beats_to_generate)))
+                resp = _request_batch()
                 batch_secs = pp._extract_marked(resp, markers)
             except pp.GenerationCancelled:
                 raise
@@ -732,7 +820,9 @@ Instructions:
                 payoff_blocking = pp.payoff_blocking_residual(residual, contract['is_last'])
                 if style_errs and sys.stdout:
                     print(f"[DIRECT] Batch beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {style_errs}")
-                if not remaining_milestone_errors and not payoff_blocking:
+                hard_gate_errors = list(dict.fromkeys(
+                    remaining_milestone_errors + payoff_blocking + list(residual or [])))
+                if not hard_gate_errors:
                     if residual and sys.stdout:
                         print(f"[DIRECT] Batch beat {i} 回读校验仍有残留（回炉未真正生效）: {residual}")
                     pp.record_beat_audit(config, i, structural, style_errs, reworked, image_reworked,
@@ -785,16 +875,24 @@ Instructions:
             # 断点续传:只把真正成功生成(非占位符兜底)的拍标记为已完成——兜底拍在续传时
             # 仍需重新真实生成，否则一次 LLM 抖动就会把某一拍永久锁死成占位符文本。
             if beat_succeeded:
+                slot_states[str(i)] = 'validated'
                 pass_beats_done.add(i)
+            else:
+                slot_states[str(i)] = 'degraded'
             _save_checkpoint()
 
         # Quality gate
-        fallback_limit = max(2, total_beats // 3)
+        fallback_limit = 0 if strict_v2 and not diagnostic_mode else total_beats
         if fallback_count > fallback_limit:
-            raise RuntimeError(
+            raise pp.ComposeFailure(
                 f"{fallback_count} of {total_beats} beats fell back to placeholder prompts "
-                f"(limit {fallback_limit}); output quality too low to ship. See server.log for per-beat errors."
+                f"(limit {fallback_limit}); diagnostic output cannot be shipped.",
+                'PLACEHOLDER_PROMPTS_PRESENT',
             )
+        if isinstance(config, dict):
+            config['_compose_degraded'] = bool(fallback_count)
+            config['_compose_placeholder_count'] = fallback_count
+            config['_compose_diagnostic'] = diagnostic_mode
 
         # 收尾步骤：追加一条"英雄展示视频"提示词（视频 total_beats+1 [HERO]），
         # 唯一来源锚点是帧序列最后一张整体完工图。锦上添花，不设硬门禁——失败/跳过

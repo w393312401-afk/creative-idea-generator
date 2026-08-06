@@ -498,11 +498,15 @@ def rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=None):
 # /'manual_flagged'（人工主动描述了这一帧的问题，见
 # pipeline_orchestrator.set_manual_frame_issue）。三者一律不再烧昂贵的视频生成额度，
 # 除非用户显式 override_flagged 确认风险。
-_FLAGGED_QUALITY_GATES = ('vlm_qa_failed', 'sequence_review_flagged', 'manual_flagged')
+_FLAGGED_QUALITY_GATES = (
+    'vlm_qa_failed', 'sequence_review_flagged', 'manual_flagged',
+    'frame_continuity_failed',
+)
 
 _FLAGGED_GATE_LABELS = {
     'vlm_qa_failed': '未通过质检',
     'sequence_review_flagged': '未通过一致性审查',
+    'frame_continuity_failed': '生成期场景连续性检查失败',
     'manual_flagged': '被人工标记存在问题',
 }
 
@@ -749,9 +753,13 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                 f"视频 {slot} 的起始帧 IMAGE {start_slot} 或结束帧 IMAGE {slot + 1} 属于降级帧（i2i fallback degraded），"
                 f"已拦截该段视频生成以防止画面跳变。请重新生成并修复受损帧。"
             )
-        elif not override_flagged and gate_level != 'off' and (
+        elif not override_flagged and (
             slot_to_quality.get(start_slot) in _FLAGGED_QUALITY_GATES
             or slot_to_quality.get(slot + 1) in _FLAGGED_QUALITY_GATES
+        ) and (
+            gate_level != 'off'
+            or slot_to_quality.get(start_slot) == 'frame_continuity_failed'
+            or slot_to_quality.get(slot + 1) == 'frame_continuity_failed'
         ):
             # 已知坏帧不再烧昂贵的视频生成额度，见 _FLAGGED_QUALITY_GATES。
             _bad = start_slot if slot_to_quality.get(start_slot) in _FLAGGED_QUALITY_GATES else slot + 1
@@ -760,7 +768,9 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
             plan['reason'] = (
                 f"视频 {slot} 的锚点帧 IMAGE {_bad} {_FLAGGED_GATE_LABELS.get(_bad_gate, '未通过一致性审查')}"
                 f"（{_bad_gate}），已拦截该段视频生成。"
-                f"请重渲或修复该帧（或将质检档位调为 off 放行）后重试。"
+                + ("请重渲或修复该帧后重试。"
+                   if _bad_gate == 'frame_continuity_failed'
+                   else "请重渲或修复该帧（或将质检档位调为 off 放行）后重试。")
             )
         elif not override_flagged and stale_slots and gate_level != 'off' \
                 and (start_slot in stale_slots or (slot + 1) in stale_slots):

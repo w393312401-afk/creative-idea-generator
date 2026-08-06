@@ -5,6 +5,15 @@ from prompt_pipeline.frame_state import (
 )
 
 
+# 每个相位的同族伴随工序：一个普通施工拍要申报 2~3 道紧密工序，同族配对不会额外
+# 触发相位冲突判据。与 deterministic_fallback_beat_ladder 里的 phase_companion 同源。
+_COMPANION = {
+    "clearing": "demolition", "repair": "placement", "rough-in": "wiring",
+    "framing": "insulation", "drywall": "paneling", "flooring": "painting",
+    "painting": "priming", "furnishing": "lighting",
+}
+
+
 def _beat(index, operation, *, package=None, after=None, space="primary"):
     return {
         "index": index,
@@ -16,7 +25,7 @@ def _beat(index, operation, *, package=None, after=None, space="primary"):
         "completion_extent": "the full visible work zone",
         "preserve_state": "all earlier completed features remain unchanged",
         "changed_grid_cells": ["B2", "C2"],
-        "package_operations": package or [operation],
+        "package_operations": package or [operation, _COMPANION[operation]],
         "persistent_traces": ["fastener heads", "tool contact marks"],
     }
 
@@ -40,13 +49,22 @@ def test_state_contract_rejects_overpacked_and_regressing_beat():
         _beat(
             2,
             "framing",
-            package=["framing", "insulation", "drywall"],
+            package=["framing", "insulation", "drywall", "flooring"],
             after="the same completed wall is raw and open again",
         ),
     ]
     errors = validate_frame_state_contract(build_frame_state_contract(ladder))
-    assert any("only one primary operation or two tightly coupled" in error for error in errors)
+    assert any("2 to 3 tightly coupled operations" in error for error in errors)
     assert any("explicitly regresses" in error for error in errors)
+
+
+def test_state_contract_rejects_a_single_operation_beat():
+    """下限 2：一道工序的拍不再合规。这条与 milestone_ladder_violations 和 ladder
+    schema 第 13 条是同一口径——三处任意一处漂开，梯子就会通过规划验收后被这道
+    循环外硬闸判死，用户等满整轮规划只拿到一句 RuntimeError。"""
+    ladder = [_beat(1, "framing", package=["framing"])]
+    errors = validate_frame_state_contract(build_frame_state_contract(ladder))
+    assert any("declares 1 operations" in error for error in errors)
 
 
 def _crossing(index, stage, *, before, after):

@@ -41,4 +41,13 @@ p = progressFromEvents(frameEvents, 'frames', 'running');
 assert.strictEqual(p.percent, 50);
 assert.match(p.label, /图片生成/);
 
+p = progressFromEvents([
+  ['start', { total: 2 }],
+  ['frame_start', { slot: 2, sequence: 2 }],
+  ['frame_continuity_check', { slot: 2, sequence: 2 }],
+  ['frame_continuity_retry', { slot: 2, sequence: 2, attempt: 1 }]
+], 'frames', 'running');
+assert.strictEqual(p.status, 'retrying');
+assert.match(p.label, /发现漂移/);
+
 console.log('progress_model tests passed');

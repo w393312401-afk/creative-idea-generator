@@ -47,8 +47,11 @@ class TestBeatDeltaWeight(unittest.TestCase):
         repairs = pp.repair_incompatible_package_operations(ladder)
 
         self.assertEqual(ladder[0]['package_operations'], ['furnishing', 'lighting'])
-        self.assertEqual(ladder[1]['package_operations'], ['rough-in'])
-        self.assertEqual(len(repairs), 2)
+        # 裁到下限（2 道）以下就不裁：rough-in 与 drywall 不相容，删掉 drywall 只是把
+        # 「相位冲突」换成「只剩一道工序」——同样要被 milestone/frame-state 闸报一次，
+        # 却白丢了模型的申报内容。凭空补一道工序更不行，下游提示词会照着它写。
+        self.assertEqual(ladder[1]['package_operations'], ['rough-in', 'drywall'])
+        self.assertEqual(len(repairs), 1)
 
     def test_camera_beats_have_no_weight(self):
         """运镜拍返回 None 而不是 0：它们有专属契约、不承载施工增量，参与统计只会

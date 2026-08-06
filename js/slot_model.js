@@ -43,6 +43,19 @@ function slotSwappedFrom(entry, key) {
 
 const FRAME_BADGE_DEFS = [
     {
+        id: 'continuity-failed', text: '连续性失败', cls: 'vlm-failed-badge',
+        test: f => f.quality_gate === 'frame_continuity_failed',
+        tip: f => (f.continuity_check && f.continuity_check.reason) || f.vlm_qa_reason || '',
+        hover: f => ` (生成期连续性失败: ${(f.continuity_check && f.continuity_check.reason) || f.vlm_qa_reason || '场景或镜头漂移'})`,
+    },
+    {
+        id: 'continuity-warned', text: '连续性留痕', cls: 'degraded-badge',
+        test: f => f.quality_gate !== 'frame_continuity_failed'
+            && f.continuity_check && f.continuity_check.status === 'warned',
+        tip: f => f.continuity_check.reason || '',
+        hover: f => ` (连续性检查留痕: ${f.continuity_check.reason || ''})`,
+    },
+    {
         id: 'degraded', text: '降级', cls: 'degraded-badge',
         test: f => f.quality_gate === 'i2i_fallback_degraded',
         tip: () => '',
@@ -59,7 +72,8 @@ const FRAME_BADGE_DEFS = [
     },
     {
         id: 'review-failed', text: '审查未过', cls: 'vlm-failed-badge',
-        test: f => frameIsReviewFailed(f) && !frameManualIssue(f),
+        test: f => frameIsReviewFailed(f) && !frameManualIssue(f)
+            && f.quality_gate !== 'frame_continuity_failed',
         tip: f => f.vlm_qa_reason || '',
         hover: f => ` (一致性审查未通过: ${f.vlm_qa_reason || '跳变或无变化'})`,
     },
@@ -119,7 +133,9 @@ const VIDEO_BADGE_DEFS = [
 
 /** 'vlm_qa_failed' 是已停用的逐帧质检门终态，仅为兼容旧 manifest 保留。 */
 function frameIsReviewFailed(frame) {
-    return frame.quality_gate === 'vlm_qa_failed' || frame.quality_gate === 'sequence_review_flagged';
+    return frame.quality_gate === 'vlm_qa_failed'
+        || frame.quality_gate === 'sequence_review_flagged'
+        || frame.quality_gate === 'frame_continuity_failed';
 }
 
 function frameManualIssue(frame) {

@@ -54,6 +54,25 @@ _RATE_BUCKET = collections.defaultdict(list)
 _RATE_LOCK = threading.Lock()
 
 
+def prompt_delivery_block_reason(payload):
+    """Return a render-blocking reason for explicitly degraded/new compose results.
+
+    Missing metadata is treated as a legacy caller and remains compatible.
+    """
+    if not isinstance(payload, dict):
+        return None
+    quality = payload.get('quality_gate')
+    if payload.get('degraded') is True:
+        return '该提示词结果处于降级状态，不能进入帧渲染。'
+    if payload.get('generation_source') == 'static_fallback':
+        return '静态兜底结果不能进入帧渲染。'
+    if isinstance(quality, dict) and quality.get('status') != 'passed':
+        return '提示词质量门未通过，不能进入帧渲染。'
+    if payload.get('diagnostic_mode') is True:
+        return '诊断模式结果仅供排查，不能入库或渲染。'
+    return None
+
+
 
 def background_worker(task_id, config, dimensions):
     t = get_or_create_task(task_id, dimensions)
@@ -63,6 +82,46 @@ def background_worker(task_id, config, dimensions):
     # 几十秒的 LLM 请求里没死透——它凭令牌发现自己已被接管后必须静默退出，
     # 绝不能把过期事件/结果写进新一轮运行的记录。
     run_token = t["cancel_event"]
+    with ACTIVE_TASKS_LOCK:
+        t.setdefault("last_client_poll_at", None)
+        t["last_worker_progress_at"] = start_time
+        t["failure_code"] = None
+        t["timings"] = {"last_worker_progress_at": start_time, "batch_durations": []}
+    watchdog_done = threading.Event()
+
+    def compose_watchdog():
+        no_progress_limit = max(30, int(config.get('composeNoProgressTimeoutSeconds', 180)))
+        soft_limit = max(no_progress_limit, int(config.get('composeTaskSoftTimeoutSeconds', 480)))
+        hard_limit = max(no_progress_limit, int(config.get('composeTaskHardTimeoutSeconds', 720)))
+        soft_warned = False
+        while not watchdog_done.wait(1.0):
+            payload = None
+            with ACTIVE_TASKS_LOCK:
+                if t.get('cancel_event') is not run_token or t.get('status') != 'running':
+                    return
+                now = time.time()
+                code = None
+                if not soft_warned and now - start_time >= soft_limit:
+                    soft_warned = True
+                    payload = {
+                        'stage': 'compose_soft_timeout',
+                        'details': {'elapsed_seconds': round(now - start_time, 2),
+                                    'deadline_remaining_seconds': max(0, round(hard_limit - (now - start_time), 2))},
+                    }
+                    t['events'].append(('progress', payload))
+                if now - start_time >= hard_limit:
+                    code = 'COMPOSE_TIMEOUT'
+                elif now - float(t.get('last_worker_progress_at') or start_time) >= no_progress_limit:
+                    code = 'COMPOSE_STALLED'
+                if code:
+                    t['failure_code'] = code
+                    t['watchdog_failure_code'] = code
+                    run_token.set()
+                    return
+            if payload:
+                notify_listeners(task_id, 'progress', payload)
+
+    threading.Thread(target=compose_watchdog, name=f'compose-watchdog-{task_id}', daemon=True).start()
 
     def run_cancelled():
         return run_token.is_set() or t.get("cancel_event") is not run_token
@@ -74,6 +133,15 @@ def background_worker(task_id, config, dimensions):
             if stage == 'cancel_check':
                 # 纯取消探针（重试循环的 attempt 边界调用），不产生事件
                 return False
+            now = time.time()
+            t["last_worker_progress_at"] = now
+            t.setdefault("timings", {})["last_worker_progress_at"] = now
+            if stage == 'batch_generated' and isinstance(details, dict):
+                t["timings"].setdefault("batch_durations", []).append({
+                    "batch_index": details.get("batch_index"),
+                    "duration_seconds": details.get("elapsed_seconds", 0),
+                    "attempt": details.get("attempt", 1),
+                })
             if stage == 'text_chunk':
                 t["events"].append(('text_chunk', details))
             else:
@@ -257,7 +325,23 @@ def background_worker(task_id, config, dimensions):
             (dimensions or {}).get('project_key')
             or make_idea_project_key(task_id, result.get('title')))
         result['timings'] = {
-            'total_duration_seconds': round(time.time() - start_time, 2)
+            'total_duration_seconds': round(time.time() - start_time, 2),
+            'last_worker_progress_at': t.get('last_worker_progress_at', start_time),
+            'batch_durations': list((t.get('timings') or {}).get('batch_durations') or []),
+            'model_requests': list((config or {}).get('_compose_request_timings') or []),
+        }
+        placeholder_count = int((config or {}).get('_compose_placeholder_count') or 0)
+        result['generation_source'] = 'llm'
+        result['degraded'] = bool((config or {}).get('_compose_degraded'))
+        result['diagnostic_mode'] = bool((config or {}).get('_compose_diagnostic'))
+        result['failure_code'] = None
+        result['quality_gate'] = {
+            'status': 'degraded' if placeholder_count else 'passed',
+            'validated_beats': sum(
+                1 for value in ((config or {}).get('_compose_slot_states') or {}).values()
+                if value == 'validated'),
+            'placeholder_beats': placeholder_count,
+            'unresolved_hard_errors': placeholder_count,
         }
         # 交付总账再落一份进项目 manifest：帧渲染完之后用户手动触发的一致性审查跑在
         # 另一个任务/进程生命周期里，config 上这份到不了那边，而它正是画面层要判的
@@ -293,13 +377,21 @@ def background_worker(task_id, config, dimensions):
         finalize = False
         with ACTIVE_TASKS_LOCK:
             if t.get("cancel_event") is run_token and t["status"] == "running":
-                t["status"] = "cancelled"
-                t["error"] = "用户取消了生成任务"
+                watchdog_code = t.pop('watchdog_failure_code', None)
+                t["status"] = "failed" if watchdog_code else "cancelled"
+                t["failure_code"] = watchdog_code or "USER_CANCELLED"
+                failure_message = (
+                    '合成任务超过硬时限。' if watchdog_code == 'COMPOSE_TIMEOUT'
+                    else '合成任务长时间没有有效进展。' if watchdog_code == 'COMPOSE_STALLED'
+                    else '用户取消了生成任务')
+                t["error"] = failure_message
                 t["events"] = [evt for evt in t["events"] if evt[0] != 'text_chunk']
-                t["events"].append(('error', {'message': '用户取消了生成任务'}))
+                t["events"].append(('error', {
+                    'message': failure_message, 'failure_code': t['failure_code']}))
                 finalize = True
         if finalize:
-            notify_listeners(task_id, 'error', {'message': '用户取消了生成任务'})
+            notify_listeners(task_id, 'error', {
+                'message': failure_message, 'failure_code': t.get('failure_code')})
             save_task_to_disk(task_id)
     except Exception as e:
         if sys.stdout:
@@ -309,17 +401,30 @@ def background_worker(task_id, config, dimensions):
             if t.get("cancel_event") is run_token and t["status"] == "running":
                 if run_token.is_set():
                     # 取消引发的连带异常（连接被掐等）应记为取消，而不是失败
-                    t["status"] = "cancelled"
-                    error_msg = "用户取消了生成任务"
+                    watchdog_code = t.pop('watchdog_failure_code', None)
+                    t["status"] = "failed" if watchdog_code else "cancelled"
+                    t["failure_code"] = watchdog_code or "USER_CANCELLED"
+                    error_msg = (
+                        '合成任务超过硬时限。' if watchdog_code == 'COMPOSE_TIMEOUT'
+                        else '合成任务长时间没有有效进展。' if watchdog_code == 'COMPOSE_STALLED'
+                        else '用户取消了生成任务')
                 else:
                     t["status"] = "failed"
                     error_msg = str(e)
+                    t["failure_code"] = (
+                        getattr(e, 'failure_code', None)
+                        or ('UPSTREAM_FAILURE' if isinstance(e, (TimeoutError, OSError))
+                            else 'COMPOSE_FAILED'))
                 t["error"] = error_msg
                 t["events"] = [evt for evt in t["events"] if evt[0] != 'text_chunk']
-                t["events"].append(('error', {'message': error_msg}))
+                t["events"].append(('error', {
+                    'message': error_msg, 'failure_code': t.get('failure_code')}))
         if error_msg is not None:
-            notify_listeners(task_id, 'error', {'message': error_msg})
+            notify_listeners(task_id, 'error', {
+                'message': error_msg, 'failure_code': t.get('failure_code')})
             save_task_to_disk(task_id)
+    finally:
+        watchdog_done.set()
 
 
 def auto_run_worker(task_id, config, dimensions):
@@ -2430,12 +2535,23 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 
             with ACTIVE_TASKS_LOCK:
                 task["last_active"] = time.time()
+                task["last_client_poll_at"] = task["last_active"]
                 res = {
                     "id": task["id"],
                     "status": task["status"],
                     "result": task["result"],
                     "error": task["error"],
-                    "dimensions": task["dimensions"]
+                    "dimensions": task["dimensions"],
+                    "generation_source": ((task.get("result") or {}).get("generation_source")
+                                          if isinstance(task.get("result"), dict) else None),
+                    "degraded": bool((task.get("result") or {}).get("degraded", False))
+                                if isinstance(task.get("result"), dict) else False,
+                    "failure_code": task.get("failure_code"),
+                    "quality_gate": ((task.get("result") or {}).get("quality_gate")
+                                     if isinstance(task.get("result"), dict) else None),
+                    "timings": task.get("timings") or {},
+                    "last_client_poll_at": task.get("last_client_poll_at"),
+                    "last_worker_progress_at": task.get("last_worker_progress_at"),
                 }
             self._send_json(res)
         elif path == '/api/mode':
@@ -3642,9 +3758,14 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 result = run_ideate(config, count, theme=theme, theme_label=theme_label,
                                     trend_ref_ids=trend_ref_ids, remix_seed=remix_seed,
                                     pacing_skeleton_ids=pacing_skeleton_ids)
+                for idea in result.get('ideas') or []:
+                    idea.setdefault('generation_source', result.get('generation_source', 'llm'))
+                    idea.setdefault('degraded', bool(result.get('degraded', False)))
                 self._send_json({
                     'status': 'ok',
                     'ideas': result['ideas'],
+                    'generation_source': result.get('generation_source', 'llm'),
+                    'degraded': bool(result.get('degraded', False)),
                     # 本批注入过灵感 prompt 的联网参考(搜索词摘要/自定义网址摘要),
                     # 前端展示成可折叠面板,让用户能看到"搜到了什么"
                     'trend_refs': result.get('trend_refs') or [],
@@ -3777,6 +3898,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         t = ACTIVE_TASKS.get(task_id)
                         if t and t["status"] == "running":
                             t["status"] = "cancelled"
+                            t["failure_code"] = "USER_CANCELLED"
                             t["error"] = "用户取消了生成任务"
                             t["events"] = [evt for evt in t["events"] if evt[0] != 'text_chunk']
                             t["events"].append(('error', {'message': '用户取消了生成任务'}))
@@ -3925,6 +4047,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
                     return
                 body = self._read_json_body()
+                block_reason = prompt_delivery_block_reason(body)
+                if block_reason:
+                    self._send_json({'status': 'error', 'message': block_reason,
+                                     'failure_code': 'PROMPT_DELIVERY_BLOCKED'}, status=409)
+                    return
                 config = effective_config(body.get('config'))
                 if not _require_fx_admission(self, config.get('imageBackend') == 'google_fx'):
                     return
@@ -4154,6 +4281,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
                     return
                 body = self._read_json_body()
+                block_reason = prompt_delivery_block_reason(body)
+                if block_reason:
+                    self._send_json({'status': 'error', 'message': block_reason,
+                                     'failure_code': 'PROMPT_DELIVERY_BLOCKED'}, status=409)
+                    return
                 config = effective_config(body.get('config'))
                 if not _require_fx_admission(self):
                     return
@@ -4196,6 +4328,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'status': 'error', 'message': '请求过于频繁，请稍后再试'}, status=429)
                     return
                 body = self._read_json_body()
+                block_reason = prompt_delivery_block_reason(body)
+                if block_reason:
+                    self._send_json({'status': 'error', 'message': block_reason,
+                                     'failure_code': 'PROMPT_DELIVERY_BLOCKED'}, status=409)
+                    return
                 config = effective_config(body.get('config'))
                 title = body.get('title', '')
                 prompt = body.get('prompt', '')

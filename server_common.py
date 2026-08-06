@@ -1318,6 +1318,10 @@ def effective_config(client_config):
         for key in _SERVER_AUTHORITATIVE_KEYS:
             if key in SERVER_CONFIG:
                 merged[key] = SERVER_CONFIG[key]
+        for key in ('frameContinuityMode', 'frameContinuityMaxRetries',
+                    'frameContinuityLocalEdit', 'autoSplitHighRiskBeats'):
+            if key not in merged and key in SERVER_CONFIG:
+                merged[key] = SERVER_CONFIG[key]
         if 'googleFxImageModel' in merged:
             merged['googleFxImageModel'] = normalize_google_fx_image_model(
                 merged.get('googleFxImageModel'))
@@ -1357,7 +1361,7 @@ def effective_config(client_config):
     # base/omni 送到服务端的（active_skill_profile 读的正是 config['skillProfile']）。
     # 不进这份白名单，托管模式下前端选了哪条链路会被整个丢掉——用户以为切了，
     # 实际永远按 videoModel 推断，和 qaGateLevel / imageEditTransport 当年是同一个口子。
-    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'videoDuration', 'adsPowerPort', 'videoAccountPoolMinCredit', 'qaGateLevel', 'strictFrameStateContract', 'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile'):
+    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'videoDuration', 'adsPowerPort', 'videoAccountPoolMinCredit', 'qaGateLevel', 'strictFrameStateContract', 'frameContinuityMode', 'frameContinuityMaxRetries', 'frameContinuityLocalEdit', 'autoSplitHighRiskBeats', 'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile'):
         if k in _SERVER_AUTHORITATIVE_KEYS:
             # FX 模型设置：服务端配置优先，防止浏览器旧缓存覆盖控制台的改动
             if k in SERVER_CONFIG:
@@ -3042,6 +3046,10 @@ def save_task_to_disk(task_id, tasks_dir=None):
             'dimensions': t['dimensions'],
             'error': t.get('error'),
             'last_active': t['last_active'],
+            'last_client_poll_at': t.get('last_client_poll_at'),
+            'last_worker_progress_at': t.get('last_worker_progress_at'),
+            'failure_code': t.get('failure_code'),
+            'timings': t.get('timings') or {},
             'format': 2,
         }
         events = list(t['events'])
@@ -3286,7 +3294,11 @@ def load_tasks_from_disk(tasks_dir=None):
                             "dimensions": t["dimensions"],
                             "result": result,
                             "error": error,
-                            "last_active": t["last_active"]
+                            "last_active": t["last_active"],
+                            "last_client_poll_at": t.get("last_client_poll_at"),
+                            "last_worker_progress_at": t.get("last_worker_progress_at", t["last_active"]),
+                            "failure_code": t.get("failure_code"),
+                            "timings": t.get("timings") or {"batch_durations": []}
                         }
                         _TASK_FLUSHED_EVENTS[tid] = on_disk_events
                     except Exception as e:
@@ -3348,7 +3360,11 @@ def get_or_create_task(task_id, dimensions=None):
                 "dimensions": dimensions,
                 "result": None,
                 "error": None,
-                "last_active": time.time()
+                "last_active": time.time(),
+                "last_client_poll_at": None,
+                "last_worker_progress_at": time.time(),
+                "failure_code": None,
+                "timings": {"batch_durations": []}
             }
             save_on_create = True
         else:
@@ -3388,7 +3404,11 @@ def prepare_task_for_run(task_id, dimensions=None):
                 "dimensions": dimensions,
                 "result": None,
                 "error": None,
-                "last_active": time.time()
+                "last_active": time.time(),
+                "last_client_poll_at": None,
+                "last_worker_progress_at": time.time(),
+                "failure_code": None,
+                "timings": {"batch_durations": []}
             }
             ACTIVE_TASKS[task_id] = t
         else:
@@ -3398,6 +3418,10 @@ def prepare_task_for_run(task_id, dimensions=None):
             t["result"] = None
             t["error"] = None
             t["last_active"] = time.time()
+            t["last_client_poll_at"] = None
+            t["last_worker_progress_at"] = time.time()
+            t["failure_code"] = None
+            t["timings"] = {"batch_durations": []}
             if dimensions is not None:
                 t["dimensions"] = dimensions
     # 重跑会把 events 清空，落盘的 .jsonl 必须跟着整份重写而不是继续追加

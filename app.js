@@ -3257,6 +3257,11 @@ async function generateFrames() {
     }
     const ownerIdea = currentIdea;
     const selectedCover = ownerIdea.activeCoverUrl || (ownerIdea.covers || []).slice(-1)[0];
+    if (ownerIdea.degraded === true
+        || (ownerIdea.quality_gate && ownerIdea.quality_gate.status !== 'passed')) {
+        showToast('提示词处于降级或质量门未通过状态，不能生成帧序列。', 'error');
+        return;
+    }
     if (!selectedCover) {
         showToast("请先生成或选择封面图；第一帧必须以封面图进行图生图。", "error");
         return;
@@ -3284,7 +3289,11 @@ async function generateFrames() {
             config: withCoverReference(config, ownerIdea),
             title: getIdeaSaveTitle(ownerIdea),
             display_title: ownerIdea.title,
-            prompt_block: ownerIdea.prompt_block
+            prompt_block: ownerIdea.prompt_block,
+            generation_source: ownerIdea.generation_source,
+            degraded: ownerIdea.degraded === true,
+            quality_gate: ownerIdea.quality_gate || null,
+            diagnostic_mode: ownerIdea.diagnostic_mode === true
         };
         if (targetSequences) body.target_sequences = targetSequences;
 

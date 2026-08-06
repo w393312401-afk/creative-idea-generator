@@ -343,6 +343,7 @@ function renderIdeationCards(ideas) {
                 <div class="ideation-card-score">${idea.score}分</div>
             </div>
             <div class="ideation-card-metadata">
+                ${idea.degraded ? '<span class="ideation-card-tag degraded" title="模型生成失败后的静态兜底卡，不计入正常随机结果">降级兜底</span>' : ''}
                 <span class="ideation-card-tag">反差强度: ${idea.score >= 23 ? '极高' : '高'}</span>
                 ${Number.isFinite(+idea.recommended_beats) && +idea.recommended_beats > 0
                     ? `<span class="ideation-card-tag beats" title="${idea.beats_reason || ''}">⏱ ${idea.recommended_beats} 拍${
@@ -366,6 +367,9 @@ function renderIdeationCards(ideas) {
                 <button type="button" class="ideation-card-btn primary compose-action-btn">一键合成</button>
             </div>
         `;
+        if (idea.degraded) {
+            card.classList.add('degraded-card');
+        }
         
         // Asynchronously fetch cover
         const coverContainer = card.querySelector('.ideation-card-cover');

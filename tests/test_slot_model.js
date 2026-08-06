@@ -48,6 +48,16 @@ assert.deepStrictEqual(badges(s), ['review-failed']);
 assert.ok(acts(s).includes('fix-frame'), '审查未过必须给出定向修复入口');
 assert.ok(s.title.includes('空间跳变'));
 
+s = ready({ quality_gate: 'frame_continuity_failed',
+            continuity_check: { status: 'failed', reason: 'camera, structure' } });
+assert.deepStrictEqual(badges(s), ['continuity-failed']);
+assert.ok(acts(s).includes('fix-frame'));
+assert.ok(s.title.includes('camera, structure'));
+
+s = ready({ quality_gate: 'pending_manual_review',
+            continuity_check: { status: 'warned', reason: 'low texture' } });
+assert.deepStrictEqual(badges(s), ['continuity-warned']);
+
 // 'vlm_qa_failed' 是已停用的逐帧质检门终态，旧 manifest 仍要认
 s = ready({ quality_gate: 'vlm_qa_failed' });
 assert.deepStrictEqual(badges(s), ['review-failed']);
@@ -80,6 +90,7 @@ assert.ok(!acts(ready({ fix_backup: 'not-an-object' })).includes('undo-fix'));
 // 格子迟早对不上（见 js/slot_toolbar.js 的 fixableSlotSequences）。
 assert.ok(frameIsFixable({ quality_gate: 'sequence_review_flagged' }));
 assert.ok(frameIsFixable({ quality_gate: 'vlm_qa_failed' }), '旧质检门终态也要认');
+assert.ok(frameIsFixable({ quality_gate: 'frame_continuity_failed' }));
 assert.ok(frameIsFixable({ manual_issue: '门开反了' }));
 assert.ok(!frameIsFixable({ quality_gate: 'auto_approved' }));
 assert.ok(!frameIsFixable({ manual_issue: '   ' }), '空白描述不算人工标记');

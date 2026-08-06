@@ -36,10 +36,14 @@ def test_ideation_batch_is_not_registered(monkeypatch):
     register = Mock()
     monkeypatch.setattr(server, 'register_ledger_candidates', register)
     monkeypatch.setattr(server, 'run_ideate', lambda *args, **kwargs: {
-        'ideas': [
-            {'dna': 'a / b / c', 'title': '未激发 A'},
-            {'dna': 'd / e / f', 'title': '未激发 B'},
-        ],
+            'ideas': [
+                {'dna': 'a / b / c', 'title': '未激发 A',
+                 'generation_source': 'llm', 'degraded': False},
+                {'dna': 'd / e / f', 'title': '未激发 B',
+                 'generation_source': 'llm', 'degraded': False},
+            ],
+            'generation_source': 'llm',
+            'degraded': False,
         'trend_refs': [],
     })
     handler, sent = _handler('/api/ideate', {'count': 2})
@@ -49,9 +53,13 @@ def test_ideation_batch_is_not_registered(monkeypatch):
     assert sent == [({
         'status': 'ok',
         'ideas': [
-            {'dna': 'a / b / c', 'title': '未激发 A'},
-            {'dna': 'd / e / f', 'title': '未激发 B'},
+            {'dna': 'a / b / c', 'title': '未激发 A',
+             'generation_source': 'llm', 'degraded': False},
+            {'dna': 'd / e / f', 'title': '未激发 B',
+             'generation_source': 'llm', 'degraded': False},
         ],
+        'generation_source': 'llm',
+        'degraded': False,
         'trend_refs': [],
     }, 200)]
     register.assert_not_called()

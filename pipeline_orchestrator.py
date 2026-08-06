@@ -1143,7 +1143,9 @@ def run_autonomous_pipeline(config, dimensions, on_progress=None):
         _manifest['spatial_beats'] = [
             {key: beat.get(key) for key in (
                 'index', 'space_id', 'transition_stage', 'camera_family', 'reveal_scope',
-                'light_source_state')}
+                'light_source_state', 'operation', 'package_operations', 'milestone_name',
+                'before_state', 'after_state', 'preserve_state', 'changed_grid_cells',
+                'persistent_traces', 'hard_cut', 'bridge_stage', 'turn_direction')}
             for beat in state.get('beat_ladder', []) if isinstance(beat, dict)
         ]
         write_manifest(rendered['project_dir'], _manifest)

@@ -75,6 +75,26 @@
             percent = 40 + ratio * 45;
             label = total ? `批量合成提示词 ${current}/${total}` : '批量合成提示词中';
             phase = 'batch';
+        } else if (stage === 'batch_generating' || stage === 'batch_generated'
+            || stage === 'batch_retry' || stage === 'batch_failed') {
+            const batchIndex = Number(details && details.batch_index) || 1;
+            const batchTotal = Number(details && details.batch_total) || 1;
+            const attempt = Number(details && details.attempt) || 1;
+            const attemptTotal = Number(details && details.attempt_total) || 1;
+            current = Number(details && details.beat_end) || 0;
+            total = state.total || Number(details && details.beat_end) || 0;
+            percent = 40 + clamp(batchIndex / batchTotal, 0, 1) * 45;
+            if (stage === 'batch_retry') {
+                label = `第 ${batchIndex}/${batchTotal} 批正在重试（${attempt}/${attemptTotal}）`;
+                status = 'retrying';
+            } else if (stage === 'batch_failed') {
+                label = messageFrom(details && details.failure_reason,
+                    `第 ${batchIndex}/${batchTotal} 批生成失败`);
+                status = 'failed';
+            } else {
+                label = `正在合成第 ${batchIndex}/${batchTotal} 批（第 ${details.beat_start}-${details.beat_end} 拍）`;
+            }
+            phase = 'batch';
         } else if (stage === 'audit') {
             const msg = messageFrom(details, '正在运行质量审计...');
             const isRepairRound = /修复|repair|轮/i.test(msg);
@@ -82,6 +102,11 @@
             percent = isRepairRound ? 88 : 90;
             label = isRepairRound && state.repairCount > 0 ? `${msg}（第 ${state.repairCount} 次）` : msg;
             phase = 'audit';
+        } else if (stage === 'compose_soft_timeout') {
+            label = `合成耗时较长，仍在继续（距硬时限约 ${Math.max(0,
+                Math.round(Number(details && details.deadline_remaining_seconds) || 0))} 秒）`;
+            status = 'retrying';
+            phase = 'batch';
         } else if (stage === 'repair') {
             percent = 95;
             label = messageFrom(details, '正在修复并重新组装提示词...');
@@ -145,6 +170,18 @@
             percent = Math.max(state.percent, 5);
             label = slot ? `IMG ${String(slot).padStart(3, '0')} 质检判定中` : '质检判定中';
             status = 'active';
+        } else if (stage === 'frame_continuity_check') {
+            percent = Math.max(state.percent, 5);
+            label = slot ? `正在检查 IMG ${String(slot).padStart(3, '0')} 场景一致性` : '正在检查场景一致性';
+            status = 'active';
+        } else if (stage === 'frame_continuity_retry') {
+            percent = Math.max(state.percent, 5);
+            label = slot ? `IMG ${String(slot).padStart(3, '0')} 发现漂移，正在自动重试` : '发现漂移，正在自动重试';
+            status = 'retrying';
+        } else if (stage === 'frame_continuity_failed') {
+            percent = Math.max(state.percent, 5);
+            label = messageFrom(details, slot ? `IMG ${String(slot).padStart(3, '0')} 连续性失败，续链已暂停` : '连续性失败，续链已暂停');
+            status = 'failed';
         } else if (stage === 'frame') {
             current = Number(details && details.current) || 0;
             total = Number(details && details.total) || state.total || 0;

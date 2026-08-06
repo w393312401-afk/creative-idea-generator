@@ -65,7 +65,9 @@ function summarizeRunQuality(manifest) {
     const risks = [];
     const frames = manifest.frames || [];
     const count = (pred) => frames.filter(pred).length;
-    const flagged = count(f => f.quality_gate === 'sequence_review_flagged' || f.quality_gate === 'vlm_qa_failed');
+    const flagged = count(f => f.quality_gate === 'sequence_review_flagged'
+        || f.quality_gate === 'vlm_qa_failed'
+        || f.quality_gate === 'frame_continuity_failed');
     // 人工主动描述、但还没点「修复此帧问题」的帧：人已经看出这里不对，合成前更
     // 该提醒一次（见 describeFrameIssue）
     const manualFlagged = count(f => typeof f.manual_issue === 'string' && f.manual_issue.trim());
@@ -145,7 +147,11 @@ function renderIdea(result) {
     if (tagThemeEl) tagThemeEl.textContent = result.theme || '';
     if (tagCreativityEl) tagCreativityEl.textContent = result.creativity || '';
 
-    renderRepairBanner(result.repair_md);
+    const deliveryWarning = result.degraded === true
+        || (result.quality_gate && result.quality_gate.status !== 'passed')
+        ? `提示词质量门未通过：${result.failure_code || '结果已降级'}。帧序列渲染已禁用。`
+        : '';
+    renderRepairBanner(deliveryWarning || result.repair_md);
     document.getElementById('idea-prompt-block').textContent = result.prompt_block || '（本次未返回提示词内容）';
     document.getElementById('idea-audit').innerHTML = renderAuditMarkdown(result.audit_md);
 
@@ -284,7 +290,12 @@ function hydrateFramesPanel(idea) {
         if (rec.progressInfo && typeof setProgressBar === 'function') setProgressBar('frames', rec.progressInfo);
         if (typeof framesFeedHydrate === 'function') framesFeedHydrate(idea.id);
     } else {
-        if (btn) btn.disabled = false;
+        const deliveryBlocked = idea.degraded === true
+            || (idea.quality_gate && idea.quality_gate.status !== 'passed');
+        if (btn) {
+            btn.disabled = deliveryBlocked;
+            btn.title = deliveryBlocked ? '提示词处于降级或质量门未通过状态，不能生成帧序列' : '';
+        }
         if (progress) progress.style.display = 'none';
         const wrap = document.getElementById('frames-live-feed');
         const lines = document.getElementById('frames-live-feed-lines');

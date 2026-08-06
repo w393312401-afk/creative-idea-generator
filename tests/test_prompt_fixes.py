@@ -324,17 +324,17 @@ Video prompt 8 here.
         snapshot that must NOT be resumed as-is (else every retry is a zero-work instant re-fail)."""
         from prompt_pipeline import _checkpoint_is_failed_terminal
 
-        # 7 beats -> gate limit = max(2, 7//3) = 2. fallback_count 3 > 2 -> failed terminal.
+        # Production gate limit is zero: any saved placeholder marks a diagnostic/failed terminal.
         self.assertTrue(_checkpoint_is_failed_terminal(
             {"fallback_count": 3, "pass_beats_done": [2, 3, 5]}, 7))
-        # At/under the limit -> a legitimately resumable interruption.
-        self.assertFalse(_checkpoint_is_failed_terminal({"fallback_count": 2}, 7))
+        self.assertTrue(_checkpoint_is_failed_terminal({"fallback_count": 2}, 7))
+        # A clean checkpoint remains resumable.
         self.assertFalse(_checkpoint_is_failed_terminal({"fallback_count": 0}, 7))
         # Robust to missing field / non-dict.
         self.assertFalse(_checkpoint_is_failed_terminal({}, 7))
         self.assertFalse(_checkpoint_is_failed_terminal(None, 7))
-        # Larger sequence raises the limit: 30 beats -> limit 10, so 3 fallbacks is fine.
-        self.assertFalse(_checkpoint_is_failed_terminal({"fallback_count": 3}, 30))
+        # Sequence length does not relax the production zero-placeholder gate.
+        self.assertTrue(_checkpoint_is_failed_terminal({"fallback_count": 3}, 30))
 
     def test_local_trim_to_budget_fits_and_keeps_ends(self):
         """Local trim (used when the 8046 aux model is unreachable for compression) must bring an

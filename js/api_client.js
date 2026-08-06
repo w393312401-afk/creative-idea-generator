@@ -1233,6 +1233,10 @@ async function retrySingleFrame(seq) {
                 title: getIdeaSaveTitle(ownerIdea),
                 display_title: ownerIdea.title,
                 prompt_block: ownerIdea.prompt_block,
+                generation_source: ownerIdea.generation_source,
+                degraded: ownerIdea.degraded === true,
+                quality_gate: ownerIdea.quality_gate || null,
+                diagnostic_mode: ownerIdea.diagnostic_mode === true,
                 target_sequences: [seq]
             }),
             signal: controller.signal
@@ -1825,7 +1829,9 @@ async function confirmSequenceReviewOverride(ownerIdea, slots) {
     } else {
         candidates = frames;
     }
-    const failedFrames = candidates.filter(f => f.quality_gate === 'vlm_qa_failed' || f.quality_gate === 'sequence_review_flagged');
+    const failedFrames = candidates.filter(f => f.quality_gate === 'vlm_qa_failed'
+        || f.quality_gate === 'sequence_review_flagged'
+        || f.quality_gate === 'frame_continuity_failed');
     // slotIsStale 认三种写法（stale_lineage 是后端现在唯一会写的，另两个是旧 manifest）
     const staleFrames = candidates.filter(f => typeof slotIsStale === 'function'
         ? slotIsStale(f) : !!f.stale_lineage);

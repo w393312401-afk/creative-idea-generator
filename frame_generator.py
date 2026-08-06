@@ -31,12 +31,29 @@ from server_common import (
     _get_account_pool_service, _select_pool_account,
     _account_switch_interval, _account_rotation_ring,
 )
+from frame_continuity import (
+    analyze_frame, continuity_max_retries, continuity_mode, family_map,
+    family_master, is_transition_frame, register_family_master,
+    transition_result,
+)
 
 
 
 class QuotaExhaustedError(RuntimeError):
     """Raised when the upstream API quota is exhausted; retrying is pointless."""
     pass
+
+
+class FrameContinuityError(RuntimeError):
+    """A rendered frame failed the deterministic continuity gate after retry."""
+
+
+_CONTINUITY_RETRY_CONTROL = (
+    "CONTINUITY CORRECTION RETRY. The attached reference is authoritative. Preserve the exact "
+    "camera position, crop, perspective, horizon, architecture, terrain, fixed landmarks, object "
+    "identity, scale, lighting direction, and every surface outside the declared work area. Apply "
+    "only the requested construction delta inside its named area; do not redraw the whole scene."
+)
 
 
 class ImageTaskCancelled(GenerationCancelled):
@@ -262,6 +279,101 @@ def _get_file_hash(filepath):
         return h.hexdigest()
     except Exception:
         return ""
+
+
+def _continuity_beat(manifest, sequence):
+    """Return the structured beat whose terminal anchor is IMAGE ``sequence``."""
+    if sequence <= 1:
+        return None
+    beats = (manifest or {}).get('spatial_beats') or []
+    target = sequence - 1
+    for beat in beats:
+        if not isinstance(beat, dict):
+            continue
+        try:
+            if int(beat.get('index') or 0) == target:
+                return beat
+        except (TypeError, ValueError):
+            continue
+    if target - 1 < len(beats) and isinstance(beats[target - 1], dict):
+        return beats[target - 1]
+    return None
+
+
+def _continuity_family_maps(prompts_by_seq, videos):
+    return family_map([int(s) for s in (prompts_by_seq or {})], videos or {})
+
+
+def _continuity_family_id(families, sequence):
+    return (families or {}).get(int(sequence), 'family-1')
+
+
+def _incoming_video_meta(videos, sequence):
+    incoming = (videos or {}).get(int(sequence) - 1)
+    return str(incoming.get('meta', '') if isinstance(incoming, dict) else '')
+
+
+def _continuity_result(config, project_dir, manifest, families, videos, sequence,
+                       item, reference_path, candidate_path, on_progress=None):
+    """Evaluate one candidate and maintain the immutable family-master sidecar."""
+    mode = continuity_mode(config)
+    family_id = _continuity_family_id(families, sequence)
+    beat = _continuity_beat(manifest, sequence)
+    image_meta = str(item.get('meta', '') if isinstance(item, dict) else '')
+    incoming_meta = _incoming_video_meta(videos, sequence)
+    transition = is_transition_frame(sequence, image_meta, incoming_meta, beat)
+    master = family_master(project_dir, family_id)
+    master_path = master.get('image_path') if isinstance(master, dict) else None
+    if (isinstance(master, dict) and master_path and os.path.exists(master_path)
+            and master.get('image_sha256') != _get_file_hash(master_path)):
+        # Upload/drag/restore may overwrite the family-head file outside the renderer.  Refresh
+        # the sidecar lazily before the next comparison so a stale fingerprint never becomes the
+        # visual authority for a new lineage.
+        master = register_family_master(
+            project_dir, family_id, int(master.get('sequence') or sequence), master_path)
+        master_path = master.get('image_path')
+
+    if mode == 'off':
+        return {'version': 'frame-continuity-v1', 'status': 'skipped',
+                'reason': 'continuity mode is off'}, family_id
+    if on_progress:
+        on_progress('frame_continuity_check', {
+            'sequence': sequence, 'slot': sequence,
+            'message': f'正在检查 IMG {sequence:03d} 场景一致性…',
+        })
+    if transition or not reference_path:
+        registered = register_family_master(project_dir, family_id, sequence, candidate_path)
+        result = transition_result(reference_path, registered.get('image_path'),
+                                   'declared camera-family transition or family head')
+        result['family_id'] = family_id
+        return result, family_id
+
+    if not master_path or not os.path.exists(master_path):
+        master = register_family_master(project_dir, family_id, sequence - 1, reference_path)
+        master_path = master.get('image_path')
+    result = analyze_frame(
+        reference_path, candidate_path,
+        prompt=str(item.get('prompt', '') if isinstance(item, dict) else item or ''),
+        beat=beat, master_path=master_path, mode=mode,
+    )
+    result['family_id'] = family_id
+    return result, family_id
+
+
+def _continuity_color_reference(config, project_dir, families, sequence, fallback_path=None):
+    if continuity_mode(config) != 'off':
+        master = family_master(project_dir, _continuity_family_id(families, sequence))
+        if isinstance(master, dict) and os.path.exists(master.get('image_path', '')):
+            return master['image_path']
+    return fallback_path
+
+
+def _continuity_should_retry(result, retry_no, max_retries):
+    return bool(
+        retry_no < max_retries
+        and isinstance(result, dict)
+        and (result.get('status') == 'failed' or result.get('retry_recommended'))
+    )
 
 
 def update_manifest_stale_status(manifest, project_dir, regenerated_sequences=None, finalize=False):
@@ -1106,6 +1218,57 @@ def plan_fx_chunks(seqs, chunk_size=_FX_CHUNK_SIZE):
     return chunks
 
 
+def _fx_bridge_meta(seq, prompts_by_seq, videos):
+    """Return the bridge tag that governs IMAGE ``seq`` (normally VIDEO seq-1)."""
+    item = (prompts_by_seq or {}).get(seq) or {}
+    item_meta = str(item.get('meta', '') if isinstance(item, dict) else '').upper()
+    incoming = (videos or {}).get(seq - 1)
+    incoming_meta = str(
+        incoming.get('meta', '') if isinstance(incoming, dict) else ''
+    ).upper()
+    combined = f'{item_meta} {incoming_meta}'.strip()
+    return combined if 'BRIDGE' in combined else ''
+
+
+def fx_bridge_target_sequences(prompts_by_seq, videos):
+    """IMAGE slots reached by an incoming [BRIDGE]/[BRIDGE TURN] video slot."""
+    return {
+        int(seq) for seq in (prompts_by_seq or {})
+        if _fx_bridge_meta(int(seq), prompts_by_seq, videos)
+    }
+
+
+def split_fx_chunks_at_heads(chunks, heads):
+    """Start a fresh Flow batch at every declared transition target frame."""
+    heads = {int(s) for s in (heads or ())}
+    result = []
+    for chunk in chunks:
+        current = []
+        for seq in chunk:
+            if seq in heads and current:
+                result.append(current)
+                current = []
+            current.append(seq)
+        if current:
+            result.append(current)
+    return result
+
+
+def fx_prompt_with_bridge_control(seq, item, prompts_by_seq, videos):
+    """Inline camera-motion control into the prompt because FX has no control_prompt channel."""
+    body = str(item.get('prompt', '') if isinstance(item, dict) else item or '').strip()
+    bridge_meta = _fx_bridge_meta(seq, prompts_by_seq, videos)
+    if not bridge_meta:
+        return body
+    control = (
+        IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT
+        if 'TURN' in bridge_meta else IMG2IMG_BRIDGE_CONTROL_PROMPT
+    )
+    if control in body:
+        return body
+    return f'{control}\n\n{body}'.strip()
+
+
 def _fx_frame_canvas_binding(frame, manifest=None):
     """Return the account/project pair that owns an existing Flow frame.
 
@@ -1464,6 +1627,9 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         prompts.append({'index': idx, 'prompt': body, 'meta': meta})
     if not prompts:
         raise RuntimeError('未在 prompt_block 中找到任何 图片 N: 提示词')
+    prompts_by_seq = {int(item['index']): item for item in prompts}
+    continuity_families = _continuity_family_maps(prompts_by_seq, videos)
+    continuity_retries = continuity_max_retries(config)
 
     def _check_cancel():
         if on_progress and on_progress('cancel_check', None):
@@ -1648,6 +1814,13 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
     prompts_by_seq = {int(item['index']): item for item in prompts}
     all_seqs = sorted(prompts_by_seq.keys())
 
+    # FX/Flow has no separate control_prompt channel.  Put the movement directive in the
+    # actual IMAGE prompt (and therefore in the manifest) before batching, so a bridge target
+    # cannot silently render with the ordinary locked-camera edit contract.
+    for _seq, _item in prompts_by_seq.items():
+        _item['prompt'] = fx_prompt_with_bridge_control(
+            _seq, _item, prompts_by_seq, videos)
+
     def _webp_path(seq):
         return os.path.join(frames_dir, f'img_{seq:03d}.webp')
 
@@ -1656,13 +1829,20 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         return os.path.exists(p) and os.path.getsize(p) > 0
 
     def _align_frame_color(seq):
-        """把刚落盘的第 seq 帧向首帧对齐色彩（首帧自己不动）。"""
+        """把刚落盘帧向当前镜头族母版对齐；无母版时退回首帧。"""
         if seq <= 1:
             return
-        first_frame_path = _webp_path(1)
+        item = prompts_by_seq.get(seq) or {}
+        if is_transition_frame(
+                seq, item.get('meta', ''), _incoming_video_meta(videos, seq),
+                _continuity_beat(manifest, seq)):
+            return
         target_path = _webp_path(seq)
-        if os.path.exists(first_frame_path) and os.path.exists(target_path):
-            _match_color_lab(target_path, first_frame_path, target_path)
+        first_frame_path = _webp_path(1)
+        color_reference = _continuity_color_reference(
+            config, project_dir, continuity_families, seq, first_frame_path)
+        if color_reference and os.path.exists(color_reference) and os.path.exists(target_path):
+            _match_color_lab(target_path, color_reference, target_path)
 
     # 任务分解：full run = 已有帧直接复用（断点续传），缺失帧成批生成；
     # target 模式 = 只重生指定序号，其余帧不动也不发事件（与 API 路径一致）。
@@ -1691,7 +1871,8 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             on_progress('frame', {'frame': frame_info, 'current': generated_count, 'total': total_to_generate})
 
     def _record_frame(seq, item, fx_src_path, fx_uuid, quality_gate, vlm_reason,
-                      cover_reference=None, fx_account_id=None):
+                      cover_reference=None, fx_account_id=None, continuity_check=None,
+                      family_id=None, retry_count=0):
         webp = _webp_path(seq)
         rel_path = os.path.relpath(webp, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
         prev_path = _webp_path(seq - 1) if seq > 1 else None
@@ -1712,11 +1893,15 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             'fx_src': os.path.relpath(fx_src_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/') if fx_src_path else None,
             'aspect_ratio': config.get('imageAspectRatio') or '9:16',
             'image_size': _image_quality_to_label(config.get('imageQuality')),
-            'retry_count': 0,
+            'retry_count': retry_count,
             'quality_gate': quality_gate,
             'vlm_qa_reason': vlm_reason,
             'parent_hash': "" if cover_reference else (_get_file_hash(reference) if reference else ""),
         }
+        if continuity_check is not None:
+            frame_info['continuity_check'] = continuity_check
+        if family_id:
+            frame_info['family_id'] = family_id
         if fx_account_id:
             frame_info['fx_account_id'] = fx_account_id
             frame_project = (canvas_session.get('projects_by_account') or {}).get(fx_account_id)
@@ -1729,28 +1914,18 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         _emit_frame(frame_info)
         return frame_info
 
-    chunks = plan_fx_chunks(gen_seqs)
+    chunks = plan_fx_chunks(
+        gen_seqs, chunk_size=(1 if continuity_mode(config) != 'off' else _FX_CHUNK_SIZE))
     if target_sequences is not None:
         chunks = split_fx_chunks_by_canvas(chunks, manifest_frames_by_seq, manifest)
-    # 声明式硬切（[CUT] 视频槽）另起一批，便于让提示词主导场景变化；新批仍会显式
-    # 挂载上一帧作为参考，因此不会退化成文生图或断开血统。
-    cut_heads = set()
+    # 声明式硬切和过门目标帧都另起一批。新批仍显式挂载上一帧作为参考，所以空间
+    # 血统不断；但外景帧不会再与过门帧挤在同一个 Flow 批内链里，把批内参考惯性放大。
+    transition_heads = fx_bridge_target_sequences(prompts_by_seq, videos)
     for _v_idx, _v in (videos or {}).items():
         _vm = str(_v.get('meta', '') if isinstance(_v, dict) else '').upper()
         if 'CUT' in _vm and 'BRIDGE' not in _vm:
-            cut_heads.add(int(_v_idx) + 1)
-    if cut_heads:
-        _split = []
-        for _c in chunks:
-            _cur = []
-            for _s in _c:
-                if _s in cut_heads and _cur:
-                    _split.append(_cur)
-                    _cur = []
-                _cur.append(_s)
-            if _cur:
-                _split.append(_cur)
-        chunks = _split
+            transition_heads.add(int(_v_idx) + 1)
+    chunks = split_fx_chunks_at_heads(chunks, transition_heads)
     chunk_by_start = {c[0]: c for c in chunks}
     # 批次边界定下来之后才能分账号：按换号节拍，每批绑号池里的下一个号（IP 始终不变）
     ring = _account_rotation_ring(config, account_pool, pool_account_id) if pool_account_id else []
@@ -1889,7 +2064,6 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                 render_src = local_paths[offset]
                 _, fx_src_path, fx_uuid = _fx_store_frame(render_src, frames_dir, s)
                 _align_frame_color(s)
-                # 渲染期不做视觉判定：帧一律直出落盘，quality_gate 记"没人看过"。
                 quality_gate, vlm_reason = 'pending_manual_review', None
 
                 # P1 换族锚点惯性检测（本地像素 MAD，不是视觉判定）：FX 链路只留痕
@@ -1907,10 +2081,60 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                                 'sequence': s, 'mad': round(_inertia_mad, 2),
                                 'message': f"⚠️ IMG {s:03d} 桥接帧疑似被 i2i 惯性卡死（MAD={_inertia_mad:.2f}），已留痕",
                             })
-                _record_frame(s, item, fx_src_path, fx_uuid, quality_gate, vlm_reason,
-                              cover_reference=(cover_ref_src if s == 1 else None),
-                              fx_account_id=generated_account_by_path.get(render_src))
+                reference_for_check = cover_ref_src if s == 1 else _webp_path(s - 1)
+                continuity_check, family_id = _continuity_result(
+                    config, project_dir, manifest, continuity_families, videos, s,
+                    item, reference_for_check, _webp_path(s), on_progress=on_progress)
+                continuity_retry_no = 0
+                while _continuity_should_retry(
+                        continuity_check, continuity_retry_no, continuity_retries):
+                    continuity_retry_no += 1
+                    if on_progress:
+                        on_progress('frame_continuity_retry', {
+                            'sequence': s, 'slot': s, 'attempt': continuity_retry_no,
+                            'reason': continuity_check.get('reason'),
+                            'message': (f'IMG {s:03d} 发现场景漂移或推进不足，'
+                                        f'正在通过 Google FX 自动重试 '
+                                        f'{continuity_retry_no}/{continuity_retries}…'),
+                        })
+                    retry_prompt = f'{_CONTINUITY_RETRY_CONTROL}\n\n{item["prompt"]}'.strip()
+                    retry_paths, retry_out = _run_chunk_batch(
+                        [retry_prompt], ref_path, leg, chunk_sequences=[s],
+                        cover_reference=(cover_ref_src if s == 1 else None))
+                    try:
+                        retry_src = retry_paths[0]
+                        _, fx_src_path, fx_uuid = _fx_store_frame(retry_src, frames_dir, s)
+                        render_src = retry_src
+                        _align_frame_color(s)
+                        continuity_check, family_id = _continuity_result(
+                            config, project_dir, manifest, continuity_families, videos, s,
+                            item, reference_for_check, _webp_path(s), on_progress=on_progress)
+                    finally:
+                        shutil.rmtree(retry_out, ignore_errors=True)
+
+                if continuity_check.get('status') == 'failed':
+                    quality_gate = 'frame_continuity_failed'
+                    vlm_reason = continuity_check.get('reason') or '场景连续性检查失败'
+                elif continuity_check.get('status') == 'warned':
+                    vlm_reason = 'CONTINUITY WARN: ' + (
+                        continuity_check.get('reason') or '本地连续性检查留痕')
+                _record_frame(
+                    s, item, fx_src_path, fx_uuid, quality_gate, vlm_reason,
+                    cover_reference=(cover_ref_src if s == 1 else None),
+                    fx_account_id=generated_account_by_path.get(render_src),
+                    continuity_check=continuity_check, family_id=family_id,
+                    retry_count=continuity_retry_no)
                 done_seqs.add(s)
+                if quality_gate == 'frame_continuity_failed':
+                    if on_progress:
+                        on_progress('frame_continuity_failed', {
+                            'sequence': s, 'slot': s,
+                            'message': (f'IMG {s:03d} 连续性检查在自动重试后仍失败，'
+                                        '已暂停续链，避免污染后续帧。'),
+                            'reason': continuity_check.get('reason'),
+                        })
+                    raise FrameContinuityError(
+                        f'IMG {s:03d} 场景连续性检查失败：{continuity_check.get("reason")}')
         finally:
             shutil.rmtree(temp_out, ignore_errors=True)
 
@@ -2071,6 +2295,9 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
 
     if not prompts:
         raise RuntimeError('未在 prompt_block 中找到任何 图片 N: 提示词')
+    prompts_by_seq = {int(item['index']): item for item in prompts}
+    continuity_families = _continuity_family_maps(prompts_by_seq, videos)
+    continuity_retries = continuity_max_retries(config)
 
     def _check_cancel():
         if on_progress and on_progress('cancel_check', None):
@@ -2156,6 +2383,8 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         is_turn = 'TURN' in incoming_meta
         # CUT changes the edit instruction, but does not break the image-reference chain.
         is_cut_head = ('CUT' in incoming_meta) and ('BRIDGE' not in incoming_meta)
+        is_continuity_transition = is_transition_frame(
+            seq, item.get('meta', ''), incoming_meta, _continuity_beat(manifest, seq))
         cover_ref = (resolve_cover_reference(config, title)
                      if seq == 1 and not skip_api_call else None)
         # 跨空间层守卫（2026-08-02 复盘）：首帧的图参考只能是**同层**的封面。
@@ -2246,13 +2475,19 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                 log('ERROR', 'FRAME_SEQ', f"第 {seq} 帧图生图失败（禁止回退文生图）: {gen_err}")
                 raise RuntimeError(f"第 {seq} 帧图生图失败: {gen_err}")
 
-            # Apply LAB color matching to prevent pink drift
+            # Apply LAB color matching to prevent pink drift.  A new camera family owns a
+            # separate colour baseline; forcing every interior frame toward IMAGE 1's outdoor
+            # palette is itself a continuity defect.
             if seq > 1 and os.path.exists(target_path):
                 first_frame_path = os.path.join(frames_dir, 'img_001.webp')
-                if os.path.exists(first_frame_path):
+                color_reference = (None if is_continuity_transition else
+                                   _continuity_color_reference(
+                                       config, project_dir, continuity_families, seq,
+                                       first_frame_path))
+                if color_reference and os.path.exists(color_reference):
                     if sys.stdout:
-                        print(f"[COLOR MATCH] Aligning frame {seq} color to baseline first frame.")
-                    _match_color_lab(target_path, first_frame_path, target_path)
+                        print(f"[COLOR MATCH] Aligning frame {seq} color to family baseline.")
+                    _match_color_lab(target_path, color_reference, target_path)
 
             # P1 换族锚点惯性兜底（2026-07-15 盐湖贝壳单）：桥接帧由 i2i 生成时，
             # 参考惯性可能压过"进入新空间"的文本指令，渲出上一帧的近似复制帧——
@@ -2278,8 +2513,12 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                         retries += 1
                         reference = previous_path
                         first_frame_path = os.path.join(frames_dir, 'img_001.webp')
-                        if os.path.exists(first_frame_path):
-                            _match_color_lab(target_path, first_frame_path, target_path)
+                        color_reference = (None if is_continuity_transition else
+                                           _continuity_color_reference(
+                                               config, project_dir, continuity_families, seq,
+                                               first_frame_path))
+                        if color_reference and os.path.exists(color_reference):
+                            _match_color_lab(target_path, color_reference, target_path)
                     except QuotaExhaustedError:
                         # 配额耗尽原样上抛，与主渲染路径同一套处置：不再切兜底模型，
                         # 也不吞掉失败后继续往下渲——下一帧照样会
@@ -2291,9 +2530,45 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                         if sys.stdout:
                             print(f"[ANCHOR INERTIA] Frame {seq} i2i 加强重试失败（{inertia_err}），保留原帧并留痕")
 
-            # 渲染期不做任何视觉判定（2026-08-05 起门框清除/原始度/逐帧质检一并移除）：
-            # 帧直出落盘，quality_gate 记"没人看过"，要不要复核由用户在帧网格上手动决定。
-            current_quality_gate = 'pending_manual_review'
+            continuity_check, _family_id = _continuity_result(
+                config, project_dir, manifest, continuity_families, videos, seq,
+                item, reference, target_path, on_progress=on_progress)
+            continuity_retry_no = 0
+            while _continuity_should_retry(
+                    continuity_check, continuity_retry_no, continuity_retries):
+                continuity_retry_no += 1
+                if on_progress:
+                    on_progress('frame_continuity_retry', {
+                        'sequence': seq, 'slot': seq, 'attempt': continuity_retry_no,
+                        'reason': continuity_check.get('reason'),
+                        'message': (f'IMG {seq:03d} 发现场景漂移或推进不足，'
+                                    f'正在自动重试 {continuity_retry_no}/{continuity_retries}…'),
+                    })
+                retry_control = f'{ctrl_prompt}\n\n{_CONTINUITY_RETRY_CONTROL}'.strip()
+                transport = _generate_image_edit(
+                    config, item['prompt'], reference, target_path,
+                    control_prompt=retry_control)
+                retries += 1
+                if seq > 1:
+                    first_frame_path = os.path.join(frames_dir, 'img_001.webp')
+                    color_reference = (None if is_continuity_transition else
+                                       _continuity_color_reference(
+                                           config, project_dir, continuity_families, seq,
+                                           first_frame_path))
+                    if color_reference and os.path.exists(color_reference):
+                        _match_color_lab(target_path, color_reference, target_path)
+                continuity_check, _family_id = _continuity_result(
+                    config, project_dir, manifest, continuity_families, videos, seq,
+                    item, reference, target_path, on_progress=on_progress)
+
+            continuity_failed = continuity_check.get('status') == 'failed'
+            current_quality_gate = (
+                'frame_continuity_failed' if continuity_failed else 'pending_manual_review')
+            if continuity_check.get('status') == 'warned':
+                _warning = continuity_check.get('reason') or '本地连续性检查留痕'
+                vlm_qa_reason = f'CONTINUITY WARN: {_warning}'
+            elif continuity_failed:
+                vlm_qa_reason = continuity_check.get('reason') or '场景连续性检查失败'
         else:
             reference = previous_path if seq > 1 else None
             existing_frame = manifest_frames_by_seq.get(seq)
@@ -2342,6 +2617,9 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             'vlm_qa_reason': vlm_qa_reason,
             'parent_hash': p_hash,
         }
+        if not skip_api_call:
+            frame_info['continuity_check'] = continuity_check
+            frame_info['family_id'] = _family_id
         if cover_anchor:
             frame_info['anchor_reference'] = 'cover'
         elif cover_layer_block:
@@ -2373,7 +2651,8 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         # 不带过来的话指纹会丢，drop_stale_review_verdicts 之后就再也无法判断这条
         # 结论是否过期（等于永久停在"看着像审过"的状态）。
         if skip_api_call and existing_frame:
-            for key in ('review_frames_sha256', 'reviewed_at', 'review_issues'):
+            for key in ('review_frames_sha256', 'reviewed_at', 'review_issues',
+                        'continuity_check', 'family_id'):
                 if existing_frame.get(key) is not None:
                     frame_info[key] = existing_frame[key]
 
@@ -2389,6 +2668,17 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
 
         if on_progress:
             on_progress('frame', {'frame': frame_info, 'current': generated_count, 'total': total_to_generate})
+
+        if not skip_api_call and current_quality_gate == 'frame_continuity_failed':
+            if on_progress:
+                on_progress('frame_continuity_failed', {
+                    'sequence': seq, 'slot': seq,
+                    'message': (f'IMG {seq:03d} 连续性检查在自动重试后仍失败，'
+                                '已暂停续链，避免污染后续帧。'),
+                    'reason': continuity_check.get('reason'),
+                })
+            raise FrameContinuityError(
+                f'IMG {seq:03d} 场景连续性检查失败：{continuity_check.get("reason")}')
 
     manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
     update_manifest_stale_status(manifest, project_dir,

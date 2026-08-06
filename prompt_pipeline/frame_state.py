@@ -81,7 +81,10 @@ def build_frame_state_contract(beat_ladder: list[dict[str, Any]]) -> list[dict[s
 
 
 def validate_frame_state_contract(
-    contracts: list[dict[str, Any]], *, max_package_operations: int = 2
+    contracts: list[dict[str, Any]],
+    *,
+    min_package_operations: int = 2,
+    max_package_operations: int = 3,
 ) -> list[str]:
     """Validate one-delta-per-frame and monotonic construction state.
 
@@ -119,10 +122,15 @@ def validate_frame_state_contract(
             errors.append(f"Beat {idx} frame-state contract is missing: {', '.join(missing)}.")
 
         package = item.get("package_operations") or []
-        if not 1 <= len(package) <= max_package_operations:
+        # 口径与 milestone_ladder_violations / ladder schema 第 13 条严格一致：
+        # 一个普通施工拍申报 2~3 道紧密相关的工序。三处曾各写各的（schema 说 1~3、
+        # 里程碑闸判 1~3、这里判 1~2），于是一条 3 工序的收口拍能一路通过规划验收，
+        # 再被这道循环外硬闸判死，整单只拿到一句报错。改这里时务必同步那两处。
+        if not min_package_operations <= len(package) <= max_package_operations:
             errors.append(
-                f"Beat {idx} declares {len(package)} operations; a frame may carry only one "
-                f"primary operation or two tightly coupled operations."
+                f"Beat {idx} declares {len(package)} operations; a frame must carry "
+                f"{min_package_operations} to {max_package_operations} tightly coupled operations "
+                f"that share one terminal product."
             )
         if len(item.get("changed_grid_cells") or []) > 3:
             errors.append(f"Beat {idx} changes more than three composition cells.")

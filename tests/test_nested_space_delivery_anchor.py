@@ -40,7 +40,9 @@ def _ladder_json(total=12, bridge_at=3, cut_at=7):
             'after_state': f'the entire stage {i} product is complete',
             'completion_extent': 'the full named zone',
             'changed_grid_cells': ['Grid B2', 'Grid C2'],
-            'package_operations': ['repair'],
+            # 普通施工拍要申报 2~3 道紧密工序（pp._MIN_PACKAGE_OPERATIONS）；
+            # repair + placement 都不属于任何材料层族，不会触发跨层判据。
+            'package_operations': ['repair', 'placement'],
             'primary_progress': 'grows from absent to complete',
             'secondary_progress': 'the staged stock drains from full to empty',
             'persistent_traces': ['fastener marks', 'contact dust'],
@@ -332,7 +334,10 @@ class TestSecondSpaceArcFloor(unittest.TestCase):
     def test_final_retry_repairs_incompatible_package_metadata(self):
         ladder = json.loads(_ladder_json(total=12))
         ladder[5]['operation'] = 'furnishing'
-        ladder[5]['package_operations'] = ['furnishing', 'wiring']
+        # wiring 与 furnishing 不相容，lighting 与 furnishing 同族：末轮修复删掉
+        # 前者、留下后者，包仍然满足 2 道的下限。（若删完只剩一道，修复会整拍放过
+        # 不动——把「相位冲突」换成「只剩一道工序」并没有修好任何东西。）
+        ladder[5]['package_operations'] = ['furnishing', 'wiring', 'lighting']
         encoded = json.dumps(ladder)
 
         state, beat_users = self._run([encoded, encoded, encoded])
@@ -341,7 +346,7 @@ class TestSecondSpaceArcFloor(unittest.TestCase):
         repaired = next(b for b in state['beat_ladder']
                         if b.get('operation') == 'furnishing'
                         and b.get('transition_stage') == 'none')
-        self.assertEqual(repaired['package_operations'], ['furnishing'])
+        self.assertEqual(repaired['package_operations'], ['furnishing', 'lighting'])
 
     def test_a_missing_reset_cut_is_rejected(self):
         """只有过门、没有重置切点 —— 这正是 run_1785463152800 的形态：

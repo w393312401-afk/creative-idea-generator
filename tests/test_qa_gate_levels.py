@@ -68,6 +68,26 @@ class TestQaGateLevelResolution(unittest.TestCase):
             self.assertEqual(merged.get('qaGateLevel'), 'lenient')
             self.assertEqual(qa_gate_level(merged), 'lenient')
 
+    def test_effective_config_passes_continuity_settings_in_managed_mode(self):
+        with _gate_sources(), patch.object(server_common, 'SERVER_MANAGED', True):
+            merged = effective_config({
+                'frameContinuityMode': 'strict',
+                'frameContinuityMaxRetries': 2,
+                'frameContinuityLocalEdit': 'off',
+                'autoSplitHighRiskBeats': True,
+            })
+            self.assertEqual(merged['frameContinuityMode'], 'strict')
+            self.assertEqual(merged['frameContinuityMaxRetries'], 2)
+            self.assertTrue(merged['autoSplitHighRiskBeats'])
+
+    def test_nonmanaged_server_config_supplies_continuity_defaults(self):
+        with _gate_sources(server_cfg={
+                'frameContinuityMode': 'off', 'frameContinuityMaxRetries': 0,
+        }), patch.object(server_common, 'SERVER_MANAGED', False):
+            merged = effective_config({})
+            self.assertEqual(merged['frameContinuityMode'], 'off')
+            self.assertEqual(merged['frameContinuityMaxRetries'], 0)
+
 
 
 class TestGateResponseFormatDrift(unittest.TestCase):

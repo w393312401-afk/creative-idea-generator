@@ -10,6 +10,9 @@ from unittest.mock import patch
 
 from frame_generator import (
     plan_fx_chunks,
+    fx_bridge_target_sequences,
+    split_fx_chunks_at_heads,
+    fx_prompt_with_bridge_control,
     plan_frame_chunk_accounts,
     _fx_extract_uuid,
     _fx_find_ref_for,
@@ -72,6 +75,31 @@ class TestPlanFxChunks(unittest.TestCase):
     def test_unsorted_input_and_empty(self):
         self.assertEqual(plan_fx_chunks([5, 3, 4]), [[3, 4, 5]])
         self.assertEqual(plan_fx_chunks([]), [])
+
+    def test_bridge_target_starts_a_fresh_batch(self):
+        prompts = {i: {'prompt': f'image {i}', 'meta': ''} for i in range(1, 8)}
+        videos = {4: {'body': 'cross the threshold', 'meta': '[BRIDGE]'}}
+        heads = fx_bridge_target_sequences(prompts, videos)
+        self.assertEqual(heads, {5})
+        self.assertEqual(
+            split_fx_chunks_at_heads(plan_fx_chunks(prompts), heads),
+            [[1, 2, 3, 4], [5], [6, 7]],
+        )
+
+    def test_fx_bridge_control_is_inlined_and_idempotent(self):
+        prompts = {5: {'prompt': 'Camera settles inside.', 'meta': ''}}
+        videos = {4: {'body': 'cross', 'meta': '[BRIDGE]'}}
+        rendered = fx_prompt_with_bridge_control(5, prompts[5], prompts, videos)
+        self.assertIn('camera viewpoint is actively advancing forward', rendered)
+        prompts[5]['prompt'] = rendered
+        self.assertEqual(
+            fx_prompt_with_bridge_control(5, prompts[5], prompts, videos), rendered)
+
+    def test_fx_bridge_turn_uses_turn_control(self):
+        prompts = {5: {'prompt': 'Camera settles inside.', 'meta': ''}}
+        videos = {4: {'body': 'cross and pan', 'meta': '[BRIDGE TURN]'}}
+        rendered = fx_prompt_with_bridge_control(5, prompts[5], prompts, videos)
+        self.assertIn('ROTATES horizontally', rendered)
 
 
 class TestPlanFrameChunkAccounts(unittest.TestCase):

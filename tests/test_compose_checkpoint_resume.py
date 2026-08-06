@@ -18,6 +18,15 @@ from unittest.mock import patch
 
 import prompt_pipeline as pp
 
+# 每个相位的同族伴随工序，用来把夹具梯子的 package_operations 补到下限 2 道
+# （pp._MIN_PACKAGE_OPERATIONS）。与 deterministic_fallback_beat_ladder 里的
+# phase_companion 同源；同族配对不会额外触发相位冲突/材料层跨越判据。
+_COMPANION = {
+    'clearing': 'demolition', 'repair': 'placement', 'rough-in': 'wiring',
+    'framing': 'insulation', 'drywall': 'paneling', 'flooring': 'painting',
+    'painting': 'priming', 'furnishing': 'lighting',
+}
+
 
 class TestCheckpointStorage(unittest.TestCase):
     def setUp(self):
@@ -145,7 +154,7 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
              'milestone_name': 'approach fully cleared', 'before_state': 'debris covers the approach',
              'after_state': 'the entire approach is cleared to stable ground',
              'completion_extent': 'the entire visible approach', 'changed_grid_cells': ['Grid B2', 'Grid C2'],
-             'package_operations': ['clearing'], 'primary_progress': 'clear ground expands across the full approach',
+             'package_operations': ['clearing', 'demolition'], 'primary_progress': 'clear ground expands across the full approach',
              'secondary_progress': 'two debris crates fill from empty to full',
              'persistent_traces': ['rake grooves', 'crate drag marks'],
              'preserve_state': 'the tower shell remains rusted and untouched'},
@@ -154,7 +163,7 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
              'after_state': 'all declared wall and ceiling studs are installed',
              'completion_extent': 'all interior walls and the ceiling curve',
              'changed_grid_cells': ['Grid A2', 'Grid B2', 'Grid C2'],
-             'package_operations': ['framing'], 'primary_progress': 'stud count grows from zero to twelve',
+             'package_operations': ['framing', 'insulation'], 'primary_progress': 'stud count grows from zero to twelve',
              'secondary_progress': 'the staged timber bundle drains from twelve to zero',
              'persistent_traces': ['screw heads', 'sawdust bands'],
              'preserve_state': 'the cleared floor and original shell remain unchanged'},
@@ -322,7 +331,8 @@ class TestOutlineContractBlocksTheLadder(unittest.TestCase):
                     'after_state': f'the entire bay shows the finished {op} result',
                     'completion_extent': 'the entire visible bay',
                     'changed_grid_cells': ['Grid B2', 'Grid C2'],
-                    'package_operations': [op],
+                    # 普通施工拍要申报 2~3 道紧密工序；同族配对不触发相位冲突判据。
+                    'package_operations': [op, _COMPANION[op]] if op in _COMPANION else [op],
                     'primary_progress': f'the {op} result spreads across the whole bay',
                     'secondary_progress': 'the staged material bundle drains to zero',
                     'persistent_traces': ['screw heads', 'sawdust bands'],
@@ -535,10 +545,9 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 pp.compose_remaining_beats({}, state)
 
-        # The one batched _chat call already asked for all of beats 1-4 at once (that's
-        # the whole point of batching) — the crash happens afterward, in per-beat
-        # validation of the batch's own result, when processing reaches beat 3.
-        self.assertEqual(sorted(set(calls)), [1, 2, 3, 4])
+        # Rolling compose batches are capped at three beats. The crash happens while
+        # validating beat 3, before the next batch/individual request can start beat 4.
+        self.assertEqual(sorted(set(calls)), [1, 2, 3])
         checkpoint = pp.load_compose_checkpoint(self.fingerprint)
         self.assertIsNotNone(checkpoint, "a crash mid-loop must still leave a checkpoint behind")
         self.assertEqual(sorted(checkpoint['pass_beats_done']), [1, 2],
@@ -629,12 +638,14 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
 
         # beat 2 was attempted (via the individual direct-generation fallback, since the
         # batch response was missing its sections) but never counted as done because no
-        # attempt ever produced both sections, so it fell back to a placeholder.
+        # attempt ever produced both sections, so production mode failed without a placeholder.
         self.assertIn(2, calls)
         checkpoint = pp.load_compose_checkpoint(self.fingerprint)
         self.assertEqual(sorted(checkpoint['pass_beats_done']), [1], "the fallback beat must not be marked done")
-        self.assertEqual(checkpoint['fallback_count'], 1)
-        self.assertIn('static ultra-wide 14mm tripod shot', state['compiled_images'][3], "beat 2 should have shipped its placeholder text for now")
+        self.assertEqual(checkpoint['fallback_count'], 0,
+                         "production fail-closed mode must not count an undelivered placeholder")
+        self.assertNotIn(3, state['compiled_images'],
+                         "production mode must not write a placeholder IMAGE into the slot")
 
         # Resume: beat 2's sections now come back, and the beat-3 crash is gone.
         beat_2_sections_missing['value'] = False
@@ -645,7 +656,7 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
             output = pp.compose_remaining_beats({}, state)
 
         self.assertEqual(sorted(set(calls)), [2, 3], "resume must retry the fallback beat, not skip it like a completed one")
-        self.assertIn('Image prompt for beat 3', output)  # real beat-2 output replaced the placeholder
+        self.assertIn('Image prompt for beat 3', output)
         self.assertIn('Image prompt for beat 4', output)
         self.assertIsNone(pp.load_compose_checkpoint(self.fingerprint))
 
