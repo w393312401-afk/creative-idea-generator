@@ -302,11 +302,20 @@ def background_worker(task_id, config, dimensions):
             # 额度，adaptive 和 fixed 两态都一样。旧文案统一写"属正常自适应收缩/扩张"，
             # fixed 模式下这么说不准确——差额本来就不是"收缩/扩张"，而是过门子拍展开
             # 带来的（2026-08-06）。
+            # 2026-08-07：有卡片清单时合成走一比一模式（compose_anchor_and_packet 的
+            # _outline_strict 分支），过门/重构图这类"额外产出拍"整段停用，
+            # compose_anchor_and_packet 也已经把这次实际生效的 beats_count 回写进
+            # dimensions——理论上不应该再出现不一致。这里出现说明回写路径本身出了问题
+            # 或者走的是没有清单的兜底路径，按真事故级别记录，不再当作"正常留痕"。
+            _has_outline = bool(dimensions.get('beat_outline')) if isinstance(dimensions, dict) else False
             _mode = (dimensions.get('beat_count_mode') if isinstance(dimensions, dict) else None) or 'adaptive'
-            _reason = ('施工拍已按 fixed 声明值交付，差额来自过门子拍展开，仅留痕'
-                      if str(_mode).lower() == 'fixed' else
-                      '属正常自适应收缩/扩张，仅留痕')
-            log('INFO', 'COMPOSE',
+            if _has_outline:
+                _level, _reason = 'WARN', '有卡片清单却仍出现差额，一比一回写路径可能失效，需要排查'
+            else:
+                _level, _reason = ('INFO', '施工拍已按 fixed 声明值交付，差额来自过门子拍展开，仅留痕'
+                                   if str(_mode).lower() == 'fixed' else
+                                   '属正常自适应收缩/扩张，仅留痕')
+            log(_level, 'COMPOSE',
                 f"交付拍数与卡片声明不一致（{_reason}）："
                 f"beats_count={result['slot_counts'].get('declared_beats_count')} / "
                 f"施工拍={result['slot_counts']['construction_beats']} / "

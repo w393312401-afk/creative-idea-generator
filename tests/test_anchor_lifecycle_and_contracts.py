@@ -227,26 +227,28 @@ class TestDraftPlanIsNeverTruncated(unittest.TestCase):
             self.assertIn(entry['text'], block)
         self.assertIn('14. 点亮全景，人物入住 [reward]', block)
 
-    def test_over_budget_draft_gets_an_explicit_merge_instruction(self):
+    def test_over_budget_cap_no_longer_triggers_compression(self):
+        """2026-08-07 起清单一比一还原：调用方（compose_anchor_and_packet 的
+        _outline_strict 分支）保证 max_total_beats 恒等于 len(plan)，这个 cap 参数
+        不再被用来压缩清单——不管传进来多小，块里要求的都是清单原长度，不再出现
+        "BUDGET COMPRESSION" 或按预算合并的措辞。"""
         _, block = pp.build_outline_plan_block(self.OUTLINE, 8)
-        self.assertIn('BUDGET COMPRESSION', block)
-        self.assertIn('14 entries', block)
-        self.assertIn('capped at 8', block)
+        self.assertNotIn('BUDGET COMPRESSION', block)
+        self.assertNotIn('MERGE WIDTH LIMIT', block)
+        self.assertIn(f'EXACTLY {len(self.OUTLINE)} elements', block)
 
     def test_a_draft_that_fits_carries_no_compression_note(self):
         _, block = pp.build_outline_plan_block(self.OUTLINE, 15)
         self.assertNotIn('BUDGET COMPRESSION', block)
 
-    def test_announced_merge_limit_is_never_looser_than_the_enforced_one(self):
-        """宣告值必须是验收值的下界：照着提示词做的模型不能反而撞线。"""
+    def test_one_to_one_contract_forbids_merging_regardless_of_cap(self):
+        """一比一契约不再按拍数预算算"允许合并宽度"——不管 cap 多大/多小，块里都
+        明说禁止合并/拆分/新增一拍；_max_merge_width 只服务没有清单的旧路径
+        （outline_contract_violations 的非严格分支），不再被这个函数调用。"""
         for cap in range(4, 16):
-            plan, block = pp.build_outline_plan_block(self.OUTLINE, cap)
-            announced = int(re.search(r'at most (\d+) card work plan entries', block).group(1))
-            # 真实 ladder 只会更短、或含不计入的过门拍，两者都让允许值更宽
-            for ladder_len in range(max(2, cap - 3), cap + 1):
-                enforced = pp._max_merge_width(
-                    len(plan), [{'operation': 'repair'}] * ladder_len)
-                self.assertLessEqual(announced, enforced)
+            _, block = pp.build_outline_plan_block(self.OUTLINE, cap)
+            self.assertIn('Never merge two entries onto one beat', block)
+            self.assertIn('never split one entry across two beats', block)
 
     def test_no_draft_means_no_block_and_no_refs_demand(self):
         self.assertEqual(pp.build_outline_plan_block([], 10), ([], ""))

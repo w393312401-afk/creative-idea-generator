@@ -241,7 +241,8 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
         2026-08-05 起它是**硬规则**而不是软参考:旧文案标成 "SOFT reference" 并明说
         "Rewrite, merge, split, or reorder any draft entry",规划器把"改写"理解成
         "换成我认为更好的工序",用户照着挑的那几条就此静默消失(覆盖率契约只查编号,
-        查不到内容被掉包)。物理规则仍然优先,但只能让一条工序挪位/合并/拆分。"""
+        查不到内容被掉包)。2026-08-07 起进一步收紧为一比一：物理规则仍然优先,但
+        只能让一条工序挪位（决定哪一拍承担穿越动作），不再允许合并/拆分/新增。"""
         self.dimensions['beat_outline'] = ['清运塔内积渣与锈屑', '架设内墙木龙骨', '点亮壁炉,人物入住']
         pp.compose_anchor_and_packet({}, self.dimensions)
 
@@ -250,11 +251,11 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
         self.assertIn('架设内墙木龙骨', beat_user)
         self.assertIn('CARD WORK PLAN (MANDATORY', beat_user)
         self.assertNotIn('SOFT reference', beat_user)
-        # 物理规则仍然优先,但作用域被写死成"挪位/合并/拆分",不含删除与替换
-        self.assertIn('WHAT PHYSICS MAY AND MAY NOT CHANGE', beat_user)
-        self.assertIn('NEVER license you to DELETE it, REPLACE it, or SUBSTITUTE', beat_user)
-        # 顺序与内容两道新契约
-        self.assertIn('ORDER (mandatory)', beat_user)
+        # 一比一契约：拍数恒等于条目数,逐条对应,禁止合并/拆分/新增
+        self.assertIn('ONE-TO-ONE CONTRACT (mandatory, non-negotiable)', beat_user)
+        self.assertIn('EXACTLY 3 elements', beat_user)
+        self.assertIn('they may NEVER license merging, splitting, adding, deleting, '
+                      'or substituting an entry', beat_user)
         self.assertIn('DELIVERY RESTATEMENT (mandatory)', beat_user)
         # 编号顺序透传,便于模型对齐用户看到的那一版工序
         self.assertIn('1. 清运塔内积渣与锈屑', beat_user)
@@ -264,24 +265,30 @@ class TestSignatureAnchorFlowsIntoParsedBrief(unittest.TestCase):
         """草案**不再按拍数裁剪**(2026-08-05)。没传 beat_outline 时整块不出现,
         手工填维度直出的老路径行为不变。
 
-        旧行为是 [:max_total - 1] + 末条:beats_count=2(fixed) 时 5 条草案只送 3 条,
-        中间的「C封板」「D刷漆」根本没进过提示词——规划器不知道它们存在,BINDING
-        CONTRACT 的覆盖率也就管不到它们,而用户在「🔨 节拍简介」弹窗里看到的仍是完整
-        的 5 条。现在整份送进去,超额部分由规划器合并消化(合并留 diff、宽度受
-        _max_merge_width 闸门约束),预算不足这件事改成显式告知。"""
+        2026-08-07 起清单一比一还原是默认行为：有 beat_outline 时最终拍数恒等于
+        清单长度，dimensions.beats_count/beat_count_mode 这个"预算上限"被直接覆盖、
+        不再生效（见 compose_anchor_and_packet 的 _outline_strict 分支）——不存在
+        "超额部分合并消化"这回事了，草案有几条就是几拍，一条不多一条不少。这里把
+        beats_count 故意设成比草案条数更紧的 1（此前测的是 2/fixed ⇒ 上限 3），
+        证明这个上限现在被完全无视。"""
         pp.compose_anchor_and_packet({}, self.dimensions)
         self.assertNotIn('CARD WORK PLAN', self.captured_beat_user['text'])
 
-        self.dimensions['beat_outline'] = ['A清渣', 'B龙骨', 'C封板', 'D刷漆', 'E入住']
-        pp.compose_anchor_and_packet({}, self.dimensions)
+        # 三条草案，故意配合本用例桩响应 beat_ladder_json 的固定 3 拍结构。
+        self.dimensions['beat_outline'] = ['A清渣', 'B龙骨', 'C入住']
+        self.dimensions['beats_count'] = 1  # 比草案条数更紧的预算上限，理应被无视
+        state = pp.compose_anchor_and_packet({}, self.dimensions)
         beat_user = self.captured_beat_user['text']
         self.assertIn('CARD WORK PLAN', beat_user)
-        for i, text in enumerate(['A清渣', 'B龙骨', 'C封板', 'D刷漆', 'E入住'], 1):
+        for i, text in enumerate(['A清渣', 'B龙骨', 'C入住'], 1):
             self.assertIn(f'{i}. {text}', beat_user)
-        # 预算不足 → 显式要求合并而不是丢弃(beats_count=2 fixed ⇒ 上限 3 个元素)
-        self.assertIn('BUDGET COMPRESSION', beat_user)
-        self.assertIn('5 entries', beat_user)
-        self.assertIn('capped at 3', beat_user)
+        # 预算上限不再触发合并——这套机制已经整体移除
+        self.assertNotIn('BUDGET COMPRESSION', beat_user)
+        self.assertIn('EXACTLY 3 elements', beat_user)
+        self.assertEqual(len(state['beat_ladder']), 3)
+        # 实际生效的拍数上限回写进 dimensions，供 server.py 的槽位数核对使用
+        self.assertEqual(self.dimensions['beats_count'], 2)
+        self.assertEqual(self.dimensions['beat_count_mode'], 'fixed')
 
 
 class TestOutlineContractBlocksTheLadder(unittest.TestCase):

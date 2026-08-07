@@ -1075,6 +1075,53 @@ def _multimodal_chat(config, system, user_text, image_paths, model=None, max_tok
     return choice['message']['content']
 
 
+def ground_threshold_reveal_prompt(config, reference_image_path):
+    """在真正过门/硬切前用视觉模型看着上一帧真实渲染结果联想门后长什么样。
+
+    组稿阶段（compose_remaining_beats）写这一拍的提示词时，过门前那一帧压根还没渲出来，
+    只能凭文字空想材质/结构——2026-08-07 复盘：废弃高架桥空心桥墩过门后渲成完全不搭的
+    生锈金属格栅内部，就是这个空想的产物。这里不做事后视觉判定/拒绝重渲，只是换一个更
+    早的输入源：渲染前先把已经落盘的真实参考图丢给模型，让它照着看得见的材质/结构/光线
+    去写这一拍该有的样子，而不是继续用组稿阶段那份没见过任何像素的猜测。
+    调用失败时返回 None，调用方原样沿用组稿阶段写好的提示词，不阻塞整条渲染链。
+    """
+    system = (
+        "You are writing the content description for ONE photoreal image: what lies just "
+        "beyond a doorway/opening/threshold in an abandoned-structure renovation project, "
+        "the moment the camera finishes crossing it. You are shown the actual last frame "
+        "rendered before the crossing — look at its concrete material, structure, weathering, "
+        "and light so the space you invent is physically continuous with it, not a generic "
+        "invented room in an unrelated material.\n\n"
+        "Mandatory rules:\n"
+        "1. Untouched trauma state: show at least three of structural damage, surface decay "
+        "(rust, water stains, mold, corrosion), vegetation intrusion, or debris/clutter — "
+        "nobody has entered this space yet.\n"
+        "2. Zero intervention evidence: no tools, ladders, scaffolding, tarps, work lights, "
+        "safety cones, or any surface that reads as already cleaned/repaired/painted.\n"
+        "3. Unarranged: wreckage lies exactly where gravity and time dropped it — never swept, "
+        "piled, or aligned.\n"
+        "4. Material continuity: reuse the same material palette and weathering language "
+        "visible in the reference photo (its concrete/wood/metal/stone, its decay severity, "
+        "its light direction and colour) — never introduce a structural material the reference "
+        "photo gives no basis for.\n"
+        "5. One real photograph, never a grid, collage, or split composition.\n"
+        "6. Plain visual prose only — no percentages, labels, or on-screen text.\n\n"
+        "Respond with ONLY the description, 2-4 sentences, nothing else."
+    )
+    user_text = (
+        "This is the actual last frame rendered before the crossing. Describe what plausibly "
+        "lies just beyond this opening, continuous with everything visible here."
+    )
+    try:
+        response = _multimodal_chat(config, system, user_text, [reference_image_path], max_tokens=400)
+    except Exception as exc:
+        if sys.stdout:
+            print(f"[THRESHOLD REVEAL] 依据参考图联想室内失败，沿用组稿阶段的提示词: {exc}")
+        return None
+    text = (response or '').strip()
+    return text or None
+
+
 def is_skipped_verdict(reason):
     """True 表示该判定其实没跑（服务异常 fail-open 放行，或 qaGateLevel=off 主动关闭），
     不是真实 PASS。调用方据此把 quality_gate 记为 auto_approved_degraded，而不是伪装成
@@ -1941,7 +1988,13 @@ def milestone_ladder_violations(beat_ladder, mode='Standard'):
             errors.append('Beat ladder contains a non-object entry.')
             continue
         op = str(beat.get('operation') or '').strip().lower()
-        if op in ('threshold', 'reward', 'reframe') or beat.get('bridge_stage') or beat.get('hard_cut'):
+        if op in ('reward', 'reframe'):
+            continue
+        # 一比一模式下过门/硬切拍自己在交付一条真实清单工序（outline_refs 非空），
+        # 同样要满足这套里程碑质量门槛（见 _milestone_beat_directive 同款判据）——
+        # 只有没有 outline_refs 的老式纯占位过门/threshold 拍才继续豁免。
+        if (op == 'threshold' or beat.get('bridge_stage') or beat.get('hard_cut')) \
+                and not beat.get('outline_refs'):
             continue
         idx = beat.get('index')
         missing = [field for field in _MILESTONE_TEXT_FIELDS
@@ -3944,13 +3997,35 @@ def expand_spatial_transition_beats(beat_ladder, parsed_brief):
                 run_by_space[sid] = run + 1
         reframed.append(beat)
     expanded = reframed
+    return finalize_beat_ladder_fields(expanded)
 
+
+def finalize_beat_ladder_fields(beat_ladder):
+    """按 space_id 序列给每一拍补全 index/transition_stage/camera_family/reveal_scope/
+    light_source_state/result_space_family 默认值。
+
+    从 expand_spatial_transition_beats 尾段拆出来（2026-08-07）：一比一模式跳过该函数
+    的过门拆拍/重构图插入（见 compose_anchor_and_packet 的 _outline_strict 分支），
+    但仍需要这段默认值回填——beat_space_family/beat_space_index 会自行扫描
+    bridge_stage/hard_cut 兜底，不依赖这里，但 _beat_contract 里其余直接
+    beat.get('space_id'/'transition_stage'/'camera_family'/...) 的调用点需要一个
+    确定性默认值，不能是裸缺键。"""
+    if not isinstance(beat_ladder, list):
+        return beat_ladder
     current_space = 'site'
     powered_spaces = set()
-    for index, beat in enumerate(expanded, 1):
+    for index, beat in enumerate(beat_ladder, 1):
         if not isinstance(beat, dict):
             continue
-        current_space = str(beat.get('space_id') or current_space)
+        # 显式 space_id（legacy 过门展开路径已经打好）优先；一比一模式下过门/硬切没有
+        # 展开成独立拍，没有人预先打 space_id——这里改用 bridge_stage/hard_cut 标记本身
+        # 推断进了第几个空间，判据与 beat_space_family/beat_space_index 的兜底扫描一致：
+        # 第一次遇到标记进 'primary'，同一梯子里第二次遇到（嵌套双空间骨架的重置切点）
+        # 进 'secondary'。
+        if beat.get('space_id'):
+            current_space = str(beat['space_id'])
+        elif beat.get('bridge_stage') or beat.get('hard_cut'):
+            current_space = 'secondary' if current_space in ('primary', 'secondary') else 'primary'
         beat['index'] = index
         beat.setdefault('space_id', current_space)
         beat.setdefault('transition_stage', 'none')
@@ -3969,7 +4044,7 @@ def expand_spatial_transition_beats(beat_ladder, parsed_brief):
             else:
                 beat['light_source_state'] = 'entry daylight or carried portable work light only; fixed fixtures dark'
         beat.setdefault('result_space_family', 'exterior' if current_space == 'site' else 'interior')
-    return normalize_beat_ladder(expanded)
+    return normalize_beat_ladder(beat_ladder)
 
 
 def _beat_semantic_text(beat):
@@ -7966,25 +8041,47 @@ def compose_anchor_and_packet(config, dimensions, on_progress=None):
     pacing_skeleton_id = normalize_pacing_skeleton_ids(
         dimensions.get('pacing_skeleton'), default_all=False)[0]
     pacing_skeleton = PACING_SKELETONS[pacing_skeleton_id]
-    # beats_count is the construction-beat cap in adaptive mode; the final reward is
-    # appended inside the ladder.  total_beats begins as the maximum and is replaced by
-    # len(beat_ladder) as soon as planning succeeds.
-    max_total_beats = beats_count + 1
-    # beats_floor：本项目的施工拍下界，由灵感卡片的工序清单推出（见 compute_beats_floor），
-    # 前端原样透传。它替掉了原来那个与项目重量无关的全局常量下界——旧行为下 count_contract
-    # 要求 ladder 挑「能表达全部必要里程碑的最小拍数」，而验收只看 [5+1, max]，于是一张
-    # 推荐 13 拍的重型改造单塌回 6 拍完全合法，用户挑卡时看到的推进密度和成片对不上。
-    # 缺省（老任务/老断点/手动输入主题）回落到全局常量 = 完全保持旧行为。
-    beats_floor = dimensions.get('beats_floor')
-    try:
-        beats_floor = int(beats_floor)
-    except (TypeError, ValueError):
-        beats_floor = _MIN_ADAPTIVE_CONSTRUCTION_BEATS
-    # 下界只能抬高不能降低（卡片给个 2 也不会破坏既有保底）；且不能超过上限，
-    # 否则 _beat_count_is_valid 恒假、每次都掉进兜底 ladder。
-    beats_floor = max(_MIN_ADAPTIVE_CONSTRUCTION_BEATS, min(beats_floor, beats_count))
-    min_total_beats = min(max_total_beats, beats_floor + 1)
-    total_beats = max_total_beats
+    # 2026-08-07：清单一比一还原（默认行为，不是可选模式）。有卡片清单时，最终拍数
+    # 就是清单长度本身，不再通过 compute_beats_floor 的加权密度公式或全局下界常量去
+    # 猜"够不够"——猜的结果就是用户在弹窗里数着的 11 条清单，合成出来变成"8 拍floor
+    # 压缩＋插入过渡"的 12 张图，条目对不上号（2026-08-07 用户反馈）。没有清单的老
+    # 任务/老断点/手动主题路径完全不受影响，继续走原来的自适应/固定拍数逻辑。
+    _outline_entry_count = len(_outline_texts(dimensions))
+    _outline_strict = _outline_entry_count >= 1
+    if _outline_strict:
+        beat_count_mode = 'fixed'
+        beats_count = max(1, _outline_entry_count - 1)
+        max_total_beats = _outline_entry_count
+        beats_floor = _outline_entry_count - 1
+        min_total_beats = max_total_beats
+        total_beats = max_total_beats
+        # 把这次实际生效的拍数上限回写进调用方持有的同一个 dimensions 字典——
+        # server.py 在 call_llm 返回后还会用 dimensions.get('beats_count') 去核对
+        # "声明拍数 vs 交付拍数"是否一致（见 server.py 的 slot_counts 分支）。不回写的话
+        # 它读到的还是前端滑杆原始值，一比一模式下会被判定为"不一致"，其实只是没写。
+        if isinstance(dimensions, dict):
+            dimensions['beats_count'] = beats_count
+            dimensions['beat_count_mode'] = 'fixed'
+    else:
+        # beats_count is the construction-beat cap in adaptive mode; the final reward is
+        # appended inside the ladder.  total_beats begins as the maximum and is replaced by
+        # len(beat_ladder) as soon as planning succeeds.
+        max_total_beats = beats_count + 1
+        # beats_floor：本项目的施工拍下界，由灵感卡片的工序清单推出（见 compute_beats_floor），
+        # 前端原样透传。它替掉了原来那个与项目重量无关的全局常量下界——旧行为下 count_contract
+        # 要求 ladder 挑「能表达全部必要里程碑的最小拍数」，而验收只看 [5+1, max]，于是一张
+        # 推荐 13 拍的重型改造单塌回 6 拍完全合法，用户挑卡时看到的推进密度和成片对不上。
+        # 缺省（老任务/老断点/手动输入主题）回落到全局常量 = 完全保持旧行为。
+        beats_floor = dimensions.get('beats_floor')
+        try:
+            beats_floor = int(beats_floor)
+        except (TypeError, ValueError):
+            beats_floor = _MIN_ADAPTIVE_CONSTRUCTION_BEATS
+        # 下界只能抬高不能降低（卡片给个 2 也不会破坏既有保底）；且不能超过上限，
+        # 否则 _beat_count_is_valid 恒假、每次都掉进兜底 ladder。
+        beats_floor = max(_MIN_ADAPTIVE_CONSTRUCTION_BEATS, min(beats_floor, beats_count))
+        min_total_beats = min(max_total_beats, beats_floor + 1)
+        total_beats = max_total_beats
 
     # 断点续传:同一份 dimensions(按 brief_fingerprint 哈希)若留有上一次未完成的合成
     # 进度、且 Phase 1 已经产出 beat_ladder/packet/IMAGE 1,直接复用并跳过本函数剩余的
@@ -8213,11 +8310,13 @@ Required JSON keys:
     # 单一 bridge_stage=1 拍；且强制在其前保留至少 _MIN_PRE_THRESHOLD_BEATS 个
     # 普通室外拍，禁止过门紧贴 Beat 1/2（否则 IMAGE 1 会直接变成门口帧，序列读起来
     # 像"一开始就在室内"，见 _img1_is_pre_bridge 的历史兜底分支）。
-    _MIN_PRE_THRESHOLD_BEATS = 2
-    # 2026-07-26：过门帧被强制写成"没人碰过的废墟"（_beat_contract 的 UNTOUCHED TRAUMA
-    # STATE 条款），紧跟其后的那一拍就必须是把那堆废墟搬出去的清理工序——否则序列会
-    # 直接从满地瓦砾跳到贴板/刷漆，中间那道现实里必然存在的清运凭空消失。
-    _post_crossing_cleanup_rule = (
+    # 一比一模式（2026-08-07）：过门/硬切不再单开一拍占清单外的名额——挑清单里紧贴
+    # 边界内侧的那一拍同时承担运镜（见 build_outline_plan_block 的 THRESHOLD/CROSSING
+    # BEATS 段落），所以既不需要强制的室外铺垫拍数，过门后下一拍具体是什么也改由清单
+    # 本身的顺序决定，不再强制"必须是清理"。非一比一路径（老任务/老断点/手动主题）
+    # 完全保留原行为。
+    _MIN_PRE_THRESHOLD_BEATS = 0 if _outline_strict else 2
+    _post_crossing_cleanup_rule = "" if _outline_strict else (
         '  - MANDATORY POST-CROSSING CLEANOUT: the beat immediately AFTER the crossing beat '
         '(Beat T+1) must be a "clearing" operation — the interior cleanout. The crossing beat\'s '
         'own image shows the interior exactly as found (untouched decay, debris lying where it '
@@ -8240,7 +8339,13 @@ Required JSON keys:
                 f"{_topology['entry_motion']} and completes the declared "
                 f"{_topology['turn_degrees']}-degree {_topology['turn_direction']} turn"
             )
-        threshold_split_rules = f"""- If mode is "Threshold", this project uses the DECLARED HARD CUT crossing variant (nothing of the interior is visible before crossing): do NOT create any bridge beats (no bridge_stage anywhere). Instead create exactly ONE crossing beat:
+        if _outline_strict:
+            threshold_split_rules = f"""- If mode is "Threshold", this project uses the DECLARED HARD CUT crossing variant (nothing of the interior is visible before crossing): do NOT reserve a dedicated crossing-only beat — the ONE-TO-ONE CONTRACT above forbids an extra beat with no card work plan entry of its own.
+  - PHYSICAL TOPOLOGY LOCK: opening plane is {_topology['opening_plane']}; entry motion is {_topology['entry_motion']}; landing turn is {_topology['turn_degrees']} degrees {_topology['turn_direction']}.
+  - Pick whichever card work plan entry's own work happens on the interior side of this boundary (usually the first entry whose work takes place inside) and set "hard_cut": true on THAT beat — it still claims exactly its own single entry and still fully describes that entry's own milestone/package_operations/after_state. Its VIDEO opens with: {_hard_cut_motion}; then, in the same unbroken clip, continues into that beat's own listed construction action. Its resulting IMAGE is that beat's own completed after_state, re-established from scratch as the interior first frame (rendered without the previous frame as a visual reference, which is what makes this variant different — not a missing clip).
+  - Use "hard_cut": true on exactly this one beat and never elsewhere; a hard cut is only allowed for the threshold crossing, never as a generic transition."""
+        else:
+            threshold_split_rules = f"""- If mode is "Threshold", this project uses the DECLARED HARD CUT crossing variant (nothing of the interior is visible before crossing): do NOT create any bridge beats (no bridge_stage anywhere). Instead create exactly ONE crossing beat:
   - PHYSICAL TOPOLOGY LOCK: opening plane is {_topology['opening_plane']}; entry motion is {_topology['entry_motion']}; landing turn is {_topology['turn_degrees']} degrees {_topology['turn_direction']}.
   - Beat T: "threshold", "hard_cut": true — The single crossing beat. Its VIDEO is a normal generated clip: {_hard_cut_motion}. Its resulting image is the interior first frame, re-establishing the interior from scratch in its untouched pre-construction state (it is rendered without the previous frame as a visual reference, which is what makes this variant different — not a missing clip).
   - Beat T must be at index {_MIN_PRE_THRESHOLD_BEATS + 1} or LATER — the first {_MIN_PRE_THRESHOLD_BEATS} beats must be ordinary exterior beats that establish the overall environment and show exterior cleanup/repair progress; NEVER place the crossing at Beat 1 or Beat 2.
@@ -8264,7 +8369,13 @@ Required JSON keys:
             f"to align with the interior's long axis" if _is_pan else ""
         )
         _turn_schema_note = f' Also set "turn_direction": "{_turn_dir}" on this beat.' if _is_pan else ''
-        threshold_split_rules = f"""- If mode is "Threshold", the ENTIRE exterior-interior crossing is ONE single beat — never split it across multiple beats, and never create a separate sill/vestibule/turn beat:{_elevated_note}
+        if _outline_strict:
+            threshold_split_rules = f"""- If mode is "Threshold", the ENTIRE exterior-interior crossing is folded into the opening of ONE existing card-work-plan beat's own video — do NOT reserve a dedicated crossing-only beat, and never split the crossing across multiple beats:{_elevated_note}
+  - PHYSICAL TOPOLOGY LOCK: opening plane is {_topology['opening_plane']}; entry motion is {_topology['entry_motion']}; landing turn is {_topology['turn_degrees']} degrees {_topology['turn_direction']}. Never replace a vertical descent through a roof hatch with a level/coaxial push, and never land on an eye-level long-axis view before the declared turn has visibly completed.
+  - Pick whichever card work plan entry's own work happens on the interior side of this boundary (usually the first entry whose work takes place inside) and set bridge_stage 1 on THAT beat — it still claims exactly its own single entry and still fully describes that entry's own milestone/package_operations/after_state.{_turn_schema_note} That beat's VIDEO opens with the camera {_crossing_action}{_turn_action}, settling fully inside with every hatch/door rim and threshold edge completely out of frame, and then, in the SAME unbroken clip, continues into that beat's own listed construction action — it must depict the FULL physical arc (approach, crossing the opening plane, landing{' and turning onto the interior axis' if _is_pan else ''}, then that beat's own work) as ONE continuous shot, never resting or pausing on the opening as its own composition. Its resulting IMAGE is that beat's own completed after_state, not a generic untouched-ruin frame.
+  - All beats after the crossing beat must be interior construction operations (e.g., clearing interior, interior walls, interior flooring, etc.)."""
+        else:
+            threshold_split_rules = f"""- If mode is "Threshold", the ENTIRE exterior-interior crossing is ONE single beat — never split it across multiple beats, and never create a separate sill/vestibule/turn beat:{_elevated_note}
   - PHYSICAL TOPOLOGY LOCK: opening plane is {_topology['opening_plane']}; entry motion is {_topology['entry_motion']}; landing turn is {_topology['turn_degrees']} degrees {_topology['turn_direction']}. Never replace a vertical descent through a roof hatch with a level/coaxial push, and never land on an eye-level long-axis view before the declared turn has visibly completed.
   - Beat T: "threshold", bridge_stage 1 — the camera {_crossing_action}{_turn_action}, settling fully inside with every hatch/door rim and threshold edge completely out of frame.{_turn_schema_note} This beat's own VIDEO is the ONLY visible clip for the entire crossing — it must depict the FULL physical arc (approach, crossing the opening plane, landing{' and turning onto the interior axis' if _is_pan else ''}) as ONE continuous, unbroken shot, never resting or pausing on the opening as its own composition.
   - Beat T must be at index {_MIN_PRE_THRESHOLD_BEATS + 1} or LATER — the first {_MIN_PRE_THRESHOLD_BEATS} beats must be ordinary exterior beats that establish the overall environment and show exterior cleanup/repair progress; NEVER place the crossing at Beat 1 or Beat 2.
@@ -8275,17 +8386,6 @@ Required JSON keys:
     # （主空间完工后重置到第二个毛坯空间）。两段必须并存：只写 T1 时模型把唯一的
     # 空间切换花在进屋上，第二空间永远不会出现（见 apply_pacing_skeleton_to_brief）。
     if space_reset_cut_required(parsed_brief):
-        _nested_min_total = (_MIN_PRE_THRESHOLD_BEATS + 1
-                             + _NESTED_MIN_PRIMARY_ARC_BEATS + 1
-                             + _NESTED_MIN_SECONDARY_ARC_BEATS + 1)
-        _nested_total = max_total_beats
-        _nested_t = _MIN_PRE_THRESHOLD_BEATS + 1
-        _nested_r = _nested_total - _NESTED_MIN_SECONDARY_ARC_BEATS - 1
-        _nested_primary_count = _nested_r - _nested_t - 1
-        _nested_reference_form = ""
-        if _nested_total >= 15:
-            _nested_reference_form = """
-  - CANONICAL 15-SLOT REFERENCE FORM (mandatory at this budget; copied from the accepted buried shipping-container dual-cabin creative): Beat 1 carrier delivery/landing; Beat 2 concealment plus completed usable entrance; Beat 3 bridge into the untouched primary space; Beat 4 primary cleanout; Beat 5 substrate repair/corrosion protection; Beat 6 membrane plus hidden services; Beat 7 insulation/enclosure; Beat 8 floor plus finished wall/ceiling surfaces; Beat 9 primary core furniture and function-complete mini-payoff; Beat 10 declared reset into the untouched secondary space; Beat 11 secondary cleanout; Beat 12 hidden layers plus insulation; Beat 13 enclosure plus finished surfaces; Beat 14 secondary core furniture and soft furnishing; Beat 15 worker exit and sole final reward. Match these phase identities, not the shipping-container subject or its exact materials. Do not move the bridge/reset or replace a construction-state beat with extra reveal footage."""
         # 「怎么进去的」必须在片子里交代清楚。没有这一段，Beat R 就是凭空跳到另一个
         # 舱段：观众既不知道第二空间存在，也不知道它在哪、怎么过去的。
         _divider = parsed_brief.get('space_divider') or _SPACE_DIVIDER_FALLBACK
@@ -8297,7 +8397,34 @@ Required JSON keys:
   - This carrier's divider has NO usable door yet. Exactly ONE ordinary primary-space beat — after the primary cleanout and before Beat R — must CUT AND FRAME that doorway on camera: its "description" and "milestone_name" name the divider and the doorway/opening it produces, and its "after_state" is a finished, passable framed opening fitted with a door/panel that is still shut. Nothing may pass through the divider before that beat."""
             if _needs_built_opening else f"""
   - This carrier's divider already has a usable door/hatch, so no beat creates it; it simply stays shut until Beat R pushes it open on camera.""")
-        threshold_split_rules += f"""
+        if _outline_strict:
+            # 一比一模式：T/R 不再靠固定槽位算出来的拍号定位——两者都必须落在清单已有
+            # 的某一拍上（见 threshold_split_rules 里 T 的选法），槽位数学（15 槽参考、
+            # FIXED SLOT BLUEPRINT）在"拍数=清单条数"的前提下已经不成立，改为按角色
+            # （T 之后第一次进入第二空间的那条清单工序）描述，不再钉死具体第几拍。
+            threshold_split_rules += f"""
+- THE BOUNDARY BETWEEN THE TWO SPACES (this is what makes the reset physically readable — without it the cut is an unexplained teleport):
+  - This project's divider is: {_divider}. Beyond it lies {_second_space}.
+  - The divider must be VISIBLE AND SHUT throughout the primary act: every primary-space beat between the crossing beat T and the reset beat R must state in its "preserve_state" that the divider stays closed and that the space behind it is still untouched and raw. That is the ONLY way the viewer learns a second space exists before the cut lands in it.{_divider_entry_rule}
+  - Beat R's own "description" must name that same divider as the thing the camera passes through — never an unnamed generic transition.
+- SECOND DISCONTINUITY — THE SPACE RESET (mandatory for this project, IN ADDITION TO the crossing beat T above; they are two different beats and neither one substitutes for the other):
+  - Pick whichever card work plan entry's own work is the first one to happen in the second space — a LATER entry than the one carrying bridge_stage 1 above — and set "hard_cut": true on THAT beat; it still claims exactly its own single entry. This is NOT the way into the building — the camera is already inside from beat T. It is the one declared cut that abandons the finished primary space and lands in a SECOND, still untouched raw space (another compartment/section of the same shell, or a second unit beside it — never a natural cavity, never a room already worked on).
+  - The card work plan entry immediately BEFORE it should read as the primary space's furnished, function-complete mini-payoff, never a partial surface milestone — if the plan does not naturally produce that shape, choose the entry whose own work comes closest to it.
+  - Beat R's resulting IMAGE is that beat's own completed after_state, re-established from scratch as the second space's first frame (rendered without the previous frame as a visual reference), so nothing built in the primary space may appear in it.
+  - Use "hard_cut": true on exactly this ONE beat and nowhere else, and never revisit or regress the primary space after it."""
+        else:
+            _nested_min_total = (_MIN_PRE_THRESHOLD_BEATS + 1
+                                 + _NESTED_MIN_PRIMARY_ARC_BEATS + 1
+                                 + _NESTED_MIN_SECONDARY_ARC_BEATS + 1)
+            _nested_total = max_total_beats
+            _nested_t = _MIN_PRE_THRESHOLD_BEATS + 1
+            _nested_r = _nested_total - _NESTED_MIN_SECONDARY_ARC_BEATS - 1
+            _nested_primary_count = _nested_r - _nested_t - 1
+            _nested_reference_form = ""
+            if _nested_total >= 15:
+                _nested_reference_form = """
+  - CANONICAL 15-SLOT REFERENCE FORM (mandatory at this budget; copied from the accepted buried shipping-container dual-cabin creative): Beat 1 carrier delivery/landing; Beat 2 concealment plus completed usable entrance; Beat 3 bridge into the untouched primary space; Beat 4 primary cleanout; Beat 5 substrate repair/corrosion protection; Beat 6 membrane plus hidden services; Beat 7 insulation/enclosure; Beat 8 floor plus finished wall/ceiling surfaces; Beat 9 primary core furniture and function-complete mini-payoff; Beat 10 declared reset into the untouched secondary space; Beat 11 secondary cleanout; Beat 12 hidden layers plus insulation; Beat 13 enclosure plus finished surfaces; Beat 14 secondary core furniture and soft furnishing; Beat 15 worker exit and sole final reward. Match these phase identities, not the shipping-container subject or its exact materials. Do not move the bridge/reset or replace a construction-state beat with extra reveal footage."""
+            threshold_split_rules += f"""
 - THE BOUNDARY BETWEEN THE TWO SPACES (this is what makes the reset physically readable — without it the cut is an unexplained teleport):
   - This project's divider is: {_divider}. Beyond it lies {_second_space}.
   - The divider must be VISIBLE AND SHUT throughout the primary act: every primary-space beat from Beat {_nested_t + 1} onward must state in its "preserve_state" that the divider stays closed and that the space behind it is still untouched and raw. That is the ONLY way the viewer learns a second space exists before the cut lands in it.{_divider_entry_rule}
@@ -8341,8 +8468,8 @@ Required JSON keys:
         config['_outline_plan'] = _outline_plan
     # 只有真的给了草案才要求这个字段——老任务/老断点/手动输入主题没有草案，
     # 凭空要求一个"引用第几条草案"的数组只会让规划器编号码。
-    _outline_refs_schema = ("""20. "outline_refs": (array of integers) The 1-based indices of the CARD WORK PLAN entries THIS beat delivers, per the BINDING CONTRACT stated with that plan. Every entry must be claimed by at least one beat; only the crossing beat and the final reward beat may leave this empty. The indices you claim must never run backwards as the ladder advances.
-21. "outline_delivery": (array of strings, same length and order as "outline_refs") Element k restates in English the physical work and terminal product of the card entry named by "outline_refs"[k], using the concrete nouns this beat's own "milestone_name"/"after_state" use. Required whenever "outline_refs" is non-empty. These strings are enforced against the composed IMAGE prompt downstream, so write the real words, never a placeholder."""
+    _outline_refs_schema = ("""20. "outline_refs": (array of integers, ALWAYS a single-element array) The 1-based index of the ONE card work plan entry this beat delivers, per the ONE-TO-ONE CONTRACT stated with that plan — beat k's outline_refs is always [k]. No beat, including the threshold/crossing beat and the final reward beat, may leave this empty or claim more than one index.
+21. "outline_delivery": (array of strings, ALWAYS a single-element array matching outline_refs) Restates in English the physical work and terminal product of the card entry named by "outline_refs"[0], using the concrete nouns this beat's own "milestone_name"/"after_state" use. These strings are enforced against the composed IMAGE prompt downstream, so write the real words, never a placeholder."""
                             if _outline_plan else "")
     # 物体生命周期声明：与上面两个可选 schema 不同,这两条对**每一拍**都是必填
     # (哪怕是空数组)——它们是场景状态表(scene_state.py)校验"有没有东西提前出生/
@@ -8616,7 +8743,9 @@ Space Type: {space_type}
                                     _NESTED_MIN_PRIMARY_ARC_BEATS,
                                     max(1, max_total_beats - _MIN_PRE_THRESHOLD_BEATS
                                         - _NESTED_MIN_SECONDARY_ARC_BEATS - 3))
-                                if len(_primary_arc) < _primary_need:
+                                # 一比一模式下拍数恒等于清单条数，规划器不能凭空多造一拍去
+                                # 凑够这个下限——两幕各留几拍完全由用户清单本身的结构决定。
+                                if not _outline_strict and len(_primary_arc) < _primary_need:
                                     violations.append(
                                         f"The PRIMARY space needs at least {_primary_need} ordinary "
                                         f"construction beats between the crossing and the space-reset cut "
@@ -8657,10 +8786,12 @@ Space Type: {space_type}
                                 continue
                             # 过门后第一拍恒为清理工序（见 _post_crossing_cleanup_rule）：
                             # 首现帧按契约就是满地瓦砾的原始废墟，下一拍必须把它清出去，
-                            # 否则序列会从瓦砾直接跳到成品面层。
+                            # 否则序列会从瓦砾直接跳到成品面层。一比一模式下过门拍本身已经
+                            # 带着清单内容（见 threshold_split_rules），下一拍是什么完全由
+                            # 清单顺序决定，不再强制必须是清理。
                             _next_beat = beat_ladder[_cross_idx + 1] if _cross_idx + 1 < candidate_total else None
                             _next_op = str((_next_beat or {}).get('operation') or '').strip().lower()
-                            if _next_op != 'clearing':
+                            if not _outline_strict and _next_op != 'clearing':
                                 violations.append(
                                     f"The beat right after the {_cross_label} must be a "
                                     f"\"clearing\" operation (the cleanout of the debris that beat's "
@@ -8675,7 +8806,7 @@ Space Type: {space_type}
                                 _arc_need = min(
                                     _NESTED_MIN_SECONDARY_ARC_BEATS,
                                     max(1, max_total_beats - _MIN_PRE_THRESHOLD_BEATS - 3))
-                                if len(ordinary_after) < _arc_need:
+                                if not _outline_strict and len(ordinary_after) < _arc_need:
                                     violations.append(
                                         f"The SECOND space needs at least {_arc_need} ordinary construction "
                                         f"beats after the space-reset hard cut, but only "
@@ -8718,6 +8849,11 @@ Space Type: {space_type}
                     # blocking_violations——用满全部重排轮次，且最后一轮不再无条件放行。
                     outline_violations = (outline_contract_violations(_outline_plan, beat_ladder)
                                           + outline_binding_violations(_outline_plan, beat_ladder))
+                    # 一比一模式：覆盖率+宽度上界不够堵死"拍数对上但没有逐条对应"，
+                    # 额外关掉合并/拆分/新增三道口子（见 outline_one_to_one_violations）。
+                    if _outline_strict:
+                        outline_violations = outline_violations + outline_one_to_one_violations(
+                            _outline_plan, beat_ladder)
                     # delta 可见性预算：改动只落在边角格位的拍，在锁死的静态机位下必然
                     # 变成无效帧（见 delta_visibility_violations）。与节奏/契约同级：
                     # 重排两轮，仍不满足就接受并留痕。
@@ -8882,11 +9018,21 @@ Space Type: {space_type}
             print(
                 '[DEBUG] planning retries exhausted; continuing with deterministic '
                 f'{total_beats}-beat fallback ladder')
-    # Transition slots are additive production beats.  Expanding only after the conceptual
-    # construction ladder passes its count/order gates preserves every construction milestone.
-    beat_ladder = expand_spatial_transition_beats(beat_ladder, parsed_brief)
-    if bool((config or {}).get('autoSplitHighRiskBeats')):
-        beat_ladder = split_high_risk_beats(beat_ladder)
+    # 一比一模式：跳过过门拆多拍/每 3 拍插重构图这两个"额外产出拍"步骤——它们各自
+    # 都会让最终拍数超出清单条数，正是用户反馈"提示词不按节拍来"的根因（见
+    # build_outline_plan_block 的 ONE-TO-ONE CONTRACT）。字段默认值仍然要走一遍
+    # finalize_beat_ladder_fields，下游 _beat_contract 才有 space_id/camera_family 等
+    # 确定性默认值可读。同理，按"风险"启发式拆分一拍成多拍的 split_high_risk_beats
+    # 也会破坏拍数=清单条数这个不变式，一比一模式下永远跳过，不受 autoSplitHighRiskBeats
+    # 开关影响。非一比一路径（老任务/老断点/手动主题）完全保留原行为。
+    if _outline_strict:
+        beat_ladder = finalize_beat_ladder_fields(beat_ladder)
+    else:
+        # Transition slots are additive production beats.  Expanding only after the conceptual
+        # construction ladder passes its count/order gates preserves every construction milestone.
+        beat_ladder = expand_spatial_transition_beats(beat_ladder, parsed_brief)
+        if bool((config or {}).get('autoSplitHighRiskBeats')):
+            beat_ladder = split_high_risk_beats(beat_ladder)
     total_beats = len(beat_ladder)
     # The brief owns physical topology.  Do not let a ladder response silently omit the turn
     # required by a roof hatch or side entry; every downstream formatter keys off this marker.
@@ -9388,6 +9534,12 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
     is_bridge = (mode == 'Threshold' and beat_is_crossing_clip(beat))
     is_turn = is_bridge and bool(beat.get('turn_direction'))
     is_cut = bool(beat.get('hard_cut'))
+    # 一比一模式（见 compose_anchor_and_packet 的 _outline_strict 分支）：过门/硬切不再
+    # 单开一张不出货的空拍——它落在清单里紧贴边界那一拍身上，那一拍的 outline_refs 非空，
+    # 说明它自己就在交付一条真实工序，不是纯运镜占位。这个标记决定下面好几处"过门帧必须
+    # 是没人碰过的废墟""紧接着必须是清理"之类只适配旧的"空白过门拍"模型的强制文案要不要
+    # 让路——非一比一路径（老任务/老断点/手动主题）这里恒为 False，行为完全不变。
+    is_bridge_with_payload = (is_bridge or is_cut) and bool(beat.get('outline_refs'))
     # STAGE SCOPE RULE tier for this beat's state delta ('large'/'small'/'default');
     # threshold/reward/bridge/hard_cut beats already have their own dedicated content
     # rules and are excluded from the quota, so they carry no stage_scope directive.
@@ -9417,7 +9569,7 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
     # clause.
     _transition_stage = str(beat.get('transition_stage') or 'none')
     is_first_interior_reveal = (
-        family == 'interior' and (bridge_stage == 1 or _transition_stage in (
+        not is_bridge_with_payload and family == 'interior' and (bridge_stage == 1 or _transition_stage in (
             'landing_turn', 'threshold_partial', 'orientation_turn', 'partial_first_look',
             'interior_establish', 'secondary_threshold', 'secondary_partial_first_look',
             'secondary_establish')))
@@ -9426,11 +9578,15 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
     # 拍——它是唯一一拍的 before_state 完全由上一张首现帧的脏乱决定，所以要单独给它一
     # 条契约：清走可搬运的杂物，但结构性衰败（锈迹、裂缝、剥落）原封不动留到后面的修复
     # 拍去处理。节拍梯层面这一拍的存在由 compose_anchor_and_packet 的结构校验保证。
+    # 一比一模式下过门拍本身已经交付一条真实工序（is_bridge_with_payload），首现帧不再
+    # 是通用的"没人碰过的废墟"，这条强制清理契约也就没有前提可以成立——下一拍具体是
+    # 什么完全由清单顺序决定。
     _prev_beat = beat_ladder[i - 2] if i >= 2 else None
     is_post_reveal_cleanup = (
         mode == 'Threshold' and family == 'interior'
         and not is_bridge and not is_cut and not is_threshold_or_reveal
         and isinstance(_prev_beat, dict)
+        and not bool(_prev_beat.get('outline_refs'))
         and (str(_prev_beat.get('transition_stage') or '') in
              ('interior_establish', 'secondary_establish')
              or _prev_beat.get('bridge_stage') == 1 or bool(_prev_beat.get('hard_cut')))
@@ -9453,6 +9609,14 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
         _cut_names = "; ".join(
             f"{lm.get('name')} {_grid_bearing(lm.get('grid')) or 'in frame'}"
             for lm in (family_landmarks or []) if isinstance(lm, dict))
+        # 一比一模式：这一拍自己在交付一条真实清单工序，首帧读的是它自己的
+        # after_state（可能已经清理/已经修复），不再是通用的"没人碰过的废墟"。
+        _cut_state_clause = (
+            "(4) this beat's own completed after_state as declared in its milestone — not a "
+            "generic untouched-ruin placeholder"
+            if is_bridge_with_payload else
+            "(4) the interior's untouched pre-construction trauma state"
+        )
         anchor_rule = (
             "This IMAGE is the post-cut INTERIOR FIRST FRAME of a DECLARED HARD CUT (the camera "
             "does not physically travel through the entry; the sequence cuts exactly once from "
@@ -9466,8 +9630,8 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
                "carrier's equivalents)")
             + "; (2) the same material palette, weathering and decay severity as established "
             "outside; (3) the same daylight direction and colour temperature, entering through "
-            "the carrier's own openings; (4) the interior's untouched pre-construction trauma "
-            "state — but the cut resets the CAMERA ONLY, never the construction progress: every "
+            "the carrier's own openings; " + _cut_state_clause +
+            " — but the cut resets the CAMERA ONLY, never the construction progress: every "
             "envelope element (roof/ceiling, exterior wall or shell, window/glazing, door) that "
             "an earlier exterior beat sealed or repaired on camera is the SAME physical element "
             "seen from its other face here and must read as already closed — no sky, clouds, "
@@ -9806,21 +9970,36 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
             + ". The door/threshold must NEVER read as a resting shot or an implied cut point at "
             "any moment — the whole crossing is one unbroken push"
             + (" ending in a single pan" if is_turn else "") + ".")
-        family_contract_lines.append(
-            "- Crossing clip — raw interior throughout (mandatory): the space this clip enters is "
-            "an untouched ruin at EVERY frame of the clip, not just at its end. Name the decay the "
-            "camera moves into (debris lying where it fell, dirt drifts, rust/water stains, growth "
-            "through the cracks) so the interior reads as filthy from the first moment it becomes "
-            "visible. Nothing may be cleaned, cleared, tidied, repaired, or installed during this "
-            "clip, and no tool, ladder, scaffolding, tarp, work light, or stacked material may "
-            "appear at any point — the crossing is a pure camera move, and the cleanout is the "
-            "NEXT beat's work.")
+        if is_bridge_with_payload:
+            # 一比一模式：这一拍自己在交付一条真实清单工序（milestone_name/
+            # package_operations 已经填好），不是纯运镜占位——穿越完成后同一镜头
+            # 继续做它自己该做的事，末帧是它自己的 after_state，不是"没人碰过的废墟"。
+            family_contract_lines.append(
+                "- Crossing clip continues into real work (mandatory, this beat only): the physical "
+                "crossing above is only the OPENING action of this clip. In the SAME unbroken take, "
+                "immediately after the camera settles fully inside, the clip continues into this "
+                "beat's own listed construction work (its \"package_operations\"/\"description\"), "
+                "same as any ordinary construction beat's video — do not stop, cut, or hold once the "
+                "crossing settles. The resulting IMAGE is this beat's own completed after_state, not "
+                "a generic untouched-ruin frame; only decay this beat's own work does NOT touch may "
+                "still read as untouched.")
+        else:
+            family_contract_lines.append(
+                "- Crossing clip — raw interior throughout (mandatory): the space this clip enters is "
+                "an untouched ruin at EVERY frame of the clip, not just at its end. Name the decay the "
+                "camera moves into (debris lying where it fell, dirt drifts, rust/water stains, growth "
+                "through the cracks) so the interior reads as filthy from the first moment it becomes "
+                "visible. Nothing may be cleaned, cleared, tidied, repaired, or installed during this "
+                "clip, and no tool, ladder, scaffolding, tarp, work light, or stacked material may "
+                "appear at any point — the crossing is a pure camera move, and the cleanout is the "
+                "NEXT beat's work.")
         family_contract_lines.append(
             "- Crossing clip — one unbroken take (mandatory): a single continuous take at one "
             "steady speed. No cut, no fade, no dissolve, no wipe transition, no speed ramp, no "
             "freeze, no re-framing jump; the only edit-like motion in the clip is the door frame "
-            "leaving the frame as the camera passes it. Do NOT describe this beat as a "
-            "construction time-lapse — nothing is being built here.")
+            "leaving the frame as the camera passes it."
+            + ("" if is_bridge_with_payload else " Do NOT describe this beat as a "
+               "construction time-lapse — nothing is being built here."))
     if is_cut:
         # 2026-07-30：切入拍的 VIDEO 不再是占位声明，而是一段普通的跨越镜头提示词——
         # 契约按 bridge 的合并跨越镜头同款写满（锚定开场由 fix_video_opening 兜底），
@@ -9846,19 +10025,32 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
             "write a peek through the doorway, an already-open entry, or interior anchors visible "
             f"at the start — IMAGE {i} keeps its entry CLOSED and opaque by design, and the reveal "
             "happens on camera here.")
-        family_contract_lines.append(
-            "- Crossing clip — raw interior throughout (mandatory): the space this clip enters is "
-            "an untouched ruin at EVERY frame from the moment it becomes visible — debris lying "
-            "where it fell, dirt drifts, rust/water stains, growth through the cracks. Nothing may "
-            "be cleaned, cleared, tidied, repaired, or installed during this clip, and no tool, "
-            "ladder, scaffolding, tarp, work light, or stacked material may appear at any point; "
-            "the clip is sterile of workers (the entry opens on camera without a figure entering "
-            "frame), and the cleanout is the NEXT beat's work.")
+        if is_bridge_with_payload:
+            family_contract_lines.append(
+                "- Crossing clip continues into real work (mandatory, this beat only): the door/hatch "
+                "opening above is only the OPENING action of this clip. In the SAME unbroken take, "
+                "immediately after the camera settles fully inside, the clip continues into this "
+                "beat's own listed construction work (its \"package_operations\"/\"description\"), "
+                "same as any ordinary construction beat's video — the clip is sterile of workers "
+                "throughout (the entry opens on camera without a figure entering frame; the "
+                "construction that follows is shown as tool/material traces and progressive state "
+                "change only, per the usual zero-worker rule). The resulting IMAGE is this beat's own "
+                "completed after_state, not a generic untouched-ruin frame.")
+        else:
+            family_contract_lines.append(
+                "- Crossing clip — raw interior throughout (mandatory): the space this clip enters is "
+                "an untouched ruin at EVERY frame from the moment it becomes visible — debris lying "
+                "where it fell, dirt drifts, rust/water stains, growth through the cracks. Nothing may "
+                "be cleaned, cleared, tidied, repaired, or installed during this clip, and no tool, "
+                "ladder, scaffolding, tarp, work light, or stacked material may appear at any point; "
+                "the clip is sterile of workers (the entry opens on camera without a figure entering "
+                "frame), and the cleanout is the NEXT beat's work.")
         family_contract_lines.append(
             "- Crossing clip — one unbroken take (mandatory): a single continuous take at one "
             "steady speed. No cut, no fade, no dissolve, no wipe transition, no speed ramp, no "
-            "freeze, no re-framing jump. Do NOT describe this beat as a construction time-lapse — "
-            "nothing is being built here.")
+            "freeze, no re-framing jump."
+            + ("" if is_bridge_with_payload else " Do NOT describe this beat as a construction "
+               "time-lapse — nothing is being built here."))
     if is_pre_bridge:
         _peek = _family_landmarks(packet, 'interior') or []
         _peek_names = ", ".join(str(lm.get('name')) for lm in _peek if isinstance(lm, dict)) \
@@ -10034,7 +10226,15 @@ def _milestone_beat_directive(beat, img_before="this beat's starting IMAGE",
     """
     if not isinstance(beat, dict):
         return ''
-    if beat.get('operation') in ('threshold', 'reward') or beat.get('bridge_stage') or beat.get('hard_cut'):
+    if beat.get('operation') == 'reward':
+        return ''
+    # 一比一模式下，过门/硬切拍自己在交付一条真实清单工序（outline_refs 非空）——
+    # 它仍然需要这份 VISIBLE MILESTONE CONTRACT（含开头的 CARD WORK ITEM 复述），
+    # 不能因为它也带着 bridge_stage/hard_cut 标记就被跳过，否则合成侧压根不知道
+    # 这拍该交付什么内容，只会写出纯运镜文案。只有老的"内容为空、纯占位"的过门/
+    # 硬切/threshold 拍（没有 outline_refs）才继续走跳过分支，legacy 行为不变。
+    if (beat.get('operation') == 'threshold' or beat.get('bridge_stage') or beat.get('hard_cut')) \
+            and not beat.get('outline_refs'):
         return ''
     fields = {
         'name': beat.get('milestone_name'),
@@ -12832,25 +13032,23 @@ def render_outline_delivery_md(ledger):
 
 
 def build_outline_plan_block(beat_outline, max_total_beats):
-    """把卡片的节拍简介渲染成送进规划器的「强制工序清单 + 绑定契约」段落。
+    """把卡片的节拍简介渲染成送进规划器的「强制工序清单 + 一比一绑定契约」段落。
 
     返回 (归一后的清单条目列表, 提示词段落)。清单为空时段落是空串——老任务/老断点/
     手动输入主题本来就没有清单，凭空要求一个"引用第几条"的数组只会让规划器编号码。
 
-    **不再是软参考**（2026-08-05）。旧文案把这份清单标成 "SOFT reference"，还明说
-    "Rewrite, merge, split, or reorder any draft entry"——于是规划器把"改写"理解成
-    "换成我认为更好的工序"，用户在卡片上照着挑的那几条就此消失（覆盖率契约只查编号，
-    查不到内容被掉包）。现在措辞是强制契约：物理规则（真实施工顺序、Threshold 拆分、
-    单里程碑包、可见里程碑）仍然优先，但它们只能让一条工序**挪位/合并/拆分**，
-    不能删除、替换、掉包。
-
-    **不按拍数裁剪**（2026-08-05）。旧行为是 [:max_total_beats - 1] + 末条：卡片推荐
-    13 拍、用户把滑块拨到 8，中间那 5 条草案**根本没进过提示词**——规划器不知道它们
-    存在，BINDING CONTRACT 的覆盖率也就管不到它们，而用户在「🔨 节拍简介」弹窗里看到
-    的仍是完整的 14 条。用户调小拍数的本意是让推进更紧凑，不是让中段工序凭空消失。
-    现在整份草案都送进去，超额部分由规划器**合并**消化（合并会留 diff、宽度受
-    _max_merge_width 约束），而不是被上游静默切掉；末条 reward 揭示自然也一直在，
-    无需再特殊保留。
+    **一比一还原，不再容忍合并/拆分/新增**（2026-08-07）。此前的版本允许物理规则
+    "MOVE, MERGE or SPLIT" 一条清单条目、允许过门/reward 拍留空 outline_refs——
+    这套口径配合下游的 expand_spatial_transition_beats（过门拍炸成 3-5 张、每 3 拍
+    插一张纯运镜重构图）会让用户在弹窗里数着的 11 条清单最终变成 12 张图，其中真正
+    对应清单内容的只有 5 张、其余 7 张是规划/合成两层各自"自行创作"出来的过渡镜头
+    （2026-08-07 用户反馈：为什么提示词不按节拍来）。调用方现在保证 max_total_beats
+    恒等于 len(plan)（见 compose_anchor_and_packet 的 _outline_strict 分支），本函数
+    据此把"清单条目数 == 最终拍数"写成硬约束：每条清单对应且仅对应一拍，顺序不变，
+    不许合并、不许拆分、不许新增一拍去装运镜/重新取景/占位铺垫。过门/硬切这类"物理
+    规则"仍然优先，但作用域收窄为——只能选定清单里已有的某一拍去同时承担那个动作
+    （把穿越运镜写进它自己视频的开场，紧接着做它本来就该做的那件事），不能为承担
+    穿越动作凭空多开一拍。
     """
     plan = _outline_normalized_entries(beat_outline)
     if not plan:
@@ -12859,19 +13057,7 @@ def build_outline_plan_block(beat_outline, max_total_beats):
     lines = '\n'.join(
         f'  {i}. {e["text"]}' + (f' [{e["op"]}]' if e.get('op') else '')
         for i, e in enumerate(plan, 1))
-    # 宣告的宽度上界按"ladder 占满上限"算，是验收时那条（真实 ladder 更短或含过门拍
-    # 时只会更宽松）的下界——宁可先说紧的，也不能让照做的模型反而撞线。
-    merge_limit = _max_merge_width(len(plan), [{}] * max(1, int(max_total_beats or 0)))
-    budget_note = ""
-    if len(plan) > max_total_beats:
-        budget_note = (
-            f"\nBUDGET COMPRESSION: this card work plan has {len(plan)} entries but the ladder is "
-            f"capped at {max_total_beats} elements, so it does NOT fit one-to-one. Merge adjacent "
-            f"entries to absorb the surplus — never drop one. Merge only entries that share a "
-            f"material phase and resolve into one visible terminal product, spread the merges "
-            f"across the ladder instead of packing them into one or two beats, and keep the final "
-            f"reward entry on its own beat. Every index must still be claimed in some beat's "
-            f"\"outline_refs\".\n")
+    n = len(plan)
     block = (
         "\nCARD WORK PLAN (MANDATORY — this is the exact list of construction stages the user read "
         "on the ideation card when they chose this creative. It is a hard requirement of this job, "
@@ -12880,49 +13066,36 @@ def build_outline_plan_block(beat_outline, max_total_beats):
         "\nThe [bracketed tags] are each entry's declared operation. The beat that delivers an "
         "entry must carry that same operation in its own \"operation\" field or in its "
         "\"package_operations\".\n"
-        # 物理规则仍然优先，但"优先"的作用域必须写死：旧文案的 "Rewrite ... any draft
-        # entry" 被理解成"换成我认为更好的工序"，卡片上那条就此静默消失。
-        "\nWHAT PHYSICS MAY AND MAY NOT CHANGE: real-world construction order, the threshold split "
-        "rules, the single-milestone package rule and the visible-milestone rule still outrank this "
-        "list — they are physics and they win. But they may only ever MOVE, MERGE or SPLIT an "
-        "entry; they NEVER license you to DELETE it, REPLACE it, or SUBSTITUTE different work for "
-        "it. If an entry sits at the wrong point in the sequence, relocate it to the beat where its "
-        "work physically belongs. Do not silently swap it for work you consider better — the user "
-        "picked this creative by reading these exact stages.\n"
-        # 大纲 ↔ milestone 的 1:1 契约（2026-08-02 复盘）。旧文案明说"不必覆盖每条
-        # 草案"，于是「切割舱门装配入口梯」「铺设隐蔽水管与地暖」这类拍被静默换掉/
-        # 吞并，用户在卡片上看到的工序成片里一点痕迹都没有。改写仍然允许，但必须
-        # **认领**：每条草案拍都要有拍声明自己交付了它。
-        "\nBINDING CONTRACT (mandatory): every beat must carry an \"outline_refs\" array listing "
-        "the 1-based indices of the card work plan entries it actually delivers, and EVERY card "
-        "entry above must appear in at least one beat's \"outline_refs\". Merging is allowed — put "
-        "both indices on the beat that absorbs them. Splitting is allowed — put the same index on "
-        "each beat that carries part of it. What is NOT allowed is silently dropping an entry: if "
-        "you believe an entry cannot be delivered, still claim it on the nearest beat that carries "
-        "its work. Only the threshold/crossing beat and the final reward beat may carry an empty "
-        "\"outline_refs\".\n"
-        # 顺序：清单本身已经是施工序，认领序倒退 = 悄悄重排了用户看到的工序。
-        "\nORDER (mandatory): the entries above are already in construction order. Reading the "
-        "ladder from the first beat to the last, the indices you claim must never run backwards — "
-        "a beat may repeat the index its neighbour claimed (that is a split) and may skip ahead "
-        "(that is a merge already absorbed), but it may not claim an index lower than one an "
-        "earlier beat already claimed. If physics genuinely requires two entries to swap places, "
-        "swap them and claim them in the new order rather than interleaving them.\n"
-        # 内容绑定：编号覆盖率不查内容，认领了第 3 条却交付别的东西是零成本的。
+        # 一比一契约：条目数 == 拍数，逐条对应，物理规则只能移动，不能合并/拆分/新增。
+        f"\nONE-TO-ONE CONTRACT (mandatory, non-negotiable): you must return EXACTLY {n} elements — "
+        f"exactly one beat per card work plan entry above, in the SAME order. Beat k's \"outline_refs\" "
+        f"must be exactly [k] (a single-element array naming its own position). Never merge two "
+        f"entries onto one beat, never split one entry across two beats, never leave any beat's "
+        f"\"outline_refs\" empty, and never insert an extra beat that claims no entry (no standalone "
+        f"establishing shot, camera reframe, transition beat, or filler beat of any kind — every "
+        f"single beat you return must be one of these {n} entries doing its own listed work). Real-"
+        f"world construction order, the threshold-crossing rule below, the single-milestone package "
+        f"rule and the visible-milestone rule still outrank this list on WHAT an entry's beat must "
+        f"show — they may reorder which physical action opens an entry's own clip — but they may "
+        f"NEVER license merging, splitting, adding, deleting, or substituting an entry.\n"
+        # 过门/硬切：不再单开一拍，选定清单里紧贴边界的那一拍同时承担运镜。
+        "\nTHRESHOLD/CROSSING BEATS (only when this project has a physical exterior-interior "
+        "boundary): do NOT create a dedicated crossing-only beat — that would be an extra beat with "
+        "no entry of its own, which the ONE-TO-ONE CONTRACT above forbids. Instead pick whichever "
+        "ONE listed entry's own work naturally happens on the interior side of that boundary (usually "
+        "the first entry whose work takes place inside), and mark THAT SAME beat as the crossing beat "
+        "(set bridge_stage/hard_cut on it per the schema below) — its video opens with the physical "
+        "crossing motion and then continues, in the same unbroken clip, into that entry's own listed "
+        "work. That beat still claims exactly its own single entry like every other beat.\n"
+        # 内容绑定：编号对应不查内容，认领了第 k 条却交付别的东西是零成本的。
         # 这份英文复述是唯一能跨语言（清单中文 / 提示词英文）做确定性校验的桥。
         "\nDELIVERY RESTATEMENT (mandatory): alongside \"outline_refs\", every beat must carry an "
-        "\"outline_delivery\" array of the SAME length and in the SAME order, where element k "
-        "restates IN ENGLISH the physical work and the terminal product of the entry named by "
-        "\"outline_refs\"[k]. Use the concrete material and object nouns you will actually use in "
-        "that beat's own \"milestone_name\" / \"after_state\". These strings are carried forward "
-        "into the prompt-composition stage and are checked against the generated IMAGE prompt "
-        "afterwards, so write the real words — never a placeholder like \"entry 3\" or a generic "
-        "\"construction work\".\n"
-        # 合并宽度上界与 _max_merge_width 同源：覆盖率满分但三条挤进一拍，用户在
-        # 卡片上挑中的那几条独立工序照样看不见（见 outline_contract_violations）。
-        f"\nMERGE WIDTH LIMIT: a single beat may claim at most {merge_limit} card work plan entries. "
-        f"Beyond that the merge is rejected and sent back for repair.\n"
-        f"{budget_note}")
+        "\"outline_delivery\" array with exactly one string, restating IN ENGLISH the physical work "
+        "and the terminal product of its own entry. Use the concrete material and object nouns you "
+        "will actually use in that beat's own \"milestone_name\" / \"after_state\". This string is "
+        "carried forward into the prompt-composition stage and checked against the generated IMAGE "
+        "prompt afterwards, so write the real words — never a placeholder like \"entry 3\" or a "
+        "generic \"construction work\".\n")
     return plan, block
 
 
@@ -12990,6 +13163,45 @@ def outline_contract_violations(outline, beat_ladder):
                     'and "after_state" must name the occupant entering and using the finished '
                     'space. The zero-worker rule covers CONSTRUCTION workers only and must not '
                     'delete the occupant this project was pitched on.')
+    return errors
+
+
+def outline_one_to_one_violations(outline, beat_ladder):
+    """一比一模式（见 compose_anchor_and_packet 的 _outline_strict 分支）的额外闸门。
+
+    outline_contract_violations 只管两件事：覆盖率、合并宽度上界——拆分/新增本身
+    从不算违规，宽度只要不超 _max_merge_width（恒 >=2）也放行。这在"清单条目数
+    恰好等于最终拍数"的一比一模式下不够：拍数对上了不代表逐条对应，一拍认领两条、
+    另一拍认领零条，总数照样相等。这里在覆盖率之上再关三道口子：拍数必须与条目数
+    完全相等；任何一拍不得认领零条（新增）或多条（合并）；任何一条不得被拆到多拍
+    （拆分）。三者同时满足时，覆盖率契约保证的"每条都被认领"就退化成严格双射。"""
+    contract = outline_milestone_contract(outline, beat_ladder)
+    if not contract['declared']:
+        return []
+    errors = []
+    outline_len = len(_outline_entry_texts(outline))
+    ladder_len = len([b for b in (beat_ladder or []) if isinstance(b, dict)])
+    if ladder_len != outline_len:
+        errors.append(
+            f'the ladder has {ladder_len} beats but the card work plan has {outline_len} entries — '
+            f'one-to-one mode requires an exact match, one beat per entry, no extra beats and no '
+            f'entries folded together.')
+    for entry in contract['diff']:
+        if entry['kind'] == 'merged':
+            errors.append(
+                f'beat {entry["beat"]} ("{entry["milestone"]}") claims {len(entry["outline_refs"])} '
+                f'card work plan entries at once ({"、".join(entry["outline_texts"])}) — one-to-one '
+                f'mode forbids merging; give each entry its own beat.')
+        elif entry['kind'] == 'added':
+            errors.append(
+                f'beat {entry["beat"]} ("{entry["milestone"]}") claims no card work plan entry — '
+                f'one-to-one mode forbids extra beats; every beat must deliver exactly one listed '
+                f'entry.')
+        elif entry['kind'] == 'split':
+            beats = '、'.join(str(b) for b in (entry.get('beats') or []))
+            errors.append(
+                f'card work plan entry "{"、".join(entry["outline_texts"])}" is split across beats '
+                f'{beats} — one-to-one mode forbids splitting; deliver it entirely on one beat.')
     return errors
 
 
@@ -13220,25 +13432,13 @@ def outline_skeleton_violations(idea):
             f'beat_outline must not contain more than one doorway-crossing entry '
             f'(found {len(crossing)}: {hit_text})')
 
-    if crossing:
-        cross_idx = crossing[0]
-        # 规则 4 · 过门前留够室外拍（对齐合成侧 _MIN_PRE_THRESHOLD_BEATS = 2）
-        if cross_idx < 2:
-            errors.append(
-                'the doorway-crossing entry must come after at least two ordinary exterior entries; '
-                f'it currently sits at position {cross_idx + 1}')
-        # 规则 5 · 过门后第一拍必须是清理（过门帧按契约就是没人碰过的废墟）
-        if cross_idx + 1 < len(texts):
-            nxt_text = texts[cross_idx + 1]
-            nxt_op = ops[cross_idx + 1]
-            if nxt_op is not None:
-                is_cleanup = (nxt_op == 'clearing')
-            else:
-                is_cleanup = bool(re.search(_OUTLINE_CLEANUP_CUE, nxt_text))
-            if not is_cleanup:
-                errors.append(
-                    'the entry right after the doorway crossing must be the interior cleanout '
-                    f'(hauling out the debris the crossing just revealed), but it is "{nxt_text}"')
+    # 规则 4/5（2026-08-07 移除）：此前分别要求"过门前留至少两条室外拍"、"过门后
+    # 第一条必须是清理"，对齐的是合成侧 _MIN_PRE_THRESHOLD_BEATS=2 与
+    # _post_crossing_cleanup_rule。合成侧现在默认一比一还原清单（见
+    # compose_anchor_and_packet 的 _outline_strict 分支）：过门不再单占一拍，而是
+    # 折进清单里紧贴边界那一条自己的动镜里，前面不强制铺垫、后面也不强制清理——
+    # 这两条口径已经不对应合成侧任何硬性要求，继续在激发侧打回只会把"清单第一条
+    # 就是室内工作"这种完全合法的清单错判成结构违规。
 
     # 规则 6 · 弱里程碑措辞（只查开头，见 _WEAK_MILESTONE_PREFIXES_ZH 的注释）
     for text in texts:

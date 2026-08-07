@@ -199,19 +199,25 @@ class TestOutlineSkeletonGateRejectsBrokenCards(unittest.TestCase):
         errs = self._errs(outline)
         self.assertTrue(any('more than one doorway-crossing entry' in e for e in errs))
 
-    def test_crossing_too_early_leaves_no_exterior_arc(self):
-        """对齐合成侧的 _MIN_PRE_THRESHOLD_BEATS = 2：过门前至少两个普通室外拍。"""
+    def test_crossing_at_beat_one_is_now_allowed(self):
+        """2026-08-07 起清单一比一还原：合成侧不再要求过门前留两个室外拍
+        （_MIN_PRE_THRESHOLD_BEATS 只在没有清单的旧路径生效），过门折进清单里紧贴
+        边界那一拍自己的运镜即可——这条曾经的硬性拒绝规则已移除，激发侧不该再打回
+        清单第一条就是穿门/室内工作的合法清单（例如用户例子里"清运桥墩内积水与
+        泥沙"直接作为第一条）。"""
         outline = ['推镜过门进入原始仓内', '清空仓内朽木', '铺设防潮基层',
                    '封装内衬面板', '点亮灯光入住']
         errs = self._errs(outline)
-        self.assertTrue(any('at least two ordinary exterior entries' in e for e in errs))
+        self.assertFalse(any('exterior entries' in e for e in errs), errs)
 
-    def test_post_crossing_beat_must_be_the_cleanout(self):
+    def test_post_crossing_beat_need_not_be_the_cleanout(self):
+        """2026-08-07 起：过门拍自己交付一条真实清单工序，紧接着那一拍具体是什么
+        完全由清单顺序决定，不再强制必须是清理——这条曾经的硬性拒绝规则已移除。"""
         outline = ['清理外墙藤蔓', '完成外部入口门面', '推镜过门进入原始仓内',
                    '刷涂墙面饰面涂料', '铺装成品木地板', '布置床铺软装',
                    '点亮灯光,人物入住']
         errs = self._errs(outline)
-        self.assertTrue(any('interior cleanout' in e for e in errs))
+        self.assertFalse(any('interior cleanout' in e for e in errs), errs)
 
     def test_weak_milestone_wording_is_rejected(self):
         """schema 明文禁止的那两条：「开始施工」「继续完善」。"""

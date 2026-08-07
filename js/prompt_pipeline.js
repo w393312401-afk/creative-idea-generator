@@ -271,14 +271,12 @@ function openBeatOutlineModal(index) {
         const recBeats = Number.isFinite(+idea.recommended_beats) && +idea.recommended_beats > 0
             ? `推荐 ${idea.recommended_beats} 拍${idea.beats_reason ? `（${idea.beats_reason}）` : ''} · `
             : '';
-        const floor = Number.isFinite(+idea.beats_floor) && +idea.beats_floor > 0
-            ? `其中「不少于 ${idea.beats_floor} 拍」是强制的，合成时压不下去；`
-            : '';
-        // 改造后拍数区间是强制的（beats_floor 一路传到合成侧的 _beat_count_is_valid），
-        // 只有清单内容会被硬规则改写——这里的文案要和那个事实对齐，不能再笼统地说
-        // 「最终节拍以合成结果为准」，那会让卡片上的推进密度看起来像个空头承诺。
-        info.textContent = `${recBeats}共 ${beats.length} 条（含末条 reward 揭示）。${floor}`
-            + '清单本身是工序草案，正式合成时会按真实施工顺序等硬规则改写/合并/增删。';
+        // 2026-08-07：清单一比一还原（默认行为，不是可选模式）——最终拍数恒等于这里
+        // 列出的条目数，逐条一一对应，不再有"下界强制、正式合成时按硬规则改写/合并/
+        // 增删"的浮动空间（旧文案对应的正是用户反馈的"提示词不按节拍来"：11 条清单
+        // 合成出 12 张图，其中只有 5 张真正对应清单内容）。
+        info.textContent = `${recBeats}共 ${beats.length} 拍（含末条 reward 揭示），与下方清单逐条一一对应：`
+            + '正式合成时每一拍对应且仅对应一条，不增、不减、不合并、不拆分。';
     }
 
     const list = document.getElementById('beat-outline-modal-list');
@@ -495,8 +493,13 @@ function selectIdeationCard(index) {
     });
     
     // 保留了用户自己的拍数就说一声,否则卡片上写着「⏱ 13 拍」、滑块停在 8,
-    // 用户不知道该信哪个
-    showToast(beatsKeptByUser
+    // 用户不知道该信哪个。2026-08-07：有节拍简介的卡片改为一比一还原——合成时的
+    // 实际拍数恒等于清单条目数，节拍滑杆/规划模式对这类卡片不再生效，只在没有
+    // 清单的手动路径上才真正起作用，这里如实说明，别让滑杆看着像还有用。
+    const _hasOutline = ideaBeatOutline(idea).length > 0;
+    showToast(_hasOutline
+        ? `已载入灵感: ${idea.title}。这张卡有节拍简介，合成时按清单一比一还原（共 ${ideaBeatOutline(idea).length} 拍），节拍滑杆/规划模式不生效`
+        : beatsKeptByUser
         ? `已载入灵感: ${idea.title}。已保留你手动设定的 ${document.getElementById('slider-beats').value} 拍（卡片推荐 ${recBeats} 拍）`
         : `已载入灵感: ${idea.title}。可以在下方微调维度并点击生成！`, "success");
     saveSelectionState();

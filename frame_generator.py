@@ -1616,7 +1616,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
     # （真正送进脚本的取消信号见 _fx_batch_cancel_fn / fx_cancel_context）。
     builtins.google_fx_cancelled = False
     apply_google_fx_runtime_overrides(config)
-    from prompt_pipeline import _parse_prompt_slots
+    from prompt_pipeline import _parse_prompt_slots, ground_threshold_reveal_prompt
     images, videos = _parse_prompt_slots(prompt_block)
 
     prompts = []
@@ -1985,7 +1985,6 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         cover_ref_src = None
         ref_path = _fx_find_ref_for(frames_dir, chunk[0])
 
-        chunk_prompts = [prompts_by_seq[s]['prompt'] for s in chunk]
         if chunk[0] == 1:
             cover_src = resolve_cover_reference(config, title)
             if not cover_src:
@@ -2000,6 +1999,23 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                     f'无法生成第 {chunk[0]} 帧：缺少上一帧参考图，帧序列禁止退回文生图'
                 )
             ref_path = _fx_local_frame_ref_jpg(previous_webp, frames_dir, chunk[0] - 1)
+
+        # 过门/硬切目标帧组稿时还没有任何像素可看，只能凭文字空想门后长什么样。
+        # 真正的过门前一帧此刻已经落盘（就是上面刚解出来的 ref_path）——改用它给
+        # 模型看图联想，替掉组稿阶段那份没见过参考图的猜测（2026-08-07 复盘）。
+        if chunk[0] in transition_heads and ref_path and os.path.exists(ref_path):
+            grounded_body = ground_threshold_reveal_prompt(config, ref_path)
+            if grounded_body:
+                target_item = prompts_by_seq[chunk[0]]
+                target_item['prompt'] = fx_prompt_with_bridge_control(
+                    chunk[0], {'prompt': grounded_body}, prompts_by_seq, videos)
+                if on_progress:
+                    on_progress('threshold_reveal_grounded', {
+                        'sequence': chunk[0],
+                        'message': f'IMG {chunk[0]:03d} 已依据过门前一帧的实际画面重新联想室内描述',
+                    })
+
+        chunk_prompts = [prompts_by_seq[s]['prompt'] for s in chunk]
         leg = leg_by_chunk_start.get(chunk[0])
         if leg and leg.get('user_id') and leg['user_id'] != current_account_id:
             current_account_id = leg['user_id']
@@ -2426,6 +2442,19 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             text_only_head = bool(cover_layer_block) and seq == 1
             if not text_only_head and (not reference or not os.path.exists(reference)):
                 raise RuntimeError(f'无法生成第 {seq} 帧：缺少上一帧参考图，帧序列禁止退回文生图')
+            # 过门/硬切目标帧组稿时还没有任何像素可看，只能凭文字空想门后长什么样。
+            # 真正的过门前一帧此刻已经落盘（就是上面刚解出来的 reference）——改用它给
+            # 模型看图联想，替掉组稿阶段那份没见过参考图的猜测（2026-08-07 复盘）。
+            if (is_bridge or is_cut_head) and not cover_anchor and reference and os.path.exists(reference):
+                from prompt_pipeline import ground_threshold_reveal_prompt
+                grounded_body = ground_threshold_reveal_prompt(config, reference)
+                if grounded_body:
+                    item['prompt'] = grounded_body
+                    if on_progress:
+                        on_progress('threshold_reveal_grounded', {
+                            'sequence': seq,
+                            'message': f'IMG {seq:03d} 已依据过门前一帧的实际画面重新联想室内描述',
+                        })
             model = _image_generation_model(config) if text_only_head else _image_edit_model(config)
             if on_progress:
                 on_progress('frame_start', {

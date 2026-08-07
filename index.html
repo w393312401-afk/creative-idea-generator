@@ -392,7 +392,7 @@
                                              VIDEO 的真实额度），不再定义施工骨架：骨架（拍数下界、工序清单）
                                              整体归灵感卡片，滑块只能在卡片给的上限之下再压。
                                              value="15" 保留——那是没载卡片、纯手动路径的缺省。 -->
-                                        <span id="beat-count-label" title="自适应模式下这是额度上限（最多生成多少拍），不是承诺的拍数；拍数下界由灵感卡片的工序清单决定">节拍上限 · 额度闸门 (Budget Cap)</span>
+                                        <span id="beat-count-label" title="仅对没有节拍简介的手动主题生效：自适应模式下这是额度上限（最多生成多少拍），不是承诺的拍数。载入了带节拍简介的灵感卡片后，实际拍数改为按清单一比一还原，这个滑杆不再生效">节拍上限 · 额度闸门 (Budget Cap)</span>
                                         <span id="val-beats">15 拍</span>
                                     </div>
                                     <div class="slider-track-row">
@@ -403,9 +403,9 @@
                                         </datalist>
                                         <button type="button" class="slider-step-btn" data-target="slider-beats" data-step="1" aria-label="增加节拍数">+</button>
                                     </div>
-                                    <label class="field-row" for="beat-count-mode">
-                                        <span>节拍规划模式</span>
-                                        <select id="beat-count-mode" aria-label="节拍规划模式">
+                                    <label class="field-row" for="beat-count-mode" title="仅对没有节拍简介的手动主题生效——带节拍简介的灵感卡片一律按清单一比一还原，忽略这个选择">
+                                        <span>节拍规划模式（仅手动主题）</span>
+                                        <select id="beat-count-mode" aria-label="节拍规划模式（仅手动主题）">
                                             <option value="adaptive" selected>自适应 · 删除填充拍</option>
                                             <option value="fixed">固定 · 严格按所选施工拍数（过门运镜另计）</option>
                                         </select>

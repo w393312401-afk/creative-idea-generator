@@ -1114,7 +1114,8 @@ bridge video
         config = dict(config, coverReferencePath=self.cover)
         with patch('frame_generator._generate_text_image') as text_image, \
              patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
-             patch('frame_generator.detect_anchor_inertia', return_value=(True, 1.5)):
+             patch('frame_generator.detect_anchor_inertia', return_value=(True, 1.5)), \
+             patch('prompt_pipeline.ground_threshold_reveal_prompt', return_value=None):
             manifest = generate_frame_sequence(
                 config, 'inertia_quota_fallback', self._PROMPT_BLOCK,
                 on_progress=lambda stage, details: events.append((stage, details)))
