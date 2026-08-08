@@ -57,6 +57,10 @@ NUMERIC_RANGE_RE = re.compile(r"\b\d+\s*%?\s*(?:to|-)\s*\d+\s*%?\s*(?:cm|m|kg|s|
 SLOT_RE = re.compile(r"^(图片|视频)[ \t]*(\d+)[ \t]*(\[[A-Z][A-Z ]*\])?[ \t]*:[ \t]*$", re.MULTILINE)
 BRIDGE_TAGS = ("[BRIDGE]", "[BRIDGE TURN]", "[CUT]")
 
+# references/prompt-templates.md labels its worked exemplars with headings instead of the
+# 图片/视频 slot labels examples/ use — a separate pattern is needed to find their bodies.
+EXEMPLAR_RE = re.compile(r"^#{4,5}\s+Exemplar\s+[A-Z]", re.MULTILINE)
+
 # Absolute paths belonging to somebody else's machine. A model that follows one finds nothing
 # and improvises, which is worse than having no pointer at all.
 FOREIGN_PATH_RE = re.compile(
@@ -158,6 +162,64 @@ def check_prompt_slots(root, fnd):
                 fnd.error("bridge-tag", r,
                           f"{slot} has unknown meta tag {tag}; expected one of {BRIDGE_TAGS}",
                           label_line)
+
+
+def check_reference_templates(root, fnd):
+    """Same word budget + notation ban as check_prompt_slots, but for the canonical
+    exemplars in references/prompt-templates.md.
+
+    This file is loaded during Steps 7-8 and is what a composing model imitates most
+    directly for slot shape, so a violation here teaches the violation before the model
+    ever reaches examples/. check_prompt_slots never covered it because these exemplars are
+    headed `#### Exemplar A (...)`, not the `图片 N:` / `视频 N:` labels examples/ uses.
+    """
+    p = os.path.join(root, "references", "prompt-templates.md")
+    if not os.path.exists(p):
+        return
+    r = rel(root, p)
+    section = None
+    cur = None
+    for i, line in enumerate(read(p).split("\n"), 1):
+        stripped = line.strip()
+        if stripped == "## IMAGE Templates":
+            section = "IMAGE"
+        elif stripped == "## VIDEO Templates":
+            section = "VIDEO"
+        if EXEMPLAR_RE.match(stripped):
+            cur = (i, stripped[:60])
+            continue
+        if not cur:
+            continue
+        if not stripped or stripped.startswith("**"):
+            continue
+        label_line, label = cur
+        cur = None
+        slot = f"{section} exemplar ({label})"
+        limit = IMAGE_WORD_LIMIT if section == "IMAGE" else VIDEO_WORD_LIMIT
+        words = len(stripped.split())
+        if words > limit:
+            fnd.error("word-budget", r,
+                      f"{slot} is {words} words, over the {limit}-word validator limit "
+                      f"(over by {words - limit})", label_line)
+        if GRID_RE.search(line):
+            hits = sorted(set(GRID_RE.findall(line)))
+            fnd.error("grid-leak", r,
+                      f"{slot} carries grid notation {hits} in the delivered body; "
+                      f"image models render these as literal letters", i)
+        if "%" in line:
+            fnd.error("notation-percent", r, f"{slot} contains a '%' symbol", i)
+        elif PERCENT_NUM_RE.search(line):
+            fnd.error("notation-percent", r,
+                      f"{slot} contains a numeric percentage "
+                      f"({PERCENT_NUM_RE.search(line).group(0)!r}); write it as a fraction", i)
+        if NUMERIC_RANGE_RE.search(line):
+            fnd.error("notation-range", r,
+                      f"{slot} contains a numeric range "
+                      f"({NUMERIC_RANGE_RE.search(line).group(0)!r})", i)
+        for ac in BANNED_ACRONYMS:
+            if re.search(rf"\b{ac}\b", line):
+                fnd.error("notation-acronym", r,
+                          f"{slot} leaks the internal acronym {ac!r}", i)
 
 
 def check_bridge_tagging(root, fnd):
@@ -380,7 +442,7 @@ def check_skill_md_refs(root, fnd):
                  "below it is then written for an unknown frame shape")
 
 
-CHECKS = (check_prompt_slots, check_bridge_tagging, check_retired_tbcp,
+CHECKS = (check_prompt_slots, check_reference_templates, check_bridge_tagging, check_retired_tbcp,
           check_aspect_consistency, check_word_budget_claims, check_foreign_paths,
           check_dead_links, check_contract_registry, check_ledger_dna, check_scripts,
           check_skill_md_refs)

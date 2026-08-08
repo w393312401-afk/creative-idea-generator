@@ -30,6 +30,7 @@ from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 REGISTRY_PATH = SKILL_DIR / "references" / "skill-local-contracts.json"
+SKILL_COMMON_PATH = SKILL_DIR / "scripts" / "skill_common.py"
 
 PY_FILES = {
     "video_to_prompt_pipeline.py": SKILL_DIR / "video_to_prompt_pipeline.py",
@@ -39,13 +40,32 @@ PY_FILES = {
 REQUIRED_FIELDS = ("id", "tier", "rule_zh", "blocking")
 
 
-def _load_module_facts(py_path: Path):
+def _load_exit_constants(py_path: Path):
+    """Module-level `EXIT_* = <int>` assignments in skill_common.py, so a call site written
+    as `sys.exit(EXIT_SERVER_ERROR)` can be resolved to its numeric code without every
+    helper script re-declaring the vocabulary as literals (see skill_common.py's own
+    'one exit-code vocabulary' rationale)."""
+    if not py_path.exists():
+        return {}
+    tree = ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
+    constants = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name) \
+                and node.targets[0].id.startswith("EXIT_") \
+                and isinstance(node.value, ast.Constant) and isinstance(node.value.value, int):
+            constants[node.targets[0].id] = node.value.value
+    return constants
+
+
+def _load_module_facts(py_path: Path, exit_constants):
     """Static-analyze one Python file and collect everything an `enforced_by` pointer can
     resolve against: every def'd function/class name at any nesting level (gates are mostly
     inlined inside run_scup_audit(), not one-function-per-gate, so nested defs count too),
     every string literal (gate identity lives in `"name": "<Gate Display Name>"` dict
-    literals, not in a function name), and every integer literal passed to an exit()/sys.exit()
-    call (render_and_gate_anchor.py's contract is its exit-code taxonomy, not named gates)."""
+    literals, not in a function name), and every exit code passed to an exit()/sys.exit()
+    call (render_and_gate_anchor.py's contract is its exit-code taxonomy, not named gates) —
+    whether written as a literal int or as one of skill_common.py's named EXIT_* constants."""
     source = py_path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(py_path))
     function_names, class_names, string_literals, exit_codes = set(), set(), set(), set()
@@ -60,9 +80,12 @@ def _load_module_facts(py_path: Path):
             func = node.func
             is_exit_call = (isinstance(func, ast.Name) and func.id == "exit") or \
                           (isinstance(func, ast.Attribute) and func.attr == "exit")
-            if is_exit_call and node.args and isinstance(node.args[0], ast.Constant) \
-                    and isinstance(node.args[0].value, int):
-                exit_codes.add(node.args[0].value)
+            if is_exit_call and node.args:
+                arg = node.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, int):
+                    exit_codes.add(arg.value)
+                elif isinstance(arg, ast.Name) and arg.id in exit_constants:
+                    exit_codes.add(exit_constants[arg.id])
     return {"functions": function_names, "classes": class_names,
             "strings": string_literals, "exit_codes": exit_codes}
 
@@ -105,12 +128,13 @@ def main():
         print(f"[-] Registry is not valid JSON: {e}")
         return 1
 
+    exit_constants = _load_exit_constants(SKILL_COMMON_PATH)
     facts_by_file = {}
     for name, path in PY_FILES.items():
         if not path.exists():
             print(f"[-] Expected source file missing: {path}")
             return 1
-        facts_by_file[name] = _load_module_facts(path)
+        facts_by_file[name] = _load_module_facts(path, exit_constants)
 
     contracts = registry.get("contracts", [])
     if not contracts:
