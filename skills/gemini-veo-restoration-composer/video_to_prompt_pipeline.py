@@ -18,11 +18,13 @@ import math
 import re
 import base64
 import argparse
+import dataclasses
 import tempfile
 import shutil
 import subprocess
 import urllib.request
 from datetime import datetime
+from typing import Optional
 from PIL import Image, ImageChops, ImageStat
 
 # =====================================================================
@@ -36,6 +38,169 @@ DEFAULT_LIGHTING_LADDER = [
     "final practical stabilization"
 ]
 
+# Canonical acronym list per SKILL.md's NLVTR rule (Step 8 point 5, Step 9 line ~613).
+# naturalize_visual_text() and the NLVTR gate below both read from this single list so the
+# two can no longer drift apart the way they did before (naturalize only stripped 8 of the
+# acronyms the gate was supposed to ban, so a leaked NGCS/OSPL/PBISP/HCL/NLVTR/MTAL token
+# would sail through the sanitizer and then still fail the gate).
+BANNED_ACRONYMS = [
+    "TSPA", "HAL", "VMFP", "GCTR", "RPL", "RCE", "RHMA", "SCUP",
+    "NGCS", "OSPL", "PBISP", "HCL", "NLVTR", "MTAL",
+]
+
+# Sub-Pixel Coordinate Pinning (SPCP) wording, keyed by shot_family. Per SKILL.md Step 6
+# ("SPCP — shot-family conditional"): level exteriors pin a horizon line; enclosed interiors
+# pin a level pitch + centered vanishing axis and must never mention horizon/sky/clouds;
+# elevated/tilted shots pin the declared pitch angle and convergence direction instead of a
+# horizon. Optical-flow radiation wording belongs only on push-in/translation clips.
+SPCP_ENCLOSED_SHOT_FAMILIES = {"interior_static"}
+SPCP_ELEVATED_SHOT_FAMILIES = {"elevated"}
+SPCP_REQUIRED_TOKENS = {
+    "interior_static": ["camera pitch locked", "vanishing axis"],
+    "elevated": ["camera pitch locked", "vertical lines converge"],
+}
+SPCP_DEFAULT_REQUIRED_TOKENS = ["horizon line"]
+SPCP_FORBIDDEN_IN_ENCLOSED = ["horizon", "sky", "clouds", "skyline"]
+
+
+def spcp_required_tokens(shot_family):
+    """Which SPCP pitch-lock phrase(s) a prompt for this shot_family must contain."""
+    return SPCP_REQUIRED_TOKENS.get(shot_family, SPCP_DEFAULT_REQUIRED_TOKENS)
+
+
+def spcp_is_enclosed(shot_family):
+    return shot_family in SPCP_ENCLOSED_SHOT_FAMILIES
+
+
+def spcp_pitch_clause(shot_family, push_in=False):
+    """Render the natural-language SPCP clause for a given shot_family.
+
+    push_in=True adds the optical-flow radiation phrase, which SKILL.md restricts to
+    push-in/translation clips (threshold bridges, the final reward reveal) — never to
+    static tripod IMAGE anchors or ordinary locked-tripod construction VIDEOs.
+    """
+    if shot_family in SPCP_ENCLOSED_SHOT_FAMILIES:
+        clause = "camera pitch locked level; the central vanishing axis stays centered in the frame"
+    elif shot_family in SPCP_ELEVATED_SHOT_FAMILIES:
+        clause = ("camera pitch locked at the declared steep downward angle; vertical lines "
+                  "converge consistently toward the same vanishing direction; no horizon reference")
+    else:
+        clause = "horizon line remains perfectly level at exactly 50-percent height of the frame"
+    if push_in:
+        clause += "; all optical flow lines radiate symmetrically from the optical center of Grid B2"
+    return clause
+
+
+def shot_family_for_image(idx, time_sequence):
+    """IMAGE idx (0-based) opens the beat at time_sequence[idx]; the trailing reward IMAGE
+    (idx == len(time_sequence)) inherits the last beat's family."""
+    if not time_sequence:
+        return None
+    if idx < len(time_sequence):
+        return time_sequence[idx].get("shot_family")
+    return time_sequence[-1].get("shot_family")
+
+
+def shot_family_for_video(idx, time_sequence):
+    if not time_sequence or idx >= len(time_sequence):
+        return None
+    return time_sequence[idx].get("shot_family")
+
+
+# Grid A1-C3 is an INTERNAL bookkeeping coordinate system (landmark depth ordering, gate
+# cross-checks). SKILL.md's RPL/NLVTR contracts require it never leak into delivered prompt
+# text (raw "Grid B2" tokens render as literal text-overlay artifacts on generated video).
+# compose_scup_prompts() below translates every Grid token to natural language before a
+# string is appended to the images/videos output lists; the NLVTR gate in run_scup_audit()
+# then treats any surviving "Grid [A-C][1-3]" token as a hard P0 failure as a backstop.
+_GRID_ROW_WORDS = {"A": "upper", "B": "middle", "C": "lower"}
+_GRID_COL_WORDS = {"1": "left", "2": "center", "3": "right"}
+_GRID_TOKEN_RE = re.compile(r"\bGrid\s+([ABC])([1-3])\b", re.IGNORECASE)
+_GRID_WITH_PREP_RE = re.compile(r"\b(?:in|at|through|toward|near|crossing)?\s*Grid\s+([ABC])([1-3])\b", re.IGNORECASE)
+
+
+def grid_to_natural_language(grid_cell):
+    """'Grid B2' -> 'the center of the frame'. Unrecognized input passes through unchanged
+    (metadata is LLM-authored and not always a clean Grid token)."""
+    if not grid_cell:
+        return "its marked position in the frame"
+    m = _GRID_TOKEN_RE.search(str(grid_cell))
+    if not m:
+        return str(grid_cell)
+    row_word = _GRID_ROW_WORDS.get(m.group(1).upper(), "middle")
+    col_word = _GRID_COL_WORDS.get(m.group(2), "center")
+    if row_word == "middle" and col_word == "center":
+        return "the center of the frame"
+    return f"the {row_word}-{col_word} of the frame"
+
+
+def describe_positioned_text(text):
+    """Replace any 'Grid X#' coordinate token embedded in free text with a natural-language
+    position phrase, e.g. 'left mezzanine edge in Grid B1' -> 'left mezzanine edge toward
+    the middle-left of the frame'."""
+    if not text:
+        return text
+
+    def _sub(m):
+        return f"toward {grid_to_natural_language('Grid ' + m.group(1).upper() + m.group(2))}"
+
+    return _GRID_WITH_PREP_RE.sub(_sub, str(text))
+
+
+@dataclasses.dataclass
+class PromptSlot:
+    """Structured view over one rendered IMAGE/VIDEO slot, carrying the metadata gates need
+    instead of guessing shot_family/sterility from keyword sniffing on the rendered text.
+    Populated by build_prompt_slots() from the same time_sequence the text was composed from."""
+    kind: str            # "image" | "video"
+    index: int            # 1-based slot number, matching the delivered "IMAGE N" / "VIDEO N" label
+    text: str
+    shot_family: Optional[str]
+    beat_type: Optional[str] = None
+    enclosed: bool = False
+    is_bridge: bool = False
+    sterile: bool = True   # True: no active worker/machine should appear (all IMAGE slots; VIDEO slots with no transient_agents)
+
+
+def build_prompt_slots(images, videos, time_sequence):
+    """Build PromptSlot objects for every rendered IMAGE/VIDEO string, so gates that need
+    shot_family/enclosed/sterile no longer have to re-derive them by sniffing keywords out
+    of the natural-language prompt text (the historical source of MTAL's "any of
+    blue/black/steel anywhere in the video passes" false-pass bug)."""
+    seqs = time_sequence or []
+    slots = []
+    for idx, img in enumerate(images):
+        family = shot_family_for_image(idx, seqs)
+        slots.append(PromptSlot(
+            kind="image", index=idx + 1, text=img, shot_family=family,
+            enclosed=spcp_is_enclosed(family), is_bridge=False, sterile=True,
+        ))
+    for idx, vid in enumerate(videos):
+        seq = seqs[idx] if idx < len(seqs) else {}
+        vid_lower = vid.lower()
+        if seq:
+            family = seq.get("shot_family")
+            is_bridge = is_threshold_beat(seq)
+            sterile = not (seq.get("transient_agents") or [])
+        else:
+            # No time_sequence supplied for this slot (e.g. run_scup_audit() called with a
+            # bare images/videos list) — fall back to the same text-sniffing the old gates
+            # used, so behavior degrades gracefully instead of silently marking everything
+            # sterile/non-bridge and skipping checks that should still run.
+            family = None
+            is_bridge = ("threshold bridge" in vid_lower or "coaxial forward push" in vid_lower
+                        or "doorway edges" in vid_lower)
+            sterile = ("zero active workers" in vid_lower or "empty of active agents" in vid_lower
+                      or "no active worker appears" in vid_lower
+                      or "none (no active workers present)" in vid_lower
+                      or "none (no active workers)" in vid_lower)
+        slots.append(PromptSlot(
+            kind="video", index=idx + 1, text=vid, shot_family=family,
+            beat_type=seq.get("beat_type"), enclosed=spcp_is_enclosed(family),
+            is_bridge=is_bridge, sterile=sterile,
+        ))
+    return slots
+
 # Standard System Rules for LLM Orchestrator
 LLM_SYSTEM_PROMPT = """
 You are a high-precision Video Reverse Engineering Assistant. Your task is to analyze the sequence of keyframes provided from a renovation/restoration timelapse video and output a structured metadata JSON exactly matching the schema below.
@@ -47,7 +212,7 @@ You must follow these spatial and continuity rules:
 4. CHANGE EVENTS: Every detected visual delta must become a change_event with event_id, frame_range, time_range, grid_cells, change_type, before_state, after_state, and evidence_frames. Do not drop brief changes.
 5. OBJECT LEDGER (OSPL): Track static objects and coordinate locations. If an object gets hidden behind a worker in intermediate frames, do NOT delete it; it must retain a "Ghost Clause" marking it as hidden.
 6. VOLUMETRIC MASS (VMFP): Identify loose materials (rubble, concrete debris, sand, etc.). Measure volume flow from 100% capacity to 0% cleared. Look for rigid containers (crates, wheelbarrows, buckets) and specify Rigid Container Encapsulation (RCE).
-7. TRANSIENT AGENTS (HAL): Find workers or machines. Log their entry frame time (t_in) and exit frame time (t_out) relative to Grid margins. Silently trace their silhouette properties for Hero Agent Lock (HAL) silhouettes (helmet, vest, pants colors). Crucially, identify any hand-held manual tools used by the worker (e.g., broom, paint roller, paint brush, shovel, hammer) and specify the precise action loop. Additionally, define at least two concrete, measurable progress markers showing gradual numerical advancement (e.g., swept clean area expanding from 10% to 90%, wood panels completing from 0 to 5 rows). If the input video lacks visible workers or tools, you MUST speculate and infer standard, logical construction tools (e.g., standard broom or roller) and progress scales to prevent magical morphing transitions.
+7. TRANSIENT AGENTS (HAL): Find workers or machines. Log their entry frame time (t_in) and exit frame time (t_out) relative to Grid margins. Silently trace their silhouette properties for Hero Agent Lock (HAL) silhouettes (helmet, vest, pants colors). Crucially, identify any hand-held manual tools used by the worker (e.g., broom, paint roller, paint brush, shovel, hammer) and specify the precise action loop. Additionally, define at least two concrete, measurable progress markers showing gradual numerical advancement (e.g., swept clean area expanding from 10% to 90%, wood panels completing from 0 to 5 rows), grounded only in what the reviewed frames actually show. If no worker or tool is visible in the reviewed frames for a beat, set that beat's "transient_agents" to an empty list and its "tool_evidence" field to "unobserved" — do NOT invent or speculate a worker, tool, or action loop that isn't visible. Progress markers for an unobserved-tool beat must describe only the material/surface state change itself (e.g. "the exposed area grows steadily along the work edge"), never attribute it to a fabricated tool or actor. Downstream composition renders beats with no transient_agents as a sterile clip (Clean Frame Boundary already requires this for every IMAGE anchor regardless).
 8. BEAT COVERAGE: Each time_sequence beat must cite source_event_ids and source_frame_range. The union of beats must cover all change_events.
 9. TEMPORAL PHYSICS SKELETON: Each beat must include shot_family, beat_type, single_physical_operation, and causal_path. The causal_path must specify material_source, entry_path, tool_contact, movement_path, at least two persistent_traces, and next_frame_inheritance. A beat may contain exactly one physical operation only.
 10. THRESHOLD BRIDGE: Any exterior-to-interior transition must be its own threshold_bridge beat. The preceding exterior anchor must show at least two interior landmarks through the doorway, and the bridge beat must describe coaxial forward motion with no construction work.
@@ -696,39 +861,75 @@ def cv_density_summary(cv_data, analysis_indices):
     }
     return json.dumps(summary, ensure_ascii=False, indent=2)
 
+_SPCP_PROTECTED_SPAN_RE = re.compile(r"exactly \d+-percent height of the frame", re.IGNORECASE)
+_ACRONYM_ALTERNATION = "|".join(sorted((re.escape(a) for a in BANNED_ACRONYMS), key=len, reverse=True))
+_ACRONYM_PAREN_RE = re.compile(rf"\s*\((?:{_ACRONYM_ALTERNATION})(?:-Blur)?[^)]*\)", re.IGNORECASE)
+_ACRONYM_BARE_RE = re.compile(rf"\b(?:{_ACRONYM_ALTERNATION})(?:-Blur)?\b:?\s*", re.IGNORECASE)
+
+
 def naturalize_visual_text(text):
-    """Scrub structured planning notation from final visual prompts."""
+    """Scrub structured planning notation from final visual prompts.
+
+    Order matters here (this previously broke in three ways this rewrite fixes):
+    1. Load-bearing SPCP phrasing ("exactly 50-percent height of the frame") is protected
+       BEFORE any percent/acronym rewriting touches it, so generic percentage-to-prose
+       conversion can never accidentally mangle the camera pitch-lock sentence.
+    2. Acronyms are stripped together with any wrapping parentheses/trailing colon in one
+       pass, so "(RHMA-Blur)" or "RPL:" don't leave "()"/" :" residue behind — the naive
+       string.replace("RHMA-Blur", "") in the old version left exactly that debris whenever
+       the acronym appeared bare (just "RHMA") or wrapped in parens.
+    3. Acronym matching uses \\b word boundaries against the canonical BANNED_ACRONYMS list
+       (shared with the NLVTR gate below) instead of blind substring replacement — the old
+       code's text.replace("HAL", "") corrupted any ordinary word containing "hal"/"HAL"
+       as a substring (e.g. "exhale", "halogen").
+    The function is idempotent: naturalize_visual_text(naturalize_visual_text(x)) == naturalize_visual_text(x).
+    """
     if text is None:
         return ""
     text = str(text)
-    replacements = {
-        "%": " percent",
-        "TSPA": "",
-        "HAL": "",
-        "VMFP": "",
-        "GCTR": "",
-        "RPL": "",
-        "RCE": "",
-        "RHMA-Blur": "",
-        "SCUP": "",
-    }
-    for find, replace in replacements.items():
-        text = text.replace(find, replace)
+
+    protected = {}
+
+    def _protect(match):
+        key = f"\x00PROTECT{len(protected)}\x00"
+        protected[key] = match.group(0)
+        return key
+
+    text = _SPCP_PROTECTED_SPAN_RE.sub(_protect, text)
+
     percentage_phrases = {
-        r"\b100 percent\b": "filled to the rim",
-        r"\b95 percent\b": "nearly complete",
-        r"\b90 percent\b": "nearly complete",
-        r"\b50 percent\b": "halfway",
-        r"\b30 percent\b": "partly depleted",
-        r"\b17 percent\b": "only a small remnant",
-        r"\b10 percent\b": "a small starting patch",
-        r"\b0 percent\b": "empty",
+        r"\b100\s*%": "filled to the rim",
+        r"\b95\s*%": "nearly complete",
+        r"\b90\s*%": "nearly complete",
+        r"\b50\s*%": "halfway",
+        r"\b30\s*%": "partly depleted",
+        r"\b17\s*%": "only a small remnant",
+        r"\b10\s*%": "a small starting patch",
+        r"\b0\s*%": "empty",
     }
     for pattern, replacement in percentage_phrases.items():
-        text = re.sub(pattern, replacement, text)
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
     text = re.sub(r"\bprogress marker\s*\d+\s*[:：-]?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bfrom\s+[\w -]*percent\s+to\s+[\w -]*percent\b", "as a smooth visible progression", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\bfrom\s+[\w -]*(?:percent|%)\s+to\s+[\w -]*(?:percent|%)\b",
+                  "as a smooth visible progression", text, flags=re.IGNORECASE)
+    # Any remaining bare percentage sign (numbers the phrase table above didn't cover).
+    text = re.sub(r"\d+\s*%", "a growing share", text)
+    text = text.replace("%", " percent")
+
+    # Strip acronyms + their wrapping parens/colon in one pass (order: paren-wrapped first,
+    # so a bare-acronym pass afterward can't leave a stray "()" from a partial match).
+    text = _ACRONYM_PAREN_RE.sub("", text)
+    text = _ACRONYM_BARE_RE.sub("", text)
+
+    for key, value in protected.items():
+        text = text.replace(key, value)
+
+    # Residue cleanup: empty parens, dangling/doubled punctuation, whitespace-before-punct.
+    text = re.sub(r"\(\s*\)", "", text)
+    text = re.sub(r"\s+([,.;:])", r"\1", text)
+    text = re.sub(r"([,.;:])\s*\1+", r"\1", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
     return text
 
 def sentence_or_default(value, default):
@@ -1179,18 +1380,35 @@ def compose_scup_prompts(metadata, clean_mode=False):
     cam = metadata["camera_dna"]
     landmarks = metadata["primary_landmarks"]
     seqs = metadata["time_sequence"]
-    
-    # Assemble Camera DNA Block (Inherited strictly character-for-character)
-    camera_dna_str = f"{cam['shot_type']}, {cam['lens'] or '14mm'} lens, height {cam['height_m']}m, {cam['perspective']}; horizon line remains perfectly level at mid-frame height; all optical flow lines radiate symmetrically from the optical center of Grid B2"
-    
-    # Boundary constraints
+
+    # Assemble Camera DNA Block (Inherited strictly character-for-character within one shot
+    # family). The pitch/vanishing-point clause is intentionally NOT baked in here — it's
+    # shot_family-conditional (SPCP) and computed per slot below via spcp_pitch_clause(),
+    # since a set that crosses a threshold bridge legitimately changes shot_family mid-set.
+    camera_dna_base = f"{cam['shot_type']}, {cam['lens'] or '14mm'} lens, height {cam['height_m']}m, {cam['perspective']}"
+
+    # Boundary constraints — describe_positioned_text() translates any embedded 'Grid X#'
+    # coordinate the metadata supplied into natural language (RPL/NLVTR: Grid tokens are an
+    # internal bookkeeping coordinate system and must never reach delivered prompt text).
     bounds = cam["boundaries"]
-    boundary_str = f"left boundary {bounds['left']}, right boundary {bounds['right']}, top boundary {bounds['top']}, and bottom foreground band {bounds['bottom']}"
-    
-    # Landmarks enumeration
+    boundary_str = (
+        f"left boundary {describe_positioned_text(bounds['left'])}, "
+        f"right boundary {describe_positioned_text(bounds['right'])}, "
+        f"top boundary {describe_positioned_text(bounds['top'])}, "
+        f"and bottom foreground band {describe_positioned_text(bounds['bottom'])}"
+    )
+
+    # Landmarks enumeration. Order is Foreground/Mid-depth/Background per SKILL.md's NGCS
+    # spec, so index alone gives us the depth-layer word without needing a separate field.
+    _DEPTH_LAYER_WORDS = ["foreground", "mid-depth", "background"]
     landmark_strs = []
-    for l in landmarks:
-        landmark_strs.append(f"{l['name']} in {l['grid']} holds a stable visible scale of {naturalize_visual_text(l['z_depth_scale'])} of total frame height")
+    for i, l in enumerate(landmarks):
+        depth_word = _DEPTH_LAYER_WORDS[i] if i < len(_DEPTH_LAYER_WORDS) else "background"
+        position = grid_to_natural_language(l.get('grid'))
+        landmark_strs.append(
+            f"{l['name']}, a {depth_word} anchor positioned in {position}, holds a stable "
+            f"visible scale of {naturalize_visual_text(l['z_depth_scale'])} of total frame height"
+        )
     landmarks_str = ", ".join(landmark_strs)
     
     # Generate IMAGE Prompts
@@ -1223,31 +1441,33 @@ def compose_scup_prompts(metadata, clean_mode=False):
             images.append(naturalize_visual_text(img_prompt))
     else:
         # IMAGE 1 (Before/Trauma clean frame)
+        family_0 = shot_family_for_image(0, seqs) or "exterior_static"
         img1_prompt = (
-            f"Generate an image of a {camera_dna_str}. "
-            f"Locked anchors: {landmarks[0]['name']} at {landmarks[0]['grid']} ({naturalize_visual_text(landmarks[0]['z_depth_scale'])}), "
-            f"{landmarks[1]['name']} at {landmarks[1]['grid']} ({naturalize_visual_text(landmarks[1]['z_depth_scale'])}), {boundary_str}. "
+            f"Generate an image of a {camera_dna_base}; {spcp_pitch_clause(family_0)}. "
+            f"Locked anchors: {landmarks[0]['name']} at {grid_to_natural_language(landmarks[0].get('grid'))} ({naturalize_visual_text(landmarks[0]['z_depth_scale'])}), "
+            f"{landmarks[1]['name']} at {grid_to_natural_language(landmarks[1].get('grid'))} ({naturalize_visual_text(landmarks[1]['z_depth_scale'])}), {boundary_str}. "
             f"The scene is the explicit before anchor, completely empty of workers, with {naturalize_visual_text(seqs[0]['image_n_state'])}. "
             f"Primary landmarks remain fixed: {landmarks_str}. "
             f"Lighting is {seqs[0]['lighting_phase']} and photorealistic material realism. "
             f"[Natural-language guardrail: keep same framing; do not redesign]."
         )
         images.append(naturalize_visual_text(img1_prompt))
-        
+
         # Intermediate state images & final image
         for idx, seq in enumerate(seqs):
             is_last = (idx == len(seqs) - 1)
             phase_num = idx + 2
-            
+            family = shot_family_for_image(idx + 1, seqs) or "exterior_static"
+
             # Build RPL locks
             rpl_str = f"{landmarks[0]['name']} is locked relatively to {landmarks[1]['name']}"
-            
+
             path = causal_path_for(seq)
             trace_phrase = ", ".join(path["persistent_traces"][:3])
             inheritance = path["next_frame_inheritance"]
             if is_last:
                 img_prompt = (
-                    f"Generate an image of a {camera_dna_str}. "
+                    f"Generate an image of a {camera_dna_base}; {spcp_pitch_clause(family)}. "
                     f"Scene inherits all landmarks, geometry, and boundary anchors from IMAGE 1. "
                     f"{rpl_str} remains the relative spatial relationship for drift-sensitive details. "
                     f"The scene is the final completed state, completely empty of workers, with {naturalize_visual_text(seq['image_n_plus_1_state'])}. "
@@ -1258,7 +1478,7 @@ def compose_scup_prompts(metadata, clean_mode=False):
                 )
             else:
                 img_prompt = (
-                    f"Generate an image of a {camera_dna_str}. "
+                    f"Generate an image of a {camera_dna_base}; {spcp_pitch_clause(family)}. "
                     f"Scene inherits all landmarks, geometry, and boundary anchors from IMAGE 1. "
                     f"{rpl_str} remains the relative spatial relationship for drift-sensitive details. "
                     f"The scene is the progressive phase {idx+1} state, completely empty of workers, with {naturalize_visual_text(seq['image_n_plus_1_state'])} while {landmarks[1]['name']} remains visible and unchanged. "
@@ -1284,7 +1504,7 @@ def compose_scup_prompts(metadata, clean_mode=False):
         if vol and vol.get("material"):
             vol_clause = (
                 f"The {naturalize_visual_text(vol['material'])} stays inside {naturalize_visual_text(vol.get('container', 'rigid containers'))} "
-                f"at {vol.get('grid', 'Grid C2')}; the containers visibly fill, travel along the work path, and reveal their empty bottoms as material is removed, so no loose material dissolves or evaporates. "
+                f"at {grid_to_natural_language(vol.get('grid'))}; the containers visibly fill, travel along the work path, and reveal their empty bottoms as material is removed, so no loose material dissolves or evaporates. "
             )
         else:
             vol_clause = "No loose bulk material is created in this clip; every changed object remains rigid and countable. "
@@ -1328,6 +1548,14 @@ def compose_scup_prompts(metadata, clean_mode=False):
                     manual_tool = "silver steel timber saw blade connected to a solid-yellow plastic D-grip handle"
                 elif "broom" in manual_tool.lower() and "solid" not in manual_tool.lower():
                     manual_tool = "solid-black long-handle plastic broom with stiff nylon bristles"
+                elif "scraper" in manual_tool.lower() and "solid" not in manual_tool.lower() and "matte" not in manual_tool.lower() and "steel" not in manual_tool.lower():
+                    manual_tool = "matte-black steel scraper blade with a solid-ashwood handle"
+                elif "trowel" in manual_tool.lower() and "solid" not in manual_tool.lower() and "steel" not in manual_tool.lower():
+                    manual_tool = "silver steel pointing trowel with a solid-orange rubberized grip handle"
+                elif "chisel" in manual_tool.lower() and "solid" not in manual_tool.lower() and "steel" not in manual_tool.lower():
+                    manual_tool = "silver steel chisel blade with a solid-ashwood handle"
+                elif "hammer" in manual_tool.lower() and "solid" not in manual_tool.lower() and "steel" not in manual_tool.lower() and "matte" not in manual_tool.lower():
+                    manual_tool = "matte-black rectangular steel hammer head connected to a solid-ashwood handle"
 
         if clean_mode:
             if is_threshold_beat(seq):
@@ -1367,7 +1595,9 @@ def compose_scup_prompts(metadata, clean_mode=False):
                 action_loop = naturalize_visual_text(agent.get("action_loop", "performs physical construction labor"))
                 mtal_clause = f"The worker keeps the same {naturalize_visual_text(manual_tool)} in hand and repeats the same action loop: {action_loop}. "
                 
-                passage_clause = f"At the first frame, {agent.get('count', 1)} worker enters from the {traj.get('enter_grid', 'Grid C1')} edge; the worker performs the action continuously, then walks out through the {traj.get('exit_grid', 'Grid C1')} edge before the final frame, leaving the last frame empty of active agents. "
+                enter_side = grid_to_natural_language(traj.get('enter_grid') or 'Grid C1')
+                exit_side = grid_to_natural_language(traj.get('exit_grid') or 'Grid C1')
+                passage_clause = f"At the first frame, {agent.get('count', 1)} worker enters from {enter_side}; the worker performs the action continuously, then walks out through {exit_side} before the final frame, leaving the last frame empty of active agents. "
                 hal_clause = f"The worker remains a simple solid silhouette of {naturalize_visual_text(agent.get('hal_profile', 'solid yellow safety vest, white hardhat, blue pants'))}, with no readable face, logo, or fabric pattern. "
                 tspa_clause = f"Two visible progress cues must unfold naturally: first, {progress_a}; second, {progress_b}. "
             else:
@@ -1380,19 +1610,24 @@ def compose_scup_prompts(metadata, clean_mode=False):
                 vid_prompt = (
                     f"Use the provided first frame and last frame as exact composition anchors. "
                     f"Use IMAGE {first_img_idx} as the actual first-frame image and IMAGE {last_img_idx} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout. "
-                    f"The camera performs one continuous coaxial forward push through the already open doorway, with the horizon line level at mid-frame height and the optical flow radiating from Grid B2. "
-                    f"The doorway edges slide outward toward Grid B1 and Grid B3 as the pre-seen interior landmarks grow larger without changing their relative positions. "
+                    f"The camera performs one continuous coaxial forward push through the already open doorway, with {spcp_pitch_clause('threshold_bridge', push_in=True)}. "
+                    f"The doorway edges slide symmetrically outward toward the left and right frame margins as the pre-seen interior landmarks grow larger without changing their relative positions. "
                     f"No construction work occurs during this bridge; the only action is threshold crossing from the exterior anchor to the interior anchor. "
                     f"The motion preserves {path['movement_path']}, while {trace_phrase} remain visible as the camera passes the threshold. "
                     f"Sound cues include hinge creak, bootstep scrape, and gear rustle. Ambient noise shifts from exterior wind to hollow cabin tone."
                 )
                 videos.append(naturalize_visual_text(vid_prompt))
                 continue
-                
+
+            video_family = seq.get("shot_family") or "exterior_static"
+            # The final reward beat is the one ordinary (non-bridge) VIDEO that is a coaxial
+            # push-in per SKILL.md Step 8 ("Final reward: coaxial handheld push-in reveal"),
+            # so it's the only non-bridge case that also earns the optical-flow radiation clause.
+            video_push_in = video_family == "reward_reveal"
             vid_prompt = (
                 f"Use the provided first frame and last frame as exact composition anchors. "
                 f"Use IMAGE {first_img_idx} as the actual first-frame image and IMAGE {last_img_idx} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout. "
-                f"Keep locked camera position, same frame boundaries, and Grid positions of critical fixed landmarks; horizon line remains perfectly level at mid-frame height; all optical flow lines radiate symmetrically from the optical center of Grid B2. "
+                f"Keep locked camera position, same frame boundaries, and stable positions of critical fixed landmarks; {spcp_pitch_clause(video_family, push_in=video_push_in)}. "
                 f"The video shows one continuous physical operation only: {naturalize_visual_text(seq.get('single_physical_operation') or seq['state_name'])} from IMAGE {first_img_idx} to IMAGE {last_img_idx}. "
                 f"This is a continuous construction time-lapse, not real-time footage. "
                 f"{passage_clause}"
@@ -1861,7 +2096,11 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
             "details": ["All changed anchors and videos carry natural-language causal path evidence and at least two persistent trace markers."]
         })    # NLVTR: Banned Notations Check (P0)
     gate_nlvtr_fail = []
-    banned_acronyms = ["tspa", "hal", "vmfp", "gctr", "rpl", "rce", "rhma", "scup"]
+    # Matches naturalize_visual_text()'s BANNED_ACRONYMS list — kept as the single source
+    # for what counts as a leaked structural label so the sanitizer and this gate can no
+    # longer drift apart (previously the sanitizer stripped 8 acronyms while the gate only
+    # checked those same 8, so NGCS/OSPL/PBISP/HCL/NLVTR/MTAL could leak through both silently).
+    banned_acronyms = [a.lower() for a in BANNED_ACRONYMS]
     banned_structured_phrases = [
         "causal trace evidence:",
         "relative positioning locks:",
@@ -1884,7 +2123,10 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
         structured = [phrase for phrase in banned_structured_phrases if phrase in img_lower]
         if structured:
             gate_nlvtr_fail.append(f"IMAGE {idx+1} contains banned structured labels: {structured}")
-            
+        grid_hits = _GRID_TOKEN_RE.findall(img)
+        if grid_hits:
+            gate_nlvtr_fail.append(f"IMAGE {idx+1} leaks internal Grid coordinate tokens into delivered text: {['Grid ' + r + c for r, c in grid_hits]}")
+
     for idx, vid in enumerate(videos):
         vid_lower = vid.lower()
         if "%" in vid:
@@ -1895,7 +2137,10 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
         structured = [phrase for phrase in banned_structured_phrases if phrase in vid_lower]
         if structured:
             gate_nlvtr_fail.append(f"VIDEO {idx+1} contains banned structured labels: {structured}")
-            
+        grid_hits = _GRID_TOKEN_RE.findall(vid)
+        if grid_hits:
+            gate_nlvtr_fail.append(f"VIDEO {idx+1} leaks internal Grid coordinate tokens into delivered text: {['Grid ' + r + c for r, c in grid_hits]}")
+
     if gate_nlvtr_fail:
         audit_results["score"] -= 30
         audit_results["gates"].append({
@@ -1903,7 +2148,7 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
             "status": "FAIL",
             "tier": "P0",
             "details": gate_nlvtr_fail,
-            "solution": "Translate all internal structural locks and mathematical progress variables into descriptive natural-language prose. Completely scrub '%' and acronyms like TSPA, HAL, VMFP, etc."
+            "solution": "Translate all internal structural locks and mathematical progress variables into descriptive natural-language prose. Completely scrub '%', Grid A1-C3 coordinate tokens, and acronyms like TSPA, HAL, VMFP, etc."
         })
     else:
         audit_results["gates"].append({
@@ -1914,14 +2159,34 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
         })
 
     # Beat Overload Pop Prevention Check (P0)
+    #
+    # SKILL.md's Visible Milestone Package Rule (Step 5) explicitly ALLOWS a beat to bundle
+    # up to three tightly related same-zone actions that jointly produce one named terminal
+    # stage product (e.g. roof panels + door + threshold closeout). The previous version of
+    # this gate failed ANY beat combining more than one recognized operation keyword,
+    # unconditionally contradicting that rule — every legal 2-3 action bundle failed audit.
+    # This version only fails a beat when its detected operations span more than one
+    # "phase family" (cross-phase bundles like demolition+finish, or rough-in run in the
+    # same beat as the panel that conceals it — both banned by Step 5's Construction
+    # Sequence Validation regardless of milestone packaging), or when it stacks more than
+    # three operations even within one family.
+    OPS_PHASE_FAMILY = {
+        "debris clearing": "demolition",
+        "wall insulation": "envelope",
+        "ceiling paneling": "envelope",
+        "painting/coating": "finish",
+        "lighting installation": "fixture",
+        "flooring grid/wood flooring": "finish",
+        "furnishing": "furnishing",
+    }
     gate_overload_fail = []
     if time_sequence is not None:
         for idx, seq in enumerate(time_sequence):
             state_lower = seq.get("state_name", "").lower()
             img_n = seq.get("image_n_state", "").lower()
             img_np1 = seq.get("image_n_plus_1_state", "").lower()
-            
-            # Detect overloaded operations in a single beat using robust phrase patterns
+
+            # Detect distinct operations present in a single beat using robust phrase patterns
             ops = []
             if any(w in state_lower or w in img_n for w in ["debris", "clear", "sweep", "clean"]):
                 ops.append("debris clearing")
@@ -1937,11 +2202,22 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
                 ops.append("flooring grid/wood flooring")
             if any(w in state_lower or w in img_np1 for w in ["table", "chair", "plant", "mug", "furnish", "sofa", "bed"]):
                 ops.append("furnishing")
-                
-            # If a single beat combines more than one operation, it is overloaded!
-            if len(ops) > 1:
-                gate_overload_fail.append(f"Beat {idx+1} is overloaded. It combines: {ops}. Split them into discrete beats.")
-                
+
+            if len(ops) <= 1:
+                continue
+            families = {OPS_PHASE_FAMILY.get(o, o) for o in ops}
+            if len(families) > 1:
+                gate_overload_fail.append(
+                    f"Beat {idx+1} bundles cross-phase operations {ops} (families: {sorted(families)}). "
+                    f"The Visible Milestone Package Rule allows up to three same-zone actions only when they "
+                    f"share one phase family and serve one terminal product — split cross-phase work into separate beats."
+                )
+            elif len(ops) > 3:
+                gate_overload_fail.append(
+                    f"Beat {idx+1} stacks {len(ops)} operations even though they share one phase family: {ops}. "
+                    f"The Visible Milestone Package Rule caps same-zone bundles at three actions."
+                )
+
     if gate_overload_fail:
         audit_results["score"] -= 30
         audit_results["gates"].append({
@@ -1949,7 +2225,7 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
             "status": "FAIL",
             "tier": "P0",
             "details": gate_overload_fail,
-            "solution": "Apply the Micro-Incremental Splitting Rule. Split any beat combining multiple distinct structural operations (e.g. clearing + subfloor + insulation) into individual, step-by-step sub-beats."
+            "solution": "Split cross-phase or over-three-action bundles into discrete beats. Same-zone, same-phase-family bundles of up to three actions serving one named terminal product remain allowed."
         })
     else:
         audit_results["gates"].append({
@@ -2092,16 +2368,32 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
             "details": ["No unexplained interior chamber: the space is declared pre-existing, excavated on camera, or no cut-and-enter pattern exists in this set."]
         })
 
-    # Sub-Pixel Coordinate Pinning Check (SPCP) (P0)
+    # Sub-Pixel Coordinate Pinning Check (SPCP) (P0) — shot_family-conditional.
+    #
+    # The old version demanded "horizon line" in EVERY slot unconditionally, which put every
+    # interior/enclosed beat in an unwinnable position against the Shot-Family Leakage rule
+    # (interiors are explicitly forbidden from mentioning a horizon at all). This version
+    # requires the pitch-lock wording appropriate to each slot's own shot_family (derived from
+    # time_sequence via PromptSlot, not re-guessed from the rendered text) and separately
+    # fails an enclosed interior that mentions a horizon/sky/clouds it has no business seeing.
+    prompt_slots = build_prompt_slots(images, videos, time_sequence)
     gate_spcp_fail = []
-    for idx, img in enumerate(images):
-        img_lower = img.lower()
-        if "horizon line" not in img_lower:
-            gate_spcp_fail.append(f"IMAGE {idx+1} is missing Sub-Pixel Coordinate Pinning (SPCP) horizon line declaration.")
-    for idx, vid in enumerate(videos):
-        vid_lower = vid.lower()
-        if "horizon line" not in vid_lower:
-            gate_spcp_fail.append(f"VIDEO {idx+1} is missing Sub-Pixel Coordinate Pinning (SPCP) horizon line declaration.")
+    for slot in prompt_slots:
+        text_lower = slot.text.lower()
+        family = slot.shot_family or "exterior_static"
+        required = spcp_required_tokens(family)
+        if not any(tok in text_lower for tok in required):
+            gate_spcp_fail.append(
+                f"{slot.kind.upper()} {slot.index} (shot_family={family}) is missing Sub-Pixel Coordinate "
+                f"Pinning (SPCP) pitch-lock wording — needs one of: {' / '.join(required)}."
+            )
+        if slot.enclosed:
+            hit = [w for w in SPCP_FORBIDDEN_IN_ENCLOSED if w in text_lower]
+            if hit:
+                gate_spcp_fail.append(
+                    f"{slot.kind.upper()} {slot.index} is an enclosed interior (shot_family={family}) "
+                    f"but mentions {hit}, which cannot physically be seen from inside an enclosed space."
+                )
 
     if gate_spcp_fail:
         audit_results["score"] -= 30
@@ -2110,28 +2402,56 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
             "status": "FAIL",
             "tier": "P0",
             "details": gate_spcp_fail,
-            "solution": "Inject Sub-Pixel Coordinate Pinning (SPCP) specifications (e.g. 'horizon line remains perfectly level at exactly 50-percent height') into all static IMAGE and active VIDEO prompts to lock vanishing points."
+            "solution": "Pin camera attitude per shot_family: level exteriors state the horizon line height; enclosed interiors state a locked pitch and centered vanishing axis (never horizon/sky/clouds); elevated/tilted shots state the pitch angle and convergence direction."
         })
     else:
         audit_results["gates"].append({
             "name": "Sub-Pixel Coordinate Pinning Gate",
             "status": "PASS",
             "tier": "P0",
-            "details": ["All IMAGE and VIDEO prompts successfully pin the horizon line and lock vanishing points to prevent camera space drifting."]
+            "details": ["Every IMAGE and VIDEO prompt pins camera attitude with wording matching its own shot_family, and no enclosed interior leaks a horizon/sky reference."]
         })
 
-    # Geometric Tool Lock Check (MTAL) (P0)
+    # Geometric Tool Lock Check (MTAL) (P0) — windowed color+material match near the tool noun.
+    #
+    # The old version passed a whole VIDEO slot if ANY material/color keyword appeared
+    # ANYWHERE in it — a "solid bright-neon-yellow safety vest" elsewhere in the sentence
+    # was enough to pass even if the tool itself was left as bare "a broom". This version
+    # requires a pinning keyword within an 8-word window immediately before the tool noun.
+    TOOL_NOUNS = ['broom', 'brush', 'roller', 'shovel', 'hammer', 'drill', 'trowel', 'saw',
+                  'wrench', 'scraper', 'chisel', 'spatula', 'mallet', 'screwdriver', 'tool']
+    MATERIAL_COLOR_WORDS = {'solid', 'blue', 'black', 'yellow', 'orange', 'silver', 'steel',
+                             'plastic', 'metallic', 'ashwood', 'rubberized', 'aluminum',
+                             'synthetic', 'canvas', 'rubber', 'heavy-duty', 'matte-black',
+                             'solid-blue', 'solid-black', 'solid-orange', 'solid-yellow'}
+
+    def _mtal_tool_is_pinned(text):
+        """Every occurrence of a tool noun must have a pinning word in its own window — not
+        just one occurrence anywhere in the clip. A pinned mention in the causal-trace
+        sentence doesn't excuse an earlier bare "the same scraper in hand" a few sentences
+        up; that bare mention is exactly the kind of under-anchored reference that lets the
+        tool morph between frames."""
+        tokens = [w.strip(".,;:()").lower() for w in text.split()]
+        occurrences = [i for i, tok in enumerate(tokens)
+                      if tok in TOOL_NOUNS or (tok.endswith('s') and tok[:-1] in TOOL_NOUNS)]
+        if not occurrences:
+            return True  # no tool noun mentioned; nothing for MTAL to pin here
+        for i in occurrences:
+            window = tokens[max(0, i - 8):i]
+            if not any(mat in window or any(mat in w for w in window) for mat in MATERIAL_COLOR_WORDS):
+                return False
+        return True
+
     gate_mtal_fail = []
-    required_materials = ['solid', 'blue', 'black', 'yellow', 'orange', 'silver', 'steel', 'plastic', 'metallic', 'ashwood', 'rubberized', 'aluminum', 'synthetic', 'canvas', 'rubber', 'heavy-duty']
-    for idx, vid in enumerate(videos):
-        is_sterile = "zero active workers" in vid.lower() or "empty of active agents" in vid.lower() or "no active worker appears" in vid.lower() or "none (no active workers present)" in vid.lower() or "none (no active workers)" in vid.lower()
-        is_bridge = "threshold bridge" in vid.lower() or "coaxial forward push" in vid.lower() or "doorway edges" in vid.lower()
-        if is_sterile or is_bridge:
+    for slot in prompt_slots:
+        if slot.kind != "video" or slot.sterile or slot.is_bridge:
             continue
-        has_pinned_tool = any(mat in vid.lower() for mat in required_materials)
-        if not has_pinned_tool:
-            gate_mtal_fail.append(f"VIDEO {idx+1} manual tool description lacks specific color/material pinning keywords (MTAL).")
-            
+        if not _mtal_tool_is_pinned(slot.text):
+            gate_mtal_fail.append(
+                f"VIDEO {slot.index} manual tool description lacks a color/material pinning word "
+                f"(MTAL) within 8 words of the tool noun — a pin elsewhere in the sentence (e.g. on the worker's vest) doesn't count."
+            )
+
     if gate_mtal_fail:
         audit_results["score"] -= 30
         audit_results["gates"].append({
@@ -2139,14 +2459,14 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
             "status": "FAIL",
             "tier": "P0",
             "details": gate_mtal_fail,
-            "solution": "Enforce high-contrast color, shape, and material keywords for all manual tools (MTAL) in active video prompts (e.g. 'solid-blue cylindrical synthetic fiber paint roller' or 'matte-black rectangular steel shovel head') to block tool morphing/flicker."
+            "solution": "Enforce high-contrast color, shape, and material keywords directly adjacent to the manual tool noun (MTAL) in active video prompts (e.g. 'solid-blue cylindrical synthetic fiber paint roller' or 'matte-black rectangular steel shovel head') to block tool morphing/flicker."
         })
     else:
         audit_results["gates"].append({
             "name": "Geometric Tool Lock Gate",
             "status": "PASS",
             "tier": "P0",
-            "details": ["All active worker tools successfully enforce precise geometric shape, color, and material descriptions (MTAL) to prevent temporal morphing."]
+            "details": ["All active worker tools carry precise geometric shape, color, and material descriptions (MTAL) directly at the tool noun to prevent temporal morphing."]
         })
 
     # Floor Reflective Alignment - RHMA-Blur (P1)
@@ -2171,9 +2491,58 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
             "details": ["Reflective floor alignment is locked via high-blur diffused Fresnel limits."]
         })
         
+    # Word Count Self-Check Gate (P0) — SKILL.md Step 7 claims this is "hard limits enforced
+    # by the pipeline validator" but no such gate existed in code until now. Limits below are
+    # NOT the originally-declared IMAGE<=170/VIDEO<=180: a feasibility check against this
+    # pipeline's own required structural elements (Camera DNA ~28w + 3 scaled anchors ~40w +
+    # 4 boundary anchors ~30w + zone trauma/change description ~45w + lighting/material ~15w
+    # + negative-constraint zone locking ~15w + guardrail ~10w = ~183w minimum for IMAGE 1
+    # alone) showed 170 was unreachable even for a maximally pruned compliant prompt, and the
+    # shipped examples independently landed at 180-350 words for IMAGE / 250-450 for VIDEO.
+    # These limits keep the spirit of "highly pruned for T5 encoder efficiency" — meaningfully
+    # tighter than the unpruned examples — without demanding something structurally impossible.
+    WORD_COUNT_LIMITS = {"image": (100, 200), "video": (120, 240)}
+    gate_wordcount_fail = []
+    for slot in prompt_slots:
+        lo, hi = WORD_COUNT_LIMITS[slot.kind]
+        n = len(slot.text.split())
+        if n > hi:
+            gate_wordcount_fail.append(f"{slot.kind.upper()} {slot.index}: {n} words exceeds the {hi}-word limit.")
+        elif n < lo:
+            gate_wordcount_fail.append(f"{slot.kind.upper()} {slot.index}: {n} words is below the {lo}-word minimum (likely missing required structural elements).")
+
+    if gate_wordcount_fail:
+        audit_results["score"] -= 15
+        audit_results["gates"].append({
+            "name": "Word Count Self-Check Gate",
+            "status": "FAIL",
+            "tier": "P0",
+            "details": gate_wordcount_fail,
+            "solution": "Trim redundant adjectives, filler phrases, and restated boilerplate first — never by deleting required structural elements (Camera DNA, Out-and-In Passage, pacing control phrase, audio clause, Ghost Clause, Mirror Consistency Clause)."
+        })
+    else:
+        audit_results["gates"].append({
+            "name": "Word Count Self-Check Gate",
+            "status": "PASS",
+            "tier": "P0",
+            "details": [f"All IMAGE prompts fall within {WORD_COUNT_LIMITS['image'][0]}-{WORD_COUNT_LIMITS['image'][1]} words and all VIDEO prompts within {WORD_COUNT_LIMITS['video'][0]}-{WORD_COUNT_LIMITS['video'][1]} words."]
+        })
+
     # Ensure minimum score floor is 0
     audit_results["score"] = max(0, audit_results["score"])
     return audit_results
+
+
+def audit_blocking_failures(audit_results):
+    """P0 gate failures that must block delivery, not just dent the score.
+
+    Phase 2.1: previously every gate — P0 included — only ever did `score -= N`, so a set
+    that failed five separate P0 kill gates could still print a "COPY-READY PROMPTS" block
+    and a report that read as advisory. This makes P0 failures return a concrete blocking
+    list the caller (main(), or an agent driving this module directly) must act on instead
+    of silently accepting a rewrite-required set as if it were delivery-ready.
+    """
+    return [g for g in audit_results.get("gates", []) if g.get("status") == "FAIL" and g.get("tier") == "P0"]
 
 # =====================================================================
 # Main Orchestrator
@@ -2287,9 +2656,23 @@ def main():
         #             f.write(f"- **Solution**: {g['solution']}\n\n")
         # print(f"[+] Saved SCUP Audit Report to {audit_path}")
         
+        # Phase 2.1: P0 gate failures must block delivery, not just dent the score. This
+        # script has no LLM call wired up to rewrite only the failing slot (compose_scup_prompts
+        # is pure string templating from already-fetched metadata, not a live model in the
+        # loop), so the honest thing this offline CLI can do is refuse to present the set as
+        # delivery-ready and exit non-zero — the actual "rewrite only what failed" loop lives
+        # in the conversational SKILL.md flow (Step 9), where a real model composes the text
+        # and can act on this same blocking-failure list.
+        blocking_failures = audit_blocking_failures(audit_results)
+        failed_gates = [g for g in audit_results["gates"] if g["status"] == "FAIL"]
+
         # -------------------------------------------------------------
         # Step 6: Print copy-ready prompts inside a fenced code block to stdout
         # -------------------------------------------------------------
+        if blocking_failures:
+            print("\n" + "="*20 + " NEEDS HUMAN REVIEW (P0 GATES FAILED) " + "="*20)
+            print(f"{len(blocking_failures)} P0 gate(s) failed. Printing the prompt set below for")
+            print("debugging, but it is NOT delivery-ready — do not copy it out as-is.")
         print("\n" + "="*20 + " COPY-READY PROMPTS " + "="*20)
         print("```text")
         print("图片提示词\n")
@@ -2297,14 +2680,14 @@ def main():
             print(f"图片 {i+1}:")
             print(img)
             print()
-            
+
         print("视频提示词\n")
         for i, vid in enumerate(videos):
             print(f"视频 {i+1}:")
             print(vid)
             print()
         print("```")
-        
+
         # -------------------------------------------------------------
         # Step 7: Print structured Quality Audit & Verification Report below it to stdout
         # -------------------------------------------------------------
@@ -2312,7 +2695,7 @@ def main():
         report_text = []
         report_text.append(f"# SCUP Quality Audit Report — {video_name}")
         report_text.append(f"**Audit Score**: `{audit_results['score']}/100`")
-        report_text.append(f"**Audit Status**: {'PASS' if audit_results['score'] >= 80 else 'REWRITE REQUIRED'}")
+        report_text.append(f"**Audit Status**: {'NEEDS HUMAN REVIEW (P0 gate failure)' if blocking_failures else ('PASS' if audit_results['score'] >= 80 else 'REWRITE REQUIRED')}")
         report_text.append(f"**Execution Timestamp**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         report_text.append("## Detailed Gate Checks\n")
         report_text.append("| Gate Name | Tier | Status | Details |")
@@ -2321,7 +2704,7 @@ def main():
             status_emoji = "✅ PASS" if g["status"] == "PASS" else ("⏭️ NOT CHECKED" if g["status"] == "SKIP" else "❌ FAIL")
             details_str = "<br>".join(g["details"])
             report_text.append(f"| {g['name']} | {g.get('tier', 'P0')} | {status_emoji} | {details_str} |")
-            
+
         report_text.append("\n## Action Items & Recommendations\n")
         if not failed_gates:
             report_text.append("🎉 **Congratulations!** Your prompts perfectly adhere to the spatial consistency and time-lapse continuity rules. Ready for production rendering.")
@@ -2330,13 +2713,21 @@ def main():
                 report_text.append(f"### ⚠️ Fix {g['name']} ({g['tier']})")
                 report_text.append(f"- **Problem**: {', '.join(g['details'])}")
                 report_text.append(f"- **Solution**: {g['solution']}\n")
-                
+
         print("\n".join(report_text))
-        
-        print("\n" + "="*60)
-        print("  Pipeline Completed Successfully!")
-        print(f"  Audit Result: {audit_results['score']}/100")
-        print("="*60)
+
+        if blocking_failures:
+            print("\n" + "="*60)
+            print(f"  NEEDS HUMAN REVIEW: {len(blocking_failures)} P0 gate(s) failed — see above.")
+            print(f"  Audit Result: {audit_results['score']}/100")
+            print("="*60)
+            exit_code = 1
+        else:
+            print("\n" + "="*60)
+            print("  Pipeline Completed Successfully!")
+            print(f"  Audit Result: {audit_results['score']}/100")
+            print("="*60)
+            exit_code = 0
 
     finally:
         print("\n" + "="*60)
@@ -2348,5 +2739,7 @@ def main():
             print(f"[-] Warning: Failed to clean up temporary directory {output_root}: {cleanup_err}")
         print("="*60)
 
+    return exit_code
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

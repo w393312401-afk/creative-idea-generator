@@ -364,7 +364,14 @@ Precedence, highest first:
 Then apply the adjustments below. Feasibility rules may push the count *above* the table's
 range — a preference for more content may not.
 - Merge tiny beats that would produce nearly static clips (unless explicitly listed).
-- **Apply the Visible Milestone Package Rule**: Every ordinary beat must end in one named, immediately legible stage product at its full declared region or component count. A beat may contain one operation or up to three tightly related actions in the same zone when all are necessary for that single terminal result (for example roof panels + door + threshold closeout, or joists + bay insulation). Split cross-phase bundles such as demolition + painting + furnishing, rough-in + the panel that conceals it, or unrelated work in different zones. Adjacent IMAGE anchors may change at most 3 grid cells, but token patches, one-corner edits, and merely begun/partial states are forbidden.
+- **Apply the Visible Milestone Package Rule**: Every ordinary beat must end in one named, immediately legible stage product at its full declared region or component count. A beat may contain one operation or up to three tightly related actions in the same zone when all are necessary for that single terminal result (for example roof panels + door + threshold closeout, or joists + bay insulation). Split cross-phase bundles such as demolition + painting + furnishing, rough-in + the panel that conceals it, or unrelated work in different zones. Token patches, one-corner edits, and merely begun/partial states are forbidden — **full declared extent always wins over any grid-cell count below**.
+  - **Adjacent-Anchor Delta Budget** (a sanity-check reminder, not a hard cap — a beat that legitimately covers a whole wall or floor is still valid even if it touches more cells than its row below suggests): the number of grid cells an adjacent `IMAGE` pair may plausibly change scales with the beat's `beat_type`, because "redo the whole floor" and "hang one fixture" are not the same size of visual delta.
+    | `beat_type` | Typical cell-change budget |
+    |---|---|
+    | `removal` / `excavation` | up to 4 (may legitimately cover a full floor row) |
+    | `coating` / `interior_finish` | up to 6 (may legitimately cover a full wall) |
+    | `fixture_install` / `furnishing` | up to 3 |
+    | `threshold` | not applicable — governed by TBCP instead |
 - Always add one final `VIDEO` for the explicit reward motion.
 - Never merge a threshold bridge with construction or final reward.
 - **Construction Sequence Validation**: After deriving the beat ladder, validate its order against real construction dependencies. Default macro order: (1) demolition and debris clearing before new work in that zone; (2) structural repair before rough-in systems; (3) rough-in systems — wiring, plumbing, ducting — before any panel closes over them; (4) ceiling panels before wall panels (board the overhead first so the wall panels can support and hide the ceiling-board edges); (5) primer before finish coat; (6) floor finishing after overhead and wet work; (7) fixtures and lighting only after their wiring exists; (8) furniture and decoration last. Hard vetoes: no wiring or plumbing work after the panels that would hide them are already installed; no finish coat before primer; no new roof before the walls or frame carrying it are repaired; no practical light, lamp, or powered fixture activation in a set that contains no earlier wiring beat (off-grid carriers additionally require a visible power source — solar panel, battery bank, or generator — installed in a prior beat); no interior fit-out inside a space whose creation or pre-existence was never shown or stated on camera. **Enclosed-Space Provenance Rule**: any interior chamber revealed behind a newly opened shell must be physically accounted for — either explicitly described as pre-existing space (a natural cavity, an original room) in the opening beat, or given its own on-camera excavation and mucking-out beats before any interior finishing; the interior volume must plausibly fit inside the exterior shell. If the observed beat order violates a hard veto, re-inspect source material first — a misread frame is more likely than an impossible build sequence.
@@ -388,26 +395,11 @@ Each beat skeleton must declare:
 
 P0 rule: a beat without one clear terminal milestone fails before prompt rendering. Cross-phase or different-zone bundles fail; coherent closeout packages are allowed only when every action is causally necessary for the same visible end product.
 
-For cliff cable car / gondola restoration sequences, use this 19-beat ladder unless the user explicitly removes either the solar system or the full interior rebuild:
-1. Exterior rust scraping.
-2. Exterior sanding and leveling.
-3. White primer coating.
-4. Exterior finish coating.
-5. Platform railing installation.
-6. Door opening with interior landmark sneak-peek (peek anchors must be original cabin features, per the Anchor Qualification rule).
-7. Roof rail and bracket installation.
-8. Solar panel placement and cable clipping.
-9. Work-light stabilization without structural changes.
-10. Threshold bridge into the cabin.
-11. Interior debris removal.
-12. Interior wall base preparation.
-13. Floor joist and subfloor structure installation (creates the level working platform).
-14. Interior electrical wiring, fed from the solar cable entry, run before any panel closes over it.
-15. Ceiling panel installation with a pre-cut light opening.
-16. Yellow wall panel installation.
-17. Round light fixture installation and practical activation.
-18. Floor surface finishing.
-19. Final furniture reward reveal.
+A specialized, longer beat ladder exists for one topic family: cliff cable car / gondola
+restoration. When the topic matches, load [references/beat-ladders/cable-car.md](references/beat-ladders/cable-car.md)
+and use its 19-beat ladder instead of auto-deriving from the space type's standard workflow —
+this is a deliberate, named exception to the "default 3-6 `VIDEO` clips" rule above, not a
+contradiction of it. Do not use this ladder, or its length, as a precedent for any other topic.
 
 ### Step 6: Drift Lock & SCUP Packet Assembly
 
@@ -438,6 +430,8 @@ Build the complete packet by filling all required fields using the **Spatial Con
   3. **Z-Depth Height Scales run smaller.** The same real object subtends a *smaller* fraction of total frame height in a tall frame. Calibrate against these vertical-frame defaults rather than horizontal intuition: background anchor roughly one-fifth to one-third, mid-depth anchor roughly two-fifths to three-fifths, foreground band roughly one-fifth to one-quarter. A mid-depth anchor declared at four-fifths of frame height in 9:16 is almost always a mis-estimate.
 
 **Normalized Grid Coordinate System (NGCS) & Fixed Landmarks**:
+`Grid A1`-`Grid C3` is an internal bookkeeping coordinate system for this step (Drift Lock Packet assembly) only — it keeps your own reasoning about landmark position and drift consistent across beats. It must **never** appear as literal text in a delivered `IMAGE`/`VIDEO` prompt (Step 7 onward): NLVTR (Step 8 point 5, Step 9's No Banned Notations Gate) fails any final prompt containing a `Grid [A-C][1-3]` token, because it renders as a text-overlay artifact on the generated image/video. Translate every Grid cell to natural language before it reaches output text: depth layer (foreground/mid-depth/background) + position phrase (e.g. `Grid B2` → "the center of the frame", `Grid C1` → "the lower-left of the frame") + the height-ratio phrase already required below. Internal packet notes, the NGCS/OSPL bookkeeping in this step, and the Quality Audit's own gate descriptions may keep using `Grid` notation freely — only the copy-ready `IMAGE`/`VIDEO` prompt bodies themselves must read as pure natural language.
+
 - Divide the **9:16 vertical frame** into a $3 \times 3$ grid (`Grid A1` to `Grid C3` from top-left to bottom-right). Rows are depth bands (`A` background / `B` mid-depth / `C` foreground); in a vertical frame each row is a wide, short band and each column is a narrow slice — so a row change reads clearly on screen and a column change barely does.
 - Assign exactly **3 Primary Spatial Anchors** across three depth zones, each tied to an absolute grid cell and visual feature. Prefer a **vertically stacked** spread (one anchor per row) over a lateral spread:
   - Foreground: 1 named anchor with Grid cell (e.g., `cracked floor seam in Grid C2`)
@@ -493,21 +487,28 @@ Staged execution is the **default** per the Staged Delivery Contract (top of thi
 
 1. Run Steps 1-6 silently as usual (topic parsing through Drift Lock Packet assembly) — nothing user-facing yet.
 2. Compose `IMAGE 1`'s prompt only (the relevant slice of Step 7). Do **not** compose `IMAGE 2` onward or any `VIDEO` yet, and do not show `IMAGE 1`'s prompt to the user as a finished deliverable — it is still provisional until the anchor frame below has been rendered and looked at.
-3. Render the anchor **synchronously, in this same turn**, before writing anything else:
-   ```powershell
-   python "<SKILL_DIR>\scripts\render_and_gate_anchor.py" `
-     --title "<the Chinese topic title>" `
-     --prompt "<IMAGE 1's prompt text>" `
+3. Render the anchor **synchronously, in this same turn**, before writing anything else, via whatever command-execution tool your environment provides (Bash, PowerShell, `run_command`, etc. — the skill itself is platform-neutral):
+   ```
+   python "<SKILL_DIR>/scripts/render_and_gate_anchor.py" \
+     --title "<the Chinese topic title>" \
+     --prompt "<IMAGE 1's prompt text>" \
      --server "http://127.0.0.1:8085"
    ```
+   `<SKILL_DIR>` is this skill package's own root directory (the folder containing this `SKILL.md`), resolved by whatever harness/host loaded the skill — never a hardcoded path. On Windows, invoke this via `python "<SKILL_DIR>\scripts\render_and_gate_anchor.py"` through PowerShell with backtick line continuations if your shell needs them; the arguments and semantics are identical.
    This call blocks until the frame is on disk. Wait for it to finish; do not proceed speculatively while it's running.
 4. **Exit code 0**: the frame rendered. Show the user the image path the script printed and say plainly that nothing judged it automatically (`⚠️ 服务端不对该帧做自动判定，请确认这就是你要的首帧`). Wait for their read on it before proceeding to step 6 — you are asking a person to do the job no gate does anymore. Never claim the anchor "passed" anything.
 5. **Exit code 3/4/5** (server error / missing prompt / timeout): report exactly what the script said and stop. A timeout means the server is still working — do **not** treat it as unreachable and do not fall back to one-pass delivery.
 5b. **Exit code 2** (render server unreachable): this is the second waiver in the Staged Delivery Contract. Say `⚠️ 渲染服务未运行，本次跳过首帧预览，直接输出全套提示词`, then fall back to one-pass composition (Steps 7-11 as written) and still make the Step 13 interactive offer. Do not retry the script in a loop.
 6. Treat the rendered `IMAGE 1` — its prompt text and what actually appeared — as authoritative reality. Reconcile your working model of the Camera DNA / Primary Landmarks / object ledger against it before writing anything else (this is **Packet Reality Reconciliation**): only rewrite what visibly contradicts the render; never invent a landmark or object that isn't visible in it.
 7. Only now compose `IMAGE 2-(N+1)` (the rest of Step 7) and `VIDEO 1-N` (Step 8), then continue through Steps 9-11 as usual. The final delivered prompt set includes the exact same `IMAGE 1` prompt that was rendered, verbatim — do not silently rewrite it again at output time, or the delivered set will describe a different frame than the one the user approved.
+8. **If you or the user judge the rendered `IMAGE 1` unacceptable** (this is the other branch of step 4's "wait for their read on it" — it was previously undocumented, which let a rejected anchor silently get treated as approved):
+   a. Record the rejection reason by category (Camera DNA / Primary Landmark / damage severity / genre tone / text artifact) — this tells you which packet field to fix.
+   b. Edit only the packet field(s) that category maps to; leave every other field untouched.
+   c. Re-render by calling `render_and_gate_anchor.py` again with `--sequence 1` and the corrected prompt, **and pass `--force_regenerate`** — without it, a server-side disk cache may silently hand back the same rejected frame instead of a fresh render.
+   d. Allow at most **3** re-render attempts. If the 3rd is still unacceptable, stop: tell the user plainly and ask for guidance (a genuine `needs_human_review` — do not keep retrying silently).
+   e. **Before re-rendering, get rid of the rejected frame on disk** (delete it, or have the render call overwrite it via step c's `--force_regenerate`) — Step 13's `/api/render_staged` reuses whatever is already on disk for a sequence number, so a rejected frame left in place will silently resurface downstream even after you've moved on to a corrected version. This is the step that actually matters: skipping it means everything else in this list was wasted effort, because the polluted frame keeps propagating through the rest of the chain regardless of what you render next.
 
-Step 13's rendering trigger, further down, does not re-render `IMAGE 1`: `/api/render_staged` reuses whatever frames are already on disk and only renders the remainder. That is one more reason Step 7's rule — deliver the rendered `IMAGE 1` prompt verbatim — is load-bearing.
+Step 13's rendering trigger, further down, does not re-render `IMAGE 1`: `/api/render_staged` reuses whatever frames are already on disk and only renders the remainder. That is one more reason Step 7's rule — deliver the rendered `IMAGE 1` prompt verbatim — is load-bearing, and one more reason step 8e above is not optional.
 
 ### Step 7: IMAGE Anchor Rendering (HCL & NGCS)
 
@@ -521,9 +522,11 @@ Render `IMAGE 1-(N+1)` executing **Hierarchical Context Layering (HCL)** and **S
 - Each progressive IMAGE anchor states completion extent in concrete spatial terms (e.g., `the left two-thirds of the wall panel installed while the right third stays bare framing`), giving adjacent-anchor interpolation an unambiguous start and end.
 - **Negative-Constraint Zone Locking**: an image-editing renderer over-completes an under-constrained zone rather than under-completing it. Two recurring failure patterns confirmed by render QA logs: (1) restating an already-inherited damage descriptor from an earlier beat (e.g. `bent rib framing exposed` established back in IMAGE 1-2) inside a later beat's own change description gets misread as a fresh destructive action in that same beat, stripping wall/floor material well beyond the single declared operation; (2) an open-ended furnishing/reward beat invites invented extra props (pillows, cups, books, decor) beyond the declared object list. When a beat's operation is narrowly scoped to one zone, or its object list is closed, say so explicitly and negatively in the same anchor (e.g. `side wall panels remain in place, not stripped`; `only these listed objects are present — no additional decor, tools, or furnishings`) rather than relying on the positive description alone to bound the model.
 
+Every `[...Grid...]` placeholder below is an authoring aid, resolved from your internal NGCS bookkeeping — the text you actually write into the placeholder must already be natural language (position phrase + depth layer + height ratio), never a literal `Grid X#` token. See the Grid-is-internal-only note above Step 6's NGCS section.
+
 **IMAGE 1 (Before/Trauma Anchor - Clean Frame)**:
 ```
-Generate an image of a [Camera DNA Block: static tripod shot, 14mm, height 1.6m, eye-level: subject in Grid B2]. Locked anchors: [Primary Anchor A] at [Grid Cell, scale], [Primary Anchor B] at [Grid Cell, scale], left boundary [Grid LB], right boundary [Grid RB], top boundary [Grid TB], and bottom foreground band [Grid BB]. The scene is the explicit before anchor, completely empty of workers, with [trauma pathology: location + surface-material state + damage type for each major damage zone in its Grid cell]. [Lighting phase] and [material realism]. [Natural-language guardrail: keep same framing; do not redesign].
+Generate an image of a [Camera DNA Block: static tripod shot, 14mm, height 1.6m, eye-level perspective; SPCP pitch-lock clause matching this shot's shot_family]. Locked anchors: [Primary Anchor A] at [natural-language position, e.g. "the lower-center of the frame", holding a stable visible scale of X of total frame height], [Primary Anchor B] at [natural-language position and height-ratio], left boundary [named anchor toward its natural-language position], right boundary [named anchor toward its natural-language position], top boundary [named anchor toward its natural-language position], and bottom foreground band [named anchor toward its natural-language position]. The scene is the explicit before anchor, completely empty of workers, with [trauma pathology: location + surface-material state + damage type for each major damage zone, described by natural-language position]. [Lighting phase] and [material realism]. [Natural-language guardrail: keep same framing; do not redesign].
 ```
 
 > **Notation warning (P0).** The bracketed names below — relative positioning lock, causal
@@ -537,7 +540,7 @@ Generate an image of a [Camera DNA Block: static tripod shot, 14mm, height 1.6m,
 
 **IMAGE 2+ (Progressive State Anchors — Clean Frame, relative positioning, causal traces)**:
 ```
-Generate an image of a [Same Camera DNA Block — character-for-character copy: subject centred in the middle band]. Scene inherits all landmarks, geometry, and boundary anchors from IMAGE 1. [2-3 most drift-prone items, each positioned RELATIVE to a named Primary Landmark — "the green toolbox sits just left of the brick column", never its own absolute cell]. The scene is the [current stage name] anchor, completely empty of workers, with [one dominant change cluster, located by prose bearing] while [inherited evidence: the exact recurring object-ledger phrases + unchanged damage/repair evidence] remain visible and unchanged. [Changed object/surface] shows at least two persistent contact traces — [fastener rows / seam lines / residue / drag marks / tool scars / machine compression / contact dust] — proving how the state changed from IMAGE N. [Lighting phase] and [material realism]. [Guardrail sentence].
+Generate an image of a [Same Camera DNA Block — character-for-character copy within this shot family, including its SPCP pitch-lock clause: subject centred in the middle band]. Scene inherits all landmarks, geometry, and boundary anchors from IMAGE 1. [2-3 most drift-prone items, each positioned RELATIVE to a named Primary Landmark — "the green toolbox sits just left of the brick column", never its own absolute cell]. The scene is the [current stage name] anchor, completely empty of workers, with [one dominant change cluster, located by prose bearing] while [inherited evidence: the exact recurring object-ledger phrases + unchanged damage/repair evidence] remain visible and unchanged. [Changed object/surface] shows at least two persistent contact traces — [fastener rows / seam lines / residue / drag marks / tool scars / machine compression / contact dust] — proving how the state changed from IMAGE N. [Lighting phase] and [material realism]. [Guardrail sentence].
 ```
 
 **Final IMAGE (Reward Tail State — Clean Frame, relative positioning, blurred reflections)**:
@@ -619,16 +622,22 @@ Every VIDEO must follow this exact structure:
 
 ### Step 9: Silent Self-Check & SCUP Quality Audit Report
 
-1. Run the **SCUP P0 Kill Gates** below plus every contract registered in [references/contract-registry.json](references/contract-registry.json) before delivery. (There is no `references/continuity-contracts.md` — the registry is the machine-readable contract list, and the gate implementations live server-side; see "Where The Contracts Are Actually Enforced" above.)
+1. Run the **SCUP P0 Kill Gates** below plus every contract registered in [references/contract-registry.json](references/contract-registry.json) before delivery. **Any P0 gate failure blocks delivery — it is not a score deduction to note and move past.** Do not proceed to Step 10 while a P0 gate is failing. (There is no `references/continuity-contracts.md` — the registry is the machine-readable contract list, and the gate implementations live server-side; see "Where The Contracts Are Actually Enforced" above.)
 
-**SCUP P0 Kill Gates** — rewrite entire clip if any fires:
+**P0-Blocking Targeted Rewrite Loop**: when a P0 gate fires, do not regenerate the whole set — that destroys already-confirmed slots (most importantly a rendered/approved `IMAGE 1`). Instead:
+   1. Identify exactly which slot(s) the failing gate's details point at.
+   2. Rewrite only those slots, keeping every other slot byte-for-byte unless the fix legitimately requires a downstream slot to change too (e.g. a corrected Camera DNA Block must propagate to every same-family IMAGE that copies it character-for-character).
+   3. Re-run the full P0 gate list (a local fix can accidentally break an adjacent gate).
+   4. Allow at most **2** rewrite attempts per slot. If a P0 gate is still failing after 2 targeted rewrites, stop — do not deliver, and tell the user plainly which gate keeps failing and why, so they can adjust the input (this is the one legitimate `needs_human_review` escalation path for the chat-composition flow, mirroring the standalone `video_to_prompt_pipeline.py` CLI's exit-1 behavior for the same condition).
+
+**SCUP P0 Kill Gates** — targeted rewrite (see loop above) if any fires:
 - Structure errors (count, slot type, mixed protocol, shot family)
 - Camera DNA Block not copied literally across same-family IMAGEs
 - Any `IMAGE` contains active workers or machines (violates Clean Frame Boundary).
 - Any video featuring workers lacks an explicit Out-and-In Passage Clause trajectory at t=0s and t=7.5s.
 - Any video featuring loose/fluid materials fails to encapsulate them in rigid containers (violates Rigid Container Encapsulation RCE).
 - **Volume Conservation Gate (P0)**: container capacity, trip count, or spoil-pile growth must plausibly account for the volume removed or delivered in the beat. Clearing a room-scale debris field or cutting a passable opening into two hand crates fails; any cut-out solid piece that never receives an on-camera carry-out fails. A correctly scaled, visibly growing spoil pile satisfies encapsulation for material that is not transported out of frame.
-- Vague landmark or boundary locations without explicit `Grid A1-C3` cells and Z-depth scale, or fails to lock secondary drift-prone objects relatively using RPL.
+- Vague landmark or boundary locations that skip natural-language position + depth layer + Z-depth scale (internally tracked via `Grid A1-C3`, but the delivered prompt must state position/depth/scale in natural language — literal `Grid` tokens in the delivered text instead fail the No Banned Notations Gate below), or that fail to lock secondary drift-prone objects relatively using RPL.
 - Any occluded landmark or ledger object is omitted instead of being maintained via the `Ghost Clause`.
 - Missing coordinate-level dynamic keyframe projection (DKP) for threshold bridge or final reward push-in.
 - Volumetric materials lack a percentage scale (e.g. % capacity) and a physical transport vector (VMFP).
@@ -643,7 +652,7 @@ Every VIDEO must follow this exact structure:
 - **Change Event Coverage Gate (变化事件覆盖门 - P0)**: Every CV `change_event` must appear in `time_sequence.source_event_ids`, must be traceable to `source_frame_range`, and must be referenced in the matching VIDEO prompt. Missing event coverage fails the audit even if prompt wording looks polished.
 - **Analysis Peak Inclusion Gate (峰值帧送审门 - P0)**: For every detected change event, the event start frame, maximum-delta peak frame, and event end frame must be included in the semantic analysis frame set.
 - **No Banned Notations Gate (NLVTR Gate - P0)**: The final image/video prompts must *never* contain mathematical percentage symbols (`%`), raw numerical ranges inside the visual description (e.g. `10% to 90%`, `40cm to 0cm`), colons inside variable descriptions, or dry structured acronyms (`TSPA`, `HAL`, `VMFP`, `GCTR`, `RPL`, `RCE`, `SCUP`, `NGCS`, `OSPL`, `RHMA`, `PBISP`, `HCL`, `NLVTR`, `MTAL`). All visual progress and persistent traces must be fully described in fluid, continuous natural language prose (e.g. "dusty floor area shrinks as clean wood surface grows to cover the floor"). Any presence of math characters, colons in visual slots, technical SCUP acronyms, or grid cell coordinates (e.g. `Grid C1`, `Grid B2`) in final image/video prompts fails this gate.
-- **Beat Overload Pop Prevention Gate (P0)**: Verify that no single beat combines more than one distinct physical operation or structural system change (e.g. debris clearing, subflooring, insulation paneling, ceiling panels, painting, and lighting are distinct operations and must be split into separate beats). Any beat combining multiple operations will fail this gate.
+- **Beat Overload Pop Prevention Gate (P0)**: A beat may combine up to three detected operations when they share one phase family and one zone (this is the Visible Milestone Package Rule's allowance, e.g. ceiling paneling + wall insulation as one envelope-closeout package). It fails when detected operations span more than one phase family in the same beat (e.g. demolition + finish, or a rough-in system run in the same beat as the panel that conceals it — cross-phase bundles, never allowed regardless of packaging) or when more than three operations stack even within one family.
 - **Sub-Pixel Coordinate Pinning Gate (SPCP Gate - P0)**: Verify that every prompt (IMAGE and VIDEO) pins the camera attitude with wording matching its shot family: level exteriors pin the horizon line at a stated height; elevated/tilted shots pin the declared pitch angle and vertical convergence (no horizon reference); enclosed interiors pin a level pitch and centered vanishing axis. Mentioning a horizon, sky, or drifting clouds inside an enclosed interior prompt fails this gate; optical-flow radiation phrases inside static tripod prompts also fail.
 - **Geometric Tool Lock Gate (MTAL Gate - P0)**: Verify that all non-sterile active videos explicitly define the manual tool (MTAL) with specific color, geometric shape, and material properties (e.g., `matte-black rectangular steel shovel head` or `solid-blue heavy-duty paint roller`), rather than vague terms, to block morphing/flicker.
 - **Temporal Physics Skeleton Gate (P0)**: Verify that every `time_sequence` beat declares `shot_family`, `beat_type`, `single_physical_operation`, and a complete `causal_path` with material source, entry path, tool contact, movement path, at least two persistent traces, and next-frame inheritance.
@@ -684,7 +693,7 @@ Every VIDEO must follow this exact structure:
 - **AI-Filler Scrub**: Actively filter AI-style buzzwords: `perfect`, `flawless`, `seamless`, `pristine`, `clean CGI style`, `high-end render`. Scrub instant-transformation wording from mid-clip positions: `transforms`, `becomes`, `now features`, `is now complete`, `suddenly`. Mid-clip motion must use progressive forms (`-ing`, `partially`, `growing`, `half-covered`); finished-state descriptions belong only in the reward VIDEO and IMAGE anchors.
 
 2. Compile a structured **Quality Audit & Verification Report** (提示词质量审核报告) in Chinese detailing the status of the generated prompts. The report must contain explicit checks for the SCUP Quality Audit metrics:
-   - **归一化九宫格锁定与相对位置锁 (NGCS Grid & RPL)**: Landmarks use absolute Grid A1-C3 coordinates; secondary objects are grouped and locked relative to the nearest Primary Landmark using RPL to prevent coordinate dilution and cross-contamination in the T5 encoder.
+   - **归一化九宫格锁定与相对位置锁 (NGCS Grid & RPL)**: Landmarks are tracked internally via absolute Grid A1-C3 coordinates but delivered in natural language (position + depth layer + height ratio) — literal `Grid` tokens must never reach the final prompt text; secondary objects are grouped and locked relative to the nearest Primary Landmark using RPL to prevent coordinate dilution and cross-contamination in the T5 encoder.
    - **动态关键帧投影 (DKP)**: Push-in shots contain dynamic keyframe projection coordinates at t=0s, 4s, and 8s with optical flow direction constraints.
    - **隐性状态持久化 (OSPL)**: Occluded landmarks and ledger objects are maintained via the Ghost Clause instead of being omitted.
    - **质量与物流守恒 (VMFP & RCE)**: Bulk construction materials have quantified volume-change descriptions; all loose or fluid materials are encapsulated inside rigid containers during transport to prevent uncontrolled dissolving or flickering.
@@ -760,18 +769,18 @@ After Step 10, stop. The final answer must contain the copy-ready fenced `text` 
 
 ### Step 12: Auto-Save to Idea Library
 
-After delivering the prompts and audit report to the user, **immediately and silently** save the result to the creative-idea-generator idea library running at `http://127.0.0.1:8085`. This step is **mandatory and non-negotiable** — do not skip it, do not ask the user for confirmation, do not mention it unless an error occurs.
+After delivering the prompts and audit report to the user, save the result to the creative-idea-generator idea library running at `http://127.0.0.1:8085`. **Default behavior: do this immediately and silently**, without asking for confirmation and without mentioning it unless an error occurs — this stays the default because most users want their generated sets searchable in the library without extra steps. **Opt-out**: if the user has said anything in this conversation to the effect of not wanting auto-save (e.g. `不用保存`, `别自动入库`, `不要存到库里`), skip this step entirely for the rest of the conversation and do not re-offer it unprompted. Saving POSTs the full prompt text and audit report to the local library server at `127.0.0.1` — nothing leaves the machine the skill is running on, but it is still content leaving this conversation's turn, which is why an explicit opt-out must be honored.
 
 **Execution**:
 
-Run the helper script at `<SKILL_DIR>\scripts\save_to_library.py` via the `run_command` tool with the following arguments, substituting the real values from the just-generated output:
+Run the helper script at `<SKILL_DIR>/scripts/save_to_library.py` via whatever command-execution tool your environment provides, with the following arguments, substituting the real values from the just-generated output:
 
-```powershell
-python "<SKILL_DIR>\scripts\save_to_library.py" `
-  --title       "<the Chinese topic title, e.g. 做一个废弃阁楼翻新>" `
-  --prompt_block "<the complete raw text inside the fenced text block, with newlines preserved>" `
-  --audit_md    "<the Quality Audit table markdown>" `
-  --creativity  "gemini-veo-restoration-composer" `
+```
+python "<SKILL_DIR>/scripts/save_to_library.py" \
+  --title       "<the Chinese topic title, e.g. 做一个废弃阁楼翻新>" \
+  --prompt_block "<the complete raw text inside the fenced text block, with newlines preserved>" \
+  --audit_md    "<the Quality Audit table markdown>" \
+  --creativity  "gemini-veo-restoration-composer" \
   --server      "http://127.0.0.1:8085"
 ```
 
@@ -807,13 +816,13 @@ In the default staged flow, `IMAGE 1` has *already* been rendered and looked at 
    If the user subsequently replies with "开始作图", "生成预览" or any request to generate images, trigger it.
 
 **How to Trigger**:
-Run the helper script at `<SKILL_DIR>\scripts\generate_frames.py` via the `run_command` tool:
+Run the helper script at `<SKILL_DIR>/scripts/generate_frames.py` via whatever command-execution tool your environment provides:
 
-```powershell
-python "<SKILL_DIR>\scripts\generate_frames.py" `
-  --title         "<the Chinese topic title, e.g. 做一个废弃阁楼翻新>" `
-  --aspect_ratio  "9:16" `
-  --quality       "2K" `
+```
+python "<SKILL_DIR>/scripts/generate_frames.py" \
+  --title         "<the Chinese topic title, e.g. 做一个废弃阁楼翻新>" \
+  --aspect_ratio  "9:16" \
+  --quality       "2K" \
   --server        "http://127.0.0.1:8085"
 ```
 
@@ -1008,6 +1017,12 @@ Load these files for every composition task:
 
 - [references/prompt-templates.md](references/prompt-templates.md)
   Canonical IMAGE and VIDEO templates with fill-in slots. Load during Steps 7-8.
+
+- [references/beat-ladders/cable-car.md](references/beat-ladders/cable-car.md)
+  The 19-beat cliff cable car / gondola restoration ladder. Load during Step 5.5 only when the topic matches this specific family; it's a named exception to the default 3-6 beat count, not a general pattern.
+
+- [references/continuity-contracts.md](references/continuity-contracts.md)
+  Rendered gate-by-gate view of [references/skill-local-contracts.json](references/skill-local-contracts.json), the machine-checked registry of every P0/P1/P2 rule this skill's `video_to_prompt_pipeline.py` enforces. Load during Step 9 as the authoritative gate list — maintain the registry, not this file or Step 9's prose, when a rule changes.
 
 
 ## Examples

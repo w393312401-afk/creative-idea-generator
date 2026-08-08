@@ -78,6 +78,37 @@ def test_scene_state_allows_removal_after_a_fresh_reintroduction():
     assert not any("again without a fresh introduction" in error for error in errors)
 
 
+def test_scene_state_rejects_removing_a_persistent_structural_element():
+    """地板/拱门这类结构件一旦铺设就必须全程继承，不存在"先装后拆"的合法叙事。"""
+    beat1 = _beat(1, "wet-work")
+    beat1["introduced_objects"] = ["marble archway"]
+    beat2 = _beat(2, "clearing")
+    beat2["removed_objects"] = ["marble archway"]
+    errors = validate_scene_states(build_scene_states([beat1, beat2]))
+    assert any("persistent structural element" in error for error in errors)
+
+
+def test_scene_state_rejects_lingering_temporary_object_at_furnishing_phase():
+    """施工工具/设备是临时态：进入 furnishing 阶段时必须已经清场。"""
+    beat1 = _beat(1, "installation")
+    beat1["introduced_objects"] = ["scaffolding"]
+    beat2 = _beat(2, "furnishing")
+    errors = validate_scene_states(build_scene_states([beat1, beat2]))
+    assert any("temporary construction objects" in error for error in errors)
+
+
+def test_scene_state_allows_persistent_and_cleared_temporary_objects_through_full_flow():
+    """正常翻新流程不应被误伤：工具及时清场、结构件全程保留都不该报错。"""
+    beat1 = _beat(1, "installation")
+    beat1["introduced_objects"] = ["scaffolding", "marble archway"]
+    beat2 = _beat(2, "covering")
+    beat2["removed_objects"] = ["scaffolding"]
+    beat3 = _beat(3, "furnishing")
+    errors = validate_scene_states(build_scene_states([beat1, beat2, beat3]))
+    assert not any("temporary construction objects" in error for error in errors)
+    assert not any("persistent structural element" in error for error in errors)
+
+
 def test_outline_fallback_preserves_every_source_row_and_reference():
     brief = {
         "beat_outline": [

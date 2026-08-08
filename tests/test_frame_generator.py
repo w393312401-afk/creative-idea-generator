@@ -1183,5 +1183,190 @@ class TestDecodeImageAspectCrop(unittest.TestCase):
             self.assertEqual(im.size, (128, 128))
 
 
+class TestBeatFrameMappingGate(unittest.TestCase):
+    """Beat↔图像渲染后 1:1 硬闸：全量渲染收尾时，落盘帧号集合必须与
+    prompt_block 声明的 IMAGE N 集合完全相等。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_output_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
+
+    def tearDown(self):
+        server_common.OUTPUT_ROOT = self.old_output_root
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_stale_manifest_frame_beyond_current_beat_count_is_rejected(self):
+        """项目改稿导致 beat 数量收窄后，旧 manifest 遗留的多余帧不能被静默沿用。"""
+        project_dir = server_common._get_project_dir('mapping_gate_extra')
+        os.makedirs(project_dir, exist_ok=True)
+        manifest_path = os.path.join(project_dir, 'manifest.json')
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'title': 'mapping_gate_extra',
+                'frames': [
+                    {'sequence': 1, 'slot': 1, 'file': 'a', 'url': '/a',
+                     'quality_gate': 'pending_manual_review'},
+                    {'sequence': 2, 'slot': 2, 'file': 'b', 'url': '/b',
+                     'quality_gate': 'pending_manual_review'},
+                ],
+            }, f)
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+            with self.assertRaises(RuntimeError) as ctx:
+                generate_frame_sequence(
+                    {'coverReferencePath': self.cover},
+                    'mapping_gate_extra',
+                    '图片 1:\nonly beat left\n',
+                    on_progress=lambda *a: None,
+                )
+        self.assertIn('映射失守', str(ctx.exception))
+
+    def test_matched_beat_and_frame_counts_render_cleanly(self):
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+            manifest = generate_frame_sequence(
+                {'coverReferencePath': self.cover},
+                'mapping_gate_clean',
+                '图片 1:\nfirst\n\n图片 2:\nsecond\n',
+                on_progress=lambda *a: None,
+            )
+        self.assertEqual([f['sequence'] for f in manifest['frames']], [1, 2])
+
+
+class TestRegionLockControlPrompt(unittest.TestCase):
+    """常规拍的 changed_grid_cells 应当被写进控制指令，收紧锁定范围。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_output_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
+
+    def tearDown(self):
+        server_common.OUTPUT_ROOT = self.old_output_root
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_declared_changed_grid_cells_are_written_into_the_control_prompt(self):
+        project_dir = server_common._get_project_dir('region_lock_gate')
+        os.makedirs(project_dir, exist_ok=True)
+        manifest_path = os.path.join(project_dir, 'manifest.json')
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'title': 'region_lock_gate',
+                'frames': [],
+                'spatial_beats': [{'index': 1, 'changed_grid_cells': ['B2', 'C2']}],
+            }, f)
+
+        calls = []
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            calls.append(kwargs.get('control_prompt', ''))
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+            generate_frame_sequence(
+                {'coverReferencePath': self.cover},
+                'region_lock_gate',
+                '图片 1:\nfirst frame prompt\n\n图片 2:\nsecond frame prompt\n',
+                on_progress=lambda *a: None,
+            )
+
+        # calls[0] is IMAGE 1 (cover-anchored, control_prompt is '' by design);
+        # calls[1] is IMAGE 2, which must carry the declared grid-cell lock.
+        self.assertEqual(len(calls), 2)
+        self.assertIn('B2, C2', calls[1])
+        self.assertIn('REGION LOCK', calls[1])
+
+    def test_beat_without_declared_grid_cells_keeps_the_generic_control_prompt(self):
+        calls = []
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            calls.append(kwargs.get('control_prompt', ''))
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+            generate_frame_sequence(
+                {'coverReferencePath': self.cover},
+                'region_lock_gate_generic',
+                '图片 1:\nfirst frame prompt\n\n图片 2:\nsecond frame prompt\n',
+                on_progress=lambda *a: None,
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn('REGION LOCK', calls[1])
+
+
+class TestCollageQAWiring(unittest.TestCase):
+    """FFmpeg 拼图 + 连续性 QA 报告在全量渲染收尾时写回 manifest。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_output_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
+
+    def tearDown(self):
+        server_common.OUTPUT_ROOT = self.old_output_root
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_full_render_populates_collage_and_qa_report_urls(self):
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        def fake_collage(frame_paths, output_path, columns=5):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b'fake-jpg')
+            return output_path
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
+             patch('tools.collage.build_keyframe_collage', side_effect=fake_collage):
+            manifest = generate_frame_sequence(
+                {'coverReferencePath': self.cover},
+                'collage_qa_wiring',
+                '图片 1:\nfirst\n\n图片 2:\nsecond\n',
+                on_progress=lambda *a: None,
+            )
+
+        self.assertIn('collage_url', manifest)
+        self.assertTrue(manifest['collage_url'].endswith('_collage.jpg'))
+        self.assertIn('continuity_qa_report_url', manifest)
+        project_dir = server_common._get_project_dir('collage_qa_wiring')
+        report_path = os.path.join(project_dir, 'continuity_qa_report.json')
+        self.assertTrue(os.path.exists(report_path))
+        with open(report_path, encoding='utf-8') as f:
+            report = json.load(f)
+        self.assertEqual(report['total_frames'], 2)
+
+    def test_collage_failure_is_best_effort_and_does_not_break_the_render(self):
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
+             patch('tools.collage.build_keyframe_collage',
+                   side_effect=RuntimeError('ffmpeg missing')):
+            manifest = generate_frame_sequence(
+                {'coverReferencePath': self.cover},
+                'collage_qa_best_effort',
+                '图片 1:\nfirst\n',
+                on_progress=lambda *a: None,
+            )
+
+        self.assertNotIn('collage_url', manifest)
+        self.assertEqual(len(manifest['frames']), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -13,6 +13,28 @@ WET_WORK = {"wet-work", "wet_work", "plastering", "concrete", "priming", "painti
 COVERING = {"covering", "drywall", "paneling", "flooring", "finishing"}
 FURNISHING = {"furnishing", "placement", "move-in", "move_in"}
 
+# 临时态 vs 持久态物体生命周期规则（子串匹配，风格与 __init__.py 里的
+# _ANCHOR_RETIRE_CUES/_ANCHOR_TRANSFORM_CUES 一致）。TEMPORARY 是施工过程中的
+# 工具/设备，一旦进入 furnishing 阶段就必须已经清场；PERSISTENT_STRUCTURAL 是
+# 承重/铺装类结构件，一旦 introduced 就不许再出现在任何一拍的 removed_objects
+# 里——这两类都是关键词提示，不是穷举分类，误报风险由调用方按需要降级为
+# warning-only（见 validate_scene_states 的 6/6 事故复盘同款克制原则）。
+TEMPORARY_OBJECT_CUES = {
+    "scaffold", "scaffolding", "ladder", "crane", "tarp", "tarpaulin",
+    "temporary brace", "temporary bracing", "work platform", "mixer", "generator",
+    "power tool", "toolbox", "tool cart", "workbench", "site fencing", "site fence",
+    "dust sheet", "drop cloth", "safety barrier", "construction light",
+}
+PERSISTENT_STRUCTURAL_CUES = {
+    "floor", "flooring", "arch", "archway", "threshold",
+    "foundation", "load-bearing wall", "structural wall", "roof", "ceiling beam",
+}
+
+
+def _matches_cue(name: str, cues: set[str]) -> bool:
+    lname = _text(name).lower()
+    return bool(lname) and any(cue in lname for cue in cues)
+
 
 def _text(value: Any) -> str:
     return " ".join(str(value or "").split())
@@ -132,6 +154,10 @@ def validate_scene_states(states: list[dict[str, Any]]) -> list[str]:
     # "移除一个没声明过的物体"（那多半就是合法的原始现场物），而是"同一个物体被
     # 移除了两次、中间没有重新引入"——那才是状态账对不上的信号。
     ever_removed: set[str] = set()
+    # 持久态锁定集：一旦某个物体名匹配 PERSISTENT_STRUCTURAL_CUES 并被 introduced，
+    # 就永久记在这里——后续任何一拍都不许再把它写进 removed_objects（地板/拱门这类
+    # 结构件一旦铺设，全程继承，不存在"先装后拆"的合法叙事）。
+    persistent_locked: set[str] = set()
     for expected, state in enumerate(states or [], 1):
         idx = state.get("beat") or expected
         if idx != expected:
@@ -152,11 +178,27 @@ def validate_scene_states(states: list[dict[str, Any]]) -> list[str]:
                 errors.append(
                     f"Beat {idx} removes object '{name}' again without a fresh introduction "
                     f"since it was last removed.")
+            if key in persistent_locked:
+                errors.append(
+                    f"Beat {idx} removes '{name}', a persistent structural element that was "
+                    f"already laid; persistent elements must be inherited through every "
+                    f"subsequent beat and are never removed.")
             ever_removed.add(key)
         for name in state.get("introduced_objects") or []:
             known.add(name.lower())
+            if _matches_cue(name, PERSISTENT_STRUCTURAL_CUES):
+                persistent_locked.add(name.lower())
         for name in state.get("removed_objects") or []:
             known.discard(name.lower())
+        # 临时态清场：进入 furnishing 阶段时，任何仍"存活"（已 introduced 未
+        # removed）且匹配 TEMPORARY_OBJECT_CUES 的施工工具/设备都必须已经清场——
+        # furnishing 拍写的是搬入家具，不该还有脚手架、工具箱、临时支撑立在画面里。
+        if classify_material_flow(state.get("operation_type", "")) == "furnishing":
+            lingering = sorted(n for n in known if _matches_cue(n, TEMPORARY_OBJECT_CUES))
+            if lingering:
+                errors.append(
+                    f"Beat {idx} enters the furnishing phase but temporary construction "
+                    f"objects are still present and not yet removed: {lingering}.")
         errors.extend(validate_material_flow(state))
         previous_after = deepcopy(state.get("after") or {})
     return errors

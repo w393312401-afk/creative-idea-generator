@@ -32,8 +32,8 @@ from server_common import (
     _account_switch_interval, _account_rotation_ring,
 )
 from frame_continuity import (
-    analyze_frame, continuity_max_retries, continuity_mode, family_map,
-    family_master, is_transition_frame, register_family_master,
+    analyze_frame, changed_grid_cells, continuity_max_retries, continuity_mode,
+    family_map, family_master, is_transition_frame, register_family_master,
     transition_result,
 )
 
@@ -53,6 +53,18 @@ _CONTINUITY_RETRY_CONTROL = (
     "camera position, crop, perspective, horizon, architecture, terrain, fixed landmarks, object "
     "identity, scale, lighting direction, and every surface outside the declared work area. Apply "
     "only the requested construction delta inside its named area; do not redraw the whole scene."
+)
+
+# 该拍在规划阶段已经声明好 changed_grid_cells（3x3 网格坐标，见 frame_continuity.
+# changed_grid_cells），此前这份数据只用来做生成后的连续性 QA 比对，从未喂给生成
+# 请求本身——控制指令只有"锁定相机、除声明变化外像素保真"这种泛泛的话。这里把
+# 已经算好的具体网格坐标直接写进控制指令，把"哪块允许变"从模糊描述收紧成坐标。
+_REGION_LOCK_TEMPLATE = (
+    " REGION LOCK: this beat's declared change is confined to grid cell(s) {cells} (3x3 grid, "
+    "columns A-C left-to-right, rows 1-3 top-to-bottom). Only pixels inside {cells} may change. "
+    "Every pixel outside {cells} — including all locked anchor landmarks — must remain "
+    "pixel-identical to the source frame in position, scale, material, and lighting, not merely "
+    "similar."
 )
 
 
@@ -2477,7 +2489,14 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     elif is_bridge or is_cut_head:
                         ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT
                     else:
+                        # 过门/转向是全画幅相机运动，区域锁在语义上不适用，维持原样；
+                        # 只有静态镜头下的常规拍才用这拍已声明的网格坐标收紧锁定范围。
                         ctrl_prompt = IMG2IMG_CONTROL_PROMPT
+                        _region_cells = changed_grid_cells(
+                            item.get('prompt', ''), _continuity_beat(manifest, seq))
+                        if _region_cells:
+                            ctrl_prompt += _REGION_LOCK_TEMPLATE.format(
+                                cells=', '.join(_region_cells))
                     transport = _generate_image_edit(config, item['prompt'], reference,
                                                      target_path, control_prompt=ctrl_prompt)
                     if transport == CHAT_TRANSPORT and on_progress:
@@ -2712,6 +2731,62 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
     manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
     update_manifest_stale_status(manifest, project_dir,
                                  regenerated_sequences=target_sequences, finalize=True)
+
+    # Beat↔图像 1:1 硬闸（仅在全量渲染时检查——子集/单帧重试天然不会覆盖全集，
+    # 用这条闸会误杀合法的定向重渲）。规划阶段的 outline_one_to_one_violations
+    # 只校验文本层的 beat ladder，这里补上渲染层的收口：落盘的帧号集合必须与
+    # prompt_block 里声明的 IMAGE N 集合完全相等，不多不少、不重不漏。
+    if target_sequences is None:
+        expected_seqs = sorted(prompts_by_seq.keys())
+        actual_seqs = sorted(manifest_frames_by_seq.keys())
+        if actual_seqs != expected_seqs:
+            missing = sorted(set(expected_seqs) - set(actual_seqs))
+            extra = sorted(set(actual_seqs) - set(expected_seqs))
+            raise RuntimeError(
+                f'帧序列与 beat 列表映射失守：期望 {len(expected_seqs)} 帧 {expected_seqs}，'
+                f'实际落盘 {len(actual_seqs)} 帧 {actual_seqs}'
+                + (f'，缺失 {missing}' if missing else '')
+                + (f'，多出 {extra}' if extra else ''))
+
+    # FFmpeg 五宫格拼图质检 + 连续性 QA 报告（仅全量渲染时生成；子集/单帧重试不
+    # 覆盖全集，拼图意义不大，且会用不完整的帧集反复覆盖已有的完整拼图）。
+    # continuity_check 已经在逐帧渲染时算过一次并存进 manifest['frames']，这里只
+    # 汇总，不重新跑 ORB 比对。ffmpeg 缺失或拼图失败按 best-effort 处理，不影响
+    # 渲染任务本身的成败——质检产物缺失本身不该拖垮已经渲完的一整单。
+    if target_sequences is None:
+        try:
+            from pathlib import Path
+            from tools.collage import build_keyframe_collage
+            frame_paths = [
+                Path(frames_dir) / f'img_{s:03d}.webp'
+                for s in sorted(manifest_frames_by_seq.keys())
+            ]
+            frame_paths = [p for p in frame_paths if p.exists()]
+            collage_name = f"{os.path.basename(os.path.normpath(project_dir))}_collage.jpg"
+            collage_path = build_keyframe_collage(frame_paths, Path(project_dir) / collage_name)
+            if collage_path:
+                manifest['collage_url'] = '/' + os.path.relpath(
+                    str(collage_path),
+                    os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+
+            flagged = []
+            for s in sorted(manifest_frames_by_seq.keys()):
+                check = manifest_frames_by_seq[s].get('continuity_check') or {}
+                status = check.get('status')
+                if status in ('warned', 'failed'):
+                    flagged.append({'sequence': s, 'status': status, 'reason': check.get('reason')})
+            qa_report_path = os.path.join(project_dir, 'continuity_qa_report.json')
+            with open(qa_report_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'version': 'frame-continuity-qa-v1',
+                    'total_frames': len(manifest_frames_by_seq),
+                    'flagged_frames': flagged,
+                }, f, ensure_ascii=False, indent=2)
+            manifest['continuity_qa_report_url'] = '/' + os.path.relpath(
+                qa_report_path, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+        except Exception as collage_err:
+            if sys.stdout:
+                print(f"[COLLAGE QA] 拼图/质检报告生成失败（不影响渲染结果）：{collage_err}")
 
     manifest_path = os.path.join(project_dir, 'manifest.json')
     write_manifest(project_dir, manifest)
