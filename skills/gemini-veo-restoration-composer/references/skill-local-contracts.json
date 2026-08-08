@@ -1,0 +1,277 @@
+{
+  "registry_version": "1.0",
+  "scope": "skills/gemini-veo-restoration-composer (video_to_prompt_pipeline.py + scripts/render_and_gate_anchor.py + SKILL.md prose)",
+  "_comment": [
+    "这是本技能包自己的契约登记表，跟仓库根目录的 references/contract-registry.json 是两套",
+    "系统——那份是服务端 prompt_pipeline/__init__.py 渲染管线的契约（由 server.py 消费，",
+    "tests/test_skill_contract_registry.py 用 pytest 校验），跟这份技能包内自带的",
+    "video_to_prompt_pipeline.py（一个独立的 Tier-4 视频反推 CLI 脚本，有自己内联的",
+    "run_scup_audit）完全不共享代码路径。两份注册表故意不合并，命名也刻意不同",
+    "（skill-local-contracts.json vs contract-registry.json），避免混淆两套系统。",
+    "",
+    "enforcer 写成 '<file>::<kind>:<value>'，由 scripts/validate_contracts.py 逐条解析校验：",
+    "  function:<name>   -> AST 里存在一个同名 def（任意嵌套层级都算，因为这份脚本的绝大多数",
+    "                        门是内联在 run_scup_audit() 里的字典字面量，不是独立函数）",
+    "  class:<name>      -> AST 里存在一个同名 class",
+    "  gate_name:<name>  -> 源码里存在这个字符串字面量（门的身份是 \"name\": \"<Gate Display",
+    "                        Name>\" 这个字典键值，不是函数名）",
+    "  exit_code:<n>     -> 源码里存在 sys.exit(<n>) / exit(<n>) 调用",
+    "改名/删除/挪走了这些东西中的任何一个，validate_contracts.py 就会红。",
+    "",
+    "没有 enforcer 的契约必须写 gap 说明——这类契约通常约束的是 agent 在对话里读 SKILL.md",
+    "prose 之后应该做的事（例如首帧复核循环、P0 阻断重写循环），本质上无法被这个独立 CLI",
+    "脚本以代码形式校验，因为那条路径根本不经过这个脚本。缺口是登记在案的，不是遗漏。"
+  ],
+  "contracts": [
+    {
+      "id": "SPCP",
+      "tier": "P0",
+      "scope": "image+video",
+      "shot_family_scope": ["exterior_static", "threshold_bridge", "interior_static", "reward_reveal", "elevated"],
+      "rule_zh": "按 shot_family 锁定相机姿态措辞：室外/桥接/奖励用 horizon line；室内/封闭空间用 camera pitch locked + 居中灭点轴，且禁止出现 horizon/sky/clouds；elevated 用 pitch angle + convergence direction。optical flow 措辞只允许出现在 push-in 类镜头。",
+      "source": "SKILL.md Step 6 (Camera DNA Block SPCP), Step 9 P0 Kill Gates",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Sub-Pixel Coordinate Pinning Gate",
+      "blocking": true
+    },
+    {
+      "id": "grid-internal-only",
+      "tier": "P0",
+      "scope": "image+video",
+      "rule_zh": "Grid A1-C3 坐标只用于内部记账（NGCS/OSPL 装配阶段），最终交付的 IMAGE/VIDEO 正文一律不得出现字面 Grid 坐标 token；必须转译为方位+深度层+高度比例的自然语言。",
+      "source": "SKILL.md Step 6 (Grid-is-internal-only note), Step 9 No Banned Notations Gate",
+      "enforcer": "video_to_prompt_pipeline.py::function:grid_to_natural_language",
+      "blocking": true
+    },
+    {
+      "id": "NLVTR",
+      "tier": "P0",
+      "scope": "image+video",
+      "rule_zh": "正文禁止出现 '%' 符号、内部缩写全集（TSPA/HAL/VMFP/GCTR/RPL/RCE/SCUP/NGCS/OSPL/RHMA/PBISP/HCL/NLVTR/MTAL）、以及 Grid A1-C3 坐标 token。",
+      "source": "SKILL.md Step 8 point 5, Step 9 No Banned Notations Gate line ~613",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:No Banned Notations Gate",
+      "blocking": true
+    },
+    {
+      "id": "naturalize-sanitizer-idempotent",
+      "tier": "P1",
+      "scope": "pipeline",
+      "rule_zh": "naturalize_visual_text() 必须幂等（二次调用不再改变输出），且不得残留空括号或悬空标点。",
+      "source": "internal implementation guarantee, not directly SKILL.md-visible",
+      "enforcer": "video_to_prompt_pipeline.py::function:naturalize_visual_text",
+      "blocking": false
+    },
+    {
+      "id": "word-count",
+      "tier": "P0",
+      "scope": "image+video",
+      "rule_zh": "IMAGE 100-200 词、VIDEO 120-240 词的硬性区间（2026-08-07 从 100-170/120-180 上调，原区间对本管线自身必填结构元素而言不可达）。",
+      "source": "SKILL.md Step 7 word count targets, Step 9 Word Count Self-Check Gate",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Word Count Self-Check Gate",
+      "blocking": true
+    },
+    {
+      "id": "beat-overload",
+      "tier": "P0",
+      "scope": "pipeline",
+      "rule_zh": "一个 beat 最多包含三个同 zone、同 phase family、共同服务于一个命名终态产物的动作；跨 phase family 的动作组合（如拆除+粉刷、rough-in 与遮盖它的面板同 beat）在任意数量下都 FAIL。",
+      "source": "SKILL.md Step 5 Visible Milestone Package Rule, Step 9 Beat Overload Pop Prevention Gate",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Beat Overload Pop Prevention Gate",
+      "blocking": true
+    },
+    {
+      "id": "adjacent-anchor-delta-budget",
+      "tier": "P2",
+      "scope": "image",
+      "rule_zh": "相邻 IMAGE 锚点允许改变的格数按 beat_type 分级（removal/excavation<=4，coating/interior_finish<=6，fixture_install/furnishing<=3），且格数只是提醒工具，declared full extent 优先于格数上限。",
+      "source": "SKILL.md Step 5 Adjacent-Anchor Delta Budget table",
+      "enforcer": null,
+      "blocking": false,
+      "gap": "这是一条软提醒（P2，非阻断），当前只有 Cumulative State Gate 的正文校验（inherited traces / declared operation result）在代码里执行；格数本身没有专门的程序化门，因为 SKILL.md 明确写了格数不是硬门。登记于此以说明这是刻意的设计，不是遗漏。"
+    },
+    {
+      "id": "MTAL",
+      "tier": "P0",
+      "scope": "video",
+      "rule_zh": "非无人、非过门的 VIDEO 里，每一次工具名词出现都必须在其前 8 个词的窗口内命中颜色/材质锁定词，而不是整条 clip 里任意位置出现一次颜色词就算通过。",
+      "source": "SKILL.md Step 6 MTAL definition, Step 9 Geometric Tool Lock Gate",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Geometric Tool Lock Gate",
+      "blocking": true
+    },
+    {
+      "id": "prompt-slot-structure",
+      "tier": "P1",
+      "scope": "pipeline",
+      "rule_zh": "门禁读取 shot_family / beat_type / enclosed / is_bridge / sterile 时必须从 time_sequence 派生的结构化字段读取，不得靠对渲染出的正文做关键词猜测（历史上 MTAL/SPCP 的假通过全部源于关键词猜测）。",
+      "source": "internal implementation guarantee",
+      "enforcer": "video_to_prompt_pipeline.py::class:PromptSlot",
+      "blocking": false
+    },
+    {
+      "id": "clean-frame-boundary",
+      "tier": "P0",
+      "scope": "image",
+      "rule_zh": "所有 IMAGE 锚点必须完全不含在场工人/机械动作词。",
+      "source": "SKILL.md Step 6 Clean Frame Boundary",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Clean Frame Boundary",
+      "blocking": true
+    },
+    {
+      "id": "image-video-frame-binding",
+      "tier": "P0",
+      "scope": "video",
+      "rule_zh": "每条 VIDEO 必须显式声明与前后 IMAGE 锚点的绑定（exact composition anchors）。",
+      "source": "SKILL.md Step 8 point 1-2",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:IMAGE-VIDEO Frame Binding",
+      "blocking": true
+    },
+    {
+      "id": "bidirectional-passage-lock",
+      "tier": "P0",
+      "scope": "video",
+      "rule_zh": "出现工人的 VIDEO 必须声明 t=0s 进场、t=7.5s 前离场的双向出入通道。",
+      "source": "SKILL.md Step 6 Bi-directional Out-and-In Passage Clause",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Bi-directional Passage Lock",
+      "blocking": true
+    },
+    {
+      "id": "rigid-container-encapsulation",
+      "tier": "P0",
+      "scope": "video",
+      "rule_zh": "散装材料必须封装在刚性容器内描述，不得写裸露的铲运动作。",
+      "source": "SKILL.md Step 8 VMFP with Rigid Encapsulation",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Rigid Container Encapsulation",
+      "blocking": true
+    },
+    {
+      "id": "banned-transition-shortcuts",
+      "tier": "P0",
+      "scope": "video",
+      "rule_zh": "禁止 cross-dissolve/fade-in/suddenly/magically/rapid montage/jump cut/instant transformation 等跳过施工过程的转场措辞。",
+      "source": "SKILL.md Step 8 Banned Transition Shortcuts",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Continuous Action Flow",
+      "blocking": true
+    },
+    {
+      "id": "manual-tool-construction-realism",
+      "tier": "P0",
+      "scope": "video",
+      "rule_zh": "非无人、非过门的 VIDEO 必须包含具体手持施工工具名词，并声明两条自然语言进度线索。",
+      "source": "SKILL.md Step 8 point 5 Measurable Progress Markers",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Manual Tool & Construction Realism Gate",
+      "blocking": true
+    },
+    {
+      "id": "GCTR",
+      "tier": "P0",
+      "scope": "image+video",
+      "rule_zh": "每个可见的新增/移除/修复/清洁/安装/组装/搬运/机械动作，必须在下一帧留下至少两条可辨识的因果痕迹证据。",
+      "source": "SKILL.md Step 6 Global Causal Trace Rule",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Global Causal Trace Rule",
+      "blocking": true
+    },
+    {
+      "id": "power-chain",
+      "tier": "P0",
+      "scope": "pipeline",
+      "rule_zh": "任何通电灯具/装置的激活必须有更早的布线/电源 beat（离网载体还需一个可见电源安装 beat）。",
+      "source": "SKILL.md Step 5 Construction Sequence Validation hard vetoes",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Power Chain Gate",
+      "blocking": true
+    },
+    {
+      "id": "volume-conservation",
+      "tier": "P1",
+      "scope": "video",
+      "rule_zh": "移除/运入的材料体量必须靠容器规模、往返趟数或可见增长的堆料来交代；切出的实心大块必须有独立的撬出/搬出动作。",
+      "source": "SKILL.md Material, Access, And Crew Plausibility section",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Volume Conservation Gate",
+      "blocking": false
+    },
+    {
+      "id": "enclosed-space-provenance",
+      "tier": "P1",
+      "scope": "pipeline",
+      "rule_zh": "新开洞口后镜头进入的室内空间必须在开洞 beat 里声明是预先存在的，或者有独立的挖掘/清运 beat 交代其成因。",
+      "source": "SKILL.md Step 5 Enclosed-Space Provenance Rule",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Enclosed-Space Provenance Gate",
+      "blocking": false
+    },
+    {
+      "id": "mirror-reflective-alignment",
+      "tier": "P1",
+      "scope": "image",
+      "rule_zh": "结尾 IMAGE 如果描述了高反光地面，必须带 RHMA-Blur 式的高模糊低光泽反射描述子句（子句本身在最终正文里以自然语言呈现，不留 RHMA-Blur 缩写）。",
+      "source": "SKILL.md Step 7 Final IMAGE template, Mirror Consistency Clause",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Mirror Reflective Alignment",
+      "blocking": false
+    },
+    {
+      "id": "temporal-physics-skeleton",
+      "tier": "P0",
+      "scope": "pipeline",
+      "rule_zh": "每个 beat 必须声明 shot_family、beat_type、single_physical_operation，以及完整的 causal_path（含至少两条 persistent_traces）。",
+      "source": "SKILL.md Step 5.5 Temporal Physics Skeleton Assembly",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Temporal Physics Skeleton Gate",
+      "blocking": true
+    },
+    {
+      "id": "threshold-bridge-continuity",
+      "tier": "P0",
+      "scope": "video",
+      "rule_zh": "过门桥接 beat 必须与施工内容隔离，且前一个锚点必须预先展示至少两个室内地标。",
+      "source": "SKILL.md Step 8 Threshold bridge section, TBCP",
+      "enforcer": "video_to_prompt_pipeline.py::gate_name:Threshold Bridge Continuity Gate",
+      "blocking": true
+    },
+    {
+      "id": "tier4-evidence-discipline",
+      "tier": "P0",
+      "scope": "pipeline",
+      "rule_zh": "Tier 4 视频反推：画面中没有看到工人/工具时，必须如实标注为 unobserved，不得编造标准施工工具或动作循环来'防止变形'。",
+      "source": "SKILL.md line ~107 (Two-Stage Isolation, Anti-Priming)",
+      "enforcer": null,
+      "blocking": true,
+      "gap": "这条约束的是 LLM_SYSTEM_PROMPT 里喂给分析模型的指令文本（一段长自然语言指令，2026-08-07 已从'必须编造标准工具'改写为'必须如实标注 unobserved，禁止编造'），本质上是提示词工程而非可静态断言的代码逻辑。是否真的没编造，只能靠人工抽查分析结果里 tool_evidence 字段与画面是否一致。登记于此以免被误当作已有程序化执行者。"
+    },
+    {
+      "id": "p0-blocking-rewrite-loop",
+      "tier": "P0",
+      "scope": "pipeline",
+      "rule_zh": "任何 P0 门失败必须阻断交付，且只能针对性重写失败的槽位（最多 2 次），不得整套重生成；重写 2 次仍失败必须停止并升级为人工介入，不得静默交付。",
+      "source": "SKILL.md Step 9 P0-Blocking Targeted Rewrite Loop",
+      "enforcer": "video_to_prompt_pipeline.py::function:audit_blocking_failures",
+      "blocking": true,
+      "note_zh": "audit_blocking_failures() 只覆盖独立 CLI（video_to_prompt_pipeline.py::main()，P0 失败时 exit(1) 且不再打印 successfully 横幅）。对话式 SKILL.md 流程里真正执行'针对性重写、最多 2 次、然后升级'这套循环的是 agent 本身，无法被这个 CLI 脚本校验——那部分的强制力完全来自 SKILL.md 这段 prose 有没有被遵守。"
+    },
+    {
+      "id": "staged-anchor-render-gate",
+      "tier": "P0",
+      "scope": "pipeline",
+      "rule_zh": "分阶段交付：先只出 IMAGE 1 并同步渲染，人工确认后才允许撰写其余槽位；首帧被否决后必须走定向修复+重渲循环（最多 3 次）并清除磁盘上的旧帧，不得被 Step 13 静默复用。",
+      "source": "SKILL.md Staged Delivery Contract, Step 6.5 points 4 and 8",
+      "enforcer": null,
+      "blocking": true,
+      "gap": "这条约束的是 agent 在对话里的交付节奏，本仓库没有让这个独立 CLI 脚本参与分阶段渲染（它是一次性反推整套 beat 的批处理工具，不经过 render_and_gate_anchor.py）。render_and_gate_anchor.py 提供了 --force_regenerate 参数作为'不复用磁盘旧帧'的机制入口，但是否在被否决后真的调用它、真的清理磁盘，完全取决于 agent 是否遵守 SKILL.md Step 6.5 第 8 条——无程序化执行者，登记于此以免被误当作已执行。"
+    },
+    {
+      "id": "render-exit-code-taxonomy",
+      "tier": "P0",
+      "scope": "pipeline",
+      "rule_zh": "render_and_gate_anchor.py 的退出码必须准确区分：2=连接失败（唯一触发'服务不可用'豁免的退出码）、3=服务已连接但返回错误或响应体不合法、4=缺少必需的 prompt 文本、5=超时（读超时或连接期超时，均不等同于不可用）。HTTP 错误状态码不得被误判为退出码 2。",
+      "source": "scripts/render_and_gate_anchor.py module docstring, SKILL.md Step 6.5 points 4-5b",
+      "enforcer": "scripts/render_and_gate_anchor.py::exit_code:3",
+      "blocking": true,
+      "note_zh": "退出码 2/4/5 同样由这次修复引入/修正，均可用 exit_code:<n> 形式单独登记；这里只挑最容易和'不可用(2)'混淆的退出码 3 作为代表性校验目标，避免注册表条目膨胀成一码一条。"
+    },
+    {
+      "id": "auto-save-opt-out",
+      "tier": "P2",
+      "scope": "pipeline",
+      "rule_zh": "Step 12 的自动入库默认执行，但用户在对话中表达过不想自动入库时必须跳过且不再重新提起。",
+      "source": "SKILL.md Step 12 Auto-Save to Idea Library",
+      "enforcer": null,
+      "blocking": false,
+      "gap": "这是一条对话记忆型约束（'用户是否在本次对话里说过不要自动入库'），依赖 agent 对上下文的记忆与遵守，无法被独立 CLI 脚本静态校验。save_to_library.py 本身没有、也不需要感知这个选择——跳过与否发生在是否调用它之前。"
+    }
+  ]
+}
