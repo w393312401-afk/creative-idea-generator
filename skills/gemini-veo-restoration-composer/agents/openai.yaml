@@ -1,4 +1,17 @@
 interface:
   display_name: "修复提示词作曲家"
   short_description: "一键从主题描述生成完整的 IMAGE/VIDEO 延时改造提示词集合"
-  default_prompt: "Use $gemini-veo-restoration-composer to turn this topic description into a complete, copy-ready IMAGE/VIDEO prompt set for a restoration/renovation time-lapse. Accept minimal input (even one sentence), auto-build the Drift Lock Packet, and derive the production beat ladder from the space type. Follow the skill's Staged Delivery Contract: compose IMAGE 1 only, run scripts/render_and_gate_anchor.py synchronously and wait for it to exit 0, show the user the rendered anchor and say plainly that nothing judged it automatically, and only then compose the remaining IMAGE anchors and anchor-first VIDEO prompts — never emit the full prompt set in one pass unless the user explicitly asks for text-only output or the render server at http://127.0.0.1:8085 is unreachable. Run silent self-check gates, deliver in the standard fenced text block with Chinese labels, then auto-save to the local idea library via scripts/save_to_library.py."
+
+  # default_prompt 只做「入口」，不复述契约。
+  #
+  # 它以前把交付契约整段抄了一遍——那是 SKILL.md、references/ 与 contract-registry.json 之外
+  # 的第四份规则副本，而且已经漂了：它没提 exit 3/4/5 的处理，也来不及跟上画幅、字数、
+  # TBCP v4 这些改动。四份副本里最短的那份最容易被当成权威，也最容易过期。
+  #
+  # 现在这里只负责把模型送进技能包，具体规则由技能包自己讲。改契约请改 SKILL.md。
+  default_prompt: >-
+    Use $gemini-veo-restoration-composer for this request. Read the skill's SKILL.md in full
+    before composing anything and follow it exactly — it is the single authority for the
+    staged delivery contract, the frame aspect lock, word budgets, the threshold-bridge
+    protocol, the quality gates, and the exit-code handling for every helper script. Do not
+    substitute remembered rules for what that file currently says.

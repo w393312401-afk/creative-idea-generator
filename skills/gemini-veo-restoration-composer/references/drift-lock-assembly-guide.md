@@ -46,23 +46,27 @@ same [full boundary description], same [structural element] placement, same [ele
 
 ### 3. Fixed Landmarks & Normalized Grid Coordinate System (NGCS)
 
-Every landmark and scene boundary must use the standard 16:9 grid matrix (`Grid A1` to `Grid C3`) and specify the **Z-Depth Height Scale** (frame-height percentage) to lock the Z-axis:
+Every landmark and scene boundary must use the standard **9:16 vertical** grid matrix (`Grid A1` to `Grid C3` — this pipeline's rendering default; see the Frame Aspect Lock in SKILL.md Step 6) and specify the **Z-Depth Height Scale** (frame-height percentage) to lock the Z-axis:
 
 ```
-  NGCS Grid absolute positioning matrix
-  +-------------+-------------+-------------+
-  |  A1 (Top L)  |  A2 (Top C)  |  A3 (Top R)  |  <-- Background
-  +-------------+-------------+-------------+
-  |  B1 (Mid L)  |  B2 (Mid C)  |  B3 (Mid R)  |  <-- Mid-Depth
-  +-------------+-------------+-------------+
-  |  C1 (Bot L)  |  C2 (Bot C)  |  C3 (Bot R)  |  <-- Foreground
-  +-------------+-------------+-------------+
+  NGCS Grid absolute positioning matrix (9:16 vertical)
+  +------------+------------+------------+
+  | A1 (Top L) | A2 (Top C) | A3 (Top R) |  <-- Background
+  +------------+------------+------------+
+  | B1 (Mid L) | B2 (Mid C) | B3 (Mid R) |  <-- Mid-Depth
+  +------------+------------+------------+
+  | C1 (Bot L) | C2 (Bot C) | C3 (Bot R) |  <-- Foreground
+  +------------+------------+------------+
 ```
+
+The frame is taller than it is wide: rows are generous depth bands, columns are narrow slices. Spread the anchors **up the frame**, one per row.
 
 Assign exactly **3 Primary Spatial Anchors** across three depth zones:
 - **Foreground Landmark**: 1 named anchor with Grid cell (e.g., `cracked floor seam in Grid C2`)
-- **Mid-depth Landmark**: 1 named anchor with Grid cell and Z-depth scale (e.g., `brick column in Grid B1 holds a scale of 60% of total frame height`)
-- **Background Landmark**: 1 named anchor with Grid cell and Z-depth scale (e.g., `tall window opening in Grid A2 holds a scale of 40% of total frame height`)
+- **Mid-depth Landmark**: 1 named anchor with Grid cell and Z-depth scale (e.g., `brick column in Grid B2 holds a scale of 55% of total frame height`)
+- **Background Landmark**: 1 named anchor with Grid cell and Z-depth scale (e.g., `tall window opening in Grid A2 holds a scale of 30% of total frame height`)
+
+Vertical-frame scale bands (calibrate against these, not horizontal intuition): background ≈ one-fifth to one-third, mid-depth ≈ two-fifths to three-fifths, foreground band ≈ one-fifth to one-quarter.
 
 ### 4. Frame Boundary Lock (Grid Bounded)
 

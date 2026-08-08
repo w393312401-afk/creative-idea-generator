@@ -107,5 +107,12 @@ This topic illustrates an important routing decision: even though the space type
 
 ## Reference
 
-See the canonical engine output at:
-`/Users/fly/.codex/skills/restoration-timelapse-engine/examples/buried-school-bus-hidden-hatch-reward.md`
+This file is a **routing and beat-ladder specimen**, not a prompt-text specimen: its value is
+the Standard-vs-Threshold decision and the 6→12 beat split, both fully written out above. It
+used to close with a pointer into one developer's home directory, which is a dead link on
+every other machine — a model that follows it finds nothing and improvises, which is worse
+than having no pointer at all.
+
+For actual prompt-text form, use the two examples that carry real bodies:
+- [minimal-input-warehouse.md](minimal-input-warehouse.md) — a contract-clean worked slot pair
+- [threshold-mode-hollow-oak-tree.md](threshold-mode-hollow-oak-tree.md) — a full-length set including a TBCP v4 crossing

@@ -1,7 +1,15 @@
-opencv-python-headless>=4.8.0
-numpy>=1.21.0
-pillow>=9.0.0
-requests>=2.28.0
-python-dotenv>=1.0.0
-google-generativeai>=0.3.0
-openai>=1.0.0
+# DEPRECATED as a single install target — this package has two independent code paths with
+# disjoint dependencies, and installing one list for both forced compose-only users to pull a
+# full computer-vision stack they never import.
+#
+#   scripts/*.py          (composition chain: render anchor → save to library → render frames)
+#                         -> requirements-compose.txt  ... which is EMPTY: standard library only.
+#
+#   video_to_prompt_pipeline.py
+#                         (Tier-4 video reverse-engineering: CV extraction + multimodal calls)
+#                         -> requirements-reverse.txt
+#
+# Install the one you actually need. This file is kept only so an existing
+# `pip install -r requirements.txt` does not break, and it points at the reverse path because
+# that is the only path with real dependencies.
+-r requirements-reverse.txt

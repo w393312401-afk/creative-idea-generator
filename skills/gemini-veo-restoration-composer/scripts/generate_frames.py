@@ -8,97 +8,86 @@ and streams live progress via Server-Sent Events (SSE).
 
 Usage:
     python generate_frames.py --title "做一个废弃阁楼翻新" [--server http://127.0.0.1:8085] [--aspect_ratio 9:16] [--quality 4K]
+
+Exit codes — shared vocabulary, identical in all three helper scripts (see skill_common.py):
+    0 - the frame sequence completed
+    1 - other runtime failure (progress stream broke, generation reported an error)
+    2 - could not connect to the service
+    3 - service reachable but returned an error
+    4 - bad input (unreadable --prompt_file)
+    5 - request timed out; the server is still working
+    6 - the title does not exist in the idea library. TERMINAL, not transient — retrying will
+        never help. Run save_to_library.py first, or pass --prompt_file. (This used to be
+        exit 5 here while exit 5 meant "be patient, still rendering" in
+        render_and_gate_anchor.py — same flow, opposite instructions.)
 """
 
 import argparse
 import json
+import os
 import sys
-import time
 import urllib.request
 import urllib.error
-import urllib.parse
 
-# Reconfigure stdout/stderr to UTF-8 on Windows to prevent UnicodeEncodeError when printing emojis
-if hasattr(sys.stdout, 'reconfigure'):
-    try:
-        sys.stdout.reconfigure(encoding='utf-8')
-    except Exception:
-        pass
-if hasattr(sys.stderr, 'reconfigure'):
-    try:
-        sys.stderr.reconfigure(encoding='utf-8')
-    except Exception:
-        pass
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from skill_common import (  # noqa: E402
+    DEFAULT_SERVER, EXIT_BAD_INPUT, EXIT_NOT_FOUND, EXIT_RUNTIME, EXIT_SERVER_ERROR,
+    enable_utf8_stdio, find_library_entry, http_json, safe_print, title_slug,
+)
 
-DEFAULT_SERVER = "http://127.0.0.1:8085"
+enable_utf8_stdio()
 
-
-def safe_print(msg, is_err=False, end="\n", flush=True):
-    """Safely print message catching encoding errors if reconfigure wasn't enough."""
-    file = sys.stderr if is_err else sys.stdout
-    try:
-        file.write(msg + end)
-        if flush:
-            file.flush()
-    except UnicodeEncodeError:
-        # Fallback to printing ascii-safe characters
-        try:
-            safe_msg = msg.encode('ascii', errors='replace').decode('ascii')
-            file.write(safe_msg + end)
-            if flush:
-                file.flush()
-        except Exception:
-            pass
+CONTEXT = "generate_frames"
 
 
 def fetch_prompt_from_library(server: str, title: str) -> str:
-    """Fetch prompt_block from the library for the given title."""
-    url = server.rstrip("/") + "/api/library"
-    req = urllib.request.Request(url, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            library = json.loads(resp.read().decode("utf-8"))
-            for entry in library:
-                if entry.get("title") == title or entry.get("theme") == title:
-                    return entry.get("prompt_block") or ""
-    except Exception as e:
-        safe_print(f"[generate_frames] ⚠️  无法从点子库获取提示词 ({e})", is_err=True)
-    return ""
+    """Fetch prompt_block from the library for the given title.
+
+    Matching is tiered (slug → exact title → canonical title) via skill_common. Exact string
+    equality alone is too brittle for the one key that chains all three steps: a missed lookup
+    here makes /api/render_staged find no existing frames and re-render IMAGE 1, discarding
+    the anchor the user just approved.
+    """
+    library = http_json(server.rstrip("/") + "/api/library", method="GET", timeout=30,
+                        context=CONTEXT)
+    if not isinstance(library, list):
+        safe_print(f"[{CONTEXT}] ❌ /api/library 返回的不是列表：{type(library).__name__}", is_err=True)
+        sys.exit(EXIT_SERVER_ERROR)
+    idx, entry = find_library_entry(library, title)
+    if entry is None:
+        return ""
+    matched = entry.get("title")
+    if matched != title:
+        safe_print(f"[{CONTEXT}] ℹ️ 标题非精确匹配，已按稳定标识 slug={title_slug(title)} "
+                   f"命中库中条目 {matched!r}。")
+    return entry.get("prompt_block") or ""
 
 
-def trigger_generation(server: str, title: str, prompt_block: str, aspect_ratio: str = "9:16", quality: str = "2K") -> str:
+def trigger_generation(server, title, prompt_block, aspect_ratio="9:16", quality="2K"):
     """POST to /api/render_staged and return the task_id.
 
-    /api/render_staged renders the already-composed prompt_block, reusing any frames
-    already on disk (so the anchor rendered in Step 6.5 is not paid for twice) and then
-    generating video. No frame is judged during rendering. See SKILL.md Step 6.5."""
-    url = server.rstrip("/") + "/api/render_staged"
-    payload = json.dumps({
-        "title": title,
-        "prompt_block": prompt_block,
-        "config": {
-            "imageAspectRatio": aspect_ratio,
-            "imageQuality": quality
-        }
-    }, ensure_ascii=False).encode("utf-8")
-    
-    req = urllib.request.Request(
-        url,
-        data=payload,
+    /api/render_staged renders the already-composed prompt_block, reusing any frames already
+    on disk (so the anchor rendered in Step 6.5 is not paid for twice) and then generating
+    video. No frame is judged during rendering. See SKILL.md Step 6.5.
+
+    The timeout is 60s, not 15s: this POST can synchronously spin up a task before it returns
+    a task_id, and a 15s window turned ordinary server warm-up into a spurious failure.
+    """
+    result = http_json(
+        server.rstrip("/") + "/api/render_staged",
+        payload={
+            "title": title,
+            "prompt_block": prompt_block,
+            "config": {"imageAspectRatio": aspect_ratio, "imageQuality": quality},
+        },
         method="POST",
-        headers={"Content-Type": "application/json; charset=utf-8"}
+        timeout=60,
+        context=CONTEXT,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            if result.get("status") == "ok":
-                return result.get("task_id")
-            else:
-                safe_print(f"[generate_frames] ❌ 服务器返回错误: {result.get('error') or result}", is_err=True)
-                sys.exit(3)
-    except urllib.error.URLError as e:
-        safe_print(f"[generate_frames] ❌ 无法连接到服务 {url}: {e}", is_err=True)
-        sys.exit(2)
+    if result.get("status") != "ok":
+        safe_print(f"[{CONTEXT}] ❌ 服务器返回错误: {result.get('error') or result}", is_err=True)
+        sys.exit(EXIT_SERVER_ERROR)
+    return result.get("task_id")
 
 
 def stream_progress(server: str, task_id: str) -> bool:
@@ -106,7 +95,7 @@ def stream_progress(server: str, task_id: str) -> bool:
     url = server.rstrip("/") + f"/api/compose-stream?task_id={task_id}"
     req = urllib.request.Request(url)
     
-    safe_print(f"[generate_frames] 📡 已连接到进度流，等待任务执行...")
+    safe_print(f"[{CONTEXT}] 📡 已连接到进度流，等待任务执行...")
     
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
@@ -195,7 +184,10 @@ def stream_progress(server: str, task_id: str) -> bool:
                 except Exception as ex:
                     pass
     except Exception as e:
-        safe_print(f"\n[generate_frames] ⚠️ 连接中断或请求超时: {e}", is_err=True)
+        safe_print(f"\n[{CONTEXT}] ⚠️ 进度流连接中断或请求超时: {e}\n"
+                   f"          注意：服务端任务可能仍在后台继续跑。这只说明本脚本失去了进度流，"
+                   f"不代表生成失败——先去 outputs/ 目录或前端帧网格确认实际进度，再决定是否重跑。",
+                   is_err=True)
         return False
     return False
 
@@ -216,25 +208,30 @@ def main():
         try:
             with open(args.prompt_file, "r", encoding="utf-8") as f:
                 prompt_block = f.read()
-            safe_print(f"[generate_frames] 📂 已从本地文件 {args.prompt_file} 读取提示词")
+            safe_print(f"[{CONTEXT}] 📂 已从本地文件 {args.prompt_file} 读取提示词")
         except Exception as e:
-            safe_print(f"[generate_frames] ❌ 无法读取本地提示词文件 {args.prompt_file}: {e}", is_err=True)
-            sys.exit(4)
-            
+            safe_print(f"[{CONTEXT}] ❌ 无法读取本地提示词文件 {args.prompt_file}: {e}", is_err=True)
+            sys.exit(EXIT_BAD_INPUT)
+
     if not prompt_block:
         prompt_block = fetch_prompt_from_library(args.server, args.title)
-        
-    if not prompt_block:
-        safe_print(f"[generate_frames] ❌ 找不到标题为 '{args.title}' 的提示词模板。请确认该点子已被保存到库中，或者使用 --prompt_file 传入提示词文本。", is_err=True)
-        sys.exit(5)
 
-    safe_print(f"[generate_frames] 📡 正在向服务 {args.server} 提交生成任务...")
+    if not prompt_block:
+        safe_print(
+            f"[{CONTEXT}] ❌ 点子库中找不到标题为 {args.title!r}（slug={title_slug(args.title)}）的提示词。\n"
+            f"          这是终局性错误，重试不会好转。二选一：\n"
+            f"            1) 先跑 save_to_library.py 把这套提示词入库，再重跑本脚本；\n"
+            f"            2) 用 --prompt_file <文件> 直接把提示词正文传进来（Step 12 入库失败时的降级路径）。",
+            is_err=True)
+        sys.exit(EXIT_NOT_FOUND)
+
+    safe_print(f"[{CONTEXT}] 📡 正在向服务 {args.server} 提交生成任务（画幅 {args.aspect_ratio}，清晰度 {args.quality}）...")
     task_id = trigger_generation(args.server, args.title, prompt_block, args.aspect_ratio, args.quality)
-    safe_print(f"[generate_frames] 🚀 任务创建成功，Task ID: {task_id}")
-    
+    safe_print(f"[{CONTEXT}] 🚀 任务创建成功，Task ID: {task_id}")
+
     success = stream_progress(args.server, task_id)
     if not success:
-        sys.exit(1)
+        sys.exit(EXIT_RUNTIME)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,13 @@
 # Space Workflows — Composer Quick Reference
 
-> This is a condensed routing table for the prompt composer. For the full construction macros, see `/Users/fly/.codex/skills/restoration-timelapse-engine/references/space-workflows.md`.
+> This is a condensed routing table for the prompt composer, and it is **self-contained** —
+> everything the composer needs to route a topic is on this page. The fuller construction
+> macros live in the peer `restoration-timelapse-engine` skill package, wherever that is
+> installed on the current machine; this file previously pointed into one developer's home
+> directory, which is a dead link on every other machine and left the model guessing. Do not
+> go looking for that file: if a detail is not here, derive it from the
+> Construction Phase → Visual Signature map below plus SKILL.md's Construction Sequence
+> Validation rules.
 
 ## Workflow Routing Table
 
@@ -18,9 +25,22 @@
 
 ## Beat Derivation Rules
 
-1. **Minimum**: 3 VIDEO clips for simple transformations.
-2. **Maximum**: 12+ VIDEO clips for complex buried/threshold projects.
-3. **Threshold adds**: a TBCP two-clip bridge (Bridge-1 approach + Bridge-2 cross-and-settle, joined by a shared Sill Handoff IMAGE) + typically 2-4 additional interior beats. The crossing is never a single clip — see `threshold-bridge-consistency-protocol.md`.
+> **This table is the single authority for `N`.** SKILL.md Step 5 delegates here; it does not
+> carry a competing default. Read the space type's `Default Beats (N)` cell above, then apply
+> the adjustments below. The only case that overrides the table is an explicit upstream
+> `PRODUCTION BEAT LADDER` (Tier 2), where one listed physical phase = one VIDEO.
+
+1. **Range comes from the table**, not from a global default. It varies by space type by
+   design: `exterior facade` genuinely finishes in 3-4 beats, `underground space` genuinely
+   needs 8-12 because it must install drainage, waterproofing, ventilation and a power feed
+   before any finish surface (rule 11 below). Never substitute a generic "3-6".
+2. **Hard floor / hard ceiling**: never fewer than 3 VIDEO clips; never more than 19. Above
+   the table's range, justify the excess by naming which single-operation splits forced it —
+   feasibility rules (Beat Overload, Power Chain, Enclosed-Space Provenance) may push a count
+   up, a preference for "more content" may not.
+3. **Threshold adds**: exactly ONE TBCP v4 crossing beat (one clip + one settled-interior
+   IMAGE — never a two-clip Bridge-1/Bridge-2 split, which was retired in v4) plus typically
+   2-4 additional interior beats. See `threshold-bridge-consistency-protocol.md`.
 4. **Reward always**: The final VIDEO is always reserved for the reward motion.
 5. **Never merge**: Excavation with installation, threshold bridge with construction, construction with reward.
 6. **Split overloaded**: If one beat combines 2+ construction systems (e.g., floor finish + lighting + furniture), split into separate beats.
@@ -53,20 +73,34 @@
 
 ## Camera Default Lookup
 
+Test the **elevated-shot flag first**. It is a property of the *shot*, not of the space type,
+so it must be checked before the space-type branches — otherwise every interior/exterior scene
+is claimed by the first branch and the elevated case becomes unreachable. (It was written last
+in an earlier revision, which made the 3.2m mezzanine camera dead code even though
+`examples/double-height-loft-elevated-shot.md` exists precisely to demonstrate it.)
+
 ```
-if space_type in [interior, exterior, road, pool, backyard]:
-    lens = "ultra-wide 14-18mm lens feel"
-    height = "camera height 1.6m"
-    perspective = "locked eye-level perspective"
+if elevated_shot:                       # multi-level space, mezzanine/high-corner view,
+    lens = "ultra-wide 14-18mm lens feel"   # or the user asked to shoot down from above
+    height = "camera height 3.2m"
+    perspective = "steep downward diagonal perspective"
+    attitude = "camera pitch locked at the declared steep downward angle; vertical lines
+                converge consistently toward the same vanishing direction; no horizon reference"
 elif space_type == "custom build object":
     lens = "natural 35-50mm lens feel"
     height = "camera height 1.1m"
     perspective = "subject-centered perspective"
-elif elevated_shot:
-    lens = "ultra-wide 14-18mm lens feel"
-    height = "camera height 3.2m"
-    perspective = "steep downward diagonal perspective"
+else:                                   # interior, exterior, road, pool, backyard, and
+    lens = "ultra-wide 14-18mm lens feel"   # every other space type
+    height = "camera height 1.6m"
+    perspective = "locked eye-level perspective"
 ```
+
+**Set `elevated_shot` when** the space has two occupied levels the shot must hold at once (a
+mezzanine plus the floor below), when the user asks for a high/downward/overhead angle, or
+when a 1.6m eye-level view physically cannot contain the declared landmarks. An elevated shot
+never pins a horizon — a steep downward view has none; use the pitch/convergence attitude
+lock above (SKILL.md's Sub-Pixel Coordinate Pinning, elevated branch).
 
 ## Lighting Default
 

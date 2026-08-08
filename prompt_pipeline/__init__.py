@@ -4780,7 +4780,10 @@ def fix_horizon_line(prompt, family='exterior'):
         else:
             if not prompt.endswith('.'):
                 prompt += '.'
-            prompt += " The horizon line remains perfectly level at exactly 50-percent height of the frame."
+            # 记号无关的写法：'50-percent' 会被 scrub_spatial_notation 再翻译一次
+            # （历史上得到 'at exactly roughly half height of the frame'），这里直接写成
+            # 最终形态，清洗器就不必碰它。
+            prompt += " The horizon line remains perfectly level at exactly half the frame height."
     return prompt
 
 
@@ -4909,14 +4912,51 @@ _COVERAGE_BUCKETS = (
     (63, 'roughly three fifths'), (72, 'roughly two thirds'),
     (82, 'roughly three quarters'), (93, 'most of it'), (100, 'nearly all of it'),
 )
+# 'holding a scale of 50 percent of frame height' / 'rising to about 60 percent of frame height'
+# 2026-08-07：旧版是 r'\b(verb)?\s*(num) percent of frame height'。两个实测缺陷：
+#   1) verb 缺席时 '\s*' 会把**前面那个空格**吃掉，'a scale of 50 percent of frame height'
+#      被换成 'a scale ofrising to about half the frame height'——粘字且留下悬空的
+#      'a scale of'。整句是模板与 SKILL.md 里最常见的锚点写法，等于每个锚点都中招。
+#   2) 'rising to about 60 percent' 里的 'rising to' 没被吃掉，兜底又补一个 'rising to'，
+#      得到 'rising to about rising to about three fifths…'。
+# 现在：动词、'a scale of' 前缀、'about/roughly' 近似词各自显式吃掉，前导空格由替换串
+# 自己补回，缺动词时不再硬塞 'rising to'（分数措辞自带 'about'，句子已有连接词）。
 _SCALE_PHRASE_RE = re.compile(
-    r'\b(holding|occupying|filling|reaching|standing|rising to)?\s*'
-    r'((?:\d{1,3})|(?:[a-z]+(?:[-\s][a-z]+)?))\s*(?:-|\s)?percent\s+of\s+(?:total\s+)?frame\s+height\b',
+    r'(?:\s+(holding|occupying|filling|reaching|standing|rising\s+to|set\s+at))?'
+    r'(?:\s+(?:a|an)\s+(?:scale|height|size)\s+of)?'
+    r'(?:\s+(?:about|roughly|approximately|around|nearly|some))?'
+    r'\s+((?:\d{1,3})|(?:[a-z]+(?:[-\s][a-z]+)?))\s*(?:-|\s)?percent\s+of\s+(?:total\s+)?frame\s+height\b',
     re.IGNORECASE)
+# 'horizon line remains perfectly level at exactly 50-percent height of the frame' —— 相机
+# 姿态锁的固定句式，说的是画幅高度上的精确位置，不是覆盖度。走 _BARE_PERCENT_RE 会得到
+# 'at exactly roughly half height of the frame'（"exactly roughly"），所以先于它单独处理，
+# 并用精确分数词（half / a third），不带 'roughly'。
+_FRAME_HEIGHT_POSITION_RE = re.compile(
+    r'\b((?:\d{1,3})|(?:[a-z]+(?:[-\s][a-z]+)?))\s*(?:-|\s)?percent\s+(?:of\s+)?height\s+of\s+the\s+frame\b',
+    re.IGNORECASE)
+_EXACT_FRACTION_PROSE = {
+    20: 'a fifth of the frame height', 25: 'a quarter of the frame height',
+    30: 'three tenths of the frame height', 33: 'a third of the frame height',
+    40: 'two fifths of the frame height', 50: 'half the frame height',
+    60: 'three fifths of the frame height', 66: 'two thirds of the frame height',
+    67: 'two thirds of the frame height', 75: 'three quarters of the frame height',
+    80: 'four fifths of the frame height',
+}
 _BARE_PERCENT_RE = re.compile(
     r'\b((?:\d{1,3})|(?:[a-z]+(?:[-\s][a-z]+)?))\s*(?:-|\s)?(?:percent|%)'
     r'(?!\s*of\s+(?:total\s+)?frame\s+height)(\s+of\s+)?',
     re.IGNORECASE)
+
+
+def _frame_height_position_prose(token):
+    """画幅高度上的精确位置 -> 精确分数措辞（不带 'about/roughly'）。"""
+    value = _parse_percent_token(token)
+    if value is None or not (0 < value <= 100):
+        return ''
+    if value in _EXACT_FRACTION_PROSE:
+        return _EXACT_FRACTION_PROSE[value]
+    prose = scale_prose(value)
+    return prose[len('about '):] if prose.startswith('about ') else prose
 
 
 def _coverage_prose(scale):
@@ -4985,15 +5025,23 @@ def scrub_spatial_notation(text):
     out = _GRID_BARE_CELL_RE.sub(
         lambda m: _grid_bearing(m.group(1)) or m.group(0), out)
 
-    # 占比：先处理带 'of frame height' 的完整短语，再兜底裸百分比。
+    # 占比：先处理带 'of frame height' 的完整短语，再处理相机姿态锁的
+    # 'NN percent height of the frame'，最后兜底裸百分比。
     def _scale_sub(m):
         prose = scale_prose(m.group(2))
         if not prose:
             return m.group(0)
-        verb = (m.group(1) or '').strip()
-        return f"{verb} {prose}" if verb else f"rising to {prose}"
+        verb = re.sub(r'\s+', ' ', (m.group(1) or '').strip())
+        # 前导空格由这里补回：模式吃掉了它，不补就会和前一个词粘在一起。
+        return f" {verb} {prose}" if verb else f" {prose}"
 
     out = _SCALE_PHRASE_RE.sub(_scale_sub, out)
+
+    def _frame_pos_sub(m):
+        prose = _frame_height_position_prose(m.group(1))
+        return prose or m.group(0)
+
+    out = _FRAME_HEIGHT_POSITION_RE.sub(_frame_pos_sub, out)
 
     def _bare_percent_sub(m):
         prose = _coverage_prose(m.group(1))
@@ -9181,7 +9229,7 @@ Your job is to generate a comprehensive Drift Lock & SCUP Packet for the project
 You must output ONLY a valid JSON object matching the keys below, with no other text, no markdown, and no code fences.
 
 Required JSON keys:
-1. "camera_dna": A single camera sentence (~25-30 words) describing shot type, lens feel, camera height, perspective axis, and boundaries. Include horizon pinning (e.g., "horizon line remains perfectly level at exactly 50-percent height of the frame; all optical flow lines radiate symmetrically from the optical center of Grid B2").
+1. "camera_dna": A single camera sentence (~25-30 words) describing shot type, lens feel, camera height, perspective axis, and boundaries. Include horizon pinning (e.g., "horizon line remains perfectly level at exactly half the frame height; all optical flow lines radiate symmetrically from the optical center of Grid B2").
 2. "geometry_lock": A description of structural facts that cannot change (doors, windows, columns, wall lines, and — critically — the roofline/roof pitch silhouette and the exact opening shape/proportions of every door or archway as established in IMAGE 1; these two are easy to silently redraw between beats because no operation ever declares them as its target, so name their concrete shape here, e.g. "gabled roof holds its triangular ridge and pitch angle unchanged; the arched doorway keeps its current width-to-height ratio and curvature").
 3. "primary_landmarks": A list of exactly 3 landmarks (Foreground, Mid-depth, Background). Each landmark must be a JSON object with:
    - "name": The exact name (e.g. "cracked floor seam")

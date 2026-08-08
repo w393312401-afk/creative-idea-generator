@@ -1,87 +1,83 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 save_to_library.py
 ==================
-Saves a restoration prompt-composer output into the
-creative-idea-generator idea library (library.json via the server API).
+Saves a restoration prompt-composer output into the creative-idea-generator idea library
+(library.json via the server API).
 
 Usage (called by the agent after prompt generation):
     python save_to_library.py \
         --title  "做一个废弃阁楼翻新" \
         --prompt_block "图片提示词\n图片 1:\n..." \
         --audit_md  "| 指标 | 状态 | ... |" \
-        [--creativity "Tier-1 主题生成"] \
+        [--creativity "gemini-veo-restoration-composer"] \
         [--image_count 7] \
         [--video_count 6] \
         [--server http://127.0.0.1:8085]
 
-Returns exit code 0 on success, non-zero on failure.
+Exit codes — shared vocabulary, identical in all three helper scripts (see skill_common.py):
+    0 - saved
+    1 - other runtime failure
+    2 - could not connect to the service
+    3 - service reachable but returned an error
+    4 - bad input
+    5 - request timed out
+    6 - not used by this script
+
+This step writes a stable `slug` onto the entry (see skill_common.title_slug). generate_frames
+prefers that slug over the raw title, so a later step still finds this entry even if the title
+picks up a stray space or a full-width character on the way.
 """
 
 import argparse
-import json
+import os
 import sys
 import time
-import urllib.request
-import urllib.error
 
-# ── defaults ─────────────────────────────────────────────────────────────────
-DEFAULT_SERVER = "http://127.0.0.1:8085"
-LIBRARY_API    = "/api/library"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from skill_common import (  # noqa: E402
+    DEFAULT_SERVER, EXIT_SERVER_ERROR,
+    enable_utf8_stdio, find_library_entry, http_json, safe_print, title_slug,
+)
+
+enable_utf8_stdio()
+
+CONTEXT = "save_to_library"
+LIBRARY_API = "/api/library"
 
 
 def _count_slots(prompt_block: str, label: str) -> int:
     """Count labelled slots (图片 N: / 视频 N: / 视频 N [BRIDGE]:) inside prompt_block.
 
-    Must stay in sync with prompt_pipeline.py's _parse_prompt_slots, which allows an
-    optional bracketed annotation like [BRIDGE] between the slot number and the colon."""
+    Must stay in sync with prompt_pipeline._parse_prompt_slots, which allows an optional
+    bracketed annotation ([BRIDGE], [BRIDGE TURN], [CUT], [HERO]) between the slot number
+    and the colon.
+    """
     import re
     return len(re.findall(rf'^{label}\s*\d+(?:\s*\[.*?\])?\s*:', prompt_block, re.MULTILINE))
 
 
 def fetch_library(server: str) -> list:
-    url = server.rstrip("/") + LIBRARY_API
-    req = urllib.request.Request(url, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.URLError as e:
-        print(f"[save_to_library] ❌ 无法连接到点子库服务 {url}: {e}", file=sys.stderr)
-        sys.exit(2)
+    data = http_json(server.rstrip("/") + LIBRARY_API, method="GET", timeout=30, context=CONTEXT)
+    if not isinstance(data, list):
+        safe_print(f"[{CONTEXT}] ❌ /api/library 返回的不是列表：{type(data).__name__}", is_err=True)
+        sys.exit(EXIT_SERVER_ERROR)
+    return data
 
 
 def post_library(server: str, data: list) -> None:
-    url     = server.rstrip("/") + LIBRARY_API
-    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-    req     = urllib.request.Request(
-        url,
-        data=payload,
-        method="POST",
-        headers={"Content-Type": "application/json; charset=utf-8"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            if result.get("status") != "success":
-                print(f"[save_to_library] ⚠️  服务器返回非成功状态: {result}", file=sys.stderr)
-                sys.exit(3)
-    except urllib.error.URLError as e:
-        print(f"[save_to_library] ❌ 写入点子库失败 {url}: {e}", file=sys.stderr)
-        sys.exit(4)
+    result = http_json(server.rstrip("/") + LIBRARY_API, payload=data, method="POST",
+                       timeout=60, context=CONTEXT)
+    if result.get("status") != "success":
+        safe_print(f"[{CONTEXT}] ⚠️  服务器返回非成功状态: {result}", is_err=True)
+        sys.exit(EXIT_SERVER_ERROR)
 
 
-def build_entry(
-    title:        str,
-    prompt_block: str,
-    audit_md:     str,
-    creativity:   str,
-    image_count:  int | None,
-    video_count:  int | None,
-) -> dict:
-    ts   = int(time.time() * 1000)
-    now  = time.strftime("%m/%d/%Y, %I:%M:%S %p", time.localtime())
+def build_entry(title, prompt_block, audit_md, creativity, image_count, video_count) -> dict:
+    ts = int(time.time() * 1000)
+    now = time.strftime("%m/%d/%Y, %I:%M:%S %p", time.localtime())
 
-    # Auto-count if not provided
     if image_count is None:
         image_count = _count_slots(prompt_block, "图片")
     if video_count is None:
@@ -91,6 +87,8 @@ def build_entry(
         "id":            str(ts),
         "title":         title,
         "theme":         title,
+        # 稳定连接键：三个脚本各自从标题算出同一个 slug，标题被顺手规范化也不会失联。
+        "slug":          title_slug(title),
         "creativity":    creativity or "gemini-veo-restoration-composer",
         "prompt_block":  prompt_block,
         "audit_md":      audit_md,
@@ -115,19 +113,16 @@ def main() -> None:
     parser.add_argument("--audit_md",     default="",     help="质量审核报告 Markdown 表格")
     parser.add_argument("--creativity",   default="gemini-veo-restoration-composer",
                         help="来源标签，默认 gemini-veo-restoration-composer")
-    parser.add_argument("--image_count",  type=int, default=None,
-                        help="图片提示词数量（省略则自动统计）")
-    parser.add_argument("--video_count",  type=int, default=None,
-                        help="视频提示词数量（省略则自动统计）")
+    parser.add_argument("--image_count",  type=int, default=None, help="图片提示词数量（省略则自动统计）")
+    parser.add_argument("--video_count",  type=int, default=None, help="视频提示词数量（省略则自动统计）")
     parser.add_argument("--server",       default=DEFAULT_SERVER,
                         help=f"点子库服务地址，默认 {DEFAULT_SERVER}")
     args = parser.parse_args()
 
-    print(f"[save_to_library] 📡 连接点子库服务: {args.server}", file=sys.stderr)
+    safe_print(f"[{CONTEXT}] 📡 连接点子库服务: {args.server}", is_err=True)
     library = fetch_library(args.server)
 
-    # Dedup: if the same title already exists, update it; otherwise prepend
-    entry   = build_entry(
+    entry = build_entry(
         title        = args.title,
         prompt_block = args.prompt_block,
         audit_md     = args.audit_md,
@@ -136,15 +131,12 @@ def main() -> None:
         video_count  = args.video_count,
     )
 
-    existing_idx = next(
-        (i for i, item in enumerate(library) if item.get("title") == args.title),
-        None,
-    )
+    # Dedup on the same tiered key generate_frames will use to read it back, so "saved" and
+    # "found later" can never disagree about which entry is this topic's.
+    existing_idx, old = find_library_entry(library, args.title)
     if existing_idx is not None:
-        # Preserve existing id / timestamp; only update prompt fields
-        old = library[existing_idx]
-        entry["id"]        = old["id"]
-        entry["timestamp"] = old["timestamp"]
+        entry["id"]        = old.get("id", entry["id"])
+        entry["timestamp"] = old.get("timestamp", entry["timestamp"])
         library[existing_idx] = entry
         action = "更新"
     else:
@@ -152,11 +144,11 @@ def main() -> None:
         action = "新增"
 
     post_library(args.server, library)
-    print(
-        f"[save_to_library] ✅ {action}成功！"
-        f"  标题={args.title!r}"
+    safe_print(
+        f"[{CONTEXT}] ✅ {action}成功！"
+        f"  标题={args.title!r}  slug={entry['slug']}"
         f"  图片={entry['image_count']}  视频={entry['video_count']}",
-        file=sys.stderr,
+        is_err=True,
     )
 
 

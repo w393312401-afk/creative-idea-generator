@@ -36,7 +36,8 @@ graph TD
 
 ### 1. Hierarchical Context Layering & Syntax Pruning (HCL & Syntax Pruning)
 
-* **Principle**: Prevent attention dilution in large-scale diffusion models by packing the core spatial constraints (Camera DNA + 3 Primary Landmarks) into the first **40 tokens** (approx. 15-20 words) of the prompt.
+* **Principle**: Prevent attention dilution in large-scale diffusion models by **front-loading** the core spatial constraints (Camera DNA + 3 Primary Landmarks) into the **opening** of the prompt — the first ~40 tokens should already be carrying camera and anchors, not scene-setting prose.
+* **This is a rule about ORDER, not about total length.** It does not shrink the prompt to 15-20 words and it does not conflict with the word budget in SKILL.md Step 7 (IMAGE 140-180 / VIDEO 260-380). A compliant IMAGE opens with the camera sentence and the locked-anchor sentence, then spends its remaining budget on state delta, traces, lighting, and guardrail. What is banned is burying the camera or the anchors behind a paragraph of description.
 * **Syntax Rule**: Replace verbose, comma-separated descriptive text with weight-sensitive punctuation such as colons (`:`) and semicolons (`;`) to act as hard context dividers.
 * **Landmark Pruning**: Reduce soft landmarks to exactly **3 high-contrast landmarks** (1 foreground, 1 mid-depth, 1 background) with precise physical and material details.
 
@@ -51,18 +52,22 @@ graph TD
 ### 2. Normalized Grid Coordinate System & Z-Depth Anchor (NGCS) with RPL
 
 * **Principle**: Replace subjective descriptors ("on the left", "in the background") with absolute coordinate sectors and frame-height percentages.
-* **NGCS Grid Matrix (16:9 Frame)**:
+* **NGCS Grid Matrix (9:16 vertical frame — the pipeline's rendering default)**:
   ```
-  +-------------+-------------+-------------+
-  |  A1 (Top L)  |  A2 (Top C)  |  A3 (Top R)  |  <-- Background
-  +-------------+-------------+-------------+
-  |  B1 (Mid L)  |  B2 (Mid C)  |  B3 (Mid R)  |  <-- Mid-Depth
-  +-------------+-------------+-------------+
-  |  C1 (Bot L)  |  C2 (Bot C)  |  C3 (Bot R)  |  <-- Foreground
-  +-------------+-------------+-------------+
+  +------------+------------+------------+
+  | A1 (Top L) | A2 (Top C) | A3 (Top R) |  <-- Background
+  +------------+------------+------------+
+  | B1 (Mid L) | B2 (Mid C) | B3 (Mid R) |  <-- Mid-Depth
+  +------------+------------+------------+
+  | C1 (Bot L) | C2 (Bot C) | C3 (Bot R) |  <-- Foreground
+  +------------+------------+------------+
+        narrow      narrow       narrow
+        column      column       column
   ```
+  The frame is **taller than it is wide**. Rows are generous depth bands; columns are narrow slices. Separate the 3 primary anchors **up the frame** (one per row), not across it — a lateral spread that works in a horizontal frame pushes the outer anchors off the edge here. Left/right boundary anchors must be features that genuinely sit at the edge of a tall, narrow view (a near wall return, a jamb, a column face), never a distant lateral landmark.
 * **Z-Depth Constraint**: Force Z-axis consistency by specifying the Z-depth frame-height scale.
-  * *Example*: `The brick column in Grid B1 holds a scale of 60% of the total frame height.` (If this column fluctuates in scale between frames without camera movement, a spatial drift is flagged).
+  * *Example*: `The brick column in Grid B2 holds a scale of 60% of the total frame height.` (If this column fluctuates in scale between frames without camera movement, a spatial drift is flagged).
+  * *Vertical-frame calibration*: in 9:16 the same real object covers a **smaller** fraction of frame height than horizontal intuition suggests. Default bands: background anchor ≈ one-fifth to one-third, mid-depth anchor ≈ two-fifths to three-fifths, foreground band ≈ one-fifth to one-quarter.
 * **Relative Positioning Lock (RPL)**: To prevent T5 encoder "coordinate dilution and cross-contamination" caused by too many absolute grid coordinates, limit absolute `Grid` coordinates to the **3 Primary Anchors**. All other secondary/drift-prone objects must be grouped and anchored using relative positioning tags relative to the 3 Primary Anchors.
   * *Example*: `Relative position locks: green toolbox sits exactly 10cm to the left of the brick column (Primary Anchor B); a rolls of wires lies immediately behind the toolbox.`
 
@@ -137,12 +142,12 @@ graph TD
 * **Sneak-Peek Anchor**: The exterior `IMAGE T` immediately preceding the bridge video must NOT feature a dark, opaque, or blank doorway. It must pre-visualize at least **2 high-contrast interior landmarks** through the threshold opening.
 * **Anchor Inheritance (mandatory)**: The 2 landmarks peeked through the doorway must be the **exact same objects** that become the interior shot family's mid-depth and background primary anchors after the crossing. Anchors cross the threshold — they are never swapped for a fresh set. Introducing any interior primary anchor that was not pre-visualized through the doorway is banned.
 * **Anchor Qualification (mandatory)**: Peeked anchors must plausibly already exist at crossing time — original structure, natural formations, pre-existing wreckage, or items installed in an earlier on-camera beat. Future construction products (uncarved stairs, unplaced furniture, uninstalled fixtures) are banned: the bridge precedes interior construction, so peeking them forces objects to exist before the beat that creates them. For sealed or never-entered shells, choose natural interior features as the two peek anchors.
-* **Monotonic Scale Lock (mandatory)**: Each peeked anchor's declared frame-height scale must strictly increase across `IMAGE T → IMAGE T+1 → IMAGE T+2` (e.g. one-fifth → two-fifths → three-fifths); a constant scale across the crossing contradicts the push-in and reads as a fake digital zoom.
+* **Monotonic Scale Lock (mandatory)**: Each peeked anchor's declared frame-height scale must strictly increase from `IMAGE T` to `IMAGE T+1` — the two frames the single TBCP v4 crossing beat spans (e.g. one-fifth → three-fifths). A constant scale across the crossing contradicts the push-in and reads as a fake digital zoom. **`IMAGE T` must state both peeked anchors' scales explicitly**, small and dim though they are at that distance; an unstated starting scale is the more common failure and it breaks the lock just as badly, because a monotonic chain with no first link constrains nothing.
 * **Continuous Trajectory**: Enforce that these pre-visualized landmarks scale up symmetrically during camera translation, never repositioning or re-rendering.
   * *IMAGE T Syntax*: `Through the open doorway in Grid B2, two interior anchors are already visible and in sharp focus: a brushed-steel tool cabinet at interior mid-right and a red fire extinguisher on the interior rear wall, each reading small at about one-fifth of the frame height.`
   * *VIDEO T Syntax*: `The camera pushes forward through the door; the same brushed-steel tool cabinet and red fire extinguisher scale up continuously along the camera axis, never repositioning, never re-rendering, their apparent size growing naturally as the camera approaches.`
   * *Interior IMAGE Syntax (post-bridge)*: `Interior primary anchors: the brushed-steel tool cabinet locked at Grid B3; the red fire extinguisher locked at Grid A3.`
-* **Full crossing protocol**: When the camera physically travels from exterior to interior, the entire beat must follow the **Threshold Bridge Consistency Protocol (TBCP)** — see `threshold-bridge-consistency-protocol.md`. TBCP splits the crossing into two bridge clips joined by a shared Sill Handoff IMAGE, locks a single-variable bridge camera, soft-rolls exposure/white-balance, and wipes the cut behind the moving door frame.
+* **Full crossing protocol**: When the camera physically travels from exterior to interior, the entire beat must follow the **Threshold Bridge Consistency Protocol (TBCP v4)** — see `threshold-bridge-consistency-protocol.md`. TBCP composes the crossing as exactly ONE merged beat (one meta-tagged clip between `IMAGE T` and `IMAGE T+1`; the earlier two-clip split with a shared handoff frame was retired in v4), locks a single-variable bridge camera, soft-rolls exposure/white-balance, and wipes the cut behind the moving door frame.
 ---
 
 ### 9. Natural-Language Visual-Only Translation Rule (NLVTR)
@@ -180,6 +185,6 @@ Every prompt set must be evaluated against this quality matrix. A single `FAIL` 
 | **Out-and-In Passage** | Do video prompts featuring workers explicitly specify their entry path at $t=0s$ and exit path prior to $t=8s$? | Blocks sudden worker teleportation/popping at video boundaries. |
 | **HAL Silhouettes** | Are workers locked using high-contrast solid silhouettes and silhouette poses? | Blocks morphing of clothing patterns, facial details, or poses. |
 | **PBISP Sneak-Peek**| Does the pre-threshold IMAGE pre-visualize at least 2 interior landmarks, and are those exact objects inherited as the interior primary anchors (Anchor Inheritance)? Are both anchors plausibly pre-existing at crossing time (never future construction products), with frame-height scales rising monotonically across the bridge IMAGEs? | Eliminates random layout explosion, anchor amnesia, causality inversion, and fake-zoom scale locks during bridge crossing. |
-| **TBCP Threshold Bridge** | For any exterior→interior crossing: is it split into ≥2 bridge clips joined by a shared Sill Handoff IMAGE, with a single-variable bridge camera, a soft exposure/WB roll attributed to door-shade + doorway backlight, a symmetric door-frame wipe, ≥1 cross-threshold material/light tether, and a frame hand-off lock? | Eliminates the three-system simultaneous flip (lighting + camera family + anchor set) that causes interior explosion; see TBCP reference. |
+| **TBCP Threshold Bridge (v4)** | For any exterior→interior crossing: is it exactly ONE merged beat — one meta-tagged crossing VIDEO between `IMAGE T` and `IMAGE T+1`, never a two-clip split with a sill-handoff frame — with a single-variable bridge camera, a soft exposure/WB roll attributed to door-shade + doorway backlight, a symmetric door-frame wipe, ≥1 cross-threshold material/light tether, both peeked anchors carrying explicit scales in `IMAGE T` that increase in `IMAGE T+1`, and no construction work inside the clip? | Eliminates the three-system simultaneous flip (lighting + camera family + anchor set) that causes interior explosion; see TBCP reference. |
 | **NLVTR Text Lock** | Are raw percentages (`%`), numeric ranges, colons in variable strings, and SCUP acronyms (`TSPA`, `HAL`, `VMFP`, `GCTR`, `RPL`, `RCE`, `SCUP`, `NGCS`, `OSPL`, `RHMA`, `PBISP`, `HCL`, `NLVTR`, `MTAL`) completely banned and removed from final prompts? | Eliminates text watermark overlays and mathematical artifacts on the generated video. |
 | **Visible Milestone Package Lock** | Does every ordinary video beat create exactly one named terminal stage product at its FULL visible extent/count, using one operation or at most three tightly related same-zone actions, with both primary-product and secondary-material progress lines (never a token patch or cross-phase bundle)? | Keeps adjacent anchors instantly distinguishable while allowing physically coherent reference-case closeout packages. |

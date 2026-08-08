@@ -17,96 +17,62 @@ Usage:
     python render_and_gate_anchor.py --title "做一个废弃阁楼翻新" --prompt "Generate an image of..." [--server http://127.0.0.1:8085]
     python render_and_gate_anchor.py --title "..." --prompt_file prompt.txt
 
-Exit codes:
+Exit codes — shared vocabulary, identical in all three helper scripts (see skill_common.py):
     0 - the frame rendered; safe to continue composing the rest
-    2 - could not connect to the service (connection refused/DNS/etc.) -- this is the
-        only code that should trigger the Staged Delivery Contract's "server unreachable"
-        waiver; a server that responds with an HTTP error or times out is NOT this case
-    3 - server returned an error
-    4 - missing required prompt text
-    5 - request timed out waiting for the render (server was reachable and working, just
-        slow); do NOT treat like exit 2 -- retry with patience or ask the user, don't
-        silently fall back to unstaged full-set delivery
+    1 - other runtime failure
+    2 - could not connect to the service (connection refused/DNS). This is the ONLY code
+        that triggers the Staged Delivery Contract's "server unreachable" waiver
+    3 - service reachable but returned an error (HTTP 4xx/5xx, or status != ok)
+    4 - bad input (missing prompt text, unreadable --prompt_file)
+    5 - request timed out; the server is still working. Do NOT treat like exit 2 and do NOT
+        fall back to unstaged full-set delivery — wait, or ask the user
+    6 - not used by this script (title-not-found applies to library lookups only)
+
+IMPORTANT: print the slug this script reports and reuse the SAME --title verbatim in
+save_to_library.py and generate_frames.py. The three steps are chained by that title.
 """
 
 import argparse
-import json
+import os
 import sys
-import urllib.request
-import urllib.error
 
-# Reconfigure stdout/stderr to UTF-8 on Windows to prevent UnicodeEncodeError when printing emojis
-if hasattr(sys.stdout, 'reconfigure'):
-    try:
-        sys.stdout.reconfigure(encoding='utf-8')
-    except Exception:
-        pass
-if hasattr(sys.stderr, 'reconfigure'):
-    try:
-        sys.stderr.reconfigure(encoding='utf-8')
-    except Exception:
-        pass
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from skill_common import (  # noqa: E402
+    DEFAULT_SERVER, EXIT_BAD_INPUT, EXIT_SERVER_ERROR,
+    enable_utf8_stdio, http_json, safe_print, title_slug,
+)
 
-DEFAULT_SERVER = "http://127.0.0.1:8085"
+enable_utf8_stdio()
+
+CONTEXT = "render_and_gate_anchor"
 
 
-def safe_print(msg, is_err=False, end="\n"):
-    file = sys.stderr if is_err else sys.stdout
-    try:
-        file.write(msg + end)
-        file.flush()
-    except UnicodeEncodeError:
-        try:
-            file.write(msg.encode('ascii', errors='replace').decode('ascii') + end)
-            file.flush()
-        except Exception:
-            pass
-
-
-def render_and_gate(server: str, title: str, prompt: str, sequence: int = 1, meta: str = "") -> dict:
+def render_anchor(server, title, prompt, sequence=1, meta=""):
     """POST to /api/render_anchor and return the parsed JSON response.
 
-    This is a synchronous, blocking call by design (unlike /api/compose or
-    /api/generate_frames, which return a task_id to poll): the whole point is for the
-    calling agent to have the real anchor frame in hand before writing anything else."""
-    url = server.rstrip("/") + "/api/render_anchor"
-    payload = json.dumps({
-        "title": title,
-        "prompt": prompt,
-        "sequence": sequence,
-        "meta": meta,
-    }, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=payload,
+    Synchronous and blocking by design (unlike /api/compose or /api/generate_frames, which
+    return a task_id to poll): the whole point is for the calling agent to have the real
+    anchor frame in hand before writing anything else. The generous timeout matches a render
+    that can legitimately take minutes.
+    """
+    return http_json(
+        server.rstrip("/") + "/api/render_anchor",
+        payload={"title": title, "prompt": prompt, "sequence": sequence, "meta": meta},
         method="POST",
-        headers={"Content-Type": "application/json; charset=utf-8"},
+        timeout=900,
+        context=CONTEXT,
     )
-    try:
-        # Generous timeout: the gate renders + AI-judges up to 3 attempts server-side,
-        # each of which can legitimately take tens of seconds to a couple of minutes.
-        with urllib.request.urlopen(req, timeout=900) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except TimeoutError as e:
-        # A raw socket/read timeout is NOT the same thing as "server unreachable" (that's
-        # urllib.error.URLError below, exit code 2). The server was reachable and working;
-        # it just didn't finish within the wait window. Exit distinctly (5) so callers do
-        # NOT treat this as the "render server unreachable" staging waiver.
-        safe_print(f"[render_and_gate_anchor] ⏱️ 服务 {url} 在等待窗口内未返回结果（仍在渲染/判定中，不等同于服务不可用）: {e}", is_err=True)
-        sys.exit(5)
-    except urllib.error.URLError as e:
-        safe_print(f"[render_and_gate_anchor] ❌ 无法连接到服务 {url}: {e}", is_err=True)
-        sys.exit(2)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Render and AI-gate a single anchor frame before composing the rest of the beat ladder."
+        description="Render a single anchor frame before composing the rest of the beat ladder."
     )
-    parser.add_argument("--title", required=True, help="主题标题（需与后续 save_to_library / generate_frames 一致）")
-    parser.add_argument("--prompt", help="要渲染判定的图片提示词正文（与 --prompt_file 二选一）")
+    parser.add_argument("--title", required=True,
+                        help="主题标题（必须与后续 save_to_library / generate_frames 完全一致）")
+    parser.add_argument("--prompt", help="要渲染的图片提示词正文（与 --prompt_file 二选一）")
     parser.add_argument("--prompt_file", help="从本地文件读取提示词正文，避免命令行转义问题")
-    parser.add_argument("--sequence", type=int, default=1, help="要渲染判定的图片序号，默认 1（首帧）")
+    parser.add_argument("--sequence", type=int, default=1, help="要渲染的图片序号，默认 1（首帧）")
     parser.add_argument("--server", default=DEFAULT_SERVER, help=f"服务地址，默认 {DEFAULT_SERVER}")
     args = parser.parse_args()
 
@@ -116,25 +82,25 @@ def main():
             with open(args.prompt_file, "r", encoding="utf-8") as f:
                 prompt = f.read()
         except Exception as e:
-            safe_print(f"[render_and_gate_anchor] ❌ 无法读取 --prompt_file {args.prompt_file}: {e}", is_err=True)
-            sys.exit(4)
-    if not prompt:
-        safe_print("[render_and_gate_anchor] ❌ 必须提供 --prompt 或 --prompt_file", is_err=True)
-        sys.exit(4)
+            safe_print(f"[{CONTEXT}] ❌ 无法读取 --prompt_file {args.prompt_file}: {e}", is_err=True)
+            sys.exit(EXIT_BAD_INPUT)
+    if not prompt or not prompt.strip():
+        safe_print(f"[{CONTEXT}] ❌ 必须提供非空的 --prompt 或 --prompt_file", is_err=True)
+        sys.exit(EXIT_BAD_INPUT)
 
-    safe_print(f"[render_and_gate_anchor] 📡 正在渲染第 {args.sequence} 帧（可能需要一些时间，请耐心等待）...")
-    result = render_and_gate(args.server, args.title, prompt, sequence=args.sequence)
+    safe_print(f"[{CONTEXT}] 📡 正在渲染第 {args.sequence} 帧（可能需要几分钟，请耐心等待）...")
+    result = render_anchor(args.server, args.title, prompt, sequence=args.sequence)
 
     if result.get("status") != "ok":
-        safe_print(f"[render_and_gate_anchor] ❌ 服务返回错误: {result.get('message') or result}", is_err=True)
-        sys.exit(3)
+        safe_print(f"[{CONTEXT}] ❌ 服务返回错误: {result.get('message') or result}", is_err=True)
+        sys.exit(EXIT_SERVER_ERROR)
 
     image_url = result.get("image_url")
-
-    safe_print(f"[render_and_gate_anchor] ✅ 第 {args.sequence} 帧已渲染完成。图片: {image_url}")
-    safe_print("[render_and_gate_anchor] 服务端不对这一帧做任何自动判定：请把图片给用户看过、"
-               "确认这就是想要的锚帧之后，再继续生成后续内容。")
-    sys.exit(0)
+    safe_print(f"[{CONTEXT}] ✅ 第 {args.sequence} 帧已渲染完成。图片: {image_url}")
+    safe_print(f"[{CONTEXT}] 📎 本主题的稳定标识 slug={title_slug(args.title)}；"
+               f"后续 save_to_library / generate_frames 请传入完全相同的 --title。")
+    safe_print(f"[{CONTEXT}] 服务端不对这一帧做任何自动判定：请把图片给用户看过、"
+               f"确认这就是想要的锚帧之后，再继续生成后续内容。")
 
 
 if __name__ == "__main__":
