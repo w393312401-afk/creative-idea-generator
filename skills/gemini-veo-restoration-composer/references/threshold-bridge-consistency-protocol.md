@@ -55,7 +55,7 @@ IMAGE T+1    Interior · settled (and, pan variant, already turned) anchor — c
 
 **The clip carries no work**: the crossing clip is a pure camera move through an untouched ruin. Nothing is cleaned, cleared, tidied, repaired, or installed while the camera travels, and no tool, ladder, scaffolding, tarp, work light, or stacked material appears at any point in it; the interior reads as filthy from the first moment it becomes visible, not only at the settle. Write it as ONE unbroken take at a steady speed — no cut, fade, dissolve, wipe transition, speed ramp, or freeze (the only edit-like motion is the door frame leaving the frame) — and never label it a construction time-lapse, because nothing is being built. The cleanout of that mess is the NEXT beat (§9).
 
-**Generation note (not a separate beat)**: IMAGE T+1 is generated as a single i2i edit from IMAGE T. If the door-clearance check (§5) finds the door frame still lingering, the generator pushes one more i2i step using the just-rendered frame as reference (§5) — this is an internal quality retry on the SAME image slot, never a new numbered beat/IMAGE.
+**Generation note (not a separate beat)**: IMAGE T+1 is generated as a single i2i edit from IMAGE T. If your own door-clearance inspection (§5) finds the door frame still lingering, re-render the SAME slot — `--sequence <T+1> --force_regenerate`, deleting the rejected frame first — rather than adding a beat. This is a retry on one image slot, never a new numbered beat/IMAGE. There is no renderer-side check that does this for you (§5).
 
 ---
 
@@ -67,20 +67,24 @@ IMAGE T+1    Interior · settled (and, pan variant, already turned) anchor — c
 
 * **IMAGE T (still exterior)** — peek the future primaries, already sharp but still small:
   ```
-  Through the open doorway in Grid B2, two interior anchors are already visible and in sharp focus: a brushed-steel tool cabinet at interior mid-right and a red fire extinguisher on the interior rear wall, each reading small at about one-fifth of the frame height.
+  Through the open doorway in Grid B2, two interior anchors are already visible and in sharp focus: a soot-blackened original timber post running floor to ceiling at interior mid-right and a red fire extinguisher on the interior rear wall, each reading small at about one-fifth of the frame height.
   ```
 * **VIDEO T** — scale, never re-render:
   ```
-  the same brushed-steel tool cabinet and red fire extinguisher scale up continuously along the camera axis, never repositioning, never re-rendering, their apparent size growing naturally as the camera approaches (and, pan variant, sliding to their registered position as the camera turns).
+  the same soot-blackened timber post and red fire extinguisher scale up continuously along the camera axis, never repositioning, never re-rendering, their apparent size growing naturally as the camera approaches (and, pan variant, sliding to their registered position as the camera turns).
   ```
 * **IMAGE T+1 (interior settled)** — promote the identical objects to primary anchors:
   ```
-  Interior primary anchors: the brushed-steel tool cabinet locked at Grid B3 holding a scale of about half the frame height; the red fire extinguisher locked at Grid A3.
+  Interior primary anchors: the soot-blackened original timber post locked at Grid B3 holding a scale of about half the frame height; the red fire extinguisher locked at Grid A3.
   ```
+
+  In this example the timber post is the fixed structural feature required below; the fire extinguisher — a movable object — may hold the other slot only because of it. Two movable anchors would fail.
 
 **Banned**: introducing any interior primary anchor in IMAGE T+1 that was not visible through the doorway in IMAGE T.
 
 **Anchor Qualification (mandatory)**: peeked anchors must be features that plausibly already exist at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. Future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures) are banned as peek anchors. The bridge always precedes interior construction in the timeline; peeking a future product forces that object to exist before the beat that creates it — a hard causality inversion the audience reads instantly as an AI error. For sealed or never-entered shells, choose natural interior features (a heartwood ridge, a rock rib, an original bulkhead) as the two peek anchors.
+
+**Fixed-Feature Requirement (mandatory — Carrier Identity Hand-off, §5)**: at least **one** of the two registered interior primary anchors must be a **fixed structural feature of the carrier itself** — a window band, a ribbed roof curve, a rib frame, a bulkhead, a porthole row, a stone pier, an original beam. A movable object may hold the *other* slot, but never both. Two movable anchors is the failure mode this rule exists for: a cast-iron flywheel machine, a tool cabinet and a fire extinguisher are all things the model can slide, shrink, or re-place without contradicting anything you wrote, and when both anchors can move there is nothing nailing the walls down at all. The shell then drifts freely between frames while the audit still passes — the anchors are "inherited", they just no longer describe a room. A fixed feature is also what the Geometry Lock's envelope signature attaches to; without one, the clear-width clause has no visible referent in the frame.
 
 **Monotonic Scale Lock (mandatory)**: the same anchor's declared frame-height scale must strictly increase from `IMAGE T` to `IMAGE T+1` (e.g. one-fifth → three-fifths). The camera closes several metres of distance during the crossing; a constant scale across both IMAGEs contradicts the required continuous scale-up, and the generated bridge reads as a fake digital zoom or a mid-clip shrink-back.
 
@@ -140,7 +144,9 @@ at the sill the door-frame edges slide symmetrically outward past the left and r
 
 1. Every post-crossing IMAGE prompt states the door-clearance clause explicitly (never assume it).
 2. The cross-threshold light tether (Rule 6) is REWORDED after the settle: entry daylight becomes **directional light from behind the camera** ("daylight from the entry behind the camera lays a soft bright wedge across the floor toward the rear wall") — never a visible doorway, door frame, or bright opening in frame.
-3. The renderer runs a door-clearance check on IMAGE T+1 and, on failure, pushes one more step forward using the same bridge (camera-advance) edit instruction, reusing the just-rendered frame as reference — this is an internal retry on the same image slot, not a new beat.
+3. **You** inspect the rendered IMAGE T+1 for clearance — see the agent-side check below.
+
+**Agent-side check (no renderer backstop exists).** Since 2026-08-05 the server runs no generation-time visual judgement whatsoever, so nothing checks this frame but you. After `IMAGE T+1` renders, inspect it yourself and confirm: door frame, door leaf, threshold edges and the entry opening are all fully out of frame; interior surfaces reach every frame edge; entry daylight reads as directional light from behind the camera rather than a visible opening. On failure, delete the rejected frame and re-render the same slot with `--sequence <T+1> --force_regenerate` (at most 3 attempts, per the Staged Delivery Contract), reusing the bridge camera-advance instruction — a retry on one image slot, never a new beat. Do not assume this frame was gated on your behalf; `check_interior_door_clearance` runs on the prompt *text* before rendering and cannot see the pixels.
 
 **Carrier Identity Hand-off (mandatory)**: the door frame is usually the only element binding the interior to the carrier. Once it leaves the frame, the carrier's OWN fixed interior identity features must take over as anchors — a bus's side window band, ribbed roof curve, or wheel arches; a boat's rib frames or portholes; an aircraft's window row. At least one registered interior primary anchor must be such a feature, restated in every interior IMAGE, or the interior degrades into a generic room. Equally: once fully inside, the interior's main light source must be NAMED (the carrier's own openings, an installed practical light, or entry daylight from behind the camera) — an unlit interior invites the model to invent windows the carrier does not have, which is its own consistency break.
 
@@ -156,7 +162,21 @@ at the sill the door-frame edges slide symmetrically outward past the left and r
 
 This applies ONLY to IMAGE T+1 — every later interior beat instead follows its own STAGE SCOPE progressive-completion rule.
 
-**Renderer backstop**: after the door-clearance check (§5) passes, the renderer runs a raw-state check on the rendered IMAGE T+1 pixels (intervention evidence / already-tidied space / already-restored surfaces / fewer than two decay categories). On failure it re-edits the same image slot once with a state-correction instruction — camera locked, only the state of what is in frame changes — then keeps the frame and records the reason for the sequence review. Like §5 this is an internal retry on the SAME image slot, never a new beat.
+**Crossing Delta Budget (the amplitude constraint SKILL.md Step 5's Adjacent-Anchor Delta Budget table defers to).** That table gives every other `beat_type` a grid-cell budget and writes `threshold` off as "governed by TBCP instead". This is that governing clause — without it the deferral pointed at nothing, on the single widest-span beat in the ladder.
+
+Grid-cell counting genuinely does not apply here, but not because nothing is constrained: the crossing changes **100% of the frame by construction**, because the camera leaves one room and arrives in another. What the budget constrains instead is *what kind* of change is allowed to be spent:
+
+| Quantity | Budget across `IMAGE T` → `IMAGE T+1` |
+|---|---|
+| Viewpoint / enclosure | **the entire beat's allowance** — this is the one thing the crossing buys |
+| Construction progress | **zero** — no surface damaged at `IMAGE T` may read as repaired, cleaned, cleared, re-clad, or painted at `IMAGE T+1` (§6.2 is the frame-local statement of this; here it is stated as a delta) |
+| Time of day / weather / season | **zero** — same lighting phase either side of the sill; the exposure roll of §4 is a domain change, not a phase change |
+| Exterior state | **zero** — anything of the exterior still visible in later frames must match its `IMAGE T` state exactly |
+| Camera height / lens | **zero**, except the one deliberate Elevated Access Variant climb (§3) |
+
+The failure this budget names: a crossing beat that also quietly advances the restoration spends two beats' worth of delta in one, and the interior chain then starts from a state no beat ever earned. If a run needs both the crossing *and* interior progress, that is two beats — the crossing, then the clear-out (§9) — never one.
+
+**Agent-side check (no renderer backstop exists)**: once your §5 clearance inspection passes, run a raw-state check on the rendered IMAGE T+1 pixels yourself — intervention evidence, an already-tidied space, already-restored surfaces, or fewer than three of the decay categories above. On failure, delete the frame and re-render the same slot with a state-correction instruction (`--sequence <T+1> --force_regenerate`, camera locked, only the state of what is in frame changes), then record the reason for the sequence review. Like §5 this is a retry on the SAME image slot, never a new beat — and like §5, nothing on the server does it for you.
 
 ---
 
@@ -247,7 +267,8 @@ A single `FAIL` triggers a rewrite of the threshold beat before delivery.
 | **Exposure & WB Soft Roll** | Is the lighting change gradual across the whole clip, attributed to door-shade + doorway backlight, with no percentages/color-temp numbers, and with a single consistent colour-temperature direction (no mid-clip reversal)? | Brightness snap, white-balance jump/pumping, text artifacts |
 | **Door-Frame Wipe** | Do the door-frame edges slide symmetrically out at the sill to mask the transition? | Visible hard cut at the crossing |
 | **Settle-Frame Door Clearance** | Does IMAGE T+1 and every later interior IMAGE state the door-clearance clause (door frame/leaf/threshold/entry opening fully behind the camera, interior filling the frame edge to edge), with entry daylight written as directional light from behind the camera? | Interior seen through the doorway; interior occupying only a small inner rectangle |
-| **Carrier Identity Hand-off** | Is at least one registered interior anchor a fixed identity feature of THIS carrier (window band, ribbed roof, wheel arches, rib frames, portholes...), restated in every interior IMAGE, plus a named main light source? | Interior degrades into a generic room; model invents windows the carrier does not have |
+| **Carrier Identity Hand-off** | Is at least one registered interior **primary** anchor a fixed structural feature of THIS carrier (window band, ribbed roof, rib frames, bulkhead, portholes, original beam...) rather than a movable object, restated in every interior IMAGE, plus a named main light source? Two movable anchors fails. | Interior degrades into a generic room; nothing nails the walls down, so the shell drifts freely while the anchors still "pass"; model invents windows the carrier does not have |
+| **Shell Envelope Consistency** | Does every interior IMAGE restate the Geometry Lock's envelope signature verbatim (clear width / clear height in door units) and one roof form at the exterior's own pitch, with no aperture missing from the ledger and nothing from the denylist (skylight, vault, dome, rear-wall arched window)? | Room silently changes size and grows openings no beat ever cut; error propagates cleanly down the whole interior chain |
 | **Cross-Threshold Tether** | Does ≥1 material or light source continue unbroken across the sill? | Interior reads as a disconnected world |
 | **Frame Hand-off Lock** | Does the VIDEO bind IMAGE T (first frame) to IMAGE T+1 (last frame) with no redirection? | Anchor/first-frame mismatch |
 | **First Interior Reveal — Untouched Trauma State** | Does IMAGE T+1 show the SAME untouched pre-renovation decay established outside — ≥3 of structural damage / surface decay / vegetation intrusion / debris-clutter — with ZERO intervention evidence (no tools, ladders, scaffolding, tarps, work lights, stacked materials, no already-repaired or already-cleaned patch) and nothing swept, piled, or arranged? Applies ONLY to IMAGE T+1; later interior beats follow their own progressive-completion rule instead. | Interior reads as already clean/renovated/set-dressed before any construction beat has touched it |

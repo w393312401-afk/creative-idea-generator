@@ -430,12 +430,16 @@ Instructions:
                         pp.check_milestone_video_prompt(v_p, beat) + pp.check_milestone_image_prompt(i_p, beat))
                     # 终帧倒退是整条序列最贵的失败，和里程碑硬门同级：重试整拍而不是留痕
                     payoff_blocking = pp.payoff_blocking_residual(residual, is_last)
+                    # 硬门只有两类：里程碑骨架残缺 + 终帧倒退。其余回读残留一律留痕放行
+                    # （下面的 record_beat_audit 会记成 rework_failed/needs_attention）。
+                    # 2026-08-08：这里曾把整份 residual 也算进硬门，等于「回炉没修干净就
+                    # 整拍重来」——每拍白烧一次整拍 LLM 调用，10 拍的单子撞死 720s 硬时限
+                    # （COMPOSE_TIMEOUT），日志里还会打出「重试整拍: []」这种空原因。
                     hard_gate_errors = list(dict.fromkeys(
-                        remaining_milestone_errors + payoff_blocking + list(residual or [])))
+                        remaining_milestone_errors + payoff_blocking))
                     if hard_gate_errors:
                         if sys.stdout:
-                            print(f"[DIRECT] Beat {i} 硬门仍未通过，重试整拍: "
-                                  f"{remaining_milestone_errors + payoff_blocking}")
+                            print(f"[DIRECT] Beat {i} 硬门仍未通过，重试整拍: {hard_gate_errors}")
                         continue
                     if style_errs and sys.stdout:
                         print(f"[DIRECT] Beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {style_errs}")
@@ -505,7 +509,7 @@ Instructions:
                     _traces = ', '.join(beat.get('persistent_traces') or ['contact marks', 'material dust'])
                     vid_prompt = (
                         f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {i} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout. "
-                        f"This is a continuous construction time-lapse, not real-time footage, creating the {beat.get('milestone_name')} milestone through the cohesive {_package} package. At the very first moment the visible state is {beat.get('before_state')}; the same lone worker enters carrying material from a rigid source container, makes the first tool contact, and repeatedly performs the work cycle along a visible movement path. The primary progression shows {beat.get('primary_progress')}; simultaneously the secondary progression shows {beat.get('secondary_progress')}. By the final moment {beat.get('after_state')} across {beat.get('completion_extent')}, while {_traces} remain and the worker carries tools and empty containers out, leaving a clean handoff frame."
+                        f"This is a continuous construction time-lapse, not real-time footage, creating the {beat.get('milestone_name')} milestone through the cohesive {_package} package. At t=0s the visible state is {beat.get('before_state')}; the same lone worker is already positioned at the active work face, makes the first effective tool contact immediately, and repeatedly performs the work cycle along a visible movement path. The primary progression shows {beat.get('primary_progress')}; simultaneously the secondary progression shows {beat.get('secondary_progress')}. By the final moment {beat.get('after_state')} across {beat.get('completion_extent')}, while {_traces} remain and the worker continues the visible operation through the final frame."
                     )
                 else:
                     vid_prompt = (
@@ -820,8 +824,11 @@ Instructions:
                 payoff_blocking = pp.payoff_blocking_residual(residual, contract['is_last'])
                 if style_errs and sys.stdout:
                     print(f"[DIRECT] Batch beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {style_errs}")
+                # 同上：批量稿的硬门也只有里程碑骨架 + 终帧倒退两类。把整份 residual
+                # 算进来会让批量结果几乎全军覆没、每拍都退回单拍通路重做（实测 10/10 拍
+                # 都走了「Individually composing」），是撞硬时限的主要成本来源。
                 hard_gate_errors = list(dict.fromkeys(
-                    remaining_milestone_errors + payoff_blocking + list(residual or [])))
+                    remaining_milestone_errors + payoff_blocking))
                 if not hard_gate_errors:
                     if residual and sys.stdout:
                         print(f"[DIRECT] Batch beat {i} 回读校验仍有残留（回炉未真正生效）: {residual}")
@@ -833,8 +840,7 @@ Instructions:
                     vid_prompt, img_prompt, beat_succeeded = v_p, i_p, True
                     new_ledger_items = parsed_traces
                 elif sys.stdout:
-                    print(f"[DIRECT] Batch beat {i} 硬门未通过，转入单拍重试: "
-                          f"{remaining_milestone_errors + payoff_blocking}")
+                    print(f"[DIRECT] Batch beat {i} 硬门未通过，转入单拍重试: {hard_gate_errors}")
 
             if not beat_succeeded:
                 if sys.stdout:

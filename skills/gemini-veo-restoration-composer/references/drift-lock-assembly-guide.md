@@ -27,21 +27,62 @@ static high-corner vertical tripod shot, ultra-wide 14-18mm lens feel, 3.2m elev
 
 ### 2. Geometry Lock
 
-List every structural fact that cannot change:
+Every structural fact that cannot change — written as **relative measures against features
+visible in the frame**, never as adjectives and never as absolute metres. "Same wall lines"
+and "same carrier proportions" are unusable: no image model can draw to them, which is why
+this field was ignored downstream for so long and every interior frame re-derived the room's
+size on its own.
 
-- Door count and placement
-- Window count and placement
-- Wall lines and placement
-- Stair direction (if applicable)
-- Beam/column placement
-- Full scene boundary
-- Carrier proportions
-- Roofline
-- Any threshold opening dimensions
+Fill all seven subfields (SKILL.md Step 6 carries the same table and is the authority):
+
+| Subfield | Unit | Example |
+|---|---|---|
+| `clear_width` | door widths | `about two and a half door widths wall to wall` |
+| `clear_height` | door heights | `about three door heights to the ridge` |
+| `depth_bays` | countable facade features | `four rafter pairs deep` |
+| `roof_form` | one form, exterior's own pitch | `single shallow gable, same pitch as the outside; no second roof form anywhere` |
+| `aperture_ledger` | exhaustive, entry included | `the single plank door in the gable end; two small square vents under the eaves` |
+| `aperture_denylist` | explicit absences, by noun | `no skylight, no roof light, no vaulted or domed ceiling, no rear-wall arched window, no second doorway` |
+| `wall_material` | same family inside and out | `the same tarred board cladding continues on the inner face` |
+
+Still locked as before, alongside those: door and window count and placement, stair
+direction, beam/column placement, full scene boundary, and every threshold opening's
+dimensions.
+
+**The denylist is what actually constrains the model.** A generative model fills
+unconstrained volume with whatever the genre suggests; listing what exists does not stop it,
+naming the absent noun does. Skylights, vaulted ceilings, and rear-wall arched windows are
+this pipeline's three recurring inventions — put them on the list by name unless the shell
+genuinely has one, in which case register it in the ledger instead.
+
+**Envelope signature**: mark one clause from `clear_width` or `clear_height`, under twelve
+words, numeral-free. It gets restated verbatim on every post-crossing interior IMAGE
+(SKILL.md Step 7, Shell Envelope Restatement).
+
+### 2b. Material Palette Lock
+
+The Geometry Lock says how big the shell is; this says what it is made of. Same room, same
+clear width, and still the stone reads moss-green in one frame and dry ochre in the next —
+because each frame's material wording was improvised and every geometric gate compares names,
+height ratios and widths, never adjectives.
+
+Register **3-5 materials** that occupy real frame area. Each splits in two (SKILL.md Step 6
+carries the same table and is the authority):
+
+| Field | Mutable? | Example |
+|---|---|---|
+| `substrate` | never — copied character-for-character every frame | `coarse grey-brown fieldstone, irregular courses, dry-laid` |
+| `state_track` | one step forward, only in the beat that works this material | `thick wet moss in the joints` → `joints raked clean, stone still dark with damp` → `dry pale grey stone, tight lime pointing` |
+
+Keep lighting out of `substrate`. `warm honey stone` is a lighting phase in a material's
+clothes, and it will swing with every phase change in the ladder.
+
+Both fields ride in the `[material realism]` slot the IMAGE templates already carry, so this
+lock is word-neutral — it replaces improvised wording rather than adding a sentence.
 
 **Template phrase**:
 ```
-same [full boundary description], same [structural element] placement, same [element count], same [carrier proportion description]
+[clear_width clause]; [clear_height clause]; [depth_bays]; [roof_form, stated as never changing]; the only openings are [aperture_ledger]; there is no [aperture_denylist]; [wall_material]
 ```
 
 ### 3. Fixed Landmarks & Normalized Grid Coordinate System (NGCS)
@@ -167,7 +208,10 @@ Plan three tiers:
 Before proceeding to IMAGE rendering, verify:
 
 - [ ] Camera DNA Block is complete and reusable, copied character-for-character
-- [ ] Geometry Lock covers all structural invariants
+- [ ] Geometry Lock covers all seven subfields in relative units (`clear_width`, `clear_height`, `depth_bays`, `roof_form`, `aperture_ledger`, `aperture_denylist`, `wall_material`) — no qualitative-only entries
+- [ ] `aperture_denylist` is non-empty and names its absences as nouns, not as "no other openings"
+- [ ] Envelope signature chosen: one clause under twelve words, numeral-free, to be restated verbatim on every post-crossing interior IMAGE
+- [ ] Material Palette: 3-5 materials registered, each with an immutable `substrate` phrase (no lighting adjectives) and an ordered `state_track` from trauma to restored
 - [ ] Exactly 3 primary landmarks across 3 depth zones named with NGCS grid coordinates and Z-depth height scales
 - [ ] All 4 frame boundaries named with explicit Grid coordinates
 - [ ] Object Position-State Ledger (OSPL) has coordinates and Z-depth scale, and uses the Ghost Clause for any occlusions

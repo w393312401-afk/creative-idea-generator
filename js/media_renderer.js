@@ -152,6 +152,9 @@ function renderIdea(result) {
         ? `提示词质量门未通过：${result.failure_code || '结果已降级'}。帧序列渲染已禁用。`
         : '';
     renderRepairBanner(deliveryWarning || result.repair_md);
+    // 换单/重渲时必须先退出手动编辑态：编辑器里躺着的是上一单的提示词，
+    // 留在屏幕上一保存就写串了单（见 js/prompt_editor.js）。
+    if (typeof resetPromptEditor === 'function') resetPromptEditor();
     document.getElementById('idea-prompt-block').textContent = result.prompt_block || '（本次未返回提示词内容）';
     document.getElementById('idea-audit').innerHTML = renderAuditMarkdown(result.audit_md);
 

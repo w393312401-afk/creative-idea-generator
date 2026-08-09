@@ -511,6 +511,124 @@ class TestBeatOutlineDelivery(unittest.TestCase):
         # 拍数一律由清单长度派生,模型申报的数字不再有话语权(见 §1.3)
         self.assertEqual(result['ideas'][0]['recommended_beats'], 4)
 
+    def test_invalid_rich_entry_is_downgraded_without_losing_the_card(self):
+        payload = json.dumps([{
+            'title': '富字段降级测试', 'dna': 'steel-cabin / refuge / warm-light',
+            'beat_outline': [
+                {'op': 'clearing', 'text': '清空锈屑与碎渣',
+                 'en': 'loose rust flakes and broken debris are shoveled into steel bins',
+                 'mat': ['rust flakes', 'broken debris']},
+                {'op': 'repair', 'text': '焊补穿孔钢板',
+                 'en': '焊补钢板', 'mat': ['steel plate']},
+                {'op': 'flooring', 'text': '铺好毛毡与松木地板',
+                 'en': 'grey wool felt underlay laid edge to edge, oiled pine planks nailed over it',
+                 'mat': ['wool felt underlay', 'oiled pine planks']},
+                {'op': 'reward', 'text': '点亮暖灯完成人物入住',
+                 'en': 'warm brass wall lamps illuminate the finished cabin as its occupant settles in',
+                 'mat': ['brass wall lamps', 'finished cabin']},
+            ],
+        }], ensure_ascii=False)
+        with patch.object(pp, '_OUTLINE_RICH_GATE_ENFORCING', True):
+            result, mock_chat = self._run(lambda *a, **k: payload)
+        idea = result['ideas'][0]
+        self.assertEqual(mock_chat.call_count, 1)
+        self.assertEqual(idea['beat_outline'][1],
+                         {'op': 'repair', 'text': '焊补穿孔钢板'})
+        self.assertEqual(idea['beat_outline'][2]['mat'],
+                         ['wool felt underlay', 'oiled pine planks'])
+        self.assertFalse(idea['outline_enriched'])
+
+    RICH_OUTLINE = [
+        {'op': 'clearing', 'text': '清空舱内碎屑与旧板',
+         'en': 'loose debris and broken wall panels shoveled out of the steel cabin',
+         'mat': ['broken wall panels'], 'zone': 'cabin floor', 'scope': 'large'},
+        {'op': 'rough-in', 'text': '铺设防潮膜与电路',
+         'en': 'a black vapour barrier membrane stapled up with copper conduit runs clipped over it',
+         'mat': ['vapour barrier membrane', 'copper conduit'],
+         'zone': 'cabin floor', 'scope': 'default',
+         'trace': 'staple lines along the membrane edges'},
+        {'op': 'flooring', 'text': '铺好毛毡与松木地板',
+         'en': 'grey wool felt underlay laid edge to edge, oiled pine planks nailed over it',
+         'mat': ['wool felt underlay', 'oiled pine planks'],
+         'zone': 'cabin floor', 'scope': 'large',
+         'trace': 'pine plank seams running lengthwise'},
+        {'op': 'reward', 'text': '点亮暖灯完成入住',
+         'en': 'warm brass wall lamps illuminate the finished cabin as its occupant settles in',
+         'mat': ['brass wall lamps'], 'zone': 'sleeping nook', 'scope': 'large',
+         'trace': 'a pool of lamplight across the finished planks'},
+    ]
+    ZONE_MAP = ['cabin floor', 'walls & ceiling', 'sleeping nook']
+
+    def _rich_payload(self, mutate=None, zone_map=None):
+        outline = [dict(e) for e in self.RICH_OUTLINE]
+        if mutate:
+            mutate(outline)
+        return json.dumps([{
+            'title': '富字段卡', 'dna': 'steel-cabin / refuge / warm-light',
+            'zone_map': self.ZONE_MAP if zone_map is None else zone_map,
+            'beat_outline': outline,
+        }], ensure_ascii=False)
+
+    def test_a_fully_enriched_card_keeps_every_field(self):
+        result, _ = self._run(lambda *a, **k: self._rich_payload())
+        idea = result['ideas'][0]
+        self.assertTrue(idea['outline_enriched'])
+        self.assertEqual(idea['beat_outline'][2]['zone'], 'cabin floor')
+        self.assertEqual(idea['beat_outline'][2]['scope'], 'large')
+        self.assertEqual(idea['beat_outline'][2]['trace'],
+                         'pine plank seams running lengthwise')
+
+    def test_a_zone_outside_the_zone_map_drops_only_the_property_pack(self):
+        """事实源 en/mat 已经合格，不该被一个写错的 zone 连累掉——两包各自降级。"""
+        def mutate(outline):
+            outline[2]['zone'] = 'engine bay'
+        result, _ = self._run(lambda *a, **k: self._rich_payload(mutate))
+        entry = result['ideas'][0]['beat_outline'][2]
+        self.assertEqual(entry['mat'], ['wool felt underlay', 'oiled pine planks'])
+        self.assertNotIn('zone', entry)
+        self.assertNotIn('scope', entry)
+        self.assertNotIn('trace', entry)
+        self.assertFalse(result['ideas'][0]['outline_enriched'])
+
+    def test_all_large_coverage_is_rejected(self):
+        """每拍都是「整屋完工」= 没有进度感。"""
+        def mutate(outline):
+            outline[1]['scope'] = 'large'
+        result, _ = self._run(lambda *a, **k: self._rich_payload(mutate))
+        outline = result['ideas'][0]['beat_outline']
+        self.assertTrue(all('scope' not in e for e in outline))
+        # 事实源仍在，卡片照常交付
+        self.assertEqual(len(outline), 4)
+        self.assertTrue(all(e.get('en') for e in outline))
+
+    def test_a_repeated_trace_is_rejected(self):
+        def mutate(outline):
+            outline[2]['trace'] = outline[1]['trace']
+        result, _ = self._run(lambda *a, **k: self._rich_payload(mutate))
+        self.assertNotIn('trace', result['ideas'][0]['beat_outline'][2])
+        self.assertIn('trace', result['ideas'][0]['beat_outline'][1])
+
+    def test_zone_jitter_beyond_the_budget_is_rejected(self):
+        """每拍换一个区 = 镜头反复横跳，观众读不出进度。"""
+        def mutate(outline):
+            # 4 条清单只允许 ⌈4/3⌉ = 2 次换区，这里换了 3 次
+            outline[1]['zone'] = 'walls & ceiling'
+            outline[2]['zone'] = 'sleeping nook'
+            outline[3]['zone'] = 'cabin floor'
+        result, _ = self._run(lambda *a, **k: self._rich_payload(mutate))
+        zones = [e.get('zone') for e in result['ideas'][0]['beat_outline']]
+        self.assertIn(None, zones)
+        self.assertFalse(result['ideas'][0]['outline_enriched'])
+
+    def test_the_gate_never_burns_the_batch_over_rich_fields(self):
+        """富字段不合格一律就地降级，绝不重跑一次 150s 的激发。"""
+        def mutate(outline):
+            outline[2]['zone'] = 'engine bay'
+            outline[1]['en'] = '铺设防潮膜'
+        result, mock_chat = self._run(lambda *a, **k: self._rich_payload(mutate))
+        self.assertEqual(mock_chat.call_count, 1)
+        self.assertEqual(len(result['ideas'][0]['beat_outline']), 4)
+
     def test_outline_returned_as_one_string_is_split_into_beats(self):
         payload = json.dumps([{
             'title': 'T', 'dna': 'a / b / c',

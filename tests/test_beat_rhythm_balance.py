@@ -459,6 +459,28 @@ class TestOutlineWeight(unittest.TestCase):
         self.assertEqual(pp.outline_weight_violations({}), [])
         self.assertEqual(pp.outline_weight_violations({'beat_outline': []}), [])
 
+    def test_english_materials_catch_what_the_chinese_wordlist_misses(self):
+        """材料层判定优先读卡片自报的 mat（P4）。
+
+        中文词表覆盖不到的写法（"完成第一阶段收口"）此前静默漏判——这道闸门的输入
+        精度等于一个关键词表的召回率。mat 是模型自报的具体材料名，判层从猜变成读。"""
+        blind_spot = {'op': 'drywall', 'text': '完成第一阶段收口'}
+        self.assertEqual(pp._outline_entry_family_span(blind_spot), 0)
+        enriched = dict(blind_spot,
+                        en='vapour barrier membrane stapled up, plasterboard sheets and '
+                           'oiled pine flooring fitted over it',
+                        mat=['vapour barrier membrane', 'plasterboard sheets',
+                             'oiled pine flooring'])
+        self.assertGreaterEqual(pp._outline_entry_family_span(enriched), 3)
+        errors = pp.outline_weight_violations(
+            {'beat_outline': [enriched, {'op': 'reward', 'text': '点亮灯带,人物入住'}]})
+        self.assertTrue(any('完成第一阶段收口' in e for e in errors), errors)
+
+    def test_entries_without_materials_still_use_the_chinese_wordlist(self):
+        """mat 缺失（老卡、被剥掉富字段的条目）时原样回落，行为一字不变。"""
+        self.assertEqual(pp._outline_entry_family_span('铺防水膜立龙骨并封板'), 3)
+        self.assertEqual(pp._outline_entry_family_span({'text': '铺防水膜立龙骨并封板'}), 3)
+
 
 class TestWeightedBeatsFloor(unittest.TestCase):
     def test_heavy_entries_raise_the_floor_above_a_plain_entry_count(self):

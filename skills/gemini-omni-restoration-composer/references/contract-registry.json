@@ -44,6 +44,14 @@
       "enforcer": "prompt_pipeline:check_anchor_scale_lock"
     },
     {
+      "id": "omni-shell-envelope-consistency",
+      "level": "P0",
+      "scope": "image",
+      "summary": "跨门槛后的每张室内 IMAGE 逐字复述外壳体量签名和单一屋顶形态，开口只来自 ledger 且不得命中 denylist",
+      "source": "references/omni-restoration-continuity.md#Shell Geometry Lock",
+      "enforcer": "prompt_pipeline:check_shell_envelope_consistency"
+    },
+    {
       "id": "omni-notation-ban-video",
       "level": "P2",
       "scope": "video",
@@ -76,6 +84,38 @@
       "source": "SKILL.md#Core Job",
       "enforcer": null,
       "gap": "纯风格取向，靠 system prompt 里的 references 原文引导，没有确定性判定标准可写成门禁。登记为「有意不设门禁」，避免下次审计时被当成漏掉的一条。"
+    },
+    {
+      "id": "shelter-only-destiny",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "SHELTER-ONLY：归宿必须是能住人的私人庭护所，商业/公共/工作室类一律否决",
+      "source": "references/idea-engine.md#Axis 4",
+      "enforcer": "prompt_pipeline:ideation_shelter_violations"
+    },
+    {
+      "id": "salvage-and-rebuild",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "旧物再生（DIY 内核）：每条选题必须申报一件被拆下来、回到室内变成别的东西的原生旧构件，并在节拍清单里真的做这道工序",
+      "source": "references/idea-engine.md#Axis 4",
+      "enforcer": "prompt_pipeline:ideation_salvage_violations"
+    },
+    {
+      "id": "used-topic-ledger-dedup",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "历史选题台账去重：twist 根级去重，换个壳子套同一个 twist 算变体不算新选题",
+      "source": "references/idea-engine.md#2.3",
+      "enforcer": "prompt_pipeline:ideation_twist_root_violations"
+    },
+    {
+      "id": "carrier-family-quota",
+      "level": "P1",
+      "scope": "pipeline",
+      "summary": "载体家族配额：一批里天然原位壳体（岩洞/化石/冰洞/活体树干）不超过三分之一",
+      "source": "references/idea-engine.md#2.3b",
+      "enforcer": "prompt_pipeline:ideation_family_quota_violations"
     }
   ]
 }

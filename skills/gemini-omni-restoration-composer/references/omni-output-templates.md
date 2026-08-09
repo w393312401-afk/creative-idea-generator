@@ -10,7 +10,8 @@ shot count, which is itself set by clip length (see `omni-multishot-language.md`
 
 | Slot | Target | Hard ceiling |
 |---|---|---|
-| IMAGE | 120–200 words | 220 |
+| IMAGE — exterior or single shot family | 140–180 words | 180 |
+| IMAGE — post-crossing interior | 170–220 words | 220 |
 | VIDEO — per shot | 45–70 words | — |
 | VIDEO — whole prompt | `55 × shots + 175` words | `55 × shots + 235` |
 | Conversational edit | 30–60 words | 90 |
@@ -35,8 +36,9 @@ If a prompt runs long, trim in this order:
 2. restated boilerplate already established in an earlier slot
 3. secondary scene description outside the work zone
 
-Never trim a required structural element to fit: the anchor-binding sentence, the shot
-timeline sentence, the shot scales, the worker silhouette phrase, entry and exit paths, the
+Never trim a required structural element to fit: the shell-envelope and visible-material
+restatements in IMAGE prompts; the anchor-binding sentence, the shot
+timeline sentence, the shot scales, the worker silhouette phrase, the direct-action-at-zero clause, the
 tool description, the two persistent traces, the pacing declaration, the in-shot continuity
 sentence, the no-text sentence, or the audio clause. If those do not fit, the beat is
 overloaded and should be split.
@@ -124,6 +126,12 @@ Keep the same location, anchor images, shot order, and physical operation, but .
 Generate an image of a locked restoration anchor for Gemini Omni, captured like an unpolished smartphone still from casual UGC worksite footage, with slight handheld framing imbalance, mild wide-angle edge distortion, small blown-highlight patches near [bright source], and faint phone sensor noise in the darker corners. The camera frames [carrier] in [location] from [shot scale and phone-camera feel], with [three stable landmarks] held in the same positions for the whole sequence. The scene is in the [before/progressive/final] state: [state details with realistic weathering, dust layers, uneven surface scuffs, and material grain], with [concrete spatial completion extent, e.g. the left two-thirds of the wall primed while the right third stays bare], [explicit counts of major countable elements, e.g. three exposed roof beams and six stacked wall panels], and all permanent changes and traces from earlier beats still visible: [inherited traces such as pry scars, screw heads, dried roller stipple, staged material stockpiles]. No active workers, machines, captions, subtitles, floating labels, or rendered prompt words appear. The lighting is [specific available light source with phone auto-exposure behavior, realistic shadows, and ambient occlusion], the visual style is [UGC documentary realism with tactile material detail], and the physical materials retain [specific texture, roughness, traces, compression artifacts, or color cast]. Keep this image usable as a stable first or last frame for adjacent Omni video generation.
 ```
 
+For every post-crossing interior IMAGE, replace optional scene filler with the verbatim envelope
+signature, the single roof form at the exterior pitch, the aperture ledger/denylist, the same wall
+material, and at least one fixed carrier landmark. For every IMAGE, copy each visible registered
+material's immutable substrate phrase and current state phrase verbatim. These are required
+restatements, not extra sections or field labels.
+
 ## VIDEO Prompt Pattern
 
 Each VIDEO prompt should be one compact English paragraph. It must carry the shot timeline
@@ -132,7 +140,7 @@ the 10s / six-shot case; shorter ladders drop the rungs named in
 `omni-multishot-language.md` and fold their duties into the neighbouring shot.
 
 ```text
-Use IMAGE N as the first-frame anchor and IMAGE N+1 as the last-frame anchor; every shot must preserve the same location, object identity, lighting direction, and physical layout while showing only the single operation of [operation]. Cut this ten-second clip on these marks and hold no other cuts — an establishing long shot from 0.0 to 1.6, a full shot from 1.6 to 3.1, a medium shot from 3.1 to 5.3, a close-up from 5.3 to 6.9, an extreme close-up from 6.9 to 8.3, and a wide outro shot from 8.3 to 10.0 seconds. The sequence opens with an establishing long shot captured like casual smartphone footage, slightly off-center with mild wide-angle edge distortion and phone auto-exposure settling as it matches IMAGE N, showing [environment and carrier] under [available lighting]. A clean cut moves to a full shot with handheld phone sway as [worker/machine] enters from [path] carrying [tool/material] while leaning slightly into its physical weight, [setting a ladder or scaffold against the work face if the task is above arm reach,] with a small framing correction as the subject crosses toward [work zone]. A match cut moves into a medium shot where the actor repeatedly [verb] [surface/object] with [specific tool], the first [board/stroke/fastener] shown coming together in full from contact to placement, tensing their muscles with each physical stroke as the changed area grows from nothing to about three quarters of this beat's target while fine dust or debris settles nearby and the phone camera briefly breathes focus before locking again. A close-up isolates [tool contact and raw material physics], with minor motion blur, imperfect focus falloff, and small blown highlights on [bright material/source], capturing the material deformation as [force] bends timber fibers, showers rust flakes, or sprays fine dust, leaving [visible trace]. An extreme close-up lingers on the high-detail textures and evidence left behind: [trace one] and [trace two] remain visible in IMAGE N+1, with low-light noise or compression in shadow areas and natural scratches, wood grain, or concrete porosity on the [surface] texture. A final clean cut, after the remaining [repetitions] are completed the same way, returns to a wide outro shot, matching the exposure and phone-recorded tone of IMAGE N+1, where [worker/machine/tool] exits through [path], temporary tools leave the frame, and the empty completed state matches IMAGE N+1. Every shot opens at the progress level the previous shot ended with, and progress advances only during visible work. Everything visible in the final wide shot already exists in IMAGE N+1, and everything in IMAGE N+1 has an on-screen or stated origin inside this video — no overshoot and no missing elements. Use [available-light exposure dynamics], [UGC documentary realism with tactile material detail], and [location detail]. Keep the scene free of captions, subtitles, floating labels, UI text, and rendered prompt words. SFX and ambient noise follow the visible action.
+Use IMAGE N as the first-frame anchor and IMAGE N+1 as the last-frame anchor; every shot must preserve the same location, object identity, lighting direction, and physical layout while showing only the single operation of [operation]. Cut this ten-second clip on these marks and hold no other cuts — an establishing long shot from 0.0 to 1.6, a full shot from 1.6 to 3.1, a medium shot from 3.1 to 5.3, a close-up from 5.3 to 6.9, an extreme close-up from 6.9 to 8.3, and a wide outro shot from 8.3 to 10.0 seconds. At zero seconds the establishing long shot opens like casual smartphone footage with [worker/machine] already positioned at [work zone], making the first effective contact with [specific tool/material] immediately under [available lighting]. A clean cut moves to a full shot with handheld phone sway while that same operation continues under visible physical weight, [using a ladder or scaffold if the task is above arm reach,] with a small framing correction that preserves the locked layout. A match cut moves into a medium shot where the actor repeatedly [verb] [surface/object] with [specific tool], the first [board/stroke/fastener] shown coming together in full from contact to placement, tensing their muscles with each physical stroke as the changed area grows from nothing to about three quarters of this beat's target while fine dust or debris settles nearby and the phone camera briefly breathes focus before locking again. A close-up isolates [tool contact and raw material physics], with minor motion blur, imperfect focus falloff, and small blown highlights on [bright material/source], capturing the material deformation as [force] bends timber fibers, showers rust flakes, or sprays fine dust, leaving [visible trace]. An extreme close-up lingers on the high-detail textures and evidence left behind: [trace one] and [trace two] remain visible in IMAGE N+1, with low-light noise or compression in shadow areas and natural scratches, wood grain, or concrete porosity on the [surface] texture. A final clean cut, after the remaining [repetitions] are completed the same way, returns to a wide outro shot matching the exposure and phone-recorded tone of IMAGE N+1, where [worker/machine/tool] continues the visible operation through the final instant as the scene reaches the completed state. No shot shows or describes entrance, arrival, exit, walk-out, or a worker-free tail. Every shot opens at the progress level the previous shot ended with, and progress advances only during visible work. Everything visible in the final wide shot already exists in IMAGE N+1, and everything in IMAGE N+1 has an on-screen or stated origin inside this video — no overshoot and no missing elements. Use [available-light exposure dynamics], [UGC documentary realism with tactile material detail], and [location detail]. Keep the scene free of captions, subtitles, floating labels, UI text, and rendered prompt words. SFX and ambient noise follow the visible action.
 ```
 
 ## Conversational Edit Pattern
@@ -172,11 +180,13 @@ Immediately below the fenced block, append:
 | 累积状态与锚点差异 | 通过 | ...（说明每个锚点继承之前所有永久改动，被遮挡对象以显式保持句留存而非省略，相邻锚点差异仅为当前操作结果） |
 | 进度流动控制 | 通过 | ...（说明单视频形变量在增量预算内，镜头级进度锁生效，cut 不携带进度，首件在镜头内完整发生，压缩仅省略已示范的重复且在文字中点明，状态无回退） |
 | 空间锚定与相对位置锁 | 通过 | ...（说明三个深度带各一个主地标跨全包锁定，远/全/收尾三镜齐现，中近特至少含一个地标；易漂移次要物体已锁到最近主地标） |
+| 外壳体量与开口锁 | 通过 | ...（说明所有室内锚点逐字复述门宽/门高相对量与单一屋顶形态，开口完整匹配 ledger/denylist，至少一个室内主地标是载体固定结构） |
+| 材质基底与状态轨 | 通过 | ...（说明可见主材的 substrate 逐帧逐字一致，状态只在对应施工 beat 单步前进，无灯光形容词污染材质身份） |
 | 相机姿态与手持容差 | 通过 | ...（说明分镜族措辞正确——封闭室内未提地平线/天空；手持自由度未导致地标出框或相对关系改变） |
 | 可数清单与Reveal零新增 | 通过 | ...（说明主要可数元素有明确数量且跨镜头跨锚点一致，数量以英文单词书写，最终 reveal 不含未经安装的新物体） |
 | 物体持久化三态 | 通过 | ...（说明每个物体处于 原位继承／人工移动（含目的地）／人工搬出（含动作）之一；单条视频新增支持物类不超过一个） |
 | 因果痕迹 | 通过 | ...（说明痕迹与当前工序匹配，例如 滚涂→roller stipple） |
-| 工人身份锁与进出通道 | 通过 | ...（说明工人以纯色轮廓描述且跨镜头跨视频一致、不露脸；镜头二进场路径与镜头六退场路径均已命名，镜头一与镜头六无人） |
+| 工人身份锁与零秒开工 | 通过 | ...（说明工人以纯色轮廓描述且跨镜头跨视频一致、不露脸；0 秒已经位于作业面并立即做第一次有效动作，直到末镜持续施工，全程无进退场镜头） |
 | 驻场设施生命周期 | 通过 | ...（说明脚手架/模板/支撑有命名搭设 beat、跨锚点持续存在、有命名拆除 beat 并留痕；未凝固混凝土仍有模板支撑） |
 | 物料与登高合理性 | 通过 | ...（说明大宗材料有进场/堆料，废料有去向，湿作业在下一锚点呈干燥态，登高作业有梯子或脚手架） |
 | 前置创伤描述质量 | 通过 | ...（说明 IMAGE 1 采用 位置+表面材质状态+损伤类型 三段式，未使用 worn/aged/dirty 等软词，损伤跨多个深度带） |

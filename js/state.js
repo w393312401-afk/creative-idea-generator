@@ -34,6 +34,10 @@ const DEFAULT_CONFIG = {
     // 镜头梯表裁镜头。此项**不再允许留空**——"沿用面板当前时长"是个不可知态，会让
     // 提示词里的切点表与实际生成时长对不上。
     videoDuration: '10',
+    // 视频参考模式 = 发起视频前 Flow 面板停在哪个子模式上传参考图：
+    // 'VIDEO_FRAMES'（帧/首尾帧，约束运动起止）| 'VIDEO_REFERENCES'（素材，当风格/主体参考）。
+    // 与 fx_console.py FX_CONFIG_SPEC 的 videoRefMode 同一项，服务端配置优先。
+    videoRefMode: 'VIDEO_FRAMES',
     imageAspectRatio: '9:16',
     imageQuality: '2K',
     // 本地生成期连续性门：只对高置信度几何漂移自动重试/阻断，语义问题仍由整套审查处理。

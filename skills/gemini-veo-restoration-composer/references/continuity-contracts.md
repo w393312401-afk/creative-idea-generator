@@ -48,12 +48,12 @@ This is the skill-local counterpart to the project root's `references/contract-r
 - **Source**: SKILL.md Step 5 Visible Milestone Package Rule, Step 9 Beat Overload Pop Prevention Gate
 - **Enforced by**: `video_to_prompt_pipeline.py::gate_name:Beat Overload Pop Prevention Gate`
 
-### `bidirectional-passage-lock`
+### `direct-at-zero-worker-lock`
 
-出现工人的 VIDEO 必须声明 t=0s 进场、t=7.5s 前离场的双向出入通道。
+出现工人的施工 VIDEO 必须从 t=0s 起已经在作业面立即做有效动作，并持续到片段结束，不安排工人进场或退场。
 
-- **Source**: SKILL.md Step 6 Bi-directional Out-and-In Passage Clause
-- **Enforced by**: `video_to_prompt_pipeline.py::gate_name:Bi-directional Passage Lock`
+- **Source**: SKILL.md Step 6 Direct-at-Zero Worker Clause
+- **Enforced by**: `video_to_prompt_pipeline.py::gate_name:Direct-at-Zero Worker Lock`
 
 ### `clean-frame-boundary`
 

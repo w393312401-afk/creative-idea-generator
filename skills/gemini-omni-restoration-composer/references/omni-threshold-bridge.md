@@ -76,6 +76,31 @@ consecutive construction milestones. At least once per new space, a transition V
 shows an anonymous worker silhouette together with a standard door, rung/tread or known-size
 device; IMAGE anchors remain worker-free.
 
+The first settled IMAGE of every new family is a render stop when rendering is active. Inspect it
+before composing dependent frames. For an interior family, confirm the exterior roof form and
+pitch remain credible, every opening matches the ledger, the denylist is clean, clear width and
+height read correctly in door units, at least one primary landmark is a fixed carrier feature,
+the door frame is fully behind the camera, and the interior remains in untouched trauma state.
+Nothing checks these pixels automatically. Delete a rejected frame and re-render the same slot
+with `--force_regenerate`; a retry is not a new transition or construction beat.
+
+## Crossing delta budget
+
+Grid-area counting does not apply to a threshold because the viewpoint and enclosure legitimately
+replace the whole frame. The crossing is still tightly budgeted:
+
+| Quantity | Allowed delta across the crossing |
+|---|---|
+| viewpoint / enclosure | the whole beat; this is the only transformation the crossing buys |
+| construction progress | zero; no cleaning, clearing, repair, cladding, paint, staging or installation |
+| lighting phase, weather, season | zero; exposure adaptation is not a phase advance |
+| exterior state | zero wherever it remains visible later |
+| camera height and lens family | zero except a declared top-hatch descent that requires the move |
+
+The first settled interior IMAGE must therefore preserve at least three established trauma
+categories and contain no intervention evidence. If the story needs both entry and interior
+progress, allocate the entry first and the clean-out as the next construction beat.
+
 ## Secondary-space traversal — never reset from scratch
 
 The primary act continuously shows its concrete divider. If a door already exists, keep it shut
@@ -105,6 +130,9 @@ finished through the visible connection.
 - second space arrives by hard cut, teleport or `reset from scratch`;
 - fixed lights glow before power/wiring/fixture installation;
 - one centered camera family repeats for more than three construction milestones.
+- a crossing also advances construction, lighting phase, weather, exterior state, or undeclared camera height/lens;
+- the first settled interior family is composed onward without its render-stop inspection when rendering is active;
+- both interior primary anchors are movable, or an interior IMAGE omits the envelope signature, roof form, or aperture constraints.
 
 Any failure rewrites only the implicated beat and redraws only its target frame. Allow the initial
 render plus two targeted repair attempts. If still failing, mark `needs_human_review` and stop all

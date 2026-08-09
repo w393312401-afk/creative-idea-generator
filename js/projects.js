@@ -16,9 +16,9 @@
      · 帧/视频/封面这些媒体作业不再被整类过滤掉（旧 MEDIA_TASK_TYPES 的做法让
        失败的帧任务完全不可见），而是挂成项目行下的子作业徽章。
 
-   依赖宿主应用：escapeHtml / showToast / switchMainTab / openSparkProject /
-   viewTask / loadCompletedTask / rerunCompletedTask / retryTask / cancelTask /
-   deleteTask / deleteFromLibrary。
+   依赖宿主应用：escapeHtml / showToast / customConfirm / switchMainTab /
+   openSparkProject / viewTask / loadCompletedTask / rerunCompletedTask /
+   retryTask / cancelTask / deleteTask / deleteFromLibrary。
    见 docs/project_workbench_refactor_plan.md
    ========================================================================== */
 
@@ -98,9 +98,15 @@ async function refreshProjects(options = {}) {
         // assets=0 的轮询回来的行没有资产统计。直接覆盖会让"19 个文件"在两次
         // 轮询之间闪成 0，所以只在这次确实带了资产时才接受新值。
         if (!assets && Array.isArray(projectsRows)) {
-            const prev = new Map(projectsRows.map(p => [p.project_key, p.assets]));
+            const prev = new Map(projectsRows.map(p => [p.project_key, p]));
             (data.projects || []).forEach(p => {
-                if (!p.assets && prev.has(p.project_key)) p.assets = prev.get(p.project_key);
+                const old = prev.get(p.project_key);
+                if (!old) return;
+                if (!p.assets) p.assets = old.assets;
+                // 轻量轮询（assets=0）不会扫描 outputs，因此未收藏项目的磁盘封面
+                // 不会出现在响应里。保留上一次完整刷新拿到的封面，避免每次轮询后
+                // 缩略图从真实图片退化成灯泡占位图。
+                if (!p.cover && old.cover) p.cover = old.cover;
             });
         }
         projectsRows = data.projects || [];
@@ -152,14 +158,32 @@ function projectsFormatDuration(totalSeconds) {
     return `${Math.floor(m / 60)} 小时 ${m % 60} 分`;
 }
 
-function projectsCoverHtml(p) {
-    const url = p.cover;
-    const safe = typeof url === 'string' && (
+function projectsSafeCoverUrl(url) {
+    return typeof url === 'string' && (
         url.startsWith('http://') || url.startsWith('https://') ||
         url.startsWith('data:image/') || url.startsWith('/') || url.startsWith('outputs/'));
-    if (!safe) return '<div class="project-thumb-icon">💡</div>';
-    return `<img src="${escapeHtml(url)}" alt="" loading="lazy"
-                 onerror="this.onerror=null;this.outerHTML='<div class=&quot;project-thumb-icon&quot;>💡</div>';">`;
+}
+
+function projectsHandleCoverError(img) {
+    const fallback = img && img.dataset ? img.dataset.fallback : '';
+    if (fallback && !img.dataset.fallbackTried) {
+        img.dataset.fallbackTried = '1';
+        img.src = fallback;
+        return;
+    }
+    if (img) img.outerHTML = '<div class="project-thumb-icon">💡</div>';
+}
+
+function projectsCoverHtml(p) {
+    const candidates = [p.cover, p.assets && p.assets.cover]
+        .filter(projectsSafeCoverUrl)
+        .filter((url, index, all) => all.indexOf(url) === index);
+    if (!candidates.length) return '<div class="project-thumb-icon">💡</div>';
+    const fallback = candidates[1]
+        ? ` data-fallback="${escapeHtml(candidates[1])}"`
+        : '';
+    return `<img src="${escapeHtml(candidates[0])}"${fallback} alt="" loading="lazy"
+                 onerror="projectsHandleCoverError(this)">`;
 }
 
 function projectsBadgesHtml(p) {
@@ -315,9 +339,36 @@ function projectsModelOptions(selectedModel) {
     }).join('');
 }
 
+// 孤立作业行（kind='job'）没有 task，上面那一整排按钮（打开/跟进/再跑/重试/
+// 删除任务记录）全都不成立，详情栏因此长期只剩一张事实表——用户看得见这行、
+// 却什么都做不了。这里补的是它**能**做的几件事：找回母项目、批量收拾这批作业
+// 记录、以及在画廊里按标题找回它产出的文件。
+function projectsOrphanActionsHtml(p) {
+    const jobs = (p.sub_jobs || []).filter(j => j && j.id);
+    const running = jobs.filter(j => j.status === 'running');
+    const settled = jobs.filter(j => j.status !== 'running');
+    const btns = [
+        '<button type="button" class="projects-btn primary" data-act="find-parent" title="按标题/主题去点子库和任务列表里反查母项目">🔍 找回母项目</button>',
+    ];
+    if (running.length) {
+        btns.push(`<button type="button" class="projects-btn danger" data-act="cancel-all-jobs">✕ 取消全部运行中（${running.length}）</button>`);
+    }
+    // 资产按钮由通用分支给（有 assets.dir 时能精确定位分组）；找不到目录的孤立行
+    // 只能退而求其次，把标题丢进画廊搜索框
+    if (!(p.assets && p.assets.file_count)) {
+        btns.push('<button type="button" class="projects-btn" data-act="gallery-search">🖼️ 在画廊里搜这个标题</button>');
+    }
+    btns.push('<button type="button" class="projects-btn" data-act="copy-title">📋 复制标题</button>');
+    if (settled.length) {
+        btns.push(`<button type="button" class="projects-btn danger" data-act="delete-all-jobs">🗑️ 清空全部作业记录（${settled.length}）</button>`);
+    }
+    return btns.join('');
+}
+
 function projectsDetailActionsHtml(p) {
     const task = p.task || {};
     const btns = [];
+    if (p.kind === 'job') btns.push(projectsOrphanActionsHtml(p));
     if (p.saved || task.status === 'completed') {
         btns.push('<button type="button" class="projects-btn primary" data-act="open">🎬 打开项目</button>');
     }
@@ -349,6 +400,20 @@ function projectsDetailActionsHtml(p) {
         btns.push('<button type="button" class="projects-btn danger" data-act="delete-task">🗑️ 删除任务记录</button>');
     }
     return btns.join('');
+}
+
+function projectsJobActionsHtml(job) {
+    if (!job || !job.id) return '';
+    const jobId = escapeHtml(job.id);
+    const buttons = [];
+    if (job.status === 'running') {
+        buttons.push(`<button type="button" class="projects-job-btn danger"
+            data-act="cancel-job" data-job-id="${jobId}">取消</button>`);
+    } else {
+        buttons.push(`<button type="button" class="projects-job-btn danger"
+            data-act="delete-job" data-job-id="${jobId}">删除记录</button>`);
+    }
+    return `<span class="projects-job-actions">${buttons.join('')}</span>`;
 }
 
 function renderProjectDetail() {
@@ -392,7 +457,10 @@ function renderProjectDetail() {
             <ul class="projects-job-list">
                 ${p.sub_jobs.map(j => `
                 <li class="${escapeHtml(j.status || '')}">
-                    <span>${escapeHtml(PROJECT_JOB_ICONS[j.status] || '·')} ${escapeHtml(PROJECT_JOB_LABELS[j.type] || j.type)}</span>
+                    <span class="projects-job-head">
+                        <span>${escapeHtml(PROJECT_JOB_ICONS[j.status] || '·')} ${escapeHtml(PROJECT_JOB_LABELS[j.type] || j.type)}</span>
+                        ${projectsJobActionsHtml(j)}
+                    </span>
                     <span class="projects-job-id">${escapeHtml(j.id || '')}</span>
                     ${j.error ? `<span class="projects-job-error">${escapeHtml(j.error)}</span>` : ''}
                 </li>`).join('')}
@@ -405,6 +473,8 @@ function renderProjectDetail() {
             <button type="button" class="projects-detail-close" data-act="close-detail" title="收起详情">&times;</button>
         </div>
         ${p.theme ? `<p class="projects-detail-theme">${escapeHtml(p.theme)}</p>` : ''}
+        ${p.kind === 'job' ? `<p class="projects-detail-hint">🧩 孤立作业：母项目的激发任务记录已被清理（任务记录只保留 7 天），
+            这里只剩这批媒体作业本身。下面的动作围绕"找回它/收拾它"，不会碰 outputs/ 里的文件。</p>` : ''}
         <div class="projects-detail-actions">${projectsDetailActionsHtml(p)}</div>
         <dl class="projects-facts">
             ${facts.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(String(v))}</dd>`).join('')}
@@ -414,7 +484,33 @@ function renderProjectDetail() {
 
 /* ── 动作 ──────────────────────────────────────────────────────────────── */
 
-async function projectsRunAction(act, p, event) {
+// 批量作业操作直接打端点，不走 deleteTask/cancelTask：那两个各自带一次
+// customConfirm 和一条 toast，一行 4 个子作业就是 4 次确认 + 4 条提示。
+// 这里确认与提示各只做一次，逐条失败也不打断剩下的。
+async function projectsBulkJobRequest(url, ids) {
+    let ok = 0;
+    for (const id of ids) {
+        try {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_id: id }),
+            });
+            if (res.ok) ok++;
+        } catch (e) {
+            console.error('Bulk job request failed', url, id, e);
+        }
+    }
+    return ok;
+}
+
+function projectsConfirm(message) {
+    return (typeof customConfirm === 'function')
+        ? customConfirm(message)
+        : Promise.resolve(confirm(message));
+}
+
+async function projectsRunAction(act, p, event, jobId) {
     const task = p.task || {};
     switch (act) {
         case 'open':
@@ -448,6 +544,76 @@ async function projectsRunAction(act, p, event) {
             await deleteTask(task.id, event);
             refreshProjects();
             break;
+        case 'cancel-job':
+            if (!jobId) return;
+            await cancelTask(jobId, event);
+            refreshProjects({ assets: false });
+            break;
+        case 'delete-job':
+            if (!jobId) return;
+            await deleteTask(jobId, event);
+            refreshProjects();
+            break;
+        case 'find-parent':
+            // 孤立作业只剩标题/主题可用（母任务记录已被 7 天规则清掉），所以
+            // 不传 projectKey——job:<标题> 不是合法 project_key，传进去只会让
+            // findCompletedTaskForSpark 的主键直查白跑一趟。
+            await openSparkProject({
+                seed: p.theme || '',
+                title: p.title || '',
+                label: p.title || '该作业',
+            });
+            break;
+        case 'cancel-all-jobs': {
+            const ids = (p.sub_jobs || []).filter(j => j.id && j.status === 'running').map(j => j.id);
+            if (!ids.length) return;
+            if (!await projectsConfirm(`确定取消这 ${ids.length} 个运行中的媒体作业吗？`)) return;
+            const ok = await projectsBulkJobRequest('/api/compose-cancel', ids);
+            showToast(ok === ids.length
+                ? `已请求取消 ${ok} 个作业`
+                : `${ids.length} 个作业中 ${ok} 个已请求取消，其余失败`,
+                ok === ids.length ? 'info' : 'error');
+            refreshProjects({ assets: false });
+            break;
+        }
+        case 'delete-all-jobs': {
+            const ids = (p.sub_jobs || []).filter(j => j.id && j.status !== 'running').map(j => j.id);
+            if (!ids.length) return;
+            if (!await projectsConfirm(
+                `确定删除这 ${ids.length} 条作业记录吗？只删记录，outputs/ 里已生成的文件不受影响。`)) return;
+            const ok = await projectsBulkJobRequest('/api/tasks/delete', ids);
+            showToast(ok === ids.length
+                ? `已删除 ${ok} 条作业记录`
+                : `${ids.length} 条记录中删除了 ${ok} 条，其余失败`,
+                ok === ids.length ? 'success' : 'error');
+            refreshProjects();
+            break;
+        }
+        case 'gallery-search': {
+            switchMainTab('gallery');
+            const title = p.title || '';
+            // 画廊是懒加载的，等它把搜索框和分组渲染出来再填词；搜索框自带
+            // 200ms 去抖，所以要派 input 事件而不是直接改 gallerySearch
+            setTimeout(() => {
+                const input = document.getElementById('gallery-search');
+                if (!input) return;
+                input.value = title;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                showToast(`已在画廊里按「${title}」筛选`, 'info');
+            }, 600);
+            break;
+        }
+        case 'copy-title': {
+            const title = p.title || '';
+            try {
+                await navigator.clipboard.writeText(title);
+                showToast('标题已复制', 'success');
+            } catch (e) {
+                console.warn('Clipboard write failed', e);
+                showToast('复制失败，请手动选中标题', 'error');
+            }
+            break;
+        }
         case 'unsave':
             await deleteFromLibrary((p.library || {}).id);
             refreshProjects();
@@ -540,7 +706,7 @@ function initProjects() {
         }
         const p = projectsFindRow(projectsSelectedKey);
         if (!p) return;
-        projectsRunAction(act, p, e);
+        projectsRunAction(act, p, e, btn.dataset.jobId || '');
     });
 }
 

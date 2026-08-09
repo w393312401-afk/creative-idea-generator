@@ -73,10 +73,10 @@ Rung = namedtuple('Rung', 'key variants label phrase weight role')
 _R_ESTABLISHING = Rung(
     'establishing', ('establishing long shot',), '远景 establishing long shot',
     'an establishing long shot', 1.0,
-    '画面等同这一拍的起始 IMAGE，本拍的改动量为零，零工人')
+    '以起始 IMAGE 的环境状态开场，但工人已经在作业面，0 秒立即发生第一次有效工具接触')
 _R_FULL = Rung(
     'full', ('full shot',), '全景 full shot', 'a full shot', 1.0,
-    '工人从明确命名的边缘/路径入画，已带着工具与材料走向作业区，仅做准备，作业区仍等同起始 IMAGE')
+    '延续远景已经开始的施工，以全身尺度展示同一工人与工具、材料的真实受力和连续动作')
 _R_MEDIUM = Rung(
     'medium', ('medium shot',), '中景 medium shot', 'a medium shot', 1.4,
     '主操作推进，第一次动作完整可见，随后重复循环，本拍改动推进到约四分之三，'
@@ -90,7 +90,7 @@ _R_XCLOSE = Rung(
 _R_OUTRO = Rung(
     'outro', ('wide outro shot', 'wide outro'), '结果远景 wide outro shot',
     'a wide outro shot', 1.1,
-    '工人从明确命名的路径出画、临时工具随之离场，画面精确等同这一拍的结果 IMAGE，'
+    '工人继续施工至镜头结束，画面落到这一拍的结果 IMAGE，不安排退场或空镜尾巴，'
     '只有这一镜可以用完成态措辞')
 
 _R_APPROACH = Rung(
@@ -140,11 +140,11 @@ _COUNT_WORDS = {3: 'three', 4: 'four', 5: 'five', 6: 'six'}
 # 兜底稿里每一级镜头的一句话职责（占位稿仍计入 fallback_count 门禁，但至少不违反镜头语法）。
 _FALLBACK_SHOT_FRAGMENT = {
     'establishing': 'an establishing long shot matching the first frame',
-    'full': 'a full shot as the worker enters carrying the tool',
+    'full': 'a full shot with the worker already making effective tool contact',
     'medium': 'a medium shot of the repeated work cycle',
     'close': 'a close-up on the tool contact',
     'xclose': 'an extreme close-up on the traces left behind',
-    'outro': 'a wide outro shot matching the last frame with the worker already gone',
+    'outro': 'a wide outro shot matching the last frame while visible work continues',
     'approach': 'a wide approach shot matching the first frame',
     'threshold': 'a threshold shot at the opening itself as the door frame slides out of view',
     'arrival': 'an interior wide shot settling on the space beyond, matching the last frame',
@@ -909,7 +909,7 @@ Rewrite rules (additive — do not lose content):
 - Immediately after it, place this shot timeline VERBATIM: "{timeline_sentence(duration, ladder)}"
 - Keep every concrete detail already in the draft: the same single worker and costume, the same tool, the same operation, the same persistent traces, the same audio description, the same lighting progression. Redistribute them across the shots instead of inventing new ones.
 - Restructure the body into exactly {len(ladder)} shots IN THIS ORDER, naming each scale in prose: {scales}. Join them with clean cuts or match cuts, and open each shot's sentence by restating its cut mark in English words (for example "A clean cut at the one-and-a-half-second mark ...").
-- The opening shot equals the beat's starting IMAGE with zero workers and zero progress; the worker enters from a named path; the middle shots carry the work and its physics; the closing shot equals the beat's resulting IMAGE with the worker already gone through a named exit path.
+- The worker is already at the active work face in the opening shot and makes the first effective tool contact at 0 seconds; the middle shots carry the work and its physics; the closing shot reaches the beat's resulting state while visible work continues. Never show or describe a worker entrance or exit.
 - The shot timeline is the ONLY place arabic digits may appear. Every other count is written in English words.
 - NEVER write oner, one-shot, one-take, single continuous take, one continuous take, single take, or unbroken take — there is no exemption.
 - Output ONLY the rewritten video prompt body. No headings, no labels, no commentary."""
@@ -943,19 +943,11 @@ Rewrite rules (additive — do not lose content):
 
 def ensure_ladder_out_and_in(video_prompt, ladder, packet=None, beat=None,
                              is_threshold_or_reveal=False):
-    """镜头梯版的 worker out-and-in 兜底（约束前移，取代 base 的时间戳版）。
+    """Compatibility-named Omni fixer for direct work from the first instant.
 
-    base 的 fix_out_and_in 在 omni 下整条被跳过（它会塞进按 8 秒写死的 't=0s ... by
-    t=7.5s' 和 'Grid C1 edge' —— 两者都违反本档的记号禁用与弹性时长）。跳过之后
-    进出这件事就完全没有确定性兜底了，全靠模型自觉：2026-08-02 实测一单 13/16 拍
-    在 base 的 check_out_and_in 上报"缺 worker out-and-in"，全部只留痕不回炉。
-
-    这里按镜头梯自己的语义补：工人在**全景/中景**入画、在**结果远景**出画，用镜头梯
-    自己的措辞（named path，无时间戳、无 Grid 记号），且必须能被 base 的
-    check_out_and_in 认出（它查的是 enter / exits / leaves the frame 这些词）。
-
-    以下情况原样返回：过门拍/兑现拍（契约上就没有工人）、正文已声明画面无人、
-    正文里根本没有工人、进出两侧都已经写全、梯里没有结果远景可挂。"""
+    The worker is already at the active work face at zero seconds. Any old entrance/exit
+    language is removed and the clip uses every shot for the operation through the outro.
+    """
     text = video_prompt or ''
     if is_threshold_or_reveal or not ladder:
         return text
@@ -966,32 +958,27 @@ def ensure_ladder_out_and_in(video_prompt, ladder, packet=None, beat=None,
         return text
     if not any(re.search(rf'\b{w}s?\b', low) for w in ('worker', 'crew', 'person', 'builder', 'laborer')):
         return text
-    # 出画镜是结果远景；梯里没有它（过门/兑现梯）就不该由这里补
-    if not any(rung.key in ('outro',) for rung in ladder):
+    agent = r'(?:the\s+)?(?:same\s+)?(?:one\s+lone\s+)?(?:workers?|crew|persons?|builders?|laborers?)'
+    text = re.sub(
+        rf'(?i)\b(?:in\s+the\s+(?:opening|full|medium)\s+shot|at\s+(?:zero\s+seconds?|the\s+(?:start|beginning)))[,;:]?\s*'
+        rf'{agent}[^.;]*?\b(?:enters?|walks?\s+in|steps?\s+in)(?:[^.;]*[.;])?', '', text)
+    text = re.sub(
+        rf'(?i)(?:,?\s*(?:and|then)?\s*)?{agent}[^.;]*?\b(?:exits?|walks?\s+out|steps?\s+out|leaves?\s+the\s+(?:frame|scene))(?:[^.;]*[.;])?',
+        '', text)
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    low = text.lower()
+    if ('zero seconds' in low or 't=0' in low) and any(
+            p in low for p in ('already at', 'already positioned', 'first effective tool contact')):
         return text
-
-    has_entry = re.search(r'\benters?\b|\bwalks in\b|\bsteps in\b|\benters the frame\b', low) is not None
-    has_exit = re.search(r'\bexits?\b|\bwalks out\b|\bleaves? the frame\b|\bsteps out\b', low) is not None
-    if has_entry and has_exit:
-        return text
-
     costume = pp._worker_costume_from_packet(packet)
-    entry_rung = 'full shot' if any(r.key == 'full' for r in ladder) else 'medium shot'
-    clauses = []
-    if not has_entry:
-        clauses.append(
-            f"In the {entry_rung} the same lone worker{costume} enters the frame along a named "
-            f"approach path already carrying the tool and material for this beat")
-    if not has_exit:
-        clauses.append(
-            "in the wide outro shot that worker exits the frame back along the same named path "
-            "with the tool and the emptied container, leaving the frame completely empty of "
-            "workers before the clip ends")
-    if not clauses:
-        return text
     if text and not text.rstrip().endswith(('.', '!', '?')):
         text = text.rstrip() + '.'
-    return (text.rstrip() + ' ' + ', and '.join(clauses) + '.').strip()
+    clause = (
+        f" At zero seconds the same lone worker{costume} is already positioned at the active "
+        "work face and makes the first effective tool contact immediately; every following shot "
+        "continues that visible operation through the final wide shot."
+    )
+    return (text.rstrip() + clause).strip()
 
 
 def fallback_ladder_clause(ladder):

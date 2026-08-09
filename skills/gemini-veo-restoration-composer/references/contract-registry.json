@@ -73,10 +73,29 @@
       "id": "anchor-frame-compliance",
       "level": "P0",
       "scope": "image",
-      "summary": "首帧锚点渲染后必须复核，不合格不得继续 composing 后续槽位",
+      "summary": "每个 shot family 的首帧渲染后都必须复核，不合格不得继续 composing 后续槽位（Threshold 下即 IMAGE 1 与 IMAGE T+1 各停一次）",
       "source": "SKILL.md#Staged Delivery Contract",
       "enforcer": null,
-      "gap": "2026-08-05 起服务端渲染期不做任何视觉判定（check_anchor_frame_compliance 连同全部生成期一致性审查一并移除）。这条契约现在只由 agent 侧兑现：scripts/render_and_gate_anchor.py 渲出首帧后交给人看，agent 按 SKILL.md 的首帧复核清单口头核对。服务端无程序化执行者，登记于此以免被误当作已执行。"
+      "gap": "2026-08-05 起服务端渲染期不做任何视觉判定（check_anchor_frame_compliance 连同全部生成期一致性审查一并移除）。这条契约现在只由 agent 侧兑现：scripts/render_and_gate_anchor.py 渲出该帧后交给人看，agent 按 SKILL.md 的对应复核清单口头核对。2026-08-08 起触发条件从「序号 == 1」改为「该帧引入新 shot family」——IMAGE T+1 是室内三个主锚的诞生帧、是后面所有室内帧的祖先，此前它没有任何门。服务端无程序化执行者，登记于此以免被误当作已执行。"
+    },
+    {
+      "id": "shell-envelope-consistency",
+      "level": "P0",
+      "scope": "image",
+      "summary": "体量锁：过门后每一帧 interior IMAGE 都必须原样重贴 envelope_signature，且不得长出 aperture_denylist / 默认禁项（天窗、拱顶、穹顶、后墙拱窗）中的洞口",
+      "source": "SKILL.md#Step 6 Geometry Lock",
+      "enforcer": "prompt_pipeline:check_shell_envelope_consistency",
+      "note": "2026-08-08 新增。geometry_lock 此前是孤儿字段：packet 里写了，没有任何一处读它，室内帧的净宽/净高/屋面形式/洞口数量因此每帧由图像模型自由发挥。默认禁项无条件生效（packet 什么都没声明也跑）；aperture_ledger 登记过的洞口是真实存在的，不会被默认禁项误伤；envelope_signature 缺省时重贴检查静默跳过，老 packet 向后兼容。"
+    },
+    {
+      "id": "material-palette-lock",
+      "level": "P0",
+      "scope": "image",
+      "summary": "材质调色板锁：3-5 种主材各钉死一句不可变的 substrate 描述（基色/纹理/表面），每帧原样复制；state（脏态→修复态）单独一条轨道，只能单调前进一步，且只在真正施工于该材质的那一拍推进",
+      "source": "SKILL.md#Step 6 Material Palette Lock",
+      "enforcer": null,
+      "gap": "2026-08-08 新增，服务端无执行者。此前 IMAGE 模板只有一个 [material realism] 占位槽，每帧各写各的形容词——文本条件生成里换个形容词就是换个东西，同一面石墙因此一帧青苔绿一帧干黄，而所有几何门（primary-landmark-restatement / anchor-scale-lock / shell-envelope-consistency）全都放行：它们比对的是名称、画高比和净宽，不看材质词。这条与 shell-envelope-consistency 是互补的两半——后者管体量，这条管材质，独立失效。substrate/state 的拆分是关键：修复延时里材质状态本来就该变，不拆开就只能在'锁死'和'放任'之间二选一。目前只能由 agent 侧在 Step 9 逐帧核对；若日后实现服务端检查，落点是 prompt_pipeline 的 IMAGE 校验链，substrate 做逐字子串比对，state 做序号单调性比对。",
+      "note": "适用于两个 shot family。外景帧漂移方式完全相同，只是有天空和地平线替它兜住连续性，不容易被看出来。"
     },
     {
       "id": "camera-contradiction",
@@ -163,9 +182,10 @@
       "id": "interior-door-clearance",
       "level": "P1",
       "scope": "image",
-      "summary": "室内首帧的门洞净空必须留够，避免入口被家具/材料堵死",
+      "summary": "门框出画：过门后的 interior IMAGE 必须有一句正面声明入口/门框/门槛完全在镜头背后、已出画，其余提到入口的句子也必须这么写；沉默不算通过",
       "source": "references/threshold-bridge-consistency-protocol.md",
-      "enforcer": "prompt_pipeline:check_interior_door_clearance"
+      "enforcer": "prompt_pipeline:check_interior_door_clearance",
+      "note": "2026-08-08 更正摘要。此前这里写的是「室内首帧的门洞净空必须留够，避免入口被家具/材料堵死」——那是另一条规则，和 enforcer 实际做的事几乎相反：代码要的是门框**完全消失在画外**，不是给门洞留出通行净空。'clearance' 一词在 TBCP §5 里指出画，不指净空。这条错摘要的实际后果是：读注册表的人会判定 TBCP §5「门框必须完全出画」无人执行，进而想再登记一条 enforcer 为 null 的重复契约，把一条**已被程序化阻断**的规则记成真空。validate_contracts.py 一类的校验只验 enforcer 指针能否解析到真实符号，不验摘要和代码是不是同一条规则，因此这种漂移不会报红——只能靠人读。范围以代码为准：family == 'interior' 时生效，但 adaptive 过门的 threshold_partial 阶段豁免（那一阶段刻意保留门沿作方位证据），只有 interior_establish / secondary_establish 及其后的普通室内帧强制。它检查的是提示词文本，看不到渲染出来的像素——像素侧的门框残留只能由 agent 自己看（TBCP §5 的 agent-side check）。"
     },
     {
       "id": "colon-label-style",
@@ -188,7 +208,7 @@
       "id": "staged-anchor-render-gate",
       "level": "P0",
       "scope": "pipeline",
-      "summary": "分阶段交付：先只出 IMAGE 1 并过渲染验收门，通过后才允许写其余槽位",
+      "summary": "分阶段交付：每个 shot family 的首帧都要先单独渲出并过验收门，通过后才允许写该族其余槽位（Threshold 下停两次：IMAGE 1 与 IMAGE T+1）",
       "source": "SKILL.md#Staged Delivery Contract",
       "enforcer": null,
       "gap": "该契约约束的是 agent 侧的交付节奏（scripts/render_and_gate_anchor.py），本服务端合成链路不经过它——服务端是一次性合成全部槽位后逐帧渲染。2026-08-05 起服务端连首帧合规判定也不再跑（见 anchor-frame-compliance 的 gap），这条契约整条都只在 agent 侧成立。登记于此以免被误当作已执行。"
@@ -197,10 +217,34 @@
       "id": "used-topic-ledger-dedup",
       "level": "P0",
       "scope": "pipeline",
-      "summary": "历史选题台账去重：已用过的 Topic DNA 不得再次产出",
+      "summary": "历史选题台账去重：已用过的 Topic DNA 与 twist 根不得再次产出",
       "source": "references/idea-engine.md",
-      "enforcer": null,
-      "gap": "去重目前完全交给 LLM：台账原文塞进 run_ideate 的 system prompt，没有任何产出侧的程序化查重。managed creative ledger 读失败会硬失败（保护去重记忆不丢），但「模型是否真的避开了台账里的 DNA」无人校验。补一个产出侧 DNA 比对是独立的后续工作。"
+      "enforcer": "prompt_pipeline:ideation_twist_root_violations",
+      "gap": "DNA 全串比对由 run_ideate 内的 _dedupe_generated_ideas 承担（非模块级函数，故此处登记 twist 根这一层）。仍未程序化的只剩「一步之遥的近似 DNA」——语义近似判定继续交给 prompt 与台账原文。"
+    },
+    {
+      "id": "shelter-only-destiny",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "SHELTER-ONLY：归宿必须是能住人的私人庇护所，商业/公共/工作室类一律否决",
+      "source": "references/idea-engine.md#Axis 4",
+      "enforcer": "prompt_pipeline:ideation_shelter_violations"
+    },
+    {
+      "id": "salvage-and-rebuild",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "旧物再生（DIY 内核）：每条选题必须申报一件被拆下来、回到室内变成别的东西的原生旧构件，并在节拍清单里真的做这道工序",
+      "source": "references/idea-engine.md#Axis 4",
+      "enforcer": "prompt_pipeline:ideation_salvage_violations"
+    },
+    {
+      "id": "carrier-family-quota",
+      "level": "P1",
+      "scope": "pipeline",
+      "summary": "载体家族配额：一批里天然原位壳体（岩洞/化石/冰洞/活体树干）不超过三分之一",
+      "source": "references/idea-engine.md#2.3b",
+      "enforcer": "prompt_pipeline:ideation_family_quota_violations"
     }
   ]
 }

@@ -261,11 +261,16 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         self.assertTrue(errs)
 
     def test_out_and_in_no_double_entry_and_clean_grammar(self):
-        from prompt_pipeline import fix_out_and_in
-        # 实测单视频3形状：body 已有 enters/exits，旧检测词组太窄又贴了第二份进出模板
+        from prompt_pipeline import fix_out_and_in, check_out_and_in
+        # 旧断点里的进出场措辞会被清掉，并改成 0 秒已经在工位直接开工。
         body = ("A worker in a yellow vest enters, builds a timber frame, and exits. "
                 "Nails and conduits remain.")
-        self.assertEqual(fix_out_and_in(body, False, beat=None, packet=None), body)
+        migrated = fix_out_and_in(body, False, beat=None, packet=None)
+        self.assertNotRegex(migrated.lower(), r'\b(?:enters?|exits?|walks out|leaves the frame)\b')
+        self.assertIn('At t=0s', migrated)
+        self.assertIn('already positioned at the active work face', migrated)
+        self.assertIn('first effective tool contact immediately', migrated)
+        self.assertEqual(check_out_and_in(migrated), [])
         # 被动语态的拍描述不能拼进 'cycles of'（实测单曾产出破碎语法+双逗号）
         beat = {'operation': 'framing', 'description':
                 'An independent internal timber framing structure and floor platform are erected inside the cavity.'}
@@ -278,6 +283,17 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         self.assertNotIn('are erected', out.split('cycles of')[-1])
         # 服装截断落在词边界，不再出现 "solid dark enters"
         self.assertNotIn('solid dark enters', out)
+
+    def test_worker_boundary_choreography_is_rejected(self):
+        from prompt_pipeline import check_out_and_in
+        old = ('At t=0s, one lone worker enters the frame, hammers the wall, and exits '
+               'before the final frame.')
+        self.assertTrue(any('entrance or exit' in e for e in check_out_and_in(old)))
+        direct = ('At t=0s, one lone worker is already positioned at the active work face and '
+                  'makes the first effective tool contact immediately, continuing through the final frame.')
+        self.assertEqual(check_out_and_in(direct), [])
+        material_flow = direct + ' Rubble exits through a rigid chute into a skip outside.'
+        self.assertEqual(check_out_and_in(material_flow), [])
 
     def test_out_and_in_injects_locked_worker_scale(self):
         from prompt_pipeline import fix_out_and_in

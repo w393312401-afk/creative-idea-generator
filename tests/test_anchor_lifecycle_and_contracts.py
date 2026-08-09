@@ -261,6 +261,17 @@ class TestDraftPlanIsNeverTruncated(unittest.TestCase):
         self.assertIn('1. 清空舱内碎屑\n', block)
         self.assertNotIn('[None]', block)
 
+    def test_rich_fact_source_reaches_the_planner_verbatim(self):
+        entry = {'op': 'flooring', 'text': '铺好毛毡与松木地板',
+                 'en': 'grey wool felt underlay laid edge to edge, oiled pine planks nailed over it',
+                 'mat': ['wool felt underlay', 'oiled pine planks']}
+        plan, block = pp.build_outline_plan_block([entry], 1)
+        self.assertEqual(plan[0]['en'], entry['en'])
+        self.assertEqual(plan[0]['mat'], entry['mat'])
+        self.assertIn(f'EN: {entry["en"]}', block)
+        self.assertIn('MATERIALS: wool felt underlay, oiled pine planks', block)
+        self.assertIn('copy that EN wording verbatim', block)
+
 
 class TestMergeWidthGate(unittest.TestCase):
     """覆盖率 100% 不等于"卡片上那条工序看得见"：三条草案压进一拍照样是满分
@@ -588,6 +599,18 @@ class TestOutlineBindingIsFaithful(unittest.TestCase):
             self.assertTrue(any('no usable English content words' in v for v in violations),
                             f'{bad!r} 应该被判为不可用的复述')
 
+    def test_rich_entry_material_names_may_not_be_replaced(self):
+        outline = [
+            {'op': 'flooring', 'text': '铺好毛毡与松木地板',
+             'en': 'grey wool felt underlay laid edge to edge, oiled pine planks nailed over it',
+             'mat': ['wool felt underlay', 'oiled pine planks']},
+        ]
+        ladder = self._ladder(('flooring', [1],
+                               ['install moisture membrane beneath hardwood boards']))
+        violations = pp.outline_binding_violations(outline, ladder)
+        self.assertTrue(any('FIDELITY' in v and 'wool felt underlay' in v
+                            and 'oiled pine planks' in v for v in violations))
+
     def test_mismatched_lengths_do_not_pair_a_restatement_with_the_wrong_entry(self):
         """outline_delivery 少一项时，剩下的必须按位对齐、缺的那条判缺失——
         错位地把第 3 条的复述配给第 2 条，等于把内容校验指向错误的工序。"""
@@ -698,14 +721,186 @@ class TestOutlineReachesThePromptComposer(unittest.TestCase):
                  'with shovel marks fanning across the stone.')
         self.assertEqual(pp.check_outline_delivery_realized(image, ladder[0]), [])
 
-    def test_crossing_beats_are_skipped(self):
-        """过门/桥接/硬切拍按契约本就不认领实物交付。"""
-        beat = {'operation': 'threshold', 'bridge_stage': 1,
-                'outline_items': [{'index': 1, 'text': '过门', 'delivery': 'push through the door'}]}
+    def test_rich_card_fact_source_outranks_planner_restatement(self):
+        outline = [
+            {'op': 'flooring', 'text': '铺好毛毡与松木地板',
+             'en': 'grey wool felt underlay laid edge to edge, oiled pine planks nailed over it',
+             'mat': ['wool felt underlay', 'oiled pine planks']},
+        ]
+        ladder = [{'index': 1, 'operation': 'flooring', 'milestone_name': 'replacement floor',
+                   'outline_refs': [1],
+                   'outline_delivery': ['install moisture membrane beneath hardwood boards']}]
+        pp.bind_outline_to_ladder({}, outline, ladder)
+        errors = pp.check_outline_delivery_realized(
+            'The moisture membrane and hardwood boards cover the whole floor.', ladder[0])
+        self.assertEqual(len(errors), 1)
+        self.assertIn('铺好毛毡与松木地板', errors[0])
+
+    def test_rich_fields_are_bound_without_changing_mixed_outline_indices(self):
+        outline = [
+            '清空碎屑',
+            {'op': 'repair', 'text': '焊补钢板'},
+            {'op': 'flooring', 'text': '铺好毛毡与松木地板',
+             'en': 'grey wool felt underlay laid edge to edge, oiled pine planks nailed over it',
+             'mat': ['wool felt underlay', 'oiled pine planks'],
+             'zone': 'floor', 'scope': 'large', 'trace': 'pine seams'},
+        ]
+        ladder = [
+            {'operation': 'clearing', 'outline_refs': [1], 'outline_delivery': ['clear debris']},
+            {'operation': 'repair', 'outline_refs': [2], 'outline_delivery': ['weld steel plate']},
+            {'operation': 'flooring', 'outline_refs': [3],
+             'outline_delivery': [outline[2]['en']]},
+        ]
+        pp.bind_outline_to_ladder({}, outline, ladder)
+        self.assertEqual([b['outline_items'][0]['index'] for b in ladder], [1, 2, 3])
+        self.assertEqual(ladder[2]['outline_items'][0]['card_en'], outline[2]['en'])
+        self.assertEqual(ladder[2]['outline_items'][0]['mat'], outline[2]['mat'])
+        self.assertEqual(ladder[2]['outline_items'][0]['zone'], 'floor')
+        self.assertEqual(ladder[2]['outline_items'][0]['scope'], 'large')
+        self.assertEqual(ladder[2]['outline_items'][0]['trace'], 'pine seams')
+
+    def test_item_less_crossing_beats_are_skipped(self):
+        """老形态的纯过渡拍（一条工序都没认领）仍然豁免。"""
+        beat = {'operation': 'threshold', 'bridge_stage': 1, 'outline_items': []}
         self.assertEqual(pp.check_outline_delivery_realized('nothing relevant here', beat), [])
+        self.assertTrue(pp.outline_delivery_exempt(beat))
+
+    def test_a_crossing_beat_that_claims_an_entry_is_still_checked(self):
+        """一比一契约下过门拍自己也在交付一条真实工序（它的视频以穿越开场、紧接着
+        做那件活），豁免掉它等于让整张卡上唯一一条工序没人查正文。"""
+        beat = {'operation': 'threshold', 'bridge_stage': 1,
+                'outline_items': [{'index': 1, 'text': '推开舱门铺入口踏板',
+                                   'card_en': 'oak entry treads bolted across the hatch sill',
+                                   'mat': ['oak entry treads'],
+                                   'delivery': 'oak entry treads bolted across the hatch sill'}]}
+        self.assertFalse(pp.outline_delivery_exempt(beat))
+        errors = pp.check_outline_delivery_realized(
+            'The camera pushes through the open hatch into the bare cabin.', beat)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('推开舱门铺入口踏板', errors[0])
+        self.assertEqual(pp.check_outline_delivery_realized(
+            'Oak entry treads are bolted across the hatch sill.', beat), [])
+
+    def test_every_declared_material_must_land_not_just_one(self):
+        """卡片承诺两层材料，成片只画一层不算交付——每个 mat 独立判定。"""
+        beat = {'operation': 'flooring',
+                'outline_items': [{'index': 1, 'text': '铺好毛毡与松木地板',
+                                   'card_en': 'grey wool felt underlay laid edge to edge, '
+                                              'oiled pine planks nailed over it',
+                                   'mat': ['wool felt underlay', 'oiled pine planks']}]}
+        only_one = 'Oiled pine planks now cover the whole floor.'
+        errors = pp.check_outline_delivery_realized(only_one, beat)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(pp.check_outline_delivery_realized(
+            'A wool felt underlay runs edge to edge with oiled pine planks nailed over it.',
+            beat), [])
 
     def test_a_ladder_without_binding_is_never_flagged(self):
         self.assertEqual(pp.check_outline_delivery_realized('anything', {'operation': 'repair'}), [])
+
+
+class TestCardDeclaredBeatProperties(unittest.TestCase):
+    """卡片自报的 scope / zone / trace 必须落到拍上。
+
+    这三个下游字段（stage_scope / changed_grid_cells / persistent_traces）此前全部由
+    规划器凭空发挥：猜错 scope 直接决定 IMAGE 用不用 "the entire" 措辞，猜错 zone 让
+    相邻拍在完全不同区域反复横跳，漏掉 trace 就是「做完又消失」。"""
+
+    OUTLINE = [
+        {'op': 'clearing', 'text': '清空舱内碎屑',
+         'en': 'loose debris and broken panels shoveled out of the steel cabin floor',
+         'mat': ['broken panels'], 'zone': 'floor', 'scope': 'large'},
+        {'op': 'flooring', 'text': '铺好毛毡与松木地板',
+         'en': 'grey wool felt underlay laid edge to edge, oiled pine planks nailed over it',
+         'mat': ['wool felt underlay', 'oiled pine planks'], 'zone': 'floor', 'scope': 'large',
+         'trace': 'pine plank seams running lengthwise'},
+    ]
+
+    def _ladder(self, **overrides):
+        ladder = [
+            {'index': 1, 'operation': 'clearing', 'milestone_name': 'floor cleared',
+             'stage_scope': 'large', 'changed_grid_cells': ['Grid B2', 'Grid C2'],
+             'persistent_traces': ['shovel scrapes'], 'preserve_state': 'walls untouched',
+             'outline_refs': [1],
+             'outline_delivery': ['broken panels shoveled out of the cabin floor']},
+            {'index': 2, 'operation': 'flooring', 'milestone_name': 'pine floor complete',
+             'stage_scope': 'large', 'changed_grid_cells': ['Grid B2'],
+             'persistent_traces': ['pine plank seams running lengthwise', 'nail heads'],
+             'preserve_state': 'walls untouched', 'outline_refs': [2],
+             'outline_delivery': ['grey wool felt underlay laid edge to edge, oiled pine '
+                                  'planks nailed over it']},
+        ]
+        for pos, patch in overrides.items():
+            ladder[int(pos)].update(patch)
+        return ladder
+
+    def test_a_conforming_ladder_raises_nothing(self):
+        self.assertEqual(pp.outline_binding_violations(self.OUTLINE, self._ladder()), [])
+
+    def test_stage_scope_must_equal_the_card_declared_coverage(self):
+        errors = pp.outline_binding_violations(
+            self.OUTLINE, self._ladder(**{'1': {'stage_scope': 'small'}}))
+        self.assertEqual(len(errors), 1)
+        # 错误文案要同时点名两个值，喂回重排时才自愈得了
+        self.assertIn('scope="large"', errors[0])
+        self.assertIn('stage_scope="small"', errors[0])
+
+    def test_same_zone_beats_must_share_a_grid_cell(self):
+        errors = pp.outline_binding_violations(
+            self.OUTLINE, self._ladder(**{'1': {'changed_grid_cells': ['Grid A1']}}))
+        self.assertEqual(len(errors), 1)
+        self.assertIn('zone "floor"', errors[0])
+
+    def test_the_card_declared_trace_must_land_on_its_own_beat(self):
+        errors = pp.outline_binding_violations(
+            self.OUTLINE, self._ladder(**{'1': {'persistent_traces': ['nail heads']}}))
+        self.assertEqual(len(errors), 1)
+        self.assertIn('pine plank seams running lengthwise', errors[0])
+
+    def test_the_next_beat_must_not_drop_the_trace(self):
+        outline = [dict(self.OUTLINE[0], trace='bare steel floor pan showing shovel scrapes'),
+                   self.OUTLINE[1]]
+        ladder = self._ladder()
+        ladder[0]['persistent_traces'] = ['bare steel floor pan showing shovel scrapes']
+        ladder[1]['preserve_state'] = 'walls untouched'
+        errors = pp.outline_binding_violations(outline, ladder)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('drops the residue', errors[0])
+        # 下一拍把它写进 preserve_state 就算接住了
+        ladder[1]['preserve_state'] = 'the bare steel floor pan stays visible at the edges'
+        self.assertEqual(pp.outline_binding_violations(outline, ladder), [])
+
+    def test_legacy_cards_without_these_fields_are_untouched(self):
+        legacy = [{'op': 'clearing', 'text': '清空舱内碎屑'},
+                  {'op': 'flooring', 'text': '铺好松木地板'}]
+        ladder = self._ladder(**{'0': {'stage_scope': 'small', 'changed_grid_cells': ['Grid A1'],
+                                       'persistent_traces': []},
+                                 '1': {'outline_delivery': ['pine planks nailed down']}})
+        ladder[0]['outline_delivery'] = ['debris shoveled out']
+        self.assertEqual(pp.outline_binding_violations(legacy, ladder), [])
+
+    def test_the_plan_block_hands_the_planner_these_properties(self):
+        _, block = pp.build_outline_plan_block(self.OUTLINE, len(self.OUTLINE))
+        self.assertIn('zone: floor', block)
+        self.assertIn('scope: large', block)
+        self.assertIn('LEAVES: pine plank seams running lengthwise', block)
+        self.assertIn('COVERAGE:', block)
+        self.assertIn('ZONE:', block)
+        self.assertIn('LEAVES:', block)
+
+    def test_a_legacy_plan_block_never_mentions_them(self):
+        """老卡凭空看见一段"把 stage_scope 设成清单里的 scope"只会让规划器编值。"""
+        _, block = pp.build_outline_plan_block(
+            [{'op': 'clearing', 'text': '清空舱内碎屑'}], 1)
+        self.assertNotIn('CARD-DECLARED BEAT PROPERTIES', block)
+
+    def test_the_frame_review_names_the_materials_and_the_trace(self):
+        ladder = self._ladder()
+        pp.bind_outline_to_ladder({}, self.OUTLINE, ladder)
+        block = pp.outline_frame_review_block(ladder[1]['outline_items'])
+        self.assertIn('"oiled pine planks"', block)
+        self.assertIn('in the floor zone', block)
+        self.assertIn('pine plank seams running lengthwise', block)
 
 
 class TestOutlineDeliveryLedger(unittest.TestCase):

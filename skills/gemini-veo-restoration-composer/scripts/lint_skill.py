@@ -40,8 +40,13 @@ for _s in (sys.stdout, sys.stderr):
             pass
 
 # ── the single authority for these numbers is SKILL.md Step 7, which mirrors the runtime
-# constants prompt_pipeline.IMAGE_WORD_LIMIT / BASE_VIDEO_WORD_LIMIT ─────────────────────
+# constants prompt_pipeline.IMAGE_WORD_LIMIT / INTERIOR_IMAGE_WORD_LIMIT /
+# BASE_VIDEO_WORD_LIMIT ──────────────────────────────────────────────────────────────────
 IMAGE_WORD_LIMIT = 180
+# Post-crossing interior frames carry a strictly larger mandatory set (shell-envelope
+# restatement + door clearance) and lose the exterior's sky/horizon items — they run on
+# their own ceiling.  Mirrors prompt_pipeline.image_word_limit_for('interior').
+INTERIOR_IMAGE_WORD_LIMIT = 220
 VIDEO_WORD_LIMIT = 380
 
 # prompt_pipeline.check_nlvtr_violations' literal list
@@ -117,10 +122,16 @@ def check_prompt_slots(root, fnd):
         r = rel(root, path)
         lines = read(path).split("\n")
         cur = None
+        # Mirrors prompt_pipeline.beat_space_family: every frame from the crossing onward is
+        # the interior family and runs on the interior ceiling.  The crossing is whichever
+        # VIDEO slot carries a bridge/cut meta tag; the IMAGE it hands off to is IMAGE T+1.
+        interior = False
         for i, line in enumerate(lines, 1):
             m = SLOT_RE.match(line.strip())
             if m:
                 cur = (m.group(1), int(m.group(2)), m.group(3), i)
+                if m.group(1) == "视频" and (m.group(3) or "") in BRIDGE_TAGS:
+                    interior = True
                 continue
             if not cur or not line.strip():
                 continue
@@ -129,7 +140,10 @@ def check_prompt_slots(root, fnd):
             body = line.strip()
             is_img = kind == "图片"
             slot = f"{'IMAGE' if is_img else 'VIDEO'} {num}"
-            limit = IMAGE_WORD_LIMIT if is_img else VIDEO_WORD_LIMIT
+            if is_img:
+                limit = INTERIOR_IMAGE_WORD_LIMIT if interior else IMAGE_WORD_LIMIT
+            else:
+                limit = VIDEO_WORD_LIMIT
             words = len(body.split())
             if words > limit:
                 fnd.error("word-budget", r,
@@ -265,6 +279,40 @@ def check_retired_tbcp(root, fnd):
                     break
 
 
+# "Scene inherits all landmarks, geometry, and boundary anchors from IMAGE 1" points AT the
+# packet's anchors instead of restating them.  It is a reference, not a restatement, and two P0
+# gates disagree with it: check_primary_landmarks_exact_match compares every landmark NAME as a
+# literal substring, and check_anchor_scale_lock compares every frame-height ratio.  A frame
+# carrying only this sentence fails both.  Across a shot-family boundary it is additionally a
+# dangling pointer — IMAGE 1 has a different camera and a different anchor set, so there is
+# nothing there to inherit.  This phrase reached six template exemplars and both branches of the
+# reverse pipeline's IMAGE builder before anyone noticed; it spreads by being copied, which is
+# exactly what a lint check is for.
+ABSTRACT_INHERITANCE = re.compile(r"inherits all landmarks", re.IGNORECASE)
+# Prose that quotes the phrase in order to ban it, plus an explicit per-line opt-out for the
+# deliberately stripped-down clean_mode builder.
+ABSTRACT_INHERITANCE_ALLOWED = ("does **not**", "does not satisfy", "not a restatement",
+                                "不是重述", "过不了", "lint-allow: abstract-inheritance")
+
+
+def check_abstract_inheritance(root, fnd):
+    """Restating the anchors is the contract; naming IMAGE 1 is not restating them."""
+    for path in walk(root, {".md", ".py"}):
+        r = rel(root, path)
+        if r.endswith("scripts/lint_skill.py"):
+            continue  # this file defines the pattern
+        for i, line in enumerate(read(path).split("\n"), 1):
+            if not ABSTRACT_INHERITANCE.search(line):
+                continue
+            if any(c in line for c in ABSTRACT_INHERITANCE_ALLOWED):
+                continue
+            fnd.error("abstract-inheritance", r,
+                      "points at IMAGE 1's anchors instead of restating them — restate every "
+                      "primary landmark by exact name with its prose bearing and frame-height "
+                      "ratio, or primary-landmark-restatement (P0) and anchor-scale-lock (P0) "
+                      "both fail", i)
+
+
 def check_aspect_consistency(root, fnd):
     """The grid, the anchors, and the renderer must agree on which frame shape they describe."""
     for path in walk(root, {".md"}):
@@ -288,10 +336,12 @@ def check_word_budget_claims(root, fnd):
                 continue
             for m in pat.finditer(line):
                 lo, hi = int(m.group(1)), int(m.group(2))
-                if hi not in (IMAGE_WORD_LIMIT, VIDEO_WORD_LIMIT) and lo >= 90:
+                known = (IMAGE_WORD_LIMIT, INTERIOR_IMAGE_WORD_LIMIT, VIDEO_WORD_LIMIT)
+                if hi not in known and lo >= 90:
                     fnd.warn("word-budget-claim", r,
-                             f"states a word range {lo}-{hi} whose ceiling is neither "
-                             f"{IMAGE_WORD_LIMIT} (IMAGE) nor {VIDEO_WORD_LIMIT} (VIDEO)", i)
+                             f"states a word range {lo}-{hi} whose ceiling is none of "
+                             f"{IMAGE_WORD_LIMIT} (IMAGE) / {INTERIOR_IMAGE_WORD_LIMIT} "
+                             f"(interior IMAGE) / {VIDEO_WORD_LIMIT} (VIDEO)", i)
 
 
 def check_foreign_paths(root, fnd):
@@ -443,6 +493,7 @@ def check_skill_md_refs(root, fnd):
 
 
 CHECKS = (check_prompt_slots, check_reference_templates, check_bridge_tagging, check_retired_tbcp,
+          check_abstract_inheritance,
           check_aspect_consistency, check_word_budget_claims, check_foreign_paths,
           check_dead_links, check_contract_registry, check_ledger_dna, check_scripts,
           check_skill_md_refs)

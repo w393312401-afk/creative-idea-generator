@@ -339,6 +339,17 @@ html[data-theme="dark"] .task-status-badge.completed {
     font-style: italic;
 }
 
+/* 旧物再生申报：改造类的 DIY 内核（哪件原生旧构件被拆下来、回到室内变成了什么）。
+   给它自己的绿色而不是并进 twist 那一行——它和招牌反差是两件事，挑卡时要能一眼
+   分辨「这条有真的拆改工序」还是「只是在打磨天然壳体」。 */
+.ideation-card-salvage {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed rgba(var(--ink-rgb), 0.05);
+    color: #4A6B4A;
+    font-size: 11px;
+}
+
 .ideation-card-trend {
     margin-top: 6px;
     padding-top: 6px;
@@ -452,6 +463,14 @@ html[data-theme="dark"] .task-status-badge.completed {
 
 .beat-outline-modal-list > li:last-child {
     border-bottom: 0;
+}
+
+.beat-outline-entry-meta {
+    margin-top: 2px;
+    color: var(--text-secondary, #6B6256);
+    font-size: 11px;
+    font-weight: 400;
+    opacity: 0.72;
 }
 
 /* 本批联网参考面板(灵感卡片轨道上方,可折叠) */
@@ -1482,11 +1501,17 @@ html[data-theme="dark"] .task-status-badge.completed {
         display: none;
     }
 
-    .prompt-pre {
+    /* 编辑器与只读块在手机上也必须是同一副排版，否则一进编辑态整块文字重排 */
+    .prompt-pre,
+    .prompt-editor {
         padding: 12px;
         font-size: 11.5px;
         line-height: 1.6;
     }
+    .prompt-editor { min-height: 300px; }
+    /* 四个按钮 + 复制在窄屏一行放不下，允许折行 */
+    .prompt-header { flex-wrap: wrap; gap: 8px; }
+    .prompt-header-actions { flex-wrap: wrap; }
 
     .audit-panel {
         padding: 12px;

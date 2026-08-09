@@ -108,7 +108,73 @@ def test_mark_exhausted_sets_credit_zero_and_cooldown():
 
     accounts = {a["user_id"]: a for a in pool.list_accounts()}
     assert accounts["user_a"]["credit"] == 0
+    assert accounts["user_a"]["disabled"] is True
+    assert accounts["user_a"]["disabled_reason"] == "zero_credit"
     assert accounts["user_a"]["cooldown_until"] is not None
+
+
+def test_zero_credit_probe_automatically_disables_account(monkeypatch):
+    pool = ap.AccountPool()
+    pool.add_account("user_zero")
+
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: 0)
+
+    result = pool.refresh_credit("user_zero", force=True)
+
+    assert result["credit"] == 0
+    assert result["disabled"] is True
+    assert result["disabled_reason"] == "zero_credit"
+    assert pool.pick_account() is None
+
+
+def test_positive_probe_reenables_only_zero_credit_auto_disabled_account(monkeypatch):
+    pool = ap.AccountPool()
+    pool.add_account("auto_disabled")
+    pool.add_account("manually_disabled")
+
+    state = ap._read_state()
+    state["auto_disabled"].update({
+        "credit": 0,
+        "disabled": True,
+        "disabled_reason": "zero_credit",
+    })
+    state["manually_disabled"].update({"credit": 0, "disabled": True})
+    ap._write_state(state)
+
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: 100)
+
+    automatic = pool.refresh_credit("auto_disabled", force=True)
+    manual = pool.refresh_credit("manually_disabled", force=True)
+
+    assert automatic["disabled"] is False
+    assert automatic.get("disabled_reason") is None
+    assert manual["disabled"] is True
+
+
+def test_legacy_zero_credit_state_is_disabled_on_read():
+    pool = ap.AccountPool()
+    pool.add_account("legacy_zero")
+    state = ap._read_state()
+    state["legacy_zero"]["credit"] = 0
+    state["legacy_zero"]["disabled"] = False
+    ap._write_state(state)
+
+    account = pool.list_accounts(heal=False)[0]
+    assert account["disabled"] is True
+    assert account["disabled_reason"] == "zero_credit"
+
+
+def test_zero_credit_account_cannot_be_manually_reenabled():
+    pool = ap.AccountPool()
+    pool.add_account("zero")
+    pool.mark_exhausted("zero")
+
+    result = pool.set_disabled("zero", False)
+
+    assert result["disabled"] is True
+    assert result["disabled_reason"] == "zero_credit"
 
 
 def test_pick_account_falls_back_when_stale_leader_turns_out_exhausted(monkeypatch):

@@ -40,6 +40,59 @@
 .prompt-pre::-webkit-scrollbar { width: 8px; height: 8px; }
 .prompt-pre::-webkit-scrollbar-thumb { background: var(--neon-cyan-glow); border-radius: 4px; }
 
+/* 手动编辑提示词集（见 js/prompt_editor.js）：编辑器与只读块必须是同一副排版，
+   否则一进编辑态整块文字会重排，用户会以为内容被改动过。 */
+.prompt-editor {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    margin: 0;
+    padding: 16px;
+    min-height: 420px;
+    resize: vertical;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--text-primary);
+    background: rgba(176, 123, 82, 0.06);
+    border: 1px solid var(--neon-cyan-glow);
+    border-radius: 10px;
+    outline: none;
+}
+.prompt-editor:focus { border-color: var(--neon-cyan); }
+.prompt-editor[disabled] { opacity: 0.6; cursor: progress; }
+
+.prompt-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+/* .text-btn/.icon-btn 都带 display:flex，会盖掉 [hidden] 的 UA display:none；
+   textarea 同理（本文件给它设了 display:block）。这几处的显隐全靠 hidden 属性。 */
+.prompt-header-actions > [hidden],
+.prompt-editor[hidden] {
+    display: none !important;
+}
+.prompt-edit-btn {
+    padding: 5px 10px !important;
+    border-radius: 6px !important;
+    font-size: 11.5px !important;
+    white-space: nowrap;
+}
+.prompt-edit-hint {
+    margin: 10px 0 4px;
+    padding: 10px 12px;
+    font-size: 11.5px;
+    line-height: 1.7;
+    color: var(--text-secondary);
+    background: rgba(255, 170, 0, 0.08);
+    border: 1px solid rgba(255, 170, 0, 0.28);
+    border-radius: 8px;
+}
+.prompt-edit-hint b { color: var(--color-warning); }
+
 .audit-panel {
     padding: 14px 16px;
     font-size: 13px;

@@ -215,15 +215,25 @@ function renderIdeationTrendPanel(cardsContainer) {
 }
 
 // LLM 在激发时一次性产出 idea.beat_outline,数组长度约定为 recommended_beats + 1
-// (末条是最终 reward 揭示)。P1-C 后这个数组的每个元素是 {op, text} 对象,
-// 旧形态（纯字符串）通过此函数自动转成 {op: null, text} 兼容。
+// (末条是最终 reward 揭示)。富字段存在时一并透传；旧形态（纯字符串）仍自动兼容。
 function ideaBeatOutline(idea) {
     if (!Array.isArray(idea && idea.beat_outline)) return [];
     return idea.beat_outline
         .map(s => {
             if (typeof s === 'object' && s !== null) {
                 const text = String(s.text == null ? '' : s.text).trim();
-                return text ? { op: s.op || null, text } : null;
+                const mat = Array.isArray(s.mat)
+                    ? s.mat.map(x => String(x == null ? '' : x).trim()).filter(Boolean)
+                    : [];
+                return text ? {
+                    op: s.op || null,
+                    text,
+                    en: String(s.en == null ? '' : s.en).trim() || null,
+                    mat,
+                    zone: String(s.zone == null ? '' : s.zone).trim() || null,
+                    scope: String(s.scope == null ? '' : s.scope).trim() || null,
+                    trace: String(s.trace == null ? '' : s.trace).trim() || null
+                } : null;
             }
             const text = String(s == null ? '' : s).trim();
             return text ? { op: null, text } : null;
@@ -288,7 +298,20 @@ function openBeatOutlineModal(index) {
             if (i === beats.length - 1) li.className = 'reward';
             const text = typeof entry === 'object' ? entry.text : String(entry);
             const op = typeof entry === 'object' && entry.op ? entry.op : null;
-            li.textContent = op ? `[${op}] ${text}` : text;
+            const main = document.createElement('div');
+            main.textContent = op ? `[${op}] ${text}` : text;
+            li.appendChild(main);
+            const scopeLabels = { large: '整体', default: '常规', small: '局部' };
+            const metaParts = [];
+            if (entry.zone) metaParts.push(entry.zone);
+            if (Array.isArray(entry.mat) && entry.mat.length) metaParts.push(entry.mat.join(', '));
+            if (entry.scope) metaParts.push(scopeLabels[entry.scope] || entry.scope);
+            if (metaParts.length) {
+                const meta = document.createElement('div');
+                meta.className = 'beat-outline-entry-meta';
+                meta.textContent = metaParts.join(' · ');
+                li.appendChild(meta);
+            }
             list.appendChild(li);
         });
     }
@@ -354,6 +377,9 @@ function renderIdeationCards(ideas) {
                 <div>载体: ${idea.carrier} (${idea.env})</div>
                 <div>现状: ${idea.trauma}</div>
                 <div class="ideation-card-twist">招牌反差: ${idea.twist_zh || idea.twist}</div>
+                ${(idea.salvage_zh || idea.salvage_en)
+                    ? `<div class="ideation-card-salvage" title="从这个壳子上拆下来、再回到室内变成别的东西的那一件原生旧构件——改造类的 DIY 内核">♻️ 旧物再生: ${idea.salvage_zh || idea.salvage_en}</div>`
+                    : ''}
                 ${idea.trend_ref ? `<div class="ideation-card-trend">🌐 趋势借鉴: ${idea.trend_ref}</div>` : ''}
             </div>
             <div class="ideation-card-actions">
@@ -456,7 +482,11 @@ function selectIdeationCard(index) {
             trauma: idea.trauma || null,
             destiny: idea.destiny || null,
             twist: idea.twist || null,
-            twist_zh: idea.twist_zh || null
+            twist_zh: idea.twist_zh || null,
+            // 旧物再生申报随种子一起入账：它是这条选题「为什么算改造而不是雕刻」的
+            // 证据，合成侧和后续复盘都要能查到（见 ideation_salvage_violations）
+            salvage: idea.salvage_en || null,
+            salvage_zh: idea.salvage_zh || null
         },
         task_label: idea.title || null,
         // 载入卡片后走页脚主「激发」按钮时也要带上同一份节拍计划和骨架；
@@ -570,7 +600,9 @@ function composeIdeationCard(index) {
                 trauma: idea.trauma || null,
                 destiny: idea.destiny || null,
                 twist: idea.twist || null,
-                twist_zh: idea.twist_zh || null
+                twist_zh: idea.twist_zh || null,
+                salvage: idea.salvage_en || null,
+                salvage_zh: idea.salvage_zh || null
             }
         },
         // 联网参考案例库使用计次：后端只在这条 idea 确实借鉴过参考（trend_ref

@@ -23,6 +23,46 @@ must fit inside it. Register site, primary and secondary nodes plus their visibl
 never invent an unregistered room. Audit state monotonicity per `space_id`, so a raw secondary
 space is not mistaken for the primary space regressing.
 
+### Shell Geometry Lock
+
+The carrier envelope must be drawable, not qualitative. Register all seven fields using relative
+measures against features visible in the frame:
+
+| Field | Required form |
+|---|---|
+| `clear_width` | interior width in door widths |
+| `clear_height` | floor-to-ridge height in door heights |
+| `depth_bays` | depth in countable exterior features such as rafter pairs or bays |
+| `roof_form` | exactly one form at the exterior silhouette's own pitch |
+| `aperture_ledger` | exhaustive list of every opening, including the entry |
+| `aperture_denylist` | explicit absent nouns such as skylight, roof light, vault, dome, rear-wall arched window, second doorway |
+| `wall_material` | the same material family inside and outside |
+
+Never replace the denylist with `no other openings`; name the forms the model is likely to
+invent. Choose one clause from `clear_width` or `clear_height`, under twelve words and without
+numerals, as the `envelope_signature`. Restate that exact phrase, the roof form, and the relevant
+aperture constraints in every post-crossing interior IMAGE. An inheritance reference to IMAGE 1
+does not count across a camera-family boundary.
+
+At least one interior primary landmark must be a fixed structural feature of the carrier — an
+original beam, stone pier, bulkhead, rib frame, porthole row, window band, or roof curve. The
+other may be movable; both may not be movable. This fixed feature gives the envelope signature a
+visible referent after the entrance leaves frame.
+
+### Material Palette Lock
+
+Register the three to five materials that occupy meaningful frame area. Each material has:
+
+- `substrate`: immutable base hue, grain or texture, and finish, copied character-for-character
+  into every IMAGE where the material is visible;
+- `state_track`: ordered trauma-to-restored phrases, advanced by one step only in the beat that
+  physically works that material.
+
+Keep lighting adjectives out of `substrate`; lighting belongs to the phase ladder. A material not
+touched by the current beat carries its previous state phrase verbatim. A skipped, backward, or
+unearned state is a P0 continuity failure. Put these phrases in the existing material-realism
+prose so the lock replaces improvised wording instead of inflating the prompt.
+
 ## Single-Operation Beat Rule
 
 One ordinary VIDEO equals one dominant physical operation.

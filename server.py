@@ -5099,6 +5099,147 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/edit_prompts':
+            # 手动改写整份提示词集（提示词页的「✏️ 手动编辑」/「➕ 添加一拍」）。
+            # 合成出来的提示词不一定条条都对用户的口味，此前唯一的改法是重新激发整单
+            # 或走 fix_frame_issue 让模型改写；这里给出直接、可预期的人工入口。
+            #
+            # 服务端在这条路径上只做三件事，缺一不可：
+            #   1) 校验槽位契约——图片槽位号必须从 1 连续到 N（帧网格、配对门禁、合成
+            #      成片全按"槽位号即契约"推算，缺一格就会让下游每一处都得学会跳过它）；
+            #      视频槽位号必须落在 1..N 内。
+            #   2) 拦住"用手动编辑删拍"——删拍要同时动磁盘文件与 manifest 编号，那是
+            #      /api/delete_slot 的活（它还会写恢复快照）。这里只允许改写与追加。
+            #   3) 把提示词改过、但画面还是按旧提示词渲出来的帧/视频标脏（prompt_dirty），
+            #      否则界面上看不出这一格的图与它下面那段文字已经对不上了。
+            # 提示词块本身仍由前端落进创意库（与 delete_slot / fix_frame_issue 同一套
+            # applyPromptBlockToIdea 回写路径），服务端不重排、不重写用户的原文——
+            # 手动编辑要的就是"我写成什么样，存下来就是什么样"。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                title = body.get('title', '')
+                new_block = body.get('prompt_block') or ''
+                prev_block = body.get('prev_prompt_block') or ''
+
+                images, videos = _parse_prompt_slots(new_block)
+                if not images:
+                    self._send_json({'error': '提示词块里解析不到任何「图片 N:」槽位，拒绝保存'},
+                                    status=400)
+                    return
+                image_count = max(images)
+                missing = [n for n in range(1, image_count + 1) if n not in images]
+                if missing:
+                    self._send_json({'error': '图片槽位号必须从 1 连续编到 N，当前缺少：'
+                                              + '、'.join(f'图片 {n}' for n in missing)},
+                                    status=400)
+                    return
+                stray = sorted(n for n in videos if n < 1 or n > image_count)
+                if stray:
+                    self._send_json({'error': f'视频槽位号必须落在 1–{image_count} 内，越界的有：'
+                                              + '、'.join(f'视频 {n}' for n in stray)},
+                                    status=400)
+                    return
+
+                prev_images, prev_videos = _parse_prompt_slots(prev_block) if prev_block else ({}, {})
+                prev_count = max(prev_images) if prev_images else 0
+                if prev_count and image_count < prev_count:
+                    self._send_json({
+                        'status': 'rejected',
+                        'error': (f'手动编辑不能减少拍数（编辑前 {prev_count} 拍，'
+                                  f'现在 {image_count} 拍）。删拍要连磁盘文件和 manifest 编号'
+                                  '一起处理，请用帧卡片上的「删除」。'),
+                    }, status=409)
+                    return
+
+                def _slot_text(slots, n):
+                    item = slots.get(n) or {}
+                    return (item.get('body', ''), item.get('meta', ''))
+
+                # 提示词真的改过的槽位（正文或 [META] 任一变化）。新追加的拍不算"改过"：
+                # 它压根还没有对应的画面，标脏没有意义。
+                changed_images = sorted(n for n in prev_images
+                                        if n in images and _slot_text(images, n) != _slot_text(prev_images, n))
+                changed_videos = sorted(n for n in prev_videos
+                                        if n in videos and _slot_text(videos, n) != _slot_text(prev_videos, n))
+                added_beats = list(range(prev_count + 1, image_count + 1)) if prev_count else []
+
+                project_dir = _get_project_dir(title)
+                frames_out, videos_out = [], []
+                dirty_frames, dirty_videos = [], []
+                if os.path.isdir(project_dir) and read_manifest(project_dir):
+                    import uuid
+                    claim_id = f"editprompts_{uuid.uuid4().hex}"
+                    holder = claim_frame_run(project_dir, claim_id)
+                    if holder:
+                        self._send_json({'status': 'error',
+                                         'message': '该创意的帧序列正在生成/修复中，请等它结束后再改提示词'},
+                                        status=409)
+                        return
+                    try:
+                        with manifest_lock(project_dir):
+                            mdata = read_manifest(project_dir) or {}
+                            frame_slots = [f.get('sequence') or f.get('slot')
+                                           for f in (mdata.get('frames') or [])]
+                            frame_slots = [s for s in frame_slots if isinstance(s, int)]
+                            disk_max = max(frame_slots) if frame_slots else 0
+                            if disk_max > image_count:
+                                self._send_json({
+                                    'status': 'rejected',
+                                    'error': (f'磁盘上已经有 {disk_max} 张图片，提示词只剩 '
+                                              f'{image_count} 拍。手动编辑不负责删文件，'
+                                              '请先用帧卡片上的「删除」删掉多出来的拍。'),
+                                    'refresh_required': True,
+                                }, status=409)
+                                return
+
+                            stamp = datetime.now().isoformat(timespec='seconds')
+                            for f in (mdata.get('frames') or []):
+                                seq = f.get('sequence') or f.get('slot')
+                                if isinstance(seq, int) and seq in changed_images:
+                                    f['prompt_dirty'] = True
+                                    f['prompt_dirty_at'] = stamp
+                                    dirty_frames.append(seq)
+                            for v in (mdata.get('videos') or []):
+                                slot = v.get('slot')
+                                if isinstance(slot, int) and slot in changed_videos:
+                                    v['prompt_dirty'] = True
+                                    v['prompt_dirty_at'] = stamp
+                                    dirty_videos.append(slot)
+                            if dirty_frames or dirty_videos:
+                                # 成片是按旧提示词渲的那批素材拼的，提示词一改它就不再
+                                # 代表这一单——与 delete_slot 同款处理，去掉合并结果。
+                                mdata.pop('merged_video', None)
+                                write_manifest(project_dir, mdata)
+                            frames_out = mdata.get('frames') or []
+                            videos_out = mdata.get('videos') or []
+                    finally:
+                        release_frame_run(project_dir, claim_id)
+
+                log('INFO', 'FRAMES',
+                    f'手动编辑提示词集：共 {image_count} 拍'
+                    + (f'，新增 {len(added_beats)} 拍' if added_beats else '')
+                    + (f'，改写图片 {changed_images}' if changed_images else '')
+                    + (f'，改写视频 {changed_videos}' if changed_videos else '')
+                    + (f'；已标脏帧 {sorted(dirty_frames)}' if dirty_frames else ''),
+                    title=title)
+                self._send_json({'status': 'ok',
+                                 'prompt_block': new_block,
+                                 # 结构化槽位契约以后端解析为唯一权威（见 prompt_slots_list）
+                                 'prompt_slots': prompt_slots_list(new_block),
+                                 'frames': frames_out,
+                                 'videos': videos_out,
+                                 'image_count': image_count,
+                                 'added_beats': added_beats,
+                                 'changed_images': changed_images,
+                                 'changed_videos': changed_videos,
+                                 'dirty_frames': sorted(dirty_frames),
+                                 'dirty_videos': sorted(dirty_videos)})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/delete_slot':
             # 删除一整拍（帧/视频卡片上的「删除」按钮）：图片 N 与视频 N 的提示词、落盘
             # 文件、manifest 记录一起从当前任务移除，其后所有图片/视频整体前移一位。

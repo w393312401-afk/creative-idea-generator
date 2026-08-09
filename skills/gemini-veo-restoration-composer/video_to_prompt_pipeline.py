@@ -212,7 +212,7 @@ You must follow these spatial and continuity rules:
 4. CHANGE EVENTS: Every detected visual delta must become a change_event with event_id, frame_range, time_range, grid_cells, change_type, before_state, after_state, and evidence_frames. Do not drop brief changes.
 5. OBJECT LEDGER (OSPL): Track static objects and coordinate locations. If an object gets hidden behind a worker in intermediate frames, do NOT delete it; it must retain a "Ghost Clause" marking it as hidden.
 6. VOLUMETRIC MASS (VMFP): Identify loose materials (rubble, concrete debris, sand, etc.). Measure volume flow from 100% capacity to 0% cleared. Look for rigid containers (crates, wheelbarrows, buckets) and specify Rigid Container Encapsulation (RCE).
-7. TRANSIENT AGENTS (HAL): Find workers or machines. Log their entry frame time (t_in) and exit frame time (t_out) relative to Grid margins. Silently trace their silhouette properties for Hero Agent Lock (HAL) silhouettes (helmet, vest, pants colors). Crucially, identify any hand-held manual tools used by the worker (e.g., broom, paint roller, paint brush, shovel, hammer) and specify the precise action loop. Additionally, define at least two concrete, measurable progress markers showing gradual numerical advancement (e.g., swept clean area expanding from 10% to 90%, wood panels completing from 0 to 5 rows), grounded only in what the reviewed frames actually show. If no worker or tool is visible in the reviewed frames for a beat, set that beat's "transient_agents" to an empty list and its "tool_evidence" field to "unobserved" — do NOT invent or speculate a worker, tool, or action loop that isn't visible. Progress markers for an unobserved-tool beat must describe only the material/surface state change itself (e.g. "the exposed area grows steadily along the work edge"), never attribute it to a fabricated tool or actor. Downstream composition renders beats with no transient_agents as a sterile clip (Clean Frame Boundary already requires this for every IMAGE anchor regardless).
+7. TRANSIENT AGENTS (HAL): Find workers or machines and silently trace their silhouette properties for Hero Agent Lock (HAL) silhouettes (helmet, vest, pants colors). Do not model or request worker entry/exit timing or paths. Downstream construction prompts always begin at zero seconds with the observed worker already at the active work face and the first effective action underway. Identify any hand-held manual tools used by the worker (e.g., broom, paint roller, paint brush, shovel, hammer) and specify the precise action loop. Additionally, define at least two concrete, measurable progress markers showing gradual numerical advancement (e.g., swept clean area expanding from 10% to 90%, wood panels completing from 0 to 5 rows), grounded only in what the reviewed frames actually show. If no worker or tool is visible in the reviewed frames for a beat, set that beat's "transient_agents" to an empty list and its "tool_evidence" field to "unobserved" — do NOT invent or speculate a worker, tool, or action loop that isn't visible. Progress markers for an unobserved-tool beat must describe only the material/surface state change itself (e.g. "the exposed area grows steadily along the work edge"), never attribute it to a fabricated tool or actor. Downstream composition renders beats with no transient_agents as a sterile clip (Clean Frame Boundary already requires this for every IMAGE anchor regardless).
 8. BEAT COVERAGE: Each time_sequence beat must cite source_event_ids and source_frame_range. The union of beats must cover all change_events.
 9. TEMPORAL PHYSICS SKELETON: Each beat must include shot_family, beat_type, single_physical_operation, and causal_path. The causal_path must specify material_source, entry_path, tool_contact, movement_path, at least two persistent_traces, and next_frame_inheritance. A beat may contain exactly one physical operation only.
 10. THRESHOLD BRIDGE: Any exterior-to-interior transition must be its own threshold_bridge beat. The preceding exterior anchor must show at least two interior landmarks through the doorway, and the bridge beat must describe coaxial forward motion with no construction work.
@@ -281,7 +281,7 @@ JSON SCHEMA:
       "single_physical_operation": "debris clearing only",
       "causal_path": {
         "material_source": "existing rubble pile on the floor",
-        "entry_path": "worker enters through Grid C1 edge with crates already visible in hand",
+        "entry_path": "rigid crates are already staged beside the Grid C2 rubble pile at zero seconds",
         "tool_contact": "matte-black broom and gloved hands push rubble into crate lips",
         "movement_path": "rubble moves from Grid C2 floor into crates and exits through Grid C1",
         "persistent_traces": ["dust edge around newly exposed slab", "drag scuffs leading toward Grid C1"],
@@ -301,12 +301,6 @@ JSON SCHEMA:
           "count": 1,
           "hal_profile": "solid bright-neon-yellow safety vest, white hardhat, dark blue pants",
           "manual_tool": "solid-black long-handle plastic broom",
-          "trajectory": {
-            "enter_time": "0.0s",
-            "enter_grid": "Grid C1",
-            "exit_time": "7.5s",
-            "exit_grid": "Grid C1"
-          },
           "action_loop": "repeatedly bends down to scoop rubble into crates using the broom",
           "progress_markers": [
             "swept clean floor area ratio increases from 10% to 90%",
@@ -975,7 +969,7 @@ def default_causal_path(seq, state_lower):
         }
     return {
         "material_source": "existing damaged material already present in the scene",
-        "entry_path": "worker enters from the nearest frame edge with a rigid container",
+        "entry_path": "the rigid container is already staged beside the damaged zone at zero seconds",
         "tool_contact": "a matte-black rectangular broom head and gloved hands push material into the container",
         "movement_path": "loose material moves from the damaged zone into the container and out through the entry path",
         "persistent_traces": ["dust edge", "drag scuffs"],
@@ -1246,8 +1240,6 @@ def build_metadata_interactive(cv_data):
         container = input("Rigid container used [heavy plastic crates]: ").strip() or "heavy plastic crates"
         vol_grid = input("Material grid location [Grid C2]: ").strip() or "Grid C2"
         
-        motion = cv_data["activity_segments"][0] if cv_data["activity_segments"] else {"t_in": "0.0s", "t_out": "7.5s"}
-        
         time_sequence.append({
             "beat_index": i,
             "state_name": f"phase {i}",
@@ -1264,12 +1256,6 @@ def build_metadata_interactive(cv_data):
                     "agent_type": "worker",
                     "count": 1,
                     "hal_profile": "solid bright-neon-yellow safety vest, white hardhat, dark blue pants",
-                    "trajectory": {
-                        "enter_time": motion["t_in"],
-                        "enter_grid": "Grid C1",
-                        "exit_time": motion["t_out"],
-                        "exit_grid": "Grid C1"
-                    },
                     "action_loop": "repeatedly bends down to clear material"
                 }
             ],
@@ -1433,7 +1419,13 @@ def compose_scup_prompts(metadata, clean_mode=False):
             
             img_prompt = (
                 f"A professional photo of a {cam['shot_type']} from an {cam['perspective'] or 'eye-level perspective'}. "
-                f"This image inherits all landmarks, geometry, and camera framing from IMAGE 1. "
+                # lint-allow: abstract-inheritance — clean_mode is the deliberately stripped
+                # variant: its own IMAGE 1 above writes no "Locked anchors" sentence, no grid
+                # bearings and no frame-height ratios, so there is no anchor prose for later
+                # frames to restate.  The next line still repeats the landmark NAMES, which is
+                # all this mode ever declared.  Do not "fix" this by pasting the full lock in —
+                # that would make clean_mode strictly more verbose than the normal path.
+                f"This image inherits all landmarks, geometry, and camera framing from IMAGE 1. "  # lint-allow: abstract-inheritance
                 f"The scene is in its {state_term}, completely empty of workers, showing: {naturalize_visual_text(state_desc)}. "
                 f"The landmarks ({landmarks[0]['name']}, {landmarks[1]['name']}) remain in the exact same positions as IMAGE 1. "
                 f"Lighting is {seq['lighting_phase']}. Highly detailed, photorealistic material realism, consistent with IMAGE 1."
@@ -1468,7 +1460,12 @@ def compose_scup_prompts(metadata, clean_mode=False):
             if is_last:
                 img_prompt = (
                     f"Generate an image of a {camera_dna_base}; {spcp_pitch_clause(family)}. "
-                    f"Scene inherits all landmarks, geometry, and boundary anchors from IMAGE 1. "
+                    # 每帧原样重贴主地标（名字 + 方位 + 画高比）。此前这里写的是
+                    # "Scene inherits all landmarks... from IMAGE 1"，那是一句引用而不是重述：
+                    # P0 的 primary-landmark-restatement 逐个比对地标名是否字面出现、
+                    # anchor-scale-lock 逐个比对画高比，两道门都过不了。landmarks_str 上面
+                    # 已经拼好，IMAGE 1 用的就是它。
+                    f"Primary landmarks remain fixed, restated in full: {landmarks_str}. "
                     f"{rpl_str} remains the relative spatial relationship for drift-sensitive details. "
                     f"The scene is the final completed state, completely empty of workers, with {naturalize_visual_text(seq['image_n_plus_1_state'])}. "
                     f"The final anchor keeps visible physical proof of the last action: {trace_phrase}, and {inheritance}. "
@@ -1479,7 +1476,12 @@ def compose_scup_prompts(metadata, clean_mode=False):
             else:
                 img_prompt = (
                     f"Generate an image of a {camera_dna_base}; {spcp_pitch_clause(family)}. "
-                    f"Scene inherits all landmarks, geometry, and boundary anchors from IMAGE 1. "
+                    # 每帧原样重贴主地标（名字 + 方位 + 画高比）。此前这里写的是
+                    # "Scene inherits all landmarks... from IMAGE 1"，那是一句引用而不是重述：
+                    # P0 的 primary-landmark-restatement 逐个比对地标名是否字面出现、
+                    # anchor-scale-lock 逐个比对画高比，两道门都过不了。landmarks_str 上面
+                    # 已经拼好，IMAGE 1 用的就是它。
+                    f"Primary landmarks remain fixed, restated in full: {landmarks_str}. "
                     f"{rpl_str} remains the relative spatial relationship for drift-sensitive details. "
                     f"The scene is the progressive phase {idx+1} state, completely empty of workers, with {naturalize_visual_text(seq['image_n_plus_1_state'])} while {landmarks[1]['name']} remains visible and unchanged. "
                     f"The changed surface keeps visible physical proof from the preceding action: {trace_phrase}, and {inheritance}. "
@@ -1572,7 +1574,7 @@ def compose_scup_prompts(metadata, clean_mode=False):
             if agents:
                 agent = agents[0]
                 action_loop = naturalize_visual_text(agent.get("action_loop", "performs physical construction labor"))
-                agent_desc = f"A worker wearing a {naturalize_visual_text(agent.get('hal_profile', 'safety vest and hardhat'))} enters, uses a {naturalize_visual_text(manual_tool)} to {action_loop}, and exits before the end of the clip."
+                agent_desc = f"At zero seconds, a worker wearing a {naturalize_visual_text(agent.get('hal_profile', 'safety vest and hardhat'))} is already at the work face, uses a {naturalize_visual_text(manual_tool)} to {action_loop} immediately, and continues that visible operation through the final frame without entrance or exit choreography."
             else:
                 agent_desc = "No workers or human agents appear in the video."
                 
@@ -1595,9 +1597,7 @@ def compose_scup_prompts(metadata, clean_mode=False):
                 action_loop = naturalize_visual_text(agent.get("action_loop", "performs physical construction labor"))
                 mtal_clause = f"The worker keeps the same {naturalize_visual_text(manual_tool)} in hand and repeats the same action loop: {action_loop}. "
                 
-                enter_side = grid_to_natural_language(traj.get('enter_grid') or 'Grid C1')
-                exit_side = grid_to_natural_language(traj.get('exit_grid') or 'Grid C1')
-                passage_clause = f"At the first frame, {agent.get('count', 1)} worker enters from {enter_side}; the worker performs the action continuously, then walks out through {exit_side} before the final frame, leaving the last frame empty of active agents. "
+                passage_clause = f"At zero seconds, {agent.get('count', 1)} worker is already positioned at the active work face and makes the first effective tool contact immediately; the worker performs the action continuously through the final frame without entrance or exit choreography. "
                 hal_clause = f"The worker remains a simple solid silhouette of {naturalize_visual_text(agent.get('hal_profile', 'solid yellow safety vest, white hardhat, blue pants'))}, with no readable face, logo, or fabric pattern. "
                 tspa_clause = f"Two visible progress cues must unfold naturally: first, {progress_a}; second, {progress_b}. "
             else:
@@ -1944,27 +1944,35 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
             "details": ["All VIDEO prompts enforce rigid composition anchors and adjacent frame bindings."]
         })
         
-    # Gate 3: Bi-directional Out-and-In Passage Trajectory (P0)
+    # Gate 3: direct worker action from zero seconds, with no entrance/exit choreography (P0)
     gate3_fail = []
     for idx, vid in enumerate(videos):
-        if "bi-directional" not in vid.lower() and "out-and-in" not in vid.lower():
-            gate3_fail.append(f"VIDEO {idx+1} is missing Out-and-In passage trajectory clause")
+        low = vid.lower()
+        if not re.search(r'\bworkers?\b', low):
+            continue
+        direct = ("zero seconds" in low or "t=0" in low) and any(
+            phrase in low for phrase in ("already at", "already positioned", "first effective tool contact"))
+        positive_boundary = any(re.search(pattern, low) for pattern in (
+            r'\bworkers?\s+enters?\b', r'\bworkers?\s+exits?\b',
+            r'\bworkers?\s+walks?\s+out\b', r'\bworkers?\s+leaves?\s+the\s+frame\b'))
+        if not direct or positive_boundary:
+            gate3_fail.append(f"VIDEO {idx+1} must begin with the worker already acting at zero seconds and contain no worker entrance or exit")
             
     if gate3_fail:
         audit_results["score"] -= 20
         audit_results["gates"].append({
-            "name": "Bi-directional Passage Lock",
+            "name": "Direct-at-Zero Worker Lock",
             "status": "FAIL",
             "tier": "P0",
             "details": gate3_fail,
-            "solution": "All video prompts featuring workers must explicitly define entry (t=0s) and exit (t=7.5s) coordinates."
+            "solution": "All video prompts featuring workers must place them at the active work face at zero seconds with immediate effective tool contact and no entrance/exit choreography."
         })
     else:
         audit_results["gates"].append({
-            "name": "Bi-directional Passage Lock",
+            "name": "Direct-at-Zero Worker Lock",
             "status": "PASS",
             "tier": "P0",
-            "details": ["All VIDEO prompts lock workers using double-ended Out-and-In entry/exit bounds."]
+            "details": ["All VIDEO prompts start worker action at zero seconds and reserve no time for entrance or exit."]
         })
         
     # Gate 4: Rigid Container Encapsulation - RCE (P0)
@@ -2111,7 +2119,7 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
         "dual-stage active progress indicators:",
         "worker color and silhouette locking profile:",
         "tool and active movement loop:",
-        "bi-directional out-and-in entry and exit bounds:"
+        "direct-at-zero worker action:"
     ]
     for idx, img in enumerate(images):
         img_lower = img.lower()
@@ -2518,7 +2526,7 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
             "status": "FAIL",
             "tier": "P0",
             "details": gate_wordcount_fail,
-            "solution": "Trim redundant adjectives, filler phrases, and restated boilerplate first — never by deleting required structural elements (Camera DNA, Out-and-In Passage, pacing control phrase, audio clause, Ghost Clause, Mirror Consistency Clause)."
+            "solution": "Trim redundant adjectives, filler phrases, and restated boilerplate first — never by deleting required structural elements (Camera DNA, direct-at-zero worker action, pacing control phrase, audio clause, Ghost Clause, Mirror Consistency Clause)."
         })
     else:
         audit_results["gates"].append({

@@ -46,6 +46,7 @@ STALE_AFTER_SECONDS = _stale_seconds if _stale_seconds > 0 else None
 # 选号排序时"未探测"账号的位置：排在已探测且有额度的账号之后、明确耗尽的之前。
 # 它们会在 pick_account 里被强制真实探测一次，所以不需要乐观值来抢先。
 _UNPROBED_SORT_KEY = -1
+_ZERO_CREDIT_DISABLED_REASON = "zero_credit"
 
 
 class AccountPoolStateError(RuntimeError):
@@ -101,7 +102,26 @@ def _read_state() -> dict:
         info.setdefault("last_generation_error", None)
         info.setdefault("last_generation_error_at", None)
         info.setdefault("consecutive_failures", 0)
+        # A measured zero balance is never usable.  Normalize legacy state on
+        # read as well, so accounts that reached zero before this rule was
+        # introduced are excluded immediately without waiting for a new probe.
+        if info.get("credit") == 0 and not info.get("disabled"):
+            info["disabled"] = True
+            info["disabled_reason"] = _ZERO_CREDIT_DISABLED_REASON
     return data
+
+
+def _sync_zero_credit_disabled(info: dict, credit) -> None:
+    """Keep automatic zero-credit disabling separate from manual disabling."""
+    if credit == 0:
+        if not info.get("disabled"):
+            info["disabled"] = True
+            info["disabled_reason"] = _ZERO_CREDIT_DISABLED_REASON
+    elif credit is not None and info.get("disabled_reason") == _ZERO_CREDIT_DISABLED_REASON:
+        # A later successful probe found usable credit again. Only undo the
+        # automatic disable; a manually disabled account must stay disabled.
+        info["disabled"] = False
+        info.pop("disabled_reason", None)
 
 
 def _write_state(state: dict):
@@ -345,6 +365,11 @@ class AccountPool:
             if user_id not in state:
                 return None
             state[user_id]["disabled"] = bool(disabled)
+            # Explicit user action clears the old automatic marker. A zero-
+            # credit account is immediately disabled again by the invariant.
+            state[user_id].pop("disabled_reason", None)
+            if not disabled:
+                _sync_zero_credit_disabled(state[user_id], state[user_id].get("credit"))
             _write_state(state)
             entry = dict(state[user_id])
         entry["user_id"] = user_id
@@ -631,6 +656,7 @@ class AccountPool:
                 return None
             if credit is not None:
                 state[user_id]["credit"] = credit
+                _sync_zero_credit_disabled(state[user_id], credit)
                 state[user_id]["last_checked_at"] = attempted_at
                 state[user_id]["last_probe_status"] = "ok"
                 state[user_id]["last_probe_error"] = None
@@ -676,6 +702,7 @@ class AccountPool:
                 return
             cooldown_until = (_now() + timedelta(hours=cooldown_hours)).isoformat()
             state[user_id]["credit"] = 0
+            _sync_zero_credit_disabled(state[user_id], 0)
             state[user_id]["cooldown_until"] = cooldown_until
             state[user_id]["cooldown_reason"] = "quota_exhausted"
             state[user_id]["last_generation_error"] = "quota_exhausted"

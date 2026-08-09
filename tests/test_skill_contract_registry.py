@@ -145,8 +145,11 @@ class TestKnownGapsStayVisible:
         assert set(report['unenforced']) == {
             'anchor-frame-compliance',     # 2026-08-05 生成期视觉判定整体移除，只剩 agent 侧口头复核
             'staged-anchor-render-gate',   # agent 侧交付节奏，服务端链路不经过
-            'used-topic-ledger-dedup',     # 去重全交给 LLM，产出侧无程序化查重
+            'material-palette-lock',       # 2026-08-08 登记，执行者待补（见该条 gap 的实现方向）
         }
+        # used-topic-ledger-dedup 已于 2026-08-08 补上执行者
+        # （ideation_twist_root_violations，twist 根级去重），不再是缺口。
+        assert 'used-topic-ledger-dedup' not in report['unenforced']
 
     def test_omni_gaps_are_exactly_the_two_we_accepted(self):
         report = server_common.skill_contract_report('omni')

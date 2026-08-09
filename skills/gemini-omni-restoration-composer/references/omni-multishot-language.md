@@ -21,12 +21,12 @@ anchor), the medium shot (the only shot that carries this beat's progress), and 
 outro shot (it *is* the last-frame anchor).
 
 **Refill order as the clip gets longer**: close-up, then full shot, then extreme close-up.
-The close-up outranks the full shot because worker entry can fold into the medium shot's
-first clause without breaking the clean-frame contract, while causal traces have nowhere
+The close-up outranks the full shot because full-body context can fold into the medium shot's
+first clause, while causal traces have nowhere
 else to live.
 
 **A dropped rung's duties move to its neighbour — they are never dropped with it.** Without
-a full shot, the worker enters from a named path in the medium shot's opening clause.
+a full shot, the worker is already at the work face and begins effective action at zero seconds.
 Without an extreme close-up, the two persistent traces are shown inside the close-up.
 Without either, both land in the medium shot.
 
@@ -92,27 +92,27 @@ shots carry zero progress by contract, the close-up and extreme close-up add non
 wide outro is precisely where a stated same-way compression lands. A clip cannot be
 continuously progressing and obey its own shot-level progress locks at the same time.
 
-## Worker Entry And Exit Across The Cycle
+## Worker Action From Zero Seconds
 
-The pack's Clean Frame rule says IMAGE anchors have no workers. The cut cycle is what makes
-that physically true rather than a discontinuity. Workers enter and exit **inside** the
-video, bound to specific shots:
+The pack's IMAGE anchors remain worker-free render references, but the VIDEO does not spend
+time reconciling that boundary. At the first video instant the worker is already at the work
+face and makes effective tool contact. No shot is allocated to arrival or departure:
 
 | Shot | Worker state |
 |---|---|
-| establishing long | **Zero workers.** The frame equals IMAGE N, which is a clean anchor. |
-| full | The worker enters from a named frame edge or path, already carrying the tool and material, moving toward the work zone. |
+| establishing long | The worker is already positioned at the work zone and makes the first effective tool contact at zero seconds. |
+| full | The same active operation continues with full-body scale, tool, material source, and physical weight visible. |
 | medium | The worker performs repeated work cycles. |
 | close-up | The worker's hands / tool contact only. |
 | extreme close-up | Traces only; the worker may be entirely out of frame. |
-| wide outro | The worker has **exited** through a named edge or path. Temporary tools leave with them. The frame equals IMAGE N+1, clean. |
+| wide outro | The worker continues the visible operation through the end of the shot. No exit or empty tail is staged; the scene reaches the state represented by IMAGE N+1. |
 
-Both the entry path and the exit path must be explicitly named, and they should be
-geometrically plausible together — a worker who entered from the left doorway does not exit
-through a wall.
+Do not name or stage worker entry and exit paths. The worker is already at the active work
+face at the first frame and remains engaged through the last frame. Material and debris paths
+must still be physically plausible and may cross frame boundaries when the operation requires it.
 
-On ladders with no full shot (4s and 6s clips), entry moves into the medium shot's opening
-clause; the establishing shot stays empty regardless, because it is the anchor.
+On ladders with no full shot, full-body context moves into the medium shot; direct work still
+begins in the establishing shot at zero seconds.
 
 Machines follow the same lifecycle. Erected plant does not — see the Persistent Site Plant
 Exception in `omni-restoration-continuity.md`.
@@ -143,23 +143,23 @@ Natural prose pattern:
 
 ### Full Shot — 8s and 10s ladders
 
-Purpose: show the human, tool, or machine path.
+Purpose: show the human, tool, and material already engaged at the active work face.
 
-Progress lock: staging only — the work zone still matches IMAGE N.
+Progress lock: the first effective contact happens at zero seconds and work begins advancing.
 
 Include:
-- worker or machine entering
+- worker or machine already working at zero seconds
 - full-body scale or full object scale
 - tool already visible
 - material source visible
-- clear entry path
+- first effective tool contact
 - physical weight
 - ladder, scaffold, or standing surface if the task is above arm reach
 - small human re-framing correction that preserves anchor landmarks
 
 Natural prose pattern:
 
-`A clean cut moves to a full shot with handheld phone sway as [worker/machine] enters from [edge/path] carrying [tool/material] while leaning slightly into its physical weight, crossing toward [work zone] with a small human re-framing correction that preserves the locked layout.`
+`The opening establishing long shot begins at zero seconds with [worker/machine] already at [work zone], making the first effective contact with [tool/material]; a clean cut moves closer to a full shot while the same operation continues under real physical weight and the locked layout remains stable.`
 
 ### Medium Shot — every ladder
 
@@ -230,16 +230,16 @@ Purpose: return to anchor continuity.
 Progress lock: the remaining repetitions finish through a stated same-way compression at the cut (`after the remaining boards come loose the same way`), landing exactly on IMAGE N+1 — no overshoot, no missing elements. Finished-state wording is allowed only here.
 
 Include:
-- worker or machine exits
-- temporary tools, ladders, and scaffolds removed unless they logically stay for the next beat
+- worker or machine continues the visible operation through the shot end
+- temporary tools, ladders, and scaffolds remain only when supported by the resulting state or the next beat
 - final layout matches IMAGE N+1
 - permanent traces remain, including all changes inherited from earlier beats
-- no active worker in final shot
+- no staged exit or worker-free tail
 - phone-recorded exposure and tone matching the next anchor
 
 Natural prose pattern:
 
-`A final clean cut returns to a wide outro shot, matching the phone-recorded exposure and tone of IMAGE N+1, where [worker/machine] exits through [path], temporary tools leave the frame, and the empty, realistically weathered scene matches IMAGE N+1 while [persistent traces] remain visible.`
+`A final clean cut returns to a wide outro shot, matching the phone-recorded exposure and tone of IMAGE N+1, where [worker/machine] continues the same visible operation through the last instant as the realistically weathered scene reaches IMAGE N+1 and [persistent traces] remain visible.`
 
 ## Progress Across Cuts
 

@@ -2698,9 +2698,12 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         # 一致性审查的留痕同理：这一帧没重渲，结论与它绑定的帧内容指纹都还成立。
         # 不带过来的话指纹会丢，drop_stale_review_verdicts 之后就再也无法判断这条
         # 结论是否过期（等于永久停在"看着像审过"的状态）。
+        # prompt_dirty（提示词被手动改过、画面还没跟上，见 /api/edit_prompts）同理：
+        # 这一帧没重渲，图与新提示词照旧对不上，标记必须留着；真重渲过的帧不带过来，
+        # 那张图就是按新提示词出的。
         if skip_api_call and existing_frame:
             for key in ('review_frames_sha256', 'reviewed_at', 'review_issues',
-                        'continuity_check', 'family_id'):
+                        'continuity_check', 'family_id', 'prompt_dirty', 'prompt_dirty_at'):
                 if existing_frame.get(key) is not None:
                     frame_info[key] = existing_frame[key]
 

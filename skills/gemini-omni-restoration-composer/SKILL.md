@@ -45,7 +45,7 @@ Load only the reference files needed for the request.
 **Always load, every composition run:**
 
 - `references/omni-scene-skeleton.md`: Six-dimensional Omni scene skeleton, UGC phone-capture realism, Location DNA vs. Shot Ladder, anchor stability boundary, frame density.
-- `references/omni-multishot-language.md`: Mandatory far/full/medium/close/extreme-close/wide-outro grammar, pacing declaration, worker entry and exit across the cycle, phrasing variation.
+- `references/omni-multishot-language.md`: Mandatory far/full/medium/close/extreme-close/wide-outro grammar, pacing declaration, direct worker action from zero seconds, phrasing variation.
 - `references/omni-restoration-continuity.md`: Continuity, single-operation beats, construction dependency order and hard vetoes, causal traces, occlusion handling, persistent site plant, worker identity lock.
 - `references/omni-beat-skeleton.md`: Internal planning layer — temporal physics skeleton, visible milestone package rule, spatial anchoring without coordinates, object persistence.
 - `references/omni-damage-vocabulary.md`: Before-state pathology for IMAGE 1; banned soft-focus words.
@@ -208,11 +208,11 @@ After mapping beats, check that every `change_events` entry appears in exactly o
 1. Parse the topic into carrier, environment, trauma state, destiny, reward action, and reference assets.
 2. Build a production beat ladder. Each ordinary beat contains exactly one dominant physical operation **and** produces one full visible milestone — never a token patch. Validate the ladder against the construction dependency order, the hard vetoes, and the delta budget before writing any prompts. Consult `references/omni-worked-ladders.md` if the shape is uncertain.
 3. Convert every beat into a **Temporal Physics Skeleton** (nine fields, `references/omni-beat-skeleton.md`). A beat that cannot fill all nine is underspecified — fix it now, not in prose.
-4. Fix the **Location DNA** (copied verbatim everywhere) and the three primary landmarks, one per depth zone, in relative-position prose.
-5. Draft an internal progress ledger: for each anchor, the cumulative installed items, counts of major countable elements, completion extent, lighting phase, and inherited traces. Audit every prompt against it; never include it in the output.
-6. Create IMAGE anchors for the before state, each progressive state, and the final reward state. IMAGE anchors are clean frames at full-shot scale with no active workers or machinery. IMAGE 1 uses the three-part damage pattern from `references/omni-damage-vocabulary.md`.
+4. Fix the **Location DNA** (copied verbatim everywhere) and the three primary landmarks, one per depth zone, in relative-position prose. Build the shell Geometry Lock before writing prompts: clear width in door widths, clear height in door heights, depth in countable bays, one roof form at the exterior's own pitch, an exhaustive aperture ledger, an explicit aperture denylist, and the same wall-material family inside and out. Choose one numeral-free envelope signature under twelve words.
+5. Register a **Material Palette Lock** for the three to five materials that occupy meaningful frame area. Give each an immutable `substrate` phrase and a monotonic `state_track`; copy the substrate wording verbatim whenever that material is visible and advance its state only in the beat that works it. Then draft the internal progress ledger: for each anchor, the cumulative installed items, counts of major countable elements, completion extent, lighting phase, inherited traces, shell envelope, and current material states. Never include the ledger itself in the output.
+6. Create IMAGE anchors for the before state, each progressive state, and the final reward state. IMAGE anchors are clean frames at full-shot scale with no active workers or machinery. IMAGE 1 uses the three-part damage pattern from `references/omni-damage-vocabulary.md`. Every post-crossing interior IMAGE restates the envelope signature, roof form, aperture constraints, wall material, and at least one fixed structural carrier landmark; every IMAGE restates the visible materials' immutable substrate phrases.
 7. Create VIDEO prompts between adjacent IMAGE anchors. Every VIDEO starts by binding IMAGE N as first frame and IMAGE N+1 as last frame.
-8. Render each VIDEO as a multi-shot sequence in natural prose at this clip length's ladder size, carrying the shot timeline sentence right after the anchor-binding sentence, with the worker entering on the full shot (or the medium shot when the ladder has no full shot) and exiting by the wide outro shot.
+8. Render each VIDEO as a multi-shot sequence in natural prose at this clip length's ladder size, carrying the shot timeline sentence right after the anchor-binding sentence. At zero seconds the worker is already at the active work face and begins the first effective action immediately; keep work visible through the wide outro and never allocate a shot to entering or exiting.
 9. Apply the lighting phase, passive environment, and audio layers from `references/omni-lighting-environment-audio.md`.
 10. Apply the UGC de-AI capture layer to both IMAGE and VIDEO prompts before wording polish.
 11. (Optional, only when the user explicitly requests 对话微调提示词) Add two to three conversational edit prompts for Gemini Omni follow-up refinement.
@@ -330,7 +330,7 @@ Every object is `inherited in place`, `human-moved` (state the movement and dest
 
 ### Clean Frame Boundary
 
-IMAGE prompts must contain zero active workers and zero active machines. Workers, tools, vehicles, and temporary machines appear only inside VIDEO prompts, entering in shot 2 and exiting by shot 6. Parked plant is not an active machine and may remain.
+IMAGE prompts must contain zero active workers and zero active machines. Workers, tools, vehicles, and temporary machines appear only inside VIDEO prompts. In construction VIDEO prompts the worker is already at the work face at zero seconds, acts immediately, and continues through the final shot; no entry or exit shot is used. Parked plant is not an active machine and may remain.
 
 ### Worker Identity Lock
 
@@ -340,13 +340,13 @@ Workers are locked as high-contrast, low-detail silhouettes with solid nameable 
 
 ## Optional Render Loop
 
-This skill composes text. If — and only if — the local creative-idea-generator service is running at `http://127.0.0.1:8085`, three bundled scripts can also gate, archive, and render the pack. **None of this is part of the default flow.** When no service is configured, skip this section entirely and deliver the prompt pack as text; do not mention the scripts, and do not probe for the server on every run.
+This skill composes text. If — and only if — the local creative-idea-generator service is running at `http://127.0.0.1:8085`, three bundled scripts can also gate, archive, and render the pack. **None of this is part of the default text-only flow.** When no service is configured, skip this section entirely and deliver the prompt pack as text; do not mention the scripts, and do not probe for the server on every run.
 
 Use them only when the user explicitly asks to render, preview, gate, or archive (`作图`, `生成图片`, `渲染`, `预览`, `入库`), or when they have told you the service is running.
 
 | Script | Purpose |
 |---|---|
-| `scripts/render_and_gate_anchor.py` | Renders IMAGE 1 and blocks until it is on disk, so it can be looked at before the rest of the pack is composed. |
+| `scripts/render_and_gate_anchor.py` | Renders the first IMAGE of a shot family and blocks until it is on disk, so it can be inspected before dependent frames are composed. |
 | `scripts/save_to_library.py` | Archives the delivered prompt block and audit table to the idea library. |
 | `scripts/generate_frames.py` | Triggers rendering of the remaining frames. |
 
@@ -359,7 +359,9 @@ python3 scripts/render_and_gate_anchor.py \
 
 Exit codes: `0` rendered; `2` server unreachable, fall back to plain text delivery in one pass; `3` server error; `4` missing prompt text; `5` timed out while the server was still working — do not treat as unreachable.
 
-The server runs **no** automatic judgement on the frame (2026-08-05: all generation-time consistency review was removed). Show the user the rendered anchor, say plainly that nothing checked it automatically, and let them decide before you compose the rest. The rendered IMAGE 1 prompt is then authoritative: deliver it verbatim and reconcile the rest of the pack against what actually rendered rather than against the pre-visualised plan.
+The server runs **no** automatic judgement on the frame (2026-08-05: all generation-time consistency review was removed). Show the user the rendered anchor, say plainly that nothing checked it automatically, and let them decide before you compose the rest. The rendered prompt is then authoritative: deliver it verbatim and reconcile dependent prompts against what actually rendered rather than against the pre-visualised plan.
+
+When rendering, stop at the first IMAGE of **every new shot family**, not only IMAGE 1. A single-family run stops once at IMAGE 1. A threshold run stops again at the first settled interior IMAGE; a declared cut to a new family stops at that cut's resulting IMAGE. Pass its real slot number through `--sequence`. Before continuing, inspect roof form and pitch, aperture ledger/denylist, clear width and height in door units, fixed carrier landmark, material substrates, untouched trauma state, and full door-frame clearance. On failure, delete the rejected frame and re-render the same slot with `--force_regenerate`; allow at most three attempts. A retry never creates a new beat or IMAGE number.
 
 `--prompt_file` is preferred over `--prompt`; prompt bodies contain characters that are painful to escape on a command line.
 
@@ -399,7 +401,7 @@ Rules:
 - Do not expose internal acronyms, field names, or structured labels in prompt bodies.
 - No percent symbols, arabic digits for counts, coordinate notation, or colons introducing values inside descriptive sentences.
 - Do not default to visible text rendering.
-- Length targets: IMAGE 120–200 words; VIDEO 300–420 words (45–70 per shot). Trim adjectives and boilerplate before ever trimming a required structural element.
+- Length targets: exterior and single-family IMAGE 140–180 words with a hard ceiling of 180; post-crossing interior IMAGE 170–220 words with a hard ceiling of 220; VIDEO follows the clip-length table in `references/omni-output-templates.md`. Trim adjectives and boilerplate before ever trimming a required structural element.
 
 ---
 
@@ -421,7 +423,7 @@ Rules:
 - The final reveal contains any object never installed or carried in during a prior beat.
 - Any VIDEO lacks adjacent first-frame / last-frame binding.
 - Any IMAGE includes active workers or machinery.
-- Any VIDEO with a worker lacks a named entry path in shot 2 or a named exit path in shot 6, or shows a worker in shot 1 or shot 6.
+- Any construction VIDEO with a worker does not place that worker at the active work face at zero seconds with immediate effective tool contact, or spends any shot on worker entrance, arrival, exit, or walk-out.
 - A worker's silhouette description changes between shots or between videos.
 - Any referenced `<image>`, `<video>`, or `<audio>` is not explicitly used where needed.
 - Any prompt defaults to captions, subtitles, prompt text, labels, or rendered typography without user request.
@@ -431,6 +433,9 @@ Rules:
 - An enclosed interior prompt mentions a horizon, sky, clouds, or weather.
 - A primary landmark leaves frame in shot 1, 2, or 6, or changes its relationship to another landmark between anchors.
 - The lighting phase skips a step, regresses, or advances without an on-camera physical cause.
+- Any interior IMAGE omits the verbatim envelope signature or single roof-form clause, contains an opening absent from the aperture ledger, contains an item on the aperture denylist, or contradicts the exterior roof pitch.
+- Any visible registered material omits or rewords its immutable substrate phrase, advances state in a beat that does not work it, skips a state, or moves backward.
+- (Rendered flow) The first frame of a new shot family is not shown and inspected before dependent frames are composed; the first settled interior frame fails roof, aperture, scale, fixed-feature, material, untouched-trauma, or door-clearance inspection.
 - (Threshold) The topology-adaptive stage order is incomplete; entrance hardware, shaft/landing/turn, shared light/landmark tether or reveal budget fails; a transition slot performs construction work; or a second space arrives by hard cut / `reset from scratch` instead of through the visible divider.
 - (Reverse-engineering mode) Any prompt mentions an element listed in `banned_elements`; any beat-derived claim lacks `evidence_frames`; any `change_events` entry is unbound to a beat; the keyframe collage failed to generate; or fewer frames were reviewed than `analysis_plan` requires.
 

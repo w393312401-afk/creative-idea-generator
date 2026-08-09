@@ -88,10 +88,13 @@ def test_directive_requires_declared_features_to_appear_in_the_image():
     assert '===TRACES===' in directive
 
 
-def test_directive_requires_a_visible_worker_entering_and_exiting():
+def test_directive_requires_worker_action_from_zero_without_boundary_choreography():
     low = _milestone_beat_directive(_beat()).lower()
-    assert 'ghost work' in low
-    assert 'enters at the start' in low and 'exits before the final frame' in low
+    assert 'at t=0' in low
+    assert 'already at the work face' in low
+    assert 'first effective tool contact immediately' in low
+    assert 'no entrance or exit choreography' in low
+    assert 'enters at the start' not in low and 'exits before the final frame' not in low
 
 
 def test_directive_stays_terse():

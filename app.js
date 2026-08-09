@@ -1308,6 +1308,8 @@ function setupEventListeners() {
     document.getElementById('save-idea-btn').addEventListener('click', saveCurrentIdea);
     document.getElementById('export-idea-btn').addEventListener('click', exportIdeaMarkdown);
     document.getElementById('copy-prompt-btn').addEventListener('click', copyPromptToClipboard);
+    // 提示词页的手动编辑（✏️ 手动编辑 / ➕ 添加一拍 / 保存 / 取消），见 js/prompt_editor.js
+    if (typeof initPromptEditor === 'function') initPromptEditor();
     document.getElementById('copy-prompt-btn-all').addEventListener('click', copyPromptToClipboard);
     document.getElementById('copy-tiktok-meta-btn').addEventListener('click', copyTikTokMetaToClipboard);
     document.getElementById('copy-tiktok-meta-cn-btn').addEventListener('click', copyTikTokMetaCnToClipboard);

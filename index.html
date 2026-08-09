@@ -88,9 +88,9 @@
     <link rel="stylesheet" href="css/tokens.css?v=1.3.0">
     <!-- style.css split into ordered contiguous slices (concatenation == original); load order = cascade order -->
     <link rel="stylesheet" href="css/app/base.css?v=1.5.0">
-    <link rel="stylesheet" href="css/app/skill-output.css?v=1.2.2">
+    <link rel="stylesheet" href="css/app/skill-output.css?v=1.3.0">
     <link rel="stylesheet" href="css/app/efficiency.css?v=1.4.0">
-    <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.8.0">
+    <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.8.1">
     <!-- 激发结果页的极简布局（管线条 / 折叠标题 / section 弹层 / 宽屏分栏）。
          必须排在 panels-tabs.css 之后：它要覆盖那里的桌面端 .content-header 与
          移动端 .action-row 规则。见 docs/spark_result_minimal_layout_plan.md -->
@@ -954,15 +954,28 @@
                                 <img id="collage-preview-img" src="" alt="关键帧多宫格拼图" style="width: 100%; border-radius: 6px; border: 1px solid rgba(255,255,255,0.15); object-fit: contain; max-height: 300px; cursor: pointer;">
                             </div>
 
-                            <!-- 原始 Markdown 提示词块（本页唯一内容，直接展开显示） -->
-                            <div class="prompt-box card-dark">
+                            <!-- 原始 Markdown 提示词块（本页唯一内容，直接展开显示）。
+                                 「✏️ 手动编辑」把它换成同尺寸的 textarea，见 js/prompt_editor.js -->
+                            <div class="prompt-box card-dark" id="prompt-box">
                                 <div class="prompt-header">
                                     <span>📋 复制即用提示词集 · 图片 1–N+1 / 视频 1–N</span>
-                                    <button class="action-btn icon-btn mini-btn" id="copy-prompt-btn" title="复制全部提示词">
-                                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                                    </button>
+                                    <span class="prompt-header-actions">
+                                        <button type="button" class="action-btn text-btn prompt-edit-btn" id="edit-prompt-btn" title="手动改写这一单的提示词集：可逐条修改正文，也可在末尾追加新的一拍">✏️ 手动编辑</button>
+                                        <button type="button" class="action-btn text-btn prompt-edit-btn" id="add-beat-btn" title="在末尾追加一拍：自动补上「图片 N+1」与对应的「视频 N」骨架，填好正文再保存" hidden>➕ 添加一拍</button>
+                                        <button type="button" class="action-btn text-btn prompt-edit-btn primary" id="save-prompt-edit-btn" title="校验槽位契约后保存，并把提示词改过的帧标为待重渲" hidden>💾 保存</button>
+                                        <button type="button" class="action-btn text-btn prompt-edit-btn" id="cancel-prompt-edit-btn" title="放弃本次改动" hidden>✖ 取消</button>
+                                        <button class="action-btn icon-btn mini-btn" id="copy-prompt-btn" title="复制全部提示词">
+                                            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                                        </button>
+                                    </span>
                                 </div>
                                 <pre class="prompt-pre" id="idea-prompt-block">在左侧选择维度并点击「激发」，这里会输出经 restoration-prompt-composer skill 合成的完整图片 / 视频提示词集。</pre>
+                                <textarea class="prompt-editor" id="idea-prompt-editor" spellcheck="false" hidden></textarea>
+                                <p class="prompt-edit-hint" id="prompt-edit-hint" hidden>
+                                    「图片 N:」的条数就是帧槽位数，槽位号必须从 1 连续编到 N；「视频 N」对应 IMG N → IMG N+1，槽位号只能落在 1–N 内。
+                                    保存后：改过提示词的帧会标上「提示词已改」徽标（画面还是旧的，需重渲）；新追加的拍会以空槽位出现在帧序列里，等待生成。
+                                    <b>删拍请用帧卡片上的「删除」</b>——那条路径才会同时处理磁盘文件、编号前移与恢复快照。
+                                </p>
                             </div>
                         </div>
 
@@ -1442,13 +1455,20 @@
                     <!-- ① 生成后端 -->
                     <section class="settings-section active" data-section="backend">
                         <h4 class="settings-section-title">生成后端</h4>
-                        <p class="settings-section-desc">帧序列走哪条生成链路，以及 Google FX 侧用哪个模型。</p>
+                        <p class="settings-section-desc">帧序列走哪条生成链路、各条链路用哪个生图模型，以及视频侧的模型与参考模式。</p>
                         <div class="form-group settings-field">
                             <label for="settings-image-backend">帧序列生成方式</label>
                             <select id="settings-image-backend">
                                 <option value="api" selected>🔌 API 接口（LLM 网关）</option>
                                 <option value="google_fx">🤖 Google FX UI 自动化（AdsPower 浏览器）</option>
                             </select>
+                        </div>
+                        <!-- API 路径的生图模型（IMAGE_MODELS）：与帧序列卡片右上角的内嵌选择器
+                             双向同步，选项由 js/config.js 按 IMAGE_MODELS 动态渲染，别在这里写死。 -->
+                        <div class="form-group settings-field" id="api-image-model-group">
+                            <label for="settings-api-image-model">API 生图模型</label>
+                            <select id="settings-api-image-model"></select>
+                            <small class="settings-hint">封面图与帧序列共用；gpt-image-2 走独立的 codex 网关（只认 1024/1536 像素档，比例会归到最接近的一档）。与帧序列卡片右上角的选择器是同一项设置。</small>
                         </div>
                         <div class="form-group settings-field" id="fx-image-model-group" style="display: none;">
                             <label for="settings-fx-image-model">FX 生图模型</label>
@@ -1458,7 +1478,10 @@
                                 <option value="Nano Banana 2 Lite">🍌 Nano Banana 2 Lite</option>
                             </select>
                         </div>
-                        <div class="form-group settings-field" id="fx-video-model-group" style="display: none;">
+                        <!-- 视频三项（模型 / Omni 时长 / 参考模式）不跟着上面的「帧序列生成方式」显隐：
+                             视频生成始终走 AdsPower/google_fx，那个开关只管生图路径。以前它们被一起
+                             藏在 google_fx 分支下，默认的 api 后端下根本看不到自己实际在用的视频设置。 -->
+                        <div class="form-group settings-field" id="fx-video-model-group">
                             <label for="settings-fx-video-model">FX 视频模型</label>
                             <select id="settings-fx-video-model">
                                 <option value="Veo 3.1 - Lite">Veo 3.1 - Lite</option>
@@ -1478,7 +1501,15 @@
                             </select>
                             <small class="settings-hint">仅 Omni Flash 模型面板提供该时长切换；Veo 系列时长固定，切到 Veo 模型时本项自动隐藏且不生效。Omni 提示词按这个时长排镜头切点时间线，短片长会按镜头梯自动裁镜头（远景/中景/结果远景三镜任何长度下都保留）</small>
                         </div>
-                        <p class="settings-inline-note">模型选择已移至使用现场：LLM 模型在激发按钮上方切换，生图模型在帧序列卡片右上角切换，改动即存。<b>提示词链路</b>（Veo 单镜延时 / Omni 多镜头）也在激发按钮上方切换，默认「自动」跟随此处的 FX 视频模型。</p>
+                        <div class="form-group settings-field" id="fx-video-ref-mode-group">
+                            <label for="settings-fx-video-ref-mode">视频参考模式</label>
+                            <select id="settings-fx-video-ref-mode">
+                                <option value="VIDEO_FRAMES" selected>🎞 帧（首尾帧）</option>
+                                <option value="VIDEO_REFERENCES">🧩 素材</option>
+                            </select>
+                            <small class="settings-hint">发起视频前在 Flow 面板切到哪个子模式上传参考图：「帧」用首尾帧约束运动起止，「素材」把参考图当风格/主体素材。与 Google FX 服务管理中心的同名设置是同一项（videoRefMode），改动即同步到服务端。</small>
+                        </div>
+                        <p class="settings-inline-note">LLM 模型在激发按钮上方切换；生图模型在帧序列卡片右上角也能切，与这里的下拉是同一项设置，改动即存。<b>提示词链路</b>（Veo 单镜延时 / Omni 多镜头）也在激发按钮上方切换，默认「自动」跟随此处的 FX 视频模型。</p>
                     </section>
 
                     <!-- ② 生图参数 -->
@@ -1741,7 +1772,7 @@
     <script src="js/progress_model.js?v=1.2.3" defer></script>
     <!-- 槽位状态模型（纯函数）与卡片渲染器：必须排在 api_client / media_renderer /
          app.js 之前——那三处的槽位渲染全部转调这里。见 docs/spark_result_slots_plan.md -->
-    <script src="js/slot_model.js?v=1.2.0" defer></script>
+    <script src="js/slot_model.js?v=1.3.0" defer></script>
     <script src="js/slot_card.js?v=1.3.0" defer></script>
     <script src="js/slot_toolbar.js?v=1.1.0" defer></script>
     <!-- 日志语义规则表（纯函数）：必须排在 api_client 之前——日志面板的概览模式
@@ -1749,9 +1780,10 @@
     <script src="js/log_semantics.js?v=1.0.0" defer></script>
     <script src="js/api_client.js?v=1.9.0" defer></script>
     <script src="js/prompt_pipeline.js?v=1.2.6" defer></script>
+    <script src="js/prompt_editor.js?v=1.0.0" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
-    <script src="js/media_renderer.js?v=1.9.0" defer></script>
-    <script src="app.js?v=1.6.1" defer></script>
+    <script src="js/media_renderer.js?v=1.9.1" defer></script>
+    <script src="app.js?v=1.6.2" defer></script>
     <script src="js/image_studio.js?v=1.0.4" defer></script>
     <script src="js/gallery.js?v=1.1.2" defer></script>
     <script src="js/ledger.js?v=1.3.0" defer></script>

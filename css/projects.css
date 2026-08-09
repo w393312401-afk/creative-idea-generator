@@ -442,6 +442,19 @@
     line-height: 1.5;
 }
 
+/* 孤立作业的处境说明——它没有母项目可打开，得先讲清楚"为什么这行长得不一样" */
+#panel-projects .projects-detail-hint {
+    margin-top: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--border-color);
+    border-left: 2px solid rgba(176, 123, 82, 0.5);
+    border-radius: 6px;
+    background: rgba(var(--ink-rgb), 0.04);
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--text-muted);
+}
+
 #panel-projects .projects-detail-actions {
     display: flex;
     flex-wrap: wrap;
@@ -514,6 +527,40 @@
 }
 
 #panel-projects .projects-job-list li.failed { border-color: rgba(217, 83, 79, 0.3); }
+
+#panel-projects .projects-job-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+#panel-projects .projects-job-actions {
+    display: inline-flex;
+    gap: 4px;
+    flex: 0 0 auto;
+}
+
+#panel-projects .projects-job-btn {
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    padding: 2px 7px;
+    font: inherit;
+    font-size: 10px;
+    cursor: pointer;
+}
+
+#panel-projects .projects-job-btn:hover {
+    background: var(--bg-card-hover);
+    color: var(--text-primary);
+}
+
+#panel-projects .projects-job-btn.danger {
+    color: #c0453f;
+    border-color: rgba(217, 83, 79, 0.3);
+}
 
 #panel-projects .projects-job-id {
     font-family: var(--font-mono, monospace);

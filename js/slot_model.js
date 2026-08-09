@@ -98,6 +98,15 @@ const FRAME_BADGE_DEFS = [
         hover: f => ` (宽松档放行: ${f.vlm_qa_reason})`,
     },
     {
+        // 提示词被手动改过、画面还没跟上（后端 /api/edit_prompts 标的 prompt_dirty）。
+        // 不复用 Stale：那说的是"父帧换了、i2i 血统断了"，这说的是"这一格的图和它
+        // 下面那段文字已经对不上"，两件事的修法也不同（这里只要按新提示词重渲本帧）。
+        id: 'prompt-dirty', text: '提示词已改', cls: 'stale-badge',
+        test: f => !!(f && f.prompt_dirty),
+        tip: () => '这一拍的提示词已被手动改写，画面仍是按旧提示词渲的，建议重新生成本帧',
+        hover: () => ' (提示词已手动改写，画面尚未按新提示词重渲)',
+    },
+    {
         id: 'stale', text: 'Stale', cls: 'stale-badge',
         test: slotIsStale,
         tip: () => '此帧派生自已被替换的旧帧，建议重新生成',
@@ -116,6 +125,12 @@ const FRAME_BADGE_DEFS = [
 ];
 
 const VIDEO_BADGE_DEFS = [
+    {
+        id: 'prompt-dirty', text: '提示词已改', cls: 'stale-badge',
+        test: v => !!(v && v.prompt_dirty),
+        tip: () => '这一段的视频提示词已被手动改写，片段仍是按旧提示词生成的，建议重跑',
+        hover: () => ' (提示词已手动改写，片段尚未按新提示词重跑)',
+    },
     {
         id: 'manual-upload', text: '手动', cls: 'degraded-badge',
         test: v => v.source === 'manual_upload',

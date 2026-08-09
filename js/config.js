@@ -396,12 +396,37 @@ function syncFramesImageModelPicker() {
                 if (fxSel) fxSel.value = config.googleFxImageModel;
             } else {
                 config.imageModel = sel.value;
+                const apiSel = document.getElementById('settings-api-image-model');
+                if (apiSel) apiSel.value = config.imageModel;
             }
             localStorage.setItem('spark_config', JSON.stringify(config));
             updateCoverModelDisplay();
             showToast(`帧序列生图模型已切换：${sel.value}（下次生成/单帧重试生效）`, 'success');
         });
     }
+}
+
+/* 配置中心「生成后端」里的 API 生图模型下拉：与上面的帧序列内嵌选择器是同一项
+   设置（config.imageModel），两边互相回写。选项按 IMAGE_MODELS 动态渲染而不是写死在
+   index.html 里——清单加一条模型时只改 js/state.js 一处，两个入口一起跟上。 */
+function syncSettingsApiImageModelPicker() {
+    const sel = document.getElementById('settings-api-image-model');
+    if (!sel) return;
+    const current = config.imageModel || DEFAULT_CONFIG.imageModel;
+    sel.innerHTML = '';
+    IMAGE_MODELS.forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.value;
+        opt.textContent = m.label;
+        sel.appendChild(opt);
+    });
+    if (!IMAGE_MODELS.some(m => m.value === current)) {
+        const opt = document.createElement('option');
+        opt.value = current;
+        opt.textContent = `${current} (自定义)`;
+        sel.appendChild(opt);
+    }
+    sel.value = current;
 }
 
 function loadConfig() {
@@ -478,6 +503,10 @@ function loadConfig() {
         // 下拉框里已经没有对应项，会显示成一个空白选项，回落到默认时长。
         fxVideoDurationSelect.value = config.videoDuration || DEFAULT_CONFIG.videoDuration;
     }
+    const fxVideoRefModeSelect = document.getElementById('settings-fx-video-ref-mode');
+    if (fxVideoRefModeSelect) {
+        fxVideoRefModeSelect.value = config.videoRefMode || DEFAULT_CONFIG.videoRefMode;
+    }
     const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
     if (trendUrlsInput) {
         trendUrlsInput.value = config.ideationTrendUrls || '';
@@ -505,42 +534,50 @@ function loadConfig() {
     // 原「GPT 代理端口」选择器已移除，防止端口漂移。
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
+    syncSettingsApiImageModelPicker();
     syncIdeationLlmPicker();
     syncIdeationSkillProfilePicker();
 }
 
 // 显隐一律用空串还原（而不是写死 'block'）：配置中心的字段行是 CSS grid
 // （.settings-field），内联 display:block 会把 label/控件/说明拍回竖排。
+// 「帧序列生成方式」只决定生图走哪条路，所以只切生图模型那两行：api → API 生图模型
+// （IMAGE_MODELS，含 gpt-image-2），google_fx → FX 生图模型。视频三行始终显示，
+// 视频生成任何时候都走 AdsPower/google_fx。
 function updateFxImageModelVisibility() {
     const backendSelect = document.getElementById('settings-image-backend');
+    const apiImageGroup = document.getElementById('api-image-model-group');
     const fxImageGroup = document.getElementById('fx-image-model-group');
-    const fxVideoGroup = document.getElementById('fx-video-model-group');
     const showFx = backendSelect && backendSelect.value === 'google_fx';
+    if (apiImageGroup) apiImageGroup.style.display = showFx ? 'none' : '';
     if (fxImageGroup) fxImageGroup.style.display = showFx ? '' : 'none';
-    if (fxVideoGroup) fxVideoGroup.style.display = showFx ? '' : 'none';
     updateFxVideoDurationVisibility();
 }
 
-// Omni Flash 时长切换仅该模型面板提供（Veo 系列时长固定）：需同时满足
-// 「FX 后端已开启」与「当前选中的视频模型是 Omni Flash」两个条件才显示。
+// Omni Flash 时长切换仅该模型面板提供（Veo 系列时长固定），所以只在当前选中的
+// 视频模型是 Omni Flash 时显示。
 function updateFxVideoDurationVisibility() {
-    const backendSelect = document.getElementById('settings-image-backend');
     const fxVideoModelSelect = document.getElementById('settings-fx-video-model');
     const durationGroup = document.getElementById('fx-video-duration-group');
     if (!durationGroup) return;
-    const showFx = backendSelect && backendSelect.value === 'google_fx';
     const isOmni = fxVideoModelSelect && fxVideoModelSelect.value === 'Omni Flash';
-    durationGroup.style.display = (showFx && isOmni) ? '' : 'none';
+    durationGroup.style.display = isOmni ? '' : 'none';
 }
 
 // 把配置中心表单里的值收进 config 对象（不落盘）。saveConfig 与
 // autoSaveConfig 共用，避免两条写入路径读的字段集合漂移。
 function applySettingsFormToConfig() {
-    // config.model / config.imageModel 不再从本弹窗读取：由激发页脚与帧序列卡片的
-    // 内嵌选择器直接维护（改动即存），这里只负责其余生成参数
+    // config.model 不从本弹窗读取：LLM 模型由激发页脚的内嵌选择器直接维护。
+    // config.imageModel 有两个等价入口（本弹窗的 API 生图模型 + 帧序列卡片的内嵌
+    // 选择器），两边写的是同一个键，改完互相回写。
     const imageBackendSelect = document.getElementById('settings-image-backend');
     if (imageBackendSelect) {
         config.imageBackend = imageBackendSelect.value;
+    }
+    const apiImageModelSelect = document.getElementById('settings-api-image-model');
+    // 空值只可能出现在选项还没渲染出来的时候，别拿它覆盖掉用户存着的模型
+    if (apiImageModelSelect && apiImageModelSelect.value) {
+        config.imageModel = apiImageModelSelect.value;
     }
     const fxImageModelSelect = document.getElementById('settings-fx-image-model');
     if (fxImageModelSelect) {
@@ -553,6 +590,10 @@ function applySettingsFormToConfig() {
     const fxVideoDurationSelect = document.getElementById('settings-fx-video-duration');
     if (fxVideoDurationSelect) {
         config.videoDuration = fxVideoDurationSelect.value;
+    }
+    const fxVideoRefModeSelect = document.getElementById('settings-fx-video-ref-mode');
+    if (fxVideoRefModeSelect) {
+        config.videoRefMode = fxVideoRefModeSelect.value;
     }
     const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
     if (trendUrlsInput) {
@@ -573,6 +614,7 @@ function saveConfig() {
     localStorage.setItem('spark_config', JSON.stringify(config));
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
+    syncSettingsApiImageModelPicker();
     syncIdeationLlmPicker();
     syncIdeationSkillProfilePicker();
     showToast("API 配置保存成功！", "success");
@@ -597,7 +639,7 @@ function flashSettingsSaved() {
 // FX 模型设置由服务端 server_config.json 统一管理：前端改了之后要同步推到
 // 服务端，否则 effective_config 会采用 SERVER_CONFIG 里的旧值（服务端优先）。
 // 静默调用，失败不弹 toast——下一次生成请求仍然会把最新 config 带过去。
-const _FX_SERVER_SYNC_KEYS = ['videoModel', 'googleFxImageModel', 'videoDuration'];
+const _FX_SERVER_SYNC_KEYS = ['videoModel', 'googleFxImageModel', 'videoDuration', 'videoRefMode'];
 let _fxSyncPending = null;
 
 function syncFxModelToServer() {
@@ -623,6 +665,7 @@ function autoSaveConfig() {
     localStorage.setItem('spark_config', JSON.stringify(config));
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
+    syncSettingsApiImageModelPicker();
     // 链路选择器停在 auto 时，徽标显示的是"跟着视频模型现在实际走哪条"——
     // 改了 FX 视频模型下拉框却不重刷，徽标就会停在旧链路上，看起来像没生效。
     syncIdeationSkillProfilePicker();
@@ -641,6 +684,13 @@ function resetConfig() {
     if (imageBackendSelect) {
         imageBackendSelect.value = DEFAULT_CONFIG.imageBackend;
     }
+    // API 生图模型现在有表单项了：只改 config.imageModel 不改下拉框，
+    // 末尾的 applySettingsFormToConfig 会把旧值原样读回来（等于没恢复）。
+    const apiImageModelSelect = document.getElementById('settings-api-image-model');
+    if (apiImageModelSelect) {
+        syncSettingsApiImageModelPicker();
+        apiImageModelSelect.value = DEFAULT_CONFIG.imageModel;
+    }
     const fxImageModelSelect = document.getElementById('settings-fx-image-model');
     if (fxImageModelSelect) {
         fxImageModelSelect.value = DEFAULT_CONFIG.googleFxImageModel;
@@ -652,6 +702,10 @@ function resetConfig() {
     const fxVideoDurationSelect = document.getElementById('settings-fx-video-duration');
     if (fxVideoDurationSelect) {
         fxVideoDurationSelect.value = DEFAULT_CONFIG.videoDuration;
+    }
+    const fxVideoRefModeSelect = document.getElementById('settings-fx-video-ref-mode');
+    if (fxVideoRefModeSelect) {
+        fxVideoRefModeSelect.value = DEFAULT_CONFIG.videoRefMode;
     }
     const trendUrlsInput = document.getElementById('settings-ideation-trend-urls');
     if (trendUrlsInput) {
@@ -747,7 +801,7 @@ if (typeof window !== 'undefined') {
         try {
             const updated = JSON.parse(e.newValue);
             let dirty = false;
-            for (const key of ['videoModel', 'googleFxImageModel', 'videoDuration']) {
+            for (const key of ['videoModel', 'googleFxImageModel', 'videoDuration', 'videoRefMode']) {
                 if (key in updated && config[key] !== updated[key]) {
                     config[key] = updated[key];
                     dirty = true;
@@ -761,6 +815,8 @@ if (typeof window !== 'undefined') {
                 if (fxImageModelSelect) fxImageModelSelect.value = config.googleFxImageModel || '';
                 const fxDurationSelect = document.getElementById('settings-fx-video-duration');
                 if (fxDurationSelect) fxDurationSelect.value = config.videoDuration || DEFAULT_CONFIG.videoDuration;
+                const fxRefModeSelect = document.getElementById('settings-fx-video-ref-mode');
+                if (fxRefModeSelect) fxRefModeSelect.value = config.videoRefMode || DEFAULT_CONFIG.videoRefMode;
                 if (typeof syncIdeationSkillProfilePicker === 'function') syncIdeationSkillProfilePicker();
                 if (typeof updateFxVideoDurationVisibility === 'function') updateFxVideoDurationVisibility();
             }

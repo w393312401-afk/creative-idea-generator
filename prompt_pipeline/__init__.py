@@ -80,10 +80,8 @@ from frame_generator import (
     current_thread_sinks, set_upstream_event_sink, set_cancel_check_sink,
 )
 
-# Clip timing constants: single source of truth for the video-model clip length and the
-# worker exit deadline referenced throughout the fix_*/check_* pipeline and skill contract.
+# Clip timing constant: single source of truth for the video-model clip length.
 VIDEO_DURATION = 8.0
-WORKER_EXIT_TIME = 7.5
 
 # Bump this whenever the beat-ladder contract changes in a way that makes an old
 # checkpoint unsafe to resume.  It is deliberately part of the brief fingerprint
@@ -91,7 +89,7 @@ WORKER_EXIT_TIME = 7.5
 # pre-rollout ladder full of local/incremental filler beats.
 # v2（2026-07-26）：过门后第一拍恒为 clearing 清理工序。存量断点里的 Threshold 节拍梯
 # 没有这一拍，续传会绕过新的结构校验产出旧形态整单——只能靠指纹换代逼它重排。
-MILESTONE_POLICY_VERSION = "visible-milestones-v8-scene-state-batches"
+MILESTONE_POLICY_VERSION = "visible-milestones-v9-direct-worker-action-from-zero"
 _MIN_ADAPTIVE_CONSTRUCTION_BEATS = 5
 _MILESTONE_TEXT_FIELDS = (
     'milestone_name', 'before_state', 'after_state', 'completion_extent',
@@ -1717,9 +1715,17 @@ def normalize_packet(packet):
         return packet
     for key in ('camera_dna', 'geometry_lock', 'worker_choreography', 'worker_scale_percent',
                 'passive_environment', 'interior_camera_dna', 'interior_light_source',
-                'secondary_interior_camera_dna'):
+                'secondary_interior_camera_dna', 'envelope_signature'):
         if key in packet and not isinstance(packet[key], str):
             packet[key] = _flatten_to_text(packet[key])
+    # aperture_ledger / aperture_denylist 保持 list（_envelope_terms 两种形状都吃），
+    # 但 dict 形状要摊平成一行字，否则 ' | '.join 会拿到 dict。
+    for key in ('aperture_ledger', 'aperture_denylist'):
+        val = packet.get(key)
+        if isinstance(val, dict):
+            packet[key] = [_flatten_to_text(v) for v in val.values()]
+        elif isinstance(val, list):
+            packet[key] = [v if isinstance(v, str) else _flatten_to_text(v) for v in val]
     for lm_list in (packet.get('primary_landmarks'), packet.get('interior_primary_landmarks'),
                     packet.get('secondary_interior_primary_landmarks')):
         for lm in lm_list or []:
@@ -3395,6 +3401,12 @@ def _beat_action_phrase(beat):
 
 
 def fix_out_and_in(prompt, is_threshold_or_reveal=False, beat=None, packet=None):
+    """Compatibility-named fixer for the direct-action-from-zero worker policy.
+
+    Entrance/exit choreography is retired. Construction clips start with the worker already
+    at the work face and the first effective tool contact at t=0, then keep working through
+    the final frame.
+    """
     if is_threshold_or_reveal:
         return prompt
     low = prompt.lower()
@@ -3415,42 +3427,41 @@ def fix_out_and_in(prompt, is_threshold_or_reveal=False, beat=None, packet=None)
                             'the workers', 'both workers']
     is_multi = any(phrase in low for phrase in multi_worker_phrases)
 
-    # Check if entry/exit is already described (bare 'enters'/'exits' counts — the narrow
-    # phrase list once double-stamped a second entry/exit template onto a video whose body
-    # already said 'A worker ... enters, builds a timber frame, and exits.')
-    has_entry = any(p in low for p in ['t=0', '0 seconds', 'start of the clip']) \
-        or re.search(r'\benters?\b', low) is not None
-    has_exit = any(p in low for p in [str(WORKER_EXIT_TIME), 'walks out']) \
-        or re.search(r'\bexits?\b|\bleaves?\b', low) is not None
+    # Scrub legacy worker-boundary sentences emitted by older checkpoints/upstream drafts.
+    # Material/debris entering or leaving the frame is intentionally unaffected.
+    agent = r'(?:the\s+)?(?:same\s+)?(?:one\s+lone\s+)?(?:workers?|crew|persons?|builders?|laborers?)'
+    prompt = re.sub(
+        rf'(?i)\b(?:at\s+t\s*=\s*0s?|at\s+zero\s+seconds?|at\s+the\s+(?:very\s+)?(?:start|beginning)|in\s+the\s+(?:opening|full|medium)\s+shot)[,;:]?\s*'
+        rf'{agent}[^.;]*?\b(?:enters?|walks?\s+in|steps?\s+in|comes?\s+in)(?:[^.;]*[.;])?',
+        '', prompt)
+    prompt = re.sub(
+        rf'(?i)(?:,?\s*(?:and|then)?\s*(?:by\s+[^,.;]+[,;]?\s*)?){agent}[^.;]*?\b(?:exits?|walks?\s+out|steps?\s+out|leaves?\s+the\s+(?:frame|scene))(?:[^.;]*[.;])?',
+        '.', prompt)
+    prompt = re.sub(r'\s{2,}', ' ', prompt).strip()
 
-    if has_entry and has_exit:
-        # Already has full in/out — check for multi-worker vs single-worker template conflict
-        if is_multi and 'one lone worker' in low:
-            # Conflict: body says multi-worker but appended template says one worker
-            prompt = re.sub(
-                rf'At t=0s, one lone worker enters the frame from the (?:Grid C1|lower left) edge[^.]*'
-                rf'leaving the frame completely empty at t={int(VIDEO_DURATION)}s\.',
-                '', prompt).strip()
-            # Re-add consistent multi-worker clause if no other exit clause remains
-            if not any(p in prompt.lower() for p in ['exits the frame', 'walks out', 'leaves the frame']):
-                prompt += f' At t=0s, the workers enter the frame; by t={WORKER_EXIT_TIME}s, all workers exit the frame, leaving it completely empty at t={int(VIDEO_DURATION)}s.'
+    low = prompt.lower()
+    direct_start = ('t=0' in low or 'zero seconds' in low) and any(
+        p in low for p in ('already at', 'already positioned', 'first tool contact',
+                           'begins the first', 'starts the first'))
+    if direct_start:
         return prompt
 
-    # Add missing entry/exit clause
+    # Add direct action at zero. There is deliberately no empty handoff tail.
     if not prompt.endswith('.'):
         prompt += '.'
 
     if is_multi:
         scale_clause = _worker_scale_clause_from_packet(packet, plural=True)
-        clause = (f" At t=0s, the workers{scale_clause} enter the frame; by t={WORKER_EXIT_TIME}s, "
-                  f"all workers exit the frame, leaving it completely empty at t={int(VIDEO_DURATION)}s.")
+        clause = (f" At t=0s, the workers{scale_clause} are already positioned at the active work "
+                  "faces and make the first effective tool contact immediately; they continue the "
+                  "same visible operation through the final frame.")
     else:
         costume = _worker_costume_from_packet(packet)
         scale_clause = _worker_scale_clause_from_packet(packet)
         action = _beat_action_phrase(beat)
-        clause = (f" At t=0s, one lone worker{costume}{scale_clause} enters the frame from the lower left edge; "
-                  f"the worker {action}, and by t={WORKER_EXIT_TIME}s, walks out of the frame "
-                  f"through the lower left edge, leaving the frame completely empty at t={int(VIDEO_DURATION)}s.")
+        clause = (f" At t=0s, one lone worker{costume}{scale_clause} is already positioned at the "
+                  f"active work face and makes the first effective tool contact immediately; the worker {action} "
+                  "continuously through the final frame.")
 
     prompt += clause
     return prompt
@@ -5578,8 +5589,7 @@ def check_pacing_control(prompt, is_threshold_or_reveal):
 
 
 def check_out_and_in(prompt, is_threshold_or_reveal=False):
-    """If a worker is present, the clip must show them entering and exiting (Out-and-In passage).
-    Mirrors fix_out_and_in's trigger so proactively-fixed prompts pass."""
+    """Compatibility-named validator for direct action from t=0 with no ingress/egress."""
     if is_threshold_or_reveal:
         return []
     errors = []
@@ -5593,11 +5603,20 @@ def check_out_and_in(prompt, is_threshold_or_reveal=False):
         
     has_worker = any(re.search(rf'\b{w}s?\b', low) for w in ('worker', 'crew', 'person', 'builder', 'laborer'))
     if has_worker:
-        entered = any(k in low for k in ('enter', 'walks in', 'steps in', 't=0', 'start of the clip', '0 seconds'))
-        exited = any(k in low for k in ('exit', 'walks out', 'leaves the frame', 'steps out',
-                                        'before the final frame', f'before t={int(VIDEO_DURATION)}', str(WORKER_EXIT_TIME)))
-        if not (entered and exited):
-            errors.append(f"VIDEO with a worker must show the worker entering at the start and exiting before the clip ends (Out-and-In passage)")
+        boundary_re = re.compile(
+            r'\b(?:workers?|crew|persons?|builders?|laborers?)\b[^.!?]{0,180}'
+            r'\b(?:enters?|walks? in|steps? in|exits?|walks? out|steps? out|leaves? the (?:frame|scene))\b')
+        for sentence in re.split(r'(?<=[.!?])\s+', low):
+            if boundary_re.search(sentence) and not re.search(
+                    r'\b(?:no|without|never|do not|does not|must not)\b[^.!?]*\b(?:entr|exit|walk|leav)',
+                    sentence):
+                errors.append("VIDEO must not spend time on worker entrance or exit choreography")
+                break
+        starts_at_zero = ('t=0' in low or 'zero seconds' in low) and any(
+            p in low for p in ('already at', 'already positioned', 'first effective tool contact',
+                               'first tool contact', 'begins the first', 'starts the first'))
+        if not starts_at_zero:
+            errors.append("VIDEO with a worker must start at t=0 with the worker already at the work face and the first effective action underway")
     return errors
 
 
@@ -6157,6 +6176,123 @@ def check_interior_door_clearance(image_prompt, family='exterior'):
     return errors
 
 
+# P0 体量锁（Shell Envelope Consistency）。geometry_lock 长期是个孤儿字段：packet 里写了，
+# 没有任何一处读它，于是室内帧的净宽/净高/屋面形式/洞口数量每一帧都由图像模型自由发挥——
+# 截图里凭空长出来的天窗、拱顶、后墙拱窗就是这么来的。
+#
+# 只写"有什么"约束不住生成模型，真正干活的是否定清单：点名禁掉它最爱加的那几样。
+# 下面这批是无条件默认否定项（任何 interior 帧出现即 fail），packet 的
+# aperture_denylist 在此之上追加本项目自己的禁项。
+# (在提示词里长出来的形状, 人话标签, 在 packet 里声明它时会出现的写法)
+# 第三项是"声明豁免"的钥匙：geometry_lock 散文或 aperture_ledger 里出现它，就说明这个
+# 形状是这个外壳真实有的，默认禁项对它放行。没有这一项，一个真的筒拱地窖会被永久卡死。
+_ENVELOPE_DEFAULT_DENY = (
+    (re.compile(r'\bskylight(s)?\b', re.IGNORECASE), 'skylight',
+     re.compile(r'\bskylight', re.IGNORECASE)),
+    (re.compile(r'\broof\s+light(s)?\b', re.IGNORECASE), 'roof light',
+     re.compile(r'\broof\s+light', re.IGNORECASE)),
+    (re.compile(r'\broof\s+window(s)?\b', re.IGNORECASE), 'roof window',
+     re.compile(r'\broof\s+window', re.IGNORECASE)),
+    (re.compile(r'\bcupola(s)?\b', re.IGNORECASE), 'cupola',
+     re.compile(r'\bcupola', re.IGNORECASE)),
+    (re.compile(r'\bclerestory\b', re.IGNORECASE), 'clerestory',
+     re.compile(r'\bclerestory\b', re.IGNORECASE)),
+    (re.compile(r'\blantern\s+(?:light|opening)(s)?\b', re.IGNORECASE), 'roof lantern',
+     re.compile(r'\blantern\b', re.IGNORECASE)),
+    (re.compile(r'\bvault(ed|s)?\b', re.IGNORECASE), 'vault / vaulted ceiling',
+     re.compile(r'\bvault(ed|s)?\b', re.IGNORECASE)),
+    (re.compile(r'\bdomed?\s+(?:ceiling|roof)\b', re.IGNORECASE), 'domed ceiling',
+     re.compile(r'\bdomed?\b', re.IGNORECASE)),
+    (re.compile(r'\barched\s+(?:window|opening|doorway)(s)?\b', re.IGNORECASE),
+     'arched window / opening', re.compile(r'\barch(ed|way)?\b', re.IGNORECASE)),
+    (re.compile(r'\brose\s+window(s)?\b', re.IGNORECASE), 'rose window',
+     re.compile(r'\brose\s+window', re.IGNORECASE)),
+)
+
+
+# geometry_lock 的规范写法本身就带着否定清单（"...; there is no skylight, no vaulted
+# ceiling; ..."），直接拿它当"声明豁免"的证据会把整张否定清单反向豁免掉——那正是这条门
+# 要拦的东西。先把否定短语整段剪掉，剩下的才算"这个外壳真的有"。
+_ENVELOPE_NEGATION_RE = re.compile(
+    r'\b(?:no|not|never|without|zero|nor)\b[^.;]*', re.IGNORECASE)
+
+
+def _strip_negated(text):
+    return _ENVELOPE_NEGATION_RE.sub(' ', str(text or ''))
+
+
+def _envelope_terms(packet, key):
+    """packet 里的 aperture_ledger / aperture_denylist：list 或逗号/顿号分隔的一行字都吃。"""
+    raw = (packet or {}).get(key)
+    if isinstance(raw, str):
+        raw = re.split(r'[,，、;；\n]', raw)
+    terms = []
+    for t in raw or []:
+        if isinstance(t, dict):
+            t = t.get('name') or t.get('opening') or ''
+        t = str(t).strip().strip('.').strip()
+        if t and len(t) >= 3:
+            terms.append(t)
+    return terms
+
+
+def check_shell_envelope_consistency(image_prompt, packet, family='exterior'):
+    """P0 体量锁：过门之后每一帧 interior IMAGE 都必须重贴外壳体量，且不得长出禁项洞口。
+
+    三条独立的失败：
+      1. **默认禁项命中** —— 天窗/拱顶/穹顶/后墙拱窗这一类，是图像模型在封闭室内最爱
+         无中生有的东西，而且没有任何一拍声明过要开它。这一条无条件生效（packet 什么都
+         没声明也照样跑），除非 aperture_ledger 把这个洞口显式登记为真实存在的。
+      2. **项目禁项命中** —— aperture_denylist 里点名的本项目禁项。
+      3. **体量锁散文缺失** —— packet 声明了 envelope_signature（体量锁散文里必须逐帧
+         原样重贴的那一小截，例如 "about two and a half door widths wide"），而这一帧没带。
+         IMAGE T+1 之后的每一帧都要带，不是只有 T+1 带。
+
+    envelope_signature 缺省时第 3 条静默跳过（老 packet 向后兼容）；1、2 永远跑。
+    """
+    errors = []
+    if family != 'interior' or not image_prompt:
+        return errors
+
+    low = image_prompt.lower()
+    # 台账登记过的洞口、以及 geometry_lock 散文里明写过的屋面形式，都是真实存在的，不算
+    # 无中生有——否定清单不能反过来禁掉真墙上的窗，或一个真的筒拱地窖。默认禁项管的是
+    # "没人声明过、模型自己长出来的"，声明过的一律放行。
+    declared = _strip_negated(' | '.join(
+        _envelope_terms(packet, 'aperture_ledger')
+        + [str((packet or {}).get('geometry_lock') or '')]
+    ))
+    # aperture_denylist 压过声明豁免：项目自己点名禁掉的，任何写法都豁免不了。
+    deny_blob = ' | '.join(_envelope_terms(packet, 'aperture_denylist'))
+    for pattern, label, declared_re in _ENVELOPE_DEFAULT_DENY:
+        m = pattern.search(image_prompt)
+        if not m:
+            continue
+        if (declared and declared_re.search(declared)
+                and not (deny_blob and declared_re.search(deny_blob))):
+            continue
+        errors.append(
+            f"Interior IMAGE grows an undeclared envelope element '{m.group(0)}' ({label}) — the shell "
+            f"volume is fixed by the exterior beats and no operation ever declared cutting one; remove "
+            f"it, or register it in the packet's aperture_ledger if the shell genuinely has one"
+        )
+    for term in _envelope_terms(packet, 'aperture_denylist'):
+        if term.lower() in low:
+            errors.append(
+                f"Interior IMAGE mentions denylisted envelope element '{term}' from the packet's "
+                f"aperture_denylist — this shell does not have one"
+            )
+
+    signature = str((packet or {}).get('envelope_signature') or '').strip()
+    if signature and signature.lower() not in low:
+        errors.append(
+            f"Interior IMAGE is missing the geometry-lock restatement '{signature}' — every frame "
+            f"outside IMAGE 1's shot family must re-state the shell volume verbatim, not only the "
+            f"first interior frame; without it the model re-derives clear width/height per frame"
+        )
+    return errors
+
+
 # NLVTR gap closed 2026-07-12: the shipped set contained telegraphic label fragments
 # ("B1: glowing sconces. C2: reflective floor.", "Traces: frame, paneling, sawdust.") —
 # exactly the colon-label style NLVTR bans as a text-overlay hazard, but the old check only
@@ -6609,8 +6745,9 @@ def rework_structural_video_beat(config, i, video_prompt, structural_errs, packe
         action_rule = (
             "- The added sentences must describe the beat's single visible operation sweeping "
             "progressively across its full extent for the whole clip, performed by the same "
-            "single lone worker in progressive -ing verbs (entering near the start, exiting "
-            "near the end so the final frame is clean)."
+            "single lone worker in progressive -ing verbs. The worker is already at the work "
+            "face at t=0 and makes the first effective tool contact immediately; do not show "
+            "or describe any entrance or exit."
             + (f" Reuse this worker choreography verbatim where relevant: {chore}\n" if chore else "\n")
         )
     system = (
@@ -7061,16 +7198,52 @@ def _missing_outline_items(image_prompt, beat):
     里一点痕迹都没有"这个原始事故的形态。
 
     只用英文复述、不用中文原文匹配：IMAGE 正文恒为英文，拿中文去 in 判断永远不命中，
-    会把每一拍都判成缺失。复述缺席（老梯子/规划器没写）时这一条自动跳过。"""
+    会把每一拍都判成缺失。复述缺席（老梯子/规划器没写）时这一条自动跳过。
+
+    **逐个 material 独立判定**（2026-08-08）：此前把这条工序所有 mat 的关键词并成一个
+    大池子，命中任意一个就算交付——卡片承诺「毛毡垫层 + 松木地板」两层，成片只画了
+    地板照样满分。清单里每个 mat 都是用户读到的一件实物，缺一件就是缺一件。单个
+    material 内部仍走宽松口径（命中它自己的任一实义词即可），措辞变体不误判。"""
     if not image_prompt:
         return []
     low = image_prompt.lower()
     missing = []
     for item in beat_outline_items(beat):
-        words = _trace_name_keywords(item.get('delivery'))
+        # 富卡片的 en/mat 才是事实源；规划器写的 delivery 只做老卡兼容与补充。
+        materials = [m for m in (item.get('mat') or []) if str(m).strip()]
+        if materials:
+            # 任意一件材料整体缺席 → 这条工序算没交付。
+            for material in materials:
+                words = _trace_name_keywords(material)
+                if words and not any(w in low for w in words):
+                    missing.append(item)
+                    break
+            continue
+        # 富卡片存在时绝不能让规划器自己的复述把事实源短路；delivery 只给老卡兜底。
+        words = _trace_name_keywords(item.get('card_en')) or \
+            _trace_name_keywords(item.get('delivery'))
+        words = list(dict.fromkeys(words))
         if words and not any(w in low for w in words):
             missing.append(item)
     return missing
+
+
+def outline_delivery_exempt(beat):
+    """这一拍是否豁免"卡片工序必须出现在 IMAGE 正文里"的校验。
+
+    2026-08-05 的原始口径是"过门/桥接/硬切一律豁免"——那时它们按契约本就不认领工序。
+    一比一契约上线后（见 build_outline_plan_block）过门拍**自己也在交付一条真实清单
+    工序**：它的视频以穿越运镜开场，紧接着做它本来那件活，合成侧也已经为此放行了
+    VISIBLE MILESTONE CONTRACT（见 _milestone_beat_directive 的同款判断）。这里的
+    豁免条件如果还停在旧口径，那一条工序就成了整张卡上唯一没人查正文的工序，交付
+    总账里还会被记成 skipped。
+
+    所以豁免收窄为「这拍压根没认领任何工序」的老形态纯过渡拍。reward 拍从来不豁免。"""
+    if not isinstance(beat, dict):
+        return True
+    transitional = bool(beat.get('bridge_stage') or beat.get('hard_cut')
+                        or str(beat.get('operation') or '') == 'threshold')
+    return transitional and not beat_outline_items(beat)
 
 
 def check_outline_delivery_realized(image_prompt, beat):
@@ -7080,10 +7253,9 @@ def check_outline_delivery_realized(image_prompt, beat):
     ——认领第 3 条却写别的工作，在覆盖率契约里是满分。这道校验把链条接到底：这拍
     自己声明要交付的卡片工序，它的 IMAGE 正文里必须找得到。
 
-    过门/桥接/硬切拍跳过：它们按契约本就不认领工序（认领了也是过渡语义，不是实物
-    交付）。reward 拍**不跳过**——"点亮壁炉，人物入住"这类恰恰是用户最在意的一条。"""
-    if not isinstance(beat, dict) or beat.get('bridge_stage') or beat.get('hard_cut') \
-            or str(beat.get('operation') or '') == 'threshold':
+    豁免范围见 outline_delivery_exempt：只有"没认领任何工序"的老形态过渡拍跳过。
+    reward 拍**不跳过**——"点亮壁炉，人物入住"这类恰恰是用户最在意的一条。"""
+    if outline_delivery_exempt(beat):
         return []
     missing = _missing_outline_items(image_prompt, beat)
     if not missing:
@@ -7101,10 +7273,9 @@ def outline_missing_indices(image_prompt, beat):
     """这一拍认领的工序里，IMAGE 正文完全没提的那几条的**编号**。
 
     口径与 check_outline_delivery_realized 逐字一致（同一个 _missing_outline_items，
-    同一套过门/桥接/硬切跳过），区别只在返回编号而不是给模型看的英文错误串——
-    交付总账要按工序索引，拿错误串反查编号只会在措辞一变时静默错位。"""
-    if not isinstance(beat, dict) or beat.get('bridge_stage') or beat.get('hard_cut') \
-            or str(beat.get('operation') or '') == 'threshold':
+    同一套豁免判断 outline_delivery_exempt），区别只在返回编号而不是给模型看的英文
+    错误串——交付总账要按工序索引，拿错误串反查编号只会在措辞一变时静默错位。"""
+    if outline_delivery_exempt(beat):
         return []
     out = set()
     for item in _missing_outline_items(image_prompt, beat):
@@ -7127,7 +7298,8 @@ def record_outline_delivery(config, beat_index, image_prompt, beat, missing_befo
       · delivered —— 一次过，IMAGE 正文里找得到；
       · reworked  —— 首轮没写、定向回炉后写进去了；
       · missing   —— 回炉之后正文里仍然找不到；
-      · skipped   —— 过门/桥接/硬切拍，按契约本就不做实物交付。
+      · skipped   —— 没认领任何工序的老形态过渡拍（见 outline_delivery_exempt）。
+                     一比一契约下的过门拍自己在交付一条工序，不再落进这一档。
     按拍分桶而不是每条工序一个值：一条工序可能被拆到两拍（split），两拍各自的结论
     都要留着，聚合成一行的事交给总账（见 _worst_prompt_verdict）。
 
@@ -7138,8 +7310,7 @@ def record_outline_delivery(config, beat_index, image_prompt, beat, missing_befo
     items = beat_outline_items(beat)
     if not items:
         return
-    skipped = bool(beat.get('bridge_stage') or beat.get('hard_cut')
-                   or str(beat.get('operation') or '') == 'threshold')
+    skipped = outline_delivery_exempt(beat)
     before = {int(n) for n in (missing_before or [])}
     after = set() if skipped else set(outline_missing_indices(image_prompt, beat))
     audit = config.setdefault('_outline_prompt_audit', {})
@@ -7941,13 +8112,29 @@ def check_pbisp_peek(prompt, packet, label='IMAGE'):
 
 BASE_VIDEO_WORD_LIMIT = 380
 IMAGE_WORD_LIMIT = 180
+# 过门之后的 interior 帧（family == 'interior'）单独一档硬顶。理由不是"室内更重要"，
+# 而是这一族的必填项本来就比外景多一批：它要原样重贴体量锁散文（Shell Envelope
+# Consistency，见 check_shell_envelope_consistency）+ 门框出画句（check_interior_door_clearance）
+# + 继承来的三个主锚，同时又拿不到外景那批天空/地平线/云流的额度。180 词装不下，
+# 模型只能挤掉它自认为最不重要的那段——实测被挤掉的正好是刚加的体量锁。
+# 完全在室内、没有过门的项目 family 恒为 'exterior'，不吃这一档：它整片只有一个
+# shot family，每帧都从 IMAGE 1 继承，本来就不需要重贴体量锁。
+INTERIOR_IMAGE_WORD_LIMIT = 220
+
+
+def image_word_limit_for(family):
+    """这一帧的 IMAGE 硬顶。SKILL.md Step 7「Word count budget」块是它的散文副本，
+    两边必须同时改——那个块自称 SINGLE AUTHORITY，指的就是这两个常量。"""
+    return INTERIOR_IMAGE_WORD_LIMIT if family == 'interior' else IMAGE_WORD_LIMIT
 
 
 def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal, prev_video=None, prev_image=None, beat=None, family=None, is_pre_bridge=False, is_post_reveal_cleanup=False, video_word_limit=None):
     """video_word_limit：本 profile 的 VIDEO 硬顶。缺省 = base 的一镜到底档 380 词。
     多镜头档（omni）的一条 VIDEO 按契约就是 5 个镜头 x 45~70 词 + 约 130 词结构句，
     目标 450 / 硬顶 510——拿 380 去卡它，等于每一拍都必然报一条"超字数"，而那条报警
-    描述的是**契约本身**，不是这一拍写坏了。调用方（OmniComposer）传自己的硬顶。"""
+    描述的是**契约本身**，不是这一拍写坏了。调用方（OmniComposer）传自己的硬顶。
+
+    IMAGE 硬顶不走参数：它只由 family 决定（image_word_limit_for），所有 profile 同规则。"""
     errors = []
     video_word_limit = int(video_word_limit or BASE_VIDEO_WORD_LIMIT)
 
@@ -7960,9 +8147,10 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
     # raised to match the level of sensory/texture detail per anchor demonstrated in a
     # hand-authored reference example; see prompt-templates.md checklist for the paired
     # target ranges shown to the composing LLM)
+    img_word_limit = image_word_limit_for(family)
     img_word_count = len(image_prompt.split())
-    if img_word_count > IMAGE_WORD_LIMIT:
-        errors.append(f"IMAGE prompt word count ({img_word_count}) exceeds limit of {IMAGE_WORD_LIMIT} words")
+    if img_word_count > img_word_limit:
+        errors.append(f"IMAGE prompt word count ({img_word_count}) exceeds limit of {img_word_limit} words")
 
     vid_word_count = len(video_prompt.split())
     if vid_word_count > video_word_limit:
@@ -7989,6 +8177,10 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
     )
     errors.extend(check_interior_door_clearance(
         image_prompt, family if _requires_door_clearance else 'exterior'))
+    # 体量锁：门框出画管的是"还隔着门口看"，这一条管的是"墙自己变了形"。两条互不覆盖，
+    # 且这一条对**每一**帧 interior 生效（含过门中的 partial 阶段——外壳不会因为镜头还在
+    # 门口就允许长出天窗）。
+    errors.extend(check_shell_envelope_consistency(image_prompt, packet, family))
 
     errors.extend(check_nlvtr_violations(image_prompt))
     _wants_occupant = beat_requires_occupant(beat)
@@ -8471,7 +8663,7 @@ Required JSON keys:
             _nested_reference_form = ""
             if _nested_total >= 15:
                 _nested_reference_form = """
-  - CANONICAL 15-SLOT REFERENCE FORM (mandatory at this budget; copied from the accepted buried shipping-container dual-cabin creative): Beat 1 carrier delivery/landing; Beat 2 concealment plus completed usable entrance; Beat 3 bridge into the untouched primary space; Beat 4 primary cleanout; Beat 5 substrate repair/corrosion protection; Beat 6 membrane plus hidden services; Beat 7 insulation/enclosure; Beat 8 floor plus finished wall/ceiling surfaces; Beat 9 primary core furniture and function-complete mini-payoff; Beat 10 declared reset into the untouched secondary space; Beat 11 secondary cleanout; Beat 12 hidden layers plus insulation; Beat 13 enclosure plus finished surfaces; Beat 14 secondary core furniture and soft furnishing; Beat 15 worker exit and sole final reward. Match these phase identities, not the shipping-container subject or its exact materials. Do not move the bridge/reset or replace a construction-state beat with extra reveal footage."""
+  - CANONICAL 15-SLOT REFERENCE FORM (mandatory at this budget; copied from the accepted buried shipping-container dual-cabin creative): Beat 1 carrier delivery/landing; Beat 2 concealment plus completed usable entrance; Beat 3 bridge into the untouched primary space; Beat 4 primary cleanout; Beat 5 substrate repair/corrosion protection; Beat 6 membrane plus hidden services; Beat 7 insulation/enclosure; Beat 8 floor plus finished wall/ceiling surfaces; Beat 9 primary core furniture and function-complete mini-payoff; Beat 10 declared reset into the untouched secondary space; Beat 11 secondary cleanout; Beat 12 hidden layers plus insulation; Beat 13 enclosure plus finished surfaces; Beat 14 secondary core furniture and soft furnishing; Beat 15 sole final reward. Match these phase identities, not the shipping-container subject or its exact materials. Do not move the bridge/reset or replace a construction-state beat with extra reveal footage."""
             threshold_split_rules += f"""
 - THE BOUNDARY BETWEEN THE TWO SPACES (this is what makes the reset physically readable — without it the cut is an unexplained teleport):
   - This project's divider is: {_divider}. Beyond it lies {_second_space}.
@@ -8499,10 +8691,12 @@ Required JSON keys:
         f"""- SIGNATURE ANCHOR RULE (mandatory): this project's declared Core Creative Anchor is: {_signature_anchor}. The FINAL reward beat's "description" MUST explicitly show this exact feature completed and in its prominent hero position in the finished scene — name its concrete materials, form, and placement (never a generic substitute, e.g. a plain unrelated fixture standing in for it). If it is a heavy/mounted fixture, an earlier beat (respecting FLOORING-BEFORE-HEAVY-OBJECTS and FIXTURE INSTALLATION RULE below) should be the one that installs it, but the final beat's description must still name it as the visual centerpiece of the reveal. Populate that beat's "anchor_keywords" with the 1-3 exact phrases from your own description that carry this feature — those exact words are enforced verbatim downstream."""
         if _signature_anchor else ""
     )
-    # 灵感卡片上展示给用户的节拍简介(idea.beat_outline)作为**软计划**随 dimensions 一起
-    # 传进来:卡片上看到的工序和最终成片大体对得上,但它只是草案——本函数下面那一整套
-    # 硬规则(真实施工顺序、材质匹配修复、天花板覆盖、门扇、地板先于重物、Threshold 拆分、
-    # 单里程碑包规则、自适应拍数下限)优先级永远更高,冲突时以硬规则为准、直接改写草案。
+    # 灵感卡片上展示给用户的节拍简介(idea.beat_outline)随 dimensions 一起传进来,它是
+    # **硬计划**,不是草案(2026-08-07 起的一比一契约,见上面的 _outline_strict 分支与
+    # build_outline_plan_block):条目数 == 拍数、第 k 条 == 第 k 拍,不许合并/拆分/新增。
+    # 下面那套物理硬规则(真实施工顺序、材质匹配修复、天花板覆盖、门扇、地板先于重物、
+    # Threshold、单里程碑包规则)仍然优先决定**一条工序的拍长什么样**,但它们只能移动
+    # 内容,不能删改条目本身——冲突时改的是这一拍怎么拍,不是清单上有没有这条。
     _outline_plan, _outline_plan_block = build_outline_plan_block(
         dimensions.get('beat_outline'), max_total_beats)
     if _outline_plan:
@@ -8591,7 +8785,8 @@ Required JSON keys:
             "EARLIER rather than compressing that second ladder. Reveal a "
             "different function from the first zone, accelerate the cadence once core furniture appears "
             "through supporting furniture, soft furnishing, warm lighting and useful-content/value "
-            "stacking; then show the worker exiting and end with a brief clean worker-free wide reward. "
+            "stacking; then end with a brief clean worker-free wide reward as its own reveal beat, "
+            "without spending any construction clip on a worker exit. "
             "Every beat must produce one obvious visible result change. Do not "
             "turn the reset into a doorway travel "
             "shot, do not revisit or regress the first zone, and do not merge the two payoffs.\n"
@@ -8625,7 +8820,7 @@ Each beat object in the JSON array must have:
 4. "bridge_stage": (integer or null) Set to 1 for the SINGLE threshold/bridge beat that carries the entire exterior-interior crossing (used for the COAXIAL and PAN crossing variants only), and null for all other beats — including the HARD CUT crossing beat, which uses "hard_cut" instead and never sets bridge_stage.
 5. "hard_cut": (boolean, optional) true ONLY on the single declared-cut threshold beat in the HARD CUT crossing variant described below; omit or false everywhere else.
 6. "turn_direction": (string, optional) "left" or "right", ONLY on the bridge_stage 1 beat when this project uses the PAN crossing variant; omit everywhere else.
-7. "stage_scope": Set "large" on every ordinary construction beat for backward compatibility. Omit or set null on threshold/reward/bridge/hard-cut beats.
+7. "stage_scope": When the card work plan gives this beat's entry a "scope", copy that value verbatim ("large"/"default"/"small") — the card decides how much of the surface this stage finishes. Otherwise set "large" on every ordinary construction beat for backward compatibility. Omit or set null on threshold/reward/bridge/hard-cut beats.
 8. "milestone_name": A short, unique, concrete name for the completed visible product of this beat, such as "five-course stone wall complete" or "twelve wall studs complete".
 9. "before_state": The exact visible state at the start of this beat.
 10. "after_state": The exact visibly completed terminal state at the end of this beat. Never use begins/starts/partially/local patch wording.
@@ -9230,7 +9425,10 @@ You must output ONLY a valid JSON object matching the keys below, with no other 
 
 Required JSON keys:
 1. "camera_dna": A single camera sentence (~25-30 words) describing shot type, lens feel, camera height, perspective axis, and boundaries. Include horizon pinning (e.g., "horizon line remains perfectly level at exactly half the frame height; all optical flow lines radiate symmetrically from the optical center of Grid B2").
-2. "geometry_lock": A description of structural facts that cannot change (doors, windows, columns, wall lines, and — critically — the roofline/roof pitch silhouette and the exact opening shape/proportions of every door or archway as established in IMAGE 1; these two are easy to silently redraw between beats because no operation ever declares them as its target, so name their concrete shape here, e.g. "gabled roof holds its triangular ridge and pitch angle unchanged; the arched doorway keeps its current width-to-height ratio and curvature").
+2. "geometry_lock": A description of structural facts that cannot change. Qualitative wording ("same wall lines") is unusable — an image model cannot draw to it. Every clause must be a RELATIVE MEASURE against a feature that is visible in the frame, so write it as prose covering all of: (a) clear width in door widths ("the interior runs about two and a half door widths wall to wall"); (b) clear height in door heights ("about three door heights from floor to ridge"); (c) depth in countable facade features ("four rafter pairs deep", "three bays deep"); (d) ONE roof form, at the SAME pitch as the exterior silhouette, stated as a fact that never changes; (e) the same wall material inside and out; (f) the exact opening shape/proportions of every door or archway as established in IMAGE 1. The roofline and the door proportions are the two that get silently redrawn between beats, because no operation ever declares them as its target — name their concrete shape here, e.g. "gabled roof holds its triangular ridge and its shallow exterior pitch unchanged, with no second roof form anywhere; the arched doorway keeps its current width-to-height ratio and curvature".
+2a. "aperture_ledger": An EXHAUSTIVE list of strings naming every opening the shell has — every door, window, hatch, vent, and hole, including the entry itself. If it is not on this list it does not exist. Example: ["the single plank entry door in the gable end", "two small square vents under the eaves"].
+2b. "aperture_denylist": A list of strings naming the openings and shapes this shell explicitly does NOT have, chosen from what an image model most wants to invent in an enclosed space — skylights, roof lights, clerestory glazing, vaulted or domed ceilings, rear-wall arched windows, extra side doors. Stating what exists does not constrain a generative model; naming the absent thing does. Never leave this empty. Example: ["skylight", "roof light", "vaulted ceiling", "rear-wall arched window", "second doorway"].
+2c. "envelope_signature": ONE short clause, under twelve words, copied verbatim out of "geometry_lock" — the one that pins clear width or clear height in door units (e.g. "about two and a half door widths wall to wall"). Every interior IMAGE prompt must carry this clause word for word, so keep it short, natural-language, and free of numerals and percent signs.
 3. "primary_landmarks": A list of exactly 3 landmarks (Foreground, Mid-depth, Background). Each landmark must be a JSON object with:
    - "name": The exact name (e.g. "cracked floor seam")
    - "grid": Grid coordinate (from Grid A1 to Grid C3)
@@ -9806,6 +10004,25 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
         family_contract_lines.append(
             "- Enclosed/post-crossing frame: never mention a horizon, sky, or clouds; write "
             "\"camera pitch locked level; the central vanishing axis stays centered\" instead.")
+        _env_signature = str(packet.get('envelope_signature') or '').strip()
+        _env_deny = _envelope_terms(packet, 'aperture_denylist')
+        _env_ledger = _envelope_terms(packet, 'aperture_ledger')
+        if _env_signature:
+            family_contract_lines.append(
+                f"- Shell envelope restatement (mandatory, EVERY interior frame — not just the first): "
+                f"IMAGE {i+1} must carry this clause word for word: \"{_env_signature}\". The shell volume "
+                f"was fixed by the exterior beats; a frame that omits it lets the model re-derive clear "
+                f"width and height from scratch and the room silently changes size.")
+        if _env_ledger:
+            family_contract_lines.append(
+                "- Aperture ledger (exhaustive): the only openings this shell has are — "
+                + '; '.join(_env_ledger)
+                + ". Anything not on this list does not exist and may not appear.")
+        if _env_deny:
+            family_contract_lines.append(
+                "- Aperture denylist (hard): this shell has NO "
+                + ', '.join(_env_deny)
+                + ". Never write any of these, not even as background detail.")
         if not is_bridge or _transition_stage in ('interior_establish', 'secondary_establish'):
             family_contract_lines.append(
                 "- Door clearance (mandatory): only after the landing/partial-first-look "
@@ -10248,7 +10465,25 @@ def outline_delivery_directive(beat):
     lines = []
     for item in items:
         delivery = str(item.get('delivery') or '').strip()
+        card_en = str(item.get('card_en') or '').strip()
+        materials = [str(x).strip() for x in (item.get('mat') or []) if str(x).strip()]
+        zone = str(item.get('zone') or '').strip()
+        scope = str(item.get('scope') or '').strip()
+        trace = str(item.get('trace') or '').strip()
         lines.append(f"  · {item['text']}" + (f" — {delivery}" if delivery else ""))
+        if card_en:
+            lines.append(f"    CARD EN (fact source): {card_en}")
+        if materials:
+            lines.append(f"    MATERIALS (must be visible by name): {', '.join(materials)}")
+        # zone/scope/trace 是卡片自己申报的空间/覆盖度/残留（P2/P3）。合成侧拿到它们
+        # 就不必从一句中文里反推"这活在哪、做了多大面积、留下什么"——那三样此前全是
+        # 规划器凭空发挥，直接决定 IMAGE 的措辞与后续拍的连续性。
+        if zone:
+            lines.append(f"    ZONE (where this work lands): {zone}")
+        if scope:
+            lines.append(f"    COVERAGE: {scope}")
+        if trace:
+            lines.append(f"    LEAVES BEHIND (must stay visible from here on): {trace}")
     plural = "these card work items" if len(items) > 1 else "this card work item"
     return ("- CARD WORK ITEM(S) THIS BEAT DELIVERS (hard requirement — the user chose this "
             "creative by reading exactly this list, so the IMAGE must visibly show "
@@ -10339,9 +10574,10 @@ def _milestone_beat_directive(beat, img_before="this beat's starting IMAGE",
         'Name the material source as a stack / crate / bundle / bucket / rack / tray / barrow / bag / '
         'pile standing at a stated spot, and trace the movement path from it to the work face.',
         'Both progress markers above developing continuously and independently.',
-        'The same lone worker enters at the start and exits before the final frame — no ghost work.',
-        f'Land on the clean terminal frame matching {img_after} — the completed state above, with '
-        'worker, tools, and empty containers gone.',
+        'At t=0 the same lone worker is already at the work face and makes the first effective '
+        'tool contact immediately; no entrance or exit choreography.',
+        f'Continue visible work through the final frame while landing on the completed state matching {img_after}; '
+        'do not reserve a worker-free tail inside this construction clip.',
     ]
 
     image_block = '\n'.join(f'{n}. {rule}' for n, rule in enumerate(image_rules, 1))
@@ -10656,9 +10892,9 @@ Hard vetoes to check against these two images:
 - VMFP & RCE Volume: Loose materials must be encapsulated in rigid, countable containers (buckets/bags) and have volume percentage capacities, with the container scale matched to the load per the VOLUME CONSERVATION veto above (a correctly scaled, visibly growing spoil pile also satisfies encapsulation for material that stays in frame).
 - RHMA Reflection: Glossy/wet surfaces must use highly blurred, diffused reflections (RHMA-Blur) to prevent video flicker.
 - Clean Frame Boundary: Image anchors must have ZERO active workers or active machinery.
-- Out-and-In Passage: Workers in video prompts must enter at t=0s and exit before t={int(VIDEO_DURATION)}s.
+- Direct-at-zero worker action: workers are already at the active work face at t=0s and make the first effective tool contact immediately.
 - PERSPECTIVE ISOLATION: Do not flip camera facing directions (e.g. turning 180 degrees from looking out to looking in) in the same spatial axis without a clean separate phase or TBCP transition.
-- BI-DIRECTIONAL AGENT FLOW: Workers in video prompts must enter from a specific coordinate edge at t=0s and walk out through the same edge by t={WORKER_EXIT_TIME}s, leaving the frame completely empty of active agents at t={int(VIDEO_DURATION)}s. No teleportation or instant popping.
+- NO WORKER BOUNDARY CHOREOGRAPHY: Never show or describe workers entering, arriving, exiting, walking out, or leaving the frame. Use the whole construction clip for visible work from t=0s through the final frame; the separate reward beat may be worker-free.
 - RIGID CONTAINER ENCAPSULATION: All loose materials, debris, fasteners, and liquids must be stored and tracked inside rigid, quantifiable containers (e.g. buckets, parts trays, boxes), and their volumes must be described as continuously increasing or decreasing.
 - THRESHOLD PEEK ANCHOR QUALIFICATION & SCALE (only applies if this beat is the threshold/bridge crossing beat AND its VIDEO slot is NOT tagged [CUT]): the two interior landmarks pre-visualized through the doorway before a threshold bridge must plausibly ALREADY EXIST at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. NEVER future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures). Each peeked anchor's declared frame-height scale must strictly INCREASE from the exterior peek IMAGE to the interior-settled IMAGE; a constant scale across the crossing is a violation — fix the scales, keep the objects.
 - DECLARED CUT-IN SLOT (only applies if this beat's VIDEO slot is tagged [CUT]): this is the sanctioned single crossing beat of the variant whose whole premise is that NOTHING of the interior is visible before crossing. A shut door, closed hatch, sealed shell, or pitch-black opening in the exterior IMAGE is the REQUIRED state here — never report it as a missing interior peek, an unopened/unfinished entry, a blocked crossing, or a reason the next frame cannot be interior. There is no peek and no anchor scale-up to look for between these two images: the entry is opened and passed through INSIDE this beat's own clip, so judge that slot as a crossing clip (a pure camera move through an untouched ruin, sterile of workers) and never against the construction-clip rules (single milestone package, dual progress, worker entry/exit and agent flow, kinetic climax motion). The interior IMAGE is also deliberately re-established from scratch rather than matched frame-to-frame against the exterior one, so do not report its different composition, framing, or camera position as a defect. What still applies across this crossing: construction order, envelope-seal continuity, and state monotonicity — it resets the camera only, so anything an earlier exterior beat sealed or repaired must read as still sealed and repaired on its inner face in the interior first frame.
@@ -10861,17 +11097,33 @@ def outline_frame_review_block(items):
     """逐拍审查 user turn 里追加的「卡片工序交付」段，挂在 FOCUS RECORD 之后。
 
     没有工序（老单/过门拍/未绑定的梯子）时返回空串，那一拍的 user turn 与改造前
-    逐字相同。"""
+    逐字相同。
+
+    富卡片（mat/zone/trace）在这里**指名点姓**地问：泛问"这拍的工序做完了吗"会被
+    VLM 用一句笼统的"looks finished"糊过去，问"the oiled pine planks 在 floor 区里
+    看得见吗、pine plank seams 还在吗"才有判定力。这是富字段唯一一处不改任何闸门
+    逻辑就白拿的收益（见 docs/beat_outline_enrichment_plan.md §5.7）。"""
     lines = []
     for item in (items or []):
         if not isinstance(item, dict):
             continue
         text = str(item.get('text') or '').strip()
-        delivery = str(item.get('delivery') or '').strip()
+        delivery = str(item.get('card_en') or item.get('delivery') or '').strip()
         if text and delivery:
             lines.append(f"  · {text} — {delivery}")
         elif text or delivery:
             lines.append(f"  · {text or delivery}")
+        else:
+            continue
+        materials = [str(x).strip() for x in (item.get('mat') or []) if str(x).strip()]
+        zone = str(item.get('zone') or '').strip()
+        trace = str(item.get('trace') or '').strip()
+        if materials:
+            named = ', '.join(f'"{m}"' for m in materials)
+            where = f' in the {zone} zone' if zone else ''
+            lines.append(f"    Look for, by name{where}: {named}")
+        if trace:
+            lines.append(f'    Must still show the trace it leaves: "{trace}"')
     if not lines:
         return ""
     return (
@@ -10917,15 +11169,20 @@ def outline_frame_verdicts(items, reported):
     for line in (reported or []):
         raw = str(line)
         low = raw.lower()
+        # 问句里现在给的是卡片 EN（见 outline_frame_review_block），所以整串命中要
+        # 连 card_en 一起认，否则富卡片一律掉到下面的实义词兜底里去。
         hit = next((n for n, item in indexed
                     if (str(item.get('text') or '').strip()
                         and str(item.get('text')).strip() in raw)
-                    or (str(item.get('delivery') or '').strip()
-                        and str(item.get('delivery')).strip().lower() in low)), None)
+                    or next((True for key in ('card_en', 'delivery')
+                             if str(item.get(key) or '').strip()
+                             and str(item.get(key)).strip().lower() in low), False)), None)
         if hit is None:
             scores = {}
             for n, item in indexed:
-                words = _trace_name_keywords(item.get('delivery'))
+                words = (_trace_name_keywords(' '.join(item.get('mat') or []))
+                         or _trace_name_keywords(item.get('card_en'))
+                         or _trace_name_keywords(item.get('delivery')))
                 score = sum(1 for w in words if w in low)
                 if score:
                     scores[n] = score
@@ -10949,6 +11206,13 @@ def outline_items_by_beat(ledger):
             continue
         item = {'index': row.get('index'), 'text': str(row.get('text') or ''),
                 'delivery': str(row.get('delivery') or '')}
+        # 富字段（卡片事实源）随投影一起走，帧审查才问得出"the oiled pine planks
+        # 在 floor 区里看得见吗"这种指名问句，而不是泛问"这拍做完了吗"。
+        for key in ('card_en', 'zone', 'trace'):
+            if row.get(key):
+                item[key] = str(row.get(key))
+        if row.get('mat'):
+            item['mat'] = [str(x) for x in row['mat']]
         for beat in (row.get('claimed_beats') or []):
             by_beat.setdefault(str(beat), []).append(item)
     return by_beat
@@ -11916,7 +12180,15 @@ def _format_primary_trend_block(entries):
         "material, aesthetic, hook) from the references below, recombined through the Morphological Matrix axes.\n"
         '- The "trend_ref" field of EVERY idea MUST therefore be NON-EMPTY: cite in one short Chinese sentence '
         "which reference point was borrowed.\n"
-        "- All filters above (SHELTER-ONLY, REALISM-ONLY, ledger dedupe, cliché blocklist, buildability) still apply strictly.\n\n"
+        "- All filters above still apply strictly and none of them is relaxed by a trend match: SHELTER-ONLY, "
+        "REALISM-ONLY, SALVAGE-AND-REBUILD, burned twist ROOTS, the CARRIER-FAMILY QUOTA, ledger dedupe, "
+        "cliché blocklist, buildability.\n"
+        "- WHICH AXIS TO BORROW ON: the twist, material, aesthetic, hook, title format and pacing are the "
+        "cheapest and best things to take from a reference. The Axis-1 CARRIER is the one axis still bound by "
+        "the family quota — so when a reference showcases a natural in-situ shell (cave, rock cleft, ice "
+        "cavity, living trunk) beyond the quota, borrow its twist/material/hook and stage them on an abandoned "
+        "man-made structure or a vehicle/vessel shell instead. Borrowing a trend never licenses a carrier that "
+        "has nothing to salvage.\n\n"
         + "\n\n".join(ref_parts) + "\n"
     )
     return trend_refs, trend_block
@@ -12047,7 +12319,7 @@ PACING_SKELETONS = {
             'kitchen/work furniture mini-payoff -> keep the end divider visible, open it on camera and traverse '
             'through shared floor/utility/light anchors into a distinct untouched secondary raw space -> repeat the same base/membrane/grid/insulation/board/'
             'finish ladder -> core furniture -> accelerated supporting furniture, soft furnishing and warm '
-            'lighting -> worker exits -> brief clean worker-free wide reveal. Spend most beats on irreversible '
+            'lighting -> brief clean worker-free wide reveal as a separate reward beat. Spend most beats on irreversible '
             'construction-state changes, shorten beats as furnishing begins, and require a visible result '
             'change every beat. The two spaces must have different functions and neither payoff may be a '
             'partial construction state. CANONICAL 15-SLOT RHYTHM REFERENCE (copied from the successful '
@@ -12057,7 +12329,7 @@ PACING_SKELETONS = {
             'repair and corrosion protection; 6 membrane plus hidden services; 7 insulation/enclosure; 8 '
             'floor and finish surfaces; 9 primary furniture/function mini-payoff; 10 conceptual divider-transition marker into '
             'untouched secondary space; 11 secondary cleanout; 12 hidden layers plus insulation; 13 enclosure '
-            'plus finished surfaces; 14 secondary core furniture/soft furnishing; 15 worker exit and final '
+            'plus finished surfaces; 14 secondary core furniture/soft furnishing; 15 final '
             'reward. Preserve this phase ratio when the total is compressed; never remove either cleanout, '
             'either functional payoff, or either transition.'
         ),
@@ -12623,7 +12895,7 @@ def _outline_entry_texts(outline):
 
 
 def _outline_normalized_entries(outline):
-    """把 beat_outline 的原始条目列表收成 [{'op': str|None, 'text': str}, ...]。
+    """把 beat_outline 的原始条目列表收成统一结构，并原位透传可选富字段。
 
     与 _outline_entry_texts 同源、同顺序、同过滤条件（空文本条目一律丢弃），所以两者
     的下标可以直接互换——契约层按下标算覆盖率，任何一边多丢一条都会让编号整体错位。"""
@@ -12637,7 +12909,25 @@ def _outline_normalized_entries(outline):
         else:
             continue
         if text:
-            entries.append({'op': op, 'text': text})
+            normalized = {'op': op, 'text': text}
+            if isinstance(entry, dict):
+                en = str(entry.get('en') or '').strip()
+                raw_mat = entry.get('mat')
+                mat = ([str(x).strip() for x in raw_mat if str(x).strip()]
+                       if isinstance(raw_mat, (list, tuple)) else [])
+                if en:
+                    normalized['en'] = en
+                if mat:
+                    normalized['mat'] = mat
+                # zone/scope/trace（P2/P3）：scope 是闭集枚举，统一小写后再往下走，
+                # 否则规划器那边 stage_scope 的等值比对会被一个大写字母判成冲突。
+                for key in ('zone', 'scope', 'trace'):
+                    value = str(entry.get(key) or '').strip()
+                    if key == 'scope':
+                        value = value.lower()
+                    if value:
+                        normalized[key] = value
+            entries.append(normalized)
     return entries
 
 
@@ -12916,6 +13206,13 @@ def build_outline_delivery_ledger(beat_ladder, contract, prompt_audit=None, fram
                                       'delivery': '', 'claimed_beats': [], 'frame_seqs': []})
             if not row['delivery']:
                 row['delivery'] = str(item.get('delivery') or '')
+            # 富字段一并进账：帧审查层的指名点姓问句从这份投影取词
+            # （outline_items_by_beat → outline_frame_review_block），不带就退回泛问。
+            for key in ('card_en', 'zone', 'trace'):
+                if not row.get(key) and item.get(key):
+                    row[key] = str(item.get(key))
+            if not row.get('mat') and item.get('mat'):
+                row['mat'] = [str(x) for x in item['mat']]
             if pos not in row['claimed_beats']:
                 row['claimed_beats'].append(pos)
                 row['frame_seqs'].append(pos + 1)
@@ -13102,10 +13399,53 @@ def build_outline_plan_block(beat_outline, max_total_beats):
     if not plan:
         return plan, ""
 
-    lines = '\n'.join(
-        f'  {i}. {e["text"]}' + (f' [{e["op"]}]' if e.get('op') else '')
-        for i, e in enumerate(plan, 1))
+    rendered = []
+    for i, entry in enumerate(plan, 1):
+        head = f'  {i}. {entry["text"]}' + (f' [{entry["op"]}]' if entry.get('op') else '')
+        tags = []
+        if entry.get('zone'):
+            tags.append(f'zone: {entry["zone"]}')
+        if entry.get('scope'):
+            tags.append(f'scope: {entry["scope"]}')
+        rendered.append(head + (f' | {" | ".join(tags)}' if tags else ''))
+        if entry.get('en'):
+            rendered.append(f'     EN: {entry["en"]}')
+        if entry.get('mat'):
+            rendered.append(f'     MATERIALS: {", ".join(entry["mat"])}')
+        if entry.get('trace'):
+            rendered.append(f'     LEAVES: {entry["trace"]}')
+    lines = '\n'.join(rendered)
     n = len(plan)
+    # 富字段绑定段只在卡片真的给了这几个字段时才出现——老卡/老断点凭空看见一段
+    # "把 stage_scope 设成清单里的 scope"只会让规划器去编一个不存在的值。
+    has_scope = any(e.get('scope') for e in plan)
+    has_zone = any(e.get('zone') for e in plan)
+    has_trace = any(e.get('trace') for e in plan)
+    rich_block = ""
+    if has_scope or has_zone or has_trace:
+        rules = []
+        if has_scope:
+            rules.append(
+                "COVERAGE: an entry's own \"scope\" IS that beat's \"stage_scope\" — copy it "
+                "verbatim (large/default/small). Do not upgrade a small entry to a full-coverage "
+                "claim or downgrade a large one; that wording is enforced against the IMAGE "
+                "downstream. (Threshold/reward beats keep the null stage_scope their own rules "
+                "require.)")
+        if has_zone:
+            rules.append(
+                "ZONE: an entry's \"zone\" names the physical partition its work lands in. Beats "
+                "delivering entries of the SAME zone must work the SAME area — their "
+                "\"changed_grid_cells\" must overlap by at least one cell. A different zone must "
+                "move to a visibly different part of the frame. Never scatter one zone's work "
+                "across unrelated cells from beat to beat.")
+        if has_trace:
+            rules.append(
+                "LEAVES: an entry's \"trace\" is the visible residue its beat leaves behind. It "
+                "must appear in that beat's own \"persistent_traces\", and the NEXT beat must "
+                "still carry it in its \"persistent_traces\" or \"preserve_state\" — work that "
+                "vanishes in the following frame reads as never having been done.")
+        rich_block = ("\nCARD-DECLARED BEAT PROPERTIES (mandatory — these come from the card the "
+                      "user chose, not from you):\n- " + "\n- ".join(rules) + "\n")
     block = (
         "\nCARD WORK PLAN (MANDATORY — this is the exact list of construction stages the user read "
         "on the ideation card when they chose this creative. It is a hard requirement of this job, "
@@ -13114,6 +13454,7 @@ def build_outline_plan_block(beat_outline, max_total_beats):
         "\nThe [bracketed tags] are each entry's declared operation. The beat that delivers an "
         "entry must carry that same operation in its own \"operation\" field or in its "
         "\"package_operations\".\n"
+        f"{rich_block}"
         # 一比一契约：条目数 == 拍数，逐条对应，物理规则只能移动，不能合并/拆分/新增。
         f"\nONE-TO-ONE CONTRACT (mandatory, non-negotiable): you must return EXACTLY {n} elements — "
         f"exactly one beat per card work plan entry above, in the SAME order. Beat k's \"outline_refs\" "
@@ -13138,12 +13479,13 @@ def build_outline_plan_block(beat_outline, max_total_beats):
         # 内容绑定：编号对应不查内容，认领了第 k 条却交付别的东西是零成本的。
         # 这份英文复述是唯一能跨语言（清单中文 / 提示词英文）做确定性校验的桥。
         "\nDELIVERY RESTATEMENT (mandatory): alongside \"outline_refs\", every beat must carry an "
-        "\"outline_delivery\" array with exactly one string, restating IN ENGLISH the physical work "
-        "and the terminal product of its own entry. Use the concrete material and object nouns you "
-        "will actually use in that beat's own \"milestone_name\" / \"after_state\". This string is "
-        "carried forward into the prompt-composition stage and checked against the generated IMAGE "
-        "prompt afterwards, so write the real words — never a placeholder like \"entry 3\" or a "
-        "generic \"construction work\".\n")
+        "\"outline_delivery\" array with exactly one string. When an entry supplies an EN line above, "
+        "copy that EN wording verbatim as the start of its outline_delivery. You may append concrete "
+        "beat-specific detail, but must never replace or omit any noun phrase listed on its MATERIALS "
+        "line. For a legacy entry without EN/MATERIALS, restate its physical work and terminal product "
+        "in English using the concrete nouns from milestone_name/after_state. This string is carried "
+        "into prompt composition and checked against the generated IMAGE; never use a placeholder "
+        "like \"entry 3\" or generic \"construction work\".\n")
     return plan, block
 
 
@@ -13284,9 +13626,181 @@ _OUTLINE_DELIVERY_PLACEHOLDER = re.compile(
     r'|^\W*(?:construction|renovation|building)?\s*work\W*$'
     r'|^\W*(?:see|as)\s+(?:above|below|described)\b', re.IGNORECASE)
 
+# 富字段门禁开关。False 时只记录真实模型的不合规率、保留字段；True 时不合格条目就地
+# 剥回 {op,text}（= 今天的形态，诚实、不骗人），卡片照常交付，绝不触发整批 150s 重烧。
+# 2026-08-08 打开：观察期里模型对 en/mat 的合规率已经稳定，而"保留一个不合格的 en/mat"
+# 比"没有富字段"更糟——下游 check_outline_delivery_realized 会拿一个坏锚点去匹配正文，
+# 把好好的一拍判成缺失，或者反过来让占位串自证通过。
+_OUTLINE_RICH_GATE_ENFORCING = True
+
+_OUTLINE_SCOPE_VALUES = ('large', 'default', 'small')
+
+
+def _outline_rich_entry_violations(entry, previous_mat=None):
+    """事实源字段（en/mat）的确定性验收，逐条判。
+
+    完全没写是合法老形态，不报错；写了就得写对。判据全部**复用合成侧现成的两个**
+    （_OUTLINE_DELIVERY_PLACEHOLDER / _milestone_keywords），口径天然一致。
+
+    zone/scope/trace 不在这里，见 _outline_beat_property_violations：那三个是**独立的
+    降级包**。把两包绑在一起判过一次（2026-08-08 实测）——模型写对了 en/mat、漏了
+    zone，整条被剥成 {op,text}，连带把已经合格的跨语言锚点也扔了，比不加字段更糟。
+
+    跨条目的规则（分区抖动上界、覆盖度分布、痕迹链）见 _outline_rich_list_violations。"""
+    if not isinstance(entry, dict):
+        return []
+    en = str(entry.get('en') or '').strip()
+    raw_mat = entry.get('mat')
+    if not en and raw_mat in (None, [], ()):
+        return []
+
+    errors = []
+    if (not en or _OUTLINE_DELIVERY_PLACEHOLDER.match(en)
+            or not _milestone_keywords(en)):
+        errors.append('en must be usable English naming the physical action and terminal product')
+    word_count = len(re.findall(r"[A-Za-z]+(?:[-'][A-Za-z]+)?", en))
+    if en and not 8 <= word_count <= 20:
+        errors.append(f'en must contain 8-20 English words (got {word_count})')
+    if not isinstance(raw_mat, (list, tuple)) or not 1 <= len(raw_mat) <= 3:
+        errors.append('mat must contain 1-3 concrete English material/object names')
+        mats = []
+    else:
+        mats = [str(x).strip() for x in raw_mat]
+        if any(not x or not _milestone_keywords(x) for x in mats):
+            errors.append('every mat value must be a concrete English material/object name')
+    low_en = ' '.join(en.lower().split())
+    absent = [m for m in mats if ' '.join(m.lower().split()) not in low_en]
+    if absent:
+        errors.append(f'every mat value must occur verbatim in en (missing: {absent})')
+
+    op = str(entry.get('op') or '').strip()
+    current = tuple(sorted(' '.join(m.lower().split()) for m in mats))
+    previous = tuple(sorted(' '.join(str(m).lower().split()) for m in (previous_mat or [])))
+    if current and previous and current == previous and op not in ('clearing', 'threshold', 'reward'):
+        errors.append('mat must not exactly repeat the preceding entry for this operation')
+    return errors
+
+
+def _outline_beat_property_violations(entry, zone_map=None):
+    """拍属性字段（zone/scope/trace）的确定性验收，逐条判。
+
+    这三个是下游 changed_grid_cells / stage_scope / persistent_traces 的**上游来源**，
+    此前全由规划器凭空发挥。它们作为一个原子包一起给、一起降级：只给 zone 不给 scope
+    的半包没有意义（下游那个字段照样得猜），但它们的成败**不牵连 en/mat**。
+
+    一条都没写 = 老形态/P1 卡，合法，静默退回今天的行为。"""
+    if not isinstance(entry, dict):
+        return []
+    zone = str(entry.get('zone') or '').strip()
+    scope = str(entry.get('scope') or '').strip().lower()
+    trace = str(entry.get('trace') or '').strip()
+    if not (zone or scope or trace):
+        return []
+
+    op = str(entry.get('op') or '').strip()
+    errors = []
+    if not zone:
+        errors.append('zone is required (name the spatial partition this work lands in)')
+    elif zone_map and _normalized_zone(zone) not in {_normalized_zone(z) for z in zone_map}:
+        errors.append(f'zone "{zone}" is not one of this card\'s declared zone_map {list(zone_map)}')
+    if scope not in _OUTLINE_SCOPE_VALUES:
+        errors.append(f'scope must be one of {list(_OUTLINE_SCOPE_VALUES)} (got "{scope}")')
+    elif op == 'reward' and scope != 'large':
+        # 末拍是整屋揭示，写成局部进度会让 IMAGE 侧的覆盖度措辞跟着缩水。
+        errors.append('the final reward entry must be scope="large"')
+    if op != 'clearing' and not trace:
+        errors.append('trace is required (the visible residue this entry leaves for every later beat)')
+    if trace and not _milestone_keywords(trace):
+        errors.append('trace must be written in English and name a concrete visible residue')
+    return errors
+
+
+def _normalized_zone(value):
+    """分区名的比较口径：大小写与空白无关，其余原样。闭集校验两侧都走它。"""
+    return ' '.join(str(value or '').lower().split())
+
+
+def _outline_rich_list_violations(entries, zone_map=None):
+    """跨条目的富字段规则。返回 {条目下标(0-based): [违规, ...]}。
+
+    逐条判不出来的三件事，恰恰是画面连续性的三根柱子：
+      · 分区抖动 —— 每拍换一个区 = 镜头在完全不同的地方反复横跳，观众读不出进度；
+      · 覆盖度分布 —— 全 large（每拍都是整屋完工）与全 small（永远看不出变化）
+        是同一个病的两端；
+      · 痕迹链 —— trace 两两重复就等于没有新的可见残留。
+
+    判定落到**具体条目**上而不是整批：调用方按条目降级（剥掉富字段），一条不合格
+    不该把同一张卡的其他条目也拖下水。"""
+    entries = [e for e in (entries or []) if isinstance(e, dict)]
+    out = {}
+
+    def add(i, message):
+        out.setdefault(i, []).append(message)
+
+    rich = [(i, e) for i, e in enumerate(entries)
+            if str(e.get('zone') or '').strip() or str(e.get('scope') or '').strip()
+            or str(e.get('trace') or '').strip()]
+    if not rich:
+        return out
+
+    # 1) 分区抖动上界：切换次数 ≤ ⌈N/3⌉。超了就是"每拍换个地方"。
+    zoned = [(i, _normalized_zone(e.get('zone'))) for i, e in rich if e.get('zone')]
+    switches = [(i, prev, cur) for (_, prev), (i, cur)
+                in zip(zoned, zoned[1:]) if prev != cur]
+    budget = math.ceil(len(entries) / 3) if entries else 0
+    if len(switches) > budget:
+        for i, prev, cur in switches[budget:]:
+            add(i, f'zone switches too often: this card allows at most {budget} zone changes '
+                   f'across {len(entries)} entries, and this entry adds another ("{prev}" -> "{cur}")')
+    # 过门那条必须**是**一次分区切换：它是全片唯一一次穿越动作（见
+    # outline_skeleton_violations 的过门唯一性规则），停在原分区里就名不副实。
+    switched_at = {i for i, _, _ in switches}
+    for pos, (i, zone) in enumerate(zoned):
+        if pos and str(entries[i].get('op') or '') == 'threshold' and i not in switched_at:
+            add(i, f'the threshold entry must cross into a different zone, but it stays in '
+                   f'"{entries[i].get("zone")}" like the entry before it')
+
+    # 2) 覆盖度分布：不得全 large，也不得全 small。
+    scopes = [(i, str(e.get('scope') or '').strip().lower()) for i, e in rich if e.get('scope')]
+    values = {s for _, s in scopes}
+    if len(scopes) >= 3 and len(values) == 1 and values <= {'large', 'small'}:
+        only = next(iter(values))
+        reason = ('every beat claiming a full-coverage completion leaves no sense of progression'
+                  if only == 'large' else
+                  'every beat claiming only a local change leaves no readable milestone')
+        for i, _ in scopes:
+            add(i, f'all entries declare scope="{only}" — {reason}; vary the coverage tiers')
+
+    # 3) 痕迹链：trace 两两不得重复。
+    seen = {}
+    for i, e in rich:
+        trace = _normalized_zone(e.get('trace'))
+        if not trace:
+            continue
+        if trace in seen:
+            add(i, f'trace repeats entry {seen[trace] + 1}\'s residue ("{e.get("trace")}") — '
+                   f'each entry must leave its own distinct visible mark')
+        else:
+            seen[trace] = i
+    return out
+
+
+_OUTLINE_FACT_FIELDS = ('en', 'mat')
+_OUTLINE_PROPERTY_FIELDS = ('zone', 'scope', 'trace')
+
+
+def _strip_outline_rich_fields(entry, fields=None):
+    """降级：丢掉指定的那一包富字段，保留其余一切。
+
+    两包各自原子（事实源 en/mat / 拍属性 zone/scope/trace），互不牵连——一包不合格
+    不该把另一包已经合格的信息也扔掉。fields=None 时两包全丢，退回今天的 {op,text}。"""
+    drop = set(fields if fields is not None
+               else _OUTLINE_FACT_FIELDS + _OUTLINE_PROPERTY_FIELDS)
+    return {k: v for k, v in entry.items() if k not in drop}
+
 
 def outline_binding_violations(outline, beat_ladder):
-    """认领得**忠实**吗——覆盖率之外的三道闸门（2026-08-05，节拍简介升级为硬规则）。
+    """认领得**忠实**吗——覆盖率之外的四道闸门。
 
     outline_contract_violations 只回答"每条工序都被某拍认领了吗、有没有一拍吞太多"，
     查的全是**编号**。认领第 3 条却交付完全不相干的工作，在那套校验里是零成本的
@@ -13300,6 +13814,9 @@ def outline_binding_violations(outline, beat_ladder):
          ladder 是英文，但两边的工序类型枚举完全同源（见 _OUTLINE_OPS）。
       3) DELIVERY —— 每条认领都要有一句英文复述（outline_delivery）。它既是内容被真正
          读进去的证据，也是下游 check_outline_delivery_realized 唯一的英文抓手。
+      4) FIDELITY —— 富卡片声明的每个 mat 名词必须原样留在规划器复述中，防止换词。
+      5) SCOPE / ZONE / TRACE —— 富卡片声明的覆盖度、分区、残留必须落到拍上，
+         见 _outline_rich_binding_violations（这三个字段此前全由规划器凭空发挥）。
 
     与 outline_contract_violations 分家而不是合并进去：那一套的语义是"映射完整性"，
     老 ladder / 老断点没有 outline_delivery 也不该因此被判违规；这一套是新契约，
@@ -13311,6 +13828,7 @@ def outline_binding_violations(outline, beat_ladder):
     entries = _outline_normalized_entries(outline)
     ladder = [b for b in (beat_ladder or []) if isinstance(b, dict)]
     errors = []
+    claims = {}  # 工序号 → (拍号, 拍)，喂给富字段绑定校验
 
     highest_claimed = 0
     highest_beat = 0
@@ -13318,6 +13836,8 @@ def outline_binding_violations(outline, beat_ladder):
         refs = _beat_outline_refs(beat, len(entries))
         if not refs:
             continue
+        for n in refs:
+            claims.setdefault(n, (pos, beat))
         milestone = str(beat.get('milestone_name') or beat.get('description') or '')[:60]
 
         # 1) 认领序不得倒退
@@ -13378,6 +13898,90 @@ def outline_binding_violations(outline, beat_ladder):
                     f'content words. "outline_delivery" must be written IN ENGLISH and name the '
                     f'physical material and the terminal product, in the same words this beat\'s '
                     f'own milestone/after_state uses — never a placeholder, never Chinese.')
+            else:
+                materials = entries[n - 1].get('mat') or []
+                low_delivery = ' '.join(text.lower().split())
+                missing_materials = [m for m in materials
+                                     if ' '.join(str(m).lower().split()) not in low_delivery]
+                if missing_materials:
+                    errors.append(
+                        f'beat {pos} ("{milestone}") changes the fact-source wording for card entry '
+                        f'{n} ("{entries[n - 1]["text"]}"): its outline_delivery "{text}" omits '
+                        f'MATERIALS {missing_materials}. FIDELITY requires copying the card EN and '
+                        f'every MATERIALS name verbatim; append beat-specific detail only after them.')
+    errors.extend(_outline_rich_binding_violations(entries, ladder, claims))
+    return errors
+
+
+def _outline_rich_binding_violations(entries, ladder, claims):
+    """卡片自报的 scope / zone / trace 有没有真的落到拍上（P2/P3 的下游一半）。
+
+    这三个下游字段（stage_scope / changed_grid_cells / persistent_traces）此前全部由
+    规划器自定，卡片一根柱子都没提供：猜错 scope 直接决定 IMAGE 用不用 "the entire"
+    措辞，猜错 zone 让相邻拍在完全不同的区域反复横跳，漏掉 trace 就是"做完又消失"。
+
+    痕迹链**只查到下一拍**，不按"第 k 条的 trace 必须出现在 k+1..N 每一拍"来查：
+    persistent_traces 每拍只有两三条，第 12 拍不可能同时背着前 11 条的残留，那样的
+    契约必然每单必违、把重排循环烧穿。相邻两拍连得上，链条自然是通的；"后面还在不在"
+    由帧审查（outline_frame_review_block 的 trace 问句）在真图上查，比在 JSON 里查准。"""
+    errors = []
+    for n, (pos, beat) in sorted(claims.items()):
+        entry = entries[n - 1]
+        milestone = str(beat.get('milestone_name') or beat.get('description') or '')[:60]
+        scope = str(entry.get('scope') or '').strip().lower()
+        # 过门/揭示拍按 schema 本就要求 stage_scope 为空，不参与等值比对。
+        exempt = bool(beat.get('bridge_stage') or beat.get('hard_cut')
+                      or str(beat.get('operation') or '') in ('threshold', 'reward'))
+        if scope and not exempt:
+            declared = str(beat.get('stage_scope') or '').strip().lower()
+            if declared != scope:
+                errors.append(
+                    f'beat {pos} ("{milestone}") delivers card entry {n} '
+                    f'("{entry["text"]}"), whose card-declared coverage is scope="{scope}", but '
+                    f'this beat sets stage_scope="{beat.get("stage_scope")}". The card decides '
+                    f'how much of the surface this stage finishes — set stage_scope="{scope}".')
+
+        trace = str(entry.get('trace') or '').strip()
+        if trace:
+            words = _trace_name_keywords(trace)
+            own = ' '.join(str(t) for t in (beat.get('persistent_traces') or [])).lower()
+            if words and not any(w in own for w in words):
+                errors.append(
+                    f'beat {pos} ("{milestone}") delivers card entry {n} ("{entry["text"]}"), '
+                    f'which the card says leaves "{trace}" behind, but this beat\'s '
+                    f'persistent_traces {beat.get("persistent_traces") or []} never mention it. '
+                    f'Add that residue to persistent_traces — it is what makes this stage still '
+                    f'readable in every later frame.')
+            elif words and pos < len(ladder):
+                nxt = ladder[pos]
+                carried = (' '.join(str(t) for t in (nxt.get('persistent_traces') or []))
+                           + ' ' + str(nxt.get('preserve_state') or '')).lower()
+                if not any(w in carried for w in words):
+                    errors.append(
+                        f'beat {pos + 1} drops the residue "{trace}" that beat {pos} just left '
+                        f'for card entry {n} ("{entry["text"]}") — carry it in beat '
+                        f'{pos + 1}\'s persistent_traces or name it in its preserve_state, '
+                        f'otherwise the work done in beat {pos} visibly disappears one frame later.')
+
+    # ZONE：同一分区的工序必须落在同一片画面区域上。异区不做正向要求（分区名与 Grid
+    # 坐标没有先验对应，硬要求"换区必须换格"会把合法的同框相邻工序判违规）。
+    by_zone = {}
+    for n, (pos, beat) in claims.items():
+        zone = _normalized_zone(entries[n - 1].get('zone'))
+        cells = {str(c).strip().upper() for c in (beat.get('changed_grid_cells') or [])
+                 if str(c).strip()}
+        if zone and cells:
+            by_zone.setdefault(zone, []).append((n, pos, cells))
+    for zone, members in by_zone.items():
+        members.sort()
+        for (n_a, pos_a, cells_a), (n_b, pos_b, cells_b) in zip(members, members[1:]):
+            if not cells_a & cells_b:
+                errors.append(
+                    f'card entries {n_a} and {n_b} are both declared in zone "{zone}", but beat '
+                    f'{pos_a} works {sorted(cells_a)} and beat {pos_b} works {sorted(cells_b)} — '
+                    f'no shared grid cell. Work in one zone must stay in the same part of the '
+                    f'frame so the viewer reads it as continued progress, not a new location; '
+                    f'give the two beats at least one overlapping changed_grid_cells entry.')
     return errors
 
 
@@ -13413,10 +14017,19 @@ def bind_outline_to_ladder(config, outline, beat_ladder, violations=None):
         if not refs:
             continue
         delivery = _beat_outline_delivery(beat, refs)
-        beat['outline_items'] = [{'index': n,
-                                  'text': entries[n - 1]['text'],
-                                  'delivery': delivery.get(n, '')}
-                                 for n in refs]
+        bound_items = []
+        for n in refs:
+            source = entries[n - 1]
+            item = {'index': n, 'text': source['text'], 'delivery': delivery.get(n, '')}
+            if source.get('en'):
+                item['card_en'] = source['en']
+            if source.get('mat'):
+                item['mat'] = list(source['mat'])
+            for key in ('zone', 'scope', 'trace'):
+                if source.get(key):
+                    item[key] = source[key]
+            bound_items.append(item)
+        beat['outline_items'] = bound_items
 
     if outline_requires_occupancy(outline):
         for beat in reversed(beat_ladder or []):
@@ -13517,27 +14130,40 @@ def outline_skeleton_violations(idea):
     return errors
 
 
-def _outline_entry_family_span(text):
-    """一条中文清单条目跨了几个材料层族（0~7）。用中文侧的 _LAYER_FAMILIES。"""
-    text = str(text or '')
-    if not text.strip():
-        return 0
-    return sum(bool(re.search(pattern, text)) for pattern in _LAYER_FAMILIES)
+def _outline_entry_family_indices(entry):
+    """一条清单条目命中的材料层族下标。
 
-
-def _outline_entry_family_indices(text):
-    """Material-layer indices matched by one Chinese outline entry."""
+    entry 可以是富条目 dict、基础 dict，或纯文本（老形态）。**富条目优先按 mat/en 的
+    英文名词判层**（P4）：中文侧的 _LAYER_FAMILIES 是一张关键词表，"做好基层处理"
+    这种写法词表覆盖不到就静默漏判——拍重均衡这道闸门的输入精度，本来等于一个中文
+    词表的召回率。mat 是模型自报的具体材料名，判层从"猜"变成"读"。
+    mat/en 缺失（老卡、被剥掉富字段的条目）时原样回落到中文词表，行为不变。"""
+    if isinstance(entry, dict):
+        english = ' '.join([' '.join(str(m) for m in (entry.get('mat') or [])),
+                            str(entry.get('en') or '')]).strip()
+        if english:
+            hits = _matched_layer_indices(english, _LAYER_FAMILIES_EN)
+            if hits:
+                return hits
+        text = str(entry.get('text') or '')
+    else:
+        text = str(entry or '')
     return _matched_layer_indices(text, _LAYER_FAMILIES)
 
 
-def _outline_entry_weight(text):
+def _outline_entry_family_span(entry):
+    """一条清单条目跨了几个材料层族（0~7）。词源选择见 _outline_entry_family_indices。"""
+    return len(_outline_entry_family_indices(entry))
+
+
+def _outline_entry_weight(entry):
     """一条施工清单条目折算成几条「标准条目」。跨 N 族记 1 + 0.5*(N-1)。
 
     刻意做得很钝（只按族跨度、每多一族只加半条）：这个值直接进 compute_beats_floor，
     虚高会把 beats_floor 顶到卡片上限之上，被 compose 侧夹回后表现为「每次都掉进
     兜底 ladder」——比不加权还糟。宁可低估。
     """
-    return 1.0 + 0.5 * max(0, _outline_entry_family_span(text) - 1)
+    return 1.0 + 0.5 * max(0, _outline_entry_family_span(entry) - 1)
 
 
 # 单条清单里塞满三个材料层族仍直接算重条目；两族不再一律放行，而是额外检查
@@ -13558,17 +14184,20 @@ def outline_weight_violations(idea):
     """
     if not isinstance(idea, dict):
         return []
-    outline = _outline_texts(idea)
+    # 走归一条目而不是纯文本：富条目要拿 mat 的英文名词判层（见
+    # _outline_entry_family_indices），_outline_texts 会把那份信息丢掉。
+    entries = _outline_normalized_entries(idea.get('beat_outline'))
     errors = []
-    for text in outline[:-1]:  # 末条是 reward 揭示，不按施工条目算
-        span = _outline_entry_family_span(text)
+    for entry in entries[:-1]:  # 末条是 reward 揭示，不按施工条目算
+        text = entry['text']
+        span = _outline_entry_family_span(entry)
         if span >= _OUTLINE_MAX_ENTRY_FAMILIES:
             errors.append(
                 f'beat_outline entry "{text}" bundles {span} different material layers into one '
                 f'beat; every entry gets the same screen time, so split it into separate entries '
                 f'that each land one visible milestone')
             continue
-        pair = _forbidden_layer_pair(_outline_entry_family_indices(text))
+        pair = _forbidden_layer_pair(_outline_entry_family_indices(entry))
         if pair:
             errors.append(
                 f'beat_outline entry "{text}" crosses incompatible material-layer phases '
@@ -13608,8 +14237,10 @@ def compute_beats_floor(idea):
     #   「封板批腻子并刷完整个室内」 == 「装一盏吊灯」 == 1 条，
     # 于是一份条数少、每条却很重的清单算出的 floor 偏低，ladder 合法地把每个工序
     # 压成一拍——正是「节拍量太少、变化量大」那一侧的源头。一条塞两族按 1.5 条计。
-    construction_entries = outline[:-1]  # 末条是 reward，不算施工拍
-    weighted = sum(_outline_entry_weight(text) for text in construction_entries)
+    # 富条目的权重按 mat 的英文名词算（见 _outline_entry_family_indices）；
+    # _outline_texts 只留中文，这里要的是完整条目。
+    construction_entries = _outline_normalized_entries(idea.get('beat_outline'))[:-1]
+    weighted = sum(_outline_entry_weight(entry) for entry in construction_entries)
     density = int(math.ceil(weighted * _OUTLINE_SHRINK_TOLERANCE))
     return max(structural, density)
 
@@ -13807,6 +14438,353 @@ def pacing_skeleton_outline_violations(idea):
     return errors
 
 
+# ==================== 选题漂移门禁（把创意拉回「动手改造」）====================
+# 2026-08-08 台账复盘：最近 15 条里连着 7 条是天然岩洞/化石/晶穴壳体；twist 只剩
+# 「自材质透光墙 / 引水铜管暖榻 / 配重滑轮家具」三个根在轮换（其中 self-material-window
+# 还是参考片早就烧掉的那个）；并且漏出过一条「独居钟表与精密机械修缮室」——
+# SHELTER-ONLY 白纸黑字禁止的工作室类归宿。
+#
+# 三处漏点同源：这三条硬规则此前**只写在 system prompt 里**，产出侧没有任何确定性
+# 执行者（contract-registry 的 used-topic-ledger-dedup 干脆写着 enforcer: null）。
+# 模型漂了没人拦，于是「改造类」慢慢变成了「在天然洞里打磨石头」——工序从
+# 拆解/除锈/旧物回装退化成雕刻抛光，DIY 味就是这么流失的。
+#
+# 下面这批 violations 函数就是那三条规则的执行者，接线方式与既有 outline_* 门禁完全
+# 一致（返回英文错误串列表 → 进 hard_errs → 打回并回喂给模型返工）。
+_IDEATION_GATE_ENFORCING = True
+
+# 载体家族分类词表。2026-07-25 曾以「桶太粗、和 REALISM-ONLY 打架」为由取消家族轮换，
+# 只留「同批载体互不重复」——但那条只管**批内**互不相同，两块不同的石头就算通过，
+# 于是整批 100% 天然壳体完全合法。家族在这里回归，但只做**配额**（下面的
+# ideation_family_quota_violations），不再做「必须轮换」的强制，避开当年那个矛盾。
+#
+# 判定顺序 vehicle → man-made → natural 是刻意的：混合名（"quarry forge"、
+# "coastal stone winch house"）里人造构筑物才是真正的载体，天然词只是它所在的地貌。
+_CARRIER_FAMILY_TERMS = (
+    ('vehicle', (
+        'submarine', 'submersible', 'u-boat', 'bathyscaphe', 'escape capsule', 'escape pod',
+        'lifeboat', 'bus', 'coach', 'tram', 'trolley', 'locomotive', 'railcar', 'rail car',
+        'boxcar', 'carriage', 'wagon', 'fuselage', 'airliner', 'aircraft', 'airplane',
+        'helicopter', 'cockpit', 'plane', 'airframe', 'shipping container', 'container',
+        'tanker', 'tank car',
+        'hull', 'trawler', 'ship', 'boat', 'barge', 'ferry', 'gondola', 'cable car',
+        'cablecar', 'funicular', 'trailer', 'caravan', 'camper', 'van', 'truck', 'tractor',
+        'crane cab', 'mixer drum', 'cement mixer', 'dredger', 'ambulance', 'fire engine',
+    )),
+    ('man-made', (
+        'silo', 'lighthouse', 'water tower', 'watchtower', 'clock tower', 'bell tower',
+        'tower', 'windmill', 'watermill', 'windpump', 'mill', 'kiln', 'oast', 'chapel',
+        'church', 'belfry', 'monastery', 'shrine', 'pagoda', 'gatehouse', 'gate house',
+        'fort', 'fortress', 'bunker', 'pillbox', 'blockhouse', 'barracks', 'magazine',
+        'winch house', 'signal house', 'signal station', 'pumphouse', 'pump house',
+        'boathouse', 'smokehouse', 'icehouse', 'ice house', 'bunkhouse', 'dovecote',
+        'hut', 'cabin', 'cottage', 'shed', 'barn', 'stable', 'granary', 'warehouse',
+        'factory', 'forge', 'foundry', 'smithy', 'quarry', 'mineshaft', 'mine adit',
+        'adit', 'headframe', 'colliery', 'aqueduct', 'viaduct', 'bridge', 'pylon', 'pier',
+        'jetty', 'dam', 'sluice', 'flume', 'lock keeper', 'cistern', 'reservoir',
+        'crypt', 'catacomb', 'cellar', 'vault', 'well shaft', 'mine shaft', 'tunnel',
+        'culvert', 'subway', 'platform', 'hangar', 'depot', 'martello', 'dugout',
+        'observatory', 'lime kiln', 'charcoal kiln', 'grain elevator', 'water tank',
+        'oil tank', 'storage tank', 'silo tower', 'station',
+    )),
+    ('natural', (
+        'cave', 'cavern', 'grotto', 'karst', 'sinkhole', 'doline', 'cenote', 'lava tube',
+        'rock shelter', 'overhang', 'niche', 'alcove', 'cleft', 'fissure', 'crevice',
+        'canyon', 'gorge', 'ravine', 'tor', 'boulder', 'monolith', 'butte', 'mesa',
+        'cliff', 'crag', 'escarpment', 'hoodoo', 'glacier', 'iceberg', 'serac', 'moraine',
+        'trunk', 'stump', 'bole', 'hollow log', 'tree', 'baobab', 'redwood', 'sequoia',
+        'oak', 'juniper', 'cypress', 'cactus', 'saguaro', 'fossil', 'petrified',
+        'ammonite', 'conch', 'nautilus', 'carapace', 'shell', 'seashell', 'geode',
+        'crystal', 'quartz', 'selenite', 'amber', 'meteorite', 'coral', 'reef',
+        'mushroom', 'fungus', 'burrow', 'termite mound', 'rib cage', 'waterfall',
+        'spring', 'dune', 'basalt', 'granite', 'limestone', 'sandstone', 'tufa',
+    )),
+)
+
+# 词尾允许一个可选的 's'。矩阵里写的是 "stacked shipping containers"（复数）而词表条目
+# 是 "container"，硬 \b...\b 直接判不出来——载体名用复数是常态，漏了它等于给整整一族
+# 发通行证。
+_CARRIER_FAMILY_PATTERNS = tuple(
+    (family, re.compile(r'\b(?:' + '|'.join(re.escape(t) for t in terms) + r')s?\b'))
+    for family, terms in _CARRIER_FAMILY_TERMS
+)
+
+# 天然壳体在一批里的占比上限。天然壳体不是坏选题（参考片本身就是红杉树干），但它
+# 天生提供不了「拆下来的旧构件」，工序容易塌成打磨抛光，所以只给三分之一的配额。
+_IDEATION_NATURAL_CAP_RATIO = 1.0 / 3.0
+
+# 台账里出现过的 twist 根出现几次就算烧掉。1 = 用过一次就不许再用（idea-engine §2.3
+# 的原文口径：换个壳子套同一个 twist 产出的是变体，不是新选题）。
+_TWIST_ROOT_BURN_THRESHOLD = 1
+
+# 家族压力统计只看最近这么多条台账：整库统计会被半年前的分布稀释，看不出「最近这
+# 几批全是石头」这种正在发生的漂移。
+_FAMILY_PRESSURE_WINDOW = 24
+
+
+def carrier_family(idea):
+    """把一条 idea 的 Axis-1 载体归到 vehicle / man-made / natural / unknown。
+
+    只读 carrier 字段（缺失时回落到 topic DNA 的第一段）——把整条 DNA 丢进词表会被
+    destiny/twist 里的词污染（"missile-silo / burrow-dwelling / ..." 的 burrow 会把一个
+    人造载体拽进 natural）。判不出来时返回 unknown，配额按「非天然」处理：
+    宁可漏判，不可误判，这条门禁不值得为了严格多烧一次 150s 重试。
+    """
+    if isinstance(idea, dict):
+        carrier = str(idea.get('carrier') or '').strip()
+        if not carrier:
+            carrier = str(idea.get('dna') or '').split('/')[0].replace('-', ' ')
+    else:
+        carrier = str(idea or '')
+    carrier = carrier.lower()
+    if not carrier.strip():
+        return 'unknown'
+    for family, pattern in _CARRIER_FAMILY_PATTERNS:
+        if pattern.search(carrier):
+            return family
+    return 'unknown'
+
+
+def topic_twist_root(twist):
+    """twist 的「根」= 归一化 slug 的前两段（idea-engine §2.3）。
+
+    glass-floor-gears / glass-floor-cliff / glass-floor-tides 同为 glass-floor 一个根。
+    去重只比全串时，换个后缀就能把同一个 twist 无限复制——这正是台账里
+    「自材质透光墙」四连、「引水铜管暖榻」三连的成因。
+    """
+    slug = re.sub(r'[^a-z0-9]+', '-', str(twist or '').strip().lower()).strip('-')
+    if not slug:
+        return ''
+    return '-'.join(slug.split('-')[:2])
+
+
+def _row_twist_slug(row):
+    """从一条台账记录里取 twist slug：优先 DNA 第三段，回落到 creative_seed.twist。"""
+    if not isinstance(row, dict):
+        return ''
+    dna = str(row.get('topic_dna') or row.get('dna') or '')
+    parts = [p.strip() for p in dna.split('/')]
+    if len(parts) >= 3 and parts[2]:
+        return parts[2]
+    seed = row.get('creative_seed')
+    if isinstance(seed, dict):
+        return str(seed.get('twist') or '')
+    return str(row.get('twist') or '')
+
+
+def burned_twist_roots(rows, threshold=_TWIST_ROOT_BURN_THRESHOLD):
+    """台账里已烧掉的 twist 根 → {root: 出现次数}，按次数降序。
+
+    'custom-twist' / 'unspecified-twist' 这类占位串不进结果：它们匹配不到任何东西，
+    留在里面只会白白封掉一个不存在的根（idea-engine §2.3 最后一条）。
+    """
+    counts = {}
+    for row in rows or []:
+        root = topic_twist_root(_row_twist_slug(row))
+        if not root or root in ('custom-twist', 'unspecified-twist', 'custom', 'unspecified'):
+            continue
+        counts[root] = counts.get(root, 0) + 1
+    return dict(sorted(((r, n) for r, n in counts.items() if n >= threshold),
+                       key=lambda kv: (-kv[1], kv[0])))
+
+
+def carrier_family_pressure(rows, window=_FAMILY_PRESSURE_WINDOW):
+    """最近 window 条台账的载体家族分布 → {family: count}（含 0 值，便于直接进 prompt）。"""
+    counts = {'natural': 0, 'man-made': 0, 'vehicle': 0, 'unknown': 0}
+    for row in list(rows or [])[-window:]:
+        seed = row.get('creative_seed') if isinstance(row, dict) else None
+        probe = {
+            'carrier': (seed or {}).get('carrier') if isinstance(seed, dict) else None,
+            'dna': (row.get('topic_dna') or row.get('dna')) if isinstance(row, dict) else None,
+        }
+        counts[carrier_family(probe)] += 1
+    return counts
+
+
+# 归宿黑名单：SHELTER-ONLY 硬约束的可执行版本。idea-engine 原文列举的那几类，加上
+# 真正漏出来过的 workshop / repair room / horology（"独居钟表与精密机械修缮室"）。
+_NON_SHELTER_PATTERN = re.compile(
+    r'\b(?:bar|pub|tavern|speakeasy|cafe|café|coffee\s*(?:shop|house)|tea\s*house|'
+    r'restaurant|diner|bistro|studio|workshop|atelier|workbench room|repair\s*(?:room|shop|bay)|'
+    r'horology|horological|laborator\w*|lab|gallery|museum|showroom|boutique|shop|store|'
+    r'planetarium|public observatory|spa|sauna|onsen|bathhouse|hotel|hostel|motel|inn|'
+    r'guesthouse|guest house|clinic|surgery|office|classroom|school|venue|club|'
+    r'theatre|theater|cinema|gym|archive|reading room for)\b')
+
+_NON_SHELTER_PATTERN_ZH = re.compile(
+    r'工作室|工作坊|作坊|车间|修缮室|修理(?:室|铺|间)|维修(?:室|间)|实验室|画室|琴房|'
+    r'录音室|陶艺室|酒吧|咖啡(?:馆|厅|店)|茶室|茶馆|餐厅|食堂|民宿|旅馆|酒店|客栈|'
+    r'商店|店铺|展厅|展馆|画廊|博物馆|美术馆|图书馆|影院|健身房|诊所|办公室|教室|'
+    r'公共观星台|温泉馆|桑拿房')
+
+# 住人证据。SHELTER-ONLY 的 litmus 是「一个人能不能在这儿睡觉、生活」，所以光是
+# 没命中黑名单还不够——destiny 必须正面说出它是个住处。
+_SHELTER_CUE_PATTERN = re.compile(
+    r'\b(?:shelter|refuge|den|dwelling|home|homestead|house|cabin|hut|hideout|hideaway|'
+    r'retreat|bedroom|sleeping|sleep|bunk|bunkroom|nook|loft|lodge|quarters|abode|'
+    r'residence|cottage|nest|burrow|pod|camp|billet|snug|hermitage|bothy|dugout|'
+    r'living space|micro-?home|tiny home)\b')
+
+
+def ideation_shelter_violations(idea):
+    """SHELTER-ONLY 硬约束的确定性执行者（此前只存在于 prompt 文字里）。
+
+    两道判定，任一不过即打回：
+    1. destiny / 中文选题名里出现商业·公共·工作室类词 → 直接否决；
+    2. destiny 里找不到任何「住处」正面词 → 否决（litmus：一个人能不能睡在这儿）。
+
+    第 2 条只查 destiny 不查标题：中文标题常写成「…改造成雪境暖阁」，暖阁这类词进
+    正面词表要靠一张永远补不全的中文词典，而 destiny 字段本来就要求写成英文归宿名。
+    """
+    if not isinstance(idea, dict):
+        return []
+    destiny = str(idea.get('destiny') or '').strip()
+    errors = []
+    banned = _NON_SHELTER_PATTERN.search(destiny.lower())
+    if banned:
+        errors.append(
+            f'destiny "{destiny}" is a non-residential end-use ("{banned.group(0)}"); the '
+            f'SHELTER-ONLY POLICY is a hard veto — every destiny must be a private habitable '
+            f'shelter someone could sleep and live in')
+    zh_blob = ' '.join(str(idea.get(k) or '') for k in ('title', 'input_str'))
+    banned_zh = _NON_SHELTER_PATTERN_ZH.search(zh_blob)
+    if banned_zh and not banned:
+        errors.append(
+            f'the Chinese title declares a non-residential end-use ("{banned_zh.group(0)}"); '
+            f'the SHELTER-ONLY POLICY is a hard veto — rewrite it as a place to sleep and live in')
+    if destiny and not _SHELTER_CUE_PATTERN.search(destiny.lower()):
+        errors.append(
+            f'destiny "{destiny}" never names a dwelling; say what kind of shelter/refuge/'
+            f'bedroom/cabin it is so the "could one person live and sleep here?" litmus is passable')
+    return errors
+
+
+def ideation_twist_root_violations(idea, burned_roots=None):
+    """招牌反差的**根**级去重（idea-engine §2.3），此前完全没有程序化执行者。
+
+    burned_roots 由 burned_twist_roots() 从台账算出。命中即打回，理由串里直接写出
+    那个根和它已经用过几次——这段错误会被回喂给模型返工，说清楚才改得动。
+    """
+    if not isinstance(idea, dict):
+        return []
+    twist = str(idea.get('twist') or '').strip()
+    root = topic_twist_root(twist)
+    if not root:
+        # 完全没申报 twist 是「强制单一 twist」那条过滤器的事，而那条至今没有程序化
+        # 执行者。这道门只管**根级重复**，不越界去当另一条规则的执行者——多管一层的
+        # 代价是把一批本来只是字段不全的卡整批打回，而根级重复才是这次要治的病。
+        return []
+    if root in ('custom-twist', 'unspecified-twist', 'custom', 'unspecified'):
+        return [f'twist "{twist}" is a placeholder, not a twist; it matches nothing and blocks '
+                f'nothing in dedup — name the actual signature detail']
+    hits = (burned_roots or {}).get(root)
+    if hits:
+        return [f'twist "{twist}" reuses the burned twist root "{root}" (already used {hits}x in '
+                f'the ledger); changing the shell around a used twist produces a variant, not an '
+                f'idea — pick a twist whose first two slug segments are new']
+    return []
+
+
+# 旧物再生（DIY）词表：一条工序清单里出现这些动作，才算真的在「改造」而不是在
+# 「打磨一块天然石头」。中英各一份——清单的 text 是中文、en 是英文事实源。
+_SALVAGE_CUE_PATTERN_ZH = re.compile(
+    r'拆下|拆解|拆卸|拆检|拆出|回收|复用|回用|再利用|旧物|翻新|除锈|改装|回装|沿用|'
+    r'原件|原厂|重新利用|二次利用|修复.{0,4}(?:原|旧)|保留.{0,6}(?:改|做|作|装)')
+_SALVAGE_CUE_PATTERN_EN = re.compile(
+    r'salvag\w*|reclaim\w*|upcycl\w*|repurpos\w*|re-?us\w*|refurbish\w*|reinstall\w*|'
+    r'stripped out|cut down and|original .{0,30}(?:reused|refitted|remounted|rehung)')
+
+_SALVAGE_PLACEHOLDERS = ('n/a', 'na', 'none', 'null', 'tbd', 'unspecified', 'custom', '无', '待定')
+
+
+def ideation_salvage_violations(idea):
+    """旧物再生门（DIY 门）——这次拉回的核心。
+
+    这个门禁治的不是「重复」，是**体裁本身**：改造类视频的爽点有一半来自
+    「从这个壳子上拆下来的旧构件，回到室内变成了别的东西」——潜艇舷窗变背光搁板灯、
+    粮仓卸料斗变壁炉、炮弹钢壳变烟道。天然岩洞/化石壳体提供不了这种构件，工序就
+    只剩打磨抛光，于是整批选题看着像地质纪录片而不是改造片。
+
+    两条判定：
+    1. 卡片必须显式申报 salvage_en/salvage_zh（哪一件原生旧构件被拆下来、变成了什么）；
+    2. 那件构件必须在 beat_outline 里真的出现一拍带回收/改装/回装动作的工序——
+       只在申报字段里说一句、清单里查无此事，等于没有这道工序。
+
+    显式字段而不是从文本里猜，是刻意的：让模型在**生成时**就必须想清楚这一件东西，
+    比事后拿关键词表去猜它想没想过要可靠得多。
+    """
+    if not isinstance(idea, dict):
+        return []
+    # 两个前置条件，缺任一就不判——都不是"网开一面"，而是这道门根本无从判起：
+    # · 没申报 carrier：旧构件是**从这个壳子上**拆下来的，没有壳子就没有"这一件"可谈；
+    # · 没有工序清单：第二条判定（那道工序真的发生了吗）压根没有可查的对象，
+    #   而卡片本身也够不上候选（run_ideate 的 with_outline 分支会为此重试）。
+    # 现实中的漂移全部发生在两样都齐的卡上（台账里每一条都有），豁免不留真实漏洞。
+    if not str(idea.get('carrier') or '').strip():
+        return []
+    entries = _outline_normalized_entries(idea.get('beat_outline'))
+    if not entries:
+        return []
+    salvage_en = str(idea.get('salvage_en') or '').strip()
+    salvage_zh = str(idea.get('salvage_zh') or '').strip()
+    if not salvage_en and not salvage_zh:
+        return ['no "salvage_en"/"salvage_zh" declared: every candidate must name ONE original '
+                'component stripped out of this shell or its site and rebuilt into the interior '
+                '(e.g. brass portholes -> backlit shelf lights). This is the genre\'s DIY core; '
+                'a shell with nothing to salvage is the wrong shell']
+    if salvage_en.lower() in _SALVAGE_PLACEHOLDERS or salvage_zh in _SALVAGE_PLACEHOLDERS:
+        return [f'"salvage_en"/"salvage_zh" is a placeholder ("{salvage_en or salvage_zh}"); name '
+                f'the actual original component and what it becomes indoors']
+
+    for entry in entries:
+        if _SALVAGE_CUE_PATTERN_ZH.search(str(entry.get('text') or '')):
+            return []
+        if _SALVAGE_CUE_PATTERN_EN.search(str(entry.get('en') or '').lower()):
+            return []
+    return [f'the declared salvage ("{salvage_zh or salvage_en}") never happens in beat_outline: '
+            f'add ONE construction beat that visibly strips out / de-rusts / refits / reinstalls '
+            f'that original component (拆下·除锈·翻新·改装·回装 / salvaged·reclaimed·'
+            f'repurposed·reinstalled). Polishing the shell\'s own natural surface does not count']
+
+
+def ideation_family_quota_violations(ideas, count=None, already=None):
+    """批次级天然壳体配额 → {idx: [err]}。
+
+    与其它 ideation_* 门禁不同，这条判的是**一批**而不是一条：单看任何一条
+    「悬崖石龛改造成读书睡眠阁」都完全合法，问题只在连着七条都是石头。
+    既有的「同批载体互不重复」规则管不了这个——两块不同的石头本来就互不重复。
+
+    超额的按名次从后往前打回（score 高的先留），并把已经攒在手里的卡（already）一起
+    计入配额，避免第一轮收 2 条天然、补批再收 3 条天然，最后交付的还是一批石头。
+    """
+    ideas = [i for i in (ideas or []) if isinstance(i, dict)]
+    if not ideas:
+        return {}
+    total = max(int(count or 0), len(ideas) + len(already or []))
+    cap = max(1, int(math.ceil(total * _IDEATION_NATURAL_CAP_RATIO)))
+    used = sum(1 for row in (already or [])
+               if isinstance(row, dict) and carrier_family(row) == 'natural')
+    natural_idx = [i for i, idea in enumerate(ideas) if carrier_family(idea) == 'natural']
+    # 同为天然壳体时按分数保留高分的那几条；分数缺失当 0。
+    natural_idx.sort(key=lambda i: -(float(ideas[i].get('score') or 0)))
+    over = natural_idx[max(0, cap - used):]
+    return {
+        i: [f'carrier "{ideas[i].get("carrier") or "?"}" is another natural in-situ shell (cave / '
+            f'rock / fossil / ice / living trunk) and this batch already fills its natural-carrier '
+            f'quota of {cap}/{total}. Natural shells carry nothing salvageable, so their builds '
+            f'collapse into carving and polishing. Replace it with an abandoned man-made structure '
+            f'or a vehicle/vessel shell that arrives with fittings worth stripping out and reusing']
+        for i in sorted(over)
+    }
+
+
+def ideation_topic_violations(idea, burned_roots=None):
+    """一条卡片的全部单卡级选题门禁（家族配额是批次级的，不在这里）。"""
+    return (ideation_shelter_violations(idea)
+            + ideation_twist_root_violations(idea, burned_roots)
+            + ideation_salvage_violations(idea))
+
+
 def run_ideate(config, count=5, theme=None, theme_label=None, trend_ref_ids=None,
                 remix_seed=None, pacing_skeleton_ids=None):
     # 形态矩阵按本次激活的技能 profile 现读（做哪个模型的提示词就用哪个包的形态矩阵：
@@ -13849,18 +14827,29 @@ def run_ideate(config, count=5, theme=None, theme_label=None, trend_ref_ids=None
         for row in managed_ledger if isinstance(row, dict)
     ) or '(empty)'
 
+    # 台账不只是「别重复」的黑名单，它还是一份漂移体检报告：烧过的 twist 根、最近几批
+    # 的载体家族分布。以前这两样都只是隐含在整份台账原文里指望模型自己数出来——它数
+    # 不出来，于是同一个 twist 根用四遍、连着七条石头壳体。现在算好了明写进 prompt，
+    # 产出侧再由 ideation_* 门禁兜一道（prompt 说服 + 门禁强制，两层都要）。
+    ledger_burned_roots = burned_twist_roots(managed_ledger)
+    family_pressure = carrier_family_pressure(managed_ledger)
+    burned_roots_content = '、'.join(
+        f'{root}({hits}x)' for root, hits in list(ledger_burned_roots.items())[:60]
+    ) or '(none yet)'
+
     # 台账二创模式：母题是唯一允许做相邻变体的历史条目。只把白名单字段放进
     # prompt，并限制长度；客户端传来的其余内容一律忽略。
     remix_data = {}
     if isinstance(remix_seed, dict):
         for field in ('topic_dna', 'one_line', 'input_str', 'carrier', 'env', 'trauma',
-                      'destiny', 'twist', 'twist_zh'):
+                      'destiny', 'twist', 'twist_zh', 'salvage', 'salvage_zh'):
             value = remix_seed.get(field)
             if isinstance(value, (str, int, float)) and str(value).strip():
                 remix_data[field] = str(value).strip()[:500]
         nested = remix_seed.get('creative_seed')
         if isinstance(nested, dict):
-            for field in ('input_str', 'carrier', 'env', 'trauma', 'destiny', 'twist', 'twist_zh'):
+            for field in ('input_str', 'carrier', 'env', 'trauma', 'destiny', 'twist',
+                          'twist_zh', 'salvage', 'salvage_zh'):
                 value = nested.get(field)
                 if field not in remix_data and isinstance(value, (str, int, float)) and str(value).strip():
                     remix_data[field] = str(value).strip()[:500]
@@ -13919,12 +14908,19 @@ def run_ideate(config, count=5, theme=None, theme_label=None, trend_ref_ids=None
         """把每条 idea 的 beat_outline 收成统一的结构化列表。
 
         兼容三种形态：
-        1) 新形态 — [{op, text}, ...]  → 校验 op 合法性后原样保留
-        2) 旧字符串形态 — ["text1", "text2", ...]  → 转成 [{op: None, text}, ...]
-        3) 单字符串 — "text1;text2;..."  → 拆分后同 2)
+        1) 富形态 — [{op, text, en, mat, zone, scope, trace}, ...] → 校验后保留；
+           不合格时剥回 {op,text}
+        2) 基础形态 — [{op, text}, ...]  → 校验 op 合法性后原样保留
+        3) 旧字符串形态 — ["text1", "text2", ...]  → 转成 [{op: None, text}, ...]
+        4) 单字符串 — "text1;text2;..."  → 拆分后同 3)
 
         旧形态的 op=None 是合法的：下游所有读 op 的地方都做 fallback，
         确保存量任务/旧断点/旧缓存卡片不会报错。
+
+        富字段两层判定：逐条的 _outline_rich_entry_violations，跨条的
+        _outline_rich_list_violations（分区抖动/覆盖度分布/痕迹链）。任何一层不过
+        且门禁开着时，**只剥这一条**的富字段，卡片照常交付——绝不因为多要了几个
+        字段把一批 150s 的灵感烧掉。
         """
         with_outline = 0
         for idea in ideas:
@@ -13932,21 +14928,66 @@ def run_ideate(config, count=5, theme=None, theme_label=None, trend_ref_ids=None
             if isinstance(raw, str):
                 # 少数模型把整份清单塞进一个字符串(换行或中文顿号分隔)
                 raw = re.split(r'[\n;；]+', raw)
+            zone_map = [str(z).strip() for z in (idea.get('zone_map') or [])
+                        if str(z).strip()] if isinstance(idea.get('zone_map'), (list, tuple)) else []
+            idea['zone_map'] = zone_map
             items = []
+            previous_mat = None
+            all_enriched = True
             if isinstance(raw, (list, tuple)):
                 for s in raw:
                     if isinstance(s, dict):
-                        # 新形态：{op, text}
+                        # 新形态：基础字段 + 可选富字段。
                         text = str(s.get('text') or '').strip()
                         op = str(s.get('op') or '').strip() or None
                         if op and op not in _OUTLINE_OPS_SET:
                             op = None  # 不认识的 op 降级为 null，不打回
                         if text:
-                            items.append({'op': op, 'text': text})
+                            candidate = dict(s)
+                            candidate['op'], candidate['text'] = op, text
+                            normalized = _outline_normalized_entries([candidate])[0]
+                            # 两包分别验收、分别降级：事实源（en/mat）与拍属性
+                            # （zone/scope/trace）互不牵连，一包写歪不该连累另一包。
+                            for errors, fields in (
+                                    (_outline_rich_entry_violations(normalized, previous_mat),
+                                     _OUTLINE_FACT_FIELDS),
+                                    (_outline_beat_property_violations(normalized, zone_map),
+                                     _OUTLINE_PROPERTY_FIELDS)):
+                                if not errors:
+                                    continue
+                                all_enriched = False
+                                if sys.stdout:
+                                    action = ('剥掉 ' + '/'.join(fields)
+                                              if _OUTLINE_RICH_GATE_ENFORCING else '仅观察')
+                                    print(f"[OUTLINE-RICH] {action} {idea.get('title') or 'untitled'} / "
+                                          f"{text}: {errors}")
+                                if _OUTLINE_RICH_GATE_ENFORCING:
+                                    normalized = _strip_outline_rich_fields(normalized, fields)
+                            # outline_enriched 只在整条都齐了才为真。clearing 条目
+                            # 允许没有 trace（它清掉东西，不留新料），别把它算成缺项。
+                            required = ['en', 'mat', 'zone', 'scope'] + (
+                                [] if op == 'clearing' else ['trace'])
+                            if not all(normalized.get(k) for k in required):
+                                all_enriched = False
+                            items.append(normalized)
+                            previous_mat = list(normalized.get('mat') or []) or previous_mat
                     elif isinstance(s, (str, int, float)) and str(s).strip():
                         # 旧形态：纯字符串
                         items.append({'op': None, 'text': str(s).strip()})
+                        all_enriched = False
+            # 跨条目那三条（分区抖动 / 覆盖度分布 / 痕迹链）只有拿到整份清单才判得了，
+            # 全部属于拍属性包 —— 降级只剥 zone/scope/trace，事实源 en/mat 原样留着。
+            for pos, errors in sorted(_outline_rich_list_violations(items, zone_map).items()):
+                all_enriched = False
+                if sys.stdout:
+                    action = ('剥掉 zone/scope/trace' if _OUTLINE_RICH_GATE_ENFORCING
+                              else '仅观察')
+                    print(f"[OUTLINE-RICH] {action} {idea.get('title') or 'untitled'} / "
+                          f"{items[pos].get('text')}: {errors}")
+                if _OUTLINE_RICH_GATE_ENFORCING:
+                    items[pos] = _strip_outline_rich_fields(items[pos], _OUTLINE_PROPERTY_FIELDS)
             idea['beat_outline'] = items
+            idea['outline_enriched'] = bool(items) and all_enriched
             if len(items) >= 2:
                 with_outline += 1
                 # recommended_beats 一律由清单长度派生，不再信任模型独立申报的那个数。
@@ -14012,10 +15053,30 @@ def run_ideate(config, count=5, theme=None, theme_label=None, trend_ref_ids=None
             else:
                 trend_refs, trend_block = [], ''
 
-    # 载体家族(natural/man-made/vehicle/fantasy)已于 2026-07-25 取消:那 4 个桶太粗,
+    # 载体家族(natural/man-made/vehicle/fantasy)曾于 2026-07-25 取消:那 4 个桶太粗,
     # 既让不同载体(冰川洞/空心树/海蚀洞)撞成同一条 topic DNA 被误判重复,又和
-    # REALISM-ONLY 硬否决打架("fantasy"家族只能靠例外条款苟活)。批次多样性改由
-    # "同批载体互不重复 + 各自锚定不同趋势点"承担,粒度比家族轮换细得多。
+    # REALISM-ONLY 硬否决打架("fantasy"家族只能靠例外条款苟活)。批次多样性当时改由
+    # "同批载体互不重复 + 各自锚定不同趋势点"承担。
+    #
+    # 2026-08-08 回归,但**只做配额不做去重**——上面那两条取消理由针对的都是"拿家族
+    # 当 DNA 去重维度"的用法,配额不碰去重,两者不冲突。取消后暴露的问题是"互不重复"
+    # 只管批内互不相同:两块不同的石头本来就互不相同,于是整批 100% 天然壳体完全合法,
+    # 台账里真的连着出现了七条岩洞/化石。天然壳体身上没有可拆下来再利用的旧构件,
+    # 工序会塌成打磨抛光,这才是"创意脱离 DIY 选题"的机制。
+    natural_cap = max(1, int(math.ceil(count * _IDEATION_NATURAL_CAP_RATIO)))
+    family_rule = (
+        f"CARRIER-FAMILY QUOTA (hard, checked programmatically after you answer): at most "
+        f"{natural_cap} of the {count} candidates may use a NATURAL in-situ shell — cave, grotto, "
+        f"rock niche/cleft, boulder, cliff hollow, ice/glacier cave, sinkhole, living trunk, "
+        f"stump, fossil/geode/crystal cavity. Every other candidate must use an ABANDONED "
+        f"MAN-MADE STRUCTURE or a VEHICLE/VESSEL shell. Reason: only those arrive with fittings "
+        f"worth stripping out and rebuilding into the interior, which is where this genre's "
+        f"payoff lives. Recent ledger history (last {_FAMILY_PRESSURE_WINDOW} rows) is already "
+        f"skewed: natural {family_pressure.get('natural', 0)}, man-made "
+        f"{family_pressure.get('man-made', 0)}, vehicle {family_pressure.get('vehicle', 0)}, "
+        f"unclassified {family_pressure.get('unknown', 0)} — lean hard against the "
+        f"over-represented families."
+    )
     if theme_label:
         carrier_rule = (
             f"EVERY one of the {count} candidates MUST use the exact same Axis-1 carrier the "
@@ -14031,7 +15092,8 @@ def run_ideate(config, count=5, theme=None, theme_label=None, trend_ref_ids=None
             "DIFFERENT Axis-1 carrier — not merely a different category, a different concrete shell "
             "(two distinct kinds of cave count as a repeat; a cave and a grain silo do not). "
             "When several trend reference points are available, spread the batch across them so "
-            "different candidates are anchored in different points rather than all mining the same one."
+            "different candidates are anchored in different points rather than all mining the same one.\n"
+            + family_rule
         )
 
     selected_pacing_ids = normalize_pacing_skeleton_ids(pacing_skeleton_ids, default_all=True)
@@ -14089,7 +15151,7 @@ Use the successful buried shipping-container dual-cabin creative as the canonica
 the card has a fourteen-construction-beat budget: 1 吊装载体落位; 2 回填掩埋并完成入口; 3 推镜进入原始
 主舱; 4 清空主舱; 5 修补除锈防腐; 6 防潮膜与隐蔽电路; 7 保温封板; 8 地板墙顶饰面; 9 主舱家具
 功能小完工; 10 打开隔断舱门穿入毛坯副舱; 11 清空副舱; 12 防潮管线与保温; 13 封板地板饰面; 14 副舱
-家具软装; 15 工人离场并总揭示. Copy the phase identities and transition positions, NOT the container,
+家具软装; 15 独立总揭示. Copy the phase identities and transition positions, NOT the container,
 mountain, materials, room functions, or signature feature. If the budget is compressed, preserve the same
 phase ratio and never remove either cleanout, either functional payoff, or either transition.
 Its Axis-1 carrier MUST be a man-made shell that can be transported to the site whole and
@@ -14116,7 +15178,7 @@ utility line / primary-space return light visible, and explicitly call the desti
 transition changes that second room only and never erases the first room's completed state. Rebuild the second
 space through the same base/membrane/grid/insulation/board/finish ladder, reveal a different function through
 its core furniture, then shorten the cadence through supporting furniture, rapid soft-furnishing, warm-light
-activation and useful-content stacking. Show the worker exit before a brief, clean, worker-free wide final
+activation and useful-content stacking. End with a brief, clean, worker-free wide final
 reward. Every entry must create one obvious visible result change;
 spend more entries on irreversible construction states than on the final reveal. Use at least
 {_NESTED_MIN_OUTLINE_ENTRIES} entries; give each entry one visible state change and never compress two
@@ -14150,14 +15212,50 @@ post-reset entries must realize at least FOUR of these families: 清空/清运/�
 储物柜.
 """
 
+    # 「联网主导、skill 只做过滤器」这条定位自 2026-07-25 就是既定策略，但在这次之前
+    # **只存在于本文件的注释里**——模型那头看到的是两个都自称第一的块：idea-engine 说
+    # 自己 authoritative，趋势块说自己 PRIMARY CREATIVE SOURCE，两边都是 MUST，没有
+    # 任何 tie-break。而 idea-engine 的 Axis-1 载体银行有 53 条、其中 21 条（近 40%）
+    # 是天然壳体，趋势库那边几乎为零。模型"照矩阵组合"完全合规，于是台账连出七条石头。
+    # 下面这段就是那句缺失的 tie-break，且必须分两种情形写：断网/超时/库空那批没有趋势
+    # 参考可用，此时矩阵反过来是唯一的载体来源，不能连它一起降级。
+    if trend_block:
+        source_hierarchy_block = """
+==================== SOURCE HIERARCHY (read this before using the matrix) ====================
+`idea-engine.md` above is NOT a competing creative source. Its job in this batch is to be the
+RULEBOOK: the hard policies, the novelty filters, the dedup rules, the scoring rubric and the
+output contract. Obey all of it.
+Its Axis-1 CARRIER bank is a fallback vocabulary, not this batch's shopping list. The TREND
+REFERENCE block at the very end of this prompt outranks it on the carrier axis: pick carriers that
+the references actually point at, and reach into the Axis-1 bank only to name or vary something the
+references left open. Axes 2-5 (environment, trauma, destiny, twist) may be combined freely from the
+matrix as usual.
+Concretely: a carrier that appears nowhere in the trend references AND is a natural in-situ shell is
+the single most likely way to waste this batch — it satisfies the matrix while contradicting both the
+references and the carrier-family quota at once.
+"""
+    else:
+        source_hierarchy_block = """
+==================== SOURCE HIERARCHY (no trend reference is available this batch) ====================
+Live trend research produced nothing usable for this batch (offline, timed out, or the reference
+library is empty). `idea-engine.md` above is therefore BOTH the rulebook and your primary creative
+source this time — combine its Axis-1 carrier bank freely.
+Two things do NOT relax just because the references are missing: the CARRIER-FAMILY QUOTA still caps
+natural in-situ shells, and SALVAGE-AND-REBUILD still requires a stripped-out original component. The
+Axis-1 bank is deliberately rich in natural shells, so working straight down it will overshoot the
+quota — lean on its "Abandoned man-made" and "Vehicles / vessels" groups instead.
+"""
+
     system_prompt = f"""You are the Upstream Ideation Layer for the `restoration-prompt-composer` skill.
 Your task is to generate a ranked list of {count} highly novel, realistic, buildable time-lapse renovation topic seeds.
-You must combine axes from the Morphological Matrix in `idea-engine.md` and filter them to ensure quality.
+You combine axes from the Morphological Matrix in `idea-engine.md` and filter them to ensure quality.
 
-Here is the authoritative `idea-engine.md` specifying the matrices, rules, filters, scoring rubric, and continuous-supply mechanisms:
+Here is `idea-engine.md` — the authoritative RULEBOOK for this batch: the hard policies, novelty
+filters, dedup rules, scoring rubric and output contract. Read the SOURCE HIERARCHY right after it to
+see how its carrier bank ranks against this batch's other inputs:
 ==================== IDEA ENGINE ====================
 {engine_content}
-
+{source_hierarchy_block}
 Here is the current `used-topic-ledger.md` showing already used/burned topic DNAs:
 ==================== USED TOPIC LEDGER ====================
 {ledger_content}
@@ -14168,6 +15266,14 @@ Topic DNA, title concept, or a one-edit-step variant, except for the single seed
 explicitly identified by REMIX MODE below:
 ==================== MANAGED CREATIVE LEDGER ====================
 {managed_ledger_content}
+
+Here are the SIGNATURE TWIST ROOTS already burned by that ledger. A twist root is the first two
+hyphen-segments of the twist slug: glass-floor-gears, glass-floor-cliff and glass-floor-veins are
+ONE root (glass-floor), not three twists. Reusing a burned root is rejected programmatically even
+when the carrier and destiny are brand new — swapping the shell around a used twist produces a
+variant, not an idea.
+==================== BURNED TWIST ROOTS ====================
+{burned_roots_content}
 {remix_block}
 {pacing_block}
 
@@ -14176,8 +15282,10 @@ explicitly identified by REMIX MODE below:
 2. Filter out any candidates that:
    - Have a NON-SHELTER destiny. SHELTER-ONLY POLICY is a hard veto: every destiny MUST be a habitable private dwelling / refuge (a place to sleep, shelter, and live). Reject outright any bar, cafe, tea house, speakeasy, recording/ceramics/painting/art studio, shop, gallery, museum, public observatory, commercial spa/sauna/onsen, or lab. Litmus: "could one person live and sleep here as their own refuge?" — if no, drop it.
    - Lean sci-fi or futuristic. REALISM-ONLY POLICY is a hard veto: every destiny, twist, and material must read as a real-world, present-day, documentary-photographable build. Reject outright anything named or styled "sci-fi", "futuristic", "cyberpunk", "space-age", "capsule pod", "zero-gravity", and any twist relying on holograms, glowing tech panels, LED-neon aesthetics, spacecraft-style surfaces, or technology that does not exist today. Interiors must be warm, tactile real materials (wood, stone, brass, wool, glass, leather); fantasy-grounded carriers stay allowed but their fit-out must be realistic craftsmanship.
+   - Have NOTHING TO SALVAGE. SALVAGE-AND-REBUILD POLICY is a hard veto: this genre is a DIY conversion, not a geology documentary. Every candidate must be able to name ONE original component of the shell or its site that gets stripped out on camera and rebuilt into the finished interior as something else — brass portholes into backlit shelf lights, a grain chute into a hearth, winch gears into a counterweight bed, shell casings into a flue. If the only work the shell admits is carving, grinding and polishing its own natural surface, it is the wrong shell — drop it.
    - Violate the Orthogonal-Pairing Rule (Raw shell vs cozy interior contrast).
    - Do not have exactly ONE Axis-5 signature twist.
+   - Reuse a burned twist ROOT (first two slug segments) from the BURNED TWIST ROOTS list above.
    - Match or are one edit-step away from any burned Topic DNA in the ledger.
    - Are in the Cliché Blocklist.
    - Fail the Buildability Gate (no magic/conjuring).
@@ -14196,12 +15304,15 @@ Each object in the JSON array must have EXACTLY these keys:
 - "destiny": (string) Destiny in English — MUST be a habitable shelter/dwelling/refuge, e.g. "snug winter refuge den"
 - "twist": (string) Signature twist DNA name in English, e.g. "self-material-window"
 - "twist_zh": (string) Chinese display description of the signature twist, e.g. "窗户直接切穿半透明蓝冰"
+- "salvage_en": (string) The SALVAGE-AND-REBUILD declaration in English: the ONE original component stripped out of this shell or its site, and what it becomes indoors, e.g. "original brass portholes removed, de-rusted and reinstalled as backlit shelf lights". Never a placeholder, never the natural surface of the shell itself.
+- "salvage_zh": (string) Chinese display version of the same, at most 24 characters, e.g. "原黄铜舷窗除锈回装成背光搁板灯". It MUST also appear as a real construction beat: at least one "beat_outline" entry has to visibly perform that strip-out / de-rust / refit / reinstall (拆下·拆解·除锈·翻新·改装·回装, or salvaged/reclaimed/repurposed/reinstalled in "en"). A declaration with no matching beat is rejected.
 - "dna": (string) Topic DNA in the format "carrier-slug / destiny / twist-family", where carrier-slug is THIS candidate's own concrete carrier in lowercase hyphenated English (not a category name), e.g., "glacier-ice-cave / refuge-den / self-material-window"
 - "score": (number) Total score out of 25.
 - "recommended_beats": (integer, 5 to 15) Planning aid only — the delivered beat count is ALWAYS derived from the actual length of "beat_outline" (outline length minus the final reward entry), so put your real effort into the outline itself. Judge by transformation complexity: light single-space refit → 5-8; medium multi-stage build → 9-12; heavy structural conversion with many distinct visible stages → 13-15.
 - "beats_reason": (string) Chinese, at most 15 characters, why this beat count, e.g. "结构重建阶段多"
 - "pacing_skeleton": (string) Exactly one of: {', '.join(selected_pacing_ids)}. It declares which selected pacing reference this candidate's beat_outline actually follows.
-- "beat_outline": (array of objects) A structured Chinese construction outline. Each object has exactly two keys: "op" (string, one of: "clearing", "repair", "rough-in", "flooring", "framing", "drywall", "priming", "painting", "wiring", "lighting", "furnishing", "threshold", "reward" — pick the operation whose visible terminal product best matches this entry: clearing=清空/清运/拆除/搬出, repair=修补/加固/焊补/锚固/打磨除锈, rough-in=铺设隐蔽管线/电路/水管, flooring=铺装地板/找平/浇筑楼板, framing=架设龙骨/框架/支撑结构, drywall=封板/内衬面板/石膏板, priming=批腻子/刷底漆/防水涂层, painting=刷涂面漆/饰面涂料, wiring=布设明装电路/灯线/开关, lighting=安装灯具/灯带/照明, furnishing=布置家具/软装/设备/卫浴, threshold=过门/穿越入口/推镜进入, reward=最终揭示/点亮/入住) and "text" (string, Chinese, at most 16 characters, names ONE visible terminal milestone, starts with a verb, e.g. "清空洞内碎冰与积雪"). EXACTLY "recommended_beats" construction entries plus ONE final reward entry (so the array length is recommended_beats + 1). The last entry MUST have op="reward". Respect real-world construction order: structural stabilization and hazard removal before finishes, wiring/piping rough-in before surfaces are closed, surfaces closed and primed before painting, floor finish before heavy anchored objects, lighting installed before anything glows. Never write vague entries like "开始施工" or "继续完善", and never repeat a milestone. EVEN WEIGHT: every entry gets the same amount of screen time, so entries must carry comparable amounts of work. Never pack three or more material layers (清理/基层 · 防水管线 · 龙骨框架 · 保温填充 · 封板面板 · 饰面涂料地板 · 家具软装) into one entry — "封板批腻子并刷完墙面" is three layers in one beat and must be split; two closely related layers in one entry is the practical maximum. Equally, do not spend a whole entry on something trivially small next to a heavy neighbour. If the build crosses from exterior to interior, describe that crossing in AT MOST ONE entry with op="threshold", place it no earlier than the third entry (at least two ordinary exterior entries come first), and make the entry right after it op="clearing" (hauling out the debris the crossing just revealed).
+- "zone_map": (array of 3 to 6 strings) This carrier's own spatial partitions in English, in the order the build visits them, e.g. ["exterior shell","entry threshold","floor","walls & ceiling","sleeping nook"]. Every beat_outline entry's "zone" must be one of these exact strings — this is the closed set that keeps the camera from jumping between unrelated areas.
+- "beat_outline": (array of objects) A structured construction outline. Each object has exactly seven keys: "op", "text", "en", "mat", "zone", "scope", "trace". "op" is one of "clearing", "repair", "rough-in", "flooring", "framing", "drywall", "priming", "painting", "wiring", "lighting", "furnishing", "threshold", "reward" and names the operation whose visible terminal product best matches the entry. "text" is Chinese, at most 16 characters, starts with a verb, and names ONE visible terminal milestone. "en" is an 8-20-word English fact-source description naming the physical action and terminal product, never a placeholder. "mat" is an array of 1-3 concrete English material/object noun phrases; every phrase MUST occur verbatim inside "en". "zone" is one of the "zone_map" strings verbatim — the partition this entry's work lands in. "scope" is "large" (this operation's own full-coverage completion), "default", or "small" (a locally confined but clearly visible change); the final reward entry is always "large", and the outline must not be all-"large" or all-"small". "trace" is a short English description of the visible residue this entry leaves behind and that every later beat must keep showing (seams, tool marks, fastener heads); it must be distinct from every other entry's trace, and only op="clearing" entries may omit it. Example: {{"op":"flooring","text":"铺好防潮垫层与松木地板","en":"grey wool felt underlay laid edge to edge, oiled pine planks nailed over it","mat":["wool felt underlay","oiled pine planks"],"zone":"floor","scope":"large","trace":"pine plank seams running lengthwise"}}. ZONE CONTINUITY: consecutive entries should stay in the same zone; across the whole outline you may change zone at most ceil(entry count / 3) times, and the op="threshold" entry (when present) must be one of those changes — it is the crossing. EXACTLY "recommended_beats" construction entries plus ONE final reward entry (array length = recommended_beats + 1); the last entry has op="reward". Except for clearing/threshold/reward, adjacent entries must not repeat exactly the same mat list. Respect real-world construction order: stabilization/hazard removal before finishes, rough-in before closure, closure/primer before paint, finished floor before heavy anchored objects, lighting before glow. Never write vague or repeated milestones. EVEN WEIGHT: no entry may pack three or more material layers; two closely related layers is the practical maximum. If the build crosses exterior to interior, use AT MOST ONE op="threshold", no earlier than entry three, followed immediately by op="clearing".
 - "trend_ref": (string) If (and ONLY if) trend references are provided at the end of this prompt AND this idea clearly draws on one of those points, cite the borrowed point in one short Chinese sentence (which reference & what was borrowed). Otherwise it MUST be an empty string "". Never invent a reference.
 """ + trend_block
 
@@ -14322,6 +15433,11 @@ Each object in the JSON array must have EXACTLY these keys:
                         user_prompt_current = user_prompt + "\n\nPlease ensure every candidate includes a non-empty beat_outline array with valid construction beats."
                         continue
 
+                    # 选题门禁（归宿/twist 根/旧物再生）与家族配额一律算硬失败：降级
+                    # 只能改节拍标签，改不掉「这条选题本身不该出现」。theme_label 是用户
+                    # 在 GUI 里钉死的载体，钉了就不再拿家族配额去否决他的选择。
+                    quota_failures = ({} if theme_label else ideation_family_quota_violations(
+                        novel_ideas, count=count, already=accumulated_ideas + downgraded_ideas))
                     failures = {}
                     hard_failures = {}
                     for idea_idx, idea in enumerate(novel_ideas):
@@ -14335,6 +15451,17 @@ Each object in the JSON array must have EXACTLY these keys:
                                 print(f"[DEBUG] run_ideate: 通用骨架门禁（未强制）命中 "
                                       f"{novel_ideas[idea_idx].get('title') or 'untitled'}: {hard_errs}")
                             hard_errs = []
+                        # 选题门禁走自己的开关：清单门禁关掉时不该顺手把「这条选题本身
+                        # 不该出现」也一起放行，两者治的完全不是一回事。
+                        topic_errs = (ideation_topic_violations(idea, ledger_burned_roots)
+                                      + quota_failures.get(idea_idx, []))
+                        if topic_errs:
+                            if sys.stdout:
+                                action = '打回' if _IDEATION_GATE_ENFORCING else '仅观察'
+                                print(f"[IDEATION-GATE] {action} "
+                                      f"{idea.get('title') or 'untitled'}: {topic_errs}")
+                            if _IDEATION_GATE_ENFORCING:
+                                hard_errs = hard_errs + topic_errs
                         if hard_errs:
                             hard_failures[idea_idx] = hard_errs
                         if hard_errs or soft_errs:
@@ -14424,7 +15551,11 @@ Each object in the JSON array must have EXACTLY these keys:
     if delivered:
         return delivered
 
-    # Fallback if LLM fails (shelter-only destinies, per SHELTER-ONLY POLICY)
+    # Fallback if LLM fails (shelter-only destinies, per SHELTER-ONLY POLICY).
+    # 这三条不过 ideation_* 门禁（它们是模型三次都失败后的最后一口饭，再打回就只剩
+    # 空批）。冰川洞那条正是「天然壳体没有可拆下来的旧构件」的活标本：它没有
+    # salvage_* 可申报，卡片上那一行会缺席——留着它当兜底可以，但它排在最后一位，
+    # 且不该成为常态产出，那正是家族配额要压住的东西。
     fallback_ideas = [
         {
             "title": "蓝冰冰川洞改造成隐居雪境卧室",
@@ -14465,6 +15596,8 @@ Each object in the JSON array must have EXACTLY these keys:
             "destiny": "off-grid micro-home",
             "twist": "porthole-lighting",
             "twist_zh": "保留黄铜舷窗作为背光搁板灯",
+            "salvage_en": "original brass portholes stripped out, de-rusted and reinstalled as backlit shelf lights",
+            "salvage_zh": "原黄铜舷窗除锈回装成背光搁板灯",
             "dna": "retired-submarine / micro-home / porthole-lighting",
             "score": 23,
             "recommended_beats": 13,
@@ -14496,6 +15629,8 @@ Each object in the JSON array must have EXACTLY these keys:
             "destiny": "subterranean burrow dwelling",
             "twist": "roof-hatch",
             "twist_zh": "混凝土屋顶舱门滑动打开露出天空",
+            "salvage_en": "the silo's original sliding blast-hatch mechanism refurbished and reused as the roof light hatch",
+            "salvage_zh": "原发射井滑动舱门机构翻新复用作屋顶天窗",
             "dna": "missile-silo / burrow-dwelling / roof-hatch",
             "score": 23,
             "recommended_beats": 14,

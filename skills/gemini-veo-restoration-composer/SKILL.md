@@ -15,8 +15,11 @@ It does **not** replace `restoration-timelapse-engine` or `tiktok-abandoned-rebi
 
 **Staged (anchor-first) execution is the DEFAULT for every composition run (Tier 1-4). Do not look for explicit render intent before staging — assume rendering will happen.**
 
-1. Never write the full `IMAGE 1-(N+1)` + `VIDEO 1-N` set in your first pass. Compose `IMAGE 1` only, then call `scripts/render_and_gate_anchor.py` **synchronously in the same turn** and wait for the frame (mechanics in Step 6.5).
-2. Only after the script exits 0 and you have shown the rendered anchor to the user may the remaining `IMAGE`/`VIDEO` slots be composed and delivered. The server runs **no** automatic judgement on that frame (2026-08-05: all generation-time consistency review was removed) — never tell the user it "passed review". Show it, say plainly that nothing checked it automatically, and let them decide.
+1. Never write the full `IMAGE 1-(N+1)` + `VIDEO 1-N` set in your first pass. **Every `IMAGE` that introduces a new shot family stops for its own render gate** — not just `IMAGE 1`. Compose that frame alone, then call `scripts/render_and_gate_anchor.py` **synchronously in the same turn** and wait for the frame (mechanics in Step 6.5).
+   - Non-Threshold run: one stop, at `IMAGE 1`.
+   - Threshold run: **two** stops — `IMAGE 1` (exterior family) and `IMAGE T+1` (interior family). `IMAGE T+1` is the birth frame of all three interior primary anchors and the ancestor of every later interior frame; TBCP itself calls the crossing "the single most failure-prone beat". Leaving it ungated meant the entire interior section ran with no check at all, and a wrong shell propagated cleanly to the end of the ladder.
+   - Declared hard-cut (`[CUT]`) entry: the cut beat's resulting `IMAGE` is the new family's first frame and takes the second stop.
+2. Only after the script exits 0 and you have shown the rendered frame to the user may the remaining `IMAGE`/`VIDEO` slots **of that family** be composed and delivered. The server runs **no** automatic judgement on any frame (2026-08-05: all generation-time consistency review was removed) — never tell the user it "passed review". Show it, say plainly that nothing checked it automatically, and let them decide.
 3. Exactly two conditions waive staging and permit the legacy one-pass full-set delivery:
    - the user explicitly asked for prompt text only (e.g. `只要提示词`, `不用作图`, `不用渲染`, `纯文本`), or
    - the render server at `http://127.0.0.1:8085` is unreachable (script exit code 2) — then state plainly `⚠️ 渲染服务未运行，本次跳过首帧预览，直接输出全套提示词`, deliver in one pass, and still make the Step 13 interactive offer.
@@ -44,8 +47,8 @@ It does **not** replace `restoration-timelapse-engine` or `tiktok-abandoned-rebi
 
 ## Do Not Use This Skill When
 
-- The user only wants a topic brief without prompts → use `tiktok-abandoned-rebirth`.
-- The user has an existing prompt set and wants to edit specific slots → use `restoration-timelapse-engine` directly.
+- The user only wants a topic brief without prompts → `tiktok-abandoned-rebirth` would own this, but **it is not installed** (see Cross-Skill Integration). Produce the brief here instead of redirecting.
+- The user has an existing prompt set and wants to edit specific slots → `restoration-timelapse-engine` would own this, but **it is not installed** (see Cross-Skill Integration). Edit the slots here, holding every contract in Steps 6-9.
 - The user wants static interior design concepts without construction process.
 - The user wants fantasy/surreal content without build logic.
 
@@ -166,7 +169,7 @@ To feed the LLM orchestrator with high-fidelity metadata, the extraction engine 
 - **Camera DNA Estimation**: Use Structure from Motion (SfM) to compute camera parameters. Classify FOV $\ge 90^\circ$ as `ultra-wide 14-18mm` and FOV $\approx 45^\circ$ as `natural 35-50mm`. Calculate camera height and angle from vanishing points.
 - **OSPL Tracking & Ghost Clause**: Track all persistent objects using YOLO-World + SAM 2. Auto-map centroid positions to `Grid A1-C3` and Z-depth scales. If an object is 100% occluded in intermediate frames, trigger the **Ghost Clause** instead of omitting it.
 - **VMFP Volume Quantization**: Use monocular depth (e.g., Depth Anything V2) to measure bulk material volumes. Represent depletion or accumulation as percentages (100% to 0%). Detect nearby rigid containers and apply **Rigid Container Encapsulation (RCE)**.
-- **Worker Pose Tracking**: Trace worker skeletons using PoseTrack. Log entering frame time $t_{in}$ and leaving time $t_{out}$ relative to Grid borders. Auto-extract solid color silhouettes for **Hero Agent Lock (HAL)** and generate bi-directional Out-and-In passage clauses.
+- **Worker Pose Tracking**: Trace worker skeletons using PoseTrack and auto-extract solid-color silhouettes for **Hero Agent Lock (HAL)**. Construction clips place the worker at the active work face from zero seconds, with immediate effective tool contact and no entrance/exit choreography.
 
 #### 3. Intermediate JSON Metadata Spec (中间层数据交互规范)
 When provided with an intermediate JSON metadata file, or when generating the prompt set, the LLM must strictly parse and align with this JSON contract:
@@ -233,7 +236,7 @@ When provided with an intermediate JSON metadata file, or when generating the pr
       "single_physical_operation": "debris clearing only",
       "causal_path": {
         "material_source": "existing rubble pile on the floor",
-        "entry_path": "worker enters through Grid C1 edge with crates already visible in hand",
+        "entry_path": "rigid crates are already staged beside the Grid C2 rubble pile at zero seconds",
         "tool_contact": "matte-black broom and gloved hands push rubble into crate lips",
         "movement_path": "rubble moves from Grid C2 floor into crates and exits through Grid C1",
         "persistent_traces": ["dust edge around newly exposed slab", "drag scuffs leading toward Grid C1"],
@@ -252,12 +255,6 @@ When provided with an intermediate JSON metadata file, or when generating the pr
           "agent_type": "worker",
           "count": 1,
           "hal_profile": "solid bright-neon-yellow safety vest, white hardhat, dark blue pants",
-          "trajectory": {
-            "enter_time": "0.0s",
-            "enter_grid": "Grid C1",
-            "exit_time": "7.5s",
-            "exit_grid": "Grid C1"
-          },
           "action_loop": "repeatedly bends down to scoop rubble into crates"
         }
       ],
@@ -381,7 +378,7 @@ range — a preference for more content may not.
     | `removal` / `excavation` | up to 4 (may legitimately cover a full floor row) |
     | `coating` / `interior_finish` | up to 6 (may legitimately cover a full wall) |
     | `fixture_install` / `furnishing` | up to 3 |
-    | `threshold` | not applicable — governed by TBCP instead |
+    | `threshold` | cell counting does not apply (the crossing changes the whole frame by construction), but the beat is **not** unbudgeted: construction progress, lighting phase, exterior state, and camera height each get a delta of **zero** across the sill. See TBCP §6 **Crossing Delta Budget** — the clause this row defers to. |
 - Always add one final `VIDEO` for the explicit reward motion.
 - Never merge a threshold bridge with construction or final reward.
 - **Construction Sequence Validation**: After deriving the beat ladder, validate its order against real construction dependencies. Default macro order: (1) demolition and debris clearing before new work in that zone; (2) structural repair before rough-in systems; (3) rough-in systems — wiring, plumbing, ducting — before any panel closes over them; (4) ceiling panels before wall panels (board the overhead first so the wall panels can support and hide the ceiling-board edges); (5) primer before finish coat; (6) floor finishing after overhead and wet work; (7) fixtures and lighting only after their wiring exists; (8) furniture and decoration last. Hard vetoes: no wiring or plumbing work after the panels that would hide them are already installed; no finish coat before primer; no new roof before the walls or frame carrying it are repaired; no practical light, lamp, or powered fixture activation in a set that contains no earlier wiring beat (off-grid carriers additionally require a visible power source — solar panel, battery bank, or generator — installed in a prior beat); no interior fit-out inside a space whose creation or pre-existence was never shown or stated on camera. **Enclosed-Space Provenance Rule**: any interior chamber revealed behind a newly opened shell must be physically accounted for — either explicitly described as pre-existing space (a natural cavity, an original room) in the opening beat, or given its own on-camera excavation and mucking-out beats before any interior finishing; the interior volume must plausibly fit inside the exterior shell. If the observed beat order violates a hard veto, re-inspect source material first — a misread frame is more likely than an impossible build sequence.
@@ -424,12 +421,82 @@ Build the complete packet by filling all required fields using the **Spatial Con
 - Boundary anchors (left, right, top, bottom foreground band)
 - **Sub-Pixel Coordinate Pinning (SPCP — shot-family conditional)**: Pin the camera's angular attitude with wording that matches the shot family. Level exterior shots: `horizon line remains perfectly level at exactly half the frame height`. Elevated or tilted shots: `camera pitch locked at the declared steep downward angle; vertical lines converge consistently toward the same vanishing direction; no horizon reference`. Enclosed interiors, caves, and windowless spaces: `camera pitch locked level; the central vanishing axis stays centered in the frame` — never mention a horizon, sky, or clouds where none can physically exist. Optical-flow radiation wording (`all optical flow lines radiate symmetrically from the optical center`) belongs only in push-in/translation clips, never in static tripod prompts.
 
-**Geometry Lock**:
-- Door/window placement and count
-- Wall/roof lines
-- Stair direction (if applicable)
-- Full scene boundary
-- Carrier proportions
+**Geometry Lock (P0 — the shell's volume, not a mood board)**:
+
+The four qualitative bullets this field used to carry ("wall/roof lines", "carrier
+proportions") were unusable: an image model cannot draw to them, so nothing downstream ever
+read the field and every interior frame re-derived the room's size from scratch. Fill all
+seven subfields below, and write each one as a **relative measure against a feature that is
+visible in the frame** — door widths, door heights, countable facade features. Absolute
+metres are worse than useless here (they read as text-overlay bait and the model has no
+scale reference for them).
+
+| Subfield | What to write | Example |
+|---|---|---|
+| `clear_width` | interior width in **door widths** | `about two and a half door widths wall to wall` |
+| `clear_height` | floor-to-ridge height in **door heights** | `about three door heights to the ridge` |
+| `depth_bays` | depth counted in features visible on the exterior | `four rafter pairs deep`, `three bays deep` |
+| `roof_form` | **one** form, at the **same pitch as the exterior silhouette**, written as an immutable fact | `single shallow gable, same pitch as the outside; no second roof form anywhere` |
+| `aperture_ledger` | **exhaustive** list of every opening the shell has, entry included | `the single plank door in the gable end; two small square vents under the eaves` |
+| `aperture_denylist` | explicit list of what it does **not** have | `no skylight, no roof light, no vaulted or domed ceiling, no rear-wall arched window, no second doorway` |
+| `wall_material` | same material family inside and out | `the same tarred board cladding continues on the inner face` |
+
+**The denylist is the subfield that actually does the work.** Stating what exists does not
+constrain a generative model — it fills unconstrained volume with whatever the genre
+suggests. Naming the absent thing does constrain it. Choose the denylist from what the model
+most wants to invent in an enclosed space; the three that show up over and over in this
+pipeline's failed interiors are **skylights, vaulted/domed ceilings, and a rear-wall arched
+window**. Never leave this subfield empty, and never write it as "no other openings" — the
+model needs the noun.
+
+**Envelope signature**: pick **one** clause out of `clear_width` or `clear_height`, under
+twelve words, and mark it as the phrase that gets restated verbatim on every interior frame
+(Step 7's Shell Envelope Restatement). Keep it free of numerals and percent signs so it
+survives NLVTR.
+
+Also still locked, as before: stair direction (if applicable), full scene boundary, and the
+exact opening shape/proportions of every door or archway as established in `IMAGE 1`.
+
+When a renderer drives this skill, these subfields land in the Drift Lock Packet as
+`geometry_lock` (the prose), `aperture_ledger`, `aperture_denylist`, and
+`envelope_signature`, and `prompt_pipeline:check_shell_envelope_consistency` enforces them.
+In chat composition nothing enforces them but you.
+
+**Material Palette Lock (P0 — the substrate's identity, separate from its state)**:
+
+The Geometry Lock nails down how big the shell is. This nails down what it is *made of*. They
+fail differently and independently: a room can hold its exact clear width across ten frames
+and still have its stone walls read moss-green in one and dry ochre in the next, because
+every frame's `[material realism]` slot was written fresh and a text-conditioned model
+treats a swapped adjective as a swapped object. The fix is not more adjectives — it is the
+same adjectives, copied.
+
+Register **3-5 materials** — the ones that occupy real frame area, not every material in the
+scene. Each gets two fields, and the split between them is the whole point:
+
+| Field | Mutable? | What to write |
+|---|---|---|
+| `substrate` | **never** | the material's fixed identity: base hue, grain/texture, finish. `coarse grey-brown fieldstone, irregular courses, dry-laid` |
+| `state_track` | **monotonically**, and only on a beat that names this material | the ordered trauma→restored phrases: `thick wet moss in the joints` → `joints raked clean, stone still dark with damp` → `dry pale grey stone, tight lime pointing` |
+
+Rules:
+1. **Copy `substrate` character-for-character** into every frame that shows the material.
+   Never re-describe it, never reach for a synonym, never let the lighting phase leak into it
+   (`warm honey stone` is a lighting statement wearing a material's clothes).
+2. **Advance `state_track` only forward, only one step, and only in the beat that does the
+   work.** A material not touched by this beat carries its previous state phrase verbatim.
+   A state phrase that moves backward is the same class of failure as a repaired surface
+   un-repairing itself.
+3. **This is word-neutral.** The palette clause goes in the `[material realism]` slot the
+   IMAGE template already has — it replaces improvised wording with fixed wording, it does
+   not add a new sentence. It does not consume the interior frames' 220-word allowance.
+4. Applies to **both** shot families. Exterior drift is the same failure; it is merely less
+   obvious because exterior frames have sky and horizon carrying continuity for them.
+
+When a renderer drives this skill, this lands in the Drift Lock Packet as `material_palette`.
+Nothing on the server reads it yet (registered as a gap in
+[`references/contract-registry.json`](references/contract-registry.json) under
+`material-palette-lock`) — in every mode today it is yours to run.
 
 **Frame Aspect Lock (P0 — read before assigning any Grid cell)**:
 - This pipeline renders **9:16 vertical** by default (`--aspect_ratio` on `scripts/generate_frames.py`, `config.imageAspectRatio` server-side, and every fallback in `frame_generator.py` all default to `9:16`). The whole product is a vertical short-video pipeline; do **not** assume a horizontal frame.
@@ -463,8 +530,8 @@ Build the complete packet by filling all required fields using the **Spatial Con
 
 **Worker/Machine Choreography Ledger & HAL**:
 - Clean Frame Boundary: Force all static `IMAGE` anchors to contain **zero** active workers or machines.
-- Workers and machines are **transient elements** injected *only* in `VIDEO` prompts (entering, acting, and exiting before the final frame).
-- **Bi-directional Out-and-In Passage Clause**: Video prompts featuring transient agents must explicitly describe their entry and exit paths. Workers must enter the frame at t=0s and walk out by t=7.5s, leaving the final frame sterile.
+- Workers and active machines appear only in `VIDEO` prompts. In ordinary construction clips they are already at the active work face at zero seconds, begin the first effective action immediately, and continue through the final frame.
+- **Direct-at-Zero Worker Clause**: Never allocate video time to a worker entering, arriving, exiting, walking out, or leaving the frame. Use the full clip for visible construction action; a separate reward clip may be worker-free.
 - **Hero Agent Lock (HAL)**: When a worker must be visible, lock them using high-contrast, low-detail silhouette terms (e.g., `one lone worker in a solid bright-neon-yellow safety vest, a white hardhat, and solid dark blue work pants; do not show the worker's face`).
 - **Geometric Manual Tool Anchoring (MTAL)**: To prevent hand-held manual tools from blinking or morphing during continuous action interpolation, every worker's tool must be anchored using precise colors, shapes, and materials (e.g., `the worker sways slightly while performing repeated cycles of sweeping strokes using a solid-black long-handle plastic broom tool`). The tool's description must remain constant and clear.
 - **Persistent Site Plant Exception**: long-duration temporary works — scaffolding, formwork, shoring, cribbing, site cranes — are NOT transient agents. They arrive in a named erection beat, persist across later IMAGE anchors as static, unmanned equipment (Clean Frame bans active workers and running machinery, not parked plant), are tracked in the object ledger with Ghost Clauses when occluded, and leave only through a named temporary-works-strike beat that shows removal traces. An anchor showing freshly poured, unset concrete must still show the formwork supporting it.
@@ -520,11 +587,80 @@ Staged execution is the **default** per the Staged Delivery Contract (top of thi
 
 Step 13's rendering trigger, further down, does not re-render `IMAGE 1`: `/api/render_staged` reuses whatever frames are already on disk and only renders the remainder. That is one more reason Step 7's rule — deliver the rendered `IMAGE 1` prompt verbatim — is load-bearing, and one more reason step 9e above is not optional.
 
+#### Step 6.5b: The second stop — first frame of a new shot family (P0)
+
+Everything above describes the gate at `IMAGE 1`. Under the Staged Delivery Contract's rule
+1 the **same** procedure runs again at every frame that introduces a new shot family. In
+Threshold mode that is exactly one more frame: `IMAGE T+1`. Nothing about the script changes
+— `render_and_gate_anchor.py` already takes `--sequence`, so pass the real sequence number:
+
+```
+python "<SKILL_DIR>/scripts/render_and_gate_anchor.py" \
+  --title "<the same Chinese topic title, verbatim>" \
+  --prompt "<IMAGE T+1's prompt text>" \
+  --sequence <T+1> \
+  --server "http://127.0.0.1:8085"
+```
+
+Compose up to and including `IMAGE T+1` (that is: the exterior frames, `VIDEO T`, and
+`IMAGE T+1` itself), stop, render, look. Do not write `VIDEO T+1` or any later interior
+frame until the user has read the frame — every one of them chains off it.
+
+**`IMAGE T+1` acceptance checklist** — four items, all four must hold:
+
+1. **Roof form and pitch match the exterior.** One roof form, the same slope you can see in
+   the exterior beats. A second roof form, a vault, or a dome anywhere in the frame is a fail.
+2. **Openings match the aperture ledger, and nothing else.** Count them. Any opening not in
+   the ledger — most often a skylight, a rear-wall arched window, or a second doorway — is a
+   fail, even a small one, even in shadow.
+3. **Clear width and clear height are self-consistent when converted to door widths and door
+   heights.** The door is in the frame's recent history and is the only scale reference the
+   viewer has; if the room reads as five door widths when the lock says two and a half, the
+   shell has already drifted and every later frame inherits it.
+4. **The door frame is fully out of frame, and the interior is properly filthy.** A visible
+   jamb or sill means the crossing never completed. A clean interior at the first reveal
+   means the model skipped the untouched-trauma state (TBCP Rule 6).
+
+Any item failing → correct the packet field it points at (roof/aperture failures are
+`geometry_lock` and its denylist; scale failures are `clear_width`/`clear_height`; door-frame
+failures are `interior_camera_dna`), then re-render **with `--force_regenerate`**, and
+**delete the rejected frame from disk first**. Step 6.5 item 9e applies verbatim to this
+second gate: `/api/render_staged` reuses whatever is on disk for a sequence number, so a
+rejected `IMAGE T+1` left in place resurfaces and keeps propagating down the interior chain
+no matter what you render afterwards. Same cap as the first gate — at most 3 attempts, then
+stop and ask.
+
 ### Step 7: IMAGE Anchor Rendering (HCL & NGCS)
 
 By default (Staged Delivery Contract), compose `IMAGE 1` here first and stop for the Step 6.5 gate before returning to compose `IMAGE 2-(N+1)` — do not write the whole `IMAGE 1-(N+1)` range in one pass. Only under an explicit waiver (user asked for text only, or render server unreachable) compose the full range in one pass as below.
 
 Render `IMAGE 1-(N+1)` executing **Hierarchical Context Layering (HCL)** and **Syntax Pruning** (placing core spatial and grid constraints in the first 40 tokens using weight-sensitive punctuation `:` and `;` to prevent attention dilution):
+
+**Shell Envelope Restatement (P0 — every frame, not just the first)**:
+- Any `IMAGE` that is **not in `IMAGE 1`'s shot family** must carry the Geometry Lock's
+  envelope signature *verbatim*, plus its `roof_form` clause and, where the frame could
+  plausibly show one, the relevant `aperture_denylist` nouns. This is `IMAGE T+1` **and every
+  interior frame after it** — writing it once on `IMAGE T+1` and then relying on inheritance
+  is exactly how the room silently changes size three frames later. Each frame is generated
+  image-to-image off the previous one, so an omitted lock is not "inherited", it is re-derived.
+- `Scene inherits all landmarks, geometry, and boundary anchors from IMAGE 1` does **not**
+  satisfy this. That sentence points at a frame in a *different* shot family with a different
+  camera and a different anchor set; for a post-crossing frame it is a dangling reference,
+  not a lock. Restate the measurements.
+- Budget: this is why post-crossing interior frames run to 220 words instead of 180 (see the
+  Word count budget block below). Do not pay for the envelope clause by dropping the door
+  clearance sentence, an anchor's height ratio, or the Ghost Clause.
+
+**Material Palette Restatement (P0 — every frame, both families)**:
+- Every `IMAGE` writes the Step 6 `material_palette` `substrate` phrase *verbatim* for each
+  registered material visible in that frame, followed by that material's current
+  `state_track` phrase. Unlike the envelope signature this is not shot-family conditional —
+  exterior frames drift the same way.
+- A material this beat did not touch carries its **previous** state phrase unchanged. Only
+  the beat that performs the work on a material may advance it, and only by one step.
+- This occupies the `[material realism]` slot already present in the IMAGE templates. It is a
+  substitution, not an addition — do not budget extra words for it, and do not leave the
+  improvised wording in place alongside it.
 
 **Cumulative State And Anchor Delta**:
 - Every IMAGE anchor must inherit all permanent changes and traces from all prior beats. A trace may disappear only when a later named operation explicitly covers or removes it, and that covering must be the declared beat where it happens.
@@ -550,31 +686,50 @@ Generate an image of a [Camera DNA Block: static tripod shot, 14mm, height 1.6m,
 
 **IMAGE 2+ (Progressive State Anchors — Clean Frame, relative positioning, causal traces)**:
 ```
-Generate an image of a [Same Camera DNA Block — character-for-character copy within this shot family, including its SPCP pitch-lock clause: subject centred in the middle band]. Scene inherits all landmarks, geometry, and boundary anchors from IMAGE 1. [2-3 most drift-prone items, each positioned RELATIVE to a named Primary Landmark — "the green toolbox sits just left of the brick column", never its own absolute cell]. The scene is the [current stage name] anchor, completely empty of workers, with [one dominant change cluster, located by prose bearing] while [inherited evidence: the exact recurring object-ledger phrases + unchanged damage/repair evidence] remain visible and unchanged. [Changed object/surface] shows at least two persistent contact traces — [fastener rows / seam lines / residue / drag marks / tool scars / machine compression / contact dust] — proving how the state changed from IMAGE N. [Lighting phase] and [material realism]. [Guardrail sentence].
+Generate an image of a [Same Camera DNA Block — character-for-character copy within this shot family, including its SPCP pitch-lock clause: subject centred in the middle band]. Locked anchors: [every primary landmark restated verbatim from the packet — exact name, prose bearing, and frame-height ratio, copied character-for-character from IMAGE 1's own anchor sentence. This is a copy, not a reference: `Scene inherits all landmarks... from IMAGE 1` is not a restatement and does not satisfy `primary-landmark-restatement` (P0) or `anchor-scale-lock` (P0)]. [2-3 most drift-prone items, each positioned RELATIVE to a named Primary Landmark — "the green toolbox sits just left of the brick column", never its own absolute cell]. The scene is the [current stage name] anchor, completely empty of workers, with [one dominant change cluster, located by prose bearing] while [inherited evidence: the exact recurring object-ledger phrases + unchanged damage/repair evidence] remain visible and unchanged. [Changed object/surface] shows at least two persistent contact traces — [fastener rows / seam lines / residue / drag marks / tool scars / machine compression / contact dust] — proving how the state changed from IMAGE N. [Lighting phase] and [material realism]. [Guardrail sentence].
 ```
 
 **Final IMAGE (Reward Tail State — Clean Frame, relative positioning, blurred reflections)**:
 ```
-Generate an image of a [Same Camera DNA Block — character-for-character copy: subject centred in the middle band]. Scene inherits all landmarks, geometry, and boundary anchors from IMAGE 1. [2-3 drift-prone items locked relative to named Primary Landmarks]. The scene is the [reward tail state name] anchor, completely empty of workers, with [reward action completed — e.g. the hatch swung open on its hinge, warm light spilling across the centre], [final-state details visible], loose temporary construction clutter carried out, and permanent causal traces still visible where they explain installed or repaired elements. [Final changed elements] retain visible seams, fasteners, contact marks, tool finish texture, or machine pressure traces instead of appearing untouched. [Mirror clause, written as prose:] The highly reflective polished floor across the bottom of the frame displays a heavily blurred, low-gloss, diffused reflection of the background; reflections are muted, dark, and highly out-of-focus, preventing high-frequency contrast or sharp detail, with a realistic Fresnel falloff near the margins. Keep [final lighting phase] and [material realism]. [Guardrail sentence].
+Generate an image of a [Same Camera DNA Block — character-for-character copy: subject centred in the middle band]. Locked anchors: [every primary landmark restated verbatim from the packet — exact name, prose bearing, and frame-height ratio, copied character-for-character from IMAGE 1's own anchor sentence. This is a copy, not a reference: `Scene inherits all landmarks... from IMAGE 1` is not a restatement and does not satisfy `primary-landmark-restatement` (P0) or `anchor-scale-lock` (P0)]. [2-3 drift-prone items locked relative to named Primary Landmarks]. The scene is the [reward tail state name] anchor, completely empty of workers, with [reward action completed — e.g. the hatch swung open on its hinge, warm light spilling across the centre], [final-state details visible], loose temporary construction clutter carried out, and permanent causal traces still visible where they explain installed or repaired elements. [Final changed elements] retain visible seams, fasteners, contact marks, tool finish texture, or machine pressure traces instead of appearing untouched. [Mirror clause, written as prose:] The highly reflective polished floor across the bottom of the frame displays a heavily blurred, low-gloss, diffused reflection of the background; reflections are muted, dark, and highly out-of-focus, preventing high-frequency contrast or sharp detail, with a realistic Fresnel falloff near the margins. Keep [final lighting phase] and [material realism]. [Guardrail sentence].
 ```
 
 **Word count budget — SINGLE AUTHORITY (P0)**
 
 These numbers are not a style preference; they are the literal constants the runtime
 validator compares against (`prompt_pipeline.validate_beat_prompts` →
-`IMAGE_WORD_LIMIT` / `BASE_VIDEO_WORD_LIMIT`). Nothing else in this package may state a
-different budget — if you find another number in `references/` or `examples/`, this block
-wins and the other file is a bug.
+`image_word_limit_for(family)` / `BASE_VIDEO_WORD_LIMIT`). Nothing else in this package may
+state a different budget — if you find another number in `references/` or `examples/`, this
+block wins and the other file is a bug.
 
 | Slot | Target range | Hard ceiling (validator) |
 |---|---|---|
-| IMAGE | 140-180 words | **180** — over this fails validation |
+| IMAGE — exterior / single-shot-family projects | 140-180 words | **180** — over this fails validation |
+| IMAGE — post-crossing interior frames (`IMAGE T+1` onward) | 170-220 words | **220** — over this fails validation |
 | VIDEO (base one-take profile) | 260-380 words | **380** — over this fails validation |
 
+- **Why the interior frames get their own profile** (added 2026-08-08 — this is not a
+  loophole, it is a budget correction). An interior frame carries a strictly larger set of
+  mandatory elements than an exterior one: Camera DNA + 3 primary anchors (each with
+  position / depth / frame-height ratio) + boundary anchors + Z-depth + dirt vocabulary +
+  lighting phase + preserve list + Ghost Clause — *plus* the door-clearance sentence, *plus*
+  the verbatim shell-envelope restatement Step 6's Geometry Lock now requires on every
+  interior frame. That set does not fit in 180 words; measured, it lands at 170+ before the
+  envelope clause is written at all. A model asked to fit it anyway drops whatever it judges
+  least important, which in practice is the clause that was added last — the envelope lock.
+  The interior family also loses a batch of required elements it can never use (horizon
+  pinning, sky, cloud-flow direction, weather state), so the extra 40 words are largely the
+  ones the exterior family spends on the sky.
+- **Which frames this applies to**: exactly the frames the runtime tags `family ==
+  'interior'` — every frame from the threshold crossing's `IMAGE T+1` onward, and every
+  frame after a declared hard-cut entry. A project that is *entirely* indoors with no
+  crossing has one shot family, every frame inherits directly from `IMAGE 1`, and it
+  therefore does **not** need the envelope restatement and does **not** get the raise — it
+  stays at 180.
 - The ceiling is a **maximum**, not a goal. Aim at the middle of the target range; the
   ceiling exists so a genuinely dense beat has headroom, not so every beat runs to the wall.
-- There is no mode-based exception: complex reference-image mode and drift-sensitive space
-  work are still capped at the same numbers.
+- There is no other mode-based exception: complex reference-image mode and drift-sensitive
+  space work are still capped at the same numbers.
 - The multi-shot `omni` profile raises the VIDEO ceiling (its contract is 5 shots per clip);
   that ceiling is supplied by the profile at validation time. This skill package ships the
   `base` profile — use 380 unless you are explicitly composing under `omni`.
@@ -583,7 +738,7 @@ wins and the other file is a bug.
   spatial locks (anchors, boundaries, Camera DNA) that this whole protocol exists to protect.
 - If a beat feels like it needs more room, trim redundant adjectives, restated boilerplate,
   or secondary description first — never by cutting required structural elements (Camera DNA,
-  Out-and-In Passage, pacing control phrase, audio clause, Ghost Clause, Mirror Consistency
+  direct-at-zero worker clause, pacing control phrase, audio clause, Ghost Clause, Mirror Consistency
   Clause).
 - **Front-load regardless of length** (HCL): whatever the total, the Camera DNA + the 3
   primary anchors must land in the opening ~40 tokens. The
@@ -602,8 +757,8 @@ Every VIDEO must follow this exact structure:
 5. **8-second time-lapse action chain (Continuous Action Flow & HAL)**:
    * **Rhythm**: 8 seconds of full-length continuous action progression, with the dominant motion running from the very first frame to the very last frame without static holds, stable starts, or deceleration/settling zones.
    * **Pacing control phrase**: Must include the exact phrase `continuous construction time-lapse, not real-time footage` in the paragraph (except for threshold bridge or final reveal).
-   * **Bi-directional Out-and-In Passage Clause**: Workers must enter the frame at t=0s and walk out by t=7.5s (e.g., `At t=0s, one lone worker enters the frame from the lower-left edge; the worker performs work, and by t=7.5s, walks out of the frame through the lower-left edge, leaving the frame completely empty at t=8s`).
-   * **Transient Injection & HAL**: Workers and machines enter the frame, perform cycles of verb-first active labor, and exit before the final frame. If visible, workers are locked using Hero Agent Lock (HAL) solid-color silhouettes.
+   * **Direct-at-Zero Worker Clause**: Workers are already at the active work face at t=0s and make the first effective tool contact immediately, then continue the visible operation through the final frame. Never show or describe worker entrance, arrival, exit, walk-out, or a worker-free tail inside a construction clip.
+   * **VIDEO-only Workers & HAL**: Workers and active machines appear only in VIDEO prompts and perform cycles of verb-first active labor. If visible, workers are locked using Hero Agent Lock (HAL) solid-color silhouettes.
    * **Volumetric Mass & Flow Preservation (VMFP) with Rigid Encapsulation**: Describe bulk materials encapsulated inside rigid containers (buckets, crates, wheelbarrows, bags) with explicit quantities, and show their fill level changing in natural language, never a percentage (e.g. `sand is encapsulated inside three solid dark-green plastic buckets in the foreground, each holding 15 liters; the buckets fill from empty to heaped as the pile is cleared, then are carried out of frame along the path toward the left edge`). Do not describe loose shovel actions without containers. Scale containers to the material volume: hand buckets and crates only for debris under roughly half a cubic metre; larger removals require mechanical containers (excavator buckets, skips, chutes, tracked carriers) or explicitly repeated trips feeding a spoil pile that visibly grows across anchors. Any cut-out slab, panel, or door-sized solid piece must get its own pry-out and carry-out action — crumbs in buckets never account for a large solid piece.
    * **Measurable Progress Markers**: Mandate at least **two** measurable progress markers (e.g., exposed area increasing from 10% to 90%, wall-covering panel row count completing, spoil pile height growing from 20% to 70% of the frame).
    * **Spatial Completion Extent (SCE)**: Every VIDEO must state the operational start and end extent in concrete spatial terms that match the adjacent IMAGE anchor descriptions (e.g., `the floor panel advances from bare concrete across the left third of the foreground to fully covering the entire foreground band`). Use progressive `-ing` verb forms for mid-clip descriptions; completion language is reserved for the final moment before the clip ends.
@@ -644,7 +799,7 @@ Every VIDEO must follow this exact structure:
 - Structure errors (count, slot type, mixed protocol, shot family)
 - Camera DNA Block not copied literally across same-family IMAGEs
 - Any `IMAGE` contains active workers or machines (violates Clean Frame Boundary).
-- Any video featuring workers lacks an explicit Out-and-In Passage Clause trajectory at t=0s and t=7.5s.
+- Any construction video featuring workers does not begin at t=0s with the worker already at the work face making effective tool contact, or contains worker entrance/exit choreography.
 - Any video featuring loose/fluid materials fails to encapsulate them in rigid containers (violates Rigid Container Encapsulation RCE).
 - **Volume Conservation Gate (P0)**: container capacity, trip count, or spoil-pile growth must plausibly account for the volume removed or delivered in the beat. Clearing a room-scale debris field or cutting a passable opening into two hand crates fails; any cut-out solid piece that never receives an on-camera carry-out fails. A correctly scaled, visibly growing spoil pile satisfies encapsulation for material that is not transported out of frame.
 - Vague landmark or boundary locations that skip natural-language position + depth layer + Z-depth scale (internally tracked via `Grid A1-C3`, but the delivered prompt must state position/depth/scale in natural language — literal `Grid` tokens in the delivered text instead fail the No Banned Notations Gate below), or that fail to lock secondary drift-prone objects relatively using RPL.
@@ -667,15 +822,17 @@ Every VIDEO must follow this exact structure:
 - **Geometric Tool Lock Gate (MTAL Gate - P0)**: Verify that all non-sterile active videos explicitly define the manual tool (MTAL) with specific color, geometric shape, and material properties (e.g., `matte-black rectangular steel shovel head` or `solid-blue heavy-duty paint roller`), rather than vague terms, to block morphing/flicker.
 - **Temporal Physics Skeleton Gate (P0)**: Verify that every `time_sequence` beat declares `shot_family`, `beat_type`, `single_physical_operation`, and a complete `causal_path` with material source, entry path, tool contact, movement path, at least two persistent traces, and next-frame inheritance.
 - **Threshold Bridge Continuity Gate (P0 — TBCP v4)**: Any exterior→interior crossing must follow the Threshold Bridge Consistency Protocol. It must be **exactly one beat = one VIDEO clip + one new IMAGE** (`IMAGE T → VIDEO T → IMAGE T+1`); splitting it into Bridge-1/Bridge-2 with a Sill Handoff IMAGE is the retired v2/v3 shape and **fails this gate**. The crossing clip must be one unbroken take carrying no construction work, correctly meta-tagged (`[BRIDGE]` / `[BRIDGE TURN]` / `[CUT]`), and placed no earlier than Beat 3. The two interior landmarks peeked through the opening in `IMAGE T` must be the exact same objects inherited as the interior primary anchors in `IMAGE T+1` (Anchor Inheritance); the bridge camera must lock identical lens + height across exterior and interior families and translate forward only (with at most one declared closing pan in the pan variant, no tilt/roll); the lighting change must be a gradual exposure/white-balance roll attributed to door-shade + doorway backlight with no brightness snap; the door-frame edges must slide symmetrically outward as a wipe; and at least one material or light source must continue unbroken across the sill. Peeked anchors must be plausibly pre-existing features at crossing time (original structure, natural formations, or items installed in an earlier on-camera beat — never future construction products such as uncarved stairs or unplaced furniture). **Both peeked anchors must carry an explicit declared frame-height scale in `IMAGE T` itself**, and each must increase strictly from `IMAGE T` to `IMAGE T+1` — an unstated starting scale fails this gate just as a constant scale does, because a monotonic lock with no first link locks nothing. The `[CUT]` sealed-entry variant is the one exemption from the peek and scale-up requirements (its whole premise is that nothing is visible beforehand).
-- **Anchor Review (P0 — staged execution)**: When operating in Staged Execution Mode (Step 6.5), `IMAGE 1` must be rendered and shown to the user before any other `IMAGE`/`VIDEO` is composed or rendered. The server judges nothing, so you must check it yourself against Clean Frame Boundary, Camera DNA plausibility, Primary Landmark presence, genuine construction-grade damage, Genre DNA tone match, and no text artifacts — and say what you see. An anchor you believe is wrong must be corrected and re-rendered, never silently accepted.
+- **Anchor Review (P0 — staged execution)**: When operating in Staged Execution Mode (Step 6.5), **the first frame of every shot family** must be rendered and shown to the user before any other `IMAGE`/`VIDEO` of that family is composed or rendered — `IMAGE 1` always, plus `IMAGE T+1` in Threshold mode and the cut frame under a declared `[CUT]`. The server judges nothing, so you must check each yourself and say what you see. `IMAGE 1`: Clean Frame Boundary, Camera DNA plausibility, Primary Landmark presence, genuine construction-grade damage, Genre DNA tone match, no text artifacts. `IMAGE T+1`: the four-item checklist in Step 6.5b (roof form/pitch vs exterior, apertures vs ledger, clear width/height in door units, door frame out of frame + dirt). A frame you believe is wrong must be corrected and re-rendered with `--force_regenerate` after deleting the rejected file, never silently accepted. Skipping the second stop is the same P0 violation as skipping the first.
+- **Shell Envelope Consistency Gate (P0)**: fails when any interior `IMAGE` (a) omits the Geometry Lock's envelope signature — the verbatim clear-width/clear-height clause in door units — or its `roof_form` clause; (b) contains any element on the `aperture_denylist`, or any opening absent from the `aperture_ledger`; or (c) states a roof form or pitch that contradicts the exterior beats. Restating only on `IMAGE T+1` and relying on inheritance for the rest of the interior chain fails this gate: every frame is generated image-to-image, so an omitted lock is re-derived, not inherited. Enforced server-side by `prompt_pipeline:check_shell_envelope_consistency`; in chat composition it is yours to run.
+- **Material Palette Lock Gate (P0)**: fails when any `IMAGE` (a) omits a registered material's `substrate` phrase while that material is visible in frame; (b) re-words a `substrate` phrase instead of copying it verbatim, including swapping in a lighting-derived adjective (`warm honey stone` for `coarse grey-brown fieldstone`); (c) advances a material's `state_track` in a beat that does no work on that material, or by more than one step; or (d) moves a `state_track` phrase backward. Applies to **both** shot families — exterior frames drift identically, they just hide it better. No server-side enforcer exists (registered as a gap under `material-palette-lock`); this gate is yours to run in every mode.
 - **Rendered Text Artifact Gate (P0)**: Post-render video QA fails if any extracted frame contains visible numeric overlays, percentage glyphs, caption-like text, or model-rendered prompt notation.
 - **Hard Transition Peak Gate (P0)**: Post-render video QA fails when 3fps frame-difference spikes indicate scene replacement or hard cuts that were not declared as threshold bridge motion.
-- **Agent Boundary Pop Gate (P0)**: Post-render video QA fails when a worker or tool appears/disappears at segment boundaries without an entry/exit path.
+- **Direct Start Gate (P0)**: Post-render video QA fails when a construction clip wastes time on worker arrival/departure or does not begin effective work at zero seconds.
 - **Landmark Drift Gate (P0)**: Post-render video QA fails when primary landmarks, horizon line, or vanishing direction drift beyond the locked shot family.
 - **Object Birth Without Path Gate (P0)**: Post-render video QA fails when fixtures, solar panels, furniture, walls, railings, lights, or tools appear without a visible source and movement path in the prior frames.
 - **State Regression Gate (P0)**: Post-render video QA fails when a completed state reverts to an earlier construction state without a declared removal or rollback beat (a declared temporary-works-strike beat is a legal removal, not a regression).
 - **Phrasing Repetition Gate (P0)**: Before finalizing IMAGE N+1 or VIDEO N, compare its sentence structure, opening clauses, and verb choices against the immediately preceding IMAGE/VIDEO of the same type. Reusing the fixed required openers (Camera DNA block, "Use the provided first frame..." anchor sentence) is correct and mandatory — but reusing the *same subsequent sentence template, clause order, or verb set* beat after beat fails this gate. Deliberately vary sentence rhythm, subject phrasing, and verb selection every beat while keeping every required structural element and locked anchor.
-- **Word Count Self-Check Gate (P0)**: Before finalizing each IMAGE or VIDEO, count its words against the hard validator limit — **IMAGE 180 words, VIDEO 380 words** (base profile), the single authority defined in Step 7's Word count budget block. No exception for complex/reference mode or drift-sensitive space work. If over budget, trim redundant adjectives, filler phrases, and restated boilerplate first — never by deleting required structural elements (Camera DNA, Out-and-In Passage, pacing control phrase, audio clause, Ghost Clause, Mirror Consistency Clause).
+- **Word Count Self-Check Gate (P0)**: Before finalizing each IMAGE or VIDEO, count its words against the hard validator limit — **IMAGE 180 words (220 for post-crossing interior frames), VIDEO 380 words** (base profile), the single authority defined in Step 7's Word count budget block. No exception for complex/reference mode or drift-sensitive space work. If over budget, trim redundant adjectives, filler phrases, and restated boilerplate first — never by deleting required structural elements (Camera DNA, direct-at-zero worker clause, pacing control phrase, audio clause, Ghost Clause, Mirror Consistency Clause).
 
 - **Cumulative State Gate (P0)**: Any IMAGE anchor that drops a permanent change or trace from an earlier beat without an explicit covering operation in a named beat fails. Any adjacent anchor pair that differs by more than the declared milestone package's result fails.
 - **Construction Sequence Violation Gate (P0)**: Any beat order that violates a hard veto (wiring after enclosure, finish coat before primer, roof before structure, floor finishing before overhead/wet work) fails before prompt rendering.
@@ -709,10 +866,12 @@ Every VIDEO must follow this exact structure:
    - **质量与物流守恒 (VMFP & RCE)**: Bulk construction materials have quantified volume-change descriptions; all loose or fluid materials are encapsulated inside rigid containers during transport to prevent uncontrolled dissolving or flickering.
    - **镜像反射对齐 (RHMA-Blur)**: Reflective floor surfaces default to heavy-matte, high-blur diffused reflection (RHMA-Blur) to prevent high-frequency reflection flickering.
    - **无幽灵首尾过渡 (Clean Frame)**: All static IMAGE anchors contain zero active workers or machines.
-   - **双向进出通道锁 (Out-and-In Passage)**: Every VIDEO featuring workers explicitly describes the entry path at t=0s and the exit path at t=7.5s.
+   - **零秒直接开工锁**: Every construction VIDEO featuring workers places them at the active work face at t=0s with the first effective action starting immediately, and contains no entry/exit choreography.
    - **单兵轮廓锁定 (HAL)**: Workers in VIDEO prompts are locked as solid-color safety-vest silhouettes (Hero Agent Lock) to prevent identity morphing.
    - **全局因果痕迹锁 (GCTR)**: Every addition, removal, repair, cleaning, installation, assembly, transport, or machine-assisted change leaves at least two visible contact traces in IMAGE N+1, proving the change was physically caused.
-   - **首帧复核 (Anchor Review — staged execution only)**: When a renderer is driving the skill, the actual rendered `IMAGE 1` — not just its text prompt — is put in front of you and the user before any other beat is composed or rendered. Nothing judges it automatically, so you check it against Clean Frame Boundary, Camera DNA plausibility, Primary Landmark presence, genuine construction-grade damage, Genre DNA tone match, and no text artifacts, and say what you see; the packet is then reconciled against that render (Packet Reality Reconciliation) so downstream beats describe confirmed reality, not the pre-visualized spec.
+   - **外壳体量锁 (Shell Envelope Consistency - P0)**: The Geometry Lock is stated as relative measures a model can draw to — clear width in door widths, clear height in door heights, depth in countable bays, one roof form at the exterior's own pitch, an exhaustive aperture ledger, an explicit aperture denylist, and the same wall material inside and out. Every interior IMAGE restates the envelope signature verbatim; no frame grows a skylight, vault, dome, or rear-wall arched window that no beat ever cut.
+   - **材质调色板锁 (Material Palette Lock - P0)**: 3-5 registered materials, each split into an immutable `substrate` phrase (base hue, texture, finish) and a monotonic `state_track` (trauma → restored). Every frame copies the `substrate` character-for-character and carries the current state phrase; a material this beat did not touch keeps its previous state phrase. No stone wall reads moss-green in one frame and dry ochre in the next because its adjectives were re-invented.
+   - **首帧复核 (Anchor Review — staged execution only)**: When a renderer is driving the skill, the actual rendered first frame of **every shot family** — `IMAGE 1`, and `IMAGE T+1` in Threshold mode — not just its text prompt, is put in front of you and the user before any other beat of that family is composed or rendered. Nothing judges it automatically, so you check it against Clean Frame Boundary, Camera DNA plausibility, Primary Landmark presence, genuine construction-grade damage, Genre DNA tone match, and no text artifacts, and say what you see; the packet is then reconciled against that render (Packet Reality Reconciliation) so downstream beats describe confirmed reality, not the pre-visualized spec.
    - **盲区预描机制 (PBISP)**: The static IMAGE preceding a threshold bridge pre-visualizes at least two high-contrast interior landmarks through the door opening; those landmarks are plausibly pre-existing features at crossing time (original structure, natural formations, or previously installed items — never future construction products), and their frame-height scales rise monotonically across the bridge IMAGEs.
    - **外进内门槛桥协议 (TBCP v4 - P0)**: Any exterior→interior crossing is exactly ONE beat — one meta-tagged VIDEO clip (`[BRIDGE]` / `[BRIDGE TURN]` / `[CUT]`) between `IMAGE T` and `IMAGE T+1`, never split into Bridge-1/Bridge-2 with a sill-handoff frame; the crossing clip is one unbroken take carrying no construction work and lands no earlier than Beat 3; the two doorway-peeked landmarks are inherited as the interior primary anchors (Anchor Inheritance); the bridge camera locks identical lens + height and translates forward only (at most one declared closing pan in the pan variant); the lighting change is a gradual exposure/white-balance roll attributed to door-shade and doorway backlight (no snap); the door-frame edges wipe symmetrically outward; at least one material or light source continues unbroken across the sill; the peeked anchors qualify as pre-existing features; and both carry an explicit declared frame-height scale in `IMAGE T` that increases strictly in `IMAGE T+1`.
    - **关键帧多宫格拼图及分析密度锁定 (Keyframe Collage & Adaptive Dense Analysis Lock - T0/P0)**: When reverse-engineering or analyzing video, a 5-column tiled keyframe collage must be auto-generated via FFmpeg and saved alongside the source file as `<video_name>_collage.jpg` (T0 priority); for clips with 90 or fewer extracted frames, all frames are sent for semantic analysis; for longer clips, at least 40% of extracted frames — never fewer than one per second — with mandatory start, peak, and end frames for every change segment plus adjacent before/after frames around each peak (P0).
@@ -977,6 +1136,16 @@ Birth limit: each non-reward VIDEO may introduce at most **one** new support-obj
 ---
 
 ## Cross-Skill Integration
+
+> **Availability (verified 2026-08-08): neither sister skill is installed.** `restoration-timelapse-engine` and `tiktok-abandoned-rebirth` are **not** present in any skill directory on this machine. This whole section describes contract compatibility, not a live handoff — do not attempt to invoke either skill, and never tell the user to "use X directly", because there is no X to use.
+>
+> What still works without them, and what does not:
+> - **Tier 2 is fine.** It parses a `tiktok-abandoned-rebirth` topic brief as *pasted text*. The brief is an input format, not a skill call — a user who has one from elsewhere can still use Tier 2 exactly as documented.
+> - **The engine contract list below is fine.** Those contracts are internalized in this file (Steps 6-9) and in [`references/continuity-contracts.md`](references/continuity-contracts.md). Conformance is self-contained.
+> - **Delegation is not fine.** The two "→ use X" redirects in the *When NOT to Use This Skill* section above cannot be followed. If a user wants a topic brief only, or wants to edit individual slots of an existing set, do it here rather than pointing them at an absent skill.
+> - **The ledger handoff is not automatic.** "After prompt generation, update `references/used-topic-ledger.md`" is an instruction to *you*, not a thing the upstream skill does.
+>
+> If either skill is installed later, delete this block rather than editing around it.
 
 ### With `tiktok-abandoned-rebirth` (upstream)
 

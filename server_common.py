@@ -1379,11 +1379,13 @@ def _next_unused_account(config, pool, ring, exclude):
     return None
 
 
-# FX 模型设置（视频模型 / 图片模型 / 视频时长）由 FX 服务管理中心统一管理，
-# server_config.json 是唯一权威源。浏览器 localStorage 可能缓着旧模型——让它
-# 覆盖服务端就会出现"在控制台改了模型但不生效"的静默失效。
+# FX 模型设置（视频模型 / 图片模型 / 视频时长 / 视频参考模式）由 FX 服务管理中心
+# 统一管理，server_config.json 是唯一权威源。浏览器 localStorage 可能缓着旧模型——
+# 让它覆盖服务端就会出现"在控制台改了模型但不生效"的静默失效。
+# 配置中心（index.html）改这些项时会同步 POST /api/google-fx/config 写服务端，
+# 所以"服务端优先"不会把用户刚在配置中心选的值顶回去。
 _SERVER_AUTHORITATIVE_KEYS = frozenset({
-    'videoModel', 'googleFxImageModel', 'videoDuration',
+    'videoModel', 'googleFxImageModel', 'videoDuration', 'videoRefMode',
 })
 
 
@@ -1447,7 +1449,7 @@ def effective_config(client_config):
     # base/omni 送到服务端的（active_skill_profile 读的正是 config['skillProfile']）。
     # 不进这份白名单，托管模式下前端选了哪条链路会被整个丢掉——用户以为切了，
     # 实际永远按 videoModel 推断，和 qaGateLevel / imageEditTransport 当年是同一个口子。
-    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'videoDuration', 'adsPowerPort', 'videoAccountPoolMinCredit', 'qaGateLevel', 'strictFrameStateContract', 'frameContinuityMode', 'frameContinuityMaxRetries', 'frameContinuityLocalEdit', 'autoSplitHighRiskBeats', 'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile'):
+    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'videoDuration', 'videoRefMode', 'adsPowerPort', 'videoAccountPoolMinCredit', 'qaGateLevel', 'strictFrameStateContract', 'frameContinuityMode', 'frameContinuityMaxRetries', 'frameContinuityLocalEdit', 'autoSplitHighRiskBeats', 'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile'):
         if k in _SERVER_AUTHORITATIVE_KEYS:
             # FX 模型设置：服务端配置优先，防止浏览器旧缓存覆盖控制台的改动
             if k in SERVER_CONFIG:
@@ -2690,7 +2692,8 @@ def register_ledger_candidates(ideas, path=None, source='Ideation Pool'):
             raw_seed = idea.get('creative_seed')
             if isinstance(raw_seed, dict):
                 seed = {}
-                for field in ('input_str', 'carrier', 'env', 'trauma', 'destiny', 'twist', 'twist_zh'):
+                for field in ('input_str', 'carrier', 'env', 'trauma', 'destiny', 'twist',
+                              'twist_zh', 'salvage', 'salvage_zh'):
                     value = raw_seed.get(field)
                     if isinstance(value, (str, int, float)) and str(value).strip():
                         seed[field] = str(value).strip()[:500]
