@@ -75,7 +75,7 @@
   }
 
   function taskTypeLabel(type) {
-    return ({ frames: '帧序列', videos: '视频序列', staged_render: '分步渲染', auto: '自治管线' })[type] || 'FX 任务';
+    return ({ frames: '帧序列', videos: '视频序列', staged_render: '分步渲染', auto: '自治管线', stepped: '分步管线' })[type] || 'FX 任务';
   }
 
   function formatTime(value) {

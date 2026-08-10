@@ -372,43 +372,40 @@ def build_keyframe_collage(frame_paths: list[Path], output_path: Path, columns: 
     while len(padded) < rows * columns:
         padded.append(padded[-1])
 
-    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
-    for frame_path in padded:
-        command.extend(["-i", str(frame_path)])
+    concat_list_path = output_path.parent / f".tmp_concat_{output_path.stem}.txt"
+    try:
+        lines = [f"file '{str(p.resolve()).replace('\'', '\'\\\'\'')}'\n" for p in padded]
+        concat_list_path.write_text("".join(lines), encoding="utf-8")
 
-    # tile takes a SINGLE stream of successive frames, so the inputs are scaled to a
-    # uniform size and concatenated into one stream before tiling.
-    filter_parts = [
-        f"[{index}:v]scale=240:-1:force_divisible_by=2,setsar=1[t{index}]"
-        for index in range(len(padded))
-    ]
-    filter_parts.append(
-        "".join(f"[t{index}]" for index in range(len(padded)))
-        + f"concat=n={len(padded)}:v=1:a=0[cat]"
-    )
-    filter_parts.append(
-        f"[cat]tile={columns}x{rows}:padding=4:margin=4:color=black[out]"
-    )
-
-    command.extend(
-        [
-            "-filter_complex",
-            ";".join(filter_parts),
-            "-map",
-            "[out]",
-            "-update",
-            "1",
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_list_path),
+            "-vf",
+            f"scale=240:-1:force_divisible_by=2,setsar=1,tile={columns}x{rows}:padding=4:margin=4:color=black",
             "-frames:v",
             "1",
             "-q:v",
             "3",
             str(output_path),
         ]
-    )
-    try:
         run(command)
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, OSError):
         return None
+    finally:
+        if concat_list_path.exists():
+            try:
+                concat_list_path.unlink()
+            except OSError:
+                pass
     return output_path if output_path.exists() and output_path.stat().st_size > 0 else None
 
 

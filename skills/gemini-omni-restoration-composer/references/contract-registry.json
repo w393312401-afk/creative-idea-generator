@@ -15,7 +15,7 @@
       "id": "omni-multishot-ladder",
       "level": "P0",
       "scope": "video",
-      "summary": "每条 VIDEO 必须是多镜头组接，按片长对应的镜头梯依次出现且不得乱序",
+      "summary": "每条 VIDEO 必须是「主工作镜 + 一到两个特写插入 + 切回同机位」的组接，按片长对应的结构依次出现且不得乱序；旧的五景别轮换名（establishing long / full / medium / wide outro）一律按梯外景别报错",
       "source": "references/omni-multishot-language.md",
       "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
     },
@@ -31,7 +31,7 @@
       "id": "omni-timeline-cutmarks",
       "level": "P0",
       "scope": "video",
-      "summary": "必须原样带上把切点钉在秒上的时间线句，且与片长/镜头梯一致",
+      "summary": "必须原样带上把切点钉在秒上的时间线句，且与片长/镜头结构一致",
       "source": "references/omni-multishot-language.md",
       "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
     },

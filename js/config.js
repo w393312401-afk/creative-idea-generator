@@ -159,7 +159,7 @@ function applyPreset(presetName) {
 
 /* ── 激发维度内嵌「提示词链路」选择器 ─────────────────────────────────
    做哪个视频模型的提示词，就读哪个技能包、走哪套镜头语法：
-     · base —— restoration-prompt-composer，Veo 系列，一条连续的施工延时；
+     · base —— gemini-veo-restoration-composer，Veo 系列，一条连续的施工延时；
      · omni —— gemini-omni-restoration-composer，Gemini Omni，多镜头组接（镜头数随片长）
        （远景/全景/中景/近景/特写/结果远景）+ UGC 手机拍摄质感，禁一镜到底。
    停在 auto 时由服务端按视频模型名推断（active_skill_profile）。UI 排在 LLM 模型
@@ -172,7 +172,7 @@ function applyPreset(presetName) {
    模型名，让用户自己对照，而不是显示一个可能是错的链路名。 */
 const SKILL_PROFILE_CHOICES = [
     { value: 'auto', label: '自动', hint: '跟随视频模型' },
-    { value: 'base', label: 'Veo · 单镜延时', hint: 'restoration-prompt-composer' },
+    { value: 'base', label: 'Veo · 单镜延时', hint: 'gemini-veo-restoration-composer' },
     { value: 'omni', label: 'Omni · 多镜头', hint: 'gemini-omni-restoration-composer' },
 ];
 
@@ -724,6 +724,11 @@ function resetConfig() {
     // 必须先把刚写回表单的默认值收回 config——上面几段只改了 DOM，
     // 直接持久化 config 会把用户的旧值原样存回去。
     applySettingsFormToConfig();
+    // 门禁项没有静态表单，恢复默认 = 把本地存过的整个删掉退回服务端下发的生效值
+    // （见 js/gate_settings.js：前端不留第二份默认值）。必须排在
+    // applySettingsFormToConfig 之后——那一步不碰门禁项，但顺序颠倒会让人误以为
+    // 它会把删掉的键再写回来。
+    if (typeof resetGateSettings === 'function') resetGateSettings();
     localStorage.setItem('spark_config', JSON.stringify(config));
     updateCoverModelDisplay();
     syncFramesImageModelPicker();

@@ -33,6 +33,8 @@ from server_common import (
     # LIBRARY_LOCK 的情况下读一次现有库，读-判定-写这一串必须是原子的。
     # （LIBRARY_LOCK 已改为 RLock，同线程重入是安全的。）
     _ensure_library_split, _read_library_split, _library_store_ready, _read_library_file,
+    # 封面用途登记（/api/cover_roles）：复用同一套 outputs/ 边界校验与用途键名
+    _cover_candidate_path, COVER_ROLE_KEYS,
 )
 
 # 日志历史回放最多从文件末尾回读这么多字节（够装远超 100 行了）
@@ -533,6 +535,45 @@ def _client_ip(handler):
         return handler.client_address[0]
     except Exception:
         return 'unknown'
+
+
+def _own_host_ips():
+    """本机自己的 IP 集合（含各网卡地址），用于判断请求是不是从这台机器发出的。
+    取不到就返回空集合——调用方只用它做"额外放行"，拿不到不影响回环那条主路。"""
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            addr = info[4][0].split('%')[0]  # 剥掉 IPv6 的 zone id（fe80::1%en0）
+            ips.add(addr)
+    except Exception:
+        pass
+    return ips
+
+
+def _is_same_machine_client(handler):
+    """请求是不是来自跑服务端的这台电脑本身。
+
+    不能拿字面量比 '127.0.0.1'：服务端监听的是 IPv6 双栈套接字，浏览器从
+    http://127.0.0.1 连过来时 client_address 是 IPv4-mapped 形式
+    ::ffff:127.0.0.1（这正是"定位本地文件"最初对本机也报 403 的原因）。
+    统一按 ipaddress 解析后判回环，并额外放行本机自己的网卡地址——用户在
+    主机上按局域网 IP 打开页面也算同一台机器；别的机器过来 IP 不同，仍会被挡。
+    这里只信 socket 的真实对端地址，绝不看 X-Forwarded-For 之类可伪造的头。
+    """
+    import ipaddress
+    try:
+        raw = str(handler.client_address[0]).split('%')[0]
+    except Exception:
+        return False
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        return raw == 'localhost'
+    if getattr(ip, 'ipv4_mapped', None):
+        ip = ip.ipv4_mapped
+    if ip.is_loopback:
+        return True
+    return str(ip) in _own_host_ips()
 
 
 def access_ok(handler):
@@ -1435,6 +1476,261 @@ def render_staged_worker(task_id, config, title, prompt_block):
         set_project_key_context(None)
 
 
+def stepped_pipeline_start_worker(task_id, config, dimensions):
+    """Starts the stepped pipeline: compose Phase 1 → render anchor → pause at review_anchor.
+    The pipeline is then advanced via stepped_pipeline_advance_worker calls."""
+    t = get_or_create_task(task_id, dimensions)
+    set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
+    set_log_context(task_id)
+    log('INFO', 'STEPPED', "开始分步管线任务")
+    try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
+
+        def progress_cb(stage, details):
+            if stage == 'cancel_check':
+                return t["cancel_event"].is_set()
+            if t["cancel_event"].is_set():
+                raise GenerationCancelled("Generation cancelled by user")
+            with ACTIVE_TASKS_LOCK:
+                t["events"].append((stage, details))
+            notify_listeners(task_id, stage, details)
+
+        from stepped_pipeline import start_stepped_pipeline
+        from frame_generator import set_cancel_check_sink
+        set_cancel_check_sink(lambda: t["cancel_event"].is_set())
+        try:
+            with _fx_browser_slot(task_id, 'stepped', t['cancel_event']):
+                pipeline_state = start_stepped_pipeline(config, dimensions, on_progress=progress_cb)
+        finally:
+            set_cancel_check_sink(None)
+
+        usage = stop_and_get_accounting()
+
+        result = {
+            'status': 'paused',
+            'stage': pipeline_state.get('stage'),
+            'title': pipeline_state.get('title'),
+            'pipeline_state': pipeline_state,
+        }
+        if usage:
+            result['token_usage'] = usage
+
+        with ACTIVE_TASKS_LOCK:
+            # "paused" — 不是 completed 也不是 failed：管线暂停等用户审核
+            t["status"] = "paused"
+            t["result"] = result
+            t["events"].append(('stepped_paused', result))
+        notify_listeners(task_id, 'stepped_paused', result)
+        log('INFO', 'STEPPED', f"分步管线暂停于 {pipeline_state.get('stage')}", title=pipeline_state.get('title'))
+    except ConnectionError:
+        finalize = False
+        with ACTIVE_TASKS_LOCK:
+            if t["status"] == "running":
+                t["status"] = "cancelled"
+                t["error"] = "用户取消了分步管线任务"
+                t["events"].append(('error', {'message': '用户取消了分步管线任务'}))
+                finalize = True
+        if finalize:
+            notify_listeners(task_id, 'error', {'message': '用户取消了分步管线任务'})
+        log('WARN', 'STEPPED', "分步管线任务已被用户取消")
+    except Exception as e:
+        log_exception('STEPPED')
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "failed"
+            t["error"] = str(e)
+            t["events"].append(('error', {'message': str(e)}))
+        notify_listeners(task_id, 'error', {'message': str(e)})
+        log('ERROR', 'STEPPED', f"分步管线任务失败: {e}")
+    finally:
+        save_task_to_disk(task_id)
+        set_log_context(None)
+        set_project_key_context(None)
+
+
+def stepped_pipeline_advance_worker(task_id, config, title, action):
+    """Advances a paused stepped pipeline: approve/retry/skip the current review gate."""
+    t = get_or_create_task(task_id)
+    set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
+    set_log_context(task_id)
+    log('INFO', 'STEPPED', f"推进分步管线: action={action}", title=title)
+    try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
+
+        def progress_cb(stage, details):
+            if stage == 'cancel_check':
+                return t["cancel_event"].is_set()
+            if t["cancel_event"].is_set():
+                raise GenerationCancelled("Generation cancelled by user")
+            with ACTIVE_TASKS_LOCK:
+                t["events"].append((stage, details))
+            notify_listeners(task_id, stage, details)
+
+        from stepped_pipeline import advance_stepped_pipeline
+        from frame_generator import set_cancel_check_sink
+        set_cancel_check_sink(lambda: t["cancel_event"].is_set())
+        try:
+            with _fx_browser_slot(task_id, 'stepped', t['cancel_event']):
+                pipeline_state = advance_stepped_pipeline(title, action=action, on_progress=progress_cb, config=config)
+        finally:
+            set_cancel_check_sink(None)
+
+        usage = stop_and_get_accounting()
+        stage = pipeline_state.get('stage', '')
+        is_completed = stage == 'completed'
+        is_paused = stage in ('review_anchor', 'review_batch', 'final_review')
+
+        result = {
+            'status': 'completed' if is_completed else ('paused' if is_paused else 'running'),
+            'stage': stage,
+            'title': title,
+            'pipeline_state': pipeline_state,
+        }
+        if usage:
+            result['token_usage'] = usage
+        if is_completed and pipeline_state.get('prompt_block'):
+            result['prompt_block'] = pipeline_state['prompt_block']
+            from prompt_pipeline import prompt_slots_list
+            result['prompt_slots'] = prompt_slots_list(pipeline_state['prompt_block'])
+
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "completed" if is_completed else ("paused" if is_paused else "running")
+            t["result"] = result
+            event_name = 'result' if is_completed else 'stepped_paused'
+            t["events"].append((event_name, result))
+        notify_listeners(task_id, event_name, result)
+        log('INFO', 'STEPPED', f"分步管线推进至 {stage}", title=title)
+    except ConnectionError:
+        finalize = False
+        with ACTIVE_TASKS_LOCK:
+            if t["status"] == "running":
+                t["status"] = "cancelled"
+                t["error"] = "用户取消了分步管线推进"
+                t["events"].append(('error', {'message': '用户取消了分步管线推进'}))
+                finalize = True
+        if finalize:
+            notify_listeners(task_id, 'error', {'message': '用户取消了分步管线推进'})
+        log('WARN', 'STEPPED', "分步管线推进已被用户取消", title=title)
+    except Exception as e:
+        log_exception('STEPPED')
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "failed"
+            t["error"] = str(e)
+            t["events"].append(('error', {'message': str(e)}))
+        notify_listeners(task_id, 'error', {'message': str(e)})
+        log('ERROR', 'STEPPED', f"分步管线推进失败: {e}", title=title)
+    finally:
+        save_task_to_disk(task_id)
+        set_log_context(None)
+        set_project_key_context(None)
+
+
+def replica_task_dims(job_id, task_type='replica'):
+    """复刻任务的 dimensions。
+
+    theme 仍是 job_id（下游按它定位 job 目录），但工作台/任务列表读的是 task_label，
+    所以这里同时写一个人话名字；replica_job_id 让项目表能把同一条 job 的
+    start/advance 多次任务收进一行，而不是每跑一次多出一行同名记录。
+    """
+    from replica_pipeline import job_display_name
+    try:
+        label = job_display_name(job_id)
+    except Exception:
+        label = job_id
+    return {"type": task_type, "theme": job_id,
+            "replica_job_id": job_id, "task_label": label}
+
+
+def _replica_worker(task_id, config, job_id, label, run, task_type='replica'):
+    """复刻/二创流水线的后台 worker 骨架。
+
+    与分步管线的 worker 有一处刻意的差异：这里不进 _fx_browser_slot。整条复刻线不
+    渲染任何图，占着 FX 浏览器名额只会白白挡住真正要渲染的任务。
+    """
+    t = get_or_create_task(task_id, replica_task_dims(job_id, task_type))
+    set_project_key_context(job_id)
+    set_log_context(task_id)
+    log('INFO', 'REPLICA', f"{label}: {job_id}")
+    try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
+
+        def progress_cb(stage, details):
+            if stage == 'cancel_check':
+                return t["cancel_event"].is_set()
+            if t["cancel_event"].is_set():
+                raise GenerationCancelled("Generation cancelled by user")
+            with ACTIVE_TASKS_LOCK:
+                t["events"].append((stage, details))
+            notify_listeners(task_id, stage, details)
+
+        job_state = run(progress_cb)
+        usage = stop_and_get_accounting()
+
+        stage = job_state.get('stage', '')
+        is_completed = stage == 'completed'
+        result = {
+            'status': 'completed' if is_completed else 'paused',
+            'stage': stage,
+            'job_id': job_state.get('job_id'),
+            'job_state': job_state,
+        }
+        if usage:
+            result['token_usage'] = usage
+        if is_completed and job_state.get('prompt_block'):
+            result['prompt_block'] = job_state['prompt_block']
+            from prompt_pipeline import prompt_slots_list
+            result['prompt_slots'] = prompt_slots_list(job_state['prompt_block'])
+
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "completed" if is_completed else "paused"
+            t["result"] = result
+            event_name = 'result' if is_completed else 'replica_paused'
+            t["events"].append((event_name, result))
+        notify_listeners(task_id, event_name, result)
+        log('INFO', 'REPLICA', f"{label} 停在 {stage}")
+    except (ConnectionError, GenerationCancelled):
+        finalize = False
+        with ACTIVE_TASKS_LOCK:
+            if t["status"] == "running":
+                t["status"] = "cancelled"
+                t["error"] = "用户取消了复刻任务"
+                t["events"].append(('error', {'message': '用户取消了复刻任务'}))
+                finalize = True
+        if finalize:
+            notify_listeners(task_id, 'error', {'message': '用户取消了复刻任务'})
+        log('WARN', 'REPLICA', f"{label} 已被用户取消")
+    except Exception as e:
+        log_exception('REPLICA')
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "failed"
+            t["error"] = str(e)
+            t["events"].append(('error', {'message': str(e)}))
+        notify_listeners(task_id, 'error', {'message': str(e)})
+        log('ERROR', 'REPLICA', f"{label} 失败: {e}")
+    finally:
+        save_task_to_disk(task_id)
+        set_log_context(None)
+        set_project_key_context(None)
+
+
+def replica_start_worker(task_id, config, job_id, degraded=False):
+    """抽帧 → Pass A → Pass B，停在 review_beats 人工卡点。"""
+    from replica_pipeline import start_replica_job
+    _replica_worker(task_id, config, job_id, '反推流水线',
+                    lambda cb: start_replica_job(config, job_id, on_progress=cb, degraded=degraded))
+
+
+def replica_advance_worker(task_id, config, job_id, action, payload):
+    """推进人工卡点：approve 合成提示词 / variant 派生二创 / recluster 重跑聚类。"""
+    from replica_pipeline import advance_replica_job
+    _replica_worker(task_id, config, job_id, f'复刻推进（{action}）',
+                    lambda cb: advance_replica_job(config, job_id, action=action,
+                                                   payload=payload, on_progress=cb),
+                    task_type='replica_advance')
+
+
 # FX 浏览器串行锁 —— FX_CONTROL 是唯一 admission 入口。
 #
 # 2026-07-26 修复（清单 S1）：这里原来是「先排 FX_CONTROL 队列，再裸 acquire 一把
@@ -1724,7 +2020,11 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
                     merge_speed = config.get('_merge_speed', 2)
                     progress_cb('merge_start', {'message': f'正在自动以 {merge_speed}x 速率合并视频...'})
                     project_dir = _get_project_dir(title)
-                    merged_info = merge_project_videos(project_dir, speed=merge_speed)
+                    # 首帧封面跟手动合并同款：默认烧一帧，用哪张由 manifest 里的
+                    # cover_roles（前端在封面页登记）决定，自动合并同样吃得到。
+                    merged_info = merge_project_videos(
+                        project_dir, speed=merge_speed,
+                        cover_burn=config.get('_cover_burn', COVER_BURN_DEFAULT))
                     if merged_info:
                         result['merged_video'] = merged_info
                         # Also update manifest file on disk (locked read-modify-write)
@@ -2603,6 +2903,11 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 'skill_contract': skill_contract_report(_active),
                 'skill_contracts': skill_contract_reports(),
                 'runtime_version': _runtime_version,
+                # 质量门禁总表（server_common.GATE_SETTINGS）：键名/类型/默认值/
+                # 选项/文案 + 服务端当前生效值。配置中心的开关面板照它渲染，
+                # 前端不再抄一份默认值——抄一份就是又开了一个会漂移的真相源
+                # （白名单漂移那一类 bug 的老路，见 effective_config 上方注释）。
+                'gate_settings': gate_settings_report(),
             })
         elif path == '/api/image/task/status':
             if not self._gate():
@@ -2901,6 +3206,49 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({'error': f'Volcengine API HTTP {e.code}', 'detail': detail}, status=e.code)
             except Exception as e:
                 self._send_json({'error': str(e)}, status=500)
+        elif path == '/api/stepped/status':
+            if not self._gate():
+                return
+            title = (query.get('title', [''])[0] or '').strip()
+            if not title:
+                self._send_json({'status': 'error', 'message': 'title 参数缺失'}, status=400)
+                return
+            try:
+                from stepped_pipeline import get_stepped_status
+                state = get_stepped_status(title)
+                if state is None:
+                    self._send_json({'status': 'error', 'message': f'未找到 {title} 的分步管线状态'}, status=404)
+                    return
+                self._send_json({'status': 'ok', 'pipeline_state': state})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/jobs':
+            if not self._gate():
+                return
+            try:
+                from replica_pipeline import list_replica_jobs
+                self._send_json({'status': 'ok', 'jobs': list_replica_jobs()})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/status':
+            if not self._gate():
+                return
+            job_id = (query.get('job_id', [''])[0] or '').strip()
+            if not job_id:
+                self._send_json({'status': 'error', 'message': 'job_id 参数缺失'}, status=400)
+                return
+            try:
+                from replica_pipeline import get_replica_status
+                state = get_replica_status(job_id)
+                if state is None:
+                    self._send_json({'status': 'error', 'message': f'未找到复刻任务 {job_id}'}, status=404)
+                    return
+                self._send_json({'status': 'ok', 'job_state': state})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         else:
             if not self._static_path_allowed(path):
                 self.send_error(404, "Not found")
@@ -2914,6 +3262,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         'server_config', 'server.log', 'server.pid', 'library.json',
         'packet_cache.json', 'process_brief_cache.json', 'tasks.json',
         'requirements.txt',
+        # 复刻任务的状态文件与帧事实缓存落在 outputs/ 之下，会被静态兜底路由吐出来。
+        # 帧图片要能给前端看，但状态/缓存不必公开。
+        '.replica_pipeline', '.frame_facts_cache',
     )
     _BLOCKED_PREFIXES = (
         '/tasks/', '/.git', '/.claude/', '/.gemini/', '/scratch/',
@@ -4027,6 +4378,34 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/reveal_file':
+            # 在本机文件管理器里定位某个媒体文件（成片/片段/帧/封面都行）。
+            # 打开的是**跑服务端的这台机器**上的 Finder/资源管理器，所以只对
+            # 本机来源的请求开放：远程访问（局域网/隧道）时点这个按钮不该在
+            # 别人的桌面上弹窗口，直接 403 让前端提示"仅本机可用"。
+            if not self._gate():
+                return
+            try:
+                if not _is_same_machine_client(self):
+                    self._send_json({
+                        'status': 'error',
+                        'message': '只有在运行服务端的这台电脑上打开页面时才能定位本地文件',
+                    }, status=403)
+                    return
+                body = self._read_json_body()
+                target = (body.get('path') or body.get('url') or '') if isinstance(body, dict) else ''
+                if not target:
+                    self._send_json({'status': 'error', 'message': '缺少要定位的文件路径 path'}, status=400)
+                    return
+                try:
+                    abs_p = reveal_media_in_file_manager(target)
+                except ValueError as ve:
+                    self._send_json({'status': 'error', 'message': str(ve)}, status=400)
+                    return
+                self._send_json({'status': 'ok', 'path': abs_p})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/image/task/cancel':
             if not self._gate():
                 return
@@ -4348,6 +4727,216 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        # ── 分步管线 (Stepped Pipeline) ─────────────────────────────────
+
+        elif path == '/api/stepped/start':
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                if not rate_ok(_client_ip(self), 'compose'):
+                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                if not _require_fx_admission(self):
+                    return
+                dimensions = body.get('dimensions') or body
+                project_key = body.get('project_key') or body.get('title', '')
+                config['_project_key'] = project_key
+
+                import uuid
+                task_id = f"stepped_{uuid.uuid4().hex}"
+
+                cleanup_old_tasks()
+                get_or_create_task(task_id, {"type": "stepped", "theme": project_key,
+                                             "userId": config.get('googleFxUserId') or None})
+
+                threading.Thread(
+                    target=stepped_pipeline_start_worker,
+                    args=(task_id, config, dimensions),
+                    daemon=True
+                ).start()
+
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/stepped/advance':
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                if not rate_ok(_client_ip(self), 'compose'):
+                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                if not _require_fx_admission(self):
+                    return
+                title = body.get('title', '')
+                action = body.get('action', 'approve')
+                task_id = body.get('task_id', '')
+                config['_project_key'] = title
+
+                if not title:
+                    self._send_json({'status': 'error', 'message': 'title 不能为空'}, status=400)
+                    return
+                if action not in ('approve', 'retry', 'skip'):
+                    self._send_json({'status': 'error', 'message': f'不支持的 action: {action}'}, status=400)
+                    return
+
+                # 复用已有 task_id 或创建新的
+                if not task_id:
+                    import uuid
+                    task_id = f"stepped_adv_{uuid.uuid4().hex}"
+
+                cleanup_old_tasks()
+                # prepare_task_for_run 能正确处理 running/终态/不存在 三种情况
+                t, already_running = prepare_task_for_run(task_id, {"type": "stepped_advance", "theme": title})
+                if already_running:
+                    self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
+                    return
+
+                threading.Thread(
+                    target=stepped_pipeline_advance_worker,
+                    args=(task_id, config, title, action),
+                    daemon=True
+                ).start()
+
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/upload':
+            # 落盘 + 探测 + 按内容哈希去重。同步跑完：这一步还没烧钱，前端要立刻拿到
+            # job_id 和时长，才好在开跑前把预估摆给用户看。
+            try:
+                if not self._gate(with_rate=True, rate_action='compose'):
+                    return
+                content_type = self.headers.get('content-type') or ''
+                if 'multipart/form-data' not in content_type:
+                    self._send_json({'status': 'error', 'message': 'Content-Type must be multipart/form-data'}, status=400)
+                    return
+
+                from email.parser import BytesParser
+                from email.policy import default
+                msg = BytesParser(policy=default).parsebytes(
+                    f"Content-Type: {content_type}\r\n\r\n".encode('utf-8') + self._body_bytes)
+
+                file_bytes, file_name = None, None
+                for part in msg.walk():
+                    if part.get_content_disposition() != 'form-data':
+                        continue
+                    if part.get_param('name', header='content-disposition') != 'video':
+                        continue
+                    payload = part.get_payload(decode=True) or b''
+                    if part.get_filename() is not None and payload:
+                        file_bytes, file_name = payload, part.get_filename()
+
+                if not file_bytes:
+                    self._send_json({'status': 'error', 'message': '缺少 video 文件'}, status=400)
+                    return
+
+                from replica_pipeline import ingest_video
+                state = ingest_video(file_bytes, file_name)
+                self._send_json({'status': 'ok', 'job_state': state,
+                                 'reused': bool(state.get('reused'))})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/start':
+            try:
+                if not self._gate(with_rate=True, rate_action='compose'):
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                job_id = (body.get('job_id') or '').strip()
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                config['_project_key'] = job_id
+
+                import uuid
+                task_id = f"replica_{uuid.uuid4().hex}"
+                cleanup_old_tasks()
+                get_or_create_task(task_id, replica_task_dims(job_id, 'replica'))
+
+                threading.Thread(
+                    target=replica_start_worker,
+                    args=(task_id, config, job_id, bool(body.get('degraded'))),
+                    daemon=True
+                ).start()
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/advance':
+            try:
+                if not self._gate(with_rate=True, rate_action='compose'):
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                job_id = (body.get('job_id') or '').strip()
+                action = body.get('action', 'approve')
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                if action not in ('approve', 'variant', 'recluster'):
+                    self._send_json({'status': 'error', 'message': f'不支持的 action: {action}'}, status=400)
+                    return
+                config['_project_key'] = job_id
+
+                import uuid
+                task_id = body.get('task_id') or f"replica_adv_{uuid.uuid4().hex}"
+                cleanup_old_tasks()
+                _, already_running = prepare_task_for_run(
+                    task_id, replica_task_dims(job_id, 'replica_advance'))
+                if already_running:
+                    self._send_json({'status': 'ok', 'task_id': task_id, 'already_running': True})
+                    return
+
+                threading.Thread(
+                    target=replica_advance_worker,
+                    args=(task_id, config, job_id, action, body.get('payload') or {}),
+                    daemon=True
+                ).start()
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/beats':
+            # 人工卡点上保存用户改过的节拍。同步跑：只是写文件 + 重跑一遍纯本地校验。
+            try:
+                if not self._gate():
+                    return
+                body = self._read_json_body()
+                job_id = (body.get('job_id') or '').strip()
+                beats = body.get('beats')
+                if not job_id or not isinstance(beats, dict):
+                    self._send_json({'status': 'error', 'message': '缺少 job_id 或 beats'}, status=400)
+                    return
+                from replica_pipeline import save_beats
+                state = save_beats(job_id, beats)
+                self._send_json({'status': 'ok', 'job_state': state,
+                                 'validation': state.get('validation') or []})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+
+        elif path == '/api/replica/delete':
+            try:
+                if not self._gate():
+                    return
+                body = self._read_json_body()
+                job_id = (body.get('job_id') or '').strip()
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                from replica_pipeline import delete_replica_job
+                self._send_json({'status': 'ok', 'deleted': delete_replica_job(job_id)})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+
         elif path == '/api/render_anchor':
             try:
                 if not access_ok(self):
@@ -4449,11 +5038,16 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 
                 # Run the merge. force/allow_partial=True 时用占位帧填充缺口（强制合并）。
                 force = bool(body.get('force') or body.get('allow_partial'))
+                # 首帧封面：请求不带 cover_burn 时用默认档（一帧）；cover 允许显式指定
+                # 某一张，不传则由 resolve_merge_cover 按 manifest 里登记的用途去挑。
+                cover_burn = body.get('cover_burn', COVER_BURN_DEFAULT)
                 try:
                     merged_info = merge_project_videos(
                         project_dir,
                         allow_partial=force,
                         speed=body.get('speed', 2),
+                        cover_burn=cover_burn,
+                        cover_path=body.get('cover'),
                     )
                 except PartialMergeBlocked as blocked:
                     self._send_json({
@@ -4474,6 +5068,58 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     write_manifest(project_dir, mdata)
 
                 self._send_json({'status': 'ok', 'merged_video': merged_info})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/cover_roles':
+            # 一个项目会出好几张封面，三个用途未必用同一张：带文案的那张适合当项目
+            # 封面/成片首帧，却会把文字污染进图生图的第一帧。所以按用途分别登记，
+            # 落进 manifest（服务端自动合并与断线恢复都只认磁盘上的这份）。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                title = body.get('title', '')
+                if not title:
+                    self._send_json({'error': '缺少项目标题 (title)'}, status=400)
+                    return
+                project_dir = _get_project_dir(title)
+                if not os.path.isdir(project_dir):
+                    self._send_json({'error': f'找不到项目目录: {title}'}, status=404)
+                    return
+
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+
+                def _norm_cover(raw):
+                    """校验并归一成 /outputs/... 形式；越界或不存在返回 None。"""
+                    hit = _cover_candidate_path(raw)
+                    if not hit:
+                        return None
+                    return '/' + os.path.relpath(hit, base_dir).replace('\\', '/')
+
+                roles_in = body.get('roles') if isinstance(body.get('roles'), dict) else {}
+                roles, rejected = {}, []
+                for role in COVER_ROLE_KEYS:
+                    raw = roles_in.get(role)
+                    if raw in (None, '', False):
+                        continue  # 该用途不覆盖，回落主封面
+                    normalized = _norm_cover(raw)
+                    if not normalized:
+                        rejected.append(role)
+                        continue
+                    roles[role] = normalized
+                active = _norm_cover(body.get('active_cover'))
+
+                with manifest_lock(project_dir):
+                    mdata = read_manifest(project_dir) or {}
+                    mdata['cover_roles'] = roles
+                    if active:
+                        mdata['active_cover'] = active
+                    write_manifest(project_dir, mdata)
+
+                self._send_json({'status': 'ok', 'cover_roles': roles,
+                                 'active_cover': active, 'rejected': rejected})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -5799,6 +6445,158 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     release_frame_run(project_dir, claim_id)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/project_meta':
+            # 一键补齐一单的中英双版主题与话题标签（结果页标题行的 ✨ 按钮）。
+            #
+            # 正常激发的单子在收尾就带上了 social_title_en/cn（见 background_worker），
+            # 但手动上传的提示词集从来没跑过那条路径：theme 就是个文件名、两行发布标题
+            # 全空，工作台上那一行看着像条没主题的裸项目。这里把同一件事做成按需的、
+            # 可重复调用的一次 aux 调用，并且**以提示词集正文为依据**——只凭文件名推，
+            # 推出来的全是套话。
+            #
+            # 同步返回（单次 aux 调用，秒级），不建后台任务：它没有中间进度可报，
+            # 失败也只是"这次没生成"，不值得占一条任务记录。落库仍由前端走
+            # /api/library/item —— 与封面/删拍同一套回写路径，服务端不碰创意库。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                if not rate_ok(_client_ip(self), 'project_meta'):
+                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                title = body.get('title', '') or ''
+                theme = body.get('theme', '') or ''
+                prompt_block = body.get('prompt_block', '') or ''
+                creativity = body.get('creativity', '') or ''
+                if not (prompt_block.strip() or title.strip()):
+                    self._send_json({'error': '既没有提示词集也没有标题，无从推断主题与话题'},
+                                    status=400)
+                    return
+
+                from prompt_pipeline import generate_project_meta
+                meta = generate_project_meta(config, title, theme, prompt_block, creativity)
+                # generate_project_meta 吞掉所有异常返回空串；四个都空说明这次调用
+                # 实际失败了，如实报错，别让前端把一串空值当成"生成成功"写回创意库。
+                if not any(meta.values()):
+                    self._send_json({'error': '模型没能返回可用的主题与话题，请稍后重试'},
+                                    status=502)
+                    return
+                self._send_json({'status': 'ok', **meta})
+            except Exception as e:
+                self._send_json({'error': str(e)}, status=500)
+
+        elif path == '/api/project/rename':
+            # 项目改名：本地目录与目录里的文件跟着一起改。
+            #
+            # 只改创意条目里的标题，这一单当场散架——磁盘命名空间取的是
+            # project_key || title（前端 getIdeaSaveTitle / 后端 _get_project_dir），
+            # 改完名再去找帧/视频/封面，找到的是一个空目录：已生成的资产在界面上
+            # "凭空消失"，重新生成还会在新目录里另起一套。所以改名必须由服务端
+            # 一次做完：目录搬迁 + 目录内带名字的文件改名 + json 里写死的路径改写
+            # （见 server_common.rename_project_media），再把任务记录里的旧键换掉。
+            #
+            # 创意条目本身仍由前端落库（/api/library/item，与封面/删拍同一套回写
+            # 路径）：服务端在这条路上不碰创意库，只回一份改名清单让前端改 URL。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                old_key = (body.get('project_key') or '').strip()
+                new_title = (body.get('new_title') or '').strip()
+                if not new_title:
+                    self._send_json({'error': '新项目名不能为空'}, status=400)
+                    return
+                if not old_key:
+                    self._send_json({'error': '缺少 project_key，无从定位要改名的项目'},
+                                    status=400)
+                    return
+
+                # 有作业在跑时不能搬目录：帧/视频 worker 手里攥着旧目录路径，目录被
+                # 搬走之后它写出来的东西会落回一个刚被重建的空旧目录，两边都残缺。
+                #
+                # 但"不能搬目录"不等于"不能改名"。改名被整个挡掉才是用户实际撞到的
+                # 那个 bug：一边看着视频在跑、一边点 ✨ 是最常见的用法，结果主题换了、
+                # 项目名一直不动。这里改成降级成功——目录留在原地，把**旧键**回给前端
+                # 钉进条目当 project_key（磁盘命名空间从此不再跟着标题走，见
+                # getIdeaSaveTitle），标题就能随便改而资产一张都不丢。
+                with ACTIVE_TASKS_LOCK:
+                    busy = [t.get('id') for t in ACTIVE_TASKS.values()
+                            if t.get('status') == 'running'
+                            and old_key in ((t.get('dimensions') or {}).get('project_key'),
+                                            (t.get('result') or {}).get('project_key'))]
+                if busy:
+                    stay = os.path.basename(os.path.normpath(_get_project_dir(old_key)))
+                    log('INFO', 'RENAME',
+                        f'项目改名（目录暂不搬迁，{busy[0]} 还在跑）：{old_key} 保持为命名空间')
+                    self._send_json({'status': 'ok', 'project_key': old_key, 'tasks_updated': [],
+                                     'moved': False, 'reason': 'busy', 'busy': busy,
+                                     'old_dir_name': stay, 'new_dir_name': stay,
+                                     'dir': os.path.join(OUTPUT_ROOT, stay),
+                                     'file_map': {}, 'rewrite_failures': []})
+                    return
+
+                new_key = rekey_project_title(old_key, new_title)
+                try:
+                    moved = rename_project_media(old_key, new_key, new_title)
+                except ValueError as e:
+                    self._send_json({'error': str(e)}, status=409)
+                    return
+
+                # 任务记录：旧键要换（不换的话工作台会把这一单的媒体作业按旧键拆成
+                # 另一行「孤立作业」），记录里写死的旧路径也要跟着换——结果页的
+                # 「跟进 / 查看已完成任务」整页是照着 task.result 渲染的
+                # （app.js loadCompletedTask），只换键不换路径，打开就是满屏 404，
+                # 而且那份带死链的对象会被存成 currentIdea 再写回点子库，把改名时
+                # 刚修好的 URL 覆盖回去。
+                path_pairs = []
+                if moved['moved']:
+                    path_pairs = [(f"outputs/{moved['old_dir_name']}/",
+                                   f"outputs/{moved['new_dir_name']}/"),
+                                  (f"outputs\\{moved['old_dir_name']}\\",
+                                   f"outputs\\{moved['new_dir_name']}\\")]
+                    path_pairs += list((moved.get('file_map') or {}).items())
+                touched = []
+                with ACTIVE_TASKS_LOCK:
+                    for tid, t in ACTIVE_TASKS.items():
+                        hit = False
+                        for holder in (t.get('dimensions'), t.get('result')):
+                            if isinstance(holder, dict) and holder.get('project_key') == old_key:
+                                holder['project_key'] = new_key
+                                hit = True
+                        # result.title 是那次跑的日志，保持原样——工作台显示的标题
+                        # 现在以点子库条目为准（见 server_common.build_projects_index）
+                        if hit:
+                            if path_pairs:
+                                for holder in (t.get('dimensions'), t.get('result')):
+                                    rewrite_media_paths(holder, path_pairs)
+                            touched.append(tid)
+                for tid in touched:
+                    try:
+                        save_task_to_disk(tid)
+                    except Exception as e:
+                        log('WARN', 'RENAME', f'任务 {tid} 的新 project_key 未能落盘：{e}')
+
+                # 创意台账：不改的话，合流索引按 project_key 找不到这一行的台账，
+                # 改完名这条创意的选题/评分/投放状态就从项目行上消失了。
+                try:
+                    ledger_updated = rekey_ledger_project_key(old_key, new_key)
+                except Exception as e:
+                    ledger_updated = 0
+                    log('WARN', 'RENAME', f'台账里的 project_key 未能改写：{e}')
+
+                log('INFO', 'RENAME',
+                    f"项目改名：{old_key} → {new_key}"
+                    + (f"（目录 {moved['old_dir_name']} → {moved['new_dir_name']}）"
+                       if moved['moved'] else f"（{moved['reason'] or '无需搬迁'}）")
+                    + f"，任务 {len(touched)} 条、台账 {ledger_updated} 条跟着改")
+                self._send_json({'status': 'ok', 'project_key': new_key, 'tasks_updated': touched,
+                                 'ledger_updated': ledger_updated, **moved})
+            except Exception as e:
+                self._send_json({'error': str(e)}, status=500)
 
         elif path == '/api/generate_cover':
             try:

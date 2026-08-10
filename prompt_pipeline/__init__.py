@@ -28,7 +28,7 @@ from server_common import (
     _get_project_dir, _safe_project_name, read_ledger,
     IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT,
     PACKET_CACHE_LOCK, COMPOSE_CHECKPOINT_LOCK,
-    strict_gates_enabled, qa_gate_level, GenerationCancelled,
+    strict_gates_enabled, qa_gate_level, gate_setting, GenerationCancelled,
     skill_contract_strict, operator_blind_spot_block
 )
 from .frame_state import (
@@ -102,11 +102,11 @@ def strict_frame_state_contract_enabled(config=None):
 
     Reliability is the default.  The explicit escape hatch exists only for comparing
     old prompt packs during diagnostics; it should not be used for production renders.
+
+    取值走 server_common.gate_setting（GATE_SETTINGS 单一真源），因此
+    server_config.json 里的设置对不带 config 的无头调用同样生效。
     """
-    if not isinstance(config, dict):
-        return True
-    value = config.get('strictFrameStateContract')
-    return True if value is None else bool(value)
+    return bool(gate_setting('strictFrameStateContract', config))
 
 
 def frame_slot_counts(total_beats, declared_beats_count=None):
@@ -3014,7 +3014,7 @@ def get_brief_fingerprint(dimensions, profile=None):
 
     技能 profile 必须进指纹（2026-08-01）：同一份 dimensions 在 base 下合成到一半、
     把视频模型切成 Omni Flash 再点合成，指纹不含 profile 就会命中那份 base 存档并
-    "续传"——已完成的拍是 base 语法的一镜到底，续上的拍是 omni 的六镜头，交付出去的
+    "续传"——已完成的拍是 base 语法的一镜到底，续上的拍是 omni 的主镜加插入组接，交付出去的
     是一套半 base 半 omni 的混合提示词集。加进指纹后，换 profile 天然是另一条存档，
     行为变成"重排"而不是"续传"，这正是想要的。
 
@@ -5439,7 +5439,7 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
 
 
 # 多镜头档（omni）确定性注入的切点表句：'Cut this eight-second clip on these marks and
-# hold no other cuts — an establishing long shot from 0.0 to 1.5, ... seconds.'
+# hold no other cuts — a wide working shot from 0.0 to 2.6, ... seconds.'
 # 它是 omni-output-templates.md §Notation Ban 明文开的 Timecode exemption，由
 # _inject_timeline 逐字覆写，模型改不动也不该被扣分。非贪婪抓到第一个 'seconds.'——
 # 句内有小数点，按句号切会把它切碎（与 omni._TIMELINE_RE 同一模式，此处独立一份是为了
@@ -9274,7 +9274,7 @@ Space Type: {space_type}
         # Transition slots are additive production beats.  Expanding only after the conceptual
         # construction ladder passes its count/order gates preserves every construction milestone.
         beat_ladder = expand_spatial_transition_beats(beat_ladder, parsed_brief)
-        if bool((config or {}).get('autoSplitHighRiskBeats')):
+        if gate_setting('autoSplitHighRiskBeats', config):
             beat_ladder = split_high_risk_beats(beat_ladder)
     total_beats = len(beat_ladder)
     # The brief owns physical topology.  Do not let a ladder response silently omit the turn
@@ -10605,7 +10605,7 @@ def _batch_shared_system_prompt(packet, scup_ref, tbcp_ref):
     generic per-beat rules — sent ONCE instead of once-per-beat. Beat-specific content
     (shot family, cropped exemplars, lighting, that beat's anchor rule) lives in each
     beat's own block in the user message (see _beat_block_text)."""
-    return f"""You are a professional prompt composer operating under the `restoration-prompt-composer` skill.
+    return f"""You are a professional prompt composer operating under the `gemini-veo-restoration-composer` skill.
 You will generate VIDEO + IMAGE prompt pairs for MULTIPLE beats in this one response, each described in its own "==================== BEAT N ====================" section in the user message below. For each beat N, generate:
 1. VIDEO N: the construction timelapse video for that beat.
 2. IMAGE N (this beat's resulting clean environment state): the snapshot after that beat's video.
@@ -12113,7 +12113,7 @@ def _sanitize_social_line(s, max_len=250):
     no newlines, no wrapping quotes, no leading label ('标题：'/'Title:'), capped length."""
     s = re.sub(r'\s+', ' ', str(s or '')).strip()
     s = s.strip('"\'“”‘’「」')
-    s = re.sub(r'^\s*(?:title|标题|tiktok|caption|文案)\s*[:：]\s*', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'^\s*(?:title|标题|tiktok|caption|文案|theme|主题)\s*[:：]\s*', '', s, flags=re.IGNORECASE)
     return s[:max_len].strip()
 
 
@@ -12156,6 +12156,103 @@ def generate_social_titles(config, title, theme=''):
     except Exception as e:
         if sys.stdout:
             print(f"[SOCIAL TITLES] generation failed (non-fatal): {e}")
+        return empty
+
+
+def _prompt_block_digest(prompt_block, per_slot=420):
+    """把一整份提示词集压成给标题模型看的三段摘要：首拍（改造前）、中段、末拍
+    （改造后）。整份集子动辄上万字，全塞进去既贵又会把模型的注意力冲散；这三拍
+    正好是"从什么样变成什么样"这条主线的两端加一个过程样本。解析不出槽位时退回
+    整块文本的头部截断，绝不抛异常。"""
+    block = str(prompt_block or '').strip()
+    if not block:
+        return ''
+    try:
+        images, _ = _parse_prompt_slots(block)
+    except Exception:
+        images = {}
+    if not images:
+        return block[:per_slot * 3]
+
+    keys = sorted(images)
+    picks = [('FIRST BEAT (before state)', keys[0])]
+    if len(keys) > 2:
+        picks.append(('MIDDLE BEAT (mid build)', keys[len(keys) // 2]))
+    if len(keys) > 1:
+        picks.append(('LAST BEAT (after state)', keys[-1]))
+
+    lines = [f"Total beats: {len(keys)} image prompts."]
+    for label, k in picks:
+        item = images[k]
+        body = item['body'] if isinstance(item, dict) else str(item or '')
+        body = re.sub(r'\s+', ' ', body).strip()[:per_slot]
+        lines.append(f"{label} — 图片 {k}: {body}")
+    return '\n'.join(lines)
+
+
+def generate_project_meta(config, title='', theme='', prompt_block='', creativity=''):
+    """一键补齐一单的发布元数据：中英双版主题 + 两条可原样粘贴的标题话题行。
+
+    与 generate_social_titles 的分工：那个挂在激发收尾，只有标题和主题可用；这个
+    是给"没跑过激发"的单子（手动上传的提示词集、导入的项目）补课的，因此**以提示词
+    集正文为主要依据**——那些单子的 title/theme 往往就是个文件名，光凭它推出来的
+    话题全是套话。
+
+    返回 {'theme_cn','theme_en','tiktok','cn'}；任何失败（网络、非 JSON、非 dict）
+    都返回四个空串，绝不抛异常——它是补充信息，不允许拖垮调用方。
+    """
+    empty = {'theme_cn': '', 'theme_en': '', 'tiktok': '', 'cn': ''}
+    digest = _prompt_block_digest(prompt_block)
+    if not (digest or (title or '').strip()):
+        return empty
+
+    known = [f"Existing project title: {title or '(none)'}",
+             f"Existing theme: {theme or '(none)'}"]
+    if creativity:
+        known.append(f"Creativity dial: {creativity}")
+    context = '\n'.join(known)
+    if digest:
+        context += ('\n\nThe prompt set below is the ground truth — the existing title/theme may '
+                    'be nothing but a file name, so derive everything from these beats:\n' + digest)
+
+    user_prompt = (
+        f"{context}\n\n"
+        "This is a before/after renovation time-lapse short video. Produce its publish metadata.\n\n"
+        "Return STRICT JSON only, no markdown fence, exactly this shape:\n"
+        '{"theme_cn": "...", "theme_en": "...", "tiktok": "...", "cn": "..."}\n\n'
+        'Rules for "theme_cn": 8-16 字的中文场景主题短语，说清"把什么改造成什么"，'
+        "不要话题标签、不要标点结尾。例如：沼泽坠机残骸爆改避世小屋。\n"
+        'Rules for "theme_en": the same theme in English, 3-8 words, no hashtags, no quotes.\n'
+        'Rules for "tiktok" (for TikTok US):\n'
+        "- ONE single line: a catchy viral English title (5-9 words) first, then 4-6 English hashtags, all separated by single spaces.\n"
+        "- Hashtags in CamelCase, e.g. #Restoration #OffGridLiving #BeforeAndAfter #DIYBuild #OddlySatisfying.\n"
+        "- No quotes, no emoji, no newlines, no labels or explanations — the line is pasted as-is.\n"
+        'Rules for "cn" (for 抖音/小红书):\n'
+        "- 一整行：先是吸睛中文短标题（14字以内，有钩子感），随后 4-6 个中文话题标签，每个以#开头、彼此用单个空格分隔，例如 #旧物改造 #爆改 #解压 #治愈系.\n"
+        "- 不要引号、emoji、换行、标签名或任何解释文字，整行将被原样粘贴进发布框。"
+    )
+    try:
+        response = _chat(
+            config,
+            "You are a bilingual short-video marketing expert for TikTok US and Chinese platforms "
+            "(抖音/小红书). You output strict JSON only.",
+            user_prompt,
+            temperature=0.7, max_tokens=600, timeout=90, model=_aux_model(config),
+        )
+        data = json.loads(_strip_code_fences(response))
+        if not isinstance(data, dict):
+            return empty
+        return {
+            # 主题进的是项目字段（工作台副标题、封面提示词里的 Video Theme），不是
+            # 发布框，所以照样过一遍单行清洗但给更短的上限
+            'theme_cn': _sanitize_social_line(data.get('theme_cn'), max_len=60),
+            'theme_en': _sanitize_social_line(data.get('theme_en'), max_len=80),
+            'tiktok': _sanitize_social_line(data.get('tiktok')),
+            'cn': _sanitize_social_line(data.get('cn')),
+        }
+    except Exception as e:
+        if sys.stdout:
+            print(f"[PROJECT META] generation failed (non-fatal): {e}")
         return empty
 
 
@@ -15246,7 +15343,7 @@ Axis-1 bank is deliberately rich in natural shells, so working straight down it 
 quota — lean on its "Abandoned man-made" and "Vehicles / vessels" groups instead.
 """
 
-    system_prompt = f"""You are the Upstream Ideation Layer for the `restoration-prompt-composer` skill.
+    system_prompt = f"""You are the Upstream Ideation Layer for the `gemini-veo-restoration-composer` skill.
 Your task is to generate a ranked list of {count} highly novel, realistic, buildable time-lapse renovation topic seeds.
 You combine axes from the Morphological Matrix in `idea-engine.md` and filter them to ensure quality.
 

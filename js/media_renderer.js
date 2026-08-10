@@ -644,6 +644,7 @@ function renderVideosForIdea(idea) {
     const mergedDownload = document.getElementById('merged-video-download');
     const mergedHeading = document.getElementById('merged-video-heading');
     const mergedDescription = document.getElementById('merged-video-description');
+    const mergedReveal = document.getElementById('merged-video-reveal');
 
     if (mergedContainer) {
         if (frameRun && frameRun.merged_video && frameRun.merged_video.status === 'success') {
@@ -665,6 +666,19 @@ function renderVideosForIdea(idea) {
             if (mergedDownload) {
                 mergedDownload.href = mv.url;
                 mergedDownload.download = `${idea.title || 'video'}_merged_${speedSlug}.mp4`;
+            }
+            if (mergedReveal) {
+                // 定位用的是磁盘相对路径（mv.file），不是播放地址：合并结果原地
+                // 覆盖同名文件时播放地址还挂着 cache-bust 版本号，路径才是真值。
+                mergedReveal.dataset.path = mv.file || mv.url || '';
+                // 这个按钮是 index.html 里的常驻元素，每次重渲都会走到这里——
+                // 监听只绑一次，否则一次点击会重复打开 N 个 Finder 窗口。
+                if (!mergedReveal.dataset.bound) {
+                    mergedReveal.dataset.bound = '1';
+                    mergedReveal.addEventListener('click', () => {
+                        revealLocalFile(mergedReveal.dataset.path, '成品视频');
+                    });
+                }
             }
             if (mergedInfo) {
                 const sizeMB = mv.size_bytes ? (mv.size_bytes / (1024 * 1024)).toFixed(2) + ' MB' : '未知大小';
@@ -744,7 +758,101 @@ function renderVideosForIdea(idea) {
     if (typeof syncSlotToolbar === 'function') syncSlotToolbar('video');
 }
 
-function renderCoversForIdea(idea, activeIndex = 0) {
+// ── 封面用途分配 ────────────────────────────────────────────────────────────
+// 一个项目会出好几张封面，三个用途未必用同一张：带文案的那张适合当项目封面/成片
+// 首帧，却会把文字污染进图生图的第一帧。所以三个用途各自可以指一张，没指的跟随
+// 主封面（缩略图里选中的那张）。服务端的真相在 manifest.cover_roles（自动合并、
+// 断线恢复只认磁盘上那份），点子库条目里的 coverRoles 是同一份数据的前端副本。
+const COVER_ROLE_LABELS = {
+    project: '项目封面',
+    video: '成片首帧',
+    frame1: '帧 1 参考图',
+};
+const COVER_ROLE_HINTS = {
+    project: '项目工作台卡片上显示的那张',
+    video: '合并成片时烧进第一帧（平台取缩略图吃的就是它）',
+    frame1: '第一帧图生图的参考图；选带文案的封面会把文字带进生成画面',
+};
+
+// 某个用途实际用的那张封面（未单独指定 → 主封面 → 最后一张）
+function coverRoleUrl(idea, role) {
+    const covers = (idea && idea.covers) || [];
+    const roles = (idea && idea.coverRoles) || {};
+    return roles[role] || (idea && idea.activeCoverUrl) || covers[covers.length - 1] || null;
+}
+
+// 用途分配落盘：点子库条目（前端副本）+ 项目 manifest（服务端唯一真相）。
+// manifest 写失败只提示不回滚——用户的选择已经在点子库里，重合并时还能再同步一次。
+async function persistCoverRoles(idea) {
+    if (!idea) return;
+    if (typeof saveCurrentIdeaState === 'function' && typeof currentIdea !== 'undefined'
+        && currentIdea && currentIdea.id === idea.id) {
+        saveCurrentIdeaState();
+    }
+    if (typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
+        const idx = savedIdeas.findIndex(item => item.id === idea.id);
+        if (idx !== -1) {
+            savedIdeas[idx].coverRoles = idea.coverRoles;
+            savedIdeas[idx].activeCoverUrl = idea.activeCoverUrl;
+            if (typeof persistIdeaItem === 'function') await persistIdeaItem(savedIdeas[idx]);
+        }
+    }
+    try {
+        const title = (typeof getIdeaSaveTitle === 'function') ? getIdeaSaveTitle(idea) : idea.title;
+        if (!title) return;
+        await fetch('/api/cover_roles', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                title,
+                roles: idea.coverRoles || {},
+                active_cover: idea.activeCoverUrl || null,
+            }),
+        });
+    } catch (e) {
+        // 项目目录还没建出来（封面尚未落盘）时这里必然 404，不值得打扰用户
+        console.warn('[cover] 用途分配同步到项目失败', e);
+    }
+}
+
+function renderCoverRoleControls(idea, container) {
+    const covers = idea.covers || [];
+    container.innerHTML = '';
+    Object.keys(COVER_ROLE_LABELS).forEach(role => {
+        const field = document.createElement('label');
+        field.className = 'cover-role-field';
+        field.title = COVER_ROLE_HINTS[role];
+
+        const name = document.createElement('span');
+        name.className = 'cover-role-name';
+        name.textContent = COVER_ROLE_LABELS[role];
+
+        const select = document.createElement('select');
+        select.className = 'cover-role-select';
+        select.setAttribute('aria-label', `${COVER_ROLE_LABELS[role]}使用的封面`);
+        const follow = new Option('跟随主封面', '');
+        select.appendChild(follow);
+        covers.forEach((url, idx) => select.appendChild(new Option(`封面 ${idx + 1}`, url)));
+
+        const assigned = (idea.coverRoles || {})[role];
+        select.value = covers.includes(assigned) ? assigned : '';
+        select.addEventListener('change', async () => {
+            if (!idea.coverRoles) idea.coverRoles = {};
+            if (select.value) idea.coverRoles[role] = select.value;
+            else delete idea.coverRoles[role];
+            renderCoversForIdea(idea);
+            await persistCoverRoles(idea);
+        });
+
+        field.appendChild(name);
+        field.appendChild(select);
+        container.appendChild(field);
+    });
+}
+
+// activeIndex 传 null/省略时按「已选中的主封面」还原，而不是无脑回到第 0 张——
+// 否则任何一次重渲染（切页、任务回调）都会把用户选过的主封面悄悄改掉。
+function renderCoversForIdea(idea, activeIndex = null) {
     const placeholderEl = document.getElementById('cover-image-placeholder');
     const displayEl = document.getElementById('cover-img-display');
     const historyContainer = document.getElementById('cover-history-container');
@@ -773,6 +881,10 @@ function renderCoversForIdea(idea, activeIndex = 0) {
     }
     
     // Bound activeIndex
+    if (!Number.isInteger(activeIndex)) {
+        const remembered = covers.indexOf(idea.activeCoverUrl);
+        activeIndex = remembered === -1 ? covers.length - 1 : remembered;
+    }
     if (activeIndex < 0 || activeIndex >= covers.length) {
         activeIndex = covers.length - 1;
     }
@@ -807,11 +919,25 @@ function renderCoversForIdea(idea, activeIndex = 0) {
     historyContainer.style.display = 'flex';
     thumbnailsEl.innerHTML = '';
     
+    // 每张缩略图角上标出它当前承担的用途（项/片/帧），一眼能看出哪张在哪里用
+    const roleTags = { project: '项', video: '片', frame1: '帧' };
+    const usedBy = {};
+    Object.keys(COVER_ROLE_LABELS).forEach(role => {
+        const url = coverRoleUrl(idea, role);
+        if (!usedBy[url]) usedBy[url] = [];
+        usedBy[url].push(role);
+    });
+
     covers.forEach((coverUrl, idx) => {
         const thumb = document.createElement('div');
         thumb.className = `cover-thumb ${idx === activeIndex ? 'active' : ''}`;
-        thumb.innerHTML = `<img src="" alt="Thumbnail ${idx + 1}" loading="lazy">`;
-        
+        const roles = usedBy[coverUrl] || [];
+        const badges = roles.length
+            ? `<span class="cover-thumb-roles" title="${roles.map(r => COVER_ROLE_LABELS[r]).join(' / ')}">`
+              + roles.map(r => roleTags[r]).join('') + '</span>'
+            : '';
+        thumb.innerHTML = `<img src="" alt="Thumbnail ${idx + 1}" loading="lazy">${badges}`;
+
         const img = thumb.querySelector('img');
         img.onerror = () => {
             thumb.remove();
@@ -823,12 +949,18 @@ function renderCoversForIdea(idea, activeIndex = 0) {
         
         safeSetImageSrc(img, coverUrl);
         
-        thumb.addEventListener('click', () => {
+        thumb.addEventListener('click', async () => {
             renderCoversForIdea(idea, idx);
+            // 主封面的切换要落盘：没单独指定用途的那几项都跟着它走（项目卡片、
+            // 成片首帧、帧 1 参考图），只留在内存里等于重开一次就丢。
+            await persistCoverRoles(idea);
         });
-        
+
         thumbnailsEl.appendChild(thumb);
     });
+
+    const roleControls = document.getElementById('cover-role-controls');
+    if (roleControls) renderCoverRoleControls(idea, roleControls);
 }
 
 function extractImageUrl(content) {

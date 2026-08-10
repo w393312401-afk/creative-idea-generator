@@ -254,7 +254,7 @@ used, and exit within one video. The exception applies only to erected plant.
 
 ### Worker Identity Lock
 
-Workers are the fastest-morphing element across a six-shot cut sequence: a person
+Workers are the fastest-morphing element across a cut sequence: a person
 described in ordinary detail will change face, build, and clothing between shots. Lock
 them as a high-contrast, low-detail silhouette and repeat the same description in every
 shot that shows them:
@@ -315,7 +315,7 @@ Each worker sequence needs:
 - empty final wide shot
 
 Access and crew plausibility:
-- Work above comfortable arm reach requires a visible ladder, scaffold, or standing surface. Treat it like any other temporary tool: it enters, it is used, it exits before the wide outro shot unless it logically stays for the next beat.
+- Work above comfortable arm reach requires a visible ladder, scaffold, or standing surface. Treat it like any other temporary tool: it enters, it is used, it exits before the returning wide shot unless it logically stays for the next beat.
 - Loads beyond one person's plausible capacity (full ceiling panels, beams, large appliances) require a second worker or a machine; describe the shared or mechanical lift.
 
 Physical weight and resistance guidelines:

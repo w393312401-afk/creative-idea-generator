@@ -44,22 +44,23 @@ BASE_VIDEO_DRAFT = (
     "sill below."
 )
 
-# omni 契约下模型该交出的东西：剪辑过的六镜头序列。
+# omni 契约下模型该交出的东西：一条主工作镜，被两个特写插入切开，再切回同一机位收尾。
 OMNI_VIDEO_DRAFT = (
-    "The sequence opens with an establishing long shot captured like casual smartphone "
-    "footage, slightly off-center with mild wide-angle edge distortion and phone auto-exposure "
-    "settling on the stone shell in its unrepointed state. A clean cut moves to a full shot "
-    "with handheld phone sway as one lone worker in a solid pale shirt, dark pants, and dark "
-    "cap enters from the left courtyard path carrying a pointing trowel and a rigid mortar "
-    "bucket. A match cut moves into a medium shot where the worker repeatedly presses mortar "
-    "into the open joints, the changed area growing steadily as fine dust settles nearby. A "
-    "close-up isolates the trowel edge with minor handheld motion blur and small blown "
-    "highlights, capturing mortar squeezing out under pressure. An extreme close-up lingers on "
+    "The clip opens on a wide working shot captured like casual smartphone footage, slightly "
+    "off-center with mild wide-angle edge distortion and phone auto-exposure settling on the "
+    "stone shell in its unrepointed state, with one lone worker in a solid pale shirt, dark "
+    "pants, and dark cap already at the south wall pressing mortar into the open joints with a "
+    "pointing trowel at zero seconds, scooping from a rigid mortar bucket and working joint "
+    "after joint as the repointed run grows steadily and fine dust settles nearby. A clean cut "
+    "at the three-second mark drops into a close-up insert on the trowel edge with minor "
+    "handheld motion blur and small blown highlights, capturing mortar squeezing out under "
+    "pressure. A second insert at the five-second mark pushes to an extreme close-up insert on "
     "the tooled joint lines and the dust edge engraved into the porous stone, with low-light "
-    "noise and mild compression proving the physical causality. A final clean cut returns to a "
-    "wide outro shot matching the phone-recorded exposure of the last frame, where the worker "
-    "exits through the left courtyard path, the bucket leaves with them, and the empty "
-    "weathered wall stands repointed while the scrape grooves remain visible."
+    "noise and mild compression proving the physical causality. A final clean cut at the "
+    "seven-second mark returns to a returning wide shot from the same camera setup as the "
+    "opening wide working shot, matching the phone-recorded exposure of the last frame, where "
+    "— after the remaining joints are filled the same way — the worker keeps pointing through "
+    "the last instant and the repointed wall carries the scrape grooves still visible."
 )
 
 
@@ -253,7 +254,7 @@ class TestVendoredOmniPackage(unittest.TestCase):
 
 
 class TestOmniAudit(_ComposeHarness):
-    """六镜头缺失/一镜到底措辞 = 结构性硬伤 → 定向回炉一轮，回炉不成也要留痕。"""
+    """镜头结构缺失/一镜到底措辞 = 结构性硬伤 → 定向回炉一轮，回炉不成也要留痕。"""
 
     NON_COMPLIANT = (
         "The camera holds a single continuous take as one lone worker in a solid pale shirt "
@@ -358,20 +359,20 @@ class TestOmniDeterministicNormalisation(unittest.TestCase):
         self.assertIn('The camera pushes forward', cleaned)
 
     def test_ordinary_prose_is_not_mangled(self):
-        text = ("A match cut moves into a medium shot where the worker presses mortar into one "
-                "joint after another, and the wide outro shot lands on the finished course.")
+        text = ("A wide working shot holds while the worker presses mortar into one joint "
+                "after another, and the returning wide shot lands on the finished course.")
         self.assertEqual(omni_mod.strip_one_take_language(text), text)
 
     def test_shot_rungs_must_appear_in_order(self):
-        shuffled = ("a wide outro shot, then an extreme close-up, a close-up, a medium shot, a "
-                    "full shot and finally an establishing long shot")
+        shuffled = ("a returning wide shot, then an extreme close-up insert, a close-up "
+                    "insert, and finally a wide working shot")
         self.assertTrue(omni_mod._missing_shot_rungs(shuffled),
-                        '乱序的六个词不是轮换，不能算通过')
+                        '乱序的四个词不是组接，不能算通过')
 
     def test_hyphen_and_spacing_variants_count_as_the_same_rung(self):
         for variant in ('close-up', 'close up', 'closeup'):
-            text = (f"establishing long shot, full shot, medium shot, {variant}, extreme "
-                    f"{variant}, wide outro shot")
+            text = (f"a wide working shot, a {variant} insert, an extreme {variant} insert, "
+                    f"a returning wide shot")
             self.assertEqual(omni_mod._missing_shot_rungs(text), [], variant)
 
     def test_fallback_placeholder_gets_the_shot_ladder_clause(self):

@@ -55,6 +55,19 @@ def _isolate_repo_root_state_files(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_library_dir(tmp_path_factory, monkeypatch):
+    """创意库目录也重定向到临时目录。
+
+    与上面两条同一个理由，但这一条是被真事故教出来的（2026-08-09）：复刻流水线在
+    run_compose 末尾开始把提示词包写进创意库，于是每个跑到那一步的测试都往开发者的
+    真实创意库里塞一条桩记录——工作台上凭空多出几行 title='t' 的项目，而且没人会想到
+    是测试干的。写路径一旦存在，隔离就必须是默认行为，不能靠每个测试自觉。"""
+    import server_common
+    monkeypatch.setattr(server_common, 'LIBRARY_DIR',
+                        str(tmp_path_factory.mktemp('library')), raising=True)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_used_topic_ledger(tmp_path_factory, monkeypatch):
     """把可写的历史选题台账（runtime/used-topic-ledger.md）也重定向到临时目录。
 

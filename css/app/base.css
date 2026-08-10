@@ -772,12 +772,18 @@ html[data-theme="dark"] .segment-btn.active {
     margin-right: 16px;
 }
 
+/* 尾列一格一个按钮：英文行是「复制 + ✨ 生成主题和 tags（+ 折叠箭头，见下）」，
+   中文行只有复制。列数写死而不是用 auto-flow，是为了让两行的标题正文左右等宽。 */
 .tiktok-title-line {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 34px;
+    grid-template-columns: minmax(0, 1fr) 34px 34px;
     align-items: center;
     gap: 10px;
     min-width: 0;
+}
+
+.tiktok-title-line-cn {
+    grid-template-columns: minmax(0, 1fr) 34px;
 }
 
 #idea-title {

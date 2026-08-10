@@ -1,0 +1,339 @@
+/* ==========================================================================
+   SPARK - Stepped Pipeline Styles
+   ========================================================================== */
+
+/* --- 1. Stepped Progress Bar --- */
+.stepped-progress {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 24px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border-color);
+    border-radius: 16px;
+    margin-bottom: 24px;
+    position: relative;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.05);
+}
+
+.stepped-progress-track {
+    position: absolute;
+    top: 40px; /* Center with icons */
+    left: 48px;
+    right: 48px;
+    height: 4px;
+    background: rgba(var(--ink-rgb), 0.08);
+    border-radius: 2px;
+    z-index: 1;
+}
+
+.stepped-progress-fill {
+    height: 100%;
+    background: var(--accent-success, var(--color-success, #10b981));
+    border-radius: 2px;
+    transition: width var(--transition-normal);
+}
+
+.stepped-stage {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    flex: 1;
+}
+
+.stepped-stage-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: var(--bg-card);
+    border: 2px solid var(--border-color);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    transition: all var(--transition-normal);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+}
+
+.stepped-stage-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-align: center;
+    white-space: nowrap;
+    transition: color var(--transition-normal);
+}
+
+/* Stage States */
+.stepped-stage.completed .stepped-stage-icon {
+    background: var(--accent-success, var(--color-success, #10b981));
+    border-color: var(--accent-success, var(--color-success, #10b981));
+    color: white;
+}
+.stepped-stage.completed .stepped-stage-label {
+    color: var(--text-primary);
+}
+
+.stepped-stage.active .stepped-stage-icon {
+    border-color: var(--primary);
+    background: var(--bg-panel-solid);
+    animation: stepped-pulse 2s infinite cubic-bezier(0.4, 0, 0.2, 1);
+    box-shadow: 0 0 12px var(--primary-glow);
+}
+.stepped-stage.active .stepped-stage-label {
+    color: var(--primary);
+}
+
+.stepped-stage.paused .stepped-stage-icon {
+    border-color: var(--accent-warning, var(--color-warning, #f59e0b));
+    background: var(--bg-panel-solid);
+}
+.stepped-stage.paused .stepped-stage-label {
+    color: var(--accent-warning, var(--color-warning, #f59e0b));
+}
+
+.stepped-stage.queued .stepped-stage-icon {
+    opacity: 0.6;
+}
+
+/* Stage Status Badges */
+.stepped-stage-badge {
+    position: absolute;
+    top: -24px;
+    font-size: 10px;
+    padding: 2px 6px;
+    background: rgba(var(--ink-rgb), 0.05);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+/* --- 2. Review Panels (Shared) --- */
+.stepped-review-container {
+    animation: stepped-fadein 0.4s ease-out forwards;
+}
+
+.review-panel-glass {
+    background: var(--bg-panel);
+    border: 1px solid var(--border-color);
+    border-radius: 20px;
+    padding: 24px;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.08);
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.review-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.review-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+/* Batch Counter Badge */
+.batch-counter-badge {
+    padding: 4px 12px;
+    background: var(--primary-glow);
+    color: var(--primary);
+    border: 1px solid var(--primary);
+    border-radius: 16px;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+/* --- Image Previews --- */
+.review-image-wrapper {
+    position: relative;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--border-color);
+    background: var(--bg-card);
+    cursor: pointer;
+    transition: transform var(--transition-normal), box-shadow var(--transition-normal);
+}
+
+.review-image-wrapper:hover {
+    transform: scale(1.02);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
+    border-color: var(--border-glow);
+}
+
+.review-image-wrapper img {
+    display: block;
+    width: 100%;
+    height: auto;
+    object-fit: contain;
+    max-height: 500px;
+}
+
+.final-review-panel .review-image-wrapper {
+    overflow-x: auto;
+    display: flex;
+}
+
+.final-review-panel img {
+    max-height: none;
+    width: 100%;
+    min-width: 800px; /* Force scroll if needed */
+}
+
+/* --- Review Actions --- */
+.review-actions {
+    display: flex;
+    justify-content: center;
+    gap: 16px;
+    margin-top: 10px;
+}
+
+.review-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 24px;
+    border-radius: 12px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+    border: 1px solid transparent;
+}
+
+.review-btn-approve {
+    background: linear-gradient(135deg, var(--accent-success, #10b981), #059669);
+    color: white;
+    box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+}
+
+.review-btn-approve:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 16px rgba(16, 185, 129, 0.4);
+}
+
+.review-btn-retry {
+    background: var(--bg-card);
+    color: var(--accent-warning, #f59e0b);
+    border-color: var(--accent-warning, #f59e0b);
+}
+
+.review-btn-retry:hover {
+    background: rgba(245, 158, 11, 0.1);
+    transform: translateY(-2px);
+}
+
+.review-btn-skip {
+    background: transparent;
+    color: var(--text-muted);
+    border-color: var(--border-color);
+}
+
+.review-btn-skip:hover {
+    background: rgba(var(--ink-rgb), 0.05);
+    color: var(--text-primary);
+}
+
+.review-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none !important;
+}
+
+/* Loading State (Progress) */
+.stepped-loading {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 48px;
+    gap: 16px;
+    color: var(--text-secondary);
+}
+
+.stepped-loading-bar {
+    width: 100%;
+    max-width: 400px;
+    height: 6px;
+    background: rgba(var(--ink-rgb), 0.1);
+    border-radius: 3px;
+    overflow: hidden;
+    position: relative;
+}
+
+.stepped-loading-fill {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    background: var(--primary);
+    animation: stepped-shimmer 2s infinite linear;
+    background-image: linear-gradient(90deg, 
+        rgba(255,255,255,0) 0%, 
+        rgba(255,255,255,0.4) 50%, 
+        rgba(255,255,255,0) 100%);
+    background-size: 200% 100%;
+}
+
+/* --- Animations --- */
+@keyframes stepped-pulse {
+    0% {
+        box-shadow: 0 0 0 0 var(--primary-glow);
+    }
+    70% {
+        box-shadow: 0 0 0 10px rgba(176, 123, 82, 0);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(176, 123, 82, 0);
+    }
+}
+
+@keyframes stepped-fadein {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes stepped-shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+/* --- Responsive --- */
+@media (max-width: 768px) {
+    .stepped-stage-label {
+        display: none;
+    }
+    .stepped-progress {
+        padding: 16px;
+    }
+    .stepped-progress-track {
+        top: 32px;
+        left: 32px;
+        right: 32px;
+    }
+    .review-actions {
+        flex-direction: column;
+    }
+    .review-btn {
+        width: 100%;
+        justify-content: center;
+    }
+}

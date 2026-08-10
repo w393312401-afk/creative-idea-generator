@@ -997,6 +997,22 @@ html[data-theme="dark"] .task-status-badge.completed {
     box-shadow: 0 0 10px rgba(176, 123, 82, 0.2);
 }
 
+.ideation-card-btn.stepped-compose-btn {
+    background: linear-gradient(135deg, rgba(100, 160, 180, 0.15), rgba(140, 120, 180, 0.15));
+    border-color: rgba(100, 160, 180, 0.3);
+    color: var(--text-secondary, #9ca3af);
+    font-weight: 500;
+    flex: 0 0 auto;
+    padding: 6px 8px;
+}
+
+.ideation-card-btn.stepped-compose-btn:hover {
+    background: linear-gradient(135deg, rgba(100, 160, 180, 0.3), rgba(140, 120, 180, 0.3));
+    border-color: rgba(100, 160, 180, 0.5);
+    box-shadow: 0 0 8px rgba(100, 160, 180, 0.2);
+    color: var(--text-main, #ffffff);
+}
+
 .ideation-card-cover {
     width: 100%;
     height: 180px;
@@ -1415,7 +1431,8 @@ html[data-theme="dark"] .task-status-badge.completed {
     }
 
     .tiktok-title-line {
-        grid-template-columns: minmax(0, 1fr) 30px 30px;
+        /* 复制 + ✨ 生成主题和 tags + 折叠箭头 */
+        grid-template-columns: minmax(0, 1fr) 30px 30px 30px;
         gap: 6px;
         align-items: start;
     }

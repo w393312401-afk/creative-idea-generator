@@ -40,10 +40,28 @@ const PROJECT_STATE_LABELS = {
 };
 const PROJECT_JOB_LABELS = {
     frames: '帧序列', staged_render: '分步渲染', videos: '视频', cover: '封面',
+    stepped: '分步管线', stepped_advance: '管线推进',
 };
 const PROJECT_JOB_ICONS = {
     completed: '✓', failed: '✕', running: '⏳', cancelled: '⚪',
 };
+// 进度行上的阶段名。项目表只拿得到阶段字符串（没有 details），所以用不了
+// progress_model 那套带参数的文案，这里给一份纯静态的中文映射；查不到的阶段
+// 直接原样显示，总比把 batch_generating 这种内部名摆在用户面前强。
+const PROJECT_STAGE_LABELS = {
+    outline: '生成大纲', batch: '批量合成', batch_generating: '批量合成中',
+    batch_generated: '批次完成', batch_retry: '批次重试', batch_failed: '批次失败',
+    repair: '修复中', audit: '质量审计', compose: '合成提示词',
+    frames: '生成帧序列', staged_render: '分步渲染', videos: '生成视频', cover: '生成封面',
+    // 复刻线（replica_pipeline.STAGES）
+    ingest: '导入素材', extract: '抽帧分析', review_frames: '逐帧反推',
+    cluster_beats: '聚合节拍', review_beats: '待人工核对节拍',
+    mutate_beats: '二创变异', completed: '已完成', cancelled: '已取消',
+};
+function projectsStageLabel(stage) {
+    if (!stage) return '准备中…';
+    return PROJECT_STAGE_LABELS[stage] || stage;
+}
 
 /* ── 数据 ──────────────────────────────────────────────────────────────── */
 
@@ -225,7 +243,7 @@ function projectsRowInnerHtml(p) {
     const task = p.task || {};
     const running = p.state === 'running';
     const progress = running
-        ? `<div class="project-progress"><span class="project-progress-stage">${escapeHtml(task.stage || '准备中…')}</span><span class="project-spinner"></span></div>`
+        ? `<div class="project-progress"><span class="project-progress-stage" title="${escapeHtml(task.stage || '')}">${escapeHtml(projectsStageLabel(task.stage))}</span><span class="project-spinner"></span></div>`
         : '';
     const error = (p.state === 'failed' && task.error)
         ? `<div class="project-error">❌ ${escapeHtml(task.error)}</div>` : '';

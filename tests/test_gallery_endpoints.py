@@ -16,6 +16,7 @@ import pytest
 from server_common import (
     scan_gallery,
     gallery_delete_files,
+    resolve_gallery_media_path,
     gallery_collect_references,
     make_idea_project_key,
     _safe_project_name,
@@ -158,6 +159,35 @@ class TestGalleryDelete:
         res = gallery_delete_files(
             ['/outputs\\covers\\cover_a.webp'], base_dir=media_tree)
         assert res['deleted'] == ['outputs/covers/cover_a.webp']
+
+
+class TestRevealPathResolution:
+    """「定位本地文件」按钮的路径解析（/api/reveal_file 的落地边界）。
+    它会把结果交给系统文件管理器打开，所以越界路径必须在这一步就断掉。"""
+
+    def test_accepts_url_form_with_cache_bust(self, media_tree):
+        abs_p = resolve_gallery_media_path(
+            '/outputs/%E6%A0%91%E5%B1%8B%E9%A1%B9%E7%9B%AE/%E6%A0%91%E5%B1%8B_2x.mp4?v=1712',
+            base_dir=media_tree)
+        assert abs_p == os.path.join(media_tree, 'outputs', '树屋项目', '树屋_2x.mp4')
+
+    def test_accepts_plain_relative_path(self, media_tree):
+        abs_p = resolve_gallery_media_path('outputs/树屋项目/videos/vid_001.mp4', base_dir=media_tree)
+        assert abs_p == os.path.join(media_tree, 'outputs', '树屋项目', 'videos', 'vid_001.mp4')
+
+    @pytest.mark.parametrize('bad', [
+        '../secret.webp',                 # 相对越界
+        'outputs/../secret.webp',         # 归一化后越界
+        'outputs/树屋项目/manifest.json',  # 非媒体白名单
+        'outputs/树屋项目/frames',         # 目录
+        'outputs/covers/ghost.webp',      # 不存在
+        '',                               # 空
+        None,                             # 非字符串
+    ])
+    def test_rejects_unsafe_targets(self, media_tree, bad):
+        _touch(os.path.join(media_tree, 'secret.webp'), mtime=1)
+        with pytest.raises(ValueError):
+            resolve_gallery_media_path(bad, base_dir=media_tree)
 
 
 class TestGalleryReferences:

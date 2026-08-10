@@ -27,6 +27,7 @@ from server_common import (
     apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
     read_manifest, write_manifest, GenerationCancelled, log,
     gpt_image_pixel_size, drop_stale_review_verdicts, stamp_manifest_capabilities,
+    gate_setting,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
     _get_account_pool_service, _select_pool_account,
     _account_switch_interval, _account_rotation_ring,
@@ -1622,6 +1623,18 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel
     return paths, temp_out
 
 
+def text_only_anchor_allowed(config):
+    """本次渲染是否允许首帧在没有封面时退化为纯文生图。
+
+    默认关闭：手动入口的封面是先出的，首帧必须以它图生图，没有封面就是漏了一步。
+    分步任务（stepped_pipeline）例外——它从简报直接开跑，渲首帧那一刻整块提示词
+    只有 IMAGE 1，而封面提示词要拿首尾两拍拼 before/after 才写得出来，封面在这个
+    时点还不可能存在。首帧本来就是链头、允许没有图参考（跨层封面守卫已有同款退化
+    路径），所以由调用方显式打开这个旗标，其余帧缺参考仍是硬错误。
+    """
+    return bool((config or {}).get('allowTextOnlyAnchor'))
+
+
 def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=None, target_sequences=None):
     import builtins
     # 纯 SPARK 内部旗标：AdsPower 侧早已删掉这个进程级全局标志，外部脚本不再读它
@@ -1999,11 +2012,20 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
         if chunk[0] == 1:
             cover_src = resolve_cover_reference(config, title)
-            if not cover_src:
+            if not cover_src and not text_only_anchor_allowed(config):
                 raise RuntimeError('生成帧序列前必须先生成或选择封面图；第一帧只能以封面图进行图生图')
-            ref_path = _fx_cover_ref_jpg(cover_src, frames_dir)
-            cover_ref_src = cover_src
-            # The cover is the image reference only. Send the parsed IMAGE 1 prompt verbatim.
+            if cover_src:
+                ref_path = _fx_cover_ref_jpg(cover_src, frames_dir)
+                cover_ref_src = cover_src
+                # The cover is the image reference only. Send the parsed IMAGE 1 prompt verbatim.
+            else:
+                # 链头无封面（分步任务）：纯文生图，不带任何图参考。
+                ref_path = None
+                if on_progress:
+                    on_progress('cover_reference_skipped', {
+                        'sequence': 1,
+                        'message': 'IMG 001 无封面可用，链头改为纯文本生成',
+                    })
         elif not ref_path:
             previous_webp = _webp_path(chunk[0] - 1)
             if not _frame_exists(chunk[0] - 1):
@@ -2437,8 +2459,14 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     })
         if not skip_api_call:
             cover_anchor = bool(cover_ref)
-            if seq == 1 and not cover_ref and not cover_layer_block:
+            coverless_head = seq == 1 and not cover_ref and not cover_layer_block
+            if coverless_head and not text_only_anchor_allowed(config):
                 raise RuntimeError('生成帧序列前必须先生成或选择封面图；第一帧只能以封面图进行图生图')
+            if coverless_head and on_progress:
+                on_progress('cover_reference_skipped', {
+                    'sequence': seq,
+                    'message': 'IMG 001 无封面可用，链头改为纯文本生成',
+                })
             reference = cover_ref if cover_anchor else previous_path
             # A targeted/subset prompt block may contain only ``IMAGE N``.  In
             # that case the loop never visits IMAGE N-1, but the durable chain
@@ -2451,7 +2479,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     reference = durable_parent
             # 跨层守卫放行的首帧是唯一允许无图参考的帧（它本来就是链头）；
             # 其余帧缺参考仍然是硬错误——退回文生图会直接断掉血统。
-            text_only_head = bool(cover_layer_block) and seq == 1
+            text_only_head = seq == 1 and (bool(cover_layer_block) or coverless_head)
             if not text_only_head and (not reference or not os.path.exists(reference)):
                 raise RuntimeError(f'无法生成第 {seq} 帧：缺少上一帧参考图，帧序列禁止退回文生图')
             # 过门/硬切目标帧组稿时还没有任何像素可看，只能凭文字空想门后长什么样。
@@ -2541,8 +2569,24 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             # 参考惯性可能压过"进入新空间"的文本指令，渲出上一帧的近似复制帧——
             # 规划好的过门没执行，新空间在下一帧硬现身造成空间断裂。渲后与参考帧
             # 本地比对，近乎相同 = 惯性卡死，再以同一参考图做一次更强的 i2i 推进。
+            # anchorInertiaAutoRetry=false 时仍然检测、仍然留痕，只是不自动重渲：
+            # 检测本身是纯本地零成本的客观测量，关掉它等于让"桥接帧被惯性卡死"
+            # 静默发生；有成本、有误判风险的是后面那次加强重渲，开关管的是它。
             if is_bridge:
                 stuck, inertia_mad = detect_anchor_inertia(target_path, previous_path)
+                if stuck and not gate_setting('anchorInertiaAutoRetry', config):
+                    vlm_qa_reason = (f"anchor_inertia: 与参考帧近乎相同（MAD={inertia_mad:.2f}），"
+                                     f"自动重渲已按配置关闭（anchorInertiaAutoRetry=false），"
+                                     f"建议人工重渲该帧及其后续族段")
+                    if sys.stdout:
+                        print(f"[ANCHOR INERTIA] Frame {seq} {vlm_qa_reason}")
+                    if on_progress:
+                        on_progress('anchor_inertia', {
+                            'sequence': seq, 'mad': round(inertia_mad, 2),
+                            'message': (f"⚠️ IMG {seq:03d} 桥接帧疑似被 i2i 惯性卡死"
+                                        f"（MAD={inertia_mad:.2f}），自动重渲已关闭，已留痕"),
+                        })
+                    stuck = False
                 if stuck:
                     if sys.stdout:
                         print(f"[ANCHOR INERTIA] Frame {seq} 与参考帧近乎相同（MAD={inertia_mad:.2f} < "

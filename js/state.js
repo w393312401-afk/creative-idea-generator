@@ -29,9 +29,9 @@ const DEFAULT_CONFIG = {
     // 的人不该被顺手改掉提示词语法，反过来也一样。
     skillProfile: 'auto',
     // 视频时长（仅 Omni Flash 模型面板提供 4s/6s/8s/10s 时长 tab；Veo 系列时长固定，
-    // 该项对其无效）。默认 10s：omni 的时间线提示词按秒排镜头切点，10 秒是排满六镜
-    // （远景/全景/中景/近景/特写/结果远景）所需的长度，更短要按 composers/omni.py 的
-    // 镜头梯表裁镜头。此项**不再允许留空**——"沿用面板当前时长"是个不可知态，会让
+    // 该项对其无效）。默认 10s：omni 的时间线提示词按秒排镜头切点，10 秒既让主工作镜
+    // 有足够长度走完"第一次动作 + 重复循环"，又排得下第二个特写插入；4s/6s 按
+    // composers/omni.py 只排一个插入。此项**不再允许留空**——"沿用面板当前时长"是个不可知态，会让
     // 提示词里的切点表与实际生成时长对不上。
     videoDuration: '10',
     // 视频参考模式 = 发起视频前 Flow 面板停在哪个子模式上传参考图：
@@ -40,12 +40,13 @@ const DEFAULT_CONFIG = {
     videoRefMode: 'VIDEO_FRAMES',
     imageAspectRatio: '9:16',
     imageQuality: '2K',
-    // 本地生成期连续性门：只对高置信度几何漂移自动重试/阻断，语义问题仍由整套审查处理。
-    frameContinuityMode: 'balanced',
-    frameContinuityMaxRetries: 1,
+    // 质量门禁项（frameContinuityMode / qaGateLevel / videoProcessVlmReview / …）
+    // 刻意**不**在这里写默认值：唯一真源是 server_common.GATE_SETTINGS，经
+    // /api/mode 的 gate_settings 字段下发，配置中心「质量门禁」分区照它渲染
+    // （见 js/gate_settings.js）。在这里抄一份就是又开一个会漂移的真相源——
+    // 前端默认 balanced、服务端改成 strict，用户看到的和实际跑的就对不上了。
+    // 只有用户显式改过的门禁项才会出现在 config 里并随请求带走。
     frameContinuityLocalEdit: 'off',
-    // 高风险拍自动拆分先作为可控发布项；服务端启用后会在提示词交付前增加正式锚点拍。
-    autoSplitHighRiskBeats: false,
     strictPromptPipelineV2: true,
     composeBatchSize: 3,
     composeRequestTimeoutSeconds: 120,

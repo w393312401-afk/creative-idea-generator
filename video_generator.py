@@ -14,7 +14,8 @@ from server_common import (
     ACTIVE_TASKS_LOCK, ACTIVE_TASKS, get_or_create_task,
     notify_listeners, save_tasks_to_disk,
     apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
-    read_manifest, write_manifest, strict_gates_enabled, qa_gate_level,
+    read_manifest, write_manifest, strict_gates_enabled, qa_gate_level, gate_setting,
+    _is_cover_filename, _cover_candidate_path,
     resolve_video_duration,
     stamp_manifest_capabilities,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
@@ -142,15 +143,25 @@ def _extract_video_frame(video_path, out_png, position, sseof_offset=0.3):
         return False
 
 
-def verify_video_anchors(video_path, start_frame_path, end_frame_path, strict=False):
+def verify_video_anchors(video_path, start_frame_path, end_frame_path, strict=False,
+                         config=None):
     """校验视频首帧/尾帧是否与锚点图一致。
 
     返回 (ok: bool, reason: str)。校验环境异常（ffmpeg/PIL 不可用等）时默认返回
     (True, 'skipped:...')，不拦截正常流程——该校验只用来挡住明确的串片；
     strict=True（strictGates 开启）时环境异常按校验失败处理，防止环境退化
     悄悄关掉串片检测。
+
+    受 videoAnchorVerify 开关管辖（默认开）。config=None 时仍然查表——服务端
+    server_config.json 里关掉它，合并阶段那两个没有请求级 config 的调用点也要跟着
+    关，否则同一个开关在不同阶段各说各话。这道校验纯本地零成本，正常生成不该关；
+    开关只为离线复现/调试串片本身留的口子，因此关掉时返回的 reason 明说是
+    "被开关关掉"而不是 'skipped:'——后者在 manifest 里表示"环境异常被放行"，
+    两种放行的含义不能混。
     """
     import tempfile
+    if not gate_setting('videoAnchorVerify', config):
+        return True, 'disabled:videoAnchorVerify=false（锚点校验已按配置关闭，串片不会被拦截）'
     try:
         import numpy as np
         with tempfile.TemporaryDirectory() as td:
@@ -395,10 +406,11 @@ _VIDEO_PROCESS_GATE_DISABLED = False
 
 
 def _video_process_vlm_enabled(config):
-    value = (config or {}).get('videoProcessVlmReview', True)
-    if isinstance(value, str):
-        value = value.strip().lower() not in ('0', 'false', 'no', 'off')
-    return bool(value) and not _VIDEO_PROCESS_GATE_DISABLED
+    # 2026-08-10：取值改走 server_common.gate_setting——此前直接 config.get()，
+    # 而 videoProcessVlmReview 漏在 effective_config 的托管模式白名单外，
+    # 请求里带的值会被整个丢掉（只有 server_config.json 生效）。白名单现由
+    # GATE_SETTINGS 派生，这里跟着走同一张表，两边不会再各说各话。
+    return bool(gate_setting('videoProcessVlmReview', config)) and not _VIDEO_PROCESS_GATE_DISABLED
 
 
 def check_video_process(config, video_path, start_frame, end_frame, prompt, meta=''):
@@ -961,13 +973,16 @@ class _BatchBridge:
 
     def __init__(self, pending, total, video_model, writer, on_progress, strict=False,
                  process_check_fn=None, account_pool=None, pool_account_id=None,
-                 allow_anchor_mismatch=False):
+                 allow_anchor_mismatch=False, config=None):
         self.pending = pending          # [{'plan':..., 'req':..., 'temp_out_dir':...}]
         self.total = total
         self.video_model = video_model
         self.writer = writer
         self.on_progress = on_progress
         self.strict = strict            # strictGates：锚点校验环境异常按失败处理
+        # 本次任务的生效配置：目前只用于 videoAnchorVerify 开关。None = 按默认
+        # （校验开启），保持旧调用方/测试不受影响。
+        self.config = config
         # 段内过程门（空心视频拦截）：plan -> ('accept'|'warn'|'reject', reason)。
         # None = 不检（旧调用方/测试兼容）；生产路径由 generate_video_sequence 注入
         # check_video_process 的闭包。
@@ -1053,7 +1068,9 @@ class _BatchBridge:
                 self._fail(plan, '生成的视频文件不存在')
                 return None
             shutil.move(generated_path, plan['dest_path'])
-            ok, reason = verify_video_anchors(plan['dest_path'], plan['start_frame'], plan['end_frame'], strict=self.strict)
+            ok, reason = verify_video_anchors(plan['dest_path'], plan['start_frame'],
+                                              plan['end_frame'], strict=self.strict,
+                                              config=self.config)
             if not ok:
                 if not self.allow_anchor_mismatch:
                     self.stats['anchor_rejections'] += 1
@@ -1289,7 +1306,8 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                                       process_check_fn=_process_gate,
                                       account_pool=account_pool,
                                       pool_account_id=actual_account_id,
-                                      allow_anchor_mismatch=override_flagged)
+                                      allow_anchor_mismatch=override_flagged,
+                                      config=config)
             run_bridges.append(leg_bridge)
             from integrations.google_fx.utils import account_binding
             flow_project_url = writer.data.get('google_fx_project_url')
@@ -1502,6 +1520,166 @@ def _merge_filter(speed, has_audio):
     if has_audio:
         return f'{video_filter};[0:a]atempo={speed:g}[a]'
     return video_filter
+
+
+# ── 成片首帧烧录封面 ─────────────────────────────────────────────────────────
+# 平台（TikTok/抖音/YouTube）取缩略图时默认吃成片的第一帧，而正片第一帧是施工前的
+# 空场——点击率全靠封面图，于是合并时把选中的封面编码成一小段静帧接在最前面。
+# 默认只占**一帧**：肉眼看不见，缩略图拿到的却已经是封面；也可以显式停留 0.5/1 秒
+# 当片头。整条链路 fail-open——封面是锦上添花，绝不能因为它让用户拿不到成片。
+COVER_BURN_DEFAULT = 'frame'
+# 片头停留上限：再长就不是"首帧"而是另一段素材了，也兜住外部传进来的畸形值。
+COVER_BURN_MAX_SECONDS = 5.0
+
+
+def normalize_cover_burn(value):
+    """归一化首帧烧录档位 → 封面在成片里停留的秒数；关闭返回 None。
+
+    'frame'/True/0 → 0.0（正好一帧），数字/'0.5s' → 秒数，
+    None/False/'off'/'none' → None（不烧录）。
+    """
+    if value is None or value is False:
+        return None
+    if value is True:
+        return 0.0
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in ('', 'off', 'none', 'no', 'false', '0s'):
+            return None
+        if token in ('frame', 'single', 'one', 'first', 'true'):
+            return 0.0
+        try:
+            value = float(token.rstrip('s'))
+        except ValueError:
+            return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return min(COVER_BURN_MAX_SECONDS, seconds)
+
+
+def resolve_merge_cover(project_dir, manifest_data=None, requested=None):
+    """挑出要烧进成片首帧的那张封面。
+
+    优先级：本次合并显式指定 → manifest 里按用途登记的选择（cover_roles.video →
+    cover_roles.project → active_cover）→ 项目目录里最新的一张 cover_*。
+    前端在封面页选的是"用途 → 封面"的映射，落在 manifest 里，因此自动合并
+    （无请求体）与手动合并挑到的是同一张。
+    """
+    roles = (manifest_data or {}).get('cover_roles') or {}
+    if not isinstance(roles, dict):
+        roles = {}
+    for raw in (requested, roles.get('video'), roles.get('project'),
+                (manifest_data or {}).get('active_cover')):
+        hit = _cover_candidate_path(raw)
+        if hit:
+            return hit
+
+    try:
+        names = [n for n in os.listdir(project_dir) if _is_cover_filename(n)]
+    except OSError:
+        return None
+    paths = [os.path.join(project_dir, n) for n in names]
+    paths = [p for p in paths if os.path.isfile(p) and os.path.getsize(p) > 0]
+    return max(paths, key=os.path.getmtime) if paths else None
+
+
+def _ffprobe_audio_params(path):
+    """探测音轨采样率/声道数；无音轨或探测失败返回 None。"""
+    try:
+        cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0",
+               "-show_entries", "stream=sample_rate,channels", "-of", "json", path]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding='utf-8', errors='replace', check=True)
+        streams = json.loads(res.stdout).get('streams') or []
+        if not streams:
+            return None
+        return {'sample_rate': int(streams[0].get('sample_rate') or 44100),
+                'channels': int(streams[0].get('channels') or 2)}
+    except Exception:
+        return None
+
+
+def build_cover_intro_clip(cover_path, ref_video, out_path, seconds=0.0, speed=1.0, has_audio=False):
+    """把封面编码成与首个片段同规格的静帧片段，供合并时接在最前面。
+
+    时长先按 speed **放大**再编码：两条合并路径（concat demuxer 的全局 setpts、
+    多输入 filter 里 clip_speed=1.0 的那一路）之后都会再除以 speed，落到成片里
+    就是 seconds（seconds=0 → 一帧）。少了这一步，2 倍速下"一帧"会缩成半帧被编码器
+    丢掉：成片看起来完全正常，只有缩略图默默回到空场。
+    合并末尾的 CFR 归一有取整，实测单帧档在 2 倍速下会落在 1~2 帧（≈0.03~0.07 秒）——
+    宁可多留一帧也不能少：少一帧就是整条链路白做。失败返回 None，调用方按无封面继续。
+    """
+    params = _ffprobe_video_params(ref_video) or {}
+    width, height = int(params.get('width') or 0), int(params.get('height') or 0)
+    fps = float(params.get('fps') or 0) or 24.0
+    if width <= 0 or height <= 0:
+        print(f"[WARN] 首帧封面烧录跳过：探测不到首个片段的画幅（{ref_video}）")
+        return None
+
+    final_frames = max(1, int(round(float(seconds or 0) * fps)))
+    encoded_frames = max(1, int(round(final_frames * float(speed or 1))))
+    duration = encoded_frames / fps
+
+    # 封面与成片的比例未必一致（封面按 9:16 出图、片段可能是别的画幅）：等比缩放后
+    # 补黑边，不裁切也不拉伸；setsar=1 保证 concat 各输入的 SAR 一致（不一致会直接报错）。
+    vf = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+          f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+          f"setsar=1,fps={fps:g},format=yuv420p")
+
+    cmd = ["ffmpeg", "-y", "-v", "error", "-loop", "1", "-framerate", f"{fps:g}", "-i", cover_path]
+    audio = _ffprobe_audio_params(ref_video) if has_audio else None
+    rate = (audio or {}).get('sample_rate') or 44100
+    channels = (audio or {}).get('channels') or 2
+    if has_audio:
+        # 有音轨的成片必须整条流布局一致，否则 concat 直接失败——这段静帧配等长静音。
+        layout = 'mono' if channels == 1 else 'stereo'
+        cmd += ["-f", "lavfi", "-i", f"anullsrc=channel_layout={layout}:sample_rate={rate}"]
+    cmd += ["-vf", vf, "-t", f"{duration:.6f}", "-frames:v", str(encoded_frames),
+            "-r", f"{fps:g}", "-c:v", "libx264", "-pix_fmt", "yuv420p"]
+    if has_audio:
+        cmd += ["-c:a", "aac", "-ar", str(rate), "-ac", str(channels), "-shortest"]
+    cmd += [out_path]
+
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding='utf-8', errors='replace', timeout=120)
+    except Exception as e:
+        print(f"[WARN] 首帧封面烧录跳过（{type(e).__name__}: {e}）")
+        return None
+    if res.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        print(f"[WARN] 首帧封面烧录跳过（ffmpeg 失败）：{(res.stderr or '').strip()[:200]}")
+        return None
+    return out_path
+
+
+def prepend_cover_intro(project_dir, manifest_data, video_files, tmp_dir, speed, has_audio,
+                        cover_burn=COVER_BURN_DEFAULT, cover_path=None):
+    """在待合并片段前插入封面静帧段。返回 (video_files, cover_info)。
+
+    cover_info 为 None 表示这次没烧（关闭/没有封面/编码失败），此时 video_files 原样返回。
+    """
+    seconds = normalize_cover_burn(cover_burn)
+    if seconds is None or not video_files:
+        return video_files, None
+    cover = resolve_merge_cover(project_dir, manifest_data, cover_path)
+    if not cover:
+        return video_files, None
+
+    intro = os.path.join(tmp_dir, 'cover_intro.mp4')
+    built = build_cover_intro_clip(cover, video_files[0], intro,
+                                   seconds=seconds, speed=speed, has_audio=has_audio)
+    if not built:
+        return video_files, None
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    rel = os.path.relpath(cover, base_dir).replace('\\', '/')
+    info = {'file': rel, 'url': '/' + rel, 'seconds': round(seconds, 3)}
+    print(f"[INFO] 首帧烧录封面: {rel}（成片内停留 {'1 帧' if not seconds else f'{seconds:g} 秒'}）")
+    return [built] + list(video_files), info
 
 
 # ── 节奏时间分配（docs/pacing_rhythm_balance_plan.md 第 3 层） ─────────────────
@@ -1808,7 +1986,8 @@ def _paced_merge_filter(clip_speeds, speed, has_audio):
     return ';'.join(video_parts + [concat])
 
 
-def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
+def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
+                         cover_burn=COVER_BURN_DEFAULT, cover_path=None):
     """合并项目内全部视频片段。
 
     2026-07-04 复盘：之前失败/缺失的槽位会被静默跳过（loft 任务缺 6、7 两段仍合出了
@@ -1816,6 +1995,8 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
     1) 槽位完整性 —— 依据 manifest.frames 推出应有片段数，缺失/失败即拒绝合并；
     2) 锚点一致性 —— 每段首尾帧须与对应锚点图匹配，不匹配即拒绝合并。
     allow_partial=True 时跳过两道门禁（用户显式确认后强制合并）。
+
+    cover_burn/cover_path：把封面烧进成片首帧（默认一帧，见 prepend_cover_intro）。
     """
     speed = _normalize_merge_speed(speed)
     manifest_path = os.path.join(project_dir, 'manifest.json')
@@ -1929,6 +2110,7 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
     if allow_partial and (missing or mismatched):
         return _merge_skip_missing(
             project_dir, manifest_data, expected_slots, good, missing, mismatched, speed=speed,
+            cover_burn=cover_burn, cover_path=cover_path,
         )
 
     # 无缺口/无串片：走原有干净合并路径
@@ -1950,13 +2132,6 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
     except Exception as retime_err:
         print(f"[WARN] 段内节奏重映射整体跳过（{retime_err}），按原片合并")
 
-    # Write concat list to project directory
-    concat_list_path = os.path.join(project_dir, 'concat_list.txt')
-    with open(concat_list_path, 'w', encoding='utf-8') as f:
-        for vf in video_files:
-            safe_path = vf.replace('\\', '/')
-            f.write(f"file '{safe_path}'\n")
-            
     # Determine the Chinese theme name to use for the output filename
     title = manifest_data.get('title', '')
     chinese_name = ""
@@ -2019,7 +2194,24 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
                 has_audio = True
         except Exception as probe_err:
             print(f"[DEBUG] ffprobe check failed: {probe_err}")
-            
+
+    # 首帧封面：探完音轨布局（要按正片的布局配静音轨）之后、写 concat 清单之前插进队首。
+    # 用 retime 的临时目录存放，跟着 retime_tmp 一起清理。
+    cover_info = None
+    try:
+        video_files, cover_info = prepend_cover_intro(
+            project_dir, manifest_data, video_files, retime_tmp.name,
+            speed=speed, has_audio=has_audio, cover_burn=cover_burn, cover_path=cover_path)
+    except Exception as cover_err:
+        print(f"[WARN] 首帧封面烧录跳过（{cover_err}）")
+
+    # Write concat list to project directory
+    concat_list_path = os.path.join(project_dir, 'concat_list.txt')
+    with open(concat_list_path, 'w', encoding='utf-8') as f:
+        for vf in video_files:
+            safe_path = vf.replace('\\', '/')
+            f.write(f"file '{safe_path}'\n")
+
     import subprocess
 
     def _build_concat_demuxer_cmd():
@@ -2044,7 +2236,9 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
         # 旧 manifest 没有 clip_speed 字段，但 meta 里可能已经有 PACE 标签
         return _clip_speed_from_meta(entry.get('meta'))
 
-    clip_speeds = [_slot_clip_speed(s) for s in sorted(good)]
+    # 封面静帧段固定 1.0：它在 build_cover_intro_clip 里已经按 speed 预放大过，
+    # 这里让它跟其它"没有 PACE 标签"的片段走同一条缩放（除以 speed），落地正好是目标时长。
+    clip_speeds = ([1.0] if cover_info else []) + [_slot_clip_speed(s) for s in sorted(good)]
     paced = any(abs(k - 1.0) >= 0.01 for k in clip_speeds)
 
     if paced:
@@ -2103,7 +2297,7 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
         except Exception as dur_err:
             print(f"[DEBUG] ffprobe duration check failed: {dur_err}")
             
-        return {
+        merged = {
             'file': rel_path,
             'url': '/' + rel_path,
             'size_bytes': file_size,
@@ -2111,12 +2305,16 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0):
             'speed': speed,
             'status': 'success'
         }
+        if cover_info:
+            merged['cover_first_frame'] = cover_info
+        return merged
     else:
         print(f"[ERROR] ffmpeg merge failed with code {res.returncode}: {res.stderr}")
         raise RuntimeError(f"FFmpeg merge failed: {res.stderr}")
 
 
-def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missing, mismatched, speed=2.0):
+def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missing, mismatched,
+                        speed=2.0, cover_burn=COVER_BURN_DEFAULT, cover_path=None):
     """强制合并（allow_partial）：2026-07-22 改版——不再用起始锚点帧定格+「缺失」标注
     填充缺口（占位预览这套 filter_complex/drawtext 太重，且冻结帧撑时长的观感也不好），
     直接跳过缺失/串片的槽位，把仍然可用的片段按原顺序和所选速率拼接，跳过处是硬切。
@@ -2141,11 +2339,6 @@ def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missin
         print(f"[INFO] 段内节奏重映射: {'; '.join(retime_notes)}")
     except Exception as retime_err:
         print(f"[WARN] 段内节奏重映射整体跳过（{retime_err}），按原片合并")
-
-    concat_list_path = os.path.join(project_dir, 'concat_list.txt')
-    with open(concat_list_path, 'w', encoding='utf-8') as f:
-        for vf in video_files:
-            f.write(f"file '{vf.replace(chr(92), '/')}'\n")
 
     title = manifest_data.get('title', '')
     chinese_name = _project_display_name(title)
@@ -2172,6 +2365,20 @@ def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missin
         has_audio = "audio" in res.stdout.lower()
     except Exception as probe_err:
         print(f"[DEBUG] ffprobe check failed: {probe_err}")
+
+    # 首帧封面：缺口合并同样烧（成片再降级，缩略图也得是封面）
+    cover_info = None
+    try:
+        video_files, cover_info = prepend_cover_intro(
+            project_dir, manifest_data, video_files, retime_tmp.name,
+            speed=speed, has_audio=has_audio, cover_burn=cover_burn, cover_path=cover_path)
+    except Exception as cover_err:
+        print(f"[WARN] 首帧封面烧录跳过（{cover_err}）")
+
+    concat_list_path = os.path.join(project_dir, 'concat_list.txt')
+    with open(concat_list_path, 'w', encoding='utf-8') as f:
+        for vf in video_files:
+            f.write(f"file '{vf.replace(chr(92), '/')}'\n")
 
     cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path]
     if has_audio:
@@ -2208,7 +2415,7 @@ def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missin
     except Exception:
         pass
 
-    return {
+    merged = {
         'file': rel_path,
         'url': '/' + rel_path,
         'size_bytes': os.path.getsize(output_path),
@@ -2218,3 +2425,6 @@ def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missin
         'partial': True,
         'skipped_slots': skipped_slots,
     }
+    if cover_info:
+        merged['cover_first_frame'] = cover_info
+    return merged

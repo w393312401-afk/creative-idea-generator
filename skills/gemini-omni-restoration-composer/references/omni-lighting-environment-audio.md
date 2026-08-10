@@ -86,11 +86,10 @@ Phrasing Repetition Gate. Keep the direction; escalate the observation:
 Direction locked, detail escalating. The reverse — changing direction, holding detail — is a
 continuity failure.
 
-### Placement inside the six-shot cycle
+### Placement inside the shot structure
 
-Environmental motion belongs in shot 1 and shot 6 (the wide framings that can see it) and
-optionally shot 2. Close-ups and extreme close-ups should not describe sky or weather —
-they cannot see it.
+Environmental motion belongs in the wide working shot and the returning wide shot — the two
+framings that can see it. The inserts should not describe sky or weather; they cannot see it.
 
 ---
 

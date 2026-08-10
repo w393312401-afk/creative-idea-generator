@@ -6,13 +6,11 @@ Use this six-dimensional skeleton for every Gemini Omni restoration VIDEO prompt
 
 Use professional shot-scale terms, but make the capture style feel like casual UGC phone footage by default. The default is edited multi-shot coverage with clean cuts or match cuts, recorded as if different usable moments were captured on a phone or small consumer camera.
 
-Required shot-scale vocabulary:
-- establishing long shot
-- full shot
-- medium shot
-- close-up
-- extreme close-up
-- wide outro shot
+Required shot vocabulary — these four names, and no other shot-scale names:
+- wide working shot (the main shot; opens the clip)
+- close-up insert
+- extreme close-up insert (8s and 10s clips only)
+- returning wide shot (same camera setup as the wide working shot; closes the clip)
 
 Default phone-capture terms:
 - shot on a recent smartphone rear camera
@@ -35,11 +33,11 @@ Optional cinematic terms, only when useful or requested:
 - low-angle insert
 - rack focus / lens breathing
 
-Do not use one-take, oner, one-shot, or single continuous take unless the user explicitly requests that override. This ban has no exemption — the final reward beat is also a
-six-shot sequence, with its reveal push carried out as motion **inside** the shots rather
-than as a single unbroken take.
+Do not use one-take, oner, one-shot, or single continuous take unless the user explicitly requests that override. This ban has no exemption — the final reward beat is cut too, with
+its reveal push carried out as motion **inside** the shots rather than as a single unbroken
+take.
 
-### Location DNA vs. Shot Ladder
+### Location DNA vs. Shot Coverage
 
 Two layers, with opposite rules. Getting them backwards is what makes a pack drift.
 
@@ -52,15 +50,15 @@ identity of the world and never varies:
 - the capture-device character (phone model class, lens feel, colour rendering)
 - the three primary landmarks and their locked relationships
 
-**Shot Ladder — varies by shot, by design.** This is coverage of that world:
-- shot scale (long / full / medium / close / extreme close / wide)
+**Shot coverage — varies by shot, by design.** This is coverage of that world:
+- which of the two distances is in play (the wide working setup, or an insert)
 - subject distance and what fills the frame
-- which landmarks are in view (see `omni-beat-skeleton.md` for the per-scale rule)
+- which landmarks are in view (see `omni-beat-skeleton.md` for the per-shot rule)
 - shot-local capture artifacts
 
-IMAGE anchors are always rendered at **full-shot scale** — the same scale shot 6 lands on.
-This is what lets a video's wide outro match the next anchor exactly instead of
-approximately.
+There are only two distances in a clip, and the wide one is used twice from an identical
+camera setup. IMAGE anchors are rendered at that same **wide working scale**, which is what
+lets the returning wide shot match the next anchor exactly instead of approximately.
 
 ### Anchor Stability Under Handheld Capture
 
@@ -216,7 +214,7 @@ Do not add incidental readable signs or labels.
 
 A clean single operation must not produce an empty frame. Build visual density through depth, not through clutter in the work zone. This layer pairs with the Persistent Environmental Dressing Layer rules in `omni-restoration-continuity.md`: the depth and fill elements added here must be frozen, inert, and outside the work zone.
 
-Three-layer depth rule. Every establishing, full, and wide outro shot should read in three depth planes:
+Three-layer depth rule. The wide working shot and the returning wide shot should read in three depth planes:
 - foreground: a partial occluder at the frame edge (a door frame, hanging vine, stacked-material edge, an out-of-focus tool on a surface)
 - midground: the carrier and the operation
 - background: environmental depth (a receding wall, tree line, far corner, opening to another space)
@@ -225,14 +223,12 @@ Large-surface breakup. Walls, floors, ceilings, and sky are low-density flats. B
 
 Vertical and edge fill. Do not leave the upper frame and edges empty. Use beams, hanging cables, lamps, ropes, overhead stockpiles, roof light gaps, and partial edge objects to fill vertical volume.
 
-Atmospheric depth. Volumetric light shafts, floating dust, thin haze, and backlit silhouettes are cheap depth and density. Add at least one atmospheric or volumetric-light element to each wide/establishing shot. Keep the light phase locked (see section 3); multiple coexisting light sources are allowed and add density.
+Atmospheric depth. Volumetric light shafts, floating dust, thin haze, and backlit silhouettes are cheap depth and density. Add at least one atmospheric or volumetric-light element to the wide working shot. Keep the light phase locked (see section 3); multiple coexisting light sources are allowed and add density.
 
-Per-shot density targets. Each shot scale fills the frame differently:
-- establishing long shot: world depth, environmental dressing, atmosphere
-- full shot: the worker / tool / staged-material relationship in space
-- medium shot: debris and material accumulating around the work zone
-- close-up: tool contact filling the frame, minimal empty background
-- extreme close-up: surface texture fills the entire frame, no large soft empty area
-- wide outro shot: the same world depth and dressing as the establishing shot, now carrying the operation's permanent traces
+Per-shot density targets. Each shot fills the frame differently:
+- wide working shot: world depth, environmental dressing, and atmosphere at the opening instant, then the worker / tool / staged-material relationship in space with debris and material accumulating around the work zone
+- close-up insert: tool contact filling the frame, minimal empty background
+- extreme close-up insert: surface texture fills the entire frame, no large soft empty area
+- returning wide shot: the same world depth and dressing as the opening of the wide working shot — it is the same camera setup — now carrying the operation's permanent traces
 
 Density hierarchy. Add density toward edges, foreground, and background depth; keep the operation point and its traces high-clarity and low-interference. Never let density bury the causal evidence.

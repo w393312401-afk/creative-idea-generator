@@ -1,4 +1,4 @@
-"""base profile（restoration-prompt-composer）的 Phase 2 composer。
+"""base profile（gemini-veo-restoration-composer）的 Phase 2 composer。
 
 这里是 prompt_pipeline.compose_remaining_beats 的原实现，逐字平移过来的——行为必须
 与拆分前完全一致，任何"顺手优化"都属于越界。
@@ -62,7 +62,7 @@ Previous IMAGE {i}:
 {compiled_images[i]}
 """
 
-        return f"""You are a professional prompt composer operating under the `restoration-prompt-composer` skill.
+        return f"""You are a professional prompt composer operating under the `gemini-veo-restoration-composer` skill.
 Your job is to generate exactly two prompts for Beat {i}:
 1. VIDEO {i}: The construction timelapse video.
 2. IMAGE {i+1}: The clean environment state snapshot after the video.

@@ -48,16 +48,42 @@ THRESHOLDS = {
 _GRID_RE = re.compile(r"(?<![A-Za-z0-9])([ABCabc][123])(?![A-Za-z0-9])")
 
 
+def _gate(key: str, config: dict[str, Any] | None):
+    """走 server_common.GATE_SETTINGS 这张唯一真源表取值（含 server_config.json /
+    环境变量兜底）。本模块刻意保持 backend-neutral、可独立单测，所以是延迟导入
+    并在 server_common 不可用时退回本地默认——两边的默认值必须一致，见
+    GATE_SETTINGS 里 frameContinuityMode / frameContinuityMaxRetries 两项。"""
+    try:
+        from server_common import gate_setting
+    except Exception:
+        return None
+    return gate_setting(key, config)
+
+
 def continuity_mode(config: dict[str, Any] | None) -> str:
+    resolved = _gate("frameContinuityMode", config)
+    if resolved is not None:
+        return resolved
     raw = (config or {}).get("frameContinuityMode", "balanced")
     mode = str(raw or "balanced").strip().lower()
     return mode if mode in MODES else "balanced"
 
 
 def continuity_max_retries(config: dict[str, Any] | None) -> int:
+    # 档位默认：strict 比 balanced 多重试一次。这条"按档位取默认"的规则是本模块
+    # 独有的（GATE_SETTINGS 里 frameContinuityMaxRetries 的 default=1 只在没有档位
+    # 上下文时用），所以显式配了才走总表，没配就按档位推。
     mode = continuity_mode(config)
     default = 2 if mode == "strict" else 1
-    raw = (config or {}).get("frameContinuityMaxRetries", default)
+    raw = (config or {}).get("frameContinuityMaxRetries")
+    if raw is None:
+        try:
+            from server_common import SERVER_CONFIG
+            raw = SERVER_CONFIG.get("frameContinuityMaxRetries")
+        except Exception:
+            raw = None
+    if raw is None:
+        return default
     try:
         return max(0, min(3, int(raw)))
     except (TypeError, ValueError):

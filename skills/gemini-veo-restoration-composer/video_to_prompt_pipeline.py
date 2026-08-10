@@ -212,7 +212,11 @@ You must follow these spatial and continuity rules:
 4. CHANGE EVENTS: Every detected visual delta must become a change_event with event_id, frame_range, time_range, grid_cells, change_type, before_state, after_state, and evidence_frames. Do not drop brief changes.
 5. OBJECT LEDGER (OSPL): Track static objects and coordinate locations. If an object gets hidden behind a worker in intermediate frames, do NOT delete it; it must retain a "Ghost Clause" marking it as hidden.
 6. VOLUMETRIC MASS (VMFP): Identify loose materials (rubble, concrete debris, sand, etc.). Measure volume flow from 100% capacity to 0% cleared. Look for rigid containers (crates, wheelbarrows, buckets) and specify Rigid Container Encapsulation (RCE).
+<<<<<<< Updated upstream
 7. TRANSIENT AGENTS (HAL): Find workers or machines and silently trace their silhouette properties for Hero Agent Lock (HAL) silhouettes (helmet, vest, pants colors). Do not model or request worker entry/exit timing or paths. Downstream construction prompts always begin at zero seconds with the observed worker already at the active work face and the first effective action underway. Identify any hand-held manual tools used by the worker (e.g., broom, paint roller, paint brush, shovel, hammer) and specify the precise action loop. Additionally, define at least two concrete, measurable progress markers showing gradual numerical advancement (e.g., swept clean area expanding from 10% to 90%, wood panels completing from 0 to 5 rows), grounded only in what the reviewed frames actually show. If no worker or tool is visible in the reviewed frames for a beat, set that beat's "transient_agents" to an empty list and its "tool_evidence" field to "unobserved" — do NOT invent or speculate a worker, tool, or action loop that isn't visible. Progress markers for an unobserved-tool beat must describe only the material/surface state change itself (e.g. "the exposed area grows steadily along the work edge"), never attribute it to a fabricated tool or actor. Downstream composition renders beats with no transient_agents as a sterile clip (Clean Frame Boundary already requires this for every IMAGE anchor regardless).
+=======
+7. TRANSIENT AGENTS (HAL): Find workers or machines. Log their entry frame time (t_in) and exit frame time (t_out) relative to Grid margins. Silently trace their silhouette properties for Hero Agent Lock (HAL) silhouettes (helmet, vest, pants colors). Crucially, identify any hand-held manual tools used by the worker (e.g., broom, paint roller, paint brush, shovel, hammer) and specify the precise action loop. Additionally, define at least two concrete, measurable progress markers showing gradual numerical advancement (e.g., swept clean area expanding from 10% to 90%, wood panels completing from 0 to 5 rows), grounded only in what the reviewed frames actually show. If no worker or tool is visible in the reviewed frames for a beat, set that beat's "transient_agents" to an empty list and its "tool_evidence" field to "unobserved" — do NOT invent or speculate a worker, tool, or action loop that isn't visible. Progress markers for an unobserved-tool beat must describe only the material/surface state change itself (e.g. "the exposed area grows steadily along the work edge"), never attribute it to a fabricated tool or actor. Downstream composition renders beats with no transient_agents as a sterile clip (Clean Frame Boundary already requires this for every IMAGE anchor regardless).
+>>>>>>> Stashed changes
 8. BEAT COVERAGE: Each time_sequence beat must cite source_event_ids and source_frame_range. The union of beats must cover all change_events.
 9. TEMPORAL PHYSICS SKELETON: Each beat must include shot_family, beat_type, single_physical_operation, and causal_path. The causal_path must specify material_source, entry_path, tool_contact, movement_path, at least two persistent_traces, and next_frame_inheritance. A beat may contain exactly one physical operation only.
 10. THRESHOLD BRIDGE: Any exterior-to-interior transition must be its own threshold_bridge beat. The preceding exterior anchor must show at least two interior landmarks through the doorway, and the bridge beat must describe coaxial forward motion with no construction work.
@@ -1460,12 +1464,16 @@ def compose_scup_prompts(metadata, clean_mode=False):
             if is_last:
                 img_prompt = (
                     f"Generate an image of a {camera_dna_base}; {spcp_pitch_clause(family)}. "
+<<<<<<< Updated upstream
                     # 每帧原样重贴主地标（名字 + 方位 + 画高比）。此前这里写的是
                     # "Scene inherits all landmarks... from IMAGE 1"，那是一句引用而不是重述：
                     # P0 的 primary-landmark-restatement 逐个比对地标名是否字面出现、
                     # anchor-scale-lock 逐个比对画高比，两道门都过不了。landmarks_str 上面
                     # 已经拼好，IMAGE 1 用的就是它。
                     f"Primary landmarks remain fixed, restated in full: {landmarks_str}. "
+=======
+                    f"Scene inherits all landmarks, geometry, and boundary anchors from IMAGE 1. "
+>>>>>>> Stashed changes
                     f"{rpl_str} remains the relative spatial relationship for drift-sensitive details. "
                     f"The scene is the final completed state, completely empty of workers, with {naturalize_visual_text(seq['image_n_plus_1_state'])}. "
                     f"The final anchor keeps visible physical proof of the last action: {trace_phrase}, and {inheritance}. "
@@ -1476,12 +1484,16 @@ def compose_scup_prompts(metadata, clean_mode=False):
             else:
                 img_prompt = (
                     f"Generate an image of a {camera_dna_base}; {spcp_pitch_clause(family)}. "
+<<<<<<< Updated upstream
                     # 每帧原样重贴主地标（名字 + 方位 + 画高比）。此前这里写的是
                     # "Scene inherits all landmarks... from IMAGE 1"，那是一句引用而不是重述：
                     # P0 的 primary-landmark-restatement 逐个比对地标名是否字面出现、
                     # anchor-scale-lock 逐个比对画高比，两道门都过不了。landmarks_str 上面
                     # 已经拼好，IMAGE 1 用的就是它。
                     f"Primary landmarks remain fixed, restated in full: {landmarks_str}. "
+=======
+                    f"Scene inherits all landmarks, geometry, and boundary anchors from IMAGE 1. "
+>>>>>>> Stashed changes
                     f"{rpl_str} remains the relative spatial relationship for drift-sensitive details. "
                     f"The scene is the progressive phase {idx+1} state, completely empty of workers, with {naturalize_visual_text(seq['image_n_plus_1_state'])} while {landmarks[1]['name']} remains visible and unchanged. "
                     f"The changed surface keeps visible physical proof from the preceding action: {trace_phrase}, and {inheritance}. "
@@ -1597,7 +1609,13 @@ def compose_scup_prompts(metadata, clean_mode=False):
                 action_loop = naturalize_visual_text(agent.get("action_loop", "performs physical construction labor"))
                 mtal_clause = f"The worker keeps the same {naturalize_visual_text(manual_tool)} in hand and repeats the same action loop: {action_loop}. "
                 
+<<<<<<< Updated upstream
                 passage_clause = f"At zero seconds, {agent.get('count', 1)} worker is already positioned at the active work face and makes the first effective tool contact immediately; the worker performs the action continuously through the final frame without entrance or exit choreography. "
+=======
+                enter_side = grid_to_natural_language(traj.get('enter_grid') or 'Grid C1')
+                exit_side = grid_to_natural_language(traj.get('exit_grid') or 'Grid C1')
+                passage_clause = f"At the first frame, {agent.get('count', 1)} worker enters from {enter_side}; the worker performs the action continuously, then walks out through {exit_side} before the final frame, leaving the last frame empty of active agents. "
+>>>>>>> Stashed changes
                 hal_clause = f"The worker remains a simple solid silhouette of {naturalize_visual_text(agent.get('hal_profile', 'solid yellow safety vest, white hardhat, blue pants'))}, with no readable face, logo, or fabric pattern. "
                 tspa_clause = f"Two visible progress cues must unfold naturally: first, {progress_a}; second, {progress_b}. "
             else:
@@ -2526,7 +2544,11 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
             "status": "FAIL",
             "tier": "P0",
             "details": gate_wordcount_fail,
+<<<<<<< Updated upstream
             "solution": "Trim redundant adjectives, filler phrases, and restated boilerplate first — never by deleting required structural elements (Camera DNA, direct-at-zero worker action, pacing control phrase, audio clause, Ghost Clause, Mirror Consistency Clause)."
+=======
+            "solution": "Trim redundant adjectives, filler phrases, and restated boilerplate first — never by deleting required structural elements (Camera DNA, Out-and-In Passage, pacing control phrase, audio clause, Ghost Clause, Mirror Consistency Clause)."
+>>>>>>> Stashed changes
         })
     else:
         audit_results["gates"].append({

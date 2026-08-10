@@ -19,9 +19,9 @@
         align-items: flex-start;
     }
 
-    /* 英文标题行多留一格给折叠箭头（复制按钮 + 折叠箭头） */
+    /* 英文标题行三格：复制 + ✨ 生成主题和 tags + 折叠箭头 */
     .tiktok-title-line {
-        grid-template-columns: minmax(0, 1fr) 34px 34px;
+        grid-template-columns: minmax(0, 1fr) 34px 34px 34px;
     }
 
     .tiktok-title-line-cn {

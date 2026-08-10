@@ -72,6 +72,31 @@ class TestFirstFrameUsesImageOnePrompt(unittest.TestCase):
         text_image.assert_not_called()
         image_edit.assert_not_called()
 
+    def test_stepped_anchor_may_render_text_only_without_cover(self):
+        """分步任务渲首帧时封面还写不出来（见 text_only_anchor_allowed）：
+        链头显式退化为纯文生图，但第 2 帧起仍必须挂上一帧图参考。"""
+        os.remove(self.cover)
+
+        def fake_text(config, prompt, target_path, *args, **kwargs):
+            self.text_calls.append(prompt)
+            self._write(target_path)
+
+        def fake_edit(config, prompt, reference_path, target_path, **kwargs):
+            self.edit_calls.append((prompt, reference_path))
+            self._write(target_path)
+
+        prompt_block = "图片 1:\nuntouched first frame\n\n图片 2:\nfirst construction stage\n"
+        with patch('frame_generator._generate_text_image', side_effect=fake_text), \
+             patch('frame_generator._generate_image_edit', side_effect=fake_edit):
+            manifest = generate_frame_sequence(
+                {'allowTextOnlyAnchor': True}, 'stepped_project', prompt_block)
+
+        self.assertEqual(self.text_calls, ['untouched first frame'])
+        self.assertEqual(len(self.edit_calls), 1)
+        self.assertTrue(self.edit_calls[0][1].endswith('img_001.webp'))
+        first = next(frame for frame in manifest['frames'] if frame['sequence'] == 1)
+        self.assertIsNone(first['reference'])
+
     def test_first_frame_edit_failure_never_falls_back_to_t2i(self):
         prompt_block = "图片 1:\nuntouched first frame\n"
 

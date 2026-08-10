@@ -228,6 +228,40 @@
     border-top: 1px dashed rgba(var(--ink-rgb), 0.12);
 }
 
+/* ── 质量门禁分区 ──────────────────────────────────────────────────
+   控件由 js/gate_settings.js 动态渲染（见那里的注释：默认值/选项的唯一真源
+   在服务端 GATE_SETTINGS）。这里只给分组标题和两条附注的样式，控件本身沿用
+   .settings-field 的既有栅格，不另起一套。 */
+.gate-settings-group-title {
+    margin: 18px 0 2px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+}
+
+.gate-settings-group-title:first-child {
+    margin-top: 4px;
+}
+
+.gate-settings-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+/* 服务端已钉死该项的提示：比普通 hint 更显眼一档，但不用告警红——
+   它不是错误，只是"你改的值和服务端基线不一样"的知情提示。 */
+.gate-setting-pinned {
+    color: var(--neon-cyan);
+}
+
+/* 分区顶部那条「哪些刻意没有开关」的说明 */
+.gate-settings-note {
+    margin-bottom: 6px;
+}
+
 /* 折叠的次级设置块（号池分区的「选号策略」） */
 .settings-subgroup {
     border: 1px solid var(--border-color);

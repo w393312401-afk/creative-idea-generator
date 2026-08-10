@@ -88,7 +88,7 @@
     <link rel="stylesheet" href="css/tokens.css?v=1.3.0">
     <!-- style.css split into ordered contiguous slices (concatenation == original); load order = cascade order -->
     <link rel="stylesheet" href="css/app/base.css?v=1.5.0">
-    <link rel="stylesheet" href="css/app/skill-output.css?v=1.3.0">
+    <link rel="stylesheet" href="css/app/skill-output.css?v=1.4.0">
     <link rel="stylesheet" href="css/app/efficiency.css?v=1.4.0">
     <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.8.1">
     <!-- 激发结果页的极简布局（管线条 / 折叠标题 / section 弹层 / 宽屏分栏）。
@@ -110,6 +110,11 @@
     <!-- 项目工作台（任务列表 + 点子库合并后的主页面）。刻意排在 gallery/ledger 之后：
          它复用那两张表的工具栏/芯片视觉语言，只补自己的列表与详情栏。 -->
     <link rel="stylesheet" href="css/projects.css?v=1.2.0">
+    <link rel="stylesheet" href="css/app/stepped_pipeline.css?v=1.0.0">
+    <link rel="stylesheet" href="css/app/replica.css?v=1.0.1">
+    <!-- 顶部工作区标签栏的自定义（排序 / 隐藏）。排在 panels-tabs.css 之后：
+         它要覆盖 .mobile-nav-btn 的显示规则并给标签栏加定位上下文。 -->
+    <link rel="stylesheet" href="css/app/nav-customize.css?v=1.0.0">
     <link rel="stylesheet" href="css/shared/lightbox.css?v=1.2.1">
 </head>
 <body>
@@ -196,6 +201,10 @@
                 <span class="btn-icon">📒</span>
                 <span class="btn-text">创意台账</span>
             </button>
+            <button id="main-tab-replica" class="mobile-nav-btn" onclick="switchMainTab('replica')">
+                <span class="btn-icon">🎬</span>
+                <span class="btn-text">爆款复刻</span>
+            </button>
         </div>
 
         <!-- Main Workspace Grid -->
@@ -230,7 +239,7 @@
                         </span>
                     </button>
                     <span class="spark-rail-link" aria-hidden="true"></span>
-                    <button type="button" class="spark-stage" id="spark-stage-compose" data-stage="compose" title="合成：把选定选题送入 restoration-prompt-composer 合成完整提示词集">
+                    <button type="button" class="spark-stage" id="spark-stage-compose" data-stage="compose" title="合成：把选定选题送入 gemini-veo / omni-restoration-composer 合成完整提示词集">
                         <span class="stage-idx">3</span>
                         <span class="stage-copy">
                             <strong>合成</strong>
@@ -472,7 +481,7 @@
                 <div class="output-placeholder active" id="output-placeholder-view">
                     <div class="placeholder-icon">☄️</div>
                     <h3>等待引燃创意星火...</h3>
-                    <p>在左侧勾选联网参考案例、点选灵感推荐卡片（卡片上的「🔨 节拍简介」可看全部节拍并同时载入维度）选定选题并调整节拍数，点击“激发”。后端会把该选题送入 <b>restoration-prompt-composer</b> skill，按其连续性契约合成完整的「图片 1–N+1 + 视频 1–N」提示词集，并附质量审核报告。</p>
+                    <p>在左侧勾选联网参考案例、点选灵感推荐卡片（卡片上的「🔨 节拍简介」可看全部节拍并同时载入维度）选定选题并调整节拍数，点击“激发”。后端会把该选题送入 <b>gemini-veo-restoration-composer</b> skill，按其连续性契约合成完整的「图片 1–N+1 + 视频 1–N」提示词集，并附质量审核报告。</p>
                 </div>
 
                 <!-- Loading State View -->
@@ -557,6 +566,12 @@
                                 <button id="copy-tiktok-meta-btn" class="mini-icon-btn tiktok-copy-btn" title="复制 TikTok 标题和 tags">
                                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                                 </button>
+                                <!-- 手动上传的提示词集没跑过激发收尾，主题就是个文件名、两行发布
+                                     标题全空。这枚按钮按提示词集正文一次补齐中英双版主题和 tags
+                                     （见 app.js generateProjectMetaForCurrentIdea）。 -->
+                                <button id="gen-project-meta-btn" class="mini-icon-btn tiktok-copy-btn" type="button" title="一键生成中英双版主题和 tags（按提示词集内容推荐）">
+                                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9L12 3z"></path><path d="M18 15l.9 2.1L21 18l-2.1.9L18 21l-.9-2.1L15 18l2.1-.9L18 15z"></path></svg>
+                                </button>
                                 <button id="idea-meta-toggle" class="mini-icon-btn idea-meta-toggle" type="button" aria-expanded="false" aria-controls="idea-content-header" title="展开完整标题与话题">
                                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
                                 </button>
@@ -638,6 +653,11 @@
                                     <button id="export-idea-btn" class="action-btn text-btn menu-item">
                                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
                                         <span>导出 Markdown</span>
+                                    </button>
+                                    <hr class="menu-divider" style="border:none;border-top:1px solid var(--border-glass);margin:4px 0;">
+                                    <button id="stepped-pipeline-btn" class="action-btn text-btn menu-item" title="分步合成：每批渲染后暂停审核，适合大单或需要严格画面控制的场景">
+                                        <span style="font-size:16px">🪜</span>
+                                        <span>分步合成</span>
                                     </button>
                                 </div>
                             </div>
@@ -721,6 +741,9 @@
                                                 <div class="cover-history-thumbnails" id="cover-history-thumbnails">
                                                     <!-- 缩略图将动态渲染在此处 -->
                                                 </div>
+                                                <!-- 用途分配：三个用途各自可以指定一张封面（media_renderer.
+                                                     renderCoverRoleControls 填充），不指定则跟随选中的主封面 -->
+                                                <div class="cover-role-controls" id="cover-role-controls"></div>
                                             </div>
                                         </div>
                                     </div>
@@ -862,7 +885,20 @@
                                              renderMergeBlocked 会把「重试缺口 / 跳过合并」两个可操作
                                              按钮渲染进这里，收进弹层就等于把出口藏起来了。 -->
                                         <p class="frames-meta" id="videos-meta">尚未生成任何视频序列。</p>
-                                        <label for="merge-speed-select" style="display:inline-flex; align-items:center; gap:8px; margin-left:auto; color:var(--text-secondary); font-size:12px; white-space:nowrap;">
+                                        <!-- 首帧封面：平台取缩略图吃的是成片第一帧，而正片第一帧是施工前的空场。
+                                             默认烧一帧（肉眼看不见，缩略图已经是封面）；用哪张由封面页的
+                                             「成片首帧」用途分配决定。 -->
+                                        <label for="merge-cover-burn-select" style="display:inline-flex; align-items:center; gap:8px; margin-left:auto; color:var(--text-secondary); font-size:12px; white-space:nowrap;"
+                                               title="把封面烧进成片开头，让平台的缩略图取到封面图">
+                                            <span>封面首帧</span>
+                                            <select id="merge-cover-burn-select" aria-label="成片首帧烧录封面" style="padding:6px 10px; color:var(--text-primary); background:var(--surface, #111827); border:1px solid var(--border-color); border-radius:6px;">
+                                                <option value="frame" selected>烧一帧</option>
+                                                <option value="0.5">停留 0.5 秒</option>
+                                                <option value="1">停留 1 秒</option>
+                                                <option value="off">不烧录</option>
+                                            </select>
+                                        </label>
+                                        <label for="merge-speed-select" style="display:inline-flex; align-items:center; gap:8px; color:var(--text-secondary); font-size:12px; white-space:nowrap;">
                                             <span>合并速率</span>
                                             <select id="merge-speed-select" aria-label="视频合并速率" style="padding:6px 10px; color:var(--text-primary); background:var(--surface, #111827); border:1px solid var(--border-color); border-radius:6px;">
                                                 <option value="1">无加速</option>
@@ -903,6 +939,12 @@
                                                         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: middle;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
                                                         <span>下载成品视频</span>
                                                     </a>
+                                                    <!-- 定位到本机文件：走 /api/reveal_file，在跑服务端那台机器的
+                                                         Finder/资源管理器里选中这个成片文件（远程访问时后端会 403）。 -->
+                                                    <button type="button" id="merged-video-reveal" class="action-btn text-btn mini-btn" title="在本机文件管理器中显示该成片文件" style="display: inline-flex; align-items: center; gap: 6px; margin-left: 8px; padding: 6px 12px; font-size: 12px; color: var(--text-primary); background: rgba(var(--ink-rgb), 0.08); border: 1px solid var(--border-color); border-radius: 4px; cursor: pointer;">
+                                                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: middle;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                                                        <span>定位本地文件</span>
+                                                    </button>
                                                 </div>
                                             </div>
                                         </div>
@@ -969,7 +1011,7 @@
                                         </button>
                                     </span>
                                 </div>
-                                <pre class="prompt-pre" id="idea-prompt-block">在左侧选择维度并点击「激发」，这里会输出经 restoration-prompt-composer skill 合成的完整图片 / 视频提示词集。</pre>
+                                <pre class="prompt-pre" id="idea-prompt-block">在左侧选择维度并点击「激发」，这里会输出经 gemini-veo / omni-restoration-composer skill 合成的完整图片 / 视频提示词集。</pre>
                                 <textarea class="prompt-editor" id="idea-prompt-editor" spellcheck="false" hidden></textarea>
                                 <p class="prompt-edit-hint" id="prompt-edit-hint" hidden>
                                     「图片 N:」的条数就是帧槽位数，槽位号必须从 1 连续编到 N；「视频 N」对应 IMG N → IMG N+1，槽位号只能落在 1–N 内。
@@ -978,6 +1020,9 @@
                                 </p>
                             </div>
                         </div>
+
+                        <!-- 分步管线控制面板：分步合成时显示阶段进度条 + 审核面板，覆盖提示词区 -->
+                        <div id="stepped-pipeline-panel" class="stepped-pipeline-panel" style="display: none;"></div>
 
                         <!-- （原 Tab 3「校验与质量审核」已并入概览页顶部的 #audit-strip） -->
                     </div>
@@ -1292,6 +1337,10 @@
                             <button type="button" id="projects-refresh-btn" class="projects-tool-btn" title="重新汇总（含 outputs/ 资产统计）">🔄 刷新</button>
                             <!-- 原先挂在「我的点子库」抽屉里，抽屉删除后搬到这里 -->
                             <button type="button" id="import-btn" class="projects-tool-btn" title="从 JSON 文件导入创意">导入 JSON</button>
+                            <!-- 手上已有整份提示词集（别处生成的 .md、聊天记录里粘出来的一段）时
+                                 不必再跑一次激发：这里直接导入成一个新项目，格式不合槽位契约会自动
+                                 补全并先把改动列出来（见 js/prompt_import.js）。 -->
+                            <button type="button" id="projects-import-prompt-btn" class="projects-tool-btn" title="导入外部写好的整份提示词集（选 .md/.txt 或直接粘贴）：建成一个新项目，格式不合槽位契约时自动补全，改了什么会先列出来让你确认">📥 上传提示词集</button>
                             <button type="button" id="export-all-btn" class="projects-tool-btn" title="把整个点子库导出成 JSON">全部导出</button>
                             <input type="file" id="import-file" style="display: none;" accept=".json">
                             <button type="button" id="projects-clear-completed-btn" class="projects-tool-btn" title="删除所有已完成的任务记录（不影响已收藏的创意与磁盘素材）">🧹 清空已完成</button>
@@ -1352,6 +1401,20 @@
             </section>
 
             <!-- Topic Ledger Workspace: 创意台账 —— 已用/候选选题的管理、打分与投放表现回填 -->
+            <!-- 爆款复刻：成品视频 → 抽帧 → 逐帧客观事实 → 节拍阶梯 → 提示词包；
+                 已确认的节拍还可沿受控变异轴派生二创。
+                 方案见 docs/replica_and_variant_pipeline_plan.md。
+                 整个页面由 js/replica_pipeline.js 渲染，这里只留挂载点。 -->
+            <section class="panel-replica glass-panel" id="panel-replica">
+                <div class="replica-shell">
+                    <div class="panel-header">
+                        <h2>爆款复刻</h2>
+                        <p>传一条成品延时视频，反推出它的节拍骨架与提示词包；确认后可沿受控变异轴做二创</p>
+                    </div>
+                    <div id="replica-root"></div>
+                </div>
+            </section>
+
             <section class="panel-ledger glass-panel" id="panel-ledger">
                 <div class="ledger-shell">
                     <div class="panel-header">
@@ -1412,7 +1475,8 @@
     <!-- Settings Modal — API 配置中心 · 极简两栏布局
          旧版是一条 10 项的长滚动表单，且「号池」还要再点开一个嵌套弹窗（modal 叠 modal）；
          改一个参数要先滚着找、改完还得记得按「保存配置」。现在：
-           · 左侧分区导航（后端 / 生图 / 号池 / 激发参考 / 系统），右侧一次只显示一个分区；
+            · 左侧分区导航（后端 / 号池 / 激发参考 / 系统），右侧一次只显示一个分区；
+            · 生图参数（宽高比/清晰度）已并入「生成后端」分区，减少一级跳转；
            · 号池整块并入本窗口的「生成号池」分区（原 #account-pool-manage-modal 已删除，
              js/account_pool.js 继续负责池子渲染）；默认环境和换号节拍只在 Google FX
              服务管理中心配置；
@@ -1435,11 +1499,12 @@
                     <button type="button" class="settings-nav-item active" data-section="backend">
                         <span class="settings-nav-icon">🔌</span><span class="settings-nav-label">生成后端</span>
                     </button>
-                    <button type="button" class="settings-nav-item" data-section="image">
-                        <span class="settings-nav-icon">🖼️</span><span class="settings-nav-label">生图参数</span>
-                    </button>
+
                     <button type="button" class="settings-nav-item" data-section="pool">
                         <span class="settings-nav-icon">🎬</span><span class="settings-nav-label">生成号池</span>
+                    </button>
+                    <button type="button" class="settings-nav-item" data-section="gates">
+                        <span class="settings-nav-icon">🛡</span><span class="settings-nav-label">质量门禁</span>
                     </button>
                     <button type="button" class="settings-nav-item" data-section="ideation">
                         <span class="settings-nav-icon">🌐</span><span class="settings-nav-label">激发参考</span>
@@ -1455,7 +1520,7 @@
                     <!-- ① 生成后端 -->
                     <section class="settings-section active" data-section="backend">
                         <h4 class="settings-section-title">生成后端</h4>
-                        <p class="settings-section-desc">帧序列走哪条生成链路、各条链路用哪个生图模型，以及视频侧的模型与参考模式。</p>
+                        <p class="settings-section-desc">帧序列走哪条生成链路、各条链路用哪个生图模型，封面与帧序列共用的画幅与清晰度，以及视频侧的模型与参考模式。</p>
                         <div class="form-group settings-field">
                             <label for="settings-image-backend">帧序列生成方式</label>
                             <select id="settings-image-backend">
@@ -1509,13 +1574,7 @@
                             </select>
                             <small class="settings-hint">发起视频前在 Flow 面板切到哪个子模式上传参考图：「帧」用首尾帧约束运动起止，「素材」把参考图当风格/主体素材。与 Google FX 服务管理中心的同名设置是同一项（videoRefMode），改动即同步到服务端。</small>
                         </div>
-                        <p class="settings-inline-note">LLM 模型在激发按钮上方切换；生图模型在帧序列卡片右上角也能切，与这里的下拉是同一项设置，改动即存。<b>提示词链路</b>（Veo 单镜延时 / Omni 多镜头）也在激发按钮上方切换，默认「自动」跟随此处的 FX 视频模型。</p>
-                    </section>
-
-                    <!-- ② 生图参数 -->
-                    <section class="settings-section" data-section="image">
-                        <h4 class="settings-section-title">生图参数</h4>
-                        <p class="settings-section-desc">封面与帧序列共用的画幅与清晰度。</p>
+                        <!-- 生图参数（原独立分区，已并入生成后端） -->
                         <div class="form-group settings-field">
                             <label for="settings-image-ratio">生图宽高比</label>
                             <select id="settings-image-ratio">
@@ -1535,9 +1594,10 @@
                                 <option value="4K">4K (高清画质)</option>
                             </select>
                         </div>
+                        <p class="settings-inline-note">LLM 模型在激发按钮上方切换；生图模型在帧序列卡片右上角也能切，与这里的下拉是同一项设置，改动即存。<b>提示词链路</b>（Veo 单镜延时 / Omni 多镜头）也在激发按钮上方切换，默认「自动」跟随此处的 FX 视频模型。</p>
                     </section>
 
-                    <!-- ③ 生成号池 — 这里只管理池子成员。
+                    <!-- ② 生成号池 — 这里只管理池子成员。
                          视频生成始终走 AdsPower/google_fx（跟「帧序列生成方式」的 api/google_fx
                          切换无关，那个开关只管生图路径）。默认环境和换号节拍统一在
                          Google FX 服务管理中心配置，避免两个入口互相覆盖。 -->
@@ -1578,6 +1638,25 @@
                                 <button type="button" id="account-pool-add-btn" class="ledger-tool-btn">➕ 添加</button>
                             </div>
                             <p class="settings-inline-note" title="池子为空时完全不影响现有行为：沿用「选号策略」里的「指定浏览器编号」单选。">积分只信「刷新积分」的真实探测结果（要开一次浏览器读 Flow 页面，较慢）；发起视频生成时缓存超过 30 分钟会自动刷一次。</p>
+                        </div>
+                    </section>
+
+                    <!-- ③ 质量门禁 — 控件由 js/gate_settings.js 按 /api/mode 下发的
+                         gate_settings 表动态渲染，这里只留容器。刻意不在 HTML 里写死
+                         选项/默认值：那等于把服务端 GATE_SETTINGS 抄第二份，
+                         正是「配了但从未生效」那一类 bug 的来源。 -->
+                    <section class="settings-section" data-section="gates">
+                        <h4 class="settings-section-title">质量门禁</h4>
+                        <p class="settings-section-desc">
+                            生成过程中自动跑的那几道检查各自开到什么程度。默认档位是标定过的，
+                            没有明确理由不建议改；关掉任何一项都不会有第二处提醒。
+                        </p>
+                        <div class="modal-info gate-settings-note">
+                            <p>💡 <b>纯本地、零成本、只告警</b>的判据（片段冻结检测、段内推进节奏检测）刻意没有开关：
+                            它们不会误删片，关掉只会让你失去知情。有开关的都是<b>要么烧额度、要么会删片重来</b>的项。</p>
+                        </div>
+                        <div id="gate-settings-list" class="gate-settings-list">
+                            <p class="settings-hint" id="gate-settings-loading">正在读取服务端门禁配置…</p>
                         </div>
                     </section>
 
@@ -1763,9 +1842,12 @@
 
     <!-- Modular JS: defer so they never block HTML parsing. Order preserved. -->
     <script src="js/state.js?v=1.1.15" defer></script>
-    <script src="js/utils.js?v=1.4.0" defer></script>
+    <script src="js/utils.js?v=1.5.0" defer></script>
     <script src="js/theme_toggle.js?v=1.1.0" defer></script>
-    <script src="js/config.js?v=1.3.3" defer></script>
+    <script src="js/config.js?v=1.3.4" defer></script>
+    <!-- 质量门禁开关面板：按 /api/mode 下发的 gate_settings 表动态渲染配置中心的
+         「质量门禁」分区。必须排在 config.js 之后（读写同一个 config 对象）。 -->
+    <script src="js/gate_settings.js?v=1.0.0" defer></script>
     <script src="js/spark_rail.js?v=1.0.0" defer></script>
     <script src="js/trend_refs.js?v=1.3.1" defer></script>
     <script src="js/account_pool.js?v=1.2.1" defer></script>
@@ -1780,16 +1862,22 @@
     <script src="js/log_semantics.js?v=1.0.0" defer></script>
     <script src="js/api_client.js?v=1.9.0" defer></script>
     <script src="js/prompt_pipeline.js?v=1.2.6" defer></script>
+    <script src="js/stepped_pipeline.js?v=1.0.0" defer></script>
+    <script src="js/replica_pipeline.js?v=1.0.3" defer></script>
     <script src="js/prompt_editor.js?v=1.0.0" defer></script>
+    <script src="js/prompt_import.js?v=1.0.0" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
-    <script src="js/media_renderer.js?v=1.9.1" defer></script>
-    <script src="app.js?v=1.6.2" defer></script>
+    <script src="js/media_renderer.js?v=1.11.0" defer></script>
+    <script src="app.js?v=1.6.3" defer></script>
     <script src="js/image_studio.js?v=1.0.4" defer></script>
-    <script src="js/gallery.js?v=1.1.2" defer></script>
+    <script src="js/gallery.js?v=1.2.0" defer></script>
     <script src="js/ledger.js?v=1.3.0" defer></script>
     <!-- 项目工作台：必须排在 app.js 之后（依赖它的 openSparkProject / viewTask /
          retryTask / deleteFromLibrary 等宿主函数） -->
     <script src="js/projects.js?v=1.1.0" defer></script>
+    <!-- 顶部标签栏自定义（排序 / 隐藏）。纯 DOM 层改造，不依赖任何业务模块，
+         只要求 .mobile-nav-tabs 已经在文档里 -->
+    <script src="js/nav_customize.js?v=1.0.0" defer></script>
     <!-- 旧「移动端标签切换」内联脚本已删除：它指向早已不存在的 mobile-tab-left/right，
          MutationObserver 永远空转；自动切换结果面板改由 app.js 的 switchMainTab('results') 完成 -->
 

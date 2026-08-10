@@ -28,15 +28,17 @@ cannot fill all nine is not a beat yet — it is a wish.
 | `persistent_traces` | at least two physical traces inherited by IMAGE N+1 |
 | `next_frame_inheritance` | what must remain visible and unchanged in the next anchor |
 
-Mapping to the six-shot cycle:
+Mapping to the shot structure:
 
-- `entry_path` + `material_source` → shot 2 (full shot, staging)
-- `tool_contact` + `movement_path` → shots 3 and 4
-- `persistent_traces` → shot 5 (extreme close-up) and carried into IMAGE N+1
-- `next_frame_inheritance` → shot 6 (wide outro) and the next anchor's inherited-trace list
+- `entry_path` + `material_source` + `movement_path` → the main wide working shot, where the
+  worker, tool, and material source are all in frame at full-body scale
+- `tool_contact` → the close-up insert
+- `persistent_traces` → the extreme close-up insert (or the single close-up insert on 4s and
+  6s clips) and carried into IMAGE N+1
+- `next_frame_inheritance` → the returning wide shot and the next anchor's inherited-trace list
 
-If a field has no home in the six shots, the beat is underspecified and the model will
-invent the missing physics.
+If a field has no home in the clip's three or four shots, the beat is underspecified and the
+model will invent the missing physics.
 
 ---
 
@@ -89,11 +91,11 @@ Each is named with its approximate frame share, in words, not numbers:
 
 Visibility by shot scale:
 
-- shots 1, 2, 6 (establishing / full / wide outro): **all three** landmarks visible in their
-  locked relationships. These are the shots that carry anchor continuity.
-- shots 3, 4, 5 (medium / close / extreme close): at least **one** landmark, or a named part
-  of one, stays in frame as the spatial handle. A close-up with no landmark reference is
-  where layout drift enters.
+- the main wide working shot and the returning wide shot: **all three** landmarks visible in
+  their locked relationships. These two are the same camera setup and they are what carries
+  anchor continuity.
+- the inserts: at least **one** landmark, or a named part of one, stays in frame as the
+  spatial handle. An insert with no landmark reference is where layout drift enters.
 
 ### Tier 2 — Relative Positioning Lock for drift-prone objects
 

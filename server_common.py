@@ -304,30 +304,197 @@ def http_access_logging():
     return bool(SERVER_CONFIG.get('logHttpAccess') or os.environ.get('SPARK_LOG_HTTP_ACCESS'))
 
 
+# ════════════════════════════════════════════════════════════════════
+# 质量门禁配置总表（GATE_SETTINGS）—— 单一真源
+# ════════════════════════════════════════════════════════════════════
+# 门禁项此前散在四处手工同步：① 各消费点自己读 config.get()、② effective_config
+# 的托管模式白名单、③ js/state.js 的前端默认值、④ server_config.example.json 的
+# 注释。任何一处漏掉，就是一次"配了但从未生效"的静默失效——qaGateLevel /
+# imageEditTransport / skillProfile 都各栽过一次（见 effective_config 上方注释），
+# 而 videoProcessVlmReview 与 strictGates 到 2026-08-10 为止仍漏在白名单外：
+# 托管模式（配了 apiKey 即是）下请求 config 带的这两项会被 effective_config 整个
+# 丢掉，只有 server_config.json 能生效。strictGates 还被 SERVER_CONFIG 兜底掩盖着，
+# 看起来"能用"，实际是那条 config 分支永远走不到。
+#
+# 现在这张表是唯一真源：白名单由它派生（_GATE_KEYS），前端默认值与开关面板由
+# /api/mode 下发它渲染，example 配置的注释也照它生成。新增门禁项只改这里。
+#
+# 字段：
+#   key      —— config / server_config.json 的键名
+#   type     —— 'bool' | 'enum' | 'int'
+#   default  —— 缺省值（三处 fallback 都用它，不要在别处再写一份）
+#   env      —— 可选的环境变量覆盖（优先级最低，仅无头/脚本调用用）
+#   options  —— enum 的合法值；非法值一律回退 default，不报错
+#   min/max  —— int 的夹取区间
+#   section  —— 前端开关面板的分组
+#   label/hint —— 前端渲染用的中文文案
+#
+# 刻意**不**收进这张表的（别加）：
+#   · _ANCHOR_MAD_THRESHOLD / _PAIR_*_MAD / _FROZEN_CLIP_MAD / _ANCHOR_INERTIA_MAD
+#     等阈值常量——每一个都挂着实测标定数据（见各自定义处的注释）。改成 25 不会
+#     报错，只会让串片静默通过。要给用户的是**档位**（内部映射一组标定过的阈值），
+#     不是裸数字。
+#   · detect_frozen_clip / detect_pace_break 的本地判据开关——纯本地、确定性、零
+#     成本、最高只到 warn 永不 reject。2026-07-31 复盘已经踩过一次：给它加开关的
+#     结果是把免费的客观测量一起关掉了（见 video_generator._VIDEO_PROCESS_GATE_DISABLED
+#     上方注释）。用户反对的是 VLM 误判删片，不是反对知情。
+GATE_SETTINGS = (
+    {
+        'key': 'qaGateLevel', 'type': 'enum', 'default': 'standard',
+        'env': 'SPARK_QA_GATE_LEVEL',
+        'options': ('standard', 'lenient', 'off'),
+        'section': 'video', 'label': '视频质检门档位',
+        'option_labels': {
+            'standard': 'standard（硬伤拒收重试）',
+            'lenient': 'lenient（硬伤只告警放行）',
+            'off': 'off（整套质检门跳过）',
+        },
+        'hint': '视频段内过程门的总开关。off 会连本地冻结/节奏检测一起跳过；'
+                'lenient 把「拒收删片重试」降级成「告警放行 + manifest 留痕」。'
+                '同时也作用于手动一致性审查。',
+    },
+    {
+        'key': 'videoProcessVlmReview', 'type': 'bool', 'default': True,
+        'section': 'video', 'label': '视频段内 VLM 复审',
+        'hint': '视频下载后抽中段帧交给 VLM 判「两锚点之间是否真的发生了描述的过程」'
+                '（空心片段 / 无关内容）。烧多模态额度，误判会删片重来，所以留了开关。'
+                '关掉后本地冻结/节奏检测照跑——那两条零成本，不受本项管辖。',
+    },
+    {
+        'key': 'videoAnchorVerify', 'type': 'bool', 'default': True,
+        'section': 'video', 'label': '视频首尾锚点校验',
+        'hint': '视频落盘后抽首尾帧与该槽位锚点图比对，挡住 Flow 画布 tile 追踪串片'
+                '（实测错位段 MAD 28+，匹配段 1.5~10.3）。纯本地零成本，'
+                '**正常生成不要关**；只在离线复现/调试串片本身时才需要关。',
+    },
+    {
+        'key': 'anchorInertiaAutoRetry', 'type': 'bool', 'default': True,
+        'section': 'frame', 'label': '桥接帧惯性自动重渲',
+        'hint': '桥接/换族帧渲出来与参考帧近乎相同（i2i 参考惯性压过了「进入新空间」的'
+                '文本指令）时，自动加强图生图指令重渲一次。烧一次生图额度。'
+                '关掉后仍然检测、仍然留痕，只是不自动重渲。'
+                '（Google FX 链路本来就只留痕不重渲，本项对其无效。）',
+    },
+    {
+        'key': 'frameContinuityMode', 'type': 'enum', 'default': 'balanced',
+        'options': ('off', 'balanced', 'strict'),
+        'section': 'frame', 'label': '帧连续性检查档位',
+        'option_labels': {
+            'off': 'off（关闭）',
+            'balanced': 'balanced（默认，重试 1 次）',
+            'strict': 'strict（更敏感，重试 2 次）',
+        },
+        'hint': '渲完每一帧后本地判「锁定机位是否漂移 / 声明的变化区是否真的动了」，'
+                '要两个独立硬信号才判失败。失败自动重渲，重渲仍失败则中断整条链'
+                '避免污染后续帧。注意：开启时 Google FX 链路的批大小会被强制降到 1。',
+    },
+    {
+        'key': 'frameContinuityMaxRetries', 'type': 'int', 'default': 1,
+        'min': 0, 'max': 3,
+        'section': 'frame', 'label': '帧连续性自动重试次数',
+        'hint': '留空/非法值时按档位取默认（balanced=1，strict=2）。夹取区间 0~3。',
+    },
+    {
+        'key': 'strictFrameStateContract', 'type': 'bool', 'default': True,
+        'section': 'prompt', 'label': '帧状态契约严格模式',
+        'hint': 'before/delta/after 帧状态不合法时是否阻断提示词交付。默认开启；'
+                '关闭仅用于对比旧提示词包的诊断，不要用于正式出片。',
+    },
+    {
+        'key': 'autoSplitHighRiskBeats', 'type': 'bool', 'default': False,
+        'section': 'prompt', 'label': '高风险拍自动拆分',
+        'hint': '跨度过大的拍在提示词交付前自动插入一张正式锚点拍拆成两拍。'
+                '一比一复刻模式下永远跳过（会破坏「拍数=清单条数」不变式）。',
+    },
+    {
+        'key': 'strictGates', 'type': 'bool', 'default': False,
+        'env': 'SPARK_STRICT_GATES',
+        'section': 'env', 'label': '门禁 fail-closed',
+        'hint': '判定环境异常（ffmpeg / numpy / PIL 缺失，VLM 网关挂了）时怎么办：'
+                '关=放行但在 manifest 记 auto_approved_degraded 留痕；'
+                '开=按判定失败处理。开启可防「环境退化悄悄关掉了串片检测」，'
+                '代价是环境一抖就中断生成。',
+    },
+)
+
+_GATE_BY_KEY = {item['key']: item for item in GATE_SETTINGS}
+# effective_config 白名单据此派生——门禁项漏进白名单这个 bug 类别到此为止。
+_GATE_KEYS = tuple(item['key'] for item in GATE_SETTINGS)
+
+# 兼容旧引用（qa_gate_level 的合法值此前是模块级常量，外部有 import）。
+QA_GATE_LEVELS = _GATE_BY_KEY['qaGateLevel']['options']
+
+
+def _coerce_gate_value(spec, raw):
+    """按 spec 归一化一个门禁值。非法值一律回退 default 而不是抛错：
+    门禁配置写错不该让整条生成链崩掉，但也不该静默按"用户以为的那个值"跑。"""
+    if raw is None:
+        return spec['default']
+    kind = spec['type']
+    if kind == 'bool':
+        if isinstance(raw, str):
+            return raw.strip().lower() not in ('', '0', 'false', 'no', 'off')
+        return bool(raw)
+    if kind == 'enum':
+        value = str(raw).strip().lower()
+        return value if value in spec['options'] else spec['default']
+    if kind == 'int':
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return spec['default']
+        return max(spec.get('min', value), min(spec.get('max', value), value))
+    return raw
+
+
+def gate_setting(key, config=None):
+    """门禁配置的唯一读取入口。
+
+    优先级统一为：请求 config > server_config.json > 环境变量 > 表里的 default。
+    请求 config 优先是因为一次生成任务要能临时放宽/收紧而不改服务端配置；环境
+    变量垫底是给不带 config 的无头/脚本调用用的。
+
+    注意 config 里显式写 false 与"没写"是两回事：前者要生效（用 `in` 判断而不是
+    truthy 判断），否则「本次任务关掉 VLM 复审」这种请求永远关不掉。"""
+    spec = _GATE_BY_KEY.get(key)
+    if spec is None:
+        raise KeyError(f'未知的门禁配置项：{key}（请先加进 GATE_SETTINGS）')
+    if isinstance(config, dict) and config.get(key) is not None:
+        return _coerce_gate_value(spec, config[key])
+    if SERVER_CONFIG.get(key) is not None:
+        return _coerce_gate_value(spec, SERVER_CONFIG[key])
+    env_key = spec.get('env')
+    if env_key and os.environ.get(env_key) is not None:
+        return _coerce_gate_value(spec, os.environ[env_key])
+    return spec['default']
+
+
+def gate_settings_report():
+    """/api/mode 下发用：表结构 + 当前服务端生效值。前端据此渲染开关面板，
+    不必在 JS 里再抄一份默认值/选项列表（那正是白名单漂移的老路）。"""
+    items = []
+    for spec in GATE_SETTINGS:
+        item = {k: v for k, v in spec.items() if k != 'env'}
+        if 'options' in item:
+            item['options'] = list(item['options'])
+        # server_value：不带请求 config 时的生效值，即前端没存过本项时的实际行为
+        item['server_value'] = gate_setting(spec['key'])
+        item['server_pinned'] = SERVER_CONFIG.get(spec['key']) is not None
+        items.append(item)
+    return items
+
+
 def strict_gates_enabled(config=None):
-    """视觉门禁 fail-closed 开关（server_config.json 的 strictGates / 环境变量
-    SPARK_STRICT_GATES）。默认关闭：判定服务异常时放行但在 manifest 留痕
+    """视觉门禁 fail-closed 开关。默认关闭：判定服务异常时放行但在 manifest 留痕
     （auto_approved_degraded）；开启后判定服务异常按判定失败处理。"""
-    if isinstance(config, dict) and config.get('strictGates') is not None:
-        return bool(config.get('strictGates'))
-    return bool(SERVER_CONFIG.get('strictGates') or os.environ.get('SPARK_STRICT_GATES'))
-
-
-QA_GATE_LEVELS = ('standard', 'lenient', 'off')
+    return bool(gate_setting('strictGates', config))
 
 
 def qa_gate_level(config=None):
-    """帧质检门档位（请求 config 的 qaGateLevel > server_config.json > 环境变量
-    SPARK_QA_GATE_LEVEL）。standard=现有全量质检；lenient=只拦硬伤（无变化/换场景/
+    """帧质检门档位。standard=现有全量质检；lenient=只拦硬伤（无变化/换场景/
     出现人物机械/文字水印），构图视角漂移等降级为警告放行，且停用跨帧地标漂移复查；
     off=视觉门全部跳过（manifest 记 auto_approved_degraded 留痕）。非法值回退 standard。"""
-    raw = None
-    if isinstance(config, dict) and config.get('qaGateLevel'):
-        raw = config.get('qaGateLevel')
-    else:
-        raw = SERVER_CONFIG.get('qaGateLevel') or os.environ.get('SPARK_QA_GATE_LEVEL')
-    level = str(raw).strip().lower() if raw else 'standard'
-    return level if level in QA_GATE_LEVELS else 'standard'
+    return gate_setting('qaGateLevel', config)
 
 
 def _int_setting(env_key, cfg_key, default):
@@ -833,7 +1000,7 @@ def active_skill_profile(config=None):
 # （video_generator._CLIP_BASE_SECONDS 同款口径）。
 FIXED_VIDEO_DURATION = 8
 OMNI_VIDEO_DURATIONS = (4, 6, 8, 10)
-OMNI_DEFAULT_VIDEO_DURATION = 10  # 满六镜所需的时长，见 omni composer 的镜头梯表
+OMNI_DEFAULT_VIDEO_DURATION = 10  # 主镜够长、且排得下第二个特写插入的时长，见 omni composer
 
 
 def resolve_video_duration(config=None):
@@ -1388,6 +1555,15 @@ _SERVER_AUTHORITATIVE_KEYS = frozenset({
     'videoModel', 'googleFxImageModel', 'videoDuration', 'videoRefMode',
 })
 
+# 托管模式（配了 apiKey 即是）下允许从浏览器/请求 config 透传的键。门禁那一段由
+# GATE_SETTINGS 派生，其余是模型/画幅/激发参考等非门禁项。
+_PASSTHROUGH_CLIENT_KEYS = (
+    'imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel',
+    'videoModel', 'videoDuration', 'videoRefMode', 'adsPowerPort',
+    'videoAccountPoolMinCredit', 'frameContinuityLocalEdit',
+    'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile',
+) + _GATE_KEYS
+
 
 def effective_config(client_config):
     client_config = dict(client_config or {})
@@ -1406,8 +1582,8 @@ def effective_config(client_config):
         for key in _SERVER_AUTHORITATIVE_KEYS:
             if key in SERVER_CONFIG:
                 merged[key] = SERVER_CONFIG[key]
-        for key in ('frameContinuityMode', 'frameContinuityMaxRetries',
-                    'frameContinuityLocalEdit', 'autoSplitHighRiskBeats'):
+        # 门禁项：客户端没带的才从服务端补（客户端显式写了就以它为准，含显式 false）
+        for key in _GATE_KEYS + ('frameContinuityLocalEdit',):
             if key not in merged and key in SERVER_CONFIG:
                 merged[key] = SERVER_CONFIG[key]
         if 'googleFxImageModel' in merged:
@@ -1449,7 +1625,11 @@ def effective_config(client_config):
     # base/omni 送到服务端的（active_skill_profile 读的正是 config['skillProfile']）。
     # 不进这份白名单，托管模式下前端选了哪条链路会被整个丢掉——用户以为切了，
     # 实际永远按 videoModel 推断，和 qaGateLevel / imageEditTransport 当年是同一个口子。
-    for k in ('imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel', 'videoModel', 'videoDuration', 'videoRefMode', 'adsPowerPort', 'videoAccountPoolMinCredit', 'qaGateLevel', 'strictFrameStateContract', 'frameContinuityMode', 'frameContinuityMaxRetries', 'frameContinuityLocalEdit', 'autoSplitHighRiskBeats', 'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile'):
+    # 门禁项统一由 GATE_SETTINGS 派生（_GATE_KEYS），不再手写——qaGateLevel /
+    # videoProcessVlmReview / strictGates 漏在这里正是上面说的那个 bug 类别。
+    # frameContinuityLocalEdit 单列：它已经没有任何消费点（全仓只剩这两份白名单
+    # 在传它），不进 GATE_SETTINGS，但保留透传避免动到历史 localStorage 的形状。
+    for k in _PASSTHROUGH_CLIENT_KEYS:
         if k in _SERVER_AUTHORITATIVE_KEYS:
             # FX 模型设置：服务端配置优先，防止浏览器旧缓存覆盖控制台的改动
             if k in SERVER_CONFIG:
@@ -1531,6 +1711,20 @@ def make_idea_project_key(task_id, title):
     return f"run_{safe_id}__{title or '未命名创意'}"
 
 
+def rekey_project_title(project_key, new_title):
+    """项目改名后的新 project_key：只换标题那一段，run_<id>__ 前缀原样保留。
+
+    前缀才是"这一次 compose 的隔离命名空间"（见 make_idea_project_key），换掉它
+    等于把这一单当成另一次运行。认不出前缀的（历史数据里 project_key 直接就是
+    标题，或者压根没有 key）整体退成新标题。
+    """
+    key = str(project_key or '')
+    title = (new_title or '').strip() or '未命名创意'
+    if key.startswith('run_') and '__' in key:
+        return key.split('__', 1)[0] + '__' + title
+    return title
+
+
 def _legacy_ascii_project_name(title):
     raw = (title or 'spark_frames').strip()
     import hashlib
@@ -1581,6 +1775,205 @@ def _get_project_dir(title):
     return new_dir
 
 
+# ── 项目改名：磁盘命名空间跟着一起搬 ────────────────────────────────────────
+# 只改库里的标题、不动磁盘，这条创意当场散架：工作台那一行叫新名字，帧/视频/封面
+# 还躺在旧目录里，而 _get_project_dir 下一次按新键去找，找到的是一个空目录——已生成
+# 的资产在界面上"凭空消失"，重新生成又会在新目录里另起一套。所以改名是四件事一起
+# 做，缺一不可：
+#   1) 目录 outputs/<旧名> → outputs/<新名>；
+#   2) 目录里名字带项目名/主题的文件（拼图 <项目名>_collage.jpg、合并成片
+#      <中文主题>_<倍速>.mp4）跟着改；
+#   3) 目录里所有 .json（manifest、.deleted_slots 恢复快照、连续性报告）中写死的
+#      那些路径与 URL 一并改写——前端就是照着它们去取图的；
+#   4) 调用方还要把改动同步回创意条目与任务记录（见 server.py /api/project/rename）。
+# 目标目录已存在时整件事都不做：宁可维持现状，也不能把两单的资产合进一个目录。
+
+def _project_merged_video_stem(title, fallback_key):
+    """合并成片的文件名主干。取法与 video_generator 合并时一致（先取标题里的中文，
+    没有中文才退回安全目录名），这样改完名的文件与下次重新合并出来的同名，不会
+    在项目根目录里留下两份成片。"""
+    chars = ''.join(re.findall(r'[一-龥]+', title or ''))
+    return chars or _safe_project_name(title or fallback_key)
+
+
+def _rewrite_project_dir_paths(project_dir, pairs):
+    """把项目目录里所有 .json 内写死的旧路径/旧文件名换成新的。
+
+    只碰 .json：目录里其余都是媒体文件（帧/视频/封面/拼图），二进制里不会有路径。
+    单个文件读写失败不中断整轮——大部分 json 是可再生的报告，manifest 之外的那些
+    就算没改上，也不该把已经搬好的目录卡在半途。返回改写失败的文件名列表。
+    """
+    failures = []
+    for base, _dirs, files in os.walk(project_dir):
+        for name in files:
+            if not name.lower().endswith('.json'):
+                continue
+            path = os.path.join(base, name)
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                new_text = text
+                for old, new in pairs:
+                    if old and old != new:
+                        new_text = new_text.replace(old, new)
+                if new_text != text:
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write(new_text)
+            except Exception as e:
+                failures.append(f'{os.path.relpath(path, project_dir)}: {e}')
+    return failures
+
+
+def rewrite_media_paths(node, pairs):
+    """把一份内存结构（任务记录的 dimensions / result 等）里写死的旧路径换成新的。
+
+    与 _rewrite_project_dir_paths 是同一件事的两侧：那个管项目目录里的 .json，
+    这个管**目录之外**还留着这些 URL 的地方。任务记录就是最要命的那处：结果页的
+    「跟进 / 查看已完成任务」整页都是照着 task.result 渲染的（app.js
+    loadCompletedTask），改完名不跟着改，打开就是满屏 404，而且那份带死链的对象
+    还会被存成 currentIdea 再写回点子库，把改名时刚修好的 URL 又覆盖回去。
+
+    只换字符串，容器原地改（ACTIVE_TASKS 里挂着 Event/listeners 这类不可序列化的
+    东西，不能走 json 往返）。返回换过的字符串个数。
+    """
+    swapped = 0
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, str):
+                new = v
+                for old, repl in pairs:
+                    if old and old != repl:
+                        new = new.replace(old, repl)
+                if new != v:
+                    node[k] = new
+                    swapped += 1
+            else:
+                swapped += rewrite_media_paths(v, pairs)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            if isinstance(v, str):
+                new = v
+                for old, repl in pairs:
+                    if old and old != repl:
+                        new = new.replace(old, repl)
+                if new != v:
+                    node[i] = new
+                    swapped += 1
+            else:
+                swapped += rewrite_media_paths(v, pairs)
+    return swapped
+
+
+def rekey_ledger_project_key(old_key, new_key, path=None):
+    """项目改名后，把创意台账里指向旧 project_key 的行改到新键上。
+
+    不改的话，工作台合流索引第 4 步按 project_key 找不到这一行的台账
+    （build_projects_index：`if not key or key not in projects: continue`），
+    改完名，这条创意的选题/评分/投放状态就从项目行上凭空消失了。
+
+    走 _write_ledger_file 而不是 write_ledger：那道空列表/缩量防护堵的是"客户端
+    拿着一份过期的整表回写"，这里是服务端就地改一个字段，条数一条不少。
+    """
+    if not old_key or old_key == new_key:
+        return 0
+    path = path or LEDGER_FILE
+    with LEDGER_LOCK:
+        if not os.path.exists(path):
+            return 0
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                rows = json.load(f)
+        except Exception as e:
+            if sys.stdout:
+                print(f"[WARN] 台账读取失败，改名不改台账（不影响改名本身）: {e}")
+            return 0
+        if not isinstance(rows, list):
+            return 0
+        touched = 0
+        for row in rows:
+            if isinstance(row, dict) and row.get('project_key') == old_key:
+                row['project_key'] = new_key
+                touched += 1
+        if touched:
+            _write_ledger_file(rows, path)
+        return touched
+
+
+def rename_project_media(old_key, new_key, new_title=''):
+    """把 old_key 的磁盘命名空间整体搬到 new_key 名下。
+
+    返回 {'moved', 'reason', 'old_dir_name', 'new_dir_name', 'dir', 'file_map',
+          'rewrite_failures'}。file_map 是目录内被改名的文件（旧名 → 新名），
+    调用方要拿它把创意条目里的 URL 一并改写。
+
+    没有媒体目录（还没生成过任何东西）不是错误，返回 moved=False；目标目录已存在
+    才是错误，抛 ValueError——那意味着新名字下已经有另一单的资产。
+    """
+    old_dir = _get_project_dir(old_key)
+    new_dir_name = _safe_project_name(new_key)
+    new_dir = os.path.join(OUTPUT_ROOT, new_dir_name)
+    old_dir_name = os.path.basename(os.path.normpath(old_dir))
+    blank = {'moved': False, 'old_dir_name': old_dir_name, 'new_dir_name': new_dir_name,
+             'dir': new_dir, 'file_map': {}, 'rewrite_failures': []}
+
+    if os.path.normcase(os.path.abspath(old_dir)) == os.path.normcase(os.path.abspath(new_dir)):
+        # 目录名是 _safe_project_name 截断/替换后的产物，两个不同的键完全可能落在
+        # 同一个目录名上（例如只改了标点）。这时没有任何东西需要搬。
+        return dict(blank, reason='same_dir', dir=old_dir, old_dir_name=old_dir_name)
+    if not os.path.isdir(old_dir):
+        return dict(blank, reason='no_media')
+    if os.path.exists(new_dir):
+        raise ValueError(f'目标目录 {OUTPUT_ROOT}/{new_dir_name} 已存在，拒绝改名以免两单资产混进同一个目录')
+
+    os.rename(old_dir, new_dir)
+
+    # 目录内带名字的文件：拼图（前缀是旧目录名）与合并成片（主干是旧中文主题）
+    file_map = {}
+    try:
+        for name in os.listdir(new_dir):
+            if not os.path.isfile(os.path.join(new_dir, name)):
+                continue
+            new_name = None
+            if name.startswith(old_dir_name + '_'):
+                new_name = new_dir_name + name[len(old_dir_name):]
+            elif name.lower().endswith('.mp4'):
+                m = re.match(r'^(?P<stem>.+)_(?P<slug>[^_]+)\.mp4$', name, re.IGNORECASE)
+                if m:
+                    new_name = f"{_project_merged_video_stem(new_title, new_key)}_{m.group('slug')}.mp4"
+            if not new_name or new_name == name:
+                continue
+            if os.path.exists(os.path.join(new_dir, new_name)):
+                continue        # 同名已存在就别动，宁可留着旧名字也不覆盖别的文件
+            os.rename(os.path.join(new_dir, name), os.path.join(new_dir, new_name))
+            file_map[name] = new_name
+    except Exception as e:
+        # 目录已经搬好了：文件改名失败只是名字不好看，路径改写照常进行
+        if sys.stdout:
+            print(f"[RENAME] 项目内文件改名失败（不影响目录搬迁）: {e}")
+
+    pairs = [(f'outputs/{old_dir_name}/', f'outputs/{new_dir_name}/'),
+             (f'outputs\\{old_dir_name}\\', f'outputs\\{new_dir_name}\\')]
+    pairs += list(file_map.items())
+    failures = _rewrite_project_dir_paths(new_dir, pairs)
+
+    # manifest 里的 title 不是装饰：合并成片的文件名就是从它推出来的
+    # （video_generator.merge_project_videos 取 manifest_data['title'] 再抽中文）。
+    # 不跟着改，改完名再合一次，成片又叫回旧名字——而这一轮刚把旧名的成片改成新名，
+    # 用户看到的就是"改名对成片无效"。
+    if new_title:
+        try:
+            manifest = read_manifest(new_dir)
+            if isinstance(manifest, dict) and manifest.get('title') != new_title:
+                manifest['title'] = new_title
+                write_manifest(new_dir, manifest)
+        except Exception as e:
+            failures.append(f'manifest.json(title): {e}')
+
+    return {'moved': True, 'reason': '', 'old_dir_name': old_dir_name,
+            'new_dir_name': new_dir_name, 'dir': new_dir, 'file_map': file_map,
+            'rewrite_failures': failures}
+
+
 # 封面图与帧/视频/成片一样住在项目目录里：outputs/<项目目录>/cover_<毫秒时间戳>.webp。
 # 它以前落在全局池 outputs/covers/ 下，文件名靠 <安全标题>_cover_ 前缀反查归属——
 # 于是删项目删不掉封面（要靠 delete_idea_output_files 拿着 URL 单独再删一遍）、
@@ -1588,6 +1981,12 @@ def _get_project_dir(title):
 COVER_FILENAME_PREFIX = 'cover_'
 # 迁移前的历史封面仍留在这个全局池里（见 tools/migrate_covers.py），只读不写。
 LEGACY_COVERS_DIRNAME = 'covers'
+# 一个项目会出好几张封面，三个用途未必用同一张：'project' = 项目卡片缩略图，
+# 'video' = 烧进成片首帧的那张，'frame1' = 第一帧图生图的参考图。带文案的封面适合
+# 前两者，却会把文字污染进生成帧，所以分开登记；没登记的用途回落到主封面。
+# 用户的选择落在 manifest.json 的 cover_roles / active_cover 字段里（服务端唯一真相），
+# 点子库条目里的 coverRoles / activeCoverUrl 是同一份数据的前端副本。
+COVER_ROLE_KEYS = ('project', 'video', 'frame1')
 
 
 def _is_cover_filename(name):
@@ -1608,30 +2007,66 @@ def project_cover_path(project_key, ext='webp'):
     return os.path.join(pdir, f"{COVER_FILENAME_PREFIX}{int(time.time() * 1000)}.{ext}")
 
 
+def _cover_candidate_path(raw):
+    """把一个封面 URL/路径解析成绝对路径；越界、不存在或空文件一律返回 None。
+
+    放宽到整个 outputs/：封面现在住在项目目录里，不再只有 covers/ 一处。边界仍然是
+    outputs/——外部本地文件依旧不可能被当成参考图送进模型、或被烧进成片。
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    rel = raw.strip().split('?', 1)[0]
+    if rel.startswith('data:') or '://' in rel:
+        return None
+    root = os.path.dirname(os.path.abspath(__file__))
+    outputs_dir = os.path.abspath(os.path.join(root, OUTPUT_ROOT))
+    candidate = rel if os.path.isabs(rel) else os.path.join(root, rel.lstrip('/\\'))
+    candidate = os.path.abspath(candidate)
+    try:
+        inside = os.path.commonpath([candidate, outputs_dir]) == outputs_dir
+    except ValueError:
+        return None
+    if not inside or not os.path.isfile(candidate) or os.path.getsize(candidate) == 0:
+        return None
+    return candidate
+
+
+def manifest_cover_role(project_dir, *roles):
+    """按顺序取 manifest 里登记的封面用途，返回第一个仍然存在的绝对路径。
+
+    'active_cover'（主封面）也可以作为 roles 里的一项传进来当兜底。
+    """
+    try:
+        manifest = read_manifest(project_dir) or {}
+    except Exception:
+        return None
+    mapping = manifest.get('cover_roles')
+    if not isinstance(mapping, dict):
+        mapping = {}
+    for role in roles:
+        raw = manifest.get('active_cover') if role == 'active_cover' else mapping.get(role)
+        hit = _cover_candidate_path(raw)
+        if hit:
+            return hit
+    return None
+
+
 def resolve_cover_reference(config, title, project_key=None):
     """Resolve the cover used only as frame 1's image reference.
 
     A client-selected cover wins; headless callers fall back to this project's newest cover.
     Request paths are restricted to outputs/ so arbitrary local files cannot be uploaded.
 
-    回落查找顺序：项目目录里的 cover_*（新布局）→ 全局封面池里以 <安全标题>_cover_
-    开头的那批（迁移前的历史封面）。两处都按 mtime 取最新的一张。
+    回落查找顺序：本次请求指定的那张 → manifest 里登记的 cover_roles.frame1 / 主封面
+    （无头调用与断线恢复只认磁盘上的这份）→ 项目目录里的 cover_*（新布局）→ 全局封面池
+    里以 <安全标题>_cover_ 开头的那批（迁移前的历史封面）。后两处都按 mtime 取最新的一张。
     """
     root = os.path.dirname(os.path.abspath(__file__))
     outputs_dir = os.path.abspath(os.path.join(root, OUTPUT_ROOT))
     named = (config or {}).get('coverReferencePath') if isinstance(config, dict) else None
-    if isinstance(named, str) and named.strip():
-        raw = named.strip().split('?', 1)[0]
-        candidate = raw if os.path.isabs(raw) else os.path.join(root, raw.lstrip('/\\'))
-        candidate = os.path.abspath(candidate)
-        try:
-            # 放宽到整个 outputs/：封面现在住在项目目录里，不再只有 covers/ 一处。
-            # 边界仍然是 outputs/——外部本地文件依旧不可能被当成参考图送进模型。
-            inside = os.path.commonpath([candidate, outputs_dir]) == outputs_dir
-        except ValueError:
-            inside = False
-        if inside and os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
-            return candidate
+    picked = _cover_candidate_path(named)
+    if picked:
+        return picked
 
     found = []
 
@@ -1639,6 +2074,9 @@ def resolve_cover_reference(config, title, project_key=None):
     project_dir = (project_dir if os.path.isabs(project_dir)
                    else os.path.join(root, project_dir))
     if os.path.isdir(project_dir):
+        registered = manifest_cover_role(project_dir, 'frame1', 'active_cover')
+        if registered:
+            return registered
         found += [os.path.join(project_dir, name) for name in os.listdir(project_dir)
                   if _is_cover_filename(name)]
 
@@ -1985,6 +2423,59 @@ def _project_dir_has_gallery_media(pdir):
     return False
 
 
+def resolve_gallery_media_path(raw, base_dir=None):
+    """把前端给的相对路径/URL（outputs/... 或 /outputs/...）解析成本机绝对路径。
+
+    安全边界与 gallery_delete_files 同一套：规范化后必须仍落在 outputs/ 内、
+    扩展名在媒体白名单内、且确实是个文件。不满足就抛 ValueError（附中文原因），
+    绝不返回一个越界路径——调用方会拿它去开系统文件管理器。
+    URL 可能带 ?v= 缓存版本号或百分号编码（画廊/播放器都这么拼），一并剥掉。
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError('无效路径')
+    rel = raw.strip().split('?')[0].split('#')[0]
+    rel = urllib.parse.unquote(rel).replace('\\', '/').lstrip('/')
+    if not rel:
+        raise ValueError('无效路径')
+    base_dir = base_dir or os.path.dirname(os.path.abspath(__file__))
+    out_root_abs = os.path.abspath(os.path.join(base_dir, OUTPUT_ROOT))
+    abs_p = os.path.abspath(os.path.join(base_dir, rel))
+    if not abs_p.startswith(out_root_abs + os.sep):
+        raise ValueError('路径不在 outputs/ 内')
+    if _gallery_media_type(abs_p) is None:
+        raise ValueError('仅支持定位图片/视频文件')
+    if not os.path.isfile(abs_p):
+        raise ValueError('文件不存在（可能已被删除或重新生成过）')
+    return abs_p
+
+
+def reveal_media_in_file_manager(raw, base_dir=None):
+    """在本机文件管理器里选中这个媒体文件（macOS Finder / Windows 资源管理器 /
+    Linux 文件管理器），返回它的绝对路径。
+
+    注意这动作发生在**跑服务端的那台机器**上，不是浏览器所在的机器——所以
+    server.py 那一侧只对本机来源的请求开放这个接口。
+    Linux 上没有"选中某个文件"的通用协议，退而求其次打开所在目录。
+    """
+    import subprocess
+
+    abs_p = resolve_gallery_media_path(raw, base_dir=base_dir)
+    if sys.platform == 'darwin':
+        cmd = ['open', '-R', abs_p]
+    elif os.name == 'nt':
+        # explorer 选中语法要求 /select, 与路径之间不能有空格，且必须是反斜杠路径
+        cmd = ['explorer', '/select,' + os.path.normpath(abs_p)]
+    else:
+        cmd = ['xdg-open', os.path.dirname(abs_p)]
+    try:
+        # explorer.exe 选中成功时也会返回非 0 退出码（历史行为），因此不校验返回值，
+        # 只把"根本没这个命令"这类启动失败报上去
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        raise ValueError(f'无法打开文件管理器: {e}')
+    return abs_p
+
+
 def gallery_delete_files(paths, base_dir=None):
     """删除 outputs/ 内指定的媒体文件（画廊删除接口的后端）。
 
@@ -2283,7 +2774,7 @@ LIBRARY_DIR = _path_setting('SPARK_LIBRARY_DIR', 'libraryDir', 'library')
 LIBRARY_INDEX_FIELDS = (
     'id', 'project_key', 'title', 'theme', 'english_title',
     'social_title_cn', 'social_title_en', 'timestamp', 'creativity',
-    'image_count', 'video_count', 'activeCoverUrl', 'collage_url',
+    'image_count', 'video_count', 'activeCoverUrl', 'coverRoles', 'collage_url',
     'status', 'tags', 'note', 'updated_at',
 )
 
@@ -2304,13 +2795,24 @@ def _library_item_path(item_id, library_dir=None):
     return os.path.join(items_dir, f'{safe}.json')
 
 
+def item_project_cover(item):
+    """点子库条目 → 项目卡片上显示的那张封面。
+
+    按用途登记的 coverRoles.project 优先，其次主封面 activeCoverUrl，最后是第一张。
+    （用户可能把带文案的那张指给成片首帧、把干净的那张留给项目卡片，见 COVER_ROLE_KEYS。）
+    """
+    roles = item.get('coverRoles') if isinstance(item.get('coverRoles'), dict) else {}
+    covers = item.get('covers') if isinstance(item.get('covers'), list) else []
+    return (roles.get('project') or item.get('activeCoverUrl')
+            or (covers[0] if covers else None))
+
+
 def library_index_entry(item):
     """完整条目 → 索引条目。frameRun 的帧数折成一个计数，正文全部丢弃。"""
     entry = {k: item.get(k) for k in LIBRARY_INDEX_FIELDS if k in item}
     entry['id'] = item.get('id')
     covers = item.get('covers')
-    entry['cover'] = (item.get('activeCoverUrl')
-                      or (covers[0] if isinstance(covers, list) and covers else None))
+    entry['cover'] = item_project_cover(item)
     entry['cover_count'] = len(covers) if isinstance(covers, list) else 0
     frame_run = item.get('frameRun')
     frames = frame_run.get('frames') if isinstance(frame_run, dict) else None
@@ -3727,6 +4229,10 @@ def cleanup_old_tasks():
 # 结果是失败的媒体任务完全不可见；这里改成挂成子作业，失败照样看得到）。
 MEDIA_TASK_TYPES = frozenset({'frames', 'staged_render', 'videos', 'cover'})
 
+# 复刻线的任务：同一条 job 会先 start 再 advance 好几次，每次一个 task_id。它们
+# 说的是同一个项目，必须按 job 收成一行，否则工作台上会出现 N 行同名记录。
+REPLICA_TASK_TYPES = frozenset({'replica', 'replica_advance'})
+
 _PROJECT_TITLE_PREFIXES = ('做一个', '做个', '设计一个', '设计个')
 
 
@@ -3834,6 +4340,12 @@ def _proj_asset_stats(project_key, title, base_dir):
                     cover_mtime = st.st_mtime
                     cover_rel = '/' + os.path.relpath(fpath, base_dir).replace('\\', '/')
 
+        # 用户在封面页把某一张指给了「项目封面」时，它压过上面按 mtime 挑的那张
+        # （manifest 是服务端唯一真相，没收藏进点子库的项目也照样认）
+        registered = manifest_cover_role(pdir, 'project', 'active_cover')
+        if registered:
+            cover_rel = '/' + os.path.relpath(registered, base_dir).replace('\\', '/')
+
         stats = {
             'dir': os.path.relpath(pdir, base_dir).replace('\\', '/'),
             'file_count': file_count,
@@ -3866,7 +4378,31 @@ def _proj_blank(project_key, kind='project'):
         'ledger': None,
         'sub_jobs': [],
         'assets': None,
+        # 这一行的媒体住在哪个命名空间下。默认就是行键，点子库条目会把它改写成
+        # 条目自己的 project_key（见第 2 步）——两者不一定相等。
+        'media_key': project_key if kind == 'project' else '',
     }
+
+
+def _replica_job_of(dims):
+    """任务属于哪条复刻 job。老任务（2026-08-10 之前）dimensions 里只有 theme=job_id。"""
+    if dims.get('type') not in REPLICA_TASK_TYPES:
+        return ''
+    return str(dims.get('replica_job_id') or dims.get('theme') or '').strip()
+
+
+def _replica_live_name(job_id, cache):
+    """按 job 状态现算显示名：compose 之后标题会变，任务创建时抄下的那份会过期。"""
+    if job_id in cache:
+        return cache[job_id]
+    name = ''
+    try:
+        from replica_pipeline import job_display_name
+        name = job_display_name(job_id)
+    except Exception:
+        name = ''
+    cache[job_id] = name
+    return name
 
 
 def _proj_task_view(task):
@@ -3975,18 +4511,29 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
         return task.get('result') if isinstance(task.get('result'), dict) else {}
 
     # ── 1. 激发任务：项目表的脊柱，project_key 由它产生 ──────────────────
+    replica_names = {}
     for task in tasks:
         dims = dims_of(task)
         if dims.get('type') in MEDIA_TASK_TYPES:
             continue
         result = result_of(task)
         title = result.get('title') or dims.get('task_label') or dims.get('theme') or ''
-        key = (result.get('project_key') or dims.get('project_key')
-               or make_idea_project_key(task.get('id'), title))
+        replica_job = _replica_job_of(dims)
+        if replica_job:
+            # 复刻线按 job 收行，键不能用 task_id（那会一次跑法一行）。名字现算，
+            # 好让 compose 出标题后整行跟着改名。
+            key = f"replica:{replica_job}"
+            title = _replica_live_name(replica_job, replica_names) or title
+        else:
+            key = (result.get('project_key') or dims.get('project_key')
+                   or make_idea_project_key(task.get('id'), title))
         entry = projects.setdefault(key, _proj_blank(key))
-        entry['title'] = entry['title'] or title
+        entry['title'] = title if replica_job else (entry['title'] or title)
         entry['theme'] = entry['theme'] or dims.get('theme') or ''
-        entry['task'] = _proj_task_view(task)
+        # 同一行可能对应多个任务（复刻的 start/advance，或同键重跑）：留最新的那个，
+        # 否则行上的状态/进度取决于 ACTIVE_TASKS 的遍历顺序。
+        if (entry['task'] or {}).get('last_active', -1) <= float(task.get('last_active') or 0):
+            entry['task'] = _proj_task_view(task)
         if result.get('image_count') is not None:
             entry['image_count'] = result.get('image_count')
         if result.get('video_count') is not None:
@@ -3999,17 +4546,33 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
     # ── 2. 点子库：收藏态 ────────────────────────────────────────────────
     for item in library_items:
         title = item.get('title') or ''
-        key = (item.get('project_key')
+        # 复刻线的条目必须落回它自己那条 job 行（键 replica:<job_id>，由上面的任务
+        # 循环建出来），不能另起一行：那条行的名字是按 job 状态**现算**的
+        # （_replica_live_name，一长串英文帧描述拼出来的自动名），而改名只写点子库
+        # 条目。两行并存的话，工作台上就永远躺着一条叫着旧自动名的重复项目——用户
+        # 看到的正是"改名对复刻项目无效"。合到一行后，下面那句"点子库压过任务记录"
+        # 自然让改过的名字赢。
+        replica_row = f"replica:{item.get('replica_job_id')}" if item.get('replica_job_id') else ''
+        key = ((replica_row if replica_row in projects else '')
+               or item.get('project_key')
                or lookup(f"task:{item.get('id')}",
                          *[f"title:{v}" for v in _proj_title_variants(title, item.get('theme'))])
                or make_idea_project_key(item.get('id'), title))
         entry = projects.setdefault(key, _proj_blank(key))
-        entry['title'] = entry['title'] or title
-        entry['theme'] = entry['theme'] or item.get('theme') or ''
+        # 点子库压过任务记录：任务记录是那次跑的日志（result.title 是当时模型给的
+        # 名字，此后永不变），点子库条目才是用户手上这条创意的当前状态——改名/改
+        # 主题都只写它（见 app.js renameIdeaToTheme）。让任务标题赢，工作台上就会
+        # 一直显示改名前的旧名字。空标题仍回落到任务那份。
+        entry['title'] = title or entry['title']
+        entry['theme'] = item.get('theme') or entry['theme']
         entry['saved'] = True
+        # 磁盘命名空间以条目为准，它不一定等于行键：复刻条目落在 replica:<job> 行上，
+        # 而它的媒体在 outputs/<project_key> 里。拿行键去扫资产会一无所获（改名后
+        # 目录名与标题也可能对不上，例如作业在跑时目录没搬），封面与资产统计就整片
+        # 消失——所以把条目自己的键记下来，第 5 步优先按它扫。
+        entry['media_key'] = item.get('project_key') or entry.get('media_key') or ''
         entry['timestamp'] = item.get('timestamp') or entry['timestamp']
-        covers = item.get('covers') if isinstance(item.get('covers'), list) else []
-        entry['cover'] = item.get('activeCoverUrl') or (covers[0] if covers else None) or entry['cover']
+        entry['cover'] = item_project_cover(item) or entry['cover']
         if item.get('image_count') is not None:
             entry['image_count'] = item.get('image_count')
         if item.get('video_count') is not None:
@@ -4023,7 +4586,11 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
             'frame_count': len(frame_run.get('frames')) if isinstance(frame_run.get('frames'), list) else 0,
         }
         entry['updated_at'] = max(entry['updated_at'], _proj_epoch(item.get('timestamp')))
+        # key:<project_key> —— 条目的磁盘命名空间键指向这一行。行键本身不一定等于
+        # 它（复刻条目落在 replica:<job> 行上），而帧/视频子作业是按 project_key 精确
+        # 挂接的，没有这条别名就会掉进"孤立作业"另起一行。
         bind(key, f"task:{item.get('id')}",
+             f"key:{item.get('project_key')}" if item.get('project_key') else '',
              *[f"title:{v}" for v in _proj_title_variants(title, item.get('theme'))])
 
     # ── 3. 媒体子作业：挂回母项目；挂不上的自成一行（否则失败的帧/视频任务
@@ -4046,7 +4613,8 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
         # 标题撞名只是老任务的回落（那时候子作业 dimensions 里只有一个 theme）
         key = dims.get('project_key')
         if not key or key not in projects:
-            key = lookup(*[f"title:{v}" for v in variants])
+            key = lookup(f"key:{dims.get('project_key')}" if dims.get('project_key') else '',
+                         *[f"title:{v}" for v in variants])
         if key and key in projects:
             entry = projects[key]
         else:
@@ -4087,7 +4655,8 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
             # 孤立作业行的 key 是 job:<标题>，不是合法 project_key——只能靠标题
             # 回落到 _get_project_dir 的三套历史命名去找目录
             entry['assets'] = _proj_asset_stats(
-                key if entry['kind'] == 'project' else None, entry['title'], base_dir)
+                entry.get('media_key') or (key if entry['kind'] == 'project' else None),
+                entry['title'], base_dir)
             entry['updated_at'] = max(entry['updated_at'], float(entry['assets']['latest_mtime']))
             # 点子库记的封面优先（用户可能在多张里选过一张 activeCoverUrl），
             # 没收藏过的项目才用磁盘上那张兜底

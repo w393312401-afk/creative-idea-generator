@@ -1,6 +1,6 @@
 ---
 name: gemini-omni-restoration-composer
-description: 专门为 Gemini Omni / Gemini Omni Flash 生成改造延时提示词。接受中文或英文主题、参考图片、参考视频、参考音频、现有改造 brief，也可在无主题时先用「选题发动机」批量产出源源不断、有创新和独特性的延时改造点子。输出 copy-ready 的 IMAGE anchors 和 Gemini Omni 多镜头 VIDEO prompts。强制多镜头组接，远景、全景、中景、近景、特写、结果远景轮换；禁止默认一镜到底。内部严格执行施工顺序依赖、供电链、封闭空间成因、体积守恒、累积状态与因果痕迹契约，对用户屏蔽底层复杂度。P2 去 AI 味从整体画面开始，默认偏 UGC 手机拍摄、真实可用光、轻微过曝、压缩噪点和不稳定构图。对话微调提示词仅在用户明确要求时输出。Trigger this skill when the user asks for Omni提示词, Gemini Omni prompts, Omni Flash video prompts, omni模型, 改造延时提示词, 多镜头改造视频, 反推延时视频提示词, reverse-engineering prompts from an existing restoration time-lapse video, multimodal restoration/renovation timelapse prompts for Gemini Omni, OR asks for topic ideas with 给我点子、帮我想选题、来点延时改造创意、brainstorm topics、选题发动机.
+description: 专门为 Gemini Omni / Gemini Omni Flash 生成改造延时提示词。接受中文或英文主题、参考图片、参考视频、参考音频、现有改造 brief，也可在无主题时先用「选题发动机」批量产出源源不断、有创新和独特性的延时改造点子。输出 copy-ready 的 IMAGE anchors 和 Gemini Omni 多镜头 VIDEO prompts。强制多镜头组接：单段是一条贯穿全段的主工作镜，中间被一到两个特写插入切开，再切回同一机位收尾；禁止默认一镜到底，也禁止旧的五景别轮换。内部严格执行施工顺序依赖、供电链、封闭空间成因、体积守恒、累积状态与因果痕迹契约，对用户屏蔽底层复杂度。P2 去 AI 味从整体画面开始，默认偏 UGC 手机拍摄、真实可用光、轻微过曝、压缩噪点和不稳定构图。对话微调提示词仅在用户明确要求时输出。Trigger this skill when the user asks for Omni提示词, Gemini Omni prompts, Omni Flash video prompts, omni模型, 改造延时提示词, 多镜头改造视频, 反推延时视频提示词, reverse-engineering prompts from an existing restoration time-lapse video, multimodal restoration/renovation timelapse prompts for Gemini Omni, OR asks for topic ideas with 给我点子、帮我想选题、来点延时改造创意、brainstorm topics、选题发动机.
 ---
 
 # Gemini Omni Restoration Composer
@@ -11,7 +11,7 @@ This skill creates copy-ready Gemini Omni / Gemini Omni Flash prompt packs for r
 
 It is a parallel Omni-specific companion to `gemini-veo-restoration-composer`. Do not modify or depend on that skill at runtime. Its production contracts have been absorbed into this skill's own references — adjacent IMAGE anchors, clean static frames, single-operation beats, visible causal traces, construction dependency order, and a Chinese audit report.
 
-The Omni-specific difference is mandatory: every VIDEO prompt uses a multi-shot edit pattern with **stated cut marks**. Do not default to one-take, oner, single continuous take, or one-shot language. The video grammar is a shot ladder sized by clip length — six shots at 10s (establishing long, full, medium, close-up, extreme close-up, wide outro), down to three at 4s (establishing long, medium, wide outro). The ladder table, the never-dropped rungs, and the timeline sentence that pins the cut marks to seconds all live in `references/omni-multishot-language.md`.
+The Omni-specific difference is mandatory: every VIDEO prompt uses a multi-shot edit pattern with **stated cut marks**. Do not default to one-take, oner, single continuous take, or one-shot language. The video grammar is **one sustained wide working shot, cut open by one or two close-up inserts, then cut back to the same camera setup to land** — three shots at 4s and 6s, four at 8s and 10s. It is not a shot-scale rotation; the retired names `establishing long shot`, `full shot`, `medium shot`, and `wide outro shot` are banned. The structure table, the same-camera-setup rule, and the timeline sentence that pins the cut marks to seconds all live in `references/omni-multishot-language.md`.
 
 The realism difference is also mandatory: de-AI polish starts from the whole image capture style. Unless the user requests polished cinema, default the pack toward UGC-like phone footage, real available light, slight framing instability, overexposed highlight patches, phone auto-exposure shifts, low-light noise, mild compression, and imperfect focus behavior.
 
@@ -19,7 +19,7 @@ The realism difference is also mandatory: de-AI polish starts from the whole ima
 
 These three pairs of rules pull against each other. They are resolved here once, and the resolution is binding everywhere else.
 
-1. **Six-shot grammar beats every single-take instinct.** There is no exemption for the final reward beat, no exemption for a threshold crossing, and no exemption for a "simple" beat. Reveal pushes and forward moves happen as motion *inside* shots.
+1. **Cut coverage beats every single-take instinct, and the insert beats every scale-rotation instinct.** There is no exemption for the final reward beat, no exemption for a threshold crossing, and no exemption for a "simple" beat: every clip is cut. Equally, no beat earns extra shot scales — more clip length buys a second insert and a longer main shot, never another rung. Reveal pushes and forward moves happen as motion *inside* the main working shot.
 2. **Landmarks are locked; framing is loose.** The UGC layer buys handheld tilt, off-centre composition, focus hunting, and exposure pumping. It never buys a primary landmark leaving frame, changing its relationship to another landmark, or changing its frame share between anchors. Full rule in `references/omni-scene-skeleton.md`.
 3. **Counts are mandatory; digits are banned.** Write `three roof beams`, never `3 roof beams` and never `70%`. Numerals and percent symbols in a prompt are a leading cause of literal text rendering into the frame. Full rule in `references/omni-output-templates.md`.
 
@@ -45,7 +45,7 @@ Load only the reference files needed for the request.
 **Always load, every composition run:**
 
 - `references/omni-scene-skeleton.md`: Six-dimensional Omni scene skeleton, UGC phone-capture realism, Location DNA vs. Shot Ladder, anchor stability boundary, frame density.
-- `references/omni-multishot-language.md`: Mandatory far/full/medium/close/extreme-close/wide-outro grammar, pacing declaration, direct worker action from zero seconds, phrasing variation.
+- `references/omni-multishot-language.md`: Mandatory main-working-shot plus close-up insert grammar, same-camera-setup rule, pacing declaration, direct worker action from zero seconds, phrasing variation.
 - `references/omni-restoration-continuity.md`: Continuity, single-operation beats, construction dependency order and hard vetoes, causal traces, occlusion handling, persistent site plant, worker identity lock.
 - `references/omni-beat-skeleton.md`: Internal planning layer — temporal physics skeleton, visible milestone package rule, spatial anchoring without coordinates, object persistence.
 - `references/omni-damage-vocabulary.md`: Before-state pathology for IMAGE 1; banned soft-focus words.
@@ -128,7 +128,7 @@ The dopamine is contrast held in tension: raw huge untouched outside vs. refined
 ### Algorithm
 
 1. **Recombine** — draw one entry from each of the five orthogonal axes: `CARRIER`, `ENVIRONMENT`, `TRAUMA`, `DESTINY`, `SIGNATURE TWIST`. Rotate the carrier *family* (natural → man-made → vehicle → fantasy-grounded) so no two ideas in a batch share a shell family.
-2. **Filter**, in order — Orthogonal-Pairing Rule, mandatory single twist, dedup vs. `references/used-topic-ledger.md`, Cliché Blocklist, Buildability Gate, Realism Gate, **Six-Shot Coverage Gate**, Scroll-Stop Test. Drop any candidate that fails.
+2. **Filter**, in order — Orthogonal-Pairing Rule, mandatory single twist, dedup vs. `references/used-topic-ledger.md`, Cliché Blocklist, Buildability Gate, Realism Gate, **Two-Distance Coverage Gate**, Scroll-Stop Test. Drop any candidate that fails.
 3. **Score & rank** — rate each survivor on Novelty, Visual Contrast, Twist Strength, Buildability, Scroll-Stop; output the top N (default 8).
 4. **Honor constraints** — if the user pins an axis, lock it and recombine the other four.
 5. **Deliver** the Idea-Engine Output Contract table, each row carrying a paste-ready Tier-1 input string, and close with: **「回复任意编号，我直接把它生成完整的 Omni 多镜头提示词包」**.
@@ -179,24 +179,23 @@ Review discipline:
 
 ### `timelapse_beats.json` Contract
 
-Create `timelapse_beats.json` in the job directory before writing any prompt. Root fields: `video_duration_sec`, `beats[]`, and `banned_elements[]` — a list of objects, tools, materials, workers, or operations that a renovation of this type would plausibly involve but that are NOT visible in any reviewed frame. Banned elements must not appear in any IMAGE or VIDEO prompt.
+Create `timelapse_beats.json` in the job directory before writing any prompt.
 
-Each beat must include:
-- `id`, `start`, `end`
-- `visual_subject`, `visible_details`, `visible_action`, `visible_result` — only what frames actually show
-- `state_before`, `state_after` — concrete spatial completion extent (for example `left two-thirds of the wall primed, right third bare plaster`)
-- `persistent_traces` — traces this beat leaves that the next state must inherit
-- `workers_present` — whether workers/machines are visible in this beat's frames; used to pick clean frames as IMAGE anchor candidates
-- `source_event_ids` — every `change_events` entry from `video_overview.json` that this beat accounts for
-- `evidence_frames` — at least 1 (ideally 3) concrete `review_XXX.png` or `scene_XXX_*.png` filenames whose timestamps fall inside the beat window; required for every beat that claims an action or result
+**The field contract lives in `references/timelapse-beats.schema.json` — that file is the single source of truth.** Read it before writing the file; do not restate its fields here or anywhere else. The same schema is imported by the app's `replica_pipeline` so that manual reverse-engineering in chat and automated reverse-engineering in the app cannot drift apart.
 
-After mapping beats, check that every `change_events` entry appears in exactly one beat's `source_event_ids`, and check the observed order against the Construction Sequence Logic. If the observed order seems to violate a hard veto (for example paint before primer), re-inspect the frames first — the more likely explanation is a misread frame, not an impossible build.
+What the schema cannot enforce, and you must:
+
+- Only what the frames actually show. Inference, common sense, and industry habit are not observations.
+- `banned_elements[]` is the inverse list: things a renovation of this type would plausibly involve but that appear in no reviewed frame. They must not appear in any IMAGE or VIDEO prompt.
+- `state_before` / `state_after` must state concrete spatial completion extent (for example `left two-thirds of the wall primed, right third bare plaster`), never `partially done`.
+- Every `change_events` entry must appear in exactly one beat's `source_event_ids`.
+- Check the observed beat order against the Construction Sequence Logic. If the observed order seems to violate a hard veto (for example paint before primer), re-inspect the frames first — the more likely explanation is a misread frame, not an impossible build.
 
 ### Stage 2 Mapping To The Prompt Pack
 
 - Beats become the production beat ladder; split any beat containing more than one dominant physical operation, and expand any beat whose result is only a token patch.
 - IMAGE anchors come from clean frames (`workers_present: false`) at or near beat boundaries. The anchor description must match the evidence frame's actual state, including its `persistent_traces`.
-- Each VIDEO prompt covers exactly one beat, rendered as this clip length's mandatory shot ladder; the close-up and extreme close-up (where the ladder has them) must use the beat's actual visible tool contact and traces.
+- Each VIDEO prompt covers exactly one beat, rendered as this clip length's mandatory shot structure; the inserts must use the beat's actual visible tool contact and traces.
 - `state_before` / `state_after` become the anchor delta; `persistent_traces` feed the cumulative state rules.
 - `banned_elements` is enforced during the P0 gate: any banned element appearing in a prompt is a rewrite-before-delivery failure.
 - All normal output contract rules and audit gates still apply.
@@ -212,7 +211,7 @@ After mapping beats, check that every `change_events` entry appears in exactly o
 5. Register a **Material Palette Lock** for the three to five materials that occupy meaningful frame area. Give each an immutable `substrate` phrase and a monotonic `state_track`; copy the substrate wording verbatim whenever that material is visible and advance its state only in the beat that works it. Then draft the internal progress ledger: for each anchor, the cumulative installed items, counts of major countable elements, completion extent, lighting phase, inherited traces, shell envelope, and current material states. Never include the ledger itself in the output.
 6. Create IMAGE anchors for the before state, each progressive state, and the final reward state. IMAGE anchors are clean frames at full-shot scale with no active workers or machinery. IMAGE 1 uses the three-part damage pattern from `references/omni-damage-vocabulary.md`. Every post-crossing interior IMAGE restates the envelope signature, roof form, aperture constraints, wall material, and at least one fixed structural carrier landmark; every IMAGE restates the visible materials' immutable substrate phrases.
 7. Create VIDEO prompts between adjacent IMAGE anchors. Every VIDEO starts by binding IMAGE N as first frame and IMAGE N+1 as last frame.
-8. Render each VIDEO as a multi-shot sequence in natural prose at this clip length's ladder size, carrying the shot timeline sentence right after the anchor-binding sentence. At zero seconds the worker is already at the active work face and begins the first effective action immediately; keep work visible through the wide outro and never allocate a shot to entering or exiting.
+8. Render each VIDEO as a main working shot plus this clip length's one or two close-up inserts, in natural prose, carrying the shot timeline sentence right after the anchor-binding sentence. At zero seconds the worker is already at the active work face and begins the first effective action immediately; keep work visible through the returning wide shot and never allocate a shot to entering or exiting.
 9. Apply the lighting phase, passive environment, and audio layers from `references/omni-lighting-environment-audio.md`.
 10. Apply the UGC de-AI capture layer to both IMAGE and VIDEO prompts before wording polish.
 11. (Optional, only when the user explicitly requests 对话微调提示词) Add two to three conversational edit prompts for Gemini Omni follow-up refinement.
@@ -225,16 +224,16 @@ After mapping beats, check that every `change_events` entry appears in exactly o
 
 ### Multi-Shot Contract
 
-Every VIDEO prompt must contain this clip length's full shot-scale ladder, in order, plus the timeline sentence that states where each cut falls:
+Every VIDEO prompt is one sustained working shot cut open by inserts, plus the timeline sentence that states where each cut falls:
 
-| Clip length | Shots | Ladder |
+| Clip length | Shots | Structure |
 |---|---|---|
-| 4s | 3 | establishing long, medium, wide outro |
-| 6s | 4 | establishing long, medium, close-up, wide outro |
-| 8s | 5 | establishing long, full, medium, close-up, wide outro |
-| 10s | 6 | establishing long, full, medium, close-up, extreme close-up, wide outro |
+| 4s | 3 | wide working shot, close-up insert, returning wide shot |
+| 6s | 3 | wide working shot, close-up insert, returning wide shot |
+| 8s | 4 | wide working shot, close-up insert, extreme close-up insert, returning wide shot |
+| 10s | 4 | wide working shot, close-up insert, extreme close-up insert, returning wide shot |
 
-The establishing long shot, the medium shot, and the wide outro shot are never dropped at any length. Threshold bridge and reward videos use their own three-station ladders. A dropped rung hands its duties to its neighbour — see `references/omni-multishot-language.md`.
+The first and last shots are the **same camera setup**, differing only in how far the work has got, and the last shot says so verbatim. The main working shot carries this beat's entire visible advance; the inserts carry contact and traces and advance nothing. At 4s and 6s the single insert also carries the two persistent traces. Threshold bridge and reward videos keep their own three-station ladders. Full rules in `references/omni-multishot-language.md`.
 
 Use clean cuts or match cuts between shots. Do not use cross-dissolve, fade-in, magical transition, instant transformation, montage replacement, or scene teleport language.
 
@@ -306,7 +305,7 @@ Full statements and rationale in `references/omni-restoration-continuity.md`.
 Timelapse must compress time, but only through legal channels. If the prompt offers no legal compression path, the model invents illegal ones — instant completion and pop-in.
 
 - Delta budget: one VIDEO may only carry a plausible amount of change. If an operation alters more than roughly one-third of the visible frame area, or could not believably progress that far within one short video, split the same operation into consecutive quantified beats. Split by extent — never by shrinking the milestone to a token patch.
-- Shot-level progress lock: shot 1 shows exactly IMAGE N with zero new progress; shot 2 is staging only; shot 3 advances the beat's change from zero to roughly three quarters through repeated visible work cycles; shots 4 and 5 examine ongoing contact and existing traces without advancing the state; shot 6 lands exactly on IMAGE N+1.
+- Shot-level progress lock: the main working shot opens on exactly IMAGE N with zero new progress and then advances the beat's change from zero to roughly three quarters through repeated visible work cycles; each insert examines ongoing contact or existing traces without advancing the state; the returning wide shot lands exactly on IMAGE N+1.
 - Cuts carry no progress: every shot opens at the completion level the previous shot ended with.
 - First occurrence on camera: the first instance of every change type must appear in full with its causal chain. A cut may compress only repetitions of an action already shown once, and the prose must say so.
 - Monotonicity: construction state never regresses, across shots or across anchors.
@@ -409,8 +408,9 @@ Rules:
 
 ### P0 - Rewrite Before Delivery
 
-- Any VIDEO lacks this clip length's full shot ladder, or lacks the shot timeline sentence.
-- Any VIDEO names a shot scale that is not in this clip length's ladder (six scales crammed into a four second clip pushes every shot under a second and reads as flicker).
+- Any VIDEO lacks this clip length's full shot structure, or lacks the shot timeline sentence.
+- Any VIDEO names a shot scale that is not in this clip length's structure — in particular the retired `establishing long shot`, `full shot`, `medium shot`, or `wide outro shot`.
+- The returning wide shot does not state that it is the same camera setup as the opening wide working shot, or is framed differently from it.
 - Any VIDEO defaults to one-take / oner / one-shot language.
 - Any ordinary beat combines more than one dominant physical operation.
 - Any ordinary beat delivers only a token patch, a one-corner edit, or a merely-begun state instead of one full named milestone.
@@ -431,7 +431,7 @@ Rules:
 - Any prompt body contains a percent symbol, an arabic numeral used as a count, coordinate notation, or an internal acronym.
 - IMAGE 1 uses a banned soft-focus word (`worn`, `aged`, `dirty`, `messy`, `in disrepair`) as its primary damage descriptor.
 - An enclosed interior prompt mentions a horizon, sky, clouds, or weather.
-- A primary landmark leaves frame in shot 1, 2, or 6, or changes its relationship to another landmark between anchors.
+- A primary landmark leaves frame in the main working shot or the returning wide shot, or changes its relationship to another landmark between anchors.
 - The lighting phase skips a step, regresses, or advances without an on-camera physical cause.
 - Any interior IMAGE omits the verbatim envelope signature or single roof-form clause, contains an opening absent from the aperture ledger, contains an item on the aperture denylist, or contradicts the exterior roof pitch.
 - Any visible registered material omits or rewords its immutable substrate phrase, advances state in a beat that does not work it, skips a state, or moves backward.
@@ -441,10 +441,10 @@ Rules:
 
 ### P1 - Strengthen Before Delivery
 
-- Shot scales repeat instead of rotating far/full/medium/close/extreme-close/wide.
-- The close-up lacks tool contact or material deformation.
-- The extreme close-up lacks lasting trace evidence.
-- The extreme close-up traces are not characteristic products of the current operation (roller work must leave roller stipple, not weld beads).
+- The inserts are the same framing and subject as each other instead of stepping from contact to trace.
+- The close-up insert lacks tool contact or material deformation.
+- The last insert lacks lasting trace evidence (at 4s and 6s that duty sits on the single close-up insert).
+- The insert traces are not characteristic products of the current operation (roller work must leave roller stipple, not weld beads).
 - A hand tool is described vaguely instead of with specific colour, geometry, and material.
 - Bulk materials appear without staging or visible delivery, or removed debris disappears without visible removal.
 - Wet material at the end of a VIDEO is not shown cured or dried in the next IMAGE anchor.
@@ -452,13 +452,13 @@ Rules:
 - Above-reach work lacks a ladder or scaffold, or a single worker handles a load beyond one-person capacity.
 - Erected scaffolding, formwork, or shoring appears or vanishes between anchors without a named erection or strike beat; or unset concrete is shown without its formwork.
 - A shot opens with more progress than the previous shot ended with (a cut carries progress).
-- Result-state wording appears before the wide outro shot.
+- Result-state wording appears before the returning wide shot.
 - Major countable elements lack counts, or counts drift between shots or anchors without on-camera cause.
 - State regresses anywhere.
 - Lighting, environment, or style does not persist across adjacent anchors.
 - The passive environmental layer changes direction between clips, or repeats verbatim instead of escalating its observational detail.
 - Audio is vague, or the SFX belongs to a different trade than the operation shown; the final reward lacks named-material footsteps.
-- Any wide or establishing shot lacks a foreground / background depth layer, a large flat surface is left as a uniform low-density fill, an anchor reads as an empty frame, or a persistent environmental dressing element drifts, appears, or vanishes between anchors.
+- The main working shot or the returning wide shot lacks a foreground / background depth layer, a large flat surface is left as a uniform low-density fill, an anchor reads as an empty frame, or a persistent environmental dressing element drifts, appears, or vanishes between anchors.
 - The UGC capture layer is vague, generic, or limited to the word `realistic` without concrete phone-camera artifacts.
 - A reflective surface is described as sharp or mirror-like instead of low-gloss and defocused.
 - Sentence templates, clause order, or verb sets repeat beat after beat beyond the required fixed structural sentences.
@@ -471,7 +471,7 @@ Rules:
 
 - Remove weak image-model filler such as `8k`, `masterpiece`, generic `photorealistic`, or token-stuffing adjectives.
 - Actively filter and scrub "AI-style" buzzwords like "perfect", "flawless", "seamless", "pristine", "clean CGI style", "high-end render", or "perfectly aligned".
-- Scrub instant-transformation wording from mid-video positions: "transforms", "becomes", "now features", "is now complete", "suddenly", "reveals". Shots 2 through 5 use progressive partial-state phrasing (`-ing` verbs, "partially", "half-covered", "growing"); finished-state descriptions belong only in shot 6 and the IMAGE anchors.
+- Scrub instant-transformation wording from mid-video positions: "transforms", "becomes", "now features", "is now complete", "suddenly", "reveals". The main working shot and the inserts use progressive partial-state phrasing (`-ing` verbs, "partially", "half-covered", "growing"); finished-state descriptions belong only in the returning wide shot and the IMAGE anchors.
 - De-AI from the whole image first: default the capture style toward UGC-like phone footage or casual documentary phone stills unless the user explicitly asks for polished cinema, luxury commercial, or studio production.
 - Specify imperfect capture artifacts: handheld phone framing, slight horizon tilt, edge softness, rolling-shutter wobble, autofocus breathing, minor motion blur, sensor noise, mild compression, chromatic aberration, mixed color temperature, crushed shadows, and small blown-highlight patches.
 - Prefer real available light over ideal lighting: window glare, harsh overhead bulbs, temporary work lights, doorway backlight, visible color cast, exposure pumping, and uneven shadow falloff are better than clean studio or flat HDR illumination.

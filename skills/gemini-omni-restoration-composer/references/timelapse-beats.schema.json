@@ -1,0 +1,121 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "timelapse-beats.schema.json",
+  "title": "timelapse_beats.json",
+  "description": "反推模式（Tier 4）Stage 1 的唯一交付契约。对话里的 Claude 手工反推、以及 app 内 replica_pipeline 的自动反推，都以本文件为准。不要在别处再写一份字段说明——SKILL.md 只描述纪律，字段以此为准。",
+  "type": "object",
+  "required": ["video_duration_sec", "beats", "banned_elements"],
+  "additionalProperties": true,
+  "properties": {
+    "video_duration_sec": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "source_video": {
+      "type": "string",
+      "description": "源视频绝对路径。二创产出的变体 beats 保留它，用于回溯参考帧。"
+    },
+    "variant_of": {
+      "type": ["string", "null"],
+      "description": "非空表示这是二创变体，值为原始 beats 的 pipeline_id。1:1 复刻恒为 null。"
+    },
+    "mutation_axes": {
+      "type": "array",
+      "description": "二创专用：本变体实际改动的轴。1:1 复刻为空数组。",
+      "items": {
+        "type": "string",
+        "enum": ["carrier", "environment", "material", "pacing", "reward"]
+      },
+      "maxItems": 2
+    },
+    "banned_elements": {
+      "type": "array",
+      "description": "此类改造「合理会有」但任一被审查帧里都没出现的对象/工具/材料/工种/工序。P0 门禁据此判定：出现在任何 IMAGE/VIDEO 提示词里即交付前必须重写。",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "beats": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/definitions/beat" }
+    }
+  },
+  "definitions": {
+    "beat": {
+      "type": "object",
+      "required": [
+        "id", "start", "end",
+        "visual_subject", "visible_details", "visible_action", "visible_result",
+        "state_before", "state_after", "persistent_traces", "package_operations",
+        "workers_present", "source_event_ids", "evidence_frames"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^B[0-9]{2,}$",
+          "description": "B01、B02……按时间顺序，不跳号。"
+        },
+        "start": { "type": "number", "minimum": 0 },
+        "end": { "type": "number", "minimum": 0 },
+        "visual_subject": { "type": "string", "minLength": 1 },
+        "visible_details": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "description": "只写帧里真实可见的。推断、常识补全、行业惯例一律不算。"
+        },
+        "visible_action": { "type": "string", "minLength": 1 },
+        "visible_result": { "type": "string", "minLength": 1 },
+        "state_before": {
+          "type": "string",
+          "minLength": 1,
+          "description": "具体的空间完成度，例如「墙面左三分之二已上底漆，右三分之一仍是裸抹灰」。不接受「部分完成」这类含糊表述。"
+        },
+        "state_after": { "type": "string", "minLength": 1 },
+        "persistent_traces": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 2,
+          "description": "本拍留下、必须被后续状态继承的痕迹。下界 2 不是本文件的发明——合成器的 frame-state 硬闸就是这么判的（prompt_pipeline/frame_state.py），少于两条会在合成前被打回。"
+        },
+        "package_operations": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 3,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "共同产出同一个终端成果的 2~3 道紧密耦合工序（例如 [\"cut\", \"fit\", \"fasten\"] 共同产出一面封好的吊顶）。一个拍只申报一道工序 = 拍粒度过细，合成器会判死。上下界的权威来源是 prompt_pipeline/frame_state.validate_frame_state_contract 的 min/max_package_operations 默认值。"
+        },
+        "workers_present": {
+          "type": "boolean",
+          "description": "本拍证据帧里是否有工人/机械。false 的帧才是 IMAGE 锚点候选。"
+        },
+        "source_event_ids": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^E[0-9]{2,}$" },
+          "description": "本拍认领的 video_overview.json change_events 条目。每个事件必须且只能被一拍认领。"
+        },
+        "evidence_frames": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "review_XXX.png / scene_XXX_*.png 文件名，时间戳须落在 [start, end] 内。凡断言了动作或结果的拍，此项必填。"
+        },
+        "reference_frames": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "二创专用：原片对应帧，仅作运镜与构图参考，不再是事实断言。变异时由 evidence_frames 改名而来。"
+        },
+        "operation": {
+          "type": ["string", "null"],
+          "description": "本拍的主导物理工序（单一）。用于施工依赖顺序校验。"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Pass A 帧事实置信度在本拍上的聚合。低于 0.5 的拍在 review_beats 里高亮待人工核对。"
+        }
+      }
+    }
+  }
+}

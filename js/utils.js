@@ -17,6 +17,33 @@ function _setAccessHeader(init, code) {
     return init;
 }
 
+// 在本机文件管理器（macOS Finder / Windows 资源管理器 / Linux 文件管理器）里
+// 选中某个 outputs/ 下的媒体文件。传相对路径或播放地址都行（带 ?v= 版本号也行，
+// 服务端会剥掉）。打开的是**跑服务端那台机器**的桌面，因此远程访问时服务端会
+// 回 403，这里照原样把它的中文说明弹给用户，而不是含糊的"失败"。
+async function revealLocalFile(pathOrUrl, label) {
+    if (!pathOrUrl) {
+        showToast('没有可定位的本地文件', 'error');
+        return false;
+    }
+    try {
+        const res = await fetch('/api/reveal_file', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: pathOrUrl }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || (data && data.status !== 'ok')) {
+            throw new Error((data && data.message) || ('HTTP ' + res.status));
+        }
+        showToast(`已在文件管理器中定位${label ? `「${label}」` : ''}`, 'success');
+        return true;
+    } catch (e) {
+        showToast(`定位本地文件失败：${e.message}`, 'error');
+        return false;
+    }
+}
+
 function copyText(text) {
     if (navigator.clipboard && window.isSecureContext) {
         return navigator.clipboard.writeText(text);

@@ -67,6 +67,12 @@ async function initServerMode() {
         if (typeof syncIdeationSkillProfilePicker === 'function') {
             syncIdeationSkillProfilePicker();
         }
+        // 质量门禁总表（server_common.GATE_SETTINGS）：配置中心的开关面板照它渲染。
+        // 与 skill_profile_rules 同一个约定——表在服务端，前端只渲染不复制。
+        if (m && Array.isArray(m.gate_settings)) {
+            window.GATE_SETTINGS_SPEC = m.gate_settings;
+            if (typeof renderGateSettingsPanel === 'function') renderGateSettingsPanel();
+        }
         // 服务代码已过期：这个进程仍在跑旧代码，磁盘上已经有更新的核心文件没生效——
         // 常见于"改完代码就直接复跑同一个任务，忘了先重启服务"。不区分改动是否与
         // 本次任务相关：宁可偶尔提示一次不必要的重启，也不要让"修复已经落盘但没生效"
@@ -172,6 +178,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setupEventListeners();
     setupDragAndDrop();
     initDebugLimitControls();
+    initCoverBurnControl();
     resumeActiveTaskIfExists();
     resumeActiveBackgroundTasksIfExists();
     startGlobalTasksBadgePolling();
@@ -276,6 +283,7 @@ function switchMainTab(tabName) {
         projects: document.getElementById('panel-projects'),
         gallery: document.getElementById('panel-gallery'),
         ledger: document.getElementById('panel-ledger'),
+        replica: document.getElementById('panel-replica'),
     };
     const buttons = {
         config: document.getElementById('main-tab-config'),
@@ -284,6 +292,7 @@ function switchMainTab(tabName) {
         projects: document.getElementById('main-tab-projects'),
         gallery: document.getElementById('main-tab-gallery'),
         ledger: document.getElementById('main-tab-ledger'),
+        replica: document.getElementById('main-tab-replica'),
     };
 
     Object.keys(panels).forEach((key) => {
@@ -311,6 +320,11 @@ function switchMainTab(tabName) {
     if (typeof projectsTabEntered === 'function') {
         if (tab === 'projects') projectsTabEntered();
         else if (typeof projectsTabLeft === 'function') projectsTabLeft();
+    }
+    // 爆款复刻：进入时拉一次任务列表。没有轮询——这条线的长耗时阶段全部走 SSE，
+    // 停在人工卡点后页面是静止的，轮询只会白烧请求。
+    if (tab === 'replica' && typeof replicaTabEntered === 'function') {
+        replicaTabEntered();
     }
 }
 
@@ -415,7 +429,7 @@ function startLoadingTimer(startTimeOverride = null) {
     if (terminalBody) {
         terminalBody.innerHTML = '<span class="terminal-cursor"></span>';
         resetLiveTerminal();
-        appendLiveTerminal("[SYSTEM] Initializing creative idea engine...\n[SYSTEM] Loading restoration-prompt-composer contract...\n");
+        appendLiveTerminal("[SYSTEM] Initializing creative idea engine...\n[SYSTEM] Loading skill contract...\n");
     }
 
     clearLiveBeatsPanel();
@@ -1313,6 +1327,7 @@ function setupEventListeners() {
     document.getElementById('copy-prompt-btn-all').addEventListener('click', copyPromptToClipboard);
     document.getElementById('copy-tiktok-meta-btn').addEventListener('click', copyTikTokMetaToClipboard);
     document.getElementById('copy-tiktok-meta-cn-btn').addEventListener('click', copyTikTokMetaCnToClipboard);
+    document.getElementById('gen-project-meta-btn')?.addEventListener('click', generateProjectMetaForCurrentIdea);
     // 手机端标题区折叠开关：折叠态只留一行英文主标题（话题串与中文标题行藏起来），
     // 让封面/帧序列能上首屏。class 常驻 DOM，桌面端的 CSS 不理会它，所以按钮本身
     // 也只在 ≤768px 显示。
@@ -1380,6 +1395,10 @@ function setupEventListeners() {
     const importFile = document.getElementById('import-file');
     importBtn.addEventListener('click', () => importFile.click());
     importFile.addEventListener('change', importLibrary);
+
+    // 同一排工具条上的「📥 上传提示词集」：导入一份外部提示词集 = 新建一个项目
+    // （格式不合槽位契约时自动补全），见 js/prompt_import.js
+    if (typeof initPromptImport === 'function') initPromptImport();
 }
 
 // --- 任务状态：只剩 header 角标这一路 -------------------------------------
@@ -1721,10 +1740,10 @@ window.clearTasks = clearTasks;
 
 // Compose the full skill-grade prompt set via the server-side skill shell.
 // The GUI only collects dimensions; the server runs them through the real
-// restoration-prompt-composer contract and relays to the local LLM proxy.
+// gemini-veo-restoration-composer contract and relays to the local LLM proxy.
 // Compose the full skill-grade prompt set via the server-side skill shell.
 // The GUI only collects dimensions; the server runs them through the real
-// restoration-prompt-composer contract and relays to the local LLM proxy.
+// gemini-veo-restoration-composer contract and relays to the local LLM proxy.
 async function generateIdea(retryParams = null) {
     const badge = document.getElementById('api-status-badge');
     if (badge && badge.classList.contains('offline')) {
@@ -3199,6 +3218,182 @@ function copyTikTokMetaCnToClipboard() {
     });
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+   一键生成中英双版主题和 tags（结果页标题行的 ✨）
+
+   正常激发的单子在收尾就带上了这些字段（server.background_worker 调
+   generate_social_titles）。手动上传的提示词集走的是另一条路：js/prompt_import.js
+   直接建条目，theme 只能填成标题（往往就是个文件名）、两行发布标题留空——工作台
+   那一行于是既没主题也没话题。这里补的就是这一步，且刻意以**提示词集正文**为依据
+   送给模型（见 prompt_pipeline.generate_project_meta），而不是只递一个标题过去。
+
+   已有值不静默覆盖：这两行是要粘进发布框的文案，用户可能已经手改过。
+
+   项目名跟着新主题一起改，本地目录与目录里的文件也跟着改（见 renameIdeaToTheme）：
+   磁盘命名空间取的是 project_key || title（getIdeaSaveTitle），只改条目里的标题、
+   不动磁盘，下一次按新名字去找帧/视频/封面只会找到一个空目录——已生成的资产在界面
+   上凭空消失。目录搬迁与目录内 json 的路径改写全在服务端一次做完
+   （/api/project/rename），这里只负责把回来的改名清单套到创意条目的 URL 上。
+   ────────────────────────────────────────────────────────────────────────── */
+
+// 项目目录换名之后，条目里那些指向旧目录的 URL 全都失效。服务端回的
+// old_dir_name/new_dir_name/file_map 就是全部改动，照着替换即可。
+// 只走媒体字段：提示词/审核报告是正文，正文里碰巧出现同名字符串也不该被改。
+const IDEA_MEDIA_URL_FIELDS = ['covers', 'activeCoverUrl', 'coverRoles', 'collage_url',
+                               'cover_url', 'frameRun'];
+
+function rewriteIdeaMediaUrls(idea, plan) {
+    const pairs = [[`outputs/${plan.old_dir_name}/`, `outputs/${plan.new_dir_name}/`]]
+        .concat(Object.entries(plan.file_map || {}));
+    const swap = (s) => pairs.reduce((acc, [a, b]) => (a && a !== b ? acc.split(a).join(b) : acc), s);
+    const walk = (node) => {
+        if (typeof node === 'string') return swap(node);
+        if (Array.isArray(node)) return node.map(walk);
+        if (node && typeof node === 'object') {
+            Object.keys(node).forEach(k => { node[k] = walk(node[k]); });
+        }
+        return node;
+    };
+    IDEA_MEDIA_URL_FIELDS.forEach(f => { if (idea[f] != null) idea[f] = walk(idea[f]); });
+}
+
+/**
+ * 把项目名同步成新主题，并让服务端把本地目录/文件一起改掉。
+ *
+ * 目录搬不搬 ≠ 名字改不改：这一单还有帧/视频作业在跑时目录不能搬（worker 攥着
+ * 旧目录路径），但名字照改——服务端会把旧键回给我们钉进 project_key，磁盘命名
+ * 空间从此不再跟着标题走，资产一张都不丢（见 server.py /api/project/rename）。
+ *
+ * 返回 {renamed, from, to, reason, plan}——reason 是没改名的原因，调用方要如实
+ * 报给用户，不能让"名字没变"看起来像什么都没发生。
+ */
+async function renameIdeaToTheme(idea, newTitle) {
+    const from = idea.title || '';
+    const to = String(newTitle || '').trim();
+    if (!to || to === from) return { renamed: false, from, to, reason: '' };
+    if (Array.isArray(savedIdeas) && savedIdeas.some(it => it.id !== idea.id && it.title === to)) {
+        return { renamed: false, from, to, reason: `点子库里已有同名创意「${to}」` };
+    }
+
+    let plan;
+    try {
+        // getIdeaSaveTitle 给的就是当前的磁盘命名空间键（没有 project_key 的老创意
+        // 用的是标题本身），服务端按它定位要搬的目录
+        plan = await slotPostJson('/api/project/rename', {
+            project_key: getIdeaSaveTitle(idea),
+            new_title: to,
+        });
+    } catch (e) {
+        // 目录没搬成就绝不能改名：改了名字，界面就再也找不到旧目录里的资产了
+        return { renamed: false, from, to, reason: `本地目录改名失败：${e.message}` };
+    }
+
+    idea.title = to;
+    // 无论目录搬没搬，回来的这个键都要钉进条目里当磁盘命名空间：
+    //   · 搬了 —— 它是新目录名对应的新键；
+    //   · 没搬（还有作业在跑 / 这一单还没生成过任何媒体）—— 它就是旧键，
+    //     钉住它，标题才敢改：老条目原本没有 project_key、拿标题当命名空间，
+    //     改完名再去找帧/视频/封面就只剩一个空目录（见 getIdeaSaveTitle）。
+    idea.project_key = plan.project_key;
+    if (plan.moved) rewriteIdeaMediaUrls(idea, plan);
+    return { renamed: true, from, to, reason: '', plan };
+}
+
+async function generateProjectMetaForCurrentIdea() {
+    if (!currentIdea) {
+        showToast('先打开一个项目再生成主题和 tags。', 'error');
+        return;
+    }
+    const promptBlock = currentIdea.prompt_block || '';
+    if (!promptBlock.trim() && !(currentIdea.title || '').trim()) {
+        showToast('这一单既没有提示词集也没有标题，无从推断主题与话题。', 'error');
+        return;
+    }
+
+    const meta = getIdeaTikTokMeta(currentIdea);
+    const hasExisting = !!(currentIdea.social_title_en || currentIdea.social_title_cn);
+    if (hasExisting) {
+        const ok = await customConfirm(
+            '这一单已经有主题和 tags 了，重新生成会<b>覆盖</b>现有的两行发布文案：'
+            + `<ul style="margin:8px 0 0 18px; line-height:1.7;">
+                 <li>英文：${escapeHtml(meta.english || '（空）')}</li>
+                 <li>中文：${escapeHtml(meta.chinese || '（空）')}</li>
+                 <li>项目名也会同步改成新主题（当前「${escapeHtml(currentIdea.title || '')}」）</li>
+               </ul>`);
+        if (!ok) return;
+    }
+
+    const btn = document.getElementById('gen-project-meta-btn');
+    if (btn) btn.disabled = true;
+    // 生成期间换单/关页都可能发生：认准发起时的这条创意，回来只写它
+    const ownerId = currentIdea.id;
+    const ownerIdea = currentIdea;
+    showToast('正在按提示词集推荐主题和 tags…', 'info');
+    try {
+        const data = await slotPostJson('/api/project_meta', {
+            config: config,
+            title: ownerIdea.title || '',
+            theme: ownerIdea.theme || '',
+            creativity: ownerIdea.creativity || '',
+            prompt_block: promptBlock,
+        });
+
+        // 四个字段各自可能为空（模型漏给），空的不覆盖已有值
+        if (data.theme_cn) ownerIdea.theme = data.theme_cn;
+        if (data.theme_en) ownerIdea.theme_en = data.theme_en;
+        if (data.tiktok) ownerIdea.social_title_en = data.tiktok;
+        if (data.cn) ownerIdea.social_title_cn = data.cn;
+        const rename = await renameIdeaToTheme(ownerIdea, data.theme_cn);
+
+        if (currentIdea && currentIdea.id === ownerId) {
+            saveCurrentIdeaState();
+            renderIdeaTitles(ownerIdea);
+            const tagThemeEl = document.getElementById('tag-theme');
+            if (tagThemeEl) tagThemeEl.textContent = ownerIdea.theme || '';
+        }
+
+        const existingIdx = savedIdeas.findIndex(item => item.id === ownerId);
+        if (existingIdx !== -1) {
+            // 改名会连带重写 covers/collage_url/frameRun 里的 URL（目录换名了），
+            // 所以这里整条覆盖，而不是只挑那几个文本字段
+            Object.assign(savedIdeas[existingIdx], ownerIdea);
+            await persistIdeaItem(savedIdeas[existingIdx]);
+        } else if (rename.renamed) {
+            // 磁盘那边已经按新名字改完了，条目却不在点子库里：不落库的话，下次打开
+            // 看到的还是旧名字（以及可能已经失效的旧 URL）。如实报出来。
+            showToast(`项目名已改成「${rename.to}」，但这一单不在点子库里，改名没能存下来——`
+                      + '先收藏这一单再点一次 ✨。', 'warning', 8000);
+        }
+        if (typeof refreshProjects === 'function') refreshProjects({ assets: false });
+
+        const plan = rename.plan || {};
+        const movedNote = plan.moved
+            ? `，本地目录改成 outputs/${plan.new_dir_name}`
+            // 有作业在跑时目录不搬（worker 攥着旧路径），命名空间钉在旧键上。
+            // 名字确实改了，但目录名对不上，说清楚免得用户以为改了个寂寞。
+            : (plan.reason === 'busy'
+                ? `（还有作业在跑，本地目录暂不搬迁，仍是 outputs/${plan.old_dir_name}）` : '');
+        showToast(rename.renamed
+            ? `主题和 tags 已生成，项目名同步改成「${rename.to}」${movedNote}`
+            : `主题和 tags 已生成：${ownerIdea.theme || ''}`, 'success');
+        // 改名被挡住时必须说清楚，否则用户只会看到"主题变了、名字没变"
+        if (!rename.renamed && rename.reason) {
+            showToast(`项目名保持「${rename.from}」未改：${rename.reason}`, 'warning', 7000);
+        }
+        // 目录搬了但目录里某些 json 没改写成：那些文件里还留着旧路径，如实报出来
+        const failures = (rename.plan && rename.plan.rewrite_failures) || [];
+        if (failures.length) {
+            showToast(`本地目录已改名，但 ${failures.length} 个 json 里的旧路径没能改写：`
+                + failures[0], 'warning', 8000);
+        }
+    } catch (e) {
+        console.error('Failed to generate project meta:', e);
+        showToast(`生成主题和 tags 失败：${e.message}`, 'error');
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
 function copyPromptToClipboard() {
     const text = (currentIdea && currentIdea.prompt_block) || document.getElementById('idea-prompt-block').textContent;
     copyText(text).then(() => {
@@ -3268,8 +3463,9 @@ function computeDebugTargets(kind, idea, slotType) {
 
 // Generate the complete IMAGE prompt chain as ordered still frames.
 function withCoverReference(baseConfig, idea) {
-    const covers = (idea && idea.covers) || [];
-    const chosen = (idea && idea.activeCoverUrl) || covers[covers.length - 1];
+    // 帧 1 的参考图走 'frame1' 用途：用户可以把带文案的封面留给项目卡片/成片首帧，
+    // 这里单独指一张干净的，避免文案被图生图带进画面（见 media_renderer 的用途分配）。
+    const chosen = coverRoleUrl(idea, 'frame1');
     if (!chosen) return baseConfig;
     return Object.assign({}, baseConfig, { coverReferencePath: chosen });
 }
@@ -3280,7 +3476,7 @@ async function generateFrames() {
         return;
     }
     const ownerIdea = currentIdea;
-    const selectedCover = ownerIdea.activeCoverUrl || (ownerIdea.covers || []).slice(-1)[0];
+    const selectedCover = coverRoleUrl(ownerIdea, 'frame1');
     if (ownerIdea.degraded === true
         || (ownerIdea.quality_gate && ownerIdea.quality_gate.status !== 'passed')) {
         showToast('提示词处于降级或质量门未通过状态，不能生成帧序列。', 'error');
@@ -3445,6 +3641,26 @@ function mergeSpeedLabel(speed = getMergeSpeed()) {
     return Number(speed) === 1 ? '无加速' : `${Number(speed)}倍速`;
 }
 
+// 成片首帧烧录封面的档位。默认 'frame'（只占一帧：肉眼看不见，平台取缩略图时拿到
+// 的却已经是封面）。选择按浏览器持久化，与合并速率同款。
+const COVER_BURN_STORAGE_KEY = 'spark_merge_cover_burn';
+
+function getCoverBurn() {
+    const select = document.getElementById('merge-cover-burn-select');
+    const value = select && select.value;
+    return ['frame', '0.5', '1', 'off'].includes(value) ? value : 'frame';
+}
+
+function initCoverBurnControl() {
+    const select = document.getElementById('merge-cover-burn-select');
+    if (!select) return;
+    const stored = localStorage.getItem(COVER_BURN_STORAGE_KEY);
+    if (stored && Array.from(select.options).some(o => o.value === stored)) select.value = stored;
+    select.addEventListener('change', () => {
+        localStorage.setItem(COVER_BURN_STORAGE_KEY, select.value);
+    });
+}
+
 async function mergeVideos(force = false) {
     if (!currentIdea || !currentIdea.title) {
         showToast("请先激发一个创意点子并生成视频！", "error");
@@ -3458,6 +3674,7 @@ async function mergeVideos(force = false) {
     const originalText = mergeBtn.innerHTML;
     const speed = getMergeSpeed();
     const speedLabel = mergeSpeedLabel(speed);
+    const coverBurn = getCoverBurn();
     mergeBtn.disabled = true;
     // 合并不走 ideaTasksById 登记，管线条的「成片 · 合并中…」只能靠这个标志位
     mergeInFlight = true;
@@ -3477,7 +3694,10 @@ async function mergeVideos(force = false) {
             body: JSON.stringify({
                 title: getIdeaSaveTitle(currentIdea),
                 force: !!force,
-                speed
+                speed,
+                // 首帧封面：档位来自合并控件，用哪张来自「成片首帧」用途分配
+                cover_burn: coverBurn,
+                cover: coverBurn === 'off' ? null : coverRoleUrl(currentIdea, 'video'),
             })
         });
 
@@ -3510,13 +3730,17 @@ async function mergeVideos(force = false) {
 
             const mv = data.merged_video || {};
             const mergedSpeedLabel = mergeSpeedLabel(mv.speed || speed);
+            // 没烧成（选了封面却没进成片）要说出来：否则用户只能等平台缩略图出来才发现
+            const coverNote = mv.cover_first_frame
+                ? `；封面已烧进首帧（${mv.cover_first_frame.seconds ? `${mv.cover_first_frame.seconds}秒` : '1 帧'}）`
+                : (coverBurn === 'off' ? '' : '；未烧录封面首帧（没有可用封面）');
             if (mv.partial) {
                 const slots = (mv.skipped_slots || []).join(', ');
                 showToast(`已生成跳过缺口的合成片（${mergedSpeedLabel}）`, "success");
-                videosMeta.innerHTML = `⚠️ 已合成：槽位 <b>${escapeHtml(slots)}</b> 因缺失/串片被跳过（该处为硬切），其余片段正常拼接、${mergedSpeedLabel}。建议重试这些片段后重新合并以获得完整成片。`;
+                videosMeta.innerHTML = `⚠️ 已合成：槽位 <b>${escapeHtml(slots)}</b> 因缺失/串片被跳过（该处为硬切），其余片段正常拼接、${mergedSpeedLabel}${escapeHtml(coverNote)}。建议重试这些片段后重新合并以获得完整成片。`;
             } else {
                 showToast(`视频合并成功（${mergedSpeedLabel}）！`, "success");
-                videosMeta.textContent = `视频合并已完成（${mergedSpeedLabel}）！`;
+                videosMeta.textContent = `视频合并已完成（${mergedSpeedLabel}）${coverNote}！`;
             }
         } else {
             throw new Error(data.message || '合并失败');
@@ -4046,6 +4270,46 @@ function initPipelineBar() {
         });
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape' && !moreMenu.hidden) closeMenu();
+        });
+    }
+
+    // 「分步合成」入口：在 pipeline-more-menu 里点击后启动分步管线
+    const steppedBtn = document.getElementById('stepped-pipeline-btn');
+    if (steppedBtn) {
+        steppedBtn.addEventListener('click', () => {
+            if (typeof initSteppedPipeline !== 'function') {
+                alert('分步管线模块未加载');
+                return;
+            }
+            // loadedIdea 是全局变量，由 app.js 的 renderIdea/loadIdeaCard 设置
+            if (typeof loadedIdea === 'undefined' || !loadedIdea || !loadedIdea.input_str) {
+                alert('请先选择一个灵感卡片再使用分步合成');
+                return;
+            }
+            const panel = document.getElementById('stepped-pipeline-panel');
+            if (!panel) return;
+
+            // 构建 dimensions，与主 compose 路径对齐
+            const dims = {
+                theme: loadedIdea.input_str,
+                task_label: loadedIdea.task_label || loadedIdea.input_str,
+                cover_url: loadedIdea.cover_url || null,
+                english_title: loadedIdea.english_title || null,
+                topic_dna: loadedIdea.topic_dna || null,
+                llm_score: loadedIdea.llm_score ?? null,
+                trend_ref: loadedIdea.trend_ref || null,
+                trend_ref_ids: loadedIdea.trend_ref_ids || [],
+                beat_outline: Array.isArray(loadedIdea.beat_outline) ? loadedIdea.beat_outline.slice() : [],
+                pacing_skeleton: loadedIdea.pacing_skeleton || 'linear_milestone',
+                beats_count: parseInt(document.getElementById('slider-beats')?.value || '10', 10),
+                beats_floor: Number.isFinite(+(loadedIdea.beats_floor)) ? +loadedIdea.beats_floor : null,
+            };
+
+            // 切到结果概览页
+            if (typeof switchMainTab === 'function') switchMainTab('results');
+            if (typeof switchTab === 'function') switchTab('overview');
+
+            initSteppedPipeline(panel, dims);
         });
     }
 

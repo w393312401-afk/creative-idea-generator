@@ -271,6 +271,7 @@ function galleryCardHtml(it) {
             <div class="gallery-card-actions">
                 <button type="button" class="g-act g-act-preview" title="放大预览">🔍</button>
                 <button type="button" class="g-act g-act-download" title="下载文件">📥</button>
+                <button type="button" class="g-act g-act-reveal" title="在本机文件管理器中显示">📂</button>
                 <button type="button" class="g-act g-act-delete" title="删除本地文件">🗑️</button>
             </div>
         </div>
@@ -545,6 +546,8 @@ function initGallery() {
         }
         if (e.target.closest('.g-act-preview')) { galleryOpenPreview(path); return; }
         if (e.target.closest('.g-act-download')) { galleryDownload(item); return; }
+        // 定位到本机文件：item.path 就是 outputs/ 下的相对路径（服务端扫描出来的真值）
+        if (e.target.closest('.g-act-reveal')) { revealLocalFile(item.path, item.name); return; }
         if (e.target.closest('.g-act-delete')) { galleryDeletePaths([path], `文件「${item.name}」`); return; }
         if (e.target.closest('.gallery-thumb')) { galleryOpenPreview(path); return; }
     });

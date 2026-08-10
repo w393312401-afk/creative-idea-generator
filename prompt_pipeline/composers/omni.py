@@ -5,23 +5,37 @@
 Phase 1（brief/工序梯/Drift Lock 包/IMAGE 1）、断点续传、槽位格式全部沿用 base——
 它们是下游帧渲染/创意库/续传共同的契约，与「做哪个视频模型的提示词」无关。
 
-2026-08-01「弹性镜头梯 + 时间线」改造，三件事：
+2026-08-09「主镜 + 特写插入」改造。此前单段是一条五到六级的景别轮换梯
+（远景→全景→中景→近景→特写→结果远景）。实拍的改造延时不是这么剪的：一个作业面
+上真正成立的是**一条贯穿全段的主工作镜**，中间被一到两个特写插入切开，再切回同一
+机位收尾。景别轮换梯把每一镜都换一次机位与尺度，短片长下每镜不足一秒，观感是闪帧；
+更要命的是尺度一路换下去，锚点连续性只能靠文字反复申明来兜。
 
-  1. **镜头数不再是常量六**。Omni Flash 的 Flow 面板提供 4/6/8/10 秒四档，六镜头塞进
-     4 秒等于每镜 0.67 秒——模型只能丢镜头或整体加速，两者都表现为观感上的跳变。
-     现在镜头梯由 server_common.resolve_video_duration() 决定（见 _SHOT_COUNT_BY_DURATION），
-     约束是「平均每镜不低于 1.3 秒、主工作镜不低于 1.9 秒」。裁镜头不是随便丢：
-     远景（首帧锚）/ 中景（唯一携带推进量的镜头）/ 结果远景（尾帧锚）三镜任何长度下
-     都不可裁，回补优先级是 近景 → 全景 → 特写，被裁那一级的职责并进相邻镜头
-     （ladder_roles）。反向也要查：写出梯外的额外景别同样是硬伤（_extra_shot_rungs）——
-     四秒里塞六个镜头会把每镜压到一秒以下，观感是闪帧。
+现在的施工梯只有两档：
+
+  · 短片长（4s / 6s）三镜：主镜 wide working shot → 特写插入 close-up insert →
+    切回 returning wide shot
+  · 长片长（8s / 10s）四镜：主镜 → close-up insert → extreme close-up insert →
+    切回 returning wide shot
+
+要点：**主镜与切回镜是同一个机位**（returning wide shot 逐字要求 "the same camera
+setup as the opening wide working shot"），所以首帧锚与尾帧锚天然落在同一构图上，
+锚点连续性不再依赖跨尺度的文字兜底。推进量全部由主镜携带；插入镜按契约零推进，
+只交代工具接触点的材料物理与本次操作特有的持久痕迹；剩余重复动作在切回那个剪辑点
+上做 same-way 压缩，落到结果 IMAGE。
+
+镜长约束随之改成两档：主镜与切回镜各不低于 1.3 秒，插入镜不低于 0.9 秒（插入本来
+就是短镜，1 秒的插入读作插入，1 秒的**景别**才读作闪帧）。反向检查保留并更重要了：
+正文里写出梯外的景别——尤其是旧语法的 establishing long shot / full shot /
+medium shot / wide outro shot——一律按硬伤报（_extra_shot_rungs），否则模型会照着
+旧习惯把景别轮换梯悄悄写回来。
 
   2. **切点用时间线句显式钉在秒上**。这是本次唯一被允许出现阿拉伯数字的地方
      （omni-output-templates.md §Notation Ban 的 Timecode exemption），正文其余部分
      的数字一律折成英文单词。时间线句由 _inject_timeline 确定性注入并覆写——模型
      自己编的时间线不作数。
 
-  3. **过门桥拍与最终兑现拍走各自的梯**。此前它们被同一套六镜头施工梯审计，等于要求
+  3. **过门桥拍与最终兑现拍走各自的梯**。此前它们被同一套施工梯审计，等于要求
      一段穿门镜头也写出"工具接触点"和"重复作业循环"。
 
 同时清掉两处与 base 契约的硬冲突：
@@ -29,7 +43,7 @@ Phase 1（brief/工序梯/Drift Lock 包/IMAGE 1）、断点续传、槽位格�
     直接对撞——远景/全景推进量为零、特写不产生推进量、结果远景正是在剪辑点上做
     same-way 压缩。改用 OMNI_INSHOT_PHRASE：连续性约束到**镜内**，压缩只允许发生在
     声明过的切点上。
-  · base 的 out-and-in 兜底会往六镜头包里塞绝对时间戳与固定入画口（"At t=0s ... from
+  · base 的 out-and-in 兜底会往多镜头包里塞绝对时间戳与固定入画口（"At t=0s ... from
     the Grid C1 edge ... by t=7.5s"）：时间戳按 8 秒写死、Grid 记号本身违反记号禁用、
     且与"镜一零工人 / 镜二从命名路径入画"冲突。omni 下整条跳过，工人进出由镜头梯承载，
     真缺进出仍由 base 的 check_out_and_in 报错并触发回炉。
@@ -67,31 +81,43 @@ OMNI_THRESHOLD_REFERENCE = 'omni-threshold-bridge.md'
 # ── 镜头梯 ──────────────────────────────────────────────────────────────────
 # variants 一律写成 _normalized() 之后的形态（小写、无连字符、单空格），判定按**出现
 # 顺序**做，不只是"都出现过"——乱序的几个词不是轮换，是把词堆在一句里骗过检查。
-# weight 是时长分配权重：中景要装下"第一次动作完整可见 + 重复循环"，配额必须最高。
+# weight 是时长分配权重：主镜要装下"起始状态 + 第一次动作完整可见 + 重复循环"，配额必须最高。
 Rung = namedtuple('Rung', 'key variants label phrase weight role')
 
+_R_MAIN = Rung(
+    'main', ('wide working shot',), '主镜 wide working shot',
+    'a wide working shot', 1.5,
+    '贯穿本段的主工作镜，画面开在起始 IMAGE 上、工人已经在作业面，0 秒立即发生第一次'
+    '有效工具接触；第一次动作完整可见后转入重复循环，本拍改动在这一镜内推进到约四分之三，'
+    '全程用 -ing / partially / growing 这类进行态措辞，不出现完成态描述')
+_R_CLOSE = Rung(
+    'close', ('close up',), '特写插入 close-up insert', 'a close-up insert', 1.0,
+    '从主镜切进来的特写插入：工具接触点与材料物理（形变、碎屑、粉尘、纤维、飞溅），'
+    '不产生新的推进量，切回主镜时完成度与切走那一刻一致')
+_R_XCLOSE = Rung(
+    'xclose', ('extreme close up',), '第二处特写插入 extreme close-up insert',
+    'an extreme close-up insert', 0.9,
+    '第二个插入镜，至少两处本次操作特有的持久痕迹与微观质感，同样不产生推进量')
+_R_RETURN = Rung(
+    'return', ('returning wide shot',), '切回主镜 returning wide shot',
+    'a returning wide shot', 1.3,
+    '切回**与主镜完全相同的机位与构图**（正文要写明 the same camera setup as the opening '
+    'wide working shot），剩余重复动作在这个剪辑点上做 same-way 压缩，工人继续施工至镜头'
+    '结束，画面落到这一拍的结果 IMAGE，不安排退场或空镜尾巴，只有这一镜可以用完成态措辞')
+
+# 旧景别轮换梯的四级。已不在任何施工梯里，保留定义只为 _extra_shot_rungs 认得出来——
+# 模型照旧习惯写回 establishing / full / medium / wide outro 时要按硬伤报，而不是
+# 被当成"没写在梯里的无害措辞"放过去。
 _R_ESTABLISHING = Rung(
     'establishing', ('establishing long shot',), '远景 establishing long shot',
-    'an establishing long shot', 1.0,
-    '以起始 IMAGE 的环境状态开场，但工人已经在作业面，0 秒立即发生第一次有效工具接触')
+    'an establishing long shot', 1.0, '（旧语法，已废弃）')
 _R_FULL = Rung(
-    'full', ('full shot',), '全景 full shot', 'a full shot', 1.0,
-    '延续远景已经开始的施工，以全身尺度展示同一工人与工具、材料的真实受力和连续动作')
+    'full', ('full shot',), '全景 full shot', 'a full shot', 1.0, '（旧语法，已废弃）')
 _R_MEDIUM = Rung(
-    'medium', ('medium shot',), '中景 medium shot', 'a medium shot', 1.4,
-    '主操作推进，第一次动作完整可见，随后重复循环，本拍改动推进到约四分之三，'
-    '用 -ing / partially / growing 这类进行态措辞')
-_R_CLOSE = Rung(
-    'close', ('close up',), '近景 close-up', 'a close-up', 1.0,
-    '工具接触点与材料物理（形变、碎屑、粉尘、纤维、飞溅），不产生新的推进量')
-_R_XCLOSE = Rung(
-    'xclose', ('extreme close up',), '特写 extreme close-up', 'an extreme close-up', 0.9,
-    '至少两处本次操作特有的持久痕迹与微观质感，同样不产生推进量')
+    'medium', ('medium shot',), '中景 medium shot', 'a medium shot', 1.4, '（旧语法，已废弃）')
 _R_OUTRO = Rung(
     'outro', ('wide outro shot', 'wide outro'), '结果远景 wide outro shot',
-    'a wide outro shot', 1.1,
-    '工人继续施工至镜头结束，画面落到这一拍的结果 IMAGE，不安排退场或空镜尾巴，'
-    '只有这一镜可以用完成态措辞')
+    'a wide outro shot', 1.1, '（旧语法，已废弃）')
 
 _R_APPROACH = Rung(
     'approach', ('wide approach shot',), '逼近远景 wide approach shot',
@@ -115,36 +141,35 @@ _R_FINAL_WIDE = Rung(
     'final_wide', ('final wide shot',), '终局远景 final wide shot', 'a final wide shot', 1.3,
     '稳定在略微收紧的终局远景上，画面等同结果 IMAGE，无工人无工具无材料，这一镜本身就是收尾欣赏')
 
-# 施工梯：按时长伸缩。三镜不可裁 = 远景（首帧锚）/ 中景（唯一携带推进量的镜头）/
-# 结果远景（尾帧锚）。回补优先级 近景 → 全景 → 特写：镜头数被压到四时，工人入画可以
-# 并进中景首句（干净帧契约照样成立），而因果痕迹没有别的镜头能承载。
+# 施工梯：主镜 + 一到两个特写插入 + 切回主镜。三镜是下限（主镜/插入/切回，任何长度
+# 下都不可裁），长片长多加一个特写插入而不是多加一级景别。
 _CONSTRUCTION_LADDERS = {
-    3: (_R_ESTABLISHING, _R_MEDIUM, _R_OUTRO),
-    4: (_R_ESTABLISHING, _R_MEDIUM, _R_CLOSE, _R_OUTRO),
-    5: (_R_ESTABLISHING, _R_FULL, _R_MEDIUM, _R_CLOSE, _R_OUTRO),
-    6: (_R_ESTABLISHING, _R_FULL, _R_MEDIUM, _R_CLOSE, _R_XCLOSE, _R_OUTRO),
+    3: (_R_MAIN, _R_CLOSE, _R_RETURN),
+    4: (_R_MAIN, _R_CLOSE, _R_XCLOSE, _R_RETURN),
 }
+_DEFAULT_CONSTRUCTION_LADDER = _CONSTRUCTION_LADDERS[4]
 
 # 过门桥拍与兑现拍：三个自然工位，与时长无关（一次穿越就是逼近/门槛/落定，再切只是把
 # 同一件事切碎）。它们免除节奏声明——traverse/reveal 不压缩劳动。
 _TRAVERSAL_LADDER = (_R_APPROACH, _R_THRESHOLD, _R_ARRIVAL)
 _REWARD_LADDER = (_R_DETAIL, _R_PULLBACK, _R_FINAL_WIDE)
 
-# 时长 → 施工镜头数。约束：平均每镜 ≥1.3 秒（更短读作闪帧而非镜头），主工作镜 ≥1.9 秒。
-_SHOT_COUNT_BY_DURATION = {4: 3, 6: 4, 8: 5, 10: 6}
-_MIN_SHOT_SECONDS = 1.3
+# 时长 → 施工镜头数：短片长一个特写插入（三镜），长片长两个（四镜）。约束是主镜与切回镜
+# 各 ≥1.3 秒、插入镜 ≥0.9 秒——插入本来就是短镜，读作插入；1 秒的**景别**才读作闪帧。
+_SHOT_COUNT_BY_DURATION = {4: 3, 6: 3, 8: 4, 10: 4}
+_TWO_INSERT_MIN_SECONDS = 7
 
 _DURATION_WORDS = {4: 'four', 6: 'six', 8: 'eight', 10: 'ten'}
 _COUNT_WORDS = {3: 'three', 4: 'four', 5: 'five', 6: 'six'}
 
 # 兜底稿里每一级镜头的一句话职责（占位稿仍计入 fallback_count 门禁，但至少不违反镜头语法）。
 _FALLBACK_SHOT_FRAGMENT = {
-    'establishing': 'an establishing long shot matching the first frame',
-    'full': 'a full shot with the worker already making effective tool contact',
-    'medium': 'a medium shot of the repeated work cycle',
-    'close': 'a close-up on the tool contact',
-    'xclose': 'an extreme close-up on the traces left behind',
-    'outro': 'a wide outro shot matching the last frame while visible work continues',
+    'main': ('a wide working shot matching the first frame, with the worker already making '
+             'effective tool contact and carrying the whole visible advance of this beat'),
+    'close': 'a close-up insert on the tool contact',
+    'xclose': 'an extreme close-up insert on the traces left behind',
+    'return': ('a returning wide shot from the same camera setup, matching the last frame '
+               'while visible work continues'),
     'approach': 'a wide approach shot matching the first frame',
     'threshold': 'a threshold shot at the opening itself as the door frame slides out of view',
     'arrival': 'an interior wide shot settling on the space beyond, matching the last frame',
@@ -285,14 +310,17 @@ def _one_take_hits(text):
 # ── 梯的选取与切点分配 ──────────────────────────────────────────────────────
 
 def construction_shot_count(duration):
-    """这个时长排几个施工镜头。表外时长按「平均每镜不低于 1.3 秒」反推，钳在 3–6。"""
+    """这个时长排几个施工镜头：短片长三镜（一个特写插入），长片长四镜（两个）。
+
+    表外时长按同一条分界（≥7 秒才排得下第二个插入）判，只会返回 3 或 4——景别轮换梯
+    时代那种"时长越长镜头越多"的线性反推已经作废，多出来的时间归主镜。"""
     try:
         seconds = int(round(float(duration)))
     except (TypeError, ValueError):
         seconds = server_common.OMNI_DEFAULT_VIDEO_DURATION
     if seconds in _SHOT_COUNT_BY_DURATION:
         return _SHOT_COUNT_BY_DURATION[seconds]
-    return max(3, min(6, int(seconds // _MIN_SHOT_SECONDS)))
+    return 4 if seconds >= _TWO_INSERT_MIN_SECONDS else 3
 
 
 def is_expanded_transition_stage_beat(beat):
@@ -382,20 +410,15 @@ def timeline_sentence(duration, ladder):
 
 
 def ladder_roles(ladder):
-    """逐镜职责文案。镜头数被压缩时，被裁掉那一级的职责并进相邻镜头——否则"工人从命名
-    路径入画"和"至少两处持久痕迹"会随着镜头一起消失，那才是真正的内容损失。"""
+    """逐镜职责文案。只有一个特写插入时，第二个插入的职责（持久痕迹）并进它——否则
+    "至少两处本次操作特有的持久痕迹"会随着那一镜一起消失，那才是真正的内容损失。"""
     keys = {rung.key for rung in ladder}
     lines = []
     for index, rung in enumerate(ladder, start=1):
         role = rung.role
-        if rung.key == 'medium' and 'full' not in keys:
-            role = ('工人从明确命名的边缘/路径带着工具入画后立即开始作业'
-                    '（本长度没有独立全景，入画并进本镜首句）；') + role
         if rung.key == 'close' and 'xclose' not in keys:
-            role = role + '；并在同一镜里给到至少两处本次操作特有的持久痕迹（本长度没有独立特写）'
-        if rung.key == 'medium' and 'close' not in keys:
-            role = role + ('；工具接触点的材料物理与至少两处本次操作特有的持久痕迹'
-                           '也在本镜内交代（本长度没有独立近景与特写）')
+            role = role + ('；本片长只有这一个插入镜，因此至少两处本次操作特有的持久痕迹'
+                           '也在同一镜里给到')
         lines.append(f"{index}. {rung.phrase}（{rung.label.split()[0]}）——{role}；")
     return '\n'.join(lines)
 
@@ -424,7 +447,7 @@ def video_draft_budget(shot_count):
 
 def _missing_shot_rungs(text, ladder=None):
     """镜头梯里缺失（或顺序不对）的级别。全部按出现顺序前向扫描。"""
-    ladder = ladder or _CONSTRUCTION_LADDERS[6]
+    ladder = ladder or _DEFAULT_CONSTRUCTION_LADDER
     low = _normalized(text)
     missing = []
     cursor = 0
@@ -441,16 +464,18 @@ def _missing_shot_rungs(text, ladder=None):
     return missing
 
 
-_ALL_RUNGS = (_R_ESTABLISHING, _R_FULL, _R_MEDIUM, _R_CLOSE, _R_XCLOSE, _R_OUTRO,
+_ALL_RUNGS = (_R_MAIN, _R_CLOSE, _R_XCLOSE, _R_RETURN,
+              _R_ESTABLISHING, _R_FULL, _R_MEDIUM, _R_OUTRO,
               _R_APPROACH, _R_THRESHOLD, _R_ARRIVAL, _R_DETAIL, _R_PULLBACK, _R_FINAL_WIDE)
 
 
 def _extra_shot_rungs(text, ladder):
     """正文里出现了**不属于本梯**的景别。
 
-    这是短片长下的头号失败模式：模型照着满六镜的习惯写，把六个镜头塞进四秒。缺镜头有人
-    查（_missing_shot_rungs），多镜头此前完全没人查——而多出来的镜头恰恰会把每镜压到
-    一秒以下，观感就是闪帧。"""
+    2026-08-09 之后这条比缺镜头更要紧：模型的训练先验和本技能自己的旧稿都在写景别轮换梯
+    （establishing long / full / medium / wide outro），而现在的施工梯只有主镜 + 插入 +
+    切回。多写出来的景别既会把每镜压到一秒以下（闪帧），又会在一段本该同机位收尾的片子里
+    换掉机位，首尾帧锚跟着一起松掉。"""
     low = _normalized(text)
     in_ladder = {rung.key for rung in ladder}
     extras = []
@@ -526,20 +551,20 @@ def omni_image_violations(image_prompt):
 def omni_video_violations(video_prompt, ladder=None, duration=None, skip_shot_list=False):
     """VIDEO 正文对 omni 镜头语法的违规项。空列表 = 合规。
 
-    ladder 缺省按满六镜施工梯判（模块级调用方与旧测试的口径）。duration 给了才查
+    ladder 缺省按长片长四镜施工梯判（模块级调用方的口径）。duration 给了才查
     时间线——回炉通路拿不到拍型时不该凭空要求一张切点表。
     节奏声明不在这里查：它由 _ensure_pacing 确定性注入，查了也只会是死代码。
 
     skip_shot_list（2026-08-06）：调用方已经用 is_expanded_transition_stage_beat 判定
     这一拍是展开后的原子级过门/空间重置子拍、传了 ladder=None 时才该置 True——这类拍
-    根本不该套任何镜头梯。不加这个开关的话，下面 `ladder or _CONSTRUCTION_LADDERS[6]`
-    这行会在 ladder=None 时悄悄换成六镜施工梯，一样保证首稿必炸，只是换了个错误的
+    根本不该套任何镜头梯。不加这个开关的话，下面 `ladder or _DEFAULT_CONSTRUCTION_LADDER`
+    这行会在 ladder=None 时悄悄换成四镜施工梯，一样保证首稿必炸，只是换了个错误的
     期望镜头梯而已。"""
     if skip_shot_list:
         missing = extras = []
-        ladder = ladder or _CONSTRUCTION_LADDERS[6]
+        ladder = ladder or _DEFAULT_CONSTRUCTION_LADDER
     else:
-        ladder = ladder or _CONSTRUCTION_LADDERS[6]
+        ladder = ladder or _DEFAULT_CONSTRUCTION_LADDER
         body = _body_without_timeline(video_prompt)
         expected = ' / '.join(rung.label.split()[0] for rung in ladder)
         missing = _missing_shot_rungs(body, ladder)
@@ -705,16 +730,23 @@ class OmniComposer(BaseComposer):
 本次输出的目标模型是 Gemini Omni，单段片长 {duration} 秒。上面所有关于 IMAGE 的规则**继续完全
 生效，不做任何修改**；唯独 VIDEO 的镜头语法整体改写为下面这套，与上文冲突处一律以本段为准。
 
-MANDATORY SHOT LADDER — 每一条普通施工 VIDEO 都是一段剪辑过的多镜头序列。{duration} 秒对应
-{len(ladder)} 个镜头，按这个顺序写满，镜头之间用 clean cut / match cut 衔接（禁止 cross-dissolve、
-fade、magical transition、instant transformation、teleport、跳过物理过程的快剪）：
+MANDATORY SHOT STRUCTURE — 每一条普通施工 VIDEO 都是**一条贯穿全段的主工作镜，中间被
+{'两个' if len(ladder) == 4 else '一个'}特写插入切开，最后切回同一机位收尾**。不是景别轮换：不要写
+establishing long shot / full shot / medium shot / wide outro shot 这一类旧梯的景别名，
+一个都不要。{duration} 秒对应 {len(ladder)} 个镜头，按这个顺序写满，镜头之间用 clean cut / match cut
+衔接（禁止 cross-dissolve、fade、magical transition、instant transformation、teleport、
+跳过物理过程的快剪）：
 {ladder_roles(ladder)}
 
-SHOT TIMELINE（本段最重要的一条）——正文里必须原样带上这句切点表，位置紧跟锚定开场句之后：
+SAME CAMERA SETUP（本次改造的核心）——第一镜与最后一镜是**同一个机位、同一个构图、同一个焦段**，
+只有施工完成度不同。正文在最后一镜里要写明它切回的是 the same camera setup as the opening wide
+working shot。插入镜是从这个机位切进去的细部，切回来时完成度必须与切走那一刻一致。
+
+SHOT TIMELINE（必写）——正文里必须原样带上这句切点表，位置紧跟锚定开场句之后：
   "{timeline_sentence(duration, ladder)}"
-后面每个镜头的首句再用**英文单词**复述一次自己的入点（例如 "A clean cut at the one-and-a-half-second
-mark moves to a full shot ..."），与切点表形成冗余绑定。这句切点表是**唯一**允许出现阿拉伯数字的
-地方；正文其余部分的计数一律写成英文单词（three roof beams，不是 3 roof beams）。
+后面每个镜头的首句再用**英文单词**复述一次自己的入点（例如 "A clean cut at the three-second
+mark drops into a close-up insert ..."），与切点表形成冗余绑定。这句切点表是**唯一**允许出现
+阿拉伯数字的地方；正文其余部分的计数一律写成英文单词（three roof beams，不是 3 roof beams）。
 
 拍型分流：过门桥拍走 逼近远景 / 门槛 / 落定室内远景 三镜，最终兑现拍走 细部 / 拉开 / 终局远景
 三镜，两者都免除下面的节奏声明（它们是穿越与揭示，不压缩劳动），但**同样不许写成一镜到底**。
@@ -728,7 +760,7 @@ single continuous take、one continuous take、single take、unbroken take 或�
 - IN-SHOT CONTINUITY：上文那条 EVEN RATE 指令（"每一刻都在推进 / 不许把改动推迟后一次兑现"）
   在多镜头包里**作废**，改用这句原话——
   "{OMNI_INSHOT_PHRASE}"
-  理由：远景与全景的推进量按契约就是零，近景/特写不产生新的推进量，而结果远景恰恰是在剪辑点上
+  理由：推进量全部集中在主镜，特写插入按契约不产生新的推进量，而切回镜恰恰是在剪辑点上
   做 same-way 压缩。要求"每一刻都在推进"等于要求模型违反自己的镜头级进度锁。
 - PROGRESS ACROSS CUTS：每个镜头都从上一镜结束时的完成度开始；剪辑点只允许压缩"已经完整演示过一次"的重复动作，
   且必须在正文里说明（例如 after the remaining boards come loose the same way），不得跳过某类改动的第一次发生、
@@ -736,7 +768,8 @@ single continuous take、one continuous take、single take、unbroken take 或�
 - PHRASING VARIATION：镜头梯是固定骨架，因此逐拍复读是本技能的头号失败模式。锚定开场句、切点表、
   镜头名、工人造型短语、节奏声明这几项**必须逐字保留**；除此之外，相邻两拍的句式模板、镜头内的从句顺序、
   动词选择、转场措辞、形容词搭配都必须换过。
-- 长度：整条 VIDEO 目标 {target} 词上下，硬顶 {ceiling} 词；单个镜头 45–70 词。
+- 长度：整条 VIDEO 目标 {target} 词上下，硬顶 {ceiling} 词。主镜与切回镜各 60–90 词
+  （它们承载起始状态、推进过程与结果状态），每个特写插入 30–50 词。
 {references_section}"""
 
     # ── 覆写钩子 ────────────────────────────────────────────────────────────
@@ -852,7 +885,7 @@ single continuous take、one continuous take、single take、unbroken take 或�
         并在注入后复裁一次、节奏声明换成多镜头版、时间线切点确定性注入、不走 base 的
         out-and-in 兜底（那句会塞进按 8 秒写死的时间戳与 Grid 记号，见模块 docstring）。"""
         ladder = self.ladder_for_beat(beat, is_threshold_or_reveal)
-        shot_count = len(ladder or _CONSTRUCTION_LADDERS[6])
+        shot_count = len(ladder or _DEFAULT_CONSTRUCTION_LADDER)
         _target, ceiling = video_word_targets(shot_count)
         text = pp.clean_prompt_text(video_prompt)
         # 预压缩显式给下面的结构句注入让出余量，注入完再按硬顶复裁（见 video_draft_budget）。
@@ -908,8 +941,10 @@ Rewrite rules (additive — do not lose content):
 - Keep the opening anchor sentence ("Use the provided first frame and last frame as exact composition anchors. ...") VERBATIM as the first sentence.
 - Immediately after it, place this shot timeline VERBATIM: "{timeline_sentence(duration, ladder)}"
 - Keep every concrete detail already in the draft: the same single worker and costume, the same tool, the same operation, the same persistent traces, the same audio description, the same lighting progression. Redistribute them across the shots instead of inventing new ones.
-- Restructure the body into exactly {len(ladder)} shots IN THIS ORDER, naming each scale in prose: {scales}. Join them with clean cuts or match cuts, and open each shot's sentence by restating its cut mark in English words (for example "A clean cut at the one-and-a-half-second mark ...").
-- The worker is already at the active work face in the opening shot and makes the first effective tool contact at 0 seconds; the middle shots carry the work and its physics; the closing shot reaches the beat's resulting state while visible work continues. Never show or describe a worker entrance or exit.
+- Restructure the body into exactly {len(ladder)} shots IN THIS ORDER, naming each one in prose exactly as written here: {scales}. Join them with clean cuts or match cuts, and open each shot's sentence by restating its cut mark in English words (for example "A clean cut at the three-second mark ...").
+- This is NOT a shot-scale rotation. Do not write "establishing long shot", "full shot", "medium shot", or "wide outro shot" anywhere — those names belong to the retired grammar and count as a contract violation.
+- The first and the last shot are the SAME camera setup, framing, and focal length, differing only in how far the work has progressed; say so explicitly in the last shot ("the same camera setup as the opening wide working shot"). The insert(s) cut into that setup and cut back at the same completion level.
+- The worker is already at the active work face in the opening wide working shot and makes the first effective tool contact at 0 seconds; that shot carries this beat's whole visible advance up to roughly three quarters; the insert(s) carry tool contact, material physics, and the persistent traces without advancing the state; the returning wide shot compresses the remaining repetitions the same way and reaches the beat's resulting state while visible work continues. Never show or describe a worker entrance or exit.
 - The shot timeline is the ONLY place arabic digits may appear. Every other count is written in English words.
 - NEVER write oner, one-shot, one-take, single continuous take, one continuous take, single take, or unbroken take — there is no exemption.
 - Output ONLY the rewritten video prompt body. No headings, no labels, no commentary."""
@@ -960,7 +995,7 @@ def ensure_ladder_out_and_in(video_prompt, ladder, packet=None, beat=None,
         return text
     agent = r'(?:the\s+)?(?:same\s+)?(?:one\s+lone\s+)?(?:workers?|crew|persons?|builders?|laborers?)'
     text = re.sub(
-        rf'(?i)\b(?:in\s+the\s+(?:opening|full|medium)\s+shot|at\s+(?:zero\s+seconds?|the\s+(?:start|beginning)))[,;:]?\s*'
+        rf'(?i)\b(?:in\s+the\s+(?:opening|wide\s+working|returning\s+wide)\s+shot|at\s+(?:zero\s+seconds?|the\s+(?:start|beginning)))[,;:]?\s*'
         rf'{agent}[^.;]*?\b(?:enters?|walks?\s+in|steps?\s+in)(?:[^.;]*[.;])?', '', text)
     text = re.sub(
         rf'(?i)(?:,?\s*(?:and|then)?\s*)?{agent}[^.;]*?\b(?:exits?|walks?\s+out|steps?\s+out|leaves?\s+the\s+(?:frame|scene))(?:[^.;]*[.;])?',
@@ -976,7 +1011,7 @@ def ensure_ladder_out_and_in(video_prompt, ladder, packet=None, beat=None,
     clause = (
         f" At zero seconds the same lone worker{costume} is already positioned at the active "
         "work face and makes the first effective tool contact immediately; every following shot "
-        "continues that visible operation through the final wide shot."
+        "continues that visible operation through the last shot of the clip."
     )
     return (text.rstrip() + clause).strip()
 
