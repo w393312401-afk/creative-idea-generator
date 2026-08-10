@@ -182,7 +182,10 @@ function galleryVisibleGroups() {
     for (const g of galleryData.groups) {
         let items = (g.items || []).filter(it => galleryItemMatchesFilter(g, it));
         if (q) {
-            const groupHit = (g.title || '').toLowerCase().includes(q);
+            // 项目名与目录名都要能搜到：改过名的项目两者不一样，用户搜的多半是
+            // 现在这一屏上显示的项目名（见渲染处 g.idea_title || g.title）
+            const groupHit = (g.title || '').toLowerCase().includes(q)
+                || (g.idea_title || '').toLowerCase().includes(q);
             items = items.filter(it => groupHit
                 || it.name.toLowerCase().includes(q)
                 || it.path.toLowerCase().includes(q));
@@ -261,12 +264,22 @@ function renderGallery() {
             gridHtml = `<div class="gallery-grid">${cards}</div>${moreBtn}`;
         }
 
+        // 标题显示归属创意的**项目名**，目录名退到后面的小字。
+        // 只显示目录名的话，改过名的项目在这里对不上号：磁盘目录未必跟着标题走
+        //（改名时有作业在跑就不搬目录，早期改的名压根没搬过），于是画廊上挂着的是
+        // 「run_import_xxx_粘贴的文本」这种导入时的临时名，用户认不出那是哪一单。
+        // 反过来目录名也不能丢——这一屏管的是磁盘，删除一组删的就是那个文件夹。
+        const groupName = g.idea_title || g.title;
+        const dirNote = (g.kind === 'project' && g.idea_title && g.idea_title !== g.title)
+            ? `<span class="g-group-dir" title="磁盘目录名（删除本组删的就是它）">outputs/${escapeHtml(g.title)}</span>`
+            : '';
+
         return `
         <section class="gallery-group${collapsed ? ' collapsed' : ''}${g.orphan === true ? ' orphan' : ''}" data-group="${escapeHtml(g.key)}">
             <div class="gallery-group-head">
                 <h3 class="g-group-title" title="点击折叠/展开">
                     <span class="g-collapse-caret">${collapsed ? '▸' : '▾'}</span>
-                    <span class="g-group-icon">${icon}</span>${escapeHtml(g.title)}${orphanBadge}
+                    <span class="g-group-icon">${icon}</span>${escapeHtml(groupName)}${orphanBadge}${dirNote}
                     <span class="g-count">${g.items.length} 项 · ${galleryFmtSize(gBytes)}</span>
                 </h3>
                 <div class="gallery-group-actions">
@@ -549,9 +562,13 @@ function initGallery() {
             // "画廊可见媒体清零"自动 rmtree），确认文案要说清楚
             const raw = (galleryData.groups || []).find(g => g.key === key);
             const isFullProject = group.kind === 'project' && raw && group.items.length === (raw.items || []).length;
+            // 删除要删的是目录，所以确认文案里项目名与目录名都得报出来——改过名的
+            // 项目两者不一样，只报一个都可能让人删错东西
+            const named = group.idea_title && group.idea_title !== group.title
+                ? `${group.idea_title}（目录 outputs/${group.title}）` : group.title;
             const label = isFullProject
-                ? `「${group.title}」全部 ${group.items.length} 个文件（整个项目文件夹连同 manifest、插帧中间产物将一并移除）`
-                : `「${group.title}」当前显示的 ${group.items.length} 个文件`;
+                ? `「${named}」全部 ${group.items.length} 个文件（整个项目文件夹连同 manifest、插帧中间产物将一并移除）`
+                : `「${named}」当前显示的 ${group.items.length} 个文件`;
             galleryDeletePaths(group.items.map(it => it.path), label);
             return;
         }

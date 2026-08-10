@@ -2021,35 +2021,34 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
                 'completed_with_warnings' if has_quality_warnings else 'completed'
             )
 
-            if has_failures:
-                progress_cb('merge_skip', {'message': '检测到存在生成失败或缺失的视频片段，已跳过自动合并视频。'})
-            else:
-                # Try to automatically merge videos
-                try:
-                    merge_speed = config.get('_merge_speed', 2)
-                    progress_cb('merge_start', {'message': f'正在自动以 {merge_speed}x 速率合并视频...'})
-                    project_dir = _get_project_dir(title)
-                    # 首帧封面跟手动合并同款：默认烧一帧，用哪张由 manifest 里的
-                    # cover_roles（前端在封面页登记）决定，自动合并同样吃得到。
-                    merged_info = merge_project_videos(
-                        project_dir, speed=merge_speed,
-                        cover_burn=config.get('_cover_burn', COVER_BURN_DEFAULT))
-                    if merged_info:
-                        result['merged_video'] = merged_info
-                        # Also update manifest file on disk (locked read-modify-write)
-                        try:
-                            with manifest_lock(project_dir):
-                                mdata = read_manifest(project_dir)
-                                if mdata is not None:
-                                    mdata['merged_video'] = merged_info
-                                    write_manifest(project_dir, mdata)
-                        except Exception as e:
-                            log('WARN', 'VIDEOS', f"更新 manifest.json 的 merged_video 字段失败: {e}", title=title)
-                    progress_cb('merge_done', {'merged_video': merged_info})
-                except Exception as merge_err:
-                    log('ERROR', 'VIDEOS', f"自动合并视频失败: {merge_err}", title=title)
-                    progress_cb('merge_error', {'message': f'自动合并视频失败: {str(merge_err)}'})
-                    completion_state = 'partial_failed'
+            # 2026-08-10：不再因为存在失败/缺失片段而跳过自动合并——有多少片段就合多少，
+            # 缺口处硬切，具体跳过的槽位由 merge_project_videos 带回 skipped_slots。
+            # Try to automatically merge videos
+            try:
+                merge_speed = config.get('_merge_speed', 2)
+                progress_cb('merge_start', {'message': f'正在自动以 {merge_speed}x 速率合并视频...'})
+                project_dir = _get_project_dir(title)
+                # 首帧封面跟手动合并同款：默认烧一帧，用哪张由 manifest 里的
+                # cover_roles（前端在封面页登记）决定，自动合并同样吃得到。
+                merged_info = merge_project_videos(
+                    project_dir, speed=merge_speed,
+                    cover_burn=config.get('_cover_burn', COVER_BURN_DEFAULT))
+                if merged_info:
+                    result['merged_video'] = merged_info
+                    # Also update manifest file on disk (locked read-modify-write)
+                    try:
+                        with manifest_lock(project_dir):
+                            mdata = read_manifest(project_dir)
+                            if mdata is not None:
+                                mdata['merged_video'] = merged_info
+                                write_manifest(project_dir, mdata)
+                    except Exception as e:
+                        log('WARN', 'VIDEOS', f"更新 manifest.json 的 merged_video 字段失败: {e}", title=title)
+                progress_cb('merge_done', {'merged_video': merged_info})
+            except Exception as merge_err:
+                log('ERROR', 'VIDEOS', f"自动合并视频失败: {merge_err}", title=title)
+                progress_cb('merge_error', {'message': f'自动合并视频失败: {str(merge_err)}'})
+                completion_state = 'partial_failed'
 
             result['completion_state'] = completion_state
             result['has_failures'] = has_failures

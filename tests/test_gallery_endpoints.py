@@ -310,6 +310,25 @@ class TestGalleryProjectOwners:
         # 封面池/图像工坊不是项目，永远不带归属字段
         assert 'idea_id' not in _group(data, 'covers')
 
+    def test_renamed_project_group_carries_the_current_project_name(self, media_tree):
+        """改过名的项目：目录名停在旧名字，组上必须带着**现在**的项目名。
+
+        画廊分组标题就是照着这个字段显示的（js/gallery.js：g.idea_title || g.title）。
+        没有它，改过名的项目在画廊里挂的是导入时的临时目录名（run_import_xxx_粘贴的
+        文本 之类），用户认不出那是哪一单——磁盘目录未必跟着标题走：改名时有作业在
+        跑就不搬目录，早期改的名压根没搬过。
+        """
+        refs = gallery_collect_references(
+            library_items=[{'id': 'idea-1', 'title': '林间树屋隐居小屋',
+                            'project_key': '树屋项目'}],
+            tasks=[])
+        data = scan_gallery(base_dir=media_tree, refs=refs)
+        proj = _group(data, '树屋项目')
+
+        assert proj['title'] == '树屋项目'                 # 目录名照旧（删除要用它）
+        assert proj['idea_title'] == '林间树屋隐居小屋'     # 组标题要显示的名字
+        assert proj['orphan'] is False
+
     def test_scan_without_owner_leaves_group_unannotated(self, media_tree):
         data = scan_gallery(base_dir=media_tree,
                             refs={'cover_paths': set(), 'project_names': set()})

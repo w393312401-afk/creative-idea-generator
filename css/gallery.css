@@ -282,6 +282,25 @@
     flex-shrink: 0;
 }
 
+/* 组标题上的磁盘目录名：只在它与项目名不一致时出现（改过名的项目）。
+   删除本组删的就是这个文件夹，所以它必须看得见，但不该跟项目名抢主位。 */
+#panel-gallery .g-group-dir {
+    font-size: 11px;
+    font-weight: 500;
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    color: var(--text-muted);
+    background: rgba(var(--ink-rgb), 0.04);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 1px 7px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 42%;
+    flex-shrink: 1;
+    min-width: 0;
+}
+
 #panel-gallery .gallery-expand-btn {
     display: block;
     width: 100%;

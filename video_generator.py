@@ -1990,11 +1990,9 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
                          cover_burn=COVER_BURN_DEFAULT, cover_path=None):
     """合并项目内全部视频片段。
 
-    2026-07-04 复盘：之前失败/缺失的槽位会被静默跳过（loft 任务缺 6、7 两段仍合出了
-    成片，观感为画面硬跳/回到初始状态），且串片的片段会原样混入。现在默认执行两道门禁：
-    1) 槽位完整性 —— 依据 manifest.frames 推出应有片段数，缺失/失败即拒绝合并；
-    2) 锚点一致性 —— 每段首尾帧须与对应锚点图匹配，不匹配即拒绝合并。
-    allow_partial=True 时跳过两道门禁（用户显式确认后强制合并）。
+    2026-08-10 改版：合并前不再有任何拦截。锚点不一致（疑似串片）的片段照常并入成片，
+    只在日志里留一条 WARN；真正缺失/失败（磁盘上没有文件）的槽位无内容可拼，跳过并
+    在返回结果里列出。allow_partial 参数保留只为兼容调用方，已不影响行为。
 
     cover_burn/cover_path：把封面烧进成片首帧（默认一帧，见 prepend_cover_intro）。
     """
@@ -2062,8 +2060,8 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
             # 合并门禁没有请求级 config，strict 开关直接取服务端配置
             ok, reason = verify_video_anchors(abs_path, start_p, end_p, strict=strict_gates_enabled())
             if not ok:
-                mismatched.append(slot)
-                continue
+                # 锚点不符不再拦截，也不再剔除该槽位：片段存在就并入成片，只留日志。
+                print(f"[WARN] 槽位 {slot} 锚点校验未通过（{reason}），仍按用户要求并入合并。")
             good[slot] = abs_path
 
         # 英雄展示视频（[HERO]，默认收尾步骤）：可选附加片段，不参与上面的完整性/
@@ -2087,11 +2085,10 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
                         # 只上传首帧，没有独立的结束锚点——只核对片段首帧，不核对尾帧。
                         ok, _reason = verify_video_anchors(hero_abs, hero_anchor_p, None,
                                                             strict=strict_gates_enabled())
-                        if ok:
-                            good[hero_slot] = hero_abs
-                            expected_slots = expected_slots + [hero_slot]
-                        else:
-                            print(f"[WARN] 英雄展示视频（槽位 {hero_slot}）锚点校验未通过，跳过附加合并。")
+                        if not ok:
+                            print(f"[WARN] 英雄展示视频（槽位 {hero_slot}）锚点校验未通过，仍并入合并。")
+                        good[hero_slot] = hero_abs
+                        expected_slots = expected_slots + [hero_slot]
     else:
         # 无 frames（历史/兜底）：不做完整性/锚点门禁，直接取所有成功片段
         for v in sorted(videos, key=lambda x: x.get('slot', 0)):
@@ -2101,13 +2098,10 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
                     good[v.get('slot')] = abs_path
         expected_slots = sorted(good)
 
-    # 默认（allow_partial=False）：有缺口/串片一律拒绝，携带槽位清单抛出供前端决策
-    if not allow_partial and (missing or mismatched):
-        raise PartialMergeBlocked(missing, mismatched)
-
-    # 强制合并且确有缺口：跳过缺失/串片槽位，仅拼接可用片段（用户已在门禁提示里看到
-    # 具体缺了哪些槽位，不是背地里丢弃）
-    if allow_partial and (missing or mismatched):
+    # 合并前不再拦截。仍有缺失槽位（磁盘上没有文件，无内容可拼）时跳过它们直接合并，
+    # 跳过清单随返回结果上报，不是背地里丢弃。
+    if missing:
+        print(f"[WARN] 跳过无文件的槽位后直接合并：missing={missing}")
         return _merge_skip_missing(
             project_dir, manifest_data, expected_slots, good, missing, mismatched, speed=speed,
             cover_burn=cover_burn, cover_path=cover_path,
