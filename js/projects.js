@@ -34,6 +34,23 @@ let projectsPollTimer = null;
 let projectsTabActive = false;
 let projectsSearchDebounce = null;
 
+// 显示方式（列表 / 网格 / 紧凑）。三档只改 #projects-list 上的 view-* 类，行的
+// HTML 与数据完全不动——切视图不该重新拉一次 /api/projects，也不该丢掉勾选。
+const PROJECTS_VIEW_LS_KEY = 'spark_projects_view';
+const PROJECTS_VIEWS = ['list', 'grid', 'compact'];
+let projectsView = (() => {
+    try {
+        const v = localStorage.getItem(PROJECTS_VIEW_LS_KEY);
+        return PROJECTS_VIEWS.includes(v) ? v : 'list';
+    } catch (e) { return 'list'; }
+})();
+
+// 多选。存 project_key，但作用域刻意限定在"当前筛选下可见的行"：批量动作要拿
+// task.id / library.id 才能执行，而这些只在已加载的行里有；留着筛掉的行只会让
+// "已选 12 项"点下去实际只动了 3 项。每次渲染按可见行收敛（见 renderProjects）。
+const projectsSelected = new Set();
+let projectsLastClickedKey = null;   // shift 连选的锚点
+
 const PROJECT_STATE_LABELS = {
     running: '运行中', completed: '已完成', saved: '已收藏',
     failed: '已失败', cancelled: '已取消', unknown: '—',
@@ -53,14 +70,38 @@ const PROJECT_STAGE_LABELS = {
     batch_generated: '批次完成', batch_retry: '批次重试', batch_failed: '批次失败',
     repair: '修复中', audit: '质量审计', compose: '合成提示词',
     frames: '生成帧序列', staged_render: '分步渲染', videos: '生成视频', cover: '生成封面',
-    // 复刻线（replica_pipeline.STAGES）
-    ingest: '导入素材', extract: '抽帧分析', review_frames: '逐帧反推',
-    cluster_beats: '聚合节拍', review_beats: '待人工核对节拍',
-    mutate_beats: '二创变异', completed: '已完成', cancelled: '已取消',
+    completed: '已完成', cancelled: '已取消',
+    // 复刻线的 stage 不在这里抄第三份——真源是 replica_pipeline.py 的 STAGE_LABELS，
+    // 由 js/replica_pipeline.js 的 REPLICA_STAGE_LABELS 兜底（它在本文件之前加载）。
+    // 抄一份的代价很具体：新增一个 stage 要记得改三处，漏掉这处就在工作台上露出
+    // `confirm_cost` 这种内部名。
 };
 function projectsStageLabel(stage) {
     if (!stage) return '准备中…';
-    return PROJECT_STAGE_LABELS[stage] || stage;
+    const replica = (typeof REPLICA_STAGE_LABELS !== 'undefined' && REPLICA_STAGE_LABELS) || {};
+    return PROJECT_STAGE_LABELS[stage] || replica[stage] || stage;
+}
+
+/* ── 显示方式 ──────────────────────────────────────────────────────────── */
+
+function projectsApplyView() {
+    const container = document.getElementById('projects-list');
+    if (container) {
+        PROJECTS_VIEWS.forEach(v => container.classList.toggle(`view-${v}`, v === projectsView));
+    }
+    document.querySelectorAll('#projects-view-switch .projects-view-btn').forEach(btn => {
+        const on = btn.dataset.view === projectsView;
+        btn.classList.toggle('active', on);
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+}
+
+function projectsSetView(view) {
+    if (!PROJECTS_VIEWS.includes(view) || view === projectsView) return;
+    projectsView = view;
+    try { localStorage.setItem(PROJECTS_VIEW_LS_KEY, view); }
+    catch (e) { /* 存储满/隐私模式：视图不持久化也能用 */ }
+    projectsApplyView();
 }
 
 /* ── 数据 ──────────────────────────────────────────────────────────────── */
@@ -247,7 +288,11 @@ function projectsRowInnerHtml(p) {
         : '';
     const error = (p.state === 'failed' && task.error)
         ? `<div class="project-error">❌ ${escapeHtml(task.error)}</div>` : '';
+    // 勾选态不进 innerHTML（也不进 projectsRowSignature）：选中/取消是每次点击都
+    // 发生的高频操作，重建整行 DOM 只为翻转一个 checked 太贵，而且会打断 hover。
+    // 由 renderProjects 在行就位后直接改 .checked（见下）。
     return `
+        <label class="project-check" title="选择（Shift 点击连选）"><input type="checkbox" class="p-check"></label>
         <div class="project-thumb">${projectsCoverHtml(p)}</div>
         <div class="project-main">
             <div class="project-title-line">
@@ -293,6 +338,8 @@ function renderProjects() {
         container.innerHTML = projectsTotal
             ? '<div class="projects-status">🗂️ 这个筛选下暂时没有匹配的项目</div>'
             : '<div class="projects-status">📁 还没有项目——去「激发维度」跑一次创意激发，它会自动出现在这里</div>';
+        projectsSelected.clear();
+        renderProjectsBulkBar();
         renderProjectDetail();
         return;
     }
@@ -320,6 +367,10 @@ function renderProjects() {
         }
         row.dataset.state = p.state;
         row.classList.toggle('selected', key === projectsSelectedKey);
+        const checked = projectsSelected.has(key);
+        row.classList.toggle('multi-selected', checked);
+        const cb = row.querySelector('.p-check');
+        if (cb) cb.checked = checked;
         // 顺序维护：只有位置真的不对时才 insertBefore（移动节点会打断
         // :hover，能不动就不动）
         const expectedNext = anchor ? anchor.nextElementSibling : container.firstElementChild;
@@ -332,7 +383,198 @@ function renderProjects() {
     container.querySelectorAll('.projects-status').forEach(el => el.remove());
 
     if (projectsSelectedKey && !seen.has(projectsSelectedKey)) projectsSelectedKey = null;
+    // 勾选收敛到可见行：筛选切换/项目被删后，留在集合里的 key 已经取不到行，
+    // 批量动作对它们无从下手，计数却还在涨。
+    [...projectsSelected].forEach(k => { if (!seen.has(k)) projectsSelected.delete(k); });
+    if (projectsLastClickedKey && !seen.has(projectsLastClickedKey)) projectsLastClickedKey = null;
+    renderProjectsBulkBar();
     renderProjectDetail();
+}
+
+/* ── 多选与批量动作 ────────────────────────────────────────────────────── */
+
+function projectsSelectedRows() {
+    return (projectsRows || []).filter(p => projectsSelected.has(p.project_key));
+}
+
+function projectsSetChecked(key, on) {
+    if (on) projectsSelected.add(key); else projectsSelected.delete(key);
+    const row = document.querySelector(`#projects-list .project-row[data-key="${CSS.escape(key)}"]`);
+    if (row) {
+        row.classList.toggle('multi-selected', on);
+        const cb = row.querySelector('.p-check');
+        if (cb) cb.checked = on;
+    }
+    renderProjectsBulkBar();
+}
+
+// Shift 连选：以上一次点过的行为锚点，把两者之间的可见行统一设成本次的目标态。
+function projectsSelectRange(fromKey, toKey, on) {
+    const keys = (projectsRows || []).map(p => p.project_key);
+    const a = keys.indexOf(fromKey);
+    const b = keys.indexOf(toKey);
+    if (a === -1 || b === -1) return;
+    keys.slice(Math.min(a, b), Math.max(a, b) + 1).forEach(k => projectsSetChecked(k, on));
+}
+
+function projectsToggleSelectAll() {
+    const keys = (projectsRows || []).map(p => p.project_key);
+    if (!keys.length) return;
+    const allOn = keys.every(k => projectsSelected.has(k));
+    keys.forEach(k => projectsSetChecked(k, !allOn));
+}
+
+// 批量条的按钮按"这批选中的行里有多少条真的能执行"来给：选了 5 个但只有 2 个
+// 在跑，「取消运行中」就写 (2)；一条都不适用时按钮根本不出现，免得点下去空转。
+function renderProjectsBulkBar() {
+    const bar = document.getElementById('projects-bulkbar');
+    if (!bar) return;
+    const rows = projectsSelectedRows();
+    if (!rows.length) {
+        bar.hidden = true;
+        bar.innerHTML = '';
+        document.getElementById('projects-list')?.classList.remove('has-selection');
+        projectsSyncSelectAllBtn();
+        return;
+    }
+    bar.hidden = false;
+    document.getElementById('projects-list')?.classList.add('has-selection');
+
+    const running = rows.filter(p => (p.task || {}).status === 'running').length;
+    const withTask = rows.filter(p => (p.task || {}).id).length;
+    const saved = rows.filter(p => p.saved && (p.library || {}).id).length;
+    const btns = [];
+    if (running) btns.push(`<button type="button" class="projects-btn danger" data-bulk="cancel">✕ 取消运行中（${running}）</button>`);
+    btns.push('<button type="button" class="projects-btn" data-bulk="copy-titles">📋 复制标题</button>');
+    if (saved) btns.push(`<button type="button" class="projects-btn danger" data-bulk="unsave">🗑️ 从点子库删除（${saved}）</button>`);
+    if (withTask) btns.push(`<button type="button" class="projects-btn danger" data-bulk="delete-task">🗑️ 删除任务记录（${withTask}）</button>`);
+
+    bar.innerHTML = `
+        <span class="projects-bulk-count">已选 ${rows.length} 个项目</span>
+        <div class="projects-bulk-actions">${btns.join('')}</div>
+        <button type="button" class="projects-btn" data-bulk="clear">取消选择</button>`;
+    projectsSyncSelectAllBtn();
+}
+
+function projectsSyncSelectAllBtn() {
+    const btn = document.getElementById('projects-select-all-btn');
+    if (!btn) return;
+    const keys = (projectsRows || []).map(p => p.project_key);
+    const allOn = keys.length > 0 && keys.every(k => projectsSelected.has(k));
+    btn.textContent = allOn ? '⬜ 取消全选' : '☑️ 全选';
+    btn.disabled = keys.length === 0;
+}
+
+// 批量收藏删除不走 deleteFromLibrary：那条路径每删一条都弹一次 toast、还各自触发
+// 一次 refreshProjects（选 10 条就是 10 条提示 + 10 次全量汇总）。这里直接打端点，
+// 结束后统一同步一次本地 savedIdeas 镜像与列表。
+async function projectsBulkUnsave(rows) {
+    const removed = new Set();
+    for (const p of rows) {
+        const id = (p.library || {}).id;
+        if (!id) continue;
+        const idea = (typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas))
+            ? savedIdeas.find(i => i.id === id) : null;
+        try {
+            const res = await fetch('/api/library/item/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    id,
+                    title: idea && typeof getIdeaSaveTitle === 'function'
+                        ? getIdeaSaveTitle(idea)
+                        : (p.project_key || p.title || ''),
+                    covers: (idea && idea.covers) || [],
+                }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data.status === 'ok') removed.add(id);
+        } catch (e) {
+            console.error('Bulk unsave failed', id, e);
+        }
+    }
+    if (removed.size && typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
+        savedIdeas = savedIdeas.filter(i => !removed.has(i.id));
+        try { localStorage.setItem('spark_library', JSON.stringify(savedIdeas)); }
+        catch (e) { console.warn('[library] localStorage 镜像写入失败', e); }
+        if (typeof updateFavoriteButtonState === 'function') updateFavoriteButtonState();
+    }
+    return removed.size;
+}
+
+async function projectsRunBulkAction(act) {
+    const rows = projectsSelectedRows();
+    if (!rows.length) return;
+
+    switch (act) {
+        case 'clear':
+            projectsSelected.clear();
+            document.querySelectorAll('#projects-list .project-row.multi-selected').forEach(el => {
+                el.classList.remove('multi-selected');
+                const cb = el.querySelector('.p-check');
+                if (cb) cb.checked = false;
+            });
+            renderProjectsBulkBar();
+            break;
+
+        case 'copy-titles': {
+            const text = rows.map(p => p.title || '未命名项目').join('\n');
+            try {
+                await navigator.clipboard.writeText(text);
+                showToast(`已复制 ${rows.length} 个标题`, 'success');
+            } catch (e) {
+                console.warn('Clipboard write failed', e);
+                showToast('复制失败，请手动选中标题', 'error');
+            }
+            break;
+        }
+
+        case 'cancel': {
+            const ids = rows.filter(p => (p.task || {}).status === 'running' && p.task.id).map(p => p.task.id);
+            if (!ids.length) return;
+            if (!await projectsConfirm(`确定取消这 ${ids.length} 个运行中的项目吗？`)) return;
+            const ok = await projectsBulkJobRequest('/api/compose-cancel', ids);
+            showToast(ok === ids.length
+                ? `已请求取消 ${ok} 个项目`
+                : `${ids.length} 个项目中 ${ok} 个已请求取消，其余失败`,
+                ok === ids.length ? 'info' : 'error');
+            refreshProjects({ assets: false });
+            break;
+        }
+
+        case 'delete-task': {
+            const ids = rows.filter(p => (p.task || {}).id).map(p => p.task.id);
+            if (!ids.length) return;
+            if (!await projectsConfirm(
+                `确定删除这 ${ids.length} 条任务记录吗？只删记录，已收藏的创意与 outputs/ 里的文件不受影响。`)) return;
+            const ok = await projectsBulkJobRequest('/api/tasks/delete', ids);
+            showToast(ok === ids.length
+                ? `已删除 ${ok} 条任务记录`
+                : `${ids.length} 条记录中删除了 ${ok} 条，其余失败`,
+                ok === ids.length ? 'success' : 'error');
+            projectsSelected.clear();
+            refreshProjects();
+            break;
+        }
+
+        case 'unsave': {
+            const targets = rows.filter(p => p.saved && (p.library || {}).id);
+            if (!targets.length) return;
+            if (!await projectsConfirm(
+                `确定从点子库删除这 ${targets.length} 个创意吗？对应生成的图片/视频文件会一并清理，不可恢复。`)) return;
+            const ok = await projectsBulkUnsave(targets);
+            showToast(ok === targets.length
+                ? `已从点子库删除 ${ok} 个创意`
+                : `${targets.length} 个创意中删除了 ${ok} 个，其余失败`,
+                ok === targets.length ? 'success' : 'error');
+            projectsSelected.clear();
+            refreshProjects();
+            break;
+        }
+
+        default:
+            break;
+    }
 }
 
 /* ── 详情 pane ─────────────────────────────────────────────────────────── */
@@ -700,11 +942,40 @@ function initProjects() {
         refreshProjects();
     });
 
+    projectsApplyView();
+    document.getElementById('projects-view-switch')?.addEventListener('click', (e) => {
+        const btn = e.target.closest('.projects-view-btn');
+        if (btn) projectsSetView(btn.dataset.view);
+    });
+
+    document.getElementById('projects-select-all-btn')?.addEventListener('click', projectsToggleSelectAll);
+
+    document.getElementById('projects-bulkbar')?.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-bulk]');
+        if (btn) projectsRunBulkAction(btn.dataset.bulk);
+    });
+
     // 行点击 = 选中并展开详情
     container.addEventListener('click', (e) => {
         const row = e.target.closest('.project-row');
         if (!row) return;
-        projectsSelectedKey = (projectsSelectedKey === row.dataset.key) ? null : row.dataset.key;
+        const key = row.dataset.key;
+
+        // 勾选框走多选，不动详情 pane：勾 8 行做批量删除时不该顺带把详情翻 8 次
+        if (e.target.closest('.project-check')) {
+            const cb = row.querySelector('.p-check');
+            // label 包 checkbox，点击已由浏览器翻转过，以最终状态为准
+            const on = cb ? cb.checked : !projectsSelected.has(key);
+            if (e.shiftKey && projectsLastClickedKey && projectsLastClickedKey !== key) {
+                projectsSelectRange(projectsLastClickedKey, key, on);
+            } else {
+                projectsSetChecked(key, on);
+            }
+            projectsLastClickedKey = key;
+            return;
+        }
+
+        projectsSelectedKey = (projectsSelectedKey === key) ? null : key;
         container.querySelectorAll('.project-row.selected').forEach(el => el.classList.remove('selected'));
         if (projectsSelectedKey) row.classList.add('selected');
         renderProjectDetail();

@@ -33,17 +33,71 @@ from server_common import skill_dir
 STAGES = [
     'ingest',
     'extract',
+    'confirm_cost',    # ⏸ 抽帧完成、预估已知，等用户确认采样档位再开始烧钱
     'review_frames',
     'cluster_beats',
     'review_beats',    # ⏸ PAUSE：对着证据帧核对节拍
     'mutate_beats',    # 二创分支
     'compose',
     'audit',
+    'audit_failed',    # ⏸ banned 门禁命中：不入库、不算完成，等用户重写后重跑
     'completed',
     'cancelled',
 ]
 
-REVIEW_STAGES = {'review_beats'}
+REVIEW_STAGES = {'confirm_cost', 'review_beats', 'audit_failed'}
+
+# stage → 中文标签的唯一真源。
+#
+# 这份映射此前在前端抄了两份（js/replica_pipeline.js 的 REPLICA_STAGE_LABELS 和
+# js/projects.js 的 PROJECT_STAGE_LABELS），本仓库在 contract registry 上已经吃过一次
+# "两份长得一样但互不相关"的亏。加一个 stage 要记得改三处，漏一处就在工作台上露出
+# `cluster_beats` 这种内部名。现在后端随 job 行一起下发 stage_label，前端只留一份兜底。
+STAGE_LABELS = {
+    'ingest': '已上传',
+    'extract': '抽帧中',
+    'confirm_cost': '待确认成本',
+    'review_frames': '逐帧读取',
+    'cluster_beats': '聚类节拍',
+    'review_beats': '待人工核对',
+    'mutate_beats': '二创改写中',
+    'compose': '合成提示词',
+    'audit': '门禁校验',
+    'audit_failed': '门禁未过',
+    'completed': '已完成',
+    'cancelled': '已取消',
+}
+
+# 用户看得见的四个阶段。后台十二个 stage 是状态机的内部粒度，摆在 UI 上只会让人
+# 对着一个 chip 找不到对应区块——「聚类节拍」在页面上没有任何一块是它。
+PHASES = [
+    ('material', '素材', ('ingest', 'extract', 'confirm_cost')),
+    ('reverse', '反推', ('review_frames', 'cluster_beats', 'mutate_beats')),
+    ('review', '核对节拍', ('review_beats',)),
+    ('deliver', '交付', ('compose', 'audit', 'audit_failed', 'completed')),
+]
+
+
+def stage_label(stage):
+    return STAGE_LABELS.get(stage, stage or '')
+
+
+def phase_of(stage):
+    for key, _label, stages in PHASES:
+        if stage in stages:
+            return key
+    return 'material'
+
+
+def stage_catalog():
+    """给前端的一份阶段目录。前端据此渲染阶梯指示，不再自己抄一份 stage 列表。"""
+    return {
+        'stages': list(STAGES),
+        'labels': dict(STAGE_LABELS),
+        'review_stages': sorted(REVIEW_STAGES),
+        'phases': [{'key': k, 'label': lab, 'stages': list(s)} for k, lab, s in PHASES],
+    }
+
 
 _JOBS_DIRNAME = 'replica_jobs'
 _STATE_FILENAME = '.replica_pipeline.json'
@@ -121,6 +175,8 @@ def list_replica_jobs():
         rows.append({
             'job_id': state.get('job_id'),
             'stage': state.get('stage'),
+            'stage_label': stage_label(state.get('stage')),
+            'phase': phase_of(state.get('stage')),
             'video_name': state.get('video_name'),
             'title': state.get('title'),
             'variant_of': state.get('variant_of'),
@@ -285,16 +341,25 @@ def run_extract(state, on_progress=None):
         'full': reverse.estimate_pass_a_cost(overview, degraded=False),
         'degraded': reverse.estimate_pass_a_cost(overview, degraded=True),
     }
-    state['stage'] = 'review_frames'
+    # 停在成本确认卡点，不直接往 Pass A 走。
+    #
+    # 方案 §2.1/§4 一直要求「预估摆给用户确认再开跑」，但在此之前 extract 结束后是
+    # 直接续跑 Pass A 的，预估只作为一行 SSE 文案闪过去。结果是首跑永远走完整档，
+    # UI 上那对「完整 / 降级」单选框只有重试时才有机会被看见——一道写在文档里、
+    # 代码里不存在的卡点。Pass A 是整条线唯一的大额支出，它前面必须真的有个停顿。
+    state['stage'] = 'confirm_cost'
     _save_state(state)
 
     if on_progress:
         plan = state['overview']['analysis_plan'] or {}
+        full = (state['cost_estimate'] or {}).get('full') or {}
         on_progress('replica_stage', {
-            'stage': 'extract',
+            'stage': 'confirm_cost',
             'message': (f'抽帧完成：{state["overview"]["frame_count"]} 帧、'
                         f'{state["overview"]["change_event_count"]} 个变化事件；'
-                        f'待送审 {plan.get("required_count")} 帧'),
+                        f'待送审 {plan.get("required_count")} 帧，'
+                        f'完整档约 {full.get("batch_count", 0)} 次视觉调用。'
+                        f'选好采样档位再开始反推——这一步是整条线的成本大头。'),
             'collage': collage,
             'cost_estimate': state['cost_estimate'],
         })
@@ -481,31 +546,97 @@ def run_compose(state, config, dimensions=None, on_progress=None):
     state['title'] = compose_state.get('title')
     prompt_block = compose_remaining_beats(config, compose_state, on_progress=on_progress)
     state['prompt_block'] = prompt_block
+    _write_compose_state(state, compose_state)
     _save_state(state)
 
     return run_audit(state, on_progress=on_progress)
 
 
+def _compose_state_path(job_id):
+    return os.path.join(job_dir(job_id), 'compose_state.json')
+
+
+def _write_compose_state(state, compose_state):
+    """把 Phase 1 的产物落盘，供「送去渲染」时原样接手。
+
+    分步管线的 `start_stepped_pipeline` 自己会调一遍 `compose_anchor_and_packet`。若只把
+    dimensions 递过去，它会**重新合成一遍**：既白付一次 Phase 1 的钱，更要命的是渲染出来
+    的提示词不是这里通过 banned 门禁的那一份——审的是 A，渲的是 B，那道门禁也就白设了。
+    所以这里存下 packet / ladder / 已编译提示词，交接时跳过重合成。
+
+    packet 与 ladder 加起来几百 KB，单独一个文件，不塞进 .replica_pipeline.json——
+    那份状态每推进一步都要整体重写，驮着这些东西会把每次 save 都变成一次大写盘。
+    """
+    payload = {k: compose_state.get(k) for k in (
+        'theme', 'total_beats', 'parsed_brief', 'title', 'beat_ladder', 'packet',
+        'brief_fingerprint', 'image_1_prompt', 'compiled_images', 'compiled_videos')}
+    path = _compose_state_path(state['job_id'])
+    tmp = path + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+        state['compose_state_path'] = path
+    except (OSError, TypeError, ValueError) as e:
+        # 存不下不该让整单失败——提示词已经拿到了，交接退回重合成那条路（贵，但能走）。
+        if sys.stdout:
+            print(f'[REPLICA] compose_state 落盘失败（非致命，交接将重新合成）: {e}')
+        state['compose_state_path'] = None
+    return state.get('compose_state_path')
+
+
+def load_compose_state(job_id):
+    """交接时读回 Phase 1 产物；读不到返回 None（调用方退回重新合成）。"""
+    path = _compose_state_path(job_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    # compiled_images / compiled_videos 在 compose 里是 {int: str}，过一趟 JSON 会变成
+    # {"1": str}。分步管线按整数下标取用，不还原回去会在第一拍就 KeyError。
+    for key in ('compiled_images', 'compiled_videos'):
+        slots = data.get(key)
+        if isinstance(slots, dict):
+            data[key] = {int(k): v for k, v in slots.items() if str(k).lstrip('-').isdigit()}
+    return data if data.get('packet') and data.get('beat_ladder') else None
+
+
+def handoff_to_render(job_id):
+    """「送去分步管线渲染」要用的三样东西：dimensions、项目标题、已合成的 Phase 1 产物。
+
+    只允许已经过 banned 门禁的任务往下走——`audit_failed` 的提示词里带着原片没有的
+    东西，渲出来就是幻觉画面，那正是那道门禁要拦的。
+    """
+    from prompt_pipeline import reverse
+
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+    if state.get('stage') == 'audit_failed':
+        raise ValueError(
+            f'这一单命中了禁用元素（{"、".join((state.get("banned_hits") or [])[:5])}），'
+            f'提示词里有原片不存在的东西，不能直接拿去渲染。先重写后重跑合成。')
+    if not state.get('prompt_block'):
+        raise ValueError('还没有提示词包，先完成合成再送去渲染')
+
+    beats = state.get('beats') or {}
+    dims = reverse.beats_to_dimensions(beats)
+    return dims, (state.get('title') or job_display_name(job_id, state)), load_compose_state(job_id)
+
+
 def _translate_compose_failure(error):
     """把合成器的预检报错翻译成「用户照着能改」的话。
 
-    合成器的场景状态预检是为**原创**选题写的产线规则；反推来的阶梯照实描述了原片，
-    两者冲突时它抛的是一句英文 preflight 报错，用户在「爆款复刻」页上看到它完全不知道
-    该动哪一拍的哪个字段。这里只做翻译与指路，不修改也不绕过那道闸——它拦得对。
+    2026-08-10：原先这里的第一分支是一段专门解释「清场规则打回照实复刻」的道歉文案。
+    那条冲突已经在源头修掉了——`dimensions.reverse_engineered` 会让
+    `validate_scene_states` 豁免清场那一条，复刻单不再撞它，所以那段翻译连同它要翻译的
+    报错一起没有了。剩下的分支只兜底真正的状态账错误（时序、before 承接、重复移除），
+    那些对复刻单同样是真缺陷，该报就报。
     """
     text = str(error)
-    if 'temporary construction' in text and 'furnishing' in text:
-        import re as _re
-        beats = sorted(set(_re.findall(r'Beat (\d+)', text)))
-        objects = sorted(set(_re.findall(r"'([^']+)'", text)))
-        return RuntimeError(
-            f'合成器的清场规则打回了这条阶梯：进入软装阶段的第 {"、".join(beats)} 拍，'
-            f'画面里还留着临时施工物（{"、".join(objects)}），而搬家具进场时不该还有这些东西。\n'
-            f'原片里它确实一直在，所以这不是读错帧——是「照实复刻」和产线规则冲突了。'
-            f'回到节拍阶梯改任一处即可：\n'
-            f'  · 在进入软装的那一拍之前，给某一拍的「可见动作」补上清场（例如 "工人卷起并搬走地面防护布"）；\n'
-            f'  · 或者把它从相关拍的「可见细节 / 遗留痕迹」里删掉。\n'
-            f'（原始报错：{text[:300]}）')
     if 'Structured scene-state preflight' in text or 'frame state' in text.lower():
         return RuntimeError(
             f'合成器的结构化状态预检打回了这条阶梯。多数情况是反推出来的拍序与产线规则冲突，'
@@ -585,7 +716,16 @@ def _outputs_url(state, abs_path):
 
 
 def run_audit(state, on_progress=None):
-    """P0 门禁：banned_elements 命中即交付前必须重写。"""
+    """P0 门禁：banned_elements 命中即拦下交付。
+
+    2026-08-10 之前这里扫完命中就 `_publish_to_library` + `stage='completed'`，只在文案里
+    说一句"交付前必须重写"——没有任何东西拦着，提示词照样进创意库、任务照样显示已完成，
+    用户拿它去渲染时画面里就长出了原片根本没有的东西。门禁不堵，就只是报告单。
+
+    现在命中就停在 `audit_failed`：不入库、不算完成，UI 上给「按清单重写」的入口。
+    这条路径与合成器侧的负面清单（composers/base.banned_elements_block）是两道，前者在
+    写之前约束、后者在交付前复核；前者失手时后者必须真的拦得住，否则前者也就白加了。
+    """
     from prompt_pipeline import reverse
 
     state['stage'] = 'audit'
@@ -595,6 +735,21 @@ def run_audit(state, on_progress=None):
     hits = reverse.banned_element_hits(state.get('prompt_block'), banned)
     state['banned_hits'] = hits
 
+    if hits:
+        state['stage'] = 'audit_failed'
+        _save_state(state)
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'audit_failed',
+                'message': (f'提示词包命中 {len(hits)} 个禁用元素（原片里并不存在）：'
+                            f'{"、".join(hits[:5])}。已拦下交付，未写入创意库。'
+                            f'去掉这些表述后重新合成，或者确认它们其实出现在原片里、'
+                            f'把它们从节拍阶梯的「禁用元素」里删掉再重跑。'),
+                'title': state.get('title'),
+                'banned_hits': hits,
+            })
+        return state
+
     _publish_to_library(state)
 
     state['stage'] = 'completed'
@@ -603,32 +758,63 @@ def run_audit(state, on_progress=None):
     if on_progress:
         on_progress('replica_stage', {
             'stage': 'completed',
-            'message': ('提示词包已生成。' if not hits else
-                        f'提示词包已生成，但命中 {len(hits)} 个禁用元素（原片里并不存在）：'
-                        f'{"、".join(hits[:5])}。交付前必须重写这些表述。'),
+            'message': '提示词包已生成，并已写入创意库。',
             'title': state.get('title'),
-            'banned_hits': hits,
+            'banned_hits': [],
         })
     return state
 
 
 # ── 对外入口 ─────────────────────────────────────────────────────────────────
 
-def start_replica_job(config, job_id, on_progress=None, degraded=False):
-    """extract → Pass A → Pass B，停在 review_beats。"""
+def _begin(job_id):
+    """取出 job 并清掉上次的失败标记。
+
+    不清的话，这次跑成功了前端还挂着上一次的错误横幅。"""
     state = _load_state(job_id)
     if not state:
         raise ValueError(f'找不到复刻任务 {job_id}')
-    # 重试要先把上次的失败标记清掉，否则跑成功了前端还挂着旧的错误横幅。
     state['error'] = None
     _save_state(state)
+    return state
+
+
+def _overview_ready(job_id):
+    """判据是「磁盘上有没有 video_overview.json」而不是 stage。
+
+    抽帧中途失败的 job 停在 stage='extract'，只看 stage 会跳过重抽、直接掉进 Pass A
+    报"找不到 overview"，用户永远重试不出来。"""
+    return os.path.exists(os.path.join(job_dir(job_id), 'video_overview.json'))
+
+
+def extract_replica_job(config, job_id, on_progress=None):
+    """只抽帧，停在 confirm_cost。
+
+    与 Pass A 分成两个任务，是为了让「先看预估再决定烧不烧钱」这句话在代码里成立。
+    抽帧是本地 ffmpeg，不花模型钱，所以它可以在用户没确认任何东西的情况下自己跑完。
+    """
+    state = _begin(job_id)
     try:
-        # 判据是「磁盘上有没有 video_overview.json」而不是 stage：抽帧中途失败的 job
-        # 停在 stage='extract'，只看 stage 会跳过重抽、直接掉进 Pass A 报"找不到
-        # overview"，用户永远重试不出来。
-        overview_ready = os.path.exists(
-            os.path.join(job_dir(state['job_id']), 'video_overview.json'))
-        if not overview_ready or state.get('stage') in ('ingest', 'extract'):
+        if _overview_ready(job_id) and state.get('stage') not in ('ingest', 'extract'):
+            # 已经抽过帧（例如换个采样档位回来重跑）：不重抽，直接回到确认卡点。
+            state['stage'] = 'confirm_cost'
+            return _save_state(state)
+        return run_extract(state, on_progress=on_progress)
+    except Exception as e:
+        state['error'] = str(e)
+        _save_state(state)
+        raise
+
+
+def start_replica_job(config, job_id, on_progress=None, degraded=False):
+    """Pass A → Pass B，停在 review_beats。抽帧没跑过就先补上。
+
+    正常路径下 extract 已经在上一个任务里跑完、用户在 confirm_cost 上选了档位才到这里；
+    `run_extract` 的兜底只为覆盖「抽帧中途失败后直接点重试」这一种情况。
+    """
+    state = _begin(job_id)
+    try:
+        if not _overview_ready(job_id) or state.get('stage') in ('ingest', 'extract'):
             state = run_extract(state, on_progress=on_progress)
         return run_reverse(state, config, on_progress=on_progress, degraded=degraded)
     except Exception as e:
@@ -671,6 +857,26 @@ def advance_replica_job(config, job_id, action='approve', payload=None,
         raise
 
 
+def frame_urls(state):
+    """帧文件名 → 前端能直接用的 /outputs URL。
+
+    此前这个映射写在前端：`replicaFrameUrl` 用 `/^scene_/` 正则猜这张帧在 storyboard
+    还是 review_frames 目录下。目录布局是抽帧脚本的实现细节，前端去猜它，脚本一改
+    目录名就是一片碎图，而且碎在"看证据帧核对节拍"这个最需要看图的地方。
+    这里按磁盘上的实际位置解析，前端只管取。
+    """
+    base_job = state.get('variant_of') or state.get('job_id')
+    directory = job_dir(base_job)
+    urls = {}
+    for sub in ('review_frames', 'storyboard'):
+        folder = os.path.join(directory, sub)
+        if not os.path.isdir(folder):
+            continue
+        for name in os.listdir(folder):
+            urls.setdefault(name, f'/outputs/{_JOBS_DIRNAME}/{base_job}/{sub}/{name}')
+    return urls
+
+
 def get_replica_status(job_id):
     state = _load_state(job_id)
     if not state:
@@ -684,6 +890,9 @@ def get_replica_status(job_id):
             state['validation'] = state['beats'].get('validation') or []
         except (OSError, ValueError):
             pass
+    state['frame_urls'] = frame_urls(state)
+    state['stage_label'] = stage_label(state.get('stage'))
+    state['phase'] = phase_of(state.get('stage'))
     return state
 
 

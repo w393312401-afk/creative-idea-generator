@@ -97,6 +97,33 @@ def test_scene_state_rejects_lingering_temporary_object_at_furnishing_phase():
     assert any("temporary construction objects" in error for error in errors)
 
 
+def test_reverse_engineered_ladders_may_keep_temporary_objects_through_furnishing():
+    """复刻线豁免清场那一条。
+
+    这条规则审的是施工纪律，对原创单成立；而复刻单交付的是对一条真实成片的转录，
+    原片里那块防护布确实铺到了搬家具那一拍。对着照实转录判"你不该这样施工"，
+    拦下的不是缺陷是真实——在此之前它会把每一单复刻都判死。
+    """
+    beat1 = _beat(1, "installation")
+    beat1["introduced_objects"] = ["scaffolding"]
+    beat2 = _beat(2, "furnishing")
+    states = build_scene_states([beat1, beat2])
+    assert not any("temporary construction objects" in e
+                   for e in validate_scene_states(states, allow_lingering_temporaries=True))
+
+
+def test_the_replica_exemption_is_scoped_to_that_one_rule():
+    """豁免只放清场那一条。状态账自身对不对得上（时序、重复移除、持久件不得拆除）
+    与题材来源无关，复刻单错了照样是错。"""
+    beat1 = _beat(1, "installation")
+    beat1["introduced_objects"] = ["marble archway"]
+    beat2 = _beat(2, "covering")
+    beat2["removed_objects"] = ["marble archway"]
+    errors = validate_scene_states(build_scene_states([beat1, beat2]),
+                                   allow_lingering_temporaries=True)
+    assert any("persistent structural element" in error for error in errors)
+
+
 def test_scene_state_allows_persistent_and_cleared_temporary_objects_through_full_flow():
     """正常翻新流程不应被误伤：工具及时清场、结构件全程保留都不该报错。"""
     beat1 = _beat(1, "installation")

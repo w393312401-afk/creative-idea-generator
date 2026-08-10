@@ -41,9 +41,34 @@ class BaseComposer:
         self.config = config
         self.state = state
 
+    def banned_elements_block(self):
+        """反推复刻线的负面清单段落。非复刻单返回空串。
+
+        `banned_elements` 是 Pass B 从帧事实里反推出来的「这类改造通常会有、但原片里
+        一帧都没出现」的东西。2026-08-10 之前它只在成品提示词上做事后 substring 扫描：
+        写手从未见过这份清单，扫出命中也只是记一笔就照常交付——一道声称存在的门禁，
+        实际是张事后报告单。现在它进 system prompt，命中率的问题在写之前就解决掉，
+        `banned_element_hits` 退回它本来该是的角色：交付前的兜底复核。
+        """
+        brief = (self.state or {}).get('parsed_brief') or {}
+        banned = [str(x).strip() for x in (brief.get('banned_elements') or []) if str(x).strip()]
+        if not banned:
+            return ""
+        return (
+            "\n==================== BANNED ELEMENTS (HARD, THIS JOB ONLY) ====================\n"
+            "This job reproduces the beat ladder of a real reference film. The following things "
+            "are exactly the ones a renovation of this type would plausibly involve but that "
+            "appear in NO frame of that film. They are absent on purpose — writing them in would "
+            "invent work the reference never showed:\n"
+            + "\n".join(f"- {x}" for x in banned)
+            + "\nNever name any of these in a VIDEO or IMAGE prompt, in any wording, including as "
+              "something absent, removed, or not present. If a beat seems to need one, the beat "
+              "is describing work the reference film did not contain — write only what the beat's "
+              "own declared fields state.\n")
+
     def batch_system_prompt(self, config, packet, scup_ref, tbcp_ref):
         """批量直出调用的共享 system prompt（每拍都相同的那部分）。"""
-        return pp._batch_shared_system_prompt(packet, scup_ref, tbcp_ref)
+        return pp._batch_shared_system_prompt(packet, scup_ref, tbcp_ref) + self.banned_elements_block()
 
     def single_beat_system_prompt(self, config, i, contract, packet, compiled_images,
                                   compiled_videos, scup_ref, tbcp_ref_i):
@@ -126,7 +151,7 @@ Instructions:
 "z_depth_scale": "depth scale if mentioned (e.g. 50%, default to 50%)"
   }}
 ]
-"""
+{self.banned_elements_block()}"""
 
     def apply_proactive_fixes(self, i, video_prompt, image_prompt, packet, mode, is_last,
                               is_threshold_or_reveal, beat=None, config=None, family=None):

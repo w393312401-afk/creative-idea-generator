@@ -1476,7 +1476,7 @@ def render_staged_worker(task_id, config, title, prompt_block):
         set_project_key_context(None)
 
 
-def stepped_pipeline_start_worker(task_id, config, dimensions):
+def stepped_pipeline_start_worker(task_id, config, dimensions, precomposed=None):
     """Starts the stepped pipeline: compose Phase 1 → render anchor → pause at review_anchor.
     The pipeline is then advanced via stepped_pipeline_advance_worker calls."""
     t = get_or_create_task(task_id, dimensions)
@@ -1501,7 +1501,8 @@ def stepped_pipeline_start_worker(task_id, config, dimensions):
         set_cancel_check_sink(lambda: t["cancel_event"].is_set())
         try:
             with _fx_browser_slot(task_id, 'stepped', t['cancel_event']):
-                pipeline_state = start_stepped_pipeline(config, dimensions, on_progress=progress_cb)
+                pipeline_state = start_stepped_pipeline(config, dimensions, on_progress=progress_cb,
+                                                        precomposed=precomposed)
         finally:
             set_cancel_check_sink(None)
 
@@ -1715,8 +1716,16 @@ def _replica_worker(task_id, config, job_id, label, run, task_type='replica'):
         set_project_key_context(None)
 
 
+def replica_extract_worker(task_id, config, job_id):
+    """只抽帧，停在 confirm_cost 成本确认卡点。不花模型钱，所以不必先问用户。"""
+    from replica_pipeline import extract_replica_job
+    _replica_worker(task_id, config, job_id, '抽帧',
+                    lambda cb: extract_replica_job(config, job_id, on_progress=cb),
+                    task_type='replica_extract')
+
+
 def replica_start_worker(task_id, config, job_id, degraded=False):
-    """抽帧 → Pass A → Pass B，停在 review_beats 人工卡点。"""
+    """Pass A → Pass B，停在 review_beats 人工卡点。"""
     from replica_pipeline import start_replica_job
     _replica_worker(task_id, config, job_id, '反推流水线',
                     lambda cb: start_replica_job(config, job_id, on_progress=cb, degraded=degraded))
@@ -3227,8 +3236,22 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             if not self._gate():
                 return
             try:
-                from replica_pipeline import list_replica_jobs
-                self._send_json({'status': 'ok', 'jobs': list_replica_jobs()})
+                from replica_pipeline import list_replica_jobs, stage_catalog
+                jobs = list_replica_jobs()
+                # 跑着的任务连同它的 task_id 一起下发。前端刷新/切走再回来时靠它重连
+                # SSE —— 在此之前刷新一次就与任务失联：页面既不显示"在跑"，还会摆出
+                # 「开始反推」按钮诱导用户再点一次，把同一笔视觉调用付两遍。
+                running = {}
+                with ACTIVE_TASKS_LOCK:
+                    for task_id, task in ACTIVE_TASKS.items():
+                        if task.get('status') != 'running':
+                            continue
+                        job = str((task.get('dimensions') or {}).get('replica_job_id') or '')
+                        if job:
+                            running[job] = task_id
+                for row in jobs:
+                    row['active_task_id'] = running.get(row.get('job_id'))
+                self._send_json({'status': 'ok', 'jobs': jobs, 'catalog': stage_catalog()})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -4845,6 +4868,34 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/replica/extract':
+            # 只抽帧，停在成本确认卡点。与 /api/replica/start 分开是刻意的：抽帧是本地
+            # ffmpeg（不花模型钱），Pass A 才是大头，两者之间必须留一个用户点头的位置。
+            try:
+                if not self._gate(with_rate=True, rate_action='compose'):
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                job_id = (body.get('job_id') or '').strip()
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                config['_project_key'] = job_id
+
+                import uuid
+                task_id = f"replica_ext_{uuid.uuid4().hex}"
+                cleanup_old_tasks()
+                get_or_create_task(task_id, replica_task_dims(job_id, 'replica_extract'))
+
+                threading.Thread(
+                    target=replica_extract_worker,
+                    args=(task_id, config, job_id),
+                    daemon=True
+                ).start()
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/replica/start':
             try:
                 if not self._gate(with_rate=True, rate_action='compose'):
@@ -4922,6 +4973,70 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                  'validation': state.get('validation') or []})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=400)
+
+        elif path == '/api/replica/cancel':
+            # 打断正在跑的那一轮，但**不废掉 job**：stage 留在原地，用户改完还能重试。
+            # 后端的 cancel_event 通路一直都在（_replica_worker 捕 GenerationCancelled），
+            # 只是从来没有任何 UI 或路由去按它——一个跑错了的 Pass A 只能干等它烧完。
+            try:
+                if not self._gate():
+                    return
+                body = self._read_json_body()
+                job_id = (body.get('job_id') or '').strip()
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                cancelled = []
+                with ACTIVE_TASKS_LOCK:
+                    for task_id, task in ACTIVE_TASKS.items():
+                        if task.get('status') != 'running':
+                            continue
+                        if str((task.get('dimensions') or {}).get('replica_job_id') or '') == job_id:
+                            task['cancel_event'].set()
+                            cancelled.append(task_id)
+                self._send_json({'status': 'ok', 'cancelled': cancelled})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/handoff':
+            # 复刻的终点原先是一个 <pre> 加一个复制按钮：提示词生成完就没有下一步了，
+            # 而 /api/stepped/start 只要 dimensions —— 一步之遥没接上。这条路由把它接上，
+            # 并把复刻侧已经合成、且已过 banned 门禁的 Phase 1 产物一并递过去，
+            # 让分步管线跳过重合成（否则渲的就不是审过的那一份）。
+            try:
+                if not self._gate(with_rate=True, rate_action='compose'):
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                job_id = (body.get('job_id') or '').strip()
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                if not _require_fx_admission(self):
+                    return
+
+                from replica_pipeline import handoff_to_render
+                dimensions, project_key, precomposed = handoff_to_render(job_id)
+                config['_project_key'] = project_key
+
+                import uuid
+                task_id = f"stepped_{uuid.uuid4().hex}"
+                cleanup_old_tasks()
+                get_or_create_task(task_id, {"type": "stepped", "theme": project_key,
+                                             "replica_job_id": job_id,
+                                             "userId": config.get('googleFxUserId') or None})
+
+                threading.Thread(
+                    target=stepped_pipeline_start_worker,
+                    args=(task_id, config, dimensions, precomposed),
+                    daemon=True
+                ).start()
+                self._send_json({'status': 'ok', 'task_id': task_id, 'title': project_key,
+                                 'reused_compose': bool(precomposed)})
+            except ValueError as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/replica/delete':
             try:

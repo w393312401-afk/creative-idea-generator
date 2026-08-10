@@ -104,23 +104,54 @@ class TestExtractGate(ReplicaTempRootCase):
             with self.assertRaises(RuntimeError):
                 rp.run_extract(state)
 
-    def test_successful_extract_lands_on_review_frames_with_a_cost_estimate(self):
+    def _extracted_job(self):
         state = self._ingest()
         collage = os.path.join(rp.job_dir(state['job_id']), 'clip_collage.jpg')
         with open(collage, 'wb') as f:
             f.write(b'jpg')
         self._write_overview(state['job_id'], collage)
-
         with patch.object(rp.subprocess, 'run') as run, \
              patch.object(rp, '_analyzer_script', return_value='/fake/analyze.py'):
             run.return_value.returncode = 0
-            out = rp.run_extract(state)
+            return rp.run_extract(state), collage
 
-        self.assertEqual(out['stage'], 'review_frames')
+    def test_extract_stops_at_the_cost_gate_instead_of_running_on_into_pass_a(self):
+        """成本卡点必须在代码里真的存在。
+
+        2026-08-10 之前 extract 结束直接续跑 Pass A，预估只作为一行 SSE 文案闪过去，
+        UI 上那对「完整 / 降级」单选框首跑时根本没机会出现——每一单都默默走了完整档。
+        Pass A 是整条线唯一的大额支出，它前面必须有个真的停顿。
+        """
+        out, collage = self._extracted_job()
+        self.assertEqual(out['stage'], 'confirm_cost')
         self.assertEqual(out['overview']['collage'], collage)
-        # 开跑前必须能把预估摆给用户看，否则用户是在盲烧视觉调用的钱。
+        # 停下来的同时必须已经算好预估，否则这个卡点上没东西可看。
         self.assertIn('full', out['cost_estimate'])
         self.assertIn('degraded', out['cost_estimate'])
+
+    def test_extract_only_entry_point_does_not_touch_pass_a(self):
+        state = self._ingest()
+        collage = os.path.join(rp.job_dir(state['job_id']), 'clip_collage.jpg')
+        with open(collage, 'wb') as f:
+            f.write(b'jpg')
+        self._write_overview(state['job_id'], collage)
+        with patch.object(rp.subprocess, 'run') as run, \
+             patch.object(rp, '_analyzer_script', return_value='/fake/analyze.py'), \
+             patch.object(rp, 'run_reverse') as reverse_call:
+            run.return_value.returncode = 0
+            out = rp.extract_replica_job({}, state['job_id'])
+        self.assertEqual(out['stage'], 'confirm_cost')
+        reverse_call.assert_not_called()
+
+    def test_returning_to_the_cost_gate_does_not_re_extract(self):
+        """换个采样档位回来时不该再跑一遍几分钟的 ffmpeg。"""
+        out, _collage = self._extracted_job()
+        out['stage'] = 'review_beats'
+        rp._save_state(out)
+        with patch.object(rp, 'run_extract') as extract_call:
+            back = rp.extract_replica_job({}, out['job_id'])
+        extract_call.assert_not_called()
+        self.assertEqual(back['stage'], 'confirm_cost')
 
     def test_a_job_that_died_during_extract_re_extracts_on_retry(self):
         """判据是磁盘上有没有 overview，不是 stage——只看 stage 会让抽帧失败的 job
@@ -188,18 +219,151 @@ class TestComposeGate(ReplicaTempRootCase):
         self.assertEqual(out['stage'], 'completed')
         self.assertEqual(out['title'], '石屋工作室')
 
-    def test_banned_elements_hit_in_the_prompt_is_reported(self):
+    def test_banned_elements_hit_blocks_delivery_instead_of_just_reporting(self):
+        """2026-08-10：命中从"记一笔然后照常交付"改成真的拦下。
+
+        旧行为下这里断言的是 stage == 'completed' —— 扫出命中、写进创意库、任务显示
+        已完成，只在文案里说一句"交付前必须重写"。没有任何东西拦着，用户拿它去渲染，
+        画面里就长出原片根本没有的东西。门禁不堵就只是报告单。
+        """
         state = self._ingest()
         state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': ['excavator']}
         state['validation'] = []
         rp._save_state(state)
         with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'title': 't'}), \
              patch('prompt_pipeline.compose_remaining_beats',
-                   return_value='VIDEO 1: an EXCAVATOR swings into frame'):
+                   return_value='VIDEO 1: an EXCAVATOR swings into frame'), \
+             patch('server_common.write_library_item') as write_item:
             out = rp.run_compose(state, {})
         self.assertEqual(out['banned_hits'], ['excavator'])
-        # 命中不阻断交付——它是「交付前必须重写」的标记，不是流水线故障。
+        self.assertEqual(out['stage'], 'audit_failed')
+        # 不入库：项目工作台上不该出现一份带幻觉元素的提示词。
+        write_item.assert_not_called()
+
+    def test_a_clean_prompt_still_completes_and_publishes(self):
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': ['excavator']}
+        state['validation'] = []
+        rp._save_state(state)
+        with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'title': 't'}), \
+             patch('prompt_pipeline.compose_remaining_beats',
+                   return_value='VIDEO 1: a lone worker trowels the wall'), \
+             patch('server_common.write_library_item') as write_item:
+            out = rp.run_compose(state, {})
+        self.assertEqual(out['banned_hits'], [])
         self.assertEqual(out['stage'], 'completed')
+        write_item.assert_called_once()
+
+    def test_a_blocked_job_cannot_be_handed_off_to_the_renderer(self):
+        """拦下交付却还能送去渲染，等于没拦。"""
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': ['excavator']}
+        state['validation'] = []
+        rp._save_state(state)
+        with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'title': 't'}), \
+             patch('prompt_pipeline.compose_remaining_beats',
+                   return_value='VIDEO 1: an EXCAVATOR swings into frame'), \
+             patch('server_common.write_library_item'):
+            rp.run_compose(state, {})
+        with self.assertRaises(ValueError) as ctx:
+            rp.handoff_to_render(state['job_id'])
+        self.assertIn('excavator', str(ctx.exception))
+
+
+class TestStageCatalogAndFrameUrls(ReplicaTempRootCase):
+    def test_every_stage_has_a_label(self):
+        """漏一个 stage，工作台上就露出 `confirm_cost` 这种内部名。"""
+        for stage in rp.STAGES:
+            self.assertIn(stage, rp.STAGE_LABELS, f'{stage} 少了中文标签')
+
+    def test_every_stage_belongs_to_exactly_one_visible_phase(self):
+        """四阶段阶梯要能标出任意 stage 的位置；漏掉的会静默落回第一段。"""
+        for stage in rp.STAGES:
+            if stage == 'cancelled':
+                continue
+            owners = [k for k, _lab, stages in rp.PHASES if stage in stages]
+            self.assertEqual(len(owners), 1, f'{stage} 归属于 {owners}，应当恰好一个阶段')
+
+    def test_job_rows_carry_the_label_so_the_frontend_need_not_copy_it(self):
+        state = self._ingest()
+        row = next(r for r in rp.list_replica_jobs() if r['job_id'] == state['job_id'])
+        self.assertEqual(row['stage_label'], rp.STAGE_LABELS['ingest'])
+        self.assertEqual(row['phase'], 'material')
+
+    def test_frame_urls_come_from_disk_not_from_a_filename_guess(self):
+        """目录布局是抽帧脚本的实现细节。前端拿正则猜 storyboard/review_frames，
+        脚本一改目录名，证据帧就在最需要看图的地方碎成一片。"""
+        state = self._ingest()
+        for sub, name in (('review_frames', 'review_001.png'), ('storyboard', 'scene_01.png')):
+            folder = os.path.join(rp.job_dir(state['job_id']), sub)
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, name), 'wb') as f:
+                f.write(b'png')
+        urls = rp.get_replica_status(state['job_id'])['frame_urls']
+        self.assertTrue(urls['review_001.png'].endswith('/review_frames/review_001.png'))
+        self.assertTrue(urls['scene_01.png'].endswith('/storyboard/scene_01.png'))
+
+    def test_a_variant_resolves_frames_against_its_source_job(self):
+        """变体自己不存帧，几百张 PNG 不该复制一遍。"""
+        source = self._ingest()
+        folder = os.path.join(rp.job_dir(source['job_id']), 'review_frames')
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, 'review_007.png'), 'wb') as f:
+            f.write(b'png')
+        urls = rp.frame_urls({'job_id': 'replica_variant', 'variant_of': source['job_id']})
+        self.assertIn(source['job_id'], urls['review_007.png'])
+
+
+class TestHandoffToRenderer(ReplicaTempRootCase):
+    """「送去分步管线渲染」。
+
+    这条交接最容易悄悄坏在一个地方：只把 dimensions 递过去。分步管线的
+    start_stepped_pipeline 自己会调一遍 compose_anchor_and_packet，于是渲染用的是
+    **重新合成的另一份**提示词——既白付一次 Phase 1 的钱，又让 banned 门禁失去意义
+    （审的是 A，渲的是 B）。所以交接必须带上已合成的 Phase 1 产物。
+    """
+
+    def _completed_job(self):
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': []}
+        state['validation'] = []
+        rp._save_state(state)
+        compose_state = {
+            'title': '石屋工作室', 'theme': 't', 'total_beats': 2,
+            'parsed_brief': {'mode': 'Standard'}, 'beat_ladder': [{'index': 1}],
+            'packet': {'world_lock': 'x'}, 'brief_fingerprint': 'fp',
+            'image_1_prompt': 'IMAGE 1: ...',
+            'compiled_images': {1: 'img one'}, 'compiled_videos': {1: 'vid one'},
+        }
+        with patch('prompt_pipeline.compose_anchor_and_packet', return_value=compose_state), \
+             patch('prompt_pipeline.compose_remaining_beats', return_value='IMAGE 1: a stone hut'), \
+             patch('server_common.write_library_item'):
+            rp.run_compose(state, {})
+        return state
+
+    def test_handoff_carries_the_already_composed_phase_one(self):
+        state = self._completed_job()
+        dims, title, precomposed = rp.handoff_to_render(state['job_id'])
+        self.assertEqual(title, '石屋工作室')
+        self.assertTrue(dims.get('reverse_engineered'))
+        self.assertIsNotNone(precomposed)
+        self.assertEqual(precomposed['packet'], {'world_lock': 'x'})
+        self.assertEqual(precomposed['beat_ladder'], [{'index': 1}])
+
+    def test_compiled_slot_keys_come_back_as_integers(self):
+        """compiled_images/videos 在合成器里是 {int: str}，过一趟 JSON 会变成 {"1": str}。
+        分步管线按整数下标取用，不还原就在第一拍 KeyError。"""
+        state = self._completed_job()
+        _dims, _title, precomposed = rp.handoff_to_render(state['job_id'])
+        self.assertEqual(precomposed['compiled_images'], {1: 'img one'})
+        self.assertEqual(precomposed['compiled_videos'], {1: 'vid one'})
+
+    def test_a_job_without_a_prompt_block_is_rejected(self):
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': []}
+        rp._save_state(state)
+        with self.assertRaises(ValueError):
+            rp.handoff_to_render(state['job_id'])
 
 
 class TestSaveBeats(ReplicaTempRootCase):

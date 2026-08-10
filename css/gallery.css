@@ -138,6 +138,36 @@
     color: var(--neon-cyan);
 }
 
+/* ── 显示方式切换（网格 / 大图 / 列表）───────────────────────────── */
+#panel-gallery .gallery-view-switch {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: rgba(var(--ink-rgb), 0.04);
+    flex-shrink: 0;
+}
+
+#panel-gallery .gallery-view-btn {
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1;
+    padding: 5px 9px;
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+#panel-gallery .gallery-view-btn:hover { color: var(--neon-cyan); }
+
+#panel-gallery .gallery-view-btn.active {
+    background: rgba(176, 123, 82, 0.14);
+    color: var(--neon-cyan);
+}
+
 #panel-gallery .gallery-toolbar-right {
     display: flex;
     align-items: center;
@@ -410,12 +440,13 @@
     cursor: pointer;
 }
 
-/* 悬停操作条 */
+/* 悬停操作条。它是 .gallery-thumb 的兄弟节点（不是子节点），靠负 margin 压回
+   缩略图底边 —— 36px = 按钮 26px + 上下 padding 各 5px，与自身实际高度对齐。
+   这么做是为了列表视图：那里用 order 把它甩到行尾，作为一排常显小按钮。 */
 #panel-gallery .gallery-card-actions {
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
+    position: relative;
+    z-index: 1;
+    margin-top: -36px;
     display: flex;
     justify-content: flex-end;
     gap: 4px;
@@ -474,6 +505,112 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+/* ── 显示方式：大图 ───────────────────────────────────────────────── */
+/* 只放大列宽下限。占位高度必须跟着一起改，否则未渲染卡片按 186px 占位、
+   进入视口后撑到 260px，滚动条会随滚动来回跳（见 .gallery-card 的注释）。 */
+#panel-gallery .gallery-scroll.view-large .gallery-grid {
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 16px;
+}
+
+#panel-gallery .gallery-scroll.view-large .gallery-card {
+    contain-intrinsic-size: auto 296px;
+}
+
+/* ── 显示方式：列表 ───────────────────────────────────────────────── */
+#panel-gallery .gallery-scroll.view-list .gallery-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+#panel-gallery .gallery-scroll.view-list .gallery-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 10px;
+    border-radius: 10px;
+    contain-intrinsic-size: auto 96px;   /* 缩略图 110×82 + 上下 padding */
+}
+
+#panel-gallery .gallery-scroll.view-list .gallery-thumb {
+    width: 110px;
+    flex: 0 0 auto;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+#panel-gallery .gallery-scroll.view-list .gallery-card-meta {
+    order: 2;
+    flex: 1;
+    min-width: 0;
+    flex-direction: row;
+    align-items: baseline;
+    gap: 12px;
+    padding: 0;
+}
+
+#panel-gallery .gallery-scroll.view-list .g-name {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+}
+
+#panel-gallery .gallery-scroll.view-list .g-sub {
+    flex: 0 0 auto;
+    font-size: 11px;
+}
+
+/* 行尾常显按钮条：去掉网格视图那套负 margin + 渐变遮罩 + 悬停淡入 */
+#panel-gallery .gallery-scroll.view-list .gallery-card-actions {
+    order: 3;
+    margin-top: 0;
+    flex: 0 0 auto;
+    padding: 0;
+    background: none;
+    opacity: 1;
+}
+
+#panel-gallery .gallery-scroll.view-list .g-act {
+    width: 24px;
+    height: 24px;
+    background: rgba(var(--ink-rgb), 0.06);
+    color: var(--text-secondary);
+}
+
+#panel-gallery .gallery-scroll.view-list .g-act:hover {
+    background: rgba(176, 123, 82, 0.75);
+    color: #fff;
+}
+
+/* 徽章按比例缩小而不是隐藏：「片段/封面」是这行是什么、「🔗 使用中」是删了会破图，
+   两条都是列表视图下唯一的来源（缩略图小到看不出类型）。 */
+#panel-gallery .gallery-scroll.view-list .gallery-kind-badge,
+#panel-gallery .gallery-scroll.view-list .gallery-inuse-badge {
+    right: 3px;
+    font-size: 9px;
+    padding: 1px 4px;
+    border-radius: 4px;
+}
+
+#panel-gallery .gallery-scroll.view-list .gallery-kind-badge { top: 3px; }
+#panel-gallery .gallery-scroll.view-list .gallery-inuse-badge { top: 20px; }
+
+#panel-gallery .gallery-scroll.view-list .gallery-play-badge {
+    width: 22px;
+    height: 22px;
+    font-size: 10px;
+}
+
+#panel-gallery .gallery-scroll.view-list .gallery-check {
+    opacity: 1;
+    left: 3px;
+    top: 3px;
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
 }
 
 /* ── 移动端微调 ───────────────────────────────────────────────────── */

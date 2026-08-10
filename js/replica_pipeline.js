@@ -11,18 +11,44 @@ let replicaTaskId = null;
 let replicaSSE = null;
 let replicaBusy = false;
 
+// stage → 中文标签的**兜底**副本。真源在 replica_pipeline.py 的 STAGE_LABELS，
+// 后端随 job 行下发 stage_label；这里只在拿不到时顶上（例如渲染一条本地拼出来的
+// 乐观状态）。projects.js 也读这一份，不再自己抄第三份。
 const REPLICA_STAGE_LABELS = {
     ingest: '已上传',
     extract: '抽帧中',
+    confirm_cost: '待确认成本',
     review_frames: '逐帧读取',
     cluster_beats: '聚类节拍',
     review_beats: '待人工核对',
     mutate_beats: '二创改写中',
     compose: '合成提示词',
     audit: '门禁校验',
+    audit_failed: '门禁未过',
     completed: '已完成',
     cancelled: '已取消',
 };
+
+// 用户看得见的四个阶段。后台十二个 stage 是状态机粒度，摆在 UI 上只会让人对着一个
+// chip 找不到对应区块。与 replica_pipeline.PHASES 同序同义。
+const REPLICA_PHASES = [
+    { key: 'material', label: '素材', stages: ['ingest', 'extract', 'confirm_cost'] },
+    { key: 'reverse', label: '反推', stages: ['review_frames', 'cluster_beats', 'mutate_beats'] },
+    { key: 'review', label: '核对节拍', stages: ['review_beats'] },
+    { key: 'deliver', label: '交付', stages: ['compose', 'audit', 'audit_failed', 'completed'] },
+];
+
+function replicaStageLabel(stageOrRow) {
+    if (stageOrRow && typeof stageOrRow === 'object') {
+        return stageOrRow.stage_label || REPLICA_STAGE_LABELS[stageOrRow.stage] || stageOrRow.stage || '';
+    }
+    return REPLICA_STAGE_LABELS[stageOrRow] || stageOrRow || '';
+}
+
+function replicaPhaseIndex(stage) {
+    const at = REPLICA_PHASES.findIndex(p => p.stages.includes(stage));
+    return at < 0 ? 0 : at;
+}
 
 const REPLICA_AXES = [
     { key: 'carrier', label: '载体替换', hint: '石屋 → 废弃巴士 / 船舱 / 地窖' },
@@ -74,7 +100,12 @@ function replicaFrameBase(state) {
     return `/outputs/replica_jobs/${state.variant_of || state.job_id}`;
 }
 
+// 服务端按磁盘上的实际位置给出 frame_urls；拿不到时才退回旧的猜法（老状态文件、
+// 或者 /api/replica/jobs 那条精简行）。猜法本身是个隐患：目录布局是抽帧脚本的实现
+// 细节，脚本一改目录名，证据帧就在最需要看图的地方碎成一片。
 function replicaFrameUrl(state, name) {
+    const known = (state.frame_urls || {})[name];
+    if (known) return known;
     const dir = /^scene_/.test(name) ? 'storyboard' : 'review_frames';
     return `${replicaFrameBase(state)}/${dir}/${encodeURIComponent(name)}`;
 }
@@ -106,12 +137,16 @@ function replicaRender() {
         ${replicaState ? replicaRenderJob(replicaState) : ''}
     `;
     replicaBindEvents();
+    // 重建 DOM 会把按钮的 disabled 一起丢掉。跑着的时候重渲染（例如刚开跑要让「中断」
+    // 露出来）之后不重新落一次 busy，整排按钮就又可点了——用户能在 Pass A 跑到一半时
+    // 再点一次「开始反推」。
+    if (replicaBusy) replicaSetBusy(true);
 }
 
 function replicaRenderUploader() {
     return `
     <div class="replica-card replica-uploader">
-        <div class="replica-card-title">① 上传成品视频</div>
+        <div class="replica-card-title">上传成品视频</div>
         <p class="replica-hint">
             抽帧密度按延时视频调过（基线 2fps + 状态跳变密采 + 首尾密采），不需要你调参数。
             上传后会先给出待送审帧数与调用次数预估，确认了才开始烧钱。
@@ -132,7 +167,7 @@ function replicaRenderJobList() {
                 <span class="replica-job-name">
                     ${job.variant_of ? '🧬 ' : '🎬 '}${escapeHtmlReplica(job.video_name || job.job_id)}
                 </span>
-                <span class="replica-chip">${escapeHtmlReplica(REPLICA_STAGE_LABELS[job.stage] || job.stage)}</span>
+                <span class="replica-chip">${escapeHtmlReplica(replicaStageLabel(job))}</span>
                 ${job.beat_count ? `<span class="replica-chip">${job.beat_count} 拍</span>` : ''}
                 ${job.error ? '<span class="replica-chip replica-chip-error">出错</span>' : ''}
             </button>
@@ -146,17 +181,31 @@ function replicaRenderJobList() {
     </div>`;
 }
 
+function replicaRenderPhases(state) {
+    // 页面上原先编着 ①②③④⑤，后台却有十二个 stage —— chip 显示「聚类节拍」时用户
+    // 在页面上找不到任何一块对应它。这条阶梯把两者对齐：四个阶段，各自对应页面上
+    // 真实存在的一块区域。
+    const at = replicaPhaseIndex(state.stage);
+    const failed = state.stage === 'audit_failed' || !!state.error;
+    return `<ol class="replica-phases">${REPLICA_PHASES.map((p, i) => {
+        const cls = i < at ? 'done' : (i === at ? (failed ? 'failed' : 'current') : 'todo');
+        return `<li class="replica-phase ${cls}"><span class="replica-phase-dot">${i + 1}</span>
+            <span class="replica-phase-label">${p.label}</span></li>`;
+    }).join('')}</ol>`;
+}
+
 function replicaRenderJob(state) {
     return `
     <div class="replica-card">
         <div class="replica-card-title">
             ${state.variant_of ? '🧬 二创变体' : '🎬 1:1 复刻'} · ${escapeHtmlReplica(state.video_name || state.job_id)}
-            <span class="replica-chip">${escapeHtmlReplica(REPLICA_STAGE_LABELS[state.stage] || state.stage)}</span>
+            <span class="replica-chip">${escapeHtmlReplica(replicaStageLabel(state))}</span>
         </div>
+        ${replicaRenderPhases(state)}
         ${state.error ? `<div class="replica-banner replica-banner-error">${escapeHtmlReplica(state.error)}</div>` : ''}
         ${replicaRenderExtract(state)}
         ${replicaRenderProgress()}
-        ${replicaRenderBeats(state)}
+        <div id="replica-beats-host">${replicaRenderBeats(state)}</div>
         ${replicaRenderOutput(state)}
     </div>`;
 }
@@ -168,17 +217,22 @@ function replicaRenderExtract(state) {
     const est = state.cost_estimate || {};
     const full = est.full || {};
     const degraded = est.degraded || {};
-    // 判据是「有没有节拍」，不是 stage 白名单。按 stage 白名单渲染会让任何在抽帧之后
-    // 失败的任务（Pass A 超时、Pass B 解析失败…）变成死胡同：错误看得见，却没有任何
-    // 按钮能往下走，只能删任务重传。
+    // 采样档位选择框任何时候都渲染。
+    //
+    // 原先的判据是 `canStart = !hasBeats`：一旦跑出过节拍就再也看不到这对单选框，
+    // 想换个档位重跑 Pass A 只能删任务重传。更糟的是首跑——上传后代码直接续跑
+    // Pass A，这个框在首跑时压根没机会出现，于是「先看预估再决定」从来没发生过，
+    // 每一单都默默走了完整档。现在 extract 停在 confirm_cost，这里就是那个卡点。
     const hasBeats = !!(state.beats && (state.beats.beats || []).length);
-    const canStart = !hasBeats;
     // 重跑过一次的（已有帧事实或上次失败），标清楚这是重试而且不重付视觉调用的钱。
     const isRetry = !!state.error || !!state.facts;
+    const atCostGate = state.stage === 'confirm_cost';
+    const startLabel = atCostGate ? '确认并开始反推'
+        : (isRetry ? '重试反推' : (hasBeats ? '换档位重跑反推' : '开始反推'));
 
     return `
     <div class="replica-section">
-        <div class="replica-card-title">② 抽帧结果</div>
+        <div class="replica-card-title">抽帧结果</div>
         <div class="replica-metrics">
             <span>时长 ${ov.duration_sec ?? '—'}s</span>
             <span>抽帧 ${ov.frame_count ?? '—'} 张</span>
@@ -189,8 +243,11 @@ function replicaRenderExtract(state) {
             <img class="replica-collage" src="${collage}" alt="关键帧拼贴图" loading="lazy">
         </a>` : `<div class="replica-banner replica-banner-error">
             拼贴图缺失。它是节拍映射的前置门禁，缺了等于没看过整条序列就要定义节拍。</div>`}
-        ${canStart ? `
         <div class="replica-cost">
+            ${atCostGate ? `<p class="replica-hint replica-cost-gate">
+                <b>抽帧已完成，还没有开始花钱。</b>Pass A 是整条线的成本大头——
+                下面两档决定送多少帧给多模态模型，选好再按开始。
+            </p>` : ''}
             <label class="replica-radio">
                 <input type="radio" name="replica-mode" value="full" ${state.degraded ? '' : 'checked'}>
                 <span>完整（${full.frame_count || 0} 帧 / 约 ${full.batch_count || 0} 次视觉调用）</span>
@@ -200,19 +257,34 @@ function replicaRenderExtract(state) {
                 <span>降级（${degraded.frame_count || 0} 帧 / 约 ${degraded.batch_count || 0} 次）——
                       只读事件的起止与峰值帧，<b>事件之间发生了什么全靠推断，节拍精度更低</b></span>
             </label>
+            ${full.peak_frame_count ? `<p class="replica-hint">
+                另加 ${full.peak_batch_count || 0} 次峰值帧复核（${full.peak_frame_count} 张）。
+                节拍边界恰好落在这几帧上，读糊了整条阶梯会整体错位，所以默认开；
+                要关就把配置里的 <code>peakVerifyModel</code> 设成 <code>off</code>。
+            </p>` : ''}
             ${isRetry ? `<p class="replica-hint">
                 ${state.facts ? `已读过 ${state.facts.frame_count || 0} 帧，帧事实走磁盘缓存——
                      重试只重跑聚类，不会重付视觉调用的钱。` : '上次没跑完，可以直接重试。'}
             </p>` : ''}
+            ${hasBeats && !atCostGate ? `<p class="replica-hint">
+                已经有一份节拍阶梯了。换档位重跑会覆盖它——你在下面改过的内容会丢。
+            </p>` : ''}
             <button type="button" id="replica-start-btn" class="action-btn primary-btn">
-                ${isRetry ? '重试反推' : '开始反推'}
+                ${startLabel}
             </button>
-        </div>` : ''}
+        </div>
     </div>`;
 }
 
 function replicaRenderProgress() {
-    return `<div id="replica-progress" class="replica-progress" style="display:none;"></div>`;
+    // 跑着的时候要有个能按停的东西。后端的 cancel_event 通路一直都在，只是从来没有
+    // 按钮去按它——一轮跑错了的 Pass A 此前只能干等它烧完。
+    const running = !!replicaSSE;
+    return `
+    <div id="replica-progress" class="replica-progress" style="display:${running ? 'block' : 'none'};"></div>
+    ${running ? `<div class="replica-actions">
+        <button type="button" id="replica-cancel-btn" class="action-btn text-btn">中断这一轮</button>
+    </div>` : ''}`;
 }
 
 function replicaRenderBeats(state) {
@@ -221,18 +293,17 @@ function replicaRenderBeats(state) {
     const violations = state.validation || doc.validation || [];
     const errors = violations.filter(v => v.level === 'error');
     const warns = violations.filter(v => v.level !== 'error');
-    // 这一类告警不是"可以再想想"，而是"照这样按下去合成一定会被打回"。折叠起来等于没提示。
-    const predictsFailure = warns.some(v => v.code === 'temporary_object_lingering');
+    // 2026-08-10：这里原先把 temporary_object_lingering 特判成"会让合成直接失败"并强制
+    // 展开。那条冲突已经在源头修掉（reverse_engineered 让合成器豁免清场规则），现在它
+    // 只是一条"原片里确实有、复刻会照实保留"的提示，不再预示失败。
 
     const banner = `
         ${errors.length ? `<div class="replica-banner replica-banner-error">
             <b>${errors.length} 项硬伤必须先修掉才能合成：</b>
             <ul>${errors.map(v => `<li>${escapeHtmlReplica(v.message)}</li>`).join('')}</ul>
         </div>` : `<div class="replica-banner replica-banner-ok">节拍阶梯已通过全部机械校验。</div>`}
-        ${warns.length ? `<details class="replica-banner replica-banner-warn" ${predictsFailure ? 'open' : ''}>
-            <summary>${predictsFailure
-                ? `${warns.length} 项待确认，其中有一项会让合成直接失败`
-                : `${warns.length} 项待人工确认`}</summary>
+        ${warns.length ? `<details class="replica-banner replica-banner-warn">
+            <summary>${warns.length} 项待人工确认</summary>
             <ul>${warns.map(v => `<li>${escapeHtmlReplica(v.message)}</li>`).join('')}</ul>
         </details>` : ''}`;
 
@@ -241,7 +312,7 @@ function replicaRenderBeats(state) {
 
     return `
     <div class="replica-section">
-        <div class="replica-card-title">③ 节拍阶梯（${doc.beats.length} 拍）——唯一的人工卡点</div>
+        <div class="replica-card-title">节拍阶梯（${doc.beats.length} 拍）——唯一的人工卡点</div>
         <p class="replica-hint">
             这是整条链路上唯一能拦住「模型脑补了一个不存在的工序」的地方。对着证据帧核对，
             改完记得保存——保存会立刻重跑一遍校验。
@@ -319,7 +390,7 @@ function replicaRenderVariantForm(state) {
         </label>`).join('');
     return `
     <div class="replica-section replica-variant">
-        <div class="replica-card-title">④ 二创（可选）</div>
+        <div class="replica-card-title">二创（可选）</div>
         <p class="replica-hint">
             骨架不动，只沿轴换内容。<b>最多同时变两轴</b>——三轴以上产出的已经不是「参考爆款」，
             而是一个新选题，那条路走选题发动机更合适。
@@ -334,14 +405,29 @@ function replicaRenderVariantForm(state) {
 function replicaRenderOutput(state) {
     if (!state.prompt_block) return '';
     const hits = state.banned_hits || [];
+    const blocked = state.stage === 'audit_failed';
+    // 提示词只活在这一页里的话，用户合成完就没有下一步了。两个去向都要写出来：
+    // 一个是创意库（项目工作台能看到），一个是分步管线（真正渲染成片）。
     return `
     <div class="replica-section">
-        <div class="replica-card-title">⑤ 提示词包${state.title ? ` · ${escapeHtmlReplica(state.title)}` : ''}</div>
-        ${hits.length ? `<div class="replica-banner replica-banner-error">
-            命中 ${hits.length} 个禁用元素（原片里并不存在）：${escapeHtmlReplica(hits.join('、'))}。
-            交付前必须重写这些表述。</div>` : ''}
+        <div class="replica-card-title">提示词包${state.title ? ` · ${escapeHtmlReplica(state.title)}` : ''}</div>
+        ${blocked ? `<div class="replica-banner replica-banner-error">
+            <b>已拦下交付：命中 ${hits.length} 个禁用元素</b>（原片里并不存在）：
+            ${escapeHtmlReplica(hits.join('、'))}。<br>
+            这份提示词<b>没有写入创意库</b>，也不能送去渲染——照它渲出来的画面里会长出原片
+            没有的东西。两个改法：把这些表述从节拍阶梯里去掉后重新合成；
+            或者你确认它们其实出现在原片里，那就把它们从「禁用元素」里删掉再重跑。
+        </div>` : `<div class="replica-banner replica-banner-ok">
+            已通过禁用元素门禁，并写入创意库${state.library_id
+                ? `（项目工作台可见：${escapeHtmlReplica(state.title || state.library_id)}）` : ''}。
+        </div>`}
         <div class="replica-actions">
             <button type="button" id="replica-copy-btn" class="action-btn text-btn">复制全部</button>
+            ${blocked
+                ? `<button type="button" id="replica-recompose-btn" class="action-btn primary-btn"
+                           title="回到节拍阶梯改完后重新合成">重新合成</button>`
+                : `<button type="button" id="replica-render-btn" class="action-btn primary-btn"
+                           title="用这份已过门禁的提示词直接开分步渲染，不重新合成">送去分步管线渲染</button>`}
         </div>
         <pre class="replica-prompt-block" id="replica-prompt-block">${escapeHtmlReplica(state.prompt_block)}</pre>
     </div>`;
@@ -360,10 +446,9 @@ function replicaBindEvents() {
 
     on('#replica-upload-btn', replicaUpload);
     on('#replica-start-btn', replicaStart);
-    on('#replica-save-btn', () => replicaSaveBeats(true));
-    on('#replica-recluster-btn', () => replicaAdvance('recluster'));
-    on('#replica-compose-btn', replicaCompose);
-    on('#replica-variant-btn', replicaVariant);
+    on('#replica-recompose-btn', replicaCompose);
+    on('#replica-render-btn', replicaSendToRender);
+    on('#replica-cancel-btn', replicaCancelRun);
     on('#replica-copy-btn', () => {
         const block = root.querySelector('#replica-prompt-block');
         if (block) navigator.clipboard.writeText(block.textContent).then(
@@ -397,18 +482,61 @@ function replicaBindEvents() {
         });
     });
 
-    root.querySelectorAll('[data-split]').forEach(btn => {
+    replicaBindBeatEvents(root);
+}
+
+// 节拍区自己的绑定，单独一函数。
+//
+// 这样 replicaRefreshBeats 可以只重建节拍区、只重绑节拍区的监听。整页重建加整页重绑
+// 会在未变的节点上叠加第二份监听（点一次触发两次），而节拍区里恰恰是拆拍/合拍这种
+// 重复执行会直接改坏数据的操作。
+function replicaBindBeatEvents(scope) {
+    if (!scope) return;
+    const on = (sel, fn, evt = 'click') => {
+        const el = scope.querySelector(sel);
+        if (el) el.addEventListener(evt, fn);
+    };
+
+    on('#replica-save-btn', (e) => replicaSaveBeats(true, e.currentTarget));
+    on('#replica-recluster-btn', (e) => replicaAdvance('recluster', {}, e.currentTarget));
+    on('#replica-compose-btn', (e) => replicaCompose(e.currentTarget));
+    on('#replica-variant-btn', (e) => replicaVariant(e.currentTarget));
+
+    scope.querySelectorAll('[data-split]').forEach(btn => {
         btn.addEventListener('click', () => replicaSplitBeat(parseInt(btn.dataset.split, 10)));
     });
-    root.querySelectorAll('[data-merge]').forEach(btn => {
+    scope.querySelectorAll('[data-merge]').forEach(btn => {
         btn.addEventListener('click', () => replicaMergeBeat(parseInt(btn.dataset.merge, 10)));
     });
 
+    // 编辑即写回内存 model。原先是每次动作前用 replicaCollectBeats 全量扫一遍 DOM 反推
+    // 出文档——那要求 DOM 必须一直是唯一真相，于是任何局部刷新都不敢做，只能整页重建，
+    // 滚动位置和焦点每次都丢。现在 model 是真相，DOM 只是它的投影。
+    scope.querySelectorAll('[data-beat][data-key]').forEach(el => {
+        el.addEventListener('input', () => {
+            const beat = ((replicaState || {}).beats || {}).beats || [];
+            const target = beat[parseInt(el.dataset.beat, 10)];
+            if (!target) return;
+            const key = el.dataset.key;
+            target[key] = Array.isArray(target[key])
+                ? el.value.split('\n').map(s => s.trim()).filter(Boolean)
+                : el.value.trim();
+        });
+    });
+
+    const banned = scope.querySelector('#replica-banned');
+    if (banned) {
+        banned.addEventListener('input', () => {
+            if (!replicaState || !replicaState.beats) return;
+            replicaState.beats.banned_elements = replicaSplitList(banned.value);
+        });
+    }
+
     // 只在轴数超上限时拦一下，别默默改用户的勾选——用户自己取消一个，比我们替他决定
     // 丢掉哪一个要好。
-    root.querySelectorAll('.replica-axis-box').forEach(box => {
+    scope.querySelectorAll('.replica-axis-box').forEach(box => {
         box.addEventListener('change', () => {
-            const checked = root.querySelectorAll('.replica-axis-box:checked');
+            const checked = scope.querySelectorAll('.replica-axis-box:checked');
             if (checked.length > REPLICA_MAX_AXES) {
                 box.checked = false;
                 replicaToast(`最多同时变 ${REPLICA_MAX_AXES} 条轴`, true);
@@ -417,20 +545,56 @@ function replicaBindEvents() {
     });
 }
 
-function replicaToast(msg, isError) {
-    const el = replicaRoot() && replicaRoot().querySelector('#replica-upload-status');
-    if (el) {
-        el.textContent = msg;
-        el.className = `replica-status ${isError ? 'replica-status-error' : ''}`;
-    }
-    if (isError) console.error('[replica]', msg);
+// 只重建节拍区，不动页面其余部分，并把滚动位置放回去。
+function replicaRefreshBeats() {
+    const host = replicaRoot() && replicaRoot().querySelector('#replica-beats-host');
+    if (!host) { replicaRender(); return; }
+    const top = window.scrollY;
+    host.innerHTML = replicaRenderBeats(replicaState);
+    replicaBindBeatEvents(host);
+    if (replicaBusy) replicaSetBusy(true);
+    window.scrollTo({ top });
 }
 
-function replicaSetBusy(busy) {
+// 禁用元素的分隔符。UI 提示"用、分隔"，而原先的解析是 /[、,\n]/ —— 不含全角逗号，
+// 用户打一个「，」整串就塌成一个元素，然后禁用清单静默失效。
+function replicaSplitList(text) {
+    return String(text || '').split(/[、，,;；\n]/).map(s => s.trim()).filter(Boolean);
+}
+
+// 反馈打在固定浮层上，而不是页面顶端上传卡片里的那个 #replica-upload-status。
+// 原先所有提示——包括你在页面底部点「保存并重校验」得到的那句——都写进上传卡片，
+// 几十拍的编辑器一撑开，它就在视口外了：操作看上去毫无反应。
+let replicaToastTimer = null;
+
+function replicaToast(msg, isError) {
+    if (isError) console.error('[replica]', msg);
+    let el = document.getElementById('replica-toast');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'replica-toast';
+        document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.className = `replica-toast show ${isError ? 'is-error' : ''}`;
+    if (replicaToastTimer) clearTimeout(replicaToastTimer);
+    // 报错留久一点：它通常带着"照着改"的指路，一闪而过等于没说。
+    replicaToastTimer = setTimeout(() => { el.className = 'replica-toast'; },
+                                   isError ? 12000 : 5000);
+}
+
+// 转圈只加在**触发操作的那个按钮**上。原先是整页 disable：几十个按钮一起变灰，
+// 用户既看不出是哪一步在跑，也无法取消。
+function replicaSetBusy(busy, activeBtn) {
     replicaBusy = busy;
     const root = replicaRoot();
     if (!root) return;
-    root.querySelectorAll('button').forEach(b => { b.disabled = busy || b.hasAttribute('data-perm-disabled'); });
+    root.querySelectorAll('button').forEach(b => {
+        // 取消按钮必须在跑的时候还能按——它存在的全部意义就是打断正在跑的东西。
+        if (b.id === 'replica-cancel-btn') return;
+        b.disabled = busy || b.hasAttribute('data-perm-disabled');
+        b.classList.toggle('is-running', busy && b === activeBtn);
+    });
 }
 
 /* --- 动作 --- */
@@ -453,11 +617,31 @@ async function replicaUpload() {
         replicaRender();
         replicaToast(data.reused
             ? '这条视频之前已经抽过帧，直接复用旧任务（抽帧是几分钟的 ffmpeg，不必重跑）'
-            : '上传完成，接下来开始抽帧');
-        if (!data.reused) await replicaStart();
+            : '上传完成，开始抽帧。抽完会先给出成本预估，确认了才进入反推。');
+        // 只续抽帧，不续 Pass A。原先这里 `await replicaStart()` 一路跑到 Pass B，
+        // 成本预估在中途作为一行文案闪过，用户没有任何机会介入——那正是「先确认再
+        // 烧钱」这道卡点形同虚设的原因。
+        if (!data.reused) await replicaExtract();
     } catch (e) {
         replicaToast(e.message, true);
     } finally {
+        replicaSetBusy(false);
+    }
+}
+
+async function replicaExtract() {
+    if (!replicaState) return;
+    replicaSetBusy(true);
+    try {
+        const data = await replicaFetch('/api/replica/extract', {
+            method: 'POST', headers: replicaHeaders(),
+            body: JSON.stringify({ job_id: replicaState.job_id, config: replicaConfig() }),
+        });
+        replicaTaskId = data.task_id;
+        replicaOpenSSE(replicaTaskId);
+        replicaRender();   // 让「中断这一轮」露出来
+    } catch (e) {
+        replicaToast(e.message, true);
         replicaSetBusy(false);
     }
 }
@@ -474,15 +658,16 @@ async function replicaStart() {
         });
         replicaTaskId = data.task_id;
         replicaOpenSSE(replicaTaskId);
+        replicaRender();   // 让「中断这一轮」露出来
     } catch (e) {
         replicaToast(e.message, true);
         replicaSetBusy(false);
     }
 }
 
-async function replicaAdvance(action, payload = {}) {
+async function replicaAdvance(action, payload = {}, btn) {
     if (!replicaState) return;
-    replicaSetBusy(true);
+    replicaSetBusy(true, btn);
     try {
         const data = await replicaFetch('/api/replica/advance', {
             method: 'POST', headers: replicaHeaders(),
@@ -490,25 +675,46 @@ async function replicaAdvance(action, payload = {}) {
         });
         replicaTaskId = data.task_id;
         replicaOpenSSE(replicaTaskId);
+        replicaRender();   // 让「中断这一轮」露出来
     } catch (e) {
         replicaToast(e.message, true);
         replicaSetBusy(false);
     }
 }
 
-async function replicaCompose() {
+async function replicaCompose(btn) {
     // 合成前先把编辑器里的改动落盘：不然用户改了半天，合成用的还是磁盘上的旧节拍。
     const saved = await replicaSaveBeats(false);
     if (!saved) return;
-    replicaAdvance('approve');
+    replicaAdvance('approve', {}, btn instanceof HTMLElement ? btn : undefined);
 }
 
-function replicaVariant() {
+async function replicaSendToRender() {
+    if (!replicaState) return;
+    replicaSetBusy(true);
+    try {
+        const data = await replicaFetch('/api/replica/handoff', {
+            method: 'POST', headers: replicaHeaders(),
+            body: JSON.stringify({ job_id: replicaState.job_id, config: replicaConfig() }),
+        });
+        // 交接之后这条任务就归分步管线了——复刻页不接管它的进度，把用户送过去。
+        replicaToast(`已送去分步管线：${data.title || ''}。` +
+            (data.reused_compose ? '沿用了已过门禁的提示词，未重新合成。' : '') +
+            '去「分步管线」页看渲染进度。');
+        if (typeof switchMainTab === 'function') switchMainTab('stepped');
+    } catch (e) {
+        replicaToast(e.message, true);
+    } finally {
+        replicaSetBusy(false);
+    }
+}
+
+function replicaVariant(btn) {
     const root = replicaRoot();
     const axes = Array.from(root.querySelectorAll('.replica-axis-box:checked')).map(b => b.value);
     if (!axes.length) { replicaToast('至少勾一条变异轴', true); return; }
     const brief = (root.querySelector('#replica-variant-brief') || {}).value || '';
-    replicaAdvance('variant', { axes, brief });
+    replicaAdvance('variant', { axes, brief }, btn instanceof HTMLElement ? btn : undefined);
 }
 
 function replicaConfig() {
@@ -519,30 +725,17 @@ function replicaConfig() {
 
 /* --- 节拍编辑 --- */
 
+// model 就是真相：textarea 的 input 事件已经把每一次编辑写回 replicaState.beats
+// （见 replicaBindBeatEvents）。这里只做一次深拷贝，不再全量扫 DOM 反推文档。
 function replicaCollectBeats() {
-    const root = replicaRoot();
     if (!replicaState || !replicaState.beats) return null;
-    const doc = JSON.parse(JSON.stringify(replicaState.beats));
-
-    root.querySelectorAll('[data-beat][data-key]').forEach(el => {
-        const beat = doc.beats[parseInt(el.dataset.beat, 10)];
-        if (!beat) return;
-        const key = el.dataset.key;
-        beat[key] = Array.isArray(beat[key])
-            ? el.value.split('\n').map(s => s.trim()).filter(Boolean)
-            : el.value.trim();
-    });
-
-    const banned = root.querySelector('#replica-banned');
-    if (banned) {
-        doc.banned_elements = banned.value.split(/[、,\n]/).map(s => s.trim()).filter(Boolean);
-    }
-    return doc;
+    return JSON.parse(JSON.stringify(replicaState.beats));
 }
 
-async function replicaSaveBeats(rerender) {
+async function replicaSaveBeats(rerender, btn) {
     const doc = replicaCollectBeats();
     if (!doc) return false;
+    if (btn) replicaSetBusy(true, btn);
     try {
         const data = await replicaFetch('/api/replica/beats', {
             method: 'POST', headers: replicaHeaders(),
@@ -550,7 +743,9 @@ async function replicaSaveBeats(rerender) {
         });
         replicaState = data.job_state;
         if (rerender) {
-            replicaRender();
+            // 只重建节拍区。整页重建会把用户滚到的位置一起丢掉，而节拍区恰恰是这一页
+            // 最长的一块——几十拍改到一半被弹回顶端，等于每保存一次就罚一次。
+            replicaRefreshBeats();
             const errors = (data.validation || []).filter(v => v.level === 'error');
             replicaToast(errors.length ? `已保存，仍有 ${errors.length} 项硬伤` : '已保存，校验通过');
         }
@@ -558,7 +753,20 @@ async function replicaSaveBeats(rerender) {
     } catch (e) {
         replicaToast(e.message, true);
         return false;
+    } finally {
+        if (btn) replicaSetBusy(false);
     }
+}
+
+// 拆拍 / 合拍：改完立刻落盘，并用服务端重排过 id 的那一份回写。
+//
+// 原先只改本地就 replicaRender()，服务端的 _renumber_beats 没跑过——拆完页面上会
+// 并排出现两个 B03，用户还得记着再点一次「保存」。落盘顺带把校验也重跑了，
+// 「这一刀拆出了什么问题」当场就能看见。
+async function replicaPersistBeats(message) {
+    const ok = await replicaSaveBeats(false);
+    replicaRefreshBeats();
+    replicaToast(ok ? message : '改动只在本地，落盘失败——请再点一次「保存并重校验」', !ok);
 }
 
 function replicaSplitBeat(idx) {
@@ -574,8 +782,7 @@ function replicaSplitBeat(idx) {
     second.source_event_ids = [];
     doc.beats.splice(idx + 1, 0, second);
     replicaState.beats = doc;
-    replicaRender();
-    replicaToast('已拆成两拍。事件与证据帧没有自动分配——请对着帧手工分给正确的那一半，再保存。');
+    replicaPersistBeats('已拆成两拍并保存。事件与证据帧没有自动分配——请对着帧手工分给正确的那一半。');
 }
 
 function replicaMergeBeat(idx) {
@@ -591,8 +798,7 @@ function replicaMergeBeat(idx) {
     prev.persistent_traces = [...(prev.persistent_traces || []), ...(cur.persistent_traces || [])];
     doc.beats.splice(idx, 1);
     replicaState.beats = doc;
-    replicaRender();
-    replicaToast('已合并。若两拍是不同的物理工序，合并会违反「一拍一工序」——保存后校验会告诉你。');
+    replicaPersistBeats('已合并并保存。若两拍是不同的物理工序，上方校验会告诉你。');
 }
 
 /* --- SSE --- */
@@ -612,13 +818,14 @@ function replicaOpenSSE(taskId) {
             if (el) {
                 el.style.display = 'block';
                 el.innerHTML = `<span class="replica-chip">${escapeHtmlReplica(
-                    REPLICA_STAGE_LABELS[d.stage] || d.stage)}</span> ${escapeHtmlReplica(d.message || '')}`;
+                    replicaStageLabel(d.stage))}</span> ${escapeHtmlReplica(d.message || '')}`;
             }
         } catch (err) { /* 单条事件解析失败不该打断整条流 */ }
     });
 
     const finish = async (msg, isError) => {
         if (replicaSSE) { replicaSSE.close(); replicaSSE = null; }
+        replicaTaskId = null;
         replicaSetBusy(false);
         try {
             await replicaLoadJobs();
@@ -632,8 +839,20 @@ function replicaOpenSSE(taskId) {
         if (msg) replicaToast(msg, isError);
     };
 
-    replicaSSE.addEventListener('replica_paused', () => finish('已停在人工卡点，请核对节拍'));
-    replicaSSE.addEventListener('result', () => finish('提示词包已生成'));
+    // 停下来了，但停在哪个卡点决定了下一步该干什么。原先三个卡点共用一句"请核对节拍"，
+    // 停在成本确认或门禁未过时那句话是错的。
+    const PAUSE_MESSAGES = {
+        confirm_cost: '抽帧完成，还没开始花钱。选好采样档位再按「确认并开始反推」。',
+        review_beats: '已停在人工卡点，请对着证据帧核对节拍。',
+        audit_failed: '命中禁用元素，已拦下交付（未入库）。见下方提示词区。',
+    };
+    replicaSSE.addEventListener('replica_paused', (e) => {
+        let stage = '';
+        try { stage = (JSON.parse(e.data) || {}).stage || ''; } catch (err) { /* 用默认文案 */ }
+        finish(PAUSE_MESSAGES[stage] || '任务已暂停，请看当前阶段的操作区。',
+               stage === 'audit_failed');
+    });
+    replicaSSE.addEventListener('result', () => finish('提示词包已生成，并已写入创意库'));
     replicaSSE.addEventListener('error', (e) => {
         // EventSource 把两种完全不同的东西塞进同一个事件名：服务端发的 `error` 事件
         // （带 data，是真的任务失败），和浏览器的连接层错误（无 data，重连期间也会
@@ -662,4 +881,37 @@ async function replicaTabEntered() {
         console.error('replicaTabEntered', e);
     }
     replicaRender();
+    replicaReattach();
+}
+
+// 刷新页面 / 切走再回来之后，把还在跑的任务接回来。
+//
+// 在此之前这里什么都不做：一个跑了十五分钟的 Pass A，刷新一次就彻底失联——页面不显示
+// 任何"在跑"的迹象，还会摆出「开始反推」按钮，用户再点一次就把同一笔视觉调用付两遍。
+// job 行上的 active_task_id 由 /api/replica/jobs 下发（服务端按 replica_job_id 在
+// ACTIVE_TASKS 里找 running 的那条）。
+function replicaReattach() {
+    if (replicaSSE || !replicaState) return;
+    const row = replicaJobs.find(j => j.job_id === replicaState.job_id);
+    const taskId = row && row.active_task_id;
+    if (!taskId) return;
+    replicaTaskId = taskId;
+    replicaSetBusy(true);
+    replicaOpenSSE(taskId);
+    replicaRender();   // 让「中断这一轮」和进度条在重连后立刻可见
+    replicaToast('这条任务还在后台跑，已重新接上进度');
+}
+
+async function replicaCancelRun() {
+    if (!replicaState) return;
+    if (!window.confirm('中断正在跑的这一轮？已经读过的帧会留在缓存里，重试时不重复付费。')) return;
+    try {
+        await replicaFetch('/api/replica/cancel', {
+            method: 'POST', headers: replicaHeaders(),
+            body: JSON.stringify({ job_id: replicaState.job_id }),
+        });
+        replicaToast('已请求中断，正在等当前这一步收尾…');
+    } catch (e) {
+        replicaToast(e.message, true);
+    }
 }

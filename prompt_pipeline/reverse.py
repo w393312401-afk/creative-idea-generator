@@ -34,6 +34,18 @@ PASS_A_PROMPT_VERSION = 'v1'
 # 载荷在 2MB 量级——再大就开始撞网关的请求体上限和超时。
 _PASS_A_BATCH_SIZE = 10
 
+# Pass B 的视觉输入：送审帧按 digest 顺序拼成的分页拼图。
+#
+# 为什么必须有：Pass B 原本只拿到 `_facts_digest` 那几十行文本去聚类节拍。跨帧的东西
+# 恰恰只活在像素里——同一面墙完成度的推进、工具箱有没有挪、上一拍的痕迹是不是还在，
+# 在 `extent=左三分之二已涂` 这种一行摘要里全丢了，模型只能靠文本相邻性猜哪几帧属于
+# 同一个里程碑。给它整页拼图，节拍边界就是一次感知，不必从文字里重建。
+#
+# 5 列 × 4 行 = 20 帧一页：再密单帧就小到读不出完成范围，再稀页数上去、载荷和钱一起涨。
+_PASS_B_SHEET_COLUMNS = 5
+_PASS_B_SHEET_PAGE_SIZE = 20
+_PASS_B_SHEET_DIRNAME = '.pass_b_sheets'
+
 _FRAME_FACTS_FILENAME = 'frame_facts.json'
 _BEATS_FILENAME = 'timelapse_beats.json'
 _SCHEMA_FILENAME = 'timelapse-beats.schema.json'
@@ -190,11 +202,37 @@ def degraded_plan_frames(overview):
     return ordered
 
 
+def _frames_by_name(overview):
+    entries = ((overview.get('review_sampling') or {}).get('frames') or [])
+    return {os.path.basename(e['frame_path']): e for e in entries if e.get('frame_path')}
+
+
+def peak_frame_names(overview):
+    """每个 change_event 的峰值帧（evidence_frames 的 start/peak/end 里中间那张）。
+
+    `verify_peak_frames` 与 `estimate_pass_a_cost` 共用它——复核要花的钱必须和预估里
+    报出来的是同一笔，两处各算一遍迟早对不上。
+    """
+    by_name = _frames_by_name(overview)
+    names = []
+    for event in (overview.get('change_events') or []):
+        for name in (event.get('evidence_frames') or [])[1:2]:
+            if name in by_name and name not in names:
+                names.append(name)
+    return names
+
+
 def estimate_pass_a_cost(overview, degraded=False, batch_size=_PASS_A_BATCH_SIZE):
-    """给 UI 的开跑前预估。extract 完成后必须先把它摆给用户确认再烧钱。"""
+    """给 UI 的开跑前预估。extract 完成后必须先把它摆给用户确认再烧钱。
+
+    峰值帧复核现在默认开（见 `_peak_verify_model`），所以它那几次调用也必须出现在这里。
+    默认加钱却不进预估，等于绕开了「先确认再烧钱」这道卡点本身。
+    """
     frames = degraded_plan_frames(overview) if degraded else _planned_frames(overview)
     n = len(frames)
     batches = (n + batch_size - 1) // batch_size if n else 0
+    peaks = peak_frame_names(overview)
+    peak_batches = (len(peaks) + _PEAK_BATCH_SIZE - 1) // _PEAK_BATCH_SIZE if peaks else 0
     return {
         'frame_count': n,
         'total_extracted': len(((overview.get('review_sampling') or {}).get('frames') or [])),
@@ -202,6 +240,8 @@ def estimate_pass_a_cost(overview, degraded=False, batch_size=_PASS_A_BATCH_SIZE
         'batch_size': batch_size,
         'degraded': bool(degraded),
         'plan_mode': (overview.get('analysis_plan') or {}).get('mode'),
+        'peak_frame_count': len(peaks),
+        'peak_batch_count': peak_batches,
     }
 
 
@@ -415,8 +455,8 @@ def extract_frame_facts(config, job_dir, on_progress=None, degraded=False,
     batches = [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
     done_counter = {'n': 0}
 
-    def _run_batch(batch):
-        pp._raise_if_cancelled(on_progress)
+    def _ask(batch, max_tokens, timeout):
+        """一次视觉调用：喂这批帧，返回 {frame_name: fact}。解析失败抛 ValueError。"""
         paths = [e['frame_path'] for e in batch]
         names = [os.path.basename(p) for p in paths]
         # 先压再送：全尺寸 PNG 的 base64 会把请求体撑到十几 MB，这是超时的主要来源。
@@ -429,25 +469,58 @@ def extract_frame_facts(config, job_dir, on_progress=None, degraded=False,
             f'Read these {len(batch)} frames. They are given in this order:\n{listing}\n\n'
             'Return one JSON object per frame, in the same order, using the exact filenames above.'
         )
-        # 一批是十帧的视觉调用。解析炸了就整批作废重来，比丢掉十帧的观察便宜得多；
-        # 重试仍失败才放弃这一批——缺帧会在 Pass B 里表现为该窗口证据不足，
-        # 而不是把错误的事实塞进去。
+        raw = pp._multimodal_chat(
+            clean_config, _PASS_A_SYSTEM, user_text, small,
+            model=model, max_tokens=max_tokens, timeout=timeout,
+        )
+        try:
+            return _parse_facts_array(raw, names)
+        except ValueError as e:
+            _dump_bad_reply(job_dir, 'frame_facts', raw, e)
+            raise
+
+    def _run_batch(batch):
+        pp._raise_if_cancelled(on_progress)
+        names = [os.path.basename(e['frame_path']) for e in batch]
+        # 一批是十帧的视觉调用。解析炸了就整批作废重来，比丢掉十帧的观察便宜得多。
+        # 截断（ResponseTruncated）也走这条路：十帧的观察写不进 4096 tokens 是常事，
+        # 而它的解药和坏 JSON 一样是把这批拆小，不是原样再要一次。
         for remaining in range(_PARSE_RETRY_BUDGET, -1, -1):
             pp._raise_if_cancelled(on_progress)
-            raw = pp._multimodal_chat(
-                clean_config, _PASS_A_SYSTEM, user_text, small,
-                model=model, max_tokens=4096, timeout=180,
-            )
             try:
-                return _parse_facts_array(raw, names)
-            except ValueError as e:
-                _dump_bad_reply(job_dir, 'frame_facts', raw, e)
+                return _ask(batch, max_tokens=4096, timeout=180)
+            except (ValueError, pp.ResponseTruncated):
                 if remaining == 0:
-                    if sys.stdout:
-                        print(f'[REVERSE] 这批帧连续 {_PARSE_RETRY_BUDGET + 1} 次解析失败，'
-                              f'整批跳过: {[n for n in names]}')
-                    return {}
-        return {}
+                    break
+
+        # 整批预算用尽后不再直接丢掉这十帧。多半是其中一两帧让模型写出了坏 JSON，
+        # 而整批作废会把另外八帧本来读得好好的观察一起赔进去——缺帧在 Pass B 里
+        # 表现为该窗口证据不足，节拍边界就落错。逐帧重来一次，救回能救的：
+        # 单帧回复只有一个对象，坏 JSON 的概率和影响面都小一个量级。
+        if len(batch) == 1:
+            if sys.stdout:
+                print(f'[REVERSE] 单帧连续解析失败，放弃: {names[0]}')
+            return {}
+        if sys.stdout:
+            print(f'[REVERSE] 这批帧连续 {_PARSE_RETRY_BUDGET + 1} 次解析失败，'
+                  f'改为逐帧重试: {names}')
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'review_frames',
+                'message': f'一批 {len(batch)} 帧解析失败，正在逐帧重试以免整批丢失…',
+            })
+        salvaged = {}
+        for entry in batch:
+            pp._raise_if_cancelled(on_progress)
+            try:
+                salvaged.update(_ask([entry], max_tokens=1024, timeout=90))
+            except (ValueError, pp.ResponseTruncated):
+                if sys.stdout:
+                    print(f'[REVERSE] 逐帧重试仍失败，丢弃这一帧: '
+                          f'{os.path.basename(entry["frame_path"])}')
+        if sys.stdout:
+            print(f'[REVERSE] 逐帧重试救回 {len(salvaged)}/{len(batch)} 帧')
+        return salvaged
 
     def _on_done(_key, result):
         done_counter['n'] += len(result or {})
@@ -491,14 +564,47 @@ def extract_frame_facts(config, job_dir, on_progress=None, degraded=False,
     return payload
 
 
+# 峰值帧复核一批塞几张。比 Pass A 的十帧小：这几张是要「放大了看」的，一次问太多张
+# 就退回成粗读，复核也就白做了。
+_PEAK_BATCH_SIZE = 6
+
+# `peakVerifyModel` 的显式关闭值。默认开之后必须留一个关得掉的开关。
+_PEAK_VERIFY_OFF = ('off', 'none', 'no', 'false', '0', 'skip')
+
+
+def _peak_verify_model(config):
+    """峰值帧复核用哪个模型；返回 None 表示不复核。
+
+    默认开（2026-08-10 改）。原先默认关，省下的是几次调用的钱，代价是节拍边界——
+    边界恰好落在 peak 帧上，那几帧被 flash 读糊，整条阶梯就整体错位，后面所有合成
+    调用都建在错的骨架上。这笔账不对等，所以默认改成开。
+
+    选型顺序：`peakVerifyModel` 显式指定 → 主模型 `model`（通常比 Pass A 的
+    `reviewModel` 强一档）。即便解析下来和 Pass A 同一个模型也照跑：复核这一遍换的
+    不只是模型，还有 1024px 而非 768px 的输入、更小的批次和「放大了看」的指令。
+    要关就把 `peakVerifyModel` 设成 off/none/false。
+    """
+    cfg = config or {}
+    raw = cfg.get('peakVerifyModel')
+    if raw is False:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.lower() in _PEAK_VERIFY_OFF:
+            return None
+        if text:
+            return text
+    return cfg.get('model') or 'gemini-3.6-flash-high'
+
+
 def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
     """用强模型复核 change_events 的 peak 帧。
 
     Pass A 用 flash 打底是为了成本，但节拍边界恰恰落在 peak 上——那几帧读错，整条
     阶梯就错位。这里只对 peak 帧重跑一次，命中的改写会覆盖 flash 的结论并把
-    confidence 抬到复核值。config['peakVerifyModel'] 为空则跳过（默认不烧这笔钱）。
+    confidence 抬到复核值。开关与选型见 `_peak_verify_model`。
     """
-    model = (config or {}).get('peakVerifyModel')
+    model = _peak_verify_model(config)
     if not model:
         return facts_payload
 
@@ -506,13 +612,8 @@ def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
     with open(overview_path, 'r', encoding='utf-8') as f:
         overview = json.load(f)
 
-    entries = ((overview.get('review_sampling') or {}).get('frames') or [])
-    by_name = {os.path.basename(e['frame_path']): e for e in entries if e.get('frame_path')}
-    peak_names = []
-    for event in (overview.get('change_events') or []):
-        for name in (event.get('evidence_frames') or [])[1:2]:  # start/peak/end 的中间那张
-            if name in by_name and name not in peak_names:
-                peak_names.append(name)
+    by_name = _frames_by_name(overview)
+    peak_names = peak_frame_names(overview)
     if not peak_names:
         return facts_payload
 
@@ -523,21 +624,31 @@ def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
         })
 
     clean_config = _scrub_config_for_pass_a(config)
-    batches = [peak_names[i:i + 6] for i in range(0, len(peak_names), 6)]
+    batches = [peak_names[i:i + _PEAK_BATCH_SIZE]
+               for i in range(0, len(peak_names), _PEAK_BATCH_SIZE)]
     refined = {}
     for batch in batches:
         pp._raise_if_cancelled(on_progress)
         paths = [by_name[n]['frame_path'] for n in batch]
         small = pp._compress_frames_for_review(paths, max_side=1024, quality=82)
         listing = '\n'.join(f'{i + 1}. {n}' for i, n in enumerate(batch))
-        raw = pp._multimodal_chat(
-            clean_config, _PASS_A_SYSTEM,
-            f'Read these {len(batch)} frames carefully. Crop-zoom mentally onto material '
-            f'surfaces, tool contact points, and completion boundaries before answering.\n'
-            f'{listing}\n\nReturn one JSON object per frame in the same order.',
-            small, model=model, max_tokens=4096, timeout=240,
-        )
-        refined.update(_parse_facts_array(raw, batch))
+        # 复核是增强，不是门禁：这一批炸了就留着 Pass A 的结论继续走。默认开之后这条
+        # 尤其要紧——一次解析失败若能掀掉整单，等于把已经付过钱的 Pass A 一起赔进去，
+        # 而「没复核」的代价只是这几帧沿用 flash 的读数。
+        try:
+            raw = pp._multimodal_chat(
+                clean_config, _PASS_A_SYSTEM,
+                f'Read these {len(batch)} frames carefully. Crop-zoom mentally onto material '
+                f'surfaces, tool contact points, and completion boundaries before answering.\n'
+                f'{listing}\n\nReturn one JSON object per frame in the same order.',
+                small, model=model, max_tokens=4096, timeout=240,
+            )
+            refined.update(_parse_facts_array(raw, batch))
+        except pp.GenerationCancelled:
+            raise
+        except Exception as e:
+            if sys.stdout:
+                print(f'[REVERSE] 峰值帧复核失败，这批沿用 Pass A 的读数 {batch}: {e}')
 
     by_frame = {f['frame']: f for f in facts_payload.get('facts') or []}
     for name, fact in refined.items():
@@ -552,6 +663,109 @@ def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
     with open(os.path.join(job_dir, _FRAME_FACTS_FILENAME), 'w', encoding='utf-8') as f:
         json.dump(facts_payload, f, ensure_ascii=False, indent=2)
     return facts_payload
+
+
+# ── Pass B 的视觉输入 ────────────────────────────────────────────────────────
+
+def _digest_frame_paths(overview, facts):
+    """facts 顺序对应的帧全路径。缺路径的帧留 None 占位，序号不许错位。
+
+    拼图与 digest 的对齐全靠这个顺序：模型是按「第几格」去认「第几条事实」的，
+    这里悄悄跳过一帧，后面每一格的对应关系就整体平移一位。
+    """
+    by_name = _frames_by_name(overview)
+    out = []
+    for fact in facts:
+        entry = by_name.get(fact.get('frame'))
+        out.append(entry.get('frame_path') if entry else None)
+    return out
+
+
+def build_pass_b_sheets(job_dir, overview, facts,
+                        columns=_PASS_B_SHEET_COLUMNS, page_size=_PASS_B_SHEET_PAGE_SIZE):
+    """把送审帧按 facts 顺序拼成分页拼图。
+
+    返回 `[{'path': 拼图路径, 'start': 首格在 facts 里的下标, 'facts': 该页的事实切片}]`。
+    `start` 必须显式带着走，不能靠累加前几页的长度反推——中间跳过缺失帧之后，累加值
+    就不再等于真实下标，而这个偏移恰恰是「模型把 A 帧的画面读成 B 帧的事实」的成因。
+
+    尽力而为：ffmpeg 缺失、帧文件不在、拼接失败一律返回 []，调用方退回纯文本 Pass B。
+    拼图是让节拍聚类看得见画面的增强，不该反过来变成一道能卡死反推的门禁。
+
+    只拼**路径齐全的连续段**：中间缺一帧就换页，而不是把它跳过去接上下一帧——跳过去
+    等于让后面每一格都错位一位，模型会把 A 帧的画面当成 B 帧的事实来读，这比没有拼图
+    坏得多。
+    """
+    try:
+        from pathlib import Path
+        from tools.collage import build_keyframe_collage
+    except ImportError:
+        return []
+
+    paths = _digest_frame_paths(overview, facts)
+    sheet_dir = os.path.join(job_dir, _PASS_B_SHEET_DIRNAME)
+
+    # 连续可用段：(起点下标, [帧路径…])
+    runs, start, run = [], 0, []
+    for idx, path in enumerate(paths):
+        if path and os.path.exists(path):
+            if not run:
+                start = idx
+            run.append(path)
+            continue
+        if run:
+            runs.append((start, run))
+            run = []
+    if run:
+        runs.append((start, run))
+
+    sheets = []
+    try:
+        os.makedirs(sheet_dir, exist_ok=True)
+        for run_start, run_paths in runs:
+            for offset in range(0, len(run_paths), page_size):
+                chunk = run_paths[offset:offset + page_size]
+                lo = run_start + offset
+                out_path = os.path.join(sheet_dir, f'sheet_{lo + 1:03d}_{lo + len(chunk):03d}.jpg')
+                made = build_keyframe_collage([Path(p) for p in chunk], Path(out_path),
+                                              columns=columns)
+                if not made:
+                    return []   # ffmpeg 不可用：别交出半套拼图，那比没有更难对齐
+                sheets.append({'path': str(made), 'start': lo,
+                               'facts': facts[lo:lo + len(chunk)]})
+    except Exception as e:
+        if sys.stdout:
+            print(f'[REVERSE] Pass B 拼图生成失败，本次退回纯文本聚类: {e}')
+        return []
+    return sheets
+
+
+def _sheet_layout_block(sheets, columns=_PASS_B_SHEET_COLUMNS):
+    """告诉模型每张拼图的第几格对应 FRAME FACTS 的哪一条。
+
+    不写这段，拼图就只是一堆没有身份的缩略图——模型看得见画面，却没法把它挂回带
+    时间戳的事实上，`evidence_frames` 会开始写幻觉文件名。
+    """
+    lines = []
+    for i, sheet in enumerate(sheets, start=1):
+        chunk = sheet['facts']
+        if not chunk:
+            continue
+        lo = sheet['start'] + 1
+        lines.append(f'SHEET {i}: FRAME FACTS #{lo}–#{lo + len(chunk) - 1}  '
+                     f'({chunk[0].get("frame")} … {chunk[-1].get("frame")})')
+    return (
+        f'\n==================== CONTACT SHEETS ====================\n'
+        f'{len(sheets)} tiled sheet image(s) are attached, {columns} tiles per row, '
+        f'read left to right then top to bottom. The tiles are the SAME frames as FRAME '
+        f'FACTS above, in the SAME order:\n' + '\n'.join(lines) + '\n\n'
+        'Use the sheets to judge what the text cannot carry: how far one surface advances '
+        'across consecutive tiles, whether an object stayed put, whether a trace from an '
+        'earlier tile is still visible later. Beat boundaries are where the sheet shows the '
+        'work changing SYSTEM, not merely advancing.\n'
+        'The frame facts remain the authority on WHAT is present. Never name a tool, '
+        'material, or operation that no frame fact records, even if you think you see it.\n'
+    )
 
 
 # ── Pass B：节拍聚类 ─────────────────────────────────────────────────────────
@@ -603,9 +817,11 @@ Return one JSON object, no prose, no code fences:
 
 
 def _facts_digest(facts):
+    """事实摘要。行首的 #N 是拼图对齐用的：拼图里的格子没有文件名，模型只能靠序号
+    把「第几格的画面」挂回「第几条事实」。改这里的编号就必须同步改 `_sheet_layout_block`。"""
     lines = []
-    for f in facts:
-        parts = [f'[{f.get("timestamp")}s] {f.get("frame")}']
+    for i, f in enumerate(facts, start=1):
+        parts = [f'#{i} [{f.get("timestamp")}s] {f.get("frame")}']
         if f.get('subject'):
             parts.append(f'subject={f["subject"]}')
         if f.get('completion_extent'):
@@ -653,6 +869,32 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
         f'==================== CHANGE EVENTS ====================\n{_events_digest(events)}\n'
     )
 
+    # 拼图拿得到就走多模态。拿不到（ffmpeg 缺失、帧文件不在）退回纯文本，产出会粗一档
+    # 但不该因此跑不完——所以这里是分支，不是断言。
+    sheets = build_pass_b_sheets(job_dir, overview, facts)
+    sheet_paths = [s['path'] for s in sheets]
+    if sheets:
+        user += _sheet_layout_block(sheets)
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'cluster_beats',
+                'message': f'已生成 {len(sheets)} 张送审拼图，节拍聚类将看着画面做',
+                'sheets': sheet_paths,
+            })
+    elif sys.stdout:
+        print('[REVERSE] 无可用拼图，Pass B 退回纯文本聚类（节拍边界精度会下降）')
+
+    def _ask_pass_b(prompt):
+        if sheet_paths:
+            # `_multimodal_chat` 的 temperature 固定 0.1，比纯文本路径的 0.2 还低——
+            # 聚类要的是稳定复现，不是花样，低一点正合适。
+            return pp._multimodal_chat(
+                config, _PASS_B_SYSTEM, prompt, sheet_paths,
+                model=(config or {}).get('model'), max_tokens=16384, timeout=360,
+            )
+        return pp._chat(config, _PASS_B_SYSTEM, prompt, temperature=0.2,
+                        max_tokens=16384, timeout=240)
+
     violations = []
     beats_doc = None
     # 解析失败与校验未过是两类不同的失败，各有各的预算。共用一个计数器的话，一次
@@ -683,8 +925,22 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
                 'merging adjacent events that belong to the same milestone, list at most two '
                 'evidence_frames per beat, and keep every prose field under twenty words.\n'
             )
-        raw = pp._chat(config, _PASS_B_SYSTEM, prompt, temperature=0.2,
-                       max_tokens=16384, timeout=240)
+        try:
+            raw = _ask_pass_b(prompt)
+        except pp.ResponseTruncated as e:
+            # 多模态路径把截断当异常抛（finish_reason=length），纯文本路径只能靠
+            # parse_json_reply 从半截 JSON 里认出来。两条路必须汇进同一个「写短一点再来」
+            # 的分支——否则上了拼图之后，一次本来能回炉的截断会变成整单失败。
+            parse_budget -= 1
+            truncated_once = True
+            if parse_budget < 0:
+                raise
+            if on_progress:
+                on_progress('replica_stage', {
+                    'stage': 'cluster_beats',
+                    'message': f'模型回复太长被截断（{e}），要求它合并节拍、写短一点后重试…',
+                })
+            continue
         try:
             beats_doc = parse_json_reply(raw)
         except TruncatedReply as e:
@@ -761,17 +1017,26 @@ def _schema_path():
 def _load_schema():
     """契约唯一真源。校验器从 schema 文件读 required 清单，而不是在这里再抄一份。
 
-    读不到就跳过字段校验（事件覆盖、证据帧、施工顺序那几组不依赖 schema，照跑）。
-    这种降级必须喊出来：外部配置的技能包版本旧、没有这个文件时，字段校验会静默
-    失效，而日志上看不出异常正是最难查的那类问题。"""
+    读不到返回 None，字段校验跳过（事件覆盖、证据帧、施工顺序那几组不依赖 schema，
+    照跑）。降级本身由 `_load_schema_or_reason` 报到 validation 列表里——见那里的说明。
+    """
+    return _load_schema_or_reason()[0]
+
+
+def _load_schema_or_reason():
+    """(schema, 读不到的原因)。
+
+    降级必须喊出来。原先读不到只 print 一行 stdout 就 return None：字段校验静默失效，
+    而 UI 那边照样显示「节拍阶梯已通过全部机械校验」——一句在这种情况下完全错误的话，
+    用户据此以为阶梯是干净的。外部配置的技能包版本旧、少了这个文件时最容易踩到。
+    """
     try:
         with open(_schema_path(), 'r', encoding='utf-8') as f:
-            return json.load(f)
+            return json.load(f), None
     except (OSError, ValueError, ImportError) as e:
-        import sys
         if sys.stdout:
             print(f'[REVERSE] 读不到 {_SCHEMA_FILENAME}，本次跳过 beats 字段校验: {e}')
-        return None
+        return None, str(e)
 
 
 def _err(code, message, beat_id=None):
@@ -789,12 +1054,21 @@ def validate_beats(beats_doc, overview, schema=None):
     在这里判不了，也不该假装能判——它们是 review_beats 人工卡点存在的理由。
     """
     out = []
-    schema = schema if schema is not None else _load_schema()
+    schema_error = None
+    if schema is None:
+        schema, schema_error = _load_schema_or_reason()
     beats = beats_doc.get('beats') or []
 
     if not beats:
         return [_err('no_beats', '节拍阶梯为空')]
 
+    if schema_error:
+        # 静默降级会让 UI 显示「已通过全部机械校验」，而字段校验其实压根没跑。
+        out.append(_warn(
+            'schema_unavailable',
+            f'读不到契约文件 {_SCHEMA_FILENAME}，本次**跳过了字段完整性校验**'
+            f'（事件覆盖、证据帧、施工顺序等其余校验照常跑）。'
+            f'技能包可能版本过旧或路径配错：{schema_error}'))
     out.extend(_validate_required_fields(beats_doc, beats, schema))
     out.extend(_validate_event_coverage(beats, overview))
     out.extend(_validate_evidence_frames(beats, overview))
@@ -895,8 +1169,9 @@ def _validate_temporary_objects(beats):
                 'temporary_object_lingering',
                 f'{beat.get("id")}（{stage_label(beat.get("stage"))}）开始时，'
                 f'这些临时施工物在原片里仍然在场且没有清场动作：{names}。'
-                f'合成器的场景状态预检会因此打回整条阶梯。'
-                f'两个改法：在进入软装的拍之前补一条清场动作（改那一拍的「可见动作」），'
+                f'复刻会照实保留它们——原片就是这么拍的，合成不会因此失败。'
+                f'只有当你认为这是读帧读错了、或者不想在成片里看到它们时才需要动：'
+                f'在进入软装的拍之前补一条清场动作（改那一拍的「可见动作」），'
                 f'或者把它从相关拍的「可见细节 / 遗留痕迹」里去掉。',
                 beat.get('id')))
             break   # 一次说清就够，不必逐拍重复同一件事
@@ -1289,8 +1564,26 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
         package = [str(p).strip() for p in (beat.get('package_operations') or []) if str(p).strip()]
         if package:
             text = f'{text}（工序：{"、".join(package)}）'
-        outline.append({'text': text or (beat.get('visual_subject') or ''),
-                        'op': beat.get('operation') or beat.get('stage')})
+        entry = {'text': text or (beat.get('visual_subject') or ''),
+                 'op': beat.get('operation') or beat.get('stage')}
+
+        # 富字段绑定（2026-08-10）。此前这里只发 text + op，于是人工卡点上逐拍精修的
+        # state_before / state_after / persistent_traces / visible_details 全部止步于
+        # 本函数——用户核对的东西根本没进过模型上下文，"1:1 复刻"实际只锁住了拍数。
+        # 这几个键走 build_outline_plan_block 既有的富字段通路（MATERIALS / LEAVES /
+        # STATE），不新造第二条绑定链路。
+        details = [str(x).strip() for x in (beat.get('visible_details') or []) if str(x).strip()]
+        if details:
+            entry['mat'] = details
+        traces = [str(x).strip() for x in (beat.get('persistent_traces') or []) if str(x).strip()]
+        if traces:
+            # trace 在契约里是单串（zone/scope/trace 同组），列表要先合并。
+            entry['trace'] = '; '.join(traces)
+        for key in ('state_before', 'state_after'):
+            value = str(beat.get(key) or '').strip()
+            if value:
+                entry[key] = value
+        outline.append(entry)
     dimensions['beat_outline'] = outline
 
     if not dimensions.get('theme'):

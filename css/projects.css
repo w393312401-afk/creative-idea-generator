@@ -134,10 +134,69 @@
     cursor: pointer;
 }
 
+/* ── 显示方式切换（列表 / 网格 / 紧凑）───────────────────────────── */
+#panel-projects .projects-view-switch {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: rgba(var(--ink-rgb), 0.04);
+    flex-shrink: 0;
+}
+
+#panel-projects .projects-view-btn {
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1;
+    padding: 5px 9px;
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+#panel-projects .projects-view-btn:hover { color: var(--neon-cyan); }
+
+#panel-projects .projects-view-btn.active {
+    background: rgba(176, 123, 82, 0.14);
+    color: var(--neon-cyan);
+}
+
 #panel-projects .projects-toolbar-right {
     display: flex;
     align-items: center;
     gap: 8px;
+}
+
+/* ── 多选批量条 ────────────────────────────────────────────────────── */
+#panel-projects .projects-bulkbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 8px 1.5rem;
+    border-bottom: 1px solid rgba(176, 123, 82, 0.35);
+    background: rgba(176, 123, 82, 0.09);
+    flex-shrink: 0;
+}
+
+/* hidden 属性的 display:none 敌不过上面的 display:flex，得显式压回去 */
+#panel-projects .projects-bulkbar[hidden] { display: none; }
+
+#panel-projects .projects-bulk-count {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--text-main);
+    white-space: nowrap;
+}
+
+#panel-projects .projects-bulk-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    flex: 1;
 }
 
 #panel-projects .projects-stats {
@@ -228,6 +287,41 @@
 #panel-projects .project-row.selected {
     border-color: rgba(176, 123, 82, 0.55);
     background: rgba(176, 123, 82, 0.08);
+}
+
+/* 勾选（多选）与选中（详情焦点）是两回事：前者虚线描边，后者实线底色，
+   同一行可以同时处于两种状态 */
+#panel-projects .project-row.multi-selected {
+    border-color: rgba(176, 123, 82, 0.5);
+    border-style: dashed;
+    background: rgba(176, 123, 82, 0.05);
+}
+
+/* 勾选框占位但默认透明：常显会让 hover 之外的每一行都挂个空框，
+   而 opacity 而非 display 保证显隐不引起整列重排 */
+#panel-projects .project-check {
+    flex: 0 0 auto;
+    align-self: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+    opacity: 0;
+    transition: var(--transition-fast);
+}
+
+#panel-projects .project-row:hover .project-check,
+#panel-projects .project-row.multi-selected .project-check,
+#panel-projects .projects-list.has-selection .project-check {
+    opacity: 1;
+}
+
+#panel-projects .project-check input {
+    accent-color: var(--neon-cyan);
+    cursor: pointer;
+    margin: 0;
 }
 
 #panel-projects .project-row[data-state="running"] {
@@ -389,6 +483,99 @@
 #panel-projects .project-job.completed { color: #3f7a52; border-color: rgba(90, 150, 110, 0.3); }
 #panel-projects .project-job.failed { color: #c0453f; border-color: rgba(217, 83, 79, 0.3); }
 #panel-projects .project-job.running { color: #8A5A32; border-color: rgba(176, 123, 82, 0.35); }
+
+/* ── 显示方式：网格 ────────────────────────────────────────────────────
+   一行变一张竖卡（大封面在上、文字在下）。勾选框在这里改为浮在封面左上角——
+   竖排 flex 下留在文档流里会独占顶上一整行。 */
+#panel-projects .projects-list.view-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    align-content: start;
+    gap: 12px;
+}
+
+/* 加载/空状态在网格里会缩成一个单元格，让它横跨整行 */
+#panel-projects .projects-list.view-grid .projects-status { grid-column: 1 / -1; }
+
+#panel-projects .projects-list.view-grid .project-row {
+    position: relative;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding: 10px;
+}
+
+#panel-projects .projects-list.view-grid .project-thumb {
+    width: 100%;
+    height: 130px;
+    border-radius: 10px;
+}
+
+#panel-projects .projects-list.view-grid .project-thumb-icon { font-size: 32px; }
+
+#panel-projects .projects-list.view-grid .project-check {
+    position: absolute;
+    left: 16px;
+    top: 16px;
+    z-index: 2;
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.45);
+}
+
+#panel-projects .projects-list.view-grid .project-title {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+/* ── 显示方式：紧凑 ────────────────────────────────────────────────────
+   一行一屏里塞进最多项目：缩略图降到 32px、正文压成单行。子作业徽章与错误详情
+   在这一档隐藏——状态徽章（含"子作业失败"）仍在，要看具体哪条失败就点开详情栏。 */
+#panel-projects .projects-list.view-compact { gap: 2px; }
+
+#panel-projects .projects-list.view-compact .project-row {
+    align-items: center;
+    gap: 8px;
+    padding: 5px 10px;
+    border-radius: 8px;
+}
+
+#panel-projects .projects-list.view-compact .project-thumb {
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+}
+
+#panel-projects .projects-list.view-compact .project-thumb-icon { font-size: 14px; }
+
+#panel-projects .projects-list.view-compact .project-main {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+}
+
+#panel-projects .projects-list.view-compact .project-title-line {
+    flex: 1;
+    min-width: 0;
+    flex-wrap: nowrap;
+    overflow: hidden;
+}
+
+#panel-projects .projects-list.view-compact .project-meta,
+#panel-projects .projects-list.view-compact .project-progress {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+#panel-projects .projects-list.view-compact .project-jobs,
+#panel-projects .projects-list.view-compact .project-error {
+    display: none;
+}
 
 /* ── 详情栏 ────────────────────────────────────────────────────────────── */
 
@@ -601,8 +788,14 @@
     #panel-projects .projects-detail.open { display: block; }
 
     #panel-projects .projects-toolbar { padding: 10px 16px; }
+    #panel-projects .projects-bulkbar { padding: 8px 16px; }
     #panel-projects .projects-list { padding: 12px 16px 24px; }
     #panel-projects .projects-search-sort { max-width: none; }
+}
+
+/* 触屏没有 hover：勾选框常显，否则多选完全没法进入 */
+@media (hover: none) {
+    #panel-projects .project-check { opacity: 1; }
 }
 
 /* 拖放导入 JSON 的靶区（原先是「点子库」抽屉，抽屉删除后搬到工作台列表） */

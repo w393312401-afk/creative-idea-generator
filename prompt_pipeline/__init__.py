@@ -8703,6 +8703,22 @@ Required JSON keys:
         # Keep the authoritative card plan on the parsed brief so planning fallbacks and
         # checkpoints can compile it without reaching back into the request object.
         parsed_brief['beat_outline'] = [dict(x) for x in _outline_plan]
+    # 反推复刻线的禁用元素清单（Pass B 产出 + 人工卡点上编辑过的那一份）。挂到 brief 上
+    # 供 Phase 2 的 composer 组负面清单段（见 composers/base.banned_elements_block）。
+    # 2026-08-10 之前它只到 dimensions 为止、无人读取，写手从没见过这份清单，
+    # 而 banned_element_hits 却在成品上扫它——一道声称存在、实际只发报告的门禁。
+    _banned_elements = [str(x).strip() for x in (dimensions.get('banned_elements') or [])
+                        if str(x).strip()]
+    _banned_plan_block = ""
+    if _banned_elements:
+        parsed_brief['banned_elements'] = _banned_elements
+        # 规划器也要看见它。只在 Phase 2 拦是拦晚了：梯子里一旦排进一道原片没有的工序，
+        # 写手要么违反负面清单，要么交付一拍空洞的占位内容。
+        _banned_plan_block = (
+            "\nBANNED ELEMENTS (hard): the reference film contains no frame showing any of the "
+            "following, so no beat may be planned around them — "
+            + "; ".join(_banned_elements)
+            + ". Plan only the operations the card work plan above actually states.\n")
     # 卡片原始清单也挂到 config 上：合成收尾算交付总账时要拿它回答"这张卡本来有几条"。
     # 规划四轮全败退兜底时梯子上一个 outline_refs 都没有，只看梯子的话总账为空——
     # 而那恰恰是**整张卡的工序被通用施工序整体换掉**、最该报警的一单。
@@ -8870,6 +8886,7 @@ Destiny: {parsed_brief['destiny']}
 Mode: {parsed_brief['mode']}
 Space Type: {space_type}
 {_outline_plan_block}
+{_banned_plan_block}
 {_pacing_plan_block}"""
 
     beat_ladder = None
@@ -9317,7 +9334,14 @@ Space Type: {space_type}
     frame_state_contract = build_frame_state_contract(beat_ladder)
     frame_state_errors = validate_frame_state_contract(frame_state_contract)
     scene_states = build_scene_states(beat_ladder)
-    scene_state_errors = validate_scene_states(scene_states)
+    # 反推复刻线（dimensions.reverse_engineered）豁免「进 furnishing 前必须清场」这一条，
+    # 且**只豁免这一条**。原因见 scene_state.validate_scene_states 的 docstring：那条
+    # 规则审的是施工纪律，而复刻单交付的是对原片的转录，原片里那块防护布确实一直在。
+    # 在此之前这条闸会把每一单照实复刻都判死，replica_pipeline 只能在外面写一段
+    # 中文道歉去翻译它——翻译报错不是修复，让闸知道题材来源才是。
+    scene_state_errors = validate_scene_states(
+        scene_states,
+        allow_lingering_temporaries=bool(dimensions.get('reverse_engineered')))
     if isinstance(config, dict):
         config['_frame_state_contract'] = frame_state_contract
         config['_frame_state_contract_errors'] = frame_state_errors
@@ -13018,7 +13042,13 @@ def _outline_normalized_entries(outline):
                     normalized['mat'] = mat
                 # zone/scope/trace（P2/P3）：scope 是闭集枚举，统一小写后再往下走，
                 # 否则规划器那边 stage_scope 的等值比对会被一个大写字母判成冲突。
-                for key in ('zone', 'scope', 'trace'):
+                #
+                # state_before/state_after（2026-08-10，复刻线）：反推来的清单条目自带
+                # 一对具体空间完成范围。它们是**观察结果**而不是创作目标，所以必须原样
+                # 绑定到那一拍，不能让规划器从一句动作描述里重新想一遍——重新想出来的
+                # 起止状态和原片对不上，1:1 复刻就名存实亡。老卡片不带这两个键，
+                # build_outline_plan_block 的 has_* 守卫会让它们对现有链路完全隐形。
+                for key in ('zone', 'scope', 'trace', 'state_before', 'state_after'):
                     value = str(entry.get(key) or '').strip()
                     if key == 'scope':
                         value = value.lower()
@@ -13511,6 +13541,10 @@ def build_outline_plan_block(beat_outline, max_total_beats):
             rendered.append(f'     MATERIALS: {", ".join(entry["mat"])}')
         if entry.get('trace'):
             rendered.append(f'     LEAVES: {entry["trace"]}')
+        if entry.get('state_before'):
+            rendered.append(f'     STATE BEFORE: {entry["state_before"]}')
+        if entry.get('state_after'):
+            rendered.append(f'     STATE AFTER: {entry["state_after"]}')
     lines = '\n'.join(rendered)
     n = len(plan)
     # 富字段绑定段只在卡片真的给了这几个字段时才出现——老卡/老断点凭空看见一段
@@ -13518,8 +13552,9 @@ def build_outline_plan_block(beat_outline, max_total_beats):
     has_scope = any(e.get('scope') for e in plan)
     has_zone = any(e.get('zone') for e in plan)
     has_trace = any(e.get('trace') for e in plan)
+    has_state = any(e.get('state_before') or e.get('state_after') for e in plan)
     rich_block = ""
-    if has_scope or has_zone or has_trace:
+    if has_scope or has_zone or has_trace or has_state:
         rules = []
         if has_scope:
             rules.append(
@@ -13541,6 +13576,17 @@ def build_outline_plan_block(beat_outline, max_total_beats):
                 "must appear in that beat's own \"persistent_traces\", and the NEXT beat must "
                 "still carry it in its \"persistent_traces\" or \"preserve_state\" — work that "
                 "vanishes in the following frame reads as never having been done.")
+        if has_state:
+            rules.append(
+                "STATE PAIR: an entry's \"STATE BEFORE\" / \"STATE AFTER\" are OBSERVED spatial "
+                "completion extents read off a real reference film, not creative targets. Carry "
+                "each one into that beat's own \"before_state\" / \"after_state\" and "
+                "\"completion_extent\" with its spatial extent intact — the same surfaces, the "
+                "same fractions, the same left/right/upper/lower breakdown. You may reword for "
+                "fluency; you may NOT enlarge, shrink, round off, or generalise the extent, and "
+                "you may not replace it with vague progress wording. A beat whose delivered "
+                "after_state covers more or less of the space than its declared STATE AFTER has "
+                "broken the one thing this job exists to reproduce.")
         rich_block = ("\nCARD-DECLARED BEAT PROPERTIES (mandatory — these come from the card the "
                       "user chose, not from you):\n- " + "\n- ".join(rules) + "\n")
     block = (

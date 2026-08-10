@@ -366,3 +366,135 @@
     white-space: pre-wrap;
     word-break: break-word;
 }
+
+/* ── 阶段阶梯 ───────────────────────────────────────────────── */
+/* 页面上原先编着 ①②③④⑤，后台却有十二个 stage，chip 显示「聚类节拍」时用户在
+   页面上找不到对应区块。这条阶梯把两者对齐成四段。 */
+
+.replica-phases {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 4px;
+    margin: 0 0 14px;
+    padding: 0;
+    list-style: none;
+}
+
+.replica-phase {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px 4px 4px;
+    border-radius: 999px;
+    font-size: 12px;
+    opacity: 0.45;
+}
+
+.replica-phase + .replica-phase::before {
+    content: '';
+    width: 14px;
+    height: 1px;
+    margin-right: 2px;
+    background: currentColor;
+    opacity: 0.5;
+}
+
+.replica-phase-dot {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    border: 1px solid currentColor;
+    font-size: 11px;
+    line-height: 1;
+}
+
+.replica-phase.done {
+    opacity: 0.75;
+}
+
+.replica-phase.current {
+    opacity: 1;
+    background: rgba(110, 231, 255, 0.1);
+    color: var(--accent, #6ee7ff);
+}
+
+.replica-phase.failed {
+    opacity: 1;
+    background: rgba(255, 90, 90, 0.14);
+    color: var(--danger, #ff7b7b);
+}
+
+/* ── 成本确认卡点 ───────────────────────────────────────────── */
+/* Pass A 是整条线唯一的大额支出。这一段是它前面那个"真的停下来"的位置，
+   不能长得像一句普通提示。 */
+
+.replica-cost-gate {
+    margin: 0 0 10px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: rgba(255, 190, 90, 0.1);
+    border: 1px solid rgba(255, 190, 90, 0.3);
+    opacity: 1;
+}
+
+/* ── 浮层提示 ───────────────────────────────────────────────── */
+/* 原先所有反馈都写进页面顶端上传卡片里的 #replica-upload-status。几十拍的编辑器
+   一撑开，你在底部点「保存并重校验」得到的那句提示就在视口外了——操作看上去毫无
+   反应。固定在视口上，跟滚动位置无关。 */
+
+.replica-toast {
+    position: fixed;
+    left: 50%;
+    bottom: 28px;
+    z-index: 9999;
+    max-width: min(560px, calc(100vw - 32px));
+    padding: 12px 16px;
+    border-radius: 10px;
+    background: rgba(20, 24, 32, 0.96);
+    border: 1px solid rgba(110, 231, 255, 0.3);
+    color: #e8f4f8;
+    font-size: 13px;
+    line-height: 1.6;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+    transform: translate(-50%, 16px);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.replica-toast.show {
+    opacity: 1;
+    transform: translate(-50%, 0);
+}
+
+.replica-toast.is-error {
+    border-color: rgba(255, 123, 123, 0.55);
+    color: #ffd9d9;
+}
+
+/* 转圈只加在触发操作的那个按钮上，而不是整页变灰 */
+.replica-card .action-btn.is-running {
+    position: relative;
+    color: transparent !important;
+}
+
+.replica-card .action-btn.is-running::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 14px;
+    height: 14px;
+    margin: -7px 0 0 -7px;
+    border: 2px solid rgba(255, 255, 255, 0.35);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: replica-spin 0.7s linear infinite;
+}
+
+@keyframes replica-spin {
+    to { transform: rotate(360deg); }
+}

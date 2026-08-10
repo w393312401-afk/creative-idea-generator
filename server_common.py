@@ -2449,6 +2449,116 @@ def resolve_gallery_media_path(raw, base_dir=None):
     return abs_p
 
 
+_WIN_EXPLORER_CLASSES = ('CabinetWClass', 'ExplorerWClass')
+
+
+def _win_force_foreground(hwnd):
+    """把窗口真正拽到前台。
+
+    Windows 的前台锁（foreground lock）规定：只有当前前台进程、或刚收到用户输入的
+    进程才能调 SetForegroundWindow。服务端是个后台进程（pythonw，没有窗口也收不到
+    输入），它拉起的资源管理器窗口因此只会在任务栏闪一下，不会跳到浏览器前面——
+    这就是 Windows 上"点了定位没反应"的真正原因。
+    绕过办法是把本线程的输入队列临时挂到当前前台窗口的线程上，这期间前台锁对我们
+    失效，SetForegroundWindow 才会生效，用完立刻解绑。
+    """
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    SW_RESTORE = 9
+    user32.ShowWindow(hwnd, SW_RESTORE)
+
+    cur_tid = kernel32.GetCurrentThreadId()
+    fg = user32.GetForegroundWindow()
+    tids = set()
+    for h in (fg, hwnd):
+        if h:
+            t = user32.GetWindowThreadProcessId(h, None)
+            if t and t != cur_tid:
+                tids.add(t)
+    attached = []
+    for t in tids:
+        if user32.AttachThreadInput(cur_tid, t, True):
+            attached.append(t)
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        for t in attached:
+            user32.AttachThreadInput(cur_tid, t, False)
+
+
+def _win_explorer_title_matches(title, folder):
+    """资源管理器窗口标题是不是指向 folder 这个目录。
+
+    标题不是裸的文件夹名，而是「videos - 文件资源管理器」这种带应用名后缀的形式
+    （开了"标题栏显示完整路径"则是全路径 + 同样的后缀），所以按"名字 + 分隔空格"
+    前缀匹配，不能按相等匹配——最初按相等写，结果一个都匹配不上，窗口照样留在后面。
+    """
+    t = (title or '').strip().lower()
+    if not t:
+        return False
+    folder = os.path.normpath(folder or '')
+    names = {n.lower() for n in (os.path.basename(folder), folder) if n}
+    return any(t == n or t.startswith(n + ' ') for n in names)
+
+
+def _win_find_explorer_windows(folder=None):
+    """列出（可见的）资源管理器窗口 hwnd。给了 folder 就只留标题指向它的那些。"""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    found = []
+
+    def _cb(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buf, 256)
+        if buf.value not in _WIN_EXPLORER_CLASSES:
+            return True
+        if folder:
+            title = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(hwnd, title, 512)
+            if not _win_explorer_title_matches(title.value, folder):
+                return True
+        found.append(hwnd)
+        return True
+
+    user32.EnumWindows(ENUMPROC(_cb), 0)
+    return found
+
+
+def _win_focus_revealed_window(folder, known_hwnds=(), timeout=4.0):
+    """等 explorer 把窗口开出来，然后把它拉到前台。
+
+    优先挑 known_hwnds（发起前的快照）里没有的那个新窗口；explorer 复用已有窗口
+    时没有新 hwnd，就退回到标题匹配上的那个。始终返回布尔、不抛异常——窗口反正
+    已经开了，只是没抢到前台，绝不能因为这一步失败把整个"定位"接口弄成报错。
+    """
+    import time
+
+    known = set(known_hwnds or ())
+    deadline = time.time() + timeout
+    fallback = None
+    while time.time() < deadline:
+        matches = _win_find_explorer_windows(folder)
+        fresh = [h for h in matches if h not in known]
+        if fresh:
+            _win_force_foreground(fresh[0])
+            return True
+        if matches and fallback is None:
+            fallback = matches[0]
+        time.sleep(0.15)
+    if fallback is not None:
+        _win_force_foreground(fallback)
+        return True
+    return False
+
+
 def reveal_media_in_file_manager(raw, base_dir=None):
     """在本机文件管理器里选中这个媒体文件（macOS Finder / Windows 资源管理器 /
     Linux 文件管理器），返回它的绝对路径。
@@ -2458,13 +2568,25 @@ def reveal_media_in_file_manager(raw, base_dir=None):
     Linux 上没有"选中某个文件"的通用协议，退而求其次打开所在目录。
     """
     import subprocess
+    import threading
 
     abs_p = resolve_gallery_media_path(raw, base_dir=base_dir)
+    known_hwnds = ()
     if sys.platform == 'darwin':
         cmd = ['open', '-R', abs_p]
     elif os.name == 'nt':
-        # explorer 选中语法要求 /select, 与路径之间不能有空格，且必须是反斜杠路径
-        cmd = ['explorer', '/select,' + os.path.normpath(abs_p)]
+        # explorer 选中语法要求 /select, 与路径之间不能有空格。这里必须传**字符串**
+        # 命令行而不是 list：list2cmdline 遇到带空格的路径会把 `/select,C:\a b\c.mp4`
+        # 整个套上引号，explorer 认不出这种写法（用户名含空格时就是这样，表现为
+        # 打开"文档"或干脆什么都不开）。正确写法是只给路径本身加引号。
+        win_path = os.path.normpath(abs_p)
+        cmd = '{} /select,"{}"'.format(
+            os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'explorer.exe'), win_path)
+        # 拉起前先记下已有的资源管理器窗口，等下好认出哪个是新开的那一个
+        try:
+            known_hwnds = _win_find_explorer_windows()
+        except Exception:
+            known_hwnds = ()
     else:
         cmd = ['xdg-open', os.path.dirname(abs_p)]
     try:
@@ -2473,6 +2595,19 @@ def reveal_media_in_file_manager(raw, base_dir=None):
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
         raise ValueError(f'无法打开文件管理器: {e}')
+    if os.name == 'nt':
+        # 抢前台得等窗口真的建出来（~0.2-1 秒），不能占着 HTTP 线程干等，
+        # 否则前端那句"已定位"的提示要等好几秒才回来。抢不到也只是窗口留在后面，
+        # 不该冒泡成接口错误，所以整段吞掉异常。
+        folder = os.path.dirname(abs_p)
+
+        def _focus():
+            try:
+                _win_focus_revealed_window(folder, known_hwnds)
+            except Exception:
+                pass
+
+        threading.Thread(target=_focus, daemon=True).start()
     return abs_p
 
 
@@ -4231,7 +4366,7 @@ MEDIA_TASK_TYPES = frozenset({'frames', 'staged_render', 'videos', 'cover'})
 
 # 复刻线的任务：同一条 job 会先 start 再 advance 好几次，每次一个 task_id。它们
 # 说的是同一个项目，必须按 job 收成一行，否则工作台上会出现 N 行同名记录。
-REPLICA_TASK_TYPES = frozenset({'replica', 'replica_advance'})
+REPLICA_TASK_TYPES = frozenset({'replica', 'replica_extract', 'replica_advance'})
 
 _PROJECT_TITLE_PREFIXES = ('做一个', '做个', '设计一个', '设计个')
 

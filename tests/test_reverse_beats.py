@@ -202,6 +202,24 @@ class TestSchemaBackedFieldValidation(unittest.TestCase):
         messages = [v['message'] for v in reverse.validate_beats(doc, _overview())]
         self.assertTrue(any('state_after' in m for m in messages))
 
+    def test_an_unreadable_schema_is_reported_not_silently_skipped(self):
+        """静默降级会让 UI 显示「已通过全部机械校验」，而字段校验其实压根没跑——
+        用户据此以为阶梯是干净的。降级本身必须出现在 validation 列表里。"""
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [],
+               'beats': [_beat('B01', 0.0, 10.0, events=['E01', 'E02'])]}
+        with patch.object(reverse, '_schema_path', return_value='/nonexistent/schema.json'):
+            violations = reverse.validate_beats(doc, _overview())
+        hit = next(v for v in violations if v['code'] == 'schema_unavailable')
+        self.assertEqual(hit['level'], 'warn')
+        self.assertIn('跳过', hit['message'])
+
+    def test_an_explicit_schema_argument_reports_nothing(self):
+        """调用方自己给了 schema（或明确要求跳过）时不该冒出这条告警。"""
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [],
+               'beats': [_beat('B01', 0.0, 10.0, events=['E01', 'E02'])]}
+        codes = [v['code'] for v in reverse.validate_beats(doc, _overview(), schema={})]
+        self.assertNotIn('schema_unavailable', codes)
+
     def test_empty_source_event_ids_is_legitimate(self):
         """一拍可以不认领任何变化事件（安静窗口，或整条视频压根没检出事件）。
         真正的覆盖不变量由 _validate_event_coverage 管，不该在字段校验里一刀切。"""
@@ -696,6 +714,61 @@ class TestHandoffToComposer(unittest.TestCase):
         dims = reverse.beats_to_dimensions(doc, {'theme': '用户自己写的主题'})
         self.assertEqual(dims['theme'], '用户自己写的主题')
 
+    def test_the_fields_the_user_edits_actually_reach_the_composer(self):
+        """人工卡点的存在理由。
+
+        这条测试盯的是本模块最容易静默退化的一处：`beats_to_dimensions` 曾经只发
+        text + op，于是用户在审核卡点上逐拍精修的起止状态、遗留痕迹、可见细节全部
+        止步于这个函数——UI 摆出七个字段让人改，其中五个没有任何下游消费者。
+        退回那个形态时，成片不会报错，只会悄悄不像原片。
+        """
+        doc = {'beats': [_beat(
+            'B01', 0.0, 5.0,
+            visible_details=['bare plaster', 'a taped seam'],
+            persistent_traces=['trowel ridges', 'splatter flecks'],
+            state_before='left two-thirds bare, right third primed',
+            state_after='left two-thirds coated, right third primed')]}
+        entry = reverse.beats_to_dimensions(doc)['beat_outline'][0]
+
+        self.assertEqual(entry['mat'], ['bare plaster', 'a taped seam'])
+        self.assertEqual(entry['trace'], 'trowel ridges; splatter flecks')
+        self.assertEqual(entry['state_before'], 'left two-thirds bare, right third primed')
+        self.assertEqual(entry['state_after'], 'left two-thirds coated, right third primed')
+
+    def test_absent_rich_fields_are_omitted_rather_than_sent_empty(self):
+        """空键会让 build_outline_plan_block 的 has_* 守卫误判，凭空长出一段
+        「把 stage_scope 设成清单里的 scope」——规划器就会去编一个不存在的值。"""
+        doc = {'beats': [_beat('B01', 0.0, 5.0, visible_details=[],
+                               persistent_traces=[], state_before='', state_after='')]}
+        entry = reverse.beats_to_dimensions(doc)['beat_outline'][0]
+        for key in ('mat', 'trace', 'state_before', 'state_after'):
+            self.assertNotIn(key, entry)
+
+    def test_rich_fields_survive_the_composer_outline_normaliser(self):
+        """绑定通路的另一端。这里直接调 prompt_pipeline 的归一化器与提示词段落生成，
+        确认这几个键不会在半路被 `_outline_normalized_entries` 丢掉——两侧各自单测
+        通过、中间那一跳却对不上，是这条链路最贵的失败方式。"""
+        doc = {'beats': [_beat('B01', 0.0, 5.0,
+                               state_before='left two-thirds bare',
+                               state_after='left two-thirds coated')]}
+        outline = reverse.beats_to_dimensions(doc)['beat_outline']
+
+        normalized = pp._outline_normalized_entries(outline)
+        self.assertEqual(normalized[0]['state_before'], 'left two-thirds bare')
+        self.assertEqual(normalized[0]['state_after'], 'left two-thirds coated')
+
+        _plan, block = pp.build_outline_plan_block(outline, len(outline))
+        self.assertIn('STATE BEFORE: left two-thirds bare', block)
+        self.assertIn('STATE AFTER: left two-thirds coated', block)
+        # 光渲染出来还不够：没有那条绑定规则，模型会把它当背景资料而不是硬约束。
+        self.assertIn('STATE PAIR', block)
+
+    def test_a_plain_card_outline_gains_no_state_rule(self):
+        """老卡片/手动主题不带这几个键，提示词里就不该出现这段规则。"""
+        _plan, block = pp.build_outline_plan_block(
+            [{'text': '拆除塌陷的屋顶板', 'op': 'demolition'}], 1)
+        self.assertNotIn('STATE PAIR', block)
+
     def test_banned_hits_are_case_insensitive(self):
         hits = reverse.banned_element_hits(
             'A worker lifts a WELDING TORCH into frame.', ['welding torch', 'excavator'])
@@ -703,6 +776,242 @@ class TestHandoffToComposer(unittest.TestCase):
 
     def test_no_banned_elements_means_no_hits(self):
         self.assertEqual(reverse.banned_element_hits('anything at all', []), [])
+
+
+class _SheetJob:
+    """临时 job 目录 + 真实存在的帧文件。拼图那条路会 os.path.exists 每一帧。"""
+
+    def __init__(self, count=5, missing=()):
+        self.dir = tempfile.mkdtemp()
+        self.frames = []
+        for i in range(1, count + 1):
+            name = f'review_{i:03d}.png'
+            path = os.path.join(self.dir, name)
+            if i not in missing:
+                with open(path, 'wb') as f:
+                    f.write(b'\x89PNG')
+            self.frames.append({'index': i, 'timestamp': float(i), 'frame_path': path})
+        self.overview = {
+            'source_video': '/x/clip.mp4',
+            'media_metadata': {'duration_sec': float(count)},
+            'change_events': [],
+            'review_sampling': {'frames': self.frames},
+            'scenes': [],
+        }
+        with open(os.path.join(self.dir, 'video_overview.json'), 'w', encoding='utf-8') as f:
+            json.dump(self.overview, f)
+
+    def facts(self):
+        return [{'frame': os.path.basename(e['frame_path']), 'timestamp': e['timestamp']}
+                for e in self.frames]
+
+
+def _fake_collage(frame_paths, output_path, columns=5):
+    """替身拼图：写一个真文件出来并记下它拼了哪几帧。"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b'\xff\xd8\xff')
+    _fake_collage.calls.append([p.name for p in frame_paths])
+    return output_path
+
+
+class TestPassBSheets(unittest.TestCase):
+    """Pass B 的视觉输入。
+
+    原先 Pass B 只拿到 `_facts_digest` 那几十行文本去聚类——跨帧的东西（同一面墙的推进、
+    痕迹还在不在）只活在像素里，文本里全丢了，模型只能靠文本相邻性猜里程碑边界。
+    这一组盯的是拼图接上去之后最容易静默坏掉的地方：**格子与事实的对齐**。错位一格，
+    模型会把 A 帧的画面当成 B 帧的事实读，比没有拼图坏得多。
+    """
+
+    def setUp(self):
+        _fake_collage.calls = []
+
+    def test_sheets_are_paged_and_carry_their_own_start_index(self):
+        job = _SheetJob(count=12)
+        with patch('tools.collage.build_keyframe_collage', _fake_collage):
+            sheets = reverse.build_pass_b_sheets(job.dir, job.overview, job.facts(), page_size=5)
+        self.assertEqual([s['start'] for s in sheets], [0, 5, 10])
+        self.assertEqual([len(s['facts']) for s in sheets], [5, 5, 2])
+
+    def test_a_missing_frame_breaks_the_page_instead_of_shifting_every_tile_after_it(self):
+        """第 3 帧缺失。跳过它接上第 4 帧会让后面每一格都平移一位——那正是要防的。"""
+        job = _SheetJob(count=6, missing=(3,))
+        with patch('tools.collage.build_keyframe_collage', _fake_collage):
+            sheets = reverse.build_pass_b_sheets(job.dir, job.overview, job.facts(), page_size=5)
+        self.assertEqual([s['start'] for s in sheets], [0, 3])
+        # 缺帧之后那一页的 start 必须是 3（真实下标），而不是 2（累加前几页的长度）。
+        self.assertEqual([f['frame'] for f in sheets[1]['facts']],
+                         ['review_004.png', 'review_005.png', 'review_006.png'])
+        self.assertNotIn('review_003.png', sum(_fake_collage.calls, []))
+
+    def test_the_layout_block_numbers_match_the_digest_numbering(self):
+        job = _SheetJob(count=6, missing=(3,))
+        facts = job.facts()
+        with patch('tools.collage.build_keyframe_collage', _fake_collage):
+            sheets = reverse.build_pass_b_sheets(job.dir, job.overview, facts, page_size=5)
+        block = reverse._sheet_layout_block(sheets)
+        digest = reverse._facts_digest(facts)
+        # digest 的 #4 就是 review_004.png，layout 说第二张拼图从 #4 起——两处必须一致。
+        self.assertIn('#4 [4.0s] review_004.png', digest)
+        self.assertIn('SHEET 2: FRAME FACTS #4–#6', block)
+
+    def test_no_ffmpeg_means_no_sheets_rather_than_a_half_set(self):
+        job = _SheetJob(count=6)
+        with patch('tools.collage.build_keyframe_collage', return_value=None):
+            self.assertEqual(reverse.build_pass_b_sheets(job.dir, job.overview, job.facts()), [])
+
+    def test_missing_frame_files_degrade_to_no_sheets(self):
+        job = _SheetJob(count=3, missing=(1, 2, 3))
+        self.assertEqual(reverse.build_pass_b_sheets(job.dir, job.overview, job.facts()), [])
+
+    def _good_reply(self):
+        return json.dumps({'banned_elements': [], 'beats': [{
+            'id': 'B01', 'start': 0.0, 'end': 5.0, 'stage': 'structural',
+            'operation': 'work', 'visual_subject': 'wall', 'visible_details': ['bare'],
+            'visible_action': 'works', 'visible_result': 'done',
+            'state_before': 'left half bare', 'state_after': 'left half done',
+            'package_operations': ['cut', 'fit', 'fasten'],
+            'persistent_traces': ['dust film', 'screw head rows'], 'workers_present': True,
+            'source_event_ids': [], 'evidence_frames': ['review_001.png'],
+        }]})
+
+    def test_cluster_beats_sends_the_sheets_to_a_multimodal_call(self):
+        job = _SheetJob(count=5)
+        facts = {'facts': job.facts()}
+        with patch('tools.collage.build_keyframe_collage', _fake_collage), \
+                patch.object(pp, '_multimodal_chat', return_value=self._good_reply()) as mm, \
+                patch.object(pp, '_chat') as text_chat:
+            reverse.cluster_beats({'model': 'm'}, job.dir, facts_payload=facts)
+        text_chat.assert_not_called()
+        self.assertEqual(mm.call_count, 1)
+        images = mm.call_args[0][3]
+        self.assertTrue(images, '拼图存在时必须真的把图片传进去，否则这条改动等于没做')
+        self.assertIn('CONTACT SHEETS', mm.call_args[0][2])
+
+    def test_cluster_beats_still_runs_when_no_sheet_can_be_built(self):
+        """拼图是增强，不是门禁。ffmpeg 缺失不该让反推跑不完。"""
+        job = _SheetJob(count=3, missing=(1, 2, 3))
+        with patch.object(pp, '_chat', return_value=self._good_reply()) as text_chat, \
+                patch.object(pp, '_multimodal_chat') as mm:
+            doc = reverse.cluster_beats({}, job.dir, facts_payload={'facts': job.facts()})
+        mm.assert_not_called()
+        self.assertEqual(text_chat.call_count, 1)
+        self.assertEqual(len(doc['beats']), 1)
+
+    def test_a_truncated_multimodal_reply_is_reworked_not_fatal(self):
+        """多模态路径把截断报成异常，纯文本路径靠半截 JSON 认出来。两条路都得汇进
+        「合并节拍、写短一点」的回炉分支——否则上了拼图之后一次截断就是整单失败。"""
+        job = _SheetJob(count=5)
+        replies = [pp.ResponseTruncated('cut off'), self._good_reply()]
+        with patch('tools.collage.build_keyframe_collage', _fake_collage), \
+                patch.object(pp, '_multimodal_chat', side_effect=replies) as mm:
+            doc = reverse.cluster_beats({'model': 'm'}, job.dir,
+                                        facts_payload={'facts': job.facts()})
+        self.assertEqual(mm.call_count, 2)
+        self.assertIn('CUT OFF', mm.call_args[0][2])
+        self.assertEqual(len(doc['beats']), 1)
+
+
+class TestPeakVerification(unittest.TestCase):
+    """峰值帧复核默认开（2026-08-10）。
+
+    原先默认关，省下几次调用的钱，代价是节拍边界——边界恰好落在 peak 帧上，那几帧被
+    flash 读糊，整条阶梯就整体错位，后面所有合成调用都建在错的骨架上。
+    """
+
+    def setUp(self):
+        self.job = _SheetJob(count=3)
+        self.job.overview['change_events'] = [{
+            'event_id': 'E01', 'start': 1.0, 'peak': 2.0, 'end': 3.0,
+            'evidence_frames': ['review_001.png', 'review_002.png', 'review_003.png'],
+        }]
+        with open(os.path.join(self.job.dir, 'video_overview.json'), 'w', encoding='utf-8') as f:
+            json.dump(self.job.overview, f)
+        self.payload = {'facts': [dict(f, subject='blurry', confidence=0.3)
+                                  for f in self.job.facts()]}
+
+    def _reply(self):
+        return json.dumps([{'frame': 'review_002.png', 'subject': 'a boarded ceiling',
+                            'confidence': 0.9}])
+
+    def test_it_runs_without_any_peak_verify_model_being_configured(self):
+        with patch.object(pp, '_multimodal_chat', return_value=self._reply()) as mm:
+            out = reverse.verify_peak_frames({'model': 'm-strong'}, self.job.dir, self.payload)
+        self.assertEqual(mm.call_count, 1)
+        self.assertEqual(mm.call_args.kwargs['model'], 'm-strong')
+        refined = [f for f in out['facts'] if f['frame'] == 'review_002.png'][0]
+        self.assertEqual(refined['subject'], 'a boarded ceiling')
+        self.assertEqual(refined['verified_by'], 'm-strong')
+        # 时间戳必须跟着复核结果走，否则这一帧在 Pass B 里落不进任何拍窗。
+        self.assertEqual(refined['timestamp'], 2.0)
+
+    def test_it_can_still_be_turned_off(self):
+        for off in ('off', 'none', 'false', False):
+            with patch.object(pp, '_multimodal_chat') as mm:
+                reverse.verify_peak_frames({'model': 'm', 'peakVerifyModel': off},
+                                           self.job.dir, self.payload)
+            mm.assert_not_called()
+
+    def test_a_failed_verification_leaves_pass_a_intact_instead_of_killing_the_job(self):
+        """复核是增强，不是门禁。默认开之后这条尤其要紧——一次解析失败若能掀掉整单，
+        等于把已经付过钱的 Pass A 一起赔进去。"""
+        with patch.object(pp, '_multimodal_chat', side_effect=RuntimeError('gateway down')):
+            out = reverse.verify_peak_frames({'model': 'm'}, self.job.dir, self.payload)
+        self.assertEqual(len(out['facts']), 3)
+        self.assertEqual(out['facts'][1]['subject'], 'blurry')
+
+    def test_the_cost_estimate_reports_the_peak_calls_it_will_now_make(self):
+        """默认加钱却不进预估，等于绕开了「先确认再烧钱」这道卡点本身。"""
+        est = reverse.estimate_pass_a_cost(self.job.overview)
+        self.assertEqual(est['peak_frame_count'], 1)
+        self.assertEqual(est['peak_batch_count'], 1)
+
+
+class TestSingleFrameSalvage(unittest.TestCase):
+    """整批预算用尽后逐帧重试。
+
+    多半是其中一两帧让模型写出了坏 JSON，整批作废会把另外八帧读得好好的观察一起赔进去
+    ——缺帧在 Pass B 里表现为该窗口证据不足，节拍边界就落错。
+    """
+
+    def _fact(self, name):
+        return json.dumps([{'frame': name, 'subject': 'wall', 'confidence': 0.8}])
+
+    def test_a_doomed_batch_is_retried_frame_by_frame(self):
+        job = _SheetJob(count=3)
+        job.overview['analysis_plan'] = {
+            'required_frames': [f'review_{i:03d}.png' for i in (1, 2, 3)]}
+        with open(os.path.join(job.dir, 'video_overview.json'), 'w', encoding='utf-8') as f:
+            json.dump(job.overview, f)
+
+        broken = ['{ broken'] * (reverse._PARSE_RETRY_BUDGET + 1)
+        # 逐帧重试里第二帧仍然坏，另外两帧救得回来。
+        singles = [self._fact('review_001.png'), '{ still broken',
+                   self._fact('review_003.png')]
+        with patch.object(pp, '_multimodal_chat', side_effect=broken + singles) as mm:
+            payload = reverse.extract_frame_facts({}, job.dir, batch_size=10)
+
+        self.assertEqual(mm.call_count, len(broken) + 3)
+        read = {f['frame']: f for f in payload['facts'] if f.get('subject')}
+        self.assertEqual(set(read), {'review_001.png', 'review_003.png'})
+        # 救不回来的那帧仍然占位，confidence 归零——Pass B 该看到「这帧没读到」，
+        # 而不是这帧压根不存在。
+        lost = [f for f in payload['facts'] if f['frame'] == 'review_002.png'][0]
+        self.assertEqual(lost['confidence'], 0.0)
+
+    def test_truncation_also_falls_through_to_the_per_frame_retry(self):
+        """十帧的观察写不进 4096 tokens 是常事，解药和坏 JSON 一样是把这批拆小。"""
+        job = _SheetJob(count=1)
+        job.overview['analysis_plan'] = {'required_frames': ['review_001.png']}
+        with open(os.path.join(job.dir, 'video_overview.json'), 'w', encoding='utf-8') as f:
+            json.dump(job.overview, f)
+
+        cut = [pp.ResponseTruncated('too long')] * (reverse._PARSE_RETRY_BUDGET + 1)
+        with patch.object(pp, '_multimodal_chat', side_effect=cut) as mm:
+            payload = reverse.extract_frame_facts({}, job.dir)
+        # 单帧批次没有可拆的余地，用完预算就放弃——但不能把异常抛出去杀掉整单。
+        self.assertEqual(mm.call_count, len(cut))
+        self.assertEqual(payload['facts'][0]['confidence'], 0.0)
 
 
 if __name__ == '__main__':

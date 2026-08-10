@@ -17,6 +17,17 @@ const gallerySelected = new Set();  // 已勾选 item.path 集合（跨筛选保
 const galleryExpanded = new Set();  // 本次会话内点过"展开全部"的组 key
 const GALLERY_TRUNCATE = 12;        // 每组默认最多显示的卡片数
 
+// 显示方式跨会话记住。三档只改 #gallery-groups 上的 view-* 类，卡片 HTML 与
+// 数据完全不动 —— 切视图不该重扫磁盘，也不该丢掉已有的勾选和展开态。
+const GALLERY_VIEW_LS_KEY = 'spark_gallery_view';
+const GALLERY_VIEWS = ['grid', 'large', 'list'];
+let galleryView = (() => {
+    try {
+        const v = localStorage.getItem(GALLERY_VIEW_LS_KEY);
+        return GALLERY_VIEWS.includes(v) ? v : 'grid';
+    } catch (e) { return 'grid'; }
+})();
+
 // 折叠状态跨会话记住（存组 key 数组）
 const GALLERY_COLLAPSED_LS_KEY = 'spark_gallery_collapsed';
 const galleryCollapsed = new Set((() => {
@@ -34,6 +45,26 @@ const GALLERY_KIND_LABELS = {
 };
 
 const GALLERY_GROUP_ICONS = { covers: '🖼️', studio: '🎨', project: '📁' };
+
+function galleryApplyView() {
+    const container = document.getElementById('gallery-groups');
+    if (container) {
+        GALLERY_VIEWS.forEach(v => container.classList.toggle(`view-${v}`, v === galleryView));
+    }
+    document.querySelectorAll('#gallery-view-switch .gallery-view-btn').forEach(btn => {
+        const on = btn.dataset.view === galleryView;
+        btn.classList.toggle('active', on);
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+}
+
+function gallerySetView(view) {
+    if (!GALLERY_VIEWS.includes(view) || view === galleryView) return;
+    galleryView = view;
+    try { localStorage.setItem(GALLERY_VIEW_LS_KEY, view); }
+    catch (e) { /* 存储满/隐私模式：视图不持久化也能用 */ }
+    galleryApplyView();
+}
 
 function galleryTabEntered() {
     // 每次切进画廊都重新扫描（不再只扫一次）：磁盘上的帧序列/视频会在其他
@@ -268,12 +299,15 @@ function galleryCardHtml(it) {
             ${badge ? `<span class="gallery-kind-badge">${badge}</span>` : ''}
             ${inUseBadge}
             <label class="gallery-check" title="选择"><input type="checkbox" class="g-check"${sel ? ' checked' : ''}></label>
-            <div class="gallery-card-actions">
-                <button type="button" class="g-act g-act-preview" title="放大预览">🔍</button>
-                <button type="button" class="g-act g-act-download" title="下载文件">📥</button>
-                <button type="button" class="g-act g-act-reveal" title="在本机文件管理器中显示">📂</button>
-                <button type="button" class="g-act g-act-delete" title="删除本地文件">🗑️</button>
-            </div>
+        </div>
+        <!-- 操作条是缩略图的兄弟节点而不是它的子节点：网格/大图视图靠负 margin 把它
+             压回缩略图底边（视觉与旧版一致），列表视图则用 order 把它甩到行尾成为
+             一排常显小按钮 —— 挂在缩略图里面就只能跟着缩略图一起被压成一列。 -->
+        <div class="gallery-card-actions">
+            <button type="button" class="g-act g-act-preview" title="放大预览">🔍</button>
+            <button type="button" class="g-act g-act-download" title="下载文件">📥</button>
+            <button type="button" class="g-act g-act-reveal" title="在本机文件管理器中显示">📂</button>
+            <button type="button" class="g-act g-act-delete" title="删除本地文件">🗑️</button>
         </div>
         <div class="gallery-card-meta">
             <span class="g-name" title="${escapeHtml(it.path)}">${escapeHtml(it.name)}</span>
@@ -435,6 +469,12 @@ async function galleryDeletePaths(paths, label) {
 function initGallery() {
     const container = document.getElementById('gallery-groups');
     if (!container) return; // console.html 等页面没有画廊
+
+    galleryApplyView();
+    document.getElementById('gallery-view-switch')?.addEventListener('click', (e) => {
+        const btn = e.target.closest('.gallery-view-btn');
+        if (btn) gallerySetView(btn.dataset.view);
+    });
 
     // 筛选 chips
     const filters = document.getElementById('gallery-filters');

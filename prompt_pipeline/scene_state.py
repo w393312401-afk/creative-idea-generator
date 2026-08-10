@@ -141,7 +141,18 @@ def validate_material_flow(state: dict[str, Any]) -> list[str]:
     return [f"Beat {state.get('beat')} material flow is missing {x['store']}:{x['direction']}." for x in missing]
 
 
-def validate_scene_states(states: list[dict[str, Any]]) -> list[str]:
+def validate_scene_states(states: list[dict[str, Any]],
+                          allow_lingering_temporaries: bool = False) -> list[str]:
+    """校验场景状态账。
+
+    `allow_lingering_temporaries`：关掉「进入 furnishing 前必须清场」那一条。
+    只有反推复刻线该打开它（见 __init__.py 的 reverse_engineered 分支）。理由是这条
+    规则是为**原创**选题写的产线纪律——原创单里画面还立着脚手架就搬家具进场是失误；
+    而复刻单里那块防护布是从原片上读下来的**观察结果**，原片就是那么拍的。对着一份
+    照实转录判"你不该这样施工"，拦下的不是缺陷，是真实。其余各条（时序、before 承接、
+    重复移除、持久件不得拆除）对两条线一视同仁，它们查的是状态账自身对不对得上，
+    与题材来源无关。
+    """
     errors: list[str] = []
     previous_after: dict[str, Any] = {}
     known: set[str] = set()
@@ -193,7 +204,8 @@ def validate_scene_states(states: list[dict[str, Any]]) -> list[str]:
         # 临时态清场：进入 furnishing 阶段时，任何仍"存活"（已 introduced 未
         # removed）且匹配 TEMPORARY_OBJECT_CUES 的施工工具/设备都必须已经清场——
         # furnishing 拍写的是搬入家具，不该还有脚手架、工具箱、临时支撑立在画面里。
-        if classify_material_flow(state.get("operation_type", "")) == "furnishing":
+        if (not allow_lingering_temporaries
+                and classify_material_flow(state.get("operation_type", "")) == "furnishing"):
             lingering = sorted(n for n in known if _matches_cue(n, TEMPORARY_OBJECT_CUES))
             if lingering:
                 errors.append(
