@@ -16,7 +16,7 @@ full interior rebuild (in which case drop the corresponding beats and renumber):
 3. White primer coating.
 4. Exterior finish coating.
 5. Platform railing installation.
-6. Door opening with interior landmark sneak-peek (peek anchors must be original cabin features, per the Anchor Qualification rule).
+6. Door hardware fitted and shut — the cabin door reads closed and opaque, nothing of the interior visible (Sealed Entry; the crossing clip opens it on camera). Registered interior anchors must be original cabin features, per the Anchor Qualification rule.
 7. Roof rail and bracket installation.
 8. Solar panel placement and cable clipping.
 9. Work-light stabilization without structural changes.

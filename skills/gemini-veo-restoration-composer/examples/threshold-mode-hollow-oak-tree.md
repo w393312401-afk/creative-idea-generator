@@ -13,7 +13,7 @@ its length. It demonstrates:
 4. **Complete 16-beat video chain**: fills in the truncated video prompts from the user's input to form a contiguous time-lapse, and inserts the light-fixture installation beat the raw input skipped (a bulb never glows without an on-camera fixture install on the wired ends).
 5. **TBCP v4 single-beat crossing**: the exterior→interior crossing is **one** beat — `IMAGE 6 → 视频 6 [BRIDGE] → IMAGE 7` — not the retired two-clip Bridge-1/Bridge-2 split with a sill-handoff frame. Note the `[BRIDGE]` meta tag on the label: without it the renderer's continuity judge reads the exterior-to-interior jump as a continuity failure and burns retry budget on a frame that was correct.
 6. **No grid annotations, no percentages**: every grid reference and numeric ratio is written as natural-language bearing and fraction (`bottom-left`, `at three-fifths frame height`), so no coordinate label or numeral can be rendered into the frame as literal text.
-7. **Provenance-safe peek anchors with a complete scale chain**: the two landmarks pre-visualized through the carved portal are natural heartwood features (a thick vertical heartwood ridge, a natural burl shelf) that already exist inside the sealed trunk — never future construction products like the spiral staircase (carved only in Video 10) or the writing desk (carried in during furnishing). **IMAGE 6 states both peek scales explicitly** (one-fifth and one-eighth) and IMAGE 7 raises them (three-fifths and two-fifths). Declaring the destination scale but not the starting one leaves the monotonic lock with no first link — which is what an earlier revision of this file did.
+7. **Sealed entry with provenance-safe interior anchors**: IMAGE 6 keeps the carved portal's plank door shut and opaque — nothing of the trunk's hollow is visible before the crossing clip opens it on camera (TBCP v7; the older revision of this file did the opposite and peeked both anchors at declared start scales). The two registered interior landmarks are natural heartwood features (a thick vertical heartwood ridge, a natural burl shelf) that already exist inside the sealed trunk — never future construction products like the spiral staircase (carved only in Video 10) or the writing desk (carried in during furnishing). Their frame-height scales are declared once, in IMAGE 7 where they settle (three-fifths and two-fifths).
 8. **Static shots carry no optical-flow wording**: `all perspective lines radiate symmetrically from the center` belongs only in translation clips (the crossing), never in a static tripod prompt.
 
 ## User Input
@@ -38,9 +38,10 @@ N: 16 beats → 16 VIDEO + 17 IMAGE
    4. Door frame installation
    5. Conduit routing (exterior root flare)
    6. THRESHOLD CROSSING — one merged TBCP v4 beat, tagged 视频 6 [BRIDGE]:
-      IMAGE 6 (last exterior, portal open, both peek anchors declared WITH scales)
-        → 视频 6 [BRIDGE] (the only visible clip: approach, sill wipe, exposure roll, settle)
-        → IMAGE 7 (interior settled, untouched decay)
+      IMAGE 6 (last exterior, portal door SHUT and opaque, no interior visible)
+        → 视频 6 [BRIDGE] (the only visible clip: door pushed open on camera, approach,
+           sill wipe, exposure roll, settle)
+        → IMAGE 7 (interior settled, untouched decay, anchors at their settled scales)
       Lands at beat 6, comfortably past the "never earlier than beat 3" floor.
    7. Interior debris removal   ← the cleanout the crossing clip deliberately did NOT do
    8. Wall sanding and preservative treatment
@@ -53,9 +54,10 @@ N: 16 beats → 16 VIDEO + 17 IMAGE
   15. Furnishing (writing desk + armchair placement, temporary tool carry-out)
   16. Final reward reveal (tea cup steaming on desk)
 
-Peek-anchor scale chain (must be strictly increasing, and IMAGE 6 must state the start):
-  heartwood ridge   IMAGE 6 one-fifth   → IMAGE 7 three-fifths
-  burl shelf        IMAGE 6 one-eighth  → IMAGE 7 two-fifths
+Interior anchor scales (declared once, at the frame where they settle — IMAGE 6 shows no
+interior at all, so it declares no interior scale):
+  heartwood ridge   IMAGE 7 three-fifths
+  burl shelf        IMAGE 7 two-fifths
 ```
 
 ## Composed Output

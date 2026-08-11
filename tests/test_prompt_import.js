@@ -194,6 +194,36 @@ const bodyOf = (text, type, index) => (Array.from(ctx.parsePromptBlock(text))
     assert.strictEqual(bodyOf(resumed.text, 'video', 2), 'v2 body');
 }
 
+// ── 直接从合成器输出复制来的集子：===AUDIT=== 那一节不能接到最后一拍上 ──
+// `===XXX===` 既不是分隔线（中间夹着字）也不是 Markdown 小标题，两条既有规则
+// 都拦不住它；漏掉的话末尾那句「skill 直出模式：…」会跟着视频 N 送去渲染。
+{
+    const src = [
+        '===TITLE===', '悬崖小屋',
+        '===THEME===', '一句主题',
+        '===PROMPTS===',
+        '图片 1:', 'a', '图片 2:', 'b',
+        '视频 1:', 'v1 body',
+        '',
+        '===AUDIT===',
+        'skill 直出模式：文本阶段无审查、无重写，批量直出+确定性修复一次成型。',
+    ].join('\n');
+    const r = norm(src);
+    assert.strictEqual(r.ok, true, r.error);
+    assert.strictEqual(r.imageCount, 2);
+    assert.strictEqual(r.videoCount, 1);
+    assert.strictEqual(bodyOf(r.text, 'video', 1), 'v1 body');
+    assert.ok(!/AUDIT|直出模式|===/.test(r.text), '尾部审查小节被接进了提示词正文');
+    assert.ok(Array.from(r.fixes).some(f => /分节标记/.test(f)));
+    // ===PROMPTS=== 是解除断开，不是开始断开：它下面的第一拍不能被吞掉
+    assert.strictEqual(bodyOf(r.text, 'image', 1), 'a');
+    // 标记之后又出现槽位头行时同样解除断开
+    const resumed = norm([src, '图片 3:', 'c', '视频 2:', 'v2 body'].join('\n'));
+    assert.strictEqual(bodyOf(resumed.text, 'image', 3), 'c');
+    assert.strictEqual(bodyOf(resumed.text, 'video', 2), 'v2 body');
+    assert.ok(!/直出模式/.test(resumed.text));
+}
+
 // ── 解析不到任何图片提示词：报错、不导入 ───────────────────────────────
 {
     const r = norm('随便一段没有槽位标签的文字\n再来一行');

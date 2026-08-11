@@ -1829,14 +1829,23 @@ def run_scup_audit(images, videos, fps=3.0, num_analyzed_frames=None, total_fram
             if any(word in seq.get("state_name", "").lower() for word in ("install", "paint", "clean", "floor", "panel")):
                 gate_threshold_fail.append(f"Beat {idx+1} threshold bridge appears to include construction work.")
             if idx > 0:
+                # TBCP v7 (Sealed Entry): this used to demand the OPPOSITE — two visible
+                # interior sneak-peek landmarks in the preceding anchor. That peek is what
+                # destabilises the crossing clip (the video model treats a low-resolution,
+                # largely invented patch of interior as a fact it must match), so the
+                # pre-crossing anchor must now read as a closed, opaque entry instead.
                 pre_anchor = (time_sequence[idx - 1].get("image_n_plus_1_state", "") + " " + time_sequence[idx - 1].get("state_name", "")).lower()
-                sneak_terms = sum(1 for term in ("interior", "landmark", "rear window", "ceiling", "light", "bench", "cabinet") if term in pre_anchor)
-                if sneak_terms < 2:
-                    gate_threshold_fail.append(f"Beat {idx+1} lacks a preceding anchor with two visible interior sneak-peek landmarks.")
+                sealed = any(term in pre_anchor for term in (
+                    "shut", "closed", "sealed", "latched", "padlocked", "boarded",
+                    "unlit", "dark", "opaque"))
+                if not sealed:
+                    gate_threshold_fail.append(f"Beat {idx+1}'s preceding anchor does not read as a sealed entry (shut/closed/latched door or hatch, or an unlit raw opening) — the interior must not be visible before the crossing clip.")
             vid = videos[idx] if idx < len(videos) else ""
             for term in ("coaxial forward", "doorway edges", "interior landmarks"):
                 if term not in vid.lower():
                     gate_threshold_fail.append(f"VIDEO {idx+1} threshold bridge is missing '{term}'.")
+            if not any(term in vid.lower() for term in ("opens", "opened", "pushed open", "swings", "lifts")):
+                gate_threshold_fail.append(f"VIDEO {idx+1} threshold bridge never opens the entry on camera — the crossing clip owns the reveal.")
     if gate_threshold_fail:
         audit_results["score"] -= 30
         audit_results["gates"].append({

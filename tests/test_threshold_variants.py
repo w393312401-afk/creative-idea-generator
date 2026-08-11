@@ -947,5 +947,68 @@ class TestVideoOpeningFirstFrameIndex(unittest.TestCase):
         self.assertTrue([e for e in errs if 'VIDEO' in e or 'video' in e.lower()])
 
 
+class TestSealedEntryBeforeCrossing(unittest.TestCase):
+    """TBCP v7：过门前那一帧的门一律关死，三变体统一。
+
+    旧规则（PBISP peek）要求相反：门开着、室内锚点已经透过门洞可见。它是为 i2i 服务的
+    （给室内首帧一个可继承的锚点），但在 i2v 侧代价更大——半开的门递给视频模型一块低
+    分辨率、基本靠脑补的室内，模型随后把它当成插值时必须对齐的既成事实；对不上时，镜头
+    落地的室内就读作换了个世界，或者干脆没完全进去。门关死则无可对齐，揭示整个发生在
+    片段内部。
+    """
+    PACKET = {'camera_dna': '', 'primary_landmarks': [], 'frame_boundaries': {},
+              'interior_camera_dna': 'Static interior shot.',
+              'interior_primary_landmarks': [
+                  {'name': 'ribbed roof curve', 'grid': 'Grid B2', 'z_depth_scale': 'half'}]}
+
+    def _contract(self, ladder, i, mode='Threshold'):
+        return _beat_contract(i, len(ladder), ladder, mode, self.PACKET, '')
+
+    def test_beat_before_the_crossing_must_seal_its_entry(self):
+        before = self._contract(_ladder_coaxial(t=4), 3)
+        self.assertTrue(before['is_pre_bridge'])
+        self.assertIn('SEALED ENTRY (mandatory)', before['family_contract'])
+        self.assertIn('CLOSED', before['family_contract'])
+        # 没有门扇的毛坯载体：等价合规形态是洞里一片不透光的黑
+        self.assertIn('unlit darkness', before['family_contract'])
+        # 那一拍的 VIDEO 末帧就是这张闭门帧，所以它也不许在结尾开门
+        self.assertIn('SEALED ENTRY continuity in VIDEO 3', before['family_contract'])
+
+    def test_pbisp_peek_is_gone_from_the_pre_crossing_contract(self):
+        before = self._contract(_ladder_coaxial(t=4), 3)
+        self.assertNotIn('PBISP', before['family_contract'])
+        self.assertNotIn('sneak-peek', before['family_contract'])
+        self.assertNotIn('one-fifth of frame height', before['family_contract'])
+
+    def test_crossing_clip_opens_the_entry_on_camera(self):
+        for name, ladder in (('coaxial', _ladder_coaxial(t=4)),
+                             ('pan', _ladder_pan(t=4)),
+                             ('hard_cut', _ladder_cut(t=4))):
+            with self.subTest(variant=name):
+                cross = self._contract(ladder, 4)['family_contract']
+                self.assertIn('no interior preview before the opening', cross)
+                self.assertIn('pushed open on camera', cross)
+
+    def test_bridge_clip_no_longer_assumes_inherited_anchors_are_already_visible(self):
+        cross = self._contract(_ladder_coaxial(t=4), 4)['family_contract']
+        self.assertIn('become visible for the first time as the entry opens', cross)
+        self.assertNotIn('inherited interior anchors continuously scale up', cross)
+
+    def test_adaptive_ladder_opens_the_entry_but_keeps_it_unreadable(self):
+        """阶梯式过门（transition_stage）里"开门"本身就是一拍的里程碑，门当然是开的——
+        规则在这条路径上的等价形态是：开口里不许有任何可读的室内。"""
+        ladder = _ladder_coaxial(t=4)
+        ladder[3].update(transition_stage='door_hardware_open', camera_family='exterior',
+                         reveal_scope='none', light_source_state='daylight')
+        brief = {'mode': 'Threshold',
+                 'entrance_topology': {'hardware': ['door leaf', 'hinges', 'latch']}}
+        cross = _beat_contract(4, len(ladder), ladder, 'Threshold', self.PACKET, '',
+                               parsed_brief=brief)['family_contract']
+        self.assertIn('OPENED BUT UNREADABLE', cross)
+        self.assertIn('flat unlit darkness', cross)
+        # 这条路径不吃闭门契约（门在这一拍就是要打开的）
+        self.assertNotIn('SEALED ENTRY (mandatory)', cross)
+
+
 if __name__ == '__main__':
     unittest.main()

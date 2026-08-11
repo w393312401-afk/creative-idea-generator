@@ -152,16 +152,14 @@
     margin-bottom: 10px;
 }
 
-.replica-collage-link {
-    display: block;
-}
-
 .replica-collage {
+    display: block;
     width: 100%;
     max-height: 320px;
     object-fit: contain;
     border: 1px solid rgba(255, 255, 255, 0.15);
     border-radius: 6px;
+    cursor: zoom-in;
 }
 
 .replica-cost {
@@ -184,6 +182,68 @@
     margin-top: 3px;
 }
 
+/* ── 抽帧密度 / 反推模型选择 ────────────────────────────────── */
+
+.replica-inline-field {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    opacity: 0.9;
+}
+
+.replica-select {
+    padding: 5px 8px;
+    max-width: 100%;
+    font-size: 12px;
+    color: inherit;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 6px;
+}
+
+.replica-select option {
+    /* 深色面板里的原生下拉在部分平台上会用系统浅色背景画选项。 */
+    color: #111;
+    background: #fff;
+}
+
+.replica-reextract {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin-top: 10px;
+}
+
+.replica-reextract .replica-hint {
+    flex: 1 1 100%;
+    margin: 0;
+}
+
+.replica-model-picker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 16px;
+    margin-top: 6px;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+}
+
+.replica-card-subtitle {
+    flex: 1 1 100%;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--neon-cyan, #6ee7ff);
+}
+
+.replica-model-picker .replica-hint {
+    flex: 1 1 100%;
+    margin: 0;
+}
+
 .replica-progress {
     margin-top: 12px;
     padding: 10px 12px;
@@ -191,6 +251,43 @@
     border-radius: 8px;
     font-size: 12px;
     line-height: 1.6;
+}
+
+.replica-progress-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.replica-progress-percent {
+    margin-left: auto;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.75;
+}
+
+.replica-progress-track {
+    margin-top: 8px;
+    height: 5px;
+    border-radius: 3px;
+    background: rgba(255, 255, 255, 0.12);
+    overflow: hidden;
+}
+
+.replica-progress-fill {
+    height: 100%;
+    width: 2%;
+    border-radius: 3px;
+    background: linear-gradient(90deg, rgba(110, 231, 255, 0.75), rgba(160, 255, 210, 0.9));
+    transition: width 0.35s ease;
+}
+
+/* 最近几条事件。合成阶段一跑好几分钟，只给一个百分比看不出它到底卡在哪一步。 */
+.replica-progress-log {
+    margin: 8px 0 0;
+    padding-left: 16px;
+    opacity: 0.62;
+    font-size: 11px;
+    line-height: 1.7;
 }
 
 /* ── 校验横幅 ───────────────────────────────────────────────── */
@@ -284,6 +381,11 @@
     height: 82px;
     border-radius: 4px;
     border: 1px solid rgba(255, 255, 255, 0.15);
+    cursor: zoom-in;
+}
+
+.replica-thumb:hover {
+    border-color: rgba(110, 231, 255, 0.6);
 }
 
 .replica-beat-fields {
@@ -301,6 +403,15 @@
 .replica-field-label {
     font-size: 11px;
     opacity: 0.7;
+}
+
+/* 英文原文下面那行中文对照。只读、只为核对——英文才是送去合成的事实源。 */
+.replica-field-zh {
+    font-size: 11px;
+    line-height: 1.6;
+    opacity: 0.72;
+    color: rgba(160, 255, 210, 0.92);
+    word-break: break-word;
 }
 
 .replica-textarea {

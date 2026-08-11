@@ -554,29 +554,20 @@ IMG2IMG_CONTROL_PROMPT = (
     "letters, numbers, percentages, captions, text, watermarks, extra people, or active "
     "machinery. Return one clean edited image only."
 )
-IMG2IMG_BRIDGE_CONTROL_PROMPT = (
-    "IMAGE EDITING MODE (CAMERA MOVEMENT ACTIVE). The attached previous frame is the authoritative "
-    "source image. Maintain extreme consistency of all physical landmarks, geometry, colors, "
-    "materials, light source angles, and structural features. However, the camera viewpoint is "
-    "actively advancing forward in a controlled camera-move / push-in (the camera perspective is "
-    "shifting closer along the central axis). Shift object placement, horizon, and perspective boundaries "
-    "according to correct optical flow and 3D depth parallax, and render the advanced viewpoint "
-    "fully and decisively — inherited landmarks scale up naturally, newly exposed margins are "
-    "filled with coherent detail; do not shrink the camera advance into a timid crop. "
-    "Do not add extra objects, active machinery, or workers. Return one clean edited image only."
-)
-IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT = (
-    "IMAGE EDITING MODE (CAMERA MOVEMENT + TURN ACTIVE). The attached previous frame is the "
-    "authoritative source image. Maintain extreme consistency of all physical landmarks, geometry, "
-    "colors, materials, light source angles, and structural features. This single edit covers the "
-    "WHOLE merged crossing: the camera first advances forward through the threshold in a controlled "
-    "push-in, then ROTATES horizontally (one smooth pan) to face the interior's long axis — do not "
-    "render only one half of this move. Inherited landmarks scale up naturally as the camera "
-    "advances, then slide toward and past the frame edge as the camera turns; the newly revealed "
-    "side of the space enters from the opposite edge and must be rendered fully and decisively, "
-    "coherent with the established materials, lighting direction, weathering, and decay state — do "
-    "not shrink either the advance or the turn into a timid crop. Do not add extra objects, active "
-    "machinery, or workers. Return one clean edited image only."
+IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT = (
+    "IMAGE EDITING MODE (CROSSING REVEAL — WEAK COMPOSITIONAL REFERENCE). The attached previous "
+    "frame is the exterior shot taken immediately before the camera crossed the threshold, and its "
+    "entry is CLOSED, so it contains no view of the space you are rendering. Do NOT crop, zoom, or "
+    "push into that closed doorway, and do not reproduce its composition, framing, or subject "
+    "placement — the camera has already moved through the entry and is now standing INSIDE, facing "
+    "the interior described below. Treat the attached frame as evidence of the SAME WORLD only: "
+    "inherit its exact photographic rendering style, grain, exposure feel, colour temperature and "
+    "light direction, its materials, and its level of weathering, grime, decay and age, and keep "
+    "the shell's geometry and scale plausible for the structure visible in it. Then render the "
+    "interior description fully and decisively as a new viewpoint in that world: interior walls, "
+    "ceiling and floor fill the frame edge to edge, and no door frame, door leaf, threshold edge or "
+    "entry opening appears anywhere — they are behind the camera now. Do not add grid lines, "
+    "labels, text, watermarks, extra people, or active machinery. Return one clean image only."
 )
 # ── 技能 profile：目标视频模型 → 技能包 的注册表 ──
 # 一个 profile = 一个技能包 + 它自己的契约清单。清单必须按包分开声明：两个包的
@@ -1562,6 +1553,11 @@ _PASSTHROUGH_CLIENT_KEYS = (
     'videoModel', 'videoDuration', 'videoRefMode', 'adsPowerPort',
     'videoAccountPoolMinCredit', 'frameContinuityLocalEdit',
     'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile',
+    # 复刻线反推段的模型选择（前端「反推模型」两个下拉）：Pass A 逐帧识别
+    # frameFactsModel、峰值帧复核 peakVerifyModel（'off' 关掉）。不进这份白名单，
+    # 托管模式下用户选了哪个模型会被整个丢掉，页面上却照常显示已切换——和
+    # skillProfile / qaGateLevel 当年是同一个静默失效的口子。
+    'frameFactsModel', 'peakVerifyModel', 'reviewModel',
 ) + _GATE_KEYS
 
 

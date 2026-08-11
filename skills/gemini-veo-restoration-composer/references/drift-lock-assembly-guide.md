@@ -219,7 +219,7 @@ Before proceeding to IMAGE rendering, verify:
 - [ ] Hero Agent Lock (HAL): SILHOUETTES and block-color properties locked for workers in VIDEO prompts
 - [ ] Volumetric Mass & Flow Preservation (VMFP): Percentage volume capacity and physical transport vectors defined for bulk materials
 - [ ] Reflective Mirror Alignment (RHMA): Mirror reflection alignment clauses included for high-gloss, polished, or wet floors in final staging/reward beats
-- [ ] Pre-Bridge Interior Sneak-Peek (PBISP): Pre-visualized interior landmarks present in threshold IMAGEs
+- [ ] Sealed Entry: the pre-crossing exterior IMAGE keeps its entry shut/opaque with no interior visible; the crossing clip opens it on camera
 - [ ] Lighting phase assigned per IMAGE with hold or +1 only, maintaining shadow fall and exposure
 - [ ] Passive environment direction locked across the entire sequence
 - [ ] Interest budget allocated across three tiers (clip hook, reveal, final reward)

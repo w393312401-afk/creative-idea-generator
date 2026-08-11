@@ -22,7 +22,7 @@ graph TD
         A[Single Bridge Beat: 1 IMAGE + 1 VIDEO] --> O
     end
     subgraph "Carry, Don't Switch"
-        B[Anchor Inheritance: PBISP peek = interior primaries] --> O[Continuity]
+        B[Anchor Inheritance: registered interior primaries] --> O[Continuity]
         C[Single-Variable Camera: lock lens+height, translate (+ turn) only] --> O
         D[Cross-Threshold Tether: 1 material or light continues] --> O
     end
@@ -59,19 +59,22 @@ IMAGE T+1    Interior · settled (and, pan variant, already turned) anchor — c
 
 ---
 
-### 2. Anchor Inheritance (PBISP — closes the biggest gap)
+### 2. Sealed Entry + Anchor Inheritance (TBCP v7 — replaces the PBISP peek)
 
-**Principle**: SCUP-PBISP requires the pre-bridge exterior IMAGE to pre-visualize 2 interior landmarks through the doorway. TBCP makes those **the same two objects that become the interior shot family's mid-depth and background primary anchors.** Anchors cross the threshold; they are never swapped for a fresh set. This gives the model an unbroken spatial spine through the cut.
+**Principle**: the exterior IMAGE immediately before the crossing keeps its entry **CLOSED** and shows nothing of the interior. The interior primary anchors are still declared up front (in the packet, as the objects the interior shot family locks onto), but they are first *seen* inside the crossing clip, not pre-visualized through an open doorway.
 
-**Two-stage hand-off syntax**:
+This inverts the old PBISP sneak-peek, which asked for an open threshold with the interior anchors already visible at about one-fifth of frame height. That rule was written for the image chain — the peek gave the interior frame something to inherit. On the video side it costs more than it buys: a half-open doorway hands the i2v model a low-resolution, largely hallucinated patch of interior that it then treats as a fact it must match while interpolating the crossing. When it cannot match it, the space the camera lands in reads as a different world, or the camera never fully gets inside. A fully shut entry gives the model nothing to reconcile, so the reveal happens where the model is generating freely. Live runs put this among the largest single stability wins available on the crossing.
 
-* **IMAGE T (still exterior)** — peek the future primaries, already sharp but still small:
+**Three-stage hand-off syntax**:
+
+* **IMAGE T (still exterior)** — the entry is shut and opaque; nothing beyond it reads:
   ```
-  Through the open doorway in Grid B2, two interior anchors are already visible and in sharp focus: a soot-blackened original timber post running floor to ceiling at interior mid-right and a red fire extinguisher on the interior rear wall, each reading small at about one-fifth of the frame height.
+  The plank entry door in Grid B2 is closed tight in its frame, its boards swollen and streaked with rust from the strap hinges; nothing of the space behind it is visible.
   ```
-* **VIDEO T** — scale, never re-render:
+  On a carrier whose entrance has no leaf yet, the equivalent is unlit darkness: `the raw entrance opening in Grid B2 reads as flat unlit darkness, showing nothing of what lies inside`.
+* **VIDEO T (the crossing clip)** — open it on camera, then advance:
   ```
-  the same soot-blackened timber post and red fire extinguisher scale up continuously along the camera axis, never repositioning, never re-rendering, their apparent size growing naturally as the camera approaches (and, pan variant, sliding to their registered position as the camera turns).
+  the closed plank door swings inward on its rust-streaked hinges, revealing the dark interior for the first time; the camera pushes coaxially through the opening as the door-frame edges slide symmetrically past the left and right bounds, and the soot-blackened timber post and red fire extinguisher come into view and scale up continuously along the camera axis, never repositioning, never re-rendering (and, pan variant, sliding to their registered position as the camera turns).
   ```
 * **IMAGE T+1 (interior settled)** — promote the identical objects to primary anchors:
   ```
@@ -80,13 +83,13 @@ IMAGE T+1    Interior · settled (and, pan variant, already turned) anchor — c
 
   In this example the timber post is the fixed structural feature required below; the fire extinguisher — a movable object — may hold the other slot only because of it. Two movable anchors would fail.
 
-**Banned**: introducing any interior primary anchor in IMAGE T+1 that was not visible through the doorway in IMAGE T.
+**Banned**: introducing an interior primary anchor in IMAGE T+1 that is not in the registered interior anchor set — the set is fixed at brief time and the crossing clip reveals exactly those objects. Equally banned: any interior detail visible in IMAGE T.
 
-**Anchor Qualification (mandatory)**: peeked anchors must be features that plausibly already exist at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. Future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures) are banned as peek anchors. The bridge always precedes interior construction in the timeline; peeking a future product forces that object to exist before the beat that creates it — a hard causality inversion the audience reads instantly as an AI error. For sealed or never-entered shells, choose natural interior features (a heartwood ridge, a rock rib, an original bulkhead) as the two peek anchors.
+**Anchor Qualification (mandatory)**: the registered interior anchors must be features that plausibly already exist at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. Future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures) are banned. The crossing always precedes interior construction in the timeline; landing on a future product forces that object to exist before the beat that creates it — a hard causality inversion the audience reads instantly as an AI error. For sealed or never-entered shells, choose natural interior features (a heartwood ridge, a rock rib, an original bulkhead).
 
 **Fixed-Feature Requirement (mandatory — Carrier Identity Hand-off, §5)**: at least **one** of the two registered interior primary anchors must be a **fixed structural feature of the carrier itself** — a window band, a ribbed roof curve, a rib frame, a bulkhead, a porthole row, a stone pier, an original beam. A movable object may hold the *other* slot, but never both. Two movable anchors is the failure mode this rule exists for: a cast-iron flywheel machine, a tool cabinet and a fire extinguisher are all things the model can slide, shrink, or re-place without contradicting anything you wrote, and when both anchors can move there is nothing nailing the walls down at all. The shell then drifts freely between frames while the audit still passes — the anchors are "inherited", they just no longer describe a room. A fixed feature is also what the Geometry Lock's envelope signature attaches to; without one, the clear-width clause has no visible referent in the frame.
 
-**Monotonic Scale Lock (mandatory)**: the same anchor's declared frame-height scale must strictly increase from `IMAGE T` to `IMAGE T+1` (e.g. one-fifth → three-fifths). The camera closes several metres of distance during the crossing; a constant scale across both IMAGEs contradicts the required continuous scale-up, and the generated bridge reads as a fake digital zoom or a mid-clip shrink-back.
+**Scale declaration (mandatory)**: each interior anchor's frame-height scale is declared once, at `IMAGE T+1`, where it settles. There is no cross-frame scale ladder to satisfy any more — `IMAGE T` declares no interior scale at all, because it shows no interior. Inside the clip, the anchors still grow continuously along the camera axis from the moment the entry opens; a clip that presents them at a constant size still reads as a fake digital zoom.
 
 ---
 
@@ -224,20 +227,21 @@ Use IMAGE T as the actual first-frame image and IMAGE T+1 as the actual last-fra
 
 ---
 
-## Hard Cut Variant (declared cut, no bridge) — unchanged
+## Hard Cut Variant (declared cut-in)
 
-**Trigger**: NOTHING of the interior is visible before crossing (sealed shell, pitch-black behind the hatch, no openable view in). PBISP peek is impossible by definition, so a walked crossing would force the model to hallucinate the interior mid-clip. Declared once at brief time as `threshold_variant: hard_cut`; budget: at most ONE per project, and ONLY for the threshold crossing — never as a generic transition shortcut. This variant already matches the "2 images, connected by nothing visible" shape (its crossing has no video at all, just a declared cut), so it is unaffected by the single-beat merge above — it was always exactly one beat.
+**Trigger**: the interior is not merely hidden but *unknowable* from outside — a sealed shell, a buried or windowless volume, an entry whose far side no exterior beat can motivate. Declared once at brief time as `threshold_variant: hard_cut`; budget: at most ONE per project, and ONLY for the threshold crossing — never as a generic transition shortcut.
 
-**Structure — no bridge clips, one declared cut**:
+Since v7 the closed-entry start frame is universal, so this variant no longer differs on the *video* side at all: like every other crossing it is exactly one beat whose VIDEO is a real generated clip that opens the entry on camera and pushes through. What still makes it its own variant is the **image chain**: the interior first frame is deliberately re-established rather than composed to match the exterior frame, and continuity judges are told not to read that as drift.
+
+**Structure**:
 
 ```
-IMAGE T      Exterior · at-threshold anchor (door may stay closed; no peek required).
-VIDEO T      [CUT] slot: a fixed placeholder declaration — NO video clip is generated for this
-             slot, it is never sent to the image-to-video model (interpolating two unrelated
-             compositions produces a smeared morph), and the merge treats it as an EXPECTED gap:
-             the final film hard-cuts here.
-IMAGE T+1    Interior FIRST frame — a NEW CHAIN HEAD: rendered text-to-image, WITHOUT the
-             previous frame as reference. Every frame after chains from it as usual.
+IMAGE T      Exterior · at-threshold anchor, entry CLOSED and opaque (same rule as every variant).
+VIDEO T      [CUT] slot: a REAL generated crossing clip, written as an ordinary video prompt bound
+             IMAGE T -> IMAGE T+1 — the entry is pushed open on camera, the camera advances
+             through, the door frame wipes out of shot, and the clip settles fully inside.
+IMAGE T+1    Interior FIRST frame — re-established from the Scene DNA list below rather than
+             matched to IMAGE T's composition. It becomes the new family anchor for the chain.
 ```
 
 **Consistency across the cut (Scene DNA restatement — the interior has no inherited visual anchor, so the prompt must re-establish the world from scratch, all four mandatory)**:
@@ -259,9 +263,9 @@ A single `FAIL` triggers a rewrite of the threshold beat before delivery.
 |---|---|---|
 | **One Merged Beat** | Is the exterior→interior crossing exactly ONE beat, producing exactly 2 visible images (last exterior + settled interior) and exactly 1 visible VIDEO clip narrating the full arc? | Extra held "at the doorway" clips / images the viewer never needed to see |
 | **Minimum Run-Up** | Is the crossing beat at index ≥3, with at least 2 ordinary exterior beats before it? | Sequence reads as "starting indoors" |
-| **Anchor Inheritance** | Are the 2 interior anchors peeked through the doorway in IMAGE T the exact same objects promoted to interior primary anchors in IMAGE T+1? | Anchor amnesia / interior layout reshuffle |
-| **Anchor Qualification** | Are both peeked anchors plausibly pre-existing at crossing time (original structure, natural formations, or previously installed on camera) — never future construction products (uncarved stairs, unplaced furniture, uninstalled fixtures)? | Causality inversion: objects existing before the beat that creates them |
-| **Monotonic Scale** | Does each peeked anchor's declared frame-height scale strictly increase from IMAGE T to IMAGE T+1? | Fake digital-zoom feel / mid-clip shrink-back on the push-in |
+| **Sealed Entry** | Is the entry CLOSED in IMAGE T (shut door/hatch, or unlit darkness in a raw opening with no leaf yet), showing nothing of the interior — and does the crossing clip open it on camera? Applies to EVERY crossing variant. | i2v forced to match a hallucinated peek patch: interior lands as a different world, or the camera never fully gets inside |
+| **Anchor Inheritance** | Are the interior anchors the crossing lands on in IMAGE T+1 exactly the registered interior primary set — no fresh objects invented at the settle? | Anchor amnesia / interior layout reshuffle |
+| **Anchor Qualification** | Are the registered interior anchors plausibly pre-existing at crossing time (original structure, natural formations, or previously installed on camera) — never future construction products (uncarved stairs, unplaced furniture, uninstalled fixtures)? | Causality inversion: objects existing before the beat that creates them |
 | **Single-Variable Camera (ground-level case)** | If the crossing door sits at camera height, does the clip use coaxial forward translation only (+ one declared pan at the very end for the pan variant), with no other pan/tilt/roll? Not applicable when the Elevated Access Variant fires. | Perspective stretch, camera-family discontinuity |
 | **Elevated Access Variant (supersedes the row above when applicable)** | If the crossing door sits above camera height, does the clip describe one continuous forward-and-upward climbing push — never a flat push followed by an unexplained height jump? | Impossible camera physics (flat push reaching an elevated door) |
 | **Exposure & WB Soft Roll** | Is the lighting change gradual across the whole clip, attributed to door-shade + doorway backlight, with no percentages/color-temp numbers, and with a single consistent colour-temperature direction (no mid-clip reversal)? | Brightness snap, white-balance jump/pumping, text artifacts |
@@ -275,7 +279,7 @@ A single `FAIL` triggers a rewrite of the threshold beat before delivery.
 | **Crossing Clip Carries No Work** | Is the crossing clip a pure camera move — nothing cleaned, cleared, repaired or installed during it, no tools/ladders/staged materials appearing, one unbroken take with no cut/fade/speed ramp, and not labelled a construction time-lapse? | Work happening mid-crossing; the interior quietly tidying itself before the cleanout beat exists |
 | **Post-Crossing Cleanout** | Is the beat right after the crossing a `clearing` operation that hauls out every loose piece of the reveal's mess to a bare floor, while leaving all structural damage/rust/stains for the later repair beats? | Sequence jumps from knee-deep wreckage straight to finishes; the first real restoration step disappears |
 | **Pan Variant Turn (pan crossings only)** | Does the same single clip end in one stationary pan locking onto the interior's long axis, described in the same clip's prose (not a separate beat), with every surface the pan newly reveals covered by registered anchors at constant scale? | Turn hallucinates unseen space; turn split into its own beat re-introduces a held clip |
-| **Hard Cut Declaration (hard-cut crossings only)** | Exactly one [CUT] slot (placeholder body, no clip generated, expected-gap at merge), interior first frame re-establishing all four Scene DNA items, and no judge flagging/"repairing" the sanctioned jump? | Smeared i2v morph across the cut; disconnected generic interior; false continuity violations |
+| **Hard Cut Declaration (hard-cut crossings only)** | Exactly one [CUT] slot carrying a real generated crossing clip, interior first frame re-establishing all four Scene DNA items, and no judge flagging/"repairing" the sanctioned viewpoint jump? | Disconnected generic interior; false continuity violations; an empty, unretryable slot in the result panel |
 | **Single Continuous Photograph** | Does every IMAGE (including both sides of the crossing) read as one real photograph — never a grid of panels, a collage, a storyboard, or a before/after split? | Grid-coordinate ("Grid A2" etc.) prose misread by the image model as an instruction to render an actual grid/collage |
 
 ---
@@ -285,6 +289,6 @@ A single `FAIL` triggers a rewrite of the threshold beat before delivery.
 TBCP does not replace SCUP — it sequences and tightens the SCUP locks that all fire at the threshold:
 
 - **DKP (SCUP #3)** still supplies the `t=0s / 4s / 8s` door-opening coordinates and symmetric optical flow for the bridge clip.
-- **PBISP (SCUP #8)** is upgraded by TBCP Rule 2 (Anchor Inheritance) — the peek is no longer decorative; it defines the interior primaries.
+- **PBISP (SCUP #8)** is **superseded** by TBCP Rule 2 (Sealed Entry): the pre-crossing sneak-peek is retired outright. The interior primaries are registered at brief time and first revealed inside the crossing clip; the exterior frame before the crossing keeps its entry shut.
 - **Clean Frame (SCUP #7)** still applies: the Sill/settled IMAGE and the bridge clip stay sterile of active workers.
 - **Beat Overload Lock (SCUP #10)** is satisfied because the crossing stays a single beat rather than fragmenting into several.

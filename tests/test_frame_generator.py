@@ -90,16 +90,19 @@ class TestPlanFxChunks(unittest.TestCase):
         prompts = {5: {'prompt': 'Camera settles inside.', 'meta': ''}}
         videos = {4: {'body': 'cross', 'meta': '[BRIDGE]'}}
         rendered = fx_prompt_with_bridge_control(5, prompts[5], prompts, videos)
-        self.assertIn('camera viewpoint is actively advancing forward', rendered)
+        self.assertIn('CROSSING REVEAL', rendered)
         prompts[5]['prompt'] = rendered
         self.assertEqual(
             fx_prompt_with_bridge_control(5, prompts[5], prompts, videos), rendered)
 
-    def test_fx_bridge_turn_uses_turn_control(self):
+    def test_fx_bridge_turn_uses_the_same_crossing_reveal_control(self):
+        """TBCP v7：过门前一帧的门是关死的，参考图里没有可推进、也没有可旋转的室内，
+        直推与转向在图像侧因此完全同构——两者共用弱参考揭示指令，不再分流。"""
         prompts = {5: {'prompt': 'Camera settles inside.', 'meta': ''}}
         videos = {4: {'body': 'cross and pan', 'meta': '[BRIDGE TURN]'}}
         rendered = fx_prompt_with_bridge_control(5, prompts[5], prompts, videos)
-        self.assertIn('ROTATES horizontally', rendered)
+        self.assertIn('CROSSING REVEAL', rendered)
+        self.assertIn('do not reproduce its composition', rendered)
 
 
 class TestPlanFrameChunkAccounts(unittest.TestCase):

@@ -266,10 +266,15 @@ class TestAntiPriming(unittest.TestCase):
         self.assertNotIn('废弃石屋', json.dumps(clean, ensure_ascii=False))
 
     def test_extract_frame_facts_has_no_parameter_that_can_carry_a_brief(self):
-        """签名即防护。加形参之前先想清楚：这是反注入唯一的结构性保证。"""
+        """签名即防护。加形参之前先想清楚：这是反注入唯一的结构性保证。
+
+        `scope` 是送审档位枚举（REVIEW_SCOPES 里那三个字符串之一，认不出的一律回落到
+        默认档），装不下主题/简报，所以它进签名不破坏这条不变量。
+        """
         import inspect
         params = set(inspect.signature(reverse.extract_frame_facts).parameters)
-        self.assertEqual(params, {'config', 'job_dir', 'on_progress', 'degraded', 'batch_size'})
+        self.assertEqual(params,
+                         {'config', 'job_dir', 'on_progress', 'degraded', 'batch_size', 'scope'})
         for banned in ('dimensions', 'brief', 'title', 'theme', 'kwargs'):
             self.assertNotIn(banned, params)
 
@@ -308,6 +313,134 @@ class TestDegradedPlan(unittest.TestCase):
         self.assertEqual(est['frame_count'], 3)
         self.assertEqual(est['batch_count'], 1)
         self.assertFalse(est['degraded'])
+        self.assertEqual(est['scope'], 'plan')
+
+
+class TestReviewScope(unittest.TestCase):
+    """送审档位：analysis_plan 是硬下界，不是上界。
+
+    长片走 adaptive 时计划档只挑约四成，于是「抽了四百帧、只识别了一百来张」——
+    'all' 档存在的全部意义就是把这个上界打开。
+    """
+
+    def _overview_with_a_narrow_plan(self):
+        overview = _overview()
+        overview['analysis_plan'] = {
+            'mode': 'adaptive',
+            'required_frames': ['review_001.png'],
+            'required_count': 1,
+        }
+        return overview
+
+    def test_plan_scope_obeys_the_analysis_plan(self):
+        frames = reverse.scope_frames(self._overview_with_a_narrow_plan(), 'plan')
+        self.assertEqual([os.path.basename(f['frame_path']) for f in frames],
+                         ['review_001.png'])
+
+    def test_all_scope_sends_every_extracted_frame(self):
+        frames = reverse.scope_frames(self._overview_with_a_narrow_plan(), 'all')
+        self.assertEqual([os.path.basename(f['frame_path']) for f in frames],
+                         ['review_001.png', 'review_002.png', 'review_003.png'])
+
+    def test_all_scope_costs_more_than_the_plan_and_says_so(self):
+        overview = self._overview_with_a_narrow_plan()
+        plan = reverse.estimate_pass_a_cost(overview, scope='plan')
+        every = reverse.estimate_pass_a_cost(overview, scope='all')
+        self.assertEqual(plan['frame_count'], 1)
+        self.assertEqual(every['frame_count'], 3)
+        self.assertEqual(every['scope'], 'all')
+        self.assertFalse(every['degraded'])
+
+    def test_the_old_degraded_boolean_still_selects_the_degraded_scope(self):
+        """磁盘上的老 job 状态与老前端只会传 degraded，不能因为多了档位就失效。"""
+        self.assertEqual(reverse.normalize_review_scope(None, True), 'degraded')
+        self.assertEqual(reverse.normalize_review_scope(None, False), 'plan')
+        # 认不出来的档位名回落到默认档，而不是静默送全部帧（那是花钱的方向）。
+        self.assertEqual(reverse.normalize_review_scope('everything', False), 'plan')
+        # 两者都给时以 scope 为准。
+        self.assertEqual(reverse.normalize_review_scope('all', True), 'all')
+
+
+class TestFactsCacheIsKeyedByModel(unittest.TestCase):
+    """帧事实缓存按模型分桶。
+
+    键只有帧名的话，把逐帧识别换成强模型之后 Pass A 会原样命中弱模型留下的读数：
+    用户付了强模型的价、拿到的还是上一轮的结论，页面上没有任何迹象。这正是「加了
+    模型选择却等于没加」的形态。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def test_another_model_does_not_inherit_the_first_models_readings(self):
+        reverse._save_facts_cache(self.dir, 'flash', {'review_001.png': {'subject': 'wall'}})
+        self.assertEqual(reverse._load_facts_cache(self.dir, 'flash'),
+                         {'review_001.png': {'subject': 'wall'}})
+        self.assertEqual(reverse._load_facts_cache(self.dir, 'pro'), {})
+
+    def test_switching_back_is_still_free(self):
+        reverse._save_facts_cache(self.dir, 'flash', {'review_001.png': {'subject': 'wall'}})
+        reverse._save_facts_cache(self.dir, 'pro', {'review_001.png': {'subject': 'a wall'}})
+        self.assertEqual(reverse._load_facts_cache(self.dir, 'flash')['review_001.png']['subject'],
+                         'wall')
+
+    def test_a_new_prompt_version_still_invalidates_everything(self):
+        reverse._save_facts_cache(self.dir, 'flash', {'review_001.png': {}})
+        path = reverse._facts_cache_path(self.dir)
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        data['prompt_version'] = 'v0'
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        self.assertEqual(reverse._load_facts_cache(self.dir, 'flash'), {})
+
+    def test_a_legacy_cache_is_claimed_by_the_model_that_wrote_the_facts(self):
+        """升级当天正在跑的任务不该白付一次 Pass A：老格式没记模型，但磁盘上的
+        frame_facts.json 记了，那份产物就是这批缓存生出来的。"""
+        with open(reverse._facts_cache_path(self.dir), 'w', encoding='utf-8') as f:
+            json.dump({'prompt_version': reverse.PASS_A_PROMPT_VERSION,
+                       'frames': {'review_001.png': {'subject': 'wall'}}}, f)
+        with open(os.path.join(self.dir, 'frame_facts.json'), 'w', encoding='utf-8') as f:
+            json.dump({'model': 'flash', 'facts': []}, f)
+        self.assertEqual(reverse._load_facts_cache(self.dir, 'flash'),
+                         {'review_001.png': {'subject': 'wall'}})
+        self.assertEqual(reverse._load_facts_cache(self.dir, 'pro'), {})
+
+    def test_a_legacy_cache_with_no_traceable_model_is_dropped(self):
+        """认不出是谁读的就只能丢：错认一个模型就是上面那个 bug 本身。"""
+        with open(reverse._facts_cache_path(self.dir), 'w', encoding='utf-8') as f:
+            json.dump({'prompt_version': reverse.PASS_A_PROMPT_VERSION,
+                       'frames': {'review_001.png': {'subject': 'wall'}}}, f)
+        self.assertEqual(reverse._load_facts_cache(self.dir, 'flash'), {})
+
+
+class TestPassAModelSelection(unittest.TestCase):
+    """反推段的模型选择：UI 上选了什么，必须真的送到调用里。"""
+
+    def test_frame_facts_model_overrides_the_review_and_main_model(self):
+        self.assertEqual(
+            reverse._pass_a_model({'frameFactsModel': 'gemini-3.1-pro-high',
+                                   'reviewModel': 'r', 'model': 'm'}),
+            'gemini-3.1-pro-high')
+        self.assertEqual(reverse._pass_a_model({'reviewModel': 'r', 'model': 'm'}), 'r')
+        self.assertEqual(reverse._pass_a_model({'model': 'm'}), 'm')
+
+    def test_model_keys_survive_the_anti_priming_scrub(self):
+        """剥 config 是为了挡主题，不是挡模型名——剥掉了选择器就等于没接上。"""
+        clean = reverse._scrub_config_for_pass_a({
+            'frameFactsModel': 'gemini-3.1-pro-high', 'peakVerifyModel': 'off',
+            'dimensions': {'theme': 'leak'},
+        })
+        self.assertEqual(clean, {'frameFactsModel': 'gemini-3.1-pro-high',
+                                 'peakVerifyModel': 'off'})
+
+    def test_peak_verify_can_be_switched_off_and_follows_the_main_model_by_default(self):
+        self.assertIsNone(reverse._peak_verify_model({'model': 'm', 'peakVerifyModel': 'off'}))
+        self.assertEqual(reverse._peak_verify_model({'model': 'm'}), 'm')
+        self.assertEqual(reverse._peak_verify_model({'model': 'm', 'peakVerifyModel': ''}), 'm')
+        self.assertEqual(
+            reverse._peak_verify_model({'model': 'm', 'peakVerifyModel': 'claude-opus-4-6-thinking'}),
+            'claude-opus-4-6-thinking')
 
 
 class TestTemporaryObjects(unittest.TestCase):
@@ -1016,3 +1149,53 @@ class TestSingleFrameSalvage(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestBeatTranslation(unittest.TestCase):
+    """中文对照：只为人工卡点服务，英文永远是唯一事实源。"""
+
+    def _doc(self):
+        return {'beats': [_beat('B01', 0.0, 5.0), _beat('B02', 5.0, 10.0)]}
+
+    def test_translation_lands_in_zh_and_never_touches_the_english(self):
+        reply = json.dumps({
+            'B01': {'visual_subject': '一面墙', 'visible_action': '工人抹平墙面',
+                    'persistent_traces': ['抹刀纹', '地面溅点']},
+            'B02': {'visual_subject': '同一面墙'},
+        })
+        doc = self._doc()
+        with patch.object(pp, '_chat', return_value=reply) as chat:
+            count = reverse.translate_beats({}, doc)
+
+        self.assertEqual(count, 2)
+        self.assertEqual(chat.call_count, 1)
+        self.assertEqual(doc['beats'][0]['zh']['visual_subject'], '一面墙')
+        self.assertEqual(doc['beats'][0]['zh']['persistent_traces'], ['抹刀纹', '地面溅点'])
+        # 英文原样不动——下游提示词、相位判定、banned 门禁读的都是它。
+        self.assertEqual(doc['beats'][0]['visual_subject'], 'a wall')
+        self.assertEqual(doc['beats'][0]['persistent_traces'],
+                         ['trowel ridges', 'splatter flecks on the floor'])
+
+    def test_a_length_mismatch_on_a_list_field_drops_that_field_only(self):
+        """条数对不上的对照比没有对照更坏——核对的人会照着错位的那条点头。"""
+        reply = json.dumps({'B01': {'visual_subject': '一面墙',
+                                    'persistent_traces': ['只译了一条']}})
+        doc = self._doc()
+        with patch.object(pp, '_chat', return_value=reply):
+            reverse.translate_beats({}, doc)
+        self.assertEqual(doc['beats'][0]['zh'], {'visual_subject': '一面墙'})
+
+    def test_a_failed_translation_is_never_fatal(self):
+        doc = self._doc()
+        with patch.object(pp, '_chat', side_effect=RuntimeError('gateway down')):
+            self.assertEqual(reverse.translate_beats({}, doc), 0)
+        self.assertNotIn('zh', doc['beats'][0])
+
+    def test_editing_the_english_invalidates_only_that_field_translation(self):
+        previous = self._doc()
+        previous['beats'][0]['zh'] = {'visual_subject': '一面墙', 'visible_action': '工人抹平墙面'}
+        edited = json.loads(json.dumps(previous))
+        edited['beats'][0]['visible_action'] = 'a worker sands the surface instead'
+
+        reverse.prune_stale_translations(previous, edited)
+        self.assertEqual(edited['beats'][0]['zh'], {'visual_subject': '一面墙'})

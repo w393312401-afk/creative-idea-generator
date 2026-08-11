@@ -15,7 +15,7 @@ from prompt_pipeline import (
     check_camera_contradictions,
     check_colon_label_style,
     check_image_static_state,
-    check_pbisp_peek,
+    check_closed_entry_before_crossing,
     check_shot_family_leakage,
     fix_primary_landmarks,
     fix_sound_design,
@@ -148,35 +148,68 @@ class TestNegativeExampleIsCaught(unittest.TestCase):
         self.assertEqual(check_image_static_state(
             "Two brass sconces are mounted on the walls, fully installed and glowing."), [])
 
-    def test_pbisp_peek_flagged(self):
-        packet_with_interior = dict(PACKET, interior_primary_landmarks=[
-            {'name': 'heartwood ridge', 'grid': 'Grid B2', 'z_depth_scale': '60%'},
-        ])
-        # 实际产出的桥前帧（图4）没有透过开口预览室内锚点
-        errs = check_pbisp_peek(IMAGES[4]['body'], packet_with_interior)
-        self.assertTrue(any('heartwood ridge' in e for e in errs))
-        self.assertEqual(check_pbisp_peek(
-            "Through the open trunk base, the heartwood ridge is already visible and sharp.",
-            packet_with_interior), [])
+    def test_open_peeking_pre_crossing_image_flagged(self):
+        """TBCP v7：过门前一帧必须闭门。旧规则要的恰好相反（透过开口预览室内锚点），
+        实测下来那块低分辨率的猜测室内正是 i2v 过门后换世界的来源。"""
+        # 旧 PBISP 范文原句：既没有闭门声明，又明说了 peek。
+        peeking = ("Through the open doorway in Grid B2 the camera sneak-peeks the heartwood "
+                   "ridge, already sharp at about one-fifth of frame height.")
+        errs = check_closed_entry_before_crossing(peeking, PACKET)
+        self.assertTrue(any('previews the interior' in e for e in errs))
+        self.assertTrue(any('must state that the entry is CLOSED' in e for e in errs))
+        # 门被写成开着的（即使没用 peek 措辞）同样命中——缺闭门声明这条是兜底。
+        open_door = ("The plank entry door stands open in Grid B2 while the worker finishes the "
+                     "step below it.")
+        self.assertTrue(any('must state that the entry is CLOSED' in e
+                            for e in check_closed_entry_before_crossing(open_door, PACKET)))
 
-    def test_pbisp_peek_video_side_flagged_as_structural(self):
-        # 2026-07-22 森林瞭望塔实测单：图片3有门内预告室内锚点，视频2全篇没提，
-        # 造成视频末尾跟静态末帧对不上（"结尾跳变"）。label='VIDEO' 让同一条
-        # 检查也能查视频文本，且命中的错误文案要落进结构性硬伤标记表以触发回炉。
-        from prompt_pipeline import check_pbisp_peek, _STRUCTURAL_VIDEO_ERROR_MARKERS
-        packet_with_interior = dict(PACKET, interior_primary_landmarks=[
-            {'name': 'heartwood ridge', 'grid': 'Grid B2', 'z_depth_scale': '60%'},
-        ])
-        video_missing_peek = (
+    def test_closed_entry_pre_crossing_image_passes(self):
+        sealed = ("The weathered plank door in Grid B2 is shut tight in its frame, its boards "
+                  "swollen and streaked with rust; nothing of the hollow inside reads through it.")
+        self.assertEqual(check_closed_entry_before_crossing(sealed, PACKET), [])
+
+    def test_leafless_carrier_satisfies_the_rule_with_darkness(self):
+        """没有门扇的毛坯洞口没法"关上"——等价合规形态是洞里一片不透光的黑。"""
+        dark = ("The raw entrance opening in the trunk base reads as flat unlit darkness, "
+                "showing nothing of what lies inside.")
+        self.assertEqual(check_closed_entry_before_crossing(dark, PACKET), [])
+
+    def test_negated_open_wording_is_not_a_violation(self):
+        """契约本身鼓励写澄清句；"门从不打开"不能被当成"门开着"。"""
+        negated = ("The plank door stays closed for the whole beat — it never swings open, and "
+                   "no part of the interior is visible.")
+        self.assertEqual(check_closed_entry_before_crossing(negated, PACKET), [])
+
+    def test_pre_crossing_video_that_opens_the_door_is_structural(self):
+        """过门前一拍的 VIDEO 末帧就是那张闭门帧：这一拍把门打开 = 和自己的末帧矛盾，
+        与旧 PBISP continuity 同一类交接断裂，必须进结构性硬伤表触发定向回炉。"""
+        from prompt_pipeline import _STRUCTURAL_VIDEO_ERROR_MARKERS
+        video_opens_it = (
             "Use the provided first frame and last frame as exact composition anchors. "
-            "The worker repairs the stairs and railings throughout the clip."
+            "The worker repairs the stairs, then the trunk door swings open to reveal the "
+            "heartwood ridge inside."
         )
-        errs = check_pbisp_peek(video_missing_peek, packet_with_interior, label='VIDEO')
-        self.assertTrue(any('heartwood ridge' in e for e in errs))
+        errs = check_closed_entry_before_crossing(video_opens_it, PACKET, label='VIDEO')
+        self.assertTrue(errs)
         self.assertTrue(any(any(m in e for m in _STRUCTURAL_VIDEO_ERROR_MARKERS) for e in errs))
-        self.assertEqual(check_pbisp_peek(
-            "Through the open trunk base, the heartwood ridge stays visible and sharp across the clip.",
-            packet_with_interior, label='VIDEO'), [])
+        sealed_video = (
+            "Use the provided first frame and last frame as exact composition anchors. "
+            "The worker repairs the stairs and railings throughout the clip; the plank door "
+            "stays shut behind them and nothing inside is revealed."
+        )
+        self.assertEqual(check_closed_entry_before_crossing(sealed_video, PACKET, label='VIDEO'), [])
+
+    def test_pre_crossing_video_need_not_mention_the_door_at_all(self):
+        """正面的闭门声明只对 IMAGE 强制：这一拍的 VIDEO 常在做门以外的室外工序，
+        不提那扇门本来就合规（末帧照样是闭门帧）。对它也强制，等于每单白烧一轮回炉。"""
+        off_door_video = (
+            "Use the provided first frame and last frame as exact composition anchors. "
+            "The worker rakes the gravel apron flat across the whole clip."
+        )
+        self.assertEqual(
+            check_closed_entry_before_crossing(off_door_video, PACKET, label='VIDEO'), [])
+        # 同一段正文放在 IMAGE 侧仍然要被打回——静态帧必须正面说明门是关着的
+        self.assertTrue(check_closed_entry_before_crossing(off_door_video, PACKET))
 
     def test_video_process_content_contract(self):
         # 2026-07-12 17:18 实测单：IMAGE 对是全画幅大变化，VIDEO 却空心

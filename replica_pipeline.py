@@ -20,6 +20,7 @@
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -103,8 +104,37 @@ _JOBS_DIRNAME = 'replica_jobs'
 _STATE_FILENAME = '.replica_pipeline.json'
 
 # 抽帧脚本的默认参数就是为延时调过的（见脚本 docstring），不要在这里再调低。
-# 只有 degraded 模式会收窄送审帧数，那是 Pass A 一侧的事，与抽帧密度无关。
+# 送审档位（degraded / plan / all）收窄或放开的是**送多少帧给模型**，那是 Pass A
+# 一侧的事，与这里的抽帧密度是两个独立旋钮：抽帧决定「一共有多少帧可选」。
 _ANALYZER_TIMEOUT_SEC = 1800
+
+# 抽帧密度档位：基线 fps → (base_fps, dense_fps)。
+#
+# 为什么要能选：脚本默认 2fps 基线，一秒钟只留两张，慢工序（刮腻子、铺砖）在两张
+# 之间就跨过了半个工序，Pass A 再怎么读也读不出中间发生了什么。密采只在「状态跳变
+# ±0.5s」窗口里生效，跳变检测漏掉的渐变过程它救不了。抽帧是本地 ffmpeg，不花模型
+# 钱——真正花钱的是送审档位，所以这一档可以放心往上调。
+#
+# dense_fps 跟着基线走（三倍、封顶 12）：基线抬上去之后还留着 6fps 的密采窗，等于
+# 密采不再"密"，跳变点的分辨率反而被基线追平。
+EXTRACT_FPS_CHOICES = (1.0, 2.0, 3.0, 4.0, 6.0)
+DEFAULT_EXTRACT_FPS = 2.0
+
+
+def normalize_extract_fps(value=None):
+    """请求里的基线 fps → 档位表里的合法值。认不出来的一律回默认档。"""
+    try:
+        fps = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_EXTRACT_FPS
+    if fps not in EXTRACT_FPS_CHOICES:
+        # 不做四舍五入到最近档：静默改档位比明确回落到默认档更难查。
+        return DEFAULT_EXTRACT_FPS
+    return fps
+
+
+def _dense_fps_for(base_fps):
+    return min(12.0, round(base_fps * 3, 3))
 
 
 # ── job 目录与状态 ───────────────────────────────────────────────────────────
@@ -246,6 +276,8 @@ def ingest_video(file_bytes, filename, config=None):
         'media': _probe(video_path),
         'overview': None,
         'cost_estimate': None,
+        'sampling': None,        # 抽帧密度，run_extract 定下来（EXTRACT_FPS_CHOICES）
+        'review_scope': None,    # 送审档位，run_reverse 定下来（reverse.REVIEW_SCOPES）
         'degraded': False,
         'facts': None,
         'beats': None,
@@ -294,20 +326,47 @@ def _analyzer_script():
     return path
 
 
-def run_extract(state, on_progress=None):
-    """调 skill 自带的抽帧脚本。不重写它——它已经把延时特有的采样纪律做完了。"""
+def _purge_extract_products(directory):
+    """重抽帧之前把上一轮的帧与帧事实清掉。
+
+    送审帧的文件名是 `review_001.png` 这种**序号**，不是时间戳：换了抽帧密度，
+    同一个名字指向的是另一个时刻的画面。留着旧的 `.frame_facts_cache.json`，
+    Pass A 会按名字命中缓存，于是把上一档某一秒的观察安在这一档另一秒的帧上——
+    整条节拍阶梯建在错位的事实上，而且全程没有任何报错。
+    """
+    shutil.rmtree(os.path.join(directory, 'review_frames'), ignore_errors=True)
+    for name in ('.frame_facts_cache.json', 'frame_facts.json'):
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError:
+            pass
+
+
+def run_extract(state, on_progress=None, base_fps=None):
+    """调 skill 自带的抽帧脚本。不重写它——它已经把延时特有的采样纪律做完了。
+
+    `base_fps` 是基线抽帧密度（见 EXTRACT_FPS_CHOICES）。不传就沿用这条 job 上
+    次用过的档位，没跑过就用默认档。
+    """
+    base = normalize_extract_fps(
+        base_fps if base_fps is not None else (state.get('sampling') or {}).get('base_fps'))
+    dense = _dense_fps_for(base)
     state['stage'] = 'extract'
+    state['sampling'] = {'base_fps': base, 'dense_fps': dense}
     _save_state(state)
     if on_progress:
         on_progress('replica_stage', {
             'stage': 'extract',
-            'message': '正在抽帧：基线 2fps + 状态跳变密采 + 首尾密采（视频越长越久）…',
+            'message': f'正在抽帧：基线 {base:g}fps + 状态跳变密采 {dense:g}fps + '
+                       f'首尾密采（视频越长越久）…',
         })
 
     directory = job_dir(state['job_id'])
+    _purge_extract_products(directory)
     proc = subprocess.run(
         [sys.executable, _analyzer_script(),
-         '--video', state['video_path'], '--output-dir', directory],
+         '--video', state['video_path'], '--output-dir', directory,
+         '--base-fps', str(base), '--dense-fps', str(dense)],
         capture_output=True, text=True, timeout=_ANALYZER_TIMEOUT_SEC,
     )
     if proc.returncode != 0:
@@ -336,10 +395,14 @@ def run_extract(state, on_progress=None):
         'analysis_plan': overview.get('analysis_plan'),
         'pace_metrics': overview.get('pace_metrics'),
         'contact_sheets': (overview.get('review_sampling') or {}).get('contact_sheets') or [],
+        'sampling': dict(state['sampling']),
     }
+    # 三档都算：用户要在确认卡点上比的就是「多花多少钱换多少帧」。键名 full 保持不动
+    # （老状态文件与前端都在读它），它对应的是 analysis_plan 那一档。
     state['cost_estimate'] = {
-        'full': reverse.estimate_pass_a_cost(overview, degraded=False),
-        'degraded': reverse.estimate_pass_a_cost(overview, degraded=True),
+        'degraded': reverse.estimate_pass_a_cost(overview, scope='degraded'),
+        'full': reverse.estimate_pass_a_cost(overview, scope='plan'),
+        'all': reverse.estimate_pass_a_cost(overview, scope='all'),
     }
     # 停在成本确认卡点，不直接往 Pass A 走。
     #
@@ -353,12 +416,15 @@ def run_extract(state, on_progress=None):
     if on_progress:
         plan = state['overview']['analysis_plan'] or {}
         full = (state['cost_estimate'] or {}).get('full') or {}
+        every = (state['cost_estimate'] or {}).get('all') or {}
         on_progress('replica_stage', {
             'stage': 'confirm_cost',
-            'message': (f'抽帧完成：{state["overview"]["frame_count"]} 帧、'
+            'message': (f'抽帧完成（基线 {base:g}fps）：{state["overview"]["frame_count"]} 帧、'
                         f'{state["overview"]["change_event_count"]} 个变化事件；'
-                        f'待送审 {plan.get("required_count")} 帧，'
-                        f'完整档约 {full.get("batch_count", 0)} 次视觉调用。'
+                        f'计划档送审 {plan.get("required_count")} 帧'
+                        f'（约 {full.get("batch_count", 0)} 次视觉调用），'
+                        f'全部档送审 {every.get("frame_count", 0)} 帧'
+                        f'（约 {every.get("batch_count", 0)} 次）。'
                         f'选好采样档位再开始反推——这一步是整条线的成本大头。'),
             'collage': collage,
             'cost_estimate': state['cost_estimate'],
@@ -368,23 +434,31 @@ def run_extract(state, on_progress=None):
 
 # ── review_frames + cluster_beats ────────────────────────────────────────────
 
-def run_reverse(state, config, on_progress=None, degraded=False):
-    """Pass A + Pass B，跑完停在 review_beats 人工卡点。"""
+def run_reverse(state, config, on_progress=None, degraded=False, scope=None):
+    """Pass A + Pass B，跑完停在 review_beats 人工卡点。
+
+    `scope` 是送审档位（reverse.REVIEW_SCOPES）；`degraded` 只是它的老写法，留着
+    是因为磁盘上的老 job 状态还在用它。两个都给以 scope 为准。
+    """
     from prompt_pipeline import reverse
 
+    scope = reverse.normalize_review_scope(scope, degraded)
     directory = job_dir(state['job_id'])
     state['stage'] = 'review_frames'
-    state['degraded'] = bool(degraded)
+    state['review_scope'] = scope
+    state['degraded'] = scope == 'degraded'
     _save_state(state)
 
     facts = reverse.extract_frame_facts(config, directory, on_progress=on_progress,
-                                        degraded=degraded)
+                                        scope=scope)
     facts = reverse.verify_peak_frames(config, directory, facts, on_progress=on_progress)
     state['facts'] = {
         'path': os.path.join(directory, 'frame_facts.json'),
         'frame_count': facts.get('frame_count'),
         'model': facts.get('model'),
+        'peak_verify_model': facts.get('peak_verify_model'),
         'peak_verified': facts.get('peak_verified', 0),
+        'scope': facts.get('scope'),
         'degraded': facts.get('degraded'),
     }
     state['stage'] = 'cluster_beats'
@@ -392,6 +466,11 @@ def run_reverse(state, config, on_progress=None, degraded=False):
 
     beats = reverse.cluster_beats(config, directory, facts_payload=facts, on_progress=on_progress)
     beats['pipeline_id'] = state['job_id']
+    # 人工卡点是整条链路上唯一拦得住幻觉的地方，而卡点上摆的是一屏英文——看不懂就核对
+    # 不了，那道闸等于没有。补一份中文对照（英文仍是唯一事实源，见 translate_beats）。
+    # 放在这里而不是 cluster_beats 里面：Pass B 的契约是「事实 → 节拍阶梯」，中文对照是
+    # 这个 app 的界面需要，手工跑 Tier 4 的人并不需要它。
+    reverse.translate_beats(config, beats, on_progress=on_progress)
     _write_beats(state, beats)
 
     state['stage'] = 'review_beats'
@@ -438,8 +517,31 @@ def save_beats(job_id, beats):
     beats['pipeline_id'] = job_id
     beats['validation'] = reverse.validate_beats(beats, overview)
     beats['edited_by_user'] = True
+    # 改过的英文字段，其中文对照当场作废（见 prune_stale_translations）。前端只回传
+    # 英文字段，所以 zh 是从上一版原样带回来的——不清理就会出现「中文还是旧的」。
+    reverse.prune_stale_translations(state.get('beats'), beats)
     _write_beats(state, beats)
     return _save_state(state)
+
+
+def translate_job_beats(config, job_id, on_progress=None):
+    """给已有的节拍阶梯补/重做一份中文对照。
+
+    存量任务（2026-08-11 之前跑的）的 beats 里没有 `zh`，卡点上只有英文；用户手改过
+    英文之后对照也会被作废。两种情况都由这里补回来。
+    """
+    from prompt_pipeline import reverse
+
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+    beats = state.get('beats')
+    if not beats or not beats.get('beats'):
+        raise ValueError('还没有节拍阶梯')
+    translated = reverse.translate_beats(config, beats, on_progress=on_progress)
+    _write_beats(state, beats)
+    _save_state(state)
+    return state, translated
 
 
 # ── 二创 ─────────────────────────────────────────────────────────────────────
@@ -471,6 +573,8 @@ def run_mutate(state, config, axis_spec, on_progress=None):
         'media': state.get('media'),
         'overview': state.get('overview'),
         'cost_estimate': None,
+        'sampling': state.get('sampling'),
+        'review_scope': state.get('review_scope'),
         'degraded': state.get('degraded'),
         'facts': state.get('facts'),
         'beats': None,
@@ -490,6 +594,9 @@ def run_mutate(state, config, axis_spec, on_progress=None):
 
     variant_beats = reverse.mutate_beats(config, source_beats, axis_spec, on_progress=on_progress)
     variant_beats['pipeline_id'] = variant_id
+    # 二创改写过的英文字段，其中文对照刚被 _merge_variant 作废（见那里的注释）；补回来，
+    # 否则变体的卡点又退回一屏英文。与 run_reverse 同一个理由、同一个位置。
+    reverse.translate_beats(config, variant_beats, on_progress=on_progress)
     _write_beats(variant_state, variant_beats)
 
     variant_state['stage'] = 'review_beats'
@@ -542,7 +649,7 @@ def run_compose(state, config, dimensions=None, on_progress=None):
     try:
         compose_state = compose_anchor_and_packet(config, dims, on_progress=on_progress)
     except Exception as e:
-        raise _translate_compose_failure(e) from e
+        raise _translate_compose_failure(e, beats) from e
     state['title'] = compose_state.get('title')
     prompt_block = compose_remaining_beats(config, compose_state, on_progress=on_progress)
     state['prompt_block'] = prompt_block
@@ -627,7 +734,30 @@ def handoff_to_render(job_id):
     return dims, (state.get('title') or job_display_name(job_id, state)), load_compose_state(job_id)
 
 
-def _translate_compose_failure(error):
+# 合成器预检报错（英文，逐条以 " | " 分隔）→ 中文说法 + 用户照着能做的动作。
+# 每条规则写成 (匹配正则, 中文模板)；模板里的 {beat} 是合成器报的拍号。
+# 口径的权威来源是 prompt_pipeline/frame_state.py 与 scene_state.py，这里只翻译，
+# 不复制判据——复制一份迟早和本体漂开（见 _validate_composer_frame_contract 同款说明）。
+_COMPOSE_FAILURE_RULES = (
+    (r'Beat (?P<beat>\d+) declares (?P<n>\d+) operations',
+     '第 {beat} 拍只申报了 {n} 道工序，合成器要求每拍 2~3 道紧密耦合、共同产出同一成果的'
+     '工序。在「工序包」里补齐这一拍真实做过的其余工序，或把它与相邻的同一里程碑并成一拍。'),
+    (r'Beat (?P<beat>\d+) declares fewer than two visible persistent traces',
+     '第 {beat} 拍的「遗留痕迹」少于两条。补上这一拍在画面里留下、后续帧必须继承的两条可见痕迹。'),
+    (r'Beat (?P<beat>\d+) repeats the preceding terminal state',
+     '第 {beat} 拍的「结束状态」和上一拍逐字相同，等于这一拍什么都没推进。把它改写成本拍自己的终产物。'),
+    (r'Beat (?P<beat>\d+) explicitly regresses',
+     '第 {beat} 拍把已经完工的面又写回了裸露/缺失状态。除非这一拍真的是拆除，否则改掉这句倒退描述。'),
+    (r'Beat (?P<beat>\d+) frame-state contract is missing: (?P<fields>[^.]+)',
+     '第 {beat} 拍缺字段：{fields}。这几项是合成器排状态账的依据，必须逐项填上。'),
+    (r'Beat (?P<beat>\d+) changes more than three composition cells',
+     '第 {beat} 拍一次改动了三格以上的画面区域，锁死机位下读不出单一变化。拆成两拍。'),
+    (r'Beat (?P<beat>\d+) is out of sequence',
+     '第 {beat} 拍的编号与它在阶梯里的位置对不上。保存一次节拍阶梯会自动重编号。'),
+)
+
+
+def _translate_compose_failure(error, beats_doc=None):
     """把合成器的预检报错翻译成「用户照着能改」的话。
 
     2026-08-10：原先这里的第一分支是一段专门解释「清场规则打回照实复刻」的道歉文案。
@@ -635,13 +765,44 @@ def _translate_compose_failure(error):
     `validate_scene_states` 豁免清场那一条，复刻单不再撞它，所以那段翻译连同它要翻译的
     报错一起没有了。剩下的分支只兜底真正的状态账错误（时序、before 承接、重复移除），
     那些对复刻单同样是真缺陷，该报就报。
+
+    2026-08-11：改成**逐条**翻译，并把合成器的拍号映射回用户在卡点上看得见的拍 ID
+    （B01…）。此前只是把整串英文原样贴在一句中文导语后面：用户被告知"按报错指的拍号
+    调整"，而报错里那个 "Beat 9" 既不是他看到的编号体系，报的规则也全是英文。
     """
     text = str(error)
-    if 'Structured scene-state preflight' in text or 'frame state' in text.lower():
-        return RuntimeError(
-            f'合成器的结构化状态预检打回了这条阶梯。多数情况是反推出来的拍序与产线规则冲突，'
-            f'回到节拍阶梯按报错指的拍号调整后重试。\n原始报错：{text[:600]}')
-    return error
+    if 'Structured scene-state preflight' not in text and 'frame state' not in text.lower():
+        return error
+
+    raw = text.split('preflight rejected the beat ladder before prompt generation:', 1)[-1]
+    beats = (beats_doc or {}).get('beats') or []
+    lines, untranslated = [], []
+    for item in [x.strip() for x in raw.split(' | ') if x.strip()]:
+        for pattern, template in _COMPOSE_FAILURE_RULES:
+            match = re.search(pattern, item)
+            if not match:
+                continue
+            fields = match.groupdict()
+            line = template.format(**fields)
+            # 合成器的拍号是 1 起的阶梯下标；1:1 复刻下它与节拍阶梯逐位对应，
+            # 把用户在卡点上认得的 B0x 一并标出来。
+            try:
+                beat = beats[int(fields.get('beat')) - 1]
+            except (TypeError, ValueError, IndexError):
+                beat = None
+            if isinstance(beat, dict) and beat.get('id'):
+                line = f'{line}（对应节拍阶梯的 {beat["id"]}）'
+            lines.append(line)
+            break
+        else:
+            untranslated.append(item)
+
+    if not lines and not untranslated:
+        return error
+    body = '\n'.join(f'· {x}' for x in lines + untranslated)
+    return RuntimeError(
+        f'合成器的结构化状态预检打回了这条阶梯，共 {len(lines) + len(untranslated)} 项。'
+        f'回到「节拍阶梯」按下面每一条改，改完保存会立刻重校验：\n{body}')
 
 
 def _publish_to_library(state):
@@ -787,26 +948,33 @@ def _overview_ready(job_id):
     return os.path.exists(os.path.join(job_dir(job_id), 'video_overview.json'))
 
 
-def extract_replica_job(config, job_id, on_progress=None):
+def extract_replica_job(config, job_id, on_progress=None, base_fps=None):
     """只抽帧，停在 confirm_cost。
 
     与 Pass A 分成两个任务，是为了让「先看预估再决定烧不烧钱」这句话在代码里成立。
     抽帧是本地 ffmpeg，不花模型钱，所以它可以在用户没确认任何东西的情况下自己跑完。
+
+    `base_fps` 与这条 job 上次用的密度不同时**必须**重抽：那正是用户点「按新密度
+    重抽帧」的全部意思，沿用旧帧等于这个按钮什么也没做。
     """
     state = _begin(job_id)
     try:
-        if _overview_ready(job_id) and state.get('stage') not in ('ingest', 'extract'):
-            # 已经抽过帧（例如换个采样档位回来重跑）：不重抽，直接回到确认卡点。
+        current = (state.get('sampling') or {}).get('base_fps')
+        wants = normalize_extract_fps(base_fps) if base_fps is not None else None
+        density_changed = wants is not None and normalize_extract_fps(current) != wants
+        if (_overview_ready(job_id) and not density_changed
+                and state.get('stage') not in ('ingest', 'extract')):
+            # 已经抽过帧（例如换个送审档位回来重跑）：不重抽，直接回到确认卡点。
             state['stage'] = 'confirm_cost'
             return _save_state(state)
-        return run_extract(state, on_progress=on_progress)
+        return run_extract(state, on_progress=on_progress, base_fps=base_fps)
     except Exception as e:
         state['error'] = str(e)
         _save_state(state)
         raise
 
 
-def start_replica_job(config, job_id, on_progress=None, degraded=False):
+def start_replica_job(config, job_id, on_progress=None, degraded=False, scope=None):
     """Pass A → Pass B，停在 review_beats。抽帧没跑过就先补上。
 
     正常路径下 extract 已经在上一个任务里跑完、用户在 confirm_cost 上选了档位才到这里；
@@ -816,7 +984,8 @@ def start_replica_job(config, job_id, on_progress=None, degraded=False):
     try:
         if not _overview_ready(job_id) or state.get('stage') in ('ingest', 'extract'):
             state = run_extract(state, on_progress=on_progress)
-        return run_reverse(state, config, on_progress=on_progress, degraded=degraded)
+        return run_reverse(state, config, on_progress=on_progress,
+                           degraded=degraded, scope=scope)
     except Exception as e:
         state['error'] = str(e)
         _save_state(state)
@@ -830,6 +999,7 @@ def advance_replica_job(config, job_id, action='approve', payload=None,
     approve  → 合成提示词（1:1 复刻）
     variant  → 派生二创变体（payload: {axes, brief}），返回新 job 的 state
     recluster→ 重跑 Pass B（Pass A 的帧事实走缓存，不重付视觉钱）
+    translate→ 重做中文对照（纯文本调用，不碰英文原文，也不动 stage）
     """
     payload = payload or {}
     state = _load_state(job_id)
@@ -849,7 +1019,17 @@ def advance_replica_job(config, job_id, action='approve', payload=None,
             }, on_progress=on_progress)
         if action == 'recluster':
             return run_reverse(state, config, on_progress=on_progress,
+                               scope=state.get('review_scope'),
                                degraded=bool(state.get('degraded')))
+        if action == 'translate':
+            state, translated = translate_job_beats(config, job_id, on_progress=on_progress)
+            if on_progress:
+                on_progress('replica_stage', {
+                    'stage': state.get('stage') or 'review_beats',
+                    'message': (f'已更新 {translated} 拍的中文对照。'
+                                if translated else '中文对照没有更新（模型没给出可用译文）。'),
+                })
+            return state
         raise ValueError(f'不支持的 action: {action}')
     except Exception as e:
         state['error'] = str(e)

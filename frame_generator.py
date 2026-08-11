@@ -21,7 +21,7 @@ except ImportError:
 from server_common import (
     SERVER_CONFIG, SERVER_MANAGED, resolve_gateway, effective_config,
     OUTPUT_ROOT, SKILL_DIR, _get_project_dir, _safe_project_name,
-    IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT, IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT,
+    IMG2IMG_CONTROL_PROMPT, IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT,
     resolve_cover_reference, project_cover_path,
     IMAGE_TASKS, IMAGE_TASKS_LOCK,
     apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
@@ -142,6 +142,41 @@ def _interruptible_sleep(seconds, cancel_fn=None):
             raise ImageTaskCancelled("任务已被用户取消（退避期间检测到取消）")
 
 
+def _annotate_unreachable_gateway(err, req):
+    """把「本地网关没在跑」这类 URLError 补成能直接照着修的一句话。
+
+    原样抛出时前端和日志里只剩 `<urlopen error [Errno 61] Connection refused>`——
+    看不出是哪个网关（本机有两个：baseUrl 的 8046 和 codexBaseUrl 的 codex 网关），
+    也看不出该去启哪个进程。实测封面任务撞过：模型是 gpt-image-2、被路由到
+    codexBaseUrl，而那个网关进程已经退了，报错却完全没提这两件事。
+    只在「连不上」这一类上加注（拒绝/超时/DNS），其他 URLError 原样返回。
+    """
+    reason = getattr(err, 'reason', None)
+    if not isinstance(reason, (ConnectionRefusedError, socket.gaierror, socket.timeout, TimeoutError)):
+        return err
+    try:
+        url = req.full_url if hasattr(req, 'full_url') else str(req)
+        parsed = urllib.parse.urlparse(url)
+        origin = f'{parsed.scheme}://{parsed.netloc}'
+    except Exception:
+        origin = '上游网关'
+    which = ('codexBaseUrl（gpt-5 / gpt-image-2 / codex 系列走这个网关）'
+             if _is_codex_origin(origin) else 'baseUrl')
+    return urllib.error.URLError(
+        f'{reason} —— 连不上本地网关 {origin}；'
+        f'请确认该网关进程在跑，或把 server_config.json 的 {which} 改成它当前的端口'
+    )
+
+
+def _is_codex_origin(origin):
+    try:
+        from server_common import SERVER_CONFIG
+        codex = (SERVER_CONFIG.get('codexBaseUrl') or '')
+    except Exception:
+        codex = ''
+    return bool(codex) and origin and origin in codex
+
+
 def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=2, initial_delay=2.0, cancel_check=None, on_attempt=None, emit_quota_failure=True):
     """emit_quota_failure=False：配额耗尽照常抛 QuotaExhaustedError，但不往进度流
     广播「上游报错」。只给「调用方撞到这堵墙时有等价的路可换、换完这一帧照渲」的
@@ -256,7 +291,7 @@ def _execute_request_with_retry(req, opener=None, timeout=None, max_attempts=2, 
                 _interruptible_sleep(sleep_time, check_cancel)
                 continue
             _emit_upstream_failure(attempt + 1, max_attempts, f'连接失败: {e.reason}')
-            raise e
+            raise _annotate_unreachable_gateway(e, req)
         except socket.timeout as e:
             last_exception = e
             log('WARN', 'HTTP', f"尝试 {attempt+1}/{max_attempts} 失败：socket timeout")
@@ -1273,10 +1308,9 @@ def fx_prompt_with_bridge_control(seq, item, prompts_by_seq, videos):
     bridge_meta = _fx_bridge_meta(seq, prompts_by_seq, videos)
     if not bridge_meta:
         return body
-    control = (
-        IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT
-        if 'TURN' in bridge_meta else IMG2IMG_BRIDGE_CONTROL_PROMPT
-    )
+    # TBCP v7：过门帧一律走弱参考揭示指令（闭门参考图里没有可推进/可旋转的室内），
+    # 直推与转向在图像侧不再分流。
+    control = IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT
     if control in body:
         return body
     return f'{control}\n\n{body}'.strip()
@@ -2512,10 +2546,12 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     if cover_anchor:
                         # No generic prefix or label: send the parsed IMAGE 1 prompt verbatim.
                         ctrl_prompt = ''
-                    elif is_turn:
-                        ctrl_prompt = IMG2IMG_BRIDGE_TURN_CONTROL_PROMPT
-                    elif is_bridge or is_cut_head:
-                        ctrl_prompt = IMG2IMG_BRIDGE_CONTROL_PROMPT
+                    elif is_turn or is_bridge or is_cut_head:
+                        # TBCP v7：过门前一帧的门是关死的，参考图里没有任何室内像素，
+                        # 三种过门（直推/转向/切入）在图像侧因此完全同构——推进版与
+                        # 转向版指令都以"参考帧里有可放大/可旋转的室内"为前提，在闭门
+                        # 参考下只会得到那扇门的裁剪放大。统一走弱参考揭示指令。
+                        ctrl_prompt = IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT
                     else:
                         # 过门/转向是全画幅相机运动，区域锁在语义上不适用，维持原样；
                         # 只有静态镜头下的常规拍才用这拍已声明的网格坐标收紧锁定范围。
@@ -2600,7 +2636,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     try:
                         transport = _generate_image_edit(
                             config, item['prompt'], previous_path, target_path,
-                            control_prompt=IMG2IMG_BRIDGE_CONTROL_PROMPT)
+                            control_prompt=IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT)
                         model = _image_edit_model(config)
                         retries += 1
                         reference = previous_path

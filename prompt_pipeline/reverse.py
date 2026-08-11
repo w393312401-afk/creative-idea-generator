@@ -125,6 +125,7 @@ _PASS_A_CONFIG_KEYS = (
     # title / outline…）都不在这里，这就是反注入的结构性保证。
     'baseUrl', 'apiKey', 'codexBaseUrl', 'codexApiKey',
     'model', 'reviewModel', 'reviewConcurrency',
+    'frameFactsModel', 'peakVerifyModel',
 )
 
 
@@ -148,7 +149,7 @@ def _facts_cache_path(job_dir):
     return os.path.join(job_dir, '.frame_facts_cache.json')
 
 
-def _load_facts_cache(job_dir):
+def _read_facts_cache_file(job_dir):
     path = _facts_cache_path(job_dir)
     if not os.path.exists(path):
         return {}
@@ -160,14 +161,54 @@ def _load_facts_cache(job_dir):
     if data.get('prompt_version') != PASS_A_PROMPT_VERSION:
         # 提示词换了版，旧结果不能复用——这正是版本号存在的理由。
         return {}
-    return data.get('frames') or {}
+    return data
 
 
-def _save_facts_cache(job_dir, frames):
+def _migrated_legacy_cache(job_dir, data):
+    """老格式（一个扁平的 frames 表，没记模型）→ 按模型分桶的新格式。
+
+    老格式没有记是哪个模型读的。硬扔掉会让升级当天正在跑的任务白付一次 Pass A，
+    所以从磁盘上的 frame_facts.json 认领那个模型名——那份产物就是这批缓存生出来的。
+    认不出来才丢。
+    """
+    frames = data.get('frames') or {}
+    if not frames:
+        return {}
+    try:
+        with open(os.path.join(job_dir, _FRAME_FACTS_FILENAME), 'r', encoding='utf-8') as f:
+            model = (json.load(f) or {}).get('model')
+    except (OSError, ValueError):
+        return {}
+    return {model: frames} if model else {}
+
+
+def _load_facts_cache(job_dir, model):
+    """这一模型读过的帧事实。
+
+    缓存必须按模型分桶：键只有帧名的话，把「逐帧识别」换成强模型之后，Pass A 会
+    原样命中弱模型留下的读数——用户付了强模型的价，拿到的还是上一轮的结论，而且
+    页面上没有任何迹象。分桶之后换模型是真的重读，换回来则仍然免费。
+    """
+    data = _read_facts_cache_file(job_dir)
+    if not data:
+        return {}
+    by_model = data.get('by_model')
+    if by_model is None:
+        by_model = _migrated_legacy_cache(job_dir, data)
+    return dict((by_model or {}).get(model) or {})
+
+
+def _save_facts_cache(job_dir, model, frames):
+    data = _read_facts_cache_file(job_dir)
+    by_model = data.get('by_model')
+    if by_model is None:
+        by_model = _migrated_legacy_cache(job_dir, data)
+    by_model = dict(by_model or {})
+    by_model[model] = frames
     path = _facts_cache_path(job_dir)
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump({'prompt_version': PASS_A_PROMPT_VERSION, 'frames': frames},
+        json.dump({'prompt_version': PASS_A_PROMPT_VERSION, 'by_model': by_model},
                   f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
@@ -202,6 +243,47 @@ def degraded_plan_frames(overview):
     return ordered
 
 
+def all_review_frames(overview):
+    """抽帧抽出来的**全部**送审帧，不做任何裁剪。
+
+    analysis_plan 是硬下界，不是上界：长片走 adaptive 时它只挑「四成 + 每秒一张」，
+    于是一条三分钟的视频抽出四百多帧、真正送进模型的只有一百来张，事件之间的推进
+    全靠 Pass B 在文本里补——用户反馈的「图片识别数量太少」就是这一档。要更密，
+    就在这里把上界打开，代价是视觉调用次数按比例上涨（预估里照实报）。
+    """
+    return [e for e in ((overview.get('review_sampling') or {}).get('frames') or [])
+            if e.get('frame_path')]
+
+
+# 送审档位。三档都只决定「送多少帧给多模态模型」，与抽帧密度（--base-fps，见
+# replica_pipeline.run_extract）是两个独立的旋钮：抽帧决定总共有多少帧可选，
+# 这里决定选多少张去花钱。
+REVIEW_SCOPES = ('degraded', 'plan', 'all')
+DEFAULT_REVIEW_SCOPE = 'plan'
+
+
+def normalize_review_scope(scope=None, degraded=False):
+    """把「档位字符串 / 老的 degraded 布尔」统一成一个档位名。
+
+    `degraded` 是这三档存在之前的唯一开关，磁盘上的老 job 状态和老前端都还在传它，
+    所以它继续作为 scope 缺省时的回退，而不是被删掉。
+    """
+    text = str(scope or '').strip().lower()
+    if text in REVIEW_SCOPES:
+        return text
+    return 'degraded' if degraded else DEFAULT_REVIEW_SCOPE
+
+
+def scope_frames(overview, scope):
+    """档位 → 送审帧列表。"""
+    scope = normalize_review_scope(scope)
+    if scope == 'degraded':
+        return degraded_plan_frames(overview)
+    if scope == 'all':
+        return all_review_frames(overview)
+    return _planned_frames(overview)
+
+
 def _frames_by_name(overview):
     entries = ((overview.get('review_sampling') or {}).get('frames') or [])
     return {os.path.basename(e['frame_path']): e for e in entries if e.get('frame_path')}
@@ -222,13 +304,15 @@ def peak_frame_names(overview):
     return names
 
 
-def estimate_pass_a_cost(overview, degraded=False, batch_size=_PASS_A_BATCH_SIZE):
+def estimate_pass_a_cost(overview, degraded=False, batch_size=_PASS_A_BATCH_SIZE,
+                         scope=None):
     """给 UI 的开跑前预估。extract 完成后必须先把它摆给用户确认再烧钱。
 
     峰值帧复核现在默认开（见 `_peak_verify_model`），所以它那几次调用也必须出现在这里。
     默认加钱却不进预估，等于绕开了「先确认再烧钱」这道卡点本身。
     """
-    frames = degraded_plan_frames(overview) if degraded else _planned_frames(overview)
+    scope = normalize_review_scope(scope, degraded)
+    frames = scope_frames(overview, scope)
     n = len(frames)
     batches = (n + batch_size - 1) // batch_size if n else 0
     peaks = peak_frame_names(overview)
@@ -238,7 +322,8 @@ def estimate_pass_a_cost(overview, degraded=False, batch_size=_PASS_A_BATCH_SIZE
         'total_extracted': len(((overview.get('review_sampling') or {}).get('frames') or [])),
         'batch_count': batches,
         'batch_size': batch_size,
-        'degraded': bool(degraded),
+        'scope': scope,
+        'degraded': scope == 'degraded',
         'plan_mode': (overview.get('analysis_plan') or {}).get('mode'),
         'peak_frame_count': len(peaks),
         'peak_batch_count': peak_batches,
@@ -424,23 +509,25 @@ def _clamp01(value, default=0.5):
 
 
 def extract_frame_facts(config, job_dir, on_progress=None, degraded=False,
-                        batch_size=_PASS_A_BATCH_SIZE):
+                        batch_size=_PASS_A_BATCH_SIZE, scope=None):
     """Pass A。读 job_dir/video_overview.json，产出 job_dir/frame_facts.json。
 
     签名里没有 dimensions / brief / title / theme，且不接受 **kwargs——反注入靠这个
-    形状来保证，别为了「顺手传个主题过去让它理解得更好」而破坏它。
+    形状来保证，别为了「顺手传个主题过去让它理解得更好」而破坏它。`scope` 是档位
+    枚举（见 REVIEW_SCOPES），装不下主题，加它不破坏这条不变量。
     """
     overview_path = os.path.join(job_dir, 'video_overview.json')
     with open(overview_path, 'r', encoding='utf-8') as f:
         overview = json.load(f)
 
-    entries = degraded_plan_frames(overview) if degraded else _planned_frames(overview)
+    scope = normalize_review_scope(scope, degraded)
+    entries = scope_frames(overview, scope)
     if not entries:
         raise ValueError('analysis_plan 为空：抽帧阶段没有产出任何可送审的帧')
 
     clean_config = _scrub_config_for_pass_a(config)
     model = _pass_a_model(config)
-    cache = _load_facts_cache(job_dir)
+    cache = _load_facts_cache(job_dir, model)
 
     pending = [e for e in entries if os.path.basename(e['frame_path']) not in cache]
     if on_progress:
@@ -541,7 +628,7 @@ def extract_frame_facts(config, job_dir, on_progress=None, degraded=False,
         )
         for chunk in results.values():
             cache.update(chunk or {})
-        _save_facts_cache(job_dir, cache)
+        _save_facts_cache(job_dir, model, cache)
 
     facts = []
     for entry in entries:
@@ -553,7 +640,8 @@ def extract_frame_facts(config, job_dir, on_progress=None, degraded=False,
     payload = {
         'prompt_version': PASS_A_PROMPT_VERSION,
         'model': model,
-        'degraded': bool(degraded),
+        'scope': scope,
+        'degraded': scope == 'degraded',
         'frame_count': len(facts),
         'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'facts': facts,
@@ -659,6 +747,9 @@ def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
             by_frame[name] = fact
     facts_payload['facts'] = [by_frame[f['frame']] for f in facts_payload.get('facts') or []]
     facts_payload['peak_verified'] = len(refined)
+    # 复核用了哪个模型要落进产物：UI 上「峰值复核模型」是可选的，选了什么、有没有
+    # 真的生效，只有这里说了算。
+    facts_payload['peak_verify_model'] = model
 
     with open(os.path.join(job_dir, _FRAME_FACTS_FILENAME), 'w', encoding='utf-8') as f:
         json.dump(facts_payload, f, ensure_ascii=False, indent=2)
@@ -988,6 +1079,124 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(beats_doc, f, ensure_ascii=False, indent=2)
     return beats_doc
+
+
+# ── 中文对照 ─────────────────────────────────────────────────────────────────
+
+# 要翻译的字段，与人工卡点上那张卡展示/可编辑的字段一一对应。
+# operation / package_operations 是**工序名**：合成器按它们做相位判定，翻译只作提示，
+# 不参与任何判据。
+TRANSLATE_FIELDS = (
+    'visual_subject', 'operation', 'visible_action', 'visible_result',
+    'state_before', 'state_after', 'visible_details', 'persistent_traces',
+    'package_operations',
+)
+
+_TRANSLATE_SYSTEM = """You translate a construction time-lapse beat ladder from English into Simplified Chinese for a human reviewer.
+
+RULES
+- Translate only. Never add, drop, merge, soften or "fix" any fact — the reviewer is checking these lines against real video frames, so an improved translation destroys the only thing this step is for.
+- Keep it terse and concrete, in the register a Chinese site foreman would use (「把黄色保温棉塞满地梁格栅」, not 「进行保温施工作业」).
+- Array fields translate item by item, same length, same order.
+- Keep proper nouns, brand names and measurements as they are.
+
+OUTPUT
+Return one JSON object, no prose, no code fences, mapping each beat id to its translated fields:
+{"B01": {"visual_subject": "...", "visible_details": ["..."]}, "B02": {...}}
+Include only the fields you were given for that beat."""
+
+
+def prune_stale_translations(previous_doc, beats_doc):
+    """用户在卡点上改过的英文字段，其中文对照立刻作废。
+
+    保存时不重跑翻译（那是一次要等的模型调用，而保存必须是即时的）；作废掉的字段在
+    界面上退回只显示英文，用户按「重译中文」才会补回来。留着旧译文是最坏的选择——
+    核对的人会照着中文点头，而实际送去合成的是他刚改过的英文。
+    """
+    old = {b.get('id'): b for b in (previous_doc or {}).get('beats') or [] if isinstance(b, dict)}
+    for beat in (beats_doc or {}).get('beats') or []:
+        if not isinstance(beat, dict) or not isinstance(beat.get('zh'), dict):
+            continue
+        before = old.get(beat.get('id')) or {}
+        beat['zh'] = {key: value for key, value in beat['zh'].items()
+                      if key in before and before.get(key) == beat.get(key)}
+        if not beat['zh']:
+            beat.pop('zh', None)
+    return beats_doc
+
+
+def _beat_translation_payload(beats):
+    """送去翻译的最小载荷：只有 id 和需要翻译的字段。"""
+    payload = []
+    for beat in beats:
+        item = {'id': beat.get('id')}
+        for key in TRANSLATE_FIELDS:
+            value = beat.get(key)
+            if isinstance(value, (list, tuple)):
+                items = [str(x).strip() for x in value if str(x).strip()]
+                if items:
+                    item[key] = items
+            elif str(value or '').strip():
+                item[key] = str(value).strip()
+        if len(item) > 1:
+            payload.append(item)
+    return payload
+
+
+def translate_beats(config, beats_doc, on_progress=None):
+    """给每一拍补一份中文对照，写在 `beat['zh']` 里。返回翻译过的拍数。
+
+    英文仍然是**唯一事实源**：下游提示词、合成器的相位判定、banned 门禁读的全是英文
+    原文，`zh` 只喂给人工卡点的界面。所以这里不允许把翻译写回英文字段，也不允许因为
+    翻译失败而让整单失败——看不懂是体验问题，翻错了写回去才是事故。
+
+    纯文本调用，不带任何帧图：Pass A 的反注入不变量与它无关（此时 beats 已经产出，
+    主题信息也不会倒流回帧事实提取）。
+    """
+    beats = [b for b in (beats_doc or {}).get('beats') or [] if isinstance(b, dict)]
+    payload = _beat_translation_payload(beats)
+    if not payload:
+        return 0
+    if on_progress:
+        on_progress('replica_stage', {
+            'stage': 'cluster_beats',
+            'message': f'正在把 {len(payload)} 拍的英文观察译成中文对照…',
+        })
+    try:
+        raw = pp._chat(
+            config, _TRANSLATE_SYSTEM,
+            json.dumps(payload, ensure_ascii=False),
+            temperature=0.1, max_tokens=8192, timeout=180)
+        data = parse_json_reply(raw)
+    except Exception as e:
+        # 翻译只是可读性增强，炸了就保持英文原样。
+        if sys.stdout:
+            print(f'[REVERSE] 中文对照生成失败（非致命，卡点仍显示英文原文）: {e}')
+        return 0
+    if not isinstance(data, dict):
+        return 0
+
+    translated = 0
+    for beat in beats:
+        item = data.get(beat.get('id'))
+        if not isinstance(item, dict):
+            continue
+        zh = {}
+        for key in TRANSLATE_FIELDS:
+            value = item.get(key)
+            source = beat.get(key)
+            if isinstance(source, (list, tuple)):
+                if isinstance(value, (list, tuple)):
+                    # 条数对不上就整项丢弃：错位的对照比没有对照更容易误导核对的人。
+                    items = [str(x).strip() for x in value if str(x).strip()]
+                    if len(items) == len([x for x in source if str(x).strip()]):
+                        zh[key] = items
+            elif isinstance(value, str) and value.strip():
+                zh[key] = value.strip()
+        if zh:
+            beat['zh'] = zh
+            translated += 1
+    return translated
 
 
 def _renumber_beats(beats_doc):
@@ -1527,6 +1736,10 @@ def _merge_variant(beats_doc, data, axes):
                     'state_before', 'state_after', 'persistent_traces', 'operation'):
             if patch.get(key):
                 new[key] = patch[key]
+                # 中文对照是上一版英文的译文，改了英文就必须作废对应那条——留着它，
+                # 卡点上会出现「中文写着旧载体、英文已经换成新载体」的错位。
+                if isinstance(new.get('zh'), dict):
+                    new['zh'] = {k: v for k, v in new['zh'].items() if k != key}
         # 证据帧降级为构图参考：变体不再对原片的事实负责，那些帧只提供机位与构图。
         new['reference_frames'] = list(src.get('evidence_frames') or [])
         new.pop('evidence_frames', None)
@@ -1566,6 +1779,12 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
             text = f'{text}（工序：{"、".join(package)}）'
         entry = {'text': text or (beat.get('visual_subject') or ''),
                  'op': beat.get('operation') or beat.get('stage')}
+        # 结构化再发一遍。正文里那段「（工序：…）」是给规划模型读的，合成器的确定性
+        # 通路（compile_outline_fallback_ladder / backfill_package_operations）读的是
+        # 这个键——2026-08-11 的整单失败就是它缺席造成的：兜底梯子最后一拍拿不到本拍
+        # 真实工序，只继承到一个单元素的占位，随即被合成器自己的硬闸判死。
+        if package:
+            entry['package_operations'] = package
 
         # 富字段绑定（2026-08-10）。此前这里只发 text + op，于是人工卡点上逐拍精修的
         # state_before / state_after / persistent_traces / visible_details 全部止步于

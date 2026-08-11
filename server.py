@@ -1716,19 +1716,21 @@ def _replica_worker(task_id, config, job_id, label, run, task_type='replica'):
         set_project_key_context(None)
 
 
-def replica_extract_worker(task_id, config, job_id):
+def replica_extract_worker(task_id, config, job_id, base_fps=None):
     """只抽帧，停在 confirm_cost 成本确认卡点。不花模型钱，所以不必先问用户。"""
     from replica_pipeline import extract_replica_job
     _replica_worker(task_id, config, job_id, '抽帧',
-                    lambda cb: extract_replica_job(config, job_id, on_progress=cb),
+                    lambda cb: extract_replica_job(config, job_id, on_progress=cb,
+                                                   base_fps=base_fps),
                     task_type='replica_extract')
 
 
-def replica_start_worker(task_id, config, job_id, degraded=False):
+def replica_start_worker(task_id, config, job_id, degraded=False, scope=None):
     """Pass A → Pass B，停在 review_beats 人工卡点。"""
     from replica_pipeline import start_replica_job
     _replica_worker(task_id, config, job_id, '反推流水线',
-                    lambda cb: start_replica_job(config, job_id, on_progress=cb, degraded=degraded))
+                    lambda cb: start_replica_job(config, job_id, on_progress=cb,
+                                                 degraded=degraded, scope=scope))
 
 
 def replica_advance_worker(task_id, config, job_id, action, payload):
@@ -4888,7 +4890,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
                 threading.Thread(
                     target=replica_extract_worker,
-                    args=(task_id, config, job_id),
+                    args=(task_id, config, job_id, body.get('base_fps')),
                     daemon=True
                 ).start()
                 self._send_json({'status': 'ok', 'task_id': task_id})
@@ -4914,7 +4916,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
                 threading.Thread(
                     target=replica_start_worker,
-                    args=(task_id, config, job_id, bool(body.get('degraded'))),
+                    args=(task_id, config, job_id, bool(body.get('degraded')),
+                          body.get('scope')),
                     daemon=True
                 ).start()
                 self._send_json({'status': 'ok', 'task_id': task_id})
@@ -4932,7 +4935,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 if not job_id:
                     self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
                     return
-                if action not in ('approve', 'variant', 'recluster'):
+                if action not in ('approve', 'variant', 'recluster', 'translate'):
                     self._send_json({'status': 'error', 'message': f'不支持的 action: {action}'}, status=400)
                     return
                 config['_project_key'] = job_id

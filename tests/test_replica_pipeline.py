@@ -63,7 +63,9 @@ class TestIngest(ReplicaTempRootCase):
         self.assertEqual(os.path.dirname(state['video_path']), rp.job_dir(state['job_id']))
 
 
-class TestExtractGate(ReplicaTempRootCase):
+class ExtractedJobCase(ReplicaTempRootCase):
+    """抽帧产物的夹具。抽帧密度那一组用例复用同一份，不另抄一份 overview。"""
+
     def _write_overview(self, job_id, collage):
         payload = {
             'source_video': 'x.mp4',
@@ -83,6 +85,19 @@ class TestExtractGate(ReplicaTempRootCase):
             json.dump(payload, f)
         return path
 
+    def _extracted_job(self, base_fps=None):
+        state = self._ingest()
+        collage = os.path.join(rp.job_dir(state['job_id']), 'clip_collage.jpg')
+        with open(collage, 'wb') as f:
+            f.write(b'jpg')
+        self._write_overview(state['job_id'], collage)
+        with patch.object(rp.subprocess, 'run') as run, \
+             patch.object(rp, '_analyzer_script', return_value='/fake/analyze.py'):
+            run.return_value.returncode = 0
+            return rp.run_extract(state, base_fps=base_fps), collage
+
+
+class TestExtractGate(ExtractedJobCase):
     def test_missing_collage_is_a_hard_failure(self):
         """手工跑时人会看到脚本 stdout 的 FAILED；产品化后没人看 stdout，
         所以必须在这里转成硬失败，否则就会出现「没见过整条序列就定义节拍」。"""
@@ -104,17 +119,6 @@ class TestExtractGate(ReplicaTempRootCase):
             with self.assertRaises(RuntimeError):
                 rp.run_extract(state)
 
-    def _extracted_job(self):
-        state = self._ingest()
-        collage = os.path.join(rp.job_dir(state['job_id']), 'clip_collage.jpg')
-        with open(collage, 'wb') as f:
-            f.write(b'jpg')
-        self._write_overview(state['job_id'], collage)
-        with patch.object(rp.subprocess, 'run') as run, \
-             patch.object(rp, '_analyzer_script', return_value='/fake/analyze.py'):
-            run.return_value.returncode = 0
-            return rp.run_extract(state), collage
-
     def test_extract_stops_at_the_cost_gate_instead_of_running_on_into_pass_a(self):
         """成本卡点必须在代码里真的存在。
 
@@ -125,9 +129,11 @@ class TestExtractGate(ReplicaTempRootCase):
         out, collage = self._extracted_job()
         self.assertEqual(out['stage'], 'confirm_cost')
         self.assertEqual(out['overview']['collage'], collage)
-        # 停下来的同时必须已经算好预估，否则这个卡点上没东西可看。
+        # 停下来的同时必须已经算好预估，否则这个卡点上没东西可看。三档都要在：
+        # 用户在这个卡点上比的就是「多花多少钱换多少帧」。
         self.assertIn('full', out['cost_estimate'])
         self.assertIn('degraded', out['cost_estimate'])
+        self.assertIn('all', out['cost_estimate'])
 
     def test_extract_only_entry_point_does_not_touch_pass_a(self):
         state = self._ingest()
@@ -191,6 +197,110 @@ class TestExtractGate(ReplicaTempRootCase):
             with self.assertRaises(RuntimeError) as ctx:
                 rp.run_extract(state)
         self.assertIn('ffmpeg not found', str(ctx.exception))
+
+
+class TestSamplingDensity(ExtractedJobCase):
+    """抽帧密度可选（用户反馈：识别到的图片太少）。
+
+    盯两件会静默坏掉的事：选的密度要真的传进抽帧脚本；换了密度必须重抽**并且**
+    把上一档的帧事实清掉——帧文件名是序号不是时间戳，留着缓存就会把上一档某一秒
+    的观察安在这一档另一秒的帧上，全程不报错。
+    """
+
+    def _run_extract_capturing_argv(self, state, base_fps=None):
+        collage = os.path.join(rp.job_dir(state['job_id']), 'clip_collage.jpg')
+        with open(collage, 'wb') as f:
+            f.write(b'jpg')
+        self._write_overview(state['job_id'], collage)
+        with patch.object(rp.subprocess, 'run') as run, \
+             patch.object(rp, '_analyzer_script', return_value='/fake/analyze.py'):
+            run.return_value.returncode = 0
+            out = rp.run_extract(state, base_fps=base_fps)
+        return out, run.call_args[0][0]
+
+    def test_chosen_density_reaches_the_analyzer_and_lands_in_the_state(self):
+        out, argv = self._run_extract_capturing_argv(self._ingest(), base_fps=4)
+        self.assertEqual(argv[argv.index('--base-fps') + 1], '4.0')
+        # 密采窗跟着基线走：基线抬上去还留着默认 6fps，等于密采不再密。
+        self.assertEqual(argv[argv.index('--dense-fps') + 1], '12.0')
+        self.assertEqual(out['sampling'], {'base_fps': 4.0, 'dense_fps': 12.0})
+
+    def test_an_unknown_density_falls_back_to_the_default_tier(self):
+        """不做四舍五入到最近档：静默改档位比明确回落到默认档更难查。"""
+        _out, argv = self._run_extract_capturing_argv(self._ingest(), base_fps=9.7)
+        self.assertEqual(argv[argv.index('--base-fps') + 1], '2.0')
+
+    def test_a_re_extract_without_a_density_keeps_the_one_the_job_used(self):
+        state = self._ingest()
+        self._run_extract_capturing_argv(state, base_fps=3)
+        _out, argv = self._run_extract_capturing_argv(state, base_fps=None)
+        self.assertEqual(argv[argv.index('--base-fps') + 1], '3.0')
+
+    def test_changing_the_density_forces_a_re_extract(self):
+        """「按新密度重抽帧」按钮的全部意思就是重抽。沿用旧帧等于这个按钮什么也没做。"""
+        out, _collage = self._extracted_job(base_fps=2)
+        with patch.object(rp, 'run_extract') as extract_call:
+            rp.extract_replica_job({}, out['job_id'], base_fps=4)
+        extract_call.assert_called_once()
+        self.assertEqual(extract_call.call_args.kwargs['base_fps'], 4)
+
+    def test_the_same_density_still_skips_the_re_extract(self):
+        """抽帧是几分钟的 ffmpeg。只换送审档位回到卡点时不该再跑一遍。"""
+        out, _collage = self._extracted_job(base_fps=2)
+        out['stage'] = 'review_beats'
+        rp._save_state(out)
+        with patch.object(rp, 'run_extract') as extract_call:
+            back = rp.extract_replica_job({}, out['job_id'], base_fps=2)
+        extract_call.assert_not_called()
+        self.assertEqual(back['stage'], 'confirm_cost')
+
+    def test_re_extract_drops_the_stale_frame_facts_cache(self):
+        state = self._ingest()
+        self._run_extract_capturing_argv(state, base_fps=2)
+        directory = rp.job_dir(state['job_id'])
+        os.makedirs(os.path.join(directory, 'review_frames'), exist_ok=True)
+        stale = os.path.join(directory, 'review_frames', 'review_001.png')
+        with open(stale, 'wb') as f:
+            f.write(b'png')
+        cache = os.path.join(directory, '.frame_facts_cache.json')
+        with open(cache, 'w', encoding='utf-8') as f:
+            json.dump({'prompt_version': 'v1', 'frames': {'review_001.png': {}}}, f)
+
+        self._run_extract_capturing_argv(state, base_fps=4)
+        self.assertFalse(os.path.exists(cache))
+        self.assertFalse(os.path.exists(stale))
+
+
+class TestReviewScopeThreading(ReplicaTempRootCase):
+    """送审档位要一路走到 Pass A。断在中间的话，UI 上选了「全部」照样只送计划档。"""
+
+    def _job_ready_for_reverse(self):
+        state = self._ingest()
+        state['stage'] = 'confirm_cost'
+        rp._save_state(state)
+        os.makedirs(rp.job_dir(state['job_id']), exist_ok=True)
+        with open(os.path.join(rp.job_dir(state['job_id']), 'video_overview.json'),
+                  'w', encoding='utf-8') as f:
+            json.dump({'review_sampling': {'frames': []}}, f)
+        return state
+
+    def test_scope_reaches_pass_a_and_is_remembered_on_the_job(self):
+        state = self._job_ready_for_reverse()
+        with patch('prompt_pipeline.reverse.extract_frame_facts',
+                   side_effect=RuntimeError('stop after pass a call')) as pass_a:
+            with self.assertRaises(RuntimeError):
+                rp.start_replica_job({}, state['job_id'], scope='all')
+        self.assertEqual(pass_a.call_args.kwargs['scope'], 'all')
+        # recluster 会拿这个字段重跑，存错等于下一次静默换档。
+        self.assertEqual(rp._load_state(state['job_id'])['review_scope'], 'all')
+
+    def test_the_old_degraded_boolean_still_works(self):
+        state = self._job_ready_for_reverse()
+        with patch('prompt_pipeline.reverse.extract_frame_facts',
+                   side_effect=RuntimeError('stop after pass a call')) as pass_a:
+            with self.assertRaises(RuntimeError):
+                rp.start_replica_job({}, state['job_id'], degraded=True)
+        self.assertEqual(pass_a.call_args.kwargs['scope'], 'degraded')
 
 
 class TestComposeGate(ReplicaTempRootCase):
@@ -415,6 +525,20 @@ class TestSaveBeats(ReplicaTempRootCase):
         reloaded = rp.get_replica_status(state['job_id'])
         self.assertEqual(reloaded['beats']['banned_elements'], ['excavator'])
 
+    def test_saving_an_edited_field_invalidates_its_stale_chinese_mirror(self):
+        """前端只回传英文字段，zh 是从上一版原样带回来的——不清理就会出现「中文还是
+        旧的、英文已经改了」，而核对的人看的是中文。"""
+        state = self._job_with_overview()
+        rp.save_beats(state['job_id'], {
+            'video_duration_sec': 10.0, 'banned_elements': [],
+            'beats': [self._beat(zh={'visible_action': '工人干活', 'visible_result': '完成'})]})
+
+        out = rp.save_beats(state['job_id'], {
+            'video_duration_sec': 10.0, 'banned_elements': [],
+            'beats': [self._beat(visible_action='a worker sands it down instead',
+                                 zh={'visible_action': '工人干活', 'visible_result': '完成'})]})
+        self.assertEqual(out['beats']['beats'][0]['zh'], {'visible_result': '完成'})
+
     def test_empty_beats_are_rejected(self):
         state = self._job_with_overview()
         with self.assertRaises(ValueError):
@@ -471,3 +595,38 @@ class TestVariantBranch(ReplicaTempRootCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestComposeFailureTranslation(ReplicaTempRootCase):
+    """预检报错要变成「照着能改」的中文，而不是原样贴一串英文规则。"""
+
+    def _failure(self, detail):
+        from prompt_pipeline import ComposeFailure
+        return ComposeFailure(
+            'Structured scene-state preflight rejected the beat ladder before prompt '
+            f'generation: {detail}', 'QUALITY_GATE_FAILED')
+
+    def test_each_violation_is_translated_and_mapped_back_to_a_beat_id(self):
+        error = self._failure(
+            'Beat 9 declares 1 operations; a frame must carry 2 to 3 tightly coupled '
+            'operations that share one terminal product. | '
+            'Beat 3 declares fewer than two visible persistent traces.')
+        beats = {'beats': [{'id': 'B%02d' % i} for i in range(1, 10)]}
+
+        out = str(rp._translate_compose_failure(error, beats))
+        self.assertIn('第 9 拍只申报了 1 道工序', out)
+        self.assertIn('B09', out)          # 用户在卡点上认得的编号
+        self.assertIn('第 3 拍的「遗留痕迹」少于两条', out)
+        self.assertIn('B03', out)
+        self.assertIn('共 2 项', out)
+        # 原始英文规则不再糊在用户脸上。
+        self.assertNotIn('tightly coupled', out)
+
+    def test_an_untranslated_rule_is_still_shown_rather_than_swallowed(self):
+        error = self._failure('Some rule nobody has translated yet.')
+        out = str(rp._translate_compose_failure(error, {'beats': []}))
+        self.assertIn('Some rule nobody has translated yet.', out)
+
+    def test_unrelated_errors_pass_through_untouched(self):
+        error = RuntimeError('上游网关 503')
+        self.assertIs(rp._translate_compose_failure(error, {'beats': []}), error)

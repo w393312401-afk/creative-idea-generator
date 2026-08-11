@@ -69,25 +69,27 @@ class TestSequenceReviewSystemPromptMilestones(unittest.TestCase):
         self.assertIn('CONCRETE visible detail', prompt)
         self.assertIn('do NOT report it', prompt)
 
-    def test_hard_cut_slot_is_exempt_from_the_threshold_peek_rule(self):
-        """2026-07-28 误杀回归：硬切变体的前提就是过门前看不见室内，切点前那张外部帧的
-        门本该封死；局部审查此前只有一条按桥接变体写死的 peek 规则，把「拱门处木门完全
-        封闭、无法透过门洞预览室内」报成了违规。"""
+    def test_sealed_entry_rule_covers_every_crossing_variant(self):
+        """2026-07-28 误杀回归：切点前那张外部帧的门本该封死，审查却按当年只对桥接变体
+        写死的 peek 规则把「木门完全封闭、无法预览室内」报成违规。TBCP v7 把闭门起帧
+        提级为全变体规则，两条规则因此合并成一条，不再按 [CUT] 标签分流——旧的 peek
+        规则（连同 Monotonic Scale Lock）必须整条消失，否则它会继续要求桥接变体开门。"""
         prompt = pp._local_beat_review_system_prompt()
-        peek_rule = next(line for line in prompt.splitlines()
-                         if line.startswith('- THRESHOLD PEEK ANCHOR QUALIFICATION'))
-        self.assertIn('NOT tagged [CUT]', peek_rule)
+        self.assertNotIn('THRESHOLD PEEK ANCHOR QUALIFICATION', prompt)
+        self.assertNotIn('scale must strictly INCREASE', prompt)
 
-        cut_rule = next(line for line in prompt.splitlines()
-                        if line.startswith('- DECLARED CUT-IN SLOT'))
-        self.assertIn('REQUIRED state', cut_rule)
-        self.assertIn('never report it as a missing interior peek', cut_rule)
+        rule = next(line for line in prompt.splitlines()
+                    if line.startswith('- SEALED ENTRY BEFORE ANY CROSSING'))
+        self.assertIn('[BRIDGE], [BRIDGE TURN] and [CUT] alike', rule)
+        self.assertIn('REQUIRED state', rule)
+        self.assertIn('never report it as a missing interior peek', rule)
+        # 反向判据：外部帧已经开着门、室内可见，这才是本轮要抓的违规
+        self.assertIn('standing open with the interior visible through it IS a violation', rule)
         # 切入只重置机位，不重置施工进度——封套密闭/施工顺序照查
-        self.assertIn('resets the camera only', cut_rule)
-        # 2026-07-30：该槽现在是真实生成的跨越片段，规则不得再说它「不是片段」
-        # ——否则审查会把这段真片段当占位声明放过（也是当年不生成的同一套说法）。
-        self.assertIn('judge that slot as a crossing clip', cut_rule)
-        self.assertNotIn('placeholder', cut_rule.lower())
+        self.assertIn('resets the camera only', rule)
+        # 该槽是真实生成的跨越片段，规则不得再说它「不是片段」
+        self.assertIn('Judge the slot as a crossing clip', rule)
+        self.assertNotIn('placeholder', rule.lower())
 
     def test_global_prompt_only_has_cross_frame_rules(self):
         prompt = pp._global_review_system_prompt()

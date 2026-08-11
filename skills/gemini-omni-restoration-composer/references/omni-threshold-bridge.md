@@ -19,11 +19,23 @@ Carry four records through every prompt and manifest:
 - `space_graph`: named site/primary/secondary nodes and visible connecting edges. Never invent
   an unregistered room.
 
+## Sealed-until-crossed rule (applies to every topology below)
+
+The hardware-open slot opens the entry on camera — that is its milestone — but what lies beyond it
+must stay **unreadable** in that slot's IMAGE: flat unlit darkness in the opening, with no interior
+wall, floor, depth, or registered interior anchor visible through it. State the darkness explicitly.
+
+This is deliberate, and it costs nothing to obey: an opening that shows a small, low-resolution
+patch of interior hands the video model a half-invented fact it then has to match while
+interpolating the crossing, and when it cannot, the space the camera lands in reads as a different
+world — or the camera never fully gets inside. Darkness gives it nothing to reconcile, so the
+interior is generated where it is actually being generated: inside the crossing clip.
+
 ## Topology-adaptive primary entry
 
 ### Vertical axial door — three slots
 
-1. `door_hardware_open`: open the registered leaf and show hinges, latch, gasket and sill.
+1. `door_hardware_open`: open the registered leaf and show hinges, latch, gasket and sill; the opening itself reads as unlit darkness.
 2. `threshold_partial`: cross the sill locally; retain frame and shared floor line.
 3. `interior_establish`: deliver the raw interior from a three-quarter oblique axis.
 

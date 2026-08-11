@@ -56,6 +56,14 @@ const PROMPT_IMPORT_SECTION_RE =
     /^(?:图片|视频|image|video)\s*(?:提示词|提示|prompts?)\s*[:：]?$/i;
 // 纯分隔线
 const PROMPT_IMPORT_RULE_RE = /^(?:-{3,}|={3,}|\*{3,}|_{3,}|—{3,})$/;
+// 合成器输出的分节标记（===TITLE=== / ===THEME=== / ===PROMPTS=== / ===AUDIT===）。
+// 它们不是分隔线（中间夹着字），也不是 Markdown 小标题，所以两条既有规则都拦不住：
+// 直接从 Skill 输出复制过来的集子，末尾那段 `===AUDIT===` + 审核说明会被接到最后
+// 一段视频的正文里，然后原样送去渲染。
+const PROMPT_IMPORT_MARKER_RE = /^={2,}\s*([^=]{1,40}?)\s*={2,}$/;
+// 其中只有「提示词」这一节装的是槽位正文，遇到它是解除断开、不是开始断开
+const PROMPT_IMPORT_MARKER_PROMPTS_RE =
+    /^(?:image|video|图片|视频)?\s*(?:prompts?|提示词|提示)$/i;
 // 代码围栏
 const PROMPT_IMPORT_FENCE_RE = /^\s*(?:```|~~~)/;
 
@@ -130,6 +138,7 @@ function normalizePromptSetText(raw) {
     let preambleLines = 0;
     let fenceLines = 0;
     let droppedHeadings = 0;
+    let droppedMarkers = 0;
     let droppedSectionLines = 0;
     let inlineMoved = 0;
     // 正文中间遇到 Markdown 小标题后置位：它开了文档的新一节（「## 提示词质量审核报告」
@@ -150,7 +159,21 @@ function normalizePromptSetText(raw) {
 
         if (PROMPT_IMPORT_FENCE_RE.test(trimmed)) { fenceLines++; continue; }
         if (PROMPT_IMPORT_RULE_RE.test(trimmed)) continue;
-        if (PROMPT_IMPORT_SECTION_RE.test(stripPromptImportDecorations(trimmed))) continue;
+        const stripped = stripPromptImportDecorations(trimmed);
+        if (PROMPT_IMPORT_SECTION_RE.test(stripped)) continue;
+
+        // ===AUDIT=== / ===THEME=== 这类分节标记：标记行本身丢掉，其下整节内容
+        // 一并丢到下一个槽位头行为止（===PROMPTS=== 反过来，是解除断开）
+        const marker = stripped.match(PROMPT_IMPORT_MARKER_RE);
+        if (marker) {
+            if (PROMPT_IMPORT_MARKER_PROMPTS_RE.test(marker[1])) {
+                skippingSection = false;
+            } else if (current) {
+                droppedMarkers++;
+                skippingSection = true;
+            }
+            continue;
+        }
 
         const header = matchPromptImportHeader(rawLine);
         if (header) {
@@ -209,8 +232,11 @@ function normalizePromptSetText(raw) {
 
     if (fenceLines) fixes.push(`去掉了 ${fenceLines} 行 \`\`\` 代码围栏`);
     if (preambleLines) fixes.push(`丢弃了提示词集之前的 ${preambleLines} 行说明文字`);
-    if (droppedHeadings) {
-        fixes.push(`丢弃了 ${droppedHeadings} 处 Markdown 小标题`
+    if (droppedHeadings || droppedMarkers) {
+        const what = [];
+        if (droppedHeadings) what.push(`${droppedHeadings} 处 Markdown 小标题`);
+        if (droppedMarkers) what.push(`${droppedMarkers} 处 ===XXX=== 分节标记`);
+        fixes.push(`丢弃了 ${what.join(' 和 ')}`
             + (droppedSectionLines ? `及其下的 ${droppedSectionLines} 行内容` : '')
             + '（不属于任何一拍，如附在末尾的质量审核报告）');
     }

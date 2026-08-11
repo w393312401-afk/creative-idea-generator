@@ -50,6 +50,26 @@ function replicaPhaseIndex(stage) {
     return at < 0 ? 0 : at;
 }
 
+// 节拍自己的施工阶段（beat.stage）。与 prompt_pipeline/reverse.py 的 _STAGE_LABELS_ZH
+// 同源同义——那九个值是 Pass B 的闭集枚举，直接摆英文等于让核对的人先查一遍词典。
+const REPLICA_BEAT_STAGE_LABELS = {
+    demolition: '拆除清运',
+    structural: '结构修复',
+    rough_in: '隐蔽工程',
+    enclosure: '封板封闭',
+    surface: '面层饰面',
+    floor: '地面收尾',
+    fixtures: '灯具设备',
+    furnishing: '家具软装',
+    reveal: '成品揭示',
+};
+
+// 节拍卡片上按「一行一条」编辑的数组字段（timelapse-beats.schema.json 里的 array 项）。
+const REPLICA_LIST_FIELDS = new Set([
+    'package_operations', 'persistent_traces', 'visible_details', 'source_event_ids',
+    'evidence_frames', 'reference_frames',
+]);
+
 const REPLICA_AXES = [
     { key: 'carrier', label: '载体替换', hint: '石屋 → 废弃巴士 / 船舱 / 地窖' },
     { key: 'environment', label: '地域环境', hint: '江南 → 北欧 / 沙漠' },
@@ -59,6 +79,94 @@ const REPLICA_AXES = [
 ];
 
 const REPLICA_MAX_AXES = 2;
+
+/* --- 反推段的模型与采样档位 ---
+ *
+ * 反推（Pass A 逐帧识别 + 峰值帧复核）此前只能改配置文件：`frameFactsModel` /
+ * `peakVerifyModel` 两个键在 UI 上不存在，页面上的「LLM 模型」选择器管的是激发/
+ * 合成那条链路，改它对反推毫无影响。而这两步恰恰是整条复刻线上最吃模型能力的
+ * 地方——flash 读不出材料标签和完成范围，节拍就从源头错了。所以把它们摆到成本
+ * 确认卡点上，和帧数、调用次数一起看。
+ *
+ * 模型清单直接复用 js/state.js 的 LLM_MODEL_GROUPS（不抄第二份；那边加了模型这里
+ * 自动就有）。state.js 没加载时退回一份最小清单，保证选择器不会变成空下拉。
+ */
+const REPLICA_FALLBACK_MODELS = [
+    { value: 'gemini-3.6-flash-high', label: 'gemini-3.6-flash-high' },
+    { value: 'gemini-3.1-pro-high', label: 'gemini-3.1-pro-high' },
+];
+
+const REPLICA_PASS_A_DEFAULT_MODEL = 'gemini-3.6-flash-high';
+
+function replicaModelChoices() {
+    const groups = typeof LLM_MODEL_GROUPS !== 'undefined' ? LLM_MODEL_GROUPS : null;
+    if (!groups) return REPLICA_FALLBACK_MODELS.slice();
+    return ['gemini', 'gpt', 'claude']
+        .flatMap(key => (groups[key] || []).map(m => ({ value: m.value, label: m.label })));
+}
+
+// 下拉里出现的值不一定在清单里（配置文件里手写过一个自定义模型名）：把当前值补进去，
+// 否则下拉会自己跳到第一项，用户一保存就把配置文件里的选择改掉了。
+function replicaModelSelect(id, current, extraOptions) {
+    const choices = replicaModelChoices();
+    const options = (extraOptions || []).concat(choices);
+    const cur = String(current == null ? '' : current);
+    if (cur && !options.some(o => o.value === cur)) {
+        options.push({ value: cur, label: `${cur}（自定义）` });
+    }
+    return `<select id="${id}" class="replica-select">${options.map(o => `
+        <option value="${escapeHtmlReplica(o.value)}" ${o.value === cur ? 'selected' : ''}
+        >${escapeHtmlReplica(o.label)}</option>`).join('')}</select>`;
+}
+
+// 反推段的模型选择写回全局 config + localStorage，和激发页脚的模型选择器同一套
+// 持久化（'spark_config'）——服务端读的是请求体里的 config，不另开一条存储。
+function replicaSetConfigValue(key, value) {
+    if (typeof config === 'undefined' || !config) return;
+    config[key] = value;
+    try {
+        localStorage.setItem('spark_config', JSON.stringify(config));
+    } catch (e) {
+        console.warn('[replica] 配置写入 localStorage 失败', e);
+    }
+}
+
+function replicaConfigValue(key, fallback) {
+    const cfg = typeof config !== 'undefined' && config ? config : {};
+    const v = cfg[key];
+    return v === undefined || v === null || v === '' ? fallback : v;
+}
+
+// 抽帧密度档位。与 replica_pipeline.EXTRACT_FPS_CHOICES 同值同序；服务端会把认不出
+// 的值回落到默认档，这里只负责把选项摆出来。
+const REPLICA_FPS_CHOICES = [
+    { value: 1, label: '1 fps（每秒 1 张，只看大轮廓）' },
+    { value: 2, label: '2 fps（默认，延时片调过的基线）' },
+    { value: 3, label: '3 fps' },
+    { value: 4, label: '4 fps（慢工序推荐：刮腻子、铺砖）' },
+    { value: 6, label: '6 fps（最密，抽帧耗时最长）' },
+];
+const REPLICA_DEFAULT_FPS = 2;
+
+function replicaCurrentFps(state) {
+    const v = state && state.sampling && state.sampling.base_fps;
+    return REPLICA_FPS_CHOICES.some(c => c.value === Number(v)) ? Number(v) : REPLICA_DEFAULT_FPS;
+}
+
+// 单选框的 value → 后端档位名。'full' 这个 value 是三档之前留下来的（那时只有
+// 完整/降级两档），后端叫它 'plan'——改 value 会让浏览器里缓存着旧页面的人静默换档，
+// 所以在这里翻译，而不是去动 HTML。
+const REPLICA_SCOPE_BY_MODE = { all: 'all', full: 'plan', degraded: 'degraded' };
+
+function replicaScopeFromMode(value) {
+    return REPLICA_SCOPE_BY_MODE[value] || 'plan';
+}
+
+function replicaFpsSelect(id, current) {
+    return `<select id="${id}" class="replica-select">${REPLICA_FPS_CHOICES.map(c => `
+        <option value="${c.value}" ${c.value === current ? 'selected' : ''}
+        >${escapeHtmlReplica(c.label)}</option>`).join('')}</select>`;
+}
 
 /* --- API --- */
 
@@ -141,6 +249,9 @@ function replicaRender() {
     // 露出来）之后不重新落一次 busy，整排按钮就又可点了——用户能在 Pass A 跑到一半时
     // 再点一次「开始反推」。
     if (replicaBusy) replicaSetBusy(true);
+    // 重建 DOM 也会把进度条清空（它是 JS 直接写进去的，不在模板里）。跑着的时候
+    // 重渲染之后必须把当前进度重新画一遍，否则一次 replicaRender() 就让进度归零。
+    if (replicaSSE && replicaProgress) replicaProgressPaint();
 }
 
 function replicaRenderUploader() {
@@ -148,11 +259,15 @@ function replicaRenderUploader() {
     <div class="replica-card replica-uploader">
         <div class="replica-card-title">上传成品视频</div>
         <p class="replica-hint">
-            抽帧密度按延时视频调过（基线 2fps + 状态跳变密采 + 首尾密采），不需要你调参数。
-            上传后会先给出待送审帧数与调用次数预估，确认了才开始烧钱。
+            抽帧密度默认按延时视频调过（基线 2fps + 状态跳变密采 + 首尾密采）。慢工序
+            （刮腻子、铺砖这类两张之间就跨过半个工序的）可以往上调——抽帧是本地 ffmpeg，
+            不花模型钱，只是更慢。上传后会先给出待送审帧数与调用次数预估，确认了才开始烧钱。
         </p>
         <div class="replica-row">
             <input type="file" id="replica-file" accept="video/*" class="replica-file-input">
+            <label class="replica-inline-field">抽帧密度
+                ${replicaFpsSelect('replica-upload-fps', REPLICA_DEFAULT_FPS)}
+            </label>
             <button type="button" id="replica-upload-btn" class="action-btn primary-btn">上传并抽帧</button>
         </div>
         <div id="replica-upload-status" class="replica-status"></div>
@@ -217,6 +332,7 @@ function replicaRenderExtract(state) {
     const est = state.cost_estimate || {};
     const full = est.full || {};
     const degraded = est.degraded || {};
+    const every = est.all || {};
     // 采样档位选择框任何时候都渲染。
     //
     // 原先的判据是 `canStart = !hasBeats`：一旦跑出过节拍就再也看不到这对单选框，
@@ -229,6 +345,8 @@ function replicaRenderExtract(state) {
     const atCostGate = state.stage === 'confirm_cost';
     const startLabel = atCostGate ? '确认并开始反推'
         : (isRetry ? '重试反推' : (hasBeats ? '换档位重跑反推' : '开始反推'));
+    const scope = state.review_scope || (state.degraded ? 'degraded' : 'plan');
+    const fps = replicaCurrentFps(state);
 
     return `
     <div class="replica-section">
@@ -236,35 +354,83 @@ function replicaRenderExtract(state) {
         <div class="replica-metrics">
             <span>时长 ${ov.duration_sec ?? '—'}s</span>
             <span>抽帧 ${ov.frame_count ?? '—'} 张</span>
+            <span>基线 ${fps} fps</span>
             <span>变化事件 ${ov.change_event_count ?? '—'} 个</span>
             <span>送审计划 ${(ov.analysis_plan || {}).mode || '—'}</span>
         </div>
-        ${collage ? `<a href="${collage}" target="_blank" class="replica-collage-link">
-            <img class="replica-collage" src="${collage}" alt="关键帧拼贴图" loading="lazy">
-        </a>` : `<div class="replica-banner replica-banner-error">
+        <div class="replica-reextract">
+            <label class="replica-inline-field">抽帧密度
+                ${replicaFpsSelect('replica-base-fps', fps)}
+            </label>
+            <button type="button" id="replica-reextract-btn" class="action-btn text-btn">
+                按新密度重抽帧
+            </button>
+            <p class="replica-hint">
+                抽出来的帧太少（事件之间的推进看不出来）就往上调一档再抽一次。抽帧不花
+                模型钱，但<b>会作废这条任务已有的帧事实与节拍</b>：帧文件名是序号不是
+                时间戳，换了密度同一个名字指向的是另一时刻的画面，所以旧的读数必须全丢。
+            </p>
+        </div>
+        ${collage ? `<img class="replica-collage" id="replica-collage" src="${collage}"
+             alt="关键帧拼贴图" title="点开看大图" loading="lazy">`
+        : `<div class="replica-banner replica-banner-error">
             拼贴图缺失。它是节拍映射的前置门禁，缺了等于没看过整条序列就要定义节拍。</div>`}
         <div class="replica-cost">
             ${atCostGate ? `<p class="replica-hint replica-cost-gate">
                 <b>抽帧已完成，还没有开始花钱。</b>Pass A 是整条线的成本大头——
-                下面两档决定送多少帧给多模态模型，选好再按开始。
+                下面三档决定送多少帧给多模态模型，选好再按开始。
             </p>` : ''}
             <label class="replica-radio">
-                <input type="radio" name="replica-mode" value="full" ${state.degraded ? '' : 'checked'}>
-                <span>完整（${full.frame_count || 0} 帧 / 约 ${full.batch_count || 0} 次视觉调用）</span>
+                <input type="radio" name="replica-mode" value="all" ${scope === 'all' ? 'checked' : ''}>
+                <span>全部（${every.frame_count || 0} 帧 / 约 ${every.batch_count || 0} 次视觉调用）——
+                      抽出来多少送多少，识别最密、也最贵</span>
             </label>
             <label class="replica-radio">
-                <input type="radio" name="replica-mode" value="degraded" ${state.degraded ? 'checked' : ''}>
+                <input type="radio" name="replica-mode" value="full" ${scope === 'plan' ? 'checked' : ''}>
+                <span>计划（${full.frame_count || 0} 帧 / 约 ${full.batch_count || 0} 次）——
+                      脚本的送审计划：长片只挑约四成 + 每秒至少一张</span>
+            </label>
+            <label class="replica-radio">
+                <input type="radio" name="replica-mode" value="degraded" ${scope === 'degraded' ? 'checked' : ''}>
                 <span>降级（${degraded.frame_count || 0} 帧 / 约 ${degraded.batch_count || 0} 次）——
                       只读事件的起止与峰值帧，<b>事件之间发生了什么全靠推断，节拍精度更低</b></span>
             </label>
+            <p class="replica-hint">
+                觉得「识别的图片太少」时先看这里：抽出来的 ${ov.frame_count ?? '—'} 张里，
+                计划档只送 ${full.frame_count || 0} 张。要更密就选「全部」；抽出来的总数
+                本身不够，则回上面调抽帧密度重抽。
+            </p>
+            <div class="replica-model-picker">
+                <div class="replica-card-subtitle">反推模型</div>
+                <label class="replica-inline-field">逐帧识别（Pass A）
+                    ${replicaModelSelect('replica-frame-model',
+                        replicaConfigValue('frameFactsModel', REPLICA_PASS_A_DEFAULT_MODEL))}
+                </label>
+                <label class="replica-inline-field">峰值帧复核
+                    ${replicaModelSelect('replica-peak-model',
+                        replicaConfigValue('peakVerifyModel', ''),
+                        [{ value: '', label: '跟随主模型（默认）' },
+                         { value: 'off', label: '关闭复核（省这几次调用）' }])}
+                </label>
+                <p class="replica-hint">
+                    逐帧识别读的是材料标签、工具类型、完成范围这类细节，模型弱一档就会
+                    读糊，而节拍阶梯完全建在这些读数上。便宜的 flash 打底 + 强模型复核
+                    峰值帧是默认组合；对精度不满意就把逐帧识别也换成强模型，代价是
+                    ${full.batch_count || 0} 次调用全部按强模型计价。
+                    ${state.facts && state.facts.model
+                        ? `上一轮实际用的是 <code>${escapeHtmlReplica(state.facts.model)}</code>。` : ''}
+                </p>
+            </div>
             ${full.peak_frame_count ? `<p class="replica-hint">
                 另加 ${full.peak_batch_count || 0} 次峰值帧复核（${full.peak_frame_count} 张）。
-                节拍边界恰好落在这几帧上，读糊了整条阶梯会整体错位，所以默认开；
-                要关就把配置里的 <code>peakVerifyModel</code> 设成 <code>off</code>。
+                节拍边界恰好落在这几帧上，读糊了整条阶梯会整体错位，所以默认开。
             </p>` : ''}
             ${isRetry ? `<p class="replica-hint">
                 ${state.facts ? `已读过 ${state.facts.frame_count || 0} 帧，帧事实走磁盘缓存——
-                     重试只重跑聚类，不会重付视觉调用的钱。` : '上次没跑完，可以直接重试。'}
+                     同一档、同一个逐帧识别模型重试不重付视觉调用的钱；换到更密的一档只
+                     补付新增的那些帧。<b>换了逐帧识别模型则会全部重读</b>（缓存按模型分桶，
+                     不然新模型的钱付了、拿到的还是旧模型的读数），换回去仍然免费。`
+                    : '上次没跑完，可以直接重试。'}
             </p>` : ''}
             ${hasBeats && !atCostGate ? `<p class="replica-hint">
                 已经有一份节拍阶梯了。换档位重跑会覆盖它——你在下面改过的内容会丢。
@@ -281,10 +447,122 @@ function replicaRenderProgress() {
     // 按钮去按它——一轮跑错了的 Pass A 此前只能干等它烧完。
     const running = !!replicaSSE;
     return `
-    <div id="replica-progress" class="replica-progress" style="display:${running ? 'block' : 'none'};"></div>
+    <div id="replica-progress" class="replica-progress" style="display:${running ? 'block' : 'none'};">
+        <div class="replica-progress-head">
+            <span class="replica-chip" id="replica-progress-stage"></span>
+            <span id="replica-progress-label"></span>
+            <span class="replica-progress-percent" id="replica-progress-percent"></span>
+        </div>
+        <div class="replica-progress-track"><div class="replica-progress-fill" id="replica-progress-fill"></div></div>
+        <ul class="replica-progress-log" id="replica-progress-log"></ul>
+    </div>
     ${running ? `<div class="replica-actions">
         <button type="button" id="replica-cancel-btn" class="action-btn text-btn">中断这一轮</button>
     </div>` : ''}`;
+}
+
+/* --- 进度模型 ---
+ *
+ * 复刻线最长的那一段（合成提示词）此前在这个页面上是**完全静默**的：合成器一路广播
+ * outline / batch / batch_generating / beat_ready 这些事件，页面却只监听 replica_stage，
+ * 于是用户看到的是「正在按 9 拍阶梯合成提示词…」这一句，然后干等好几分钟。
+ * 这里把两路合并成一条进度：replica_stage 决定处在哪个大阶段（给出百分比区间），
+ * 合成器的事件在 compose 那一段里给出段内进度，文案直接复用 ProgressModel
+ * （js/progress_model.js，与主生成页同一套口径，不另抄一份）。
+ */
+
+// 每个 replica stage 在整条进度上的区间。
+const REPLICA_STAGE_RANGE = {
+    ingest: [0, 3], extract: [3, 15], confirm_cost: [15, 15],
+    review_frames: [15, 45], cluster_beats: [45, 68], mutate_beats: [45, 68],
+    review_beats: [68, 68],
+    compose: [68, 94], audit: [94, 99], audit_failed: [99, 99], completed: [100, 100],
+};
+
+// 合成器自己的事件（progress_model 认得的那一套）。beat_ready 单独处理：它带的是
+// 「第几拍的提示词已经产出」，是这一段里唯一能给出真实分子/分母的信号。
+const REPLICA_COMPOSER_EVENTS = [
+    'outline', 'batch', 'batch_generating', 'batch_generated', 'batch_retry',
+    'batch_failed', 'compose_soft_timeout', 'audit', 'repair', 'beat_ready',
+];
+
+let replicaProgress = null;
+
+function replicaResetProgress() {
+    replicaProgress = {
+        stage: '',
+        range: [0, 100],
+        percent: 0,
+        label: '',
+        log: [],
+        composeState: (window.ProgressModel && window.ProgressModel.createProgressState('compose')) || null,
+    };
+}
+
+function replicaProgressPaint() {
+    const root = replicaRoot();
+    const box = root && root.querySelector('#replica-progress');
+    if (!box || !replicaProgress) return;
+    box.style.display = 'block';
+    const set = (id, text) => {
+        const el = box.querySelector(id);
+        if (el) el.textContent = text;
+    };
+    set('#replica-progress-stage', replicaStageLabel(replicaProgress.stage) || '进行中');
+    set('#replica-progress-label', replicaProgress.label || '');
+    set('#replica-progress-percent', `${Math.round(replicaProgress.percent)}%`);
+    const fill = box.querySelector('#replica-progress-fill');
+    if (fill) fill.style.width = `${Math.max(2, Math.min(100, replicaProgress.percent))}%`;
+    const log = box.querySelector('#replica-progress-log');
+    if (log) {
+        log.innerHTML = replicaProgress.log
+            .map(line => `<li>${escapeHtmlReplica(line)}</li>`).join('');
+    }
+}
+
+// 百分比只增不减：几路事件交替到达时来回跳的进度条比没有进度条更让人不安。
+function replicaProgressUpdate(percent, label, stage) {
+    if (!replicaProgress) replicaResetProgress();
+    if (stage) replicaProgress.stage = stage;
+    if (Number.isFinite(percent)) {
+        replicaProgress.percent = Math.max(replicaProgress.percent, Math.min(100, percent));
+    }
+    if (label && label !== replicaProgress.label) {
+        replicaProgress.label = label;
+        // 只留最近 6 条，且不重复上一条——批量合成会连着推很多条同文案的事件。
+        if (replicaProgress.log[replicaProgress.log.length - 1] !== label) {
+            replicaProgress.log.push(label);
+            replicaProgress.log = replicaProgress.log.slice(-6);
+        }
+    }
+    replicaProgressPaint();
+}
+
+function replicaHandleStageEvent(detail) {
+    const stage = (detail && detail.stage) || '';
+    const range = REPLICA_STAGE_RANGE[stage] || replicaProgress.range || [0, 100];
+    replicaProgress.range = range;
+    // 进入一个新阶段时先落到它的区间起点，段内进度由该阶段自己的事件推进。
+    replicaProgressUpdate(range[0], (detail && detail.message) || '', stage);
+}
+
+function replicaHandleComposerEvent(type, detail) {
+    if (!replicaProgress) replicaResetProgress();
+    const [lo, hi] = REPLICA_STAGE_RANGE[replicaProgress.stage] || REPLICA_STAGE_RANGE.compose;
+
+    if (type === 'beat_ready') {
+        const total = Number(detail && detail.total) || 0;
+        const index = Number(detail && detail.index) || 0;
+        const ratio = total ? Math.min(1, index / total) : 0;
+        replicaProgressUpdate(lo + ratio * (hi - lo),
+            total ? `已产出第 ${index}/${total} 拍的提示词` : '提示词逐拍产出中');
+        return;
+    }
+    if (!window.ProgressModel) return;
+    const out = window.ProgressModel.normalizeGenerationProgress(
+        type, detail, 'compose', replicaProgress.composeState);
+    replicaProgress.composeState = out.state;
+    replicaProgressUpdate(lo + (Number(out.percent) || 0) / 100 * (hi - lo), out.label);
 }
 
 function replicaRenderBeats(state) {
@@ -328,6 +606,8 @@ function replicaRenderBeats(state) {
             <button type="button" id="replica-save-btn" class="action-btn text-btn">保存并重校验</button>
             <button type="button" id="replica-recluster-btn" class="action-btn text-btn"
                     title="帧事实走缓存，不会重付视觉调用的钱">重跑聚类</button>
+            <button type="button" id="replica-translate-btn" class="action-btn text-btn"
+                    title="只翻译，不改英文原文。改过英文的字段中文会先作废，按这里补回来">重译中文</button>
             <button type="button" id="replica-compose-btn" class="action-btn primary-btn"
                     ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词</button>
         </div>
@@ -338,16 +618,30 @@ function replicaRenderBeats(state) {
 function replicaRenderBeatCard(state, beat, idx) {
     const frames = beat.evidence_frames || beat.reference_frames || [];
     const isRef = !beat.evidence_frames && (beat.reference_frames || []).length;
-    const thumbs = frames.map(name => `
-        <a href="${replicaFrameUrl(state, name)}" target="_blank" title="${escapeHtmlReplica(name)}">
-            <img class="replica-thumb" src="${replicaFrameUrl(state, name)}" alt="${escapeHtmlReplica(name)}" loading="lazy">
-        </a>`).join('');
+    // 证据帧原地开灯箱，不再 target="_blank"。核对是「看一眼帧、回来改这一拍」的
+    // 来回动作，每看一帧就多一个标签页，用户得自己收拾一地窗口才能回到编辑器。
+    // 灯箱走全局的那一份（js/lightbox.js）：点空白处 / Esc / 关闭键都能返回，
+    // 同一拍的多张帧还能左右翻。
+    const thumbs = frames.map((name, at) => `
+        <img class="replica-thumb" src="${replicaFrameUrl(state, name)}"
+             alt="${escapeHtmlReplica(name)}" title="${escapeHtmlReplica(name)}" loading="lazy"
+             data-lightbox-beat="${idx}" data-lightbox-at="${at}">`).join('');
+
+    // 中文对照：反推产出的是英文（下游提示词、相位判定、banned 门禁读的都是它），
+    // 但人工卡点是给人看的。zh 只在这里显示，永远不回写英文字段。
+    const zh = beat.zh || {};
+    const mirror = (key) => {
+        const value = zh[key];
+        const text = Array.isArray(value) ? value.join(' / ') : value;
+        return text ? `<span class="replica-field-zh">${escapeHtmlReplica(text)}</span>` : '';
+    };
 
     const field = (key, label, rows = 1) => `
         <label class="replica-field">
             <span class="replica-field-label">${label}</span>
             <textarea class="replica-textarea" rows="${rows}" data-beat="${idx}" data-key="${key}"
                 >${escapeHtmlReplica(Array.isArray(beat[key]) ? beat[key].join('\n') : beat[key])}</textarea>
+            ${mirror(key)}
         </label>`;
 
     return `
@@ -355,7 +649,8 @@ function replicaRenderBeatCard(state, beat, idx) {
         <div class="replica-beat-head">
             <b>${escapeHtmlReplica(beat.id)}</b>
             <span class="replica-chip">${beat.start}s – ${beat.end}s</span>
-            <span class="replica-chip">${escapeHtmlReplica(beat.stage || '未分类')}</span>
+            <span class="replica-chip" title="${escapeHtmlReplica(beat.stage || '')}">${escapeHtmlReplica(
+                REPLICA_BEAT_STAGE_LABELS[beat.stage] || beat.stage || '未分类')}</span>
             ${beat.source_event_ids && beat.source_event_ids.length
                 ? `<span class="replica-chip">事件 ${escapeHtmlReplica(beat.source_event_ids.join(','))}</span>` : ''}
             <span class="replica-chip">${beat.workers_present ? '有工人' : '清场帧（锚点候选）'}</span>
@@ -372,6 +667,8 @@ function replicaRenderBeatCard(state, beat, idx) {
         <div class="replica-beat-fields">
             ${field('visual_subject', '画面主体')}
             ${field('operation', '主导工序')}
+            ${field('package_operations',
+                    `工序包（一行一道，须 2~3 道；当前 ${(beat.package_operations || []).length} 道）`, 2)}
             ${field('visible_action', '可见动作', 2)}
             ${field('visible_result', '可见结果', 2)}
             ${field('state_before', '起始状态（须写具体空间完成范围）', 2)}
@@ -446,6 +743,11 @@ function replicaBindEvents() {
 
     on('#replica-upload-btn', replicaUpload);
     on('#replica-start-btn', replicaStart);
+    on('#replica-reextract-btn', replicaReExtract);
+    // 模型选择改一下就落盘，不必等到点「开始反推」：用户很可能选完就去点了别的动作
+    // （比如 recluster），那条路径读的是 config，没落盘就等于没选。
+    on('#replica-frame-model', replicaCaptureReverseModels, 'change');
+    on('#replica-peak-model', replicaCaptureReverseModels, 'change');
     on('#replica-recompose-btn', replicaCompose);
     on('#replica-render-btn', replicaSendToRender);
     on('#replica-cancel-btn', replicaCancelRun);
@@ -482,7 +784,25 @@ function replicaBindEvents() {
         });
     });
 
+    on('#replica-collage', () => replicaOpenLightbox([{
+        url: replicaCollageUrl(replicaState),
+        caption: '关键帧拼贴图（整条序列的一览）',
+    }], 0));
+
     replicaBindBeatEvents(root);
+}
+
+// 原地开图：点空白处 / Esc / 关闭键返回，多张帧可左右翻。
+// 走全局灯箱（js/lightbox.js），不自造第二个——控制台与主页面已经共用它了。
+// 灯箱不可用时退回新窗口，宁可多一个标签页也不能点了没反应。
+function replicaOpenLightbox(items, index) {
+    const usable = (items || []).filter(x => x && x.url);
+    if (!usable.length) return;
+    if (typeof openLightbox === 'function') {
+        openLightbox(usable, Math.max(0, Math.min(index || 0, usable.length - 1)));
+        return;
+    }
+    window.open(usable[Math.max(0, index || 0)].url, '_blank');
 }
 
 // 节拍区自己的绑定，单独一函数。
@@ -499,8 +819,31 @@ function replicaBindBeatEvents(scope) {
 
     on('#replica-save-btn', (e) => replicaSaveBeats(true, e.currentTarget));
     on('#replica-recluster-btn', (e) => replicaAdvance('recluster', {}, e.currentTarget));
+    // 先落盘再翻译：翻译在服务端读的是已保存的那一份，不先保存就会翻旧的英文。
+    on('#replica-translate-btn', async (e) => {
+        const btn = e.currentTarget;
+        if (!(await replicaSaveBeats(false, btn))) {
+            replicaToast('保存失败，未翻译', true);
+            return;
+        }
+        replicaAdvance('translate', {}, btn);
+    });
     on('#replica-compose-btn', (e) => replicaCompose(e.currentTarget));
     on('#replica-variant-btn', (e) => replicaVariant(e.currentTarget));
+
+    // 证据帧：原地开灯箱。一拍的几张帧作为一组传进去，左右方向键就能在同一拍内翻。
+    scope.querySelectorAll('[data-lightbox-beat]').forEach(img => {
+        img.addEventListener('click', () => {
+            const beats = ((replicaState || {}).beats || {}).beats || [];
+            const beat = beats[parseInt(img.dataset.lightboxBeat, 10)];
+            if (!beat) return;
+            const frames = beat.evidence_frames || beat.reference_frames || [];
+            replicaOpenLightbox(frames.map(name => ({
+                url: replicaFrameUrl(replicaState, name),
+                caption: `${beat.id || ''} ${name}`,
+            })), parseInt(img.dataset.lightboxAt, 10) || 0);
+        });
+    });
 
     scope.querySelectorAll('[data-split]').forEach(btn => {
         btn.addEventListener('click', () => replicaSplitBeat(parseInt(btn.dataset.split, 10)));
@@ -518,7 +861,10 @@ function replicaBindBeatEvents(scope) {
             const target = beat[parseInt(el.dataset.beat, 10)];
             if (!target) return;
             const key = el.dataset.key;
-            target[key] = Array.isArray(target[key])
+            // 数组字段按键名判定，不看当前值的类型：老任务里可能压根没有这个键
+            // （undefined 不是数组），一次编辑就会把一个数组字段写成字符串，
+            // 保存时 schema 校验直接判死。
+            target[key] = (REPLICA_LIST_FIELDS.has(key) || Array.isArray(target[key]))
                 ? el.value.split('\n').map(s => s.trim()).filter(Boolean)
                 : el.value.trim();
         });
@@ -603,6 +949,8 @@ async function replicaUpload() {
     const input = replicaRoot().querySelector('#replica-file');
     const file = input && input.files && input.files[0];
     if (!file) { replicaToast('请先选择一个视频文件', true); return; }
+    const fpsEl = replicaRoot().querySelector('#replica-upload-fps');
+    const baseFps = fpsEl ? Number(fpsEl.value) : REPLICA_DEFAULT_FPS;
 
     replicaSetBusy(true);
     replicaToast(`正在上传 ${file.name}（${(file.size / 1048576).toFixed(1)} MB）…`);
@@ -621,7 +969,7 @@ async function replicaUpload() {
         // 只续抽帧，不续 Pass A。原先这里 `await replicaStart()` 一路跑到 Pass B，
         // 成本预估在中途作为一行文案闪过，用户没有任何机会介入——那正是「先确认再
         // 烧钱」这道卡点形同虚设的原因。
-        if (!data.reused) await replicaExtract();
+        if (!data.reused) await replicaExtract(baseFps);
     } catch (e) {
         replicaToast(e.message, true);
     } finally {
@@ -629,13 +977,17 @@ async function replicaUpload() {
     }
 }
 
-async function replicaExtract() {
+async function replicaExtract(baseFps) {
     if (!replicaState) return;
     replicaSetBusy(true);
     try {
         const data = await replicaFetch('/api/replica/extract', {
             method: 'POST', headers: replicaHeaders(),
-            body: JSON.stringify({ job_id: replicaState.job_id, config: replicaConfig() }),
+            body: JSON.stringify({
+                job_id: replicaState.job_id,
+                base_fps: baseFps == null ? undefined : Number(baseFps),
+                config: replicaConfig(),
+            }),
         });
         replicaTaskId = data.task_id;
         replicaOpenSSE(replicaTaskId);
@@ -646,15 +998,51 @@ async function replicaExtract() {
     }
 }
 
+// 换密度重抽帧。已有的帧事实与节拍会作废（帧名是序号不是时间戳，见后端
+// _purge_extract_products），所以先问一句再动。
+async function replicaReExtract() {
+    if (!replicaState) return;
+    const fpsEl = replicaRoot().querySelector('#replica-base-fps');
+    const baseFps = fpsEl ? Number(fpsEl.value) : REPLICA_DEFAULT_FPS;
+    if (baseFps === replicaCurrentFps(replicaState)) {
+        replicaToast('抽帧密度没变，不必重抽。先在左边选一个新的密度。', true);
+        return;
+    }
+    const hasWork = !!(replicaState.facts
+        || (replicaState.beats && (replicaState.beats.beats || []).length));
+    if (hasWork && !window.confirm(
+        `按 ${baseFps}fps 重抽帧？这条任务已有的帧事实与节拍会一并作废（帧文件名是序号，`
+        + '换了密度就对不上原来的时刻），Pass A 需要重跑、重新付费。')) return;
+    await replicaExtract(baseFps);
+}
+
+// 反推段的模型选择：先落进全局 config（写 localStorage），再随请求体发出去。
+// 落盘是为了下一条任务、下一次开页面还是这个选择——不落的话每次都回默认值，
+// 用户会以为自己选过了。
+function replicaCaptureReverseModels() {
+    const root = replicaRoot();
+    if (!root) return;
+    const frameEl = root.querySelector('#replica-frame-model');
+    if (frameEl) replicaSetConfigValue('frameFactsModel', frameEl.value);
+    const peakEl = root.querySelector('#replica-peak-model');
+    // 空值 = 跟随主模型：写空字符串，reverse._peak_verify_model 会回落到 config.model。
+    if (peakEl) replicaSetConfigValue('peakVerifyModel', peakEl.value);
+}
+
 async function replicaStart() {
     if (!replicaState) return;
     const modeEl = replicaRoot().querySelector('input[name="replica-mode"]:checked');
-    const degraded = modeEl ? modeEl.value === 'degraded' : false;
+    const scope = replicaScopeFromMode(modeEl && modeEl.value);
+    replicaCaptureReverseModels();
     replicaSetBusy(true);
     try {
         const data = await replicaFetch('/api/replica/start', {
             method: 'POST', headers: replicaHeaders(),
-            body: JSON.stringify({ job_id: replicaState.job_id, degraded, config: replicaConfig() }),
+            body: JSON.stringify({
+                job_id: replicaState.job_id, scope,
+                degraded: scope === 'degraded',   // 老服务端只认这个键
+                config: replicaConfig(),
+            }),
         });
         replicaTaskId = data.task_id;
         replicaOpenSSE(replicaTaskId);
@@ -803,24 +1191,42 @@ function replicaMergeBeat(idx) {
 
 /* --- SSE --- */
 
+// 服务端的 SSE 帧统一是 {"type": ..., "data": ...}（见 server._open_sse_stream）。
+// 此前这个文件到处直接读 JSON.parse(e.data).stage / .message —— 读的是信封而不是信，
+// 恒为 undefined：进度框里那个 chip 一直是空的、失败提示恒为「任务失败」四个字。
+// 老格式（不带信封）也一并兼容，免得 replay 的历史事件形态不同就炸。
+function replicaEventPayload(event) {
+    if (!event || !event.data) return null;
+    let parsed;
+    try {
+        parsed = JSON.parse(event.data);
+    } catch (err) {
+        return null;
+    }
+    if (parsed && typeof parsed === 'object' && 'type' in parsed && 'data' in parsed) {
+        return parsed.data;
+    }
+    return parsed;
+}
+
 function replicaOpenSSE(taskId) {
     if (replicaSSE) replicaSSE.close();
     const code = typeof ACCESS_CODE !== 'undefined' ? ACCESS_CODE : '';
     replicaSSE = new EventSource(
         `/api/compose-stream?task_id=${encodeURIComponent(taskId)}${code ? '&access_code=' + encodeURIComponent(code) : ''}`);
 
-    const progress = () => replicaRoot() && replicaRoot().querySelector('#replica-progress');
+    replicaResetProgress();
 
     replicaSSE.addEventListener('replica_stage', (e) => {
-        try {
-            const d = JSON.parse(e.data);
-            const el = progress();
-            if (el) {
-                el.style.display = 'block';
-                el.innerHTML = `<span class="replica-chip">${escapeHtmlReplica(
-                    replicaStageLabel(d.stage))}</span> ${escapeHtmlReplica(d.message || '')}`;
-            }
-        } catch (err) { /* 单条事件解析失败不该打断整条流 */ }
+        replicaHandleStageEvent(replicaEventPayload(e) || {});
+    });
+
+    // 合成器的事件此前没有任何监听器：整个 compose 阶段（复刻线最长的一段）在页面上
+    // 表现为一句话之后长时间静止，用户无从判断是在跑还是已经卡死。
+    REPLICA_COMPOSER_EVENTS.forEach(type => {
+        replicaSSE.addEventListener(type, (e) => {
+            replicaHandleComposerEvent(type, replicaEventPayload(e));
+        });
     });
 
     const finish = async (msg, isError) => {
@@ -847,8 +1253,7 @@ function replicaOpenSSE(taskId) {
         audit_failed: '命中禁用元素，已拦下交付（未入库）。见下方提示词区。',
     };
     replicaSSE.addEventListener('replica_paused', (e) => {
-        let stage = '';
-        try { stage = (JSON.parse(e.data) || {}).stage || ''; } catch (err) { /* 用默认文案 */ }
+        const stage = ((replicaEventPayload(e) || {}).stage) || '';
         finish(PAUSE_MESSAGES[stage] || '任务已暂停，请看当前阶段的操作区。',
                stage === 'audit_failed');
     });
@@ -863,9 +1268,7 @@ function replicaOpenSSE(taskId) {
             }
             return;
         }
-        let msg = '任务失败';
-        try { msg = JSON.parse(e.data).message || msg; } catch (err) { /* 保留默认文案 */ }
-        finish(msg, true);
+        finish((replicaEventPayload(e) || {}).message || '任务失败', true);
     });
 }
 

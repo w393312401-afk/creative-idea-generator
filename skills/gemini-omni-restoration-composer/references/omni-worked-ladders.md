@@ -23,7 +23,7 @@ vehicle, or small structure with a real door.
 | 3 | Primer coating | `coating` | Next anchor shows it **cured**, matte. |
 | 4 | Exterior finish coating | `coating` | Primer must be cured first — hard veto otherwise. |
 | 5 | Platform railing installation | `fixture_install` | Bolted; washer rings + drill dust as traces. |
-| 6 | Door opening, interior peek | `threshold` prep | Peeked landmarks must be **pre-existing** cabin features. |
+| 6 | Door opening, interior still unreadable | `threshold` prep | The opening reads as unlit darkness; the registered interior landmarks must be **pre-existing** cabin features, revealed only by the crossing. |
 | 7 | Roof rail and bracket installation | `fixture_install` | Prepares the solar mount. |
 | 8 | Solar panel placement and cable clipping | `fixture_install` | This is the power source the Power Chain veto requires. |
 | 9 | Work-light stabilisation | `fixture_install` | Lighting phase → `temporary work light active`. |

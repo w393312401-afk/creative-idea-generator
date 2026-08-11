@@ -26,12 +26,13 @@ from server_common import (
     DEFAULT_SKILL_PROFILE, active_skill_profile, ensure_used_topic_ledger,
     used_topic_ledger_path,
     _get_project_dir, _safe_project_name, read_ledger,
-    IMG2IMG_CONTROL_PROMPT, IMG2IMG_BRIDGE_CONTROL_PROMPT,
+    IMG2IMG_CONTROL_PROMPT,
     PACKET_CACHE_LOCK, COMPOSE_CHECKPOINT_LOCK,
     strict_gates_enabled, qa_gate_level, gate_setting, GenerationCancelled,
     skill_contract_strict, operator_blind_spot_block
 )
 from .frame_state import (
+    TRANSITION_OPERATIONS,
     build_frame_state_contract,
     validate_frame_state_contract,
     compile_delta_image_prompt,
@@ -89,7 +90,7 @@ VIDEO_DURATION = 8.0
 # pre-rollout ladder full of local/incremental filler beats.
 # v2（2026-07-26）：过门后第一拍恒为 clearing 清理工序。存量断点里的 Threshold 节拍梯
 # 没有这一拍，续传会绕过新的结构校验产出旧形态整单——只能靠指纹换代逼它重排。
-MILESTONE_POLICY_VERSION = "visible-milestones-v9-direct-worker-action-from-zero"
+MILESTONE_POLICY_VERSION = "visible-milestones-v10-sealed-entry-before-crossing"
 _MIN_ADAPTIVE_CONSTRUCTION_BEATS = 5
 _MILESTONE_TEXT_FIELDS = (
     'milestone_name', 'before_state', 'after_state', 'completion_extent',
@@ -1103,7 +1104,11 @@ def ground_threshold_reveal_prompt(config, reference_image_path):
         "its light direction and colour) — never introduce a structural material the reference "
         "photo gives no basis for.\n"
         "5. One real photograph, never a grid, collage, or split composition.\n"
-        "6. Plain visual prose only — no percentages, labels, or on-screen text.\n\n"
+        "6. Plain visual prose only — no percentages, labels, or on-screen text.\n"
+        "7. The entry in the reference photo is deliberately CLOSED (a shut door or hatch, or an "
+        "unlit raw opening), so the reference shows you nothing of the space itself — infer it "
+        "from the shell's material, scale and condition, and never describe the doorway, its "
+        "frame, or the view through it. The camera is already inside, facing away from it.\n\n"
         "Respond with ONLY the description, 2-4 sentences, nothing else."
     )
     user_text = (
@@ -1919,6 +1924,109 @@ _INCOMPATIBLE_PACKAGE_FAMILIES = (
     ({'priming'}, {'furnishing'}),
 )
 
+# 每个相位的伴随工序，用来把只申报了一道工序的拍补齐到 _MIN_PACKAGE_OPERATIONS。
+# 挑选口径：与主工序同一材料层族（或干脆不属于任何族），因此
+#   - 过得了 _INCOMPATIBLE_PACKAGE_FAMILIES；
+#   - _forbidden_layer_pair 恒为空（族跨度 0 或 1，不落在 _FORBIDDEN_LAYER_PAIRS）；
+#   - 不给 beat_delta_weight 平白加 _FAMILY_SPAN_WEIGHT。
+# framing + insulation 是唯一一对跨族的（2->3），它正是 ladder schema 第 13 条点名的
+# 参考组合「joists + insulation batts」，(2,3) 也不在禁止对里。
+# 兜底梯子（deterministic_fallback_beat_ladder）与 backfill_package_operations 共用它。
+_PHASE_COMPANION_OPERATIONS = {
+    'clearing': 'demolition', 'demolition': 'clearing', 'excavation': 'clearing',
+    'repair': 'placement', 'placement': 'repair',
+    'rough-in': 'wiring', 'wiring': 'rough-in', 'plumbing': 'rough-in',
+    'framing': 'insulation', 'insulation': 'framing',
+    'drywall': 'paneling', 'paneling': 'drywall',
+    'flooring': 'painting', 'painting': 'priming', 'priming': 'painting',
+    'furnishing': 'lighting', 'lighting': 'furnishing',
+}
+
+
+def _normalize_operation_token(value):
+    return str(value or '').strip().lower().replace('_', '-')
+
+
+def _compatible_package(candidates, limit=None):
+    """按给定顺序挑出一组互不冲突的工序，去重并截到上限。"""
+    limit = _MAX_PACKAGE_OPERATIONS if limit is None else limit
+    picked = []
+    for item in candidates:
+        item = _normalize_operation_token(item)
+        if not item or item in picked or len(picked) >= limit:
+            continue
+        trial = set(picked + [item])
+        if any(trial & early and trial & late
+               for early, late in _INCOMPATIBLE_PACKAGE_FAMILIES):
+            continue
+        picked.append(item)
+    return picked
+
+
+def _outline_entry_operations(entry):
+    """一条卡片清单条目里申报过的工序。
+
+    结构化的 `package_operations` 是首选；读不到就从条目正文里那段「（工序：a、b、c）」
+    取——反推线在 2026-08-11 之前只把工序写进了正文，存量断点/任务里的清单仍是那个形态。
+    """
+    if not isinstance(entry, dict):
+        return []
+    ops = [_normalize_operation_token(x) for x in (entry.get('package_operations') or [])]
+    if not ops:
+        match = re.search(r'[（(]\s*(?:工序|ops?|operations?)\s*[：:]\s*([^）)]*)[）)]',
+                          str(entry.get('text') or ''))
+        if match:
+            ops = [_normalize_operation_token(x)
+                   for x in re.split(r'[、,，/;；]', match.group(1))]
+    return [op for op in ops if op]
+
+
+def backfill_package_operations(beat_ladder, parsed_brief=None):
+    """把「只申报了一道工序」的普通施工拍补齐到下限，避免整单被循环外硬闸判死。
+
+    2026-08-11 事故：一条 9 条的反推清单四次重排都没过验收，落到确定性兜底梯子上；
+    兜底梯子第 9 拍的 operation 被清单条目的 `show` 覆盖（因此不再算运镜拍），
+    package_operations 却仍是继承来的单元素 `['reward']`——**兜底路径自己造出了一条
+    必然过不了 frame_state 硬闸的梯子**，用户等满整轮规划只拿到一句英文报错。
+
+    补的工序只来自**已经被申报过的真实工序**，按可信度排序：
+      1) 这一拍自己的 operation / package_operations；
+      2) 这一拍认领的卡片清单条目申报的工序（反推线里就是原片观察到的那几道）；
+      3) 兜到 _PHASE_COMPANION_OPERATIONS 的同族伴随工序。
+    第 3 档才是「凭空补一道」，且只在前两档都给不出第二道时才用——与
+    repair_incompatible_package_operations 拒绝凭空补的立场一致：那里是**裁剪**路径，
+    补出来的工序会顶掉模型的真实申报；这里是**兜底**路径，替代品是整单失败。
+    """
+    outline = (parsed_brief or {}).get('beat_outline') or (parsed_brief or {}).get('outline') or []
+    outline = [x for x in outline if isinstance(x, dict)]
+    repaired = []
+    for beat in beat_ladder if isinstance(beat_ladder, list) else []:
+        if not isinstance(beat, dict):
+            continue
+        op = _normalize_operation_token(beat.get('operation'))
+        if op in TRANSITION_OPERATIONS or beat.get('bridge_stage') or beat.get('hard_cut'):
+            continue
+        package = [_normalize_operation_token(x)
+                   for x in (beat.get('package_operations') or []) if str(x).strip()]
+        if len(_compatible_package(package)) >= _MIN_PACKAGE_OPERATIONS:
+            continue
+
+        candidates = ([op] if op else []) + package
+        for ref in (beat.get('outline_refs') or [beat.get('index')]):
+            try:
+                pos = int(ref) - 1
+            except (TypeError, ValueError):
+                continue
+            if 0 <= pos < len(outline):
+                candidates += _outline_entry_operations(outline[pos])
+        candidates += [_PHASE_COMPANION_OPERATIONS.get(x) for x in list(candidates)]
+
+        filled = _compatible_package([x for x in candidates if x])
+        if len(filled) >= _MIN_PACKAGE_OPERATIONS and filled != package:
+            beat['package_operations'] = filled
+            repaired.append((beat.get('index'), package, filled))
+    return repaired
+
 # 材料层族词表（中文侧）。此前在 pacing_skeleton_outline_violations 的 nested 分支与
 # dual 分支里各内联了一份，且已经漂开了——一份有「隐蔽」没有「装备板」，另一份反过来。
 # 收编成唯一一份，取两份的并集：并集只会让某一族更容易命中，从而抬高两处调用点的
@@ -2320,7 +2428,9 @@ def compile_outline_fallback_ladder(parsed_brief, total_beats, variant=None, top
             'description': text,
             'milestone_name': text,
             'outline_refs': list(entry.get('outline_refs') or [pos]),
-            'package_operations': list(entry.get('package_operations') or beat.get('package_operations') or [op]),
+            'package_operations': list(entry.get('package_operations')
+                                       or _outline_entry_operations(entry)
+                                       or beat.get('package_operations') or [op]),
         })
         if op not in ('threshold', 'reward'):
             beat.update({
@@ -2338,6 +2448,10 @@ def compile_outline_fallback_ladder(parsed_brief, total_beats, variant=None, top
                 'preserve_state': _fallback_preserve_state(compiled),
             })
         compiled.append(beat)
+    # 兜底梯子的存在意义是「模型全灭时也要交付一条可用的梯子」，那它自己必须先过得了
+    # 下游的硬闸。清单条目的 op 会覆盖掉基础梯子的相位（末拍的 reward 被换成 show/
+    # reveal 之后就不再是运镜拍），继承来的单元素 package_operations 于是变成非法。
+    backfill_package_operations(compiled, parsed_brief)
     return compiled
 
 
@@ -2367,18 +2481,8 @@ def deterministic_fallback_beat_ladder(parsed_brief, total_beats, variant=None, 
 
     phase_cycle = ('clearing', 'repair', 'rough-in', 'framing', 'drywall',
                    'flooring', 'painting', 'furnishing')
-    # 每个相位的伴随工序，用来把兜底梯子的 package_operations 补到下限 2 道。
-    # 挑选口径：与主工序同一材料层族（或干脆不属于任何族），因此
-    #   - 过得了 _INCOMPATIBLE_PACKAGE_FAMILIES；
-    #   - _forbidden_layer_pair 恒为空（族跨度 0 或 1，不落在 _FORBIDDEN_LAYER_PAIRS）；
-    #   - 不给 beat_delta_weight 平白加 _FAMILY_SPAN_WEIGHT。
-    # framing + insulation 是唯一一对跨族的（2->3），它正是 schema 第 13 条点名的
-    # 参考组合「joists + insulation batts」，(2,3) 也不在禁止对里。
-    phase_companion = {
-        'clearing': 'demolition', 'repair': 'placement', 'rough-in': 'wiring',
-        'framing': 'insulation', 'drywall': 'paneling', 'flooring': 'painting',
-        'painting': 'priming', 'furnishing': 'lighting',
-    }
+    # 伴随工序表见模块级 _PHASE_COMPANION_OPERATIONS（挑选口径写在那里）。
+    phase_companion = _PHASE_COMPANION_OPERATIONS
     phase_cursor = 0
     ladder = []
     for idx in range(1, total_beats + 1):
@@ -6595,7 +6699,9 @@ _STRUCTURAL_VIDEO_ERROR_MARKERS = (
     'contains no camera-pan description',
     'describes construction/cleanup work during the crossing',
     'sterile of workers yet describes construction actions',
-    'PBISP continuity',
+    # TBCP v7：过门前一拍的 VIDEO 末帧就是那张闭门帧。这一拍的片段若在结尾把门打开，
+    # 或干脆预览了室内，和它自己的末帧直接矛盾——与旧 PBISP continuity 同一类交接断裂。
+    'Pre-crossing VIDEO',
 )
 
 
@@ -8075,38 +8181,81 @@ def check_image_static_state(image_prompt):
     return errors
 
 
-def check_pbisp_peek(prompt, packet, label='IMAGE'):
-    """PBISP/TBCP: the exterior IMAGE immediately before the single threshold/bridge beat
-    must pre-visualize the interior anchors through the open threshold — they are the
-    objects the bridge inherits. label='VIDEO' runs the same check against that beat's
-    VIDEO text instead, since the connecting clip must also carry the same peek across its
-    clip (not just the still IMAGE it hands off to) — otherwise the video's own last moment
-    has no visible reason for content that IMAGE {i+1} already shows, reading as a jump at
-    the handoff (2026-07-22 forest-lookout live diagnosis: VIDEO had zero mention of the
-    door-frame interior peek while IMAGE {i+1} carried it).
-    Enforceable deterministically now that the packet registers interior_primary_landmarks."""
+_ENTRY_NOUN_RE = (r'(?:door\s*-?\s*ways?|doors?|door\s+leaf|hatch(?:es|way)?|entryway|entrance|'
+                  r'entry|threshold|opening|portal|gateway|gate|access\s+panel)')
+# 起帧的门必须读作"封闭"。有门扇的载体 = 关死/上闩/封板；没有门扇的毛坯洞口 =
+# 洞内无照明的纯黑（见 _transition_stage_description 里 door_hardware_open 的
+# hardware_installed=False 分支，那句 "unlit darkness sits just inside it" 就是本形态）。
+_CLOSED_ENTRY_RE = re.compile(
+    rf'\b{_ENTRY_NOUN_RE}\b[^.;]{{0,90}}?\b(?:shut|closed|sealed|latched|padlocked|bolted|'
+    rf'barred|boarded|blocked|opaque|unlit|dark|darkness|pitch-?black|black)\b'
+    rf'|\b(?:shut|closed|sealed|latched|padlocked|bolted|barred|boarded|blocked|opaque|unlit|'
+    rf'pitch-?black)\b[^.;]{{0,90}}?\b{_ENTRY_NOUN_RE}\b',
+    re.I)
+# 明确的"预览室内"措辞。锚点名本身不能当判据：载体身份锚点（校车侧窗带、船舷窗列）
+# 从室外本来就看得见，按名字封杀会把合规稿判死。
+_INTERIOR_PREVIEW_KEYWORDS = (
+    'sneak-peek', 'sneak peek', 'peek', 'peeks', 'peeked', 'peeking',
+    'pre-visualize', 'pre-visualise', 'pre-visualized', 'pre-visualised',
+    'previsualize', 'glimpse', 'glimpses', 'glimpsed',
+)
+_OPEN_ENTRY_RE = re.compile(
+    rf'\b(?:wide[- ]?open|opened|ajar|gaping|propped\s+open|swung\s+open|standing\s+open|'
+    rf'thrown\s+open)\b[^.;]{{0,40}}?\b{_ENTRY_NOUN_RE}\b'
+    rf'|\b{_ENTRY_NOUN_RE}\b[^.;]{{0,40}}?\b(?:stands?|sits?|hangs?|is|remains?|lies?)?\s*'
+    rf'(?:wide\s+)?(?:open|ajar|gaping|propped\s+open|swung\s+open)\b',
+    re.I)
+
+
+def check_closed_entry_before_crossing(prompt, packet=None, label='IMAGE'):
+    """TBCP v7: the exterior IMAGE immediately before the single crossing beat must keep its
+    entry CLOSED — and show nothing of the interior.
+
+    This inverts the old PBISP sneak-peek requirement (an open threshold pre-visualizing the
+    interior anchors), which was written for the i2i side: the peek gave the interior first
+    frame something to inherit. Live runs say it costs more than it buys on the i2v side —
+    a half-open doorway hands the video model a low-resolution, hallucinated interior patch
+    that it then treats as a fact it must match while interpolating the crossing, and when it
+    cannot, the interior it lands in reads as a different world (or the camera never fully
+    gets inside). A fully shut entry gives it nothing to match, so the reveal happens entirely
+    inside the clip where the model is actually generating rather than reconciling. The
+    sealed-entry (hard_cut) variant always worked this way; v7 promotes it to every variant.
+
+    label='VIDEO' runs the same check against the pre-crossing beat's own VIDEO text, since
+    that clip's last frame IS this IMAGE — a clip that swings the door open at its end would
+    re-introduce exactly the preview the still frame just removed.
+
+    `packet` is unused now (kept for call-site compatibility with the checker family)."""
     errors = []
-    landmarks = (packet or {}).get('interior_primary_landmarks')
-    if not isinstance(landmarks, list) or not landmarks:
+    text = prompt or ''
+    if not text.strip():
         return errors
-    low = (prompt or '').lower()
-    for lm in landmarks:
-        if not isinstance(lm, dict):
-            continue
-        name = str(lm.get('name', '')).strip()
-        if not name or name.lower() in low:
-            continue
-        if label == 'VIDEO':
-            errors.append(
-                f"Pre-bridge VIDEO must also peek interior anchor '{name}' through the open "
-                f"threshold across its clip, PBISP continuity matching the IMAGE it hands off to "
-                f"— it is missing"
-            )
-        else:
-            errors.append(
-                f"Pre-bridge IMAGE must peek interior anchor '{name}' through the open threshold "
-                f"(PBISP sneak-peek, small scale, already sharp) — it is missing"
-            )
+    low = text.lower()
+    where = ('Pre-crossing VIDEO' if label == 'VIDEO' else 'Pre-crossing IMAGE')
+    # 正面的"门是关的"声明只对 IMAGE 强制。这一拍的 VIDEO 往往在做门以外的室外工序，
+    # 完全不提那扇门是合规的（末帧照样是闭门帧）；对它也要一句闭门声明，等于每单都为
+    # 一句可有可无的话烧一轮定向回炉——VIDEO 侧只查真正的违规：把门打开、或预览室内。
+    if label != 'VIDEO' and not _CLOSED_ENTRY_RE.search(text):
+        errors.append(
+            f"{where} must state that the entry is CLOSED at this moment (shut/sealed/latched "
+            f"door or hatch, or — on a carrier with no leaf yet — unlit darkness filling the raw "
+            f"opening); the crossing clip is the only place the interior may be revealed"
+        )
+    for hit in _mentions_without_negation(low, _INTERIOR_PREVIEW_KEYWORDS):
+        errors.append(
+            f"{where} previews the interior ('{hit}') — the entry stays closed and opaque here; "
+            f"delete the preview and let the crossing clip do the reveal"
+        )
+        break
+    for m in _OPEN_ENTRY_RE.finditer(text):
+        window = low[max(0, m.start() - _INTERVENTION_NEGATION_WINDOW):m.start()]
+        if any(cue in window for cue in _INTERVENTION_NEGATION_CUES):
+            continue  # "the door never swings open here" is the compliant wording, not a breach
+        errors.append(
+            f"{where} shows the entry open ('{m.group(0).strip()}') — it must still be closed in "
+            f"this frame; the entry is pushed open on camera inside the crossing clip"
+        )
+        break
     return errors
 
 
@@ -8189,8 +8338,8 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
     errors.extend(check_image_static_state(image_prompt))
     errors.extend(check_colon_label_style(image_prompt))
     if is_pre_bridge:
-        errors.extend(check_pbisp_peek(image_prompt, packet))
-        errors.extend(check_pbisp_peek(video_prompt, packet, label='VIDEO'))
+        errors.extend(check_closed_entry_before_crossing(image_prompt, packet))
+        errors.extend(check_closed_entry_before_crossing(video_prompt, packet, label='VIDEO'))
     _low_img = image_prompt.lower()
     if family == 'exterior':
         if "horizon line" not in _low_img:
@@ -8595,15 +8744,20 @@ Required JSON keys:
         _is_pan = (_variant in ('pan_left', 'pan_right')
                    or _topology['turn_degrees'] == 90)
         _turn_dir = (_topology['turn_direction'] if _is_pan else '')
+        # TBCP v7：起帧的门一律是关死的（见 _beat_contract 的 SEALED ENTRY 契约），
+        # 所以节拍梯层面描述这一拍的动作时也必须从"开门"起手——否则规划模型会按
+        # "门本来就开着"去写这一拍，和它上一拍的闭门契约当场对撞。
         if _topology['opening_plane'] == 'horizontal_top':
             _crossing_action = (
-                "descends vertically through the horizontal top hatch, clears the hatch rim and "
-                "lands fully on the interior deck"
+                "opens the closed horizontal top hatch on camera, descends vertically through it, "
+                "clears the hatch rim and lands fully on the interior deck"
             )
         elif _topology['entry_motion'] == 'climb_and_push':
-            _crossing_action = "climbs forward and upward through the vertical entry"
+            _crossing_action = ("pushes the shut vertical entry open on camera, then climbs forward "
+                                "and upward through it")
         else:
-            _crossing_action = "pushes level and forward through the vertical threshold"
+            _crossing_action = ("pushes the shut entry open on camera, then pushes level and forward "
+                                "through the vertical threshold")
         _turn_action = (
             f", then turns exactly ninety degrees with ONE smooth horizontal pan to the {_turn_dir} "
             f"to align with the interior's long axis" if _is_pan else ""
@@ -8613,6 +8767,7 @@ Required JSON keys:
             threshold_split_rules = f"""- If mode is "Threshold", the ENTIRE exterior-interior crossing is folded into the opening of ONE existing card-work-plan beat's own video — do NOT reserve a dedicated crossing-only beat, and never split the crossing across multiple beats:{_elevated_note}
   - PHYSICAL TOPOLOGY LOCK: opening plane is {_topology['opening_plane']}; entry motion is {_topology['entry_motion']}; landing turn is {_topology['turn_degrees']} degrees {_topology['turn_direction']}. Never replace a vertical descent through a roof hatch with a level/coaxial push, and never land on an eye-level long-axis view before the declared turn has visibly completed.
   - Pick whichever card work plan entry's own work happens on the interior side of this boundary (usually the first entry whose work takes place inside) and set bridge_stage 1 on THAT beat — it still claims exactly its own single entry and still fully describes that entry's own milestone/package_operations/after_state.{_turn_schema_note} That beat's VIDEO opens with the camera {_crossing_action}{_turn_action}, settling fully inside with every hatch/door rim and threshold edge completely out of frame, and then, in the SAME unbroken clip, continues into that beat's own listed construction action — it must depict the FULL physical arc (approach, crossing the opening plane, landing{' and turning onto the interior axis' if _is_pan else ''}, then that beat's own work) as ONE continuous shot, never resting or pausing on the opening as its own composition. Its resulting IMAGE is that beat's own completed after_state, not a generic untouched-ruin frame.
+  - SEALED ENTRY: the beat BEFORE the crossing beat ends on a closed entry — its resulting IMAGE shows the door/hatch shut (or, if this carrier has no leaf yet, its raw opening as unlit darkness) with nothing of the interior visible. The crossing beat's own clip is what opens it. Never plan a beat whose after_state is "the doorway now stands open revealing the interior".
   - All beats after the crossing beat must be interior construction operations (e.g., clearing interior, interior walls, interior flooring, etc.)."""
         else:
             threshold_split_rules = f"""- If mode is "Threshold", the ENTIRE exterior-interior crossing is ONE single beat — never split it across multiple beats, and never create a separate sill/vestibule/turn beat:{_elevated_note}
@@ -8620,6 +8775,7 @@ Required JSON keys:
   - Beat T: "threshold", bridge_stage 1 — the camera {_crossing_action}{_turn_action}, settling fully inside with every hatch/door rim and threshold edge completely out of frame.{_turn_schema_note} This beat's own VIDEO is the ONLY visible clip for the entire crossing — it must depict the FULL physical arc (approach, crossing the opening plane, landing{' and turning onto the interior axis' if _is_pan else ''}) as ONE continuous, unbroken shot, never resting or pausing on the opening as its own composition.
   - Beat T must be at index {_MIN_PRE_THRESHOLD_BEATS + 1} or LATER — the first {_MIN_PRE_THRESHOLD_BEATS} beats must be ordinary exterior beats that establish the overall environment and show exterior cleanup/repair progress; NEVER place the crossing at Beat 1 or Beat 2.
 {_post_crossing_cleanup_rule}
+  - SEALED ENTRY: Beat T-1 ends on a closed entry — its resulting IMAGE shows the door/hatch shut (or, if this carrier has no leaf yet, its raw opening as unlit darkness) with nothing of the interior visible. Beat T's own clip is what opens it. Never plan a beat whose after_state is "the doorway now stands open revealing the interior".
   - All subsequent beats (Beat T+1 to {beats_count}) must be interior construction operations (e.g., clearing interior, interior walls, interior flooring, etc.)."""
 
     # 「双空间重置兑现」的第二处不连续。上面那段说的是 T1（进主空间），这段说 T2
@@ -8913,6 +9069,15 @@ Space Type: {space_type}
     for attempt in range(beat_ladder_max_attempts):
         try:
             _raise_if_cancelled(on_progress)
+            # 这个循环是整条合成里最长的一段静默区：最多 4 轮 × 150s 的重负载调用，
+            # 期间不广播任何东西，前端只能对着上一句"正在规划里程碑"干等好几分钟，
+            # 分不清是在跑还是已经卡死。每一轮都报一次自己是第几轮。
+            if on_progress:
+                on_progress('outline', (
+                    f'正在规划节拍阶梯（目标 {max_total_beats} 拍，第 1/'
+                    f'{beat_ladder_max_attempts} 轮）…' if attempt == 0 else
+                    f'第 {attempt}/{beat_ladder_max_attempts} 轮未过验收，'
+                    f'正在按违规项定向重排…'))
             # 2026-07-24：这一步的 system prompt 是全流水线里最重的（18 个字段/拍 x 最多
             # 12 拍的完整结构化 JSON），90s 对偏慢的模型/网关拥堵时段常年不够——实测
             # server.log 里出现过连续 3 次纯超时（并非结构校验没通过）直接把这道"visible
@@ -9327,6 +9492,18 @@ Space Type: {space_type}
                 'persistent_traces': ['track ruts', 'spoil ridge', 'sling scuff marks'],
             })
     import hashlib
+    # 硬闸之前的最后一次确定性修补：只补「工序条数不足」这一类，且只用已申报过的
+    # 真实工序（详见 backfill_package_operations）。这道闸一旦响就是整单失败，而
+    # 一条拍序被判死的最常见原因恰恰是这一类元数据缺口——重排轮次已经用完，此时
+    # 能自己补齐的东西不该再让用户等 90 秒只换回一句报错。
+    _package_backfills = backfill_package_operations(beat_ladder, parsed_brief)
+    if _package_backfills and sys.stdout:
+        print(f'[DEBUG] backfilled under-scoped package_operations before the '
+              f'frame-state gate: {_package_backfills}')
+    if isinstance(config, dict) and _package_backfills:
+        config['_package_operation_backfills'] = [
+            {'beat': idx, 'before': before, 'after': after}
+            for idx, before, after in _package_backfills]
     # Persist the authoritative state table beside the other compose diagnostics.  Run
     # the hard gate again after deterministic transition expansion/carrier tagging so
     # downstream prompt writing can never receive a ladder different from the one that
@@ -9385,19 +9562,17 @@ Space Type: {space_type}
         _has_crossing = any(
             isinstance(b, dict) and (b.get('bridge_stage') == 1 or b.get('hard_cut'))
             for b in beat_ladder)
-        _has_cut = any(isinstance(b, dict) and b.get('hard_cut') for b in beat_ladder)
         interior_family_keys = ""
         if _has_crossing:
-            # hard_cut 变体没有"透过门洞可见"的 peek 前提——室内锚点只需是载体固有的
-            # 既存特征；桥接变体维持 PBISP peek 资格要求。
+            # TBCP v7：三变体统一——过门前那一帧的门一律关死，所以"透过门洞可见"
+            # 不再是任何变体的锚点资格要求（曾经只有 hard_cut 免除）。锚点只需在过门
+            # 时刻已经存在，第一次可见发生在跨越片段内部。
             _peek_clause = (
                 "They MUST be pre-existing features of this carrier's interior (original structure, "
-                "natural formations, pre-existing wreckage) — never future construction products; "
-                "visibility through the threshold opening is NOT required (this crossing is a "
-                "declared hard cut)." if _has_cut else
-                "They MUST be features that plausibly already exist at crossing time and are visible "
-                "through the threshold opening from outside (original structure, natural formations, "
-                "pre-existing wreckage) — never future construction products.")
+                "natural formations, pre-existing wreckage) — never future construction products. "
+                "Visibility through the entry from outside is NOT required and must not be assumed: "
+                "the entry stays closed until the crossing clip opens it, so these anchors are first "
+                "seen inside that clip.")
             interior_family_keys = f"""
 11. "interior_camera_dna": The INTERIOR shot family's single static camera sentence used for every IMAGE after the threshold crossing (same lens feel and camera height as the exterior family; camera pitch locked level; central vanishing axis centered; NEVER mention a horizon or sky indoors; the door frame and entry opening are fully behind the camera and never appear in frame).
 12. "interior_primary_landmarks": A list of 2-3 INTERIOR landmarks that become the post-crossing primary anchors. {_peek_clause} CARRIER IDENTITY (mandatory): at least ONE (prefer TWO) of them must be a fixed identity feature of THIS carrier's interior that makes the space unmistakably this carrier and no generic room — e.g. a school bus's side window band, ribbed roof curve, or wheel arches; a boat's rib frames or portholes; an aircraft's window row or overhead bins; this carrier's own equivalents. Each is a JSON object with "name", "grid" (their settled post-crossing Grid cell), and "z_depth_scale" (their settled frame-height percentage).
@@ -9539,21 +9714,21 @@ Beat Ladder:
     templates_raw = load_reference_file('prompt-templates.md', _profile)
     templates_cropped_img1 = get_cropped_templates(templates_raw, None, total_beats, mode, None)
 
-    # Edge case: when the bridge starts at beat 1, IMAGE 1 itself is the pre-bridge
+    # Edge case: when the bridge starts at beat 1, IMAGE 1 itself is the pre-crossing
     # threshold frame (IMAGE T) — it never passes through validate_beat_prompts, so the
-    # PBISP sneak-peek must be demanded and checked right here.
+    # sealed-entry rule must be demanded and checked right here.
     _img1_is_pre_bridge = bool(beat_ladder) and isinstance(beat_ladder[0], dict) \
         and beat_ladder[0].get('bridge_stage') == 1 \
         and str(beat_ladder[0].get('transition_stage') or 'none') == 'none'
     _img1_pbisp_rule = ""
     if _img1_is_pre_bridge:
-        _peek_lms = packet.get('interior_primary_landmarks') or []
-        _peek_names = ", ".join(str(lm.get('name')) for lm in _peek_lms if isinstance(lm, dict)) \
-            or "the registered interior anchors"
         _img1_pbisp_rule = (
-            f"\n9. PBISP sneak-peek (mandatory — the very next beat is the threshold bridge): "
-            f"through the open threshold, pre-visualize {_peek_names}, already sharp but still "
-            f"small (about one-fifth of frame height); never leave the opening dark or blank."
+            "\n9. SEALED ENTRY (mandatory — the very next beat is the threshold crossing): the "
+            "entry is CLOSED in this frame. State it plainly — the door leaf shut in its frame, "
+            "the hatch cover down and latched, or, if this carrier has no leaf yet, unlit "
+            "darkness filling the raw opening so nothing behind it reads. Show NOTHING of the "
+            "interior: no peek through the doorway, no interior anchor visible beyond it, no lit "
+            "depth. The crossing clip opens that entry on camera and does the reveal itself."
         )
 
     # 「载体是被运来的」这一类项目（双空间重置兑现）：Beat 1 的动作就是吊车/平板车把
@@ -9682,6 +9857,8 @@ Hard Rules:
     # skill 直出模式：IMAGE 1 一次生成即采纳——确定性修复（clean/clean-frame/camera DNA）
     # 照常兜住硬伤，结构校验只记录不再触发整次重生成；重试仅针对传输/代理故障。
     image_1_prompt = ""
+    if on_progress:
+        on_progress('outline', '锁定特征已就位。正在写 IMAGE 1（改造前的那张起始帧）…')
     for attempt in range(3):
         try:
             _raise_if_cancelled(on_progress)
@@ -9703,7 +9880,7 @@ Hard Rules:
                 errs.extend(check_primary_landmarks_exact_match(image_1_prompt, packet))
                 errs.extend(check_anchor_scale_lock(image_1_prompt, packet))
                 if _img1_is_pre_bridge:
-                    errs.extend(check_pbisp_peek(image_1_prompt, packet))
+                    errs.extend(check_closed_entry_before_crossing(image_1_prompt, packet))
                 # 唯一一条在直出模式下仍然重生成的首帧硬伤：载体提前入镜。
                 # 其余校验是「画面质量瑕疵」，改不改都还是同一场戏；而载体入镜会让
                 # Beat 1（把载体运到现场）没有任何可交付的状态变化，整条叙事从第一
@@ -10194,6 +10371,14 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
                 f"- ENTRY HARDWARE EVIDENCE: retain {_hardware or 'leaf/cover, hinges, latch and gasket'}, "
                 "plus the first rung/tread and drainage/vent detail where applicable. A bare geometric hole "
                 "or decorative wood frame is a hard failure.")
+            # TBCP v7 在这条阶梯上的等价形态：这一拍的里程碑就是"把门打开"，所以门当然
+            # 是开的——但开口里不许出现任何可读的室内。让下一拍的跨越片段从一片黑里生成，
+            # 而不是从一块低分辨率的猜测室内里去"对齐"（后者正是过门后换世界的来源）。
+            family_contract_lines.append(
+                "- OPENED BUT UNREADABLE (mandatory): the entry is open at the end of this beat, yet "
+                "the space beyond it must stay unreadable — flat unlit darkness in the opening, no "
+                "interior wall, floor, depth, or registered interior anchor visible through it. State "
+                "that darkness explicitly. The interior is revealed only by the crossing that follows.")
         if beat.get('reveal_scope') == 'partial':
             family_contract_lines.append(
                 "- PARTIAL-FIRST-LOOK BUDGET: reveal one short floor/rail segment, one raw wall patch or "
@@ -10215,21 +10400,30 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
     if is_bridge and _transition_stage == 'none':
         _turn_dir = str(beat.get('turn_direction') or '').strip().lower()
         _topology = threshold_topology(parsed_brief)
+        # TBCP v7：三种几何的第 (1) 步统一以"开门"开场——起帧的门是关死的（见
+        # is_pre_bridge 的 SEALED ENTRY 契约），室内第一次可见只能发生在这段片段内部。
         if _topology['opening_plane'] == 'horizontal_top':
             _approach_step = (
-                "(1) camera approaches the horizontal top hatch from above, then descends "
+                "(0) the closed hatch cover seen in the previous IMAGE is lifted/swung back on "
+                "camera, opening the shaft mouth for the first time; (1) camera approaches the "
+                "horizontal top hatch from above, then descends "
                 "VERTICALLY through its plane — never a level/coaxial push; (2) the hatch rim "
                 "expands outward on all four sides until it passes completely behind the camera; "
                 "(3) the camera lands fully on the interior deck before any turn begins;"
             )
         elif _topology['entry_motion'] == 'climb_and_push':
             _approach_step = (
-                "(1) camera climbs forward and upward toward the vertical entry in one continuous "
+                "(0) the shut entry seen in the previous IMAGE is pushed open on camera, revealing "
+                "the dark interior beyond for the first time; (1) camera climbs forward and upward "
+                "toward that now-open entry in one continuous "
                 "motion; (2) as it crosses, the door-frame edges slide past the left/right bounds;"
             )
         else:
             _approach_step = (
-                "(1) camera pushes coaxially forward toward the vertical open threshold, exterior "
+                "(0) the shut door/panel seen in the previous IMAGE is pushed open on camera (the "
+                "leaf swinging inward, the panel sliding back — whatever this carrier's own entry "
+                "actually does), revealing the dark interior beyond for the first time; (1) camera "
+                "pushes coaxially forward through that opening, exterior "
                 "daylight and materials visible at the start; (2) as it reaches and crosses the "
                 "sill, the door-frame edges slide symmetrically outward past the left/right bounds;"
             )
@@ -10250,8 +10444,9 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
             "threshold/doorway as a composition: " + _approach_step + " (3) exposure "
             "and white balance roll smoothly from exterior daylight to the interior's dimmer tone "
             "across the whole clip, attributed to the same light source throughout; (4) the "
-            "inherited interior anchors continuously scale up along the camera axis without "
-            "repositioning or re-rendering, reaching their settled scale;"
+            "registered interior anchors become visible for the first time as the entry opens, "
+            "then scale up continuously along the camera axis without repositioning or "
+            "re-rendering, reaching their settled scale;"
             + _turn_step +
             " (5) the clip ends with the camera fully inside, the door frame and threshold "
             "completely behind the camera and out of frame"
@@ -10259,6 +10454,13 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
             + ". The door/threshold must NEVER read as a resting shot or an implied cut point at "
             "any moment — the whole crossing is one unbroken push"
             + (" ending in a single pan" if is_turn else "") + ".")
+        family_contract_lines.append(
+            "- Crossing clip — no interior preview before the opening (mandatory): nothing of the "
+            f"interior is visible until the entry is opened inside this clip. IMAGE {i} keeps that "
+            "entry CLOSED and opaque by design, so do NOT write a peek through the doorway, an "
+            "already-open entry, or interior anchors visible at the start — the reveal happens on "
+            "camera here, and the interior anchors' scales are declared only for where they settle "
+            f"in IMAGE {i+1}.")
         if is_bridge_with_payload:
             # 一比一模式：这一拍自己在交付一条真实清单工序（milestone_name/
             # package_operations 已经填好），不是纯运镜占位——穿越完成后同一镜头
@@ -10341,20 +10543,20 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
             + ("" if is_bridge_with_payload else " Do NOT describe this beat as a construction "
                "time-lapse — nothing is being built here."))
     if is_pre_bridge:
-        _peek = _family_landmarks(packet, 'interior') or []
-        _peek_names = ", ".join(str(lm.get('name')) for lm in _peek if isinstance(lm, dict)) \
-            or "the two registered interior anchors"
         family_contract_lines.append(
-            f"- PBISP sneak-peek (mandatory): IMAGE {i+1} is the exterior threshold frame — through "
-            f"the open threshold, pre-visualize {_peek_names}, already sharp but still small "
-            f"(about one-fifth of frame height); never leave the opening dark or blank.")
+            f"- SEALED ENTRY (mandatory): IMAGE {i+1} is the last exterior frame before the "
+            f"crossing, and its entry must be CLOSED — the door leaf shut in its frame, the hatch "
+            f"cover down and latched, or, on a carrier with no leaf built yet, unlit darkness "
+            f"filling the raw opening. Say so explicitly. Show NOTHING of the interior in this "
+            f"frame: no peek through the doorway, no interior anchor visible beyond it, no lit "
+            f"depth, no floor running inward. The reveal belongs entirely to the next beat's "
+            f"crossing clip, which pushes that entry open on camera.")
         family_contract_lines.append(
-            f"- PBISP sneak-peek continuity in VIDEO {i} (mandatory): since the camera stays static "
-            f"through this beat, {_peek_names} must ALSO be visible through the open threshold "
-            f"across VIDEO {i}'s clip (same small, sharp scale as IMAGE {i+1}) — do not write a "
-            f"VIDEO whose action stays confined to the exterior repair work while leaving the "
-            f"doorway dark, blank, or unmentioned; the last frame of VIDEO {i} must already match "
-            f"IMAGE {i+1}'s sneak-peek, not introduce it for the first time as a static cutaway.")
+            f"- SEALED ENTRY continuity in VIDEO {i} (mandatory): the last frame of VIDEO {i} IS "
+            f"IMAGE {i+1}, so this clip must leave the entry shut at its end — it may show work on "
+            f"or around the entry, but it must NOT swing it open, prop it ajar, or reveal anything "
+            f"behind it. Do not write an opening action here; the crossing clip in the NEXT beat "
+            f"owns it.")
     # 人物入住类的最终兑现拍：通用的"干净帧 / 无人场景"规则在这一拍必须让路，
     # 否则用户在卡片上点的最后一条工序（「点亮全景，人物入住」）会被系统性删干净。
     if beat_requires_occupant(beat):
@@ -10651,7 +10853,7 @@ Write the beats IN ORDER. Each beat's resulting IMAGE must continue directly and
 - THIS BEAT'S resulting IMAGE must be a clean frame with ZERO workers/machinery. Do NOT use the words 'worker', 'builder', 'carpenter', 'laborer', 'person', 'man', 'woman', or 'people' under any circumstances, even to state that they are absent or not present. Describe only static objects, surfaces, and traces. For every ordinary construction beat, follow its VISIBLE MILESTONE CONTRACT exactly: name the milestone anchor, state its completed full extent/count, preserve inherited and not-yet-worked state, and include at least two declared persistent contact traces. Never reduce the delta to a local patch, a beginning, or vague incremental progress.
 - THIS BEAT'S VIDEO must execute the same visible milestone from its exact before_state to after_state. It must include TWO independently observable progress lines: the main product growing to its complete extent/count, plus stock/container/spoil movement or a tightly coupled second component. Show first contact, repeated cycles, material source and movement path, and a clean terminal frame. Prior installed/finished features stay present and unchanged.
 - A construction package may contain up to three tightly related actions only when all actions occur in the same zone and jointly create the one named milestone. Do not leak unrelated demolition, rough-in, finish, lighting, or furnishing work into that package.
-- For threshold bridge beats (if a beat is a threshold bridge, per its own section below), follow the TBCP rules: the ENTIRE exterior-to-interior crossing is ONE single beat (bridge_stage 1) — there is no separate hold/sill/vestibule/turn beat. Its VIDEO is the ONLY visible clip for the crossing, bound normally from the previous beat's IMAGE to this beat's own IMAGE, and must depict the full exterior-to-settle arc (plus, in the PAN variant, ending in a stationary pan locking onto the interior's long axis) in one continuous shot, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it. A DECLARED CUT-IN beat works the same way on the video side — its VIDEO is a real generated crossing clip, written as an ordinary video prompt bound from the previous beat's IMAGE to this beat's own IMAGE, except that the entry starts CLOSED and is pushed open on camera inside that clip (no peek, no anchor scale-up before it) — while its IMAGE re-establishes the interior from scratch per its anchor rule. The crossing clip enters an untouched ruin and stays that way for its whole length — nothing is cleaned, cleared, tidied, repaired, or installed while the camera moves, and no tool, ladder, scaffolding, tarp, work light, or stacked material appears in it; write it as one unbroken take at a steady speed (no cut, fade, dissolve, speed ramp, or freeze), and never call it a construction time-lapse. The cleanout of that mess is the NEXT beat.
+- For threshold bridge beats (if a beat is a threshold bridge, per its own section below), follow the TBCP rules: the ENTIRE exterior-to-interior crossing is ONE single beat (bridge_stage 1) — there is no separate hold/sill/vestibule/turn beat. Its VIDEO is the ONLY visible clip for the crossing, bound normally from the previous beat's IMAGE to this beat's own IMAGE, and must depict the full exterior-to-settle arc (plus, in the PAN variant, ending in a stationary pan locking onto the interior's long axis) in one continuous shot, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it. EVERY crossing — bridge or DECLARED CUT-IN alike — starts from a CLOSED entry: the previous beat's IMAGE keeps its door/hatch shut (or, on a carrier with no leaf yet, its raw opening unlit and opaque) and shows nothing of the interior, and the crossing clip itself pushes that entry open on camera before advancing through it. There is no interior peek and no anchor scale-up before the clip. A DECLARED CUT-IN beat works the same way on the video side — its VIDEO is a real generated crossing clip, written as an ordinary video prompt bound from the previous beat's IMAGE to this beat's own IMAGE — while its IMAGE re-establishes the interior from scratch per its anchor rule. The crossing clip enters an untouched ruin and stays that way for its whole length — nothing is cleaned, cleared, tidied, repaired, or installed while the camera moves, and no tool, ladder, scaffolding, tarp, work light, or stacked material appears in it; write it as one unbroken take at a steady speed (no cut, fade, dissolve, speed ramp, or freeze), and never call it a construction time-lapse. The cleanout of that mess is the NEXT beat.
 - NLVTR visual-only rule: No '%' symbols, no numeric ranges, no acronyms (HAL, SCUP, NGCS, VMFP, RCE, GCTR, RPL, OSPL, RHMA, PBISP, HCL, NLVTR, MTAL, TSPA) in the prompts.
 - REALISM rule (mandatory): strictly documentary photorealism. Every material, fixture, tool, and technique must be real-world and present-day (wood, stone, brass, wool, glass, leather, standard trade tools). NO sci-fi, futuristic, cyberpunk, holographic, glowing-tech-panel, LED-neon, or spacecraft-style elements anywhere in the scene.
 - SINGLE CONTINUOUS PHOTOGRAPH rule (mandatory): each IMAGE is one real photograph of one moment — never a grid of multiple panels, a collage, a storyboard, a comparison/before-after split, or a multi-view composite. The "Grid A1-C3" notation used elsewhere in this contract is an internal composition-registration convention for you the writer — never describe or render literal grid lines, panel borders, or divided frames in the image itself.
@@ -10874,7 +11076,12 @@ def _local_beat_review_system_prompt():
     2026-07-30：[CUT] 槽已改为真实生成的跨越片段（不再是占位声明），因此该条规则里
     "不是片段、不按片段规则judge" 的措辞一并撤掉——它现在照常按跨越片段judge（纯运镜、
     无工人、室内全程未被动工），只保留"起帧门封闭不是缺陷、没有 peek/无 scale-up"这部分
-    豁免。"""
+    豁免。
+
+    2026-08-11（TBCP v7）：闭门起帧成为全部变体的统一规则，于是这两条规则合并成一条
+    SEALED ENTRY BEFORE ANY CROSSING——不再按 [CUT] 标签分流，并补上反向判据（外部帧
+    已经开着门、室内可见 = 违规）。旧的 THRESHOLD PEEK 规则连同 Monotonic Scale Lock
+    整条退役，只留下锚点资格（过门时刻必须已存在）那半条。"""
     return f"""You are a strict construction-sequence and physical-causality auditor for a restoration / renovation time-lapse. You are judging ONLY ONE beat of a longer sequence: its VIDEO takes the space from IMAGE A to IMAGE B. You are shown the two actual RENDERED images for this beat only (IMAGE A first, IMAGE B second), alongside the complete IMAGE/VIDEO prompt text set for the whole sequence — use the full text only for context on what earlier/later beats established (e.g. when wiring/exterior/excavation happened), but only report a violation if it is visible IN THESE TWO IMAGES. Judge the real images, not just the prompt text — a prompt can describe the right thing and still have rendered wrong. Do NOT redesign, restyle, re-theme, or otherwise "improve" anything; you are reporting violations, not fixing them.
 
 Most of the rules below will not apply to this specific beat — skip inapplicable ones quickly. Only report a rule as violated if you can point to a CONCRETE visible detail in one of the two images that clearly contradicts it. If a potential issue is subtle, ambiguous, debatable, or you are not confident, do NOT report it — under-reporting is far cheaper than a false accusation here; a second reviewer will independently re-check anything you do report before it counts.
@@ -10920,8 +11127,8 @@ Hard vetoes to check against these two images:
 - PERSPECTIVE ISOLATION: Do not flip camera facing directions (e.g. turning 180 degrees from looking out to looking in) in the same spatial axis without a clean separate phase or TBCP transition.
 - NO WORKER BOUNDARY CHOREOGRAPHY: Never show or describe workers entering, arriving, exiting, walking out, or leaving the frame. Use the whole construction clip for visible work from t=0s through the final frame; the separate reward beat may be worker-free.
 - RIGID CONTAINER ENCAPSULATION: All loose materials, debris, fasteners, and liquids must be stored and tracked inside rigid, quantifiable containers (e.g. buckets, parts trays, boxes), and their volumes must be described as continuously increasing or decreasing.
-- THRESHOLD PEEK ANCHOR QUALIFICATION & SCALE (only applies if this beat is the threshold/bridge crossing beat AND its VIDEO slot is NOT tagged [CUT]): the two interior landmarks pre-visualized through the doorway before a threshold bridge must plausibly ALREADY EXIST at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. NEVER future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures). Each peeked anchor's declared frame-height scale must strictly INCREASE from the exterior peek IMAGE to the interior-settled IMAGE; a constant scale across the crossing is a violation — fix the scales, keep the objects.
-- DECLARED CUT-IN SLOT (only applies if this beat's VIDEO slot is tagged [CUT]): this is the sanctioned single crossing beat of the variant whose whole premise is that NOTHING of the interior is visible before crossing. A shut door, closed hatch, sealed shell, or pitch-black opening in the exterior IMAGE is the REQUIRED state here — never report it as a missing interior peek, an unopened/unfinished entry, a blocked crossing, or a reason the next frame cannot be interior. There is no peek and no anchor scale-up to look for between these two images: the entry is opened and passed through INSIDE this beat's own clip, so judge that slot as a crossing clip (a pure camera move through an untouched ruin, sterile of workers) and never against the construction-clip rules (single milestone package, dual progress, worker entry/exit and agent flow, kinetic climax motion). The interior IMAGE is also deliberately re-established from scratch rather than matched frame-to-frame against the exterior one, so do not report its different composition, framing, or camera position as a defect. What still applies across this crossing: construction order, envelope-seal continuity, and state monotonicity — it resets the camera only, so anything an earlier exterior beat sealed or repaired must read as still sealed and repaired on its inner face in the interior first frame.
+- INTERIOR ANCHOR QUALIFICATION (only applies if this beat is the threshold crossing beat, tagged [BRIDGE ...] or [CUT]): the interior landmarks this crossing lands on must plausibly ALREADY EXIST at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. NEVER future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures).
+- SEALED ENTRY BEFORE ANY CROSSING (applies to EVERY crossing beat — [BRIDGE], [BRIDGE TURN] and [CUT] alike): the premise of every crossing in this system is that NOTHING of the interior is visible before it. A shut door, closed hatch, sealed shell, or pitch-black opening in the exterior IMAGE is the REQUIRED state — never report it as a missing interior peek, an unopened/unfinished entry, a blocked crossing, or a reason the next frame cannot be interior. There is no peek and no anchor scale-up to look for between these two images: the entry is opened and passed through INSIDE this beat's own clip. Conversely, an exterior IMAGE that already shows the entry standing open with the interior visible through it IS a violation of this rule. Judge the slot as a crossing clip (a pure camera move through an untouched ruin, sterile of workers) and never against the construction-clip rules (single milestone package, dual progress, worker entry/exit and agent flow, kinetic climax motion). The interior IMAGE is deliberately re-established rather than matched frame-to-frame against the exterior one, so do not report its different composition, framing, or camera position as a defect. What still applies across this crossing: construction order, envelope-seal continuity, and state monotonicity — it resets the camera only, so anything an earlier exterior beat sealed or repaired must read as still sealed and repaired on its inner face in the interior first frame.
 - BRIDGE WHITE-BALANCE DIRECTION (only applies if this beat is the threshold/bridge crossing beat): the single threshold/bridge beat's merged crossing clip VIDEO prose must describe ONE consistent, gradual colour-temperature direction across its full arc, attributed to the same light source throughout. A mid-clip reversal is a violation.
 - DOOR-FRAME CLEARANCE (only after an INTERIOR ESTABLISH / SECONDARY ESTABLISH slot): once established, the rendered frame may be fully inside with the entry out of view. Earlier transition slots MUST retain the hatch/door rim, sill, ladder/tread, landing or divider edge needed for orientation; never penalize that required evidence.
 - INTERIOR OCCUPANCY: post-crossing interior frames must be dominated by the interior space itself — walls, ceiling, and floor reaching the frame edges — never a small bright interior rectangle surrounded by exterior or dark margins.
@@ -13040,6 +13247,16 @@ def _outline_normalized_entries(outline):
                     normalized['en'] = en
                 if mat:
                     normalized['mat'] = mat
+                # package_operations（2026-08-11，复刻线）：这一条清单条目在原片里被
+                # 观察到的那 2~3 道耦合工序。规划模型读的是正文里那段「（工序：…）」，
+                # 但确定性通路（compile_outline_fallback_ladder /
+                # backfill_package_operations）读的是这个键——不透传的话，规划全灭
+                # 退回兜底梯子时就只剩一个单元素占位，随即被 frame_state 硬闸判死。
+                raw_ops = entry.get('package_operations')
+                ops = ([str(x).strip() for x in raw_ops if str(x).strip()]
+                       if isinstance(raw_ops, (list, tuple)) else [])
+                if ops:
+                    normalized['package_operations'] = ops
                 # zone/scope/trace（P2/P3）：scope 是闭集枚举，统一小写后再往下走，
                 # 否则规划器那边 stage_scope 的等值比对会被一个大写字母判成冲突。
                 #
@@ -13618,7 +13835,10 @@ def build_outline_plan_block(beat_outline, max_total_beats):
         "the first entry whose work takes place inside), and mark THAT SAME beat as the crossing beat "
         "(set bridge_stage/hard_cut on it per the schema below) — its video opens with the physical "
         "crossing motion and then continues, in the same unbroken clip, into that entry's own listed "
-        "work. That beat still claims exactly its own single entry like every other beat.\n"
+        "work. That beat still claims exactly its own single entry like every other beat. The entry "
+        "the camera crosses is CLOSED before that clip — the beat before it ends on a shut door/hatch "
+        "(or, on a carrier with no leaf yet, an unlit raw opening) with nothing of the interior "
+        "visible — and the crossing clip itself pushes it open on camera.\n"
         # 内容绑定：编号对应不查内容，认领了第 k 条却交付别的东西是零成本的。
         # 这份英文复述是唯一能跨语言（清单中文 / 提示词英文）做确定性校验的桥。
         "\nDELIVERY RESTATEMENT (mandatory): alongside \"outline_refs\", every beat must carry an "
