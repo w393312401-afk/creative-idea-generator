@@ -27,7 +27,13 @@
       "id": "SPCP",
       "tier": "P0",
       "scope": "image+video",
-      "shot_family_scope": ["exterior_static", "threshold_bridge", "interior_static", "reward_reveal", "elevated"],
+      "shot_family_scope": [
+        "exterior_static",
+        "threshold_bridge",
+        "interior_static",
+        "reward_reveal",
+        "elevated"
+      ],
       "rule_zh": "按 shot_family 锁定相机姿态措辞：室外/桥接/奖励用 horizon line；室内/封闭空间用 camera pitch locked + 居中灭点轴，且禁止出现 horizon/sky/clouds；elevated 用 pitch angle + convergence direction。optical flow 措辞只允许出现在 push-in 类镜头。",
       "source": "SKILL.md Step 6 (Camera DNA Block SPCP), Step 9 P0 Kill Gates",
       "enforcer": "video_to_prompt_pipeline.py::gate_name:Sub-Pixel Coordinate Pinning Gate",
@@ -272,6 +278,30 @@
       "enforcer": null,
       "blocking": false,
       "gap": "这是一条对话记忆型约束（'用户是否在本次对话里说过不要自动入库'），依赖 agent 对上下文的记忆与遵守，无法被独立 CLI 脚本静态校验。save_to_library.py 本身没有、也不需要感知这个选择——跳过与否发生在是否调用它之前。"
+    },
+    {
+      "id": "named-cast-lock",
+      "tier": "P0",
+      "scope": "image+video",
+      "shot_family_scope": [
+        "exterior_static",
+        "interior_static",
+        "reward_reveal",
+        "elevated"
+      ],
+      "rule_zh": "agent_lock_mode 为 named_cast 时，每条含人物提示词必须逐字重述登记的身份块（全条仅一次、前置于动作动词之前）、不得出现跨段指代或泛指人物、必须带三条常驻负面项、双人镜必须写助手区分句；T1 部位颜色词按 cast-registry.json 词表校验，禁止同义替换。",
+      "source": "references/character-consistency-protocol.md, SKILL.md Step 6 (Worker/Machine Choreography Ledger), Step 8",
+      "enforcer": "scripts/check_character_lock.py::function:check_prompt",
+      "blocking": true
+    },
+    {
+      "id": "named-cast-registry-authority",
+      "tier": "P1",
+      "scope": "image+video",
+      "rule_zh": "身份块与 T1 词表的唯一权威副本在 references/cast-registry.json；协议文档与校验脚本都不得内嵌副本，两处各写一份就是下一次漂移的源头。",
+      "source": "references/character-consistency-protocol.md",
+      "enforcer": "scripts/check_character_lock.py::function:load_registry",
+      "blocking": false
     }
   ]
 }

@@ -35,6 +35,7 @@ SKILL_COMMON_PATH = SKILL_DIR / "scripts" / "skill_common.py"
 PY_FILES = {
     "video_to_prompt_pipeline.py": SKILL_DIR / "video_to_prompt_pipeline.py",
     "scripts/render_and_gate_anchor.py": SKILL_DIR / "scripts" / "render_and_gate_anchor.py",
+    "scripts/check_character_lock.py": SKILL_DIR / "scripts" / "check_character_lock.py",
 }
 
 REQUIRED_FIELDS = ("id", "tier", "rule_zh", "blocking")

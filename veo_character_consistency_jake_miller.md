@@ -1,3 +1,12 @@
+> **本文件已落地，现为历史草案，不要再据此撰写提示词。**
+> 权威副本在
+> [`skills/gemini-veo-restoration-composer/references/character-consistency-protocol.md`](skills/gemini-veo-restoration-composer/references/character-consistency-protocol.md)（协议）
+> 与 [`skills/gemini-veo-restoration-composer/references/cast-registry.json`](skills/gemini-veo-restoration-composer/references/cast-registry.json)（身份块与词表）。
+> 校验：`python skills/gemini-veo-restoration-composer/scripts/check_character_lock.py --cast jake-miller <prompt-set.md>`
+>
+> 落地时改动了本草案两处，理由见协议第一节与第四节：Named Cast Lock 与既有 Hero Agent Lock
+> 互斥（不是叠加），且与 Direct-at-Zero Worker Clause 冲突，进离场被限制在首尾各半秒。
+
 # 杰克·米勒 人物一致性方案（Veo 多镜头）
 
 适用对象：硬朗型装修工 杰克·米勒（Jake Miller），38 岁美国白人男性。

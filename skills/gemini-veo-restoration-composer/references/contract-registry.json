@@ -245,6 +245,33 @@
       "summary": "载体家族配额：一批里天然原位壳体（岩洞/化石/冰洞/活体树干）不超过三分之一",
       "source": "references/idea-engine.md#2.3b",
       "enforcer": "prompt_pipeline:ideation_family_quota_violations"
+    },
+    {
+      "id": "named-cast-vocabulary-lock",
+      "level": "P0",
+      "scope": "both",
+      "summary": "Named Cast Lock：每条含人物提示词必须逐字重述登记的身份块，T1 颜色词禁止同义替换；跨段无记忆，同义漂色等于换人",
+      "source": "references/character-consistency-protocol.md",
+      "enforcer": null,
+      "gap": "服务端 prompt_pipeline 没有具名人物概念，只有 HAL 剪影检查。唯一执行点是本包 scripts/check_character_lock.py，须由 agent 在交付前手动运行；聊天内撰写时无任何自动拦截。"
+    },
+    {
+      "id": "named-cast-direct-at-zero-exemption",
+      "level": "P0",
+      "scope": "video",
+      "summary": "Named Cast Lock 模式下 Direct-at-Zero Worker Clause 被项目级豁免：允许进离场，但压缩到首尾各半秒以内；尾帧不得留人，否则与下一张 Clean Frame IMAGE 锚点冲突",
+      "source": "references/character-consistency-protocol.md",
+      "enforcer": null,
+      "gap": "这是两条既有 P0 契约之间的真实矛盾（Direct-at-Zero 禁止进离场 vs 人物 QC 第 14 项要求进离场路径），不是措辞问题。已在协议第一节明确裁决并登记，服务端与本地脚本均未表达；半秒上限目前只能人工判定。"
+    },
+    {
+      "id": "named-cast-hal-exclusivity",
+      "level": "P0",
+      "scope": "both",
+      "summary": "Hero Agent Lock 与 Named Cast Lock 互斥，一个项目只能选一种，全片不得混用；混用会把两套服装契约的特征互串",
+      "source": "references/character-consistency-protocol.md",
+      "enforcer": null,
+      "gap": "没有任何执行点检查一个交付集里是否同时出现两种锁（例如既有 neon-yellow safety vest 又有具名身份块）。check_character_lock.py 只看被选中的那一种，不做互斥判定。"
     }
   ]
 }

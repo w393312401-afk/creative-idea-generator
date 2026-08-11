@@ -1,0 +1,101 @@
+{
+  "registry_version": "1.0",
+  "scope": "Named Cast Lock 的权威角色数据。每个 T1 部位登记唯一允许写法 + 禁止写法，供 scripts/check_character_lock.py 做全文机器比对。",
+  "_comment": "这是身份块正文的唯一副本。character-consistency-protocol.md 只做索引，不复制正文 —— 两处各写一份就是下一次漂移的源头。identity_blocks 里的字符串必须逐字复制进提示词，禁止同义替换。",
+  "always_on_negatives": [
+    "no readable text or logos on clothing",
+    "no change of jacket colour",
+    "no second person resembling him"
+  ],
+  "coreference_bans": [
+    "the same worker",
+    "the same contractor",
+    "he returns",
+    "the previous worker",
+    "the previous contractor",
+    "as before",
+    "the aforementioned worker"
+  ],
+  "generic_agent_residue": [
+    "one worker",
+    "two workers",
+    "one lone worker",
+    "both workers",
+    "the workers",
+    "the worker",
+    "a worker"
+  ],
+  "cast": [
+    {
+      "id": "jake-miller",
+      "display_name": "Jake Miller",
+      "role": "38-year-old white American male contractor",
+      "pipeline_mode": "A",
+      "glove_policy": "gloves stay on throughout",
+      "first_used_in": "veo_petrified_saguaro_prompt_set.md",
+      "tier1_anchors": [
+        {
+          "slot": "cap",
+          "required": "dark-grey baseball cap",
+          "banned": ["charcoal cap", "charcoal baseball cap", "grey hat", "gray hat", "black cap", "grey cap", "dark grey cap", "hardhat", "hard hat", "helmet"]
+        },
+        {
+          "slot": "jacket",
+          "required": "faded olive-green work jacket",
+          "banned": ["army green jacket", "khaki jacket", "military jacket", "olive jacket", "green work jacket", "olive-drab jacket", "hi-vis vest", "safety vest"]
+        },
+        {
+          "slot": "shirt",
+          "required": "charcoal-grey T-shirt",
+          "banned": ["dark grey tee", "dark-grey tee", "black shirt", "grey shirt", "gray t-shirt", "sand-colored shirt", "sand-coloured shirt"]
+        },
+        {
+          "slot": "trousers",
+          "required": "brown canvas",
+          "banned": ["tan pants", "carpenter jeans", "denim jeans", "dark trousers", "khaki trousers", "blue work pants", "dark blue work pants"]
+        },
+        {
+          "slot": "boots",
+          "required": "dark-brown",
+          "banned": ["brown boots", "tan boots", "black boots", "dark boots"]
+        },
+        {
+          "slot": "gloves",
+          "required": "yellow leather gloves",
+          "banned": ["orange gloves", "work gloves", "leather work gloves", "yellow gloves", "tan gloves"]
+        },
+        {
+          "slot": "beard",
+          "required": "neatly trimmed light-brown short beard",
+          "banned": ["stubble", "full beard", "goatee", "bushy beard", "clean-shaven contractor", "short beard"]
+        },
+        {
+          "slot": "eyes",
+          "required": "grey-blue eyes",
+          "banned": ["blue eyes", "grey eyes", "gray-blue eyes", "steel-blue eyes"]
+        },
+        {
+          "slot": "hair",
+          "required": "short light-brown hair",
+          "banned": ["blond hair", "brown hair", "dark hair", "light brown hair"]
+        }
+      ],
+      "tier2_anchors": [
+        {"slot": "age", "required": "38-year-old"},
+        {"slot": "ethnicity", "required": "white American"},
+        {"slot": "height", "required": "185cm tall"},
+        {"slot": "build", "required": "broad-shouldered"},
+        {"slot": "face", "required": "square jaw"},
+        {"slot": "skin", "required": "sun-reddened"}
+      ],
+      "identity_blocks": {
+        "full": "Jake Miller, a 38-year-old white American male contractor, 185cm tall, broad-shouldered and solidly built, with sun-reddened weathered skin, a square jaw, a neatly trimmed light-brown short beard, grey-blue eyes, and short light-brown hair showing under a dark-grey baseball cap. He wears a faded olive-green work jacket, a charcoal-grey T-shirt, brown canvas utility trousers, dark-brown leather work boots, and yellow leather gloves. His movements are steady and powerful, reading as a real independent American contractor.",
+        "mid": "Jake Miller, a 38-year-old broad-shouldered white American contractor with sun-reddened skin, a neatly trimmed light-brown short beard, grey-blue eyes, and a dark-grey baseball cap, wearing a faded olive-green work jacket, charcoal-grey T-shirt, brown canvas utility trousers, dark-brown leather work boots, and yellow leather gloves.",
+        "short": "Jake Miller, the bearded broad-shouldered contractor in a dark-grey baseball cap, faded olive-green work jacket, charcoal-grey T-shirt, brown canvas trousers, dark-brown boots, and yellow leather gloves,"
+      },
+      "short_block_anchor_slots": ["cap", "jacket", "shirt", "trousers", "boots", "gloves", "beard"],
+      "assistant_lock": "plain dark clothing, no cap, clean-shaven, visibly shorter",
+      "negative_list_full": "No hardhat, no hi-vis vest, no sunglasses, no visible tattoos, no jewelry, no readable text or logos on clothing, no change of jacket colour, no beard length change, no second person resembling him, no face distortion, no extra fingers."
+    }
+  ]
+}
