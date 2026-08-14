@@ -380,6 +380,70 @@ class TestComposeGate(ReplicaTempRootCase):
         self.assertIn('excavator', str(ctx.exception))
 
 
+class TestComposeGateRevalidates(ReplicaTempRootCase):
+    """合成卡点不信任一份可能来自旧版校验器的 validation 快照。
+
+    2026-08-12：变体阶梯被按原片口径判了 24 项「缺少 evidence_frames」，校验器改好之后
+    那份写死在 state 里的旧结论仍然拦着整单——快照过期比阶梯脏更难查。
+    """
+
+    def _variant_job(self):
+        state = self._ingest()
+        payload = {
+            'media_metadata': {'duration_sec': 10.0},
+            'change_events': [{'event_id': 'E01', 'start': 1.0, 'peak': 2.0, 'end': 3.0,
+                               'evidence_frames': ['review_001.png']}],
+            'review_sampling': {'frames': [{'index': 1, 'timestamp': 2.0,
+                                            'frame_path': '/x/review_001.png'}]},
+            'scenes': [],
+        }
+        with open(os.path.join(rp.job_dir(state['job_id']), 'video_overview.json'),
+                  'w', encoding='utf-8') as f:
+            json.dump(payload, f)
+        state['variant_of'] = 'replica_src'
+        state['beats'] = {
+            'video_duration_sec': 10.0, 'banned_elements': [],
+            'variant_of': 'replica_src', 'mutation_axes': ['carrier'],
+            'beats': [{
+                'id': 'B01', 'start': 0.0, 'end': 10.0, 'stage': 'structural',
+                'operation': 'work', 'visual_subject': 'a rusted bus shell',
+                'visible_details': ['bare'], 'visible_action': 'a worker works',
+                'visible_result': 'done', 'state_before': 'left half bare',
+                'state_after': 'left half done',
+                'package_operations': ['cut', 'fit', 'fasten'],
+                'persistent_traces': ['dust film', 'screw head rows'],
+                'workers_present': True, 'source_event_ids': ['E01'],
+                'reference_frames': ['review_001.png'],
+            }],
+        }
+        # 旧版校验器留下的快照：整拍都被判缺字段。
+        state['validation'] = [
+            {'level': 'error', 'code': 'missing_beat_field', 'message': 'B01 缺少字段 `evidence_frames`'},
+            {'level': 'error', 'code': 'no_evidence', 'message': 'B01 没有证据帧，但它断言了动作与结果'},
+        ]
+        rp._save_state(state)
+        return state
+
+    def test_a_stale_error_snapshot_is_recomputed_and_cleared(self):
+        state = self._variant_job()
+        with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'title': 't'}), \
+             patch('prompt_pipeline.compose_remaining_beats',
+                   return_value='VIDEO 1: a worker trowels the wall'), \
+             patch('server_common.write_library_item'):
+            out = rp.run_compose(state, {})
+        self.assertEqual(out['stage'], 'completed')
+        self.assertEqual([v for v in out['validation'] if v['level'] == 'error'], [])
+
+    def test_a_real_error_still_blocks_after_recomputation(self):
+        """重算不是放行：阶梯真脏的时候照样拦下。"""
+        state = self._variant_job()
+        state['beats']['beats'][0]['source_event_ids'] = []
+        rp._save_state(state)
+        with self.assertRaises(RuntimeError) as ctx:
+            rp.run_compose(state, {})
+        self.assertIn('E01', str(ctx.exception))
+
+
 class TestStageCatalogAndFrameUrls(ReplicaTempRootCase):
     def test_every_stage_has_a_label(self):
         """漏一个 stage，工作台上就露出 `confirm_cost` 这种内部名。"""
@@ -474,6 +538,81 @@ class TestHandoffToRenderer(ReplicaTempRootCase):
         rp._save_state(state)
         with self.assertRaises(ValueError):
             rp.handoff_to_render(state['job_id'])
+
+
+class TestPublishToProject(ReplicaTempRootCase):
+    """「存入项目并打开激发结果」。
+
+    复刻页的终点从"送去分步管线渲染"改成"落成一个项目"：项目才是所有下游动作
+    （分步合成 / 一键合成 / 手动编辑 / 帧序列）的共同起点，只通向分步管线那一条路
+    把用户锁死在一种渲染方式上。
+
+    这条路径上两样东西缺一不可，缺了它们那条记录只是工作台上的一行标题：
+      · project_key —— 媒体目录的命名空间（帧、视频、manifest 全挂它下面），
+        而且必须**跨多次点击稳定**，否则第二次点会把已渲出的帧留在无人打开的目录里；
+      · prompt_slots —— 槽位契约的权威解析，前端优先消费它。
+    """
+
+    BLOCK = ('图片提示词\n图片 1:\n一间石屋\n\n图片 2:\n屋顶已封\n\n'
+             '视频提示词\n视频 1:\n工人抹平墙面\n')
+
+    def _completed_job(self):
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': []}
+        state['validation'] = []
+        rp._save_state(state)
+        with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'title': '石屋工作室'}), \
+             patch('prompt_pipeline.compose_remaining_beats', return_value=self.BLOCK), \
+             patch('server_common.write_library_item'):
+            rp.run_compose(state, {})
+        return state
+
+    def test_the_published_item_is_a_real_project(self):
+        state = self._completed_job()
+        with patch('server_common.write_library_item') as write_item:
+            item = rp.publish_to_project(state['job_id'])
+        write_item.assert_called_once()
+        self.assertEqual(item['id'], state['job_id'])
+        self.assertTrue(item['project_key'].startswith('run_'))
+        self.assertEqual([s['index'] for s in item['prompt_slots']['images']], [1, 2])
+        self.assertEqual([s['index'] for s in item['prompt_slots']['videos']], [1])
+        self.assertEqual(item['image_count'], 2)
+        self.assertEqual(item['prompt_block'], self.BLOCK)
+
+    def test_the_project_key_is_stable_across_repeated_saves(self):
+        """再点一次「存入项目」不能换命名空间——那会把已渲出的帧丢在无人打开的目录里。"""
+        state = self._completed_job()
+        with patch('server_common.write_library_item'):
+            first = rp.publish_to_project(state['job_id'])
+            second = rp.publish_to_project(state['job_id'])
+        self.assertEqual(first['project_key'], second['project_key'])
+        self.assertEqual(rp._load_state(state['job_id'])['project_key'],
+                         first['project_key'])
+
+    def test_a_blocked_job_cannot_become_a_project(self):
+        """门禁没过的提示词不该在工作台上露面，更不该被下游当成可渲染的项目。"""
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': ['excavator']}
+        state['validation'] = []
+        rp._save_state(state)
+        with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'title': 't'}), \
+             patch('prompt_pipeline.compose_remaining_beats',
+                   return_value='视频提示词\n视频 1:\n一台 EXCAVATOR 转进画面\n'), \
+             patch('server_common.write_library_item'):
+            rp.run_compose(state, {})
+        with patch('server_common.write_library_item') as write_item:
+            with self.assertRaises(ValueError) as ctx:
+                rp.publish_to_project(state['job_id'])
+        self.assertIn('excavator', str(ctx.exception))
+        write_item.assert_not_called()
+
+    def test_a_failed_write_is_reported_not_swallowed(self):
+        """合成收尾时入库失败可以吞（那只是附赠）；用户手点这个按钮时不能吞——
+        静默失败会把他送进一个空的结果页，还以为是页面没刷新。"""
+        state = self._completed_job()
+        with patch('server_common.write_library_item', side_effect=OSError('磁盘满')):
+            with self.assertRaises(OSError):
+                rp.publish_to_project(state['job_id'])
 
 
 class TestSaveBeats(ReplicaTempRootCase):

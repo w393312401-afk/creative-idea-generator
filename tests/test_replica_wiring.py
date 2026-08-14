@@ -62,7 +62,8 @@ def test_stepped_pipeline_can_skip_recomposition():
 def test_the_new_routes_are_registered():
     import server
     src = inspect.getsource(server)
-    for route in ('/api/replica/extract', '/api/replica/cancel', '/api/replica/handoff'):
+    for route in ('/api/replica/extract', '/api/replica/cancel', '/api/replica/handoff',
+                  '/api/replica/to_project'):
         assert f"path == '{route}'" in src, f'{route} 没有注册'
 
 
@@ -192,3 +193,96 @@ def test_package_operations_backfill_uses_declared_work_before_inventing_any():
     # 3) 运镜拍不承载施工增量，一律不碰。
     assert ladder[2]['package_operations'] == ['reward']
     assert [r[0] for r in repaired] == [1, 2]
+
+
+def test_the_stage_taxonomy_agrees_across_validator_prompt_and_ui():
+    """第五处接缝：施工阶段这套九档分类，判据、产出它的提示词、改它的 UI 必须一致。
+
+    2026-08-13 的整单卡死就出在这条缝上：Pass B 的提示词只列了九个**名字**、一条释义
+    没有，模型把「立墙龙骨 + 塞保温」判成 fixtures（灯具设备）；校验器照着这个标签
+    推断「装了通电设备却全程没布线」，报出一条与真实病灶无关的硬伤；而前端把 stage
+    渲成只读 chip，用户在唯一的人工卡点上根本改不动它。三层各自都"对"，缝上却对不齐。
+    """
+    import os
+    import re
+
+    stages = set(reverse._STAGE_RANK)
+
+    # 1) 提示词必须逐档给出释义，而不只是列举名字——没有释义，分类就是按词面猜。
+    for stage in stages:
+        assert f'- {stage}:' in reverse._PASS_B_SYSTEM, f'Pass B 提示词缺少 {stage} 的释义'
+
+    # 2) UI 必须给得出全部九档，否则用户改不到某一档（改不动的字段最容易错）。
+    js_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           'js', 'replica_pipeline.js')
+    with open(js_path, encoding='utf-8') as f:
+        js = f.read()
+    block = re.search(r'const REPLICA_BEAT_STAGE_LABELS = \{(.*?)\};', js, re.S)
+    assert block, '前端的施工阶段标签表不见了'
+    assert set(re.findall(r'(\w+):', block.group(1))) == stages
+
+    # 3) 那张表必须真的接到可编辑控件上。断言渲染函数存在且写的是 stage 这个键——
+    #    只有标签表、没有 select，就退回 2026-08-13 之前那个改不动的只读 chip。
+    assert 'function replicaStageSelect(' in js
+    assert 'data-key="stage"' in js
+
+
+def test_scene_constants_reach_the_composer_system_prompt():
+    """第六处接缝：场景恒常特征必须真的被写手读到。
+
+    与 banned_elements 的历史教训同型（2026-08-10：dimensions 里写了、零消费者）。
+    这条链路有四跳，断在任何一跳，产物看起来都正常，只是复刻出来不像原片——
+    beats_doc → beats_to_dimensions → parsed_brief → composer system prompt。
+    """
+    doc = {
+        'video_duration_sec': 10.0, 'banned_elements': [],
+        'scene_signature': 'A mossy concrete bunker in autumn woodland, lit by one work light.',
+        'scene_constants': {
+            'materials': ['greenish stained concrete'],
+            'fixtures_in_shot': ['tripod-mounted work light'],
+        },
+        'beats': [{'id': 'B01', 'start': 0, 'end': 10, 'stage': 'demolition',
+                   'operation': 'clearing', 'package_operations': ['rake', 'sweep'],
+                   'visual_subject': 'a floor', 'visible_details': ['leaf litter'],
+                   'visible_action': 'a worker rakes', 'visible_result': 'floor is clear',
+                   'state_before': 'covered', 'state_after': 'clear',
+                   'persistent_traces': ['rake lines', 'damp patch'],
+                   'workers_present': True, 'source_event_ids': [],
+                   'evidence_frames': ['review_002.png']}],
+    }
+
+    # 1) beats → dimensions
+    dims = reverse.beats_to_dimensions(doc)
+    assert dims['scene_constants']['materials'] == ['greenish stained concrete']
+    assert dims['scene_signature'].startswith('A mossy concrete bunker')
+
+    # 2) dimensions → parsed_brief（compose_anchor_and_packet 内部那一跳；这里直接验
+    #    它读的是哪个键，避免为了一次接线断言去跑整个 Phase 1）
+    brief = {}
+    if dims.get('scene_constants'):
+        brief['scene_constants'] = dims['scene_constants']
+    if dims.get('scene_signature'):
+        brief['scene_signature'] = dims['scene_signature']
+
+    # 3) parsed_brief → system prompt
+    c = _Composer()
+    c.state = {'parsed_brief': brief}
+    block = c.scene_constants_block()
+    assert 'SCENE CONSTANTS' in block
+    assert 'greenish stained concrete' in block
+    assert 'tripod-mounted work light' in block
+    assert 'mossy concrete bunker' in block
+
+    # 4) 非复刻单一个字都不该多出来
+    plain = _Composer()
+    plain.state = {'parsed_brief': {}}
+    assert plain.scene_constants_block() == ""
+
+
+def test_the_composer_prompt_actually_includes_the_scene_block():
+    """段落本身写对了，但没被拼进 system prompt 的话，等于没写。"""
+    import inspect
+
+    src = inspect.getsource(BaseComposer)
+    assert src.count('self.scene_constants_block()') >= 2, \
+        '批量直出与单拍兜底两条路径都要带上这一段'

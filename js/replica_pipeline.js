@@ -92,11 +92,12 @@ const REPLICA_MAX_AXES = 2;
  * 自动就有）。state.js 没加载时退回一份最小清单，保证选择器不会变成空下拉。
  */
 const REPLICA_FALLBACK_MODELS = [
+    { value: 'gemini-3.7-flash-high', label: 'gemini-3.7-flash-high' },
     { value: 'gemini-3.6-flash-high', label: 'gemini-3.6-flash-high' },
     { value: 'gemini-3.1-pro-high', label: 'gemini-3.1-pro-high' },
 ];
 
-const REPLICA_PASS_A_DEFAULT_MODEL = 'gemini-3.6-flash-high';
+const REPLICA_PASS_A_DEFAULT_MODEL = 'gemini-3.7-flash-high';
 
 function replicaModelChoices() {
     const groups = typeof LLM_MODEL_GROUPS !== 'undefined' ? LLM_MODEL_GROUPS : null;
@@ -575,17 +576,26 @@ function replicaRenderBeats(state) {
     // 展开。那条冲突已经在源头修掉（reverse_engineered 让合成器豁免清场规则），现在它
     // 只是一条"原片里确实有、复刻会照实保留"的提示，不再预示失败。
 
+    // 一条校验结论一个 <li>；带 beat_id 的做成可点，点了滚到那一拍并高亮。
+    // 原先是一列纯文本：红字说「B08 违反施工依赖顺序」，用户得自己在十几张卡片里
+    // 数到 B08。报错指得出是哪一拍，就应该能带人走到那一拍。
+    const item = (v) => (v.beat_id
+        ? `<li><button type="button" class="replica-jump" data-jump-beat="${escapeHtmlReplica(v.beat_id)}"
+                >${escapeHtmlReplica(v.message)}</button></li>`
+        : `<li>${escapeHtmlReplica(v.message)}</li>`);
+
     const banner = `
         ${errors.length ? `<div class="replica-banner replica-banner-error">
             <b>${errors.length} 项硬伤必须先修掉才能合成：</b>
-            <ul>${errors.map(v => `<li>${escapeHtmlReplica(v.message)}</li>`).join('')}</ul>
+            <ul>${errors.map(item).join('')}</ul>
         </div>` : `<div class="replica-banner replica-banner-ok">节拍阶梯已通过全部机械校验。</div>`}
         ${warns.length ? `<details class="replica-banner replica-banner-warn">
             <summary>${warns.length} 项待人工确认</summary>
-            <ul>${warns.map(v => `<li>${escapeHtmlReplica(v.message)}</li>`).join('')}</ul>
+            <ul>${warns.map(item).join('')}</ul>
         </details>` : ''}`;
 
-    const cards = (doc.beats || []).map((beat, idx) => replicaRenderBeatCard(state, beat, idx)).join('');
+    const cards = (doc.beats || []).map((beat, idx) => replicaRenderBeatCard(
+        state, beat, idx, (doc.beats[idx - 1] || {}).space)).join('');
     const banned = (doc.banned_elements || []).map(x => escapeHtmlReplica(x)).join('、');
 
     return `
@@ -596,12 +606,14 @@ function replicaRenderBeats(state) {
             改完记得保存——保存会立刻重跑一遍校验。
         </p>
         ${banner}
+        ${replicaRenderTimeWindows(doc)}
         <div class="replica-beats">${cards}</div>
         <div class="replica-section">
             <label class="replica-field-label">禁用元素（原片里不存在，出现在提示词里即须重写）</label>
             <textarea id="replica-banned" class="replica-textarea" rows="2"
                       placeholder="用、分隔">${banned}</textarea>
         </div>
+        ${replicaRenderSceneConstants(doc)}
         <div class="replica-actions">
             <button type="button" id="replica-save-btn" class="action-btn text-btn">保存并重校验</button>
             <button type="button" id="replica-recluster-btn" class="action-btn text-btn"
@@ -615,7 +627,126 @@ function replicaRenderBeats(state) {
     </div>`;
 }
 
-function replicaRenderBeatCard(state, beat, idx) {
+// 施工阶段：卡片上唯一一个由校验器直接判死、却长期改不动的字段。
+//
+// 它此前是个只读 chip。于是「阶段标错」这类硬伤在人工卡点上无解——红字指着某一拍说
+// 它违反施工依赖顺序，而那一拍上偏偏没有任何入口能纠正它，用户只能重跑聚类碰运气
+// （2026-08-13：整条阶梯只有一项硬伤，病灶恰好就是这个字段）。校验器指着某个字段说
+// 它不对，那个字段就必须能改，否则那条校验对人是不可操作的。
+//
+// 走 [data-beat][data-key] 那条通用回写通路，不另造一条：select 的 input 事件与
+// textarea 同形，写回的是 stage 的英文枚举值（中文只作显示，见 zh 的同一条纪律）。
+function replicaStageSelect(beat, idx) {
+    const current = beat.stage || '';
+    const known = Object.prototype.hasOwnProperty.call(REPLICA_BEAT_STAGE_LABELS, current);
+    // 模型偶尔回一个不在九档里的值。保留它作为一个选项，否则渲染时会被下拉框默默
+    // 改成第一档——用户没动过的字段被我们改了，还改得无声无息。
+    const options = [
+        ...(known || !current ? [] : [[current, `${current}（未知档，请重选）`]]),
+        ...Object.entries(REPLICA_BEAT_STAGE_LABELS),
+    ].map(([value, label]) => `
+        <option value="${escapeHtmlReplica(value)}" ${value === current ? 'selected' : ''}
+            >${escapeHtmlReplica(label)}</option>`).join('');
+    return `
+        <select class="replica-chip replica-stage-select" data-beat="${idx}" data-key="stage"
+                title="施工阶段。改完点「保存并重校验」立刻看硬伤数变化">${options}</select>`;
+}
+
+// 场景恒常特征：与禁用元素对称的另一半。禁用元素说「原片里永远没有的」，这里说
+// 「原片里一直都在的」。它随 dimensions 进每一条合成提示词，所以必须可编辑——统计
+// 难免把工人的手套、一次性道具算进来，用户删掉之后不能被下一次读状态又加回去
+// （后端 attach_scene_constants 因此只在字段为空时才算）。
+const REPLICA_SCENE_CONSTANT_FIELDS = [
+    ['materials', '常驻材质与表面'],
+    ['traces', '常驻痕迹与风化'],
+    ['fixtures_in_shot', '常驻画面的器具'],
+];
+
+function replicaRenderSceneConstants(doc) {
+    const sc = doc.scene_constants || {};
+    const signature = doc.scene_signature || '';
+    if (!signature && !REPLICA_SCENE_CONSTANT_FIELDS.some(([k]) => (sc[k] || []).length)) return '';
+    const rows = REPLICA_SCENE_CONSTANT_FIELDS.map(([key, label]) => `
+        <label class="replica-field">
+            <span class="replica-field-label">${label}</span>
+            <textarea class="replica-textarea" rows="2" data-scene-key="${key}"
+                      placeholder="用、分隔">${escapeHtmlReplica((sc[key] || []).join('、'))}</textarea>
+        </label>`).join('');
+    return `
+    <div class="replica-section">
+        <div class="replica-field-label">场景恒常特征（整片一直存在，会写进每一条提示词）</div>
+        <p class="replica-hint">
+            由帧事实本地统计得来。节拍只承载每一拍的变化，而这些东西不变化，因此在阶梯里没有落脚点——
+            不单独送进去，复刻出来就是工序全对、质感全无。误判的（工人手套、一次性道具）请直接删掉。
+        </p>
+        <label class="replica-field">
+            <span class="replica-field-label">场景一句话（模型写的整体基调，第一帧成立、最后一帧仍成立）</span>
+            <textarea class="replica-textarea" rows="2" id="replica-scene-signature"
+                      placeholder="例：一座长着青苔的混凝土掩体，位于秋日林地，靠一盏三脚架工作灯照明"
+                >${escapeHtmlReplica(signature)}</textarea>
+        </label>
+        <div class="replica-beat-fields">${rows}</div>
+    </div>`;
+}
+
+// 定长时间窗：与节拍并列的第二套读法。
+//
+// 节拍是模型按「生产里程碑」切的，宽窄不一；这一条按固定 5 秒切，只讲画面里多了
+// 什么、少了什么。两者对不上的地方就是要看帧的地方——某一窗有明显增减、而覆盖它的
+// 那一拍只字未提，那多半是漏掉了一道工序。全部由帧事实本地统计得来，不花模型钱。
+function replicaRenderTimeWindows(doc) {
+    const windows = doc.time_windows || [];
+    if (!windows.length) return '';
+
+    const tag = (items, cls, label) => (items || []).length
+        ? `<span class="replica-win-tag ${cls}">${label}</span>` +
+          (items || []).map(x => `<span class="replica-win-item">${escapeHtmlReplica(x)}</span>`).join('')
+        : '';
+
+    const rows = windows.map(w => {
+        const changed = (w.appeared || []).length + (w.vanished || []).length
+            + (w.brief || []).length;
+        return `
+        <div class="replica-win-row${changed ? '' : ' replica-win-quiet'}">
+            <span class="replica-win-time">${w.start}–${w.end}s</span>
+            <span class="replica-win-meta">${w.frame_count} 帧${
+                w.workers_present_ratio >= 0.5 ? '' : ' · 多为空镜'}</span>
+            <span class="replica-win-body">
+                ${tag(w.baseline, 'is-base', '起始')}
+                ${tag(w.appeared, 'is-new', '新增')}
+                ${tag(w.vanished, 'is-gone', '消失')}
+                ${tag(w.brief, 'is-brief', '仅此窗')}
+                ${changed ? '' : '<span class="replica-hint">画面无显著增减</span>'}
+            </span>
+        </div>`;
+    }).join('');
+
+    return `
+    <details class="replica-windows">
+        <summary>画面变化时间线（每 ${windows[0].end - windows[0].start}s 一格，共 ${windows.length} 格）</summary>
+        <p class="replica-hint">
+            由帧事实本地统计，不花模型调用。与上方节拍对照着看：某一格有明显增减、而覆盖它的那一拍
+            只字未提，多半是漏掉了一道工序。「消失」比「新增」噪声大——同一样东西换个说法就会被算成消失，
+            以画面为准。
+        </p>
+        <div class="replica-win-list">${rows}</div>
+    </details>`;
+}
+
+// 这一拍的空间标记。过门是复刻里最容易整段丢掉的东西——原片走廊尽头那道门再进一次，
+// 复刻里可能一次都没进（2026-08-14 复盘）。合成期按 space 序列逐处标过门，所以这里把
+// 「本拍换空间了」直接写在卡片头上：用户核对时看得见有没有多、有没有少。
+function replicaSpaceChip(beat, idx, previousSpace) {
+    const space = String(beat.space || '').trim();
+    if (!space) return '';
+    const previous = String(previousSpace || '').trim();
+    const crossed = idx > 0 && previous && previous.toLowerCase() !== space.toLowerCase();
+    return crossed
+        ? `<span class="replica-chip replica-chip-cross">过门 → ${escapeHtmlReplica(space)}</span>`
+        : `<span class="replica-chip">${escapeHtmlReplica(space)}</span>`;
+}
+
+function replicaRenderBeatCard(state, beat, idx, previousSpace) {
     const frames = beat.evidence_frames || beat.reference_frames || [];
     const isRef = !beat.evidence_frames && (beat.reference_frames || []).length;
     // 证据帧原地开灯箱，不再 target="_blank"。核对是「看一眼帧、回来改这一拍」的
@@ -626,6 +757,18 @@ function replicaRenderBeatCard(state, beat, idx) {
         <img class="replica-thumb" src="${replicaFrameUrl(state, name)}"
              alt="${escapeHtmlReplica(name)}" title="${escapeHtmlReplica(name)}" loading="lazy"
              data-lightbox-beat="${idx}" data-lightbox-at="${at}">`).join('');
+
+    // 覆盖帧：按时间均分铺满整个拍窗（后端 attach_coverage_frames 算好的）。证据帧
+    // 最多三张，一拍 10s 的窗光看那三张等于中段全黑；这一排是拿来看「这段时间里
+    // 到底发生了什么」的，不参与任何判据，所以标注时间、但不做成可编辑字段。
+    const coverage = beat.coverage_frames || [];
+    const coverageThumbs = coverage.map((item, at) => `
+        <figure class="replica-cov-item">
+            <img class="replica-thumb replica-thumb-cov" src="${replicaFrameUrl(state, item.frame)}"
+                 alt="${escapeHtmlReplica(item.frame)}" title="${escapeHtmlReplica(item.frame)}"
+                 loading="lazy" data-cov-beat="${idx}" data-cov-at="${at}">
+            <figcaption class="replica-cov-time">${item.timestamp}s</figcaption>
+        </figure>`).join('');
 
     // 中文对照：反推产出的是英文（下游提示词、相位判定、banned 门禁读的都是它），
     // 但人工卡点是给人看的。zh 只在这里显示，永远不回写英文字段。
@@ -649,11 +792,11 @@ function replicaRenderBeatCard(state, beat, idx) {
         <div class="replica-beat-head">
             <b>${escapeHtmlReplica(beat.id)}</b>
             <span class="replica-chip">${beat.start}s – ${beat.end}s</span>
-            <span class="replica-chip" title="${escapeHtmlReplica(beat.stage || '')}">${escapeHtmlReplica(
-                REPLICA_BEAT_STAGE_LABELS[beat.stage] || beat.stage || '未分类')}</span>
+            ${replicaStageSelect(beat, idx)}
             ${beat.source_event_ids && beat.source_event_ids.length
                 ? `<span class="replica-chip">事件 ${escapeHtmlReplica(beat.source_event_ids.join(','))}</span>` : ''}
             <span class="replica-chip">${beat.workers_present ? '有工人' : '清场帧（锚点候选）'}</span>
+            ${replicaSpaceChip(beat, idx, previousSpace)}
             ${typeof beat.confidence === 'number' && beat.confidence < 0.5
                 ? '<span class="replica-chip replica-chip-error">低置信</span>' : ''}
             <span class="replica-beat-tools">
@@ -664,7 +807,13 @@ function replicaRenderBeatCard(state, beat, idx) {
         </div>
         <div class="replica-thumbs">${thumbs || '<span class="replica-hint">无证据帧</span>'}</div>
         ${isRef ? '<p class="replica-hint">变体：这些帧只作运镜与构图参考，不再是事实断言。</p>' : ''}
+        ${coverage.length ? `
+        <details class="replica-coverage" ${beat.end - beat.start >= 6 ? 'open' : ''}>
+            <summary class="replica-hint">覆盖帧 ${coverage.length} 张（${beat.start}s – ${beat.end}s 内按时间均分，仅供核对）</summary>
+            <div class="replica-cov-strip">${coverageThumbs}</div>
+        </details>` : ''}
         <div class="replica-beat-fields">
+            ${field('space', '所在空间（同一个空间逐字沿用同一个名字；换名字＝机位穿过开口进了另一个空间，会多出一次过门）')}
             ${field('visual_subject', '画面主体')}
             ${field('operation', '主导工序')}
             ${field('package_operations',
@@ -703,8 +852,9 @@ function replicaRenderOutput(state) {
     if (!state.prompt_block) return '';
     const hits = state.banned_hits || [];
     const blocked = state.stage === 'audit_failed';
-    // 提示词只活在这一页里的话，用户合成完就没有下一步了。两个去向都要写出来：
-    // 一个是创意库（项目工作台能看到），一个是分步管线（真正渲染成片）。
+    // 提示词只活在这一页里的话，用户合成完就没有下一步了。下一步只有一个去向：
+    // 存成项目、直接进激发结果页。渲染（分步合成 / 一键合成）在那一页里全都有，
+    // 复刻页不必自己再开一条只通向分步管线的窄路。
     return `
     <div class="replica-section">
         <div class="replica-card-title">提示词包${state.title ? ` · ${escapeHtmlReplica(state.title)}` : ''}</div>
@@ -717,14 +867,16 @@ function replicaRenderOutput(state) {
         </div>` : `<div class="replica-banner replica-banner-ok">
             已通过禁用元素门禁，并写入创意库${state.library_id
                 ? `（项目工作台可见：${escapeHtmlReplica(state.title || state.library_id)}）` : ''}。
+            下一步按「存入项目并打开激发结果」：渲染（分步合成 / 一键合成）、手动改提示词、
+            补主题与话题，都在那一页上。
         </div>`}
         <div class="replica-actions">
             <button type="button" id="replica-copy-btn" class="action-btn text-btn">复制全部</button>
             ${blocked
                 ? `<button type="button" id="replica-recompose-btn" class="action-btn primary-btn"
                            title="回到节拍阶梯改完后重新合成">重新合成</button>`
-                : `<button type="button" id="replica-render-btn" class="action-btn primary-btn"
-                           title="用这份已过门禁的提示词直接开分步渲染，不重新合成">送去分步管线渲染</button>`}
+                : `<button type="button" id="replica-project-btn" class="action-btn primary-btn"
+                           title="把这份已过门禁的提示词存成一个项目，并立刻打开它的激发结果页">存入项目并打开激发结果</button>`}
         </div>
         <pre class="replica-prompt-block" id="replica-prompt-block">${escapeHtmlReplica(state.prompt_block)}</pre>
     </div>`;
@@ -749,7 +901,7 @@ function replicaBindEvents() {
     on('#replica-frame-model', replicaCaptureReverseModels, 'change');
     on('#replica-peak-model', replicaCaptureReverseModels, 'change');
     on('#replica-recompose-btn', replicaCompose);
-    on('#replica-render-btn', replicaSendToRender);
+    on('#replica-project-btn', (e) => replicaSaveToProject(e.currentTarget));
     on('#replica-cancel-btn', replicaCancelRun);
     on('#replica-copy-btn', () => {
         const block = root.querySelector('#replica-prompt-block');
@@ -845,6 +997,35 @@ function replicaBindBeatEvents(scope) {
         });
     });
 
+    // 覆盖帧走同一个灯箱，一拍的整排帧作为一组：左右方向键就是在这一拍的时间轴上
+    // 前后走，这正是「长拍中段发生了什么」最自然的看法。
+    scope.querySelectorAll('[data-cov-beat]').forEach(img => {
+        img.addEventListener('click', () => {
+            const beats = ((replicaState || {}).beats || {}).beats || [];
+            const beat = beats[parseInt(img.dataset.covBeat, 10)];
+            if (!beat) return;
+            replicaOpenLightbox((beat.coverage_frames || []).map(item => ({
+                url: replicaFrameUrl(replicaState, item.frame),
+                caption: `${beat.id || ''} ${item.timestamp}s ${item.frame}`,
+            })), parseInt(img.dataset.covAt, 10) || 0);
+        });
+    });
+
+    // 硬伤 → 涉事那一拍。高亮用一次性的 class，动画结束就摘掉，免得整页留着一片黄。
+    scope.querySelectorAll('[data-jump-beat]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const beats = ((replicaState || {}).beats || {}).beats || [];
+            const idx = beats.findIndex(b => b.id === btn.dataset.jumpBeat);
+            const card = idx >= 0 && scope.querySelector(`[data-beat-index="${idx}"]`);
+            if (!card) { replicaToast(`找不到 ${btn.dataset.jumpBeat}，阶梯可能已被改过`, true); return; }
+            card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            card.classList.remove('replica-beat-flag');
+            // 强制回流，否则连点同一条时 class 没被真正摘掉过，动画不会重播。
+            void card.offsetWidth;
+            card.classList.add('replica-beat-flag');
+        });
+    });
+
     scope.querySelectorAll('[data-split]').forEach(btn => {
         btn.addEventListener('click', () => replicaSplitBeat(parseInt(btn.dataset.split, 10)));
     });
@@ -877,6 +1058,22 @@ function replicaBindBeatEvents(scope) {
             replicaState.beats.banned_elements = replicaSplitList(banned.value);
         });
     }
+
+    const signature = scope.querySelector('#replica-scene-signature');
+    if (signature) {
+        signature.addEventListener('input', () => {
+            if (!replicaState || !replicaState.beats) return;
+            replicaState.beats.scene_signature = signature.value.trim();
+        });
+    }
+
+    scope.querySelectorAll('[data-scene-key]').forEach(el => {
+        el.addEventListener('input', () => {
+            if (!replicaState || !replicaState.beats) return;
+            const sc = replicaState.beats.scene_constants || (replicaState.beats.scene_constants = {});
+            sc[el.dataset.sceneKey] = replicaSplitList(el.value);
+        });
+    });
 
     // 只在轴数超上限时拦一下，别默默改用户的勾选——用户自己取消一个，比我们替他决定
     // 丢掉哪一个要好。
@@ -1077,19 +1274,42 @@ async function replicaCompose(btn) {
     replicaAdvance('approve', {}, btn instanceof HTMLElement ? btn : undefined);
 }
 
-async function replicaSendToRender() {
+// 「存入项目并打开激发结果」。
+//
+// 这里原先是「送去分步管线渲染」：一按就起一条 stepped 任务，把用户扔进分步管线页。
+// 那条路只通向一种渲染方式，而且渲染一旦开跑，这一单在工作台上才刚刚成形——用户
+// 想先看看提示词、改一拍、或者改用别的渲染方式，都没有入口。改成先落成项目：
+// 项目才是这套系统里所有下游动作（分步合成、一键合成、手动编辑、帧序列）的共同起点。
+async function replicaSaveToProject(btn) {
     if (!replicaState) return;
-    replicaSetBusy(true);
+    replicaSetBusy(true, btn);
     try {
-        const data = await replicaFetch('/api/replica/handoff', {
+        const data = await replicaFetch('/api/replica/to_project', {
             method: 'POST', headers: replicaHeaders(),
-            body: JSON.stringify({ job_id: replicaState.job_id, config: replicaConfig() }),
+            body: JSON.stringify({ job_id: replicaState.job_id }),
         });
-        // 交接之后这条任务就归分步管线了——复刻页不接管它的进度，把用户送过去。
-        replicaToast(`已送去分步管线：${data.title || ''}。` +
-            (data.reused_compose ? '沿用了已过门禁的提示词，未重新合成。' : '') +
-            '去「分步管线」页看渲染进度。');
-        if (typeof switchMainTab === 'function') switchMainTab('stepped');
+        const item = data && data.item;
+        if (!item || !item.id) throw new Error('服务端没有回这条项目记录，未打开结果页');
+
+        // 服务端已经落库（write_library_item），这里只把浏览器里那份 savedIdeas 对齐：
+        // 不再 persistIdeaItem —— 那会把刚拿到的同一条记录原样写回去一次。
+        if (typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
+            const at = savedIdeas.findIndex(x => String(x.id) === String(item.id));
+            if (at >= 0) savedIdeas[at] = item;
+            else savedIdeas.unshift(item);
+        }
+        if (typeof refreshProjects === 'function') refreshProjects({ assets: false });
+
+        if (typeof loadSavedIdea !== 'function' || typeof switchMainTab !== 'function') {
+            // 存是存下了，只是这一页打不开它。说清楚"已存入"，别让用户以为白按了。
+            replicaToast('已存入项目，但激发结果工作区尚未加载完成——去「激发结果」页手动打开它。',
+                         true);
+            return;
+        }
+        switchMainTab('results');
+        loadSavedIdea(item, { toast: `已存入项目「${item.title || ''}」，可在这里渲染或继续编辑` });
+        // loadSavedIdea 收尾停在「总览」，而这一单此刻只有提示词集——直接落到那一页。
+        if (typeof switchTab === 'function') switchTab('prompts');
     } catch (e) {
         replicaToast(e.message, true);
     } finally {
@@ -1182,7 +1402,10 @@ function replicaMergeBeat(idx) {
     prev.state_after = cur.state_after;
     prev.visible_result = cur.visible_result;
     prev.source_event_ids = [...(prev.source_event_ids || []), ...(cur.source_event_ids || [])];
-    prev.evidence_frames = [...(prev.evidence_frames || []), ...(cur.evidence_frames || [])];
+    // 变体那一份叫 reference_frames。写死 evidence_frames 会同时丢掉参考帧、并给变体
+    // 凭空造出一个空的 evidence_frames——两边都会在合成卡点上报错。
+    const frameKey = prev.evidence_frames || cur.evidence_frames ? 'evidence_frames' : 'reference_frames';
+    prev[frameKey] = [...(prev[frameKey] || []), ...(cur[frameKey] || [])];
     prev.persistent_traces = [...(prev.persistent_traces || []), ...(cur.persistent_traces || [])];
     doc.beats.splice(idx, 1);
     replicaState.beats = doc;

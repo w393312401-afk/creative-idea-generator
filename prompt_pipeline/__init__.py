@@ -37,6 +37,16 @@ from .frame_state import (
     validate_frame_state_contract,
     compile_delta_image_prompt,
 )
+# Named Cast Lock（具名人物一致性锁）。re-export 是给契约注册表用的：
+# contract-registry.json 里 named-cast-vocabulary-lock / named-cast-hal-exclusivity 的
+# enforcer 写成 `prompt_pipeline:named_cast_lock_violations`，
+# tests/test_skill_contract_registry.py 会按 `模块:属性` 真的 import 一次，
+# 解析不到就红——所以这里必须是模块级名字，不能只在函数里 import。
+from .cast_lock import (
+    named_cast_lock_violations,
+    named_cast_beat_violations,
+    apply_named_cast_settings,
+)
 
 
 def _raise_if_cancelled(on_progress):
@@ -854,7 +864,7 @@ def refresh_trend_refs(config):
 
 def _chat(config, system, user, temperature=0.85, max_tokens=16384, timeout=240, on_chunk=None, model=None, enable_search=False):
     if not model:
-        model = config.get('model') or 'gemini-3.6-flash-high'
+        model = config.get('model') or 'gemini-3.7-flash-high'
     base_url, api_key = resolve_gateway(model, config)
 
     payload = {
@@ -1011,7 +1021,7 @@ def _chat(config, system, user, temperature=0.85, max_tokens=16384, timeout=240,
 
 def _multimodal_chat(config, system, user_text, image_paths, model=None, max_tokens=1000, timeout=90):
     if not model:
-        model = config.get('model') or 'gemini-3.6-flash-high'
+        model = config.get('model') or 'gemini-3.7-flash-high'
     base_url, api_key = resolve_gateway(model, config)
 
     content_list = [{"type": "text", "text": user_text}]
@@ -2754,7 +2764,8 @@ _STABILITY_OCCLUSION_WORDS = (
     'cover', 'hide', 'enclose', 'seal over', 'behind', 'conceal',
     '覆盖', '遮挡', '封闭', '隐藏',
 )
-from .scene_state import build_scene_states, validate_scene_states, compile_video_skeleton
+from .scene_state import (build_scene_states, validate_scene_states, compile_video_skeleton,
+                          scrub_planning_annotations)
 _STABILITY_CAMERA_WORDS = ('reframe', 'push-in', 'push in', 'pan', 'turn', 'cross', '穿过', '转向')
 
 
@@ -4140,15 +4151,15 @@ def finalize_beat_ladder_fields(beat_ladder):
         if beat.get('space_id'):
             current_space = str(beat['space_id'])
         elif beat.get('bridge_stage') or beat.get('hard_cut'):
-            current_space = 'secondary' if current_space in ('primary', 'secondary') else 'primary'
+            current_space = next_space_id(current_space)
         beat['index'] = index
         beat.setdefault('space_id', current_space)
         beat.setdefault('transition_stage', 'none')
-        beat.setdefault('camera_family', 'oblique_exterior' if current_space == 'site' else 'oblique_interior')
+        beat.setdefault('camera_family', space_camera_family(current_space))
         beat.setdefault('reveal_scope', 'full')
         semantic = ' '.join(str(beat.get(k) or '') for k in
                             ('operation', 'description', 'milestone_name', 'after_state')).lower()
-        if current_space in ('primary', 'secondary') and re.search(
+        if is_interior_space(current_space) and re.search(
                 r'\b(?:power source|battery|generator|solar|wiring|electrical|rough-in|conduit)\b', semantic):
             powered_spaces.add(current_space)
         if 'light_source_state' not in beat:
@@ -4160,6 +4171,128 @@ def finalize_beat_ladder_fields(beat_ladder):
                 beat['light_source_state'] = 'entry daylight or carried portable work light only; fixed fixtures dark'
         beat.setdefault('result_space_family', 'exterior' if current_space == 'site' else 'interior')
     return normalize_beat_ladder(beat_ladder)
+
+
+# ── 空间序列（任意多个） ─────────────────────────────────────────────────────
+#
+# 2026-08-14 之前，一条梯子最多认得三个空间：'site'（外景）、'primary'（进门后的室内）、
+# 'secondary'（只有 nested_space_payoff 那个骨架才会出现的第二个室内）。空间数写死，
+# 过门次数就跟着写死——原片进了三次门，复刻永远只进第一次（用户复盘：走廊尽头那道门
+# 从头到尾没被推开过）。这几个函数把那套词表改成开放序列：site → primary → secondary →
+# space_3 → space_4 …，前两级的名字与所有既有判据保持逐字兼容。
+_SPACE_ID_SEQUENCE = ('site', 'primary', 'secondary')
+
+
+def space_id_at(ordinal, has_exterior=True):
+    """第 `ordinal` 个空间的规范 id（1-based，含外景）。"""
+    names = _SPACE_ID_SEQUENCE if has_exterior else _SPACE_ID_SEQUENCE[1:]
+    if 1 <= ordinal <= len(names):
+        return names[ordinal - 1]
+    return f'space_{ordinal}'
+
+
+def next_space_id(current):
+    """当前空间的下一个空间 id。"""
+    current = str(current or '')
+    if current in _SPACE_ID_SEQUENCE:
+        position = _SPACE_ID_SEQUENCE.index(current) + 1
+        return space_id_at(position + 1)
+    match = re.fullmatch(r'space_(\d+)', current)
+    if match:
+        return f'space_{int(match.group(1)) + 1}'
+    return 'primary'
+
+
+def is_interior_space(space_id):
+    """外景之外的一切都是室内。空间数不再封顶，判据只能问「是不是外景」。"""
+    return bool(space_id) and str(space_id) != 'site'
+
+
+def space_ordinal(space_id):
+    """空间 id → 它是第几个室内空间（外景恒为 1，不参与室内锚点选择）。"""
+    space_id = str(space_id or '')
+    if space_id in ('', 'site', 'primary'):
+        return 1
+    if space_id == 'secondary':
+        return 2
+    match = re.fullmatch(r'space_(\d+)', space_id)
+    # space_N 的 N 是含外景的序号，室内序号要减去外景那一格。
+    return max(1, int(match.group(1)) - 1) if match else 1
+
+
+def space_camera_family(space_id):
+    """空间 id → 默认机位族名。同一空间的每一帧共用一个族，不同空间必须不同名，
+    否则 frame_continuity 会拿上一个空间的族锚去比对新空间的首帧。"""
+    if not is_interior_space(space_id):
+        return 'oblique_exterior'
+    ordinal = space_ordinal(space_id)
+    return 'oblique_interior' if ordinal == 1 else f'oblique_interior_{ordinal}'
+
+
+def apply_observed_space_sequence(beat_ladder, parsed_brief):
+    """按**原片观察到的**空间序列，在梯子上确定性地标出每一次过门。返回过门拍号列表。
+
+    复刻线专用（清单条目带 `space` 时才生效）。规划器已经被 build_outline_plan_block 的
+    SPACE 规则点过名，但它是模型：过门标记漏一处、多一处、错一拍都发生过，而这个标记是
+    下游一切空间语义的唯一入口——[BRIDGE] 标签、机位族切分（frame_continuity.family_map）、
+    跨越片段的生成、锚点换视图（packet_for_space）全从它读。所以这里再做一次确定性收口：
+    序列变一次就是一次过门，多标的清掉，漏标的补上，位置以清单为准。
+
+    只改空间/过门这几个键，不碰任何施工字段——那些是规划器的产物，本函数无权改写。
+    """
+    if not isinstance(beat_ladder, list):
+        return []
+    plan = (parsed_brief or {}).get('beat_outline') or []
+    labels = outline_space_labels(plan)
+    if not labels or len(labels) != len(beat_ladder):
+        # 条数对不上就整段不生效：一比一契约破了的时候（规划四轮全灭退回兜底梯子），
+        # 按下标硬贴空间只会把过门贴到毫不相干的拍上。
+        return []
+    has_exterior = (parsed_brief or {}).get('mode') == 'Threshold'
+    ordinal_by_label = {}
+    for label in labels:
+        if label not in ordinal_by_label:
+            ordinal_by_label[label] = len(ordinal_by_label) + 1
+    crossings, bridge_serial = [], 0
+    for position, (beat, label) in enumerate(zip(beat_ladder, labels), 1):
+        if not isinstance(beat, dict):
+            continue
+        space_id = space_id_at(ordinal_by_label[label], has_exterior=has_exterior)
+        is_crossing = position > 1 and label != labels[position - 2]
+        beat['space_id'] = space_id
+        beat['observed_space'] = label
+        beat['camera_family'] = space_camera_family(space_id)
+        beat['result_space_family'] = 'exterior' if space_id == 'site' else 'interior'
+        if is_crossing:
+            bridge_serial += 1
+            crossings.append(position)
+            beat['bridge_stage'] = bridge_serial
+            # transition_stage 留 'none'：这些拍不是被展开出来的纯运镜拍，它们照常交付
+            # 自己那一条清单工序，过门只是本拍视频的开场（见 build_outline_plan_block
+            # 的 SPACE 规则）。beat_is_crossing_clip 认 bridge_stage，够用。
+            beat.setdefault('transition_stage', 'none')
+            beat['hard_cut'] = False
+        else:
+            beat['bridge_stage'] = None
+            beat['hard_cut'] = False
+    if isinstance(parsed_brief, dict):
+        parsed_brief['observed_space_sequence'] = list(labels)
+        parsed_brief['observed_space_crossings'] = list(crossings)
+        # 空间图跟着重登记：它是「不许凭空多出一个房间」那条契约的登记处，
+        # 而原片里确实存在的第三、第四个空间必须在册，否则合成侧会把它当违规。
+        parsed_brief['space_graph'] = {
+            'nodes': [{'id': space_id_at(o, has_exterior=has_exterior),
+                       'observed': label,
+                       'kind': 'exterior' if space_id_at(o, has_exterior=has_exterior) == 'site'
+                               else 'interior'}
+                      for label, o in ordinal_by_label.items()],
+            'edges': [{'from': space_id_at(ordinal_by_label[labels[p - 2]], has_exterior=has_exterior),
+                       'to': space_id_at(ordinal_by_label[labels[p - 1]], has_exterior=has_exterior),
+                       'via': f'observed opening between {labels[p - 2]} and {labels[p - 1]}'}
+                      for p in crossings],
+            'rule': 'never create an unregistered room or invisible connection',
+        }
+    return crossings
 
 
 def _beat_semantic_text(beat):
@@ -4395,16 +4528,17 @@ def beat_space_family(beat_ladder, i):
 
 
 def beat_space_index(beat_ladder, i):
-    """这一拍的 IMAGE 属于第几个室内空间：1 = 主空间，2 = 重置后的第二空间。
+    """这一拍的 IMAGE 属于第几个室内空间：1 = 主空间，2 = 第二个室内空间，依此类推。
 
-    只有「双空间重置兑现」那种 bridge（进主空间）+ 之后一个 hard_cut（重置）的形态会
-    返回 2。单一切入拍的项目（hard_cut 变体、无 bridge）整片只有一个室内，恒为 1。
-    外景拍也返回 1——它不参与室内锚点的选择。"""
+    2026-08-14 之前这里封顶在 2（只认 'secondary'），因为当时一条梯子最多有两个室内。
+    复刻线按原片观察到的空间序列标过门之后，室内空间可以有任意多个（space_ordinal），
+    封顶就意味着第三个空间会拿到第一个空间的锚点集与 camera DNA。
+    外景拍返回 1——它不参与室内锚点的选择。"""
     if not beat_ladder:
         return 1
     if (1 <= i <= len(beat_ladder) and isinstance(beat_ladder[i - 1], dict)
             and beat_ladder[i - 1].get('space_id')):
-        return 2 if beat_ladder[i - 1].get('space_id') == 'secondary' else 1
+        return space_ordinal(beat_ladder[i - 1].get('space_id'))
     b1 = cut = None
     for idx, b in enumerate(beat_ladder, start=1):
         if not isinstance(b, dict):
@@ -4418,6 +4552,13 @@ def beat_space_index(beat_ladder, i):
     return 2 if i >= cut else 1
 
 
+def _int_or_none(value):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def packet_for_space(packet, space):
     """把 Drift Lock 包切到第二空间的锚点视角。
 
@@ -4427,11 +4568,33 @@ def packet_for_space(packet, space):
     validator 逐个加形参——漏掉任何一处，第一空间的地标就会被盖到第二空间的帧上，
     画面读起来就是「刚装好的空间原地变回废墟」（2026-07-31 实机复盘）。
 
+    第三个及以后的空间（复刻线按原片观察到的空间序列可以有任意多个）读
+    `interior_space_families` 里对应的那一项；只有两个室内空间的老包仍走
+    secondary_interior_* 那两个键，行为逐字不变。查不到自己那一套锚点时**原样返回主空间
+    的包**是明知故犯的降级：宁可锚点偏保守，也不能把第二个空间的地标盖到第三个空间上。
+
     老包（没有第二套锚点）原样返回：保持既有行为，不做没有意义的降级。"""
-    if space != 2 or not isinstance(packet, dict):
+    if space in (None, 1) or not isinstance(packet, dict):
         return packet
-    lms = packet.get('secondary_interior_primary_landmarks')
-    dna = _flatten_to_text(packet.get('secondary_interior_camera_dna') or '').strip()
+    families = packet.get('interior_space_families')
+    family = None
+    if isinstance(families, list):
+        for item in families:
+            if isinstance(item, dict) and _int_or_none(item.get('space')) == space:
+                family = item
+                break
+        else:
+            # 未编号时按出场顺序对号：families[0] 是第二个室内空间。
+            if 2 <= space <= len(families) + 1 and isinstance(families[space - 2], dict):
+                family = families[space - 2]
+    if family is not None:
+        lms = family.get('primary_landmarks')
+        dna = _flatten_to_text(family.get('camera_dna') or '').strip()
+    elif space == 2:
+        lms = packet.get('secondary_interior_primary_landmarks')
+        dna = _flatten_to_text(packet.get('secondary_interior_camera_dna') or '').strip()
+    else:
+        return packet
     has_lms = isinstance(lms, list) and lms
     if not has_lms and not dna:
         return packet
@@ -5538,6 +5701,12 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
     # 放在这里，等于无论记号从哪条路进来，都出不了这个函数。
     video_prompt = scrub_spatial_notation(video_prompt)
     image_prompt = scrub_spatial_notation(image_prompt)
+
+    # 同一道收口的第二条：规划期标注（「（工序：…）」「；本拍认领…」「→」）。它们跟
+    # Grid 记号一样，可能是模板拼进来的，也可能是合成模型从上下文照抄出来的，
+    # 一律在送去渲染之前剥掉。
+    video_prompt = scrub_planning_annotations(video_prompt)
+    image_prompt = scrub_planning_annotations(image_prompt)
 
     return video_prompt, image_prompt
 
@@ -6703,6 +6872,10 @@ _STRUCTURAL_VIDEO_ERROR_MARKERS = (
     # 或干脆预览了室内，和它自己的末帧直接矛盾——与旧 PBISP continuity 同一类交接断裂。
     'Pre-crossing VIDEO',
 )
+# 注意：具名人物锁的消息一律以 'Named Cast Lock [' 开头，刻意不含上面任何一条标记。
+# 那把锁是「谁穿了什么」，不是「这拍有没有可拍的画面」——把它划进结构性硬伤会让一条
+# 外套形容词触发定向回炉，烧掉一轮本该留给真正无画面可拍的拍的预算。
+# tests/test_named_cast_lock.py 钉住了这条不变量。
 
 
 def split_structural_video_errors(errs):
@@ -8287,10 +8460,11 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
     errors = []
     video_word_limit = int(video_word_limit or BASE_VIDEO_WORD_LIMIT)
 
-    _bridge_stage = beat.get('bridge_stage') if beat else None
-    _is_cut = bool(beat.get('hard_cut')) if beat else False
     if family is None:
-        family = 'interior' if _bridge_stage == 1 else 'exterior'
+        # 任何一次过门之后都在室内。原先按 `bridge_stage == 1` 判定，第二、第三次过门
+        # （复刻线按原片观察到的空间序列可以有任意多次）会被当成外景拍，套上外景的
+        # 字数上限与措辞规则。
+        family = 'interior' if beat_is_crossing_clip(beat) else 'exterior'
 
     # Word count limits check (2026-07-21 richness alignment pass: 170->250 / 180->380,
     # raised to match the level of sensory/texture detail per anchor demonstrated in a
@@ -8397,6 +8571,16 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
         errors.extend(check_stylistic_repetition(video_prompt, prev_video, packet, is_video=True))
     if prev_image:
         errors.extend(check_stylistic_repetition(image_prompt, prev_image, packet, is_video=False))
+
+    # 具名人物一致性锁（P0 named-cast-vocabulary-lock / named-cast-hal-exclusivity）。
+    # 仅在 packet 显式写了 agent_lock_mode: named_cast 时生效——Hero Agent Lock 仍是默认，
+    # 未选具名锁的单子这里整段是 no-op。
+    #
+    # 归入 errors 而不是单开一条通道，是因为直出模式下这个列表本来就只记录不拦截
+    # （见 composers/base.py：只有结构性硬伤才回炉）。这正是第一轮想要的投放形态：
+    # 先在真实流量上看误报率，再谈要不要让一条服装形容词把整单合成判死。
+    # 前提是这些消息不能被误判成结构性硬伤——见 _STRUCTURAL_VIDEO_ERROR_MARKERS 旁的说明。
+    errors.extend(named_cast_beat_violations(image_prompt, video_prompt, packet))
 
     return errors
 
@@ -8715,6 +8899,13 @@ Required JSON keys:
         'later repair beats. Never place framing, rough-in, surfacing, painting or furnishing '
         'before this cleanout.'
     )
+    # 原片观察到的过门位置（复刻线；清单条目自带 space 时才非空）。几次都算，位置不由
+    # 规划器挑——它只负责把那几拍的正文写成「推门进去，然后干本拍该干的活」。
+    # 直接从 dimensions 归一（而不是等下面的 _outline_plan）：过门规则要写进这一段
+    # 系统提示词，而 build_outline_plan_block 在它之后才跑。两边归一的是同一份清单、
+    # 走的是同一个 _outline_normalized_entries，条目下标因此一致。
+    _observed_crossings = outline_space_crossings(
+        _outline_normalized_entries(dimensions.get('beat_outline')))
     if _variant == 'hard_cut':
         if _topology['opening_plane'] == 'horizontal_top':
             _hard_cut_motion = (
@@ -8777,6 +8968,17 @@ Required JSON keys:
 {_post_crossing_cleanup_rule}
   - SEALED ENTRY: Beat T-1 ends on a closed entry — its resulting IMAGE shows the door/hatch shut (or, if this carrier has no leaf yet, its raw opening as unlit darkness) with nothing of the interior visible. Beat T's own clip is what opens it. Never plan a beat whose after_state is "the doorway now stands open revealing the interior".
   - All subsequent beats (Beat T+1 to {beats_count}) must be interior construction operations (e.g., clearing interior, interior walls, interior flooring, etc.)."""
+
+    if _observed_crossings:
+        # 复刻线整段改写上面那套「只有一次过门」的规则：位置与次数都是从原片数出来的
+        # （清单条目自带 space），不是「挑一处边界」。两套口径同时出现在系统提示词里，
+        # 必然有一套被违反——规划器读到的应当只有这一套。
+        _crossing_list = "、".join(f'#{n}' for n in _observed_crossings)
+        threshold_split_rules = f"""- If mode is "Threshold", this project's crossings are already fixed by the SPACE labels observed on the reference film: beats {_crossing_list} — {len(_observed_crossings)} crossing(s) in total, no more and no fewer. Do NOT pick your own boundary, and do NOT reserve a dedicated crossing-only beat (the ONE-TO-ONE CONTRACT forbids a beat with no entry of its own).
+  - PHYSICAL TOPOLOGY LOCK (the FIRST crossing, from outside into the structure): opening plane is {_topology['opening_plane']}; entry motion is {_topology['entry_motion']}; landing turn is {_topology['turn_degrees']} degrees {_topology['turn_direction']}. Every later crossing moves between two interior spaces through its own observed opening — name that opening in the beat's own "description".
+  - Mark each of those beats with "bridge_stage" (1 for the first crossing, 2 for the second, and so on) and NEVER use "hard_cut": every crossing here is a continuous visible move through an opening, not a cut. Each crossing beat still claims exactly its own single entry and still fully describes that entry's own milestone/package_operations/after_state; its VIDEO opens with the camera moving through that opening and then continues, in the SAME unbroken clip, into that beat's own listed construction action.
+  - SEALED ENTRY: the beat before each crossing ends with that opening still shut (or, where there is no leaf yet, an unlit raw opening) and nothing of the next space visible. The crossing clip itself is what opens it.
+  - A crossing moves the CAMERA, never the construction state: everything completed in an earlier space stays completed, is never revisited, regressed, or re-shown as raw."""
 
     # 「双空间重置兑现」的第二处不连续。上面那段说的是 T1（进主空间），这段说 T2
     # （主空间完工后重置到第二个毛坯空间）。两段必须并存：只写 T1 时模型把唯一的
@@ -8875,6 +9077,17 @@ Required JSON keys:
             "following, so no beat may be planned around them — "
             + "; ".join(_banned_elements)
             + ". Plan only the operations the card work plan above actually states.\n")
+    # 场景恒常特征：与 banned 对称的另一半。banned 说「原片里永远没有的东西」，这条说
+    # 「原片里一直都在的东西」——墙上的污渍、青苔、常驻画面的那盏工作灯。它们不产生
+    # 状态变化，因此在节拍阶梯里没有落脚点，一路被压掉；不把它们单独送进来，复刻出的
+    # 就是同一道工序的通用想象，而不是这条片子的质感（见 reverse.analyze_scene_constants）。
+    _scene_constants = (dimensions.get('scene_constants')
+                        if isinstance(dimensions.get('scene_constants'), dict) else None)
+    if _scene_constants:
+        parsed_brief['scene_constants'] = {k: [str(x).strip() for x in (v or []) if str(x).strip()]
+                                           for k, v in _scene_constants.items()}
+    if str(dimensions.get('scene_signature') or '').strip():
+        parsed_brief['scene_signature'] = str(dimensions['scene_signature']).strip()
     # 卡片原始清单也挂到 config 上：合成收尾算交付总账时要拿它回答"这张卡本来有几条"。
     # 规划四轮全败退兜底时梯子上一个 outline_refs 都没有，只看梯子的话总账为空——
     # 而那恰恰是**整张卡的工序被通用施工序整体换掉**、最该报警的一单。
@@ -9116,7 +9329,24 @@ Space Type: {space_type}
                                     bridge_1_idx = idx
                             if b.get('hard_cut'):
                                 cut_idxs.append(idx)
-                        if _variant == 'hard_cut':
+                        if _observed_crossings:
+                            # 复刻线：过门次数与位置都是原片读出来的，「有且仅有一次
+                            # bridge_stage=1」那套单过门口径在这里是错的判据——它会把一条
+                            # 忠实复刻了三次进门的梯子判死。位置最终由
+                            # apply_observed_space_sequence 做确定性收口，所以这里只报
+                            # 「规划器标到别处去了」，让它有一轮机会把那几拍的正文改成
+                            # 真的在推门（正文改不了，标记对了也是空壳）。
+                            _marked = sorted({i + 1 for i, b in enumerate(beat_ladder)
+                                              if b.get('bridge_stage') or b.get('hard_cut')})
+                            if _marked != _observed_crossings:
+                                violations.append(
+                                    f"The reference film's own space labels put its "
+                                    f"{len(_observed_crossings)} crossing(s) on beat(s) "
+                                    f"{_observed_crossings}, but this ladder marks {_marked or 'none'}. "
+                                    f"Mark exactly those beats with bridge_stage (1, 2, 3 … in order) "
+                                    f"and no others, and write each one's own action as: move through "
+                                    f"that opening, then do that beat's listed work in the same clip.")
+                        elif _variant == 'hard_cut':
                             if bridge_1_idx >= 0:
                                 violations.append("In the HARD CUT variant, no beat may have a bridge_stage.")
                             if len(cut_idxs) != 1:
@@ -9452,6 +9682,13 @@ Space Type: {space_type}
     # 开关影响。非一比一路径（老任务/老断点/手动主题）完全保留原行为。
     if _outline_strict:
         beat_ladder = finalize_beat_ladder_fields(beat_ladder)
+        # 观察到的空间序列收口（复刻线）：过门标记以原片为准，不以规划器的判断为准。
+        # 放在 finalize 之后，因为它要覆盖 finalize 按 bridge/hard_cut 推出来的默认
+        # space_id/camera_family；放在 total_beats 重算之前，因为它不增删任何一拍。
+        _observed_crossing_beats = apply_observed_space_sequence(beat_ladder, parsed_brief)
+        if _observed_crossing_beats and sys.stdout:
+            print(f'[SPACE] 原片观察到 {len(_observed_crossing_beats)} 次过门，'
+                  f'落在第 {_observed_crossing_beats} 拍；机位族按空间切分。')
     else:
         # Transition slots are additive production beats.  Expanding only after the conceptual
         # construction ladder passes its count/order gates preserves every construction milestone.
@@ -9580,7 +9817,27 @@ Space Type: {space_type}
             # 第二空间自己的锚点族。没有它，重置切点后的每一帧仍然逐字复述主空间那三条
             # 地标、用主空间那句 camera DNA——画面读起来就是「刚装好的空间原地变回废墟」，
             # 而不是「切到了另一个舱段」（2026-07-31 实机复盘）。
-            if space_reset_cut_required(parsed_brief):
+            # 复刻线：室内空间的个数由原片决定（apply_observed_space_sequence 已经把
+            # space_id 打在每一拍上）。超过两个时不能再用 secondary_interior_* 那对键——
+            # 它只装得下一个第二空间，第三个空间会拿到第二个空间的锚点，正是上面那条
+            # 复盘要避免的事。这里改成按空间序号逐个登记。
+            _interior_spaces = max(
+                [space_ordinal(b.get('space_id')) for b in beat_ladder
+                 if isinstance(b, dict) and is_interior_space(b.get('space_id'))] or [1])
+            _observed_spaces = [str(x) for x in (parsed_brief.get('observed_space_sequence') or [])]
+            if _interior_spaces > 2:
+                _interior_names = []
+                for _label in _observed_spaces:
+                    if _label not in _interior_names:
+                        _interior_names.append(_label)
+                # 第一个标签是外景（mode == 'Threshold' 时），室内族从第二个标签起。
+                _interior_names = _interior_names[1:] if parsed_brief.get('mode') == 'Threshold' \
+                    else _interior_names
+                _named = "; ".join(f'space {i}: "{name}"'
+                                   for i, name in enumerate(_interior_names, 1))
+                interior_family_keys += f"""
+14. "interior_space_families": This film walks through {_interior_spaces - 1} further doorway(s) after the first crossing, so it has {_interior_spaces} DISTINCT interior spaces, observed in the reference film as — {_named}. Return an array with one object per interior space AFTER the first, in that same order, each: {{"space": <2 for the second interior space, 3 for the third, and so on>, "camera_dna": "<that space's own static camera sentence — same lens feel and camera height as the primary interior, since it is the same production, but a different facing/axis so the spaces are never confusable side by side; camera pitch locked level; NEVER mention a horizon or sky indoors; the connecting doorway is fully behind the camera and never appears in frame>", "primary_landmarks": [2-3 objects with "name", "grid", "z_depth_scale"]}}. HARD REQUIREMENT: no landmark may repeat one registered for ANY other space — each of these is a physically different room/compartment with its own fixed features (its own end wall, its own openings, its own structural members, its own pre-existing wreckage). They must be pre-existing features present when the camera first enters that space, never future construction products, and at least one per space must still make it unmistakably part of THIS carrier."""
+            elif space_reset_cut_required(parsed_brief):
                 interior_family_keys += """
 14. "secondary_interior_camera_dna": The SECOND interior space's static camera sentence, used for every IMAGE after the declared space-reset cut. Same lens feel and camera height as the primary interior (this is the same production), but it must read as ANOTHER ROOM, not the same shot: state a different facing/axis (e.g. looking toward the opposite bulkhead, across the short axis, or from the far end back), so the two spaces are never confusable side by side. Camera pitch locked level; NEVER mention a horizon or sky indoors; the partition doorway is fully behind the camera and never appears in frame.
 15. "secondary_interior_primary_landmarks": A list of 2-3 landmarks for that SECOND space. HARD REQUIREMENT: none of them may be an object already registered in "interior_primary_landmarks" — it is a physically different compartment/section, so it has its own fixed features (its own bulkhead, its own window or vent positions, its own structural members, its own pre-existing wreckage). They must be pre-existing features present at reset time, never future construction products. At least one must still make the space unmistakably part of THIS carrier. Each is a JSON object with "name", "grid", and "z_depth_scale"."""
@@ -9922,6 +10179,11 @@ Hard Rules:
             'is_revision': False,
         })
 
+    # 具名人物锁的选择（agent_lock_mode / cast_id）从 config 盖到 packet 上：packet 是
+    # 每道下游检查都拿得到的东西，config 不是。不做这一步，validate_beat_prompts 里那道
+    # 锁无论怎么配都够不着。默认仍是 Hero Agent Lock —— 没显式写 named_cast 就整段不生效。
+    packet = apply_named_cast_settings(packet, config)
+
     return {
         'theme': theme,
         'total_beats': total_beats,
@@ -10183,16 +10445,24 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
             f"- Divider (mandatory): this cut passes through {_divider_name} — the VIDEO must open on "
             f"it shut, push it open on camera, and carry the camera through it into the second space. "
             f"It is a real boundary in this shell, not an unexplained jump to somewhere new.")
-    if space == 2:
-        # 第二空间的帧必须读成「另一个舱段」而不是「第一个空间被拆了重来」。锚点集与
-        # camera DNA 已经在 packet_for_space 里换成第二套，这条把口径写给生成侧。
+    if space >= 2:
+        # 第二个及以后的空间：这一帧必须读成「另一个舱段」，而不是「上一个空间被拆了
+        # 重来」。锚点集与 camera DNA 已经在 packet_for_space 里换成这个空间自己那一套，
+        # 这条把口径写给生成侧。
+        # 原先写死 space == 2：复刻线按原片观察到的序列可以有第三、第四个空间
+        # （见 apply_observed_space_sequence），那些帧当时一句约束都拿不到，于是逐帧
+        # 复述上一个空间的地标——画面读起来就是「刚装好的空间原地变回废墟」。
+        _space_ordinal_word = {2: 'SECOND', 3: 'THIRD', 4: 'FOURTH', 5: 'FIFTH'}.get(space, f'#{space}')
+        _observed_name = str(beat.get('observed_space') or '').strip()
         family_contract_lines.append(
-            f"- SECOND SPACE (mandatory): IMAGE {i+1} is inside the SECOND, physically separate "
-            f"compartment reached by the declared space-reset cut — not the primary space at an "
-            f"earlier stage. Everything finished in the primary space stays finished off-camera and "
-            f"must NOT be shown being undone, reverted, or rebuilt here. Restate ONLY the anchors "
-            f"listed below (this space's own fixed features); never name or re-pin an anchor that "
-            f"belongs to the primary space, and never describe this space as the same room.")
+            f"- {_space_ordinal_word} SPACE (mandatory): IMAGE {i+1} is inside the "
+            f"{_space_ordinal_word}, physically separate space"
+            + (f" — the one observed as \"{_observed_name}\"" if _observed_name else "")
+            + f" reached by crossing into it on camera — not an earlier space at an earlier stage. "
+            f"Everything finished in every earlier space stays finished off-camera and must NOT be "
+            f"shown being undone, reverted, or rebuilt here. Restate ONLY the anchors listed below "
+            f"(this space's own fixed features); never name or re-pin an anchor that belongs to "
+            f"another space, and never describe this space as the same room.")
         if _transition_stage in ('secondary_threshold', 'secondary_partial_first_look'):
             family_contract_lines.append(
                 f"- CROSS-DIVIDER ORIENTATION (mandatory): keep the edge of {_divider_name or 'the divider'}, "
@@ -13265,7 +13535,11 @@ def _outline_normalized_entries(outline):
                 # 绑定到那一拍，不能让规划器从一句动作描述里重新想一遍——重新想出来的
                 # 起止状态和原片对不上，1:1 复刻就名存实亡。老卡片不带这两个键，
                 # build_outline_plan_block 的 has_* 守卫会让它们对现有链路完全隐形。
-                for key in ('zone', 'scope', 'trace', 'state_before', 'state_after'):
+                # space（2026-08-14，复刻线）：这一条在原片里的机位所在空间。与 zone
+                # 不是一回事——zone 说「活干在画面的哪一块」，space 说「机位站在哪个
+                # 封闭空间里」。序列每变一次值就是原片里的一次过门，合成期按它标记
+                # 过门拍（apply_observed_space_sequence），不透传就只剩骨架写死的那一次。
+                for key in ('space', 'zone', 'scope', 'trace', 'state_before', 'state_after'):
                     value = str(entry.get(key) or '').strip()
                     if key == 'scope':
                         value = value.lower()
@@ -13720,6 +13994,28 @@ def render_outline_delivery_md(ledger):
     return '\n'.join(lines)
 
 
+def outline_space_labels(plan):
+    """清单条目逐条的空间标签（缺失继承上一条）。没有任何条目声明过 space 时返回 []。
+
+    「继承上一条」与 reverse.normalize_beat_spaces 同一口径：漏写一条不等于新开一个
+    空间，按「未知即新空间」处理会在阶梯中间插进一串根本不存在的过门。
+    """
+    if not any(str((e or {}).get('space') or '').strip() for e in (plan or [])):
+        return []
+    labels, current = [], ''
+    for entry in plan:
+        label = str((entry or {}).get('space') or '').strip().lower()
+        current = label or current or 'main space'
+        labels.append(current)
+    return labels
+
+
+def outline_space_crossings(plan):
+    """清单里发生过门的条目号（1-based）。几次都算，没有上限，也不写死位置。"""
+    labels = outline_space_labels(plan)
+    return [i for i in range(2, len(labels) + 1) if labels[i - 1] != labels[i - 2]]
+
+
 def build_outline_plan_block(beat_outline, max_total_beats):
     """把卡片的节拍简介渲染成送进规划器的「强制工序清单 + 一比一绑定契约」段落。
 
@@ -13747,6 +14043,8 @@ def build_outline_plan_block(beat_outline, max_total_beats):
     for i, entry in enumerate(plan, 1):
         head = f'  {i}. {entry["text"]}' + (f' [{entry["op"]}]' if entry.get('op') else '')
         tags = []
+        if entry.get('space'):
+            tags.append(f'space: {entry["space"]}')
         if entry.get('zone'):
             tags.append(f'zone: {entry["zone"]}')
         if entry.get('scope'):
@@ -13770,9 +14068,31 @@ def build_outline_plan_block(beat_outline, max_total_beats):
     has_zone = any(e.get('zone') for e in plan)
     has_trace = any(e.get('trace') for e in plan)
     has_state = any(e.get('state_before') or e.get('state_after') for e in plan)
+    observed_crossings = outline_space_crossings(plan)
     rich_block = ""
-    if has_scope or has_zone or has_trace or has_state:
+    if has_scope or has_zone or has_trace or has_state or observed_crossings:
         rules = []
+        if observed_crossings:
+            # 观察到的过门位置。下面那段通用 THRESHOLD/CROSSING 规则说的是「挑一拍去
+            # 承担过门」——那是给原创单写的，只有一处边界可挑。复刻单的边界是从原片
+            # 数出来的，有几处就是几处，位置也不由规划器挑（见 apply_observed_space_sequence，
+            # 合成期会按同一份序列做确定性收口；这里先把它写给规划器，让那几拍的正文
+            # 自己就是「推门进去然后干活」，而不是事后被贴上一个标签）。
+            _spots = "、".join(
+                f'#{n}（{plan[n - 1].get("space") or "next space"}）' for n in observed_crossings)
+            rules.append(
+                "SPACE: an entry's \"space\" is the physical space the reference film's camera "
+                "stands in for that beat, read off the film itself. Entries sharing a space label "
+                "are one continuous shot family; a changed label means the camera physically walked "
+                "through an opening into another space. In this plan the label changes at entry "
+                f"{_spots} — mark EACH of those beats as a crossing beat (bridge_stage per the "
+                "schema below), whatever its number, and never mark a beat whose label equals the "
+                "previous entry's. There is no fixed number of crossings: reproduce exactly the ones "
+                "listed here. Each crossing beat's video opens with the camera moving through that "
+                "opening and then, in the same unbroken clip, does that entry's own listed work; the "
+                "beat before it ends with that opening still closed or unlit, nothing of the next "
+                "space visible. Work already finished in an earlier space stays finished — a crossing "
+                "moves the camera, it never resets construction.")
         if has_scope:
             rules.append(
                 "COVERAGE: an entry's own \"scope\" IS that beat's \"stage_scope\" — copy it "
@@ -13828,17 +14148,25 @@ def build_outline_plan_block(beat_outline, max_total_beats):
         f"show — they may reorder which physical action opens an entry's own clip — but they may "
         f"NEVER license merging, splitting, adding, deleting, or substituting an entry.\n"
         # 过门/硬切：不再单开一拍，选定清单里紧贴边界的那一拍同时承担运镜。
-        "\nTHRESHOLD/CROSSING BEATS (only when this project has a physical exterior-interior "
-        "boundary): do NOT create a dedicated crossing-only beat — that would be an extra beat with "
-        "no entry of its own, which the ONE-TO-ONE CONTRACT above forbids. Instead pick whichever "
-        "ONE listed entry's own work naturally happens on the interior side of that boundary (usually "
-        "the first entry whose work takes place inside), and mark THAT SAME beat as the crossing beat "
-        "(set bridge_stage/hard_cut on it per the schema below) — its video opens with the physical "
-        "crossing motion and then continues, in the same unbroken clip, into that entry's own listed "
-        "work. That beat still claims exactly its own single entry like every other beat. The entry "
-        "the camera crosses is CLOSED before that clip — the beat before it ends on a shut door/hatch "
-        "(or, on a carrier with no leaf yet, an unlit raw opening) with nothing of the interior "
-        "visible — and the crossing clip itself pushes it open on camera.\n"
+        # 清单自带观察到的空间序列时（复刻线），过门位置已经由上面的 SPACE 规则逐个点名，
+        # 这里再写一段「挑一处边界」只会让规划器在两套口径之间二选一。
+        + ("\nTHRESHOLD/CROSSING BEATS: the crossing beats of this job are the ones named in the "
+           "SPACE rule above — no others, and no dedicated crossing-only beat (that would be an "
+           "extra beat with no entry of its own, which the ONE-TO-ONE CONTRACT forbids). Each of "
+           "them still claims exactly its own single entry like every other beat.\n"
+           if observed_crossings else
+           "\nTHRESHOLD/CROSSING BEATS (only when this project has a physical exterior-interior "
+           "boundary): do NOT create a dedicated crossing-only beat — that would be an extra beat with "
+           "no entry of its own, which the ONE-TO-ONE CONTRACT above forbids. Instead pick whichever "
+           "ONE listed entry's own work naturally happens on the interior side of that boundary (usually "
+           "the first entry whose work takes place inside), and mark THAT SAME beat as the crossing beat "
+           "(set bridge_stage/hard_cut on it per the schema below) — its video opens with the physical "
+           "crossing motion and then continues, in the same unbroken clip, into that entry's own listed "
+           "work. That beat still claims exactly its own single entry like every other beat. The entry "
+           "the camera crosses is CLOSED before that clip — the beat before it ends on a shut door/hatch "
+           "(or, on a carrier with no leaf yet, an unlit raw opening) with nothing of the interior "
+           "visible — and the crossing clip itself pushes it open on camera.\n")
+        +
         # 内容绑定：编号对应不查内容，认领了第 k 条却交付别的东西是零成本的。
         # 这份英文复述是唯一能跨语言（清单中文 / 提示词英文）做确定性校验的桥。
         "\nDELIVERY RESTATEMENT (mandatory): alongside \"outline_refs\", every beat must carry an "

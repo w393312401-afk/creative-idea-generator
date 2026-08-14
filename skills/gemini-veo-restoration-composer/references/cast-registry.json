@@ -7,6 +7,19 @@
     "no change of jacket colour",
     "no second person resembling him"
   ],
+  "_action_onset_comment": "身份块必须前置到动作动词之前，机器判据是「身份块出现在动作起点标记之前」。这里登记的是本包默认题材（施工延时）的标记；换题材的角色在自己的 cast 条目里写 action_onset_markers 覆盖。一个都不命中时校验器报 identity-block-placement-unverifiable 警告——此前这句话是硬编码在脚本里的常量，于是非施工题材上这道门从不执行，报告干净、退出码 0，缺陷是看不见的。",
+  "action_onset_markers": [
+    "continuous construction time-lapse"
+  ],
+  "_hero_agent_lock_comment": "Hero Agent Lock 的标志写法。Named Cast Lock 项目里出现任何一条即违反 named-cast-hal-exclusivity（P0）：两套服装契约互斥，同条并存会让模型把 neon-yellow 背心与登记的橄榄绿外套特征互串。只列 Hero Agent Lock 特有的整句，单个部位词（hardhat / hi-vis vest）已由各自 T1 槽位的 banned 表覆盖，重复登记只会让同一处违规报两遍。",
+  "hero_agent_lock_markers": [
+    "solid bright-neon-yellow safety vest",
+    "bright-neon-yellow safety vest",
+    "white hardhat",
+    "solid dark blue work pants",
+    "do not show the worker's face",
+    "do not show the workers' faces"
+  ],
   "coreference_bans": [
     "the same worker",
     "the same contractor",

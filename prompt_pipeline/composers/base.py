@@ -66,9 +66,37 @@ class BaseComposer:
               "is describing work the reference film did not contain — write only what the beat's "
               "own declared fields state.\n")
 
+    def scene_constants_block(self):
+        """反推复刻线的场景恒常特征段落。非复刻单返回空串。
+
+        与 `banned_elements_block` 严格对称：那一段说「原片里永远没有的东西」，这一段说
+        「原片里一直都在的东西」——墙上的绿霉污渍、屋檐的青苔、常驻画面的那盏工作灯。
+
+        它们为什么需要单独一段：整条反推链路是围绕**变化**建的，节拍只承载每一拍的
+        delta，而恒常的东西不产生 delta。实测（2026-08-13）一条片子里 57% 的帧都记到了
+        墙上的污渍，而它在整条节拍阶梯里一个字都没有。不把它们送进来，写手写出的就是
+        同一道工序的通用想象——干净的混凝土、没有落叶青苔——工序全对，就是不像那条片子。
+        """
+        brief = (self.state or {}).get('parsed_brief') or {}
+        from prompt_pipeline import reverse
+        lines = reverse.scene_constants_lines(brief.get('scene_constants'),
+                                              brief.get('scene_signature'))
+        if not lines:
+            return ""
+        return (
+            "\n==================== SCENE CONSTANTS (THIS JOB ONLY) ====================\n"
+            "These are present in the reference film from the first frame to the last. They are "
+            "not work anyone performs — they are what the place is made of and what it looks "
+            "like. Carry them through EVERY prompt as standing description of the environment:\n"
+            + "\n".join(f"- {x}" for x in lines)
+            + "\nNever describe a surface these cover as clean, new, or unmarked unless a beat "
+              "explicitly says that beat's work made it so. They are the reason the reference "
+              "film looks like itself.\n")
+
     def batch_system_prompt(self, config, packet, scup_ref, tbcp_ref):
         """批量直出调用的共享 system prompt（每拍都相同的那部分）。"""
-        return pp._batch_shared_system_prompt(packet, scup_ref, tbcp_ref) + self.banned_elements_block()
+        return (pp._batch_shared_system_prompt(packet, scup_ref, tbcp_ref)
+                + self.banned_elements_block() + self.scene_constants_block())
 
     def single_beat_system_prompt(self, config, i, contract, packet, compiled_images,
                                   compiled_videos, scup_ref, tbcp_ref_i):
@@ -151,7 +179,7 @@ Instructions:
 "z_depth_scale": "depth scale if mentioned (e.g. 50%, default to 50%)"
   }}
 ]
-{self.banned_elements_block()}"""
+{self.banned_elements_block()}{self.scene_constants_block()}"""
 
     def apply_proactive_fixes(self, i, video_prompt, image_prompt, packet, mode, is_last,
                               is_threshold_or_reveal, beat=None, config=None, family=None):

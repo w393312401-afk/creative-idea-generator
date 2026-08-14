@@ -252,8 +252,8 @@
       "scope": "both",
       "summary": "Named Cast Lock：每条含人物提示词必须逐字重述登记的身份块，T1 颜色词禁止同义替换；跨段无记忆，同义漂色等于换人",
       "source": "references/character-consistency-protocol.md",
-      "enforcer": null,
-      "gap": "服务端 prompt_pipeline 没有具名人物概念，只有 HAL 剪影检查。唯一执行点是本包 scripts/check_character_lock.py，须由 agent 在交付前手动运行；聊天内撰写时无任何自动拦截。"
+      "enforcer": "prompt_pipeline:named_cast_lock_violations",
+      "gap": "执行点已就位但**只在 agent_lock_mode: named_cast 时生效**，且判定结果进的是 validate_beat_prompts 的留痕列表（直出模式只记录不拦截），不阻断合成——第一轮先观察真实流量上的误报率。另：IMAGE 1（锚点帧）不经过 validate_beat_prompts，这一帧仍只由 Clean Frame Boundary 管。"
     },
     {
       "id": "named-cast-direct-at-zero-exemption",
@@ -270,8 +270,8 @@
       "scope": "both",
       "summary": "Hero Agent Lock 与 Named Cast Lock 互斥，一个项目只能选一种，全片不得混用；混用会把两套服装契约的特征互串",
       "source": "references/character-consistency-protocol.md",
-      "enforcer": null,
-      "gap": "没有任何执行点检查一个交付集里是否同时出现两种锁（例如既有 neon-yellow safety vest 又有具名身份块）。check_character_lock.py 只看被选中的那一种，不做互斥判定。"
+      "enforcer": "prompt_pipeline:named_cast_lock_violations",
+      "gap": "互斥判定是单向的：Named Cast Lock 项目里出现 Hero Agent Lock 标志写法会被 Gate 8 抓到（cast-registry.json 的 hero_agent_lock_markers），反向不成立——纯 Hero Agent Lock 项目里混进具名身份块无人检查，因为那种单子根本不会带 cast_id、整套锁不启动。"
     }
   ]
 }

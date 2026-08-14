@@ -8,6 +8,8 @@ from prompt_pipeline.frame_state import (
 from prompt_pipeline.scene_state import (
     build_scene_states,
     classify_material_flow,
+    compile_video_skeleton,
+    scrub_planning_annotations,
     validate_scene_states,
 )
 from server import prompt_delivery_block_reason
@@ -205,3 +207,41 @@ def test_render_gate_blocks_only_explicit_new_degraded_results():
     assert prompt_delivery_block_reason({"generation_source": "static_fallback"})
     assert prompt_delivery_block_reason({"prompt_block": "legacy"}) is None
     assert prompt_delivery_block_reason({"quality_gate": {"status": "passed"}}) is None
+
+
+def test_video_skeleton_never_emits_python_reprs_of_the_state_record():
+    """交付出去的提示词里不许出现内部数据结构的 repr。
+
+    2026-08-13：delta 是 dict、material_flow 是 list[dict]，骨架句原先直接把它们塞进
+    f-string，于是花括号、单引号和 milestone/terminal_state/completion_extent/store
+    这些**内部键名**逐字进了复刻单的 prompt_block（实测一单 28 处）。
+    """
+    state = build_scene_states([_beat(1, "clearing")])[0]
+    skeleton = compile_video_skeleton(state)
+    for junk in ("{", "}", "'", "terminal_state", "completion_extent", "'store'", "direction"):
+        assert junk not in skeleton, junk
+    assert "milestone 1" in skeleton
+    assert "site waste decreases" in skeleton
+
+
+def test_planning_annotations_are_scrubbed_from_delivered_prompt_text():
+    """规划期标注不进正文：它们是写给规划模型读的，渲染模型只该看到散文。"""
+    echoed = ("As the final milestone of the The equipment cuts stems. → The floor is cleared."
+              "（工序：saw、rake、sweep） anchor, the entire floor is swept.")
+    cleaned = scrub_planning_annotations(echoed)
+    assert "（工序" not in cleaned
+    assert "→" not in cleaned
+    assert "resulting in The floor is cleared." in cleaned
+
+    with_tail = "the span is fastened；本拍认领的卡片工序终产物：a sod roof deck"
+    assert scrub_planning_annotations(with_tail) == (
+        "the span is fastened, delivering: a sod roof deck")
+
+
+def test_annotated_milestone_survives_the_ladder_but_not_the_prompt():
+    """标注留在梯子里（校验/去重靠它逐字比对），只在渲染那一层被剥掉。"""
+    beat = _beat(1, "framing")
+    beat["milestone_name"] = "lay planks. → a sod roof deck.（工序：frame、nail、lay）"
+    state = build_scene_states([beat])[0]
+    assert "（工序" in state["delta"]["milestone"]
+    assert "（工序" not in compile_video_skeleton(state)

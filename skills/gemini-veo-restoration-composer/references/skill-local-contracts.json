@@ -291,14 +291,34 @@
       ],
       "rule_zh": "agent_lock_mode 为 named_cast 时，每条含人物提示词必须逐字重述登记的身份块（全条仅一次、前置于动作动词之前）、不得出现跨段指代或泛指人物、必须带三条常驻负面项、双人镜必须写助手区分句；T1 部位颜色词按 cast-registry.json 词表校验，禁止同义替换。",
       "source": "references/character-consistency-protocol.md, SKILL.md Step 6 (Worker/Machine Choreography Ledger), Step 8",
-      "enforcer": "scripts/check_character_lock.py::function:check_prompt",
+      "enforcer": "scripts/cast_lock_core.py::function:check_prompt",
       "blocking": true
+    },
+    {
+      "id": "named-cast-action-onset-markers",
+      "tier": "P1",
+      "scope": "video",
+      "rule_zh": "「身份块前置于动作动词之前」这道门的机器判据是「身份块出现在已登记的动作起点标记之前」，标记来自 cast-registry.json 的 action_onset_markers（可按角色覆盖）；一条都不命中时必须报 identity-block-placement-unverifiable，不得静默跳过。",
+      "source": "references/character-consistency-protocol.md#3",
+      "enforcer": "scripts/cast_lock_core.py::function:_first_marker_index",
+      "blocking": false,
+      "note_zh": "此前这句标记是 check_character_lock.py 里的模块常量 PACING_PHRASE = 'continuous construction time-lapse'，于是任何非施工题材上这道门从不执行——报告干净、退出码 0，缺陷完全看不见。静默跳过比没有这道门更危险，所以「判不了」现在自己就是一条发现。"
+    },
+    {
+      "id": "named-cast-hal-exclusivity-gate",
+      "tier": "P0",
+      "scope": "image+video",
+      "rule_zh": "Named Cast Lock 项目里不得出现 Hero Agent Lock 的标志写法（cast-registry.json 的 hero_agent_lock_markers）；两套服装契约互斥，同条并存会让模型把两边特征互串。该门对每条提示词生效，含自称无人的槽位。",
+      "source": "references/character-consistency-protocol.md#0",
+      "enforcer": "scripts/cast_lock_core.py::function:check_lock_exclusivity",
+      "blocking": true,
+      "gap": "只单向：反过来（纯 Hero Agent Lock 项目里混进具名身份块）无人检查，那种单子不带 cast_id，整套锁不启动。"
     },
     {
       "id": "named-cast-registry-authority",
       "tier": "P1",
       "scope": "image+video",
-      "rule_zh": "身份块与 T1 词表的唯一权威副本在 references/cast-registry.json；协议文档与校验脚本都不得内嵌副本，两处各写一份就是下一次漂移的源头。",
+      "rule_zh": "身份块与 T1 词表的唯一权威副本在 references/cast-registry.json；协议文档与校验脚本都不得内嵌副本，两处各写一份就是下一次漂移的源头。同理，门禁实现的唯一副本在 scripts/cast_lock_core.py —— CLI 与服务端 prompt_pipeline.cast_lock 都从那里取，不各写一份。",
       "source": "references/character-consistency-protocol.md",
       "enforcer": "scripts/check_character_lock.py::function:load_registry",
       "blocking": false

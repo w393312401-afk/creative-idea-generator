@@ -84,7 +84,44 @@ async function initServerMode() {
             showToast(
                 `⚠️ 服务代码已过期：${preview || '核心文件'}在本次服务启动后被修改过，`
                 + `当前进程仍在用旧代码运行。请重启后端服务后再生成，否则可能拿到"看似已修复、实际未生效"的结果。`,
-                'error', 15000);
+                'error', 15000, {
+                    label: '一键重启服务',
+                    onClick: async () => {
+                        showToast('正在重启后端服务，请稍候...', 'info', 6000);
+                        try {
+                            await fetch('/api/restart', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-Access-Code': ACCESS_CODE || ''
+                                }
+                            });
+                        } catch (_) {}
+                        // 轮询等待新进程启动就绪
+                        let restarted = false;
+                        for (let i = 0; i < 25; i++) {
+                            await new Promise(r => setTimeout(r, 600));
+                            try {
+                                const check = await fetch('/api/mode', {
+                                    headers: { 'X-Access-Code': ACCESS_CODE || '' }
+                                });
+                                if (check.ok) {
+                                    const data = await check.json();
+                                    if (data && data.runtime_version && !data.runtime_version.stale) {
+                                        restarted = true;
+                                        break;
+                                    }
+                                }
+                            } catch (_) {}
+                        }
+                        if (restarted) {
+                            showToast('✓ 后端服务已成功重启并载入最新代码！', 'success', 3000);
+                            setTimeout(() => window.location.reload(), 800);
+                        } else {
+                            showToast('未能确认服务重启状态，请手动刷新页面重试。', 'warning', 5000);
+                        }
+                    }
+                });
         }
         // 技能契约缺失只劣化生成质量、不影响接口可用性，过去仅写进启动日志——
         // 从浏览器用的人看不到那个终端，等于没有告知。这里提示一次。

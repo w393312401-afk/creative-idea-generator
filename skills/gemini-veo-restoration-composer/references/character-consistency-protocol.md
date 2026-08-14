@@ -32,6 +32,11 @@ Choreography Ledger`）。两者解决同一个问题（identity morphing），�
    写死 `agent_lock_mode: named_cast`。
 3. **一个项目只能选一种，全片不得混用。** 混用等于在同一条片子里放两个互相矛盾的服装契约，
    模型会把两套特征互串。
+   > 这条现在有执行点了（Gate 8，`check_lock_exclusivity`）：Named Cast Lock 项目里出现
+   > `cast-registry.json` 的 `hero_agent_lock_markers` 任意一条即判违规，对每条提示词生效
+   > （含自称无人的槽位 —— 自称无人却还挂着背心句，正是这道门要抓的残留）。
+   > **互斥判定只有一个方向**：纯 Hero Agent Lock 项目里混进具名身份块无人检查，
+   > 因为那种单子不带 `cast_id`，整套锁根本不启动。
 4. 一旦选了 Named Cast Lock，该项目内 Hero Agent Lock 的安全帽/反光背心要求**作废**，
    由本协议第五节负面清单替代。这是**项目级豁免**，不是全局改契约。
 
@@ -77,7 +82,19 @@ Named Cast Lock 段落里进离场的合法写法上限是 **首尾各半秒**�
 **T1 的执行方式是固定词表，不是描写。** 模型最主要的漂移来源是同义词漂色：
 只要有一段写成了 `khaki jacket`，那一段就会生成另一个人。每个 T1 部位必须登记
 **唯一允许写法** + **禁止写法清单**，写进 [`cast-registry.json`](cast-registry.json)，
-由 `scripts/check_character_lock.py` 做全文机器比对。词表比描写重要。
+由 `scripts/cast_lock_core.py` 的八道门做全文机器比对。词表比描写重要。
+
+**执行点有两个，跑的是同一份实现**：
+
+| 执行点 | 何时跑 | 后果 |
+|---|---|---|
+| `scripts/check_character_lock.py` | 交付前人工运行 | 退出码 1 即不得交付 |
+| `prompt_pipeline.cast_lock` | 合成时逐拍自动运行 | 只留痕不拦截（第一轮先看误报率） |
+
+门禁实现的唯一副本在 `scripts/cast_lock_core.py`，两个执行点都从那里取 —— 和身份块
+正文同理，两处各写一份就是下一次漂移的源头。服务端侧仅在 Drift Lock Packet 写了
+`agent_lock_mode: named_cast` 时启动，且要有 `cast_id`；没写就整段不生效，
+Hero Agent Lock 仍是本包默认。
 
 ---
 
@@ -97,7 +114,13 @@ Named Cast Lock 段落里进离场的合法写法上限是 **首尾各半秒**�
    —— 跨段无记忆，指代等于放弃控制，必须整块重述 `short`。
 2. `short` 块放在**动作动词之前**，紧贴主语位置：
    `At the first instant, <SHORT> enters from the lower right with a matte-black shovel...`
-   机器校验用的代理判据是：身份块必须出现在 `continuous construction time-lapse` 这句之前。
+   机器校验用的代理判据是：身份块必须出现在**动作起点标记**之前。标记登记在
+   [`cast-registry.json`](cast-registry.json) 的 `action_onset_markers`（可在角色条目里
+   按题材覆盖），本包默认题材的那条是 `continuous construction time-lapse`。
+   > **换题材必须登记自己的标记。** 一条都不命中时校验器报
+   > `identity-block-placement-unverifiable`（warn 级，`--strict` 可提级为失败）。
+   > 这条警告不是噪音：此前标记是写死在脚本里的常量，非施工题材上这道门从不执行 ——
+   > 报告干净、退出码 0，缺陷完全看不见。静默跳过比没有这道门更危险。
 3. 一条提示词里只出现**一次**完整身份块，后续用 `he` 回指 —— 重复描写会把注意力权重打散，
    这是"越到后段越不像"的直接成因。
 4. **远近景分档**：人物脸部占画面高度超过六分之一的镜头，`short` 不够，必须升到 `mid`
@@ -223,7 +246,9 @@ Close-up of the contractor's hands in yellow leather gloves gripping a matte-bla
 - [ ] （模式 B）5 张角色参考图已生成并通过 QC 表
 - [ ] 全片 `one worker` / `two workers` 类泛指着装句已全部替换为身份块
 - [ ] 每条含人物提示词均带负面清单三条常驻项
+- [ ] 该角色已登记 `action_onset_markers`（非施工题材必须自己登记，否则前置判定跑不起来）
 - [ ] `python scripts/check_character_lock.py --cast <id> <prompt-set.md>` 退出码为 0
+      且**没有 warning**（有 warning 就用 `--strict` 复跑一遍确认是真的可接受）
 - [ ] 每段成片过一遍 14 项 QC 表，第 1～8 项零容忍
 
 ---

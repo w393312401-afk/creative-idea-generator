@@ -19,6 +19,7 @@ banned_elements 里本该出现的东西反而被写进了 beats。
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -73,6 +74,9 @@ _STAGE_RANK = {
     'furnishing': 8,    # 家具软装
     'reveal': 9,        # 最终奖励揭示
 }
+
+# 会把隐蔽工程盖住的阶段。做完其中任何一样再去走线，都意味着要拆开刚做完的东西。
+_COVERING_STAGES = ('enclosure', 'surface', 'floor')
 
 _STAGE_LABELS_ZH = {
     'demolition': '拆除清运',
@@ -142,7 +146,7 @@ def _pass_a_model(config):
     flash 打底 + peak 帧强模型复核（见 verify_peak_frames）。"""
     cfg = config or {}
     return (cfg.get('frameFactsModel') or cfg.get('reviewModel')
-            or cfg.get('model') or 'gemini-3.6-flash-high')
+            or cfg.get('model') or 'gemini-3.7-flash-high')
 
 
 def _facts_cache_path(job_dir):
@@ -682,7 +686,7 @@ def _peak_verify_model(config):
             return None
         if text:
             return text
-    return cfg.get('model') or 'gemini-3.6-flash-high'
+    return cfg.get('model') or 'gemini-3.7-flash-high'
 
 
 def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
@@ -866,30 +870,48 @@ _PASS_B_SYSTEM = """You cluster observed frame facts into a production beat ladd
 You are given:
 - FRAME FACTS: per-frame observations with timestamps. This is the only evidence that exists.
 - CHANGE EVENTS: detected state jumps, each with a start, peak, end, and evidence frames.
+- TIME WINDOWS: the same footage summarised again on a fixed five-second grid — what entered the frame, what left it, and the concrete state at the end of each window. Computed mechanically from the frame facts, so it is evidence, not opinion.
 
 RULES
+- Every five-second window must fall inside some beat. A window whose NEW/GONE items appear in no beat's narration is work you have skipped — go back and widen a beat or claim it. The windows exist to catch exactly that.
 - Every change event must be claimed by exactly one beat, via source_event_ids. Zero unclaimed, zero double-claimed. A single beat may and often should claim SEVERAL adjacent events — events are detected state jumps, not production beats.
 - A beat is a PRODUCTION MILESTONE, not a state jump. It must declare TWO OR THREE tightly coupled operations in package_operations that share ONE terminal product (for example ["cut", "fit", "fasten"] all producing one boarded ceiling). A beat carrying only one operation is under-scoped — widen its window and merge the adjacent events that belong to the same milestone.
 - Never mix two different physical SYSTEMS in one beat (wiring and wall panels are separate milestones), but the two-to-three operations that jointly produce one milestone belong together in one beat.
 - A beat must produce a full visible milestone, not a token patch. If two adjacent windows continue the same milestone, merge them.
-- persistent_traces must list AT LEAST TWO visible marks this beat leaves behind.
+- visible_details: THREE to SIX items. Each names a material with its colour, texture or condition and where it sits — "yellow fibreglass batts in the left wall bays", not "insulation". These items are the only place the reference film's actual look survives into the prompt; a bare noun brings back a generic version of this work, not this film.
+- persistent_traces: AT LEAST TWO visible marks this beat leaves behind, each naming the mark AND the surface it sits on.
 - evidence_frames: list AT MOST THREE frames per beat — the one that best shows the start, the one that best shows the work, and the one that best shows the result. Do not echo every frame in the window; a long frame list is the single biggest cause of a reply that gets cut off before it finishes.
-- Keep every prose field under thirty words. This is a structural ladder, not a description.
+- Keep the SENTENCE fields (visual_subject, visible_action, visible_result, state_before, state_after) under thirty words each. Length belongs in visible_details and persistent_traces, where it buys concrete look; in the sentence fields it only buys narration.
+- Do not restate scene_signature in every beat. It is written once, at the top, and applies throughout.
+- space: name the physical space the camera is filming FROM, as a short lowercase label ("wooded slope outside", "entrance tunnel", "main room", "sleeping alcove"). Reuse the SAME label verbatim for every beat shot in that space. Start a NEW label ONLY when the camera has physically moved into a different enclosed space through an opening — never for a reframe, a closer angle, or a pan inside one space, and never because the work changed. Every beat filmed outside the structure shares ONE outdoor label. This field is the only record of how many times the film walks through a doorway; a film that enters a corridor and later enters a room off it has THREE labels, and collapsing them into one deletes that second entry from the reproduction.
 - Every claim must trace to a frame. Never write a tool, material, worker, or operation that no frame fact mentions.
 - state_before / state_after must be concrete spatial completion extent, never "partially done".
 - banned_elements: things a renovation of this type would plausibly involve but that appear in NO frame fact. Be generous here — this list is what stops the prompt writer from hallucinating later.
-- stage: classify each beat as one of demolition | structural | rough_in | enclosure | surface | floor | fixtures | furnishing | reveal.
+- stage: classify each beat as exactly one of the nine below. Read these definitions — the stage drives a construction-dependency check, and a beat filed under the wrong one gets the ladder rejected for a violation it does not actually have.
+  - demolition: tearing out, clearing, hauling away debris.
+  - structural: foundations, framing, load-bearing walls, roof structure, cutting an opening through a structural wall.
+  - rough_in: services that later get covered up — electrical cable, plumbing pipe, ductwork. ONLY the services themselves.
+  - enclosure: closing a cavity up — wall studs, insulation batts, sheathing, wall boards, ceiling boards. Wall framing plus insulation belongs HERE, not in structural and never in fixtures.
+  - surface: finish layers — primer, paint, plaster, cladding, wall panelling and trim, wet trades.
+  - floor: floor build-up and finishing — sub-base, joists, floorboards, floor coverings.
+  - fixtures: powered or plumbed equipment being installed — light fittings, sockets, switches, taps, appliances. A beat with no powered or plumbed device in it is NEVER fixtures.
+  - furnishing: loose furniture, textiles, decor being moved in and arranged.
+  - reveal: the final walk-through / hero shot of the finished result.
 - Beats are ordered by time and must not overlap.
+
+- scene_signature: ONE sentence naming the venue and how it looks throughout — its structure, its materials, its weathering, its surroundings, its standing light. Write what is true in the first frame and still true in the last. No work, no progress, no beat content. This is the one line that says why the reference film looks like itself; a generic version of it ("an interior space under renovation") is worse than none.
 
 OUTPUT
 Return one JSON object, no prose, no code fences:
 {
   "video_duration_sec": <number>,
+  "scene_signature": "<one sentence, under thirty words>",
   "banned_elements": ["..."],
   "beats": [{
     "id": "B01",
     "start": <sec>, "end": <sec>,
     "stage": "<one of the nine>",
+    "space": "<short label of the space this beat is filmed in, reused verbatim across beats>",
     "operation": "<the dominant physical operation naming this milestone>",
     "package_operations": ["<two or three tightly coupled operations sharing one terminal product>"],
     "visual_subject": "...",
@@ -954,10 +976,16 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
     events = overview.get('change_events') or []
     duration = (overview.get('media_metadata') or {}).get('duration_sec') or 0
 
+    # 定长窗与帧事实同源，但换了一根轴：事实是逐帧的、密到读不完，窗是逐五秒的、
+    # 直接说「这五秒里画面多了什么少了什么」。给模型两套读法，是为了让「某一段没被
+    # 任何一拍认领」这件事在输入里就显形，而不是等成片出来才发现少了一道工序。
+    windows = analyze_time_windows(facts, duration)
     user = (
         f'VIDEO DURATION: {duration} seconds\n\n'
         f'==================== FRAME FACTS ====================\n{_facts_digest(facts)}\n\n'
-        f'==================== CHANGE EVENTS ====================\n{_events_digest(events)}\n'
+        f'==================== CHANGE EVENTS ====================\n{_events_digest(events)}\n\n'
+        f'==================== TIME WINDOWS (fixed {WINDOW_SECONDS:g}s grid) ===================='
+        f'\n{_windows_digest(windows)}\n'
     )
 
     # 拼图拿得到就走多模态。拿不到（ffmpeg 缺失、帧文件不在）退回纯文本，产出会粗一档
@@ -1067,7 +1095,16 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
         beats_doc['source_video'] = overview.get('source_video')
         beats_doc['variant_of'] = None
         beats_doc['mutation_axes'] = []
+        # 归一必须在校验之前：键名漂移会伪装成十几条「缺少字段」，回炉预算只有一轮，
+        # 拿去修一个纯搬运就能解决的问题，等于把那一轮扔了。
+        normalize_beat_keys(beats_doc)
         _renumber_beats(beats_doc)
+        normalize_beat_spaces(beats_doc)
+        attach_coverage_frames(beats_doc, overview)
+        # 定长窗随文档一起落盘：卡点上要拿它跟节拍对照，回炉时也要用同一份，不能
+        # 每次重算一遍——那样两次看到的「画面变化」可能不是同一份。
+        beats_doc['time_windows'] = windows
+        attach_scene_constants(beats_doc, facts)
 
         violations = validate_beats(beats_doc, overview)
         if not [v for v in violations if v['level'] == 'error']:
@@ -1216,6 +1253,558 @@ def _num(value, default=0.0):
         return default
 
 
+# ── 观察到的空间序列 ─────────────────────────────────────────────────────────
+#
+# 一条片子进过几次门，是**看出来的**，不是骨架规定的。Pass B 逐拍写下 `space`（这一拍
+# 的机位在哪个空间里），这里把它归一成一条序列；序列每变一次值，就是原片里的一次进门。
+#
+# 在此之前，反推层根本不产出空间信息：beats_to_dimensions 只交出工序与状态，合成期再由
+# 叙事骨架决定过门次数——linear_milestone 写死一次、nested_space_payoff 写死两次。于是
+# 原片走廊尽头那道门无论开几次，复刻出来都只进一次门（2026-08-14 用户复盘：地堡单
+# IMG 006-013 全在同一机位族里，第二个空间只是画面深处一扇永远没被推开的门）。
+_DEFAULT_SPACE_LABEL = 'main space'
+
+
+def normalize_space_label(value):
+    """空间名归一：折叠空白、转小写、去尾部标点。空值返回空串（由调用方决定继承谁）。
+
+    归一只为**判等**服务——判等错了后果是两个方向的：把同一个空间的两种写法当成两个
+    空间，会凭空插进一次不存在的过门；反过来把两个空间当成一个，就是本函数存在的理由。
+    """
+    text = ' '.join(str(value or '').split()).strip().strip('.,;:!'
+                                                            '。，；：').lower()
+    return text
+
+
+def normalize_beat_spaces(beats_doc):
+    """把每拍的 `space` 归一并回填，返回归一后的标签序列。
+
+    缺字段/写空的拍**继承上一拍**（而不是各自新开一个空间）：漏写是模型最常见的失误，
+    按「未知即新空间」处理会在阶梯中间插进一串假过门。首拍缺失才退到通用名。
+    老文档（2026-08-14 之前跑的、压根没有这个字段）因此整条序列只有一个空间，
+    行为与改动前完全一致。
+    """
+    labels = []
+    current = ''
+    for beat in (beats_doc.get('beats') or []):
+        if not isinstance(beat, dict):
+            continue
+        label = normalize_space_label(beat.get('space'))
+        current = label or current or _DEFAULT_SPACE_LABEL
+        beat['space'] = current
+        labels.append(current)
+    return labels
+
+
+def space_sequence(beats_doc):
+    """这份阶梯逐拍的空间标签序列（不改写文档）。"""
+    labels, current = [], ''
+    for beat in (beats_doc.get('beats') or []):
+        if not isinstance(beat, dict):
+            continue
+        label = normalize_space_label(beat.get('space'))
+        current = label or current or _DEFAULT_SPACE_LABEL
+        labels.append(current)
+    return labels
+
+
+def space_crossings(labels):
+    """空间序列 → 过门位置的 1-based 拍号列表。值一变就是一次过门，几次都算。"""
+    crossings = []
+    for position, label in enumerate(labels or [], 1):
+        if position > 1 and label != labels[position - 2]:
+            crossings.append(position)
+    return crossings
+
+
+# ── 定长时间窗：画面变化的第二套读法 ─────────────────────────────────────────
+#
+# 节拍是**语义**切分：一拍 = 一个生产里程碑，因此拍窗宽窄不一（3.5s 到 10.9s 都有），
+# 而且它由模型划定。这套切法有个结构性盲点：一段时间里发生的事若没被模型认成里程碑，
+# 它就不在任何一拍的叙述里，而没有任何机制会喊出来——「漏了」和「这段确实没事发生」
+# 在产物里长得一模一样。
+#
+# 定长窗是独立的第二套读法：不问语义，只按固定 5 秒切开，逐窗统计画面里**新出现**和
+# **消失**了什么。它与节拍互为对照——节拍说「这一拍在铺地板」，定长窗说「45–50s 之间
+# 画面里多了碎石、少了积叶」。两者对不上的地方，就是要人去看帧的地方。
+#
+# 全部本地统计，不花一次模型调用：Pass A 已经把每一帧读完了，这里只是换一个轴去汇总。
+WINDOW_SECONDS = 5.0
+
+# 一个词要在窗内多少比例的帧里出现，才算这一窗的显著特征。太低会被模型的一次性措辞
+# 带偏（同一样东西每帧说法都不同），太高会漏掉只在半个窗里露面的东西。
+_WINDOW_SALIENT_RATIO = 0.4
+# 判「新出现」时，此前各窗的出现比例必须低于这个值。留出余地是因为 Pass A 偶尔会在
+# 一两帧里提前提到某样东西（反光、半遮挡），那不算它已经在画面里了。
+_WINDOW_NOVEL_RATIO = 0.15
+
+_WINDOW_STOPWORDS = frozenset("""
+a an the and or of in on at to for from with without by over under near into onto
+is are was were be been being this that these those it its there here some several
+many few more most other another same such as than then when while during after
+before across along around behind between through visible seen shows showing
+partially fully mostly slightly very quite still also just only both each any all
+left right front back top bottom side upper lower middle center central
+""".split())
+
+
+def _content_words(value):
+    """一段文本里的实词集合。用词而不是整串短语做判据：同一样东西每帧的措辞都不同
+    （"black ceiling sheeting" / "dark ceiling surface"），按整串统计会把一个恒常物
+    拆成几十个「只出现一次」的条目，于是什么都像是刚出现的。"""
+    words = set()
+    for token in re.split(r'[^a-zA-Z一-鿿]+', str(value or '').lower()):
+        if len(token) > 2 and token not in _WINDOW_STOPWORDS:
+            words.add(token)
+    return words
+
+
+_WINDOW_FACT_FIELDS = ('materials', 'tools', 'traces')
+
+
+def _fact_phrases(fact):
+    """一条帧事实里所有可见物的短语（材质 / 器具 / 痕迹）。"""
+    out = []
+    for field in _WINDOW_FACT_FIELDS:
+        for item in (fact.get(field) or []):
+            text = str(item).strip()
+            if text:
+                out.append(text)
+    return out
+
+
+def analyze_time_windows(facts, duration, window_seconds=WINDOW_SECONDS):
+    """按定长窗汇总画面变化，返回逐窗的 dict 列表。
+
+    每一窗给出：窗内帧数、有工人的帧占比、窗首窗尾的完成范围原文，以及这一窗里
+    **新出现**和**消失**的可见物（用代表性短语表述，判据在词一级）。
+    """
+    rows = []
+    for fact in (facts or []):
+        ts = fact.get('timestamp')
+        if ts is None:
+            continue
+        try:
+            rows.append((float(ts), fact))
+        except (TypeError, ValueError):
+            continue
+    if not rows:
+        return []
+    rows.sort(key=lambda r: r[0])
+
+    span = _num(duration) or rows[-1][0]
+    step = max(0.5, float(window_seconds))
+    count = max(1, int(math.ceil(span / step - 1e-9)))
+
+    buckets = [[] for _ in range(count)]
+    for ts, fact in rows:
+        buckets[min(count - 1, int(ts // step))].append((ts, fact))
+
+    # 每窗每词的出现比例，以及这个词在本窗最常见的完整短语（判据在词一级，展示在
+    # 短语一级——只报一个词，人看不出「多了什么」）。
+    ratios, phrases = [], []
+    for bucket in buckets:
+        hits, best = {}, {}
+        for _ts, fact in bucket:
+            seen_here = set()
+            for phrase in _fact_phrases(fact):
+                for word in _content_words(phrase):
+                    best.setdefault(word, {})
+                    best[word][phrase] = best[word].get(phrase, 0) + 1
+                    seen_here.add(word)
+            for word in seen_here:
+                hits[word] = hits.get(word, 0) + 1
+        n = len(bucket)
+        ratios.append({w: k / n for w, k in hits.items()} if n else {})
+        phrases.append({w: max(v.items(), key=lambda kv: (kv[1], -len(kv[0])))[0]
+                        for w, v in best.items()})
+
+    def _elsewhere_max(word, indices):
+        return max((ratios[j].get(word, 0.0) for j in indices), default=0.0)
+
+    out = []
+    for i, bucket in enumerate(buckets):
+        salient = [w for w, r in ratios[i].items() if r >= _WINDOW_SALIENT_RATIO]
+        novel = {w for w in salient if _elsewhere_max(w, range(i)) < _WINDOW_NOVEL_RATIO}
+        # 最后一窗不判「消失」：它后面没有窗，于是窗里的一切都满足「此后再没出现」。
+        # 那是片子结束了，不是东西消失了——真实数据里这一条会把片尾成品的木墙板、
+        # 床品、灯串全部报成消失，正好是最不该出错的一窗（成品揭示）。
+        gone = set() if i == count - 1 else {
+            w for w in salient
+            if _elsewhere_max(w, range(i + 1, count)) < _WINDOW_NOVEL_RATIO}
+        # 三分而不是两分。只在这一窗露过面的东西（前面没有、后面也没有）同时满足
+        # 「新出现」和「消失」，两栏都报就成了自相矛盾的一行——而它其实是最值得看的
+        # 一类：某样东西只在这五秒里出现过，多半是一次一闪而过的工序或一件临时道具。
+        brief = novel & gone
+        appeared = novel - brief
+        vanished = gone - brief
+
+        # 去重是跨栏的，不是每栏各去各的：一条短语含好几个词（"wide landscape rake"
+        # 里 rake 只在本窗出现、landscape 之后还有），不同的词会把同一条短语同时拉进
+        # 两栏，读起来就是「它既是新出现的又是只出现一次的」。先到先得，顺序按信息量
+        # 从高到低：只此一窗 > 消失 > 新出现 > 起始就有。
+        claimed = set()
+
+        def _phrases(words):
+            picked = []
+            for word in sorted(words, key=lambda w: -ratios[i].get(w, 0.0)):
+                phrase = phrases[i].get(word)
+                key = phrase.lower() if phrase else None
+                if key and key not in claimed:
+                    claimed.add(key)
+                    picked.append(phrase)
+            return picked[:6]
+
+        brief_p, vanished_p, appeared_p = (_phrases(brief), _phrases(vanished),
+                                           _phrases(appeared))
+
+        first, last = (bucket[0][1], bucket[-1][1]) if bucket else ({}, {})
+        workers = [bool(f.get('workers_present')) for _ts, f in bucket]
+        row = {
+            'start': round(i * step, 3),
+            'end': round(min(span, (i + 1) * step), 3),
+            'frame_count': len(bucket),
+            'workers_present_ratio': round(sum(workers) / len(workers), 2) if workers else 0.0,
+            # 第一窗没有「此前」，它的显著特征全都算新出现，那不是变化而是起始画面。
+            # 混进 appeared 会让整条时间线的第一行永远是一大串噪音。
+            'baseline': appeared_p if i == 0 else [],
+            'appeared': [] if i == 0 else appeared_p,
+            'vanished': vanished_p,
+            'brief': brief_p,
+            'extent_start': str(first.get('completion_extent') or '').strip(),
+            'extent_end': str(last.get('completion_extent') or '').strip(),
+        }
+        out.append(row)
+    return out
+
+
+def _windows_digest(windows, max_extent_lines=48):
+    """定长窗摘要，喂给 Pass B。
+
+    完成范围原文是整份摘要里最长的部分，窗一多就会把提示词撑爆；超过阈值只保留
+    每窗的增减清单。宁可让长视频少带一层细节，也不能让这块把节拍聚类挤掉。
+    """
+    verbose = len(windows) <= max_extent_lines
+    lines = []
+    for w in windows:
+        head = (f'{w["start"]:.1f}–{w["end"]:.1f}s | frames={w["frame_count"]} '
+                f'| workers={w["workers_present_ratio"]:.0%}')
+        for label, key in (('PRESENT AT START', 'baseline'), ('NEW', 'appeared'),
+                           ('GONE', 'vanished'), ('ONLY HERE', 'brief')):
+            if w.get(key):
+                head += f' | {label}: ' + '; '.join(w[key])
+        lines.append(head)
+        if verbose and w['extent_end']:
+            lines.append(f'    state at {w["end"]:.1f}s: {w["extent_end"]}')
+    return '\n'.join(lines)
+
+
+# ── 场景恒常特征 ─────────────────────────────────────────────────────────────
+#
+# 整条管线是围绕**变化**建的：change_events → beats → 每拍的 delta。恒常的东西不产生
+# delta，于是在数据结构里没有落脚点——一段实测（2026-08-13）：`stains`（墙上的污渍）
+# 出现在 57% 的帧里，青苔、裸露树根、那盏挂着的灯泡各占一到两成，而它们在整条节拍
+# 阶梯里一个字都没有。40 万字的帧事实压成 2 万字的阶梯，被压掉的正是「这条片子长
+# 什么样」。
+#
+# 于是复刻出来的提示词有正确的工序和骨架，质感却是重新想象的：干净的混凝土而不是
+# 长着绿霉污渍的，没有落叶青苔，没有那盏灯。
+#
+# 这个字段就是给它们的落脚点，和 `banned_elements` 正好对称：一个记「原片里永远没有
+# 的东西」，一个记「原片里一直都在的东西」。同样是本地统计，不花一次模型调用。
+SCENE_CONSTANT_RATIO = 0.35
+_SCENE_CONSTANT_LIMIT = 8
+
+
+def analyze_scene_constants(facts, min_ratio=SCENE_CONSTANT_RATIO,
+                            limit=_SCENE_CONSTANT_LIMIT):
+    """出现在超过 `min_ratio` 比例的帧里的可见物，按材质 / 痕迹 / 常驻器具分栏。
+
+    判据在词一级、展示在短语一级，与 `analyze_time_windows` 同一套方法（同一样东西
+    每帧措辞不同，按整串统计会把一个恒常物拆成几十个「只出现一次」的条目）。
+    """
+    rows = [f for f in (facts or []) if isinstance(f, dict)]
+    if not rows:
+        return {}
+    n = len(rows)
+
+    out = {}
+    for field, key in (('materials', 'materials'), ('traces', 'traces'),
+                       ('tools', 'fixtures_in_shot')):
+        hits, best = {}, {}
+        for fact in rows:
+            seen_here = set()
+            for item in (fact.get(field) or []):
+                phrase = str(item).strip()
+                if not phrase:
+                    continue
+                for word in _content_words(phrase):
+                    best.setdefault(word, {})
+                    best[word][phrase] = best[word].get(phrase, 0) + 1
+                    seen_here.add(word)
+            for word in seen_here:
+                hits[word] = hits.get(word, 0) + 1
+
+        picked, claimed = [], set()
+        for word, k in sorted(hits.items(), key=lambda kv: -kv[1]):
+            if k / n < min_ratio:
+                break
+            phrase = max(best[word].items(), key=lambda kv: (kv[1], -len(kv[0])))[0]
+            if phrase.lower() in claimed:
+                continue
+            claimed.add(phrase.lower())
+            picked.append(phrase)
+            if len(picked) >= limit:
+                break
+        if picked:
+            out[key] = picked
+    return out
+
+
+def attach_scene_constants(beats_doc, facts):
+    """算出场景恒常特征并挂到文档上。只在字段**不存在**时算一次。
+
+    判「键在不在」而不是「值真不真」：它进合成提示词、影响每一条产物，而统计难免会
+    把工人的手套、一次性道具算进来。用户在卡点上把三栏全删空之后，值是空的、键还在——
+    按真值判定的话，下一次读状态就会把它们原样加回去，用户永远删不掉。
+    """
+    if 'scene_constants' in beats_doc:
+        return beats_doc['scene_constants']
+    # 一个都没统计出来也要落键，否则每次读状态都会重算一遍（几百 KB 的事实全扫）。
+    beats_doc['scene_constants'] = analyze_scene_constants(facts)
+    return beats_doc['scene_constants']
+
+
+def anchor_reference_frame(beats_doc, overview):
+    """起始锚点该照着哪一张真实帧写：原片最早的那一张送审帧。
+
+    锚点图（IMAGE 1）是整条序列的地基——后面每一拍的画面都从它继承材质与光线。它写歪
+    了，后面全歪，而组稿阶段它恰恰是凭文字空想出来的。
+    """
+    entries = [e for e in ((overview or {}).get('review_sampling') or {}).get('frames') or []
+               if e.get('frame_path') and e.get('timestamp') is not None]
+    if not entries:
+        return None
+    path = min(entries, key=lambda e: _num(e['timestamp'], default=1e9))['frame_path']
+    return path if os.path.exists(path) else None
+
+
+def ground_anchor_on_reference(config, anchor_prompt, frame_path, on_progress=None):
+    """拿原片真实首帧重写锚点图提示词的画面描述。失败原样返回，绝不阻塞合成。
+
+    形状照搬 `pp.ground_threshold_reveal_prompt`（2026-08-07 那次「废弃桥墩过门后渲成
+    生锈金属格栅」的解药）：不做事后视觉判定、不重渲，只是把输入源从「没见过任何像素
+    的文字猜测」换成「已经在磁盘上的真实画面」。
+
+    对反推复刻来说这一步的收益比原场景还大：合成器从头到尾看不到任何一帧原片，80 秒
+    视频最终只经由约七千字文本抵达写手。给它看一眼真正的起点，是最省的一次纠偏——
+    整单只多一次调用，而锚点图的材质与光线会被后面每一拍继承。
+    """
+    if not anchor_prompt or not frame_path:
+        return anchor_prompt
+    system = (
+        "You are rewriting ONE photoreal image prompt: the opening anchor frame of a "
+        "reconstruction sequence. You are shown the ACTUAL first frame of the reference film "
+        "this sequence reproduces.\n\n"
+        "Rewrite the prompt you are given so that its structure, materials, weathering, "
+        "vegetation, clutter and light match what you can see in the reference frame. Keep its "
+        "subject, its camera framing and its intent exactly as written — you are correcting "
+        "what the place is made of and what it looks like, not what the shot is of.\n\n"
+        "Rules:\n"
+        "1. Never introduce a material, structure or object the reference frame gives no basis for.\n"
+        "2. Keep every decay, stain, moss, debris and vegetation detail the reference frame "
+        "actually shows — those are why the reference film looks like itself.\n"
+        "3. Do not describe the reference frame's transient contents: people, tools being held, "
+        "or equipment mid-use. Standing equipment that never leaves the shot is fine.\n"
+        "4. Plain visual prose only — no percentages, labels, on-screen text, or commentary.\n"
+        "Respond with ONLY the rewritten prompt, nothing else."
+    )
+    try:
+        text = pp._multimodal_chat(
+            config, system,
+            f'The prompt to correct:\n\n{anchor_prompt}', [frame_path], max_tokens=900)
+    except Exception as exc:
+        if sys.stdout:
+            print(f'[REVERSE] 锚点图对齐真实首帧失败，沿用组稿阶段的提示词: {exc}')
+        return anchor_prompt
+    text = (text or '').strip()
+    if not text:
+        return anchor_prompt
+    if on_progress:
+        on_progress('replica_stage', {
+            'stage': 'compose',
+            'message': '锚点图已照着原片真实首帧校正过材质与光线',
+        })
+    return text
+
+
+def scene_constants_lines(constants, signature=None):
+    """把场景恒常信息摊平成给提示词用的行。
+
+    两个来源有意并存，因为它们的失效方式相反：`scene_constants` 是本地统计，绝不会
+    凭空捏造，但措辞是从帧事实里挑的、偏碎（"dark ceiling surface"）；`signature` 是
+    模型写的整体基调，读起来像人话，但它可能润色。碎而可靠的那份负责兜底，整体那份
+    负责让写手知道这是个什么地方。
+    """
+    lines = []
+    text = str(signature or '').strip()
+    if text:
+        lines.append(f'the place itself: {text}')
+    labels = (('materials', 'always-present materials and surfaces'),
+              ('traces', 'always-present marks and weathering'),
+              ('fixtures_in_shot', 'equipment permanently in shot'))
+    for key, label in labels:
+        items = [str(x).strip() for x in ((constants or {}).get(key) or []) if str(x).strip()]
+        if items:
+            lines.append(f'{label}: ' + '; '.join(items))
+    return lines
+
+
+# ── 键名漂移 ─────────────────────────────────────────────────────────────────
+#
+# 模型会在长回复的后半段把字段名写成近义词：2026-08-13 的那一单，前五拍老实写
+# `visible_action` / `visible_result`，从第六拍起整段漂成 `visual_action` /
+# `visual_result`。内容一个字不缺，全部躺在错名字底下，而校验器报的是十二条
+# 「缺少字段」——把用户挡在合成门外，去修一个根本不存在的缺失。
+#
+# 这不该由模型来修。内容已经在文档里了：重跑一次要重付一次调用，措辞会被重新生成
+# （可能偏离画面），而且极可能在别处再漂一次。这里做的是纯搬运。
+#
+# 纪律：**只搬运，不生成，绝不覆盖**。目标键已经有值时一律不动，连错名的那份也
+# 留着——两个都有值意味着模型写了两份不同的说法，那是需要人看画面裁决的事，静默
+# 挑一份等于替用户篡改观察结果。这条与「不自动修 beats」的纪律不冲突：搬运不改变
+# 任何一个字的内容。
+_BEAT_KEY_ALIASES = {
+    'space_id': 'space',
+    'room': 'space',
+    'location': 'space',
+    'visual_action': 'visible_action',
+    'visual_result': 'visible_result',
+    'visual_details': 'visible_details',
+    'visible_subject': 'visual_subject',
+    'persistent_trace': 'persistent_traces',
+    'package_operation': 'package_operations',
+    'source_event_id': 'source_event_ids',
+    'evidence_frame': 'evidence_frames',
+    'reference_frame': 'reference_frames',
+}
+
+
+def normalize_beat_keys(beats_doc):
+    """把漂掉的字段名搬回契约名，返回搬运记录 [{'beat_id','from','to'}, …]。
+
+    记录会写进 `beats_doc['key_normalizations']`，由 validate_beats 转成一条 warn。
+    修得静默是不行的：用户得知道这一拍的动作描述是从一个错名字底下捡回来的，
+    值得对着帧多看一眼。
+    """
+    moved = []
+    for beat in (beats_doc.get('beats') or []):
+        if not isinstance(beat, dict):
+            continue
+        for alias, canonical in _BEAT_KEY_ALIASES.items():
+            if alias not in beat:
+                continue
+            if beat.get(canonical) or beat[alias] in (None, '', [], {}):
+                continue
+            beat[canonical] = beat.pop(alias)
+            moved.append({'beat_id': beat.get('id'), 'from': alias, 'to': canonical})
+    if moved:
+        # 累加而不是覆盖，且没搬到东西时绝不清空：这条记录是这份文档的历史事实，
+        # 不是一次调用的临时值。归一会在每次读状态、每次保存时重跑，第二次跑必然
+        # 一处也搬不到——那时清空，等于这条 warn 只在用户看不见的那一瞬间存在过。
+        beats_doc['key_normalizations'] = (beats_doc.get('key_normalizations') or []) + moved
+    return moved
+
+
+# ── 覆盖帧 ───────────────────────────────────────────────────────────────────
+#
+# `evidence_frames` 最多三张（见 _PASS_B_SYSTEM：帧列表一长，Pass B 的回复就会被
+# 截断）。三张对一拍 3s 的窗够看，对一拍 10s 的窗就是每 3.4s 才有一张——同一份阶梯
+# 里，长拍的画面密度只有短拍的三分之一，人工核对时长拍中段发生过什么根本看不见。
+#
+# 覆盖帧补的就是这一段：从**已经抽好的**帧里按时间均匀取一排，铺满整个拍窗。它是
+# 纯本地计算，不多抽一帧、不多花一次模型调用，也不参与任何判据——合成器读的仍然是
+# evidence_frames。它只负责让人工卡点上「这一拍的 10 秒里到底发生了什么」看得见。
+COVERAGE_MIN_FRAMES = 6
+COVERAGE_MAX_FRAMES = 10
+
+
+def _review_frame_timeline(overview):
+    """[(timestamp, 文件名), …]，按时间升序。抽帧脚本产出的全部送审帧。
+
+    注意取的是 review_sampling 的**全集**，不是 analysis_plan 那个子集：plan 是
+    「哪些帧值得花钱送给模型看」，覆盖帧是「哪些帧值得给人看」，后者不花钱，没有
+    理由跟着前者一起稀疏。
+    """
+    rows = []
+    for entry in ((overview.get('review_sampling') or {}).get('frames') or []):
+        path, ts = entry.get('frame_path'), entry.get('timestamp')
+        if not path or ts is None:
+            continue
+        try:
+            rows.append((float(ts), os.path.basename(path)))
+        except (TypeError, ValueError):
+            continue
+    rows.sort()
+    return rows
+
+
+def coverage_frames_for_window(timeline, start, end,
+                               min_frames=COVERAGE_MIN_FRAMES,
+                               max_frames=COVERAGE_MAX_FRAMES):
+    """拍窗 [start, end] 内按时间均分取帧，返回 [{'frame', 'timestamp'}, …]。
+
+    张数自适应：窗内帧不够 `max_frames` 就全给（抽帧密度是上限，这里造不出帧来），
+    多了就按等时距目标点就近取 `max_frames` 张。`min_frames` 只在窗内帧数超过上限
+    时作为下界兜底，正常档位的抽帧密度下每拍会落在 6~10 张。
+    """
+    if not timeline:
+        return []
+    lo, hi = sorted((_num(start), _num(end)))
+    inside = [row for row in timeline if lo - 1e-6 <= row[0] <= hi + 1e-6]
+    if not inside:
+        # 拍窗比抽帧步长还短（用户拆拍能拆出这种窗）。给最近的一张，别让这拍空着——
+        # 空着会被误读成「这一段没有画面」，而事实是这一段没被单独抽到帧。
+        nearest = min(timeline, key=lambda row: min(abs(row[0] - lo), abs(row[0] - hi)))
+        return [{'frame': nearest[1], 'timestamp': round(nearest[0], 3)}]
+
+    count = max(min_frames, min(max_frames, len(inside)))
+    if len(inside) <= count:
+        picked = list(inside)
+    else:
+        span = hi - lo
+        picked, used = [], set()
+        for i in range(count):
+            target = lo + (span * i / (count - 1) if count > 1 and span > 0 else 0.0)
+            # 每个目标点消耗一张帧，所以 count 张一定取得满，也一定不重复。
+            best = min((row for row in inside if row[1] not in used),
+                       key=lambda row: abs(row[0] - target))
+            used.add(best[1])
+            picked.append(best)
+        picked.sort()
+    return [{'frame': name, 'timestamp': round(ts, 3)} for ts, name in picked]
+
+
+def attach_coverage_frames(beats_doc, overview):
+    """给每一拍挂上 `coverage_frames`。派生数据，每次都重算。
+
+    重算而不是「缺了才补」：用户在卡点上拆拍/并拍会改动时间窗，留着上一版的覆盖帧
+    等于让人对着**别的拍窗**的画面核对这一拍——比没有覆盖帧更坏。
+    """
+    timeline = _review_frame_timeline(overview)
+    beats = beats_doc.get('beats') or []
+    if not timeline:
+        for beat in beats:
+            if isinstance(beat, dict):
+                beat.pop('coverage_frames', None)
+        return beats_doc
+    for beat in beats:
+        if isinstance(beat, dict):
+            beat['coverage_frames'] = coverage_frames_for_window(
+                timeline, beat.get('start'), beat.get('end'))
+    return beats_doc
+
+
 # ── 校验器 ───────────────────────────────────────────────────────────────────
 
 def _schema_path():
@@ -1256,6 +1845,17 @@ def _warn(code, message, beat_id=None):
     return {'level': 'warn', 'code': code, 'message': message, 'beat_id': beat_id}
 
 
+def is_variant_doc(beats_doc):
+    """这份阶梯是不是二创变体。
+
+    变体没有 `evidence_frames`——`_merge_variant` 有意把它改名成 `reference_frames`：
+    变体不再对原片的事实负责，那些帧只剩机位与构图参考。校验器不知道这件事的话，
+    每一拍都会同时报「缺少字段 evidence_frames」和「没有证据帧」，一条本来干净的
+    变体阶梯在合成卡点上被判死（2026-08-12 的整单失败就是这样来的）。
+    """
+    return bool(beats_doc.get('variant_of') or beats_doc.get('mutation_axes'))
+
+
 def validate_beats(beats_doc, overview, schema=None):
     """返回 violations 列表；error 级别会触发回炉，warn 级别只在人工卡点上高亮。
 
@@ -1278,9 +1878,21 @@ def validate_beats(beats_doc, overview, schema=None):
             f'读不到契约文件 {_SCHEMA_FILENAME}，本次**跳过了字段完整性校验**'
             f'（事件覆盖、证据帧、施工顺序等其余校验照常跑）。'
             f'技能包可能版本过旧或路径配错：{schema_error}'))
-    out.extend(_validate_required_fields(beats_doc, beats, schema))
+    # 键名搬运过就说出来。静默修复会让人以为模型本来就写对了，而这几拍的动作描述
+    # 是从一个错名字底下捡回来的，值得对着帧多看一眼。
+    moved = beats_doc.get('key_normalizations') or []
+    if moved:
+        ids = sorted({str(m.get('beat_id')) for m in moved})
+        pairs = sorted({f'{m.get("from")}→{m.get("to")}' for m in moved})
+        out.append(_warn(
+            'beat_keys_normalized',
+            f'{len(ids)} 拍（{"、".join(ids)}）的字段名写漂了，已按契约名归位：'
+            f'{"，".join(pairs)}。内容原样搬运、未作改动，但请顺带核对这几拍的措辞。'))
+
+    variant = is_variant_doc(beats_doc)
+    out.extend(_validate_required_fields(beats_doc, beats, schema, variant=variant))
     out.extend(_validate_event_coverage(beats, overview))
-    out.extend(_validate_evidence_frames(beats, overview))
+    out.extend(_validate_evidence_frames(beats, overview, variant=variant))
     out.extend(_validate_time_axis(beats, beats_doc.get('video_duration_sec')))
     out.extend(_validate_construction_order(beats))
     out.extend(_validate_temporary_objects(beats))
@@ -1442,10 +2054,13 @@ def _missing_field_reason(beat, key, prop):
     return None
 
 
-def _validate_required_fields(beats_doc, beats, schema):
+def _validate_required_fields(beats_doc, beats, schema, variant=False):
     out = []
     if not schema:
         return out
+    # schema 的 required 是按原片阶梯写的。变体那一份的对应字段叫 reference_frames，
+    # 由 `_validate_evidence_frames` 按变体口径校验，不在这里当缺失字段报。
+    exempt = {'evidence_frames'} if variant else set()
     root_required = schema.get('required') or []
     for key in root_required:
         if key not in beats_doc:
@@ -1457,6 +2072,8 @@ def _validate_required_fields(beats_doc, beats, schema):
     for beat in beats:
         bid = beat.get('id')
         for key in beat_required:
+            if key in exempt:
+                continue
             problem = _missing_field_reason(beat, key, beat_props.get(key) or {})
             if problem:
                 out.append(_err('missing_beat_field', f'{bid} {problem}', bid))
@@ -1465,6 +2082,15 @@ def _validate_required_fields(beats_doc, beats, schema):
             if re.search(r'partial|部分完成|some of|一些', text, re.I):
                 out.append(_warn('vague_state',
                                  f'{bid} 的 `{key}` 用了含糊表述，必须写具体空间完成范围：{text}', bid))
+        # 细节条数：判 warn 不判 error，schema 的 minItems 也照旧留在 1。
+        # 这是**质量**下限不是**契约**下限——把它提成硬伤，会让所有存量阶梯在合成门口
+        # 集体判死，而它们并没有变坏。visible_details 是原片长相在提示词里唯一的落脚点，
+        # 少于三条基本等于只剩工序名（见 _PASS_B_SYSTEM 里对这个字段的要求）。
+        details = [x for x in (beat.get('visible_details') or []) if str(x).strip()]
+        if 0 < len(details) < 3:
+            out.append(_warn('thin_details',
+                             f'{bid} 只写了 {len(details)} 条可见细节。这是原片质感在提示词里'
+                             f'唯一的落脚点，对着覆盖帧补到三条以上，复刻出来才像这条片子。', bid))
     return out
 
 
@@ -1495,9 +2121,16 @@ def _validate_event_coverage(beats, overview):
     return out
 
 
-def _validate_evidence_frames(beats, overview):
-    """证据帧必须真实存在，且时间戳落在本拍窗口内。"""
+def _validate_evidence_frames(beats, overview, variant=False):
+    """证据帧必须真实存在，且时间戳落在本拍窗口内。
+
+    变体读 `reference_frames`，而且整档降级为 warn：那些帧不再是「这拍确实发生过」的
+    证据，只是原片的构图参考，缺一张不该拦住合成。见 `is_variant_doc`。
+    """
     out = []
+    frame_key = 'reference_frames' if variant else 'evidence_frames'
+    label = '参考帧' if variant else '证据帧'
+    flag = _warn if variant else _err
     entries = ((overview.get('review_sampling') or {}).get('frames') or [])
     ts_by_name = {os.path.basename(e['frame_path']): e['timestamp']
                   for e in entries if e.get('frame_path')}
@@ -1509,29 +2142,71 @@ def _validate_evidence_frames(beats, overview):
 
     for beat in beats:
         bid = beat.get('id')
-        frames = beat.get('evidence_frames') or []
+        frames = beat.get(frame_key) or []
         if not frames:
-            out.append(_err('no_evidence', f'{bid} 没有证据帧，但它断言了动作与结果', bid))
+            if not variant:
+                out.append(_err('no_evidence', f'{bid} 没有证据帧，但它断言了动作与结果', bid))
             continue
         start, end = _num(beat.get('start')), _num(beat.get('end'))
         for name in frames:
             if name not in ts_by_name:
-                out.append(_err('evidence_missing',
-                                f'{bid} 引用了不存在的证据帧 {name}', bid))
+                out.append(flag('evidence_missing',
+                                f'{bid} 引用了不存在的{label} {name}', bid))
                 continue
             ts = _num(ts_by_name[name], default=None) if ts_by_name[name] is not None else None
             if ts is not None and not (start - 0.5 <= ts <= end + 0.5):
                 out.append(_warn('evidence_out_of_window',
-                                 f'{bid} 的证据帧 {name}（t={ts}s）落在拍窗 [{start}, {end}] 之外', bid))
+                                 f'{bid} 的{label} {name}（t={ts}s）落在拍窗 [{start}, {end}] 之外', bid))
     return out
 
 
+_UNCOVERED_TOLERANCE_SEC = 0.5
+
+
+def _validate_space_grouping(source_doc, variant_doc):
+    """二创：空间的**分组**必须与原骨架逐拍一致，名字可以随载体改。
+
+    「哪几拍在同一个空间、哪一拍换空间」和拍数、施工序一样属于被复用的节奏骨架——
+    它就是这条片子进几次门、什么时候进。名字换成新载体的叫法是应该的（"main room"
+    → "bus saloon"），把两个空间并成一个、或者凭空多出一个，改的就是骨架本身。
+    判 error：合成期按这份序列标过门（apply_observed_space_sequence），并错了就是
+    变体比原片少走进一个房间，而这件事在成片之前看不出来。
+    """
+    source = space_sequence(source_doc)
+    variant = space_sequence(variant_doc)
+    if not source or len(source) != len(variant):
+        return []
+    src_crossings, var_crossings = space_crossings(source), space_crossings(variant)
+    if src_crossings == var_crossings:
+        return []
+    beats = variant_doc.get('beats') or []
+    bid = None
+    for position in sorted(set(src_crossings) ^ set(var_crossings)):
+        if 1 <= position <= len(beats):
+            bid = (beats[position - 1] or {}).get('id')
+            break
+    return [_err('space_grouping_changed',
+                 f'空间分组被改了：原骨架在第 {src_crossings or "—"} 拍过门，变体成了第 '
+                 f'{var_crossings or "—"} 拍。换空间的名字可以，改哪几拍共用一个空间不行——'
+                 f'那等于改掉了这条片子进几次门。', bid)]
+
+
 def _validate_time_axis(beats, duration):
+    """时间轴：非法窗、超长、重叠，以及**没有任何一拍覆盖的时间段**。
+
+    空洞这一条是 2026-08-13 补的。此前只查重叠不查空洞，于是「这一段被漏掉了」与
+    「这一段确实没事发生」在产物里长得一模一样——而前者正是复刻会整段丢掉一道工序的
+    成因。判 warn 不判 error：安静段落（比如镜头空摇）确实可以不属于任何里程碑，
+    该由人看一眼定夺，不该直接拦死合成。
+    """
     out = []
     prev_end = None
+    first_start = None
     for beat in beats:
         bid = beat.get('id')
         start, end = _num(beat.get('start')), _num(beat.get('end'))
+        if first_start is None:
+            first_start = start
         if end <= start:
             out.append(_err('bad_window', f'{bid} 的时间窗非法：start={start} end={end}', bid))
         if duration and end > _num(duration) + 0.5:
@@ -1540,7 +2215,22 @@ def _validate_time_axis(beats, duration):
         if prev_end is not None and start + 0.01 < prev_end:
             out.append(_err('window_overlap',
                             f'{bid} 与上一拍时间窗重叠（start={start} < 上一拍 end={prev_end}）', bid))
+        elif prev_end is not None and start - prev_end > _UNCOVERED_TOLERANCE_SEC:
+            out.append(_warn('window_uncovered',
+                             f'{prev_end}s – {start}s（{start - prev_end:.1f}s）不属于任何一拍。'
+                             f'对着这段的覆盖帧看一眼：若有工序发生，把它并进 {bid} 或前一拍。',
+                             bid))
         prev_end = end
+
+    if first_start is not None and first_start > _UNCOVERED_TOLERANCE_SEC:
+        out.append(_warn('window_uncovered',
+                         f'0s – {first_start}s（{first_start:.1f}s）不属于任何一拍。',
+                         beats[0].get('id') if beats else None))
+    if duration and prev_end is not None and _num(duration) - prev_end > _UNCOVERED_TOLERANCE_SEC:
+        out.append(_warn('window_uncovered',
+                         f'{prev_end}s – {duration}s（{_num(duration) - prev_end:.1f}s）'
+                         f'不属于任何一拍，片尾这段被漏掉了。',
+                         beats[-1].get('id') if beats else None))
     return out
 
 
@@ -1552,7 +2242,17 @@ def _validate_construction_order(beats):
     out = []
     staged = [(b, _STAGE_RANK.get(b.get('stage'))) for b in beats]
 
-    # 阶段逆行。允许同级和小幅回退（真实改造确实会来回穿插），跨两级以上的倒挂才判。
+    # 阶段逆行。允许同级和小幅回退（真实改造确实会来回穿插），跨三级以上的倒挂才判。
+    #
+    # 容差从 ±1 放到 ±2 是被一条真片子逼出来的（2026-08-13，木屋自建）：先铺垫层和
+    # 地板（floor=6），再立室内隔墙龙骨、塞保温（enclosure=4），最后钉墙板。这个顺序
+    # 在画面里清清楚楚，在自建里也很常见——地面基层先做完，人才站得住去框隔墙。而
+    # ±1 的容差判它逆行，于是「如实标注」反而比「标错」更容易被判死，逼着人把墙体
+    # 龙骨记成面层去骗过校验器。校验器把人推向说谎，比漏判更坏。
+    #
+    # 放宽后仍然拦得住的：structural 出现在 floor 之后（2+2=4 < 6）、demolition 出现在
+    # surface 之后（1+2=3 < 5）——那些是真的不可能。而硬否决榜首「布线/水管不得晚于
+    # 遮盖它的板材」根本不走这条容差，它在下面有自己那条不吃容差的判据。
     max_rank_so_far = 0
     max_rank_beat = None
     for beat, rank in staged:
@@ -1560,7 +2260,7 @@ def _validate_construction_order(beats):
             out.append(_warn('stage_unknown',
                              f'{beat.get("id")} 的 stage 无法识别：{beat.get("stage")}', beat.get('id')))
             continue
-        if rank + 1 < max_rank_so_far:
+        if rank + 2 < max_rank_so_far:
             out.append(_err('stage_regression',
                             f'{beat.get("id")}（{stage_label(beat.get("stage"))}）出现在 '
                             f'{max_rank_beat}（{stage_label(_rank_to_stage(max_rank_so_far))}）之后，'
@@ -1571,17 +2271,22 @@ def _validate_construction_order(beats):
 
     stages = {b.get('stage') for b, _ in staged}
 
-    # 「布线/水管在封板之后」是硬否决榜首，而它恰好只差一级（enclosure=4 → rough_in=3），
-    # 会被上面那条 ±1 容差整条放过。所以单独判：任何 rough_in 拍出现在 enclosure 拍
-    # 之后都是错，不吃容差。
-    first_enclosure = next((b for b, r in staged if b.get('stage') == 'enclosure'), None)
-    if first_enclosure is not None:
-        enclosure_start = _num(first_enclosure.get('start'))
+    # 「布线/水管在遮盖它的东西之后」是硬否决榜首，而它与遮盖层只差一两级，会被上面
+    # 那条容差整条放过。所以单独判，不吃容差。
+    #
+    # 遮盖层不止封板：墙板、面层、地面收尾，任何一样做完，再去走线就意味着要把刚
+    # 做完的东西拆开——这正是那条硬否决要拦的事。原先只认 enclosure，于是「面层做完
+    # 又回去布线」只能靠通用容差兜住；容差一放宽（见上）它就会漏网，所以这里把遮盖
+    # 层补全，把这条不变量交还给它自己那条不吃容差的判据。
+    first_cover = next((b for b, _r in staged if b.get('stage') in _COVERING_STAGES), None)
+    if first_cover is not None:
+        cover_start = _num(first_cover.get('start'))
         for beat, _rank in staged:
-            if beat.get('stage') == 'rough_in' and _num(beat.get('start')) > enclosure_start:
+            if beat.get('stage') == 'rough_in' and _num(beat.get('start')) > cover_start:
                 out.append(_err('rough_in_after_enclosure',
-                                f'{beat.get("id")} 在 {first_enclosure.get("id")} 封板之后才做隐蔽工程，'
-                                f'违反硬否决「布线/水管不得晚于遮盖它的板材」。先回去核对帧。',
+                                f'{beat.get("id")} 在 {first_cover.get("id")}'
+                                f'（{stage_label(first_cover.get("stage"))}）之后才做隐蔽工程，'
+                                f'违反硬否决「布线/水管不得晚于遮盖它的板材/面层」。先回去核对帧。',
                                 beat.get('id')))
 
     # 供电链：有灯具/通电设备的拍，前面必须有 rough_in。
@@ -1631,19 +2336,21 @@ WHAT YOU MUST NOT CHANGE
 - The magnitude of progress per beat. If beat 3 originally took a wall from bare to fully boarded, the new beat 3 must take its equivalent surface equally far.
 - The construction dependency order and each beat's stage.
 - The trace inheritance chain: whatever a beat leaves behind must still be inherited by the beats after it.
+- The SPACE structure: which beats share a space and where the label changes. That pattern is how many times the film walks through a doorway and when — part of the rhythm skeleton, not of the subject. Rename each space to fit the new carrier ("main room" -> "bus saloon"), but keep the same beats sharing a label and the same beats starting a new one; never merge two spaces into one or invent a third.
 
 WHAT YOU REWRITE
-Only along the requested mutation axes: visual_subject, visible_details, visible_action, visible_result, state_before, state_after, persistent_traces, operation.
+Only along the requested mutation axes: visual_subject, visible_details, visible_action, visible_result, state_before, state_after, persistent_traces, operation, and the space NAMES (never their grouping).
 
 RULES
 - Do not carry the old carrier's construction habits onto the new one. A bus does not get brick footings; a boat hull does not get drywall screwed to studs. Re-derive the operation that achieves the SAME stage milestone on the NEW carrier.
 - state_before / state_after stay concrete and spatial.
 - Recompute banned_elements from scratch for the new carrier. Do not inherit the old list.
+- Write a scene_signature for the NEW venue: one sentence naming what the place is, what it is made of, how it is weathered, what surrounds it, how it is lit — true from the first frame to the last. Never carry the old venue's over; a bus in a snowfield shares nothing with a mossy concrete bunker.
 - Never write digits or percent symbols; spell counts as words.
 
 OUTPUT
 Return one JSON object, no prose, no code fences:
-{ "banned_elements": ["..."], "beats": [ { same fields as input, rewritten } ] }"""
+{ "scene_signature": "<one sentence, under thirty words>", "banned_elements": ["..."], "beats": [ { same fields as input, rewritten } ] }"""
 
 
 def mutate_beats(config, beats_doc, axis_spec, on_progress=None, max_rework=1):
@@ -1717,6 +2424,7 @@ def mutate_beats(config, beats_doc, axis_spec, on_progress=None, max_rework=1):
         variant = _merge_variant(beats_doc, data, axes)
         violations = [v for v in _validate_construction_order(variant['beats'])]
         violations.extend(_validate_time_axis(variant['beats'], variant.get('video_duration_sec')))
+        violations.extend(_validate_space_grouping(beats_doc, variant))
         if not [v for v in violations if v['level'] == 'error']:
             break
         attempt += 1
@@ -1733,7 +2441,7 @@ def _merge_variant(beats_doc, data, axes):
         new = dict(src)
         patch = rewritten.get(src.get('id')) or {}
         for key in ('visual_subject', 'visible_details', 'visible_action', 'visible_result',
-                    'state_before', 'state_after', 'persistent_traces', 'operation'):
+                    'state_before', 'state_after', 'persistent_traces', 'operation', 'space'):
             if patch.get(key):
                 new[key] = patch[key]
                 # 中文对照是上一版英文的译文，改了英文就必须作废对应那条——留着它，
@@ -1750,6 +2458,11 @@ def _merge_variant(beats_doc, data, axes):
         'source_video': beats_doc.get('source_video'),
         'variant_of': beats_doc.get('pipeline_id') or beats_doc.get('variant_of') or 'source',
         'mutation_axes': axes,
+        # 场景恒常特征与场景签名都**不继承**，理由和 banned_elements 一样：它们描述的是
+        # 原片那个地方——青苔、混凝土污渍、那盏三脚架灯。换了载体还带着它们，写手会把
+        # 废弃巴士写成长着青苔的混凝土掩体。统计那份没有源事实可算（变体 job 目录下没有
+        # frame_facts.json），签名则由模型按新载体重写。
+        'scene_signature': str(data.get('scene_signature') or '').strip(),
         # banned 按新载体重算，绝不继承旧列表——旧载体的「不存在物」对新载体毫无意义。
         'banned_elements': [str(x).strip() for x in (data.get('banned_elements') or []) if str(x).strip()],
         'beats': out_beats,
@@ -1779,6 +2492,12 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
             text = f'{text}（工序：{"、".join(package)}）'
         entry = {'text': text or (beat.get('visual_subject') or ''),
                  'op': beat.get('operation') or beat.get('stage')}
+        # 观察到的机位所在空间。合成期据此确定过门发生在第几拍、发生几次
+        # （见 __init__.apply_observed_space_sequence）——不透传这一个键，
+        # 复刻单的过门次数就仍由叙事骨架写死，与原片无关。
+        space = normalize_space_label(beat.get('space'))
+        if space:
+            entry['space'] = space
         # 结构化再发一遍。正文里那段「（工序：…）」是给规划模型读的，合成器的确定性
         # 通路（compile_outline_fallback_ladder / backfill_package_operations）读的是
         # 这个键——2026-08-11 的整单失败就是它缺席造成的：兜底梯子最后一拍拿不到本拍
@@ -1816,7 +2535,22 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
 
     # banned_elements 走 P0 门禁：任一 banned 元素出现在提示词里 = 交付前必须重写。
     dimensions['banned_elements'] = list(beats_doc.get('banned_elements') or [])
+    # 场景恒常特征：与 banned 对称的另一半——一个说「永远没有」，一个说「一直都在」。
+    # 只有它进了提示词，复刻出来的才是这条片子的质感，而不是同一道工序的通用想象。
+    constants = beats_doc.get('scene_constants') or {}
+    if constants:
+        dimensions['scene_constants'] = {k: list(v) for k, v in constants.items() if v}
+    signature = str(beats_doc.get('scene_signature') or '').strip()
+    if signature:
+        dimensions['scene_signature'] = signature
     dimensions['reverse_engineered'] = True
+    # 逐拍空间序列 + 过门拍号。清单条目上已经带了 space，这里再给一份整体视图：
+    # 合成期的确定性收口（apply_observed_space_sequence）读它，人工审阅也看得见
+    # 「这条片子进了几次门、在第几拍」。
+    _spaces = space_sequence(beats_doc)
+    if _spaces:
+        dimensions['space_sequence'] = _spaces
+        dimensions['space_crossings'] = space_crossings(_spaces)
     dimensions['mutation_axes'] = list(beats_doc.get('mutation_axes') or [])
     return dimensions
 

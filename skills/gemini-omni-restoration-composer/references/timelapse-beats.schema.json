@@ -33,6 +33,38 @@
       "description": "此类改造「合理会有」但任一被审查帧里都没出现的对象/工具/材料/工种/工序。P0 门禁据此判定：出现在任何 IMAGE/VIDEO 提示词里即交付前必须重写。",
       "items": { "type": "string", "minLength": 1 }
     },
+    "scene_signature": {
+      "type": "string",
+      "description": "一句话说清这是个什么地方：结构、材质、风化、周围环境、常驻光线——第一帧成立、最后一帧仍然成立的那部分。由 Pass B 产出；二创按新载体重写，绝不继承。与 banned_elements 对称：一个说原片里永远没有的，一个说原片里一直都在的。"
+    },
+    "scene_constants": {
+      "type": "object",
+      "description": "场景恒常特征，由 prompt_pipeline.reverse.analyze_scene_constants 从帧事实本地统计（出现在超过三成半帧里的可见物），不花模型调用。存在的理由：整条反推链路围绕**变化**而建，节拍只承载每拍 delta，恒常的东西不产生 delta，于是被整条压掉——实测一条片子 57% 的帧都记到了墙上的污渍，而它在节拍阶梯里一个字都没有。人工卡点上可编辑；删空后不会被重新统计回来（判键在不在，不判值真不真）。",
+      "properties": {
+        "materials": { "type": "array", "items": { "type": "string" } },
+        "traces": { "type": "array", "items": { "type": "string" } },
+        "fixtures_in_shot": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "time_windows": {
+      "type": "array",
+      "description": "定长时间窗（默认 5 秒一格），由 prompt_pipeline.reverse.analyze_time_windows 从帧事实本地统计。与节拍互为对照：节拍由模型按语义切、宽窄不一，定长窗只讲「这五秒画面里多了什么少了什么」。某一格有明显增减而覆盖它的那一拍只字未提，多半是漏掉了一道工序。",
+      "items": {
+        "type": "object",
+        "properties": {
+          "start": { "type": "number" },
+          "end": { "type": "number" },
+          "frame_count": { "type": "integer" },
+          "workers_present_ratio": { "type": "number" },
+          "baseline": { "type": "array", "items": { "type": "string" }, "description": "第一窗专用：起始画面里就有的东西。第一窗没有「此前」，把它们算成新出现只会让时间线第一行全是噪音。" },
+          "appeared": { "type": "array", "items": { "type": "string" } },
+          "vanished": { "type": "array", "items": { "type": "string" }, "description": "比 appeared 噪声大：同一样东西换个说法就会被算成消失。最后一窗恒为空——片子结束不等于东西消失。" },
+          "brief": { "type": "array", "items": { "type": "string" }, "description": "只在这一窗露过面的东西。它同时满足新出现与消失，两栏都报会自相矛盾，因此单列——往往是一闪而过的工序或临时道具。" },
+          "extent_start": { "type": "string" },
+          "extent_end": { "type": "string" }
+        }
+      }
+    },
     "beats": {
       "type": "array",
       "minItems": 1,
@@ -98,7 +130,29 @@
           "type": "array",
           "minItems": 1,
           "items": { "type": "string", "minLength": 1 },
-          "description": "review_XXX.png / scene_XXX_*.png 文件名，时间戳须落在 [start, end] 内。凡断言了动作或结果的拍，此项必填。"
+          "description": "review_XXX.png / scene_XXX_*.png 文件名，时间戳须落在 [start, end] 内。凡断言了动作或结果的拍，此项必填。二创变体例外：那一份改名为 reference_frames，validate_beats 据 variant_of / mutation_axes 豁免本字段。"
+        },
+        "stage": {
+          "type": "string",
+          "enum": ["demolition", "structural", "rough_in", "enclosure", "surface", "floor", "fixtures", "furnishing", "reveal"],
+          "description": "施工阶段。九档的释义以 prompt_pipeline/reverse.py 的 _STAGE_RANK 与 _PASS_B_SYSTEM 为准，两处必须一致（tests/test_replica_wiring.py 钉住）。要点：墙体龙骨与保温属 enclosure，不属 structural，更不属 fixtures；fixtures 专指通电/通水设备，本拍没有这类设备就一定不是 fixtures；rough_in 只指日后会被盖住的线管水管本身。校验器据此判施工依赖顺序，标错会报出一条与真实病灶无关的硬伤。"
+        },
+        "space": {
+          "type": "string",
+          "minLength": 1,
+          "description": "这一拍的机位所在的物理空间，短标签，同一空间的每一拍逐字复用（如 \"wooded slope outside\" / \"entrance tunnel\" / \"sleeping alcove\"）。只有机位真的穿过开口进入另一个封闭空间才换新标签；同一空间内的重新取景、换角度、推拉摇一律沿用原标签。这条序列是原片「进了几次门、在第几拍进」的唯一记录：合成期按它逐处标记过门拍（prompt_pipeline.__init__.apply_observed_space_sequence），把两个空间写成同一个标签，复刻出来就少一次进门。缺失/写空的拍继承上一拍（reverse.normalize_beat_spaces），因此 2026-08-14 之前的存量文档整片只有一个空间，行为不变。"
+        },
+        "coverage_frames": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["frame", "timestamp"],
+            "properties": {
+              "frame": { "type": "string", "minLength": 1 },
+              "timestamp": { "type": "number", "minimum": 0 }
+            }
+          },
+          "description": "派生字段，由 prompt_pipeline.reverse.attach_coverage_frames 从已抽好的 review_sampling 帧里按时间均分算出，铺满 [start, end]（每拍 6~10 张）。只为人工核对而存在——evidence_frames 最多三张，长拍中段会看不见。不参与任何判据，模型不产出它，时间窗一改就整份重算。"
         },
         "reference_frames": {
           "type": "array",

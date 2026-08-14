@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from typing import Any
 
@@ -38,6 +39,42 @@ def _matches_cue(name: str, cues: set[str]) -> bool:
 
 def _text(value: Any) -> str:
     return " ".join(str(value or "").split())
+
+
+# 规划期才有意义的标注：它们是写给**规划模型**读的，不是提示词正文的一部分。
+#   （工序：saw、rake、sweep）  reverse.beats_to_dimensions 挂在清单条目正文后的耦合工序
+#   ；本拍认领的卡片工序终产物：X  compile_outline_beat_ladder 给终态去重挂的中文尾巴
+#   A → B                        清单条目"动作 → 结果"的记号连接
+# 三者都会顺着 milestone_name / after_state 流进最终交付的英文提示词里。
+_PACKAGE_ANNOTATION_RE = re.compile(r"\s*（工序：[^）]*）")
+_CLAIMED_PRODUCT_RE = re.compile(r"\s*；本拍认领的卡片工序终产物：\s*")
+
+
+def scrub_planning_annotations(text: str) -> str:
+    """最终提示词正文的收口：剥掉规划期标注，换成散文。
+
+    与 scrub_spatial_notation 同一道防线、同一个理由：标注从哪条路进来都拦得住。
+    确定性拼装（compile_video_skeleton）只是其中一条；更多的是合成模型**照抄**了
+    上下文里那份带标注的 milestone_name，自己把「（工序：…）」写进了英文正文。
+    """
+    if not text:
+        return text
+    out = _PACKAGE_ANNOTATION_RE.sub("", text)
+    out = _CLAIMED_PRODUCT_RE.sub(", delivering: ", out)
+    # 箭头前那个句号一并吃掉：清单条目写的是「动作。 → 结果」，不吃就留下 "…planks., resulting in"。
+    out = re.sub(r"[ \t]*\.?[ \t]*→[ \t]*", ", resulting in ", out)
+    return re.sub(r"[ \t]{2,}", " ", out)
+
+
+def _prompt_text(value: Any) -> str:
+    """写进**交付出去的提示词**的标量文本：先规整空白，再剥掉规划期标注。
+
+    _text 仍然是内部口径（校验、状态账、去重都靠它逐字比对，不能在那一层改写）；
+    只有正文渲染这一层做这道转译。
+    """
+    out = scrub_planning_annotations(_text(value))
+    # 末尾标点也去掉：这些片段要被拼进骨架句里，句号由骨架自己补，留着就是 "deck.." 和 "deck., ending with"。
+    return " ".join(out.split()).strip(" ,;.") if out else out
 
 
 def classify_material_flow(operation: str) -> str:
@@ -216,22 +253,69 @@ def validate_scene_states(states: list[dict[str, Any]],
     return errors
 
 
+def _delta_prose(delta: Any) -> str:
+    """状态账里的 delta（dict）→ 交给渲染模型的一句话。
+
+    这里必须逐字段拼：delta 是 build_scene_states 造的三键字典，直接丢进 f-string 会
+    走 str(dict)，把花括号、引号和 milestone/terminal_state/completion_extent 这些
+    **内部键名**原样写进交付出去的提示词（2026-08-13 从复刻单的 prompt_block 里捞出
+    28 处）。键名是我们排状态账用的，不是给渲染模型读的英文。
+    """
+    if not isinstance(delta, dict):
+        return _prompt_text(delta)
+    milestone = _prompt_text(delta.get("milestone"))
+    terminal = _prompt_text(delta.get("terminal_state"))
+    extent = _prompt_text(delta.get("completion_extent"))
+    parts = [x for x in (milestone,
+                         f"ending with {terminal}" if terminal else "",
+                         f"completed across {extent}" if extent else "") if x]
+    return ", ".join(parts)
+
+
+def _accumulated_prose(accumulated: Any) -> str:
+    """before/after 累积账（{beat_N: delta} 映射）→ 逐拍已完成产物的一串散文。"""
+    if not isinstance(accumulated, dict):
+        return _prompt_text(accumulated)
+    return "; ".join(x for x in (_delta_prose(v) for v in accumulated.values()) if x)
+
+
+def _flow_prose(flows: Any) -> str:
+    """material_flow（[{store, direction}, …]）→ 'site waste decreases, offsite waste increases'。
+
+    同 _delta_prose：原先走 _text 会把整个列表的 Python repr 写进提示词。
+    """
+    if not isinstance(flows, (list, tuple)):
+        return _prompt_text(flows)
+    phrases = []
+    for item in flows:
+        if not isinstance(item, dict):
+            phrase = _prompt_text(item)
+        else:
+            store = _prompt_text(item.get("store")).replace("_", " ")
+            verb = {"increase": "increases", "decrease": "decreases"}.get(
+                _prompt_text(item.get("direction")), "changes")
+            phrase = f"{store} {verb}".strip() if store else ""
+        if phrase:
+            phrases.append(phrase)
+    return ", ".join(phrases)
+
+
 def compile_image_skeleton(camera_dna: str, landmarks: list[Any], state: dict[str, Any], lighting: str) -> str:
     return " ".join(filter(None, [
-        f"Camera DNA: {_text(camera_dna)}.",
-        f"Locked landmarks: {', '.join(_text(x) for x in landmarks if _text(x))}.",
-        f"Inherited state: {_text(state.get('before'))}.",
-        f"Only delta: {_text(state.get('delta'))}.",
-        f"Preserve: {_text(state.get('preserve'))}.",
-        f"Lighting: {_text(lighting)}.",
+        f"Camera DNA: {_prompt_text(camera_dna)}.",
+        f"Locked landmarks: {', '.join(_prompt_text(x) for x in landmarks if _prompt_text(x))}.",
+        f"Inherited state: {_accumulated_prose(state.get('before'))}.",
+        f"Only delta: {_delta_prose(state.get('delta'))}.",
+        f"Preserve: {', '.join(_prompt_text(x) for x in (state.get('preserve') or []) if _prompt_text(x))}.",
+        f"Lighting: {_prompt_text(lighting)}.",
     ]))
 
 
 def compile_video_skeleton(state: dict[str, Any]) -> str:
     return " ".join([
-        f"First-frame state: {_text(state.get('before_summary'))}.",
+        f"First-frame state: {_prompt_text(state.get('before_summary'))}.",
         "The tool makes its first visible contact before any state changes.",
-        f"Repeated physical actions execute only this delta: {_text(state.get('delta'))}.",
-        f"Material path: {_text(state.get('material_flow'))}.",
-        f"Last-frame state: {_text(state.get('after_summary'))}.",
+        f"Repeated physical actions execute only this delta: {_delta_prose(state.get('delta'))}.",
+        f"Material path: {_flow_prose(state.get('material_flow'))}.",
+        f"Last-frame state: {_prompt_text(state.get('after_summary'))}.",
     ])

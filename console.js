@@ -261,6 +261,36 @@ document.addEventListener('DOMContentLoaded', () => {
         "tryNowType": "text"
     },
     {
+        "name": "gemini-3.7-flash-high",
+        "displayName": "gemini-3.7-flash-high",
+        "provider": "Google",
+        "providerDisplay": "Google",
+        "type": "text",
+        "tagsAttr": "对话,工具,思考",
+        "tags": [
+            "对话",
+            "工具",
+            "思考"
+        ],
+        "bannerClass": "banner-gemini-agent",
+        "badgeStyle": "",
+        "badgeText": "文本",
+        "illustration": "<svg class=\"banner-illustration\" viewBox=\"0 0 100 100\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n                    <rect x=\"20\" y=\"20\" width=\"60\" height=\"60\" rx=\"4\" stroke=\"rgba(0, 242, 254, 0.3)\" stroke-dasharray=\"4 4\" stroke-width=\"1.5\"/>\n                    <line x1=\"20\" y1=\"40\" x2=\"80\" y2=\"40\" stroke=\"rgba(0, 242, 254, 0.2)\" stroke-width=\"1\"/>\n                    <line x1=\"20\" y1=\"60\" x2=\"80\" y2=\"60\" stroke=\"rgba(0, 242, 254, 0.2)\" stroke-width=\"1\"/>\n                    <line x1=\"40\" y1=\"20\" x2=\"40\" y2=\"80\" stroke=\"rgba(0, 242, 254, 0.2)\" stroke-width=\"1\"/>\n                    <line x1=\"60\" y1=\"20\" x2=\"60\" y2=\"80\" stroke=\"rgba(0, 242, 254, 0.2)\" stroke-width=\"1\"/>\n                    <circle cx=\"50\" cy=\"50\" r=\"10\" fill=\"rgba(138, 43, 226, 0.25)\" stroke=\"var(--primary)\" stroke-width=\"1.5\"/>\n                  </svg>",
+        "description": "系统默认的推理规划智能体模型（Gemini 3.7 Flash High）。用于快速对齐设计维度，构建极高一致性的渲染指令时间轴序列（SCUP 编排）。",
+        "pricing": [
+            {
+                "label": "输入价格",
+                "value": "⚡ 1.5000/M"
+            },
+            {
+                "label": "补全价格",
+                "value": "⚡ 7.5000/M"
+            }
+        ],
+        "billing": "",
+        "tryNowType": "text"
+    },
+    {
         "name": "gemini-3.6-flash-high",
         "displayName": "gemini-3.6-flash-high",
         "provider": "Google",
@@ -276,7 +306,7 @@ document.addEventListener('DOMContentLoaded', () => {
         "badgeStyle": "",
         "badgeText": "文本",
         "illustration": "<svg class=\"banner-illustration\" viewBox=\"0 0 100 100\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n                    <rect x=\"20\" y=\"20\" width=\"60\" height=\"60\" rx=\"4\" stroke=\"rgba(0, 242, 254, 0.3)\" stroke-dasharray=\"4 4\" stroke-width=\"1.5\"/>\n                    <line x1=\"20\" y1=\"40\" x2=\"80\" y2=\"40\" stroke=\"rgba(0, 242, 254, 0.2)\" stroke-width=\"1\"/>\n                    <line x1=\"20\" y1=\"60\" x2=\"80\" y2=\"60\" stroke=\"rgba(0, 242, 254, 0.2)\" stroke-width=\"1\"/>\n                    <line x1=\"40\" y1=\"20\" x2=\"40\" y2=\"80\" stroke=\"rgba(0, 242, 254, 0.2)\" stroke-width=\"1\"/>\n                    <line x1=\"60\" y1=\"20\" x2=\"60\" y2=\"80\" stroke=\"rgba(0, 242, 254, 0.2)\" stroke-width=\"1\"/>\n                    <circle cx=\"50\" cy=\"50\" r=\"10\" fill=\"rgba(138, 43, 226, 0.25)\" stroke=\"var(--primary)\" stroke-width=\"1.5\"/>\n                  </svg>",
-        "description": "系统默认的推理规划智能体模型。用于快速对齐设计维度，构建极高一致性的渲染指令时间轴序列（SCUP 编排）。",
+        "description": "推理规划智能体模型（Gemini 3.6 Flash High）。",
         "pricing": [
             {
                 "label": "输入价格",
@@ -1171,7 +1201,7 @@ document.addEventListener('DOMContentLoaded', () => {
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${keyString}" \\
   -d '{
-    "model": "gemini-3.6-flash-high",
+    "model": "gemini-3.7-flash-high",
     "messages": [
       {"role": "system", "content": "You are a creative assistant."},
       {"role": "user", "content": "设计一个废弃巴士的改造点子"}
@@ -1187,7 +1217,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gemini-3.6-flash-high",
+    model="gemini-3.7-flash-high",
     messages=[
         {"role": "user", "content": "设计一个废弃巴士的改造点子"}
     ]
@@ -1201,7 +1231,7 @@ print(response.choices[0].message.content)`;
     "Authorization": "Bearer ${keyString}"
   },
   body: JSON.stringify({
-    model: "gemini-3.6-flash-high",
+    model: "gemini-3.7-flash-high",
     messages: [{"role": "user", "content": "设计一个废弃巴士的改造点子"}]
   })
 })

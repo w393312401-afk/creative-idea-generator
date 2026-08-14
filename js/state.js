@@ -16,7 +16,7 @@ const DEFAULT_CONFIG = {
     // backend supplies the key from server_config.json. For local self-use, enter your key
     // once in the ⚙️ 配置中心 (it persists in this browser's localStorage).
     apiKey: '',
-    model: 'gemini-3.6-flash-high',
+    model: 'gemini-3.7-flash-high',
     imageModel: 'nano-banana-2',
     // 帧序列生成方式: 'api'（LLM 网关）| 'google_fx'（AdsPower 浏览器 UI 自动化）
     imageBackend: 'api',
@@ -81,7 +81,8 @@ const LLM_MODEL_GROUPS = {
         { value: 'gpt-5.6-luna', label: 'gpt-5.6-luna' }
     ],
     gemini: [
-        { value: 'gemini-3.6-flash-high', label: 'gemini-3.6-flash-high', recommended: true },
+        { value: 'gemini-3.7-flash-high', label: 'gemini-3.7-flash-high', recommended: true },
+        { value: 'gemini-3.6-flash-high', label: 'gemini-3.6-flash-high' },
         // 2026-07-26 实测：8046 网关直接认这个模型名（内部落到 gemini-pro-agent），
         // 回包带 reasoning_content，正文仍在 choices[0].message.content，链路无需改动。
         { value: 'gemini-3.1-pro-high', label: 'gemini-3.1-pro-high' }

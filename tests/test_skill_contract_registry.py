@@ -140,16 +140,32 @@ class TestEveryEnforcerActuallyExists:
 class TestKnownGapsStayVisible:
     """已知缺口的清单本身就是交付物：它变了要有人知道。"""
 
-    def test_base_gaps_are_exactly_the_three_we_accepted(self):
+    def test_base_gaps_are_exactly_the_four_we_accepted(self):
         report = server_common.skill_contract_report('base')
         assert set(report['unenforced']) == {
             'anchor-frame-compliance',     # 2026-08-05 生成期视觉判定整体移除，只剩 agent 侧口头复核
             'staged-anchor-render-gate',   # agent 侧交付节奏，服务端链路不经过
             'material-palette-lock',       # 2026-08-08 登记，执行者待补（见该条 gap 的实现方向）
+            # 2026-08-12：这一条是**真缺口且大概率长期是**。它是两条既有 P0 之间的真实矛盾
+            # （Direct-at-Zero 禁止进离场 vs 人物 QC 第 14 项要求进离场路径），协议第一节已
+            # 明确裁决；但裁决的内容是"进离场压缩到首尾各半秒以内"，而"半秒"是时长判定，
+            # 静态文本里没有可比对的量。同批的另外两条具名人物契约已经补上执行者，单独把
+            # 这条留下不是遗漏。
+            'named-cast-direct-at-zero-exemption',
         }
         # used-topic-ledger-dedup 已于 2026-08-08 补上执行者
         # （ideation_twist_root_violations，twist 根级去重），不再是缺口。
         assert 'used-topic-ledger-dedup' not in report['unenforced']
+
+    def test_named_cast_locks_are_no_longer_unenforced(self):
+        """2026-08-12：这两条 P0 此前的唯一执行点是一个要人记得跑的 CLI，注册表如实登记为
+        缺口。现在服务端 prompt_pipeline.cast_lock 逐拍自动跑同一套门，缺口关闭。
+
+        单独立一条而不是只靠上面那个集合相等：集合断言在有人**新增**一条缺口时也会红，
+        读断言失败信息的人分不清是"新缺口出现"还是"这两条又退回去了"。"""
+        report = server_common.skill_contract_report('base')
+        assert 'named-cast-vocabulary-lock' not in report['unenforced']
+        assert 'named-cast-hal-exclusivity' not in report['unenforced']
 
     def test_omni_gaps_are_exactly_the_two_we_accepted(self):
         report = server_common.skill_contract_report('omni')

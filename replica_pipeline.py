@@ -513,7 +513,13 @@ def save_beats(job_id, beats):
     with open(os.path.join(directory, 'video_overview.json'), 'r', encoding='utf-8') as f:
         overview = json.load(f)
 
+    reverse.normalize_beat_keys(beats)
     reverse._renumber_beats(beats)
+    # 人工在卡点上拆拍/并拍/改 space 之后，空间序列要跟着重新归一：一次编辑就可能
+    # 增删一次过门（见 reverse.normalize_beat_spaces）。
+    reverse.normalize_beat_spaces(beats)
+    # 拆拍/并拍改的就是时间窗，覆盖帧必须跟着重算——见 attach_coverage_frames。
+    reverse.attach_coverage_frames(beats, overview)
     beats['pipeline_id'] = job_id
     beats['validation'] = reverse.validate_beats(beats, overview)
     beats['edited_by_user'] = True
@@ -617,6 +623,86 @@ def run_mutate(state, config, axis_spec, on_progress=None):
 
 # ── compose + audit ──────────────────────────────────────────────────────────
 
+def _load_overview(state):
+    """读这条 job 的 video_overview.json；读不到返回 {}。
+
+    变体 job 目录下有一份从源 job 复制过来的副本（见 start_variant），所以变体也能拿到
+    原片的送审帧名册——参考帧本来就该指回原片。
+    """
+    path = os.path.join(job_dir(state['job_id']), 'video_overview.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _backfill_time_windows(state, beats):
+    """存量任务补算定长窗。只在缺的时候算一次，并落盘。
+
+    帧事实是几百 KB 的 JSON，而这个函数挂在每次状态轮询的路径上——不落盘的话，
+    前端每两秒就会把它重算一遍。定长窗是纯派生数据，写一次比反复算便宜得多。
+
+    变体 job 自己没有 frame_facts.json（帧与事实都在源 job 那边），读不到就算了：
+    定长窗是给原片核对用的对照读法，变体的时间骨架本来就是原片那一份。
+    """
+    if not beats or (beats.get('time_windows') is not None and 'scene_constants' in beats):
+        return
+    path = os.path.join(job_dir(state['job_id']), 'frame_facts.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            facts = (json.load(f) or {}).get('facts') or []
+    except (OSError, ValueError):
+        return
+    if not facts:
+        return
+
+    from prompt_pipeline import reverse
+    duration = (beats.get('video_duration_sec')
+                or (state.get('overview') or {}).get('duration_sec'))
+    if beats.get('time_windows') is None:
+        beats['time_windows'] = reverse.analyze_time_windows(facts, duration)
+    # 恒常特征只在空的时候算：用户在卡点上删掉的误判项，不能被下一次读状态加回去。
+    reverse.attach_scene_constants(beats, facts)
+    _write_beats(state, beats)
+
+
+def _revalidate(state, persist=True):
+    """当场重跑一遍校验；overview 读不到（或 beats 还没有）就退回 state 里那份快照。
+
+    校验口径不在这里，仍然是 reverse.validate_beats；这里只是不信任一份可能来自旧版
+    校验器的结论——快照过期比阶梯真脏难查得多，而且它会同时骗过卡点和合成闸。
+    `persist=False` 给只读的状态查询用：轮询不该往磁盘写。
+    """
+    from prompt_pipeline import reverse
+
+    beats = state.get('beats')
+    if not beats or not beats.get('beats'):
+        return state.get('validation') or []
+    path = os.path.join(job_dir(state['job_id']), 'video_overview.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            overview = json.load(f)
+        # 顺手补覆盖帧：这条路径每次读状态都会走，存量任务（加这个字段之前跑的）
+        # 不用重跑聚类也能在卡点上看到铺满拍窗的那一排帧。读不到 overview 就跳过，
+        # 与校验同一档降级——变体 job 自己目录下没有 overview，走的就是这一支。
+        reverse.attach_coverage_frames(beats, overview)
+        # 键名漂移同样在这里补救：存量任务不用重跑聚类，读一次状态就把「缺少字段」
+        # 这类假硬伤化掉（真的缺内容当然还是照报）。
+        reverse.normalize_beat_keys(beats)
+        _backfill_time_windows(state, beats)
+        validation = reverse.validate_beats(beats, overview)
+    except (OSError, ValueError):
+        return state.get('validation') or []
+
+    if persist:
+        beats['validation'] = validation
+        _write_beats(state, beats)
+    else:
+        state['validation'] = validation
+    return validation
+
+
 def run_compose(state, config, dimensions=None, on_progress=None):
     """beats → 提示词包。走既有合成器，一行合成逻辑都不重写。
 
@@ -630,7 +716,10 @@ def run_compose(state, config, dimensions=None, on_progress=None):
     if not beats:
         raise ValueError('还没有节拍阶梯，无法合成提示词')
 
-    errors = [v for v in (state.get('validation') or []) if v.get('level') == 'error']
+    # 存量任务的 validation 是上一版校验器留下的快照，可能早已不成立（2026-08-12：变体
+    # 阶梯被按原片口径判了 24 项「缺少 evidence_frames」，改好校验器后那份快照还在拦人）。
+    # 能重算就以当场重算的为准，别让一份过期结论卡住整单。
+    errors = [v for v in (_revalidate(state) or []) if v.get('level') == 'error']
     if errors:
         raise RuntimeError(
             f'节拍阶梯还有 {len(errors)} 项硬伤未处理，先在审核卡点上修掉再合成：'
@@ -651,6 +740,16 @@ def run_compose(state, config, dimensions=None, on_progress=None):
     except Exception as e:
         raise _translate_compose_failure(e, beats) from e
     state['title'] = compose_state.get('title')
+    # 锚点图对齐真实首帧。这是整条链路上唯一一次让写手看见原片像素的机会：
+    # compose_anchor_and_packet 的契约明说调用方可以在进 Phase 2 前替换 image_1_prompt，
+    # 所以这一步落在复刻这一层，不必动共享合成器。失败软退，绝不阻塞合成。
+    # 二创不做这一步：拿原片首帧去校正一份「换成废弃巴士」的锚点，等于把新载体又拧回
+    # 旧载体——和 scene_constants / banned_elements 不继承是同一条理由。
+    reference = (None if reverse.is_variant_doc(beats)
+                 else reverse.anchor_reference_frame(beats, _load_overview(state)))
+    if reference and compose_state.get('image_1_prompt'):
+        compose_state['image_1_prompt'] = reverse.ground_anchor_on_reference(
+            config, compose_state['image_1_prompt'], reference, on_progress=on_progress)
     prompt_block = compose_remaining_beats(config, compose_state, on_progress=on_progress)
     state['prompt_block'] = prompt_block
     _write_compose_state(state, compose_state)
@@ -734,6 +833,30 @@ def handoff_to_render(job_id):
     return dims, (state.get('title') or job_display_name(job_id, state)), load_compose_state(job_id)
 
 
+def publish_to_project(job_id):
+    """「存入项目」：把这一单落成一条完整的创意记录，并把它整条回给前端。
+
+    复刻页的终点不是渲染，是**一个项目**。合成收尾时已经顺手入过一次库（run_audit →
+    _publish_to_library），但那一次是附赠、可以静默失败；用户手点这个按钮时要的是
+    确定性：写不进去就报错，写进去就把整条记录交出来，前端拿它直接打开激发结果页，
+    不必再赌浏览器里那份 savedIdeas 是不是最新的。
+
+    门禁与交接同一套：`audit_failed` 的提示词带着原片没有的东西，它不该在工作台上
+    露面，更不该被下游当成一个可渲染的项目。
+    """
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+    if state.get('stage') == 'audit_failed':
+        raise ValueError(
+            f'这一单命中了禁用元素（{"、".join((state.get("banned_hits") or [])[:5])}），'
+            f'提示词里有原片不存在的东西，没有写入创意库，也不能存成项目。'
+            f'先按清单重写后重跑合成。')
+    if not state.get('prompt_block'):
+        raise ValueError('还没有提示词包，先完成合成再存入项目')
+    return _write_library_item(state)
+
+
 # 合成器预检报错（英文，逐条以 " | " 分隔）→ 中文说法 + 用户照着能做的动作。
 # 每条规则写成 (匹配正则, 中文模板)；模板里的 {beat} 是合成器报的拍号。
 # 口径的权威来源是 prompt_pipeline/frame_state.py 与 scene_state.py，这里只翻译，
@@ -805,6 +928,50 @@ def _translate_compose_failure(error, beats_doc=None):
         f'回到「节拍阶梯」按下面每一条改，改完保存会立刻重校验：\n{body}')
 
 
+def _library_item(state):
+    """这一单在创意库 / 项目工作台 / 激发结果页里的那条记录。
+
+    带齐 project_key 与 prompt_slots，这条记录才是一个**能打开的项目**而不只是一行
+    标题：project_key 是媒体目录的命名空间（帧、视频、manifest 全挂在它下面），
+    prompt_slots 是槽位契约的权威解析（见 prompt_pipeline.prompt_slots_list，前端
+    优先消费它）。缺了这两样，激发结果页能显示提示词，却渲不出也认不回这一单。
+    """
+    from prompt_pipeline import prompt_slots_list
+    from server_common import make_idea_project_key
+
+    kind = (f'二创变体（{"、".join(state.get("mutation_axes") or [])}）'
+            if state.get('variant_of') else '爆款 1:1 复刻')
+    title = _library_title(state, kind)
+    slots = prompt_slots_list(state['prompt_block'])
+    # project_key 一经写下就不再变：重复「存入项目」必须落回同一个媒体命名空间，
+    # 否则第二次点会把已经渲出来的帧留在一个再也没人打开的目录里。
+    project_key = state.get('project_key') or make_idea_project_key(state['job_id'], title)
+    return {
+        # job_id 本身就以 replica_ 开头，别再套一层。
+        'id': state['job_id'],
+        'title': title,
+        # theme 在项目工作台里被当成项目身份的别名（build_projects_index 用
+        # title/theme 的变体互相挂接）。这里如果写死一个 "爆款 1:1 复刻"，所有
+        # 复刻任务会共享同一个别名、在工作台上塌成一行，后写的把先写的标题顶掉。
+        # 所以必须带上本单独有的信息。
+        'theme': f'{kind} · {state.get("video_name") or state["job_id"]}',
+        'project_key': project_key,
+        'creativity': kind,
+        'prompt_block': state['prompt_block'],
+        'prompt_slots': slots,
+        'image_count': len(slots['images']),
+        'video_count': len(slots['videos']),
+        'timestamp': datetime.now().isoformat(),
+        'source': 'replica',
+        'replica_job_id': state['job_id'],
+        'replica_variant_of': state.get('variant_of'),
+        'source_video': state.get('video_name'),
+        'collage_url': _outputs_url(state, (state.get('overview') or {}).get('collage')),
+        'banned_hits': state.get('banned_hits') or [],
+        'beat_count': len(((state.get('beats') or {}).get('beats')) or []),
+    }
+
+
 def _publish_to_library(state):
     """把提示词包写进创意库，让它在「项目」工作台里直接可见。
 
@@ -815,37 +982,28 @@ def _publish_to_library(state):
     if not state.get('prompt_block'):
         return None
     try:
-        from server_common import write_library_item
-        # job_id 本身就以 replica_ 开头，别再套一层。
-        item_id = state['job_id']
-        kind = (f'二创变体（{"、".join(state.get("mutation_axes") or [])}）'
-                if state.get('variant_of') else '爆款 1:1 复刻')
-        item = {
-            'id': item_id,
-            'title': _library_title(state, kind),
-            # theme 在项目工作台里被当成项目身份的别名（build_projects_index 用
-            # title/theme 的变体互相挂接）。这里如果写死一个 "爆款 1:1 复刻"，所有
-            # 复刻任务会共享同一个别名、在工作台上塌成一行，后写的把先写的标题顶掉。
-            # 所以必须带上本单独有的信息。
-            'theme': f'{kind} · {state.get("video_name") or state["job_id"]}',
-            'prompt_block': state['prompt_block'],
-            'timestamp': datetime.now().isoformat(),
-            'source': 'replica',
-            'replica_job_id': state['job_id'],
-            'replica_variant_of': state.get('variant_of'),
-            'source_video': state.get('video_name'),
-            'collage_url': _outputs_url(state, (state.get('overview') or {}).get('collage')),
-            'banned_hits': state.get('banned_hits') or [],
-            'beat_count': len(((state.get('beats') or {}).get('beats')) or []),
-        }
-        write_library_item(item)
-        state['library_id'] = item_id
-        _save_state(state)
-        return item_id
+        return _write_library_item(state)['id']
     except Exception as e:
         if sys.stdout:
             print(f'[REPLICA] 写入创意库失败（非致命，提示词仍在任务里）: {e}')
         return None
+
+
+def _write_library_item(state):
+    """真正落库的那一步：失败**向上抛**。
+
+    合成收尾（run_audit）走 _publish_to_library 吞掉异常——那里入库只是附赠。
+    用户手点「存入项目」时不能吞：他按下按钮就是为了得到这条记录，静默失败会让他
+    跳进一个空的结果页，还以为是页面没刷新。
+    """
+    from server_common import write_library_item
+
+    item = _library_item(state)
+    write_library_item(item)
+    state['library_id'] = item['id']
+    state['project_key'] = item['project_key']
+    _save_state(state)
+    return item
 
 
 def _library_title(state, kind):
@@ -1070,6 +1228,9 @@ def get_replica_status(job_id):
             state['validation'] = state['beats'].get('validation') or []
         except (OSError, ValueError):
             pass
+    # 卡点上显示的必须是当前校验器的结论，否则用户对着一份旧版留下的红字找不存在的硬伤
+    # （2026-08-12 的变体阶梯就是这样：24 项「缺少 evidence_frames」全是过期结论）。
+    _revalidate(state, persist=False)
     state['frame_urls'] = frame_urls(state)
     state['stage_label'] = stage_label(state.get('stage'))
     state['phase'] = phase_of(state.get('stage'))

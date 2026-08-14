@@ -117,19 +117,62 @@ class TestEvidenceFrames(unittest.TestCase):
         self.assertEqual(found[0]['level'], 'warn')
 
 
+class TestVariantEvidenceFrames(unittest.TestCase):
+    """变体的证据帧已被 _merge_variant 改名成 reference_frames（构图参考，不再是事实断言）。
+
+    校验器不知道这件事的话，每一拍都会同时报「缺少字段 evidence_frames」和「没有证据帧」——
+    2026-08-12 一条 12 拍的干净变体阶梯就是这样凑出 24 项硬伤、在合成卡点上被判死的。
+    """
+
+    def _variant(self, **kw):
+        beats = []
+        for beat in (_beat('B01', 0.0, 5.0, events=['E01']),
+                     _beat('B02', 5.0, 10.0, stage='surface', events=['E02'],
+                           frames=['review_003.png'])):
+            beat['reference_frames'] = beat.pop('evidence_frames')
+            beats.append(beat)
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [], 'beats': beats,
+               'variant_of': 'replica_src', 'mutation_axes': ['carrier']}
+        doc.update(kw)
+        return doc
+
+    def test_a_clean_variant_has_no_errors(self):
+        errors = [v for v in reverse.validate_beats(self._variant(), _overview())
+                  if v['level'] == 'error']
+        self.assertEqual(errors, [], errors)
+
+    def test_a_nonexistent_reference_frame_only_warns(self):
+        """变体不对原片的事实负责，缺一张构图参考不该拦住合成。"""
+        doc = self._variant()
+        doc['beats'][0]['reference_frames'] = ['review_999.png']
+        found = [v for v in reverse.validate_beats(doc, _overview())
+                 if v['code'] == 'evidence_missing']
+        self.assertTrue(found)
+        self.assertEqual(found[0]['level'], 'warn')
+        self.assertIn('参考帧', found[0]['message'])
+
+    def test_the_source_ladder_is_still_held_to_evidence(self):
+        """豁免只对变体生效——原片阶梯少了证据帧仍然是硬伤。"""
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [],
+               'beats': [_beat('B01', 0.0, 10.0, events=['E01', 'E02'], frames=[])]}
+        codes = [v['code'] for v in reverse.validate_beats(doc, _overview())]
+        self.assertIn('no_evidence', codes)
+        self.assertTrue(any(c == 'missing_beat_field' for c in codes))
+
+
 class TestConstructionOrder(unittest.TestCase):
     def test_stage_regression_is_an_error(self):
-        """面层做完又回去做隐蔽工程 = 布线在封板之后，硬否决。"""
+        """地面收尾之后又回去做结构：跨三级的倒挂，真的不可能。"""
         doc = {'video_duration_sec': 10.0, 'banned_elements': [], 'beats': [
-            _beat('B01', 0.0, 5.0, stage='surface', events=['E01']),
-            _beat('B02', 5.0, 10.0, stage='rough_in', events=['E02'],
+            _beat('B01', 0.0, 5.0, stage='floor', events=['E01']),
+            _beat('B02', 5.0, 10.0, stage='structural', events=['E02'],
                   frames=['review_003.png']),
         ]}
         codes = [v['code'] for v in reverse.validate_beats(doc, _overview(), schema=None)]
         self.assertIn('stage_regression', codes)
 
     def test_small_stage_backtrack_is_tolerated(self):
-        """真实改造会来回穿插一级，只有跨两级以上的倒挂才判。"""
+        """真实改造会来回穿插一两级，只有跨三级以上的倒挂才判。"""
         doc = {'video_duration_sec': 10.0, 'banned_elements': [], 'beats': [
             _beat('B01', 0.0, 5.0, stage='floor', events=['E01']),
             _beat('B02', 5.0, 10.0, stage='surface', events=['E02'],
@@ -139,8 +182,25 @@ class TestConstructionOrder(unittest.TestCase):
                   if v['level'] == 'error']
         self.assertEqual(errors, [])
 
+    def test_floor_before_wall_enclosure_is_not_a_regression(self):
+        """先铺地板再立室内隔墙——自建里常见，画面里也拍得清清楚楚。
+
+        容差从 ±1 放到 ±2 就是被这条真片子逼出来的（2026-08-13 木屋自建）：±1 会判
+        它逆行，于是「如实标注」比「标错」更容易被判死，逼着人把墙体龙骨记成面层去
+        骗过校验器。校验器把人推向说谎，比漏判更坏。
+        """
+        doc = {'video_duration_sec': 15.0, 'banned_elements': [], 'beats': [
+            _beat('B01', 0.0, 5.0, stage='floor', events=['E01']),
+            _beat('B02', 5.0, 10.0, stage='enclosure', events=['E02'],
+                  frames=['review_003.png']),
+            _beat('B03', 10.0, 15.0, stage='surface', frames=['review_003.png']),
+        ]}
+        errors = [v for v in reverse.validate_beats(doc, _overview(), schema=None)
+                  if v['level'] == 'error']
+        self.assertEqual(errors, [])
+
     def test_rough_in_after_enclosure_beats_the_backtrack_tolerance(self):
-        """布线在封板之后是硬否决榜首，而它只差一级——不能被 ±1 容差放过。"""
+        """布线在封板之后是硬否决榜首，而它只差一级——不能被容差放过。"""
         doc = {'video_duration_sec': 10.0, 'banned_elements': [], 'beats': [
             _beat('B01', 0.0, 5.0, stage='enclosure', events=['E01']),
             _beat('B02', 5.0, 10.0, stage='rough_in', events=['E02'],
@@ -150,6 +210,24 @@ class TestConstructionOrder(unittest.TestCase):
         hit = next(v for v in violations if v['code'] == 'rough_in_after_enclosure')
         self.assertEqual(hit['level'], 'error')
         self.assertEqual(hit['beat_id'], 'B02')
+
+    def test_rough_in_after_any_covering_stage_is_an_error(self):
+        """遮盖层不止封板。面层、地面收尾做完再走线，一样要拆开刚做完的东西。
+
+        这条以前是靠通用容差兜住的（surface=5 → rough_in=3 跨两级）。容差放宽到 ±2
+        之后它会漏网，所以判据必须收在这条不吃容差的硬否决里，而不是靠容差的副作用。
+        """
+        for cover in ('surface', 'floor'):
+            with self.subTest(cover=cover):
+                doc = {'video_duration_sec': 10.0, 'banned_elements': [], 'beats': [
+                    _beat('B01', 0.0, 5.0, stage=cover, events=['E01']),
+                    _beat('B02', 5.0, 10.0, stage='rough_in', events=['E02'],
+                          frames=['review_003.png']),
+                ]}
+                violations = reverse.validate_beats(doc, _overview(), schema=None)
+                hit = next(v for v in violations if v['code'] == 'rough_in_after_enclosure')
+                self.assertEqual(hit['level'], 'error')
+                self.assertEqual(hit['beat_id'], 'B02')
 
     def test_power_chain_broken_when_fixtures_have_no_rough_in(self):
         doc = {'video_duration_sec': 10.0, 'banned_elements': [], 'beats': [
@@ -1199,3 +1277,364 @@ class TestBeatTranslation(unittest.TestCase):
 
         reverse.prune_stale_translations(previous, edited)
         self.assertEqual(edited['beats'][0]['zh'], {'visual_subject': '一面墙'})
+
+
+class TestCoverageFrames(unittest.TestCase):
+    """覆盖帧：拍窗越长越不能只靠那三张证据帧。
+
+    这里盯的是一条会静默失效的不变量——覆盖帧是**派生**数据。用户在卡点上拆过拍、
+    改过时间窗之后，如果它没跟着重算，卡片上就会出现「时间戳写着这一拍、画面是
+    上一版拍窗」的帧：比没有覆盖帧更坏，因为人会照着它核对。
+    """
+
+    def _timeline_overview(self, step=0.5, duration=14.0):
+        frames = []
+        n = int(duration / step) + 1
+        for i in range(n):
+            frames.append({'index': i + 1, 'timestamp': round(i * step, 3),
+                           'frame_path': f'/job/review_frames/review_{i + 1:03d}.png'})
+        return _overview(frames=frames)
+
+    def test_a_long_beat_gets_frames_across_its_whole_window(self):
+        overview = self._timeline_overview()
+        doc = {'video_duration_sec': 14.0, 'banned_elements': [],
+               'beats': [_beat('B01', 3.6, 13.8, events=['E01', 'E02'])]}
+        reverse.attach_coverage_frames(doc, overview)
+        cov = doc['beats'][0]['coverage_frames']
+
+        self.assertEqual(len(cov), reverse.COVERAGE_MAX_FRAMES)
+        times = [c['timestamp'] for c in cov]
+        self.assertEqual(times, sorted(times))
+        # 证据帧最多三张，覆盖帧要铺满整段：首尾都得贴着拍窗边界。
+        self.assertLessEqual(times[0], 4.1)
+        self.assertGreaterEqual(times[-1], 13.3)
+        # 最大空档不该比均分步长大太多，否则「不漏细节」是句空话。
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        self.assertLess(max(gaps), 2.0)
+
+    def test_a_short_beat_takes_every_frame_it_has(self):
+        overview = self._timeline_overview()
+        doc = {'video_duration_sec': 14.0, 'banned_elements': [],
+               'beats': [_beat('B01', 0.0, 1.0, events=['E01', 'E02'])]}
+        reverse.attach_coverage_frames(doc, overview)
+        # 窗内只有 3 张（0/0.5/1.0）。抽帧密度是上限，这里造不出帧来。
+        self.assertEqual([c['timestamp'] for c in doc['beats'][0]['coverage_frames']],
+                         [0.0, 0.5, 1.0])
+
+    def test_a_window_thinner_than_the_sampling_step_still_gets_a_frame(self):
+        overview = self._timeline_overview(step=2.0)
+        doc = {'video_duration_sec': 14.0, 'banned_elements': [],
+               'beats': [_beat('B01', 5.1, 5.2, events=['E01', 'E02'])]}
+        reverse.attach_coverage_frames(doc, overview)
+        cov = doc['beats'][0]['coverage_frames']
+        # 空着会被读成「这段没有画面」，而事实是这段没被单独抽到帧。
+        self.assertEqual(len(cov), 1)
+        self.assertEqual(cov[0]['timestamp'], 6.0)
+
+    def test_editing_the_window_recomputes_coverage(self):
+        overview = self._timeline_overview()
+        doc = {'video_duration_sec': 14.0, 'banned_elements': [],
+               'beats': [_beat('B01', 0.0, 14.0, events=['E01', 'E02'])]}
+        reverse.attach_coverage_frames(doc, overview)
+        stale = [c['frame'] for c in doc['beats'][0]['coverage_frames']]
+
+        doc['beats'][0]['end'] = 3.0          # 用户在卡点上拆了一刀
+        reverse.attach_coverage_frames(doc, overview)
+        fresh = doc['beats'][0]['coverage_frames']
+        self.assertNotEqual([c['frame'] for c in fresh], stale)
+        self.assertTrue(all(c['timestamp'] <= 3.0 for c in fresh))
+
+    def test_no_extracted_frames_means_no_coverage_field(self):
+        doc = {'video_duration_sec': 14.0, 'banned_elements': [],
+               'beats': [_beat('B01', 0.0, 3.0, coverage_frames=[{'frame': 'x.png',
+                                                                 'timestamp': 1.0}])]}
+        reverse.attach_coverage_frames(doc, _overview(frames=[]))
+        # 留着上一版的覆盖帧等于指向一批可能已经不存在的文件。
+        self.assertNotIn('coverage_frames', doc['beats'][0])
+
+    def test_coverage_frames_do_not_disturb_validation(self):
+        overview = self._timeline_overview()
+        doc = {'video_duration_sec': 14.0, 'banned_elements': [], 'beats': [
+            _beat('B01', 0.0, 7.0, events=['E01']),
+            _beat('B02', 7.0, 14.0, events=['E02'], stage='enclosure'),
+        ]}
+        before = reverse.validate_beats(doc, overview)
+        reverse.attach_coverage_frames(doc, overview)
+        after = reverse.validate_beats(doc, overview)
+        self.assertEqual([v['code'] for v in before], [v['code'] for v in after])
+
+
+class TestKeyDrift(unittest.TestCase):
+    """字段名漂移：内容都在，只是模型把键名写成了近义词。
+
+    2026-08-13 的那一单，前五拍老实写 visible_action，从第六拍起整段漂成
+    visual_action，于是校验器报十二条「缺少字段」——把用户挡在合成门外，去修一个
+    根本不存在的缺失。这一组盯的是修法的边界：搬运可以，生成不行，覆盖更不行。
+    """
+
+    def _doc(self, **beat_kw):
+        return {'video_duration_sec': 10.0, 'banned_elements': [],
+                'beats': [_beat('B01', 0.0, 10.0, events=['E01', 'E02'], **beat_kw)]}
+
+    def test_a_drifted_key_is_moved_back_and_stops_the_false_missing_field(self):
+        doc = self._doc()
+        beat = doc['beats'][0]
+        beat['visual_action'] = beat.pop('visible_action')
+        beat['visual_result'] = beat.pop('visible_result')
+        codes = [v['code'] for v in reverse.validate_beats(doc, _overview())]
+        self.assertIn('missing_beat_field', codes)   # 归一之前：假硬伤
+
+        moved = reverse.normalize_beat_keys(doc)
+        self.assertEqual({m['to'] for m in moved}, {'visible_action', 'visible_result'})
+        self.assertNotIn('visual_action', beat)
+        self.assertEqual(beat['visible_action'], 'a worker trowels the surface')
+        errors = [v for v in reverse.validate_beats(doc, _overview()) if v['level'] == 'error']
+        self.assertEqual(errors, [])
+
+    def test_a_populated_canonical_key_is_never_overwritten(self):
+        """两个名字都有值 = 模型写了两份说法，那是要看画面裁决的事，不能静默挑一份。"""
+        doc = self._doc()
+        beat = doc['beats'][0]
+        beat['visual_action'] = 'a completely different claim'
+        self.assertEqual(reverse.normalize_beat_keys(doc), [])
+        self.assertEqual(beat['visible_action'], 'a worker trowels the surface')
+        self.assertEqual(beat['visual_action'], 'a completely different claim')
+
+    def test_an_empty_alias_never_displaces_a_missing_field(self):
+        """错名字底下是空的，就还是「真的缺」。搬一个空值过去只是把硬伤藏起来。"""
+        doc = self._doc()
+        beat = doc['beats'][0]
+        beat.pop('visible_action')
+        beat['visual_action'] = ''
+        self.assertEqual(reverse.normalize_beat_keys(doc), [])
+        codes = [v['code'] for v in reverse.validate_beats(doc, _overview())]
+        self.assertIn('missing_beat_field', codes)
+
+    def test_the_repair_is_announced_not_silent(self):
+        doc = self._doc()
+        doc['beats'][0]['visual_action'] = doc['beats'][0].pop('visible_action')
+        reverse.normalize_beat_keys(doc)
+        warns = [v for v in reverse.validate_beats(doc, _overview())
+                 if v['code'] == 'beat_keys_normalized']
+        self.assertEqual(len(warns), 1)
+        self.assertEqual(warns[0]['level'], 'warn')
+        self.assertIn('visual_action→visible_action', warns[0]['message'])
+
+    def test_a_clean_doc_never_gains_a_normalization_record(self):
+        doc = self._doc()
+        self.assertEqual(reverse.normalize_beat_keys(doc), [])
+        self.assertNotIn('key_normalizations', doc)
+
+    def test_the_record_survives_the_next_normalization_pass(self):
+        """归一每次读状态、每次保存都会重跑，第二趟必然一处也搬不到。
+
+        那一趟若把记录清掉，这条 warn 就只在用户看不见的那一瞬间存在过——修复重新
+        变回静默的，而静默修复正是这条记录要防的事。
+        """
+        doc = self._doc()
+        doc['beats'][0]['visual_action'] = doc['beats'][0].pop('visible_action')
+        reverse.normalize_beat_keys(doc)
+        self.assertEqual(reverse.normalize_beat_keys(doc), [])   # 第二趟：无事可搬
+
+        warns = [v for v in reverse.validate_beats(doc, _overview())
+                 if v['code'] == 'beat_keys_normalized']
+        self.assertEqual(len(warns), 1)
+        self.assertEqual(len(doc['key_normalizations']), 1)
+
+
+class TestTimeWindows(unittest.TestCase):
+    """定长时间窗：与节拍并列的第二套读法。
+
+    节拍由模型按语义切，因此「某段时间被漏掉了」和「这段确实没事发生」在产物里长得
+    一模一样。定长窗按固定 5 秒切、只统计画面增减，就是用来把这两者分开的。
+    """
+
+    def _facts(self, spec):
+        """spec: [(timestamp, [可见物…]), …]"""
+        return [{'frame': f'review_{i:03d}.png', 'timestamp': ts,
+                 'materials': items, 'tools': [], 'traces': [],
+                 'workers_present': True, 'completion_extent': f'state at {ts}s'}
+                for i, (ts, items) in enumerate(spec, start=1)]
+
+    def _dense(self, lo, hi, items, step=0.5):
+        out, t = [], lo
+        while t < hi - 1e-9:
+            out.append((round(t, 3), list(items)))
+            t += step
+        return out
+
+    def test_a_thing_that_shows_up_midway_is_reported_as_new(self):
+        facts = self._facts(self._dense(0, 5, ['bare concrete floor'])
+                            + self._dense(5, 10, ['bare concrete floor', 'yellow insulation batts']))
+        w = reverse.analyze_time_windows(facts, 10.0)
+        self.assertEqual(len(w), 2)
+        self.assertIn('bare concrete floor', w[0]['baseline'])
+        self.assertEqual(w[0]['appeared'], [])          # 第一窗没有「此前」
+        self.assertIn('yellow insulation batts', w[1]['appeared'])
+
+    def test_a_thing_seen_only_in_one_window_is_neither_new_nor_gone(self):
+        """既报「新出现」又报「消失」是自相矛盾的一行，而它其实是最值得看的一类。"""
+        facts = self._facts(self._dense(0, 5, ['floor'])
+                            + self._dense(5, 10, ['floor', 'landscape rake'])
+                            + self._dense(10, 15, ['floor']))
+        w = reverse.analyze_time_windows(facts, 15.0)
+        self.assertIn('landscape rake', w[1]['brief'])
+        self.assertNotIn('landscape rake', w[1]['appeared'])
+        self.assertNotIn('landscape rake', w[1]['vanished'])
+
+    def test_one_phrase_never_lands_in_two_columns(self):
+        """一条短语含多个词，不同的词会把它同时拉进两栏。跨栏去重，先到先得。"""
+        facts = self._facts(self._dense(0, 5, ['gravel'])
+                            + self._dense(5, 10, ['gravel', 'wide landscape rake'])
+                            + self._dense(10, 15, ['gravel', 'wide landscape trim']))
+        w = reverse.analyze_time_windows(facts, 15.0)
+        for row in w:
+            bag = row['baseline'] + row['appeared'] + row['vanished'] + row['brief']
+            self.assertEqual(len(bag), len(set(x.lower() for x in bag)))
+
+    def test_windows_tile_the_whole_video_including_a_short_tail(self):
+        facts = self._facts(self._dense(0, 12, ['floor']))
+        w = reverse.analyze_time_windows(facts, 12.0)
+        self.assertEqual([(x['start'], x['end']) for x in w],
+                         [(0.0, 5.0), (5.0, 10.0), (10.0, 12.0)])
+
+    def test_no_facts_yields_no_windows_instead_of_a_crash(self):
+        self.assertEqual(reverse.analyze_time_windows([], 10.0), [])
+        self.assertEqual(reverse.analyze_time_windows(None, 0), [])
+
+    def test_the_digest_drops_the_state_lines_when_there_are_too_many_windows(self):
+        """摘要要喂进 Pass B，长视频不能让它把节拍聚类挤掉。"""
+        facts = self._facts(self._dense(0, 300, ['floor']))
+        w = reverse.analyze_time_windows(facts, 300.0)
+        self.assertGreater(len(w), 48)
+        self.assertNotIn('state at', reverse._windows_digest(w))
+        self.assertIn('state at', reverse._windows_digest(w[:4]))
+
+
+class TestUncoveredTime(unittest.TestCase):
+    def test_a_gap_between_beats_is_reported(self):
+        """此前只查重叠不查空洞：「漏了一段」和「这段没事发生」长得一模一样。"""
+        doc = {'video_duration_sec': 20.0, 'banned_elements': [], 'beats': [
+            _beat('B01', 0.0, 5.0, events=['E01']),
+            _beat('B02', 12.0, 20.0, events=['E02'], frames=['review_003.png']),
+        ]}
+        hits = [v for v in reverse.validate_beats(doc, _overview(), schema=None)
+                if v['code'] == 'window_uncovered']
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]['level'], 'warn')      # 空镜可以不属于任何里程碑
+        self.assertIn('7.0s', hits[0]['message'])
+
+    def test_a_missing_head_and_tail_are_both_reported(self):
+        doc = {'video_duration_sec': 20.0, 'banned_elements': [], 'beats': [
+            _beat('B01', 3.0, 10.0, events=['E01', 'E02']),
+        ]}
+        hits = [v for v in reverse.validate_beats(doc, _overview(), schema=None)
+                if v['code'] == 'window_uncovered']
+        self.assertEqual(len(hits), 2)
+
+    def test_contiguous_beats_raise_nothing(self):
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [], 'beats': [
+            _beat('B01', 0.0, 5.0, events=['E01']),
+            _beat('B02', 5.0, 10.0, events=['E02'], frames=['review_003.png']),
+        ]}
+        self.assertEqual([v for v in reverse.validate_beats(doc, _overview(), schema=None)
+                          if v['code'] == 'window_uncovered'], [])
+
+
+class TestSceneConstants(unittest.TestCase):
+    """场景恒常特征：与 banned_elements 对称的另一半。
+
+    整条反推链路围绕**变化**而建，节拍只承载每拍 delta，于是不变的东西（墙上的污渍、
+    青苔、常驻画面的工作灯）在数据结构里没有落脚点，一路被压掉——实测一条片子 57% 的
+    帧都记到了污渍，而它在整条阶梯里一个字都没有。这一组盯的是它算得准、改得掉。
+    """
+
+    def _facts(self, n=20, always=('mossy concrete wall',), sometimes=('fresh timber',)):
+        out = []
+        for i in range(n):
+            out.append({'frame': f'review_{i:03d}.png', 'timestamp': float(i),
+                        'materials': list(always) + (list(sometimes) if i > n - 3 else []),
+                        'tools': [], 'traces': [], 'workers_present': True})
+        return out
+
+    def test_a_thing_in_most_frames_becomes_a_constant(self):
+        c = reverse.analyze_scene_constants(self._facts())
+        self.assertIn('mossy concrete wall', c['materials'])
+        self.assertNotIn('fresh timber', c['materials'])   # 只在最后两帧，是变化不是恒常
+
+    def test_an_emptied_field_is_never_recomputed_back(self):
+        """它进每一条合成提示词，所以用户必须删得掉。
+
+        判「键在不在」而不是「值真不真」：按真值判定的话，用户把三栏全删空之后，
+        下一次读状态就会把统计结果原样加回去——那个字段就永远删不掉了。
+        """
+        doc = {'beats': []}
+        reverse.attach_scene_constants(doc, self._facts())
+        self.assertTrue(doc['scene_constants']['materials'])
+
+        doc['scene_constants'] = {}                      # 用户在卡点上删光
+        reverse.attach_scene_constants(doc, self._facts())
+        self.assertEqual(doc['scene_constants'], {})
+
+    def test_no_facts_still_lands_the_key_so_it_is_not_recomputed_forever(self):
+        doc = {'beats': []}
+        reverse.attach_scene_constants(doc, [])
+        self.assertIn('scene_constants', doc)
+
+    def test_constants_and_signature_both_reach_the_dimensions(self):
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [],
+               'scene_signature': 'A mossy concrete bunker in autumn woodland.',
+               'scene_constants': {'materials': ['mossy concrete wall'], 'traces': []},
+               'beats': [_beat('B01', 0.0, 10.0)]}
+        dims = reverse.beats_to_dimensions(doc)
+        self.assertEqual(dims['scene_constants'], {'materials': ['mossy concrete wall']})
+        self.assertEqual(dims['scene_signature'], 'A mossy concrete bunker in autumn woodland.')
+
+    def test_the_prompt_lines_carry_the_signature_first(self):
+        lines = reverse.scene_constants_lines(
+            {'materials': ['mossy concrete wall'], 'fixtures_in_shot': ['tripod work light']},
+            'A mossy concrete bunker in autumn woodland.')
+        self.assertTrue(lines[0].startswith('the place itself:'))
+        self.assertTrue(any('tripod work light' in x for x in lines))
+        self.assertEqual(reverse.scene_constants_lines({}, ''), [])
+
+
+class TestAnchorGrounding(unittest.TestCase):
+    """锚点图对齐真实首帧：整条链路上唯一一次让写手看见原片像素。"""
+
+    def _overview(self, exists=True):
+        path = __file__ if exists else '/nope/review_001.png'
+        return {'review_sampling': {'frames': [
+            {'frame_path': '/nope/review_009.png', 'timestamp': 9.0},
+            {'frame_path': path, 'timestamp': 0.5},
+        ]}}
+
+    def test_the_earliest_existing_frame_is_chosen(self):
+        self.assertEqual(reverse.anchor_reference_frame({}, self._overview()), __file__)
+
+    def test_a_missing_file_yields_no_reference_instead_of_a_bad_path(self):
+        self.assertIsNone(reverse.anchor_reference_frame({}, self._overview(exists=False)))
+        self.assertIsNone(reverse.anchor_reference_frame({}, {}))
+
+    def test_a_failed_call_keeps_the_composed_prompt(self):
+        """失败软退是硬要求：这一步是纠偏，不该让整单合成挂掉。"""
+        with patch.object(pp, '_multimodal_chat', side_effect=RuntimeError('gateway down')):
+            self.assertEqual(
+                reverse.ground_anchor_on_reference({}, 'original prompt', __file__),
+                'original prompt')
+
+    def test_an_empty_reply_keeps_the_composed_prompt(self):
+        with patch.object(pp, '_multimodal_chat', return_value='   '):
+            self.assertEqual(
+                reverse.ground_anchor_on_reference({}, 'original prompt', __file__),
+                'original prompt')
+
+    def test_a_good_reply_replaces_it(self):
+        with patch.object(pp, '_multimodal_chat', return_value=' grounded prompt '):
+            self.assertEqual(
+                reverse.ground_anchor_on_reference({}, 'original prompt', __file__),
+                'grounded prompt')
+
+    def test_no_reference_means_no_call_at_all(self):
+        with patch.object(pp, '_multimodal_chat', side_effect=AssertionError('不该被调用')):
+            self.assertEqual(reverse.ground_anchor_on_reference({}, 'p', None), 'p')

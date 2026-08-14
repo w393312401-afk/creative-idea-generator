@@ -2,7 +2,7 @@
   "_comment": "复制为 server_config.json 后填写。填了 apiKey 即进入『服务端托管模式』:模型密钥只留在服务端,浏览器再也拿不到。",
   "baseUrl": "http://127.0.0.1:8046/v1",
   "apiKey": "在这里填你 Antigravity 的 API Key(建议新建一个 User Token 专用于本服务)",
-  "model": "gemini-3.6-flash-high",
+  "model": "gemini-3.7-flash-high",
   "cheapModel": "gemini-3.5-flash-low",
   "_beatChunkSize_comment": "保留字段，当前版本未接入生产链路",
   "beatChunkSize": 4,

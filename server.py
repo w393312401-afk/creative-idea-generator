@@ -2250,6 +2250,72 @@ class _QuietConnResetMixin:
         super().handle_error(request, client_address)
 
 
+HTTPD_INSTANCE = None
+_AUTO_RELOAD_TRIGGERED = False
+
+
+def restart_server_process():
+    """优雅重启后端服务进程"""
+    global _AUTO_RELOAD_TRIGGERED, HTTPD_INSTANCE
+    _AUTO_RELOAD_TRIGGERED = True
+    time.sleep(0.4)
+    try:
+        if HTTPD_INSTANCE is not None:
+            HTTPD_INSTANCE.server_close()
+    except Exception:
+        pass
+
+    script_path = os.path.abspath(sys.argv[0] if sys.argv else 'server.py')
+    args = [sys.executable, script_path] + sys.argv[1:]
+
+    if sys.platform == 'win32':
+        import subprocess
+        subprocess.Popen(args)
+        os._exit(0)
+    else:
+        # macOS / Linux
+        os.execv(sys.executable, args)
+
+
+def _start_auto_reload_watcher():
+    """后台监听核心文件改动，在无活跃任务时自动重启进程（防代码更新后跑陈旧内存实例）。"""
+    def _watch():
+        global _AUTO_RELOAD_TRIGGERED
+        time.sleep(3.0)
+        while not _AUTO_RELOAD_TRIGGERED:
+            time.sleep(1.5)
+            try:
+                cfg = read_server_config()
+                if not cfg.get('autoReload', True):
+                    continue
+
+                report = code_staleness_report()
+                if not report.get('stale'):
+                    continue
+
+                active_running = False
+                with TASKS_LOCK:
+                    for t in ACTIVE_TASKS.values():
+                        if isinstance(t, dict) and t.get('status') == 'running':
+                            active_running = True
+                            break
+                if active_running:
+                    continue
+
+                time.sleep(1.0)
+                _AUTO_RELOAD_TRIGGERED = True
+                if sys.stdout:
+                    files_str = ', '.join(report.get('stale_files', [])[:3])
+                    print(f"[AUTO-RELOAD] 检测到核心源文件更新 ({files_str})，正在自动重启服务...")
+                restart_server_process()
+                break
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_watch, daemon=True, name="AutoReloadWatcher")
+    t.start()
+
+
 class DualStackHTTPServer(_QuietConnResetMixin, ThreadingMixIn, HTTPServer):
     # ThreadingMixIn so a long-running /api/compose call (the skill can take 60-180s)
     # does not block static file serving or library reads in the same browser session.
@@ -5040,6 +5106,29 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/replica/to_project':
+            # 「存入项目」：复刻页的终点从"送去渲染"改成"落成一个项目"。渲染在项目里
+            # 有更全的入口（激发结果页的分步合成 / 一键合成 / 手动编辑），复刻页不必
+            # 自己再开一条只通向分步管线的窄路。
+            #
+            # 只写创意库，不起任何任务：这条路由不烧钱，所以不吃 compose 的限流。
+            try:
+                if not self._gate():
+                    return
+                body = self._read_json_body()
+                job_id = (body.get('job_id') or '').strip()
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+
+                from replica_pipeline import publish_to_project
+                item = publish_to_project(job_id)
+                self._send_json({'status': 'ok', 'item': item})
+            except ValueError as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': f'存入项目失败：{e}'}, status=500)
+
         elif path == '/api/replica/delete':
             try:
                 if not self._gate():
@@ -7016,6 +7105,16 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     print(f"[ARK PROXY] POST tasks error: {e}")
                 self._send_json({'error': str(e)}, status=500)
 
+        elif path in ('/api/restart', '/api/service/restart'):
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                self._send_json({'status': 'ok', 'message': '正在重启服务...'})
+                threading.Thread(target=restart_server_process, daemon=True).start()
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         else:
             self._send_json({'error': 'Not found'}, status=404)
 
@@ -7362,6 +7461,7 @@ def run():
         print(f"Skill profile: {_active_profile}"
               f"（videoModel={SERVER_CONFIG.get('videoModel') or '未设置'}，"
               f"skillProfile={SERVER_CONFIG.get('skillProfile') or 'auto'}）")
+    global HTTPD_INSTANCE
     server_address = ('', PORT)
     try:
         httpd = DualStackHTTPServer(server_address, SparkRequestHandler)
@@ -7370,6 +7470,8 @@ def run():
         if sys.stdout:
             print(f"IPv6 双栈监听失败（{e}），回退到 IPv4 监听...")
         httpd = IPv4HTTPServer(server_address, SparkRequestHandler)
+    HTTPD_INSTANCE = httpd
+    _start_auto_reload_watcher()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

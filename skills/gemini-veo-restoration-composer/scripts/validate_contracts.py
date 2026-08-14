@@ -36,6 +36,10 @@ PY_FILES = {
     "video_to_prompt_pipeline.py": SKILL_DIR / "video_to_prompt_pipeline.py",
     "scripts/render_and_gate_anchor.py": SKILL_DIR / "scripts" / "render_and_gate_anchor.py",
     "scripts/check_character_lock.py": SKILL_DIR / "scripts" / "check_character_lock.py",
+    # The Named Cast Lock gates moved out of check_character_lock.py into this module when the
+    # server started running the same gates at compose time; the CLI is now a shell around it.
+    # Pointers must follow the code, which is the whole point of this validator.
+    "scripts/cast_lock_core.py": SKILL_DIR / "scripts" / "cast_lock_core.py",
 }
 
 REQUIRED_FIELDS = ("id", "tier", "rule_zh", "blocking")

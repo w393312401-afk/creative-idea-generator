@@ -277,7 +277,7 @@ const LLM_MODEL_PICKER_FAMILIES = [
 function syncIdeationLlmPicker() {
     const wrap = document.getElementById('ideation-llm-groups');
     if (!wrap) return;
-    const current = config.model || 'gemini-3.6-flash-high';
+    const current = config.model || 'gemini-3.7-flash-high';
     const isKnown = LLM_MODEL_PICKER_FAMILIES.some(
         fam => LLM_MODEL_GROUPS[fam.key].some(m => m.value === current)
     );

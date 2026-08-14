@@ -136,9 +136,37 @@
     white-space: nowrap;
 }
 
+/* 施工阶段下拉框。长得像 chip（它在头部那一排里），但明确可点：这是唯一一个
+   被校验器直接判死的可编辑字段，不能让它看上去是只读的。 */
+.replica-stage-select {
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    color: inherit;
+    cursor: pointer;
+    font-family: inherit;
+    appearance: none;
+    padding-right: 18px;
+    background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+                      linear-gradient(135deg, currentColor 50%, transparent 50%);
+    background-position: right 8px top 50%, right 4px top 50%;
+    background-size: 4px 4px, 4px 4px;
+    background-repeat: no-repeat;
+}
+
+.replica-stage-select:hover {
+    border-color: rgba(110, 231, 255, 0.6);
+}
+
 .replica-chip-error {
     background: rgba(255, 90, 90, 0.18);
     color: var(--danger, #ff7b7b);
+}
+
+/* 过门拍：本拍的机位穿过开口进了另一个空间。整条阶梯上过门次数就是靠它一眼数出来的，
+   所以它不能和普通 chip 一样淡（见 replicaSpaceChip）。 */
+.replica-chip-cross {
+    background: rgba(110, 231, 255, 0.18);
+    color: var(--accent, #6ee7ff);
+    font-weight: 600;
 }
 
 /* ── 抽帧结果 ───────────────────────────────────────────────── */
@@ -339,6 +367,115 @@
     border-radius: 8px;
 }
 
+/* ── 画面变化时间线 ─────────────────────────────────────────── */
+
+.replica-windows {
+    margin-bottom: 12px;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+}
+
+.replica-windows > summary {
+    cursor: pointer;
+    user-select: none;
+    font-weight: 600;
+}
+
+.replica-win-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.replica-win-row {
+    display: grid;
+    grid-template-columns: 92px 96px 1fr;
+    gap: 8px;
+    align-items: baseline;
+    padding: 4px 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    font-size: 12px;
+}
+
+/* 无增减的格子压暗但不隐藏：「这五秒确实没事发生」本身就是要看见的信息。 */
+.replica-win-quiet {
+    opacity: 0.45;
+}
+
+.replica-win-time {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.replica-win-meta {
+    font-size: 11px;
+    opacity: 0.6;
+    white-space: nowrap;
+}
+
+.replica-win-body {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    align-items: baseline;
+}
+
+.replica-win-tag {
+    flex: 0 0 auto;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+}
+
+.replica-win-tag.is-base { background: rgba(255, 255, 255, 0.12); }
+.replica-win-tag.is-new { background: rgba(110, 231, 160, 0.22); }
+.replica-win-tag.is-gone { background: rgba(255, 140, 140, 0.2); }
+.replica-win-tag.is-brief { background: rgba(255, 200, 110, 0.22); }
+
+.replica-win-item {
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: rgba(255, 255, 255, 0.06);
+}
+
+/* 硬伤条目：看上去是行内链接，实际是 button（它触发的是滚动，不是导航）。 */
+.replica-jump {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+    cursor: pointer;
+}
+
+.replica-jump:hover {
+    text-decoration-style: solid;
+}
+
+/* 跳过去之后闪一下。只闪两下就停：常亮会和「这一拍当前有错」混淆，而校验结论
+   是保存时才更新的，闪光不该冒充状态。 */
+.replica-beat-flag {
+    animation: replica-beat-flag 0.6s ease-in-out 2;
+}
+
+@keyframes replica-beat-flag {
+    0%, 100% { border-color: rgba(255, 255, 255, 0.1); }
+    50% { border-color: rgba(255, 190, 90, 0.85); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .replica-beat-flag {
+        animation: none;
+        border-color: rgba(255, 190, 90, 0.85);
+    }
+}
+
 .replica-beat-head {
     display: flex;
     align-items: center;
@@ -386,6 +523,40 @@
 
 .replica-thumb:hover {
     border-color: rgba(110, 231, 255, 0.6);
+}
+
+/* 覆盖帧：比证据帧矮一档，一眼能看出这排是「铺时间」的，不是模型挑出来的证据。 */
+.replica-coverage {
+    margin-bottom: 10px;
+}
+
+.replica-coverage > summary {
+    cursor: pointer;
+    user-select: none;
+}
+
+.replica-cov-strip {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    padding: 6px 0 4px;
+}
+
+.replica-cov-item {
+    margin: 0;
+    flex: 0 0 auto;
+    text-align: center;
+}
+
+.replica-thumb-cov {
+    height: 56px;
+    display: block;
+}
+
+.replica-cov-time {
+    font-size: 10px;
+    opacity: 0.6;
+    margin-top: 2px;
 }
 
 .replica-beat-fields {

@@ -1589,7 +1589,7 @@ def effective_config(client_config):
     merged = {
         'baseUrl': SERVER_CONFIG.get('baseUrl') or 'http://127.0.0.1:8046/v1',
         'apiKey': SERVER_CONFIG.get('apiKey') or '',
-        'model': SERVER_CONFIG.get('model') or 'gemini-3.6-flash-high',
+        'model': SERVER_CONFIG.get('model') or 'gemini-3.7-flash-high',
         'imageModel': SERVER_CONFIG.get('imageModel') or 'gemini-3.1-flash-image',
     }
     # cheapModel/auxModel 此前在托管模式下被静默丢弃（example 配置里承诺了
@@ -4831,7 +4831,7 @@ def filter_projects(rows, state=None, query=None, sort='newest'):
 
 
 def ping_proxy(config):
-    model = config.get('model') or 'gemini-3.6-flash-high'
+    model = config.get('model') or 'gemini-3.7-flash-high'
     base_url, api_key = resolve_gateway(model, config)
     req = urllib.request.Request(
         f'{base_url}/models',
@@ -4855,7 +4855,7 @@ def ping_proxy(config):
 
 
 def ping_model_completion(config):
-    model = config.get('model') or 'gemini-3.6-flash-high'
+    model = config.get('model') or 'gemini-3.7-flash-high'
     base_url, api_key = resolve_gateway(model, config)
     payload = json.dumps({
         'model': model,
