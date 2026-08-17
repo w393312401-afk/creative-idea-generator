@@ -18,6 +18,7 @@ from PIL import Image
 
 import server_common
 import frame_generator
+import candidate_selection_pipeline as csp
 import prompt_pipeline as pp
 import pipeline_orchestrator as po
 from frame_generator import QuotaExhaustedError
@@ -997,39 +998,39 @@ class TestFixFrameIssue(_TmpProjectCase):
                           3: ('sequence_reviewed_pass', None)})
         render_calls = []
 
-        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4):
             render_calls.append(target_sequences)
 
         with patch.object(po, 'fix_beat_from_sequence_review',
                           return_value=('fixed video 1', 'fixed image 2')) as mock_fix, \
-             patch.object(po, 'generate_frame_sequence', side_effect=fake_render):
+             patch.object(csp, 'run_candidate_selection_frame_sequence', side_effect=fake_render):
             result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
 
         mock_fix.assert_called_once_with({}, 'video one', 'second frame', ['天花板未随墙面一起封板'],
                                          video_meta='')
-        self.assertEqual(render_calls, [[2]])  # 只重渲第 2 帧，图生图链式编辑
+        self.assertEqual(render_calls, [[2]])  # 只重渲第 2 帧（4选1候选优选）
         self.assertIn('fixed image 2', result['prompt_block'])
         self.assertIn('fixed video 1', result['prompt_block'])
         self.assertEqual(result['reason'], '天花板未随墙面一起封板')
 
     def test_first_frame_uses_prompt_feedback_and_image_edit_never_t2i(self):
-        # 首帧没有前置视频过渡（beat 0 不存在），必须走单提示词反馈重写，
-        # 且重渲必须是图生图自编辑——绝不能走 generate_frame_sequence 的
-        # seq==1 强制文生图路径（那条路径会推倒重来，丢掉已确认的构图）。
+        # 首帧没有前置视频过渡（beat 0 不存在），走单提示词反馈重写，
+        # 并以 4选1 候选优选模式重渲
         self._touch_frame(1)
         self._write_gate({1: ('sequence_review_flagged', 'IMAGE 1 不够原始'),
                           2: ('sequence_reviewed_pass', None), 3: ('sequence_reviewed_pass', None)})
+        render_calls = []
+
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4):
+            render_calls.append(target_sequences)
 
         with patch.object(po, 'fix_image_prompt_with_vlm_feedback',
                           return_value='fixed first frame') as mock_fix, \
-             patch.object(po, '_fix_frame_via_image_edit') as mock_edit, \
-             patch.object(po, 'generate_frame_sequence',
-                          side_effect=AssertionError('首帧修复不该走 generate_frame_sequence')):
+             patch.object(csp, 'run_candidate_selection_frame_sequence', side_effect=fake_render):
             result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 1)
 
         mock_fix.assert_called_once_with({}, 'first frame', 'IMAGE 1 不够原始')
-        mock_edit.assert_called_once()
-        self.assertEqual(mock_edit.call_args.args[2], 1)  # sequence
+        self.assertEqual(render_calls, [[1]])
         self.assertIn('fixed first frame', result['prompt_block'])
 
 
@@ -1285,7 +1286,7 @@ class TestUndoFrameFix(_TmpProjectCase):
 
         with patch.object(po, 'fix_beat_from_sequence_review',
                           return_value=('video one 改过', 'second frame 改过')), \
-             patch.object(po, 'generate_frame_sequence',
+             patch.object(csp, 'run_candidate_selection_frame_sequence',
                           side_effect=RuntimeError('上游炸了')), \
              patch.object(po, '_reverify_frame_issues', return_value=None):
             with self.assertRaises(RuntimeError):
@@ -1295,7 +1296,7 @@ class TestUndoFrameFix(_TmpProjectCase):
 
         with patch.object(po, 'fix_beat_from_sequence_review',
                           return_value=('video one 改过', 'second frame 改过')), \
-             patch.object(po, 'generate_frame_sequence', return_value=None), \
+             patch.object(csp, 'run_candidate_selection_frame_sequence', return_value=None), \
              patch.object(po, '_reverify_frame_issues', return_value=None):
             result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
 
@@ -1476,7 +1477,7 @@ class TestReverifyAfterFix(_TmpProjectCase):
 
     def _run_fix(self, verify_side_effect):
         with patch.object(po, 'fix_beat_from_sequence_review', return_value=('v', 'i')), \
-             patch.object(po, 'generate_frame_sequence'), \
+             patch.object(csp, 'run_candidate_selection_frame_sequence'), \
              patch.object(po, '_verify_review_violation', side_effect=verify_side_effect):
             return po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
 
@@ -1535,7 +1536,7 @@ class TestReverifyAfterFix(_TmpProjectCase):
         calls = []
 
         with patch.object(po, 'fix_beat_from_sequence_review', return_value=('v', 'i')), \
-             patch.object(po, 'generate_frame_sequence'), \
+             patch.object(csp, 'run_candidate_selection_frame_sequence'), \
              patch.object(po, '_verify_review_violation',
                           side_effect=lambda cfg, text, imgs: calls.append(text) or False):
             result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
@@ -1780,7 +1781,7 @@ class TestManualFrameIssue(_TmpProjectCase):
 
         with patch.object(po, 'fix_beat_from_sequence_review',
                           return_value=('fixed video 1', 'fixed image 2')) as mock_fix, \
-             patch.object(po, 'generate_frame_sequence'):
+             patch.object(csp, 'run_candidate_selection_frame_sequence'):
             result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
 
         mock_fix.assert_called_once_with({}, 'video one', 'second frame', ['塔吊凭空消失了'],
@@ -1802,7 +1803,7 @@ class TestManualFrameIssue(_TmpProjectCase):
 
         with patch.object(po, 'fix_beat_from_sequence_review',
                           return_value=('fixed video 1', 'fixed image 2')) as mock_fix, \
-             patch.object(po, 'generate_frame_sequence'):
+             patch.object(csp, 'run_candidate_selection_frame_sequence'):
             result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
 
         # 人工描述排在机器判定前面，两份都交给改写
@@ -1820,14 +1821,14 @@ class TestManualFrameIssue(_TmpProjectCase):
         ]})
         seen = {}
 
-        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None):
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4):
             seen['gate'] = self._read_manifest()['frames'][0]['quality_gate']
             seen['issue'] = self._read_manifest()['frames'][0].get('manual_issue')
             raise RuntimeError('上游炸了')
 
         with patch.object(po, 'fix_beat_from_sequence_review',
                           return_value=('fixed video 1', 'fixed image 2')), \
-             patch.object(po, 'generate_frame_sequence', side_effect=fake_render):
+             patch.object(csp, 'run_candidate_selection_frame_sequence', side_effect=fake_render):
             with self.assertRaises(RuntimeError):
                 po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2,
                                    manual_reason='塔吊凭空消失了')
@@ -1848,7 +1849,7 @@ class TestManualFrameIssue(_TmpProjectCase):
 
         with patch.object(po, 'fix_beat_from_sequence_review',
                           return_value=('v', 'i')) as mock_fix, \
-             patch.object(po, 'generate_frame_sequence'):
+             patch.object(csp, 'run_candidate_selection_frame_sequence'):
             po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
 
         self.assertEqual(mock_fix.call_args.args[3], ['同一句话'])
@@ -1860,15 +1861,17 @@ class TestManualFrameIssue(_TmpProjectCase):
         ]})
         po.set_manual_frame_issue(self.TITLE, 1, '首帧地面太干净，不像废墟')
 
+        render_calls = []
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4):
+            render_calls.append(target_sequences)
+
         with patch.object(po, 'fix_image_prompt_with_vlm_feedback',
                           return_value='fixed first frame') as mock_fix, \
-             patch.object(po, '_fix_frame_via_image_edit') as mock_edit, \
-             patch.object(po, 'generate_frame_sequence',
-                          side_effect=AssertionError('首帧修复不该走 generate_frame_sequence')):
+             patch.object(csp, 'run_candidate_selection_frame_sequence', side_effect=fake_render):
             po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 1)
 
         mock_fix.assert_called_once_with({}, 'first frame', '首帧地面太干净，不像废墟')
-        mock_edit.assert_called_once()
+        self.assertEqual(render_calls, [[1]])
 
 
 class TestGlobalReviewWindows(unittest.TestCase):

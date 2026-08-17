@@ -88,9 +88,15 @@ def _generate_batch_collage(title, sequences, batch_index):
     filter_str += ''.join(f'[s{i}]' for i in range(n))
     filter_str += f'concat=n={n}:v=1:a=0,tile={cols}x{rows}'
     
+    try:
+        from server_common import get_subprocess_window_flags
+        win_flags = get_subprocess_window_flags()
+    except Exception:
+        win_flags = {}
+
     subprocess.run(
         ['ffmpeg', '-y'] + input_args + ['-filter_complex', filter_str, outpath],
-        capture_output=True, timeout=60
+        capture_output=True, timeout=60, **win_flags
     )
     return outpath if os.path.exists(outpath) else None
 
@@ -119,9 +125,15 @@ def _generate_full_collage(title):
     filter_str += ''.join(f'[s{i}]' for i in range(n))
     filter_str += f'concat=n={n}:v=1:a=0,tile={cols}x{rows}'
     
+    try:
+        from server_common import get_subprocess_window_flags
+        win_flags = get_subprocess_window_flags()
+    except Exception:
+        win_flags = {}
+
     subprocess.run(
         ['ffmpeg', '-y'] + input_args + ['-filter_complex', filter_str, outpath],
-        capture_output=True, timeout=60
+        capture_output=True, timeout=60, **win_flags
     )
     return outpath if os.path.exists(outpath) else None
 

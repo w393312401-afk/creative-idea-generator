@@ -321,5 +321,59 @@ def test_detect_page_credit_exhaustion():
 
     # 3. 正常页面
     p3 = DummyDialogPage(dialog_texts=[], credit_text="1050 Google Flow credits")
-    res3 = credit.detect_page_credit_exhaustion(p3)
-    assert res3 is None
+    assert credit.detect_page_credit_exhaustion(p3) is None
+
+
+def test_is_manageable_user_page_and_find_or_create_page_exclusion():
+    from integrations.google_fx.utils.browser import _is_manageable_user_page, find_or_create_page
+
+    class DummyPageInternal:
+        def __init__(self, url):
+            self.url = url
+            self.closed = False
+            self.brought_to_front = False
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+        def bring_to_front(self):
+            self.brought_to_front = True
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+    # 1. 验证内部协议页面识别
+    assert _is_manageable_user_page(None) is False
+    assert _is_manageable_user_page(DummyPageInternal("chrome://omnibox-popup.top-chrome/")) is False
+    assert _is_manageable_user_page(DummyPageInternal("chrome-extension://abcdef/popup.html")) is False
+    assert _is_manageable_user_page(DummyPageInternal("devtools://devtools/bundled/inspector.html")) is False
+    assert _is_manageable_user_page(DummyPageInternal("about:blank")) is True
+    assert _is_manageable_user_page(DummyPageInternal("https://labs.google/fx/tools/flow")) is True
+
+    # 2. 验证 find_or_create_page 不会选择内部页面，也不会调用内部页面的 close()
+    omnibox_p1 = DummyPageInternal("chrome://omnibox-popup.top-chrome/")
+    omnibox_p2 = DummyPageInternal("chrome://omnibox-popup.top-chrome/omnibox_popup_aim.html")
+    flow_page = DummyPageInternal("https://labs.google/fx/tools/flow")
+    extra_user_page = DummyPageInternal("https://example.com")
+
+    class DummyContext:
+        def __init__(self, pages):
+            self.pages = list(pages)
+
+        def new_page(self):
+            p = DummyPageInternal("about:blank")
+            self.pages.append(p)
+            return p
+
+    ctx = DummyContext([omnibox_p1, omnibox_p2, flow_page, extra_user_page])
+    chosen = find_or_create_page(ctx, "/fx/tools/flow", auto_login=False)
+
+    assert chosen is flow_page
+    # 内部页面绝不能被 close
+    assert omnibox_p1.closed is False
+    assert omnibox_p2.closed is False
+    # 多余的普通用户页被正常清理
+    assert extra_user_page.closed is True

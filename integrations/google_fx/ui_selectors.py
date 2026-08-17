@@ -126,6 +126,17 @@ UI_SELECTORS = {
             "button:has-text('继续')",
             "button:has-text('Lanjutkan')",
         ],
+        "flow_project_error_btn": [
+            "button:has-text('Back to projects')",
+            "button:has-text('Back to project')",
+            "button:has-text('返回项目')",
+            "button:has-text('Kembali ke project')",
+            "button:has-text('Kembali ke proyek')",
+            "a:has-text('Back to projects')",
+            "a:has-text('返回项目')",
+            "button:has(i:text('arrow_back'))",
+            "button:has(i.google-symbols:text('arrow_back'))",
+        ],
         "account_menu_trigger": [
             "button:has(img[alt='User profile image'])",
             "button:has(img[alt='用户头像'])",

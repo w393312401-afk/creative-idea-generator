@@ -319,3 +319,185 @@ def test_api_switch_candidate_routing(monkeypatch, temp_project):
         assert body['manifest']['frames'][0]['chosen_candidate_index'] == 3
         mock_switch.assert_called_once_with(temp_project['project_name'], 1, 3)
 
+
+def test_generate_frame_candidates_fx_uuid_preservation(temp_project):
+    """Test that Google FX batch generation extracts UUIDs, saves raw JPGs, and records metadata."""
+    from PIL import Image
+
+    dummy_dir = tempfile.mkdtemp()
+    fake_fx_files = []
+    fake_uuids = [
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222",
+        "33333333-3333-3333-3333-333333333333",
+        "44444444-4444-4444-4444-444444444444",
+    ]
+    for idx, u in enumerate(fake_uuids):
+        fpath = os.path.join(dummy_dir, f"fx_batch_123_{idx}_{u}.jpg")
+        img = Image.new("RGB", (64, 64), color="blue")
+        img.save(fpath, "JPEG")
+        fake_fx_files.append(fpath)
+
+    mock_fx_service = MagicMock()
+    mock_fx_service._generate_images_batch_google_fx.return_value = {
+        "status": "success",
+        "image_urls": fake_fx_files,
+        "project_url": "https://labs.google/fx/tools/flow/project/test-proj-123"
+    }
+
+    with patch("candidate_selection_pipeline._get_google_fx_image_service", return_value=(mock_fx_service, None)), \
+         patch("candidate_selection_pipeline._fx_image_model", return_value="imagen-3.0"):
+
+        cands = csp.generate_frame_candidates(
+            config={"imageBackend": "google_fx"},
+            title=temp_project["project_name"],
+            item={"prompt": "test excavation"},
+            reference_path=None,
+            seq=1,
+            candidate_count=4,
+            project_url=None,
+            frames_dir=temp_project["frames_dir"]
+        )
+
+    assert len(cands) == 4
+    for c in cands:
+        assert os.path.exists(c)
+
+    # Check candidates_meta.json
+    cand_dir = os.path.join(temp_project["frames_dir"], "candidates", "frame_001")
+    meta_json = os.path.join(cand_dir, "candidates_meta.json")
+    assert os.path.exists(meta_json)
+    with open(meta_json, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    assert meta["project_url"] == "https://labs.google/fx/tools/flow/project/test-proj-123"
+    assert len(meta["candidates"]) == 4
+    for idx, c_meta in enumerate(meta["candidates"]):
+        assert c_meta["fx_uuid"] == fake_uuids[idx]
+        assert os.path.exists(c_meta["raw_src"])
+
+
+def test_switch_frame_candidate_updates_fx_src_and_uuid(temp_project):
+    """Test that switching a candidate updates fx_src with the new candidate's UUID."""
+    from PIL import Image
+
+    cand_dir = os.path.join(temp_project["frames_dir"], "candidates", "frame_001")
+    os.makedirs(cand_dir, exist_ok=True)
+    
+    cand_uuid_2 = "22222222-2222-2222-2222-222222222222"
+    cand_uuid_3 = "33333333-3333-3333-3333-333333333333"
+
+    cand_2_webp = os.path.join(cand_dir, "candidate_2.webp")
+    cand_3_webp = os.path.join(cand_dir, "candidate_3.webp")
+    cand_3_raw = os.path.join(cand_dir, f"candidate_3_{cand_uuid_3}.jpg")
+
+    for p in (cand_2_webp, cand_3_webp):
+        Image.new("RGB", (64, 64), color="green").save(p, "WEBP")
+    Image.new("RGB", (64, 64), color="red").save(cand_3_raw, "JPEG")
+
+    # Initial main frame
+    main_frame = os.path.join(temp_project["frames_dir"], "img_001.webp")
+    shutil.copyfile(cand_2_webp, main_frame)
+
+    meta_payload = {
+        "sequence": 1,
+        "project_url": "https://labs.google/fx/tools/flow/project/test-proj-123",
+        "candidates": [
+            {"index": 2, "path": cand_2_webp, "raw_src": cand_2_webp, "fx_uuid": cand_uuid_2},
+            {"index": 3, "path": cand_3_webp, "raw_src": cand_3_raw, "fx_uuid": cand_uuid_3},
+        ]
+    }
+    with open(os.path.join(cand_dir, "candidates_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta_payload, f)
+
+    manifest_data = {
+        "project": temp_project["project_name"],
+        "project_url": "https://labs.google/fx/tools/flow/project/test-proj-123",
+        "frames": [
+            {
+                "sequence": 1,
+                "file": "frames/img_001.webp",
+                "fx_uuid": cand_uuid_2,
+                "chosen_candidate_index": 2,
+                "candidates": [
+                    {"index": 2, "file": "frames/candidates/frame_001/candidate_2.webp", "fx_uuid": cand_uuid_2, "is_chosen": True},
+                    {"index": 3, "file": "frames/candidates/frame_001/candidate_3.webp", "fx_uuid": cand_uuid_3, "is_chosen": False},
+                ]
+            }
+        ]
+    }
+    manifest_path = os.path.join(temp_project["project_dir"], "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest_data, f)
+
+    with patch.object(csp, "_generate_full_collage_from_frames", return_value="frames/collage.jpg"):
+        updated_manifest = csp.switch_frame_candidate(temp_project["project_name"], seq=1, new_candidate_index=3)
+
+    assert updated_manifest["frames"][0]["chosen_candidate_index"] == 3
+    assert updated_manifest["frames"][0]["fx_uuid"] == cand_uuid_3
+
+    # Check fx_src directory
+    fx_src_file = csp._fx_find_ref_for(temp_project["frames_dir"], seq=2)
+    assert fx_src_file is not None
+    assert cand_uuid_3 in fx_src_file
+
+
+def test_partial_sequence_regeneration_stale_lineage(temp_project):
+    """Test regenerating a subset of frames updates stale_lineage correctly."""
+    prompt_block = """IMAGE 1:
+Prompt: Frame 1
+IMAGE 2:
+Prompt: Frame 2
+IMAGE 3:
+Prompt: Frame 3
+"""
+
+    def fake_gen_candidates(config, title, item, reference, seq, candidate_count=4, **kwargs):
+        cand_dir = os.path.join(temp_project["frames_dir"], "candidates", f"frame_{seq:03d}")
+        os.makedirs(cand_dir, exist_ok=True)
+        paths = []
+        for i in range(1, candidate_count + 1):
+            p = os.path.join(cand_dir, f"candidate_{i}.webp")
+            with open(p, "wb") as f:
+                f.write(f"fake_image_bytes_{seq}_{i}".encode('utf-8'))
+            paths.append(p)
+        return paths
+
+    def fake_eval(config, prompt_text, reference_path, candidate_paths, seq, on_progress=None):
+        return {
+            "best_index": 1,
+            "selection_reason": "test selection",
+            "candidates": [{"index": i + 1, "score": 85, "strengths": "ok", "defects": ""} for i in range(len(candidate_paths))]
+        }
+
+    with patch.object(csp, "generate_frame_candidates", side_effect=fake_gen_candidates), \
+         patch.object(csp, "evaluate_and_select_best_candidate", side_effect=fake_eval), \
+         patch.object(csp, "_generate_full_collage_from_frames", return_value="frames/collage.jpg"):
+
+        # 1. Run all 3 frames
+        res1 = csp.run_candidate_selection_frame_sequence(
+            config={},
+            title=temp_project["project_name"],
+            prompt_block=prompt_block,
+            candidate_count=4
+        )
+        assert len(res1["frames"]) == 3
+        for f in res1["frames"]:
+            assert "stale_lineage" not in f
+
+        # 2. Regenerate only Frame 2
+        res2 = csp.run_candidate_selection_frame_sequence(
+            config={},
+            title=temp_project["project_name"],
+            prompt_block=prompt_block,
+            target_sequences=[2],
+            candidate_count=4
+        )
+        # Frame 3 was after frame 2 and not regenerated, so it should be marked stale_lineage
+        assert len(res2["frames"]) == 3
+        assert res2["frames"][0].get("stale_lineage") is not True  # Frame 1
+        assert res2["frames"][1].get("stale_lineage") is not True  # Frame 2 (regenerated)
+        assert res2["frames"][2].get("stale_lineage") is True      # Frame 3 (downstream stale)
+
+
+

@@ -1066,6 +1066,7 @@ def _google_fx_status_snapshot():
             'ip_rotation': rotation,
             'dry_run': os.environ.get('FX_DRY_RUN', '0') in ('1', 'true', 'yes'),
             'debug_capture': os.environ.get('GOOGLE_FX_DEBUG_CAPTURE', '1') not in ('0', 'false', 'no'),
+            'silent_mode': os.environ.get('ADSPOWER_SILENT_MODE', '1') not in ('0', 'false', 'no'),
         },
         'accounts': {
             'total': len(accounts),
@@ -3205,8 +3206,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             if not self._gate():
                 return
             try:
+                force = query.get('force', ['0'])[0] in ('1', 'true', 'True')
                 pool = _get_account_pool()
-                self._send_json({'status': 'ok', 'profiles': pool.list_adspower_profiles()})
+                self._send_json({'status': 'ok', 'profiles': pool.list_adspower_profiles(force=force)})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
         elif path == '/api/account-pool/export':
@@ -4676,7 +4678,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 prompt_block = body.get('prompt_block', '')
                 target_sequences = body.get('target_sequences')
 
-                if not resolve_cover_reference(config, title, project_key):
+                skip_cover = bool(
+                    config.get('skipCoverReference')
+                    or config.get('allowTextOnlyAnchor')
+                    or config.get('coverReferencePath') == 'none'
+                )
+                if not skip_cover and not resolve_cover_reference(config, title, project_key):
                     self._send_json({
                         'status': 'error',
                         'message': '请先生成或选择封面图；第一帧必须以封面图进行图生图。',
@@ -4704,10 +4711,15 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 get_or_create_task(task_id, {"type": "frames", "theme": title, "project_key": project_key,
                                              "userId": config.get('googleFxUserId') or None})
 
-                target_worker = generate_frames_selection_worker if (
+                manifest = read_manifest(project_dir) if project_dir else {}
+                is_candidate_selection = (
                     body.get('generation_mode') == 'candidate_selection'
                     or body.get('candidate_selection') is True
-                ) else generate_frames_worker
+                    or config.get('generation_mode') == 'candidate_selection'
+                    or config.get('candidateSelection') is True
+                    or (isinstance(manifest, dict) and manifest.get('generation_mode') == 'candidate_selection')
+                )
+                target_worker = generate_frames_selection_worker if is_candidate_selection else generate_frames_worker
 
                 threading.Thread(
                     target=target_worker,
@@ -4743,7 +4755,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 target_sequences = body.get('target_sequences')
                 candidate_count = int(body.get('candidate_count') or 4)
 
-                if not resolve_cover_reference(config, title, project_key):
+                skip_cover = bool(
+                    config.get('skipCoverReference')
+                    or config.get('allowTextOnlyAnchor')
+                    or config.get('coverReferencePath') == 'none'
+                )
+                if not skip_cover and not resolve_cover_reference(config, title, project_key):
                     self._send_json({
                         'status': 'error',
                         'message': '请先生成或选择封面图；第一帧必须以封面图进行图生图。',
@@ -5804,7 +5821,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                   "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
                                   "-movflags", "+faststart", normalized_path]
                     res = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                          text=True, encoding='utf-8', errors='replace', timeout=120)
+                                          text=True, encoding='utf-8', errors='replace', timeout=120,
+                                          **get_subprocess_window_flags())
                     if res.returncode != 0 or not os.path.exists(normalized_path):
                         self._send_json({
                             'error': f'视频转码失败，文件可能已损坏或格式不受支持: {(res.stderr or "")[-300:]}'

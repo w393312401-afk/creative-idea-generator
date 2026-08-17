@@ -39,29 +39,40 @@ def resolve_binary(name: str) -> str | None:
     return None
 
 
-def build_keyframe_collage(frame_paths: list[Path], output_path: Path, columns: int = 5) -> Path | None:
-    """5-column tiled collage saved next to the source frames.
+def _win_subprocess_flags() -> dict:
+    flags: dict = {}
+    if sys.platform.startswith("win"):
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            flags["creationflags"] = subprocess.CREATE_NO_WINDOW
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        flags["startupinfo"] = si
+    return flags
 
-    This is the persistent, high-density visual reference for a whole render — it
-    makes it possible to spot a missed work stage or continuity break at a glance.
-    Returns None (rather than raising) when ffmpeg is unavailable or the tile
-    fails, so callers can treat the collage as best-effort QA, not a hard gate.
-    """
+
+def build_keyframe_collage(
+    frame_paths: list[Path | str],
+    output_path: Path | str,
+    columns: int = 5,
+) -> Path | None:
+    """Render a tiled keyframe collage using ffmpeg."""
     if not frame_paths:
         return None
+
     ffmpeg = resolve_binary("ffmpeg")
     if not ffmpeg:
         return None
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    rows = math.ceil(len(frame_paths) / columns)
-    padded = list(frame_paths)
-    # ffmpeg's tile filter needs a full grid; repeat the last frame to fill the tail.
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    paths = [Path(p) for p in frame_paths]
+    rows = math.ceil(len(paths) / columns)
+    padded = list(paths)
     while len(padded) < rows * columns:
         padded.append(padded[-1])
 
-    # To avoid opening hundreds of input demuxer threads/FDs in ffmpeg, write a concat list file
-    concat_list_path = output_path.parent / f".tmp_concat_{output_path.stem}.txt"
+    concat_list_path = out.parent / f".tmp_concat_{out.stem}.txt"
     try:
         lines = [f"file '{str(p.resolve()).replace('\'', '\'\\\'\'')}'\n" for p in padded]
         concat_list_path.write_text("".join(lines), encoding="utf-8")
@@ -86,7 +97,7 @@ def build_keyframe_collage(frame_paths: list[Path], output_path: Path, columns: 
             "3",
             str(output_path),
         ]
-        subprocess.run(command, capture_output=True, check=True)
+        subprocess.run(command, capture_output=True, check=True, **_win_subprocess_flags())
     except (subprocess.CalledProcessError, OSError):
         return None
     finally:

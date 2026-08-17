@@ -13,6 +13,56 @@ import collections
 import threading
 import time
 import re
+import subprocess
+
+# Suppress Windows system error dialogs (WerFault) from popping up and blocking execution
+if sys.platform.startswith("win"):
+    try:
+        import ctypes
+        SEM_FAILCRITICALERRORS = 0x0001
+        SEM_NOGPFAULTERRORBOX = 0x0002
+        SEM_NOOPENFILEERRORBOX = 0x8000
+        ctypes.windll.kernel32.SetErrorMode(
+            SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+        )
+    except Exception:
+        pass
+
+
+def get_subprocess_window_flags() -> dict:
+    """Returns extra kwargs for subprocess.run/Popen to prevent console windows and focus-stealing on Windows."""
+    kwargs = {}
+    if sys.platform.startswith("win"):
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
+FALLBACK_BINARY_DIRS = (
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/opt/local/bin",
+    r"C:\Users\video\AppData\Local\Microsoft\WinGet\Packages"
+    r"\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+    r"\ffmpeg-8.1.1-full_build\bin",
+)
+
+
+def resolve_binary(name: str) -> str:
+    """Resolve binary executable path, checking PATH and common fallback directories."""
+    found = shutil.which(name)
+    if found:
+        return found
+    suffix = ".exe" if sys.platform.startswith("win") else ""
+    for directory in FALLBACK_BINARY_DIRS:
+        candidate = os.path.join(directory, f"{name}{suffix}")
+        if os.path.exists(candidate):
+            return candidate
+    return name
 
 class DummyWriter:
     def write(self, *args, **kwargs):
@@ -1183,12 +1233,12 @@ def _git_head_info():
     "这个进程当初从哪个代码状态启动"，不是"磁盘现在是什么状态"（那是下面
     code_staleness_report() 按 mtime 比对的事）。非 git 环境/git 不在 PATH 时静默
     返回全 None，不影响服务启动。"""
-    import subprocess
     info = {'commit': None, 'commit_short': None, 'dirty': None}
+    win_flags = get_subprocess_window_flags()
     try:
         commit = subprocess.run(
             ['git', 'rev-parse', 'HEAD'], cwd=_PROJECT_ROOT, capture_output=True,
-            text=True, timeout=5, check=False).stdout.strip()
+            text=True, timeout=5, check=False, **win_flags).stdout.strip()
         if commit:
             info['commit'] = commit
             info['commit_short'] = commit[:12]
@@ -1197,7 +1247,7 @@ def _git_head_info():
     try:
         status = subprocess.run(
             ['git', 'status', '--porcelain'], cwd=_PROJECT_ROOT, capture_output=True,
-            text=True, timeout=5, check=False).stdout
+            text=True, timeout=5, check=False, **win_flags).stdout
         info['dirty'] = bool(status.strip())
     except Exception:
         pass
@@ -1393,6 +1443,15 @@ def apply_google_fx_runtime_overrides(config):
     browser_port = str(config.get('adsPowerPort') or '').strip()
     if browser_port:
         os.environ['ADSPOWER_PORT'] = browser_port
+    ads_silent = config.get('adsPowerSilentMode')
+    if ads_silent is not None:
+        os.environ['ADSPOWER_SILENT_MODE'] = '1' if str(ads_silent).lower() in ('1', 'true', 'yes', 'on') else '0'
+    ads_pos = config.get('adsPowerWindowPosition')
+    if ads_pos:
+        os.environ['ADSPOWER_WINDOW_POSITION'] = str(ads_pos).strip()
+    ads_headless = config.get('adsPowerHeadless')
+    if ads_headless is not None:
+        os.environ['ADSPOWER_HEADLESS'] = '1' if str(ads_headless).lower() in ('1', 'true', 'yes', 'on') else '0'
     browser_user_id = str(config.get('googleFxUserId') or '').strip()
     if browser_user_id:
         os.environ['ADSPOWER_DEFAULT_USER_ID'] = browser_user_id
@@ -1551,6 +1610,7 @@ _SERVER_AUTHORITATIVE_KEYS = frozenset({
 _PASSTHROUGH_CLIENT_KEYS = (
     'imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel',
     'videoModel', 'videoDuration', 'videoRefMode', 'adsPowerPort',
+    'adsPowerSilentMode', 'adsPowerWindowPosition', 'adsPowerHeadless',
     'videoAccountPoolMinCredit', 'frameContinuityLocalEdit',
     'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile',
     # 复刻线反推段的模型选择（前端「反推模型」两个下拉）：Pass A 逐帧识别
@@ -2040,6 +2100,8 @@ def manifest_cover_role(project_dir, *roles):
     if not isinstance(mapping, dict):
         mapping = {}
     for role in roles:
+        if role != 'active_cover' and mapping.get(role) == 'none':
+            return None
         raw = manifest.get('active_cover') if role == 'active_cover' else mapping.get(role)
         hit = _cover_candidate_path(raw)
         if hit:
@@ -2057,6 +2119,13 @@ def resolve_cover_reference(config, title, project_key=None):
     （无头调用与断线恢复只认磁盘上的这份）→ 项目目录里的 cover_*（新布局）→ 全局封面池
     里以 <安全标题>_cover_ 开头的那批（迁移前的历史封面）。后两处都按 mtime 取最新的一张。
     """
+    if isinstance(config, dict) and (
+        config.get('skipCoverReference')
+        or config.get('allowTextOnlyAnchor')
+        or config.get('coverReferencePath') == 'none'
+    ):
+        return None
+
     root = os.path.dirname(os.path.abspath(__file__))
     outputs_dir = os.path.abspath(os.path.join(root, OUTPUT_ROOT))
     named = (config or {}).get('coverReferencePath') if isinstance(config, dict) else None

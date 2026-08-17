@@ -146,6 +146,11 @@ def _write_state(state: dict):
 class AccountPool:
     """Google Flow 账号池：状态持久化 + 选号 + 积分刷新。"""
 
+    def __init__(self):
+        self._profile_cache = None
+        self._profile_cache_at = 0.0
+        self._profile_cache_port = None
+
     # ── 基础增删改查 ──────────────────────────────
 
     def list_accounts(self, heal: bool = True, sort_by: Optional[str] = None, sort_order: str = "desc") -> list:
@@ -521,15 +526,20 @@ class AccountPool:
 
     _PROFILE_PAGE_SIZE = 100
     _RATE_LIMIT_RETRIES = 4
+    _PROFILE_CACHE_TTL_SECONDS = 30.0
 
-    def list_adspower_profiles(self, port=None) -> list:
+    def list_adspower_profiles(self, port=None, force: bool = False) -> list:
         """列出本机 AdsPower 里所有浏览器环境，供"添加账号"下拉框和一键导入用。
 
-        翻页取全量（本地 API 单页上限 100）：只取第一页的老写法在环境超过 100 个
-        时会静默漏掉后面的，一键导入全部就成了"只导入前 100 个"。AdsPower 本地
-        API 有约 1 次/秒的限频，页间要停一下，否则第二页起会直接被拒。
+        带 30 秒内存 TTL 缓存（force=True 绕过），避免控制台切换标签页或频繁渲染
+        时重复慢速轮询 AdsPower 本地 API 导致假死。
         """
         port = port or get_runtime_default_port()
+        now = time.time()
+        if not force and self._profile_cache is not None and port == self._profile_cache_port:
+            if now - self._profile_cache_at < self._PROFILE_CACHE_TTL_SECONDS:
+                return list(self._profile_cache)
+
         profiles = []
         page = 1
         while True:
@@ -542,7 +552,7 @@ class AccountPool:
                     resp = requests.get(
                         f"http://127.0.0.1:{port}/api/v1/user/list"
                         f"?page={page}&page_size={self._PROFILE_PAGE_SIZE}",
-                        timeout=10,
+                        timeout=4,
                     ).json()
                 except Exception as e:
                     log(f"⚠️ 查询 AdsPower 环境列表异常（第 {page} 页）: {type(e).__name__}: {e}", "账号池")
@@ -577,6 +587,11 @@ class AccountPool:
                 break
             page += 1
             time.sleep(1.1)  # AdsPower 本地 API 限频
+
+        if profiles:
+            self._profile_cache = profiles
+            self._profile_cache_at = now
+            self._profile_cache_port = port
         return profiles
 
     def import_adspower_profiles(self, port=None) -> dict:
@@ -586,7 +601,7 @@ class AccountPool:
         不覆盖用户改过的命名/备注，也不重置积分缓存和禁用/冷却状态。新加的账号
         命名沿用 add_account() 的规则（AdsPower 环境的邮箱地址）。
         """
-        profiles = self.list_adspower_profiles(port=port)
+        profiles = self.list_adspower_profiles(port=port, force=True)
         if not profiles:
             log("⚠️ 一键导入：没拿到任何 AdsPower 环境（AdsPower 没开或本地 API 未启用？）", "账号池")
             return {"added": [], "skipped": [], "total": 0}

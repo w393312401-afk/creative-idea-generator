@@ -141,6 +141,59 @@ def test_unknown_page_without_entry_or_workspace_returns_false():
     assert ensure_flow_workspace(page, timeout_seconds=0.01) is False
 
 
+def test_flow_project_crashed_recovers_via_back_button():
+    class _CrashedPage:
+        def __init__(self):
+            self.crashed = True
+            self.ready = False
+            self.clicked = False
+
+        def locator(self, selector):
+            if "Back to projects" in selector and self.crashed:
+                def on_click():
+                    self.clicked = True
+                    self.crashed = False
+                    self.ready = True
+                return _Locator([_Element(self, on_click=on_click)])
+            if self.ready and selector == "button:has-text('New project')":
+                return _Locator([_Element(self, y=100)])
+            return _Locator()
+
+        def inner_text(self, selector, timeout=None):
+            return "Something went wrong." if self.crashed else ""
+
+    page = _CrashedPage()
+    assert ensure_flow_workspace(page, timeout_seconds=2) is True
+    assert page.clicked is True
+    assert page.ready is True
+
+
+def test_flow_project_crashed_recovers_via_goto_fallback():
+    class _CrashedPageNoBtn:
+        def __init__(self):
+            self.crashed = True
+            self.ready = False
+            self.navigated_to = None
+
+        def locator(self, selector):
+            if self.ready and selector == "button:has-text('New project')":
+                return _Locator([_Element(self, y=100)])
+            return _Locator()
+
+        def inner_text(self, selector, timeout=None):
+            return "Something went wrong." if self.crashed else ""
+
+        def goto(self, url, timeout=None, **kwargs):
+            self.navigated_to = url
+            self.crashed = False
+            self.ready = True
+
+    page = _CrashedPageNoBtn()
+    assert ensure_flow_workspace(page, timeout_seconds=2) is True
+    assert page.navigated_to == "https://labs.google/fx/tools/flow"
+    assert page.ready is True
+
+
 def test_closed_browser_fails_immediately_instead_of_waiting_for_navigation_timeout():
     class _Browser:
         def is_connected(self):
@@ -294,3 +347,41 @@ def test_find_or_create_page_can_disable_eager_login(monkeypatch):
 
     browser_utils.find_or_create_page(
         DummyContext(), "accounts.google.com", auto_login=False)
+
+
+def test_ensure_flow_workspace_resets_deadline_on_auto_login_success(monkeypatch):
+    """当自动登录耗时较长（例如 25s）但成功时，ensure_flow_workspace 必须重置 deadline，
+    给新进入的工作台页面预留充分的加载时间，而不是在登录完成瞬间直接因旧 deadline 超时判失败。"""
+    from integrations.google_fx.utils import browser as browser_utils
+
+    login_states = [True, False]
+    workspace_states = [False, False, True]
+
+    def mock_is_login(page):
+        return login_states.pop(0) if login_states else False
+
+    def mock_workspace_ready(page):
+        return workspace_states.pop(0) if workspace_states else True
+
+    auto_login_called = []
+    def mock_auto_login(page, **kwargs):
+        auto_login_called.append(True)
+        return True
+
+    monkeypatch.setattr(browser_utils, "is_google_login_page", mock_is_login)
+    monkeypatch.setattr(browser_utils, "wait_for_login_redirect", lambda *a, **kw: False)
+    monkeypatch.setattr(browser_utils, "_flow_workspace_ready", mock_workspace_ready)
+    monkeypatch.setattr(browser_utils, "flow_onboarding_required", lambda page: False)
+    monkeypatch.setattr(browser_utils, "_flow_project_crashed", lambda page: False)
+    monkeypatch.setattr(browser_utils, "attempt_auto_login", mock_auto_login)
+
+    class DummyPage:
+        def wait_for_load_state(self, *a, **kw):
+            pass
+
+    page = DummyPage()
+    # 传入极短的 initial timeout (0.1s)，验证 auto_login 成功后重置 deadline 让 workspace 成功判定
+    result = ensure_flow_workspace(page, timeout_seconds=0.1, user_id="test-user")
+    assert result is True
+    assert len(auto_login_called) == 1
+

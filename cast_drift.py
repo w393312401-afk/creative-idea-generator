@@ -204,7 +204,12 @@ def extract_frames(video_path, count=FRAMES_PER_SEGMENT, out_dir=None):
            # 配 -frames:v 限制总数。比按时间点 seek 快得多，也不需要先探时长。
            "-vf", f"thumbnail={max(2, 90 // max(1, count))},scale={_MAX_SIDE}:-1",
            "-frames:v", str(count), "-vsync", "vfr", pattern]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    try:
+        import server_common
+        win_flags = server_common.get_subprocess_window_flags() if hasattr(server_common, "get_subprocess_window_flags") else {}
+    except Exception:
+        win_flags = {}
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, **win_flags)
     if proc.returncode != 0:
         if owned:
             _cleanup(out_dir)

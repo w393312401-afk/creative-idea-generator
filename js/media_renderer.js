@@ -786,10 +786,11 @@ const COVER_ROLE_HINTS = {
     frame1: '第一帧图生图的参考图；选带文案的封面会把文字带进生成画面',
 };
 
-// 某个用途实际用的那张封面（未单独指定 → 主封面 → 最后一张）
+// 某个用途实际用的那张封面（显式指定 none 禁用 → 显式指定某张 → 主封面 → 最后一张）
 function coverRoleUrl(idea, role) {
     const covers = (idea && idea.covers) || [];
     const roles = (idea && idea.coverRoles) || {};
+    if (roles[role] === 'none') return null;
     return roles[role] || (idea && idea.activeCoverUrl) || covers[covers.length - 1] || null;
 }
 
@@ -845,9 +846,12 @@ function renderCoverRoleControls(idea, container) {
         const follow = new Option('跟随主封面', '');
         select.appendChild(follow);
         covers.forEach((url, idx) => select.appendChild(new Option(`封面 ${idx + 1}`, url)));
+        if (role === 'frame1') {
+            select.appendChild(new Option('🚫 不使用（纯文生图）', 'none'));
+        }
 
         const assigned = (idea.coverRoles || {})[role];
-        select.value = covers.includes(assigned) ? assigned : '';
+        select.value = (assigned === 'none' || covers.includes(assigned)) ? assigned : '';
         select.addEventListener('change', async () => {
             if (!idea.coverRoles) idea.coverRoles = {};
             if (select.value) idea.coverRoles[role] = select.value;

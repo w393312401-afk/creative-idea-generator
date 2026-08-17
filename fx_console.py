@@ -26,6 +26,10 @@ FX_CONFIG_SPEC = {
         'type': 'integer', 'min': 1, 'max': 65535, 'default': 50325, 'hot': True,
         'group': '连接', 'label': 'AdsPower 本地 API 端口',
     },
+    'adsPowerSilentMode': {
+        'type': 'bool', 'default': True, 'hot': True, 'env': 'ADSPOWER_SILENT_MODE',
+        'group': '连接', 'label': '后台静默运行（屏幕外运行，不弹窗抢焦点）',
+    },
     'googleFxImageModel': {
         'type': 'enum', 'options': list(GOOGLE_FX_IMAGE_MODELS),
         'default': 'Nano Banana 2', 'hot': True, 'group': '模型', 'label': '图片模型',

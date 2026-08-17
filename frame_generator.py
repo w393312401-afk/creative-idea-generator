@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import sys
 import json
@@ -1686,15 +1687,10 @@ def _fx_generate_batch(google_fx, models, config, prompt_texts, ref_path, cancel
 
 
 def text_only_anchor_allowed(config):
-    """本次渲染是否允许首帧在没有封面时退化为纯文生图。
-
-    默认关闭：手动入口的封面是先出的，首帧必须以它图生图，没有封面就是漏了一步。
-    分步任务（stepped_pipeline）例外——它从简报直接开跑，渲首帧那一刻整块提示词
-    只有 IMAGE 1，而封面提示词要拿首尾两拍拼 before/after 才写得出来，封面在这个
-    时点还不可能存在。首帧本来就是链头、允许没有图参考（跨层封面守卫已有同款退化
-    路径），所以由调用方显式打开这个旗标，其余帧缺参考仍是硬错误。
-    """
-    return bool((config or {}).get('allowTextOnlyAnchor'))
+    """本次渲染是否允许首帧在没有封面时退化为纯文生图。"""
+    if not isinstance(config, dict):
+        return False
+    return bool(config.get('allowTextOnlyAnchor') or config.get('skipCoverReference') or config.get('coverReferencePath') == 'none')
 
 
 def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=None, target_sequences=None):
@@ -1753,12 +1749,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
     def _run_chunk_batch(chunk_prompts, ref_path, leg, chunk_sequences=None,
                          cover_reference=None):
-        """跑一批并保存成功前缀，再从首个失败 prompt 精确续跑。
-
-        google_fx_image 会在第一张未捕获/未落盘时停止本批并返回已经成功的严格前缀。
-        这里把前缀搬进一个聚合临时目录，再以上一张成功图为参考继续剩余 prompts；
-        因而不会为了末尾一张失败而重复生成、重复计费整个五张批次。
-        """
+        # Run chunk batch and save prefix, resume from first failed prompt.
         user_id = (leg or {}).get('user_id') or pool_account_id or config.get('googleFxUserId')
         if user_id:
             config['googleFxUserId'] = user_id
@@ -1918,7 +1909,7 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         return os.path.exists(p) and os.path.getsize(p) > 0
 
     def _align_frame_color(seq):
-        """把刚落盘帧向当前镜头族母版对齐；无母版时退回首帧。"""
+        # Align newly rendered frame to current shot family master or fallback to frame 1.
         if seq <= 1:
             return
         item = prompts_by_seq.get(seq) or {}

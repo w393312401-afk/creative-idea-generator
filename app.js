@@ -1360,14 +1360,14 @@ function setupEventListeners() {
     initSectionPops();
 
     // Idea Interaction Buttons
-    document.getElementById('save-idea-btn').addEventListener('click', saveCurrentIdea);
-    document.getElementById('export-idea-btn').addEventListener('click', exportIdeaMarkdown);
-    document.getElementById('copy-prompt-btn').addEventListener('click', copyPromptToClipboard);
+    document.getElementById('save-idea-btn')?.addEventListener('click', saveCurrentIdea);
+    document.getElementById('export-idea-btn')?.addEventListener('click', exportIdeaMarkdown);
+    document.getElementById('copy-prompt-btn')?.addEventListener('click', copyPromptToClipboard);
     // 提示词页的手动编辑（✏️ 手动编辑 / ➕ 添加一拍 / 保存 / 取消），见 js/prompt_editor.js
     if (typeof initPromptEditor === 'function') initPromptEditor();
-    document.getElementById('copy-prompt-btn-all').addEventListener('click', copyPromptToClipboard);
-    document.getElementById('copy-tiktok-meta-btn').addEventListener('click', copyTikTokMetaToClipboard);
-    document.getElementById('copy-tiktok-meta-cn-btn').addEventListener('click', copyTikTokMetaCnToClipboard);
+    document.getElementById('copy-prompt-btn-all')?.addEventListener('click', copyPromptToClipboard);
+    document.getElementById('copy-tiktok-meta-btn')?.addEventListener('click', copyTikTokMetaToClipboard);
+    document.getElementById('copy-tiktok-meta-cn-btn')?.addEventListener('click', copyTikTokMetaCnToClipboard);
     document.getElementById('gen-project-meta-btn')?.addEventListener('click', generateProjectMetaForCurrentIdea);
     // 手机端标题区折叠开关：折叠态只留一行英文主标题（话题串与中文标题行藏起来），
     // 让封面/帧序列能上首屏。class 常驻 DOM，桌面端的 CSS 不理会它，所以按钮本身
@@ -3545,30 +3545,66 @@ function computeDebugTargets(kind, idea, slotType) {
     return slots.slice(0, n);
 }
 
+function hasIdeaCover(idea) {
+    if (!idea) return false;
+    if (Array.isArray(idea.covers) && idea.covers.length > 0) return true;
+    if (idea.activeCoverUrl) return true;
+    if (typeof coverRoleUrl === 'function' && coverRoleUrl(idea, 'frame1')) return true;
+    return false;
+}
+
+function isSkipCoverReferenceEnabled(idea) {
+    const toggle = document.getElementById('frames-skip-cover-toggle');
+    if (toggle && toggle.checked) return true;
+    const roles = (idea && idea.coverRoles) || {};
+    if (roles['frame1'] === 'none') return true;
+    if (typeof config !== 'undefined' && (config.skipCoverReference || config.allowTextOnlyAnchor)) return true;
+    return false;
+}
+
 // Generate the complete IMAGE prompt chain as ordered still frames.
 function withCoverReference(baseConfig, idea) {
-    // 帧 1 的参考图走 'frame1' 用途：用户可以把带文案的封面留给项目卡片/成片首帧，
-    // 这里单独指一张干净的，避免文案被图生图带进画面（见 media_renderer 的用途分配）。
+    if (!idea || isSkipCoverReferenceEnabled(idea)) {
+        return Object.assign({}, baseConfig, {
+            coverReferencePath: 'none',
+            skipCoverReference: true,
+            allowTextOnlyAnchor: true
+        });
+    }
     const chosen = coverRoleUrl(idea, 'frame1');
-    if (!chosen) return baseConfig;
-    return Object.assign({}, baseConfig, { coverReferencePath: chosen });
+    if (!chosen) {
+        return Object.assign({}, baseConfig, {
+            coverReferencePath: 'none',
+            skipCoverReference: true,
+            allowTextOnlyAnchor: true
+        });
+    }
+    return Object.assign({}, baseConfig, {
+        coverReferencePath: chosen,
+        skipCoverReference: false,
+        allowTextOnlyAnchor: false
+    });
+}
+
+function isCandidateSelectionMode() {
+    const toggle = document.getElementById('pipeline-selection-checkbox');
+    return toggle ? toggle.checked : false;
 }
 
 async function generateFrames() {
+    if (isCandidateSelectionMode()) {
+        return generateFramesSelection();
+    }
     if (!currentIdea || !currentIdea.prompt_block) {
         showToast("请先激发一个创意点子！", "error");
         return;
     }
     const ownerIdea = currentIdea;
-    const selectedCover = coverRoleUrl(ownerIdea, 'frame1');
-    if (ownerIdea.degraded === true
-        || (ownerIdea.quality_gate && ownerIdea.quality_gate.status !== 'passed')) {
-        showToast('提示词处于降级或质量门未通过状态，不能生成帧序列。', 'error');
-        return;
-    }
-    if (!selectedCover) {
-        showToast("请先生成或选择封面图；第一帧必须以封面图进行图生图。", "error");
-        return;
+    const skipCover = isSkipCoverReferenceEnabled(ownerIdea);
+    const hasCover = hasIdeaCover(ownerIdea);
+    if (!skipCover && !hasCover) {
+        const ok = await customConfirm("尚未生成封面图，是否直接开始生成帧序列？<br>（将使用纯文生图渲染第 1 帧）");
+        if (!ok) return;
     }
     if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
         showToast("该创意的帧序列已在生成中，请稍候", "error");
@@ -3629,6 +3665,8 @@ async function generateFrames() {
             display_title: ownerIdea.title,
             prompt_block: ownerIdea.prompt_block,
             generation_source: ownerIdea.generation_source,
+            generation_mode: ownerIdea.generation_mode || 'candidate_selection',
+            candidate_count: 4,
             degraded: ownerIdea.degraded === true,
             quality_gate: ownerIdea.quality_gate || null,
             diagnostic_mode: ownerIdea.diagnostic_mode === true
@@ -3677,8 +3715,10 @@ async function generateFramesSelection() {
         return;
     }
 
-    if (!ownerIdea.cover_image) {
-        const ok = await customConfirm("尚未生成封面图，是否直接开始 4选1 智能帧序列生成？<br>（将使用纯文生图渲染第1帧）");
+    const skipCover = isSkipCoverReferenceEnabled(ownerIdea);
+    const hasCover = hasIdeaCover(ownerIdea);
+    if (!skipCover && !hasCover) {
+        const ok = await customConfirm("尚未生成封面图，是否直接开始 4选1 智能帧序列生成？<br>（将使用纯文生图渲染第 1 帧）");
         if (!ok) return;
     }
 
@@ -3698,7 +3738,7 @@ async function generateFramesSelection() {
 
     try {
         const body = {
-            config,
+            config: withCoverReference(config, ownerIdea),
             title: getIdeaSaveTitle(ownerIdea),
             display_title: ownerIdea.title,
             prompt_block: ownerIdea.prompt_block,
@@ -4468,7 +4508,10 @@ function updatePipelineBar() {
         // 跑了一半（调试限量、中途取消、部分重试）时文案改成"继续"，
         // 免得看着像要从头再来一遍
         const partial = state[next].have > 0 && (next === 'frames' || next === 'videos');
-        nextText.textContent = partial ? `继续${PIPELINE_NEXT_LABEL[next]}` : PIPELINE_NEXT_LABEL[next];
+        const isCand = isCandidateSelectionMode();
+        const framesLabel = isCand ? '4选1 生成帧序列' : PIPELINE_NEXT_LABEL['frames'];
+        const label = next === 'frames' ? framesLabel : PIPELINE_NEXT_LABEL[next];
+        nextText.textContent = partial ? `继续${label}` : label;
     }
 }
 
@@ -4518,68 +4561,27 @@ function initPipelineBar() {
     const nextBtn = document.getElementById('pipeline-next-btn');
     if (nextBtn) nextBtn.addEventListener('click', runPipelineNext);
 
-    const moreBtn = document.getElementById('pipeline-more-btn');
-    const moreMenu = document.getElementById('pipeline-more-menu');
-    if (moreBtn && moreMenu) {
-        const closeMenu = () => {
-            moreMenu.hidden = true;
-            moreBtn.setAttribute('aria-expanded', 'false');
-        };
-        moreBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const willOpen = moreMenu.hidden;
-            moreMenu.hidden = !willOpen;
-            moreBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
-        });
-        // 菜单项的监听绑在按钮自己身上（冒泡先到它们），所以这里收菜单不会吞掉动作
-        moreMenu.addEventListener('click', closeMenu);
-        document.addEventListener('click', (e) => {
-            if (moreMenu.hidden) return;
-            if (moreBtn.contains(e.target) || moreMenu.contains(e.target)) return;
-            closeMenu();
-        });
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape' && !moreMenu.hidden) closeMenu();
-        });
-    }
-
-    // 「分步合成」入口：在 pipeline-more-menu 里点击后启动分步管线
-    const steppedBtn = document.getElementById('stepped-pipeline-btn');
-    if (steppedBtn) {
-        steppedBtn.addEventListener('click', () => {
-            if (typeof initSteppedPipeline !== 'function') {
-                alert('分步管线模块未加载');
-                return;
+    // 4选1 智能模式开关初始化与状态绑定
+    const candToggle = document.getElementById('pipeline-selection-checkbox');
+    const toggleLabel = document.getElementById('pipeline-selection-mode-toggle');
+    if (candToggle) {
+        const saved = localStorage.getItem('pipeline_candidate_selection_mode');
+        if (saved !== null) {
+            candToggle.checked = (saved === 'true');
+        } else if (typeof config !== 'undefined' && config.candidateSelectionMode === true) {
+            candToggle.checked = true;
+        }
+        if (toggleLabel) {
+            toggleLabel.classList.toggle('is-active', candToggle.checked);
+        }
+        candToggle.addEventListener('change', () => {
+            const checked = candToggle.checked;
+            localStorage.setItem('pipeline_candidate_selection_mode', checked ? 'true' : 'false');
+            if (typeof config !== 'undefined') config.candidateSelectionMode = checked;
+            if (toggleLabel) {
+                toggleLabel.classList.toggle('is-active', checked);
             }
-            // loadedIdea 是全局变量，由 app.js 的 renderIdea/loadIdeaCard 设置
-            if (typeof loadedIdea === 'undefined' || !loadedIdea || !loadedIdea.input_str) {
-                alert('请先选择一个灵感卡片再使用分步合成');
-                return;
-            }
-            const panel = document.getElementById('stepped-pipeline-panel');
-            if (!panel) return;
-
-            // 构建 dimensions，与主 compose 路径对齐
-            const dims = {
-                theme: loadedIdea.input_str,
-                task_label: loadedIdea.task_label || loadedIdea.input_str,
-                cover_url: loadedIdea.cover_url || null,
-                english_title: loadedIdea.english_title || null,
-                topic_dna: loadedIdea.topic_dna || null,
-                llm_score: loadedIdea.llm_score ?? null,
-                trend_ref: loadedIdea.trend_ref || null,
-                trend_ref_ids: loadedIdea.trend_ref_ids || [],
-                beat_outline: Array.isArray(loadedIdea.beat_outline) ? loadedIdea.beat_outline.slice() : [],
-                pacing_skeleton: loadedIdea.pacing_skeleton || 'linear_milestone',
-                beats_count: parseInt(document.getElementById('slider-beats')?.value || '10', 10),
-                beats_floor: Number.isFinite(+(loadedIdea.beats_floor)) ? +loadedIdea.beats_floor : null,
-            };
-
-            // 切到结果概览页
-            if (typeof switchMainTab === 'function') switchMainTab('results');
-            if (typeof switchTab === 'function') switchTab('overview');
-
-            initSteppedPipeline(panel, dims);
+            updatePipelineBar();
         });
     }
 
@@ -4603,6 +4605,21 @@ function initSectionPops() {
             btn.classList.toggle('active', willOpen);
         });
     });
+
+    const skipCoverToggle = document.getElementById('frames-skip-cover-toggle');
+    if (skipCoverToggle) {
+        const savedSkip = localStorage.getItem('frames_skip_cover_reference');
+        if (savedSkip !== null) {
+            skipCoverToggle.checked = (savedSkip === 'true');
+        }
+        skipCoverToggle.addEventListener('change', () => {
+            localStorage.setItem('frames_skip_cover_reference', skipCoverToggle.checked ? 'true' : 'false');
+            if (typeof config !== 'undefined') {
+                config.skipCoverReference = skipCoverToggle.checked;
+                config.allowTextOnlyAnchor = skipCoverToggle.checked;
+            }
+        });
+    }
 }
 
 // =====================================================================

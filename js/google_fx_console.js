@@ -97,14 +97,28 @@
     return `${Math.floor(value / 3600)}h${String(Math.floor((value % 3600) / 60)).padStart(2, '0')}m`;
   }
 
-  async function api(path, options) {
-    const response = await fetch(path, options);
-    let data = {};
-    try { data = await response.json(); } catch (_) { /* empty body */ }
-    if (!response.ok || data.status === 'error') {
-      throw new Error(data.message || data.error || `HTTP ${response.status}`);
+  async function api(path, options = {}) {
+    const timeoutMs = options.timeout ?? 8000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const fetchOpts = { ...options, signal: options.signal || controller.signal };
+      delete fetchOpts.timeout;
+      const response = await fetch(path, fetchOpts);
+      let data = {};
+      try { data = await response.json(); } catch (_) { /* empty body */ }
+      if (!response.ok || data.status === 'error') {
+        throw new Error(data.message || data.error || `HTTP ${response.status}`);
+      }
+      return data;
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        throw new Error(`请求超时 (${timeoutMs / 1000}s)`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
     }
-    return data;
   }
 
   function post(path, body) {
@@ -219,6 +233,15 @@
     if (dryRunEl) {
       dryRunEl.textContent = config.dry_run ? 'Dry-run 开启（不会真的生成）' : '正常提交';
       dryRunEl.className = config.dry_run ? 'fx-danger-value' : 'fx-safe-value';
+    }
+    const silentModeEl = $('fx-config-silent-mode');
+    if (silentModeEl) {
+      const isSilent = config.silent_mode !== false;
+      silentModeEl.textContent = isSilent ? '静默后台 (防抢焦)' : '正常可见窗口';
+      silentModeEl.className = isSilent ? 'fx-safe-value' : 'fx-danger-value';
+      silentModeEl.title = isSilent
+        ? 'AdsPower 浏览器在屏幕外 (-10000, -10000) 运行，不弹窗抢焦点'
+        : 'AdsPower 浏览器以可见窗口运行（适合调试/人工登录）';
     }
 
     const modeBadge = $('fx-service-mode');
@@ -657,11 +680,23 @@
         api('/api/account-pool')
       ]);
       // 账号先渲染：renderStatus 里的「序列默认环境」要拿号池的命名来显示
-      renderAccountsAndSyncConfig(pool.accounts || []);
-      renderStatus(status);
+      renderAccountsAndSyncConfig((pool && pool.accounts) || []);
+      renderStatus(status || {});
       if (!silent) showToast('Google FX 状态已刷新');
     } catch (error) {
       setCard('fx-runtime', '读取失败', error.message, 'bad');
+      setCard('fx-adspower', '读取失败', '服务端未响应', 'bad');
+      setCard('fx-execution', '未知', '状态同步失败', 'bad');
+      setCard('fx-account', '读取失败', '号池未加载', 'bad');
+      setCard('fx-proxy', '读取失败', '代理未加载', 'bad');
+      const diagList = $('fx-diagnostic-list');
+      if (diagList) {
+        diagList.innerHTML = `<div class="fx-diagnostic" data-level="error">Google FX 状态同步失败：${esc(error.message)}</div>`;
+      }
+      const accBody = $('fx-account-table-body');
+      if (accBody && !state.accounts.length) {
+        accBody.innerHTML = `<tr><td colspan="6" class="fx-empty">获取账号列表失败：${esc(error.message)}</td></tr>`;
+      }
       if (!silent) showToast(`刷新失败：${error.message}`, true);
     } finally {
       state.loading = false;
@@ -746,8 +781,14 @@
   }
 
   async function loadConfig() {
-    try { renderConfig(await api('/api/google-fx/config')); }
-    catch (error) { showToast(`配置读取失败：${error.message}`, true); }
+    try {
+      renderConfig(await api('/api/google-fx/config'));
+    } catch (error) {
+      if ($('fx-config-note')) {
+        $('fx-config-note').textContent = `配置读取失败：${error.message}`;
+      }
+      showToast(`配置读取失败：${error.message}`, true);
+    }
   }
 
   function collectConfigPatch() {
@@ -1138,7 +1179,8 @@
     if (!select) return;
     select.disabled = true;
     try {
-      const data = await api('/api/account-pool/adspower-profiles');
+      const url = force ? '/api/account-pool/adspower-profiles?force=1' : '/api/account-pool/adspower-profiles';
+      const data = await api(url, { timeout: 10000 });
       const known = new Set(state.accounts.map((account) => String(account.user_id)));
       const profiles = (data.profiles || []).filter((profile) => !known.has(String(profile.user_id)));
       select.innerHTML = '<option value="">选择环境…</option>' + profiles.map((profile) => {
@@ -1542,12 +1584,12 @@
   function activate() {
     init();
     state.active = true;
-    refresh(true);
-    loadConfig();
-    loadProfiles(false);
-    loadProxies();
-    loadCaptures();
-    loadLogs();
+    refresh(true).catch((e) => console.warn('FX console refresh failed:', e));
+    loadConfig().catch((e) => console.warn('FX console loadConfig failed:', e));
+    loadProfiles(false).catch((e) => console.warn('FX console loadProfiles failed:', e));
+    loadProxies().catch((e) => console.warn('FX console loadProxies failed:', e));
+    loadCaptures().catch((e) => console.warn('FX console loadCaptures failed:', e));
+    loadLogs().catch((e) => console.warn('FX console loadLogs failed:', e));
     scheduleNextTick(1500);
   }
 

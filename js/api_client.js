@@ -1245,6 +1245,8 @@ async function retrySingleFrame(seq) {
                 display_title: ownerIdea.title,
                 prompt_block: ownerIdea.prompt_block,
                 generation_source: ownerIdea.generation_source,
+                generation_mode: ownerIdea.generation_mode || 'candidate_selection',
+                candidate_count: 4,
                 degraded: ownerIdea.degraded === true,
                 quality_gate: ownerIdea.quality_gate || null,
                 diagnostic_mode: ownerIdea.diagnostic_mode === true,
@@ -1273,6 +1275,22 @@ async function retrySingleFrame(seq) {
                     if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
                 } else if (type === 'frame_start') {
                     feedLine(`🎨 IMG ${String(seq).padStart(3, '0')} 渲染中…`);
+                } else if (type === 'candidate_generating') {
+                    const cSeq = evData && evData.sequence ? evData.sequence : seq;
+                    const cCnt = evData && evData.candidate_count ? evData.candidate_count : 4;
+                    feedLine(`🎯 IMG ${String(cSeq).padStart(3, '0')} 正在生成 ${cCnt} 张候选图（4选1模式）…`);
+                } else if (type === 'candidate_batch_ready') {
+                    const cSeq = evData && evData.sequence ? evData.sequence : seq;
+                    const cCnt = evData && evData.candidate_count ? evData.candidate_count : 4;
+                    feedLine(`✨ IMG ${String(cSeq).padStart(3, '0')} 已生成 ${cCnt} 张候选图，准备 AI 鉴别…`);
+                } else if (type === 'candidate_evaluating') {
+                    const cSeq = evData && evData.sequence ? evData.sequence : seq;
+                    feedLine(`🧪 IMG ${String(cSeq).padStart(3, '0')} 正在进行多模态 AI 智能打分与优选…`);
+                } else if (type === 'candidate_ai_evaluation') {
+                    const cSeq = evData && evData.sequence ? evData.sequence : seq;
+                    const bestIdx = evData && evData.best_index ? evData.best_index : '?';
+                    const reason = evData && evData.selection_reason ? `：${evData.selection_reason}` : '';
+                    feedLine(`🏆 IMG ${String(cSeq).padStart(3, '0')} 优选采纳候选 #${bestIdx}${reason}`);
                 } else if (type === 'frame_qa') {
                     feedLine(`🧪 IMG ${String(seq).padStart(3, '0')} 质检判定中…`);
                 } else if (type === 'frame_retry') {
@@ -1553,7 +1571,15 @@ async function fixFrameIssue(seq, manualReason) {
                 } else if (type === 'frame_issue_fix_start') {
                     feedLine(`🔧 ${(evData && evData.message) || `正在优化 IMG ${String(seq).padStart(3, '0')} 的提示词…`}`);
                 } else if (type === 'frame_issue_fix_render' || type === 'frame_start') {
-                    feedLine(`🎨 ${(evData && evData.message) || `正在重渲 IMG ${String(seq).padStart(3, '0')}…`}`);
+                    feedLine(`🎨 ${(evData && evData.message) || `正在以 4选1 模式重渲 IMG ${String(seq).padStart(3, '0')}…`}`);
+                } else if (type === 'candidate_generating') {
+                    feedLine(`🎨 ${(evData && evData.message) || `IMG ${String(seq).padStart(3, '0')} 正在生成候选图 #${(evData && evData.candidate_index) || 1}/4…`}`);
+                } else if (type === 'candidate_batch_ready') {
+                    feedLine(`📦 ${(evData && evData.message) || `4张候选图已就绪，准备 AI 鉴别…`}`);
+                } else if (type === 'candidate_evaluating') {
+                    feedLine(`🤖 ${(evData && evData.message) || `AI 模型正在多模态打分鉴别…`}`);
+                } else if (type === 'candidate_ai_evaluation') {
+                    feedLine(`🎯 ${(evData && evData.message) || `AI 鉴别选定最佳候选`}`, 'ok');
                 } else if (type === 'frame_issue_reverify') {
                     // 修复闭环（2026-07-25）：重渲后对着新画面逐条复核"到底修好没有"
                     feedLine(`🔎 ${(evData && evData.message) || '正在复核问题是否已解决…'}`);

@@ -26,6 +26,8 @@ from frame_generator import (
     _generate_image_edit, _match_color_lab, detect_anchor_inertia,
     _continuity_family_maps, _continuity_beat, _image_quality_to_label,
     _get_google_fx_image_service, _fx_image_model,
+    _fx_extract_uuid, _fx_store_frame, _fx_find_ref_for, _fx_src_dir,
+    _fx_clear_frame_reference, _fx_cover_ref_jpg, _fx_local_frame_ref_jpg, update_manifest_stale_status,
 )
 from prompt_pipeline import (
     _parse_prompt_slots, _multimodal_chat, ground_threshold_reveal_prompt,
@@ -104,17 +106,21 @@ def _generate_single_api_candidate(config, prompt_text, reference_path, out_path
         _generate_image_edit(config, prompt_text, reference_path, out_path, control_prompt=ctrl_prompt)
 
 
-def generate_frame_candidates(config, title, item, reference_path, seq, candidate_count=4, on_progress=None, is_bridge=False, is_cut_head=False, is_turn=False):
+def generate_frame_candidates(config, title, item, reference_path, seq, candidate_count=4, on_progress=None, is_bridge=False, is_cut_head=False, is_turn=False, project_url=None, frames_dir=None):
     """
     Generate `candidate_count` candidate images for a given sequence step.
     Saves candidates to `outputs/<title>/frames/candidates/frame_{seq:03d}/candidate_{1..N}.webp`.
+    Extracts & preserves Google FX UUIDs and supports single-canvas project_url reuse.
     Returns list of absolute candidate file paths.
     """
     project_dir = _get_project_dir(title)
-    candidates_dir = os.path.join(project_dir, 'frames', 'candidates', f'frame_{seq:03d}')
+    if not frames_dir:
+        frames_dir = os.path.join(project_dir, 'frames')
+    candidates_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
     os.makedirs(candidates_dir, exist_ok=True)
 
     candidate_paths = []
+    candidates_meta = []
     is_text_only = (seq == 1 and not reference_path)
     
     # Determine control prompt
@@ -133,6 +139,7 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
     prompt_text = item.get('prompt', '')
 
     backend = (config.get('imageBackend') or 'api').strip().lower()
+    returned_project_url = project_url
 
     if backend == 'google_fx':
         log('INFO', 'CANDIDATE_GEN', f"IMG {seq:03d} 走 Google FX UI 自动化生成 {candidate_count} 张候选图...")
@@ -142,8 +149,16 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
             from integrations.google_fx.models import ImageBatchRequest
             fx_model = _fx_image_model(config)
             
-            # Request 4x candidate generation in single submit
-            req_images = [reference_path] if reference_path and os.path.exists(reference_path) else []
+            # If Google FX, prefer fx_src reference with UUID if available
+            eff_ref = reference_path
+            if seq > 1 and frames_dir:
+                fx_ref = _fx_find_ref_for(frames_dir, seq)
+                if fx_ref and os.path.exists(fx_ref) and os.path.getsize(fx_ref) > 0:
+                    eff_ref = fx_ref
+                elif eff_ref and os.path.exists(eff_ref) and eff_ref.lower().endswith('.webp'):
+                    eff_ref = _fx_local_frame_ref_jpg(eff_ref, frames_dir, seq - 1)
+
+            req_images = [eff_ref] if eff_ref and os.path.exists(eff_ref) else []
             
             req = ImageBatchRequest(
                 prompts=[prompt_text],
@@ -151,23 +166,43 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
                 ratio=config.get('imageAspectRatio') or '9:16',
                 model=fx_model,
                 output_path=candidates_dir,
-                require_fresh_canvas=(seq == 1),
+                project_url=project_url,
+                require_fresh_canvas=(seq == 1 and not project_url),
                 generation_count=f"{candidate_count}x",
                 is_candidate_mode=True,
             )
             fx_res = google_fx._generate_images_batch_google_fx(req)
-            if fx_res and fx_res.get('image_urls'):
-                fx_urls = fx_res['image_urls']
-                for idx, src_p in enumerate(fx_urls[:candidate_count]):
-                    cand_dest = os.path.join(candidates_dir, f'candidate_{idx+1}.webp')
-                    if src_p != cand_dest:
-                        try:
-                            from PIL import Image
-                            with Image.open(src_p) as im:
-                                im.save(cand_dest, 'WEBP', quality=95)
-                        except Exception:
-                            shutil.copy2(src_p, cand_dest)
-                    candidate_paths.append(cand_dest)
+            if fx_res:
+                if fx_res.get('project_url'):
+                    returned_project_url = fx_res.get('project_url')
+                if fx_res.get('image_urls'):
+                    fx_urls = fx_res['image_urls']
+                    for idx, src_p in enumerate(fx_urls[:candidate_count]):
+                        cand_dest = os.path.join(candidates_dir, f'candidate_{idx+1}.webp')
+                        cand_uuid = _fx_extract_uuid(src_p)
+                        cand_raw_jpg = None
+                        if cand_uuid and os.path.exists(src_p) and src_p.lower().endswith('.jpg'):
+                            cand_raw_jpg = os.path.join(candidates_dir, f'candidate_{idx+1}_{cand_uuid}.jpg')
+                            if src_p != cand_raw_jpg:
+                                shutil.copy2(src_p, cand_raw_jpg)
+                        elif os.path.exists(src_p):
+                            cand_raw_jpg = src_p
+
+                        if src_p != cand_dest:
+                            try:
+                                from PIL import Image
+                                with Image.open(src_p) as im:
+                                    im.save(cand_dest, 'WEBP', quality=95)
+                            except Exception:
+                                shutil.copy2(src_p, cand_dest)
+                        
+                        candidate_paths.append(cand_dest)
+                        candidates_meta.append({
+                            'index': idx + 1,
+                            'path': cand_dest,
+                            'raw_src': cand_raw_jpg or cand_dest,
+                            'fx_uuid': cand_uuid,
+                        })
         except Exception as e:
             log('WARN', 'CANDIDATE_GEN', f"Google FX 批量候选生成异常 ({e})，退回 API 多候选生成")
 
@@ -199,6 +234,12 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
                 p = _make_cand(c_idx)
                 if os.path.exists(p) and os.path.getsize(p) > 0:
                     candidate_paths.append(p)
+                    candidates_meta.append({
+                        'index': c_idx,
+                        'path': p,
+                        'raw_src': p,
+                        'fx_uuid': None,
+                    })
             except Exception as gen_err:
                 log('ERROR', 'CANDIDATE_GEN', f"生成候选图 #{c_idx} 失败: {gen_err}")
                 if candidate_paths:
@@ -207,6 +248,18 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
 
     if not candidate_paths:
         raise RuntimeError(f"IMG {seq:03d} 生成候选图失败，未获得任何有效图片")
+
+    # Save candidates metadata for easy recovery/switch
+    try:
+        meta_payload = {
+            'sequence': seq,
+            'project_url': returned_project_url,
+            'candidates': candidates_meta,
+        }
+        with open(os.path.join(candidates_dir, 'candidates_meta.json'), 'w', encoding='utf-8') as f:
+            json.dump(meta_payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
     return candidate_paths
 
@@ -328,9 +381,15 @@ def _generate_full_collage_from_frames(frames_dir):
     filter_str += f'concat=n={n}:v=1:a=0,tile={cols}x{rows}'
 
     try:
+        from server_common import get_subprocess_window_flags
+        win_flags = get_subprocess_window_flags()
+    except Exception:
+        win_flags = {}
+
+    try:
         subprocess.run(
             ['ffmpeg', '-y'] + input_args + ['-filter_complex', filter_str, outpath],
-            capture_output=True, timeout=60
+            capture_output=True, timeout=60, **win_flags
         )
         return outpath if os.path.exists(outpath) else None
     except Exception:
@@ -380,6 +439,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
         'aspect_ratio': config.get('imageAspectRatio') or '9:16',
         'image_size': _image_quality_to_label(config.get('imageQuality')),
         'control_prompt': IMG2IMG_CONTROL_PROMPT,
+        'project_url': None,
         'frames': [],
     }
 
@@ -391,13 +451,15 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                     manifest['frames'] = existing_manifest['frames']
                     manifest['created_at'] = existing_manifest.get('created_at', manifest['created_at'])
                     for _k, _v in existing_manifest.items():
-                        if _k not in manifest:
+                        if _k not in manifest or manifest[_k] is None:
                             manifest[_k] = _v
         except Exception:
             pass
 
     manifest_frames_by_seq = {f['sequence']: f for f in manifest.get('frames', [])}
     total_to_generate = len(target_sequences) if target_sequences is not None else len(prompts)
+    project_url = manifest.get('project_url')
+    backend = (config.get('imageBackend') or 'api').strip().lower()
     
     if on_progress:
         on_progress('start', {'total': total_to_generate, 'mode': 'candidate_selection', 'candidate_count': candidate_count})
@@ -428,14 +490,28 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
             seq, item.get('meta', ''), incoming_meta, _continuity_beat(manifest, seq)
         )
 
-        cover_ref = (resolve_cover_reference(config, title) if seq == 1 else None)
-        cover_anchor = bool(cover_ref)
-        reference = cover_ref if cover_anchor else previous_path
-        
-        if not reference and seq > 1:
-            durable_parent = os.path.join(frames_dir, f'img_{seq - 1:03d}.webp')
-            if os.path.exists(durable_parent) and os.path.getsize(durable_parent) > 0:
-                reference = durable_parent
+        if backend == 'google_fx':
+            if seq == 1:
+                cover_ref = resolve_cover_reference(config, title)
+                if cover_ref:
+                    reference = _fx_cover_ref_jpg(cover_ref, frames_dir)
+                elif target_sequences is not None and os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+                    reference = _fx_local_frame_ref_jpg(target_path, frames_dir, 1)
+                else:
+                    reference = None
+            else:
+                reference = _fx_find_ref_for(frames_dir, seq) or previous_path
+        else:
+            cover_ref = (resolve_cover_reference(config, title) if seq == 1 else None)
+            cover_anchor = bool(cover_ref)
+            reference = cover_ref if cover_anchor else previous_path
+            if not reference:
+                if seq > 1:
+                    durable_parent = os.path.join(frames_dir, f'img_{seq - 1:03d}.webp')
+                    if os.path.exists(durable_parent) and os.path.getsize(durable_parent) > 0:
+                        reference = durable_parent
+                elif seq == 1 and target_sequences is not None and os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+                    reference = target_path
 
         if on_progress:
             on_progress('frame_start', {
@@ -453,7 +529,25 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
             is_bridge=is_bridge,
             is_cut_head=is_cut_head,
             is_turn=is_turn,
+            project_url=project_url,
+            frames_dir=frames_dir,
         )
+
+        # Retrieve candidate metadata if saved
+        cand_meta_map = {}
+        cands_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
+        meta_file = os.path.join(cands_dir, 'candidates_meta.json')
+        if os.path.exists(meta_file):
+            try:
+                with open(meta_file, 'r', encoding='utf-8') as f:
+                    meta_payload = json.load(f)
+                    if meta_payload.get('project_url'):
+                        project_url = meta_payload.get('project_url')
+                        manifest['project_url'] = project_url
+                    for c in meta_payload.get('candidates', []):
+                        cand_meta_map[c.get('index')] = c
+            except Exception:
+                pass
 
         # Rel paths for candidates
         cand_rel_urls = [
@@ -478,8 +572,25 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
         best_candidate_path = candidate_paths[best_idx - 1]
         selection_reason = eval_result.get('selection_reason', '')
 
-        # ── Step 3: Copy Best Candidate to Target Frame Path ──
+        # ── Step 3: Copy Best Candidate to Target Frame Path & fx_src ──
         shutil.copy2(best_candidate_path, target_path)
+
+        best_cand_meta = cand_meta_map.get(best_idx, {})
+        best_uuid = best_cand_meta.get('fx_uuid')
+        best_raw_src = best_cand_meta.get('raw_src')
+
+        if best_raw_src and os.path.exists(best_raw_src):
+            try:
+                _, fx_src_path, stored_uuid = _fx_store_frame(best_raw_src, frames_dir, seq)
+                best_uuid = stored_uuid or best_uuid
+            except Exception as e:
+                log('WARN', 'CANDIDATE_GEN', f"IMG {seq:03d} 留档 fx_src 异常: {e}")
+        elif os.path.exists(best_candidate_path):
+            try:
+                _, fx_src_path, stored_uuid = _fx_store_frame(best_candidate_path, frames_dir, seq)
+                best_uuid = stored_uuid or best_uuid
+            except Exception:
+                pass
 
         # Color matching if needed
         if seq > 1 and os.path.exists(target_path):
@@ -497,6 +608,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                 'index': i + 1,
                 'file': os.path.relpath(cp, workspace_root).replace('\\', '/'),
                 'url': os.path.relpath(cp, workspace_root).replace('\\', '/'),
+                'fx_uuid': cand_meta_map.get(i + 1, {}).get('fx_uuid'),
                 'is_chosen': (i + 1 == best_idx),
                 'score': (eval_result.get('candidates') or [{}])[i].get('score', 80) if i < len(eval_result.get('candidates') or []) else 80,
                 'strengths': (eval_result.get('candidates') or [{}])[i].get('strengths', '') if i < len(eval_result.get('candidates') or []) else '',
@@ -510,6 +622,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
             'slot': seq,
             'file': rel_target_path,
             'url': rel_target_path,
+            'fx_uuid': best_uuid,
             'prompt': item.get('prompt', ''),
             'reference': os.path.relpath(reference, workspace_root).replace('\\', '/') if reference else None,
             'quality_gate': 'auto_approved',
@@ -524,6 +637,17 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
         # Update manifest frames
         manifest_frames_by_seq[seq] = frame_data
         manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
+        if project_url:
+            manifest['project_url'] = project_url
+
+        try:
+            update_manifest_stale_status(
+                manifest, project_dir,
+                regenerated_sequences=target_sequences,
+                finalize=False,
+            )
+        except Exception as stale_err:
+            log('WARN', 'CANDIDATE_GEN', f"更新 manifest stale 状态异常: {stale_err}")
 
         with open(manifest_path, 'w', encoding='utf-8') as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
@@ -544,6 +668,19 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                 'frame': frame_data,
             })
 
+    # Finalize stale status & capability stamping
+    try:
+        update_manifest_stale_status(
+            manifest, project_dir,
+            regenerated_sequences=target_sequences,
+            finalize=True,
+        )
+    except Exception as stale_err:
+        log('WARN', 'CANDIDATE_GEN', f"最终收尾 manifest stale 状态异常: {stale_err}")
+
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
     # Generate full collage
     _generate_full_collage_from_frames(frames_dir)
 
@@ -555,7 +692,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
 def switch_frame_candidate(title, seq, new_candidate_index):
     """
     Manually switch the authoritative frame for sequence `seq` to a different candidate.
-    Updates `img_{seq:03d}.webp` and `manifest.json`.
+    Updates `img_{seq:03d}.webp`, `fx_src`, and `manifest.json`.
     """
     project_dir = _get_project_dir(title)
     frames_dir = os.path.join(project_dir, 'frames')
@@ -568,8 +705,47 @@ def switch_frame_candidate(title, seq, new_candidate_index):
     target_frame_path = os.path.join(frames_dir, f'img_{seq:03d}.webp')
     shutil.copy2(target_cand_path, target_frame_path)
 
+    # Find raw candidate jpg or uuid
+    new_uuid = None
+    raw_src = None
+    meta_path = os.path.join(candidates_dir, 'candidates_meta.json')
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                m_data = json.load(f)
+            for c in m_data.get('candidates', []):
+                if c.get('index') == new_candidate_index:
+                    new_uuid = c.get('fx_uuid')
+                    raw_src = c.get('raw_src')
+                    break
+        except Exception:
+            pass
+
+    if not raw_src or not os.path.exists(raw_src):
+        if os.path.exists(candidates_dir):
+            prefix = f'candidate_{new_candidate_index}_'
+            for fname in os.listdir(candidates_dir):
+                if fname.startswith(prefix) and fname.lower().endswith('.jpg'):
+                    raw_src = os.path.join(candidates_dir, fname)
+                    new_uuid = _fx_extract_uuid(fname)
+                    break
+
+    if raw_src and os.path.exists(raw_src):
+        try:
+            _, _, stored_uuid = _fx_store_frame(raw_src, frames_dir, seq)
+            new_uuid = stored_uuid or new_uuid
+        except Exception:
+            pass
+    elif os.path.exists(target_cand_path):
+        try:
+            _, _, stored_uuid = _fx_store_frame(target_cand_path, frames_dir, seq)
+            new_uuid = stored_uuid or new_uuid
+        except Exception:
+            pass
+
     # Update manifest
     manifest_path = os.path.join(project_dir, 'manifest.json')
+    manifest = {}
     if os.path.exists(manifest_path):
         with open(manifest_path, 'r', encoding='utf-8') as f:
             manifest = json.load(f)
@@ -578,9 +754,20 @@ def switch_frame_candidate(title, seq, new_candidate_index):
             if frame.get('sequence') == seq:
                 frame['chosen_candidate_index'] = new_candidate_index
                 frame['vlm_qa_reason'] = f"人工切换为候选 #{new_candidate_index}"
+                if new_uuid:
+                    frame['fx_uuid'] = new_uuid
                 for cand in frame.get('candidates', []):
                     cand['is_chosen'] = (cand.get('index') == new_candidate_index)
                 break
+
+        try:
+            update_manifest_stale_status(
+                manifest, project_dir,
+                regenerated_sequences=[seq],
+                finalize=True,
+            )
+        except Exception as stale_err:
+            log('WARN', 'CANDIDATE_GEN', f"更新 manifest stale 状态异常: {stale_err}")
 
         with open(manifest_path, 'w', encoding='utf-8') as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)

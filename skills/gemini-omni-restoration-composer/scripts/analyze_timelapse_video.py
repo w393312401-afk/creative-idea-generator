@@ -40,6 +40,32 @@ from typing import Any
 
 NUL_DEVICE = "NUL" if sys.platform.startswith("win") else "/dev/null"
 
+# Suppress Windows system error dialogs (WerFault) from popping up and blocking execution
+if sys.platform.startswith("win"):
+    try:
+        import ctypes
+        SEM_FAILCRITICALERRORS = 0x0001
+        SEM_NOGPFAULTERRORBOX = 0x0002
+        SEM_NOOPENFILEERRORBOX = 0x8000
+        ctypes.windll.kernel32.SetErrorMode(
+            SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+        )
+    except Exception:
+        pass
+
+
+def _window_suppression_kwargs() -> dict[str, Any]:
+    """Returns extra kwargs for subprocess.run/Popen to prevent console windows and focus-stealing on Windows."""
+    kwargs: dict[str, Any] = {}
+    if sys.platform.startswith("win"):
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kwargs["startupinfo"] = startupinfo
+    return kwargs
+
 # Extra directories to probe when ffmpeg/ffprobe are not already on PATH. Covers a
 # Homebrew Intel/Apple-silicon install, MacPorts, and the WinGet layout on Windows.
 FALLBACK_BINARY_DIRS = (
@@ -77,6 +103,7 @@ def run(cmd: list[str], *, capture_output: bool = False) -> subprocess.Completed
         errors="replace",
         capture_output=capture_output,
         check=True,
+        **_window_suppression_kwargs(),
     )
 
 

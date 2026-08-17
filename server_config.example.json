@@ -17,6 +17,8 @@
   "_skillProfile_comment": "做哪个模型的提示词就读哪个技能包。auto=按 videoModel 推断(模型名里含 omni → omni 包，其余 → base 包)；也可直接钉死为 base 或 omni。钉死的用处：只想换渲染档位的人不该被顺手改掉提示词语法，反过来只想换提示词语法的人也不该被迫去改视频模型下拉框",
   "adsPowerPort": "50325",
   "_adsPowerPort_comment": "AdsPower 本地 API 端口。Google FX 运行时代码已内置，不再需要配置外部脚本路径",
+  "adsPowerSilentMode": true,
+  "_adsPowerSilentMode_comment": "默认 true: 开启屏幕外静默后台模式，浏览器在屏幕外 (-10000, -10000) 运行，不弹窗抢焦点，不打扰日常办公",
   "accessCode": "设一个访问码,外部用户要输对才能用;留空=不设门(不推荐对外)",
   "rateLimitEnabled": true,
   "_rateLimitEnabled_comment": "纯个人自用(没有别人会撞见这个链接)可设为 false 完全关闭频控;对外分享/怕链接泄露时保持 true",

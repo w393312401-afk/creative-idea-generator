@@ -941,7 +941,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                         return False
                     return True
 
-                def _scan_new_result_tiles():
+                def _scan_new_result_tiles(known_tile_ids=None):
                     """一次 evaluate 同时取回「新 tile 里的媒体」「全页媒体 src」「新 tile 是否已报错」。
 
                     2026-08-01 合并：路径B 和路径C 原本是两次独立的 page.evaluate，各自
@@ -954,6 +954,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     落进一个新 data-tile-id 里——画布是虚拟化的，视口外的结果 tile 根本不
                     挂载。它用来给路径A 的候选做「提交后才出现的媒体」佐证。
                     """
+                    before_ids = known_tile_ids if known_tile_ids is not None else known_tile_ids_before_submit
                     try:
                         result = page.evaluate("""(beforeIds) => {
                             const before = new Set(beforeIds || []);
@@ -1029,7 +1030,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                                 if (hasWarningIcon || hasCreditExhaustedText) failed = {text: tile.innerText, isCreditExhausted: hasCreditExhaustedText};
                             }
                             return {rows, mediaSrcs, failed};
-                        }""", list(known_tile_ids_before_submit or []))
+                        }""", list(before_ids or []))
                     except Exception as e:
                         log(f"  ⚠️ 新结果 tile 扫描失败: {type(e).__name__}", "GoogleFX")
                         return {"rows": [], "mediaSrcs": [], "failed": None}

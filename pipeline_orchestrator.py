@@ -911,7 +911,7 @@ def undo_frame_fix(title, sequence, prompt_block):
 def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, manual_reason=None):
     """人工确认修复流程的落地点：`_sequence_consistency_review` 只标记问题、不
     自动改写重渲，人工在帧网格看过 vlm_qa_reason 后点击「修复此帧问题」才会真正
-    触发这里——针对被标记的具体问题做定向提示词优化，再重渲。
+    触发这里——针对被标记的具体问题做定向提示词优化，再以 4选1 候选优选模式重渲。
 
     问题来源有两条，可并存也可单独成立：机器的一致性审查判定（vlm_qa_reason）与
     人工主动描述（manual_issue，见 set_manual_frame_issue）。manual_reason 是人在
@@ -922,14 +922,13 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
     非首帧沿用一致性审查的定向重写（fix_beat_from_sequence_review，同时改前一拍
     的视频过渡文本，保持"过渡描述"与"到达画面"一致）；首帧没有前置视频过渡，
     走单提示词反馈重写（fix_image_prompt_with_vlm_feedback）。
-    重渲一律走图生图——首帧走 _fix_frame_via_image_edit 的自编辑通道，非首帧走
-    generate_frame_sequence(target_sequences=[sequence])（seq>1 天然图生图链式
-    编辑，不需要特殊处理）。
+    重渲一律走 4选1 智能优选通道（run_candidate_selection_frame_sequence），一次性
+    生成 4 张候选图并由 VLM 多维度评分鉴别挑选最佳候选作为权威帧。
 
     重渲之后会对着新画面把这几条问题逐条再验一遍（_reverify_frame_issues），结果放在
     返回值的 'reverify' 里——修复流程此前是开环的，重渲完没人回答"到底修好没有"。
 
-    返回 {'prompt_block': ..., 'reason': ..., 'reverify': {...}|None}。"""
+    返回 {'prompt_block': ..., 'reason': ..., 'reverify': {...}|None, 'undoable': True}。"""
     project_dir = _get_project_dir(title)
     manual_reason = (manual_reason or '').strip()
     if manual_reason:
@@ -997,14 +996,16 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
     if on_progress:
         on_progress('frame_issue_fix_render', {
             'sequence': sequence,
-            'message': f"🎨 正在以图生图方式重渲 IMG {sequence:03d}…",
+            'message': f"🎨 正在以 4选1 候选优选方式重渲 IMG {sequence:03d}…",
         })
 
-    if sequence == 1:
-        _fix_frame_via_image_edit(config, title, sequence, new_image_body, on_progress=on_progress)
-    else:
-        generate_frame_sequence(config, title, new_prompt_block, on_progress=on_progress,
-                                target_sequences=[sequence])
+    from candidate_selection_pipeline import run_candidate_selection_frame_sequence
+    run_candidate_selection_frame_sequence(
+        config, title, new_prompt_block,
+        on_progress=on_progress,
+        target_sequences=[sequence],
+        candidate_count=4,
+    )
 
     # 重渲成功才清人工描述：中途抛错时描述必须原样留在 manifest 上，否则人得重新
     # 把问题再描述一遍。

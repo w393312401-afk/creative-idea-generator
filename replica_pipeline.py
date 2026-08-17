@@ -604,6 +604,20 @@ def ingest_video(file_bytes, filename, config=None):
     return _save_state(state)
 
 
+def _win_subprocess_flags():
+    if hasattr(server_common, 'get_subprocess_window_flags'):
+        return server_common.get_subprocess_window_flags()
+    flags = {}
+    if sys.platform.startswith('win'):
+        if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+            flags['creationflags'] = subprocess.CREATE_NO_WINDOW
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = getattr(subprocess, 'SW_HIDE', 0)
+        flags['startupinfo'] = si
+    return flags
+
+
 def _probe(video_path):
     """时长/分辨率/帧率。探测失败不是致命错误——抽帧脚本自己还会再探一次。"""
     try:
@@ -612,6 +626,7 @@ def _probe(video_path):
              'format=duration:stream=width,height,avg_frame_rate',
              '-of', 'json', video_path],
             capture_output=True, text=True, timeout=60, check=True,
+            **_win_subprocess_flags(),
         ).stdout
         data = json.loads(out)
         stream = next((s for s in data.get('streams') or [] if s.get('width')), {})
@@ -687,7 +702,7 @@ def _generate_collage_thumb(collage_path):
         subprocess.run(
             [ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-i', collage_path,
              '-vf', 'scale=1920:-1:force_divisible_by=2', '-q:v', '5', thumb_path],
-            capture_output=True, check=True
+            capture_output=True, check=True, **_win_subprocess_flags(),
         )
         return thumb_path
     except Exception:
@@ -720,6 +735,7 @@ def run_extract(state, on_progress=None, base_fps=None):
          '--video', state['video_path'], '--output-dir', directory,
          '--base-fps', str(base), '--dense-fps', str(dense)],
         capture_output=True, text=True, timeout=_ANALYZER_TIMEOUT_SEC,
+        **_win_subprocess_flags(),
     )
     if proc.returncode != 0:
         raise RuntimeError(f'抽帧脚本失败（exit {proc.returncode}）:\n{(proc.stderr or "")[-2000:]}')

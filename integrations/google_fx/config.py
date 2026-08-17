@@ -120,6 +120,10 @@ SERVER_PORT = int(_env_or_default("SERVER_PORT", "8000"))
 # 💡 AdsPower 配置
 DEFAULT_PORT = _env_or_default("ADSPOWER_PORT", "50325")
 DEFAULT_USER_ID = _env_or_default("ADSPOWER_DEFAULT_USER_ID", "")
+ADSPOWER_SILENT_MODE = _env_or_default("ADSPOWER_SILENT_MODE", "1") == "1"
+ADSPOWER_WINDOW_POSITION = _env_or_default("ADSPOWER_WINDOW_POSITION", "-10000,-10000")
+ADSPOWER_WINDOW_SIZE = _env_or_default("ADSPOWER_WINDOW_SIZE", "1280,800")
+ADSPOWER_HEADLESS = _env_or_default("ADSPOWER_HEADLESS", "0") == "1"
 
 # 💡 路径
 # 独立 AdsPower 项目过去按平台写到桌面或 N8N-main/AI_video；内置后统一回到
@@ -153,6 +157,28 @@ def get_runtime_default_port() -> str:
 
 def get_runtime_default_user_id() -> str:
     return runtime_env_or_default("ADSPOWER_DEFAULT_USER_ID", DEFAULT_USER_ID)
+
+
+def get_runtime_adspower_silent_mode() -> bool:
+    """返回 AdsPower 是否开启屏幕外静默后台模式（默认开启，窗口位于屏幕外避免抢焦点）。"""
+    val = runtime_env_or_default("ADSPOWER_SILENT_MODE", "1").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+def get_runtime_adspower_window_position() -> str:
+    """返回 AdsPower 屏幕外窗口坐标，默认 '-10000,-10000'。"""
+    return runtime_env_or_default("ADSPOWER_WINDOW_POSITION", "-10000,-10000").strip()
+
+
+def get_runtime_adspower_window_size() -> str:
+    """返回 AdsPower 窗口视口尺寸，默认 '1280,800'。"""
+    return runtime_env_or_default("ADSPOWER_WINDOW_SIZE", "1280,800").strip()
+
+
+def get_runtime_adspower_headless() -> bool:
+    """返回 AdsPower 是否开启原生 Headless 模式（默认 0/False）。"""
+    val = runtime_env_or_default("ADSPOWER_HEADLESS", "0").strip().lower()
+    return val in ("1", "true", "yes", "on")
 
 
 def get_runtime_google_fx_video_model() -> str:

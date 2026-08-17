@@ -21,6 +21,10 @@ from ..config import (
     OUTPUT_DIR,
     get_runtime_default_user_id,
     get_runtime_default_port,
+    get_runtime_adspower_silent_mode,
+    get_runtime_adspower_window_position,
+    get_runtime_adspower_window_size,
+    get_runtime_adspower_headless,
 )
 from . import account_binding
 from .logger import log
@@ -169,6 +173,41 @@ def _is_ws_port_open(ws_url: str) -> bool:
         return False
 
 
+def build_adspower_launch_args(silent: bool = True) -> tuple[str, list[str]]:
+    """🛠️ 构造 AdsPower 启动所需的 Chromium 参数列表与 URL 编码串。
+
+    静默后台模式（silent=True）：
+    - --window-position=-10000,-10000：将窗口生成在屏幕可见范围之外，完全不抢占用户焦点与打字输入
+    - --window-size=1280,800：确保标准化渲染视口，不影响 DOM / WebGL / Canvas
+    - --disable-features=CalculateNativeWinOcclusion,HardwareMediaKeyHandling：
+      禁用 Windows 窗口遮挡检测，防止窗口移出屏幕后 Chrome 自动挂起或降低帧率
+    - --disable-backgrounding-occluded-windows：禁止后台/遮挡窗口休眠
+    - --disable-renderer-backgrounding：禁止渲染进程在后台降低优先级
+    - --mute-audio：静音
+    - --no-first-run：跳过首次运行弹窗
+    """
+    import json
+    import urllib.parse
+
+    chrome_args = [
+        "--disable-features=CalculateNativeWinOcclusion,HardwareMediaKeyHandling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--mute-audio",
+        "--no-first-run",
+    ]
+    if silent:
+        pos = get_runtime_adspower_window_position()
+        size = get_runtime_adspower_window_size()
+        chrome_args.extend([
+            f"--window-position={pos}",
+            f"--window-size={size}",
+        ])
+
+    encoded = urllib.parse.quote(json.dumps(chrome_args))
+    return encoded, chrome_args
+
+
 def get_ads_ws_url(user_id=None, port=None, auto_rotate_proxy=True,
                    max_start_attempts=3, start_timeout=45):
     """🔌 连接 AdsPower 并返回 WebSocket URL (替代 4 处重复代码)
@@ -200,9 +239,15 @@ def get_ads_ws_url(user_id=None, port=None, auto_rotate_proxy=True,
         except Exception as e:
             log(f"⚠️ 代理轮换异常（不阻塞主流程）: {type(e).__name__}: {e}", "代理轮换")
 
-    launch_args = '%5B%22--disable-features%3DHardwareMediaKeyHandling%22%2C%22--mute-audio%22%5D'
+    silent_mode = get_runtime_adspower_silent_mode()
+    launch_args, chrome_args = build_adspower_launch_args(silent=silent_mode)
     api_start_url = f"http://127.0.0.1:{port}/api/v1/browser/start?user_id={user_id}&launch_args={launch_args}"
+    if get_runtime_adspower_headless():
+        api_start_url += "&headless=1"
     api_stop_url = f"http://127.0.0.1:{port}/api/v1/browser/stop?user_id={user_id}"
+
+    if silent_mode:
+        log(f"🤫 AdsPower 静默后台启动中 (屏幕外坐标: {get_runtime_adspower_window_position()})", "浏览器启动")
 
     max_start_attempts = max(1, int(max_start_attempts))
     for attempt in range(1, max_start_attempts + 1):
@@ -272,6 +317,27 @@ def _page_is_alive(page, timeout_ms=_PAGE_ALIVE_PROBE_TIMEOUT_MS) -> bool:
         return False
 
 
+def _is_manageable_user_page(page) -> bool:
+    """判断一个 page 是否为可操作/可关闭的普通用户标签页。
+    Chromium 内部页面（chrome://, chrome-extension://, devtools://, edge://, brave:// 等）
+    不可作为工作台标签页复用，调用 pg.close() 还会因 CDP Target.closeTarget 阻塞/挂死。
+    """
+    if page is None:
+        return False
+    try:
+        if callable(getattr(page, "is_closed", None)) and page.is_closed():
+            return False
+        url = str(getattr(page, "url", "") or "").strip().lower()
+        if not url or url.startswith("about:blank"):
+            return True
+        for scheme in ("chrome://", "chrome-extension://", "devtools://", "edge://", "brave://", "view-source:"):
+            if url.startswith(scheme):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _recover_valid_page(context, broken_page):
     """从 context.pages 中找到一个可用的 page 对象；都不行就新建。
 
@@ -281,7 +347,7 @@ def _recover_valid_page(context, broken_page):
     """
     candidates = [
         p for p in getattr(context, "pages", [])
-        if not (callable(getattr(p, "is_closed", None)) and p.is_closed())
+        if _is_manageable_user_page(p) and not (callable(getattr(p, "is_closed", None)) and p.is_closed())
     ]
     # 优先选不是 broken_page 的其他活页
     for pg in reversed(candidates):
@@ -316,7 +382,7 @@ def find_or_create_page(context, url_pattern, fallback_url=None, *, user_id=None
     if not fallback_url and ("labs.google" in url_pattern or "/fx" in url_pattern):
         fallback_url = "https://labs.google/fx/tools/flow"
 
-    pages = list(getattr(context, "pages", []))
+    pages = [p for p in getattr(context, "pages", []) if _is_manageable_user_page(p)]
     target_page = None
 
     # 1. 优先查找 URL 已经匹配 url_pattern、labs.google 或 /fx/tools/flow 的已打开 Flow 标签页
@@ -383,8 +449,9 @@ def find_or_create_page(context, url_pattern, fallback_url=None, *, user_id=None
             else:
                 log(f"⚠️ 标签页跳转 fallback_url ({fallback_url}) 异常: {e}", "浏览器管理")
 
-    # 5. 【核心修复】：清理并关闭除 target_page 外的所有多余标签页，保证浏览器标签栏始终保持一个 Flow 窗口
-    remaining_pages = list(getattr(context, "pages", []))
+    # 5. 【核心修复】：清理并关闭除 target_page 外的所有多余用户标签页，保证浏览器标签栏始终保持一个 Flow 窗口
+    # 注意：绝不关闭 chrome:// 等内部页面，否则会导致 CDP 挂起死锁
+    remaining_pages = [p for p in getattr(context, "pages", []) if _is_manageable_user_page(p)]
     for pg in remaining_pages:
         if pg != target_page:
             try:
@@ -400,7 +467,7 @@ def find_or_create_page(context, url_pattern, fallback_url=None, *, user_id=None
     # fallback 导航可能被 Google 重定向到 accounts.google.com。此处统一前置
     # 自愈；ensure_flow_workspace / wait_out_manual_intervention 仍保留二次兜底，
     # 用于登录重定向在本函数返回后才发生的慢页面。
-    if auto_login and is_google_login_page(target_page):
+    if auto_login and (is_google_login_page(target_page) or wait_for_login_redirect(target_page, timeout_seconds=2.0)):
         attempt_auto_login(
             target_page,
             user_id=user_id,
@@ -529,11 +596,11 @@ def complete_flow_onboarding(page, timeout_seconds: float = 60.0) -> bool:
                 target.evaluate("""dialog => {
                     const rows = Array.from(dialog.querySelectorAll('*'));
                     const scrollable = rows
-                      .filter(el => el.scrollHeight > el.clientHeight + 20)
-                      .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
+                        .filter(el => el.scrollHeight > el.clientHeight + 20)
+                        .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
                     if (scrollable) {
-                      scrollable.scrollTop = scrollable.scrollHeight;
-                      scrollable.dispatchEvent(new Event('scroll', {bubbles: true}));
+                        scrollable.scrollTop = scrollable.scrollHeight;
+                        scrollable.dispatchEvent(new Event('scroll', {bubbles: true}));
                     }
                 }""")
             except Exception:
@@ -557,13 +624,14 @@ def is_google_login_page(page) -> bool:
             "signin/accountchooser",
             "servicelogin",
             "signin/identifier",
+            "signin/challenge",
             "signin/v2",
         ]):
             return True
 
         state = page.evaluate(r"""() => {
             const url = window.location.href.toLowerCase();
-            if (url.includes('accounts.google.com') || url.includes('signin/accountchooser')) {
+            if (url.includes('accounts.google.com') || url.includes('signin/accountchooser') || url.includes('signin/challenge')) {
                 return true;
             }
             const text = (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -716,8 +784,55 @@ def attempt_auto_login(page, user_id=None, context_label="Flow导航", cancel_ch
         return False
 
 
+def _flow_project_crashed(page) -> bool:
+    """检测是否停留在项目崩溃/失效页面（例如 'Something went wrong.' + 'Back to projects'）"""
+    try:
+        from ..ui_selectors import UI_SELECTORS
+        selectors = UI_SELECTORS.get("google_fx", {}).get("flow_project_error_btn", [])
+    except Exception:
+        selectors = ["button:has-text('Back to projects')", "button:has-text('返回项目')"]
+    if _any_visible(page, selectors):
+        return True
+    try:
+        body_text = (page.inner_text("body", timeout=500) or "").lower()
+        if "something went wrong" in body_text or "出错了" in body_text or "terjadi kesalahan" in body_text:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _recover_from_flow_project_crash(page) -> bool:
+    """从项目崩溃页返回 Flow 主工作台列表"""
+    log("🔄 检测到 Google Flow 项目异常崩溃页 (Something went wrong)，正在返回工作台...", "Flow导航")
+    try:
+        from ..ui_selectors import UI_SELECTORS
+        selectors = UI_SELECTORS.get("google_fx", {}).get("flow_project_error_btn", [])
+    except Exception:
+        selectors = ["button:has-text('Back to projects')", "button:has-text('返回项目')"]
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            for index in range(locator.count()):
+                btn = locator.nth(index)
+                if btn.is_visible(timeout=500) and btn.is_enabled():
+                    btn.click(timeout=3000)
+                    time.sleep(1.0)
+                    return True
+        except Exception:
+            continue
+    # 兜底：如果按钮无法点击或不存在，直接 goto 回 /fx/tools/flow
+    try:
+        page.goto("https://labs.google/fx/tools/flow", timeout=30000, wait_until="domcontentloaded")
+        time.sleep(1.0)
+        return True
+    except Exception as e:
+        log(f"⚠️ 无法自动跳转回 Flow 工作台: {e}", "Flow导航")
+        return False
+
+
 def ensure_flow_workspace(page, timeout_seconds: float = 30.0, user_id=None) -> bool:
-    """若账号停在 Flow 产品介绍页，点击首屏 CTA 进入真正工作台。
+    """若账号停在 Flow 产品介绍页或项目崩溃页，自动进入/恢复真正工作台。
 
     页面同时渲染首屏和页尾两个同文案按钮；不能盲点 `.first`。这里选择纵坐标
     最小的可见按钮（即用户截图红框处），点击后必须看到可见输入框或“新建项目”
@@ -747,7 +862,13 @@ def ensure_flow_workspace(page, timeout_seconds: float = 30.0, user_id=None) -> 
                 auto_login_tried = True
                 if attempt_auto_login(page, user_id=user_id, context_label="Flow导航"):
                     # 登录成功后页面通常已经跳回 Flow，但可能落在产品介绍页，
-                    # 所以不直接 return True，交给下一轮循环照常判定工作台。
+                    # 必须重置/延长截止时间，避免因登录表单耗时导致下一轮判定直接超时。
+                    deadline = time.monotonic() + max(30.0, float(timeout_seconds))
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
                     continue
             log("🔒 检测到 Google 登录页面，无法自动进入工作台，提示人工处理登录", "Flow导航")
             return False
@@ -755,6 +876,13 @@ def ensure_flow_workspace(page, timeout_seconds: float = 30.0, user_id=None) -> 
             if not complete_flow_onboarding(page, timeout_seconds=max(1.0, deadline - time.monotonic())):
                 log("⚠️ Flow 首次使用引导未能自动完成", "Flow导航")
                 return False
+            deadline = time.monotonic() + max(20.0, float(timeout_seconds))
+            continue
+        if _flow_project_crashed(page):
+            if not _recover_from_flow_project_crash(page):
+                time.sleep(0.5)
+            else:
+                deadline = max(deadline, time.monotonic() + 15.0)
             continue
         if _flow_workspace_ready(page):
             if clicked:
@@ -783,6 +911,8 @@ def ensure_flow_workspace(page, timeout_seconds: float = 30.0, user_id=None) -> 
                 try:
                     _open_flow_entry_in_current_page(page, entry)
                     clicked = True
+                    # 点击进入后给工作台加载预留充足时间
+                    deadline = max(deadline, time.monotonic() + 15.0)
                 except Exception as e:
                     log(f"⚠️ 点击 Flow 工作台入口失败: {type(e).__name__}: {e}", "Flow导航")
                     return False

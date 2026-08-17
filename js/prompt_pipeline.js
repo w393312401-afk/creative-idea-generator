@@ -1102,7 +1102,6 @@ function renderIdeationCards(ideas) {
                     : `<button type="button" class="ideation-card-btn select-action-btn" title="这张卡激发时未产出节拍简介，点击仅载入维度">载入维度</button>`}
                 <button type="button" class="ideation-card-btn copy-action-btn">复制选题</button>
                 <button type="button" class="ideation-card-btn primary compose-action-btn">一键合成</button>
-                <button type="button" class="ideation-card-btn stepped-compose-btn" title="分步合成：每批渲染后暂停审核，适合大单或需要严格画面控制的场景">🪜 分步</button>
             </div>
         `;
         if (idea.degraded) {
@@ -1148,15 +1147,6 @@ function renderIdeationCards(ideas) {
             e.stopPropagation();
             composeIdeationCard(idx);
         });
-
-        // Clicking "🪜 分步" starts stepped pipeline (compose + render with review gates)
-        const steppedBtn = card.querySelector('.stepped-compose-btn');
-        if (steppedBtn) {
-            steppedBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                composeIdeationCardStepped(idx);
-            });
-        }
 
         // Clicking "复制选题" copies the ready-to-paste Tier-1 input string so it can be
         // pasted directly into a real gemini-veo-restoration-composer skill chat session.
@@ -1343,69 +1333,4 @@ function composeIdeationCard(index) {
         dimensions: dimensions,
         config: { ...config }
     });
-}
-
-/**
- * 「🪜 分步合成」入口：与 composeIdeationCard 构建相同的 dimensions，
- * 但走分步管线（stepped pipeline）而非一键合成。
- * 分步管线从提示词合成阶段就开始，每个批次渲染后暂停等待用户审核。
- */
-function composeIdeationCardStepped(index) {
-    const idea = currentIdeatedIdeas[index];
-    if (!idea) return;
-
-    if (typeof initSteppedPipeline !== 'function') {
-        showToast('分步管线模块未加载', 'error');
-        return;
-    }
-
-    const beatSettings = resolveCardBeatSettings(idea);
-
-    const dimensions = {
-        theme: idea.input_str,
-        task_label: idea.title || null,
-        anchors: [idea.twist_zh || idea.twist],
-        complexity: "硬核重工",
-        budget: "轻奢设计师级",
-        ratio: "50% (外壳粗野 ↔ 内里精致)",
-        creativity: "脑洞大开",
-        beats_count: beatSettings.beats_count,
-        beats_floor: Number.isFinite(+idea.beats_floor) ? +idea.beats_floor : null,
-        beat_count_mode: beatSettings.beat_count_mode,
-        beat_outline: ideaBeatOutline(idea),
-        pacing_skeleton: String(idea.pacing_skeleton || 'linear_milestone'),
-        cover_url: idea.cover_url || null,
-        english_title: idea.english_title || null,
-        topic_dna: idea.dna || null,
-        llm_score: Number.isFinite(+idea.score) ? +idea.score : null,
-        ledger_candidate: {
-            dna: idea.dna || null,
-            title: idea.title || null,
-            score: Number.isFinite(+idea.score) ? +idea.score : null,
-            creative_seed: {
-                input_str: idea.input_str || null,
-                carrier: idea.carrier || null,
-                env: idea.env || null,
-                trauma: idea.trauma || null,
-                destiny: idea.destiny || null,
-                twist: idea.twist || null,
-                twist_zh: idea.twist_zh || null,
-                salvage: idea.salvage_en || null,
-                salvage_zh: idea.salvage_zh || null
-            }
-        },
-        trend_ref: idea.trend_ref || null,
-        trend_ref_ids: idea.trend_ref_ids || []
-    };
-
-    showToast(`🪜 开始分步合成: ${idea.title}（${beatSettings.beats_count} 拍）...`, 'success');
-
-    // 切到激发结果工作区
-    if (typeof switchMainTab === 'function') switchMainTab('results');
-    if (typeof switchTab === 'function') switchTab('overview');
-
-    const panel = document.getElementById('stepped-pipeline-panel');
-    if (panel) {
-        initSteppedPipeline(panel, dimensions);
-    }
 }

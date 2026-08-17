@@ -4,7 +4,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // State management
   let serverManaged = false;
   let needsAccessCode = false;
-  let activeTab = 'google-fx';
+  let activeTab = '';
   let dashboardPollInterval = null;
   let videoPollInterval = null;
 
@@ -616,8 +616,8 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
-  function swapTab(targetTab) {
-    if (targetTab === activeTab) return;
+  function swapTab(targetTab, force = false) {
+    if (targetTab === activeTab && !force) return;
 
     // Update active nav item
     navItems.forEach(nav => {
@@ -661,7 +661,14 @@ document.addEventListener('DOMContentLoaded', () => {
   const initialTab = (requestedTab && Array.from(navItems).some(item => item.getAttribute('data-tab') === requestedTab))
     ? requestedTab
     : 'google-fx';
-  swapTab(initialTab);
+  swapTab(initialTab, true);
+
+  window.addEventListener('hashchange', () => {
+    const hashTab = window.location.hash.replace(/^#/, '');
+    if (hashTab && Array.from(navItems).some(item => item.getAttribute('data-tab') === hashTab)) {
+      swapTab(hashTab);
+    }
+  });
 
   // 3. Status Checking & Dynamic Dashboard
   async function checkSystemStatuses() {

@@ -327,6 +327,17 @@ JSON SCHEMA:
 # =====================================================================
 # Utilities
 # =====================================================================
+def _win_subprocess_flags():
+    flags = {}
+    if sys.platform.startswith('win'):
+        if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+            flags['creationflags'] = subprocess.CREATE_NO_WINDOW
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = getattr(subprocess, 'SW_HIDE', 0)
+        flags['startupinfo'] = si
+    return flags
+
 def ensure_dir(path):
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
@@ -334,7 +345,7 @@ def ensure_dir(path):
 
 def check_command(cmd):
     try:
-        subprocess.run([cmd, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([cmd, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_win_subprocess_flags())
         return True
     except FileNotFoundError:
         return False
@@ -446,7 +457,7 @@ def extract_keyframes(video_path, output_dir, fps=3.0):
     ]
     
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, **_win_subprocess_flags())
         # Scan extracted files
         files = sorted([os.path.join(keyframes_dir, f) for f in os.listdir(keyframes_dir) if f.startswith("keyframe_") and f.endswith(".jpg")])
         print(f"[+] Successfully extracted {len(files)} keyframes.")
@@ -467,7 +478,7 @@ def extract_keyframes(video_path, output_dir, fps=3.0):
                     "-vframes", "1",
                     collage_path
                 ]
-                subprocess.run(collage_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                subprocess.run(collage_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, **_win_subprocess_flags())
                 print(f"[+] Successfully generated keyframe collage: {collage_path}")
             except Exception as collage_err:
                 print(f"[-] Warning: Failed to generate keyframe collage: {collage_err}")

@@ -22,7 +22,15 @@ from server_common import (
     _get_account_pool_service, _select_pool_account,
     _account_switch_interval, _account_in_cooldown,
     _account_has_credit, _account_rotation_ring, _next_unused_account,
+    get_subprocess_window_flags,
 )
+
+
+def _win_subprocess_flags():
+    try:
+        return get_subprocess_window_flags()
+    except Exception:
+        return {}
 
 
 def _get_google_fx_video_service():
@@ -137,7 +145,8 @@ def _extract_video_frame(video_path, out_png, position, sseof_offset=0.3):
                "-i", video_path, "-frames:v", "1", "-update", "1", out_png]
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, encoding='utf-8', errors='replace', timeout=60)
+                             text=True, encoding='utf-8', errors='replace', timeout=60,
+                             **_win_subprocess_flags())
         return res.returncode == 0 and os.path.exists(out_png) and os.path.getsize(out_png) > 0
     except Exception:
         return False
@@ -206,7 +215,8 @@ def _extract_video_mid_frames(video_path, out_dir, fractions=(0.25, 0.5, 0.75)):
                "-frames:v", "1", out_png]
         try:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 text=True, encoding='utf-8', errors='replace', timeout=60)
+                                 text=True, encoding='utf-8', errors='replace', timeout=60,
+                                 **_win_subprocess_flags())
             if res.returncode == 0 and os.path.exists(out_png) and os.path.getsize(out_png) > 0:
                 paths.append(out_png)
         except Exception:
@@ -309,7 +319,8 @@ def clip_step_profile(video_path, tmp_dir, samples=_PACE_SAMPLES):
                     ["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.3f}", "-i", video_path,
                      "-frames:v", "1", png],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, encoding='utf-8', errors='replace', timeout=60)
+                    text=True, encoding='utf-8', errors='replace', timeout=60,
+                    **_win_subprocess_flags())
                 ok = (res.returncode == 0 and os.path.exists(png)
                       and os.path.getsize(png) > 0)
             if not ok:
@@ -1534,7 +1545,8 @@ def _ffprobe_video_params(path):
                "-show_entries", "stream=width,height,r_frame_rate:format=duration",
                "-of", "json", path]
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, encoding='utf-8', errors='replace', check=True)
+                             text=True, encoding='utf-8', errors='replace', check=True,
+                             **_win_subprocess_flags())
         info = json.loads(res.stdout)
         st = (info.get('streams') or [{}])[0]
         rate = st.get('r_frame_rate') or '24/1'
@@ -1672,7 +1684,8 @@ def _ffprobe_audio_params(path):
         cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0",
                "-show_entries", "stream=sample_rate,channels", "-of", "json", path]
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, encoding='utf-8', errors='replace', check=True)
+                             text=True, encoding='utf-8', errors='replace', check=True,
+                             **_win_subprocess_flags())
         streams = json.loads(res.stdout).get('streams') or []
         if not streams:
             return None
@@ -1725,7 +1738,8 @@ def build_cover_intro_clip(cover_path, ref_video, out_path, seconds=0.0, speed=1
 
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, encoding='utf-8', errors='replace', timeout=120)
+                             text=True, encoding='utf-8', errors='replace', timeout=120,
+                             **_win_subprocess_flags())
     except Exception as e:
         print(f"[WARN] 首帧封面烧录跳过（{type(e).__name__}: {e}）")
         return None
@@ -1972,7 +1986,8 @@ def retime_clip_even(src, dst, tmp_dir=None):
         cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p",
                     "-t", f"{duration:.6f}", dst])
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, encoding='utf-8', errors='replace', timeout=300)
+                             text=True, encoding='utf-8', errors='replace', timeout=300,
+                             **_win_subprocess_flags())
         if res.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
             return False, f'ffmpeg_failed:{(res.stderr or "").strip()[:200]}'
         return True, (f'retimed(spread={spread:.2f}, '
@@ -1990,7 +2005,8 @@ def _clip_has_audio(path):
             ["ffprobe", "-v", "error", "-select_streams", "a",
              "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding='utf-8', errors='replace', timeout=60)
+            text=True, encoding='utf-8', errors='replace', timeout=60,
+            **_win_subprocess_flags())
         return 'audio' in (res.stdout or '').lower()
     except Exception:
         return False
@@ -2262,7 +2278,8 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
         try:
             import subprocess
             res = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                 encoding='utf-8', errors='replace', check=True)
+                                 encoding='utf-8', errors='replace', check=True,
+                                 **_win_subprocess_flags())
             if "audio" in res.stdout.lower():
                 has_audio = True
         except Exception as probe_err:
@@ -2332,7 +2349,7 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
     # encoding must be explicit: ffmpeg emits UTF-8, but Windows text-mode default is GBK,
     # which crashes the subprocess stderr reader thread mid-merge
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                         encoding='utf-8', errors='replace')
+                         encoding='utf-8', errors='replace', **_win_subprocess_flags())
 
     if paced and res.returncode != 0:
         # 多输入 concat filter 要求所有输入的流布局一致；has_audio 只探了第一段，
@@ -2341,7 +2358,7 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
         print(f"[WARN] 按拍重变速的合并失败，回退等长拼接: {res.stderr[-400:]}")
         res = subprocess.run(_build_concat_demuxer_cmd(), stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True,
-                             encoding='utf-8', errors='replace')
+                             encoding='utf-8', errors='replace', **_win_subprocess_flags())
 
     try:
         os.remove(concat_list_path)
@@ -2365,7 +2382,8 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
                 output_path
             ]
             dur_res = subprocess.run(dur_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                     encoding='utf-8', errors='replace', check=True)
+                                     encoding='utf-8', errors='replace', check=True,
+                                     **_win_subprocess_flags())
             duration = float(dur_res.stdout.strip())
         except Exception as dur_err:
             print(f"[DEBUG] ffprobe duration check failed: {dur_err}")
@@ -2434,7 +2452,8 @@ def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missin
                  "-show_entries", "stream=codec_type", "-of", "csv=p=0", video_files[0]]
     try:
         res = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                             encoding='utf-8', errors='replace', check=True)
+                             encoding='utf-8', errors='replace', check=True,
+                             **_win_subprocess_flags())
         has_audio = "audio" in res.stdout.lower()
     except Exception as probe_err:
         print(f"[DEBUG] ffprobe check failed: {probe_err}")
@@ -2463,7 +2482,7 @@ def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missin
 
     print(f"[INFO] Skip-merge: {len(video_files)} segments, skipped {skipped_slots}, speed={speed:g}x -> {output_path}")
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, encoding='utf-8', errors='replace')
+                         text=True, encoding='utf-8', errors='replace', **_win_subprocess_flags())
     try:
         os.remove(concat_list_path)
     except Exception:
@@ -2483,7 +2502,7 @@ def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missin
         dur_res = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", output_path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding='utf-8', errors='replace', check=True)
+            encoding='utf-8', errors='replace', check=True, **_win_subprocess_flags())
         duration = float(dur_res.stdout.strip())
     except Exception:
         pass
