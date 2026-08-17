@@ -102,22 +102,45 @@ def _read_state() -> dict:
         info.setdefault("last_generation_error", None)
         info.setdefault("last_generation_error_at", None)
         info.setdefault("consecutive_failures", 0)
-        # A measured zero balance is never usable.  Normalize legacy state on
-        # read as well, so accounts that reached zero before this rule was
+        # A measured balance below threshold (default 15) is not usable. Normalize legacy state on
+        # read as well, so accounts that reached low credit before this rule was
         # introduced are excluded immediately without waiting for a new probe.
-        if info.get("credit") == 0 and not info.get("disabled"):
+        min_threshold = _get_min_credit_threshold()
+        credit_val = info.get("credit")
+        if credit_val is not None and credit_val < min_threshold and not info.get("disabled"):
             info["disabled"] = True
             info["disabled_reason"] = _ZERO_CREDIT_DISABLED_REASON
     return data
 
 
+def _get_min_credit_threshold() -> int:
+    """获取触发自动禁用的最低积分阈值（优先读取 server_config.json 中的 videoAccountPoolMinCredit，默认 15）。"""
+    try:
+        cfg_file = AI_DIR / "server_config.json"
+        if cfg_file.exists():
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "videoAccountPoolMinCredit" in data:
+                    return int(data["videoAccountPoolMinCredit"])
+    except Exception:
+        pass
+    try:
+        val = os.environ.get("GOOGLE_FX_ACCOUNT_POOL_MIN_CREDIT") or os.environ.get("GOOGLE_FX_MIN_CREDIT")
+        if val:
+            return int(val)
+    except Exception:
+        pass
+    return 15
+
+
 def _sync_zero_credit_disabled(info: dict, credit) -> None:
-    """Keep automatic zero-credit disabling separate from manual disabling."""
-    if credit == 0:
+    """Keep automatic low-credit disabling separate from manual disabling."""
+    min_threshold = _get_min_credit_threshold()
+    if credit is not None and credit < min_threshold:
         if not info.get("disabled"):
             info["disabled"] = True
             info["disabled_reason"] = _ZERO_CREDIT_DISABLED_REASON
-    elif credit is not None and info.get("disabled_reason") == _ZERO_CREDIT_DISABLED_REASON:
+    elif credit is not None and credit >= min_threshold and info.get("disabled_reason") == _ZERO_CREDIT_DISABLED_REASON:
         # A later successful probe found usable credit again. Only undo the
         # automatic disable; a manually disabled account must stay disabled.
         info["disabled"] = False

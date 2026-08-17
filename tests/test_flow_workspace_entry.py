@@ -385,3 +385,59 @@ def test_ensure_flow_workspace_resets_deadline_on_auto_login_success(monkeypatch
     assert result is True
     assert len(auto_login_called) == 1
 
+
+
+# ── 2026-08-17：崩溃页误判把健康画布"恢复"回项目列表，单画布复用整条失效 ──
+# 误判被 ensure_flow_workspace 当真之后，页面被退回项目列表，绑定的画布就此丢失；
+# 上层找不到编辑器只能新建一块空白画布，于是每帧一个新 project_url，参考图 UUID
+# 在新画布上挂不到，只能一张张重新上传。
+
+def _crash_probe_page(*, editor_visible, body_text="", back_button=False,
+                      arrow_back=False):
+    class _Page:
+        def __init__(self):
+            self.clicked_y = None
+
+        def locator(self, selector):
+            if selector in ("textarea", "[contenteditable='true']") and editor_visible:
+                return _Locator([_Element(self)])
+            if "arrow_back" in selector and arrow_back:
+                return _Locator([_Element(self)])
+            if "Back to projects" in selector and back_button:
+                return _Locator([_Element(self)])
+            return _Locator()
+
+        def inner_text(self, selector, timeout=None):
+            return body_text
+
+    return _Page()
+
+
+def test_healthy_canvas_with_header_back_arrow_is_not_a_crash():
+    """页头的通用 arrow_back 图标按钮在正常画布上一直都在，不能当崩溃证据。"""
+    from integrations.google_fx.utils.browser import _flow_project_crashed
+
+    page = _crash_probe_page(editor_visible=True, arrow_back=True)
+    assert _flow_project_crashed(page) is False
+
+
+def test_failed_tile_text_on_a_working_canvas_is_not_a_crash():
+    """画布上一张 Failed 卡片的正文同样是 'Something went wrong'，不能整页判崩。"""
+    from integrations.google_fx.utils.browser import _flow_project_crashed
+
+    page = _crash_probe_page(
+        editor_visible=True,
+        body_text="Frame 3 Something went wrong. Try again",
+    )
+    assert _flow_project_crashed(page) is False
+
+
+def test_real_crash_page_is_still_detected():
+    from integrations.google_fx.utils.browser import _flow_project_crashed
+
+    assert _flow_project_crashed(
+        _crash_probe_page(editor_visible=False, back_button=True)
+    ) is True
+    assert _flow_project_crashed(
+        _crash_probe_page(editor_visible=False, body_text="Something went wrong.")
+    ) is True

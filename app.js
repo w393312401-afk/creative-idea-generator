@@ -3729,12 +3729,14 @@ async function generateFramesSelection() {
     const grid = slotRenderTarget('image');
     if (!btn || !progress || !meta || !grid) return;
 
-    const targetSequences = computeDebugTargets('frames', ownerIdea, 'frame');
+    const targetSequences = computeDebugTargets('frames', ownerIdea, 'image');
 
     if (btn) btn.disabled = true;
     if (selBtn) selBtn.disabled = true;
     progress.style.display = 'flex';
-    meta.textContent = '🚀 正在启动 4选1 智能帧序列生成与 AI 鉴别管线...';
+    meta.textContent = targetSequences
+        ? `🚀 正在启动 4选1 智能帧序列生成（调试模式：仅前 ${targetSequences.length} 帧）...`
+        : '🚀 正在启动 4选1 智能帧序列生成与 AI 鉴别管线...';
 
     try {
         const body = {

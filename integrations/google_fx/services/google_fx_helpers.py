@@ -1274,15 +1274,12 @@ def _inspect_all_pending_tiles(page, tile_ids, prompts_map=None, slices_map=None
             const thumbSrc = thumbEl ? (thumbEl.currentSrc || thumbEl.src || '') : '';
             const progressMatch = (tile.innerText || '').match(/(\\d{1,3})\\s*%/);
             const hasProgress = progressMatch !== null;
-            const creditTokens = [
-                'credit', 'credits', 'quota', 'exhausted', 'insufficient',
-                '积分', '点数', '额度', '配额', 'run out', 'out of'
-            ];
-            const hasCreditExhaustedText = creditTokens.some(tok => text.includes(tok)) && (
-                text.includes('0') || text.includes('no ') || text.includes('not enough')
-                || text.includes('insufficient') || text.includes('out of') || text.includes('exhausted')
-                || text.includes('不足') || text.includes('已用完') || text.includes('耗尽')
-                || text.includes('无可用') || text.includes('没有') || text.includes('缺少')
+            const hasCreditExhaustedText = (
+                /\\b(out of credits?|insufficient credits?|not enough credits?|credits? exhausted|credits? depleted|no credits? left|resource_exhausted|quota_exhausted|quota exceeded)\\b/i.test(text)
+                || /(?<!\\d)0\\s*(?:(?:google\\s+)?flow\\s+)?credits?\\b/i.test(text)
+                || /(?:credits?|credit\\s+balance|积分|点数|额度|配额|余额)[:：=为是]\\s*0(?!\\d)/i.test(text)
+                || /(积分不足|没有足够的积分|积分已用完|积分已耗尽|积分耗尽|点数不足|点数已用完|点数已耗尽|额度不足|额度已用完|额度耗尽|配额不足|配额已用完|配额耗尽|无可用积分|无可用点数)/.test(text)
+                || /(?<!\\d)0\\s*(?:积分|点数)(?!\\d)/.test(text)
             );
             const hasFailText = text.includes('failed') || text.includes('something went wrong')
                              || text.includes('unusual activity') || text.includes('help center')

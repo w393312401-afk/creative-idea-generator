@@ -80,7 +80,7 @@ class CreditProbeCancelled(RuntimeError):
 # 猜测性与实测关键词库：命中即认为该次失败是积分/配额耗尽，
 # 而不是网络/画布等其它原因。
 CREDIT_EXHAUSTED_KEYWORDS = [
-    # 英文常见表达
+    # 英文明确耗尽短语（不放裸数字子串，避免 "100 credits" 命中 "0 credits"）
     "out of credits",
     "out of credit",
     "insufficient credits",
@@ -102,18 +102,7 @@ CREDIT_EXHAUSTED_KEYWORDS = [
     "credit exhausted",
     "credits depleted",
     "credit depleted",
-    "credits: 0",
-    "credit: 0",
-    "0 credits",
-    "0 credit",
     "zero credits",
-    "need more credits",
-    "get more credits",
-    "buy credits",
-    "purchase credits",
-    "upgrade to continue",
-    "upgrade plan",
-    "upgrade your plan",
     "resource_exhausted",
     "resource exhausted",
     "quota_exhausted",
@@ -121,7 +110,6 @@ CREDIT_EXHAUSTED_KEYWORDS = [
     "quota exceeded",
     "exceeded your quota",
     "exceeded quota",
-    "rate limit exceeded",
     "insufficient balance",
     "credit balance is 0",
     "credit balance: 0",
@@ -131,10 +119,7 @@ CREDIT_EXHAUSTED_KEYWORDS = [
     "not enough credits to perform this action",
     "try other settings or get more ai credits",
     "try other settings or upgrade for more google flow credits",
-    "you're running low on credits",
-    "you're running low on google flow and ai credits",
-    "you're running low on google flow credits",
-    # 中文常见表达
+    # 中文明确耗尽短语
     "积分不足",
     "没有足够的积分",
     "积分已用完",
@@ -154,14 +139,10 @@ CREDIT_EXHAUSTED_KEYWORDS = [
     "配额已用完",
     "配额耗尽",
     "配额已耗尽",
-    "剩余 0 积分",
-    "剩余 0 点数",
-    "0 积分",
-    "0 点数",
-    "0点数",
-    "0积分",
     "积分余额为 0",
+    "积分余额为0",
     "点数余额为 0",
+    "点数余额为0",
     "积分余额不足",
     "点数余额不足",
     "无可用积分",
@@ -173,9 +154,11 @@ CREDIT_EXHAUSTED_KEYWORDS = [
 ]
 
 _ZERO_CREDIT_REGEXES = [
-    re.compile(r"\b0\s+(?:(?:google\s+)?flow\s+)?credits?\b", re.IGNORECASE),
-    re.compile(r"(?:credits?|积分|点数|余额)[:：]?\s*0\b", re.IGNORECASE),
-    re.compile(r"(?:剩余|left|remaining)\s*0\s*(?:credits?|积分|点数)?", re.IGNORECASE),
+    # 严格数字边界：仅匹配独立的 0，绝不匹配 100/500/1000 等以 0 结尾的正数
+    re.compile(r"(?<!\d)0\s*(?:(?:google\s+)?flow\s+)?credits?\b", re.IGNORECASE),
+    re.compile(r"(?:credits?|credit\s+balance|积分|点数|额度|配额|余额)[:：=为是]\s*0(?!\d)", re.IGNORECASE),
+    re.compile(r"(?:剩余|left|remaining|balance\s+is)\s*0\s*(?:credits?|积分|点数)?(?!\d)", re.IGNORECASE),
+    re.compile(r"(?<!\d)0\s*(?:积分|点数|额度|配额)(?:余额)?(?!\d)", re.IGNORECASE),
 ]
 
 
@@ -270,7 +253,7 @@ def detect_page_credit_exhaustion(page) -> Optional[str]:
     if not page:
         return None
     try:
-        # 1. 检查可见的对话框 / 弹层 / 告警条 / Toast / 提示框
+        # 1. 检查可见的错误对话框 / 弹层 / 告警条 / Toast
         dialog_texts = page.evaluate("""() => {
             const selectors = [
                 "[role='dialog']",
@@ -279,10 +262,8 @@ def detect_page_credit_exhaustion(page) -> Optional[str]:
                 ".cdk-overlay-pane",
                 "[class*='toast']",
                 "[class*='snackbar']",
-                "[class*='banner']",
                 "[class*='notification']",
                 "div[aria-live='assertive']",
-                "div[aria-live='polite']",
             ];
             const texts = [];
             for (const sel of selectors) {
@@ -297,35 +278,6 @@ def detect_page_credit_exhaustion(page) -> Optional[str]:
                     }
                 } catch (e) {}
             }
-            try {
-                const promptArea = document.querySelector('form, [data-slate-editor], textarea')?.closest('div');
-                if (promptArea) {
-                    const t = (promptArea.innerText || '').trim();
-                    if (t) texts.push(t);
-                }
-            } catch (e) {}
-
-            // 检查输入栏内是否出现替换了 Generate 按钮的橙色积分不足警告图标
-            try {
-                const infoIcons = document.querySelectorAll('i.google-symbols, i');
-                for (const i of infoIcons) {
-                    const text = (i.innerText || i.textContent || '').trim().toLowerCase();
-                    if (text === 'info' || text === 'error') {
-                        const p = i.parentElement;
-                        if (p) {
-                            const style = window.getComputedStyle(p);
-                            if (style.display !== 'none' && style.visibility !== 'hidden') {
-                                const isPromptBar = i.closest('form, footer, [data-slate-editor], [contenteditable], div[class*="5c3af813"]') !== null
-                                                 || p.hasAttribute('data-state');
-                                if (isPromptBar) {
-                                    texts.push("Not enough Google Flow and AI credits to perform this action (提示词栏显示积分不足警告图标)");
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (e) {}
-
             return texts;
         }""")
 
@@ -341,11 +293,14 @@ def detect_page_credit_exhaustion(page) -> Optional[str]:
                 locator = page.locator(sel).first
                 if locator.count() > 0 and locator.is_visible(timeout=500):
                     t = (locator.inner_text(timeout=500) or "").strip()
-                    if t and is_credit_exhausted_message(t):
-                        return f"账号菜单/顶栏显示积分耗尽: {t}"
+                    if not t:
+                        continue
                     credit_num = _extract_credit_number(t)
-                    if credit_num is not None and credit_num == 0:
-                        return f"账号积分余额为 0 (当前读数: {t})"
+                    if credit_num is not None:
+                        if credit_num == 0:
+                            return f"账号积分余额为 0 (当前读数: {t})"
+                    elif is_credit_exhausted_message(t):
+                        return f"账号菜单/顶栏显示积分耗尽: {t}"
             except Exception:
                 continue
 

@@ -1349,7 +1349,8 @@ class TestRegionLockControlPrompt(unittest.TestCase):
             _write_test_image(target_path, (72, 128))
             return False
 
-        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit), \
+             patch('frame_generator._continuity_result', return_value=({}, 'fam-1')):
             generate_frame_sequence(
                 {'coverReferencePath': self.cover},
                 'region_lock_gate',

@@ -563,4 +563,25 @@ def test_account_pool_credit_sorting(monkeypatch):
     assert [a["user_id"] for a in accs_asc] == ["user_low", "user_high"]
 
 
+def test_credit_below_min_threshold_automatically_disables_account(monkeypatch):
+    pool = ap.AccountPool()
+    pool.add_account("user_low_credit")
 
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    # Probing 14 credits (< 15 threshold) should automatically disable account
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: 14)
+    result = pool.refresh_credit("user_low_credit", force=True)
+
+    assert result["credit"] == 14
+    assert result["disabled"] is True
+    assert result["disabled_reason"] == "zero_credit"
+    assert pool.pick_account(min_credit=15) is None
+
+    # Probing 15 credits (>= 15 threshold) should re-enable account
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: 15)
+    result2 = pool.refresh_credit("user_low_credit", force=True)
+
+    assert result2["credit"] == 15
+    assert result2["disabled"] is False
+    assert result2.get("disabled_reason") is None
+    assert pool.pick_account(min_credit=15)["user_id"] == "user_low_credit"

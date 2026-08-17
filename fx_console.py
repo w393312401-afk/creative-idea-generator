@@ -57,8 +57,8 @@ FX_CONFIG_SPEC = {
         'group': '号池', 'label': '换号节拍（每 N 个请求换一个号）',
     },
     'videoAccountPoolMinCredit': {
-        'type': 'integer', 'min': 0, 'max': 100000, 'default': 1, 'hot': True,
-        'group': '号池', 'label': '选号最低积分',
+        'type': 'integer', 'min': 0, 'max': 100000, 'default': 15, 'hot': True,
+        'group': '号池', 'label': '选号最低积分（低于此值自动禁用）',
     },
     # 'account' 类型的候选项来自号池（前端用 /api/account-pool 的结果渲染下拉），
     # 不写进 spec 的 options：号池是会变的运行时数据，固化进配置 schema 只会过期。

@@ -21,7 +21,9 @@ from ..config import (
 )
 from ..models import ImageBatchRequest
 from ..utils.logger import log
-from ..utils.browser import random_sleep, clean_path, ensure_flow_workspace
+from ..utils.browser import (
+    random_sleep, clean_path, ensure_flow_workspace, _flow_project_crashed,
+)
 from ..utils.ui_helpers import inject_batch_image_observer
 from ..utils import account_binding, cancel_flag, media_ledger
 
@@ -122,9 +124,10 @@ def _cooldown_current_login_account(reason):
 def _is_quota_failure(reason):
     text = str(reason or "").lower()
     return is_credit_exhausted_message(text) or any(token in text for token in (
-        "quota", "配额", "额度耗尽", "credits exhausted",
-        "insufficient credits", "not enough credits", "resource_exhausted",
-        "quota_exhausted", "insufficient_credits",
+        "quota_exhausted", "quota exhausted", "quota exceeded", "quota_exceeded",
+        "resource_exhausted", "resource exhausted", "insufficient_credits",
+        "insufficient credits", "not enough credits", "credits exhausted",
+        "额度耗尽", "配额耗尽", "配额不足", "额度不足",
     ))
 
 
@@ -199,6 +202,14 @@ def _create_fresh_flow_canvas(page, stale_url=""):
             "FLOW_CANVAS_UNAVAILABLE: 无法为新任务创建可用的 Google Flow 画布"
         )
 
+    # 等待新建项目后 URL 稳定变为 /project/<id> 或工具栏输入框出现
+    for _ in range(8):
+        current_url = str(getattr(page, "url", "") or "")
+        fresh_project = _flow_project_id(current_url)
+        if fresh_project:
+            break
+        random_sleep(0.2, 0.4)
+
     current_url = str(getattr(page, "url", "") or "")
     fresh_project = _flow_project_id(current_url)
     if stale_project and fresh_project == stale_project:
@@ -223,6 +234,71 @@ def _create_fresh_flow_canvas(page, stale_url=""):
         "FLOW_CANVAS_UNAVAILABLE: 新建画布后画布上仍有历史媒体卡片，"
         "无法确认已离开上一个任务的画布，已中止以免把历史帧混入本次任务"
     )
+
+
+def _enter_bound_project(page, requested_project_url, attempts=3):
+    """Navigate back into the task's own canvas and **prove** we landed in it.
+
+    2026-08-17 现场：AdsPower 每个请求都会把 profile 重新拉起，绑定的项目页于是常
+    在冷加载时撞上 Flow 的 "Something went wrong" 崩溃页。崩溃页由
+    ``ensure_flow_workspace`` 里的 ``_recover_from_flow_project_crash`` 处理——它把
+    页面弹回**工作台列表**然后返回 True。原来这里只看 workspace_ready，于是"回到列表"
+    被当成"已经进入绑定画布"：找不到编辑器就去点 New project，整条帧链换到一块空白
+    新画布上，上一帧的结果 tile 不在了，参考图只能一张张重新上传（日志里那串
+    「画布上挂不到该参考图，改用上传方式」）。
+
+    所以进门后必须核对 ``/project/<id>``。崩溃是瞬时的，reload 通常就能进去，
+    因此这里按 goto → (崩溃则 reload) → 核对 的节奏重试几轮，全都失败才允许上层
+    去新建画布。
+    """
+    requested_pid = _flow_project_id(requested_project_url)
+
+    def _landed():
+        current = str(getattr(page, "url", "") or "")
+        if requested_pid and _flow_project_id(current) != requested_pid:
+            return None
+        if _find_fx_prompt_input(page, announce=False) is None:
+            return None
+        return current
+
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        try:
+            page.goto(requested_project_url, timeout=60000, wait_until="domcontentloaded")
+            random_sleep(1, 2)
+        except Exception as nav_err:
+            log(f"⚠️ 第 {attempt} 次打开已绑定 Flow 画布失败: {nav_err}", "GoogleFX")
+            random_sleep(2, 3)
+            continue
+
+        # 崩溃页先就地 reload：ensure_flow_workspace 的兜底是"退回项目列表"，
+        # 那等于主动放弃这块画布，只能作为 reload 也救不回来时的最后一步。
+        if _flow_project_crashed(page):
+            log(f"🔁 已绑定 Flow 画布撞上崩溃页，就地刷新重试 ({attempt}/{attempts})...", "GoogleFX")
+            try:
+                page.reload(timeout=60000, wait_until="domcontentloaded")
+                random_sleep(2, 3)
+            except Exception as reload_err:
+                log(f"⚠️ 崩溃页刷新失败: {reload_err}", "GoogleFX")
+
+        # ensure_flow_workspace 返回 False = 这个项目本身进不了工作台（被删/失效）。
+        # 返回 True 也不代表进对了地方：崩溃恢复"退回项目列表"同样算 ready，
+        # 所以下面还要用 /project/<id> 核对落点。
+        ready = ensure_flow_workspace(page, timeout_seconds=30)
+        landed = _landed() if ready else None
+        if landed is not None:
+            if attempt > 1:
+                log(f"✅ 第 {attempt} 次尝试后已回到本任务的 Flow 画布", "GoogleFX")
+            return landed
+
+        landed_pid = _flow_project_id(str(getattr(page, "url", "") or ""))
+        log(
+            f"⚠️ 第 {attempt}/{attempts} 次未能进入已绑定画布"
+            f"（当前落点项目={landed_pid[:8] or '工作台列表'}），重试...",
+            "GoogleFX",
+        )
+        random_sleep(2, 4)
+
+    return None
 
 
 def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canvas=False):
@@ -251,7 +327,12 @@ def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canv
     # does not require navigating again when the requested workspace is already
     # open and its prompt editor is usable; avoiding goto preserves canvas state
     # and removes a repeated page-load timeout from every five-frame chunk.
-    same_project = bool(requested_project_url and current_url == requested_project_url)
+    requested_pid = _flow_project_id(requested_project_url)
+    current_pid = _flow_project_id(current_url)
+    same_project = bool(
+        requested_project_url
+        and (current_url == requested_project_url or (requested_pid and requested_pid == current_pid))
+    )
     # ⚠️ "/fx/tools/flow" is a prefix of every project route, so this substring
     # test used to accept the previous task's `/fx/tools/flow/project/<id>` as a
     # "restored workspace" and bind it to the new task (2026-08-05 事故).  Only a
@@ -261,8 +342,24 @@ def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canv
         and "/fx/tools/flow" in current_url
         and "/project/" not in current_url
     )
-    if (same_project or restored_workspace) and _find_fx_prompt_input(page, announce=False) is not None:
-        return current_url if "/project/" in current_url else None
+    if same_project or restored_workspace:
+        # 刚跑完上一帧的画布常常还在收尾（结果 tile 挂载、编辑器重挂），此刻
+        # _find_fx_prompt_input 会短暂返回 None。原来一旦没找到就直接落到下面的
+        # page.goto——同一块画布被整页重载，i2i 的画布上下文与已挂载的参考图全部
+        # 丢掉，每帧还要多付一次页面加载。这里先给它几秒钟稳定下来。
+        editor = _find_fx_prompt_input(page, announce=False)
+        if editor is None and same_project:
+            # 只在"确知这块画布就是我们要的那块"时才等；route-less 的 restored_workspace
+            # 没有编辑器时多半停在产品落地页，那条路要立刻去点 New project，不能白等。
+            for _ in range(10):
+                random_sleep(0.4, 0.6)
+                editor = _find_fx_prompt_input(page, announce=False)
+                if editor is not None:
+                    break
+        if editor is not None:
+            current_url = str(getattr(page, "url", "") or "")
+            log("♻️ 复用当前标签页里已打开的 Flow 画布（不刷新、不新建）", "GoogleFX")
+            return current_url if "/project/" in current_url else None
 
     # _connect_fx_page() has already entered the Flow workspace.  The normal
     # workspace home has a visible "New project" button but no prompt editor.
@@ -290,33 +387,33 @@ def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canv
         raise RuntimeError(
             "FLOW_CANVAS_UNAVAILABLE: Flow 工作台已打开，但无法进入或新建可用画布"
         )
-    try:
-        page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
-        random_sleep(1, 2)
-    except Exception as nav_err:
-        if not requested_project_url:
-            raise RuntimeError(f"Cannot open the Flow workspace: {nav_err}") from nav_err
+    if requested_project_url:
+        # 已绑定画布：进门要么成功、要么证明进不去，绝不把"被弹回工作台列表"
+        # 当成进门成功（否则下面那句 _click_new_project_button 会把整条帧链
+        # 换到一块空白新画布上）。
+        landed = _enter_bound_project(page, requested_project_url)
+        if landed is not None:
+            return landed if "/project/" in landed else None
         # A persisted project can be deleted, expire, or become inaccessible to
         # the same account.  The local reference files are durable and will be
         # uploaded into a replacement canvas below, so a dead project URL must
         # not permanently brick the whole frame sequence.
         log(
-            f"⚠️ 已绑定 Flow 项目无法打开，准备回到项目列表新建画布: {nav_err}",
+            "⚠️ 已绑定 Flow 画布多次进入失败（崩溃页/被弹回列表/项目失效），"
+            "只能新建替代画布：本帧起 i2i 续链断开，参考图将改用上传方式重新挂载",
             "GoogleFX",
         )
         # 绑定的项目打不开时，页面上剩下的那块画布不是"替代品"而是别人的东西
         # （多半就是上一个任务的）。只能新建，且要能证明确实换了一块。
         return _create_fresh_flow_canvas(page, stale_url=requested_project_url)
 
-    workspace_ready = ensure_flow_workspace(page, timeout_seconds=30)
-    if not workspace_ready and requested_project_url:
-        log(
-            "⚠️ 已绑定 Flow 项目不可用，回到项目列表创建替代画布；"
-            "本地参考图将在新画布重新上传",
-            "GoogleFX",
-        )
-        return _create_fresh_flow_canvas(page, stale_url=requested_project_url)
+    try:
+        page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
+        random_sleep(1, 2)
+    except Exception as nav_err:
+        raise RuntimeError(f"Cannot open the Flow workspace: {nav_err}") from nav_err
 
+    workspace_ready = ensure_flow_workspace(page, timeout_seconds=30)
     if not workspace_ready:
         raise RuntimeError(
             "FLOW_CANVAS_UNAVAILABLE: 未能从当前页面进入 Google Flow 工作台"
@@ -823,15 +920,12 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
 
                             if (failed) continue;
                             const t = (tile.innerText || '').toLowerCase();
-                            const creditTokens = [
-                                'credit', 'credits', 'quota', 'exhausted', 'insufficient',
-                                '积分', '点数', '额度', '配额', 'run out', 'out of'
-                            ];
-                            const hasCreditExhaustedText = creditTokens.some(tok => t.includes(tok)) && (
-                                t.includes('0') || t.includes('no ') || t.includes('not enough')
-                                || t.includes('insufficient') || t.includes('out of') || t.includes('exhausted')
-                                || t.includes('不足') || t.includes('已用完') || t.includes('耗尽')
-                                || t.includes('无可用') || t.includes('没有') || t.includes('缺少')
+                            const hasCreditExhaustedText = (
+                                /\\b(out of credits?|insufficient credits?|not enough credits?|credits? exhausted|credits? depleted|no credits? left|resource_exhausted|quota_exhausted|quota exceeded)\\b/i.test(t)
+                                || /(?<!\\d)0\\s*(?:(?:google\\s+)?flow\\s+)?credits?\\b/i.test(t)
+                                || /(?:credits?|credit\\s+balance|积分|点数|额度|配额|余额)[:：=为是]\\s*0(?!\\d)/i.test(t)
+                                || /(积分不足|没有足够的积分|积分已用完|积分已耗尽|积分耗尽|点数不足|点数已用完|点数已耗尽|额度不足|额度已用完|额度耗尽|配额不足|配额已用完|配额耗尽|无可用积分|无可用点数)/.test(t)
+                                || /(?<!\\d)0\\s*(?:积分|点数)(?!\\d)/.test(t)
                             );
                             const hasFailText = t.includes('failed') || t.includes('something went wrong')
                                              || t.includes('unusual activity') || t.includes('help center')
@@ -1006,15 +1100,12 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
 
                                 if (failed) continue;
                                 const t = (tile.innerText || '').toLowerCase();
-                                const creditTokens = [
-                                    'credit', 'credits', 'quota', 'exhausted', 'insufficient',
-                                    '积分', '点数', '额度', '配额', 'run out', 'out of'
-                                ];
-                                const hasCreditExhaustedText = creditTokens.some(tok => t.includes(tok)) && (
-                                    t.includes('0') || t.includes('no ') || t.includes('not enough')
-                                    || t.includes('insufficient') || t.includes('out of') || t.includes('exhausted')
-                                    || t.includes('不足') || t.includes('已用完') || t.includes('耗尽')
-                                    || t.includes('无可用') || t.includes('没有') || t.includes('缺少')
+                                const hasCreditExhaustedText = (
+                                    /\\b(out of credits?|insufficient credits?|not enough credits?|credits? exhausted|credits? depleted|no credits? left|resource_exhausted|quota_exhausted|quota exceeded)\\b/i.test(t)
+                                    || /(?<!\\d)0\\s*(?:(?:google\\s+)?flow\\s+)?credits?\\b/i.test(t)
+                                    || /(?:credits?|credit\\s+balance|积分|点数|额度|配额|余额)[:：=为是]\\s*0(?!\\d)/i.test(t)
+                                    || /(积分不足|没有足够的积分|积分已用完|积分已耗尽|积分耗尽|点数不足|点数已用完|点数已耗尽|额度不足|额度已用完|额度耗尽|配额不足|配额已用完|配额耗尽|无可用积分|无可用点数)/.test(t)
+                                    || /(?<!\\d)0\\s*(?:积分|点数)(?!\\d)/.test(t)
                                 );
                                 const hasFailText = t.includes('failed') || t.includes('something went wrong')
                                                  || t.includes('unusual activity') || t.includes('help center')
@@ -1389,7 +1480,14 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     result["status"] = "success"
                     result["image_urls"] = local_paths
                     result["message"] = f"成功生成 {len(local_paths)} 张候选图"
-                    log(f"🎉 [4选1 智能候选] 4x 批量生成完成，共获得 {len(local_paths)} 张候选图", "GoogleFX")
+                    try:
+                        final_url = str(getattr(page, "url", "") or "")
+                        if "/project/" in final_url:
+                            result["project_url"] = final_url
+                            req.project_url = final_url
+                    except Exception:
+                        pass
+                    log(f"🎉 [4选1 智能候选] 4x 批量生成完成，共获得 {len(local_paths)} 张候选图 (project_url: {result.get('project_url')})", "GoogleFX")
                     return result
                 else:
                     raise RuntimeError("4选1 候选图生成未捕获到有效图片")
@@ -1676,6 +1774,14 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
         #         browser.close()
         #     except Exception:
         #         pass  # CDP 连接模式下 close() 会抛出异常，这是预期行为
+
+    try:
+        final_url = str(getattr(page, "url", "") or "")
+        if "/project/" in final_url:
+            result["project_url"] = final_url
+            req.project_url = final_url
+    except Exception:
+        pass
 
     return result
 

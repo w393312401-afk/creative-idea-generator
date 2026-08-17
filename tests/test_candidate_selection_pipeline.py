@@ -500,4 +500,226 @@ Prompt: Frame 3
         assert res2["frames"][2].get("stale_lineage") is True      # Frame 3 (downstream stale)
 
 
+def test_single_canvas_project_url_propagation(temp_project):
+    """Test that project_url established in frame 1 is propagated to frame 2 and manifest."""
+    prompt_block = """IMAGE 1:
+Prompt: First step on canvas.
+IMAGE 2:
+Prompt: Second step on same canvas.
+"""
+    passed_project_urls = []
+
+    def fake_gen_candidates(config, title, item, reference, seq, candidate_count=4, project_url=None, **kwargs):
+        passed_project_urls.append((seq, project_url))
+        cand_dir = os.path.join(temp_project["frames_dir"], "candidates", f"frame_{seq:03d}")
+        os.makedirs(cand_dir, exist_ok=True)
+        paths = []
+        for i in range(1, candidate_count + 1):
+            p = os.path.join(cand_dir, f"candidate_{i}.webp")
+            with open(p, "wb") as f:
+                f.write(f"fake_data_{seq}_{i}".encode('utf-8'))
+            paths.append(p)
+        # Mock writing candidates_meta.json with project_url returned from Flow
+        meta_payload = {
+            "sequence": seq,
+            "project_url": "https://labs.google/fx/tools/flow/project/flow-proj-12345",
+            "candidates": [{"index": i, "path": p, "fx_uuid": f"uuid-{seq}-{i}"} for i, p in enumerate(paths, 1)],
+        }
+        with open(os.path.join(cand_dir, "candidates_meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta_payload, f)
+        return paths
+
+    def fake_eval(config, prompt_text, reference_path, candidate_paths, seq, on_progress=None):
+        return {
+            "best_index": 1,
+            "selection_reason": "test",
+            "candidates": [{"index": i + 1, "score": 90, "strengths": "ok", "defects": ""} for i in range(len(candidate_paths))]
+        }
+
+    with patch.object(csp, "generate_frame_candidates", side_effect=fake_gen_candidates), \
+         patch.object(csp, "evaluate_and_select_best_candidate", side_effect=fake_eval), \
+         patch.object(csp, "_generate_full_collage_from_frames", return_value="frames/collage.jpg"):
+
+        result = csp.run_candidate_selection_frame_sequence(
+            config={},
+            title=temp_project["project_name"],
+            prompt_block=prompt_block,
+            candidate_count=4
+        )
+
+    # Frame 1 started with None, Frame 2 received the project_url from Frame 1
+    assert passed_project_urls[0] == (1, None)
+    assert passed_project_urls[1] == (2, "https://labs.google/fx/tools/flow/project/flow-proj-12345")
+
+    # Manifest contains project_url and google_fx_project_url
+    manifest_path = os.path.join(temp_project["project_dir"], "manifest.json")
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        m = json.load(f)
+    assert m.get("project_url") == "https://labs.google/fx/tools/flow/project/flow-proj-12345"
+    assert m.get("google_fx_project_url") == "https://labs.google/fx/tools/flow/project/flow-proj-12345"
+    assert result["frames"][0]["fx_project_url"] == "https://labs.google/fx/tools/flow/project/flow-proj-12345"
+    assert result["frames"][1]["fx_project_url"] == "https://labs.google/fx/tools/flow/project/flow-proj-12345"
+
+
+
+
+
+def _fx_service_stub(project_url, seen_reqs, status="success"):
+    """Stub Google FX service that records every ImageBatchRequest it receives."""
+    from PIL import Image
+
+    def _fake_batch(req):
+        seen_reqs.append(req)
+        out_dir = req.output_path
+        os.makedirs(out_dir, exist_ok=True)
+        files = []
+        for idx in range(4):
+            uuid = f"{idx}{idx}{idx}{idx}{idx}{idx}{idx}{idx}-1111-1111-1111-111111111111"
+            fpath = os.path.join(out_dir, f"fx_{idx}_{uuid}.jpg")
+            Image.new("RGB", (32, 32), color="green").save(fpath, "JPEG")
+            files.append(fpath)
+        return {"status": status, "image_urls": files, "project_url": project_url}
+
+    svc = MagicMock()
+    svc._generate_images_batch_google_fx.side_effect = _fake_batch
+    return svc
+
+
+def _run_fx_candidates(temp_project, seqs, project_url, canvas_state, seen_reqs, status="success"):
+    svc = _fx_service_stub(project_url, seen_reqs, status=status)
+    with patch("candidate_selection_pipeline._get_google_fx_image_service", return_value=(svc, None)), \
+         patch("candidate_selection_pipeline._fx_image_model", return_value="imagen-3.0"):
+        for seq in seqs:
+            csp.generate_frame_candidates(
+                config={"imageBackend": "google_fx"},
+                title=temp_project["project_name"],
+                item={"prompt": f"beat {seq}"},
+                reference_path=None,
+                seq=seq,
+                candidate_count=4,
+                frames_dir=temp_project["frames_dir"],
+                canvas_state=canvas_state,
+            )
+
+
+def test_canvas_state_binds_once_and_reuses_project_url(temp_project):
+    """第 1 帧新建画布，后续帧只透传 project_url、绝不再要求新画布，且不再换号。"""
+    seen = []
+    state = {}
+    _run_fx_candidates(temp_project, [1, 2, 3], "https://labs.google/fx/tools/flow/project/p-1", state, seen)
+
+    assert [r.require_fresh_canvas for r in seen] == [True, False, False]
+    assert [r.project_url for r in seen] == [
+        None,
+        "https://labs.google/fx/tools/flow/project/p-1",
+        "https://labs.google/fx/tools/flow/project/p-1",
+    ]
+    # 画布已绑定 → 锁号，换号会脱离这块画布
+    assert [r.allow_account_switch for r in seen] == [True, False, False]
+    assert state["project_url"] == "https://labs.google/fx/tools/flow/project/p-1"
+    assert state["opened"] is True
+
+
+def test_canvas_reused_on_route_less_flow_variant(temp_project):
+    """没有 /project/ 路由的 Flow 变体：拿不到 project_url 也不能每帧重开画布。"""
+    seen = []
+    state = {}
+    _run_fx_candidates(temp_project, [1, 2, 3], None, state, seen)
+
+    assert [r.require_fresh_canvas for r in seen] == [True, False, False]
+    assert state.get("project_url") is None
+    assert state["opened"] is True
+
+
+def test_failed_canvas_keeps_requiring_fresh_canvas(temp_project):
+    """画布没开成的失败不得记账，否则下一帧会跑进上一个任务的画布。"""
+    seen = []
+    state = {}
+    _run_fx_candidates(temp_project, [1, 2], None, state, seen, status="failed")
+
+    assert [r.require_fresh_canvas for r in seen] == [True, True]
+    assert not state.get("opened")
+
+
+def test_subset_rerun_without_binding_still_opens_own_canvas(temp_project):
+    """子集重跑（不含第 1 帧）且 manifest 无绑定时，首帧仍必须新建画布。"""
+    seen = []
+    state = {}
+    _run_fx_candidates(temp_project, [5, 6], "https://labs.google/fx/tools/flow/project/p-9", state, seen)
+
+    assert [r.require_fresh_canvas for r in seen] == [True, False]
+
+
+def test_candidate_selection_skips_existing_frames_and_resumes(temp_project):
+    """整单 4选1 模式下自动跳过已存在的帧，从未生成的槽位开始生成，并以前一帧为底图。"""
+    prompt_block = """IMAGE 1:
+Prompt: First step done.
+IMAGE 2:
+Prompt: Second step to generate.
+IMAGE 3:
+Prompt: Third step to generate.
+"""
+    # 模拟第 1 帧已经生成并落盘
+    img1_path = os.path.join(temp_project["frames_dir"], "img_001.webp")
+    with open(img1_path, "wb") as f:
+        f.write(b"fake_existing_frame_1")
+
+    # 预设 manifest 中第 1 帧记录
+    manifest_path = os.path.join(temp_project["project_dir"], "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "title": temp_project["project_name"],
+            "frames": [{
+                "sequence": 1,
+                "slot": 1,
+                "file": "frames/img_001.webp",
+                "url": "/frames/img_001.webp",
+                "prompt": "First step done.",
+            }]
+        }, f)
+
+    generated_seqs = []
+    received_references = {}
+
+    def fake_gen_candidates(config, title, item, reference, seq, candidate_count=4, **kwargs):
+        generated_seqs.append(seq)
+        received_references[seq] = reference
+        cand_dir = os.path.join(temp_project["frames_dir"], "candidates", f"frame_{seq:03d}")
+        os.makedirs(cand_dir, exist_ok=True)
+        paths = []
+        for i in range(1, candidate_count + 1):
+            p = os.path.join(cand_dir, f"candidate_{i}.webp")
+            with open(p, "wb") as f:
+                f.write(f"cand_{seq}_{i}".encode('utf-8'))
+            paths.append(p)
+        return paths
+
+    def fake_eval(config, prompt_text, reference_path, candidate_paths, seq, on_progress=None):
+        return {
+            "best_index": 1,
+            "selection_reason": f"good_{seq}",
+            "candidates": [{"index": i + 1, "score": 90, "strengths": "ok", "defects": ""} for i in range(len(candidate_paths))]
+        }
+
+    with patch.object(csp, "generate_frame_candidates", side_effect=fake_gen_candidates), \
+         patch.object(csp, "evaluate_and_select_best_candidate", side_effect=fake_eval), \
+         patch.object(csp, "_generate_full_collage_from_frames", return_value="frames/collage.jpg"):
+
+        res = csp.run_candidate_selection_frame_sequence(
+            config={},
+            title=temp_project["project_name"],
+            prompt_block=prompt_block,
+            target_sequences=None,
+            candidate_count=4
+        )
+
+    # 1. 验证第 1 帧被跳过，只生成了第 2 帧和第 3 帧
+    assert generated_seqs == [2, 3]
+    # 2. 验证第 2 帧以已存在的第 1 帧作为图生图参考底图
+    assert received_references[2] == img1_path
+    # 3. 验证最终 manifest 中包含全部 3 帧
+    assert len(res["frames"]) == 3
+    assert res["frames"][0]["sequence"] == 1
+    assert res["frames"][1]["sequence"] == 2
+    assert res["frames"][2]["sequence"] == 3
 

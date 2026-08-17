@@ -271,8 +271,10 @@ def test_is_credit_exhausted_message_comprehensive():
     assert credit.is_credit_exhausted_message("0 credits remaining") is True
     assert credit.is_credit_exhausted_message("Credits: 0") is True
     assert credit.is_credit_exhausted_message("0 Google Flow credits") is True
+    assert credit.is_credit_exhausted_message("0 credits") is True
+    assert credit.is_credit_exhausted_message("0 credit") is True
     assert credit.is_credit_exhausted_message("Resource_exhausted: quota exceeded") is True
-    assert credit.is_credit_exhausted_message("Upgrade plan to get more credits") is True
+    assert credit.is_credit_exhausted_message("Not enough Google Flow and AI credits to perform this action") is True
 
     # 中文关键词与变体
     assert credit.is_credit_exhausted_message("当前账号积分不足") is True
@@ -285,12 +287,42 @@ def test_is_credit_exhausted_message_comprehensive():
     assert credit.is_credit_exhausted_message("配额已耗尽") is True
     assert credit.is_credit_exhausted_message("剩余 0 积分") is True
     assert credit.is_credit_exhausted_message("积分: 0") is True
+    assert credit.is_credit_exhausted_message("0 积分") is True
+    assert credit.is_credit_exhausted_message("0积分") is True
+    assert credit.is_credit_exhausted_message("0 点数") is True
+    assert credit.is_credit_exhausted_message("0点数") is True
     assert credit.is_credit_exhausted_message("点数余额为 0") is True
+    assert credit.is_credit_exhausted_message("积分余额为 0") is True
+    assert credit.is_credit_exhausted_message("无可用积分") is True
 
-    # 正常非积分耗尽报错
+    # 正常正数积分（严防以 0 结尾的正数被子串 "0 credits" / "0积分" 误伤）
+    assert credit.is_credit_exhausted_message("100 credits") is False
+    assert credit.is_credit_exhausted_message("100 Google Flow credits") is False
+    assert credit.is_credit_exhausted_message("1000 credits") is False
+    assert credit.is_credit_exhausted_message("500 credits") is False
+    assert credit.is_credit_exhausted_message("50 credits") is False
+    assert credit.is_credit_exhausted_message("200 credits") is False
+    assert credit.is_credit_exhausted_message("10 credits") is False
+    assert credit.is_credit_exhausted_message("1 credit") is False
+    assert credit.is_credit_exhausted_message("100积分") is False
+    assert credit.is_credit_exhausted_message("500积分") is False
+    assert credit.is_credit_exhausted_message("1000 积分") is False
+    assert credit.is_credit_exhausted_message("50 点数") is False
+    assert credit.is_credit_exhausted_message("100点数") is False
+    assert credit.is_credit_exhausted_message("Credits: 100") is False
+    assert credit.is_credit_exhausted_message("Credits: 50") is False
+    assert credit.is_credit_exhausted_message("剩余 100 积分") is False
+    assert credit.is_credit_exhausted_message("积分余额: 500") is False
+
+    # 正常非积分耗尽报错、营销文案与进度数字
     assert credit.is_credit_exhausted_message("未找到底部配置按钮") is False
     assert credit.is_credit_exhausted_message("网络连接超时") is False
     assert credit.is_credit_exhausted_message("Target page is closed") is False
+    assert credit.is_credit_exhausted_message("0% generating") is False
+    assert credit.is_credit_exhausted_message("seed: 0, 1080p, 1 credit") is False
+    assert credit.is_credit_exhausted_message("Daily Bonus: Enjoy 50 extra credits") is False
+    assert credit.is_credit_exhausted_message("Upgrade plan to get more credits") is False
+    assert credit.is_credit_exhausted_message("Rate limit exceeded, please retry in 5s") is False
     assert credit.is_credit_exhausted_message("") is False
 
 
@@ -319,9 +351,18 @@ def test_detect_page_credit_exhaustion():
     assert res2 is not None
     assert "0" in res2
 
-    # 3. 正常页面
+    # 3. 正常正数页面（1050 / 100 / 500 / 50 积分均不能被误判）
     p3 = DummyDialogPage(dialog_texts=[], credit_text="1050 Google Flow credits")
     assert credit.detect_page_credit_exhaustion(p3) is None
+
+    p4 = DummyDialogPage(dialog_texts=[], credit_text="100 Google Flow credits")
+    assert credit.detect_page_credit_exhaustion(p4) is None
+
+    p5 = DummyDialogPage(dialog_texts=[], credit_text="500 Google Flow credits")
+    assert credit.detect_page_credit_exhaustion(p5) is None
+
+    p6 = DummyDialogPage(dialog_texts=[], credit_text="50 Google Flow credits")
+    assert credit.detect_page_credit_exhaustion(p6) is None
 
 
 def test_is_manageable_user_page_and_find_or_create_page_exclusion():

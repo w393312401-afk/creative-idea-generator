@@ -784,18 +784,46 @@ def attempt_auto_login(page, user_id=None, context_label="Flow导航", cancel_ch
         return False
 
 
+# 崩溃页的"证据"必须是崩溃页独有的控件。整份 flow_project_error_btn 不能直接拿来
+# **判定**：它末尾那两条 `button:has(i:text('arrow_back'))` 是通用返回箭头，正常项目
+# 画布的页头一直挂着它——用它判崩溃，等于每次进画布都判一次崩溃。
+_FLOW_CRASH_ONLY_BTNS = (
+    "button:has-text('Back to projects')",
+    "button:has-text('Back to project')",
+    "button:has-text('返回项目')",
+    "button:has-text('Kembali ke project')",
+    "button:has-text('Kembali ke proyek')",
+    "a:has-text('Back to projects')",
+    "a:has-text('返回项目')",
+)
+_FLOW_CRASH_TEXTS = ("something went wrong", "出错了", "terjadi kesalahan")
+
+
 def _flow_project_crashed(page) -> bool:
-    """检测是否停留在项目崩溃/失效页面（例如 'Something went wrong.' + 'Back to projects'）"""
+    """检测是否停留在项目崩溃/失效页面（例如 'Something went wrong.' + 'Back to projects'）。
+
+    ⚠️ 2026-08-17：这个判定曾经把**健康画布**判成崩溃页，整条单画布复用因此从未生效。
+    两个误判源：
+    1. 页头的通用返回箭头 `arrow_back`（见 _FLOW_CRASH_ONLY_BTNS 的说明）；
+    2. 画布上任意一张 Failed 卡片的正文就是 "Something went wrong"
+       （与 _count_error_cards 认的是同一串文案），而这里是全 body 子串匹配。
+    误判的代价不是多等一会儿：`ensure_flow_workspace` 会"恢复"——把页面退回项目列表，
+    于是绑定的画布丢了、`_open_image_flow_canvas` 找不到编辑器就新建一块空白画布，
+    上一帧的结果 tile 不在新画布上，参考图只能一张张重新上传。
+    工作台还能用就绝不是崩溃页，这是最可靠的一条否证，放在最前面。
+    """
     try:
-        from ..ui_selectors import UI_SELECTORS
-        selectors = UI_SELECTORS.get("google_fx", {}).get("flow_project_error_btn", [])
+        # 只认"编辑器可见"这一条否证，不用 _flow_workspace_ready：后者把项目列表页的
+        # New project 按钮也算 ready，而真正的崩溃页可能还挂着同一套导航外壳。
+        if _any_visible(page, ["textarea", "[contenteditable='true']"]):
+            return False
     except Exception:
-        selectors = ["button:has-text('Back to projects')", "button:has-text('返回项目')"]
-    if _any_visible(page, selectors):
+        pass
+    if _any_visible(page, _FLOW_CRASH_ONLY_BTNS):
         return True
     try:
         body_text = (page.inner_text("body", timeout=500) or "").lower()
-        if "something went wrong" in body_text or "出错了" in body_text or "terjadi kesalahan" in body_text:
+        if any(token in body_text for token in _FLOW_CRASH_TEXTS):
             return True
     except Exception:
         pass

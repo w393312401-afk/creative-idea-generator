@@ -656,6 +656,9 @@ def _purge_extract_products(directory, state=None):
     shutil.rmtree(os.path.join(directory, 'review_frames'), ignore_errors=True)
     shutil.rmtree(os.path.join(directory, 'storyboard'), ignore_errors=True)
     shutil.rmtree(os.path.join(directory, '.pass_b_sheets'), ignore_errors=True)
+    # 峰值复核的原生特写切片（reverse.verify_peak_frames 写进 roi_patches/）。切片名字
+    # 是从帧名派生的，换 fps 重抽之后帧名整套变化，不删就是一层层白留在盘上。
+    shutil.rmtree(os.path.join(directory, 'roi_patches'), ignore_errors=True)
     if os.path.isdir(directory):
         for name in os.listdir(directory):
             if (name.endswith('_collage_thumb.jpg')

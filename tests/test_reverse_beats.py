@@ -1887,6 +1887,229 @@ class TestAutofixBeats(unittest.TestCase):
         self.assertEqual(spaces, ['exterior', 'exterior', 'interior'])
 
 
+class TestMicroEngineeringForensics(unittest.TestCase):
+    """验证微观工程细节提取、细粒度实体本体规范化与 ROI 局部切片生成。"""
+
+    def test_canonicalize_expanded_entities(self):
+        self.assertEqual(reverse.canonicalize_entity_phrase('18V cordless impact driver'), 'cordless impact driver')
+        self.assertEqual(reverse.canonicalize_entity_phrase('pneumatic framing nail gun'), 'framing nailer')
+        self.assertEqual(reverse.canonicalize_entity_phrase('black phosphate drywall screws'), 'drywall screws')
+        self.assertEqual(reverse.canonicalize_entity_phrase('polyurethane expanding spray foam'), 'expanding PU foam sealant')
+        self.assertEqual(reverse.canonicalize_entity_phrase('9mm OSB board'), 'OSB sheathing')
+        self.assertEqual(reverse.canonicalize_entity_phrase('heavy-duty construction adhesive'), 'construction adhesive')
+        self.assertEqual(reverse.canonicalize_entity_phrase('laser torpedo level'), 'spirit level')
+        self.assertEqual(reverse.canonicalize_entity_phrase('tuck tape seam sealing'), 'seam sealing tape')
+
+    def test_parse_facts_array_micro_details(self):
+        raw_json = json.dumps([{
+            'frame': 'review_005.png',
+            'subject': 'worker securing wall studs',
+            'spatial_zones': {'facade_and_walls': 'stud framing', 'floor': 'concrete'},
+            'materials': ['2x4 lumber', 'black poly sheeting'],
+            'material_specs': ['2x4 SPF timber studs (38x89mm)', '9mm OSB sheathing with raw matte texture'],
+            'tools': ['cordless impact driver', 'spirit level'],
+            'tool_specifics': ['18V brushless impact driver with magnetic bit holder'],
+            'fastening_and_bonding': ['black drywall screws', 'construction adhesive'],
+            'workers_present': True,
+            'completion_extent': 'left wall framed',
+            'traces': ['sawdust on floor'],
+            'micro_traces': ['fine sawdust along cut lines', 'pencil layout cross-marks'],
+            'confidence': 0.95
+        }])
+        facts = reverse._parse_facts_array(raw_json, ['review_005.png'])
+        self.assertIn('review_005.png', facts)
+        fact = facts['review_005.png']
+        self.assertEqual(fact['materials'], ['timber framing studs', 'vapor barrier membrane'])
+        self.assertEqual(fact['fastening_and_bonding'], ['drywall screws', 'construction adhesive'])
+        self.assertEqual(fact['material_specs'], ['2x4 SPF timber studs (38x89mm)', '9mm OSB sheathing with raw matte texture'])
+        self.assertEqual(fact['tool_specifics'], ['18V brushless impact driver with magnetic bit holder'])
+        self.assertEqual(fact['micro_traces'], ['fine sawdust along cut lines', 'pencil layout cross-marks'])
+
+    def test_drill_variants_collapse_to_one_entity(self):
+        """钻的各种叫法必须归一到同一个实体。
+
+        这条规则被删过一次（v3 重写词典时整条 drill 规则没了）。`tools` 是
+        `_WINDOW_FACT_FIELDS` 成员，同一把钻在相邻帧里叫 drill / cordless drill 就会被
+        逐窗统计读成"一个消失、一个出现"，节拍边界跟着错位——而这不会让任何校验器变红。
+        """
+        for phrase in ('drill', 'power drill', 'cordless drill', 'hammer drill',
+                       'rotary drill', 'electric drill', 'cordless drill driver'):
+            self.assertEqual(reverse.canonicalize_entity_phrase(phrase), 'cordless drill', phrase)
+
+    def test_screw_gun_is_a_driver_not_a_nailer(self):
+        """射钉枪那条规则不许再吃 `screw`——螺丝枪打的是螺丝，不是钉子。"""
+        for phrase in ('screw gun', 'screwdriver', 'impact driver', 'cordless impact driver'):
+            self.assertEqual(reverse.canonicalize_entity_phrase(phrase),
+                             'cordless impact driver', phrase)
+        for phrase in ('nail gun', 'pneumatic nailer', 'brad nailer', 'framing nailer'):
+            self.assertEqual(reverse.canonicalize_entity_phrase(phrase), 'framing nailer', phrase)
+
+    def test_level_prefix_is_required(self):
+        """`level` 的前缀不能全可选，否则把根本不是器具的短语也归成水平尺。"""
+        for phrase in ('level', 'spirit level', 'laser level', 'bubble level'):
+            self.assertEqual(reverse.canonicalize_entity_phrase(phrase), 'spirit level', phrase)
+        for phrase in ('floor level', 'eye level', 'water level in the trench'):
+            self.assertEqual(reverse.canonicalize_entity_phrase(phrase), phrase)
+
+    def test_parse_facts_array_strict_drops_unmatched_names(self):
+        """峰值复核那一路给的图片多于帧数，按位兜底会把特写的读数挂到别的帧上。
+
+        strict=True 必须只认名字对得上的对象——宁可这一帧不复核。
+        """
+        raw = json.dumps([
+            {'frame': 'a.png', 'subject': 'real a'},
+            {'frame': 'detail crop 1', 'subject': 'CROP LEAK'},
+            {'frame': 'detail crop 2', 'subject': 'CROP LEAK'},
+            {'frame': 'b.png', 'subject': 'real b'},
+        ])
+        expected = ['a.png', 'b.png', 'c.png']
+
+        loose = reverse._parse_facts_array(raw, expected)
+        self.assertEqual(loose['c.png']['subject'], 'CROP LEAK',
+                         '按位兜底本来就会串位，这里固定住旧行为以说明 strict 的必要性')
+
+        strict = reverse._parse_facts_array(raw, expected, strict=True)
+        self.assertEqual(sorted(strict), ['a.png', 'b.png'])
+        self.assertEqual(strict['a.png']['subject'], 'real a')
+        self.assertEqual(strict['b.png']['subject'], 'real b')
+
+    def test_merge_verified_fact_keeps_pass_a_on_blank_fields(self):
+        """复核是增强不是门禁——这条得落到字段一级。
+
+        复核提示词的重心在 material_specs / tool_specifics 上，模型漏答 materials/tools
+        是常事；整条替换会把 Pass A 已经读对的实体清成空表，而 peak 帧正是节拍边界。
+        """
+        base = {
+            'frame': 'f1.png', 'timestamp': 1.5, 'subject': 'pass A subject',
+            'materials': ['plywood sheathing'], 'tools': ['cordless drill'],
+            'traces': ['sawdust'], 'workers_present': True, 'confidence': 0.5,
+        }
+        refined = {
+            'frame': 'f1.png', 'timestamp': None, 'subject': 'verified subject',
+            'materials': [], 'tools': [], 'traces': ['fresh sawdust along cut lines'],
+            'material_specs': ['9mm OSB sheathing'], 'workers_present': False,
+            'confidence': 0.9,
+        }
+        merged = reverse._merge_verified_fact(base, refined, 'strong-model')
+
+        # 漏答的字段落回 Pass A
+        self.assertEqual(merged['materials'], ['plywood sheathing'])
+        self.assertEqual(merged['tools'], ['cordless drill'])
+        # 答了的字段以复核为准
+        self.assertEqual(merged['subject'], 'verified subject')
+        self.assertEqual(merged['traces'], ['fresh sawdust along cut lines'])
+        self.assertEqual(merged['material_specs'], ['9mm OSB sheathing'])
+        # bool/数值即便是 falsy 也算答了——workers_present: false 正是复核要给的结论
+        self.assertIs(merged['workers_present'], False)
+        self.assertEqual(merged['confidence'], 0.9)
+        # timestamp 一律以 Pass A 为准：复核提示词里没有时间轴
+        self.assertEqual(merged['timestamp'], 1.5)
+        self.assertEqual(merged['verified_by'], 'strong-model')
+
+    def test_extract_roi_patches_generation(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as td:
+            img_path = os.path.join(td, 'frame_1080p.png')
+            # 创建一张 1920x1080 的临时测试图像
+            im = Image.new('RGB', (1920, 1080), color=(120, 150, 180))
+            im.save(img_path)
+
+            patches = reverse.extract_roi_patches(img_path, patch_size=512, max_patches=2, output_dir=td)
+            self.assertEqual(len(patches), 2)
+            for p in patches:
+                self.assertTrue(os.path.exists(p))
+                with Image.open(p) as p_im:
+                    self.assertEqual(p_im.size, (512, 512))
+
+    def test_extract_roi_patches_without_output_dir(self):
+        """output_dir 省略时也要真的出切片。
+
+        `tempfile` 曾漏了 import，NameError 被函数里的 except 吞掉，整个特写功能静默
+        退回整帧——校验器全绿、日志一行没有。
+        """
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as td:
+            img_path = os.path.join(td, 'frame_1080p.png')
+            Image.new('RGB', (1920, 1080), color=(120, 150, 180)).save(img_path)
+
+            patches = reverse.extract_roi_patches(img_path, patch_size=512, max_patches=2)
+            self.assertEqual(len(patches), 2)
+            self.assertNotIn(img_path, patches)
+            for p in patches:
+                with Image.open(p) as p_im:
+                    self.assertEqual(p_im.size, (512, 512))
+
+    def test_extract_roi_patches_limits_overlap(self):
+        """两块 ROI 不许几乎重合。
+
+        两块各自独立贴边内推时，16:9 上会重叠 55%——第二张图基本是第一张的副本，白花
+        载荷还让"哪张图属于哪一帧"更难对位。矮画幅则应当只出一块，而不是出两块副本。
+        """
+        from PIL import Image
+
+        # 切片是以 quality=85 存成 JPEG 的，逐像素编码会被有损压缩打坏，所以这里用整块
+        # 平均亮度反推位置——线性渐变下平均亮度和 top 一一对应，而 JPEG 保得住均值。
+        def gradient(path, w, h):
+            """纵向线性渐变：第 y 行的亮度是 255 * y / h。"""
+            im = Image.new('L', (w, h))
+            im.putdata([(y * 255) // h for y in range(h) for _ in range(w)])
+            im.convert('RGB').save(path)
+
+        def patches_of(path, patch_size=512):
+            return reverse.extract_roi_patches(path, patch_size=patch_size, max_patches=2,
+                                               output_dir=os.path.dirname(path))
+
+        def top_of(patch_path, h, patch_size=512):
+            """从切片平均亮度反推它在原图里的 top。"""
+            from PIL import ImageStat
+            with Image.open(patch_path) as im:
+                mean = ImageStat.Stat(im.convert('L')).mean[0]
+            # mean ≈ 255 * (top + patch_size / 2) / h
+            return mean * h / 255.0 - patch_size / 2.0
+
+        with tempfile.TemporaryDirectory() as td:
+            for w, h in ((1920, 1080), (3840, 2160), (1080, 1920)):
+                p = os.path.join(td, f'f_{w}x{h}.png')
+                gradient(p, w, h)
+                patches = patches_of(p)
+                self.assertEqual(len(patches), 2, f'{w}x{h} 应当出两块')
+
+                # 重叠不许超过 patch 的 25%（即两个 top 至少相差 0.75 * patch）。
+                # 留 8px 容差给 JPEG 与整数取整。
+                sep = abs(top_of(patches[0], h) - top_of(patches[1], h))
+                self.assertGreaterEqual(sep, int(512 * 0.75) - 8,
+                                        f'{w}x{h} 两块重叠超过 25%（top 间距仅 {sep:.0f}px）')
+
+            # 画幅高度不足 1.75 * patch_size 时，第二块只会是第一块的副本，应当只出一块。
+            short = os.path.join(td, 'short.png')
+            gradient(short, 1280, 700)
+            self.assertEqual(len(patches_of(short)), 1)
+
+    def test_facts_digest_includes_micro_details(self):
+        facts = [{
+            'frame': 'f01.png',
+            'timestamp': 2.5,
+            'subject': 'framing',
+            'spatial_zones': {'facade_and_walls': 'studs'},
+            'completion_extent': 'half wall',
+            'materials': ['timber framing studs'],
+            'material_specs': ['2x4 SPF studs'],
+            'tools': ['cordless impact driver'],
+            'tool_specifics': ['18V impact driver'],
+            'fastening_and_bonding': ['drywall screws'],
+            'traces': ['dust'],
+            'micro_traces': ['fine sawdust'],
+            'workers_present': True,
+            'confidence': 0.9,
+        }]
+        digest = reverse._facts_digest(facts)
+        self.assertIn('mat_specs=2x4 SPF studs', digest)
+        self.assertIn('tool_specs=18V impact driver', digest)
+        self.assertIn('fasteners=drywall screws', digest)
+        self.assertIn('micro_traces=fine sawdust', digest)
+
+
+
 
 
 

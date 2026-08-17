@@ -142,7 +142,8 @@ def test_dead_bound_project_falls_back_to_a_fresh_canvas(monkeypatch):
     )
 
     assert image_service._open_image_flow_canvas(page, dead_project) == FRESH_PROJECT
-    assert page.goto_calls == [dead_project, WORKSPACE]
+    # 换新画布之前必须先重试进入绑定画布（Flow 的崩溃页多半是瞬时的）。
+    assert page.goto_calls == [dead_project] * 3 + [WORKSPACE]
 
 
 def test_flow_project_id_extraction():
@@ -177,3 +178,65 @@ def test_prepare_canvas_never_reopens_history_for_a_fresh_task():
     # 最新历史项目正是上一个任务的画布。
     assert "/project/" not in fresh_branch
     assert "_click_new_project_button" in fresh_branch
+
+
+# ── 2026-08-17 现场：绑定画布撞崩溃页，整条帧链被换到空白新画布上 ──
+# AdsPower 每个请求都会把 profile 重新拉起，绑定的项目页于是常在冷加载时撞上
+# Flow 的 "Something went wrong"。ensure_flow_workspace 里的崩溃恢复会把页面弹回
+# **工作台列表**然后返回 True，而这里原来只看 workspace_ready——"回到列表"被当成
+# "已进入绑定画布"，找不到编辑器就去点 New project。日志里的表现是每帧一个新
+# project_url，加上一串「画布上挂不到该参考图，改用上传方式」。
+
+class _CrashOncePage(_StubPage):
+    """第一次进项目给崩溃页，reload 之后才正常——真机上最常见的形态。"""
+
+    def __init__(self, url, crash_times=1):
+        super().__init__(url)
+        self.crash_left = crash_times
+        self.reload_calls = 0
+        self.crashed = False
+
+    def goto(self, url, timeout=None, wait_until=None):
+        super().goto(url, timeout=timeout, wait_until=wait_until)
+        self.crashed = self.crash_left > 0
+
+    def reload(self, timeout=None, wait_until=None):
+        self.reload_calls += 1
+        if self.crash_left > 0:
+            self.crash_left -= 1
+        self.crashed = self.crash_left > 0
+
+
+def test_bound_canvas_survives_a_transient_crash_page(monkeypatch):
+    page = _CrashOncePage(WORKSPACE)  # 崩溃恢复已经把我们弹回了工作台列表
+    _patch_canvas_env(
+        monkeypatch,
+        new_project=lambda *a, **k: pytest.fail("崩溃页是瞬时的，不该换新画布"),
+    )
+    monkeypatch.setattr(image_service, "_flow_project_crashed", lambda p: p.crashed)
+
+    assert image_service._open_image_flow_canvas(page, PREV_TASK_PROJECT) == PREV_TASK_PROJECT
+    assert page.reload_calls == 1
+    assert page.goto_calls == [PREV_TASK_PROJECT]
+
+
+def test_bounced_back_to_workspace_list_is_not_a_successful_entry(monkeypatch):
+    """崩溃恢复把我们留在工作台列表时，绝不能当作"已进入绑定画布"。"""
+    page = _StubPage(WORKSPACE)
+    created = []
+
+    def _new_project(target, confirm_timeout=10.0):
+        created.append(target.url)
+        target.url = FRESH_PROJECT
+        return True
+
+    _patch_canvas_env(monkeypatch, new_project=_new_project)
+    monkeypatch.setattr(image_service, "_flow_project_crashed", lambda p: False)
+    # goto 之后 URL 仍停在工作台列表 = Flow 把我们弹了回来
+    monkeypatch.setattr(_StubPage, "goto", lambda self, url, **k: self.goto_calls.append(url))
+
+    result = image_service._open_image_flow_canvas(page, PREV_TASK_PROJECT)
+
+    # 重试用尽后才允许新建，且新建必须走"回项目列表"的正规路径
+    assert page.goto_calls == [PREV_TASK_PROJECT] * 3 + [WORKSPACE]
+    assert result == FRESH_PROJECT

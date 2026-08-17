@@ -97,6 +97,26 @@ class ExtractedJobCase(ReplicaTempRootCase):
             return rp.run_extract(state, base_fps=base_fps), collage
 
 
+class TestPurgeExtractProducts(ReplicaTempRootCase):
+    def test_purge_clears_the_peak_verify_roi_patches(self):
+        """重抽帧要把峰值复核的原生特写切片一起清掉。
+
+        切片名是从帧名派生的，换 fps 重抽之后整套帧名都变，不删就是一层层白留在盘上。
+        """
+        directory = os.path.join(self.tmp, 'job_purge')
+        for sub in ('review_frames', 'storyboard', 'roi_patches'):
+            os.makedirs(os.path.join(directory, sub), exist_ok=True)
+        stale = os.path.join(directory, 'roi_patches', 'review_003_roi_action.jpg')
+        with open(stale, 'wb') as f:
+            f.write(b'stale-crop')
+
+        rp._purge_extract_products(directory)
+
+        self.assertFalse(os.path.exists(stale))
+        self.assertFalse(os.path.isdir(os.path.join(directory, 'roi_patches')))
+        self.assertFalse(os.path.isdir(os.path.join(directory, 'review_frames')))
+
+
 class TestExtractGate(ExtractedJobCase):
     def test_missing_collage_is_a_hard_failure(self):
         """手工跑时人会看到脚本 stdout 的 FAILED；产品化后没人看 stdout，

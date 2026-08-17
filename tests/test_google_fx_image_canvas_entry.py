@@ -132,7 +132,10 @@ def test_stale_bound_project_falls_back_to_project_home(monkeypatch):
     result = image_service._open_image_flow_canvas(page, stale_url)
 
     assert result.endswith("/replacement")
+    # 进不去的绑定画布要先重试几轮（崩溃页多半是瞬时的），全都失败才换新画布。
     assert page.goto_calls == [
+        (stale_url, 60000),
+        (stale_url, 60000),
         (stale_url, 60000),
         ("https://labs.google/fx/tools/flow", 60000),
     ]

@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import contextlib
 import time
 import shutil
 import re
@@ -13,7 +14,7 @@ from server_common import (
     OUTPUT_ROOT, _get_project_dir, _safe_project_name,
     IMG2IMG_CONTROL_PROMPT, IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT,
     resolve_cover_reference, project_cover_path,
-    apply_google_fx_runtime_overrides, fx_cancel_context,
+    apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
     read_manifest, write_manifest, GenerationCancelled, log,
     gate_setting, _get_account_pool_service, _select_pool_account,
 )
@@ -106,12 +107,22 @@ def _generate_single_api_candidate(config, prompt_text, reference_path, out_path
         _generate_image_edit(config, prompt_text, reference_path, out_path, control_prompt=ctrl_prompt)
 
 
-def generate_frame_candidates(config, title, item, reference_path, seq, candidate_count=4, on_progress=None, is_bridge=False, is_cut_head=False, is_turn=False, project_url=None, frames_dir=None):
+def generate_frame_candidates(config, title, item, reference_path, seq, candidate_count=4, on_progress=None, is_bridge=False, is_cut_head=False, is_turn=False, project_url=None, frames_dir=None, canvas_state=None):
     """
     Generate `candidate_count` candidate images for a given sequence step.
     Saves candidates to `outputs/<title>/frames/candidates/frame_{seq:03d}/candidate_{1..N}.webp`.
     Extracts & preserves Google FX UUIDs and supports single-canvas project_url reuse.
     Returns list of absolute candidate file paths.
+
+    ``canvas_state``：本次整条序列共用的画布账本（调用方持有并跨帧传同一个 dict）。
+    - ``project_url``：已绑定的 Flow 项目；有它就一路透传，禁止新建。
+    - ``opened``：本任务是否已经开出过自己的画布。**没有 project_url 不等于没开过
+      画布**——部分 Flow 变体的工作台没有 /project/ 路由，画布只能靠这个旗记账
+      （与 frame_generator 的 canvas_session['opened_accounts'] 同一套账）。用
+      ``seq == 1`` 代替它有两个方向都错：子集重跑（target_sequences 不含 1）永远
+      不要求新画布，会直接跑进上一个任务的画布；而路由缺失的账号上每帧都以为自己
+      是"还没开画布"，i2i 续链被打断成一次次重新上传。
+    - ``account_id``：画布是账号私有的，整条序列必须钉在同一个 AdsPower 账号上。
     """
     project_dir = _get_project_dir(title)
     if not frames_dir:
@@ -139,6 +150,9 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
     prompt_text = item.get('prompt', '')
 
     backend = (config.get('imageBackend') or 'api').strip().lower()
+    canvas_state = canvas_state if isinstance(canvas_state, dict) else {}
+    project_url = project_url or canvas_state.get('project_url')
+    canvas_opened = bool(canvas_state.get('opened') or project_url)
     returned_project_url = project_url
 
     if backend == 'google_fx':
@@ -167,14 +181,43 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
                 model=fx_model,
                 output_path=candidates_dir,
                 project_url=project_url,
-                require_fresh_canvas=(seq == 1 and not project_url),
+                # 只有"本任务还没有自己的画布"时才新建；已开出来的画布一律复用。
+                require_fresh_canvas=(not canvas_opened),
+                # 画布是账号私有的：换号必然脱离已绑定的画布，所以一旦画布建立
+                # 就锁号（与 frame_generator 迭代已绑定画布时的口径一致）。
+                allow_account_switch=(not canvas_opened),
                 generation_count=f"{candidate_count}x",
                 is_candidate_mode=True,
             )
-            fx_res = google_fx._generate_images_batch_google_fx(req)
+            # 取消/预算上下文必须显式建：没有它，FX 运行时里那一整排 _check_cancelled()
+            # 与 deadline_exceeded() 全是空转（理由见 server_common.fx_cancel_context）。
+            _cancel_fn = (lambda: bool(on_progress('cancel_check', None))) if on_progress else None
+            with contextlib.ExitStack() as _fx_stack:
+                _fx_account = canvas_state.get('account_id')
+                if _fx_account:
+                    # 画布是账号私有的：每帧都要在同一个账号上下文里连浏览器，
+                    # 否则解析到的是进程默认账号，绑定的 project_url 根本打不开。
+                    from integrations.google_fx.utils import account_binding
+                    _fx_stack.enter_context(account_binding.bound_task_account(_fx_account))
+                _fx_stack.enter_context(fx_cancel_context(_cancel_fn, deadline=fx_request_deadline()))
+                fx_res = google_fx._generate_images_batch_google_fx(req)
             if fx_res:
                 if fx_res.get('project_url'):
                     returned_project_url = fx_res.get('project_url')
+                    if project_url and returned_project_url != project_url:
+                        # 换画布 = 上一帧的结果 tile 不在了，i2i 只能靠重新上传接链。
+                        # 静默换绑会让"每帧都在上传做好的图"看起来像无缘无故发生。
+                        log('WARN', 'CANDIDATE_GEN',
+                            f"IMG {seq:03d} Flow 画布已换绑："
+                            f"{str(project_url).rsplit('/', 1)[-1][:8]} → "
+                            f"{str(returned_project_url).rsplit('/', 1)[-1][:8]}；"
+                            f"本帧起参考图改用上传方式挂载")
+                    canvas_state['project_url'] = returned_project_url
+                # 画布真的为本任务开出来了才记账：画布都没开成的失败
+                # （FLOW_CANVAS_UNAVAILABLE）必须让下一帧继续要求新画布，
+                # 否则重试就退回沿用上一个任务画布的老路。
+                if fx_res.get('status') in ('success', 'partial', 'ok'):
+                    canvas_state['opened'] = True
                 if fx_res.get('image_urls'):
                     fx_urls = fx_res['image_urls']
                     for idx, src_p in enumerate(fx_urls[:candidate_count]):
@@ -204,7 +247,11 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
                             'fx_uuid': cand_uuid,
                         })
         except Exception as e:
-            log('WARN', 'CANDIDATE_GEN', f"Google FX 批量候选生成异常 ({e})，退回 API 多候选生成")
+            # 这里静默退回 API 会同时丢掉画布与 UUID 续链（后续帧再也挂不上参考图
+            # tile），而日志只有一行 WARN。按 ERROR 记，并把异常类型带出来。
+            log('ERROR', 'CANDIDATE_GEN',
+                f"IMG {seq:03d} Google FX 批量候选生成失败（{type(e).__name__}: {e}），"
+                f"退回 API 多候选生成；本帧不参与 Flow 单画布串联")
 
     # If Google FX produced fewer candidates or backend is API, use API generation
     if len(candidate_paths) < candidate_count:
@@ -458,9 +505,35 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
 
     manifest_frames_by_seq = {f['sequence']: f for f in manifest.get('frames', [])}
     total_to_generate = len(target_sequences) if target_sequences is not None else len(prompts)
-    project_url = manifest.get('project_url')
+    project_url = manifest.get('project_url') or manifest.get('google_fx_project_url')
     backend = (config.get('imageBackend') or 'api').strip().lower()
-    
+
+    # 整条序列共用一块画布 = 整条序列必须钉在同一个 AdsPower 账号上，并且 FX 运行时
+    # 得先拿到本次配置。此前这里两件事都没做：账号由进程默认环境变量随缘解析（上一个
+    # 任务留下的值），额度耗尽时又会在帧与帧之间被换号救场——换号后原 project_url
+    # 打不开，兜底就新建画布，表现成"每帧一块新画布"。
+    fx_account_id = None
+    if backend == 'google_fx':
+        apply_google_fx_runtime_overrides(config)
+        try:
+            account_pool = _get_account_pool_service()
+        except Exception as pool_err:
+            log('WARN', 'CANDIDATE_GEN', f"号池服务不可用，帧序列沿用当前账号 ({pool_err})")
+            account_pool = None
+        pool_account_id = _select_pool_account(config, account_pool) if account_pool else None
+        if pool_account_id:
+            apply_google_fx_runtime_overrides(config)
+        fx_account_id = pool_account_id or (str(config.get('googleFxUserId') or '').strip() or None)
+        if fx_account_id:
+            log('INFO', 'CANDIDATE_GEN', f"本次帧序列钉定 Flow 账号 {fx_account_id}（单画布复用要求账号不变）")
+
+    # 单画布账本：跨帧透传（详见 generate_frame_candidates 的 canvas_state 说明）。
+    canvas_state = {
+        'project_url': project_url,
+        'opened': bool(project_url),
+        'account_id': fx_account_id,
+    }
+
     if on_progress:
         on_progress('start', {'total': total_to_generate, 'mode': 'candidate_selection', 'candidate_count': candidate_count})
 
@@ -479,6 +552,39 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
         if not should_generate:
             if os.path.exists(target_path):
                 previous_path = target_path
+            continue
+
+        already_exists = os.path.exists(target_path) and os.path.getsize(target_path) > 0
+        skip_generation = already_exists and (target_sequences is None)
+
+        if skip_generation:
+            previous_path = target_path
+            existing_frame = manifest_frames_by_seq.get(seq)
+            if not existing_frame:
+                rel_target_path = os.path.relpath(target_path, workspace_root).replace('\\', '/')
+                existing_frame = {
+                    'sequence': seq,
+                    'slot': seq,
+                    'file': rel_target_path,
+                    'url': '/' + rel_target_path if not rel_target_path.startswith('/') else rel_target_path,
+                    'prompt': item.get('prompt', ''),
+                    'meta': item.get('meta', ''),
+                    'quality_gate': 'auto_approved',
+                    'selection_mode': 'candidate_selection',
+                    'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                }
+                manifest_frames_by_seq[seq] = existing_frame
+                manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
+            if on_progress:
+                on_progress('frame', {
+                    'sequence': seq,
+                    'slot': seq,
+                    'current': len([f for f in manifest.get('frames', []) if f.get('file')]),
+                    'total': total_to_generate,
+                    'frame': existing_frame,
+                    'skipped': True,
+                    'message': f"IMG {seq:03d} 已存在，跳过重新生成",
+                })
             continue
 
         incoming_video = videos.get(seq - 1)
@@ -531,7 +637,15 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
             is_turn=is_turn,
             project_url=project_url,
             frames_dir=frames_dir,
+            canvas_state=canvas_state,
         )
+
+        # 画布绑定以 canvas_state 为准（内存直传），candidates_meta.json 只是留档：
+        # 元数据落盘在 try/except: pass 里，写失败时绑定不能跟着一起丢。
+        if canvas_state.get('project_url'):
+            project_url = canvas_state['project_url']
+            manifest['project_url'] = project_url
+            manifest['google_fx_project_url'] = project_url
 
         # Retrieve candidate metadata if saved
         cand_meta_map = {}
@@ -544,6 +658,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                     if meta_payload.get('project_url'):
                         project_url = meta_payload.get('project_url')
                         manifest['project_url'] = project_url
+                        manifest['google_fx_project_url'] = project_url
                     for c in meta_payload.get('candidates', []):
                         cand_meta_map[c.get('index')] = c
             except Exception:
@@ -623,6 +738,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
             'file': rel_target_path,
             'url': rel_target_path,
             'fx_uuid': best_uuid,
+            'fx_project_url': project_url,
             'prompt': item.get('prompt', ''),
             'reference': os.path.relpath(reference, workspace_root).replace('\\', '/') if reference else None,
             'quality_gate': 'auto_approved',
@@ -639,6 +755,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
         manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
         if project_url:
             manifest['project_url'] = project_url
+            manifest['google_fx_project_url'] = project_url
 
         try:
             update_manifest_stale_status(

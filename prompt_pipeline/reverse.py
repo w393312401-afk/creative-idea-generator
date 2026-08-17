@@ -23,38 +23,75 @@ import math
 import os
 import re
 import sys
+import tempfile
 import time
 
 import prompt_pipeline as pp
 
 
 # Pass A 的提示词版本号。改了 _PASS_A_SYSTEM 就必须改它，否则旧缓存会被当成新结果复用。
-PASS_A_PROMPT_VERSION = 'v2'
+PASS_A_PROMPT_VERSION = 'v3'
 
 # ── 实体规范化与消歧词典 ───────────────────────────────────────────────────
 #
 # 解决多模态模型在不同帧中对同一物理材质/器具用词漂移的问题（如上一帧叫 poly sheeting，
 # 下一帧叫 black vapor barrier），确保定长窗与阶梯统计不会产生虚假的出现与消失。
 _CANONICAL_ENTITY_PATTERNS = [
-    # 防潮与防水卷材
+    # 动力工具与气动设备（优先于紧固件和板材）
+    #
+    # 钻这一条必须排在冲击起子之前，且不许再被删掉：v3 重写时整条 drill 规则丢了一次，
+    # 于是 drill / power drill / hammer drill 在相邻帧里成了三个不同实体，逐窗统计
+    # （见 _WINDOW_FACT_FIELDS）把它读成"一个消失、一个出现"，节拍边界跟着错位。
+    # 排在前面是因为 "cordless drill driver" 这类合写必须归钻，不能被下面的 driver 吃掉。
+    (re.compile(r'\b(?:cordless|corded|power|electric|hammer|rotary)?\s*drill(?:\s*driver)?\b', re.I), 'cordless drill'),
+    # `screw gun` / `screwdriver` 归起子，不归射钉枪——所以射钉枪那条的前缀里不许有
+    # `screw`。它们同为 first-match-wins，射钉枪排在后面只是双保险。
+    (re.compile(r'\b(?:cordless|brushless|impact)?\s*(?:impact\s*driver|driver)\b|\b(?:screw\s*gun|screwdriver)\b', re.I), 'cordless impact driver'),
+    (re.compile(r'\b(?:pneumatic|framing|brad|finish|nail)\s*(?:gun|nailer)\b', re.I), 'framing nailer'),
+    (re.compile(r'\b(?:circular|skil)\s*saw\b', re.I), 'circular saw'),
+    (re.compile(r'\b(?:reciprocating\s*saw|sawzall|sabre\s*saw)\b', re.I), 'reciprocating saw'),
+    (re.compile(r'\b(?:orbital|sheet|belt|disc)\s*sander\b', re.I), 'orbital sander'),
+    (re.compile(r'\b(?:airless|paint|high-?pressure)\s*sprayer\b', re.I), 'paint sprayer'),
+    (re.compile(r'\b(?:caulk(?:ing)?\s*gun|sealant\s*gun)\b', re.I), 'caulking gun'),
+
+    # 紧固件与辅料（优先于板材与基础材料）
+    (re.compile(r'\b(?:drywall|phosphate|coarse-?thread|fine-?thread)\s+screws?\b|\bblack\s+screws?\b', re.I), 'drywall screws'),
+    (re.compile(r'\b(?:wood|timber|decking|countersunk)\s+screws?\b', re.I), 'countersunk wood screws'),
+    (re.compile(r'\b(?:framing|collated|strip|pneumatic|galvanized)\s+nails?\b', re.I), 'framing nails'),
+    (re.compile(r'\b(?:construction\s+adhesive|heavy-?duty\s+adhesive|liquid\s+nails?)\b', re.I), 'construction adhesive'),
+
+    # 防潮与防水卷材与胶带
     (re.compile(r'\b(?:vapor|vapour)\s+barrier\s*(?:membrane|sheeting|sheet|film)?\b|\bpoly(?:ethylene)?\s+(?:sheeting|sheet|film)\b|\bblack\s+(?:poly|plastic\s+sheeting|tarp|membrane)\b', re.I), 'vapor barrier membrane'),
     (re.compile(r'\bwaterproof(?:ing)?\s+(?:membrane|sheet|sheeting|film|layer)\b', re.I), 'waterproof membrane'),
+    (re.compile(r'\b(?:seam|tuck|sheathing|flashing|acrylic|vapor|foil)\s+tape\b', re.I), 'seam sealing tape'),
+
     # 保温材料
     (re.compile(r'\b(?:fiberglass|fibreglass|glass\s*wool|mineral\s*wool|rockwool)\s*(?:insulation|batts?|rolls?)?\b|\byellow\s+(?:insulation|fibreglass\s+batts?)\b', re.I), 'insulation batts'),
+    (re.compile(r'\b(?:rigid\s+foam|xps|eps|foam\s*board|polyiso(?:cyanurate)?)\s*(?:insulation|panel|sheet)?\b', re.I), 'rigid foam board'),
+    (re.compile(r'\b(?:spray\s+foam|polyurethane\s+foam|expanding\s+foam|pu\s+foam)\b', re.I), 'expanding PU foam sealant'),
+
     # 龙骨与结构木料
     (re.compile(r'\b(?:timber|wood|wooden)\s*(?:studs?|framing|rafters?|joists?)\b|\b2x4\s*(?:studs?|framing)?\b', re.I), 'timber framing studs'),
+
     # 板材
     (re.compile(r'\b(?:gypsum\s*board|sheetrock|plasterboard|drywall\s*(?:sheet|panel|board)?)\b', re.I), 'drywall panels'),
-    (re.compile(r'\b(?:plywood|osb|oriented\s*strand\s*board)\s*(?:sheet|sheeting|panel|board)?s?\b', re.I), 'plywood sheathing'),
-    # 地基碎石与水泥
+    (re.compile(r'\b(?:osb|oriented\s*strand\s*board)\s*(?:sheet|sheeting|panel|board)?s?\b', re.I), 'OSB sheathing'),
+    (re.compile(r'\b(?:plywood)\s*(?:sheet|sheeting|panel|board|subfloor)?s?\b', re.I), 'plywood sheathing'),
+
+    # 地基碎石、水泥与自流平
     (re.compile(r'\b(?:crushed\s*(?:gravel|stone|rock)|aggregate|gravel\s*sub-?base)\b', re.I), 'crushed gravel'),
     (re.compile(r'\b(?:concrete|cement)\s*(?:slab|screed|mortar|patch)\b', re.I), 'concrete surface'),
-    # 常见工具
-    (re.compile(r'\b(?:cordless|power|electric|impact)?\s*(?:drill|driver|screw\s*gun|screwdriver)\b', re.I), 'cordless drill'),
-    (re.compile(r'\b(?:spirit|bubble)?\s*level\b', re.I), 'spirit level'),
-    (re.compile(r'\b(?:plastering|hand|masonry|smoothing|notched)?\s*trowel\b', re.I), 'trowel'),
+    (re.compile(r'\b(?:self-?level(?:ing)?\s*(?:compound|underlayment|cement|screed))\b', re.I), 'self-leveling underlayment'),
+
+    # 常见手工具
+    # 前缀不能全可选：裸 `level` 一并吃掉了 "floor level" / "eye level" 这类根本不是
+    # 器具的短语。留一条"整条短语就是 level"的分支来接住 tools 里单写 level 的情况。
+    (re.compile(r'\b(?:spirit|bubble|laser|torpedo)\s*levels?\b|^\s*levels?\s*$', re.I), 'spirit level'),
+    (re.compile(r'\b(?:plastering|hand|masonry|smoothing|notched|taping)?\s*trowel\b|\bputty\s*knife\b', re.I), 'trowel'),
     (re.compile(r'\b(?:tape\s*measure|measuring\s*tape)\b', re.I), 'measuring tape'),
     (re.compile(r'\b(?:utility|craft|stanley|box|snap-off)\s*knife\b', re.I), 'utility knife'),
+    (re.compile(r'\b(?:chalk\s*line|snap\s*line)\b', re.I), 'chalk snap line'),
+    (re.compile(r'\b(?:spiked\s*roller)\b', re.I), 'spiked roller'),
 ]
 
 
@@ -67,6 +104,68 @@ def canonicalize_entity_phrase(phrase):
         if pattern.search(text):
             return canonical
     return text
+
+
+def extract_roi_patches(frame_path, patch_size=512, max_patches=2, output_dir=None):
+    """从原生高分辨率帧中提取关键作业工区/接触点的 100% 原生分辨率局部特写切片。
+
+    解决整图缩小后微小工具刀头、紧固件、板材接缝像素被池化抹平的问题。
+    返回局部切片的图片路径列表；若图片过小或裁剪失败则返回原图路径列表。
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return [frame_path]
+
+    if not frame_path or not os.path.exists(frame_path):
+        return []
+
+    try:
+        with Image.open(frame_path) as im:
+            w, h = im.size
+            if w <= patch_size or h <= patch_size:
+                return [frame_path]
+
+            target_dir = output_dir or tempfile.mkdtemp(prefix='roi_patch_')
+            os.makedirs(target_dir, exist_ok=True)
+            base_name = os.path.splitext(os.path.basename(frame_path))[0]
+            patches = []
+
+            left = max(0, min(w - patch_size, int(w * 0.5) - patch_size // 2))
+
+            def _save_patch(top, suffix):
+                box = (left, top, left + patch_size, top + patch_size)
+                path = os.path.join(target_dir, f'{base_name}_roi_{suffix}.jpg')
+                im.crop(box).convert('RGB').save(path, 'JPEG', quality=85)
+                return path
+
+            # 两块 ROI 的纵向位置必须一起算，不能各自独立贴边内推。
+            #
+            # 名义中心是 0.55H（作业接触区）与 0.78H（材料交接/底面）。各自独立 clamp 的话，
+            #16:9 上两块会重叠 55%：第一块占到 338–850，底下只剩 230px，第二块被贴底推回
+            # 来。多花的载荷买回两张近似重复的图，还让"哪张图属于哪一帧"更难对位。
+            #
+            # 所以这里先把第一块上限压到"给第二块留出 min_sep 的位置"，再让第二块尽量待在
+            # 它的名义位置上。留不出 min_sep（画幅太矮）就只出一块——第二块此时几乎是第一
+            # 块的副本，白搭载荷。
+            min_sep = int(patch_size * 0.75)          # 容许最多 25% 重叠
+            room = h - patch_size                     # top 的合法上界
+            two_fit = room >= min_sep
+
+            top1 = int(h * 0.55) - patch_size // 2
+            top1 = max(0, min(room - min_sep if two_fit else room, top1))
+            patches.append(_save_patch(top1, 'action'))
+
+            if max_patches >= 2 and two_fit:
+                top2 = max(int(h * 0.78) - patch_size // 2, top1 + min_sep)
+                top2 = max(0, min(room, top2))
+                patches.append(_save_patch(top2, 'seam'))
+
+            return patches if patches else [frame_path]
+    except Exception as e:
+        if sys.stdout:
+            print(f"[REVERSE] ROI 特写裁剪异常，回退使用原帧: {e}")
+        return [frame_path]
 
 
 # 单次多模态调用塞多少帧。压到 768px JPEG 之后单帧约 100–200KB，10 帧一批的 base64
@@ -136,19 +235,25 @@ def stage_label(stage):
 
 # ── Pass A：逐帧客观事实提取 ─────────────────────────────────────────────────
 
-_PASS_A_SYSTEM = """You are a forensic frame reader. You are given still frames extracted from a video.
+_PASS_A_SYSTEM = """You are a forensic engineering frame reader. You are given still frames extracted from a video.
 
-Your ONLY job is to record what is physically visible in each frame. You have no knowledge of what this video is about, what it is for, or what usually happens in videos like this.
+Your ONLY job is to record exact, physically visible facts in each frame at high forensic fidelity. You have no knowledge of what this video is about, what it is for, or what usually happens in videos like this.
 
 HARD RULES
-- Record only what the pixels show. If you cannot see it, it does not exist.
+- Record ONLY what the pixels show. If you cannot see it, it does not exist.
 - Never infer a tool, material, worker, or operation from context, common sense, or industry habit. "There is fresh paint, so there must be a brush" is a forbidden inference.
 - Never describe intent, purpose, story, or what will happen next.
+- FORBIDDEN VAGUE WORDS: In 'tool_specifics', 'material_specs', 'fastening_and_bonding', and 'micro_traces', NEVER write single generic words like "tool", "drill", "machine", "wood", "board", "paint", "metal", "plastic", "renovation work", "partially done". ALWAYS specify the concrete physical type, driving mechanism, finish, or cross-section.
 - Four-Zone Spatial Fact Decomposition: Break down physical state across 4 spatial domains:
   1. overhead: roof, rafters, ceiling, overhead lights/ducts, upper structure.
   2. facade_and_walls: wall framing, studs, sheathing, panels, doors/windows, wiring.
   3. floor: ground, dirt, gravel, insulation, subfloor, joists, flooring finish.
   4. peripherals_and_spoil: debris piles, waste bags, toolboxes, raw materials.
+- Micro-Engineering Forensic Extraction:
+  - material_specs: Visible material layers, nominal thickness/grade, surface texture, sheen/reflectivity (e.g. "9mm OSB sheathing with raw matte texture", "2x4 SPF timber studs (38x89mm)", "black polyethylene vapor barrier membrane with red taped seams").
+  - tool_specifics: Specific equipment/tool model, power source, and active bit/blade (e.g. "18V cordless brushless impact driver with magnetic bit", "pneumatic framing nailer", "stainless steel notched trowel", "airless paint spray gun").
+  - fastening_and_bonding: Observable mechanical fasteners or chemical bonds (e.g. "countersunk black drywall screws", "expanding PU foam sealant along gap", "heavy-duty construction adhesive bead", "staples").
+  - micro_traces: Visible microscopic physical marks left by the work (e.g. "fine wood sawdust along pencil cut-lines", "fresh drywall dust on floor edges", "chalk snap line", "paint overspray splatter").
 - Describe completion extent spatially and concretely: "left two-thirds of the wall is coated, right third is bare" — never "partially done".
 - If a frame is too blurry, dark, or occluded to read, say so and give it a low confidence.
 
@@ -164,10 +269,14 @@ Return a JSON array, one object per frame given, in the same order:
     "peripherals_and_spoil": "<concrete physical state or 'none'>"
   },
   "materials": ["<visible material surfaces>"],
+  "material_specs": ["<specific material thickness, texture, grade>"],
   "tools": ["<visible tools, machines, equipment>"],
+  "tool_specifics": ["<exact tool model/type, drive mechanism, bit/blade>"],
+  "fastening_and_bonding": ["<countersunk screws, expanding foam, staples, adhesive>"],
   "workers_present": true|false,
   "completion_extent": "<concrete spatial state of the work visible in this frame>",
   "traces": ["<visible marks left by work: dust, drips, cut lines, offcuts, stains>"],
+  "micro_traces": ["<fine dust, pencil layout marks, offcuts, splatter>"],
   "confidence": 0.0-1.0
 }]
 
@@ -521,8 +630,14 @@ def _dump_bad_reply(job_dir, stage, raw, error):
         pass
 
 
-def _parse_facts_array(raw, expected_names):
-    """把模型回复解析成 {frame_name: fact}。名字对不上的按顺序兜底。"""
+def _parse_facts_array(raw, expected_names, strict=False):
+    """把模型回复解析成 {frame_name: fact}。名字对不上的按顺序兜底。
+
+    `strict=True` 关掉按位兜底，只认名字对得上的对象。峰值复核必须用它：那一路给模型
+    的图片数量多于帧数量（整帧 + 原生特写切片），一旦模型按图片数而不是帧数逐个作答，
+    按位兜底就会把第 1 帧的特写读数挂到第 2、3 帧上——正好挂在节拍边界帧上，还会覆盖
+    Pass A 已经读对的结论。宁可这一帧不复核。
+    """
     data = parse_json_reply(raw)
     if isinstance(data, dict):
         data = data.get('frames') or data.get('results') or []
@@ -535,6 +650,8 @@ def _parse_facts_array(raw, expected_names):
             continue
         name = str(item.get('frame') or '').strip()
         if name not in expected_names:
+            if strict:
+                continue
             # 模型偶尔会回 "frame 3" 或省略字段。按位置兜底，位置也超界就丢弃——
             # 丢一帧比把事实挂到错误的帧上安全得多。
             if idx < len(expected_names):
@@ -550,15 +667,27 @@ def _parse_facts_array(raw, expected_names):
                 if val:
                     zones[k] = val
 
+        materials = [canonicalize_entity_phrase(x) for x in (item.get('materials') or []) if str(x).strip()]
+        tools = [canonicalize_entity_phrase(x) for x in (item.get('tools') or []) if str(x).strip()]
+        material_specs = [str(x).strip() for x in (item.get('material_specs') or []) if str(x).strip()]
+        tool_specifics = [str(x).strip() for x in (item.get('tool_specifics') or []) if str(x).strip()]
+        fastening = [canonicalize_entity_phrase(x) for x in (item.get('fastening_and_bonding') or []) if str(x).strip()]
+        traces = [str(x).strip() for x in (item.get('traces') or []) if str(x).strip()]
+        micro_traces = [str(x).strip() for x in (item.get('micro_traces') or []) if str(x).strip()]
+
         out[name] = {
             'frame': name,
             'subject': str(item.get('subject') or '').strip(),
             'spatial_zones': zones,
-            'materials': [str(x).strip() for x in (item.get('materials') or []) if str(x).strip()],
-            'tools': [str(x).strip() for x in (item.get('tools') or []) if str(x).strip()],
+            'materials': materials,
+            'material_specs': material_specs,
+            'tools': tools,
+            'tool_specifics': tool_specifics,
+            'fastening_and_bonding': fastening,
             'workers_present': bool(item.get('workers_present')),
             'completion_extent': str(item.get('completion_extent') or '').strip(),
-            'traces': [str(x).strip() for x in (item.get('traces') or []) if str(x).strip()],
+            'traces': traces,
+            'micro_traces': micro_traces,
             'confidence': _clamp01(item.get('confidence'), default=0.5),
         }
     return out
@@ -790,6 +919,43 @@ def _peak_verify_model(config):
     return cfg.get('model') or 'gemini-3.7-flash-high'
 
 
+# 复核结果里"这一项模型没答"和"这一项模型看清了是空的"必须分开。空串/空表/空 dict 一律
+# 算没答，落回 Pass A 的读数；bool 与数值不算——`workers_present: false` 正是复核要给的
+# 结论，把它当"没答"就等于永远推翻不了 Pass A 说有人。
+def _is_blank_fact_value(value):
+    if value is None:
+        return True
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return False
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, dict, set)):
+        return len(value) == 0
+    return False
+
+
+def _merge_verified_fact(base, refined, model):
+    """把峰值复核的读数按字段合进 Pass A 的事实，而不是整条替换。
+
+    整条替换埋过一个很贵的坑：复核提示词的重心在 material_specs / tool_specifics 这些
+    新字段上，模型漏答 `materials`/`tools` 是常事，而这两个字段正是 `_WINDOW_FACT_FIELDS`
+    的成员——一旦被清成空表，逐窗统计就在 peak 帧上看到实体集体消失，而 peak 帧恰恰是
+    节拍边界。「复核是增强，不是门禁」这条既有约定得落到字段一级才算数。
+
+    timestamp 一律以 Pass A 为准（复核提示词里没有时间轴，模型无从知道）。
+    """
+    merged = dict(base or {})
+    for key, value in (refined or {}).items():
+        if key in ('frame', 'timestamp'):
+            continue
+        if _is_blank_fact_value(value) and not _is_blank_fact_value(merged.get(key)):
+            continue
+        merged[key] = value
+    merged['timestamp'] = (base or {}).get('timestamp')
+    merged['verified_by'] = model
+    return merged
+
+
 def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
     """用强模型复核 change_events 的 peak 帧。
 
@@ -817,26 +983,69 @@ def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
         })
 
     clean_config = _scrub_config_for_pass_a(config)
+    roi_dir = os.path.join(job_dir, 'roi_patches')
+    os.makedirs(roi_dir, exist_ok=True)
     batches = [peak_names[i:i + _PEAK_BATCH_SIZE]
                for i in range(0, len(peak_names), _PEAK_BATCH_SIZE)]
 
     def _run_peak_batch(batch):
         pp._raise_if_cancelled(on_progress)
-        paths = [by_name[n]['frame_path'] for n in batch]
-        small = pp._compress_frames_for_review(paths, max_side=1024, quality=82)
+        full_paths = [by_name[n]['frame_path'] for n in batch]
+        compressed_full = pp._compress_frames_for_review(full_paths, max_side=1024, quality=82)
+
+        # 为这批峰值关键帧提取 100% 原生尺寸局部特写切片并持久化到 job_dir/roi_patches。
+        #
+        # 送进去的图片数量从此不再等于帧数量（一帧 = 1 张整帧 + 最多 2 张原生特写）。
+        # 模型只能靠文字知道哪张图属于哪一帧，所以这里必须逐张编号列清单——早先只写
+        # 「Detail Crop for X is attached」不给序号，模型无从对位，而它一旦按图片数逐个
+        # 作答，下游按位兜底就会把特写的读数挂到别的帧上。配合 strict=True 双保险。
+        detail_images = []
+        image_manifest = []
+        batch_roi_map = {}
+        for idx, (n, fp) in enumerate(zip(batch, full_paths)):
+            detail_images.append(compressed_full[idx])
+            image_manifest.append(f'- Image {len(detail_images)}: FULL FRAME of {n}')
+            patches = extract_roi_patches(fp, patch_size=512, max_patches=2, output_dir=roi_dir)
+            rel_patches = []
+            for p_idx, patch in enumerate(patches):
+                if patch != fp and os.path.exists(patch):
+                    detail_images.append(patch)
+                    rel_patches.append(os.path.relpath(patch, job_dir))
+                    image_manifest.append(
+                        f'- Image {len(detail_images)}: native-scale DETAIL CROP #{p_idx + 1} '
+                        f'of {n} (same frame as its full frame above, not a separate frame)'
+                    )
+            batch_roi_map[n] = rel_patches
+
         listing = '\n'.join(f'{i + 1}. {n}' for i, n in enumerate(batch))
-        # 复核是增强，不是门禁：这一批炸了就留着 Pass A 的结论继续走。默认开之后这条
-        # 尤其要紧——一次解析失败若能掀掉整单，等于把已经付过钱的 Pass A 一起赔进去，
-        # 而「没复核」的代价只是这几帧沿用 flash 的读数。
+        manifest_text = '\n'.join(image_manifest)
+
+        user_text = (
+            f'You are given {len(detail_images)} images that together show only '
+            f'{len(batch)} distinct frames. Detail crops are native-scale magnifications of a '
+            f'frame you already have — they let you read microscopic fastener types, tool '
+            f'blade/bit models, and material cross-sections. They are NOT additional frames.\n\n'
+            f'Image manifest (in the order attached):\n{manifest_text}\n\n'
+            f'Frames to analyze:\n{listing}\n\n'
+            f'Read these {len(batch)} peak frames with forensic scrutiny, folding each frame\'s '
+            f'detail crops into that frame\'s reading. Inspect material surfaces, fasteners, '
+            f'tool mechanisms, and boundaries.\n'
+            f'Return a JSON array of EXACTLY {len(batch)} objects — one per frame, in the exact '
+            f'order of the {len(batch)} frame names listed above, never one per image. Set each '
+            f'object\'s "frame" field to the exact frame name from the list above.'
+        )
+
         try:
             raw = pp._multimodal_chat(
                 clean_config, _PASS_A_SYSTEM,
-                f'Read these {len(batch)} frames carefully. Crop-zoom mentally onto material '
-                f'surfaces, tool contact points, and completion boundaries before answering.\n'
-                f'{listing}\n\nReturn one JSON object per frame in the same order.',
-                small, model=model, max_tokens=4096, timeout=240,
+                user_text,
+                detail_images, model=model, max_tokens=4096, timeout=240,
             )
-            return _parse_facts_array(raw, batch)
+            parsed = _parse_facts_array(raw, batch, strict=True)
+            for n, fact in parsed.items():
+                if n in batch_roi_map:
+                    fact['roi_patches'] = batch_roi_map[n]
+            return parsed
         except pp.GenerationCancelled:
             raise
         except Exception as e:
@@ -857,10 +1066,7 @@ def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
     by_frame = {f['frame']: f for f in facts_payload.get('facts') or []}
     for name, fact in refined.items():
         if name in by_frame:
-            ts = by_frame[name].get('timestamp')
-            fact['timestamp'] = ts
-            fact['verified_by'] = model
-            by_frame[name] = fact
+            by_frame[name] = _merge_verified_fact(by_frame[name], fact, model)
     facts_payload['facts'] = [by_frame[f['frame']] for f in facts_payload.get('facts') or []]
     facts_payload['peak_verified'] = len(refined)
     # 复核用了哪个模型要落进产物：UI 上「峰值复核模型」是可选的，选了什么、有没有
@@ -1080,10 +1286,18 @@ def _facts_digest(facts):
             parts.append(f'extent={f["completion_extent"]}')
         if f.get('materials'):
             parts.append(f'materials={"/".join(f["materials"])}')
+        if f.get('material_specs'):
+            parts.append(f'mat_specs={"/".join(f["material_specs"])}')
         if f.get('tools'):
             parts.append(f'tools={"/".join(f["tools"])}')
+        if f.get('tool_specifics'):
+            parts.append(f'tool_specs={"/".join(f["tool_specifics"])}')
+        if f.get('fastening_and_bonding'):
+            parts.append(f'fasteners={"/".join(f["fastening_and_bonding"])}')
         if f.get('traces'):
             parts.append(f'traces={"/".join(f["traces"])}')
+        if f.get('micro_traces'):
+            parts.append(f'micro_traces={"/".join(f["micro_traces"])}')
         parts.append(f'workers={"yes" if f.get("workers_present") else "no"}')
         parts.append(f'conf={f.get("confidence")}')
         lines.append(' | '.join(parts))
