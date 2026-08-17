@@ -296,7 +296,8 @@ Full statements and rationale in `references/omni-restoration-continuity.md`.
 ### Cumulative State And Anchor Delta
 
 - Every IMAGE anchor N must inherit all permanent changes and traces from beats 1 through N-1. A trace may disappear only when a later named operation visibly covers or removes it, and that covering operation must be the beat where it happens.
-- The difference between IMAGE N and IMAGE N+1 must be exactly the declared operation's result of VIDEO N. No side progress, no extra cleanup, no bonus improvements in other zones.
+- The difference between IMAGE N and IMAGE N+1 must be exactly the declared operation's result of VIDEO N across all 4 spatial zones (Top, Middle, Bottom, Peripherals) with 100% action-tool-SFX mapping. No phantom state disappearance, no unacted structural changes, no side progress, no extra cleanup, no bonus improvements in other zones.
+- Demolition/clearing tasks must explicitly describe debris moving into containers/spoil stacks, and installation tasks must describe material depletion.
 - Each progressive IMAGE anchor states its completion extent in concrete spatial terms, so adjacent-anchor interpolation has an unambiguous start and end.
 - Where a beat's scope is narrow or its object list is closed, say so **negatively and explicitly** (`the side wall panels remain in place, not stripped`; `only these listed objects are present`). Positive description alone does not bound an image model.
 

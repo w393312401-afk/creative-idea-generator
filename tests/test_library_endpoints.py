@@ -167,6 +167,18 @@ class TestSplitEndpoints:
         h.do_POST()
         assert sent[0][1] == 400
 
+    def test_bulk_delete_items(self, store):
+        _seed(store, [_idea('a'), _idea('b'), _idea('c')])
+        sc.read_library_index()
+
+        h, sent = _post('/api/library/items/bulk_delete', {'ids': ['a', 'c']})
+        h.do_POST()
+
+        body, status = sent[0]
+        assert status == 200
+        assert body['count'] == 2
+        assert [r['id'] for r in sc.read_library_index()] == ['b']
+
 
 # ── 整表兼容层 ────────────────────────────────────────────────────────────
 

@@ -29,7 +29,45 @@ import prompt_pipeline as pp
 
 
 # Pass A 的提示词版本号。改了 _PASS_A_SYSTEM 就必须改它，否则旧缓存会被当成新结果复用。
-PASS_A_PROMPT_VERSION = 'v1'
+PASS_A_PROMPT_VERSION = 'v2'
+
+# ── 实体规范化与消歧词典 ───────────────────────────────────────────────────
+#
+# 解决多模态模型在不同帧中对同一物理材质/器具用词漂移的问题（如上一帧叫 poly sheeting，
+# 下一帧叫 black vapor barrier），确保定长窗与阶梯统计不会产生虚假的出现与消失。
+_CANONICAL_ENTITY_PATTERNS = [
+    # 防潮与防水卷材
+    (re.compile(r'\b(?:vapor|vapour)\s+barrier\s*(?:membrane|sheeting|sheet|film)?\b|\bpoly(?:ethylene)?\s+(?:sheeting|sheet|film)\b|\bblack\s+(?:poly|plastic\s+sheeting|tarp|membrane)\b', re.I), 'vapor barrier membrane'),
+    (re.compile(r'\bwaterproof(?:ing)?\s+(?:membrane|sheet|sheeting|film|layer)\b', re.I), 'waterproof membrane'),
+    # 保温材料
+    (re.compile(r'\b(?:fiberglass|fibreglass|glass\s*wool|mineral\s*wool|rockwool)\s*(?:insulation|batts?|rolls?)?\b|\byellow\s+(?:insulation|fibreglass\s+batts?)\b', re.I), 'insulation batts'),
+    # 龙骨与结构木料
+    (re.compile(r'\b(?:timber|wood|wooden)\s*(?:studs?|framing|rafters?|joists?)\b|\b2x4\s*(?:studs?|framing)?\b', re.I), 'timber framing studs'),
+    # 板材
+    (re.compile(r'\b(?:gypsum\s*board|sheetrock|plasterboard|drywall\s*(?:sheet|panel|board)?)\b', re.I), 'drywall panels'),
+    (re.compile(r'\b(?:plywood|osb|oriented\s*strand\s*board)\s*(?:sheet|sheeting|panel|board)?s?\b', re.I), 'plywood sheathing'),
+    # 地基碎石与水泥
+    (re.compile(r'\b(?:crushed\s*(?:gravel|stone|rock)|aggregate|gravel\s*sub-?base)\b', re.I), 'crushed gravel'),
+    (re.compile(r'\b(?:concrete|cement)\s*(?:slab|screed|mortar|patch)\b', re.I), 'concrete surface'),
+    # 常见工具
+    (re.compile(r'\b(?:cordless|power|electric|impact)?\s*(?:drill|driver|screw\s*gun|screwdriver)\b', re.I), 'cordless drill'),
+    (re.compile(r'\b(?:spirit|bubble)?\s*level\b', re.I), 'spirit level'),
+    (re.compile(r'\b(?:plastering|hand|masonry|smoothing|notched)?\s*trowel\b', re.I), 'trowel'),
+    (re.compile(r'\b(?:tape\s*measure|measuring\s*tape)\b', re.I), 'measuring tape'),
+    (re.compile(r'\b(?:utility|craft|stanley|box|snap-off)\s*knife\b', re.I), 'utility knife'),
+]
+
+
+def canonicalize_entity_phrase(phrase):
+    """把短语中的近义词归一到标准术语。"""
+    text = str(phrase or '').strip()
+    if not text:
+        return ''
+    for pattern, canonical in _CANONICAL_ENTITY_PATTERNS:
+        if pattern.search(text):
+            return canonical
+    return text
+
 
 # 单次多模态调用塞多少帧。压到 768px JPEG 之后单帧约 100–200KB，10 帧一批的 base64
 # 载荷在 2MB 量级——再大就开始撞网关的请求体上限和超时。
@@ -79,6 +117,7 @@ _STAGE_RANK = {
 _COVERING_STAGES = ('enclosure', 'surface', 'floor')
 
 _STAGE_LABELS_ZH = {
+    'transition': '空间过门/镜头穿越',
     'demolition': '拆除清运',
     'structural': '结构修复',
     'rough_in': '隐蔽工程',
@@ -105,6 +144,11 @@ HARD RULES
 - Record only what the pixels show. If you cannot see it, it does not exist.
 - Never infer a tool, material, worker, or operation from context, common sense, or industry habit. "There is fresh paint, so there must be a brush" is a forbidden inference.
 - Never describe intent, purpose, story, or what will happen next.
+- Four-Zone Spatial Fact Decomposition: Break down physical state across 4 spatial domains:
+  1. overhead: roof, rafters, ceiling, overhead lights/ducts, upper structure.
+  2. facade_and_walls: wall framing, studs, sheathing, panels, doors/windows, wiring.
+  3. floor: ground, dirt, gravel, insulation, subfloor, joists, flooring finish.
+  4. peripherals_and_spoil: debris piles, waste bags, toolboxes, raw materials.
 - Describe completion extent spatially and concretely: "left two-thirds of the wall is coated, right third is bare" — never "partially done".
 - If a frame is too blurry, dark, or occluded to read, say so and give it a low confidence.
 
@@ -113,6 +157,12 @@ Return a JSON array, one object per frame given, in the same order:
 [{
   "frame": "<the exact filename you were given>",
   "subject": "<what occupies the frame, one sentence>",
+  "spatial_zones": {
+    "overhead": "<concrete physical state or 'none'>",
+    "facade_and_walls": "<concrete physical state or 'none'>",
+    "floor": "<concrete physical state or 'none'>",
+    "peripherals_and_spoil": "<concrete physical state or 'none'>"
+  },
   "materials": ["<visible material surfaces>"],
   "tools": ["<visible tools, machines, equipment>"],
   "workers_present": true|false,
@@ -491,9 +541,19 @@ def _parse_facts_array(raw, expected_names):
                 name = expected_names[idx]
             else:
                 continue
+
+        zones_raw = item.get('spatial_zones')
+        zones = {}
+        if isinstance(zones_raw, dict):
+            for k in ('overhead', 'facade_and_walls', 'floor', 'peripherals_and_spoil'):
+                val = str(zones_raw.get(k) or '').strip()
+                if val:
+                    zones[k] = val
+
         out[name] = {
             'frame': name,
             'subject': str(item.get('subject') or '').strip(),
+            'spatial_zones': zones,
             'materials': [str(x).strip() for x in (item.get('materials') or []) if str(x).strip()],
             'tools': [str(x).strip() for x in (item.get('tools') or []) if str(x).strip()],
             'workers_present': bool(item.get('workers_present')),
@@ -546,12 +606,12 @@ def extract_frame_facts(config, job_dir, on_progress=None, degraded=False,
     batches = [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
     done_counter = {'n': 0}
 
-    def _ask(batch, max_tokens, timeout):
+    def _ask(batch, max_tokens, timeout, max_side=768):
         """一次视觉调用：喂这批帧，返回 {frame_name: fact}。解析失败抛 ValueError。"""
         paths = [e['frame_path'] for e in batch]
         names = [os.path.basename(p) for p in paths]
         # 先压再送：全尺寸 PNG 的 base64 会把请求体撑到十几 MB，这是超时的主要来源。
-        small = pp._compress_frames_for_review(paths, max_side=768, quality=72)
+        small = pp._compress_frames_for_review(paths, max_side=max_side, quality=78 if max_side > 768 else 72)
         listing = '\n'.join(
             f'{i + 1}. {n}  (t={e["timestamp"]}s)'
             for i, (n, e) in enumerate(zip(names, batch))
@@ -584,14 +644,50 @@ def extract_frame_facts(config, job_dir, on_progress=None, degraded=False,
                 if remaining == 0:
                     break
 
-        # 整批预算用尽后不再直接丢掉这十帧。多半是其中一两帧让模型写出了坏 JSON，
-        # 而整批作废会把另外八帧本来读得好好的观察一起赔进去——缺帧在 Pass B 里
-        # 表现为该窗口证据不足，节拍边界就落错。逐帧重来一次，救回能救的：
-        # 单帧回复只有一个对象，坏 JSON 的概率和影响面都小一个量级。
         if len(batch) == 1:
             if sys.stdout:
                 print(f'[REVERSE] 单帧连续解析失败，放弃: {names[0]}')
             return {}
+
+        # 二分梯队重试：若批次大于 2 帧，先尝试二分为两个半批（例如 10 -> 5 + 5），
+        # 并提升压缩分辨率至 1024px 提高微小工具与工序接缝的识别精度。
+        if len(batch) > 2:
+            mid = len(batch) // 2
+            sub_batches = [batch[:mid], batch[mid:]]
+            if sys.stdout:
+                print(f'[REVERSE] 这批 {len(batch)} 帧解析失败，二分拆为 {len(sub_batches[0])} + {len(sub_batches[1])} 帧（升至 1024px）重试…')
+            if on_progress:
+                on_progress('replica_stage', {
+                    'stage': 'review_frames',
+                    'message': f'一批 {len(batch)} 帧解析失败，正在二分拆为 {len(sub_batches[0])} + {len(sub_batches[1])} 帧高清重试…',
+                })
+            bisection_salvaged = {}
+            for sub_batch in sub_batches:
+                pp._raise_if_cancelled(on_progress)
+                sub_names = [os.path.basename(e['frame_path']) for e in sub_batch]
+                sub_ok = False
+                for sub_rem in range(_PARSE_RETRY_BUDGET, -1, -1):
+                    pp._raise_if_cancelled(on_progress)
+                    try:
+                        sub_res = _ask(sub_batch, max_tokens=2048, timeout=120, max_side=1024)
+                        bisection_salvaged.update(sub_res)
+                        sub_ok = True
+                        break
+                    except (ValueError, pp.ResponseTruncated):
+                        if sub_rem == 0:
+                            break
+                if not sub_ok:
+                    # 半批仍失败，降级逐帧重试（同样使用 1024px）
+                    for entry in sub_batch:
+                        pp._raise_if_cancelled(on_progress)
+                        try:
+                            bisection_salvaged.update(_ask([entry], max_tokens=1024, timeout=90, max_side=1024))
+                        except (ValueError, pp.ResponseTruncated):
+                            if sys.stdout:
+                                print(f'[REVERSE] 逐帧重试仍失败，丢弃这一帧: '
+                                      f'{os.path.basename(entry["frame_path"])}')
+            return bisection_salvaged
+
         if sys.stdout:
             print(f'[REVERSE] 这批帧连续 {_PARSE_RETRY_BUDGET + 1} 次解析失败，'
                   f'改为逐帧重试: {names}')
@@ -604,7 +700,7 @@ def extract_frame_facts(config, job_dir, on_progress=None, degraded=False,
         for entry in batch:
             pp._raise_if_cancelled(on_progress)
             try:
-                salvaged.update(_ask([entry], max_tokens=1024, timeout=90))
+                salvaged.update(_ask([entry], max_tokens=1024, timeout=90, max_side=1024))
             except (ValueError, pp.ResponseTruncated):
                 if sys.stdout:
                     print(f'[REVERSE] 逐帧重试仍失败，丢弃这一帧: '
@@ -614,6 +710,9 @@ def extract_frame_facts(config, job_dir, on_progress=None, degraded=False,
         return salvaged
 
     def _on_done(_key, result):
+        if result:
+            cache.update(result)
+            _save_facts_cache(job_dir, model, cache)
         done_counter['n'] += len(result or {})
         if on_progress:
             on_progress('replica_stage', {
@@ -624,15 +723,17 @@ def extract_frame_facts(config, job_dir, on_progress=None, degraded=False,
             })
 
     if batches:
-        results = pp._map_parallel(
-            _run_batch,
-            [(i, b) for i, b in enumerate(batches)],
-            pp.review_concurrency(config),
-            on_done=_on_done,
-        )
-        for chunk in results.values():
-            cache.update(chunk or {})
-        _save_facts_cache(job_dir, model, cache)
+        try:
+            results = pp._map_parallel(
+                _run_batch,
+                [(i, b) for i, b in enumerate(batches)],
+                pp.review_concurrency(config),
+                on_done=_on_done,
+            )
+            for chunk in results.values():
+                cache.update(chunk or {})
+        finally:
+            _save_facts_cache(job_dir, model, cache)
 
     facts = []
     for entry in entries:
@@ -718,8 +819,8 @@ def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
     clean_config = _scrub_config_for_pass_a(config)
     batches = [peak_names[i:i + _PEAK_BATCH_SIZE]
                for i in range(0, len(peak_names), _PEAK_BATCH_SIZE)]
-    refined = {}
-    for batch in batches:
+
+    def _run_peak_batch(batch):
         pp._raise_if_cancelled(on_progress)
         paths = [by_name[n]['frame_path'] for n in batch]
         small = pp._compress_frames_for_review(paths, max_side=1024, quality=82)
@@ -735,12 +836,23 @@ def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
                 f'{listing}\n\nReturn one JSON object per frame in the same order.',
                 small, model=model, max_tokens=4096, timeout=240,
             )
-            refined.update(_parse_facts_array(raw, batch))
+            return _parse_facts_array(raw, batch)
         except pp.GenerationCancelled:
             raise
         except Exception as e:
             if sys.stdout:
                 print(f'[REVERSE] 峰值帧复核失败，这批沿用 Pass A 的读数 {batch}: {e}')
+            return {}
+
+    refined = {}
+    if batches:
+        results = pp._map_parallel(
+            _run_peak_batch,
+            [(i, b) for i, b in enumerate(batches)],
+            pp.review_concurrency(config),
+        )
+        for chunk in results.values():
+            refined.update(chunk or {})
 
     by_frame = {f['frame']: f for f in facts_payload.get('facts') or []}
     for name, fact in refined.items():
@@ -878,6 +990,8 @@ RULES
 - A beat is a PRODUCTION MILESTONE, not a state jump. It must declare TWO OR THREE tightly coupled operations in package_operations that share ONE terminal product (for example ["cut", "fit", "fasten"] all producing one boarded ceiling). A beat carrying only one operation is under-scoped — widen its window and merge the adjacent events that belong to the same milestone.
 - Never mix two different physical SYSTEMS in one beat (wiring and wall panels are separate milestones), but the two-to-three operations that jointly produce one milestone belong together in one beat.
 - A beat must produce a full visible milestone, not a token patch. If two adjacent windows continue the same milestone, merge them.
+- Four-Zone Spatial Scanning: In every beat, scan four spatial domains for physical delta: 1. Top/Overhead (roof, beams, ceiling, fixtures, skylights), 2. Middle (walls, framing, openings, wiring), 3. Bottom (floor, sub-base, insulation, finish), 4. Peripherals & Spoil (debris removal, material balance). Material & Spoil Balance: Demolition/clearing must account for where debris goes (e.g. bundled or hauled out); installation must account for raw material consumption. Zero Phantom Changes: Never describe action in only one zone while letting another zone's damage or debris disappear without worker action.
+- Monotonic Chronological Inheritance across Spaces: When passing through a doorway or opening into a new space (space label changes), the first beat in the new space must physically inherit all completed exterior/prior work. Never regress already-finished elements (e.g. never describe a roof leaking or ground full of dead leaves if previous beats cleared/repaired them).
 - visible_details: THREE to SIX items. Each names a material with its colour, texture or condition and where it sits — "yellow fibreglass batts in the left wall bays", not "insulation". These items are the only place the reference film's actual look survives into the prompt; a bare noun brings back a generic version of this work, not this film.
 - persistent_traces: AT LEAST TWO visible marks this beat leaves behind, each naming the mark AND the surface it sits on.
 - evidence_frames: list AT MOST THREE frames per beat — the one that best shows the start, the one that best shows the work, and the one that best shows the result. Do not echo every frame in the window; a long frame list is the single biggest cause of a reply that gets cut off before it finishes.
@@ -887,7 +1001,8 @@ RULES
 - Every claim must trace to a frame. Never write a tool, material, worker, or operation that no frame fact mentions.
 - state_before / state_after must be concrete spatial completion extent, never "partially done".
 - banned_elements: things a renovation of this type would plausibly involve but that appear in NO frame fact. Be generous here — this list is what stops the prompt writer from hallucinating later.
-- stage: classify each beat as exactly one of the nine below. Read these definitions — the stage drives a construction-dependency check, and a beat filed under the wrong one gets the ladder rejected for a violation it does not actually have.
+- stage: classify each beat as exactly one of the ten below. Read these definitions — the stage drives a construction-dependency check, and a beat filed under the wrong one gets the ladder rejected for a violation it does not actually have.
+  - transition: camera moving through an opening or doorway into a new enclosed space (pure camera move across the threshold, sterile of workers, carrying NO construction tasks; operation is "threshold" or "过门", package_operations is ["threshold"] or []).
   - demolition: tearing out, clearing, hauling away debris.
   - structural: foundations, framing, load-bearing walls, roof structure, cutting an opening through a structural wall.
   - rough_in: services that later get covered up — electrical cable, plumbing pipe, ductwork. ONLY the services themselves.
@@ -897,6 +1012,17 @@ RULES
   - fixtures: powered or plumbed equipment being installed — light fittings, sockets, switches, taps, appliances. A beat with no powered or plumbed device in it is NEVER fixtures.
   - furnishing: loose furniture, textiles, decor being moved in and arranged.
   - reveal: the final walk-through / hero shot of the finished result.
+- Threshold Beat Purity (过门镜头独立与纯净零施工规则):
+  - When the camera moves into a new enclosed space through an opening (the space label changes), the crossing must be recorded as an independent "transition" beat.
+  - Never combine a doorway/threshold crossing with construction operations (e.g. clearing or framing) into a single beat.
+  - The crossing beat is sterile of workers and carries no construction work; the subsequent construction work begins in the following beat.
+- 2X Speed Timelapse Model & Strict Duration Breakdown (按秒数拆拍与 2 倍速硬规则):
+  - The reference video is a ~2x fast-forward timelapse. In source footage timestamps, the ideal duration of each trade milestone is strictly 2.5s to 5.5s (which represents 5.0s~11.0s of actual physical trade work).
+  - HARD SPLIT ON OVER-LONG BEATS (>6.0s): NEVER allow any single beat to span longer than 6.0s. If a construction stage spans 6.0s or longer (e.g. 7.3s of structural work or 10.0s of final walkthrough), you MUST SPLIT it into 2 or more distinct sub-milestones (e.g. split structural into rough framing vs joist reinforcement/boarding; split reveal into final soft-furnishing/lighting closeout vs camera pull-back hero reveal).
+  - HARD MERGE ON FLEETING MICRO-BEATS (<2.0s): Avoid micro-beats under 2.0s. If an action lasts under 2.0s (e.g. 1.2s placing loose items), MERGE it into the preceding or following trade milestone (NEVER merge across space boundaries or merge a transition beat with construction work).
+  - TARGET BEAT DENSITY: For a 30s~40s video, aim for approximately 8 to 11 concise, evenly-spaced production beats (each 2.5s~5.0s). Never collapse the narrative into 5~7 bloated over-long beats!
+- Construction Sequence Monotonicity: Strictly adhere to the 9-stage sequence (demolition -> structural -> rough_in -> enclosure -> surface -> floor -> fixtures -> furnishing -> reveal). Rough-in services must precede cavity enclosure/boarding; structural sub-base must precede floor finishing.
+- Boundary Precision: Beat start and end timestamps must strictly align with actual visible state transitions shown in the contact sheets and frame facts.
 - Beats are ordered by time and must not overlap.
 
 - scene_signature: ONE sentence naming the venue and how it looks throughout — its structure, its materials, its weathering, its surroundings, its standing light. Write what is true in the first frame and still true in the last. No work, no progress, no beat content. This is the one line that says why the reference film looks like itself; a generic version of it ("an interior space under renovation") is worse than none.
@@ -910,10 +1036,10 @@ Return one JSON object, no prose, no code fences:
   "beats": [{
     "id": "B01",
     "start": <sec>, "end": <sec>,
-    "stage": "<one of the nine>",
+    "stage": "<one of the ten>",
     "space": "<short label of the space this beat is filmed in, reused verbatim across beats>",
     "operation": "<the dominant physical operation naming this milestone>",
-    "package_operations": ["<two or three tightly coupled operations sharing one terminal product>"],
+    "package_operations": ["<two or three tightly coupled operations sharing one terminal product; or [\"threshold\"] for transition>"],
     "visual_subject": "...",
     "visible_details": ["..."],
     "visible_action": "...",
@@ -937,6 +1063,19 @@ def _facts_digest(facts):
         parts = [f'#{i} [{f.get("timestamp")}s] {f.get("frame")}']
         if f.get('subject'):
             parts.append(f'subject={f["subject"]}')
+        zones = f.get('spatial_zones') or {}
+        if isinstance(zones, dict) and any(zones.values()):
+            z_parts = []
+            if zones.get('overhead') and zones['overhead'].lower() != 'none':
+                z_parts.append(f"top:{zones['overhead']}")
+            if zones.get('facade_and_walls') and zones['facade_and_walls'].lower() != 'none':
+                z_parts.append(f"wall:{zones['facade_and_walls']}")
+            if zones.get('floor') and zones['floor'].lower() != 'none':
+                z_parts.append(f"floor:{zones['floor']}")
+            if zones.get('peripherals_and_spoil') and zones['peripherals_and_spoil'].lower() != 'none':
+                z_parts.append(f"spoil:{zones['peripherals_and_spoil']}")
+            if z_parts:
+                parts.append(f'zones=[{", ".join(z_parts)}]')
         if f.get('completion_extent'):
             parts.append(f'extent={f["completion_extent"]}')
         if f.get('materials'):
@@ -1105,6 +1244,22 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
         # 每次重算一遍——那样两次看到的「画面变化」可能不是同一份。
         beats_doc['time_windows'] = windows
         attach_scene_constants(beats_doc, facts)
+
+        # 注入 2x 倍速与双轴时序计算元数据
+        speed_multiplier = float(beats_doc.get('speed_multiplier') or 2.0)
+        beats_doc['speed_multiplier'] = speed_multiplier
+        try:
+            from .duration_engine import calculate_beat_word_quota
+            for b in beats_doc.get('beats') or []:
+                start, end = _num(b.get('start')), _num(b.get('end'))
+                if end > start:
+                    s_dur = round(end - start, 1)
+                    b['screen_duration_sec'] = s_dur
+                    b['action_duration_sec'] = round(s_dur * speed_multiplier, 1)
+                    b['speed_factor'] = speed_multiplier
+                    b['voiceover_quota'] = calculate_beat_word_quota(s_dur, lang='zh')
+        except Exception:
+            pass
 
         violations = validate_beats(beats_doc, overview)
         if not [v for v in violations if v['level'] == 'error']:
@@ -1353,7 +1508,12 @@ def _content_words(value):
     （"black ceiling sheeting" / "dark ceiling surface"），按整串统计会把一个恒常物
     拆成几十个「只出现一次」的条目，于是什么都像是刚出现的。"""
     words = set()
-    for token in re.split(r'[^a-zA-Z一-鿿]+', str(value or '').lower()):
+    raw_str = str(value or '').strip()
+    canon = canonicalize_entity_phrase(raw_str)
+    tokens = list(re.split(r'[^a-zA-Z一-鿿]+', raw_str.lower()))
+    if canon and canon.lower() != raw_str.lower():
+        tokens.extend(re.split(r'[^a-zA-Z一-鿿]+', canon.lower()))
+    for token in tokens:
         if len(token) > 2 and token not in _WINDOW_STOPWORDS:
             words.add(token)
     return words
@@ -1363,13 +1523,20 @@ _WINDOW_FACT_FIELDS = ('materials', 'tools', 'traces')
 
 
 def _fact_phrases(fact):
-    """一条帧事实里所有可见物的短语（材质 / 器具 / 痕迹）。"""
+    """一条帧事实里所有可见物的短语（材质 / 器具 / 痕迹）。包含空间四域提取实体。"""
     out = []
     for field in _WINDOW_FACT_FIELDS:
         for item in (fact.get(field) or []):
             text = str(item).strip()
             if text:
                 out.append(text)
+    zones = fact.get('spatial_zones') or {}
+    if isinstance(zones, dict):
+        for val in zones.values():
+            if val and str(val).lower() != 'none':
+                text = str(val).strip()
+                if text:
+                    out.append(text)
     return out
 
 
@@ -1893,8 +2060,13 @@ def validate_beats(beats_doc, overview, schema=None):
     out.extend(_validate_required_fields(beats_doc, beats, schema, variant=variant))
     out.extend(_validate_event_coverage(beats, overview))
     out.extend(_validate_evidence_frames(beats, overview, variant=variant))
-    out.extend(_validate_time_axis(beats, beats_doc.get('video_duration_sec')))
+    out.extend(_validate_time_axis(
+        beats,
+        beats_doc.get('video_duration_sec'),
+        speed_multiplier=beats_doc.get('speed_multiplier') or beats_doc.get('source_speed_multiplier')
+    ))
     out.extend(_validate_construction_order(beats))
+    out.extend(_validate_space_monotonicity(beats))
     out.extend(_validate_temporary_objects(beats))
     out.extend(_validate_composer_frame_contract(beats))
     return out
@@ -1932,6 +2104,16 @@ def _validate_composer_frame_contract(beats):
 
     for beat in beats:
         bid = beat.get('id')
+        op = str(beat.get('operation') or '').lower()
+        stage = str(beat.get('stage') or '').lower()
+        is_transition = (
+            op in ('threshold', 'reward', 'reframe')
+            or stage in ('transition', 'threshold', 'reveal')
+            or bool(beat.get('bridge_stage'))
+            or bool(beat.get('hard_cut'))
+        )
+        if is_transition:
+            continue
         package = [p for p in (beat.get('package_operations') or []) if str(p).strip()]
         if not lo <= len(package) <= hi:
             out.append(_err(
@@ -2094,6 +2276,97 @@ def _validate_required_fields(beats_doc, beats, schema, variant=False):
     return out
 
 
+def _get_event_timestamp(ev):
+    for k in ('peak', 'timestamp', 'time'):
+        if ev.get(k) is not None:
+            return _num(ev.get(k))
+    if ev.get('start') is not None and ev.get('end') is not None:
+        return (_num(ev.get('start')) + _num(ev.get('end'))) / 2.0
+    if ev.get('start') is not None:
+        return _num(ev.get('start'))
+    return None
+
+
+def _find_best_matching_beat(beats, ev, ev_time=None):
+    if ev_time is None:
+        ev_time = _get_event_timestamp(ev)
+    best_beat = None
+    best_overlap = -1.0
+    for b in beats:
+        b_start = _num(b.get('start'))
+        b_end = _num(b.get('end'))
+        if ev_time is not None and (b_start <= ev_time <= b_end or (b_start - 0.1 <= ev_time <= b_end + 0.1)):
+            return b
+        e_start = _num(ev.get('start', ev_time or 0))
+        e_end = _num(ev.get('end', ev_time or 0))
+        overlap = max(0.0, min(b_end, e_end) - max(b_start, e_start))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_beat = b
+    if best_beat is None and beats:
+        min_dist = float('inf')
+        target_t = ev_time if ev_time is not None else 0.0
+        for b in beats:
+            b_mid = (_num(b.get('start')) + _num(b.get('end'))) / 2.0
+            dist = abs(b_mid - target_t)
+            if dist < min_dist:
+                min_dist = dist
+                best_beat = b
+    return best_beat
+
+
+def reconcile_event_coverage(beats_doc, overview=None, reconcile_unbound=True):
+    """自动解决 event_double_bound (多拍认领同一事件) 以及可选的 event_unbound (漏认领事件)。
+
+    规则：
+    1. 每个 change_event 必须且只能分配给时间窗口最匹配（包含 peak/中点）的唯一一拍。
+    2. 拆拍后派生的子拍绝不重复声明父拍的 event_id。
+    3. 没有任何 change_event 的子拍保持 source_event_ids 为空列表 []，完全合规。
+    """
+    overview = overview or {}
+    events = overview.get('change_events') or []
+    beats = beats_doc.get('beats') or []
+    if not beats:
+        return beats_doc
+
+    if not events:
+        seen = set()
+        for b in beats:
+            eids = b.get('source_event_ids') or []
+            unique_eids = []
+            for eid in eids:
+                if eid not in seen:
+                    unique_eids.append(eid)
+                    seen.add(eid)
+            b['source_event_ids'] = unique_eids
+        return beats_doc
+
+    event_by_id = {e.get('event_id'): e for e in events if e.get('event_id')}
+
+    if reconcile_unbound:
+        for b in beats:
+            b['source_event_ids'] = []
+        for eid, ev in event_by_id.items():
+            best_beat = _find_best_matching_beat(beats, ev)
+            if best_beat is not None:
+                if eid not in best_beat['source_event_ids']:
+                    best_beat['source_event_ids'].append(eid)
+    else:
+        claimed_map = {}
+        for b in beats:
+            for eid in (b.get('source_event_ids') or []):
+                claimed_map.setdefault(eid, []).append(b)
+        for eid, beat_list in claimed_map.items():
+            if len(beat_list) > 1:
+                ev = event_by_id.get(eid, {})
+                best_b = _find_best_matching_beat(beat_list, ev) or beat_list[0]
+                for b in beat_list:
+                    if b is not best_b:
+                        b['source_event_ids'] = [x for x in (b.get('source_event_ids') or []) if x != eid]
+
+    return beats_doc
+
+
 def _validate_event_coverage(beats, overview):
     """每个 change_event 必须且只能被一拍认领。
 
@@ -2191,17 +2464,21 @@ def _validate_space_grouping(source_doc, variant_doc):
                  f'那等于改掉了这条片子进几次门。', bid)]
 
 
-def _validate_time_axis(beats, duration):
+def _validate_time_axis(beats, duration, speed_multiplier=None):
     """时间轴：非法窗、超长、重叠，以及**没有任何一拍覆盖的时间段**。
 
     空洞这一条是 2026-08-13 补的。此前只查重叠不查空洞，于是「这一段被漏掉了」与
     「这一段确实没事发生」在产物里长得一模一样——而前者正是复刻会整段丢掉一道工序的
     成因。判 warn 不判 error：安静段落（比如镜头空摇）确实可以不属于任何里程碑，
     该由人看一眼定夺，不该直接拦死合成。
+    
+    2x 倍速适配（2026-08-16）：参考视频通常为 2x 倍速，单拍屏幕时长 span 对应的
+    真实物理动作为 span * speed_multiplier。
     """
     out = []
     prev_end = None
     first_start = None
+    speed = float(speed_multiplier) if speed_multiplier and speed_multiplier > 0 else 2.0
     for beat in beats:
         bid = beat.get('id')
         start, end = _num(beat.get('start')), _num(beat.get('end'))
@@ -2209,6 +2486,17 @@ def _validate_time_axis(beats, duration):
             first_start = start
         if end <= start:
             out.append(_err('bad_window', f'{bid} 的时间窗非法：start={start} end={end}', bid))
+        span = end - start
+        if span < 2.0:
+            action_sec = span * speed
+            out.append(_warn('beat_too_short',
+                             f'{bid} 屏幕时长仅 {span:.1f}s（等效 1.0x 物理动作约 {action_sec:.1f}s，低于 2.0s 阈值），'
+                             f'粒度过细，建议与相邻工序合并', bid))
+        elif span > 6.0:
+            action_sec = span * speed
+            out.append(_warn('beat_too_long',
+                             f'{bid} 屏幕时长达 {span:.1f}s（等效 1.0x 物理动作长达 {action_sec:.1f}s，超过 6.0s 建议上限），'
+                             f'包含过多复合工序，建议拆分为两个具体子工序里程碑', bid))
         if duration and end > _num(duration) + 0.5:
             out.append(_warn('window_overruns',
                              f'{bid} 的 end={end}s 超出视频时长 {duration}s', bid))
@@ -2256,6 +2544,8 @@ def _validate_construction_order(beats):
     max_rank_so_far = 0
     max_rank_beat = None
     for beat, rank in staged:
+        if beat.get('stage') in ('transition', 'threshold') or str(beat.get('operation') or '').lower() in ('threshold', 'reward', 'reframe') or beat.get('bridge_stage'):
+            continue
         if rank is None:
             out.append(_warn('stage_unknown',
                              f'{beat.get("id")} 的 stage 无法识别：{beat.get("stage")}', beat.get('id')))
@@ -2307,6 +2597,37 @@ def _validate_construction_order(beats):
             out.append(_warn('finish_before_primer',
                              f'{beat.get("id")} 出现面漆但此前没有底漆拍。先核对帧再改顺序。',
                              beat.get('id')))
+    return out
+
+
+_SPACE_REGRESSION_KEYWORDS = re.compile(
+    r'leaking|water drip|decayed rafter|rotted wood|collapsed ceiling|'
+    r'piles of leaves|dead branches|broken rubble|bare mud|'
+    r'落叶堆积|残枝枯木|天花板漏水|破损塌陷|泥泞积水|地面杂物',
+    re.I
+)
+
+
+def _validate_space_monotonicity(beats):
+    """过门时空单调继承与零状态回退校验：跨空间过门后，不得在 state_before 或 visible_details 中描写已被修复的退化状态。"""
+    out = []
+    if not beats:
+        return out
+    crossings = space_crossings([b.get('space', '') for b in beats if isinstance(b, dict)])
+    for pos in crossings:
+        idx = pos - 1
+        if 0 <= idx < len(beats):
+            beat = beats[idx]
+            bid = beat.get('id')
+            text = f"{beat.get('state_before') or ''} {' '.join(beat.get('visible_details') or [])}"
+            matched = _SPACE_REGRESSION_KEYWORDS.findall(text)
+            if matched:
+                out.append(_warn(
+                    'space_state_regression',
+                    f'{bid}（过门进入新空间第一拍）描述了疑似已被前序工序修复的退化状态（{"、".join(set(matched))}）。'
+                    f'请核对证据帧：进门首帧必须物理继承已完工的室外/前序工序，严禁状态倒退。',
+                    bid
+                ))
     return out
 
 
@@ -2423,7 +2744,11 @@ def mutate_beats(config, beats_doc, axis_spec, on_progress=None, max_rework=1):
             raise ValueError(f'二创回复应当是一个 JSON 对象，实际是 {type(data).__name__}')
         variant = _merge_variant(beats_doc, data, axes)
         violations = [v for v in _validate_construction_order(variant['beats'])]
-        violations.extend(_validate_time_axis(variant['beats'], variant.get('video_duration_sec')))
+        violations.extend(_validate_time_axis(
+            variant['beats'],
+            variant.get('video_duration_sec'),
+            speed_multiplier=variant.get('speed_multiplier') or beats_doc.get('speed_multiplier')
+        ))
         violations.extend(_validate_space_grouping(beats_doc, variant))
         if not [v for v in violations if v['level'] == 'error']:
             break
@@ -2467,6 +2792,332 @@ def _merge_variant(beats_doc, data, axes):
         'banned_elements': [str(x).strip() for x in (data.get('banned_elements') or []) if str(x).strip()],
         'beats': out_beats,
     }
+
+
+# ── AI 定向修复节拍硬伤 ───────────────────────────────────────────────────────
+
+_AUTOFIX_SYSTEM = """You fix validation errors and construction order violations in a renovation/restoration time-lapse beat ladder (timelapse_beats.json).
+
+You are given:
+- CURRENT BEAT LADDER: list of beats with timestamps, stages, spaces, operations, actions, traces.
+- VALIDATION FAILURES: the exact mechanical validation errors that MUST be fixed (e.g. stage regressions, rough_in after covering/enclosure, package operations out of range, missing fields).
+
+THE 9 STANDARDIZED STAGES (IN STRICT CHRONOLOGICAL SEQUENCE):
+1. demolition: tearing out, clearing, digging, hauling away waste debris.
+2. structural: foundations, framing, load-bearing walls, subfloors, roof structure, structural opening cuts.
+3. rough_in: MEP services that get covered up — electrical wiring, plumbing pipes, conduits, ductwork, insulation.
+4. enclosure: closing cavities — wall studs, insulation batts/foam, wallboards, drywall, ceiling boards, timber cladding.
+5. surface: finish layers — joint taping, sanding, primer, paint, plaster, tiles, trim, wet trades.
+6. floor: floor finishing — subfloor, joists, teak/wood planking, tiles, floor coverings.
+7. fixtures: powered/plumbed equipment installed — light fittings, sockets, switches, sconces, taps, built-in cabinets/furniture.
+8. furnishing: loose furniture, mattresses, textiles, decor staging, tea table.
+9. reveal: final walkthrough / hero shot showcasing completed space.
+
+CRITICAL RULES:
+- CHRONOLOGICAL STAGE MONOTONICITY:
+  - Stages across the beat ladder must follow the construction sequence without invalid regressions (demolition -> structural -> rough_in -> enclosure -> surface -> floor -> fixtures -> furnishing -> reveal).
+  - NEVER mark a beat as rough_in if it occurs AFTER enclosure, surface, or floor. If it installs lights, switches, or outlets on finished walls, change stage to fixtures.
+  - NEVER mark a beat as structural if it occurs during interior finish/carpentry after surfaces or flooring (reclassify to surface, fixtures, or enclosure as appropriate).
+  - Beats occurring after or at the very end of reveal must be furnishing or reveal (e.g. hero shots, lighting ambiance, final staging).
+  - If a prior beat was misclassified (e.g. an early framing beat was mislabelled enclosure before rough_in, or rough_in was mislabelled surface), reclassify the stage to the logically accurate one.
+- PRESERVE INTEGRITY:
+  - Keep all beat `id`s intact in their existing order (B01, B02, ...).
+  - Keep timestamps (`start`, `end`), `space`, and frame bindings (`evidence_frames` / `reference_frames`) unchanged.
+  - Fix `package_operations` if out of range: ensure each beat has 1 to 3 concise, tightly coupled operations.
+  - Fix `persistent_traces`: ensure at least 2 visible physical marks left on surfaces.
+  - Keep descriptions faithful to the work shown, only adjusting wording where necessary to match the corrected stage or fix vague states.
+
+OUTPUT:
+Return ONE JSON object, no commentary, no code fences:
+{
+  "beats": [
+    {
+      "id": "B01",
+      "stage": "<one of the 9 stages>",
+      "operation": "...",
+      "package_operations": ["..."],
+      "visual_subject": "...",
+      "visible_details": ["..."],
+      "visible_action": "...",
+      "visible_result": "...",
+      "state_before": "...",
+      "state_after": "...",
+      "persistent_traces": ["..."]
+    }
+  ]
+}"""
+
+
+def _merge_fixed_beats(beats_doc, data):
+    """把 AI 修复后的字段并回原 beats_doc，保护 timestamps、evidence_frames 等不被抹除。"""
+    raw_list = data.get('beats') if isinstance(data, dict) else data
+    if not isinstance(raw_list, list):
+        return beats_doc
+
+    by_id = {}
+    for idx, b in enumerate(raw_list):
+        if isinstance(b, dict):
+            bid = b.get('id')
+            if bid:
+                by_id[bid] = b
+            by_id[idx] = b
+
+    out_beats = []
+    for idx, src in enumerate(beats_doc.get('beats') or []):
+        new = dict(src)
+        patch = by_id.get(src.get('id')) or by_id.get(idx) or {}
+        for key in ('stage', 'operation', 'package_operations', 'persistent_traces',
+                    'visual_subject', 'visible_details', 'visible_action', 'visible_result',
+                    'state_before', 'state_after', 'space', 'workers_present', 'source_event_ids'):
+            if key in patch and patch[key] not in (None, '', []):
+                new[key] = patch[key]
+                if isinstance(new.get('zh'), dict):
+                    new['zh'] = {k: v for k, v in new['zh'].items() if k != key}
+        out_beats.append(new)
+
+    beats_doc['beats'] = out_beats
+    beats_doc.setdefault('banned_elements', [])
+    beats_doc.setdefault('scene_signature', '')
+    if isinstance(data, dict):
+        if 'scene_signature' in data and data['scene_signature']:
+            beats_doc['scene_signature'] = str(data['scene_signature']).strip()
+        if 'banned_elements' in data and isinstance(data['banned_elements'], list):
+            beats_doc['banned_elements'] = [str(x).strip() for x in data['banned_elements'] if str(x).strip()]
+    return beats_doc
+
+
+def autofix_beats(config, beats_doc, overview=None, on_progress=None, max_rework=2):
+    """AI 定向修复节拍阶梯中的硬伤与违规项。
+
+    针对校验器指出的 stage_regression, rough_in_after_enclosure, package_operations,
+    event_double_bound 等违规，机械层优先自动调解事件覆盖冲突，剩余逻辑回喂给 LLM 做定向修正，
+    修复后重新执行机械校验。返回 (fixed_beats_doc, fixed_errors_count)。
+    """
+    overview = overview or {}
+    
+    raw_violations = validate_beats(beats_doc, overview)
+    raw_errors = [v for v in raw_violations if v.get('level') == 'error']
+    if not raw_errors:
+        return beats_doc, 0
+
+    # 1. 机械层确定性预修复：解决 event_double_bound (多拍认领) 与 event_unbound (漏认领)
+    reconcile_event_coverage(beats_doc, overview)
+    
+    initial_violations = validate_beats(beats_doc, overview)
+    initial_errors = [v for v in initial_violations if v.get('level') == 'error']
+    if not initial_errors:
+        beats_doc['validation'] = initial_violations
+        return beats_doc, len(raw_errors)
+
+    source_beats = beats_doc.get('beats') or []
+    skeleton = json.dumps([
+        {k: b.get(k) for k in ('id', 'start', 'end', 'space', 'stage', 'operation',
+                               'package_operations', 'visual_subject', 'visible_details',
+                               'visible_action', 'visible_result', 'state_before',
+                               'state_after', 'persistent_traces', 'workers_present', 'source_event_ids')
+         if b.get(k) is not None}
+        for b in source_beats
+    ], ensure_ascii=False, indent=2)
+
+    parse_budget = _PARSE_RETRY_BUDGET
+    violations = list(initial_violations)
+    attempt = 0
+
+    while attempt <= max_rework:
+        pp._raise_if_cancelled(on_progress)
+        err_lines = [f"- [{v.get('level', 'error').upper()}] ({v.get('code')}) "
+                     f"{v.get('beat_id') or 'GLOBAL'}: {v.get('message')}" for v in violations]
+        user_prompt = (
+            f"==================== CURRENT BEAT LADDER ====================\n{skeleton}\n\n"
+            f"==================== VALIDATION FAILURES (FIX THESE) ====================\n"
+            + "\n".join(err_lines) + "\n\n"
+            "Please fix the errors above by correcting the stage classification, package_operations, "
+            "persistent_traces, source_event_ids, or descriptions. Preserve the beat IDs and real construction observations."
+        )
+
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'review_beats',
+                'message': ('AI 正在分析硬伤并定向修复节拍阶梯…' if attempt == 0
+                            else f'正在进行第 {attempt + 1} 轮定向修复…'),
+            })
+
+        raw = pp._chat(config, _AUTOFIX_SYSTEM, user_prompt, temperature=0.1,
+                       max_tokens=16384, timeout=240)
+        try:
+            data = parse_json_reply(raw)
+        except ValueError as e:
+            parse_budget -= 1
+            if parse_budget < 0:
+                raise
+            if on_progress:
+                on_progress('replica_stage', {
+                    'stage': 'review_beats',
+                    'message': f'模型回复不是合法 JSON，正在重试（剩余 {parse_budget + 1} 次）…',
+                })
+            continue
+
+        if not isinstance(data, (dict, list)):
+            raise ValueError(f'AI 修复回复应当是一个 JSON 对象或数组，实际是 {type(data).__name__}')
+
+        _merge_fixed_beats(beats_doc, data)
+        normalize_beat_keys(beats_doc)
+        _renumber_beats(beats_doc)
+        normalize_beat_spaces(beats_doc)
+        reconcile_event_coverage(beats_doc, overview)
+        attach_coverage_frames(beats_doc, overview)
+
+        violations = validate_beats(beats_doc, overview)
+        remaining_errors = [v for v in violations if v.get('level') == 'error']
+        if not remaining_errors:
+            break
+        attempt += 1
+
+    beats_doc['validation'] = violations
+    remaining_errors = [v for v in violations if v.get('level') == 'error']
+    fixed_count = max(0, len(initial_errors) - len(remaining_errors))
+    return beats_doc, max(1, fixed_count)
+
+
+def autobalance_beats(beats_doc, overview=None, max_duration=6.0, min_duration=2.0, speed_multiplier=2.0):
+    """根据秒数与 2x 倍速模型自动拆解超长拍（>6.0s）并合并微拍（<2.0s）。"""
+    overview = overview or {}
+    source_beats = [dict(b) for b in (beats_doc.get('beats') or []) if isinstance(b, dict)]
+    if not source_beats:
+        return beats_doc, 0
+
+    speed = float(beats_doc.get('speed_multiplier') or speed_multiplier or 2.0)
+    beats_doc['speed_multiplier'] = speed
+
+    changed_count = 0
+    current_beats = source_beats
+
+    for _ in range(3):
+        # 1. 拆解超长拍 (> max_duration)
+        split_beats = []
+        split_occurred = False
+        for b in current_beats:
+            start = _num(b.get('start'))
+            end = _num(b.get('end'))
+            span = round(end - start, 2)
+            if span > max_duration:
+                num_parts = max(2, int(math.ceil(span / max_duration)))
+                part_duration = round(span / num_parts, 1)
+                cur_start = start
+                pkg = list(b.get('package_operations') or [])
+
+                for part_idx in range(num_parts):
+                    cur_end = end if part_idx == num_parts - 1 else round(cur_start + part_duration, 1)
+                    sub_b = dict(b)
+                    sub_b['start'] = cur_start
+                    sub_b['end'] = cur_end
+
+                    if len(pkg) >= num_parts:
+                        chunk_sz = max(1, len(pkg) // num_parts)
+                        sub_pkg = pkg[part_idx * chunk_sz:(part_idx + 1) * chunk_sz] or [pkg[-1]]
+                        sub_b['package_operations'] = sub_pkg
+
+                    if b.get('stage') == 'reveal' or b.get('operation') in ('reward', 'reveal'):
+                        if part_idx == 0:
+                            sub_b['operation'] = '软装点缀与设备点亮 (Phase 1)'
+                            sub_b['stage'] = 'furnishing'
+                        else:
+                            sub_b['operation'] = '终极完工全景赏析 (Phase 2)'
+                            sub_b['stage'] = 'reveal'
+                    else:
+                        op_name = b.get('operation') or '施工推进'
+                        sub_b['operation'] = f'{op_name} ({part_idx + 1}/{num_parts})'
+
+                    split_beats.append(sub_b)
+                    cur_start = cur_end
+                changed_count += (num_parts - 1)
+                split_occurred = True
+            else:
+                split_beats.append(b)
+
+        current_beats = split_beats
+
+        # 2. 合并过短微拍 (< min_duration)（严禁跨空间合并，严禁将过门/运镜拍与施工拍合并）
+        merged_beats = []
+        i = 0
+        merge_occurred = False
+        while i < len(current_beats):
+            curr = dict(current_beats[i])
+            c_start = _num(curr.get('start'))
+            c_end = _num(curr.get('end'))
+            c_span = round(c_end - c_start, 2)
+            c_is_trans = (
+                curr.get('stage') in ('transition', 'threshold', 'reveal')
+                or str(curr.get('operation') or '').lower() in ('threshold', 'reward', 'reframe')
+                or bool(curr.get('bridge_stage'))
+                or bool(curr.get('hard_cut'))
+            )
+            if c_span < min_duration and len(current_beats) > 1 and not c_is_trans:
+                if merged_beats:
+                    prev = merged_beats[-1]
+                    p_is_trans = (
+                        prev.get('stage') in ('transition', 'threshold', 'reveal')
+                        or str(prev.get('operation') or '').lower() in ('threshold', 'reward', 'reframe')
+                        or bool(prev.get('bridge_stage'))
+                        or bool(prev.get('hard_cut'))
+                    )
+                    if prev.get('space') == curr.get('space') and not p_is_trans:
+                        prev['end'] = c_end
+                        p_pkg = list(prev.get('package_operations') or [])
+                        c_pkg = list(curr.get('package_operations') or [])
+                        prev['package_operations'] = list(dict.fromkeys(p_pkg + c_pkg))[:3]
+                        changed_count += 1
+                        merge_occurred = True
+                        i += 1
+                        continue
+                if i + 1 < len(current_beats):
+                    nxt = dict(current_beats[i + 1])
+                    n_is_trans = (
+                        nxt.get('stage') in ('transition', 'threshold', 'reveal')
+                        or str(nxt.get('operation') or '').lower() in ('threshold', 'reward', 'reframe')
+                        or bool(nxt.get('bridge_stage'))
+                        or bool(nxt.get('hard_cut'))
+                    )
+                    if nxt.get('space') == curr.get('space') and not n_is_trans:
+                        nxt['start'] = c_start
+                        n_pkg = list(nxt.get('package_operations') or [])
+                        c_pkg = list(curr.get('package_operations') or [])
+                        nxt['package_operations'] = list(dict.fromkeys(c_pkg + n_pkg))[:3]
+                        current_beats[i + 1] = nxt
+                        changed_count += 1
+                        merge_occurred = True
+                        i += 1
+                        continue
+            merged_beats.append(curr)
+            i += 1
+
+        current_beats = merged_beats
+        if not split_occurred and not merge_occurred:
+            break
+
+    beats_doc['beats'] = current_beats
+    normalize_beat_keys(beats_doc)
+    _renumber_beats(beats_doc)
+    normalize_beat_spaces(beats_doc)
+    reconcile_event_coverage(beats_doc, overview)
+    attach_coverage_frames(beats_doc, overview)
+
+    try:
+        from .duration_engine import calculate_beat_word_quota
+        for b in beats_doc.get('beats') or []:
+            start, end = _num(b.get('start')), _num(b.get('end'))
+            if end > start:
+                s_dur = round(end - start, 1)
+                b['screen_duration_sec'] = s_dur
+                b['action_duration_sec'] = round(s_dur * speed, 1)
+                b['speed_factor'] = speed
+                b['voiceover_quota'] = calculate_beat_word_quota(s_dur, lang='zh')
+    except Exception:
+        pass
+
+    violations = validate_beats(beats_doc, overview)
+    beats_doc['validation'] = violations
+    return beats_doc, changed_count
 
 
 # ── 交给合成器 ───────────────────────────────────────────────────────────────
@@ -2521,6 +3172,24 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
             value = str(beat.get(key) or '').strip()
             if value:
                 entry[key] = value
+
+        # 中文简介与结构化对照透传（2026-08-16）：卡点上核对过的 zh 字段（包含 operation/headline/
+        # visible_action/visible_result 等）必须透传给合成器。此前这里遗漏了 zh，导致合成出来的
+        # prompt_block 标题只有「图片 1:」而没有「图片 1（中文简介）:」，前端折叠栏缺失简介。
+        zh = beat.get('zh')
+        if isinstance(zh, dict) and zh:
+            entry['zh'] = dict(zh)
+            summary = zh.get('operation') or zh.get('headline') or zh.get('visible_result') or zh.get('visible_action')
+            if isinstance(summary, (list, tuple)):
+                summary = '、'.join(str(s).strip() for s in summary if str(s).strip())
+            if summary:
+                entry['summary'] = str(summary).strip()
+                entry['operation_zh'] = str(summary).strip()
+        elif beat.get('operation_zh') or beat.get('headline_zh') or beat.get('summary'):
+            summary = beat.get('operation_zh') or beat.get('headline_zh') or beat.get('summary')
+            entry['summary'] = str(summary).strip()
+            entry['operation_zh'] = str(summary).strip()
+
         outline.append(entry)
     dimensions['beat_outline'] = outline
 

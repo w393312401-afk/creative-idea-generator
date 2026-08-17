@@ -104,6 +104,8 @@ class ImageBatchRequest(BrowserEnvLockedRequest):
     # Targeted frame iteration must stay with the account that owns project_url.
     # A quota/risk retry on another account cannot open that account-scoped canvas.
     allow_account_switch: bool = True
+    is_candidate_mode: bool = False
+    generation_count: Optional[str] = None
 
 
 class GoogleFxRunRequest(BrowserEnvLockedRequest):

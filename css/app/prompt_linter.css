@@ -1,0 +1,243 @@
+/* =====================================================================
+   Pre-flight Prompt Linter Modal Styles
+   ===================================================================== */
+
+.prompt-linter-modal {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.75);
+    backdrop-filter: blur(8px);
+}
+
+.linter-modal-content {
+    background: #141721;
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    border-radius: 12px;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6), 0 0 25px rgba(245, 158, 11, 0.15);
+    width: 92%;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    animation: linterModalPop 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes linterModalPop {
+    from { opacity: 0; transform: scale(0.95) translateY(10px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.linter-modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    background: rgba(245, 158, 11, 0.08);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.linter-title-group {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.linter-warning-icon {
+    font-size: 24px;
+    line-height: 1;
+}
+
+.linter-status-bar {
+    padding: 10px 20px;
+    background: rgba(0, 0, 0, 0.25);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    font-size: 13px;
+    color: var(--text-secondary, #cbd5e1);
+}
+
+.linter-status-bar b {
+    color: var(--color-warning, #f59e0b);
+}
+
+.linter-modal-body {
+    padding: 16px 20px;
+    overflow-y: auto;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.linter-issues-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.linter-issue-card {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-left: 4px solid var(--color-warning, #f59e0b);
+    border-radius: 8px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    transition: background 0.15s ease;
+}
+
+.linter-issue-card:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.linter-issue-card.is-error {
+    border-left-color: var(--color-danger, #ef4444);
+    background: rgba(239, 68, 68, 0.04);
+}
+
+.linter-issue-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.linter-slot-badge {
+    background: #202636;
+    color: #93c5fd;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 4px;
+    border: 1px solid rgba(147, 197, 253, 0.3);
+    font-family: var(--font-mono, monospace);
+}
+
+.linter-rule-badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 4px;
+}
+
+.linter-tag-warning {
+    background: rgba(245, 158, 11, 0.18);
+    color: #fbbf24;
+    border: 1px solid rgba(245, 158, 11, 0.4);
+}
+
+.linter-tag-error {
+    background: rgba(239, 68, 68, 0.18);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+}
+
+.linter-autofix-badge {
+    font-size: 10.5px;
+    color: #34d399;
+    background: rgba(52, 211, 153, 0.12);
+    border: 1px solid rgba(52, 211, 153, 0.3);
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin-left: auto;
+}
+
+.linter-issue-body {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.linter-issue-msg {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #e2e8f0;
+}
+
+.linter-issue-match {
+    font-size: 12px;
+    color: #94a3b8;
+}
+
+.linter-issue-match code {
+    background: rgba(0, 0, 0, 0.4);
+    color: #fca5a5;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid rgba(248, 113, 113, 0.2);
+    font-family: var(--font-mono, monospace);
+    word-break: break-all;
+}
+
+.linter-issue-suggestion {
+    font-size: 12px;
+    color: #6ee7b7;
+    background: rgba(16, 185, 129, 0.08);
+    padding: 6px 10px;
+    border-radius: 6px;
+    border: 1px solid rgba(16, 185, 129, 0.2);
+    line-height: 1.4;
+}
+
+.linter-modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    padding: 14px 20px;
+    background: rgba(0, 0, 0, 0.3);
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.linter-cancel-btn {
+    background: rgba(255, 255, 255, 0.06) !important;
+    border: 1px solid rgba(255, 255, 255, 0.15) !important;
+    color: var(--text-secondary) !important;
+    border-radius: 6px !important;
+    padding: 6px 12px !important;
+    font-size: 12px !important;
+}
+
+.linter-cancel-btn:hover {
+    background: rgba(255, 255, 255, 0.12) !important;
+    border-color: rgba(255, 255, 255, 0.25) !important;
+    color: #ffffff !important;
+    transform: translateY(-1px);
+}
+
+.linter-autofix-btn {
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.2) 0%, rgba(5, 150, 105, 0.25) 100%) !important;
+    border: 1px solid #10b981 !important;
+    color: #34d399 !important;
+    font-weight: 700 !important;
+    border-radius: 6px !important;
+    padding: 6px 14px !important;
+    font-size: 12px !important;
+    box-shadow: 0 0 12px rgba(16, 185, 129, 0.2);
+}
+
+.linter-autofix-btn:hover {
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%) !important;
+    color: #ffffff !important;
+    box-shadow: 0 2px 16px rgba(16, 185, 129, 0.45);
+    transform: translateY(-1px);
+}
+
+.linter-proceed-btn {
+    background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%) !important;
+    border: 1px solid #f59e0b !important;
+    color: #0f172a !important;
+    font-weight: 700 !important;
+    border-radius: 6px !important;
+    padding: 6px 14px !important;
+    font-size: 12px !important;
+    box-shadow: 0 0 12px rgba(245, 158, 11, 0.3);
+}
+
+.linter-proceed-btn:hover {
+    background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%) !important;
+    box-shadow: 0 2px 18px rgba(245, 158, 11, 0.5);
+    color: #040812 !important;
+    transform: translateY(-1px);
+}

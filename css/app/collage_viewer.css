@@ -1,0 +1,477 @@
+/* =====================================================================
+   Interactive 5-Column Collage Viewer Modal Styles
+   ===================================================================== */
+
+.collage-viewer-modal {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.88);
+    backdrop-filter: blur(12px);
+}
+
+.cv-modal-content {
+    background: #0d111a;
+    border: 1px solid rgba(0, 245, 212, 0.3);
+    border-radius: 12px;
+    box-shadow: 0 25px 60px rgba(0, 0, 0, 0.8), 0 0 35px rgba(0, 245, 212, 0.15);
+    width: 95vw;
+    height: 92vh;
+    max-width: 1700px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    animation: cvModalPop 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes cvModalPop {
+    from { opacity: 0; transform: scale(0.97); }
+    to { opacity: 1; transform: scale(1); }
+}
+
+/* ── 头部与工具栏 ────────────────────────────────────────── */
+
+.cv-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    background: rgba(13, 20, 32, 0.9);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    gap: 16px;
+    flex-wrap: wrap;
+}
+
+.cv-header-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.cv-title-icon {
+    font-size: 22px;
+}
+
+.cv-title-text h3 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: 0.3px;
+}
+
+.cv-subtitle {
+    font-size: 11.5px;
+    color: #94a3b8;
+}
+
+.cv-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.cv-toolgroup {
+    display: inline-flex;
+    align-items: center;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 6px;
+    padding: 2px;
+    gap: 2px;
+}
+
+.cv-tool-btn {
+    background: transparent;
+    border: none;
+    color: #cbd5e1;
+    font-size: 12px;
+    padding: 5px 9px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: inherit;
+}
+
+.cv-tool-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: #fff;
+}
+
+.cv-tool-btn.is-active {
+    background: var(--neon-cyan, #00f5d4);
+    color: #0d111a;
+    font-weight: 700;
+    box-shadow: 0 0 10px rgba(0, 245, 212, 0.35);
+}
+
+.cv-zoom-display {
+    font-size: 11.5px;
+    font-family: var(--font-mono, monospace);
+    color: #94a3b8;
+    padding: 0 6px;
+    min-width: 40px;
+    text-align: center;
+}
+
+/* ── 主体区域 ────────────────────────────────────────────── */
+
+.cv-body {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    background: #080a10;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* ── 5列拼图画布 ─────────────────────────────────────────── */
+
+.cv-canvas-viewport {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: grab;
+    user-select: none;
+}
+
+.cv-canvas-transform {
+    transform-origin: center center;
+    transition: transform 0.05s linear;
+    display: inline-block;
+}
+
+.cv-image-container {
+    position: relative;
+    display: inline-block;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.cv-collage-img {
+    display: block;
+    max-width: 100%;
+    max-height: 80vh;
+    object-fit: contain;
+    pointer-events: none;
+}
+
+/* 滤镜效果 */
+.cv-filter-mono {
+    filter: grayscale(100%) contrast(115%);
+}
+
+.cv-filter-contrast {
+    filter: contrast(180%) brightness(95%);
+}
+
+/* ── 辅助基准线系统 ───────────────────────────────────────── */
+
+.cv-guidelines-layer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    pointer-events: none;
+}
+
+/* 水平地平基准线 */
+.cv-line-horizon {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: rgba(0, 245, 212, 0.85);
+    box-shadow: 0 0 8px rgba(0, 245, 212, 0.8);
+    cursor: row-resize;
+    pointer-events: auto;
+    z-index: 10;
+}
+
+.cv-line-handle {
+    position: absolute;
+    right: 8px;
+    top: -20px;
+    background: rgba(0, 245, 212, 0.9);
+    color: #000;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-family: var(--font-mono, monospace);
+    pointer-events: none;
+}
+
+/* 三分线 */
+.cv-grid-thirds {
+    position: absolute;
+    inset: 0;
+}
+
+.cv-thirds-v {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: rgba(255, 255, 255, 0.25);
+    border-right: 1px dashed rgba(0, 245, 212, 0.4);
+}
+
+.cv-thirds-h {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: rgba(255, 255, 255, 0.25);
+    border-bottom: 1px dashed rgba(0, 245, 212, 0.4);
+}
+
+/* 透视十字线 */
+.cv-crosshair {
+    position: absolute;
+    inset: 0;
+}
+
+.cv-cross-v {
+    position: absolute;
+    left: 50%;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: rgba(239, 68, 68, 0.7);
+    box-shadow: 0 0 4px rgba(239, 68, 68, 0.5);
+}
+
+.cv-cross-h {
+    position: absolute;
+    top: 50%;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: rgba(239, 68, 68, 0.7);
+    box-shadow: 0 0 4px rgba(239, 68, 68, 0.5);
+}
+
+/* ── 局部放大镜 (Loupe Magnifier) ────────────────────────── */
+
+.cv-loupe-magnifier {
+    position: fixed;
+    width: 180px;
+    height: 180px;
+    border-radius: 50%;
+    border: 3px solid var(--neon-cyan, #00f5d4);
+    box-shadow: 0 0 25px rgba(0, 245, 212, 0.4), inset 0 0 15px rgba(0, 0, 0, 0.6);
+    overflow: hidden;
+    pointer-events: none;
+    z-index: 100;
+    background: #000;
+}
+
+.cv-loupe-canvas-wrap {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+}
+
+.cv-loupe-img {
+    position: absolute;
+    pointer-events: none;
+}
+
+.cv-loupe-crosshair {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(circle, transparent 4px, rgba(0, 245, 212, 0.4) 5px, transparent 6px);
+}
+
+.cv-loupe-crosshair::before,
+.cv-loupe-crosshair::after {
+    content: '';
+    position: absolute;
+    background: rgba(0, 245, 212, 0.6);
+}
+
+.cv-loupe-crosshair::before {
+    left: 50%; top: 0; bottom: 0; width: 1px;
+}
+
+.cv-loupe-crosshair::after {
+    top: 50%; left: 0; right: 0; height: 1px;
+}
+
+.cv-loupe-info {
+    position: absolute;
+    bottom: 6px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.75);
+    color: #00f5d4;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: var(--font-mono, monospace);
+}
+
+/* ── 邻帧对比滑块 (Adjacent Compare View) ─────────────────── */
+
+.cv-compare-container {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    padding: 16px;
+    box-sizing: border-box;
+}
+
+.cv-compare-selector-bar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    margin-bottom: 12px;
+}
+
+.cv-pair-picks {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 4px 12px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.cv-pair-label {
+    font-size: 12px;
+    color: #93c5fd;
+    font-weight: 600;
+}
+
+.cv-pair-arrow {
+    font-size: 12px;
+    color: #f59e0b;
+    font-weight: 600;
+}
+
+.cv-frame-select {
+    background: #141a29;
+    color: #fff;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 12px;
+    font-family: var(--font-mono, monospace);
+}
+
+.cv-split-viewport {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    background: #000;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: ew-resize;
+    user-select: none;
+}
+
+.cv-split-layer {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+
+.cv-compare-img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    pointer-events: none;
+}
+
+.cv-split-tag {
+    position: absolute;
+    top: 12px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 700;
+    font-family: var(--font-mono, monospace);
+    z-index: 5;
+}
+
+.cv-split-tag.tag-a {
+    left: 12px;
+    background: rgba(59, 130, 246, 0.85);
+    color: #fff;
+}
+
+.cv-split-tag.tag-b {
+    right: 12px;
+    background: rgba(245, 158, 11, 0.85);
+    color: #000;
+}
+
+/* 分割线与把手 */
+.cv-split-divider {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: #fff;
+    box-shadow: 0 0 10px rgba(255, 255, 255, 0.8);
+    z-index: 10;
+    pointer-events: none;
+}
+
+.cv-divider-handle {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    background: #fff;
+    color: #000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 900;
+    box-shadow: 0 0 15px rgba(0, 0, 0, 0.6);
+}
+
+/* ── 底部状态栏 ──────────────────────────────────────────── */
+
+.cv-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 20px;
+    background: rgba(13, 20, 32, 0.95);
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    font-size: 12px;
+    color: #94a3b8;
+}
+
+.cv-footer-stats b {
+    color: var(--neon-cyan, #00f5d4);
+}

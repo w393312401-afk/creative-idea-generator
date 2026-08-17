@@ -25,6 +25,7 @@ from ..model_catalog import DEFAULT_GOOGLE_FX_IMAGE_MODEL, GOOGLE_FX_IMAGE_MODEL
 from ..utils import selector_stats
 from ..utils import cancel_flag
 from .google_fx_dom import _click_first_visible, _find_first_visible, _safe_press_escape
+from .google_fx_credit import detect_page_credit_exhaustion, is_credit_exhausted_message
 
 _SLATE_EDITOR_SELECTOR = "[data-slate-editor='true']"
 
@@ -1273,10 +1274,21 @@ def _inspect_all_pending_tiles(page, tile_ids, prompts_map=None, slices_map=None
             const thumbSrc = thumbEl ? (thumbEl.currentSrc || thumbEl.src || '') : '';
             const progressMatch = (tile.innerText || '').match(/(\\d{1,3})\\s*%/);
             const hasProgress = progressMatch !== null;
+            const creditTokens = [
+                'credit', 'credits', 'quota', 'exhausted', 'insufficient',
+                '积分', '点数', '额度', '配额', 'run out', 'out of'
+            ];
+            const hasCreditExhaustedText = creditTokens.some(tok => text.includes(tok)) && (
+                text.includes('0') || text.includes('no ') || text.includes('not enough')
+                || text.includes('insufficient') || text.includes('out of') || text.includes('exhausted')
+                || text.includes('不足') || text.includes('已用完') || text.includes('耗尽')
+                || text.includes('无可用') || text.includes('没有') || text.includes('缺少')
+            );
             const hasFailText = text.includes('failed') || text.includes('something went wrong')
                              || text.includes('unusual activity') || text.includes('help center')
                              || text.includes('出错了') || text.includes('生成失败')
-                             || text.includes('失败') || text.includes('使用人数过多');
+                             || text.includes('失败') || text.includes('使用人数过多')
+                             || hasCreditExhaustedText;
             const isVisible = (el) => {
                 let cur = el;
                 while (cur) {
@@ -1294,13 +1306,14 @@ def _inspect_all_pending_tiles(page, tile_ids, prompts_map=None, slices_map=None
                 const isWarning = t === 'warning' || t === 'error' || t === 'error_outline';
                 return isWarning && isVisible(i);
             });
-            const failed = hasFailText && hasWarningIcon;
+            const failed = (hasFailText && hasWarningIcon) || hasCreditExhaustedText;
             // 🔧 2026-07-04: 收紧 IP 封禁判定。'help center'/'帮助中心' 是 Flow 所有失败
             // 卡片都会带的通用链接，此前把它算作 IP 被封的证据，导致普通生成失败也被
             // 当成封 IP → 整批中止 + 换 IP 重跑 → 大量重复提交。只认 unusual activity。
             const isIpBlocked = failed && (
                 text.includes('unusual activity') || text.includes('异常活动')
             );
+            const isCreditExhausted = failed && hasCreditExhaustedText;
             let status;
             if (videoSrc) {
                 status = 'done';
@@ -1317,6 +1330,7 @@ def _inspect_all_pending_tiles(page, tile_ids, prompts_map=None, slices_map=None
                 progress: (progressMatch ? Number(progressMatch[1]) : null),
                 failedText: (status === 'failed') ? (tile.innerText || '') : null,
                 isIpBlocked: isIpBlocked,
+                isCreditExhausted: isCreditExhausted,
             };
         }
         return results;
@@ -1678,6 +1692,9 @@ def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
 
     new_tile_id = _wait_for_new_tile_id(page, before_tile_ids, timeout=20, expect_slice=expect_slice)
     if not new_tile_id:
+        page_credit_err = detect_page_credit_exhaustion(page)
+        if page_credit_err:
+            raise RuntimeError(f"INSUFFICIENT_CREDITS: {page_credit_err}")
         raise RuntimeError("Generate 后未检测到新 tile")
     log(f"🎯 新 tile: {new_tile_id[:16]}...", "GoogleFX")
 
@@ -2814,7 +2831,7 @@ def _safe_page_url(page):
 # 取代了（那里才是真正会 raise 的地方）。它顺带带走了一处 forensics.capture("config_invalid")
 # ——那个 capture 标签因此从来没产生过现场文件，别再去 Errors 目录里找它。
 
-def _verify_and_fix_fx_config(page, model, ratio, want_video, context_label, mode_label="", duration=None, video_submode=None):
+def _verify_and_fix_fx_config(page, model, ratio, want_video, context_label, mode_label="", duration=None, video_submode=None, count="1x"):
     """统一的配置校验→面板修复确认流程 (三个生成函数共用)。
     video_submode: 'VIDEO_FRAMES' | 'VIDEO_REFERENCES' | None (仅 want_video 时生效)
     """
@@ -2836,7 +2853,7 @@ def _verify_and_fix_fx_config(page, model, ratio, want_video, context_label, mod
             f"（已尝试退出智能体模式 / 清弹窗 / 重进项目页 / 刷新页面均无效；"
             f"当前页面 {_safe_page_url(page)}，现场已留档到 Errors 目录）"
         )
-    checks = check_fx_config(status_text, model=model, orientation=vid_ratio, count="1x", duration=duration, want_video=want_video)
+    checks = check_fx_config(status_text, model=model, orientation=vid_ratio, count=count, duration=duration, want_video=want_video)
     # video_submode 不在底部摘要中显示，始终标记为需要修复
     if want_video and video_submode:
         checks["video_submode"] = False
@@ -2844,7 +2861,7 @@ def _verify_and_fix_fx_config(page, model, ratio, want_video, context_label, mod
         log("✅ 所有配置正确", "GoogleFX")
         return selected_ratio
     fix_info = fix_fx_config(page, cfg_btn, checks, model=model,
-                             orientation=vid_ratio, count="1x", duration=duration, want_video=want_video,
+                             orientation=vid_ratio, count=count, duration=duration, want_video=want_video,
                              mode_label=mode_label, video_submode=video_submode)
     initially_failed = [k for k, v in checks.items() if not v]
     fixed_keys = set((fix_info or {}).get("clicked_keys") or []) | set((fix_info or {}).get("resolved_keys") or [])
@@ -4318,6 +4335,13 @@ def _classify_failure_for_switch(reason):
     for token in _ACCOUNT_LOGIN_ERROR_TOKENS:
         if token in text:
             return True, f"账号登录失效（命中 '{token}'）"
+    # 积分/配额耗尽也是账号自身状态，必须先于自动化类（如 timeout）判断，
+    # 避免"超时未捕获到 URL（积分耗尽）"被 timeout 拦截而拒绝换号。
+    from .google_fx_credit import is_credit_exhausted_message
+    if is_credit_exhausted_message(text) or any(tok in text for tok in (
+        "insufficient_credits", "quota_exhausted", "resource_exhausted", "quota_exceeded"
+    )):
+        return True, "账号积分/配额耗尽（命中积分耗尽特征）"
     # 自动化类先判：'timeout'/'not found' 这类词在两边都可能出现，
     # 但"UI 元素超时/找不到"远比风控类超时常见，误判成换号的代价更大。
     for token in _AUTOMATION_ERROR_TOKENS:

@@ -1638,3 +1638,255 @@ class TestAnchorGrounding(unittest.TestCase):
     def test_no_reference_means_no_call_at_all(self):
         with patch.object(pp, '_multimodal_chat', side_effect=AssertionError('不该被调用')):
             self.assertEqual(reverse.ground_anchor_on_reference({}, 'p', None), 'p')
+
+
+class TestPassAOptimizationTests(unittest.TestCase):
+    """测试 Pass A 增量缓存、二分重试与峰值帧并发。"""
+
+    def test_pass_a_bisection_retry(self):
+        """当 >2 帧的批次解析失败时，先二分为两个子批次重试。"""
+        import tempfile
+        tmp_dir = tempfile.mkdtemp()
+        frames = []
+        for i in range(1, 5):
+            p = os.path.join(tmp_dir, f'review_{i:03d}.png')
+            with open(p, 'wb') as f: f.write(b'\x89PNG\r\n\x1a\n')
+            frames.append({'index': i, 'timestamp': float(i), 'frame_path': p})
+
+        overview = {'review_sampling': {'frames': frames}}
+        with open(os.path.join(tmp_dir, 'video_overview.json'), 'w') as f:
+            json.dump(overview, f)
+
+        calls = []
+        def mock_chat(*args, **kwargs):
+            imgs = args[3]
+            calls.append(len(imgs))
+            if len(imgs) == 4:
+                raise ValueError('4-frame response broken')
+            # 2帧子批次返回正确 JSON
+            ret = []
+            for img_path in imgs:
+                name = os.path.basename(img_path)
+                ret.append({
+                    'image_filename': name,
+                    'subject': 'wall',
+                    'action': 'painting',
+                    'space': 'room',
+                    'persistent_traces': ['paint on floor'],
+                })
+            return json.dumps(ret)
+
+        with patch.object(pp, '_multimodal_chat', side_effect=mock_chat):
+            facts = reverse.extract_frame_facts({}, tmp_dir)
+
+        self.assertEqual(len(facts['facts']), 4)
+        # 第一次尝试 4 帧失败后重试超额，接着二分为两个 2 帧子批次成功
+        self.assertIn(4, calls)
+        self.assertIn(2, calls)
+
+    def test_verify_peak_frames_parallel_execution(self):
+        """验证 verify_peak_frames 使用 _map_parallel 并行执行。"""
+        import tempfile
+        tmp_dir = tempfile.mkdtemp()
+        f1 = os.path.join(tmp_dir, 'review_002.png')
+        f2 = os.path.join(tmp_dir, 'review_005.png')
+        with open(f1, 'wb') as f: f.write(b'png')
+        with open(f2, 'wb') as f: f.write(b'png')
+
+        overview = {
+            'review_sampling': {
+                'frames': [
+                    {'frame_path': f1, 'timestamp': 1.0},
+                    {'frame_path': f2, 'timestamp': 2.0},
+                ]
+            },
+            'change_events': [
+                {'event_id': 'E01', 'evidence_frames': ['review_001.png', 'review_002.png', 'review_003.png']},
+                {'event_id': 'E02', 'evidence_frames': ['review_004.png', 'review_005.png', 'review_006.png']},
+            ]
+        }
+        with open(os.path.join(tmp_dir, 'video_overview.json'), 'w') as f:
+            json.dump(overview, f)
+        raw_doc = {'facts': [{'frame': 'review_002.png', 'timestamp': 1.0}, {'frame': 'review_005.png', 'timestamp': 2.0}]}
+        with patch.object(pp, '_map_parallel', return_value={
+            0: {'review_002.png': {'subject': 'peak 1'}},
+            1: {'review_005.png': {'subject': 'peak 2'}},
+        }) as map_mock:
+            res = reverse.verify_peak_frames({'model': 'test-model'}, tmp_dir, raw_doc)
+            map_mock.assert_called_once()
+            self.assertEqual(len(map_mock.call_args[0][1]), 1)
+            self.assertEqual(res['peak_verified'], 2)
+
+
+class TestAutofixBeats(unittest.TestCase):
+    """AI 定向修复节拍阶梯硬伤的单元测试。"""
+
+    def test_autofix_beats_clean_ladder_noop(self):
+        """干净无错的阶梯不触发 LLM 调用，直接返回。"""
+        overview = _overview(('E01', 'E02'))
+        beats_doc = {
+            'video_duration_sec': 10.0,
+            'banned_elements': [],
+            'scene_signature': 'a clean room',
+            'beats': [
+                _beat('B01', 0.0, 5.0, stage='demolition', events=('E01',)),
+                _beat('B02', 5.0, 10.0, stage='surface', events=('E02',)),
+            ]
+        }
+        with patch.object(pp, '_chat') as chat_mock:
+            fixed_doc, fixed_count = reverse.autofix_beats({}, beats_doc, overview)
+            chat_mock.assert_not_called()
+            self.assertEqual(fixed_count, 0)
+            self.assertEqual(len(fixed_doc['beats']), 2)
+
+    def test_autofix_beats_fixes_stage_regression_and_rough_in(self):
+        """阶梯包含阶段逆行与遮盖后隐蔽工程时，LLM 返回修正后能通过校验。"""
+        overview = _overview(('E01', 'E02', 'E03'))
+        # 构造有硬伤的节拍：B02 是 surface，B03 却逆行成 rough_in 且在 surface 之后
+        beats_doc = {
+            'video_duration_sec': 10.0,
+            'banned_elements': [],
+            'scene_signature': 'a room',
+            'beats': [
+                _beat('B01', 0.0, 3.0, stage='demolition', events=('E01',)),
+                _beat('B02', 3.0, 6.0, stage='surface', events=('E02',)),
+                _beat('B03', 6.0, 10.0, stage='rough_in', events=('E03',)),
+            ]
+        }
+        initial_errors = [v for v in reverse.validate_beats(beats_doc, overview) if v['level'] == 'error']
+        self.assertTrue(len(initial_errors) >= 1)
+
+        # 模拟 LLM 修复：把 B03 改成 floor，符合施工顺序
+        fixed_reply = json.dumps({
+            'beats': [
+                {'id': 'B01', 'stage': 'demolition', 'operation': 'clearing debris'},
+                {'id': 'B02', 'stage': 'surface', 'operation': 'plastering'},
+                {'id': 'B03', 'stage': 'floor', 'operation': 'installing wood planks'},
+            ]
+        })
+
+        with patch.object(pp, '_chat', return_value=fixed_reply) as chat_mock:
+            fixed_doc, fixed_count = reverse.autofix_beats({}, beats_doc, overview)
+            chat_mock.assert_called_once()
+            self.assertTrue(fixed_count >= 1)
+            remaining_errors = [v for v in fixed_doc['validation'] if v['level'] == 'error']
+            self.assertEqual(len(remaining_errors), 0)
+            self.assertEqual(fixed_doc['beats'][2]['stage'], 'floor')
+            # 验证时间与证据帧未丢失
+            self.assertEqual(fixed_doc['beats'][2]['start'], 6.0)
+            self.assertEqual(fixed_doc['beats'][2]['end'], 10.0)
+
+    def test_autofix_beats_retries_on_bad_json(self):
+        """首次返回非 JSON 时重试并成功修复。"""
+        overview = _overview(('E01', 'E02'))
+        beats_doc = {
+            'video_duration_sec': 10.0,
+            'banned_elements': [],
+            'scene_signature': 'a room',
+            'beats': [
+                _beat('B01', 0.0, 5.0, stage='surface', events=('E01',)),
+                _beat('B02', 5.0, 10.0, stage='structural', events=('E02',)), # 逆行
+            ]
+        }
+        fixed_reply = json.dumps({
+            'beats': [
+                {'id': 'B01', 'stage': 'surface'},
+                {'id': 'B02', 'stage': 'floor'},
+            ]
+        })
+        with patch.object(pp, '_chat', side_effect=['not a json', fixed_reply]) as chat_mock:
+            fixed_doc, fixed_count = reverse.autofix_beats({}, beats_doc, overview)
+            self.assertEqual(chat_mock.call_count, 2)
+            self.assertEqual(fixed_doc['beats'][1]['stage'], 'floor')
+            remaining_errors = [v for v in fixed_doc['validation'] if v['level'] == 'error']
+            self.assertEqual(len(remaining_errors), 0)
+
+    def test_reconcile_event_coverage_resolves_double_bound_and_unbound(self):
+        """测试自动解决多拍重复认领 E02/E07 的硬伤。"""
+        overview = _overview(('E01', 'E02', 'E03'))
+        overview['change_events'] = [
+            {'event_id': 'E01', 'start': 0.0, 'end': 3.6, 'peak': 1.8},
+            {'event_id': 'E02', 'start': 3.6, 'end': 10.9, 'peak': 5.5},
+            {'event_id': 'E03', 'start': 10.9, 'end': 14.5, 'peak': 12.0},
+        ]
+        beats_doc = {
+            'video_duration_sec': 14.5,
+            'banned_elements': [],
+            'scene_signature': 'a bunker',
+            'beats': [
+                _beat('B01', 0.0, 3.6, stage='demolition', events=('E01',)),
+                # 拆拍导致的重复认领：B02 和 B03 均认领 E02
+                _beat('B02', 3.6, 7.2, stage='structural', events=('E02',)),
+                _beat('B03', 7.2, 10.9, stage='structural', events=('E02',)),
+                _beat('B04', 10.9, 14.5, stage='surface', events=('E03',)),
+            ]
+        }
+        # 此时有硬伤：E02 被多拍同时认领
+        violations = reverse.validate_beats(beats_doc, overview)
+        codes = [v['code'] for v in violations if v['level'] == 'error']
+        self.assertIn('event_double_bound', codes)
+
+        # 机械修复
+        reverse.reconcile_event_coverage(beats_doc, overview)
+        # 校验通过：E02 根据时间精确归属于 B02（包含 peak 5.5s），B03 为空，无重复认领
+        fixed_violations = reverse.validate_beats(beats_doc, overview)
+        fixed_errors = [v for v in fixed_violations if v['level'] == 'error']
+        self.assertEqual(fixed_errors, [])
+        self.assertEqual(beats_doc['beats'][1]['source_event_ids'], ['E02'])
+        self.assertEqual(beats_doc['beats'][2]['source_event_ids'], [])
+
+        # 测试 autofix_beats 面对包含 event_double_bound 的阶梯，在无须调用大模型的情况下也能直接通过机械层自愈
+        broken_doc = {
+            'video_duration_sec': 14.5,
+            'banned_elements': [],
+            'scene_signature': 'a bunker',
+            'beats': [
+                _beat('B01', 0.0, 3.6, stage='demolition', events=('E01',)),
+                _beat('B02', 3.6, 7.2, stage='structural', events=('E02',)),
+                _beat('B03', 7.2, 10.9, stage='structural', events=('E02',)),
+                _beat('B04', 10.9, 14.5, stage='surface', events=('E03',)),
+            ]
+        }
+        fixed_doc, count = reverse.autofix_beats({}, broken_doc, overview)
+        self.assertGreaterEqual(count, 1)
+        self.assertEqual([v for v in fixed_doc['validation'] if v['level'] == 'error'], [])
+
+    def test_transition_beat_exempt_from_package_operations_check(self):
+        """过门拍/运镜拍豁免 2~3 道施工工序与遗留痕迹检查。"""
+        beats = [
+            _beat('B01', 0.0, 3.5, stage='demolition', op='clear', pkg=('clear', 'haul')),
+            _beat('B02', 3.5, 6.0, stage='transition', op='threshold', pkg=('threshold',), traces=()),
+            _beat('B03', 6.0, 10.0, stage='floor', op='subfloor', pkg=('grade', 'compact')),
+        ]
+        errs = reverse._validate_composer_frame_contract(beats)
+        self.assertEqual(errs, [])
+
+    def test_autobalance_does_not_merge_transition_or_cross_space(self):
+        """自动微拍平衡严禁合并过门运镜拍，严禁跨空间合并。"""
+        beats_doc = {
+            'video_duration_sec': 9.0,
+            'beats': [
+                {'id': 'B01', 'start': 0.0, 'end': 3.5, 'stage': 'demolition', 'space': 'exterior',
+                 'operation': 'clear', 'package_operations': ['clear', 'haul']},
+                # 1.5s 的过门微拍
+                {'id': 'B02', 'start': 3.5, 'end': 5.0, 'stage': 'transition', 'space': 'exterior',
+                 'operation': 'threshold', 'package_operations': ['threshold']},
+                # 1.2s 的室内微拍
+                {'id': 'B03', 'start': 5.0, 'end': 6.2, 'stage': 'demolition', 'space': 'interior',
+                 'operation': 'clear', 'package_operations': ['rake', 'sweep']},
+                {'id': 'B04', 'start': 6.2, 'end': 9.0, 'stage': 'floor', 'space': 'interior',
+                 'operation': 'pave', 'package_operations': ['lay', 'fit']},
+            ]
+        }
+        balanced, count = reverse.autobalance_beats(beats_doc, min_duration=2.0)
+        stages = [b['stage'] for b in balanced['beats']]
+        # 过门拍保持独立，未被并入 B01 或 B03
+        self.assertIn('transition', stages)
+        # B03 与 B04 在同空间 (interior) 合并，未跨到 exterior
+        spaces = [b['space'] for b in balanced['beats']]
+        self.assertEqual(spaces, ['exterior', 'exterior', 'interior'])
+
+
+
+
+

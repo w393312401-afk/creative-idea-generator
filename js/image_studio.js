@@ -7,6 +7,7 @@
    ========================================================================== */
 
 let imgStudioCurrentTab = 't2i';
+let imgStudioMobileView = 'create'; // 'create' | 'result'
 let imgStudioSelectedT2iRatio = '16:9';
 let imgStudioSelectedT2iQuality = '2K';
 let imgStudioSelectedI2iRatio = 'auto';
@@ -14,6 +15,41 @@ let imgStudioSelectedI2iQuality = '1K';
 let imgStudioUploadedFiles = []; // Array of { name, file, base64 }
 let imgStudioHistory = []; // Array of { id, type, prompt, model, ratio, quality, timestamp, image }
 let imgStudioTaskList = []; // Array of { id, type, prompt, model, ratio, quality, status, error, image, timestamp, controller, extraData }
+
+// Mobile Subview Switch (P4: 创作 / 结果 互斥切换)
+window.switchImageStudioMobileView = function (view) {
+    imgStudioMobileView = view;
+    const grid = document.querySelector('#panel-image-studio .imgstudio-grid');
+    if (grid) {
+        grid.setAttribute('data-mobile-view', view);
+        grid.scrollTop = 0;
+    }
+    const createBtn = document.getElementById('imgstudio-mobtab-create');
+    const resultBtn = document.getElementById('imgstudio-mobtab-result');
+    if (createBtn) createBtn.classList.toggle('active', view === 'create');
+    if (resultBtn) resultBtn.classList.toggle('active', view === 'result');
+};
+
+function initImageStudioMobileView() {
+    const mql = window.matchMedia('(max-width: 768px)');
+    const syncView = (e) => {
+        const grid = document.querySelector('#panel-image-studio .imgstudio-grid');
+        if (!grid) return;
+        if (e.matches) {
+            grid.setAttribute('data-mobile-view', imgStudioMobileView);
+        } else {
+            grid.removeAttribute('data-mobile-view');
+        }
+    };
+    if (mql.matches) {
+        switchImageStudioMobileView(imgStudioMobileView);
+    }
+    if (typeof mql.addEventListener === 'function') {
+        mql.addEventListener('change', syncView);
+    } else if (typeof mql.addListener === 'function') {
+        mql.addListener(syncView);
+    }
+}
 
 // Curated Creative Prompts for Random Generator
 const IMGSTUDIO_CREATIVE_PROMPTS = [
@@ -270,6 +306,7 @@ function imgStudioTriggerGeneration() {
         }
 
         imgStudioAddTask('t2i', prompt, model, imgStudioSelectedT2iRatio, imgStudioSelectedT2iQuality, null);
+        switchImageStudioMobileView('result');
         showToast('文生图任务已加入生成队列', 'success');
     } else {
         const prompt = document.getElementById('i2i-prompt').value.trim();
@@ -290,6 +327,7 @@ function imgStudioTriggerGeneration() {
         const finalRatio = imgStudioSelectedI2iRatio === 'auto' ? 'Auto' : imgStudioSelectedI2iRatio;
 
         imgStudioAddTask('i2i', prompt, model, finalRatio, imgStudioSelectedI2iQuality, extraData);
+        switchImageStudioMobileView('result');
         showToast('图生图修改任务已加入生成队列', 'success');
     }
 }
@@ -550,6 +588,12 @@ function imgStudioRenderTaskListUI() {
     if (section) section.style.display = totalCount > 0 ? 'block' : 'none';
     const liveDot = document.getElementById('feed-live-dot');
     if (liveDot) liveDot.classList.toggle('active', activeCount > 0);
+
+    const mobileBadge = document.getElementById('imgstudio-mobile-active-badge');
+    if (mobileBadge) {
+        mobileBadge.textContent = activeCount;
+        mobileBadge.style.display = activeCount > 0 ? 'inline-block' : 'none';
+    }
 
     if (!container) return;
 
@@ -982,7 +1026,7 @@ function imgStudioSetupSpotlightActions(imgDataUrl, prompt, model, ratio, qualit
     };
 
     document.getElementById('spotlight-reuse-btn').onclick = () => {
-        imgStudioReusePrompt(prompt, ratio, quality);
+        imgStudioReusePrompt(prompt, ratio, quality, model);
     };
 
     document.getElementById('spotlight-to-i2i-btn').onclick = () => {
@@ -1041,9 +1085,15 @@ async function imgStudioCopyImageToClipboard(dataUrl) {
     }
 }
 
-function imgStudioReusePrompt(prompt, ratio, quality) {
+function imgStudioReusePrompt(prompt, ratio, quality, model) {
     if (imgStudioCurrentTab === 't2i') {
         document.getElementById('t2i-prompt').value = prompt;
+        if (model) {
+            const modelSelect = document.getElementById('t2i-model');
+            if (modelSelect && Array.from(modelSelect.options).some(o => o.value === model)) {
+                modelSelect.value = model;
+            }
+        }
         const ratioCard = document.querySelector(`#t2i-ratio-selector .ratio-card[data-ratio="${ratio}"]`);
         if (ratioCard) ratioCard.click();
 
@@ -1051,13 +1101,21 @@ function imgStudioReusePrompt(prompt, ratio, quality) {
         if (qualityCard) qualityCard.click();
     } else {
         document.getElementById('i2i-prompt').value = prompt;
+        if (model) {
+            const modelSelect = document.getElementById('i2i-model');
+            if (modelSelect && Array.from(modelSelect.options).some(o => o.value === model)) {
+                modelSelect.value = model;
+            }
+        }
     }
 
     showToast('创意提示词已填回配置面板', 'success');
+    switchImageStudioMobileView('create');
 }
 
 function imgStudioSendToImageToImage(dataUrl, filename) {
     switchImageStudioTab('i2i');
+    switchImageStudioMobileView('create');
 
     fetch(dataUrl)
         .then(res => res.blob())
@@ -1178,6 +1236,10 @@ function imgStudioRenderHistoryGrid() {
     imgStudioHistory.forEach(item => {
         const card = document.createElement('div');
         card.className = 'history-card';
+        card.onclick = (e) => {
+            if (e.target.closest('button')) return;
+            imgStudioDisplaySpotlight(item.image, item.prompt, item.model, item.ratio, item.quality);
+        };
         card.innerHTML = `
             <img src="${item.image}" alt="History Item" loading="lazy">
             <div class="history-card-overlay">
@@ -1205,7 +1267,7 @@ window.viewImageStudioHistoryItem = function (id, action) {
     } else if (action === 'download') {
         imgStudioDownloadImage(item.image, `spark_${item.id}.png`);
     } else if (action === 'reuse') {
-        imgStudioReusePrompt(item.prompt, item.ratio, item.quality);
+        imgStudioReusePrompt(item.prompt, item.ratio, item.quality, item.model);
     } else if (action === 'to-i2i') {
         imgStudioSendToImageToImage(item.image, `ref_${item.id}.png`);
     }
@@ -1236,6 +1298,7 @@ document.addEventListener('DOMContentLoaded', () => {
     imgStudioLoadTaskList();
     initImageStudioSelectors();
     initImageStudioFileUploader();
+    initImageStudioMobileView();
 
     const clearCompletedTasksBtn = document.getElementById('clear-completed-tasks-btn');
     if (clearCompletedTasksBtn) clearCompletedTasksBtn.addEventListener('click', clearCompletedImageStudioTasks);

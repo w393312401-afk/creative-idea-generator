@@ -397,9 +397,16 @@ def check_contract_registry(root, fnd):
                       f"unenforced contract must be registered as such, never silent")
         src = c.get("source", "")
         if src.startswith("references/"):
-            if not os.path.exists(os.path.join(root, src)):
+            # Strip the `#section` fragment before the existence check. Citing a section
+            # (`references/idea-engine.md#Axis 4`) is the more useful form of a source
+            # pointer, and checking the fragment as part of the filename reported three
+            # perfectly good citations as missing files — which trains people to drop the
+            # section anchor to silence the linter, losing the only thing that says *where*
+            # in a 150-line reference the rule actually lives.
+            path_part = src.split("#", 1)[0]
+            if not os.path.exists(os.path.join(root, path_part)):
                 fnd.error("registry-source", r,
-                          f"contract {cid!r} cites a missing source file {src!r}")
+                          f"contract {cid!r} cites a missing source file {path_part!r}")
 
 
 def check_ledger_dna(root, fnd):

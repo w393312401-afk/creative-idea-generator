@@ -4,7 +4,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // State management
   let serverManaged = false;
   let needsAccessCode = false;
-  let activeTab = 'dashboard';
+  let activeTab = 'google-fx';
   let dashboardPollInterval = null;
   let videoPollInterval = null;
 
@@ -637,17 +637,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     activeTab = targetTab;
     
-    // Update header title
     const labelMap = {
-      'dashboard': '控制台仪表盘',
       'google-fx': 'Google FX 服务管理',
       'models': '可用模型中心',
       'docs': 'API 交互文档',
       'playground': '接口测试沙盒'
     };
     const descMap = {
-      'dashboard': '监控后台任务、系统状态并管理可用 AI 模型与 API 接口',
-      'google-fx': '管理 Flow 自动化运行时、AdsPower 连接、账号池与浏览器任务队列',
+      'google-fx': '管理 Flow 自动化运行时、AdsPower 连接、账号池与浏览器执行状态',
       'models': '浏览当前可用模型、能力标签与计费信息',
       'docs': '查看 SPARK API 请求格式与调用示例',
       'playground': '直接构造请求并检查 API 返回结果'
@@ -661,9 +658,10 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   const requestedTab = window.location.hash.replace(/^#/, '');
-  if (requestedTab && Array.from(navItems).some(item => item.getAttribute('data-tab') === requestedTab)) {
-    swapTab(requestedTab);
-  }
+  const initialTab = (requestedTab && Array.from(navItems).some(item => item.getAttribute('data-tab') === requestedTab))
+    ? requestedTab
+    : 'google-fx';
+  swapTab(initialTab);
 
   // 3. Status Checking & Dynamic Dashboard
   async function checkSystemStatuses() {
@@ -676,23 +674,31 @@ document.addEventListener('DOMContentLoaded', () => {
       needsAccessCode = modeData.needs_access_code;
 
       if (serverManaged) {
-        statServerMode.textContent = '托管模式 (Managed)';
-        managedModeBadge.style.background = 'rgba(138, 43, 226, 0.15)';
-        managedModeBadge.style.borderColor = 'var(--secondary)';
-        managedModeText.innerHTML = '<span style="color:#a78bfa">● 托管模式 (Managed)</span>';
+        if (statServerMode) statServerMode.textContent = '托管模式 (Managed)';
+        if (managedModeBadge) {
+          managedModeBadge.style.background = 'rgba(138, 43, 226, 0.15)';
+          managedModeBadge.style.borderColor = 'var(--secondary)';
+        }
+        if (managedModeText) managedModeText.innerHTML = '<span style="color:#a78bfa">● 托管模式 (Managed)</span>';
         
-        localTokenInput.placeholder = '当前为服务端托管模式，密钥从服务端加载';
-        localTokenInput.disabled = true;
+        if (localTokenInput) {
+          localTokenInput.placeholder = '当前为服务端托管模式，密钥从服务端加载';
+          localTokenInput.disabled = true;
+        }
       } else {
-        statServerMode.textContent = '本地模式 (Local)';
-        managedModeBadge.style.background = 'rgba(255, 255, 255, 0.03)';
-        managedModeBadge.style.borderColor = 'var(--border-color)';
-        managedModeText.innerHTML = '<span>● 本地模式 (Local)</span>';
-        localTokenInput.placeholder = '输入 User Token 进行测试...';
-        localTokenInput.disabled = false;
+        if (statServerMode) statServerMode.textContent = '本地模式 (Local)';
+        if (managedModeBadge) {
+          managedModeBadge.style.background = 'rgba(255, 255, 255, 0.03)';
+          managedModeBadge.style.borderColor = 'var(--border-color)';
+        }
+        if (managedModeText) managedModeText.innerHTML = '<span>● 本地模式 (Local)</span>';
+        if (localTokenInput) {
+          localTokenInput.placeholder = '输入 User Token 进行测试...';
+          localTokenInput.disabled = false;
+        }
       }
 
-      const devToken = localTokenInput.value.trim();
+      const devToken = localTokenInput ? localTokenInput.value.trim() : '';
       const configPayload = {
         config: {
           baseUrl: 'http://127.0.0.1:8046/v1',
@@ -707,16 +713,18 @@ document.addEventListener('DOMContentLoaded', () => {
       });
       
       const pingData = await pingResp.json();
-      if (pingData.online) {
-        statusGatewayDot.className = 'status-dot online';
-        statusGatewayText.textContent = '在线 (8046)';
-      } else {
-        statusGatewayDot.className = 'status-dot offline';
-        statusGatewayText.textContent = '无法连接到本地网关';
+      if (statusGatewayDot && statusGatewayText) {
+        if (pingData.online) {
+          statusGatewayDot.className = 'status-dot online';
+          statusGatewayText.textContent = '在线 (8046)';
+        } else {
+          statusGatewayDot.className = 'status-dot offline';
+          statusGatewayText.textContent = '无法连接到本地网关';
+        }
       }
 
-      statusAppDot.className = 'status-dot online';
-      statusAppText.textContent = '在线 (8085)';
+      if (statusAppDot) statusAppDot.className = 'status-dot online';
+      if (statusAppText) statusAppText.textContent = '在线 (8085)';
 
       // 托管模式下受门禁保护的端点需要携带访问码（侧栏凭证框）
       const gateHeaders = {};
@@ -728,18 +736,17 @@ document.addEventListener('DOMContentLoaded', () => {
       try {
         const tasksResp = await fetch('/api/tasks', { headers: gateHeaders });
         if (tasksResp.ok) {
-          // 服务端契约是 {tasks, total_count}；兼容旧的纯数组形状
           const resData = await tasksResp.json();
           const tasks = Array.isArray(resData) ? resData : (resData.tasks || []);
           const runningTasks = tasks.filter(t => t.status === 'running');
-          statActiveTasks.textContent = runningTasks.length;
-          renderTasksTable(tasks);
+          if (statActiveTasks) statActiveTasks.textContent = runningTasks.length;
+          if (taskTableBody) renderTasksTable(tasks);
         }
       } catch (taskErr) {
         console.warn('Failed to refresh task table', taskErr);
       }
 
-      statRateMax.textContent = '20';
+      if (statRateMax) statRateMax.textContent = '20';
 
       // Get cache info
       try {
@@ -758,11 +765,11 @@ document.addEventListener('DOMContentLoaded', () => {
       }
 
     } catch (err) {
-      statusAppDot.className = 'status-dot offline';
-      statusAppText.textContent = '已断开连接';
-      statusGatewayDot.className = 'status-dot offline';
-      statusGatewayText.textContent = '未就绪';
-      statServerMode.textContent = '未知';
+      if (statusAppDot) statusAppDot.className = 'status-dot offline';
+      if (statusAppText) statusAppText.textContent = '已断开连接';
+      if (statusGatewayDot) statusGatewayDot.className = 'status-dot offline';
+      if (statusGatewayText) statusGatewayText.textContent = '未就绪';
+      if (statServerMode) statServerMode.textContent = '未知';
     }
   }
 

@@ -286,6 +286,17 @@ function renderVideoSlotPending(slotIdx, text) {
 function renderVideoSlotDone(idx, video) {
     if (!video) return;
     const busy = isIdeaTaskActive(currentIdea && currentIdea.id, 'videos');
+    if (currentIdea && currentIdea.frameRun) {
+        if (!Array.isArray(currentIdea.frameRun.videos)) currentIdea.frameRun.videos = [];
+        const slotNum = Number(video.slot) || idx;
+        const existIdx = currentIdea.frameRun.videos.findIndex(v => (Number(v && v.slot) || 0) === slotNum);
+        if (existIdx >= 0) {
+            currentIdea.frameRun.videos[existIdx] = video;
+        } else {
+            currentIdea.frameRun.videos.push(video);
+        }
+        currentIdea.frameRun.videos.sort((a, b) => (Number(a && a.slot) || 0) - (Number(b && b.slot) || 0));
+    }
     renderSlotById('video', idx, videoSlotState(video, { seq: Number(video.slot) || idx, busy }));
 }
 
@@ -1439,8 +1450,12 @@ async function undoFrameFix(seq) {
                 await persistIdeaItem(savedIdeas[existingIdx]);
             }
             if (isViewingIdea(ownerIdea.id)) {
-                const blockEl = document.getElementById('idea-prompt-block');
-                if (blockEl) blockEl.textContent = ownerIdea.prompt_block;
+                if (typeof renderPromptDisplay === 'function') {
+                    renderPromptDisplay(ownerIdea.prompt_block);
+                } else {
+                    const blockEl = document.getElementById('idea-prompt-block');
+                    if (blockEl) blockEl.textContent = ownerIdea.prompt_block;
+                }
             }
         }
         // 帧文件被原地换回旧图：路径没变、内容变了，不回源就还是浏览器缓存里那张
@@ -1586,8 +1601,12 @@ async function fixFrameIssue(seq, manualReason) {
                     await persistIdeaItem(savedIdeas[existingIdx]);
                 }
                 if (isViewingIdea(ownerIdea.id)) {
-                    const blockEl = document.getElementById('idea-prompt-block');
-                    if (blockEl) blockEl.textContent = ownerIdea.prompt_block;
+                    if (typeof renderPromptDisplay === 'function') {
+                        renderPromptDisplay(ownerIdea.prompt_block);
+                    } else {
+                        const blockEl = document.getElementById('idea-prompt-block');
+                        if (blockEl) blockEl.textContent = ownerIdea.prompt_block;
+                    }
                 }
             }
             if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
@@ -2197,9 +2216,7 @@ function applyManifestPatchToIdea(ownerIdea, patch) {
 }
 
 // 手动上传本地视频文件覆盖某个槽位（例如外部渠道单独补的片段，或对自动化产出
-// 不满意想换一版）。上传前后端会用与自动生成同一套 verify_video_anchors 校验
-// 首尾帧是否匹配该槽位期望的锚点图——不匹配时先返回 409，这里弹确认框，用户
-// 确认"仍要覆盖"后带 force=true 重新提交才会真正落盘，防止选错文件误覆盖好片段。
+// 不满意想换一版）。
 async function uploadVideoToSlot(slot, file, force = false) {
     const ownerIdea = currentIdea;
     const progress = document.getElementById('videos-progress');
@@ -2208,7 +2225,6 @@ async function uploadVideoToSlot(slot, file, force = false) {
     return mutateSlot({
         what: `第 ${slot} 段视频上传`,
         ownerIdea, scope: 'videos', requirePrompt: true,
-        // force=true 是同一次用户操作在 409 确认后的续跑，闸门在外层那次调用手里
         guard: !force,
         meta: `正在上传第 ${slot} 段视频...`,
         pending: () => {
@@ -2224,17 +2240,6 @@ async function uploadVideoToSlot(slot, file, force = false) {
             formData.append('video', file, file.name);
 
             const resp = await fetch('/api/upload_video', { method: 'POST', body: formData });
-            if (resp.status === 409) {
-                // 首尾帧与该槽位期望的锚点图不符，疑似传错文件：先退回原样，
-                // 由用户确认后带 force 重来，防止误覆盖一段好片子
-                const data = await resp.json().catch(() => ({}));
-                _renderSlotScope(ownerIdea, 'videos');
-                const proceed = await customConfirm(escapeHtml(
-                    data.error || '上传视频的首/尾帧与该槽位期望的锚点帧不符，疑似传错文件。是否仍要强制覆盖？'));
-                if (proceed) await uploadVideoToSlot(slot, file, true);
-                else showToast('已取消上传。', 'info');
-                return SLOT_MUTATION_HANDLED;
-            }
             const data = await resp.json().catch(() => ({}));
             if (!resp.ok || data.status !== 'ok' || !data.video) {
                 throw new Error(data.message || data.error || `HTTP ${resp.status}`);
@@ -2623,9 +2628,16 @@ async function applyPromptBlockToIdea(ownerIdea, promptBlock, promptSlots, defer
         else delete savedIdeas[existingIdx].prompt_slots;
         if (!deferSave) await persistIdeaItem(savedIdeas[existingIdx]);
     }
+    if (ownerIdea.id && promptBlock && typeof recordPromptHistory === 'function') {
+        recordPromptHistory(ownerIdea.id, promptBlock, '提示词更新');
+    }
     if (isViewingIdea(ownerIdea.id)) {
-        const blockEl = document.getElementById('idea-prompt-block');
-        if (blockEl) blockEl.textContent = promptBlock;
+        if (typeof renderPromptDisplay === 'function') {
+            renderPromptDisplay(promptBlock);
+        } else {
+            const blockEl = document.getElementById('idea-prompt-block');
+            if (blockEl) blockEl.textContent = promptBlock;
+        }
     }
 }
 

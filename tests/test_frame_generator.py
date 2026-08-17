@@ -1042,6 +1042,79 @@ class TestPromptBlockBracketSurvival(unittest.TestCase):
         self.assertEqual(sorted(images.keys()), list(range(1, total_beats + 2)))
         self.assertEqual(sorted(videos.keys()), list(range(1, total_beats + 1)))
 
+    def test_a_whole_output_document_parsed_as_a_block_drops_head_and_tail(self):
+        """存量/误传的数据里，整份带标记文档被当成 prompt_block 直接送来解析。
+
+        slot 正则的尾段是开放式的（…|\\Z），所以 ===AUDIT=== 那一节会被吃进**最后
+        一段视频**的正文，跟着这一拍原样送进 i2v（2026-08-15：复刻线的提示词末尾
+        长出「skill 直出模式：…」）。写入侧已经改成只存 ===PROMPTS=== 正文，解析器
+        这道兜底管的是已经存脏了的数据。"""
+        block, total_beats = self._build_block()
+        content = (
+            "===TITLE===\n测试标题\n===THEME===\n测试主题\n===PROMPTS===\n"
+            f"{block}\n===AUDIT===\nskill 直出模式：文本阶段无审查、无重写。\n"
+        )
+        images, videos = _parse_prompt_slots(content)
+        self.assertEqual(sorted(images.keys()), list(range(1, total_beats + 2)))
+        self.assertEqual(sorted(videos.keys()), list(range(1, total_beats + 1)))
+        self.assertNotIn('直出模式', videos[total_beats]['body'])
+        self.assertNotIn('测试标题', images[1]['body'])
+
+    def test_a_line_that_merely_looks_like_a_marker_stays_in_the_body(self):
+        """只认 TITLE/THEME/PROMPTS/AUDIT/TRACES 这几个名字：提示词正文里真写着
+        一行 `=== ... ===` 时不能被当成分节切掉。"""
+        body = 'A carved sign over the door reads\n=== WELCOME HOME ===\nin burnt letters.'
+        images, _videos = _parse_prompt_slots(f'图片提示词\n图片 1:\n{body}\n')
+        self.assertEqual(images[1]['body'], body)
+
+    def test_parse_prompt_slots_survives_summary_and_meta(self):
+        """测试提示词编号后面加简介（例如：视频 10（最终完工氛围展示）:）以及
+        带有 [PACE 1.38] / [BRIDGE] / [CUT] / [HERO] 的各种组合解析与保持。"""
+        sample_block = """图片提示词
+图片 1（初始泥地·未动工）:
+A wide shot of muddy soil.
+
+图片 2（开荒挖坑）:
+A wide shot of excavated pit.
+
+图片 5（室内一层·切开地洞活板门）[BRIDGE]:
+A shot of the wooden hatch door.
+
+视频提示词
+视频 1（开荒挖坑）[PACE 1.31]:
+Worker digging in the mud.
+
+视频 5（一层车间布置与开地洞）[PACE 1.38]:
+Worker mounting tools and opening trapdoor.
+
+视频 10（最终完工氛围展示）:
+Cinematic showcase of finished bedroom.
+"""
+        images, videos = _parse_prompt_slots(sample_block)
+        self.assertEqual(images[1]['summary'], '初始泥地·未动工')
+        self.assertEqual(images[1]['meta'], '')
+        self.assertEqual(images[1]['body'], 'A wide shot of muddy soil.')
+
+        self.assertEqual(images[5]['summary'], '室内一层·切开地洞活板门')
+        self.assertEqual(images[5]['meta'], 'BRIDGE')
+
+        self.assertEqual(videos[1]['summary'], '开荒挖坑')
+        self.assertEqual(videos[1]['meta'], 'PACE 1.31')
+
+        self.assertEqual(videos[5]['summary'], '一层车间布置与开地洞')
+        self.assertEqual(videos[5]['meta'], 'PACE 1.38')
+
+        self.assertEqual(videos[10]['summary'], '最终完工氛围展示')
+        self.assertEqual(videos[10]['meta'], '')
+
+        # 验证 _format_prompt_block 重新输出一致性
+        formatted = _format_prompt_block(images, videos)
+        self.assertIn("图片 1（初始泥地·未动工）:", formatted)
+        self.assertIn("图片 5（室内一层·切开地洞活板门） [BRIDGE]:", formatted)
+        self.assertIn("视频 1（开荒挖坑） [PACE 1.31]:", formatted)
+        self.assertIn("视频 5（一层车间布置与开地洞） [PACE 1.38]:", formatted)
+        self.assertIn("视频 10（最终完工氛围展示）:", formatted)
+
 
 class TestGptImagePixelSize(unittest.TestCase):
     """gpt-image-2 routes to the real OpenAI-shaped codex gateway (65038), which only

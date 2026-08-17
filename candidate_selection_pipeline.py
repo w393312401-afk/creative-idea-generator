@@ -1,0 +1,590 @@
+import os
+import sys
+import json
+import time
+import shutil
+import re
+import math
+import subprocess
+import glob
+
+from server_common import (
+    SERVER_CONFIG, resolve_gateway, effective_config,
+    OUTPUT_ROOT, _get_project_dir, _safe_project_name,
+    IMG2IMG_CONTROL_PROMPT, IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT,
+    resolve_cover_reference, project_cover_path,
+    apply_google_fx_runtime_overrides, fx_cancel_context,
+    read_manifest, write_manifest, GenerationCancelled, log,
+    gate_setting, _get_account_pool_service, _select_pool_account,
+)
+from frame_continuity import (
+    analyze_frame, changed_grid_cells, continuity_max_retries, continuity_mode,
+    family_map, is_transition_frame,
+)
+from frame_generator import (
+    _image_edit_model, _image_generation_model, _generate_text_image,
+    _generate_image_edit, _match_color_lab, detect_anchor_inertia,
+    _continuity_family_maps, _continuity_beat, _image_quality_to_label,
+    _get_google_fx_image_service, _fx_image_model,
+)
+from prompt_pipeline import (
+    _parse_prompt_slots, _multimodal_chat, ground_threshold_reveal_prompt,
+    threshold_reveal_continuity_clause,
+)
+
+_AI_DISCRIMINATION_SYSTEM_PROMPT = """You are an elite Hollywood Visual Director and Automated Quality Assurance Evaluator for AI-generated continuous video frame sequences.
+
+You will be given:
+1. THE PROMPT describing the current frame's physical scene, construction milestone delta, tools/actions, materials, and lighting.
+2. THE REFERENCE IMAGE (if provided: the previous authoritative frame in the sequence).
+3. 4 CANDIDATE IMAGES (labeled CANDIDATE 1, CANDIDATE 2, CANDIDATE 3, CANDIDATE 4) generated for this current frame.
+
+Your mission:
+Critically inspect all 4 candidate images and determine the SINGLE BEST candidate image to be selected as the official frame for this step. The chosen frame will become the authoritative reference image for the subsequent steps.
+
+Evaluate each candidate strictly across 4 Core Pillars:
+1. PROMPT & CONSTRUCTION DELTA ACCURACY (0-30 pts):
+   - Does it accurately portray the new physical milestone requested in the prompt (e.g. framing installed, floor laid, concrete poured)?
+   - Are the declared items, materials, and actions present without missing steps or premature completion?
+
+2. SPATIAL ANCHOR & PERSPECTIVE CONTINUITY (0-30 pts):
+   - Camera Alignment: Horizon height, field of view (24mm wide angle, human eye/chest level 1.3m), camera angle, and perspective must match the REFERENCE IMAGE.
+   - Landmark Lock: Ceilings, background walls, boundary structures, door frames, and fixed landmarks must remain physically consistent with the reference frame.
+   - Zero Cavernous Hall Expansion: Compact rooms/pits must NOT stretch into giant auditoriums or cave-like halls.
+   - Zero Phantom Changes: No unexplained alterations to already finished areas.
+
+3. MATERIAL REALISM & LIGHTING INTEGRITY (0-25 pts):
+   - Photorealistic texture (matte/satin wood grains, authentic rough concrete/stone, natural light bounce).
+   - Forbidden: NO artificial mirror reflections or wet floor gloss in finished reveal scenes, NO random neon or zig-zag fluorescent light bars.
+
+4. ARTIFACT & PROHIBITED OBJECTS FREEDOM (0-15 pts):
+   - No extra/mutated human limbs or duplicated workers.
+   - Construction tool lifecycle: Tripods, loose cables, and heavy demolition tools must be removed once rooms are finished/furnished.
+   - No blurry distortion, floating objects, or AI rendering glitches.
+
+Output strictly valid JSON with this exact schema:
+{
+  "candidates": [
+    {
+      "index": 1,
+      "score": 85,
+      "strengths": "Detailed strengths of candidate 1",
+      "defects": "Defects or continuity drift of candidate 1"
+    },
+    {
+      "index": 2,
+      "score": 92,
+      "strengths": "Detailed strengths of candidate 2",
+      "defects": "Defects or continuity drift of candidate 2"
+    },
+    {
+      "index": 3,
+      "score": 78,
+      "strengths": "Detailed strengths of candidate 3",
+      "defects": "Defects or continuity drift of candidate 3"
+    },
+    {
+      "index": 4,
+      "score": 88,
+      "strengths": "Detailed strengths of candidate 4",
+      "defects": "Defects or continuity drift of candidate 4"
+    }
+  ],
+  "best_index": 2,
+  "selection_reason": "Clear explanation of why candidate 2 was chosen as the best frame"
+}
+"""
+
+
+def _generate_single_api_candidate(config, prompt_text, reference_path, out_path, is_text_only, ctrl_prompt):
+    """Generate a single candidate image via API."""
+    if is_text_only or not reference_path:
+        _generate_text_image(config, prompt_text, out_path)
+    else:
+        _generate_image_edit(config, prompt_text, reference_path, out_path, control_prompt=ctrl_prompt)
+
+
+def generate_frame_candidates(config, title, item, reference_path, seq, candidate_count=4, on_progress=None, is_bridge=False, is_cut_head=False, is_turn=False):
+    """
+    Generate `candidate_count` candidate images for a given sequence step.
+    Saves candidates to `outputs/<title>/frames/candidates/frame_{seq:03d}/candidate_{1..N}.webp`.
+    Returns list of absolute candidate file paths.
+    """
+    project_dir = _get_project_dir(title)
+    candidates_dir = os.path.join(project_dir, 'frames', 'candidates', f'frame_{seq:03d}')
+    os.makedirs(candidates_dir, exist_ok=True)
+
+    candidate_paths = []
+    is_text_only = (seq == 1 and not reference_path)
+    
+    # Determine control prompt
+    if is_text_only:
+        ctrl_prompt = ''
+    elif seq == 1 and reference_path:
+        ctrl_prompt = ''
+    elif is_turn or is_bridge or is_cut_head:
+        ctrl_prompt = IMG2IMG_CROSSING_REVEAL_CONTROL_PROMPT
+    else:
+        ctrl_prompt = IMG2IMG_CONTROL_PROMPT
+        _region_cells = changed_grid_cells(item.get('prompt', ''))
+        if _region_cells:
+            ctrl_prompt += f" REGION LOCK: this beat's declared change is confined to grid cell(s) {', '.join(_region_cells)}."
+
+    prompt_text = item.get('prompt', '')
+
+    backend = (config.get('imageBackend') or 'api').strip().lower()
+
+    if backend == 'google_fx':
+        log('INFO', 'CANDIDATE_GEN', f"IMG {seq:03d} 走 Google FX UI 自动化生成 {candidate_count} 张候选图...")
+        # Check if Google FX service can generate multiple candidates
+        try:
+            google_fx, fx_models = _get_google_fx_image_service()
+            from integrations.google_fx.models import ImageBatchRequest
+            fx_model = _fx_image_model(config)
+            
+            # Request 4x candidate generation in single submit
+            req_images = [reference_path] if reference_path and os.path.exists(reference_path) else []
+            
+            req = ImageBatchRequest(
+                prompts=[prompt_text],
+                images=req_images,
+                ratio=config.get('imageAspectRatio') or '9:16',
+                model=fx_model,
+                output_path=candidates_dir,
+                require_fresh_canvas=(seq == 1),
+                generation_count=f"{candidate_count}x",
+                is_candidate_mode=True,
+            )
+            fx_res = google_fx._generate_images_batch_google_fx(req)
+            if fx_res and fx_res.get('image_urls'):
+                fx_urls = fx_res['image_urls']
+                for idx, src_p in enumerate(fx_urls[:candidate_count]):
+                    cand_dest = os.path.join(candidates_dir, f'candidate_{idx+1}.webp')
+                    if src_p != cand_dest:
+                        try:
+                            from PIL import Image
+                            with Image.open(src_p) as im:
+                                im.save(cand_dest, 'WEBP', quality=95)
+                        except Exception:
+                            shutil.copy2(src_p, cand_dest)
+                    candidate_paths.append(cand_dest)
+        except Exception as e:
+            log('WARN', 'CANDIDATE_GEN', f"Google FX 批量候选生成异常 ({e})，退回 API 多候选生成")
+
+    # If Google FX produced fewer candidates or backend is API, use API generation
+    if len(candidate_paths) < candidate_count:
+        missing_count = candidate_count - len(candidate_paths)
+        start_idx = len(candidate_paths) + 1
+        log('INFO', 'CANDIDATE_GEN', f"IMG {seq:03d} 生成 {missing_count} 张候选图 (从 index {start_idx} 开始)...")
+        
+        def _make_cand(c_idx):
+            cand_path = os.path.join(candidates_dir, f'candidate_{c_idx}.webp')
+            p_variant = prompt_text
+            if c_idx > 1:
+                p_variant = f"{prompt_text}\n\n[Variation #{c_idx}]"
+            _generate_single_api_candidate(config, p_variant, reference_path, cand_path, is_text_only, ctrl_prompt)
+            return cand_path
+
+        for c_idx in range(start_idx, candidate_count + 1):
+            if on_progress and on_progress('cancel_check', None):
+                raise ConnectionError('用户取消了候选帧生成')
+            if on_progress:
+                on_progress('candidate_generating', {
+                    'sequence': seq,
+                    'candidate_index': c_idx,
+                    'total_candidates': candidate_count,
+                    'message': f"IMG {seq:03d} 正在生成候选图 #{c_idx}/{candidate_count}...",
+                })
+            try:
+                p = _make_cand(c_idx)
+                if os.path.exists(p) and os.path.getsize(p) > 0:
+                    candidate_paths.append(p)
+            except Exception as gen_err:
+                log('ERROR', 'CANDIDATE_GEN', f"生成候选图 #{c_idx} 失败: {gen_err}")
+                if candidate_paths:
+                    break
+                raise
+
+    if not candidate_paths:
+        raise RuntimeError(f"IMG {seq:03d} 生成候选图失败，未获得任何有效图片")
+
+    return candidate_paths
+
+
+def evaluate_and_select_best_candidate(config, prompt_text, reference_path, candidate_paths, seq, on_progress=None):
+    """
+    Calls multimodal VLM (Gemini 3.7 / 3.5 / Flash) to evaluate all candidates and choose the best one.
+    Returns:
+    {
+        "candidates": [
+            {"index": 1, "score": int, "strengths": str, "defects": str},
+            ...
+        ],
+        "best_index": int (1-based),
+        "selection_reason": str
+    }
+    """
+    if len(candidate_paths) == 1:
+        return {
+            "candidates": [{"index": 1, "score": 90, "strengths": "唯一生成候选图", "defects": "无对比候选"}],
+            "best_index": 1,
+            "selection_reason": "单候选直选"
+        }
+
+    if on_progress:
+        on_progress('candidate_evaluating', {
+            'sequence': seq,
+            'candidate_count': len(candidate_paths),
+            'message': f"IMG {seq:03d} 4张候选图已就绪，AI 模型正在多模态鉴别与打分...",
+        })
+
+    # Prepare multimodal message
+    user_text_parts = [
+        f"--- CURRENT FRAME REQUIREMENTS (IMAGE {seq:03d}) ---",
+        f"Prompt / Construction Milestone:",
+        prompt_text,
+        "",
+    ]
+    
+    image_paths_to_send = []
+    if reference_path and os.path.exists(reference_path) and os.path.getsize(reference_path) > 0:
+        user_text_parts.append("The first image attached is the REFERENCE IMAGE (authoritative ground-truth from previous frame).")
+        user_text_parts.append(f"The following images are CANDIDATE 1 through CANDIDATE {len(candidate_paths)}.")
+        image_paths_to_send.append(reference_path)
+    else:
+        user_text_parts.append("This is Frame 1 (Anchor). There is no prior reference image. Evaluate based on prompt fidelity and photorealism.")
+        user_text_parts.append(f"The following images are CANDIDATE 1 through CANDIDATE {len(candidate_paths)}.")
+
+    for idx, cp in enumerate(candidate_paths):
+        user_text_parts.append(f"- CANDIDATE {idx+1}: {os.path.basename(cp)}")
+        image_paths_to_send.append(cp)
+
+    user_text_parts.append("\nPlease output strictly the requested JSON analysis evaluating all candidates and selecting the best one.")
+    user_text = "\n".join(user_text_parts)
+
+    try:
+        response_text = _multimodal_chat(
+            config,
+            system=_AI_DISCRIMINATION_SYSTEM_PROMPT,
+            user_text=user_text,
+            image_paths=image_paths_to_send,
+            max_tokens=2000,
+            timeout=120,
+        )
+        
+        # Parse JSON
+        clean_json = response_text.strip()
+        m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', clean_json, re.DOTALL)
+        if m:
+            clean_json = m.group(1)
+        else:
+            m2 = re.search(r'(\{.*\})', clean_json, re.DOTALL)
+            if m2:
+                clean_json = m2.group(1)
+
+        result_data = json.loads(clean_json)
+        best_idx = int(result_data.get('best_index', 1))
+        if best_idx < 1 or best_idx > len(candidate_paths):
+            best_idx = 1
+        
+        cands_meta = result_data.get('candidates') or []
+        selection_reason = result_data.get('selection_reason') or f"AI 鉴别选出最佳候选 #{best_idx}"
+
+        return {
+            "candidates": cands_meta,
+            "best_index": best_idx,
+            "selection_reason": selection_reason,
+            "raw_response": response_text[:500],
+        }
+    except Exception as e:
+        log('WARN', 'CANDIDATE_AI', f"IMG {seq:03d} AI 多模态鉴别调用异常 ({e})，默认采纳第 1 张候选")
+        # Fallback to candidate 1
+        return {
+            "candidates": [{"index": i + 1, "score": 80, "strengths": "默认采纳", "defects": ""} for i in range(len(candidate_paths))],
+            "best_index": 1,
+            "selection_reason": f"AI鉴别服务暂不可用 ({e})，已默认采纳候选 #1",
+        }
+
+
+def _generate_full_collage_from_frames(frames_dir):
+    """Generate 5-col collage image using ffmpeg for visual consistency checking."""
+    frame_files = sorted(glob.glob(os.path.join(frames_dir, 'img_*.webp')))
+    if not frame_files:
+        return None
+    input_args = []
+    inputs = []
+    for path in frame_files:
+        input_args.extend(['-i', path])
+        inputs.append(path)
+
+    cols = 5
+    rows = math.ceil(len(inputs) / cols)
+    outpath = os.path.join(frames_dir, 'full_collage.jpg')
+    n = len(inputs)
+
+    filter_parts = [f'[{i}:v]scale=240:-1:force_original_aspect_ratio=decrease,pad=240:ih:(ow-iw)/2:(oh-ih)/2[s{i}]' for i in range(n)]
+    filter_str = ';'.join(filter_parts) + ';'
+    filter_str += ''.join(f'[s{i}]' for i in range(n))
+    filter_str += f'concat=n={n}:v=1:a=0,tile={cols}x{rows}'
+
+    try:
+        subprocess.run(
+            ['ffmpeg', '-y'] + input_args + ['-filter_complex', filter_str, outpath],
+            capture_output=True, timeout=60
+        )
+        return outpath if os.path.exists(outpath) else None
+    except Exception:
+        return None
+
+
+def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4):
+    """
+    Main entry point for 4-candidate AI selection frame sequence generation.
+    For each frame in the sequence:
+    1. Generates `candidate_count` (4) candidate images via UI automation / API.
+    2. Runs AI multimodal model to evaluate & rank all 4 images, picking the best one.
+    3. Saves winning candidate to `frames/img_{seq:03d}.webp`.
+    4. Records candidate metadata & AI review in `manifest.json`.
+    5. Feeds winning candidate as the reference image to the next frame.
+    """
+    images, videos = _parse_prompt_slots(prompt_block)
+    prompts = []
+    for idx in sorted(images):
+        item = images[idx]
+        body = item['body'] if isinstance(item, dict) else item
+        meta = item.get('meta', '') if isinstance(item, dict) else ''
+        prompts.append({'index': idx, 'prompt': body, 'meta': meta})
+
+    if not prompts:
+        raise RuntimeError('未在 prompt_block 中找到任何 图片 N: 提示词')
+
+    prompts_by_seq = {int(item['index']): item for item in prompts}
+    all_seqs = sorted(prompts_by_seq.keys())
+    continuity_families = _continuity_family_maps(prompts_by_seq, videos)
+
+    def _check_cancel():
+        if on_progress and on_progress('cancel_check', None):
+            raise ConnectionError('用户取消了帧序列生成')
+
+    project_dir = _get_project_dir(title)
+    frames_dir = os.path.join(project_dir, 'frames')
+    os.makedirs(frames_dir, exist_ok=True)
+
+    manifest_path = os.path.join(project_dir, 'manifest.json')
+    manifest = {
+        'title': title,
+        'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'method': 'A_single_chain_4_candidates',
+        'generation_mode': 'candidate_selection',
+        'candidate_count': candidate_count,
+        'aspect_ratio': config.get('imageAspectRatio') or '9:16',
+        'image_size': _image_quality_to_label(config.get('imageQuality')),
+        'control_prompt': IMG2IMG_CONTROL_PROMPT,
+        'frames': [],
+    }
+
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                existing_manifest = json.load(f)
+                if isinstance(existing_manifest, dict) and 'frames' in existing_manifest:
+                    manifest['frames'] = existing_manifest['frames']
+                    manifest['created_at'] = existing_manifest.get('created_at', manifest['created_at'])
+                    for _k, _v in existing_manifest.items():
+                        if _k not in manifest:
+                            manifest[_k] = _v
+        except Exception:
+            pass
+
+    manifest_frames_by_seq = {f['sequence']: f for f in manifest.get('frames', [])}
+    total_to_generate = len(target_sequences) if target_sequences is not None else len(prompts)
+    
+    if on_progress:
+        on_progress('start', {'total': total_to_generate, 'mode': 'candidate_selection', 'candidate_count': candidate_count})
+
+    previous_path = None
+    workspace_root = os.path.dirname(os.path.abspath(__file__))
+
+    for item in prompts:
+        seq = int(item['index'])
+        _check_cancel()
+
+        target_path = os.path.join(frames_dir, f'img_{seq:03d}.webp')
+        should_generate = True
+        if target_sequences is not None:
+            should_generate = seq in target_sequences
+
+        if not should_generate:
+            if os.path.exists(target_path):
+                previous_path = target_path
+            continue
+
+        incoming_video = videos.get(seq - 1)
+        incoming_meta = (incoming_video.get('meta', '') if isinstance(incoming_video, dict) else '').upper()
+        is_bridge = ('BRIDGE' in item.get('meta', '').upper() or 'BRIDGE' in incoming_meta)
+        is_turn = 'TURN' in incoming_meta
+        is_cut_head = ('CUT' in incoming_meta) and ('BRIDGE' not in incoming_meta)
+        is_continuity_transition = is_transition_frame(
+            seq, item.get('meta', ''), incoming_meta, _continuity_beat(manifest, seq)
+        )
+
+        cover_ref = (resolve_cover_reference(config, title) if seq == 1 else None)
+        cover_anchor = bool(cover_ref)
+        reference = cover_ref if cover_anchor else previous_path
+        
+        if not reference and seq > 1:
+            durable_parent = os.path.join(frames_dir, f'img_{seq - 1:03d}.webp')
+            if os.path.exists(durable_parent) and os.path.getsize(durable_parent) > 0:
+                reference = durable_parent
+
+        if on_progress:
+            on_progress('frame_start', {
+                'slot': seq,
+                'sequence': seq,
+                'total': total_to_generate,
+                'message': f"IMG {seq:03d} 开始生成（4选1 智能模式）...",
+            })
+
+        # ── Step 1: Generate 4 Candidate Images ──
+        candidate_paths = generate_frame_candidates(
+            config, title, item, reference, seq,
+            candidate_count=candidate_count,
+            on_progress=on_progress,
+            is_bridge=is_bridge,
+            is_cut_head=is_cut_head,
+            is_turn=is_turn,
+        )
+
+        # Rel paths for candidates
+        cand_rel_urls = [
+            os.path.relpath(cp, workspace_root).replace('\\', '/')
+            for cp in candidate_paths
+        ]
+
+        if on_progress:
+            on_progress('candidate_batch_ready', {
+                'sequence': seq,
+                'candidate_urls': cand_rel_urls,
+                'candidate_count': len(candidate_paths),
+                'message': f"IMG {seq:03d} 4张候选图生成完毕，准备 AI 鉴别...",
+            })
+
+        # ── Step 2: AI Multi-modal Evaluation & Selection ──
+        eval_result = evaluate_and_select_best_candidate(
+            config, item.get('prompt', ''), reference, candidate_paths, seq, on_progress=on_progress
+        )
+
+        best_idx = eval_result.get('best_index', 1)
+        best_candidate_path = candidate_paths[best_idx - 1]
+        selection_reason = eval_result.get('selection_reason', '')
+
+        # ── Step 3: Copy Best Candidate to Target Frame Path ──
+        shutil.copy2(best_candidate_path, target_path)
+
+        # Color matching if needed
+        if seq > 1 and os.path.exists(target_path):
+            first_frame_path = os.path.join(frames_dir, 'img_001.webp')
+            if os.path.exists(first_frame_path) and not is_continuity_transition:
+                _match_color_lab(target_path, first_frame_path, target_path)
+
+        # Set as previous_path for the next frame
+        previous_path = target_path
+
+        # ── Step 4: Record into Manifest ──
+        rel_target_path = os.path.relpath(target_path, workspace_root).replace('\\', '/')
+        rel_candidates = [
+            {
+                'index': i + 1,
+                'file': os.path.relpath(cp, workspace_root).replace('\\', '/'),
+                'url': os.path.relpath(cp, workspace_root).replace('\\', '/'),
+                'is_chosen': (i + 1 == best_idx),
+                'score': (eval_result.get('candidates') or [{}])[i].get('score', 80) if i < len(eval_result.get('candidates') or []) else 80,
+                'strengths': (eval_result.get('candidates') or [{}])[i].get('strengths', '') if i < len(eval_result.get('candidates') or []) else '',
+                'defects': (eval_result.get('candidates') or [{}])[i].get('defects', '') if i < len(eval_result.get('candidates') or []) else '',
+            }
+            for i, cp in enumerate(candidate_paths)
+        ]
+
+        frame_data = {
+            'sequence': seq,
+            'slot': seq,
+            'file': rel_target_path,
+            'url': rel_target_path,
+            'prompt': item.get('prompt', ''),
+            'reference': os.path.relpath(reference, workspace_root).replace('\\', '/') if reference else None,
+            'quality_gate': 'auto_approved',
+            'vlm_qa_reason': f"AI 4选1 鉴别优选 (候选 #{best_idx}): {selection_reason}",
+            'selection_mode': 'candidate_selection',
+            'chosen_candidate_index': best_idx,
+            'ai_evaluation': eval_result,
+            'candidates': rel_candidates,
+            'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+        }
+
+        # Update manifest frames
+        manifest_frames_by_seq[seq] = frame_data
+        manifest['frames'] = [manifest_frames_by_seq[s] for s in sorted(manifest_frames_by_seq.keys())]
+
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+        if on_progress:
+            on_progress('candidate_ai_evaluation', {
+                'sequence': seq,
+                'best_index': best_idx,
+                'selection_reason': selection_reason,
+                'scores': [c.get('score') for c in rel_candidates],
+                'message': f"IMG {seq:03d} AI 鉴别选中候选 #{best_idx}：{selection_reason}",
+            })
+            on_progress('frame', {
+                'sequence': seq,
+                'slot': seq,
+                'current': len([f for f in manifest['frames'] if f.get('file')]),
+                'total': total_to_generate,
+                'frame': frame_data,
+            })
+
+    # Generate full collage
+    _generate_full_collage_from_frames(frames_dir)
+
+    manifest['project_dir'] = project_dir
+    manifest['manifest'] = manifest_path
+    return manifest
+
+
+def switch_frame_candidate(title, seq, new_candidate_index):
+    """
+    Manually switch the authoritative frame for sequence `seq` to a different candidate.
+    Updates `img_{seq:03d}.webp` and `manifest.json`.
+    """
+    project_dir = _get_project_dir(title)
+    frames_dir = os.path.join(project_dir, 'frames')
+    candidates_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
+    target_cand_path = os.path.join(candidates_dir, f'candidate_{new_candidate_index}.webp')
+
+    if not os.path.exists(target_cand_path):
+        raise FileNotFoundError(f"未找到候选图片: {target_cand_path}")
+
+    target_frame_path = os.path.join(frames_dir, f'img_{seq:03d}.webp')
+    shutil.copy2(target_cand_path, target_frame_path)
+
+    # Update manifest
+    manifest_path = os.path.join(project_dir, 'manifest.json')
+    if os.path.exists(manifest_path):
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            manifest = json.load(f)
+
+        for frame in manifest.get('frames', []):
+            if frame.get('sequence') == seq:
+                frame['chosen_candidate_index'] = new_candidate_index
+                frame['vlm_qa_reason'] = f"人工切换为候选 #{new_candidate_index}"
+                for cand in frame.get('candidates', []):
+                    cand['is_chosen'] = (cand.get('index') == new_candidate_index)
+                break
+
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    # Regenerate collage
+    _generate_full_collage_from_frames(frames_dir)
+    return manifest

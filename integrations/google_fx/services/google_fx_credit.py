@@ -76,17 +76,105 @@ class CreditProbeTimeout(RuntimeError):
 class CreditProbeCancelled(RuntimeError):
     """探测在排队或执行期间被取消。"""
 
-# 猜测性关键词，未经真实"账号耗尽"案例验证；命中即认为该次失败是积分不足，
+# 猜测性与实测关键词库：命中即认为该次失败是积分/配额耗尽，
 # 而不是网络/画布等其它原因。
 CREDIT_EXHAUSTED_KEYWORDS = [
+    # 英文常见表达
     "out of credits",
+    "out of credit",
     "insufficient credits",
+    "insufficient credit",
     "not enough credits",
+    "not enough credit",
     "no credits left",
+    "no credit left",
+    "no credits remaining",
+    "no credit remaining",
+    "no credits available",
+    "no credit available",
     "you've run out of credits",
+    "you have run out of credits",
+    "you are out of credits",
+    "run out of credits",
+    "ran out of credits",
+    "credits exhausted",
+    "credit exhausted",
+    "credits depleted",
+    "credit depleted",
+    "credits: 0",
+    "credit: 0",
+    "0 credits",
+    "0 credit",
+    "zero credits",
+    "need more credits",
+    "get more credits",
+    "buy credits",
+    "purchase credits",
+    "upgrade to continue",
+    "upgrade plan",
+    "upgrade your plan",
+    "resource_exhausted",
+    "resource exhausted",
+    "quota_exhausted",
+    "quota exhausted",
+    "quota exceeded",
+    "exceeded your quota",
+    "exceeded quota",
+    "rate limit exceeded",
+    "insufficient balance",
+    "credit balance is 0",
+    "credit balance: 0",
+    "not enough google flow and ai credits",
+    "not enough google flow credits",
+    "not enough ai credits",
+    "not enough credits to perform this action",
+    "try other settings or get more ai credits",
+    "try other settings or upgrade for more google flow credits",
+    "you're running low on credits",
+    "you're running low on google flow and ai credits",
+    "you're running low on google flow credits",
+    # 中文常见表达
     "积分不足",
     "没有足够的积分",
     "积分已用完",
+    "积分已耗尽",
+    "积分耗尽",
+    "积分用尽",
+    "点数不足",
+    "没有足够的点数",
+    "点数已用完",
+    "点数已耗尽",
+    "点数耗尽",
+    "额度不足",
+    "额度已用完",
+    "额度耗尽",
+    "额度已耗尽",
+    "配额不足",
+    "配额已用完",
+    "配额耗尽",
+    "配额已耗尽",
+    "剩余 0 积分",
+    "剩余 0 点数",
+    "0 积分",
+    "0 点数",
+    "0点数",
+    "0积分",
+    "积分余额为 0",
+    "点数余额为 0",
+    "积分余额不足",
+    "点数余额不足",
+    "无可用积分",
+    "无可用点数",
+    "没有积分",
+    "没有点数",
+    "缺少积分",
+    "缺少点数",
+]
+
+_ZERO_CREDIT_REGEXES = [
+    re.compile(r"\b0\s+(?:(?:google\s+)?flow\s+)?credits?\b", re.IGNORECASE),
+    re.compile(r"(?:credits?|积分|点数|余额)[:：]?\s*0\b", re.IGNORECASE),
+    re.compile(r"(?:剩余|left|remaining)\s*0\s*(?:credits?|积分|点数)?", re.IGNORECASE),
 ]
 
 
@@ -165,11 +253,105 @@ def _try_click_once(page, selectors) -> bool:
 
 
 def is_credit_exhausted_message(message: str) -> bool:
-    """粗粒度关键词匹配：判断一条生成失败文案是否指向"账号积分耗尽"。"""
+    """粗粒度关键词及正则匹配：判断一条生成/卡片/UI错误文案是否指向"账号积分/配额耗尽"。"""
     text = (message or "").lower()
     if not text:
         return False
-    return any(keyword.lower() in text for keyword in CREDIT_EXHAUSTED_KEYWORDS)
+    if any(keyword.lower() in text for keyword in CREDIT_EXHAUSTED_KEYWORDS):
+        return True
+    return any(pattern.search(text) is not None for pattern in _ZERO_CREDIT_REGEXES)
+
+
+def detect_page_credit_exhaustion(page) -> Optional[str]:
+    """主动扫描当前 Flow 页面是否存在积分/配额耗尽的弹窗、提示、Toast 或余额为 0 的状态。
+    若检测到，返回对应的错误描述字符串；否则返回 None。
+    """
+    if not page:
+        return None
+    try:
+        # 1. 检查可见的对话框 / 弹层 / 告警条 / Toast / 提示框
+        dialog_texts = page.evaluate("""() => {
+            const selectors = [
+                "[role='dialog']",
+                "[role='alertdialog']",
+                "[role='alert']",
+                ".cdk-overlay-pane",
+                "[class*='toast']",
+                "[class*='snackbar']",
+                "[class*='banner']",
+                "[class*='notification']",
+                "div[aria-live='assertive']",
+                "div[aria-live='polite']",
+            ];
+            const texts = [];
+            for (const sel of selectors) {
+                try {
+                    const elements = document.querySelectorAll(sel);
+                    for (const el of elements) {
+                        const style = window.getComputedStyle(el);
+                        if (style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity) > 0) {
+                            const t = (el.innerText || el.textContent || '').trim();
+                            if (t) texts.push(t);
+                        }
+                    }
+                } catch (e) {}
+            }
+            try {
+                const promptArea = document.querySelector('form, [data-slate-editor], textarea')?.closest('div');
+                if (promptArea) {
+                    const t = (promptArea.innerText || '').trim();
+                    if (t) texts.push(t);
+                }
+            } catch (e) {}
+
+            // 检查输入栏内是否出现替换了 Generate 按钮的橙色积分不足警告图标
+            try {
+                const infoIcons = document.querySelectorAll('i.google-symbols, i');
+                for (const i of infoIcons) {
+                    const text = (i.innerText || i.textContent || '').trim().toLowerCase();
+                    if (text === 'info' || text === 'error') {
+                        const p = i.parentElement;
+                        if (p) {
+                            const style = window.getComputedStyle(p);
+                            if (style.display !== 'none' && style.visibility !== 'hidden') {
+                                const isPromptBar = i.closest('form, footer, [data-slate-editor], [contenteditable], div[class*="5c3af813"]') !== null
+                                                 || p.hasAttribute('data-state');
+                                if (isPromptBar) {
+                                    texts.push("Not enough Google Flow and AI credits to perform this action (提示词栏显示积分不足警告图标)");
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e) {}
+
+            return texts;
+        }""")
+
+        for text in (dialog_texts or []):
+            if is_credit_exhausted_message(text):
+                first_line = text.splitlines()[0][:100].strip()
+                return f"页面提示积分耗尽: {first_line}"
+
+        # 2. 检查 UI 上的明确 0 积分链接/元素 (a[href*='credits'])
+        credit_elements = UI_SELECTORS.get("google_fx", {}).get("credit_display", [])
+        for sel in credit_elements:
+            try:
+                locator = page.locator(sel).first
+                if locator.count() > 0 and locator.is_visible(timeout=500):
+                    t = (locator.inner_text(timeout=500) or "").strip()
+                    if t and is_credit_exhausted_message(t):
+                        return f"账号菜单/顶栏显示积分耗尽: {t}"
+                    credit_num = _extract_credit_number(t)
+                    if credit_num is not None and credit_num == 0:
+                        return f"账号积分余额为 0 (当前读数: {t})"
+            except Exception:
+                continue
+
+    except Exception as e:
+        log(f"⚠️ 页面积分状态探测异常: {type(e).__name__}: {e}", "GoogleFX")
+
+    return None
 
 
 @contextlib.contextmanager

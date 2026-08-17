@@ -14,6 +14,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from prompt_pipeline import (
     beat_space_family,
@@ -35,6 +36,7 @@ from prompt_pipeline import (
     _beat_contract,
     fix_video_opening,
     check_video_opening,
+    check_threshold_monotonic_inheritance,
 )
 from video_generator import plan_video_slots, merge_project_videos, PartialMergeBlocked
 from frame_generator import update_manifest_stale_status
@@ -501,18 +503,22 @@ class TestPlanVideoSlotsCut(_TmpDirCase):
         self.assertEqual(plans[1]['start_anchor_slot'], 2)
         self.assertTrue(plans[1]['start_frame'] and plans[1]['end_frame'])
 
-    def test_legacy_placeholder_body_is_still_skipped(self):
-        """旧单（正文仍是占位声明）继续按预期缺失跳过——按正文识别，不按 [CUT] 标签。"""
+    def test_legacy_placeholder_body_now_generates_video(self):
+        """旧单遗留的占位声明正文不再跳过生成，而是清洗为可执行的跨越运镜提示词后正常生成。"""
         frames = self._make_frames(4)
         videos = {1: {'body': 'v1', 'meta': ''},
                   2: {'body': HARD_CUT_VIDEO_PLACEHOLDER, 'meta': 'CUT'},
                   3: {'body': 'v3', 'meta': ''}}
         plans = plan_video_slots(videos, frames, {}, self.videos_dir)
-        self.assertEqual([p['action'] for p in plans], ['generate', 'skip_cut', 'generate'])
-        # 切槽不因缺帧/降级被误判为 blocked
-        self.assertIn('硬切', plans[1]['reason'])
+        self.assertEqual([p['action'] for p in plans], ['generate', 'generate', 'generate'])
+        self.assertEqual(plans[1]['start_anchor_slot'], 2)
+        self.assertTrue(plans[1]['start_frame'] and plans[1]['end_frame'])
+        self.assertIn('IMAGE 1', plans[1]['prompt'])
+        self.assertIn('IMAGE 2', plans[1]['prompt'])
+        self.assertNotIn('no video clip is generated', plans[1]['prompt'])
 
-    def test_explicit_editorial_cut_is_skipped_without_i2v(self):
+    def test_explicit_editorial_cut_now_generates_video(self):
+        """显式声明剪辑硬切的提示词同样转换为可执行的跨越运镜提示词，照常生成视频。"""
         frames = self._make_frames(4)
         videos = {
             1: {'body': 'v1', 'meta': ''},
@@ -524,8 +530,11 @@ class TestPlanVideoSlotsCut(_TmpDirCase):
             3: {'body': 'v3', 'meta': ''},
         }
         plans = plan_video_slots(videos, frames, {}, self.videos_dir)
-        self.assertEqual([p['action'] for p in plans], ['generate', 'skip_cut', 'generate'])
-        self.assertIn('剪辑硬切', plans[1]['reason'])
+        self.assertEqual([p['action'] for p in plans], ['generate', 'generate', 'generate'])
+        self.assertEqual(plans[1]['start_anchor_slot'], 2)
+        self.assertTrue(plans[1]['start_frame'] and plans[1]['end_frame'])
+        self.assertIn('IMAGE 1', plans[1]['prompt'])
+        self.assertIn('IMAGE 2', plans[1]['prompt'])
 
     def test_bridge_turn_slot_not_mistaken_for_cut(self):
         frames = self._make_frames(3)
@@ -550,15 +559,18 @@ class TestMergeGateCut(_TmpDirCase):
 
     def test_skipped_cut_is_expected_gap_not_missing(self):
         self._make_frames(4)
-        # 槽位 2 是声明式硬切；槽位 3 真缺失 → 门禁只报 3，不报 2
+        # 槽位 2 是声明式硬切（旧单记录）；槽位 3 真缺失 → 门禁跳过无文件的槽位后合并，missing 只计 [1, 3]（槽位 1 缺少实际 mp4 文件），不计 2
         self._write_manifest(4, [
             {'slot': 1, 'status': 'success', 'file': 'videos/vid_001.mp4'},
             {'slot': 2, 'status': 'skipped_cut'},
         ])
-        with self.assertRaises(PartialMergeBlocked) as ctx:
+        with patch('video_generator._merge_skip_missing') as mock_skip_merge:
             merge_project_videos(self.tmp)
-        self.assertNotIn(2, ctx.exception.missing)
-        self.assertIn(3, ctx.exception.missing)
+            self.assertTrue(mock_skip_merge.called)
+            args = mock_skip_merge.call_args[0]
+            missing = args[4]
+            self.assertNotIn(2, missing)
+            self.assertIn(3, missing)
 
 
 class TestContinuousStaleLineage(_TmpDirCase):
@@ -742,6 +754,18 @@ class TestPostRevealCleanupContract(unittest.TestCase):
         fc = cross['family_contract']
         self.assertIn('raw interior throughout', fc)
         self.assertIn('one unbroken take', fc)
+        self.assertIn('NEXT beat', fc)
+
+    def test_crossing_clip_with_outline_refs_remains_pure_and_sterile_of_work(self):
+        """1:1 节拍映射下，过门拍依然是 100% 纯运镜拍，严禁要求在同一个镜头内继续施工。"""
+        ladder = self._ladder_with_cleanup(t=3)
+        ladder[2]['outline_refs'] = [3]
+        ladder[2]['milestone_name'] = 'installing flooring'
+        ladder[2]['package_operations'] = ['lay', 'fasten']
+        cross = self._contract(ladder, 3)
+        fc = cross['family_contract']
+        self.assertIn('raw interior throughout', fc)
+        self.assertNotIn('continues into real work', fc)
         self.assertIn('NEXT beat', fc)
 
 
@@ -1008,6 +1032,55 @@ class TestSealedEntryBeforeCrossing(unittest.TestCase):
         self.assertIn('flat unlit darkness', cross)
         # 这条路径不吃闭门契约（门在这一拍就是要打开的）
         self.assertNotIn('SEALED ENTRY (mandatory)', cross)
+
+
+class TestThresholdMonotonicInheritance(unittest.TestCase):
+    """Scheme A: 过门时空单调继承与状态回退测试。"""
+
+    def test_reverted_ceiling_trauma_is_flagged(self):
+        bad_prompt = (
+            "Static 14mm interior shot. Ceiling cracks and damp runoff cover the upper concrete, "
+            "with water leaks from the ceiling. Coarse grey concrete sidewalls remain."
+        )
+        errors = check_threshold_monotonic_inheritance(bad_prompt, is_first_interior=True)
+        self.assertTrue(len(errors) > 0)
+        self.assertIn("reverted ceiling/roof trauma", errors[0])
+
+    def test_inherited_completed_roof_passes(self):
+        good_prompt = (
+            "Static 14mm interior shot. The ceiling overhead inherits the newly completed timber rafter "
+            "framing and clean black waterproof membrane from exterior beats with zero ceiling cracks. "
+            "Coarse grey concrete sidewalls show original moisture streaks."
+        )
+        errors = check_threshold_monotonic_inheritance(good_prompt, is_first_interior=True)
+        self.assertEqual(errors, [])
+
+    def test_reverted_floor_debris_is_flagged_when_exterior_cleared(self):
+        bad_prompt = (
+            "Static 14mm interior shot. The floor has fallen timber and rotting leaf piles scattered "
+            "across the muddy surface. The ceiling inherits timber rafters."
+        )
+        errors = check_threshold_monotonic_inheritance(
+            bad_prompt, is_first_interior=True, exterior_history=['clearing', 'roofing']
+        )
+        self.assertTrue(len(errors) > 0)
+        self.assertIn("reverted floor debris", errors[0])
+
+    def test_clean_bare_earth_floor_passes(self):
+        good_prompt = (
+            "Static 14mm interior shot. The floor is clean bare earth swept free of loose debris. "
+            "The ceiling inherits completed oak rafters. Coarse concrete walls remain."
+        )
+        errors = check_threshold_monotonic_inheritance(
+            good_prompt, is_first_interior=True, exterior_history=['clearing', 'roofing']
+        )
+        self.assertEqual(errors, [])
+
+    def test_non_first_interior_skips_check(self):
+        # 普通后续室内施工帧由 ordinary milestone check 检查，不触发过门首帧拦截
+        bad_prompt = "Static 14mm interior shot. Ceiling cracks exist."
+        errors = check_threshold_monotonic_inheritance(bad_prompt, is_first_interior=False)
+        self.assertEqual(errors, [])
 
 
 if __name__ == '__main__':

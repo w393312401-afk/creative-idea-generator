@@ -13,6 +13,7 @@ from prompt_pipeline import (
     refine_packet_from_accepted_anchor,
     _parse_prompt_slots,
     _format_prompt_block,
+    prompt_block_from_output,
     prompt_slots_list,
 )
 from pipeline_orchestrator import render_single_frame, _render_videos_with_recovery, persist_outline_delivery_ledger
@@ -165,6 +166,7 @@ def start_stepped_pipeline(config, dimensions, on_progress=None, precomposed=Non
         'beat_ladder': None,
         'full_collage': None,
         'video_result': None,
+        'banned_hits': [],
         'error': None,
         'created_at': datetime.now().isoformat(),
         'updated_at': datetime.now().isoformat(),
@@ -212,8 +214,9 @@ def start_stepped_pipeline(config, dimensions, on_progress=None, precomposed=Non
                             'camera_palette')
             }
             _manifest['spatial_beats'] = [
+                # 'space' 必须在册，理由同 pipeline_orchestrator 的同款投影。
                 {key: beat.get(key) for key in (
-                    'index', 'space_id', 'transition_stage', 'camera_family', 'reveal_scope',
+                    'index', 'space', 'space_id', 'transition_stage', 'camera_family', 'reveal_scope',
                     'light_source_state', 'operation', 'package_operations', 'milestone_name',
                     'before_state', 'after_state', 'preserve_state', 'changed_grid_cells',
                     'persistent_traces', 'hard_cut', 'bridge_stage', 'turn_direction')}
@@ -269,9 +272,27 @@ def advance_stepped_pipeline(title, action='approve', on_progress=None, config=N
                     'beat_ladder': state.get('beat_ladder'),
                 }
                 
-                prompt_block = compose_remaining_beats(config, compose_state, on_progress=on_progress)
+                # 合成器返回的是整份带标记文档（TITLE/THEME/PROMPTS/AUDIT），不是提示词
+                # 正文；不剥头尾，末尾那句审计说明会跟着最后一段视频送去渲染。
+                prompt_block = prompt_block_from_output(
+                    compose_remaining_beats(config, compose_state, on_progress=on_progress))
                 state['prompt_block'] = prompt_block
                 
+                # 事后门禁复核：若简报带有 banned_elements，对 Phase 2 重写后的成稿做二次扫描
+                banned = (state.get('parsed_brief') or {}).get('banned_elements') or []
+                if banned:
+                    from prompt_pipeline.reverse import banned_element_hits
+                    hits = banned_element_hits(prompt_block, banned)
+                    state['banned_hits'] = hits
+                    if hits and on_progress:
+                        on_progress('stepped_stage', {
+                            'stage': 'compose_phase2',
+                            'message': f'警告：重写提示词命中了 {len(hits)} 个禁用元素（{"、".join(hits[:5])}），请在审阅时重点核对。',
+                            'banned_hits': hits,
+                        })
+                else:
+                    state['banned_hits'] = []
+
                 project_dir = _get_project_dir(title)
                 persist_outline_delivery_ledger(
                     project_dir, config.get('_outline_delivery_ledger'), title=title)

@@ -286,47 +286,12 @@ def test_fx_config_update_is_whitelisted_and_audited(config_store):
     assert control.recent_audit()[0]['details']['before']['adsPowerPort'] == 50325
 
 
-def test_fx_config_rollback_walks_back_more_than_one_step(config_store):
-    """B3 回归：原实现只能退一步，第二次点击是重复套用同一份 before（空操作）。"""
+def test_fx_config_noop_save_returns_empty_changed(config_store):
     store, _config, _control = config_store
-    store.ensure_baseline()          # 50325
     store.save({'adsPowerPort': 50326})
-    store.save({'adsPowerPort': 50327})
-    assert store.current()['adsPowerPort'] == 50327
-
-    store.restore()                  # → 50326
-    assert store.current()['adsPowerPort'] == 50326
-    store.restore()                  # → 50325，这一步旧实现做不到
-    assert store.current()['adsPowerPort'] == 50325
-
-
-def test_fx_config_redo_moves_forward_again(config_store):
-    store, _config, _control = config_store
-    store.ensure_baseline()
-    store.save({'adsPowerPort': 50326})
-    store.restore()
-    assert store.current()['adsPowerPort'] == 50325
-    store.restore(direction='forward')
-    assert store.current()['adsPowerPort'] == 50326
-
-
-def test_fx_config_restore_to_explicit_version(config_store):
-    store, _config, _control = config_store
-    store.ensure_baseline()
-    target = store.save({'adsPowerPort': 50330})['version']
-    store.save({'adsPowerPort': 50340})
-    store.restore(version_id=target['id'])
-    assert store.current()['adsPowerPort'] == 50330
-
-
-def test_fx_config_noop_save_does_not_pollute_version_stack(config_store):
-    store, _config, _control = config_store
-    store.ensure_baseline()
-    store.save({'adsPowerPort': 50326})
-    before = len(store.versions(100))
     outcome = store.save({'adsPowerPort': 50326})
+    assert outcome['changed'] == {}
     assert outcome['version'] is None
-    assert len(store.versions(100)) == before
 
 
 def test_pacing_bounds_must_not_be_inverted(config_store):

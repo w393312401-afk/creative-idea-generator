@@ -36,7 +36,7 @@ def _count_slots(prompt_block: str, label: str) -> int:
     Must stay in sync with prompt_pipeline.py's _parse_prompt_slots, which allows an
     optional bracketed annotation like [BRIDGE] between the slot number and the colon."""
     import re
-    return len(re.findall(rf'^{label}\s*\d+(?:\s*\[.*?\])?\s*:', prompt_block, re.MULTILINE))
+    return len(re.findall(rf'^{label}\s*\d+((?:\s*(?:[（\(].*?[）\)]|\[.*?\]))*)\s*[:：]', prompt_block, re.MULTILINE))
 
 
 def fetch_library(server: str) -> list:

@@ -60,6 +60,7 @@ from prompt_pipeline import (
     fix_horizon_line,
     fix_camera_contradictions,
     prompt_slots_list,
+    prompt_block_from_output,
     _format_prompt_block,
     _parse_prompt_slots,
 )
@@ -1141,8 +1142,11 @@ def run_autonomous_pipeline(config, dimensions, on_progress=None):
                         'camera_palette')
         }
         _manifest['spatial_beats'] = [
+            # 'space' 必须在册：复刻线的空间标签落在这个键上（reverse.normalize_beat_spaces），
+            # 而 _BEAT_KEY_ALIASES 会把 space_id 搬进去。只投影 space_id 的话，渲染层的过门
+            # 前情判定（_threshold_reveal_context）读到的每一拍都是同一个 'primary'。
             {key: beat.get(key) for key in (
-                'index', 'space_id', 'transition_stage', 'camera_family', 'reveal_scope',
+                'index', 'space', 'space_id', 'transition_stage', 'camera_family', 'reveal_scope',
                 'light_source_state', 'operation', 'package_operations', 'milestone_name',
                 'before_state', 'after_state', 'preserve_state', 'changed_grid_cells',
                 'persistent_traces', 'hard_cut', 'bridge_stage', 'turn_direction')}
@@ -1153,7 +1157,9 @@ def run_autonomous_pipeline(config, dimensions, on_progress=None):
         on_progress('packet_refined', {'message': 'Drift Lock 数据包已依据实际渲染结果修正。'})
 
     project_dir = rendered['project_dir']
-    prompt_block = compose_remaining_beats(config, state, on_progress=on_progress)
+    # 合成器返回的是整份带标记文档（TITLE/THEME/PROMPTS/AUDIT），不是提示词正文。
+    prompt_block = prompt_block_from_output(
+        compose_remaining_beats(config, state, on_progress=on_progress))
     # 卡片工序交付总账落盘：帧渲染完之后用户手动触发的一致性审查在另一个进程生命周期里，
     # config 上那份到不了那边（见 persist_outline_delivery_ledger）
     persist_outline_delivery_ledger(

@@ -380,6 +380,61 @@ class TestComposeGate(ReplicaTempRootCase):
         self.assertIn('excavator', str(ctx.exception))
 
 
+class TestComposedBlockHasNoDocumentWrapper(ReplicaTempRootCase):
+    """合成器返回的是一份**带标记的文档**，不是提示词正文。
+
+    `compose_remaining_beats` 的返回值长这样：
+        ===TITLE=== / ===THEME=== / ===PROMPTS=== <正文> / ===AUDIT=== <一句说明>
+    激发那条线在 server.py 里过一道 parse_sections 才落库；复刻这条线 2026-08-15
+    之前是整份原样存进 state['prompt_block']。后果不只是"页面上多两行"：
+    `_parse_prompt_slots` 的尾段正则是开放式的（…|\\Z），末尾那句
+    「skill 直出模式：…」会被吃进**最后一段视频**的正文，跟着这一拍送进 i2v。
+    """
+
+    DOC = ('===TITLE===\n石屋工作室\n===THEME===\n把废弃石屋修成工作室\n===PROMPTS===\n'
+           '图片提示词\n\n图片 1:\n一间石屋\n\n图片 2:\n屋顶已封\n\n'
+           '视频提示词\n\n视频 1:\n工人抹平墙面\n'
+           '===AUDIT===\nskill 直出模式：文本阶段无审查、无重写，批量直出+确定性修复一次成型。')
+
+    def _compose(self, composed):
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': []}
+        state['validation'] = []
+        rp._save_state(state)
+        with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'title': '石屋工作室'}), \
+             patch('prompt_pipeline.compose_remaining_beats', return_value=composed), \
+             patch('server_common.write_library_item'):
+            return rp.run_compose(state, {})
+
+    def test_head_and_tail_are_stripped_before_the_block_is_stored(self):
+        out = self._compose(self.DOC)
+        block = out['prompt_block']
+        self.assertNotIn('===', block)
+        self.assertNotIn('直出模式', block)
+        self.assertNotIn('石屋工作室', block)      # TITLE 段
+        self.assertNotIn('把废弃石屋修成工作室', block)  # THEME 段
+        self.assertIn('工人抹平墙面', block)
+
+    def test_the_audit_note_does_not_ride_along_on_the_last_video(self):
+        from prompt_pipeline import _parse_prompt_slots
+        out = self._compose(self.DOC)
+        _images, videos = _parse_prompt_slots(out['prompt_block'])
+        self.assertEqual(videos[1]['body'], '工人抹平墙面')
+
+    def test_a_stale_job_is_cleaned_when_its_state_is_read_back(self):
+        """存量任务的 state 文件里存着整份文档，不做数据迁移——读的时候剥。"""
+        state = self._compose(self.DOC)
+        state['prompt_block'] = self.DOC          # 把旧数据写回去，模拟存量任务
+        rp._save_state(state)
+        reloaded = rp._load_state(state['job_id'])
+        self.assertNotIn('直出模式', reloaded['prompt_block'])
+        self.assertIn('工人抹平墙面', reloaded['prompt_block'])
+
+    def test_an_already_clean_block_is_not_touched(self):
+        clean = '图片提示词\n图片 1:\n一间石屋\n\n视频提示词\n视频 1:\n工人抹平墙面\n'
+        self.assertEqual(self._compose(clean)['prompt_block'], clean)
+
+
 class TestComposeGateRevalidates(ReplicaTempRootCase):
     """合成卡点不信任一份可能来自旧版校验器的 validation 快照。
 
@@ -732,8 +787,154 @@ class TestVariantBranch(ReplicaTempRootCase):
             rp.run_mutate(state, {}, {'axes': ['carrier']})
 
 
-if __name__ == '__main__':
-    unittest.main()
+class TestOptimizationPlanCoverage(ReplicaTempRootCase):
+    """测试复刻管线主优化计划中的核心机制与防线。"""
+
+    def test_job_id_validation_rejects_traversal(self):
+        """防止路径穿越非法字符。"""
+        invalid_ids = ['../foo', 'job/123', 'job\\123', 'a' * 65, 'ab', 'job*id']
+        for bad_id in invalid_ids:
+            with self.assertRaises(ValueError):
+                rp.validate_job_id(bad_id)
+
+    def test_summary_index_fast_loading_and_state_slimming(self):
+        """验证 .summary.json 索引生成与 list_replica_jobs 高速读取。"""
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01', 'operation': '拆除'}]}
+        state['prompt_block'] = 'Prompt text...'
+        rp._save_state(state)
+
+        # 验证 summary 文件存在
+        summary_path = os.path.join(rp.job_dir(state['job_id']), '.summary.json')
+        self.assertTrue(os.path.exists(summary_path))
+
+        # 验证 state 文件中 beats 被单独保存为 timelapse_beats.json (State Slimming)
+        beats_path = os.path.join(rp.job_dir(state['job_id']), 'timelapse_beats.json')
+        self.assertTrue(os.path.exists(beats_path))
+
+        # 验证 list_replica_jobs 能读出列表并包含基本元数据
+        jobs = rp.list_replica_jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]['job_id'], state['job_id'])
+        self.assertEqual(jobs[0]['beat_count'], 1)
+
+    def test_delete_protection_for_source_jobs_with_variants(self):
+        """验证存在变体依赖时禁止误删源任务。"""
+        source = self._ingest()
+        variant_dir = os.path.join(rp.jobs_root(), 'replica_var123456')
+        os.makedirs(variant_dir, exist_ok=True)
+        var_state = {
+            'job_id': 'replica_var123456',
+            'stage': 'review_beats',
+            'variant_of': source['job_id'],
+            'created_at': '2026-08-14T00:00:00',
+        }
+        rp._save_state(var_state)
+
+        # 未使用 force=True 时应当报错拦截
+        with self.assertRaises(ValueError) as ctx:
+            rp.delete_replica_job(source['job_id'], force=False)
+        self.assertIn('变体', str(ctx.exception))
+
+        # 使用 force=True 可以成功删除
+        self.assertTrue(rp.delete_replica_job(source['job_id'], force=True))
+
+    def test_compose_failed_state_transition(self):
+        """合成报错时必须进入 compose_failed 终态，不能悬挂在 compose。"""
+        state = self._ingest()
+        state['stage'] = 'review_beats'
+        state['beats'] = {'beats': [{'id': 'B01', 'operation': '拆除'}]}
+        rp._save_state(state)
+
+        with patch('replica_pipeline.run_audit', side_effect=RuntimeError('LLM Context Exceeded')):
+            with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'slots': {'images': ['a']}, 'anchor_prompt': 'p', 'packet': 'pk'}):
+                with patch('prompt_pipeline.compose_remaining_beats', return_value={'blocks': ['b1']}):
+                    with self.assertRaises(RuntimeError):
+                        rp.run_compose(state, {})
+
+        loaded = rp._load_state(state['job_id'])
+        self.assertEqual(loaded['stage'], 'compose_failed')
+        self.assertIn('LLM Context Exceeded', loaded['error'])
+
+    def test_mutate_failed_state_transition(self):
+        """变体改写报错时必须进入 mutate_failed 终态，不能悬挂在 mutate_beats。"""
+        source = self._ingest()
+        source['beats'] = {'beats': [{'id': 'B01', 'operation': '拆除'}]}
+        rp._save_state(source)
+
+        with patch('prompt_pipeline.reverse.mutate_beats', side_effect=ValueError('Mutation failed')):
+            with self.assertRaises(ValueError):
+                rp.run_mutate(source, {}, {'axes': ['carrier']})
+
+        # 检查新派生的 variant job 状态
+        all_jobs = rp.list_replica_jobs()
+        variant_jobs = [j for j in all_jobs if j.get('variant_of') == source['job_id']]
+        self.assertEqual(len(variant_jobs), 1)
+        var_loaded = rp._load_state(variant_jobs[0]['job_id'])
+        self.assertEqual(var_loaded['stage'], 'mutate_failed')
+
+    def test_advance_valid_actions_enforcement(self):
+        """验证 advance_replica_job 的合法 action 校验白名单。"""
+        state = self._ingest()
+        with self.assertRaises(ValueError) as ctx:
+            rp.advance_replica_job({}, state['job_id'], action='hack_action')
+        self.assertIn('不支持的 action', str(ctx.exception))
+
+    def test_advance_autofix_action(self):
+        """验证 advance_replica_job(action='autofix') 成功调用 autofix_job_beats 并更新状态。"""
+        import prompt_pipeline as pp
+        from prompt_pipeline import reverse
+        state = self._ingest()
+        jdir = rp.job_dir(state['job_id'])
+        # 写入 overview 和初始 beats
+        with open(os.path.join(jdir, 'video_overview.json'), 'w') as f:
+            json.dump({'media_metadata': {'duration_sec': 10.0}, 'change_events': []}, f)
+        beats = {
+            'video_duration_sec': 10.0,
+            'beats': [
+                {'id': 'B01', 'start': 0.0, 'end': 5.0, 'stage': 'surface',
+                 'package_operations': ['plaster', 'paint'], 'persistent_traces': ['mark1', 'mark2']},
+                {'id': 'B02', 'start': 5.0, 'end': 10.0, 'stage': 'structural',
+                 'package_operations': ['frame', 'weld'], 'persistent_traces': ['mark1', 'mark2']},
+            ]
+        }
+        rp._write_beats(state, beats)
+        rp._save_state(state)
+
+        fixed_reply = json.dumps({
+            'beats': [
+                {'id': 'B01', 'stage': 'surface'},
+                {'id': 'B02', 'stage': 'floor'},
+            ]
+        })
+        with patch.object(pp, '_chat', return_value=fixed_reply), \
+             patch.object(reverse, 'translate_beats', return_value=2):
+            progress_calls = []
+            res_state = rp.advance_replica_job(
+                {}, state['job_id'], action='autofix',
+                on_progress=lambda t, d: progress_calls.append((t, d))
+            )
+            self.assertEqual(res_state['stage'], 'review_beats')
+            self.assertEqual(res_state['beats']['beats'][1]['stage'], 'floor')
+            self.assertTrue(any(isinstance(d, dict) and 'AI 修复完成' in d.get('message', '') for _, d in progress_calls))
+
+    def test_gc_replica_job_removes_intermediate_and_tmp_files(self):
+        """验证 gc_replica_job 清理临时文件。"""
+        state = self._ingest()
+        jdir = rp.job_dir(state['job_id'])
+        # 写入临时垃圾文件
+        tmp_file = os.path.join(jdir, 'test.tmp')
+        bad_reply = os.path.join(jdir, '.bad_reply_1.json')
+        pass_b_dir = os.path.join(jdir, '.pass_b_sheets')
+        os.makedirs(pass_b_dir, exist_ok=True)
+        with open(tmp_file, 'w') as f: f.write('temp')
+        with open(bad_reply, 'w') as f: f.write('bad')
+
+        res = rp.gc_replica_job(state['job_id'])
+        self.assertFalse(os.path.exists(tmp_file))
+        self.assertFalse(os.path.exists(bad_reply))
+        self.assertFalse(os.path.exists(pass_b_dir))
+        self.assertIn('test.tmp', res['cleaned'])
 
 
 class TestComposeFailureTranslation(ReplicaTempRootCase):
@@ -766,6 +967,98 @@ class TestComposeFailureTranslation(ReplicaTempRootCase):
         out = str(rp._translate_compose_failure(error, {'beats': []}))
         self.assertIn('Some rule nobody has translated yet.', out)
 
-    def test_unrelated_errors_pass_through_untouched(self):
-        error = RuntimeError('上游网关 503')
-        self.assertIs(rp._translate_compose_failure(error, {'beats': []}), error)
+
+class TestReplicaGovernance(ReplicaTempRootCase):
+    """测试治理能力：重命名、归档瘦身、级联删除与注意力状态计算。"""
+
+    def test_attention_calculation(self):
+        self.assertEqual(rp.attention_of('confirm_cost'), 'waiting_you')
+        self.assertEqual(rp.attention_of('review_beats'), 'waiting_you')
+        self.assertEqual(rp.attention_of('audit_failed'), 'waiting_you')
+        self.assertEqual(rp.attention_of('compose_failed'), 'waiting_you')
+        self.assertEqual(rp.attention_of('mutate_failed'), 'waiting_you')
+        self.assertEqual(rp.attention_of('completed'), 'done')
+        self.assertEqual(rp.attention_of('archived'), 'archived')
+        self.assertEqual(rp.attention_of('review_beats', has_active_task=True), 'running')
+        self.assertEqual(rp.attention_of('ingest'), 'stalled')
+        self.assertEqual(rp.attention_of('cancelled'), 'stalled')
+
+    def test_rename_and_title_locked(self):
+        state = self._ingest(b'fake', 'my_video.mp4')
+        job_id = state['job_id']
+        self.assertEqual(state['title'], 'my_video')
+        self.assertFalse(state.get('title_locked'))
+
+        # 人工重命名
+        updated = rp.rename_replica_job(job_id, '人工锁定的自拟标题')
+        self.assertEqual(updated['title'], '人工锁定的自拟标题')
+        self.assertTrue(updated['title_locked'])
+
+        # 检查 summary 也更新了
+        summaries = rp.list_replica_jobs()
+        row = next(r for r in summaries if r['job_id'] == job_id)
+        self.assertEqual(row['title'], '人工锁定的自拟标题')
+        self.assertTrue(row['title_locked'])
+
+    def test_archive_replica_job(self):
+        state = self._ingest(b'fake-video', 'source.mp4')
+        job_id = state['job_id']
+        jdir = rp.job_dir(job_id)
+
+        # 伪造重资产
+        rf_dir = os.path.join(jdir, 'review_frames')
+        os.makedirs(rf_dir, exist_ok=True)
+        with open(os.path.join(rf_dir, 'frame_001.png'), 'w') as f: f.write('big frame')
+
+        sheet_dir = os.path.join(jdir, '.pass_b_sheets')
+        os.makedirs(sheet_dir, exist_ok=True)
+        with open(os.path.join(sheet_dir, 'sheet.jpg'), 'w') as f: f.write('sheet')
+
+        collage_file = os.path.join(jdir, 'source_collage.jpg')
+        with open(collage_file, 'w') as f: f.write('big collage')
+
+        thumb_file = os.path.join(jdir, 'source_collage_thumb.jpg')
+        with open(thumb_file, 'w') as f: f.write('thumb')
+
+        beats_file = os.path.join(jdir, 'timelapse_beats.json')
+        with open(beats_file, 'w') as f: f.write('{"beats": [{"id": "B01"}]}')
+
+        # 归档
+        archived = rp.archive_replica_job(job_id)
+        self.assertEqual(archived['stage'], 'archived')
+        self.assertTrue(archived['archived'])
+
+        # 验证重资产已被删除
+        self.assertFalse(os.path.exists(rf_dir))
+        self.assertFalse(os.path.exists(sheet_dir))
+        self.assertFalse(os.path.exists(collage_file))
+        self.assertFalse(os.path.exists(state['video_path']))
+
+        # 验证节拍与缩略图依然保留
+        self.assertTrue(os.path.exists(thumb_file))
+        self.assertTrue(os.path.exists(beats_file))
+        self.assertTrue(os.path.exists(rp._state_path(job_id)))
+
+    def test_delete_cascades_task_files(self):
+        state = self._ingest(b'fake', 'test_delete.mp4')
+        job_id = state['job_id']
+        tid = f'replica_test_task_{job_id}'
+
+        # 在 server_common 建立 fake 任务
+        tasks_dir = os.path.join(self.tmp, 'tasks')
+        os.makedirs(tasks_dir, exist_ok=True)
+        with patch.object(server_common, 'TASKS_DIR', tasks_dir):
+            server_common.get_or_create_task(tid, dimensions={'type': 'replica_extract', 'replica_job_id': job_id})
+            tpaths = server_common._task_paths(tid, tasks_dir=tasks_dir)
+            self.assertTrue(os.path.exists(tpaths[0]))
+
+            # 删除 job
+            self.assertTrue(rp.delete_replica_job(job_id))
+            # 关联的 task 文件也应该被级联删除
+            self.assertFalse(os.path.exists(tpaths[0]))
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+

@@ -63,6 +63,8 @@ from .google_fx_helpers import (
     _click_new_project_button,
     _dismiss_active_agent_mode,
     _dismiss_unexpected_overlays,
+    detect_page_credit_exhaustion,
+    is_credit_exhausted_message,
 )
 
 # 🚨 打包批量上传 (_upload_images_to_canvas_bulk) 依赖一个未经现场验证的假设：
@@ -590,6 +592,11 @@ class _IPBlockedError(Exception):
     pass
 
 
+class _CreditExhaustedError(Exception):
+    """Google Flow 账号积分/配额耗尽，立即标记号池冷却并切换下一账号。"""
+    pass
+
+
 # 2026-07-25：把"被判异常活动就强制换 IP"统一改成换号重试。换 IP 只换出口地址，
 # 账号侧的风控评分不会跟着重置，实测换完照样被判；而频繁换 IP 反而会把 Flow 的
 # 登录 token 打失效（见 SPARK server_common 的「换号不换 IP 阶梯」）。现在递增冷却
@@ -760,6 +767,14 @@ class _ChunkRunner:
             try:
                 if self._run_round(remaining):
                     break
+            except _CreditExhaustedError as e:
+                log(f"🧊 捕获到账号积分耗尽: {e}，立即换号重试剩余任务...", "GoogleFX-Video")
+                try:
+                    self._cooldown_and_switch_credit_exhausted()
+                except Exception as switch_err:
+                    log(f"⛔ 积分耗尽换号终止: {switch_err}", "GoogleFX-Video")
+                    break
+                continue
             except _IPBlockedError:
                 if MAX_IP_RETRIES > 0 and self.ip_retry >= MAX_IP_RETRIES:
                     log(
@@ -1391,9 +1406,11 @@ class _ChunkRunner:
                     page, _UuidRefRequest(req, _start_uuid, _end_uuid), before_tile_ids,
                     expect_slice=self.chunk_slices.get(sub_idx)
                 )
-            except (_IPBlockedError, ConnectionError):
+            except (_IPBlockedError, _CreditExhaustedError, ConnectionError):
                 raise
             except Exception as submit_err:
+                if "INSUFFICIENT_CREDITS" in str(submit_err) or is_credit_exhausted_message(str(submit_err)):
+                    raise _CreditExhaustedError(f"Credit exhausted during submit: {submit_err}")
                 if "TargetClosedError" in type(submit_err).__name__ or "Target page" in str(submit_err):
                     # 浏览器页面意外关闭：不是这一个任务的问题，交给 run() 外层的
                     # TargetClosedError 恢复逻辑重建连接、整轮重跑。
@@ -1435,7 +1452,7 @@ class _ChunkRunner:
             self._tile_slices[tile_id] = self.chunk_slices.get(sub_idx, '')
             before_tile_ids.append(tile_id)
 
-            # 🚨 提前检测 IP 被封：每提交完一个任务就扫一次已提交 tile，
+            # 🚨 提前检测 IP 被封或积分耗尽：每提交完一个任务就扫一次已提交 tile，
             # 命中立即中止本轮提交（而不是等整批提交完才发现）
             early_states = _inspect_all_pending_tiles(
                 page, [t["tile_id"] for t in submitted], self._prompts_map,
@@ -1448,6 +1465,13 @@ class _ChunkRunner:
                     "GoogleFX-Video",
                 )
                 raise _IPBlockedError("IP blocked: unusual activity detected during submit")
+
+            if any(s.get("isCreditExhausted") for s in early_states.values()):
+                log(
+                    "🧊 提交过程中检测到账号积分耗尽，立即停止提交剩余任务，标记冷却并换号...",
+                    "GoogleFX-Video",
+                )
+                raise _CreditExhaustedError("Credit exhausted: out of credits detected during submit")
 
             random_sleep(1.0, 1.5)
 
@@ -1484,6 +1508,20 @@ class _ChunkRunner:
                     "GoogleFX-Video",
                 )
                 raise _IPBlockedError("IP blocked: unusual activity detected")
+
+            if any(state.get("isCreditExhausted") for state in states.values()):
+                log(
+                    "🧊 检测到账号积分耗尽（out of credits / 积分已用完），"
+                    "立即中止当前批次，标记冷却并换号重跑...",
+                    "GoogleFX-Video",
+                )
+                raise _CreditExhaustedError("Credit exhausted: out of credits detected during generation")
+
+            if poll_count % 3 == 0:
+                page_credit_err = detect_page_credit_exhaustion(page)
+                if page_credit_err:
+                    log(f"🧊 页面检测到积分耗尽: {page_credit_err}，立即中止并换号...", "GoogleFX-Video")
+                    raise _CreditExhaustedError(page_credit_err)
 
             still_pending = []
             for task in submitted:
@@ -1595,6 +1633,41 @@ class _ChunkRunner:
                 "reason": "ip_blocked",
                 "retry": self.ip_retry,
             })
+
+    def _cooldown_and_switch_credit_exhausted(self):
+        """检测到积分耗尽：标记当前账号 quota_exhausted，切换号池下一个可用账号。"""
+        from ..config import get_runtime_default_user_id
+        from ..utils.account_pool import switch_to_next_account, AccountPool
+
+        current = (get_runtime_default_user_id() or "").strip()
+        if current:
+            self.tried_accounts.add(current)
+            try:
+                AccountPool().mark_exhausted(current)
+                log(f"🧊 账号 {current} 积分已耗尽，已在账号池中标记为 quota_exhausted 冷却 24 小时", "GoogleFX-Video")
+            except Exception as pool_err:
+                log(f"⚠️ 标记账号 {current} 额度耗尽失败: {pool_err}", "GoogleFX-Video")
+
+        chosen = switch_to_next_account(exclude=self.tried_accounts)
+        if chosen:
+            self.tried_accounts.add(chosen["user_id"])
+            log(f"🔄 已自动切换到号池新账号 {chosen['user_id']}（{chosen.get('name') or '未命名'}）继续生成", "GoogleFX-Video")
+            self._notify(self.chunk_start, "account_switched", {
+                "previous": current or None,
+                "user_id": chosen["user_id"],
+                "name": chosen.get("name") or "",
+                "reason": "credit_exhausted",
+                "retry": 1,
+            })
+        else:
+            log("⛔ 号池中已无其他可用账号，无法继续换号重试", "Error")
+            remaining = [
+                (sub_idx, self.chunk[sub_idx])
+                for sub_idx in range(len(self.chunk))
+                if sub_idx not in self.completed
+            ]
+            self._fail_remaining(remaining, "号池所有可用账号积分均已耗尽，请补充积分或添加新账号")
+            raise RuntimeError("号池所有可用账号积分均已耗尽")
 
 
 def generate_videos_batch_google_fx(reqs: list, on_progress=None, cancel_check=None):

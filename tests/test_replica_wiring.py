@@ -286,3 +286,56 @@ def test_the_composer_prompt_actually_includes_the_scene_block():
     src = inspect.getsource(BaseComposer)
     assert src.count('self.scene_constants_block()') >= 2, \
         '批量直出与单拍兜底两条路径都要带上这一段'
+
+
+def test_gc_route_registered_in_server():
+    import inspect
+    import server
+    src = inspect.getsource(server)
+    assert "path == '/api/replica/gc'" in src
+
+
+def test_upload_1gb_limit_and_reuse_contract():
+    import inspect
+    import server
+    src = inspect.getsource(server)
+    assert "content_length > 1024 * 1024 * 1024" in src
+    assert "'existing_job': state if state.get('reused') else None" in src
+
+
+def test_advance_uses_replica_pipeline_valid_actions():
+    import inspect
+    import server
+    src = inspect.getsource(server)
+    assert "from replica_pipeline import VALID_ACTIONS" in src
+    assert "if action not in VALID_ACTIONS:" in src
+
+
+def test_replica_library_item_contains_asmr_mixing_defaults():
+    """复刻生成的项目记录必须默认携带 ASMR 混音偏好（video_volume: 0.6, bgm_volume: 0.0）。"""
+    import replica_pipeline
+    state = {
+        'job_id': 'replica_test123',
+        'stage': 'completed',
+        'title': '测试复刻',
+        'prompt_block': 'IMAGE 1: A photo\n\nVIDEO 1: Camera moves',
+        'video_name': 'test.mp4',
+    }
+    item = replica_pipeline._library_item(state)
+    assert item['video_volume'] == 0.6
+    assert item['bgm_volume'] == 0.0
+    assert item['mute_original'] is False
+
+
+def test_space_monotonicity_validation_catches_regression():
+    """跨空间过门后，若描述了前序工序已修好的倒退特征，必须报出 space_state_regression 警告。"""
+    beats = [
+        {'id': 'B01', 'space': 'outdoor', 'stage': 'demolition', 'visible_action': 'clearing fallen leaves', 'state_after': 'clean ground'},
+        {'id': 'B02', 'space': 'indoor', 'stage': 'rough_in', 'state_before': 'ground full of dead leaves, decayed rafter leaking', 'visible_details': ['broken rubble']},
+    ]
+    warns = reverse._validate_space_monotonicity(beats)
+    assert len(warns) == 1
+    assert warns[0]['code'] == 'space_state_regression'
+    assert warns[0]['beat_id'] == 'B02'
+
+

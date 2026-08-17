@@ -204,7 +204,7 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    padding: 8px 16px;
+    padding: 7px 16px;
     border: none;
     border-radius: 8px;
     background: linear-gradient(135deg, var(--neon-cyan) 0%, var(--neon-purple) 100%);
@@ -214,20 +214,34 @@
     font-weight: 600;
     white-space: nowrap;
     cursor: pointer;
-    transition: var(--transition-fast);
+    transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: 0 0 10px rgba(0, 245, 212, 0.25);
+    user-select: none;
 }
 
 .pipeline-next:hover:not(:disabled) {
-    box-shadow: 0 0 12px rgba(176, 123, 82, 0.3);
+    box-shadow: 0 2px 18px rgba(0, 245, 212, 0.45);
+    transform: translateY(-1px);
+}
+
+.pipeline-next:active:not(:disabled) {
+    transform: translateY(0) scale(0.98);
 }
 
 .pipeline-next:disabled {
-    opacity: 0.55;
+    opacity: 0.45;
     cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
 }
 
 .pipeline-next-arrow {
     font-weight: 700;
+    transition: transform 0.18s ease;
+}
+
+.pipeline-next:hover:not(:disabled) .pipeline-next-arrow {
+    transform: translateX(2px);
 }
 
 /* ⋯ 溢出菜单：复制全部提示词 / 收藏 / 导出 Markdown */
@@ -248,13 +262,25 @@
     font-size: 16px;
     line-height: 1;
     cursor: pointer;
-    transition: var(--transition-fast);
+    transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    user-select: none;
 }
 
-.pipeline-more-btn:hover,
+.pipeline-more-btn:hover {
+    background: rgba(var(--ink-rgb), 0.08);
+    border-color: rgba(var(--ink-rgb), 0.18);
+    color: var(--text-primary);
+    transform: translateY(-1px);
+}
+
+.pipeline-more-btn:active {
+    transform: translateY(0) scale(0.96);
+}
+
 .pipeline-more-btn[aria-expanded="true"] {
     background: var(--bg-card-hover);
     color: var(--text-primary);
+    border-color: var(--neon-cyan);
 }
 
 .pipeline-more-menu {

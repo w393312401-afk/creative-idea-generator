@@ -96,6 +96,7 @@ function applySlotSize(size) {
 function slotMatchesFilter(card, filter) {
     if (filter === 'all') return true;
     if (filter === 'flagged') return Number(card.dataset.badges || 0) > 0;
+    if (filter === 'dirty') return card.dataset.promptDirty === '1';
     if (filter === 'missing') return ['missing', 'failed'].includes(card.dataset.kind);
     return true;
 }
@@ -118,7 +119,7 @@ function syncSlotToolbar(type) {
         if (!present.has(seq)) st.selected.delete(seq);
     });
 
-    let shown = 0, ready = 0, flagged = 0, missing = 0, fixable = 0;
+    let shown = 0, ready = 0, flagged = 0, missing = 0, fixable = 0, dirty = 0;
     cards.forEach(card => {
         const seq = Number(card.dataset.seq);
         const match = slotMatchesFilter(card, st.filter);
@@ -127,6 +128,7 @@ function syncSlotToolbar(type) {
         if (card.dataset.kind === 'ready') ready += 1;
         if (Number(card.dataset.badges || 0) > 0) flagged += 1;
         if (card.dataset.fixable === '1') fixable += 1;
+        if (card.dataset.promptDirty === '1') dirty += 1;
         if (['missing', 'failed'].includes(card.dataset.kind)) missing += 1;
 
         const picked = st.selected.has(seq);
@@ -142,6 +144,7 @@ function syncSlotToolbar(type) {
     if (countEl) {
         const parts = [`${label} ${ready}/${cards.length}`];
         if (flagged) parts.push(`⚠ ${flagged}`);
+        if (dirty) parts.push(`⚡改动 ${dirty}`);
         if (missing) parts.push(`缺 ${missing}`);
         countEl.textContent = parts.join(' · ');
     }
@@ -165,6 +168,21 @@ function syncSlotToolbar(type) {
     }
     const jumpBtn = bar.querySelector('.slot-jump-btn');
     if (jumpBtn) jumpBtn.hidden = flagged === 0;
+
+    // 「⚡ 重渲已改动帧」：存在 prompt_dirty 标脏槽位时自动显示
+    const retryDirtyBtn = bar.querySelector('.slot-retry-dirty-btn');
+    if (retryDirtyBtn) {
+        retryDirtyBtn.hidden = dirty === 0;
+        retryDirtyBtn.textContent = `⚡ 重渲已改动帧 (${dirty})`;
+    }
+
+    // 「🖼️ 多宫格检查器」快捷入口按钮
+    const cvBtn = bar.querySelector('.slot-collage-btn');
+    if (cvBtn) {
+        const hasCollage = typeof currentIdea !== 'undefined' && currentIdea && (currentIdea.collage_url || (currentIdea.frameRun && (currentIdea.frameRun.collage_url || (currentIdea.frameRun.frames && currentIdea.frameRun.frames.length))));
+        cvBtn.hidden = !hasCollage;
+    }
+
     // 「全部修复」只在真有待修帧时露面，并把条数写在按钮上——⚠ 计数里还混着
     // 降级/过期这类修不了的徽标，光看它判断不出"有几帧可以一键修"
     const fixAllBtn = bar.querySelector('.slot-fix-all-btn');
@@ -269,6 +287,75 @@ function slotCardIsFixable(type, seq) {
 // 一轮批量修复是否正在进行：帧与帧之间有一段没有任务登记的空隙（回读 manifest、
 // 弹确认框），此时 isIdeaTaskActive 是假的，再点一次按钮就会有两轮批量交错着修。
 let fixAllRunning = false;
+let retryDirtyRunning = false;
+
+/** 当前网格里"提示词已改"的槽位号（升序）。只读卡片上的 data-prompt-dirty */
+function dirtySlotSequences(type) {
+    const { grid } = slotToolbarEls(type);
+    if (!grid) return [];
+    return Array.from(grid.querySelectorAll(
+        `.slot-card[data-type="${type}"][data-prompt-dirty="1"]`))
+        .map(c => Number(c.dataset.seq))
+        .filter(n => Number.isFinite(n))
+        .sort((a, b) => a - b);
+}
+
+/**
+ * 「一键重渲已改动帧」：把所有被标脏（prompt_dirty）的槽位按编号升序自动依次重新生成。
+ */
+async function bulkRetryDirtySlots(type = 'image') {
+    const idea = (typeof currentIdea !== 'undefined' && currentIdea) || null;
+    if (!idea) {
+        showToast('请先激发一个创意点子！', 'error');
+        return;
+    }
+    if (retryDirtyRunning || isIdeaTaskActive(idea.id, type === 'video' ? 'videos' : 'frames')) {
+        showToast(`该创意的${type === 'video' ? '视频' : '帧'}序列正在生成/重试中，请稍候`, 'error');
+        return;
+    }
+    const seqs = dirtySlotSequences(type);
+    if (!seqs.length) {
+        showToast('当前没有需要重渲的已改动帧。', 'info');
+        return;
+    }
+
+    retryDirtyRunning = true;
+    try {
+        const label = type === 'video' ? 'VID' : 'IMG';
+        const proceed = await customConfirm(
+            `将按编号依次重新生成 <b>${seqs.length}</b> 个提示词已改动的槽位：<br><br>`
+            + `<b>${seqs.map(s => label + ' ' + padSlot(s)).join('、')}</b><br><br>`
+            + '生成完成后将自动刷新画面并清除「提示词已改」徽标。');
+        if (!proceed) return;
+
+        const feed = (text, cls) => {
+            if (typeof framesFeedLine === 'function') framesFeedLine(idea.id, text, cls);
+        };
+        feed(`⚡ 一键重渲已改动槽位：共 ${seqs.length} 帧待重跑，按编号依次处理…`);
+
+        let count = 0;
+        for (const seq of seqs) {
+            if (type === 'video') {
+                await retrySingleVideo(seq);
+            } else {
+                await retrySingleFrame(seq);
+            }
+            count += 1;
+            if (typeof reloadManifestIntoIdea === 'function') await reloadManifestIntoIdea(idea);
+            if (typeof isViewingIdea === 'function' && isViewingIdea(idea.id)) {
+                if (type === 'video' && typeof renderVideosForIdea === 'function') renderVideosForIdea(idea);
+                else if (typeof renderFramesForIdea === 'function') renderFramesForIdea(idea);
+            }
+        }
+
+        feed(`⚡ 一键重渲结束：共完成 ${count} 个槽位的重新渲染。`, 'ok');
+        showToast(`⚡ 已成功重渲 ${count} 个槽位！`, 'success');
+    } catch (e) {
+        showToast(`重渲中断: ${e.message}`, 'error');
+    } finally {
+        retryDirtyRunning = false;
+    }
+}
 
 /**
  * 「一键全部修复」：把所有带待修问题的帧（一致性审查未过 + 人工标记）按帧号
@@ -369,6 +456,11 @@ function bindSlotToolbar(type) {
         const sizeBtn = e.target.closest('.slot-size-btn');
         if (sizeBtn) { applySlotSize(sizeBtn.dataset.size); return; }
         if (e.target.closest('.slot-jump-btn')) { jumpToFirstFlagged(type); return; }
+        if (e.target.closest('.slot-retry-dirty-btn')) { bulkRetryDirtySlots(type); return; }
+        if (e.target.closest('.slot-collage-btn')) {
+            if (typeof openCollageViewer === 'function') openCollageViewer();
+            return;
+        }
         // 「全部修复」只有图片工具条有这枚按钮（视频槽位没有"待修问题"这一说）
         if (e.target.closest('.slot-fix-all-btn')) { bulkFixFlaggedFrames(); return; }
         if (e.target.closest('.slot-merge-btn')) { setSlotMergedView(!slotMergedView); return; }

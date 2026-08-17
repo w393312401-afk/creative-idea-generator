@@ -145,13 +145,7 @@
             </div>
           </div>
           <nav class="nav-menu">
-            <div class="nav-item active" data-tab="dashboard">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6A2.25 2.25 0 0 1 3.75 18v-2.25ZM13.5 6a2.25 2.25 0 0 1 2.25-2.25H18A2.25 2.25 0 0 1 20.25 6v2.25A2.25 2.25 0 0 1 18 10.5h-2.25a2.25 2.25 0 0 1-2.25-2.25V6ZM13.5 15.75a2.25 2.25 0 0 1 2.25-2.25H18a2.25 2.25 0 0 1 2.25 2.25V18A2.25 2.25 0 0 1 18 20.25h-2.25A2.25 2.25 0 0 1 13.5 18v-2.25Z" />
-              </svg>
-              <span>仪表盘控制台</span>
-            </div>
-            <div class="nav-item" data-tab="google-fx">
+            <div class="nav-item active" data-tab="google-fx">
               <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" d="M9 3.75H6.75A2.25 2.25 0 0 0 4.5 6v12a2.25 2.25 0 0 0 2.25 2.25h10.5A2.25 2.25 0 0 0 19.5 18V6a2.25 2.25 0 0 0-2.25-2.25H15M9 3.75V6h6V3.75M9 3.75h6M8.25 11.25h7.5m-7.5 3h4.5" />
               </svg>
@@ -210,118 +204,24 @@
                 <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
               </svg>
             </button>
-            <h2 id="page-title-label">控制台仪表盘</h2>
+            <h2 id="page-title-label">Google FX 服务管理</h2>
           </div>
-          <p id="page-title-desc">监控后台任务、系统状态并管理可用 AI 模型与 API 接口</p>
+          <p id="page-title-desc">管理 Flow 自动化运行时、AdsPower 连接、账号池与浏览器执行状态</p>
         </div>
 
-        <!-- TAB 1: DASHBOARD -->
-        <section class="tab-content active" id="tab-dashboard">
-        <!-- Tunnel URL Announcement banner -->
-        <div class="alert alert-info" id="tunnel-url-banner" style="display: none;">
-          <div class="alert-info-left">
-            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" style="width:18px;height:18px;color:var(--primary);filter:drop-shadow(0 0 4px var(--primary-glow));">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
-            </svg>
-            <span><strong>公网访问已开启</strong>：当前已通过 Cloudflare Tunnel 暴露服务，公网 API Base URL 为：<code id="tunnel-url-code">-</code></span>
-          </div>
-          <button class="alert-copy-btn" id="btn-copy-tunnel-url">
-            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:14px;height:14px;">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H5.25m11.9-3.664A2.251 2.251 0 0 0 15 2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25h-.007a2.25 2.25 0 0 0-2.25 2.25M18.75 8.25v11.25m0-11.25a2.25 2.25 0 0 0-2.25-2.25h-1.5a2.25 2.25 0 0 0-2.25 2.25m7.5 0v11.25m-18-11.25a2.25 2.25 0 0 1 2.25-2.25h1.5a2.25 2.25 0 0 1 2.25 2.25m-4.5 0v11.25m11.9-3.664C19.302 15.1 19.5 14.201 19.5 13.25V9.75" />
-            </svg>
-            <span>复制 URL</span>
-          </button>
-        </div>
-
-        <!-- Quick Stats Cards -->
-        <div class="dashboard-grid">
-          <div class="glass-card">
-            <div class="card-icon">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
-              </svg>
-            </div>
-            <div class="card-value" id="stat-active-tasks">0</div>
-            <div class="card-label">后台活跃生成任务</div>
-          </div>
-          <div class="glass-card">
-            <div class="card-icon">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M9 12h3.75M9 15h3.375c.9 0 1.625-.724 1.625-1.625V12.75M9 9h3.375c.9 0 1.625-.724 1.625-1.625V6.75M12 3v18M3 21h18" />
-              </svg>
-            </div>
-            <div class="card-value" id="stat-rate-max">20</div>
-            <div class="card-label">单IP限制量 (1小时内最多/次)</div>
-          </div>
-          <div class="glass-card">
-            <div class="card-icon">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 15a4.5 4.5 0 0 0 4.5 4.5H18a3.75 3.75 0 0 0 1.332-7.257 3 3 0 0 0-3.758-3.848 5.25 5.25 0 0 0-10.233 2.33A4.502 4.502 0 0 0 2.25 15Z" />
-              </svg>
-            </div>
-            <div class="card-value" id="stat-server-mode">托管模式</div>
-            <div class="card-label">服务器运行状态</div>
-          </div>
-          <div class="glass-card" style="display: flex; flex-direction: column; justify-content: space-between;">
-            <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
-              <div class="card-icon" style="margin-bottom: 0;">
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" />
-                </svg>
-              </div>
-              <button id="btn-clear-system-cache" class="btn btn-sm" style="margin: 0; padding: 4px 8px; font-size: 11px; background: rgba(255, 75, 75, 0.12); border: 1px solid rgba(255, 75, 75, 0.25); color: #ff4b4b; border-radius: 6px; cursor: pointer; transition: 0.2s; font-weight: 600;">清理缓存</button>
-            </div>
-            <div class="card-value" id="stat-cache-size" style="margin-top: 12px; margin-bottom: 6px;">计算中...</div>
-            <div class="card-label">系统缓存 (packet_cache)</div>
-          </div>
-        </div>
-
-        <!-- Task Monitor Section -->
-        <div class="glass-card">
-          <div class="section-title">
-            <span>活跃时光机合成任务监视器</span>
-            <span id="task-monitor-sync-time">上次更新: 刚刚</span>
-          </div>
-          <div class="table-container">
-            <table class="custom-table">
-              <thead>
-                <tr>
-                  <th>任务 ID</th>
-                  <th>改造主题</th>
-                  <th>状态</th>
-                  <th>维度数 (Beats)</th>
-                  <th>持续时长</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody id="task-table-body">
-                <tr>
-                  <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 40px 0;">
-                    正在获取任务列表...
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <!-- TAB: GOOGLE FX OPERATIONS -->
-      <section class="tab-content" id="tab-google-fx">
+        <!-- TAB: GOOGLE FX OPERATIONS -->
+        <section class="tab-content active" id="tab-google-fx">
         <div class="fx-console" id="fx-console-root">
           <div class="fx-hero">
             <div>
               <div class="fx-eyebrow">FLOW AUTOMATION RUNTIME</div>
               <h3>Google FX 服务管理中心</h3>
-              <p>集中查看运行时、AdsPower、账号池和任务队列；状态检查不会启动或关闭浏览器。</p>
+              <p>集中查看运行时、AdsPower、账号池与浏览器状态；状态检查不会启动或关闭浏览器。</p>
             </div>
             <div class="fx-hero-actions">
               <span class="fx-sync-time" id="fx-sync-time">尚未同步</span>
               <span class="fx-lock-badge" id="fx-service-mode">运行中</span>
               <button class="fx-button" id="fx-open-manual" type="button" title="打开 Google FX 服务管理中心使用说明书">📖 使用说明书</button>
-              <button class="fx-button" id="fx-control-pause" type="button">暂停</button>
-              <button class="fx-button" id="fx-control-drain" type="button">排空</button>
-              <button class="fx-button" id="fx-control-resume" type="button">恢复</button>
               <button class="fx-button fx-button-primary" id="fx-refresh-status" type="button">刷新状态</button>
             </div>
           </div>
@@ -337,7 +237,7 @@
             </article>
             <article class="fx-status-card" data-tone="neutral">
               <div class="fx-status-icon">↯</div>
-              <div><span>执行队列</span><strong id="fx-execution-state">检测中</strong><small id="fx-execution-sub">等待快照</small></div>
+              <div><span>执行状态</span><strong id="fx-execution-state">空闲</strong><small id="fx-execution-sub">无活跃任务</small></div>
             </article>
             <article class="fx-status-card" data-tone="neutral">
               <div class="fx-status-icon">◎</div>
@@ -362,38 +262,20 @@
 
           <div class="fx-orphaned" id="fx-orphaned" hidden></div>
 
-          <!-- ⚡ 核心执行槽位与底层队列监控 -->
+          <!-- ⚡ 浏览器执行状态 -->
           <article class="fx-panel fx-slot-panel" id="fx-slot-panel">
             <div class="fx-panel-header">
               <div>
-                <h4>⚡ 核心执行槽位与底层排队队列 (Active Slot & Execution Queue)</h4>
-                <p>实时监控独占浏览器的底层任务（包含账号积分探针、选择器探针、自检、生成任务）。遇服务被占用提示时可在此点击强行释放。</p>
+                <h4>⚡ 浏览器执行状态 (Browser Activity)</h4>
+                <p>实时监控独占浏览器的当前任务。若遇任务异常退出导致锁未释放，可点击强行释放。</p>
               </div>
               <div class="fx-inline-actions">
-                <button class="fx-button fx-button-danger" id="fx-force-release-all" type="button" title="当日志提示服务被占用但找不到任务时，点击此按钮一键清空所有卡死槽位">🧹 强行清空所有卡死槽位</button>
-                <button class="fx-button" id="fx-slot-refresh" type="button">刷新槽位</button>
+                <button class="fx-button fx-button-danger" id="fx-force-release-all" type="button" title="点击强行释放当前浏览器占用">🧹 强行释放占用</button>
+                <button class="fx-button" id="fx-slot-refresh" type="button">刷新</button>
               </div>
             </div>
             <div id="fx-slot-display" class="fx-slot-display">
-              <div class="fx-empty">正在加载底层槽位状态…</div>
-            </div>
-          </article>
-
-          <article class="fx-panel fx-limits-panel">
-            <div class="fx-panel-header">
-              <div><h4>调度限额</h4><p>并发度、执行超时与排队超时。超时由看门狗发取消信号，浏览器保持开启。</p></div>
-              <div class="fx-inline-actions">
-                <span class="fx-limit-note" id="fx-limit-note">未设置分类配额</span>
-                <button class="fx-button fx-button-primary" id="fx-limit-save" type="button">应用限额</button>
-              </div>
-            </div>
-            <div class="fx-config-form">
-              <label class="fx-config-field"><span>浏览器并发度（Flow 画布非并发安全，默认 1）</span>
-                <input id="fx-limit-concurrent" type="number" min="1" max="8"></label>
-              <label class="fx-config-field"><span>单任务执行超时（秒，0=不限）</span>
-                <input id="fx-limit-exec-timeout" type="number" min="0" max="86400"></label>
-              <label class="fx-config-field"><span>排队等待超时（秒，0=不限）</span>
-                <input id="fx-limit-wait-timeout" type="number" min="0" max="86400"></label>
+              <div class="fx-empty">当前空闲（无任务占用浏览器）</div>
             </div>
           </article>
 
@@ -401,10 +283,6 @@
             <div class="fx-panel-header">
               <div><h4>运行配置</h4><p>仅开放非敏感白名单字段。标「需重启」的字段其读取方是启动时求值的常量，保存后不会热生效。</p></div>
               <div class="fx-inline-actions">
-                <select id="fx-config-versions" class="fx-select" aria-label="配置版本"></select>
-                <button class="fx-button" id="fx-config-restore" type="button">恢复到选中版本</button>
-                <button class="fx-button" id="fx-config-rollback" type="button">回滚一步</button>
-                <button class="fx-button" id="fx-config-redo" type="button">重做</button>
                 <button class="fx-button fx-button-primary" id="fx-config-save" type="button">保存配置</button>
               </div>
             </div>
@@ -438,31 +316,18 @@
             </div>
           </article>
 
-          <div class="fx-main-grid">
-            <article class="fx-panel fx-capture-panel">
-              <div class="fx-panel-header">
-                <div><h4>失败现场</h4><p>截图 / DOM / 页面文字 / 可见按钮 / 选择器快照，自动落在 runtime/fx_debug/。</p></div>
-                <div class="fx-inline-actions">
-                  <button class="fx-button" id="fx-reload-captures" type="button">刷新</button>
-                </div>
+          <article class="fx-panel fx-capture-panel">
+            <div class="fx-panel-header">
+              <div><h4>失败现场</h4><p>截图 / DOM / 页面文字 / 可见按钮 / 选择器快照，自动落在 runtime/fx_debug/。</p></div>
+              <div class="fx-inline-actions">
+                <button class="fx-button fx-button-danger" id="fx-clear-captures" type="button">清空现场</button>
+                <button class="fx-button" id="fx-reload-captures" type="button">刷新</button>
               </div>
-              <div class="fx-capture-list" id="fx-capture-list">
-                <div class="fx-empty">正在读取…</div>
-              </div>
-            </article>
-
-            <article class="fx-panel fx-audit-panel">
-              <div class="fx-panel-header">
-                <div><h4>操作与队列审计</h4><p>暂停/排空、排队与释放、优先级、取消、配置修改的完整流水。</p></div>
-                <div class="fx-inline-actions">
-                  <button class="fx-button" id="fx-reload-audit" type="button">刷新</button>
-                </div>
-              </div>
-              <div class="fx-audit-list" id="fx-audit-list">
-                <div class="fx-empty">正在读取…</div>
-              </div>
-            </article>
-          </div>
+            </div>
+            <div class="fx-capture-list" id="fx-capture-list">
+              <div class="fx-empty">正在读取…</div>
+            </div>
+          </article>
 
           <article class="fx-panel fx-log-panel">
             <div class="fx-panel-header">
@@ -561,19 +426,6 @@
               <table class="fx-table">
                 <thead><tr><th>代理</th><th>出口 IP</th><th>状态</th><th>绑定环境</th><th>最后检测</th><th>操作</th></tr></thead>
                 <tbody id="fx-proxy-table-body"><tr><td colspan="6" class="fx-empty">正在读取代理号池…</td></tr></tbody>
-              </table>
-            </div>
-          </article>
-
-          <article class="fx-panel fx-tasks-panel">
-            <div class="fx-panel-header">
-              <div><h4>FX 任务队列</h4><p>帧、视频、分步渲染和自治管线共用同一浏览器串行锁。</p></div>
-              <span class="fx-lock-badge" id="fx-lock-badge">锁状态未知</span>
-            </div>
-            <div class="fx-table-wrap">
-              <table class="fx-table">
-                <thead><tr><th>任务</th><th>类型</th><th>队列</th><th>阶段</th><th>账号</th><th>状态</th><th>操作</th></tr></thead>
-                <tbody id="fx-task-table-body"><tr><td colspan="7" class="fx-empty">正在读取任务…</td></tr></tbody>
               </table>
             </div>
           </article>

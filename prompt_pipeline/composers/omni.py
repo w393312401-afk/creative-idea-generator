@@ -984,7 +984,7 @@ def ensure_ladder_out_and_in(video_prompt, ladder, packet=None, beat=None,
     language is removed and the clip uses every shot for the operation through the outro.
     """
     text = video_prompt or ''
-    if is_threshold_or_reveal or not ladder:
+    if is_threshold_or_reveal or not ladder or ladder in (_TRAVERSAL_LADDER, _REWARD_LADDER):
         return text
     low = text.lower()
     sterile_phrases = ('sterile of workers', 'sterile of active workers', 'sterile of any human',

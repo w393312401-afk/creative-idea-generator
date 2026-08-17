@@ -168,6 +168,23 @@ graph TD
   * **At most 1 major operation per beat**: A single video clip can only depict a single continuous physical process (e.g. debris removal, plywood subflooring, wall insulation, painting, lighting, or furnishing). Forbid combining structural framing, wall insulation, and ceiling paneling into one beat.
   * **Full coverage per milestone package (Global Stage Delta)**: the named terminal product must reach its FULL visible extent/count — a paneling milestone covers every declared wall and ceiling surface, while a roof-closeout milestone may combine its panels, door, and threshold finish when they occupy the same zone and jointly define the completed shell. Anti-popping comes from one coherent result, repeated action cycles, and continuous dual progress, NOT from shrinking the changed area. Token patches and unrelated cross-phase bundles are forbidden; adjacent IMAGE anchors must differ so strongly that a side-by-side viewer instantly sees a completed stage.
 
+### 11. Human-Spatial Metric Conservation & Ergonomic Scale Lock (HSMC)
+
+* **Principle**: Prevent subterranean dugouts, tree cavities, and compact shelters from expanding into giant cavernous halls by binding all camera framing, spatial envelopes, prop inventories, and worker scales to explicit metric dimensions.
+* **Strict Metric 3D Envelopes**:
+  * Every enclosed carrier space MUST declare explicit 3D metric dimensions: e.g. `compact circular subterranean room: diameter 3.0 meters, ceiling clearance 2.2 meters`.
+  * Exterior excavation pits MUST declare diameter and depth in meters (e.g. `compact circular excavation pit: diameter 3.2 meters, depth 1.8 meters`).
+* **Ergonomic Prop Allocation (Banned Oversized Props)**:
+  * For compact structures (diameter/span $\le 3.5\text{m}$), **FORBID** residential-scale massive furniture (e.g. `two-tier bunk bed / double bunk bed`, large sectional sofas, formal dining tables).
+  * **ENFORCE** compact ergonomic fixtures: `low-profile single timber platform daybed` (height 0.4m, length 2.0m), `recessed wall berth/nook`, `compact 80cm-high timber workbench`.
+* **Standard Camera & Horizon Normalization**:
+  * Normalize all main shots to `24mm wide-angle lens feel (natural perspective without extreme fisheye distortion)` at `camera height 1.3m (human chest level)`.
+  * Horizon line / vanishing line locked at `45% to 50% frame height`.
+* **Video Scale Figure Lock**:
+  * In dynamic video prompts, declare worker scale: `a lone male worker (1.78m tall, occupying ~35% of frame height, realistically proportioned to the 2.2m ceiling)`.
+* **Negative Scale Restraints**:
+  * Mandatory negative terms: `(cavernous hall, oversized room, giant space, miniature furniture, dollhouse scale, telephoto distortion:1.4)`.
+
 ---
 
 ## SCUP Standard Quality Audit Table
@@ -186,5 +203,7 @@ Every prompt set must be evaluated against this quality matrix. A single `FAIL` 
 | **HAL Silhouettes** | Are workers locked using high-contrast solid silhouettes and silhouette poses? | Blocks morphing of clothing patterns, facial details, or poses. |
 | **Sealed Entry**| Is the entry CLOSED and opaque in the pre-crossing IMAGE, with nothing of the interior visible, and does the crossing clip open it on camera? Does the crossing land on exactly the registered interior primary anchors (Anchor Inheritance), all plausibly pre-existing at crossing time (never future construction products)? | Eliminates random layout explosion, anchor amnesia, causality inversion, and the interpolation failure caused by asking the video model to match a hallucinated peek. |
 | **TBCP Threshold Bridge (v4)** | For any exterior→interior crossing: is it exactly ONE merged beat — one meta-tagged crossing VIDEO between `IMAGE T` and `IMAGE T+1`, never a two-clip split with a sill-handoff frame — with a single-variable bridge camera, a soft exposure/WB roll attributed to door-shade + doorway backlight, a symmetric door-frame wipe, ≥1 cross-threshold material/light tether, a sealed entry in `IMAGE T` that the clip opens on camera, the registered interior anchors carrying their settled scales in `IMAGE T+1`, and no construction work inside the clip? | Eliminates the three-system simultaneous flip (lighting + camera family + anchor set) that causes interior explosion; see TBCP reference. |
-| **NLVTR Text Lock** | Are raw percentages (`%`), numeric ranges, colons in variable strings, and SCUP acronyms (`TSPA`, `HAL`, `VMFP`, `GCTR`, `RPL`, `RCE`, `SCUP`, `NGCS`, `OSPL`, `RHMA`, `PBISP`, `HCL`, `NLVTR`, `MTAL`) completely banned and removed from final prompts? | Eliminates text watermark overlays and mathematical artifacts on the generated video. |
+| **NLVTR Text Lock** | Are raw percentages (`%`), numeric ranges, colons in variable strings, and SCUP acronyms (`TSPA`, `HAL`, `VMFP`, `GCTR`, `RPL`, `RCE`, `SCUP`, `NGCS`, `OSPL`, `RHMA`, `PBISP`, `HCL`, `NLVTR`, `MTAL`, `HSMC`) completely banned and removed from final prompts? | Eliminates text watermark overlays and mathematical artifacts on the generated video. |
 | **Visible Milestone Package Lock** | Does every ordinary video beat create exactly one named terminal stage product at its FULL visible extent/count, using one operation or at most three tightly related same-zone actions, with both primary-product and secondary-material progress lines (never a token patch or cross-phase bundle)? | Keeps adjacent anchors instantly distinguishable while allowing physically coherent reference-case closeout packages. |
+| **HSMC Metric & Human Scale Lock** | Are spatial dimensions declared in metric terms (e.g. 3.0m diameter, 2.2m clearance)? Are oversized residential props (bunk beds) banned in compact carriers and replaced with platform daybeds? Is worker height anchored at ~1.78m (~35% frame height)? Are negative anti-cavernous terms applied? | Prevents compact dugouts from expanding into giant cavernous halls and eliminates miniature/giant human scale distortion. |
+

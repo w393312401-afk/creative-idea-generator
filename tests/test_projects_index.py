@@ -417,9 +417,8 @@ def _replica_task(task_id, job_id, task_type='replica', status='running',
     }
 
 
-def test_replica_tasks_of_one_job_collapse_into_a_single_row():
-    """一条复刻 job 会先 start 再 advance 好几次，每次一个 task_id。按 task_id
-    建行的话工作台上会出现 N 行「replica_xxx」——实测就是这样。"""
+def test_replica_tasks_do_not_appear_in_projects():
+    """爆款复刻模块的所有任务（抽帧/Pass A/Pass B/节拍推进/正交发散等）不得出现在项目工作台中。"""
     rows = _index(tasks=[
         _replica_task('replica_a', 'replica_2c5c1ef61396', status='completed',
                       last_active=7000.0),
@@ -427,55 +426,27 @@ def test_replica_tasks_of_one_job_collapse_into_a_single_row():
                       status='running', last_active=9000.0),
         _replica_task('replica_adv_c', 'replica_2c5c1ef61396', 'replica_advance',
                       status='completed', last_active=8000.0),
+        _replica_task('replica_ext_d', 'replica_2c5c1ef61396', 'replica_extract',
+                      status='completed', last_active=6000.0),
+        _replica_task('replica_mut_e', 'replica_2c5c1ef61396', 'replica_mutate',
+                      status='running', last_active=9500.0),
     ])
+    assert len(rows) == 0
 
+
+def test_replica_tasks_filtered_out_when_mixed_with_regular_tasks():
+    """当列表中同时存在普通激发任务与复刻任务时，复刻任务被过滤，普通任务正常保留。"""
+    rows = _index(tasks=[
+        _compose_task('idea_main_1', status='completed', title='普通激发项目'),
+        _replica_task('replica_a', 'replica_2c5c1ef61396', status='completed'),
+        _replica_task('replica_adv_b', 'replica_2c5c1ef61396', 'replica_advance', status='running'),
+    ])
     assert len(rows) == 1
-    assert rows[0]['project_key'] == 'replica:replica_2c5c1ef61396'
-    # 行上留的是最新那次任务，而不是遍历顺序里最后碰到的那个
-    assert rows[0]['task']['id'] == 'replica_adv_b'
-    assert rows[0]['state'] == 'running'
+    assert rows[0]['title'] == '普通激发项目'
 
 
-def test_replica_row_title_follows_job_state(tmp_path, monkeypatch):
-    """标题现算：compose 写下 title 之后，整行要跟着改名，而不是一直挂着任务
-    创建时抄下的旧名字（更早还只有视频文件名）。"""
-    import json
-    import server_common
-
-    monkeypatch.setattr(server_common, 'OUTPUT_ROOT', str(tmp_path))
-    job_dir = tmp_path / 'replica_jobs' / 'replica_deadbeef'
-    job_dir.mkdir(parents=True)
-    (job_dir / '.replica_pipeline.json').write_text(json.dumps({
-        'job_id': 'replica_deadbeef',
-        'title': '苔原废弃雷达站改造',
-        'video_name': 'douyin_source.mp4',
-    }), encoding='utf-8')
-
-    rows = _index(tasks=[_replica_task('replica_a', 'replica_deadbeef',
-                                       label='复刻·douyin_source')])
-    assert rows[0]['title'] == '复刻·苔原废弃雷达站改造'
-
-
-def test_replica_row_falls_back_to_video_name_before_compose(tmp_path, monkeypatch):
-    import json
-    import server_common
-
-    monkeypatch.setattr(server_common, 'OUTPUT_ROOT', str(tmp_path))
-    job_dir = tmp_path / 'replica_jobs' / 'replica_deadbeef'
-    job_dir.mkdir(parents=True)
-    (job_dir / '.replica_pipeline.json').write_text(json.dumps({
-        'job_id': 'replica_deadbeef',
-        'title': None,
-        'video_name': 'douyin_source.mp4',
-        'variant_of': 'replica_older',
-    }), encoding='utf-8')
-
-    rows = _index(tasks=[_replica_task('replica_a', 'replica_deadbeef')])
-    assert rows[0]['title'] == '二创·douyin_source'
-
-
-def test_legacy_replica_task_without_job_id_still_groups():
-    """2026-08-10 之前建的任务 dimensions 里只有 theme=job_id。"""
+def test_legacy_replica_task_without_job_id_also_filtered():
+    """老格式复刻任务（dimensions 仅含 theme）也必须被过滤。"""
     rows = _index(tasks=[
         {'id': 'replica_a', 'status': 'completed', 'last_active': 10.0,
          'dimensions': {'type': 'replica', 'theme': 'replica_old01'}, 'result': None},
@@ -483,9 +454,7 @@ def test_legacy_replica_task_without_job_id_still_groups():
          'dimensions': {'type': 'replica_advance', 'theme': 'replica_old01'},
          'result': None},
     ])
-
-    assert len(rows) == 1
-    assert rows[0]['project_key'] == 'replica:replica_old01'
+    assert len(rows) == 0
 
 
 def _replica_library_item(job_id='replica_2c5c1ef61396', title='倒伏巨型杉木爆改河岸隐居小屋',
@@ -506,27 +475,22 @@ def _replica_library_item(job_id='replica_2c5c1ef61396', title='倒伏巨型杉�
 
 
 class TestReplicaLibraryMerge:
-    """复刻 job 行与它的点子库条目必须是同一行。
+    """复刻点子库条目与项目工作台。"""
 
-    拆成两行时，job 行的名字是按 job 状态现算的一长串自动名（_replica_live_name），
-    而改名只写点子库条目——工作台上于是永远躺着一条叫着旧自动名的重复项目，看起来
-    就是"改名对复刻项目无效"。"""
-
-    def test_library_item_lands_on_the_replica_job_row(self):
+    def test_library_item_gets_its_own_project_row_without_replica_task(self):
+        """点子库中的复刻条目作为保存项生成项目行，即使伴随复刻任务也不会带入复刻任务记录。"""
         rows = _index(tasks=[_replica_task('replica_adv_b', 'replica_2c5c1ef61396',
                                            'replica_advance', status='completed')],
                       library_items=[_replica_library_item()])
 
         assert len(rows) == 1
-        assert rows[0]['project_key'] == 'replica:replica_2c5c1ef61396'
-        # 点子库压过任务：显示的是改过的名字，不是那串自动名
         assert rows[0]['title'] == '倒伏巨型杉木爆改河岸隐居小屋'
         assert rows[0]['saved'] is True
+        assert rows[0].get('task') is None
 
     def test_renamed_replica_keeps_its_media_jobs_on_the_same_row(self):
         """改名会把旧标题钉成 project_key（app.js renameIdeaToTheme），此后帧/视频
-        子作业的 dimensions.project_key 还是那个旧键——它必须仍然挂回这一行，
-        否则工作台上会多出一行「孤立作业」。"""
+        子作业挂回点子库条目所在的行，而复刻任务被过滤。"""
         old_key = '倒伏巨木河岸隐居小屋（Veo修正版）'
         media = _media_task('videos_x', 'videos', 'completed', theme=old_key)
         media['dimensions']['project_key'] = old_key
@@ -536,7 +500,7 @@ class TestReplicaLibraryMerge:
                       library_items=[_replica_library_item(project_key=old_key)])
 
         assert len(rows) == 1
-        assert rows[0]['project_key'] == 'replica:replica_2c5c1ef61396'
+        assert rows[0]['project_key'] == old_key
         assert [j['id'] for j in rows[0]['sub_jobs']] == ['videos_x']
 
     def test_library_item_without_a_matching_job_still_gets_its_own_row(self):

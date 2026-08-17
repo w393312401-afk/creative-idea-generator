@@ -154,6 +154,20 @@ def test_capture_prunes_old_buckets(tmp_path, monkeypatch):
     assert len(os.listdir(tmp_path / 'fx_debug')) <= 2
 
 
+def test_clear_captures_removes_all_directories(tmp_path, monkeypatch):
+    debug_dir = tmp_path / 'fx_debug'
+    monkeypatch.setattr(forensics, 'DEBUG_ROOT', debug_dir)
+    forensics.capture(FakePage(), 'cap1', '', bucket='task_1')
+    forensics.capture(FakePage(), 'cap2', '', bucket='task_2')
+    assert len(forensics.list_captures()) == 2
+    assert len(os.listdir(debug_dir)) == 2
+
+    cleared = forensics.clear_captures()
+    assert cleared == 2
+    assert len(forensics.list_captures()) == 0
+    assert len(os.listdir(debug_dir)) == 0
+
+
 # ── D6：dry-run 不提交 ───────────────────────────────────────────────────────
 
 def test_dry_run_short_circuits_the_single_submit_choke_point(monkeypatch):

@@ -32,8 +32,8 @@ function promptBeatVideoPlaceholder(n) {
         + `IMG ${padSlot(n + 1)} 的这几秒里，镜头与画面如何变化）`;
 }
 
-const PROMPT_SLOT_HEADER_RE = /^\s*(图片|视频)\s*(\d+)\s*(?:\[(.*?)\])?\s*:/;
-const PROMPT_SECTION_HEADER_RE = /^\s*(图片提示词|视频提示词)\s*$/;
+const PROMPT_SLOT_HEADER_RE = /^\s*(?:#{1,6}\s*|\*{1,2}\s*|[-*+]\s+)?(图片|视频|图像|画面|IMAGE|IMG|Frame|VIDEO|VID|Clip)\s*(?:第|#)?\s*(\d+)((?:\s*(?:[（\(].*?[）\)]|\[.*?\]))*)\s*[:：]/i;
+const PROMPT_SECTION_HEADER_RE = /^\s*(?:#{1,6}\s*|\*{1,2}\s*)?(图片提示词|视频提示词|IMAGE\s*PROMPTS?|VIDEO\s*PROMPTS?)\s*[:：]?\s*(?:\*{1,2})?$/i;
 
 let promptEditorOpen = false;
 // 进入编辑态那一刻的基准：哪一单、当时的提示词块长什么样。保存前拿它对一次账——
@@ -48,7 +48,10 @@ function promptEditorEls() {
         pre: document.getElementById('idea-prompt-block'),
         textarea: document.getElementById('idea-prompt-editor'),
         hint: document.getElementById('prompt-edit-hint'),
+        foldAllBtn: document.getElementById('toggle-fold-all-prompts-btn'),
         editBtn: document.getElementById('edit-prompt-btn'),
+        autoFixBtn: document.getElementById('auto-fix-prompt-btn'),
+        historyBtn: document.getElementById('prompt-history-btn'),
         addBtn: document.getElementById('add-beat-btn'),
         saveBtn: document.getElementById('save-prompt-edit-btn'),
         cancelBtn: document.getElementById('cancel-prompt-edit-btn'),
@@ -63,7 +66,10 @@ function setPromptEditorMode(on) {
     el.pre.hidden = promptEditorOpen;
     el.textarea.hidden = !promptEditorOpen;
     if (el.hint) el.hint.hidden = !promptEditorOpen;
+    if (el.foldAllBtn) el.foldAllBtn.hidden = promptEditorOpen;
     if (el.editBtn) el.editBtn.hidden = promptEditorOpen;
+    if (el.autoFixBtn) el.autoFixBtn.hidden = !promptEditorOpen;
+    if (el.historyBtn) el.historyBtn.hidden = promptEditorOpen;
     if (el.addBtn) el.addBtn.hidden = !promptEditorOpen;
     if (el.saveBtn) el.saveBtn.hidden = !promptEditorOpen;
     if (el.cancelBtn) el.cancelBtn.hidden = !promptEditorOpen;
@@ -74,6 +80,79 @@ function setPromptEditorMode(on) {
         promptEditorBaseBlock = '';
         el.textarea.value = '';
         el.textarea.disabled = false;
+    }
+}
+
+/**
+ * 针对 Markdown 标题前缀（如 #### 图片 8:）、加粗、列表符号、全角冒号等的轻量规范化兜底
+ */
+function autoCleanPromptTextFallback(text) {
+    if (!text || typeof text !== 'string') return text;
+    const lines = text.split('\n');
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+        let line = lines[i];
+        // 匹配各类槽位头行: "#### 图片 8:", "### 图片 8：", "**图片 8:**", "- 图片 8（简介）[BRIDGE]:"
+        const m = line.match(/^\s*(?:#{1,6}\s*|[-*+•·]\s+|\d+[.)、]\s+|\*{1,2})?\s*(图片|视频|图像|画面|IMAGE|IMG|Frame|VIDEO|VID|Clip)\s*(?:第|#)?\s*(\d+)((?:\s*(?:[（\(].*?[）\)]|\[.*?\]))*)\s*[:：\s]\s*(.*)$/i);
+        if (m) {
+            const isImg = /^(?:图片|图像|画面|IMAGE|IMG|Frame)$/i.test(m[1]);
+            const typeLabel = isImg ? '图片' : '视频';
+            const num = parseInt(m[2], 10);
+            const tags = m[3] || '';
+            const summaryMatch = tags.match(/[（\(](.*?)[）\)]/);
+            const summary = summaryMatch ? `（${summaryMatch[1].trim()}）` : '';
+            const metaMatch = tags.match(/\[(.*?)\]/);
+            const meta = metaMatch ? ` [${metaMatch[1].trim()}]` : '';
+            const inline = (m[4] || '').replace(/[*_`]/g, '').trim();
+            out.push(`${typeLabel} ${num}${summary}${meta}:`);
+            if (inline) {
+                out.push(inline);
+            }
+            continue;
+        }
+        // 匹配分节标题: "## 图片提示词", "### 视频提示词"
+        const secM = line.match(/^\s*(?:#{1,6}\s*|\*{1,2})?\s*(图片提示词|视频提示词|IMAGE\s*PROMPTS?|VIDEO\s*PROMPTS?)\s*[:：]?\s*(?:\*{1,2})?$/i);
+        if (secM) {
+            const isImg = /图片|image/i.test(secM[1]);
+            out.push(isImg ? '图片提示词' : '视频提示词');
+            continue;
+        }
+        out.push(line);
+    }
+    return out.join('\n');
+}
+
+/**
+ * 自动识别并修复编辑器中 Markdown 标题（#### ）、多余符号、中英文标签或全角冒号等格式问题，
+ * 规整为符合槽位契约的标准提示词集文本。
+ */
+function autoFixPromptFormatInEditor() {
+    const el = promptEditorEls();
+    if (!el.textarea || el.textarea.hidden) return;
+    const raw = el.textarea.value;
+    if (!raw || !raw.trim()) {
+        showToast('编辑器中没有内容可修复', 'warning');
+        return;
+    }
+
+    if (typeof normalizePromptSetText === 'function') {
+        const res = normalizePromptSetText(raw);
+        if (res.ok) {
+            el.textarea.value = res.text;
+            const fixDetails = (res.fixes && res.fixes.length)
+                ? `（${res.fixes.slice(0, 3).join('；')}${res.fixes.length > 3 ? '等' : ''}）`
+                : '';
+            showToast(`✨ 提示词格式已自动修复！${fixDetails}`, 'success', 5000);
+            return;
+        }
+    }
+
+    const cleaned = autoCleanPromptTextFallback(raw);
+    if (cleaned !== raw) {
+        el.textarea.value = cleaned;
+        showToast('✨ 已清除 Markdown 标题前缀并修正冒号格式！', 'success');
+    } else {
+        showToast('文本格式已规范，未发现需要修复的槽位格式错误。', 'info');
     }
 }
 
@@ -281,16 +360,77 @@ async function savePromptEdit() {
         }
     }
 
-    const text = el.textarea.value;
+    let text = el.textarea.value;
     if (text.trim() === (ownerIdea.prompt_block || '').trim()) {
         setPromptEditorMode(false);
         showToast('提示词没有改动。', 'info');
         return false;
     }
-    const check = validatePromptEditorText(text, ownerIdea.prompt_block);
+    
+    let check = validatePromptEditorText(text, ownerIdea.prompt_block);
+    let autoFixed = false;
     if (!check.ok) {
-        showToast(check.error, 'error');
-        return false;
+        // 自动容错修复：尝试通过正规化修正格式问题（如 #### 图片 1: / 全角冒号 / 英文标签等）
+        let candidateText = text;
+        if (typeof normalizePromptSetText === 'function') {
+            const norm = normalizePromptSetText(text);
+            if (norm.ok) candidateText = norm.text;
+        } else {
+            candidateText = autoCleanPromptTextFallback(text);
+        }
+        const candidateCheck = validatePromptEditorText(candidateText, ownerIdea.prompt_block);
+        if (candidateCheck.ok) {
+            text = candidateText;
+            el.textarea.value = candidateText;
+            check = candidateCheck;
+            autoFixed = true;
+        } else {
+            showToast(check.error, 'error');
+            return false;
+        }
+    } else {
+        // 即使槽位初步解析成功，若检测到 Markdown 标题前缀（如 #### 图片 8:）或全角冒号，无损规整为标准契约文本
+        if (/^\s*#{1,6}\s*(?:图片|视频|IMAGE|VIDEO)/m.test(text) || /[:：]/.test(text)) {
+            if (typeof normalizePromptSetText === 'function') {
+                const norm = normalizePromptSetText(text);
+                if (norm.ok) {
+                    text = norm.text;
+                    el.textarea.value = norm.text;
+                    autoFixed = true;
+                }
+            }
+        }
+    }
+
+    // ── 前置提示词静态合规审查（Pre-flight Prompt Linter）──
+    if (typeof lintPromptBlock === 'function') {
+        const lintReport = lintPromptBlock(text);
+        if (!lintReport.passed) {
+            let linterProceed = false;
+            await new Promise(resolve => {
+                showPromptLinterModal({
+                    report: lintReport,
+                    actionTitle: '保存提示词',
+                    onProceed: () => {
+                        linterProceed = true;
+                        resolve();
+                    },
+                    onAutoFix: () => {
+                        text = autoFixLintIssues(text);
+                        el.textarea.value = text;
+                        autoFixed = true;
+                        linterProceed = true;
+                        showToast('✨ 已自动修复提示词格式瑕疵！', 'success');
+                        resolve();
+                    },
+                    onEdit: () => {
+                        linterProceed = false;
+                        resolve();
+                    }
+                });
+            });
+            if (!linterProceed) return false;
+        }
     }
 
     const prevSlots = parsePromptBlock(ownerIdea.prompt_block || '');
@@ -302,6 +442,7 @@ async function savePromptEdit() {
         + `<li>本单共 ${check.imageCount} 拍`
         + (added ? `（其中 <b>新增 ${added} 拍</b>，以空槽位出现在帧序列里等待生成）` : '')
         + '</li>'
+        + (autoFixed ? '<li style="color:var(--color-success,#10b981);"><b>已自动修复格式</b>：清除了多余 Markdown 标题与符号，规整为标准槽位格式</li>' : '')
         + '<li>提示词改过、画面还没跟上的帧会标上「提示词已改」徽标，按新提示词重渲后自动消失</li>'
         + '<li>已合并的成片会作废（它是按旧提示词渲的素材拼的）</li>'
         + '</ul>'
@@ -332,6 +473,9 @@ async function savePromptEdit() {
             + '）。',
         extraToasts: (d) => {
             const out = [];
+            if (autoFixed) {
+                out.push(['已自动修复 Markdown 标题与符号格式瑕疵。', 'info']);
+            }
             if ((d.dirty_frames || []).length) {
                 out.push([`IMG ${d.dirty_frames.map(padSlot).join(' / ')} 的提示词改了、画面还是旧的，`
                     + '已标为待重渲。', 'info']);
@@ -350,14 +494,30 @@ async function savePromptEdit() {
     });
 
     el.textarea.disabled = false;
-    if (ok) setPromptEditorMode(false);
+    if (ok) {
+        if (typeof recordPromptHistory === 'function') {
+            recordPromptHistory(ownerIdea.id, text, '手动全局编辑保存');
+        }
+        setPromptEditorMode(false);
+    }
     return ok;
 }
 
 function initPromptEditor() {
     const el = promptEditorEls();
     if (!el.textarea) return;
+    if (el.foldAllBtn) {
+        el.foldAllBtn.addEventListener('click', () => {
+            if (typeof toggleFoldAllPrompts === 'function') {
+                toggleFoldAllPrompts();
+            }
+        });
+    }
     if (el.editBtn) el.editBtn.addEventListener('click', enterPromptEdit);
+    if (el.autoFixBtn) el.autoFixBtn.addEventListener('click', autoFixPromptFormatInEditor);
+    if (el.historyBtn) el.historyBtn.addEventListener('click', () => {
+        if (typeof openPromptHistoryModal === 'function') openPromptHistoryModal();
+    });
     if (el.addBtn) el.addBtn.addEventListener('click', addBeatInPromptEditor);
     if (el.saveBtn) el.saveBtn.addEventListener('click', savePromptEdit);
     if (el.cancelBtn) el.cancelBtn.addEventListener('click', cancelPromptEdit);

@@ -47,6 +47,15 @@ from .cast_lock import (
     named_cast_beat_violations,
     apply_named_cast_settings,
 )
+from .mutate import (
+    generate_orthogonal_variant,
+    ai_diverge_orthogonal_ideas,
+    ORTHOGONAL_AXES,
+    MUTATION_PRESETS,
+    map_asmr_audio,
+    apply_slot_replacement,
+    apply_trace_mapping,
+)
 
 
 def _raise_if_cancelled(on_progress):
@@ -1084,55 +1093,139 @@ def _multimodal_chat(config, system, user_text, image_paths, model=None, max_tok
     return choice['message']['content']
 
 
-def ground_threshold_reveal_prompt(config, reference_image_path):
-    """在真正过门/硬切前用视觉模型看着上一帧真实渲染结果联想门后长什么样。
+# 过门落点帧的接地规则。**这里没有任何一条规定门后是什么状态**——那是合成阶段的事，
+# 本函数只订正材质。
+#
+# 2026-08-15 复盘：此前这里写死「Untouched trauma state ... nobody has entered this space
+# yet」+「no surface that reads as already cleaned/repaired/painted」，并且调用方拿返回值
+# **整条替换**掉组稿产物。后果有两层：
+#   一、回头进已经施工过的空间时，完工的室内被重新画成废墟；
+#   二、更严重——复刻线的过门拍不是纯运镜拍，它照常交付自己那道工序（梯子里
+#       beat 7 = primary+grading、beat 12 = primary+framing）。整条替换把这一拍**本该
+#       完成的施工**也一并删掉了。
+# 实测那一单 16 张图里 4 张是过门落点帧，四条合成好的提示词全都正确写着
+# "Prior structural elements remain completely unchanged" / "New state delta: …"，
+# 全部被丢弃。
+#
+# 现在改成就地改写：状态一律以合成好的提示词为准，本函数只做 2026-08-07 那次事故真正
+# 需要的那件事——照着已经落盘的真实参考图订正材质/风化/光线。形状与
+# `reverse.ground_anchor_on_reference` 一致（同一个问题的既有解法）。
+_REVEAL_GROUNDING_RULES = (
+    "1. The construction state is NOT yours to decide. Whatever the prompt declares — work "
+    "already completed, prior work unchanged, a new state delta this frame delivers, an "
+    "untouched pre-renovation ruin — keep it exactly as written. Never add decay, debris, "
+    "vegetation or damage the prompt does not ask for, and never remove or downgrade work "
+    "the prompt says is finished. A crossing frame very often also delivers its own "
+    "construction milestone; that milestone must survive your rewrite intact.\n"
+    "2. Keep the camera sentence, the framing, and every locked-anchor clause verbatim.\n"
+    "3. Correct ONLY the physical substance: material palette, surface texture, weathering "
+    "language, colour, and light direction, so they match what the reference photo actually "
+    "shows. Never introduce a structural material the reference photo gives no basis for.\n"
+    "4. The entry in the reference photo is deliberately CLOSED (a shut door or hatch, or an "
+    "unlit raw opening), so it shows you nothing of the space beyond it — never describe the "
+    "doorway, its frame, or the view through it. The camera is already inside, facing away "
+    "from it.\n"
+    "5. One real photograph, never a grid, collage, or split composition.\n"
+    "6. Plain visual prose only — no percentages, labels, or on-screen text.\n"
+)
 
-    组稿阶段（compose_remaining_beats）写这一拍的提示词时，过门前那一帧压根还没渲出来，
-    只能凭文字空想材质/结构——2026-08-07 复盘：废弃高架桥空心桥墩过门后渲成完全不搭的
-    生锈金属格栅内部，就是这个空想的产物。这里不做事后视觉判定/拒绝重渲，只是换一个更
-    早的输入源：渲染前先把已经落盘的真实参考图丢给模型，让它照着看得见的材质/结构/光线
-    去写这一拍该有的样子，而不是继续用组稿阶段那份没见过任何像素的猜测。
-    调用失败时返回 None，调用方原样沿用组稿阶段写好的提示词，不阻塞整条渲染链。
+# 改写回来的文本比原文短这么多，就不是「订正材质」而是「另写了一条」——多半把
+# 机位句、锁定锚点或那条 state delta 整段丢了。宁可沿用组稿产物。
+_REVEAL_REWRITE_MIN_RATIO = 0.5
+
+
+def ground_threshold_reveal_prompt(config, reference_image_path, composed_prompt=None, *,
+                                   first_entry=True, inherited_state='',
+                                   carried_structural='', last_seen_image_path=None):
+    """照着过门前那张真实渲染帧，就地订正这一拍提示词里的材质/风化/光线。
+
+    组稿阶段（compose_remaining_beats）写这一拍时，过门前那一帧压根还没渲出来，只能凭
+    文字空想材质——2026-08-07 复盘：废弃高架桥空心桥墩过门后渲成完全不搭的生锈金属格栅
+    内部，就是这个空想的产物。这里不做事后视觉判定/拒绝重渲，只是换一个更早的输入源：
+    渲染前把已经落盘的真实参考图丢给模型，让它照着看得见的材质/结构/光线**改写**这条
+    提示词。调用失败或改写明显残缺时返回 None，调用方原样沿用组稿阶段写好的提示词。
+
+    **状态不归本函数管。** 门后是废墟还是已完工，由 ``composed_prompt`` 自己声明——它是
+    带着整份梯子写出来的，本函数只见得到一张闭着门的参考图，没有任何依据去推翻它。
+    ``composed_prompt`` 缺失时返回 None：没有可改写的正文，硬造一条就又变回老毛病。
+
+    ``inherited_state`` / ``carried_structural``（由 frame_state.space_entry_context 提供，
+    拍表送得到时才有）只作为**补充**提示，用来加固已完工的部分，不构成任何相反的指令。
+    ``last_seen_image_path`` 是这个空间上一次被拍到的真实帧：闭门起帧（TBCP v7）意味着
+    参考图里一个室内像素都没有，把上次那张图一并递过去，模型才有像素可依。
     """
+    composed = ' '.join(str(composed_prompt or '').split())
+    if not composed:
+        return None
+    inherited_state = ' '.join(str(inherited_state or '').split())
+    carried_structural = ' '.join(str(carried_structural or '').split())
+
     system = (
-        "You are writing the content description for ONE photoreal image: what lies just "
-        "beyond a doorway/opening/threshold in an abandoned-structure renovation project, "
-        "the moment the camera finishes crossing it. You are shown the actual last frame "
-        "rendered before the crossing — look at its concrete material, structure, weathering, "
-        "and light so the space you invent is physically continuous with it, not a generic "
-        "invented room in an unrelated material.\n\n"
-        "Mandatory rules:\n"
-        "1. Untouched trauma state: show at least three of structural damage, surface decay "
-        "(rust, water stains, mold, corrosion), vegetation intrusion, or debris/clutter — "
-        "nobody has entered this space yet.\n"
-        "2. Zero intervention evidence: no tools, ladders, scaffolding, tarps, work lights, "
-        "safety cones, or any surface that reads as already cleaned/repaired/painted.\n"
-        "3. Unarranged: wreckage lies exactly where gravity and time dropped it — never swept, "
-        "piled, or aligned.\n"
-        "4. Material continuity: reuse the same material palette and weathering language "
-        "visible in the reference photo (its concrete/wood/metal/stone, its decay severity, "
-        "its light direction and colour) — never introduce a structural material the reference "
-        "photo gives no basis for.\n"
-        "5. One real photograph, never a grid, collage, or split composition.\n"
-        "6. Plain visual prose only — no percentages, labels, or on-screen text.\n"
-        "7. The entry in the reference photo is deliberately CLOSED (a shut door or hatch, or an "
-        "unlit raw opening), so the reference shows you nothing of the space itself — infer it "
-        "from the shell's material, scale and condition, and never describe the doorway, its "
-        "frame, or the view through it. The camera is already inside, facing away from it.\n\n"
-        "Respond with ONLY the description, 2-4 sentences, nothing else."
+        "You are correcting ONE photoreal image prompt: the frame a camera lands on the moment "
+        "it finishes crossing a doorway/opening/threshold in an abandoned-structure renovation "
+        "project. You are shown the actual last frame rendered before the crossing.\n\n"
+        "Rewrite the prompt you are given so that its materials, weathering and light match "
+        "what the reference photo actually shows — you are correcting what the place is made "
+        "of, never what has or has not been built in it.\n\n"
+        "Rules:\n" + _REVEAL_GROUNDING_RULES +
+        "\nRespond with ONLY the rewritten prompt, nothing else."
     )
-    user_text = (
-        "This is the actual last frame rendered before the crossing. Describe what plausibly "
-        "lies just beyond this opening, continuous with everything visible here."
-    )
+
+    images = [reference_image_path]
+    user_parts = ["The first image is the actual last frame rendered before the crossing."]
+    if last_seen_image_path and os.path.exists(last_seen_image_path):
+        images.append(last_seen_image_path)
+        user_parts.append(
+            "The second image is this same space the last time the camera was in it — use it "
+            "for what the space is made of and what has already been built there.")
+    if inherited_state:
+        user_parts.append(
+            f"Already completed in this space, and still present: {inherited_state}.")
+    if carried_structural:
+        user_parts.append(
+            f"Completed elsewhere in this build and visible from here: {carried_structural}.")
+    user_parts.append(f"The prompt to correct:\n\n{composed}")
+    user_text = ' '.join(user_parts[:-1]) + '\n\n' + user_parts[-1]
+
     try:
-        response = _multimodal_chat(config, system, user_text, [reference_image_path], max_tokens=400)
+        response = _multimodal_chat(config, system, user_text, images, max_tokens=1200)
     except Exception as exc:
         if sys.stdout:
-            print(f"[THRESHOLD REVEAL] 依据参考图联想室内失败，沿用组稿阶段的提示词: {exc}")
+            print(f"[THRESHOLD REVEAL] 依据参考图订正材质失败，沿用组稿阶段的提示词: {exc}")
         return None
     text = (response or '').strip()
-    return text or None
+    if not text:
+        return None
+    if len(text.split()) < len(composed.split()) * _REVEAL_REWRITE_MIN_RATIO:
+        if sys.stdout:
+            print("[THRESHOLD REVEAL] 改写结果明显短于原文（疑似丢掉机位/锚点/状态），"
+                  "沿用组稿阶段的提示词")
+        return None
+    return text
+
+
+def threshold_reveal_continuity_clause(inherited_state='', carried_structural=''):
+    """过门落点帧提示词末尾那段硬性延续声明。
+
+    与 ground_threshold_reveal_prompt 里的系统提示是两道**独立**的防线，故意重复：那道
+    约束的是「写描述的那个模型」，这一段约束的是「读最终提示词的图像模型」。渲染层此前
+    直接 `item['prompt'] = grounded_body` 整条替换掉组稿产物，组稿阶段写好的继承状态
+    因此一个字都没能抵达图像模型。
+    """
+    inherited_state = ' '.join(str(inherited_state or '').split())
+    carried_structural = ' '.join(str(carried_structural or '').split())
+    parts = []
+    if inherited_state:
+        parts.append(
+            f"Already completed in this space and still present, unchanged: {inherited_state}.")
+    if carried_structural:
+        parts.append(
+            "Structural work completed elsewhere in this build and visible from here: "
+            f"{carried_structural}.")
+    if parts:
+        parts.append(
+            "Show none of it as raw, missing, damaged, overgrown or under construction again.")
+    return ' '.join(parts)
 
 
 def is_skipped_verdict(reason):
@@ -3100,6 +3193,20 @@ def beat_clip_speed(weight, rhythm=None):
     if not weight:
         return 1.0
     return round(beat_clip_seconds(weight, rhythm) / float(VIDEO_DURATION), 3)
+
+
+# ── 双轴时序引擎导出 (按秒数拆拍与 2 倍速适配) ──────────────────────────────
+from .duration_engine import (
+    convert_time_axes,
+    calculate_beat_word_quota,
+    allocate_beat_durations,
+    validate_beat_duration_budget,
+    DEFAULT_SPEED_MULTIPLIER,
+    DEFAULT_TARGET_SCREEN_SEC,
+    MIN_BEAT_SCREEN_SEC,
+    MAX_BEAT_SCREEN_SEC,
+    MAX_REWARD_SCREEN_SEC,
+)
 
 
 def load_packet_cache():
@@ -6480,6 +6587,10 @@ _ENVELOPE_DEFAULT_DENY = (
      'arched window / opening', re.compile(r'\barch(ed|way)?\b', re.IGNORECASE)),
     (re.compile(r'\brose\s+window(s)?\b', re.IGNORECASE), 'rose window',
      re.compile(r'\brose\s+window', re.IGNORECASE)),
+    (re.compile(r'\b(?:a-frame|cathedral\s+ceiling|truss\s+web)\b', re.IGNORECASE),
+     'A-frame / cathedral ceiling', re.compile(r'\b(?:a-frame|cathedral)\b', re.IGNORECASE)),
+    (re.compile(r'\b(?:central\s+(?:pier|pillar|column)|chimney\s+breast)\b', re.IGNORECASE),
+     'central pier / column', re.compile(r'\b(?:central\s+(?:pier|pillar|column)|chimney)\b', re.IGNORECASE)),
 )
 
 
@@ -6630,6 +6741,60 @@ def check_bridge_sterile(video_prompt):
             f"TBCP bridge clip must stay completely sterile of active workers, but describes one: "
             f"'{raw.strip()[:80]}' — move this work to a non-bridge beat"
         )
+    return errors
+
+
+_REVERTED_CEILING_TRAUMA_PATTERNS = [
+    re.compile(r'\b(?:ceiling|roof)\s+(?:cracks?|sagging|leaks?|holes?|voids?|damage)\b', re.IGNORECASE),
+    re.compile(r'\b(?:cracked|sagging|collapsed|damaged|leaking|rotted)\s+(?:ceiling|roof)\b', re.IGNORECASE),
+    re.compile(r'\b(?:torn\s+(?:black\s+)?(?:membrane|liner)|slumping\s+through\s+holes)\b', re.IGNORECASE),
+    re.compile(r'\b(?:water\s+runoff\s+from\s+(?:the\s+)?ceiling)\b', re.IGNORECASE),
+]
+
+_REVERTED_FLOOR_DEBRIS_PATTERNS = [
+    re.compile(r'\b(?:fallen\s+timber|rotting\s+leaves|leaf\s+piles?|scattered\s+rotten\s+boards)\b', re.IGNORECASE),
+    re.compile(r'\b(?:debris\s+across\s+the\s+(?:entire\s+)?muddy\s+floor)\b', re.IGNORECASE),
+]
+
+
+def check_threshold_monotonic_inheritance(image_prompt, packet=None, is_first_interior=False, exterior_history=None):
+    """P0 过门时空单调继承：进门首帧 IMAGE T+1 必须继承室外已完成的屋面与地坪施工，严禁状态倒退。
+
+    1. 若室外已完成屋架/封板/防水 (roofing/framing/sheathing)，IMAGE T+1 严禁描写天花板漏水、坍塌、裂缝。
+    2. 若室外已完成地面清理 (clearing)，IMAGE T+1 严禁描写地面重新堆满落叶枯木。
+    """
+    errors = []
+    if not is_first_interior or not image_prompt:
+        return errors
+
+    low = image_prompt.lower()
+    for pat in _REVERTED_CEILING_TRAUMA_PATTERNS:
+        m = pat.search(image_prompt)
+        if m:
+            raw_sentence = next((s for s in re.split(r'[.!?]', image_prompt) if m.group(0) in s), '')
+            if any(re.search(rf'\b{re.escape(n)}\b', raw_sentence.lower()) for n in _STERILE_NEGATION_WORDS):
+                continue
+            errors.append(
+                f"IMAGE T+1 (first interior reveal) describes reverted ceiling/roof trauma '{m.group(0)}' — "
+                f"the roof was already framed/weatherproofed in exterior beats; ceiling underside must "
+                f"inherit the completed roof framing/membrane without state regression"
+            )
+            break
+
+    if exterior_history and ('clearing' in exterior_history or 'cleared' in exterior_history):
+        for pat in _REVERTED_FLOOR_DEBRIS_PATTERNS:
+            m = pat.search(image_prompt)
+            if m:
+                raw_sentence = next((s for s in re.split(r'[.!?]', image_prompt) if m.group(0) in s), '')
+                if any(re.search(rf'\b{re.escape(n)}\b', raw_sentence.lower()) for n in _STERILE_NEGATION_WORDS):
+                    continue
+                errors.append(
+                    f"IMAGE T+1 (first interior reveal) describes reverted floor debris '{m.group(0)}' — "
+                    f"the floor was already cleared in exterior beats; floor must inherit the clean bare "
+                    f"earth state without state regression"
+                )
+                break
+
     return errors
 
 
@@ -8055,12 +8220,42 @@ _ENVELOPE_SKELETAL_QUALIFIERS = (
     'joist', 'rafter', 'stud', 'batten', 'purlin', 'truss', 'framing', 'frame', 'skeleton',
     'ribs', 'lath', 'furring', 'strapping',
 )
-# 楼板的「覆盖层」构件词：这些一铺上，脚下那一面就实了。见 _clause_seals_element
-# 里的楼板例外——铺板句里几乎必然带 'joist'，不给例外这一组等于白加。
+# 各构件组的「覆盖层」词：这些一装上，那一面就实了，即使同句还提着骨架。见
+# _clause_seals_element 里的覆盖层例外。
+#
+# 2026-08-15：原先只有楼板一组有例外，理由是「铺板句里几乎必然带 joist」。同样的话
+# 对另外三组一字不差地成立，而且后果更严重：
+#   · 屋面 —— 「新椽条上重新装玻璃」带 rafter，木结构载体的屋面里程碑**必然**这么写；
+#   · 外墙 —— 「立柱立好后外墙重新挂板」带 stud；
+#   · 门窗 —— 「新玻璃装进修复好的窗框」带 frame（frame 本身就在骨架否决表里）。
+# 实测：一条 "new timber rafters and glazed roof complete" 的屋面里程碑，
+# sealed_envelope_elements 返回 {} —— 整组从不进账，跨视角校验一辈子不触发。玻璃温室
+# 那一单「外面看天花板已重建、进门又是原始状态」就是这么漏过去的。
 _FLOOR_COVERING_KEYWORDS = (
     'subfloor', 'sub-floor', 'decking', 'floorboard', 'floorboards', 'floor slab',
     'deck slab', 'floor deck', 'plywood', 'osb', 'sheathing', 'screed',
 )
+_ROOF_COVERING_KEYWORDS = (
+    'glazing', 'glazed', 'glass', 'membrane', 'sheeting', 'shingle', 'shingles', 'tile',
+    'tiles', 'slate', 'slates', 'felt', 'bitumen', 'corrugated', 'panel', 'panels',
+    'panelled', 'paneled', 'boarded over', 'weathertight', 'watertight', 'weatherproof',
+)
+_WALL_COVERING_KEYWORDS = (
+    'cladding', 'clad', 'siding', 'weatherboard', 'weatherboarding', 'shiplap', 'render',
+    'rendered', 'plaster', 'plastered', 'panel', 'panels', 'panelled', 'paneled',
+    'sheathing', 'sheathed', 'boarded', 'pointed', 'repointed', 'infill', 'infilled',
+)
+_WINDOW_COVERING_KEYWORDS = (
+    'glazing', 'glazed', 'glass', 'pane', 'panes', 'sealed unit', 'putty', 'puttied',
+    'weathertight', 'watertight', 'weatherproof',
+)
+# 组 → 覆盖层词表。不在表里的组保持原样：骨架词一律否决。
+_GROUP_COVERING_KEYWORDS = {
+    'floor/deck slab': _FLOOR_COVERING_KEYWORDS,
+    'roof/ceiling': _ROOF_COVERING_KEYWORDS,
+    'exterior wall/shell': _WALL_COVERING_KEYWORDS,
+    'window/glazing': _WINDOW_COVERING_KEYWORDS,
+}
 # 构件词与封闭词必须落在同一个子句里才算同一件事。纯按字符距离判会把同一拍里另一件事
 # 的封闭词算到屋面头上（"…sealed watertight with bitumen membrane and backfilled, while
 # overhead the roof is left exactly as found" 里 membrane 离 roof 只有三十几个字符）；
@@ -8079,6 +8274,28 @@ _ENVELOPE_OPEN_MARKERS = (
     'punctured', 'rain falls through', 'snow drifts in', 'exposed to the weather',
 )
 _SENTENCE_SPLIT_PATTERN = re.compile(r'(?<=[.;!?])\s+')
+# ── 第二类倒退：「这个构件根本没动过」──────────────────────────────────────
+# _ENVELOPE_OPEN_MARKERS 只认「透天/破洞/坍塌」。可屋面被换掉之后，室内帧写成
+#   "Overhead the original ceiling boards are still rotten and cobwebbed."
+# 同样是倒退——那块构件已经是新的了，不可能还是原来那块烂的——却一个词都不命中。
+# 实测确认过：这一句在 roof/ceiling 已进账的前提下照样通过。
+#
+# 判定要三个条件同时成立（元素词 + 未动过词 + 衰败词），刻意收得比敞开判据还紧：
+#   · 光有衰败词不算 —— 只封了外面一层时，里面那层留着旧裂纹、锈迹、水渍完全合法
+#     （与 _ENVELOPE_OPEN_MARKERS 不收裸 'crack' 同一个理由）；
+#   · 光有「original/old」也不算 —— "the original roofline is preserved"、"the same
+#     original stone" 是正确写法，说的是形制与材质延续，不是没换过。
+# 两个词一起出现才唯一地指向「这块构件本身还是找到时那块烂的」。
+_ENVELOPE_UNCHANGED_CUES = (
+    'original', 'still the', 'still its', 'as found', 'untouched', 'unchanged', 'never touched',
+    'pre-renovation', 'pre-restoration', 'left exactly as', 'exactly as found', 'same as before',
+)
+_ENVELOPE_DECAY_CUES = (
+    'rotten', 'rotted', 'rotting', 'rot ', 'sagging', 'sags', 'cobweb', 'cobwebbed',
+    'mouldering', 'moldering', 'mouldy', 'moldy', 'decayed', 'decaying', 'crumbling',
+    'worm-eaten', 'wormeaten', 'blackened', 'charred', 'flaking', 'derelict', 'ruined',
+    'filthy', 'grime-caked', 'debris-strewn', 'wreckage', 'battered', 'dilapidated',
+)
 # 楼板专用的敞开判据：透天透雨那套词对楼板没有物理意义（脚下看见天空说明破了个洞，
 # 而「洞」本身已经在词表里），留着只会把「透过屋顶的天光洒在地板上」这种完全正常的
 # 写法算到楼板头上。这里只认结构性破口。
@@ -8162,16 +8379,18 @@ def _clause_seals_element(clause, element_keywords, group=None):
     """True when one clause declares an element of this group CLOSED: the clause names the
     element AND carries a seal marker, with no skeletal qualifier in it.
 
-    楼板例外（group == 'floor/deck slab'）：骨架否决表里有 'joist'，而"在楼板龙骨上
-    铺好底板/面板"恰恰是封楼板最标准的写法（"subfloor decking laid over the floor
-    joists"），一律否决会让楼板这一组几乎永不生效、白加。所以这一组在同一子句里
-    出现覆盖层构件词时不吃骨架否决——铺上了盖板就是盖住了，脚下不可能再是空的。
-    其它组保持原样：椽条/桁架立起来不等于屋面封上了。"""
+    覆盖层例外（见 _GROUP_COVERING_KEYWORDS）：骨架否决表里有 'joist'/'rafter'/'stud'
+    /'frame'，而"在龙骨上铺好盖板"恰恰是封住这一面最标准的写法（"subfloor decking
+    laid over the floor joists"、"the roof re-glazed over new rafters"），一律否决会让
+    这些组几乎永不生效、白加。所以同一子句里出现本组覆盖层词时不吃骨架否决——盖板
+    铺上了就是盖住了，那一面不可能还是空的。
+
+    没有覆盖层词时仍然照旧否决：椽条/桁架**只是**立起来，不等于屋面封上了，头顶依然
+    合法地敞着。"""
     if not any(kw in clause for kw in element_keywords):
         return False
     if any(q in clause for q in _ENVELOPE_SKELETAL_QUALIFIERS):
-        if not (group == 'floor/deck slab'
-                and any(kw in clause for kw in _FLOOR_COVERING_KEYWORDS)):
+        if not any(kw in clause for kw in _GROUP_COVERING_KEYWORDS.get(group) or ()):
             return False
     return any(marker in clause for marker in _ENVELOPE_SEAL_MARKERS)
 
@@ -8198,6 +8417,24 @@ def _envelope_hit_in_scope(scope_low, group):
     if any(cue in scope_low for cue in _ENVELOPE_DECLARED_OPENING_CUES):
         return None
     return hit_element, open_hits[0]
+
+
+def _unchanged_hit_in_scope(scope_low, group):
+    """「这个构件 + 没动过 + 还烂着」的三词共现，返回 (element, unchanged_cue, decay_cue)
+    或 None。见 _ENVELOPE_UNCHANGED_CUES 上方对「为什么必须三个词都在」的说明。
+
+    未动过词与衰败词都走 _mentions_without_negation：否定式澄清句（"no longer the
+    original rotten boards"、"nothing here is still rotten"）是合规写法，不是违规。"""
+    hit_element = next((kw for kw in _ENVELOPE_ELEMENT_KEYWORDS[group] if kw in scope_low), None)
+    if not hit_element:
+        return None
+    unchanged_hits = _mentions_without_negation(scope_low, _ENVELOPE_UNCHANGED_CUES)
+    if not unchanged_hits:
+        return None
+    decay_hits = _mentions_without_negation(scope_low, _ENVELOPE_DECAY_CUES)
+    if not decay_hits:
+        return None
+    return hit_element, unchanged_hits[0], decay_hits[0]
 
 
 def _names_other_group(text_low, group):
@@ -8256,6 +8493,7 @@ def check_envelope_seal_regression(image_prompt, i, beat_ladder, family='exterio
     if not sealed:
         return errors
     for group, milestone in sealed.items():
+        reported = False
         for scope_text, scope_low in _envelope_scopes(image_prompt, group):
             hit = _envelope_hit_in_scope(scope_low, group)
             if not hit:
@@ -8270,7 +8508,28 @@ def check_envelope_seal_regression(image_prompt, i, beat_ladder, family='exterio
                 f"fasteners, unfinished inner face) and move any required decay onto surfaces no "
                 f"earlier beat has touched."
             )
+            reported = True
             break   # 每个构件组最多一条：报三遍也是同一件事要修
+        if reported:
+            continue
+        # 第二类倒退：构件没被写成「敞着」，而是被写成「还是原来那块烂的」。同样一组
+        # 最多一条，且只在敞开判据没命中时才查——两条报的是同一个构件的同一件事。
+        for scope_text, scope_low in _envelope_scopes(image_prompt, group):
+            unchanged = _unchanged_hit_in_scope(scope_low, group)
+            if not unchanged:
+                continue
+            hit_element, unchanged_cue, decay_cue = unchanged
+            errors.append(
+                f"Envelope regression: an earlier beat already rebuilt/closed the {group} "
+                f"(\"{milestone}\"), but this interior IMAGE still describes it as the untouched "
+                f"original — '{hit_element}' together with '{unchanged_cue}' and '{decay_cue}' in: "
+                f"\"{scope_text.strip()}\". That element is new material now; it cannot still be "
+                f"the found, decayed one. Rewrite it as the completed element seen from its inner "
+                f"face (raw and unfinished is correct — bare new decking, exposed structure, "
+                f"fastener rows, fresh seam lines — but never the original rotten fabric), and "
+                f"move any required decay onto surfaces no earlier beat has touched."
+            )
+            break
     return errors
 
 
@@ -8282,15 +8541,20 @@ def rework_envelope_seal_regression_beat(config, i, image_prompt, envelope_errs,
     adopted only if it re-passes the check. Returns (image_prompt, adopted)."""
     system = (
         "You are repairing ONE physical-continuity error in a still-frame construction IMAGE "
-        "prompt from a restoration time-lapse. An earlier beat already sealed a building-envelope "
-        "element (roof/ceiling, exterior wall or shell, window/glazing) on camera, but this "
-        "interior frame still describes that same element as open — a state regression, since one "
-        "physical element cannot be closed from the outside and open from the inside. Hard rules:\n"
+        "prompt from a restoration time-lapse. An earlier beat already sealed or rebuilt a "
+        "building-envelope element (roof/ceiling, exterior wall or shell, window/glazing) on "
+        "camera, but this interior frame still describes that same element as open, or as the "
+        "untouched decayed original — a state regression, since one physical element cannot be "
+        "closed from the outside and open from the inside, and cannot be new material outside and "
+        "the original rotten fabric inside. Hard rules:\n"
         "- KEEP every sentence describing camera position, lens, geometry, locked anchors, grid "
         "coordinates, or frame-height percentages EXACTLY VERBATIM.\n"
         "- REWRITE only the offending sentence(s) so the sealed element reads as CLOSED from "
         "underneath/inside: no sky, clouds, distant ridge, horizon, daylight shaft, rain, or snow "
-        "coming through it, and no hole, gap, breach, missing section, or collapse in it.\n"
+        "coming through it, and no hole, gap, breach, missing section, or collapse in it. If the "
+        "error says the element is still written as the untouched original, that element is NEW "
+        "material now — delete the 'original / still / as found' framing and the decay attached to "
+        "it, and describe the completed element instead.\n"
         "- Its inner face is still allowed to be raw and unfinished — bare new decking, exposed "
         "rafters or ribs, fastener rows, seam lines, fresh underside of the new material — that is "
         "the correct way to show 'sealed outside, not yet finished inside'. Unfinished never means "
@@ -8504,6 +8768,10 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
     # 且这一条对**每一**帧 interior 生效（含过门中的 partial 阶段——外壳不会因为镜头还在
     # 门口就允许长出天窗）。
     errors.extend(check_shell_envelope_consistency(image_prompt, packet, family))
+    # 过门时空单调继承：进门首帧 IMAGE T+1 必须继承室外已完成的屋面与地坪施工，禁止状态倒退
+    errors.extend(check_threshold_monotonic_inheritance(
+        image_prompt, packet=packet, is_first_interior=beat_is_crossing_clip(beat)
+    ))
 
     errors.extend(check_nlvtr_violations(image_prompt))
     _wants_occupant = beat_requires_occupant(beat)
@@ -9021,7 +9289,7 @@ Required JSON keys:
             _nested_reference_form = ""
             if _nested_total >= 15:
                 _nested_reference_form = """
-  - CANONICAL 15-SLOT REFERENCE FORM (mandatory at this budget; copied from the accepted buried shipping-container dual-cabin creative): Beat 1 carrier delivery/landing; Beat 2 concealment plus completed usable entrance; Beat 3 bridge into the untouched primary space; Beat 4 primary cleanout; Beat 5 substrate repair/corrosion protection; Beat 6 membrane plus hidden services; Beat 7 insulation/enclosure; Beat 8 floor plus finished wall/ceiling surfaces; Beat 9 primary core furniture and function-complete mini-payoff; Beat 10 declared reset into the untouched secondary space; Beat 11 secondary cleanout; Beat 12 hidden layers plus insulation; Beat 13 enclosure plus finished surfaces; Beat 14 secondary core furniture and soft furnishing; Beat 15 sole final reward. Match these phase identities, not the shipping-container subject or its exact materials. Do not move the bridge/reset or replace a construction-state beat with extra reveal footage."""
+  - CANONICAL 15-SLOT REFERENCE FORM (mandatory at this budget; copied from the accepted buried shipping-container dual-cabin creative): Beat 1 carrier delivery/landing; Beat 2 concealment plus completed usable entrance; Beat 3 bridge into the untouched primary space; Beat 4 primary cleanout; Beat 5 substrate repair/corrosion protection; Beat 6 membrane plus hidden services; Beat 7 insulation/enclosure; Beat 8 floor plus finished wall/ceiling surfaces; Beat 9 primary core furniture and function-complete mini-payoff; Beat 10 declared reset into the untouched secondary space; Beat 11 secondary cleanout; Beat 12 hidden layers plus insulation; Beat 13 enclosure plus finished surfaces; Beat 14 secondary core furniture and soft furnishing; Beat 15 worker exit and sole final reward. Match these phase identities, not the shipping-container subject or its exact materials. Do not move the bridge/reset or replace a construction-state beat with extra reveal footage."""
             threshold_split_rules += f"""
 - THE BOUNDARY BETWEEN THE TWO SPACES (this is what makes the reset physically readable — without it the cut is an unexplained teleport):
   - This project's divider is: {_divider}. Beyond it lies {_second_space}.
@@ -9825,7 +10093,7 @@ Space Type: {space_type}
                 [space_ordinal(b.get('space_id')) for b in beat_ladder
                  if isinstance(b, dict) and is_interior_space(b.get('space_id'))] or [1])
             _observed_spaces = [str(x) for x in (parsed_brief.get('observed_space_sequence') or [])]
-            if _interior_spaces > 2:
+            if len(_observed_spaces) > 2 or _interior_spaces > 2:
                 _interior_names = []
                 for _label in _observed_spaces:
                     if _label not in _interior_names:
@@ -9873,6 +10141,10 @@ DELIVERED-CARRIER ANCHOR RULE (mandatory for this project): the carrier is haule
 OPENING ENVIRONMENT TYPE (binding): {_opening_env}. Use exactly the matching scene lock below; do not blend the two environment types.
 {_opening_env_packet}
 OPENING SUBJECT SCALE LOCK (mandatory): compose this exterior camera around the carrier's EMPTY receiving footprint, not around the whole valley, neighbourhood, forest, quarry, or skyline. Use a grounded wide view, never an ultra-wide, aerial, high-angle, or distant panorama. The empty footprint must fill the central majority of IMAGE 1 so that, without any later camera move or crop, the delivered carrier can be fully visible in the near midground and its longest visible dimension can span roughly two-thirds of the frame. The selected surrounding setting is secondary edge context only. Keep the three site landmarks readable around that dominant central footprint rather than pushing the footprint into the distance.
+"""
+        elif project_origin_mode(parsed_brief) == 'ground_up_build':
+            _delivered_carrier_packet_rule = """
+GROUND-UP BUILD ANCHOR RULE (mandatory for this project): IMAGE 1 is undeveloped raw ground before any construction, and the carrier structure is excavated and built from scratch on camera. Therefore all three "primary_landmarks" (and the exterior "frame_boundaries") MUST be permanent natural features of the SITE/TERRAIN that exist before construction (e.g. background trees, natural rock/earth bank, ground clearing perimeter). NEVER register the unbuilt shelter/carrier itself, any part of it (doorway, entrance rim, roof apex, deck platform), or the marker powder line as an exterior primary landmark. Do not hallucinate collapsed rotted structures or ruins in IMAGE 1 unless explicitly specified.
 """
 
         packet_system = f"""You are a spatial consistency supervisor for a time-lapse renovation prompt composer.
@@ -10171,7 +10443,8 @@ Hard Rules:
 
     if on_progress:
         _, _, anchor_block = _build_partial_prompt_block(
-            compiled_images, compiled_videos, beat_ladder, pacing_skeleton_id)
+            compiled_images, compiled_videos, beat_ladder, pacing_skeleton_id,
+            parsed_brief=parsed_brief)
         on_progress('beat_ready', {
             'index': 0,
             'total': total_beats,
@@ -10244,11 +10517,8 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
     is_turn = is_bridge and bool(beat.get('turn_direction'))
     is_cut = bool(beat.get('hard_cut'))
     # 一比一模式（见 compose_anchor_and_packet 的 _outline_strict 分支）：过门/硬切不再
-    # 单开一张不出货的空拍——它落在清单里紧贴边界那一拍身上，那一拍的 outline_refs 非空，
-    # 说明它自己就在交付一条真实工序，不是纯运镜占位。这个标记决定下面好几处"过门帧必须
-    # 是没人碰过的废墟""紧接着必须是清理"之类只适配旧的"空白过门拍"模型的强制文案要不要
-    # 让路——非一比一路径（老任务/老断点/手动主题）这里恒为 False，行为完全不变。
-    is_bridge_with_payload = (is_bridge or is_cut) and bool(beat.get('outline_refs'))
+    # 过门拍与硬切拍为独立纯运镜拍，不得夹带任何施工工序（Zero Work Contamination）。
+    is_bridge_with_payload = False
     # STAGE SCOPE RULE tier for this beat's state delta ('large'/'small'/'default');
     # threshold/reward/bridge/hard_cut beats already have their own dedicated content
     # rules and are excluded from the quota, so they carry no stage_scope directive.
@@ -10287,15 +10557,11 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
     # 拍——它是唯一一拍的 before_state 完全由上一张首现帧的脏乱决定，所以要单独给它一
     # 条契约：清走可搬运的杂物，但结构性衰败（锈迹、裂缝、剥落）原封不动留到后面的修复
     # 拍去处理。节拍梯层面这一拍的存在由 compose_anchor_and_packet 的结构校验保证。
-    # 一比一模式下过门拍本身已经交付一条真实工序（is_bridge_with_payload），首现帧不再
-    # 是通用的"没人碰过的废墟"，这条强制清理契约也就没有前提可以成立——下一拍具体是
-    # 什么完全由清单顺序决定。
     _prev_beat = beat_ladder[i - 2] if i >= 2 else None
     is_post_reveal_cleanup = (
         mode == 'Threshold' and family == 'interior'
         and not is_bridge and not is_cut and not is_threshold_or_reveal
         and isinstance(_prev_beat, dict)
-        and not bool(_prev_beat.get('outline_refs'))
         and (str(_prev_beat.get('transition_stage') or '') in
              ('interior_establish', 'secondary_establish')
              or _prev_beat.get('bridge_stage') == 1 or bool(_prev_beat.get('hard_cut')))
@@ -10731,36 +10997,21 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
             "already-open entry, or interior anchors visible at the start — the reveal happens on "
             "camera here, and the interior anchors' scales are declared only for where they settle "
             f"in IMAGE {i+1}.")
-        if is_bridge_with_payload:
-            # 一比一模式：这一拍自己在交付一条真实清单工序（milestone_name/
-            # package_operations 已经填好），不是纯运镜占位——穿越完成后同一镜头
-            # 继续做它自己该做的事，末帧是它自己的 after_state，不是"没人碰过的废墟"。
-            family_contract_lines.append(
-                "- Crossing clip continues into real work (mandatory, this beat only): the physical "
-                "crossing above is only the OPENING action of this clip. In the SAME unbroken take, "
-                "immediately after the camera settles fully inside, the clip continues into this "
-                "beat's own listed construction work (its \"package_operations\"/\"description\"), "
-                "same as any ordinary construction beat's video — do not stop, cut, or hold once the "
-                "crossing settles. The resulting IMAGE is this beat's own completed after_state, not "
-                "a generic untouched-ruin frame; only decay this beat's own work does NOT touch may "
-                "still read as untouched.")
-        else:
-            family_contract_lines.append(
-                "- Crossing clip — raw interior throughout (mandatory): the space this clip enters is "
-                "an untouched ruin at EVERY frame of the clip, not just at its end. Name the decay the "
-                "camera moves into (debris lying where it fell, dirt drifts, rust/water stains, growth "
-                "through the cracks) so the interior reads as filthy from the first moment it becomes "
-                "visible. Nothing may be cleaned, cleared, tidied, repaired, or installed during this "
-                "clip, and no tool, ladder, scaffolding, tarp, work light, or stacked material may "
-                "appear at any point — the crossing is a pure camera move, and the cleanout is the "
-                "NEXT beat's work.")
+        family_contract_lines.append(
+            "- Crossing clip — raw interior throughout (mandatory): the space this clip enters is "
+            "an untouched ruin at EVERY frame of the clip, not just at its end. Name the decay the "
+            "camera moves into (debris lying where it fell, dirt drifts, rust/water stains, growth "
+            "through the cracks) so the interior reads as filthy from the first moment it becomes "
+            "visible. Nothing may be cleaned, cleared, tidied, repaired, or installed during this "
+            "clip, and no tool, ladder, scaffolding, tarp, work light, or stacked material may "
+            "appear at any point — the crossing is a pure camera move, and the cleanout is the "
+            "NEXT beat's work.")
         family_contract_lines.append(
             "- Crossing clip — one unbroken take (mandatory): a single continuous take at one "
             "steady speed. No cut, no fade, no dissolve, no wipe transition, no speed ramp, no "
             "freeze, no re-framing jump; the only edit-like motion in the clip is the door frame "
-            "leaving the frame as the camera passes it."
-            + ("" if is_bridge_with_payload else " Do NOT describe this beat as a "
-               "construction time-lapse — nothing is being built here."))
+            "leaving the frame as the camera passes it. Do NOT describe this beat as a "
+            "construction time-lapse — nothing is being built here.")
     if is_cut:
         # 2026-07-30：切入拍的 VIDEO 不再是占位声明，而是一段普通的跨越镜头提示词——
         # 契约按 bridge 的合并跨越镜头同款写满（锚定开场由 fix_video_opening 兜底），
@@ -10786,32 +11037,19 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
             "write a peek through the doorway, an already-open entry, or interior anchors visible "
             f"at the start — IMAGE {i} keeps its entry CLOSED and opaque by design, and the reveal "
             "happens on camera here.")
-        if is_bridge_with_payload:
-            family_contract_lines.append(
-                "- Crossing clip continues into real work (mandatory, this beat only): the door/hatch "
-                "opening above is only the OPENING action of this clip. In the SAME unbroken take, "
-                "immediately after the camera settles fully inside, the clip continues into this "
-                "beat's own listed construction work (its \"package_operations\"/\"description\"), "
-                "same as any ordinary construction beat's video — the clip is sterile of workers "
-                "throughout (the entry opens on camera without a figure entering frame; the "
-                "construction that follows is shown as tool/material traces and progressive state "
-                "change only, per the usual zero-worker rule). The resulting IMAGE is this beat's own "
-                "completed after_state, not a generic untouched-ruin frame.")
-        else:
-            family_contract_lines.append(
-                "- Crossing clip — raw interior throughout (mandatory): the space this clip enters is "
-                "an untouched ruin at EVERY frame from the moment it becomes visible — debris lying "
-                "where it fell, dirt drifts, rust/water stains, growth through the cracks. Nothing may "
-                "be cleaned, cleared, tidied, repaired, or installed during this clip, and no tool, "
-                "ladder, scaffolding, tarp, work light, or stacked material may appear at any point; "
-                "the clip is sterile of workers (the entry opens on camera without a figure entering "
-                "frame), and the cleanout is the NEXT beat's work.")
+        family_contract_lines.append(
+            "- Crossing clip — raw interior throughout (mandatory): the space this clip enters is "
+            "an untouched ruin at EVERY frame from the moment it becomes visible — debris lying "
+            "where it fell, dirt drifts, rust/water stains, growth through the cracks. Nothing may "
+            "be cleaned, cleared, tidied, repaired, or installed during this clip, and no tool, "
+            "ladder, scaffolding, tarp, work light, or stacked material may appear at any point; "
+            "the clip is sterile of workers (the entry opens on camera without a figure entering "
+            "frame), and the cleanout is the NEXT beat's work.")
         family_contract_lines.append(
             "- Crossing clip — one unbroken take (mandatory): a single continuous take at one "
             "steady speed. No cut, no fade, no dissolve, no wipe transition, no speed ramp, no "
-            "freeze, no re-framing jump."
-            + ("" if is_bridge_with_payload else " Do NOT describe this beat as a construction "
-               "time-lapse — nothing is being built here."))
+            "freeze, no re-framing jump. Do NOT describe this beat as a construction "
+            "time-lapse — nothing is being built here.")
     if is_pre_bridge:
         family_contract_lines.append(
             f"- SEALED ENTRY (mandatory): IMAGE {i+1} is the last exterior frame before the "
@@ -11119,11 +11357,16 @@ Write the beats IN ORDER. Each beat's resulting IMAGE must continue directly and
 - THIS BEAT'S VIDEO must use progressive (-ing) verbs for ongoing actions, name worker silhouettes (HAL) and tools (MTAL) if workers are present, encapsulate bulk materials in rigid containers (VMFP/RCE), and include pacing control "continuous construction time-lapse, not real-time footage" (unless threshold or reward).
 - EVEN RATE (unless threshold or reward): the clip must also state that the transformation advances continuously and at an even rate across the entire clip duration — at every moment something is visibly progressing, no interval of the clip is static or paused, and no part of the change is deferred and then delivered as a single sudden step. Distribute the beat's work evenly over the whole clip; never describe the scene as holding, settling, or waiting mid-clip, and never save a visible portion of the milestone for the final moment.
 - THIS BEAT'S VIDEO CONCRETENESS (no abstractions): describe the SAME single lone worker every beat, reusing the exact costume from the packet worker_choreography (e.g. "one lone worker in a solid pale shirt, dark pants, and dark cap"); name the ONE specific manual tool used; describe the concrete repeated work cycle in -ing verbs (e.g. scooping, lifting, pressing, fastening). NEVER write vague filler like "transformation progresses" or "the scene transforms" — show observable physical actions only.
+- FULL-FIELD DELTA CONSERVATION & MULTI-ZONE ACTION COVERAGE (P0): In THIS BEAT'S VIDEO, all physical differences between the starting IMAGE and the resulting IMAGE across 4 spatial zones (Top/Roof/Ceiling, Middle/Walls/Openings, Bottom/Floor/Approach, Peripherals/Spoil/Materials) MUST have 100% assigned worker actions, explicit geometric tools, and corresponding audio SFX. If the resulting IMAGE shows structural demolition (e.g. rotted roof boards/membrane stripped away) or debris cleared alongside ground work, the VIDEO MUST explicitly describe the worker dismantling and tossing/stacking those roof elements into designated spoil piles as well as the ground clearing. Zero phantom changes: never leave any changing zone unacted. Material balance: demolition debris must visibly stack/bundle, and installed materials must deplete.
 - THIS BEAT'S VIDEO must end with a PERSISTENT-TRACES clause naming the marks this beat leaves behind (e.g. scrape grooves, end-grain circles, screw heads, nail rows, sawdust trails, trimmed edges, compression tracks), followed by a natural-language description of both the near-field diegetic sound effects (2-4 specific sounds of tools, materials, or footsteps) and the steady room/environment ambient noise. Use varied phrasing for these audio descriptions rather than a single formulaic structure across beats.
 - THIS BEAT'S resulting IMAGE must be a clean frame with ZERO workers/machinery. Do NOT use the words 'worker', 'builder', 'carpenter', 'laborer', 'person', 'man', 'woman', or 'people' under any circumstances, even to state that they are absent or not present. Describe only static objects, surfaces, and traces. For every ordinary construction beat, follow its VISIBLE MILESTONE CONTRACT exactly: name the milestone anchor, state its completed full extent/count, preserve inherited and not-yet-worked state, and include at least two declared persistent contact traces. Never reduce the delta to a local patch, a beginning, or vague incremental progress.
 - THIS BEAT'S VIDEO must execute the same visible milestone from its exact before_state to after_state. It must include TWO independently observable progress lines: the main product growing to its complete extent/count, plus stock/container/spoil movement or a tightly coupled second component. Show first contact, repeated cycles, material source and movement path, and a clean terminal frame. Prior installed/finished features stay present and unchanged.
 - A construction package may contain up to three tightly related actions only when all actions occur in the same zone and jointly create the one named milestone. Do not leak unrelated demolition, rough-in, finish, lighting, or furnishing work into that package.
-- For threshold bridge beats (if a beat is a threshold bridge, per its own section below), follow the TBCP rules: the ENTIRE exterior-to-interior crossing is ONE single beat (bridge_stage 1) — there is no separate hold/sill/vestibule/turn beat. Its VIDEO is the ONLY visible clip for the crossing, bound normally from the previous beat's IMAGE to this beat's own IMAGE, and must depict the full exterior-to-settle arc (plus, in the PAN variant, ending in a stationary pan locking onto the interior's long axis) in one continuous shot, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it. EVERY crossing — bridge or DECLARED CUT-IN alike — starts from a CLOSED entry: the previous beat's IMAGE keeps its door/hatch shut (or, on a carrier with no leaf yet, its raw opening unlit and opaque) and shows nothing of the interior, and the crossing clip itself pushes that entry open on camera before advancing through it. There is no interior peek and no anchor scale-up before the clip. A DECLARED CUT-IN beat works the same way on the video side — its VIDEO is a real generated crossing clip, written as an ordinary video prompt bound from the previous beat's IMAGE to this beat's own IMAGE — while its IMAGE re-establishes the interior from scratch per its anchor rule. The crossing clip enters an untouched ruin and stays that way for its whole length — nothing is cleaned, cleared, tidied, repaired, or installed while the camera moves, and no tool, ladder, scaffolding, tarp, work light, or stacked material appears in it; write it as one unbroken take at a steady speed (no cut, fade, dissolve, speed ramp, or freeze), and never call it a construction time-lapse. The cleanout of that mess is the NEXT beat.
+- For threshold bridge beats (if a beat is a threshold bridge, per its own section below), follow the TBCP rules: the ENTIRE exterior-to-interior crossing is ONE single beat (bridge_stage 1) — there is no separate hold/sill/vestibule/turn beat. Its VIDEO is the ONLY visible clip for the crossing, bound normally from the previous beat's IMAGE to this beat's own IMAGE, and must depict the full exterior-to-settle arc (plus, in the PAN variant, ending in a stationary pan locking onto the interior's long axis) in one continuous shot, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it. EVERY crossing — bridge or DECLARED CUT-IN alike — starts from a CLOSED entry: the previous beat's IMAGE keeps its door/hatch shut (or, on a carrier with no leaf yet, its raw opening unlit and opaque) and shows nothing of the interior, and the crossing clip itself pushes that entry open on camera before advancing through it. There is no interior peek and no anchor scale-up before the clip. A DECLARED CUT-IN beat works the same way on the video side — its VIDEO is a real generated crossing clip, written as an ordinary video prompt bound from the previous beat's IMAGE to this beat's own IMAGE — while its IMAGE re-establishes the interior from scratch per its anchor rule. The crossing clip enters an untouched ruin and stays that way for its whole length — nothing is cleaned, cleared, tidied, repaired, or installed while the camera moves, and no tool, ladder, scaffolding, tarp, work light, or stacked material appears in it; write it as one unbroken take at a steady speed (no cut, fade, dissolve, speed ramp, or freeze), and never call it a construction time-lapse.
+- THRESHOLD MONOTONIC INHERITANCE (P0): When crossing from exterior to interior (IMAGE T+1), the interior first reveal MUST 100% physically inherit all envelope/structural work completed in prior exterior beats:
+  1. Roof/Ceiling: If exterior beats built or weatherproofed the roof, the ceiling underside in IMAGE T+1 MUST show the newly installed roof timbers/sheathing/membrane. NEVER describe ceiling cracks, missing roof sections, or water leaks.
+  2. Ground/Floor: If an earlier exterior beat already cleared the earthen floor, the floor in IMAGE T+1 is already clean bare earth. DO NOT describe fallen timber or leaf piles again.
+  3. Untouched Scope: ONLY untreated interior wall surfaces, lack of interior framing/insulation, and lack of internal utilities remain in their raw state.
 - NLVTR visual-only rule: No '%' symbols, no numeric ranges, no acronyms (HAL, SCUP, NGCS, VMFP, RCE, GCTR, RPL, OSPL, RHMA, PBISP, HCL, NLVTR, MTAL, TSPA) in the prompts.
 - REALISM rule (mandatory): strictly documentary photorealism. Every material, fixture, tool, and technique must be real-world and present-day (wood, stone, brass, wool, glass, leather, standard trade tools). NO sci-fi, futuristic, cyberpunk, holographic, glowing-tech-panel, LED-neon, or spacecraft-style elements anywhere in the scene.
 - SINGLE CONTINUOUS PHOTOGRAPH rule (mandatory): each IMAGE is one real photograph of one moment — never a grid of multiple panels, a collage, a storyboard, a comparison/before-after split, or a multi-view composite. The "Grid A1-C3" notation used elsewhere in this contract is an internal composition-registration convention for you the writer — never describe or render literal grid lines, panel borders, or divided frames in the image itself.
@@ -12319,12 +12562,7 @@ def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, fa
         return video_prompt, image_prompt
     _meta = str(video_meta or '').upper()
     _is_crossing_slot = 'BRIDGE' in _meta or 'CUT' in _meta
-    _is_legacy_cut_placeholder = is_legacy_hard_cut_placeholder(video_prompt)
     _cut_note = (
-        " NOTE: this beat's VIDEO slot is a legacy DECLARED HARD CUT placeholder — no clip is "
-        "generated for it in this project and the crossing is carried in words there. Return its "
-        "text character-for-character unchanged and fix the IMAGE prompt only."
-        if _is_legacy_cut_placeholder else
         " NOTE: this beat's VIDEO is the single exterior-to-interior crossing clip (a pure camera "
         "move through an untouched ruin, sterile of workers). Keep its camera-motion sentences — "
         "never turn it into a static-camera or construction-work clip."
@@ -12353,9 +12591,6 @@ def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, fa
         new_image = str(data.get('image') or '').strip()
         if not new_video or not new_image:
             return video_prompt, image_prompt
-        # 提示词里已经关照过了，但这是确定性兜底：旧单的占位声明不接受任何改写。
-        if _is_legacy_cut_placeholder:
-            new_video = video_prompt
         # 收尾走一遍与其它改写路径同款的确定性修复
         new_image = clean_prompt_text(new_image)
         new_image = fix_image_clean_frame_proactive(new_image)
@@ -12426,40 +12661,223 @@ def _strip_code_fences(s):
     return s
 
 
+# 合成器输出文档的分节标记（只认这几个已知名字，行首独占一行）。识别得越窄越好：
+# 提示词正文里真出现一行 `=== X ===` 时不该被当成分节。
+_COMPOSER_MARKER_LINE_RE = re.compile(
+    r'^[ \t]*(?:\*\*)?===\s*(TITLE|THEME|PROMPTS|AUDIT|TRACES)\s*===(?:\*\*)?[ \t]*$',
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _strip_composer_marker_sections(text):
+    """丢掉带标记文档里除 ===PROMPTS=== 之外的分节，只留提示词正文。
+
+    这是 `_parse_prompt_slots` 的兜底：整份文档被当成 prompt_block 存下来时
+    （历史遗留数据、外部粘进来的集子），尾部 `===AUDIT===` 那段说明会被下面
+    slot 正则的开放式尾段（`…|\\Z`）吃进**最后一段视频**的正文，然后原样送进 i2v。
+    落在解析器里而不是只在写入侧，是因为渲染读的是解析结果——存量数据也得挡住。
+
+    没有已知标记的文本原样返回（绝大多数调用都走这条），幂等。"""
+    matches = list(_COMPOSER_MARKER_LINE_RE.finditer(text or ''))
+    if not matches:
+        return text
+    # 第一个标记之前的内容是正文（"干净块 + 尾巴" 这种形状），照留
+    kept = [text[:matches[0].start()]]
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        if m.group(1).upper() == 'PROMPTS':
+            kept.append(text[m.end():end])
+    return '\n'.join(part.strip('\n') for part in kept if part.strip()).strip()
+
+
+def _short_slot_summary(text, max_chars=20):
+    if not text:
+        return ""
+    s = str(text).strip()
+    # 剥除外层括号/引号与常见标记噪音（如 （工序：...）、[BRIDGE...]、工序：等）
+    s = re.sub(r'^[（\(\[\{【「“"\'\s]+|[）\)\]\}】」”"\'\s]+$', '', s)
+    s = re.sub(r'[（\(]\s*工序\s*[:：].*?[）\)]', '', s)
+    s = re.sub(r'\[\s*(?:BRIDGE|CUT|HERO|PACE|REFRAME)[^\]]*\]', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'^\s*工序\s*[:：]\s*', '', s)
+    s = s.strip()
+    if not s:
+        return ""
+
+    # 按标点子句切分（不要按 \s 空格切分，否则英文短语会被截断成单个单词如 The / Rigging）
+    clauses = re.split(r'[，,。；;\n\r—\-\t|/]+', s)
+
+    # 1. 优先找含中文字符的有意义子句
+    for c in clauses:
+        c = c.strip()
+        c = re.sub(r'^[（\(\[\{【「“"\'\s]+|[）\)\]\}】」”"\'\s]+$', '', c).strip()
+        if c and re.search(r'[\u4e00-\u9fa5]', c):
+            return c[:max_chars]
+
+    # 2. 若全为英文或无中文子句，取首个非空子句并清理多余的冠词开头（如 The / A / An）
+    for c in clauses:
+        c = c.strip()
+        c = re.sub(r'^[（\(\[\{【「“"\'\s]+|[）\)\]\}】」”"\'\s]+$', '', c).strip()
+        if c:
+            cleaned_en = re.sub(r'^(?:The|A|An)\s+', '', c, flags=re.IGNORECASE).strip()
+            res = cleaned_en if cleaned_en else c
+            return res[:max_chars]
+
+    return s[:max_chars]
+
+
+def _extract_slot_summary(beat, is_before_state=False, outline_plan=None):
+    if not isinstance(beat, dict):
+        return ""
+
+    # 1. 如果是首帧（前置未动工状态）
+    if is_before_state:
+        # a. 优先从 beat 本身的 zh 字典中取 before_state / state_before / before_zh
+        zh = beat.get('zh') or {}
+        if isinstance(zh, dict) and zh:
+            val = zh.get('before_state') or zh.get('state_before') or zh.get('before_zh')
+            if val:
+                return _short_slot_summary(str(val))
+        val = beat.get('before_zh') or beat.get('state_before_zh')
+        if val and re.search(r'[\u4e00-\u9fa5]', str(val)):
+            return _short_slot_summary(str(val))
+        before_val = beat.get('state_before') or beat.get('before_state')
+        if before_val and re.search(r'[\u4e00-\u9fa5]', str(before_val)):
+            return _short_slot_summary(str(before_val))
+
+        # b. 回溯 outline_plan 首条
+        if outline_plan and isinstance(outline_plan, (list, tuple)) and len(outline_plan) > 0:
+            target = outline_plan[0]
+            if isinstance(target, dict):
+                t_zh = target.get('zh') or {}
+                if isinstance(t_zh, dict) and t_zh:
+                    t_val = t_zh.get('before_state') or t_zh.get('state_before') or t_zh.get('before_zh')
+                    if t_val:
+                        return _short_slot_summary(str(t_val))
+                t_val = target.get('before_zh') or target.get('state_before')
+                if t_val and re.search(r'[\u4e00-\u9fa5]', str(t_val)):
+                    return _short_slot_summary(str(t_val))
+            return "初始未动工状态"
+
+        if isinstance(zh, dict) and zh:
+            return "初始未动工状态"
+        if any(re.search(r'[\u4e00-\u9fa5]', str(v)) for v in beat.values() if isinstance(v, str)):
+            return "初始未动工状态"
+
+        return ""
+
+    # 2. 中间各拍 / 视频槽位（操作与里程碑）
+    # a. 优先从 beat.get('zh') 取中文操作名
+    zh = beat.get('zh') or {}
+    if isinstance(zh, dict):
+        val = zh.get('operation') or zh.get('headline') or zh.get('visible_result') or zh.get('visible_action')
+        if val and re.search(r'[\u4e00-\u9fa5]', str(val)):
+            if isinstance(val, (list, tuple)):
+                val = '、'.join(str(s).strip() for s in val if str(s).strip())
+            return _short_slot_summary(str(val))
+
+    # b. beat 顶层的中文对照字段
+    val = beat.get('operation_zh') or beat.get('headline_zh') or beat.get('summary_zh') or beat.get('operation_name_zh')
+    if val and re.search(r'[\u4e00-\u9fa5]', str(val)):
+        return _short_slot_summary(str(val))
+
+    # c. beat.get('summary') / beat.get('title')（若含中文）
+    explicit = beat.get('summary') or beat.get('title')
+    if explicit and re.search(r'[\u4e00-\u9fa5]', str(explicit)):
+        return _short_slot_summary(str(explicit))
+
+    # d. 回溯 outline_plan / outline_items 中的对应条目
+    if outline_plan and isinstance(outline_plan, (list, tuple)):
+        refs = beat.get('outline_refs')
+        if not refs and beat.get('index') is not None:
+            refs = [beat.get('index')]
+        if refs and isinstance(refs, (list, tuple)):
+            for r in refs:
+                try:
+                    idx = int(r) - 1
+                    if 0 <= idx < len(outline_plan):
+                        target = outline_plan[idx]
+                        if isinstance(target, dict):
+                            t_zh = target.get('zh') or {}
+                            if isinstance(t_zh, dict):
+                                t_summary = (t_zh.get('operation') or t_zh.get('headline') or
+                                             t_zh.get('visible_result') or t_zh.get('visible_action'))
+                                if t_summary and re.search(r'[\u4e00-\u9fa5]', str(t_summary)):
+                                    if isinstance(t_summary, (list, tuple)):
+                                        t_summary = '、'.join(str(s).strip() for s in t_summary if str(s).strip())
+                                    return _short_slot_summary(str(t_summary))
+                            t_summary = (target.get('summary') or target.get('operation_zh') or
+                                         target.get('headline_zh') or target.get('summary_zh'))
+                            if t_summary and re.search(r'[\u4e00-\u9fa5]', str(t_summary)):
+                                if isinstance(t_summary, (list, tuple)):
+                                    t_summary = '、'.join(str(s).strip() for s in t_summary if str(s).strip())
+                                return _short_slot_summary(str(t_summary))
+                            t_text = str(target.get('text') or '')
+                            clean_t_text = re.sub(r'[（\(]\s*工序\s*[:：].*?[）\)]', '', t_text).strip()
+                            if clean_t_text and re.search(r'[\u4e00-\u9fa5]', clean_t_text):
+                                return _short_slot_summary(clean_t_text)
+                except (TypeError, ValueError):
+                    pass
+
+    # e. beat 自身的 milestone_name / description / text（仅当去除工序标签后确实包含中文时）
+    for key in ('milestone_name', 'description', 'text'):
+        raw_val = str(beat.get(key) or '').strip()
+        if raw_val:
+            clean_val = re.sub(r'[（\(]\s*工序\s*[:：].*?[）\)]', '', raw_val).strip()
+            if clean_val and re.search(r'[\u4e00-\u9fa5]', clean_val):
+                return _short_slot_summary(clean_val)
+
+    return ""
+
+
 def _parse_prompt_slots(block):
-    """Parse Chinese-labeled image/video prompt slots from a prompt block,
-    preserving optional metadata annotations like [BRIDGE] attached to the labels."""
-    text = _strip_markdown_fences_only(block or '')
-    
-    # Matches: "图片 8:" or "图片 8 [BRIDGE]:"
+    """Parse Chinese/aliased-labeled image/video prompt slots from a prompt block,
+    preserving optional metadata annotations like [BRIDGE] and summary annotations
+    like （最终完工氛围展示） attached to the labels.
+    Tolerates Markdown headers (#### ), bullets, bolding, and full-width colons."""
+    text = _strip_composer_marker_sections(_strip_markdown_fences_only(block or ''))
+    text = re.sub(r'[\u200B-\u200D\u2060\uFEFF]', '', text)
+
+    # Matches: "图片 8:", "#### 图片 8:", "**图片 8:**", "图片 8（简介）[BRIDGE]:", "IMAGE 8:", etc.
     image_matches = re.findall(
-        r'图片\s*(\d+)(?:\s*\[(.*?)\])?\s*:\s*(.*?)(?=\n图片\s*\d+|\n视频提示词|\n视频\s*\d+|\Z)',
+        r'(?:^|\n)\s*(?:#{1,6}\s*|\*{1,2}\s*|[-*+]\s+)?(?:图片|图像|画面|IMAGE|IMG|Frame)\s*(?:第|#)?\s*(\d+)((?:\s*(?:[（\(].*?[）\)]|\[.*?\]))*)\s*[:：]\s*(.*?)(?=(?:\n\s*(?:#{1,6}\s*|\*{1,2}\s*|[-*+]\s+)?(?:图片|图像|画面|IMAGE|IMG|Frame)\s*(?:第|#)?\s*\d+|\n\s*(?:#{1,6}\s*)?(?:视频提示词|VIDEO\s*PROMPTS?)|\n\s*(?:#{1,6}\s*|\*{1,2}\s*|[-*+]\s+)?(?:视频|镜头|VIDEO|VID|Clip)\s*(?:第|#)?\s*\d+|\Z))',
         text,
-        re.DOTALL
+        re.DOTALL | re.IGNORECASE
     )
     
-    # Matches: "视频 8:" or "视频 8 [BRIDGE]:"
     video_matches = re.findall(
-        r'视频\s*(\d+)(?:\s*\[(.*?)\])?\s*:\s*(.*?)(?=\n视频\s*\d+|\n图片提示词|\n图片\s*\d+|\Z)',
+        r'(?:^|\n)\s*(?:#{1,6}\s*|\*{1,2}\s*|[-*+]\s+)?(?:视频|镜头|VIDEO|VID|Clip)\s*(?:第|#)?\s*(\d+)((?:\s*(?:[（\(].*?[）\)]|\[.*?\]))*)\s*[:：]\s*(.*?)(?=(?:\n\s*(?:#{1,6}\s*|\*{1,2}\s*|[-*+]\s+)?(?:视频|镜头|VIDEO|VID|Clip)\s*(?:第|#)?\s*\d+|\n\s*(?:#{1,6}\s*)?(?:图片提示词|IMAGE\s*PROMPTS?)|\n\s*(?:#{1,6}\s*|\*{1,2}\s*|[-*+]\s+)?(?:图片|图像|画面|IMAGE|IMG|Frame)\s*(?:第|#)?\s*\d+|\Z))',
         text,
-        re.DOTALL
+        re.DOTALL | re.IGNORECASE
     )
     
     images = {}
-    for n, meta, body in image_matches:
+    for n, tags, body in image_matches:
         if body.strip():
-            images[int(n)] = {
+            summary_m = re.search(r'[（\(](.*?)[）\)]', tags)
+            summary = summary_m.group(1).strip() if summary_m else ''
+            meta_m = re.search(r'\[(.*?)\]', tags)
+            meta = meta_m.group(1).strip() if meta_m else ''
+            item = {
                 'body': body.strip(),
-                'meta': meta.strip() if meta else ''
+                'meta': meta,
             }
+            if summary:
+                item['summary'] = summary
+            images[int(n)] = item
             
     videos = {}
-    for n, meta, body in video_matches:
+    for n, tags, body in video_matches:
         if body.strip():
-            videos[int(n)] = {
+            summary_m = re.search(r'[（\(](.*?)[）\)]', tags)
+            summary = summary_m.group(1).strip() if summary_m else ''
+            meta_m = re.search(r'\[(.*?)\]', tags)
+            meta = meta_m.group(1).strip() if meta_m else ''
+            item = {
                 'body': body.strip(),
-                'meta': meta.strip() if meta else ''
+                'meta': meta,
             }
+            if summary:
+                item['summary'] = summary
+            videos[int(n)] = item
             
     return images, videos
 
@@ -12476,33 +12894,46 @@ def _format_prompt_block(images, videos):
         item = images[idx]
         body = item['body'] if isinstance(item, dict) else item
         meta = item.get('meta', '') if isinstance(item, dict) else ''
+        summary = item.get('summary', '') if isinstance(item, dict) else ''
+        summary_str = f"（{summary}）" if summary else ""
         meta_str = f" [{meta}]" if meta else ""
-        image_lines.extend([f"图片 {idx}{meta_str}:", body.strip(), ""])
+        image_lines.extend([f"图片 {idx}{summary_str}{meta_str}:", body.strip(), ""])
 
     video_lines = ["视频提示词"]
     for idx in sorted(videos):
         item = videos[idx]
         body = item['body'] if isinstance(item, dict) else item
         meta = item.get('meta', '') if isinstance(item, dict) else ''
+        summary = item.get('summary', '') if isinstance(item, dict) else ''
+        summary_str = f"（{summary}）" if summary else ""
         meta_str = f" [{meta}]" if meta else ""
-        video_lines.extend([f"视频 {idx}{meta_str}:", body.strip(), ""])
+        video_lines.extend([f"视频 {idx}{summary_str}{meta_str}:", body.strip(), ""])
 
     return ("\n".join(image_lines).rstrip() + "\n\n" + "\n".join(video_lines).rstrip()).strip()
 
 
 def _build_partial_prompt_block(compiled_images, compiled_videos, beat_ladder,
-                                pacing_skeleton_id=None):
+                                pacing_skeleton_id=None, parsed_brief=None):
     """Formats whatever beats have been compiled so far into prompt_block text,
     tagging BRIDGE beats the same way the final reassembly does. Shared by the
     per-beat progressive-reveal on_progress('beat_ready', ...) events and the
     final assembly, so the two never diverge in BRIDGE-tagging behavior.
     Returns (formatted_images, formatted_videos, block_text)."""
+    outline_plan = None
+    if isinstance(parsed_brief, dict):
+        outline_plan = parsed_brief.get('beat_outline') or parsed_brief.get('outline')
+
     formatted_images = {}
     for idx, img in compiled_images.items():
         meta = ""
+        summary = ""
         # For idx > 1, the image is the end frame of beat idx - 1
-        if idx > 1 and (idx - 2) < len(beat_ladder):
+        if idx == 1:
+            if beat_ladder:
+                summary = _extract_slot_summary(beat_ladder[0], is_before_state=True, outline_plan=outline_plan)
+        elif idx > 1 and (idx - 2) < len(beat_ladder):
             beat = beat_ladder[idx - 2]
+            summary = _extract_slot_summary(beat, outline_plan=outline_plan)
             if beat.get('transition_stage') == 'camera_reframe':
                 meta = "REFRAME"
             elif beat.get('hard_cut'):
@@ -12510,23 +12941,22 @@ def _build_partial_prompt_block(compiled_images, compiled_videos, beat_ladder,
             elif beat_is_crossing_clip(beat):
                 stage = str(beat.get('transition_stage') or '').strip().upper().replace('_', ' ')
                 meta = f"BRIDGE {stage}".strip()
-        formatted_images[idx] = {"body": img, "meta": meta}
+        item = {"body": img, "meta": meta}
+        if summary:
+            item["summary"] = summary
+        formatted_images[idx] = item
 
     # 节奏时间分配（docs/pacing_rhythm_balance_plan.md 第 3 层）：每段的 setpts 系数
     # 由拍重算出，写成 "PACE <k>" 挂进 meta。
-    #
-    # 为什么走 meta 这条路：generate_video_sequence(config, title, prompt_block, ...)
-    # 只收得到 prompt_block，节拍梯在视频阶段根本不可见（video_generator.py:779）。
-    # meta 是 compose -> 帧渲染 -> 视频 -> manifest -> 合并 全程唯一幸存的每槽位元数据
-    # 通道（[BRIDGE]/[CUT]/[HERO] 都走它），所以拍重必须在这里就换算成合并阶段直接
-    # 可用的系数——而不是把拍重原样带出去，因为合并阶段拿不到骨架、算不出参考拍重。
     rhythm = skeleton_rhythm(pacing_skeleton_id) if _RHYTHM_CLIP_TIMING else None
 
     formatted_videos = {}
     for idx, vid in compiled_videos.items():
         meta = ""
+        summary = ""
         if (idx - 1) < len(beat_ladder):
             beat = beat_ladder[idx - 1]
+            summary = _extract_slot_summary(beat, outline_plan=outline_plan)
             if rhythm is not None:
                 speed = beat_clip_speed(beat_delta_weight(beat), rhythm)
                 # 1.0 不写：运镜拍和恰好落在参考拍重上的拍不需要标签，少一层视觉噪声。
@@ -12537,14 +12967,14 @@ def _build_partial_prompt_block(compiled_images, compiled_videos, beat_ladder,
             elif beat.get('hard_cut'):
                 meta = "CUT"
             elif beat_is_crossing_clip(beat):
-                # 单一过门拍：本拍视频是唯一可见的合并跨越镜头（含 pan 变体的转向）；
-                # 'BRIDGE TURN' 供帧渲染选旋转版 i2i 控制指令，'BRIDGE' 子串保留，
-                # 所有既有 is_bridge 检测不受影响。
                 stage = str(beat.get('transition_stage') or '').strip().upper().replace('_', ' ')
                 meta = "BRIDGE TURN" if beat.get('turn_direction') else "BRIDGE"
                 if stage and stage != 'NONE':
                     meta += f" {stage}"
-        formatted_videos[idx] = {"body": vid, "meta": meta}
+        item = {"body": vid, "meta": meta}
+        if summary:
+            item["summary"] = summary
+        formatted_videos[idx] = item
 
     return formatted_images, formatted_videos, _format_prompt_block(formatted_images, formatted_videos)
 
@@ -12607,6 +13037,27 @@ def parse_sections(content):
     if not out['title']:
         out['title'] = '未命名创意'
     return out
+
+
+def prompt_block_from_output(content):
+    """从合成器的整份输出里只取 ===PROMPTS=== 那一段正文。
+
+    `call_llm` / `compose_remaining_beats` 返回的是一份**带标记的文档**：
+    `===TITLE===` / `===THEME===` / `===PROMPTS===` / `===AUDIT===`。它不是
+    prompt_block。把整份原样当提示词存下去或送去渲染，两头都会漏进交付：
+      · 头部：`===TITLE===` + 标题 + `===THEME===` + 主题这几行留在提示词正文最前面；
+      · 尾部：`===AUDIT===` 那句「skill 直出模式：…」会被 `_parse_prompt_slots` 的
+        开放式尾段正则（`(?=\\n视频\\s*\\d+|...|\\Z)`）吃进**最后一段视频**的正文里，
+        跟着这一拍原样送进 i2v。头部只是难看，尾部是真的会渲出来。
+    /api/compose 走的是 `parse_sections`；只要 block 的调用方走这里，两条线同一道口径。
+
+    没有标记的文本原样返回 —— 对已经干净的块、手动编辑过的块、断点续传读回来的块
+    都是幂等的；非字符串同样原样返回，这里只负责文本，不替调用方做类型判断。"""
+    # 没有标记就一个字都不碰（连首尾空白都不动）：已经干净的块过这里必须字节不变，
+    # 否则"手动编辑保存了什么就存什么"这条契约会被一次隐形 strip 打破。
+    if not isinstance(content, str) or '===' not in content:
+        return content
+    return (parse_sections(content).get('prompt_block') or '').strip() or content
 
 
 def _sanitize_social_line(s, max_len=250):
@@ -13539,12 +13990,14 @@ def _outline_normalized_entries(outline):
                 # 不是一回事——zone 说「活干在画面的哪一块」，space 说「机位站在哪个
                 # 封闭空间里」。序列每变一次值就是原片里的一次过门，合成期按它标记
                 # 过门拍（apply_observed_space_sequence），不透传就只剩骨架写死的那一次。
-                for key in ('space', 'zone', 'scope', 'trace', 'state_before', 'state_after'):
+                for key in ('space', 'zone', 'scope', 'trace', 'state_before', 'state_after', 'summary', 'operation_zh', 'headline_zh'):
                     value = str(entry.get(key) or '').strip()
                     if key == 'scope':
                         value = value.lower()
                     if value:
                         normalized[key] = value
+                if isinstance(entry.get('zh'), dict) and entry.get('zh'):
+                    normalized['zh'] = dict(entry['zh'])
             entries.append(normalized)
     return entries
 
@@ -14088,8 +14541,8 @@ def build_outline_plan_block(beat_outline, max_total_beats):
                 f"{_spots} — mark EACH of those beats as a crossing beat (bridge_stage per the "
                 "schema below), whatever its number, and never mark a beat whose label equals the "
                 "previous entry's. There is no fixed number of crossings: reproduce exactly the ones "
-                "listed here. Each crossing beat's video opens with the camera moving through that "
-                "opening and then, in the same unbroken clip, does that entry's own listed work; the "
+                "listed here. Each crossing beat's video depicts the pure camera move through that "
+                "opening (sterile of workers, untouched ruin); the "
                 "beat before it ends with that opening still closed or unlit, nothing of the next "
                 "space visible. Work already finished in an earlier space stays finished — a crossing "
                 "moves the camera, it never resets construction.")
@@ -14151,19 +14604,14 @@ def build_outline_plan_block(beat_outline, max_total_beats):
         # 清单自带观察到的空间序列时（复刻线），过门位置已经由上面的 SPACE 规则逐个点名，
         # 这里再写一段「挑一处边界」只会让规划器在两套口径之间二选一。
         + ("\nTHRESHOLD/CROSSING BEATS: the crossing beats of this job are the ones named in the "
-           "SPACE rule above — no others, and no dedicated crossing-only beat (that would be an "
-           "extra beat with no entry of its own, which the ONE-TO-ONE CONTRACT forbids). Each of "
-           "them still claims exactly its own single entry like every other beat.\n"
+           "SPACE rule above — each crossing beat is a pure camera transition (sterile of active workers, "
+           "carrying no construction work) through the opening into the untouched interior.\n"
            if observed_crossings else
            "\nTHRESHOLD/CROSSING BEATS (only when this project has a physical exterior-interior "
-           "boundary): do NOT create a dedicated crossing-only beat — that would be an extra beat with "
-           "no entry of its own, which the ONE-TO-ONE CONTRACT above forbids. Instead pick whichever "
-           "ONE listed entry's own work naturally happens on the interior side of that boundary (usually "
-           "the first entry whose work takes place inside), and mark THAT SAME beat as the crossing beat "
-           "(set bridge_stage/hard_cut on it per the schema below) — its video opens with the physical "
-           "crossing motion and then continues, in the same unbroken clip, into that entry's own listed "
-           "work. That beat still claims exactly its own single entry like every other beat. The entry "
-           "the camera crosses is CLOSED before that clip — the beat before it ends on a shut door/hatch "
+           "boundary): mark the crossing beat (usually the first entry whose work takes place inside, "
+           "set bridge_stage/hard_cut on it per the schema below) — its video is a pure camera transition "
+           "through the opening into the untouched interior (sterile of workers, carrying no construction tasks). "
+           "The entry the camera crosses is CLOSED before that clip — the beat before it ends on a shut door/hatch "
            "(or, on a carrier with no leaf yet, an unlit raw opening) with nothing of the interior "
            "visible — and the crossing clip itself pushes it open on camera.\n")
         +
@@ -14720,6 +15168,13 @@ def bind_outline_to_ladder(config, outline, beat_ladder, violations=None):
                 if source.get(key):
                     item[key] = source[key]
             bound_items.append(item)
+            # 丰富字段透传至当前拍，确保下游提示词槽位简介与审核能直接读取
+            if isinstance(source.get('zh'), dict) and source.get('zh'):
+                if not beat.get('zh'):
+                    beat['zh'] = dict(source['zh'])
+            for zh_key in ('summary', 'operation_zh', 'headline_zh', 'state_before', 'state_after'):
+                if source.get(zh_key) and not beat.get(zh_key):
+                    beat[zh_key] = source[zh_key]
         beat['outline_items'] = bound_items
 
     if outline_requires_occupancy(outline):

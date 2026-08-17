@@ -42,7 +42,7 @@ function buildPromptImportHeaderRe(alias) {
         + '(?:\\s*提示词|\\s*提示|\\s*prompt)?'                // 「图片提示词 3:」
         + '\\s*(?:第|no\\.?|#)?\\s*(\\d{1,3})'                // 1 槽位号（含 01 这种补零）
         + '\\s*(?:张|段|帧|号|个)?'                            // 「图片第 3 张:」
-        + '(?:\\s*[\\[（(]\\s*([^\\]）)]{0,40}?)\\s*[\\]）)])?' // 2 [META]（[HERO] 等）
+        + '((?:\\s*(?:[（\\(].*?[）\\)]|\\[.*?\\]))*)'         // 2 tags（[META] 与 （简介））
         + '\\s*([:：]|[-–—=>|~]+|、|\\.)?'                     // 3 分隔符
         + '\\s*([\\s\\S]*)$',                                 // 4 同行正文
         'i');
@@ -82,7 +82,7 @@ function stripPromptImportDecorations(line) {
 }
 
 /**
- * 宽松解析一行是否槽位头行。返回 {type, index, meta, inline} 或 null。
+ * 宽松解析一行是否槽位头行。返回 {type, index, meta, summary, inline} 或 null。
  *
  * 判定为头行的条件：别名 + 槽位号命中，**且**（有冒号类分隔符 或 该行到此为止）。
  * 少了后半条，视频正文里那句 "IMAGE 1 as the actual first-frame image…" 会被
@@ -95,6 +95,11 @@ function matchPromptImportHeader(line) {
                               ['video', PROMPT_IMPORT_VIDEO_HEADER_RE]]) {
         const m = s.match(re);
         if (!m) continue;
+        const tags = m[2] || '';
+        const summaryMatch = tags.match(/[（\(](.*?)[）\)]/);
+        const summary = summaryMatch ? summaryMatch[1].trim() : '';
+        const metaMatch = tags.match(/\[(.*?)\]/);
+        const meta = metaMatch ? metaMatch[1].trim() : '';
         const sep = m[3] || '';
         const inline = (m[4] || '').trim();
         const isColon = /^[:：]$/.test(sep);
@@ -102,16 +107,19 @@ function matchPromptImportHeader(line) {
         return {
             type,
             index: parseInt(m[1], 10),
-            meta: (m[2] || '').trim(),
+            meta,
+            summary,
             inline,
         };
     }
     return null;
 }
 
-function promptImportHeaderLine(type, index, meta) {
+function promptImportHeaderLine(type, index, meta, summary) {
     const label = type === 'image' ? '图片' : '视频';
-    return `${label} ${index}${meta ? ` [${meta}]` : ''}:`;
+    const sumStr = summary ? `（${summary}）` : '';
+    const metaStr = meta ? ` [${meta}]` : '';
+    return `${label} ${index}${sumStr}${metaStr}:`;
 }
 
 /**
@@ -183,6 +191,7 @@ function normalizePromptSetText(raw) {
                 type: header.type,
                 srcIndex: header.index,
                 meta: header.meta,
+                summary: header.summary,
                 bodyLines: [],
             };
             if (header.inline) {
@@ -332,12 +341,12 @@ function normalizePromptSetText(raw) {
     // ── 按契约布局重新输出 ──
     const out = ['图片提示词', ''];
     images.forEach(s => {
-        out.push(promptImportHeaderLine('image', s.index, s.meta), s.body, '');
+        out.push(promptImportHeaderLine('image', s.index, s.meta, s.summary), s.body, '');
     });
     if (outVideos.length) {
         out.push('视频提示词', '');
         outVideos.forEach(v => {
-            out.push(promptImportHeaderLine('video', v.index, v.meta), v.body, '');
+            out.push(promptImportHeaderLine('video', v.index, v.meta, v.summary), v.body, '');
         });
     }
 

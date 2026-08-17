@@ -1140,6 +1140,10 @@ html[data-theme="dark"] .task-status-badge.completed {
 }
 
 .mobile-nav-btn {
+    /* 状态角标（.replica-tab-status-dot）绝对定位挂在按钮上，按钮必须是定位上下文。
+       没有这一条时最近的定位祖先是 .mobile-nav-tabs（nav-customize.css 给的），
+       角标会飘到整条标签栏的右上角，而不是它要标注的那一个标签上。 */
+    position: relative;
     flex: 1;
     background: transparent;
     border: none;
@@ -1161,6 +1165,48 @@ html[data-theme="dark"] .task-status-badge.completed {
     color: var(--neon-cyan);
     border: 1px solid rgba(176, 123, 82, 0.2);
     box-shadow: 0 0 10px rgba(176, 123, 82, 0.1);
+}
+
+/* ── 复刻标签页常驻状态指示点 ──────────────────────────────────
+   切走之后也要知道那条 job 在等你：跑着=蓝点呼吸，停在人工卡点=橙点，有硬伤=红点。
+   这一段必须待在任何媒体查询**之外** —— 它原先被写在 max-width:768px 块里，
+   于是桌面上 replicaUpdateTabBadge() 造出来的是个完全没有样式的空 span。 */
+.replica-tab-status-dot {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #a1a1aa;
+    pointer-events: none;
+}
+
+.replica-tab-status-dot.is-error {
+    background: #ef4444;
+    box-shadow: 0 0 6px rgba(239, 68, 68, 0.6);
+}
+
+.replica-tab-status-dot.is-running {
+    background: #3b82f6;
+    box-shadow: 0 0 6px rgba(59, 130, 246, 0.6);
+    animation: replicaDotPulse 1.5s infinite;
+}
+
+.replica-tab-status-dot.is-pause {
+    background: #f59e0b;
+    box-shadow: 0 0 6px rgba(245, 158, 11, 0.6);
+}
+
+@keyframes replicaDotPulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.85); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .replica-tab-status-dot.is-running {
+        animation: none;
+    }
 }
 
 /* =====================================================================
@@ -1406,6 +1452,7 @@ html[data-theme="dark"] .task-status-badge.completed {
         white-space: nowrap;
         min-width: 0;
         overflow: hidden;
+        position: relative;
     }
 
     .mobile-nav-btn .btn-text {
@@ -1416,6 +1463,18 @@ html[data-theme="dark"] .task-status-badge.completed {
     .mobile-nav-btn .btn-icon {
         font-size: 13px;
     }
+
+@media (max-width: 480px) {
+    .mobile-nav-btn:not(.active) .btn-text {
+        display: none;
+    }
+    .mobile-nav-btn.active {
+        flex: 1 0 auto;
+    }
+    .mobile-nav-btn.active .btn-text {
+        display: inline;
+    }
+}
 
     /* — 头部：标题列 + 横滑操作条上下堆叠，不再左右对挤 — */
     .content-header {
@@ -1524,6 +1583,43 @@ html[data-theme="dark"] .task-status-badge.completed {
         padding: 12px;
         font-size: 11.5px;
         line-height: 1.6;
+    }
+    .prompt-display-container {
+        padding: 10px;
+        gap: 12px;
+    }
+    .prompt-item-card {
+        padding: 10px 12px;
+    }
+    .prompt-item-body {
+        font-size: 11.5px;
+        line-height: 1.6;
+        padding: 8px 10px;
+    }
+    .prompt-section-header {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+    .prompt-item-header {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+    .prompt-item-actions {
+        flex-wrap: wrap;
+    }
+    .prompt-history-modal-body {
+        flex-direction: column;
+    }
+    .prompt-history-sidebar {
+        width: 100%;
+        max-height: 180px;
+        border-right: none;
+        border-bottom: 1px solid var(--border-color);
+    }
+    .prompt-history-modal-footer {
+        flex-direction: column;
+        gap: 12px;
+        align-items: flex-start;
     }
     .prompt-editor { min-height: 300px; }
     /* 四个按钮 + 复制在窄屏一行放不下，允许折行 */
@@ -2536,6 +2632,38 @@ body.log-expanded .log-pill {
     z-index: 10;
     pointer-events: none;
     box-shadow: 0 2px 4px rgba(0,0,0,0.4);
+}
+
+.candidate-selection-badge {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    background: linear-gradient(135deg, #10b981, #059669);
+    color: #fff;
+    padding: 2px 6px;
+    font-size: 9px;
+    border-radius: 4px;
+    font-weight: bold;
+    z-index: 10;
+    cursor: pointer;
+    box-shadow: 0 2px 6px rgba(16, 185, 129, 0.4);
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+}
+
+.candidate-selection-badge:hover {
+    transform: scale(1.05);
+    background: #059669;
+}
+
+.view-candidates-btn {
+    border-color: rgba(16, 185, 129, 0.5) !important;
+    color: #10b981 !important;
+}
+
+.view-candidates-btn:hover {
+    background: rgba(16, 185, 129, 0.15) !important;
 }
 
 /* 人工主动标记的问题帧（manual_issue，见 describeFrameIssue）：与机器判定的

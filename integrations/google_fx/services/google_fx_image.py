@@ -87,6 +87,12 @@ def _reference_mount_error(message):
     return ReferenceMountError(f"REFERENCE_MOUNT_FAILED: {message}")
 
 
+from .google_fx_credit import (
+    is_credit_exhausted_message,
+    detect_page_credit_exhaustion,
+)
+
+
 def _is_login_required_failure(reason):
     text = str(reason or "").lower()
     return any(token in text for token in (
@@ -115,9 +121,10 @@ def _cooldown_current_login_account(reason):
 
 def _is_quota_failure(reason):
     text = str(reason or "").lower()
-    return any(token in text for token in (
+    return is_credit_exhausted_message(text) or any(token in text for token in (
         "quota", "配额", "额度耗尽", "credits exhausted",
         "insufficient credits", "not enough credits", "resource_exhausted",
+        "quota_exhausted", "insufficient_credits",
     ))
 
 
@@ -477,9 +484,11 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
 
 
             # 🛠️ 2. 验证配置 (Image 模式)
+            target_count_cfg = getattr(req, "generation_count", None) or ("4x" if getattr(req, "is_candidate_mode", False) else "1x")
             selected_ratio = _verify_and_fix_fx_config(
                 page, model=req.model, ratio=req.ratio,
                 want_video=False, context_label="图片生成",
+                count=target_count_cfg,
             )
             # 2026-08-01 清理：此处原有一个 36 行的 _wait_for_new_panel_image() 闭包
             # （轮询 add_2 面板等新 UUID、带 cancel chip 早退哨兵）。它定义了但从未被
@@ -698,6 +707,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
 
             local_paths = []       # 最终保存的本地路径列表
             all_result_urls = []   # 对应的网络 URL（用于面板 UUID 提取）
+            last_failed_detail = [None]  # 记录卡片/页面级真实报错信息（避免被超时通配文本覆盖）
 
             def _download_image(img_url, save_idx):
                 """下载单张图到本地，返回 local_path 或 None"""
@@ -762,6 +772,86 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     except Exception as e:
                         log(f"  ⚠️ Browser fetch 下载失败: {e}", "GoogleFX")
                         return None
+
+            def _scan_new_result_tiles(known_tile_ids=None):
+                """一次 evaluate 同时取回「新 tile 里的媒体」「全页媒体 src」「新 tile 是否已报错」。"""
+                try:
+                    result = page.evaluate("""(beforeIds) => {
+                        const before = new Set(beforeIds || []);
+                        const rows = [];
+                        const mediaSrcs = [];
+                        let failed = null;
+
+                        const isMediaSrc = (lower) => lower.includes('getmediaurlredirect')
+                            || lower.includes('flow-content.google')
+                            || lower.includes('storage.googleapis.com')
+                            || lower.includes('googleusercontent.com')
+                            || lower.includes('ggpht.com');
+
+                        for (const img of document.querySelectorAll('img')) {
+                            const src = img.currentSrc || img.getAttribute('src') || '';
+                            if (src && isMediaSrc(src.toLowerCase())) mediaSrcs.push(src);
+                        }
+
+                        const isVisible = (el) => {
+                            let cur = el;
+                            while (cur) {
+                                const style = window.getComputedStyle(cur);
+                                if (style.display === 'none' || style.visibility === 'hidden'
+                                    || parseFloat(style.opacity) === 0) {
+                                    return false;
+                                }
+                                cur = cur.parentElement;
+                            }
+                            return true;
+                        };
+
+                        for (const tile of document.querySelectorAll('div[data-tile-id]')) {
+                            const tileId = tile.getAttribute('data-tile-id') || '';
+                            if (!tileId || before.has(tileId)) continue;
+
+                            for (const img of tile.querySelectorAll('img')) {
+                                const src = img.currentSrc || img.getAttribute('src') || '';
+                                if (!src) continue;
+                                const lower = src.toLowerCase();
+                                const looksLikeMedia = isMediaSrc(lower)
+                                    || lower.startsWith('blob:')
+                                    || lower.startsWith('data:image/');
+                                const largeEnough = img.naturalWidth >= 128 && img.naturalHeight >= 128;
+                                if (looksLikeMedia && largeEnough) rows.push({tileId, src});
+                            }
+
+                            if (failed) continue;
+                            const t = (tile.innerText || '').toLowerCase();
+                            const creditTokens = [
+                                'credit', 'credits', 'quota', 'exhausted', 'insufficient',
+                                '积分', '点数', '额度', '配额', 'run out', 'out of'
+                            ];
+                            const hasCreditExhaustedText = creditTokens.some(tok => t.includes(tok)) && (
+                                t.includes('0') || t.includes('no ') || t.includes('not enough')
+                                || t.includes('insufficient') || t.includes('out of') || t.includes('exhausted')
+                                || t.includes('不足') || t.includes('已用完') || t.includes('耗尽')
+                                || t.includes('无可用') || t.includes('没有') || t.includes('缺少')
+                            );
+                            const hasFailText = t.includes('failed') || t.includes('something went wrong')
+                                             || t.includes('unusual activity') || t.includes('help center')
+                                             || t.includes('出错了') || t.includes('生成失败')
+                                             || t.includes('失败') || t.includes('使用人数过多')
+                                             || hasCreditExhaustedText;
+                            if (!hasFailText) continue;
+                            const hasWarningIcon = Array.from(tile.querySelectorAll('i')).some((i) => {
+                                const txt = (i.innerText || i.textContent || '').trim().toLowerCase();
+                                const isWarning = txt === 'warning' || txt === 'error' || txt === 'error_outline';
+                                return isWarning && isVisible(i);
+                            });
+                            if (hasWarningIcon || hasCreditExhaustedText) failed = {text: tile.innerText, isCreditExhausted: hasCreditExhaustedText};
+                        }
+                        return {rows, mediaSrcs, failed};
+                    }""", list(known_tile_ids or []))
+                except Exception as e:
+                    log(f"  ⚠️ 新结果 tile 扫描失败: {type(e).__name__}", "GoogleFX")
+                    return {"rows": [], "mediaSrcs": [], "failed": None}
+                return result or {"rows": [], "mediaSrcs": [], "failed": None}
 
             def _wait_for_net_url(submit_ts_this, timeout=None, known_tile_ids_before_submit=None,
                                    known_net_urls_before_submit=None,
@@ -915,17 +1005,28 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
 
                                 if (failed) continue;
                                 const t = (tile.innerText || '').toLowerCase();
+                                const creditTokens = [
+                                    'credit', 'credits', 'quota', 'exhausted', 'insufficient',
+                                    '积分', '点数', '额度', '配额', 'run out', 'out of'
+                                ];
+                                const hasCreditExhaustedText = creditTokens.some(tok => t.includes(tok)) && (
+                                    t.includes('0') || t.includes('no ') || t.includes('not enough')
+                                    || t.includes('insufficient') || t.includes('out of') || t.includes('exhausted')
+                                    || t.includes('不足') || t.includes('已用完') || t.includes('耗尽')
+                                    || t.includes('无可用') || t.includes('没有') || t.includes('缺少')
+                                );
                                 const hasFailText = t.includes('failed') || t.includes('something went wrong')
                                                  || t.includes('unusual activity') || t.includes('help center')
                                                  || t.includes('出错了') || t.includes('生成失败')
-                                                 || t.includes('失败') || t.includes('使用人数过多');
+                                                 || t.includes('失败') || t.includes('使用人数过多')
+                                                 || hasCreditExhaustedText;
                                 if (!hasFailText) continue;
                                 const hasWarningIcon = Array.from(tile.querySelectorAll('i')).some((i) => {
                                     const txt = (i.innerText || i.textContent || '').trim().toLowerCase();
                                     const isWarning = txt === 'warning' || txt === 'error' || txt === 'error_outline';
                                     return isWarning && isVisible(i);
                                 });
-                                if (hasWarningIcon) failed = {text: tile.innerText};
+                                if (hasWarningIcon || hasCreditExhaustedText) failed = {text: tile.innerText, isCreditExhausted: hasCreditExhaustedText};
                             }
                             return {rows, mediaSrcs, failed};
                         }""", list(known_tile_ids_before_submit or []))
@@ -987,7 +1088,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     # association evidence.  Flow also lazy-loads historical canvas tiles
                     # after Send, so page-wide media is only ever used to corroborate a
                     # network candidate that already survived the pre-submit baselines.
-                    tile_scan = _scan_new_result_tiles()
+                    tile_scan = _scan_new_result_tiles(known_tile_ids_before_submit)
                     new_tile_rows = tile_scan.get("rows") or []
                     new_failed_tile = tile_scan.get("failed")
                     confirmed_new_tile_uuids = {
@@ -1052,8 +1153,10 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     # 顺序仍是先 B 后 C：同一轮里既拿到媒体又检测到报错时，媒体优先，
                     # 与合并前的行为一致。
                     if new_failed_tile:
+                        failed_text = str(new_failed_tile.get('text') or '').strip()
                         log(f"  ❌ 检测到新提交卡片已报错失败: "
-                            f"{str(new_failed_tile.get('text') or '')[:100]}", "GoogleFX")
+                            f"{failed_text[:100]}", "GoogleFX")
+                        last_failed_detail[0] = failed_text or "卡片报错生成失败"
                         return None
 
                     elapsed = int(deadline - time.time())
@@ -1079,6 +1182,11 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                             log(f"  📡 路径A 网络捕获: {hit[:80]}...", "GoogleFX")
                             return hit
                         _check_cancelled()
+
+                # 超时前主动扫描一次页面是否存在积分/配额耗尽提示
+                page_credit_err = detect_page_credit_exhaustion(page)
+                if page_credit_err:
+                    last_failed_detail[0] = page_credit_err
 
                 return None
 
@@ -1117,6 +1225,173 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
             if consumed_media_uuids:
                 log(f"  📒 已加载账号 {ledger_account_id} 的历史媒体台账: "
                     f"{len(consumed_media_uuids)} 条", "GoogleFX")
+
+            def _wait_for_candidate_urls(submit_ts_this, target_count=4, timeout=None,
+                                         known_tile_ids_before_submit=None,
+                                         known_net_urls_before_submit=None,
+                                         known_dom_srcs_before_submit=None,
+                                         blocked_media_uuids=None):
+                """4选1候选图模式：单次提交 x4 后统一等待并捕获所有候选图 URL。"""
+                timeout = timeout or get_runtime_max_wait_seconds()
+                deadline = time.time() + timeout
+                known_net = set(known_net_urls_before_submit or ())
+                if known_net_urls_before_submit is None:
+                    known_net = set(url for ts, url in captured_data if ts < submit_ts_this)
+
+                known_dom_srcs = set(known_dom_srcs_before_submit or ())
+                blocked_media_uuids = {
+                    str(value).lower() for value in (blocked_media_uuids or ()) if value
+                }
+                collected = []
+                seen_uuids = set()
+
+                poll_count = 0
+                while time.time() < deadline:
+                    _check_cancelled()
+                    poll_count += 1
+
+                    tile_scan = _scan_new_result_tiles(known_tile_ids_before_submit)
+                    new_tile_rows = tile_scan.get("rows") or []
+                    confirmed_new_tile_uuids = {
+                        _extract_media_uuid(row.get("src"))
+                        for row in new_tile_rows
+                        if _extract_media_uuid(row.get("src"))
+                    }
+                    post_submit_dom_uuids = {
+                        _extract_media_uuid(src)
+                        for src in (tile_scan.get("mediaSrcs") or [])
+                        if src and src not in known_dom_srcs and _extract_media_uuid(src)
+                    }
+
+                    # 1. 扫描网络捕获 captured_data
+                    for ts, url in list(captured_data):
+                        if ts >= submit_ts_this - 1 and url not in known_net:
+                            m_uuid = _extract_media_uuid(url)
+                            if m_uuid and m_uuid not in seen_uuids and not _is_blocked_media_candidate(url, blocked_media_uuids):
+                                in_new_tile = m_uuid in confirmed_new_tile_uuids
+                                confirmed = in_new_tile or (m_uuid in post_submit_dom_uuids)
+                                if confirmed or _is_generated_candidate_stable(submit_ts_this, confirmed_new_tile=in_new_tile):
+                                    seen_uuids.add(m_uuid)
+                                    collected.append(url)
+                                    log(f"  🎯 捕获候选图 ({len(collected)}/{target_count}): {url[:70]}...", "GoogleFX")
+                                    if len(collected) >= target_count:
+                                        return collected
+
+                    # 2. 扫描 DOM 新 tile
+                    for row in new_tile_rows:
+                        src = row.get("src")
+                        if src and src not in known_dom_srcs:
+                            m_uuid = _extract_media_uuid(src)
+                            if m_uuid and m_uuid not in seen_uuids and not _is_blocked_media_candidate(src, blocked_media_uuids):
+                                full_url = _absolute_media_url(src)
+                                if full_url:
+                                    seen_uuids.add(m_uuid)
+                                    collected.append(full_url)
+                                    log(f"  🎯 从新 tile 捕获候选图 ({len(collected)}/{target_count}): {full_url[:70]}...", "GoogleFX")
+                                    if len(collected) >= target_count:
+                                        return collected
+
+                    if len(collected) >= target_count:
+                        return collected
+
+                    if len(collected) >= 1 and (time.time() - submit_ts_this) > 45:
+                        return collected
+
+                    page.wait_for_timeout(400)
+
+                return collected
+
+            if getattr(req, "is_candidate_mode", False):
+                prompt_text = prompts[0]
+                has_ref_for_this_prompt = bool(valid_refs)
+                if has_ref_for_this_prompt:
+                    refs_before_prompt = _get_prompt_reference_uuids(page, limit=8)
+                    if refs_before_prompt:
+                        filled = _fill_text_only(prompt_text, 0, has_ref=True)
+                    else:
+                        _ref_ready, _ = _wait_for_flow_reference_ready(page, timeout_seconds=45)
+                        filled = _fill_text_only(prompt_text, 0, has_ref=_ref_ready)
+                else:
+                    filled = _fill_text_only(prompt_text, 0, has_ref=False)
+
+                if not filled:
+                    raise RuntimeError("候选图提示词输入失败")
+
+                try:
+                    input_el.click(); random_sleep(0.1, 0.2)
+                    page.keyboard.press("End")
+                    page.keyboard.type(" "); random_sleep(0.15, 0.25)
+                    if not has_ref_for_this_prompt:
+                        page.keyboard.press("Backspace"); random_sleep(0.1, 0.2)
+                except Exception as e:
+                    log(f"  ⚠️ React state 触发: {e}", "GoogleFX")
+
+                random_sleep(1.0, 2.0)
+                try:
+                    pre_submit_tile_ids = set(page.evaluate("""() => {
+                        return Array.from(document.querySelectorAll('div[data-tile-id]'))
+                            .map(card => card.getAttribute('data-tile-id') || '')
+                            .filter(Boolean);
+                    }"""))
+                except Exception:
+                    pre_submit_tile_ids = set()
+
+                pre_submit_known_net_urls = {url for _ts, url in captured_data}
+                try:
+                    pre_submit_dom_srcs = set(page.evaluate("""() => {
+                        const isMediaSrc = (lower) => lower.includes('getmediaurlredirect')
+                            || lower.includes('flow-content.google')
+                            || lower.includes('storage.googleapis.com')
+                            || lower.includes('googleusercontent.com')
+                            || lower.includes('ggpht.com');
+                        return Array.from(document.querySelectorAll('img'))
+                            .map(img => img.currentSrc || img.getAttribute('src') || '')
+                            .filter(src => src && isMediaSrc(src.toLowerCase()));
+                    }"""))
+                except Exception:
+                    pre_submit_dom_srcs = set()
+
+                prompt_reference_uuids = set(_get_prompt_reference_uuids(page, limit=8))
+                pre_submit_media_uuids = (
+                    set(_get_panel_uuids(page))
+                    | prompt_reference_uuids
+                    | consumed_media_uuids
+                    | {
+                        str(value).lower()
+                        for value in (getattr(req, "excluded_media_uuids", None) or [])
+                        if value
+                    }
+                )
+
+                click_fx_send_button(page, input_el)
+                note_fx_submit()
+                submit_ts_this = time.time()
+                log(f"🚀 [4选1 智能候选] 已单次提交 prompt (x4 模式)，等待 4 张候选图同步生成...", "GoogleFX")
+
+                candidate_urls = _wait_for_candidate_urls(
+                    submit_ts_this,
+                    target_count=4,
+                    timeout=get_runtime_max_wait_seconds(),
+                    known_tile_ids_before_submit=pre_submit_tile_ids,
+                    known_net_urls_before_submit=pre_submit_known_net_urls,
+                    known_dom_srcs_before_submit=pre_submit_dom_srcs,
+                    blocked_media_uuids=pre_submit_media_uuids,
+                )
+
+                for c_idx, c_url in enumerate(candidate_urls):
+                    log(f"⬇️  下载候选图 #{c_idx+1}/{len(candidate_urls)}...", "GoogleFX")
+                    lp = _download_image(c_url, c_idx)
+                    if lp and os.path.exists(lp) and os.path.getsize(lp) > 0:
+                        local_paths.append(lp)
+
+                if local_paths:
+                    result["status"] = "success"
+                    result["image_urls"] = local_paths
+                    result["message"] = f"成功生成 {len(local_paths)} 张候选图"
+                    log(f"🎉 [4选1 智能候选] 4x 批量生成完成，共获得 {len(local_paths)} 张候选图", "GoogleFX")
+                    return result
+                else:
+                    raise RuntimeError("4选1 候选图生成未捕获到有效图片")
 
             for idx, prompt_text in enumerate(prompts):
                 _check_cancelled()
@@ -1298,7 +1573,13 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     # mapping.  Stop here and return the durable successful prefix;
                     # the SPARK layer resumes from this exact index.
                     result["failed_index"] = idx
-                    result["message"] = f"第 {idx+1} 张图超时未捕获到 URL"
+                    fail_detail = last_failed_detail[0]
+                    if not fail_detail:
+                        fail_detail = detect_page_credit_exhaustion(page)
+                    if fail_detail:
+                        result["message"] = f"第 {idx+1} 张图生成失败: {fail_detail}"
+                    else:
+                        result["message"] = f"第 {idx+1} 张图超时未捕获到 URL"
                     log(f"⚠️ {result['message']}，停止本批并保留前 {len(local_paths)} 张成功结果", "GoogleFX")
                     break
 
@@ -1413,7 +1694,7 @@ def _generate_images_batch_google_fx_unlocked(req: ImageBatchRequest):
         log(f"🔄 开始第 {attempt}/{max_retries} 次图片生成尝试...", "GoogleFX")
         try:
             result = _generate_images_batch_google_fx_single_attempt(req)
-            if result.get("status") in ("success", "partial"):
+            if result.get("status") in ("success", "partial", "ok"):
                 result["attempts_used"] = attempt
                 images = result.get("image_urls") or []
                 if images:
@@ -1466,7 +1747,7 @@ def _generate_images_batch_google_fx_unlocked(req: ImageBatchRequest):
             # 每次都要关浏览器重连、把 Flow 登录 token 越打越松。
             log(f"⚠️ 第 {attempt} 次图片生成失败: {e}，"
                 f"{'准备换号重试' if should_switch else '原地冷却重试（不换号）'}：{verdict}", "GoogleFX")
-            cooldown_time = 0 if _is_login_required_failure(e) else 15 * attempt
+            cooldown_time = 0 if (_is_login_required_failure(e) or _is_quota_failure(e)) else 15 * attempt
             if cooldown_time:
                 log(f"🕐 冷却等待 {cooldown_time} 秒...", "GoogleFX")
                 _cancellable_sleep(cooldown_time)

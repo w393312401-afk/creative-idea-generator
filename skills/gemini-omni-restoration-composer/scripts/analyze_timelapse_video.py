@@ -292,19 +292,19 @@ def build_analysis_plan(
 ) -> dict[str, Any]:
     """Adaptive dense analysis rate.
 
-    Small clips go to semantic review in full. Longer clips send at least forty percent of
+    Small clips go to semantic review in full. Longer clips send at least seventy percent of
     extracted frames, never fewer than one per second, and always include the first frame,
     the last frame, per-second baselines, and every change event's start / peak / end plus
-    the frames either side of each peak.
+    the frames adjacent to each.
     """
     total = len(review_entries)
     if total == 0:
         return {"mode": "empty", "required_frames": [], "required_count": 0, "total_frames": 0}
 
-    if total <= 90:
+    if total <= 120:
         return {
             "mode": "full",
-            "rule": "clip has ninety extracted frames or fewer; send every extracted frame",
+            "rule": "clip has 120 extracted frames or fewer; send every extracted frame",
             "total_frames": total,
             "required_count": total,
             "required_frames": [Path(entry["frame_path"]).name for entry in review_entries],
@@ -322,16 +322,16 @@ def build_analysis_plan(
         required.add(best_index)
         second += 1.0
 
-    # Every event's start / peak / end, with the frames either side of the peak.
+    # Every event's start / peak / end, with the frames adjacent to each keypoint.
     name_to_index = {Path(entry["frame_path"]).name: i for i, entry in enumerate(review_entries)}
     for event in change_events:
-        for name in nearest_frames(review_entries, [event["start"], event["end"]], neighbours=0):
+        for name in nearest_frames(review_entries, [event["start"], event["end"]], neighbours=1):
             required.add(name_to_index[name])
         for name in nearest_frames(review_entries, [event["peak"]], neighbours=1):
             required.add(name_to_index[name])
 
-    # Top up to the forty-percent floor with an even spread over frames not yet chosen.
-    floor_count = math.ceil(total * 0.4)
+    # Top up to the seventy-percent floor with an even spread over frames not yet chosen.
+    floor_count = math.ceil(total * 0.7)
     if len(required) < floor_count:
         remaining = [i for i in range(total) if i not in required]
         needed = floor_count - len(required)
@@ -344,9 +344,9 @@ def build_analysis_plan(
     return {
         "mode": "adaptive",
         "rule": (
-            "clip exceeds ninety extracted frames; send at least forty percent, never fewer "
+            "clip exceeds 120 extracted frames; send at least seventy percent, never fewer "
             "than one per second, with forced first/last, per-second baselines, and every "
-            "change event's start, peak, end and the frames adjacent to each peak"
+            "change event's start, peak, end and the adjacent frames"
         ),
         "total_frames": total,
         "required_count": len(ordered),

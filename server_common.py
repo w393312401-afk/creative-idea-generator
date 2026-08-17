@@ -2491,12 +2491,21 @@ def _win_explorer_title_matches(title, folder):
     标题不是裸的文件夹名，而是「videos - 文件资源管理器」这种带应用名后缀的形式
     （开了"标题栏显示完整路径"则是全路径 + 同样的后缀），所以按"名字 + 分隔空格"
     前缀匹配，不能按相等匹配——最初按相等写，结果一个都匹配不上，窗口照样留在后面。
+
+    路径一律用 ntpath 拆，不用 os.path：这个函数只在 Windows 上被调用，但它收到的
+    永远是 Windows 路径，而 os.path 在 macOS / Linux 上是 posixpath——反斜杠不是
+    分隔符，`basename(r'C:\\out\\proj\\videos')` 会把整串原样还回来，names 里于是
+    根本没有 'videos' 这一项，只有"标题栏显示完整路径"那一种标题还能匹配上。
+    在 Windows 上 ntpath 就是 os.path，所以生产行为一个字都没变；换成它是为了让
+    这个 Windows-only 的判据在任何平台上都跑得出正确结果、也测得了。
     """
+    import ntpath
+
     t = (title or '').strip().lower()
     if not t:
         return False
-    folder = os.path.normpath(folder or '')
-    names = {n.lower() for n in (os.path.basename(folder), folder) if n}
+    folder = ntpath.normpath(folder or '')
+    names = {n.lower() for n in (ntpath.basename(folder), folder) if n}
     return any(t == n or t.startswith(n + ' ') for n in names)
 
 
@@ -4047,6 +4056,87 @@ def load_tasks_from_disk(tasks_dir=None):
             print(f"[TASKS] 已把 {len(legacy_ids)} 个任务记录迁移到拆分形态"
                   f"（meta / events.jsonl / results）")
 
+    # 复刻账本治理迁移：清理孤儿复刻任务，并收敛 paused 状态为 completed
+    try:
+        migrate_cleanup_orphan_replica_tasks(tasks_dir=root)
+    except Exception as e:
+        if sys.stdout:
+            print(f"[WARN] 复刻任务孤儿清理迁移失败: {e}")
+
+
+def migrate_cleanup_orphan_replica_tasks(tasks_dir=None, jobs_root_dir=None):
+    """清理指向不存在 job 的复刻孤儿 task，并将残留的 paused 复刻 task 状态收敛为 completed。"""
+    root = tasks_dir or TASKS_DIR
+    jroot = jobs_root_dir or os.path.join(OUTPUT_ROOT, 'replica_jobs')
+    if not os.path.isdir(root):
+        return {'cleaned_orphans': 0, 'migrated_paused': 0}
+
+    cleaned_orphans = 0
+    migrated_paused = 0
+
+    with ACTIVE_TASKS_LOCK:
+        active_items = list(ACTIVE_TASKS.items())
+
+    for tid, t in active_items:
+        if not _is_replica_task(t):
+            continue
+        dims = t.get('dimensions') if isinstance(t.get('dimensions'), dict) else {}
+        job_id = _replica_job_of(dims)
+
+        job_exists = False
+        if job_id and os.path.isdir(os.path.join(jroot, job_id)):
+            job_exists = True
+
+        if not job_exists and job_id:
+            # 孤儿任务：指向已不存在的 job
+            with ACTIVE_TASKS_LOCK:
+                ACTIVE_TASKS.pop(tid, None)
+            delete_task_files(tid, tasks_dir=root)
+            cleaned_orphans += 1
+        elif t.get('status') == 'paused':
+            # 状态收敛：paused -> completed
+            with ACTIVE_TASKS_LOCK:
+                if tid in ACTIVE_TASKS:
+                    ACTIVE_TASKS[tid]['status'] = 'completed'
+            save_task_to_disk(tid, tasks_dir=root)
+            migrated_paused += 1
+
+    # 磁盘防漏扫描：检查磁盘上存在但不在内存中的复刻任务文件
+    try:
+        with ACTIVE_TASKS_LOCK:
+            active_fids = {_task_file_id(k) for k in ACTIVE_TASKS}
+        for fname in os.listdir(root):
+            if not fname.endswith('.json'):
+                continue
+            fid = fname[:-5]
+            if fid in active_fids:
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as fp:
+                    mdata = json.load(fp)
+                if not _is_replica_task(mdata):
+                    continue
+                mdims = mdata.get('dimensions') if isinstance(mdata.get('dimensions'), dict) else {}
+                mjob_id = _replica_job_of(mdims)
+                if mjob_id and not os.path.isdir(os.path.join(jroot, mjob_id)):
+                    delete_task_files(fid, tasks_dir=root)
+                    cleaned_orphans += 1
+                elif mdata.get('status') == 'paused':
+                    mdata['status'] = 'completed'
+                    write_json_atomic(fpath, mdata)
+                    migrated_paused += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if (cleaned_orphans or migrated_paused) and sys.stdout:
+        print(f"[REPLICA] 账本治理迁移完成: 清理孤儿任务 {cleaned_orphans} 条，收敛 paused 状态 {migrated_paused} 条")
+
+    return {'cleaned_orphans': cleaned_orphans, 'migrated_paused': migrated_paused}
+
+
 
 def ensure_task_project_key(task_id, dimensions):
     """在 dimensions 里就位 project_key，并返回它。
@@ -4360,9 +4450,8 @@ def cleanup_old_tasks():
 # 结果是失败的媒体任务完全不可见；这里改成挂成子作业，失败照样看得到）。
 MEDIA_TASK_TYPES = frozenset({'frames', 'staged_render', 'videos', 'cover'})
 
-# 复刻线的任务：同一条 job 会先 start 再 advance 好几次，每次一个 task_id。它们
-# 说的是同一个项目，必须按 job 收成一行，否则工作台上会出现 N 行同名记录。
-REPLICA_TASK_TYPES = frozenset({'replica', 'replica_extract', 'replica_advance'})
+# 复刻线的任务类型：抽帧 / Pass A / Pass B / 节拍推进 / 提示词合成 / 正交发散等
+REPLICA_TASK_TYPES = frozenset({'replica', 'replica_extract', 'replica_advance', 'replica_mutate'})
 
 _PROJECT_TITLE_PREFIXES = ('做一个', '做个', '设计一个', '设计个')
 
@@ -4515,11 +4604,99 @@ def _proj_blank(project_key, kind='project'):
     }
 
 
+def task_has_cover(task, base_dir=None, library_items=None):
+    """判断一条任务记录是否拥有关联的封面图片。
+
+    检测来源：
+    1. 任务自身结果 (result.covers / result.cover / result.activeCoverUrl / result.cover_image)
+    2. 任务 dimensions 中的封面声明 (dimensions.covers / dimensions.cover 等)
+    3. 点子库条目 (item_project_cover)
+    4. outputs/ 本地磁盘项目资产 (通过 _proj_asset_stats / manifest 登记)
+    """
+    if not isinstance(task, dict):
+        return False
+
+    # 1. 检查 result
+    result = task.get('result') if isinstance(task.get('result'), dict) else {}
+    covers = result.get('covers')
+    if isinstance(covers, list) and any(bool(c and str(c).strip()) for c in covers):
+        return True
+    for key in ('cover', 'activeCoverUrl', 'cover_image', 'active_cover'):
+        val = result.get(key)
+        if val and str(val).strip():
+            return True
+
+    # 2. 检查 dimensions
+    dims = task.get('dimensions') if isinstance(task.get('dimensions'), dict) else {}
+    for key in ('covers', 'cover', 'activeCoverUrl', 'cover_image'):
+        val = dims.get(key)
+        if isinstance(val, list) and any(bool(c and str(c).strip()) for c in val):
+            return True
+        if isinstance(val, str) and val.strip():
+            return True
+
+    # 3. 检查点子库
+    tid = task.get('id')
+    project_key = result.get('project_key') or dims.get('project_key') or ''
+    title = result.get('title') or dims.get('task_label') or dims.get('theme') or ''
+
+    if library_items is None:
+        try:
+            library_items = read_library() or []
+        except Exception:
+            library_items = []
+
+    if library_items:
+        for item in library_items:
+            if not isinstance(item, dict):
+                continue
+            if (tid and item.get('id') == tid) or \
+               (project_key and item.get('project_key') == project_key) or \
+               (title and item.get('title') == title):
+                cov = item_project_cover(item)
+                if cov and str(cov).strip():
+                    return True
+
+    # 4. 检查 outputs/ 磁盘资产
+    if base_dir and (project_key or title):
+        try:
+            stats = _proj_asset_stats(project_key, title, base_dir)
+            if stats and stats.get('cover'):
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _is_replica_task(task):
+    """判断是否为爆款复刻模块的任务。
+
+    复刻模块的所有流水线任务（视频抽帧/Pass A/Pass B/节拍阶梯/提示词合成/正交变体等）
+    仅在其专属的爆款复刻工作台中流转与管理，不作为激发任务或子作业出现在「项目」工作台（/api/projects）中。
+    """
+    if not isinstance(task, dict):
+        return False
+    dims = task.get('dimensions') if isinstance(task.get('dimensions'), dict) else {}
+    task_type = str(dims.get('type') or '').strip()
+    if task_type in REPLICA_TASK_TYPES or task_type.startswith('replica'):
+        return True
+    if dims.get('replica_job_id'):
+        return True
+    task_id = str(task.get('id') or '').strip()
+    if task_id.startswith('replica'):
+        return True
+    return False
+
+
 def _replica_job_of(dims):
     """任务属于哪条复刻 job。老任务（2026-08-10 之前）dimensions 里只有 theme=job_id。"""
-    if dims.get('type') not in REPLICA_TASK_TYPES:
+    if not isinstance(dims, dict):
         return ''
-    return str(dims.get('replica_job_id') or dims.get('theme') or '').strip()
+    task_type = str(dims.get('type') or '').strip()
+    if task_type in REPLICA_TASK_TYPES or task_type.startswith('replica') or dims.get('replica_job_id'):
+        return str(dims.get('replica_job_id') or dims.get('theme') or '').strip()
+    return ''
 
 
 def _replica_live_name(job_id, cache):
@@ -4642,26 +4819,20 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
         return task.get('result') if isinstance(task.get('result'), dict) else {}
 
     # ── 1. 激发任务：项目表的脊柱，project_key 由它产生 ──────────────────
-    replica_names = {}
     for task in tasks:
+        if _is_replica_task(task):
+            continue
         dims = dims_of(task)
         if dims.get('type') in MEDIA_TASK_TYPES:
             continue
         result = result_of(task)
         title = result.get('title') or dims.get('task_label') or dims.get('theme') or ''
-        replica_job = _replica_job_of(dims)
-        if replica_job:
-            # 复刻线按 job 收行，键不能用 task_id（那会一次跑法一行）。名字现算，
-            # 好让 compose 出标题后整行跟着改名。
-            key = f"replica:{replica_job}"
-            title = _replica_live_name(replica_job, replica_names) or title
-        else:
-            key = (result.get('project_key') or dims.get('project_key')
-                   or make_idea_project_key(task.get('id'), title))
+        key = (result.get('project_key') or dims.get('project_key')
+               or make_idea_project_key(task.get('id'), title))
         entry = projects.setdefault(key, _proj_blank(key))
-        entry['title'] = title if replica_job else (entry['title'] or title)
+        entry['title'] = entry['title'] or title
         entry['theme'] = entry['theme'] or dims.get('theme') or ''
-        # 同一行可能对应多个任务（复刻的 start/advance，或同键重跑）：留最新的那个，
+        # 同一行可能对应同键重跑：留最新的那个，
         # 否则行上的状态/进度取决于 ACTIVE_TASKS 的遍历顺序。
         if (entry['task'] or {}).get('last_active', -1) <= float(task.get('last_active') or 0):
             entry['task'] = _proj_task_view(task)
@@ -4677,15 +4848,7 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
     # ── 2. 点子库：收藏态 ────────────────────────────────────────────────
     for item in library_items:
         title = item.get('title') or ''
-        # 复刻线的条目必须落回它自己那条 job 行（键 replica:<job_id>，由上面的任务
-        # 循环建出来），不能另起一行：那条行的名字是按 job 状态**现算**的
-        # （_replica_live_name，一长串英文帧描述拼出来的自动名），而改名只写点子库
-        # 条目。两行并存的话，工作台上就永远躺着一条叫着旧自动名的重复项目——用户
-        # 看到的正是"改名对复刻项目无效"。合到一行后，下面那句"点子库压过任务记录"
-        # 自然让改过的名字赢。
-        replica_row = f"replica:{item.get('replica_job_id')}" if item.get('replica_job_id') else ''
-        key = ((replica_row if replica_row in projects else '')
-               or item.get('project_key')
+        key = (item.get('project_key')
                or lookup(f"task:{item.get('id')}",
                          *[f"title:{v}" for v in _proj_title_variants(title, item.get('theme'))])
                or make_idea_project_key(item.get('id'), title))
@@ -4697,10 +4860,6 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
         entry['title'] = title or entry['title']
         entry['theme'] = item.get('theme') or entry['theme']
         entry['saved'] = True
-        # 磁盘命名空间以条目为准，它不一定等于行键：复刻条目落在 replica:<job> 行上，
-        # 而它的媒体在 outputs/<project_key> 里。拿行键去扫资产会一无所获（改名后
-        # 目录名与标题也可能对不上，例如作业在跑时目录没搬），封面与资产统计就整片
-        # 消失——所以把条目自己的键记下来，第 5 步优先按它扫。
         entry['media_key'] = item.get('project_key') or entry.get('media_key') or ''
         entry['timestamp'] = item.get('timestamp') or entry['timestamp']
         entry['cover'] = item_project_cover(item) or entry['cover']
@@ -4717,9 +4876,6 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
             'frame_count': len(frame_run.get('frames')) if isinstance(frame_run.get('frames'), list) else 0,
         }
         entry['updated_at'] = max(entry['updated_at'], _proj_epoch(item.get('timestamp')))
-        # key:<project_key> —— 条目的磁盘命名空间键指向这一行。行键本身不一定等于
-        # 它（复刻条目落在 replica:<job> 行上），而帧/视频子作业是按 project_key 精确
-        # 挂接的，没有这条别名就会掉进"孤立作业"另起一行。
         bind(key, f"task:{item.get('id')}",
              f"key:{item.get('project_key')}" if item.get('project_key') else '',
              *[f"title:{v}" for v in _proj_title_variants(title, item.get('theme'))])
@@ -4727,6 +4883,8 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
     # ── 3. 媒体子作业：挂回母项目；挂不上的自成一行（否则失败的帧/视频任务
     #      像现在的任务抽屉那样被整类过滤掉，用户永远看不见）──────────────
     for task in tasks:
+        if _is_replica_task(task):
+            continue
         dims = dims_of(task)
         job_type = dims.get('type')
         if job_type not in MEDIA_TASK_TYPES:

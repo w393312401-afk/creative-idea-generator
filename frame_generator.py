@@ -348,6 +348,34 @@ def _continuity_beat(manifest, sequence):
     return None
 
 
+def _threshold_reveal_context(manifest, sequence, frames_dir):
+    """过门落点帧 IMAGE ``sequence`` 的前情：这个空间进来过没有、上次离开时是什么状态、
+    上次看见它的那张真实帧在哪。
+
+    拍号换算与 ``_continuity_beat`` 同款：IMAGE N 由第 N-1 拍产出，反过来第 i 拍的终点
+    帧是 IMAGE i+1。
+
+    读不到 spatial_beats（老 manifest、或没跑过规划的分步任务）时返回首次进门的空前情，
+    等价于改动前的行为。
+    """
+    beats = (manifest or {}).get('spatial_beats') or []
+    if not beats or sequence <= 1:
+        return {'first_entry': True, 'inherited_state': '', 'carried_structural': ''}
+    try:
+        from prompt_pipeline.frame_state import space_entry_context
+        ctx = dict(space_entry_context(beats, int(sequence) - 1))
+    except Exception:
+        # 前情缺失只该让这一拍退回改动前的行为，绝不该炸掉整条渲染链。
+        return {'first_entry': True, 'inherited_state': '', 'carried_structural': ''}
+
+    last_index = ctx.get('last_seen_index')
+    if last_index:
+        candidate = os.path.join(frames_dir, f'img_{int(last_index) + 1:03d}.webp')
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+            ctx['last_seen_image_path'] = candidate
+    return ctx
+
+
 def _continuity_family_maps(prompts_by_seq, videos):
     return family_map([int(s) for s in (prompts_by_seq or {})], videos or {})
 
@@ -1675,7 +1703,9 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
     # （真正送进脚本的取消信号见 _fx_batch_cancel_fn / fx_cancel_context）。
     builtins.google_fx_cancelled = False
     apply_google_fx_runtime_overrides(config)
-    from prompt_pipeline import _parse_prompt_slots, ground_threshold_reveal_prompt
+    from prompt_pipeline import (
+        _parse_prompt_slots, ground_threshold_reveal_prompt,
+        threshold_reveal_continuity_clause)
     images, videos = _parse_prompt_slots(prompt_block)
 
     prompts = []
@@ -2072,15 +2102,30 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         # 真正的过门前一帧此刻已经落盘（就是上面刚解出来的 ref_path）——改用它给
         # 模型看图联想，替掉组稿阶段那份没见过参考图的猜测（2026-08-07 复盘）。
         if chunk[0] in transition_heads and ref_path and os.path.exists(ref_path):
-            grounded_body = ground_threshold_reveal_prompt(config, ref_path)
+            target_item = prompts_by_seq[chunk[0]]
+            reveal_ctx = _threshold_reveal_context(manifest, chunk[0], frames_dir)
+            # 组稿产物是**状态的唯一权威**（它带着整份梯子写出来，本函数只见得到一张
+            # 闭着门的参考图）。传进去让模型就地订正材质，而不是另写一条把它替换掉。
+            grounded_body = ground_threshold_reveal_prompt(
+                config, ref_path, target_item.get('prompt'),
+                first_entry=reveal_ctx.get('first_entry', True),
+                inherited_state=reveal_ctx.get('inherited_state', ''),
+                carried_structural=reveal_ctx.get('carried_structural', ''),
+                last_seen_image_path=reveal_ctx.get('last_seen_image_path'))
             if grounded_body:
-                target_item = prompts_by_seq[chunk[0]]
+                # 拍表送得到时再补一段硬性延续声明；送不到就只有上面那次材质订正，
+                # 状态照样由组稿产物自己守着。
+                clause = threshold_reveal_continuity_clause(
+                    reveal_ctx.get('inherited_state', ''),
+                    reveal_ctx.get('carried_structural', ''))
+                merged = f'{grounded_body}\n\n{clause}'.strip() if clause else grounded_body
                 target_item['prompt'] = fx_prompt_with_bridge_control(
-                    chunk[0], {'prompt': grounded_body}, prompts_by_seq, videos)
+                    chunk[0], {'prompt': merged}, prompts_by_seq, videos)
                 if on_progress:
                     on_progress('threshold_reveal_grounded', {
                         'sequence': chunk[0],
-                        'message': f'IMG {chunk[0]:03d} 已依据过门前一帧的实际画面重新联想室内描述',
+                        'first_entry': bool(reveal_ctx.get('first_entry', True)),
+                        'message': f'IMG {chunk[0]:03d} 已照过门前一帧的实际画面订正材质（状态按组稿产物保留）',
                     })
 
         chunk_prompts = [prompts_by_seq[s]['prompt'] for s in chunk]
@@ -2520,14 +2565,27 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             # 真正的过门前一帧此刻已经落盘（就是上面刚解出来的 reference）——改用它给
             # 模型看图联想，替掉组稿阶段那份没见过参考图的猜测（2026-08-07 复盘）。
             if (is_bridge or is_cut_head) and not cover_anchor and reference and os.path.exists(reference):
-                from prompt_pipeline import ground_threshold_reveal_prompt
-                grounded_body = ground_threshold_reveal_prompt(config, reference)
+                from prompt_pipeline import (
+                    ground_threshold_reveal_prompt, threshold_reveal_continuity_clause)
+                reveal_ctx = _threshold_reveal_context(manifest, seq, frames_dir)
+                # 组稿产物是**状态的唯一权威**：传进去就地订正材质，不再另写一条替换它。
+                grounded_body = ground_threshold_reveal_prompt(
+                    config, reference, item.get('prompt'),
+                    first_entry=reveal_ctx.get('first_entry', True),
+                    inherited_state=reveal_ctx.get('inherited_state', ''),
+                    carried_structural=reveal_ctx.get('carried_structural', ''),
+                    last_seen_image_path=reveal_ctx.get('last_seen_image_path'))
                 if grounded_body:
-                    item['prompt'] = grounded_body
+                    # 拍表送得到时再补一段硬性延续声明；送不到就只有上面那次材质订正。
+                    clause = threshold_reveal_continuity_clause(
+                        reveal_ctx.get('inherited_state', ''),
+                        reveal_ctx.get('carried_structural', ''))
+                    item['prompt'] = f'{grounded_body}\n\n{clause}'.strip() if clause else grounded_body
                     if on_progress:
                         on_progress('threshold_reveal_grounded', {
                             'sequence': seq,
-                            'message': f'IMG {seq:03d} 已依据过门前一帧的实际画面重新联想室内描述',
+                            'first_entry': bool(reveal_ctx.get('first_entry', True)),
+                            'message': f'IMG {seq:03d} 已照过门前一帧的实际画面订正材质（状态按组稿产物保留）',
                         })
             model = _image_generation_model(config) if text_only_head else _image_edit_model(config)
             if on_progress:

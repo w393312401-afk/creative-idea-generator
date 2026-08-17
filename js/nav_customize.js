@@ -7,10 +7,8 @@
    localStorage（spark_nav_prefs），下次开页面直接生效。
 
    两条刻意的约束：
-   1. 隐藏只是视觉层的事。被隐藏的标签仍然可以被代码 switchMainTab() 激活
-      （生成完成后自动跳「激发结果」这类），此时 CSS 让它临时露出来——见
-      css/app/nav-customize.css 里的 :not(.active) 选择器。不然用户会撞上
-      "内容切过去了但没有一个标签高亮"的死状态。
+   1. 隐藏即彻底隐藏：被隐藏的标签在标签栏中不会因为处于 active 状态而意外显现；
+      若当前激活的标签被隐藏，自动平滑切换到第一个可见标签。
    2. 至少保留一个可见标签，全部隐藏会让整条栏变成空盒子。
 
    顶部 app-switcher（创意工坊 / 图像工坊 / 控制台）不在管辖范围内：那三个
@@ -93,6 +91,16 @@
         const hidden = new Set(prefs.hidden);
         if (hidden.size >= ordered.length) hidden.clear(); // 兜底：不允许全隐藏
         ordered.forEach(btn => btn.classList.toggle('nav-hidden', hidden.has(btn.id)));
+
+        // 如果当前高亮的标签属于已隐藏标签，自动切到第一个可见标签，确保始终停留在可见模块
+        const activeBtn = ordered.find(btn => btn.classList.contains('active'));
+        if (activeBtn && hidden.has(activeBtn.id)) {
+            const firstVisible = ordered.find(btn => !hidden.has(btn.id));
+            if (firstVisible && typeof switchMainTab === 'function') {
+                const tabKey = firstVisible.id.replace(/^main-tab-/, '');
+                switchMainTab(tabKey);
+            }
+        }
     }
 
     /* ---------- 「⋯」入口 ---------- */

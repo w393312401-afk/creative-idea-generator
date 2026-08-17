@@ -22,20 +22,22 @@ const REPLICA_STAGE_LABELS = {
     cluster_beats: '聚类节拍',
     review_beats: '待人工核对',
     mutate_beats: '二创改写中',
+    mutate_failed: '二创失败',
     compose: '合成提示词',
+    compose_failed: '合成失败',
     audit: '门禁校验',
     audit_failed: '门禁未过',
     completed: '已完成',
+    archived: '已归档',
     cancelled: '已取消',
 };
 
-// 用户看得见的四个阶段。后台十二个 stage 是状态机粒度，摆在 UI 上只会让人对着一个
-// chip 找不到对应区块。与 replica_pipeline.PHASES 同序同义。
+// 用户看得见的四个阶段。后台状态机粒度与 UI 呈现阶段映射。
 const REPLICA_PHASES = [
     { key: 'material', label: '素材', stages: ['ingest', 'extract', 'confirm_cost'] },
-    { key: 'reverse', label: '反推', stages: ['review_frames', 'cluster_beats', 'mutate_beats'] },
+    { key: 'reverse', label: '反推', stages: ['review_frames', 'cluster_beats', 'mutate_beats', 'mutate_failed'] },
     { key: 'review', label: '核对节拍', stages: ['review_beats'] },
-    { key: 'deliver', label: '交付', stages: ['compose', 'audit', 'audit_failed', 'completed'] },
+    { key: 'deliver', label: '交付', stages: ['compose', 'compose_failed', 'audit', 'audit_failed', 'completed', 'archived'] },
 ];
 
 function replicaStageLabel(stageOrRow) {
@@ -70,15 +72,29 @@ const REPLICA_LIST_FIELDS = new Set([
     'evidence_frames', 'reference_frames',
 ]);
 
+let replicaActivePreset = 'custom';
+let replicaAiIdeas = [];
+let replicaActiveIdeaIndex = -1;
+let replicaDivergeBrief = '';
+let replicaDiverging = false;
+let replicaComparatorOpen = false;
+let replicaBeatFoldState = {};
+let replicaJobListExpanded = false;
+let replicaJobListSearchQuery = '';
+let replicaVariantFoldState = {};
+let replicaExtractExpanded = false;
+let replicaRefsDrawerOpen = false;
+let replicaRefsDirectionOpen = false;
+let replicaRefsFilterQuery = '';
+
 const REPLICA_AXES = [
-    { key: 'carrier', label: '载体替换', hint: '石屋 → 废弃巴士 / 船舱 / 地窖' },
-    { key: 'environment', label: '地域环境', hint: '江南 → 北欧 / 沙漠' },
-    { key: 'material', label: '材质风格', hint: '木作 → 清水混凝土' },
-    { key: 'pacing', label: '节奏拍数', hint: '六拍 8s → 四拍 10s' },
-    { key: 'reward', label: '结局奖励', hint: '工作室 → 茶室 / 民宿' },
+    { key: 'environment', label: '地貌水体', hint: '荒野水岸 → 极地峡湾 / 火山地热 / 雨林溪谷 / 崖壁溶洞 / 荒漠绿洲' },
+    { key: 'material', label: '材质工艺', hint: '钢构原木 → 粗石毛石 / 侘寂微水泥 / 黑碳钢+火山石 / 老柚木+黄铜 / 传统夯土' },
+    { key: 'function', label: '空间功用', hint: '江景卧房 → 极地观景木屋 / 恒温私汤茶室 / 水上木工坊 / 崖穴酒窖 / 夯土避暑居' },
+    { key: 'hero_reveal', label: '终极生物', hint: '野生大鲟鱼 → 北极白鲸 / 高山马鹿 / 温泉猕猴 / 热带巨骨舌鱼 / 绿洲双峰驼' },
 ];
 
-const REPLICA_MAX_AXES = 2;
+const REPLICA_MAX_AXES = 4;
 
 /* --- 反推段的模型与采样档位 ---
  *
@@ -198,7 +214,11 @@ async function replicaLoadJobs() {
 async function replicaLoadJob(jobId) {
     const data = await replicaFetch(`/api/replica/status?job_id=${encodeURIComponent(jobId)}`,
         { headers: replicaHeaders() });
+    const switched = !replicaState || replicaState.job_id !== jobId;
     replicaState = data.job_state;
+    // 折叠状态按 beat.id 存，而 B01…B11 在每一条任务里都叫这个名字。不清空的话，
+    // 在 A 任务折起来的 B03，切到 B 任务照样是折的——用户没折过它，它却是折的。
+    if (switched) replicaBeatFoldState = {};
     return replicaState;
 }
 
@@ -206,7 +226,22 @@ async function replicaLoadJob(jobId) {
 // 服务端给的是绝对文件路径；静态路由只认 /outputs 下的相对路径。变体 job 自己不存帧，
 // 指回源 job 的目录。
 function replicaFrameBase(state) {
-    return `/outputs/replica_jobs/${state.variant_of || state.job_id}`;
+    if (!state) return `/outputs/replica_jobs`;
+    const targetId = state.parent_baseline_id || state.variant_of || state.job_id;
+    let rootId = targetId;
+    if (typeof replicaJobs !== 'undefined' && Array.isArray(replicaJobs) && replicaJobs.length) {
+        let cur = replicaJobs.find(j => j.job_id === targetId);
+        let depth = 0;
+        while (cur && (cur.parent_baseline_id || cur.variant_of) && depth < 10) {
+            const nextParent = cur.parent_baseline_id || cur.variant_of;
+            const nextJob = replicaJobs.find(j => j.job_id === nextParent);
+            if (!nextJob || nextParent === cur.job_id) break;
+            rootId = nextParent;
+            cur = nextJob;
+            depth++;
+        }
+    }
+    return `/outputs/replica_jobs/${rootId || targetId}`;
 }
 
 // 服务端按磁盘上的实际位置给出 frame_urls；拿不到时才退回旧的猜法（老状态文件、
@@ -217,6 +252,13 @@ function replicaFrameUrl(state, name) {
     if (known) return known;
     const dir = /^scene_/.test(name) ? 'storyboard' : 'review_frames';
     return `${replicaFrameBase(state)}/${dir}/${encodeURIComponent(name)}`;
+}
+
+function replicaCollageThumbUrl(state) {
+    const raw = state.overview && state.overview.collage_thumb;
+    if (!raw) return replicaCollageUrl(state);
+    const base = raw.split(/[\\/]/).pop();
+    return `${replicaFrameBase(state)}/${encodeURIComponent(base)}`;
 }
 
 function replicaCollageUrl(state) {
@@ -237,15 +279,178 @@ function replicaRoot() {
     return document.getElementById('replica-root');
 }
 
+// 这一页真正的滚动容器。全站在任何宽度下都是「单面板 + 面板内滚动」，window 从不滚动
+// （见 css/app/base.css 的 .app-main 与 panels-tabs.css 的 .glass-panel 手机规则）——
+// 所以任何存位/还位/滚动监听都必须挂在它身上，用 window.scrollY 得到的恒为 0。
+function replicaShell() {
+    const root = replicaRoot();
+    return (root && root.closest('.replica-shell')) || document.querySelector('.replica-shell');
+}
+
+function replicaRenderFloatingTools() {
+    return `
+    <div class="replica-floating-tools" id="replica-floating-tools">
+        <button type="button" class="replica-float-btn" data-float-action="top" title="回到顶部">
+            <span class="replica-float-icon">⌃</span>
+            <span class="replica-float-label">顶部</span>
+        </button>
+        <button type="button" class="replica-float-btn replica-float-save" data-float-action="save" title="保存并重校验">
+            <span class="replica-float-icon">💾</span>
+            <span class="replica-float-label">保存</span>
+        </button>
+    </div>`;
+}
+
+// 吸顶区段导航。
+//
+// 每一项的出现条件必须与「那一块到底渲不渲染」逐字一致——导航项指向一个不存在的
+// 锚点时，点它是彻底静默的：不滚动、不报错、不给任何反馈。所以这里的判据一律从
+// 对应渲染函数里抄同一条，改了那边就得改这边（scratchpad 的冒烟脚本会逐项核对）。
+function replicaRenderNavBar(state) {
+    const beats = (state && state.beats && state.beats.beats) || [];
+    const hasBeats = beats.length > 0;
+    // 与 replicaRenderDualWorkbench 的两条门槛同源
+    const pastExtract = !!state && state.stage !== 'ingest' && state.stage !== 'extract'
+        && state.stage !== 'confirm_cost';
+
+    const items = [];
+    items.push({ id: 'replica-sec-uploader', label: '素材上传' });
+    if (replicaJobs.length > 0) {
+        items.push({ id: 'replica-sec-jobs', label: '已有任务' });
+    }
+    if (pastExtract) {
+        items.push({ id: 'replica-sec-workbench', label: '母本视窗' });
+        // 二创栏本身要等有节拍才渲染，导航项也一样
+        if (hasBeats) items.push({ id: 'replica-sec-variant', label: '二创变体' });
+    }
+    if (state && state.overview) {
+        items.push({ id: 'replica-sec-extract', label: '抽帧结果' });
+    }
+    if (hasBeats) {
+        const violations = state.validation || (state.beats && state.beats.validation) || [];
+        const errCount = violations.filter(v => v.level === 'error').length;
+        items.push({
+            id: 'replica-sec-beats',
+            label: '节拍阶梯',
+            count: beats.length,
+            errors: errCount,
+        });
+        // 与 replicaRenderSceneConstants 的空判据同源
+        if (state.beats.scene_signature || (state.beats.scene_constants && Object.values(state.beats.scene_constants).some(a => a && a.length))) {
+            items.push({ id: 'replica-sec-scene', label: '场景恒常' });
+        }
+    }
+    if (state && state.prompt_block) {
+        items.push({ id: 'replica-sec-output', label: '提示词包' });
+    }
+
+    if (!items.length) return '';
+
+    return `
+    <nav class="replica-nav-bar" id="replica-nav-bar">
+        <div class="replica-nav-scroll">
+            ${items.map((item, idx) => `
+                <button type="button" class="replica-nav-item ${idx === 0 ? 'active' : ''}" data-nav-target="${item.id}">
+                    <span>${escapeHtmlReplica(item.label)}</span>
+                    ${item.count ? `<span class="replica-nav-count">${item.count}</span>` : ''}
+                    ${item.errors ? `<span class="replica-nav-badge-err">${item.errors}</span>` : ''}
+                </button>
+            `).join('')}
+        </div>
+    </nav>`;
+}
+
+function replicaRenderHeaderToolbar(state) {
+    if (!replicaJobs.length) return '';
+    return `
+    <div class="replica-card replica-header-toolbar">
+        <label class="replica-header-job">
+            <span class="replica-header-job-label">🎬 切换任务</span>
+            <select id="replica-quick-job-select" class="replica-select">
+                ${replicaJobs.map(j => `
+                    <option value="${escapeHtmlReplica(j.job_id)}" ${state && state.job_id === j.job_id ? 'selected' : ''}>
+                        ${j.variant_of ? '🧬' : '🎬'} ${escapeHtmlReplica(j.title || j.video_name || j.job_id)} (${escapeHtmlReplica(replicaStageLabel(j))})
+                    </option>
+                `).join('')}
+            </select>
+        </label>
+        <button type="button" id="replica-new-upload-btn" class="action-btn text-btn replica-mini-btn replica-header-new">
+            ＋ 上传新视频
+        </button>
+    </div>`;
+}
+
+// 吸底主操作栏：每个阶段只有一个主 CTA，永远够得着。
+//
+// 这条栏是「保存并重校验 / 合成提示词 / 确认并开始反推 / 存入项目」的**唯一**落点——
+// 节拍区底部那一排只留别处没有的动作（重跑聚类、重译中文、AI 修复硬伤）。
+// AI 修复不放在这里：硬伤清单在校验横幅里，修复按钮就该挨着那份清单；这条栏上的
+// 硬伤计数做成可点，按一下直接把人带到那份清单前面。
+function replicaRenderBottomBar(state) {
+    if (!state) return '';
+    const stage = state.stage || '';
+    const violations = state.validation || (state.beats && state.beats.validation) || [];
+    const errors = violations.filter(v => v.level === 'error');
+    const hasBeats = !!(state.beats && (state.beats.beats || []).length);
+    const isRunning = !!replicaSSE;
+
+    let mainActionHtml = '';
+    if (isRunning) {
+        mainActionHtml = `<button type="button" id="replica-bar-cancel-btn" class="action-btn text-btn">中断这一轮</button>`;
+    } else if (stage === 'confirm_cost') {
+        mainActionHtml = `<button type="button" id="replica-bar-start-btn" class="action-btn primary-btn">确认并开始反推</button>`;
+    } else if (stage === 'review_beats' || (hasBeats && stage !== 'completed' && stage !== 'audit_failed')) {
+        mainActionHtml = `
+            <button type="button" id="replica-bar-save-btn" class="action-btn text-btn">保存并重校验</button>
+            <button type="button" id="replica-bar-compose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词</button>
+        `;
+    } else if (stage === 'completed' || stage === 'audit') {
+        mainActionHtml = `
+            <button type="button" id="replica-bar-project-btn" class="action-btn primary-btn">存入项目并打开激发结果</button>
+        `;
+    } else if (stage === 'audit_failed' || stage === 'compose_failed') {
+        mainActionHtml = `
+            <button type="button" id="replica-bar-recompose-btn" class="action-btn primary-btn">重新合成</button>
+        `;
+    }
+
+    const statusHtml = errors.length
+        ? `<button type="button" id="replica-bar-errors-btn" class="replica-chip replica-chip-error replica-bar-errors"
+                   title="按一下跳到校验横幅，那里列着每一条硬伤">⚠️ ${errors.length} 项硬伤</button>`
+        : (hasBeats ? '<span class="replica-chip replica-chip-ok">✓ 校验通过</span>' : '');
+
+    return `
+    <div class="replica-bottom-bar" id="replica-bottom-bar">
+        <div class="replica-bottom-bar-info">
+            <span class="replica-chip">${escapeHtmlReplica(replicaStageLabel(state))}</span>
+            ${statusHtml}
+        </div>
+        <div class="replica-bottom-bar-actions">
+            ${mainActionHtml}
+        </div>
+    </div>`;
+}
+
 function replicaRender() {
     const root = replicaRoot();
     if (!root) return;
     root.innerHTML = `
+        ${replicaRenderFloatingTools()}
+        ${replicaRenderNavBar(replicaState)}
+        ${replicaRenderHeaderToolbar(replicaState)}
         ${replicaRenderUploader()}
         ${replicaRenderJobList()}
         ${replicaState ? replicaRenderJob(replicaState) : ''}
+        ${replicaState ? replicaRenderBottomBar(replicaState) : ''}
     `;
     replicaBindEvents();
+    replicaInitScrollSpy();
+    replicaUpdateTabBadge();
+    // 重建 DOM 之后必须立刻按当前滚动位置重算一次导航态。滚动监听只在真的滚动时才
+    // 触发，而 innerHTML 换掉的是内容、不是 scrollTop —— 在节拍区点「AI 修复硬伤」
+    // 触发整页重渲之后，药丸会停在模板里写死的第一项（「素材上传」）、悬浮工具会
+    // 因为丢了 .is-visible 而整个消失，直到用户手动滚一下才恢复。
+    replicaHandleScroll(replicaShell());
     // 重建 DOM 会把按钮的 disabled 一起丢掉。跑着的时候重渲染（例如刚开跑要让「中断」
     // 露出来）之后不重新落一次 busy，整排按钮就又可点了——用户能在 Pass A 跑到一半时
     // 再点一次「开始反推」。
@@ -257,7 +462,7 @@ function replicaRender() {
 
 function replicaRenderUploader() {
     return `
-    <div class="replica-card replica-uploader">
+    <div class="replica-card replica-uploader" id="replica-sec-uploader">
         <div class="replica-card-title">上传成品视频</div>
         <p class="replica-hint">
             抽帧密度默认按延时视频调过（基线 2fps + 状态跳变密采 + 首尾密采）。慢工序
@@ -277,24 +482,155 @@ function replicaRenderUploader() {
 
 function replicaRenderJobList() {
     if (!replicaJobs.length) return '';
-    const rows = replicaJobs.map(job => `
-        <div class="replica-job-row ${replicaState && replicaState.job_id === job.job_id ? 'active' : ''}">
+
+    let list = replicaJobs;
+    const q = (replicaJobListSearchQuery || '').trim().toLowerCase();
+    if (q) {
+        list = list.filter(j => {
+            const t = (j.title || '').toLowerCase();
+            const vn = (j.video_name || '').toLowerCase();
+            const id = (j.job_id || '').toLowerCase();
+            const st = (replicaStageLabel(j) || '').toLowerCase();
+            return t.includes(q) || vn.includes(q) || id.includes(q) || st.includes(q);
+        });
+    }
+
+    // 分类到 4 个 Attention 分组
+    const groups = {
+        waiting_you: [],
+        running: [],
+        done: [],
+        stalled: [],
+    };
+
+    for (const job of list) {
+        let att = job.attention;
+        if (!att) {
+            if (job.active_task_id) att = 'running';
+            else if (['confirm_cost', 'review_beats', 'audit_failed', 'compose_failed', 'mutate_failed'].includes(job.stage)) att = 'waiting_you';
+            else if (job.stage === 'completed') att = 'done';
+            else if (job.stage === 'archived' || job.archived) att = 'stalled';
+            else att = 'stalled';
+        }
+        if (att === 'archived') att = 'stalled';
+        if (groups[att]) {
+            groups[att].push(job);
+        } else {
+            groups.stalled.push(job);
+        }
+    }
+
+    const waitingCount = groups.waiting_you.length;
+
+    function renderJobRow(job, isChild = false, currentGroupList = null) {
+        const isCurrent = replicaState && replicaState.job_id === job.job_id;
+        const isArchived = job.stage === 'archived' || !!job.archived;
+        const displayName = job.title || job.video_name || job.job_id;
+        const stageText = replicaStageLabel(job);
+
+        // 成本卡点醒目标签
+        let costBadge = '';
+        if (job.stage === 'confirm_cost') {
+            const est = (job.cost_estimate && job.cost_estimate.full) || {};
+            const frames = est.frame_count || '';
+            const calls = est.batch_count || '';
+            costBadge = `<span class="replica-chip replica-chip-cost" title="待确认反推成本">💰 待确认${frames ? `: ${frames} 帧` : ''}${calls ? ` / 约 ${calls} 次调用` : ''}</span>`;
+        }
+
+        // 血缘变体展开按钮（如果是母本且在系统中有子变体）
+        let lineageToggleHtml = '';
+        const childJobs = replicaJobs.filter(v => v.job_id !== job.job_id && (v.variant_of === job.job_id || v.parent_baseline_id === job.job_id));
+        const hasVariants = childJobs.length > 0;
+        const isFolded = replicaVariantFoldState[job.job_id] !== false; // 默认折叠
+
+        if (hasVariants && !isChild) {
+            lineageToggleHtml = `
+                <button type="button" class="replica-job-variant-toggle" data-toggle-variants="${escapeHtmlReplica(job.job_id)}"
+                        title="${isFolded ? '展开二创变体' : '收起二创变体'}">
+                    👑 ${childJobs.length} 个变体 ${isFolded ? '▼' : '▲'}
+                </button>
+            `;
+        }
+
+        const rowHtml = `
+        <div class="replica-job-row ${isCurrent ? 'active' : ''} ${isChild ? 'replica-job-variant-row' : ''}">
             <button type="button" class="replica-job-open" data-job="${escapeHtmlReplica(job.job_id)}">
                 <span class="replica-job-name">
-                    ${job.variant_of ? '🧬 ' : '🎬 '}${escapeHtmlReplica(job.video_name || job.job_id)}
+                    ${job.variant_of ? '🧬 ' : '🎬 '}<strong>${escapeHtmlReplica(displayName)}</strong>
                 </span>
-                <span class="replica-chip">${escapeHtmlReplica(replicaStageLabel(job))}</span>
+                ${job.title_locked ? '<span class="replica-chip replica-chip-locked" title="名称已锁定">🔒</span>' : ''}
+                <span class="replica-chip ${job.stage === 'completed' ? 'replica-chip-done' : ''}">${escapeHtmlReplica(stageText)}</span>
+                ${costBadge}
                 ${job.beat_count ? `<span class="replica-chip">${job.beat_count} 拍</span>` : ''}
                 ${job.error ? '<span class="replica-chip replica-chip-error">出错</span>' : ''}
+                ${isArchived ? '<span class="replica-chip">📦 已归档</span>' : ''}
             </button>
-            <button type="button" class="replica-mini-btn" data-delete="${escapeHtmlReplica(job.job_id)}"
-                    title="删除这个任务及其抽帧产物">删除</button>
-        </div>`).join('');
+            ${lineageToggleHtml}
+            <button type="button" class="replica-mini-btn" data-rename="${escapeHtmlReplica(job.job_id)}" title="重命名此任务">改名</button>
+            ${!isArchived ? `<button type="button" class="replica-mini-btn" data-archive="${escapeHtmlReplica(job.job_id)}" title="瘦身归档（删除视频与高清帧，释放磁盘空间）">归档</button>` : ''}
+            <button type="button" class="replica-mini-btn" data-delete="${escapeHtmlReplica(job.job_id)}" title="删除这个任务及其数据">删除</button>
+        </div>`;
+
+        // 如果是展开状态，渲染挂载的子变体
+        let childrenHtml = '';
+        if (hasVariants && !isChild && !isFolded) {
+            childrenHtml = childJobs.map(cj => renderJobRow(cj, true)).join('');
+        }
+
+        return rowHtml + childrenHtml;
+    }
+
+    function renderGroupSection(title, icon, jobList, extraBadge = '') {
+        if (!jobList.length) return '';
+        // 顶层任务判断：
+        // 1. 如果搜索 query 存在，所有命中的 job 都显示
+        // 2. 如果 parent 也在当前 jobList 里，由 parent 嵌套渲染 child
+        // 3. 如果 parent 不在当前 jobList 里（例如 parent 在 done，而 child 在 waiting_you），child 必须作为独立项在当前组直接展示，绝不能被吞掉！
+        const topLevelJobs = q ? jobList : jobList.filter(j => {
+            const pid = j.variant_of || j.parent_baseline_id;
+            if (!pid) return true;
+            const parentInThisGroup = jobList.some(pj => pj.job_id === pid);
+            return !parentInThisGroup;
+        });
+
+        if (!topLevelJobs.length) return '';
+
+        return `
+        <div class="replica-job-group">
+            <div class="replica-job-group-title">
+                ${icon} ${title} (${jobList.length}) ${extraBadge}
+            </div>
+            ${topLevelJobs.map(j => renderJobRow(j, false, jobList)).join('')}
+        </div>`;
+    }
+
+    const waitingHtml = renderGroupSection('待你处理', '🔥', groups.waiting_you, `<span class="replica-chip replica-chip-urgent">${groups.waiting_you.length} 条在等你</span>`);
+    const runningHtml = renderGroupSection('运行中', '⚡', groups.running);
+    const doneHtml = renderGroupSection('已完成', '✅', groups.done);
+    const stalledHtml = renderGroupSection('已搁置 / 已归档', '📦', groups.stalled);
+
+    const emptyNotice = (!waitingHtml && !runningHtml && !doneHtml && !stalledHtml)
+        ? `<div class="replica-hint" style="text-align:center; padding:12px 0;">未找到匹配的任务</div>` : '';
+
     return `
-    <div class="replica-card">
-        <div class="replica-card-title">已有任务</div>
-        <div class="replica-job-list">${rows}</div>
-    </div>`;
+    <details class="replica-card" id="replica-sec-jobs" ${replicaJobListExpanded ? 'open' : ''}>
+        <summary class="replica-card-title replica-jobs-summary">
+            已有任务 <span class="replica-chip">${replicaJobs.length}</span>
+            ${waitingCount ? `<span class="replica-chip replica-chip-urgent">🔥 ${waitingCount} 条待处理</span>` : ''}
+        </summary>
+        <div class="replica-job-list">
+            <div class="replica-job-list-header">
+                <input type="text" id="replica-job-search-input" class="replica-job-search"
+                       placeholder="🔍 搜索任务标题、ID、状态..."
+                       value="${escapeHtmlReplica(replicaJobListSearchQuery)}">
+            </div>
+            ${waitingHtml}
+            ${runningHtml}
+            ${doneHtml}
+            ${stalledHtml}
+            ${emptyNotice}
+        </div>
+    </details>`;
 }
 
 function replicaRenderPhases(state) {
@@ -305,20 +641,440 @@ function replicaRenderPhases(state) {
     const failed = state.stage === 'audit_failed' || !!state.error;
     return `<ol class="replica-phases">${REPLICA_PHASES.map((p, i) => {
         const cls = i < at ? 'done' : (i === at ? (failed ? 'failed' : 'current') : 'todo');
-        return `<li class="replica-phase ${cls}"><span class="replica-phase-dot">${i + 1}</span>
+        // 已经走到过的阶段才能点着跳回去；没到的阶段页面上还没有那一块。
+        const canJump = i <= at;
+        const title = canJump ? `点击直达「${p.label}」区段` : '尚未进入该阶段';
+        return `<li class="replica-phase ${cls} ${canJump ? 'is-jumpable' : 'is-locked'}"
+                    data-phase="${p.key}" title="${title}"><span class="replica-phase-dot">${i + 1}</span>
             <span class="replica-phase-label">${p.label}</span></li>`;
     }).join('')}</ol>`;
 }
 
-function replicaRenderJob(state) {
+function replicaRenderLineageNav(state) {
+    const isVariant = !!state.variant_of || !!state.parent_baseline_id;
+    const parentId = state.parent_baseline_id || state.variant_of;
+    const baselineId = parentId || state.job_id;
+
+    // 汇总当前母本下的所有有效变体
+    const variantIdSet = new Set(state.lineage_variants || []);
+    if (typeof replicaJobs !== 'undefined' && Array.isArray(replicaJobs)) {
+        replicaJobs.forEach(j => {
+            if (j.job_id && j.job_id !== baselineId && (j.variant_of === baselineId || j.parent_baseline_id === baselineId)) {
+                variantIdSet.add(j.job_id);
+            }
+        });
+    }
+    variantIdSet.delete(baselineId);
+    const validVariants = Array.from(variantIdSet).filter(vid => {
+        if (typeof replicaJobs === 'undefined' || !replicaJobs.length) return true;
+        return replicaJobs.some(j => j.job_id === vid);
+    });
+
+    if (!isVariant && !validVariants.length) return '';
+
+    // 获取母本显示名称
+    const parentJob = (typeof replicaJobs !== 'undefined' && Array.isArray(replicaJobs)) ? replicaJobs.find(j => j.job_id === baselineId) : null;
+    const parentName = (parentJob && (parentJob.title || parentJob.video_name)) || baselineId;
+
     return `
-    <div class="replica-card">
-        <div class="replica-card-title">
-            ${state.variant_of ? '🧬 二创变体' : '🎬 1:1 复刻'} · ${escapeHtmlReplica(state.video_name || state.job_id)}
+    <div class="replica-lineage-nav">
+        <div class="replica-lineage-breadcrumb">
+            ${isVariant ? `
+                <span class="replica-lineage-crumb">
+                    <button type="button" class="replica-lineage-link" data-open-job="${escapeHtmlReplica(baselineId)}"
+                            title="返回 1:1 黄金母本：${escapeHtmlReplica(parentName)}">
+                        👑 黄金母本 <strong>${escapeHtmlReplica(parentName.length > 20 ? parentName.slice(0, 20) + '…' : parentName)}</strong>
+                    </button>
+                </span>
+                <span class="replica-lineage-sep">➔</span>
+                <span class="replica-lineage-crumb is-current">
+                    🧬 当前二创变体 <code>${escapeHtmlReplica(state.job_id)}</code>
+                </span>
+            ` : `
+                <span class="replica-lineage-crumb is-current">
+                    👑 黄金母本 <code>${escapeHtmlReplica(state.job_id)}</code> (1:1 Ground-Truth Baseline)
+                </span>
+            `}
+        </div>
+        ${validVariants.length ? `
+        <div class="replica-lineage-variants">
+            <span class="replica-lineage-label">二创变体 (${validVariants.length})：</span>
+            ${validVariants.map(vid => {
+                const vjob = (typeof replicaJobs !== 'undefined' && Array.isArray(replicaJobs)) ? replicaJobs.find(j => j.job_id === vid) : null;
+                const vtitle = (vjob && (vjob.title || vjob.job_id)) || vid;
+                let shortName = vtitle;
+                if (vtitle.includes(' · ')) {
+                    shortName = vtitle.split(' · ').pop().trim();
+                } else if (shortName.length > 18) {
+                    shortName = shortName.slice(0, 18) + '…';
+                }
+                const isCurrent = state.job_id === vid;
+                return `
+                <button type="button" class="replica-chip replica-lineage-chip ${isCurrent ? 'is-active' : ''}"
+                        data-open-job="${escapeHtmlReplica(vid)}"
+                        title="打开变体任务：${escapeHtmlReplica(vtitle)} (${escapeHtmlReplica(replicaStageLabel(vjob || vid))})">
+                    🧬 ${escapeHtmlReplica(shortName)}
+                </button>`;
+            }).join('')}
+        </div>` : ''}
+    </div>`;
+}
+
+// 双轨拼图对比。右轨此前是**同一张母本拼图**加一个 CSS 滤镜冒充的变体
+// （`filter: saturate(1.2) contrast(1.05)`），而标题写着「肉眼 3 秒判定漂移」——
+// 那样它永远判不出漂移，比没有对比更糟：用户会以为自己已经查过了。
+//
+// 变体在这个阶段本来就没有画面可比：`replicaFrameBase` 把变体的帧目录指回源 job
+// （变体自己不抽帧，它派生的是提示词而不是素材），要等它走完分步渲染才有自己的成片。
+// 所以右轨给的是实话 + 去处，不再造一张假图。
+function replicaRenderDualTrackComparator(state) {
+    if (!replicaComparatorOpen) return '';
+    const baseCollage = replicaCollageUrl(state);
+    const isVariant = !!(state.variant_of || state.parent_baseline_id);
+
+    return `
+    <div class="replica-comparator-section glass-panel" id="replica-sec-comparator">
+        <div class="replica-comparator-header">
+            <span class="replica-card-title">👁 双轨 5 列拼图横向对比快检 (Dual-Track 5-Column Comparator)</span>
+            <button type="button" class="replica-mini-btn" id="replica-close-comparator-btn">✕ 关闭对比</button>
+        </div>
+        <p class="replica-hint">
+            左轨是原片的 5 列基准拼图（单帧宽 240px），用来核对光影色调、材质质感与空间结构。
+            右轨要等变体真的渲染出来才有画面——变体自己不抽帧，它派生的是提示词。
+        </p>
+        <div class="replica-comparator-tracks">
+            <div class="replica-comparator-track">
+                <div class="replica-track-tag">◀ 黄金母本视觉基准 (Gold Baseline 5-Column)</div>
+                ${baseCollage ? `
+                    <img class="replica-comparator-img" src="${baseCollage}" alt="母本 5 列原片拼图"
+                         onclick="replicaOpenLightbox([{url: '${baseCollage}', caption: '1:1 母本 5 列拼图'}], 0)">
+                ` : '<div class="replica-hint">母本拼图不可用</div>'}
+            </div>
+            <div class="replica-comparator-track">
+                <div class="replica-track-tag">▶ 变体成片 (Rendered Variant)</div>
+                <div class="replica-comparator-empty">
+                    <div class="replica-empty-icon">🎞</div>
+                    <div class="replica-empty-desc">
+                        ${isVariant
+                            ? '这条变体还没有自己的成片。按「存入项目并打开激发结果」渲染完成后，在项目工作台里对着这张基准图逐帧比对。'
+                            : '还没有派生出变体。右栏填好四轴、生成变体提示词包并渲染之后，成片会出现在项目工作台。'}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>`;
+}
+
+function replicaRenderTrendRefsDrawer() {
+    const storedDirection = (typeof readStoredIdeationDirection === 'function')
+        ? readStoredIdeationDirection()
+        : { query: '', urls: '' };
+    const selCount = (typeof getSelectedTrendRefIds === 'function') ? getSelectedTrendRefIds().length : 0;
+    const noteText = selCount > 0 ? `已选 ${selCount} 条（发散优先参考）` : '未勾选：发散自动取材';
+
+    return `
+    <div class="control-group spark-drawer replica-trend-refs-drawer ${replicaRefsDrawerOpen ? 'drawer-open' : ''}" id="replica-spark-drawer-refs" data-drawer="replica-refs">
+        <div class="spark-drawer-head">
+            <button type="button" class="spark-drawer-toggle" id="replica-trend-refs-toggle" aria-expanded="${replicaRefsDrawerOpen ? 'true' : 'false'}" aria-controls="replica-spark-drawer-refs-body">
+                <svg class="spark-drawer-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                <span class="group-title">🌐 联网参考案例库</span>
+                <span class="trend-refs-selected-note spark-drawer-note" id="replica-trend-refs-selected-note">${escapeHtmlReplica(noteText)}</span>
+            </button>
+            <div class="trend-refs-header-actions">
+                <button type="button" id="replica-trend-refs-direction-toggle" class="preset-header-action" title="自定义联网搜索方向与参考网址">🎯 搜索方向</button>
+                <button type="button" id="replica-trend-refs-search-btn" class="preset-header-action">🔍 搜一批新参考</button>
+            </div>
+        </div>
+        <div class="spark-drawer-body" id="replica-spark-drawer-refs-body">
+            <div class="trend-refs-direction-panel" id="replica-trend-refs-direction-panel" ${replicaRefsDirectionOpen ? '' : 'hidden'}>
+                <label for="replica-trend-refs-search-query">搜索方向（留空用默认：最新爆款延时摄影改造视频）</label>
+                <input type="text" id="replica-trend-refs-search-query" placeholder="例如：AI 宠物拟人化改造视频 趋势" value="${escapeHtmlReplica(storedDirection.query || '')}">
+                <label for="replica-trend-refs-trend-urls">参考网址（每行一个，最多取前 5 个，可选）</label>
+                <textarea id="replica-trend-refs-trend-urls" rows="2" placeholder="https://...">${escapeHtmlReplica(storedDirection.urls || '')}</textarea>
+                <p class="trend-refs-direction-hint">设置与激发维度同步，点「搜一批新参考」立即生效，助您精准引入目标爆款领域的视觉要点。</p>
+            </div>
+            <p class="trend-refs-hint">勾选参考后，AI 智能发散将深度结合所选已验证爆款案例；未勾选时发散将自动从案例库或联网趋势中取材。</p>
+            <div class="trend-refs-toolbar">
+                <input type="text" id="replica-trend-refs-filter" class="trend-refs-filter replica-input" placeholder="筛选案例库…" value="${escapeHtmlReplica(replicaRefsFilterQuery)}">
+            </div>
+            <div class="trend-refs-list" id="replica-trend-refs-list">
+                <div class="trend-refs-empty">正在载入联网参考案例库...</div>
+            </div>
+            <div class="trend-refs-archive-bar">
+                <span class="trend-refs-cap-note" id="replica-trend-refs-cap-note"></span>
+                <button type="button" id="replica-trend-refs-manage-open-btn" class="trend-refs-archive-toggle">🗂️ 管理全部</button>
+                <button type="button" id="replica-trend-refs-archive-toggle" class="trend-refs-archive-toggle" hidden>查看归档</button>
+            </div>
+            <div class="trend-refs-list trend-refs-archive-list" id="replica-trend-refs-archive-list" hidden></div>
+        </div>
+    </div>`;
+}
+
+function replicaRenderAiIdeas(state) {
+    const ideas = (state && state.ai_diverged_ideas) || replicaAiIdeas || [];
+    if (!ideas || !ideas.length) {
+        return `
+            <div class="replica-ai-ideas-empty">
+                <div class="replica-empty-icon">💡</div>
+                <div class="replica-empty-desc">
+                    点击上方<b>「✨ AI 智能发散创意」</b>，AI 将结合选中的<b>联网参考案例</b>与母本工序骨架，自动派生 4 组完全正交的爆款二创脑洞；您也可直接在下方自由填写四轴。
+                </div>
+            </div>`;
+    }
+
+    return `
+        <div class="replica-ai-ideas-header">
+            <span class="replica-preset-label">🎯 AI 发散脑洞方案（点击一键载入四轴）：</span>
+            <button type="button" id="replica-ai-diverge-refresh-btn" class="action-btn text-btn replica-mini-btn" title="重新换一批灵感">
+                🎲 换一批灵感
+            </button>
+        </div>
+        <div class="replica-ai-ideas-grid">
+            ${ideas.map((idea, idx) => {
+                const isActive = replicaActiveIdeaIndex === idx;
+                return `
+                    <div class="replica-ai-idea-card ${isActive ? 'active' : ''}" data-idea-idx="${idx}" title="${escapeHtmlReplica(idea.hook || '')}">
+                        <div class="replica-ai-idea-top">
+                            <span class="replica-ai-idea-name">${escapeHtmlReplica(idea.icon || '✨')} ${escapeHtmlReplica(idea.name || `创意方案 ${idx + 1}`)}</span>
+                            ${isActive ? '<span class="replica-ai-idea-badge">已选用</span>' : ''}
+                        </div>
+                        <div class="replica-ai-idea-hook">${escapeHtmlReplica(idea.hook || '')}</div>
+                        ${idea.trend_ref ? `<div class="replica-ai-idea-trend" title="${escapeHtmlReplica(idea.trend_ref)}">🌐 趋势借鉴: ${escapeHtmlReplica(idea.trend_ref)}</div>` : ''}
+                    </div>
+                `;
+            }).join('')}
+        </div>
+    `;
+}
+
+function replicaRenderDualWorkbench(state) {
+    if (state.stage === 'ingest' || state.stage === 'extract' || state.stage === 'confirm_cost') {
+        return '';
+    }
+
+    const isLocked = !!state.is_locked_baseline;
+    const collage = replicaCollageUrl(state);
+    const collageThumb = replicaCollageThumbUrl(state) || collage;
+    const beats = (state.beats && (state.beats.beats || [])) || [];
+    const beatsCount = beats.length || state.beat_count || 0;
+    const ov = state.overview || {};
+    const violations = state.validation || (state.beats && state.beats.validation) || [];
+    const errors = violations.filter(v => v.level === 'error');
+    const crossedCount = beats.filter((b, i, arr) => i > 0 && arr[i-1].space && b.space && arr[i-1].space.toLowerCase() !== b.space.toLowerCase()).length;
+
+    // 初始化 ideas
+    if (state.ai_diverged_ideas && state.ai_diverged_ideas.length && (!replicaAiIdeas || !replicaAiIdeas.length)) {
+        replicaAiIdeas = state.ai_diverged_ideas;
+    }
+    const ideas = (state && state.ai_diverged_ideas) || replicaAiIdeas || [];
+    const activeIdea = (replicaActiveIdeaIndex >= 0 && ideas[replicaActiveIdeaIndex]) ? ideas[replicaActiveIdeaIndex] : null;
+
+    const axes = (state.mutation_config && state.mutation_config.axes)
+        || (activeIdea && activeIdea.axes)
+        || { environment: '', material: '', function: '', hero_reveal: '' };
+
+    // 二创栏的门槛是「有没有节拍」，不是 stage。
+    //
+    // 按 stage 挡只排除了 ingest/extract/confirm_cost，于是 review_frames /
+    // cluster_beats 跑着的时候右栏照旧摆着「⚡ 一键生成二创变体提示词包」——而此刻
+    // 一拍都还没有，那个按钮按下去只能失败。二创是「骨架不动、只换内容」，没有骨架
+    // 就没有二创可言。
+    const canMutate = beatsCount > 0;
+
+    return `
+    <div class="replica-workbench-grid ${canMutate ? '' : 'is-baseline-only'}" id="replica-sec-workbench">
+        <!-- ◀ 左栏：1:1 黄金母本视窗 (Baseline View) -->
+        <div class="replica-pane-baseline glass-panel">
+            <div class="replica-pane-header">
+                <span class="replica-pane-title">◀ 1:1 黄金母本视窗 (Baseline View)</span>
+                <span class="replica-badge ${isLocked ? 'is-locked' : 'is-unlocked'}">
+                    ${isLocked ? '🔒 Gold Baseline 已加锁' : '🔓 待固化母本'}
+                </span>
+            </div>
+
+            <div class="replica-baseline-collage-wrap">
+                ${collage ? `
+                    <div class="replica-collage-container" id="replica-baseline-collage-box" title="点击放大查看 5 列标准多宫格拼图">
+                        <img class="replica-collage" id="replica-baseline-collage" src="${collageThumb}"
+                             alt="5 列母本关键帧拼贴大图" loading="lazy">
+                        <div class="replica-collage-tag">5 列原片视觉基准 (240px 单帧宽)</div>
+                    </div>
+                ` : `<div class="replica-banner replica-banner-error">拼贴图缺失，请先抽帧。</div>`}
+            </div>
+
+            <div class="replica-baseline-lock-card ${isLocked ? 'is-locked' : 'is-unlocked'}">
+                <div class="replica-lock-info">
+                    <b>${isLocked ? '🔒 母本已固化为 Gold Baseline' : '🔓 母本待加锁固化'}</b>
+                    <p class="replica-hint" style="margin:2px 0 0;">
+                        ${isLocked ? '骨架已严格锁定（拍数、机位、工序因果不变）。节拍已保护为只读。'
+                                   : '核对节拍无误后加锁，锁定后节拍转为只读，防止骨架与变体脱节。'}
+                    </p>
+                </div>
+                <div class="replica-lock-action">
+                    ${isLocked ? `
+                        <button type="button" id="replica-unlock-baseline-btn" class="action-btn text-btn">🔓 解除锁定</button>
+                    ` : `
+                        <button type="button" id="replica-lock-baseline-btn" class="action-btn primary-btn">🔒 固化为 Gold Baseline</button>
+                    `}
+                </div>
+            </div>
+
+            <div class="replica-metrics-grid">
+                <div class="replica-metric-card">
+                    <span class="replica-metric-label">拍数 (实测)</span>
+                    <span class="replica-metric-val">${beatsCount ? `${beatsCount} 拍` : '—'}</span>
+                    <span class="replica-metric-sub">1:1 严格映射</span>
+                </div>
+                <div class="replica-metric-card">
+                    <span class="replica-metric-label">时长 (实测)</span>
+                    <span class="replica-metric-val">${ov.duration_sec != null ? `${ov.duration_sec}s` : '—'}</span>
+                    <span class="replica-metric-sub">原片物理时长</span>
+                </div>
+                <div class="replica-metric-card">
+                    <span class="replica-metric-label">空间过门 (实测)</span>
+                    <span class="replica-metric-val">${crossedCount} 次</span>
+                    <span class="replica-metric-sub">${errors.length ? `${errors.length} 项硬伤` : '✓ 校验通过'}</span>
+                </div>
+            </div>
+
+            <div class="replica-baseline-actions">
+                <button type="button" id="replica-pane-handoff-btn" class="action-btn primary-btn" title="直接推入分步渲染管线">
+                    🚀 送去分步管线渲染 1:1 母本
+                </button>
+                ${canMutate ? `
+                <button type="button" id="replica-pane-focus-mutator-btn" class="action-btn text-btn">
+                    ➕ 以此母本为基准派生变体 ──►
+                </button>` : ''}
+            </div>
+        </div>
+        ${!canMutate ? '' : `
+        <!-- ▶ 右栏：AI 正交发散刺激器 (AI Orthogonal Mutator) -->
+        <div class="replica-pane-mutator glass-panel" id="replica-sec-variant">
+            <div class="replica-pane-header">
+                <span class="replica-pane-title">▶ AI 正交发散刺激器 (AI Orthogonal Mutator)</span>
+                <span class="replica-chip">✨ AI 智能受控发散</span>
+            </div>
+
+            <!-- 🌐 联网参考案例库 -->
+            ${replicaRenderTrendRefsDrawer()}
+
+            <!-- AI 创意发散控制台 -->
+            <div class="replica-diverge-bar">
+                <div class="replica-diverge-input-wrap">
+                    <input type="text" id="replica-diverge-brief" class="replica-input replica-diverge-input"
+                           placeholder="输入发散灵感/偏好（如：雪山隐世木屋 / 崖壁私汤 / 荒漠夯土工坊 / 雨林树屋，写实建造题材）"
+                           value="${escapeHtmlReplica(replicaDivergeBrief || '')}">
+                </div>
+                <button type="button" id="replica-ai-diverge-btn" class="action-btn primary-btn replica-diverge-btn"
+                        title="结合联网参考与母本工序骨架，智能发散 4 组完全正交的写实建造二创创意">
+                    ${replicaDiverging ? '⏳ 正在发散...' : '✨ AI 智能发散创意'}
+                </button>
+            </div>
+
+            <!-- AI 发散创意卡片集 -->
+            <div class="replica-ai-ideas-container">
+                ${replicaRenderAiIdeas(state)}
+            </div>
+
+            <!-- 四轴正交词槽输入 (支持 AI 填入后自由微调) -->
+            <div class="replica-axis-inputs">
+                <div class="replica-axis-field">
+                    <label class="replica-axis-label" for="replica-axis-env">
+                        <span class="replica-axis-tag">轴 1</span>
+                        <span>地貌与水体环境 (Environment & Biome)</span>
+                    </label>
+                    <input type="text" id="replica-axis-env" class="replica-input"
+                           value="${escapeHtmlReplica(axes.environment || '')}"
+                           placeholder="例如：雪山松林积雪与清澈冰溪 / 荒漠绿洲与红岩峡谷">
+                </div>
+
+                <div class="replica-axis-field">
+                    <label class="replica-axis-label" for="replica-axis-mat">
+                        <span class="replica-axis-tag">轴 2</span>
+                        <span>材质与工艺体系 (Material & Craft)</span>
+                    </label>
+                    <input type="text" id="replica-axis-mat" class="replica-input"
+                           value="${escapeHtmlReplica(axes.material || '')}"
+                           placeholder="例如：老柚木防腐原木 + 侘寂微水泥 + 哑光黑碳钢">
+                </div>
+
+                <div class="replica-axis-field">
+                    <label class="replica-axis-label" for="replica-axis-func">
+                        <span class="replica-axis-tag">轴 3</span>
+                        <span>空间功能与软装 (Space Function & Furnishing)</span>
+                    </label>
+                    <input type="text" id="replica-axis-func" class="replica-input"
+                           value="${escapeHtmlReplica(axes.function || '')}"
+                           placeholder="例如：山林暖炉阅读卧榻 + 悬浮实木茶室">
+                </div>
+
+                <div class="replica-axis-field">
+                    <label class="replica-axis-label" for="replica-axis-hero">
+                        <span class="replica-axis-tag">轴 4</span>
+                        <span>终极生物/事件揭示 (Hero Creature / Reveal)</span>
+                    </label>
+                    <input type="text" id="replica-axis-hero" class="replica-input"
+                           value="${escapeHtmlReplica(axes.hero_reveal || '')}"
+                           placeholder="例如：窗外林间慢步的高山马鹿 / 绿洲饮水的野生双峰驼">
+                </div>
+            </div>
+
+            <div class="replica-guarantee-box">
+                <div class="replica-guarantee-title">🛡️ 骨架硬冻结保障 (Zero Drift Guarantee)：</div>
+                <div class="replica-guarantee-list">
+                    <span>✓ 拍数严格保持：${beatsCount || 11} 拍 (1:1 同构)</span>
+                    <span>✓ 镜头动力学：14mm / 50% 视高与地平线锁死</span>
+                    <span>✓ ASMR 原声混音：60% 物理细节 (0% BGM / 100% 旁白)</span>
+                    <span>✓ 进出场时间戳：0s 进场 / 7.5s 撤离 / 8s 交接</span>
+                </div>
+            </div>
+
+            <div class="replica-mutator-actions">
+                <button type="button" id="replica-mutate-orthogonal-btn" class="action-btn primary-btn"
+                        title="按四轴正交矩阵瞬间派生零漂移二创变体">
+                    ⚡ 一键生成二创变体提示词包 (Variant)
+                </button>
+                <button type="button" id="replica-toggle-comparator-btn" class="action-btn text-btn"
+                        title="横向比对母本与变体 5 列拼图">
+                    ${replicaComparatorOpen ? '收起横向对比器' : '👁 双轨 5 列拼图横向对比快检'}
+                </button>
+            </div>
+        </div>`}
+    </div>
+    ${canMutate ? replicaRenderDualTrackComparator(state) : ''}`;
+}
+
+function replicaRenderJob(state) {
+    const isComposeFailed = state.stage === 'compose_failed';
+    const isMutateFailed = state.stage === 'mutate_failed';
+    const isArchived = state.stage === 'archived' || !!state.archived;
+    return `
+    <div class="replica-card" id="replica-sec-current-job">
+        ${replicaRenderLineageNav(state)}
+        <div class="replica-card-title replica-job-title-row">
+            <span class="replica-job-title-text">
+                ${state.variant_of ? '🧬 二创变体' : '🎬 1:1 黄金母本'} · <strong id="replica-current-title">${escapeHtmlReplica(state.title || state.video_name || state.job_id)}</strong>
+            </span>
+            <button type="button" class="replica-mini-btn" data-rename-current="${escapeHtmlReplica(state.job_id)}" title="重命名此任务">✏️ 改名</button>
+            ${state.title_locked ? '<span class="replica-chip replica-chip-locked" title="名称已锁定，不会被后续步骤覆盖">🔒 已锁定名称</span>' : ''}
             <span class="replica-chip">${escapeHtmlReplica(replicaStageLabel(state))}</span>
+            ${state.is_locked_baseline ? '<span class="replica-chip replica-chip-locked">🔒 Gold Baseline 已锁定</span>' : ''}
+            ${!isArchived ? `<button type="button" class="replica-mini-btn" data-archive-current="${escapeHtmlReplica(state.job_id)}" title="瘦身归档（删除视频与高清帧，释放磁盘空间）">📦 瘦身归档</button>` : '<span class="replica-chip">📦 已瘦身归档</span>'}
         </div>
         ${replicaRenderPhases(state)}
-        ${state.error ? `<div class="replica-banner replica-banner-error">${escapeHtmlReplica(state.error)}</div>` : ''}
+        ${isComposeFailed ? `
+            <div class="replica-banner replica-banner-error">
+                <b>合成提示词失败</b>：${escapeHtmlReplica(state.error || '模型调用异常或超限')}
+                <div style="margin-top:8px;">
+                    <button type="button" id="replica-retry-compose-btn" class="action-btn primary-btn">重新合成</button>
+                </div>
+            </div>` : ''}
+        ${isMutateFailed ? `
+            <div class="replica-banner replica-banner-error">
+                <b>二创生成失败</b>：${escapeHtmlReplica(state.error || '变体改写异常')}
+            </div>` : ''}
+        ${state.error && !isComposeFailed && !isMutateFailed ? `<div class="replica-banner replica-banner-error">${escapeHtmlReplica(state.error)}</div>` : ''}
+        ${replicaRenderDualWorkbench(state)}
         ${replicaRenderExtract(state)}
         ${replicaRenderProgress()}
         <div id="replica-beats-host">${replicaRenderBeats(state)}</div>
@@ -349,97 +1105,119 @@ function replicaRenderExtract(state) {
     const scope = state.review_scope || (state.degraded ? 'degraded' : 'plan');
     const fps = replicaCurrentFps(state);
 
+    const isCollapsible = !atCostGate && state.stage !== 'extract' && hasBeats;
+    const isCollapsed = isCollapsible && !replicaExtractExpanded;
+
     return `
-    <div class="replica-section">
-        <div class="replica-card-title">抽帧结果</div>
-        <div class="replica-metrics">
-            <span>时长 ${ov.duration_sec ?? '—'}s</span>
-            <span>抽帧 ${ov.frame_count ?? '—'} 张</span>
-            <span>基线 ${fps} fps</span>
-            <span>变化事件 ${ov.change_event_count ?? '—'} 个</span>
-            <span>送审计划 ${(ov.analysis_plan || {}).mode || '—'}</span>
+    <div class="replica-section" id="replica-sec-extract">
+        <div class="replica-card-title replica-section-head">
+            <span>抽帧结果</span>
+            ${isCollapsible ? `
+                <button type="button" id="replica-toggle-extract-btn" class="action-btn text-btn replica-mini-btn">
+                    ${isCollapsed ? '展开抽帧与模型设置 ⌄' : '收起 ⌃'}
+                </button>
+            ` : ''}
         </div>
-        <div class="replica-reextract">
-            <label class="replica-inline-field">抽帧密度
-                ${replicaFpsSelect('replica-base-fps', fps)}
-            </label>
-            <button type="button" id="replica-reextract-btn" class="action-btn text-btn">
-                按新密度重抽帧
-            </button>
-            <p class="replica-hint">
-                抽出来的帧太少（事件之间的推进看不出来）就往上调一档再抽一次。抽帧不花
-                模型钱，但<b>会作废这条任务已有的帧事实与节拍</b>：帧文件名是序号不是
-                时间戳，换了密度同一个名字指向的是另一时刻的画面，所以旧的读数必须全丢。
-            </p>
-        </div>
-        ${collage ? `<img class="replica-collage" id="replica-collage" src="${collage}"
-             alt="关键帧拼贴图" title="点开看大图" loading="lazy">`
-        : `<div class="replica-banner replica-banner-error">
-            拼贴图缺失。它是节拍映射的前置门禁，缺了等于没看过整条序列就要定义节拍。</div>`}
-        <div class="replica-cost">
-            ${atCostGate ? `<p class="replica-hint replica-cost-gate">
-                <b>抽帧已完成，还没有开始花钱。</b>Pass A 是整条线的成本大头——
-                下面三档决定送多少帧给多模态模型，选好再按开始。
-            </p>` : ''}
-            <label class="replica-radio">
-                <input type="radio" name="replica-mode" value="all" ${scope === 'all' ? 'checked' : ''}>
-                <span>全部（${every.frame_count || 0} 帧 / 约 ${every.batch_count || 0} 次视觉调用）——
-                      抽出来多少送多少，识别最密、也最贵</span>
-            </label>
-            <label class="replica-radio">
-                <input type="radio" name="replica-mode" value="full" ${scope === 'plan' ? 'checked' : ''}>
-                <span>计划（${full.frame_count || 0} 帧 / 约 ${full.batch_count || 0} 次）——
-                      脚本的送审计划：长片只挑约四成 + 每秒至少一张</span>
-            </label>
-            <label class="replica-radio">
-                <input type="radio" name="replica-mode" value="degraded" ${scope === 'degraded' ? 'checked' : ''}>
-                <span>降级（${degraded.frame_count || 0} 帧 / 约 ${degraded.batch_count || 0} 次）——
-                      只读事件的起止与峰值帧，<b>事件之间发生了什么全靠推断，节拍精度更低</b></span>
-            </label>
-            <p class="replica-hint">
-                觉得「识别的图片太少」时先看这里：抽出来的 ${ov.frame_count ?? '—'} 张里，
-                计划档只送 ${full.frame_count || 0} 张。要更密就选「全部」；抽出来的总数
-                本身不够，则回上面调抽帧密度重抽。
-            </p>
-            <div class="replica-model-picker">
-                <div class="replica-card-subtitle">反推模型</div>
-                <label class="replica-inline-field">逐帧识别（Pass A）
-                    ${replicaModelSelect('replica-frame-model',
-                        replicaConfigValue('frameFactsModel', REPLICA_PASS_A_DEFAULT_MODEL))}
+        ${isCollapsed ? `
+            <div class="replica-metrics replica-metrics-folded">
+                <span>时长 ${ov.duration_sec ?? '—'}s</span>
+                <span>抽帧 ${ov.frame_count ?? '—'} 张</span>
+                <span>基线 ${fps} fps</span>
+                <span>变化事件 ${ov.change_event_count ?? '—'} 个</span>
+                <span>送审档位 ${scope}</span>
+            </div>
+            ${collage ? `<img class="replica-collage replica-collage-folded" id="replica-collage" src="${collage}"
+                 alt="关键帧拼贴图" title="点开看大图" loading="lazy">` : ''}
+        ` : `
+            <div class="replica-metrics">
+                <span>时长 ${ov.duration_sec ?? '—'}s</span>
+                <span>抽帧 ${ov.frame_count ?? '—'} 张</span>
+                <span>基线 ${fps} fps</span>
+                <span>变化事件 ${ov.change_event_count ?? '—'} 个</span>
+                <span>送审计划 ${(ov.analysis_plan || {}).mode || '—'}</span>
+            </div>
+            <div class="replica-reextract">
+                <label class="replica-inline-field">抽帧密度
+                    ${replicaFpsSelect('replica-base-fps', fps)}
                 </label>
-                <label class="replica-inline-field">峰值帧复核
-                    ${replicaModelSelect('replica-peak-model',
-                        replicaConfigValue('peakVerifyModel', ''),
-                        [{ value: '', label: '跟随主模型（默认）' },
-                         { value: 'off', label: '关闭复核（省这几次调用）' }])}
-                </label>
+                <button type="button" id="replica-reextract-btn" class="action-btn text-btn">
+                    按新密度重抽帧
+                </button>
                 <p class="replica-hint">
-                    逐帧识别读的是材料标签、工具类型、完成范围这类细节，模型弱一档就会
-                    读糊，而节拍阶梯完全建在这些读数上。便宜的 flash 打底 + 强模型复核
-                    峰值帧是默认组合；对精度不满意就把逐帧识别也换成强模型，代价是
-                    ${full.batch_count || 0} 次调用全部按强模型计价。
-                    ${state.facts && state.facts.model
-                        ? `上一轮实际用的是 <code>${escapeHtmlReplica(state.facts.model)}</code>。` : ''}
+                    抽出来的帧太少（事件之间的推进看不出来）就往上调一档再抽一次。抽帧不花
+                    模型钱，但<b>会作废这条任务已有的帧事实与节拍</b>：帧文件名是序号不是
+                    时间戳，换了密度同一个名字指向的是另一时刻的画面，所以旧的读数必须全丢。
                 </p>
             </div>
-            ${full.peak_frame_count ? `<p class="replica-hint">
-                另加 ${full.peak_batch_count || 0} 次峰值帧复核（${full.peak_frame_count} 张）。
-                节拍边界恰好落在这几帧上，读糊了整条阶梯会整体错位，所以默认开。
-            </p>` : ''}
-            ${isRetry ? `<p class="replica-hint">
-                ${state.facts ? `已读过 ${state.facts.frame_count || 0} 帧，帧事实走磁盘缓存——
-                     同一档、同一个逐帧识别模型重试不重付视觉调用的钱；换到更密的一档只
-                     补付新增的那些帧。<b>换了逐帧识别模型则会全部重读</b>（缓存按模型分桶，
-                     不然新模型的钱付了、拿到的还是旧模型的读数），换回去仍然免费。`
-                    : '上次没跑完，可以直接重试。'}
-            </p>` : ''}
-            ${hasBeats && !atCostGate ? `<p class="replica-hint">
-                已经有一份节拍阶梯了。换档位重跑会覆盖它——你在下面改过的内容会丢。
-            </p>` : ''}
-            <button type="button" id="replica-start-btn" class="action-btn primary-btn">
-                ${startLabel}
-            </button>
-        </div>
+            ${collage ? `<img class="replica-collage" id="replica-collage" src="${collage}"
+                 alt="关键帧拼贴图" title="点开看大图" loading="lazy">`
+            : `<div class="replica-banner replica-banner-error">
+                拼贴图缺失。它是节拍映射的前置门禁，缺了等于没看过整条序列就要定义节拍。</div>`}
+            <div class="replica-cost">
+                ${atCostGate ? `<p class="replica-hint replica-cost-gate">
+                    <b>抽帧已完成，还没有开始花钱。</b>Pass A 是整条线的成本大头——
+                    下面三档决定送多少帧给多模态模型，选好再按开始。
+                </p>` : ''}
+                <label class="replica-radio">
+                    <input type="radio" name="replica-mode" value="all" ${scope === 'all' ? 'checked' : ''}>
+                    <span>全部（${every.frame_count || 0} 帧 / 约 ${every.batch_count || 0} 次视觉调用）——
+                          抽出来多少送多少，识别最密、也最贵</span>
+                </label>
+                <label class="replica-radio">
+                    <input type="radio" name="replica-mode" value="full" ${scope === 'plan' ? 'checked' : ''}>
+                    <span>计划（${full.frame_count || 0} 帧 / 约 ${full.batch_count || 0} 次）——
+                          脚本的送审计划：长片只挑约四成 + 每秒至少一张</span>
+                </label>
+                <label class="replica-radio">
+                    <input type="radio" name="replica-mode" value="degraded" ${scope === 'degraded' ? 'checked' : ''}>
+                    <span>降级（${degraded.frame_count || 0} 帧 / 约 ${degraded.batch_count || 0} 次）——
+                          只读事件的起止与峰值帧，<b>事件之间发生了什么全靠推断，节拍精度更低</b></span>
+                </label>
+                <p class="replica-hint">
+                    觉得「识别的图片太少」时先看这里：抽出来的 ${ov.frame_count ?? '—'} 张里，
+                    计划档只送 ${full.frame_count || 0} 张。要更密就选「全部」；抽出来的总数
+                    本身不够，则回上面调抽帧密度重抽。
+                </p>
+                <div class="replica-model-picker">
+                    <div class="replica-card-subtitle">反推模型</div>
+                    <label class="replica-inline-field">逐帧识别（Pass A）
+                        ${replicaModelSelect('replica-frame-model',
+                            replicaConfigValue('frameFactsModel', REPLICA_PASS_A_DEFAULT_MODEL))}
+                    </label>
+                    <label class="replica-inline-field">峰值帧复核
+                        ${replicaModelSelect('replica-peak-model',
+                            replicaConfigValue('peakVerifyModel', ''),
+                            [{ value: '', label: '跟随主模型（默认）' },
+                             { value: 'off', label: '关闭复核（省这几次调用）' }])}
+                    </label>
+                    <p class="replica-hint">
+                        逐帧识别读的是材料标签、工具类型、完成范围这类细节，模型弱一档就会
+                        读糊，而节拍阶梯完全建在这些读数上。便宜的 flash 打底 + 强模型复核
+                        峰值帧是默认组合；对精度不满意就把逐帧识别也换成强模型，代价是
+                        ${full.batch_count || 0} 次调用全部按强模型计价。
+                        ${state.facts && state.facts.model
+                            ? `上一轮实际用的是 <code>${escapeHtmlReplica(state.facts.model)}</code>。` : ''}
+                    </p>
+                </div>
+                ${full.peak_frame_count ? `<p class="replica-hint">
+                    另加 ${full.peak_batch_count || 0} 次峰值帧复核（${full.peak_frame_count} 张）。
+                    节拍边界恰好落在这几帧上，读糊了整条阶梯会整体错位，所以默认开。
+                </p>` : ''}
+                ${isRetry ? `<p class="replica-hint">
+                    ${state.facts ? `已读过 ${state.facts.frame_count || 0} 帧，帧事实走磁盘缓存——
+                         同一档、同一个逐帧识别模型重试不重付视觉调用的钱；换到更密的一档只
+                         补付新增的那些帧。<b>换了逐帧识别模型则会全部重读</b>（缓存按模型分桶，
+                         不然新模型的钱付了、拿到的还是旧模型的读数），换回去仍然免费。`
+                        : '上次没跑完，可以直接重试。'}
+                </p>` : ''}
+                ${hasBeats && !atCostGate ? `<p class="replica-hint">
+                    已经有一份节拍阶梯了。换档位重跑会覆盖它——你在下面改过的内容会丢。
+                </p>` : ''}
+                <button type="button" id="replica-start-btn" class="action-btn primary-btn">
+                    ${startLabel}
+                </button>
+            </div>
+        `}
     </div>`;
 }
 
@@ -566,12 +1344,54 @@ function replicaHandleComposerEvent(type, detail) {
     replicaProgressUpdate(lo + (Number(out.percent) || 0) / 100 * (hi - lo), out.label);
 }
 
+function replicaRenderBeatTimeline(doc, state) {
+    const beats = doc.beats || [];
+    if (!beats.length) return '';
+    const totalDuration = doc.video_duration_sec || (beats[beats.length - 1] ? beats[beats.length - 1].end : 10) || 10;
+    const speed = doc.speed_multiplier || (beats[0] && beats[0].speed_factor) || 2.0;
+    const totalActionSec = (totalDuration * speed).toFixed(1);
+    
+    const blocks = beats.map((b, i) => {
+        const span = Math.max(0.1, ((b.end || 0) - (b.start || 0)));
+        const pct = Math.max(2, Math.min(100, (span / totalDuration) * 100));
+        const stage = b.stage || 'structural';
+        const label = REPLICA_BEAT_STAGE_LABELS[stage] || stage;
+        const aSec = (span * speed).toFixed(1);
+        const isTooLong = span > 6.0;
+        const isTooShort = span < 2.0;
+        const warnTag = isTooLong ? '<span class="replica-timeline-warn-tag is-toolong">⚠️超长</span>' : (isTooShort ? '<span class="replica-timeline-warn-tag is-tooshort">⚠️微拍</span>' : '');
+
+        return `
+        <div class="replica-timeline-block stage-${escapeHtmlReplica(stage)} ${isTooLong ? 'is-toolong' : ''} ${isTooShort ? 'is-tooshort' : ''}" style="width: ${pct.toFixed(1)}%;"
+             data-jump-beat="${escapeHtmlReplica(b.id)}" title="${escapeHtmlReplica(b.id)} (${b.start}s–${b.end}s, 2x等效动作 ${aSec}s): ${escapeHtmlReplica(label)} · ${escapeHtmlReplica(b.operation || '')}">
+            <div class="replica-timeline-block-id">${escapeHtmlReplica(b.id)} ${warnTag}</div>
+            <div class="replica-timeline-block-label">${escapeHtmlReplica(label)}</div>
+            <div class="replica-timeline-block-time">${b.start}s–${b.end}s <small class="replica-timeline-span">(${span.toFixed(1)}s)</small></div>
+        </div>`;
+    }).join('');
+
+    return `
+    <div class="replica-beat-timeline-wrap">
+        <div class="replica-timeline-header">
+            <span class="replica-timeline-title">🎬 节拍胶卷时间轴（共 ${beats.length} 拍 · 屏幕 ${totalDuration.toFixed(1)}s | 2x 等效动作 ${totalActionSec}s）</span>
+            <div class="replica-timeline-header-actions">
+                <button type="button" id="replica-autobalance-btn" class="action-btn text-btn replica-mini-btn" title="根据 2x 倍速时序规则自动拆解 >6.0s 超长拍并合并微拍">⚡ 自动平衡秒数/拆拍</button>
+                <span class="replica-timeline-hint">点击时间块可快速定位对应拍</span>
+            </div>
+        </div>
+        <div class="replica-timeline-track">
+            ${blocks}
+        </div>
+    </div>`;
+}
+
 function replicaRenderBeats(state) {
     const doc = state.beats;
     if (!doc || !(doc.beats || []).length) return '';
     const violations = state.validation || doc.validation || [];
     const errors = violations.filter(v => v.level === 'error');
     const warns = violations.filter(v => v.level !== 'error');
+
     // 2026-08-10：这里原先把 temporary_object_lingering 特判成"会让合成直接失败"并强制
     // 展开。那条冲突已经在源头修掉（reverse_engineered 让合成器豁免清场规则），现在它
     // 只是一条"原片里确实有、复刻会照实保留"的提示，不再预示失败。
@@ -586,7 +1406,10 @@ function replicaRenderBeats(state) {
 
     const banner = `
         ${errors.length ? `<div class="replica-banner replica-banner-error">
-            <b>${errors.length} 项硬伤必须先修掉才能合成：</b>
+            <div class="replica-banner-head">
+                <b>${errors.length} 项硬伤必须先修掉才能合成：</b>
+                <button type="button" id="replica-banner-autofix-btn" class="action-btn primary-btn replica-mini-btn">🪄 一键 AI 修复全部硬伤</button>
+            </div>
             <ul>${errors.map(item).join('')}</ul>
         </div>` : `<div class="replica-banner replica-banner-ok">节拍阶梯已通过全部机械校验。</div>`}
         ${warns.length ? `<details class="replica-banner replica-banner-warn">
@@ -599,13 +1422,43 @@ function replicaRenderBeats(state) {
     const banned = (doc.banned_elements || []).map(x => escapeHtmlReplica(x)).join('、');
 
     return `
-    <div class="replica-section">
+    <div class="replica-section" id="replica-sec-beats">
         <div class="replica-card-title">节拍阶梯（${doc.beats.length} 拍）——唯一的人工卡点</div>
         <p class="replica-hint">
             这是整条链路上唯一能拦住「模型脑补了一个不存在的工序」的地方。对着证据帧核对，
             改完记得保存——保存会立刻重跑一遍校验。
         </p>
         ${banner}
+        ${replicaRenderBeatTimeline(doc, state)}
+
+        <!-- 节拍快速跳轨与折叠控制条 -->
+        <div class="replica-beat-jump-bar">
+            <div class="replica-beat-jump-controls">
+                <div class="replica-fold-toggle">
+                    <button type="button" id="replica-toggle-fold-all" class="action-btn text-btn replica-mini-btn">
+                        全部折叠 / 全部展开
+                    </button>
+                </div>
+                <div class="replica-beat-jump-chips-wrap">
+                    ${(doc.beats || []).map((b, i) => {
+                        const isErr = errors.some(e => e.beat_id === b.id);
+                        const isWarn = !isErr && warns.some(w => w.beat_id === b.id);
+                        const isCrossed = i > 0 && doc.beats[i-1].space && b.space && doc.beats[i-1].space.toLowerCase() !== b.space.toLowerCase();
+                        const cls = [
+                            'replica-beat-jump-chip',
+                            isErr ? 'is-error' : '',
+                            isWarn ? 'is-warn' : '',
+                            isCrossed ? 'is-crossed' : '',
+                        ].filter(Boolean).join(' ');
+                        return `<button type="button" class="${cls}" data-jump-beat="${escapeHtmlReplica(b.id)}" title="${escapeHtmlReplica(b.id)}: ${escapeHtmlReplica(b.operation || '')}">
+                            <span>${escapeHtmlReplica(b.id)}</span>
+                            ${isErr ? '<span class="dot-err">●</span>' : ''}
+                        </button>`;
+                    }).join('')}
+                </div>
+            </div>
+        </div>
+
         ${replicaRenderTimeWindows(doc)}
         <div class="replica-beats">${cards}</div>
         <div class="replica-section">
@@ -614,16 +1467,17 @@ function replicaRenderBeats(state) {
                       placeholder="用、分隔">${banned}</textarea>
         </div>
         ${replicaRenderSceneConstants(doc)}
+        ${/* 这一排只放别处没有的动作：保存与合成已经常驻吸底操作栏
+              （replicaRenderBottomBar）。同一个动作在一屏之内出现两次，用户得先
+              判断这两个是不是同一个按钮才敢点。 */''}
         <div class="replica-actions">
-            <button type="button" id="replica-save-btn" class="action-btn text-btn">保存并重校验</button>
+            <button type="button" id="replica-autofix-btn" class="action-btn text-btn" title="调用 AI 根据工序依赖与因果逻辑自动修正硬伤">🪄 AI 修复硬伤</button>
+            <button type="button" id="replica-actions-autobalance-btn" class="action-btn text-btn" title="按 2x 倍速时序规则自动拆解 >6.0s 超长拍并合并微拍">⚡ 自动平衡秒数/拆拍</button>
             <button type="button" id="replica-recluster-btn" class="action-btn text-btn"
                     title="帧事实走缓存，不会重付视觉调用的钱">重跑聚类</button>
             <button type="button" id="replica-translate-btn" class="action-btn text-btn"
                     title="只翻译，不改英文原文。改过英文的字段中文会先作废，按这里补回来">重译中文</button>
-            <button type="button" id="replica-compose-btn" class="action-btn primary-btn"
-                    ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词</button>
         </div>
-        ${replicaRenderVariantForm(state)}
     </div>`;
 }
 
@@ -673,7 +1527,7 @@ function replicaRenderSceneConstants(doc) {
                       placeholder="用、分隔">${escapeHtmlReplica((sc[key] || []).join('、'))}</textarea>
         </label>`).join('');
     return `
-    <div class="replica-section">
+    <div class="replica-section" id="replica-sec-scene">
         <div class="replica-field-label">场景恒常特征（整片一直存在，会写进每一条提示词）</div>
         <p class="replica-hint">
             由帧事实本地统计得来。节拍只承载每一拍的变化，而这些东西不变化，因此在阶梯里没有落脚点——
@@ -787,11 +1641,32 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
             ${mirror(key)}
         </label>`;
 
+    const violations = state.validation || (state.beats && state.beats.validation) || [];
+    const isErr = violations.some(v => v.level === 'error' && v.beat_id === beat.id);
+    const isMobile = typeof window !== 'undefined' && typeof window.innerWidth === 'number' && window.innerWidth <= 768;
+    let isCollapsed = isMobile ? (!isErr) : false;
+    if (replicaBeatFoldState[beat.id] !== undefined) {
+        isCollapsed = !!replicaBeatFoldState[beat.id];
+    }
+
+    const s_dur = (typeof beat.screen_duration_sec === 'number') ? beat.screen_duration_sec : Math.max(0.1, Math.round(((beat.end || 0) - (beat.start || 0)) * 10) / 10);
+    const speed = (state.beats && state.beats.speed_multiplier) || beat.speed_factor || 2.0;
+    const a_dur = (typeof beat.action_duration_sec === 'number') ? beat.action_duration_sec : Math.round(s_dur * speed * 10) / 10;
+    const quota = beat.voiceover_quota || { max_words: Math.floor(s_dur * 0.8 * 4.2), silence_sec: Math.round(s_dur * 0.2 * 10) / 10 };
+
     return `
-    <div class="replica-beat" data-beat-index="${idx}">
+    <div class="replica-beat ${isCollapsed ? 'is-collapsed' : ''}" data-beat-id="${escapeHtmlReplica(beat.id)}" data-beat-index="${idx}">
         <div class="replica-beat-head">
+            <button type="button" class="replica-beat-fold-btn" data-beat-fold="${escapeHtmlReplica(beat.id)}" title="折叠/展开本拍">
+                ${isCollapsed ? '▾' : '⌃'}
+            </button>
             <b>${escapeHtmlReplica(beat.id)}</b>
-            <span class="replica-chip">${beat.start}s – ${beat.end}s</span>
+            <span class="replica-chip replica-time-chip" title="点击箭头微调时间，或在右侧拆拍/合并">
+                <button type="button" class="replica-nudge-btn" data-nudge-beat="${idx}" data-nudge-field="start" data-nudge-delta="-0.5" title="起始时间提早 0.5 秒">◀</button>
+                <b class="replica-time-val">${beat.start}s – ${beat.end}s</b>
+                <button type="button" class="replica-nudge-btn" data-nudge-beat="${idx}" data-nudge-field="end" data-nudge-delta="+0.5" title="结束时间延后 0.5 秒">▶</button>
+            </span>
+            <span class="replica-chip replica-chip-timing" title="2x 倍速成片时序：屏幕时长 ${s_dur}s 对应 1.0x 真实物理动作 ${a_dur}s，旁白建议不超过 ${quota.max_words} 字">⏱️ ${s_dur}s (2x: ${a_dur}s) · 🎙️ 旁白 ≤${quota.max_words}字</span>
             ${replicaStageSelect(beat, idx)}
             ${beat.source_event_ids && beat.source_event_ids.length
                 ? `<span class="replica-chip">事件 ${escapeHtmlReplica(beat.source_event_ids.join(','))}</span>` : ''}
@@ -805,58 +1680,46 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
                         title="并入上一拍">上并</button>
             </span>
         </div>
-        <div class="replica-thumbs">${thumbs || '<span class="replica-hint">无证据帧</span>'}</div>
-        ${isRef ? '<p class="replica-hint">变体：这些帧只作运镜与构图参考，不再是事实断言。</p>' : ''}
-        ${coverage.length ? `
-        <details class="replica-coverage" ${beat.end - beat.start >= 6 ? 'open' : ''}>
-            <summary class="replica-hint">覆盖帧 ${coverage.length} 张（${beat.start}s – ${beat.end}s 内按时间均分，仅供核对）</summary>
-            <div class="replica-cov-strip">${coverageThumbs}</div>
-        </details>` : ''}
-        <div class="replica-beat-fields">
-            ${field('space', '所在空间（同一个空间逐字沿用同一个名字；换名字＝机位穿过开口进了另一个空间，会多出一次过门）')}
-            ${field('visual_subject', '画面主体')}
-            ${field('operation', '主导工序')}
-            ${field('package_operations',
-                    `工序包（一行一道，须 2~3 道；当前 ${(beat.package_operations || []).length} 道）`, 2)}
-            ${field('visible_action', '可见动作', 2)}
-            ${field('visible_result', '可见结果', 2)}
-            ${field('state_before', '起始状态（须写具体空间完成范围）', 2)}
-            ${field('state_after', '结束状态（须写具体空间完成范围）', 2)}
-            ${field('persistent_traces', '遗留痕迹（一行一条）', 2)}
+        <div class="replica-beat-summary">
+            <span class="replica-summary-tag"><b>${escapeHtmlReplica(beat.id)}</b> · ${beat.start}–${beat.end}s</span>
+            <span class="replica-summary-tag"><b>阶段:</b> ${escapeHtmlReplica(REPLICA_BEAT_STAGE_LABELS[beat.stage] || beat.stage || '—')}</span>
+            <span class="replica-summary-tag"><b>主体:</b> ${escapeHtmlReplica(beat.visual_subject || '—')}</span>
+            <span class="replica-summary-tag"><b>工序:</b> ${escapeHtmlReplica(beat.operation || (beat.package_operations || [])[0] || '—')}</span>
+            ${beat.space ? `<span class="replica-summary-tag"><b>空间:</b> ${escapeHtmlReplica(beat.space)}</span>` : ''}
         </div>
-    </div>`;
-}
-
-function replicaRenderVariantForm(state) {
-    if (state.stage !== 'review_beats' && state.stage !== 'completed') return '';
-    const boxes = REPLICA_AXES.map(a => `
-        <label class="replica-axis">
-            <input type="checkbox" class="replica-axis-box" value="${a.key}">
-            <span><b>${a.label}</b><em>${a.hint}</em></span>
-        </label>`).join('');
-    return `
-    <div class="replica-section replica-variant">
-        <div class="replica-card-title">二创（可选）</div>
-        <p class="replica-hint">
-            骨架不动，只沿轴换内容。<b>最多同时变两轴</b>——三轴以上产出的已经不是「参考爆款」，
-            而是一个新选题，那条路走选题发动机更合适。
-        </p>
-        <div class="replica-axes">${boxes}</div>
-        <textarea id="replica-variant-brief" class="replica-textarea" rows="2"
-                  placeholder="想变成什么？例如：换成废弃双层巴士，落在北欧雪地"></textarea>
-        <button type="button" id="replica-variant-btn" class="action-btn primary-btn">生成二创节拍</button>
+        <div class="replica-beat-body">
+            <div class="replica-thumbs">${thumbs || '<span class="replica-hint">无证据帧</span>'}</div>
+            ${isRef ? '<p class="replica-hint">变体：这些帧只作运镜与构图参考，不再是事实断言。</p>' : ''}
+            ${coverage.length ? `
+            <details class="replica-coverage" ${beat.end - beat.start >= 6 ? 'open' : ''}>
+                <summary class="replica-hint">覆盖帧 ${coverage.length} 张（${beat.start}s – ${beat.end}s 内按时间均分，仅供核对）</summary>
+                <div class="replica-cov-strip">${coverageThumbs}</div>
+            </details>` : ''}
+            <div class="replica-beat-fields">
+                ${field('space', '所在空间（同一个空间逐字沿用同一个名字；换名字＝机位穿过开口进了另一个空间，会多出一次过门）')}
+                ${field('visual_subject', '画面主体')}
+                ${field('operation', '主导工序')}
+                ${field('package_operations',
+                        `工序包（一行一道，须 2~3 道；当前 ${(beat.package_operations || []).length} 道）`, 2)}
+                ${field('visible_action', '可见动作', 2)}
+                ${field('visible_result', '可见结果', 2)}
+                ${field('state_before', '起始状态（须写具体空间完成范围）', 2)}
+                ${field('state_after', '结束状态（须写具体空间完成范围）', 2)}
+                ${field('persistent_traces', '遗留痕迹（一行一条）', 2)}
+            </div>
+        </div>
     </div>`;
 }
 
 function replicaRenderOutput(state) {
     if (!state.prompt_block) return '';
-    const hits = state.banned_hits || [];
-    const blocked = state.stage === 'audit_failed';
     // 提示词只活在这一页里的话，用户合成完就没有下一步了。下一步只有一个去向：
     // 存成项目、直接进激发结果页。渲染（分步合成 / 一键合成）在那一页里全都有，
     // 复刻页不必自己再开一条只通向分步管线的窄路。
+    const hits = state.banned_hits || [];
+    const blocked = state.stage === 'audit_failed';
     return `
-    <div class="replica-section">
+    <div class="replica-section" id="replica-sec-output">
         <div class="replica-card-title">提示词包${state.title ? ` · ${escapeHtmlReplica(state.title)}` : ''}</div>
         ${blocked ? `<div class="replica-banner replica-banner-error">
             <b>已拦下交付：命中 ${hits.length} 个禁用元素</b>（原片里并不存在）：
@@ -896,6 +1759,11 @@ function replicaBindEvents() {
     on('#replica-upload-btn', replicaUpload);
     on('#replica-start-btn', replicaStart);
     on('#replica-reextract-btn', replicaReExtract);
+    on('#replica-toggle-extract-btn', () => {
+        replicaExtractExpanded = !replicaExtractExpanded;
+        replicaRender();
+    });
+    // 模型选择改一下就落盘，不必等到点「开始反推」
     // 模型选择改一下就落盘，不必等到点「开始反推」：用户很可能选完就去点了别的动作
     // （比如 recluster），那条路径读的是 config，没落盘就等于没选。
     on('#replica-frame-model', replicaCaptureReverseModels, 'change');
@@ -909,19 +1777,146 @@ function replicaBindEvents() {
             () => replicaToast('已复制'), () => replicaToast('复制失败', true));
     });
 
+    // 快捷任务切换与新建
+    on('#replica-quick-job-select', async (e) => {
+        const jid = e.target.value;
+        if (jid) {
+            try {
+                await replicaLoadJob(jid);
+                replicaRender();
+            } catch (err) { replicaToast(err.message, true); }
+        }
+    }, 'change');
+
+    on('#replica-new-upload-btn', () => replicaFocusSection('replica-sec-uploader'));
+
+    // 任务列表的展开态要跨重渲染活下来，否则展开它、点开一条任务、页面重画，它又收上了。
+    on('#replica-sec-jobs', (e) => { replicaJobListExpanded = e.currentTarget.open; }, 'toggle');
+
+    // 阶段指示条点击跳转：四个用户可见阶段各对应页面上真实存在的一块区域。
+    root.querySelectorAll('.replica-phase[data-phase]').forEach(li => {
+        li.addEventListener('click', () => {
+            const phase = li.dataset.phase;
+            let targetId = '';
+            if (phase === 'material') {
+                targetId = document.getElementById('replica-sec-extract') ? 'replica-sec-extract' : 'replica-sec-uploader';
+            } else if (phase === 'reverse') {
+                targetId = document.getElementById('replica-progress') && replicaSSE ? 'replica-progress' : 'replica-sec-extract';
+            } else if (phase === 'review') {
+                targetId = 'replica-sec-beats';
+            } else if (phase === 'deliver') {
+                targetId = 'replica-sec-output';
+            }
+            replicaFocusSection(targetId);
+        });
+    });
+
+    replicaBindNavEvents();
+    replicaBindBottomBarEvents();
+
+    // 悬浮直达工具
+    root.querySelectorAll('[data-float-action="top"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const shell = replicaShell();
+            if (shell) shell.scrollTo({ top: 0, behavior: 'smooth' });
+            else window.scrollTo({ top: 0, behavior: 'smooth' });
+        });
+    });
+    root.querySelectorAll('[data-float-action="save"]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            replicaSaveBeats(true, e.currentTarget);
+        });
+    });
+    on('#replica-bar-recompose-btn', (e) => replicaCompose(e.currentTarget));
+    on('#replica-bar-cancel-btn', replicaCancelRun);
+
     root.querySelectorAll('.replica-job-open').forEach(btn => {
         btn.addEventListener('click', async () => {
             try {
                 await replicaLoadJob(btn.dataset.job);
                 replicaRender();
+                if (!replicaFocusSection('replica-sec-workbench')) replicaFocusSection('replica-sec-current-job');
             } catch (e) { replicaToast(e.message, true); }
         });
     });
 
+    root.querySelectorAll('[data-rename], [data-rename-current]').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const jobId = btn.dataset.rename || btn.dataset.renameCurrent;
+            const currentJob = replicaJobs.find(j => j.job_id === jobId) || (replicaState && replicaState.job_id === jobId ? replicaState : {}) || {};
+            const oldTitle = currentJob.title || currentJob.video_name || jobId;
+            const newTitle = window.prompt('请输入新的任务标题（保存后将锁定）：', oldTitle);
+            if (!newTitle || !newTitle.trim() || newTitle.trim() === oldTitle) return;
+            try {
+                await replicaFetch('/api/replica/rename', {
+                    method: 'POST', headers: replicaHeaders(),
+                    body: JSON.stringify({ job_id: jobId, title: newTitle.trim() }),
+                });
+                if (replicaState && replicaState.job_id === jobId) {
+                    replicaState.title = newTitle.trim();
+                    replicaState.title_locked = true;
+                }
+                await replicaLoadJobs();
+                replicaRender();
+                replicaToast('任务已重命名并锁定');
+            } catch (err) { replicaToast(err.message, true); }
+        });
+    });
+
+    root.querySelectorAll('[data-archive], [data-archive-current]').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const jobId = btn.dataset.archive || btn.dataset.archiveCurrent;
+            if (!window.confirm('确认瘦身归档此任务？\n将清理所有高清抽帧、过程拼图与原始视频（释放数百 MB 磁盘），保留核心节拍骨架与提示词资产。')) return;
+            try {
+                await replicaFetch('/api/replica/archive', {
+                    method: 'POST', headers: replicaHeaders(),
+                    body: JSON.stringify({ job_id: jobId }),
+                });
+                if (replicaState && replicaState.job_id === jobId) {
+                    await replicaLoadJob(jobId);
+                }
+                await replicaLoadJobs();
+                replicaRender();
+                replicaToast('任务已完成瘦身归档');
+            } catch (err) { replicaToast(err.message, true); }
+        });
+    });
+
+    root.querySelectorAll('[data-toggle-variants]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const parentId = btn.dataset.toggleVariants;
+            const currentlyFolded = replicaVariantFoldState[parentId] !== false;
+            replicaVariantFoldState[parentId] = !currentlyFolded;
+            replicaRender();
+        });
+    });
+
+    const searchInput = root.querySelector('#replica-job-search-input');
+    if (searchInput) {
+        searchInput.addEventListener('input', (e) => {
+            replicaJobListSearchQuery = e.target.value;
+            replicaRender();
+            const nextInput = replicaRoot().querySelector('#replica-job-search-input');
+            if (nextInput) {
+                nextInput.focus();
+                nextInput.setSelectionRange(nextInput.value.length, nextInput.value.length);
+            }
+        });
+    }
+
+    const jobsCard = root.querySelector('#replica-sec-jobs');
+    if (jobsCard) {
+        jobsCard.addEventListener('toggle', () => {
+            replicaJobListExpanded = jobsCard.open;
+        });
+    }
+
     root.querySelectorAll('[data-delete]').forEach(btn => {
         btn.addEventListener('click', async () => {
             const jobId = btn.dataset.delete;
-            // 删的是几百张抽帧产物，不可撤销——问一句。
             if (!window.confirm('删除这个任务？抽帧产物会一并清掉，不可恢复。')) return;
             try {
                 await replicaFetch('/api/replica/delete', {
@@ -935,6 +1930,76 @@ function replicaBindEvents() {
             } catch (e) { replicaToast(e.message, true); }
         });
     });
+
+    on('#replica-lock-baseline-btn', () => replicaToggleBaselineLock(true));
+    on('#replica-unlock-baseline-btn', () => replicaToggleBaselineLock(false));
+    on('#replica-mutate-orthogonal-btn', (e) => replicaMutateOrthogonal(e.currentTarget));
+    on('#replica-toggle-comparator-btn', () => replicaToggleComparator());
+    on('#replica-close-comparator-btn', () => replicaToggleComparator(false));
+    on('#replica-pane-handoff-btn', (e) => replicaHandoffToStepped(e.currentTarget));
+    on('#replica-ai-diverge-btn', (e) => replicaAiDiverge(e.currentTarget));
+    on('#replica-ai-diverge-refresh-btn', (e) => replicaAiDiverge(e.currentTarget));
+    on('#replica-pane-focus-mutator-btn', () => {
+        const envInput = root.querySelector('#replica-axis-env');
+        if (envInput) envInput.focus();
+    });
+
+    // 联网参考案例库抽屉事件
+    on('#replica-trend-refs-toggle', () => {
+        replicaRefsDrawerOpen = !replicaRefsDrawerOpen;
+        const drawer = root.querySelector('#replica-spark-drawer-refs');
+        if (drawer) {
+            drawer.classList.toggle('drawer-open', replicaRefsDrawerOpen);
+            const toggle = drawer.querySelector('#replica-trend-refs-toggle');
+            if (toggle) toggle.setAttribute('aria-expanded', replicaRefsDrawerOpen ? 'true' : 'false');
+        }
+    });
+    on('#replica-trend-refs-direction-toggle', () => {
+        replicaRefsDirectionOpen = !replicaRefsDirectionOpen;
+        const panel = root.querySelector('#replica-trend-refs-direction-panel');
+        if (panel) panel.hidden = !replicaRefsDirectionOpen;
+    });
+    on('#replica-trend-refs-search-btn', () => {
+        if (typeof searchNewTrendRefs === 'function') searchNewTrendRefs();
+    });
+    on('#replica-trend-refs-manage-open-btn', () => {
+        if (typeof openTrendRefsManageModal === 'function') openTrendRefsManageModal();
+    });
+    on('#replica-trend-refs-archive-toggle', () => {
+        if (typeof toggleArchivePanel === 'function') toggleArchivePanel('replica');
+    });
+    on('#replica-trend-refs-filter', (e) => {
+        replicaRefsFilterQuery = e.target.value;
+        if (typeof renderTrendRefs === 'function') renderTrendRefs();
+    }, 'input');
+
+    if (typeof initTrendRefsDirectionPanel === 'function') initTrendRefsDirectionPanel();
+    if (typeof renderTrendRefs === 'function') renderTrendRefs();
+
+    root.querySelectorAll('[data-idea-idx]').forEach(card => {
+        card.addEventListener('click', () => {
+            const idx = parseInt(card.dataset.ideaIdx, 10);
+            if (!isNaN(idx)) replicaSelectIdea(idx);
+        });
+    });
+
+    root.querySelectorAll('[data-open-job]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const jid = btn.dataset.openJob;
+            if (jid) {
+                try {
+                    await replicaLoadJob(jid);
+                    replicaRender();
+                    if (!replicaFocusSection('replica-sec-workbench')) replicaFocusSection('replica-sec-current-job');
+                } catch (e) { replicaToast(e.message, true); }
+            }
+        });
+    });
+
+    on('#replica-baseline-collage-box', () => replicaOpenLightbox([{
+        url: replicaCollageUrl(replicaState),
+        caption: '1:1 黄金母本 5 列标准拼图 (Ground-Truth Collage)',
+    }], 0));
 
     on('#replica-collage', () => replicaOpenLightbox([{
         url: replicaCollageUrl(replicaState),
@@ -958,10 +2023,6 @@ function replicaOpenLightbox(items, index) {
 }
 
 // 节拍区自己的绑定，单独一函数。
-//
-// 这样 replicaRefreshBeats 可以只重建节拍区、只重绑节拍区的监听。整页重建加整页重绑
-// 会在未变的节点上叠加第二份监听（点一次触发两次），而节拍区里恰恰是拆拍/合拍这种
-// 重复执行会直接改坏数据的操作。
 function replicaBindBeatEvents(scope) {
     if (!scope) return;
     const on = (sel, fn, evt = 'click') => {
@@ -969,9 +2030,12 @@ function replicaBindBeatEvents(scope) {
         if (el) el.addEventListener(evt, fn);
     };
 
-    on('#replica-save-btn', (e) => replicaSaveBeats(true, e.currentTarget));
+    // 保存与合成不在这一排里，它们常驻吸底操作栏（见 replicaBindBottomBarEvents）。
+    on('#replica-autofix-btn', (e) => replicaAdvance('autofix', {}, e.currentTarget));
+    on('#replica-banner-autofix-btn', (e) => replicaAdvance('autofix', {}, e.currentTarget));
+    on('#replica-autobalance-btn', (e) => replicaAdvance('autobalance', {}, e.currentTarget));
+    on('#replica-actions-autobalance-btn', (e) => replicaAdvance('autobalance', {}, e.currentTarget));
     on('#replica-recluster-btn', (e) => replicaAdvance('recluster', {}, e.currentTarget));
-    // 先落盘再翻译：翻译在服务端读的是已保存的那一份，不先保存就会翻旧的英文。
     on('#replica-translate-btn', async (e) => {
         const btn = e.currentTarget;
         if (!(await replicaSaveBeats(false, btn))) {
@@ -980,10 +2044,59 @@ function replicaBindBeatEvents(scope) {
         }
         replicaAdvance('translate', {}, btn);
     });
-    on('#replica-compose-btn', (e) => replicaCompose(e.currentTarget));
     on('#replica-variant-btn', (e) => replicaVariant(e.currentTarget));
 
-    // 证据帧：原地开灯箱。一拍的几张帧作为一组传进去，左右方向键就能在同一拍内翻。
+    // 全部折叠 / 全部展开
+    on('#replica-toggle-fold-all', () => {
+        const cards = scope.querySelectorAll('.replica-beat');
+        if (!cards.length) return;
+        const hasExpanded = Array.from(cards).some(c => !c.classList.contains('is-collapsed'));
+        cards.forEach(c => {
+            const id = c.dataset.beatId;
+            if (hasExpanded) {
+                c.classList.add('is-collapsed');
+                if (id) replicaBeatFoldState[id] = true;
+                const btn = c.querySelector('.replica-beat-fold-btn');
+                if (btn) btn.textContent = '▾';
+            } else {
+                c.classList.remove('is-collapsed');
+                if (id) replicaBeatFoldState[id] = false;
+                const btn = c.querySelector('.replica-beat-fold-btn');
+                if (btn) btn.textContent = '⌃';
+            }
+        });
+        const toggleBtn = scope.querySelector('#replica-toggle-fold-all');
+        if (toggleBtn) {
+            toggleBtn.textContent = hasExpanded ? '全部展开' : '全部折叠';
+        }
+    });
+
+    // 单拍折叠 / 展开
+    scope.querySelectorAll('.replica-beat-fold-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const card = btn.closest('.replica-beat');
+            if (!card) return;
+            const isCol = card.classList.toggle('is-collapsed');
+            const id = card.dataset.beatId;
+            if (id) replicaBeatFoldState[id] = isCol;
+            btn.textContent = isCol ? '▾' : '⌃';
+        });
+    });
+
+    scope.querySelectorAll('.replica-beat-summary').forEach(sumEl => {
+        sumEl.addEventListener('click', () => {
+            const card = sumEl.closest('.replica-beat');
+            if (!card) return;
+            card.classList.remove('is-collapsed');
+            const id = card.dataset.beatId;
+            if (id) replicaBeatFoldState[id] = false;
+            const btn = card.querySelector('.replica-beat-fold-btn');
+            if (btn) btn.textContent = '⌃';
+        });
+    });
+
+    // 证据帧：原地开灯箱
     scope.querySelectorAll('[data-lightbox-beat]').forEach(img => {
         img.addEventListener('click', () => {
             const beats = ((replicaState || {}).beats || {}).beats || [];
@@ -997,8 +2110,7 @@ function replicaBindBeatEvents(scope) {
         });
     });
 
-    // 覆盖帧走同一个灯箱，一拍的整排帧作为一组：左右方向键就是在这一拍的时间轴上
-    // 前后走，这正是「长拍中段发生了什么」最自然的看法。
+    // 覆盖帧灯箱
     scope.querySelectorAll('[data-cov-beat]').forEach(img => {
         img.addEventListener('click', () => {
             const beats = ((replicaState || {}).beats || {}).beats || [];
@@ -1011,18 +2123,24 @@ function replicaBindBeatEvents(scope) {
         });
     });
 
-    // 硬伤 → 涉事那一拍。高亮用一次性的 class，动画结束就摘掉，免得整页留着一片黄。
+    // 跳轨 Chip 与硬伤跳转：滚到对应拍并自动展开
     scope.querySelectorAll('[data-jump-beat]').forEach(btn => {
         btn.addEventListener('click', () => {
-            const beats = ((replicaState || {}).beats || {}).beats || [];
-            const idx = beats.findIndex(b => b.id === btn.dataset.jumpBeat);
-            const card = idx >= 0 && scope.querySelector(`[data-beat-index="${idx}"]`);
-            if (!card) { replicaToast(`找不到 ${btn.dataset.jumpBeat}，阶梯可能已被改过`, true); return; }
+            const beatId = btn.dataset.jumpBeat;
+            const card = scope.querySelector(`[data-beat-id="${beatId}"]`)
+                      || scope.querySelector(`[data-beat-index="${parseInt(beatId, 10)}"]`);
+            if (!card) { replicaToast(`找不到 ${beatId}，阶梯可能已被改动`, true); return; }
+            if (card.classList.contains('is-collapsed')) {
+                card.classList.remove('is-collapsed');
+                if (beatId) replicaBeatFoldState[beatId] = false;
+                const foldBtn = card.querySelector('.replica-beat-fold-btn');
+                if (foldBtn) foldBtn.textContent = '⌃';
+            }
             card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            card.classList.remove('replica-beat-flag');
-            // 强制回流，否则连点同一条时 class 没被真正摘掉过，动画不会重播。
+            card.classList.remove('replica-beat-flag', 'replica-section-flash');
             void card.offsetWidth;
-            card.classList.add('replica-beat-flag');
+            card.classList.add('replica-beat-flag', 'replica-section-flash');
+            setTimeout(() => card.classList.remove('replica-section-flash'), 1000);
         });
     });
 
@@ -1032,23 +2150,28 @@ function replicaBindBeatEvents(scope) {
     scope.querySelectorAll('[data-merge]').forEach(btn => {
         btn.addEventListener('click', () => replicaMergeBeat(parseInt(btn.dataset.merge, 10)));
     });
+    scope.querySelectorAll('[data-nudge-beat]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const beatIdx = parseInt(btn.dataset.nudgeBeat, 10);
+            const field = btn.dataset.nudgeField;
+            const delta = parseFloat(btn.dataset.nudgeDelta);
+            replicaNudgeBeatTime(beatIdx, field, delta);
+        });
+    });
 
-    // 编辑即写回内存 model。原先是每次动作前用 replicaCollectBeats 全量扫一遍 DOM 反推
-    // 出文档——那要求 DOM 必须一直是唯一真相，于是任何局部刷新都不敢做，只能整页重建，
-    // 滚动位置和焦点每次都丢。现在 model 是真相，DOM 只是它的投影。
     scope.querySelectorAll('[data-beat][data-key]').forEach(el => {
-        el.addEventListener('input', () => {
+        const updateBeat = () => {
             const beat = ((replicaState || {}).beats || {}).beats || [];
             const target = beat[parseInt(el.dataset.beat, 10)];
             if (!target) return;
             const key = el.dataset.key;
-            // 数组字段按键名判定，不看当前值的类型：老任务里可能压根没有这个键
-            // （undefined 不是数组），一次编辑就会把一个数组字段写成字符串，
-            // 保存时 schema 校验直接判死。
             target[key] = (REPLICA_LIST_FIELDS.has(key) || Array.isArray(target[key]))
                 ? el.value.split('\n').map(s => s.trim()).filter(Boolean)
                 : el.value.trim();
-        });
+        };
+        el.addEventListener('input', updateBeat);
+        el.addEventListener('change', updateBeat);
     });
 
     const banned = scope.querySelector('#replica-banned');
@@ -1075,8 +2198,6 @@ function replicaBindBeatEvents(scope) {
         });
     });
 
-    // 只在轴数超上限时拦一下，别默默改用户的勾选——用户自己取消一个，比我们替他决定
-    // 丢掉哪一个要好。
     scope.querySelectorAll('.replica-axis-box').forEach(box => {
         box.addEventListener('change', () => {
             const checked = scope.querySelectorAll('.replica-axis-box:checked');
@@ -1089,14 +2210,180 @@ function replicaBindBeatEvents(scope) {
 }
 
 // 只重建节拍区，不动页面其余部分，并把滚动位置放回去。
+//
+// 整页重建会把滚动位置一起丢掉，而节拍区恰恰是这一页最长的一块——几十拍改到一半被
+// 弹回顶端，等于每保存一次就罚一次。存位/还位必须用 replicaShell()：全站 window
+// 从不滚动，用 window.scrollY 存下来的恒为 0，还位就成了空操作。
 function replicaRefreshBeats() {
     const host = replicaRoot() && replicaRoot().querySelector('#replica-beats-host');
     if (!host) { replicaRender(); return; }
-    const top = window.scrollY;
+    const shell = replicaShell();
+    const top = shell ? shell.scrollTop : 0;
     host.innerHTML = replicaRenderBeats(replicaState);
     replicaBindBeatEvents(host);
+    // 硬伤数变了，栏外那两块也得跟着变：吸顶导航上的红色角标、吸底栏上的硬伤计数与
+    // 「合成提示词」的禁用态，都是从同一份 validation 算出来的。只刷节拍区的话，
+    // 保存完硬伤明明清零了，导航还挂着红角标、合成按钮还是灰的。
+    replicaRefreshChrome();
     if (replicaBusy) replicaSetBusy(true);
-    window.scrollTo({ top });
+    if (shell) shell.scrollTop = top;
+}
+
+// 重画吸顶导航与吸底操作栏（都在节拍区之外，且都读 validation）。
+function replicaRefreshChrome() {
+    const navBar = document.getElementById('replica-nav-bar');
+    if (navBar) {
+        navBar.outerHTML = replicaRenderNavBar(replicaState);
+        replicaBindNavEvents();
+    }
+    const bottomBar = document.getElementById('replica-bottom-bar');
+    if (bottomBar) {
+        bottomBar.outerHTML = replicaRenderBottomBar(replicaState);
+        replicaBindBottomBarEvents();
+    }
+    replicaUpdateNavActive();
+    replicaUpdateTabBadge();
+}
+
+// ── 区段直达 ──────────────────────────────────────────────────────────────────────
+
+// 滚到某个区段并闪一下。三个入口（阶段轨、吸顶导航、页头「上传新视频」）此前各写了
+// 一份一模一样的 scrollIntoView + flash + setTimeout。
+function replicaFocusSection(targetId) {
+    const target = targetId && document.getElementById(targetId);
+    if (!target) return false;
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    target.classList.remove('replica-section-flash');
+    void target.offsetWidth;   // 强制回流，否则连点同一项时动画不会重播
+    target.classList.add('replica-section-flash');
+    setTimeout(() => target.classList.remove('replica-section-flash'), 1000);
+    return true;
+}
+
+// 吸顶区段导航。单独一函数是因为它要在 replicaRefreshBeats 里被重绑——保存一次
+// 之后硬伤数会变，那个角标挂在导航药丸上。
+function replicaBindNavEvents() {
+    const bar = document.getElementById('replica-nav-bar');
+    if (!bar) return;
+    bar.querySelectorAll('.replica-nav-item').forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (!replicaFocusSection(btn.dataset.navTarget)) return;
+            bar.querySelectorAll('.replica-nav-item').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+        });
+    });
+}
+
+// 吸底主操作栏。同样要能重绑：栏上的硬伤计数与「合成提示词」的禁用态都跟着校验结果走。
+function replicaBindBottomBarEvents() {
+    const bar = document.getElementById('replica-bottom-bar');
+    if (!bar) return;
+    const on = (sel, fn) => {
+        const el = bar.querySelector(sel);
+        if (el) el.addEventListener('click', fn);
+    };
+    on('#replica-bar-start-btn', replicaStart);
+    on('#replica-bar-save-btn', (e) => replicaSaveBeats(true, e.currentTarget));
+    on('#replica-bar-compose-btn', (e) => replicaCompose(e.currentTarget));
+    on('#replica-bar-project-btn', (e) => replicaSaveToProject(e.currentTarget));
+    on('#replica-bar-recompose-btn', replicaCompose);
+    on('#replica-bar-cancel-btn', replicaCancelRun);
+    // 硬伤计数本身就是「带我去看」的入口：它是这条栏上唯一说得出问题在哪的东西。
+    on('#replica-bar-errors-btn', () => replicaFocusSection('replica-sec-beats'));
+}
+
+// ── 滚动监听与 ScrollSpy ──────────────────────────────────────────────────────────
+
+function replicaInitScrollSpy() {
+    const shell = replicaShell();
+    if (!shell || shell._hasReplicaScrollSpy) return;
+    shell._hasReplicaScrollSpy = true;
+    shell.addEventListener('scroll', () => {
+        replicaHandleScroll(shell);
+    }, { passive: true });
+}
+
+function replicaHandleScroll(shell) {
+    if (!shell) return;
+    const top = shell.scrollTop;
+    const floatTools = document.getElementById('replica-floating-tools');
+    if (floatTools) {
+        floatTools.classList.toggle('is-visible', top > 150);
+    }
+    replicaUpdateNavActive();
+}
+
+function replicaUpdateNavActive() {
+    const shell = replicaShell();
+    if (!shell) return;
+    const navItems = document.querySelectorAll('.replica-nav-item');
+    if (!navItems.length) return;
+
+    const shellRect = shell.getBoundingClientRect();
+    const targets = [];
+    navItems.forEach(item => {
+        const id = item.dataset.navTarget;
+        const el = document.getElementById(id);
+        if (el) {
+            const rect = el.getBoundingClientRect();
+            const relTop = rect.top - shellRect.top;
+            targets.push({ id, item, el, relTop });
+        }
+    });
+
+    // 按「相对滚动容器顶端的距离」排，而不是 offsetTop。offsetTop 是相对各自
+    // offsetParent 的，眼下所有锚点恰好共用同一个（谁都没有 position），所以两者
+    // currently 等价；但给 .replica-workbench-grid 或 .replica-card 加一次
+    // position:relative，offsetTop 的口径就会分裂，排序静默错乱、高亮跳到别的区段。
+    // relTop 上面已经算好了，用它没有这个前提。
+    targets.sort((a, b) => a.relTop - b.relTop);
+
+    // 最后一个「顶端已经越过吸顶导航条」的区段就是当前区段。
+    let best = null;
+    for (const t of targets) {
+        if (t.relTop <= 160) {
+            best = t;
+        }
+    }
+    if (!best && targets.length > 0) {
+        best = targets[0];
+    }
+
+    if (best) {
+        navItems.forEach(item => {
+            item.classList.toggle('active', item.dataset.navTarget === best.id);
+        });
+    }
+}
+
+function replicaUpdateTabBadge() {
+    const tab = document.getElementById('main-tab-replica');
+    if (!tab) return;
+    let badge = tab.querySelector('.replica-tab-status-dot');
+    const hasRunning = !!replicaSSE;
+    const isPausedReview = replicaState && replicaState.stage === 'review_beats';
+    const violations = replicaState ? (replicaState.validation || (replicaState.beats && replicaState.beats.validation) || []) : [];
+    const hasErrors = violations.some(v => v.level === 'error');
+
+    if (hasRunning || isPausedReview || hasErrors) {
+        if (!badge) {
+            badge = document.createElement('span');
+            badge.className = 'replica-tab-status-dot';
+            tab.appendChild(badge);
+        }
+        if (hasErrors) {
+            badge.className = 'replica-tab-status-dot is-error';
+            badge.title = '存在待修复硬伤';
+        } else if (hasRunning) {
+            badge.className = 'replica-tab-status-dot is-running';
+            badge.title = '正在执行中';
+        } else if (isPausedReview) {
+            badge.className = 'replica-tab-status-dot is-pause';
+            badge.title = '待人工核对节拍';
+        }
+    } else if (badge) {
+        badge.remove();
+    }
 }
 
 // 禁用元素的分隔符。UI 提示"用、分隔"，而原先的解析是 /[、,\n]/ —— 不含全角逗号，
@@ -1317,6 +2604,197 @@ async function replicaSaveToProject(btn) {
     }
 }
 
+function replicaSelectIdea(ideaIndex) {
+    replicaActiveIdeaIndex = ideaIndex;
+    const ideas = (replicaState && replicaState.ai_diverged_ideas) || replicaAiIdeas || [];
+    const idea = ideas[ideaIndex];
+    if (!idea) return;
+
+    replicaActivePreset = idea.id || `idea_${ideaIndex}`;
+    const root = replicaRoot();
+    if (!root) return;
+
+    root.querySelectorAll('.replica-ai-idea-card').forEach((card, idx) => {
+        const active = idx === ideaIndex;
+        card.classList.toggle('active', active);
+        const top = card.querySelector('.replica-ai-idea-top');
+        if (top) {
+            let badge = top.querySelector('.replica-ai-idea-badge');
+            if (active) {
+                if (!badge) top.insertAdjacentHTML('beforeend', '<span class="replica-ai-idea-badge">已选用</span>');
+            } else {
+                if (badge) badge.remove();
+            }
+        }
+    });
+
+    const setVal = (id, val) => {
+        const el = root.querySelector(id);
+        if (el) el.value = val || '';
+    };
+
+    if (idea.axes) {
+        setVal('#replica-axis-env', idea.axes.environment || '');
+        setVal('#replica-axis-mat', idea.axes.material || '');
+        setVal('#replica-axis-func', idea.axes.function || '');
+        setVal('#replica-axis-hero', idea.axes.hero_reveal || '');
+    }
+
+    const note = idea.trend_ref ? `（借鉴：${idea.trend_ref}）` : '';
+    replicaToast(`已装载「${idea.name}」正交词槽${note}`);
+}
+
+async function replicaAiDiverge(btn) {
+    if (!replicaState) {
+        replicaToast('请先选择或上传一个母本任务', true);
+        return;
+    }
+    const root = replicaRoot() || document;
+    const briefInput = root.querySelector('#replica-diverge-brief');
+    const brief = briefInput ? briefInput.value.trim() : (replicaDivergeBrief || '');
+    replicaDivergeBrief = brief;
+
+    const selTrendRefIds = typeof getSelectedTrendRefIds === 'function' ? getSelectedTrendRefIds() : [];
+
+    replicaDiverging = true;
+    replicaSetBusy(true, btn);
+    try {
+        const data = await replicaFetch('/api/replica/ai_diverge', {
+            method: 'POST',
+            headers: replicaHeaders(),
+            body: JSON.stringify({
+                baseline_job_id: replicaState.job_id,
+                brief: brief,
+                count: 4,
+                trend_ref_ids: selTrendRefIds,
+                config: replicaConfig(),
+            }),
+        });
+        if (data.ideas && data.ideas.length) {
+            replicaAiIdeas = data.ideas;
+            if (replicaState) {
+                replicaState.ai_diverged_ideas = data.ideas;
+            }
+            replicaActiveIdeaIndex = 0;
+            replicaRender();
+            replicaSelectIdea(0);
+            const refNote = selTrendRefIds.length > 0 ? `已结合 ${selTrendRefIds.length} 条联网参考` : '已结合趋势案例库';
+            replicaToast(`✨ AI 智能发散成功（${refNote}），已自动装载首选方案！`);
+        } else {
+            replicaToast('未能生成发散方案，请重试', true);
+        }
+    } catch (e) {
+        replicaToast(e.message, true);
+    } finally {
+        replicaDiverging = false;
+        replicaSetBusy(false);
+    }
+}
+
+function replicaToggleComparator(open) {
+    if (typeof open === 'boolean') replicaComparatorOpen = open;
+    else replicaComparatorOpen = !replicaComparatorOpen;
+    replicaRender();
+    if (replicaComparatorOpen) {
+        const el = document.getElementById('replica-sec-comparator');
+        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+}
+
+async function replicaToggleBaselineLock(lock) {
+    if (!replicaState) return;
+    replicaSetBusy(true);
+    try {
+        const data = await replicaFetch('/api/replica/lock_baseline', {
+            method: 'POST',
+            headers: replicaHeaders(),
+            body: JSON.stringify({ job_id: replicaState.job_id, lock: !!lock }),
+        });
+        replicaState = data.job_state;
+        await replicaLoadJobs();
+        replicaRender();
+        replicaToast(lock ? '🔒 已成功固化为 Gold Baseline 母本（节拍转为只读保护）' : '🔓 已解锁母本（可继续编辑节拍）');
+    } catch (e) {
+        replicaToast(e.message, true);
+    } finally {
+        replicaSetBusy(false);
+    }
+}
+
+async function replicaMutateOrthogonal(btn) {
+    if (!replicaState) return;
+    const root = replicaRoot() || document;
+    const env = (root.querySelector('#replica-axis-env') || {}).value || '';
+    const mat = (root.querySelector('#replica-axis-mat') || {}).value || '';
+    const func = (root.querySelector('#replica-axis-func') || {}).value || '';
+    const hero = (root.querySelector('#replica-axis-hero') || {}).value || '';
+
+    if (!env && !mat && !func && !hero) {
+        replicaToast('请先输入四轴参数或点击「✨ AI 智能发散创意」', true);
+        return;
+    }
+
+    const mutationAxes = {
+        environment: env,
+        material: mat,
+        function: func,
+        hero_reveal: hero,
+    };
+
+    const ideas = (replicaState && replicaState.ai_diverged_ideas) || replicaAiIdeas || [];
+    const activeIdea = replicaActiveIdeaIndex >= 0 ? ideas[replicaActiveIdeaIndex] : null;
+    if (activeIdea) {
+        if (activeIdea.scene_signature) mutationAxes.scene_signature = activeIdea.scene_signature;
+        if (activeIdea.banned_elements) mutationAxes.banned_elements = activeIdea.banned_elements;
+        if (activeIdea.trend_ref) mutationAxes.trend_ref = activeIdea.trend_ref;
+        if (activeIdea.trend_ref_ids) mutationAxes.trend_ref_ids = activeIdea.trend_ref_ids;
+    }
+
+    replicaSetBusy(true, btn);
+    try {
+        const data = await replicaFetch('/api/replica/mutate_orthogonal', {
+            method: 'POST',
+            headers: replicaHeaders(),
+            body: JSON.stringify({
+                baseline_job_id: replicaState.job_id,
+                mutation_axes: mutationAxes,
+                preset: (activeIdea && activeIdea.id) || replicaActivePreset || 'ai_variant',
+                brief: replicaDivergeBrief || '',
+                config: replicaConfig(),
+            }),
+        });
+        replicaTaskId = data.task_id;
+        replicaOpenSSE(replicaTaskId);
+        replicaToast('⚡ 正在执行四轴正交派生（100% 锁死母本节拍骨架与机位）...');
+    } catch (e) {
+        replicaToast(e.message, true);
+        replicaSetBusy(false);
+    }
+}
+
+async function replicaHandoffToStepped(btn) {
+    if (!replicaState) return;
+    replicaSetBusy(true, btn);
+    try {
+        const data = await replicaFetch('/api/replica/handoff', {
+            method: 'POST',
+            headers: replicaHeaders(),
+            body: JSON.stringify({
+                job_id: replicaState.job_id,
+                config: replicaConfig(),
+            }),
+        });
+        replicaToast(`已成功递交至分步渲染管线 (任务: ${data.task_id})`);
+        if (typeof switchMainTab === 'function') {
+            switchMainTab('stepped');
+        }
+    } catch (e) {
+        replicaToast(e.message, true);
+    } finally {
+        replicaSetBusy(false);
+    }
+}
+
 function replicaVariant(btn) {
     const root = replicaRoot();
     const axes = Array.from(root.querySelectorAll('.replica-axis-box:checked')).map(b => b.value);
@@ -1390,6 +2868,9 @@ function replicaSplitBeat(idx) {
     second.source_event_ids = [];
     doc.beats.splice(idx + 1, 0, second);
     replicaState.beats = doc;
+    // 服务端会重排 id，折叠状态是按 id 存的：不清掉，旧的 B05 变成 B06 之后，
+    // 新占用 B05 这个名字的那一拍会莫名其妙带着上一任的折叠态。
+    replicaBeatFoldState = {};
     replicaPersistBeats('已拆成两拍并保存。事件与证据帧没有自动分配——请对着帧手工分给正确的那一半。');
 }
 
@@ -1409,7 +2890,33 @@ function replicaMergeBeat(idx) {
     prev.persistent_traces = [...(prev.persistent_traces || []), ...(cur.persistent_traces || [])];
     doc.beats.splice(idx, 1);
     replicaState.beats = doc;
+    replicaBeatFoldState = {};   // 同 replicaSplitBeat：id 会重排
     replicaPersistBeats('已合并并保存。若两拍是不同的物理工序，上方校验会告诉你。');
+}
+
+function replicaNudgeBeatTime(idx, field, delta) {
+    const doc = replicaCollectBeats();
+    if (!doc || !doc.beats || !doc.beats[idx]) return;
+    const beat = doc.beats[idx];
+    if (field === 'start') {
+        const newVal = Math.max(0, Math.round((beat.start + delta) * 10) / 10);
+        if (newVal >= beat.end) { replicaToast('起始时间不能晚于结束时间', true); return; }
+        const oldStart = beat.start;
+        beat.start = newVal;
+        if (idx > 0 && Math.abs(doc.beats[idx - 1].end - oldStart) < 0.05) {
+            doc.beats[idx - 1].end = newVal;
+        }
+    } else if (field === 'end') {
+        const newVal = Math.round((beat.end + delta) * 10) / 10;
+        if (newVal <= beat.start) { replicaToast('结束时间不能早于起始时间', true); return; }
+        const oldEnd = beat.end;
+        beat.end = newVal;
+        if (idx < doc.beats.length - 1 && Math.abs(doc.beats[idx + 1].start - oldEnd) < 0.05) {
+            doc.beats[idx + 1].start = newVal;
+        }
+    }
+    replicaState.beats = doc;
+    replicaPersistBeats(`已微调 ${beat.id} 的${field === 'start' ? '起始' : '结束'}时间至 ${field === 'start' ? beat.start : beat.end}s 并保存。`);
 }
 
 /* --- SSE --- */
@@ -1452,16 +2959,18 @@ function replicaOpenSSE(taskId) {
         });
     });
 
-    const finish = async (msg, isError) => {
+    const finish = async (msg, isError, targetJobId) => {
         if (replicaSSE) { replicaSSE.close(); replicaSSE = null; }
         replicaTaskId = null;
         replicaSetBusy(false);
         try {
             await replicaLoadJobs();
-            // 变体会派生出新 job_id，跟过去而不是停在源任务上。
-            const newest = replicaJobs[0];
-            const target = (newest && newest.variant_of === (replicaState || {}).job_id)
-                ? newest.job_id : (replicaState || {}).job_id;
+            let target = targetJobId;
+            if (!target) {
+                const newest = replicaJobs[0];
+                target = (newest && newest.variant_of === (replicaState || {}).job_id)
+                    ? newest.job_id : (replicaState || {}).job_id;
+            }
             if (target) await replicaLoadJob(target);
         } catch (err) { /* 列表刷新失败不该盖掉上面的完成/失败提示 */ }
         replicaRender();
@@ -1476,11 +2985,17 @@ function replicaOpenSSE(taskId) {
         audit_failed: '命中禁用元素，已拦下交付（未入库）。见下方提示词区。',
     };
     replicaSSE.addEventListener('replica_paused', (e) => {
-        const stage = ((replicaEventPayload(e) || {}).stage) || '';
+        const payload = replicaEventPayload(e) || {};
+        const stage = payload.stage || '';
+        const targetJobId = payload.job_id || (payload.job_state && payload.job_state.job_id);
         finish(PAUSE_MESSAGES[stage] || '任务已暂停，请看当前阶段的操作区。',
-               stage === 'audit_failed');
+               stage === 'audit_failed', targetJobId);
     });
-    replicaSSE.addEventListener('result', () => finish('提示词包已生成，并已写入创意库'));
+    replicaSSE.addEventListener('result', (e) => {
+        const payload = replicaEventPayload(e) || {};
+        const targetJobId = payload.job_id || (payload.job_state && payload.job_state.job_id);
+        finish('提示词包已生成，并已写入创意库', false, targetJobId);
+    });
     replicaSSE.addEventListener('error', (e) => {
         // EventSource 把两种完全不同的东西塞进同一个事件名：服务端发的 `error` 事件
         // （带 data，是真的任务失败），和浏览器的连接层错误（无 data，重连期间也会

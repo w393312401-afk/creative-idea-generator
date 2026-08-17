@@ -1,0 +1,220 @@
+test_a_failed_call_keeps_the_composed_prompt (tests.test_reverse_beats.TestAnchorGrounding.test_a_failed_call_keeps_the_composed_prompt)
+失败软退是硬要求：这一步是纠偏，不该让整单合成挂掉。 ... ok
+test_a_good_reply_replaces_it (tests.test_reverse_beats.TestAnchorGrounding.test_a_good_reply_replaces_it) ... ok
+test_a_missing_file_yields_no_reference_instead_of_a_bad_path (tests.test_reverse_beats.TestAnchorGrounding.test_a_missing_file_yields_no_reference_instead_of_a_bad_path) ... ok
+test_an_empty_reply_keeps_the_composed_prompt (tests.test_reverse_beats.TestAnchorGrounding.test_an_empty_reply_keeps_the_composed_prompt) ... ok
+test_no_reference_means_no_call_at_all (tests.test_reverse_beats.TestAnchorGrounding.test_no_reference_means_no_call_at_all) ... ok
+test_the_earliest_existing_frame_is_chosen (tests.test_reverse_beats.TestAnchorGrounding.test_the_earliest_existing_frame_is_chosen) ... ok
+test_config_is_scrubbed_down_to_gateway_keys (tests.test_reverse_beats.TestAntiPriming.test_config_is_scrubbed_down_to_gateway_keys) ... ok
+test_extract_frame_facts_has_no_parameter_that_can_carry_a_brief (tests.test_reverse_beats.TestAntiPriming.test_extract_frame_facts_has_no_parameter_that_can_carry_a_brief)
+签名即防护。加形参之前先想清楚：这是反注入唯一的结构性保证。 ... ok
+test_pass_a_system_prompt_forbids_inference (tests.test_reverse_beats.TestAntiPriming.test_pass_a_system_prompt_forbids_inference) ... ok
+test_autofix_beats_clean_ladder_noop (tests.test_reverse_beats.TestAutofixBeats.test_autofix_beats_clean_ladder_noop)
+干净无错的阶梯不触发 LLM 调用，直接返回。 ... ok
+test_autofix_beats_fixes_stage_regression_and_rough_in (tests.test_reverse_beats.TestAutofixBeats.test_autofix_beats_fixes_stage_regression_and_rough_in)
+阶梯包含阶段逆行与遮盖后隐蔽工程时，LLM 返回修正后能通过校验。 ... ok
+test_autofix_beats_retries_on_bad_json (tests.test_reverse_beats.TestAutofixBeats.test_autofix_beats_retries_on_bad_json)
+首次返回非 JSON 时重试并成功修复。 ... ok
+test_a_failed_translation_is_never_fatal (tests.test_reverse_beats.TestBeatTranslation.test_a_failed_translation_is_never_fatal) ... ok
+test_a_length_mismatch_on_a_list_field_drops_that_field_only (tests.test_reverse_beats.TestBeatTranslation.test_a_length_mismatch_on_a_list_field_drops_that_field_only)
+条数对不上的对照比没有对照更坏——核对的人会照着错位的那条点头。 ... ok
+test_editing_the_english_invalidates_only_that_field_translation (tests.test_reverse_beats.TestBeatTranslation.test_editing_the_english_invalidates_only_that_field_translation) ... ok
+test_translation_lands_in_zh_and_never_touches_the_english (tests.test_reverse_beats.TestBeatTranslation.test_translation_lands_in_zh_and_never_touches_the_english) ... ok
+test_a_bad_reply_is_dumped_for_debugging (tests.test_reverse_beats.TestClusterRetryBudget.test_a_bad_reply_is_dumped_for_debugging) ... ok
+test_a_broken_reply_is_retried_rather_than_killing_the_run (tests.test_reverse_beats.TestClusterRetryBudget.test_a_broken_reply_is_retried_rather_than_killing_the_run) ... ok
+test_a_non_object_reply_is_rejected_outright (tests.test_reverse_beats.TestClusterRetryBudget.test_a_non_object_reply_is_rejected_outright) ... ok
+test_the_run_gives_up_after_the_parse_budget_is_spent (tests.test_reverse_beats.TestClusterRetryBudget.test_the_run_gives_up_after_the_parse_budget_is_spent) ... ok
+test_a_gate_clean_ladder_survives_the_composers_real_frame_state_gate (tests.test_reverse_beats.TestComposerContractAlignment.test_a_gate_clean_ladder_survives_the_composers_real_frame_state_gate)
+端到端对齐：通过我这道闸的节拍，转成合成器的 ladder 形状后， ... ok
+test_a_single_operation_beat_is_rejected_at_the_gate (tests.test_reverse_beats.TestComposerContractAlignment.test_a_single_operation_beat_is_rejected_at_the_gate) ... ok
+test_a_well_formed_milestone_beat_passes (tests.test_reverse_beats.TestComposerContractAlignment.test_a_well_formed_milestone_beat_passes) ... ok
+test_bounds_are_read_from_the_composer_not_hardcoded (tests.test_reverse_beats.TestComposerContractAlignment.test_bounds_are_read_from_the_composer_not_hardcoded) ... ok
+test_fewer_than_two_traces_is_rejected (tests.test_reverse_beats.TestComposerContractAlignment.test_fewer_than_two_traces_is_rejected) ... ok
+test_package_operations_reach_the_composer_outline (tests.test_reverse_beats.TestComposerContractAlignment.test_package_operations_reach_the_composer_outline)
+不把工序写进清单，合成器只能从一句动作描述里猜，猜出一道工序就自己判死。 ... ok
+test_pass_b_prompt_does_not_demand_a_single_operation (tests.test_reverse_beats.TestComposerContractAlignment.test_pass_b_prompt_does_not_demand_a_single_operation)
+这句话正是事故的根因，别让它回来。 ... ok
+test_finish_coat_before_primer_warns (tests.test_reverse_beats.TestConstructionOrder.test_finish_coat_before_primer_warns) ... ok
+test_floor_before_wall_enclosure_is_not_a_regression (tests.test_reverse_beats.TestConstructionOrder.test_floor_before_wall_enclosure_is_not_a_regression)
+先铺地板再立室内隔墙——自建里常见，画面里也拍得清清楚楚。 ... ok
+test_power_chain_broken_when_fixtures_have_no_rough_in (tests.test_reverse_beats.TestConstructionOrder.test_power_chain_broken_when_fixtures_have_no_rough_in) ... ok
+test_rough_in_after_any_covering_stage_is_an_error (tests.test_reverse_beats.TestConstructionOrder.test_rough_in_after_any_covering_stage_is_an_error)
+遮盖层不止封板。面层、地面收尾做完再走线，一样要拆开刚做完的东西。 ... ok
+test_rough_in_after_enclosure_beats_the_backtrack_tolerance (tests.test_reverse_beats.TestConstructionOrder.test_rough_in_after_enclosure_beats_the_backtrack_tolerance)
+布线在封板之后是硬否决榜首，而它只差一级——不能被容差放过。 ... ok
+test_small_stage_backtrack_is_tolerated (tests.test_reverse_beats.TestConstructionOrder.test_small_stage_backtrack_is_tolerated)
+真实改造会来回穿插一两级，只有跨三级以上的倒挂才判。 ... ok
+test_stage_regression_is_an_error (tests.test_reverse_beats.TestConstructionOrder.test_stage_regression_is_an_error)
+地面收尾之后又回去做结构：跨三级的倒挂，真的不可能。 ... ok
+test_a_long_beat_gets_frames_across_its_whole_window (tests.test_reverse_beats.TestCoverageFrames.test_a_long_beat_gets_frames_across_its_whole_window) ... ok
+test_a_short_beat_takes_every_frame_it_has (tests.test_reverse_beats.TestCoverageFrames.test_a_short_beat_takes_every_frame_it_has) ... ok
+test_a_window_thinner_than_the_sampling_step_still_gets_a_frame (tests.test_reverse_beats.TestCoverageFrames.test_a_window_thinner_than_the_sampling_step_still_gets_a_frame) ... ok
+test_coverage_frames_do_not_disturb_validation (tests.test_reverse_beats.TestCoverageFrames.test_coverage_frames_do_not_disturb_validation) ... ok
+test_editing_the_window_recomputes_coverage (tests.test_reverse_beats.TestCoverageFrames.test_editing_the_window_recomputes_coverage) ... ok
+test_no_extracted_frames_means_no_coverage_field (tests.test_reverse_beats.TestCoverageFrames.test_no_extracted_frames_means_no_coverage_field) ... ok
+test_cost_estimate_reports_both_modes (tests.test_reverse_beats.TestDegradedPlan.test_cost_estimate_reports_both_modes) ... ok
+test_degraded_plan_keeps_event_evidence_plus_endpoints (tests.test_reverse_beats.TestDegradedPlan.test_degraded_plan_keeps_event_evidence_plus_endpoints) ... ok
+test_claiming_an_unknown_event_is_an_error (tests.test_reverse_beats.TestEventCoverage.test_claiming_an_unknown_event_is_an_error) ... ok
+test_double_bound_event_is_an_error (tests.test_reverse_beats.TestEventCoverage.test_double_bound_event_is_an_error) ... ok
+test_full_coverage_is_clean (tests.test_reverse_beats.TestEventCoverage.test_full_coverage_is_clean) ... ok
+test_unbound_event_is_an_error (tests.test_reverse_beats.TestEventCoverage.test_unbound_event_is_an_error) ... ok
+test_evidence_outside_the_beat_window_only_warns (tests.test_reverse_beats.TestEvidenceFrames.test_evidence_outside_the_beat_window_only_warns)
+时间戳落在窗外通常是拍窗划歪了，不是致命伤——高亮给人看，别打回重跑。 ... ok
+test_missing_evidence_frame_is_an_error (tests.test_reverse_beats.TestEvidenceFrames.test_missing_evidence_frame_is_an_error) ... ok
+test_nonexistent_evidence_frame_is_an_error (tests.test_reverse_beats.TestEvidenceFrames.test_nonexistent_evidence_frame_is_an_error) ... ok
+test_a_legacy_cache_is_claimed_by_the_model_that_wrote_the_facts (tests.test_reverse_beats.TestFactsCacheIsKeyedByModel.test_a_legacy_cache_is_claimed_by_the_model_that_wrote_the_facts)
+升级当天正在跑的任务不该白付一次 Pass A：老格式没记模型，但磁盘上的 ... ok
+test_a_legacy_cache_with_no_traceable_model_is_dropped (tests.test_reverse_beats.TestFactsCacheIsKeyedByModel.test_a_legacy_cache_with_no_traceable_model_is_dropped)
+认不出是谁读的就只能丢：错认一个模型就是上面那个 bug 本身。 ... ok
+test_a_new_prompt_version_still_invalidates_everything (tests.test_reverse_beats.TestFactsCacheIsKeyedByModel.test_a_new_prompt_version_still_invalidates_everything) ... ok
+test_another_model_does_not_inherit_the_first_models_readings (tests.test_reverse_beats.TestFactsCacheIsKeyedByModel.test_another_model_does_not_inherit_the_first_models_readings) ... ok
+test_switching_back_is_still_free (tests.test_reverse_beats.TestFactsCacheIsKeyedByModel.test_switching_back_is_still_free) ... ok
+test_a_plain_card_outline_gains_no_state_rule (tests.test_reverse_beats.TestHandoffToComposer.test_a_plain_card_outline_gains_no_state_rule)
+老卡片/手动主题不带这几个键，提示词里就不该出现这段规则。 ... ok
+test_absent_rich_fields_are_omitted_rather_than_sent_empty (tests.test_reverse_beats.TestHandoffToComposer.test_absent_rich_fields_are_omitted_rather_than_sent_empty)
+空键会让 build_outline_plan_block 的 has_* 守卫误判，凭空长出一段 ... ok
+test_banned_hits_are_case_insensitive (tests.test_reverse_beats.TestHandoffToComposer.test_banned_hits_are_case_insensitive) ... ok
+test_beat_outline_length_locks_the_beat_count (tests.test_reverse_beats.TestHandoffToComposer.test_beat_outline_length_locks_the_beat_count)
+beat_outline 非空会让 compose_anchor_and_packet 切进「清单一比一还原」， ... ok
+test_existing_theme_is_not_overwritten (tests.test_reverse_beats.TestHandoffToComposer.test_existing_theme_is_not_overwritten) ... ok
+test_no_banned_elements_means_no_hits (tests.test_reverse_beats.TestHandoffToComposer.test_no_banned_elements_means_no_hits) ... ok
+test_rich_fields_survive_the_composer_outline_normaliser (tests.test_reverse_beats.TestHandoffToComposer.test_rich_fields_survive_the_composer_outline_normaliser)
+绑定通路的另一端。这里直接调 prompt_pipeline 的归一化器与提示词段落生成， ... ok
+test_the_fields_the_user_edits_actually_reach_the_composer (tests.test_reverse_beats.TestHandoffToComposer.test_the_fields_the_user_edits_actually_reach_the_composer)
+人工卡点的存在理由。 ... ok
+test_a_cut_off_reply_is_reported_as_truncation_not_a_format_error (tests.test_reverse_beats.TestJsonReplyParsing.test_a_cut_off_reply_is_reported_as_truncation_not_a_format_error)
+实测：21 拍的回复写到 32KB 撞上 max_tokens，报的是 `Expecting ',' delimiter`， ... ok
+test_a_merely_malformed_reply_is_not_called_truncation (tests.test_reverse_beats.TestJsonReplyParsing.test_a_merely_malformed_reply_is_not_called_truncation) ... ok
+test_a_truncated_reply_shows_where_it_stopped (tests.test_reverse_beats.TestJsonReplyParsing.test_a_truncated_reply_shows_where_it_stopped) ... ok
+test_apostrophes_and_colons_inside_strings_survive (tests.test_reverse_beats.TestJsonReplyParsing.test_apostrophes_and_colons_inside_strings_survive) ... ok
+test_clean_json_passes_through (tests.test_reverse_beats.TestJsonReplyParsing.test_clean_json_passes_through) ... ok
+test_code_fences_are_stripped (tests.test_reverse_beats.TestJsonReplyParsing.test_code_fences_are_stripped) ... ok
+test_escaped_quotes_are_left_alone (tests.test_reverse_beats.TestJsonReplyParsing.test_escaped_quotes_are_left_alone) ... ok
+test_pass_a_array_survives_an_unescaped_quote (tests.test_reverse_beats.TestJsonReplyParsing.test_pass_a_array_survives_an_unescaped_quote) ... ok
+test_pass_b_caps_the_evidence_frame_list (tests.test_reverse_beats.TestJsonReplyParsing.test_pass_b_caps_the_evidence_frame_list)
+每拍回一长串帧名是回复被截断的头号原因。 ... ok
+test_raw_newlines_inside_strings_are_repaired (tests.test_reverse_beats.TestJsonReplyParsing.test_raw_newlines_inside_strings_are_repaired) ... ok
+test_structurally_broken_reply_names_the_raw_text (tests.test_reverse_beats.TestJsonReplyParsing.test_structurally_broken_reply_names_the_raw_text)
+修不回来时，异常必须带上原始回复——上次故障日志里只有一句报错， ... ok
+test_trailing_commas_are_repaired (tests.test_reverse_beats.TestJsonReplyParsing.test_trailing_commas_are_repaired) ... ok
+test_truncation_detection_ignores_brackets_inside_strings (tests.test_reverse_beats.TestJsonReplyParsing.test_truncation_detection_ignores_brackets_inside_strings) ... ok
+test_unescaped_inner_quotes_are_repaired (tests.test_reverse_beats.TestJsonReplyParsing.test_unescaped_inner_quotes_are_repaired) ... ok
+test_a_clean_doc_never_gains_a_normalization_record (tests.test_reverse_beats.TestKeyDrift.test_a_clean_doc_never_gains_a_normalization_record) ... ok
+test_a_drifted_key_is_moved_back_and_stops_the_false_missing_field (tests.test_reverse_beats.TestKeyDrift.test_a_drifted_key_is_moved_back_and_stops_the_false_missing_field) ... ok
+test_a_populated_canonical_key_is_never_overwritten (tests.test_reverse_beats.TestKeyDrift.test_a_populated_canonical_key_is_never_overwritten)
+两个名字都有值 = 模型写了两份说法，那是要看画面裁决的事，不能静默挑一份。 ... ok
+test_an_empty_alias_never_displaces_a_missing_field (tests.test_reverse_beats.TestKeyDrift.test_an_empty_alias_never_displaces_a_missing_field)
+错名字底下是空的，就还是「真的缺」。搬一个空值过去只是把硬伤藏起来。 ... ok
+test_the_record_survives_the_next_normalization_pass (tests.test_reverse_beats.TestKeyDrift.test_the_record_survives_the_next_normalization_pass)
+归一每次读状态、每次保存都会重跑，第二趟必然一处也搬不到。 ... ok
+test_the_repair_is_announced_not_silent (tests.test_reverse_beats.TestKeyDrift.test_the_repair_is_announced_not_silent) ... ok
+test_banned_elements_are_recomputed_not_inherited (tests.test_reverse_beats.TestMutation.test_banned_elements_are_recomputed_not_inherited)
+旧载体的「不存在物」对新载体毫无意义，继承它等于给新载体套错约束。 ... ok
+test_content_fields_are_rewritten (tests.test_reverse_beats.TestMutation.test_content_fields_are_rewritten) ... ok
+test_evidence_frames_are_demoted_to_reference_frames (tests.test_reverse_beats.TestMutation.test_evidence_frames_are_demoted_to_reference_frames)
+变体不再对原片的事实负责：那些帧只提供机位与构图。 ... ok
+test_more_than_two_axes_is_rejected (tests.test_reverse_beats.TestMutation.test_more_than_two_axes_is_rejected) ... ok
+test_no_axis_is_rejected (tests.test_reverse_beats.TestMutation.test_no_axis_is_rejected) ... ok
+test_timing_skeleton_survives_the_model_trying_to_change_it (tests.test_reverse_beats.TestMutation.test_timing_skeleton_survives_the_model_trying_to_change_it)
+模型回了改过的 id/start/end 也不算数——骨架以原文档为准。 ... ok
+test_variant_is_traceable_to_its_source (tests.test_reverse_beats.TestMutation.test_variant_is_traceable_to_its_source) ... ok
+test_frame_facts_model_overrides_the_review_and_main_model (tests.test_reverse_beats.TestPassAModelSelection.test_frame_facts_model_overrides_the_review_and_main_model) ... ok
+test_model_keys_survive_the_anti_priming_scrub (tests.test_reverse_beats.TestPassAModelSelection.test_model_keys_survive_the_anti_priming_scrub)
+剥 config 是为了挡主题，不是挡模型名——剥掉了选择器就等于没接上。 ... ok
+test_peak_verify_can_be_switched_off_and_follows_the_main_model_by_default (tests.test_reverse_beats.TestPassAModelSelection.test_peak_verify_can_be_switched_off_and_follows_the_main_model_by_default) ... ok
+test_pass_a_bisection_retry (tests.test_reverse_beats.TestPassAOptimizationTests.test_pass_a_bisection_retry)
+当 >2 帧的批次解析失败时，先二分为两个子批次重试。 ... ok
+test_verify_peak_frames_parallel_execution (tests.test_reverse_beats.TestPassAOptimizationTests.test_verify_peak_frames_parallel_execution)
+验证 verify_peak_frames 使用 _map_parallel 并行执行。 ... ok
+test_extra_items_beyond_the_batch_are_dropped (tests.test_reverse_beats.TestPassAParsing.test_extra_items_beyond_the_batch_are_dropped) ... ok
+test_frame_names_fall_back_to_position_when_model_renames_them (tests.test_reverse_beats.TestPassAParsing.test_frame_names_fall_back_to_position_when_model_renames_them) ... ok
+test_a_missing_frame_breaks_the_page_instead_of_shifting_every_tile_after_it (tests.test_reverse_beats.TestPassBSheets.test_a_missing_frame_breaks_the_page_instead_of_shifting_every_tile_after_it)
+第 3 帧缺失。跳过它接上第 4 帧会让后面每一格都平移一位——那正是要防的。 ... ok
+test_a_truncated_multimodal_reply_is_reworked_not_fatal (tests.test_reverse_beats.TestPassBSheets.test_a_truncated_multimodal_reply_is_reworked_not_fatal)
+多模态路径把截断报成异常，纯文本路径靠半截 JSON 认出来。两条路都得汇进 ... ok
+test_cluster_beats_sends_the_sheets_to_a_multimodal_call (tests.test_reverse_beats.TestPassBSheets.test_cluster_beats_sends_the_sheets_to_a_multimodal_call) ... ok
+test_cluster_beats_still_runs_when_no_sheet_can_be_built (tests.test_reverse_beats.TestPassBSheets.test_cluster_beats_still_runs_when_no_sheet_can_be_built)
+拼图是增强，不是门禁。ffmpeg 缺失不该让反推跑不完。 ... ok
+test_missing_frame_files_degrade_to_no_sheets (tests.test_reverse_beats.TestPassBSheets.test_missing_frame_files_degrade_to_no_sheets) ... ok
+test_no_ffmpeg_means_no_sheets_rather_than_a_half_set (tests.test_reverse_beats.TestPassBSheets.test_no_ffmpeg_means_no_sheets_rather_than_a_half_set) ... ok
+test_sheets_are_paged_and_carry_their_own_start_index (tests.test_reverse_beats.TestPassBSheets.test_sheets_are_paged_and_carry_their_own_start_index) ... ok
+test_the_layout_block_numbers_match_the_digest_numbering (tests.test_reverse_beats.TestPassBSheets.test_the_layout_block_numbers_match_the_digest_numbering) ... ok
+test_a_failed_verification_leaves_pass_a_intact_instead_of_killing_the_job (tests.test_reverse_beats.TestPeakVerification.test_a_failed_verification_leaves_pass_a_intact_instead_of_killing_the_job)
+复核是增强，不是门禁。默认开之后这条尤其要紧——一次解析失败若能掀掉整单， ... ok
+test_it_can_still_be_turned_off (tests.test_reverse_beats.TestPeakVerification.test_it_can_still_be_turned_off) ... ok
+test_it_runs_without_any_peak_verify_model_being_configured (tests.test_reverse_beats.TestPeakVerification.test_it_runs_without_any_peak_verify_model_being_configured) ... ok
+test_the_cost_estimate_reports_the_peak_calls_it_will_now_make (tests.test_reverse_beats.TestPeakVerification.test_the_cost_estimate_reports_the_peak_calls_it_will_now_make)
+默认加钱却不进预估，等于绕开了「先确认再烧钱」这道卡点本身。 ... ok
+test_all_scope_costs_more_than_the_plan_and_says_so (tests.test_reverse_beats.TestReviewScope.test_all_scope_costs_more_than_the_plan_and_says_so) ... ok
+test_all_scope_sends_every_extracted_frame (tests.test_reverse_beats.TestReviewScope.test_all_scope_sends_every_extracted_frame) ... ok
+test_plan_scope_obeys_the_analysis_plan (tests.test_reverse_beats.TestReviewScope.test_plan_scope_obeys_the_analysis_plan) ... ok
+test_the_old_degraded_boolean_still_selects_the_degraded_scope (tests.test_reverse_beats.TestReviewScope.test_the_old_degraded_boolean_still_selects_the_degraded_scope)
+磁盘上的老 job 状态与老前端只会传 degraded，不能因为多了档位就失效。 ... ok
+test_a_thing_in_most_frames_becomes_a_constant (tests.test_reverse_beats.TestSceneConstants.test_a_thing_in_most_frames_becomes_a_constant) ... ok
+test_an_emptied_field_is_never_recomputed_back (tests.test_reverse_beats.TestSceneConstants.test_an_emptied_field_is_never_recomputed_back)
+它进每一条合成提示词，所以用户必须删得掉。 ... ok
+test_constants_and_signature_both_reach_the_dimensions (tests.test_reverse_beats.TestSceneConstants.test_constants_and_signature_both_reach_the_dimensions) ... ok
+test_no_facts_still_lands_the_key_so_it_is_not_recomputed_forever (tests.test_reverse_beats.TestSceneConstants.test_no_facts_still_lands_the_key_so_it_is_not_recomputed_forever) ... ok
+test_the_prompt_lines_carry_the_signature_first (tests.test_reverse_beats.TestSceneConstants.test_the_prompt_lines_carry_the_signature_first) ... ok
+test_an_explicit_schema_argument_reports_nothing (tests.test_reverse_beats.TestSchemaBackedFieldValidation.test_an_explicit_schema_argument_reports_nothing)
+调用方自己给了 schema（或明确要求跳过）时不该冒出这条告警。 ... ok
+test_an_unreadable_schema_is_reported_not_silently_skipped (tests.test_reverse_beats.TestSchemaBackedFieldValidation.test_an_unreadable_schema_is_reported_not_silently_skipped)
+静默降级会让 UI 显示「已通过全部机械校验」，而字段校验其实压根没跑—— ... ok
+test_blank_state_before_is_rejected (tests.test_reverse_beats.TestSchemaBackedFieldValidation.test_blank_state_before_is_rejected) ... ok
+test_empty_evidence_frames_is_still_rejected (tests.test_reverse_beats.TestSchemaBackedFieldValidation.test_empty_evidence_frames_is_still_rejected)
+schema 给 evidence_frames 写了 minItems 1——空值严格度由 schema 决定。 ... ok
+test_empty_source_event_ids_is_legitimate (tests.test_reverse_beats.TestSchemaBackedFieldValidation.test_empty_source_event_ids_is_legitimate)
+一拍可以不认领任何变化事件（安静窗口，或整条视频压根没检出事件）。 ... ok
+test_schema_file_is_readable_and_drives_required_fields (tests.test_reverse_beats.TestSchemaBackedFieldValidation.test_schema_file_is_readable_and_drives_required_fields) ... ok
+test_workers_present_false_is_not_treated_as_missing (tests.test_reverse_beats.TestSchemaBackedFieldValidation.test_workers_present_false_is_not_treated_as_missing)
+workers_present=False 是合法值，还是 IMAGE 锚点候选的判据——不能被空值判定吃掉。 ... ok
+test_a_doomed_batch_is_retried_frame_by_frame (tests.test_reverse_beats.TestSingleFrameSalvage.test_a_doomed_batch_is_retried_frame_by_frame) ... ok
+test_truncation_also_falls_through_to_the_per_frame_retry (tests.test_reverse_beats.TestSingleFrameSalvage.test_truncation_also_falls_through_to_the_per_frame_retry)
+十帧的观察写不进 4096 tokens 是常事，解药和坏 JSON 一样是把这批拆小。 ... ok
+test_a_removal_that_never_names_the_object_does_not_clear_it (tests.test_reverse_beats.TestTemporaryObjects.test_a_removal_that_never_names_the_object_does_not_clear_it)
+销账要求清场动作点到那个物体本身。点不到就保留告警—— ... ok
+test_an_on_camera_cleanup_clears_the_flag (tests.test_reverse_beats.TestTemporaryObjects.test_an_on_camera_cleanup_clears_the_flag) ... ok
+test_an_unrelated_removal_does_not_clear_the_tarp (tests.test_reverse_beats.TestTemporaryObjects.test_an_unrelated_removal_does_not_clear_the_tarp)
+销账按 cue 走，不按整词交集——后者会被 a / the 这类虚词撞上， ... ok
+test_it_is_a_warning_not_a_hard_error (tests.test_reverse_beats.TestTemporaryObjects.test_it_is_a_warning_not_a_hard_error)
+原片里那块布是真实观察，不是错误。判成 error 会把合法观察堵死， ... ok
+test_lingering_tarp_is_flagged_before_the_user_spends_a_compose_call (tests.test_reverse_beats.TestTemporaryObjects.test_lingering_tarp_is_flagged_before_the_user_spends_a_compose_call) ... ok
+test_no_furnishing_beat_means_no_flag (tests.test_reverse_beats.TestTemporaryObjects.test_no_furnishing_beat_means_no_flag) ... ok
+test_the_cue_list_comes_from_scene_state_not_a_local_copy (tests.test_reverse_beats.TestTemporaryObjects.test_the_cue_list_comes_from_scene_state_not_a_local_copy)
+规则本体只有一份。这里 import 它，抄一份就是第二份契约，迟早漂移。 ... ok
+test_verb_inflections_are_recognised (tests.test_reverse_beats.TestTemporaryObjects.test_verb_inflections_are_recognised)
+第一版把 `roll up` 写死，遇到 "rolls up" 就漏判，已经清过场的阶梯照样被标黄。 ... ok
+test_overlapping_windows_are_an_error (tests.test_reverse_beats.TestTimeAxis.test_overlapping_windows_are_an_error) ... ok
+test_renumber_sorts_and_renames (tests.test_reverse_beats.TestTimeAxis.test_renumber_sorts_and_renames) ... ok
+test_a_thing_seen_only_in_one_window_is_neither_new_nor_gone (tests.test_reverse_beats.TestTimeWindows.test_a_thing_seen_only_in_one_window_is_neither_new_nor_gone)
+既报「新出现」又报「消失」是自相矛盾的一行，而它其实是最值得看的一类。 ... ok
+test_a_thing_that_shows_up_midway_is_reported_as_new (tests.test_reverse_beats.TestTimeWindows.test_a_thing_that_shows_up_midway_is_reported_as_new) ... FAIL
+test_no_facts_yields_no_windows_instead_of_a_crash (tests.test_reverse_beats.TestTimeWindows.test_no_facts_yields_no_windows_instead_of_a_crash) ... ok
+test_one_phrase_never_lands_in_two_columns (tests.test_reverse_beats.TestTimeWindows.test_one_phrase_never_lands_in_two_columns)
+一条短语含多个词，不同的词会把它同时拉进两栏。跨栏去重，先到先得。 ... ok
+test_the_digest_drops_the_state_lines_when_there_are_too_many_windows (tests.test_reverse_beats.TestTimeWindows.test_the_digest_drops_the_state_lines_when_there_are_too_many_windows)
+摘要要喂进 Pass B，长视频不能让它把节拍聚类挤掉。 ... ok
+test_windows_tile_the_whole_video_including_a_short_tail (tests.test_reverse_beats.TestTimeWindows.test_windows_tile_the_whole_video_including_a_short_tail) ... ok
+test_a_gap_between_beats_is_reported (tests.test_reverse_beats.TestUncoveredTime.test_a_gap_between_beats_is_reported)
+此前只查重叠不查空洞：「漏了一段」和「这段没事发生」长得一模一样。 ... ok
+test_a_missing_head_and_tail_are_both_reported (tests.test_reverse_beats.TestUncoveredTime.test_a_missing_head_and_tail_are_both_reported) ... ok
+test_contiguous_beats_raise_nothing (tests.test_reverse_beats.TestUncoveredTime.test_contiguous_beats_raise_nothing) ... ok
+test_a_clean_variant_has_no_errors (tests.test_reverse_beats.TestVariantEvidenceFrames.test_a_clean_variant_has_no_errors) ... ok
+test_a_nonexistent_reference_frame_only_warns (tests.test_reverse_beats.TestVariantEvidenceFrames.test_a_nonexistent_reference_frame_only_warns)
+变体不对原片的事实负责，缺一张构图参考不该拦住合成。 ... ok
+test_the_source_ladder_is_still_held_to_evidence (tests.test_reverse_beats.TestVariantEvidenceFrames.test_the_source_ladder_is_still_held_to_evidence)
+豁免只对变体生效——原片阶梯少了证据帧仍然是硬伤。 ... ok
+
+======================================================================
+FAIL: test_a_thing_that_shows_up_midway_is_reported_as_new (tests.test_reverse_beats.TestTimeWindows.test_a_thing_that_shows_up_midway_is_reported_as_new)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/fly/Desktop/creative-idea-generator/tests/test_reverse_beats.py", line 1473, in test_a_thing_that_shows_up_midway_is_reported_as_new
+    self.assertIn('yellow insulation batts', w[1]['appeared'])
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'yellow insulation batts' not found in ['insulation batts']
+
+----------------------------------------------------------------------
+Ran 148 tests in 0.068s
+
+FAILED (failures=1)

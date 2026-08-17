@@ -81,4 +81,53 @@ assert.equal(JSON.parse(call(`localStorage.getItem('spark_config')`)).frameFacts
              'gemini-3.1-pro-high');
 assert.equal(call(`replicaConfigValue('peakVerifyModel', 'fallback')`), 'fallback');
 
+// ── 4. 节拍阶梯硬伤时的 AI 修复按钮渲染 ──────────────────────────────────────
+const sampleStateWithErrors = {
+    beats: {
+        beats: [
+            { id: 'B01', start: 0, end: 5, stage: 'demolition' },
+            { id: 'B02', start: 5, end: 10, stage: 'structural' },
+        ],
+        banned_elements: [],
+    },
+    validation: [
+        { level: 'error', message: 'B02 违反施工顺序', beat_id: 'B02' }
+    ]
+};
+call(`replicaState = ${JSON.stringify(sampleStateWithErrors)}`);
+const beatsHtml = call(`replicaRenderBeats(replicaState)`);
+assert.ok(beatsHtml.includes('id="replica-autofix-btn"'), '底部操作栏必须包含 AI 修复按钮');
+assert.ok(beatsHtml.includes('id="replica-banner-autofix-btn"'), '硬伤横幅必须包含一键 AI 修复按钮');
+assert.ok(beatsHtml.includes('AI 修复全部硬伤'), '横幅修复文案正确');
+
+// ── 5. 变体任务折叠/展开下拉功能测试 ───────────────────────────────────────
+const sampleJobs = [
+    { job_id: 'job_parent', stage: 'completed', title: '母本视频', job_type: 'baseline' },
+    { job_id: 'job_var1', stage: 'review_beats', title: '变体1', variant_of: 'job_parent', parent_baseline_id: 'job_parent', job_type: 'variant' },
+    { job_id: 'job_var2', stage: 'completed', title: '变体2', variant_of: 'job_parent', parent_baseline_id: 'job_parent', job_type: 'variant' },
+];
+call(`replicaJobs = ${JSON.stringify(sampleJobs)}; replicaVariantFoldState = {};`);
+
+// 默认折叠：母本行渲染，但变体行未展开挂载在母本下
+let listHtml = call(`replicaRenderJobList()`);
+assert.ok(listHtml.includes('👑 2 个变体 ▼'), '母本应渲染折叠状态的变体下拉按钮');
+
+// 模拟点击展开变体
+call(`
+    const parentId = 'job_parent';
+    const currentlyFolded = replicaVariantFoldState[parentId] !== false;
+    replicaVariantFoldState[parentId] = !currentlyFolded;
+`);
+listHtml = call(`replicaRenderJobList()`);
+assert.ok(listHtml.includes('👑 2 个变体 ▲'), '展开后下拉按钮应切换为收起箭头');
+assert.ok(listHtml.includes('replica-job-variant-row'), '展开后应渲染子变体行');
+
+// 模拟再次点击折叠
+call(`
+    const currentlyFolded2 = replicaVariantFoldState[parentId] !== false;
+    replicaVariantFoldState[parentId] = !currentlyFolded2;
+`);
+listHtml = call(`replicaRenderJobList()`);
+assert.ok(listHtml.includes('👑 2 个变体 ▼'), '再次点击后应恢复折叠状态');
+
 console.log('test_replica_controls.js: all assertions passed');

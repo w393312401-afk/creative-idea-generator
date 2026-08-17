@@ -122,6 +122,12 @@ const FRAME_BADGE_DEFS = [
         tip: f => f.degraded_reason || '',
         hover: f => ` (降档通道产出: ${f.degraded_reason || ''})`,
     },
+    {
+        id: 'candidate-selection', text: '4选1', cls: 'candidate-selection-badge',
+        test: f => !!(f && f.candidates && f.candidates.length > 1),
+        tip: f => `4选1智能生成：AI已鉴别优选候选 #${f.chosen_candidate_index || 1}。点击卡片可查看4张候选对比并手动切换`,
+        hover: f => ` (4选1智能生成: 已优选候选 #${f.chosen_candidate_index || 1})`,
+    },
 ];
 
 const VIDEO_BADGE_DEFS = [
@@ -219,6 +225,12 @@ function frameActions(state, ctx) {
             cls: 'describe-frame-btn',
             idle: '人工描述这一帧哪里不对，作为定向修复的依据',
         }));
+        if (state.flags.hasCandidates) {
+            list.push(mk('view-candidates', '4选1', {
+                cls: 'view-candidates-btn',
+                idle: '查看本帧的4张候选图与AI评审详情，可手动切换采用图',
+            }));
+        }
         if (state.flags.fixBackup) {
             // 修复越修越糟时的退路：修复覆盖写同一个文件，没有这个入口就只能盲重渲
             list.push(mk('undo-fix', '撤销修复', {
@@ -321,6 +333,7 @@ function frameSlotState(frame, ctx) {
         stale: slotIsStale(frame),
         manualUpload: frame.source === 'manual_upload',
         swappedFrom: slotSwappedFrom(frame, 'swapped_from_sequence'),
+        hasCandidates: !!(frame && frame.candidates && frame.candidates.length > 1),
         manualIssue,
     };
     // 「修复此帧问题」的出口条件（判定收口在 frameIsFixable，工具条的「全部修复」

@@ -155,7 +155,15 @@ function renderIdea(result) {
     // 换单/重渲时必须先退出手动编辑态：编辑器里躺着的是上一单的提示词，
     // 留在屏幕上一保存就写串了单（见 js/prompt_editor.js）。
     if (typeof resetPromptEditor === 'function') resetPromptEditor();
-    document.getElementById('idea-prompt-block').textContent = result.prompt_block || '（本次未返回提示词内容）';
+    if (typeof renderPromptDisplay === 'function') {
+        renderPromptDisplay(result.prompt_block || '（本次未返回提示词内容）');
+    } else {
+        const blockEl = document.getElementById('idea-prompt-block');
+        if (blockEl) blockEl.textContent = result.prompt_block || '（本次未返回提示词内容）';
+    }
+    if (result.id && result.prompt_block && typeof recordPromptHistory === 'function') {
+        recordPromptHistory(result.id, result.prompt_block, '初始激发生成');
+    }
     document.getElementById('idea-audit').innerHTML = renderAuditMarkdown(result.audit_md);
 
     // 提示词槽位卡片已移除：本页仅展示原始 Markdown 提示词块（#idea-prompt-block，见上）。
@@ -194,11 +202,15 @@ function renderIdea(result) {
             collageWrapper.style.display = 'block';
             
             collageImg.onclick = () => {
-                openLightbox([{
-                    type: 'image',
-                    url: result.collage_url,
-                    caption: '<strong>视频关键帧多宫格拼图 (Keyframe Collage)</strong>'
-                }], 0);
+                if (typeof openCollageViewer === 'function') {
+                    openCollageViewer({ collageUrl: result.collage_url, idea: result });
+                } else {
+                    openLightbox([{
+                        type: 'image',
+                        url: result.collage_url,
+                        caption: '<strong>视频关键帧多宫格拼图 (Keyframe Collage)</strong>'
+                    }], 0);
+                }
             };
         } else {
             collageWrapper.style.display = 'none';

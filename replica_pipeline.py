@@ -39,21 +39,22 @@ STAGES = [
     'cluster_beats',
     'review_beats',    # ⏸ PAUSE：对着证据帧核对节拍
     'mutate_beats',    # 二创分支
+    'mutate_failed',   # ⏸ 二创生成失败
     'compose',
+    'compose_failed',  # ⏸ 合成模型异常/超限
     'audit',
     'audit_failed',    # ⏸ banned 门禁命中：不入库、不算完成，等用户重写后重跑
     'completed',
+    'archived',
     'cancelled',
 ]
 
-REVIEW_STAGES = {'confirm_cost', 'review_beats', 'audit_failed'}
+REVIEW_STAGES = {'confirm_cost', 'review_beats', 'audit_failed', 'compose_failed', 'mutate_failed'}
+ATTENTION_WAITING_YOU = {'confirm_cost', 'review_beats', 'audit_failed', 'compose_failed', 'mutate_failed'}
+
+VALID_ACTIONS = {'approve', 'variant', 'recluster', 'translate', 'autofix', 'fix_beats', 'autobalance', 'archive', 'rename'}
 
 # stage → 中文标签的唯一真源。
-#
-# 这份映射此前在前端抄了两份（js/replica_pipeline.js 的 REPLICA_STAGE_LABELS 和
-# js/projects.js 的 PROJECT_STAGE_LABELS），本仓库在 contract registry 上已经吃过一次
-# "两份长得一样但互不相关"的亏。加一个 stage 要记得改三处，漏一处就在工作台上露出
-# `cluster_beats` 这种内部名。现在后端随 job 行一起下发 stage_label，前端只留一份兜底。
 STAGE_LABELS = {
     'ingest': '已上传',
     'extract': '抽帧中',
@@ -62,20 +63,22 @@ STAGE_LABELS = {
     'cluster_beats': '聚类节拍',
     'review_beats': '待人工核对',
     'mutate_beats': '二创改写中',
+    'mutate_failed': '二创失败',
     'compose': '合成提示词',
+    'compose_failed': '合成失败',
     'audit': '门禁校验',
     'audit_failed': '门禁未过',
     'completed': '已完成',
+    'archived': '已归档',
     'cancelled': '已取消',
 }
 
-# 用户看得见的四个阶段。后台十二个 stage 是状态机的内部粒度，摆在 UI 上只会让人
-# 对着一个 chip 找不到对应区块——「聚类节拍」在页面上没有任何一块是它。
+# 用户看得见的四个阶段。后台状态机粒度与 UI 呈现阶段映射。
 PHASES = [
     ('material', '素材', ('ingest', 'extract', 'confirm_cost')),
-    ('reverse', '反推', ('review_frames', 'cluster_beats', 'mutate_beats')),
+    ('reverse', '反推', ('review_frames', 'cluster_beats', 'mutate_beats', 'mutate_failed')),
     ('review', '核对节拍', ('review_beats',)),
-    ('deliver', '交付', ('compose', 'audit', 'audit_failed', 'completed')),
+    ('deliver', '交付', ('compose', 'compose_failed', 'audit', 'audit_failed', 'completed', 'archived')),
 ]
 
 
@@ -90,6 +93,27 @@ def phase_of(stage):
     return 'material'
 
 
+def attention_of(stage, updated_at=None, has_active_task=False):
+    """计算 Job 的下一步归属 (attention)。
+    - running: 正在后台运行
+    - waiting_you: 等你动手 (confirm_cost / review_beats / audit_failed / compose_failed / mutate_failed)
+    - done: completed 已完成
+    - archived: 已归档
+    - stalled: 其余搁置/超期/取消状态
+    """
+    if has_active_task:
+        return 'running'
+    if stage == 'archived':
+        return 'archived'
+    if stage == 'completed':
+        return 'done'
+    if stage in ATTENTION_WAITING_YOU:
+        return 'waiting_you'
+    if stage == 'cancelled':
+        return 'stalled'
+    return 'stalled'
+
+
 def stage_catalog():
     """给前端的一份阶段目录。前端据此渲染阶梯指示，不再自己抄一份 stage 列表。"""
     return {
@@ -102,6 +126,7 @@ def stage_catalog():
 
 _JOBS_DIRNAME = 'replica_jobs'
 _STATE_FILENAME = '.replica_pipeline.json'
+
 
 # 抽帧脚本的默认参数就是为延时调过的（见脚本 docstring），不要在这里再调低。
 # 送审档位（degraded / plan / all）收窄或放开的是**送多少帧给模型**，那是 Pass A
@@ -139,35 +164,262 @@ def _dense_fps_for(base_fps):
 
 # ── job 目录与状态 ───────────────────────────────────────────────────────────
 
+REPLICA_JOB_ID_RE = re.compile(r'^[a-zA-Z0-9_-]{3,64}$')
+
+
+def validate_job_id(job_id):
+    """校验 job_id 格式，杜绝路径穿越与非法字符。"""
+    if not job_id or not isinstance(job_id, str):
+        raise ValueError('非法的 job_id: 不能为空')
+    cleaned = job_id.strip()
+    if not REPLICA_JOB_ID_RE.match(cleaned):
+        raise ValueError(f'非法的 job_id: {job_id}')
+    return cleaned
+
+
 def jobs_root():
     # OUTPUT_ROOT 在测试里会被 patch，必须每次读模块属性而不是 import 时快照。
     return os.path.join(server_common.OUTPUT_ROOT, _JOBS_DIRNAME)
 
 
 def job_dir(job_id):
-    return os.path.join(jobs_root(), job_id)
+    valid_id = validate_job_id(job_id)
+    return os.path.join(jobs_root(), valid_id)
 
 
 def _state_path(job_id):
     return os.path.join(job_dir(job_id), _STATE_FILENAME)
 
 
+_SUMMARY_FILENAME = '.summary.json'
+
+
+def _summary_path(job_id):
+    return os.path.join(job_dir(job_id), _SUMMARY_FILENAME)
+
+
+from contextlib import contextmanager
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+
+@contextmanager
+def state_lock(job_id, exclusive=True):
+    """跨进程/线程文件排他锁，防止后台 Worker 与前端 HTTP 请求并发写冲突。"""
+    try:
+        valid_id = validate_job_id(job_id)
+        directory = os.path.join(jobs_root(), valid_id)
+        os.makedirs(directory, exist_ok=True)
+        lock_path = os.path.join(directory, '.state.lock')
+        flags = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) if fcntl else 0
+        with open(lock_path, 'a') as f:
+            if fcntl:
+                try:
+                    fcntl.flock(f.fileno(), flags)
+                except (OSError, AttributeError):
+                    pass
+            try:
+                yield
+            finally:
+                if fcntl:
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    except (OSError, AttributeError):
+                        pass
+    except Exception:
+        yield
+
+
+def _write_summary(state):
+    """维护单任务轻量索引文件（<1KB），供列表 O(1) 检索。"""
+    job_id = state.get('job_id')
+    if not job_id:
+        return
+    try:
+        beats = state.get('beats')
+        beat_count = len((beats.get('beats') if isinstance(beats, dict) else []) or [])
+        if not beat_count:
+            bpath = os.path.join(job_dir(job_id), 'timelapse_beats.json')
+            if os.path.exists(bpath):
+                try:
+                    with open(bpath, 'r', encoding='utf-8') as f:
+                        bdata = json.load(f)
+                        beat_count = len((bdata.get('beats') or []))
+                except Exception:
+                    pass
+        summary = {
+            'job_id': job_id,
+            'stage': state.get('stage'),
+            'stage_label': stage_label(state.get('stage')),
+            'phase': phase_of(state.get('stage')),
+            'attention': attention_of(state.get('stage'), state.get('updated_at')),
+            'job_type': state.get('job_type') or ('variant' if state.get('variant_of') else 'baseline'),
+            'is_locked_baseline': bool(state.get('is_locked_baseline')),
+            'parent_baseline_id': state.get('parent_baseline_id') or state.get('variant_of'),
+            'lineage_variants': state.get('lineage_variants') or [],
+            'video_name': state.get('video_name'),
+            'video_sha256': state.get('video_sha256'),
+            'title': state.get('title'),
+            'title_locked': bool(state.get('title_locked')),
+            'variant_of': state.get('variant_of'),
+            'beat_count': beat_count,
+            'cost_estimate': state.get('cost_estimate'),
+            'archived': bool(state.get('archived') or state.get('stage') == 'archived'),
+            'error': state.get('error'),
+            'created_at': state.get('created_at'),
+            'updated_at': state.get('updated_at'),
+        }
+        path = _summary_path(job_id)
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _prompt_block_only(text):
+    """合成器输出 → 提示词正文（剥掉 TITLE/THEME 头与 AUDIT 尾）。
+
+    口径唯一长在 `prompt_pipeline.prompt_block_from_output`，这里只是个惰性导入的
+    薄壳——replica_pipeline 在模块顶层不碰 prompt_pipeline（导入成本）。
+    """
+    from prompt_pipeline import prompt_block_from_output
+    return prompt_block_from_output(text)
+
+
+def _ensure_prompt_block_summaries(prompt_block, beats_doc=None):
+    """如果 prompt_block 里的图片/视频分槽标题缺少或含有无效的「（中文简介）」，从 beats_doc 的中文对照中自动补全/修复。"""
+    if not prompt_block or not beats_doc or not isinstance(prompt_block, str):
+        return prompt_block
+    beats = beats_doc.get('beats') if isinstance(beats_doc, dict) else (beats_doc if isinstance(beats_doc, list) else [])
+    if not beats:
+        return prompt_block
+
+    from prompt_pipeline import _short_slot_summary
+
+    summaries = {}
+    for idx, beat in enumerate(beats, start=1):
+        if not isinstance(beat, dict):
+            continue
+        zh = beat.get('zh') or {}
+        s = None
+        if isinstance(zh, dict):
+            s = (zh.get('operation') or zh.get('headline') or zh.get('visible_result') or zh.get('visible_action'))
+        if not s:
+            s = (beat.get('operation_zh') or beat.get('headline_zh') or beat.get('summary_zh')
+                 or beat.get('summary') or beat.get('operation'))
+        if isinstance(s, (list, tuple)):
+            s = '、'.join(str(x).strip() for x in s if str(x).strip())
+        if s:
+            summaries[idx] = _short_slot_summary(str(s).strip())
+
+    first_beat = beats[0] if beats else {}
+    first_zh = first_beat.get('zh') or {} if isinstance(first_beat, dict) else {}
+    before_s = None
+    if isinstance(first_zh, dict):
+        before_s = first_zh.get('before_state') or first_zh.get('state_before') or first_zh.get('before_zh')
+    if not before_s:
+        before_s = first_beat.get('before_zh') or first_beat.get('state_before')
+
+    if not summaries and not before_s:
+        return prompt_block
+
+    if not before_s and summaries:
+        before_s = '初始未动工状态'
+    before_s = _short_slot_summary(str(before_s))
+
+    lines = prompt_block.split('\n')
+    new_lines = []
+    for line in lines:
+        m_img = re.match(r'^(\s*(?:#{1,6}\s*|\*{1,2}\s*)?图片\s*(\d+))(?:\s*[（\(](.*?)[）\)])?(\s*(?:\[.*?\])?\s*[:：].*)$', line)
+        if m_img:
+            prefix = m_img.group(1)
+            num = int(m_img.group(2))
+            existing_s = (m_img.group(3) or '').strip()
+            rest = m_img.group(4)
+            # 若现有简介为空，或不含中文字符（如误提取的 (The) / (Rigging) 等英文残留），用正确中文简介替换
+            if not existing_s or not re.search(r'[\u4e00-\u9fa5]', existing_s):
+                summary = before_s if num == 1 else summaries.get(num - 1, "")
+                if summary:
+                    new_lines.append(f"{prefix}（{summary}）{rest}")
+                    continue
+
+        m_vid = re.match(r'^(\s*(?:#{1,6}\s*|\*{1,2}\s*)?视频\s*(\d+))(?:\s*[（\(](.*?)[）\)])?(\s*(?:\[.*?\])?\s*[:：].*)$', line)
+        if m_vid:
+            prefix = m_vid.group(1)
+            num = int(m_vid.group(2))
+            existing_s = (m_vid.group(3) or '').strip()
+            rest = m_vid.group(4)
+            if not existing_s or not re.search(r'[\u4e00-\u9fa5]', existing_s):
+                summary = summaries.get(num, "")
+                if summary:
+                    new_lines.append(f"{prefix}（{summary}）{rest}")
+                    continue
+
+        new_lines.append(line)
+    return '\n'.join(new_lines)
+
+
 def _load_state(job_id):
-    path = _state_path(job_id)
+    try:
+        valid_id = validate_job_id(job_id)
+    except ValueError:
+        return None
+    path = _state_path(valid_id)
     if not os.path.exists(path):
         return None
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    with state_lock(valid_id, exclusive=False):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            return None
+    if state and not state.get('beats'):
+        beats_path = os.path.join(job_dir(valid_id), 'timelapse_beats.json')
+        if os.path.exists(beats_path):
+            try:
+                with open(beats_path, 'r', encoding='utf-8') as f:
+                    state['beats'] = json.load(f)
+                    if not state.get('validation'):
+                        state['validation'] = state['beats'].get('validation') or []
+            except (OSError, ValueError):
+                pass
+    if state and state.get('prompt_block'):
+        # 存量任务：2026-08-15 之前 run_compose 把合成器的整份带标记文档原样存成了
+        # prompt_block（见 _prompt_block_only）。读的时候剥一次，不必迁移旧任务文件。
+        state['prompt_block'] = _prompt_block_only(state['prompt_block'])
+        if state.get('beats'):
+            state['prompt_block'] = _ensure_prompt_block_summaries(state['prompt_block'], state['beats'])
+    return state
 
 
 def _save_state(state):
-    path = _state_path(state['job_id'])
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    valid_id = validate_job_id(state['job_id'])
+    directory = job_dir(valid_id)
+    os.makedirs(directory, exist_ok=True)
+    path = _state_path(valid_id)
     state['updated_at'] = datetime.now().isoformat()
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+
+    beats = state.get('beats')
+    if beats:
+        beats_path = os.path.join(directory, 'timelapse_beats.json')
+        try:
+            tmp_beats = beats_path + '.tmp'
+            with open(tmp_beats, 'w', encoding='utf-8') as f:
+                json.dump(beats, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_beats, beats_path)
+        except Exception:
+            pass
+
+    with state_lock(valid_id, exclusive=True):
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        _write_summary(state)
     return state
 
 
@@ -199,23 +451,61 @@ def list_replica_jobs():
         return []
     rows = []
     for name in os.listdir(root):
-        state = _load_state(name)
+        dir_path = os.path.join(root, name)
+        if not os.path.isdir(dir_path):
+            continue
+        try:
+            valid_id = validate_job_id(name)
+        except ValueError:
+            continue
+        summary_file = os.path.join(dir_path, _SUMMARY_FILENAME)
+        if os.path.exists(summary_file):
+            try:
+                with open(summary_file, 'r', encoding='utf-8') as f:
+                    summary = json.load(f)
+                    summary['attention'] = summary.get('attention') or attention_of(summary.get('stage'), summary.get('updated_at'))
+                    rows.append(summary)
+                    continue
+            except (OSError, ValueError):
+                pass
+        state = _load_state(valid_id)
         if not state:
             continue
+        _write_summary(state)
         rows.append({
             'job_id': state.get('job_id'),
             'stage': state.get('stage'),
             'stage_label': stage_label(state.get('stage')),
             'phase': phase_of(state.get('stage')),
+            'attention': attention_of(state.get('stage'), state.get('updated_at')),
+            'job_type': state.get('job_type') or ('variant' if state.get('variant_of') else 'baseline'),
+            'is_locked_baseline': bool(state.get('is_locked_baseline')),
+            'parent_baseline_id': state.get('parent_baseline_id') or state.get('variant_of'),
+            'lineage_variants': state.get('lineage_variants') or [],
             'video_name': state.get('video_name'),
+            'video_sha256': state.get('video_sha256'),
             'title': state.get('title'),
+            'title_locked': bool(state.get('title_locked')),
             'variant_of': state.get('variant_of'),
             'beat_count': len(((state.get('beats') or {}).get('beats')) or []),
+            'cost_estimate': state.get('cost_estimate'),
+            'archived': bool(state.get('archived') or state.get('stage') == 'archived'),
             'error': state.get('error'),
             'created_at': state.get('created_at'),
             'updated_at': state.get('updated_at'),
         })
     rows.sort(key=lambda r: r.get('updated_at') or '', reverse=True)
+    valid_ids = {r['job_id'] for r in rows if r.get('job_id')}
+    for r in rows:
+        jid = r.get('job_id')
+        raw_v = r.get('lineage_variants') or []
+        r['lineage_variants'] = [v for v in raw_v if v in valid_ids and v != jid]
+        for other in rows:
+            oid = other.get('job_id')
+            if not oid or oid == jid:
+                continue
+            if (other.get('parent_baseline_id') == jid or other.get('variant_of') == jid) and oid not in r['lineage_variants']:
+                r['lineage_variants'].append(oid)
     return rows
 
 
@@ -233,10 +523,13 @@ def _sha256(path, chunk=1 << 20):
 
 def find_job_by_video_hash(video_hash):
     """同一条视频不必重抽帧。抽帧是几分钟的 ffmpeg，重传一次就重跑一遍纯属浪费。"""
+    if not video_hash:
+        return None
     for row in list_replica_jobs():
-        state = _load_state(row['job_id'])
-        if state and state.get('video_sha256') == video_hash and state.get('stage') != 'cancelled':
-            return state
+        if row.get('video_sha256') == video_hash and row.get('stage') != 'cancelled':
+            state = _load_state(row['job_id'])
+            if state:
+                return state
     return None
 
 
@@ -267,9 +560,14 @@ def ingest_video(file_bytes, filename, config=None):
         existing['reused'] = True
         return existing
 
+    initial_title = os.path.splitext(safe_name)[0] if safe_name else f"素材 {job_id[-6:]}"
     state = {
         'job_id': job_id,
         'stage': 'ingest',
+        'job_type': 'baseline',
+        'is_locked_baseline': False,
+        'parent_baseline_id': None,
+        'lineage_variants': [],
         'video_path': video_path,
         'video_name': safe_name,
         'video_sha256': video_hash,
@@ -282,11 +580,23 @@ def ingest_video(file_bytes, filename, config=None):
         'facts': None,
         'beats': None,
         'validation': [],
-        'title': None,
+        'title': initial_title,
+        'title_locked': False,
+        'archived': False,
         'prompt_block': None,
         'banned_hits': [],
         'variant_of': None,
         'mutation_axes': [],
+        'mutation_config': {
+            'enabled': False,
+            'selected_preset': None,
+            'axes': {
+                'environment': None,
+                'material': None,
+                'function': None,
+                'hero_reveal': None,
+            },
+        },
         'error': None,
         'created_at': datetime.now().isoformat(),
         'updated_at': datetime.now().isoformat(),
@@ -326,20 +636,62 @@ def _analyzer_script():
     return path
 
 
-def _purge_extract_products(directory):
-    """重抽帧之前把上一轮的帧与帧事实清掉。
-
-    送审帧的文件名是 `review_001.png` 这种**序号**，不是时间戳：换了抽帧密度，
-    同一个名字指向的是另一个时刻的画面。留着旧的 `.frame_facts_cache.json`，
-    Pass A 会按名字命中缓存，于是把上一档某一秒的观察安在这一档另一秒的帧上——
-    整条节拍阶梯建在错位的事实上，而且全程没有任何报错。
-    """
+def _purge_extract_products(directory, state=None):
+    """重抽帧之前把上一轮的帧、拼图、帧事实、节拍与合成状态全部彻底清空。"""
     shutil.rmtree(os.path.join(directory, 'review_frames'), ignore_errors=True)
-    for name in ('.frame_facts_cache.json', 'frame_facts.json'):
+    shutil.rmtree(os.path.join(directory, 'storyboard'), ignore_errors=True)
+    shutil.rmtree(os.path.join(directory, '.pass_b_sheets'), ignore_errors=True)
+    if os.path.isdir(directory):
+        for name in os.listdir(directory):
+            if (name.endswith('_collage_thumb.jpg')
+                    or name.startswith('.bad_reply_') or name.startswith('.tmp_concat_')):
+                try:
+                    os.remove(os.path.join(directory, name))
+                except OSError:
+                    pass
+    for name in ('.frame_facts_cache.json', 'frame_facts.json', 'timelapse_beats.json',
+                 'compose_state.json'):
         try:
             os.remove(os.path.join(directory, name))
         except OSError:
             pass
+    if state is not None:
+        state['overview'] = None
+        state['facts'] = None
+        state['beats'] = None
+        state['validation'] = []
+        state['prompt_block'] = None
+        state['title'] = None
+        state['banned_hits'] = []
+        state['cost_estimate'] = None
+        state['error'] = None
+
+
+def _generate_collage_thumb(collage_path):
+    """生成 Web 展示专用的拼贴图缩略图（~300KB）。"""
+    if not collage_path or not os.path.exists(collage_path) or os.path.getsize(collage_path) < 100:
+        return None
+    thumb_path = os.path.splitext(collage_path)[0] + '_thumb.jpg'
+    if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+        return thumb_path
+    try:
+        from PIL import Image
+        with Image.open(collage_path) as im:
+            im.thumbnail((1920, 1920))
+            im.save(thumb_path, 'JPEG', quality=80, optimize=True)
+        return thumb_path
+    except Exception:
+        pass
+    try:
+        ffmpeg = server_common.resolve_binary('ffmpeg') if hasattr(server_common, 'resolve_binary') else 'ffmpeg'
+        subprocess.run(
+            [ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-i', collage_path,
+             '-vf', 'scale=1920:-1:force_divisible_by=2', '-q:v', '5', thumb_path],
+            capture_output=True, check=True
+        )
+        return thumb_path
+    except Exception:
+        return None
 
 
 def run_extract(state, on_progress=None, base_fps=None):
@@ -362,7 +714,7 @@ def run_extract(state, on_progress=None, base_fps=None):
         })
 
     directory = job_dir(state['job_id'])
-    _purge_extract_products(directory)
+    _purge_extract_products(directory, state)
     proc = subprocess.run(
         [sys.executable, _analyzer_script(),
          '--video', state['video_path'], '--output-dir', directory,
@@ -385,10 +737,12 @@ def run_extract(state, on_progress=None, base_fps=None):
             '关键帧拼贴图生成失败。它是节拍映射的前置门禁：没有它，等于没看过整条'
             '序列就要定义节拍。请先修复 ffmpeg 环境再重跑抽帧。')
 
+    thumb = _generate_collage_thumb(collage)
     from prompt_pipeline import reverse
     state['overview'] = {
         'path': overview_path,
         'collage': collage,
+        'collage_thumb': thumb or collage,
         'duration_sec': (overview.get('media_metadata') or {}).get('duration_sec'),
         'change_event_count': overview.get('change_event_count'),
         'frame_count': (overview.get('review_sampling') or {}).get('frame_count'),
@@ -506,6 +860,8 @@ def save_beats(job_id, beats):
     state = _load_state(job_id)
     if not state:
         raise ValueError(f'找不到复刻任务 {job_id}')
+    if state.get('is_locked_baseline'):
+        raise ValueError('已加锁为 Gold Baseline，禁止直接修改节拍；如需调整请先解锁或以此母本派生变体。')
     if not isinstance(beats, dict) or not beats.get('beats'):
         raise ValueError('beats 不能为空')
 
@@ -518,6 +874,7 @@ def save_beats(job_id, beats):
     # 人工在卡点上拆拍/并拍/改 space 之后，空间序列要跟着重新归一：一次编辑就可能
     # 增删一次过门（见 reverse.normalize_beat_spaces）。
     reverse.normalize_beat_spaces(beats)
+    reverse.reconcile_event_coverage(beats, overview, reconcile_unbound=False)
     # 拆拍/并拍改的就是时间窗，覆盖帧必须跟着重算——见 attach_coverage_frames。
     reverse.attach_coverage_frames(beats, overview)
     beats['pipeline_id'] = job_id
@@ -527,6 +884,28 @@ def save_beats(job_id, beats):
     # 英文字段，所以 zh 是从上一版原样带回来的——不清理就会出现「中文还是旧的」。
     reverse.prune_stale_translations(state.get('beats'), beats)
     _write_beats(state, beats)
+    return _save_state(state)
+
+
+def lock_baseline_job(job_id, lock=True):
+    """将验证通过的 1:1 Job 加锁固化为 Gold Baseline 或解锁。"""
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+
+    if lock:
+        beats = state.get('beats')
+        if not beats or not (beats.get('beats') if isinstance(beats, dict) else []):
+            raise ValueError('该任务尚未生成节拍阶梯，无法锁定为 Gold Baseline')
+        # 确保没有未处理的阻断性硬伤
+        errors = [v for v in (_revalidate(state, persist=False) or []) if v.get('level') == 'error']
+        if errors:
+            raise ValueError(f'节拍阶梯仍有 {len(errors)} 项硬伤未解决，无法锁定为 Gold Baseline：' + '；'.join(v['message'] for v in errors[:3]))
+        state['is_locked_baseline'] = True
+        state['job_type'] = 'baseline'
+    else:
+        state['is_locked_baseline'] = False
+
     return _save_state(state)
 
 
@@ -548,6 +927,76 @@ def translate_job_beats(config, job_id, on_progress=None):
     _write_beats(state, beats)
     _save_state(state)
     return state, translated
+
+
+def autofix_job_beats(config, job_id, on_progress=None):
+    """根据硬伤和违规项定向 AI 修复节拍阶梯。"""
+    from prompt_pipeline import reverse
+
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+    beats = state.get('beats')
+    if not beats or not beats.get('beats'):
+        raise ValueError('还没有节拍阶梯，无法修复')
+
+    overview = _load_overview(state)
+    fixed_doc, fixed_count = reverse.autofix_beats(
+        config, beats, overview=overview, on_progress=on_progress
+    )
+
+    # 翻译作废并重新翻译更新过的字段
+    reverse.prune_stale_translations(beats, fixed_doc)
+    reverse.translate_beats(config, fixed_doc, on_progress=on_progress)
+    _write_beats(state, fixed_doc)
+    state['stage'] = 'review_beats'
+    _save_state(state)
+
+    if on_progress:
+        errors = [v for v in state.get('validation') or [] if v.get('level') == 'error']
+        msg = ('AI 修复完成！已解决全部硬伤，节拍阶梯已通过全部机械校验。'
+               if not errors else f'AI 修复完成，已修复 {fixed_count} 项，剩余 {len(errors)} 项硬伤待核对。')
+        on_progress('replica_stage', {
+            'stage': 'review_beats',
+            'message': msg,
+            'beats': fixed_doc,
+            'validation': state.get('validation') or [],
+        })
+    return state, fixed_count
+
+
+def autobalance_job_beats(config, job_id, on_progress=None):
+    """根据秒数与 2x 倍速时序模型自动拆解超长拍（>6.0s）并合并过短微拍（<2.0s）。"""
+    from prompt_pipeline import reverse
+
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+    beats = state.get('beats')
+    if not beats or not beats.get('beats'):
+        raise ValueError('还没有节拍阶梯，无法平衡时序')
+
+    overview = _load_overview(state)
+    balanced_doc, changed_count = reverse.autobalance_beats(
+        beats, overview=overview
+    )
+
+    # 翻译作废并重新补译新增的拆拍条目
+    reverse.prune_stale_translations(beats, balanced_doc)
+    reverse.translate_beats(config, balanced_doc, on_progress=on_progress)
+    _write_beats(state, balanced_doc)
+    state['stage'] = 'review_beats'
+    _save_state(state)
+
+    if on_progress:
+        msg = f'时序自动平衡完成！已拆解/合并 {changed_count} 处异常时长拍，当前共 {len(balanced_doc.get("beats") or [])} 拍。'
+        on_progress('replica_stage', {
+            'stage': 'review_beats',
+            'message': msg,
+            'beats': balanced_doc,
+            'validation': state.get('validation') or [],
+        })
+    return state, changed_count
 
 
 # ── 二创 ─────────────────────────────────────────────────────────────────────
@@ -573,6 +1022,11 @@ def run_mutate(state, config, axis_spec, on_progress=None):
     variant_state = {
         'job_id': variant_id,
         'stage': 'mutate_beats',
+        'job_type': 'variant',
+        'is_locked_baseline': False,
+        'parent_baseline_id': state['job_id'],
+        'variant_of': state['job_id'],
+        'lineage_variants': [],
         'video_path': state.get('video_path'),
         'video_name': state.get('video_name'),
         'video_sha256': None,   # 变体不参与视频去重，否则会顶掉源 job
@@ -588,9 +1042,13 @@ def run_mutate(state, config, axis_spec, on_progress=None):
         'title': None,
         'prompt_block': None,
         'banned_hits': [],
-        'variant_of': state['job_id'],
         'source_frames_dir': src_dir,
         'mutation_axes': list(axis_spec.get('axes') or []),
+        'mutation_config': {
+            'enabled': True,
+            'selected_preset': axis_spec.get('preset'),
+            'axes': axis_spec.get('axes') if isinstance(axis_spec.get('axes'), dict) else {a: '' for a in (axis_spec.get('axes') or [])},
+        },
         'mutation_brief': axis_spec.get('brief') or '',
         'error': None,
         'created_at': datetime.now().isoformat(),
@@ -598,27 +1056,232 @@ def run_mutate(state, config, axis_spec, on_progress=None):
     }
     _save_state(variant_state)
 
-    variant_beats = reverse.mutate_beats(config, source_beats, axis_spec, on_progress=on_progress)
-    variant_beats['pipeline_id'] = variant_id
-    # 二创改写过的英文字段，其中文对照刚被 _merge_variant 作废（见那里的注释）；补回来，
-    # 否则变体的卡点又退回一屏英文。与 run_reverse 同一个理由、同一个位置。
-    reverse.translate_beats(config, variant_beats, on_progress=on_progress)
-    _write_beats(variant_state, variant_beats)
+    # 维护母本的血统树
+    parent_lineage = state.get('lineage_variants') or []
+    if variant_id not in parent_lineage:
+        state['lineage_variants'] = parent_lineage + [variant_id]
+        _save_state(state)
 
-    variant_state['stage'] = 'review_beats'
-    _save_state(variant_state)
+    try:
+        variant_beats = reverse.mutate_beats(config, source_beats, axis_spec, on_progress=on_progress)
+        variant_beats['pipeline_id'] = variant_id
+        # 二创改写过的英文字段，其中文对照刚被 _merge_variant 作废（见那里的注释）；补回来，
+        # 否则变体的卡点又退回一屏英文。与 run_reverse 同一个理由、同一个位置。
+        reverse.translate_beats(config, variant_beats, on_progress=on_progress)
+        _write_beats(variant_state, variant_beats)
+
+        variant_state['stage'] = 'review_beats'
+        _save_state(variant_state)
+    except Exception as e:
+        variant_state['stage'] = 'mutate_failed'
+        variant_state['error'] = str(e)
+        _save_state(variant_state)
+        raise
 
     if on_progress:
         on_progress('replica_stage', {
             'stage': 'review_beats',
             'message': (f'二创节拍已生成（{len(variant_beats.get("beats") or [])} 拍，'
-                        f'变异轴：{"、".join(reverse.MUTATION_AXES[a] for a in variant_state["mutation_axes"])}）。'
+                        f'变异轴：{"、".join(reverse.MUTATION_AXES[a] for a in variant_state["mutation_axes"] if a in reverse.MUTATION_AXES)}）。'
                         f'请核对后再合成提示词。'),
             'job_id': variant_id,
             'beats': variant_beats,
             'validation': variant_state['validation'],
         })
     return variant_state
+
+
+def ai_diverge_ideas(config, baseline_job_id, brief=None, count=4, on_progress=None, trend_ref_ids=None):
+    """调用大模型基于黄金母本工序与骨架并结合联网参考，智能发散 4 组完全正交的二创方案。"""
+    from prompt_pipeline import mutate
+
+    baseline_job_id = validate_job_id(baseline_job_id)
+    state = _load_state(baseline_job_id)
+    if not state:
+        raise ValueError(f'找不到母本复刻任务 {baseline_job_id}')
+
+    source_beats = state.get('beats')
+    if not source_beats or not (source_beats.get('beats') if isinstance(source_beats, dict) else []):
+        raise ValueError('母本尚未生成节拍阶梯，无法进行 AI 创意发散')
+
+    baseline_doc = dict(source_beats) if isinstance(source_beats, dict) else {'beats': source_beats}
+    baseline_doc['video_name'] = state.get('video_name') or ''
+    baseline_doc['overview'] = state.get('overview') or {}
+    baseline_doc['video_duration_sec'] = state.get('overview', {}).get('duration_sec') or 0.0
+
+    ideas = mutate.ai_diverge_orthogonal_ideas(
+        config=config,
+        baseline_doc=baseline_doc,
+        brief=brief,
+        count=count,
+        on_progress=on_progress,
+        trend_ref_ids=trend_ref_ids,
+    )
+
+    # 缓存到 state 中，页面刷新时持久化展示
+    state['ai_diverged_ideas'] = ideas
+    _save_state(state)
+
+    return ideas
+
+
+def mutate_orthogonal(config, baseline_job_id, mutation_axes=None, preset=None, brief=None, on_progress=None):
+    """基于已有的 1:1 母本执行四轴正交替换，瞬间派生二创 Job。"""
+    from prompt_pipeline import reverse
+    from prompt_pipeline import mutate
+
+    baseline_job_id = validate_job_id(baseline_job_id)
+    state = _load_state(baseline_job_id)
+    if not state:
+        raise ValueError(f'找不到母本复刻任务 {baseline_job_id}')
+
+    source_beats = state.get('beats')
+    if not source_beats or not (source_beats.get('beats') if isinstance(source_beats, dict) else []):
+        raise ValueError('母本尚未生成节拍阶梯，无法正交派生变体')
+
+    variant_id = f'replica_{uuid.uuid4().hex[:12]}'
+    variant_dir = job_dir(variant_id)
+    os.makedirs(variant_dir, exist_ok=True)
+
+    src_dir = job_dir(baseline_job_id)
+    for name in ('video_overview.json',):
+        src = os.path.join(src_dir, name)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(variant_dir, name))
+
+    mutation_axes = mutation_axes or {}
+    trend_ref = mutation_axes.get('trend_ref') if isinstance(mutation_axes, dict) else None
+    trend_ref_ids = mutation_axes.get('trend_ref_ids') if isinstance(mutation_axes, dict) else None
+    parent_title = state.get('title') or (os.path.splitext(state.get('video_name') or '')[0]) or f"母本 {baseline_job_id[-6:]}"
+    preset_name = preset or (list(mutation_axes.keys())[0] if isinstance(mutation_axes, dict) and mutation_axes else '二创变体')
+    variant_title = f"{parent_title} · {preset_name}"
+    variant_state = {
+        'job_id': variant_id,
+        'stage': 'mutate_beats',
+        'job_type': 'variant',
+        'is_locked_baseline': False,
+        'parent_baseline_id': baseline_job_id,
+        'variant_of': baseline_job_id,
+        'lineage_variants': [],
+        'video_path': state.get('video_path'),
+        'video_name': state.get('video_name'),
+        'video_sha256': None,
+        'media': state.get('media'),
+        'overview': state.get('overview'),
+        'cost_estimate': None,
+        'sampling': state.get('sampling'),
+        'review_scope': state.get('review_scope'),
+        'degraded': state.get('degraded'),
+        'facts': state.get('facts'),
+        'beats': None,
+        'validation': [],
+        'title': variant_title,
+        'title_locked': False,
+        'archived': False,
+        'prompt_block': None,
+        'banned_hits': [],
+        'source_frames_dir': src_dir,
+        'mutation_axes': list(mutation_axes.keys()) if isinstance(mutation_axes, dict) else [],
+        'trend_ref': trend_ref,
+        'trend_ref_ids': trend_ref_ids,
+        'mutation_config': {
+            'enabled': True,
+            'selected_preset': preset,
+            'axes': mutation_axes,
+            'trend_ref': trend_ref,
+            'trend_ref_ids': trend_ref_ids,
+        },
+        'mutation_brief': brief or '',
+        'error': None,
+        'created_at': datetime.now().isoformat(),
+        'updated_at': datetime.now().isoformat(),
+    }
+    _save_state(variant_state)
+
+    # 维护母本的数字血统树 (Lineage)
+    baseline_lineage = state.get('lineage_variants') or []
+    if variant_id not in baseline_lineage:
+        state['lineage_variants'] = baseline_lineage + [variant_id]
+        _save_state(state)
+
+    try:
+        variant_beats = mutate.generate_orthogonal_variant(
+            source_beats,
+            mutation_axes=mutation_axes,
+            preset=preset,
+            brief=brief,
+            config=config,
+        )
+        variant_beats['pipeline_id'] = variant_id
+        # 翻译成中文对照
+        reverse.translate_beats(config, variant_beats, on_progress=on_progress)
+        _write_beats(variant_state, variant_beats)
+        variant_state['stage'] = 'review_beats'
+        _save_state(variant_state)
+    except Exception as e:
+        variant_state['stage'] = 'mutate_failed'
+        variant_state['error'] = str(e)
+        _save_state(variant_state)
+        raise
+
+    if on_progress:
+        on_progress('replica_stage', {
+            'stage': 'review_beats',
+            'message': (f'四轴正交变体已生成（{len(variant_beats.get("beats") or [])} 拍，'
+                        f'预置：{preset or "自定义"}）。骨架拓扑 100% 锁死。'),
+            'job_id': variant_id,
+            'beats': variant_beats,
+            'validation': variant_state.get('validation') or [],
+        })
+    return variant_state
+
+
+def get_lineage(baseline_id):
+    """查询某个母本派生出的所有二创变体树状关系。"""
+    baseline_id = validate_job_id(baseline_id)
+    base_state = _load_state(baseline_id)
+    if not base_state:
+        raise ValueError(f'找不到复刻任务 {baseline_id}')
+
+    all_jobs = list_replica_jobs()
+    variants = []
+    for job in all_jobs:
+        jid = job.get('job_id')
+        if jid == baseline_id:
+            continue
+        if job.get('variant_of') == baseline_id or job.get('parent_baseline_id') == baseline_id:
+            st = _load_state(jid)
+            if st:
+                variants.append({
+                    'job_id': jid,
+                    'title': job_display_name(jid, st),
+                    'stage': st.get('stage'),
+                    'job_type': st.get('job_type', 'variant'),
+                    'preset': (st.get('mutation_config') or {}).get('selected_preset'),
+                    'mutation_config': st.get('mutation_config'),
+                    'mutation_axes': st.get('mutation_axes'),
+                    'beat_count': len(((st.get('beats') or {}).get('beats')) or []),
+                    'created_at': st.get('created_at'),
+                    'updated_at': st.get('updated_at'),
+                })
+
+    return {
+        'baseline': {
+            'job_id': baseline_id,
+            'title': job_display_name(baseline_id, base_state),
+            'stage': base_state.get('stage'),
+            'stage_label': stage_label(base_state.get('stage')),
+            'job_type': base_state.get('job_type', 'baseline'),
+            'is_locked_baseline': bool(base_state.get('is_locked_baseline')),
+            'video_name': base_state.get('video_name'),
+            'collage_url': _outputs_url(base_state, (base_state.get('overview') or {}).get('collage')),
+            'beat_count': len(((base_state.get('beats') or {}).get('beats')) or []),
+            'lineage_variants': base_state.get('lineage_variants') or [v['job_id'] for v in variants],
+            'created_at': base_state.get('created_at'),
+            'updated_at': base_state.get('updated_at'),
+        },
+        'variants': variants,
+    }
 
 
 # ── compose + audit ──────────────────────────────────────────────────────────
@@ -736,26 +1399,36 @@ def run_compose(state, config, dimensions=None, on_progress=None):
         })
 
     try:
-        compose_state = compose_anchor_and_packet(config, dims, on_progress=on_progress)
-    except Exception as e:
-        raise _translate_compose_failure(e, beats) from e
-    state['title'] = compose_state.get('title')
-    # 锚点图对齐真实首帧。这是整条链路上唯一一次让写手看见原片像素的机会：
-    # compose_anchor_and_packet 的契约明说调用方可以在进 Phase 2 前替换 image_1_prompt，
-    # 所以这一步落在复刻这一层，不必动共享合成器。失败软退，绝不阻塞合成。
-    # 二创不做这一步：拿原片首帧去校正一份「换成废弃巴士」的锚点，等于把新载体又拧回
-    # 旧载体——和 scene_constants / banned_elements 不继承是同一条理由。
-    reference = (None if reverse.is_variant_doc(beats)
-                 else reverse.anchor_reference_frame(beats, _load_overview(state)))
-    if reference and compose_state.get('image_1_prompt'):
-        compose_state['image_1_prompt'] = reverse.ground_anchor_on_reference(
-            config, compose_state['image_1_prompt'], reference, on_progress=on_progress)
-    prompt_block = compose_remaining_beats(config, compose_state, on_progress=on_progress)
-    state['prompt_block'] = prompt_block
-    _write_compose_state(state, compose_state)
-    _save_state(state)
+        try:
+            compose_state = compose_anchor_and_packet(config, dims, on_progress=on_progress)
+        except Exception as e:
+            raise _translate_compose_failure(e, beats) from e
+        if not state.get('title_locked') or not state.get('title'):
+            state['title'] = compose_state.get('title')
+        # 锚点图对齐真实首帧。这是整条链路上唯一一次让写手看见原片像素的机会：
+        # compose_anchor_and_packet 的契约明说调用方可以在进 Phase 2 前替换 image_1_prompt，
+        # 所以这一步落在复刻这一层，不必动共享合成器。失败软退，绝不阻塞合成。
+        # 二创不做这一步：拿原片首帧去校正一份「换成废弃巴士」的锚点，等于把新载体又拧回
+        # 旧载体——和 scene_constants / banned_elements 不继承是同一条理由。
+        reference = (None if reverse.is_variant_doc(beats)
+                     else reverse.anchor_reference_frame(beats, _load_overview(state)))
+        if reference and compose_state.get('image_1_prompt'):
+            compose_state['image_1_prompt'] = reverse.ground_anchor_on_reference(
+                config, compose_state['image_1_prompt'], reference, on_progress=on_progress)
+        composed = compose_remaining_beats(config, compose_state, on_progress=on_progress)
+        # 合成器返回的是整份带标记文档，不是提示词正文——头尾的 TITLE/THEME/AUDIT
+        # 必须在落进 state 之前剥掉（见 _prompt_block_only）。激发那条线在
+        # server.py 里过的是同一道 parse_sections。
+        state['prompt_block'] = _ensure_prompt_block_summaries(_prompt_block_only(composed), beats)
+        _write_compose_state(state, compose_state)
+        _save_state(state)
 
-    return run_audit(state, on_progress=on_progress)
+        return run_audit(state, on_progress=on_progress)
+    except Exception as e:
+        state['stage'] = 'compose_failed'
+        state['error'] = str(e)
+        _save_state(state)
+        raise
 
 
 def _compose_state_path(job_id):
@@ -969,6 +1642,9 @@ def _library_item(state):
         'collage_url': _outputs_url(state, (state.get('overview') or {}).get('collage')),
         'banned_hits': state.get('banned_hits') or [],
         'beat_count': len(((state.get('beats') or {}).get('beats')) or []),
+        'video_volume': 0.6,
+        'bgm_volume': 0.0,
+        'mute_original': False,
     }
 
 
@@ -1159,6 +1835,8 @@ def advance_replica_job(config, job_id, action='approve', payload=None,
     recluster→ 重跑 Pass B（Pass A 的帧事实走缓存，不重付视觉钱）
     translate→ 重做中文对照（纯文本调用，不碰英文原文，也不动 stage）
     """
+    if action not in VALID_ACTIONS:
+        raise ValueError(f'不支持的 action: {action}，合法值为: {sorted(VALID_ACTIONS)}')
     payload = payload or {}
     state = _load_state(job_id)
     if not state:
@@ -1188,11 +1866,38 @@ def advance_replica_job(config, job_id, action='approve', payload=None,
                                 if translated else '中文对照没有更新（模型没给出可用译文）。'),
                 })
             return state
+        if action in ('autofix', 'fix_beats'):
+            state, fixed_count = autofix_job_beats(config, job_id, on_progress=on_progress)
+            return state
+        if action == 'autobalance':
+            state, changed_count = autobalance_job_beats(config, job_id, on_progress=on_progress)
+            return state
         raise ValueError(f'不支持的 action: {action}')
     except Exception as e:
         state['error'] = str(e)
         _save_state(state)
         raise
+
+
+def find_root_baseline_id(job_id):
+    """溯源查找包含真实抽帧与素材文件的根基准母本任务 ID。"""
+    if not job_id:
+        return None
+    visited = set()
+    cur = job_id
+    while cur and cur not in visited:
+        visited.add(cur)
+        directory = job_dir(cur)
+        if os.path.isdir(os.path.join(directory, 'review_frames')) or os.path.isdir(os.path.join(directory, 'storyboard')):
+            return cur
+        st = _load_state(cur)
+        if not st:
+            break
+        parent = st.get('parent_baseline_id') or st.get('variant_of')
+        if not parent or parent == cur:
+            return cur
+        cur = parent
+    return cur or job_id
 
 
 def frame_urls(state):
@@ -1203,15 +1908,17 @@ def frame_urls(state):
     目录名就是一片碎图，而且碎在"看证据帧核对节拍"这个最需要看图的地方。
     这里按磁盘上的实际位置解析，前端只管取。
     """
-    base_job = state.get('variant_of') or state.get('job_id')
+    raw_base = state.get('variant_of') or state.get('parent_baseline_id') or state.get('job_id')
+    base_job = find_root_baseline_id(raw_base) or raw_base
     directory = job_dir(base_job)
     urls = {}
-    for sub in ('review_frames', 'storyboard'):
-        folder = os.path.join(directory, sub)
-        if not os.path.isdir(folder):
-            continue
-        for name in os.listdir(folder):
-            urls.setdefault(name, f'/outputs/{_JOBS_DIRNAME}/{base_job}/{sub}/{name}')
+    if directory and os.path.isdir(directory):
+        for sub in ('review_frames', 'storyboard'):
+            folder = os.path.join(directory, sub)
+            if not os.path.isdir(folder):
+                continue
+            for name in os.listdir(folder):
+                urls.setdefault(name, f'/outputs/{_JOBS_DIRNAME}/{base_job}/{sub}/{name}')
     return urls
 
 
@@ -1234,6 +1941,26 @@ def get_replica_status(job_id):
     state['frame_urls'] = frame_urls(state)
     state['stage_label'] = stage_label(state.get('stage'))
     state['phase'] = phase_of(state.get('stage'))
+
+    # 动态纠正与补全 lineage_variants：过滤已删除的孤儿 ID，并汇总该家族下的所有有效变体
+    baseline_id = state.get('parent_baseline_id') or state.get('variant_of') or state.get('job_id')
+    raw_variants = state.get('lineage_variants') or []
+    valid_variants = []
+    for vid in raw_variants:
+        if vid and vid != baseline_id and os.path.isdir(job_dir(vid)) and os.path.exists(os.path.join(job_dir(vid), _STATE_FILENAME)):
+            if vid not in valid_variants:
+                valid_variants.append(vid)
+
+    for row in list_replica_jobs():
+        cid = row.get('job_id')
+        if not cid or cid == baseline_id:
+            continue
+        c_parent = row.get('parent_baseline_id') or row.get('variant_of')
+        if c_parent == baseline_id:
+            if cid not in valid_variants and os.path.isdir(job_dir(cid)):
+                valid_variants.append(cid)
+
+    state['lineage_variants'] = valid_variants
     return state
 
 
@@ -1245,13 +1972,191 @@ def cancel_replica_job(job_id):
     return _save_state(state)
 
 
-def delete_replica_job(job_id):
+def delete_replica_job(job_id, force=False):
+    job_id = validate_job_id(job_id)
     directory = job_dir(job_id)
     # 只允许删 jobs_root 之下的目录：job_id 来自请求体，不能让 ../ 走出去。
     if os.path.commonpath([os.path.abspath(directory), os.path.abspath(jobs_root())]) \
             != os.path.abspath(jobs_root()):
         raise ValueError('非法的 job_id')
+
+    if not force:
+        # 检查是否有变体任务依赖此任务
+        dependents = []
+        for item in list_replica_jobs():
+            if item.get('variant_of') == job_id:
+                dependents.append(item.get('job_id'))
+        if dependents:
+            raise ValueError(
+                f'无法删除该任务：已有 {len(dependents)} 个二创变体（如 {dependents[0]}）'
+                f'依赖于其视频素材。请先删除变体任务或使用强制删除。')
+
+    # 级联更新父任务的 lineage_variants，移除当前被删除的 job_id
+    try:
+        deleted_state = _load_state(job_id)
+        if deleted_state:
+            parent_id = deleted_state.get('parent_baseline_id') or deleted_state.get('variant_of')
+            if parent_id and parent_id != job_id:
+                p_state = _load_state(parent_id)
+                if p_state:
+                    p_lineage = [v for v in (p_state.get('lineage_variants') or []) if v != job_id]
+                    p_state['lineage_variants'] = p_lineage
+                    _save_state(p_state)
+    except Exception:
+        pass
+
     if os.path.isdir(directory):
         shutil.rmtree(directory, ignore_errors=True)
+        # 级联清理对应的 task 记录与磁盘文件
+        try:
+            with server_common.ACTIVE_TASKS_LOCK:
+                replica_tids = [
+                    tid for tid, t in server_common.ACTIVE_TASKS.items()
+                    if server_common._replica_job_of((t or {}).get('dimensions') or {}) == job_id
+                    or str((t or {}).get('id') or '').endswith(f"_{job_id}")
+                ]
+                for tid in replica_tids:
+                    server_common.ACTIVE_TASKS[tid]["cancel_event"].set()
+                    server_common.ACTIVE_TASKS.pop(tid, None)
+            for tid in replica_tids:
+                server_common.delete_task_files(tid)
+
+            tasks_root = getattr(server_common, 'TASKS_DIR', 'tasks')
+            if os.path.isdir(tasks_root):
+                for fname in os.listdir(tasks_root):
+                    if not fname.endswith('.json'):
+                        continue
+                    ftid = fname[:-5]
+                    fpath = os.path.join(tasks_root, fname)
+                    try:
+                        with open(fpath, 'r', encoding='utf-8') as fp:
+                            mdata = json.load(fp)
+                        mdims = mdata.get('dimensions') if isinstance(mdata.get('dimensions'), dict) else {}
+                        if server_common._replica_job_of(mdims) == job_id:
+                            server_common.delete_task_files(ftid, tasks_dir=tasks_root)
+                    except Exception:
+                        pass
+        except Exception as e:
+            if sys.stdout:
+                print(f"[REPLICA] 级联删除任务文件异常: {e}")
         return True
     return False
+
+
+def rename_replica_job(job_id, title):
+    """人工修改复刻/二创任务标题，并锁定 title_locked，防止 compose 覆盖。"""
+    job_id = validate_job_id(job_id)
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+    clean_title = str(title or '').strip()
+    if not clean_title:
+        raise ValueError('任务名称不能为空')
+    state['title'] = clean_title
+    state['title_locked'] = True
+    state['updated_at'] = datetime.now().isoformat()
+    _save_state(state)
+    _write_summary(state)
+    return state
+
+
+def archive_replica_job(job_id):
+    """瘦身归档复刻/二创任务：清理占用空间的重资产（高清帧、原始视频、大拼图），保留节拍骨架与提示词包。"""
+    job_id = validate_job_id(job_id)
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+
+    directory = job_dir(job_id)
+    # 1. 确保缩略图存在
+    overview = state.get('overview') or {}
+    collage_path = overview.get('keyframe_collage')
+    if collage_path and not os.path.isabs(collage_path):
+        collage_path = os.path.join(directory, collage_path)
+    if collage_path and os.path.exists(collage_path):
+        try:
+            _generate_collage_thumb(collage_path)
+        except Exception:
+            pass
+
+    # 2. 清理占用空间的大文件与子目录
+    # 删除 review_frames/
+    rf_dir = os.path.join(directory, 'review_frames')
+    if os.path.isdir(rf_dir):
+        shutil.rmtree(rf_dir, ignore_errors=True)
+
+    # 删除 .pass_b_sheets/ 和 storyboard/
+    for sub in ('.pass_b_sheets', 'storyboard'):
+        sdir = os.path.join(directory, sub)
+        if os.path.isdir(sdir):
+            shutil.rmtree(sdir, ignore_errors=True)
+
+    # 删除原始 mp4 和 高清拼图原图（保留 _thumb.jpg 与 json）
+    if os.path.isdir(directory):
+        for name in os.listdir(directory):
+            fpath = os.path.join(directory, name)
+            if not os.path.isfile(fpath):
+                continue
+            # 删源视频
+            if name.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm')):
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
+            # 删大尺寸拼图（保留 _thumb.jpg）
+            elif name.endswith('_collage.jpg') or (name.endswith('.jpg') and not name.endswith('_thumb.jpg') and 'collage' in name):
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
+            # 删临时与日志文件
+            elif name.endswith('.tmp') or name.startswith('.bad_reply_') or name.startswith('.tmp_concat_'):
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
+
+    state['stage'] = 'archived'
+    state['archived'] = True
+    state['archived_at'] = datetime.now().isoformat()
+    state['updated_at'] = datetime.now().isoformat()
+    _save_state(state)
+    _write_summary(state)
+    return state
+
+
+def gc_replica_job(job_id):
+    """清理单个任务目录下的临时文件、重试报错日志及中间拼图。"""
+    job_id = validate_job_id(job_id)
+    directory = job_dir(job_id)
+    if not os.path.isdir(directory):
+        return {'job_id': job_id, 'cleaned': []}
+    cleaned = []
+    for name in os.listdir(directory):
+        if (name.endswith('.tmp') or name.startswith('.bad_reply_')
+                or name.startswith('.tmp_concat_')):
+            try:
+                os.remove(os.path.join(directory, name))
+                cleaned.append(name)
+            except OSError:
+                pass
+    pass_b = os.path.join(directory, '.pass_b_sheets')
+    if os.path.isdir(pass_b):
+        shutil.rmtree(pass_b, ignore_errors=True)
+        cleaned.append('.pass_b_sheets/')
+    return {'job_id': job_id, 'cleaned': cleaned}
+
+
+def gc_all_replica_jobs():
+    """全局垃圾回收。"""
+    root = jobs_root()
+    if not os.path.isdir(root):
+        return []
+    results = []
+    for name in os.listdir(root):
+        if os.path.isdir(os.path.join(root, name)):
+            try:
+                results.append(gc_replica_job(name))
+            except Exception:
+                pass
+    return results

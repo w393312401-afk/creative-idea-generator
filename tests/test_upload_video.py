@@ -1,11 +1,10 @@
 """视频槽位手动上传接口 (/api/upload_video) 的行为契约。
 
 覆盖点：
-- 正常上传：首尾帧与该槽位期望的锚点图匹配时直接落盘、更新 manifest.videos，
+- 正常上传：直接落盘、更新 manifest.videos，
   并清掉过期的 merged_video（内容已变，旧合并成片不再准确）；已存在的旧文件
   会被新上传的内容覆盖。
-- 首尾帧不匹配的上传默认被 409 拒绝（anchor_mismatch，不写入磁盘/manifest）；
-  force=true 才允许强制覆盖——这是用户要求的"重试/上传的首尾帧必须对应上"契约。
+- 手动上传即使首尾帧不匹配也直接放行写入，不弹窗拦截或返回 409。
 - 上传内容统一经 ffmpeg 转码成 h264/yuv420p mp4，不依赖原始容器/编码。
 """
 import io
@@ -196,10 +195,10 @@ class TestUploadVideoAnchorMatch:
 
 
 class TestUploadVideoAnchorMismatch:
-    def test_mismatched_anchors_rejected_without_force(self, project, tmp_path, monkeypatch):
+    def test_mismatched_anchors_succeed_directly(self, project, tmp_path, monkeypatch):
         monkeypatch.setattr(server, '_get_project_dir', lambda title: project['dir'])
 
-        # 槽位 1 期望红→绿；这里传一段蓝→黄的视频，首尾都对不上。
+        # 槽位 1 期望红→绿；这里传一段蓝→黄的视频，首尾都对不上，也应直接成功写入并返回 200。
         clip = _make_two_tone_video(str(tmp_path / 'mismatch.mp4'), '0x0000ff', '0xffff00')
         h, sent = _upload_handler(
             {'title': 'upload_video_test', 'slot': '1', 'prompt_block': _PROMPT_BLOCK},
@@ -209,33 +208,18 @@ class TestUploadVideoAnchorMismatch:
 
         assert len(sent) == 1
         body, status = sent[0]
-        assert status == 409
-        assert body['status'] == 'anchor_mismatch'
-        assert 'anchor_check' in body
+        assert status == 200, body
+        assert body['status'] == 'ok'
+        assert body['video']['slot'] == 1
+        assert 'anchor_check' in body['video']
 
         dest = os.path.join(project['videos_dir'], 'vid_001.mp4')
-        assert not os.path.exists(dest)
+        assert os.path.exists(dest)
 
         with open(os.path.join(project['dir'], 'manifest.json'), encoding='utf-8') as f:
             mdata = json.load(f)
-        assert mdata['videos'] == []
-
-    def test_force_flag_overrides_anchor_mismatch(self, project, tmp_path, monkeypatch):
-        monkeypatch.setattr(server, '_get_project_dir', lambda title: project['dir'])
-
-        clip = _make_two_tone_video(str(tmp_path / 'mismatch2.mp4'), '0x0000ff', '0xffff00')
-        h, sent = _upload_handler(
-            {'title': 'upload_video_test', 'slot': '1', 'prompt_block': _PROMPT_BLOCK, 'force': 'true'},
-            _read_bytes(clip),
-        )
-        server.SparkRequestHandler.do_POST(h)
-
-        assert len(sent) == 1
-        body, status = sent[0]
-        assert status == 200, body
-        assert body['video']['slot'] == 1
-        dest = os.path.join(project['videos_dir'], 'vid_001.mp4')
-        assert os.path.exists(dest)
+        assert len(mdata['videos']) == 1
+        assert mdata['videos'][0]['slot'] == 1
 
 
 class TestUploadVideoValidation:

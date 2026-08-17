@@ -40,6 +40,815 @@
 .prompt-pre::-webkit-scrollbar { width: 8px; height: 8px; }
 .prompt-pre::-webkit-scrollbar-thumb { background: var(--neon-cyan-glow); border-radius: 4px; }
 
+/* =====================================================================
+   Prompt Display Container & Item Cards (逐条提示词一键复制)
+   ===================================================================== */
+.prompt-display-container {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    margin: 0;
+    padding: 16px;
+    background: rgba(176, 123, 82, 0.04);
+    border: 1px solid rgba(var(--ink-rgb), 0.08);
+    border-radius: 10px;
+}
+
+.prompt-display-container.prompt-empty {
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--text-muted);
+}
+
+.prompt-section {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.prompt-section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 12px;
+    background: rgba(var(--ink-rgb), 0.04);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    cursor: pointer;
+    user-select: none;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.prompt-section-header:hover {
+    background: rgba(var(--ink-rgb), 0.08);
+    border-color: rgba(var(--ink-rgb), 0.18);
+}
+
+.prompt-section-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.prompt-section-fold-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    color: var(--text-muted);
+    transition: color 0.15s ease;
+}
+
+.prompt-section-header:hover .prompt-section-fold-icon {
+    color: var(--text-primary);
+}
+
+.prompt-fold-chevron {
+    transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.prompt-section.is-collapsed .prompt-fold-chevron {
+    transform: rotate(-90deg);
+}
+
+.prompt-section-icon {
+    font-size: 14px;
+}
+
+.prompt-section-count {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    background: rgba(var(--ink-rgb), 0.06);
+    padding: 2px 7px;
+    border-radius: 10px;
+    letter-spacing: 0.2px;
+}
+
+.prompt-section-fold-badge {
+    font-size: 10.5px;
+    font-weight: 600;
+    color: #f59e0b;
+    background: rgba(245, 158, 11, 0.12);
+    border: 1px solid rgba(245, 158, 11, 0.25);
+    padding: 1px 6px;
+    border-radius: 4px;
+}
+
+.prompt-section-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.prompt-section-fold-items-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px !important;
+    padding: 4px 8px !important;
+    border-radius: 6px !important;
+    color: var(--text-secondary);
+    background: rgba(var(--ink-rgb), 0.04);
+    border: 1px solid var(--border-color);
+    transition: var(--transition-fast);
+    cursor: pointer;
+}
+.prompt-section-fold-items-btn:hover {
+    color: var(--text-primary);
+    background: rgba(var(--ink-rgb), 0.09);
+    border-color: rgba(var(--ink-rgb), 0.22);
+}
+
+.prompt-section-copy-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11.5px !important;
+    padding: 4px 10px !important;
+    border-radius: 6px !important;
+    color: var(--text-secondary);
+    background: rgba(var(--ink-rgb), 0.05);
+    border: 1px solid var(--border-color);
+    transition: var(--transition-fast);
+    cursor: pointer;
+}
+.prompt-section-copy-btn:hover {
+    color: var(--neon-cyan);
+    border-color: var(--neon-cyan-glow);
+    background: rgba(0, 210, 255, 0.08);
+}
+.prompt-section-copy-btn.copied {
+    color: #10b981 !important;
+    border-color: rgba(16, 185, 129, 0.4) !important;
+    background: rgba(16, 185, 129, 0.12) !important;
+}
+
+.prompt-section-notes {
+    padding: 8px 12px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+    background: rgba(var(--ink-rgb), 0.03);
+    border-radius: 6px;
+    white-space: pre-wrap;
+}
+
+.prompt-section.is-collapsed .prompt-items-list,
+.prompt-section.is-collapsed .prompt-section-notes {
+    display: none !important;
+}
+
+.prompt-items-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.prompt-item-card {
+    background: var(--card-bg, rgba(20, 24, 33, 0.7));
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px 14px;
+    transition: var(--transition-fast);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.prompt-item-card:hover {
+    border-color: rgba(var(--ink-rgb), 0.22);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+}
+
+.prompt-item-card.is-collapsed {
+    padding: 8px 12px;
+    gap: 4px;
+    background: rgba(var(--ink-rgb), 0.03);
+}
+
+.prompt-item-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
+    padding: 2px 0;
+}
+
+.prompt-item-fold-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    color: var(--text-muted);
+    transition: color 0.15s ease;
+}
+
+.prompt-item-header:hover .prompt-item-fold-icon {
+    color: var(--text-primary);
+}
+
+.fold-chevron-mini {
+    transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.prompt-item-card.is-collapsed .fold-chevron-mini {
+    transform: rotate(-90deg);
+}
+
+.prompt-item-preview {
+    display: none;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding: 2px 4px;
+    cursor: pointer;
+    transition: color 0.15s ease;
+}
+
+.prompt-item-preview:hover {
+    color: var(--text-secondary);
+}
+
+.prompt-item-card.is-collapsed .prompt-item-preview {
+    display: block;
+}
+
+.prompt-item-card.is-collapsed .prompt-item-body {
+    display: none !important;
+}
+
+.prompt-item-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.prompt-item-badge {
+    font-size: 12px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    letter-spacing: 0.2px;
+}
+
+.prompt-item-badge.badge-image {
+    background: rgba(0, 200, 255, 0.12);
+    color: var(--neon-cyan, #00d2ff);
+    border: 1px solid rgba(0, 200, 255, 0.25);
+}
+
+.prompt-item-badge.badge-video {
+    background: rgba(255, 170, 0, 0.12);
+    color: #ffaa00;
+    border: 1px solid rgba(255, 170, 0, 0.25);
+}
+
+.prompt-item-summary {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-primary, rgba(255, 255, 255, 0.88));
+    letter-spacing: 0.2px;
+    opacity: 0.92;
+}
+
+.prompt-item-tag {
+    font-size: 10.5px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+    text-transform: uppercase;
+}
+
+.prompt-item-tag.tag-cut {
+    background: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.prompt-item-tag.tag-hero {
+    background: rgba(168, 85, 247, 0.15);
+    color: #c084fc;
+    border: 1px solid rgba(168, 85, 247, 0.3);
+}
+
+.prompt-item-tag.tag-meta {
+    background: rgba(var(--ink-rgb), 0.08);
+    color: var(--text-secondary);
+    border: 1px solid rgba(var(--ink-rgb), 0.12);
+}
+
+.prompt-item-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.prompt-item-actions .action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px !important;
+    font-size: 11px !important;
+    border-radius: 5px !important;
+    color: var(--text-secondary);
+    background: rgba(var(--ink-rgb), 0.05);
+    border: 1px solid var(--border-color);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    user-select: none;
+}
+
+.prompt-item-actions .action-btn:hover {
+    color: var(--text-main, #ffffff);
+    background: rgba(0, 210, 255, 0.12);
+    border-color: var(--neon-cyan);
+    transform: translateY(-1px);
+}
+
+.prompt-item-actions .action-btn:active {
+    transform: translateY(0);
+}
+
+.prompt-item-jump-btn:hover {
+    color: #38bdf8 !important;
+    border-color: #38bdf8 !important;
+    background: rgba(56, 189, 248, 0.12) !important;
+}
+
+.prompt-item-edit-btn:hover {
+    color: #f59e0b !important;
+    border-color: #f59e0b !important;
+    background: rgba(245, 158, 11, 0.12) !important;
+}
+
+.prompt-item-copy-btn.copied {
+    color: #10b981 !important;
+    background: rgba(16, 185, 129, 0.15) !important;
+    border-color: rgba(16, 185, 129, 0.4) !important;
+}
+
+.prompt-item-body {
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    word-break: break-word;
+    user-select: text;
+    background: rgba(0, 0, 0, 0.12);
+    padding: 10px 12px;
+    border-radius: 6px;
+    border: 1px solid rgba(var(--ink-rgb), 0.06);
+}
+
+/* 提示词单条就地编辑（In-place Inline Edit） */
+.prompt-item-card.is-inline-editing {
+    border-color: rgba(245, 158, 11, 0.6) !important;
+    box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.3), 0 4px 16px rgba(0, 0, 0, 0.2);
+}
+
+.prompt-inline-edit-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+}
+
+.prompt-inline-textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--text-primary);
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--neon-amber, #f59e0b);
+    border-radius: 6px;
+    padding: 10px 12px;
+    resize: vertical;
+    outline: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.prompt-inline-textarea:focus {
+    box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.2);
+}
+
+.prompt-inline-actions {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.prompt-inline-hint {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.prompt-inline-buttons {
+    display: inline-flex;
+    gap: 6px;
+}
+
+/* 提示词与槽位卡片双向定位光晕脉冲动效 */
+@keyframes slotPulseGlow {
+    0% {
+        box-shadow: 0 0 0 0 rgba(6, 182, 212, 0.9), 0 0 0 0 rgba(6, 182, 212, 0.5);
+        transform: scale(1.02);
+    }
+    40% {
+        box-shadow: 0 0 0 4px rgba(6, 182, 212, 0.8), 0 0 24px rgba(6, 182, 212, 0.6);
+        transform: scale(1.02);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(6, 182, 212, 0), 0 0 0 0 rgba(6, 182, 212, 0);
+        transform: scale(1);
+    }
+}
+
+@keyframes promptPulseGlow {
+    0% {
+        box-shadow: 0 0 0 0 rgba(234, 179, 8, 0.9), 0 0 0 0 rgba(234, 179, 8, 0.5);
+        transform: scale(1.01);
+    }
+    40% {
+        box-shadow: 0 0 0 4px rgba(234, 179, 8, 0.8), 0 0 20px rgba(234, 179, 8, 0.5);
+        transform: scale(1.01);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(234, 179, 8, 0), 0 0 0 0 rgba(234, 179, 8, 0);
+        transform: scale(1);
+    }
+}
+
+.highlight-slot-pulse {
+    animation: slotPulseGlow 2.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    z-index: 10;
+}
+
+.highlight-prompt-pulse {
+    animation: promptPulseGlow 2.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    z-index: 10;
+}
+
+/* 提示词历史版本与 Visual Diff 模态框 */
+.prompt-history-modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    z-index: 9999;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+
+.prompt-history-modal-overlay.active {
+    display: flex;
+}
+
+.prompt-history-modal-container {
+    background: var(--bg-card, #18191e);
+    border: 1px solid var(--border-color, #2d3139);
+    border-radius: 12px;
+    width: 100%;
+    max-width: 1100px;
+    height: 82vh;
+    max-height: 850px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+    overflow: hidden;
+}
+
+.prompt-history-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border-color, #2d3139);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.prompt-history-title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.prompt-history-icon {
+    font-size: 18px;
+}
+
+.prompt-history-title {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary, #ffffff);
+}
+
+.prompt-history-count {
+    font-size: 11.5px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    background: rgba(var(--ink-rgb), 0.08);
+    color: var(--text-secondary);
+}
+
+.prompt-history-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.prompt-history-view-toggle {
+    display: inline-flex;
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 6px;
+    padding: 2px;
+    border: 1px solid var(--border-color);
+}
+
+.view-toggle-btn {
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    padding: 4px 10px;
+    font-size: 11.5px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.view-toggle-btn.active {
+    background: var(--neon-cyan, #00d2ff);
+    color: #000000;
+    font-weight: 600;
+}
+
+.prompt-history-modal-body {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.prompt-history-sidebar {
+    width: 280px;
+    border-right: 1px solid var(--border-color, #2d3139);
+    overflow-y: auto;
+    background: rgba(0, 0, 0, 0.15);
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.prompt-history-item {
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.prompt-history-item:hover {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.12);
+}
+
+.prompt-history-item.active {
+    background: rgba(0, 210, 255, 0.1);
+    border-color: var(--neon-cyan, #00d2ff);
+}
+
+.prompt-history-item-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    margin-bottom: 4px;
+}
+
+.prompt-history-item-summary {
+    font-size: 12.5px;
+    font-weight: 500;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.prompt-history-current-tag {
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: rgba(16, 185, 129, 0.2);
+    color: #10b981;
+    font-weight: 600;
+    flex-shrink: 0;
+}
+
+.prompt-history-item-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.prompt-history-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    background: var(--bg-primary, #121316);
+}
+
+.prompt-history-view-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    margin-bottom: 12px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.banner-stats {
+    display: inline-flex;
+    gap: 8px;
+}
+
+.diff-stat-add {
+    color: #10b981;
+    font-weight: 600;
+}
+
+.diff-stat-del {
+    color: #ef4444;
+    font-weight: 600;
+}
+
+.diff-stat-same, .badge-same {
+    color: #10b981;
+    font-weight: 500;
+}
+
+.prompt-history-raw-code {
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+    font-size: 12px;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text-primary);
+    background: rgba(0, 0, 0, 0.25);
+    padding: 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+    margin: 0;
+}
+
+.prompt-diff-code-wrapper {
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    overflow-x: auto;
+}
+
+.prompt-diff-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.diff-row td {
+    padding: 2px 6px;
+    vertical-align: top;
+}
+
+.diff-num {
+    width: 38px;
+    text-align: right;
+    color: var(--text-muted);
+    user-select: none;
+    font-size: 10.5px;
+    border-right: 1px solid rgba(255, 255, 255, 0.05);
+    background: rgba(0, 0, 0, 0.15);
+}
+
+.diff-sign {
+    width: 16px;
+    text-align: center;
+    user-select: none;
+    font-weight: 600;
+}
+
+.diff-text {
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text-primary);
+}
+
+.diff-line-add {
+    background: rgba(16, 185, 129, 0.15);
+}
+.diff-line-add .diff-sign, .diff-line-add .diff-text {
+    color: #34d399;
+}
+
+.diff-line-del {
+    background: rgba(239, 68, 68, 0.15);
+}
+.diff-line-del .diff-sign, .diff-line-del .diff-text {
+    color: #f87171;
+}
+
+.diff-line-ctx {
+    color: var(--text-primary);
+}
+
+.prompt-history-modal-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    border-top: 1px solid var(--border-color, #2d3139);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.prompt-history-footer-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+
+.diff-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.legend-box {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+}
+
+.legend-added {
+    background: rgba(16, 185, 129, 0.4);
+    border: 1px solid #10b981;
+}
+
+.legend-deleted {
+    background: rgba(239, 68, 68, 0.4);
+    border: 1px solid #ef4444;
+}
+
+.prompt-history-footer-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.prompt-history-empty {
+    text-align: center;
+    color: var(--text-muted);
+    padding: 40px 20px;
+    font-size: 13px;
+}
+
 /* 手动编辑提示词集（见 js/prompt_editor.js）：编辑器与只读块必须是同一副排版，
    否则一进编辑态整块文字会重排，用户会以为内容被改动过。 */
 .prompt-editor {
@@ -67,7 +876,8 @@
 .prompt-header-actions {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
+    flex-wrap: wrap;
 }
 /* .text-btn/.icon-btn 都带 display:flex，会盖掉 [hidden] 的 UA display:none；
    textarea 同理（本文件给它设了 display:block）。这几处的显隐全靠 hidden 属性。 */
@@ -75,11 +885,113 @@
 .prompt-editor[hidden] {
     display: none !important;
 }
-.prompt-edit-btn {
-    padding: 5px 10px !important;
+
+.prompt-edit-btn,
+.prompt-fold-btn {
+    padding: 4px 11px !important;
     border-radius: 6px !important;
     font-size: 11.5px !important;
+    font-weight: 500;
     white-space: nowrap;
+    transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1) !important;
+    user-select: none;
+}
+
+.prompt-edit-btn:active,
+.prompt-fold-btn:active {
+    transform: translateY(0) scale(0.97) !important;
+}
+
+#toggle-fold-all-prompts-btn {
+    background: rgba(var(--ink-rgb), 0.05);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+#toggle-fold-all-prompts-btn:hover {
+    background: rgba(var(--ink-rgb), 0.11);
+    border-color: rgba(var(--ink-rgb), 0.25);
+    color: var(--text-primary);
+    transform: translateY(-1px);
+}
+
+#edit-prompt-btn {
+    background: rgba(var(--ink-rgb), 0.06);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+}
+#edit-prompt-btn:hover {
+    background: rgba(0, 245, 212, 0.12);
+    border-color: var(--neon-cyan);
+    color: #ffffff;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 10px rgba(0, 245, 212, 0.25);
+}
+
+#auto-fix-prompt-btn {
+    background: rgba(168, 85, 247, 0.14) !important;
+    border: 1px solid rgba(168, 85, 247, 0.5) !important;
+    color: #c084fc !important;
+    font-weight: 600 !important;
+    box-shadow: 0 0 10px rgba(168, 85, 247, 0.18);
+}
+#auto-fix-prompt-btn:hover {
+    background: rgba(168, 85, 247, 0.28) !important;
+    border-color: #a855f7 !important;
+    color: #ffffff !important;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 14px rgba(168, 85, 247, 0.35);
+}
+
+#prompt-history-btn {
+    background: rgba(var(--ink-rgb), 0.05);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+}
+#prompt-history-btn:hover {
+    background: rgba(var(--ink-rgb), 0.10);
+    color: var(--text-primary);
+    transform: translateY(-1px);
+}
+
+#add-beat-btn {
+    background: rgba(59, 130, 246, 0.14) !important;
+    border: 1px solid rgba(59, 130, 246, 0.5) !important;
+    color: #93c5fd !important;
+    font-weight: 600 !important;
+}
+#add-beat-btn:hover {
+    background: rgba(59, 130, 246, 0.25) !important;
+    border-color: #3b82f6 !important;
+    color: #ffffff !important;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 12px rgba(59, 130, 246, 0.35);
+}
+
+#save-prompt-edit-btn {
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%) !important;
+    border: 1px solid #10b981 !important;
+    color: #ffffff !important;
+    font-weight: 700 !important;
+    box-shadow: 0 0 12px rgba(16, 185, 129, 0.35) !important;
+}
+#save-prompt-edit-btn:hover {
+    box-shadow: 0 2px 16px rgba(16, 185, 129, 0.55) !important;
+    transform: translateY(-1px);
+}
+
+#cancel-prompt-edit-btn {
+    background: rgba(239, 68, 68, 0.1) !important;
+    border: 1px solid rgba(239, 68, 68, 0.4) !important;
+    color: #f87171 !important;
+}
+#cancel-prompt-edit-btn:hover {
+    background: rgba(239, 68, 68, 0.2) !important;
+    border-color: #ef4444 !important;
+    color: #ffffff !important;
+    transform: translateY(-1px);
 }
 .prompt-edit-hint {
     margin: 10px 0 4px;
@@ -471,27 +1383,42 @@
 }
 
 /* ── 槽位工具条 ────────────────────────────────────────────────── */
+/* ── 槽位工具条 ────────────────────────────────────────────────── */
 .slot-toolbar {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
     gap: 8px;
-    margin-bottom: 10px;
+    margin-bottom: 12px;
+    padding: 6px 10px;
+    background: rgba(var(--ink-rgb), 0.03);
+    border: 1px solid rgba(var(--ink-rgb), 0.08);
+    border-radius: 8px;
     font-size: 12px;
     color: var(--text-secondary);
+    backdrop-filter: blur(8px);
 }
 
 .slot-count {
     font-weight: 700;
+    font-size: 11.5px;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
+    color: var(--neon-cyan, #00f5d4);
+    background: rgba(0, 245, 212, 0.08);
+    border: 1px solid rgba(0, 245, 212, 0.22);
+    padding: 3px 8px;
+    border-radius: 5px;
+    letter-spacing: 0.2px;
 }
 
 .slot-toolbar-group {
     display: inline-flex;
+    background: rgba(0, 0, 0, 0.18);
     border: 1px solid var(--border-color);
     border-radius: 6px;
     overflow: hidden;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.25);
 }
 
 .slot-size-group {
@@ -500,14 +1427,16 @@
 
 .slot-filter-btn,
 .slot-size-btn {
-    padding: 3px 10px;
+    padding: 3.5px 11px;
     font-size: 11.5px;
+    font-weight: 500;
     color: var(--text-secondary);
     background: transparent;
     border: none;
-    border-right: 1px solid var(--border-color);
+    border-right: 1px solid rgba(var(--ink-rgb), 0.08);
     cursor: pointer;
-    transition: var(--transition-fast);
+    transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    user-select: none;
 }
 
 .slot-toolbar-group > :last-child {
@@ -516,62 +1445,207 @@
 
 .slot-filter-btn:hover,
 .slot-size-btn:hover {
-    background: rgba(var(--ink-rgb), 0.06);
-    color: var(--text-main);
+    background: rgba(var(--ink-rgb), 0.08);
+    color: var(--text-primary);
+}
+
+.slot-filter-btn:active,
+.slot-size-btn:active {
+    transform: scale(0.96);
 }
 
 .slot-filter-btn.is-active,
 .slot-size-btn.is-active {
-    background: rgba(var(--ink-rgb), 0.10);
-    color: var(--text-main);
+    background: var(--neon-cyan, #00f5d4);
+    color: #040914 !important;
     font-weight: 700;
+    box-shadow: 0 0 10px rgba(0, 245, 212, 0.35);
 }
 
-.slot-jump-btn {
-    padding: 3px 10px;
+/* ⚡ 重渲已改动帧 */
+.slot-retry-dirty-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3.5px 11px;
     font-size: 11.5px;
+    font-weight: 600;
+    color: #fbbf24;
+    background: rgba(245, 158, 11, 0.14);
+    border: 1px solid rgba(245, 158, 11, 0.5);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: 0 0 10px rgba(245, 158, 11, 0.15);
+    user-select: none;
+}
+
+.slot-retry-dirty-btn:hover {
+    background: rgba(245, 158, 11, 0.26);
+    border-color: #f59e0b;
+    color: #ffffff;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 12px rgba(245, 158, 11, 0.35);
+}
+
+.slot-retry-dirty-btn:active {
+    transform: translateY(0) scale(0.98);
+}
+
+/* 🖼️ 多宫格检查器 */
+.slot-collage-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3.5px 11px;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #00f5d4;
+    background: rgba(0, 245, 212, 0.12);
+    border: 1px solid rgba(0, 245, 212, 0.45);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: 0 0 10px rgba(0, 245, 212, 0.15);
+    user-select: none;
+}
+
+.slot-collage-btn:hover {
+    background: rgba(0, 245, 212, 0.24);
+    border-color: #00f5d4;
+    color: #ffffff;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 14px rgba(0, 245, 212, 0.35);
+}
+
+.slot-collage-btn:active {
+    transform: translateY(0) scale(0.98);
+}
+
+/* ⚠ 跳到第一个问题 */
+.slot-jump-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3.5px 11px;
+    font-size: 11.5px;
+    font-weight: 600;
     color: #f59e0b;
     background: rgba(245, 158, 11, 0.10);
     border: 1px solid rgba(245, 158, 11, 0.45);
     border-radius: 6px;
     cursor: pointer;
+    transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    user-select: none;
 }
 
 .slot-jump-btn:hover {
-    background: rgba(245, 158, 11, 0.18);
+    background: rgba(245, 158, 11, 0.22);
+    border-color: #f59e0b;
+    color: #ffffff;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 10px rgba(245, 158, 11, 0.25);
 }
 
-/* 「全部修复」与卡片上那枚「修复此帧问题」是同一件事的批量版，沿用它的红调，
-   与旁边琥珀色的「跳到第一个问题」区分开：一个是导航，一个是会动画面的操作。 */
+.slot-jump-btn:active {
+    transform: translateY(0) scale(0.98);
+}
+
+/* 🛠 全部修复 */
 .slot-fix-all-btn {
-    padding: 3px 10px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3.5px 11px;
     font-size: 11.5px;
+    font-weight: 600;
     color: #f87171;
-    background: rgba(180, 40, 40, 0.12);
-    border: 1px solid rgba(180, 40, 40, 0.5);
+    background: rgba(239, 68, 68, 0.12);
+    border: 1px solid rgba(239, 68, 68, 0.45);
     border-radius: 6px;
     cursor: pointer;
+    transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: 0 0 10px rgba(239, 68, 68, 0.15);
+    user-select: none;
 }
 
 .slot-fix-all-btn:hover {
-    background: rgba(180, 40, 40, 0.22);
+    background: rgba(239, 68, 68, 0.24);
+    border-color: #ef4444;
+    color: #ffffff;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 12px rgba(239, 68, 68, 0.35);
+}
+
+.slot-fix-all-btn:active {
+    transform: translateY(0) scale(0.98);
+}
+
+/* ◧ 合并视图 */
+.slot-merge-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3.5px 11px;
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    user-select: none;
+}
+
+.slot-merge-btn:hover {
+    background: rgba(var(--ink-rgb), 0.08);
+    color: var(--text-primary);
+    border-color: rgba(var(--ink-rgb), 0.18);
+    transform: translateY(-1px);
+}
+
+.slot-merge-btn.is-active {
+    background: rgba(59, 130, 246, 0.18);
+    border-color: #3b82f6;
+    color: #93c5fd;
+    font-weight: 700;
+    box-shadow: 0 0 10px rgba(59, 130, 246, 0.25);
 }
 
 .slot-bulk {
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    background: rgba(0, 0, 0, 0.2);
+    padding: 2px 6px;
+    border-radius: 6px;
+    border: 1px solid rgba(var(--ink-rgb), 0.12);
+}
+
+.slot-bulk .action-btn {
+    padding: 3px 9px !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    border-radius: 5px !important;
 }
 
 .slot-bulk-clear {
-    padding: 2px 8px;
+    padding: 2px 7px;
     font-size: 13px;
     line-height: 1;
     color: var(--text-secondary);
     background: transparent;
     border: 1px solid var(--border-color);
-    border-radius: 6px;
+    border-radius: 5px;
     cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.slot-bulk-clear:hover {
+    color: #ef4444;
+    border-color: #ef4444;
+    background: rgba(239, 68, 68, 0.1);
 }
 
 .slot-filter-empty {
@@ -672,29 +1746,6 @@ body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-merge-btn {
     display: none;
 }
 
-.slot-merge-btn {
-    padding: 3px 10px;
-    font-size: 11.5px;
-    color: var(--text-secondary);
-    background: transparent;
-    border: 1px solid var(--border-color);
-    border-radius: 6px;
-    cursor: pointer;
-    transition: var(--transition-fast);
-}
-
-.slot-merge-btn:hover {
-    background: rgba(var(--ink-rgb), 0.06);
-    color: var(--text-main);
-}
-
-.slot-merge-btn.is-active {
-    background: rgba(var(--ink-rgb), 0.10);
-    border-color: var(--neon-cyan);
-    color: var(--text-main);
-    font-weight: 700;
-}
-
 @keyframes slotFlash {
     0%, 100% { box-shadow: none; }
     50% { box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.75); }
@@ -711,7 +1762,7 @@ body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-merge-btn {
     padding: 6px;
     color: var(--text-secondary);
     cursor: pointer;
-    transition: var(--transition-fast);
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
     position: relative;
 }
 
@@ -719,6 +1770,7 @@ body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-merge-btn {
     border-color: var(--neon-cyan);
     color: var(--text-primary);
     transform: translateY(-2px);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
 }
 
 /* 拖拽放置态（帧/视频网格）：拖文件进来上传、或把视频卡片拖到别的槽位换位时，
@@ -756,13 +1808,7 @@ body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-merge-btn {
 
 /* ── 槽位卡片：结构与操作区 ──────────────────────────────────────────
    卡片由 js/slot_card.js 的 renderSlotCard 独家渲染，那边只写 class 与
-   data-*，不写任何行内样式——所以这一节是槽位卡片外观的唯一出处。
-   （历史上 JS 把 background/border/padding/font-size/opacity 全写成行内，
-   这里的规则等于死代码，移动端只能整段 !important 压回来。） */
-/* 一行排不下就换行，别把每枚按钮挤成竖排文字。S 档一列只有 88px 宽，出图卡上
-   最多有五枚按钮（修复/描述/重试/上传/删除）——不限左边界、不许换行时，它们会
-   被压成一列一列的竖排汉字并溢出到隔壁格上，看着是按钮、实际点不准
-   （2026-07-28 实机截图）。移动端那份规则早就是这么写的，这里把桌面对齐。 */
+   data-*，不写任何行内样式——所以这一节是槽位卡片外观的唯一出处。 */
 .slot-actions {
     position: absolute;
     top: 5px;
@@ -792,40 +1838,78 @@ body.slot-merged-view .slot-toolbar[data-slot-type="video"] .slot-merge-btn {
 }
 
 .slot-action-btn {
-    background: rgba(0, 0, 0, 0.6);
-    border: 1px solid rgba(255, 255, 255, 0.3);
-    color: #fff;
-    padding: 2px 6px;
-    font-size: 10px;
-    border-radius: 3px;
+    background: rgba(15, 23, 42, 0.88);
+    backdrop-filter: blur(6px);
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    color: #f1f5f9;
+    padding: 3px 7.5px;
+    font-size: 10.5px;
+    font-weight: 600;
+    border-radius: 4px;
     cursor: pointer;
-    transition: all 0.2s;
-    /* 逐字折行的按钮既读不出来也点不准：宁可整枚换到下一行（见 .slot-actions） */
+    transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
     white-space: nowrap;
-}
-
-.slot-action-btn[data-variant="danger"] {
-    background: rgba(150, 30, 30, 0.75);
-}
-
-.slot-action-btn[data-act="fix-frame"] {
-    background: rgba(180, 40, 40, 0.75);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+    user-select: none;
+    line-height: 1.3;
 }
 
 .slot-action-btn:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.18);
-    border-color: #fff;
-    box-shadow: 0 0 8px rgba(0, 242, 254, 0.3);
+    background: rgba(30, 41, 59, 0.95);
+    border-color: var(--neon-cyan, #00f5d4);
+    color: #ffffff;
+    transform: translateY(-1px) scale(1.03);
+    box-shadow: 0 0 10px rgba(0, 245, 212, 0.35);
+}
+
+.slot-action-btn:active:not(:disabled) {
+    transform: translateY(0) scale(0.97);
+}
+
+.slot-action-btn[data-act="fix-frame"] {
+    background: rgba(220, 38, 38, 0.88);
+    border-color: rgba(248, 113, 113, 0.6);
+    color: #ffffff;
+}
+
+.slot-action-btn[data-act="fix-frame"]:hover:not(:disabled) {
+    background: rgba(239, 68, 68, 0.98);
+    border-color: #f87171;
+    box-shadow: 0 0 10px rgba(239, 68, 68, 0.45);
+}
+
+.slot-action-btn[data-act="describe-frame"] {
+    background: rgba(217, 119, 6, 0.88);
+    border-color: rgba(251, 191, 36, 0.6);
+    color: #ffffff;
+}
+
+.slot-action-btn[data-act="describe-frame"]:hover:not(:disabled) {
+    background: rgba(245, 158, 11, 0.98);
+    border-color: #fbbf24;
+    box-shadow: 0 0 10px rgba(245, 158, 11, 0.45);
+}
+
+.slot-action-btn[data-variant="danger"],
+.slot-action-btn[data-act="delete-slot"] {
+    background: rgba(185, 28, 28, 0.88);
+    border-color: rgba(239, 68, 68, 0.6);
+    color: #ffffff;
+}
+
+.slot-action-btn[data-variant="danger"]:hover:not(:disabled),
+.slot-action-btn[data-act="delete-slot"]:hover:not(:disabled) {
+    background: rgba(220, 38, 38, 0.98);
+    border-color: #ef4444;
+    box-shadow: 0 0 10px rgba(239, 68, 68, 0.45);
 }
 
 .slot-action-btn:disabled {
     opacity: 0.45;
     cursor: not-allowed;
+    filter: grayscale(0.5);
 }
 
-/* 徽标横排：同时成立的徽标可能有 6 枚以上（降级/审查未过/人工标记/未核验/
-   未审查/留痕/过期/手动/换位），旧实现靠第二枚硬编码 left:45px 挪位，第三枚
-   就没地方放了。这里改成 flex 容器，加多少枚都自动排。 */
 .slot-badges {
     position: absolute;
     top: 5px;

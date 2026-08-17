@@ -7,11 +7,9 @@
     position: relative;
 }
 
-/* 被隐藏的标签：仅在「不是当前页」时才真的消失。
-   代码里 switchMainTab() 可能把一个被隐藏的页激活（例如生成结束自动跳到
-   激发结果），这时让它临时露出来，避免出现没有任何标签高亮的死状态。 */
-.mobile-nav-btn.nav-hidden:not(.active) {
-    display: none;
+/* 被隐藏的标签：无论是否为 active 状态，均彻底隐藏，避免由于 active 状态而意外闪现 */
+.mobile-nav-btn.nav-hidden {
+    display: none !important;
 }
 
 /* — 「⋯」入口：不参与 flex:1 的等分，固定窄条吊在最右 — */

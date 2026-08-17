@@ -159,7 +159,7 @@
 #panel-image-studio textarea:focus {
     border-color: var(--primary);
     box-shadow: 0 0 10px var(--border-color-glow);
-    background: rgba(0, 0, 0, 0.35);
+    background: var(--bg-card);
 }
 
 #panel-image-studio .random-prompt-btn {
@@ -449,17 +449,29 @@
     box-shadow: none !important;
 }
 
+#panel-image-studio .btn-shortcut-hint {
+    display: block;
+    font-size: 11px;
+    font-weight: normal;
+    opacity: 0.8;
+    margin-top: 2px;
+}
+
 #panel-image-studio .panel-footer {
-    /* Reset position/z-index explicitly: the host app's own .panel-footer rule
-       (used by the config panel) makes this sticky with inset:0 on narrow
-       viewports, which without this reset leaks in here and overlaps the
-       tab bar above it. */
-    position: static;
-    z-index: auto;
     padding: 16px 28px 24px 28px;
     border-top: 1px solid var(--border-color);
     background: var(--bg-panel-solid);
     flex-shrink: 0;
+}
+
+@media (min-width: 769px) {
+    #panel-image-studio .panel-footer {
+        /* Reset position/z-index explicitly on desktop: the host app's own .panel-footer rule
+           (used by the config panel) makes this sticky with inset:0 on narrow
+           viewports, which without this reset leaks in here on desktop. */
+        position: static;
+        z-index: auto;
+    }
 }
 
 /* Drag & Drop File Upload */
@@ -577,7 +589,7 @@
 
 #panel-image-studio .spotlight-card {
     width: 100%;
-    background: rgba(0, 0, 0, 0.3);
+    background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
     border-radius: 16px;
     overflow: hidden;
@@ -622,7 +634,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: #020308;
+    background: rgba(var(--ink-rgb), 0.06);
 }
 
 #panel-image-studio .spotlight-image-wrapper img {
@@ -637,7 +649,7 @@
     bottom: 0;
     left: 0;
     right: 0;
-    background: linear-gradient(to top, rgba(7, 9, 19, 0.9) 0%, rgba(7, 9, 19, 0.6) 70%, transparent 100%);
+    background: linear-gradient(to top, rgba(var(--panel-rgb), 0.94) 0%, rgba(var(--panel-rgb), 0.6) 70%, transparent 100%);
     padding: 1.5rem;
     display: flex;
     justify-content: space-between;
@@ -670,7 +682,7 @@
     padding: 0.15rem 0.5rem;
     border-radius: 4px;
     width: fit-content;
-    color: #dfb2ff;
+    color: var(--primary);
 }
 
 #panel-image-studio .info-prompt {
@@ -678,7 +690,7 @@
     line-height: 1.4;
     max-height: 60px;
     overflow-y: auto;
-    color: #fff;
+    color: var(--text-main);
 }
 
 #panel-image-studio .info-actions {
@@ -687,9 +699,9 @@
 }
 
 #panel-image-studio .action-icon-btn {
-    background: rgba(255, 255, 255, 0.1);
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    color: #fff;
+    background: rgba(var(--ink-rgb), 0.06);
+    border: 1px solid var(--border-color);
+    color: var(--text-main);
     width: 36px;
     height: 36px;
     border-radius: 8px;
@@ -705,6 +717,7 @@
 #panel-image-studio .action-icon-btn:hover {
     background: var(--primary);
     border-color: var(--primary);
+    color: #fff;
     transform: translateY(-2px);
     box-shadow: 0 0 8px var(--primary-glow);
 }
@@ -1106,38 +1119,6 @@
     50% { opacity: 0.6; }
 }
 
-/* Responsive: stack the two cards on narrower widths */
-@media (max-width: 1200px) {
-    #panel-image-studio .imgstudio-grid {
-        grid-template-columns: 380px 1fr;
-    }
-}
-
-@media (max-width: 992px) {
-    #panel-image-studio .imgstudio-grid {
-        grid-template-columns: 1fr;
-        overflow-y: auto;
-    }
-    #panel-image-studio .imgstudio-card {
-        height: auto;
-        max-height: none;
-    }
-    #panel-image-studio .spotlight-image-wrapper img {
-        max-height: 400px;
-    }
-}
-
-@media (max-width: 768px) {
-    #panel-image-studio .aspect-ratio-grid {
-        grid-template-columns: repeat(2, 1fr);
-    }
-    #panel-image-studio .quality-grid {
-        grid-template-columns: repeat(3, 1fr);
-    }
-    #panel-image-studio .panel-footer {
-        padding: 12px 16px 16px 16px;
-    }
-}
 
 /* ── 实时生成动态（Live Feed，替代旧任务队列卡片） ─────────────────── */
 #panel-image-studio .feed-live-dot {
@@ -1283,4 +1264,371 @@
 
 #panel-image-studio .feed-entry-result img:hover {
     transform: scale(1.04);
+}
+
+/* ==========================================================================
+   Image Studio 移动端与触屏增强系统 (P0-P4 Consolidated Responsive System)
+   ========================================================================== */
+
+/* ── 默认状态下的辅助元素 ── */
+#panel-image-studio .imgstudio-mobile-nav {
+    display: none;
+}
+
+#panel-image-studio .upload-text-mobile {
+    display: none;
+}
+
+/* ── P0/P3: 触屏能力判定 (hover: none, pointer: coarse) ── */
+@media (hover: none), (pointer: coarse) {
+    /* Spotlight 信息与操作条：从悬浮浮层改为图片下方的常驻工具条 */
+    #panel-image-studio .spotlight-image-wrapper {
+        flex-direction: column;
+    }
+
+    #panel-image-studio .spotlight-info-overlay {
+        position: static;
+        opacity: 1;
+        transform: none;
+        background: rgba(var(--panel-rgb), 0.92);
+        border-top: 1px solid var(--border-color);
+        flex-direction: column;
+        align-items: stretch;
+        gap: 10px;
+        padding: 12px;
+        width: 100%;
+    }
+
+    #panel-image-studio .info-prompt {
+        color: var(--text-main);
+        max-height: none;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+    }
+
+    /* 5 个操作平分一行，触控高 >= 44px */
+    #panel-image-studio .info-actions {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 8px;
+    }
+
+    #panel-image-studio .action-icon-btn {
+        width: auto;
+        height: 44px;
+        background: rgba(var(--ink-rgb), 0.06);
+        border-color: var(--border-color);
+        color: var(--text-main);
+    }
+
+    /* 历史卡片操作条：常驻显示并允许换行避免小尺寸溢出 */
+    #panel-image-studio .history-card-overlay {
+        opacity: 1;
+        background: linear-gradient(to top, rgba(0, 0, 0, 0.66) 0%, transparent 55%);
+        align-items: flex-end;
+        justify-content: flex-end;
+        align-content: flex-end;
+        flex-wrap: wrap;
+        padding: 6px;
+        gap: 6px;
+    }
+
+    #panel-image-studio .history-card-btn {
+        width: 36px;
+        height: 36px;
+        font-size: 0.9rem;
+        background: rgba(0, 0, 0, 0.45);
+    }
+
+    /* 上传提示文案切换为触屏友好文案 */
+    #panel-image-studio .upload-text-desktop {
+        display: none;
+    }
+
+    #panel-image-studio .upload-text-mobile {
+        display: inline;
+    }
+}
+
+/* ── P0/P3: 粗指针触控尺寸增强 (pointer: coarse) ── */
+@media (pointer: coarse) {
+    #panel-image-studio .task-btn-icon {
+        width: 40px;
+        height: 40px;
+    }
+    #panel-image-studio .upload-preview-card {
+        width: 76px;
+        height: 76px;
+    }
+    #panel-image-studio .upload-preview-delete {
+        width: 26px;
+        height: 26px;
+        top: 4px;
+        right: 4px;
+        font-size: 0.85rem;
+    }
+    #panel-image-studio .text-action-btn {
+        min-height: 36px;
+        padding: 6px 4px;
+    }
+    #panel-image-studio .style-tag {
+        padding: 0.55rem 0.85rem;
+        font-size: 0.8rem;
+    }
+    #panel-image-studio .toggle-btn-small {
+        min-height: 36px;
+        padding: 6px 8px;
+    }
+    #panel-image-studio .random-prompt-btn {
+        padding: 0.4rem 0.75rem;
+        min-height: 32px;
+    }
+}
+
+/* ── P3: 消除触屏 hover 动画粘滞并补充 active 反馈 ── */
+@media (hover: none) {
+    #panel-image-studio .history-card:hover,
+    #panel-image-studio .style-tag:hover,
+    #panel-image-studio .task-card:hover,
+    #panel-image-studio .gradient-submit-btn:hover,
+    #panel-image-studio .action-icon-btn:hover,
+    #panel-image-studio .feed-entry-result img:hover,
+    #panel-image-studio .random-prompt-btn:hover {
+        transform: none;
+    }
+
+    #panel-image-studio .history-card:active,
+    #panel-image-studio .style-tag:active {
+        opacity: 0.75;
+    }
+}
+
+/* ── P1/P2: 平板与窄屏断点（1024px，统一滚动容器） ── */
+@media (max-width: 1024px) {
+    #panel-image-studio .imgstudio-grid {
+        grid-template-columns: 1fr;
+        gap: 16px;
+        height: 100%;
+        min-height: 0;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        -webkit-overflow-scrolling: touch;
+        padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+    }
+
+    #panel-image-studio .imgstudio-card {
+        height: auto;
+        max-height: none;
+        overflow: visible;
+    }
+
+    /* 卡片内部不再嵌套滚动，全部交由 .imgstudio-grid 统一滚动 */
+    #panel-image-studio .panel-body,
+    #panel-image-studio .gallery-body {
+        overflow: visible !important;
+        flex: 0 0 auto;
+    }
+
+    #panel-image-studio .live-feed-container,
+    #panel-image-studio .tasks-list-container,
+    #panel-image-studio .feed-stage-lines {
+        max-height: none;
+        overflow: visible;
+    }
+
+    #panel-image-studio .spotlight-image-wrapper img {
+        max-height: 400px;
+    }
+}
+
+/* ── P0-P4: 手机端核心断点（768px） ── */
+@media (max-width: 768px) {
+    /* P1: iOS Safari 输入控件 >= 16px 避免页面自动放大 */
+    #panel-image-studio textarea,
+    #panel-image-studio .styled-select {
+        font-size: 16px;
+    }
+
+    /* P0: 底部生成按钮粘底吸附 + 安全区支持 */
+    #panel-image-studio .panel-footer {
+        position: sticky;
+        bottom: 0;
+        z-index: 5;
+        padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px)) 12px;
+        box-shadow: 0 -4px 14px rgba(0, 0, 0, 0.12);
+    }
+
+    #panel-image-studio .gradient-submit-btn {
+        min-height: 48px;
+        padding: 0.85rem 1rem;
+    }
+
+    #panel-image-studio .btn-shortcut-hint {
+        display: none !important;
+    }
+
+    /* P2: 面板头部与 Tab 紧凑排布 */
+    #panel-image-studio .panel-header {
+        padding: 14px 16px 10px !important;
+    }
+
+    #panel-image-studio .panel-header h2 {
+        font-size: 1.05rem !important;
+    }
+
+    #panel-image-studio .panel-header p {
+        font-size: 0.75rem;
+    }
+
+    #panel-image-studio .panel-tab-btn {
+        padding: 0.75rem 0.5rem;
+        font-size: 0.85rem;
+    }
+
+    #panel-image-studio .panel-tab-btn .tab-en {
+        display: none;
+    }
+
+    /* P2: 比例选择器 3 列紧凑卡片 */
+    #panel-image-studio .aspect-ratio-grid {
+        grid-template-columns: repeat(3, 1fr);
+        gap: 0.4rem;
+    }
+
+    #panel-image-studio .ratio-card {
+        padding: 0.5rem 0.25rem;
+        gap: 0.35rem;
+    }
+
+    #panel-image-studio .ratio-text {
+        font-size: 0.66rem;
+    }
+
+    #panel-image-studio .ratio-text .ratio-hint {
+        display: none;
+    }
+
+    /* P2: 清晰度选择器 3 列，隐藏第二行说明与英文后缀 */
+    #panel-image-studio .quality-grid {
+        grid-template-columns: repeat(3, 1fr);
+    }
+
+    #panel-image-studio .quality-title {
+        font-size: 0.78rem;
+    }
+
+    #panel-image-studio .quality-title .quality-hint {
+        display: none;
+    }
+
+    #panel-image-studio .quality-desc {
+        display: none;
+    }
+
+    /* P2: 历史与任务标题行允许换行，杜绝横向溢出 */
+    #panel-image-studio .history-header-row,
+    #panel-image-studio .tasks-header-row {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    #panel-image-studio .history-header-row h3,
+    #panel-image-studio .tasks-header-row h3 {
+        font-size: 0.95rem;
+    }
+
+    /* P2: 历史画廊 3-4 列紧凑缩略图 */
+    #panel-image-studio .history-grid-container {
+        grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+        gap: 0.5rem;
+    }
+
+    /* P2: Spotlight 紧凑尺寸，首屏不被吃光 */
+    #panel-image-studio .spotlight-container {
+        min-height: 180px;
+    }
+
+    #panel-image-studio .spotlight-image-wrapper img {
+        max-height: 46vh;
+    }
+
+    /* P2: 提示词 2 行 clamp 省略 */
+    #panel-image-studio .feed-entry-prompt,
+    #panel-image-studio .task-prompt {
+        white-space: normal;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+    }
+
+    /* P4: 移动端专属子视图分段导航与显示控制 */
+    #panel-image-studio .imgstudio-mobile-nav {
+        display: flex;
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        background: var(--bg-panel-solid);
+        border-bottom: 1px solid var(--border-color);
+        padding: 6px 12px;
+        gap: 8px;
+    }
+
+    #panel-image-studio .imgstudio-mobile-nav-btn {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        padding: 8px 12px;
+        border-radius: 8px;
+        border: 1px solid transparent;
+        background: transparent;
+        color: var(--text-muted);
+        font-size: 0.85rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: var(--transition-fast);
+    }
+
+    #panel-image-studio .imgstudio-mobile-nav-btn.active {
+        background: rgba(var(--ink-rgb), 0.06);
+        border-color: var(--border-color);
+        color: var(--text-main);
+    }
+
+    #panel-image-studio .imgstudio-mobile-badge {
+        font-size: 0.7rem;
+        padding: 1px 6px;
+        border-radius: 10px;
+        background: var(--primary);
+        color: #fff;
+        font-weight: 700;
+        line-height: 1.2;
+    }
+
+    #panel-image-studio .imgstudio-grid[data-mobile-view="result"] #imgstudio-controls {
+        display: none;
+    }
+
+    #panel-image-studio .imgstudio-grid[data-mobile-view="create"] #imgstudio-gallery {
+        display: none;
+    }
+}
+
+/* ── P2: 极小屏幕断点（480px） ── */
+@media (max-width: 480px) {
+    #panel-image-studio .aspect-ratio-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    #panel-image-studio .info-actions {
+        grid-template-columns: repeat(3, 1fr);
+    }
+
+    #panel-image-studio .history-grid-container {
+        grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+    }
 }

@@ -75,6 +75,20 @@ s = ready({ manual_issue: '墙面材质不对' });
 assert.deepStrictEqual(badges(s), ['manual-flagged']);
 assert.ok(acts(s).includes('fix-frame'));
 
+// 4选1 候选图智能生成：候选图数量 > 1 时必须画「4选1」徽标并提供「4选1」查看/切换按钮
+s = ready({
+    candidates: [
+        { index: 1, file: 'f1', is_chosen: false },
+        { index: 2, file: 'f2', is_chosen: true },
+        { index: 3, file: 'f3', is_chosen: false },
+        { index: 4, file: 'f4', is_chosen: false }
+    ],
+    chosen_candidate_index: 2
+});
+assert.deepStrictEqual(badges(s), ['candidate-selection']);
+assert.ok(acts(s).includes('view-candidates'), '多候选帧必须提供4选1对比与切换入口');
+assert.ok(s.badges[0].tip.includes('候选 #2'));
+
 // ── 撤销修复：只有真的存下过快照的帧才给这个出口 ─────────────────────
 // 修复是覆盖写同一个帧文件，没有快照就真的退不回去——不能画一枚点了会报错的按钮。
 s = ready({ quality_gate: 'pending_manual_review',

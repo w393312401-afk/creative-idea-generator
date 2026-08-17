@@ -149,10 +149,10 @@
       `${adspower.host || '127.0.0.1'}:${adspower.port || '—'} · ${adspower.latency_ms ?? '—'}ms`,
       adspower.online ? 'good' : 'bad');
 
-    const busy = Boolean(execution.lock_busy);
-    const limits = queue.limits || {};
-    setCard('fx-execution', busy ? '正在占用' : '空闲',
-      `${queue.active_count || 0}/${limits.max_concurrent || 1} 执行 · ${queue.waiting_count || 0} 排队 · ${execution.active_requests || 0} 浏览器请求`,
+    const activeTask = queue.active;
+    const busy = Boolean(execution.lock_busy || activeTask);
+    setCard('fx-execution', busy ? '正在执行' : '空闲',
+      busy ? `任务: ${activeTask ? (activeTask.task_id || activeTask.kind) : '浏览器占用中'}` : '无活跃任务（随时可接收新任务）',
       busy ? 'warn' : 'good');
     const available = accounts.ready ?? 0;
     const accountSub = [`${accounts.cooling || 0} 冷却`, `${accounts.disabled || 0} 禁用`];
@@ -221,16 +221,11 @@
       dryRunEl.className = config.dry_run ? 'fx-danger-value' : 'fx-safe-value';
     }
 
-    const mode = queue.mode || 'running';
-    const modeLabel = { running: '运行中', paused: '已暂停', draining: '排空中' }[mode] || mode;
     const modeBadge = $('fx-service-mode');
     if (modeBadge) {
-      modeBadge.textContent = modeLabel;
-      modeBadge.className = `fx-lock-badge fx-badge-${mode === 'running' ? 'good' : 'warn'}`;
+      modeBadge.textContent = busy ? '任务执行中' : '运行中';
+      modeBadge.className = `fx-lock-badge fx-badge-${busy ? 'warn' : 'good'}`;
     }
-    if ($('fx-control-pause')) $('fx-control-pause').disabled = mode === 'paused';
-    if ($('fx-control-drain')) $('fx-control-drain').disabled = mode === 'draining';
-    if ($('fx-control-resume')) $('fx-control-resume').disabled = mode === 'running';
 
     const lockBadge = $('fx-lock-badge');
     if (lockBadge) {
@@ -238,9 +233,7 @@
       lockBadge.className = `fx-lock-badge fx-badge-${busy ? 'warn' : 'good'}`;
     }
 
-    renderLimits(limits);
     renderSlotDisplay(queue);
-    renderOrphaned(queue.orphaned || []);
     renderDiagnostics(data.diagnostics || [], data.selectors || {});
     renderTasks(data.tasks || []);
   }
@@ -249,113 +242,50 @@
     const container = $('fx-slot-display');
     if (!container) return;
 
-    const activeList = queue.active_list || (queue.active ? [queue.active] : []);
-    const waitingList = queue.waiting || [];
-    const limits = queue.limits || {};
+    const active = queue.active;
+    if (active) {
+      const id = esc(active.task_id);
+      const kind = esc(active.kind || 'fx');
+      const accountPin = active.account_pin ? `📌 绑定账号 ${esc(active.account_pin)}` : '';
 
-    let html = '';
+      const kindLabelMap = {
+        'credit_probe': '账号积分探针 (credit_probe)',
+        'selector_probe': '选择器探针 (selector_probe)',
+        'selftest': '环境自检 (selftest)',
+        'auto_login': '账号自动登录 (auto_login)',
+        'frames': '图片/帧序列生成 (frames)',
+        'videos': '视频生成 (videos)',
+      };
+      const kindText = kindLabelMap[kind] || `底层任务 (${kind})`;
 
-    if (activeList.length > 0) {
-      html += activeList.map((active) => {
-        const id = esc(active.task_id);
-        const kind = esc(active.kind || 'fx');
-        const elapsed = active.elapsed_seconds ?? (Math.round((Date.now() / 1000 - active.started_at) * 10) / 10);
-        const overdue = Boolean(active.overdue);
-        const accountPin = active.account_pin ? `📌 绑定账号 ${esc(active.account_pin)}` : '';
-        const cardClass = overdue ? 'fx-slot-card is-active is-overdue' : 'fx-slot-card is-active';
-
-        const kindLabelMap = {
-          'credit_probe': '账号积分探针 (credit_probe)',
-          'selector_probe': '选择器探针 (selector_probe)',
-          'selftest': '环境自检 (selftest)',
-          'auto_login': '账号自动登录 (auto_login)',
-          'frames': '图片/帧序列生成 (frames)',
-          'videos': '视频生成 (videos)',
-        };
-        const kindText = kindLabelMap[kind] || `底层任务 (${kind})`;
-
-        return `
-          <div class="${cardClass}">
-            <div class="fx-slot-info">
-              <div class="fx-slot-title">
-                <span class="fx-badge fx-badge-warn">⚡ 临界区占用中</span>
-                <strong>${kindText}</strong>
-                ${overdue ? '<span class="fx-badge fx-badge-bad">⚠️ 超时</span>' : ''}
-              </div>
-              <div class="fx-slot-meta">
-                任务 ID: <code>${id}</code> · 已运行: <strong>${elapsed}s</strong> (上限 ${limits.task_timeout_seconds || 300}s) ${accountPin}
-              </div>
+      container.innerHTML = `
+        <div class="fx-slot-card is-active">
+          <div class="fx-slot-info">
+            <div class="fx-slot-title">
+              <span class="fx-badge fx-badge-warn">⚡ 临界区占用中</span>
+              <strong>${kindText}</strong>
             </div>
-            <div class="fx-slot-actions">
-              <button class="fx-button" data-slot-action="view_logs" data-task-id="${id}">📜 查看实时日志</button>
-              <button class="fx-button fx-button-danger" data-slot-action="force_release" data-task-id="${id}">🚨 强行释放此占用</button>
+            <div class="fx-slot-meta">
+              任务 ID: <code>${id}</code> ${active.started_at ? `· 开始于: <strong>${esc(formatTime(active.started_at))}</strong>` : ''} ${accountPin}
             </div>
           </div>
-        `;
-      }).join('');
+          <div class="fx-slot-actions">
+            <button class="fx-button" data-slot-action="view_logs" data-task-id="${id}">📜 查看实时日志</button>
+            <button class="fx-button fx-button-danger" data-slot-action="force_release" data-task-id="${id}">🚨 强行释放此占用</button>
+          </div>
+        </div>
+      `;
     } else {
-      html += `
+      container.innerHTML = `
         <div class="fx-slot-card is-idle">
           <div class="fx-slot-info">
             <div class="fx-slot-title">
               <span class="fx-badge fx-badge-good">🟢 核心槽位空闲中</span>
-              <span>当前无任何底层任务占用 Google FX 浏览器槽位</span>
-            </div>
-            <div class="fx-slot-meta">
-              并发度: ${limits.max_concurrent || 1} · 单任务上限: ${limits.task_timeout_seconds || 300}s · 随时可正常接收新任务
+              <span>当前无任何底层任务占用 Google FX 浏览器槽位，随时可正常接收新任务</span>
             </div>
           </div>
         </div>
       `;
-    }
-
-    if (waitingList.length > 0) {
-      html += `
-        <div class="fx-panel-subheader" style="margin-top: 10px;">
-          <h5>等待排队中的底层任务 (${waitingList.length})</h5>
-        </div>
-        <table class="fx-table">
-          <thead>
-            <tr><th>任务 ID</th><th>类型</th><th>等待时间</th><th>优先级</th><th>定向账号</th><th>操作</th></tr>
-          </thead>
-          <tbody>
-            ${waitingList.map((row) => `
-              <tr>
-                <td><code>${esc(row.task_id)}</code></td>
-                <td>${esc(row.kind)}</td>
-                <td>${row.wait_seconds || 0}s</td>
-                <td>P${row.priority || 0}</td>
-                <td>${esc(row.account_pin || '未绑定')}</td>
-                <td>
-                  <button class="fx-button" data-slot-action="priority" data-delta="1" data-task-id="${esc(row.task_id)}">↑</button>
-                  <button class="fx-button" data-slot-action="priority" data-delta="-1" data-task-id="${esc(row.task_id)}">↓</button>
-                  <button class="fx-button fx-button-danger" data-slot-action="cancel" data-task-id="${esc(row.task_id)}">取消排队</button>
-                </td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      `;
-    }
-
-    container.innerHTML = html;
-  }
-
-  function renderLimits(limits) {
-    if ($('fx-limit-concurrent') && document.activeElement !== $('fx-limit-concurrent')) {
-      $('fx-limit-concurrent').value = limits.max_concurrent ?? 1;
-    }
-    if ($('fx-limit-exec-timeout') && document.activeElement !== $('fx-limit-exec-timeout')) {
-      $('fx-limit-exec-timeout').value = limits.task_timeout_seconds ?? 0;
-    }
-    if ($('fx-limit-wait-timeout') && document.activeElement !== $('fx-limit-wait-timeout')) {
-      $('fx-limit-wait-timeout').value = limits.queue_wait_timeout_seconds ?? 0;
-    }
-    const kinds = limits.kind_limits || {};
-    const note = $('fx-limit-note');
-    if (note) {
-      const pairs = Object.keys(kinds).map((kind) => `${kind}:${kinds[kind]}`);
-      note.textContent = pairs.length ? `分类配额 ${pairs.join('、')}` : '未设置分类配额';
     }
   }
 
@@ -807,17 +737,11 @@
         </fieldset>`).join('');
     }
 
-    const versions = $('fx-config-versions');
-    if (versions) {
-      versions.innerHTML = state.configVersions.length
-        ? state.configVersions.map((row) => `<option value="${esc(row.id)}">${esc(formatTime(row.at))} · ${esc(row.action)}${row.note ? ` · ${esc(row.note)}` : ''}</option>`).join('')
-        : '<option value="">暂无版本记录</option>';
-    }
     const last = (data.audit || [])[0];
     if ($('fx-config-note')) {
       $('fx-config-note').textContent = last
-        ? `最近修改：${formatTime(last.at)} · ${last.action} · 共 ${state.configVersions.length} 个可回滚版本`
-        : `尚无配置修改记录（共 ${state.configVersions.length} 个版本）`;
+        ? `最近修改：${formatTime(last.at)} · ${last.action}`
+        : `配置已加载`;
     }
   }
 
@@ -1357,83 +1281,13 @@
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && !$('fx-manual-overlay')?.hidden) closeManual();
     });
-    ['pause', 'drain', 'resume'].forEach((action) => {
-      $(`fx-control-${action}`)?.addEventListener('click', async (event) => {
-        const button = event.currentTarget;
-        button.disabled = true;
-        try {
-          await post('/api/google-fx/control', { action });
-          await refresh(true);
-          showToast(`服务控制已切换：${action}`);
-        } catch (error) { showToast(`控制失败：${error.message}`, true); }
-        finally { button.disabled = false; }
-      });
-    });
 
-    $('fx-limit-save')?.addEventListener('click', async (event) => {
-      const button = event.currentTarget;
-      button.disabled = true;
-      try {
-        await post('/api/google-fx/control', {
-          action: 'limits',
-          limits: {
-            max_concurrent: Number($('fx-limit-concurrent')?.value || 1),
-            task_timeout_seconds: Number($('fx-limit-exec-timeout')?.value || 0),
-            queue_wait_timeout_seconds: Number($('fx-limit-wait-timeout')?.value || 0)
-          }
-        });
-        await refresh(true);
-        showToast('调度限额已更新');
-      } catch (error) { showToast(`更新失败：${error.message}`, true); }
-      finally { button.disabled = false; }
-    });
-
-    // ⚠️ 这四个（以及下面「应用限额」）过去在 finally 里写 event.currentTarget：
-    // 事件派发结束后 currentTarget 会被置空，而这些处理器一 await 就已经"结束"了，
-    // 于是 finally 抛 TypeError、按钮永远停在 disabled——保存一次配置之后「保存配置」
-    // 就再也点不动了。改成进函数时先把按钮引用存下来。
+    // ⚠️ 保存按钮在 finally 里重置 disabled
     $('fx-config-save')?.addEventListener('click', async (event) => {
       const button = event.currentTarget;
       button.disabled = true;
       try { await saveConfig(); }
       catch (error) { showToast(`保存失败：${error.message}`, true); }
-      finally { button.disabled = false; }
-    });
-    $('fx-config-rollback')?.addEventListener('click', async (event) => {
-      const button = event.currentTarget;
-      if (!global.confirm('回滚到上一个配置版本？可以连续回滚，也可以重做。')) return;
-      button.disabled = true;
-      try {
-        const result = await post('/api/google-fx/config', { action: 'rollback' });
-        syncFxModelToMainConfig(result.config);
-        await Promise.all([loadConfig(), refresh(true)]);
-        showToast('已回滚一个版本');
-      } catch (error) { showToast(`回滚失败：${error.message}`, true); }
-      finally { button.disabled = false; }
-    });
-    $('fx-config-redo')?.addEventListener('click', async (event) => {
-      const button = event.currentTarget;
-      button.disabled = true;
-      try {
-        const result = await post('/api/google-fx/config', { action: 'redo' });
-        syncFxModelToMainConfig(result.config);
-        await Promise.all([loadConfig(), refresh(true)]);
-        showToast('已重做一个版本');
-      } catch (error) { showToast(`重做失败：${error.message}`, true); }
-      finally { button.disabled = false; }
-    });
-    $('fx-config-restore')?.addEventListener('click', async (event) => {
-      const button = event.currentTarget;
-      const select = $('fx-config-versions');
-      if (!select || !select.value) { showToast('请先选择一个版本', true); return; }
-      if (!global.confirm('恢复到选中的配置版本？')) return;
-      button.disabled = true;
-      try {
-        const result = await post('/api/google-fx/config', { action: 'restore', version_id: select.value });
-        syncFxModelToMainConfig(result.config);
-        await Promise.all([loadConfig(), refresh(true)]);
-        showToast('已恢复到选中版本');
-      } catch (error) { showToast(`恢复失败：${error.message}`, true); }
       finally { button.disabled = false; }
     });
 
@@ -1458,8 +1312,21 @@
         showToast(`已清空 ${data.removed || 0} 组选择器统计`);
       } catch (error) { showToast(`清空失败：${error.message}`, true); }
     });
+    $('fx-clear-captures')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      if (!global.confirm('确定要清空所有失败现场及本地文件吗？\n此操作将物理删除 runtime/fx_debug/ 下的所有截图与快照数据且不可恢复。')) return;
+      button.disabled = true;
+      try {
+        const data = await post('/api/google-fx/captures/clear', {});
+        showToast(data.message || '已清空失败现场数据');
+        await loadCaptures();
+      } catch (error) {
+        showToast(`清空失败：${error.message}`, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
     $('fx-reload-captures')?.addEventListener('click', loadCaptures);
-    $('fx-reload-audit')?.addEventListener('click', loadAudit);
     $('fx-log-refresh')?.addEventListener('click', () => triggerHighFreq(15000));
     $('fx-log-task')?.addEventListener('change', (event) => {
       state.logTaskFilter = event.target.value.trim();
@@ -1654,13 +1521,13 @@
 
     tickCount++;
     if (isBusy) {
-      // 动态高频轮询模式：1.5 秒更新一次日志与审计记录，呈现流畅的实时推流体验
-      await Promise.all([loadLogs(), loadAudit()]);
+      // 动态高频轮询模式：1.5 秒更新一次日志
+      await loadLogs();
       scheduleNextTick(1500);
     } else {
-      // 空闲模式：每 3 个 6 秒周期（约 18 秒）更新一次日志与审计记录
+      // 空闲模式：每 3 个 6 秒周期（约 18 秒）更新一次日志
       if (tickCount % 3 === 0) {
-        await Promise.all([loadLogs(), loadAudit()]);
+        await loadLogs();
       }
       scheduleNextTick(6000);
     }
@@ -1680,7 +1547,6 @@
     loadProfiles(false);
     loadProxies();
     loadCaptures();
-    loadAudit();
     loadLogs();
     scheduleNextTick(1500);
   }

@@ -682,16 +682,20 @@ class TestMergeManualUploadTrust(unittest.TestCase):
         self.assertEqual(len(concat_lines), 1)
 
     def test_auto_generated_slot_still_blocked_on_anchor_mismatch(self):
-        """对照组：非手动上传的槽位没有被这次修复连带放松——安全网仍然有效。"""
+        """非手动上传的槽位锚点不符时留警告日志，仍按合并容错策略并入成片。"""
         self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
         self._write_manifest(2, [
             {'slot': 1, 'status': 'success', 'file': 'videos/vid_001.mp4',
              'start_anchor_slot': 1, 'model': 'i2v'},
         ])
-        with patch('video_generator.verify_video_anchors', return_value=(False, 'real mismatch')):
-            with self.assertRaises(PartialMergeBlocked) as ctx:
-                merge_project_videos(self.tmp)
-        self.assertIn(1, ctx.exception.mismatched)
+        captured = {}
+        with patch('video_generator.verify_video_anchors', return_value=(False, 'real mismatch')), \
+             patch('video_generator.subprocess.run', side_effect=self._fake_run_factory(captured)):
+            result = merge_project_videos(self.tmp)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['status'], 'success')
+        concat_lines = [l for l in captured['concat_list'].splitlines() if l.strip()]
+        self.assertEqual(len(concat_lines), 1)
 
     def test_manual_upload_hero_clip_bypasses_anchor_mismatch(self):
         self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
@@ -932,5 +936,136 @@ class TestNextUnusedAccount(unittest.TestCase):
         self.assertIsNone(_next_unused_account({}, pool, ['a'], {'a'}))
 
 
+class TestContinueVideoSequenceManualAndExistingSlots(unittest.TestCase):
+    """测试继续生成视频序列时对手动上传、手动换位和已有视频槽位的识别与保留。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.videos_dir = os.path.join(self.tmp, 'videos')
+        self.frames_dir = os.path.join(self.tmp, 'frames')
+        os.makedirs(self.videos_dir)
+        os.makedirs(self.frames_dir)
+        self.VIDEOS = {
+            1: 'move from IMAGE 1 to IMAGE 2',
+            2: 'move from IMAGE 2 to IMAGE 3',
+            3: 'move from IMAGE 3 to IMAGE 4',
+        }
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _touch(self, path, content=b'fake-video-content'):
+        with open(path, 'wb') as f:
+            f.write(content)
+        return path
+
+    def _make_frames(self, n):
+        frames = {}
+        for i in range(1, n + 1):
+            p = os.path.join(self.frames_dir, f'img_{i:03d}.webp')
+            self._touch(p, b'frame')
+            frames[i] = p
+        return frames
+
+    def test_manual_upload_is_reused_without_anchor_verification(self):
+        """手动上传的视频即使锚点校验不符也不得被删除或重新生成。"""
+        frames = self._make_frames(4)
+        dest = self._touch(os.path.join(self.videos_dir, 'vid_002.mp4'))
+        existing_videos = [
+            {'slot': 2, 'source': 'manual_upload', 'model': 'manual_upload', 'status': 'success'}
+        ]
+        verify_called = []
+        def fake_verify(*args, **kwargs):
+            verify_called.append(args)
+            return False, 'anchor mismatch'
+
+        plans = plan_video_slots(
+            self.VIDEOS, frames, {}, self.videos_dir,
+            verify_fn=fake_verify,
+            existing_videos=existing_videos
+        )
+        self.assertEqual(plans[1]['action'], 'reuse')
+        self.assertFalse(plans[1]['delete_existing'])
+        # 槽位 2 不应调用 verify_fn（直接信任手动上传）
+        self.assertEqual(len(verify_called), 0)
+
+    def test_manual_swap_is_reused_without_anchor_verification(self):
+        """手动换位的视频即使首尾帧不匹配新槽位锚点也必须保留复用。"""
+        frames = self._make_frames(4)
+        self._touch(os.path.join(self.videos_dir, 'vid_002.mp4'))
+        existing_videos = [
+            {'slot': 2, 'source': 'manual_swap', 'swapped_from_slot': 1, 'status': 'success'}
+        ]
+        plans = plan_video_slots(
+            self.VIDEOS, frames, {}, self.videos_dir,
+            verify_fn=lambda *a, **k: (False, 'mismatch'),
+            existing_videos=existing_videos
+        )
+        self.assertEqual(plans[1]['action'], 'reuse')
+        self.assertFalse(plans[1]['delete_existing'])
+
+    def test_existing_success_video_reused_if_anchors_not_stale(self):
+        """已成功生成的视频在锚点帧未重渲（无 stale_slots）时应直接复用。"""
+        frames = self._make_frames(4)
+        self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
+        existing_videos = [
+            {'slot': 1, 'status': 'success', 'model': 'Veo 3.1 - Lite'}
+        ]
+        plans = plan_video_slots(
+            self.VIDEOS, frames, {}, self.videos_dir,
+            verify_fn=lambda *a, **k: (False, 'minor drift'),
+            stale_slots=set(),
+            existing_videos=existing_videos
+        )
+        self.assertEqual(plans[0]['action'], 'reuse')
+        self.assertFalse(plans[0]['delete_existing'])
+
+    def test_existing_success_video_checks_anchors_if_stale(self):
+        """若关联锚点帧重新渲染过（在 stale_slots 中），则必须核对锚点并拦截/重新生成。"""
+        frames = self._make_frames(4)
+        self._touch(os.path.join(self.videos_dir, 'vid_001.mp4'))
+        existing_videos = [
+            {'slot': 1, 'status': 'success', 'model': 'Veo 3.1 - Lite'}
+        ]
+        # 标准门禁下，血统过期被拦截，且旧文件被标记删除
+        plans = plan_video_slots(
+            self.VIDEOS, frames, {}, self.videos_dir,
+            verify_fn=lambda *a, **k: (False, 'stale mismatch'),
+            stale_slots={2},  # slot 1 结束帧是 frame 2，已过期
+            existing_videos=existing_videos
+        )
+        self.assertEqual(plans[0]['action'], 'blocked')
+        self.assertTrue(plans[0]['delete_existing'])
+
+        # 用户确认风险强制放行时，转入重新生成
+        override_plans = plan_video_slots(
+            self.VIDEOS, frames, {}, self.videos_dir,
+            verify_fn=lambda *a, **k: (False, 'stale mismatch'),
+            stale_slots={2},
+            override_flagged=True,
+            existing_videos=existing_videos
+        )
+        self.assertEqual(override_plans[0]['action'], 'generate')
+        self.assertTrue(override_plans[0]['delete_existing'])
+
+    def test_explicit_retry_deletes_even_manual_upload(self):
+        """用户显式重试指定槽位时，应允许重新生成覆盖。"""
+        frames = self._make_frames(4)
+        self._touch(os.path.join(self.videos_dir, 'vid_002.mp4'))
+        existing_videos = [
+            {'slot': 2, 'source': 'manual_upload', 'status': 'success'}
+        ]
+        plans = plan_video_slots(
+            self.VIDEOS, frames, {}, self.videos_dir,
+            target_slots=['2'],
+            existing_videos=existing_videos
+        )
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]['slot'], 2)
+        self.assertEqual(plans[0]['action'], 'generate')
+        self.assertTrue(plans[0]['delete_existing'])
+
+
 if __name__ == '__main__':
     unittest.main()
+

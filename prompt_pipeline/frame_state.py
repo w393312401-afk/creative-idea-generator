@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .scene_state import PERSISTENT_STRUCTURAL_CUES, scrub_planning_annotations
+
 
 TRANSITION_OPERATIONS = {"threshold", "reward", "reframe"}
 
@@ -60,7 +62,12 @@ def _text(value: Any) -> str:
 
 
 def _space_id(beat: dict[str, Any]) -> str:
-    return _text(beat.get("space_id") or beat.get("space_family") or "primary").lower()
+    # `space` 排在最前：复刻线的空间标签走 reverse.normalize_beat_spaces 落在这个键上，
+    # 而 _BEAT_KEY_ALIASES 又会把 space_id/room/location 统统搬进 `space`。只认 space_id
+    # 的话，整条复刻梯子在这里会塌成一个 "primary" 桶——按空间分账的判据全部失效。
+    return _text(
+        beat.get("space") or beat.get("space_id") or beat.get("space_family") or "primary"
+    ).lower()
 
 
 def _phase(beat: dict[str, Any]) -> int | None:
@@ -95,6 +102,144 @@ def build_frame_state_contract(beat_ladder: list[dict[str, Any]]) -> list[dict[s
             ),
         })
     return contracts
+
+
+# ── 按空间的状态账 ───────────────────────────────────────────────────────────
+#
+# build_frame_state_contract 回答不了过门揭示真正要问的那个问题：镜头正要推进去的这个
+# 空间，**之前进来过没有**？进来过的话，上次离开时它长什么样？
+#
+# 整条流水线原本不需要问——规划期指令写死了「a crossing moves the CAMERA, never the
+# construction state: everything completed in an earlier space ... is never revisited」
+# （__init__.py:9080），靠「永不回头」来保证不回退。2026-08-14 改成按原片逐拍 space
+# 序列标过门之后，`外 → 内 → 外 → 内` 成了常态，这条保证就塌了：回到旧空间的那一拍
+# 没有任何数据告诉渲染层「这里已经铺完地板了」，于是过门揭示照着「没人进来过」的口径
+# 把它重新画成废墟（2026-08-15 用户复盘：外景已是成品温室，一进门又是杂草与裸土）。
+#
+# 这份账只服务提示词，不做硬闸。理由见 _PHASE_RANK 的排序本身就不可靠（framing=3 排在
+# rough-in=2 前面，而真实工序是先框架后铺管），拿它判死会误伤正常梯子。
+
+
+def _completed_phrases(after: str) -> str:
+    """一条 after_state 里能直接写进提示词的散文。
+
+    必须过 scrub_planning_annotations：after_state 会带「（工序：…）」这类规划期标注，
+    它们顺着这条路会一路流进交付出去的英文提示词正文（见 scene_state 同名函数的注释）。
+    """
+    return scrub_planning_annotations(_text(after)).strip(" ,;.")
+
+
+def build_space_state_ledger(beat_ladder: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """空间 → 这个空间被拍到过的每一拍 [{'index','after','phase','operation'}, …]。
+
+    只收录承载施工增量的拍：过门/reward/桥接拍本身不改变任何建造状态，把它们记进来
+    会让「上次离开时的样子」变成一句运镜描述。
+    """
+    ledger: dict[str, list[dict[str, Any]]] = {}
+    for position, beat in enumerate(beat_ladder or [], start=1):
+        if not isinstance(beat, dict):
+            continue
+        op = _text(beat.get("operation")).lower()
+        if op in TRANSITION_OPERATIONS or beat.get("bridge_stage") or beat.get("hard_cut"):
+            continue
+        after = _completed_phrases(beat.get("after_state"))
+        if not after:
+            continue
+        ledger.setdefault(_space_id(beat), []).append({
+            "index": int(beat.get("index") or position),
+            "after": after,
+            "phase": _phase(beat),
+            "operation": op,
+        })
+    return ledger
+
+
+def _carried_structural(ledger: dict[str, list[dict[str, Any]]], space: str, limit: int = 3) -> str:
+    """在**别的**空间完成、但从这个空间也看得见的结构件终态。
+
+    屋顶/天花板/地面是一个物件被两个空间同时看见：外景拍申报「屋顶重建完成」，室内拍的
+    天花板状态和它此前没有任何数据关联，于是进门后天花板又回到原始态。按空间分账解决
+    不了这一类——它恰恰是跨空间的，所以单独捞一遍结构件关键词。
+    """
+    picked: list[str] = []
+    for other, visits in (ledger or {}).items():
+        if other == space:
+            continue
+        for visit in visits:
+            after = visit.get("after") or ""
+            # 正面主张「又变回生料/裸露」的终态一律不算「已完成、必须照着画」：清理拍的
+            # "bare earth floor exposed" 命中 floor 关键词，不滤掉的话会被当成结构件成果
+            # 递给首次进外景的那一拍，等于命令模型把裸土画进一个还没动工的空间。
+            if not _matches_structural(after) or _asserts_regression(after):
+                continue
+            if after not in picked:
+                picked.append(after)
+    return "; ".join(picked[-limit:])
+
+
+def _matches_structural(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(cue in lowered for cue in PERSISTENT_STRUCTURAL_CUES)
+
+
+def space_entry_context(
+    beat_ladder: list[dict[str, Any]],
+    beat_index: int,
+    *,
+    limit: int = 3,
+) -> dict[str, Any]:
+    """镜头在第 ``beat_index`` 拍进入的那个空间的前情，供过门揭示提示词使用。
+
+    返回 ``first_entry``（这个空间此前没有任何施工拍）、``inherited_state``（上次离开时
+    的终态，最多 ``limit`` 条）、``carried_structural``（别处完成但这里看得见的结构件）、
+    ``last_seen_index``（上一次拍到这个空间的拍号，渲染层据此挂上那张真实帧）。
+
+    找不到梯子/找不到这一拍时返回 ``first_entry=True`` 的空前情——等价于改动前的行为，
+    老 manifest（没有 space 字段的）因此一切照旧。
+    """
+    beats = [b for b in (beat_ladder or []) if isinstance(b, dict)]
+    unknown = {"space": "", "first_entry": True, "inherited_state": "",
+               "carried_structural": "", "last_seen_index": None}
+    if not beats:
+        return unknown
+
+    # 一拍都没有显式空间标签 = 这份梯子根本没有空间信息（2026-08-14 之前的 manifest，
+    # 或投影漏了 space 键）。此时 _space_id 会把每一拍都兜底成 "primary"，整条序列塌成
+    # 一个桶——于是**真正的新空间**也会被判成复入场，反过来命令模型把一个还没动工的
+    # 房间画成完工。宁可整条退回改动前的首入场行为，也不能拿兜底值当判据。
+    if not any(_text(b.get("space") or b.get("space_id") or b.get("space_family")) for b in beats):
+        return unknown
+
+    current = None
+    for position, beat in enumerate(beats, start=1):
+        if int(beat.get("index") or position) == int(beat_index):
+            current = beat
+            break
+    if current is None:
+        return {"space": "", "first_entry": True, "inherited_state": "",
+                "carried_structural": "", "last_seen_index": None}
+
+    space = _space_id(current)
+    ledger = build_space_state_ledger(beats)
+    prior = [v for v in ledger.get(space, []) if v["index"] < int(beat_index)]
+
+    # 最近一条终态永远保留；更早的那些若正面主张「裸露/缺失」，说明它已经被后续工序
+    # 取代了（先清出裸土、再铺地板），把它一并回放等于同时命令模型画裸土和画地板。
+    seen: list[str] = []
+    for offset, visit in enumerate(prior[-limit:]):
+        is_latest = offset == len(prior[-limit:]) - 1
+        if not is_latest and _asserts_regression(visit["after"]):
+            continue
+        if visit["after"] not in seen:
+            seen.append(visit["after"])
+
+    return {
+        "space": space,
+        "first_entry": not prior,
+        "inherited_state": "; ".join(seen),
+        "carried_structural": _carried_structural(ledger, space, limit=limit),
+        "last_seen_index": prior[-1]["index"] if prior else None,
+    }
 
 
 def validate_frame_state_contract(

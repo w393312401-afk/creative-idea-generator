@@ -552,16 +552,15 @@ class TestFixBeatFromSequenceReview(unittest.TestCase):
         self.assertEqual(v, 'new video body')
         self.assertEqual(i, 'new image body')
 
-    def test_legacy_hard_cut_placeholder_body_is_never_rewritten(self):
-        """旧单遗留的占位声明（该单确实不生成这段视频）不接受改写：把它改成一条真镜头
-        描述，会与这一单实际的渲染行为不符。IMAGE 照常修，VIDEO 原样保留。"""
+    def test_cut_slot_video_body_rewritable_from_placeholder(self):
+        """占位声明正文在复审中支持重写为真实的跨越镜头运镜描述。"""
         raw = json.dumps({'video': 'a sweeping dolly through the doorway', 'image': 'new image body'})
         with patch.object(pp, '_chat', return_value=raw), \
              patch.object(pp, 'clean_prompt_text', side_effect=lambda s: s), \
              patch.object(pp, 'fix_image_clean_frame_proactive', side_effect=lambda s: s):
             v, i = pp.fix_beat_from_sequence_review(
                 {}, pp.HARD_CUT_VIDEO_PLACEHOLDER, 'old image', ['木门封闭'], video_meta='CUT')
-        self.assertEqual(v, pp.HARD_CUT_VIDEO_PLACEHOLDER)
+        self.assertEqual(v, 'a sweeping dolly through the doorway')
         self.assertEqual(i, 'new image body')
 
     def test_new_cut_slot_video_body_stays_rewritable(self):

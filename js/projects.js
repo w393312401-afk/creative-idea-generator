@@ -446,8 +446,8 @@ function renderProjectsBulkBar() {
     const btns = [];
     if (running) btns.push(`<button type="button" class="projects-btn danger" data-bulk="cancel">✕ 取消运行中（${running}）</button>`);
     btns.push('<button type="button" class="projects-btn" data-bulk="copy-titles">📋 复制标题</button>');
-    if (saved) btns.push(`<button type="button" class="projects-btn danger" data-bulk="unsave">🗑️ 从点子库删除（${saved}）</button>`);
-    if (withTask) btns.push(`<button type="button" class="projects-btn danger" data-bulk="delete-task">🗑️ 删除任务记录（${withTask}）</button>`);
+    if (withTask) btns.push(`<button type="button" class="projects-btn" data-bulk="delete-task" title="只删除生成任务记录与日志，已收藏的创意与磁盘素材不受影响">🧹 仅清除任务记录（${withTask}）</button>`);
+    if (saved) btns.push(`<button type="button" class="projects-btn danger" data-bulk="unsave" title="从点子库删除并彻底清理本地磁盘生成的图片/视频文件">🗑️ 从点子库彻底删除（${saved}）</button>`);
 
     bar.innerHTML = `
         <span class="projects-bulk-count">已选 ${rows.length} 个项目</span>
@@ -465,34 +465,57 @@ function projectsSyncSelectAllBtn() {
     btn.disabled = keys.length === 0;
 }
 
-// 批量收藏删除不走 deleteFromLibrary：那条路径每删一条都弹一次 toast、还各自触发
-// 一次 refreshProjects（选 10 条就是 10 条提示 + 10 次全量汇总）。这里直接打端点，
-// 结束后统一同步一次本地 savedIdeas 镜像与列表。
+// 批量收藏删除：优先单次批量端点（/api/library/items/bulk_delete），大幅降低网络耗时与避免部分删除。
 async function projectsBulkUnsave(rows) {
+    const targets = rows.filter(p => p.saved && (p.library || {}).id);
+    const targetIds = targets.map(p => p.library.id).filter(Boolean);
+    if (!targetIds.length) return 0;
+
     const removed = new Set();
-    for (const p of rows) {
-        const id = (p.library || {}).id;
-        if (!id) continue;
-        const idea = (typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas))
-            ? savedIdeas.find(i => i.id === id) : null;
-        try {
-            const res = await fetch('/api/library/item/delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    id,
-                    title: idea && typeof getIdeaSaveTitle === 'function'
-                        ? getIdeaSaveTitle(idea)
-                        : (p.project_key || p.title || ''),
-                    covers: (idea && idea.covers) || [],
-                }),
-            });
-            const data = await res.json().catch(() => ({}));
-            if (res.ok && data.status === 'ok') removed.add(id);
-        } catch (e) {
-            console.error('Bulk unsave failed', id, e);
+    try {
+        const res = await fetch('/api/library/items/bulk_delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: targetIds }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.status === 'ok') {
+            if (Array.isArray(data.items)) {
+                data.items.filter(x => x.removed).forEach(x => removed.add(x.id));
+            } else {
+                targetIds.forEach(id => removed.add(id));
+            }
+        }
+    } catch (e) {
+        console.warn('Bulk unsave batch request failed, falling back to sequential', e);
+    }
+
+    // 失败时回落到单条删除兼容
+    if (!removed.size) {
+        for (const p of targets) {
+            const id = p.library.id;
+            const idea = (typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas))
+                ? savedIdeas.find(i => i.id === id) : null;
+            try {
+                const res = await fetch('/api/library/item/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        id,
+                        title: idea && typeof getIdeaSaveTitle === 'function'
+                            ? getIdeaSaveTitle(idea)
+                            : (p.project_key || p.title || ''),
+                        covers: (idea && idea.covers) || [],
+                    }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (res.ok && data.status === 'ok') removed.add(id);
+            } catch (e) {
+                console.error('Fallback single unsave failed', id, e);
+            }
         }
     }
+
     if (removed.size && typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
         savedIdeas = savedIdeas.filter(i => !removed.has(i.id));
         try { localStorage.setItem('spark_library', JSON.stringify(savedIdeas)); }
@@ -546,14 +569,14 @@ async function projectsRunBulkAction(act) {
             const ids = rows.filter(p => (p.task || {}).id).map(p => p.task.id);
             if (!ids.length) return;
             if (!await projectsConfirm(
-                `确定删除这 ${ids.length} 条任务记录吗？只删记录，已收藏的创意与 outputs/ 里的文件不受影响。`)) return;
+                `确定清除这 ${ids.length} 条任务记录吗？（仅清理生成记录与日志，已收藏的创意与本地磁盘素材文件不受影响）`)) return;
             const ok = await projectsBulkJobRequest('/api/tasks/delete', ids);
             showToast(ok === ids.length
-                ? `已删除 ${ok} 条任务记录`
-                : `${ids.length} 条记录中删除了 ${ok} 条，其余失败`,
+                ? `已清除 ${ok} 条任务记录`
+                : `${ids.length} 条记录中清除了 ${ok} 条，其余失败`,
                 ok === ids.length ? 'success' : 'error');
             projectsSelected.clear();
-            refreshProjects();
+            refreshProjects({ assets: false });
             break;
         }
 
@@ -561,10 +584,10 @@ async function projectsRunBulkAction(act) {
             const targets = rows.filter(p => p.saved && (p.library || {}).id);
             if (!targets.length) return;
             if (!await projectsConfirm(
-                `确定从点子库删除这 ${targets.length} 个创意吗？对应生成的图片/视频文件会一并清理，不可恢复。`)) return;
+                `确定从点子库彻底删除这 ${targets.length} 个创意吗？\n⚠ 对应在 outputs/ 目录已生成的图片与成片文件会一并彻底清除，不可恢复。`)) return;
             const ok = await projectsBulkUnsave(targets);
             showToast(ok === targets.length
-                ? `已从点子库删除 ${ok} 个创意`
+                ? `已从点子库彻底删除 ${ok} 个创意及对应磁盘素材`
                 : `${targets.length} 个创意中删除了 ${ok} 个，其余失败`,
                 ok === targets.length ? 'success' : 'error');
             projectsSelected.clear();
@@ -744,12 +767,30 @@ function renderProjectDetail() {
 
 /* ── 动作 ──────────────────────────────────────────────────────────────── */
 
-// 批量作业操作直接打端点，不走 deleteTask/cancelTask：那两个各自带一次
-// customConfirm 和一条 toast，一行 4 个子作业就是 4 次确认 + 4 条提示。
-// 这里确认与提示各只做一次，逐条失败也不打断剩下的。
+// 批量作业操作：优先使用批量端点，单次网络请求完成；失败时回落到逐条重试。
 async function projectsBulkJobRequest(url, ids) {
+    const validIds = (ids || []).filter(Boolean);
+    if (!validIds.length) return 0;
+
+    // 优先单次批量请求
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task_ids: validIds, task_id: validIds[0] }),
+        });
+        if (res.ok) {
+            const data = await res.json().catch(() => ({}));
+            if (typeof data.count === 'number') return data.count;
+            return validIds.length;
+        }
+    } catch (e) {
+        console.warn('Batch job request failed, falling back to sequential', url, e);
+    }
+
+    // 回落到逐条发送
     let ok = 0;
-    for (const id of ids) {
+    for (const id of validIds) {
         try {
             const res = await fetch(url, {
                 method: 'POST',
@@ -758,7 +799,7 @@ async function projectsBulkJobRequest(url, ids) {
             });
             if (res.ok) ok++;
         } catch (e) {
-            console.error('Bulk job request failed', url, id, e);
+            console.error('Bulk job request fallback failed', url, id, e);
         }
     }
     return ok;

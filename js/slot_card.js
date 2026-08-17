@@ -66,6 +66,7 @@ function renderSlotCard(cardEl, state) {
     // 问题」的那些格子；工具条的「全部修复」按它取帧，与卡片按钮同源。
     cardEl.dataset.badges = String((state.badges || []).length);
     cardEl.dataset.fixable = (state.flags && state.flags.fixable) ? '1' : '0';
+    cardEl.dataset.promptDirty = (state.badges || []).some(b => b.id === 'prompt-dirty') ? '1' : '0';
     // 拖出能力随状态走：只有真的有内容的格子能当换位的源。
     // （旧实现只在首次 enable 时按当时有没有内容设一次，重渲后就失灵了）
     cardEl.draggable = !!state.draggable;
@@ -109,7 +110,10 @@ function renderSlotCard(cardEl, state) {
 
     // ── 文本与提示一律用属性赋值，不拼进 HTML ──
     const labelEl = cardEl.querySelector('.slot-label');
-    if (labelEl) labelEl.textContent = state.label || '';
+    if (labelEl) {
+        labelEl.textContent = state.label || '';
+        labelEl.title = '点击跳转并高亮对应的提示词卡片 📝';
+    }
 
     const errEl = cardEl.querySelector('.error-text');
     if (errEl) {
@@ -181,10 +185,20 @@ const SLOT_ACTION_HANDLERS = {
     'fix-frame': seq => fixFrameIssue(seq),
     'undo-fix': seq => undoFrameFix(seq),
     'describe-frame': seq => describeFrameIssue(seq, currentFrameManualIssue(seq)),
+    'view-candidates': seq => {
+        if (typeof openCandidateSelectionModal === 'function') {
+            openCandidateSelectionModal(seq);
+        }
+    },
     'upload-frame': seq => triggerFrameUpload(seq),
     'retry-video': seq => retrySingleVideo(seq),
     'upload-video': seq => triggerVideoUpload(seq),
     'delete-slot': seq => deleteSlotBeat(seq),
+    'jump-prompt': (seq, type) => {
+        if (typeof jumpFromMediaToPrompt === 'function') {
+            jumpFromMediaToPrompt(type || 'image', seq);
+        }
+    },
 };
 
 /** 点「改描述」时现取当前已记录的问题描述（渲染时刻的闭包会过期）。 */
@@ -241,11 +255,31 @@ function bindSlotGrid(gridId) {
         const seq = Number(card.dataset.seq);
         if (!Number.isFinite(seq)) return;
 
+        // 点击左下角槽位标签直接跳转对应提示词卡片
+        const labelEl = e.target.closest('.slot-label');
+        if (labelEl) {
+            e.stopPropagation();
+            if (typeof jumpFromMediaToPrompt === 'function') {
+                jumpFromMediaToPrompt(card.dataset.type || 'image', seq);
+            }
+            return;
+        }
+
+        // 点击 4选1 徽标直接打开候选对比弹窗
+        const candidateBadge = e.target.closest('.slot-badge[data-badge="candidate-selection"]');
+        if (candidateBadge) {
+            e.stopPropagation();
+            if (typeof openCandidateSelectionModal === 'function') {
+                openCandidateSelectionModal(seq);
+            }
+            return;
+        }
+
         const btn = e.target.closest('.slot-action-btn');
         if (btn) {
             // disabled 的按钮浏览器不会派发 click，走到这里就一定是可点的
             const handler = SLOT_ACTION_HANDLERS[btn.dataset.act];
-            if (handler) handler(seq);
+            if (handler) handler(seq, card.dataset.type);
             return;
         }
         if (card.dataset.kind !== 'ready') return;

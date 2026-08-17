@@ -119,7 +119,12 @@ function testOrphanRowGetsItsOwnActionRow() {
 async function testBulkJobActionsHitEachJobOnce() {
   const posted = [];
   sandbox.fetch = async (url, init) => {
-    posted.push([url, JSON.parse(init.body).task_id]);
+    const body = JSON.parse(init.body);
+    if (Array.isArray(body.task_ids)) {
+      body.task_ids.forEach(id => posted.push([url, id]));
+    } else {
+      posted.push([url, body.task_id]);
+    }
     return { ok: true, json: async () => ({}) };
   };
   sandbox.customConfirm = async () => true;

@@ -1,14 +1,8 @@
-"""Google FX 服务管理中心的后端支撑：配置白名单 + 版本栈。
+"""Google FX 服务管理中心的后端支撑：配置白名单与运行配置存储。
 
 从 server.py 拆出来的原因：配置项从 6 个扩到二十来个之后，"哪些能热改、
-哪些要重启、改了写哪个环境变量、怎么回滚" 这套规则本身就有足够的体量和测试面，
+哪些要重启、改了写哪个环境变量" 这套规则本身就有足够的体量和测试面，
 塞在 HTTP 路由旁边会淹没在 4000 行里。
-
-版本栈（替代原来的单步回滚）：每次成功保存都往 runtime/fx_config_versions.jsonl
-追加一条完整快照，于是可以列版本、看 diff、回滚到任意版本、以及回滚之后重做。
-原实现是"在审计里找最近一条 config.update 然后套用它的 before"——只能退一步，
-第二次点击会重复套用同一份 before（看起来像又退了一步，实际是空操作），
-而且没有任何前进的路。
 """
 
 import json
@@ -219,50 +213,21 @@ def validate_patch(patch):
 
 
 class FxConfigStore:
-    """FX 运行配置的读写与版本栈。
+    """FX 运行配置的读写存储。
 
-    宿主注入四个协作对象，避免本模块反向依赖 server：
+    宿主注入协作对象，避免本模块反向依赖 server：
       config          —— 活的 SERVER_CONFIG dict（原地更新，其它模块持有同一引用）
       config_file     —— server_config.json 路径
       apply_overrides —— server_common.apply_google_fx_runtime_overrides
       audit           —— FX_CONTROL.audit
     """
 
-    def __init__(self, config, config_file, versions_file, apply_overrides, audit):
+    def __init__(self, config, config_file, versions_file=None, apply_overrides=None, audit=None):
         self._config = config
         self._config_file = str(config_file)
-        self._versions_file = str(versions_file)
-        self._cursor_file = str(versions_file) + '.cursor'
-        self._apply_overrides = apply_overrides
-        self._audit = audit
+        self._apply_overrides = apply_overrides or (lambda _c: None)
+        self._audit = audit or (lambda *a, **kw: None)
         self._lock = threading.Lock()
-
-    # ── 游标 ──────────────────────────────────────────
-    # 回滚/重做需要知道"当前停在版本栈的哪一格"。光比对"配置内容和当前不同的最近
-    # 一条"是不够的：回滚本身也会追加一条版本记录，于是第二次回滚会把刚被退掉的
-    # 那一版当成"最近的不同版本"又装回去（来回跳，永远退不到第三格）。
-
-    def _read_cursor(self):
-        try:
-            with open(self._cursor_file, 'r', encoding='utf-8') as handle:
-                return json.load(handle).get('version_id')
-        except Exception:
-            return None
-
-    def _write_cursor(self, version_id):
-        try:
-            os.makedirs(os.path.dirname(self._cursor_file), exist_ok=True)
-            tmp = self._cursor_file + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as handle:
-                json.dump({'version_id': version_id}, handle)
-            os.replace(tmp, self._cursor_file)
-        except Exception:
-            pass
-
-    def _chronological(self):
-        rows = self.versions(500)
-        rows.reverse()
-        return rows
 
     # ── 读 ────────────────────────────────────────────
 
@@ -289,72 +254,20 @@ class FxConfigStore:
                 for key, spec in FX_CONFIG_SPEC.items()}
 
     def versions(self, limit=30):
-        rows = []
-        try:
-            with open(self._versions_file, 'r', encoding='utf-8') as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rows.append(json.loads(line))
-                    except Exception:
-                        continue
-        except FileNotFoundError:
-            return []
-        except Exception:
-            return []
-        rows.reverse()
-        return rows[:max(1, min(int(limit), 200))]
+        return []
 
-    def diff_against_current(self, version_id):
-        target = next((row for row in self.versions(200) if row.get('id') == version_id), None)
-        if target is None:
-            raise KeyError('找不到这个配置版本')
-        current = self.current()
-        changes = {}
-        for key, value in (target.get('config') or {}).items():
-            if key in FX_CONFIG_SPEC and current.get(key) != value:
-                changes[key] = {'current': current.get(key), 'target': value}
-        return {'version': target, 'changes': changes}
+    def ensure_baseline(self, actor='system'):
+        return None
 
     # ── 写 ────────────────────────────────────────────
 
-    def _append_version(self, config, action, actor, note=''):
-        row = {
-            'id': datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ'),
-            'at': datetime.now(timezone.utc).astimezone().isoformat(),
-            'action': action,
-            'actor': actor,
-            'note': note,
-            'config': dict(config),
-        }
-        try:
-            os.makedirs(os.path.dirname(self._versions_file), exist_ok=True)
-            with open(self._versions_file, 'a', encoding='utf-8') as handle:
-                handle.write(json.dumps(row, ensure_ascii=False, default=str) + '\n')
-        except Exception:
-            pass
-        return row
-
-    def ensure_baseline(self, actor='system'):
-        """版本文件为空时先记一条基线，否则第一次"回滚"没有落脚点。"""
-        if self.versions(1):
-            return None
-        return self._append_version(self.current(), 'baseline', actor,
-                                    note='服务启动时记录的基线配置')
-
-    def save(self, patch, actor='local', action='config.update', note='', cursor_id=None):
+    def save(self, patch, actor='local', action='config.update', note=''):
         clean = validate_patch(patch)
         with self._lock:
             before = {key: self._config.get(key, FX_CONFIG_SPEC[key]['default'])
                       for key in clean}
             if all(before[key] == clean[key] for key in clean):
-                # 没有实际变化就不要污染版本栈——否则"回滚一步"会退到一个同样的版本。
-                if cursor_id:
-                    self._write_cursor(cursor_id)
-                return {'config': self.current(), 'changed': {}, 'version': None,
-                        'cursor': cursor_id or self._read_cursor()}
+                return {'config': self.current(), 'changed': {}, 'version': None, 'versions': []}
             updated = dict(self._config)
             updated.update(clean)
             tmp = self._config_file + '.tmp'
@@ -365,55 +278,6 @@ class FxConfigStore:
             self._config.update(updated)
             self._apply_overrides(self._config)
             apply_direct_env(self.current())
-            version = self._append_version(self.current(), action, actor, note)
-            # 普通保存把游标推到新版本；回滚/重做由调用方指定游标落在目标版本上，
-            # 这样连续回滚才能一格一格往前走。
-            self._write_cursor(cursor_id or version['id'])
-        self._audit(action, details={'before': before, 'after': clean,
-                                    'version_id': version['id']}, actor=actor)
-        return {'config': self.current(), 'changed': clean, 'version': version,
-                'cursor': cursor_id or version['id']}
+        self._audit(action, details={'before': before, 'after': clean}, actor=actor)
+        return {'config': self.current(), 'changed': clean, 'version': None, 'versions': []}
 
-    def restore(self, version_id=None, actor='local', direction='back'):
-        """回滚/重做到某个版本。
-
-        version_id 给定时直接跳到那一版。否则按 direction 沿版本栈移动一格：
-          back    —— 游标往前（更早）找最近一个配置内容不同的版本
-          forward —— 游标往后（更晚）找最近一个配置内容不同的版本
-        """
-        history = self._chronological()
-        if not history:
-            raise ValueError('还没有任何配置版本记录')
-        current = self.current()
-
-        if version_id:
-            target = next((row for row in history if row.get('id') == version_id), None)
-            if target is None:
-                raise KeyError('找不到这个配置版本')
-        else:
-            cursor = self._read_cursor()
-            index = next((i for i, row in enumerate(history) if row.get('id') == cursor), None)
-            if index is None:
-                # 没有游标（老数据/刚升级）：从最后一条与当前等价的版本起步
-                index = next((i for i in range(len(history) - 1, -1, -1)
-                              if (history[i].get('config') or {}) == current), len(history) - 1)
-            step = 1 if direction == 'forward' else -1
-            target = None
-            probe = index + step
-            while 0 <= probe < len(history):
-                if (history[probe].get('config') or {}) != current:
-                    target = history[probe]
-                    break
-                probe += step
-            if target is None:
-                raise ValueError(
-                    '没有可回滚的更早版本' if direction != 'forward'
-                    else '没有可重做的更新版本')
-
-        patch = {key: value for key, value in (target.get('config') or {}).items()
-                 if key in FX_CONFIG_SPEC}
-        if not patch:
-            raise ValueError('目标版本没有可应用的字段')
-        return self.save(patch, actor=actor, action='config.restore',
-                         note=f'恢复到版本 {target["id"]}（{target.get("action")}）',
-                         cursor_id=target['id'])

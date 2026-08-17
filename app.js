@@ -1161,9 +1161,13 @@ function setupEventListeners() {
     // 抽屉里那两个「清空已完成 / 清空失败」搬到了项目工作台工具栏；筛选与搜索
     // 由 js/projects.js 的 chips 接管，不再需要这里的三个绑定。
     const clearCompletedBtn = document.getElementById('projects-clear-completed-btn');
+    const clearNoCoverBtn = document.getElementById('projects-clear-nocover-btn');
     const clearFailedBtn = document.getElementById('projects-clear-failed-btn');
     if (clearCompletedBtn) {
         clearCompletedBtn.addEventListener('click', () => clearTasks('completed'));
+    }
+    if (clearNoCoverBtn) {
+        clearNoCoverBtn.addEventListener('click', () => clearTasks('no_cover'));
     }
     if (clearFailedBtn) {
         clearFailedBtn.addEventListener('click', () => clearTasks('failed_cancelled'));
@@ -1392,6 +1396,17 @@ function setupEventListeners() {
     }
     document.getElementById('make-cover-btn').addEventListener('click', () => generateCover());
     document.getElementById('generate-frames-btn').addEventListener('click', () => generateFrames());
+    const genSelBtn = document.getElementById('generate-frames-selection-btn');
+    if (genSelBtn) genSelBtn.addEventListener('click', () => generateFramesSelection());
+    const pipeSelBtn = document.getElementById('pipeline-frames-selection-btn');
+    if (pipeSelBtn) pipeSelBtn.addEventListener('click', () => generateFramesSelection());
+    const candCloseBtn = document.getElementById('candidate-selection-close-btn');
+    if (candCloseBtn) {
+        candCloseBtn.addEventListener('click', () => {
+            const modal = document.getElementById('candidate-selection-modal');
+            if (modal) modal.style.display = 'none';
+        });
+    }
     document.getElementById('run-sequence-review-btn').addEventListener('click', () => runSequenceReview());
     const fullReviewBtn = document.getElementById('run-full-sequence-review-btn');
     if (fullReviewBtn) {
@@ -1443,11 +1458,18 @@ function setupEventListeners() {
 // formatTaskDuration 已于 2026-07-31（P4）随「激发任务列表」抽屉一并删除，
 // 任务的展示与操作全部由「📁 项目」主标签页承担（js/projects.js）。
 // 这里只保留两样别处还在用的东西：
-//   · MEDIA_TASK_TYPES / isIdeationTask —— openSparkProject 解析激发任务时要用它
-//     排除帧/视频/封面子作业（误配上去会载入一份没有提示词的空壳结果）；
-//   · 下面的 header 角标轮询 —— 它跟当前在哪个标签页无关，必须独立跑。
 const MEDIA_TASK_TYPES = new Set(['frames', 'staged_render', 'videos', 'cover']);
-const isIdeationTask = (t) => !MEDIA_TASK_TYPES.has((t.dimensions && t.dimensions.type) || 'idea');
+const REPLICA_TASK_TYPES = new Set(['replica', 'replica_extract', 'replica_advance', 'replica_mutate']);
+const isReplicaTask = (t) => {
+    if (!t) return false;
+    const dims = t.dimensions || {};
+    const type = dims.type || '';
+    if (REPLICA_TASK_TYPES.has(type) || type.startsWith('replica')) return true;
+    if (dims.replica_job_id) return true;
+    if (String(t.id || '').startsWith('replica')) return true;
+    return false;
+};
+const isIdeationTask = (t) => !MEDIA_TASK_TYPES.has((t.dimensions && t.dimensions.type) || 'idea') && !isReplicaTask(t);
 
 let globalBadgeTimeout = null;
 
@@ -1704,11 +1726,27 @@ async function rerunCompletedTask(taskId, dimensions, event) {
 }
 
 async function clearTasks(statusGroup) {
+    let countHint = "";
+    if (typeof projectsRows !== 'undefined' && Array.isArray(projectsRows)) {
+        if (statusGroup === "completed") {
+            const n = projectsRows.filter(p => (p.task || {}).status === 'completed' || p.state === 'completed').length;
+            if (n > 0) countHint = `（检测到约 ${n} 条）`;
+        } else if (statusGroup === "failed_cancelled") {
+            const n = projectsRows.filter(p => ['failed', 'cancelled'].includes((p.task || {}).status) || p.state === 'failed' || p.has_failed_jobs).length;
+            if (n > 0) countHint = `（检测到约 ${n} 条）`;
+        } else if (statusGroup === "no_cover") {
+            const n = projectsRows.filter(p => !p.cover && !(p.assets && p.assets.cover)).length;
+            if (n > 0) countHint = `（检测到约 ${n} 条）`;
+        }
+    }
+
     let msg = "";
     if (statusGroup === "completed") {
-        msg = "确定要清空所有【已完成】的任务记录吗？";
+        msg = `确定要清空所有【已完成】的任务记录吗${countHint}？（仅清理历史记录，不影响已收藏的创意与磁盘素材）`;
     } else if (statusGroup === "failed_cancelled") {
-        msg = "确定要清空所有【已失败】和【已取消】的任务记录吗？";
+        msg = `确定要清空所有【已失败】和【已取消】的任务记录吗${countHint}？`;
+    } else if (statusGroup === "no_cover") {
+        msg = `确定要清空所有【无封面】的任务记录吗${countHint}？（仅清理历史记录，不影响已收藏的创意与磁盘素材）`;
     }
     
     const confirmed = await customConfirm(msg);
@@ -2499,6 +2537,12 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                     // 属于正常轮换，不是告警，所以不标 warn。
                     if (data && data.message) {
                         framesFeedLine(ownerId, `🔀 ${data.message}`);
+                    }
+                } else if (type === 'candidate_generating' || type === 'candidate_batch_ready' || type === 'candidate_evaluating' || type === 'candidate_ai_evaluation') {
+                    if (data && data.message) {
+                        setMeta(data.message);
+                        const isEval = type === 'candidate_ai_evaluation';
+                        framesFeedLine(ownerId, `${isEval ? '🎯' : '🎨'} ${data.message}`, isEval ? 'ok' : undefined);
                     }
                 } else if (type === 'transport_fallback') {
                     // 图生图端点号池无额度、同模型改走 chat 通道续渲：帧能接着渲。
@@ -3432,7 +3476,10 @@ async function generateProjectMetaForCurrentIdea() {
 }
 
 function copyPromptToClipboard() {
-    const text = (currentIdea && currentIdea.prompt_block) || document.getElementById('idea-prompt-block').textContent;
+    const blockEl = document.getElementById('idea-prompt-block');
+    const text = (currentIdea && currentIdea.prompt_block)
+        || (blockEl && blockEl.dataset && blockEl.dataset.rawText)
+        || (blockEl ? blockEl.textContent : '');
     copyText(text).then(() => {
         showToast("提示词集已复制到剪贴板！", "success");
     }).catch(err => {
@@ -3528,6 +3575,40 @@ async function generateFrames() {
         return;
     }
 
+    // ── 前置提示词静态合规审查（Pre-flight Prompt Linter）──
+    if (typeof lintPromptBlock === 'function') {
+        const lintReport = lintPromptBlock(ownerIdea.prompt_block);
+        if (!lintReport.passed) {
+            let linterProceed = false;
+            await new Promise(resolve => {
+                showPromptLinterModal({
+                    report: lintReport,
+                    actionTitle: '生成帧序列',
+                    onProceed: () => {
+                        linterProceed = true;
+                        resolve();
+                    },
+                    onAutoFix: async () => {
+                        const fixed = autoFixLintIssues(ownerIdea.prompt_block);
+                        ownerIdea.prompt_block = fixed;
+                        const pre = document.getElementById('idea-prompt-block');
+                        if (pre) pre.textContent = fixed;
+                        showToast('✨ 已自动修复提示词格式问题并继续！', 'success');
+                        linterProceed = true;
+                        resolve();
+                    },
+                    onEdit: () => {
+                        linterProceed = false;
+                        if (typeof switchMainTab === 'function') switchMainTab('prompts');
+                        if (typeof enterPromptEdit === 'function') enterPromptEdit();
+                        resolve();
+                    }
+                });
+            });
+            if (!linterProceed) return;
+        }
+    }
+
     const btn = document.getElementById('generate-frames-btn');
     const progress = document.getElementById('frames-progress');
     const meta = document.getElementById('frames-meta');
@@ -3584,6 +3665,203 @@ async function generateFrames() {
     }
 }
 
+async function generateFramesSelection() {
+    if (!currentIdea || !currentIdea.prompt_block) {
+        showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
+        showToast("该创意的帧序列已在生成中，请稍候", "error");
+        return;
+    }
+
+    if (!ownerIdea.cover_image) {
+        const ok = await customConfirm("尚未生成封面图，是否直接开始 4选1 智能帧序列生成？<br>（将使用纯文生图渲染第1帧）");
+        if (!ok) return;
+    }
+
+    const btn = document.getElementById('generate-frames-btn');
+    const selBtn = document.getElementById('generate-frames-selection-btn');
+    const progress = document.getElementById('frames-progress');
+    const meta = document.getElementById('frames-meta');
+    const grid = slotRenderTarget('image');
+    if (!btn || !progress || !meta || !grid) return;
+
+    const targetSequences = computeDebugTargets('frames', ownerIdea, 'frame');
+
+    if (btn) btn.disabled = true;
+    if (selBtn) selBtn.disabled = true;
+    progress.style.display = 'flex';
+    meta.textContent = '🚀 正在启动 4选1 智能帧序列生成与 AI 鉴别管线...';
+
+    try {
+        const body = {
+            config,
+            title: getIdeaSaveTitle(ownerIdea),
+            display_title: ownerIdea.title,
+            prompt_block: ownerIdea.prompt_block,
+            candidate_count: 4
+        };
+        if (targetSequences) body.target_sequences = targetSequences;
+
+        const response = await fetch('/api/generate_frames_selection', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errText}`);
+        }
+
+        const data = await response.json();
+        const taskId = data.task_id;
+
+        streamFramesProgress(taskId, ownerIdea, targetSequences);
+    } catch (e) {
+        console.error("Failed to generate frames selection:", e);
+        if (isViewingIdea(ownerIdea.id)) {
+            meta.textContent = `4选1 智能生成失败: ${e.message}`;
+            renderFramesForIdea(ownerIdea);
+            progress.style.display = 'none';
+            if (btn) btn.disabled = false;
+            if (selBtn) selBtn.disabled = false;
+        }
+        showToast(`4选1 智能生成失败: ${e.message}`, "error");
+    }
+}
+
+function openCandidateSelectionModal(seq, frameData) {
+    const modal = document.getElementById('candidate-selection-modal');
+    if (!modal) return;
+
+    if (!frameData && typeof currentIdea !== 'undefined' && currentIdea && currentIdea.frameRun && currentIdea.frameRun.frames) {
+        frameData = currentIdea.frameRun.frames.find(f => f.sequence === seq) || {};
+    }
+
+    const titleEl = document.getElementById('candidate-modal-title');
+    const subtitleEl = document.getElementById('candidate-modal-subtitle');
+    const reasoningEl = document.getElementById('candidate-modal-reasoning');
+    const gridEl = document.getElementById('candidate-cards-grid');
+
+    if (titleEl) titleEl.textContent = `🎯 IMG ${String(seq).padStart(3, '0')} · 4 候选图对比与 AI 鉴别结果`;
+    if (subtitleEl) subtitleEl.textContent = `当前展示该帧的全部生成候选图与 AI 多模态多维视觉评分。点击“设为采用”可随时手动切换采用图。`;
+
+    const aiEval = (frameData && frameData.ai_evaluation) || {};
+    if (reasoningEl) {
+        const reasonText = aiEval.selection_reason || (frameData && frameData.candidate_selection_reason) || 'AI 鉴别优选';
+        const bestIdx = aiEval.best_index || (frameData && frameData.chosen_candidate_index) || 1;
+        reasoningEl.innerHTML = `<strong>🤖 AI 多模态评估结论：</strong>${escapeHtml(reasonText)} <span style="margin-left:8px; padding:2px 8px; border-radius:10px; background:rgba(16,185,129,0.2); color:#10b981; font-weight:600;">推荐采用: 候选 #${bestIdx}</span>`;
+        reasoningEl.style.display = 'block';
+    }
+
+    if (gridEl) {
+        gridEl.innerHTML = '';
+        const candidates = (frameData && frameData.candidates) || [];
+        const chosenIdx = (frameData && frameData.chosen_candidate_index) || 1;
+
+        if (!candidates.length) {
+            gridEl.innerHTML = `<div style="grid-column:1/-1; text-align:center; padding:30px; color:var(--text-muted);">暂无候选图记录</div>`;
+        } else {
+            candidates.forEach(cand => {
+                const cIdx = cand.index;
+                const isChosen = cIdx === chosenIdx;
+                const score = cand.score != null ? cand.score : '--';
+                const strengths = cand.strengths || '';
+                const defects = cand.defects || '';
+                const fileUrl = cand.url || cand.file || '';
+
+                const card = document.createElement('div');
+                card.className = `candidate-card ${isChosen ? 'chosen' : ''}`;
+                card.style.cssText = `
+                    background: var(--bg-card, #1e293b);
+                    border: 2px solid ${isChosen ? '#10b981' : 'rgba(255,255,255,0.08)'};
+                    border-radius: 8px;
+                    overflow: hidden;
+                    display: flex;
+                    flex-direction: column;
+                    box-shadow: ${isChosen ? '0 0 12px rgba(16,185,129,0.3)' : 'none'};
+                    position: relative;
+                `;
+
+                card.innerHTML = `
+                    <div style="position:relative; aspect-ratio: 9/16; background:#0f172a; overflow:hidden; cursor:pointer;" onclick="if(window.openLightbox) openLightbox('${fileUrl}')">
+                        <img src="${fileUrl}" alt="Candidate #${cIdx}" style="width:100%; height:100%; object-fit:contain;" />
+                        <div style="position:absolute; top:6px; left:6px; background:rgba(0,0,0,0.7); color:#fff; font-size:11px; padding:2px 6px; border-radius:4px; font-weight:bold;">
+                            #${cIdx}
+                        </div>
+                        <div style="position:absolute; top:6px; right:6px; background:${isChosen ? '#10b981' : 'rgba(0,0,0,0.6)'}; color:#fff; font-size:11px; padding:2px 6px; border-radius:4px; font-weight:bold;">
+                            ${score} 分
+                        </div>
+                        ${isChosen ? '<div style="position:absolute; bottom:6px; left:6px; right:6px; background:#10b981; color:#fff; font-size:11px; text-align:center; padding:2px 4px; border-radius:4px; font-weight:bold;">👑 当前采用</div>' : ''}
+                    </div>
+                    <div style="padding:10px; font-size:12px; flex:1; display:flex; flex-direction:column; justify-content:space-between; gap:6px;">
+                        <div style="color:var(--text-muted, #94a3b8); line-height:1.4;">
+                            ${strengths ? `<div style="color:#10b981; margin-bottom:2px;"><strong>+</strong> ${escapeHtml(strengths)}</div>` : ''}
+                            ${defects ? `<div style="color:#f87171;"><strong>-</strong> ${escapeHtml(defects)}</div>` : ''}
+                        </div>
+                        <div>
+                            ${isChosen 
+                                ? `<button class="action-btn text-btn mini-btn" style="width:100%; border-color:#10b981; color:#10b981; cursor:default;" disabled>✅ 当前已采用</button>`
+                                : `<button class="action-btn text-btn mini-btn" style="width:100%; color:var(--accent-orange, #f59e0b); border-color:rgba(245,158,11,0.4);" onclick="switchCandidateForFrame(${seq}, ${cIdx})">👉 设为采用此图</button>`
+                            }
+                        </div>
+                    </div>
+                `;
+                gridEl.appendChild(card);
+            });
+        }
+    }
+
+    modal.style.display = 'flex';
+}
+
+async function switchCandidateForFrame(seq, candidateIndex) {
+    if (!currentIdea) return;
+    const ownerIdea = currentIdea;
+    const projectTitle = getIdeaSaveTitle(ownerIdea);
+
+    try {
+        const response = await fetch('/api/switch_candidate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                title: projectTitle,
+                sequence: seq,
+                candidate_index: candidateIndex
+            })
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errText}`);
+        }
+
+        const data = await response.json();
+        showToast(`已成功切换 IMG ${String(seq).padStart(3, '0')} 为候选 #${candidateIndex}`, "success");
+
+        if (data.manifest && data.manifest.frames) {
+            ownerIdea.frameRun = {
+                ...(ownerIdea.frameRun || {}),
+                frames: data.manifest.frames
+            };
+            if (isViewingIdea(ownerIdea.id)) {
+                renderFramesForIdea(ownerIdea);
+            }
+            saveCurrentIdeaState();
+        }
+
+        const modal = document.getElementById('candidate-selection-modal');
+        if (modal) modal.style.display = 'none';
+
+    } catch (e) {
+        console.error("Failed to switch candidate:", e);
+        showToast(`切换候选图失败: ${e.message}`, "error");
+    }
+}
 
 // Function renderFramesForIdea moved to modular JS file
 

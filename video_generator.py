@@ -492,12 +492,55 @@ def _rel_url(abs_path):
     return rel, '/' + rel
 
 
+def sanitize_cut_video_prompt(prompt, start_slot=1, end_slot=2):
+    """把声明式硬切正文（含旧占位声明或剪辑硬切声明）转化为可执行的视频生成提示词。
+
+    确保进入 I2V 模型的提示词包含明确的运镜与画面过渡指令，而不是「不生成片段」的免责声明。
+    """
+    text = str(prompt or '').strip()
+    if not text:
+        return (f"Use IMAGE {start_slot} as first frame and IMAGE {end_slot} as last frame. "
+                f"A continuous camera move executes the threshold crossing: the closed entry seen in "
+                f"IMAGE {start_slot} is pushed open on camera, the camera moves smoothly through it "
+                f"into the interior space, and settles fully inside matching IMAGE {end_slot}.")
+
+    # 1. 标准占位声明模板（纯免责文本）
+    if 'DECLARED HARD CUT - no video clip is generated' in text or 'the final film cuts directly from the previous IMAGE' in text:
+        return (f"Use IMAGE {start_slot} as first frame and IMAGE {end_slot} as last frame. "
+                f"A continuous camera move executes the threshold crossing: the sealed entry seen in "
+                f"IMAGE {start_slot} is pushed open on camera, the camera moves coaxially forward through "
+                f"it into the interior space, and settles fully inside matching IMAGE {end_slot}. "
+                f"Exposure and white balance adjust smoothly; sterile of workers.")
+
+    # 2. 纯粹的否定句（如 intentional editorial cut, no camera travel）
+    text_lower = ' '.join(text.lower().split())
+    if any(k in text_lower for k in ('not an interpolated transformation', 'no generated in-between', 'no camera travel', '不做插值', '禁止插值', '不生成过渡')) and len(text) < 200:
+        return (f"Use IMAGE {start_slot} as first frame and IMAGE {end_slot} as last frame. "
+                f"The camera executes a direct crossing transition from IMAGE {start_slot} to IMAGE {end_slot}, "
+                f"smoothly shifting exposure and perspective to settle fully into the new space matching IMAGE {end_slot}.")
+
+    # 3. 前缀带有 DECLARED HARD CUT / no video clip 开头但后文有丰富动作
+    cleaned = re.sub(
+        r'^\s*DECLARED HARD CUT\s*[-—:]\s*(no\s+[^;:]*clip is generated for this slot;?\s*)?',
+        '',
+        text,
+        flags=re.IGNORECASE
+    ).strip()
+    if cleaned != text and cleaned:
+        if not re.search(r'\bIMAGE\s*1\b', cleaned, re.IGNORECASE) and not re.search(r'\bIMAGE\s*\d+\b', cleaned, re.IGNORECASE):
+            return f"Use IMAGE {start_slot} as first frame and IMAGE {end_slot} as last frame. {cleaned}"
+        return cleaned
+
+    return text
+
+
 def rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=None):
     """把提示词里的 IMAGE start_slot / IMAGE slot+1（含中文「图片 N」）改写为
     IMAGE 1 / IMAGE 2，对应 Google Labs Flow 两卡位（首帧/尾帧）UI。start_slot 默认
     等于 slot（含单一过门拍——起止帧绑定和普通拍完全一样，无需重定向）；参数保留
     作为通用覆盖钩子。"""
     start_slot = slot if start_slot is None else start_slot
+    prompt = sanitize_cut_video_prompt(prompt, start_slot=start_slot, end_slot=slot + 1)
     prompt = re.sub(rf'\bimage\s+{start_slot}\b', 'IMAGE 1', prompt, flags=re.IGNORECASE)
     prompt = re.sub(rf'\bimage\s+{slot + 1}\b', 'IMAGE 2', prompt, flags=re.IGNORECASE)
     prompt = re.sub(rf'图片\s*{start_slot}\b', 'IMAGE 1', prompt)
@@ -648,7 +691,7 @@ def _is_declared_editorial_cut(body, meta=''):
 
 def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, target_slots=None,
                       strict=False, verify_fn=None, gate_level='standard', stale_slots=None,
-                      override_flagged=False):
+                      override_flagged=False, existing_videos=None):
     """为每个视频槽位做生成决策。只读文件系统，不做任何写操作，可单测。
 
     video_slots: _parse_prompt_slots 的 videos 输出（{slot: str 或 {'body':...}}）
@@ -664,6 +707,7 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
       范畴，强推只会浪费视频生成额度。（2026-07-30 核实：这个值自 f5a003b 起已无
       生产方，该门禁如今只对旧 manifest 生效，见下方分支上的注释。）True 时改判
       'generate' 并落一条 warning 说明是人工确认风险后强制放行的。
+    existing_videos: 当前 manifest 里的 videos 列表，用于识别手动上传、手动换位和已完成的槽位。
 
     返回按槽位升序的计划列表，每项：
       slot / seq / prompt（已改写 IMAGE 1/2）/ dest_path
@@ -681,22 +725,25 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
         wanted = {int(x) for x in target_slots}
         slots = [s for s in slots if s in wanted]
     is_explicit_retry = target_slots is not None
+    existing_by_slot = {
+        v['slot']: v for v in (existing_videos or [])
+        if isinstance(v, dict) and 'slot' in v
+    }
 
     plans = []
     for seq, slot in enumerate(slots, start=1):
         item = video_slots[slot]
         prompt = item['body'] if isinstance(item, dict) else item
         meta = str(item.get('meta', '') if isinstance(item, dict) else '').upper()
-        # 旧单的硬切占位声明按原始正文识别（改写 IMAGE 编号之前），见下方 skip_cut 分支。
-        is_legacy_cut_placeholder = _is_legacy_hard_cut_placeholder(prompt)
-        is_editorial_cut = _is_declared_editorial_cut(prompt, meta)
         # 英雄展示视频（[HERO]，默认收尾步骤）：唯一来源锚点是帧序列最后一张整体
         # 完工图，没有独立的"下一张"结束帧可绑定——只上传首帧，走单图生视频
         # （见 prompt_pipeline._compose_hero_showcase_video），不设结束锚点。
         is_hero = 'HERO' in meta
 
-        # 单一过门拍（[BRIDGE]/[BRIDGE TURN]）：本拍的 VIDEO 是过门唯一可见片段，
-        # 起止帧绑定和普通拍完全一样（IMAGE slot -> IMAGE slot+1），无需重定向。
+        # 单一过门拍（[BRIDGE]/[BRIDGE TURN]）与声明式硬切槽位（[CUT]）：
+        # 本拍的 VIDEO 是过门/过渡可见片段，起止帧绑定和普通拍完全一样（IMAGE slot -> IMAGE slot+1）。
+        # 所有声明式硬切槽位照常生成视频（提示词已由 rewrite_prompt_for_two_card_ui 清洗为可执行的运镜动作），
+        # 绝不跳过生成。
         start_slot = slot
 
         prompt = rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=start_slot)
@@ -716,27 +763,32 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
             'meta': meta,
         }
 
-        # 声明式切入槽位（[CUT]，TBCP v2 hard_cut 变体）现在照常生成视频：正文是一段
-        # 普通的过门跨越镜头（门在片段里被推开、镜头推进入内），起止帧绑定与普通拍一致。
-        # 2026-07-30 之前该槽被无条件跳过，成片在过门处只有两张静帧硬拼，用户看到的就是
-        # "过门硬切镜头不生成"。
-        #
-        # 唯一仍然跳过的是切换前落盘的旧单：它们的正文是占位声明本身
-        # （prompt_pipeline.HARD_CUT_VIDEO_PLACEHOLDER，开头即 'DECLARED HARD CUT'），
-        # 拿这段声明去送 i2v 只会得到一段照读声明的废片。按正文识别而不是按 [CUT] 标签
-        # 识别——标签在新单里保留着别的用途（帧渲染的 t2i 新链头、族锚、审查豁免）。
-        if is_legacy_cut_placeholder or is_editorial_cut:
-            plan['action'] = 'skip_cut'
-            cut_kind = '声明式剪辑硬切' if is_editorial_cut else '旧单的硬切占位槽位'
-            plan['reason'] = f"视频 {slot} 是{cut_kind}：不提交 I2V，成片在此处直接硬切。"
-            plans.append(plan)
-            continue
-
+        existing_entry = existing_by_slot.get(slot)
         existing = os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
         if not is_explicit_retry and existing:
-            # 断点续传：已存在的视频仍须与当前锚点帧内容一致才复用——起止帧可能在
-            # 上一轮失败后被单独重渲（retrySingleFrame），旧片段这时已经过期，
-            # 复用会重蹈 spark-video-mixup-postmortem 那类串片问题，须按缺失处理重渲。
+            # 1. 手动上传的视频（/api/upload_video 已做过校验/force 确认）：直接信任复用，不重新验锚点
+            if existing_entry and (existing_entry.get('source') == 'manual_upload' or existing_entry.get('model') == 'manual_upload'):
+                plan['action'] = 'reuse'
+                plans.append(plan)
+                continue
+            # 2. 人工手动换位/复制的视频（/api/swap_video_slots）：直接信任人工排布，不重新验锚点
+            if existing_entry and (existing_entry.get('source') == 'manual_swap' or existing_entry.get('swapped_from_slot') is not None or existing_entry.get('swapped_from_sequence') is not None):
+                plan['action'] = 'reuse'
+                plans.append(plan)
+                continue
+            # 3. 显式确认风险覆盖锚点不一致的视频：信任用户确认
+            if existing_entry and existing_entry.get('anchor_mismatch_overridden'):
+                plan['action'] = 'reuse'
+                plans.append(plan)
+                continue
+            # 4. 历史已成功生成的视频：若其起止锚点帧均未被重新生成（非 stale_slots），直接复用
+            has_stale_anchor = bool(stale_slots and (start_slot in stale_slots or ((slot + 1) in stale_slots)))
+            if existing_entry and existing_entry.get('status') == 'success' and not has_stale_anchor:
+                plan['action'] = 'reuse'
+                plans.append(plan)
+                continue
+
+            # 5. 其余已有视频（如起止帧重渲过导致血统过期，或未登记在清单的残留文件）：核对首尾帧锚点
             ok, verify_reason = verify_fn(dest_path, start_p, end_p, strict=strict)
             if ok:
                 plan['action'] = 'reuse'
@@ -918,10 +970,12 @@ class _ManifestWriter:
         self.save()
 
     def save(self):
-        by_slot = {v['slot']: v for v in self.data.get('videos', [])}
+        by_slot = {v['slot']: v for v in self.data.get('videos', []) if isinstance(v, dict) and 'slot' in v}
         for v in self.results:
-            by_slot[v['slot']] = v
-        self.data['videos'] = [by_slot[s] for s in self.all_slots if s in by_slot]
+            if isinstance(v, dict) and 'slot' in v:
+                by_slot[v['slot']] = v
+        all_known_slots = sorted(set(self.all_slots) | set(by_slot.keys()))
+        self.data['videos'] = [by_slot[s] for s in all_known_slots if s in by_slot]
         # 视频阶段的能力印章：numpy/ffmpeg 缺失时防串片的首尾帧锚点校验、i2v 帧对
         # 契约、冻结检测全都静默跳过（返回 'skipped'/False，不拦截也不报错）。每次
         # 落盘都重盖一次，环境中途变化也能如实反映（stamp 内部按阶段覆盖，不累积）。
@@ -1179,11 +1233,13 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     frame_canvas_uuids = load_frame_canvas_uuids(manifest_data, slot_to_path)
     canvas_project_url = str(manifest_data.get('google_fx_project_url') or '').strip()
 
+    existing_videos = manifest_data.get('videos', [])
     plans = plan_video_slots(videos, slot_to_path, slot_to_quality, videos_dir, target_slots,
                               strict=strict_gates_enabled(config),
                               gate_level=qa_gate_level(config),
                               stale_slots=load_stale_slots(manifest_data),
-                              override_flagged=override_flagged)
+                              override_flagged=override_flagged,
+                              existing_videos=existing_videos)
 
     if on_progress:
         on_progress('start', {
@@ -1208,6 +1264,7 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
         video_duration = None
     writer = _ManifestWriter(manifest_path, manifest_data, videos.keys())
     run_bridges = []
+    existing_by_slot = {v['slot']: v for v in existing_videos if isinstance(v, dict) and 'slot' in v}
 
     # 按计划分流：复用/拦截立即出结果，待生成的装配为批量请求
     pending_items = []
@@ -1223,7 +1280,29 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                 })
             continue
         if plan['action'] == 'reuse':
-            info = _video_info(plan, video_model, status='success')
+            existing_info = existing_by_slot.get(plan['slot'])
+            if existing_info:
+                info = dict(existing_info)
+                info['slot'] = plan['slot']
+                info['sequence'] = plan['seq']
+                info['status'] = 'success'
+                rel, url = _rel_url(plan['dest_path'])
+                info['file'] = rel
+                info['url'] = url
+                if not info.get('model'):
+                    info['model'] = video_model
+                if not info.get('prompt'):
+                    info['prompt'] = plan['prompt']
+                if not info.get('start_anchor_slot'):
+                    info['start_anchor_slot'] = plan.get('start_anchor_slot', plan['slot'])
+                if 'meta' not in info:
+                    info['meta'] = plan.get('meta', '')
+                if 'is_hero' not in info:
+                    info['is_hero'] = 'HERO' in str(plan.get('meta', '')).upper()
+                if 'clip_speed' not in info:
+                    info['clip_speed'] = _clip_speed_from_meta(plan.get('meta', ''))
+            else:
+                info = _video_info(plan, video_model, status='success')
             writer.record(info)
             if on_progress:
                 on_progress('video_done', {
@@ -2047,9 +2126,9 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
             if not os.path.exists(abs_path):
                 missing.append(slot)
                 continue
-            # 手动上传和显式风险覆盖在落盘前都已经得到用户确认。这里再复查会让 force
+            # 手动上传、手动换位和显式风险覆盖在落盘前都已经得到用户确认。这里再复查会让 force
             # 形同虚设（下载阶段保留，合并阶段却再次拦下），因此直接信任并保留审计字段。
-            if v.get('source') == 'manual_upload' or v.get('anchor_mismatch_overridden'):
+            if v.get('source') in ('manual_upload', 'manual_swap') or v.get('model') == 'manual_upload' or v.get('swapped_from_slot') is not None or v.get('swapped_from_sequence') is not None or v.get('anchor_mismatch_overridden'):
                 good[slot] = abs_path
                 continue
             # start_anchor_slot 现在总是等于 slot（单一过门拍起止帧绑定和普通拍一样）；
@@ -2075,8 +2154,8 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
             if hero_v.get('status') == 'success' and hero_v.get('file'):
                 hero_abs = _resolve_abs(hero_v['file'])
                 if os.path.exists(hero_abs):
-                    if hero_v.get('source') == 'manual_upload':
-                        # 手动上传同样信任 /api/upload_video 已做过的锚点校验/force 确认。
+                    if hero_v.get('source') in ('manual_upload', 'manual_swap') or hero_v.get('model') == 'manual_upload' or hero_v.get('swapped_from_slot') is not None or hero_v.get('anchor_mismatch_overridden'):
+                        # 手动上传/换位同样信任已做过的锚点校验/force 确认。
                         good[hero_slot] = hero_abs
                         expected_slots = expected_slots + [hero_slot]
                     else:

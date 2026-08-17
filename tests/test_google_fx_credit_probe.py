@@ -258,3 +258,68 @@ def test_is_google_login_page():
         inner_text="Try signing in with a different account.",
     )
     assert is_google_login_page(p4) is True
+
+
+def test_is_credit_exhausted_message_comprehensive():
+    # 英文关键词与变体
+    assert credit.is_credit_exhausted_message("Out of credits") is True
+    assert credit.is_credit_exhausted_message("You've run out of credits") is True
+    assert credit.is_credit_exhausted_message("You have run out of credits to generate video") is True
+    assert credit.is_credit_exhausted_message("Insufficient credits") is True
+    assert credit.is_credit_exhausted_message("Not enough credits to continue") is True
+    assert credit.is_credit_exhausted_message("No credits left in your account") is True
+    assert credit.is_credit_exhausted_message("0 credits remaining") is True
+    assert credit.is_credit_exhausted_message("Credits: 0") is True
+    assert credit.is_credit_exhausted_message("0 Google Flow credits") is True
+    assert credit.is_credit_exhausted_message("Resource_exhausted: quota exceeded") is True
+    assert credit.is_credit_exhausted_message("Upgrade plan to get more credits") is True
+
+    # 中文关键词与变体
+    assert credit.is_credit_exhausted_message("当前账号积分不足") is True
+    assert credit.is_credit_exhausted_message("没有足够的积分生成视频") is True
+    assert credit.is_credit_exhausted_message("积分已用完") is True
+    assert credit.is_credit_exhausted_message("点数不足") is True
+    assert credit.is_credit_exhausted_message("点数已用完") is True
+    assert credit.is_credit_exhausted_message("额度不足") is True
+    assert credit.is_credit_exhausted_message("额度耗尽") is True
+    assert credit.is_credit_exhausted_message("配额已耗尽") is True
+    assert credit.is_credit_exhausted_message("剩余 0 积分") is True
+    assert credit.is_credit_exhausted_message("积分: 0") is True
+    assert credit.is_credit_exhausted_message("点数余额为 0") is True
+
+    # 正常非积分耗尽报错
+    assert credit.is_credit_exhausted_message("未找到底部配置按钮") is False
+    assert credit.is_credit_exhausted_message("网络连接超时") is False
+    assert credit.is_credit_exhausted_message("Target page is closed") is False
+    assert credit.is_credit_exhausted_message("") is False
+
+
+def test_detect_page_credit_exhaustion():
+    class DummyDialogPage:
+        def __init__(self, dialog_texts=None, credit_text=None):
+            self.dialog_texts = dialog_texts or []
+            self.credit_text = credit_text
+
+        def evaluate(self, script):
+            return self.dialog_texts
+
+        def locator(self, selector):
+            return _Locator([self.credit_text] if self.credit_text else [])
+
+    # 1. 弹窗命中积分耗尽
+    p1 = DummyDialogPage(dialog_texts=["You've run out of credits\nUpgrade now to continue creating."])
+    res1 = credit.detect_page_credit_exhaustion(p1)
+    assert res1 is not None
+    assert "页面提示积分耗尽" in res1
+    assert "You've run out of credits" in res1
+
+    # 2. 顶栏/菜单显示 0 积分
+    p2 = DummyDialogPage(dialog_texts=[], credit_text="0 Google Flow credits")
+    res2 = credit.detect_page_credit_exhaustion(p2)
+    assert res2 is not None
+    assert "0" in res2
+
+    # 3. 正常页面
+    p3 = DummyDialogPage(dialog_texts=[], credit_text="1050 Google Flow credits")
+    res3 = credit.detect_page_credit_exhaustion(p3)
+    assert res3 is None

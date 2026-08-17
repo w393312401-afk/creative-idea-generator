@@ -62,6 +62,14 @@
       "enforcer": "prompt_pipeline:check_shot_family_leakage"
     },
     {
+      "id": "threshold-monotonic-inheritance",
+      "level": "P0",
+      "scope": "image",
+      "summary": "过门时空单调继承：进门首帧 IMAGE T+1 必须继承室外已完成的屋面与地坪施工，严禁天花板与地面状态倒退",
+      "source": "references/threshold-bridge-consistency-protocol.md#6",
+      "enforcer": "prompt_pipeline:check_threshold_monotonic_inheritance"
+    },
+    {
       "id": "image-clean-frame",
       "level": "P0",
       "scope": "image",

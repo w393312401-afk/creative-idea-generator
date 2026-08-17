@@ -111,10 +111,12 @@
          它复用那两张表的工具栏/芯片视觉语言，只补自己的列表与详情栏。 -->
     <link rel="stylesheet" href="css/projects.css?v=1.3.0">
     <link rel="stylesheet" href="css/app/stepped_pipeline.css?v=1.0.0">
-    <link rel="stylesheet" href="css/app/replica.css?v=1.3.0">
+    <link rel="stylesheet" href="css/app/replica.css?v=2.0.2">
+    <link rel="stylesheet" href="css/app/prompt_linter.css?v=1.0.0">
+    <link rel="stylesheet" href="css/app/collage_viewer.css?v=1.0.0">
     <!-- 顶部工作区标签栏的自定义（排序 / 隐藏）。排在 panels-tabs.css 之后：
          它要覆盖 .mobile-nav-btn 的显示规则并给标签栏加定位上下文。 -->
-    <link rel="stylesheet" href="css/app/nav-customize.css?v=1.0.0">
+    <link rel="stylesheet" href="css/app/nav-customize.css?v=1.0.1">
     <link rel="stylesheet" href="css/shared/lightbox.css?v=1.2.1">
 </head>
 <body>
@@ -659,6 +661,10 @@
                                         <span style="font-size:16px">🪜</span>
                                         <span>分步合成</span>
                                     </button>
+                                    <button id="pipeline-frames-selection-btn" class="action-btn text-btn menu-item" title="4选1 智能生成：每帧一次性制作4张候选图，AI模型鉴别最好的一张作为后续参考，依次迭代生成">
+                                        <span style="font-size:16px">🎯</span>
+                                        <span>4选1 智能帧序列</span>
+                                    </button>
                                 </div>
                             </div>
                         </div>
@@ -777,6 +783,7 @@
                                         <input type="number" id="frames-debug-count" min="1" max="99" value="3" disabled>
                                         <span>帧</span>
                                     </div>
+                                    <button id="generate-frames-selection-btn" class="action-btn text-btn mini-btn" style="color:var(--accent-orange, #f59e0b); border-color:rgba(245,158,11,0.4);" title="4选1 智能生成：每帧一次性制作4张候选图，AI模型鉴别最好的一张作为后续参考，依次迭代生成">🎯 4选1 智能生成</button>
                                     <button id="run-sequence-review-btn" class="action-btn text-btn mini-btn" title="整套序列渲染完成后，手动检查跨帧施工顺序/空间一致性（不会自动运行，也不会阻塞视频生成）。增量：帧图自上次审查后没变的拍直接沿用结论，只重审变过的那几拍">🔍 一致性审查</button>
                                     <!-- 全量重审：跨帧层是按窗口切的，某一帧的改动理论上可能影响别的
                                          窗口里的判断；增量只重跑覆盖失效拍的那几个窗口，这个入口留给
@@ -824,9 +831,14 @@
                                         <span class="slot-toolbar-group">
                                             <button type="button" class="slot-filter-btn is-active" data-filter="all">全部</button>
                                             <button type="button" class="slot-filter-btn" data-filter="flagged">只看有问题</button>
+                                            <button type="button" class="slot-filter-btn" data-filter="dirty">已改动</button>
                                             <button type="button" class="slot-filter-btn" data-filter="missing">未生成</button>
                                         </span>
                                         <button type="button" class="slot-jump-btn" title="滚到第一个有问题的槽位" hidden>⚠ 跳到第一个问题</button>
+                                        <!-- 一键重渲已改动帧：自动按帧号依次重新生成所有提示词被改过的帧 -->
+                                        <button type="button" class="slot-retry-dirty-btn" title="一键按帧号依次重新生成所有提示词已改动的帧" hidden>⚡ 重渲已改动帧</button>
+                                        <!-- 交互式多宫格检查器：放大镜 / 邻帧对比 / 地平透视对齐 -->
+                                        <button type="button" class="slot-collage-btn" title="打开交互式 5 列多宫格检查器（放大镜 / 邻帧对比 / 地平透视对齐）" hidden>🖼️ 多宫格检查器</button>
                                         <!-- 一键全部修复：把所有画着「修复此帧问题」的格子（一致性审查未过
                                              或人工标记）按帧号依次走一遍定向修复。没有待修帧时自动隐藏。 -->
                                         <button type="button" class="slot-fix-all-btn" title="按帧号依次修复所有带待修问题的帧（一致性审查未过 + 人工标记）：逐帧优化提示词后图生图重渲，并对着新画面复核" hidden>🛠 全部修复</button>
@@ -1002,7 +1014,13 @@
                                 <div class="prompt-header">
                                     <span>📋 复制即用提示词集 · 图片 1–N+1 / 视频 1–N</span>
                                     <span class="prompt-header-actions">
+                                        <button type="button" class="action-btn text-btn prompt-fold-btn" id="toggle-fold-all-prompts-btn" title="一键全部折叠或展开图片与视频提示词">
+                                            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"></polyline><polyline points="20 10 14 10 14 4"></polyline><line x1="14" y1="10" x2="21" y2="3"></line><line x1="3" y1="21" x2="10" y2="14"></line></svg>
+                                            <span>全部折叠</span>
+                                        </button>
                                         <button type="button" class="action-btn text-btn prompt-edit-btn" id="edit-prompt-btn" title="手动改写这一单的提示词集：可逐条修改正文，也可在末尾追加新的一拍">✏️ 手动编辑</button>
+                                        <button type="button" class="action-btn text-btn prompt-edit-btn" id="auto-fix-prompt-btn" title="自动识别并修复 Markdown 标题（####）、多余符号、中英文标签或全角冒号，规整为标准提示词槽位格式" hidden>✨ 自动修复格式</button>
+                                        <button type="button" class="action-btn text-btn prompt-edit-btn" id="prompt-history-btn" title="查看提示词的历史修改版本与差异对比">📜 历史版本</button>
                                         <button type="button" class="action-btn text-btn prompt-edit-btn" id="add-beat-btn" title="在末尾追加一拍：自动补上「图片 N+1」与对应的「视频 N」骨架，填好正文再保存" hidden>➕ 添加一拍</button>
                                         <button type="button" class="action-btn text-btn prompt-edit-btn primary" id="save-prompt-edit-btn" title="校验槽位契约后保存，并把提示词改过的帧标为待重渲" hidden>💾 保存</button>
                                         <button type="button" class="action-btn text-btn prompt-edit-btn" id="cancel-prompt-edit-btn" title="放弃本次改动" hidden>✖ 取消</button>
@@ -1011,7 +1029,7 @@
                                         </button>
                                     </span>
                                 </div>
-                                <pre class="prompt-pre" id="idea-prompt-block">在左侧选择维度并点击「激发」，这里会输出经 gemini-veo / omni-restoration-composer skill 合成的完整图片 / 视频提示词集。</pre>
+                                <div class="prompt-display-container prompt-pre" id="idea-prompt-block">在左侧选择维度并点击「激发」，这里会输出经 gemini-veo / omni-restoration-composer skill 合成的完整图片 / 视频提示词集。</div>
                                 <textarea class="prompt-editor" id="idea-prompt-editor" spellcheck="false" hidden></textarea>
                                 <p class="prompt-edit-hint" id="prompt-edit-hint" hidden>
                                     「图片 N:」的条数就是帧槽位数，槽位号必须从 1 连续编到 N；「视频 N」对应 IMG N → IMG N+1，槽位号只能落在 1–N 内。
@@ -1032,7 +1050,20 @@
             <!-- Image Studio Workspace: free-form text-to-image / image-to-image generator,
                  folded in from the former standalone /image-service-station/ page. -->
             <section class="panel-image-studio glass-panel" id="panel-image-studio">
-                <div class="imgstudio-grid">
+                <!-- Mobile Subview Segment Navigation (<= 768px) -->
+                <div class="imgstudio-mobile-nav" id="imgstudio-mobile-nav">
+                    <button type="button" class="imgstudio-mobile-nav-btn active" id="imgstudio-mobtab-create" onclick="switchImageStudioMobileView('create')">
+                        <span class="mobnav-icon">✏️</span>
+                        <span class="mobnav-text">创作参数</span>
+                    </button>
+                    <button type="button" class="imgstudio-mobile-nav-btn" id="imgstudio-mobtab-result" onclick="switchImageStudioMobileView('result')">
+                        <span class="mobnav-icon">🖼️</span>
+                        <span class="mobnav-text">渲染结果</span>
+                        <span class="imgstudio-mobile-badge" id="imgstudio-mobile-active-badge" style="display: none;">0</span>
+                    </button>
+                </div>
+
+                <div class="imgstudio-grid" data-mobile-view="create">
                     <!-- Controls Card -->
                     <div class="imgstudio-card" id="imgstudio-controls">
                         <div class="panel-header">
@@ -1041,8 +1072,8 @@
                         </div>
 
                         <div class="panel-header-tabs">
-                            <button class="panel-tab-btn active" id="imgstudio-tab-t2i" onclick="switchImageStudioTab('t2i')">文生图 (Text-to-Image)</button>
-                            <button class="panel-tab-btn" id="imgstudio-tab-i2i" onclick="switchImageStudioTab('i2i')">图生图 (Image-to-Image)</button>
+                            <button class="panel-tab-btn active" id="imgstudio-tab-t2i" onclick="switchImageStudioTab('t2i')">文生图<span class="tab-en"> (Text-to-Image)</span></button>
+                            <button class="panel-tab-btn" id="imgstudio-tab-i2i" onclick="switchImageStudioTab('i2i')">图生图<span class="tab-en"> (Image-to-Image)</span></button>
                         </div>
 
                         <div class="panel-body">
@@ -1053,6 +1084,7 @@
                                     <div class="model-select-wrapper">
                                         <select id="t2i-model" class="styled-select" translate="no">
                                             <option value="nano-banana-2" selected>🍌 Nano Banana 2</option>
+                                            <option value="gpt-image-2">gpt-image-2 (GPT / codex 通道)</option>
                                         </select>
                                     </div>
                                 </div>
@@ -1086,27 +1118,27 @@
                                     <div class="aspect-ratio-grid" id="t2i-ratio-selector" translate="no">
                                         <div class="ratio-card" data-ratio="1:1">
                                             <div class="ratio-box ratio-1-1"></div>
-                                            <span class="ratio-text">1:1 (社交头像)</span>
+                                            <span class="ratio-text">1:1<span class="ratio-hint"> (社交头像)</span></span>
                                         </div>
                                         <div class="ratio-card" data-ratio="9:16">
                                             <div class="ratio-box ratio-9-16"></div>
-                                            <span class="ratio-text">9:16 (手机壁纸/抖音)</span>
+                                            <span class="ratio-text">9:16<span class="ratio-hint"> (手机壁纸/抖音)</span></span>
                                         </div>
                                         <div class="ratio-card active" data-ratio="16:9">
                                             <div class="ratio-box ratio-16-9"></div>
-                                            <span class="ratio-text">16:9 (电脑壁纸/视频)</span>
+                                            <span class="ratio-text">16:9<span class="ratio-hint"> (电脑壁纸/视频)</span></span>
                                         </div>
                                         <div class="ratio-card" data-ratio="3:2">
                                             <div class="ratio-box ratio-3-2"></div>
-                                            <span class="ratio-text">3:2 (标准相机)</span>
+                                            <span class="ratio-text">3:2<span class="ratio-hint"> (标准相机)</span></span>
                                         </div>
                                         <div class="ratio-card" data-ratio="2:3">
                                             <div class="ratio-box ratio-2-3"></div>
-                                            <span class="ratio-text">2:3 (海报肖像)</span>
+                                            <span class="ratio-text">2:3<span class="ratio-hint"> (海报肖像)</span></span>
                                         </div>
                                         <div class="ratio-card" data-ratio="21:9">
                                             <div class="ratio-box ratio-21-9"></div>
-                                            <span class="ratio-text">21:9 (宽幅电影)</span>
+                                            <span class="ratio-text">21:9<span class="ratio-hint"> (宽幅电影)</span></span>
                                         </div>
                                     </div>
                                 </div>
@@ -1115,15 +1147,15 @@
                                     <label class="group-title">生图清晰度 (Resolution Quality)</label>
                                     <div class="quality-grid" id="t2i-quality-selector" translate="no">
                                         <div class="quality-card" data-quality="1K">
-                                            <span class="quality-title">1K (Standard)</span>
+                                            <span class="quality-title">1K<span class="quality-hint"> (Standard)</span></span>
                                             <span class="quality-desc">标准画质 (1024px)</span>
                                         </div>
                                         <div class="quality-card active" data-quality="2K">
-                                            <span class="quality-title">2K (Medium)</span>
+                                            <span class="quality-title">2K<span class="quality-hint"> (Medium)</span></span>
                                             <span class="quality-desc">中等清晰 (2048px/推荐)</span>
                                         </div>
                                         <div class="quality-card" data-quality="4K">
-                                            <span class="quality-title">4K (HD)</span>
+                                            <span class="quality-title">4K<span class="quality-hint"> (HD)</span></span>
                                             <span class="quality-desc">高清画质 (4096px)</span>
                                         </div>
                                     </div>
@@ -1152,7 +1184,10 @@
                                             <line x1="12" y1="5" x2="12" y2="13"></line>
                                             <polyline points="9 8 12 5 15 8"></polyline>
                                         </svg>
-                                        <p class="upload-text">拖拽图片到此处，或<span>点击上传</span></p>
+                                        <p class="upload-text">
+                                            <span class="upload-text-desktop">拖拽图片到此处，或<span>点击上传</span></span>
+                                            <span class="upload-text-mobile"><span>点击选择图片</span>或拍照</span>
+                                        </p>
                                         <p class="upload-hint">支持 PNG, JPG, JPEG, WEBP 格式，可上传多张进行多参考图生图</p>
                                         <input type="file" id="i2i-file-input" multiple accept="image/*" style="display: none;">
                                     </div>
@@ -1180,7 +1215,7 @@
                                         <div class="aspect-ratio-grid" id="i2i-ratio-selector" translate="no">
                                             <div class="ratio-card active" data-ratio="auto">
                                                 <div class="ratio-box ratio-auto">A</div>
-                                                <span class="ratio-text">自动适应 (Auto)</span>
+                                                <span class="ratio-text">自动适应<span class="ratio-hint"> (Auto)</span></span>
                                             </div>
                                             <div class="ratio-card" data-ratio="1:1">
                                                 <div class="ratio-box ratio-1-1"></div>
@@ -1232,7 +1267,7 @@
                             <button type="button" id="imgstudio-generate-btn" class="gradient-submit-btn">
                                 <span class="btn-icon">⚡</span>
                                 <span class="btn-text">开始生成意象 (Generate)</span>
-                                <span class="btn-shortcut-hint" style="display: block; font-size: 11px; font-weight: normal; opacity: 0.8; margin-top: 2px;">Ctrl + Enter</span>
+                                <span class="btn-shortcut-hint">Ctrl + Enter</span>
                             </button>
                         </div>
                     </div>
@@ -1353,6 +1388,7 @@
                             <button type="button" id="export-all-btn" class="projects-tool-btn" title="把整个点子库导出成 JSON">全部导出</button>
                             <input type="file" id="import-file" style="display: none;" accept=".json">
                             <button type="button" id="projects-clear-completed-btn" class="projects-tool-btn" title="删除所有已完成的任务记录（不影响已收藏的创意与磁盘素材）">🧹 清空已完成</button>
+                            <button type="button" id="projects-clear-nocover-btn" class="projects-tool-btn" title="删除所有无封面图的任务记录（未生成封面或无封面资产，不影响已收藏的创意与磁盘素材）">🧹 清空无封面</button>
                             <button type="button" id="projects-clear-failed-btn" class="projects-tool-btn danger" title="删除所有失败/已取消的任务记录">🗑️ 清空失败</button>
                         </div>
                     </div>
@@ -1786,6 +1822,31 @@
 
     <!-- Toast Notification Container -->
     <!-- Toast Notification Container -->
+        <!-- Candidate Selection Modal: 4选1 候选图对比与 AI 评审详情 -->
+    <div class="modal" id="candidate-selection-modal" style="display:none;">
+        <div class="modal-content glass-panel modal-wide" style="max-width: 960px;">
+            <div class="modal-header">
+                <div class="modal-title-wrap" style="display:flex; align-items:center; gap:10px;">
+                    <h3>🎯 帧候选对比与 AI 鉴别详情</h3>
+                    <span class="modal-subtitle" id="candidate-modal-seq" style="font-size:13px; color:var(--text-secondary); background:var(--bg-card); padding:2px 8px; border-radius:6px;">IMG 001</span>
+                </div>
+                <button id="candidate-selection-close-btn" class="close-btn">&times;</button>
+            </div>
+            <div class="modal-body candidate-modal-body">
+                <div class="candidate-ai-summary card-dark" id="candidate-ai-summary" style="margin-bottom: 16px; padding: 12px 16px; border-radius: 8px; border: 1px solid var(--border-glass);">
+                    <div class="candidate-ai-head" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                        <span style="font-weight:600; color:var(--text-primary);">🤖 AI 鉴别优选结论</span>
+                        <span class="candidate-chosen-badge" id="candidate-modal-chosen-tag" style="background:#10b981; color:#fff; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:600;">已采用候选 #1</span>
+                    </div>
+                    <p id="candidate-modal-reason" style="font-size:13px; color:var(--text-secondary); margin:0; line-height:1.6;">暂无 AI 鉴别记录</p>
+                </div>
+                <div class="candidates-grid" id="candidates-modal-grid" style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px;">
+                    <!-- Candidate Cards rendered dynamically -->
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div id="toast-container" class="toast-container"></div>
 
     <!-- 日志静息态：右下角状态胶囊。日志 90% 的时间只需要回答"有没有出问题"，
@@ -1884,12 +1945,15 @@
     <script src="js/api_client.js?v=1.9.0" defer></script>
     <script src="js/prompt_pipeline.js?v=1.2.6" defer></script>
     <script src="js/stepped_pipeline.js?v=1.0.0" defer></script>
-    <script src="js/replica_pipeline.js?v=1.3.0" defer></script>
-    <script src="js/prompt_editor.js?v=1.0.0" defer></script>
-    <script src="js/prompt_import.js?v=1.0.0" defer></script>
+    <script src="js/replica_pipeline.js?v=2.0.2" defer></script>
+    <script src="js/prompt_history.js?v=1.0.0" defer></script>
+    <script src="js/prompt_linter.js?v=1.0.0" defer></script>
+    <script src="js/collage_viewer.js?v=1.0.0" defer></script>
+    <script src="js/prompt_import.js?v=1.0.1" defer></script>
+    <script src="js/prompt_editor.js?v=1.0.1" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
     <script src="js/media_renderer.js?v=1.11.0" defer></script>
-    <script src="app.js?v=1.6.3" defer></script>
+    <script src="app.js?v=1.6.4" defer></script>
     <script src="js/image_studio.js?v=1.0.4" defer></script>
     <script src="js/gallery.js?v=1.3.0" defer></script>
     <script src="js/ledger.js?v=1.3.0" defer></script>
@@ -1898,7 +1962,7 @@
     <script src="js/projects.js?v=1.2.1" defer></script>
     <!-- 顶部标签栏自定义（排序 / 隐藏）。纯 DOM 层改造，不依赖任何业务模块，
          只要求 .mobile-nav-tabs 已经在文档里 -->
-    <script src="js/nav_customize.js?v=1.0.0" defer></script>
+    <script src="js/nav_customize.js?v=1.0.1" defer></script>
     <!-- 旧「移动端标签切换」内联脚本已删除：它指向早已不存在的 mobile-tab-left/right，
          MutationObserver 永远空转；自动切换结果面板改由 app.js 的 switchMainTab('results') 完成 -->
 

@@ -65,6 +65,25 @@ def test_account_login_failures_switch_account(message):
     assert "登录" in verdict
 
 
+@pytest.mark.parametrize("message", [
+    "第 1 张图生成失败: 页面提示积分耗尽: You've run out of credits",
+    "第 1 张图生成失败: 账号积分余额为 0",
+    "INSUFFICIENT_CREDITS: 账号菜单/顶栏显示积分耗尽: 0 credits remaining",
+    "INSUFFICIENT_CREDITS: 当前账号积分不足",
+    "QUOTA_EXHAUSTED: resource_exhausted",
+    "超时未捕获到 URL（积分不足）",
+    "Generate 后未检测到新 tile（页面提示积分耗尽: out of credits）",
+    "0 credits left",
+    "点数已用完",
+    "额度耗尽",
+])
+def test_credit_exhausted_failures_switch_account(message):
+    """积分/配额耗尽类错误：即便包含'超时'等自动化词汇，也必须优先判定换号。"""
+    should_switch, verdict = H._classify_failure_for_switch(message)
+    assert should_switch is True, verdict
+    assert "积分" in verdict or "配额" in verdict
+
+
 def test_login_failure_cools_the_current_bound_account(monkeypatch):
     seen = []
 

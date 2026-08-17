@@ -109,6 +109,16 @@ assert.strictEqual(ctx.appendBeatToPromptText('随便写点什么'), null);
     const good = ctx.validatePromptEditorText(filled, block());
     assert.strictEqual(good.ok, true, good.error);
     assert.strictEqual(good.imageCount, 5);
+
+    // Markdown 标题前缀（如 #### 图片 8:）与全角冒号容错
+    const markdownFormatted = `#### 图片 1：\nimage 1\n\n#### 图片 2:\nimage 2\n\n#### 图片 3:\nimage 3\n\n#### 图片 4:\nimage 4\n\n#### 视频 1:\nvideo 1\n\n#### 视频 2:\nvideo 2\n\n#### 视频 3:\nvideo 3`;
+    const mdCheck = ctx.validatePromptEditorText(markdownFormatted, block());
+    assert.strictEqual(mdCheck.ok, true, '带 #### 的 Markdown 标题应被宽松解析通过');
+    assert.strictEqual(mdCheck.imageCount, 4);
+
+    const cleaned = ctx.autoCleanPromptTextFallback(markdownFormatted);
+    assert.ok(cleaned.includes('图片 1:'));
+    assert.ok(!cleaned.includes('####'));
 }
 
 console.log('prompt editor tests passed');

@@ -23,12 +23,17 @@ function refFilterMatches(ref, q) {
 }
 
 function updateTrendRefsSelectedNote() {
-    const note = document.getElementById('trend-refs-selected-note');
-    if (!note) return;
+    const notePrimary = document.getElementById('trend-refs-selected-note');
+    const noteReplica = document.getElementById('replica-trend-refs-selected-note');
     const n = getSelectedTrendRefIds().length;
-    note.textContent = n > 0
+    const textPrimary = n > 0
         ? `已选 ${n} 条（本批优先用你选的）`
         : '未勾选：本批将自动从案例库加权随机挑 1 条';
+    const textReplica = n > 0
+        ? `已选 ${n} 条（发散优先参考）`
+        : '未勾选：发散自动取材';
+    if (notePrimary) notePrimary.textContent = textPrimary;
+    if (noteReplica) noteReplica.textContent = textReplica;
     // 这行同时是取材抽屉折叠态的摘要；勾选变化要让激发轨的 ① 芯片跟着变
     if (typeof updateSparkRail === 'function') updateSparkRail();
 }
@@ -47,8 +52,9 @@ function saveSelectedTrendRefIds(ids) {
 }
 
 async function loadTrendRefs() {
-    const list = document.getElementById('trend-refs-list');
-    if (!list) return;
+    const primaryList = document.getElementById('trend-refs-list');
+    const replicaList = document.getElementById('replica-trend-refs-list');
+    if (!primaryList && !replicaList) return;
     try {
         const resp = await fetch('/api/trend-refs');
         const data = await resp.json();
@@ -60,19 +66,25 @@ async function loadTrendRefs() {
             renderTrendRefs();
             updateCapNote(data.cap, data.archived_count);
         } else {
-            list.textContent = '';
-            const err = document.createElement('div');
-            err.className = 'trend-refs-empty';
-            err.textContent = `案例库载入失败：${(data && data.error) || '未知错误'}`;
-            list.appendChild(err);
+            [primaryList, replicaList].forEach(list => {
+                if (!list) return;
+                list.textContent = '';
+                const err = document.createElement('div');
+                err.className = 'trend-refs-empty';
+                err.textContent = `案例库载入失败：${(data && data.error) || '未知错误'}`;
+                list.appendChild(err);
+            });
         }
     } catch (e) {
         console.error('Failed to load trend refs:', e);
-        list.textContent = '';
-        const err = document.createElement('div');
-        err.className = 'trend-refs-empty';
-        err.textContent = '案例库载入失败，请检查本地服务';
-        list.appendChild(err);
+        [primaryList, replicaList].forEach(list => {
+            if (!list) return;
+            list.textContent = '';
+            const err = document.createElement('div');
+            err.className = 'trend-refs-empty';
+            err.textContent = '案例库载入失败，请检查本地服务';
+            list.appendChild(err);
+        });
     }
 }
 
@@ -80,34 +92,44 @@ async function loadTrendRefs() {
 // （不硬删），archived_count 为 0/null 时不打扰用户，只在有归档可看时露出入口。
 function updateCapNote(cap, archivedCount) {
     if (typeof cap === 'number') trendRefsCapValue = cap;
-    const note = document.getElementById('trend-refs-cap-note');
-    if (note) {
-        note.textContent = trendRefsCapValue ? `${trendRefsCache.length} / ${trendRefsCapValue} 条` : '';
-    }
-    // archivedCount 省略时只刷新左侧计数(如手动删除后),不改动归档入口的显隐状态
+    const capText = trendRefsCapValue ? `${trendRefsCache.length} / ${trendRefsCapValue} 条` : `${trendRefsCache.length} 条`;
+    const notePrimary = document.getElementById('trend-refs-cap-note');
+    const noteReplica = document.getElementById('replica-trend-refs-cap-note');
+    if (notePrimary) notePrimary.textContent = capText;
+    if (noteReplica) noteReplica.textContent = capText;
+
+    // archivedCount 省略时只刷新计数(如手动删除后),不改动归档入口的显隐状态
     if (typeof archivedCount === 'undefined') return;
-    const toggle = document.getElementById('trend-refs-archive-toggle');
-    if (toggle) {
-        const has = typeof archivedCount === 'number' && archivedCount > 0;
-        toggle.hidden = !has;
-        toggle.textContent = has ? `查看归档 (${archivedCount})` : '查看归档';
-        if (!has) {
-            const archiveList = document.getElementById('trend-refs-archive-list');
-            if (archiveList) archiveList.hidden = true;
-            trendRefsArchiveLoaded = false;
+    const has = typeof archivedCount === 'number' && archivedCount > 0;
+    ['trend-refs-archive-toggle', 'replica-trend-refs-archive-toggle'].forEach(id => {
+        const toggle = document.getElementById(id);
+        if (toggle) {
+            toggle.hidden = !has;
+            toggle.textContent = has ? `查看归档 (${archivedCount})` : '查看归档';
         }
+    });
+    if (!has) {
+        ['trend-refs-archive-list', 'replica-trend-refs-archive-list'].forEach(id => {
+            const archiveList = document.getElementById(id);
+            if (archiveList) archiveList.hidden = true;
+        });
+        trendRefsArchiveLoaded = false;
     }
 }
 
-async function toggleArchivePanel() {
-    const archiveList = document.getElementById('trend-refs-archive-list');
-    const toggle = document.getElementById('trend-refs-archive-toggle');
-    if (!archiveList || !toggle) return;
+async function toggleArchivePanel(targetPrefix = '') {
+    const listId = targetPrefix ? `${targetPrefix}-trend-refs-archive-list` : 'trend-refs-archive-list';
+    const toggleId = targetPrefix ? `${targetPrefix}-trend-refs-archive-toggle` : 'trend-refs-archive-toggle';
+    const archiveList = document.getElementById(listId);
+    const toggle = document.getElementById(toggleId);
+    if (!archiveList) return;
     if (!archiveList.hidden) {
         archiveList.hidden = true;
+        if (toggle) toggle.textContent = `查看归档 (${trendRefsArchiveCache.length})`;
         return;
     }
     archiveList.hidden = false;
+    if (toggle) toggle.textContent = '收起归档';
     if (trendRefsArchiveLoaded) {
         renderArchiveRefs();
         return;
@@ -142,80 +164,86 @@ async function toggleArchivePanel() {
 }
 
 function renderArchiveRefs() {
-    const archiveList = document.getElementById('trend-refs-archive-list');
-    if (!archiveList) return;
-    archiveList.textContent = '';
+    const lists = [
+        document.getElementById('trend-refs-archive-list'),
+        document.getElementById('replica-trend-refs-archive-list'),
+    ].filter(Boolean);
+    if (!lists.length) return;
 
-    if (trendRefsArchiveCache.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'trend-refs-empty';
-        empty.textContent = '归档是空的：案例库超过条数上限时，最老且从未被勾选用过的参考会自动挪到这里。';
-        archiveList.appendChild(empty);
-        return;
-    }
+    lists.forEach(archiveList => {
+        archiveList.textContent = '';
 
-    trendRefsArchiveCache.forEach(ref => {
-        const item = document.createElement('div');
-        item.className = 'trend-ref-item';
+        if (trendRefsArchiveCache.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'trend-refs-empty';
+            empty.textContent = '归档是空的：案例库超过条数上限时，最老且从未被勾选用过的参考会自动挪到这里。';
+            archiveList.appendChild(empty);
+            return;
+        }
 
-        const row = document.createElement('div');
-        row.className = 'trend-ref-row';
+        trendRefsArchiveCache.forEach(ref => {
+            const item = document.createElement('div');
+            item.className = 'trend-ref-item';
 
-        const main = document.createElement('div');
-        main.className = 'trend-ref-main';
-        const label = document.createElement('div');
-        label.className = 'trend-ref-label';
-        label.textContent = ref.label || '(未命名参考)';
-        label.title = '双击改名';
-        const meta = document.createElement('div');
-        meta.className = 'trend-ref-meta';
-        const usedSuffix = ref.used_count ? ` · 曾用 ${ref.used_count} 次` : '';
-        meta.textContent = `${ref.source === 'custom_urls' ? '🔗 自定义网址' : '🌐 联网搜索'} · ${ref.created_at || ''}${usedSuffix}`;
-        main.appendChild(label);
-        main.appendChild(meta);
-        label.addEventListener('dblclick', (e) => {
-            e.stopPropagation();
-            startRenameTrendRef(label, ref, renderArchiveRefs, { archive: true });
+            const row = document.createElement('div');
+            row.className = 'trend-ref-row';
+
+            const main = document.createElement('div');
+            main.className = 'trend-ref-main';
+            const label = document.createElement('div');
+            label.className = 'trend-ref-label';
+            label.textContent = ref.label || '(未命名参考)';
+            label.title = '双击改名';
+            const meta = document.createElement('div');
+            meta.className = 'trend-ref-meta';
+            const usedSuffix = ref.used_count ? ` · 曾用 ${ref.used_count} 次` : '';
+            meta.textContent = `${ref.source === 'custom_urls' ? '🔗 自定义网址' : '🌐 联网搜索'} · ${ref.created_at || ''}${usedSuffix}`;
+            main.appendChild(label);
+            main.appendChild(meta);
+            label.addEventListener('dblclick', (e) => {
+                e.stopPropagation();
+                startRenameTrendRef(label, ref, renderArchiveRefs, { archive: true });
+            });
+
+            const expandBtn = document.createElement('button');
+            expandBtn.type = 'button';
+            expandBtn.className = 'trend-ref-mini-btn';
+            expandBtn.textContent = '详情';
+            expandBtn.title = '展开/收起参考要点全文';
+
+            const restoreBtn = document.createElement('button');
+            restoreBtn.type = 'button';
+            restoreBtn.className = 'trend-ref-mini-btn trend-ref-restore';
+            restoreBtn.textContent = '♻ 恢复';
+            restoreBtn.title = '恢复到案例库，可重新勾选使用';
+
+            const delBtn = document.createElement('button');
+            delBtn.type = 'button';
+            delBtn.className = 'trend-ref-mini-btn trend-ref-delete';
+            delBtn.textContent = '×';
+            delBtn.title = '从归档永久删除（不可恢复）';
+
+            row.appendChild(main);
+            row.appendChild(expandBtn);
+            row.appendChild(restoreBtn);
+            row.appendChild(delBtn);
+            item.appendChild(row);
+
+            const body = document.createElement('pre');
+            body.className = 'trend-ref-text';
+            body.textContent = ref.text || '';
+            body.hidden = true;
+            item.appendChild(body);
+
+            expandBtn.addEventListener('click', () => {
+                body.hidden = !body.hidden;
+                expandBtn.textContent = body.hidden ? '详情' : '收起';
+            });
+            restoreBtn.addEventListener('click', () => restoreTrendRefFromArchive(ref.id, restoreBtn));
+            delBtn.addEventListener('click', () => deleteArchivedTrendRef(ref.id, delBtn));
+
+            archiveList.appendChild(item);
         });
-
-        const expandBtn = document.createElement('button');
-        expandBtn.type = 'button';
-        expandBtn.className = 'trend-ref-mini-btn';
-        expandBtn.textContent = '详情';
-        expandBtn.title = '展开/收起参考要点全文';
-
-        const restoreBtn = document.createElement('button');
-        restoreBtn.type = 'button';
-        restoreBtn.className = 'trend-ref-mini-btn trend-ref-restore';
-        restoreBtn.textContent = '♻ 恢复';
-        restoreBtn.title = '恢复到案例库，可重新勾选使用';
-
-        const delBtn = document.createElement('button');
-        delBtn.type = 'button';
-        delBtn.className = 'trend-ref-mini-btn trend-ref-delete';
-        delBtn.textContent = '×';
-        delBtn.title = '从归档永久删除（不可恢复）';
-
-        row.appendChild(main);
-        row.appendChild(expandBtn);
-        row.appendChild(restoreBtn);
-        row.appendChild(delBtn);
-        item.appendChild(row);
-
-        const body = document.createElement('pre');
-        body.className = 'trend-ref-text';
-        body.textContent = ref.text || '';
-        body.hidden = true;
-        item.appendChild(body);
-
-        expandBtn.addEventListener('click', () => {
-            body.hidden = !body.hidden;
-            expandBtn.textContent = body.hidden ? '详情' : '收起';
-        });
-        restoreBtn.addEventListener('click', () => restoreTrendRefFromArchive(ref.id, restoreBtn));
-        delBtn.addEventListener('click', () => deleteArchivedTrendRef(ref.id, delBtn));
-
-        archiveList.appendChild(item);
     });
 }
 
@@ -388,114 +416,134 @@ async function deleteTrendRef(id, btn) {
 }
 
 function renderTrendRefs() {
-    const list = document.getElementById('trend-refs-list');
-    if (!list) return;
-    list.textContent = '';
+    const primaryList = document.getElementById('trend-refs-list');
+    const replicaList = document.getElementById('replica-trend-refs-list');
+    if (!primaryList && !replicaList) return;
+
     updateTrendRefsSelectedNote();
 
-    const filterInput = document.getElementById('trend-refs-filter');
-    if (filterInput) filterInput.hidden = trendRefsCache.length === 0;
+    const primaryFilter = document.getElementById('trend-refs-filter');
+    const replicaFilter = document.getElementById('replica-trend-refs-filter');
+    if (primaryFilter) primaryFilter.hidden = trendRefsCache.length === 0;
+    if (replicaFilter) replicaFilter.hidden = trendRefsCache.length === 0;
 
     // 空库时把取材抽屉摊开一次当引导（见 js/spark_rail.js）
     if (typeof maybeGuideEmptyRefLibrary === 'function') {
         maybeGuideEmptyRefLibrary(trendRefsCache.length);
     }
 
-    if (trendRefsCache.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'trend-refs-empty';
-        empty.textContent = '案例库还是空的：点右上「🔍 搜一批新参考」，或直接换一批灵感（自动搜索的结果会沉淀到这里）。';
-        list.appendChild(empty);
-        return;
-    }
-
-    const q = trendRefsFilterQuery.trim().toLowerCase();
-    const visible = trendRefsCache.filter(ref => refFilterMatches(ref, q));
-    if (visible.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'trend-refs-empty';
-        empty.textContent = `没有匹配「${trendRefsFilterQuery}」的参考`;
-        list.appendChild(empty);
-        return;
-    }
-
     const selected = new Set(getSelectedTrendRefIds());
-    visible.forEach(ref => {
-        const item = document.createElement('div');
-        item.className = 'trend-ref-item' + (selected.has(ref.id) ? ' selected' : '');
 
-        const row = document.createElement('div');
-        row.className = 'trend-ref-row';
+    const renderList = (listEl, filterVal) => {
+        if (!listEl) return;
+        listEl.textContent = '';
 
-        const check = document.createElement('span');
-        check.className = 'trend-ref-check';
-        check.textContent = selected.has(ref.id) ? '✓' : '';
+        if (trendRefsCache.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'trend-refs-empty';
+            empty.textContent = '案例库还是空的：点右上「🔍 搜一批新参考」，或直接换一批灵感（自动搜索的结果会沉淀到这里）。';
+            listEl.appendChild(empty);
+            return;
+        }
 
-        const main = document.createElement('div');
-        main.className = 'trend-ref-main';
-        const label = document.createElement('div');
-        label.className = 'trend-ref-label';
-        label.textContent = ref.label || '(未命名参考)';
-        label.title = '双击改名';
-        const meta = document.createElement('div');
-        meta.className = 'trend-ref-meta';
-        const usedSuffix = ref.used_count ? ` · 曾用 ${ref.used_count} 次` : '';
-        meta.textContent = `${ref.source === 'custom_urls' ? '🔗 自定义网址' : '🌐 联网搜索'} · ${ref.created_at || ''}${usedSuffix}`;
-        main.appendChild(label);
-        main.appendChild(meta);
+        const q = (filterVal || '').trim().toLowerCase();
+        const visible = trendRefsCache.filter(ref => refFilterMatches(ref, q));
+        if (visible.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'trend-refs-empty';
+            empty.textContent = `没有匹配「${filterVal}」的参考`;
+            listEl.appendChild(empty);
+            return;
+        }
 
-        const expandBtn = document.createElement('button');
-        expandBtn.type = 'button';
-        expandBtn.className = 'trend-ref-mini-btn';
-        expandBtn.textContent = '详情';
-        expandBtn.title = '展开/收起参考要点全文';
+        visible.forEach(ref => {
+            const item = document.createElement('div');
+            item.className = 'trend-ref-item' + (selected.has(ref.id) ? ' selected' : '');
 
-        const delBtn = document.createElement('button');
-        delBtn.type = 'button';
-        delBtn.className = 'trend-ref-mini-btn trend-ref-delete';
-        delBtn.textContent = '×';
-        delBtn.title = '从案例库删除此参考';
+            const row = document.createElement('div');
+            row.className = 'trend-ref-row';
 
-        row.appendChild(check);
-        row.appendChild(main);
-        row.appendChild(expandBtn);
-        row.appendChild(delBtn);
-        item.appendChild(row);
+            const check = document.createElement('span');
+            check.className = 'trend-ref-check';
+            check.textContent = selected.has(ref.id) ? '✓' : '';
 
-        const body = document.createElement('pre');
-        body.className = 'trend-ref-text';
-        body.textContent = ref.text || '';
-        body.hidden = true;
-        item.appendChild(body);
+            const main = document.createElement('div');
+            main.className = 'trend-ref-main';
+            const label = document.createElement('div');
+            label.className = 'trend-ref-label';
+            label.textContent = ref.label || '(未命名参考)';
+            label.title = '双击改名';
+            const meta = document.createElement('div');
+            meta.className = 'trend-ref-meta';
+            const usedSuffix = ref.used_count ? ` · 曾用 ${ref.used_count} 次` : '';
+            meta.textContent = `${ref.source === 'custom_urls' ? '🔗 自定义网址' : '🌐 联网搜索'} · ${ref.created_at || ''}${usedSuffix}`;
+            main.appendChild(label);
+            main.appendChild(meta);
 
-        row.addEventListener('click', (e) => {
-            if (e.target === expandBtn || e.target === delBtn) return;
-            toggleTrendRefSelection(ref.id);
+            const expandBtn = document.createElement('button');
+            expandBtn.type = 'button';
+            expandBtn.className = 'trend-ref-mini-btn';
+            expandBtn.textContent = '详情';
+            expandBtn.title = '展开/收起参考要点全文';
+
+            const delBtn = document.createElement('button');
+            delBtn.type = 'button';
+            delBtn.className = 'trend-ref-mini-btn trend-ref-delete';
+            delBtn.textContent = '×';
+            delBtn.title = '从案例库删除此参考';
+
+            row.appendChild(check);
+            row.appendChild(main);
+            row.appendChild(expandBtn);
+            row.appendChild(delBtn);
+            item.appendChild(row);
+
+            const body = document.createElement('pre');
+            body.className = 'trend-ref-text';
+            body.textContent = ref.text || '';
+            body.hidden = true;
+            item.appendChild(body);
+
+            row.addEventListener('click', (e) => {
+                if (e.target === expandBtn || e.target === delBtn) return;
+                toggleTrendRefSelection(ref.id);
+            });
+            label.addEventListener('dblclick', (e) => {
+                e.stopPropagation();
+                startRenameTrendRef(label, ref, renderTrendRefs, { archive: false });
+            });
+            expandBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                body.hidden = !body.hidden;
+                expandBtn.textContent = body.hidden ? '详情' : '收起';
+            });
+            delBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                deleteTrendRef(ref.id, delBtn);
+            });
+
+            listEl.appendChild(item);
         });
-        label.addEventListener('dblclick', (e) => {
-            e.stopPropagation();
-            startRenameTrendRef(label, ref, renderTrendRefs, { archive: false });
-        });
-        expandBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            body.hidden = !body.hidden;
-            expandBtn.textContent = body.hidden ? '详情' : '收起';
-        });
-        delBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            deleteTrendRef(ref.id, delBtn);
-        });
+    };
 
-        list.appendChild(item);
-    });
+    renderList(primaryList, trendRefsFilterQuery);
+    const replicaFilterVal = replicaFilter ? replicaFilter.value : trendRefsFilterQuery;
+    renderList(replicaList, replicaFilterVal);
 }
 
 async function searchNewTrendRefs() {
-    const btn = document.getElementById('trend-refs-search-btn');
-    if (!btn || btn.disabled) return;
-    btn.disabled = true;
-    const prevText = btn.textContent;
-    btn.textContent = '🔍 搜索中…（约 1–2 分钟）';
+    const btns = [
+        document.getElementById('trend-refs-search-btn'),
+        document.getElementById('replica-trend-refs-search-btn'),
+    ].filter(Boolean);
+
+    if (btns.some(b => b.disabled)) return;
+    btns.forEach(b => {
+        b.disabled = true;
+        b.dataset.prevText = b.textContent;
+        b.textContent = '🔍 搜索中…（约 1–2 分钟）';
+    });
+
     try {
         const resp = await fetch('/api/trend-refs/search', {
             method: 'POST',
@@ -508,7 +556,7 @@ async function searchNewTrendRefs() {
             trendRefsCache = data.refs;
             const batch = Array.isArray(data.added) ? data.added : [];
             const newCount = batch.filter(id => !prevIds.has(id)).length;
-            // 自动勾选本批搜到的参考（含与旧条目重复命中的），方便直接开下一批灵感
+            // 自动勾选本批搜到的参考（含与旧条目重复命中的），方便直接开下一批灵感/发散
             const selected = new Set(getSelectedTrendRefIds());
             batch.forEach(id => selected.add(id));
             saveSelectedTrendRefIds([...selected]);
@@ -529,8 +577,10 @@ async function searchNewTrendRefs() {
         console.error('Trend refs search failed:', e);
         showToast('搜索失败，请检查网络或本地服务', 'error');
     } finally {
-        btn.disabled = false;
-        btn.textContent = prevText;
+        btns.forEach(b => {
+            b.disabled = false;
+            if (b.dataset.prevText) b.textContent = b.dataset.prevText;
+        });
     }
 }
 
@@ -565,29 +615,38 @@ function saveIdeationDirection(query, urls) {
         config.ideationSearchQuery = query;
         config.ideationTrendUrls = urls;
     }
-    const settingsQuery = document.getElementById('settings-ideation-search-query');
-    if (settingsQuery) settingsQuery.value = query;
-    const settingsUrls = document.getElementById('settings-ideation-trend-urls');
-    if (settingsUrls) settingsUrls.value = urls;
+    ['settings-ideation-search-query', 'trend-refs-search-query', 'replica-trend-refs-search-query'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el && el.value !== query) el.value = query;
+    });
+    ['settings-ideation-trend-urls', 'trend-refs-trend-urls', 'replica-trend-refs-trend-urls'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el && el.value !== urls) el.value = urls;
+    });
 }
 
 function initTrendRefsDirectionPanel() {
-    const toggle = document.getElementById('trend-refs-direction-toggle');
-    const panel = document.getElementById('trend-refs-direction-panel');
-    const queryInput = document.getElementById('trend-refs-search-query');
-    const urlsInput = document.getElementById('trend-refs-trend-urls');
-    if (!toggle || !panel || !queryInput || !urlsInput) return;
+    ['trend-refs', 'replica-trend-refs'].forEach(prefix => {
+        const toggle = document.getElementById(`${prefix}-direction-toggle`);
+        const panel = document.getElementById(`${prefix}-direction-panel`);
+        const queryInput = document.getElementById(`${prefix}-search-query`);
+        const urlsInput = document.getElementById(`${prefix}-trend-urls`);
+        if (!toggle || !panel || !queryInput || !urlsInput) return;
 
-    const stored = readStoredIdeationDirection();
-    queryInput.value = stored.query;
-    urlsInput.value = stored.urls;
+        const stored = readStoredIdeationDirection();
+        queryInput.value = stored.query;
+        urlsInput.value = stored.urls;
 
-    toggle.addEventListener('click', () => {
-        panel.hidden = !panel.hidden;
+        if (!toggle.dataset.bound) {
+            toggle.dataset.bound = '1';
+            toggle.addEventListener('click', () => {
+                panel.hidden = !panel.hidden;
+            });
+            const commit = () => saveIdeationDirection(queryInput.value.trim(), urlsInput.value.trim());
+            queryInput.addEventListener('blur', commit);
+            urlsInput.addEventListener('blur', commit);
+        }
     });
-    const commit = () => saveIdeationDirection(queryInput.value.trim(), urlsInput.value.trim());
-    queryInput.addEventListener('blur', commit);
-    urlsInput.addEventListener('blur', commit);
 }
 
 // ── 案例库管理弹窗（🗂️ 管理全部）─────────────────────────────────────────
@@ -897,3 +956,14 @@ document.addEventListener('DOMContentLoaded', () => {
     initTrendRefsManageModal();
     loadTrendRefs();
 });
+
+// 暴露全局方法给其他模块（如复刻工作台 AI 正交发散激发器）调用
+window.renderTrendRefs = renderTrendRefs;
+window.searchNewTrendRefs = searchNewTrendRefs;
+window.toggleArchivePanel = toggleArchivePanel;
+window.openTrendRefsManageModal = openTrendRefsManageModal;
+window.initTrendRefsDirectionPanel = initTrendRefsDirectionPanel;
+window.getSelectedTrendRefIds = getSelectedTrendRefIds;
+window.saveSelectedTrendRefIds = saveSelectedTrendRefIds;
+window.toggleTrendRefSelection = toggleTrendRefSelection;
+window.loadTrendRefs = loadTrendRefs;

@@ -211,3 +211,27 @@ def resolve_capture_file(capture_id, filename):
         return str(target) if target.is_file() else None
     except Exception:
         return None
+
+
+def clear_captures():
+    """清空所有失败现场取证文件与目录，同时物理删除本地文件。返回删除的顶级条目数。"""
+    count = 0
+    try:
+        if not DEBUG_ROOT.exists():
+            return 0
+        import shutil
+        for child in list(DEBUG_ROOT.iterdir()):
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                    count += 1
+                elif child.is_file():
+                    child.unlink(missing_ok=True)
+                    count += 1
+            except Exception:
+                pass
+        log(f"🧹 已清空失败现场本地数据（共删除 {count} 个任务/条目目录）", "取证")
+    except Exception as e:
+        log(f"⚠️ 清空失败现场时出错: {type(e).__name__}: {e}", "取证")
+    return count
+

@@ -96,6 +96,14 @@ the door frame is fully behind the camera, and the interior remains in untouched
 Nothing checks these pixels automatically. Delete a rejected frame and re-render the same slot
 with `--force_regenerate`; a retry is not a new transition or construction beat.
 
+The untouched-trauma half of that check applies only when the family lands in a space **no earlier
+beat has worked in**. Where the space sequence returns to an earlier space, the check inverts:
+reject the frame if any milestone that space already earned reads as raw, missing, cluttered or
+under construction again. Reading a re-entry frame against the first-entry bar rejects a correct
+frame and re-renders a restored room back into a ruin. A structural element visible from two
+spaces — roof, ceiling, floor slab, glazing — is one object: once an exterior beat delivers it,
+it stays delivered across the sill, first entry included.
+
 ## Crossing delta budget
 
 Grid-area counting does not apply to a threshold because the viewpoint and enclosure legitimately

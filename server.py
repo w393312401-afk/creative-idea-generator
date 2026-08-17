@@ -652,13 +652,11 @@ def _require_fx_admission(handler, required=True):
     return False
 
 
-# FX 运行配置：白名单、校验与版本栈都在 fx_console.py（那套规则本身有独立的测试面，
+# FX 运行配置：白名单、校验都在 fx_console.py（那套规则本身有独立的测试面，
 # 塞在 HTTP 路由旁边会淹没）。这里只保留一个进程内单例。
 FX_CONFIG = FxConfigStore(
     config=SERVER_CONFIG,
     config_file=SERVER_CONFIG_FILE,
-    versions_file=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               'runtime', 'fx_config_versions.jsonl'),
     apply_overrides=apply_google_fx_runtime_overrides,
     audit=FX_CONTROL.audit,
 )
@@ -1257,6 +1255,76 @@ def generate_frames_worker(task_id, config, title, prompt_block, target_sequence
         set_project_key_context(None)
 
 
+def generate_frames_selection_worker(task_id, config, title, prompt_block, target_sequences, candidate_count=4):
+    """4选1 AI鉴别迭代生成后台工作线程：每帧生成4张候选图，多模态AI模型鉴别并选出最佳一张，
+    落盘并作为下一帧的参考图，依次类推。"""
+    t = get_or_create_task(task_id)
+    set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
+    set_log_context(task_id)
+    log('INFO', 'FRAMES_SEL', f"开始帧序列 4选1 智能生成任务 {'（整单）' if target_sequences is None else f'（子集 {target_sequences}）'}", title=title)
+    try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
+        def progress_cb(stage, details):
+            if stage == 'cancel_check':
+                return t["cancel_event"].is_set()
+            if t["cancel_event"].is_set():
+                raise GenerationCancelled("Generation cancelled by user")
+            with ACTIVE_TASKS_LOCK:
+                t["events"].append((stage, details))
+            notify_listeners(task_id, stage, details)
+
+        from frame_generator import set_upstream_event_sink, set_cancel_check_sink
+        set_upstream_event_sink(lambda ev: progress_cb('upstream_retry', ev))
+        set_cancel_check_sink(lambda: t["cancel_event"].is_set())
+        try:
+            from candidate_selection_pipeline import run_candidate_selection_frame_sequence
+            with _fx_serial_lock_for(config, task_id, 'frames_selection', t['cancel_event']):
+                result = run_candidate_selection_frame_sequence(
+                    config, title, prompt_block,
+                    on_progress=progress_cb,
+                    target_sequences=target_sequences,
+                    candidate_count=candidate_count
+                )
+        finally:
+            set_upstream_event_sink(None)
+            set_cancel_check_sink(None)
+        usage = stop_and_get_accounting()
+        if usage:
+            result['token_usage'] = usage
+            
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "completed"
+            t["result"] = result
+            t["events"].append(('result', result))
+        notify_listeners(task_id, 'result', result)
+        log('INFO', 'FRAMES_SEL', "帧序列 4选1 任务完成", title=title)
+    except ConnectionError:
+        finalize = False
+        with ACTIVE_TASKS_LOCK:
+            if t["status"] == "running":
+                t["status"] = "cancelled"
+                t["error"] = "用户取消了 4选1 帧序列生成"
+                t["events"].append(('error', {'message': '用户取消了 4选1 帧序列生成'}))
+                finalize = True
+        if finalize:
+            notify_listeners(task_id, 'error', {'message': '用户取消了 4选1 帧序列生成'})
+        log('WARN', 'FRAMES_SEL', "帧序列 4选1 任务已被用户取消", title=title)
+    except Exception as e:
+        log_exception('FRAMES_SEL')
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "failed"
+            t["error"] = str(e)
+            t["events"].append(('error', {'message': str(e)}))
+        notify_listeners(task_id, 'error', {'message': str(e)})
+        log('ERROR', 'FRAMES_SEL', f"帧序列 4选1 任务失败: {e}", title=title)
+    finally:
+        release_frame_run(_get_project_dir(title), task_id)
+        save_task_to_disk(task_id)
+        set_log_context(None)
+        set_project_key_context(None)
+
+
 def fix_frame_issue_worker(task_id, config, title, prompt_block, sequence, manual_reason=None):
     """人工在帧网格点击「修复此帧问题」后台工作线程：读取该帧记录的问题原因、
     优化提示词后图生图重渲（pipeline_orchestrator.fix_frame_issue）。与
@@ -1685,7 +1753,7 @@ def _replica_worker(task_id, config, job_id, label, run, task_type='replica'):
             result['prompt_slots'] = prompt_slots_list(job_state['prompt_block'])
 
         with ACTIVE_TASKS_LOCK:
-            t["status"] = "completed" if is_completed else "paused"
+            t["status"] = "completed"
             t["result"] = result
             event_name = 'result' if is_completed else 'replica_paused'
             t["events"].append((event_name, result))
@@ -1740,6 +1808,15 @@ def replica_advance_worker(task_id, config, job_id, action, payload):
                     lambda cb: advance_replica_job(config, job_id, action=action,
                                                    payload=payload, on_progress=cb),
                     task_type='replica_advance')
+
+
+def replica_mutate_orthogonal_worker(task_id, config, baseline_job_id, mutation_axes=None, preset=None, brief=None):
+    """四轴正交受控变体派生 Worker。"""
+    from replica_pipeline import mutate_orthogonal
+    _replica_worker(task_id, config, baseline_job_id, f'正交变体派生（{preset or "自定义"}）',
+                    lambda cb: mutate_orthogonal(config, baseline_job_id, mutation_axes=mutation_axes,
+                                                 preset=preset, brief=brief, on_progress=cb),
+                    task_type='replica_mutate')
 
 
 # FX 浏览器串行锁 —— FX_CONTROL 是唯一 admission 入口。
@@ -1957,7 +2034,6 @@ def bootstrap_fx_runtime():
         FX_CONFIG.migrate_deprecated_values()
         apply_google_fx_runtime_overrides(SERVER_CONFIG)
         apply_direct_env(FX_CONFIG.current())
-        FX_CONFIG.ensure_baseline()
     except Exception as e:
         log('WARN', 'FX', f"Google FX 运行时环境变量初始化失败: {e}")
     if not _FX_WATCHDOG_STARTED.is_set():
@@ -3187,7 +3263,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 'status': 'ok',
                 'config': FX_CONFIG.current(),
                 'schema': FX_CONFIG.schema(),
-                'versions': FX_CONFIG.versions(int(query.get('limit', ['20'])[0] or 20)),
+                'versions': [],
                 'audit': FX_CONTROL.recent_audit(20, action_prefix='config.'),
             })
         elif path == '/api/google-fx/logs':
@@ -3317,7 +3393,10 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         if job:
                             running[job] = task_id
                 for row in jobs:
-                    row['active_task_id'] = running.get(row.get('job_id'))
+                    active_tid = running.get(row.get('job_id'))
+                    row['active_task_id'] = active_tid
+                    if active_tid:
+                        row['attention'] = 'running'
                 self._send_json({'status': 'ok', 'jobs': jobs, 'catalog': stage_catalog()})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
@@ -3336,6 +3415,20 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'status': 'error', 'message': f'未找到复刻任务 {job_id}'}, status=404)
                     return
                 self._send_json({'status': 'ok', 'job_state': state})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/lineage':
+            if not self._gate():
+                return
+            baseline_id = (query.get('baseline_id', [''])[0] or query.get('job_id', [''])[0] or '').strip()
+            if not baseline_id:
+                self._send_json({'status': 'error', 'message': '缺少 baseline_id 参数'}, status=400)
+                return
+            try:
+                from replica_pipeline import get_lineage
+                lineage = get_lineage(baseline_id)
+                self._send_json({'status': 'ok', 'lineage': lineage})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -3396,6 +3489,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
         # 拼一个只够跑单个分支的假 handler（不走真实 socket，没有 .headers/.rfile，
         # _read_json_body 也被单测自己打桩替换掉了），这里没有真实连接可读也不需要读。
         content_length = int(self.headers.get('Content-Length', 0) or 0) if hasattr(self, 'headers') else 0
+        if content_length > 1024 * 1024 * 1024:
+            self._send_json({'status': 'error', 'message': '请求体大小超过 1GB 上限'}, status=413)
+            return
         self._body_bytes = self.rfile.read(content_length) if content_length else b''
 
         # 整表覆盖写（POST /api/library）已于 2026-07-31 移除。
@@ -3432,42 +3528,53 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     print(f"Error writing library item: {e}")
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
-        elif path == '/api/library/item/delete':
-            # 按 id 删单条。与创意台账的 /api/ledger/delete 同一个道理：按 id 删
+        elif path in ('/api/library/item/delete', '/api/library/items/bulk_delete'):
+            # 按 id 删单条或批量删。与创意台账的 /api/ledger/delete 同一个道理：按 id 删
             # 天然带着"确有意图"的证据，不吃缩量闸门，删到最后一条也不会被 409。
             if not self._gate():
                 return
             try:
                 body = self._read_json_body()
-                item_id = body.get('id') if isinstance(body, dict) else None
-                if item_id in (None, ''):
-                    self._send_json({'status': 'error', 'message': '缺少 id'}, status=400)
+                item_ids = body.get('ids')
+                if not isinstance(item_ids, list):
+                    single_id = body.get('id')
+                    item_ids = [single_id] if single_id not in (None, '') else []
+                if not item_ids:
+                    self._send_json({'status': 'error', 'message': '缺少 id 或 ids'}, status=400)
                     return
-                # 顺带清掉这条创意生成的图片/视频文件（与老的
+                # 顺带清掉这些创意生成的图片/视频文件（与老的
                 # /api/library/delete_item 同一套清理，前端不必再多打一次请求）
-                item = read_library_item(item_id)
-                deleted_files = None
-                # 传给 delete_idea_output_files 的必须是**项目目录键**而不是展示
-                # 标题：新记录的产物落在 outputs/<project_key>/ 下（前端
-                # getIdeaSaveTitle 也是 project_key || title 这个顺序）。传错的
-                # 后果是删了记录、产物却留在磁盘上变成孤儿。
-                title = (body.get('title')
-                         or (item or {}).get('project_key')
-                         or (item or {}).get('title'))
-                covers = body.get('covers')
-                if covers is None:
-                    covers = (item or {}).get('covers') or []
-                if title:
-                    try:
-                        deleted_files = delete_idea_output_files(title, covers)
-                    except Exception as e:
-                        if sys.stdout:
-                            print(f"[LIBRARY] 删除创意产物失败（记录仍会删除）: {e}")
-                removed = delete_library_item(item_id)
-                self._send_json({'status': 'ok', 'removed': removed, 'deleted': deleted_files})
+                deleted_items = []
+                for item_id in item_ids:
+                    item = read_library_item(item_id)
+                    title = (body.get('title') if len(item_ids) == 1 else None) \
+                             or (item or {}).get('project_key') \
+                             or (item or {}).get('title')
+                    covers = (body.get('covers') if len(item_ids) == 1 else None)
+                    if covers is None:
+                        covers = (item or {}).get('covers') or []
+                    deleted_files = None
+                    if title:
+                        try:
+                            deleted_files = delete_idea_output_files(title, covers)
+                        except Exception as e:
+                            if sys.stdout:
+                                print(f"[LIBRARY] 删除创意产物失败（记录仍会删除）: {e}")
+                    removed = delete_library_item(item_id)
+                    deleted_items.append({'id': item_id, 'removed': removed, 'deleted': deleted_files})
+
+                if len(item_ids) == 1 and 'ids' not in body:
+                    res0 = deleted_items[0]
+                    self._send_json({'status': 'ok', 'removed': res0['removed'], 'deleted': res0['deleted']})
+                else:
+                    self._send_json({
+                        'status': 'ok',
+                        'count': len([x for x in deleted_items if x['removed']]),
+                        'items': deleted_items,
+                    })
             except Exception as e:
                 if sys.stdout:
-                    print(f"Error deleting library item: {e}")
+                    print(f"Error deleting library item(s): {e}")
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/ledger':
@@ -3610,22 +3717,13 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             try:
                 body = self._read_json_body()
                 actor = _client_ip(self)
-                action = str(body.get('action') or '').strip()
-                if action in ('rollback', 'restore', 'redo'):
-                    # 版本栈：可以连续往前回退，也可以重做（原实现只能退一步，
-                    # 而且第二次点击是重复套用同一份 before = 空操作）
-                    outcome = FX_CONFIG.restore(
-                        version_id=body.get('version_id') or None,
-                        actor=actor,
-                        direction='forward' if action == 'redo' else 'back')
-                else:
-                    outcome = FX_CONFIG.save(body.get('patch'), actor=actor)
+                outcome = FX_CONFIG.save(body.get('patch'), actor=actor)
                 self._send_json({
                     'status': 'ok',
                     'config': outcome['config'],
                     'changed': outcome.get('changed') or {},
-                    'version': outcome.get('version'),
-                    'versions': FX_CONFIG.versions(20),
+                    'version': None,
+                    'versions': [],
                     # 命中 hot=False 的字段时如实告诉用户要重启，别谎称热生效
                     'restart_required': sorted(
                         key for key in (outcome.get('changed') or {})
@@ -3700,6 +3798,19 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                           'removed': removed}, actor=_client_ip(self))
                 google_fx_status_snapshot(force=True)
                 self._send_json({'status': 'ok', 'removed': removed})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path in ('/api/google-fx/captures/clear', '/api/google-fx/captures'):
+            # 清空所有失败现场取证文件与本地目录
+            if not self._gate():
+                return
+            try:
+                from integrations.google_fx.utils import forensics
+                cleared = forensics.clear_captures()
+                FX_CONTROL.audit('diagnostics.captures_clear',
+                                 details={'cleared': cleared}, actor=_client_ip(self))
+                self._send_json({'status': 'ok', 'cleared': cleared, 'message': f'已成功清空 {cleared} 个失败现场目录/文件'})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -4408,29 +4519,30 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
-        elif path == '/api/tasks/delete':
+        elif path in ('/api/tasks/delete', '/api/tasks/bulk_delete'):
             if not self._gate():
                 return
             try:
                 body = self._read_json_body()
-                task_id = body.get('task_id')
-                if task_id:
-                    title = None
-                    with ACTIVE_TASKS_LOCK:
-                        task = ACTIVE_TASKS.get(task_id)
+                task_ids = body.get('task_ids')
+                if not isinstance(task_ids, list):
+                    single_id = body.get('task_id')
+                    task_ids = [single_id] if single_id else []
+                deleted_ids = []
+                with ACTIVE_TASKS_LOCK:
+                    for tid in task_ids:
+                        if not tid:
+                            continue
+                        task = ACTIVE_TASKS.get(tid)
                         if task:
                             # If it's running, cancel it first
                             task["cancel_event"].set()
-                            task_result = task.get("result") or {}
-                            title = task_result.get("project_key") or task_result.get("title")
-                            del ACTIVE_TASKS[task_id]
-                    if title:
-                        delete_idea_output_files(title)
-                    # 显式删这条任务自己的三份文件。老实现是"从内存摘掉 →
-                    # save_tasks_to_disk() 靠孤儿扫描顺手删"，那个隐式耦合正是
-                    # 两次误删事故的机制本身（见 server_common 的 P2 说明）。
-                    delete_task_files(task_id)
-                self._send_json({'status': 'ok'})
+                            del ACTIVE_TASKS[tid]
+                        deleted_ids.append(tid)
+                # 显式删任务自己的三份文件，绝不触碰 outputs/ 里的项目成片资产
+                for tid in deleted_ids:
+                    delete_task_files(tid)
+                self._send_json({'status': 'ok', 'count': len(deleted_ids), 'deleted_ids': deleted_ids})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -4519,13 +4631,18 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             try:
                 body = self._read_json_body()
                 status_group = body.get('status_group')
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                library_items = read_library() or []
                 with ACTIVE_TASKS_LOCK:
                     to_delete = []
                     for tid, t in ACTIVE_TASKS.items():
-                        if status_group == "completed" and t["status"] == "completed":
+                        if status_group == "completed" and t.get("status") == "completed":
                             to_delete.append(tid)
-                        elif status_group == "failed_cancelled" and t["status"] in ("failed", "cancelled"):
+                        elif status_group == "failed_cancelled" and t.get("status") in ("failed", "cancelled"):
                             to_delete.append(tid)
+                        elif status_group == "no_cover":
+                            if t.get("status") != "running" and not task_has_cover(t, base_dir=base_dir, library_items=library_items):
+                                to_delete.append(tid)
                     for tid in to_delete:
                         ACTIVE_TASKS[tid]["cancel_event"].set()
                         del ACTIVE_TASKS[tid]
@@ -4587,13 +4704,90 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 get_or_create_task(task_id, {"type": "frames", "theme": title, "project_key": project_key,
                                              "userId": config.get('googleFxUserId') or None})
 
+                target_worker = generate_frames_selection_worker if (
+                    body.get('generation_mode') == 'candidate_selection'
+                    or body.get('candidate_selection') is True
+                ) else generate_frames_worker
+
                 threading.Thread(
-                    target=generate_frames_worker,
+                    target=target_worker,
                     args=(task_id, config, title, prompt_block, target_sequences),
                     daemon=True
                 ).start()
 
                 self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/generate_frames_selection':
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                if not rate_ok(_client_ip(self), 'frames'):
+                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
+                    return
+                body = self._read_json_body()
+                block_reason = prompt_delivery_block_reason(body)
+                if block_reason:
+                    self._send_json({'status': 'error', 'message': block_reason,
+                                     'failure_code': 'PROMPT_DELIVERY_BLOCKED'}, status=409)
+                    return
+                config = effective_config(body.get('config'))
+                if not _require_fx_admission(self, config.get('imageBackend') == 'google_fx'):
+                    return
+                project_key = body.get('title', '')
+                title = body.get('display_title') or project_key
+                config['_project_key'] = project_key
+                prompt_block = body.get('prompt_block', '')
+                target_sequences = body.get('target_sequences')
+                candidate_count = int(body.get('candidate_count') or 4)
+
+                if not resolve_cover_reference(config, title, project_key):
+                    self._send_json({
+                        'status': 'error',
+                        'message': '请先生成或选择封面图；第一帧必须以封面图进行图生图。',
+                    }, status=400)
+                    return
+
+                import uuid
+                task_id = f"frames_sel_{uuid.uuid4().hex}"
+
+                project_dir = _get_project_dir(project_key)
+                holder = claim_frame_run(project_dir, task_id)
+                if holder:
+                    self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})
+                    return
+
+                cleanup_old_tasks()
+                get_or_create_task(task_id, {"type": "frames", "theme": title, "project_key": project_key,
+                                             "userId": config.get('googleFxUserId') or None})
+
+                threading.Thread(
+                    target=generate_frames_selection_worker,
+                    args=(task_id, config, title, prompt_block, target_sequences, candidate_count),
+                    daemon=True
+                ).start()
+
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/switch_candidate':
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                project_key = body.get('title', '')
+                sequence = body.get('sequence')
+                candidate_index = body.get('candidate_index')
+                if not isinstance(sequence, int) or not isinstance(candidate_index, int):
+                    self._send_json({'status': 'error', 'message': 'sequence 和 candidate_index 必须为整数'}, status=400)
+                    return
+                from candidate_selection_pipeline import switch_frame_candidate
+                updated_manifest = switch_frame_candidate(project_key, sequence, candidate_index)
+                self._send_json({'status': 'ok', 'manifest': updated_manifest})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -4931,7 +5125,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 from replica_pipeline import ingest_video
                 state = ingest_video(file_bytes, file_name)
                 self._send_json({'status': 'ok', 'job_state': state,
-                                 'reused': bool(state.get('reused'))})
+                                 'reused': bool(state.get('reused')),
+                                 'existing_job': state if state.get('reused') else None})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -5001,8 +5196,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 if not job_id:
                     self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
                     return
-                if action not in ('approve', 'variant', 'recluster', 'translate'):
-                    self._send_json({'status': 'error', 'message': f'不支持的 action: {action}'}, status=400)
+                from replica_pipeline import VALID_ACTIONS
+                if action not in VALID_ACTIONS:
+                    self._send_json({'status': 'error', 'message': f'不支持的 action: {action}，合法值为: {sorted(VALID_ACTIONS)}'}, status=400)
                     return
                 config['_project_key'] = job_id
 
@@ -5024,7 +5220,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
-        elif path == '/api/replica/beats':
+        elif path in ('/api/replica/beats', '/api/replica/save_beats'):
             # 人工卡点上保存用户改过的节拍。同步跑：只是写文件 + 重跑一遍纯本地校验。
             try:
                 if not self._gate():
@@ -5039,8 +5235,135 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 state = save_beats(job_id, beats)
                 self._send_json({'status': 'ok', 'job_state': state,
                                  'validation': state.get('validation') or []})
-            except Exception as e:
+            except ValueError as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/lock_baseline':
+            # 将验证通过的 1:1 Job 加锁固化为 Gold Baseline 或解锁
+            try:
+                if not self._gate():
+                    return
+                body = self._read_json_body()
+                job_id = (body.get('job_id') or '').strip()
+                lock = body.get('locked', body.get('lock', True))
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                from replica_pipeline import lock_baseline_job
+                state = lock_baseline_job(job_id, lock=bool(lock))
+                self._send_json({'status': 'ok', 'job_state': state,
+                                 'is_locked_baseline': state.get('is_locked_baseline')})
+            except ValueError as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/mutate_orthogonal':
+            # 基于已有的 1:1 母本执行四轴正交替换，瞬间派生二创 Job
+            try:
+                if not self._gate(with_rate=True, rate_action='compose'):
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                baseline_job_id = (body.get('baseline_job_id') or body.get('job_id') or '').strip()
+                if not baseline_job_id:
+                    self._send_json({'status': 'error', 'message': 'baseline_job_id 不能为空'}, status=400)
+                    return
+                mutation_axes = body.get('mutation_axes') or {}
+                preset = body.get('preset')
+                brief = body.get('brief')
+                config['_project_key'] = baseline_job_id
+
+                import uuid
+                task_id = body.get('task_id') or f"replica_mut_{uuid.uuid4().hex}"
+                cleanup_old_tasks()
+                prepare_task_for_run(task_id, replica_task_dims(baseline_job_id, 'replica_mutate'))
+
+                threading.Thread(
+                    target=replica_mutate_orthogonal_worker,
+                    args=(task_id, config, baseline_job_id, mutation_axes, preset, brief),
+                    daemon=True
+                ).start()
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except ValueError as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/ai_diverge':
+            # 基于母本工序与骨架，调用 LLM 智能发散四轴正交创意方案
+            try:
+                if not self._gate(with_rate=True, rate_action='compose'):
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                baseline_job_id = (body.get('baseline_job_id') or body.get('job_id') or '').strip()
+                if not baseline_job_id:
+                    self._send_json({'status': 'error', 'message': 'baseline_job_id 不能为空'}, status=400)
+                    return
+                brief = body.get('brief') or ''
+                count = int(body.get('count') or 4)
+                trend_ref_ids = body.get('trend_ref_ids') or []
+                from replica_pipeline import ai_diverge_ideas
+                ideas = ai_diverge_ideas(config, baseline_job_id, brief=brief, count=count, trend_ref_ids=trend_ref_ids)
+                self._send_json({'status': 'ok', 'ideas': ideas})
+            except ValueError as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path in ('/api/replica/pass_a', '/api/replica/pass_b'):
+            # 规范文档别名路由支持
+            try:
+                if not self._gate(with_rate=True, rate_action='compose'):
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                job_id = (body.get('job_id') or '').strip()
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                config['_project_key'] = job_id
+                import uuid
+                task_id = f"replica_{uuid.uuid4().hex}"
+                cleanup_old_tasks()
+                get_or_create_task(task_id, replica_task_dims(job_id, 'replica'))
+                scope = body.get('scope') or body.get('sample_mode')
+                threading.Thread(
+                    target=replica_start_worker,
+                    args=(task_id, config, job_id, bool(body.get('degraded')), scope),
+                    daemon=True
+                ).start()
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/compose':
+            # 规范文档别名路由：100% 字段级绑定合成 1:1 标准提示词包
+            try:
+                if not self._gate(with_rate=True, rate_action='compose'):
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                job_id = (body.get('job_id') or '').strip()
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                config['_project_key'] = job_id
+                import uuid
+                task_id = f"replica_adv_{uuid.uuid4().hex}"
+                cleanup_old_tasks()
+                prepare_task_for_run(task_id, replica_task_dims(job_id, 'replica_advance'))
+                threading.Thread(
+                    target=replica_advance_worker,
+                    args=(task_id, config, job_id, 'approve', body.get('payload') or {}),
+                    daemon=True
+                ).start()
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/replica/cancel':
             # 打断正在跑的那一轮，但**不废掉 job**：stage 留在原地，用户改完还能重试。
@@ -5129,7 +5452,57 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': f'存入项目失败：{e}'}, status=500)
 
+        elif path == '/api/replica/gc':
+            try:
+                if not self._gate():
+                    return
+                body = self._read_json_body()
+                job_id = (body.get('job_id') or '').strip()
+                from replica_pipeline import gc_replica_job, gc_all_replica_jobs
+                if job_id:
+                    res = gc_replica_job(job_id)
+                else:
+                    res = gc_all_replica_jobs()
+                self._send_json({'status': 'ok', 'gc_result': res})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/replica/delete':
+            try:
+                if not self._gate():
+                    return
+                body = self._read_json_body()
+                job_id = (body.get('job_id') or '').strip()
+                force = bool(body.get('force'))
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                from replica_pipeline import delete_replica_job
+                del_res = delete_replica_job(job_id, force=force)
+                self._send_json({'status': 'ok', 'deleted': del_res})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+
+        elif path == '/api/replica/rename':
+            try:
+                if not self._gate():
+                    return
+                body = self._read_json_body()
+                job_id = (body.get('job_id') or '').strip()
+                title = (body.get('title') or '').strip()
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                if not title:
+                    self._send_json({'status': 'error', 'message': 'title 不能为空'}, status=400)
+                    return
+                from replica_pipeline import rename_replica_job
+                st = rename_replica_job(job_id, title)
+                self._send_json({'status': 'ok', 'job_id': job_id, 'title': st.get('title')})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+
+        elif path == '/api/replica/archive':
             try:
                 if not self._gate():
                     return
@@ -5138,10 +5511,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 if not job_id:
                     self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
                     return
-                from replica_pipeline import delete_replica_job
-                self._send_json({'status': 'ok', 'deleted': delete_replica_job(job_id)})
+                from replica_pipeline import archive_replica_job
+                st = archive_replica_job(job_id)
+                self._send_json({'status': 'ok', 'job_id': job_id, 'stage': st.get('stage')})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=400)
+
 
         elif path == '/api/render_anchor':
             try:
@@ -5437,14 +5812,6 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                         return
 
                     ok, reason = verify_video_anchors(normalized_path, start_p, end_p, strict=False)
-                    if not ok and not force:
-                        self._send_json({
-                            'status': 'anchor_mismatch',
-                            'error': f'上传视频的首/尾帧与该槽位期望的锚点帧不符（{reason}），疑似传错文件。'
-                                     f'如确认无误，可勾选"强制覆盖"后重新上传。',
-                            'anchor_check': reason,
-                        }, status=409)
-                        return
 
                     for _attempt in range(5):
                         try:

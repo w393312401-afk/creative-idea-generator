@@ -420,3 +420,62 @@ class TestFixAll:
         self._click(page)
         page.wait_for_timeout(300)
         assert page.evaluate("() => window.__fixed") == []
+
+
+RETRY_DIRTY_BTN = '.slot-toolbar[data-slot-type="image"] .slot-retry-dirty-btn'
+
+DIRTY_IDEA = {
+    "id": "dirty1",
+    "title": "已改动重渲",
+    "prompt_block": "x",
+    "prompt_slots": {"images": [{"index": i} for i in range(1, 5)],
+                     "videos": [{"index": i} for i in range(1, 4)]},
+    "frameRun": {
+        "frames": [
+            {"sequence": 1, "url": "/outputs/t/frames/img_001.webp"},
+            {"sequence": 2, "url": "/outputs/t/frames/img_002.webp", "prompt_dirty": True},
+            {"sequence": 3, "url": "/outputs/t/frames/img_003.webp"},
+            {"sequence": 4, "url": "/outputs/t/frames/img_004.webp", "prompt_dirty": True},
+        ],
+        "videos": [],
+    },
+}
+
+
+class TestRetryDirty:
+    def _load(self, page, idea=DIRTY_IDEA):
+        page.evaluate("""idea => {
+            currentIdea = idea; savedIdeas = [idea];
+            renderFramesForIdea(idea);
+        }""", idea)
+
+    def _stub(self, page):
+        page.evaluate("""() => {
+            window.__retried = [];
+            window.customConfirm = () => Promise.resolve(true);
+            window.reloadManifestIntoIdea = () => Promise.resolve();
+            window.retrySingleFrame = (seq) => {
+                window.__retried.push(seq);
+                return Promise.resolve();
+            };
+        }""")
+
+    def test_button_shows_and_counts_dirty_slots(self, page):
+        self._load(page)
+        assert page.eval_on_selector(RETRY_DIRTY_BTN, "el => !el.hidden")
+        assert page.eval_on_selector(RETRY_DIRTY_BTN, "el => el.textContent") == "⚡ 重渲已改动帧 (2)"
+
+    def test_button_hides_when_no_dirty_slots(self, page):
+        clean = json.loads(json.dumps(DIRTY_IDEA))
+        for f in clean["frameRun"]["frames"]:
+            f.pop("prompt_dirty", None)
+        self._load(page, clean)
+        assert page.eval_on_selector(RETRY_DIRTY_BTN, "el => el.hidden")
+
+    def test_retries_dirty_slots_in_ascending_order(self, page):
+        self._load(page)
+        self._stub(page)
+        page.eval_on_selector(RETRY_DIRTY_BTN, "el => el.click()")
+        page.wait_for_function("() => window.__retried.length === 2", timeout=5000)
+        assert page.evaluate("() => window.__retried") == [2, 4]
+
