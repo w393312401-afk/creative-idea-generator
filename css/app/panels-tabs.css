@@ -2650,6 +2650,50 @@ body.log-expanded .log-pill {
     background: rgba(16, 185, 129, 0.15) !important;
 }
 
+/* 4选1 候选图弹窗样式 */
+.modal-content.modal-candidates {
+    max-width: 1040px !important;
+    width: 95vw;
+}
+
+.candidates-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 16px;
+    align-items: stretch;
+}
+
+.candidate-card {
+    background: var(--bg-card, #1e293b);
+    border: 2px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.candidate-card:hover {
+    transform: translateY(-2px);
+    border-color: rgba(255, 255, 255, 0.2);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+.candidate-card.chosen {
+    border-color: #10b981 !important;
+    box-shadow: 0 0 16px rgba(16, 185, 129, 0.35) !important;
+}
+
+.candidate-card .candidate-thumb-wrap:hover img {
+    transform: scale(1.02);
+}
+
+.candidate-card .candidate-thumb-wrap img {
+    transition: transform 0.2s ease;
+}
+
+
 /* 人工主动标记的问题帧（manual_issue，见 describeFrameIssue）：与机器判定的
    vlm-failed 红色区分开——琥珀偏橙的描边表示"人说这里不对"，还没修。 */
 .frame-card.manual-flagged-card {

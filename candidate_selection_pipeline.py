@@ -35,66 +35,69 @@ from prompt_pipeline import (
     threshold_reveal_continuity_clause,
 )
 
-_AI_DISCRIMINATION_SYSTEM_PROMPT = """You are an elite Hollywood Visual Director and Automated Quality Assurance Evaluator for AI-generated continuous video frame sequences.
+_AI_DISCRIMINATION_SYSTEM_PROMPT = """你是一名好莱坞级电影视觉总监与 AI 视频连续帧序列智能质检鉴别专家。
 
-You will be given:
-1. THE PROMPT describing the current frame's physical scene, construction milestone delta, tools/actions, materials, and lighting.
-2. THE REFERENCE IMAGE (if provided: the previous authoritative frame in the sequence).
-3. 4 CANDIDATE IMAGES (labeled CANDIDATE 1, CANDIDATE 2, CANDIDATE 3, CANDIDATE 4) generated for this current frame.
+你将收到：
+1. 【本帧施工阶段与物理提示词】描述当前帧的具体施工节点、物理变化差量、工装工具/动作、材质与光影。
+2. 【前序基准参考图】（若提供：即前一拍已确认的官方基底画面）。
+3. 【4 张当前帧生成候选图】（标记为 CANDIDATE 1, CANDIDATE 2, CANDIDATE 3, CANDIDATE 4）。
 
-Your mission:
-Critically inspect all 4 candidate images and determine the SINGLE BEST candidate image to be selected as the official frame for this step. The chosen frame will become the authoritative reference image for the subsequent steps.
+你的核心任务：
+对全部 4 张候选图进行严格对比评审与多维度打分，选出最优秀、最连贯、最写实的唯一 1 张图作为本帧的官方采用图。被选中的帧将作为后续所有帧的基准参考图。
 
-Evaluate each candidate strictly across 4 Core Pillars:
-1. PROMPT & CONSTRUCTION DELTA ACCURACY (0-30 pts):
-   - Does it accurately portray the new physical milestone requested in the prompt (e.g. framing installed, floor laid, concrete poured)?
-   - Are the declared items, materials, and actions present without missing steps or premature completion?
+严格围绕以下 4 大核心维度进行评分（总分 100 分）：
+1. 提示词与工序差量准确性 (0-30 分)：
+   - 是否准确呈现提示词要求的全新物理施工节点（如龙骨已安装、地板已铺设、混凝土已浇筑等）？
+   - 声明的道具、建材和施工动作是否到位，无漏做工序或提前超纲完成？
 
-2. SPATIAL ANCHOR & PERSPECTIVE CONTINUITY (0-30 pts):
-   - Camera Alignment: Horizon height, field of view (24mm wide angle, human eye/chest level 1.3m), camera angle, and perspective must match the REFERENCE IMAGE.
-   - Landmark Lock: Ceilings, background walls, boundary structures, door frames, and fixed landmarks must remain physically consistent with the reference frame.
-   - Zero Cavernous Hall Expansion: Compact rooms/pits must NOT stretch into giant auditoriums or cave-like halls.
-   - Zero Phantom Changes: No unexplained alterations to already finished areas.
+2. 空间锚点与透视连续性 (0-30 分)：
+   - 镜头统一：地平线高度、视角焦段（24mm 广角感，1.3m 人眼/胸口视高）、机位高度和透视感是否与前序参考图高度一致？
+   - 地标锁定：天花板、后背景墙、门框/洞口边界、固定地标结构是否维持物理一致？
+   - 严防空间膨胀：紧凑空间/坑穴严禁异常拉伸为巨大礼堂或洞穴大厅（Cavernous expansion）。
+   - 零凭空变化：已完成的区域绝无莫名变动或无故复原破损。
 
-3. MATERIAL REALISM & LIGHTING INTEGRITY (0-25 pts):
-   - Photorealistic texture (matte/satin wood grains, authentic rough concrete/stone, natural light bounce).
-   - Forbidden: NO artificial mirror reflections or wet floor gloss in finished reveal scenes, NO random neon or zig-zag fluorescent light bars.
+3. 材质真实感与光影一致性 (0-25 分)：
+   - 真实物理质感（哑光/半哑光实木纹理、粗糙混凝土/天然石材、自然漫反射光）。
+   - 严禁违规：成品展示帧严禁出现假反光镜面或湿水面效果；灯光必须自然，严禁产生杂乱荧光灯带。
 
-4. ARTIFACT & PROHIBITED OBJECTS FREEDOM (0-15 pts):
-   - No extra/mutated human limbs or duplicated workers.
-   - Construction tool lifecycle: Tripods, loose cables, and heavy demolition tools must be removed once rooms are finished/furnished.
-   - No blurry distortion, floating objects, or AI rendering glitches.
+4. 瑕疵与违规物过滤 (0-15 分)：
+   - 严禁多肢/融化/肢体畸变或工人克隆多体重影。
+   - 工具生命周期：已完工/软装展示阶段必须彻底撤除三脚架、裸露电缆与破坏性重型工具。
+   - 画面清晰，无模糊失真或 AI 伪影。
 
-Output strictly valid JSON with this exact schema:
+【输出语言强制要求】：
+必须全量严格使用【简体中文】输出所有评分、优势（strengths）、缺陷（defects）与最终优选理由（selection_reason）。语言简练、专业、切中要点。
+
+请严格输出符合以下结构的合法 JSON 格式：
 {
   "candidates": [
     {
       "index": 1,
       "score": 85,
-      "strengths": "Detailed strengths of candidate 1",
-      "defects": "Defects or continuity drift of candidate 1"
+      "strengths": "简述候选1的核心优势（中文，不超过35字）",
+      "defects": "简述候选1的不足或偏差（中文，不超过35字）"
     },
     {
       "index": 2,
       "score": 92,
-      "strengths": "Detailed strengths of candidate 2",
-      "defects": "Defects or continuity drift of candidate 2"
+      "strengths": "简述候选2的核心优势（中文，不超过35字）",
+      "defects": "简述候选2的不足或偏差（中文，无明显缺陷可写'无明显缺陷'）"
     },
     {
       "index": 3,
       "score": 78,
-      "strengths": "Detailed strengths of candidate 3",
-      "defects": "Defects or continuity drift of candidate 3"
+      "strengths": "简述候选3的核心优势（中文，不超过35字）",
+      "defects": "简述候选3的不足或偏差（中文，不超过35字）"
     },
     {
       "index": 4,
       "score": 88,
-      "strengths": "Detailed strengths of candidate 4",
-      "defects": "Defects or continuity drift of candidate 4"
+      "strengths": "简述候选4的核心优势（中文，不超过35字）",
+      "defects": "简述候选4的不足或偏差（中文，不超过35字）"
     }
   ],
   "best_index": 2,
-  "selection_reason": "Clear explanation of why candidate 2 was chosen as the best frame"
+  "selection_reason": "综合评估结论：清晰阐述为何选择该候选图作为最佳官方采用帧（中文，不超过60字）"
 }
 """
 
@@ -340,26 +343,26 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
 
     # Prepare multimodal message
     user_text_parts = [
-        f"--- CURRENT FRAME REQUIREMENTS (IMAGE {seq:03d}) ---",
-        f"Prompt / Construction Milestone:",
+        f"--- 当前帧施工与画面要求 (IMG {seq:03d}) ---",
+        f"【本帧施工节点与提示词要求】:",
         prompt_text,
         "",
     ]
     
     image_paths_to_send = []
     if reference_path and os.path.exists(reference_path) and os.path.getsize(reference_path) > 0:
-        user_text_parts.append("The first image attached is the REFERENCE IMAGE (authoritative ground-truth from previous frame).")
-        user_text_parts.append(f"The following images are CANDIDATE 1 through CANDIDATE {len(candidate_paths)}.")
+        user_text_parts.append("附带的第 1 张图片为【基准参考图】（来自前序帧已确认的官方基底画面）。")
+        user_text_parts.append(f"随后的图片依次为【候选图 1】至【候选图 {len(candidate_paths)}】。")
         image_paths_to_send.append(reference_path)
     else:
-        user_text_parts.append("This is Frame 1 (Anchor). There is no prior reference image. Evaluate based on prompt fidelity and photorealism.")
-        user_text_parts.append(f"The following images are CANDIDATE 1 through CANDIDATE {len(candidate_paths)}.")
+        user_text_parts.append("本帧为【第 1 帧 / 锚点基准帧】，无前序参考图，请重点评估提示词还原度、透视构图与画面质感。")
+        user_text_parts.append(f"附带的图片依次为【候选图 1】至【候选图 {len(candidate_paths)}】。")
 
     for idx, cp in enumerate(candidate_paths):
-        user_text_parts.append(f"- CANDIDATE {idx+1}: {os.path.basename(cp)}")
+        user_text_parts.append(f"- 候选图 {idx+1}: {os.path.basename(cp)}")
         image_paths_to_send.append(cp)
 
-    user_text_parts.append("\nPlease output strictly the requested JSON analysis evaluating all candidates and selecting the best one.")
+    user_text_parts.append("\n【重要】：请全量严格使用【简体中文】输出 JSON 评审分析，对各候选图的优势（strengths）、缺陷（defects）与最终优选结论（selection_reason）进行中文评价。")
     user_text = "\n".join(user_text_parts)
 
     try:

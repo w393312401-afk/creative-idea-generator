@@ -290,6 +290,93 @@ def test_api_generate_frames_selection_routing(monkeypatch, temp_project):
         assert 'task_id' in body
         assert body['task_id'].startswith('frames_sel_')
         assert mock_thread.called
+        assert mock_thread.call_args[1]['target'] == server.generate_frames_selection_worker
+
+
+def test_api_generate_frames_standard_routing_ignores_old_manifest(monkeypatch, temp_project):
+    """Test that /api/generate_frames with standard mode routes to generate_frames_worker
+    even if the project previously had candidate_selection in manifest.json."""
+    import server
+
+    # Pre-populate manifest with candidate_selection
+    manifest_path = os.path.join(temp_project['project_dir'], 'manifest.json')
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        json.dump({'generation_mode': 'candidate_selection', 'frames': []}, f)
+
+    h = object.__new__(server.SparkRequestHandler)
+    h.path = '/api/generate_frames'
+    h.headers = {'content-type': 'application/json'}
+    sent = []
+    h._send_json = lambda obj, status=200: sent.append((obj, status))
+    h._read_json_body = lambda: {
+        'title': temp_project['project_name'],
+        'prompt_block': 'IMAGE 1:\nPrompt: test\n',
+        'generation_mode': 'standard',
+        'candidate_selection': False,
+        'config': {'candidateSelectionMode': False}
+    }
+
+    monkeypatch.setattr(server, 'access_ok', lambda self: True)
+    monkeypatch.setattr(server, 'rate_ok', lambda ip, k: True)
+    monkeypatch.setattr(server, 'prompt_delivery_block_reason', lambda body: None)
+    monkeypatch.setattr(server, '_require_fx_admission', lambda self, is_fx: True)
+    monkeypatch.setattr(server, 'resolve_cover_reference', lambda c, t, k: True)
+    monkeypatch.setattr(server, 'claim_frame_run', lambda p, tid: None)
+    monkeypatch.setattr(server, 'cleanup_old_tasks', lambda: None)
+    monkeypatch.setattr(server, 'get_or_create_task', lambda tid, meta=None: {'cancel_event': MagicMock()})
+
+    with patch('threading.Thread') as mock_thread:
+        mock_instance = MagicMock()
+        mock_thread.return_value = mock_instance
+
+        h.do_POST()
+
+        assert len(sent) == 1
+        body, status = sent[0]
+        assert status == 200
+        assert body['status'] == 'ok'
+        assert mock_thread.called
+        assert mock_thread.call_args[1]['target'] == server.generate_frames_worker
+
+
+def test_api_generate_frames_candidate_selection_routing(monkeypatch, temp_project):
+    """Test that /api/generate_frames with candidate_selection mode routes to generate_frames_selection_worker."""
+    import server
+
+    h = object.__new__(server.SparkRequestHandler)
+    h.path = '/api/generate_frames'
+    h.headers = {'content-type': 'application/json'}
+    sent = []
+    h._send_json = lambda obj, status=200: sent.append((obj, status))
+    h._read_json_body = lambda: {
+        'title': temp_project['project_name'],
+        'prompt_block': 'IMAGE 1:\nPrompt: test\n',
+        'generation_mode': 'candidate_selection',
+        'candidate_selection': True,
+        'config': {}
+    }
+
+    monkeypatch.setattr(server, 'access_ok', lambda self: True)
+    monkeypatch.setattr(server, 'rate_ok', lambda ip, k: True)
+    monkeypatch.setattr(server, 'prompt_delivery_block_reason', lambda body: None)
+    monkeypatch.setattr(server, '_require_fx_admission', lambda self, is_fx: True)
+    monkeypatch.setattr(server, 'resolve_cover_reference', lambda c, t, k: True)
+    monkeypatch.setattr(server, 'claim_frame_run', lambda p, tid: None)
+    monkeypatch.setattr(server, 'cleanup_old_tasks', lambda: None)
+    monkeypatch.setattr(server, 'get_or_create_task', lambda tid, meta=None: {'cancel_event': MagicMock()})
+
+    with patch('threading.Thread') as mock_thread:
+        mock_instance = MagicMock()
+        mock_thread.return_value = mock_instance
+
+        h.do_POST()
+
+        assert len(sent) == 1
+        body, status = sent[0]
+        assert status == 200
+        assert body['status'] == 'ok'
+        assert mock_thread.called
+        assert mock_thread.call_args[1]['target'] == server.generate_frames_selection_worker
 
 
 def test_api_switch_candidate_routing(monkeypatch, temp_project):

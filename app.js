@@ -1403,8 +1403,19 @@ function setupEventListeners() {
     const candCloseBtn = document.getElementById('candidate-selection-close-btn');
     if (candCloseBtn) {
         candCloseBtn.addEventListener('click', () => {
-            const modal = document.getElementById('candidate-selection-modal');
-            if (modal) modal.style.display = 'none';
+            if (typeof closeCandidateSelectionModal === 'function') closeCandidateSelectionModal();
+            else {
+                const modal = document.getElementById('candidate-selection-modal');
+                if (modal) { modal.classList.remove('active'); modal.style.display = 'none'; }
+            }
+        });
+    }
+    const candModal = document.getElementById('candidate-selection-modal');
+    if (candModal) {
+        candModal.addEventListener('click', (e) => {
+            if (e.target === candModal) {
+                if (typeof closeCandidateSelectionModal === 'function') closeCandidateSelectionModal();
+            }
         });
     }
     document.getElementById('run-sequence-review-btn').addEventListener('click', () => runSequenceReview());
@@ -3659,14 +3670,18 @@ async function generateFrames() {
         : '准备生成帧序列...';
 
     try {
+        if (ownerIdea) {
+            ownerIdea.generation_mode = 'standard';
+        }
         const body = {
             config: withCoverReference(config, ownerIdea),
             title: getIdeaSaveTitle(ownerIdea),
             display_title: ownerIdea.title,
             prompt_block: ownerIdea.prompt_block,
             generation_source: ownerIdea.generation_source,
-            generation_mode: ownerIdea.generation_mode || 'candidate_selection',
-            candidate_count: 4,
+            generation_mode: 'standard',
+            candidate_selection: false,
+            candidate_count: 1,
             degraded: ownerIdea.degraded === true,
             quality_gate: ownerIdea.quality_gate || null,
             diagnostic_mode: ownerIdea.diagnostic_mode === true
@@ -3739,11 +3754,16 @@ async function generateFramesSelection() {
         : '🚀 正在启动 4选1 智能帧序列生成与 AI 鉴别管线...';
 
     try {
+        if (ownerIdea) {
+            ownerIdea.generation_mode = 'candidate_selection';
+        }
         const body = {
             config: withCoverReference(config, ownerIdea),
             title: getIdeaSaveTitle(ownerIdea),
             display_title: ownerIdea.title,
             prompt_block: ownerIdea.prompt_block,
+            generation_mode: 'candidate_selection',
+            candidate_selection: true,
             candidate_count: 4
         };
         if (targetSequences) body.target_sequences = targetSequences;
@@ -3776,79 +3796,118 @@ async function generateFramesSelection() {
     }
 }
 
-function openCandidateSelectionModal(seq, frameData) {
+async function openCandidateSelectionModal(seq, frameData) {
     const modal = document.getElementById('candidate-selection-modal');
     if (!modal) return;
 
+    const seqNum = Number(seq);
+
+    // 1. 若外部未传 frameData，从 currentIdea.frameRun.frames 中获取
     if (!frameData && typeof currentIdea !== 'undefined' && currentIdea && currentIdea.frameRun && currentIdea.frameRun.frames) {
-        frameData = currentIdea.frameRun.frames.find(f => f.sequence === seq) || {};
+        frameData = currentIdea.frameRun.frames.find(f => Number(f.sequence) === seqNum || Number(f.slot) === seqNum) || {};
+    }
+
+    // 2. 若内存中暂无候选图记录，尝试从后端 manifest 同步最新数据
+    if ((!frameData || !frameData.candidates || !frameData.candidates.length) && typeof currentIdea !== 'undefined' && currentIdea) {
+        const projectTitle = (typeof getIdeaSaveTitle === 'function') ? getIdeaSaveTitle(currentIdea) : (currentIdea.project_key || currentIdea.title);
+        if (projectTitle) {
+            try {
+                const resp = await fetch(`/api/get_manifest?title=${encodeURIComponent(projectTitle)}`);
+                if (resp.ok) {
+                    const mf = await resp.json();
+                    if (mf && Array.isArray(mf.frames)) {
+                        if (!currentIdea.frameRun) currentIdea.frameRun = {};
+                        currentIdea.frameRun.frames = mf.frames;
+                        frameData = mf.frames.find(f => Number(f.sequence) === seqNum || Number(f.slot) === seqNum) || {};
+                        if (typeof saveCurrentIdeaState === 'function') saveCurrentIdeaState();
+                    }
+                }
+            } catch (e) {
+                console.warn('[Candidates] 同步最新 manifest 异常:', e);
+            }
+        }
     }
 
     const titleEl = document.getElementById('candidate-modal-title');
-    const subtitleEl = document.getElementById('candidate-modal-subtitle');
-    const reasoningEl = document.getElementById('candidate-modal-reasoning');
-    const gridEl = document.getElementById('candidate-cards-grid');
+    const seqEl = document.getElementById('candidate-modal-seq');
+    const chosenTagEl = document.getElementById('candidate-modal-chosen-tag');
+    const reasonEl = document.getElementById('candidate-modal-reason') || document.getElementById('candidate-modal-reasoning');
+    const gridEl = document.getElementById('candidates-modal-grid') || document.getElementById('candidate-cards-grid');
 
-    if (titleEl) titleEl.textContent = `🎯 IMG ${String(seq).padStart(3, '0')} · 4 候选图对比与 AI 鉴别结果`;
-    if (subtitleEl) subtitleEl.textContent = `当前展示该帧的全部生成候选图与 AI 多模态多维视觉评分。点击“设为采用”可随时手动切换采用图。`;
+    const padSeq = String(seqNum || 1).padStart(3, '0');
+    if (seqEl) seqEl.textContent = `IMG ${padSeq}`;
+    if (titleEl) titleEl.textContent = `🎯 IMG ${padSeq} · 4选1 候选图对比与 AI 鉴别详情`;
 
     const aiEval = (frameData && frameData.ai_evaluation) || {};
-    if (reasoningEl) {
-        const reasonText = aiEval.selection_reason || (frameData && frameData.candidate_selection_reason) || 'AI 鉴别优选';
-        const bestIdx = aiEval.best_index || (frameData && frameData.chosen_candidate_index) || 1;
-        reasoningEl.innerHTML = `<strong>🤖 AI 多模态评估结论：</strong>${escapeHtml(reasonText)} <span style="margin-left:8px; padding:2px 8px; border-radius:10px; background:rgba(16,185,129,0.2); color:#10b981; font-weight:600;">推荐采用: 候选 #${bestIdx}</span>`;
-        reasoningEl.style.display = 'block';
+    const chosenIdx = (frameData && frameData.chosen_candidate_index) || 1;
+
+    if (chosenTagEl) {
+        chosenTagEl.textContent = `👑 当前采用: 候选 #${chosenIdx}`;
+    }
+
+    if (reasonEl) {
+        const reasonText = aiEval.selection_reason || (frameData && frameData.candidate_selection_reason) || (frameData && frameData.vlm_qa_reason) || 'AI 4选1 智能鉴别优选完成';
+        const bestIdx = aiEval.best_index || chosenIdx;
+        reasonEl.innerHTML = `${escapeHtml(reasonText)} <span style="margin-left:8px; padding:2px 8px; border-radius:10px; background:rgba(16,185,129,0.2); color:#10b981; font-weight:600;">推荐采用: 候选 #${bestIdx}</span>`;
     }
 
     if (gridEl) {
         gridEl.innerHTML = '';
-        const candidates = (frameData && frameData.candidates) || [];
-        const chosenIdx = (frameData && frameData.chosen_candidate_index) || 1;
+        let candidates = (frameData && Array.isArray(frameData.candidates)) ? frameData.candidates : [];
+
+        if (!candidates.length && frameData && (frameData.url || frameData.file)) {
+            candidates = [{
+                index: 1,
+                url: frameData.url || frameData.file,
+                score: 85,
+                strengths: '基础主帧画面',
+                defects: '',
+                is_chosen: true
+            }];
+        }
 
         if (!candidates.length) {
-            gridEl.innerHTML = `<div style="grid-column:1/-1; text-align:center; padding:30px; color:var(--text-muted);">暂无候选图记录</div>`;
+            gridEl.innerHTML = `<div style="grid-column:1/-1; text-align:center; padding:36px 20px; color:var(--text-muted);">
+                <div style="font-size:32px; margin-bottom:10px;">🖼️</div>
+                <div style="font-weight:600; font-size:14px; color:var(--text-primary); margin-bottom:6px;">暂无该帧的 4 选 1 候选图记录</div>
+                <div style="font-size:12px;">请确保已开启「4选1 智能模式」并重新生成该帧。</div>
+            </div>`;
         } else {
             candidates.forEach(cand => {
-                const cIdx = cand.index;
-                const isChosen = cIdx === chosenIdx;
+                const cIdx = cand.index || 1;
+                const isChosen = Number(cIdx) === Number(chosenIdx);
                 const score = cand.score != null ? cand.score : '--';
                 const strengths = cand.strengths || '';
                 const defects = cand.defects || '';
-                const fileUrl = cand.url || cand.file || '';
+                let fileUrl = cand.url || cand.file || '';
+                if (fileUrl && !fileUrl.startsWith('/') && !fileUrl.startsWith('http') && !fileUrl.startsWith('data:')) {
+                    fileUrl = '/' + fileUrl;
+                }
 
                 const card = document.createElement('div');
                 card.className = `candidate-card ${isChosen ? 'chosen' : ''}`;
-                card.style.cssText = `
-                    background: var(--bg-card, #1e293b);
-                    border: 2px solid ${isChosen ? '#10b981' : 'rgba(255,255,255,0.08)'};
-                    border-radius: 8px;
-                    overflow: hidden;
-                    display: flex;
-                    flex-direction: column;
-                    box-shadow: ${isChosen ? '0 0 12px rgba(16,185,129,0.3)' : 'none'};
-                    position: relative;
-                `;
 
                 card.innerHTML = `
-                    <div style="position:relative; aspect-ratio: 9/16; background:#0f172a; overflow:hidden; cursor:pointer;" onclick="if(window.openLightbox) openLightbox('${fileUrl}')">
-                        <img src="${fileUrl}" alt="Candidate #${cIdx}" style="width:100%; height:100%; object-fit:contain;" />
-                        <div style="position:absolute; top:6px; left:6px; background:rgba(0,0,0,0.7); color:#fff; font-size:11px; padding:2px 6px; border-radius:4px; font-weight:bold;">
+                    <div class="candidate-thumb-wrap" style="position:relative; aspect-ratio: 9/16; background:#0f172a; overflow:hidden; cursor:pointer;" title="点击查看大图" onclick="if(window.openLightbox) openLightbox('${escapeHtml(fileUrl)}')">
+                        <img src="${escapeHtml(fileUrl)}" alt="Candidate #${cIdx}" style="width:100%; height:100%; object-fit:cover;" onerror="this.onerror=null; this.src='${escapeHtml(fileUrl)}';" />
+                        <div style="position:absolute; top:8px; left:8px; background:rgba(0,0,0,0.75); backdrop-filter:blur(4px); color:#fff; font-size:11px; padding:3px 7px; border-radius:4px; font-weight:bold;">
                             #${cIdx}
                         </div>
-                        <div style="position:absolute; top:6px; right:6px; background:${isChosen ? '#10b981' : 'rgba(0,0,0,0.6)'}; color:#fff; font-size:11px; padding:2px 6px; border-radius:4px; font-weight:bold;">
+                        <div style="position:absolute; top:8px; right:8px; background:${isChosen ? '#10b981' : 'rgba(0,0,0,0.65)'}; backdrop-filter:blur(4px); color:#fff; font-size:11px; padding:3px 7px; border-radius:4px; font-weight:bold;">
                             ${score} 分
                         </div>
-                        ${isChosen ? '<div style="position:absolute; bottom:6px; left:6px; right:6px; background:#10b981; color:#fff; font-size:11px; text-align:center; padding:2px 4px; border-radius:4px; font-weight:bold;">👑 当前采用</div>' : ''}
+                        ${isChosen ? '<div style="position:absolute; bottom:8px; left:8px; right:8px; background:linear-gradient(135deg, #10b981, #059669); color:#fff; font-size:11px; text-align:center; padding:3px 6px; border-radius:4px; font-weight:bold; box-shadow:0 2px 6px rgba(0,0,0,0.3);">👑 当前采用</div>' : ''}
                     </div>
-                    <div style="padding:10px; font-size:12px; flex:1; display:flex; flex-direction:column; justify-content:space-between; gap:6px;">
-                        <div style="color:var(--text-muted, #94a3b8); line-height:1.4;">
-                            ${strengths ? `<div style="color:#10b981; margin-bottom:2px;"><strong>+</strong> ${escapeHtml(strengths)}</div>` : ''}
+                    <div style="padding:12px; font-size:12px; flex:1; display:flex; flex-direction:column; justify-content:space-between; gap:8px;">
+                        <div style="color:var(--text-muted, #94a3b8); line-height:1.45; font-size:11.5px;">
+                            ${strengths ? `<div style="color:#10b981; margin-bottom:4px;"><strong>+</strong> ${escapeHtml(strengths)}</div>` : ''}
                             ${defects ? `<div style="color:#f87171;"><strong>-</strong> ${escapeHtml(defects)}</div>` : ''}
+                            ${!strengths && !defects ? `<div style="color:var(--text-secondary);">候选图 #${cIdx}（评分: ${score}）</div>` : ''}
                         </div>
-                        <div>
+                        <div style="margin-top:auto;">
                             ${isChosen 
-                                ? `<button class="action-btn text-btn mini-btn" style="width:100%; border-color:#10b981; color:#10b981; cursor:default;" disabled>✅ 当前已采用</button>`
-                                : `<button class="action-btn text-btn mini-btn" style="width:100%; color:var(--accent-orange, #f59e0b); border-color:rgba(245,158,11,0.4);" onclick="switchCandidateForFrame(${seq}, ${cIdx})">👉 设为采用此图</button>`
+                                ? `<button type="button" class="action-btn text-btn mini-btn" style="width:100%; border-color:#10b981; color:#10b981; background:rgba(16,185,129,0.1); cursor:default; font-weight:600;" disabled>✅ 当前已采用</button>`
+                                : `<button type="button" class="action-btn text-btn mini-btn" style="width:100%; color:var(--accent-orange, #f59e0b); border-color:rgba(245,158,11,0.5); font-weight:600;" onclick="switchCandidateForFrame(${seqNum}, ${cIdx})">👉 设为采用此图</button>`
                             }
                         </div>
                     </div>
@@ -3859,12 +3918,24 @@ function openCandidateSelectionModal(seq, frameData) {
     }
 
     modal.style.display = 'flex';
+    modal.classList.add('active');
+}
+
+function closeCandidateSelectionModal() {
+    const modal = document.getElementById('candidate-selection-modal');
+    if (!modal) return;
+    modal.classList.remove('active');
+    setTimeout(() => {
+        if (!modal.classList.contains('active')) {
+            modal.style.display = 'none';
+        }
+    }, 200);
 }
 
 async function switchCandidateForFrame(seq, candidateIndex) {
     if (!currentIdea) return;
     const ownerIdea = currentIdea;
-    const projectTitle = getIdeaSaveTitle(ownerIdea);
+    const projectTitle = (typeof getIdeaSaveTitle === 'function') ? getIdeaSaveTitle(ownerIdea) : (ownerIdea.project_key || ownerIdea.title);
 
     try {
         const response = await fetch('/api/switch_candidate', {
@@ -3872,8 +3943,8 @@ async function switchCandidateForFrame(seq, candidateIndex) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 title: projectTitle,
-                sequence: seq,
-                candidate_index: candidateIndex
+                sequence: Number(seq),
+                candidate_index: Number(candidateIndex)
             })
         });
 
@@ -3890,20 +3961,23 @@ async function switchCandidateForFrame(seq, candidateIndex) {
                 ...(ownerIdea.frameRun || {}),
                 frames: data.manifest.frames
             };
-            if (isViewingIdea(ownerIdea.id)) {
+            if (typeof isViewingIdea === 'function' ? isViewingIdea(ownerIdea.id) : true) {
                 renderFramesForIdea(ownerIdea);
             }
-            saveCurrentIdeaState();
+            if (typeof saveCurrentIdeaState === 'function') saveCurrentIdeaState();
         }
 
-        const modal = document.getElementById('candidate-selection-modal');
-        if (modal) modal.style.display = 'none';
+        closeCandidateSelectionModal();
 
     } catch (e) {
         console.error("Failed to switch candidate:", e);
         showToast(`切换候选图失败: ${e.message}`, "error");
     }
 }
+
+window.openCandidateSelectionModal = openCandidateSelectionModal;
+window.closeCandidateSelectionModal = closeCandidateSelectionModal;
+window.switchCandidateForFrame = switchCandidateForFrame;
 
 // Function renderFramesForIdea moved to modular JS file
 
@@ -4358,6 +4432,12 @@ function handleGlobalHotkeys(e) {
             if (closeBtn) closeBtn.click();
         }
 
+        const candModal = document.getElementById('candidate-selection-modal');
+        if (candModal && (candModal.classList.contains('active') || candModal.style.display === 'flex')) {
+            if (typeof closeCandidateSelectionModal === 'function') closeCandidateSelectionModal();
+            else { candModal.classList.remove('active'); candModal.style.display = 'none'; }
+        }
+
         // 收起项目工作台的详情栏（两个右侧抽屉与卡片删除确认浮层已随 P4 删除）
         const detailClose = document.querySelector('#projects-detail .projects-detail-close');
         if (detailClose) detailClose.click();
@@ -4572,6 +4652,16 @@ function initPipelineBar() {
             candToggle.checked = (saved === 'true');
         } else if (typeof config !== 'undefined' && config.candidateSelectionMode === true) {
             candToggle.checked = true;
+        } else {
+            candToggle.checked = false;
+        }
+        if (typeof config !== 'undefined') {
+            config.candidateSelectionMode = candToggle.checked;
+            config.candidateSelection = candToggle.checked;
+            config.generation_mode = candToggle.checked ? 'candidate_selection' : 'standard';
+        }
+        if (typeof currentIdea !== 'undefined' && currentIdea) {
+            currentIdea.generation_mode = candToggle.checked ? 'candidate_selection' : 'standard';
         }
         if (toggleLabel) {
             toggleLabel.classList.toggle('is-active', candToggle.checked);
@@ -4579,7 +4669,14 @@ function initPipelineBar() {
         candToggle.addEventListener('change', () => {
             const checked = candToggle.checked;
             localStorage.setItem('pipeline_candidate_selection_mode', checked ? 'true' : 'false');
-            if (typeof config !== 'undefined') config.candidateSelectionMode = checked;
+            if (typeof config !== 'undefined') {
+                config.candidateSelectionMode = checked;
+                config.candidateSelection = checked;
+                config.generation_mode = checked ? 'candidate_selection' : 'standard';
+            }
+            if (typeof currentIdea !== 'undefined' && currentIdea) {
+                currentIdea.generation_mode = checked ? 'candidate_selection' : 'standard';
+            }
             if (toggleLabel) {
                 toggleLabel.classList.toggle('is-active', checked);
             }

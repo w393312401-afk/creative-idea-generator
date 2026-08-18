@@ -188,6 +188,8 @@ const SLOT_ACTION_HANDLERS = {
     'view-candidates': seq => {
         if (typeof openCandidateSelectionModal === 'function') {
             openCandidateSelectionModal(seq);
+        } else if (typeof window !== 'undefined' && typeof window.openCandidateSelectionModal === 'function') {
+            window.openCandidateSelectionModal(seq);
         }
     },
     'upload-frame': seq => triggerFrameUpload(seq),
@@ -271,6 +273,8 @@ function bindSlotGrid(gridId) {
             e.stopPropagation();
             if (typeof openCandidateSelectionModal === 'function') {
                 openCandidateSelectionModal(seq);
+            } else if (typeof window !== 'undefined' && typeof window.openCandidateSelectionModal === 'function') {
+                window.openCandidateSelectionModal(seq);
             }
             return;
         }

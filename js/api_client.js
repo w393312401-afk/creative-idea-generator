@@ -1235,6 +1235,12 @@ async function retrySingleFrame(seq) {
     let disconnected = false;
 
     try {
+        const isCand = (typeof isCandidateSelectionMode === 'function')
+            ? isCandidateSelectionMode()
+            : false;
+        if (ownerIdea) {
+            ownerIdea.generation_mode = isCand ? 'candidate_selection' : 'standard';
+        }
         const response = await fetch('/api/generate_frames', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1245,8 +1251,9 @@ async function retrySingleFrame(seq) {
                 display_title: ownerIdea.title,
                 prompt_block: ownerIdea.prompt_block,
                 generation_source: ownerIdea.generation_source,
-                generation_mode: ownerIdea.generation_mode || 'candidate_selection',
-                candidate_count: 4,
+                generation_mode: isCand ? 'candidate_selection' : 'standard',
+                candidate_selection: isCand,
+                candidate_count: isCand ? 4 : 1,
                 degraded: ownerIdea.degraded === true,
                 quality_gate: ownerIdea.quality_gate || null,
                 diagnostic_mode: ownerIdea.diagnostic_mode === true,

@@ -31,9 +31,17 @@ function initLightbox() {
     });
 }
 
-function openLightbox(items, index) {
-    lightboxItems = items;
-    lightboxActiveIndex = index;
+function openLightbox(items, index = 0) {
+    if (typeof items === 'string') {
+        lightboxItems = [{ type: 'image', url: items, caption: '' }];
+        lightboxActiveIndex = 0;
+    } else if (items && !Array.isArray(items)) {
+        lightboxItems = [items];
+        lightboxActiveIndex = 0;
+    } else {
+        lightboxItems = items || [];
+        lightboxActiveIndex = (typeof index === 'number' && index >= 0) ? index : 0;
+    }
 
     const modal = document.getElementById('lightbox-modal');
     if (!modal) return;

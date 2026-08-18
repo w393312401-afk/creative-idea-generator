@@ -4712,13 +4712,26 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                              "userId": config.get('googleFxUserId') or None})
 
                 manifest = read_manifest(project_dir) if project_dir else {}
-                is_candidate_selection = (
-                    body.get('generation_mode') == 'candidate_selection'
-                    or body.get('candidate_selection') is True
-                    or config.get('generation_mode') == 'candidate_selection'
-                    or config.get('candidateSelection') is True
-                    or (isinstance(manifest, dict) and manifest.get('generation_mode') == 'candidate_selection')
+                is_explicitly_disabled = (
+                    body.get('candidate_selection') is False
+                    or body.get('candidateSelectionMode') is False
+                    or body.get('candidateSelection') is False
+                    or body.get('generation_mode') in ('standard', 'sequential', 'normal', 'single', 'default')
+                    or config.get('candidateSelection') is False
+                    or config.get('candidateSelectionMode') is False
+                    or config.get('generation_mode') in ('standard', 'sequential', 'normal', 'single', 'default')
                 )
+                if is_explicitly_disabled:
+                    is_candidate_selection = False
+                else:
+                    is_candidate_selection = bool(
+                        body.get('generation_mode') == 'candidate_selection'
+                        or body.get('candidate_selection') is True
+                        or body.get('candidateSelectionMode') is True
+                        or config.get('generation_mode') == 'candidate_selection'
+                        or config.get('candidateSelection') is True
+                        or config.get('candidateSelectionMode') is True
+                    )
                 target_worker = generate_frames_selection_worker if is_candidate_selection else generate_frames_worker
 
                 threading.Thread(
