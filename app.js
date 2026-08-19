@@ -1029,6 +1029,29 @@ async function updateCacheSizeInfo() {
     }
 }
 
+// Fetch and update log size info in settings modal
+async function updateLogsSizeInfo() {
+    const logsInfoSpan = document.getElementById('logs-size-info');
+    if (!logsInfoSpan) return;
+    logsInfoSpan.textContent = '计算中...';
+    try {
+        const resp = await fetch('/api/logs-info');
+        if (resp.ok) {
+            const data = await resp.json();
+            const total = data.total_size || 0;
+            // 日志按 8MB×3 封顶，KB 在这个量级读起来太长，超过 1MB 就换单位
+            const size = total >= 1024 * 1024
+                ? `${(total / 1024 / 1024).toFixed(2)} MB`
+                : `${(total / 1024).toFixed(2)} KB`;
+            logsInfoSpan.textContent = `${size} (${data.file_count || 0}个文件)`;
+        } else {
+            logsInfoSpan.textContent = '获取失败';
+        }
+    } catch (e) {
+        logsInfoSpan.textContent = '获取失败';
+    }
+}
+
 // 「任务列表」「点子库」两个右侧抽屉及其开合函数已于 2026-07-31（P4）删除，
 // 内容合并进「📁 项目」主标签页（js/projects.js）。右侧现在只剩日志 dock 一个
 // 停靠物，不再需要三者互斥的那套协调逻辑。
@@ -1061,6 +1084,7 @@ function setupEventListeners() {
             switchSettingsSection(localStorage.getItem('spark_settings_section') || 'backend');
         }
         updateCacheSizeInfo();
+        updateLogsSizeInfo();
     });
     closeSettings.addEventListener('click', () => settingsModal.classList.remove('active'));
     
@@ -1096,6 +1120,37 @@ function setupEventListeners() {
             } finally {
                 clearCacheBtn.disabled = false;
                 clearCacheBtn.textContent = '🧹 清理系统缓存';
+            }
+        });
+    }
+
+    // Clear logs button handler
+    const clearLogsBtn = document.getElementById('clear-logs-btn');
+    if (clearLogsBtn) {
+        clearLogsBtn.addEventListener('click', async () => {
+            if (!confirm('确定要清理运行日志吗？server.log 及其轮转备份会被清空，历史日志无法恢复。\n\n服务不会中断，日志会继续写入。')) {
+                return;
+            }
+            try {
+                clearLogsBtn.disabled = true;
+                clearLogsBtn.textContent = '清理中...';
+                const resp = await fetch('/api/clear-logs', { method: 'POST' });
+                const data = await resp.json();
+                if (data.status === 'success') {
+                    const freed = data.freed_bytes || 0;
+                    const size = freed >= 1024 * 1024
+                        ? `${(freed / 1024 / 1024).toFixed(2)} MB`
+                        : `${(freed / 1024).toFixed(2)} KB`;
+                    showToast(`运行日志清理成功，释放 ${size}`, 'success');
+                    updateLogsSizeInfo();
+                } else {
+                    showToast('清理失败: ' + data.message, 'error');
+                }
+            } catch (err) {
+                showToast('请求出错: ' + err.message, 'error');
+            } finally {
+                clearLogsBtn.disabled = false;
+                clearLogsBtn.textContent = '🧹 清理运行日志';
             }
         });
     }

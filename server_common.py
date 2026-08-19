@@ -183,6 +183,48 @@ class RotatingFileStream:
                 pass
         self._open()
 
+    def sibling_paths(self):
+        """轮转兄弟文件的完整清单（.1 / .2 ...），不含主文件。"""
+        return [f"{self.filepath}.{i}" for i in range(1, self.backup_count + 1)]
+
+    def clear(self):
+        """清空主日志并删除全部轮转兄弟文件，返回释放的字节数。
+
+        必须走这条路而不是外部直接 os.remove(server.log)：日志文件被本对象以
+        追加模式常驻打开（buffering=1），Windows 上删不掉正在打开的文件，
+        Linux 上删了也只是解链——句柄还指向旧 inode，之后的日志会写进一个
+        已经没有目录项的幽灵文件，前端日志面板从此再也收不到新行。
+        这里复用 _rotate() 那套「先关闭、再动文件、最后 _open() 重开」的顺序，
+        并全程持 self.lock，与并发的 _write_line() 互斥。
+        """
+        freed = 0
+        with self.lock:
+            if self.file:
+                try:
+                    self.file.close()
+                except Exception:
+                    pass
+                self.file = None
+            for path in [self.filepath] + self.sibling_paths():
+                if not os.path.exists(path):
+                    continue
+                try:
+                    freed += os.path.getsize(path)
+                except Exception:
+                    pass
+                try:
+                    # 主文件截断而不是删除：run.sh 后台启动时把进程的 fd1/fd2 直接
+                    # 重定向到了这个路径，删掉它那两个 fd 就会跟着悬空。
+                    if path == self.filepath:
+                        with open(path, 'w', encoding=self.encoding):
+                            pass
+                    else:
+                        os.remove(path)
+                except Exception:
+                    pass
+            self._open()
+        return freed
+
 class _Tee:
     """Write to several streams at once (e.g. the real console + the log file),
     swallowing per-stream errors so one broken stream never crashes the server."""
@@ -231,6 +273,54 @@ else:
     if _rotating_log.file:
         _rotating_log.file.write(f"\n===== SPARK server log opened {datetime.now().isoformat()} =====\n")
         _rotating_log.file.flush()
+
+
+# ── 日志维护：给配置中心「系统」分区的日志清理功能用 ──────────────────
+# 两个函数都不假设 _rotating_log 存在：pytest 下它是 None（测试进程不碰生产
+# 日志），此时按 _LOG_PATH 直接扫盘/清理，行为与线上一致。
+
+def log_files_info():
+    """当前日志占用：主文件 + 轮转兄弟文件的逐个大小与合计。"""
+    if _rotating_log is not None:
+        paths = [_rotating_log.filepath] + _rotating_log.sibling_paths()
+    else:
+        paths = [_LOG_PATH] + [f"{_LOG_PATH}.{i}" for i in (1, 2)]
+    files = []
+    total = 0
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            size = os.path.getsize(path)
+        except Exception:
+            continue
+        files.append({'name': os.path.basename(path), 'size': size})
+        total += size
+    return {'files': files, 'total_size': total, 'file_count': len(files)}
+
+
+def clear_log_files():
+    """清空日志，返回释放的字节数。轮转兄弟文件删除，主文件截断（见 clear()）。"""
+    if _rotating_log is not None:
+        return _rotating_log.clear()
+    freed = 0
+    for path in [_LOG_PATH] + [f"{_LOG_PATH}.{i}" for i in (1, 2)]:
+        if not os.path.exists(path):
+            continue
+        try:
+            freed += os.path.getsize(path)
+        except Exception:
+            pass
+        try:
+            if path == _LOG_PATH:
+                with open(path, 'w', encoding='utf-8'):
+                    pass
+            else:
+                os.remove(path)
+        except Exception:
+            pass
+    return freed
+
 
 # Load config early so we know DEBUG_MODE
 SERVER_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server_config.json')

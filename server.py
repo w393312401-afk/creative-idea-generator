@@ -3125,6 +3125,15 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 })
             except Exception as e:
                 self._send_json({'error': str(e)}, status=500)
+        elif path == '/api/logs-info':
+            # 日志占用体积：server.log 及其轮转兄弟（.1/.2）。文件名会回给前端，
+            # 而它们只是 basename（不含目录），不泄露服务端路径。
+            if not self._gate():
+                return
+            try:
+                self._send_json(log_files_info())
+            except Exception as e:
+                self._send_json({'error': str(e)}, status=500)
         elif path == '/api/gallery':
             # 画廊：扫描 outputs/ 下全部历史媒体（封面/帧序列/视频/图像工坊），
             # 并标注引用关系（封面 in_use / 项目组 orphan）。引用收集失败时降级
@@ -4315,6 +4324,24 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     with open(CACHE_PATH, 'w', encoding='utf-8') as f:
                         json.dump({}, f, ensure_ascii=False, indent=2)
                 self._send_json({'status': 'success', 'message': '系统缓存清理成功'})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/clear-logs':
+            # 清空 server.log 及其轮转兄弟。日志文件被 RotatingFileStream 常驻
+            # 打开，清理必须走 clear_log_files()（内部持锁 + 关闭重开），外部
+            # 直接删文件会让日志句柄悬空，前端日志面板从此收不到新行。
+            if not self._gate():
+                return
+            try:
+                freed = clear_log_files()
+                # 这条会成为清空后的第一行，正好给日志面板一个"确实清过"的锚点。
+                print(f"[LOGS] 日志已由配置中心清理，释放 {freed} 字节")
+                self._send_json({
+                    'status': 'success',
+                    'message': '日志清理成功',
+                    'freed_bytes': freed,
+                })
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 

@@ -1732,6 +1732,14 @@
                             </div>
                             <small class="settings-hint">清理的是 packet_cache.json（已缓存的 LLM 激发数据），不影响点子库与已生成的素材。</small>
                         </div>
+                        <div class="form-group settings-field" id="logs-group">
+                            <label>运行日志</label>
+                            <div class="settings-field-inline">
+                                <button id="clear-logs-btn" class="text-btn danger">🧹 清理运行日志</button>
+                                <span id="logs-size-info">计算中...</span>
+                            </div>
+                            <small class="settings-hint">清空 server.log 及其轮转备份（.1/.2）。只删历史记录，服务照常运行、日志继续写；右侧日志面板会从空白重新开始。</small>
+                        </div>
                     </section>
 
                 </div>
