@@ -55,3 +55,8 @@ scratch_*
 .gemini/
 .pytest_cache/
 .DS_Store
+
+# ── Python 虚拟环境:体积 200M+ 且含平台专属二进制(.pyd/.exe),
+# Mac/Win 双机同步时互不可用。用 requirements.txt / pyproject.toml 重建。──
+.venv/
+venv/
