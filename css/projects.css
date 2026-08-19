@@ -430,8 +430,7 @@
     border-color: var(--border-color);
 }
 
-#panel-projects .project-badge.saved,
-#panel-projects .project-badge.ledger {
+#panel-projects .project-badge.saved {
     background: rgba(var(--ink-rgb), 0.05);
     color: var(--text-secondary);
     border-color: var(--border-color);

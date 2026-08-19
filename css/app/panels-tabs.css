@@ -202,321 +202,6 @@ html[data-theme="dark"] .task-status-badge.completed {
     color: #6ee7b7;
 }
 
-/* Topic Ideation Styles */
-.ideation-cards-container {
-    display: flex; /* Horizontal slide track */
-    overflow-x: auto;
-    gap: 12px;
-    padding: 4px 4px 12px 4px; /* avoid shadow clipping & scrollbar spacing */
-    margin-top: 12px;
-    scroll-snap-type: x mandatory;
-    -webkit-overflow-scrolling: touch;
-}
-
-/* Elegant thin scrollbar for the inspiration track */
-.ideation-cards-container::-webkit-scrollbar {
-    height: 5px;
-}
-.ideation-cards-container::-webkit-scrollbar-track {
-    background: rgba(var(--ink-rgb), 0.02);
-    border-radius: 3px;
-}
-.ideation-cards-container::-webkit-scrollbar-thumb {
-    background: rgba(var(--ink-rgb), 0.12);
-    border-radius: 3px;
-}
-.ideation-cards-container::-webkit-scrollbar-thumb:hover {
-    background: rgba(var(--ink-rgb), 0.22);
-}
-
-.ideation-card {
-    background: var(--bg-card);
-    border: 1px solid rgba(var(--ink-rgb), 0.1);
-    border-radius: 8px;
-    padding: 14px;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    position: relative;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-    justify-content: space-between;
-    cursor: pointer;
-    flex: 0 0 260px; /* Fixed width to prevent collapsing in flexbox */
-    scroll-snap-align: start;
-    margin-bottom: 0;
-}
-
-.ideation-card::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 3px;
-    background: linear-gradient(90deg, var(--neon-blue, #B07B52), var(--neon-purple, #7A8B6F));
-    opacity: 0;
-    transition: opacity 0.3s ease;
-}
-
-.ideation-card:hover {
-    transform: translateY(-4px);
-    background: rgba(var(--ink-rgb), 0.05);
-    border-color: rgba(176, 123, 82, 0.3);
-    box-shadow: 0 8px 24px rgba(176, 123, 82, 0.08);
-}
-
-.ideation-card:hover::before {
-    opacity: 1;
-}
-
-.ideation-card.selected {
-    border-color: var(--neon-blue, #B07B52);
-    background: rgba(176, 123, 82, 0.05);
-    box-shadow: 0 0 15px rgba(176, 123, 82, 0.15);
-}
-
-.ideation-card.selected::before {
-    opacity: 1;
-    background: var(--neon-blue, #B07B52);
-}
-
-.ideation-card-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 8px;
-    margin-bottom: 8px;
-}
-
-.ideation-card-title {
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--text-main, #ffffff);
-    line-height: 1.4;
-}
-
-.ideation-card-score {
-    background: rgba(176, 123, 82, 0.1);
-    color: var(--neon-blue, #B07B52);
-    border: 1px solid rgba(176, 123, 82, 0.2);
-    font-size: 11px;
-    font-weight: bold;
-    padding: 2px 6px;
-    border-radius: 4px;
-    white-space: nowrap;
-}
-
-.ideation-card-metadata {
-    display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
-    margin-bottom: 10px;
-}
-
-.ideation-card-tag {
-    font-size: 10px;
-    padding: 2px 6px;
-    border-radius: 10px;
-    background: rgba(var(--ink-rgb), 0.04);
-    color: var(--text-secondary, #6B6256);
-}
-
-/* 载体家族标签(.natural/.man-made/.vehicle/.fantasy)随载体家族取消一并删除 */
-
-.ideation-card-body {
-    font-size: 12px;
-    color: var(--text-secondary, #6B6256);
-    line-height: 1.5;
-    flex-grow: 1;
-    margin-bottom: 12px;
-}
-
-.ideation-card-twist {
-    margin-top: 6px;
-    padding-top: 6px;
-    border-top: 1px dashed rgba(var(--ink-rgb), 0.05);
-    color: #9A5B3B;
-    font-style: italic;
-}
-
-/* 旧物再生申报：改造类的 DIY 内核（哪件原生旧构件被拆下来、回到室内变成了什么）。
-   给它自己的绿色而不是并进 twist 那一行——它和招牌反差是两件事，挑卡时要能一眼
-   分辨「这条有真的拆改工序」还是「只是在打磨天然壳体」。 */
-.ideation-card-salvage {
-    margin-top: 6px;
-    padding-top: 6px;
-    border-top: 1px dashed rgba(var(--ink-rgb), 0.05);
-    color: #4A6B4A;
-    font-size: 11px;
-}
-
-.ideation-card-trend {
-    margin-top: 6px;
-    padding-top: 6px;
-    border-top: 1px dashed rgba(var(--ink-rgb), 0.05);
-    color: #4A5B66;
-    font-size: 11px;
-}
-
-.ideation-card-tag.beats {
-    background: rgba(176, 123, 82, 0.12);
-    color: #8A5A32;
-    cursor: help;
-}
-
-.ideation-card-tag.pacing-skeleton {
-    background: rgba(92, 116, 134, 0.12);
-    color: #4A6475;
-}
-
-/* 激发维度·推进节拍骨架参考：这是激发 prompt 的真实输入，
-   不是展示用说明卡，所以使用原生 checkbox 保留清晰的多选语义。 */
-.pacing-skeleton-control {
-    border-top: 1px solid rgba(var(--ink-rgb), 0.06);
-    padding-top: 14px;
-}
-
-.pacing-skeleton-selected-note {
-    color: #4A6475;
-    font-size: 11px;
-    white-space: nowrap;
-}
-
-.pacing-skeleton-hint {
-    margin: 7px 0 10px;
-    color: var(--text-secondary, #6B6256);
-    font-size: 11px;
-    line-height: 1.5;
-}
-
-.pacing-skeleton-options {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-}
-
-.pacing-skeleton-option {
-    display: flex;
-    align-items: flex-start;
-    gap: 9px;
-    padding: 10px;
-    border: 1px solid rgba(var(--ink-rgb), 0.1);
-    border-radius: 8px;
-    background: rgba(var(--ink-rgb), 0.025);
-    cursor: pointer;
-    transition: border-color 0.2s ease, background 0.2s ease;
-}
-
-.pacing-skeleton-option:has(input:checked) {
-    border-color: rgba(176, 123, 82, 0.42);
-    background: rgba(176, 123, 82, 0.07);
-}
-
-.pacing-skeleton-option input {
-    margin: 3px 0 0;
-    accent-color: var(--neon-blue, #B07B52);
-    flex: 0 0 auto;
-}
-
-.pacing-skeleton-copy {
-    display: grid;
-    gap: 4px;
-    min-width: 0;
-}
-
-.pacing-skeleton-copy strong {
-    color: var(--text-main, #2B2723);
-    font-size: 12px;
-    line-height: 1.35;
-}
-
-.pacing-skeleton-copy small {
-    color: var(--text-secondary, #6B6256);
-    font-size: 10.5px;
-    line-height: 1.5;
-}
-
-/* 逐拍清单(只在节拍简介弹窗内:卡片轨道装不下,卡片上只留底部那个按钮入口) */
-.ideation-card-outline-list {
-    margin: 0;
-    padding-left: 22px;
-    font-size: 12px;
-    line-height: 1.9;
-    color: var(--text-secondary, #6B6256);
-}
-
-.ideation-card-outline-list > li::marker {
-    color: rgba(var(--ink-rgb), 0.35);
-}
-
-.ideation-card-outline-list > li.reward {
-    color: #9A5B3B;
-    font-weight: 500;
-}
-
-/* 节拍简介弹窗:不限高、不内部截断——高度由 .modal-content(90vh)+ modal-body 滚动兜住,
-   所以十几拍也是一条不落全展示。 */
-.beat-outline-modal-list > li {
-    padding: 2px 0;
-    border-bottom: 1px dashed rgba(var(--ink-rgb), 0.06);
-}
-
-.beat-outline-modal-list > li:last-child {
-    border-bottom: 0;
-}
-
-.beat-outline-entry-meta {
-    margin-top: 2px;
-    color: var(--text-secondary, #6B6256);
-    font-size: 11px;
-    font-weight: 400;
-    opacity: 0.72;
-}
-
-/* 本批联网参考面板(灵感卡片轨道上方,可折叠) */
-.ideation-trend-panel {
-    margin-top: 12px;
-    border: 1px solid rgba(var(--ink-rgb), 0.1);
-    border-radius: 8px;
-    background: rgba(var(--ink-rgb), 0.02);
-    font-size: 12px;
-    color: var(--text-secondary, #6B6256);
-}
-
-.ideation-trend-panel summary {
-    padding: 8px 12px;
-    cursor: pointer;
-    user-select: none;
-    font-size: 11px;
-    color: var(--text-secondary, #6B6256);
-}
-
-.ideation-trend-panel summary:hover {
-    color: var(--text-main, #3A342C);
-}
-
-.ideation-trend-ref {
-    padding: 4px 12px 10px 12px;
-}
-
-.ideation-trend-ref-label {
-    font-weight: 600;
-    font-size: 11px;
-    margin-bottom: 4px;
-    color: #8A5A32;
-}
-
-.ideation-trend-ref-text {
-    margin: 0;
-    white-space: pre-wrap;
-    word-break: break-word;
-    font-family: inherit;
-    font-size: 11px;
-    line-height: 1.6;
-    max-height: 220px;
-    overflow-y: auto;
-}
-
 /* 联网参考案例库（左面板第 1 区，取代旧主题选择器；js/trend_refs.js） */
 .trend-refs-hint {
     margin: 0 0 10px 0;
@@ -956,73 +641,6 @@ html[data-theme="dark"] .task-status-badge.completed {
     accent-color: #B07B52;
 }
 
-.ideation-card-actions {
-    display: flex;
-    /* 卡片定宽 260px，四个按钮挤一行会把「🔨 节拍简介」「一键合成」折成两行字，
-       改成 2×2 换行排布，每个按钮的文字都能整行显示 */
-    flex-wrap: wrap;
-    gap: 8px;
-    margin-top: auto;
-}
-
-.ideation-card-btn {
-    flex: 1 1 calc(50% - 8px);
-    white-space: nowrap;
-    font-size: 11px;
-    padding: 6px 0;
-    border-radius: 4px;
-    border: 1px solid rgba(var(--ink-rgb), 0.08);
-    background: rgba(var(--ink-rgb), 0.03);
-    color: var(--text-main, #ffffff);
-    cursor: pointer;
-    transition: all 0.2s ease;
-    text-align: center;
-}
-
-.ideation-card-btn:hover {
-    background: rgba(var(--ink-rgb), 0.06);
-    border-color: rgba(var(--ink-rgb), 0.18);
-}
-
-.ideation-card-btn.primary {
-    background: linear-gradient(135deg, rgba(176, 123, 82, 0.2), rgba(122, 139, 111, 0.2));
-    border-color: rgba(176, 123, 82, 0.3);
-    color: var(--neon-blue, #B07B52);
-    font-weight: 600;
-}
-
-.ideation-card-btn.primary:hover {
-    background: linear-gradient(135deg, rgba(176, 123, 82, 0.35), rgba(122, 139, 111, 0.35));
-    border-color: var(--neon-blue, #B07B52);
-    box-shadow: 0 0 10px rgba(176, 123, 82, 0.2);
-}
-
-.ideation-card-cover {
-    width: 100%;
-    height: 180px;
-    background: var(--bg-input, #1c1815);
-    border-radius: 6px;
-    margin-bottom: 12px;
-    overflow: hidden;
-    position: relative;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border: 1px solid rgba(var(--ink-rgb), 0.05);
-    cursor: zoom-in;
-}
-
-.ideation-card-cover img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    transition: transform 0.5s ease;
-}
-
-.ideation-card:hover .ideation-card-cover img {
-    transform: scale(1.05);
-}
-
 .cover-spinner {
     display: flex;
     flex-direction: column;
@@ -1044,25 +662,6 @@ html[data-theme="dark"] .task-status-badge.completed {
     100% { transform: rotate(360deg); }
 }
 
-.ideation-cover-hook-overlay {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    width: 100%;
-    background: linear-gradient(to top, rgba(0, 0, 0, 0.8) 0%, rgba(0, 0, 0, 0) 100%);
-    color: #FACC15; /* High impact yellow! */
-    font-weight: 900;
-    font-size: 12px;
-    text-transform: uppercase;
-    text-align: center;
-    padding: 20px 8px 8px 8px;
-    box-sizing: border-box;
-    text-shadow: 1px 1px 2px #000;
-    pointer-events: none;
-    font-family: 'Montserrat', sans-serif;
-    letter-spacing: 0.5px;
-}
-
 .cover-error {
     display: flex;
     flex-direction: column;
@@ -1074,39 +673,8 @@ html[data-theme="dark"] .task-status-badge.completed {
     text-align: center;
 }
 
-.ideation-cover-placeholder {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 100%;
-    height: 100%;
-    background: linear-gradient(135deg, rgba(176, 123, 82, 0.08), rgba(122, 139, 111, 0.08));
-}
-
-.ideation-cover-placeholder-icon {
-    font-size: 40px;
-    opacity: 0.6;
-}
-
 .cover-error .error-icon {
     font-size: 16px;
-}
-
-.ideation-loading, .ideation-error {
-    grid-column: 1 / -1;
-    text-align: center;
-    padding: 30px;
-    font-size: 13px;
-    color: var(--text-secondary, #6B6256);
-    background: rgba(var(--ink-rgb), 0.03);
-    border: 1px dashed rgba(var(--ink-rgb), 0.06);
-    border-radius: 8px;
-}
-
-.ideation-error {
-    color: #f87171;
-    border-color: rgba(239, 68, 68, 0.2);
-    background: rgba(239, 68, 68, 0.02);
 }
 
 /* =====================================================================
@@ -1665,53 +1233,6 @@ html[data-theme="dark"] .task-status-badge.completed {
     background: rgba(var(--ink-rgb), 0.02);
 }
 
-/* 激发维度内嵌 LLM 模型选择器（配置摘要与激发按钮之间）：分组芯片单选器。
-   GPT/Gemini/Claude 每个供应商一行（左侧供应商标签 + 右侧模型胶囊按钮平铺），
-   全局有且只有一个芯片挂 .selected（高亮描边+勾号），当前生效模型全局唯一、
-   一眼可辨；head 行右侧的 .model-active-hint 徽标另行点名生效模型作双保险。
-   芯片按内容宽度自适应换行，窄侧栏/手机上自然折行不挤压。
-   结构由 config.js syncIdeationLlmPicker 全量重建。 */
-.ideation-model-picker {
-    margin-bottom: 12px;
-    padding: 10px 12px 11px;
-    border: 1px solid rgba(var(--ink-rgb), 0.1);
-    border-radius: 12px;
-    background: rgba(var(--ink-rgb), 0.02);
-}
-
-.model-picker-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 9px;
-}
-
-.model-picker-label {
-    font-size: 0.78rem;
-    font-weight: 600;
-    color: var(--text-secondary);
-    white-space: nowrap;
-}
-
-/* 芯片组折叠开关：只在手机上出现（见移动端块），桌面端页脚宽裕、常驻铺开 */
-.model-picker-toggle {
-    display: none;
-    width: 26px;
-    height: 26px;
-    flex: 0 0 26px;
-    align-items: center;
-    justify-content: center;
-    border: 1px solid rgba(var(--ink-rgb), 0.14);
-    border-radius: 7px;
-    background: rgba(var(--panel-rgb), 0.7);
-    color: var(--text-secondary);
-    cursor: pointer;
-}
-
-.model-picker-toggle svg {
-    transition: transform 0.2s ease;
-}
-
 .model-active-hint {
     margin-left: auto;
     max-width: 70%;
@@ -1724,33 +1245,6 @@ html[data-theme="dark"] .task-status-badge.completed {
     background: var(--primary-glow);
     border-radius: 999px;
     padding: 2px 10px;
-}
-
-.model-family-groups {
-    display: flex;
-    flex-direction: column;
-    gap: 7px;
-}
-
-.model-family-group {
-    display: grid;
-    grid-template-columns: 52px 1fr;
-    align-items: start;
-    gap: 8px;
-}
-
-.model-family-tag {
-    font-size: 0.62rem;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    color: var(--text-muted);
-    padding-top: 6px;
-    padding-left: 2px;
-}
-
-.model-family-group.active .model-family-tag {
-    color: var(--primary);
 }
 
 .model-chip-row {
@@ -2796,12 +2290,7 @@ body.log-expanded .log-pill {
     -webkit-overflow-scrolling: touch;
 }
 
-/* Promote animated / hover-transformed cards to their own composite layer.
-   This prevents card hover-transforms from dirtying sibling elements. */
 .anchor-node,
-.ideation-card,
-/* Reduce the paint cost of the glass-panel hover: only animate border-color,
-   not the full box-shadow composite. The shadow is already statically defined. */
 .glass-panel {
     contain: layout style;
 }
@@ -3081,30 +2570,8 @@ body.log-expanded .log-pill {
         max-height: 230px;
     }
 
-    .trend-ref-text,
-    .ideation-trend-ref-text {
+    .trend-ref-text {
         max-height: 150px;
-    }
-
-    /* — 灵感卡横滑轨：单卡实测 260×548，比手机上可用的滚动窗口还高，卡底
-         「节拍简介 / 一键合成」四个按钮永远要再滚一次才看得到。压低封面、加宽
-         卡片（少折行）后整卡回到 440 上下，一屏能看全 — */
-    .ideation-card {
-        flex: 0 0 300px;
-        padding: 12px;
-    }
-
-    .ideation-card-cover {
-        height: 130px;
-        margin-bottom: 10px;
-    }
-
-    .pacing-skeleton-options {
-        grid-template-columns: 1fr;
-    }
-
-    .pacing-skeleton-option {
-        padding: 9px;
     }
 
     /* — 粘性页脚瘦身 — */
@@ -3128,34 +2595,8 @@ body.log-expanded .log-pill {
         overflow: hidden;
     }
 
-    .ideation-model-picker {
-        margin-bottom: 8px;
-        padding: 8px 10px;
-    }
-
-    .model-picker-toggle {
-        display: flex;
-    }
-
     .model-active-hint {
         max-width: 56%;
-    }
-
-    /* 折叠态：只留「LLM 模型 · 使用中 xxx ⌄」一行（省 200+px） */
-    .model-picker-head {
-        margin-bottom: 0;
-    }
-
-    .ideation-model-picker.picker-collapsed .model-family-groups {
-        display: none;
-    }
-
-    .ideation-model-picker:not(.picker-collapsed) .model-picker-head {
-        margin-bottom: 9px;
-    }
-
-    .ideation-model-picker:not(.picker-collapsed) .model-picker-toggle svg {
-        transform: rotate(180deg);
     }
 
     .pulse-btn {

@@ -1140,8 +1140,15 @@ def build_pass_b_sheets(job_dir, overview, facts,
                 chunk = run_paths[offset:offset + page_size]
                 lo = run_start + offset
                 out_path = os.path.join(sheet_dir, f'sheet_{lo + 1:03d}_{lo + len(chunk):03d}.jpg')
+                # max_frames=0 关掉降采样：build_keyframe_collage 默认会把超过 25 张的
+                # 输入抽稀成 25 张（那是给整片总览拼图用的），而这里的拼图是**带下标
+                # 契约**的——第 k 格必须恰好是 FRAME FACTS 第 lo+k 条，_sheet_layout_block
+                # 就是照这个对应关系写给模型的。抽掉任何一张，后面每一格都错位一位，
+                # 模型会把 A 帧的画面当成 B 帧的事实来读，正是本函数 docstring 说的
+                # 「比没有拼图坏得多」。page_size 现在是 20，侥幸没撞上默认值 25；
+                # 但那是巧合不是保证，把它显式钉死。
                 made = build_keyframe_collage([Path(p) for p in chunk], Path(out_path),
-                                              columns=columns)
+                                              columns=columns, max_frames=0)
                 if not made:
                     return []   # ffmpeg 不可用：别交出半套拼图，那比没有更难对齐
                 sheets.append({'path': str(made), 'start': lo,
@@ -1198,6 +1205,7 @@ RULES
 - A beat must produce a full visible milestone, not a token patch. If two adjacent windows continue the same milestone, merge them.
 - Four-Zone Spatial Scanning: In every beat, scan four spatial domains for physical delta: 1. Top/Overhead (roof, beams, ceiling, fixtures, skylights), 2. Middle (walls, framing, openings, wiring), 3. Bottom (floor, sub-base, insulation, finish), 4. Peripherals & Spoil (debris removal, material balance). Material & Spoil Balance: Demolition/clearing must account for where debris goes (e.g. bundled or hauled out); installation must account for raw material consumption. Zero Phantom Changes: Never describe action in only one zone while letting another zone's damage or debris disappear without worker action.
 - Monotonic Chronological Inheritance across Spaces: When passing through a doorway or opening into a new space (space label changes), the first beat in the new space must physically inherit all completed exterior/prior work. Never regress already-finished elements (e.g. never describe a roof leaking or ground full of dead leaves if previous beats cleared/repaired them).
+- macro_environment: ONE to THREE items describing the macro terrain, geology, climate/lighting, and spatial metric envelope visible in this beat — "arid desert sandstone cliff with natural ambient sunlight", "loose reddish-tan desert sand ground with ripples".
 - visible_details: THREE to SIX items. Each names a material with its colour, texture or condition and where it sits — "yellow fibreglass batts in the left wall bays", not "insulation". These items are the only place the reference film's actual look survives into the prompt; a bare noun brings back a generic version of this work, not this film.
 - persistent_traces: AT LEAST TWO visible marks this beat leaves behind, each naming the mark AND the surface it sits on.
 - evidence_frames: list AT MOST THREE frames per beat — the one that best shows the start, the one that best shows the work, and the one that best shows the result. Do not echo every frame in the window; a long frame list is the single biggest cause of a reply that gets cut off before it finishes.
@@ -1227,6 +1235,7 @@ RULES
   - HARD SPLIT ON OVER-LONG BEATS (>6.0s): NEVER allow any single beat to span longer than 6.0s. If a construction stage spans 6.0s or longer (e.g. 7.3s of structural work or 10.0s of final walkthrough), you MUST SPLIT it into 2 or more distinct sub-milestones (e.g. split structural into rough framing vs joist reinforcement/boarding; split reveal into final soft-furnishing/lighting closeout vs camera pull-back hero reveal).
   - HARD MERGE ON FLEETING MICRO-BEATS (<2.0s): Avoid micro-beats under 2.0s. If an action lasts under 2.0s (e.g. 1.2s placing loose items), MERGE it into the preceding or following trade milestone (NEVER merge across space boundaries or merge a transition beat with construction work).
   - TARGET BEAT DENSITY: For a 30s~40s video, aim for approximately 8 to 11 concise, evenly-spaced production beats (each 2.5s~5.0s). Never collapse the narrative into 5~7 bloated over-long beats!
+- Action-Tool-SFX Triad Binding: When given change events with triad evidence (pre_state, action_peak, post_state) and audio_sfx pulses, declare the exact physical action verb and geometric tool shown at the action peak, matching the acoustic strike/cutting/drilling impact.
 - Construction Sequence Monotonicity: Strictly adhere to the 9-stage sequence (demolition -> structural -> rough_in -> enclosure -> surface -> floor -> fixtures -> furnishing -> reveal). Rough-in services must precede cavity enclosure/boarding; structural sub-base must precede floor finishing.
 - Boundary Precision: Beat start and end timestamps must strictly align with actual visible state transitions shown in the contact sheets and frame facts.
 - Beats are ordered by time and must not overlap.
@@ -1244,6 +1253,7 @@ Return one JSON object, no prose, no code fences:
     "start": <sec>, "end": <sec>,
     "stage": "<one of the ten>",
     "space": "<short label of the space this beat is filmed in, reused verbatim across beats>",
+    "macro_environment": ["..."],
     "operation": "<the dominant physical operation naming this milestone>",
     "package_operations": ["<two or three tightly coupled operations sharing one terminal product; or [\"threshold\"] for transition>"],
     "visual_subject": "...",
@@ -1305,11 +1315,23 @@ def _facts_digest(facts):
 
 
 def _events_digest(events):
-    return '\n'.join(
-        f'{e.get("event_id")}: start={e.get("start")}s peak={e.get("peak")}s end={e.get("end")}s '
-        f'evidence={",".join(e.get("evidence_frames") or [])}'
-        for e in events
-    )
+    lines = []
+    for e in events:
+        part = (
+            f'{e.get("event_id")}: start={e.get("start")}s peak={e.get("peak")}s end={e.get("end")}s '
+            f'evidence={",".join(e.get("evidence_frames") or [])}'
+        )
+        triad = e.get("triad_frames")
+        if isinstance(triad, dict):
+            pre = triad.get("pre_state") or "none"
+            act = triad.get("action_peak") or "none"
+            post = triad.get("post_state") or "none"
+            part += f' | triad=[pre:{pre}, action:{act}, post:{post}]'
+        cue = e.get("audio_cue")
+        if isinstance(cue, dict) and cue.get("has_acoustic_spike"):
+            part += f' | audio_sfx=[spike@{cue.get("transient_time")}s, +{cue.get("delta_db")}dB]'
+        lines.append(part)
+    return '\n'.join(lines)
 
 
 def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rework=1):
@@ -1357,15 +1379,17 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
         print('[REVERSE] 无可用拼图，Pass B 退回纯文本聚类（节拍边界精度会下降）')
 
     def _ask_pass_b(prompt):
+        # 预估输出 token 预算：基线 32768，确保长片多拍（20+ 拍）与结构回炉提示词不撞硬上限
+        target_tokens = 32768
         if sheet_paths:
             # `_multimodal_chat` 的 temperature 固定 0.1，比纯文本路径的 0.2 还低——
             # 聚类要的是稳定复现，不是花样，低一点正合适。
             return pp._multimodal_chat(
                 config, _PASS_B_SYSTEM, prompt, sheet_paths,
-                model=(config or {}).get('model'), max_tokens=16384, timeout=360,
+                model=(config or {}).get('model'), max_tokens=target_tokens, timeout=360,
             )
         return pp._chat(config, _PASS_B_SYSTEM, prompt, temperature=0.2,
-                        max_tokens=16384, timeout=240)
+                        max_tokens=target_tokens, timeout=240)
 
     violations = []
     beats_doc = None
@@ -1453,6 +1477,7 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
         normalize_beat_keys(beats_doc)
         _renumber_beats(beats_doc)
         normalize_beat_spaces(beats_doc)
+        reconcile_event_coverage(beats_doc, overview)
         attach_coverage_frames(beats_doc, overview)
         # 定长窗随文档一起落盘：卡点上要拿它跟节拍对照，回炉时也要用同一份，不能
         # 每次重算一遍——那样两次看到的「画面变化」可能不是同一份。
@@ -1495,7 +1520,7 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
 TRANSLATE_FIELDS = (
     'visual_subject', 'operation', 'visible_action', 'visible_result',
     'state_before', 'state_after', 'visible_details', 'persistent_traces',
-    'package_operations',
+    'package_operations', 'macro_environment',
 )
 
 _TRANSLATE_SYSTEM = """You translate a construction time-lapse beat ladder from English into Simplified Chinese for a human reviewer.
@@ -2031,7 +2056,8 @@ def scene_constants_lines(constants, signature=None):
     text = str(signature or '').strip()
     if text:
         lines.append(f'the place itself: {text}')
-    labels = (('materials', 'always-present materials and surfaces'),
+    labels = (('environment', 'always-present macro environment & biome'),
+              ('materials', 'always-present materials and surfaces'),
               ('traces', 'always-present marks and weathering'),
               ('fixtures_in_shot', 'equipment permanently in shot'))
     for key, label in labels:
@@ -2062,12 +2088,16 @@ _BEAT_KEY_ALIASES = {
     'visual_action': 'visible_action',
     'visual_result': 'visible_result',
     'visual_details': 'visible_details',
+    'details': 'visible_details',
     'visible_subject': 'visual_subject',
     'persistent_trace': 'persistent_traces',
     'package_operation': 'package_operations',
     'source_event_id': 'source_event_ids',
     'evidence_frame': 'evidence_frames',
     'reference_frame': 'reference_frames',
+    'environment': 'macro_environment',
+    'macro_env': 'macro_environment',
+    'macro_environment_specs': 'macro_environment',
 }
 
 
@@ -2279,7 +2309,7 @@ def validate_beats(beats_doc, overview, schema=None):
         beats_doc.get('video_duration_sec'),
         speed_multiplier=beats_doc.get('speed_multiplier') or beats_doc.get('source_speed_multiplier')
     ))
-    out.extend(_validate_construction_order(beats))
+    out.extend(_validate_construction_order(beats, banned_elements=beats_doc.get('banned_elements')))
     out.extend(_validate_space_monotonicity(beats))
     out.extend(_validate_temporary_objects(beats))
     out.extend(_validate_composer_frame_contract(beats))
@@ -2467,8 +2497,19 @@ def _validate_required_fields(beats_doc, beats, schema, variant=False):
     beat_props = beat_schema.get('properties') or {}
     for beat in beats:
         bid = beat.get('id')
+        op = str(beat.get('operation') or '').lower()
+        stage = str(beat.get('stage') or '').lower()
+        is_transition = (
+            op in ('threshold', 'reward', 'reframe')
+            or stage in ('transition', 'threshold', 'reveal')
+            or bool(beat.get('bridge_stage'))
+            or bool(beat.get('hard_cut'))
+        )
         for key in beat_required:
             if key in exempt:
+                continue
+            if is_transition and key == 'package_operations':
+                # 过门/穿越/揭示拍允许 0~1 道工序（例如 ["threshold"] 或 []），不适用 2~3 道施工工序限制
                 continue
             problem = _missing_field_reason(beat, key, beat_props.get(key) or {})
             if problem:
@@ -2736,27 +2777,18 @@ def _validate_time_axis(beats, duration, speed_multiplier=None):
     return out
 
 
-def _validate_construction_order(beats):
+def _validate_construction_order(beats, banned_elements=None):
     """施工依赖顺序 + 三条可机械判定的硬否决。
 
     其余硬否决（体积守恒、封闭空间成因、承重件临时支撑）必须看画面，不在这里判。
+    按 space（空间分区）分别维护阶段单调性与遮盖层，避免室外完工转入室内时产生假阳性逆行误报。
     """
     out = []
     staged = [(b, _STAGE_RANK.get(b.get('stage'))) for b in beats]
 
-    # 阶段逆行。允许同级和小幅回退（真实改造确实会来回穿插），跨三级以上的倒挂才判。
-    #
-    # 容差从 ±1 放到 ±2 是被一条真片子逼出来的（2026-08-13，木屋自建）：先铺垫层和
-    # 地板（floor=6），再立室内隔墙龙骨、塞保温（enclosure=4），最后钉墙板。这个顺序
-    # 在画面里清清楚楚，在自建里也很常见——地面基层先做完，人才站得住去框隔墙。而
-    # ±1 的容差判它逆行，于是「如实标注」反而比「标错」更容易被判死，逼着人把墙体
-    # 龙骨记成面层去骗过校验器。校验器把人推向说谎，比漏判更坏。
-    #
-    # 放宽后仍然拦得住的：structural 出现在 floor 之后（2+2=4 < 6）、demolition 出现在
-    # surface 之后（1+2=3 < 5）——那些是真的不可能。而硬否决榜首「布线/水管不得晚于
-    # 遮盖它的板材」根本不走这条容差，它在下面有自己那条不吃容差的判据。
-    max_rank_so_far = 0
-    max_rank_beat = None
+    # 阶段逆行：按空间隔离判定。允许同级和小幅回退（真实改造确实会来回穿插），跨三级以上的倒挂才判。
+    max_rank_per_space = {}
+    max_rank_beat_per_space = {}
     for beat, rank in staged:
         if beat.get('stage') in ('transition', 'threshold') or str(beat.get('operation') or '').lower() in ('threshold', 'reward', 'reframe') or beat.get('bridge_stage'):
             continue
@@ -2764,42 +2796,72 @@ def _validate_construction_order(beats):
             out.append(_warn('stage_unknown',
                              f'{beat.get("id")} 的 stage 无法识别：{beat.get("stage")}', beat.get('id')))
             continue
+        space = normalize_space_label(beat.get('space')) or '_default_space_'
+        max_rank_so_far = max_rank_per_space.get(space, 0)
+        max_rank_beat = max_rank_beat_per_space.get(space)
         if rank + 2 < max_rank_so_far:
+            space_hint = f'（空间「{space}」）' if space != '_default_space_' else ''
             out.append(_err('stage_regression',
-                            f'{beat.get("id")}（{stage_label(beat.get("stage"))}）出现在 '
+                            f'{beat.get("id")}（{stage_label(beat.get("stage"))}{space_hint}）出现在 '
                             f'{max_rank_beat}（{stage_label(_rank_to_stage(max_rank_so_far))}）之后，'
                             f'违反施工依赖顺序。先回去核对帧，误读帧远比不可能的施工顺序更常见。',
                             beat.get('id')))
         if rank > max_rank_so_far:
-            max_rank_so_far, max_rank_beat = rank, beat.get('id')
+            max_rank_per_space[space] = rank
+            max_rank_beat_per_space[space] = beat.get('id')
 
     stages = {b.get('stage') for b, _ in staged}
 
-    # 「布线/水管在遮盖它的东西之后」是硬否决榜首，而它与遮盖层只差一两级，会被上面
-    # 那条容差整条放过。所以单独判，不吃容差。
-    #
-    # 遮盖层不止封板：墙板、面层、地面收尾，任何一样做完，再去走线就意味着要把刚
-    # 做完的东西拆开——这正是那条硬否决要拦的事。原先只认 enclosure，于是「面层做完
-    # 又回去布线」只能靠通用容差兜住；容差一放宽（见上）它就会漏网，所以这里把遮盖
-    # 层补全，把这条不变量交还给它自己那条不吃容差的判据。
-    first_cover = next((b for b, _r in staged if b.get('stage') in _COVERING_STAGES), None)
-    if first_cover is not None:
-        cover_start = _num(first_cover.get('start'))
-        for beat, _rank in staged:
-            if beat.get('stage') == 'rough_in' and _num(beat.get('start')) > cover_start:
+    # 「布线/水管在遮盖它的东西之后」：同一空间内遮盖层先于隐蔽工程才算违规。
+    first_cover_per_space = {}
+    for beat, _rank in staged:
+        if beat.get('stage') in ('transition', 'threshold') or str(beat.get('operation') or '').lower() in ('threshold', 'reward', 'reframe') or beat.get('bridge_stage'):
+            continue
+        space = normalize_space_label(beat.get('space')) or '_default_space_'
+        if beat.get('stage') in _COVERING_STAGES and space not in first_cover_per_space:
+            first_cover_per_space[space] = beat
+
+    for beat, _rank in staged:
+        if beat.get('stage') == 'rough_in':
+            space = normalize_space_label(beat.get('space')) or '_default_space_'
+            first_cover = first_cover_per_space.get(space)
+            if first_cover is not None and _num(beat.get('start')) > _num(first_cover.get('start')):
+                space_hint = f'在同一空间「{space}」的 ' if space != '_default_space_' else '在 '
                 out.append(_err('rough_in_after_enclosure',
-                                f'{beat.get("id")} 在 {first_cover.get("id")}'
+                                f'{beat.get("id")} {space_hint}{first_cover.get("id")}'
                                 f'（{stage_label(first_cover.get("stage"))}）之后才做隐蔽工程，'
                                 f'违反硬否决「布线/水管不得晚于遮盖它的板材/面层」。先回去核对帧。',
                                 beat.get('id')))
 
     # 供电链：有灯具/通电设备的拍，前面必须有 rough_in。
+    # 豁免情况：
+    # 1. banned_elements 明确声明了无暗管布线 / 禁止隐蔽布线（说明原片确实未拍摄隐蔽走线）
+    # 2. 所有 fixtures 拍均为太阳能（solar/photovoltaic）、电池（battery）、发电机或明线插头设备
     if 'fixtures' in stages and 'rough_in' not in stages:
-        lit = next((b.get('id') for b in beats if b.get('stage') == 'fixtures'), None)
-        out.append(_err('power_chain_broken',
-                        f'{lit} 安装了灯具/通电设备，但整条阶梯里没有任何隐蔽布线拍。'
-                        f'若原片确实没拍布线，应把该拍降级为非通电设备，或把布线写进 banned_elements。',
-                        lit))
+        banned_list = banned_elements or []
+        has_banned_wiring = any(
+            re.search(r'wiring|electrical|conduit|cable|rough.?in|走线|布线|隐蔽工程', str(x), re.I)
+            for x in banned_list
+        )
+        if not has_banned_wiring:
+            fixture_beats = [b for b in beats if b.get('stage') == 'fixtures']
+            standalone_pattern = re.compile(
+                r'solar|photovoltaic|panel|battery|generator|off.?grid|cord|plug|'
+                r'太阳能|光伏|电池|发电机|插头|明线|便携',
+                re.I
+            )
+            all_standalone = True
+            for fb in fixture_beats:
+                desc = f"{fb.get('operation') or ''} {fb.get('visual_subject') or ''} {fb.get('visible_action') or ''} {' '.join(fb.get('visible_details') or [])}"
+                if not standalone_pattern.search(desc):
+                    all_standalone = False
+                    break
+            if not all_standalone:
+                lit = next((b.get('id') for b in fixture_beats), None)
+                out.append(_err('power_chain_broken',
+                                f'{lit} 安装了灯具/通电设备，但整条阶梯里没有任何隐蔽布线拍。'
+                                f'若原片确实没拍布线，应把该拍降级为非通电设备，或把布线写进 banned_elements。',
+                                lit))
 
     # 底漆先于面漆：同一 surface 段内的文本启发式。
     primer_seen = False
@@ -2940,7 +3002,7 @@ def mutate_beats(config, beats_doc, axis_spec, on_progress=None, max_rework=1):
                 + '\n'.join(f'- {v["message"]}' for v in violations) + '\n'
             )
         raw = pp._chat(config, _MUTATE_SYSTEM, prompt, temperature=0.6,
-                       max_tokens=16384, timeout=240)
+                       max_tokens=32768, timeout=240)
         try:
             data = parse_json_reply(raw)
         except ValueError as e:
@@ -3157,7 +3219,7 @@ def autofix_beats(config, beats_doc, overview=None, on_progress=None, max_rework
             })
 
         raw = pp._chat(config, _AUTOFIX_SYSTEM, user_prompt, temperature=0.1,
-                       max_tokens=16384, timeout=240)
+                       max_tokens=32768, timeout=240)
         try:
             data = parse_json_reply(raw)
         except ValueError as e:
@@ -3378,6 +3440,9 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
         details = [str(x).strip() for x in (beat.get('visible_details') or []) if str(x).strip()]
         if details:
             entry['mat'] = details
+        macro_env = [str(x).strip() for x in ((beat.get('macro_environment') if isinstance(beat.get('macro_environment'), (list, tuple)) else [beat.get('macro_environment')]) if beat.get('macro_environment') else []) if str(x).strip()]
+        if macro_env:
+            entry['macro_environment'] = macro_env
         traces = [str(x).strip() for x in (beat.get('persistent_traces') or []) if str(x).strip()]
         if traces:
             # trace 在契约里是单串（zone/scope/trace 同组），列表要先合并。

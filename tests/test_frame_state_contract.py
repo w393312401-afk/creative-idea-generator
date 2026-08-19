@@ -71,6 +71,8 @@ def test_state_contract_does_not_read_a_negated_mention_as_a_regression():
         "subfloor left exposed",
         "the entire surface is coated in even, fully dry finish paint with no bare patches remaining",
         "every framed surface is panelled with no seams left raw",
+        "ceiling and left walls are 100% insulated and fully enclosed with raw OSB sheathing panels",
+        "all perimeter framing bays are infilled with raw unrendered red clay brick masonry",
     ):
         ladder = [
             _beat(1, "drywall", after="the panel run is completed and sealed across the span"),

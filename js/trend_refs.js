@@ -1,12 +1,18 @@
 // --- trend_refs.js ---
-// 联网参考案例库（左面板第 1 区，取代旧的固定六主题选择器）。
-// 后端把每次联网搜索/网址摘要的结果沉淀进 trend_refs.json；本模块负责列表渲染、
-// 多选勾选、删除与「搜一批新参考」（强制绕过 6 小时缓存重搜入库）。
-// 选中集合存 localStorage，app.js 的 loadIdeationCards 通过 getSelectedTrendRefIds()
-// 取走作为 /api/ideate 的 trend_ref_ids —— 选中的案例即成为该批灵感的首要创意来源。
+// 联网参考案例库。后端把每次联网搜索/网址摘要的结果沉淀进 trend_refs.json；本模块
+// 负责列表渲染、多选勾选、删除与「搜一批新参考」（强制绕过 6 小时缓存重搜入库）。
+// 选中集合存 localStorage，由 getSelectedTrendRefIds() 取走。
+//
+// 当前唯一的消费方是「爆款复刻」面板的 🌐 联网参考案例库抽屉
+// （js/replica_pipeline.js replicaRenderTrendRefsDrawer），选中的案例作为 AI 正交
+// 发散的首要参考。原来的另一个消费方是「激发维度」页的灵感卡（走 /api/ideate 的
+// trend_ref_ids），那一页与整条卡片链路已于 2026-08-19 移除。
+// 本模块**不随那一页下线**——摘掉 index.html 里的 <script> 会让复刻侧的抽屉静默失效。
+//
 // 全部文本用 textContent 渲染（LLM/网页产出不走 innerHTML，防注入）。
 
 let trendRefsCache = [];
+let trendRefsLoaded = false;
 let trendRefsArchiveCache = [];
 let trendRefsArchiveLoaded = false;
 let trendRefsCapValue = null;
@@ -60,6 +66,7 @@ async function loadTrendRefs() {
         const data = await resp.json();
         if (data && Array.isArray(data.refs)) {
             trendRefsCache = data.refs;
+            trendRefsLoaded = true;
             // 清掉指向已删除条目的幽灵勾选
             const known = new Set(trendRefsCache.map(r => r.id));
             saveSelectedTrendRefIds(getSelectedTrendRefIds().filter(id => known.has(id)));
@@ -86,6 +93,20 @@ async function loadTrendRefs() {
             list.appendChild(err);
         });
     }
+}
+
+// 挂载即取数：loadTrendRefs 只在「列表已经在 DOM 里」时才干活，而爆款复刻面板的
+// 抽屉是 js/replica_pipeline.js 后渲染进 #replica-root 的——DOMContentLoaded 那一刻
+// 两个列表都还不存在，那次调用会直接 return，缓存永远是空的。
+// 「激发维度」页还在时这个坑被盖住了：那一页的 #trend-refs-list 写在 index.html 里，
+// 启动时就在，顺手把缓存填满，复刻抽屉再渲染时正好有数据可用。那一页下线后，
+// 取数就没人负责了。所以让复刻侧自己认领：首次挂载拉一次，之后只重渲染。
+async function ensureTrendRefsLoaded() {
+    if (trendRefsLoaded) {
+        renderTrendRefs();
+        return;
+    }
+    await loadTrendRefs();
 }
 
 // 软上限徽标："N / 60 条 · 已归档 M 条"，超上限的老旧未用参考会自动挪进归档
@@ -651,9 +672,7 @@ function initTrendRefsDirectionPanel() {
 
 // ── 案例库管理弹窗（🗂️ 管理全部）─────────────────────────────────────────
 // 侧栏紧凑列表只负责"选案例喂给下一批灵感"；条目多起来后浏览/整理需要更大
-// 空间和排序/批量操作。这是独立于创意台账的一套视图——两者数据模型不同
-// （used_count/source vs. llm_score/status），不合并数据，只借创意台账已经
-// 验证过的 toolbar/bulk-bar UI 范式（css/ledger.css，全局已加载）。
+// 空间和排序/批量操作（样式在 css/app/panels-tabs.css 中定义）。
 let trendRefsManageScope = 'main';
 let trendRefsManageFilter = '';
 let trendRefsManageSort = 'created_desc';
@@ -967,3 +986,4 @@ window.getSelectedTrendRefIds = getSelectedTrendRefIds;
 window.saveSelectedTrendRefIds = saveSelectedTrendRefIds;
 window.toggleTrendRefSelection = toggleTrendRefSelection;
 window.loadTrendRefs = loadTrendRefs;
+window.ensureTrendRefsLoaded = ensureTrendRefsLoaded;

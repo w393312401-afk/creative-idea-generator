@@ -41,6 +41,7 @@
       "type": "object",
       "description": "场景恒常特征，由 prompt_pipeline.reverse.analyze_scene_constants 从帧事实本地统计（出现在超过三成半帧里的可见物），不花模型调用。存在的理由：整条反推链路围绕**变化**而建，节拍只承载每拍 delta，恒常的东西不产生 delta，于是被整条压掉——实测一条片子 57% 的帧都记到了墙上的污渍，而它在节拍阶梯里一个字都没有。人工卡点上可编辑；删空后不会被重新统计回来（判键在不在，不判值真不真）。",
       "properties": {
+        "environment": { "type": "array", "items": { "type": "string" }, "description": "常驻大环境与地貌水体、气候光照等宏观环境特征。" },
         "materials": { "type": "array", "items": { "type": "string" } },
         "traces": { "type": "array", "items": { "type": "string" } },
         "fixtures_in_shot": { "type": "array", "items": { "type": "string" } }
@@ -89,6 +90,11 @@
         },
         "start": { "type": "number", "minimum": 0 },
         "end": { "type": "number", "minimum": 0 },
+        "macro_environment": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "这一拍所处的大环境与地貌水体、气候光照、空间包络与周边宏观环境识别特征。"
+        },
         "visual_subject": { "type": "string", "minLength": 1 },
         "visible_details": {
           "type": "array",

@@ -170,6 +170,90 @@ def safe_frame_timestamp(timestamp: float, duration: float, fps: float) -> float
     return round(min(max(timestamp, 0.0), safe_end), 3)
 
 
+def detect_audio_transients(
+    video_path: Path,
+    has_audio: bool = True,
+    min_gap: float = 0.4,
+    spike_threshold_db: float = 6.0,
+) -> list[dict[str, Any]]:
+    """Extract ASMR impact points and loudness transients from the audio track.
+
+    When audio is present, detects sudden acoustic spikes (drilling, hammering, cuts, drops)
+    to serve as high-priority acoustic anchors for keyframe sampling and SFX alignment.
+    """
+    if not has_audio:
+        return []
+    try:
+        completed = run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-i",
+                str(video_path),
+                "-af",
+                "highpass=f=100,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-",
+                "-vn",
+                "-f",
+                "null",
+                NUL_DEVICE,
+            ],
+            capture_output=True,
+        )
+        combined = "\n".join([completed.stdout or "", completed.stderr or ""])
+        records: list[tuple[float, float]] = []
+        curr_time: float | None = None
+        for line in combined.splitlines():
+            t_match = re.search(r"pts_time:(\d+(?:\.\d+)?)", line)
+            if t_match:
+                curr_time = float(t_match.group(1))
+                continue
+            v_match = re.search(r"lavfi\.astats\.Overall\.RMS_level=([-\d\.]+)", line)
+            if v_match and curr_time is not None:
+                try:
+                    val = float(v_match.group(1))
+                    records.append((curr_time, val))
+                except ValueError:
+                    pass
+                curr_time = None
+        if not records:
+            return []
+
+        transients: list[dict[str, Any]] = []
+        running_avg = records[0][1]
+        for t, val in records:
+            if val < -65.0:
+                running_avg = -65.0
+                continue
+            delta = val - running_avg
+            if delta >= spike_threshold_db and (not transients or t - transients[-1]["timestamp"] >= min_gap):
+                transients.append({
+                    "timestamp": round(t, 3),
+                    "rms_db": round(val, 2),
+                    "delta_db": round(delta, 2),
+                })
+            running_avg = running_avg * 0.85 + val * 0.15
+        return transients
+    except Exception:
+        return []
+
+
+def extract_spatial_dna(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Derive foundational spatial DNA, aspect ratio, and perspective anchors from video metadata."""
+    w = int(metadata.get("width", 1080) or 1080)
+    h = int(metadata.get("height", 1920) or 1920)
+    is_vertical = h > w
+    aspect_ratio = "9:16" if is_vertical else "16:9"
+    return {
+        "aspect_ratio": aspect_ratio,
+        "width": w,
+        "height": h,
+        "horizon_height_pct": 0.50,
+        "vanishing_axis": "centered",
+        "recommended_lens": "24mm wide-angle lens (human eye-level 1.3m)",
+        "pitch_lock_clause": "camera pitch locked level; vanishing axis stays centered",
+    }
+
+
 def detect_scored_change_points(video_path: Path, threshold: float) -> list[tuple[float, float]]:
     """Return (timestamp, scene_score) pairs above the threshold.
 
@@ -382,7 +466,74 @@ def build_analysis_plan(
     }
 
 
-def build_keyframe_collage(frame_paths: list[Path], output_path: Path, columns: int = 5) -> Path | None:
+def select_milestone_frames(
+    review_entries: list[dict[str, Any]],
+    change_events: list[dict[str, Any]],
+    duration: float,
+    target_count: int = 20,
+) -> list[Path]:
+    """Select 15~25 key milestone frames for the global macro-environment collage.
+
+    Includes:
+    1. First frame (initial before-state / spatial anchor)
+    2. Last frame (final reveal / after-state)
+    3. Significant change event milestones (peak action / structural transformations)
+    4. Evenly-spaced intermediate baseline frames across timeline to fill target_count
+    """
+    total = len(review_entries)
+    if total == 0:
+        return []
+    if total <= target_count:
+        return [Path(entry["frame_path"]) for entry in review_entries]
+
+    chosen_indices: set[int] = {0, total - 1}
+
+    # Add peak frames from change events
+    name_to_index = {Path(entry["frame_path"]).name: i for i, entry in enumerate(review_entries)}
+    for event in change_events:
+        for name in nearest_frames(review_entries, [event.get("peak", 0.0)], neighbours=0):
+            if name in name_to_index:
+                chosen_indices.add(name_to_index[name])
+
+    # If we have space, add start and end frames from events
+    if len(chosen_indices) < target_count:
+        for event in change_events:
+            for name in nearest_frames(review_entries, [event.get("start", 0.0), event.get("end", 0.0)], neighbours=0):
+                if name in name_to_index:
+                    chosen_indices.add(name_to_index[name])
+                if len(chosen_indices) >= target_count:
+                    break
+
+    # If still fewer than target_count, fill with evenly spaced temporal checkpoints
+    if len(chosen_indices) < target_count:
+        step = (total - 1) / float(target_count - 1)
+        for i in range(target_count):
+            idx = int(round(i * step))
+            chosen_indices.add(idx)
+
+    # If more than target_count, uniformly downsample while keeping 0 and total - 1
+    sorted_indices = sorted(list(chosen_indices))
+    if len(sorted_indices) > target_count:
+        n_sel = len(sorted_indices)
+        step = (n_sel - 1) / float(target_count - 1)
+        downsampled = [sorted_indices[0]]
+        for i in range(1, target_count - 1):
+            idx = sorted_indices[int(round(i * step))]
+            if idx not in downsampled and idx < total - 1:
+                downsampled.append(idx)
+        downsampled.append(sorted_indices[-1])
+        sorted_indices = sorted(list(dict.fromkeys(downsampled)))
+
+    return [Path(review_entries[i]["frame_path"]) for i in sorted_indices]
+
+
+def build_keyframe_collage(
+    frame_paths: list[Path],
+    output_path: Path,
+    columns: int = 5,
+    max_frames: int = 25,
+    tile_width: int = 360,
+) -> Path | None:
     """5-column tiled collage saved next to the source video.
 
     This is the persistent, high-density visual reference for the whole transition — it is
@@ -393,8 +544,22 @@ def build_keyframe_collage(frame_paths: list[Path], output_path: Path, columns: 
         return None
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    rows = math.ceil(len(frame_paths) / columns)
-    padded = list(frame_paths)
+    paths = list(frame_paths)
+
+    if max_frames and len(paths) > max_frames:
+        n = len(paths)
+        indices = [0]
+        step = (n - 1) / float(max_frames - 1)
+        for i in range(1, max_frames - 1):
+            idx = int(round(i * step))
+            if idx not in indices and idx < n - 1:
+                indices.append(idx)
+        indices.append(n - 1)
+        indices = sorted(list(dict.fromkeys(indices)))
+        paths = [paths[i] for i in indices]
+
+    rows = math.ceil(len(paths) / columns)
+    padded = list(paths)
     # ffmpeg's tile filter needs a full grid; repeat the last frame to fill the tail.
     while len(padded) < rows * columns:
         padded.append(padded[-1])
@@ -404,6 +569,7 @@ def build_keyframe_collage(frame_paths: list[Path], output_path: Path, columns: 
         lines = [f"file '{str(p.resolve()).replace('\'', '\'\\\'\'')}'\n" for p in padded]
         concat_list_path.write_text("".join(lines), encoding="utf-8")
 
+        scale_w = max(120, tile_width)
         command = [
             "ffmpeg",
             "-hide_banner",
@@ -417,11 +583,11 @@ def build_keyframe_collage(frame_paths: list[Path], output_path: Path, columns: 
             "-i",
             str(concat_list_path),
             "-vf",
-            f"scale=240:-1:force_divisible_by=2,setsar=1,tile={columns}x{rows}:padding=4:margin=4:color=black",
+            f"scale={scale_w}:-1:force_divisible_by=2,setsar=1,tile={columns}x{rows}:padding=4:margin=4:color=black",
             "-frames:v",
             "1",
             "-q:v",
-            "3",
+            "2",
             str(output_path),
         ]
         run(command)
@@ -434,6 +600,7 @@ def build_keyframe_collage(frame_paths: list[Path], output_path: Path, columns: 
             except OSError:
                 pass
     return output_path if output_path.exists() and output_path.stat().st_size > 0 else None
+
 
 
 def build_segments(points: list[float], total_duration: float, min_scene_duration: float) -> list[tuple[float, float]]:
@@ -593,6 +760,7 @@ def review_timestamps(
     segments: list[tuple[float, float]] | None = None,
     cut_points: list[float] | None = None,
     state_points: list[float] | None = None,
+    audio_transients: list[dict[str, Any]] | None = None,
 ) -> list[float]:
     if duration <= 0:
         return [0.0]
@@ -645,6 +813,17 @@ def review_timestamps(
                 ts_set.add(round(t, 3))
                 t += dense_step
 
+    # 7. Audio transient impact points (ASMR bursts / tool onsets): exact time +/-0.15s.
+    if audio_transients:
+        for at in audio_transients:
+            t_at = at.get("timestamp")
+            if t_at is not None and 0.0 <= t_at <= duration:
+                ts_set.add(round(t_at, 3))
+                if t_at - 0.15 >= 0.0:
+                    ts_set.add(round(t_at - 0.15, 3))
+                if t_at + 0.15 <= duration:
+                    ts_set.add(round(t_at + 0.15, 3))
+
     ts_set.add(duration)
 
     normalized: list[float] = []
@@ -685,6 +864,10 @@ def analyze_video(
     change_events = build_change_events(scored_state_points, duration)
     all_segments = build_segments(cut_points, duration, min_scene_duration)
     kept_segments = evenly_sample_segments(all_segments, max_scenes)
+
+    # Multi-modal acoustic transients and spatial DNA extraction
+    audio_transients = detect_audio_transients(video_path, has_audio=metadata.get("has_audio", False))
+    spatial_dna = extract_spatial_dna(metadata)
 
     storyboard_dir = output_dir / "storyboard"
     storyboard_dir.mkdir(parents=True, exist_ok=True)
@@ -735,6 +918,7 @@ def analyze_video(
         all_segments,
         cut_points,
         state_points,
+        audio_transients=audio_transients,
     )
     for index, timestamp in enumerate(timestamps, start=1):
         frame_path = review_dir / f"review_{index:03d}.png"
@@ -754,25 +938,59 @@ def analyze_video(
         columns=6,
     )
 
-    # Attach concrete evidence frames to every change event.
+    # Attach concrete evidence frames, Triad frames (pre/peak/post), and audio cues to every change event.
     for event in change_events:
-        event["evidence_frames"] = nearest_frames(
+        ev_frames = nearest_frames(
             review_entries,
             [event["start"], event["peak"], event["end"]],
             neighbours=0,
         )
+        event["evidence_frames"] = ev_frames
+        
+        # Triad sampling structure: pre-state (anchor start), peak action (operation burst), post-state (milestone completion)
+        pre_f = nearest_frames(review_entries, [event["start"]], neighbours=0)
+        peak_f = nearest_frames(review_entries, [event["peak"]], neighbours=0)
+        post_f = nearest_frames(review_entries, [event["end"]], neighbours=0)
+        event["triad_frames"] = {
+            "pre_state": pre_f[0] if pre_f else None,
+            "action_peak": peak_f[0] if peak_f else None,
+            "post_state": post_f[0] if post_f else None,
+        }
+
+        # Correlate acoustic cue if an audio transient coincides with this event
+        matching_transients = [
+            at for at in audio_transients
+            if (event["start"] - 0.3) <= at["timestamp"] <= (event["end"] + 0.3)
+        ]
+        if matching_transients:
+            best_at = max(matching_transients, key=lambda x: x.get("delta_db", 0.0))
+            event["audio_cue"] = {
+                "transient_time": best_at["timestamp"],
+                "delta_db": best_at["delta_db"],
+                "rms_db": best_at.get("rms_db"),
+                "has_acoustic_spike": True,
+            }
+        else:
+            event["audio_cue"] = None
 
     analysis_plan = build_analysis_plan(review_entries, change_events, duration)
 
-    # 5-column keyframe collage, written next to the SOURCE VIDEO, not into the job dir.
+    # 5-column keyframe collage (milestone downsampled to 15-25 frames, sharp 360px tiles),
+    # written next to the SOURCE VIDEO, not into the job dir.
+    milestone_frames = select_milestone_frames(review_entries, change_events, duration, target_count=20)
     collage_path = build_keyframe_collage(
-        [Path(entry["frame_path"]) for entry in review_entries],
+        milestone_frames,
         video_path.with_name(f"{video_path.stem}_collage.jpg"),
+        columns=5,
+        max_frames=25,
+        tile_width=360,
     )
 
     payload = {
         "source_video": str(video_path.resolve()),
         "media_metadata": metadata,
+        "spatial_dna": spatial_dna,
+        "audio_transients": audio_transients,
         "pace_metrics": pace_metrics(cut_points, all_segments, duration),
         "cut_points": cut_points,
         "state_change_points": state_points,
@@ -783,7 +1001,7 @@ def analyze_video(
         "review_sampling": {
             "strategy": (
                 f"timelapse: base {base_fps}fps, state-jump windows {dense_fps}fps, "
-                "cut points +/-0.2s, scene start/mid/end, before-state and final-reveal 4fps"
+                "cut points +/-0.2s, audio transients, scene start/mid/end, before-state and final-reveal 4fps"
             ),
             "frame_count": len(review_entries),
             "contact_sheets": [str(page.resolve()) for page in sheet_pages],

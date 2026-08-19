@@ -233,10 +233,81 @@ class TestConstructionOrder(unittest.TestCase):
         doc = {'video_duration_sec': 10.0, 'banned_elements': [], 'beats': [
             _beat('B01', 0.0, 5.0, stage='demolition', events=['E01']),
             _beat('B02', 5.0, 10.0, stage='fixtures', events=['E02'],
-                  frames=['review_003.png']),
+                  frames=['review_003.png'], operation='installing chandelier and wall sconces'),
         ]}
         codes = [v['code'] for v in reverse.validate_beats(doc, _overview(), schema=None)]
         self.assertIn('power_chain_broken', codes)
+
+    def test_solar_panel_fixture_without_rough_in_is_allowed(self):
+        """太阳能光伏/电池/离网独立供电设备无需隐蔽布线拍，不误报 power_chain_broken。"""
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [], 'beats': [
+            _beat('B01', 0.0, 5.0, stage='structural', events=['E01']),
+            _beat('B02', 5.0, 10.0, stage='fixtures', events=['E02'],
+                  frames=['review_003.png'], operation='solar panel mounting on rock ledge',
+                  subject='mounting a monocrystalline solar photovoltaic panel'),
+        ]}
+        codes = [v['code'] for v in reverse.validate_beats(doc, _overview(), schema=None)]
+        self.assertNotIn('power_chain_broken', codes)
+
+    def test_banned_wiring_fixture_without_rough_in_is_allowed(self):
+        """banned_elements 明确声明无暗管/布线时，灯具安装不误报 power_chain_broken。"""
+        doc = {'video_duration_sec': 10.0, 'banned_elements': ['concealed electrical wiring'], 'beats': [
+            _beat('B01', 0.0, 5.0, stage='surface', events=['E01']),
+            _beat('B02', 5.0, 10.0, stage='fixtures', events=['E02'],
+                  frames=['review_003.png'], operation='hanging pendant lights'),
+        ]}
+        codes = [v['code'] for v in reverse.validate_beats(doc, _overview(), schema=None)]
+        self.assertNotIn('power_chain_broken', codes)
+
+    def test_multi_space_construction_order_no_false_regression(self):
+        """室外完成（surface/fixtures）后进入室内从龙骨/封板开始施工，按空间隔离不误判阶段逆行。"""
+        doc = {'video_duration_sec': 25.0, 'banned_elements': [], 'beats': [
+            _beat('B01', 0.0, 5.0, stage='structural', events=['E01'], space='outdoor'),
+            _beat('B02', 5.0, 10.0, stage='surface', events=['E02'], space='outdoor'),
+            _beat('B03', 10.0, 12.0, stage='transition', operation='threshold', package=['threshold'], space='indoor'),
+            _beat('B04', 12.0, 17.0, stage='enclosure', events=['E03'], space='indoor', frames=['review_003.png']),
+            _beat('B05', 17.0, 22.0, stage='floor', space='indoor', frames=['review_003.png']),
+            _beat('B06', 22.0, 25.0, stage='furnishing', space='indoor', frames=['review_003.png']),
+        ]}
+        errors = [v for v in reverse.validate_beats(doc, _overview(('E01', 'E02', 'E03')), schema=None)
+                  if v['level'] == 'error']
+        self.assertEqual(errors, [])
+
+    def test_multi_space_rough_in_after_different_space_cover_valid(self):
+        """室外封板（B01）不应阻拦室内（B03）的隐蔽工程。"""
+        doc = {'video_duration_sec': 15.0, 'banned_elements': [], 'beats': [
+            _beat('B01', 0.0, 5.0, stage='enclosure', events=['E01'], space='outdoor'),
+            _beat('B02', 5.0, 7.0, stage='transition', operation='threshold', package=['threshold'], space='indoor'),
+            _beat('B03', 7.0, 12.0, stage='rough_in', events=['E02'], space='indoor', frames=['review_003.png']),
+        ]}
+        errors = [v for v in reverse.validate_beats(doc, _overview(), schema=None)
+                  if v['level'] == 'error']
+        self.assertEqual(errors, [])
+
+    def test_transition_beat_package_operations_valid(self):
+        """过门拍 package_operations 只有 1 项（如 ['threshold']）或为空时不报 missing_beat_field。"""
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [], 'beats': [
+            _beat('B01', 0.0, 5.0, stage='structural', events=['E01'], space='outdoor'),
+            _beat('B02', 5.0, 10.0, stage='transition', operation='threshold', package=['threshold'], space='indoor'),
+        ]}
+        schema, _ = reverse._load_schema_or_reason()
+        violations = reverse._validate_required_fields(doc, doc['beats'], schema)
+        missing_errors = [v for v in violations if v['code'] == 'missing_beat_field']
+        self.assertEqual(missing_errors, [])
+
+    def test_real_world_multi_space_long_job_passes_validation(self):
+        """验证实际长视频任务（22拍，包含室外/室内/睡眠凹室多个空间与太阳能设备）在新校验器下无硬伤。"""
+        job_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'outputs', 'replica_jobs', 'replica_9898f9e639ab')
+        beats_path = os.path.join(job_dir, 'timelapse_beats.json')
+        overview_path = os.path.join(job_dir, 'video_overview.json')
+        if os.path.exists(beats_path) and os.path.exists(overview_path):
+            with open(beats_path, 'r', encoding='utf-8') as f:
+                beats_doc = json.load(f)
+            with open(overview_path, 'r', encoding='utf-8') as f:
+                overview = json.load(f)
+            violations = reverse.validate_beats(beats_doc, overview)
+            errors = [v for v in violations if v.get('level') == 'error']
+            self.assertEqual(errors, [])
 
     def test_finish_coat_before_primer_warns(self):
         doc = {'video_duration_sec': 10.0, 'banned_elements': [], 'beats': [
@@ -1017,11 +1088,17 @@ class _SheetJob:
                 for e in self.frames]
 
 
-def _fake_collage(frame_paths, output_path, columns=5):
-    """替身拼图：写一个真文件出来并记下它拼了哪几帧。"""
+def _fake_collage(frame_paths, output_path, columns=5, max_frames=25, tile_width=360):
+    """替身拼图：写一个真文件出来并记下它拼了哪几帧、以及降采样开没开。
+
+    签名必须跟 tools.collage.build_keyframe_collage 保持一致。替身少一个关键字参数、
+    真实调用点多传一个就是 TypeError，而 build_pass_b_sheets 把异常吞成「退回纯文本
+    聚类」——于是整组用例看到的是空拼图而不是报错，失败信息指向别处。
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(b'\xff\xd8\xff')
     _fake_collage.calls.append([p.name for p in frame_paths])
+    _fake_collage.max_frames.append(max_frames)
     return output_path
 
 
@@ -1036,6 +1113,20 @@ class TestPassBSheets(unittest.TestCase):
 
     def setUp(self):
         _fake_collage.calls = []
+        _fake_collage.max_frames = []
+
+    def test_sheets_never_let_the_collage_downsample(self):
+        """拼图的下标契约不容许抽帧：第 k 格必须恰好是 FRAME FACTS 第 lo+k 条。
+
+        build_keyframe_collage 默认 max_frames=25，会把超量输入抽稀成 25 张（那是给
+        整片总览拼图用的）。这里必须显式传 0 关掉。page_size 目前是 20、撞不上 25
+        只是巧合，谁把它调过 25，后面每一格都平移一位，而且是静默的。
+        """
+        job = _SheetJob(count=12)
+        with patch('tools.collage.build_keyframe_collage', _fake_collage):
+            reverse.build_pass_b_sheets(job.dir, job.overview, job.facts(), page_size=5)
+        self.assertTrue(_fake_collage.max_frames)
+        self.assertEqual(set(_fake_collage.max_frames), {0})
 
     def test_sheets_are_paged_and_carry_their_own_start_index(self):
         job = _SheetJob(count=12)

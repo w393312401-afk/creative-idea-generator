@@ -61,6 +61,8 @@
   "_videoProcessVlmReview_comment": "⟦门禁⟧true=视频下载后抽取中段帧并执行VLM施工过程复审；false=仅保留本地冻结/节奏检测(那两条纯本地零成本、最高只到warn,刻意不给开关)。qaGateLevel=off时无论本项为何值都跳过。",
   "reviewConcurrency": 4,
   "_reviewConcurrency_comment": "整套序列一致性审查的逐拍并发度(1~8,默认4)。逐拍审查彼此独立,串行跑12帧要十几次多模态调用、几分钟不出声;并发后耗时约按并发度下降。上游网关按并发限流时调小,设1退回串行",
+  "candidateConcurrency": 4,
+  "_candidateConcurrency_comment": "4选1智能优选模式下API候选图并发生成度(1~8,默认4)。多候选并行请求大幅缩短生图耗时;上游限流时可调小或设1退回串行",
   "debug": false,
   "logHttpAccess": false,
   "_logHttpAccess_comment": "是否把正常的 HTTP 往返(2xx/3xx,以及 /outputs 下\"帧文件还没生成\"的 404 探测)也写进 server.log。默认 false:实测这类行占日志的 81%,把真正有用的行冲得找不到。4xx/5xx 里真正的异常不受本项影响,永远留痕。刻意独立于 debug——\"我要看异常堆栈\"和\"我要看每一个 304\"是两回事。排查前端到底请求了什么时临时打开,或设环境变量 SPARK_LOG_HTTP_ACCESS=1"

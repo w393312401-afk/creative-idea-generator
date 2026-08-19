@@ -205,10 +205,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     loadConfig();
     loadLibrary();
-    loadCustomPresets();
-    initSliders();
-    initSelectors();
-    loadSelectionState();
     loadCurrentIdeaState();
     initCanvas();
     checkApiStatus();
@@ -219,25 +215,8 @@ document.addEventListener('DOMContentLoaded', () => {
     resumeActiveTaskIfExists();
     resumeActiveBackgroundTasksIfExists();
     startGlobalTasksBadgePolling();
-    initPacingSkeletonSelector();
-    loadIdeationCards();
-    initBeatOutlineModal();
     updateDrawerTopOffset();
     window.addEventListener('resize', window._debounce(updateDrawerTopOffset, 150));
-    const refreshBtn = document.getElementById('ideate-refresh-btn');
-    if (refreshBtn) {
-        refreshBtn.addEventListener('click', () => {
-            loadIdeationCards(true);
-        });
-    }
-    const countSelect = document.getElementById('ideation-count-select');
-    if (countSelect) {
-        const savedCount = localStorage.getItem('ideation_card_count');
-        if (savedCount) countSelect.value = savedCount;
-        countSelect.addEventListener('change', () => {
-            localStorage.setItem('ideation_card_count', countSelect.value);
-        });
-    }
     initLocalServiceLogs();
 });
 
@@ -293,42 +272,25 @@ const PRESETS = {
 
 // Function renderParsedPrompts moved to modular JS file
 
-// 页脚 LLM 芯片组收回折叠态（仅窄屏有意义；桌面端 picker-collapsed 不生效，
-// 调了也不会有视觉变化）。config.js 选完模型后回调这里，见 syncIdeationLlmPicker。
-function collapseIdeationPickerOnMobile() {
-    if (!window.matchMedia || !window.matchMedia('(max-width: 768px)').matches) return;
-    const picker = document.getElementById('ideation-model-picker');
-    if (picker) picker.classList.add('picker-collapsed');
-    const toggle = document.getElementById('ideation-llm-toggle');
-    if (toggle) {
-        toggle.setAttribute('aria-expanded', 'false');
-        toggle.title = '展开模型选择';
-    }
-}
-
 // Top-level workspace switch: exclusive single-panel view (config / results / image studio),
 // used at every screen size. 'left'/'right' are accepted as aliases of 'config'/'results' for
 // backward compatibility with any inline handlers still spelled the old way.
 function switchMainTab(tabName) {
-    const aliases = { left: 'config', right: 'results' };
+    const aliases = { left: 'results', config: 'results', right: 'results' };
     const tab = aliases[tabName] || tabName;
 
     const panels = {
-        config: document.querySelector('.panel-left'),
         results: document.querySelector('.panel-right'),
         image: document.getElementById('panel-image-studio'),
         projects: document.getElementById('panel-projects'),
         gallery: document.getElementById('panel-gallery'),
-        ledger: document.getElementById('panel-ledger'),
         replica: document.getElementById('panel-replica'),
     };
     const buttons = {
-        config: document.getElementById('main-tab-config'),
         results: document.getElementById('main-tab-results'),
         image: document.getElementById('main-tab-image'),
         projects: document.getElementById('main-tab-projects'),
         gallery: document.getElementById('main-tab-gallery'),
-        ledger: document.getElementById('main-tab-ledger'),
         replica: document.getElementById('main-tab-replica'),
     };
 
@@ -345,11 +307,6 @@ function switchMainTab(tabName) {
     // 画廊首次进入时才扫描本地文件（js/gallery.js 提供；懒加载避免拖慢启动）
     if (tab === 'gallery' && typeof galleryTabEntered === 'function') {
         galleryTabEntered();
-    }
-    // 创意台账：每次进入都重新拉取（体量小、纯 JSON 读取，代价远低于画廊的文件系统扫描），
-    // 这样"存入备选"后立刻切回台账页也能看到最新数据，无需手动点刷新
-    if (tab === 'ledger' && typeof ledgerTabEntered === 'function') {
-        ledgerTabEntered();
     }
     // 项目工作台：进入时拉一次并开始轮询，离开时立刻停表。轮询节奏由
     // js/projects.js 按"有没有项目在跑"自己决定（4s / 30s），离开页面还接着
@@ -761,161 +718,8 @@ async function checkApiStatus() {
     }
 }
 
-// Interactive Sliders Initialization
-function initSliders() {
-    const complexity = document.getElementById('slider-complexity');
-    const budget = document.getElementById('slider-budget');
-    const ratio = document.getElementById('slider-ratio');
-    const creativity = document.getElementById('slider-creativity');
-    const beats = document.getElementById('slider-beats');
-    const beatCountMode = document.getElementById('beat-count-mode');
-
-    const complexityLabels = { 1: '轻量级改造', 2: '中等重工', 3: '硬核结构性改建' };
-    const budgetLabels = { 1: '平民精简版', 2: '轻奢设计师级', 3: '顶奢艺术级定制' };
-    // 注意：这些标签文字会作为 Creativity Scale 原样送进 LLM（generateIdea 直接取
-    // val-creativity 的 textContent）——措辞必须保持写实取向，绝不能出现「科幻」类
-    // 引导词（旧文案「脑洞大开 (极致科幻)」曾把整条产出带偏成科幻题材）。
-    const creativityLabels = { 1: '常规务实', 2: '突破常规', 3: '脑洞大开 (写实奇观)' };
-
-    // 反差强度/节拍数轨道上色到当前值，让拖动时能直接看到进度而不是只有上方的静态文字
-    const updateFill = (input) => {
-        const min = Number(input.min) || 0;
-        const max = Number(input.max) || 100;
-        const pct = max > min ? ((Number(input.value) - min) / (max - min)) * 100 : 0;
-        input.style.setProperty('--fill-pct', `${pct}%`);
-    };
-
-    // 复杂度/预算/脑洞大开度只有 3 档，拖滑块去精确命中某一档很别扭，改成点选式分段按钮。
-    // 底层 <input type=range> 保留（视觉隐藏）：config.js / prompt_pipeline.js 里大量代码
-    // 按 id 直接读写它的 .value，分段按钮只是换了一层交互，不改数据模型。
-    const fillSegmentLabels = (targetId, labels) => {
-        const group = document.querySelector(`.segmented-control[data-target="${targetId}"]`);
-        if (!group) return;
-        group.querySelectorAll('.segment-btn').forEach((btn) => {
-            btn.textContent = labels[btn.dataset.value] || btn.dataset.value;
-        });
-    };
-    fillSegmentLabels('slider-complexity', complexityLabels);
-    fillSegmentLabels('slider-budget', budgetLabels);
-    fillSegmentLabels('slider-creativity', creativityLabels);
-
-    const syncSegments = (input) => {
-        const group = document.querySelector(`.segmented-control[data-target="${input.id}"]`);
-        if (!group) return;
-        group.querySelectorAll('.segment-btn').forEach((btn) => {
-            const isActive = btn.dataset.value === String(input.value);
-            btn.classList.toggle('active', isActive);
-            btn.setAttribute('aria-pressed', String(isActive));
-        });
-    };
-
-    document.querySelectorAll('.segmented-control').forEach((group) => {
-        const input = document.getElementById(group.dataset.target);
-        if (!input) return;
-        group.querySelectorAll('.segment-btn').forEach((btn) => {
-            btn.addEventListener('click', () => {
-                input.value = btn.dataset.value;
-                // 'input' 驱动即时的标签/摘要更新；'change' 是 saveSelectionState() 落盘到
-                // localStorage 唯一挂钩的事件——原生滑块靠"松手"触发它，这里补发使其等效。
-                input.dispatchEvent(new Event('input'));
-                input.dispatchEvent(new Event('change'));
-            });
-        });
-    });
-
-    // 反差强度/节拍数两侧的 −/+：不想拖也能单步精调
-    document.querySelectorAll('.slider-step-btn').forEach((btn) => {
-        btn.addEventListener('click', () => {
-            const input = document.getElementById(btn.dataset.target);
-            if (!input) return;
-            const step = Number(input.step) || 1;
-            const min = Number(input.min);
-            const max = Number(input.max);
-            const next = Number(input.value) + Number(btn.dataset.step) * step;
-            input.value = Math.min(max, Math.max(min, next));
-            input.dispatchEvent(new Event('input'));
-            input.dispatchEvent(new Event('change'));
-        });
-    });
-
-    complexity.addEventListener('input', (e) => {
-        document.getElementById('val-complexity').textContent = complexityLabels[e.target.value];
-        syncSegments(e.target);
-    });
-    budget.addEventListener('input', (e) => {
-        document.getElementById('val-budget').textContent = budgetLabels[e.target.value];
-        syncSegments(e.target);
-    });
-    ratio.addEventListener('input', (e) => {
-        const val = e.target.value;
-        document.getElementById('val-ratio').textContent = `反差强度: ${val}%`;
-        updateFill(e.target);
-    });
-    creativity.addEventListener('input', (e) => {
-        document.getElementById('val-creativity').textContent = creativityLabels[e.target.value];
-        syncSegments(e.target);
-    });
-    beats.addEventListener('input', (e) => {
-        document.getElementById('val-beats').textContent = `${e.target.value} 拍`;
-        updateFill(e.target);
-    });
-    // 只挂 'change'：拖动松手 / ± 步进（上面补发过 change）才算用户拍板，
-    // 读档与「载入灵感卡片」的回填只发 'input'，不会误置这个标记。
-    beats.addEventListener('change', () => {
-        if (typeof markBeatsUserOverridden === 'function') markBeatsUserOverridden();
-    });
-    const syncBeatModeLabel = () => {
-        const adaptive = !beatCountMode || beatCountMode.value !== 'fixed';
-        const label = document.getElementById('beat-count-label');
-        // adaptive 下滑块只是额度闸门（骨架由灵感卡片定义，滑块压不动它的下界）；
-        // fixed 下它才真的定义拍数。两态文案必须分开，否则用户会把上限读成承诺。
-        // 无论哪一态，这个数字都只管施工拍——过门/穿越运镜由后端按拓扑展开成
-        // 3~5 个额外的子拍，不占用这里设置的额度（2026-08-06，之前 title 只在
-        // HTML 里写死了 adaptive 的说明，切到 fixed 也不会跟着换，文案和实际
-        // 交付的总拍数对不上）。
-        if (label) {
-            label.textContent = adaptive ? '节拍上限 · 额度闸门 (Budget Cap)' : '固定施工节拍数 (Beat Count)';
-            label.title = adaptive
-                ? '自适应模式下这是额度上限（最多生成多少施工拍），不是承诺的拍数；拍数下界由灵感卡片的工序清单决定。过门/穿越运镜另计，不占用这个额度。'
-                : '固定模式下这是施工拍的精确拍数。过门/穿越运镜由过门逻辑按入口/出口拓扑另外展开成 3~5 个子拍，不占用这里设置的施工拍数，所以最终交付的总拍数会比这个数字多。';
-        }
-        updateConfigSummary();
-    };
-    if (beatCountMode) {
-        beatCountMode.addEventListener('input', syncBeatModeLabel);
-        beatCountMode.addEventListener('change', () => {
-            syncBeatModeLabel();
-            if (typeof markBeatsUserOverridden === 'function') markBeatsUserOverridden();
-        });
-    }
-
-    // Fire initial displays
-    complexity.dispatchEvent(new Event('input'));
-    budget.dispatchEvent(new Event('input'));
-    ratio.dispatchEvent(new Event('input'));
-    creativity.dispatchEvent(new Event('input'));
-    beats.dispatchEvent(new Event('input'));
-    syncBeatModeLabel();
-}
-
-// Theme & Anchor Selection Handling
-function initSelectors() {
-    // 基础场景主题选择器已从 GUI 移除（灵感改由联网参考案例库驱动，见
-    // js/trend_refs.js）；#theme-selector 不复存在，这里不再绑定它的监听。
-
-    // Anchor Selector (Multi-select) — section removed from the GUI; guard kept since
-    // #anchor-selector no longer exists (anchors are now left for the composer to pick).
-    const anchorFlex = document.getElementById('anchor-selector');
-    if (anchorFlex) {
-        anchorFlex.addEventListener('click', (e) => {
-            const btn = e.target.closest('.anchor-node');
-            if (!btn) return;
-
-            btn.classList.toggle('active');
-        });
-    }
-}
-
+// 维度滑块（复杂度/预算/反差/尺度/拍数）的初始化随「激发维度」页一起下线：
+// 那五个 #slider-* 已不在 index.html 里，函数本身也早已无人调用。
 // Interactive Particle Background (Canvas)
 function initCanvas() {
     const canvas = document.getElementById('particle-canvas');
@@ -1253,9 +1057,9 @@ function setupEventListeners() {
         manualInterventionDismissBtn.addEventListener('click', () => hideManualInterventionBanner());
     }
 
-    // Generation Action
-    document.getElementById('generate-btn').addEventListener('click', () => generateIdea());
-    document.getElementById('retry-btn').addEventListener('click', () => retryGeneration());
+    // Generation Action —— 「激发」主按钮随「激发维度」页下线，只剩结果页的重试按钮。
+    const retryBtn = document.getElementById('retry-btn');
+    if (retryBtn) retryBtn.addEventListener('click', () => retryGeneration());
 
     // Cancel Generation Actions
     const cancelGenBtn = document.getElementById('cancel-generate-btn');
@@ -1370,37 +1174,9 @@ function setupEventListeners() {
     });
 
     // Preset Selection
-    document.querySelectorAll('.preset-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            const preset = e.currentTarget.dataset.preset;
-            if (preset) {
-                applyPreset(preset);
-            }
-        });
-    });
-
-    // Save state on slider input/change
-    // rAF-gate the heavy updateConfigSummary (many DOM reads) so it runs
-    // at most once per animation frame during rapid drag gestures
-    let _configSummaryPending = false;
-    const rafConfigSummary = () => {
-        if (!_configSummaryPending) {
-            _configSummaryPending = true;
-            requestAnimationFrame(() => {
-                updateConfigSummary();
-                _configSummaryPending = false;
-            });
-        }
-    };
-    ['slider-complexity', 'slider-budget', 'slider-ratio', 'slider-creativity', 'slider-beats', 'beat-count-mode'].forEach(id => {
-        const el = document.getElementById(id);
-        if (el) {
-            el.addEventListener('input', rafConfigSummary);
-            el.addEventListener('change', saveSelectionState);
-        }
-    });
-
-    // （旧 #theme-selector 点击存档监听已随主题选择器一起移除）
+    // （预设按钮与维度滑块的监听已随「激发维度」页一起移除：.preset-btn 与
+    //   #slider-* 都不在 index.html 里了，applyPreset / updateConfigSummary /
+    //   saveSelectionState 三个宿主函数也已从 js/config.js 删除。）
 
     // Tab buttons switching
     document.querySelectorAll('.result-tabs-bar .tab-btn').forEach(btn => {
@@ -1437,18 +1213,8 @@ function setupEventListeners() {
             ideaMetaToggle.title = collapsed ? '展开完整标题与话题' : '收起标题与话题';
         });
     }
-    // 手机端页脚 LLM 模型选择器的折叠开关：折叠态只留「LLM 模型 · 使用中 xxx」一行，
-    // 展开才铺开全部芯片。桌面端 CSS 不理会 picker-collapsed，按钮本身也不显示。
-    const llmToggle = document.getElementById('ideation-llm-toggle');
-    if (llmToggle) {
-        llmToggle.addEventListener('click', () => {
-            const picker = document.getElementById('ideation-model-picker');
-            if (!picker) return;
-            const collapsed = picker.classList.toggle('picker-collapsed');
-            llmToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-            llmToggle.title = collapsed ? '展开模型选择' : '收起模型选择';
-        });
-    }
+    // （页脚 LLM 模型选择器的折叠开关已移除：#ideation-llm-toggle / #ideation-model-picker
+    //   随「激发维度」页一起下线。模型切换现在只在配置中心，见 syncSettingsLlmModelPicker。）
     document.getElementById('make-cover-btn').addEventListener('click', () => generateCover());
     document.getElementById('generate-frames-btn').addEventListener('click', () => generateFrames());
     const genSelBtn = document.getElementById('generate-frames-selection-btn');
@@ -1900,12 +1666,11 @@ async function generateIdea(retryParams = null) {
         }
     }
 
-    // 基础场景主题选择器已移除：非重试路径的选题只能来自选中过的灵感卡片（联网参考
-    // 驱动，点卡片或点卡片上的「🔨 节拍简介」都会载入维度）。没载入过就没有可合成的
-    // 主题，在切换视图前先拦下。
-    const loadedIdea = (typeof loadedIdeationCover !== 'undefined' && loadedIdeationCover) ? loadedIdeationCover : null;
-    if (!retryParams && (!loadedIdea || !loadedIdea.input_str)) {
-        showToast('请先点选灵感推荐卡片（或卡片上的「🔨 节拍简介」）选定选题，也可直接在卡片上一键合成', 'error');
+    // 灵感卡片链路已下线，所有入口（项目工作台的重试 / 换模型重跑 / 结果页重试）
+    // 都会带着完整的 dimensions 进来。没有 retryParams 就没有可合成的选题，这里拦下，
+    // 免得后面拿着一份空维度去发请求。
+    if (!retryParams) {
+        showToast('没有可合成的选题：请从「📁 项目」里重试一条任务，或用「📥 上传提示词集」新建。', 'error');
         return;
     }
 
@@ -1934,48 +1699,6 @@ async function generateIdea(retryParams = null) {
         dimensions = retryParams.dimensions;
         currentConf = retryParams.config;
         reuseTaskId = retryParams.taskId ? String(retryParams.taskId) : null;
-    } else {
-        // Collect GUI dimensions — 选题（theme=一键输入串）与任务名都取自已载入的
-        // 灵感卡片；函数入口已保证 loadedIdea.input_str 存在
-        const activeAnchors = Array.from(document.querySelectorAll('#anchor-selector .anchor-node.active'))
-            .map(node => node.textContent.trim());
-
-        dimensions = {
-            theme: loadedIdea.input_str,
-            task_label: loadedIdea.task_label || loadedIdea.input_str,
-            // 与卡片「一键合成」路径对齐：封面与英文标题一并带给后端（有则复用）
-            cover_url: loadedIdea.cover_url || null,
-            english_title: loadedIdea.english_title || null,
-            topic_dna: loadedIdea.topic_dna || null,
-            llm_score: loadedIdea.llm_score ?? null,
-            // 台账登记跟随真正的激发请求；仅浏览/载入灵感卡片不会入账。
-            ledger_candidate: {
-                dna: loadedIdea.topic_dna || null,
-                title: loadedIdea.task_label || null,
-                score: loadedIdea.llm_score ?? null,
-                creative_seed: loadedIdea.creative_seed || null
-            },
-            // 联网参考案例库使用计次：与卡片「一键合成」路径对齐透传，让选中卡片载入维度
-            // 后走主生成按钮的合成同样能在真正借鉴时计次（见 server.py /api/compose）
-            trend_ref: loadedIdea.trend_ref || null,
-            trend_ref_ids: loadedIdea.trend_ref_ids || [],
-            beat_outline: Array.isArray(loadedIdea.beat_outline)
-                ? loadedIdea.beat_outline.slice()
-                : [],
-            pacing_skeleton: loadedIdea.pacing_skeleton || 'linear_milestone',
-            anchors: activeAnchors,
-            complexity: document.getElementById('val-complexity').textContent,
-            budget: document.getElementById('val-budget').textContent,
-            ratio: document.getElementById('val-ratio').textContent,
-            creativity: document.getElementById('val-creativity').textContent,
-            beats_count: parseInt(document.getElementById('slider-beats').value, 10),
-            // 载入卡片后走主生成按钮的这条路径也要带上拍数下界，否则它和卡片
-            // 「一键合成」会落在两个不同的区间里（同一张卡走两条路拿到不同拍数）。
-            // 滑块只压上限；下界由卡片的工序清单决定，见 compute_beats_floor。
-            beats_floor: Number.isFinite(+(loadedIdea.beats_floor)) ? +loadedIdea.beats_floor : null,
-            beat_count_mode: (document.getElementById('beat-count-mode') || {}).value || 'adaptive'
-        };
-        currentConf = { ...config };
     }
 
     // Generate unique taskId (retry reuses the failed record's id so the rerun
@@ -4321,47 +4044,6 @@ async function generateCover() {
 // =====================================================================
 // Function loadCustomPresets moved to modular JS file
 
-async function saveCustomPreset() {
-    const presetName = await customPrompt("请输入此自定义预设的名称 (例如: 极简清水舱, 脑洞自然舱):");
-    if (presetName === null) return; // User cancelled
-    const trimmedName = presetName.trim();
-    if (!trimmedName) {
-        showToast("预设名称不能为空", "error");
-        return;
-    }
-
-    // 自定义预设不再存 theme：#theme-selector 已移除，原逻辑必然取不到激活按钮、
-    // 于是每条新预设都被写死成 'hollow_oak' 这个假值，applyCustomPreset 读它也是空转。
-    const activeAnchors = Array.from(document.querySelectorAll('#anchor-selector .anchor-node.active'))
-        .map(node => node.dataset.value);
-
-    customPresets[trimmedName] = {
-        anchors: activeAnchors,
-        complexity: parseInt(document.getElementById('slider-complexity').value, 10),
-        budget: parseInt(document.getElementById('slider-budget').value, 10),
-        ratio: parseInt(document.getElementById('slider-ratio').value, 10),
-        creativity: parseInt(document.getElementById('slider-creativity').value, 10),
-        beats: parseInt(document.getElementById('slider-beats').value, 10)
-    };
-
-    localStorage.setItem('spark_custom_presets', JSON.stringify(customPresets));
-    renderCustomPresets();
-    showToast(`自定义预设 "${trimmedName}" 保存成功！`, "success");
-}
-
-async function deleteCustomPreset(name, event) {
-    if (event) event.stopPropagation();
-    if (!customPresets[name]) return;
-    
-    const confirmed = await customConfirm(`确定删除自定义预设 "${name}" 吗？`);
-    if (confirmed) {
-        delete customPresets[name];
-        localStorage.setItem('spark_custom_presets', JSON.stringify(customPresets));
-        renderCustomPresets();
-        showToast(`已删除预设 "${name}"`, "success");
-    }
-}
-
 // Function applyCustomPreset moved to modular JS file
 
 // Function renderCustomPresets moved to modular JS file
@@ -4478,12 +4160,6 @@ function handleGlobalHotkeys(e) {
         const trendRefsManageModal = document.getElementById('trend-refs-manage-modal');
         if (trendRefsManageModal && trendRefsManageModal.classList.contains('active')) {
             const closeBtn = trendRefsManageModal.querySelector('.close-btn');
-            if (closeBtn) closeBtn.click();
-        }
-
-        const beatOutlineModal = document.getElementById('beat-outline-modal');
-        if (beatOutlineModal && beatOutlineModal.classList.contains('active')) {
-            const closeBtn = beatOutlineModal.querySelector('.close-btn');
             if (closeBtn) closeBtn.click();
         }
 
@@ -4824,261 +4500,12 @@ function updateActiveGenerationBanner() {
     }
 }
 
-// ==========================================================================
-// Upstream Topic Ideation Engine (P2)
-// --------------------------------------------------------------------------
-let currentIdeatedIdeas = [];
-// 缓存版本随卡片输出契约变化：4 起每条 idea 除 beat_outline
-// 外还带 pacing_skeleton，旧缓存不能冒充成「已按骨架参考规划」的新卡。
-// v5 作废「只带骨架标签、未经内容验收」时期产出的旧卡：那些卡可能
-// 在仅勾 dual_payoff 时仍保存了单线 outline，服务端修好后也不能继续命中它们。
-// v8 作废「双空间重置兑现」用自然/原地载体（冰洞、竖井、地窖）产出的旧卡：
-// 该骨架现在要求人工运输载体（集装箱/校车/大巴/机身）在第一拍被装备运到现场落位，
-// 旧缓存卡的第一拍是「清理」，与新契约对不上。
-// v9 把该参考从“只借四幕结构”升级为埋地校车原片的施工顺序一比一复刻；旧卡缺少
-// 入口井、逐层地面/墙顶和开门重置等明确阶段，不能继续冒充新骨架产物。
-const IDEATION_CACHE_VERSION = '9-nested-space-literal-stage-order';
-const DEFAULT_PACING_SKELETON_IDS = ['linear_milestone', 'dual_payoff', 'nested_space_payoff'];
-
-function getSelectedPacingSkeletonIds() {
-    const checked = Array.from(document.querySelectorAll('input[name="pacing-skeleton"]:checked'))
-        .map(el => String(el.value || '').trim())
-        .filter(id => DEFAULT_PACING_SKELETON_IDS.includes(id));
-    return checked.length > 0 ? checked : DEFAULT_PACING_SKELETON_IDS.slice();
-}
-
-function initPacingSkeletonSelector() {
-    const inputs = Array.from(document.querySelectorAll('input[name="pacing-skeleton"]'));
-    if (inputs.length === 0) return;
-
-    let stored = [];
-    try {
-        const parsed = JSON.parse(localStorage.getItem('ideation_pacing_skeleton_ids') || '[]');
-        if (Array.isArray(parsed)) {
-            stored = parsed.filter(id => DEFAULT_PACING_SKELETON_IDS.includes(id));
-        }
-    } catch (e) {
-        stored = [];
-    }
-    if (stored.length > 0) {
-        inputs.forEach(input => { input.checked = stored.includes(input.value); });
-    }
-
-    const updateNote = () => {
-        const selected = inputs.filter(input => input.checked);
-        const note = document.getElementById('pacing-skeleton-selected-note');
-        if (!note) return;
-        // 这行是骨架抽屉折叠态的唯一露出处，顺带点名启用了哪几套，
-        // 不用展开就知道下一批灵感按什么节奏规划
-        const names = (typeof pacingSkeletonLabel === 'function')
-            ? selected.map(item => pacingSkeletonLabel(item.value)).join(' / ')
-            : '';
-        note.textContent = names
-            ? `已启用 ${selected.length} 套 · ${names}`
-            : `已启用 ${selected.length} 套`;
-    };
-
-    inputs.forEach(input => input.addEventListener('change', () => {
-        let selected = inputs.filter(item => item.checked);
-        if (selected.length === 0) {
-            input.checked = true;
-            selected = [input];
-            showToast('至少保留一套推进节拍骨架', 'info');
-        }
-        const ids = selected.map(item => item.value);
-        localStorage.setItem('ideation_pacing_skeleton_ids', JSON.stringify(ids));
-        // 选择变了不立即发起昂贵的 LLM 请求；下次「换一批」/重载时
-        // 由缓存绑定键自动判旧批次过期。
-        updateNote();
-        updateConfigSummary();
-    }));
-    updateNote();
-}
-
-// 一次激发是一串 LLM 调用（失败重试时可能跑上几分钟）。按钮上没有 disabled，
-// 用户等不及连点几下就会并发出几路同样昂贵的请求，回来还互相覆盖卡片区。
-let ideationInFlight = false;
-
-// 缓存绑定用的「生成数设置」原值（'5' / 'random' …）。用原值而不是解析出来的张数：
-// random 每次解析都不同，用解析值会让缓存永远失效；而交付张数可能少于请求张数，
-// 用交付数比对又会每次进页面都重新激发一批。
-function getIdeationCountKey() {
-    const select = document.getElementById('ideation-count-select');
-    return String((select && select.value) || localStorage.getItem('ideation_card_count') || '5');
-}
-
-function getRequestedIdeationCount() {
-    const select = document.getElementById('ideation-count-select');
-    let val = select ? select.value : (localStorage.getItem('ideation_card_count') || '5');
-    if (val === 'random') {
-        return Math.floor(Math.random() * 6) + 3; // 随机 3~8 张
-    }
-    const parsed = parseInt(val, 10);
-    return (Number.isFinite(parsed) && parsed >= 1 && parsed <= 15) ? parsed : 5;
-}
-
-async function loadIdeationCards(force = false, options = {}) {
-    const container = document.getElementById('ideation-cards-container');
-    if (!container) return;
-    if (ideationInFlight) {
-        if (typeof showToast === 'function') showToast('正在激发中，请稍候…', 'info');
-        return;
-    }
-    const remixSeed = options && options.remixSeed ? options.remixSeed : null;
-    const requestedCount = getRequestedIdeationCount();
-
-    // 灵感推荐由联网参考案例库驱动（js/trend_refs.js）：勾选了参考就直接从选中
-    // 案例取材；没勾选则后端自动联网搜索（结果沉淀回案例库）
-    const selIds = remixSeed
-        ? []
-        : ((typeof getSelectedTrendRefIds === 'function') ? getSelectedTrendRefIds() : []);
-    const selKey = selIds.slice().sort().join(',');
-    const pacingSkeletonIds = getSelectedPacingSkeletonIds();
-    const pacingSkeletonKey = pacingSkeletonIds.slice().sort().join(',');
-
-    const countKey = getIdeationCountKey();
-
-    if (!force && !remixSeed) {
-        const cached = localStorage.getItem('ideation_cached_ideas');
-        // 缓存与生成时勾选的联网参考集合、骨架、以及「生成数」设置绑定。
-        // 生成数此前没进绑定键：改成 10 张之后不点「换一批」就还是那批旧卡，
-        // 看起来就像「选了生成数也没用」。
-        const cachedSel = localStorage.getItem('ideation_cached_trend_sel');
-        const cachedSkeletons = localStorage.getItem('ideation_cached_pacing_skeletons');
-        const cachedCount = localStorage.getItem('ideation_cached_count');
-        const cachedVersion = localStorage.getItem('ideation_cache_version');
-        if (cached && cachedSel === selKey && cachedSkeletons === pacingSkeletonKey
-                && cachedCount === countKey
-                && cachedVersion === IDEATION_CACHE_VERSION) {
-            try {
-                const parsed = JSON.parse(cached);
-                if (parsed && Array.isArray(parsed) && parsed.length > 0) {
-                    currentIdeatedIdeas = parsed;
-                    try {
-                        currentIdeationTrendRefs = JSON.parse(localStorage.getItem('ideation_cached_trend_refs')) || [];
-                    } catch (e2) {
-                        currentIdeationTrendRefs = [];
-                    }
-                    renderIdeationCards(parsed);
-                    return;
-                }
-            } catch (e) {
-                console.error("Failed to parse cached ideas:", e);
-            }
-        }
-    }
-
-    // 激发中不再把整块卡片区清空成一行文案：上一批还能看、还能点（选中态也留着），
-    // 进度与秒表由激发轨的 ② 芯片承担（见 js/spark_rail.js）。空库时才铺骨架占位。
-    const pendingMsg = remixSeed
-        ? `正在以「${remixSeed.one_line || remixSeed.topic_dna || '台账创意'}」为母题激发二创方案`
-        : selIds.length > 0
-        ? `正在从选中的 ${selIds.length} 条联网参考案例中取材激发灵感 (${requestedCount} 张)`
-        : `正在从案例库自动挑选参考激发灵感中 (${requestedCount} 张)`;
-    renderIdeationPending(container, pendingMsg, requestedCount);
-    ideationInFlight = true;
-    if (typeof setSparkIdeating === 'function') setSparkIdeating(true);
-
-    try {
-        const response = await fetch('/api/ideate', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                config: config,
-                count: requestedCount,
-                trend_ref_ids: selIds,
-                pacing_skeleton_ids: pacingSkeletonIds,
-                remix_seed: remixSeed
-            })
-        });
-
-        const data = await response.json();
-        if (data.status === 'ok' && Array.isArray(data.ideas) && data.ideas.length > 0) {
-            currentIdeatedIdeas = data.ideas;
-            currentIdeationTrendRefs = Array.isArray(data.trend_refs) ? data.trend_refs : [];
-            if (!remixSeed) {
-                localStorage.setItem('ideation_cached_ideas', JSON.stringify(data.ideas));
-                localStorage.setItem('ideation_cached_trend_refs', JSON.stringify(currentIdeationTrendRefs));
-                localStorage.setItem('ideation_cached_trend_sel', selKey);
-                localStorage.setItem('ideation_cached_pacing_skeletons', pacingSkeletonKey);
-                localStorage.setItem('ideation_cached_count', countKey);
-                localStorage.setItem('ideation_cache_version', IDEATION_CACHE_VERSION);
-            }
-            renderIdeationCards(data.ideas);
-            // 交付张数少于请求张数时说清原因：后端把没通过节拍骨架验收的候选丢掉了，
-            // 不说的话用户只看到「选了 5 张却只回来 2 张」，只能怀疑生成数没生效。
-            if (!remixSeed && data.ideas.length < requestedCount && typeof showToast === 'function') {
-                showToast(`本批只产出 ${data.ideas.length} 张（请求 ${requestedCount} 张）：`
-                    + '其余候选没通过所选节拍骨架的验收已被丢弃。想更容易凑齐可在细调条里'
-                    + '同时勾上「单线里程碑推进」。', 'info');
-            }
-            if (typeof loadTrendRefs === 'function') loadTrendRefs();
-        } else {
-            renderIdeationFailure(container,
-                data.message || (data.status === 'ok' ? '本次没有产出新的灵感卡片' : '未知错误'));
-        }
-    } catch (e) {
-        console.error("Failed to load ideated cards:", e);
-        renderIdeationFailure(container, '请检查网络或配置');
-    } finally {
-        ideationInFlight = false;
-        if (typeof setSparkIdeating === 'function') setSparkIdeating(false);
-    }
-}
-
-// 激发中的卡片区占位：已有卡片就原样留着，空库时按 requestedCount 铺骨架卡。
-function renderIdeationPending(container, message, requestedCount = 5) {
-    if (!container) return;
-    const keepOld = !!container.querySelector('.ideation-card');
-    const text = keepOld ? `${message}…（下方是上一批，仍可点选）` : `${message}…`;
-
-    let strip = container.querySelector('.ideation-pending-strip');
-    if (!keepOld) {
-        container.innerHTML = '';
-        strip = null;
-        const count = Math.max(1, requestedCount || 5);
-        for (let i = 0; i < count; i++) {
-            const sk = document.createElement('div');
-            sk.className = 'ideation-card-skeleton';
-            container.appendChild(sk);
-        }
-    }
-    if (!strip) {
-        strip = document.createElement('div');
-        strip.className = 'ideation-pending-strip';
-        container.insertBefore(strip, container.firstChild);
-    }
-    strip.textContent = text;
-}
-
-/* 激发失败：上一批还在就留着（那是用户仅有的可点内容），只把顶部那条进度提示换成
-   失败原因；一张都没有时才把骨架占位替换成错误块。以前这里无条件 innerHTML 覆写，
-   等于失败一次就把上一批也一并抹掉。 */
-function renderIdeationFailure(container, message) {
-    if (!container) return;
-    const keepOld = !!container.querySelector('.ideation-card');
-    if (!keepOld) {
-        container.innerHTML = `<div class="ideation-error">加载失败: ${message}</div>`;
-        return;
-    }
-    let strip = container.querySelector('.ideation-pending-strip');
-    if (!strip) {
-        strip = document.createElement('div');
-        strip.className = 'ideation-pending-strip';
-        container.insertBefore(strip, container.firstChild);
-    }
-    strip.textContent = `激发失败: ${message}（下方仍是上一批，可继续点选）`;
-    if (typeof showToast === 'function') showToast(`激发失败: ${message}`, 'error');
-}
-
-// Function renderIdeationCards moved to modular JS file
-
-// Function selectIdeationCard moved to modular JS file
-
-// Function composeIdeationCard moved to modular JS file
-
+// ── 上游选题激发引擎（灵感卡）已整体移除（2026-08-19）──────────────────
+// loadIdeationCards / renderIdeationPending / renderIdeationFailure /
+// getRequestedIdeationCount / getSelectedPacingSkeletonIds 等，落点是「激发维度」页
+// 的 #ideation-cards-container。那一页下线后这里没有任何入口，卡片渲染侧
+// （js/prompt_pipeline.js 的 renderIdeationCards 一线）也一并移除。
+// 后端 /api/ideate 完好未动，将来重建卡片区从那里接回来。
 // Function mapEnglishCarrierToValue moved to modular JS file
 
 /* 暗夜模式 toggle 已抽出到 js/theme_toggle.js(双前端共享,index.html 加载)*/

@@ -47,6 +47,13 @@ tasks.json
 scratch/
 scratch_*
 
+# ── 仓库根的媒体探针产物 ──
+# ffmpeg 手工核对(音频瞬态检测、脉冲测试)会在仓库根落下 test_*.wav 之类的中间文件。
+# 这类文件没有任何代码引用,却极易失控:实测出现过 4.0GB 的 test_audio.wav 和 2.6GB 的
+# test_pulse.wav 一直挂在未跟踪列表里,离一次 `git add -A` 只差一步。
+# 仓库里没有任何被跟踪的 .wav,整类忽略是安全的。
+*.wav
+
 # ── 一次性事故恢复留底(整份 manifest/创意库/媒体快照,体积大且是用户内容)──
 .recovery/
 

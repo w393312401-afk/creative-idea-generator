@@ -68,8 +68,8 @@ const REPLICA_BEAT_STAGE_LABELS = {
 
 // 节拍卡片上按「一行一条」编辑的数组字段（timelapse-beats.schema.json 里的 array 项）。
 const REPLICA_LIST_FIELDS = new Set([
-    'package_operations', 'persistent_traces', 'visible_details', 'source_event_ids',
-    'evidence_frames', 'reference_frames',
+    'package_operations', 'persistent_traces', 'visible_details', 'macro_environment',
+    'source_event_ids', 'evidence_frames', 'reference_frames',
 ]);
 
 let replicaActivePreset = 'custom';
@@ -1511,6 +1511,7 @@ function replicaStageSelect(beat, idx) {
 // 难免把工人的手套、一次性道具算进来，用户删掉之后不能被下一次读状态又加回去
 // （后端 attach_scene_constants 因此只在字段为空时才算）。
 const REPLICA_SCENE_CONSTANT_FIELDS = [
+    ['environment', '常驻大环境与地貌水体'],
     ['materials', '常驻材质与表面'],
     ['traces', '常驻痕迹与风化'],
     ['fixtures_in_shot', '常驻画面的器具'],
@@ -1697,10 +1698,13 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
             </details>` : ''}
             <div class="replica-beat-fields">
                 ${field('space', '所在空间（同一个空间逐字沿用同一个名字；换名字＝机位穿过开口进了另一个空间，会多出一次过门）')}
+                ${field('macro_environment', '大环境识别项（地貌水体、气候光照、空间包络与周边宏观环境；一行一条）', 2)}
                 ${field('visual_subject', '画面主体')}
                 ${field('operation', '主导工序')}
                 ${field('package_operations',
                         `工序包（一行一道，须 2~3 道；当前 ${(beat.package_operations || []).length} 道）`, 2)}
+                ${field('visible_details',
+                        `细节识别项（一行一条，须 3~6 条；当前 ${(beat.visible_details || []).length} 条）`, 2)}
                 ${field('visible_action', '可见动作', 2)}
                 ${field('visible_result', '可见结果', 2)}
                 ${field('state_before', '起始状态（须写具体空间完成范围）', 2)}
@@ -1974,7 +1978,10 @@ function replicaBindEvents() {
     }, 'input');
 
     if (typeof initTrendRefsDirectionPanel === 'function') initTrendRefsDirectionPanel();
-    if (typeof renderTrendRefs === 'function') renderTrendRefs();
+    // 首次挂载要真的去取一次数（见 trend_refs.js ensureTrendRefsLoaded 的注释）：
+    // 只调 renderTrendRefs 就是拿空缓存渲染，抽屉会一直是空的。
+    if (typeof ensureTrendRefsLoaded === 'function') ensureTrendRefsLoaded();
+    else if (typeof renderTrendRefs === 'function') renderTrendRefs();
 
     root.querySelectorAll('[data-idea-idx]').forEach(card => {
         card.addEventListener('click', () => {

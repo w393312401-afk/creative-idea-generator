@@ -465,23 +465,18 @@ def extract_keyframes(video_path, output_dir, fps=3.0):
         # Auto-generate a beautiful 5-column tiled keyframe collage persistent next to the video (T0 Rule)
         if files:
             try:
+                from tools.collage import build_keyframe_collage
+                from pathlib import Path
                 collage_path = os.path.splitext(video_path)[0] + "_collage.jpg"
                 print(f"[*] Generating 5-column tiled keyframe collage at: {collage_path}...")
-                cols = 5
-                rows = math.ceil(len(files) / cols)
-                
-                collage_cmd = [
-                    ffmpeg_path,
-                    "-y",
-                    "-i", video_path,
-                    "-vf", f"fps={fps},scale=240:-1,tile={cols}x{rows}",
-                    "-vframes", "1",
-                    collage_path
-                ]
-                subprocess.run(collage_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, **_win_subprocess_flags())
-                print(f"[+] Successfully generated keyframe collage: {collage_path}")
+                res = build_keyframe_collage([Path(f) for f in files], Path(collage_path), columns=5, max_frames=25, tile_width=360)
+                if res and os.path.exists(collage_path):
+                    print(f"[+] Successfully generated keyframe collage: {collage_path}")
+                else:
+                    print(f"[-] Warning: Failed to generate keyframe collage via build_keyframe_collage")
             except Exception as collage_err:
                 print(f"[-] Warning: Failed to generate keyframe collage: {collage_err}")
+
                 
         return files
     except Exception as e:

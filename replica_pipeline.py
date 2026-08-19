@@ -764,6 +764,8 @@ def run_extract(state, on_progress=None, base_fps=None):
         'collage_thumb': thumb or collage,
         'duration_sec': (overview.get('media_metadata') or {}).get('duration_sec'),
         'change_event_count': overview.get('change_event_count'),
+        'audio_transient_count': len(overview.get('audio_transients') or []),
+        'spatial_dna': overview.get('spatial_dna') or {},
         'frame_count': (overview.get('review_sampling') or {}).get('frame_count'),
         'analysis_plan': overview.get('analysis_plan'),
         'pace_metrics': overview.get('pace_metrics'),

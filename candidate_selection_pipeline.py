@@ -29,10 +29,12 @@ from frame_generator import (
     _get_google_fx_image_service, _fx_image_model,
     _fx_extract_uuid, _fx_store_frame, _fx_find_ref_for, _fx_src_dir,
     _fx_clear_frame_reference, _fx_cover_ref_jpg, _fx_local_frame_ref_jpg, update_manifest_stale_status,
+    current_thread_sinks, set_upstream_event_sink, set_cancel_check_sink,
 )
 from prompt_pipeline import (
     _parse_prompt_slots, _multimodal_chat, ground_threshold_reveal_prompt,
     threshold_reveal_continuity_clause,
+    accounting_is_active, start_accounting, stop_and_get_accounting, merge_accounting,
 )
 
 _AI_DISCRIMINATION_SYSTEM_PROMPT = """你是一名好莱坞级电影视觉总监与 AI 视频连续帧序列智能质检鉴别专家。
@@ -100,6 +102,18 @@ _AI_DISCRIMINATION_SYSTEM_PROMPT = """你是一名好莱坞级电影视觉总监
   "selection_reason": "综合评估结论：清晰阐述为何选择该候选图作为最佳官方采用帧（中文，不超过60字）"
 }
 """
+
+
+_DEFAULT_CANDIDATE_CONCURRENCY = 4
+
+
+def candidate_concurrency(config, candidate_count=4):
+    """4选1模式 API 候选图生成的并发度。config['candidateConcurrency'] 可覆盖；默认 candidate_count (4)，范围 1~8。"""
+    try:
+        n = int((config or {}).get('candidateConcurrency') or candidate_count or _DEFAULT_CANDIDATE_CONCURRENCY)
+    except Exception:
+        n = candidate_count or _DEFAULT_CANDIDATE_CONCURRENCY
+    return max(1, min(8, n))
 
 
 def _generate_single_api_candidate(config, prompt_text, reference_path, out_path, is_text_only, ctrl_prompt):
@@ -260,41 +274,132 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
     if len(candidate_paths) < candidate_count:
         missing_count = candidate_count - len(candidate_paths)
         start_idx = len(candidate_paths) + 1
-        log('INFO', 'CANDIDATE_GEN', f"IMG {seq:03d} 生成 {missing_count} 张候选图 (从 index {start_idx} 开始)...")
-        
+        missing_indices = list(range(start_idx, candidate_count + 1))
+        max_workers = candidate_concurrency(config, missing_count)
+        log('INFO', 'CANDIDATE_GEN', f"IMG {seq:03d} 并发生成 {missing_count} 张候选图 (从 index {start_idx} 开始，并发度 {max_workers})...")
+
+        if on_progress and on_progress('cancel_check', None):
+            raise ConnectionError('用户取消了候选帧生成')
+
+        if on_progress:
+            on_progress('candidate_generating', {
+                'sequence': seq,
+                'candidate_index': None,
+                'total_candidates': candidate_count,
+                'message': f"IMG {seq:03d} 正在并发生成 {missing_count} 张候选图 (#{start_idx}~#{candidate_count})...",
+            })
+
         def _make_cand(c_idx):
             cand_path = os.path.join(candidates_dir, f'candidate_{c_idx}.webp')
             p_variant = prompt_text
             if c_idx > 1:
                 p_variant = f"{prompt_text}\n\n[Variation #{c_idx}]"
             _generate_single_api_candidate(config, p_variant, reference_path, cand_path, is_text_only, ctrl_prompt)
-            return cand_path
+            if os.path.exists(cand_path) and os.path.getsize(cand_path) > 0:
+                return {
+                    'index': c_idx,
+                    'path': cand_path,
+                    'raw_src': cand_path,
+                    'fx_uuid': None,
+                }
+            raise RuntimeError(f"Candidate #{c_idx} image file is missing or empty")
 
-        for c_idx in range(start_idx, candidate_count + 1):
-            if on_progress and on_progress('cancel_check', None):
-                raise ConnectionError('用户取消了候选帧生成')
-            if on_progress:
-                on_progress('candidate_generating', {
-                    'sequence': seq,
-                    'candidate_index': c_idx,
-                    'total_candidates': candidate_count,
-                    'message': f"IMG {seq:03d} 正在生成候选图 #{c_idx}/{candidate_count}...",
-                })
-            try:
-                p = _make_cand(c_idx)
-                if os.path.exists(p) and os.path.getsize(p) > 0:
-                    candidate_paths.append(p)
-                    candidates_meta.append({
-                        'index': c_idx,
-                        'path': p,
-                        'raw_src': p,
-                        'fx_uuid': None,
+        if max_workers <= 1 or len(missing_indices) <= 1:
+            for c_idx in missing_indices:
+                if on_progress and on_progress('cancel_check', None):
+                    raise ConnectionError('用户取消了候选帧生成')
+                if on_progress:
+                    on_progress('candidate_generating', {
+                        'sequence': seq,
+                        'candidate_index': c_idx,
+                        'total_candidates': candidate_count,
+                        'message': f"IMG {seq:03d} 正在生成候选图 #{c_idx}/{candidate_count}...",
                     })
-            except Exception as gen_err:
-                log('ERROR', 'CANDIDATE_GEN', f"生成候选图 #{c_idx} 失败: {gen_err}")
-                if candidate_paths:
-                    break
-                raise
+                try:
+                    meta = _make_cand(c_idx)
+                    candidate_paths.append(meta['path'])
+                    candidates_meta.append(meta)
+                except Exception as gen_err:
+                    log('ERROR', 'CANDIDATE_GEN', f"生成候选图 #{c_idx} 失败: {gen_err}")
+                    if candidate_paths:
+                        break
+                    raise
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            parent_upstream, parent_cancel = current_thread_sinks()
+            parent_accounting = accounting_is_active()
+
+            def _wrapped(c_idx):
+                set_upstream_event_sink(parent_upstream)
+                set_cancel_check_sink(parent_cancel)
+                if parent_accounting:
+                    start_accounting()
+                try:
+                    res = _make_cand(c_idx)
+                    usage = stop_and_get_accounting() if parent_accounting else None
+                    return res, usage
+                finally:
+                    set_upstream_event_sink(None)
+                    set_cancel_check_sink(None)
+
+            generated_results = {}
+            errors = {}
+            completed_so_far = len(candidate_paths)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_wrapped, c_idx): c_idx for c_idx in missing_indices}
+                try:
+                    for fut in as_completed(futures):
+                        c_idx = futures[fut]
+                        if on_progress and on_progress('cancel_check', None):
+                            for f in futures:
+                                f.cancel()
+                            raise ConnectionError('用户取消了候选帧生成')
+                        try:
+                            cand_meta, usage = fut.result()
+                            if parent_accounting and usage:
+                                merge_accounting(usage)
+                            generated_results[c_idx] = cand_meta
+                            completed_so_far += 1
+                            if on_progress:
+                                on_progress('candidate_generating', {
+                                    'sequence': seq,
+                                    'candidate_index': c_idx,
+                                    'completed_count': completed_so_far,
+                                    'total_candidates': candidate_count,
+                                    'message': f"IMG {seq:03d} 候选图 #{c_idx} 生成完成 ({completed_so_far}/{candidate_count})...",
+                                })
+                        except GenerationCancelled:
+                            for f in futures:
+                                f.cancel()
+                            raise
+                        except ConnectionError:
+                            for f in futures:
+                                f.cancel()
+                            raise
+                        except Exception as gen_err:
+                            log('ERROR', 'CANDIDATE_GEN', f"IMG {seq:03d} 生成候选图 #{c_idx} 失败: {gen_err}")
+                            errors[c_idx] = gen_err
+                except GenerationCancelled:
+                    raise
+                except ConnectionError:
+                    raise
+                finally:
+                    for fut in futures:
+                        fut.cancel()
+
+            # 按候选序号顺序组装结果
+            for c_idx in missing_indices:
+                if c_idx in generated_results:
+                    meta = generated_results[c_idx]
+                    candidate_paths.append(meta['path'])
+                    candidates_meta.append(meta)
+
+            if not candidate_paths:
+                if errors:
+                    first_err = next(iter(errors.values()))
+                    raise RuntimeError(f"IMG {seq:03d} 所有候选图并发生成均失败: {first_err}")
+                raise RuntimeError(f"IMG {seq:03d} 生成候选图失败，未获得任何有效图片")
 
     if not candidate_paths:
         raise RuntimeError(f"IMG {seq:03d} 生成候选图失败，未获得任何有效图片")
@@ -425,7 +530,7 @@ def _generate_full_collage_from_frames(frames_dir):
     outpath = os.path.join(frames_dir, 'full_collage.jpg')
     n = len(inputs)
 
-    filter_parts = [f'[{i}:v]scale=240:-1:force_original_aspect_ratio=decrease,pad=240:ih:(ow-iw)/2:(oh-ih)/2[s{i}]' for i in range(n)]
+    filter_parts = [f'[{i}:v]scale=360:-1:force_original_aspect_ratio=decrease,pad=360:ih:(ow-iw)/2:(oh-ih)/2[s{i}]' for i in range(n)]
     filter_str = ';'.join(filter_parts) + ';'
     filter_str += ''.join(f'[s{i}]' for i in range(n))
     filter_str += f'concat=n={n}:v=1:a=0,tile={cols}x{rows}'

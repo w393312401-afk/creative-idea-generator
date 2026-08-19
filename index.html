@@ -95,20 +95,14 @@
          必须排在 panels-tabs.css 之后：它要覆盖那里的桌面端 .content-header 与
          移动端 .action-row 规则。见 docs/spark_result_minimal_layout_plan.md -->
     <link rel="stylesheet" href="css/app/result-minimal.css?v=1.0.0">
-    <!-- 激发维度页的极简布局（激发轨 / 取材抽屉 / 灵感卡网格 / 单行页脚）。
-         同样必须排在 panels-tabs.css 之后：要覆盖那里的 .panel-footer、
-         .ideation-cards-container 与整段移动端补丁。
-         见 docs/spark_dimension_minimal_layout_plan.md -->
-    <link rel="stylesheet" href="css/app/dimension-minimal.css?v=1.0.0">
     <!-- API 配置中心的极简两栏布局（左分区导航 + 右单区表单，号池并入同一窗口）。
          必须排在 base.css 之后：要覆盖那里的 .form-group 竖排规则与 .modal-content 宽度。
          见 docs/spark_settings_center_layout_plan.md -->
     <link rel="stylesheet" href="css/app/settings-center.css?v=1.0.0">
     <link rel="stylesheet" href="css/image_studio.css?v=1.2.0">
     <link rel="stylesheet" href="css/gallery.css?v=1.4.0">
-    <link rel="stylesheet" href="css/ledger.css?v=1.2.0">
-    <!-- 项目工作台（任务列表 + 点子库合并后的主页面）。刻意排在 gallery/ledger 之后：
-         它复用那两张表的工具栏/芯片视觉语言，只补自己的列表与详情栏。 -->
+    <!-- 项目工作台（任务列表 + 点子库合并后的主页面）。刻意排在 gallery 之后：
+         它复用工具栏/芯片视觉语言，只补自己的列表与详情栏。 -->
     <link rel="stylesheet" href="css/projects.css?v=1.3.0">
     <link rel="stylesheet" href="css/app/stepped_pipeline.css?v=1.0.0">
     <link rel="stylesheet" href="css/app/replica.css?v=2.0.2">
@@ -183,11 +177,7 @@
 
         <!-- Top-level workspace tabs: exclusive single-panel view at every screen size -->
         <div class="mobile-nav-tabs">
-            <button id="main-tab-config" class="mobile-nav-btn active" onclick="switchMainTab('config')">
-                <span class="btn-icon">⚙️</span>
-                <span class="btn-text">激发维度</span>
-            </button>
-            <button id="main-tab-results" class="mobile-nav-btn" onclick="switchMainTab('results')">
+            <button id="main-tab-results" class="mobile-nav-btn active" onclick="switchMainTab('results')">
                 <span class="btn-icon">☄️</span>
                 <span class="btn-text">激发结果</span>
             </button>
@@ -198,10 +188,6 @@
             <button id="main-tab-gallery" class="mobile-nav-btn" onclick="switchMainTab('gallery')">
                 <span class="btn-icon">🖼️</span>
                 <span class="btn-text">画廊</span>
-            </button>
-            <button id="main-tab-ledger" class="mobile-nav-btn" onclick="switchMainTab('ledger')">
-                <span class="btn-icon">📒</span>
-                <span class="btn-text">创意台账</span>
             </button>
             <button id="main-tab-replica" class="mobile-nav-btn" onclick="switchMainTab('replica')">
                 <span class="btn-icon">🎬</span>
@@ -215,261 +201,8 @@
                  极简布局（激发轨 / 取材抽屉 / 灵感卡网格 / 单行页脚）：
                  方案与取舍见 docs/spark_dimension_minimal_layout_plan.md。
                  所有控件 id 与既有监听保持不变，只换外壳与位置。 -->
-            <section class="panel-left glass-panel mobile-active spark-minimal">
-                <div class="panel-header">
-                    <h2>概念设定与维度映射</h2>
-                    <p>配置您想激发的改造或建造项目的核心维度</p>
-                </div>
-
-                <!-- 激发轨：① 取材 → ② 选题 → ③ 合成 三段状态一目了然，并指出下一步。
-                     状态由 updateSparkRail()（js/spark_rail.js）从参考勾选 /
-                     loadedIdeationCover / currentIdea 推出，不参与任何请求逻辑。 -->
-                <div class="spark-rail" id="spark-rail" role="group" aria-label="激发流程">
-                    <button type="button" class="spark-stage" id="spark-stage-source" data-stage="source" title="取材：联网参考案例 + 推进节拍骨架，点此展开设置">
-                        <span class="stage-idx">1</span>
-                        <span class="stage-copy">
-                            <strong>取材</strong>
-                            <small id="spark-stage-source-note">读取参考…</small>
-                        </span>
-                    </button>
-                    <span class="spark-rail-link" aria-hidden="true"></span>
-                    <button type="button" class="spark-stage" id="spark-stage-topic" data-stage="topic" title="选题：点一张灵感卡把它的维度载入本次激发">
-                        <span class="stage-idx">2</span>
-                        <span class="stage-copy">
-                            <strong>选题</strong>
-                            <small id="spark-stage-topic-note">未选定</small>
-                        </span>
-                    </button>
-                    <span class="spark-rail-link" aria-hidden="true"></span>
-                    <button type="button" class="spark-stage" id="spark-stage-compose" data-stage="compose" title="合成：把选定选题送入 gemini-veo / omni-restoration-composer 合成完整提示词集">
-                        <span class="stage-idx">3</span>
-                        <span class="stage-copy">
-                            <strong>合成</strong>
-                            <small id="spark-stage-compose-note">待激发</small>
-                        </span>
-                    </button>
-                </div>
-
-                <div class="panel-body">
-                    <!-- Pane 1: Text prompt generation -->
-                    <div id="input-pane-text" class="input-pane active">
-                        <!-- Trend Reference Library — replaces the removed fixed six-theme
-                             selector: ideation is now driven by user-selected persisted
-                             web-search references (verified viral cases, trend_refs.json)
-                             to break out of the fixed-theme information cocoon.
-                             折叠成一行抽屉：折叠态摘要直接复用 #trend-refs-selected-note
-                             （trend_refs.js 一直在实时更新它）。 -->
-                        <div class="control-group spark-drawer" id="spark-drawer-refs" data-drawer="refs">
-                            <div class="spark-drawer-head">
-                                <button type="button" class="spark-drawer-toggle" aria-expanded="false" aria-controls="spark-drawer-refs-body">
-                                    <svg class="spark-drawer-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
-                                    <span class="group-title">🌐 联网参考案例库</span>
-                                    <span class="trend-refs-selected-note spark-drawer-note" id="trend-refs-selected-note"></span>
-                                </button>
-                                <div class="trend-refs-header-actions">
-                                    <button type="button" id="trend-refs-direction-toggle" class="preset-header-action" title="自定义联网搜索方向，就在这里改，不用去配置中心">🎯 搜索方向</button>
-                                    <button type="button" id="trend-refs-search-btn" class="preset-header-action">🔍 搜一批新参考</button>
-                                </div>
-                            </div>
-                            <div class="spark-drawer-body" id="spark-drawer-refs-body">
-                                <div class="trend-refs-direction-panel" id="trend-refs-direction-panel" hidden>
-                                    <label for="trend-refs-search-query">搜索方向（留空用默认：最新爆款延时摄影改造视频）</label>
-                                    <input type="text" id="trend-refs-search-query" placeholder="例如：AI 宠物拟人化改造视频 趋势">
-                                    <label for="trend-refs-trend-urls">参考网址（每行一个，最多取前 5 个，可选）</label>
-                                    <textarea id="trend-refs-trend-urls" rows="2" placeholder="https://..."></textarea>
-                                    <p class="trend-refs-direction-hint">改这里会同步「配置中心」里的同一项设置，下次点「搜一批新参考」立即生效——换个方向搜，案例库才不会越搜越像。</p>
-                                </div>
-                                <p class="trend-refs-hint">勾选参考后，灵感推荐将直接从这些已验证案例中取材；不勾选则每批自动联网搜索（结果也会沉淀进本库）。</p>
-                                <div class="trend-refs-toolbar">
-                                    <input type="text" id="trend-refs-filter" class="trend-refs-filter" placeholder="筛选案例库…" hidden>
-                                </div>
-                                <div class="trend-refs-list" id="trend-refs-list">
-                                    <div class="trend-refs-empty">正在载入联网参考案例库...</div>
-                                </div>
-                                <div class="trend-refs-archive-bar">
-                                    <span class="trend-refs-cap-note" id="trend-refs-cap-note"></span>
-                                    <button type="button" id="trend-refs-manage-open-btn" class="trend-refs-archive-toggle">🗂️ 管理全部</button>
-                                    <button type="button" id="trend-refs-archive-toggle" class="trend-refs-archive-toggle" hidden>查看归档</button>
-                                </div>
-                                <div class="trend-refs-list trend-refs-archive-list" id="trend-refs-archive-list" hidden></div>
-                            </div>
-                        </div>
-
-                        <!-- Pacing skeleton references: all are enabled by default so one
-                             ideation batch can deliberately spread candidates across the
-                             established linear ladder and the two payoff variants instead of
-                             silently collapsing every topic onto one rhythm. -->
-                        <div class="control-group pacing-skeleton-control spark-drawer" id="pacing-skeleton-control" data-drawer="pacing">
-                            <div class="spark-drawer-head">
-                                <button type="button" class="spark-drawer-toggle" aria-expanded="false" aria-controls="spark-drawer-pacing-body">
-                                    <svg class="spark-drawer-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
-                                    <span class="group-title">🦴 推进节拍骨架</span>
-                                    <span class="pacing-skeleton-selected-note spark-drawer-note" id="pacing-skeleton-selected-note">已启用 3 套</span>
-                                </button>
-                            </div>
-                            <div class="spark-drawer-body" id="spark-drawer-pacing-body">
-                                <p class="pacing-skeleton-hint">勾选的骨架会参与下一批灵感规划；同时启用时，候选会尽量均分使用。修改后点「换一批灵感」生效。</p>
-                                <div class="pacing-skeleton-options" role="group" aria-label="推进节拍骨架参考">
-                                    <label class="pacing-skeleton-option">
-                                        <input type="checkbox" name="pacing-skeleton" value="linear_milestone" checked>
-                                        <span class="pacing-skeleton-copy">
-                                            <strong>单线里程碑推进</strong>
-                                            <small>原骨架 · 外部清障/修复 → 过门 → 内部墙顶/地面/机电 → 家具 → 最终奖励</small>
-                                        </span>
-                                    </label>
-                                    <label class="pacing-skeleton-option">
-                                        <input type="checkbox" name="pacing-skeleton" value="dual_payoff" checked>
-                                        <span class="pacing-skeleton-copy">
-                                            <strong>内外双重完工</strong>
-                                            <small>新骨架 · 外部门面先完工小高潮 → 连续推镜过门进入原始室内 → 基层/隐蔽层/封板/饰面 → 家具终局</small>
-                                        </span>
-                                    </label>
-                                    <label class="pacing-skeleton-option">
-                                        <input type="checkbox" name="pacing-skeleton" value="nested_space_payoff" checked>
-                                        <span class="pacing-skeleton-copy">
-                                            <strong>双空间一比一复刻</strong>
-                                            <small>73.5 秒埋地校车原片 · 空基坑 → 吊装载体落位 → 覆土铺草 → 木质入口井/楼梯 → 过门进入原始主空间 → 拆空 → 防潮膜 → 地面龙骨 → 保温 → 木地板 → 墙顶龙骨/保温/封板/饰面 → 厨房家具小完工 → 打开尽头门并硬切第二毛坯空间 → 原样重复基层/膜/龙骨/保温/封板/饰面 → 核心家具 → 软装灯光加速 → 人物退出后的无人大广角。先复制施工顺序，再发散载体、环境、功能与风格。</small>
-                                        </span>
-                                    </label>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Topic Ideation Engine (P2) — fed by both the selected trend
-                             references and pacing skeletons above. 这是本页的主体：卡片区
-                             在宽屏铺成网格、窄屏纵向单列，不再横向滚。
-                             「🎲 换一批灵感」按钮已移到页脚与主激发按钮并排。 -->
-                        <div class="control-group spark-cards-group">
-                            <div class="preset-header-row">
-                                <label class="group-title">💡 灵感推荐 · 点卡片选定选题</label>
-                                <div class="ideation-count-controls" style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted, #94a3b8);">
-                                    <label for="ideation-count-select" class="ideation-count-label" style="font-size: 12px;">生成数：</label>
-                                    <select id="ideation-count-select" class="ideation-count-select" title="选择每次生成的灵感卡片数量" style="background: rgba(15, 23, 42, 0.6); color: var(--text-main, #f8fafc); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 6px; padding: 2px 8px; font-size: 12px; cursor: pointer; outline: none;">
-                                        <option value="1">1 张</option>
-                                        <option value="3">3 张</option>
-                                        <option value="5" selected>5 张 (默认)</option>
-                                        <option value="8">8 张</option>
-                                        <option value="10">10 张</option>
-                                        <option value="random">🎲 随机 (3~8张)</option>
-                                    </select>
-                                </div>
-                                <span class="spark-cards-note" id="spark-cards-note"></span>
-                            </div>
-                            <div class="ideation-cards-container" id="ideation-cards-container">
-                                <div class="ideation-loading">正在载入灵感引擎...</div>
-                            </div>
-                        </div>
-
-                        <!-- Fixed-value data holders for complexity/budget/ratio/creativity — no
-                             longer user-editable, but kept in the DOM (permanently at these
-                             defaults) because config.js/app.js/prompt_pipeline.js read their
-                             .value / label text by id in many places. -->
-                        <div style="display:none" aria-hidden="true">
-                            <span id="val-complexity">中等重工</span>
-                            <input type="range" id="slider-complexity" min="1" max="3" value="2" tabindex="-1">
-                            <span id="val-budget">轻奢设计师级</span>
-                            <input type="range" id="slider-budget" min="1" max="3" value="2" tabindex="-1">
-                            <span id="val-ratio">50%</span>
-                            <input type="range" id="slider-ratio" min="0" max="100" value="50" tabindex="-1">
-                            <span id="val-creativity">脑洞大开 (写实奇观)</span>
-                            <input type="range" id="slider-creativity" min="1" max="3" value="3" tabindex="-1">
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Sticky Footer at the bottom of panel-left：一行细调条 + 一行按钮。
-                     #config-summary 保留在 DOM 里（config.js 仍往里写文本）但不再显示：
-                     它 7 项里有 4 项是上面那组永久固定的隐藏值，会变的三项已上到激发轨。 -->
-                <div class="panel-footer">
-                    <div id="footer-pane-text" class="footer-pane active">
-                        <div id="config-summary" class="config-summary-box">
-                            <span class="summary-label">配置摘要：</span>
-                            <span id="config-summary-text" class="summary-text">正在计算...</span>
-                        </div>
-
-                        <!-- 细调条：节拍数 / 规划模式 / LLM 模型三项折进一行，点开才展开。
-                             折叠态摘要由 updateSparkRail() 写入 #spark-tune-summary-text。 -->
-                        <div class="spark-tune tune-collapsed" id="spark-tune">
-                            <button type="button" class="spark-tune-head" id="spark-tune-toggle" aria-expanded="false" aria-controls="spark-tune-body" title="展开节拍与模型细调">
-                                <span class="spark-tune-summary" id="spark-tune-summary-text">15 拍 · 自适应上限</span>
-                                <svg class="spark-tune-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"></polyline></svg>
-                            </button>
-                            <div class="spark-tune-body" id="spark-tune-body">
-                                <!-- Beat Count — the one dimension kept manually tunable (it directly
-                                     controls how many construction beats get generated). -->
-                                <div class="control-group spark-beats">
-                                    <div class="slider-labels">
-                                        <!-- 自适应下这个滑块只是**额度闸门**（15 拍 ≈ 16 张 IMAGE + 15 段
-                                             VIDEO 的真实额度），不再定义施工骨架：骨架（拍数下界、工序清单）
-                                             整体归灵感卡片，滑块只能在卡片给的上限之下再压。
-                                             value="15" 保留——那是没载卡片、纯手动路径的缺省。 -->
-                                        <span id="beat-count-label" title="仅对没有节拍简介的手动主题生效：自适应模式下这是额度上限（最多生成多少拍），不是承诺的拍数。载入了带节拍简介的灵感卡片后，实际拍数改为按清单一比一还原，这个滑杆不再生效">节拍上限 · 额度闸门 (Budget Cap)</span>
-                                        <span id="val-beats">15 拍</span>
-                                    </div>
-                                    <div class="slider-track-row">
-                                        <button type="button" class="slider-step-btn" data-target="slider-beats" data-step="-1" aria-label="减少节拍数">−</button>
-                                        <input type="range" id="slider-beats" min="5" max="15" step="1" value="15" class="neon-slider" list="beats-ticks">
-                                        <datalist id="beats-ticks">
-                                            <option value="5"></option><option value="6"></option><option value="7"></option><option value="8"></option><option value="9"></option><option value="10"></option><option value="11"></option><option value="12"></option><option value="13"></option><option value="14"></option><option value="15"></option>
-                                        </datalist>
-                                        <button type="button" class="slider-step-btn" data-target="slider-beats" data-step="1" aria-label="增加节拍数">+</button>
-                                    </div>
-                                    <label class="field-row" for="beat-count-mode" title="仅对没有节拍简介的手动主题生效——带节拍简介的灵感卡片一律按清单一比一还原，忽略这个选择">
-                                        <span>节拍规划模式（仅手动主题）</span>
-                                        <select id="beat-count-mode" aria-label="节拍规划模式（仅手动主题）">
-                                            <option value="adaptive" selected>自适应 · 删除填充拍</option>
-                                            <option value="fixed">固定 · 严格按所选施工拍数（过门运镜另计）</option>
-                                        </select>
-                                    </label>
-                                </div>
-                                <!-- 提示词链路：做哪个视频模型的提示词，就读哪个技能包、走哪套
-                                     镜头语法（base=Veo 单镜延时 / omni=Gemini Omni 多镜头组接）。
-                                     排在 LLM 模型之前是刻意的——链路决定"写成什么样"，模型只决定
-                                     "谁来写"，前者是更上位的选择。auto 停在跟随视频模型下拉框。 -->
-                                <div class="ideation-model-picker picker-collapsed" id="ideation-skill-profile-picker">
-                                    <div class="model-picker-head">
-                                        <span class="model-picker-label">提示词链路</span>
-                                        <span id="ideation-skill-profile-active-hint" class="model-active-hint"></span>
-                                        <button type="button" id="ideation-skill-profile-toggle" class="model-picker-toggle" aria-expanded="false" aria-controls="ideation-skill-profile-groups" title="展开链路选择">
-                                            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
-                                        </button>
-                                    </div>
-                                    <div id="ideation-skill-profile-groups" class="model-family-groups"></div>
-                                </div>
-                                <!-- picker-collapsed 只在手机窄屏起作用；在细调条里它已经是
-                                     二级展开内容，芯片组常驻铺开（见 dimension-minimal.css）。 -->
-                                <div class="ideation-model-picker picker-collapsed" id="ideation-model-picker">
-                                    <div class="model-picker-head">
-                                        <span class="model-picker-label">LLM 模型</span>
-                                        <span id="ideation-llm-model-active-hint" class="model-active-hint"></span>
-                                        <button type="button" id="ideation-llm-toggle" class="model-picker-toggle" aria-expanded="false" aria-controls="ideation-llm-groups" title="展开模型选择">
-                                            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
-                                        </button>
-                                    </div>
-                                    <div id="ideation-llm-groups" class="model-family-groups"></div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- 两枚激发入口并排，主次由状态决定（updateSparkRail）：还没选定
-                             选题时 🎲 为主、⚡ 置灰；选定后互换。 -->
-                        <div class="spark-actions">
-                            <!-- 标签直接写在按钮里，刻意不套 .btn-text：那个类被
-                                 base.css 强制成 color:#fff !important（给 .pulse-btn
-                                 的深色渐变用的），套上去在浅色底上就是白字看不见。 -->
-                            <button type="button" id="ideate-refresh-btn" class="spark-secondary-btn" title="让 LLM 重新激发一批候选选题">🎲 换一批灵感</button>
-                            <button id="generate-btn" class="pulse-btn">
-                                <div class="btn-glow"></div>
-                                <span class="btn-text">⚡ 激发核心创意点子 ⚡</span>
-                                <span class="btn-shortcut-hint">Ctrl + Enter</span>
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            </section>
-
-            <!-- Right Workspace: Spark Outputs -->
-            <section class="panel-right glass-panel">
+            <!-- Main Workspace: Spark Outputs -->
+            <section class="panel-right glass-panel mobile-active">
                 <!-- Active Generation Banner -->
                 <div id="active-generation-banner" class="active-generation-banner" style="display: none;">
                     <div class="banner-content">
@@ -483,7 +216,7 @@
                 <div class="output-placeholder active" id="output-placeholder-view">
                     <div class="placeholder-icon">☄️</div>
                     <h3>等待引燃创意星火...</h3>
-                    <p>在左侧勾选联网参考案例、点选灵感推荐卡片（卡片上的「🔨 节拍简介」可看全部节拍并同时载入维度）选定选题并调整节拍数，点击“激发”。后端会把该选题送入 <b>gemini-veo-restoration-composer</b> skill，按其连续性契约合成完整的「图片 1–N+1 + 视频 1–N」提示词集，并附质量审核报告。</p>
+                    <p>新建一单有两条路：到 <b>🎬 爆款复刻</b> 传一条成品延时视频反推出提示词包，或在 <b>📁 项目</b> 工具栏用「📥 上传提示词集」导入手上已有的整份提示词集。两条路都会把选题送入 <b>gemini-veo-restoration-composer</b> skill，按其连续性契约合成完整的「图片 1–N+1 + 视频 1–N」提示词集，并附质量审核报告。</p>
                 </div>
 
                 <!-- Loading State View -->
@@ -1332,7 +1065,7 @@
                 <div class="projects-shell">
                     <div class="panel-header">
                         <h2>项目工作台</h2>
-                        <p>激发任务与收藏的点子合成一张表：跑起来的、跑完的、收藏的、连同它们的成片资产与台账记录</p>
+                        <p>激发任务与收藏的点子合成一张表：跑起来的、跑完的、收藏的，连同它们的成片资产</p>
                     </div>
 
                     <div class="projects-toolbar">
@@ -1441,7 +1174,6 @@
                 </div>
             </section>
 
-            <!-- Topic Ledger Workspace: 创意台账 —— 已用/候选选题的管理、打分与投放表现回填 -->
             <!-- 爆款复刻：成品视频 → 抽帧 → 逐帧客观事实 → 节拍阶梯 → 提示词包；
                  已确认的节拍还可沿受控变异轴派生二创。
                  方案见 docs/replica_and_variant_pipeline_plan.md。
@@ -1453,56 +1185,6 @@
                         <p>传一条成品延时视频，反推出它的节拍骨架与提示词包；确认后可沿受控变异轴做二创</p>
                     </div>
                     <div id="replica-root"></div>
-                </div>
-            </section>
-
-            <section class="panel-ledger glass-panel" id="panel-ledger">
-                <div class="ledger-shell">
-                    <div class="panel-header">
-                        <h2>创意台账</h2>
-                        <p>管理已用/候选选题的状态与表现打分，也可拎出历史创意作为母题继续二创</p>
-                    </div>
-
-                    <div class="ledger-toolbar">
-                        <div class="ledger-filters" id="ledger-filters">
-                            <button class="ledger-filter-chip active" data-filter="all">全部</button>
-                            <button class="ledger-filter-chip" data-filter="candidate">候选</button>
-                            <button class="ledger-filter-chip" data-filter="used">已用</button>
-                            <button class="ledger-filter-chip" data-filter="published">已发布</button>
-                            <button class="ledger-filter-chip" data-filter="discarded">已弃用</button>
-                        </div>
-                        <div class="ledger-search-sort">
-                            <input type="search" id="ledger-search" class="ledger-search-input" placeholder="🔍 搜索 Topic DNA / 选题" autocomplete="off">
-                            <select id="ledger-sort" class="ledger-sort-select" title="排序方式">
-                                <option value="newest" selected>最新日期优先</option>
-                                <option value="oldest">最旧日期优先</option>
-                                <option value="llm_score">LLM 评分高优先</option>
-                                <option value="user_score">表现打分高优先</option>
-                            </select>
-                        </div>
-                        <div class="ledger-toolbar-right">
-                            <span class="ledger-stats" id="ledger-stats"></span>
-                            <button type="button" id="ledger-refresh-btn" class="ledger-tool-btn" title="重新加载台账">🔄 刷新</button>
-                        </div>
-                    </div>
-
-                    <div class="ledger-bulk-bar">
-                        <button type="button" id="ledger-select-all-btn" class="ledger-tool-btn">☑️ 全选</button>
-                        <span class="ledger-bulk-count" id="ledger-bulk-count"></span>
-                        <div class="ledger-bulk-spacer"></div>
-                        <select id="ledger-bulk-status-select" class="ledger-sort-select" title="批量设置为该状态">
-                            <option value="candidate">候选</option>
-                            <option value="used">已用</option>
-                            <option value="published">已发布</option>
-                            <option value="discarded">已弃用</option>
-                        </select>
-                        <button type="button" id="ledger-bulk-status-apply-btn" class="ledger-tool-btn" disabled>批量设为该状态</button>
-                        <button type="button" id="ledger-bulk-delete-btn" class="ledger-tool-btn danger" disabled>🗑️ 批量删除所选</button>
-                    </div>
-
-                    <div class="panel-body ledger-scroll" id="ledger-body">
-                        <div class="ledger-status">📡 正在加载创意台账…</div>
-                    </div>
                 </div>
             </section>
         </main>
@@ -1562,6 +1244,20 @@
                     <section class="settings-section active" data-section="backend">
                         <h4 class="settings-section-title">生成后端</h4>
                         <p class="settings-section-desc">帧序列走哪条生成链路、各条链路用哪个生图模型，封面与帧序列共用的画幅与清晰度，以及视频侧的模型与参考模式。</p>
+                        <div class="form-group settings-field" id="settings-llm-model-group">
+                            <label for="settings-llm-model">LLM 主模型</label>
+                            <select id="settings-llm-model"></select>
+                            <small class="settings-hint">全局大语言模型，用于创意激发、母案提示词合成、连贯性审核与质检判定。</small>
+                        </div>
+                        <div class="form-group settings-field" id="settings-skill-profile-group">
+                            <label for="settings-skill-profile">提示词链路</label>
+                            <select id="settings-skill-profile">
+                                <option value="auto" selected>跟随视频模型（默认）</option>
+                                <option value="base">Veo 单镜延时</option>
+                                <option value="omni">Gemini Omni 多镜头组接</option>
+                            </select>
+                            <small class="settings-hint">auto 模式下：选 Omni Flash 自动走 Omni 链路，选 Veo 系列自动走 Veo 链路。</small>
+                        </div>
                         <div class="form-group settings-field">
                             <label for="settings-image-backend">帧序列生成方式</label>
                             <select id="settings-image-backend">
@@ -1575,6 +1271,18 @@
                             <label for="settings-api-image-model">API 生图模型</label>
                             <select id="settings-api-image-model"></select>
                             <small class="settings-hint">封面图与帧序列共用；gpt-image-2 走独立的 codex 网关（只认 1024/1536 像素档，比例会归到最接近的一档）。与帧序列卡片右上角的选择器是同一项设置。</small>
+                        </div>
+                        <div class="form-group settings-field" id="api-candidate-concurrency-group">
+                            <label for="settings-candidate-concurrency">4选1 候选并发度</label>
+                            <select id="settings-candidate-concurrency">
+                                <option value="1">1（串行排队）</option>
+                                <option value="2">2 并发</option>
+                                <option value="3">3 并发</option>
+                                <option value="4" selected>4 并发（默认推荐）</option>
+                                <option value="6">6 并发</option>
+                                <option value="8">8 并发（最大）</option>
+                            </select>
+                            <small class="settings-hint">4选1 智能优选模式下 API 候选图并发生成数量（1~8，默认 4 并发）。多候选并行发起请求大幅缩短生成耗时；若网关限流可调小或设 1 退回串行。</small>
                         </div>
                         <div class="form-group settings-field" id="fx-image-model-group" style="display: none;">
                             <label for="settings-fx-image-model">FX 生图模型</label>
@@ -1753,27 +1461,9 @@
         </div>
     </div>
 
-    <!-- Beat Outline Modal — 灵感卡片的「节拍简介」完整视图。卡片轨道是横向定宽卡片，
-         十几拍的清单在卡片里只能截断/内嵌滚动（用户看不全），所以全量清单统一放到这里：
-         modal-body 自己滚动，节拍一条不落。内容由 js/prompt_pipeline.js 的
-         openBeatOutlineModal 用 DOM/textContent 注入（LLM 文本不走 innerHTML）。 -->
-    <div class="modal" id="beat-outline-modal">
-        <div class="modal-content glass-panel">
-            <div class="modal-header">
-                <h3 id="beat-outline-modal-title">🔨 节拍简介</h3>
-                <button id="beat-outline-modal-close-btn" class="close-btn">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="modal-info" id="beat-outline-modal-info"></div>
-                <ol class="ideation-card-outline-list beat-outline-modal-list" id="beat-outline-modal-list"></ol>
-            </div>
-        </div>
-    </div>
-
     <!-- Trend Refs Library Management Modal — full-page browse/sort/filter/bulk-delete
-         view for trend_refs.json, modeled on 创意台账 tab's toolbar/bulk-bar pattern
-         (css/ledger.css classes reused directly for visual consistency). The compact
-         sidebar list stays for pick-before-generate; this is for library housekeeping. -->
+         view for trend_refs.json (toolbar/bulk-bar pattern styled via css/app/panels-tabs.css).
+         The compact sidebar list stays for pick-before-generate; this is for library housekeeping. -->
     <div class="modal" id="trend-refs-manage-modal">
         <div class="modal-content glass-panel modal-wide">
             <div class="modal-header">
@@ -1922,8 +1612,13 @@
     <!-- 质量门禁开关面板：按 /api/mode 下发的 gate_settings 表动态渲染配置中心的
          「质量门禁」分区。必须排在 config.js 之后（读写同一个 config 对象）。 -->
     <script src="js/gate_settings.js?v=1.0.0" defer></script>
-    <script src="js/spark_rail.js?v=1.0.0" defer></script>
-    <script src="js/trend_refs.js?v=1.3.1" defer></script>
+    <!-- 联网参考案例库（trend_refs.json）的控制器。刻意不随「激发维度」页一起下线：
+         它是**共享**模块，爆款复刻面板的 🌐 联网参考案例库抽屉（js/replica_pipeline.js
+         replicaRenderTrendRefsDrawer）整块都靠它填充与响应——列表、搜一批新参考、
+         管理全部、查看归档、筛选、搜索方向的落盘，以及发散请求里的 trend_ref_ids。
+         摘掉这一行，那个抽屉会永远停在「正在载入联网参考案例库...」，且抽屉里每个
+         按钮都被 typeof 守卫吞成静默 no-op——不报错，所以从控制台看不出来。 -->
+    <script src="js/trend_refs.js?v=1.3.2" defer></script>
     <script src="js/account_pool.js?v=1.2.1" defer></script>
     <script src="js/progress_model.js?v=1.2.3" defer></script>
     <!-- 槽位状态模型（纯函数）与卡片渲染器：必须排在 api_client / media_renderer /
@@ -1948,7 +1643,6 @@
     <script src="app.js?v=1.6.4" defer></script>
     <script src="js/image_studio.js?v=1.0.4" defer></script>
     <script src="js/gallery.js?v=1.3.0" defer></script>
-    <script src="js/ledger.js?v=1.3.0" defer></script>
     <!-- 项目工作台：必须排在 app.js 之后（依赖它的 openSparkProject / viewTask /
          retryTask / deleteFromLibrary 等宿主函数） -->
     <script src="js/projects.js?v=1.2.1" defer></script>

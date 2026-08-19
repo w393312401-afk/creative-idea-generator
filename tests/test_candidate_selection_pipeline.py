@@ -810,3 +810,156 @@ Prompt: Third step to generate.
     assert res["frames"][1]["sequence"] == 2
     assert res["frames"][2]["sequence"] == 3
 
+
+def test_candidate_concurrency_config_and_bounds():
+    """测试 candidate_concurrency 解析与边界夹取。"""
+    assert csp.candidate_concurrency({}) == 4
+    assert csp.candidate_concurrency(None) == 4
+    assert csp.candidate_concurrency({'candidateConcurrency': 2}) == 2
+    assert csp.candidate_concurrency({'candidateConcurrency': 8}) == 8
+    assert csp.candidate_concurrency({'candidateConcurrency': 16}) == 8
+    assert csp.candidate_concurrency({'candidateConcurrency': 0}) == 4  # 0 or falsy defaults to candidate_count
+    assert csp.candidate_concurrency({'candidateConcurrency': 1}) == 1
+    assert csp.candidate_concurrency({'candidateConcurrency': 'invalid'}) == 4
+
+
+def test_generate_frame_candidates_api_concurrent_execution(temp_project):
+    """测试 4选1 模式 API 候选图默认并发生成。"""
+    events = []
+    def on_progress(stage, data):
+        events.append((stage, data))
+
+    called_prompts = []
+    def fake_make_cand(config, p_variant, reference_path, out_path, is_text_only, ctrl_prompt):
+        called_prompts.append(p_variant)
+        with open(out_path, 'wb') as f:
+            f.write(b'fake_api_candidate_bytes')
+
+    with patch.object(csp, '_generate_single_api_candidate', side_effect=fake_make_cand):
+        cands = csp.generate_frame_candidates(
+            config={"imageBackend": "api"},
+            title=temp_project["project_name"],
+            item={"prompt": "A modern underground cabin"},
+            reference_path=None,
+            seq=1,
+            candidate_count=4,
+            on_progress=on_progress,
+            frames_dir=temp_project["frames_dir"]
+        )
+
+    assert len(cands) == 4
+    assert len(called_prompts) == 4
+    # 验证候选图文件名与内容
+    for idx, cp in enumerate(cands, start=1):
+        assert os.path.exists(cp)
+        assert f"candidate_{idx}.webp" in cp
+        with open(cp, 'rb') as f:
+            assert f.read() == b'fake_api_candidate_bytes'
+
+    # 验证 variation 提示词后缀
+    assert any("[Variation #2]" in p for p in called_prompts)
+    assert any("[Variation #3]" in p for p in called_prompts)
+    assert any("[Variation #4]" in p for p in called_prompts)
+
+    # 验证 candidates_meta.json 元数据文件落盘
+    cand_dir = os.path.join(temp_project["frames_dir"], "candidates", "frame_001")
+    meta_path = os.path.join(cand_dir, "candidates_meta.json")
+    assert os.path.exists(meta_path)
+    with open(meta_path, 'r', encoding='utf-8') as f:
+        meta_data = json.load(f)
+    assert len(meta_data["candidates"]) == 4
+    assert [c["index"] for c in meta_data["candidates"]] == [1, 2, 3, 4]
+
+    # 验证并发进度广播事件
+    gen_events = [d for s, d in events if s == 'candidate_generating']
+    assert len(gen_events) >= 1
+    assert any("并发生成" in (d.get('message') or '') for d in gen_events)
+
+
+def test_generate_frame_candidates_api_serial_fallback(temp_project):
+    """测试 candidateConcurrency=1 时走串行兜底通道。"""
+    called_prompts = []
+    def fake_make_cand(config, p_variant, reference_path, out_path, is_text_only, ctrl_prompt):
+        called_prompts.append(p_variant)
+        with open(out_path, 'wb') as f:
+            f.write(b'fake_serial_bytes')
+
+    with patch.object(csp, '_generate_single_api_candidate', side_effect=fake_make_cand):
+        cands = csp.generate_frame_candidates(
+            config={"imageBackend": "api", "candidateConcurrency": 1},
+            title=temp_project["project_name"],
+            item={"prompt": "A modern cabin"},
+            reference_path=None,
+            seq=1,
+            candidate_count=4,
+            frames_dir=temp_project["frames_dir"]
+        )
+
+    assert len(cands) == 4
+    assert len(called_prompts) == 4
+
+
+def test_generate_frame_candidates_api_partial_failure_resilience(temp_project):
+    """测试并发生成部分候选失败时，依然保留并采纳成功的候选图。"""
+    def fake_make_cand(config, p_variant, reference_path, out_path, is_text_only, ctrl_prompt):
+        if "Variation #3" in p_variant:
+            raise RuntimeError("API timeout on candidate 3")
+        with open(out_path, 'wb') as f:
+            f.write(b'fake_partial_bytes')
+
+    with patch.object(csp, '_generate_single_api_candidate', side_effect=fake_make_cand):
+        cands = csp.generate_frame_candidates(
+            config={"imageBackend": "api"},
+            title=temp_project["project_name"],
+            item={"prompt": "A modern cabin"},
+            reference_path=None,
+            seq=1,
+            candidate_count=4,
+            frames_dir=temp_project["frames_dir"]
+        )
+
+    # 候选 1, 2, 4 成功生成，候选 3 失败，总共保留 3 张
+    assert len(cands) == 3
+    assert not any("candidate_3.webp" in cp for cp in cands)
+
+
+def test_generate_frame_candidates_api_all_fail_raises(temp_project):
+    """测试所有候选并发生成均失败时向上抛出 RuntimeError。"""
+    def fake_make_cand(config, p_variant, reference_path, out_path, is_text_only, ctrl_prompt):
+        raise RuntimeError("Gateway 502 Bad Gateway")
+
+    with patch.object(csp, '_generate_single_api_candidate', side_effect=fake_make_cand):
+        with pytest.raises(RuntimeError) as exc_info:
+            csp.generate_frame_candidates(
+                config={"imageBackend": "api"},
+                title=temp_project["project_name"],
+                item={"prompt": "A modern cabin"},
+                reference_path=None,
+                seq=1,
+                candidate_count=4,
+                frames_dir=temp_project["frames_dir"]
+            )
+        assert "失败" in str(exc_info.value)
+
+
+def test_generate_frame_candidates_api_cancel_check(temp_project):
+    """测试候选图并发生成过程中响应取消事件。"""
+    def progress_cb(stage, data):
+        if stage == 'cancel_check':
+            return True
+        return False
+
+    with pytest.raises(ConnectionError) as exc_info:
+        csp.generate_frame_candidates(
+            config={"imageBackend": "api"},
+            title=temp_project["project_name"],
+            item={"prompt": "A modern cabin"},
+            reference_path=None,
+            seq=1,
+            candidate_count=4,
+            on_progress=progress_cb,
+            frames_dir=temp_project["frames_dir"]
+        )
+    assert "取消" in str(exc_info.value)
+
+

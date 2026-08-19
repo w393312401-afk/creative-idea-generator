@@ -254,10 +254,6 @@ function projectsBadgesHtml(p) {
     if (p.has_failed_jobs && p.state !== 'failed') {
         badges.push('<span class="project-badge warn" title="有媒体子作业失败——这类失败在旧任务列表里完全不可见">子作业失败</span>');
     }
-    if (p.ledger && p.ledger.status) {
-        const labels = { candidate: '候选', used: '已用', published: '已发布', discarded: '已弃用' };
-        badges.push(`<span class="project-badge ledger">📒 ${escapeHtml(labels[p.ledger.status] || p.ledger.status)}</span>`);
-    }
     return badges.join('');
 }
 
@@ -315,7 +311,6 @@ function projectsRowSignature(p) {
         p.image_count, p.video_count, p.updated_at,
         task.status, task.stage, task.error,
         (p.assets || {}).file_count, (p.assets || {}).bytes,
-        (p.ledger || {}).status,
         (p.sub_jobs || []).map(j => `${j.type}:${j.status}`).join(','),
     ]);
 }
@@ -655,6 +650,12 @@ function projectsDetailActionsHtml(p) {
     if (p.saved || task.status === 'completed') {
         btns.push('<button type="button" class="projects-btn primary" data-act="open">🎬 打开项目</button>');
     }
+    // 二创只对**复刻来的**项目露出：它去的是爆款复刻面板的「二创变体」栏，那一栏
+    // 是沿变异轴改写既有节拍阶梯，没有阶梯就没有可改的东西。激发出来的项目不在这
+    // 条线上，给它按钮等于给一个必然落空的入口。
+    if (projectReplicaJobId(p)) {
+        btns.push('<button type="button" class="projects-btn" data-act="remix" title="到爆款复刻的「二创变体」栏，沿变异轴从本项目的节拍阶梯派生衍生方案">♻️ 二创</button>');
+    }
     if (task.status === 'running') {
         btns.push('<button type="button" class="projects-btn primary" data-act="follow">👁 跟进实时输出</button>');
         btns.push('<button type="button" class="projects-btn danger" data-act="cancel">✕ 取消</button>');
@@ -672,9 +673,6 @@ function projectsDetailActionsHtml(p) {
     }
     if (p.assets && p.assets.file_count) {
         btns.push('<button type="button" class="projects-btn" data-act="gallery">🖼️ 去画廊看资产</button>');
-    }
-    if (p.ledger) {
-        btns.push('<button type="button" class="projects-btn" data-act="ledger">📒 去台账</button>');
     }
     if (p.saved) {
         btns.push('<button type="button" class="projects-btn danger" data-act="unsave">🗑️ 从点子库删除</button>');
@@ -728,10 +726,6 @@ function renderProjectDetail() {
     if (task.token_usage) {
         const u = task.token_usage;
         facts.push(['Tokens', `${u.total_tokens} (I:${u.prompt_tokens} O:${u.completion_tokens}) · ${u.api_calls} 次调用`]);
-    }
-    if (p.ledger) {
-        facts.push(['台账 DNA', p.ledger.topic_dna || '—']);
-        facts.push(['评分', `LLM ${p.ledger.llm_score ?? '—'} · 表现 ${p.ledger.user_score ?? '—'}`]);
     }
 
     const jobs = (p.sub_jobs || []).length ? `
@@ -915,6 +909,9 @@ async function projectsRunAction(act, p, event, jobId) {
             }
             break;
         }
+        case 'remix':
+            await startProjectRemix(p);
+            break;
         case 'unsave':
             await deleteFromLibrary((p.library || {}).id);
             refreshProjects();
@@ -936,22 +933,72 @@ async function projectsRunAction(act, p, event, jobId) {
             }, 600);
             break;
         }
-        case 'ledger': {
-            switchMainTab('ledger');
-            const id = (p.ledger || {}).id;
-            setTimeout(() => {
-                const tr = document.querySelector(`#ledger-body tr[data-id="${CSS.escape(String(id))}"]`);
-                if (tr) {
-                    tr.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    tr.classList.add('flash-highlight');
-                    setTimeout(() => tr.classList.remove('flash-highlight'), 1600);
-                }
-            }, 600);
-            break;
-        }
         default:
             break;
     }
+}
+
+// 这个项目对应哪条爆款复刻作业。两个来源，都不用后端改字段：
+//   1. 复刻产出入库时 library item 的 id 直接写的就是 job_id（replica_pipeline.py
+//      _library_item：「job_id 本身就以 replica_ 开头，别再套一层」）；
+//   2. 复刻相关的任务在 dimensions 里带 replica_job_id（server_common._replica_job_of）。
+// 取不到就说明这个项目不是复刻线上的，二创无从谈起 —— 调用方据此决定露不露按钮。
+function projectReplicaJobId(p) {
+    if (!p) return '';
+    const libId = String((p.library || {}).id || '');
+    if (/^replica/.test(libId)) return libId;
+    const dims = ((p.task || {}).dimensions) || {};
+    return String(dims.replica_job_id || '').trim();
+}
+
+// 二创：把该项目对应的复刻作业在「爆款复刻」面板里打开，并定位到「二创变体」栏。
+//
+// 这里刻意**不**走 /api/ideate 的 remix_seed 那条路：那条路的落点是激发维度页的灵感
+// 卡网格，那一页已经下线，调用它只会静默返回、再配一个"正在激发…"的假提示。复刻面板
+// 的二创变体是现存唯一活着的二创机制（沿变异轴改写节拍阶梯，见 replicaMutateOrthogonal）。
+async function startProjectRemix(p) {
+    const jobId = projectReplicaJobId(p);
+    const toast = (msg, kind) => { if (typeof showToast === 'function') showToast(msg, kind); };
+
+    if (!jobId) {
+        toast('这个项目不是从爆款复刻来的，没有可改写的节拍阶梯', 'error');
+        return;
+    }
+    if (typeof switchMainTab !== 'function' || typeof replicaLoadJob !== 'function') {
+        toast('复刻工作台尚未加载完成，请稍后重试', 'error');
+        return;
+    }
+
+    let state;
+    try {
+        // 取数必须排在切页**之前**：switchMainTab 会触发 replicaTabEntered，它在
+        // replicaState 为空时会自作主张打开作业列表里的第一条。先把 state 落定，
+        // 那个兜底分支就不会跟我们抢；否则两个请求赛跑，用户可能落在别的作业上。
+        state = await replicaLoadJob(jobId);
+    } catch (e) {
+        toast(`打开复刻作业失败：${e.message}`, 'error');
+        return;
+    }
+
+    switchMainTab('replica');
+
+    // 节拍还没反推出来就没有「二创变体」栏可去（该栏与导航项都以 beats 非空为条件
+    // 渲染）。这时候滚到当前作业本身，并说清楚下一步该干什么。
+    const beats = ((state || {}).beats || {}).beats || [];
+    if (!beats.length) toast('该复刻作业还没有节拍阶梯，先跑完反推再做二创', 'info');
+
+    // 与上面「去画廊看资产」同一套：复刻面板由 replicaTabEntered 异步重渲一次，
+    // 立刻定位会被那次重渲把滚动位置顶回顶部。
+    setTimeout(() => {
+        if (typeof replicaFocusSection !== 'function') return;
+        // 逐个回落：每一栏都有自己的渲染条件（二创变体要 beats 非空、母本视窗要过了
+        // 抽帧），条件不满足时那个锚点根本不存在，而 replicaFocusSection 找不到锚点是
+        // 彻底静默的——不滚动、不报错。所以按可能性从窄到宽试，别只赌一个。
+        const targets = beats.length
+            ? ['replica-sec-variant', 'replica-sec-workbench', 'replica-sec-current-job']
+            : ['replica-sec-current-job', 'replica-sec-workbench', 'replica-sec-jobs'];
+        targets.some(id => replicaFocusSection(id));
+    }, 600);
 }
 
 /* ── 初始化 ────────────────────────────────────────────────────────────── */

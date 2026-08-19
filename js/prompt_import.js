@@ -97,9 +97,17 @@ function matchPromptImportHeader(line) {
         if (!m) continue;
         const tags = m[2] || '';
         const summaryMatch = tags.match(/[（\(](.*?)[）\)]/);
-        const summary = summaryMatch ? summaryMatch[1].trim() : '';
+        let summary = summaryMatch ? summaryMatch[1].trim() : '';
         const metaMatch = tags.match(/\[(.*?)\]/);
-        const meta = metaMatch ? metaMatch[1].trim() : '';
+        let meta = metaMatch ? metaMatch[1].trim() : '';
+        // 括号里写的是标记词而不是简介时收进 meta。判据与 js/prompt_pipeline.js 的
+        // 两处解析共用一份 SLOT_META_TAG_RE——三处必须认出同一批标记，否则同一份
+        // 文本"看到的"和"存下来的"槽位语义会分叉。这里尤其要紧：认不出 HERO，
+        // 下面的 heroVideos 就筛不到它，收尾英雄段会被当成普通段重编号。
+        if (!meta && typeof SLOT_META_TAG_RE !== 'undefined' && SLOT_META_TAG_RE.test(summary)) {
+            meta = summary.toUpperCase().replace(/\s+/g, ' ');
+            summary = '';
+        }
         const sep = m[3] || '';
         const inline = (m[4] || '').trim();
         const isColon = /^[:：]$/.test(sep);

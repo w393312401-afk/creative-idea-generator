@@ -115,6 +115,8 @@ assert.ok(card.includes('data-lightbox-beat="0"') && card.includes('data-lightbo
 assert.ok(card.includes('封板封闭'), '施工阶段用中文标签');
 assert.ok(card.includes('工人封板'), '中文对照要显示在英文原文下面');
 assert.ok(card.includes('data-key="package_operations"'), '工序包必须可编辑——报错就指着它');
+assert.ok(card.includes('data-key="macro_environment"'), '大环境识别项必须可编辑');
+assert.ok(card.includes('data-key="visible_details"'), '细节识别项必须可编辑');
 
 // 灯箱不可用时退回新窗口：点了没反应比多一个标签页更糟。
 let opened = null;

@@ -1,175 +1,12 @@
 // --- config.js ---
 
-function saveSelectionState() {
-    // 基础场景主题选择器已移除；state.theme 不再保存（旧档里残留的值被忽略）
-    const activeAnchors = Array.from(document.querySelectorAll('#anchor-selector .anchor-node.active'))
-        .map(node => node.dataset.value);
+/* =====================================================================
+   配置中心与模型设置模块 (Config & Models)
+   ---------------------------------------------------------------------
+   管理 LLM 模型、生图模型、视频模型、提示词链路及系统运行参数的
+   读取、持久化 (localStorage) 与 UI 同步。
+   ===================================================================== */
 
-    const state = {
-        anchors: activeAnchors,
-        complexity: document.getElementById('slider-complexity').value,
-        budget: document.getElementById('slider-budget').value,
-        ratio: document.getElementById('slider-ratio').value,
-        creativity: document.getElementById('slider-creativity').value,
-        beats: document.getElementById('slider-beats').value,
-        beatCountMode: (document.getElementById('beat-count-mode') || {}).value || 'adaptive'
-    };
-    
-    localStorage.setItem('spark_selection_state', JSON.stringify(state));
-    updateConfigSummary();
-}
-
-function loadSelectionState() {
-    const stored = localStorage.getItem('spark_selection_state');
-    if (!stored) {
-        updateConfigSummary();
-        return;
-    }
-    
-    try {
-        const state = JSON.parse(stored);
-
-        // （主题选择器已移除，旧档 state.theme 直接忽略）
-
-        // Anchors
-        if (Array.isArray(state.anchors)) {
-            document.querySelectorAll('#anchor-selector .anchor-node').forEach(btn => {
-                if (state.anchors.includes(btn.dataset.value)) {
-                    btn.classList.add('active');
-                } else {
-                    btn.classList.remove('active');
-                }
-            });
-        }
-        
-        // Sliders
-        const setVal = (id, val) => {
-            const el = document.getElementById(id);
-            if (el && val !== undefined) {
-                el.value = val;
-                el.dispatchEvent(new Event('input'));
-            }
-        };
-        setVal('slider-complexity', state.complexity);
-        setVal('slider-budget', state.budget);
-        setVal('slider-ratio', state.ratio);
-        setVal('slider-creativity', state.creativity);
-        setVal('slider-beats', state.beats);
-        setVal('beat-count-mode', state.beatCountMode || 'adaptive');
-        
-    } catch (e) {
-        console.error("Failed to load selection state", e);
-    }
-    updateConfigSummary();
-}
-
-function updateConfigSummary() {
-    // 选题来自选中（载入维度）过的灵感卡片（联网参考驱动），不再有基础场景主题
-    const themeText = (typeof loadedIdeationCover !== 'undefined' && loadedIdeationCover && loadedIdeationCover.task_label)
-        ? loadedIdeationCover.task_label : '未载入灵感卡';
-
-    const activeAnchors = Array.from(document.querySelectorAll('#anchor-selector .anchor-node.active'))
-        .map(node => {
-            const text = node.textContent.trim();
-            const bracketIdx = text.indexOf('(');
-            return bracketIdx !== -1 ? text.substring(0, bracketIdx).trim() : text;
-        });
-        
-    const anchorsStr = activeAnchors.length > 0 ? ` + ${activeAnchors.join('、')}` : '';
-    
-    const complexityVal = document.getElementById('slider-complexity').value;
-    const complexityLabels = { 1: '轻量', 2: '中等', 3: '硬核' };
-    const complexityText = complexityLabels[complexityVal] || '中等';
-    
-    const budgetVal = document.getElementById('slider-budget').value;
-    const budgetLabels = { 1: '平民', 2: '轻奢', 3: '顶奢' };
-    const budgetText = budgetLabels[budgetVal] || '轻奢';
-    
-    const ratioVal = document.getElementById('slider-ratio').value;
-    
-    const creativityVal = document.getElementById('slider-creativity').value;
-    const creativityLabels = { 1: '常规', 2: '突破', 3: '脑洞' };
-    const creativityText = creativityLabels[creativityVal] || '常规';
-    
-    const beatsVal = document.getElementById('slider-beats').value;
-    const beatMode = ((document.getElementById('beat-count-mode') || {}).value || 'adaptive') === 'fixed'
-        ? '固定' : '自适应上限';
-    const pacingId = (typeof loadedIdeationCover !== 'undefined' && loadedIdeationCover
-        && loadedIdeationCover.pacing_skeleton) || '';
-    const pacingText = pacingId === 'dual_payoff' ? '内外双重完工'
-        : (pacingId === 'nested_space_payoff' ? '双空间一比一复刻'
-        : (pacingId === 'linear_milestone' ? '单线里程碑' : '未载入'));
-    
-    const summaryText = `${themeText}${anchorsStr} | 骨架:${pacingText}, 复杂度:${complexityText}, 预算:${budgetText}, 反差:${ratioVal}%, 尺度:${creativityText}, ${beatMode}:${beatsVal}拍`;
-    
-    const summaryEl = document.getElementById('config-summary-text');
-    if (summaryEl) {
-        summaryEl.textContent = summaryText;
-    }
-
-    // 摘要框本身在极简布局里不显示了（7 项里 4 项是永久固定的隐藏值），会变的
-    // 三项改由激发轨呈现。这里搭车刷新——本函数已覆盖初始化 / 滑杆变更 /
-    // 卡片载入 / 骨架勾选 / 面板切换这几乎全部时机。见 js/spark_rail.js
-    if (typeof updateSparkRail === 'function') updateSparkRail();
-}
-
-function applyPreset(presetName) {
-    const p = PRESETS[presetName];
-    if (!p) return;
-
-    // （#theme-selector 已随基础场景主题选择器一并移除，预设不再有主题这一项）
-
-    // Anchors
-    document.querySelectorAll('#anchor-selector .anchor-node').forEach(btn => {
-        if (p.anchors.includes(btn.dataset.value)) {
-            btn.classList.add('active');
-        } else {
-            btn.classList.remove('active');
-        }
-    });
-    
-    // Sliders
-    const setVal = (id, val) => {
-        const el = document.getElementById(id);
-        if (el) {
-            el.value = val;
-            el.dispatchEvent(new Event('input'));
-        }
-    };
-    setVal('slider-complexity', p.complexity);
-    setVal('slider-budget', p.budget);
-    setVal('slider-ratio', p.ratio);
-    setVal('slider-creativity', p.creativity);
-    setVal('slider-beats', p.beats);
-    // 预设/随机同样是用户拍板的拍数，之后载入灵感卡片不该再把它覆盖掉
-    if (typeof markBeatsUserOverridden === 'function') markBeatsUserOverridden();
-
-    saveSelectionState();
-    const PRESET_LABELS = {
-        nature_wonder: '自然奇观',
-        industrial_relic: '工业遗迹',
-        retired_vehicle: '退役载具',
-        contrast_novelty: '反差猎奇'
-    };
-    showToast(`已应用预设：${PRESET_LABELS[presetName] || presetName}`, 'success');
-}
-
-// updateImageModelOptions 已删除（2026-07-12）：配置中心的 LLM/生图模型下拉整体移除，
-// 模型选择完全由激发页脚 #ideation-llm-model 与帧序列卡片 #frames-image-model 承担。
-
-/* ── 激发维度内嵌「提示词链路」选择器 ─────────────────────────────────
-   做哪个视频模型的提示词，就读哪个技能包、走哪套镜头语法：
-     · base —— gemini-veo-restoration-composer，Veo 系列，一条连续的施工延时；
-     · omni —— gemini-omni-restoration-composer，Gemini Omni，多镜头组接（镜头数随片长）
-       （远景/全景/中景/近景/特写/结果远景）+ UGC 手机拍摄质感，禁一镜到底。
-   停在 auto 时由服务端按视频模型名推断（active_skill_profile）。UI 排在 LLM 模型
-   之前：链路决定"提示词写成什么样"，模型只决定"谁来写"，前者更上位。
-
-   ⚠️ 前端不自己判断"omni 该走哪条"：那张规则表由 /api/mode 的 skill_profile_rules
-   下发（服务端 SKILL_PROFILE_VIDEO_MODEL_RULES 原样），这里只负责按表匹配显示。
-   在这里硬编码一份 /omni/ 判断，就是给同一件事留了第二个会漂移的真相源。
-   拿不到规则表（/api/mode 还没回、或旧服务端）时不猜：auto 的徽标退回只报视频
-   模型名，让用户自己对照，而不是显示一个可能是错的链路名。 */
 const SKILL_PROFILE_CHOICES = [
     { value: 'auto', label: '自动', hint: '跟随视频模型' },
     { value: 'base', label: 'Veo · 单镜延时', hint: 'gemini-veo-restoration-composer' },
@@ -193,170 +30,58 @@ function resolveAutoSkillProfile() {
     return window.SKILL_PROFILE_DEFAULT || 'base';
 }
 
-function syncIdeationSkillProfilePicker() {
-    const wrap = document.getElementById('ideation-skill-profile-groups');
-    if (!wrap) return;
-    const current = config.skillProfile || 'auto';
-
-    wrap.innerHTML = '';
-    const group = document.createElement('div');
-    group.className = 'model-family-group active';
-    group.dataset.family = 'skill-profile';
-
-    const tag = document.createElement('span');
-    tag.className = 'model-family-tag';
-    tag.textContent = '链路';
-    group.appendChild(tag);
-
-    const row = document.createElement('div');
-    row.className = 'model-chip-row';
-    SKILL_PROFILE_CHOICES.forEach(choice => {
-        const isSelected = choice.value === current;
-        const chip = document.createElement('button');
-        chip.type = 'button';
-        chip.className = 'model-chip' + (isSelected ? ' selected' : '');
-        chip.title = choice.value === 'auto'
-            ? '跟随「FX 视频模型」下拉框：选 Omni Flash 走 Omni 链路，选 Veo 系列走 Veo 链路'
-            : `${choice.hint}（钉死这条链路，不再跟随视频模型）`;
-
-        const name = document.createElement('span');
-        name.className = 'model-chip-name';
-        name.textContent = choice.label;
-        chip.appendChild(name);
-
-        chip.addEventListener('click', () => {
-            if ((config.skillProfile || 'auto') === choice.value) return;
-            config.skillProfile = choice.value;
-            localStorage.setItem('spark_config', JSON.stringify(config));
-            const effective = choice.value === 'auto' ? resolveAutoSkillProfile() : choice.value;
-            showToast(
-                `提示词链路已切换：${choice.label}`
-                + (choice.value === 'auto' && effective ? `（当前实际走 ${effective}）` : '')
-                + '（下次激发/合成生效）',
-                'success');
-            syncIdeationSkillProfilePicker();
-            if (typeof collapseIdeationPickerOnMobile === 'function') {
-                collapseIdeationPickerOnMobile();
-            }
-        });
-        row.appendChild(chip);
-    });
-    group.appendChild(row);
-    wrap.appendChild(group);
-
-    const hint = document.getElementById('ideation-skill-profile-active-hint');
-    if (!hint) return;
-    if (current !== 'auto') {
-        const picked = SKILL_PROFILE_CHOICES.find(c => c.value === current);
-        hint.textContent = `使用中 · ${picked ? picked.label : current}`;
-        return;
-    }
-    const effective = resolveAutoSkillProfile();
-    const effectiveLabel = effective
-        && (SKILL_PROFILE_CHOICES.find(c => c.value === effective) || {}).label;
-    hint.textContent = effectiveLabel
-        ? `使用中 · ${effectiveLabel}（跟随 ${config.videoModel || '视频模型'}）`
-        : `跟随视频模型 · ${config.videoModel || '未设置'}`;
+function syncSettingsSkillProfilePicker() {
+    const select = document.getElementById('settings-skill-profile');
+    if (!select) return;
+    select.value = config.skillProfile || DEFAULT_CONFIG.skillProfile || 'auto';
 }
 
-/* ── 激发维度内嵌 LLM 模型选择器 ─────────────────────────────────────
-   LLM 主模型（激发/合成/审核/质检判定共用 config.model）的唯一 UI 入口：
-   在激发按钮上方直接切换，改动即写 localStorage，下次激发/合成生效。
-   （配置中心的主模型下拉已于 2026-07-12 移除。）
-   2026-07-13 改为分组芯片单选器：GPT/Gemini/Claude 每个供应商一行，模型平铺成
-   胶囊按钮，全局有且只有一个 .selected（此前的三个并排 <select> 方案光看选中项
-   容易误以为三个都在生效——用户当日反馈"用哪个模型没有唯一性"）。点任意芯片即
-   切换 config.model；label 旁的徽标（#ideation-llm-model-active-hint）另行点名
-   当前生效模型作双保险。整个分组区每次 sync 全量重建，事件直接绑在新节点上。 */
 const LLM_MODEL_PICKER_FAMILIES = [
     { key: 'gpt', label: 'GPT' },
     { key: 'gemini', label: 'Gemini' },
     { key: 'claude', label: 'Claude' },
 ];
 
-function syncIdeationLlmPicker() {
-    const wrap = document.getElementById('ideation-llm-groups');
-    if (!wrap) return;
-    const current = config.model || 'gemini-3.7-flash-high';
-    const isKnown = LLM_MODEL_PICKER_FAMILIES.some(
-        fam => LLM_MODEL_GROUPS[fam.key].some(m => m.value === current)
-    );
+function syncSettingsLlmModelPicker() {
+    const select = document.getElementById('settings-llm-model');
+    if (!select) return;
+    const current = config.model || DEFAULT_CONFIG.model;
+    select.innerHTML = '';
 
-    wrap.innerHTML = '';
     LLM_MODEL_PICKER_FAMILIES.forEach(fam => {
-        const models = LLM_MODEL_GROUPS[fam.key].slice();
-        // 当前生效模型不属于任何一组（比如手动改过 localStorage 的自定义模型名）：
-        // 追加展示在 GPT 组末尾，避免用户看不到当前实际生效的值。
-        if (!isKnown && fam.key === 'gpt') {
-            models.push({ value: current, label: `${current}（自定义）` });
-        }
-
-        const group = document.createElement('div');
-        group.className = 'model-family-group'
-            + (models.some(m => m.value === current) ? ' active' : '');
-        group.dataset.family = fam.key;
-
-        const tag = document.createElement('span');
-        tag.className = 'model-family-tag';
-        tag.textContent = fam.label;
-        group.appendChild(tag);
-
-        const row = document.createElement('div');
-        row.className = 'model-chip-row';
+        const optgroup = document.createElement('optgroup');
+        optgroup.label = fam.label;
+        const models = LLM_MODEL_GROUPS[fam.key] || [];
         models.forEach(m => {
-            const isSelected = m.value === current;
-            const chip = document.createElement('button');
-            chip.type = 'button';
-            chip.className = 'model-chip' + (isSelected ? ' selected' : '');
-            chip.title = isSelected
-                ? `${m.value}（当前生效，激发/提示词合成/审核/质检判定共用）`
-                : `点击切换为 ${m.value}`;
-
-            const name = document.createElement('span');
-            name.className = 'model-chip-name';
-            name.textContent = m.label;
-            chip.appendChild(name);
-            if (m.recommended) {
-                const badge = document.createElement('span');
-                badge.className = 'model-chip-badge';
-                badge.textContent = '推荐';
-                chip.appendChild(badge);
-            }
-
-            chip.addEventListener('click', () => {
-                if (config.model === m.value) return;
-                config.model = m.value;
-                localStorage.setItem('spark_config', JSON.stringify(config));
-                showToast(`LLM 模型已切换：${m.value}（下次激发/合成生效）`, 'success');
-                syncIdeationLlmPicker();
-                // 手机上芯片组是临时展开的（picker-collapsed，见 index.html）：
-                // 选完就收回去，把页脚高度还给上面的案例库/灵感卡。
-                if (typeof collapseIdeationPickerOnMobile === 'function') {
-                    collapseIdeationPickerOnMobile();
-                }
-                // 顶栏「本地 xxx 在线」徽章即时复测：不同供应商路由到不同网关
-                // （gpt→codex / 其余→8046），不复测的话徽章会一直挂着旧模型名
-                // 和旧网关的在线状态。ping 只查网关可达（毫秒级、零 token），
-                // 不发真实补全验模型——8046 间歇抽风，单点真调用探测误报率高，
-                // 激发链路自有重试兜底。
-                checkApiStatus();
-            });
-            row.appendChild(chip);
+            const opt = document.createElement('option');
+            opt.value = m.value;
+            opt.textContent = m.label + (m.recommended ? '（推荐）' : '');
+            optgroup.appendChild(opt);
         });
-        group.appendChild(row);
-        wrap.appendChild(group);
+        select.appendChild(optgroup);
     });
 
-    const hint = document.getElementById('ideation-llm-model-active-hint');
-    if (hint) hint.textContent = `使用中 · ${current}`;
+    const isKnown = LLM_MODEL_PICKER_FAMILIES.some(
+        fam => (LLM_MODEL_GROUPS[fam.key] || []).some(m => m.value === current)
+    );
+    if (!isKnown && current) {
+        const customOpt = document.createElement('option');
+        customOpt.value = current;
+        customOpt.textContent = `${current}（自定义）`;
+        select.appendChild(customOpt);
+    }
+    select.value = current;
 }
 
-/* ── 帧序列模块内嵌生图模型选择器 ────────────────────────────────────
-   生图模型的唯一 UI 入口（配置中心的生图模型下拉已于 2026-07-12 移除）：
-   在「连续帧序列生成」卡片里直接切换。选项集随帧后端切换
-   （api → IMAGE_MODELS 绑 config.imageModel；google_fx → FX_IMAGE_MODELS
-   绑 config.googleFxImageModel，后者仍与配置中心的 FX 生图下拉同步），
-   改动即写 localStorage，下次生成/单帧重试生效。 */
+// 向后兼容别名
+function syncIdeationSkillProfilePicker() {
+    syncSettingsSkillProfilePicker();
+}
+
+function syncIdeationLlmPicker() {
+    syncSettingsLlmModelPicker();
+}
+
 function syncFramesImageModelPicker() {
     const sel = document.getElementById('frames-image-model');
     if (!sel) return;
@@ -530,13 +255,18 @@ function loadConfig() {
         imageQualitySelect.value = config.imageQuality || '2K';
     }
 
+    const candidateConcurrencySelect = document.getElementById('settings-candidate-concurrency');
+    if (candidateConcurrencySelect) {
+        candidateConcurrencySelect.value = String(config.candidateConcurrency || DEFAULT_CONFIG.candidateConcurrency || 4);
+    }
+
     // 端口已永久固定（应用 8085 / 代理 8046，gpt-5.5 由服务端 resolve_gateway 固定路由），
     // 原「GPT 代理端口」选择器已移除，防止端口漂移。
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
     syncSettingsApiImageModelPicker();
-    syncIdeationLlmPicker();
-    syncIdeationSkillProfilePicker();
+    syncSettingsLlmModelPicker();
+    syncSettingsSkillProfilePicker();
 }
 
 // 显隐一律用空串还原（而不是写死 'block'）：配置中心的字段行是 CSS grid
@@ -547,9 +277,11 @@ function loadConfig() {
 function updateFxImageModelVisibility() {
     const backendSelect = document.getElementById('settings-image-backend');
     const apiImageGroup = document.getElementById('api-image-model-group');
+    const candConcurrencyGroup = document.getElementById('api-candidate-concurrency-group');
     const fxImageGroup = document.getElementById('fx-image-model-group');
     const showFx = backendSelect && backendSelect.value === 'google_fx';
     if (apiImageGroup) apiImageGroup.style.display = showFx ? 'none' : '';
+    if (candConcurrencyGroup) candConcurrencyGroup.style.display = showFx ? 'none' : '';
     if (fxImageGroup) fxImageGroup.style.display = showFx ? '' : 'none';
     updateFxVideoDurationVisibility();
 }
@@ -567,9 +299,15 @@ function updateFxVideoDurationVisibility() {
 // 把配置中心表单里的值收进 config 对象（不落盘）。saveConfig 与
 // autoSaveConfig 共用，避免两条写入路径读的字段集合漂移。
 function applySettingsFormToConfig() {
-    // config.model 不从本弹窗读取：LLM 模型由激发页脚的内嵌选择器直接维护。
-    // config.imageModel 有两个等价入口（本弹窗的 API 生图模型 + 帧序列卡片的内嵌
-    // 选择器），两边写的是同一个键，改完互相回写。
+    const llmModelSelect = document.getElementById('settings-llm-model');
+    if (llmModelSelect && llmModelSelect.value) {
+        config.model = llmModelSelect.value;
+    }
+    const skillProfileSelect = document.getElementById('settings-skill-profile');
+    if (skillProfileSelect && skillProfileSelect.value) {
+        config.skillProfile = skillProfileSelect.value;
+    }
+
     const imageBackendSelect = document.getElementById('settings-image-backend');
     if (imageBackendSelect) {
         config.imageBackend = imageBackendSelect.value;
@@ -607,6 +345,10 @@ function applySettingsFormToConfig() {
     if (ratioSelect) config.imageAspectRatio = ratioSelect.value.trim();
     const qualitySelect = document.getElementById('settings-image-quality');
     if (qualitySelect) config.imageQuality = qualitySelect.value.trim();
+    const candidateConcurrencySelect = document.getElementById('settings-candidate-concurrency');
+    if (candidateConcurrencySelect && candidateConcurrencySelect.value) {
+        config.candidateConcurrency = parseInt(candidateConcurrencySelect.value, 10) || 4;
+    }
 }
 
 function saveConfig() {
@@ -615,8 +357,8 @@ function saveConfig() {
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
     syncSettingsApiImageModelPicker();
-    syncIdeationLlmPicker();
-    syncIdeationSkillProfilePicker();
+    syncSettingsLlmModelPicker();
+    syncSettingsSkillProfilePicker();
     showToast("API 配置保存成功！", "success");
     checkApiStatus();
 }
@@ -717,6 +459,10 @@ function resetConfig() {
     }
     document.getElementById('settings-image-ratio').value = DEFAULT_CONFIG.imageAspectRatio;
     document.getElementById('settings-image-quality').value = DEFAULT_CONFIG.imageQuality;
+    const candidateConcurrencySelect = document.getElementById('settings-candidate-concurrency');
+    if (candidateConcurrencySelect) {
+        candidateConcurrencySelect.value = String(DEFAULT_CONFIG.candidateConcurrency || 4);
+    }
     updateFxImageModelVisibility();
     updateFxVideoDurationVisibility();
     // 表单已经全部改成「改动即存」，恢复默认自然也得当场落盘，否则关掉弹窗
@@ -732,8 +478,8 @@ function resetConfig() {
     localStorage.setItem('spark_config', JSON.stringify(config));
     updateCoverModelDisplay();
     syncFramesImageModelPicker();
-    syncIdeationLlmPicker();
-    syncIdeationSkillProfilePicker();
+    syncSettingsLlmModelPicker();
+    syncSettingsSkillProfilePicker();
     showToast('已恢复默认配置', 'success');
 }
 
@@ -878,118 +624,4 @@ function loadCurrentIdeaState() {
             console.error("Failed to load current idea state", e);
         }
     }
-}
-
-function loadCustomPresets() {
-    const stored = localStorage.getItem('spark_custom_presets');
-    if (stored) {
-        try {
-            customPresets = JSON.parse(stored);
-        } catch (e) {
-            console.error("Failed to parse custom presets", e);
-            customPresets = {};
-        }
-    }
-    renderCustomPresets();
-}
-
-function applyCustomPreset(name) {
-    const p = customPresets[name];
-    if (!p) return;
-    
-    // （#theme-selector 已移除；旧自定义预设档里残留的 p.theme 直接忽略）
-
-    // Anchors
-    document.querySelectorAll('#anchor-selector .anchor-node').forEach(btn => {
-        if (p.anchors.includes(btn.dataset.value)) {
-            btn.classList.add('active');
-        } else {
-            btn.classList.remove('active');
-        }
-    });
-    
-    // Sliders
-    const setVal = (id, val) => {
-        const el = document.getElementById(id);
-        if (el && val !== undefined) {
-            el.value = val;
-            el.dispatchEvent(new Event('input'));
-        }
-    };
-    setVal('slider-complexity', p.complexity);
-    setVal('slider-budget', p.budget);
-    setVal('slider-ratio', p.ratio);
-    setVal('slider-creativity', p.creativity);
-    setVal('slider-beats', p.beats);
-    if (typeof markBeatsUserOverridden === 'function') markBeatsUserOverridden();
-
-    saveSelectionState();
-    showToast(`已应用自定义预设：${name}`, 'success');
-}
-
-function renderCustomPresets() {
-    const container = document.getElementById('custom-presets-list');
-    if (!container) return;
-    
-    container.innerHTML = '';
-    const keys = Object.keys(customPresets);
-    
-    if (keys.length === 0) {
-        container.style.display = 'none';
-        return;
-    }
-    
-    container.style.display = 'flex';
-    keys.forEach(name => {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'custom-preset-btn';
-        btn.textContent = name;
-        
-        const deleteIcon = document.createElement('span');
-        deleteIcon.className = 'delete-preset-icon';
-        deleteIcon.innerHTML = '&times;';
-        deleteIcon.title = '删除此预设';
-        deleteIcon.addEventListener('click', (e) => deleteCustomPreset(name, e));
-        
-        btn.appendChild(deleteIcon);
-        btn.addEventListener('click', () => applyCustomPreset(name));
-        
-        container.appendChild(btn);
-    });
-}
-
-function randomizeDimensions() {
-    // （随机主题这一步已随 #theme-selector 移除；场景主题现在由灵感卡片/联网参考决定）
-
-    // 1. Select 1 to 3 random anchors
-    const anchorNodes = Array.from(document.querySelectorAll('#anchor-selector .anchor-node'));
-    if (anchorNodes.length > 0) {
-        anchorNodes.forEach(node => node.classList.remove('active'));
-        const numAnchors = Math.floor(Math.random() * 3) + 1;
-        const shuffled = [...anchorNodes].sort(() => 0.5 - Math.random());
-        for (let i = 0; i < Math.min(numAnchors, shuffled.length); i++) {
-            shuffled[i].classList.add('active');
-        }
-    }
-    
-    // 2. Randomize sliders
-    const setRandomVal = (id, min, max) => {
-        const el = document.getElementById(id);
-        if (el) {
-            const randomVal = Math.floor(Math.random() * (max - min + 1)) + min;
-            el.value = randomVal;
-            el.dispatchEvent(new Event('input'));
-        }
-    };
-    
-    setRandomVal('slider-complexity', 1, 3);
-    setRandomVal('slider-budget', 1, 3);
-    setRandomVal('slider-ratio', 0, 100);
-    setRandomVal('slider-creativity', 1, 3);
-    setRandomVal('slider-beats', 5, 15);
-    if (typeof markBeatsUserOverridden === 'function') markBeatsUserOverridden();
-
-    saveSelectionState();
-    showToast("🎲 随机激发配比已装配！", "success");
 }

@@ -21,17 +21,25 @@ TRANSITION_OPERATIONS = {"threshold", "reward", "reframe"}
 # remaining"），那恰恰是**完工**的说法，不是回退。2026-08-06 实测：兜底梯子的
 # flooring / painting 两档 after_state 都带 "no bare …"，跟在任何一条含
 # complete/finished 的前序状态后面就被这道闸判成"显式回退"，整单直接 QUALITY_GATE_FAILED。
+# 同样，"raw OSB panels", "raw timber", "raw brick masonry" 等是正向施工安装的材料
+# 材质描述（未饰面基材/原木/欧松板），不是空间倒退。
 _REGRESSION_WORDS = r"(?:absent|missing|removed|bare|raw|open again)"
 _NEGATED_REGRESSION_RE = re.compile(
     rf"\b(?:no|not|never|without|zero|free of)\b(?:\W+\w+){{0,3}}?\W+{_REGRESSION_WORDS}\b",
+    re.IGNORECASE,
+)
+_MATERIAL_RAW_RE = re.compile(
+    r"\b(?:raw|bare)\s+(?:osb|plywood|timber|wood|brick|masonry|stone|concrete|lumber|pine|board|boards|panel|panels|aggregate|sheathing|flake|flakes|flak|plank|planks|slat|slats|log|logs|rock|rocks|unrendered|substrate|finish)\b",
     re.IGNORECASE,
 )
 _REGRESSION_RE = re.compile(rf"\b{_REGRESSION_WORDS}\b", re.IGNORECASE)
 
 
 def _asserts_regression(after: str) -> bool:
-    """after_state 是否**正面主张**某个面回到了生料/缺失状态（否定式说法不算）。"""
-    return bool(_REGRESSION_RE.search(_NEGATED_REGRESSION_RE.sub(" ", after or "")))
+    """after_state 是否**正面主张**某个面回到了生料/缺失状态（否定式说法及材料名不算）。"""
+    cleaned = _NEGATED_REGRESSION_RE.sub(" ", after or "")
+    cleaned = _MATERIAL_RAW_RE.sub(" ", cleaned)
+    return bool(_REGRESSION_RE.search(cleaned))
 
 # Coarse construction phases.  These are deliberately conservative: equal ranks are
 # allowed, forward movement is allowed, and a lower rank is only allowed for an

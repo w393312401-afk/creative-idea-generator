@@ -167,6 +167,68 @@ async function testFindParentOmitsTheSyntheticJobKey() {
   assert.equal(calls[0].seed, '荒野钟表');
 }
 
+
+// 「♻️ 二创」按钮：激发维度页下线后，remix_seed 那条路已经没有落点，按钮改为把项目
+// 对应的复刻作业在爆款复刻面板里打开。所以它只对**复刻来的**项目露出——给激发出来
+// 的项目留一个必然落空的入口，正是上一版的毛病。
+function testRemixButtonOnlyShowsForReplicaProjects() {
+  const replicaProject = { title: '复刻项目', saved: true, library: { id: 'replica_ab12cd34ef56' } };
+  const ideatedProject = { title: '激发项目', saved: true, library: { id: 'idea_9f8e7d' } };
+
+  assert.equal(sandbox.projectReplicaJobId(replicaProject), 'replica_ab12cd34ef56');
+  assert.equal(sandbox.projectReplicaJobId(ideatedProject), '');
+  // 老任务只在 dimensions 里带 replica_job_id
+  assert.equal(
+    sandbox.projectReplicaJobId({ task: { dimensions: { replica_job_id: 'replica_legacy01' } } }),
+    'replica_legacy01');
+
+  assert.match(sandbox.projectsDetailActionsHtml(replicaProject), /data-act="remix"/);
+  assert.doesNotMatch(sandbox.projectsDetailActionsHtml(ideatedProject), /data-act="remix"/);
+}
+
+// 取数必须排在切页之前：switchMainTab 触发的 replicaTabEntered 在 replicaState 为空时
+// 会打开作业列表的第一条，先切页就是让两个请求赛跑。
+async function testRemixLoadsTheJobBeforeSwitchingTabs() {
+  const order = [];
+  sandbox.switchMainTab = tab => order.push(`switch:${tab}`);
+  sandbox.replicaLoadJob = async jid => {
+    order.push(`load:${jid}`);
+    return { job_id: jid, beats: { beats: [{ id: 'B01' }, { id: 'B02' }] } };
+  };
+  sandbox.replicaFocusSection = () => true;
+  sandbox.showToast = () => {};
+
+  await sandbox.startProjectRemix({ title: 'X', library: { id: 'replica_zzz111' } });
+  assert.deepEqual(order, ['load:replica_zzz111', 'switch:replica']);
+}
+
+// 没有节拍阶梯就没有二创可做（复刻面板的 canMutate = beatsCount > 0）。这时候不能
+// 一声不吭地把人扔在页面上——上一版的假提示就是这么来的。
+async function testRemixWithoutBeatsSaysSo() {
+  const toasts = [];
+  sandbox.switchMainTab = () => {};
+  sandbox.replicaLoadJob = async jid => ({ job_id: jid, beats: { beats: [] } });
+  sandbox.replicaFocusSection = () => true;
+  sandbox.showToast = msg => toasts.push(msg);
+
+  await sandbox.startProjectRemix({ title: 'X', library: { id: 'replica_nobeats' } });
+  assert.equal(toasts.length, 1);
+  assert.match(toasts[0], /节拍阶梯/);
+}
+
+// 取作业失败时不切页：切过去只会看到上一条作业，比留在原地更让人困惑。
+async function testRemixDoesNotSwitchWhenLoadFails() {
+  const toasts = [];
+  let switched = false;
+  sandbox.switchMainTab = () => { switched = true; };
+  sandbox.replicaLoadJob = async () => { throw new Error('job 不存在'); };
+  sandbox.showToast = msg => toasts.push(msg);
+
+  await sandbox.startProjectRemix({ title: 'X', library: { id: 'replica_gone' } });
+  assert.equal(switched, false);
+  assert.match(toasts[0], /打开复刻作业失败/);
+}
+
 (async () => {
   await testLightweightRefreshKeepsExistingCover();
   testBrokenLibraryCoverFallsBackToDiskCover();
@@ -175,6 +237,10 @@ async function testFindParentOmitsTheSyntheticJobKey() {
   testOrphanRowGetsItsOwnActionRow();
   await testBulkJobActionsHitEachJobOnce();
   await testFindParentOmitsTheSyntheticJobKey();
+  testRemixButtonOnlyShowsForReplicaProjects();
+  await testRemixLoadsTheJobBeforeSwitchingTabs();
+  await testRemixWithoutBeatsSaysSo();
+  await testRemixDoesNotSwitchWhenLoadFails();
   console.log('projects UI regression tests passed');
 })().catch(error => {
   console.error(error);

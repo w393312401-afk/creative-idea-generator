@@ -1708,6 +1708,7 @@ _PASSTHROUGH_CLIENT_KEYS = (
     # 托管模式下用户选了哪个模型会被整个丢掉，页面上却照常显示已切换——和
     # skillProfile / qaGateLevel 当年是同一个静默失效的口子。
     'frameFactsModel', 'peakVerifyModel', 'reviewModel',
+    'reviewConcurrency', 'candidateConcurrency',
 ) + _GATE_KEYS
 
 
@@ -2165,9 +2166,16 @@ def _cover_candidate_path(raw):
     if rel.startswith('data:') or '://' in rel:
         return None
     root = os.path.dirname(os.path.abspath(__file__))
-    outputs_dir = os.path.abspath(os.path.join(root, OUTPUT_ROOT))
-    candidate = rel if os.path.isabs(rel) else os.path.join(root, rel.lstrip('/\\'))
-    candidate = os.path.abspath(candidate)
+    outputs_dir = os.path.abspath(OUTPUT_ROOT if os.path.isabs(OUTPUT_ROOT) else os.path.join(root, OUTPUT_ROOT))
+    clean_rel = rel.lstrip('/\\')
+    if re.match(r'^[a-zA-Z]:[/\\]', rel) or rel.startswith('\\\\'):
+        candidate = os.path.abspath(rel)
+    elif clean_rel == 'outputs' or clean_rel.startswith('outputs/') or clean_rel.startswith('outputs\\'):
+        sub_rel = clean_rel[7:].lstrip('/\\')
+        cand_in_out = os.path.abspath(os.path.join(outputs_dir, sub_rel))
+        candidate = cand_in_out if os.path.isfile(cand_in_out) else os.path.abspath(os.path.join(root, clean_rel))
+    else:
+        candidate = os.path.abspath(os.path.join(root, clean_rel))
     try:
         inside = os.path.commonpath([candidate, outputs_dir]) == outputs_dir
     except ValueError:

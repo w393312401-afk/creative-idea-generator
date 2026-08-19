@@ -55,8 +55,20 @@ def build_keyframe_collage(
     frame_paths: list[Path | str],
     output_path: Path | str,
     columns: int = 5,
+    max_frames: int = 25,
+    tile_width: int = 360,
 ) -> Path | None:
-    """Render a tiled keyframe collage using ffmpeg."""
+    """Render a tiled keyframe collage using ffmpeg.
+
+    If `len(frame_paths) > max_frames` and `max_frames > 0`, it intelligently samples
+    milestone frames (always preserving first and last frame anchors) to prevent runaway
+    collage tile explosion and extreme vertical aspect ratio squishing.
+
+    Pass `max_frames=0` to disable sampling entirely. Callers whose collage carries an
+    index contract — "tile k is exactly item k of some parallel list" — MUST do so:
+    dropping a frame shifts every later tile by one, which is worse than having no
+    collage at all. See `prompt_pipeline.reverse._build_pass_b_sheets`.
+    """
     if not frame_paths:
         return None
 
@@ -67,6 +79,26 @@ def build_keyframe_collage(
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     paths = [Path(p) for p in frame_paths]
+
+    # max_frames <= 0 表示"不降采样，全都要"（带下标契约的拼图必须走这条，见
+    # prompt_pipeline/reverse.py 的调用点）。max_frames == 1 单独挡掉：下面的
+    # step 要除以 max_frames-1，取 1 会直接 ZeroDivisionError；而"只留一张"本就
+    # 不是拼图，退回首帧即可。
+    if max_frames is not None and max_frames > 0 and len(paths) > max_frames:
+        if max_frames == 1:
+            paths = paths[:1]
+        else:
+            n = len(paths)
+            indices = [0]
+            step = (n - 1) / float(max_frames - 1)
+            for i in range(1, max_frames - 1):
+                idx = int(round(i * step))
+                if idx not in indices and idx < n - 1:
+                    indices.append(idx)
+            indices.append(n - 1)
+            indices = sorted(list(dict.fromkeys(indices)))
+            paths = [paths[i] for i in indices]
+
     rows = math.ceil(len(paths) / columns)
     padded = list(paths)
     while len(padded) < rows * columns:
@@ -77,6 +109,7 @@ def build_keyframe_collage(
         lines = [f"file '{str(p.resolve()).replace('\'', '\'\\\'\'')}'\n" for p in padded]
         concat_list_path.write_text("".join(lines), encoding="utf-8")
 
+        scale_w = max(120, tile_width)
         command = [
             ffmpeg,
             "-hide_banner",
@@ -90,11 +123,11 @@ def build_keyframe_collage(
             "-i",
             str(concat_list_path),
             "-vf",
-            f"scale=240:-1:force_divisible_by=2,setsar=1,tile={columns}x{rows}:padding=4:margin=4:color=black",
+            f"scale={scale_w}:-1:force_divisible_by=2,setsar=1,tile={columns}x{rows}:padding=4:margin=4:color=black",
             "-frames:v",
             "1",
             "-q:v",
-            "3",
+            "2",
             str(output_path),
         ]
         subprocess.run(command, capture_output=True, check=True, **_win_subprocess_flags())
@@ -107,3 +140,4 @@ def build_keyframe_collage(
             except OSError:
                 pass
     return output_path if output_path.exists() and output_path.stat().st_size > 0 else None
+
