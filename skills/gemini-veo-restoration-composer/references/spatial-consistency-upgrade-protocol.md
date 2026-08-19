@@ -182,8 +182,20 @@ graph TD
   * Horizon line / vanishing line locked at `45% to 50% frame height`.
 * **Video Scale Figure Lock**:
   * In dynamic video prompts, declare worker scale: `a lone male worker (1.78m tall, occupying ~35% of frame height, realistically proportioned to the 2.2m ceiling)`.
-* **Negative Scale Restraints**:
-  * Mandatory negative terms: `(cavernous hall, oversized room, giant space, miniature furniture, dollhouse scale, telephoto distortion:1.4)`.
+### 12. Depth-Layered Spatial Protocol & Anti-Distortion Perspective Lock (DLSP)
+
+* **Principle**: Eradicate multi-round layout drift (e.g. 2m square cubicle vs. 15m bowling-alley tunnel vs. background-drifted ladder) by strictly structuring all interior establish and post-crossing prompts into a 5-layer depth staging architecture.
+* **5-Layer Depth Staging Architecture**:
+  1. **Camera Geometry**: Lock `24mm wide-angle interior shot at 1.3m eye-level, wide 3/4 diagonal oblique perspective from near corner`. Forbid single-point center vanishing lines on rectangular rooms to prevent infinite hallway stretching.
+  2. **Layer 1 - Immediate Foreground (<1m)**: Explicitly bind entrance landmarks (ladders, portal doorframes, entry rungs) as **near-foreground objects positioned 0.5m in front of the lens on the frame margin** (e.g. `overhead in right-foreground Grid A3-C3`). This prevents diffusion models from pulling the ladder into the middle-ground or far background wall.
+  3. **Layer 2 - Midground Staging Floor (1~4m)**: Declare a broad, open floor expanse with authentic surface seams and reflections, kept completely unobstructed for visible action and construction movement.
+  4. **Layer 3 - Longitudinal Boundary Topology**: Explicitly define every wall plane (e.g. `Left wall: two consecutive widescreen rectangular glass windows; Right wall: solid opaque corrugated steel wall, zero windows`). Ban generic multi-window terms that trigger 3-sided aquarium boxes.
+  5. **Layer 4 - Background Wall & Metric Envelope (>4m)**: State the true metric room dimensions (e.g. `3.8m wide, 5.5m deep, 2.6m ceiling clearance`) and close out depth with a solid far end wall.
+* **Banned Perspective Triggers**:
+  * Forbid: `corridor`, `tunnel`, `long axis`, `vanishing point`, `one-point perspective`, `panoramic windows` (unbounded).
+  * Enforce: `wide 3/4 diagonal oblique perspective`, `wide master bedroom gallery`, `consecutive windows exclusively on the left wall`.
+* **Negative Anti-Distortion Restraints**:
+  * Mandatory negative terms: `(cramped room, square box room, tiny cubicle, 2m small room, elevator shaft, three-sided glass box, glass back wall, endless narrow tunnel, bowling alley effect, train carriage, ladder placed in background, ladder far away:1.6)`.
 
 ---
 
@@ -203,7 +215,8 @@ Every prompt set must be evaluated against this quality matrix. A single `FAIL` 
 | **HAL Silhouettes** | Are workers locked using high-contrast solid silhouettes and silhouette poses? | Blocks morphing of clothing patterns, facial details, or poses. |
 | **Sealed Entry**| Is the entry CLOSED and opaque in the pre-crossing IMAGE, with nothing of the interior visible, and does the crossing clip open it on camera? Does the crossing land on exactly the registered interior primary anchors (Anchor Inheritance), all plausibly pre-existing at crossing time (never future construction products)? | Eliminates random layout explosion, anchor amnesia, causality inversion, and the interpolation failure caused by asking the video model to match a hallucinated peek. |
 | **TBCP Threshold Bridge (v4)** | For any exterior→interior crossing: is it exactly ONE merged beat — one meta-tagged crossing VIDEO between `IMAGE T` and `IMAGE T+1`, never a two-clip split with a sill-handoff frame — with a single-variable bridge camera, a soft exposure/WB roll attributed to door-shade + doorway backlight, a symmetric door-frame wipe, ≥1 cross-threshold material/light tether, a sealed entry in `IMAGE T` that the clip opens on camera, the registered interior anchors carrying their settled scales in `IMAGE T+1`, and no construction work inside the clip? | Eliminates the three-system simultaneous flip (lighting + camera family + anchor set) that causes interior explosion; see TBCP reference. |
-| **NLVTR Text Lock** | Are raw percentages (`%`), numeric ranges, colons in variable strings, and SCUP acronyms (`TSPA`, `HAL`, `VMFP`, `GCTR`, `RPL`, `RCE`, `SCUP`, `NGCS`, `OSPL`, `RHMA`, `PBISP`, `HCL`, `NLVTR`, `MTAL`, `HSMC`) completely banned and removed from final prompts? | Eliminates text watermark overlays and mathematical artifacts on the generated video. |
+| **NLVTR Text Lock** | Are raw percentages (`%`), numeric ranges, colons in variable strings, and SCUP acronyms (`TSPA`, `HAL`, `VMFP`, `GCTR`, `RPL`, `RCE`, `SCUP`, `NGCS`, `OSPL`, `RHMA`, `PBISP`, `HCL`, `NLVTR`, `MTAL`, `HSMC`, `DLSP`) completely banned and removed from final prompts? | Eliminates text watermark overlays and mathematical artifacts on the generated video. |
 | **Visible Milestone Package Lock** | Does every ordinary video beat create exactly one named terminal stage product at its FULL visible extent/count, using one operation or at most three tightly related same-zone actions, with both primary-product and secondary-material progress lines (never a token patch or cross-phase bundle)? | Keeps adjacent anchors instantly distinguishable while allowing physically coherent reference-case closeout packages. |
 | **HSMC Metric & Human Scale Lock** | Are spatial dimensions declared in metric terms (e.g. 3.0m diameter, 2.2m clearance)? Are oversized residential props (bunk beds) banned in compact carriers and replaced with platform daybeds? Is worker height anchored at ~1.78m (~35% frame height)? Are negative anti-cavernous terms applied? | Prevents compact dugouts from expanding into giant cavernous halls and eliminates miniature/giant human scale distortion. |
+| **DLSP Depth & Perspective Lock** | Are interior establish prompts structured in 5-layer depth staging? Is the camera set to wide 3/4 oblique view instead of 1-point tunnel? Is the entrance ladder/portal locked to near foreground (<1m)? Are wall topologies explicitly declared for all planes? | Prevents multi-round layout drift, bowling-alley corridor stretching, tiny cubicle box hallucination, and background ladder migration. |
 

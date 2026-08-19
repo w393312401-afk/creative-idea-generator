@@ -72,12 +72,18 @@ space may not have glowing fixed ceiling lights. Fixed practicals turn on only a
 beat visibly installs power source, wiring and fixtures. Entry/back light keeps the same direction
 and colour across the threshold.
 
-## Reveal budget
+## Reveal budget & DLSP 5-layer depth structure
 
 Partial stages retain orientation evidence and hide the far wall. The full room overview is a
-later establish stage. Do not use a centered one-point overview for both. In 9:16 long-axis
-spaces, default to a three-quarter oblique establish; reserve centered one-point perspective for
-one establish or final payoff.
+later establish stage. In 9:16 vertical long-axis spaces, **default to a three-quarter oblique establish (wide 3/4 diagonal corner perspective)**; strictly forbid centered one-point perspective corridor overviews that trigger extreme tunnel/bowling-alley stretching.
+
+Every interior establish prompt (`interior_establish` / IMAGE T+1) must follow the **Depth-Layered Spatial Protocol (DLSP)**:
+1. **Camera Geometry**: `24mm wide-angle interior shot at 1.3m eye-level, wide 3/4 diagonal oblique perspective from near corner`.
+2. **Layer 1 - Immediate Foreground (<1m)**: Entrance hardware (ladder, hatch ring, door jamb) is explicitly locked as a **near-foreground object 0.5m from the lens at the frame margin (Grid A3-C3)** to prevent it from drifting to the back wall.
+3. **Layer 2 - Midground Staging Floor (1~4m)**: Broad, open floor expanse with raw seams and water/light caustics, completely unobstructed for future staging.
+4. **Layer 3 - Lateral Boundary Topology**: Explicitly define every wall plane (e.g. `Left wall: two consecutive widescreen windows; Right wall: solid corrugated steel wall`).
+5. **Layer 4 - Background Wall & Metric Envelope (>4m)**: State metric proportions (e.g. `3.8m wide, 5.5m deep, 2.6m ceiling`) and close out with a solid far background wall.
+6. **Negative Anti-Distortion Restraints**: Always inject `(cramped room, square box room, tiny cubicle, elevator shaft, three-sided glass box, endless narrow tunnel, bowling alley effect, train carriage, ladder placed in background:1.6)`.
 
 ## Scale and camera families
 

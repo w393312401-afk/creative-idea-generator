@@ -545,17 +545,123 @@ def sanitize_cut_video_prompt(prompt, start_slot=1, end_slot=2):
     return text
 
 
-def rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=None):
-    """把提示词里的 IMAGE start_slot / IMAGE slot+1（含中文「图片 N」）改写为
-    IMAGE 1 / IMAGE 2，对应 Google Labs Flow 两卡位（首帧/尾帧）UI。start_slot 默认
-    等于 slot（含单一过门拍——起止帧绑定和普通拍完全一样，无需重定向）；参数保留
-    作为通用覆盖钩子。"""
-    start_slot = slot if start_slot is None else start_slot
-    prompt = sanitize_cut_video_prompt(prompt, start_slot=start_slot, end_slot=slot + 1)
-    prompt = re.sub(rf'\bimage\s+{start_slot}\b', 'IMAGE 1', prompt, flags=re.IGNORECASE)
-    prompt = re.sub(rf'\bimage\s+{slot + 1}\b', 'IMAGE 2', prompt, flags=re.IGNORECASE)
-    prompt = re.sub(rf'图片\s*{start_slot}\b', 'IMAGE 1', prompt)
-    prompt = re.sub(rf'图片\s*{slot + 1}\b', 'IMAGE 2', prompt)
+def _declared_frame_anchors(prompt):
+    """提取视频提示词正文里**显式声明**的首尾帧编号，没有声明则返回 None。
+
+    返回 (start_slot: int, end_slot: Optional[int]) 或 None。end_slot 为 None 表示
+    正文声明这一段只有首帧（英雄展示）。
+
+    注意：这个函数的返回值**不决定送哪两张帧**。槽位契约（视频 slot 绑定
+    IMAGE slot -> IMAGE slot+1）才是唯一权威，见 plan_video_slots 的说明。这里解出
+    来的编号只用于两件事：把正文改写成 Flow 两卡位的 IMAGE 1/IMAGE 2，以及在声明
+    与契约不符时报警。
+
+    支持的声明模式：
+      - 单帧/英雄展示: "Use ... (IMAGE 11) as the sole starting-frame anchor" -> (11, None)
+      - 双帧显式声明: "Use IMAGE 7 as the actual first-frame image and IMAGE 8 as the actual last-frame image" -> (7, 8)
+      - 双帧标准声明: "Use IMAGE 7 as first frame and IMAGE 8 as last frame" -> (7, 8)
+      - 双帧转场声明: "starting from the close-up shot of IMAGE 5... (IMAGE 6)" -> (5, 6)
+      - 箭头映射声明: "IMAGE 7 -> IMAGE 8" / "图片 7 -> 图片 8" -> (7, 8)
+    """
+    text = str(prompt or '').strip()
+    if not text:
+        return None
+
+    # 1. 英雄帧/单帧声明：sole starting-frame anchor / sole starting frame
+    #    编号必须取紧挨着这句话的那个（"...reference image (IMAGE 11) as the sole
+    #    starting-frame anchor"），不能取全文第一个 IMAGE ——正文里先出现的往往是
+    #    继承描述里引用的别的帧号。
+    hero_m = re.search(r'sole\s+starting[- ]frame', text, re.IGNORECASE)
+    if hero_m:
+        before = text[:hero_m.start()]
+        near = re.findall(r'(?:IMAGE|图片)\s*(\d+)', before, re.IGNORECASE)
+        if near:
+            return int(near[-1]), None
+        after = re.search(r'(?:IMAGE|图片)\s*(\d+)', text[hero_m.end():], re.IGNORECASE)
+        if after:
+            return int(after.group(1)), None
+        return None
+
+    # 2. 标准双帧声明：Use IMAGE X as ... first ... and IMAGE Y as ... last ...
+    m1 = re.search(
+        r'Use\s+(?:the\s+provided\s+)?(?:IMAGE|图片)\s*(\d+)\s+as\s+(?:the\s+)?(?:actual\s+)?(?:first|starting)[- ]frame.*?'
+        r'(?:and\s+)?(?:IMAGE|图片)\s*(\d+)\s+as\s+(?:the\s+)?(?:actual\s+)?(?:last[- ]frame|resulting\s+anchor|ending[- ]frame)',
+        text,
+        re.IGNORECASE | re.DOTALL
+    )
+    if m1:
+        return int(m1.group(1)), int(m1.group(2))
+
+    m2 = re.search(
+        r'Use\s+(?:IMAGE|图片)\s*(\d+)\s+as\s+(?:first|starting)\s+frame\s+and\s+(?:IMAGE|图片)\s*(\d+)\s+as\s+(?:last|ending)\s+frame',
+        text,
+        re.IGNORECASE
+    )
+    if m2:
+        return int(m2.group(1)), int(m2.group(2))
+
+    # 3. 箭头声明：(Image X -> Image Y) 或 IMAGE X -> IMAGE Y 或 图片 X -> 图片 Y
+    m3 = re.search(r'(?:IMAGE|图片|Image)\s*(\d+)\s*(?:->|—>|-->|至|到)\s*(?:IMAGE|图片|Image)\s*(\d+)', text, re.IGNORECASE)
+    if m3:
+        return int(m3.group(1)), int(m3.group(2))
+
+    # 4. 转场开启声明：starting from ... IMAGE X ... (IMAGE Y)
+    m4 = re.search(r'starting\s+from\s+[^;]*?(?:IMAGE|图片)\s*(\d+).*?\(\s*(?:IMAGE|图片)\s*(\d+)\s*\)', text, re.IGNORECASE | re.DOTALL)
+    if m4:
+        return int(m4.group(1)), int(m4.group(2))
+
+    # 5. 中文声明：使用/以 图片 X 作为起始/首帧 ... 图片 Y 作为结束/尾帧
+    m5 = re.search(
+        r'(?:使用|以)?\s*(?:IMAGE|图片)\s*(\d+)\s*(?:作为|为)?\s*(?:起始|首|第一)[- ]?帧.*?'
+        r'(?:IMAGE|图片)\s*(\d+)\s*(?:作为|为)?\s*(?:结束|尾|最后|第二)[- ]?帧',
+        text,
+        re.IGNORECASE | re.DOTALL
+    )
+    if m5:
+        return int(m5.group(1)), int(m5.group(2))
+
+    return None
+
+
+def extract_declared_frame_anchors(prompt, default_start=1, default_end=2):
+    """_declared_frame_anchors 的兜底包装：没有显式声明时返回调用方给的默认值。
+
+    同样只用于文案改写与报警，不用来改选帧（见 _declared_frame_anchors）。"""
+    declared = _declared_frame_anchors(prompt)
+    if declared is None:
+        return default_start, default_end
+    return declared
+
+
+def rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=None, end_slot=None):
+    """把提示词里的 IMAGE start_slot / IMAGE end_slot（含中文「图片 N」）改写为
+    IMAGE 1 / IMAGE 2，对应 Google Labs Flow 两卡位（首帧/尾帧）UI。若未传 start_slot/end_slot，
+    自动从提示词正文中提取显式声明；无声明时默认等于 slot / slot+1。"""
+    if start_slot is None or end_slot is None:
+        _s, _e = extract_declared_frame_anchors(prompt, slot, slot + 1)
+        start_slot = start_slot if start_slot is not None else _s
+        end_slot = end_slot if end_slot is not None else _e
+
+    prompt = sanitize_cut_video_prompt(
+        prompt,
+        start_slot=start_slot,
+        end_slot=end_slot if end_slot is not None else start_slot
+    )
+
+    if end_slot is not None and start_slot != end_slot:
+        prompt = re.sub(rf'\bimage\s+{start_slot}\b', '___IMG_ANCHOR_1___', prompt, flags=re.IGNORECASE)
+        prompt = re.sub(rf'图片\s*{start_slot}\b', '___IMG_ANCHOR_1___', prompt)
+        prompt = re.sub(rf'\bimage\s+{end_slot}\b', '___IMG_ANCHOR_2___', prompt, flags=re.IGNORECASE)
+        prompt = re.sub(rf'图片\s*{end_slot}\b', '___IMG_ANCHOR_2___', prompt)
+        prompt = prompt.replace('___IMG_ANCHOR_1___', 'IMAGE 1').replace('___IMG_ANCHOR_2___', 'IMAGE 2')
+    elif end_slot is not None and start_slot == end_slot:
+        prompt = re.sub(rf'\bimage\s+{start_slot}\b', 'IMAGE 1', prompt, flags=re.IGNORECASE)
+        prompt = re.sub(rf'图片\s*{start_slot}\b', 'IMAGE 1', prompt)
+    else:
+        # 单帧（HERO）
+        prompt = re.sub(rf'\bimage\s+{start_slot}\b', 'IMAGE 1', prompt, flags=re.IGNORECASE)
+        prompt = re.sub(rf'图片\s*{start_slot}\b', 'IMAGE 1', prompt)
+
     return prompt
 
 
@@ -751,16 +857,32 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
         # （见 prompt_pipeline._compose_hero_showcase_video），不设结束锚点。
         is_hero = 'HERO' in meta
 
-        # 单一过门拍（[BRIDGE]/[BRIDGE TURN]）与声明式硬切槽位（[CUT]）：
-        # 本拍的 VIDEO 是过门/过渡可见片段，起止帧绑定和普通拍完全一样（IMAGE slot -> IMAGE slot+1）。
-        # 所有声明式硬切槽位照常生成视频（提示词已由 rewrite_prompt_for_two_card_ui 清洗为可执行的运镜动作），
-        # 绝不跳过生成。
+        # 槽位契约是唯一权威：视频 slot 绑定 IMAGE slot -> IMAGE slot+1（HERO 只有首帧）。
+        # 2026-08-18：这里一度改成"正文声明优先"，让提示词里写的 IMAGE 编号决定送哪两
+        # 张帧。那条路把组稿阶段的编号错位原样执行了——underwater_container 那单的视频
+        # 6~9 正文整体滑了一格（视频 6 写成 IMAGE 7 -> IMAGE 8），于是 IMAGE 6 -> IMAGE 7
+        # 这一跨根本没有视频、vid_009 首尾同帧变成 8 秒静止，而锚点校验因为拿"声明的
+        # 锚点"去比对全部照过，成片跳帧却没有任何一道门发出声音。声明不能改选帧。
         start_slot = slot
+        end_slot = None if is_hero else (slot + 1)
 
-        prompt = rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=start_slot)
+        # 正文里显式声明的编号只做两件事：把文案改写成 Flow 两卡位的 IMAGE 1/IMAGE 2
+        # （否则 "Use IMAGE 7 ... IMAGE 8" 会留下裸的 IMAGE 8 送进模型），以及在声明与
+        # 契约不符时报警——那说明组稿编号错了，得回上游修，不该在这里将错就错。
+        declared = _declared_frame_anchors(prompt)
+        anchor_declaration_mismatch = None
+        if declared is not None and (declared[0] != start_slot or declared[1] != end_slot):
+            anchor_declaration_mismatch = {
+                'declared_start': declared[0],
+                'declared_end': declared[1],
+                'contract_start': start_slot,
+                'contract_end': end_slot,
+            }
+        rewrite_start, rewrite_end = declared if declared is not None else (start_slot, end_slot)
+        prompt = rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=rewrite_start, end_slot=rewrite_end)
         dest_path = os.path.join(videos_dir, f'vid_{slot:03d}.mp4')
         start_p = slot_to_path.get(start_slot)
-        end_p = None if is_hero else slot_to_path.get(slot + 1)
+        end_p = None if (is_hero or end_slot is None) else slot_to_path.get(end_slot)
         plan = {
             'slot': slot,
             'seq': seq,
@@ -769,6 +891,8 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
             'start_frame': start_p,
             'end_frame': end_p,
             'start_anchor_slot': start_slot,
+            'end_anchor_slot': end_slot,
+            'anchor_declaration_mismatch': anchor_declaration_mismatch,
             'delete_existing': False,
             'reason': '',
             'meta': meta,
@@ -793,7 +917,7 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                 plans.append(plan)
                 continue
             # 4. 历史已成功生成的视频：若其起止锚点帧均未被重新生成（非 stale_slots），直接复用
-            has_stale_anchor = bool(stale_slots and (start_slot in stale_slots or ((slot + 1) in stale_slots)))
+            has_stale_anchor = bool(stale_slots and (start_slot in stale_slots or (end_slot is not None and end_slot in stale_slots)))
             if existing_entry and existing_entry.get('status') == 'success' and not has_stale_anchor:
                 plan['action'] = 'reuse'
                 plans.append(plan)
@@ -813,31 +937,26 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
         if not start_p or not os.path.exists(start_p):
             plan['action'] = 'blocked'
             plan['reason'] = f"视频 {slot} 所需的起始帧 IMAGE {start_slot} 不存在。请重新生成该帧！"
-        elif not is_hero and (not end_p or not os.path.exists(end_p)):
+        elif not is_hero and (end_slot is not None) and (not end_p or not os.path.exists(end_p)):
             plan['action'] = 'blocked'
-            plan['reason'] = f"视频 {slot} 所需的结束帧 IMAGE {slot + 1} 不存在。请重新生成该帧！"
-        # 注意：'i2i_fallback_degraded' 自 f5a003b 起已无生产方——当年产生它的是
-        # "参考图缺失就退回文生图"那条静默降级路径，现在那里直接抛
-        # RuntimeError('帧序列禁止退回文生图')，不再产出脱链帧。所以这一条如今只对
-        # 旧 manifest 生效，留着是为了让那些老单仍被拦住。今天真正活着的降级信号是
-        # 帧上的 degraded_reason（chat 通道降档），它按设计只做提示不拦截。
+            plan['reason'] = f"视频 {slot} 所需的结束帧 IMAGE {end_slot} 不存在。请重新生成该帧！"
         elif slot_to_quality.get(start_slot) == 'i2i_fallback_degraded' \
-                or slot_to_quality.get(slot + 1) == 'i2i_fallback_degraded':
+                or (end_slot is not None and slot_to_quality.get(end_slot) == 'i2i_fallback_degraded'):
             plan['action'] = 'blocked'
             plan['reason'] = (
-                f"视频 {slot} 的起始帧 IMAGE {start_slot} 或结束帧 IMAGE {slot + 1} 属于降级帧（i2i fallback degraded），"
+                f"视频 {slot} 的起始帧 IMAGE {start_slot} 或结束帧 IMAGE {end_slot} 属于降级帧（i2i fallback degraded），"
                 f"已拦截该段视频生成以防止画面跳变。请重新生成并修复受损帧。"
             )
         elif not override_flagged and (
             slot_to_quality.get(start_slot) in _FLAGGED_QUALITY_GATES
-            or slot_to_quality.get(slot + 1) in _FLAGGED_QUALITY_GATES
+            or (end_slot is not None and slot_to_quality.get(end_slot) in _FLAGGED_QUALITY_GATES)
         ) and (
             gate_level != 'off'
             or slot_to_quality.get(start_slot) == 'frame_continuity_failed'
-            or slot_to_quality.get(slot + 1) == 'frame_continuity_failed'
+            or (end_slot is not None and slot_to_quality.get(end_slot) == 'frame_continuity_failed')
         ):
             # 已知坏帧不再烧昂贵的视频生成额度，见 _FLAGGED_QUALITY_GATES。
-            _bad = start_slot if slot_to_quality.get(start_slot) in _FLAGGED_QUALITY_GATES else slot + 1
+            _bad = start_slot if slot_to_quality.get(start_slot) in _FLAGGED_QUALITY_GATES else end_slot
             _bad_gate = slot_to_quality.get(_bad)
             plan['action'] = 'blocked'
             plan['reason'] = (
@@ -848,42 +967,61 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                    else "请重渲或修复该帧（或将质检档位调为 off 放行）后重试。")
             )
         elif not override_flagged and stale_slots and gate_level != 'off' \
-                and (start_slot in stale_slots or (slot + 1) in stale_slots):
-            # 2026-07-30：血统过期从"standard 拦 / lenient 只警告"改成"除 off 档一律拦"。
-            # 理由是它和其它门禁不同类：一致性审查的判定有主观成分（可能误报，宽松档
-            # 放行是合理档位），而血统过期是确定性事实——上游帧被单独换过，这一对锚点
-            # 帧确实来自两条不同的 i2i 链，送 i2v 必然是跨链漂移。lenient 档只发一条
-            # 警告，实际使用中等于没拦（警告和其它十几条混在一起滚过去），2026-07-27
-            # 的 ice_cave slot3 事故就是这么走到成片的。要放行请走 override_flagged
-            # （前端确认风险，见 confirmSequenceReviewOverride）或把档位调成 off。
-            _stale = start_slot if start_slot in stale_slots else slot + 1
+                and (start_slot in stale_slots or (end_slot is not None and end_slot in stale_slots)):
+            _stale = start_slot if start_slot in stale_slots else end_slot
             plan['action'] = 'blocked'
             plan['reason'] = (
                 f"视频 {slot} 的锚点帧 IMAGE {_stale} 派生自旧的 i2i 链（上游帧已被单独重渲，"
                 f"血统过期），已拦截以防跨链跳变。请顺序重渲 IMAGE {_stale} 及其后续帧，"
                 f"或在确认风险后强制生成。"
             )
+        elif anchor_declaration_mismatch and not override_flagged and gate_level != 'off':
+            # 正文声明的锚点编号与槽位契约不符：几乎总是组稿阶段整段编号错位（最典型
+            # 的是跨 [CUT] 之后整体滑一格）。照契约生成会拿到与文案描述不同的一对帧，
+            # 照声明生成会让中间某一跨没有视频、成片跳帧——两条都不对，唯一的正解是
+            # 回上游把编号修对，所以这里直接拦下来而不是二选一。
+            _d = anchor_declaration_mismatch
+            _decl_end = 'None（无尾帧）' if _d['declared_end'] is None else f"IMAGE {_d['declared_end']}"
+            _con_end = 'None（无尾帧）' if _d['contract_end'] is None else f"IMAGE {_d['contract_end']}"
+            plan['action'] = 'blocked'
+            plan['reason'] = (
+                f"视频 {slot} 的正文声明首尾锚点为 IMAGE {_d['declared_start']} → {_decl_end}，"
+                f"与槽位契约 IMAGE {_d['contract_start']} → {_con_end} 不符。这通常是组稿阶段"
+                f"整段编号错位（例如跨 [CUT] 后整体滑了一格），照此出片会漏掉一整跨画面并在"
+                f"成片里跳帧。请先修正提示词里的 IMAGE 编号；确认无误可强制生成"
+                f"（届时仍按槽位契约取帧）。"
+            )
         else:
             plan['action'] = 'generate'
             warnings = []
+            # 锚点帧编号（HERO 没有尾锚，下面所有涉及尾帧的判断都要先过这一关）
+            _anchor_slots = [start_slot] + ([] if end_slot is None else [end_slot])
+            if anchor_declaration_mismatch:
+                _d = anchor_declaration_mismatch
+                _decl_end = '无尾帧' if _d['declared_end'] is None else f"IMAGE {_d['declared_end']}"
+                warnings.append(
+                    f"视频 {slot} 的正文声明锚点为 IMAGE {_d['declared_start']} → {_decl_end}，"
+                    f"与槽位契约不符；已按契约取 IMAGE {start_slot} → "
+                    f"IMAGE {end_slot if end_slot is not None else '（无）'} 生成，"
+                    f"画面内容可能与文案描述的工序对不上，请核对组稿编号。"
+                )
             _flagged_quality = _FLAGGED_QUALITY_GATES
-            if override_flagged and (slot_to_quality.get(start_slot) in _flagged_quality
-                                      or slot_to_quality.get(slot + 1) in _flagged_quality):
-                _bad = start_slot if slot_to_quality.get(start_slot) in _flagged_quality else slot + 1
+            if override_flagged and any(slot_to_quality.get(s) in _flagged_quality for s in _anchor_slots):
+                _bad = next(s for s in _anchor_slots if slot_to_quality.get(s) in _flagged_quality)
                 _bad_gate = slot_to_quality.get(_bad)
                 warnings.append(
                     f"视频 {slot} 的锚点帧 IMAGE {_bad} "
                     f"{_FLAGGED_GATE_LABELS.get(_bad_gate, '未通过一致性审查')}（{_bad_gate}），"
                     f"已按用户确认风险强制生成，请留意画面跳变/内容缺陷。"
                 )
-            if stale_slots and (start_slot in stale_slots or (slot + 1) in stale_slots):
-                _stale = start_slot if start_slot in stale_slots else slot + 1
+            if stale_slots and any(s in stale_slots for s in _anchor_slots):
+                _stale = next(s for s in _anchor_slots if s in stale_slots)
                 warnings.append(
                     f"视频 {slot} 的锚点帧 IMAGE {_stale} 派生自旧 i2i 链（上游帧已被单独重渲），"
                     f"两端帧可能存在跨链色彩/内容漂移。"
                 )
             # 未经判定的锚点帧：不拦（审查是手动的，没审不等于有问题），但必须说出来。
-            _unjudged = [s for s in (start_slot, slot + 1)
+            _unjudged = [s for s in _anchor_slots
                          if slot_to_quality.get(s) in _UNREVIEWED_QUALITY_GATES]
             if _unjudged:
                 _names = '、'.join(f"IMAGE {s}" for s in _unjudged)
@@ -915,14 +1053,14 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                     f"视频 {slot} 的首尾锚点帧跨度偏大（MAD={mad:.1f}，连续插值上限约"
                     f"{_PAIR_TOO_WIDE_MAD:.0f}），一段 {_CLIP_BASE_SECONDS:.0f} 秒 i2v 装不下这个差量，"
                     f"大概率产出「推进→停滞→突进补足」的跳变片段——建议在 IMAGE {start_slot} 与 "
-                    f"IMAGE {slot + 1} 之间补一张中间帧，把这一拍拆成两拍。"
+                    f"IMAGE {end_slot} 之间补一张中间帧，把这一拍拆成两拍。"
                 )
                 plan['split_recommendation'] = {
                     'required': True,
-                    'between_images': [start_slot, slot + 1],
+                    'between_images': [start_slot, end_slot],
                     'reason': 'anchor_span_too_wide',
                     'suggested_midpoint': (
-                        f"在 IMAGE {start_slot} 与 IMAGE {slot + 1} 之间增加只完成约一半施工量的中间锚点"
+                        f"在 IMAGE {start_slot} 与 IMAGE {end_slot} 之间增加只完成约一半施工量的中间锚点"
                     ),
                 }
             if warnings:
@@ -939,7 +1077,14 @@ def _video_info(plan, video_model, status, error=None):
         rel, url = '', ''
     info = {
         'slot': plan['slot'],
-        'sequence': plan['seq'],
+        # 2026-08-18：这里原本写的是 plan['seq']——那是**本批次内**的序号
+        # （plan_video_slots 里 enumerate(slots)，还会被 target_slots 过滤）。于是每
+        # 做一次部分重试，被重试槽位的 sequence 就被写成 1，manifest 里出现 slot=7
+        # sequence=1 这种记录（实测 荒野河滩爆改水下奢华套房 的 5/7/8/9 号全是 1）。
+        # 帧那边 sequence 恒等于 slot，server 各处重排也一律按"slot 升序的位次"记账，
+        # 这里跟着对齐，别让两条序列的同名字段是两个意思。批内进度仍走 on_progress
+        # 的 'current' 字段，不受影响。
+        'sequence': plan['slot'],
         'file': rel,
         'url': url,
         'prompt': plan['prompt'],
@@ -948,6 +1093,9 @@ def _video_info(plan, video_model, status, error=None):
         # 起始锚点帧编号，现在总是等于自身 slot；字段保留供 merge_project_videos 的
         # 锚点一致性核对读取，兼容旧 manifest 里 TBCP v3 Bridge SPAN 的重定向记录。
         'start_anchor_slot': plan.get('start_anchor_slot', plan['slot']),
+        # 结束锚点帧编号：merge_project_videos 读它做合并期的锚点复核。不落盘的话
+        # 那边只能回退成 slot+1，生成期与合并期就会拿两对不同的帧互相核对。
+        'end_anchor_slot': plan.get('end_anchor_slot'),
         'meta': plan.get('meta', ''),
         # 英雄展示视频（默认收尾步骤）：只上传首帧、无独立结束锚点，前端据此选用
         # 不同的槽位标签/文案，merge_project_videos 据此把它当可选附加片段处理。
@@ -957,6 +1105,10 @@ def _video_info(plan, video_model, status, error=None):
         # 是哪一段的系数不对。
         'clip_speed': _clip_speed_from_meta(plan.get('meta', '')),
     }
+    if plan.get('anchor_declaration_mismatch'):
+        # 正文声明与槽位契约不符的留痕：这一段是按契约取帧生成的，文案描述的工序
+        # 可能对不上画面，出问题时得能查到是哪几段。
+        info['anchor_declaration_mismatch'] = plan['anchor_declaration_mismatch']
     if plan.get('pair_contract'):
         info['pair_contract'] = plan['pair_contract']
     if plan.get('split_recommendation'):
@@ -1295,7 +1447,7 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
             if existing_info:
                 info = dict(existing_info)
                 info['slot'] = plan['slot']
-                info['sequence'] = plan['seq']
+                info['sequence'] = plan['slot']
                 info['status'] = 'success'
                 rel, url = _rel_url(plan['dest_path'])
                 info['file'] = rel
@@ -1306,6 +1458,10 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                     info['prompt'] = plan['prompt']
                 if not info.get('start_anchor_slot'):
                     info['start_anchor_slot'] = plan.get('start_anchor_slot', plan['slot'])
+                # 复用的旧条目多半是在 end_anchor_slot 落盘之前写的，这里补齐，
+                # 否则合并期又会回退到 slot+1 去核对。
+                if info.get('end_anchor_slot') is None:
+                    info['end_anchor_slot'] = plan.get('end_anchor_slot')
                 if 'meta' not in info:
                     info['meta'] = plan.get('meta', '')
                 if 'is_hero' not in info:
@@ -2147,11 +2303,13 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
             if v.get('source') in ('manual_upload', 'manual_swap') or v.get('model') == 'manual_upload' or v.get('swapped_from_slot') is not None or v.get('swapped_from_sequence') is not None or v.get('anchor_mismatch_overridden'):
                 good[slot] = abs_path
                 continue
-            # start_anchor_slot 现在总是等于 slot（单一过门拍起止帧绑定和普通拍一样）；
-            # 字段仍保留读取，兼容旧 manifest 里 TBCP v3 Bridge SPAN 的重定向记录。
+            # 锚点编号按槽位契约恒为 slot -> slot+1（见 plan_video_slots）；两个字段
+            # 仍保留读取，一是兼容旧 manifest 里 TBCP v3 Bridge SPAN 的重定向记录，
+            # 二是 end_anchor_slot 在它落盘之前生成的条目里就是缺的，得能回退。
             start_slot = v.get('start_anchor_slot') or slot
+            end_slot = v.get('end_anchor_slot') or (slot + 1)
             start_p = _resolve_frame(frame_by_slot.get(start_slot))
-            end_p = _resolve_frame(frame_by_slot.get(slot + 1))
+            end_p = _resolve_frame(frame_by_slot.get(end_slot))
             # 合并门禁没有请求级 config，strict 开关直接取服务端配置
             ok, reason = verify_video_anchors(abs_path, start_p, end_p, strict=strict_gates_enabled())
             if not ok:

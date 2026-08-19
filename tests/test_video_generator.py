@@ -372,7 +372,8 @@ class TestVideoInfo(unittest.TestCase):
         self.assertEqual(info['status'], 'failed')
         self.assertEqual(info['error'], 'boom')
         self.assertEqual(info['slot'], 2)
-        self.assertEqual(info['sequence'], 1)
+        # sequence 跟 slot 走，不再是批内序号（plan['seq'] 这里是 1）
+        self.assertEqual(info['sequence'], 2)
 
     def test_success_info_has_relative_url(self):
         info = _video_info(self.PLAN, 'veo', status='success')
@@ -1066,6 +1067,141 @@ class TestContinueVideoSequenceManualAndExistingSlots(unittest.TestCase):
         self.assertTrue(plans[0]['delete_existing'])
 
 
+
+class TestDeclaredAnchorExtractionAndPlanning(unittest.TestCase):
+    """测试从视频提示词中智能提取首尾锚点声明，并在槽位规划中正确绑定。"""
+
+    def test_extract_various_declared_anchors(self):
+        from video_generator import extract_declared_frame_anchors
+
+        # 1. 显式双帧描述（Shot B 进场工序）
+        p1 = (
+            "Use the provided first frame and last frame as exact composition anchors. "
+            "Use IMAGE 7 as the actual first-frame image and IMAGE 8 as the actual last-frame image; "
+            "every visible action must interpolate between those two frame images without inventing a third layout."
+        )
+        self.assertEqual(extract_declared_frame_anchors(p1, 6, 7), (7, 8))
+
+        # 2. 箭头格式
+        p2 = "视频 6 [BRIDGE TRANSITION] (Image 7 -> Image 8): worker enters chamber..."
+        self.assertEqual(extract_declared_frame_anchors(p2, 6, 7), (7, 8))
+
+        # 3. 中文格式
+        p3 = "使用图片 7 作为起始帧，图片 8 作为结束帧进行平滑过渡。"
+        self.assertEqual(extract_declared_frame_anchors(p3, 6, 7), (7, 8))
+
+        # 4. 英雄单帧展示
+        p4 = "Use the provided reference image (IMAGE 11) as the sole starting-frame anchor for this clip."
+        self.assertEqual(extract_declared_frame_anchors(p4, 11, None), (11, None))
+
+        # 5. 无显式声明（回退到默认）
+        p5 = "worker paints the floor continuously."
+        self.assertEqual(extract_declared_frame_anchors(p5, 3, 4), (3, 4))
+
+    def _eleven_frames(self, tmp):
+        frames_dir = os.path.join(tmp, 'frames')
+        os.makedirs(frames_dir, exist_ok=True)
+        frames = {}
+        for i in range(1, 12):
+            p = os.path.join(frames_dir, f'img_{i:03d}.webp')
+            with open(p, 'wb') as f:
+                f.write(b'frame')
+            frames[i] = p
+        return frames
+
+    _SHIFTED_SLOTS = {
+        5: {
+            'body': 'starting from the close-up shot of IMAGE 5... reveal ladder (IMAGE 6)',
+            'meta': 'CUT - SHOT A TRANSITION',
+        },
+        6: {
+            # 组稿阶段整段编号滑了一格：视频 6 本该是 IMAGE 6 -> IMAGE 7
+            'body': (
+                'Use the provided first frame and last frame as exact composition anchors. '
+                'Use IMAGE 7 as the actual first-frame image and IMAGE 8 as the actual last-frame image; '
+                'worker climbs down ladder and fastens oak timber panels matching IMAGE 8.'
+            ),
+            'meta': 'SHOT B INTERIOR ENTRY',
+        },
+    }
+
+    def test_slot_contract_wins_over_declared_anchors(self):
+        """正文声明的编号不得改选帧：错位的声明必须被拦下，而不是照着执行。"""
+        tmp = tempfile.mkdtemp()
+        try:
+            videos_dir = os.path.join(tmp, 'videos')
+            os.makedirs(videos_dir)
+            frames = self._eleven_frames(tmp)
+
+            plans = plan_video_slots(dict(self._SHIFTED_SLOTS), frames, {}, videos_dir)
+
+            # slot 5：声明与契约一致，照常生成
+            self.assertEqual(plans[0]['slot'], 5)
+            self.assertEqual(plans[0]['start_anchor_slot'], 5)
+            self.assertEqual(plans[0]['end_anchor_slot'], 6)
+            self.assertIsNone(plans[0]['anchor_declaration_mismatch'])
+            self.assertEqual(plans[0]['action'], 'generate')
+
+            # slot 6：声明 7->8，契约 6->7。锚点仍按契约，且必须拦下来
+            self.assertEqual(plans[1]['slot'], 6)
+            self.assertEqual(plans[1]['start_anchor_slot'], 6)
+            self.assertEqual(plans[1]['end_anchor_slot'], 7)
+            self.assertEqual(plans[1]['start_frame'], frames[6])
+            self.assertEqual(plans[1]['end_frame'], frames[7])
+            self.assertEqual(plans[1]['action'], 'blocked')
+            self.assertIn('编号错位', plans[1]['reason'])
+            self.assertEqual(plans[1]['anchor_declaration_mismatch'], {
+                'declared_start': 7, 'declared_end': 8,
+                'contract_start': 6, 'contract_end': 7,
+            })
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_declared_mismatch_override_generates_by_contract(self):
+        """确认风险强制生成时：仍按契约取帧，只降级成告警，并把不符留痕。"""
+        tmp = tempfile.mkdtemp()
+        try:
+            videos_dir = os.path.join(tmp, 'videos')
+            os.makedirs(videos_dir)
+            frames = self._eleven_frames(tmp)
+
+            plans = plan_video_slots(dict(self._SHIFTED_SLOTS), frames, {}, videos_dir,
+                                      override_flagged=True)
+            slot6 = plans[1]
+            self.assertEqual(slot6['action'], 'generate')
+            self.assertEqual(slot6['start_frame'], frames[6])
+            self.assertEqual(slot6['end_frame'], frames[7])
+            self.assertIn('与槽位契约不符', slot6.get('warning', ''))
+            # 文案改写按声明的编号做，别在提示词里留下裸的 IMAGE 7 / IMAGE 8
+            self.assertIn('IMAGE 1', slot6['prompt'])
+            self.assertIn('IMAGE 2', slot6['prompt'])
+            self.assertNotIn('IMAGE 7', slot6['prompt'])
+            self.assertNotIn('IMAGE 8', slot6['prompt'])
+            # 质检档位关掉时同样只告警不拦
+            off_plans = plan_video_slots(dict(self._SHIFTED_SLOTS), frames, {}, videos_dir,
+                                          gate_level='off')
+            self.assertEqual(off_plans[1]['action'], 'generate')
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_video_info_records_end_anchor_and_slot_sequence(self):
+        """manifest 条目必须带 end_anchor_slot，且 sequence 用 slot 而不是批内序号。"""
+        from video_generator import _video_info
+        plan = {
+            'slot': 7, 'seq': 1, 'prompt': 'x', 'dest_path': os.path.join(os.sep, 'tmp', 'v.mp4'),
+            'start_anchor_slot': 7, 'end_anchor_slot': 8, 'meta': '',
+        }
+        info = _video_info(plan, 'Veo 3.1', status='failed', error='boom')
+        self.assertEqual(info['slot'], 7)
+        self.assertEqual(info['sequence'], 7)          # 不是批内序号 1
+        self.assertEqual(info['start_anchor_slot'], 7)
+        self.assertEqual(info['end_anchor_slot'], 8)
+
+        hero = dict(plan, slot=11, end_anchor_slot=None, meta='HERO REVEAL')
+        self.assertIsNone(_video_info(hero, 'Veo 3.1', status='failed')['end_anchor_slot'])
+
+
 if __name__ == '__main__':
     unittest.main()
+
 

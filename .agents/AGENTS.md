@@ -90,3 +90,16 @@
       - **终帧 (Image T+2 交付成果)**：全域清晰呈现第一道物理工序交付完成的平整状态，为后续木工/地台/软装工序建立物理基底。
       - **音效设计 (ASMR 60%)**：工人靴底踏击钢梯/踩地闷响、空压机运转轰鸣、高压喷枪脉冲喷射声或铁铲清渣碰撞声。
 
+11. **Depth-Layered Spatial Protocol & Anti-Distortion Perspective Lock (五层绝对景深协议与防畸变透视锁 · 彻底终结空间与道具漂移)**:
+    - **五层绝对景深提示词架构 (DLSP 5-Layer Depth Staging)**:
+      - 任何室内或受限空间首帧（IMAGE T+1 / Shot B 室内承接），提示词必须严格按 5 层物理景深编写：
+        1. **机位与视线 (Camera)**: 锁定 `24mm wide-angle interior shot at 1.3m eye-level, wide 3/4 diagonal oblique perspective from near corner`（从角落向对角开阔斜拍），严禁在长条空间使用单点对称正灭点（避免拉伸为 15 米保龄球道/火车车厢）。
+        2. **近景道具锚点 (Layer 1: Immediate Foreground <1m)**: 入口爬梯、门框或立柱必须显式声明为**镜头前 0.5m 近身物**（如 `Overhead in upper-right ceiling (Grid A3), circular submarine hatch with vertical steel ladder descending through immediate right-foreground (Grid A3-C3) flush to floor`），彻底阻断 AI 将爬梯放置到中景或远端后墙的错误。
+        3. **中景开阔通廊 (Layer 2: Midground Staging Floor 1~4m)**: 声明平整开阔的地面主通廊（`expansive, broad floor expanse with weld seams, washed with water caustics, completely open for staging`）。
+        4. **侧翼边界拓扑 (Layer 3: Longitudinal Boundaries)**: 必须逐面声明实壁与虚壁（如 `Left wall: two consecutive widescreen rectangular glass windows; Right wall: solid blue corrugated steel wall, zero windows`），严禁泛指导致 AI 脑补成三面玻璃小水箱。
+        5. **后景收口与面宽 (Layer 4: Far Background Wall & Metric Envelope >4m)**: 声明真实房间公制三维比例（如 `3.8m wide, 5.5m deep, 2.6m ceiling clearance`），后墙封闭收口。
+    - **高危禁忌词与白名单替换 (Banned Perspective Triggers)**:
+      - 严禁使用 `corridor`, `tunnel`, `long axis`, `vanishing point`, `one-point perspective`（防止管道拉伸）。
+      - 严禁泛指 `panoramic windows`（防止三面水箱盒），必须替换为 `two consecutive widescreen windows exclusively on the left wall`。
+    - **负向防畸变词库强注入 (Anti-Distortion Negative Restraints)**:
+      - 在图像与视频提示词中强制注入：`(cramped room, square box room, tiny cubicle, 2m small room, elevator shaft, three-sided glass box, glass back wall, endless narrow tunnel, bowling alley effect, train carriage, ladder placed in background, ladder far away:1.6)`。
