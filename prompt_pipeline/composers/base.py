@@ -246,8 +246,16 @@ Instructions:
         title = state['title']
         beat_ladder = state['beat_ladder']
         packet = state['packet']
-        compiled_images = state['compiled_images']
-        compiled_videos = state['compiled_videos']
+        compiled_images = state.get('compiled_images')
+        if not isinstance(compiled_images, dict):
+            compiled_images = {}
+            state['compiled_images'] = compiled_images
+        compiled_videos = state.get('compiled_videos')
+        if not isinstance(compiled_videos, dict):
+            compiled_videos = {}
+            state['compiled_videos'] = compiled_videos
+        if state.get('image_1_prompt'):
+            compiled_images[1] = state['image_1_prompt']
         brief_fingerprint = state['brief_fingerprint']
 
         mode = parsed_brief.get('mode', 'Standard')

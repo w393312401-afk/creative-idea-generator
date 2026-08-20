@@ -249,15 +249,52 @@ class TestConstructionOrder(unittest.TestCase):
         codes = [v['code'] for v in reverse.validate_beats(doc, _overview(), schema=None)]
         self.assertNotIn('power_chain_broken', codes)
 
-    def test_banned_wiring_fixture_without_rough_in_is_allowed(self):
-        """banned_elements 明确声明无暗管/布线时，灯具安装不误报 power_chain_broken。"""
-        doc = {'video_duration_sec': 10.0, 'banned_elements': ['concealed electrical wiring'], 'beats': [
-            _beat('B01', 0.0, 5.0, stage='surface', events=['E01']),
+    def test_non_electrical_fixtures_without_rough_in_allowed(self):
+        """纯橱柜/水槽/实木门架等非通电设备无需隐蔽布线拍，不误报 power_chain_broken。"""
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [], 'beats': [
+            _beat('B01', 0.0, 5.0, stage='enclosure', events=['E01']),
             _beat('B02', 5.0, 10.0, stage='fixtures', events=['E02'],
-                  frames=['review_003.png'], operation='hanging pendant lights'),
+                  frames=['review_003.png'], operation='cabinetry_and_plumbing_install',
+                  subject='Worker leveling sink base cabinet, installing countertop and ceramic sink',
+                  action='mounts apron sink, solid timber countertop, and hangs solid pine door',
+                  details=['solid pine batten door', 'ceramic apron-front sink', 'timber countertop']),
         ]}
         codes = [v['code'] for v in reverse.validate_beats(doc, _overview(), schema=None)]
         self.assertNotIn('power_chain_broken', codes)
+
+    def test_lantern_and_battery_lighting_without_rough_in_allowed(self):
+        """马灯/燃油灯/电池灯串等独立照明设备无需隐蔽布线拍，不误报 power_chain_broken。"""
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [], 'beats': [
+            _beat('B01', 0.0, 5.0, stage='enclosure', events=['E01']),
+            _beat('B02', 5.0, 10.0, stage='fixtures', events=['E02'],
+                  frames=['review_003.png'], operation='lantern and fairy lights setup',
+                  subject='hanging a metal hurricane lantern and battery-powered micro-LED string lights'),
+        ]}
+        codes = [v['code'] for v in reverse.validate_beats(doc, _overview(), schema=None)]
+        self.assertNotIn('power_chain_broken', codes)
+
+    def test_autofix_power_chain_mechanically_adds_banned_wiring(self):
+        """autofix_beats 面对包含 power_chain_broken 错误的阶梯，机械层自动补齐 banned_elements 并通过校验。"""
+        overview = _overview(('E01', 'E02'))
+        doc = {
+            'video_duration_sec': 10.0,
+            'banned_elements': ['concrete mixer'],
+            'scene_signature': 'rustic cabin',
+            'beats': [
+                _beat('B01', 0.0, 5.0, stage='surface', events=['E01']),
+                _beat('B02', 5.0, 10.0, stage='fixtures', events=['E02'],
+                      frames=['review_003.png'], operation='installing hardwired ceiling downlights and wall sconces'),
+            ]
+        }
+        # 初始有 power_chain_broken
+        violations = reverse.validate_beats(doc, overview)
+        self.assertIn('power_chain_broken', [v['code'] for v in violations])
+
+        # autofix 自动治愈
+        fixed_doc, count = reverse.autofix_beats({}, doc, overview)
+        self.assertGreaterEqual(count, 1)
+        self.assertNotIn('power_chain_broken', [v['code'] for v in fixed_doc.get('validation') or []])
+        self.assertTrue(any('wiring' in x.lower() for x in fixed_doc.get('banned_elements') or []))
 
     def test_multi_space_construction_order_no_false_regression(self):
         """室外完成（surface/fixtures）后进入室内从龙骨/封板开始施工，按空间隔离不误判阶段逆行。"""

@@ -2208,7 +2208,19 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
         aspect_ratio = config.get('imageAspectRatio') or '9:16'
         
         # Extract first (Before) and last (After) image prompts from the build process
-        def _extract_before_after_prompts(block):
+        def _extract_before_after_prompts(block, project_key=None, title=None):
+            # 1. 优先从磁盘上的 manifest.json 读取真实首尾帧提示词（避免前端缓存旧文本）
+            try:
+                mf = read_manifest(project_key or title)
+                if mf and isinstance(mf.get('frames'), list) and len(mf['frames']) >= 2:
+                    first_p = (mf['frames'][0].get('prompt') or '').strip()
+                    last_p = (mf['frames'][-1].get('prompt') or '').strip()
+                    if first_p and last_p:
+                        return first_p, last_p
+            except Exception:
+                pass
+
+            # 2. 从 prompt_block 中解析
             images, _ = _parse_prompt_slots(block)
             if images:
                 keys = sorted(images)
@@ -2219,7 +2231,7 @@ def generate_cover_worker(task_id, config, parent_task_id, title, theme, prompt_
                 return before_body, after_body
             return None, None
         
-        before_prompt, after_prompt = _extract_before_after_prompts(prompt_block)
+        before_prompt, after_prompt = _extract_before_after_prompts(prompt_block, project_key=project_key, title=title)
         if before_prompt and after_prompt:
             visual_context = (
                 f"- BEFORE STATE (Left half of image): A highly realistic, detailed view showing: {before_prompt}\n"
@@ -4662,8 +4674,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 status_group = body.get('status_group')
                 base_dir = os.path.dirname(os.path.abspath(__file__))
                 library_items = read_library() or []
+                to_delete = []
                 with ACTIVE_TASKS_LOCK:
-                    to_delete = []
                     for tid, t in ACTIVE_TASKS.items():
                         if status_group == "completed" and t.get("status") == "completed":
                             to_delete.append(tid)
@@ -4678,7 +4690,34 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 # 逐条显式删除，而不是靠一次全目录扫描"谁不在内存里就删谁"
                 for tid in to_delete:
                     delete_task_files(tid)
-                self._send_json({'status': 'ok', 'count': len(to_delete)})
+
+                deleted_library_ids = []
+                # 清空无封面：同步清空点子库中所有已收藏但无封面的条目
+                if status_group == "no_cover":
+                    for item in library_items:
+                        if isinstance(item, dict) and not library_item_has_cover(item, base_dir=base_dir):
+                            item_id = item.get('id')
+                            if item_id not in (None, ''):
+                                title = item.get('project_key') or item.get('title')
+                                covers = item.get('covers') or []
+                                if title:
+                                    try:
+                                        delete_idea_output_files(title, covers)
+                                    except Exception as e:
+                                        if sys.stdout:
+                                            print(f"[CLEAR] 清理无封面点子产物失败: {e}")
+                                removed = delete_library_item(item_id)
+                                if removed:
+                                    deleted_library_ids.append(item_id)
+
+                total_count = len(to_delete) + len(deleted_library_ids)
+                self._send_json({
+                    'status': 'ok',
+                    'count': total_count,
+                    'deleted_task_count': len(to_delete),
+                    'deleted_library_count': len(deleted_library_ids),
+                    'deleted_library_ids': deleted_library_ids,
+                })
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 

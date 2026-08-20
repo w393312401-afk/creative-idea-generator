@@ -1434,8 +1434,20 @@ def run_compose(state, config, dimensions=None, on_progress=None):
         reference = (None if reverse.is_variant_doc(beats)
                      else reverse.anchor_reference_frame(beats, _load_overview(state)))
         if reference and compose_state.get('image_1_prompt'):
-            compose_state['image_1_prompt'] = reverse.ground_anchor_on_reference(
+            corrected_prompt = reverse.ground_anchor_on_reference(
                 config, compose_state['image_1_prompt'], reference, on_progress=on_progress)
+            compose_state['image_1_prompt'] = corrected_prompt
+            if isinstance(compose_state.get('compiled_images'), dict):
+                compose_state['compiled_images'][1] = corrected_prompt
+            if compose_state.get('packet'):
+                try:
+                    from prompt_pipeline import refine_packet_from_accepted_anchor
+                    compose_state['packet'] = refine_packet_from_accepted_anchor(
+                        config, reference, compose_state['packet'],
+                        parsed_brief=compose_state.get('parsed_brief'))
+                except Exception as exc:
+                    if sys.stdout:
+                        print(f'[REPLICA] 锚点图校准 packet 失败（软退）: {exc}')
         composed = compose_remaining_beats(config, compose_state, on_progress=on_progress)
         # 合成器返回的是整份带标记文档，不是提示词正文——头尾的 TITLE/THEME/AUDIT
         # 必须在落进 state 之前剥掉（见 _prompt_block_only）。激发那条线在
@@ -1666,6 +1678,8 @@ def _library_item(state):
         'video_volume': 0.6,
         'bgm_volume': 0.0,
         'mute_original': False,
+        'allow_text_only_anchor': True,
+        'skip_cover_reference': True,
     }
 
 

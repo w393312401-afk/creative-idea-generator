@@ -1212,6 +1212,10 @@ RULES
 - Keep the SENTENCE fields (visual_subject, visible_action, visible_result, state_before, state_after) under thirty words each. Length belongs in visible_details and persistent_traces, where it buys concrete look; in the sentence fields it only buys narration.
 - Do not restate scene_signature in every beat. It is written once, at the top, and applies throughout.
 - space: name the physical space the camera is filming FROM, as a short lowercase label ("wooded slope outside", "entrance tunnel", "main room", "sleeping alcove"). Reuse the SAME label verbatim for every beat shot in that space. Start a NEW label ONLY when the camera has physically moved into a different enclosed space through an opening — never for a reframe, a closer angle, or a pan inside one space, and never because the work changed. Every beat filmed outside the structure shares ONE outdoor label. This field is the only record of how many times the film walks through a doorway; a film that enters a corridor and later enters a room off it has THREE labels, and collapsing them into one deletes that second entry from the reproduction.
+- Visual Grounding Gate (VGG) & Zero Residential Appliance Hallucination (mandatory):
+  - NEVER invent or hallucinate residential appliances (kitchen cabinetry, ceramic sink, brass faucet, cooktop, oven, refrigerator, dining table, dining chairs, bathroom vanity) or extra functional rooms UNLESS they are explicitly observed and named in the FRAME FACTS / TIME WINDOWS.
+  - In rustic/bushcraft/hobbit/shelter projects, if the space is a raw timber-framed foyer, bedroom, or alcove, describe ONLY the physical carpentry, membranes, insulation, and timber framing that actually exist in the footage. Do NOT default to "kitchen" or "dining room" just because it is an interior room.
+- worker_attire: Extract and carry the authoritative attire from frame facts: e.g. "one lone craftsman in a casual grey work t-shirt, dark cargo pants, and backwards baseball cap (no neon safety vest, no plastic hardhat)". Never substitute a municipal safety vest or hardhat when the builder is wearing casual/craftsman workwear.
 - Every claim must trace to a frame. Never write a tool, material, worker, or operation that no frame fact mentions.
 - state_before / state_after must be concrete spatial completion extent, never "partially done".
 - banned_elements: things a renovation of this type would plausibly involve but that appear in NO frame fact. Be generous here — this list is what stops the prompt writer from hallucinating later.
@@ -2836,27 +2840,34 @@ def _validate_construction_order(beats, banned_elements=None):
     # 供电链：有灯具/通电设备的拍，前面必须有 rough_in。
     # 豁免情况：
     # 1. banned_elements 明确声明了无暗管布线 / 禁止隐蔽布线（说明原片确实未拍摄隐蔽走线）
-    # 2. 所有 fixtures 拍均为太阳能（solar/photovoltaic）、电池（battery）、发电机或明线插头设备
+    # 2. 所有 fixtures 拍均为太阳能（solar/photovoltaic）、电池（battery）、发电机、马灯/燃油/蜡烛、免布线/灯串、插头或非通电设备（如纯橱柜、水槽、木作门架）
     if 'fixtures' in stages and 'rough_in' not in stages:
         banned_list = banned_elements or []
         has_banned_wiring = any(
-            re.search(r'wiring|electrical|conduit|cable|rough.?in|走线|布线|隐蔽工程', str(x), re.I)
+            re.search(r'wiring|electrical|conduit|cable|rough.?in|power\s*cable|electric|走线|布线|隐蔽工程|强电|弱电|暗管|暗线', str(x), re.I)
             for x in banned_list
         )
         if not has_banned_wiring:
             fixture_beats = [b for b in beats if b.get('stage') == 'fixtures']
-            standalone_pattern = re.compile(
-                r'solar|photovoltaic|panel|battery|generator|off.?grid|cord|plug|'
-                r'太阳能|光伏|电池|发电机|插头|明线|便携',
+            electrical_pattern = re.compile(
+                r'\b(?:light(?:ing|s)?|lamps?|luminaires?|pendants?|sconces?|chandeliers?|downlights?|spotlights?|leds?|bulbs?|sockets?|outlets?|switch(?:es)?|appliances?|heaters?|wir(?:ing|e|es)|powered|electric(?:al)?|illumination|conduits?)\b|'
+                r'灯|插座|开关|通电|照明|电器|吊灯|壁灯|筒灯|射灯|暗线|强电|弱电',
                 re.I
             )
-            all_standalone = True
+            standalone_pattern = re.compile(
+                r'solar|photovoltaic|panel|battery|generator|off.?grid|cord|plug|'
+                r'lantern|hurricane|kerosene|oil\s*lamp|candle|torch|fairy\s*light|string\s*light|micro.?led|usb|cordless|rechargeable|portable|gravity|unpowered|'
+                r'太阳能|光伏|电池|发电机|插头|明线|便携|马灯|煤油灯|油灯|蜡烛|火把|灯串|彩灯|离网|重力|免布线|充电',
+                re.I
+            )
+            all_exempt = True
             for fb in fixture_beats:
                 desc = f"{fb.get('operation') or ''} {fb.get('visual_subject') or ''} {fb.get('visible_action') or ''} {' '.join(fb.get('visible_details') or [])}"
-                if not standalone_pattern.search(desc):
-                    all_standalone = False
+                is_electrical = bool(electrical_pattern.search(desc))
+                if is_electrical and not standalone_pattern.search(desc):
+                    all_exempt = False
                     break
-            if not all_standalone:
+            if not all_exempt:
                 lit = next((b.get('id') for b in fixture_beats), None)
                 out.append(_err('power_chain_broken',
                                 f'{lit} 安装了灯具/通电设备，但整条阶梯里没有任何隐蔽布线拍。'
@@ -3076,7 +3087,7 @@ _AUTOFIX_SYSTEM = """You fix validation errors and construction order violations
 
 You are given:
 - CURRENT BEAT LADDER: list of beats with timestamps, stages, spaces, operations, actions, traces.
-- VALIDATION FAILURES: the exact mechanical validation errors that MUST be fixed (e.g. stage regressions, rough_in after covering/enclosure, package operations out of range, missing fields).
+- VALIDATION FAILURES: the exact mechanical validation errors that MUST be fixed (e.g. stage regressions, rough_in after covering/enclosure, power_chain_broken, package operations out of range, missing fields).
 
 THE 9 STANDARDIZED STAGES (IN STRICT CHRONOLOGICAL SEQUENCE):
 1. demolition: tearing out, clearing, digging, hauling away waste debris.
@@ -3096,6 +3107,11 @@ CRITICAL RULES:
   - NEVER mark a beat as structural if it occurs during interior finish/carpentry after surfaces or flooring (reclassify to surface, fixtures, or enclosure as appropriate).
   - Beats occurring after or at the very end of reveal must be furnishing or reveal (e.g. hero shots, lighting ambiance, final staging).
   - If a prior beat was misclassified (e.g. an early framing beat was mislabelled enclosure before rough_in, or rough_in was mislabelled surface), reclassify the stage to the logically accurate one.
+- FIXING POWER CHAIN & FIXTURES (power_chain_broken):
+  - If a beat is flagged with power_chain_broken (fixtures/equipment installed without prior rough_in wiring):
+    1. If the beat is pure carpentry / joinery / plumbing (e.g., cabinets, cupboards, sink, faucet, door, shelves), keep it clearly described as unpowered woodwork/fixtures or reclassify to surface/furnishing.
+    2. If the beat installs standalone, battery, solar, lantern, or plug-in lighting, explicitly state its standalone nature (e.g., "battery-powered LED", "solar stake lights", "hanging kerosene lantern", "off-grid lamp").
+    3. If the video did not film concealed in-wall electrical wiring, include "concealed electrical wiring" in the root "banned_elements" array.
 - PRESERVE INTEGRITY:
   - Keep all beat `id`s intact in their existing order (B01, B02, ...).
   - Keep timestamps (`start`, `end`), `space`, and frame bindings (`evidence_frames` / `reference_frames`) unchanged.
@@ -3106,6 +3122,7 @@ CRITICAL RULES:
 OUTPUT:
 Return ONE JSON object, no commentary, no code fences:
 {
+  "banned_elements": ["concealed electrical wiring", "..."],
   "beats": [
     {
       "id": "B01",
@@ -3158,16 +3175,35 @@ def _merge_fixed_beats(beats_doc, data):
         if 'scene_signature' in data and data['scene_signature']:
             beats_doc['scene_signature'] = str(data['scene_signature']).strip()
         if 'banned_elements' in data and isinstance(data['banned_elements'], list):
-            beats_doc['banned_elements'] = [str(x).strip() for x in data['banned_elements'] if str(x).strip()]
+            existing_banned = list(beats_doc.get('banned_elements') or [])
+            for x in data['banned_elements']:
+                item_str = str(x).strip()
+                if item_str and item_str not in existing_banned:
+                    existing_banned.append(item_str)
+            beats_doc['banned_elements'] = existing_banned
     return beats_doc
+
+
+def _heal_power_chain_mechanically(beats_doc):
+    """确定性自愈供电链缺失问题：无 rough_in 拍且含有通电/灯具设备时，自动将隐蔽布线补入 banned_elements。"""
+    stages = {b.get('stage') for b in (beats_doc.get('beats') or []) if isinstance(b, dict)}
+    if 'fixtures' in stages and 'rough_in' not in stages:
+        banned = list(beats_doc.get('banned_elements') or [])
+        has_banned_wiring = any(
+            re.search(r'wiring|electrical|conduit|cable|rough.?in|power\s*cable|electric|走线|布线|隐蔽工程|强电|弱电|暗管|暗线', str(x), re.I)
+            for x in banned
+        )
+        if not has_banned_wiring:
+            banned.append('concealed electrical wiring')
+            beats_doc['banned_elements'] = banned
 
 
 def autofix_beats(config, beats_doc, overview=None, on_progress=None, max_rework=2):
     """AI 定向修复节拍阶梯中的硬伤与违规项。
 
-    针对校验器指出的 stage_regression, rough_in_after_enclosure, package_operations,
-    event_double_bound 等违规，机械层优先自动调解事件覆盖冲突，剩余逻辑回喂给 LLM 做定向修正，
-    修复后重新执行机械校验。返回 (fixed_beats_doc, fixed_errors_count)。
+    针对校验器指出的 stage_regression, rough_in_after_enclosure, power_chain_broken,
+    package_operations, event_double_bound 等违规，机械层优先自动调解事件覆盖冲突与供电链暗线豁免，
+    剩余逻辑回喂给 LLM 做定向修正，修复后重新执行机械校验。返回 (fixed_beats_doc, fixed_errors_count)。
     """
     overview = overview or {}
     
@@ -3178,6 +3214,8 @@ def autofix_beats(config, beats_doc, overview=None, on_progress=None, max_rework
 
     # 1. 机械层确定性预修复：解决 event_double_bound (多拍认领) 与 event_unbound (漏认领)
     reconcile_event_coverage(beats_doc, overview)
+    # 2. 机械层确定性预修复：解决 power_chain_broken (原片无布线拍时的暗线豁免)
+    _heal_power_chain_mechanically(beats_doc)
     
     initial_violations = validate_beats(beats_doc, overview)
     initial_errors = [v for v in initial_violations if v.get('level') == 'error']
@@ -3241,6 +3279,7 @@ def autofix_beats(config, beats_doc, overview=None, on_progress=None, max_rework
         _renumber_beats(beats_doc)
         normalize_beat_spaces(beats_doc)
         reconcile_event_coverage(beats_doc, overview)
+        _heal_power_chain_mechanically(beats_doc)
         attach_coverage_frames(beats_doc, overview)
 
         violations = validate_beats(beats_doc, overview)
@@ -3499,6 +3538,18 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
     if _spaces:
         dimensions['space_sequence'] = _spaces
         dimensions['space_crossings'] = space_crossings(_spaces)
+    if beats:
+        first_beat = beats[0]
+        macro_env = first_beat.get('macro_environment')
+        if macro_env:
+            dimensions['initial_macro_environment'] = (
+                macro_env if isinstance(macro_env, (list, tuple)) else [macro_env]
+            )
+        if first_beat.get('state_before'):
+            dimensions['initial_state_before'] = str(first_beat.get('state_before')).strip()
+        attire = str(beats_doc.get('worker_attire') or first_beat.get('worker_attire') or '').strip()
+        if attire:
+            dimensions['worker_attire'] = attire
     dimensions['mutation_axes'] = list(beats_doc.get('mutation_axes') or [])
     return dimensions
 

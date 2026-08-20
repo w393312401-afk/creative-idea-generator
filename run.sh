@@ -10,11 +10,11 @@ ALT_PORT=8086
 cd "$(dirname "$0")"
 
 # ─── 定位 Python ───────────────────────────────────────────
-PYTHON_CMD=""
+SYS_PYTHON=""
 if command -v python3 &>/dev/null; then
-    PYTHON_CMD="python3"
+    SYS_PYTHON="python3"
 elif command -v python &>/dev/null; then
-    PYTHON_CMD="python"
+    SYS_PYTHON="python"
 else
     echo ""
     echo "[错误] 找不到 python / python3，Python 可能未安装或未加入 PATH。"
@@ -27,12 +27,22 @@ fi
 # ─── 虚拟环境 (解决 macOS Homebrew PEP 668 限制) ───────────
 # Google FX 运行时与依赖已经内置/统一声明，新的 venv 不再借用系统 site-packages。
 VENV_DIR=".venv"
-if [ ! -d "$VENV_DIR" ]; then
-    echo "[SPARK] 首次运行，正在创建虚拟环境 ($VENV_DIR) ..."
-    $PYTHON_CMD -m venv "$VENV_DIR"
+VENV_PY="$VENV_DIR/bin/python"
+
+if [ ! -d "$VENV_DIR" ] || [ ! -f "$VENV_DIR/pyvenv.cfg" ] || [ ! -f "$VENV_PY" ]; then
+    echo "[SPARK] 正在初始化虚拟环境 ($VENV_DIR) ..."
+    $SYS_PYTHON -m venv "$VENV_DIR"
 fi
-source "$VENV_DIR/bin/activate"
-PYTHON_CMD="python"
+
+if [ -f "$VENV_DIR/bin/activate" ]; then
+    source "$VENV_DIR/bin/activate"
+fi
+
+if [ -x "$VENV_PY" ]; then
+    PYTHON_CMD="$VENV_PY"
+else
+    PYTHON_CMD="$SYS_PYTHON"
+fi
 
 # ─── 工具函数 ─────────────────────────────────────────────
 get_pid_on_ports() {

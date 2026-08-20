@@ -5478,6 +5478,44 @@ def _canonical_anchor_clause(landmarks):
     return "Locked anchors: " + "; ".join(parts) + "."
 
 
+def _adapt_landmarks_to_completed_surfaces(landmarks, body):
+    """Adapt initial trauma landmarks to reflect completed construction layers
+    (e.g., avoid forcing 'bare soil floor' when 'wood floor' has been laid)."""
+    if not landmarks or not body:
+        return landmarks
+    low = body.lower()
+    adapted = []
+    for lm in landmarks:
+        if not isinstance(lm, dict):
+            adapted.append(lm)
+            continue
+        new_lm = dict(lm)
+        name = str(lm.get('name', '')).strip()
+        name_low = name.lower()
+
+        # Floor / Subgrade adaptation:
+        if any(w in name_low for w in ('soil floor', 'dirt floor', 'earthen floor', 'bare subgrade', 'floor subgrade', 'unfloored')):
+            if any(f in low for f in ('wood floor', 'timber floor', 'planked floor', 'floorboards', 'installed wood floor', 'hardwood floor', 'decking', 'finished floor', 'flooring')):
+                new_lm['name'] = 'the installed timber plank floor'
+            elif any(f in low for f in ('vapor barrier', 'vapour barrier', 'polyethylene membrane', 'floor membrane', 'joist')):
+                new_lm['name'] = 'the floor membrane and framing base'
+
+        # Ceiling / Roof / Vault adaptation:
+        if any(w in name_low for w in ('raw cob', 'bare cob', 'monolithic straw-clay', 'unfinished ceiling', 'straw-clay cob dome ceiling', 'exposed earthen ceiling')):
+            if any(c in low for c in ('pine staves', 'tongue-and-groove pine', 'paneled ceiling', 'clad ceiling', 'timber cladding', 'wood ceiling', 'ceiling staves')):
+                new_lm['name'] = 'the clad timber dome ceiling'
+            elif any(c in low for c in ('insulation', 'arch ribs', 'timber arch ribs', 'radial timber')):
+                new_lm['name'] = 'the insulated radial timber rib ceiling structure'
+
+        # Window / Aperture adaptation:
+        if any(w in name_low for w in ('unglazed', 'window aperture reveal', 'porthole reveal', 'raw window hole', 'unframed window')):
+            if any(win in low for win in ('glazed window', 'casement window', 'divided-lite', 'fitted window', 'installed window', 'window frame')):
+                new_lm['name'] = 'the fitted circular divided-lite window'
+
+        adapted.append(new_lm)
+    return adapted
+
+
 def fix_primary_landmarks(prompt, packet, family='exterior'):
     """Deterministically canonicalize the Locked-anchors stanza for the beat's shot family.
 
@@ -5516,6 +5554,9 @@ def fix_primary_landmarks(prompt, packet, family='exterior'):
     stanza_present = any(_LOCKED_ANCHOR_STANZA_PATTERN.match(s) for s in sentences)
     body = " ".join(s for s in sentences if not _LOCKED_ANCHOR_STANZA_PATTERN.match(s)).strip() \
         if stanza_present else prompt
+
+    # 动态演进地标：若当前正文已完成地板/木顶，地标不可回退至原始裸土/破损态
+    landmarks = _adapt_landmarks_to_completed_surfaces(landmarks, body)
 
     low = body.lower()
     missing = False
@@ -9044,6 +9085,25 @@ Required JSON keys:
 - Creativity Scale: {creativity}
 - Pacing Skeleton Reference: {pacing_skeleton_id} ({pacing_skeleton['label_zh']}) — {pacing_skeleton['summary']}
 """
+    if dimensions.get('scene_signature'):
+        brief_user += f"- Scene Signature: {dimensions['scene_signature']}\n"
+    if dimensions.get('worker_attire'):
+        brief_user += f"- Authoritative Builder / Worker Attire: {dimensions['worker_attire']}\n"
+    if dimensions.get('initial_macro_environment'):
+        macro_env_str = '; '.join(str(x).strip() for x in dimensions['initial_macro_environment'] if str(x).strip())
+        if macro_env_str:
+            brief_user += f"- Initial Site Macro Environment & Biome (authoritative starting reality): {macro_env_str}\n"
+    if dimensions.get('initial_state_before'):
+        brief_user += f"- Initial Starting State: {dimensions['initial_state_before']}\n"
+    if dimensions.get('scene_constants'):
+        try:
+            from prompt_pipeline import reverse as _pp_rev
+            const_lines = _pp_rev.scene_constants_lines(dimensions['scene_constants'])
+            if const_lines:
+                brief_user += f"- Observed Scene Constants: {'; '.join(const_lines)}\n"
+        except Exception:
+            pass
+
     
     _brief_fallback = {
         "carrier": theme,
@@ -9068,6 +9128,8 @@ Required JSON keys:
             brief_text = _chat(config, brief_system, brief_user, temperature=0.2, timeout=60)
             brief_text_cleaned = _strip_code_fences(brief_text)
             parsed_brief = json.loads(brief_text_cleaned)
+            if dimensions.get('worker_attire') and not parsed_brief.get('worker_attire'):
+                parsed_brief['worker_attire'] = dimensions['worker_attire']
             required_keys = ["carrier", "env", "trauma", "destiny", "reward", "mode", "space_type"]
             if all(k in parsed_brief for k in required_keys):
                 break
@@ -10164,6 +10226,7 @@ Required JSON keys:
 4. "frame_boundaries": A JSON object with keys "left", "right", "top", "bottom", specifying Grid coordinates and physical features for each edge.
 5. "object_ledger": A list of detail-critical recurring objects. Each must be a JSON object with "name", "material_color", "initial_state", "grid", and "z_depth_scale". Provide a comprehensive list of all detail-critical objects with no hard limit. Prefer the real-world materials listed in REAL-WORLD MATERIALS REFERENCE below over generic placeholders when they fit the scene.
 6. "worker_choreography": The worker trajectory, silhouette (HAL), and manual tool lock (MTAL) details.
+   - THEME-ADAPTIVE ATTIRE RULE (mandatory): For rustic, natural, bushcraft, hobbit, woodland, cabin, or DIY builds, describe a rugged craftsman in realistic casual workwear: "one lone craftsman in a solid neutral/earth-tone work t-shirt, dark cargo work pants, durable work boots, and dark baseball cap or bareheaded (no neon safety vest, no plastic construction hardhat:1.4)". Only for heavy municipal/industrial construction use standard safety vest & hardhat. If Scene Variables specifies "worker_attire", use it verbatim.
 7. "worker_scale_percent": The worker's standing-height frame-height percentage for this shot family's camera_dna (e.g. "18%"), sized realistically using an average adult standing height (~1.7m) measured against this carrier's real-world dimensions and the declared primary_landmarks scales — never invented independent of them. This keeps the worker from being drawn towering over the carrier or shrinking to an unreadable speck across different beats.
 8. "lighting_phase_ladder": A mapping of IMAGE indices (1 to {total_beats + 1}) to lighting phases (e.g. "ambient only", "temporary work light active", etc.). Shadow and exposure progression must be monotonic.
 9. "passive_environment": Direction and elements for passive layers (e.g. clouds, watercaustics).
@@ -10211,6 +10274,7 @@ Beat Ladder:
                 if sys.stdout:
                     print(f"[DEBUG] Drift lock packet generation attempt {attempt+1} failed: {e}")
                 if attempt == 2:
+                    _default_worker_attire = str(parsed_brief.get('worker_attire') or "one lone craftsman in a solid neutral work t-shirt, dark cargo trousers, and boots")
                     packet = {
                         "camera_dna": f"static tripod shot, ultra-wide 14mm lens feel, camera height 1.6m, locked eye-level perspective; horizon line remains level at 50-percent height; optical flow radiates from B2.",
                         "geometry_lock": "Standard boundaries",
@@ -10221,7 +10285,7 @@ Beat Ladder:
                         ],
                         "frame_boundaries": {"left": "B1", "right": "B3", "top": "A2", "bottom": "C2"},
                         "object_ledger": [],
-                        "worker_choreography": "HAL safety vest worker",
+                        "worker_choreography": _default_worker_attire,
                         "worker_scale_percent": "18%",
                         "lighting_phase_ladder": {str(i): "ambient only" for i in range(1, total_beats + 2)},
                         "passive_environment": "soft light drift",

@@ -2168,7 +2168,7 @@ def _cover_candidate_path(raw):
     root = os.path.dirname(os.path.abspath(__file__))
     outputs_dir = os.path.abspath(OUTPUT_ROOT if os.path.isabs(OUTPUT_ROOT) else os.path.join(root, OUTPUT_ROOT))
     clean_rel = rel.lstrip('/\\')
-    if re.match(r'^[a-zA-Z]:[/\\]', rel) or rel.startswith('\\\\'):
+    if os.path.isabs(rel) or re.match(r'^[a-zA-Z]:[/\\]', rel) or rel.startswith('\\\\'):
         candidate = os.path.abspath(rel)
     elif clean_rel == 'outputs' or clean_rel.startswith('outputs/') or clean_rel.startswith('outputs\\'):
         sub_rel = clean_rel[7:].lstrip('/\\')
@@ -4832,6 +4832,46 @@ def task_has_cover(task, base_dir=None, library_items=None):
                 return True
         except Exception:
             pass
+
+    return False
+
+
+def library_item_has_cover(item, base_dir=None):
+    """判断一条点子库条目是否拥有关联的封面图片。
+
+    检测来源：
+    1. item_project_cover(item) (coverRoles.project / activeCoverUrl / covers 首图)
+    2. item 字典中的 cover / activeCoverUrl / cover_image / active_cover 字段
+    3. covers 列表非空
+    4. outputs/ 本地磁盘项目资产 (_proj_asset_stats / manifest 登记)
+    """
+    if not isinstance(item, dict):
+        return False
+
+    cov = item_project_cover(item)
+    if cov and str(cov).strip():
+        return True
+
+    for key in ('cover', 'activeCoverUrl', 'cover_image', 'active_cover'):
+        val = item.get(key)
+        if val and str(val).strip():
+            return True
+
+    covers = item.get('covers')
+    if isinstance(covers, list) and any(bool(c and str(c).strip()) for c in covers):
+        return True
+
+    # 检查 outputs/ 磁盘资产
+    if base_dir:
+        project_key = item.get('project_key') or ''
+        title = item.get('title') or ''
+        if project_key or title:
+            try:
+                stats = _proj_asset_stats(project_key, title, base_dir)
+                if stats and stats.get('cover'):
+                    return True
+            except Exception:
+                pass
 
     return False
 

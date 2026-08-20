@@ -1578,7 +1578,7 @@ async function clearTasks(statusGroup) {
     } else if (statusGroup === "failed_cancelled") {
         msg = `确定要清空所有【已失败】和【已取消】的任务记录吗${countHint}？`;
     } else if (statusGroup === "no_cover") {
-        msg = `确定要清空所有【无封面】的任务记录吗${countHint}？（仅清理历史记录，不影响已收藏的创意与磁盘素材）`;
+        msg = `确定要清空所有【无封面】的项目吗${countHint}？（将同时清除无封面项目的生成任务记录与点子库收藏，包括已收藏但无封面的项目）`;
     }
     
     const confirmed = await customConfirm(msg);
@@ -1592,7 +1592,28 @@ async function clearTasks(statusGroup) {
         });
         if (response.ok) {
             const data = await response.json();
-            showToast(`清空成功，共删除 ${data.count} 条记录`, "success");
+            const libCount = data.deleted_library_count || 0;
+            let toastMsg = `清空成功，共删除 ${data.count} 项`;
+            if (libCount > 0) {
+                toastMsg = `清空成功，共删除 ${data.count} 项（含 ${libCount} 个已收藏创意）`;
+            }
+            showToast(toastMsg, "success");
+
+            // 同步清理已收藏条目的前端缓存与持久化
+            if (Array.isArray(data.deleted_library_ids) && data.deleted_library_ids.length > 0) {
+                const deletedSet = new Set(data.deleted_library_ids);
+                if (typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
+                    savedIdeas = savedIdeas.filter(item => !deletedSet.has(item.id));
+                    try {
+                        localStorage.setItem('spark_library', JSON.stringify(savedIdeas));
+                    } catch (e) {
+                        console.warn('[library] localStorage 镜像写入失败', e);
+                    }
+                }
+                if (typeof updateFavoriteButtonState === 'function') {
+                    updateFavoriteButtonState();
+                }
+            }
             
             // If the currently viewed task was deleted, reset the active task ID
             const activeTaskId = localStorage.getItem('spark_active_task_id');

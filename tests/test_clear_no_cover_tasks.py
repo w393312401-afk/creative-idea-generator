@@ -66,9 +66,57 @@ def test_task_has_cover_detection():
     assert server_common.task_has_cover(task_pk, base_dir='/tmp', library_items=lib_pk) is True
 
 
+def test_library_item_has_cover_detection(monkeypatch):
+    # 1. 无封面条目
+    item_no_cover = {
+        'id': 'lib_1',
+        'title': '无封面收藏',
+        'covers': [],
+    }
+    assert server_common.library_item_has_cover(item_no_cover, base_dir='/tmp') is False
+
+    # 2. 带 covers 数组
+    item_with_covers = {
+        'id': 'lib_2',
+        'title': '带封面数组收藏',
+        'covers': ['/outputs/test/cover_1.webp'],
+    }
+    assert server_common.library_item_has_cover(item_with_covers, base_dir='/tmp') is True
+
+    # 3. 带 activeCoverUrl
+    item_with_active_cover = {
+        'id': 'lib_3',
+        'title': '主封面收藏',
+        'activeCoverUrl': '/outputs/test/main_cover.webp',
+    }
+    assert server_common.library_item_has_cover(item_with_active_cover, base_dir='/tmp') is True
+
+    # 4. 带 coverRoles.project
+    item_with_roles = {
+        'id': 'lib_4',
+        'title': '角色封面收藏',
+        'coverRoles': {'project': '/outputs/test/project_cover.webp'},
+    }
+    assert server_common.library_item_has_cover(item_with_roles, base_dir='/tmp') is True
+
+    # 5. 磁盘资产中包含封面
+    monkeypatch.setattr(server_common, '_proj_asset_stats', lambda pk, title, bdir: {'cover': '/outputs/disk/cover.webp'})
+    item_with_disk_cover = {
+        'id': 'lib_5',
+        'project_key': 'pk_disk',
+        'title': '磁盘封面收藏',
+    }
+    assert server_common.library_item_has_cover(item_with_disk_cover, base_dir='/tmp') is True
+
+
 def test_clear_no_cover_tasks_endpoint(monkeypatch, tmp_path):
-    deleted_files = []
-    monkeypatch.setattr(server, 'delete_task_files', lambda tid: deleted_files.append(tid))
+    deleted_task_files = []
+    deleted_library_items = []
+    deleted_output_titles = []
+
+    monkeypatch.setattr(server, 'delete_task_files', lambda tid: deleted_task_files.append(tid))
+    monkeypatch.setattr(server, 'delete_library_item', lambda iid: deleted_library_items.append(iid) or True)
+    monkeypatch.setattr(server, 'delete_idea_output_files', lambda t, c=None: deleted_output_titles.append(t))
 
     # 模拟 ACTIVE_TASKS
     tasks = {
@@ -102,8 +150,29 @@ def test_clear_no_cover_tasks_endpoint(monkeypatch, tmp_path):
         },
     }
 
+    # 模拟 library_items（包含有封面和无封面的收藏条目）
+    lib_items = [
+        {
+            'id': 'lib_no_cover_1',
+            'project_key': 'pk_no_cov_1',
+            'title': '已收藏无封面1',
+            'covers': [],
+        },
+        {
+            'id': 'lib_no_cover_2',
+            'project_key': 'pk_no_cov_2',
+            'title': '已收藏无封面2',
+        },
+        {
+            'id': 'lib_with_cover',
+            'project_key': 'pk_with_cov',
+            'title': '已收藏有封面',
+            'covers': ['/outputs/pk_with_cov/cover_0.webp'],
+        },
+    ]
+
     monkeypatch.setattr(server, 'ACTIVE_TASKS', tasks)
-    monkeypatch.setattr(server_common, 'read_library', lambda *a, **k: [])
+    monkeypatch.setattr(server, 'read_library', lambda *a, **k: lib_items)
 
     # 构造请求 handler
     h = object.__new__(server.SparkRequestHandler)
@@ -118,7 +187,11 @@ def test_clear_no_cover_tasks_endpoint(monkeypatch, tmp_path):
     body, status = sent[0]
     assert status == 200
     assert body['status'] == 'ok'
-    assert body['count'] == 2
+    # 2 个任务 + 2 个收藏 = 4 项
+    assert body['count'] == 4
+    assert body['deleted_task_count'] == 2
+    assert body['deleted_library_count'] == 2
+    assert set(body['deleted_library_ids']) == {'lib_no_cover_1', 'lib_no_cover_2'}
 
     # 验证只有 t_no_cover_completed 和 t_no_cover_failed 被删除
     assert 't_no_cover_completed' not in tasks
@@ -126,7 +199,9 @@ def test_clear_no_cover_tasks_endpoint(monkeypatch, tmp_path):
     assert 't_running' in tasks  # 运行中的任务不应被清空
     assert 't_with_cover' in tasks  # 有封面的任务不应被清空
 
-    assert set(deleted_files) == {'t_no_cover_completed', 't_no_cover_failed'}
+    assert set(deleted_task_files) == {'t_no_cover_completed', 't_no_cover_failed'}
+    assert set(deleted_library_items) == {'lib_no_cover_1', 'lib_no_cover_2'}
+    assert set(deleted_output_titles) == {'pk_no_cov_1', 'pk_no_cov_2'}
 
 
 def test_tasks_bulk_delete_and_safety(monkeypatch):
