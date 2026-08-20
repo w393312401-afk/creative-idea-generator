@@ -93,7 +93,7 @@
         "macro_environment": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 },
-          "description": "这一拍所处的大环境与地貌水体、气候光照、空间包络与周边宏观环境识别特征。"
+          "description": "这一拍所处的大环境与地貌水体、气候光照、空间包络与周边宏观环境识别特征。规则：仅在第一拍（锚点首帧）与过门拍/换空间首拍（新空间承接帧）填写，中间普通工序拍保持留空以减少对大模型提示词的上下文干扰。"
         },
         "visual_subject": { "type": "string", "minLength": 1 },
         "visible_details": {

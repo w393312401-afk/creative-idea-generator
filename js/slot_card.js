@@ -103,7 +103,7 @@ function renderSlotCard(cardEl, state) {
     }
     // 多选勾选框：等待中的格子还没有内容可操作，不给选
     if (state.kind !== 'pending') {
-        body += `<label class="slot-select" title="选中这一拍，用于批量重试/删除">`
+        body += `<label class="slot-select" title="选中这一拍，用于批量重试/删除（支持鼠标拖拽框选，按住 Shift 累加选/连选）">`
             + `<input type="checkbox" class="slot-select-box"></label>`;
     }
     cardEl.innerHTML = body;

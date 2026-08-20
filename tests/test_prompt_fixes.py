@@ -77,10 +77,11 @@ class TestPromptFixes(unittest.TestCase):
         self.assertIn("equipment", cleaned.lower())
         self.assertIn("installation", cleaned.lower())
 
-        # Test negative sentence with worker remains untouched
-        prompt_negative = "No workers are present in this view."
+        # Test negative sentence with worker is stripped of worker tokens to prevent diffusion hallucinations
+        prompt_negative = "The room is clean with no workers present."
         cleaned_negative = fix_image_clean_frame_proactive(prompt_negative)
-        self.assertEqual(cleaned_negative, prompt_negative)
+        self.assertNotIn("worker", cleaned_negative.lower())
+        self.assertIn("clean", cleaned_negative.lower())
 
         # Test sweep replacement
         prompt_sweep = "The person is sweeping the floor."

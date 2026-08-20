@@ -1409,6 +1409,20 @@ def run_compose(state, config, dimensions=None, on_progress=None):
             f'节拍阶梯还有 {len(errors)} 项硬伤未处理，先在审核卡点上修掉再合成：'
             + '；'.join(v['message'] for v in errors[:3]))
 
+    # 快速通道：若当前已有提示词包且已无任何禁用元素违规（如修了分词误判，或用户在阶梯中
+    # 删除了禁用词），直接复核通过并落库，免去数分钟昂贵的大模型重复生成。
+    current_prompt_block = state.get('prompt_block')
+    banned = (beats or {}).get('banned_elements') or []
+    if current_prompt_block:
+        current_hits = reverse.banned_element_hits(current_prompt_block, banned)
+        if not current_hits:
+            if on_progress:
+                on_progress('replica_stage', {
+                    'stage': 'audit',
+                    'message': '现有提示词已完全符合禁用元素门禁要求，正在写入创意库…',
+                })
+            return run_audit(state, on_progress=on_progress)
+
     state['stage'] = 'compose'
     _save_state(state)
 
@@ -1418,6 +1432,27 @@ def run_compose(state, config, dimensions=None, on_progress=None):
             'stage': 'compose',
             'message': f'正在按 {len(beats.get("beats") or [])} 拍阶梯合成提示词（拍数已锁死）…',
         })
+
+    # 若磁盘上已有本任务的 Phase 1 产物（packet / brief / ladder），预填进断点续传存档，
+    # 避免重跑时重新解析 Brief 和规划工序（省时且省模型 token）。
+    cached_compose_state = load_compose_state(state.get('job_id'))
+    if cached_compose_state and cached_compose_state.get('packet') and cached_compose_state.get('beat_ladder'):
+        try:
+            from prompt_pipeline import get_brief_fingerprint, save_compose_checkpoint, active_skill_profile
+            fp = get_brief_fingerprint(dims, active_skill_profile(config))
+            save_compose_checkpoint(fp, {
+                'theme': dims.get('theme', ''),
+                'total_beats': len(beats.get('beats') or []),
+                'parsed_brief': cached_compose_state.get('parsed_brief') or {},
+                'title': cached_compose_state.get('title') or state.get('title') or '',
+                'beat_ladder': cached_compose_state.get('beat_ladder'),
+                'packet': cached_compose_state.get('packet'),
+                'image_1_prompt': cached_compose_state.get('image_1_prompt') or '',
+                'compiled_images': cached_compose_state.get('compiled_images') or {},
+                'compiled_videos': cached_compose_state.get('compiled_videos') or {},
+            })
+        except Exception:
+            pass
 
     try:
         try:
@@ -1973,6 +2008,18 @@ def get_replica_status(job_id):
     # 卡点上显示的必须是当前校验器的结论，否则用户对着一份旧版留下的红字找不存在的硬伤
     # （2026-08-12 的变体阶梯就是这样：24 项「缺少 evidence_frames」全是过期结论）。
     _revalidate(state, persist=False)
+
+    # 自动自愈：若任务停在 audit_failed，但当前提示词在最新门禁规则下已无禁用词违规，自动恢复到 completed 并落库
+    if state.get('stage') == 'audit_failed' and state.get('prompt_block'):
+        from prompt_pipeline import reverse
+        banned = (state.get('beats') or {}).get('banned_elements') or []
+        hits = reverse.banned_element_hits(state.get('prompt_block'), banned)
+        state['banned_hits'] = hits
+        if not hits:
+            state['stage'] = 'completed'
+            _publish_to_library(state)
+            _save_state(state)
+
     state['frame_urls'] = frame_urls(state)
     state['stage_label'] = stage_label(state.get('stage'))
     state['phase'] = phase_of(state.get('stage'))

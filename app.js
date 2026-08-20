@@ -2842,6 +2842,9 @@ async function deleteFromLibrary(id) {
 
 function loadSavedIdea(idea, options = {}) {
     currentIdea = idea;
+    if (currentIdea && typeof isCandidateSelectionMode === 'function') {
+        currentIdea.generation_mode = isCandidateSelectionMode() ? 'candidate_selection' : 'standard';
+    }
     saveCurrentIdeaState();
     renderIdea(idea);
 
@@ -4425,9 +4428,13 @@ function initPipelineBar() {
                 config.candidateSelectionMode = checked;
                 config.candidateSelection = checked;
                 config.generation_mode = checked ? 'candidate_selection' : 'standard';
+                try {
+                    localStorage.setItem('spark_config', JSON.stringify(config));
+                } catch (e) {}
             }
             if (typeof currentIdea !== 'undefined' && currentIdea) {
                 currentIdea.generation_mode = checked ? 'candidate_selection' : 'standard';
+                if (typeof saveCurrentIdeaState === 'function') saveCurrentIdeaState();
             }
             if (toggleLabel) {
                 toggleLabel.classList.toggle('is-active', checked);

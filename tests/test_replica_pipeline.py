@@ -399,6 +399,42 @@ class TestComposeGate(ReplicaTempRootCase):
             rp.handoff_to_render(state['job_id'])
         self.assertIn('excavator', str(ctx.exception))
 
+    def test_recompose_fast_path_when_existing_prompt_is_clean(self):
+        """当已有 prompt_block 且已无禁用词违规时，重新合成走极速通道，不调用大模型。"""
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': ['oven']}
+        state['prompt_block'] = 'VIDEO 1: a worker carries woven baskets into the room'
+        state['stage'] = 'audit_failed'
+        state['validation'] = []
+        rp._save_state(state)
+
+        with patch('prompt_pipeline.compose_anchor_and_packet') as mock_anchor, \
+             patch('prompt_pipeline.compose_remaining_beats') as mock_beats, \
+             patch('server_common.write_library_item') as mock_write:
+            out = rp.run_compose(state, {})
+            mock_anchor.assert_not_called()
+            mock_beats.assert_not_called()
+            mock_write.assert_called_once()
+            self.assertEqual(out['stage'], 'completed')
+            self.assertEqual(out['banned_hits'], [])
+
+    def test_get_replica_status_auto_heals_audit_failed_when_clean(self):
+        """读取任务状态时，若已无违规，自动自愈 audit_failed 状态为 completed 并落库。"""
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': ['oven']}
+        state['prompt_block'] = 'VIDEO 1: a worker places woven mats on the floor'
+        state['stage'] = 'audit_failed'
+        state['banned_hits'] = ['oven']
+        state['validation'] = []
+        rp._save_state(state)
+
+        with patch('server_common.write_library_item') as mock_write:
+            out = rp.get_replica_status(state['job_id'])
+            self.assertEqual(out['stage'], 'completed')
+            self.assertEqual(out['banned_hits'], [])
+            mock_write.assert_called_once()
+
+
 
 class TestComposedBlockHasNoDocumentWrapper(ReplicaTempRootCase):
     """合成器返回的是一份**带标记的文档**，不是提示词正文。

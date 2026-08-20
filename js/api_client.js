@@ -1543,15 +1543,25 @@ async function fixFrameIssue(seq, manualReason) {
     let disconnected = false;
 
     try {
+        const isCand = (typeof isCandidateSelectionMode === 'function')
+            ? isCandidateSelectionMode()
+            : false;
         const response = await fetch('/api/fix_frame_issue', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                config,
+                config: Object.assign({}, config, {
+                    candidateSelectionMode: isCand,
+                    candidateSelection: isCand,
+                    generation_mode: isCand ? 'candidate_selection' : 'standard',
+                }),
                 title: getIdeaSaveTitle(ownerIdea),
                 display_title: ownerIdea.title,
                 prompt_block: ownerIdea.prompt_block,
                 sequence: seq,
+                generation_mode: isCand ? 'candidate_selection' : 'standard',
+                candidate_selection: isCand,
+                candidate_count: isCand ? 4 : 1,
                 manual_reason: (manualReason || '').trim() || undefined
             }),
             signal: controller.signal
@@ -1578,7 +1588,7 @@ async function fixFrameIssue(seq, manualReason) {
                 } else if (type === 'frame_issue_fix_start') {
                     feedLine(`🔧 ${(evData && evData.message) || `正在优化 IMG ${String(seq).padStart(3, '0')} 的提示词…`}`);
                 } else if (type === 'frame_issue_fix_render' || type === 'frame_start') {
-                    feedLine(`🎨 ${(evData && evData.message) || `正在以 4选1 模式重渲 IMG ${String(seq).padStart(3, '0')}…`}`);
+                    feedLine(`🎨 ${(evData && evData.message) || (isCand ? `正在以 4选1 模式重渲 IMG ${String(seq).padStart(3, '0')}…` : `正在重渲 IMG ${String(seq).padStart(3, '0')}…`)}`);
                 } else if (type === 'candidate_generating') {
                     feedLine(`🎨 ${(evData && evData.message) || `IMG ${String(seq).padStart(3, '0')} 正在生成候选图 #${(evData && evData.candidate_index) || 1}/4…`}`);
                 } else if (type === 'candidate_batch_ready') {

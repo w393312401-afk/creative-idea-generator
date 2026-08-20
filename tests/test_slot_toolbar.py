@@ -479,3 +479,65 @@ class TestRetryDirty:
         page.wait_for_function("() => window.__retried.length === 2", timeout=5000)
         assert page.evaluate("() => window.__retried") == [2, 4]
 
+
+class TestMarqueeSelection:
+    def test_marquee_box_selects_intersected_cards(self, page):
+        """按住 Shift 框选或从网格间隙拖拽，应选中框内卡片并同步工具条。"""
+        # 获取第 1 张和第 2 张卡片的位置
+        box1 = page.eval_on_selector("#frame-slot-1", "el => { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; }")
+        box2 = page.eval_on_selector("#frame-slot-2", "el => { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; }")
+
+        # 按住 Shift 从卡片 1 拖拽到卡片 2
+        page.keyboard.down("Shift")
+        page.mouse.move(box1["x"] + 5, box1["y"] + 5)
+        page.mouse.down()
+        page.mouse.move(box2["x"] + box2["w"] - 5, box2["y"] + box2["h"] - 5)
+        page.mouse.up()
+        page.keyboard.up("Shift")
+
+        selected = page.evaluate("() => Array.from(slotToolbarState.image.selected).sort((a, b) => a - b)")
+        assert 1 in selected and 2 in selected, "框选应包含槽位 1 和 2: %s" % selected
+        assert page.eval_on_selector("#frame-slot-1", "el => el.classList.contains('is-selected')")
+        assert page.eval_on_selector("#frame-slot-2", "el => el.classList.contains('is-selected')")
+
+    def test_shift_drag_adds_to_existing_selection(self, page):
+        """按住 Shift 框选可在已有选择基础上累加。"""
+        # 先选第 1 拍
+        page.eval_on_selector("#frame-slot-1 .slot-select-box", "el => el.click()")
+        assert page.evaluate("() => Array.from(slotToolbarState.image.selected)") == [1]
+
+        # 按住 Shift 框选第 3 拍
+        box3 = page.eval_on_selector("#frame-slot-3", "el => { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; }")
+        page.keyboard.down("Shift")
+        page.mouse.move(box3["x"] + 5, box3["y"] + 5)
+        page.mouse.down()
+        page.mouse.move(box3["x"] + box3["w"] - 5, box3["y"] + box3["h"] - 5)
+        page.mouse.up()
+        page.keyboard.up("Shift")
+
+        selected = page.evaluate("() => Array.from(slotToolbarState.image.selected).sort((a, b) => a - b)")
+        assert selected == [1, 3]
+
+    def test_click_empty_space_clears_selection(self, page):
+        """在网格空白区域单击应清空选中状态。"""
+        page.eval_on_selector("#frame-slot-1 .slot-select-box", "el => el.click()")
+        page.eval_on_selector("#frame-slot-2 .slot-select-box", "el => el.click()")
+        assert page.evaluate("() => slotToolbarState.image.selected.size") == 2
+
+        # 点击网格空白区域
+        page.eval_on_selector("#frames-grid", "el => el.dispatchEvent(new MouseEvent('click', { bubbles: true }))")
+        assert page.evaluate("() => slotToolbarState.image.selected.size") == 0
+
+    def test_shift_click_checkbox_selects_range(self, page):
+        """Shift + 点击勾选框支持区间连选。"""
+        # 先点第 2 拍
+        page.eval_on_selector("#frame-slot-2 .slot-select-box", "el => el.click()")
+        assert page.evaluate("() => Array.from(slotToolbarState.image.selected)") == [2]
+
+        # Shift + 点击第 5 拍勾选框
+        page.click("#frame-slot-5 .slot-select-box", modifiers=["Shift"])
+
+        selected = page.evaluate("() => Array.from(slotToolbarState.image.selected).sort((a, b) => a - b)")
+        assert selected == [2, 3, 4, 5]
+
+

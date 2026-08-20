@@ -1007,7 +1007,8 @@ class TestFixFrameIssue(_TmpProjectCase):
             result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
 
         mock_fix.assert_called_once_with({}, 'video one', 'second frame', ['天花板未随墙面一起封板'],
-                                         video_meta='')
+                                         video_meta='', preceding_image_prompt='first frame',
+                                         succeeding_image_prompt='third frame', succeeding_video_prompt='video two')
         self.assertEqual(render_calls, [[2]])  # 只重渲第 2 帧（4选1候选优选）
         self.assertIn('fixed image 2', result['prompt_block'])
         self.assertIn('fixed video 1', result['prompt_block'])
@@ -1029,9 +1030,10 @@ class TestFixFrameIssue(_TmpProjectCase):
              patch.object(csp, 'run_candidate_selection_frame_sequence', side_effect=fake_render):
             result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 1)
 
-        mock_fix.assert_called_once_with({}, 'first frame', 'IMAGE 1 不够原始')
+        mock_fix.assert_called_once_with({}, 'first frame', 'IMAGE 1 不够原始', succeeding_image_prompt='second frame')
         self.assertEqual(render_calls, [[1]])
         self.assertIn('fixed first frame', result['prompt_block'])
+
 
 
 class TestReviewVerdictInvalidation(_TmpProjectCase):
@@ -1785,7 +1787,8 @@ class TestManualFrameIssue(_TmpProjectCase):
             result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
 
         mock_fix.assert_called_once_with({}, 'video one', 'second frame', ['塔吊凭空消失了'],
-                                         video_meta='')
+                                         video_meta='', preceding_image_prompt='first frame',
+                                         succeeding_image_prompt='third frame', succeeding_video_prompt='video two')
         self.assertEqual(result['reason'], '塔吊凭空消失了')
         # 修完清掉描述，否则帧网格会一直显示「人工标记」看着像没修
         stored = [f for f in self._read_manifest()['frames'] if f['sequence'] == 2][0]
@@ -1809,7 +1812,8 @@ class TestManualFrameIssue(_TmpProjectCase):
         # 人工描述排在机器判定前面，两份都交给改写
         mock_fix.assert_called_once_with({}, 'video one', 'second frame',
                                          ['塔吊凭空消失了', '天花板未随墙面一起封板'],
-                                         video_meta='')
+                                         video_meta='', preceding_image_prompt='first frame',
+                                         succeeding_image_prompt='third frame', succeeding_video_prompt='video two')
         self.assertEqual(result['reason'], '塔吊凭空消失了；天花板未随墙面一起封板')
 
     def test_fix_accepts_manual_reason_argument_and_persists_it_first(self):
@@ -1870,8 +1874,9 @@ class TestManualFrameIssue(_TmpProjectCase):
              patch.object(csp, 'run_candidate_selection_frame_sequence', side_effect=fake_render):
             po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 1)
 
-        mock_fix.assert_called_once_with({}, 'first frame', '首帧地面太干净，不像废墟')
+        mock_fix.assert_called_once_with({}, 'first frame', '首帧地面太干净，不像废墟', succeeding_image_prompt='second frame')
         self.assertEqual(render_calls, [[1]])
+
 
 
 class TestGlobalReviewWindows(unittest.TestCase):

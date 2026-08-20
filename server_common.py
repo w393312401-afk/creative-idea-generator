@@ -1709,6 +1709,7 @@ _PASSTHROUGH_CLIENT_KEYS = (
     # skillProfile / qaGateLevel 当年是同一个静默失效的口子。
     'frameFactsModel', 'peakVerifyModel', 'reviewModel',
     'reviewConcurrency', 'candidateConcurrency',
+    'candidateSelectionMode', 'candidateSelection', 'generation_mode', 'candidate_selection',
 ) + _GATE_KEYS
 
 
@@ -2168,16 +2169,16 @@ def _cover_candidate_path(raw):
     root = os.path.dirname(os.path.abspath(__file__))
     outputs_dir = os.path.abspath(OUTPUT_ROOT if os.path.isabs(OUTPUT_ROOT) else os.path.join(root, OUTPUT_ROOT))
     clean_rel = rel.lstrip('/\\')
-    if os.path.isabs(rel) or re.match(r'^[a-zA-Z]:[/\\]', rel) or rel.startswith('\\\\'):
-        candidate = os.path.abspath(rel)
-    elif clean_rel == 'outputs' or clean_rel.startswith('outputs/') or clean_rel.startswith('outputs\\'):
+    if clean_rel == 'outputs' or clean_rel.startswith('outputs/') or clean_rel.startswith('outputs\\'):
         sub_rel = clean_rel[7:].lstrip('/\\')
         cand_in_out = os.path.abspath(os.path.join(outputs_dir, sub_rel))
         candidate = cand_in_out if os.path.isfile(cand_in_out) else os.path.abspath(os.path.join(root, clean_rel))
+    elif os.path.isabs(rel) or re.match(r'^[a-zA-Z]:[/\\]', rel) or rel.startswith('\\\\'):
+        candidate = os.path.abspath(rel)
     else:
         candidate = os.path.abspath(os.path.join(root, clean_rel))
     try:
-        inside = os.path.commonpath([candidate, outputs_dir]) == outputs_dir
+        inside = os.path.normcase(os.path.commonpath([candidate, outputs_dir])) == os.path.normcase(outputs_dir)
     except ValueError:
         return None
     if not inside or not os.path.isfile(candidate) or os.path.getsize(candidate) == 0:

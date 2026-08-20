@@ -1540,10 +1540,19 @@ def refine_packet_from_accepted_anchor(config, image_path, packet, parsed_brief=
         return packet
 
 
-def fix_image_prompt_with_vlm_feedback(config, original_prompt, vlm_reason):
+def fix_image_prompt_with_vlm_feedback(config, original_prompt, vlm_reason, succeeding_image_prompt=None):
     """
     Use LLM (auxModel) to generate a corrected image prompt based on the VLM QA audit failure reason.
+    Supports succeeding_image_prompt to enforce forward boundary compatibility when repairing early frames.
     """
+    succ_context_note = ""
+    if succeeding_image_prompt:
+        succ_context_note = (
+            "\n- SUCCEEDING FRAME COMPATIBILITY (Sandwich Forward Constraint): The corrected IMAGE prompt must remain a "
+            "valid physical starting state for the succeeding frame (Frame 2). Do NOT introduce permanent structures or "
+            "elements that contradict the starting conditions required by Frame 2."
+        )
+
     system_prompt = (
         "You are an expert prompt engineering assistant. Your job is to modify a stable-diffusion-style IMAGE prompt "
         "to fix specific visual errors detected by a visual auditor (VLM). "
@@ -1554,14 +1563,17 @@ def fix_image_prompt_with_vlm_feedback(config, original_prompt, vlm_reason):
         "- If the auditor reported that a required object is missing, append a clear description of the object to the prompt.\n"
         "- If the auditor reported intervention evidence (tools, ladders, scaffolding, paint cans, tarps, staged materials, work lights, or any already-repaired/already-cleaned/already-painted patch), explicitly add a negation clause naming and removing each offending item (e.g. 'no ladders, no tools, no scaffolding, no staged materials anywhere in frame; every surface is untouched original decay') — do not just soften the wording, actually state their absence.\n"
         "- If the auditor reported insufficient damage severity (missing damage categories), strengthen the trauma description by adding concrete, specific damage from the categories the auditor said were missing (structural cracks/collapse, rust/water stains/peeling paint/mold, moss/vines/roots growing through, rubble/scattered debris) — do not just say 'very damaged', name the specific material and damage type and where it is.\n"
-        "- Keep the rest of the original prompt's structure, landmarks, Camera DNA, and style intact.\n"
+        "- Keep the rest of the original prompt's structure, landmarks, Camera DNA, and style intact."
+        + succ_context_note + "\n"
         "- Do NOT output any explanations, markdown code fences, or headers. Output ONLY the raw corrected prompt text in English."
     )
-    user_prompt = (
-        f"Original IMAGE prompt:\n{original_prompt}\n\n"
-        f"VLM Audit Failure Reason:\n{vlm_reason}\n\n"
-        f"Please output the corrected IMAGE prompt in English."
-    )
+    user_prompt_parts = [
+        f"Original IMAGE prompt:\n{original_prompt}\n",
+    ]
+    if succeeding_image_prompt:
+        user_prompt_parts.append(f"Succeeding Frame Target (Frame 2 starting state to maintain compatibility with):\n{succeeding_image_prompt}\n")
+    user_prompt_parts.append(f"VLM Audit Failure Reason:\n{vlm_reason}\n\nPlease output the corrected IMAGE prompt in English.")
+    user_prompt = "\n".join(user_prompt_parts)
     try:
         response = _chat(
             config, system_prompt, user_prompt,
@@ -1574,6 +1586,7 @@ def fix_image_prompt_with_vlm_feedback(config, original_prompt, vlm_reason):
         if sys.stdout:
             print(f"[DEBUG] fix_image_prompt_with_vlm_feedback failed: {e}")
         return original_prompt
+
 
 
 _REFERENCE_MISS_LOGGED = set()
@@ -3479,7 +3492,19 @@ def fix_image_clean_frame_proactive(prompt, allow_occupant=False):
         has_negative = any(re.search(rf'\b{neg}\b', low_sent) for neg in negatives)
         has_worker = any(re.search(rf'\b{w}s?\b', low_sent) for w in worker_agents)
         if has_negative and has_worker:
-            cleaned_sentences.append(sentence)
+            # 彻底清洗负向人物否定句，消除生图扩散模型（Midjourney/Flux/SD）的「粉色大象」幻觉
+            # 例如 "The room is clean with no workers present." -> "The room is clean."
+            # 确保生成的 clean frame 提示词中 100% 零人物词根，杜绝生成幽灵工人。
+            stripped = re.sub(
+                rf'(?:,\s*)?(?:with\s+)?(?:no|zero|without|free\s+of|absent\s+of|clear\s+of|empty\s+of|never\s+having)\s+(?:any\s+)?(?:active\s+)?(?:'
+                + '|'.join(worker_agents)
+                + r')s?(?:\s+(?:are\s+)?(?:present|visible|in\s+(?:the\s+)?(?:scene|frame|room|shot|view)|on\s+site))?',
+                '',
+                sentence,
+                flags=re.IGNORECASE
+            ).strip(' ,;.')
+            if stripped and len(stripped.split()) >= 3:
+                cleaned_sentences.append(stripped + ('.' if not stripped.endswith(('.', '!', '?')) else ''))
             continue
             
         if 'painting' in low_sent and 'after painting' not in low_sent:
@@ -12609,10 +12634,14 @@ def frame_review_status(sequences, review_result):
 
 
 def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, family=None,
-                                  video_meta=''):
+                                  video_meta='', preceding_image_prompt=None,
+                                  succeeding_image_prompt=None, succeeding_video_prompt=None):
     """整套序列审查标记某一拍有问题后，定向重写该拍的 VIDEO/IMAGE 提示词。issues 是
     check_full_sequence_consistency 给出的该拍中文违规描述列表。失败时原样返回输入，
     调用方据此判断本轮是否有实际改动（未变化就不用重渲）。
+
+    支持前向物理锚定（preceding_image_prompt）与后向交付目标收口（succeeding_image_prompt / succeeding_video_prompt），
+    严格遵循三明治双向上下文绑定协议（Sandwich Bidirectional Context Protocol），防止单拍修改导致整体环境格局断层。
 
     video_meta：该拍 VIDEO 槽的 meta 标签，用于识别过门跨越槽（[BRIDGE]/[BRIDGE TURN]/
     [CUT]）——这三种槽的正文是纯运镜片段，收尾的确定性修复必须按「运动镜头」跑，否则
@@ -12631,6 +12660,19 @@ def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, fa
         "move through an untouched ruin, sterile of workers). Keep its camera-motion sentences — "
         "never turn it into a static-camera or construction-work clip."
         if _is_crossing_slot else "")
+
+    sandwich_notes = (
+        "\nCRITICAL CONSISTENCY CONSTRAINTS (SANDWICH BIDIRECTIONAL CONTEXT PROTOCOL):\n"
+        "1. PRECEDING PHYSICAL ANCHOR INHERITANCE: If a preceding frame state is provided, the rewritten "
+        "VIDEO and IMAGE prompts MUST 100% physically inherit and build upon that preceding state. "
+        "DO NOT revert, delete, or contradict any renovation steps or fixed structures already completed in the preceding frame. "
+        "Keep camera height (1.3m chest level), 24mm wide-angle perspective, horizon line, and architectural landmarks character-for-character stable.\n"
+        "2. SUCCEEDING TARGET COMPATIBILITY: If a succeeding frame target or succeeding video is provided, the rewritten "
+        "IMAGE prompt MUST remain a physically valid, natural prerequisite for that succeeding frame. "
+        "DO NOT introduce conflicting permanent structures, incompatible materials, or out-of-order room changes that contradict the succeeding frame or make the subsequent video transition impossible.\n"
+        "3. ZERO PHANTOM DRIFT: Fix ONLY what is necessary to address the stated violations. Keep everything else intact."
+    )
+
     system_prompt = (
         "You are an expert prompt engineering assistant fixing a construction-sequence "
         "time-lapse VIDEO+IMAGE prompt pair based on violations found by reviewing the "
@@ -12639,15 +12681,25 @@ def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, fa
         "and a list of specific violations (in Chinese) found in this beat. Rewrite "
         "ONLY what is necessary to fix those violations — keep everything else "
         "(camera DNA, landmark restatements, style, structure) character-for-character "
-        "identical." + _cut_note + " Output STRICT JSON only, no markdown fences, exactly "
+        "identical." + _cut_note + sandwich_notes + " Output STRICT JSON only, no markdown fences, exactly "
         'this shape: {"video": "...", "image": "..."}'
     )
-    user_prompt = (
-        f"Current VIDEO prompt:\n{video_prompt}\n\n"
-        f"Current IMAGE prompt (state after this VIDEO):\n{image_prompt}\n\n"
-        f"Violations found by reviewing the rendered frames:\n"
+    user_prompt_parts = []
+    if preceding_image_prompt:
+        user_prompt_parts.append(f"Preceding Frame State (Frame BEFORE this beat):\n{preceding_image_prompt.strip()}\n")
+    user_prompt_parts.append(f"Current VIDEO prompt:\n{video_prompt.strip()}\n")
+    user_prompt_parts.append(f"Current IMAGE prompt (state after this VIDEO):\n{image_prompt.strip()}\n")
+    if succeeding_image_prompt:
+        succ_desc = f"Succeeding Frame Target (Frame AFTER this beat to stay compatible with):\n{succeeding_image_prompt.strip()}\n"
+        if succeeding_video_prompt:
+            succ_desc += f"Succeeding Video Transition:\n{succeeding_video_prompt.strip()}\n"
+        user_prompt_parts.append(succ_desc)
+    user_prompt_parts.append(
+        "Violations found by reviewing the rendered frames:\n"
         + "\n".join(f"- {issue}" for issue in issues)
     )
+    user_prompt = "\n\n".join(user_prompt_parts)
+
     try:
         response = _chat(config, system_prompt, user_prompt, temperature=0.3, timeout=60, model=_aux_model(config))
         data = json.loads(_strip_code_fences(response))
@@ -12671,6 +12723,7 @@ def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, fa
         if sys.stdout:
             print(f"[SEQUENCE REVIEW] fix_beat_from_sequence_review failed (beat left unchanged): {e}")
         return video_prompt, image_prompt
+
 
 
 def _strip_markdown_fences_only(s):

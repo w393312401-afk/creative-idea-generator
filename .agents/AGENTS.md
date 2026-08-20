@@ -103,3 +103,28 @@
       - 严禁泛指 `panoramic windows`（防止三面水箱盒），必须替换为 `two consecutive widescreen windows exclusively on the left wall`。
     - **负向防畸变词库强注入 (Anti-Distortion Negative Restraints)**:
       - 在图像与视频提示词中强制注入：`(cramped room, square box room, tiny cubicle, 2m small room, elevator shaft, three-sided glass box, glass back wall, endless narrow tunnel, bowling alley effect, train carriage, ladder placed in background, ladder far away:1.6)`。
+
+12. **Sandwich Bidirectional Context-Bound Iteration & Cascade Blocker (三明治双向上下文绑定修改律与波及阻断机制 · 彻底终结格局断层与全盘重做)**:
+    - **彻底禁止孤岛式修改 (Full Prohibition of Isolated Frame Modifications)**:
+      - 在成套帧序列全部生成完毕后的审查与修改阶段，**严禁对任何单帧进行脱离上下文的孤立重写或盲抽重绘**。
+      - 孤立修改单帧会导致空间透视、边界几何、光影色温及工序交付物与前后帧断裂（格局断层），引发后向雪崩效应（Cascading Desync），导致后续全部帧序列报废重做。
+    - **双向三明治约束架构 (Sandwich Bidirectional Context Triad: K-1 $\leftarrow$ [K] $\rightarrow$ K+1)**:
+      - 任何单帧（Frame K）的修改必须同时受到**前向物理继承锚点**与**后向交付目标收口**的双向夹具约束：
+        1. **前向物理锚定 (Preceding State Anchor - K-1)**:
+           - Frame K 必须 100% 物理继承 Frame K-1 的硬装基底、边界拓扑、材质色泽、镜头机位高度（1.3m）与透视灭点。
+           - 严禁发生“前序已完成产物在 Frame K 突变、消失或材质倒退”。
+        2. **后向承接校验与物理通道锁 (Succeeding Target Boundary Lock - K+1)**:
+           - Frame K 的修改成果必须是通往 Frame K+1 的自然且唯一的物理前置条件，确保差量 $\Delta(K \rightarrow K+1)$ 的工人动作与物料变化真实可达。
+           - 严禁在 Frame K 植入与 Frame K+1 冲突的新结构、大型永久家具或不可逆材质。
+    - **三级差量修改层级 (Graded Modification Protocol)**:
+      - **Level 1（局部道具/人物/微瑕修正）**：优先采用局部蒙版重绘 (Mask / Inpainting) 或 ControlNet 局部修复，锁定三维空间背景像素 100% 不动。
+      - **Level 2（光照/视角微调）**：必须以 Frame K-1 为图生图 (I2I) 核心基底，绑定深度图/线稿控制，严禁脱离底图使用纯文生图 (T2I) 盲抽。
+      - **Level 3（工序重构/结构级变更）**：若 Frame K 必须进行结构级调整，必须立即启动“连带连锁预警”，从 Frame K 开始以 Frame K-1 为基准向后链式同步修正提示词，阻止断层向下游蔓延。
+    - **三帧联排硬性审查门禁 (3-Frame Triptych Inspection Gate)**:
+      - 单帧修改完成后，**严禁单独审查单张图即判定通过**。
+      - 必须强制调取 `[Frame K-1] - [Modified Frame K] - [Frame K+1]` 进行三联屏并排动态比对，重点快检：
+        1. **空间与透视**：后墙水渍线、梁架走向、窗洞位置是否保持像素级稳定。
+        2. **材质与状态**：地板/墙面是否发生湿水镜面化、突变反光或破损复活。
+        3. **物料守恒**：工具与材料的出现/消耗是否在三帧之间具备连续的物理因果链。
+      - 只有在三联屏比对确认无缝咬合后，方可写入管线并固化为最终帧。
+

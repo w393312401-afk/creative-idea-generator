@@ -21,9 +21,10 @@ assert.ok(appJs.includes('pipeline_candidate_selection_mode'), 'localStorage pre
 assert.ok(/generation_mode:\s*'standard'/.test(appJs), 'generateFrames must send generation_mode: standard when 4-in-1 is off');
 assert.ok(/candidate_selection:\s*false/.test(appJs), 'generateFrames must send candidate_selection: false when 4-in-1 is off');
 
-// 3. Check js/api_client.js retryFrame logic
-assert.ok(apiClientJs.includes('isCandidateSelectionMode'), 'retryFrame must check isCandidateSelectionMode');
+// 3. Check js/api_client.js retryFrame and fixFrameIssue logic
+assert.ok(apiClientJs.includes('isCandidateSelectionMode'), 'api_client must check isCandidateSelectionMode');
 assert.ok(/generation_mode:\s*isCand\s*\?\s*'candidate_selection'\s*:\s*'standard'/.test(apiClientJs), 'retryFrame must set generation_mode according to isCand');
 assert.ok(/candidate_selection:\s*isCand/.test(apiClientJs), 'retryFrame must set candidate_selection according to isCand');
+assert.ok(/fix_frame_issue[\s\S]*?candidate_selection:\s*isCand/.test(apiClientJs), 'fixFrameIssue must set candidate_selection according to isCand');
 
 console.log('Candidate selection toggle tests passed successfully!');

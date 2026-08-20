@@ -1096,6 +1096,22 @@ class TestHandoffToComposer(unittest.TestCase):
     def test_no_banned_elements_means_no_hits(self):
         self.assertEqual(reverse.banned_element_hits('anything at all', []), [])
 
+    def test_banned_hits_word_boundary_avoids_false_positives(self):
+        """防止 oven 误杀 woven、bed 误杀 embedded、car 误杀 carpet 等假阳性。"""
+        text = 'Worker arranging woven storage baskets, placing embedded LED fixtures on carpet, stripping tree bark.'
+        banned = ['oven', 'bed', 'car', 'bar', 'pot', 'fan']
+        self.assertEqual(reverse.banned_element_hits(text, banned), [])
+
+        # 真实出现完整独立词时必须正常拦截
+        real_violating_text = 'Worker installs an oven on the counter and platform bed.'
+        self.assertEqual(sorted(reverse.banned_element_hits(real_violating_text, banned)), ['bed', 'oven'])
+
+    def test_banned_hits_cjk_support(self):
+        """中文禁用词支持自然匹配。"""
+        text = '在厨房吧台角落安装了微波炉和电磁炉'
+        self.assertEqual(reverse.banned_element_hits(text, ['微波炉', '洗碗机']), ['微波炉'])
+
+
 
 class _SheetJob:
     """临时 job 目录 + 真实存在的帧文件。拼图那条路会 os.path.exists 每一帧。"""
@@ -1689,6 +1705,19 @@ class TestSceneConstants(unittest.TestCase):
         c = reverse.analyze_scene_constants(self._facts())
         self.assertIn('mossy concrete wall', c['materials'])
         self.assertNotIn('fresh timber', c['materials'])   # 只在最后两帧，是变化不是恒常
+
+    def test_transient_tools_are_excluded_from_fixtures(self):
+        facts = [
+            {'frame': f'f_{i}.png', 'tools': ['cordless drill', 'tripod work light', 'utility knife'],
+             'materials': ['concrete'], 'traces': []}
+            for i in range(10)
+        ]
+        c = reverse.analyze_scene_constants(facts)
+        # 手持工具（电钻、美工刀）属于瞬态工具，绝不能进入全片常驻器具列表
+        self.assertNotIn('cordless drill', c.get('fixtures_in_shot', []))
+        self.assertNotIn('utility knife', c.get('fixtures_in_shot', []))
+        # 重型常驻照明设备（三脚架工作灯）允许作为常驻器具
+        self.assertIn('tripod work light', c.get('fixtures_in_shot', []))
 
     def test_an_emptied_field_is_never_recomputed_back(self):
         """它进每一条合成提示词，所以用户必须删得掉。

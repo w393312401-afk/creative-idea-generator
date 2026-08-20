@@ -473,14 +473,19 @@ function bindSlotToolbar(type) {
 
 }
 
+const lastCheckedSlot = { image: null, video: null };
+let lastShiftClickState = false;
+
 /**
  * 勾选走容器级委托。类型从 card.dataset.type 现取而不是闭包——合并视图下
  * #beats-grid 里同时放着两类卡片（同 slot_card.js 的 bindSlotGrid）。
+ * 支持 Shift + 点击进行连续范围选择（Range Selection）。
  */
 function bindSlotSelection(gridId) {
     const grid = document.getElementById(gridId);
     if (!grid || grid.dataset.selectBound === '1') return;
     grid.dataset.selectBound = '1';
+
     grid.addEventListener('change', (e) => {
         const box = e.target.closest('.slot-select-box');
         if (!box) return;
@@ -488,14 +493,229 @@ function bindSlotSelection(gridId) {
         if (!card) return;
         const cardType = card.dataset.type === 'video' ? 'video' : 'image';
         const seq = Number(card.dataset.seq);
+        if (!Number.isFinite(seq)) return;
         const st = slotToolbarState[cardType];
-        if (box.checked) st.selected.add(seq); else st.selected.delete(seq);
+        const isChecked = box.checked;
+        const isShift = e.shiftKey || lastShiftClickState;
+
+        // Shift + 点击：连续范围选择
+        if (isShift && lastCheckedSlot[cardType] !== null) {
+            const from = Math.min(lastCheckedSlot[cardType], seq);
+            const to = Math.max(lastCheckedSlot[cardType], seq);
+            const allCards = Array.from(grid.querySelectorAll(
+                slotMergedView ? `.slot-card[data-type="${cardType}"]` : '.slot-card'));
+
+            allCards.forEach(c => {
+                const s = Number(c.dataset.seq);
+                if (s >= from && s <= to && !c.classList.contains('slot-filtered-out') && c.dataset.kind !== 'pending') {
+                    if (isChecked) st.selected.add(s);
+                    else st.selected.delete(s);
+                }
+            });
+        } else {
+            if (isChecked) st.selected.add(seq);
+            else st.selected.delete(seq);
+        }
+
+        lastCheckedSlot[cardType] = seq;
         syncSlotToolbar(cardType);
     });
-    // 勾选框在卡片内，别让这一下点击顺带开了 lightbox
+
+    // 勾选框在卡片内，别让这一下点击顺带开了 lightbox，并记录 Shift 按下状态
     grid.addEventListener('click', (e) => {
-        if (e.target.closest('.slot-select')) e.stopPropagation();
+        if (e.target.closest('.slot-select')) {
+            lastShiftClickState = !!e.shiftKey;
+            e.stopPropagation();
+        }
     }, true);
+}
+
+/**
+ * 框选多选（Marquee Box Selection）：
+ * 在网格空白区域按住鼠标左键拖拽，或按住 Shift/Ctrl 在任意位置拖拽，
+ * 绘制半透明青色框选框，实时计算与卡片的 2D 矩形相交（AABB 碰撞），实现批量多选。
+ */
+function bindSlotMarqueeSelection(gridId) {
+    const grid = document.getElementById(gridId);
+    if (!grid || grid.dataset.marqueeBound === '1') return;
+    grid.dataset.marqueeBound = '1';
+
+    let marqueeEl = null;
+    let isDragging = false;
+    let startX = 0, startY = 0;
+    let initialSelected = { image: new Set(), video: new Set() };
+    let isAdditive = false;
+    let startGridType = 'image';
+
+    function getGridType() {
+        if (grid.id === 'beats-grid') return 'merged';
+        if (grid.id === 'videos-grid') return 'video';
+        return 'image';
+    }
+
+    grid.addEventListener('mousedown', (e) => {
+        // 仅响应鼠标左键
+        if (e.button !== 0) return;
+
+        // 忽略交互型子元素（按钮、输入框、下拉框、操作条、徽标、卡片标签等）
+        if (e.target.closest('button, input, textarea, a, select, label, .slot-actions, .slot-badge, .slot-label, .slot-select, .slot-bulk, .slot-toolbar')) {
+            return;
+        }
+
+        const card = e.target.closest('.slot-card');
+        const hasModifier = e.shiftKey || e.ctrlKey || e.metaKey;
+
+        // 若直接点在卡片上，且未按 Shift/Ctrl，则保留卡片的单击（灯箱）与原生拖拽（换位）行为
+        if (card && !hasModifier) {
+            return;
+        }
+
+        startX = e.clientX;
+        startY = e.clientY;
+        isDragging = false;
+        isAdditive = hasModifier;
+        startGridType = getGridType();
+
+        // 记录按下时刻的已有选中项快照
+        initialSelected.image = new Set(slotToolbarState.image.selected);
+        initialSelected.video = new Set(slotToolbarState.video.selected);
+
+        // 如果按了 Shift/Ctrl 且点在卡片上，阻止浏览器默认的卡片 dragstart 与文本选区
+        if (hasModifier) {
+            e.preventDefault();
+        }
+
+        function onMouseMove(moveEvent) {
+            const dx = moveEvent.clientX - startX;
+            const dy = moveEvent.clientY - startY;
+            const dist = Math.hypot(dx, dy);
+
+            // 拖拽阈值（至少移动 4 像素才进入框选，防止普通轻点误触发）
+            if (!isDragging) {
+                if (dist < 4) return;
+                isDragging = true;
+                document.body.classList.add('is-slot-marquee-selecting');
+
+                if (!marqueeEl) {
+                    marqueeEl = document.createElement('div');
+                    marqueeEl.className = 'slot-marquee-box';
+                    document.body.appendChild(marqueeEl);
+                }
+            }
+
+            // 视口坐标下的框选矩形
+            const boxLeft = Math.min(startX, moveEvent.clientX);
+            const boxTop = Math.min(startY, moveEvent.clientY);
+            const boxWidth = Math.abs(dx);
+            const boxHeight = Math.abs(dy);
+            const boxRight = boxLeft + boxWidth;
+            const boxBottom = boxTop + boxHeight;
+
+            if (marqueeEl) {
+                marqueeEl.style.left = boxLeft + 'px';
+                marqueeEl.style.top = boxTop + 'px';
+                marqueeEl.style.width = boxWidth + 'px';
+                marqueeEl.style.height = boxHeight + 'px';
+            }
+
+            // 获取当前网格中所有可供选择的卡片
+            const cards = Array.from(grid.querySelectorAll('.slot-card')).filter(c => {
+                if (c.classList.contains('slot-filtered-out')) return false;
+                if (c.dataset.kind === 'pending') return false;
+                return true;
+            });
+
+            const touchedImage = new Set(isAdditive ? initialSelected.image : []);
+            const touchedVideo = new Set(isAdditive ? initialSelected.video : []);
+
+            cards.forEach(c => {
+                const rect = c.getBoundingClientRect();
+                // 2D AABB 矩形相交检测
+                const intersects = !(
+                    rect.right < boxLeft ||
+                    rect.left > boxRight ||
+                    rect.bottom < boxTop ||
+                    rect.top > boxBottom
+                );
+
+                const cType = c.dataset.type === 'video' ? 'video' : 'image';
+                const seq = Number(c.dataset.seq);
+                if (!Number.isFinite(seq)) return;
+
+                if (intersects) {
+                    if (cType === 'video') touchedVideo.add(seq);
+                    else touchedImage.add(seq);
+                } else if (!isAdditive) {
+                    if (cType === 'video') touchedVideo.delete(seq);
+                    else touchedImage.delete(seq);
+                }
+            });
+
+            // 实时更新选中集合与工具条
+            if (startGridType === 'merged') {
+                slotToolbarState.image.selected = touchedImage;
+                slotToolbarState.video.selected = touchedVideo;
+                syncSlotToolbar('image');
+                syncSlotToolbar('video');
+            } else if (startGridType === 'video') {
+                slotToolbarState.video.selected = touchedVideo;
+                syncSlotToolbar('video');
+            } else {
+                slotToolbarState.image.selected = touchedImage;
+                syncSlotToolbar('image');
+            }
+        }
+
+        function onMouseUp(upEvent) {
+            window.removeEventListener('mousemove', onMouseMove, true);
+            window.removeEventListener('mouseup', onMouseUp, true);
+            document.body.classList.remove('is-slot-marquee-selecting');
+
+            if (marqueeEl) {
+                marqueeEl.remove();
+                marqueeEl = null;
+            }
+
+            // 若只是在空白处单纯单击（未发生有效拖拽）且未按 Shift/Ctrl，则清空当前网格选中
+            if (!isDragging) {
+                if (!card && !hasModifier) {
+                    if (startGridType === 'merged') {
+                        clearSlotSelection('image');
+                        clearSlotSelection('video');
+                    } else {
+                        clearSlotSelection(startGridType);
+                    }
+                }
+                return;
+            }
+
+            // 拖拽结束：最后确保状态完全同步
+            if (startGridType === 'merged') {
+                syncSlotToolbar('image');
+                syncSlotToolbar('video');
+            } else {
+                syncSlotToolbar(startGridType);
+            }
+        }
+
+        window.addEventListener('mousemove', onMouseMove, true);
+        window.addEventListener('mouseup', onMouseUp, true);
+    });
+
+    // 空白处单击直接清空选中集
+    grid.addEventListener('click', (e) => {
+        if (e.shiftKey || e.ctrlKey || e.metaKey) return;
+        if (e.target.closest('.slot-card, button, input, textarea, a, select, label, .slot-actions, .slot-badge, .slot-label, .slot-select, .slot-bulk, .slot-toolbar')) {
+            return;
+        }
+        const gType = getGridType();
+        if (gType === 'merged') {
+            clearSlotSelection('image');
+            clearSlotSelection('video');
+        } else {
+            clearSlotSelection(gType);
+        }
+    });
 }
 
 /**
@@ -539,6 +759,7 @@ function initSlotToolbars() {
     bindSlotToolbar('image');
     bindSlotToolbar('video');
     ['frames-grid', 'videos-grid', 'beats-grid'].forEach(bindSlotSelection);
+    ['frames-grid', 'videos-grid', 'beats-grid'].forEach(bindSlotMarqueeSelection);
     applySlotSize(readSlotSize());
     setSlotMergedView(readSlotMergedView(), false);
     syncSlotToolbar('image');

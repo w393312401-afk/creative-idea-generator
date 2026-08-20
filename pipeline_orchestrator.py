@@ -975,15 +975,30 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
             'message': f"🔧 正在依据问题描述优化 IMG {sequence:03d} 的提示词（{reason}）…",
         })
 
+    prev_image_item = images.get(sequence - 1)
+    prev_image_body = (prev_image_item['body'] if isinstance(prev_image_item, dict) else prev_image_item) if prev_image_item else None
+
+    succ_image_item = images.get(sequence + 1)
+    succ_image_body = (succ_image_item['body'] if isinstance(succ_image_item, dict) else succ_image_item) if succ_image_item else None
+
+    succ_video_item = videos.get(sequence)
+    succ_video_body = (succ_video_item['body'] if isinstance(succ_video_item, dict) else succ_video_item) if succ_video_item else None
+
     if video_item is not None:
         video_body = video_item['body'] if isinstance(video_item, dict) else video_item
         video_meta = video_item.get('meta', '') if isinstance(video_item, dict) else ''
         new_video_body, new_image_body = fix_beat_from_sequence_review(
-            config, video_body, image_body, issues, video_meta=video_meta)
+            config, video_body, image_body, issues, video_meta=video_meta,
+            preceding_image_prompt=prev_image_body,
+            succeeding_image_prompt=succ_image_body,
+            succeeding_video_prompt=succ_video_body)
         if new_video_body != video_body:
             videos[video_beat] = {'body': new_video_body, 'meta': video_meta}
     else:
-        new_image_body = fix_image_prompt_with_vlm_feedback(config, image_body, reason)
+        new_image_body = fix_image_prompt_with_vlm_feedback(
+            config, image_body, reason,
+            succeeding_image_prompt=succ_image_body)
+
 
     _family = image_space_family(videos, sequence)
     new_image_body = clean_prompt_text(new_image_body)
@@ -993,19 +1008,41 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
     images[sequence] = {'body': new_image_body, 'meta': image_meta}
     new_prompt_block = _format_prompt_block(images, videos)
 
-    if on_progress:
-        on_progress('frame_issue_fix_render', {
-            'sequence': sequence,
-            'message': f"🎨 正在以 4选1 候选优选方式重渲 IMG {sequence:03d}…",
-        })
-
-    from candidate_selection_pipeline import run_candidate_selection_frame_sequence
-    run_candidate_selection_frame_sequence(
-        config, title, new_prompt_block,
-        on_progress=on_progress,
-        target_sequences=[sequence],
-        candidate_count=4,
+    is_explicitly_disabled = (
+        config.get('candidateSelection') is False
+        or config.get('candidateSelectionMode') is False
+        or config.get('candidate_selection') is False
+        or config.get('generation_mode') in ('standard', 'sequential', 'normal', 'single', 'default')
     )
+    is_candidate_mode = not is_explicitly_disabled
+
+    if is_candidate_mode:
+        if on_progress:
+            on_progress('frame_issue_fix_render', {
+                'sequence': sequence,
+                'message': f"🎨 正在以 4选1 候选优选方式重渲 IMG {sequence:03d}…",
+            })
+
+        from candidate_selection_pipeline import run_candidate_selection_frame_sequence
+        run_candidate_selection_frame_sequence(
+            config, title, new_prompt_block,
+            on_progress=on_progress,
+            target_sequences=[sequence],
+            candidate_count=4,
+        )
+    else:
+        if on_progress:
+            on_progress('frame_issue_fix_render', {
+                'sequence': sequence,
+                'message': f"🎨 正在重渲 IMG {sequence:03d}…",
+            })
+
+        from frame_generator import generate_frame_sequence
+        generate_frame_sequence(
+            config, title, new_prompt_block,
+            on_progress=on_progress,
+            target_sequences=[sequence],
+        )
 
     # 重渲成功才清人工描述：中途抛错时描述必须原样留在 manifest 上，否则人得重新
     # 把问题再描述一遍。

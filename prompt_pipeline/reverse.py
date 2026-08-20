@@ -1205,7 +1205,7 @@ RULES
 - A beat must produce a full visible milestone, not a token patch. If two adjacent windows continue the same milestone, merge them.
 - Four-Zone Spatial Scanning: In every beat, scan four spatial domains for physical delta: 1. Top/Overhead (roof, beams, ceiling, fixtures, skylights), 2. Middle (walls, framing, openings, wiring), 3. Bottom (floor, sub-base, insulation, finish), 4. Peripherals & Spoil (debris removal, material balance). Material & Spoil Balance: Demolition/clearing must account for where debris goes (e.g. bundled or hauled out); installation must account for raw material consumption. Zero Phantom Changes: Never describe action in only one zone while letting another zone's damage or debris disappear without worker action.
 - Monotonic Chronological Inheritance across Spaces: When passing through a doorway or opening into a new space (space label changes), the first beat in the new space must physically inherit all completed exterior/prior work. Never regress already-finished elements (e.g. never describe a roof leaking or ground full of dead leaves if previous beats cleared/repaired them).
-- macro_environment: ONE to THREE items describing the macro terrain, geology, climate/lighting, and spatial metric envelope visible in this beat — "arid desert sandstone cliff with natural ambient sunlight", "loose reddish-tan desert sand ground with ripples".
+- macro_environment: ONLY declare for the opening anchor beat (B01) AND the first beat after entering a new enclosed space / threshold crossing (when space label changes or stage is transition). ONE to THREE items describing the macro terrain, geology, climate/lighting, and spatial metric envelope visible in this beat — e.g. "arid desert sandstone cliff with natural ambient sunlight", "loose reddish-tan desert sand ground with ripples". For intermediate beats within the same space, do NOT declare macro_environment (keep empty [] or omit) to avoid context clutter and reduce interference with trade actions.
 - visible_details: THREE to SIX items. Each names a material with its colour, texture or condition and where it sits — "yellow fibreglass batts in the left wall bays", not "insulation". These items are the only place the reference film's actual look survives into the prompt; a bare noun brings back a generic version of this work, not this film.
 - persistent_traces: AT LEAST TWO visible marks this beat leaves behind, each naming the mark AND the surface it sits on.
 - evidence_frames: list AT MOST THREE frames per beat — the one that best shows the start, the one that best shows the work, and the one that best shows the result. Do not echo every frame in the window; a long frame list is the single biggest cause of a reply that gets cut off before it finishes.
@@ -1926,12 +1926,26 @@ SCENE_CONSTANT_RATIO = 0.35
 _SCENE_CONSTANT_LIMIT = 8
 
 
+_TRANSIENT_TOOL_PATTERN = re.compile(
+    r'\b(?:drill|impact\s*driver|driver|saw|sander|nailer|nail\s*gun|staple\s*gun|'
+    r'trowel|putty\s*knife|tape\s*measure|measuring\s*tape|utility\s*knife|'
+    r'caulk(?:ing)?\s*gun|paint(?:brush|\s*roller|brush)?|roller|hammer|mallet|'
+    r'wrench|pliers|chisel|crowbar|pry\s*bar|level|spirit\s*level|'
+    r'glove|gloves|mask|glasses|rag|sponge|bucket|screw|screws|nail|nails)\b',
+    re.IGNORECASE
+)
+
+def _is_transient_tool(phrase):
+    return bool(_TRANSIENT_TOOL_PATTERN.search(str(phrase or '')))
+
+
 def analyze_scene_constants(facts, min_ratio=SCENE_CONSTANT_RATIO,
                             limit=_SCENE_CONSTANT_LIMIT):
     """出现在超过 `min_ratio` 比例的帧里的可见物，按材质 / 痕迹 / 常驻器具分栏。
 
     判据在词一级、展示在短语一级，与 `analyze_time_windows` 同一套方法（同一样东西
     每帧措辞不同，按整串统计会把一个恒常物拆成几十个「只出现一次」的条目）。
+    过滤掉手持工具（电钻/锤子/锯子/抹刀等）与一次性消耗品，避免将瞬态施工工具误判为全片常驻器具。
     """
     rows = [f for f in (facts or []) if isinstance(f, dict)]
     if not rows:
@@ -1948,6 +1962,8 @@ def analyze_scene_constants(facts, min_ratio=SCENE_CONSTANT_RATIO,
                 phrase = str(item).strip()
                 if not phrase:
                     continue
+                if key == 'fixtures_in_shot' and _is_transient_tool(phrase):
+                    continue
                 for word in _content_words(phrase):
                     best.setdefault(word, {})
                     best[word][phrase] = best[word].get(phrase, 0) + 1
@@ -1960,6 +1976,8 @@ def analyze_scene_constants(facts, min_ratio=SCENE_CONSTANT_RATIO,
             if k / n < min_ratio:
                 break
             phrase = max(best[word].items(), key=lambda kv: (kv[1], -len(kv[0])))[0]
+            if key == 'fixtures_in_shot' and _is_transient_tool(phrase):
+                continue
             if phrase.lower() in claimed:
                 continue
             claimed.add(phrase.lower())
@@ -3448,7 +3466,7 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
     dimensions = dict(base_dimensions or {})
 
     outline = []
-    for beat in beats:
+    for i, beat in enumerate(beats):
         text = f'{beat.get("visible_action") or ""} → {beat.get("visible_result") or ""}'.strip(' →')
         # 把耦合工序写进条目正文。合成器会照这份清单重新规划 ladder 并自己填
         # package_operations——不给它工序，它只能从一句动作描述里猜，猜出一道工序的
@@ -3479,9 +3497,17 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
         details = [str(x).strip() for x in (beat.get('visible_details') or []) if str(x).strip()]
         if details:
             entry['mat'] = details
-        macro_env = [str(x).strip() for x in ((beat.get('macro_environment') if isinstance(beat.get('macro_environment'), (list, tuple)) else [beat.get('macro_environment')]) if beat.get('macro_environment') else []) if str(x).strip()]
-        if macro_env:
-            entry['macro_environment'] = macro_env
+
+        # 大环境识别项（2026-08-20）：仅在第一拍（锚点首帧）与过门拍/换空间首拍（新空间承接）透传，
+        # 中间普通工序拍默认不透传，避免对大模型提示词造成上下文干扰与动作冲淡。
+        is_first = (i == 0)
+        prev_space = normalize_space_label(beats[i - 1].get('space')) if i > 0 else ''
+        is_crossed = bool(i > 0 and prev_space and space and prev_space.lower() != space.lower())
+        is_transition = (beat.get('stage') == 'transition')
+        if is_first or is_crossed or is_transition:
+            macro_env = [str(x).strip() for x in ((beat.get('macro_environment') if isinstance(beat.get('macro_environment'), (list, tuple)) else [beat.get('macro_environment')]) if beat.get('macro_environment') else []) if str(x).strip()]
+            if macro_env:
+                entry['macro_environment'] = macro_env
         traces = [str(x).strip() for x in (beat.get('persistent_traces') or []) if str(x).strip()]
         if traces:
             # trace 在契约里是单串（zone/scope/trace 同组），列表要先合并。
@@ -3564,11 +3590,25 @@ def _short_subject(text, fallback, limit=60):
 
 
 def banned_element_hits(prompt_block, banned_elements):
-    """P0 门禁用：提示词整块里命中的 banned 元素。命中即交付前必须重写。"""
-    text = (prompt_block or '').lower()
+    """P0 门禁用：提示词整块里命中的 banned 元素。命中即交付前必须重写。
+
+    使用字词边界正则匹配，防止英文短词做子串包含时的假阳性误判
+    （如 'woven' 误判为 'oven'、'embedded' 误判为 'bed'、'carpet' 误判为 'car'、
+    'bark' 误判为 'bar'、'spot' 误判为 'pot' 等）。中文字符保留自然子串匹配。
+    """
+    if not prompt_block or not banned_elements:
+        return []
+    text = str(prompt_block)
     hits = []
-    for item in (banned_elements or []):
-        needle = str(item).strip().lower()
-        if needle and needle in text:
+    for item in banned_elements:
+        needle = str(item).strip()
+        if not needle:
+            continue
+        pattern = re.escape(needle)
+        prefix = r'\b' if re.match(r'^[a-zA-Z0-9_]', needle) else ''
+        suffix = r'\b' if re.search(r'[a-zA-Z0-9_]$', needle) else ''
+        regex = f'{prefix}{pattern}{suffix}'
+        if re.search(regex, text, re.IGNORECASE):
             hits.append(item)
     return hits
+

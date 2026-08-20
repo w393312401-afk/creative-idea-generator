@@ -42,7 +42,8 @@ _AI_DISCRIMINATION_SYSTEM_PROMPT = """你是一名好莱坞级电影视觉总监
 你将收到：
 1. 【本帧施工阶段与物理提示词】描述当前帧的具体施工节点、物理变化差量、工装工具/动作、材质与光影。
 2. 【前序基准参考图】（若提供：即前一拍已确认的官方基底画面）。
-3. 【4 张当前帧生成候选图】（标记为 CANDIDATE 1, CANDIDATE 2, CANDIDATE 3, CANDIDATE 4）。
+3. 【后续目标参考图】（若提供：即后一拍已生成的官方交付画面，用于三明治前后双向闭环，严防单帧修改导致整体格局断层）。
+4. 【4 张当前帧生成候选图】（标记为 CANDIDATE 1, CANDIDATE 2, CANDIDATE 3, CANDIDATE 4）。
 
 你的核心任务：
 对全部 4 张候选图进行严格对比评审与多维度打分，选出最优秀、最连贯、最写实的唯一 1 张图作为本帧的官方采用图。被选中的帧将作为后续所有帧的基准参考图。
@@ -52,8 +53,9 @@ _AI_DISCRIMINATION_SYSTEM_PROMPT = """你是一名好莱坞级电影视觉总监
    - 是否准确呈现提示词要求的全新物理施工节点（如龙骨已安装、地板已铺设、混凝土已浇筑等）？
    - 声明的道具、建材和施工动作是否到位，无漏做工序或提前超纲完成？
 
-2. 空间锚点与透视连续性 (0-30 分)：
+2. 空间锚点与前后双向连续性 (0-30 分)：
    - 镜头统一：地平线高度、视角焦段（24mm 广角感，1.3m 人眼/胸口视高）、机位高度和透视感是否与前序参考图高度一致？
+   - 双向咬合（若提供后续目标参考图）：所选候选图必须能够作为连接【前序基准图】与【后续目标图】的自然桥梁，严禁破坏通往后一帧的物理可达性，绝不允许环境格局断层（如门窗突变、后墙消失、透视颠覆等引起后续帧整体报废的硬伤）。
    - 地标锁定：天花板、后背景墙、门框/洞口边界、固定地标结构是否维持物理一致？
    - 严防空间膨胀：紧凑空间/坑穴严禁异常拉伸为巨大礼堂或洞穴大厅（Cavernous expansion）。
    - 零凭空变化：已完成的区域绝无莫名变动或无故复原破损。
@@ -419,9 +421,10 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
     return candidate_paths
 
 
-def evaluate_and_select_best_candidate(config, prompt_text, reference_path, candidate_paths, seq, on_progress=None):
+def evaluate_and_select_best_candidate(config, prompt_text, reference_path, candidate_paths, seq, on_progress=None, succeeding_path=None, succeeding_prompt=None):
     """
     Calls multimodal VLM (Gemini 3.7 / 3.5 / Flash) to evaluate all candidates and choose the best one.
+    Supports succeeding_path and succeeding_prompt for bidirectional sandwich context binding during frame repair.
     Returns:
     {
         "candidates": [
@@ -456,12 +459,20 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
     
     image_paths_to_send = []
     if reference_path and os.path.exists(reference_path) and os.path.getsize(reference_path) > 0:
-        user_text_parts.append("附带的第 1 张图片为【基准参考图】（来自前序帧已确认的官方基底画面）。")
-        user_text_parts.append(f"随后的图片依次为【候选图 1】至【候选图 {len(candidate_paths)}】。")
+        user_text_parts.append("附带的第 1 张图片为【前序基准参考图】（来自前一拍已确认的官方基底画面）。")
         image_paths_to_send.append(reference_path)
     else:
         user_text_parts.append("本帧为【第 1 帧 / 锚点基准帧】，无前序参考图，请重点评估提示词还原度、透视构图与画面质感。")
-        user_text_parts.append(f"附带的图片依次为【候选图 1】至【候选图 {len(candidate_paths)}】。")
+
+    if succeeding_path and os.path.exists(succeeding_path) and os.path.getsize(succeeding_path) > 0:
+        succ_img_idx = len(image_paths_to_send) + 1
+        user_text_parts.append(f"附带的第 {succ_img_idx} 张图片为【后续目标参考图】（来自后一拍已生成的官方画面，用于三明治前后双向闭环校验，确保当前帧与后续帧不脱节断层）。")
+        if succeeding_prompt:
+            user_text_parts.append(f"【后续帧目标要求】: {succeeding_prompt.strip()}")
+        image_paths_to_send.append(succeeding_path)
+
+    start_cand_idx = len(image_paths_to_send) + 1
+    user_text_parts.append(f"随后的图片依次为【候选图 1】至【候选图 {len(candidate_paths)}】（对应附件中第 {start_cand_idx} 至 {start_cand_idx + len(candidate_paths) - 1} 张图片）。")
 
     for idx, cp in enumerate(candidate_paths):
         user_text_parts.append(f"- 候选图 {idx+1}: {os.path.basename(cp)}")
@@ -469,6 +480,7 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
 
     user_text_parts.append("\n【重要】：请全量严格使用【简体中文】输出 JSON 评审分析，对各候选图的优势（strengths）、缺陷（defects）与最终优选结论（selection_reason）进行中文评价。")
     user_text = "\n".join(user_text_parts)
+
 
     try:
         response_text = _multimodal_chat(
@@ -786,10 +798,34 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                 'message': f"IMG {seq:03d} 4张候选图生成完毕，准备 AI 鉴别...",
             })
 
-        # ── Step 2: AI Multi-modal Evaluation & Selection ──
-        eval_result = evaluate_and_select_best_candidate(
-            config, item.get('prompt', ''), reference, candidate_paths, seq, on_progress=on_progress
-        )
+        # ── Step 2: AI Multi-modal Evaluation & Selection (with Sandwich Bidirectional Check if succ frame exists) ──
+        succeeding_frame_path = None
+        succeeding_prompt_text = None
+        if frames_dir:
+            potential_succ = os.path.join(frames_dir, f'img_{seq + 1:03d}.webp')
+            if os.path.exists(potential_succ) and os.path.getsize(potential_succ) > 0:
+                succeeding_frame_path = potential_succ
+                succeeding_prompt_text = prompts_by_seq.get(seq + 1, {}).get('prompt')
+
+        eval_kw = {'on_progress': on_progress}
+        if succeeding_frame_path:
+            eval_kw['succeeding_path'] = succeeding_frame_path
+        if succeeding_prompt_text:
+            eval_kw['succeeding_prompt'] = succeeding_prompt_text
+
+        try:
+            eval_result = evaluate_and_select_best_candidate(
+                config, item.get('prompt', ''), reference, candidate_paths, seq, **eval_kw
+            )
+        except TypeError as te:
+            if 'succeeding_path' in str(te) or 'unexpected keyword' in str(te):
+                eval_result = evaluate_and_select_best_candidate(
+                    config, item.get('prompt', ''), reference, candidate_paths, seq, on_progress=on_progress
+                )
+            else:
+                raise
+
+
 
         best_idx = eval_result.get('best_index', 1)
         best_candidate_path = candidate_paths[best_idx - 1]

@@ -20,6 +20,7 @@ mimetypes.add_type('image/webp', '.webp')
 mimetypes.add_type('video/mp4', '.mp4')
 
 # Import everything from sub-modules to preserve namespace compatibility
+import server_common
 from server_common import *
 from frame_generator import *
 from video_generator import *
@@ -4904,6 +4905,12 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 config['_project_key'] = project_key
                 prompt_block = body.get('prompt_block', '')
                 sequence = body.get('sequence')
+                if body.get('candidate_selection') is not None:
+                    config['candidateSelection'] = bool(body.get('candidate_selection'))
+                    config['candidateSelectionMode'] = bool(body.get('candidate_selection'))
+                    config['candidate_selection'] = bool(body.get('candidate_selection'))
+                if body.get('generation_mode'):
+                    config['generation_mode'] = body.get('generation_mode')
                 if not isinstance(sequence, int):
                     self._send_json({'status': 'error', 'message': 'sequence 必须是整数'}, status=400)
                     return
@@ -5773,6 +5780,13 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     hit = _cover_candidate_path(raw)
                     if not hit:
                         return None
+                    outputs_dir = os.path.abspath(server_common.OUTPUT_ROOT if os.path.isabs(server_common.OUTPUT_ROOT) else os.path.join(base_dir, server_common.OUTPUT_ROOT))
+                    try:
+                        rel_to_out = os.path.relpath(hit, outputs_dir)
+                        if not rel_to_out.startswith('..'):
+                            return '/outputs/' + rel_to_out.replace('\\', '/')
+                    except ValueError:
+                        pass
                     return '/' + os.path.relpath(hit, base_dir).replace('\\', '/')
 
                 roles_in = body.get('roles') if isinstance(body.get('roles'), dict) else {}

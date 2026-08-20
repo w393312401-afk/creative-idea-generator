@@ -73,7 +73,7 @@ class TestFixFrameCandidateSelection(unittest.TestCase):
              patch.object(csp, 'generate_frame_candidates', side_effect=fake_generate_candidates) as mock_gen, \
              patch.object(csp, 'evaluate_and_select_best_candidate', return_value=fake_eval_result) as mock_eval, \
              patch.object(po, '_verify_review_violation', return_value=False):
-            result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 2)
+            result = po.fix_frame_issue({'candidateSelectionMode': True}, self.TITLE, self.PROMPT_BLOCK, 2)
 
         self.assertTrue(result['undoable'])
         self.assertIn('fixed image 2', result['prompt_block'])
@@ -107,6 +107,24 @@ class TestFixFrameCandidateSelection(unittest.TestCase):
         self.assertEqual(restored_content, b'fake_frame_bytes')
         self.assertIn('timber framing studs installed on the left wall', undo_res['prompt_block'])
 
+    def test_fix_frame_with_candidate_selection_disabled_generates_single_frame(self):
+        """当 4选1 模式开关关闭（candidateSelectionMode: False）时，修复单帧走标准单帧重渲而非 4选1。"""
+        fake_gen_seq = MagicMock()
+        with patch.object(po, 'fix_beat_from_sequence_review',
+                          return_value=('fixed video 1', 'fixed image 2')), \
+             patch('frame_generator.generate_frame_sequence', fake_gen_seq), \
+             patch.object(csp, 'run_candidate_selection_frame_sequence') as mock_cand_seq, \
+             patch.object(po, '_verify_review_violation', return_value=False):
+            result = po.fix_frame_issue({'candidateSelectionMode': False, 'generation_mode': 'standard'},
+                                        self.TITLE, self.PROMPT_BLOCK, 2)
+
+        self.assertTrue(result['undoable'])
+        self.assertIn('fixed image 2', result['prompt_block'])
+        # 确认未调用 4选1 流程，而是调用了标准 generate_frame_sequence
+        mock_cand_seq.assert_not_called()
+        fake_gen_seq.assert_called_once()
+        self.assertEqual(fake_gen_seq.call_args[1]['target_sequences'], [2])
+
     def test_fix_frame_1_generates_4_candidates_and_selects_best(self):
         """修复第 1 帧（首帧）：生成 4 张候选图，AI 鉴别优选 #3，写入主帧并更新 manifest。"""
         def fake_generate_candidates(config, title, item, reference_path, seq, candidate_count=4, **kwargs):
@@ -139,7 +157,7 @@ class TestFixFrameCandidateSelection(unittest.TestCase):
              patch.object(csp, 'generate_frame_candidates', side_effect=fake_generate_candidates) as mock_gen, \
              patch.object(csp, 'evaluate_and_select_best_candidate', return_value=fake_eval_result) as mock_eval, \
              patch.object(po, '_verify_review_violation', return_value=False):
-            result = po.fix_frame_issue({}, self.TITLE, self.PROMPT_BLOCK, 1)
+            result = po.fix_frame_issue({'candidateSelection': True}, self.TITLE, self.PROMPT_BLOCK, 1)
 
         self.assertTrue(result['undoable'])
         self.assertIn('fixed raw concrete prompt', result['prompt_block'])

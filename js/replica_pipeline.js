@@ -1655,6 +1655,30 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
     const a_dur = (typeof beat.action_duration_sec === 'number') ? beat.action_duration_sec : Math.round(s_dur * speed * 10) / 10;
     const quota = beat.voiceover_quota || { max_words: Math.floor(s_dur * 0.8 * 4.2), silence_sec: Math.round(s_dur * 0.2 * 10) / 10 };
 
+    const space = String(beat.space || '').trim();
+    const previous = String(previousSpace || '').trim();
+    const isCrossed = idx > 0 && previous && space && previous.toLowerCase() !== space.toLowerCase();
+    const isFirstBeat = idx === 0;
+    const isThreshold = beat.stage === 'transition' || isCrossed;
+    const hasMacroEnv = Array.isArray(beat.macro_environment)
+        ? beat.macro_environment.length > 0
+        : Boolean(String(beat.macro_environment || '').trim());
+
+    let macroEnvField = '';
+    if (isFirstBeat) {
+        macroEnvField = field('macro_environment', '大环境识别项（锚点首拍必填：地貌水体、气候光照、空间包络与周边宏观环境；一行一条）', 2);
+    } else if (isThreshold) {
+        macroEnvField = field('macro_environment', '大环境识别项（过门新空间首拍：新空间地貌、气候光照、空间三维包络；一行一条）', 2);
+    } else if (hasMacroEnv) {
+        macroEnvField = field('macro_environment', '大环境识别项（非首拍/过门拍建议留空以减少大模型干扰；一行一条）', 2);
+    } else {
+        macroEnvField = `
+            <details class="replica-field-optional">
+                <summary class="replica-hint">＋ 展开大环境识别项（非首拍/过门拍默认留空，避免干扰大模型）</summary>
+                ${field('macro_environment', '大环境识别项（地貌水体、气候光照、空间包络；一行一条）', 2)}
+            </details>`;
+    }
+
     return `
     <div class="replica-beat ${isCollapsed ? 'is-collapsed' : ''}" data-beat-id="${escapeHtmlReplica(beat.id)}" data-beat-index="${idx}">
         <div class="replica-beat-head">
@@ -1698,7 +1722,7 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
             </details>` : ''}
             <div class="replica-beat-fields">
                 ${field('space', '所在空间（同一个空间逐字沿用同一个名字；换名字＝机位穿过开口进了另一个空间，会多出一次过门）')}
-                ${field('macro_environment', '大环境识别项（地貌水体、气候光照、空间包络与周边宏观环境；一行一条）', 2)}
+                ${macroEnvField}
                 ${field('visual_subject', '画面主体')}
                 ${field('operation', '主导工序')}
                 ${field('package_operations',
