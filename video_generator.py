@@ -1887,7 +1887,8 @@ def build_cover_intro_clip(cover_path, ref_video, out_path, seconds=0.0, speed=1
         layout = 'mono' if channels == 1 else 'stereo'
         cmd += ["-f", "lavfi", "-i", f"anullsrc=channel_layout={layout}:sample_rate={rate}"]
     cmd += ["-vf", vf, "-t", f"{duration:.6f}", "-frames:v", str(encoded_frames),
-            "-r", f"{fps:g}", "-c:v", "libx264", "-pix_fmt", "yuv420p"]
+            "-r", f"{fps:g}", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart"]
     if has_audio:
         cmd += ["-c:a", "aac", "-ar", str(rate), "-ac", str(channels), "-shortest"]
     cmd += [out_path]
@@ -2139,7 +2140,7 @@ def retime_clip_even(src, dst, tmp_dir=None):
         # 2~3 帧（实测 8.0 → 8.08）。单段无所谓，但 12 段拼起来音轨（原样拷贝、仍是
         # 8.0）就会累积出接近一秒的音画偏移。多出来的那几帧落在片尾静置区，是重复帧，
         # 截掉不损失任何内容。
-        cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p",
+        cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                     "-t", f"{duration:.6f}", dst])
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, encoding='utf-8', errors='replace', timeout=300,
@@ -2470,7 +2471,7 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
                          "-map", "[v]", "-map", "[a]", "-c:a", "aac"])
         else:
             base.extend(["-filter_complex", _merge_filter(speed, False), "-map", "[v]"])
-        base.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", output_path])
+        base.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path])
         return base
 
     # 节奏时间分配：只要有任何一段带了 PACE 标签就走多输入路径；一段都没有时
@@ -2497,7 +2498,7 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
                     "-map", "[v]"])
         if has_audio:
             cmd.extend(["-map", "[a]", "-c:a", "aac"])
-        cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", output_path])
+        cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path])
         print(f"[INFO] Merging {len(video_files)} videos to {output_path} "
               f"(speed={speed:g}x, has_audio={has_audio}, pace={[round(k, 2) for k in clip_speeds]})...")
     else:
@@ -2636,7 +2637,7 @@ def _merge_skip_missing(project_dir, manifest_data, expected_slots, good, missin
                 "-map", "[v]", "-map", "[a]", "-c:a", "aac"]
     else:
         cmd += ["-filter_complex", _merge_filter(speed, False), "-map", "[v]"]
-    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", output_path]
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path]
 
     print(f"[INFO] Skip-merge: {len(video_files)} segments, skipped {skipped_slots}, speed={speed:g}x -> {output_path}")
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

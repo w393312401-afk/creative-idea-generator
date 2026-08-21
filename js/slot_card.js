@@ -90,7 +90,7 @@ function renderSlotCard(cardEl, state) {
             + `</div><span class="slot-label"></span>`;
     } else if (state.type === 'video') {
         body = `<div class="video-preview-wrapper">`
-            + `<video loop muted playsinline></video>`
+            + `<video loop muted playsinline preload="metadata"></video>`
             + `<div class="video-play-overlay"><span class="play-icon">▶</span></div>`
             + slotBadgesHtml(state)
             + slotActionsHtml(state)
