@@ -323,6 +323,10 @@ def analyze_frame(reference_path: str, candidate_path: str, *, prompt: str = "",
     hard_votes: set[str] = set()
     warning_votes: set[str] = set()
     for values in metrics:
+        matches = values.get("matches", 0)
+        if matches < thresholds["min_matches"]:
+            warning_votes.add("low_texture")
+            continue
         translation = values.get("translation_ratio")
         scale = values.get("scale_delta")
         if ((translation is not None and translation > thresholds["translation_ratio"])
@@ -331,15 +335,12 @@ def analyze_frame(reference_path: str, candidate_path: str, *, prompt: str = "",
         if (translation is not None and translation > thresholds["translation_ratio"]
                 and values.get("unaligned_edge_difference", 0) > 0.035):
             hard_votes.add("composition")
-        if (values.get("matches", 0) >= thresholds["min_matches"]
-                and values.get("inlier_ratio") is not None
+        if (values.get("inlier_ratio") is not None
                 and values["inlier_ratio"] < thresholds["min_inlier_ratio"]):
             hard_votes.add("landmarks")
         if (values.get("edge_difference", 0) > thresholds["edge_difference"]
                 and values.get("pixel_difference", 0) > thresholds["pixel_difference"]):
             hard_votes.add("structure")
-        if values.get("matches", 0) < thresholds["min_matches"]:
-            warning_votes.add("low_texture")
 
     progress = result["previous"].get("change_region_difference", 0)
     no_progress = progress < thresholds["min_progress"]

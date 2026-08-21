@@ -83,6 +83,24 @@ class FrameContinuityTests(unittest.TestCase):
         second = fc.register_family_master(self.tmp.name, 'family-1', 1, self.ref)
         self.assertNotEqual(first['image_sha256'], second['image_sha256'])
 
+    def test_low_texture_degrades_to_warning_not_hard_failure(self):
+        # When an image pair has very few keypoints/matches, it should degrade to a warning
+        # rather than falsely rejecting on noisy affine estimation.
+        blank_ref = os.path.join(self.tmp.name, 'blank_ref.png')
+        blank_cand = os.path.join(self.tmp.name, 'blank_cand.png')
+        img1 = Image.new('RGB', (360, 540), '#b9c8d2')
+        img2 = Image.new('RGB', (360, 540), '#b9c8d2')
+        d1 = ImageDraw.Draw(img1)
+        d2 = ImageDraw.Draw(img2)
+        d1.rectangle((50, 100, 65, 115), fill='#202020')
+        d2.rectangle((55, 105, 70, 120), fill='#202020')
+        img1.save(blank_ref)
+        img2.save(blank_cand)
+        result = fc.analyze_frame(blank_ref, blank_cand, mode='balanced')
+        self.assertNotEqual(result['status'], 'failed')
+        self.assertEqual(result['status'], 'warned')
+        self.assertTrue(any('low-texture' in r for r in result['reasons']))
+
 
 if __name__ == '__main__':
     unittest.main()
