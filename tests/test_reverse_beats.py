@@ -1769,6 +1769,26 @@ class TestAnchorGrounding(unittest.TestCase):
     def test_the_earliest_existing_frame_is_chosen(self):
         self.assertEqual(reverse.anchor_reference_frame({}, self._overview()), __file__)
 
+    def test_teaser_frame_is_skipped_for_real_start_frame(self):
+        with tempfile.NamedTemporaryFile(suffix='_001.png', delete=False) as f1, \
+             tempfile.NamedTemporaryFile(suffix='_002.png', delete=False) as f2:
+            f1_path, f2_path = f1.name, f2.name
+        try:
+            overview = {'review_sampling': {'frames': [
+                {'frame_path': f1_path, 'timestamp': 0.0},
+                {'frame_path': f2_path, 'timestamp': 0.16},
+            ]}}
+            facts = [
+                {'subject': 'A completed shelter clad in bark shingles stands on riverbank'},
+                {'subject': 'A worker spraying white marking line onto wild grass'},
+                {'subject': 'A worker cuts sod along outline'},
+            ]
+            self.assertEqual(reverse.anchor_reference_frame({}, overview, facts=facts), f2_path)
+        finally:
+            for p in (f1_path, f2_path):
+                if os.path.exists(p):
+                    os.unlink(p)
+
     def test_a_missing_file_yields_no_reference_instead_of_a_bad_path(self):
         self.assertIsNone(reverse.anchor_reference_frame({}, self._overview(exists=False)))
         self.assertIsNone(reverse.anchor_reference_frame({}, {}))

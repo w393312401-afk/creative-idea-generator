@@ -257,18 +257,139 @@ function projectsBadgesHtml(p) {
     return badges.join('');
 }
 
+function projectsAggregateJobs(p, maybeJobs) {
+    let project = {};
+    let subJobs = [];
+    if (Array.isArray(p)) {
+        subJobs = p;
+        project = maybeJobs || {};
+    } else if (p && typeof p === 'object') {
+        project = p;
+        subJobs = maybeJobs || p.sub_jobs || [];
+    } else {
+        return [];
+    }
+    if (!Array.isArray(subJobs) || !subJobs.length) return [];
+
+    const order = ['frames', 'staged_render', 'stepped', 'stepped_advance', 'videos', 'cover'];
+    const groups = new Map();
+
+    subJobs.forEach(job => {
+        if (!job) return;
+        const type = job.type || 'unknown';
+        if (!groups.has(type)) {
+            groups.set(type, {
+                type,
+                total: 0,
+                completed: 0,
+                failed: 0,
+                running: 0,
+                cancelled: 0,
+                unknown: 0,
+            });
+        }
+        const g = groups.get(type);
+        g.total++;
+        const st = job.status || 'unknown';
+        if (st === 'completed') g.completed++;
+        else if (st === 'failed') g.failed++;
+        else if (st === 'running') g.running++;
+        else if (st === 'cancelled') g.cancelled++;
+        else g.unknown++;
+    });
+
+    const result = Array.from(groups.values());
+    result.sort((a, b) => {
+        const ia = order.indexOf(a.type);
+        const ib = order.indexOf(b.type);
+        if (ia !== -1 && ib !== -1) return ia - ib;
+        if (ia !== -1) return -1;
+        if (ib !== -1) return 1;
+        return a.type.localeCompare(b.type);
+    });
+
+    const hasMediaFrames = (project.image_count > 0)
+        || (project.library && project.library.frame_count > 0)
+        || (project.assets && project.assets.file_count > 0 && (project.cover || project.assets.cover));
+    const hasMediaVideos = (project.video_count > 0);
+    const hasMediaCover = !!project.cover || (project.assets && !!project.assets.cover);
+
+    return result.map(g => {
+        const typeLabel = PROJECT_JOB_LABELS[g.type] || g.type;
+        let statusClass = 'completed';
+        let icon = '✓';
+        let label = '';
+        let title = '';
+
+        const typeHasMedia = (g.type === 'frames' || g.type === 'staged_render' || g.type === 'stepped' || g.type === 'stepped_advance') ? hasMediaFrames
+                           : (g.type === 'videos') ? hasMediaVideos
+                           : (g.type === 'cover') ? hasMediaCover
+                           : (project.saved || project.state === 'completed');
+
+        if (g.running > 0) {
+            statusClass = 'running';
+            icon = '⏳';
+            label = `${typeLabel}生成中`;
+            title = `${typeLabel}: ${g.running} 任务进行中${g.completed ? `, ${g.completed} 已完成` : ''}`;
+        } else if (g.completed > 0 || typeHasMedia) {
+            // 如果该类型有已完成任务，或者项目自身已有该媒体资产
+            statusClass = 'completed';
+            icon = '✓';
+            if ((g.type === 'frames' || g.type === 'staged_render') && (project.image_count || (project.library && project.library.frame_count))) {
+                const count = project.image_count || (project.library && project.library.frame_count);
+                label = `${count}帧序列`;
+            } else if (g.type === 'videos' && project.video_count) {
+                label = `${project.video_count}镜视频`;
+            } else {
+                label = typeLabel;
+            }
+            if (g.failed > 0) {
+                title = `${typeLabel}: 媒体已就绪（含 ${g.failed} 条历史重试/失败记录）`;
+            } else {
+                title = `${typeLabel}: 已就绪`;
+            }
+        } else if (g.failed > 0) {
+            statusClass = 'failed';
+            icon = '✕';
+            label = `${typeLabel}失败`;
+            title = `${typeLabel}: 生成失败（${g.failed} 次尝试未成功）`;
+        } else if (g.cancelled === g.total) {
+            statusClass = 'cancelled';
+            icon = '⚪';
+            label = `${typeLabel}已取消`;
+            title = `${typeLabel}: 全部已取消`;
+        } else {
+            statusClass = 'completed';
+            icon = '✓';
+            label = typeLabel;
+            title = `${typeLabel}: 已就绪`;
+        }
+
+        return {
+            type: g.type,
+            statusClass,
+            icon,
+            label,
+            title,
+            stats: g,
+        };
+    });
+}
+
 function projectsJobsHtml(p) {
-    if (!p.sub_jobs || !p.sub_jobs.length) return '';
-    return `<div class="project-jobs">${p.sub_jobs.map(j => `
-        <span class="project-job ${escapeHtml(j.status || '')}" title="${escapeHtml(j.error || j.status || '')}">
-            ${escapeHtml(PROJECT_JOB_ICONS[j.status] || '·')} ${escapeHtml(PROJECT_JOB_LABELS[j.type] || j.type)}
+    const agg = projectsAggregateJobs(p);
+    if (!agg.length) return '';
+    return `<div class="project-jobs">${agg.map(j => `
+        <span class="project-job ${escapeHtml(j.statusClass)}" title="${escapeHtml(j.title)}">
+            ${escapeHtml(j.icon)} ${escapeHtml(j.label)}
         </span>`).join('')}</div>`;
 }
 
 function projectsMetaHtml(p) {
     const bits = [];
     if (p.video_count) bits.push(`${p.video_count} 镜`);
-    else if (p.image_count) bits.push(`${p.image_count} 图`);
+    else if (p.image_count) bits.push(`${p.image_count} 帧`);
+    else if (p.library && p.library.frame_count) bits.push(`${p.library.frame_count} 帧`);
     if (p.assets && p.assets.file_count) {
         bits.push(`${p.assets.file_count} 个文件 · ${projectsFormatBytes(p.assets.bytes)}`);
     }
@@ -283,17 +404,42 @@ function projectsRowInnerHtml(p) {
         ? `<div class="project-progress"><span class="project-progress-stage" title="${escapeHtml(task.stage || '')}">${escapeHtml(projectsStageLabel(task.stage))}</span><span class="project-spinner"></span></div>`
         : '';
     const error = (p.state === 'failed' && task.error)
-        ? `<div class="project-error">❌ ${escapeHtml(task.error)}</div>` : '';
+        ? `<div class="project-error" title="${escapeHtml(task.error)}">❌ ${escapeHtml(task.error)}</div>` : '';
+    const badgesHtml = projectsBadgesHtml(p);
+
+    const actionBtns = [];
+    if (p.saved || task.status === 'completed') {
+        actionBtns.push('<button type="button" class="project-card-btn primary" data-act="open" title="打开项目">🎬 打开</button>');
+    }
+    if (task.status === 'running') {
+        actionBtns.push('<button type="button" class="project-card-btn primary" data-act="follow" title="跟进实时输出">👁 跟进</button>');
+    }
+    if (task.status === 'failed' || task.status === 'cancelled') {
+        actionBtns.push('<button type="button" class="project-card-btn" data-act="retry" title="重试">🔁 重试</button>');
+    }
+    if (p.assets && p.assets.file_count) {
+        actionBtns.push('<button type="button" class="project-card-btn" data-act="gallery" title="去画廊看资产">🖼️ 资产</button>');
+    }
+    const actionsOverlay = actionBtns.length
+        ? `<div class="project-card-actions">${actionBtns.join('')}</div>`
+        : '';
+
     // 勾选态不进 innerHTML（也不进 projectsRowSignature）：选中/取消是每次点击都
     // 发生的高频操作，重建整行 DOM 只为翻转一个 checked 太贵，而且会打断 hover。
     // 由 renderProjects 在行就位后直接改 .checked（见下）。
     return `
         <label class="project-check" title="选择（Shift 点击连选）"><input type="checkbox" class="p-check"></label>
-        <div class="project-thumb">${projectsCoverHtml(p)}</div>
+        <div class="project-thumb">
+            ${projectsCoverHtml(p)}
+            <div class="project-thumb-overlay">
+                <div class="project-thumb-badges">${badgesHtml}</div>
+                ${actionsOverlay}
+            </div>
+        </div>
         <div class="project-main">
             <div class="project-title-line">
-                <span class="project-title">${escapeHtml(p.title || '未命名项目')}</span>
-                ${projectsBadgesHtml(p)}
+                <span class="project-title" title="${escapeHtml(p.title || '未命名项目')}">${escapeHtml(p.title || '未命名项目')}</span>
+                <span class="project-badges-inline">${badgesHtml}</span>
             </div>
             ${projectsMetaHtml(p)}
             ${progress}
@@ -1043,11 +1189,21 @@ function initProjects() {
         if (btn) projectsRunBulkAction(btn.dataset.bulk);
     });
 
-    // 行点击 = 选中并展开详情
+    // 行点击 = 快捷动作 / 勾选 / 选中并展开详情
     container.addEventListener('click', (e) => {
         const row = e.target.closest('.project-row');
         if (!row) return;
         const key = row.dataset.key;
+
+        // 快捷操作按钮（卡片上的打开/跟进/重试/资产等）
+        const actBtn = e.target.closest('[data-act]');
+        if (actBtn) {
+            e.stopPropagation();
+            const act = actBtn.dataset.act;
+            const p = projectsFindRow(key);
+            if (p) projectsRunAction(act, p, e, actBtn.dataset.jobId || '');
+            return;
+        }
 
         // 勾选框走多选，不动详情 pane：勾 8 行做批量删除时不该顺带把详情翻 8 次
         if (e.target.closest('.project-check')) {
@@ -1067,6 +1223,20 @@ function initProjects() {
         container.querySelectorAll('.project-row.selected').forEach(el => el.classList.remove('selected'));
         if (projectsSelectedKey) row.classList.add('selected');
         renderProjectDetail();
+    });
+
+    // 双击卡片快速打开项目
+    container.addEventListener('dblclick', (e) => {
+        const row = e.target.closest('.project-row');
+        if (!row || e.target.closest('.project-check') || e.target.closest('[data-act]')) return;
+        const key = row.dataset.key;
+        const p = projectsFindRow(key);
+        if (!p) return;
+        if (p.saved || (p.task && p.task.status === 'completed')) {
+            projectsRunAction('open', p, e);
+        } else if (p.task && p.task.status === 'running') {
+            projectsRunAction('follow', p, e);
+        }
     });
 
     // 详情里的动作按钮

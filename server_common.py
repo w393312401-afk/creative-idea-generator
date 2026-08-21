@@ -3103,16 +3103,77 @@ def _library_item_path(item_id, library_dir=None):
     return os.path.join(items_dir, f'{safe}.json')
 
 
+def result_project_cover(result):
+    """从激发结果中提取封面。若无独立封面则回退至第一帧画面或首图。"""
+    if not isinstance(result, dict):
+        return None
+    roles = result.get('coverRoles') if isinstance(result.get('coverRoles'), dict) else {}
+    cov = (roles.get('project') or result.get('activeCoverUrl') or result.get('cover')
+           or result.get('cover_image') or result.get('active_cover'))
+    if cov and str(cov).strip():
+        return str(cov).strip()
+    covers = result.get('covers')
+    if isinstance(covers, list) and covers:
+        for c in covers:
+            if c and str(c).strip():
+                return str(c).strip()
+    frame_run = result.get('frameRun') if isinstance(result.get('frameRun'), dict) else {}
+    frames = frame_run.get('frames') if isinstance(frame_run.get('frames'), list) else []
+    if not frames and isinstance(result.get('frames'), list):
+        frames = result.get('frames')
+    if frames:
+        for f in frames:
+            if isinstance(f, dict):
+                url = f.get('url') or f.get('image_url') or f.get('path') or f.get('image') or f.get('file')
+                if url and str(url).strip():
+                    return str(url).strip()
+            elif isinstance(f, str) and f.strip():
+                return f.strip()
+    images = result.get('images')
+    if isinstance(images, list) and images:
+        for img in images:
+            if isinstance(img, str) and img.strip():
+                return img.strip()
+            elif isinstance(img, dict) and (img.get('url') or img.get('path')):
+                return str(img.get('url') or img.get('path')).strip()
+    return None
+
+
 def item_project_cover(item):
     """点子库条目 → 项目卡片上显示的那张封面。
 
-    按用途登记的 coverRoles.project 优先，其次主封面 activeCoverUrl，最后是第一张。
-    （用户可能把带文案的那张指给成片首帧、把干净的那张留给项目卡片，见 COVER_ROLE_KEYS。）
+    按用途登记的 coverRoles.project 优先，其次主封面 activeCoverUrl，其次 covers 首图。
+    若无独立封面，则回退至 frameRun.frames[0]（第一帧画面）、frames[0] 或 images[0]。
     """
+    if not isinstance(item, dict):
+        return None
     roles = item.get('coverRoles') if isinstance(item.get('coverRoles'), dict) else {}
     covers = item.get('covers') if isinstance(item.get('covers'), list) else []
-    return (roles.get('project') or item.get('activeCoverUrl')
-            or (covers[0] if covers else None))
+    cov = (roles.get('project') or item.get('activeCoverUrl')
+           or (covers[0] if covers else None) or item.get('cover') or item.get('cover_image'))
+    if cov and str(cov).strip():
+        return str(cov).strip()
+    # 回退至首帧画面
+    frame_run = item.get('frameRun') if isinstance(item.get('frameRun'), dict) else {}
+    frames = frame_run.get('frames') if isinstance(frame_run.get('frames'), list) else []
+    if not frames and isinstance(item.get('frames'), list):
+        frames = item.get('frames')
+    if frames:
+        for f in frames:
+            if isinstance(f, dict):
+                url = f.get('url') or f.get('image_url') or f.get('path') or f.get('image') or f.get('file')
+                if url and str(url).strip():
+                    return str(url).strip()
+            elif isinstance(f, str) and f.strip():
+                return f.strip()
+    images = item.get('images')
+    if isinstance(images, list) and images:
+        for img in images:
+            if isinstance(img, str) and img.strip():
+                return img.strip()
+            elif isinstance(img, dict) and (img.get('url') or img.get('path')):
+                return str(img.get('url') or img.get('path')).strip()
+    return None
 
 
 def library_index_entry(item):
@@ -4708,12 +4769,13 @@ def _proj_asset_stats(project_key, title, base_dir):
             if not os.path.isdir(dpath):
                 continue
             try:
-                names = os.listdir(dpath)
+                names = sorted(os.listdir(dpath))
             except OSError:
                 continue
             for fname in names:
                 fpath = os.path.join(dpath, fname)
-                if _gallery_media_type(fname) is None or not os.path.isfile(fpath):
+                mtype = _gallery_media_type(fname)
+                if mtype is None or not os.path.isfile(fpath):
                     continue
                 try:
                     st = os.stat(fpath)
@@ -4776,7 +4838,7 @@ def task_has_cover(task, base_dir=None, library_items=None):
     """判断一条任务记录是否拥有关联的封面图片。
 
     检测来源：
-    1. 任务自身结果 (result.covers / result.cover / result.activeCoverUrl / result.cover_image)
+    1. 任务自身结果 (result_project_cover: coverRoles / activeCoverUrl / covers / frameRun / images / frames)
     2. 任务 dimensions 中的封面声明 (dimensions.covers / dimensions.cover 等)
     3. 点子库条目 (item_project_cover)
     4. outputs/ 本地磁盘项目资产 (通过 _proj_asset_stats / manifest 登记)
@@ -4786,13 +4848,8 @@ def task_has_cover(task, base_dir=None, library_items=None):
 
     # 1. 检查 result
     result = task.get('result') if isinstance(task.get('result'), dict) else {}
-    covers = result.get('covers')
-    if isinstance(covers, list) and any(bool(c and str(c).strip()) for c in covers):
+    if result_project_cover(result):
         return True
-    for key in ('cover', 'activeCoverUrl', 'cover_image', 'active_cover'):
-        val = result.get(key)
-        if val and str(val).strip():
-            return True
 
     # 2. 检查 dimensions
     dims = task.get('dimensions') if isinstance(task.get('dimensions'), dict) else {}
@@ -4841,7 +4898,7 @@ def library_item_has_cover(item, base_dir=None):
     """判断一条点子库条目是否拥有关联的封面图片。
 
     检测来源：
-    1. item_project_cover(item) (coverRoles.project / activeCoverUrl / covers 首图)
+    1. item_project_cover(item) (coverRoles.project / activeCoverUrl / covers 首图 / frameRun.frames / images)
     2. item 字典中的 cover / activeCoverUrl / cover_image / active_cover 字段
     3. covers 列表非空
     4. outputs/ 本地磁盘项目资产 (_proj_asset_stats / manifest 登记)
@@ -4860,6 +4917,21 @@ def library_item_has_cover(item, base_dir=None):
 
     covers = item.get('covers')
     if isinstance(covers, list) and any(bool(c and str(c).strip()) for c in covers):
+        return True
+
+    frame_run = item.get('frameRun') if isinstance(item.get('frameRun'), dict) else {}
+    frames = frame_run.get('frames') if isinstance(frame_run.get('frames'), list) else []
+    if not frames and isinstance(item.get('frames'), list):
+        frames = item.get('frames')
+    if frames:
+        for f in frames:
+            if isinstance(f, dict) and (f.get('url') or f.get('image_url') or f.get('path') or f.get('file')):
+                return True
+            if isinstance(f, str) and f.strip():
+                return True
+
+    images = item.get('images') if isinstance(item.get('images'), list) else []
+    if any(bool(img and str(img).strip()) for img in images):
         return True
 
     # 检查 outputs/ 磁盘资产
@@ -5040,6 +5112,7 @@ def build_projects_index(tasks=None, library_items=None, ledger_rows=None,
         entry = projects.setdefault(key, _proj_blank(key))
         entry['title'] = entry['title'] or title
         entry['theme'] = entry['theme'] or dims.get('theme') or ''
+        entry['cover'] = entry['cover'] or result_project_cover(result)
         # 同一行可能对应同键重跑：留最新的那个，
         # 否则行上的状态/进度取决于 ACTIVE_TASKS 的遍历顺序。
         if (entry['task'] or {}).get('last_active', -1) <= float(task.get('last_active') or 0):

@@ -3363,6 +3363,11 @@ function hasIdeaCover(idea) {
     if (Array.isArray(idea.covers) && idea.covers.length > 0) return true;
     if (idea.activeCoverUrl) return true;
     if (typeof coverRoleUrl === 'function' && coverRoleUrl(idea, 'frame1')) return true;
+    if (idea.cover || idea.cover_image) return true;
+    const run = idea.frameRun || {};
+    if (Array.isArray(run.frames) && run.frames.some(f => f && (f.url || f.image_url || f.file || f.path))) return true;
+    if (Array.isArray(idea.frames) && idea.frames.some(f => f && (f.url || f.image_url || f.file || f.path || (typeof f === 'string' && f.trim())))) return true;
+    if (Array.isArray(idea.images) && idea.images.some(img => img && (typeof img === 'string' && img.trim()))) return true;
     return false;
 }
 

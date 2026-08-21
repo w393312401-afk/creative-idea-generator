@@ -229,6 +229,71 @@ async function testRemixDoesNotSwitchWhenLoadFails() {
   assert.match(toasts[0], /打开复刻作业失败/);
 }
 
+function testSubJobsAggregation() {
+  const pWithMedia = {
+    image_count: 21,
+    video_count: 4,
+    sub_jobs: [
+      { id: 'f_1', type: 'frames', status: 'failed' },
+      { id: 'f_2', type: 'frames', status: 'failed' },
+      { id: 'v_1', type: 'videos', status: 'failed' },
+    ],
+  };
+
+  const agg = sandbox.projectsAggregateJobs(pWithMedia);
+  assert.equal(agg.length, 2);
+  assert.equal(agg[0].type, 'frames');
+  assert.equal(agg[0].statusClass, 'completed');
+  assert.equal(agg[0].icon, '✓');
+  assert.equal(agg[0].label, '21帧序列');
+
+  assert.equal(agg[1].type, 'videos');
+  assert.equal(agg[1].statusClass, 'completed');
+  assert.equal(agg[1].icon, '✓');
+  assert.equal(agg[1].label, '4镜视频');
+
+  const html = sandbox.projectsJobsHtml(pWithMedia);
+  assert.match(html, /✓ 21帧序列/);
+  assert.match(html, /✓ 4镜视频/);
+
+  // 无媒体且失败的项目
+  const pFailed = {
+    image_count: 0,
+    video_count: 0,
+    sub_jobs: [
+      { id: 'f_1', type: 'frames', status: 'failed' },
+    ],
+  };
+  const aggFailed = sandbox.projectsAggregateJobs(pFailed);
+  assert.equal(aggFailed[0].statusClass, 'failed');
+  assert.equal(aggFailed[0].icon, '✕');
+  assert.equal(aggFailed[0].label, '帧序列失败');
+}
+
+function testRowInnerHtmlIncludesOverlayAndActions() {
+  const rowHtml = sandbox.projectsRowInnerHtml({
+    project_key: 'test_p1',
+    title: '河畔树皮棚改造成地下避世静室',
+    state: 'completed',
+    saved: true,
+    cover: '/outputs/test.webp',
+    image_count: 21,
+    assets: { file_count: 46, bytes: 151 * 1024 * 1024 },
+    updated_at: 1787287928,
+    sub_jobs: [
+      { id: 'f1', type: 'frames', status: 'completed' },
+      { id: 'f2', type: 'frames', status: 'completed' },
+    ],
+  });
+
+  assert.match(rowHtml, /class="project-thumb-overlay"/);
+  assert.match(rowHtml, /class="project-thumb-badges"/);
+  assert.match(rowHtml, /data-act="open"/);
+  assert.match(rowHtml, /data-act="gallery"/);
+  assert.match(rowHtml, /class="project-badges-inline"/);
+  assert.match(rowHtml, /✓ 21帧序列/);
+}
+
 (async () => {
   await testLightweightRefreshKeepsExistingCover();
   testBrokenLibraryCoverFallsBackToDiskCover();
@@ -241,6 +306,8 @@ async function testRemixDoesNotSwitchWhenLoadFails() {
   await testRemixLoadsTheJobBeforeSwitchingTabs();
   await testRemixWithoutBeatsSaysSo();
   await testRemixDoesNotSwitchWhenLoadFails();
+  testSubJobsAggregation();
+  testRowInnerHtmlIncludesOverlayAndActions();
   console.log('projects UI regression tests passed');
 })().catch(error => {
   console.error(error);

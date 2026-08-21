@@ -65,6 +65,23 @@ def test_task_has_cover_detection():
     }]
     assert server_common.task_has_cover(task_pk, base_dir='/tmp', library_items=lib_pk) is True
 
+    # 6. 结果中带 frameRun 帧序列（实际在激发结果中已有媒体）
+    task_with_framerun = {
+        'id': 'task_6',
+        'status': 'completed',
+        'dimensions': {'theme': '帧序列项目'},
+        'result': {
+            'title': '帧序列项目',
+            'frameRun': {
+                'frames': [
+                    {'url': '/outputs/frames/frame_01.webp', 'prompt': '...'},
+                    {'url': '/outputs/frames/frame_02.webp', 'prompt': '...'},
+                ]
+            }
+        }
+    }
+    assert server_common.task_has_cover(task_with_framerun, base_dir='/tmp', library_items=[]) is True
+
 
 def test_library_item_has_cover_detection(monkeypatch):
     # 1. 无封面条目
@@ -107,6 +124,16 @@ def test_library_item_has_cover_detection(monkeypatch):
         'title': '磁盘封面收藏',
     }
     assert server_common.library_item_has_cover(item_with_disk_cover, base_dir='/tmp') is True
+
+    # 6. 带 frameRun.frames
+    item_with_framerun = {
+        'id': 'lib_6',
+        'title': '帧序列收藏',
+        'frameRun': {
+            'frames': [{'url': '/outputs/lib6/frame_01.png'}]
+        }
+    }
+    assert server_common.library_item_has_cover(item_with_framerun, base_dir='/tmp') is True
 
 
 def test_clear_no_cover_tasks_endpoint(monkeypatch, tmp_path):

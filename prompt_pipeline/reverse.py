@@ -2003,18 +2003,66 @@ def attach_scene_constants(beats_doc, facts):
     return beats_doc['scene_constants']
 
 
-def anchor_reference_frame(beats_doc, overview):
-    """起始锚点该照着哪一张真实帧写：原片最早的那一张送审帧。
+def is_teaser_flash_frame(f0_text, f_subsequent_texts):
+    """判断首帧是否为短视频常见的 0.16s 完工/半成品先导钩子闪帧 (Teaser Flash)。"""
+    if not f0_text or not f_subsequent_texts:
+        return False
+
+    adv_patterns = [
+        r'\b(shelter|shingle|window|retaining|shoring|plank shoring|clad in|paneled|roof deck|bunker|cabin|suite|completed|furnished|welded|aquarium)\b'
+    ]
+    layout_patterns = [
+        r'\b(marking can|spraying|spray paint|marking line|mineral powder|powder from a bag|layout line|aerosol|dispensing white|running downward|walks across a grassy field|clearing grass|cutting sod|stripping turf|natural wild|undisturbed|bare ground)\b'
+    ]
+
+    f0_has_adv = any(re.search(p, f0_text, re.I) for p in adv_patterns)
+    subs_have_layout = any(re.search(p, text, re.I) for text in f_subsequent_texts for p in layout_patterns)
+
+    return bool(f0_has_adv and subs_have_layout)
+
+
+def anchor_reference_frame(beats_doc, overview, facts=None):
+    """起始锚点该照着哪一张真实帧写：原片最早的那一张有效送审帧。
 
     锚点图（IMAGE 1）是整条序列的地基——后面每一拍的画面都从它继承材质与光线。它写歪
     了，后面全歪，而组稿阶段它恰恰是凭文字空想出来的。
+    如果原片在 0.0s 处含有短视频常见的 0.16s 完工/半成品先导钩子帧（Teaser Flash），
+    而后续几帧才是真正的施工放线/未开发原始地面，则自动跳过孤立先导帧，锁定真实起始帧。
     """
     entries = [e for e in ((overview or {}).get('review_sampling') or {}).get('frames') or []
                if e.get('frame_path') and e.get('timestamp') is not None]
     if not entries:
         return None
-    path = min(entries, key=lambda e: _num(e['timestamp'], default=1e9))['frame_path']
-    return path if os.path.exists(path) else None
+    entries = [e for e in entries if os.path.exists(e['frame_path'])]
+    if not entries:
+        return None
+    entries.sort(key=lambda e: _num(e['timestamp'], default=1e9))
+
+    # 尝试加载 frame_facts 进行先导帧检测
+    if len(entries) > 1 and _num(entries[0].get('timestamp'), default=0) < 0.25:
+        if facts is None:
+            facts = (beats_doc or {}).get('facts') or (overview or {}).get('facts')
+            if not facts and entries[0].get('frame_path'):
+                job_dir_cand = os.path.dirname(os.path.dirname(entries[0]['frame_path']))
+                ff_path = os.path.join(job_dir_cand, 'frame_facts.json')
+                if os.path.exists(ff_path):
+                    try:
+                        with open(ff_path, 'r', encoding='utf-8') as f:
+                            facts = json.load(f)
+                    except Exception:
+                        facts = None
+        if isinstance(facts, dict):
+            facts = facts.get('facts') or []
+
+        if isinstance(facts, list) and len(facts) > 1:
+            f0_text = str(facts[0].get('subject') or facts[0].get('description') or '')
+            f_subs = [str(f.get('subject') or f.get('description') or '') for f in facts[1:min(6, len(facts))]]
+            if is_teaser_flash_frame(f0_text, f_subs):
+                if sys.stdout:
+                    print(f'[REVERSE] 检测到片头先导钩子帧 (Teaser Flash: {entries[0]["frame_path"]})，自动跳过并锁定真实起始帧: {entries[1]["frame_path"]}')
+                return entries[1]['frame_path']
+
+    return entries[0]['frame_path']
 
 
 def ground_anchor_on_reference(config, anchor_prompt, frame_path, on_progress=None):
