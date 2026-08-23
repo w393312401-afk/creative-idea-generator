@@ -14,7 +14,7 @@ from server_common import (
     ACTIVE_TASKS_LOCK, ACTIVE_TASKS, get_or_create_task,
     notify_listeners, save_tasks_to_disk,
     apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
-    read_manifest, write_manifest, strict_gates_enabled, qa_gate_level, gate_setting,
+    read_manifest, write_manifest, manifest_lock, strict_gates_enabled, qa_gate_level, gate_setting,
     _is_cover_filename, _cover_candidate_path,
     resolve_video_duration,
     stamp_manifest_capabilities,
@@ -22,6 +22,7 @@ from server_common import (
     _get_account_pool_service, _select_pool_account,
     _account_switch_interval, _account_in_cooldown,
     _account_has_credit, _account_rotation_ring, _next_unused_account,
+    revalidate_leg_account,
     get_subprocess_window_flags,
 )
 
@@ -633,10 +634,118 @@ def extract_declared_frame_anchors(prompt, default_start=1, default_end=2):
     return declared
 
 
-def rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=None, end_slot=None):
+# 两卡位锚点声明句：整句就是"首帧=IMAGE a、尾帧=IMAGE b、在两者之间插值"这件事，
+# 单图段里一个字都不成立，整句丢弃。分两条是因为正文里它经常被拆成两句写。
+_TWO_ANCHOR_DECLARATION_RE = re.compile(
+    r'(?:\bfirst[\s-]frame\b.*?\blast[\s-]frame\b|\blast[\s-]frame\b.*?\bfirst[\s-]frame\b)',
+    re.IGNORECASE | re.DOTALL)
+_INTERPOLATION_CLAUSE_RE = re.compile(
+    r'interpolat\w*\s+between\s+(?:those|these|the)\s+two\s+frame\s+images?', re.IGNORECASE)
+
+_SINGLE_FRAME_OPENING = (
+    "Use the provided reference image (IMAGE 1) as the sole starting-frame anchor for this clip "
+    "— use IMAGE 1 as the actual first-frame image. There is no last-frame reference image for "
+    "this clip, so the clip must reach its own finished state by the final frame; hold the same "
+    "space, the same locked camera family, and every landmark from IMAGE 1 throughout, and "
+    "invent no new layout, no new room, and no new structure."
+)
+
+
+_T2V_DISCARD_SENTENCE_RE = re.compile(
+    r'(?:'
+    r'\bfirst[\s-]frame\b.*?\blast[\s-]frame\b|'
+    r'\blast[\s-]frame\b.*?\bfirst[\s-]frame\b|'
+    r'exact\s+composition\s+anchors|'
+    r'sole\s+starting[- ]frame\s+anchor|'
+    r'no\s+last[- ]frame\s+reference\s+image|'
+    r'interpolat\w*\s+between\s+(?:those|these|the)\s+(?:two\s+)?frame\s+images?|'
+    r'Use\s+(?:the\s+provided\s+)?(?:reference\s+image\s+)?\(?(?:IMAGE|图片)\s*\d+\)?\s+as\s+(?:the\s+)?(?:actual\s+)?first[- ]frame|'
+    r'Use\s+(?:the\s+provided\s+)?(?:IMAGE|图片)\s*\d+\s+as\s+(?:the\s+)?(?:actual\s+)?first[- ]frame|'
+    r'Use\s+(?:IMAGE|图片)\s*\d+\s+as\s+first\s+frame|'
+    r'Use\s+(?:IMAGE|图片)\s*\d+\s+as\s+the\s+start'
+    r')',
+    re.IGNORECASE | re.DOTALL
+)
+
+
+def prepare_prompt_for_t2v(prompt: str) -> str:
+    """把一条带有图像锚点声明/插值指令的视频提示词净化为纯文生视频 (Text-to-Video) 提示词。
+
+    保留场景描写、运镜机位、工人动作、光影材质与 SFX 音效，彻底剔除不存在的参考图声明与两卡位插值样板句。
+    """
+    text = str(prompt or '').strip()
+    if not text:
+        return ''
+
+    # 剔除 ANCHOR_RETRY_ADAPTATION 块
+    text = re.sub(r'ANCHOR_RETRY_ADAPTATION:.*?(?=\n\n|\Z)', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    kept = []
+    for sentence in re.split(r'(?<=[.!?。！？])\s+', text):
+        if _T2V_DISCARD_SENTENCE_RE.search(sentence):
+            continue
+        kept.append(sentence)
+    body = ' '.join(s for s in kept if s.strip()).strip()
+
+    # 清除残留的 "from IMAGE 1" / "matching IMAGE 1" / "IMAGE \d+" / "图片 \d+"
+    body = re.sub(r'\b(?:from|matching|matching\s+the)\s+(?:IMAGE|图片)\s*\d+\b', '', body, flags=re.IGNORECASE)
+    body = re.sub(r'\b(?:IMAGE|图片)\s*\d+\b', '', body, flags=re.IGNORECASE)
+
+    # 规整标点与连续空格
+    body = re.sub(r'\s{2,}', ' ', body)
+    body = re.sub(r'\s*([,;.!?，。；！？])\s*', r'\1 ', body)
+    body = body.strip(' ,;，；')
+    return body
+
+
+def rewrite_prompt_for_single_frame(prompt, start_slot):
+    """把一条为两张锚点帧写的视频正文改写成单图段（只上首帧）能用的正文。
+
+    2026-08-22：单帧分支此前只把 `IMAGE start_slot` 换成 `IMAGE 1`，正文里那句
+    "…and IMAGE 13 as the actual last-frame image" 原样留着，于是一个**裸的 IMAGE 13**
+    被送进模型——它会去找一张根本没上传的参考图。同一段还留着"在两张帧之间插值、不得
+    自造第三种布局"，而单图段恰恰没有第二张可插值的帧。两者叠起来，模型只能自由发挥。
+
+    三步：
+      1. 丢掉两卡位锚点声明句与插值指令句（整句就是这件事，删了不损失动作正文）；
+      2. 正文中残留的 `IMAGE start_slot` 换成 `IMAGE 1`，其余任何 `IMAGE n` 一律换成
+         「本段自己要抵达的完工态」——不能留裸编号；
+      3. 前置单锚点声明，并把"没有尾锚"这件事和"不得另起炉灶"一起写明。
+    """
+    text = str(prompt or '').strip()
+    if not text:
+        return _SINGLE_FRAME_OPENING
+
+    kept = []
+    for sentence in re.split(r'(?<=[.!?])\s+', text):
+        if _TWO_ANCHOR_DECLARATION_RE.search(sentence) or _INTERPOLATION_CLAUSE_RE.search(sentence):
+            continue
+        kept.append(sentence)
+    body = ' '.join(s for s in kept if s.strip()).strip()
+
+    body = re.sub(rf'\bimage\s*{start_slot}\b', 'IMAGE 1', body, flags=re.IGNORECASE)
+    body = re.sub(rf'图片\s*{start_slot}\b', 'IMAGE 1', body)
+    # 其余编号（尾锚及任何跨段引用）不能留裸数字：模型会当成一张没上传的参考图。
+    body = re.sub(r'\bimage\s*\d+\b', "this clip's own finished state", body, flags=re.IGNORECASE)
+    body = re.sub(r'图片\s*\d+\b', "this clip's own finished state", body)
+    # 删句后可能留下的空壳标点
+    body = re.sub(r'\s{2,}', ' ', body).strip(' ;,')
+
+    return f"{_SINGLE_FRAME_OPENING} {body}".strip() if body else _SINGLE_FRAME_OPENING
+
+
+def rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=None, end_slot=None, single_frame=False):
     """把提示词里的 IMAGE start_slot / IMAGE end_slot（含中文「图片 N」）改写为
     IMAGE 1 / IMAGE 2，对应 Google Labs Flow 两卡位（首帧/尾帧）UI。若未传 start_slot/end_slot，
-    自动从提示词正文中提取显式声明；无声明时默认等于 slot / slot+1。"""
+    自动从提示词正文中提取显式声明；无声明时默认等于 slot / slot+1。
+
+    single_frame=True 表示**槽位契约**说这一段只上首帧（[HERO] / 末槽单图）。这一位不能
+    用 end_slot=None 代替：那个值在本函数里的含义是"没传，去正文里自动认"，一条普通两锚点
+    正文会当场把尾帧编号认回来，改写成「IMAGE 1 首帧 / IMAGE 2 尾帧」，而 IMAGE 2 根本
+    没上传。契约优先于正文声明，所以它是独立的一位。"""
+    if single_frame:
+        return rewrite_prompt_for_single_frame(
+            prompt, start_slot if start_slot is not None else slot)
     if start_slot is None or end_slot is None:
         _s, _e = extract_declared_frame_anchors(prompt, slot, slot + 1)
         start_slot = start_slot if start_slot is not None else _s
@@ -658,9 +767,9 @@ def rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=None, end_slot=None)
         prompt = re.sub(rf'\bimage\s+{start_slot}\b', 'IMAGE 1', prompt, flags=re.IGNORECASE)
         prompt = re.sub(rf'图片\s*{start_slot}\b', 'IMAGE 1', prompt)
     else:
-        # 单帧（HERO）
-        prompt = re.sub(rf'\bimage\s+{start_slot}\b', 'IMAGE 1', prompt, flags=re.IGNORECASE)
-        prompt = re.sub(rf'图片\s*{start_slot}\b', 'IMAGE 1', prompt)
+        # 单帧（HERO / 末槽单图）：不能只换首帧编号了事——正文里的尾帧声明和插值指令
+        # 在单图段里全部不成立，见 rewrite_prompt_for_single_frame。
+        prompt = rewrite_prompt_for_single_frame(prompt, start_slot)
 
     return prompt
 
@@ -879,7 +988,11 @@ def plan_video_slots(video_slots, slot_to_path, slot_to_quality, videos_dir, tar
                 'contract_end': end_slot,
             }
         rewrite_start, rewrite_end = declared if declared is not None else (start_slot, end_slot)
-        prompt = rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=rewrite_start, end_slot=rewrite_end)
+        # 契约说这一段只上首帧时，正文里声明的尾帧编号一个字也不能改写口径——否则一条
+        # 普通两锚点正文被挂到单图槽位上，会被改写成「IMAGE 1 首帧 / IMAGE 2 尾帧」，
+        # 而 IMAGE 2 根本没上传。同 declared 不改选帧，declared 也不改卡位数。
+        prompt = rewrite_prompt_for_two_card_ui(prompt, slot, start_slot=rewrite_start,
+                                                end_slot=rewrite_end, single_frame=(end_slot is None))
         dest_path = os.path.join(videos_dir, f'vid_{slot:03d}.mp4')
         start_p = slot_to_path.get(start_slot)
         end_p = None if (is_hero or end_slot is None) else slot_to_path.get(end_slot)
@@ -1597,6 +1710,26 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                 # 腿与腿之间是唯一能干净停下来的位置：用户已取消就别再开下一个浏览器
                 if idx > 0 and (getattr(builtins, 'google_fx_cancelled', False) or cancel_check_cb()):
                     break
+                # 切腿前复核积分：ring 是整条序列开始前按缓存值排定的，前面几条腿
+                # 烧掉多少积分号池并不记账，环里排在后面的号可能早就不够跑了。
+                if idx > 0 and pool_account_id:
+                    verified = revalidate_leg_account(
+                        config, account_pool, leg['user_id'], ring, used_account_ids)
+                    if verified is None:
+                        if on_progress:
+                            on_progress('video_warning', {
+                                'total': len(plans),
+                                'message': (f"号池里已经没有积分够用的账号，第 {idx + 1}/{len(legs)} 段"
+                                            f"仍按原计划用 {leg['user_id']} 试跑（生成中若确认积分不足会自动中止）"),
+                            })
+                    elif verified != leg['user_id']:
+                        if on_progress:
+                            on_progress('video_warning', {
+                                'total': len(plans),
+                                'message': (f"复核积分：原定账号 {leg['user_id']} 已不够用，"
+                                            f"第 {idx + 1}/{len(legs)} 段改用 {verified}"),
+                            })
+                        leg['user_id'] = verified
                 if idx > 0 and on_progress:
                     on_progress('video_warning', {
                         'total': len(plans),
@@ -1676,6 +1809,346 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     manifest_data['manifest'] = '/' + os.path.relpath(manifest_path, _BASE_DIR).replace('\\', '/')
     manifest_data['project_dir'] = os.path.abspath(project_dir)
     return manifest_data
+
+
+def generate_video_collage(project_dir, out_collage_path=None):
+    """根据项目下的 frames 生成 5 列多宫格拼图大图（单帧宽度 240px，行数向上取整）。
+    用于全局视觉连续性检查。"""
+    frames_dir = os.path.join(project_dir, 'frames')
+    if not os.path.exists(frames_dir):
+        return None
+    import glob
+    import math
+    frame_files = sorted(
+        glob.glob(os.path.join(frames_dir, 'img_*.webp'))
+        + glob.glob(os.path.join(frames_dir, 'img_*.png'))
+        + glob.glob(os.path.join(frames_dir, 'img_*.jpg'))
+    )
+    if not frame_files:
+        return None
+
+    inputs = []
+    input_args = []
+    for p in frame_files:
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            input_args.extend(['-i', p])
+            inputs.append(p)
+    if not inputs:
+        return None
+
+    cols = 5
+    rows = math.ceil(len(inputs) / cols)
+    if not out_collage_path:
+        out_collage_path = os.path.join(frames_dir, 'full_collage.jpg')
+    n = len(inputs)
+    filter_parts = [
+        f'[{i}:v]scale=240:-1:force_original_aspect_ratio=decrease,pad=240:ih:(ow-iw)/2:(oh-ih)/2[s{i}]'
+        for i in range(n)
+    ]
+    filter_str = ';'.join(filter_parts) + ';'
+    filter_str += ''.join(f'[s{i}]' for i in range(n))
+    filter_str += f'concat=n={n}:v=1:a=0,tile={cols}x{rows}'
+
+    try:
+        subprocess.run(
+            ['ffmpeg', '-y'] + input_args + ['-filter_complex', filter_str, out_collage_path],
+            capture_output=True, timeout=60, **_win_subprocess_flags()
+        )
+        if os.path.exists(out_collage_path):
+            proj_name = os.path.basename(project_dir)
+            proj_collage = os.path.join(project_dir, f'{proj_name}_collage.jpg')
+            try:
+                shutil.copy2(out_collage_path, proj_collage)
+            except Exception:
+                pass
+            return out_collage_path
+    except Exception as e:
+        print(f"Warning: generate_video_collage failed: {e}")
+    return None
+
+
+def generate_video_chain_sequence(config, title, prompt_block, on_progress=None, target_slots=None,
+                                  override_flagged=False):
+    """纯视频提示词链式生成通道 (T2V -> I2V Chain)：
+    - 第 1 段视频（Slot 1）：纯文生视频 (T2V)，无输入参考图。
+    - 第 2..N 段视频（Slot k >= 2）：单图生视频 (I2V)，以前一段视频生成的最后一帧作为参考帧输入。
+    - 生成完成后自动抽取关键帧更新 Manifest、生成 5 列多宫格拼图、并自动合并成片。
+    """
+    import builtins
+    builtins.google_fx_cancelled = False
+    apply_google_fx_runtime_overrides(config)
+    from prompt_pipeline import _parse_prompt_slots
+    images, videos = _parse_prompt_slots(prompt_block)
+    if not videos:
+        if images:
+            videos = {i: {'body': img.get('body') if isinstance(img, dict) else str(img),
+                          'meta': img.get('meta', '') if isinstance(img, dict) else ''}
+                      for i, img in images.items()}
+        elif prompt_block and prompt_block.strip():
+            videos = {1: {'body': prompt_block.strip(), 'meta': ''}}
+        else:
+            raise RuntimeError('未找到任何视频提示词！请先提供视频提示词。')
+
+    project_dir = _get_project_dir(title)
+    frames_dir = os.path.join(project_dir, 'frames')
+    videos_dir = os.path.join(project_dir, 'videos')
+    os.makedirs(frames_dir, exist_ok=True)
+    os.makedirs(videos_dir, exist_ok=True)
+
+    manifest_path = os.path.join(project_dir, 'manifest.json')
+    manifest_data = {}
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest_data = json.load(f)
+        except Exception as e:
+            print(f"Warning: could not read manifest.json ({e})")
+
+    manifest_data.setdefault('videos', [])
+    manifest_data.setdefault('frames', [])
+    manifest_data['prompt_block'] = prompt_block
+    manifest_data['generation_channel'] = 'video_chain'
+    canvas_project_url = str(manifest_data.get('google_fx_project_url') or '').strip()
+
+    all_available_slots = sorted(videos.keys())
+    first_slot = all_available_slots[0] if all_available_slots else 1
+
+    slots_to_run = all_available_slots
+    if target_slots is not None:
+        wanted = {int(x) for x in target_slots}
+        slots_to_run = [s for s in all_available_slots if s in wanted]
+
+    if on_progress:
+        on_progress('start', {
+            'total': len(slots_to_run),
+            'slots': slots_to_run,
+            'mode': 'video_chain',
+        })
+
+    google_fx_video, models = _get_google_fx_video_service()
+    video_model = config.get('videoModel') or 'Veo 3.1 - Lite [Lower Priority]'
+    if 'omni' in str(video_model).strip().lower():
+        video_duration = str(resolve_video_duration(config))
+    else:
+        video_duration = None
+
+    account_pool = _get_account_pool_service()
+    pool_account_id = _select_pool_account(config, account_pool)
+    actual_account_id = pool_account_id or config.get('googleFxUserId')
+    if actual_account_id:
+        config['googleFxUserId'] = actual_account_id
+        apply_google_fx_runtime_overrides(config)
+
+    def cancel_check_cb():
+        if on_progress:
+            try:
+                return bool(on_progress('cancel_check', None))
+            except Exception:
+                return True
+        return False
+
+    from integrations.google_fx.utils import account_binding
+
+    writer = _ManifestWriter(manifest_path, manifest_data, all_available_slots)
+
+    for seq_idx, slot in enumerate(slots_to_run, start=1):
+        if cancel_check_cb():
+            print(f"[VIDEO CHAIN] 任务已被用户取消，停止后续槽位生成")
+            break
+
+        item = videos[slot]
+        raw_prompt = item['body'] if isinstance(item, dict) else item
+        meta = str(item.get('meta', '') if isinstance(item, dict) else '').upper()
+        dest_path = os.path.join(videos_dir, f'vid_{slot:03d}.mp4')
+        is_hero = 'HERO' in meta
+
+        is_t2v = (slot == first_slot)
+        start_frame_path = None
+
+        if is_t2v:
+            prompt_for_gen = prepare_prompt_for_t2v(raw_prompt)
+        else:
+            prev_slot = slot - 1
+            prev_video_path = os.path.join(videos_dir, f'vid_{prev_slot:03d}.mp4')
+            start_frame_path = os.path.join(frames_dir, f'img_{slot:03d}.webp')
+
+            # 如果参考帧图片不存在，尝试从上一段视频的尾帧抽取
+            if (not os.path.exists(start_frame_path) or os.path.getsize(start_frame_path) == 0) and os.path.exists(prev_video_path):
+                _extract_video_frame(prev_video_path, start_frame_path, 'last', sseof_offset=0.15)
+                rel_f = os.path.relpath(start_frame_path, _BASE_DIR).replace('\\', '/')
+                f_entry = {
+                    'slot': slot,
+                    'sequence': slot,
+                    'file': rel_f,
+                    'url': '/' + rel_f,
+                    'quality_gate': 'extracted_from_prev_video_last_frame',
+                    'source': f'vid_{prev_slot:03d}.mp4',
+                }
+                flist = [f for f in writer.data.get('frames', []) if f.get('slot') != slot]
+                flist.append(f_entry)
+                flist.sort(key=lambda x: x.get('slot', 0))
+                writer.data['frames'] = flist
+                writer.save()
+
+            if not os.path.exists(start_frame_path) or os.path.getsize(start_frame_path) == 0:
+                err_msg = f"缺少上一段视频 (vid_{prev_slot:03d}.mp4) 的尾帧作为参考帧，无法生成视频 {slot}！"
+                print(f"[VIDEO CHAIN][ERROR] {err_msg}")
+                plan_mock = {
+                    'slot': slot, 'seq': seq_idx, 'prompt': raw_prompt,
+                    'dest_path': dest_path, 'start_frame': None, 'end_frame': None,
+                    'start_anchor_slot': slot, 'end_anchor_slot': None, 'meta': meta,
+                }
+                writer.record(_video_info(plan_mock, video_model, status='failed', error=err_msg))
+                if on_progress:
+                    on_progress('video_error', {
+                        'index': slot, 'current': seq_idx, 'total': len(slots_to_run),
+                        'message': err_msg,
+                    })
+                continue
+
+            prompt_for_gen = rewrite_prompt_for_single_frame(raw_prompt, start_slot=slot)
+
+        if on_progress:
+            on_progress('video_start', {
+                'index': slot,
+                'current': seq_idx,
+                'total': len(slots_to_run),
+                'prompt': prompt_for_gen,
+                'is_t2v': is_t2v,
+            })
+
+        temp_out_dir = tempfile.mkdtemp(prefix=f'vchain_{slot}_')
+        req = models.VideoRequest(
+            prompt=prompt_for_gen,
+            image=start_frame_path or '',
+            end_image='',
+            model=video_model,
+            ratio=config.get('imageAspectRatio') or '9:16',
+            duration=video_duration,
+            output_path=temp_out_dir,
+            project_url=canvas_project_url or None,
+        )
+
+        plan_item = {
+            'slot': slot,
+            'seq': seq_idx,
+            'prompt': prompt_for_gen,
+            'dest_path': dest_path,
+            'start_frame': start_frame_path,
+            'end_frame': None,
+            'start_anchor_slot': slot,
+            'end_anchor_slot': None,
+            'meta': meta,
+        }
+
+        def _process_gate(p):
+            return check_video_process(config, p['dest_path'], p['start_frame'],
+                                       p['end_frame'], p['prompt'],
+                                       meta=p.get('meta', ''))
+
+        single_item = [{'plan': plan_item, 'req': req, 'temp_out_dir': temp_out_dir}]
+        slot_bridge = _BatchBridge(
+            single_item, len(slots_to_run), video_model, writer, on_progress,
+            strict=strict_gates_enabled(config),
+            process_check_fn=_process_gate,
+            account_pool=account_pool,
+            pool_account_id=actual_account_id,
+            allow_anchor_mismatch=override_flagged,
+            config=config
+        )
+
+        with account_binding.bound_task_account(actual_account_id), \
+                fx_cancel_context(cancel_check_cb, deadline=fx_request_deadline()):
+            try:
+                fx_results = google_fx_video.generate_videos_batch_google_fx(
+                    [req],
+                    on_progress=slot_bridge,
+                    cancel_check=cancel_check_cb
+                )
+                returned_url = next(
+                    (r.get('project_url') for r in (fx_results or [])
+                     if isinstance(r, dict) and r.get('project_url')),
+                    None,
+                )
+                if returned_url:
+                    canvas_project_url = returned_url
+                    writer.data['google_fx_project_url'] = returned_url
+                    writer.save()
+
+                if not (os.path.exists(dest_path) and os.path.getsize(dest_path) > 0) and os.path.exists(temp_out_dir):
+                    downloaded = [os.path.join(temp_out_dir, f) for f in os.listdir(temp_out_dir) if f.endswith('.mp4')]
+                    if downloaded:
+                        shutil.move(downloaded[0], dest_path)
+                        writer.record(_video_info(plan_item, video_model, status='success'))
+            except Exception as e:
+                print(f"[VIDEO CHAIN] 槽位 {slot} 生成异常: {e}")
+                if on_progress:
+                    on_progress('video_error', {
+                        'index': slot, 'current': seq_idx, 'total': len(slots_to_run),
+                        'message': str(e),
+                    })
+                continue
+            finally:
+                shutil.rmtree(temp_out_dir, ignore_errors=True)
+
+        # 如果生成成功并已落盘到 dest_path，则抽取当前视频的关键帧
+        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+            if is_t2v:
+                first_f = os.path.join(frames_dir, f'img_{slot:03d}.webp')
+                if _extract_video_frame(dest_path, first_f, 'first'):
+                    rel_f0 = os.path.relpath(first_f, _BASE_DIR).replace('\\', '/')
+                    flist = [f for f in writer.data.get('frames', []) if f.get('slot') != slot]
+                    flist.append({
+                        'slot': slot,
+                        'sequence': slot,
+                        'file': rel_f0,
+                        'url': '/' + rel_f0,
+                        'quality_gate': 'extracted_from_t2v_first_frame',
+                        'source': f'vid_{slot:03d}.mp4',
+                    })
+                    flist.sort(key=lambda x: x.get('slot', 0))
+                    writer.data['frames'] = flist
+                    writer.save()
+
+            next_f = os.path.join(frames_dir, f'img_{slot+1:03d}.webp')
+            if _extract_video_frame(dest_path, next_f, 'last', sseof_offset=0.15):
+                rel_f1 = os.path.relpath(next_f, _BASE_DIR).replace('\\', '/')
+                flist = [f for f in writer.data.get('frames', []) if f.get('slot') != (slot + 1)]
+                flist.append({
+                    'slot': slot + 1,
+                    'sequence': slot + 1,
+                    'file': rel_f1,
+                    'url': '/' + rel_f1,
+                    'quality_gate': 'extracted_from_video_last_frame',
+                    'source': f'vid_{slot:03d}.mp4',
+                })
+                flist.sort(key=lambda x: x.get('slot', 0))
+                writer.data['frames'] = flist
+                writer.save()
+
+    try:
+        generate_video_collage(project_dir)
+    except Exception as coll_err:
+        print(f"[VIDEO CHAIN] 生成拼图失败（非致命）: {coll_err}")
+
+    try:
+        merge_speed = config.get('_merge_speed', 2)
+        if on_progress:
+            on_progress('merge_start', {'message': f'正在自动以 {merge_speed}x 速率合并视频...'})
+        merged_info = merge_project_videos(
+            project_dir, speed=merge_speed,
+            cover_burn=config.get('_cover_burn', COVER_BURN_DEFAULT)
+        )
+        if merged_info:
+            writer.data['merged_video'] = merged_info
+            writer.save()
+    except Exception as merge_err:
+        print(f"[VIDEO CHAIN] 自动合并视频异常: {merge_err}")
+
+    final_manifest = read_manifest(project_dir) or writer.data
+    final_manifest['manifest'] = '/' + os.path.relpath(manifest_path, _BASE_DIR).replace('\\', '/')
+    final_manifest['project_dir'] = os.path.abspath(project_dir)
+    return final_manifest
 
 
 class PartialMergeBlocked(RuntimeError):
@@ -2276,81 +2749,99 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
             p = os.path.join(project_dir, 'frames', os.path.basename(entry['file']))
         return p if os.path.exists(p) else None
 
-    by_slot = {v.get('slot'): v for v in videos}
-    frame_by_slot = {f.get('slot'): f for f in frames}
+    by_slot = {v.get('slot'): v for v in videos if isinstance(v, dict)}
+    frame_by_slot = {f.get('slot'): f for f in frames if isinstance(f, dict)}
     good = {}          # slot -> 绝对路径（可用片段）
     missing = []       # 缺失/失败/文件不存在
     mismatched = []    # 首尾帧与锚点不符（疑似串片）
-    expected_slots = []
 
-    if frames:
-        # 旧单的硬切占位槽位（status='skipped_cut'）是"预期缺失"：不算缺口、不占位填充，
-        # 相邻两段直接相接（成片在此处硬切）。'skipped_bridge_hold' 已停用（单一过门拍
-        # 收编后不再有需要跳过的 HOLD 槽位），仅为兼容旧 manifest 保留识别。
-        skipped_cut = {v.get('slot') for v in videos
-                       if isinstance(v, dict) and v.get('status') in ('skipped_cut', 'skipped_bridge_hold')}
-        expected_slots = [s for s in range(1, len(frames)) if s not in skipped_cut]
+    # 汇总所有预期的视频槽位：
+    # 1. 连续帧间槽位（1 .. len(frames)-1）
+    # 2. manifest['videos'] 里明确记录的槽位（包含手动上传、HERO、附加槽位等）
+    # 3. prompt_block 解析出的视频槽位（若有）
+    prompt_block = manifest_data.get('prompt_block') or ''
+    parsed_video_slots = set()
+    if prompt_block:
+        try:
+            from prompt_pipeline import _parse_prompt_slots
+            _, p_vids = _parse_prompt_slots(prompt_block)
+            parsed_video_slots = {int(k) for k in p_vids.keys()}
+        except Exception:
+            pass
+
+    manifest_video_slots = {
+        int(v.get('slot')) for v in videos
+        if isinstance(v, dict) and v.get('slot') is not None
+    }
+    frame_transition_slots = set(range(1, len(frames))) if frames else set()
+
+    all_slots = sorted(frame_transition_slots | manifest_video_slots | parsed_video_slots)
+
+    # 排除声明式硬切（旧单兼容：status='skipped_cut' / 'skipped_bridge_hold'）
+    skipped_cut = {
+        int(v.get('slot')) for v in videos
+        if isinstance(v, dict) and v.get('slot') is not None
+        and v.get('status') in ('skipped_cut', 'skipped_bridge_hold')
+    }
+    expected_slots = [s for s in all_slots if s not in skipped_cut]
+
+    if not expected_slots and not frames:
+        for v in sorted(videos, key=lambda x: x.get('slot', 0) if isinstance(x, dict) else 0):
+            if isinstance(v, dict) and v.get('status') == 'success' and v.get('file'):
+                abs_path = _resolve_abs(v['file'])
+                if os.path.exists(abs_path):
+                    good[v.get('slot')] = abs_path
+        expected_slots = sorted(good)
+    else:
         for slot in expected_slots:
             v = by_slot.get(slot)
+            is_hero_slot = bool(
+                v and (
+                    v.get('is_hero')
+                    or 'HERO' in str(v.get('meta', '')).upper()
+                )
+            )
             if not v or v.get('status') != 'success' or not v.get('file'):
-                missing.append(slot)
+                if not is_hero_slot:
+                    missing.append(slot)
                 continue
             abs_path = _resolve_abs(v['file'])
             if not os.path.exists(abs_path):
-                missing.append(slot)
+                if not is_hero_slot:
+                    missing.append(slot)
                 continue
-            # 手动上传、手动换位和显式风险覆盖在落盘前都已经得到用户确认。这里再复查会让 force
-            # 形同虚设（下载阶段保留，合并阶段却再次拦下），因此直接信任并保留审计字段。
-            if v.get('source') in ('manual_upload', 'manual_swap') or v.get('model') == 'manual_upload' or v.get('swapped_from_slot') is not None or v.get('swapped_from_sequence') is not None or v.get('anchor_mismatch_overridden'):
+            # 手动上传、手动换位和显式风险覆盖在落盘前都已经得到用户确认。这里直接信任并加入 good
+            if (v.get('source') in ('manual_upload', 'manual_swap')
+                    or v.get('model') == 'manual_upload'
+                    or v.get('swapped_from_slot') is not None
+                    or v.get('swapped_from_sequence') is not None
+                    or v.get('anchor_mismatch_overridden')):
                 good[slot] = abs_path
                 continue
+
+            if is_hero_slot:
+                hero_anchor_slot = v.get('start_anchor_slot') or slot
+                hero_anchor_p = _resolve_frame(frame_by_slot.get(hero_anchor_slot))
+                ok, _reason = verify_video_anchors(abs_path, hero_anchor_p, None,
+                                                    strict=strict_gates_enabled())
+                if not ok:
+                    print(f"[WARN] 英雄展示视频（槽位 {slot}）锚点校验未通过，仍并入合并。")
+                good[slot] = abs_path
+                continue
+
             # 锚点编号按槽位契约恒为 slot -> slot+1（见 plan_video_slots）；两个字段
             # 仍保留读取，一是兼容旧 manifest 里 TBCP v3 Bridge SPAN 的重定向记录，
             # 二是 end_anchor_slot 在它落盘之前生成的条目里就是缺的，得能回退。
             start_slot = v.get('start_anchor_slot') or slot
             end_slot = v.get('end_anchor_slot') or (slot + 1)
             start_p = _resolve_frame(frame_by_slot.get(start_slot))
-            end_p = _resolve_frame(frame_by_slot.get(end_slot))
+            end_p = _resolve_frame(frame_by_slot.get(end_slot)) if end_slot else None
             # 合并门禁没有请求级 config，strict 开关直接取服务端配置
             ok, reason = verify_video_anchors(abs_path, start_p, end_p, strict=strict_gates_enabled())
             if not ok:
                 # 锚点不符不再拦截，也不再剔除该槽位：片段存在就并入成片，只留日志。
                 print(f"[WARN] 槽位 {slot} 锚点校验未通过（{reason}），仍按用户要求并入合并。")
             good[slot] = abs_path
-
-        # 英雄展示视频（[HERO]，默认收尾步骤）：可选附加片段，不参与上面的完整性/
-        # 锚点门禁——缺失或未通过校验时直接跳过，绝不阻塞主体成片的合并。成功时
-        # 追加到 expected_slots 末尾（它的槽位号总是大于所有正片槽位），随主体
-        # 一起拼接进最终成片，作为收尾的完工展示镜头。
-        hero_entries = [v for v in videos if isinstance(v, dict) and 'HERO' in str(v.get('meta', '')).upper()]
-        if hero_entries:
-            hero_v = hero_entries[0]
-            hero_slot = hero_v.get('slot')
-            if hero_v.get('status') == 'success' and hero_v.get('file'):
-                hero_abs = _resolve_abs(hero_v['file'])
-                if os.path.exists(hero_abs):
-                    if hero_v.get('source') in ('manual_upload', 'manual_swap') or hero_v.get('model') == 'manual_upload' or hero_v.get('swapped_from_slot') is not None or hero_v.get('anchor_mismatch_overridden'):
-                        # 手动上传/换位同样信任已做过的锚点校验/force 确认。
-                        good[hero_slot] = hero_abs
-                        expected_slots = expected_slots + [hero_slot]
-                    else:
-                        hero_anchor_slot = hero_v.get('start_anchor_slot') or hero_slot
-                        hero_anchor_p = _resolve_frame(frame_by_slot.get(hero_anchor_slot))
-                        # 只上传首帧，没有独立的结束锚点——只核对片段首帧，不核对尾帧。
-                        ok, _reason = verify_video_anchors(hero_abs, hero_anchor_p, None,
-                                                            strict=strict_gates_enabled())
-                        if not ok:
-                            print(f"[WARN] 英雄展示视频（槽位 {hero_slot}）锚点校验未通过，仍并入合并。")
-                        good[hero_slot] = hero_abs
-                        expected_slots = expected_slots + [hero_slot]
-    else:
-        # 无 frames（历史/兜底）：不做完整性/锚点门禁，直接取所有成功片段
-        for v in sorted(videos, key=lambda x: x.get('slot', 0)):
-            if v.get('status') == 'success' and v.get('file'):
-                abs_path = _resolve_abs(v['file'])
-                if os.path.exists(abs_path):
-                    good[v.get('slot')] = abs_path
-        expected_slots = sorted(good)
 
     # 合并前不再拦截。仍有缺失槽位（磁盘上没有文件，无内容可拼）时跳过它们直接合并，
     # 跳过清单随返回结果上报，不是背地里丢弃。

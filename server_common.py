@@ -508,12 +508,36 @@ GATE_SETTINGS = (
                 '**正常生成不要关**；只在离线复现/调试串片本身时才需要关。',
     },
     {
+        'key': 'optimizeVideoPromptsBeforeGen', 'type': 'bool', 'default': True,
+        'env': 'SPARK_OPTIMIZE_VIDEO_PROMPTS',
+        'section': 'video', 'label': '视频生成前画面差量提示词优化',
+        'hint': '在生成视频序列前，自动依据真实渲染落盘的相邻首末帧画面差量，'
+                '通过多模态 VLM 优化并重写所有视频提示词，彻底防止画面跳变与幽灵建造。'
+                '关掉后跳过视觉差量优化门，直接使用初始视频提示词生成。',
+    },
+    {
         'key': 'anchorInertiaAutoRetry', 'type': 'bool', 'default': True,
         'section': 'frame', 'label': '桥接帧惯性自动重渲',
         'hint': '桥接/换族帧渲出来与参考帧近乎相同（i2i 参考惯性压过了「进入新空间」的'
                 '文本指令）时，自动加强图生图指令重渲一次。烧一次生图额度。'
                 '关掉后仍然检测、仍然留痕，只是不自动重渲。'
                 '（Google FX 链路本来就只留痕不重渲，本项对其无效。）',
+    },
+    {
+        'key': 'chainGuardMode', 'type': 'enum', 'default': 'autofix',
+        'options': ('off', 'report', 'halt', 'autofix'),
+        'section': 'frame', 'label': '生成期链上逐拍守卫',
+        'option_labels': {
+            'off': 'off（关闭）',
+            'report': 'report（只记账不阻断）',
+            'halt': 'halt（结构级问题停链等人）',
+            'autofix': 'autofix（默认，结构级问题就地自动修复后继续）',
+        },
+        'hint': '生成循环中每渲完一帧立即执行逐拍一致性审查与分级。'
+                'autofix 档检出结构级问题时就地走一遍「修复此帧问题」（定向重写提示词 + '
+                '4选1 重渲），复审通过就接着往下渲，连修 2 次仍不过才停链等人；'
+                'halt 档一检出就停链；report 档仅记录留痕不停链。'
+                '错误顺着 i2i 往下传的代价是整条链，所以默认不放行。',
     },
     {
         'key': 'frameContinuityMode', 'type': 'enum', 'default': 'balanced',
@@ -637,6 +661,13 @@ def qa_gate_level(config=None):
     return gate_setting('qaGateLevel', config)
 
 
+def chain_guard_mode(config=None):
+    """生成期链上逐拍守卫档位。off=关闭；report=只记账不停链；halt=结构级问题停链等人；
+    autofix=结构级问题就地自动修复后继续（连修 2 次仍不过则退化成 halt）。
+    非法值回退 default (autofix)。"""
+    return gate_setting('chainGuardMode', config)
+
+
 def _int_setting(env_key, cfg_key, default):
     """数值配置的容错解析：非法值给出中文告警并回退默认，而不是 import 时崩掉整个服务。"""
     raw = os.environ.get(env_key, SERVER_CONFIG.get(cfg_key, default))
@@ -744,6 +775,27 @@ _OMNI_CONTRACT_FILES = (
     'references/idea-engine.md',
     'references/used-topic-ledger.md',
 )
+# miniature 包的清单里除了 miniature-*.md，还必须列上那五份与 base 重名的文件
+# （SCUP / 提示词模板 / 过门协议 / Drift Lock 装配 / 工序表）。它们不是可选补充：
+# 合成链路本来就会按这些名字去读，而这个 profile 关掉了向 base 的回退（见
+# reference_fallback），缺一份就是整段读空——模板读空意味着写手一条范例都看不到。
+# 反过来说，把它们列进清单，缺失才会在启动日志与 /api/mode 上喊出来。
+_MINIATURE_CONTRACT_FILES = (
+    'SKILL.md',
+    'references/miniature-scene-skeleton.md',
+    'references/miniature-multishot-language.md',
+    'references/miniature-macro-language.md',
+    'references/miniature-materials-and-tools.md',
+    'references/miniature-cutaway-architecture.md',
+    'references/miniature-output-templates.md',
+    'references/prompt-templates.md',
+    'references/spatial-consistency-upgrade-protocol.md',
+    'references/threshold-bridge-consistency-protocol.md',
+    'references/drift-lock-assembly-guide.md',
+    'references/space-workflows.md',
+    'references/idea-engine.md',
+    'references/used-topic-ledger.md',
+)
 
 # ── 契约注册表 ──
 # 上面那份 _*_CONTRACT_FILES 只回答"文件在不在"，回答不了"SKILL.md 里写的契约有没有
@@ -770,6 +822,9 @@ SKILL_PROFILES = {
         # 已经配好的机器在升级后静默回到默认路径。
         'env': 'SKILL_DIR',
         'config_key': 'skillDir',
+        # base 就是回退目标本身，这一格对它无意义（load_reference_file 只对非 base
+        # 的 profile 走回退）。写出来是为了让三行长得一样，少一格容易被读成"漏了"。
+        'reference_fallback': True,
     },
     'omni': {
         'package': 'gemini-omni-restoration-composer',
@@ -777,6 +832,23 @@ SKILL_PROFILES = {
         'contracts': _OMNI_CONTRACT_FILES,
         'env': 'SKILL_DIR_OMNI',
         'config_key': None,  # 只认 skillProfiles.omni，不再给每个包发一个顶层键
+        # omni 与 base 同为「真人施工 + 实景」世界观，借用 base 的空间协议、提示词
+        # 模板与过门协议是合理的补全——omni 包本来就只写了自己独有的镜头语法那部分。
+        'reference_fallback': True,
+    },
+    'miniature': {
+        'package': 'gemini-miniature-restoration-composer',
+        'label': '微缩模型与巨人手建造合成器（多镜头）',
+        'contracts': _MINIATURE_CONTRACT_FILES,
+        'env': 'SKILL_DIR_MINIATURE',
+        'config_key': None,
+        # miniature 必须关掉回退。它与 base 不是详略之别而是互为反面：base 的 SCUP
+        # 锁「1.78m 工人 / 24mm 广角 / 1.3m 胸高视点」，TBCP 的负向词库明确压制
+        # `miniature furniture, dollhouse scale`，提示词模板的每一条范例都是真人走进
+        # 真实房间。回退借用这些，等于在每份提示词里同时下达两条相反指令，而且是以
+        # 「结构化事实」的身份下达——覆盖段是散文，压不过逐拍复述的契约正文。
+        # 关掉回退的前提是这五份文件在本包里都真实存在，见 _MINIATURE_CONTRACT_FILES。
+        'reference_fallback': False,
     },
 }
 # 旧名保留：外部（测试、frame_generator）按这个名字引用 base 的契约清单。
@@ -788,6 +860,7 @@ SKILL_PACKAGE_NAME = SKILL_PROFILES[DEFAULT_SKILL_PROFILE]['package']
 # 视频模型名带档位后缀（'Omni Flash'、'Veo 3.1 - Lite [Lower Priority]'）。
 SKILL_PROFILE_VIDEO_MODEL_RULES = (
     ('omni', 'omni'),
+    ('miniature', 'miniature'),
 )
 
 # ── 技能包（skill）本地路径的解析 ──
@@ -826,6 +899,15 @@ def _normalize_skill_profile(profile):
 def skill_contract_files(profile=None):
     """某个 profile 的契约清单（相对该包根目录）。"""
     return SKILL_PROFILES[_normalize_skill_profile(profile)]['contracts']
+
+
+def skill_reference_fallback(profile=None):
+    """该 profile 读不到某份 reference 时，是否允许回落到 base 包的同名文件。
+
+    缺省 True——历史行为，也是 omni 依赖的行为。只有世界观与 base 互斥的包（当前是
+    miniature）才关掉它：对那种包，回退不是补全而是污染。"""
+    spec = SKILL_PROFILES[_normalize_skill_profile(profile)]
+    return bool(spec.get('reference_fallback', True))
 
 
 def _skill_contract_hits(directory, profile=None):
@@ -1601,6 +1683,12 @@ def _select_pool_account(config, pool):
             print(f"Warning: 序列生成默认环境 {preferred} 处于冷却期，改为自动选号")
         elif not _account_has_credit(match, min_credit):
             print(f"Warning: 序列生成默认环境 {preferred} 积分不足 {min_credit}，改为自动选号")
+        elif match.get('credit') is None and not _probe_preferred_account(pool, preferred, min_credit):
+            # 钉死的环境一旦选中，整条序列就跑到底，中间不再有人验第二次——
+            # 所以"从来没探过积分"的默认环境要在这里先真实探一次，而不是凭
+            # 一个空值开跑。注意是"探了再判"，不是"没探过就甩掉"：用户是显式
+            # 钉的这个号，探出来够用当然还用它。
+            print(f"Warning: 序列生成默认环境 {preferred} 实测积分不足 {min_credit}，改为自动选号")
         else:
             config['googleFxUserId'] = preferred
             return preferred
@@ -1638,10 +1726,16 @@ def _account_in_cooldown(account):
 
 
 def _account_has_credit(account, min_credit):
+    """账号缓存里的积分是否够本次用。
+
+    积分未知（还没探测过）在这里仍算"不排除"：这只是个按缓存值筛候选的粗筛，
+    真正用到之前还有一道复核——钉死的默认环境走 _probe_preferred_account()，
+    轮转环的每条腿走 revalidate_leg_account()，两处都会强制真实探测一次。
+    """
     try:
         return float(account.get('credit')) >= float(min_credit)
     except (TypeError, ValueError):
-        return True  # 积分未知（还没探测过）不排除，交给生成时的真实反馈去冷却
+        return True
 
 
 def _account_rotation_ring(config, pool, first_user_id):
@@ -1669,6 +1763,59 @@ def _account_rotation_ring(config, pool, first_user_id):
     if first_user_id:
         ring = [first_user_id] + [uid for uid in ring if uid != first_user_id]
     return ring
+
+
+def _probe_preferred_account(pool, user_id, min_credit):
+    """钉死的默认环境积分未知时，真实探一次再决定用不用它。
+
+    探不动就维持旧的放行行为——这条路径宁可放行，也不该因为号池服务缺个方法
+    就把用户显式钉的环境甩掉。
+    """
+    try:
+        return bool(pool.account_is_usable(user_id, min_credit=min_credit))
+    except AttributeError:
+        return True
+    except Exception as e:
+        print(f"Warning: 复核序列生成默认环境 {user_id} 积分失败，按原配置继续 ({e})")
+        return True
+
+
+def revalidate_leg_account(config, pool, user_id, ring, exclude):
+    """切腿前复核这条腿要用的账号此刻是否真的还够用，不够就在环里顺延。
+
+    轮转环是整条序列开始前按**缓存**积分一次性排定的，而号池不伪造单张扣费——
+    中间几条腿烧掉多少积分没人记账。于是轮到后面的腿时，环里那个"当时还有 57 分"
+    的号可能早就跑不动了，却照样被排上去。复核走 AccountPool.account_is_usable()，
+    口径与 pick_account 完全一致（缓存过期或上次探测后又跑过任务就强制真实探一次）。
+
+    返回实际该用的 user_id；一个可用的都找不到时返回 None，由调用方决定怎么办。
+    """
+    if not user_id:
+        return user_id
+    min_credit = config.get('videoAccountPoolMinCredit', 1)
+    try:
+        if pool.account_is_usable(user_id, min_credit=min_credit):
+            return user_id
+    except Exception as e:
+        # 复核本身出错（老测试桩没有这个方法、状态文件读不动……）不该拖垮生成：
+        # 按原计划继续，让生成过程中的页面检测去兜底。
+        print(f"Warning: 复核账号 {user_id} 积分失败，按原计划继续 ({e})")
+        return user_id
+
+    skip = set(exclude or ()) | {user_id}
+    for candidate in (ring or []):
+        if candidate in skip:
+            continue
+        try:
+            if pool.account_is_usable(candidate, min_credit=min_credit):
+                return candidate
+        except Exception:
+            continue
+    try:
+        chosen = pool.pick_account(min_credit=min_credit, exclude=skip)
+    except Exception:
+        chosen = None
+    return chosen.get('user_id') if chosen else None
 
 
 def _next_unused_account(config, pool, ring, exclude):
@@ -3813,7 +3960,8 @@ def drop_stale_review_verdicts(manifest, project_dir):
     前端据此显示的"全部通过"从那一刻起就是假的。
 
     判定依据是审查时记下的 review_frames_sha256（{帧序号: 内容哈希}，见
-    pipeline_orchestrator._record_review_fingerprints）。作废＝结论回落
+    pipeline_orchestrator._record_review_fingerprints）以及链上守卫的
+    inline_beat_review（{帧序号: 内容哈希}）。作废＝结论回落
     pending_manual_review、清掉 vlm_qa_reason 与结构化 review_issues。
     调用方负责写回 manifest。"""
     frames = (manifest or {}).get('frames') or []
@@ -3830,32 +3978,56 @@ def drop_stale_review_verdicts(manifest, project_dir):
     changed = []
     for frame in frames:
         recorded = frame.get('review_frames_sha256')
-        if not isinstance(recorded, dict) or not recorded:
-            continue
-        stale = False
-        for seq_str, recorded_hash in recorded.items():
-            try:
-                seq = int(seq_str)
-            except (TypeError, ValueError):
-                continue
-            if _live_hash(seq) != recorded_hash:
-                stale = True
-                break
-        if not stale:
-            continue
-        changed.append(frame.get('sequence'))
-        frame.pop('review_frames_sha256', None)
-        frame.pop('reviewed_at', None)
-        frame.pop('review_issues', None)
-        # 人工标记压着机器判定时，那份判定被暂存在 manual_flag_prev_gate（见
-        # pipeline_orchestrator._set_manifest_quality_gate 的 respect_manual_flag）。
-        # 帧图变了它同样不再成立——留着的话，用户之后撤销人工标记会回落到一个针对
-        # 旧画面的"审查通过"。
-        if frame.get('manual_flag_prev_gate') in REAL_REVIEW_VERDICTS:
-            frame['manual_flag_prev_gate'] = 'pending_manual_review'
-        if frame.get('quality_gate') in REAL_REVIEW_VERDICTS:
-            frame['quality_gate'] = 'pending_manual_review'
-            frame['vlm_qa_reason'] = None
+        if isinstance(recorded, dict) and recorded:
+            stale = False
+            for seq_str, recorded_hash in recorded.items():
+                try:
+                    seq = int(seq_str)
+                except (TypeError, ValueError):
+                    continue
+                if _live_hash(seq) != recorded_hash:
+                    stale = True
+                    break
+            if stale:
+                if frame.get('sequence') not in changed:
+                    changed.append(frame.get('sequence'))
+                frame.pop('review_frames_sha256', None)
+                frame.pop('reviewed_at', None)
+                frame.pop('review_issues', None)
+                # 人工标记压着机器判定时，那份判定被暂存在 manual_flag_prev_gate（见
+                # pipeline_orchestrator._set_manifest_quality_gate 的 respect_manual_flag）。
+                # 帧图变了它同样不再成立——留着的话，用户之后撤销人工标记会回落到一个针对
+                # 旧画面的"审查通过"。
+                if frame.get('manual_flag_prev_gate') in REAL_REVIEW_VERDICTS:
+                    frame['manual_flag_prev_gate'] = 'pending_manual_review'
+                if frame.get('quality_gate') in REAL_REVIEW_VERDICTS:
+                    frame['quality_gate'] = 'pending_manual_review'
+                    frame['vlm_qa_reason'] = None
+
+        # 链上逐拍守卫记录检查
+        ibr = frame.get('inline_beat_review')
+        if isinstance(ibr, dict) and ibr:
+            ibr_hashes = ibr.get('frames_sha256')
+            if isinstance(ibr_hashes, dict) and ibr_hashes:
+                ibr_stale = False
+                for seq_str, recorded_hash in ibr_hashes.items():
+                    try:
+                        seq = int(seq_str)
+                    except (TypeError, ValueError):
+                        continue
+                    if _live_hash(seq) != recorded_hash:
+                        ibr_stale = True
+                        break
+                if ibr_stale:
+                    frame.pop('inline_beat_review', None)
+                    if frame.get('flag_origin') == 'chain_guard':
+                        frame.pop('flag_origin', None)
+                        if frame.get('quality_gate') == 'sequence_review_flagged':
+                            frame['quality_gate'] = 'pending_manual_review'
+                            frame['vlm_qa_reason'] = None
+                    if frame.get('sequence') not in changed:
+                        changed.append(frame.get('sequence'))
+
     return [s for s in changed if isinstance(s, int)]
 
 

@@ -2290,3 +2290,106 @@ class TestMicroEngineeringForensics(unittest.TestCase):
 
 
 
+
+
+class TestObservedShotCuts(unittest.TestCase):
+    """原片这一拍是一个镜头还是切了三刀——多镜头交付唯一的事实底座。
+
+    这组数据抽帧脚本一直在算（analyze_timelapse_video.detect_scene_change_points 的高阈值
+    那一遍就是剪辑切点，低阈值那遍还专门扣掉了切点附近 0.3s 以免把切点误当状态变化），
+    也一直写进 video_overview.json 的 cut_points，但在 attach_shot_cuts 之前**全线没有
+    读者**：复刻线只取了聚合后的 pace_metrics 三个数拿去显示。逐拍接出来之后，
+    「这一拍排三镜还是四镜」才不再是由片长凭空决定。
+
+    这里钉的是三条会静默错的边界：边界那一刀不算内部切点、没有切点数据时字段必须
+    缺席（而不是伪装成一镜）、二创变体原样跳过。
+    """
+
+    def _overview_with_cuts(self, cuts):
+        overview = _overview()
+        overview['cut_points'] = list(cuts)
+        return overview
+
+    def test_cut_points_are_sanitised(self):
+        self.assertEqual(reverse.overview_cut_points(None), [])
+        self.assertEqual(reverse.overview_cut_points({}), [])
+        self.assertEqual(reverse.overview_cut_points({'cut_points': 'nope'}), [])
+        # 排序、去重、丢掉负数与非数字
+        self.assertEqual(
+            reverse.overview_cut_points({'cut_points': [5.2, 1.0, 5.2, -3, 'x', 2.5]}),
+            [1.0, 2.5, 5.2])
+
+    def test_boundary_cuts_do_not_split_the_beat(self):
+        """拍与拍的分界处本来就常压着一刀（Pass B 就是按变化聚的类）。
+
+        把它算成内部切点，等于每一拍都凭空多一个镜头——而且是**每一拍**都多，
+        错得整齐到看不出来。"""
+        cuts = [4.0, 6.5, 10.0]
+        self.assertEqual(reverse.observed_cuts_for_window(cuts, 4.0, 10.0), [6.5])
+        # 边界容差 0.15s 与抽帧脚本给切点去重用的窗口同宽
+        self.assertEqual(reverse.observed_cuts_for_window([4.1], 4.0, 10.0), [])
+        self.assertEqual(reverse.observed_cuts_for_window([4.2], 4.0, 10.0), [4.2])
+
+    def test_shot_count_is_cuts_plus_one(self):
+        overview = self._overview_with_cuts([0.0, 3.0, 5.5, 9.0])
+        doc = {'video_duration_sec': 14.0, 'banned_elements': [],
+               'beats': [_beat('B01', 0.0, 9.0, events=['E01']),
+                         _beat('B02', 9.0, 14.0, events=['E02'])]}
+        reverse.attach_shot_cuts(doc, overview)
+        first, second = doc['beats']
+        self.assertEqual(first['observed_cuts'], [3.0, 5.5])
+        self.assertEqual(first['observed_shot_count'], 3)
+        # 第二拍内部一刀都没有 = 原片这一拍是一镜
+        self.assertEqual(second['observed_cuts'], [])
+        self.assertEqual(second['observed_shot_count'], 1)
+
+    def test_editing_the_window_recomputes_the_count(self):
+        """拆拍/并拍改的就是时间窗。留着上一版的镜头数，等于让人按别的拍窗做判断。"""
+        overview = self._overview_with_cuts([3.0, 5.5])
+        doc = {'video_duration_sec': 14.0, 'banned_elements': [],
+               'beats': [_beat('B01', 0.0, 9.0, events=['E01'])]}
+        reverse.attach_shot_cuts(doc, overview)
+        self.assertEqual(doc['beats'][0]['observed_shot_count'], 3)
+        doc['beats'][0]['end'] = 4.0
+        reverse.attach_shot_cuts(doc, overview)
+        self.assertEqual(doc['beats'][0]['observed_cuts'], [3.0])
+        self.assertEqual(doc['beats'][0]['observed_shot_count'], 2)
+
+    def test_missing_cut_data_leaves_the_field_absent(self):
+        """未知与「一镜到底」必须分得开。
+
+        老 job 的 overview 里没有 cut_points；抽帧环境异常时也可能整组缺失。
+        这时候留下一个 1，下游会当成「原片确实是一镜」，据此挑最小镜头梯并在审核表上
+        写一行言之凿凿的偏差说明——全是编的。"""
+        doc = {'video_duration_sec': 14.0, 'banned_elements': [],
+               'beats': [_beat('B01', 0.0, 9.0, events=['E01'],
+                               observed_cuts=[3.0], observed_shot_count=2)]}
+        reverse.attach_shot_cuts(doc, _overview())
+        self.assertNotIn('observed_cuts', doc['beats'][0])
+        self.assertNotIn('observed_shot_count', doc['beats'][0])
+        self.assertIsNone(reverse.observed_shot_stats(doc))
+
+    def test_variants_inherit_the_rhythm_instead_of_recomputing(self):
+        """二创变体自己的目录里没有 overview（reference_frames 那条线）。
+
+        按空切点重算只会把继承下来的镜头数一路抹平——与 shot_scale / camera_move
+        被列为「节奏骨架，原样继承」是同一条纪律。"""
+        doc = {'video_duration_sec': 14.0, 'banned_elements': [], 'variant_of': 'job-1',
+               'mutation_axes': ['carrier'],
+               'beats': [_beat('B01', 0.0, 9.0, events=['E01'],
+                               observed_cuts=[3.0, 5.5], observed_shot_count=3)]}
+        reverse.attach_shot_cuts(doc, _overview())
+        self.assertEqual(doc['beats'][0]['observed_shot_count'], 3)
+
+    def test_stats_summarise_the_whole_ladder(self):
+        overview = self._overview_with_cuts([3.0, 5.5, 11.0])
+        doc = {'video_duration_sec': 14.0, 'banned_elements': [],
+               'beats': [_beat('B01', 0.0, 9.0, events=['E01']),
+                         _beat('B02', 9.0, 14.0, events=['E02'])]}
+        reverse.attach_shot_cuts(doc, overview)
+        stats = reverse.observed_shot_stats(doc)
+        self.assertEqual(stats['beats'], 2)
+        self.assertEqual(stats['cuts'], 3)
+        self.assertEqual(stats['single_shot_beats'], 0)
+        self.assertEqual(stats['max_shots'], 3)
+        self.assertEqual(stats['avg_shots'], 2.5)

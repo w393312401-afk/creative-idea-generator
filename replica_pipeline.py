@@ -807,6 +807,31 @@ def run_extract(state, on_progress=None, base_fps=None):
     return state
 
 
+def _compose_state_path(job_id):
+    return os.path.join(job_dir(job_id), 'compose_state.json')
+
+
+def _invalidate_compose_artifacts(state):
+    """当节拍阶梯（beats）发生实质性变更（重跑聚类、编辑保存、AI修复、时序平衡等）时，
+    清空已有的提示词产物与断点缓存，防止后续合成时误走快速通道复用过期的旧提示词。"""
+    if not isinstance(state, dict):
+        return
+    state['prompt_block'] = None
+    state['compose_state_path'] = None
+    if 'banned_hits' in state:
+        state['banned_hits'] = None
+    if 'audit_errors' in state:
+        state['audit_errors'] = None
+    job_id = state.get('job_id')
+    if job_id:
+        c_path = _compose_state_path(job_id)
+        if os.path.exists(c_path):
+            try:
+                os.remove(c_path)
+            except OSError:
+                pass
+
+
 # ── review_frames + cluster_beats ────────────────────────────────────────────
 
 def run_reverse(state, config, on_progress=None, degraded=False, scope=None):
@@ -819,6 +844,7 @@ def run_reverse(state, config, on_progress=None, degraded=False, scope=None):
 
     scope = reverse.normalize_review_scope(scope, degraded)
     directory = job_dir(state['job_id'])
+    _invalidate_compose_artifacts(state)
     state['stage'] = 'review_frames'
     state['review_scope'] = scope
     state['degraded'] = scope == 'degraded'
@@ -896,14 +922,22 @@ def save_beats(job_id, beats):
     # 增删一次过门（见 reverse.normalize_beat_spaces）。
     reverse.normalize_beat_spaces(beats)
     reverse.reconcile_event_coverage(beats, overview, reconcile_unbound=False)
-    # 拆拍/并拍改的就是时间窗，覆盖帧必须跟着重算——见 attach_coverage_frames。
+    # 拆拍/并拍改的就是时间窗，覆盖帧与观察到的镜头数必须跟着重算
+    # （见 attach_coverage_frames / attach_shot_cuts）。
     reverse.attach_coverage_frames(beats, overview)
+    reverse.attach_shot_cuts(beats, overview)
     beats['pipeline_id'] = job_id
     beats['validation'] = reverse.validate_beats(beats, overview)
     beats['edited_by_user'] = True
     # 改过的英文字段，其中文对照当场作废（见 prune_stale_translations）。前端只回传
     # 英文字段，所以 zh 是从上一版原样带回来的——不清理就会出现「中文还是旧的」。
     reverse.prune_stale_translations(state.get('beats'), beats)
+    # 如果用户在 review_beats 阶段编辑，或修改了实际 beats 序列内容，作废旧提示词产物；
+    # 若任务停在 audit_failed 且仅微调了 banned_elements/scene_constants，保留 prompt_block 供快速复核。
+    beats_changed = (state.get('beats') or {}).get('beats') != beats.get('beats')
+    if state.get('stage') != 'audit_failed' or beats_changed:
+        _invalidate_compose_artifacts(state)
+
     _write_beats(state, beats)
     return _save_state(state)
 
@@ -969,6 +1003,7 @@ def autofix_job_beats(config, job_id, on_progress=None):
     # 翻译作废并重新翻译更新过的字段
     reverse.prune_stale_translations(beats, fixed_doc)
     reverse.translate_beats(config, fixed_doc, on_progress=on_progress)
+    _invalidate_compose_artifacts(state)
     _write_beats(state, fixed_doc)
     state['stage'] = 'review_beats'
     _save_state(state)
@@ -1005,6 +1040,7 @@ def autobalance_job_beats(config, job_id, on_progress=None):
     # 翻译作废并重新补译新增的拆拍条目
     reverse.prune_stale_translations(beats, balanced_doc)
     reverse.translate_beats(config, balanced_doc, on_progress=on_progress)
+    _invalidate_compose_artifacts(state)
     _write_beats(state, balanced_doc)
     state['stage'] = 'review_beats'
     _save_state(state)
@@ -1371,6 +1407,9 @@ def _revalidate(state, persist=True):
         # 不用重跑聚类也能在卡点上看到铺满拍窗的那一排帧。读不到 overview 就跳过，
         # 与校验同一档降级——变体 job 自己目录下没有 overview，走的就是这一支。
         reverse.attach_coverage_frames(beats, overview)
+        # 同一条回填通路补上观察到的镜头切点：存量任务不用重跑抽帧/聚类，
+        # 读一次状态就能在卡点上看见「原片这一拍切了几刀」。
+        reverse.attach_shot_cuts(beats, overview)
         # 键名漂移同样在这里补救：存量任务不用重跑聚类，读一次状态就把「缺少字段」
         # 这类假硬伤化掉（真的缺内容当然还是照报）。
         reverse.normalize_beat_keys(beats)
@@ -1409,11 +1448,11 @@ def run_compose(state, config, dimensions=None, on_progress=None):
             f'节拍阶梯还有 {len(errors)} 项硬伤未处理，先在审核卡点上修掉再合成：'
             + '；'.join(v['message'] for v in errors[:3]))
 
-    # 快速通道：若当前已有提示词包且已无任何禁用元素违规（如修了分词误判，或用户在阶梯中
-    # 删除了禁用词），直接复核通过并落库，免去数分钟昂贵的大模型重复生成。
+    # 快速通道：仅在任务此前停在 audit_failed 且已有提示词包经当前规则复核后已无任何禁用元素违规
+    # （如修了分词误判，或用户删除了误判的禁用词）时生效，直接复核通过并落库，免去数分钟昂贵的大模型重复生成。
     current_prompt_block = state.get('prompt_block')
     banned = (beats or {}).get('banned_elements') or []
-    if current_prompt_block:
+    if current_prompt_block and state.get('stage') == 'audit_failed':
         current_hits = reverse.banned_element_hits(current_prompt_block, banned)
         if not current_hits:
             if on_progress:
@@ -1497,10 +1536,6 @@ def run_compose(state, config, dimensions=None, on_progress=None):
         state['error'] = str(e)
         _save_state(state)
         raise
-
-
-def _compose_state_path(job_id):
-    return os.path.join(job_dir(job_id), 'compose_state.json')
 
 
 def _write_compose_state(state, compose_state):

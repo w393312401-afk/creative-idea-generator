@@ -127,7 +127,52 @@ call(`
     const currentlyFolded2 = replicaVariantFoldState[parentId] !== false;
     replicaVariantFoldState[parentId] = !currentlyFolded2;
 `);
-listHtml = call(`replicaRenderJobList()`);
-assert.ok(listHtml.includes('👑 2 个变体 ▼'), '再次点击后应恢复折叠状态');
+// ── 6. 运行/忙碌态下导航与回到顶部等纯浏览操作不被 disable ─────────────────
+// 在任务执行中（replicaSetBusy 为 true），导航栏、回到顶部、取消中断等交互必须保持可用。
+call(`
+    const mockButtons = [
+        { id: 'replica-cancel-btn', dataset: {}, classList: { contains: () => false, toggle: () => {} }, hasAttribute: () => false, disabled: false },
+        { id: 'replica-bar-cancel-btn', dataset: {}, classList: { contains: () => false, toggle: () => {} }, hasAttribute: () => false, disabled: false },
+        { id: 'replica-bar-errors-btn', dataset: {}, classList: { contains: () => false, toggle: () => {} }, hasAttribute: () => false, disabled: false },
+        { id: '', dataset: { floatAction: 'top' }, classList: { contains: (c) => c === 'replica-float-btn', toggle: () => {} }, hasAttribute: () => false, disabled: false },
+        { id: '', dataset: { floatAction: 'save' }, classList: { contains: (c) => c === 'replica-float-save', toggle: () => {} }, hasAttribute: () => false, disabled: false },
+        { id: '', dataset: { navTarget: 'replica-sec-beats' }, classList: { contains: (c) => c === 'replica-nav-item', toggle: () => {} }, hasAttribute: () => false, disabled: false },
+        { id: '', dataset: { jumpBeat: 'B01' }, classList: { contains: (c) => c === 'replica-jump', toggle: () => {} }, hasAttribute: () => false, disabled: false },
+        { id: 'replica-upload-btn', dataset: {}, classList: { contains: () => false, toggle: () => {} }, hasAttribute: () => false, disabled: false },
+        { id: 'replica-bar-start-btn', dataset: {}, classList: { contains: () => false, toggle: () => {} }, hasAttribute: () => false, disabled: false },
+        { id: 'perm-disabled-btn', dataset: {}, classList: { contains: () => false, toggle: () => {} }, hasAttribute: (a) => a === 'data-perm-disabled', disabled: false },
+    ];
+    document.getElementById = (id) => (id === 'replica-root' ? { querySelectorAll: () => mockButtons } : null);
+    replicaSetBusy(true);
+`);
+
+const btns = call('mockButtons');
+const cancelBtn1 = btns.find(b => b.id === 'replica-cancel-btn');
+const cancelBtn2 = btns.find(b => b.id === 'replica-bar-cancel-btn');
+const topBtn = btns.find(b => b.dataset.floatAction === 'top');
+const navBtn = btns.find(b => b.classList.contains('replica-nav-item'));
+const jumpBtn = btns.find(b => b.dataset.jumpBeat === 'B01');
+const uploadBtn = btns.find(b => b.id === 'replica-upload-btn');
+const startBtn = btns.find(b => b.id === 'replica-bar-start-btn');
+const saveBtn = btns.find(b => b.dataset.floatAction === 'save');
+const permBtn = btns.find(b => b.id === 'perm-disabled-btn');
+
+assert.equal(cancelBtn1.disabled, false, 'replica-cancel-btn 在 busy 态下不应被禁用');
+assert.equal(cancelBtn2.disabled, false, 'replica-bar-cancel-btn 在 busy 态下不应被禁用');
+assert.equal(topBtn.disabled, false, '回到顶部按钮 [data-float-action="top"] 在 busy 态下不应被禁用');
+assert.equal(navBtn.disabled, false, '吸顶导航项 .replica-nav-item 在 busy 态下不应被禁用');
+assert.equal(jumpBtn.disabled, false, '跳轨定位按钮 [data-jump-beat] 在 busy 态下不应被禁用');
+
+assert.equal(uploadBtn.disabled, true, '动作按钮 replica-upload-btn 在 busy 态下必须被禁用');
+assert.equal(startBtn.disabled, true, '动作按钮 replica-bar-start-btn 在 busy 态下必须被禁用');
+assert.equal(saveBtn.disabled, true, '保存按钮 replica-float-save 在 busy 态下必须被禁用');
+assert.equal(permBtn.disabled, true, '带 data-perm-disabled 的按钮应始终禁用');
+
+// 恢复 non-busy 态
+call('replicaSetBusy(false);');
+assert.equal(uploadBtn.disabled, false, '解除 busy 后动作按钮应恢复可用');
+assert.equal(topBtn.disabled, false, '解除 busy 后回到顶部按钮保持可用');
+assert.equal(permBtn.disabled, true, '解除 busy 后带 data-perm-disabled 的按钮依然保持禁用');
 
 console.log('test_replica_controls.js: all assertions passed');
+

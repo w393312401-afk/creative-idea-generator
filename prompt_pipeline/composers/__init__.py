@@ -12,12 +12,14 @@ server_common.SKILL_PROFILE_VIDEO_MODEL_RULES / active_skill_profile()，这里�
 """
 
 from .base import BaseComposer
+from .miniature import MiniatureComposer
 from .omni import OmniComposer
 
 # profile 名 → composer 类。键必须与 server_common.SKILL_PROFILES 的键一致。
 COMPOSERS = {
     'base': BaseComposer,
     'omni': OmniComposer,
+    'miniature': MiniatureComposer,
 }
 
 DEFAULT_COMPOSER = BaseComposer
@@ -33,4 +35,4 @@ def get_composer(profile=None):
     return COMPOSERS.get(name, DEFAULT_COMPOSER)()
 
 
-__all__ = ['BaseComposer', 'OmniComposer', 'COMPOSERS', 'get_composer']
+__all__ = ['BaseComposer', 'MiniatureComposer', 'OmniComposer', 'COMPOSERS', 'get_composer']

@@ -38,7 +38,12 @@
   // "未探测"也必须和"额度耗尽"分开：credit=null 表示从来没探测成功过，
   // 不是"没额度"，把它显示成 0 或"可用"都是在编造账号健康状态。
   function accountState(account, nowMs = Date.now()) {
-    if (account && account.disabled) return { key: 'disabled', label: '已禁用', tone: 'bad' };
+    if (account && account.disabled) {
+      if (account.disabled_reason === 'zero_credit' || (account.credit !== null && Number(account.credit) <= 0)) {
+        return { key: 'empty', label: '积分不足', tone: 'bad' };
+      }
+      return { key: 'disabled', label: '已禁用', tone: 'bad' };
+    }
     const cooling = account && account.cooldown_until
       && Number.isFinite(Date.parse(account.cooldown_until))
       && Date.parse(account.cooldown_until) > nowMs;

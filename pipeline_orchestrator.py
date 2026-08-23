@@ -47,6 +47,7 @@ from server_common import (
 from prompt_pipeline import (
     frame_review_status, merge_review_results,
     outline_items_by_beat, outline_delivery_log_line,
+    _merge_outline_frame_verdicts,
     compose_anchor_and_packet,
     compose_remaining_beats,
     refine_packet_from_accepted_anchor,
@@ -63,6 +64,7 @@ from prompt_pipeline import (
     prompt_block_from_output,
     _format_prompt_block,
     _parse_prompt_slots,
+    optimize_video_prompts_for_sequence,
 )
 from frame_generator import (
     generate_frame_sequence, _generate_image_edit, _image_edit_model,
@@ -368,6 +370,85 @@ def _valid_verdict_sequences(project_dir, sequences):
     return out
 
 
+def _valid_inline_beats(project_dir, rendered):
+    """这些拍里，哪几拍的链上守卫记录（inline_beat_review）此刻仍然成立。
+
+    判定依据是守卫落盘时记下的 frames_sha256（{帧序号: 内容哈希}）。
+    只有 verdict 在 ('pass', 'flagged')（unreviewed 不算审过）且两帧哈希均与磁盘实时文件一致
+    才算有效。"""
+    manifest = read_manifest(project_dir) or {}
+    frames_dir = os.path.join(project_dir, 'frames')
+    rendered_set = set(rendered)
+    live = {}
+
+    def _live_hash(seq):
+        if seq not in live:
+            live[seq] = frame_content_hash(os.path.join(frames_dir, f'img_{seq:03d}.webp'))
+        return live[seq]
+
+    inline_ok = set()
+    for frame in manifest.get('frames') or []:
+        ibr = frame.get('inline_beat_review')
+        if not isinstance(ibr, dict) or ibr.get('verdict') not in ('pass', 'flagged'):
+            continue
+        beat = ibr.get('beat')
+        if not isinstance(beat, int) or beat not in rendered_set or (beat + 1) not in rendered_set:
+            continue
+        recorded_hashes = ibr.get('frames_sha256')
+        if not isinstance(recorded_hashes, dict) or not recorded_hashes:
+            continue
+        valid = True
+        for seq_str, recorded_hash in recorded_hashes.items():
+            try:
+                seq = int(seq_str)
+            except (TypeError, ValueError):
+                valid = False
+                break
+            if _live_hash(seq) != recorded_hash:
+                valid = False
+                break
+        if valid:
+            inline_ok.add(beat)
+    return inline_ok
+
+
+def _inline_result(project_dir, inline_ok):
+    """把仍然成立的守卫记录拼成 check_full_sequence_consistency 的同形状 dict。
+
+    注意：global_reviewed=False, global_attempted=False，绝不伪造跨帧层的成功。"""
+    manifest = read_manifest(project_dir) or {}
+    failures = {}
+    issues = []
+    outline_per_beat = []
+    for frame in manifest.get('frames') or []:
+        ibr = frame.get('inline_beat_review')
+        if not isinstance(ibr, dict):
+            continue
+        beat = ibr.get('beat')
+        if beat not in inline_ok:
+            continue
+        ibr_issues = ibr.get('issues') or []
+        for issue in ibr_issues:
+            if issue.get('verified') is not False:
+                failures.setdefault(beat, []).append(issue.get('text'))
+            issues.append(issue)
+        # 卡片工序的画面判定：守卫过的拍在收尾那趟被跳过，逐拍层不会再产一次，
+        # 这里是它们进 _record_outline_frame_verdicts 的唯一通路（漏掉不报错，
+        # 只是交付总账的 frame_verdict 一直空着）。
+        ibr_outline = ibr.get('outline_frame_verdicts')
+        if isinstance(ibr_outline, dict) and ibr_outline:
+            outline_per_beat.append(ibr_outline)
+    return {
+        'failures': failures,
+        'issues': issues,
+        'unreviewed_beats': [],
+        'global_unreviewed_beats': [],
+        'global_reviewed': False,
+        'global_attempted': False,
+        'outline_frame_verdicts': _merge_outline_frame_verdicts(outline_per_beat),
+    }
+
+
 def _manifest_review_summary(project_dir, sequences):
     """这段已渲染序列**此刻**的审查状态（从 manifest 现读）：
     {'flagged': {seq: 原因}, 'unreviewed': [seq, ...]}。
@@ -520,10 +601,13 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
             })
         return prompt_block
 
+    inline_ok = set() if full else _valid_inline_beats(project_dir, rendered)
+    local_beats = [b for b in beats_to_review if b not in inline_ok]
+
     if on_progress:
-        scope = (f'本轮只需重审 {len(beats_to_review)}/{len(all_beats)} 拍'
-                 f'（其余 {len(all_beats) - len(beats_to_review)} 拍的结论仍然成立，直接复用）'
-                 if incremental else f'本轮审查全部 {len(all_beats)} 拍')
+        scope = (f'本轮只需重审 {len(local_beats)}/{len(all_beats)} 拍'
+                 f'（其余 {len(all_beats) - len(local_beats)} 拍的结论仍然成立，直接复用）'
+                 if (incremental or inline_ok) else f'本轮审查全部 {len(all_beats)} 拍')
         if partial:
             on_progress('sequence_review', {
                 'message': f'仅前 {len(rendered)}/{len(all_seqs)} 帧已渲染，'
@@ -542,7 +626,7 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
         outline_kw['outline_items'] = outline_items
     final_result = check_full_sequence_consistency(
         config, prompt_block, frame_paths, on_progress=on_progress,
-        only_beats=(beats_to_review if incremental else None),
+        only_beats=(local_beats if (incremental or inline_ok) else None),
         global_only_beats=(beats_to_review if incremental else None),
         **outline_kw)
     if final_result is None:
@@ -554,7 +638,7 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
             })
         final_result = check_full_sequence_consistency(
             config, prompt_block, frame_paths, degraded=True, on_progress=on_progress,
-            only_beats=(beats_to_review if incremental else None),
+            only_beats=(local_beats if (incremental or inline_ok) else None),
             global_only_beats=(beats_to_review if incremental else None),
             **outline_kw)
     elif final_result.get('unreviewed_beats') or not final_result.get('global_reviewed'):
@@ -578,6 +662,9 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
                                                 global_only_beats=(global_unreviewed or None),
                                                 on_progress=on_progress, **outline_kw)
         final_result = merge_review_results(final_result, retry)
+
+    if final_result is not None and inline_ok:
+        final_result = merge_review_results(_inline_result(project_dir, inline_ok), final_result)
 
     if final_result is None:
         # 审查两次（常规+降级）都彻底没跑起来。如实标"未经审查"，绝不盖
@@ -908,10 +995,14 @@ def undo_frame_fix(title, sequence, prompt_block):
             'at': snap.get('at')}
 
 
-def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, manual_reason=None):
+def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, manual_reason=None, cascade_downstream=False):
     """人工确认修复流程的落地点：`_sequence_consistency_review` 只标记问题、不
     自动改写重渲，人工在帧网格看过 vlm_qa_reason 后点击「修复此帧问题」才会真正
     触发这里——针对被标记的具体问题做定向提示词优化，再以 4选1 候选优选模式重渲。
+
+    cascade_downstream=True: 当修改属于透视/硬装/结构级重大变更（Level 3）时，
+    在重渲完成第 sequence 帧后，自动以新帧为底图向后链式重渲所有下游帧（sequence+1..N），
+    彻底清除下游的 stale_lineage 标记，杜绝单帧修复导致的后向断层。
 
     问题来源有两条，可并存也可单独成立：机器的一致性审查判定（vlm_qa_reason）与
     人工主动描述（manual_issue，见 set_manual_frame_issue）。manual_reason 是人在
@@ -1016,32 +1107,42 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
     )
     is_candidate_mode = not is_explicitly_disabled
 
+    target_sequences = [sequence]
+    if cascade_downstream:
+        downstream = [s for s in sorted(images.keys()) if s > sequence]
+        if downstream:
+            target_sequences.extend(downstream)
+
     if is_candidate_mode:
         if on_progress:
+            render_msg = (f"🎨 正在以 4选1 候选优选方式重渲 IMG {sequence:03d}，并连带重渲下游 {len(target_sequences)-1} 帧…"
+                          if len(target_sequences) > 1 else f"🎨 正在以 4选1 候选优选方式重渲 IMG {sequence:03d}…")
             on_progress('frame_issue_fix_render', {
                 'sequence': sequence,
-                'message': f"🎨 正在以 4选1 候选优选方式重渲 IMG {sequence:03d}…",
+                'message': render_msg,
             })
 
         from candidate_selection_pipeline import run_candidate_selection_frame_sequence
         run_candidate_selection_frame_sequence(
             config, title, new_prompt_block,
             on_progress=on_progress,
-            target_sequences=[sequence],
+            target_sequences=target_sequences,
             candidate_count=4,
         )
     else:
         if on_progress:
+            render_msg = (f"🎨 正在重渲 IMG {sequence:03d}，并连带重渲下游 {len(target_sequences)-1} 帧…"
+                          if len(target_sequences) > 1 else f"🎨 正在重渲 IMG {sequence:03d}…")
             on_progress('frame_issue_fix_render', {
                 'sequence': sequence,
-                'message': f"🎨 正在重渲 IMG {sequence:03d}…",
+                'message': render_msg,
             })
 
         from frame_generator import generate_frame_sequence
         generate_frame_sequence(
             config, title, new_prompt_block,
             on_progress=on_progress,
-            target_sequences=[sequence],
+            target_sequences=target_sequences,
         )
 
     # 重渲成功才清人工描述：中途抛错时描述必须原样留在 manifest 上，否则人得重新
@@ -1052,6 +1153,24 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
     # 重渲之后才盖"可撤销"的记号：重渲会整体改写这条 manifest 条目，写在前面会被冲掉。
     # 中途抛错时也不该有这枚记号——那次修复没落地，没有"新版本"需要退回。
     _mark_fix_backup(project_dir, sequence, snapshot.get('at'), reason)
+
+    # 自动刷新 5 列多宫格拼图大图
+    try:
+        from tools.collage import build_keyframe_collage
+        from pathlib import Path
+        all_frames = [os.path.join(project_dir, 'frames', f'img_{s:03d}.webp') for s in sorted(images.keys())]
+        existing_frames = [p for p in all_frames if os.path.exists(p)]
+        if existing_frames:
+            c_name = f"{os.path.basename(os.path.normpath(project_dir))}_collage.jpg"
+            c_path = build_keyframe_collage(existing_frames, Path(project_dir) / c_name, columns=5, tile_width=240, max_frames=0)
+            if c_path and os.path.exists(c_path):
+                with manifest_lock(project_dir):
+                    mf = read_manifest(project_dir)
+                    if mf:
+                        mf['collage_url'] = '/' + os.path.relpath(str(c_path), os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+                        write_manifest(project_dir, mf)
+    except Exception:
+        pass
 
     verify = _reverify_frame_issues(config, title, sequence, recorded_issues, on_progress=on_progress)
     return {'prompt_block': new_prompt_block, 'reason': reason, 'reverify': verify,
@@ -1204,6 +1323,14 @@ def run_autonomous_pipeline(config, dimensions, on_progress=None):
         project_dir, (config or {}).get('_outline_delivery_ledger'), title=title)
     generate_frame_sequence(config, title, prompt_block, on_progress=on_progress,
                             target_sequences=None)
+    # 视频生成前优化门：根据真实渲染的帧序列画面差量优化所有视频提示词，以防跳变
+    try:
+        prompt_block = optimize_video_prompts_for_sequence(
+            config, title, prompt_block, on_progress=on_progress
+        )
+    except Exception as opt_e:
+        print(f"[ORCHESTRATOR] Video prompt optimization error (proceeding with original): {opt_e}")
+
     video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress,
                                                 project_dir=project_dir)
 
@@ -1230,6 +1357,14 @@ def run_staged_frame_rendering(config, title, prompt_block, on_progress=None):
     project_dir = _get_project_dir(title)
     generate_frame_sequence(config, title, prompt_block, on_progress=on_progress,
                             target_sequences=None)
+    # 视频生成前优化门：根据真实渲染的帧序列画面差量优化所有视频提示词，以防跳变
+    try:
+        prompt_block = optimize_video_prompts_for_sequence(
+            config, title, prompt_block, on_progress=on_progress
+        )
+    except Exception as opt_e:
+        print(f"[ORCHESTRATOR] Video prompt optimization error (proceeding with original): {opt_e}")
+
     video_result = _render_videos_with_recovery(config, title, prompt_block, on_progress=on_progress,
                                                 project_dir=project_dir)
 

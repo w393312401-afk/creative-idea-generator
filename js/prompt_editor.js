@@ -532,3 +532,45 @@ function initPromptEditor() {
         }
     });
 }
+
+async function optimizeVideoPromptsAction(ownerIdea) {
+    ownerIdea = ownerIdea || currentIdea;
+    if (!ownerIdea || !ownerIdea.prompt_block) {
+        showToast('当前创意无提示词', 'warning');
+        return;
+    }
+    showToast('正在依据画面差量优化视频提示词...', 'info');
+    try {
+        const resp = await fetch('/api/optimize_video_prompts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                config,
+                title: typeof getIdeaSaveTitle === 'function' ? getIdeaSaveTitle(ownerIdea) : (ownerIdea.title || ''),
+                display_title: ownerIdea.title,
+                prompt_block: ownerIdea.prompt_block,
+                force: true,
+            })
+        });
+        if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+        }
+        const data = await resp.json();
+        if (data.prompt_block) {
+            if (typeof applyPromptBlockToIdea === 'function') {
+                await applyPromptBlockToIdea(ownerIdea, data.prompt_block, data.prompt_slots, false);
+            } else {
+                ownerIdea.prompt_block = data.prompt_block;
+                if (typeof renderPromptDisplay === 'function') renderPromptDisplay(data.prompt_block);
+            }
+            showToast('视频提示词优化完成！', 'success');
+        }
+    } catch (e) {
+        console.error('Failed to optimize video prompts:', e);
+        showToast(`优化失败: ${e.message}`, 'error');
+    }
+}
+
+if (typeof window !== 'undefined') {
+    window.optimizeVideoPromptsAction = optimizeVideoPromptsAction;
+}

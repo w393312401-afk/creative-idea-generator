@@ -11,6 +11,7 @@ const SKILL_PROFILE_CHOICES = [
     { value: 'auto', label: '自动', hint: '跟随视频模型' },
     { value: 'base', label: 'Veo · 单镜延时', hint: 'gemini-veo-restoration-composer' },
     { value: 'omni', label: 'Omni · 多镜头', hint: 'gemini-omni-restoration-composer' },
+    { value: 'miniature', label: 'Miniature · 微缩多镜头', hint: 'gemini-miniature-restoration-composer' },
 ];
 
 // /api/mode 下发的链路信息（app.js initServerMode 填）。规则表形如

@@ -95,7 +95,12 @@ function applySlotSize(size) {
 /** 这张卡片在当前筛选下是否该显示。只读渲染时写下的 data-*，不另算一套。 */
 function slotMatchesFilter(card, filter) {
     if (filter === 'all') return true;
-    if (filter === 'flagged') return Number(card.dataset.badges || 0) > 0;
+    if (filter === 'flagged') {
+        const issues = card.dataset.issueBadges !== undefined
+            ? Number(card.dataset.issueBadges)
+            : Number(card.dataset.badges || 0);
+        return issues > 0;
+    }
     if (filter === 'dirty') return card.dataset.promptDirty === '1';
     if (filter === 'missing') return ['missing', 'failed'].includes(card.dataset.kind);
     return true;
@@ -126,7 +131,10 @@ function syncSlotToolbar(type) {
         card.classList.toggle('slot-filtered-out', !match);
         if (match) shown += 1;
         if (card.dataset.kind === 'ready') ready += 1;
-        if (Number(card.dataset.badges || 0) > 0) flagged += 1;
+        const issues = card.dataset.issueBadges !== undefined
+            ? Number(card.dataset.issueBadges)
+            : Number(card.dataset.badges || 0);
+        if (issues > 0) flagged += 1;
         if (card.dataset.fixable === '1') fixable += 1;
         if (card.dataset.promptDirty === '1') dirty += 1;
         if (['missing', 'failed'].includes(card.dataset.kind)) missing += 1;
@@ -207,8 +215,12 @@ function jumpToFirstFlagged(type) {
     const { grid } = slotToolbarEls(type);
     if (!grid) return;
     const target = Array.from(grid.querySelectorAll('.slot-card'))
-        .find(c => Number(c.dataset.badges || 0) > 0
-            && !c.classList.contains('slot-filtered-out'));
+        .find(c => {
+            const issues = c.dataset.issueBadges !== undefined
+                ? Number(c.dataset.issueBadges)
+                : Number(c.dataset.badges || 0);
+            return issues > 0 && !c.classList.contains('slot-filtered-out');
+        });
     if (!target) return;
     target.scrollIntoView({ behavior: 'smooth', block: 'center' });
     target.classList.add('slot-flash');

@@ -72,6 +72,19 @@ _MIN_GENERATED_RESULT_AGE_SECONDS = 8.0
 # outside the current viewport is never mounted, so waiting for DOM confirmation
 # forever means waiting until the timeout.
 _UNCONFIRMED_CANDIDATE_GRACE_SECONDS = 30.0
+# 提交后的「画布水化窗口」：Flow 画布是虚拟化的，点下发送后它会把先前卸载掉的历史
+# tile 重新挂载，这些 tile 的签名 URL 也会被重新拉一次；上一次提交刚落地、还没被
+# 谁认领的结果也在其中。「捕获时刻离提交太近」是历史媒体唯一不会被画布重排伪装的
+# 证据——tile 是否新建、DOM 是否新增这两条佐证恰恰都被重排伪装成「本次新结果」
+# （2026-08-22 事故：IMG 012 在提交后 1 秒就"抓"回了 IMG 013 的候选图并落进槽位）。
+#
+# 两条线的窗口不同，取值来自全量日志里「提交 → 捕获」的实测分布：
+#   · 单图 1x（660 次）：0/1/2s 各有若干（全是本类事故），3–6s 一次没有，
+#     真结果集中在 10–14s；取 6s。
+#   · 候选 x4（85 批）：真结果最快 15s，主群落在 20–44s；异常批则是 0/1/4/7/9s
+#     的整齐爆发；取 12s。
+_CANVAS_HYDRATION_WINDOW_SECONDS = 6.0
+_CANDIDATE_HYDRATION_WINDOW_SECONDS = 12.0
 
 
 class ReferenceMountError(RuntimeError):
@@ -487,6 +500,34 @@ def _is_generated_candidate_stable(submit_ts, *, now=None, confirmed_new_tile=Fa
     return current_time >= submit_ts + _MIN_GENERATED_RESULT_AGE_SECONDS
 
 
+def _canvas_hydration_window_seconds(candidate_mode=False):
+    """水化窗口秒数。SPARK_FX_HYDRATION_WINDOW 可覆盖两条线，置 0 关掉该判据。"""
+    default = (_CANDIDATE_HYDRATION_WINDOW_SECONDS if candidate_mode
+               else _CANVAS_HYDRATION_WINDOW_SECONDS)
+    raw = os.environ.get("SPARK_FX_HYDRATION_WINDOW")
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_canvas_hydration_capture(capture_ts, submit_ts, *, window=None,
+                                 candidate_mode=False):
+    """这条观测是不是「提交后画布重排」顺带拉回来的历史媒体。
+
+    与 _is_generated_candidate_stable 的关键差别在于判据落在**观测时刻**而不是
+    **判定时刻**：后者只要多等几轮就自动放行，于是提交后 0 秒抓到的历史图熬过 8s
+    最小年龄闸照样会被收下——2026-08-22 事故正是这么发生的。观测时刻不会随等待改变。
+    """
+    if window is None:
+        window = _canvas_hydration_window_seconds(candidate_mode)
+    if window <= 0 or capture_ts is None or not submit_ts:
+        return False
+    return capture_ts < submit_ts + window
+
+
 def _unconfirmed_candidate_is_acceptable(first_seen_ts, *, now=None,
                                          grace=_UNCONFIRMED_CANDIDATE_GRACE_SECONDS):
     """Whether a never-corroborated network candidate may be accepted anyway.
@@ -539,6 +580,9 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
     if not prompts:
         result["message"] = "No prompts provided"
         return result
+
+    # 候选 x4 与单图 1x 的真实生成延迟差一倍，水化窗口按模式取（见窗口常量处的实测分布）
+    is_candidate_request = bool(getattr(req, "is_candidate_mode", False))
 
     log(f"🚀 Google FX 批量生图请求: {len(prompts)} 个, 首个: {prompts[0][:30]}...", "GoogleFX")
     # 模型名归一化：将任意别名/错误名称映射为真实模型
@@ -647,6 +691,10 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                         # 参考就能跨账号接上（视频侧一直是纯上传，所以从来没有这个问题）。
                         log(f"  ↻ 画布上挂不到该参考图，改用上传方式: {os.path.basename(local_path)}", "GoogleFX")
                         _ok = _upload_image_to_canvas_and_mount(page, local_path)
+                        # 上传成功会把新 tile 的 UUID 交回来。带回给调用方留档，
+                        # 下一次引用同一张参考图就能直接挂画布，不必再传一遍。
+                        if isinstance(_ok, str) and _ok:
+                            result.setdefault('uploaded_reference_uuids', {})[local_path] = _ok
                     if _ok:
                         mounted_count += 1
                         _rr, _rs = _wait_for_flow_reference_ready(page, timeout_seconds=15, settle_range=(0.5, 1.0))
@@ -998,8 +1046,31 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                 pending_unconfirmed_candidates = set()
                 early_candidate_logs = set()
 
-                def _acceptable_candidate(url, source, *, confirmed_new_tile=False):
+                def _acceptable_candidate(url, source, *, confirmed_new_tile=False,
+                                          capture_ts=None):
                     if not url or url in ignored_candidates:
+                        return False
+                    # 提交后头几秒的观测是画布重排把历史 tile 又拉了一遍，不是本次结果。
+                    # 网络侧有确切的捕获时刻，可以就地判死并把这个 UUID 拉黑（生成不可能
+                    # 在 4 秒内完成，所以这不是"证据不足"而是"证据相反"）；DOM 侧没有捕获
+                    # 时刻，只能按"现在还太早"延后一轮，绝不拉黑。
+                    if capture_ts is not None:
+                        if _is_canvas_hydration_capture(
+                                capture_ts, submit_ts_this,
+                                candidate_mode=is_candidate_request):
+                            ignored_candidates.add(url)
+                            media_uuid = _extract_media_uuid(url)
+                            if media_uuid:
+                                blocked_media_uuids.add(media_uuid)
+                            log(
+                                f"  🚫 {source}提交后 {max(0.0, capture_ts - submit_ts_this):.1f}s 即被捕获，"
+                                f"判为画布重排的历史媒体: {media_uuid[:16] if media_uuid else 'no-uuid'}...",
+                                "GoogleFX",
+                            )
+                            return False
+                    elif _is_canvas_hydration_capture(
+                            time.time(), submit_ts_this,
+                            candidate_mode=is_candidate_request):
                         return False
                     # Hard evidence first.  Only media that already existed before Send
                     # (canvas history, mounted prompt references, caller exclusions) is
@@ -1148,6 +1219,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                                     url,
                                     "路径A",
                                     confirmed_new_tile=in_new_tile,
+                                    capture_ts=ts,
                                 )):
                             if confirmed:
                                 return url
@@ -1336,11 +1408,16 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                 }
                 collected = []
                 seen_uuids = set()
+                hydration_logged = set()
 
                 poll_count = 0
                 while time.time() < deadline:
                     _check_cancelled()
                     poll_count += 1
+                    # 提交刚落下的这几秒里，画布重排会把历史 tile 连同它们的媒体一起
+                    # 重新挂上来。这段时间内 DOM 侧的一切"新增"都不可信，直接不采。
+                    in_hydration_window = _is_canvas_hydration_capture(
+                        time.time(), submit_ts_this, candidate_mode=True)
 
                     tile_scan = _scan_new_result_tiles(known_tile_ids_before_submit)
                     new_tile_rows = tile_scan.get("rows") or []
@@ -1359,18 +1436,38 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     for ts, url in list(captured_data):
                         if ts >= submit_ts_this - 1 and url not in known_net:
                             m_uuid = _extract_media_uuid(url)
-                            if m_uuid and m_uuid not in seen_uuids and not _is_blocked_media_candidate(url, blocked_media_uuids):
-                                in_new_tile = m_uuid in confirmed_new_tile_uuids
-                                confirmed = in_new_tile or (m_uuid in post_submit_dom_uuids)
-                                if confirmed or _is_generated_candidate_stable(submit_ts_this, confirmed_new_tile=in_new_tile):
-                                    seen_uuids.add(m_uuid)
-                                    collected.append(url)
-                                    log(f"  🎯 捕获候选图 ({len(collected)}/{target_count}): {url[:70]}...", "GoogleFX")
-                                    if len(collected) >= target_count:
-                                        return collected
+                            if not m_uuid or m_uuid in seen_uuids:
+                                continue
+                            if _is_blocked_media_candidate(url, blocked_media_uuids):
+                                continue
+                            if _is_canvas_hydration_capture(
+                                    ts, submit_ts_this, candidate_mode=True):
+                                # 提交后十来秒内就出现 = 画布重排捞回来的历史媒体
+                                # （x4 真结果 15s 起，见窗口常量处的实测分布）。
+                                # 这里必须就地拉黑 UUID：只"跳过本轮"的话，它熬过
+                                # _MIN_GENERATED_RESULT_AGE_SECONDS 之后照样会被
+                                # 下一轮收下——2026-08-22 的 IMG 012 就是这么被
+                                # IMG 013 的候选图顶掉的。
+                                blocked_media_uuids.add(m_uuid)
+                                if m_uuid not in hydration_logged:
+                                    hydration_logged.add(m_uuid)
+                                    log(
+                                        f"  🚫 提交后 {max(0.0, ts - submit_ts_this):.1f}s 即被捕获，"
+                                        f"判为画布重排的历史媒体，不作候选: {m_uuid[:16]}...",
+                                        "GoogleFX",
+                                    )
+                                continue
+                            in_new_tile = m_uuid in confirmed_new_tile_uuids
+                            confirmed = in_new_tile or (m_uuid in post_submit_dom_uuids)
+                            if confirmed or _is_generated_candidate_stable(submit_ts_this, confirmed_new_tile=in_new_tile):
+                                seen_uuids.add(m_uuid)
+                                collected.append(url)
+                                log(f"  🎯 捕获候选图 ({len(collected)}/{target_count}): {url[:70]}...", "GoogleFX")
+                                if len(collected) >= target_count:
+                                    return collected
 
-                    # 2. 扫描 DOM 新 tile
-                    for row in new_tile_rows:
+                    # 2. 扫描 DOM 新 tile（水化窗口内一律不采：此刻的"新 tile"多半是旧图重挂）
+                    for row in (() if in_hydration_window else new_tile_rows):
                         src = row.get("src")
                         if src and src not in known_dom_srcs:
                             m_uuid = _extract_media_uuid(src)
@@ -1470,11 +1567,47 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     blocked_media_uuids=pre_submit_media_uuids,
                 )
 
+                # 候选线此前既不做近重复校验、也不记台账：整条 4选1 通路上，
+                # 「这张图是不是本次生成的」全靠 tile/DOM 佐证，而那两条恰恰会被
+                # 画布重排骗过（2026-08-22）。这里补上单图线早就有的两道：
+                #   · 像素级近重复 —— 抓回来的旧图往往就是参考图或某个已有槽位；
+                #   · 媒体台账 —— 落盘即记账，下一次提交起这个 UUID 永远不再是"新结果"。
+                candidate_reference_paths = list(valid_refs)
+                candidate_reference_paths.extend(
+                    path
+                    for path in (getattr(req, "excluded_image_paths", None) or [])
+                    if path not in candidate_reference_paths
+                )
                 for c_idx, c_url in enumerate(candidate_urls):
                     log(f"⬇️  下载候选图 #{c_idx+1}/{len(candidate_urls)}...", "GoogleFX")
                     lp = _download_image(c_url, c_idx)
-                    if lp and os.path.exists(lp) and os.path.getsize(lp) > 0:
-                        local_paths.append(lp)
+                    if not (lp and os.path.exists(lp) and os.path.getsize(lp) > 0):
+                        continue
+                    duplicate, duplicate_mad, duplicate_ref = _images_are_near_duplicates(
+                        lp, candidate_reference_paths,
+                    )
+                    if duplicate:
+                        # 丢这一张即可，别的候选照常参评：候选之间本就互相独立，
+                        # 与单图线"整批停在这一张"的语义不同。
+                        try:
+                            os.remove(lp)
+                        except OSError:
+                            pass
+                        log(
+                            f"  🚫 候选 #{c_idx+1} 与已有画面近乎相同 "
+                            f"(MAD={duplicate_mad:.2f}, ref={os.path.basename(duplicate_ref or '')})，"
+                            f"判为画布上的旧图，丢弃",
+                            "GoogleFX",
+                        )
+                        continue
+                    consumed_uuid = _extract_media_uuid(c_url) or _extract_media_uuid(lp)
+                    if consumed_uuid:
+                        consumed_media_uuids.add(consumed_uuid)
+                        media_ledger.record_consumed(
+                            ledger_account_id, consumed_uuid,
+                            context=os.path.basename(lp),
+                        )
+                    local_paths.append(lp)
 
                 if local_paths:
                     result["status"] = "success"

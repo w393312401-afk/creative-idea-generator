@@ -18,6 +18,16 @@ account_menu_trigger）才会弹出账号信息对话框，里面有一行
 同时提供 is_credit_exhausted_message()：给视频批量生成失败时的原始错误文案
 做一次关键词扫描，命中则认为是"账号积分耗尽"而非普通生成失败——这组关键词
 是猜测性的，等真实遇到一次耗尽再用实测文案回填。
+
+⚠️ 判据是「低于用户配的选号最低积分」，不是「等于 0」（2026-08-23 改）。
+detect_page_credit_exhaustion() 原本读到了页面上的真实余额却只判 `== 0`，于是
+"还剩 10 分、跑不动一段视频"这种最常见的情况永远识别不出来：上层把生成失败
+当成普通失败，在同一个号上原地重试到耗光重试次数，配置里那个阈值只在选号
+那一刻起作用，进了生成过程就再也没人看它。阈值取自 min_usable_credit()。
+
+能"当余额读"的选择器是白名单（扫描结果里 balance=true 的那一组）。误判一次
+的代价是把好账号自动停用 24 小时，而套餐宣传文案里遍地是数字，所以弹窗/
+Toast 这类**文案**容器一律只做关键词匹配，绝不从里面取数字当余额。
 """
 
 import contextlib
@@ -83,12 +93,25 @@ CREDIT_EXHAUSTED_KEYWORDS = [
     # 英文明确耗尽短语（不放裸数字子串，避免 "100 credits" 命中 "0 credits"）
     "out of credits",
     "out of credit",
+    "out of google flow credits",
+    "out of flow credits",
+    "out of ai credits",
     "insufficient credits",
     "insufficient credit",
+    "insufficient google flow credits",
+    "insufficient flow credits",
+    "insufficient ai credits",
     "not enough credits",
     "not enough credit",
+    "not enough google flow credits",
+    "not enough flow credits",
+    "not enough ai credits",
+    "not enough google flow and ai credits",
     "no credits left",
     "no credit left",
+    "no google flow credits left",
+    "no flow credits left",
+    "no ai credits left",
     "no credits remaining",
     "no credit remaining",
     "no credits available",
@@ -96,13 +119,21 @@ CREDIT_EXHAUSTED_KEYWORDS = [
     "you've run out of credits",
     "you have run out of credits",
     "you are out of credits",
+    "you do not have enough credits",
+    "you don't have enough credits",
     "run out of credits",
     "ran out of credits",
+    "run out of google flow credits",
+    "ran out of google flow credits",
+    "run out of flow credits",
+    "ran out of flow credits",
     "credits exhausted",
     "credit exhausted",
+    "flow credits exhausted",
     "credits depleted",
     "credit depleted",
     "zero credits",
+    "zero credit",
     "resource_exhausted",
     "resource exhausted",
     "quota_exhausted",
@@ -113,12 +144,16 @@ CREDIT_EXHAUSTED_KEYWORDS = [
     "insufficient balance",
     "credit balance is 0",
     "credit balance: 0",
-    "not enough google flow and ai credits",
-    "not enough google flow credits",
-    "not enough ai credits",
-    "not enough credits to perform this action",
+    "credit balance:0",
+    "get ai credits",
+    "get flow credits",
+    "get more ai credits",
+    "get more google flow credits",
+    "used when you're out of google flow credits",
+    "used when you are out of google flow credits",
     "try other settings or get more ai credits",
     "try other settings or upgrade for more google flow credits",
+    "not enough credits to perform this action",
     # 中文明确耗尽短语
     "积分不足",
     "没有足够的积分",
@@ -131,14 +166,17 @@ CREDIT_EXHAUSTED_KEYWORDS = [
     "点数已用完",
     "点数已耗尽",
     "点数耗尽",
+    "点数用尽",
     "额度不足",
     "额度已用完",
     "额度耗尽",
     "额度已耗尽",
+    "额度用尽",
     "配额不足",
     "配额已用完",
     "配额耗尽",
     "配额已耗尽",
+    "配额用尽",
     "积分余额为 0",
     "积分余额为0",
     "点数余额为 0",
@@ -147,6 +185,8 @@ CREDIT_EXHAUSTED_KEYWORDS = [
     "点数余额不足",
     "无可用积分",
     "无可用点数",
+    "没有可用积分",
+    "没有可用点数",
     "没有积分",
     "没有点数",
     "缺少积分",
@@ -155,10 +195,13 @@ CREDIT_EXHAUSTED_KEYWORDS = [
 
 _ZERO_CREDIT_REGEXES = [
     # 严格数字边界：仅匹配独立的 0，绝不匹配 100/500/1000 等以 0 结尾的正数
-    re.compile(r"(?<!\d)0\s*(?:(?:google\s+)?flow\s+)?credits?\b", re.IGNORECASE),
-    re.compile(r"(?:credits?|credit\s+balance|积分|点数|额度|配额|余额)[:：=为是]\s*0(?!\d)", re.IGNORECASE),
-    re.compile(r"(?:剩余|left|remaining|balance\s+is)\s*0\s*(?:credits?|积分|点数)?(?!\d)", re.IGNORECASE),
-    re.compile(r"(?<!\d)0\s*(?:积分|点数|额度|配额)(?:余额)?(?!\d)", re.IGNORECASE),
+    re.compile(r"(?<!\d)0\s*(?:(?:google\s+)?flow\s+|ai\s+)?credits?\b", re.IGNORECASE),
+    re.compile(r"(?:credits?|credit\s+balance|flow\s+credits?|ai\s+credits?|积分|点数|额度|配额|余额)[:：=为是]\s*0(?!\d)", re.IGNORECASE),
+    re.compile(r"(?:剩余|left|remaining|balance\s+is|available)\s*0\s*(?:(?:google\s+)?flow\s+|ai\s+)?(?:credits?|积分|点数)?(?!\d)", re.IGNORECASE),
+    re.compile(r"(?<!\d)0\s*(?:google\s*flow\s*)?(?:积分|点数|额度|配额)(?:余额|剩余)?(?!\d)", re.IGNORECASE),
+    re.compile(r"\b(?:insufficient|out\s+of|not\s+enough|run\s+out\s+of)\s+(?:\w+\s+){0,3}credits?\b", re.IGNORECASE),
+    re.compile(r"\bget\s+(?:more\s+)?(?:ai|flow|google\s+flow)\s+credits?\b", re.IGNORECASE),
+    re.compile(r"\b(?:used\s+when\s+you'?re\s+out\s+of\s+(?:google\s+)?flow\s+credits?)\b", re.IGNORECASE),
 ]
 
 
@@ -236,6 +279,32 @@ def _try_click_once(page, selectors) -> bool:
     return False
 
 
+# 检测到"积分不足"时，把实测读数编进消息里的这个稳定标记，让上层把**真实数字**
+# 写回号池，而不是一律按 0 记账——本模块的规矩是积分数字只信真实探测，
+# mark_exhausted() 无脑写 0 会让控制台显示一个页面上根本不存在的余额。
+_MEASURED_CREDIT_MARK = re.compile(r"\[credit=(\d+)\]")
+
+
+def measured_credit_from_reason(reason) -> Optional[int]:
+    """从 detect_page_credit_exhaustion() 返回的描述里取回实测积分；没有则 None。"""
+    match = _MEASURED_CREDIT_MARK.search(str(reason or ""))
+    return int(match.group(1)) if match else None
+
+
+def min_usable_credit() -> int:
+    """用户在「选号最低积分（低于此值自动禁用）」里配的阈值，默认 15。
+
+    低于它的余额跑不动一段视频，跟余额恰好为 0 是同一件事。检测这一侧原本硬写死
+    比 0，于是"不够了"永远识别不出来：页面明明写着还剩 10 分，`10 == 0` 为假，
+    上层就把生成失败当成普通失败在同一个号上原地重试到耗光重试次数。
+    """
+    try:
+        from ..utils.account_pool import _get_min_credit_threshold
+        return int(_get_min_credit_threshold())
+    except Exception:
+        return 15
+
+
 def is_credit_exhausted_message(message: str) -> bool:
     """粗粒度关键词及正则匹配：判断一条生成/卡片/UI错误文案是否指向"账号积分/配额耗尽"。"""
     text = (message or "").lower()
@@ -246,6 +315,13 @@ def is_credit_exhausted_message(message: str) -> bool:
     return any(pattern.search(text) is not None for pattern in _ZERO_CREDIT_REGEXES)
 
 
+def _insufficient_credit_reason(credit_num: int, threshold: int, raw_text: str) -> str:
+    if credit_num == 0:
+        return f"账号积分余额为 0 (当前读数: {raw_text}) [credit=0]"
+    return (f"账号积分不足：实测 {credit_num} < 选号最低积分 {threshold}"
+            f" (当前读数: {raw_text}) [credit={credit_num}]")
+
+
 def detect_page_credit_exhaustion(page) -> Optional[str]:
     """主动扫描当前 Flow 页面是否存在积分/配额耗尽的弹窗、提示、Toast 或余额为 0 的状态。
     若检测到，返回对应的错误描述字符串；否则返回 None。
@@ -253,40 +329,67 @@ def detect_page_credit_exhaustion(page) -> Optional[str]:
     if not page:
         return None
     try:
-        # 1. 检查可见的错误对话框 / 弹层 / 告警条 / Toast
+        # 1. 检查可见的错误对话框 / 弹层 / 告警条 / Toast / 积分链接与按钮
+        # balance=true 的那几个是"余额本体"选择器，读到的整行数字可以当真实余额拿去
+        # 跟阈值比；其余是弹窗/Toast 之类的**文案**容器，只做关键词匹配——套餐宣传
+        # 文案（"1,000 monthly Google Flow credits"）就挂在这类容器里，拿它们的
+        # 数字当余额会把好账号误判成不足。
         dialog_texts = page.evaluate("""() => {
-            const selectors = [
-                "[role='dialog']",
-                "[role='alertdialog']",
-                "[role='alert']",
-                ".cdk-overlay-pane",
-                "[class*='toast']",
-                "[class*='snackbar']",
-                "[class*='notification']",
-                "div[aria-live='assertive']",
+            const groups = [
+                { balance: false, selectors: [
+                    "[role='dialog']",
+                    "[role='alertdialog']",
+                    "[role='alert']",
+                    ".cdk-overlay-pane",
+                    "[class*='toast']",
+                    "[class*='snackbar']",
+                    "[class*='notification']",
+                    "div[aria-live='assertive']",
+                ]},
+                { balance: true, selectors: [
+                    "a[href*='flow_ai_credits_page']",
+                    "a[href*='credits']",
+                    "[data-test-id*='credit']",
+                    "[class*='credit']",
+                ]},
             ];
-            const texts = [];
-            for (const sel of selectors) {
-                try {
-                    const elements = document.querySelectorAll(sel);
-                    for (const el of elements) {
-                        const style = window.getComputedStyle(el);
-                        if (style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity) > 0) {
-                            const t = (el.innerText || el.textContent || '').trim();
-                            if (t) texts.push(t);
+            const out = [];
+            for (const g of groups) {
+                for (const sel of g.selectors) {
+                    try {
+                        const elements = document.querySelectorAll(sel);
+                        for (const el of elements) {
+                            const style = window.getComputedStyle(el);
+                            if (style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity) > 0) {
+                                const t = (el.innerText || el.textContent || '').trim();
+                                if (t) out.push({ text: t, balance: g.balance });
+                            }
                         }
-                    }
-                } catch (e) {}
+                    } catch (e) {}
+                }
             }
-            return texts;
+            return out;
         }""")
 
-        for text in (dialog_texts or []):
+        threshold = min_usable_credit()
+        for entry in (dialog_texts or []):
+            # 兼容旧版返回纯字符串数组的调用方/测试桩
+            if isinstance(entry, str):
+                text, is_balance = entry, False
+            else:
+                text, is_balance = (entry or {}).get("text") or "", bool((entry or {}).get("balance"))
+            if not text:
+                continue
             if is_credit_exhausted_message(text):
                 first_line = text.splitlines()[0][:100].strip()
                 return f"页面提示积分耗尽: {first_line}"
+            if is_balance:
+                credit_num = _extract_credit_number(text)
+                if credit_num is not None and credit_num < threshold:
+                    return _insufficient_credit_reason(credit_num, threshold, text.splitlines()[0][:100].strip())
 
-        # 2. 检查 UI 上的明确 0 积分链接/元素 (a[href*='credits'])
+        # 2. 检查 UI 上的余额元素 (a[href*='credits'])：低于「选号最低积分」即判不可用。
+        #    这里原本只判 == 0，于是"还剩 10 分但跑不动一段视频"永远识别不出来。
         credit_elements = UI_SELECTORS.get("google_fx", {}).get("credit_display", [])
         for sel in credit_elements:
             try:
@@ -297,8 +400,8 @@ def detect_page_credit_exhaustion(page) -> Optional[str]:
                         continue
                     credit_num = _extract_credit_number(t)
                     if credit_num is not None:
-                        if credit_num == 0:
-                            return f"账号积分余额为 0 (当前读数: {t})"
+                        if credit_num < threshold:
+                            return _insufficient_credit_reason(credit_num, threshold, t)
                     elif is_credit_exhausted_message(t):
                         return f"账号菜单/顶栏显示积分耗尽: {t}"
             except Exception:

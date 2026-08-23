@@ -1445,5 +1445,61 @@ class TestCollageQAWiring(unittest.TestCase):
         self.assertEqual(len(manifest['frames']), 1)
 
 
+class TestManifestSyncAndFrameResilience(unittest.TestCase):
+    """测试 manifest 中存在旧格式 dict 或非 dict 项时的健壮性。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_output_root = server_common.OUTPUT_ROOT
+        server_common.OUTPUT_ROOT = self.tmp
+        self.cover = _make_test_cover(self.tmp)
+
+    def tearDown(self):
+        server_common.OUTPUT_ROOT = self.old_output_root
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_sync_project_manifest_handles_dict_videos_and_frames(self):
+        import server
+        project_dir = os.path.join(self.tmp, 'legacy_dict_project')
+        os.makedirs(project_dir, exist_ok=True)
+        manifest_path = os.path.join(project_dir, 'manifest.json')
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'title': 'legacy_dict_project',
+                'images': {'1': {'summary': 'frame 1'}},
+                'videos': {'1': {'summary': 'video 1'}},
+            }, f)
+
+        # Should not throw 'str' object has no attribute 'get'
+        server.sync_project_manifest_with_disk(project_dir)
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        self.assertIsInstance(data.get('frames'), list)
+        self.assertIsInstance(data.get('videos'), list)
+
+    def test_frame_generation_handles_manifest_with_only_slot_key(self):
+        project_dir = os.path.join(self.tmp, 'slot_only_project')
+        os.makedirs(project_dir, exist_ok=True)
+        manifest_path = os.path.join(project_dir, 'manifest.json')
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'title': 'slot_only_project',
+                'frames': [{'slot': 1, 'file': 'img_001.webp'}],
+            }, f)
+
+        def fake_image_edit(config, prompt, reference_path, target_path, *args, **kwargs):
+            _write_test_image(target_path, (72, 128))
+            return False
+
+        with patch('frame_generator._generate_image_edit', side_effect=fake_image_edit):
+            manifest = generate_frame_sequence(
+                {'coverReferencePath': self.cover},
+                'slot_only_project',
+                '图片 1:\nfirst\n',
+                on_progress=lambda *a: None,
+            )
+        self.assertEqual(len(manifest['frames']), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

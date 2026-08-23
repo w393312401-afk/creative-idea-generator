@@ -461,6 +461,11 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
             patch.object(pp, 'validate_beat_prompts', return_value=[]),
             patch.object(pp, 'check_milestone_video_prompt', return_value=[]),
             patch.object(pp, 'check_milestone_image_prompt', return_value=[]),
+            # 2026-08-22：IMAGE 侧缺陷检测改由 pp.collect_image_defects 自己跑（不再
+            # 从 validate_beat_prompts 的结果里切），所以把 validate 桩成 [] 已经不足以
+            # 关掉回炉——夹具里"Image prompt for beat N"逐拍几乎一样，必然触发相似度
+            # 回炉、多打一次 _chat，把这些用例真正要断言的"每拍一次调用"冲掉。
+            patch.object(pp, 'collect_image_defects', return_value={}),
         ]
         for p in patches:
             p.start()
@@ -553,10 +558,10 @@ class TestComposeRemainingBeatsResume(unittest.TestCase):
         with patch.object(pp, 'validate_beat_prompts', side_effect=self._validation_crashes_on(3, crash_flag)), \
              patch.object(pp, '_chat', side_effect=self._fake_chat_factory(calls)):
             with self.assertRaises(RuntimeError):
-                pp.compose_remaining_beats({}, state)
+                pp.compose_remaining_beats({'composeBatchSize': 3}, state)
 
-        # Rolling compose batches are capped at three beats. The crash happens while
-        # validating beat 3, before the next batch/individual request can start beat 4.
+        # 窗口大小显式钉成 3（默认值是 5，会把 4 拍装进同一窗，测不到跨窗那一刀）：
+        # 第一窗覆盖 1-3 拍，崩在校验第 3 拍时，第 4 拍所在的第二窗还没发出去。
         self.assertEqual(sorted(set(calls)), [1, 2, 3])
         checkpoint = pp.load_compose_checkpoint(self.fingerprint)
         self.assertIsNotNone(checkpoint, "a crash mid-loop must still leave a checkpoint behind")

@@ -617,10 +617,11 @@
                                              renderMergeBlocked 会把「重试缺口 / 跳过合并」两个可操作
                                              按钮渲染进这里，收进弹层就等于把出口藏起来了。 -->
                                         <p class="frames-meta" id="videos-meta">尚未生成任何视频序列。</p>
+                                        <button type="button" id="generate-video-chain-btn" class="action-btn text-btn mini-btn" style="color:var(--neon-cyan, #06b6d4); border-color:rgba(6,182,212,0.4); margin-left:auto;" title="纯视频提示词链式生成通道：无需预先生成整套关键帧图，第1段为文生视频(T2V)，后续各段自动截取上一段视频的最后一帧作为参考帧(I2V)循环生成并自动合并">🎬 纯视频链生成 (T2V→I2V)</button>
                                         <!-- 首帧封面：平台取缩略图吃的是成片第一帧，而正片第一帧是施工前的空场。
                                              默认烧一帧（肉眼看不见，缩略图已经是封面）；用哪张由封面页的
                                              「成片首帧」用途分配决定。 -->
-                                        <label for="merge-cover-burn-select" style="display:inline-flex; align-items:center; gap:8px; margin-left:auto; color:var(--text-secondary); font-size:12px; white-space:nowrap;"
+                                        <label for="merge-cover-burn-select" style="display:inline-flex; align-items:center; gap:8px; color:var(--text-secondary); font-size:12px; white-space:nowrap;"
                                                title="把封面烧进成片开头，让平台的缩略图取到封面图">
                                             <span>封面首帧</span>
                                             <select id="merge-cover-burn-select" aria-label="成片首帧烧录封面" style="padding:6px 10px; color:var(--text-primary); background:var(--surface, #111827); border:1px solid var(--border-color); border-radius:6px;">
@@ -1255,8 +1256,9 @@
                                 <option value="auto" selected>跟随视频模型（默认）</option>
                                 <option value="base">Veo 单镜延时</option>
                                 <option value="omni">Gemini Omni 多镜头组接</option>
+                                <option value="miniature">Miniature · 微缩巨人手多镜头</option>
                             </select>
-                            <small class="settings-hint">auto 模式下：选 Omni Flash 自动走 Omni 链路，选 Veo 系列自动走 Veo 链路。</small>
+                            <small class="settings-hint">auto 模式下：选 Omni Flash 自动走 Omni 链路，选 Veo 系列自动走 Veo 链路；也可手动强制指定为 Miniature 微缩链路（巨人手微缩，同样是多镜头组接）。</small>
                         </div>
                         <div class="form-group settings-field">
                             <label for="settings-image-backend">帧序列生成方式</label>
@@ -1403,6 +1405,20 @@
                         <div class="modal-info gate-settings-note">
                             <p>💡 <b>纯本地、零成本、只告警</b>的判据（片段冻结检测、段内推进节奏检测）刻意没有开关：
                             它们不会误删片，关掉只会让你失去知情。有开关的都是<b>要么烧额度、要么会删片重来</b>的项。</p>
+                        </div>
+                        <div class="gate-settings-toolbar" id="gate-settings-toolbar">
+                            <div class="gate-search-wrap">
+                                <span class="gate-search-icon">🔍</span>
+                                <input type="text" id="gate-settings-search" class="gate-settings-search-input" placeholder="快速查找门禁开关（如：差量、优化、质检、连续性、锚点）..." autocomplete="off">
+                                <button type="button" id="gate-settings-search-clear" class="gate-search-clear-btn" title="清空搜索" style="display: none;">&times;</button>
+                            </div>
+                            <div class="gate-filter-chips" id="gate-filter-chips">
+                                <button type="button" class="gate-filter-chip active" data-filter="all">🌟 全部阶段</button>
+                                <button type="button" class="gate-filter-chip" data-filter="video">🎬 阶段3·视频与差量优化</button>
+                                <button type="button" class="gate-filter-chip" data-filter="frame">🖼️ 阶段2·帧渲染与连续性</button>
+                                <button type="button" class="gate-filter-chip" data-filter="prompt">📝 阶段1·提示词契约</button>
+                                <button type="button" class="gate-filter-chip" data-filter="env">🛡️ 全局环境兜底</button>
+                            </div>
                         </div>
                         <div id="gate-settings-list" class="gate-settings-list">
                             <p class="settings-hint" id="gate-settings-loading">正在读取服务端门禁配置…</p>

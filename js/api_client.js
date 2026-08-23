@@ -248,10 +248,27 @@ async function syncFrameRunToLibrary(manifestData, ownerIdea) {
     ownerIdea = ownerIdea || currentIdea;
     if (!ownerIdea || !manifestData) return;
     ownerIdea.frameRun = manifestData;
+    if (manifestData.prompt_block && manifestData.prompt_block !== ownerIdea.prompt_block) {
+        ownerIdea.prompt_block = manifestData.prompt_block;
+        if (manifestData.prompt_slots) {
+            ownerIdea.prompt_slots = manifestData.prompt_slots;
+        }
+        if (isViewingIdea(ownerIdea.id)) {
+            if (typeof renderPromptDisplay === 'function') {
+                renderPromptDisplay(manifestData.prompt_block);
+            }
+        }
+    }
     if (currentIdea && currentIdea.id === ownerIdea.id) saveCurrentIdeaState();
     const existingIdx = savedIdeas.findIndex(item => item.id === ownerIdea.id);
     if (existingIdx !== -1) {
         savedIdeas[existingIdx].frameRun = manifestData;
+        if (manifestData.prompt_block) {
+            savedIdeas[existingIdx].prompt_block = manifestData.prompt_block;
+            if (manifestData.prompt_slots) {
+                savedIdeas[existingIdx].prompt_slots = manifestData.prompt_slots;
+            }
+        }
         await persistIdeaItem(savedIdeas[existingIdx]);
     }
 }
@@ -1509,7 +1526,7 @@ async function undoFrameFix(seq) {
 // 单帧点击不关心返回值；「全部修复」（slot_toolbar.bulkFixFlaggedFrames）靠它
 // 决定这一轮算不算修好、以及要不要接着修下一帧——用户点了取消却继续往下修，
 // 或者一帧失败后剩下的照跑不误，都是不能接受的。
-async function fixFrameIssue(seq, manualReason) {
+async function fixFrameIssue(seq, manualReason, cascadeDownstream) {
     if (!currentIdea || !currentIdea.prompt_block) {
         showToast("请先激发一个创意点子！", "error");
         return { status: 'skipped', error: '尚未激发创意' };
@@ -1527,8 +1544,9 @@ async function fixFrameIssue(seq, manualReason) {
 
     renderSlotPending('image', seq, '修复中...');
 
+    const isCascade = !!cascadeDownstream;
     progress.style.display = 'flex';
-    meta.textContent = `正在依据问题描述修复第 ${seq} 帧...`;
+    meta.textContent = isCascade ? `正在修复第 ${seq} 帧并连带向后重渲下游帧...` : `正在依据问题描述修复第 ${seq} 帧...`;
 
     const controller = new AbortController();
     const rec = beginIdeaTask(ownerIdea.id, 'frames', null, controller);
@@ -1537,7 +1555,7 @@ async function fixFrameIssue(seq, manualReason) {
 
     const feedLine = (text, cls) => { if (typeof framesFeedLine === 'function') framesFeedLine(ownerIdea.id, text, cls); };
     if (typeof framesFeedSetLive === 'function') framesFeedSetLive(ownerIdea.id, true);
-    feedLine(`🔧 开始修复 IMG ${String(seq).padStart(3, '0')}…`);
+    feedLine(isCascade ? `🔧 开始修复 IMG ${String(seq).padStart(3, '0')} 并向后连带重渲…` : `🔧 开始修复 IMG ${String(seq).padStart(3, '0')}…`);
 
     // 与服务器失联（非任务真的失败）时置真，同 retrySingleFrame 的同款说明。
     let disconnected = false;
@@ -1562,6 +1580,7 @@ async function fixFrameIssue(seq, manualReason) {
                 generation_mode: isCand ? 'candidate_selection' : 'standard',
                 candidate_selection: isCand,
                 candidate_count: isCand ? 4 : 1,
+                cascade_downstream: isCascade,
                 manual_reason: (manualReason || '').trim() || undefined
             }),
             signal: controller.signal

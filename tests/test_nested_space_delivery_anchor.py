@@ -344,6 +344,9 @@ class TestSecondSpaceArcFloor(unittest.TestCase):
 
         state, beat_users = self._run([encoded, encoded, encoded])
 
+        # 2026-08-22：规划循环加了「不收敛就收手」（见 tests/test_beat_ladder_early_stop.py）。
+        # 这里三轮喂的是**同一份**梯子，第 3 轮必然没能超过前两轮 —— 收手点恰好也是第 3
+        # 轮，与原来的"末轮"重合，所以轮数仍是 3，末轮的确定性修复照常执行。
         self.assertEqual(len(beat_users), 3)
         repaired = next(b for b in state['beat_ladder']
                         if b.get('operation') == 'furnishing'

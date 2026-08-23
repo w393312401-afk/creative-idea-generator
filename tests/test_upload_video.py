@@ -298,3 +298,50 @@ class TestUploadVideoHeroMetaPropagation:
             "merge_project_videos 靠 meta 里的 HERO 标记识别英雄片段；"
             "没有旧 manifest 记录时必须落回 prompt_block 解析结果，否则会被合成阶段静默忽略"
         )
+
+
+class TestManualUploadMergeRecognition:
+    """测试手动上传的视频（尤其是 slot >= len(frames) 的末尾槽位，如 12 帧项目上传了 VID 12）
+    在合成视频 (merge_project_videos) 时能被正确识别并完整并入成片。"""
+
+    def test_manual_upload_at_last_slot_is_merged(self, project, tmp_path, monkeypatch):
+        from video_generator import merge_project_videos
+
+        monkeypatch.setattr(server, '_get_project_dir', lambda title: project['dir'])
+
+        # 构造 12 个 frames 和前 11 段视频
+        frames = []
+        for i in range(1, 13):
+            f_path = os.path.join(project['frames_dir'], f'frame_{i:03d}.png')
+            _make_frame(f_path, (i * 15 % 255, 100, 100))
+            frames.append({'slot': i, 'file': f'frames/frame_{i:03d}.png', 'status': 'success'})
+
+        videos = []
+        for i in range(1, 12):
+            v_path = os.path.join(project['videos_dir'], f'vid_{i:03d}.mp4')
+            _make_two_tone_video(v_path, '0xff0000', '0x00ff00')
+            videos.append({'slot': i, 'file': f'videos/vid_{i:03d}.mp4', 'status': 'success'})
+
+        with open(os.path.join(project['dir'], 'manifest.json'), 'w', encoding='utf-8') as f:
+            json.dump({'title': 'upload_video_test', 'frames': frames, 'videos': videos}, f)
+
+        # 手动上传第 12 段视频 (slot=12, 即 VID 012)
+        clip12 = _make_two_tone_video(str(tmp_path / 'clip12.mp4'), '0x0000ff', '0xffff00')
+        h, sent = _upload_handler(
+            {'title': 'upload_video_test', 'slot': '12'},
+            _read_bytes(clip12),
+        )
+        server.SparkRequestHandler.do_POST(h)
+        assert sent[0][1] == 200
+
+        # 执行合并视频
+        result = merge_project_videos(project['dir'], speed=2.0)
+        assert result is not None
+        assert result['status'] == 'success'
+
+        # 检查 concat 列表，确保 vid_012.mp4 被包含进来了
+        with open(os.path.join(project['dir'], 'manifest.json'), encoding='utf-8') as f:
+            mdata = json.load(f)
+        assert len(mdata['videos']) == 12
+        assert any(v['slot'] == 12 and v['source'] == 'manual_upload' for v in mdata['videos'])
+

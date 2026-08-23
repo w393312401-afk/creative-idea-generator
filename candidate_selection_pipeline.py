@@ -16,7 +16,7 @@ from server_common import (
     resolve_cover_reference, project_cover_path,
     apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
     read_manifest, write_manifest, GenerationCancelled, log,
-    gate_setting, _get_account_pool_service, _select_pool_account,
+    gate_setting, chain_guard_mode, _get_account_pool_service, _select_pool_account,
 )
 from frame_continuity import (
     analyze_frame, changed_grid_cells, continuity_max_retries, continuity_mode,
@@ -28,7 +28,8 @@ from frame_generator import (
     _continuity_family_maps, _continuity_beat, _image_quality_to_label,
     _get_google_fx_image_service, _fx_image_model,
     _fx_extract_uuid, _fx_store_frame, _fx_find_ref_for, _fx_src_dir,
-    _fx_clear_frame_reference, _fx_cover_ref_jpg, _fx_local_frame_ref_jpg, update_manifest_stale_status,
+    _fx_clear_frame_reference, _fx_cover_ref_jpg, _fx_local_frame_ref_jpg, _fx_heal_frame_uuid,
+    update_manifest_stale_status,
     current_thread_sinks, set_upstream_event_sink, set_cancel_check_sink,
 )
 from prompt_pipeline import (
@@ -54,15 +55,16 @@ _AI_DISCRIMINATION_SYSTEM_PROMPT = """你是一名好莱坞级电影视觉总监
    - 声明的道具、建材和施工动作是否到位，无漏做工序或提前超纲完成？
 
 2. 空间锚点与前后双向连续性 (0-30 分)：
-   - 镜头统一：地平线高度、视角焦段（24mm 广角感，1.3m 人眼/胸口视高）、机位高度和透视感是否与前序参考图高度一致？
+   - 镜头统一：视角焦段统一锁定为 24mm 广角感（无极端鱼眼畸变）、机位高度严格锁定在 1.3m 人眼/胸口视高、地平线高度维持在 45%~50% 画面高度，透视感与前序参考图高度一致。
+   - DLSP 五层绝对景深协议：严格检查近景锚点（门框/爬梯 <1m）、中景开阔通廊（1-4m）、侧翼实虚墙体边界与后景收口（>4m），严禁保龄球道式管道拉伸（Bowling alley effect）。
    - 双向咬合（若提供后续目标参考图）：所选候选图必须能够作为连接【前序基准图】与【后续目标图】的自然桥梁，严禁破坏通往后一帧的物理可达性，绝不允许环境格局断层（如门窗突变、后墙消失、透视颠覆等引起后续帧整体报废的硬伤）。
-   - 地标锁定：天花板、后背景墙、门框/洞口边界、固定地标结构是否维持物理一致？
-   - 严防空间膨胀：紧凑空间/坑穴严禁异常拉伸为巨大礼堂或洞穴大厅（Cavernous expansion）。
+   - 地标锁定与非对称特征：天花板梁架走向、后背景墙（无凭空立柱）、门框/洞口边界、左右非对称地标结构维持物理一致。
+   - 严防空间膨胀：紧凑空间/坑穴（如直径 3.0m、净高 2.2m 空间）严禁异常拉伸为巨大礼堂或洞穴大厅（Cavernous expansion），工人人体比例尺（1.78m 占画面高度约 35%）自然协调。
    - 零凭空变化：已完成的区域绝无莫名变动或无故复原破损。
 
 3. 材质真实感与光影一致性 (0-25 分)：
-   - 真实物理质感（哑光/半哑光实木纹理、粗糙混凝土/天然石材、自然漫反射光）。
-   - 严禁违规：成品展示帧严禁出现假反光镜面或湿水面效果；灯光必须自然，严禁产生杂乱荧光灯带。
+   - 真实物理质感（温润哑光/半哑光实木纹理、粗糙混凝土/天然石材、自然漫反射光）。
+   - 严禁违规：成品展示帧严禁出现假反光镜面或湿水面效果；灯光必须自然，严禁产生杂乱网状荧光灯带。
 
 4. 瑕疵与违规物过滤 (0-15 分)：
    - 严禁多肢/融化/肢体畸变或工人克隆多体重影。
@@ -108,6 +110,11 @@ _AI_DISCRIMINATION_SYSTEM_PROMPT = """你是一名好莱坞级电影视觉总监
 
 _DEFAULT_CANDIDATE_CONCURRENCY = 4
 
+# autofix 档下同一拍最多就地自动修几次。修一次≈一次定向提示词重写 + 4 张候选重渲，
+# 不设上限就会在"改写解决不了的问题"上原地烧额度（典型是提示词本身与上游画面矛盾，
+# 改多少遍都渲不对）。连修这么多次仍不过 = 这拍不是自动改写能解决的，退化成停链等人。
+_CHAIN_GUARD_AUTOFIX_ATTEMPTS = 2
+
 
 def candidate_concurrency(config, candidate_count=4):
     """4选1模式 API 候选图生成的并发度。config['candidateConcurrency'] 可覆盖；默认 candidate_count (4)，范围 1~8。"""
@@ -124,6 +131,71 @@ def _generate_single_api_candidate(config, prompt_text, reference_path, out_path
         _generate_text_image(config, prompt_text, out_path)
     else:
         _generate_image_edit(config, prompt_text, reference_path, out_path, control_prompt=ctrl_prompt)
+
+
+# 像素级近重复校验拿最近几张槽位图当参照。取"最近"而不是"全部"：比对成本随帧数
+# 线性增长，而画布重排捞回来的历史 tile 几乎总是最近生成的那几张。
+_NEAR_DUP_REFERENCE_FRAMES = 6
+
+
+def fx_media_exclusions(project_dir, frames_dir):
+    """本任务已经消费过的 Flow 媒体 UUID + 已落盘的槽位图。
+
+    候选线一直没往 ImageBatchRequest 里塞过这两样，于是 FX 侧提交前的黑名单只剩
+    「画布面板上此刻看得见的 UUID」——而 Flow 画布是虚拟化的，滚出视口的历史 tile
+    一个都不在里面。结果就是本任务自己刚生成的图被下一拍当成新结果抓回来
+    （2026-08-22：IMG 011 的三张候选原样变成 IMG 012 的候选）。
+
+    UUID 取三处，取全为止：manifest 里每帧的 fx_uuid、每张候选图的 fx_uuid，以及
+    frames/fx_src 与 frames/candidates 下的文件名（partial 批次可能还没写进 manifest，
+    但图已经落了盘、UUID 已经被消费掉了）。
+    图片路径只取最近 _NEAR_DUP_REFERENCE_FRAMES 张正式槽位图 img_XXX.webp：它们是
+    下载后像素级近重复校验的参照物。这份名单要克制——每张候选都要跟名单上每张图做
+    一次解码+缩放+差分，整表比对会给每一拍凭空加上好几秒。真正的广撒网是上面那份
+    UUID 名单（近乎免费），像素比对只是兜住"UUID 都认不出来"的残余情形，而画布重排
+    捞回来的恰恰是刚生成不久的那几张。
+    """
+    uuids = set()
+    paths = []
+
+    manifest_path = os.path.join(project_dir or '', 'manifest.json')
+    try:
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            manifest = json.load(f)
+    except Exception:
+        manifest = {}
+    for frame in (manifest.get('frames') or []) if isinstance(manifest, dict) else []:
+        if not isinstance(frame, dict):
+            continue
+        if frame.get('fx_uuid'):
+            uuids.add(str(frame['fx_uuid']).lower())
+        for cand in (frame.get('candidates') or []):
+            if isinstance(cand, dict) and cand.get('fx_uuid'):
+                uuids.add(str(cand['fx_uuid']).lower())
+
+    frames_dir = frames_dir or os.path.join(project_dir or '', 'frames')
+    if os.path.isdir(frames_dir):
+        for name in sorted(os.listdir(frames_dir)):
+            if not re.match(r'^img_\d{3}\.webp$', name):
+                continue
+            full = os.path.join(frames_dir, name)
+            try:
+                if os.path.getsize(full) > 0:
+                    paths.append(full)
+            except OSError:
+                pass
+        paths = paths[-_NEAR_DUP_REFERENCE_FRAMES:]
+    for sub in ('fx_src', 'candidates'):
+        root = os.path.join(frames_dir, sub)
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                found = _fx_extract_uuid(name)
+                if found:
+                    uuids.add(found.lower())
+
+    return sorted(uuids), paths
 
 
 def generate_frame_candidates(config, title, item, reference_path, seq, candidate_count=4, on_progress=None, is_bridge=False, is_cut_head=False, is_turn=False, project_url=None, frames_dir=None, canvas_state=None):
@@ -193,9 +265,14 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
 
             req_images = [eff_ref] if eff_ref and os.path.exists(eff_ref) else []
             
+            # 提交前把「本任务已经消费过的媒体」交给 FX 侧：没有它，抓图那边只剩
+            # 实时 DOM 基线，而画布虚拟化会让历史 tile 在基线里彻底隐身。
+            fx_excluded_uuids, fx_excluded_paths = fx_media_exclusions(project_dir, frames_dir)
             req = ImageBatchRequest(
                 prompts=[prompt_text],
                 images=req_images,
+                excluded_media_uuids=fx_excluded_uuids,
+                excluded_image_paths=fx_excluded_paths,
                 ratio=config.get('imageAspectRatio') or '9:16',
                 model=fx_model,
                 output_path=candidates_dir,
@@ -221,6 +298,20 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
                 _fx_stack.enter_context(fx_cancel_context(_cancel_fn, deadline=fx_request_deadline()))
                 fx_res = google_fx._generate_images_batch_google_fx(req)
             if fx_res:
+                # 参考图只能靠上传挂载的那次，上传完它就在画布上并有了自己的 UUID。
+                # 立刻把上一帧的 fx_src 留档改名成带 UUID 的形式，下一次引用（下一帧
+                # 的链式参考、以及每一次「修复此帧问题」）就能直接挂画布 tile。
+                # 不做这一步，同一张图会被无限次重传：留档名一直是 nouuid，
+                # _fx_find_ref_for 永远认不出它。
+                uploaded_uuids = fx_res.get('uploaded_reference_uuids') or {}
+                if uploaded_uuids and seq > 1 and frames_dir:
+                    healed = _fx_heal_frame_uuid(
+                        frames_dir, seq - 1,
+                        uploaded_uuids.get(eff_ref) or next(iter(uploaded_uuids.values()), None))
+                    if healed:
+                        log('INFO', 'CANDIDATE_GEN',
+                            f"IMG {seq - 1:03d} 的参考图留档已补上画布 UUID，"
+                            f"后续引用与修复不再重复上传")
                 if fx_res.get('project_url'):
                     returned_project_url = fx_res.get('project_url')
                     if project_url and returned_project_url != project_url:
@@ -272,8 +363,25 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
                 f"IMG {seq:03d} Google FX 批量候选生成失败（{type(e).__name__}: {e}），"
                 f"退回 API 多候选生成；本帧不参与 Flow 单画布串联")
 
+    # FX 少返回几张时，**不要**用 API 候选去补齐缺口（除非 FX 一张都没给出来）。
+    #
+    # API 候选没有画布 tile，_make_cand 里的 'fx_uuid': None 就是这个事实。它一旦被
+    # 4选1 选中，这一帧就脱离了 Flow 血统：留档只能落成 img_NNN_nouuid.jpg，
+    # _fx_find_ref_for 认不出，于是**下一帧的链式参考只能靠重新上传接链**——为了多
+    # 一个候选，赔掉的是下游整条链的画布连续性。2026-08-23 实测：IMG 017 的 FX 批次
+    # 只回了 3 张，第 4 张由 API 补齐并被选中，此后每次渲染/修复第 18 帧都要重传一次
+    # 同一张图。
+    #
+    # 3 张画布候选足够挑，比 4 张里混一张"选中就断链"的划算。FX 彻底空手（0 张）时
+    # 仍然退回 API——那是"有帧"与"没帧"的区别，另当别论；那种情况下下一帧会付一次
+    # 上传，并由 _fx_heal_frame_uuid 就地自愈，不会反复付。
+    if backend == 'google_fx' and candidate_paths and len(candidate_paths) < candidate_count:
+        log('INFO', 'CANDIDATE_GEN',
+            f"IMG {seq:03d} Flow 只回了 {len(candidate_paths)}/{candidate_count} 张候选，"
+            f"按画布血统优先不补 API 候选（补进来的候选一旦选中，下一帧就得靠上传接链）")
+
     # If Google FX produced fewer candidates or backend is API, use API generation
-    if len(candidate_paths) < candidate_count:
+    elif len(candidate_paths) < candidate_count:
         missing_count = candidate_count - len(candidate_paths)
         start_idx = len(candidate_paths) + 1
         missing_indices = list(range(start_idx, candidate_count + 1))
@@ -446,7 +554,7 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
         on_progress('candidate_evaluating', {
             'sequence': seq,
             'candidate_count': len(candidate_paths),
-            'message': f"IMG {seq:03d} 4张候选图已就绪，AI 模型正在多模态鉴别与打分...",
+            'message': f"IMG {seq:03d} {len(candidate_paths)}张候选图已就绪，AI 模型正在多模态鉴别与打分...",
         })
 
     # Prepare multimodal message
@@ -526,23 +634,34 @@ def evaluate_and_select_best_candidate(config, prompt_text, reference_path, cand
         }
 
 
-def _generate_full_collage_from_frames(frames_dir):
+def _generate_full_collage_from_frames(frames_dir, project_dir=None, manifest=None):
     """Generate 5-col collage image using ffmpeg for visual consistency checking."""
     frame_files = sorted(glob.glob(os.path.join(frames_dir, 'img_*.webp')))
     if not frame_files:
         return None
-    input_args = []
-    inputs = []
-    for path in frame_files:
-        input_args.extend(['-i', path])
-        inputs.append(path)
+    outpath = os.path.join(frames_dir, 'full_collage.jpg')
+    try:
+        from tools.collage import build_keyframe_collage
+        from pathlib import Path
+        build_keyframe_collage(frame_files, outpath, columns=5, tile_width=240, max_frames=0)
+        if project_dir:
+            c_name = f"{os.path.basename(os.path.normpath(project_dir))}_collage.jpg"
+            c_path = Path(project_dir) / c_name
+            build_keyframe_collage(frame_files, c_path, columns=5, tile_width=240, max_frames=0)
+            if manifest is not None and c_path.exists():
+                manifest['collage_url'] = '/' + os.path.relpath(str(c_path), os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+        return outpath if os.path.exists(outpath) else None
+    except Exception:
+        pass
 
     cols = 5
-    rows = math.ceil(len(inputs) / cols)
-    outpath = os.path.join(frames_dir, 'full_collage.jpg')
-    n = len(inputs)
+    rows = math.ceil(len(frame_files) / cols)
+    n = len(frame_files)
+    input_args = []
+    for path in frame_files:
+        input_args.extend(['-i', path])
 
-    filter_parts = [f'[{i}:v]scale=360:-1:force_original_aspect_ratio=decrease,pad=360:ih:(ow-iw)/2:(oh-ih)/2[s{i}]' for i in range(n)]
+    filter_parts = [f'[{i}:v]scale=240:-1:force_original_aspect_ratio=decrease,pad=240:ih:(ow-iw)/2:(oh-ih)/2[s{i}]' for i in range(n)]
     filter_str = ';'.join(filter_parts) + ';'
     filter_str += ''.join(f'[s{i}]' for i in range(n))
     filter_str += f'concat=n={n}:v=1:a=0,tile={cols}x{rows}'
@@ -615,7 +734,8 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 existing_manifest = json.load(f)
                 if isinstance(existing_manifest, dict) and 'frames' in existing_manifest:
-                    manifest['frames'] = existing_manifest['frames']
+                    if isinstance(existing_manifest['frames'], list):
+                        manifest['frames'] = [f for f in existing_manifest['frames'] if isinstance(f, dict)]
                     manifest['created_at'] = existing_manifest.get('created_at', manifest['created_at'])
                     for _k, _v in existing_manifest.items():
                         if _k not in manifest or manifest[_k] is None:
@@ -623,7 +743,16 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
         except Exception:
             pass
 
-    manifest_frames_by_seq = {f['sequence']: f for f in manifest.get('frames', [])}
+    # 上一趟停链留下的印记不能顺着上面那圈"未知键原样继承"带进这一趟：带进来的话，
+    # 这一趟哪怕从断点顺利渲到底，返回的 manifest 里仍挂着 halted_at_beat，前端会
+    # 一直把这单报成「已暂停」。这一趟停没停，只由这一趟自己写。
+    manifest.pop('halted_at_beat', None)
+
+    manifest_frames_by_seq = {
+        int(f.get('sequence') or f.get('slot')): f
+        for f in manifest.get('frames', [])
+        if isinstance(f, dict) and (f.get('sequence') or f.get('slot'))
+    }
     total_to_generate = len(target_sequences) if target_sequences is not None else len(prompts)
     project_url = manifest.get('project_url') or manifest.get('google_fx_project_url')
     backend = (config.get('imageBackend') or 'api').strip().lower()
@@ -658,6 +787,9 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
         on_progress('start', {'total': total_to_generate, 'mode': 'candidate_selection', 'candidate_count': candidate_count})
 
     previous_path = None
+    # autofix 就地改写过的提示词正文：改过就要还给调用方（manifest['prompt_block'] →
+    # syncFrameRunToLibrary 会写回创意），否则下次重渲又会拿着旧提示词跑一遍。
+    autofixed_prompt_block = None
     workspace_root = os.path.dirname(os.path.abspath(__file__))
 
     for item in prompts:
@@ -795,7 +927,7 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                 'sequence': seq,
                 'candidate_urls': cand_rel_urls,
                 'candidate_count': len(candidate_paths),
-                'message': f"IMG {seq:03d} 4张候选图生成完毕，准备 AI 鉴别...",
+                'message': f"IMG {seq:03d} {len(candidate_paths)}张候选图生成完毕，准备 AI 鉴别...",
             })
 
         # ── Step 2: AI Multi-modal Evaluation & Selection (with Sandwich Bidirectional Check if succ frame exists) ──
@@ -929,6 +1061,111 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                 'frame': frame_data,
             })
 
+        # 链上逐拍守卫审查
+        guard_mode = chain_guard_mode(config)
+        if seq >= 2 and guard_mode != 'off':
+            beat = seq - 1
+            prev_seq = seq - 1
+            prev_file = os.path.join(frames_dir, f'img_{prev_seq:03d}.webp')
+            if os.path.exists(prev_file):
+                try:
+                    from chain_guard import guard_beat
+
+                    def _resync_from_disk():
+                        """守卫与自动修复都是隔着磁盘改 manifest 的，改完必须把这一份
+                        内存副本追上去——否则本函数收尾那次整份写盘会把它们全盖掉。"""
+                        updated_manifest = read_manifest(project_dir)
+                        if updated_manifest and 'frames' in updated_manifest:
+                            manifest['frames'] = updated_manifest['frames']
+                            for f_entry in manifest['frames']:
+                                if f_entry.get('sequence') == seq:
+                                    manifest_frames_by_seq[seq] = f_entry
+                                    break
+
+                    # 定向重渲（单帧重试 / fix_frame_issue 的连带重渲）只审不停也不自动修：
+                    # 那一趟的下游帧本来就要被重新盖掉，中途停链会留下一条修了一半的链
+                    # （上游新图 + 下游旧血统），正是 cascade_downstream 要消灭的
+                    # stale_lineage；而自动修复本身就是靠调 fix_frame_issue 实现的，
+                    # 在它内部再触发一次就是无限递归。停与修都只在向前建链时才成立。
+                    forward_build = (target_sequences is None)
+                    guard_res = guard_beat(
+                        config, title, prompt_block, beat, project_dir,
+                        on_progress=on_progress,
+                        allow_halt=forward_build,
+                    )
+                    _resync_from_disk()
+
+                    # autofix：就地走一遍「修复此帧问题」，复审过了就接着往下渲。
+                    if guard_res.get('halt') and guard_mode == 'autofix' and forward_build:
+                        from pipeline_orchestrator import fix_frame_issue
+                        for attempt in range(1, _CHAIN_GUARD_AUTOFIX_ATTEMPTS + 1):
+                            texts = '；'.join(
+                                i.get('text') or '' for i in (guard_res.get('issues') or [])
+                                if i.get('severity') == 'chain') or '结构级链式问题'
+                            if on_progress:
+                                on_progress('chain_guard_autofix', {
+                                    'beat': beat, 'sequence': seq,
+                                    'attempt': attempt, 'max_attempts': _CHAIN_GUARD_AUTOFIX_ATTEMPTS,
+                                    'issues': guard_res.get('issues', []),
+                                    'message': f"🔧 第 {beat} 拍检出结构级问题，正在就地自动修复 "
+                                               f"IMG {seq:03d}（第 {attempt}/{_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次）：{texts}",
+                                })
+                            # 下游此刻还不存在，没有血统要清 → 不必连带重渲
+                            try:
+                                fix_res = fix_frame_issue(
+                                    config, title, prompt_block, seq,
+                                    on_progress=on_progress, cascade_downstream=False,
+                                )
+                            except GenerationCancelled:
+                                raise
+                            except Exception as fix_err:
+                                # 修复本身没跑成（网关异常/没有可修的记录）≠ 这帧没问题。
+                                # 此刻 guard_res 仍是 halt，跳出去让下面的停链分支接管——
+                                # 绝不能吞掉异常继续往下渲，那等于拿一张已知有结构问题的
+                                # 图当所有下游帧的 i2i 基底。
+                                log('WARN', 'CHAIN_GUARD',
+                                    f"IMG {seq:03d} 自动修复第 {attempt} 次未跑成，转为停链: {fix_err}")
+                                break
+                            new_block = (fix_res or {}).get('prompt_block')
+                            if new_block:
+                                # 这一拍的 IMAGE/VIDEO 正文被改写过了。后续帧的提示词
+                                # 没变（prompts 不用重解析），但之后每一拍的守卫都要
+                                # 拿着改写后的全文当上下文，否则它对着旧文本判新画面。
+                                prompt_block = new_block
+                                autofixed_prompt_block = new_block
+                            _resync_from_disk()
+
+                            guard_res = guard_beat(
+                                config, title, prompt_block, beat, project_dir,
+                                on_progress=on_progress, allow_halt=True,
+                            )
+                            _resync_from_disk()
+                            if not guard_res.get('halt'):
+                                if on_progress:
+                                    on_progress('chain_guard_autofix_done', {
+                                        'beat': beat, 'sequence': seq, 'attempt': attempt,
+                                        'message': f"✅ IMG {seq:03d} 自动修复后复审通过（第 {attempt} 次），继续往下生成",
+                                    })
+                                break
+
+                    # halt 档一检出就停；autofix 档修满次数仍不过才停——继续往下渲
+                    # 等于让一张已知有结构问题的图当所有下游帧的 i2i 基底。
+                    if guard_res.get('halt') and guard_mode in ('halt', 'autofix'):
+                        manifest['halted_at_beat'] = beat
+                        if on_progress:
+                            tail = ('' if guard_mode == 'halt'
+                                    else f"（已自动修复 {_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次仍未通过）")
+                            on_progress('chain_guard_halt', {
+                                'beat': beat,
+                                'sequence': seq,
+                                'issues': guard_res.get('issues', []),
+                                'autofix_exhausted': guard_mode == 'autofix',
+                                'message': f"第 {beat} 拍（IMG {prev_seq:03d}→{seq:03d}）检出结构级链式问题{tail}，生成已自动暂停，请检查并修复此帧问题。",
+                            })
+                        break
+                except Exception as guard_err:
+                    log('WARN', 'CHAIN_GUARD', f"拍 {beat} 链上守卫执行异常: {guard_err}")
+
     # Finalize stale status & capability stamping
     try:
         update_manifest_stale_status(
@@ -939,14 +1176,19 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
     except Exception as stale_err:
         log('WARN', 'CANDIDATE_GEN', f"最终收尾 manifest stale 状态异常: {stale_err}")
 
+    # Generate full collage and update manifest collage_url
+    _generate_full_collage_from_frames(frames_dir, project_dir=project_dir, manifest=manifest)
+
     with open(manifest_path, 'w', encoding='utf-8') as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
 
-    # Generate full collage
-    _generate_full_collage_from_frames(frames_dir)
-
     manifest['project_dir'] = project_dir
     manifest['manifest'] = manifest_path
+    # 只放进返回值、**不落盘**（写盘在上面已经做完了）：manifest 的未知键会被下一趟
+    # 原样继承（见本函数开头读盘合并那段），落盘的话 syncFrameRunToLibrary 之后每趟
+    # 都会拿这份陈旧正文回写创意，跟 halted_at_beat 是同一个坑。
+    if autofixed_prompt_block:
+        manifest['prompt_block'] = autofixed_prompt_block
     return manifest
 
 
@@ -1030,9 +1272,8 @@ def switch_frame_candidate(title, seq, new_candidate_index):
         except Exception as stale_err:
             log('WARN', 'CANDIDATE_GEN', f"更新 manifest stale 状态异常: {stale_err}")
 
+        # Regenerate collage and update manifest
+        _generate_full_collage_from_frames(frames_dir, project_dir=project_dir, manifest=manifest)
         with open(manifest_path, 'w', encoding='utf-8') as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
-
-    # Regenerate collage
-    _generate_full_collage_from_frames(frames_dir)
     return manifest

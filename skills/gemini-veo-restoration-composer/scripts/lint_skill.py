@@ -56,6 +56,33 @@ BANNED_ACRONYMS = ("HAL", "TSPA", "VMFP", "GCTR", "RPL", "RCE", "SCUP", "NGCS",
 GRID_RE = re.compile(r"\bGrid\s+[A-Ca-c]\s*[1-3]\b")
 PERCENT_NUM_RE = re.compile(r"\b\d+\s*(?:-\s*)?(?:percent|%)")
 NUMERIC_RANGE_RE = re.compile(r"\b\d+\s*%?\s*(?:to|-)\s*\d+\s*%?\s*(?:cm|m|kg|s|h|l|ml)?\b")
+# 多镜头包（omni / miniature）的切点表句是唯一允许带阿拉伯数字的结构件，服务端的
+# NLVTR 门禁按 prompt_pipeline.strip_timecode_sentence 放行同一句。这里必须用同一条
+# 口径先剥掉它，否则 "from 0.0 to 2.6" 会被逐条报成禁用数值区间——每条多镜头范例
+# 各报一次，真正的记号违规全被淹掉。
+TIMECODE_SENTENCE_RE = re.compile(r"\bCut this\b[^\n]*?\bseconds\.", re.IGNORECASE)
+
+
+def strip_timecode(text):
+    """剥掉切点表句后的正文；记号类判定都要先过这一道。"""
+    return TIMECODE_SENTENCE_RE.sub(" ", text or "")
+
+
+# 多镜头包（omni / miniature）的 VIDEO 正文要装下三到四个镜头，字数上限跟着镜头数走：
+# prompt_pipeline.composers.omni.video_word_targets 的硬顶是 55×镜头数+235（三镜 400、
+# 四镜 455）。拿单镜档的 380 去量它，等于按一条一镜到底的片子去卡一条剪辑过的片子——
+# 合规范例会被逐条报成超标，而真正超标的那条淹在里面。镜头数从范例自己的切点表里数：
+# 那句话本来就按顺序列出了每一镜，是这条正文自证的镜头数。
+_SHOT_SEGMENT_RE = re.compile(r"\bfrom\s+\d+(?:\.\d+)?\s+to\s+\d+(?:\.\d+)?", re.IGNORECASE)
+
+
+def video_word_limit(body):
+    """这条 VIDEO 正文该用哪个字数硬顶：带切点表的按镜头数算，否则用单镜档。"""
+    timeline = TIMECODE_SENTENCE_RE.search(body or "")
+    if not timeline:
+        return VIDEO_WORD_LIMIT
+    shots = len(_SHOT_SEGMENT_RE.findall(timeline.group(0)))
+    return 55 * shots + 235 if shots else VIDEO_WORD_LIMIT
 # MULTILINE matters: this pattern is used both line-by-line and with finditer over whole
 # files. Without it the anchors bind to the whole string and every finditer scan returns
 # nothing — which reads as "no bridge tag anywhere" rather than "the check never ran".
@@ -143,7 +170,7 @@ def check_prompt_slots(root, fnd):
             if is_img:
                 limit = INTERIOR_IMAGE_WORD_LIMIT if interior else IMAGE_WORD_LIMIT
             else:
-                limit = VIDEO_WORD_LIMIT
+                limit = video_word_limit(body)
             words = len(body.split())
             if words > limit:
                 fnd.error("word-budget", r,
@@ -154,16 +181,17 @@ def check_prompt_slots(root, fnd):
                 fnd.error("grid-leak", r,
                           f"{slot} carries grid notation {hits} in the delivered body; "
                           f"image models render these as literal letters", i)
+            probe = strip_timecode(body)
             if "%" in body:
                 fnd.error("notation-percent", r, f"{slot} contains a '%' symbol", i)
-            elif PERCENT_NUM_RE.search(body):
+            elif PERCENT_NUM_RE.search(probe):
                 fnd.error("notation-percent", r,
                           f"{slot} contains a numeric percentage "
-                          f"({PERCENT_NUM_RE.search(body).group(0)!r}); write it as a fraction", i)
-            if NUMERIC_RANGE_RE.search(body):
+                          f"({PERCENT_NUM_RE.search(probe).group(0)!r}); write it as a fraction", i)
+            if NUMERIC_RANGE_RE.search(probe):
                 fnd.error("notation-range", r,
                           f"{slot} contains a numeric range "
-                          f"({NUMERIC_RANGE_RE.search(body).group(0)!r})", i)
+                          f"({NUMERIC_RANGE_RE.search(probe).group(0)!r})", i)
             for ac in BANNED_ACRONYMS:
                 if re.search(rf"\b{ac}\b", body):
                     fnd.error("notation-acronym", r,
@@ -209,7 +237,7 @@ def check_reference_templates(root, fnd):
         label_line, label = cur
         cur = None
         slot = f"{section} exemplar ({label})"
-        limit = IMAGE_WORD_LIMIT if section == "IMAGE" else VIDEO_WORD_LIMIT
+        limit = IMAGE_WORD_LIMIT if section == "IMAGE" else video_word_limit(stripped)
         words = len(stripped.split())
         if words > limit:
             fnd.error("word-budget", r,
@@ -220,16 +248,17 @@ def check_reference_templates(root, fnd):
             fnd.error("grid-leak", r,
                       f"{slot} carries grid notation {hits} in the delivered body; "
                       f"image models render these as literal letters", i)
+        probe = strip_timecode(line)
         if "%" in line:
             fnd.error("notation-percent", r, f"{slot} contains a '%' symbol", i)
-        elif PERCENT_NUM_RE.search(line):
+        elif PERCENT_NUM_RE.search(probe):
             fnd.error("notation-percent", r,
                       f"{slot} contains a numeric percentage "
-                      f"({PERCENT_NUM_RE.search(line).group(0)!r}); write it as a fraction", i)
-        if NUMERIC_RANGE_RE.search(line):
+                      f"({PERCENT_NUM_RE.search(probe).group(0)!r}); write it as a fraction", i)
+        if NUMERIC_RANGE_RE.search(probe):
             fnd.error("notation-range", r,
                       f"{slot} contains a numeric range "
-                      f"({NUMERIC_RANGE_RE.search(line).group(0)!r})", i)
+                      f"({NUMERIC_RANGE_RE.search(probe).group(0)!r})", i)
         for ac in BANNED_ACRONYMS:
             if re.search(rf"\b{ac}\b", line):
                 fnd.error("notation-acronym", r,

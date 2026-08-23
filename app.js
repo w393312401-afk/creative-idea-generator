@@ -1254,6 +1254,8 @@ function setupEventListeners() {
     const deletedSlotsBtn = document.getElementById('deleted-slots-btn');
     if (deletedSlotsBtn) deletedSlotsBtn.addEventListener('click', () => openDeletedSlotsPanel());
     document.getElementById('generate-videos-btn').addEventListener('click', () => generateVideos());
+    const genVideoChainBtn = document.getElementById('generate-video-chain-btn');
+    if (genVideoChainBtn) genVideoChainBtn.addEventListener('click', () => generateVideoChain());
     document.getElementById('merge-videos-btn').addEventListener('click', () => mergeVideos());
     const copyHookBtn = document.getElementById('copy-hook-btn');
     if (copyHookBtn) {
@@ -2190,9 +2192,18 @@ function framesFeedHydrate(ideaId) {
     if (dot) dot.classList.toggle('active', !!rec.live);
 }
 
-// 渲染期不做任何视觉判定（2026-08-05 起生成期一致性审查已整体移除），所以新渲的帧
-// 一律是 'pending_manual_review'。其余取值只会出现在旧 manifest 或手动一致性审查/
-// 人工标记的结果里。isIsolatedRetry 保留在签名上供调用方传参，两条路径现在文案一致。
+// gate 的来源现在有三条：4选1 候选优选线落 'auto_approved'；生成期链上守卫
+// （chain_guard）检出结构级问题落 'sequence_review_flagged'；手动一致性审查与人工
+// 标记落其余取值。
+//
+// 'pending_manual_review' 有**两个语义完全相反**的来源，必须分开说：
+//   (a) 这帧从没被审过（旧 manifest / 非候选线渲的帧）；
+//   (b) 这帧被审查抓到过、人点了「修复此帧问题」、重渲后复核确认问题已解决，
+//       gate 按设计回落等人最终确认（见 pipeline_orchestrator._reverify_frame_issues）。
+// 只按 (a) 的话术渲染，会把"刚修好的帧"说成"没人看过"，意思正好反了。
+// fix_backup 是 (b) 的可靠标记（_mark_fix_backup 写入，撤销修复时摘掉）。
+//
+// isIsolatedRetry 保留在签名上供调用方传参，两条路径现在文案一致。
 function framesFeedQualityLine(ideaId, f, isIsolatedRetry) {
     if (!f) return;
     const seq = String(f.sequence || 0).padStart(3, '0');
@@ -2214,7 +2225,13 @@ function framesFeedQualityLine(ideaId, f, isIsolatedRetry) {
     } else if (gate === 'sequence_reviewed_pass') {
         framesFeedLine(ideaId, `✅ IMG ${seq} 完成（一致性审查通过）`, 'ok');
     } else if (gate === 'pending_manual_review') {
-        framesFeedLine(ideaId, `✅ IMG ${seq} 完成（渲染不做审查，如需复核请在帧网格点「一致性审查」）`, 'ok');
+        const fixed = f.fix_backup && typeof f.fix_backup === 'object' ? f.fix_backup : null;
+        if (fixed) {
+            const was = typeof fixed.reason === 'string' && fixed.reason ? fixed.reason : '';
+            framesFeedLine(ideaId, `🔧 IMG ${seq} 已修复并复核通过，等你最终确认${was ? `（原问题：${was}）` : ''}`, 'ok');
+        } else {
+            framesFeedLine(ideaId, `✅ IMG ${seq} 完成（渲染不做审查，如需复核请在帧网格点「一致性审查」）`, 'ok');
+        }
     } else {
         framesFeedLine(ideaId, `✅ IMG ${seq} 完成`, 'ok');
     }
@@ -2361,6 +2378,32 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                     if (data && data.message) {
                         framesFeedLine(ownerId, `🔀 ${data.message}`, data.degraded ? 'warn' : undefined);
                     }
+                } else if (type === 'chain_guard_autofix') {
+                    // autofix 档：守卫检出结构级问题后就地重写提示词 + 重渲这一帧。
+                    // 后面紧跟着的 frame_issue_fix_* / candidate_* 事件都是这次修复产生的。
+                    const a = (data && data.attempt) || 1;
+                    const mx = (data && data.max_attempts) || 1;
+                    setMeta(`第 ${(data && data.beat) || 0} 拍检出结构级问题，正在自动修复（第 ${a}/${mx} 次）...`);
+                    framesFeedLine(ownerId, `${(data && data.message) || '🔧 正在自动修复本帧'}`, 'warn');
+                } else if (type === 'chain_guard_autofix_done') {
+                    framesFeedLine(ownerId, `${(data && data.message) || '✅ 自动修复后复审通过，继续生成'}`, 'ok');
+                } else if (type === 'chain_guard_halt') {
+                    // 链上守卫在生成途中检出结构级问题并主动停链（chainGuardMode=halt）。
+                    // 后端是 break 出循环、任务正常收尾，所以这里不报错——但必须说清楚
+                    // 「这单是停下的，不是渲完的」，否则下面的收尾会照常报"全部完成"。
+                    const beat = (data && data.beat) || 0;
+                    const seq = (data && data.sequence) || (beat + 1);
+                    const issues = (data && data.issues) || [];
+                    const detail = issues.map(i => i && i.text).filter(Boolean).join('；');
+                    setMeta(`第 ${beat} 拍检出结构级问题，生成已暂停在 IMG ${String(seq).padStart(3, '0')}`);
+                    framesFeedLine(ownerId, `🛑 ${(data && data.message) || `第 ${beat} 拍检出结构级链式问题，生成已自动暂停`}`, 'err');
+                    if (detail) {
+                        framesFeedLine(ownerId, `　问题：${detail}`, 'warn');
+                    }
+                    if (data && data.autofix_exhausted) {
+                        framesFeedLine(ownerId, '　自动修复已连试数次仍未通过——这一拍多半不是改写提示词能解决的（提示词与上游画面本身矛盾），需要人工看一眼', 'warn');
+                    }
+                    framesFeedLine(ownerId, '　修复这一帧后再点「生成帧序列」即可从断点续渲（已渲好的帧会跳过）', 'warn');
                 } else if (type === 'sequence_review') {
                     setMeta((data && data.message) || '正在对整套序列做一致性审查...');
                     framesFeedLine(ownerId, `🔍 ${(data && data.message) || '正在对整套序列做一致性审查...'}`);
@@ -2402,6 +2445,16 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
         if (watch.result) {
             await syncFrameRunToLibrary(watch.result, ownerIdea);
             if (isViewing()) renderFramesForIdea(ownerIdea);
+            // 链上守卫停链的单子不是渲完的单子：后端 break 出循环后照常收尾返回，
+            // 这里若沿用"全部完成"的话术，用户会拿着一条断在半路的链去生成视频。
+            const haltedBeat = watch.result.halted_at_beat;
+            if (haltedBeat) {
+                const doneCount = (watch.result.frames || []).filter(f => f && f.file).length;
+                framesFeedLine(ownerId, `🛑 帧序列已暂停：第 ${haltedBeat} 拍检出结构级问题，已渲 ${doneCount} 帧`, 'err');
+                setMeta(`帧序列已暂停在第 ${haltedBeat} 拍（已渲 ${doneCount} 帧）`);
+                showToast(`${titleTag()}帧序列在第 ${haltedBeat} 拍检出结构级问题已暂停，请修复该帧后续渲。`, 'warning');
+                return;
+            }
             framesFeedLine(ownerId, `🏁 帧序列全部完成，共 ${(watch.result.frames || []).length} 帧`, 'ok');
             const frameRisks = summarizeRunQuality(watch.result);
             if (frameRisks) {
@@ -2553,6 +2606,21 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
                     if (isViewing() && typeof renderVideoSlotSkippedCut === 'function') {
                         renderVideoSlotSkippedCut(data.index, data && data.message);
                     }
+                } else if (type === 'video_optimization_start') {
+                    applyVideoProgress('video_optimization_start', data);
+                    setMeta((data && data.message) || '正在执行视频提示词视觉优化门...');
+                } else if (type === 'video_optimization_slot') {
+                    applyVideoProgress('video_optimization_slot', data);
+                    setMeta((data && data.message) || `正在依据画面差量优化视频 ${data && data.slot} 提示词...`);
+                } else if (type === 'prompt_block_updated') {
+                    if (data && data.prompt_block) {
+                        ownerIdea.prompt_block = data.prompt_block;
+                        if (typeof applyPromptBlockToIdea === 'function') {
+                            applyPromptBlockToIdea(ownerIdea, data.prompt_block, data.prompt_slots, false);
+                        } else {
+                            if (isViewing()) renderPromptDisplay(ownerIdea.prompt_block);
+                        }
+                    }
                 } else if (type === 'queue') {
                     applyVideoProgress('queue', data);
                     setMeta((data && data.message) || '正在排队等待生成视频...');
@@ -2598,6 +2666,14 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
         }
 
         if (watch.result) {
+            if (watch.result.prompt_block) {
+                ownerIdea.prompt_block = watch.result.prompt_block;
+                if (typeof applyPromptBlockToIdea === 'function') {
+                    await applyPromptBlockToIdea(ownerIdea, watch.result.prompt_block, watch.result.prompt_slots, false);
+                } else {
+                    if (isViewing()) renderPromptDisplay(ownerIdea.prompt_block);
+                }
+            }
             await syncFrameRunToLibrary(watch.result, ownerIdea);
             if (isViewing()) renderVideosForIdea(ownerIdea);
             const videoRisks = summarizeRunQuality(watch.result);
@@ -3865,6 +3941,75 @@ async function generateVideos() {
 
             progress.style.display = 'none';
             btn.disabled = false;
+        }
+    }
+}
+
+async function generateVideoChain() {
+    if (!currentIdea || !currentIdea.prompt_block) {
+        showToast("请先激发或输入包含视频提示词的创意！", "error");
+        return;
+    }
+
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'videos') || isIdeaTaskActive(ownerIdea.id, 'video_chain')) {
+        showToast("该创意的视频生成已在进行中，请稍候", "error");
+        return;
+    }
+
+    const btn = document.getElementById('generate-video-chain-btn');
+    const videosBtn = document.getElementById('generate-videos-btn');
+    const progress = document.getElementById('videos-progress');
+    const meta = document.getElementById('videos-meta');
+    const grid = slotRenderTarget('video');
+    if (btn) btn.disabled = true;
+    if (videosBtn) videosBtn.disabled = true;
+    if (progress) progress.style.display = 'flex';
+    if (meta) meta.textContent = '准备纯视频链式生成 (第1段 T2V，后续自动截取尾帧 I2V)...';
+
+    const targetSlots = typeof computeDebugTargets === 'function' ? computeDebugTargets('videos', ownerIdea, 'video') : null;
+
+    try {
+        const body = {
+            config,
+            title: getIdeaSaveTitle(ownerIdea),
+            display_title: ownerIdea.title,
+            prompt_block: ownerIdea.prompt_block,
+            merge_speed: typeof getMergeSpeed === 'function' ? getMergeSpeed() : 2
+        };
+        if (targetSlots) body.target_slots = targetSlots;
+
+        const response = await fetch('/api/generate_video_chain', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errText}`);
+        }
+
+        const data = await response.json();
+        const taskId = data.task_id;
+
+        streamVideosProgress(taskId, ownerIdea, targetSlots);
+        showToast("已启动纯视频链式生成通道！", "success");
+    } catch (e) {
+        console.error("Failed to generate video chain:", e);
+        showToast(`纯视频链生成失败: ${e.message}`, "error");
+
+        if (isViewingIdea(ownerIdea.id)) {
+            if (meta) meta.textContent = `纯视频链生成失败: ${e.message}`;
+            if (grid) {
+                grid.querySelectorAll('.placeholder-frame-card').forEach(card => {
+                    const slotMatch = card.id && card.id.match(/video-slot-(\d+)/);
+                    if (slotMatch) renderVideoSlotFailed(parseInt(slotMatch[1], 10), e.message);
+                });
+            }
+            if (progress) progress.style.display = 'none';
+            if (btn) btn.disabled = false;
+            if (videosBtn) videosBtn.disabled = false;
         }
     }
 }

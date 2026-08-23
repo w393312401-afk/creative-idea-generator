@@ -31,7 +31,7 @@ from server_common import (
     gate_setting,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
     _get_account_pool_service, _select_pool_account,
-    _account_switch_interval, _account_rotation_ring,
+    _account_switch_interval, _account_rotation_ring, revalidate_leg_account,
 )
 from frame_continuity import (
     analyze_frame, changed_grid_cells, continuity_max_retries, continuity_mode,
@@ -1440,6 +1440,37 @@ def _fx_find_ref_for(frames_dir, seq):
     return None
 
 
+def _fx_heal_frame_uuid(frames_dir, seq, uuid_str):
+    """把第 seq 帧的 fx_src 留档改名成带 UUID 的形式，返回是否真的改了。
+
+    用在「参考图只能靠上传挂载」之后：上传完成的那一刻，这张图**已经在画布上**并
+    拿到了自己的 UUID，只是本地留档还叫 img_NNN_nouuid.jpg。不改名的话
+    _fx_find_ref_for 下次仍然认不出它，同一张图会被反复上传——每渲一次下一帧、
+    每点一次「修复此帧问题」都白传一遍。
+
+    UUID 丢失的源头在上游（中选候选的媒体 URL 里没有 UUID 可解析，见
+    _fx_store_frame 的 "nouuid" 兜底）；这里管不到源头，但能保证代价只付一次。
+    """
+    if not uuid_str or not _FX_UUID_RE.fullmatch(str(uuid_str)):
+        return False
+    src_dir = _fx_src_dir(frames_dir)
+    prefix = f'img_{seq:03d}_'
+    target = os.path.join(src_dir, f'{prefix}{uuid_str}.jpg')
+    if os.path.exists(target):
+        return False
+    for name in sorted(os.listdir(src_dir)):
+        if not (name.startswith(prefix) and name.lower().endswith('.jpg')):
+            continue
+        if _fx_extract_uuid(name):
+            return False          # 已经有正经 UUID 留档，不动它
+        try:
+            os.replace(os.path.join(src_dir, name), target)
+            return True
+        except OSError:
+            return False
+    return False
+
+
 def _fx_cover_ref_jpg(cover_path, frames_dir):
     """Convert the selected cover to the JPEG reference format required by Flow."""
     target = os.path.join(_fx_src_dir(frames_dir), 'cover_ref.jpg')
@@ -1863,7 +1894,8 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 existing_manifest = json.load(f)
             if isinstance(existing_manifest, dict) and 'frames' in existing_manifest:
-                manifest['frames'] = existing_manifest['frames']
+                if isinstance(existing_manifest['frames'], list):
+                    manifest['frames'] = [f for f in existing_manifest['frames'] if isinstance(f, dict)]
                 manifest['created_at'] = existing_manifest.get('created_at', manifest['created_at'])
                 # 未知键保留：spatial_contract / 手动审查留痕等由别的写入方落进 manifest
                 # 的键，重建 manifest 时丢掉它们会让本轮的逐帧落盘把它们抹掉
@@ -1880,7 +1912,11 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
         canvas_session['project_url'] = manifest['google_fx_project_url']
         canvas_session['project_account_id'] = manifest.get('google_fx_project_account_id')
 
-    manifest_frames_by_seq = {f['sequence']: f for f in manifest['frames']}
+    manifest_frames_by_seq = {
+        int(f.get('sequence') or f.get('slot')): f
+        for f in manifest.get('frames', [])
+        if isinstance(f, dict) and (f.get('sequence') or f.get('slot'))
+    }
     # Per-frame ownership is the authoritative map for later iteration.  Fold
     # it back into the session as well so manifests written before
     # google_fx_projects existed can still reopen the exact original canvas.
@@ -2023,12 +2059,14 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                 # Iteration must run as the account that owns the target frame;
                 # Flow project URLs are account-scoped and cannot be reopened by
                 # whichever pool account happens to have the highest balance.
-                leg_by_chunk_start[_chunk[0]] = {'user_id': _owner_account}
+                leg_by_chunk_start[_chunk[0]] = {'user_id': _owner_account, 'pinned': True}
             if _owner_account and _owner_project:
                 canvas_session.setdefault('projects_by_account', {})[
                     _owner_account
                 ] = _owner_project
     current_account_id = pool_account_id
+    # 复核换号时用来排除"这条序列已经用过的号"，口径与视频序列的 used_account_ids 一致
+    used_account_ids = [pool_account_id] if pool_account_id else []
     done_seqs = set()
 
     for seq in all_seqs:
@@ -2122,8 +2160,25 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
 
         chunk_prompts = [prompts_by_seq[s]['prompt'] for s in chunk]
         leg = leg_by_chunk_start.get(chunk[0])
+        # 切腿前复核积分：ring 按缓存值一次排定，前面几批烧掉的积分没人记账。
+        # pinned 的腿不动——那是画布归属账号，换号就打不开那块画布。
+        if leg and leg.get('user_id') and not leg.get('pinned') \
+                and leg['user_id'] != current_account_id and pool_account_id:
+            verified = revalidate_leg_account(
+                config, account_pool, leg['user_id'], ring, used_account_ids)
+            if verified and verified != leg['user_id']:
+                if on_progress:
+                    on_progress('account_switch', {
+                        'user_id': verified,
+                        'message': (f"复核积分：原定账号 {leg['user_id']} 已不够用，"
+                                    f"帧 {chunk[0]}~{chunk[-1]} 改用 {verified}"),
+                    })
+                leg = dict(leg, user_id=verified)
+                leg_by_chunk_start[chunk[0]] = leg
         if leg and leg.get('user_id') and leg['user_id'] != current_account_id:
             current_account_id = leg['user_id']
+            if current_account_id not in used_account_ids:
+                used_account_ids.append(current_account_id)
             if on_progress:
                 on_progress('account_switch', {
                     'user_id': leg['user_id'],
@@ -2445,7 +2500,8 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 existing_manifest = json.load(f)
                 if isinstance(existing_manifest, dict) and 'frames' in existing_manifest:
-                    manifest['frames'] = existing_manifest['frames']
+                    if isinstance(existing_manifest['frames'], list):
+                        manifest['frames'] = [f for f in existing_manifest['frames'] if isinstance(f, dict)]
                     manifest['created_at'] = existing_manifest.get('created_at', manifest['created_at'])
                     # 未知键保留（与 FX 路径同款）：别的写入方落进 manifest 的键
                     # 不能被逐帧落盘的重建 manifest 抹掉
@@ -2459,7 +2515,11 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         total_to_generate = len(target_sequences) if target_sequences is not None else len(prompts)
         on_progress('start', {'total': total_to_generate})
 
-    manifest_frames_by_seq = {f['sequence']: f for f in manifest['frames']}
+    manifest_frames_by_seq = {
+        int(f.get('sequence') or f.get('slot')): f
+        for f in manifest.get('frames', [])
+        if isinstance(f, dict) and (f.get('sequence') or f.get('slot'))
+    }
 
     previous_path = None
     generated_count = 0

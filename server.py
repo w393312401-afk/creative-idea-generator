@@ -41,7 +41,10 @@ from server_common import (
 
 # 日志历史回放最多从文件末尾回读这么多字节（够装远超 100 行了）
 _LOG_TAIL_BYTES = 256 * 1024
-from prompt_pipeline import _parse_prompt_slots, _format_prompt_block, _chat, _aux_model
+from prompt_pipeline import (
+    _parse_prompt_slots, _format_prompt_block, _chat, _aux_model,
+    prompt_slots_list, optimize_video_prompts_for_sequence,
+)
 from frame_generator import (
     _image_generation_model_for_request,
     _image_quality_to_label,
@@ -839,9 +842,15 @@ def _google_fx_status_snapshot():
     now = datetime.now().astimezone()
     enabled = disabled = cooling = low_credit = ready = unprobed = login_required = 0
     stale_credit = probe_failed = 0
+    # 「积分不够」的口径统一到用户配的「选号最低积分」，不再各处自己跟 0 比：
+    # 余额低于阈值的号后端本来就已经自动停用了，统计里却不算进 low_credit，
+    # 面板上就会出现"一堆号被停用，但积分不足数是 0"这种对不上的读数。
+    min_credit = accounts[0].get('min_credit', 15) if accounts else 15
     for account in accounts:
         if account.get('disabled'):
             disabled += 1
+            if account.get('disabled_reason') == 'zero_credit' or (isinstance(account.get('credit'), (int, float)) and account.get('credit') < min_credit):
+                low_credit += 1
             continue
         enabled += 1
         is_cooling = False
@@ -862,7 +871,7 @@ def _google_fx_status_snapshot():
             unprobed += 1
         elif account.get('credit_stale'):
             stale_credit += 1
-        elif isinstance(credit, (int, float)) and credit <= 0:
+        elif isinstance(credit, (int, float)) and credit < min_credit:
             low_credit += 1
         elif account.get('credit_trustworthy', account.get('last_probe_status') != 'failed') and not is_cooling:
             ready += 1
@@ -1328,18 +1337,20 @@ def generate_frames_selection_worker(task_id, config, title, prompt_block, targe
         set_project_key_context(None)
 
 
-def fix_frame_issue_worker(task_id, config, title, prompt_block, sequence, manual_reason=None):
+def fix_frame_issue_worker(task_id, config, title, prompt_block, sequence, manual_reason=None, cascade_downstream=False):
     """人工在帧网格点击「修复此帧问题」后台工作线程：读取该帧记录的问题原因、
     优化提示词后图生图重渲（pipeline_orchestrator.fix_frame_issue）。与
     generate_frames_worker 共用同一个项目级互斥（claim_frame_run）——两者都会
     整体改写同一份 manifest.json，不能并发跑。
 
     manual_reason 是人工在修复对话框里现场写下的问题描述（可为空——此时只修
-    manifest 上已记录的问题），会先落盘再参与改写，见 fix_frame_issue。"""
+    manifest 上已记录的问题），会先落盘再参与改写，见 fix_frame_issue。
+
+    cascade_downstream=True 时，修完当前帧后顺带链式重渲后续下游帧，消除血统过期断层。"""
     t = get_or_create_task(task_id)
     set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
     set_log_context(task_id)
-    log('INFO', 'FRAMES', f"开始修复第 {sequence} 帧问题", title=title)
+    log('INFO', 'FRAMES', f"开始修复第 {sequence} 帧问题" + (" (并向后连带重渲)" if cascade_downstream else ""), title=title)
     try:
         from prompt_pipeline import start_accounting, stop_and_get_accounting
         start_accounting()
@@ -1360,7 +1371,8 @@ def fix_frame_issue_worker(task_id, config, title, prompt_block, sequence, manua
             from pipeline_orchestrator import fix_frame_issue
             with _fx_serial_lock_for(config, task_id, 'frame_fix', t['cancel_event']):
                 result = fix_frame_issue(config, title, prompt_block, sequence,
-                                         on_progress=progress_cb, manual_reason=manual_reason)
+                                         on_progress=progress_cb, manual_reason=manual_reason,
+                                         cascade_downstream=cascade_downstream)
         finally:
             set_upstream_event_sink(None)
             set_cancel_check_sink(None)
@@ -2064,6 +2076,14 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
 
         progress_cb('queue', {'message': '视频生成请求已加入队列，正在等待排队生成...'})
 
+        # 视频生成前优化门：根据真实渲染的帧序列画面差量优化所有视频提示词，以防跳变
+        try:
+            prompt_block = optimize_video_prompts_for_sequence(
+                config, title, prompt_block, on_progress=progress_cb, target_slots=target_slots, force=False
+            )
+        except Exception as opt_err:
+            log('WARN', 'VIDEOS', f"视频提示词优化门跳过或异常（继续按原提示词生成）: {opt_err}", title=title)
+
         with _fx_browser_slot(task_id, 'videos', t['cancel_event']):
             result = generate_video_sequence(
                 config, title, prompt_block,
@@ -2071,6 +2091,8 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
                 target_slots=target_slots,
                 override_flagged=override_flagged
             )
+            result['prompt_block'] = prompt_block
+            result['prompt_slots'] = prompt_slots_list(prompt_block)
             
             usage = stop_and_get_accounting()
             if usage:
@@ -2163,6 +2185,81 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
             t["events"].append(('error', {'message': str(e)}))
         notify_listeners(task_id, 'error', {'message': str(e)})
         log('ERROR', 'VIDEOS', f"视频任务失败: {e}", title=title)
+    finally:
+        save_task_to_disk(task_id)
+        set_log_context(None)
+        set_project_key_context(None)
+
+
+def generate_video_chain_worker(task_id, config, title, prompt_block, target_slots, override_flagged=False):
+    t = get_or_create_task(task_id)
+    set_project_key_context(config.get('_project_key') if isinstance(config, dict) else None)
+    set_log_context(task_id)
+    log('INFO', 'VIDEOS', f"开始纯视频提示词链式生成任务{f'（子集 {target_slots}）' if target_slots else '（整单）'}", title=title)
+    try:
+        from prompt_pipeline import start_accounting, stop_and_get_accounting
+        start_accounting()
+        def progress_cb(stage, details):
+            if stage == 'cancel_check':
+                return t["cancel_event"].is_set()
+            if t["cancel_event"].is_set():
+                raise GenerationCancelled("Generation cancelled by user")
+            with ACTIVE_TASKS_LOCK:
+                t["events"].append((stage, details))
+            notify_listeners(task_id, stage, details)
+
+        progress_cb('queue', {'message': '纯视频提示词链式生成请求已加入队列，正在等待排队生成...'})
+
+        with _fx_browser_slot(task_id, 'videos', t['cancel_event']):
+            result = generate_video_chain_sequence(
+                config, title, prompt_block,
+                on_progress=progress_cb,
+                target_slots=target_slots,
+                override_flagged=override_flagged
+            )
+            result['prompt_block'] = prompt_block
+            result['prompt_slots'] = prompt_slots_list(prompt_block)
+
+            usage = stop_and_get_accounting()
+            if usage:
+                result['token_usage'] = usage
+
+            manifest_videos = result.get('videos', [])
+            has_failures = any(
+                v.get('status') not in ('success', 'skipped_cut', 'skipped_bridge_hold')
+                for v in manifest_videos if isinstance(v, dict)
+            )
+            completion_state = 'partial_failed' if has_failures else 'completed'
+
+            result['completion_state'] = completion_state
+            result['has_failures'] = has_failures
+
+            with ACTIVE_TASKS_LOCK:
+                t["status"] = "completed"
+                t["outcome"] = completion_state
+                t["result"] = result
+                t["events"].append(('result', result))
+            notify_listeners(task_id, 'result', result)
+            log('INFO', 'VIDEOS', "纯视频提示词链式生成任务完成", title=title)
+    except ConnectionError:
+        finalize = False
+        with ACTIVE_TASKS_LOCK:
+            if t["status"] == "running":
+                t["status"] = "cancelled"
+                t["error"] = "用户取消了视频生成"
+                t["events"].append(('error', {'message': '用户取消了视频生成'}))
+                finalize = True
+        if finalize:
+            notify_listeners(task_id, 'error', {'message': '用户取消了视频生成'})
+        log('WARN', 'VIDEOS', "纯视频链式生成任务已被用户取消", title=title)
+    except Exception as e:
+        log_exception('VIDEOS')
+        with ACTIVE_TASKS_LOCK:
+            t["status"] = "failed"
+            t["error"] = str(e)
+            t["events"].append(('error', {'message': str(e)}))
+        notify_listeners(task_id, 'error', {'message': str(e)})
+        log('ERROR', 'VIDEOS', f"纯视频链式生成任务失败: {e}", title=title)
     finally:
         save_task_to_disk(task_id)
         set_log_context(None)
@@ -4673,8 +4770,8 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     dimensions = ACTIVE_TASKS[task_id].get("dimensions") or {}
                     id_prefix = str(task_id).split('_', 1)[0]
                     is_fx_capable = (
-                        id_prefix in ('frames', 'videos', 'staged', 'auto')
-                        or dimensions.get('type') in ('frames', 'videos', 'staged', 'auto_run')
+                        id_prefix in ('frames', 'videos', 'staged', 'auto', 'vchain')
+                        or dimensions.get('type') in ('frames', 'videos', 'staged', 'auto_run', 'video_chain')
                     )
                     finalized = False
                     with ACTIVE_TASKS_LOCK:
@@ -5076,6 +5173,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     return
                 manual_reason = body.get('manual_reason')
                 manual_reason = manual_reason.strip() if isinstance(manual_reason, str) else None
+                cascade_downstream = bool(body.get('cascade_downstream') or body.get('cascade'))
 
                 import uuid
                 task_id = f"fixframe_{uuid.uuid4().hex}"
@@ -5094,7 +5192,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
                 threading.Thread(
                     target=fix_frame_issue_worker,
-                    args=(task_id, config, title, prompt_block, sequence, manual_reason),
+                    args=(task_id, config, title, prompt_block, sequence, manual_reason, cascade_downstream),
                     daemon=True
                 ).start()
 
@@ -5861,6 +5959,67 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 ).start()
 
                 self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/generate_video_chain':
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                if not rate_ok(_client_ip(self), 'videos'):
+                    self._send_json({'error': '请求过于频繁，请稍后再试'}, status=429)
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                if not _require_fx_admission(self):
+                    return
+                project_key = body.get('title', '')
+                title = body.get('display_title') or project_key
+                config['_project_key'] = project_key
+                config['_merge_speed'] = body.get('merge_speed', 2)
+                prompt_block = body.get('prompt_block', '')
+                target_slots = body.get('target_slots')
+                override_flagged = bool(body.get('override_flagged'))
+
+                import uuid
+                task_id = f"vchain_{uuid.uuid4().hex}"
+
+                cleanup_old_tasks()
+                get_or_create_task(task_id, {"type": "video_chain", "theme": title, "project_key": project_key,
+                                             "userId": config.get('googleFxUserId') or None})
+
+                threading.Thread(
+                    target=generate_video_chain_worker,
+                    args=(task_id, config, title, prompt_block, target_slots, override_flagged),
+                    daemon=True
+                ).start()
+
+                self._send_json({'status': 'ok', 'task_id': task_id})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/optimize_video_prompts':
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                project_key = body.get('title', '')
+                title = body.get('display_title') or project_key
+                prompt_block = body.get('prompt_block', '')
+                target_slots = body.get('target_slots')
+                force = bool(body.get('force', True))
+
+                optimized_prompt_block = optimize_video_prompts_for_sequence(
+                    config, title, prompt_block, target_slots=target_slots, force=force
+                )
+                self._send_json({
+                    'status': 'ok',
+                    'prompt_block': optimized_prompt_block,
+                    'prompt_slots': prompt_slots_list(optimized_prompt_block),
+                })
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -7794,12 +7953,31 @@ def _sync_project_manifest_with_disk_locked(project_dir):
             
     if not isinstance(manifest, dict):
         return
-        
-    if 'frames' not in manifest:
-        manifest['frames'] = []
-    if 'videos' not in manifest:
-        manifest['videos'] = []
-        
+
+    if not isinstance(manifest.get('frames'), list):
+        if isinstance(manifest.get('frames'), dict):
+            manifest['frames'] = [
+                v for k, v in sorted(manifest['frames'].items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0)
+                if isinstance(v, dict)
+            ]
+        else:
+            manifest['frames'] = []
+    else:
+        manifest['frames'] = [f for f in manifest['frames'] if isinstance(f, dict)]
+
+    if not isinstance(manifest.get('videos'), list):
+        if isinstance(manifest.get('videos'), dict):
+            converted_videos = []
+            for k, v in sorted(manifest['videos'].items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
+                if isinstance(v, dict):
+                    v.setdefault('slot', int(k) if k.isdigit() else k)
+                    converted_videos.append(v)
+            manifest['videos'] = converted_videos
+        else:
+            manifest['videos'] = []
+    else:
+        manifest['videos'] = [v for v in manifest['videos'] if isinstance(v, dict)]
+
     frames_dir = os.path.join(project_dir, 'frames')
     modified = False
     

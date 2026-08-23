@@ -211,7 +211,7 @@ function customTextarea({ title = '输入内容', message = '', defaultValue = '
     });
 }
 
-function customConfirm(message) {
+function customConfirm(message, confirmLabel = '确定', cancelLabel = '取消') {
     return new Promise((resolve) => {
         const modal = document.createElement('div');
         modal.className = 'modal active';
@@ -219,7 +219,7 @@ function customConfirm(message) {
         modal.style.zIndex = '1100';
         
         modal.innerHTML = `
-            <div class="modal-content glass-panel" style="max-width: 400px; border-color: var(--neon-purple);">
+            <div class="modal-content glass-panel" style="max-width: 420px; border-color: var(--neon-purple);">
                 <div class="modal-header">
                     <h3>操作确认</h3>
                     <button class="close-btn">&times;</button>
@@ -228,8 +228,8 @@ function customConfirm(message) {
                     <p style="font-size: 13.5px; line-height: 1.5; color: var(--text-secondary);">${message}</p>
                 </div>
                 <div class="modal-footer">
-                    <button class="action-btn text-btn secondary cancel-btn">取消</button>
-                    <button class="action-btn text-btn primary confirm-btn" style="background: var(--neon-purple); border-color: rgba(157,78,221,0.4); color: #fff; font-weight:600;">确定</button>
+                    <button class="action-btn text-btn secondary cancel-btn">${cancelLabel}</button>
+                    <button class="action-btn text-btn primary confirm-btn" style="background: var(--neon-purple); border-color: rgba(157,78,221,0.4); color: #fff; font-weight:600;">${confirmLabel}</button>
                 </div>
             </div>
         `;

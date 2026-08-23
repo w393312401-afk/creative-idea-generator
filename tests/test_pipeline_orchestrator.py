@@ -260,6 +260,8 @@ class TestRunStagedFrameRendering(_ProjectTestCase):
                    side_effect=self._fake_render([1, 2])), \
              patch('pipeline_orchestrator.compose_anchor_and_packet') as mock_phase1, \
              patch('pipeline_orchestrator.compose_remaining_beats') as mock_phase2, \
+             patch('pipeline_orchestrator.optimize_video_prompts_for_sequence',
+                   side_effect=lambda config, title, pb, **kw: pb) as mock_opt, \
              patch('pipeline_orchestrator.generate_video_sequence',
                    return_value={'videos': [{'slot': 1, 'status': 'success'}]}) as mock_video, \
              patch.object(prompt_pipeline, '_multimodal_chat') as mock_judge:
@@ -269,6 +271,7 @@ class TestRunStagedFrameRendering(_ProjectTestCase):
         self.assertEqual(result['prompt_block'], self.PROMPT_BLOCK)
         mock_phase1.assert_not_called()
         mock_phase2.assert_not_called()
+        mock_opt.assert_called_once()
         mock_video.assert_called_once()
         self.assertNoJudgeCalled(mock_judge)
 

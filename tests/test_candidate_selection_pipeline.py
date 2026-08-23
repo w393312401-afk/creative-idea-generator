@@ -963,3 +963,75 @@ def test_generate_frame_candidates_api_cancel_check(temp_project):
     assert "取消" in str(exc_info.value)
 
 
+def _fake_fx_batch(uuids):
+    """造一批带 UUID 文件名的假 FX 产出。"""
+    from PIL import Image
+    d = tempfile.mkdtemp()
+    files = []
+    for idx, u in enumerate(uuids):
+        p = os.path.join(d, f"fx_batch_9_{idx}_{u}.jpg")
+        Image.new("RGB", (64, 64), color="green").save(p, "JPEG")
+        files.append(p)
+    return files
+
+
+def test_short_fx_batch_is_not_topped_up_with_api_candidates(temp_project):
+    """FX 少回几张时不拿 API 候选补齐。
+
+    API 候选没有画布 tile（fx_uuid=None）。补进来一旦被 4选1 选中，这一帧就脱离
+    Flow 血统，下一帧的链式参考只能靠重新上传接链——为多一个候选赔掉整条下游链的
+    画布连续性。2026-08-23 IMG 017 就是这么坏的。
+    """
+    uuids = ["aaaaaaaa-1111-1111-1111-111111111111",
+             "bbbbbbbb-2222-2222-2222-222222222222",
+             "cccccccc-3333-3333-3333-333333333333"]
+    svc = MagicMock()
+    svc._generate_images_batch_google_fx.return_value = {
+        "status": "partial", "image_urls": _fake_fx_batch(uuids),
+        "project_url": "https://labs.google/fx/tools/flow/project/p1",
+    }
+
+    with patch("candidate_selection_pipeline._get_google_fx_image_service", return_value=(svc, None)), \
+         patch("candidate_selection_pipeline._fx_image_model", return_value="imagen-3.0"), \
+         patch("candidate_selection_pipeline._generate_single_api_candidate") as api_gen:
+        cands = csp.generate_frame_candidates(
+            config={"imageBackend": "google_fx"},
+            title=temp_project["project_name"],
+            item={"prompt": "p"}, reference_path=None, seq=1, candidate_count=4,
+            project_url=None, frames_dir=temp_project["frames_dir"],
+        )
+
+    assert api_gen.call_count == 0, "FX 已经给出候选时不该再叫 API 补齐"
+    assert len(cands) == 3
+
+    meta_json = os.path.join(temp_project["frames_dir"], "candidates", "frame_001",
+                             "candidates_meta.json")
+    with open(meta_json, encoding="utf-8") as f:
+        meta = json.load(f)
+    # 留下来的每一张都带画布 UUID —— 无论选中哪张，下一帧都能直接挂 tile
+    assert [c["fx_uuid"] for c in meta["candidates"]] == uuids
+
+
+def test_empty_fx_batch_still_falls_back_to_api(temp_project):
+    """FX 彻底空手是"有帧/没帧"的区别，仍然要退回 API 把这一帧渲出来。"""
+    from PIL import Image
+    svc = MagicMock()
+    svc._generate_images_batch_google_fx.return_value = {
+        "status": "failed", "image_urls": [], "project_url": None,
+    }
+
+    def _make(config, prompt_text, reference_path, out_path, is_text_only, ctrl_prompt):
+        Image.new("RGB", (64, 64), color="red").save(out_path, "WEBP")
+
+    with patch("candidate_selection_pipeline._get_google_fx_image_service", return_value=(svc, None)), \
+         patch("candidate_selection_pipeline._fx_image_model", return_value="imagen-3.0"), \
+         patch("candidate_selection_pipeline._generate_single_api_candidate", side_effect=_make) as api_gen:
+        cands = csp.generate_frame_candidates(
+            config={"imageBackend": "google_fx"},
+            title=temp_project["project_name"],
+            item={"prompt": "p"}, reference_path=None, seq=1, candidate_count=4,
+            project_url=None, frames_dir=temp_project["frames_dir"],
+        )
+
+    assert api_gen.call_count == 4
+    assert len(cands) == 4

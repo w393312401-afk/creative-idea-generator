@@ -50,6 +50,16 @@ medium shot / wide outro shot——一律按硬伤报（_extra_shot_rungs），�
 
 契约文件一律经 pp.load_reference_file(name, self.profile) 读取（omni 包缺的文件由它
 回落到 base），不在这里拼任何路径。
+
+2026-08-23 起本文件不只服务 omni：MiniatureComposer 也继承 OmniComposer，复用整套镜头梯
+机制（切点表、一镜到底禁令、镜头名审计、定向回炉），只换皮不换机制。**改这里等于同时改两条线。**
+可换皮的接缝就这五处，子类覆写它们、不要改模块级实现：
+  · ladder_for_kind —— 拍型 → 镜头梯（miniature 有自己的镜头名，且三套梯收敛成一种形状）
+  · ensure_pacing + pacing_phrase / inshot_phrase 四个类属性 —— 节奏与镜内连续性文案
+  · ensure_actor_engagement —— 零秒作业主体句（omni 是实景工人，miniature 是巨人手）
+  · fallback_ladder_clause —— 占位兜底稿的镜头梯声明与拍摄质感
+  · multishot_rework_system —— 定向回炉的 system prompt
+类内取梯一律走 self.ladder_for_kind，不要直接调模块级的 ladder_for。
 """
 
 import re
@@ -409,16 +419,24 @@ def timeline_sentence(duration, ladder):
             f"{body} seconds.")
 
 
-def ladder_roles(ladder):
+def ladder_roles(ladder, insert_subject=None):
     """逐镜职责文案。只有一个特写插入时，第二个插入的职责（持久痕迹）并进它——否则
-    "至少两处本次操作特有的持久痕迹"会随着那一镜一起消失，那才是真正的内容损失。"""
+    "至少两处本次操作特有的持久痕迹"会随着那一镜一起消失，那才是真正的内容损失。
+
+    insert_subject（复刻线）：原片这一拍自己的插入镜拍的是什么。给了就钉在第一个插入镜
+    上——通用职责（工具接触点 / 持久痕迹）是这条片子里**任何一拍**都能写的话，而这一句
+    是**这一拍**的画面。没给（原创单，或原片这一拍本来就是一镜到底）时逐字不变。"""
     keys = {rung.key for rung in ladder}
+    subject = str(insert_subject or '').strip()
     lines = []
     for index, rung in enumerate(ladder, start=1):
         role = rung.role
         if rung.key == 'close' and 'xclose' not in keys:
             role = role + ('；本片长只有这一个插入镜，因此至少两处本次操作特有的持久痕迹'
                            '也在同一镜里给到')
+        if rung.key == 'close' and subject:
+            role = role + (f'；**本拍原片的插入镜拍的就是：{subject}** —— 这一镜要拍的是它，'
+                           f'不是一个泛泛的工具接触点')
         lines.append(f"{index}. {rung.phrase}（{rung.label.split()[0]}）——{role}；")
     return '\n'.join(lines)
 
@@ -553,7 +571,7 @@ def omni_video_violations(video_prompt, ladder=None, duration=None, skip_shot_li
 
     ladder 缺省按长片长四镜施工梯判（模块级调用方的口径）。duration 给了才查
     时间线——回炉通路拿不到拍型时不该凭空要求一张切点表。
-    节奏声明不在这里查：它由 _ensure_pacing 确定性注入，查了也只会是死代码。
+    节奏声明不在这里查：它由 OmniComposer.ensure_pacing 确定性注入，查了也只会是死代码。
 
     skip_shot_list（2026-08-06）：调用方已经用 is_expanded_transition_stage_beat 判定
     这一拍是展开后的原子级过门/空间重置子拍、传了 ladder=None 时才该置 True——这类拍
@@ -628,6 +646,17 @@ class OmniComposer(BaseComposer):
 
     profile = 'omni'
 
+    # 下面四项是**可按 profile 换皮**的确定性注入文案。镜头梯机制（切点表、一镜到底禁令、
+    # 镜头名审计）对所有多镜头 profile 是同一套，但节奏声明的措辞随题材而变——微缩线的
+    # 施工不是 construction time-lapse 而是 craft time-lapse。marker 是**已注入判定**用的
+    # 小写子串，必须是 phrase 的真子串，否则 ensure_pacing 会每过一次就再追加一句。
+    pacing_phrase = OMNI_PACING_PHRASE
+    pacing_marker = OMNI_PACING_MARKER
+    inshot_phrase = OMNI_INSHOT_PHRASE
+    inshot_marker = OMNI_INSHOT_MARKER
+    # 镜头语法定向回炉时读的那份契约（子类换成自己包里的同类文档）。
+    multishot_reference = 'omni-multishot-language.md'
+
     def __init__(self):
         super().__init__()
         self._reference_cache = {}
@@ -669,6 +698,25 @@ class OmniComposer(BaseComposer):
         送给 Flow 面板的那个一致——两边都走 server_common.resolve_video_duration。"""
         return server_common.resolve_video_duration(self.config)
 
+    def ladder_for_kind(self, duration, kind='construction', observed_shots=None):
+        """(时长, 拍型) → 镜头梯。**类内所有取梯的地方都必须走这里，且必须把
+        observed_shots 一起传**——不要直接调模块级的 ladder_for。子 profile 可能有自己的
+        一套镜头名与拍型映射（见 miniature），而复刻单的梯还随原片切点变；漏掉任何一处，
+        取梯与审计就会各用一套梯：注入的是四镜切点表、审计要的是三镜，每一拍都判违规、
+        每一拍都烧一轮回炉，报出来的还是「缺镜头」，看不出真因在取梯。
+
+        observed_shots（复刻线）：原片这一拍由几个镜头组成。给了就按它排施工梯——原片
+        切得碎（≥3 镜）排四镜，切得少或没切排三镜下限；给 None（原创单、老 job、二创
+        变体、抽帧异常）时按片长排，与改造前完全一致。过门梯与兑现梯不受影响：它们的
+        三个工位是由职责定的，原片多切几刀也只是把同一件事切碎。"""
+        if kind == 'construction' and observed_shots is not None:
+            # 夹进合法区间 [3, 4] 之后，再按片长压一次上限：4/6 秒排不下第二个
+            # 插入镜（construction_shot_count 的分界），硬排等于每镜不足一秒的闪帧。
+            capped = min(max(observed_shots, min(pp._MULTISHOT_LEGAL_SHOT_COUNTS)),
+                         construction_shot_count(duration))
+            return _CONSTRUCTION_LADDERS[capped]
+        return ladder_for(duration, kind)
+
     def ladder_for_beat(self, beat=None, is_threshold_or_reveal=None, is_crossing=None):
         """这一拍的镜头梯。拍型不明时返回 None（见 ladder_kind）。"""
         if is_crossing is None:
@@ -676,7 +724,8 @@ class OmniComposer(BaseComposer):
         kind = ladder_kind(beat, is_threshold_or_reveal, is_crossing)
         if kind is None:
             return None
-        return ladder_for(self.clip_duration(), kind)
+        return self.ladder_for_kind(self.clip_duration(), kind,
+                                    observed_shots=pp.observed_shot_count_of(beat))
 
     # ── 风格分支 ────────────────────────────────────────────────────────────
 
@@ -708,7 +757,38 @@ class OmniComposer(BaseComposer):
             "is loose: no primary landmark may leave the frame in the opening, staging, or closing shots."
         )
 
-    def video_override_block(self, include_threshold=False, ladder=None):
+    def ensure_pacing(self, video_prompt):
+        """普通施工拍补齐节奏声明与镜内连续性声明（缺了才补，不重复注入）。
+
+        文案取自类属性（pacing_phrase / inshot_phrase），子 profile 换皮即可——注入点、
+        判定口径与「过门拍/兑现拍免除」的分流仍然只有这一处实现。"""
+        text = video_prompt or ''
+        if self.pacing_marker not in text.lower():
+            if text and not text.endswith(('.', '!', '?')):
+                text += '.'
+            text = f"{text} {self.pacing_phrase}".strip()
+        if self.inshot_marker not in text.lower():
+            if text and not text.endswith(('.', '!', '?')):
+                text += '.'
+            text = f"{text} {self.inshot_phrase}".strip()
+        return text
+
+    def fallback_ladder_clause(self, ladder):
+        """占位兜底稿补的镜头梯声明。默认是 omni 的 UGC 手机质感版本。"""
+        return fallback_ladder_clause(ladder)
+
+    def ensure_actor_engagement(self, video_prompt, ladder, packet=None, beat=None,
+                                is_threshold_or_reveal=False):
+        """确保正文里的施工主体从零秒起就在作业面上（并清掉进出场措辞）。
+
+        默认是 omni 的实景工人口径。世界观不同的子 profile（微缩线的施工主体是从画幅
+        边缘伸入的巨人手，进出画本身就是契约要求）必须覆写这一处，否则会被塞进一句
+        "the same lone worker is already positioned at the active work face"。"""
+        return ensure_ladder_out_and_in(
+            video_prompt, ladder, packet=packet, beat=beat,
+            is_threshold_or_reveal=is_threshold_or_reveal)
+
+    def video_override_block(self, include_threshold=False, ladder=None, insert_subject=None):
         """追加在 base system prompt 之后的 OMNI VIDEO OVERRIDE 段。
 
         只覆盖 VIDEO：上面那份 base 契约里关于 IMAGE 的每一条（干净帧、无人称词、
@@ -718,7 +798,7 @@ class OmniComposer(BaseComposer):
         里可能混着过门拍与兑现拍，它们各自的切点表由 _inject_timeline 逐拍确定性覆写，
         这里只需要把三套梯的规则讲清楚。"""
         duration = self.clip_duration()
-        ladder = ladder or ladder_for(duration, 'construction')
+        ladder = ladder or self.ladder_for_kind(duration, 'construction')
         target, ceiling = video_word_targets(len(ladder))
         references = self.required_references_block(include_threshold=include_threshold)
         references_section = (
@@ -736,7 +816,7 @@ establishing long shot / full shot / medium shot / wide outro shot 这一类旧�
 一个都不要。{duration} 秒对应 {len(ladder)} 个镜头，按这个顺序写满，镜头之间用 clean cut / match cut
 衔接（禁止 cross-dissolve、fade、magical transition、instant transformation、teleport、
 跳过物理过程的快剪）：
-{ladder_roles(ladder)}
+{ladder_roles(ladder, insert_subject)}
 
 SAME CAMERA SETUP（本次改造的核心）——第一镜与最后一镜是**同一个机位、同一个构图、同一个焦段**，
 只有施工完成度不同。正文在最后一镜里要写明它切回的是 the same camera setup as the opening wide
@@ -786,10 +866,13 @@ single continuous take、one continuous take、single take、unbroken take 或�
             contract.get('beat'), contract.get('is_threshold_or_reveal'), is_crossing=is_crossing)
         return (super().single_beat_system_prompt(
             config, i, contract, packet, compiled_images, compiled_videos, scup_ref, tbcp_ref_i)
-            + self.video_override_block(include_threshold=is_crossing, ladder=ladder))
+            + self.video_override_block(
+                include_threshold=is_crossing, ladder=ladder,
+                insert_subject=(contract.get('beat') or {}).get('insert_subject')))
 
     def apply_proactive_fixes(self, i, video_prompt, image_prompt, packet, mode, is_last,
-                              is_threshold_or_reveal, beat=None, config=None, family=None):
+                              is_threshold_or_reveal, beat=None, config=None, family=None,
+                              beat_ladder=None):
         """IMAGE 完全委托 base（下游帧渲染吃的是同一套契约）；VIDEO 走 omni 自己的链路。
 
         VIDEO 不能借道 base：base 会把正文压到 270 词（多镜头文本会被腰斩）、注入含
@@ -797,7 +880,7 @@ single continuous take、one continuous take、single take、unbroken take 或�
         的工人进出时间戳。"""
         _discarded_video, fixed_image = pp.apply_proactive_fixes(
             i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
-            beat=beat, config=config, family=family)
+            beat=beat, config=config, family=family, beat_ladder=beat_ladder)
         # 记号禁用适用于两侧的 prompt body，不只 VIDEO。base 的锚点重述句会写进
         # `holding 45 percent of frame height`，词形化之后 SCUP 的比例门禁照样解析
         # 得到同一个数（_integer_to_words 的连字符形态就是为此选的），所以这里可以
@@ -805,6 +888,10 @@ single continuous take、one continuous take、single take、unbroken take 或�
         fixed_image = _digits_to_words(fixed_image)
         fixed_video = self.fix_omni_video(
             i, video_prompt, packet, is_threshold_or_reveal, beat=beat, config=config, family=family)
+        # 末帧的镜面地收窄对 VIDEO 同样成立，但 omni 的 VIDEO 不走 base（见上），所以这里
+        # 单独补一次：IMAGE 不再要求镜面地时，VIDEO 也不该留着「倒环氧做镜面」那道工序。
+        if is_last and pp.ladder_gloss_floor_milestone(beat_ladder, i) == '':
+            fixed_video = pp.strip_unearned_gloss_floor(fixed_video)
         return fixed_video, fixed_image
 
     def validate_beat_prompts(self, i, video_prompt, image_prompt, packet, mode, is_last,
@@ -814,7 +901,7 @@ single continuous take、one continuous take、single take、unbroken take 或�
         ladder = self.ladder_for_beat(beat, is_threshold_or_reveal)
         # 字数硬顶按本 profile 的镜头梯算，不用 base 的一镜到底档 380
         # （见 pp.validate_beat_prompts 的 video_word_limit 说明）。拍型不明时按施工梯。
-        _ceiling_ladder = ladder or ladder_for(self.clip_duration(), 'construction')
+        _ceiling_ladder = ladder or self.ladder_for_kind(self.clip_duration(), 'construction')
         errs = super().validate_beat_prompts(
             i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
             prev_video, prev_image, beat=beat, family=family, is_pre_bridge=is_pre_bridge,
@@ -874,7 +961,7 @@ single continuous take、one continuous take、single take、unbroken take 或�
         if ladder and _missing_shot_rungs(_body_without_timeline(text), ladder):
             if not text.endswith(('.', '!', '?')):
                 text += '.'
-            text = f"{text} {fallback_ladder_clause(ladder)}"
+            text = f"{text} {self.fallback_ladder_clause(ladder)}"
         return text
 
     # ── omni 自己的 VIDEO 处理 ───────────────────────────────────────────────
@@ -893,8 +980,8 @@ single continuous take、one continuous take、single take、unbroken take 或�
                                             is_video=True)
         text = pp.fix_video_opening(i, text)
         text = pp.fix_sound_design(text, family=family or 'exterior')
-        text = ensure_ladder_out_and_in(text, ladder, packet=packet, beat=beat,
-                                        is_threshold_or_reveal=is_threshold_or_reveal)
+        text = self.ensure_actor_engagement(text, ladder, packet=packet, beat=beat,
+                                            is_threshold_or_reveal=is_threshold_or_reveal)
         text = self.normalize_omni_video(
             text, is_threshold_or_reveal=is_threshold_or_reveal, beat=beat)
         return pp.compress_prompt_to_budget(text, ceiling, config, is_video=True)
@@ -917,23 +1004,23 @@ single continuous take、one continuous take、single take、unbroken take 或�
             return text
 
         duration = self.clip_duration()
-        ladder = ladder_for(duration, kind)
+        # observed_shots 必须跟着传：切点表是在这里确定性注入的，而镜头名审计走的是
+        # ladder_for_beat。两边取梯的口径一旦不一致，注入的是四镜切点表、审计要的是
+        # 三镜，每一拍都必然判违规并烧掉一轮定向回炉——而且报的是「缺镜头」，
+        # 看不出真因在取梯。
+        ladder = self.ladder_for_kind(duration, kind,
+                                      observed_shots=pp.observed_shot_count_of(beat))
         text = _inject_timeline(text, timeline_sentence(duration, ladder))
         if kind == 'construction':
-            text = _ensure_pacing(text)
+            text = self.ensure_pacing(text)
         return text
 
-    def rework_omni_multishot(self, config, i, video_prompt, packet, beat=None):
-        """镜头语法定向回炉一轮：只重写 VIDEO，把正文改写成按切点表剪辑的多镜头序列。
-
-        与 base 的结构性回炉同款契约——加法式修改、锚定开场句逐字保留、重写稿必须真的
-        通过 omni_video_violations 复验，否则保留原稿（只留痕）。返回
-        (video_prompt, 是否采用重写稿)。"""
-        multishot_ref = self.reference('omni-multishot-language.md')
-        duration = self.clip_duration()
-        ladder = self.ladder_for_beat(beat) or ladder_for(duration, 'construction')
+    def multishot_rework_system(self, ladder, duration):
+        """镜头语法定向回炉用的 system prompt。子 profile 覆写它来换掉世界观措辞
+        （施工主体、镜头名、读哪份镜头语法契约），回炉的调用/复验流程不必复制第二份。"""
+        multishot_ref = self.reference(self.multishot_reference)
         scales = ', '.join(rung.phrase for rung in ladder)
-        system = f"""You are rewriting ONE video prompt so it obeys the Gemini Omni multi-shot contract.
+        return f"""You are rewriting ONE video prompt so it obeys the Gemini Omni multi-shot contract.
 
 {multishot_ref}
 
@@ -948,6 +1035,16 @@ Rewrite rules (additive — do not lose content):
 - The shot timeline is the ONLY place arabic digits may appear. Every other count is written in English words.
 - NEVER write oner, one-shot, one-take, single continuous take, one continuous take, single take, or unbroken take — there is no exemption.
 - Output ONLY the rewritten video prompt body. No headings, no labels, no commentary."""
+
+    def rework_omni_multishot(self, config, i, video_prompt, packet, beat=None):
+        """镜头语法定向回炉一轮：只重写 VIDEO，把正文改写成按切点表剪辑的多镜头序列。
+
+        与 base 的结构性回炉同款契约——加法式修改、锚定开场句逐字保留、重写稿必须真的
+        通过 omni_video_violations 复验，否则保留原稿（只留痕）。返回
+        (video_prompt, 是否采用重写稿)。"""
+        duration = self.clip_duration()
+        ladder = self.ladder_for_beat(beat) or self.ladder_for_kind(duration, 'construction')
+        system = self.multishot_rework_system(ladder, duration)
         user = f"Beat {i} video prompt draft to restructure:\n\n{video_prompt}"
 
         try:
@@ -1083,17 +1180,3 @@ def _inject_timeline(text, sentence):
     # 锚定句还没注入（回炉稿/兜底稿在 fix_video_opening 之前）：先放最前面，
     # 后续的 fix_video_opening 会把锚定句补到它之前。
     return f"{sentence} {body}".strip()
-
-
-def _ensure_pacing(video_prompt):
-    """普通施工拍补齐 omni 的节奏声明与镜内连续性声明（缺了才补，不重复注入）。"""
-    text = video_prompt or ''
-    if OMNI_PACING_MARKER not in text.lower():
-        if text and not text.endswith(('.', '!', '?')):
-            text += '.'
-        text = f"{text} {OMNI_PACING_PHRASE}".strip()
-    if OMNI_INSHOT_MARKER not in text.lower():
-        if text and not text.endswith(('.', '!', '?')):
-            text += '.'
-        text = f"{text} {OMNI_INSHOT_PHRASE}".strip()
-    return text

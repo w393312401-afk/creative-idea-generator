@@ -83,6 +83,18 @@ class BaseComposer:
                                               brief.get('scene_signature'))
         if not lines:
             return ""
+        # 「一直在动」那一栏要单独再叮一句：上面那段说的是「一直在」，而运动项的失效方式
+        # 不是被写漏，是被写成静物（"a stream runs past the stump" 读起来完全合规，画面里
+        # 那条溪却是一张静止的贴图）。每一条 VIDEO 都必须让它继续动。
+        motion = [str(x).strip()
+                  for x in ((brief.get('scene_constants') or {}).get('motion') or [])
+                  if str(x).strip()]
+        motion_rule = (
+            "\nThe items listed as never stopping are the film's ambient life: they keep moving "
+            "in EVERY video clip, on their own, with nobody touching them, and the IMAGE anchors "
+            "catch them mid-motion rather than frozen. A clip in which only the worker's hands "
+            "move and the water, smoke, flame and foliage hold still reads as a photograph with "
+            "one animated cut-out on it.\n" if motion else "")
         return (
             "\n==================== SCENE CONSTANTS (THIS JOB ONLY) ====================\n"
             "These are present in the reference film from the first frame to the last. They are "
@@ -91,7 +103,8 @@ class BaseComposer:
             + "\n".join(f"- {x}" for x in lines)
             + "\nNever describe a surface these cover as clean, new, or unmarked unless a beat "
               "explicitly says that beat's work made it so. They are the reason the reference "
-              "film looks like itself.\n")
+              "film looks like itself.\n"
+            + motion_rule)
 
     def batch_system_prompt(self, config, packet, scup_ref, tbcp_ref):
         """批量直出调用的共享 system prompt（每拍都相同的那部分）。"""
@@ -192,11 +205,15 @@ Instructions:
 {self.banned_elements_block()}{self.scene_constants_block()}"""
 
     def apply_proactive_fixes(self, i, video_prompt, image_prompt, packet, mode, is_last,
-                              is_threshold_or_reveal, beat=None, config=None, family=None):
-        """确定性修复（VIDEO + IMAGE）。"""
+                              is_threshold_or_reveal, beat=None, config=None, family=None,
+                              beat_ladder=None):
+        """确定性修复（VIDEO + IMAGE）。
+
+        beat_ladder 供只有"看得见在先各拍"才判得了的收口用（末帧继承句、末帧镜面地是否
+        有工序背书）。缺省 None 时那两条一律保持改动前的行为，不删不改。"""
         return pp.apply_proactive_fixes(
             i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
-            beat=beat, config=config, family=family)
+            beat=beat, config=config, family=family, beat_ladder=beat_ladder)
 
     def validate_beat_prompts(self, i, video_prompt, image_prompt, packet, mode, is_last,
                               is_threshold_or_reveal, prev_video=None, prev_image=None,
@@ -219,6 +236,75 @@ Instructions:
     def finalize_fallback_video(self, video_prompt, contract):
         """占位符兜底稿的收尾（base 不做任何额外处理）。"""
         return video_prompt
+
+    def repair_beat_prompts(self, config, i, v_p, i_p, contract, packet, beat_ladder,
+                            parsed_traces, prev_image, structural, style_errs, reworked,
+                            log_prefix):
+        """一拍的「里程碑成对回炉 + IMAGE 侧合并回炉」。批量通路与单拍兜底通路共用。
+
+        2026-08-22 之前这里是一条 8 段的**串行链**（相似度 → 里程碑 → TRACES → 卡片工序
+        → STAGE SCOPE → 招牌反差点 → sterile 占位 → 首现衰败 → 包络体倒退），每段各打一次
+        模型：一拍命中三条就是三次调用，实测 145 拍里 26 拍 ≥2 条。而且链是有序的，后一段
+        重写可以把前一段的修复悄悄改回去——reverify_beat_repairs 只能事后把残留报出来。
+
+        现在只剩两步：里程碑仍然单独成对回炉（它要同时改 VIDEO，且是下游硬门，60 次里
+        37 次真的带着 VIDEO 错），其余 8 条 IMAGE 侧缺陷合并成 **一次** pp.repair_image_defects
+        调用，采纳条件是「至少修好一条、且一条新的都没引入」——在任何一道 check 上都不比
+        串行链更宽松。
+
+        Returns (v_p, i_p, structural, style_errs, reworked, image_reworked,
+                 outline_missing_before)。
+        """
+        beat = contract['beat']
+        image_reworked = None
+
+        milestone_video_errs = pp.check_milestone_video_prompt(v_p, beat)
+        milestone_image_errs = pp.check_milestone_image_prompt(i_p, beat)
+        if milestone_video_errs or milestone_image_errs:
+            if sys.stdout:
+                print(f"[DIRECT] {log_prefix} 显著里程碑骨架缺失，成对回炉一轮: "
+                      f"VIDEO={milestone_video_errs}; IMAGE={milestone_image_errs}")
+            v_p, i_p, milestone_reworked = pp.rework_milestone_prompt_pair(
+                config, i, v_p, i_p, beat, milestone_video_errs, milestone_image_errs)
+            structural = structural + milestone_video_errs
+            style_errs = style_errs + milestone_image_errs
+            reworked = milestone_reworked if reworked is None else (reworked or milestone_reworked)
+            image_reworked = milestone_reworked
+
+        # 卡片工序（节拍简介）在成片里的收口：回炉**之前**的缺失编号要先留一份，否则
+        # 下面记总账时区分不出"一次过"和"回炉后通过"（见 pp.record_outline_delivery）。
+        outline_missing_before = pp.outline_missing_indices(i_p, beat)
+
+        defect_kwargs = dict(
+            beat=beat, packet=packet, prev_image=prev_image, parsed_traces=parsed_traces,
+            stage_scope=contract['stage_scope'],
+            is_first_interior_reveal=contract['is_first_interior_reveal'],
+            beat_ladder=beat_ladder, family=contract['family'])
+        defects = pp.collect_image_defects(i, i_p, **defect_kwargs)
+        if defects:
+            if sys.stdout:
+                print(f"[DIRECT] {log_prefix} IMAGE 侧命中 {len(defects)} 类缺陷"
+                      f"（{'、'.join(sorted(defects))}），合并回炉一次: "
+                      + "; ".join(m for k in sorted(defects) for m in defects[k]))
+            i_p, merged_reworked, residual_defects = pp.repair_image_defects(
+                config, i, i_p, defects, **defect_kwargs)
+            if sys.stdout:
+                if merged_reworked:
+                    print(f"[DIRECT] {log_prefix} IMAGE 合并回炉成功，已采用重写稿"
+                          + (f"（仍残留：{'、'.join(sorted(residual_defects))}）"
+                             if residual_defects else "（全部修复）"))
+                else:
+                    print(f"[DIRECT] {log_prefix} IMAGE 合并回炉未通过，保留原稿（仅留痕）")
+            # 留痕口径不变：命中过的缺陷原文照旧进 style_errs（相似度那几条本就已经在
+            # validate_beat_prompts 的结果里，这里去重避免同一条记两遍）。
+            style_errs = list(dict.fromkeys(
+                style_errs + [m for k in pp._IMAGE_DEFECT_ORDER if k in defects
+                              for m in defects[k]]))
+            image_reworked = (merged_reworked if image_reworked is None
+                              else (image_reworked or merged_reworked))
+
+        return (v_p, i_p, structural, style_errs, reworked, image_reworked,
+                outline_missing_before)
 
     # ── Phase 2 主流程 ──────────────────────────────────────────────────────
 
@@ -354,7 +440,9 @@ Instructions:
                         continue
 
                     # Apply proactive fixes
-                    v_p, i_p = self.apply_proactive_fixes(i, v_p, i_p, beat_packet, mode, is_last, is_threshold_or_reveal, beat=beat, config=config, family=family)
+                    v_p, i_p = self.apply_proactive_fixes(i, v_p, i_p, beat_packet, mode, is_last, is_threshold_or_reveal,
+                                                         beat=beat, config=config, family=family,
+                                                         beat_ladder=beat_ladder)
                     # 2026-07-30：声明式切入拍的 VIDEO 不再被占位声明覆盖——它和单一过门拍
                     # 一样是真实可见的跨越片段，正文一律走 LLM 稿 + 确定性修复 + 校验 + 回炉
                     # 的普通通路（占位覆盖正是「过门镜头不生成」的根因）。
@@ -398,99 +486,10 @@ Instructions:
                         except Exception as e:
                             if sys.stdout:
                                 print(f"[DEBUG] Failed to parse prompt-embedded TRACES JSON: {e}")
-                    image_similar, style_errs = pp.split_image_similarity_errors(style_errs)
-                    image_reworked = None
-                    if image_similar:
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} IMAGE 相似度瑕疵，定向回炉一轮: {image_similar}")
-                        i_p, image_reworked = pp.rework_similar_image_beat(config, i, i_p, image_similar, packet, prev_image=prev_i, beat=beat)
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} IMAGE 回炉{'成功，已采用重写稿' if image_reworked else '未通过，保留原稿（仅留痕）'}")
-                        style_errs = style_errs + image_similar
-                    milestone_video_errs = pp.check_milestone_video_prompt(v_p, beat)
-                    milestone_image_errs = pp.check_milestone_image_prompt(i_p, beat)
-                    if milestone_video_errs or milestone_image_errs:
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} 显著里程碑骨架缺失，成对回炉一轮: "
-                                  f"VIDEO={milestone_video_errs}; IMAGE={milestone_image_errs}")
-                        v_p, i_p, milestone_reworked = pp.rework_milestone_prompt_pair(
-                            config, i, v_p, i_p, beat, milestone_video_errs, milestone_image_errs)
-                        structural = structural + milestone_video_errs
-                        style_errs = style_errs + milestone_image_errs
-                        reworked = milestone_reworked if reworked is None else (reworked or milestone_reworked)
-                        image_reworked = milestone_reworked if image_reworked is None else (image_reworked or milestone_reworked)
-                    content_errs = pp.check_image_realizes_traces(i_p, parsed_traces)
-                    if content_errs:
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} 图文内容脱节，定向回炉一轮: {content_errs}")
-                        i_p, content_reworked = pp.rework_missing_content_image_beat(config, i, i_p, parsed_traces, beat=beat)
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} 图文内容回炉{'成功，已采用重写稿' if content_reworked else '未通过，保留原稿（仅留痕）'}")
-                        style_errs = style_errs + content_errs
-                        image_reworked = content_reworked if image_reworked is None else (image_reworked or content_reworked)
-                    # 卡片工序（节拍简介）在成片里的收口：这拍认领的工序必须真的写进 IMAGE
-                    # 回炉**之前**的缺失编号要先留一份，否则下面记总账时区分不出
-                    # "一次过"和"回炉后通过"（见 pp.record_outline_delivery）
-                    outline_missing_before = pp.outline_missing_indices(i_p, beat)
-                    outline_errs = pp.check_outline_delivery_realized(i_p, beat)
-                    if outline_errs:
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} 卡片工序未交付，定向回炉一轮: {outline_errs}")
-                        i_p, outline_reworked = pp.rework_missing_outline_delivery_beat(config, i, i_p, beat=beat)
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} 卡片工序回炉{'成功，已采用重写稿' if outline_reworked else '未通过，保留原稿（仅留痕）'}")
-                        style_errs = style_errs + outline_errs
-                        image_reworked = outline_reworked if image_reworked is None else (image_reworked or outline_reworked)
-                    wording_errs = pp.check_stage_scope_wording(i_p, contract['stage_scope'])
-                    if wording_errs:
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} STAGE SCOPE 措辞瑕疵，定向回炉一轮: {wording_errs}")
-                        i_p, wording_reworked = pp.rework_stage_scope_wording_beat(
-                            config, i, i_p, wording_errs, contract['stage_scope'], beat=beat)
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} STAGE SCOPE 回炉{'成功，已采用重写稿' if wording_reworked else '未通过，保留原稿（仅留痕）'}")
-                        style_errs = style_errs + wording_errs
-                        # 相似度回炉和 stage_scope 措辞回炉都改写同一个 IMAGE 正文，合并成
-                        # 一个 image_reworked 信号喂给 record_beat_audit——否则这里两个独立
-                        # 局部变量互相覆盖，措辞回炉真实成功了审核报告也会显示"仅留痕"。
-                        image_reworked = wording_reworked if image_reworked is None else (image_reworked or wording_reworked)
-                    anchor_errs = pp.check_signature_anchor_realized(i_p, beat)
-                    if anchor_errs:
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} 招牌反差点缺失，定向回炉一轮: {anchor_errs}")
-                        i_p, anchor_reworked = pp.rework_missing_anchor_beat(config, i, i_p, anchor_errs, beat=beat)
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} 招牌反差点回炉{'成功，已采用重写稿' if anchor_reworked else '未通过，保留原稿（仅留痕）'}")
-                        style_errs = style_errs + anchor_errs
-                        image_reworked = anchor_reworked if image_reworked is None else (image_reworked or anchor_reworked)
-                    placeholder_errs = pp.check_image_decay_placeholder(i_p)
-                    if placeholder_errs:
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} sterile占位句，定向回炉一轮: {placeholder_errs}")
-                        i_p, placeholder_reworked = pp.rework_decay_placeholder_beat(config, i, i_p, placeholder_errs, beat=beat)
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} sterile占位句回炉{'成功，已采用重写稿' if placeholder_reworked else '未通过，保留原稿（仅留痕）'}")
-                        style_errs = style_errs + placeholder_errs
-                        image_reworked = placeholder_reworked if image_reworked is None else (image_reworked or placeholder_reworked)
-                    decay_errs = pp.check_first_interior_reveal_decay(i_p, contract['is_first_interior_reveal'])
-                    if decay_errs:
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} 首现衰败措辞缺失，定向回炉一轮: {decay_errs}")
-                        i_p, decay_reworked = pp.rework_first_interior_reveal_decay_beat(config, i, i_p, decay_errs, beat=beat)
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} 首现衰败措辞回炉{'成功，已采用重写稿' if decay_reworked else '未通过，保留原稿（仅留痕）'}")
-                        style_errs = style_errs + decay_errs
-                        image_reworked = decay_reworked if image_reworked is None else (image_reworked or decay_reworked)
-                    envelope_errs = pp.check_envelope_seal_regression(i_p, i, beat_ladder, family=family)
-                    if envelope_errs:
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} 包络体状态倒退（已封构件又写成敞开），定向回炉一轮: {envelope_errs}")
-                        i_p, envelope_reworked = pp.rework_envelope_seal_regression_beat(
-                            config, i, i_p, envelope_errs, beat=beat, beat_ladder=beat_ladder)
-                        if sys.stdout:
-                            print(f"[DIRECT] Beat {i} 包络体状态倒退回炉{'成功，已采用重写稿' if envelope_reworked else '未通过，保留原稿（仅留痕）'}")
-                        style_errs = style_errs + envelope_errs
-                        image_reworked = envelope_reworked if image_reworked is None else (image_reworked or envelope_reworked)
+                    (v_p, i_p, structural, style_errs, reworked, image_reworked,
+                     outline_missing_before) = self.repair_beat_prompts(
+                        config, i, v_p, i_p, contract, packet, beat_ladder, parsed_traces,
+                        prev_i, structural, style_errs, reworked, f'Beat {i}')
                     # 回读校验：修没修以最终文本为准，不以每道回炉自报的布尔为准
                     residual = pp.reverify_beat_repairs(
                         i, v_p, i_p, beat, parsed_traces=parsed_traces,
@@ -612,24 +611,45 @@ Instructions:
 
             return vid_prompt, img_prompt, new_ledger_items, beat_succeeded
 
-        # Batched first pass: precompute every pending beat's deterministic contract, then
-        # generate ALL of them in ONE _chat call (shared reference docs/rules/packet sent
-        # once instead of once-per-beat — see _batch_shared_system_prompt). This is the
-        # dominant cost saver versus the old one-call-per-beat loop; only whichever beats
-        # this batched pass doesn't produce validly for fall back to the (unchanged)
-        # single-beat retry loop above, which is the uncommon case.
+        # Batched passes: precompute every pending beat's deterministic contract, then
+        # generate the beats in ROLLING WINDOWS of composeBatchSize — each window is ONE
+        # _chat call whose shared reference docs/rules/packet are sent once instead of
+        # once-per-beat (see _batch_shared_system_prompt). This is the dominant cost saver
+        # versus the old one-call-per-beat loop; only whichever beats a window doesn't
+        # produce validly for fall back to the (unchanged) single-beat retry loop above,
+        # which is the uncommon case.
+        #
+        # 2026-08-22：此前只有**第一个**窗口真的批量发出去,窗口之外的拍全部逐拍单发
+        # （batch_total 早就按 ceil(n/batch_size) 报了 7 个窗口,实际只跑第 1 个）。
+        # 一单 21 拍 = 1 次批量 + 18 次单发,实测单发拍 ~93s/拍、批量拍 ~9s/拍生成,
+        # 整个 Phase 2 拖到半小时。改成逐窗滚动后调用次数从 19 降到 7,且每个窗口的
+        # 起点锚点图取自**已提交**的上一拍产物,跨窗口连续性与逐拍通路完全一致。
         contracts = {i: pp._beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw,
                                           parsed_brief=parsed_brief) for i in beats_to_generate}
         batch_secs = {}
-        tbcp_ref = ''
-        if beats_to_generate:
-            # Keep model context bounded. Beats omitted from this first rolling window follow
-            # the existing per-beat path below and are checkpointed independently.
-            batch_size = max(1, int(config.get('composeBatchSize', 3)))
-            batch_beats = beats_to_generate[:batch_size]
-            if any(contracts[i]['is_bridge'] or contracts[i]['is_cut'] for i in batch_beats):
-                tbcp_ref = pp.load_reference_file('threshold-bridge-consistency-protocol.md',
-                                                  _profile)
+        # TBCP 契约按**整单**是否有过门/切入拍决定加载,不再只看第一个窗口:过门拍落在
+        # 第 5/6/12 拍是常态(实测三单分别在 3、5、6、12、13 拍),旧写法下它一旦不在头
+        # 三拍里,tbcp_ref 恒为空串——那一拍无论走批量还是单发,拿到的 system prompt 里
+        # 都没有过门协议正文。这是顺带修掉的一个静默质量洞,不是提速改动。
+        tbcp_ref = (pp.load_reference_file('threshold-bridge-consistency-protocol.md', _profile)
+                    if any(contracts[i]['is_bridge'] or contracts[i]['is_cut']
+                           for i in beats_to_generate) else '')
+        # 默认 5（2026-08-22 从 3 上调）：滚动窗口落地后，窗口大小直接决定整单的模型
+        # 调用次数（21 拍 → 3 时 7 次、5 时 5 次）。上限受两头夹：一窗的输出要装得进
+        # max_tokens（每拍 VIDEO+IMAGE+TRACES 约 900 token，5 拍 ≈ 4.5k，离 32k 很远），
+        # 以及一窗要跑得完 composeRequestTimeoutSeconds（实测 3 拍窗 26.5s，5 拍窗约
+        # 45s，默认 120s 有 2.5 倍余量）。再往上不建议：一窗请求失败会把**整窗**的拍
+        # 全部退回逐拍通路，窗口越大这个爆炸半径越大。
+        batch_size = max(1, int(config.get('composeBatchSize', 5)))
+        batch_windows = [beats_to_generate[k:k + batch_size]
+                         for k in range(0, len(beats_to_generate), batch_size)]
+        # 窗口首拍 → (窗口, 第几个窗口)。逐拍循环走到窗口首拍时才发这一窗的批量请求,
+        # 于是窗口 k+1 的起点锚点图必然是窗口 k 最后一拍**已落盘**的 IMAGE。
+        window_starts = {w[0]: (w, n + 1) for n, w in enumerate(batch_windows) if w}
+
+        def _run_batch_window(batch_beats, batch_index):
+            """发一窗批量请求,返回按 ===BEAT N ...=== 标记切好的段落字典。
+            任何传输层失败都返回空字典 —— 这一窗的拍照旧退回逐拍通路。"""
             batch_system = self.batch_system_prompt(config, packet, scup_ref, tbcp_ref)
             first_anchor_image = compiled_images.get(batch_beats[0], '')
             batch_user = pp._build_batch_user_message(batch_beats, contracts, first_anchor_image)
@@ -639,14 +659,15 @@ Instructions:
 
             if on_progress:
                 on_progress('batch_generating', {
-                    'batch_index': 1, 'batch_total': max(1, (len(beats_to_generate) + batch_size - 1) // batch_size),
+                    'batch_index': batch_index, 'batch_total': len(batch_windows),
                     'beat_start': batch_beats[0], 'beat_end': batch_beats[-1],
                     'attempt': 1, 'attempt_total': 2,
                     'elapsed_seconds': 0,
                     'deadline_remaining_seconds': int(config.get('composeRequestTimeoutSeconds', 120)),
                 })
             if sys.stdout:
-                print(f"[DEBUG] Step 5: Batch-composing {len(beats_to_generate)} beat(s) of {total_beats} in one call: {beats_to_generate}...")
+                print(f"[DEBUG] Step 5: Batch-composing window {batch_index}/{len(batch_windows)} "
+                      f"— beat(s) {batch_beats} of {total_beats} in one call...")
             pp._raise_if_cancelled(on_progress)
             def _request_batch():
                 retry_count = max(0, int(config.get('composeBatchRetryCount', 1)))
@@ -666,8 +687,8 @@ Instructions:
                         })
                         if on_progress:
                             on_progress('batch_generated', {
-                                'batch_index': 1,
-                                'batch_total': max(1, (len(beats_to_generate) + batch_size - 1) // batch_size),
+                                'batch_index': batch_index,
+                                'batch_total': len(batch_windows),
                                 'beat_start': batch_beats[0], 'beat_end': batch_beats[-1],
                                 'attempt': attempt + 1, 'attempt_total': retry_count + 1,
                                 'elapsed_seconds': round(pp.time.time() - started, 2),
@@ -688,8 +709,8 @@ Instructions:
                         })
                         if on_progress:
                             on_progress('batch_retry' if attempt < retry_count else 'batch_failed', {
-                                'batch_index': 1,
-                                'batch_total': max(1, (len(beats_to_generate) + batch_size - 1) // batch_size),
+                                'batch_index': batch_index,
+                                'batch_total': len(batch_windows),
                                 'beat_start': batch_beats[0], 'beat_end': batch_beats[-1],
                                 'attempt': attempt + 1, 'attempt_total': retry_count + 1,
                                 'elapsed_seconds': round(pp.time.time() - started, 2),
@@ -706,7 +727,7 @@ Instructions:
             # and falls back to per-beat retry below, exactly what that path exists for.
             try:
                 resp = _request_batch()
-                batch_secs = pp._extract_marked(resp, markers)
+                return pp._extract_marked(resp, markers)
             except pp.GenerationCancelled:
                 raise
             except (NameError, AttributeError, TypeError, ImportError, KeyError, IndexError) as e:
@@ -716,7 +737,9 @@ Instructions:
                 ) from e
             except Exception as e:
                 if sys.stdout:
-                    print(f"[DEBUG] Batch beat generation call failed ({e}); falling back to individual retries for all {len(beats_to_generate)} beat(s).")
+                    print(f"[DEBUG] Batch window {batch_index}/{len(batch_windows)} call failed ({e}); "
+                          f"falling back to individual retries for beat(s) {batch_beats}.")
+                return {}
 
         # One beat at a time: try to resolve it from the batch response first, otherwise
         # fall back to an individual retry — and commit (compiled_images/videos, beat_ready,
@@ -726,6 +749,11 @@ Instructions:
         # every EARLIER beat's already-valid result safely checkpointed, matching the
         # granularity the resume mechanism has always guaranteed.
         for i in beats_to_generate:
+            # 走到一个窗口的首拍才发这一窗的批量请求（见 window_starts 的说明）。
+            if i in window_starts:
+                _window, _window_index = window_starts[i]
+                batch_secs = _run_batch_window(_window, _window_index)
+
             if on_progress:
                 on_progress('batch', {'current': i, 'total': total_beats})
 
@@ -742,7 +770,8 @@ Instructions:
                     _pkt = contract.get('packet') or packet
                     v_p, i_p = self.apply_proactive_fixes(
                         i, v_p, i_p, _pkt, mode, contract['is_last'], contract['is_threshold_or_reveal'],
-                        beat=contract['beat'], config=config, family=contract['family'])
+                        beat=contract['beat'], config=config, family=contract['family'],
+                        beat_ladder=beat_ladder)
                     # 2026-07-30：声明式切入拍的 VIDEO 不再被占位声明覆盖（同单拍通路的注释）。
                     prev_v = compiled_videos.get(i - 1) if i > 1 else None
                     prev_i = compiled_images.get(i) if i > 1 else None
@@ -791,98 +820,10 @@ Instructions:
                     v_p, reworked = self.rework_structural_video_beat(config, i, v_p, structural, packet, beat=contract['beat'])
                     if sys.stdout:
                         print(f"[DIRECT] Batch beat {i} 回炉{'成功，已采用重写稿' if reworked else '未通过，保留原稿（仅留痕）'}")
-                image_similar, style_errs = pp.split_image_similarity_errors(style_errs)
-                image_reworked = None
-                if image_similar:
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} IMAGE 相似度瑕疵，定向回炉一轮: {image_similar}")
-                    i_p, image_reworked = pp.rework_similar_image_beat(config, i, i_p, image_similar, packet, prev_image=prev_i, beat=contract['beat'])
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} IMAGE 回炉{'成功，已采用重写稿' if image_reworked else '未通过，保留原稿（仅留痕）'}")
-                    style_errs = style_errs + image_similar
-                milestone_video_errs = pp.check_milestone_video_prompt(v_p, contract['beat'])
-                milestone_image_errs = pp.check_milestone_image_prompt(i_p, contract['beat'])
-                if milestone_video_errs or milestone_image_errs:
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 显著里程碑骨架缺失，成对回炉一轮: "
-                              f"VIDEO={milestone_video_errs}; IMAGE={milestone_image_errs}")
-                    v_p, i_p, milestone_reworked = pp.rework_milestone_prompt_pair(
-                        config, i, v_p, i_p, contract['beat'], milestone_video_errs, milestone_image_errs)
-                    structural = structural + milestone_video_errs
-                    style_errs = style_errs + milestone_image_errs
-                    reworked = milestone_reworked if reworked is None else (reworked or milestone_reworked)
-                    image_reworked = milestone_reworked if image_reworked is None else (image_reworked or milestone_reworked)
-                content_errs = pp.check_image_realizes_traces(i_p, parsed_traces)
-                if content_errs:
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 图文内容脱节，定向回炉一轮: {content_errs}")
-                    i_p, content_reworked = pp.rework_missing_content_image_beat(config, i, i_p, parsed_traces, beat=contract['beat'])
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 图文内容回炉{'成功，已采用重写稿' if content_reworked else '未通过，保留原稿（仅留痕）'}")
-                    style_errs = style_errs + content_errs
-                    image_reworked = content_reworked if image_reworked is None else (image_reworked or content_reworked)
-                # 卡片工序（节拍简介）在成片里的收口：这拍认领的工序必须真的写进 IMAGE
-                # 回炉前的缺失编号先留一份（见上面单拍路径的同款说明）
-                outline_missing_before = pp.outline_missing_indices(i_p, contract['beat'])
-                outline_errs = pp.check_outline_delivery_realized(i_p, contract['beat'])
-                if outline_errs:
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 卡片工序未交付，定向回炉一轮: {outline_errs}")
-                    i_p, outline_reworked = pp.rework_missing_outline_delivery_beat(config, i, i_p, beat=contract['beat'])
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 卡片工序回炉{'成功，已采用重写稿' if outline_reworked else '未通过，保留原稿（仅留痕）'}")
-                    style_errs = style_errs + outline_errs
-                    image_reworked = outline_reworked if image_reworked is None else (image_reworked or outline_reworked)
-                wording_errs = pp.check_stage_scope_wording(i_p, contract['stage_scope'])
-                if wording_errs:
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} STAGE SCOPE 措辞瑕疵，定向回炉一轮: {wording_errs}")
-                    i_p, wording_reworked = pp.rework_stage_scope_wording_beat(
-                        config, i, i_p, wording_errs, contract['stage_scope'], beat=contract['beat'])
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} STAGE SCOPE 回炉{'成功，已采用重写稿' if wording_reworked else '未通过，保留原稿（仅留痕）'}")
-                    style_errs = style_errs + wording_errs
-                    # 相似度回炉和 stage_scope 措辞回炉都改写同一个 IMAGE 正文，合并成一个
-                    # image_reworked 信号喂给 record_beat_audit——否则措辞回炉真实成功了
-                    # 审核报告也会显示"仅留痕"。
-                    image_reworked = wording_reworked if image_reworked is None else (image_reworked or wording_reworked)
-                anchor_errs = pp.check_signature_anchor_realized(i_p, contract['beat'])
-                if anchor_errs:
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 招牌反差点缺失，定向回炉一轮: {anchor_errs}")
-                    i_p, anchor_reworked = pp.rework_missing_anchor_beat(config, i, i_p, anchor_errs, beat=contract['beat'])
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 招牌反差点回炉{'成功，已采用重写稿' if anchor_reworked else '未通过，保留原稿（仅留痕）'}")
-                    style_errs = style_errs + anchor_errs
-                    image_reworked = anchor_reworked if image_reworked is None else (image_reworked or anchor_reworked)
-                placeholder_errs = pp.check_image_decay_placeholder(i_p)
-                if placeholder_errs:
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} sterile占位句，定向回炉一轮: {placeholder_errs}")
-                    i_p, placeholder_reworked = pp.rework_decay_placeholder_beat(config, i, i_p, placeholder_errs, beat=contract['beat'])
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} sterile占位句回炉{'成功，已采用重写稿' if placeholder_reworked else '未通过，保留原稿（仅留痕）'}")
-                    style_errs = style_errs + placeholder_errs
-                    image_reworked = placeholder_reworked if image_reworked is None else (image_reworked or placeholder_reworked)
-                decay_errs = pp.check_first_interior_reveal_decay(i_p, contract['is_first_interior_reveal'])
-                if decay_errs:
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 首现衰败措辞缺失，定向回炉一轮: {decay_errs}")
-                    i_p, decay_reworked = pp.rework_first_interior_reveal_decay_beat(config, i, i_p, decay_errs, beat=contract['beat'])
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 首现衰败措辞回炉{'成功，已采用重写稿' if decay_reworked else '未通过，保留原稿（仅留痕）'}")
-                    style_errs = style_errs + decay_errs
-                    image_reworked = decay_reworked if image_reworked is None else (image_reworked or decay_reworked)
-                envelope_errs = pp.check_envelope_seal_regression(i_p, i, beat_ladder, family=contract['family'])
-                if envelope_errs:
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 包络体状态倒退（已封构件又写成敞开），定向回炉一轮: {envelope_errs}")
-                    i_p, envelope_reworked = pp.rework_envelope_seal_regression_beat(
-                        config, i, i_p, envelope_errs, beat=contract['beat'], beat_ladder=beat_ladder)
-                    if sys.stdout:
-                        print(f"[DIRECT] Batch beat {i} 包络体状态倒退回炉{'成功，已采用重写稿' if envelope_reworked else '未通过，保留原稿（仅留痕）'}")
-                    style_errs = style_errs + envelope_errs
-                    image_reworked = envelope_reworked if image_reworked is None else (image_reworked or envelope_reworked)
+                (v_p, i_p, structural, style_errs, reworked, image_reworked,
+                 outline_missing_before) = self.repair_beat_prompts(
+                    config, i, v_p, i_p, contract, packet, beat_ladder, parsed_traces,
+                    prev_i, structural, style_errs, reworked, f'Batch beat {i}')
                 # 回读校验：修没修以最终文本为准（见 pp.reverify_beat_repairs）
                 residual = pp.reverify_beat_repairs(
                     i, v_p, i_p, contract['beat'], parsed_traces=parsed_traces,

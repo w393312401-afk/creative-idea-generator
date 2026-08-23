@@ -46,7 +46,7 @@ fi
 
 # ─── 工具函数 ─────────────────────────────────────────────
 get_pid_on_ports() {
-    lsof -t -i:$PORT -i:$ALT_PORT 2>/dev/null
+    lsof -t -sTCP:LISTEN -i:$PORT -i:$ALT_PORT 2>/dev/null | tr '\n' ' ' | sed 's/ *$//'
 }
 
 open_url() {
@@ -62,6 +62,72 @@ open_url() {
     else
         echo "请在浏览器中打开 $URL"
     fi
+}
+
+close_terminal() {
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        CURRENT_TTY=$(tty 2>/dev/null || echo "")
+        nohup osascript - "$CURRENT_TTY" <<'APPLESCRIPT' </dev/null >/dev/null 2>&1 &
+on run argv
+    set myTty to ""
+    if (count of argv) > 0 then
+        set myTty to item 1 of argv
+    end if
+    
+    repeat 20 times
+        delay 0.3
+        set closedAny to false
+        
+        try
+            tell application "Terminal"
+                repeat with w in (every window)
+                    repeat with t in (every tab of w)
+                        if (myTty is not "" and tty of t is myTty) then
+                            if (count of tabs of w) > 1 then
+                                close t saving no
+                            else
+                                close w saving no
+                            end if
+                            set closedAny to true
+                            exit repeat
+                        end if
+                    end repeat
+                    if closedAny then exit repeat
+                end repeat
+                
+                if not closedAny and myTty is "" and (count of windows) > 0 then
+                    close window 1 saving no
+                    set closedAny to true
+                end if
+            end tell
+        end try
+        
+        if not closedAny then
+            try
+                tell application "iTerm"
+                    if (count of windows) > 0 then
+                        close current window
+                        set closedAny to true
+                    end if
+                end tell
+            end try
+            try
+                tell application "iTerm2"
+                    if (count of windows) > 0 then
+                        close current window
+                        set closedAny to true
+                    end if
+                end tell
+            end try
+        end if
+        
+        if closedAny then exit repeat
+    end repeat
+end run
+APPLESCRIPT
+        disown $! 2>/dev/null || true
+    fi
+    exit 0
 }
 
 # ─── 启动服务 ─────────────────────────────────────────────
@@ -117,6 +183,7 @@ start_service() {
     # 这一路兜的是 server_common 装好日志流之前的输出——依赖缺失、语法错误、
     # 端口占用这类连日志系统都没来得及初始化就死掉的情况。
     nohup $PYTHON_CMD server.py >> server.log 2>&1 &
+    disown 2>/dev/null || true
 
     # 等待端口就绪（最多 ~28 秒，启动期可能有 manifest 迁移）
     echo "[SPARK] 等待服务绑定端口 $PORT ..."
@@ -132,8 +199,9 @@ start_service() {
     if [ $SUCCESS -eq 1 ]; then
         open_url
         echo "[SPARK] 服务已启动，已为您打开网页 http://127.0.0.1:$PORT/"
-        echo ""
-        sleep 3
+        echo "[SPARK] 正在自动关闭终端窗口..."
+        sleep 1
+        close_terminal
     else
         echo ""
         echo "[错误] 主服务在 28 秒内未能监听端口 $PORT，启动失败。"
@@ -148,6 +216,7 @@ start_service() {
         echo "请检查以上错误信息，或联系支持。"
         echo ""
         read -p "按回车键退出..." _
+        close_terminal
     fi
 }
 
@@ -160,7 +229,7 @@ stop_service() {
     fi
     rm -f server.pid 2>/dev/null
     echo "[SPARK] 已停止。"
-    sleep 3
+    sleep 1
 }
 
 # ─── 主流程 ───────────────────────────────────────────────
@@ -177,7 +246,7 @@ if [ -n "$RUNNING_PIDS" ]; then
     echo ""
     echo "  [1] 停止服务"
     echo "  [2] 重启服务"
-    echo "  [3] 再次打开网页"
+    echo "  [3] 再次打开网页并退出"
     echo "  [4] 退出"
     echo ""
     read -p "请选择 [1-4] (直接回车默认退出): " choice
@@ -185,6 +254,7 @@ if [ -n "$RUNNING_PIDS" ]; then
     case $choice in
         1)
             stop_service
+            close_terminal
             ;;
         2)
             stop_service
@@ -193,9 +263,10 @@ if [ -n "$RUNNING_PIDS" ]; then
             ;;
         3)
             open_url
+            close_terminal
             ;;
         *)
-            exit 0
+            close_terminal
             ;;
     esac
 else

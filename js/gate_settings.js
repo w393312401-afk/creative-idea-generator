@@ -34,22 +34,83 @@ function gateSettingCurrentValue(spec) {
     return gateSettingServerValue(spec);
 }
 
-const GATE_SECTION_LABELS = {
-    prompt: '提示词编排阶段',
-    frame: '帧渲染阶段',
-    video: '视频阶段',
-    env: '环境与兜底',
+let gateSettingsSearchQuery = '';
+let gateSettingsActiveFilter = 'all';
+let gateSettingsToolbarBound = false;
+
+const GATE_SECTION_META = {
+    prompt: {
+        title: '阶段 1 · 提示词生成与状态契约门禁',
+        desc: '母案提示词交付生图前的单拍变化硬校验（before/delta/after）及高风险拍拆分',
+        icon: '📝',
+        badge: '提示词阶段',
+    },
+    frame: {
+        title: '阶段 2 · 关键帧图像渲染与连续性门禁',
+        desc: '关键帧生图阶段的视角防漂移检测、桥接帧惯性防固化与自动重试策略',
+        icon: '🖼️',
+        badge: '帧生图阶段',
+    },
+    video: {
+        title: '阶段 3 · 视频生成、画面差量优化与质检门禁',
+        desc: 'I2V 生成前真实画面差量智能重写（核心防跳变）、首尾锚点校验与 VLM 过程复审',
+        icon: '🎬',
+        badge: '视频生成阶段',
+    },
+    env: {
+        title: '全局 · 运行环境与容错降级策略',
+        desc: '底层 AI 网关、模型或本地工具异常时的全局故障安全与降级放行策略',
+        icon: '🛡️',
+        badge: '全局兜底',
+    },
+};
+
+const GATE_KEY_META = {
+    optimizeVideoPromptsBeforeGen: { icon: '✨', badge: '🔥 核心防跳变' },
+    videoAnchorVerify: { icon: '🔒', badge: '⚡ 零成本防串片' },
+    videoProcessVlmReview: { icon: '🤖', badge: 'VLM 过程复审' },
+    qaGateLevel: { icon: '🎯', badge: '质检总闸' },
+    anchorInertiaAutoRetry: { icon: '🪄', badge: '桥接帧增强' },
+    frameContinuityMode: { icon: '📐', badge: '机位锁死' },
+    frameContinuityMaxRetries: { icon: '🔁', badge: '重试上限' },
+    strictFrameStateContract: { icon: '📋', badge: '状态契约' },
+    autoSplitHighRiskBeats: { icon: '✂️', badge: '高风险拆拍' },
+    strictGates: { icon: '🚨', badge: 'Fail-Closed' },
 };
 
 function gateSettingControl(spec, current) {
     const wrap = document.createElement('div');
-    wrap.className = 'form-group settings-field gate-setting-field';
+    wrap.className = 'gate-setting-card';
     wrap.dataset.gateKey = spec.key;
+    wrap.dataset.section = spec.section || 'env';
+
+    const headerRow = document.createElement('div');
+    headerRow.className = 'gate-setting-header-row';
+
+    const labelWrap = document.createElement('div');
+    labelWrap.className = 'gate-setting-label-wrap';
+
+    const meta = GATE_KEY_META[spec.key] || {};
+    const iconSpan = document.createElement('span');
+    iconSpan.textContent = meta.icon || '⚙️';
+    labelWrap.appendChild(iconSpan);
 
     const label = document.createElement('label');
+    label.className = 'gate-setting-label';
     label.setAttribute('for', `gate-setting-${spec.key}`);
     label.textContent = spec.label || spec.key;
-    wrap.appendChild(label);
+    labelWrap.appendChild(label);
+
+    if (meta.badge) {
+        const pill = document.createElement('span');
+        pill.className = 'gate-setting-pill';
+        pill.textContent = meta.badge;
+        labelWrap.appendChild(pill);
+    }
+    headerRow.appendChild(labelWrap);
+
+    const controlWrap = document.createElement('div');
+    controlWrap.className = 'gate-setting-control-wrap';
 
     let input;
     if (spec.type === 'bool') {
@@ -78,22 +139,20 @@ function gateSettingControl(spec, current) {
         input.value = String(current);
     }
     input.id = `gate-setting-${spec.key}`;
-    wrap.appendChild(input);
+    controlWrap.appendChild(input);
+    headerRow.appendChild(controlWrap);
+    wrap.appendChild(headerRow);
 
     if (spec.hint) {
         const hint = document.createElement('small');
-        hint.className = 'settings-hint';
-        // LLM/服务端文案一律 textContent，不走 innerHTML
+        hint.className = 'gate-setting-hint';
         hint.textContent = spec.hint;
         wrap.appendChild(hint);
     }
 
-    // 服务端 server_config.json 里钉死了这一项：浏览器改的值仍然会随请求带过去
-    // 并覆盖（effective_config 里请求 config 优先），但要让用户知道服务端有个
-    // 不一样的基线值——否则"我没改过为什么行为不一样"永远查不出来。
     if (spec.server_pinned) {
         const pinned = document.createElement('small');
-        pinned.className = 'settings-hint gate-setting-pinned';
+        pinned.className = 'gate-setting-hint gate-setting-pinned';
         pinned.textContent = `⚙️ 服务端 server_config.json 已钉死本项为 `
             + `${String(gateSettingServerValue(spec))}；此处的值只对本浏览器发起的生成生效。`;
         wrap.appendChild(pinned);
@@ -125,9 +184,50 @@ function applyGateSettingFromControl(spec, input) {
     }
 }
 
+function _initGateSettingsToolbar() {
+    if (gateSettingsToolbarBound) return;
+    const searchInput = document.getElementById('gate-settings-search');
+    const clearBtn = document.getElementById('gate-settings-search-clear');
+    const chipsContainer = document.getElementById('gate-filter-chips');
+
+    if (searchInput) {
+        searchInput.addEventListener('input', () => {
+            gateSettingsSearchQuery = searchInput.value.trim().toLowerCase();
+            if (clearBtn) clearBtn.style.display = gateSettingsSearchQuery ? 'inline-block' : 'none';
+            renderGateSettingsPanel();
+        });
+    }
+
+    if (clearBtn && searchInput) {
+        clearBtn.addEventListener('click', () => {
+            searchInput.value = '';
+            gateSettingsSearchQuery = '';
+            clearBtn.style.display = 'none';
+            renderGateSettingsPanel();
+            searchInput.focus();
+        });
+    }
+
+    if (chipsContainer) {
+        chipsContainer.addEventListener('click', (e) => {
+            const btn = e.target.closest('.gate-filter-chip');
+            if (!btn) return;
+            const filter = btn.dataset.filter || 'all';
+            gateSettingsActiveFilter = filter;
+            chipsContainer.querySelectorAll('.gate-filter-chip').forEach(c => c.classList.remove('active'));
+            btn.classList.add('active');
+            renderGateSettingsPanel();
+        });
+    }
+
+    gateSettingsToolbarBound = true;
+}
+
 function renderGateSettingsPanel() {
     const host = document.getElementById('gate-settings-list');
     if (!host) return;
+    _initGateSettingsToolbar();
+
     host.textContent = '';
     const specs = window.GATE_SETTINGS_SPEC;
     if (!Array.isArray(specs) || !specs.length) {
@@ -139,24 +239,140 @@ function renderGateSettingsPanel() {
         host.appendChild(err);
         return;
     }
+
     const bySection = new Map();
     for (const spec of specs) {
         const section = spec.section || 'env';
         if (!bySection.has(section)) bySection.set(section, []);
         bySection.get(section).push(spec);
     }
+
+    const query = gateSettingsSearchQuery;
+    const filter = gateSettingsActiveFilter;
+    let totalRendered = 0;
+
     // 按生成链路的时间顺序分组显示：编排 → 渲帧 → 出片 → 环境
     for (const section of ['prompt', 'frame', 'video', 'env']) {
+        if (filter !== 'all' && filter !== section) continue;
+
         const items = bySection.get(section);
         if (!items || !items.length) continue;
-        const title = document.createElement('h5');
-        title.className = 'gate-settings-group-title';
-        title.textContent = GATE_SECTION_LABELS[section] || section;
-        host.appendChild(title);
-        for (const spec of items) {
-            host.appendChild(gateSettingControl(spec, gateSettingCurrentValue(spec)));
+
+        const secMeta = GATE_SECTION_META[section] || { title: section, desc: '', icon: '🛡️', badge: section };
+        
+        // 过滤匹配的项
+        const matchedItems = items.filter(spec => {
+            if (!query) return true;
+            const text = `${spec.key} ${spec.label || ''} ${spec.hint || ''} ${secMeta.title} ${secMeta.desc}`.toLowerCase();
+            return text.includes(query);
+        });
+
+        if (!matchedItems.length) continue;
+
+        totalRendered += matchedItems.length;
+
+        const group = document.createElement('div');
+        group.className = 'gate-settings-group';
+
+        const header = document.createElement('div');
+        header.className = 'gate-settings-group-header';
+
+        const titleRow = document.createElement('div');
+        titleRow.className = 'gate-settings-group-title-row';
+
+        const titleEl = document.createElement('h5');
+        titleEl.className = 'gate-settings-group-title';
+        titleEl.textContent = secMeta.title;
+        titleRow.appendChild(titleEl);
+
+        const badgeEl = document.createElement('span');
+        badgeEl.className = 'gate-settings-group-badge';
+        badgeEl.textContent = `${matchedItems.length} 项开关`;
+        titleRow.appendChild(badgeEl);
+
+        header.appendChild(titleRow);
+
+        if (secMeta.desc) {
+            const descEl = document.createElement('p');
+            descEl.className = 'gate-settings-group-desc';
+            descEl.textContent = secMeta.desc;
+            header.appendChild(descEl);
+        }
+
+        group.appendChild(header);
+
+        for (const spec of matchedItems) {
+            group.appendChild(gateSettingControl(spec, gateSettingCurrentValue(spec)));
+        }
+
+        host.appendChild(group);
+    }
+
+    if (totalRendered === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'gate-empty-search';
+        empty.innerHTML = `<p>🔍 未找到与 "<b>${query}</b>" 匹配的门禁开关</p>`
+            + `<button type="button" class="text-btn" id="gate-reset-search-btn">清空搜索条件</button>`;
+        host.appendChild(empty);
+
+        const resetBtn = document.getElementById('gate-reset-search-btn');
+        if (resetBtn) {
+            resetBtn.addEventListener('click', () => {
+                const searchInput = document.getElementById('gate-settings-search');
+                if (searchInput) searchInput.value = '';
+                gateSettingsSearchQuery = '';
+                gateSettingsActiveFilter = 'all';
+                const chipsContainer = document.getElementById('gate-filter-chips');
+                if (chipsContainer) {
+                    chipsContainer.querySelectorAll('.gate-filter-chip').forEach(c => {
+                        c.classList.toggle('active', c.dataset.filter === 'all');
+                    });
+                }
+                const clearBtn = document.getElementById('gate-settings-search-clear');
+                if (clearBtn) clearBtn.style.display = 'none';
+                renderGateSettingsPanel();
+            });
         }
     }
+}
+
+/* 快速定位并高亮指定门禁项（如从控制台或快捷按钮调用） */
+function openSettingsToGate(gateKey) {
+    if (typeof openSettingsModal === 'function') {
+        openSettingsModal();
+    } else {
+        const modal = document.getElementById('settings-modal');
+        if (modal) modal.style.display = 'flex';
+    }
+
+    // 切换到「质量门禁」标签页
+    const navBtn = document.querySelector('#settings-nav [data-section="gates"]');
+    if (navBtn) navBtn.click();
+
+    // 清空搜索与过滤
+    gateSettingsSearchQuery = '';
+    gateSettingsActiveFilter = 'all';
+    const searchInput = document.getElementById('gate-settings-search');
+    if (searchInput) searchInput.value = '';
+    const chips = document.getElementById('gate-filter-chips');
+    if (chips) {
+        chips.querySelectorAll('.gate-filter-chip').forEach(c => {
+            c.classList.toggle('active', c.dataset.filter === 'all');
+        });
+    }
+
+    renderGateSettingsPanel();
+
+    setTimeout(() => {
+        const target = document.querySelector(`.gate-setting-card[data-gate-key="${gateKey}"]`);
+        if (target) {
+            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            target.classList.remove('gate-setting-highlight');
+            // 触发重绘以重启动画
+            void target.offsetWidth;
+            target.classList.add('gate-setting-highlight');
+        }
+    }, 120);
 }
 
 /* 恢复默认：把本地存的门禁项整个删掉，让它们退回服务端下发的生效值——
@@ -168,9 +384,14 @@ function resetGateSettings() {
     renderGateSettingsPanel();
 }
 
+if (typeof window !== 'undefined') {
+    window.openSettingsToGate = openSettingsToGate;
+}
+
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         gateSettingCurrentValue, gateSettingServerValue,
         applyGateSettingFromControl, renderGateSettingsPanel, resetGateSettings,
+        openSettingsToGate,
     };
 }

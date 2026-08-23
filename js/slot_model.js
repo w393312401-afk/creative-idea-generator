@@ -123,7 +123,7 @@ const FRAME_BADGE_DEFS = [
         hover: f => ` (降档通道产出: ${f.degraded_reason || ''})`,
     },
     {
-        id: 'candidate-selection', text: '4选1', cls: 'candidate-selection-badge',
+        id: 'candidate-selection', text: '4选1', cls: 'candidate-selection-badge', isIssue: false,
         test: f => !!(f && f.candidates && f.candidates.length > 1),
         tip: f => `4选1智能生成：AI已鉴别优选候选 #${f.chosen_candidate_index || 1}。点击卡片可查看4张候选对比并手动切换`,
         hover: f => ` (4选1智能生成: 已优选候选 #${f.chosen_candidate_index || 1})`,
@@ -132,19 +132,19 @@ const FRAME_BADGE_DEFS = [
 
 const VIDEO_BADGE_DEFS = [
     {
-        id: 'prompt-dirty', text: '提示词已改', cls: 'stale-badge',
+        id: 'prompt-dirty', text: '提示词已改', cls: 'stale-badge', isIssue: true,
         test: v => !!(v && v.prompt_dirty),
         tip: () => '这一段的视频提示词已被手动改写，片段仍是按旧提示词生成的，建议重跑',
         hover: () => ' (提示词已手动改写，片段尚未按新提示词重跑)',
     },
     {
-        id: 'manual-upload', text: '手动', cls: 'degraded-badge',
+        id: 'manual-upload', text: '手动', cls: 'manual-flagged-badge', isIssue: false,
         test: v => v.source === 'manual_upload',
         tip: () => '此片段由用户手动上传覆盖，非本地 UI 自动化产出',
         hover: () => ' (人工上传的本地视频)',
     },
     {
-        id: 'swapped', text: '换位', cls: 'degraded-badge',
+        id: 'swapped', text: '换位', cls: 'manual-flagged-badge', isIssue: false,
         test: v => slotSwappedFrom(v, 'swapped_from_slot') !== null,
         tip: v => `此片段由人工从 VID ${padSlot(v.swapped_from_slot)} 拖过来，`
             + '首尾帧未按本槽位锚点重新校验',
@@ -180,6 +180,7 @@ function collectBadges(defs, entry) {
         text: d.text,
         cls: d.cls,
         tip: d.tip(entry) || '',
+        isIssue: d.isIssue !== false,
     }));
 }
 
@@ -459,7 +460,7 @@ function summarizeSlotStates(states) {
         ready: list.filter(s => s.kind === 'ready').length,
         pending: list.filter(s => s.kind === 'pending').length,
         missing: list.filter(s => s.kind === 'missing' || s.kind === 'failed').length,
-        flagged: list.filter(s => (s.badges || []).length > 0).length,
+        flagged: list.filter(s => (s.badges || []).some(b => b.isIssue !== false)).length,
     };
 }
 

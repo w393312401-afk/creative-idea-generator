@@ -26,7 +26,10 @@ from prompt_pipeline.composers import omni as omni_mod
 
 
 BASE_CONFIG = {'videoModel': 'Veo 3.1'}
-OMNI_CONFIG = {'videoModel': 'Omni Flash'}
+# videoDuration 必须一起钉死：不给它，clip_duration() 会回落到开发机 server_config.json
+# 里的那一档（用户在设置页随时改得动），镜头梯就跟着从四镜变三镜，而下面按默认四镜梯
+# 断言的用例会当场变红。test_omni_timeline.py 早就为同一件事留过一条注释。
+OMNI_CONFIG = {'videoModel': 'Omni Flash', 'videoDuration': 10}
 
 # 两个 profile 共用的 IMAGE 稿——IMAGE 段不随 profile 变化，测试要能证明这一点。
 IMAGE_DRAFT = (
@@ -415,9 +418,13 @@ class TestOmniSystemPrompt(unittest.TestCase):
     def test_override_block_is_appended_not_replacing_the_image_rules(self):
         """omni 不复制一份 IMAGE 契约——base 那份必须原样还在，override 只追加在后面。"""
         packet = {'camera_dna': 'static shot', 'object_ledger': []}
+        # 片长要钉住：镜头梯（进而下面那几个镜头名）随它变，不钉就会跟着开发机的
+        # server_config.json 漂——六秒档只有三镜，extreme close-up 那一行根本不会出现。
+        omni_composer = composers.get_composer('omni')
+        omni_composer.begin_run(dict(OMNI_CONFIG), {})
         with patch.object(pp, 'load_reference_file', return_value=''):
             base_prompt = composers.get_composer('base').batch_system_prompt({}, packet, '', '')
-            omni_prompt = composers.get_composer('omni').batch_system_prompt({}, packet, '', '')
+            omni_prompt = omni_composer.batch_system_prompt(dict(OMNI_CONFIG), packet, '', '')
         self.assertTrue(omni_prompt.startswith(base_prompt))
         self.assertIn('OMNI VIDEO OVERRIDE', omni_prompt)
         for rung in ('establishing long shot', 'full shot', 'medium shot', 'close-up',

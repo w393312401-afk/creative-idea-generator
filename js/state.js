@@ -50,7 +50,7 @@ const DEFAULT_CONFIG = {
     // 只有用户显式改过的门禁项才会出现在 config 里并随请求带走。
     frameContinuityLocalEdit: 'off',
     strictPromptPipelineV2: true,
-    composeBatchSize: 3,
+    composeBatchSize: 5,
     composeRequestTimeoutSeconds: 120,
     composeBatchRetryCount: 1,
     composeNoProgressTimeoutSeconds: 180,

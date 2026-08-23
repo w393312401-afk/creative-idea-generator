@@ -768,9 +768,9 @@ class _ChunkRunner:
                 if self._run_round(remaining):
                     break
             except _CreditExhaustedError as e:
-                log(f"🧊 捕获到账号积分耗尽: {e}，立即换号重试剩余任务...", "GoogleFX-Video")
+                log(f"🧊 捕获到账号积分不足: {e}，立即换号重试剩余任务...", "GoogleFX-Video")
                 try:
-                    self._cooldown_and_switch_credit_exhausted()
+                    self._cooldown_and_switch_credit_exhausted(reason=str(e))
                 except Exception as switch_err:
                     log(f"⛔ 积分耗尽换号终止: {switch_err}", "GoogleFX-Video")
                     break
@@ -1409,8 +1409,9 @@ class _ChunkRunner:
             except (_IPBlockedError, _CreditExhaustedError, ConnectionError):
                 raise
             except Exception as submit_err:
-                if "INSUFFICIENT_CREDITS" in str(submit_err) or is_credit_exhausted_message(str(submit_err)):
-                    raise _CreditExhaustedError(f"Credit exhausted during submit: {submit_err}")
+                page_credit_err = detect_page_credit_exhaustion(page)
+                if page_credit_err or "INSUFFICIENT_CREDITS" in str(submit_err) or is_credit_exhausted_message(str(submit_err)):
+                    raise _CreditExhaustedError(page_credit_err or f"Credit exhausted during submit: {submit_err}")
                 if "TargetClosedError" in type(submit_err).__name__ or "Target page" in str(submit_err):
                     # 浏览器页面意外关闭：不是这一个任务的问题，交给 run() 外层的
                     # TargetClosedError 恢复逻辑重建连接、整轮重跑。
@@ -1634,19 +1635,26 @@ class _ChunkRunner:
                 "retry": self.ip_retry,
             })
 
-    def _cooldown_and_switch_credit_exhausted(self):
-        """检测到积分耗尽：标记当前账号 quota_exhausted，切换号池下一个可用账号。"""
+    def _cooldown_and_switch_credit_exhausted(self, reason=None):
+        """检测到积分不足/耗尽：标记当前账号 quota_exhausted，切换号池下一个可用账号。
+
+        reason 里带着页面实测读数时按实测值写回号池，而不是一律记成 0——
+        "还剩 10 分、低于阈值" 和 "余额真的是 0" 在控制台要能分得出来。
+        """
         from ..config import get_runtime_default_user_id
         from ..utils.account_pool import switch_to_next_account, AccountPool
+        from .google_fx_credit import measured_credit_from_reason
 
+        measured = measured_credit_from_reason(reason)
         current = (get_runtime_default_user_id() or "").strip()
         if current:
             self.tried_accounts.add(current)
             try:
-                AccountPool().mark_exhausted(current)
-                log(f"🧊 账号 {current} 积分已耗尽，已在账号池中标记为 quota_exhausted 冷却 24 小时", "GoogleFX-Video")
+                AccountPool().mark_exhausted(current, credit=measured)
+                log(f"🧊 账号 {current} 积分不足（实测 {measured if measured is not None else '未知'}），"
+                    f"已在账号池中标记为 quota_exhausted 冷却 24 小时", "GoogleFX-Video")
             except Exception as pool_err:
-                log(f"⚠️ 标记账号 {current} 额度耗尽失败: {pool_err}", "GoogleFX-Video")
+                log(f"⚠️ 标记账号 {current} 额度不足失败: {pool_err}", "GoogleFX-Video")
 
         chosen = switch_to_next_account(exclude=self.tried_accounts)
         if chosen:

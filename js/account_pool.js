@@ -186,6 +186,9 @@ function renderAccountPoolList() {
             // 区分"登录失效等人工处理"（几小时短冷却）和"积分耗尽"（24h长冷却），
             // 不然用户看到冷却中会先怀疑是不是又没额度了。
             coolBadge = account.cooldown_reason === 'login_required' ? ' · 🔒 登录失效冷却中' : ' · 🧊 额度冷却中';
+        } else if (account.disabled_reason === 'zero_credit'
+                   || (account.credit != null && account.credit < (account.min_credit ?? 15))) {
+            coolBadge = ' · 🧊 积分不足（已自动停用）';
         }
         const creditText = account.credit == null ? '未探测'
             : `${account.credit}${account.credit_trustworthy === false ? '（缓存，不用于选号）' : ''}`;

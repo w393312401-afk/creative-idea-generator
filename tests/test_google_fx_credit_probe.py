@@ -42,10 +42,37 @@ class _Page:
 def test_credit_parser_accepts_balance_lines_only():
     assert credit._extract_credit_number('1050 Google Flow credits') == 1050
     assert credit._extract_credit_number('1,050 credits remaining') == 1050
+    assert credit._extract_credit_number('0 Google Flow credits') == 0
+    assert credit._extract_credit_number('0 credits') == 0
     assert credit._extract_credit_number('剩余 88 积分') == 88
     assert credit._extract_credit_number('860 Google Flow 点数') == 860
     assert credit._extract_credit_number('Pro plan: 1,000 monthly Google Flow credits') is None
     assert credit._extract_credit_number('Daily Bonus: Enjoy 50 extra credits') is None
+
+
+def test_is_credit_exhausted_message():
+    # 英文真实/变体耗尽短语
+    assert credit.is_credit_exhausted_message("0 Google Flow credits") is True
+    assert credit.is_credit_exhausted_message("0 AI credits") is True
+    assert credit.is_credit_exhausted_message("Get AI credits") is True
+    assert credit.is_credit_exhausted_message("Used when you're out of Google Flow credits") is True
+    assert credit.is_credit_exhausted_message("You have 0 credits left") is True
+    assert credit.is_credit_exhausted_message("Insufficient Google Flow credits") is True
+    assert credit.is_credit_exhausted_message("Run out of Flow credits") is True
+    assert credit.is_credit_exhausted_message("Not enough credits for this generation") is True
+    assert credit.is_credit_exhausted_message("Credits: 0") is True
+    assert credit.is_credit_exhausted_message("Google Flow credits: 0") is True
+    # 中文耗尽短语
+    assert credit.is_credit_exhausted_message("积分余额为 0") is True
+    assert credit.is_credit_exhausted_message("当前账号没有足够的积分") is True
+    assert credit.is_credit_exhausted_message("积分已用完，请充值") is True
+    assert credit.is_credit_exhausted_message("0 积分") is True
+    assert credit.is_credit_exhausted_message("无可用积分") is True
+    assert credit.is_credit_exhausted_message("额度耗尽") is True
+    # 正常带额度/宣传文案不应误判
+    assert credit.is_credit_exhausted_message("100 Google Flow credits") is False
+    assert credit.is_credit_exhausted_message("1500 monthly Google Flow credits") is False
+    assert credit.is_credit_exhausted_message("Generating video...") is False
 
 
 def test_menu_scan_waits_for_two_stable_reads(monkeypatch):

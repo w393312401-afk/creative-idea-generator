@@ -259,6 +259,14 @@ details[open] > .replica-jobs-summary {
     font-weight: 600;
 }
 
+/* 原片这一拍切过刀（observed_shot_count > 1）。它决定多镜头链路给这一拍排三镜还是
+   四镜，所以要能一眼从「原片一镜」那些淡 chip 里挑出来。 */
+.replica-chip-multishot {
+    background: rgba(167, 139, 250, 0.18);
+    color: #a78bfa;
+    font-weight: 600;
+}
+
 .replica-chip-cost {
     background: rgba(251, 191, 36, 0.16);
     color: #fbbf24;
@@ -723,6 +731,40 @@ details[open] > .replica-jobs-summary {
     font-size: 12px;
     line-height: 1.55;
     resize: vertical;
+}
+
+/* 制作栏：工具 / 声音 / 机位 / 光照 / 物料去向。与上面那组「画面内容」分栏，是因为
+   它们回答的是另一个问题——上面写画面里有什么，这里写这一拍是怎么拍成的。 */
+.replica-beat-craft {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px dashed rgba(255, 255, 255, 0.12);
+}
+
+.replica-beat-craft::before {
+    content: '拍摄与工艺';
+    grid-column: 1 / -1;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    opacity: 0.5;
+}
+
+.replica-select,
+.replica-number {
+    width: 100%;
+    padding: 6px 8px;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 6px;
+    color: inherit;
+    font: inherit;
+    font-size: 12px;
+    line-height: 1.55;
+}
+
+.replica-select option {
+    background: #10161d;
+    color: #e8eef5;
 }
 
 .replica-field-optional {
@@ -1358,7 +1400,7 @@ details[open] > .replica-jobs-summary {
 .replica-floating-tools {
     position: fixed;
     right: 24px;
-    bottom: 32px;
+    bottom: 84px;
     z-index: 95;
     display: flex;
     flex-direction: column;
@@ -1443,6 +1485,8 @@ details[open] > .replica-jobs-summary {
 
 #replica-sec-uploader,
 #replica-sec-jobs,
+#replica-sec-workbench,
+#replica-sec-current-job,
 #replica-sec-extract,
 #replica-sec-beats,
 #replica-sec-scene,
@@ -2406,6 +2450,12 @@ details[open] > .replica-jobs-summary {
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
+    /* 为右下角全局悬浮的「● 日志」胶囊留出安全间距，避免操作按钮被遮挡 */
+    margin-right: 76px;
+}
+
+body.log-expanded .replica-bottom-bar-actions {
+    margin-right: 0;
 }
 
 /* 硬伤计数是个按钮（按一下跳到校验横幅），但视觉上仍是 chip。 */
@@ -2514,7 +2564,7 @@ details[open] > .replica-jobs-summary {
 
     .replica-floating-tools {
         right: 12px;
-        bottom: 74px;
+        bottom: 84px;
     }
 
     .replica-float-btn {
@@ -2524,6 +2574,10 @@ details[open] > .replica-jobs-summary {
 
     .replica-bottom-bar {
         padding: 8px 12px;
+    }
+
+    .replica-bottom-bar-actions {
+        margin-right: 68px;
     }
 
     .replica-bottom-bar-actions .action-btn {

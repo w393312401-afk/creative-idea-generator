@@ -133,6 +133,25 @@ def _get_min_credit_threshold() -> int:
     return 15
 
 
+def _credit_is_stale(info: dict) -> bool:
+    """缓存的积分值是否需要重新真实探测一次。
+
+    pick_account() 和 account_is_usable() 共用这一条判据。历史上"什么时候该重探"
+    只写在 pick_account 里，于是每多一条绕过 pick_account 的选号路径（轮转环切腿
+    就是），那条路径就凭一个可能几小时前的缓存值决定用不用这个号。
+    """
+    last_checked = _parse_iso(info.get("last_checked_at"))
+    last_success = _parse_iso(info.get("last_success_at"))
+    is_unprobed = (last_checked is None or info.get("credit") is None)
+    # 上次探测之后又跑过任务 = 那之后扣了多少分没人记账，缓存值一定偏高。
+    tasks_since_check = bool(
+        last_success is not None and last_checked is not None and last_success > last_checked
+    )
+    if STALE_AFTER_SECONDS is not None and last_checked is not None:
+        return (_now() - last_checked).total_seconds() >= STALE_AFTER_SECONDS or tasks_since_check
+    return is_unprobed or tasks_since_check
+
+
 def _sync_zero_credit_disabled(info: dict, credit) -> None:
     """Keep automatic low-credit disabling separate from manual disabling."""
     min_threshold = _get_min_credit_threshold()
@@ -221,9 +240,14 @@ class AccountPool:
             log(f"⚠️ 读取账号凭据状态失败，号池列表按「都没配凭据」显示: {e}", "账号池")
             credentials = {}
 
+        # 阈值随配置变，前端不能自己写死一个 15：用户把「选号最低积分」改成 30 之后
+        # 后端已经按 30 停用账号，界面却还按 15 判"够不够"，两边说法就对不上了。
+        min_credit = _get_min_credit_threshold()
+
         accounts = []
         for user_id, info in state.items():
             entry = dict(info)
+            entry["min_credit"] = min_credit
             entry["user_id"] = user_id
             entry["serial_number"] = str(info.get("serial_number") or "")
             entry["image_task_count"] = int(info.get("image_task_count", 0))
@@ -733,14 +757,23 @@ class AccountPool:
         entry["user_id"] = user_id
         return entry
 
-    def mark_exhausted(self, user_id: str, cooldown_hours: float = 24.0):
+    def mark_exhausted(self, user_id: str, cooldown_hours: float = 24.0,
+                       credit: Optional[int] = None):
+        """账号额度不够用了：写回余额、进冷却。
+
+        credit：页面实测到的余额。传了就按实测值写回——"积分不足"跟"余额为 0"
+        是两回事，一律写 0 会在控制台显示一个页面上根本不存在的余额，跟本模块
+        "积分数字只信真实探测"的规矩直接冲突。没实测到（只命中了耗尽关键词）
+        才退回写 0。
+        """
         with _LOCK:
             state = _read_state()
             if user_id not in state:
                 return
             cooldown_until = (_now() + timedelta(hours=cooldown_hours)).isoformat()
-            state[user_id]["credit"] = 0
-            _sync_zero_credit_disabled(state[user_id], 0)
+            measured = 0 if credit is None else max(0, int(credit))
+            state[user_id]["credit"] = measured
+            _sync_zero_credit_disabled(state[user_id], measured)
             state[user_id]["cooldown_until"] = cooldown_until
             state[user_id]["cooldown_reason"] = "quota_exhausted"
             state[user_id]["last_generation_error"] = "quota_exhausted"
@@ -749,7 +782,7 @@ class AccountPool:
                 state[user_id].get("consecutive_failures", 0)
             ) + 1
             _write_state(state)
-        log(f"🧊 账号 {user_id} 标记为额度耗尽，冷却至 {cooldown_until}", "账号池")
+        log(f"🧊 账号 {user_id} 标记为额度不足（实测余额 {measured}），冷却至 {cooldown_until}", "账号池")
 
     def mark_login_required(self, user_id: str, cooldown_hours: float = 2.0):
         """账号登录失效/验证码/安全拦截等待人工处理超时：跟 mark_exhausted 一样
@@ -810,15 +843,7 @@ class AccountPool:
         candidates.sort(key=_sort_key, reverse=True)
 
         for user_id, info in candidates:
-            last_checked = _parse_iso(info.get("last_checked_at"))
-            credit = info.get("credit")
-            is_unprobed = (last_checked is None or credit is None)
-            if STALE_AFTER_SECONDS is not None and last_checked is not None:
-                is_stale = (_now() - last_checked).total_seconds() >= STALE_AFTER_SECONDS
-            else:
-                is_stale = is_unprobed
-
-            if is_stale:
+            if _credit_is_stale(info):
                 refreshed = self.refresh_credit(user_id, force=True)
                 if refreshed is not None:
                     info = refreshed
@@ -838,6 +863,43 @@ class AccountPool:
 
         return None
 
+    def account_is_usable(self, user_id: str, min_credit: Optional[int] = None) -> bool:
+        """复核单个账号此刻是否真的还能用，口径与 pick_account 完全一致。
+
+        给"不经过 pick_account 的选号路径"用——典型是 server_common._account_rotation_ring
+        排好的轮转环：环是整条序列开始前按缓存积分一次性排定的，中间每条腿烧掉多少
+        积分没人记账，轮到后面的腿时那个号可能早就跑不动了。
+
+        min_credit=None 表示取用户在「选号最低积分」里配的阈值。
+        """
+        user_id = (user_id or "").strip()
+        if not user_id:
+            return False
+        if min_credit is None:
+            min_credit = _get_min_credit_threshold()
+        with _LOCK:
+            info = dict(_read_state().get(user_id) or {})
+        if not info:
+            return False
+        if info.get("disabled"):
+            return False
+        cooldown_until = _parse_iso(info.get("cooldown_until"))
+        if cooldown_until is not None and cooldown_until > _now():
+            return False
+        if _credit_is_stale(info):
+            refreshed = self.refresh_credit(user_id, force=True)
+            if not refreshed or refreshed.get("last_probe_status") != "ok":
+                log(f"⏭️ 账号 {user_id} 复核积分未探测成功，判为不可用（不假设有额度）", "账号池")
+                return False
+            info = refreshed
+        credit = info.get("credit")
+        if credit is None:
+            return False
+        if credit < min_credit:
+            log(f"🧊 账号 {user_id} 复核积分 {credit} < 最低 {min_credit}，判为不可用", "账号池")
+            return False
+        return True
+
 
 # ── 失败换号重试（2026-07-25）────────────────────────────────
 # 各条生成链路（视频批量 / 图片批量 / FX 页面初始化）原先在失败重试前一律
@@ -856,8 +918,14 @@ class AccountPool:
 # 显示的值也会被悄悄改掉，用户看不出账号已经漂了。
 
 
-def switch_to_next_account(exclude=(), min_credit: int = 1, stop_current: bool = True) -> Optional[dict]:
+def switch_to_next_account(exclude=(), min_credit: Optional[int] = None,
+                           stop_current: bool = True) -> Optional[dict]:
     """失败重试前换一个号池账号，返回新账号 dict；没号可换时返回 None。
+
+    min_credit=None（默认）取用户在「选号最低积分」里配的阈值。这里原本硬写死
+    默认值 1：三条运行时换号路径（google_fx_video 的风控换号与积分耗尽换号、
+    google_fx_helpers 的生成报错换号）都不传这个参数，于是配置里的阈值根本到不了
+    运行时——刚好剩几分、跑不动一段视频的号照样会被换上来。
 
     exclude：本轮已经试过的 user_id（当前账号会自动并入，不必重复传）。
     stop_current：换号前先把当前 AdsPower profile 的浏览器关掉——换号等于换
@@ -866,6 +934,8 @@ def switch_to_next_account(exclude=(), min_credit: int = 1, stop_current: bool =
     返回 None 的两种情况都交由调用方原地重试（保持旧的"重试还是要跑"语义）：
     号池为空 / 没配账号，或池子里的号都被排除、禁用、冷却、额度不足。
     """
+    if min_credit is None:
+        min_credit = _get_min_credit_threshold()
     try:
         from ..config import get_runtime_default_user_id, get_runtime_default_port, DEFAULT_USER_ID
     except Exception as e:  # config 理论上一定在，兜底避免换号异常炸穿重试循环

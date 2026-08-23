@@ -376,6 +376,47 @@ class TestSplitStructuralVideoErrors(unittest.TestCase):
         self.assertEqual(pp.split_structural_video_errors(None), ([], []))
 
 
+class TestGhostWorkAgentVocabulary(unittest.TestCase):
+    """幽灵施工判据的词表必须认得合成器自己指定的施工主体称呼（2026-08-22）。
+
+    合成器的着装规则（THEME-ADAPTIVE ATTIRE RULE）**指定**模型写 "one lone craftsman ..."，
+    packet 的 worker_choreography 也照此存盘；可 _WORKER_AGENT_WORDS 里从来没有
+    craftsman（\bman\b 匹配不到 crafts|man 的词内位置）。后果不是漏判而是纯误判：
+    工人明明写了却被判成幽灵施工 → 每拍烧掉最多 2 次定向回炉 → 回炉稿复用同一句
+    choreography 又再判一次不过 → 原稿原样保留。实测三条真实复刻单 51 拍里 19 拍中招，
+    是回炉 71% 失败率的单一主因，也是提示词合成整体偏慢的大头之一。
+    """
+
+    def _clip(self, agent_phrase):
+        return (ANCHOR + f" {agent_phrase} is fastening tongue-and-groove panels row by row, "
+                "tapping each board home with a rubber mallet, coverage sweeping steadily "
+                "across the wall until the far end is fully clad. Near-field sound carries "
+                "mallet knocks over steady shell resonance. "
+                "continuous construction time-lapse, not real-time footage.")
+
+    def test_composer_mandated_craftsman_wording_is_a_visible_agent(self):
+        for phrase in ('One lone craftsman in a solid olive-drab work t-shirt',
+                       'One lone artisan in a dark cap',
+                       'A single installer in dark cargo pants',
+                       'One lone technician in a pale shirt',
+                       'One lone tradesman in work boots'):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(pp.check_video_process_content(self._clip(phrase)), [])
+
+    def test_the_original_worker_wording_still_passes(self):
+        self.assertEqual(
+            pp.check_video_process_content(self._clip('One lone worker in a pale shirt')), [])
+
+    def test_真的没有施工主体时仍然判幽灵施工(self):
+        # 扩词只让检测器多认出一个主体，绝不能让它对真正无主体的正文放行
+        ghost = (ANCHOR + " Tongue-and-groove panels are fastened row by row and each board is "
+                 "tapped home with a rubber mallet until the far wall is fully clad. Near-field "
+                 "sound carries mallet knocks. continuous construction time-lapse, not "
+                 "real-time footage.")
+        errs = pp.check_video_process_content(ghost)
+        self.assertTrue(any('ghost work' in e for e in errs), errs)
+
+
 class TestReworkStructuralVideoBeat(unittest.TestCase):
     ERRS = ["VIDEO describes no visible action/process beyond the anchor opening and audio lines"]
 

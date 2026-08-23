@@ -233,8 +233,9 @@ const states = [
     ready({ stale_lineage: true }),
     frameSlotState(null, { seq: 9 }),
     slotPendingState('image', 10, '等待中'),
+    videoSlotState({ slot: 12, url: '/o/vid_012.mp4', source: 'manual_upload' }, { seq: 12 }),
 ];
 assert.deepStrictEqual(summarizeSlotStates(states),
-    { total: 4, ready: 2, pending: 1, missing: 1, flagged: 1 });
+    { total: 5, ready: 3, pending: 1, missing: 1, flagged: 1 });
 
 console.log('slot model tests passed');

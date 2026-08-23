@@ -1206,16 +1206,34 @@ RULES
 - Four-Zone Spatial Scanning: In every beat, scan four spatial domains for physical delta: 1. Top/Overhead (roof, beams, ceiling, fixtures, skylights), 2. Middle (walls, framing, openings, wiring), 3. Bottom (floor, sub-base, insulation, finish), 4. Peripherals & Spoil (debris removal, material balance). Material & Spoil Balance: Demolition/clearing must account for where debris goes (e.g. bundled or hauled out); installation must account for raw material consumption. Zero Phantom Changes: Never describe action in only one zone while letting another zone's damage or debris disappear without worker action.
 - Monotonic Chronological Inheritance across Spaces: When passing through a doorway or opening into a new space (space label changes), the first beat in the new space must physically inherit all completed exterior/prior work. Never regress already-finished elements (e.g. never describe a roof leaking or ground full of dead leaves if previous beats cleared/repaired them).
 - macro_environment: ONLY declare for the opening anchor beat (B01) AND the first beat after entering a new enclosed space / threshold crossing (when space label changes or stage is transition). ONE to THREE items describing the macro terrain, geology, climate/lighting, and spatial metric envelope visible in this beat — e.g. "arid desert sandstone cliff with natural ambient sunlight", "loose reddish-tan desert sand ground with ripples". For intermediate beats within the same space, do NOT declare macro_environment (keep empty [] or omit) to avoid context clutter and reduce interference with trade actions.
-- visible_details: THREE to SIX items. Each names a material with its colour, texture or condition and where it sits — "yellow fibreglass batts in the left wall bays", not "insulation". These items are the only place the reference film's actual look survives into the prompt; a bare noun brings back a generic version of this work, not this film.
-- persistent_traces: AT LEAST TWO visible marks this beat leaves behind, each naming the mark AND the surface it sits on.
+  - This field is what the place LOOKS LIKE ON ITS OWN, before anyone worked on it. NEVER put a work product here — a trench that was dug, a wall that was built, a floor that was laid belong in state_before / state_after, never in macro_environment. Those one-to-three items are the film's only macro-environment budget; spending one on a result you already wrote in the state fields costs you a real environment fact.
+- visible_details: THREE to SIX items, and AIM FOR FIVE OR SIX. Each names a material with its colour, texture or condition AND where it sits in frame — "yellow fibreglass batts in the left wall bays", not "insulation". These items are the only place the reference film's actual look survives into the prompt; a bare noun brings back a generic version of this work, not this film.
+  - Never spend one of these slots restating something already written in macro_environment or persistent_traces. The budget is five or six lines for the whole beat; a line that repeats the autumn foliage you already declared as macro environment is a line that is not describing the subject.
+  - Spend the slots on what makes THIS subject recognisable — for a vehicle: its glazing, window rubbers, front face, wheels, rust; for a room: its openings, its edges, its floor build-up. Not on the background.
+- persistent_traces: AT LEAST TWO visible marks THIS beat leaves behind, each naming the mark AND the surface it sits on. A feature that was already there before this beat (fallen leaves, moss, old staining) is not a trace — it belongs in macro_environment or nowhere. Every item in this list is concatenated into one string downstream, so a pre-existing environment noun in here dilutes the marks that actually matter.
 - evidence_frames: list AT MOST THREE frames per beat — the one that best shows the start, the one that best shows the work, and the one that best shows the result. Do not echo every frame in the window; a long frame list is the single biggest cause of a reply that gets cut off before it finishes.
 - Keep the SENTENCE fields (visual_subject, visible_action, visible_result, state_before, state_after) under thirty words each. Length belongs in visible_details and persistent_traces, where it buys concrete look; in the sentence fields it only buys narration.
+- visible_result and state_after have DIFFERENT jobs and must not be the same sentence written twice:
+  - visible_result = what you SEE at the moment the action lands (the body settles, the sling goes slack, a clod breaks off the wall).
+  - state_after = HOW FAR the work got — a completion extent, carrying a quantity: a fraction, a percentage, a flush/level relation, a height, a count of bays or metres. "roof flush with surrounding grade, whole body below grade" is an extent; "the bus is in the pit" is not.
+  - The same discipline applies to state_before: give the starting extent a number or a spatial relation (how high it hangs, how much is already done), never a bare picture.
+- operation is a CLEAN milestone-level operation token of one to three words ("seat bus", "board ceiling", "pour slab"). It drives a phase check downstream, so never write it as a full clause with objects and prepositions ("lowering the bus into the excavation pit"), and never make it a verbatim copy of one of the package_operations entries.
 - Do not restate scene_signature in every beat. It is written once, at the top, and applies throughout.
 - space: name the physical space the camera is filming FROM, as a short lowercase label ("wooded slope outside", "entrance tunnel", "main room", "sleeping alcove"). Reuse the SAME label verbatim for every beat shot in that space. Start a NEW label ONLY when the camera has physically moved into a different enclosed space through an opening — never for a reframe, a closer angle, or a pan inside one space, and never because the work changed. Every beat filmed outside the structure shares ONE outdoor label. This field is the only record of how many times the film walks through a doorway; a film that enters a corridor and later enters a room off it has THREE labels, and collapsing them into one deletes that second entry from the reproduction.
 - Visual Grounding Gate (VGG) & Zero Residential Appliance Hallucination (mandatory):
   - NEVER invent or hallucinate residential appliances (kitchen cabinetry, ceramic sink, brass faucet, cooktop, oven, refrigerator, dining table, dining chairs, bathroom vanity) or extra functional rooms UNLESS they are explicitly observed and named in the FRAME FACTS / TIME WINDOWS.
   - In rustic/bushcraft/hobbit/shelter projects, if the space is a raw timber-framed foyer, bedroom, or alcove, describe ONLY the physical carpentry, membranes, insulation, and timber framing that actually exist in the footage. Do NOT default to "kitchen" or "dining room" just because it is an interior room.
 - worker_attire: Extract and carry the authoritative attire from frame facts: e.g. "one lone craftsman in a casual grey work t-shirt, dark cargo pants, and backwards baseball cap (no neon safety vest, no plastic hardhat)". Never substitute a municipal safety vest or hardhat when the builder is wearing casual/craftsman workwear.
+- PER-BEAT PRODUCTION FIELDS. Each of these is a separate channel downstream; do not smuggle them into the sentence fields and do not leave them out because "it is obvious from the action".
+  - tool: the ONE geometric tool that delivers the action at its peak ("crawler crane on outriggers", "cordless impact driver", "rubber mallet"). This is the tool half of the Action-Tool-SFX triad. If machinery does the work, the machine IS the tool.
+  - sfx: ONE to THREE physical sounds this beat actually makes, one sound source per item ("hydraulic crane whine", "soil clods sliding down the trench wall", "steel body thudding into the cut"). Match the audio_sfx spikes given to you in the CHANGE EVENTS where there are any. NEVER write music, score, mood beds, or narration — the delivery is 0% BGM, 100% physical sound.
+  - shot_scale: one of extreme_wide | wide | medium | close | extreme_close — the framing this beat is filmed at.
+  - camera_move: one of static | push_in | pull_out | pan | tilt | orbit | follow | handheld | crane — how the camera behaves during this beat. A transition beat crossing a threshold is normally push_in or follow. Use the exact token, never a phrase.
+  - worker_count: how many people are visible in this beat, as an integer. 0 for a sterile beat, and it must agree with workers_present.
+  - light_state: the light and time of day in this beat ("overcast midday, no cast shadows", "low golden side light from frame left"). The film spans days; a beat that does not declare its light gets a random one.
+  - material_flow: where this beat's material went or came from ("excavated soil piled on the trench's north lip", "offcuts bundled and carried out through the doorway"). This is the Material & Spoil Balance rule's field — demolition must say where debris goes, installation must say what stock was consumed.
+  - cast_action: what EVERY living thing in frame is DOING WITH ITS BODY this beat, apart from the work itself — posture, which way it faces, where it looks, how far it has moved since the previous beat, a gesture. Living thing means a person, a miniature figurine, OR an animal (the site dog, a cat on the wall, a resin hen in the diorama) — cover each one that is in frame, not just the humans. ("crouches at the wall foot, head tilted to sight along the course"; "the two figurines now face the rising wall, the one in red half a step closer than before, while the brown dog has lain down in the shade of the stump"). Never repeat visible_action here: that one is the operation, this one is the body. If nothing alive is in frame, leave it out.
+  - insert_subject: if the film CUTS to a closer framing inside this beat, name in a few words what that closer shot is ON ("the tweezer tip pressing a roof tile", "mortar squeezing out from under the block", "the two figurines watching from the moss"). Read it off the frames: a run of frames at a much closer framing inside one beat is that cut. Leave it out for a beat filmed as one uninterrupted shot — an invented insert is worse than none, because it will be reproduced verbatim.
 - Every claim must trace to a frame. Never write a tool, material, worker, or operation that no frame fact mentions.
 - state_before / state_after must be concrete spatial completion extent, never "partially done".
 - banned_elements: things a renovation of this type would plausibly involve but that appear in NO frame fact. Be generous here — this list is what stops the prompt writer from hallucinating later.
@@ -1244,6 +1262,7 @@ RULES
 - Boundary Precision: Beat start and end timestamps must strictly align with actual visible state transitions shown in the contact sheets and frame facts.
 - Beats are ordered by time and must not overlap.
 
+- ambient_motion: ONE list for the WHOLE film (not per beat), naming what keeps moving in the frame the whole way through without anyone doing it: running water, drifting smoke, a flame, wind in the canopy, falling snow or rain, laundry swinging, dust motes, a flickering filament. These never appear in any beat — a beat records what CHANGED, and these change nothing, they just never stop. Leaving them out is what makes a delivered clip read as a photograph with one moving hand in it. Write only what you can actually see moving across frames; if the film's background genuinely holds still, return an empty list.
 - scene_signature: ONE sentence naming the venue and how it looks throughout — its structure, its materials, its weathering, its surroundings, its standing light. Write what is true in the first frame and still true in the last. No work, no progress, no beat content. This is the one line that says why the reference film looks like itself; a generic version of it ("an interior space under renovation") is worse than none.
 
 OUTPUT
@@ -1251,6 +1270,7 @@ Return one JSON object, no prose, no code fences:
 {
   "video_duration_sec": <number>,
   "scene_signature": "<one sentence, under thirty words>",
+  "ambient_motion": ["<what keeps moving in frame all the way through, one per item; empty list if nothing does>"],
   "banned_elements": ["..."],
   "beats": [{
     "id": "B01",
@@ -1258,15 +1278,24 @@ Return one JSON object, no prose, no code fences:
     "stage": "<one of the ten>",
     "space": "<short label of the space this beat is filmed in, reused verbatim across beats>",
     "macro_environment": ["..."],
-    "operation": "<the dominant physical operation naming this milestone>",
+    "operation": "<one to three word milestone operation token>",
     "package_operations": ["<two or three tightly coupled operations sharing one terminal product; or [\"threshold\"] for transition>"],
     "visual_subject": "...",
     "visible_details": ["..."],
     "visible_action": "...",
-    "visible_result": "...",
+    "visible_result": "<what you see at the moment the action lands>",
     "state_before": "...",
-    "state_after": "...",
+    "state_after": "<how far the work got, carrying a quantity>",
     "persistent_traces": ["..."],
+    "tool": "...",
+    "sfx": ["..."],
+    "shot_scale": "<extreme_wide|wide|medium|close|extreme_close>",
+    "camera_move": "<static|push_in|pull_out|pan|tilt|orbit|follow|handheld|crane>",
+    "worker_count": <integer>,
+    "light_state": "...",
+    "material_flow": "...",
+    "cast_action": "<what the people/figurines in frame are doing with their bodies this beat, apart from the work; omit if nobody is in frame>",
+    "insert_subject": "<what the film's closer cut-in inside this beat is on; omit if this beat is one uninterrupted shot>",
     "workers_present": true|false,
     "source_event_ids": ["E01"],
     "evidence_frames": ["review_007.png"],
@@ -1483,6 +1512,7 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
         normalize_beat_spaces(beats_doc)
         reconcile_event_coverage(beats_doc, overview)
         attach_coverage_frames(beats_doc, overview)
+        attach_shot_cuts(beats_doc, overview)
         # 定长窗随文档一起落盘：卡点上要拿它跟节拍对照，回炉时也要用同一份，不能
         # 每次重算一遍——那样两次看到的「画面变化」可能不是同一份。
         beats_doc['time_windows'] = windows
@@ -1525,6 +1555,14 @@ TRANSLATE_FIELDS = (
     'visual_subject', 'operation', 'visible_action', 'visible_result',
     'state_before', 'state_after', 'visible_details', 'persistent_traces',
     'package_operations', 'macro_environment',
+    # 2026-08-22：新增的制作字段里只有这四个是自由文本，需要中文对照。
+    # shot_scale / camera_move 是闭集枚举、worker_count 是整数——它们的中文在界面上
+    # 由 SHOT_SCALE_LABELS_ZH / CAMERA_MOVE_LABELS_ZH 直接渲染，翻译它们只会把闭集
+    # 值译成一句中文，再被 _coerce_enum 丢掉。
+    'tool', 'sfx', 'light_state', 'material_flow',
+    # 2026-08-23：插入镜主体也是自由文本，且它是要被逐字抄进成片的一句，
+    # 核对的人必须看得懂它写的是什么。
+    'insert_subject', 'cast_action',
 )
 
 _TRANSLATE_SYSTEM = """You translate a construction time-lapse beat ladder from English into Simplified Chinese for a human reviewer.
@@ -1999,7 +2037,14 @@ def attach_scene_constants(beats_doc, facts):
     if 'scene_constants' in beats_doc:
         return beats_doc['scene_constants']
     # 一个都没统计出来也要落键，否则每次读状态都会重算一遍（几百 KB 的事实全扫）。
-    beats_doc['scene_constants'] = analyze_scene_constants(facts)
+    constants = analyze_scene_constants(facts)
+    # 「一直在动的东西」并不进本地统计：帧事实是一张张**静止**画面的清单，水在流、烟在飘
+    # 这件事在任何单帧里都看不出来。它只能由 Pass B 从帧序列里读（顶层 ambient_motion），
+    # 在这里并进同一个容器，之后全链路只认 scene_constants.motion 一处。
+    motion = [str(x).strip() for x in (beats_doc.get('ambient_motion') or []) if str(x).strip()]
+    if motion:
+        constants['motion'] = motion
+    beats_doc['scene_constants'] = constants
     return beats_doc['scene_constants']
 
 
@@ -2129,7 +2174,10 @@ def scene_constants_lines(constants, signature=None):
     labels = (('environment', 'always-present macro environment & biome'),
               ('materials', 'always-present materials and surfaces'),
               ('traces', 'always-present marks and weathering'),
-              ('fixtures_in_shot', 'equipment permanently in shot'))
+              ('fixtures_in_shot', 'equipment permanently in shot'),
+              # 这一栏与上面四栏的动词不同：它们是「在」，这一栏是「在动」。合成侧据此
+              # 要求每一条 VIDEO 都让它继续动（见 BaseComposer.scene_constants_block）。
+              ('motion', 'never stops moving anywhere in the film'))
     for key, label in labels:
         items = [str(x).strip() for x in ((constants or {}).get(key) or []) if str(x).strip()]
         if items:
@@ -2168,7 +2216,176 @@ _BEAT_KEY_ALIASES = {
     'environment': 'macro_environment',
     'macro_env': 'macro_environment',
     'macro_environment_specs': 'macro_environment',
+    # 2026-08-22 新增的六个制作字段。别名照旧只搬运不生成。`audio_asmr_cues` 是
+    # mutate 的正交变异线一直在写、而全链路没有一处在读的键（写完就没人管），
+    # 现在把它并进 `sfx` 这条真出口。
+    'tools': 'tool',
+    'primary_tool': 'tool',
+    'sound': 'sfx',
+    'sounds': 'sfx',
+    'audio': 'sfx',
+    'audio_sfx': 'sfx',
+    'sfx_cues': 'sfx',
+    'audio_asmr_cues': 'sfx',
+    'cast': 'cast_action',
+    'figurine_action': 'cast_action',
+    'figurines': 'cast_action',
+    'worker_action': 'cast_action',
+    'people_action': 'cast_action',
+    'posture': 'cast_action',
+    'insert': 'insert_subject',
+    'insert_shot': 'insert_subject',
+    'cutaway_subject': 'insert_subject',
+    'shot_size': 'shot_scale',
+    'framing': 'shot_scale',
+    'shot': 'shot_scale',
+    'camera': 'camera_move',
+    'camera_movement': 'camera_move',
+    'camera_motion': 'camera_move',
+    'crew_size': 'worker_count',
+    'worker_num': 'worker_count',
+    'lighting': 'light_state',
+    'light': 'light_state',
+    'light_source_state': 'light_state',
+    'time_of_day': 'light_state',
+    'spoil': 'material_flow',
+    'material_balance': 'material_flow',
+    'spoil_balance': 'material_flow',
 }
+
+# ── 制作字段的值域 ───────────────────────────────────────────────────────────
+#
+# 景别与运镜是**闭集**，不收自由文本：规划器读到 "slow dramatic push through the
+# autumn canopy" 会把它当创作提示接着发挥，读到 `push_in` 才是照抄。模型仍然会写
+# 自由文本，所以这里留一张够宽的近义词表，认不出来的一律丢弃——留一个歪值下去，
+# 等于让那一拍的机位由一句没人校对过的话决定。
+SHOT_SCALES = ('extreme_wide', 'wide', 'medium', 'close', 'extreme_close')
+CAMERA_MOVES = ('static', 'push_in', 'pull_out', 'pan', 'tilt', 'orbit',
+                'follow', 'handheld', 'crane')
+
+SHOT_SCALE_LABELS_ZH = {
+    'extreme_wide': '大远景', 'wide': '远景', 'medium': '中景',
+    'close': '近景', 'extreme_close': '特写',
+}
+CAMERA_MOVE_LABELS_ZH = {
+    'static': '固定', 'push_in': '缓推', 'pull_out': '缓拉', 'pan': '横摇',
+    'tilt': '俯仰摇', 'orbit': '环绕', 'follow': '跟随', 'handheld': '手持',
+    'crane': '升降',
+}
+
+_SHOT_SCALE_SYNONYMS = {
+    'ews': 'extreme_wide', 'extreme_wide_shot': 'extreme_wide', 'establishing': 'extreme_wide',
+    'establishing_shot': 'extreme_wide', 'very_wide': 'extreme_wide', 'xws': 'extreme_wide',
+    'aerial': 'extreme_wide', 'drone': 'extreme_wide',
+    'ws': 'wide', 'wide_shot': 'wide', 'long': 'wide', 'long_shot': 'wide', 'full': 'wide',
+    'full_shot': 'wide',
+    'ms': 'medium', 'medium_shot': 'medium', 'mid': 'medium', 'mid_shot': 'medium',
+    'medium_wide': 'medium', 'medium_close': 'medium',
+    'cu': 'close', 'close_up': 'close', 'closeup': 'close', 'close_shot': 'close',
+    'ecu': 'extreme_close', 'extreme_close_up': 'extreme_close', 'macro': 'extreme_close',
+    'detail': 'extreme_close', 'insert': 'extreme_close',
+}
+_CAMERA_MOVE_SYNONYMS = {
+    'fixed': 'static', 'locked': 'static', 'locked_off': 'static', 'lockedoff': 'static',
+    'none': 'static', 'still': 'static', 'tripod': 'static',
+    'push': 'push_in', 'dolly_in': 'push_in', 'zoom_in': 'push_in', 'truck_in': 'push_in',
+    'move_in': 'push_in', 'forward': 'push_in', 'dolly_forward': 'push_in',
+    'pull': 'pull_out', 'pull_back': 'pull_out', 'dolly_out': 'pull_out',
+    'zoom_out': 'pull_out', 'reveal_pullback': 'pull_out', 'backward': 'pull_out',
+    'pan_left': 'pan', 'pan_right': 'pan', 'whip_pan': 'pan', 'swivel': 'pan',
+    'tilt_up': 'tilt', 'tilt_down': 'tilt',
+    'arc': 'orbit', 'orbital': 'orbit', 'circle': 'orbit', 'around': 'orbit',
+    'tracking': 'follow', 'track': 'follow', 'trailing': 'follow', 'walkthrough': 'follow',
+    'steadicam': 'follow', 'gimbal': 'follow',
+    'hand_held': 'handheld', 'shaky': 'handheld', 'pov': 'handheld',
+    'jib': 'crane', 'boom': 'crane', 'crane_up': 'crane', 'crane_down': 'crane',
+}
+
+
+_NUMBER_WORDS = {
+    'zero': 0, 'no': 0, 'none': 0, 'nobody': 0, '无': 0, '零': 0,
+    'one': 1, 'a': 1, 'an': 1, 'single': 1, 'lone': 1, 'solo': 1, '一': 1, '独': 1,
+    'two': 2, 'pair': 2, 'both': 2, '两': 2, '二': 2,
+    'three': 3, '三': 3, 'four': 4, '四': 4, 'five': 5, '五': 5,
+    'six': 6, '六': 6, 'seven': 7, '七': 7, 'eight': 8, '八': 8,
+    'nine': 9, '九': 9, 'ten': 10, '十': 10,
+}
+
+
+def _coerce_count(value):
+    """人数。数字优先，其次数词——Pass B 要的是整数，实际交回来的多半是
+    "one lone craftsman"。两样都认不出就返回 None（未标注），绝不默认成 0：
+    0 是「这一拍清场」这个真实断言，跟「没写」不是一回事。"""
+    raw = str(value if value is not None else '').strip()
+    if not raw:
+        return None
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        pass
+    digits = re.search(r'\d+', raw)
+    if digits:
+        return int(digits.group())
+    for token in re.split(r'[^a-zA-Z一-鿿]+', raw.lower()):
+        if token in _NUMBER_WORDS:
+            return _NUMBER_WORDS[token]
+    return None
+
+
+def _coerce_enum(value, allowed, synonyms):
+    """把模型写的自由文本收进闭集；收不进就返回 None（宁可空着，也不留歪值）。"""
+    token = re.sub(r'[^a-z0-9]+', '_', str(value or '').strip().lower()).strip('_')
+    if not token:
+        return None
+    if token in allowed:
+        return token
+    if token in synonyms:
+        return synonyms[token]
+    # "slow push in on the trench" 这类整句：从里面捞第一个认得的词。长词优先，
+    # 否则 "push_in" 会先被 "push" 撞上（结果一样，但顺序一变就不一样了）。
+    for key in sorted(list(allowed) + list(synonyms), key=len, reverse=True):
+        if key in token:
+            return synonyms.get(key, key) if key not in allowed else key
+    return None
+
+
+def normalize_beat_craft_fields(beats_doc):
+    """制作字段的值域归一：枚举收进闭集、人数收成整数、单串/列表互转。
+
+    跟着 `normalize_beat_keys` 一起跑（键名归位完才谈得上值域），因为调用点分散在
+    replica_pipeline 与本模块的五处，单独开一个函数必然漏掉其中一两处——键名归一
+    自己就是被漏出来的教训。
+    """
+    for beat in (beats_doc.get('beats') or []):
+        if not isinstance(beat, dict):
+            continue
+        if 'sfx' in beat:
+            raw = beat['sfx']
+            items = raw if isinstance(raw, (list, tuple)) else [raw]
+            beat['sfx'] = [str(x).strip() for x in items if str(x or '').strip()][:4]
+        for key in ('tool', 'light_state', 'material_flow'):
+            if key in beat:
+                value = beat[key]
+                if isinstance(value, (list, tuple)):
+                    value = '; '.join(str(x).strip() for x in value if str(x or '').strip())
+                beat[key] = str(value or '').strip()
+        if 'shot_scale' in beat:
+            beat['shot_scale'] = _coerce_enum(
+                beat['shot_scale'], SHOT_SCALES, _SHOT_SCALE_SYNONYMS) or ''
+        if 'camera_move' in beat:
+            beat['camera_move'] = _coerce_enum(
+                beat['camera_move'], CAMERA_MOVES, _CAMERA_MOVE_SYNONYMS) or ''
+        if 'worker_count' in beat:
+            count = _coerce_count(beat['worker_count'])
+            if count is None:
+                beat.pop('worker_count', None)
+            else:
+                beat['worker_count'] = max(0, min(12, count))
+        # 人数与「有没有人」是同一件事的两种写法，两处都在时以人数为准——用户在卡片上
+        # 改的是人数那一栏，布尔那枚芯片是渲染出来给他看的。
+        if isinstance(beat.get('worker_count'), int):
+            beat['workers_present'] = beat['worker_count'] > 0
+    return beats_doc
 
 
 def normalize_beat_keys(beats_doc):
@@ -2194,6 +2411,7 @@ def normalize_beat_keys(beats_doc):
         # 不是一次调用的临时值。归一会在每次读状态、每次保存时重跑，第二次跑必然
         # 一处也搬不到——那时清空，等于这条 warn 只在用户看不见的那一瞬间存在过。
         beats_doc['key_normalizations'] = (beats_doc.get('key_normalizations') or []) + moved
+    normalize_beat_craft_fields(beats_doc)
     return moved
 
 
@@ -2264,6 +2482,114 @@ def coverage_frames_for_window(timeline, start, end,
             picked.append(best)
         picked.sort()
     return [{'frame': name, 'timestamp': round(ts, 3)} for ts, name in picked]
+
+
+# ── 观察到的镜头切点 ─────────────────────────────────────────────────────────
+#
+# 抽帧脚本（skills/…/scripts/analyze_timelapse_video.py）一直在算两组跳变：高阈值那组
+# 是**剪辑切点**（cut_points），低阈值那组扣掉切点附近 0.3s 之后是**状态变化**。整条
+# 复刻线只消费了后者与聚合出来的 pace_metrics（scene_count / cut_count 三个数），
+# 逐条 cut_points 落在 video_overview.json 里没有任何读者——于是「原片这一拍是一个
+# 镜头还是切了三刀」这件事，采集到了、写进盘了、没人接。
+#
+# 多镜头语法（omni / miniature）交付的每一拍本身就是剪辑过的序列，这个数是它唯一的
+# 事实底座：镜头梯排三镜还是四镜、原片到底切没切，都由它回答。派生字段，每次重算。
+_CUT_EDGE_EPSILON = 0.15
+
+
+def overview_cut_points(overview):
+    """video_overview.json 里的剪辑切点（升序、去重、非负）。
+
+    读不到就返回空列表而不是抛：老 job 的 overview 里没有这个键，抽帧脚本环境异常时
+    也可能整组缺失，两种情况都该降级成「这一拍的镜头数未知」，而不是让读状态失败。
+    """
+    raw = (overview or {}).get('cut_points')
+    if not isinstance(raw, (list, tuple)):
+        return []
+    points = []
+    for item in raw:
+        value = _num(item, -1.0)
+        if value >= 0:
+            points.append(round(value, 3))
+    return sorted(set(points))
+
+
+def observed_cuts_for_window(cut_points, start, end, edge=_CUT_EDGE_EPSILON):
+    """落在拍窗**内部**的剪辑切点。
+
+    边界那一刀不算：拍与拍的分界处本来就常常压着一刀（Pass B 就是按变化聚的类），
+    把它算进来会让每一拍都凭空多出一个镜头。edge 取 0.15s——与抽帧脚本自己对切点
+    去重用的窗口同宽，两边对「同一刀」的容差保持一致。
+    """
+    if not cut_points:
+        return []
+    lo, hi = sorted((_num(start), _num(end)))
+    return [t for t in cut_points if lo + edge < t < hi - edge]
+
+
+def attach_shot_cuts(beats_doc, overview):
+    """给每一拍挂上 `observed_cuts` 与 `observed_shot_count`。派生数据，每次都重算。
+
+    重算而不是「缺了才补」，理由与 attach_coverage_frames 同源：用户在卡点上拆拍/并拍
+    改的就是时间窗，留着上一版的镜头数等于让人按**别的拍窗**的剪辑节奏做判断。
+
+    二创变体原样跳过：变体的时间窗继承自原片，但它自己的目录里没有 overview
+    （`reference_frames` 那条线，见 is_variant_doc），按空切点重算只会把继承下来的
+    镜头数一路抹成 1 —— 与 shot_scale / camera_move 被列为「节奏骨架，原样继承」
+    是同一条纪律。
+    """
+    beats = beats_doc.get('beats') or []
+    if is_variant_doc(beats_doc):
+        return beats_doc
+    cut_points = overview_cut_points(overview)
+    for beat in beats:
+        if not isinstance(beat, dict):
+            continue
+        if not cut_points:
+            # 未知与「一镜到底」必须分得开：没有切点数据时把字段清掉，让下游据此降级，
+            # 而不是留下一个看起来很确定的 1。
+            beat.pop('observed_cuts', None)
+            beat.pop('observed_shot_count', None)
+            beat.pop('observed_shot_seconds', None)
+            continue
+        cuts = observed_cuts_for_window(cut_points, beat.get('start'), beat.get('end'))
+        beat['observed_cuts'] = cuts
+        beat['observed_shot_count'] = len(cuts) + 1
+        # 每镜多长。镜头**数**不能直接跨拍长比较：原片一拍平均三秒半，交付一拍是固定
+        # 片长（8 秒），"原片这拍是一镜"与"我们切了两刀"说的根本不是同一个节奏
+        # ——按每镜时长比才比得上（实测一条 77 秒片：原片 0.259 刀/秒，交付三镜
+        # 0.25 刀/秒，几乎一致；真正对不上的是原片把四镜压进三秒半的那种快切拍）。
+        span = abs(_num(beat.get('end')) - _num(beat.get('start')))
+        beat['observed_shot_seconds'] = (round(span / float(len(cuts) + 1), 2)
+                                         if span > 0 else None)
+    return beats_doc
+
+
+def observed_shot_stats(beats_doc):
+    """整条阶梯的镜头节奏概览：给卡点上那行提示与合成前的偏差告警用。
+
+    返回 None 表示这条 job 没有切点数据（老 job / 变体 / 抽帧异常），调用方据此
+    什么都不显示——显示一个「全部一镜」比不显示更误导。
+    """
+    beats = [b for b in (beats_doc.get('beats') or [])
+             if isinstance(b, dict) and isinstance(b.get('observed_shot_count'), int)]
+    if not beats:
+        return None
+    counts = [b['observed_shot_count'] for b in beats]
+    lengths = [b['observed_shot_seconds'] for b in beats
+               if isinstance(b.get('observed_shot_seconds'), (int, float))]
+    span = sum(abs(_num(b.get('end')) - _num(b.get('start'))) for b in beats)
+    cuts = sum(len(b.get('observed_cuts') or []) for b in beats)
+    return {
+        'beats': len(counts),
+        'cuts': cuts,
+        'single_shot_beats': sum(1 for c in counts if c <= 1),
+        'max_shots': max(counts),
+        'avg_shots': round(sum(counts) / float(len(counts)), 2),
+        # 每秒切点率与平均镜长才是能跨拍长比较的两个数（见 attach_shot_cuts 的说明）。
+        'cuts_per_second': round(cuts / span, 3) if span > 0 else None,
+        'avg_shot_seconds': round(sum(lengths) / float(len(lengths)), 2) if lengths else None,
+    }
 
 
 def attach_coverage_frames(beats_doc, overview):
@@ -2337,6 +2663,273 @@ def is_variant_doc(beats_doc):
     return bool(beats_doc.get('variant_of') or beats_doc.get('mutation_axes'))
 
 
+# ── 单拍内容体检 ─────────────────────────────────────────────────────────────
+#
+# 这一组判据全是 warn，一条 error 都不出。理由与 `thin_details` 那条同源：它们是
+# **质量**下限不是**契约**下限，判成硬伤会让所有存量阶梯在合成门口集体判死，而它们
+# 并没有变坏。另一条纪律是**逐条聚合**——同一种毛病十四拍各报一条，等于把人工卡点
+# 变成一面红墙，用户读第三条就开始整片忽略。每种毛病只出一条，把拍号列进去。
+
+# 施工产物词。macro_environment 只写「这地方本来长什么样」，出现这些词多半是把
+# 本拍干出来的东西写进了大环境（那份配额整条片子只有一次）。
+_WORK_PRODUCT_CUES = re.compile(
+    r'\b(excavat\w*|dug|dig|trench\w*|install\w*|built|build\w*|construct\w*|framed|framing|'
+    r'poured|laid|fitted|fastened|boarded|clad|painted|plaster\w*|insulat\w*|assembled|'
+    r'mounted|erected|demolish\w*|cleared|stacked)\b'
+    r'|挖|砌|铺|装|建|浇|封|刷|拆|码放', re.I)
+
+# 痕迹词。一条 persistent_trace 至少要点名「留下的是什么」。
+_TRACE_MARK_CUES = re.compile(
+    r'\b(mark\w*|scar\w*|stain\w*|dust|debris|shaving\w*|sawdust|scratch\w*|scuff\w*|'
+    r'print\w*|striation\w*|residue|seam\w*|dent\w*|track\w*|rut\w*|gouge\w*|imprint\w*|'
+    r'crumb\w*|smear\w*|splatter\w*|drip\w*|offcut\w*|chip\w*|groove\w*|indentation\w*|'
+    r'head\w*|hole\w*|line\w*|edge\w*)\b'
+    r'|痕|印|屑|渍|沫|坑洼|划|斑', re.I)
+
+# 量词。状态字段要写「完成到哪儿」，不是「看起来怎样」。
+_QUANTITY_CUES = re.compile(
+    r'\d|\bhalf\b|\bthird\b|\bquarter\b|\bfull\w*\b|\bentire\w*\b|\bwhole\b|\bevery\b|'
+    r'\ball\b|\bnone\b|\bflush\b|\blevel with\b|\bedge[- ]to[- ]edge\b|\bwall[- ]to[- ]wall\b|'
+    r'\bpercent\b|%|\bmetre\w*\b|\bmeter\w*\b|\bmm\b|\bcm\b|\bbay\w*\b|\bcourse\w*\b|'
+    r'\bup to\b|\bdown to\b|\bfrom .{1,20} to\b|'
+    # 写成词的数与尺度。「悬空一个车身高」是量，跟「4.5 米」一样算数。
+    r'\b(one|two|three|four|five|six|seven|eight|nine|ten)\b|'
+    r'\b(height|depth|deep|thick\w*|span|clearance|gap)\b'
+    r'|全|整|半|三分之|四分之|齐平|一半|每一|所有|米|厘米|成|高|深|厚', re.I)
+
+# 位置锚。visible_details 每条要说清「它在画面的哪儿」。这里不能复用 _content_words，
+# 它的停用词表把 left/right/top 这些方位词当虚词滤掉了。
+_POSITION_CUES = re.compile(
+    r'\b(left|right|top|bottom|upper|lower|middle|centre|center|front|back|rear|near|far|'
+    r'foreground|background|overhead|underneath|beneath|above|below|along|across|behind|'
+    r'inside|outside|beside|around|at the|on the|in the|against the)\b'
+    r'|左|右|上|下|顶|底|中|前|后|侧|旁|里|外|沿|周围', re.I)
+
+# 主导工序里不该出现的连接词。出现它 = 写成了带宾语的整句而不是工序词。
+_OPERATION_CLAUSE_CUES = re.compile(r'\b(into|onto|through|across|with|from|over|under|while|and)\b', re.I)
+
+# 环境物概念组。同一件东西在大环境、细节、痕迹三栏各换一种说法写一遍，是实词交集
+# 抓不到的（"golden orange beech and oak leaf litter" 与 "golden yellow foliage"
+# 只共用一个 golden，Jaccard 连 0.06 都不到），但它确实就是同一件东西。所以这里不判
+# 措辞判概念，且只收**本来就该待在大环境栏里**的那几类——土、石、木这些既是环境也是
+# 施工对象的词一律不收，收了会把「坑壁的分层土质」这种正当细节误判成重复。
+_AMBIENT_CONCEPTS = {
+    'leaves': ('leaf', 'leaves', 'litter', 'foliage', '落叶', '树叶', '枯叶'),
+    'canopy': ('canopy', 'treetop', 'treetops', 'branches', 'boughs', '树冠', '枝叶'),
+    'sky': ('sky', 'skies', 'cloud', 'clouds', 'overcast', '天空', '云'),
+    'undergrowth': ('moss', 'mossy', 'grass', 'weeds', 'undergrowth', 'brambles', '青苔', '苔藓', '杂草'),
+    'snow': ('snow', 'snowy', 'frost', 'ice', '积雪', '霜'),
+    'water': ('rain', 'puddle', 'puddles', 'stream', 'drizzle', '雨', '水洼'),
+    'daylight': ('sunlight', 'sunshine', 'daylight', 'shadows', 'dappled', '阳光', '日光'),
+}
+
+
+def _ambient_concepts(text):
+    """一段文本命中的环境物概念。"""
+    low = str(text or '').lower()
+    tokens = set(re.split(r'[^a-zA-Z一-鿿]+', low))
+    hits = set()
+    for concept, words in _AMBIENT_CONCEPTS.items():
+        for word in words:
+            if (word in tokens) if word.isascii() else (word in low):
+                hits.add(concept)
+                break
+    return hits
+
+
+_CRAFT_FIELD_LABELS = (
+    ('tool', '主导工具'), ('sfx', '本拍声音'), ('shot_scale', '景别'),
+    ('camera_move', '运镜'), ('worker_count', '工人数'),
+    ('light_state', '光照时段'), ('material_flow', '物料去向'),
+)
+
+
+def _is_transition_beat(beat):
+    """过门/揭示/硬切拍。它们不干活，工序与物料类判据一律不适用。"""
+    op = str(beat.get('operation') or '').lower()
+    stage = str(beat.get('stage') or '').lower()
+    return (op in ('threshold', 'reward', 'reframe')
+            or stage in ('transition', 'threshold', 'reveal')
+            or bool(beat.get('bridge_stage'))
+            or bool(beat.get('hard_cut')))
+
+
+def _text_overlap(a, b):
+    """两段文本的实词 Jaccard。用来判「同一句话写了两遍」。"""
+    wa, wb = _content_words(a), _content_words(b)
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / float(len(wa | wb))
+
+
+def _validate_beat_craft(beats):
+    """单拍内容体检：写串栏的、写重复的、写含糊的、以及六个制作字段缺不缺。
+
+    只出 warn，且每种毛病聚合成一条。判据都是文本启发式——它们指得出「这里值得再看
+    一眼」，指不出「这里一定错了」，所以绝不该有权力挡住合成。
+    """
+    out = []
+    macro_work, dup_detail, thin_trace = [], [], []
+    vague_extent, echoed_state, wordy_op, no_anchor = [], [], [], []
+    no_insert, no_cast = [], []
+    missing = {key: [] for key, _label in _CRAFT_FIELD_LABELS}
+
+    for beat in beats:
+        bid = beat.get('id')
+        is_transition = _is_transition_beat(beat)
+
+        macro = [str(x).strip() for x in (beat.get('macro_environment') or []) if str(x).strip()]
+        details = [str(x).strip() for x in (beat.get('visible_details') or []) if str(x).strip()]
+        traces = [str(x).strip() for x in (beat.get('persistent_traces') or []) if str(x).strip()]
+
+        # 一① 大环境里混进了本拍施工产物
+        if any(_WORK_PRODUCT_CUES.search(item) for item in macro):
+            macro_work.append(bid)
+
+        # 一② 可见细节复述了大环境/遗留痕迹已经写过的东西。两道判据并联：措辞几乎照抄
+        # 的走实词交集，换了说法的走环境物概念。
+        context = macro + traces
+        context_ambient = set()
+        for other in context:
+            context_ambient |= _ambient_concepts(other)
+        for item in details:
+            if (any(_text_overlap(item, other) >= 0.34 for other in context)
+                    or (_ambient_concepts(item) & context_ambient)):
+                dup_detail.append(bid)
+                break
+
+        # 一③ 遗留痕迹没点名「留下的是什么」——多半是把原本就在的环境物写了进来
+        if traces and not all(_TRACE_MARK_CUES.search(item) for item in traces):
+            thin_trace.append(bid)
+
+        # 二⓪ 画面里有人（或人偶），却没写他们的身体语言。延时片里人是唯一的活物，
+        # 这一栏空着交付出来就是一动不动的塑料小人——2026-08-23 用户实测反馈的正是它。
+        # 只对「画面里确实有人」的拍报：清场帧本来就没人可写。
+        if (beat.get('workers_present') and not _is_transition_beat(beat)
+                and not str(beat.get('cast_action') or '').strip()):
+            no_cast.append(bid)
+
+        # 二① 原片这一拍切过刀，却没说那个插入镜拍的是什么。只对真的切过刀的拍报——
+        # 一镜到底的拍本来就没有插入镜可抄，按缺字段报会把整片标红（实测一条 77 秒片
+        # 22 拍里有 7 拍是一镜）。
+        if (isinstance(beat.get('observed_shot_count'), int)
+                and beat['observed_shot_count'] >= 2
+                and not str(beat.get('insert_subject') or '').strip()):
+            no_insert.append(bid)
+
+        # 三① 状态字段没有量
+        states = [str(beat.get(k) or '').strip() for k in ('state_before', 'state_after')]
+        if any(text and not _QUANTITY_CUES.search(text) for text in states):
+            vague_extent.append(bid)
+
+        # 三② 可见结果与结束状态是同一句话
+        if _text_overlap(beat.get('visible_result'), beat.get('state_after')) >= 0.6:
+            echoed_state.append(bid)
+
+        # 三③ 主导工序写成了带宾语的整句
+        op = str(beat.get('operation') or '').strip()
+        if op and not is_transition and (len(op.split()) > 4 or _OPERATION_CLAUSE_CUES.search(op)):
+            wordy_op.append(bid)
+
+        # 三④ 可见细节缺位置锚
+        if details and sum(1 for item in details if not _POSITION_CUES.search(item)) > len(details) // 2:
+            no_anchor.append(bid)
+
+        # 二 制作字段缺不缺。过门拍不干活，工具/物料两栏本就该空。
+        for key, _label in _CRAFT_FIELD_LABELS:
+            if is_transition and key in ('tool', 'material_flow'):
+                continue
+            value = beat.get(key)
+            if key == 'worker_count':
+                filled = isinstance(value, int)
+            elif isinstance(value, str):
+                filled = bool(value.strip())
+            else:
+                filled = bool(value)
+            if not filled:
+                missing[key].append(bid)
+
+    def _ids(items):
+        return '、'.join(x for x in dict.fromkeys(items) if x)
+
+    if macro_work:
+        out.append(_warn('macro_env_work_product',
+                         f'{_ids(macro_work)} 的「大环境识别项」里写了本拍的施工产物（挖出来的坑、'
+                         f'砌起来的墙…）。这一栏只写这地方本来长什么样：地貌、地质、气候光照、'
+                         f'空间包络。施工产物属于起始/结束状态——整条片子只有首拍和过门拍能填这一栏，'
+                         f'分一条给已经写过的结果，就少一条真环境。'))
+    if dup_detail:
+        out.append(_warn('detail_repeats_context',
+                         f'{_ids(dup_detail)} 的「细节识别项」里有一条在复述大环境或遗留痕迹已经写过的'
+                         f'东西。这一栏是原片长相在提示词里唯一的落脚点，配额只有 3~6 条，'
+                         f'重复一条就少一条真信息——换成这一拍主体身上还没写过的特征。'))
+    if thin_trace:
+        out.append(_warn('trace_without_mark',
+                         f'{_ids(thin_trace)} 的「遗留痕迹」里有一条没点名留下的是什么痕迹（斗痕、'
+                         f'压印、木屑、螺钉头…）。原本就在的环境物（落叶、青苔）不是这一拍留下的痕迹；'
+                         f'整栏会被拼成一个串下发，混进环境词会稀释真正的痕迹。'))
+    if vague_extent:
+        out.append(_warn('state_without_quantity',
+                         f'{_ids(vague_extent)} 的起始/结束状态只写了「样子」没写「量」。'
+                         f'完成范围要带一个量：比例、范围、齐平关系、高度差、几个开间都算'
+                         f'（「车顶与地面齐平、车身全部入坑」是量，「校车在坑里」不是）。'))
+    if echoed_state:
+        out.append(_warn('result_echoes_state',
+                         f'{_ids(echoed_state)} 的「可见结果」和「结束状态」几乎是同一句话。'
+                         f'两栏走的是不同通路，分工写才有意义：可见结果＝这一下看见了什么'
+                         f'（车体沉下去、吊索由紧转松），结束状态＝完成到哪儿（车顶与地面齐平）。'))
+    if wordy_op:
+        out.append(_warn('operation_not_a_token',
+                         f'{_ids(wordy_op)} 的「主导工序」写成了带宾语的整句。合成器拿它做相位判定，'
+                         f'长短语会把判定和中文翻译一起搞糊——写成 1~3 个词的里程碑工序词'
+                         f'（吊装就位 / seat bus），宾语和过程留给可见动作那一栏。'))
+    if no_anchor:
+        out.append(_warn('detail_without_position',
+                         f'{_ids(no_anchor)} 的「细节识别项」多数条目没说它在画面的哪儿。'
+                         f'每条＝材料 + 颜色/质感/状态 + 位置；少了位置，图像模型会把它摆在'
+                         f'自己顺手的地方，逐拍摆得还不一样。'))
+
+    if no_cast:
+        out.append(_warn('missing_cast_action',
+                         f'{_ids(no_cast)} 的画面里有人（或人偶），但没写他们在这一拍的'
+                         f'身体语言（姿态/朝向/视线/位移/手势）。这一栏空着，交付出来的人'
+                         f'就是从头到尾一动不动的——延时片里人是唯一的活物，冻住它等于把'
+                         f'片子做成静物展示。工序动作写在「可见动作」里，这一栏只写人本身。'))
+
+    if no_insert:
+        out.append(_warn('missing_insert_subject',
+                         f'{_ids(no_insert)} 在原片里切过刀，但没写「插入镜拍的是什么」。'
+                         f'多镜头交付会照排插入镜，这一栏空着就只能落回通用职责'
+                         f'（工具接触点 / 持久痕迹）——那是这条片子里任何一拍都能写的话，'
+                         f'不是**这一拍**的画面。'))
+
+    # 缺字段聚成一条。七种各报一条、每条再列十四个拍号，人工卡点就成了一面红墙，
+    # 读到第三条就开始整片忽略——真正的硬伤也一起被忽略掉。
+    gaps = [(key, label) for key, label in _CRAFT_FIELD_LABELS if missing[key]]
+    if gaps:
+        lines = '；'.join(
+            f'{label}（{_ids(missing[key])}）：{_CRAFT_FIELD_WHY[key].rstrip("。")}'
+            for key, label in gaps)
+        out.append(_warn('missing_craft_fields',
+                         f'这几拍的拍摄与工艺栏还空着——{lines}'))
+    return out
+
+
+_CRAFT_FIELD_WHY = {
+    'tool': '动作峰值上那件工具是「动作-工具-音效」三联里的一环，'
+            '塞在可见动作那句话里合成器读不出来。',
+    'sfx': '抽帧那边已经把音频瞬态算出来了，没有这一栏它就地蒸发，'
+           '而交付口径是 ASMR 原声 60%、BGM 0%——空着就只能由模型自己编声音。',
+    'shot_scale': '复刻线逐拍此前没有任何机位字段，空着等于这一拍的景别由合成器替原片决定。',
+    'camera_move': '同上——运镜空着，原片的镜头语言这一格就没锁住。',
+    'worker_count': '「有工人」那枚芯片只是个布尔，且它压根没进合成绑定，'
+                    '十几拍下来人数会自己漂。0 是清场帧，空着是没标注，两者不一样。',
+    'light_state': '延时片跨天跨时段，不逐拍声明光照，每拍的光就会自己跳。',
+    'material_flow': '挖出来的土去哪了、耗掉的料从哪来。Material & Spoil Balance 规则'
+                     '一直要求交代它，空着画面里就会出现凭空消失的渣土。',
+}
+
+
 def validate_beats(beats_doc, overview, schema=None):
     """返回 violations 列表；error 级别会触发回炉，warn 级别只在人工卡点上高亮。
 
@@ -2383,6 +2976,7 @@ def validate_beats(beats_doc, overview, schema=None):
     out.extend(_validate_space_monotonicity(beats))
     out.extend(_validate_temporary_objects(beats))
     out.extend(_validate_composer_frame_contract(beats))
+    out.extend(_validate_beat_craft(beats))
     return out
 
 
@@ -3013,7 +3607,9 @@ WHAT YOU MUST NOT CHANGE
 - The SPACE structure: which beats share a space and where the label changes. That pattern is how many times the film walks through a doorway and when — part of the rhythm skeleton, not of the subject. Rename each space to fit the new carrier ("main room" -> "bus saloon"), but keep the same beats sharing a label and the same beats starting a new one; never merge two spaces into one or invent a third.
 
 WHAT YOU REWRITE
-Only along the requested mutation axes: visual_subject, visible_details, visible_action, visible_result, state_before, state_after, persistent_traces, operation, and the space NAMES (never their grouping).
+Only along the requested mutation axes: visual_subject, visible_details, visible_action, visible_result, state_before, state_after, persistent_traces, operation, tool, sfx, material_flow, and the space NAMES (never their grouping).
+- tool / sfx / material_flow must be re-derived for the NEW carrier and its materials: the tool that achieves the same milestone on the new carrier, the sounds that tool and that material actually make, and where the new material's waste goes. A steel hull does not sound like a plaster wall.
+- shot_scale, camera_move and worker_count are the rhythm skeleton, not the subject. Leave them exactly as given; never restage the camera.
 
 RULES
 - Do not carry the old carrier's construction habits onto the new one. A bus does not get brick footings; a boat hull does not get drywall screwed to studs. Re-derive the operation that achieves the SAME stage milestone on the NEW carrier.
@@ -3051,7 +3647,10 @@ def mutate_beats(config, beats_doc, axis_spec, on_progress=None, max_rework=1):
         {k: b.get(k) for k in ('id', 'start', 'end', 'stage', 'operation',
                                'visual_subject', 'visible_details', 'visible_action',
                                'visible_result', 'state_before', 'state_after',
-                               'persistent_traces', 'workers_present')}
+                               'persistent_traces', 'workers_present',
+                               # 工具/音效/物料去向随载体变（巴士不用瓦刀，也不响瓦刀的声）；
+                               # 景别、运镜、人数属于节奏骨架，原样继承，不发给模型。
+                               'tool', 'sfx', 'material_flow')}
         for b in source_beats
     ], ensure_ascii=False, indent=2)
 
@@ -3119,7 +3718,8 @@ def _merge_variant(beats_doc, data, axes):
         new = dict(src)
         patch = rewritten.get(src.get('id')) or {}
         for key in ('visual_subject', 'visible_details', 'visible_action', 'visible_result',
-                    'state_before', 'state_after', 'persistent_traces', 'operation', 'space'):
+                    'state_before', 'state_after', 'persistent_traces', 'operation', 'space',
+                    'tool', 'sfx', 'material_flow'):
             if patch.get(key):
                 new[key] = patch[key]
                 # 中文对照是上一版英文的译文，改了英文就必须作废对应那条——留着它，
@@ -3347,6 +3947,7 @@ def autofix_beats(config, beats_doc, overview=None, on_progress=None, max_rework
         reconcile_event_coverage(beats_doc, overview)
         _heal_power_chain_mechanically(beats_doc)
         attach_coverage_frames(beats_doc, overview)
+        attach_shot_cuts(beats_doc, overview)
 
         violations = validate_beats(beats_doc, overview)
         remaining_errors = [v for v in violations if v.get('level') == 'error']
@@ -3482,6 +4083,7 @@ def autobalance_beats(beats_doc, overview=None, max_duration=6.0, min_duration=2
     normalize_beat_spaces(beats_doc)
     reconcile_event_coverage(beats_doc, overview)
     attach_coverage_frames(beats_doc, overview)
+    attach_shot_cuts(beats_doc, overview)
 
     try:
         from .duration_engine import calculate_beat_word_quota
@@ -3564,6 +4166,45 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
             value = str(beat.get(key) or '').strip()
             if value:
                 entry[key] = value
+
+        # 制作字段（2026-08-22）。此前这六件事在卡片上根本没有落脚点：工具与音效只能
+        # 混在动作那句英文里、机位压根没有字段、光照与物料去向直接丢掉。它们各自都有
+        # 一条已经在跑的下游规则在等（动作-工具-音效三联、ASMR 原声 60%、
+        # Material & Spoil Balance），只是没人喂。键名在这里就收短，因为清单条目会被
+        # 整段渲进规划提示词，长键名要按拍数乘一遍。
+        tool = str(beat.get('tool') or '').strip()
+        if tool:
+            entry['tool'] = tool
+        sfx = [str(x).strip() for x in (beat.get('sfx') or []) if str(x).strip()]
+        if sfx:
+            entry['sfx'] = sfx
+        for src, dst in (('shot_scale', 'shot_scale'), ('camera_move', 'camera_move'),
+                         ('light_state', 'light'), ('material_flow', 'flow')):
+            value = str(beat.get(src) or '').strip()
+            if value:
+                entry[dst] = value
+        if isinstance(beat.get('worker_count'), int):
+            # 写成字符串而不是整数：清单条目的富字段通路全是字符串键，
+            # 0 传下去还会被 `if value` 判成空。
+            entry['crew'] = str(beat['worker_count'])
+
+        # 观察到的镜头数（2026-08-23，多镜头兼容）。它**不进规划提示词**——镜头梯是
+        # 合成期由 composer 确定性排的，规划器不参与；把这个数渲给它只会诱导它往
+        # description 里写分镜。它走的是与 space 同一条通路：随清单条目落到
+        # parsed_brief['beat_outline']，再由 apply_observed_shot_counts 按下标贴回梯子。
+        if isinstance(beat.get('observed_shot_count'), int):
+            entry['shot_count'] = str(beat['observed_shot_count'])
+        if isinstance(beat.get('observed_shot_seconds'), (int, float)):
+            entry['shot_seconds'] = str(beat['observed_shot_seconds'])
+        # 插入镜主体走的是另一条通路：它是**内容**，规划器要把它织进这一拍的描述里，
+        # 所以它既进 parsed_brief（给合成期逐拍绑定）也进规划提示词（见
+        # build_outline_plan_block 的 INSERT 规则，只在多镜头链路上渲染）。
+        insert_subject = str(beat.get('insert_subject') or '').strip()
+        if insert_subject:
+            entry['insert'] = insert_subject
+        cast_action = str(beat.get('cast_action') or '').strip()
+        if cast_action:
+            entry['cast'] = cast_action
 
         # 中文简介与结构化对照透传（2026-08-16）：卡点上核对过的 zh 字段（包含 operation/headline/
         # visible_action/visible_result 等）必须透传给合成器。此前这里遗漏了 zh，导致合成出来的

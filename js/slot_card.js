@@ -65,6 +65,7 @@ function renderSlotCard(cardEl, state) {
     // fixable＝这一格有待修复的问题（审查未过或人工标记），也就是画着「修复此帧
     // 问题」的那些格子；工具条的「全部修复」按它取帧，与卡片按钮同源。
     cardEl.dataset.badges = String((state.badges || []).length);
+    cardEl.dataset.issueBadges = String((state.badges || []).filter(b => b.isIssue !== false).length);
     cardEl.dataset.fixable = (state.flags && state.flags.fixable) ? '1' : '0';
     cardEl.dataset.promptDirty = (state.badges || []).some(b => b.id === 'prompt-dirty') ? '1' : '0';
     // 拖出能力随状态走：只有真的有内容的格子能当换位的源。
@@ -182,7 +183,23 @@ function slotGridIsBusy(type) {
 
 const SLOT_ACTION_HANDLERS = {
     'retry-frame': seq => retrySingleFrame(seq),
-    'fix-frame': seq => fixFrameIssue(seq),
+    'fix-frame': async seq => {
+        const frames = (typeof currentIdea !== 'undefined' && currentIdea
+            && currentIdea.frameRun && currentIdea.frameRun.frames) || [];
+        const maxSeq = frames.reduce((m, f) => Math.max(m, f.sequence || 0), 0);
+        let cascade = false;
+        if (seq < maxSeq && typeof customConfirm === 'function') {
+            cascade = await customConfirm(
+                `修复 IMG ${String(seq).padStart(3, '0')} 属于关键硬装/透视修复。<br><br>`
+                + '<b>是否连带向后重渲后续下游帧？</b><br>'
+                + '· <b>连带重渲 (推荐)</b>：以修复后的新画面为基底向后链式重渲后续各帧，彻底消除下游血统断层（Stale）。<br>'
+                + '· <b>仅修当前帧</b>：仅重渲当前帧，后续各帧保持原样。',
+                '连带重渲下游 (推荐)',
+                '仅修当前帧'
+            );
+        }
+        return fixFrameIssue(seq, undefined, cascade);
+    },
     'undo-fix': seq => undoFrameFix(seq),
     'describe-frame': seq => describeFrameIssue(seq, currentFrameManualIssue(seq)),
     'view-candidates': seq => {

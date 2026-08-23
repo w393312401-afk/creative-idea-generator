@@ -174,6 +174,16 @@ class TestKnownGapsStayVisible:
             'omni-ugc-realism-layer',      # 纯风格取向，无确定性判定标准
         }
 
+    def test_miniature_gaps_are_exactly_the_three_we_accepted(self):
+        report = server_common.skill_contract_report('miniature')
+        assert set(report['unenforced']) == {
+            'miniature-craft-materials',
+            'miniature-figurines-presence',
+            # 2026-08-23 多镜头改造带进来的第三条：镜头名与切点表都有门禁，只有"切回镜
+            # 逐字写明同机位"这一句没有——它是一句自由措辞，正则化会连合法同义写法一起判死。
+            'miniature-locked-macro-setup',
+        }
+
 
 class TestReportCarriesRegistryStateToTheFrontend:
     @pytest.mark.parametrize('profile', ALL_PROFILES)

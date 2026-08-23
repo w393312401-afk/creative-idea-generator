@@ -69,8 +69,31 @@ const REPLICA_BEAT_STAGE_LABELS = {
 // 节拍卡片上按「一行一条」编辑的数组字段（timelapse-beats.schema.json 里的 array 项）。
 const REPLICA_LIST_FIELDS = new Set([
     'package_operations', 'persistent_traces', 'visible_details', 'macro_environment',
-    'source_event_ids', 'evidence_frames', 'reference_frames',
+    'source_event_ids', 'evidence_frames', 'reference_frames', 'sfx',
 ]);
+
+// 景别与运镜是闭集（timelapse-beats.schema.json / reverse.SHOT_SCALES、CAMERA_MOVES）。
+// 卡片上给下拉不给输入框：自由文本会被规划器当创作提示接着发挥，闭集值才是照抄。
+const REPLICA_SHOT_SCALES = [
+    ['', '— 未标注 —'],
+    ['extreme_wide', '大远景'],
+    ['wide', '远景'],
+    ['medium', '中景'],
+    ['close', '近景'],
+    ['extreme_close', '特写'],
+];
+const REPLICA_CAMERA_MOVES = [
+    ['', '— 未标注 —'],
+    ['static', '固定'],
+    ['push_in', '缓推'],
+    ['pull_out', '缓拉'],
+    ['pan', '横摇'],
+    ['tilt', '俯仰摇'],
+    ['orbit', '环绕'],
+    ['follow', '跟随'],
+    ['handheld', '手持'],
+    ['crane', '升降'],
+];
 
 let replicaActivePreset = 'custom';
 let replicaAiIdeas = [];
@@ -1428,6 +1451,7 @@ function replicaRenderBeats(state) {
             这是整条链路上唯一能拦住「模型脑补了一个不存在的工序」的地方。对着证据帧核对，
             改完记得保存——保存会立刻重跑一遍校验。
         </p>
+        ${replicaShotRhythmLine(doc)}
         ${banner}
         ${replicaRenderBeatTimeline(doc, state)}
 
@@ -1515,6 +1539,10 @@ const REPLICA_SCENE_CONSTANT_FIELDS = [
     ['materials', '常驻材质与表面'],
     ['traces', '常驻痕迹与风化'],
     ['fixtures_in_shot', '常驻画面的器具'],
+    // 这一栏与上面四栏不同：它不是「一直在」而是「一直在动」，而且**统计不出来**
+    // （帧事实是一张张静止画面的清单，看不出水在流）。由 Pass B 读帧序列产出，
+    // 或者在这里手补——漏掉它，交付出来的背景就是一张静止照片。
+    ['motion', '常驻运动（溪水/烟/火苗/风吹树冠/雨雪/飘尘 —— 一直在动的东西）'],
 ];
 
 function replicaRenderSceneConstants(doc) {
@@ -1591,6 +1619,45 @@ function replicaRenderTimeWindows(doc) {
 // 这一拍的空间标记。过门是复刻里最容易整段丢掉的东西——原片走廊尽头那道门再进一次，
 // 复刻里可能一次都没进（2026-08-14 复盘）。合成期按 space 序列逐处标过门，所以这里把
 // 「本拍换空间了」直接写在卡片头上：用户核对时看得见有没有多、有没有少。
+// 原片这一拍由几个镜头组成（reverse.attach_shot_cuts 派生自 video_overview.json 的
+// cut_points）。字段缺席 = 未知（老 job / 二创变体 / 抽帧异常），什么都不显示——显示
+// 一个「一镜」比不显示更误导。多镜头链路按这个数挑三镜梯还是四镜梯。
+// 整条阶梯的剪辑节奏概览。与 reverse.observed_shot_stats 同口径（那一份给合成前的
+// 偏差告警用，这一份给卡点上的人看），任一侧改判据都要同时改另一侧。
+function replicaShotRhythmLine(doc) {
+    const beats = (doc.beats || []).filter(b => typeof b.observed_shot_count === 'number');
+    if (!beats.length) return '';
+    const counts = beats.map(b => b.observed_shot_count);
+    const cuts = beats.reduce((n, b) => n + ((b.observed_cuts || []).length), 0);
+    const span = beats.reduce((n, b) => n + Math.max(0, (b.end || 0) - (b.start || 0)), 0);
+    const lens = beats.map(b => b.observed_shot_seconds).filter(x => typeof x === 'number' && x > 0);
+    const avg = (counts.reduce((a, c) => a + c, 0) / counts.length).toFixed(2);
+    // 报**切点率与镜长**，不报「几拍是一镜」。原片一拍三秒半、交付一拍八秒，
+    // 按镜头数比的是两个拍长不同的东西：实测一条 77 秒片，原片 0.26 刀/秒、
+    // 交付三镜 0.25 刀/秒，节奏其实是对上的，而按镜头数会把 7 拍误标成偏差。
+    const rate = span > 0 ? (cuts / span).toFixed(2) : null;
+    const avgLen = lens.length ? (lens.reduce((a, c) => a + c, 0) / lens.length).toFixed(1) : null;
+    const parts = [`${beats.length} 拍内共 ${cuts} 刀，平均 ${avg} 镜/拍，最多 ${Math.max(...counts)} 镜`];
+    if (rate) parts.push(`拍内切点率 ${rate} 刀/秒`);
+    if (avgLen) parts.push(`平均每镜 ${avgLen}s`);
+    return `<p class="replica-hint">🎬 原片剪辑节奏：${parts.join('；')}。交付会把每一拍拉到固定片长，
+        所以能对齐的是<b>切点率</b>而不是逐拍镜头数——镜长与原片差一倍以上的拍会在合成日志里单独点名。</p>`;
+}
+
+function replicaShotCutChip(beat) {
+    const count = beat && beat.observed_shot_count;
+    if (typeof count !== 'number' || count < 1) return '';
+    const cuts = Array.isArray(beat.observed_cuts) ? beat.observed_cuts : [];
+    const marks = cuts.length ? `切点 ${cuts.map(t => `${t}s`).join(' / ')}` : '内部无切点';
+    const secs = beat.observed_shot_seconds;
+    // 镜长必须跟镜头数一起给：一拍三秒半里的「一镜」和八秒交付里的「三镜」，
+    // 每镜时长其实是同一个量级。只看镜头数会把前者误读成节奏对不上。
+    const len = (typeof secs === 'number' && secs > 0) ? ` · 每镜 ${secs}s` : '';
+    const cls = count > 1 ? ' replica-chip-multishot' : '';
+    const label = count > 1 ? `原片 ${count} 镜` : '原片一镜';
+    return `<span class="replica-chip${cls}" title="原片这一拍在 ${beat.start}s – ${beat.end}s 内${marks}。镜头梯把它夹进合法区间（三镜/四镜）：原片三镜就排三镜、四镜就排四镜，一到两镜排三镜下限。">🎬 ${label}${len}</span>`;
+}
+
 function replicaSpaceChip(beat, idx, previousSpace) {
     const space = String(beat.space || '').trim();
     if (!space) return '';
@@ -1642,6 +1709,30 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
             ${mirror(key)}
         </label>`;
 
+    // 闭集字段。收下拉不收输入框，理由见 REPLICA_SHOT_SCALES 上方那段注释。
+    const selectField = (key, label, options) => {
+        const current = String(beat[key] || '');
+        return `
+        <label class="replica-field">
+            <span class="replica-field-label">${label}</span>
+            <select class="replica-select" data-beat="${idx}" data-key="${key}">
+                ${options.map(([value, text]) => `
+                    <option value="${escapeHtmlReplica(value)}"${value === current ? ' selected' : ''}
+                        >${escapeHtmlReplica(text)}</option>`).join('')}
+            </select>
+        </label>`;
+    };
+
+    // 人数。空着 = 没标注（保留 workers_present 那枚布尔芯片的旧口径）；填了数就以数为准，
+    // 后端 normalize_beat_craft_fields 会据此回写 workers_present，两处不会打架。
+    const numberField = (key, label) => `
+        <label class="replica-field">
+            <span class="replica-field-label">${label}</span>
+            <input class="replica-number" type="number" min="0" max="12" step="1"
+                   data-beat="${idx}" data-key="${key}" data-num="1"
+                   value="${typeof beat[key] === 'number' ? beat[key] : ''}">
+        </label>`;
+
     const violations = state.validation || (state.beats && state.beats.validation) || [];
     const isErr = violations.some(v => v.level === 'error' && v.beat_id === beat.id);
     const isMobile = typeof window !== 'undefined' && typeof window.innerWidth === 'number' && window.innerWidth <= 768;
@@ -1666,9 +1757,9 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
 
     let macroEnvField = '';
     if (isFirstBeat) {
-        macroEnvField = field('macro_environment', '大环境识别项（锚点首拍必填：地貌水体、气候光照、空间包络与周边宏观环境；一行一条）', 2);
+        macroEnvField = field('macro_environment', '大环境识别项（锚点首拍必填：地貌水体、气候光照、空间包络；一行一条。只写这地方本来长什么样，本拍挖出来/砌起来的东西写进起始状态）', 2);
     } else if (isThreshold) {
-        macroEnvField = field('macro_environment', '大环境识别项（过门新空间首拍：新空间地貌、气候光照、空间三维包络；一行一条）', 2);
+        macroEnvField = field('macro_environment', '大环境识别项（过门新空间首拍：新空间地貌、气候光照、空间三维包络；一行一条。不写本拍施工产物）', 2);
     } else if (hasMacroEnv) {
         macroEnvField = field('macro_environment', '大环境识别项（非首拍/过门拍建议留空以减少大模型干扰；一行一条）', 2);
     } else {
@@ -1697,6 +1788,7 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
                 ? `<span class="replica-chip">事件 ${escapeHtmlReplica(beat.source_event_ids.join(','))}</span>` : ''}
             <span class="replica-chip">${beat.workers_present ? '有工人' : '清场帧（锚点候选）'}</span>
             ${replicaSpaceChip(beat, idx, previousSpace)}
+            ${replicaShotCutChip(beat)}
             ${typeof beat.confidence === 'number' && beat.confidence < 0.5
                 ? '<span class="replica-chip replica-chip-error">低置信</span>' : ''}
             <span class="replica-beat-tools">
@@ -1723,17 +1815,43 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
             <div class="replica-beat-fields">
                 ${field('space', '所在空间（同一个空间逐字沿用同一个名字；换名字＝机位穿过开口进了另一个空间，会多出一次过门）')}
                 ${macroEnvField}
-                ${field('visual_subject', '画面主体')}
-                ${field('operation', '主导工序')}
+                ${field('operation', '主导工序（1~3 个词的里程碑工序词，如「吊装就位 / seat bus」；别写成带宾语的整句，合成器拿它做相位判定）')}
                 ${field('package_operations',
                         `工序包（一行一道，须 2~3 道；当前 ${(beat.package_operations || []).length} 道）`, 2)}
                 ${field('visible_details',
-                        `细节识别项（一行一条，须 3~6 条；当前 ${(beat.visible_details || []).length} 条）`, 2)}
+                        `细节识别项（一行一条，须 3~6 条、建议顶到 5~6；当前 ${(beat.visible_details || []).length} 条。每条＝材料+颜色/质感/状态+位置；别复述大环境或遗留痕迹）`, 2)}
                 ${field('visible_action', '可见动作', 2)}
-                ${field('visible_result', '可见结果', 2)}
-                ${field('state_before', '起始状态（须写具体空间完成范围）', 2)}
-                ${field('state_after', '结束状态（须写具体空间完成范围）', 2)}
-                ${field('persistent_traces', '遗留痕迹（一行一条）', 2)}
+                ${field('visible_result', '可见结果（这一下看见了什么：车体沉下去、吊索由紧转松）', 2)}
+                ${field('state_before', '起始状态（写「量」不是写「样」：范围/比例/齐平关系/高度差）', 2)}
+                ${field('state_after', '结束状态（完成到哪儿，须带一个量，别把可见结果再写一遍）', 2)}
+                ${field('persistent_traces',
+                        `遗留痕迹（一行一条，须 ≥2 条；当前 ${(beat.persistent_traces || []).length} 条。只写本拍新留下的痕迹＋它落在哪个面上，原本就有的落叶青苔不算）`, 2)}
+            </div>
+            <div class="replica-beat-fields replica-beat-craft">
+                ${field('tool', '主导工具（动作峰值上那一件：吊车 / 冲击钻 / 橡胶锤。三联绑定的一环，塞在动作句里合成器读不出来）')}
+                ${field('sfx',
+                        `本拍声音（一行一个声源，1~3 条；当前 ${(beat.sfx || []).length} 条。原声物理音，绝不写配乐——交付口径是 ASMR 60% / BGM 0%）`, 2)}
+                ${selectField('shot_scale', '景别', REPLICA_SHOT_SCALES)}
+                ${selectField('camera_move', '运镜', REPLICA_CAMERA_MOVES)}
+                ${numberField('worker_count', '工人数（0＝清场帧）')}
+                ${beat.workers_present
+                    ? field('cast_action', '人物动作神情（画面里的人/人偶除了干活以外的身体语言：姿态、朝向、视线、比上一拍移动了多少、手势。别把可见动作再写一遍——那一栏是工序，这一栏是人。空着交付出来的人就是一动不动的）', 2)
+                    : `<details class="replica-field-optional">
+                        <summary class="replica-hint">＋ 人物动作神情（本拍标注为清场帧，画面里没人；有人偶在旁观的话仍然要写）</summary>
+                        ${field('cast_action', '人物动作神情（姿态/朝向/视线/位移/手势）', 2)}
+                       </details>`}
+                ${field('light_state', '光照时段（如「阴天正午、无投影」；延时片跨天，不逐拍声明光就会自己跳）')}
+                ${field('material_flow', '物料去向（挖出来的土去哪了 / 耗掉的料从哪来）')}
+                ${(typeof beat.observed_shot_count === 'number' && beat.observed_shot_count >= 2)
+                    ? field('insert_subject', '插入镜主体（原片这一拍切进特写时拍的是什么，如「镊子尖压住的那片瓦」。空着就落回通用职责——工具接触点/持久痕迹，那是任何一拍都能写的话）')
+                    : `<details class="replica-field-optional">
+                        <summary class="replica-hint">＋ 插入镜主体（原片这一拍是一镜到底，没有插入镜可抄；编一个会被照抄进成片）</summary>
+                        ${field('insert_subject', '插入镜主体')}
+                       </details>`}
+                <details class="replica-field-optional">
+                    <summary class="replica-hint">＋ 画面主体（派生字段：只在可见动作与可见结果都空着时兜底，另供自动标题取主语；平时不必改）</summary>
+                    ${field('visual_subject', '画面主体')}
+                </details>
             </div>
         </div>
     </div>`;
@@ -2197,6 +2315,20 @@ function replicaBindBeatEvents(scope) {
             const target = beat[parseInt(el.dataset.beat, 10)];
             if (!target) return;
             const key = el.dataset.key;
+            if (el.dataset.num) {
+                // 清空 = 撤回标注，不是 0 人。0 是「清场帧」这个真实断言，两者不能混。
+                const raw = el.value.trim();
+                if (!raw) {
+                    delete target[key];
+                } else {
+                    const n = parseInt(raw, 10);
+                    if (!Number.isNaN(n)) target[key] = Math.max(0, Math.min(12, n));
+                }
+                if (key === 'worker_count' && typeof target.worker_count === 'number') {
+                    target.workers_present = target.worker_count > 0;
+                }
+                return;
+            }
             target[key] = (REPLICA_LIST_FIELDS.has(key) || Array.isArray(target[key]))
                 ? el.value.split('\n').map(s => s.trim()).filter(Boolean)
                 : el.value.trim();
@@ -2444,15 +2576,39 @@ function replicaToast(msg, isError) {
                                    isError ? 12000 : 5000);
 }
 
-// 转圈只加在**触发操作的那个按钮**上。原先是整页 disable：几十个按钮一起变灰，
-// 用户既看不出是哪一步在跑，也无法取消。
+// 转圈只加在**触发操作的那个按钮**上。
+// 导航、回到顶部、中断取消、跳轨定位与纯查看折叠等浏览类控件在运行中必须保持可用，
+// 不能被全页 busy 误伤成 disabled，否则用户在跑长任务时无法滚动导航与查看进度。
 function replicaSetBusy(busy, activeBtn) {
     replicaBusy = busy;
     const root = replicaRoot();
     if (!root) return;
     root.querySelectorAll('button').forEach(b => {
-        // 取消按钮必须在跑的时候还能按——它存在的全部意义就是打断正在跑的东西。
-        if (b.id === 'replica-cancel-btn') return;
+        // 导航类与纯查看/中断交互在运行中保持可用：
+        const isNavOrReadOnly = (
+            b.id === 'replica-cancel-btn' ||
+            b.id === 'replica-bar-cancel-btn' ||
+            b.id === 'replica-bar-errors-btn' ||
+            b.dataset.floatAction === 'top' ||
+            b.dataset.navTarget ||
+            b.classList.contains('replica-nav-item') ||
+            b.dataset.jumpBeat ||
+            b.classList.contains('replica-jump') ||
+            b.classList.contains('replica-beat-jump-btn') ||
+            b.dataset.toggleVariants ||
+            b.dataset.beatFold ||
+            b.id === 'replica-toggle-fold-all' ||
+            b.id === 'replica-toggle-extract-btn' ||
+            b.id === 'replica-close-comparator-btn' ||
+            b.id === 'replica-toggle-comparator-btn' ||
+            b.classList.contains('spark-drawer-toggle') ||
+            b.classList.contains('modal-close') ||
+            b.classList.contains('viewer-close')
+        );
+        if (isNavOrReadOnly) {
+            b.disabled = b.hasAttribute('data-perm-disabled');
+            return;
+        }
         b.disabled = busy || b.hasAttribute('data-perm-disabled');
         b.classList.toggle('is-running', busy && b === activeBtn);
     });

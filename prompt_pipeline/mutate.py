@@ -392,12 +392,16 @@ def generate_orthogonal_variant(
             effective_axes
         )
 
-        # 1.5 动态刷新 ASMR 音效特征
-        v_beat['audio_asmr_cues'] = map_asmr_audio(
+        # 1.5 动态刷新 ASMR 音效特征。落到 `sfx` 这个契约键上：`audio_asmr_cues` 是这里
+        # 一直在写、而全链路一处也没在读的键，写完就断在这儿。`sfx` 才有出口
+        # （reverse.beats_to_dimensions → build_outline_plan_block 的 SFX 规则）。
+        # 旧键同步保留，存量变体文档读它的地方不至于突然空掉。
+        v_beat['sfx'] = map_asmr_audio(
             v_beat['stage'],
             effective_axes.get('material', ''),
             v_beat['visible_action']
         )
+        v_beat['audio_asmr_cues'] = list(v_beat['sfx'])
 
         # 1.6 清空过期的中文对照
         v_beat['zh'] = {}

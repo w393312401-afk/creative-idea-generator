@@ -1,0 +1,130 @@
+{
+  "contract_version": "1.0",
+  "package": "gemini-miniature-restoration-composer",
+  "profile": "miniature",
+  "_comment": [
+    "微缩模型与巨人手建造包（gemini-miniature-restoration-composer）的契约注册表。",
+    "将散文规范映射到真实的 Python 门禁与 Composer 验证器上。",
+    "镜头语法三条（ladder / timeline / one-take ban）的执行者在 composers/omni.py：",
+    "机制与 omni 共用一套，miniature 只换镜头名与逐镜职责（见 MiniatureComposer.ladder_for_kind），",
+    "因此违规项也照 omni 的前缀上报并按结构性硬伤回炉。"
+  ],
+  "inherits_from": "gemini-veo-restoration-composer",
+  "contracts": [
+    {
+      "id": "miniature-macro-optics",
+      "level": "P0",
+      "scope": "both",
+      "summary": "微距摄影与景深控制：必须明确声明微距镜头（macro lens）、浅景深（shallow depth of field）与模型眼平高度（model eye-level / 30-45 degree oblique），禁止使用 24mm 广角建筑走入机位",
+      "source": "references/miniature-scene-skeleton.md",
+      "enforcer": "prompt_pipeline.composers.miniature:check_miniature_macro_optics"
+    },
+    {
+      "id": "miniature-giant-hand-actor",
+      "level": "P0",
+      "scope": "both",
+      "summary": "施工主体与执行者契约：严禁出现 1.78m 施工工人或在微缩模型内走动的真人；施工动作必须由从边缘伸入的超大真人手（oversized human hands / macro fingers）配合微型工具交付",
+      "source": "references/miniature-macro-language.md",
+      "enforcer": "prompt_pipeline.composers.miniature:check_miniature_actor_violations"
+    },
+    {
+      "id": "miniature-cutaway-framing",
+      "level": "P0",
+      "scope": "both",
+      "summary": "娃娃屋敞开立面/剖面契约：室内工序必须保持在外部拍摄的敞开式剖面（open-front cutaway / modular dollhouse view），严禁走入式穿门（walk-in threshold）进室内",
+      "source": "references/miniature-cutaway-architecture.md",
+      "enforcer": "prompt_pipeline.composers.miniature:check_miniature_cutaway_framing"
+    },
+    {
+      "id": "miniature-multishot-ladder",
+      "level": "P0",
+      "scope": "video",
+      "summary": "多镜头组接：每条 VIDEO 必须按 macro working shot → close-up insert（→ extreme close-up insert）→ returning macro shot 的顺序写满，镜头名齐全且不得混入梯外景别；首末两镜是同一台锁死的微距机位",
+      "source": "references/miniature-multishot-language.md",
+      "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
+    },
+    {
+      "id": "miniature-shot-timeline",
+      "level": "P0",
+      "scope": "video",
+      "summary": "切点表：正文必须在锚定开场句之后原样带上本片长与本镜头梯对应的 Cut this ...-second clip 时间线句；它由 composer 确定性注入并覆写，也是全篇唯一允许出现阿拉伯数字的地方",
+      "source": "references/miniature-multishot-language.md#切点表",
+      "enforcer": "prompt_pipeline.composers.omni:omni_video_violations"
+    },
+    {
+      "id": "miniature-one-take-ban",
+      "level": "P0",
+      "scope": "video",
+      "summary": "一镜到底禁令：禁止 oner / one-shot / one-take / single continuous take / unbroken take 及旧的 continuous miniature craft time-lapse 措辞，揭示拍与最终兑现拍同样没有例外",
+      "source": "references/miniature-multishot-language.md#节奏声明",
+      "enforcer": "prompt_pipeline.composers.omni:strip_one_take_language"
+    },
+    {
+      "id": "miniature-locked-macro-setup",
+      "level": "P0",
+      "scope": "video",
+      "summary": "机位锁死：相机不摇不推不拉不进模型，所谓运动只是巨人手与材料在动；插入镜是同一台机位上的细部，切回镜要写明 the same locked macro setup as the opening macro working shot",
+      "source": "references/miniature-multishot-language.md#一条主工作镜被一到两个特写插入切开",
+      "enforcer": null,
+      "gap": "镜头名与切点表已由 omni_video_violations 钉住；'切回镜逐字写明同机位' 这一句目前只由 system prompt 与范例引导，没有独立门禁——它是一句自由措辞，正则化会把合法的同义写法一起判死"
+    },
+    {
+      "id": "miniature-craft-materials",
+      "level": "P1",
+      "scope": "both",
+      "summary": "微缩手工艺材质与工具：材料需具体声明为微缩椴木板条、微缩水泥砖、点胶、微型五金等微观材质，避免大型市政土木工程名词",
+      "source": "references/miniature-materials-and-tools.md",
+      "enforcer": null,
+      "gap": "由提示词模板中的材质词表引导并由 Composer 自动合规化"
+    },
+    {
+      "id": "miniature-figurines-presence",
+      "level": "P1",
+      "scope": "image",
+      "summary": "微缩住户人偶：在场地起手帧与最终完工帧必须呈现 1:24 微缩树脂人偶（miniature figurines / tiny resident couple），建立人机尺度趣味对比",
+      "source": "references/miniature-macro-language.md",
+      "enforcer": null,
+      "gap": "由提示词模板中的角色注入规则引导"
+    },
+    {
+      "id": "miniature-notation-ban",
+      "level": "P2",
+      "scope": "both",
+      "summary": "自然语言视觉化：正文禁止阿拉伯数字、百分号及内部符号记法",
+      "source": "references/miniature-output-templates.md",
+      "enforcer": "prompt_pipeline:check_nlvtr_violations"
+    },
+    {
+      "id": "shelter-only-destiny",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "SHELTER-ONLY：归宿必须是能住人的私人微缩庇护所/微型住宅，商业/公共/大型展厅类一律否决",
+      "source": "references/idea-engine.md#Axis 4",
+      "enforcer": "prompt_pipeline:ideation_shelter_violations"
+    },
+    {
+      "id": "salvage-and-rebuild",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "旧物再生（DIY 内核）：每条选题必须申报一件被拆下来、改造成微缩家具/装饰的原生构件",
+      "source": "references/idea-engine.md#Axis 4",
+      "enforcer": "prompt_pipeline:ideation_salvage_violations"
+    },
+    {
+      "id": "used-topic-ledger-dedup",
+      "level": "P0",
+      "scope": "pipeline",
+      "summary": "历史选题台账去重：twist 根级去重，换个壳子套同一个微缩 twist 算变体不算新选题",
+      "source": "references/idea-engine.md#2.3",
+      "enforcer": "prompt_pipeline:ideation_twist_root_violations"
+    },
+    {
+      "id": "carrier-family-quota",
+      "level": "P1",
+      "scope": "pipeline",
+      "summary": "载体家族配额：一批里天然原位壳体（树桩/天然石/葫芦/椰壳）不超过三分之一",
+      "source": "references/idea-engine.md#2.3b",
+      "enforcer": "prompt_pipeline:ideation_family_quota_violations"
+    }
+  ]
+}

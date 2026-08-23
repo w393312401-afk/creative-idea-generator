@@ -187,7 +187,9 @@ What the schema cannot enforce, and you must:
 
 - Only what the frames actually show. Inference, common sense, and industry habit are not observations.
 - `banned_elements[]` is the inverse list: things a renovation of this type would plausibly involve but that appear in no reviewed frame. They must not appear in any IMAGE or VIDEO prompt.
-- `state_before` / `state_after` must state concrete spatial completion extent (for example `left two-thirds of the wall primed, right third bare plaster`), never `partially done`.
+- `state_before` / `state_after` must state concrete spatial completion extent (for example `left two-thirds of the wall primed, right third bare plaster`), never `partially done`. A completion extent carries a quantity; a picture of the work does not.
+- `macro_environment`, `visible_details` and `persistent_traces` are three separate budgets, and each line spent restating another one of them is a line not describing this beat. The macro list is the place as it stands on its own, never the work done to it; the detail list is what makes this subject recognisable; the trace list is only what THIS beat left behind.
+- `visible_result` and `state_after` are not the same sentence: the first is what you see at the moment the action lands, the second is how far the work got.
 - Every `change_events` entry must appear in exactly one beat's `source_event_ids`.
 - Check the observed beat order against the Construction Sequence Logic. If the observed order seems to violate a hard veto (for example paint before primer), re-inspect the frames first — the more likely explanation is a misread frame, not an impossible build.
 
@@ -197,6 +199,7 @@ What the schema cannot enforce, and you must:
 - IMAGE anchors come from clean frames (`workers_present: false`) at or near beat boundaries. The anchor description must match the evidence frame's actual state, including its `persistent_traces`.
 - Each VIDEO prompt covers exactly one beat, rendered as this clip length's mandatory shot structure; the inserts must use the beat's actual visible tool contact and traces.
 - `state_before` / `state_after` become the anchor delta; `persistent_traces` feed the cumulative state rules.
+- `tool` and `sfx` are the tool and audio halves of the Action-Tool-SFX triad — the VIDEO prompt binds them to the moment the action lands, and the delivery carries physical sound only, no score. `shot_scale` / `camera_move` are the reference film's own framing and camera behaviour for that beat and are reproduced, not re-invented; `worker_count` fixes the cast so it cannot drift between beats; `light_state` holds the light steady except where the film itself changes it; `material_flow` is what satisfies the spoil-and-stock balance in the prompt.
 - `banned_elements` is enforced during the P0 gate: any banned element appearing in a prompt is a rewrite-before-delivery failure.
 - All normal output contract rules and audit gates still apply.
 

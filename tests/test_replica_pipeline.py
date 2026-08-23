@@ -434,6 +434,76 @@ class TestComposeGate(ReplicaTempRootCase):
             self.assertEqual(out['banned_hits'], [])
             mock_write.assert_called_once()
 
+    def test_recluster_invalidates_prompt_block_and_compose_state(self):
+        """重跑聚类时必须清除旧提示词与 compose_state.json，防止后续合成秒进快速通道复用旧提示词。"""
+        state = self._ingest()
+        state['prompt_block'] = 'VIDEO 1: old prompt text'
+        state['stage'] = 'completed'
+        c_path = rp._compose_state_path(state['job_id'])
+        with open(c_path, 'w', encoding='utf-8') as f:
+            json.dump({'packet': {}, 'beat_ladder': []}, f)
+        state['compose_state_path'] = c_path
+        rp._save_state(state)
+
+        with patch('prompt_pipeline.reverse.extract_frame_facts', return_value={'facts': []}), \
+             patch('prompt_pipeline.reverse.verify_peak_frames', return_value={'facts': []}), \
+             patch('prompt_pipeline.reverse.cluster_beats', return_value={'beats': [{'id': 'B01'}], 'validation': []}), \
+             patch('prompt_pipeline.reverse.translate_beats', return_value=1):
+            out = rp.run_reverse(state, {})
+
+        self.assertEqual(out['stage'], 'review_beats')
+        self.assertIsNone(out['prompt_block'])
+        self.assertIsNone(out['compose_state_path'])
+        self.assertFalse(os.path.exists(c_path))
+
+        # 后续再次点击合成提示词，必须真实调用大模型合成器，绝不能走快速通道秒成功
+        with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'title': 'T', 'packet': {}, 'beat_ladder': []}) as mock_anchor, \
+             patch('prompt_pipeline.compose_remaining_beats', return_value='===PROMPTS===\nVIDEO 1: newly generated') as mock_beats, \
+             patch('server_common.write_library_item'):
+            composed_out = rp.run_compose(out, {})
+            mock_anchor.assert_called_once()
+            mock_beats.assert_called_once()
+            self.assertIn('newly generated', composed_out['prompt_block'])
+
+    def test_save_beats_invalidates_prompt_block_when_beats_change(self):
+        """在 review_beats 阶段保存修改后的节拍，必须清理已有的旧 prompt_block。"""
+        state = self._ingest()
+        state['prompt_block'] = 'VIDEO 1: old prompt'
+        state['stage'] = 'review_beats'
+        rp._save_state(state)
+
+        # 准备 overview.json
+        ov_path = os.path.join(rp.job_dir(state['job_id']), 'video_overview.json')
+        with open(ov_path, 'w', encoding='utf-8') as f:
+            json.dump({'review_sampling': {'frames': []}, 'change_events': []}, f)
+
+        saved = rp.save_beats(state['job_id'], {'beats': [{'id': 'B01', 'start': 0, 'end': 2}]})
+        self.assertIsNone(saved['prompt_block'])
+
+    def test_autofix_and_autobalance_invalidate_prompt_block(self):
+        """AI 修复或自动平衡时序后，必须清理旧 prompt_block。"""
+        state = self._ingest()
+        state['prompt_block'] = 'VIDEO 1: old prompt'
+        state['beats'] = {'beats': [{'id': 'B01', 'start': 0, 'end': 8, 'camera_movement': 'static'}]}
+        state['stage'] = 'review_beats'
+        rp._save_state(state)
+
+        ov_path = os.path.join(rp.job_dir(state['job_id']), 'video_overview.json')
+        with open(ov_path, 'w', encoding='utf-8') as f:
+            json.dump({'review_sampling': {'frames': []}, 'change_events': []}, f)
+
+        with patch('prompt_pipeline.reverse.autofix_beats', return_value=({'beats': [{'id': 'B01'}]}, 1)), \
+             patch('prompt_pipeline.reverse.translate_beats', return_value=1):
+            fixed_state, _ = rp.autofix_job_beats({}, state['job_id'])
+            self.assertIsNone(fixed_state['prompt_block'])
+
+        state['prompt_block'] = 'VIDEO 1: old prompt'
+        rp._save_state(state)
+        with patch('prompt_pipeline.reverse.autobalance_beats', return_value=({'beats': [{'id': 'B01'}]}, 1)), \
+             patch('prompt_pipeline.reverse.translate_beats', return_value=1):
+            balanced_state, _ = rp.autobalance_job_beats({}, state['job_id'])
+            self.assertIsNone(balanced_state['prompt_block'])
+
 
 
 class TestComposedBlockHasNoDocumentWrapper(ReplicaTempRootCase):

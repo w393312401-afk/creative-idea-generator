@@ -15,6 +15,7 @@ from prompt_pipeline import (
     _format_prompt_block,
     prompt_block_from_output,
     prompt_slots_list,
+    optimize_video_prompts_for_sequence,
 )
 from pipeline_orchestrator import render_single_frame, _render_videos_with_recovery, persist_outline_delivery_ledger
 from frame_generator import generate_frame_sequence
@@ -364,7 +365,16 @@ def advance_stepped_pipeline(title, action='approve', on_progress=None, config=N
                 _save_state(title, state)
                 
                 if on_progress:
-                    on_progress('stepped_stage', {'stage': 'render_videos', 'message': '阶段 7/7: 开始生成并处理所有视频段落...'})
+                    on_progress('stepped_stage', {'stage': 'render_videos', 'message': '阶段 7/7: 开始依据真实画面差量优化视频提示词并生成视频段落...'})
+
+                # 视频生成前优化门：根据真实渲染的帧序列画面差量优化所有视频提示词，以防跳变
+                try:
+                    state['prompt_block'] = optimize_video_prompts_for_sequence(
+                        config, title, state['prompt_block'], on_progress=on_progress
+                    )
+                    _save_state(title, state)
+                except Exception as opt_err:
+                    print(f"[STEPPED] Video prompt optimization warning: {opt_err}")
                     
                 video_result = _render_videos_with_recovery(config, title, state['prompt_block'], on_progress=on_progress,
                                                             project_dir=_get_project_dir(title))

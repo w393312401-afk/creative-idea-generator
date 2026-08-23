@@ -585,3 +585,27 @@ def test_credit_below_min_threshold_automatically_disables_account(monkeypatch):
     assert result2["disabled"] is False
     assert result2.get("disabled_reason") is None
     assert pool.pick_account(min_credit=15)["user_id"] == "user_low_credit"
+
+
+def test_tasks_since_check_triggers_stale_probe(monkeypatch):
+    pool = ap.AccountPool()
+    pool.add_account("user_active")
+
+    # Set initial credit to 180 probed earlier
+    state = ap._read_state()
+    state["user_active"]["credit"] = 180
+    state["user_active"]["last_checked_at"] = "2026-08-23T08:00:00+08:00"
+    # But later at 09:00 it executed tasks and succeeded
+    state["user_active"]["last_success_at"] = "2026-08-23T09:00:00+08:00"
+    ap._write_state(state)
+
+    # Even though STALE_AFTER_SECONDS is huge (e.g. 6 hours), tasks_since_check should trigger a refresh!
+    monkeypatch.setattr(ap, "STALE_AFTER_SECONDS", 21600)
+    probed = []
+    from integrations.google_fx.services import google_fx_credit as credit_module
+    monkeypatch.setattr(credit_module, "probe_flow_credit", lambda user_id, port=None: (probed.append(user_id) or 0))
+
+    chosen = pool.pick_account(min_credit=15)
+    # The active account should have been probed because tasks ran since last check, found to have 0 credits, and skipped
+    assert "user_active" in probed
+    assert chosen is None

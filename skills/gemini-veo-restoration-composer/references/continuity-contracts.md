@@ -161,7 +161,7 @@ IMAGE 100-200 词、VIDEO 120-240 词的硬性区间（2026-08-07 从 100-170/12
 
 ### `mirror-reflective-alignment`
 
-结尾 IMAGE 如果描述了高反光地面，必须带 RHMA-Blur 式的高模糊低光泽反射描述子句（子句本身在最终正文里以自然语言呈现，不留 RHMA-Blur 缩写）。
+结尾 IMAGE 只有在**梯子里真有一拍交付过高反光面**（环氧/清漆/亮漆/抛光/湿光封闭）时才允许写高反光地面；允许时必须带 RHMA-Blur 式的高模糊低光泽反射描述子句（子句本身在最终正文里以自然语言呈现，不留 RHMA-Blur 缩写）。梯子里没有这样一拍时，结尾 IMAGE 的地面沿用前序帧已确立的哑光/缎光饰面，不得出现反射、亮光或湿感——末帧凭空长出的镜面地会改掉画幅下三分之一，末条视频只能替它编一道「倒环氧」工序，是场景断裂的常见根因。结尾 IMAGE 另须与其余帧一样带继承句（在先各拍交付物保持不变、被盖住的锚点以完工形态复述）与不得倒退句。
 
 - **Source**: SKILL.md Step 7 Final IMAGE template, Mirror Consistency Clause
 - **Enforced by**: `video_to_prompt_pipeline.py::gate_name:Mirror Reflective Alignment`

@@ -1,2 +1,9 @@
-# Optional agent metadata placeholder for local skill packaging.
-name: gemini-omni-restoration-composer
+interface:
+  display_name: "Gemini Omni 多镜头提示词合成器"
+  short_description: "一键生成具备多镜头剪辑梯、UGC手机质感与时间线切点的 Omni 延时改造提示词集合"
+
+  default_prompt: >-
+    Use $gemini-omni-restoration-composer for this request. Read the skill's SKILL.md in full
+    before composing anything and follow it exactly — it is the single authority for the
+    multi-shot ladder, timeline cut marks, UGC realism layer, and one-take bans. Do not
+    substitute remembered rules for what that file currently says.

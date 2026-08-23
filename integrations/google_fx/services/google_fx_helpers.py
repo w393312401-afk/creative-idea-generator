@@ -1079,12 +1079,20 @@ def _mount_video_prompt_refs(page, start_ref: str = "", end_ref: str = "", start
 
 
 # ── _upload_image_to_canvas_and_mount ──
-def _upload_image_to_canvas_and_mount(page, local_path: str, timeout: int = 60) -> bool:
+def _upload_image_to_canvas_and_mount(page, local_path: str, timeout: int = 60):
     """
     回退策略：当画布上找不到参考图 UUID 时（如页面刷新后画布清空），
     通过 Create (add_2) → Upload 按钮将本地图片上传到画布，
     等待新图出现后自动 Add to Prompt。
-    返回 True 表示成功挂载，False 表示失败。
+
+    成功时返回**新上传那张图在画布上的 UUID**（非空字符串，对 `if ok:` 与旧的
+    布尔用法完全兼容），失败返回 False。
+
+    2026-08-23：此前这里成功也只返回 True，等于把刚拿到的 UUID 扔了。上传是为了
+    补一张画布上没有的参考图，补完它就**在**画布上了——不把 UUID 交回去，调用方
+    无从留档，下一次引用同一张图还是找不到 UUID、还是走上传。实测代价：某一帧的
+    中选候选没能从 URL 解析出 UUID（留档落成 img_NNN_nouuid.jpg）之后，它的下一帧
+    每次渲染、每次「修复此帧问题」都要重传一遍同一张图，永远好不了。
     """
     if not local_path or not os.path.exists(local_path):
         log(f"  ❌ 上传回退: 文件不存在 {local_path}", "GoogleFX")
@@ -1186,7 +1194,9 @@ def _upload_image_to_canvas_and_mount(page, local_path: str, timeout: int = 60) 
     _ok = _add_flow_image_to_prompt(page, new_uuid)
     if _ok:
         log(f"  ✅ 上传回退成功: 参考图已挂入 Prompt (UUID={new_uuid[:16]}...)", "GoogleFX")
-        return True
+        # 返回 UUID 而不是 True：调用方据此把这张图留档成 img_NNN_<uuid>.jpg，
+        # 下一次引用它就能直接挂画布 tile，不必再传一遍。
+        return new_uuid
     else:
         log(f"  ❌ 上传回退: 图片已上传到画布但 Add to Prompt 失败", "GoogleFX")
         return False
@@ -1275,11 +1285,14 @@ def _inspect_all_pending_tiles(page, tile_ids, prompts_map=None, slices_map=None
             const progressMatch = (tile.innerText || '').match(/(\\d{1,3})\\s*%/);
             const hasProgress = progressMatch !== null;
             const hasCreditExhaustedText = (
-                /\\b(out of credits?|insufficient credits?|not enough credits?|credits? exhausted|credits? depleted|no credits? left|resource_exhausted|quota_exhausted|quota exceeded)\\b/i.test(text)
-                || /(?<!\\d)0\\s*(?:(?:google\\s+)?flow\\s+)?credits?\\b/i.test(text)
-                || /(?:credits?|credit\\s+balance|积分|点数|额度|配额|余额)[:：=为是]\\s*0(?!\\d)/i.test(text)
-                || /(积分不足|没有足够的积分|积分已用完|积分已耗尽|积分耗尽|点数不足|点数已用完|点数已耗尽|额度不足|额度已用完|额度耗尽|配额不足|配额已用完|配额耗尽|无可用积分|无可用点数)/.test(text)
-                || /(?<!\\d)0\\s*(?:积分|点数)(?!\\d)/.test(text)
+                /\b(out of credits?|insufficient credits?|not enough credits?|credits? exhausted|credits? depleted|no credits? left|resource_exhausted|quota_exhausted|quota exceeded)\b/i.test(text)
+                || /\b(out of (google )?flow credits?|insufficient (google )?flow credits?|not enough (google )?flow credits?|get (ai|flow) credits?)\b/i.test(text)
+                || /\b(?:insufficient|out of|not enough|run out of)\s+(?:\w+\s+){0,3}credits?\b/i.test(text)
+                || /\bget\s+(?:more\s+)?(?:ai\s+|flow\s+|google\s+flow\s+)?credits?\b/i.test(text)
+                || /(?<!\d)0\s*(?:(?:google\s+)?flow\s+|ai\s+)?credits?\b/i.test(text)
+                || /(?:credits?|credit\s+balance|flow\s+credits?|ai\s+credits?|积分|点数|额度|配额|余额)[:：=为是]\s*0(?!\d)/i.test(text)
+                || /(积分不足|没有足够的积分|积分已用完|积分已耗尽|积分耗尽|积分用尽|点数不足|点数已用完|点数已耗尽|点数耗尽|额度不足|额度已用完|额度耗尽|配额不足|配额已用完|配额耗尽|无可用积分|无可用点数|没有可用积分|0\s*积分|0\s*点数)/.test(text)
+                || /(?<!\d)0\s*(?:积分|点数)(?!\d)/.test(text)
             );
             const hasFailText = text.includes('failed') || text.includes('something went wrong')
                              || text.includes('unusual activity') || text.includes('help center')
