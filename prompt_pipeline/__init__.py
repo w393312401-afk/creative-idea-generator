@@ -5014,6 +5014,63 @@ def packet_with_anchor_lifecycle(packet, beat_ladder, before_index, family='exte
     return view
 
 
+# 活物锚点。2026-08-23 实测（微缩树桩屋）：抽包把 "seated couple figurines on compacted
+# soil" 登记成了第三个 primary_landmark —— 活物当锚点，姿态还写进了名字。锚点句是逐帧
+# 复读的（fix_primary_landmarks 丢掉 composer 的写法、换上 packet 拼的规范句），
+# check_primary_landmarks_exact_match 再要求它逐字出现，于是「坐着」被钉死到全序列，
+# 每一张关键帧里人偶都是同一个坐姿——首尾帧插值出来必然一动不动。
+#
+# 处理口径按 skill 包原文：人偶锁的是**身份、服装、比例**，不是姿态与站位。所以活物
+# 锚点仍然留在表里（它是尺度锚，退役掉会让画面失去缩尺读数），但渲染成「同一批人、
+# 同样穿着、同样大小」+ 明确让出姿态与站位，方位也不再钉（会走动的东西没有固定方位）。
+_LIVING_ANCHOR_CUES = (
+    'figurine', 'figure', 'couple', 'resident', 'people', 'person', 'worker', 'craftsman',
+    'builder', 'man ', 'woman ', 'child', 'kid', 'doll', 'dog', 'cat', 'hen', 'chicken',
+    'bird', 'puppy', 'kitten', 'animal',
+)
+
+# 名字开头的姿态词：登记时被写进名字，等于把第一帧的姿态钉成永久属性。
+_ANCHOR_POSE_PREFIX_RE = re.compile(
+    r'^(?:the\s+)?(?:seated|sitting|standing|stood|kneeling|crouching|crouched|squatting|'
+    r'lying|laying|reclining|resting|perched|leaning|walking|posed)\s+',
+    re.IGNORECASE)
+
+
+def _is_living_landmark(name):
+    """True when this anchor is a living subject (person / figurine / animal).
+
+    Living anchors lock identity, costume and scale — never pose or screen position."""
+    low = str(name or '').strip().lower()
+    if not low:
+        return False
+    return any(cue in low for cue in _LIVING_ANCHOR_CUES)
+
+
+def _strip_anchor_pose(name):
+    """Drop a pose word that was baked into an anchor's registered name."""
+    out = _ANCHOR_POSE_PREFIX_RE.sub('', str(name or '').strip())
+    return out.strip() or str(name or '').strip()
+
+
+def _sanitize_landmarks(landmarks):
+    """Pose-strip living anchors' names. Existing packets already carry 'seated couple
+    figurines …' on disk, so this runs on read rather than only at registration time —
+    both the emitted anchor clause and its exact-match check go through here."""
+    out = []
+    for lm in landmarks:
+        if not isinstance(lm, dict):
+            out.append(lm)
+            continue
+        name = str(lm.get('name', '')).strip()
+        if name and _is_living_landmark(name):
+            stripped = _strip_anchor_pose(name)
+            if stripped != name:
+                lm = dict(lm)
+                lm['name'] = stripped
+        out.append(lm)
+    return out
+
+
 def _family_landmarks(packet, family='exterior'):
     """The landmark list the given shot family must restate, or None when the family has no
     enforceable set (interior frames of a packet that predates interior_primary_landmarks)."""
@@ -5021,9 +5078,9 @@ def _family_landmarks(packet, family='exterior'):
         return None
     if family == 'interior':
         lms = packet.get('interior_primary_landmarks')
-        return lms if isinstance(lms, list) and lms else None
+        return _sanitize_landmarks(lms) if isinstance(lms, list) and lms else None
     lms = packet.get('primary_landmarks')
-    return lms if isinstance(lms, list) and lms else None
+    return _sanitize_landmarks(lms) if isinstance(lms, list) and lms else None
 
 
 _INTERIOR_IMAGE_CAMERA_DNA = (
@@ -5818,9 +5875,19 @@ def _canonical_anchor_clause(landmarks):
         name = str(lm.get('name', '')).strip()
         if not name:
             continue
+        prose = scale_prose(lm.get('z_depth_scale'))
+        if _is_living_landmark(name):
+            # 活物锚点：锁身份/服装/比例，明确让出姿态与站位。方位不写——会走动的
+            # 东西钉方位等于钉站位。分句里不许出现分号：check_anchor_scale_lock 的
+            # 比例窗口扫到分号就收口，比例声明会落在窗口外。
+            piece = f"{name}, the same figures in the same costume at the same size"
+            if prose:
+                piece += f", rising to {prose}"
+            piece += ", free to take a new pose and a new spot this frame"
+            parts.append(piece)
+            continue
         bearing = _grid_bearing(lm.get('grid'))
         piece = f"{name} {bearing}" if bearing else name
-        prose = scale_prose(lm.get('z_depth_scale'))
         if prose:
             piece += f", rising to {prose}"
         parts.append(piece)
@@ -6191,7 +6258,9 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
     # Ordinary milestone frames are compiled as a state delta after every deterministic
     # lock/fix has run.  This keeps the camera and anchor clauses while removing prose
     # that competes with the single visual change the renderer must execute.
-    image_prompt = compile_delta_image_prompt(image_prompt, beat, max_words=160)
+    # 160 -> 180（= IMAGE_WORD_LIMIT）：本拍人偶姿态句进白名单后要占掉约二十词，留在
+    # 160 会把收尾的防倒退句挤下车。硬顶本身没动，超了照样由 validate_beat_prompts 报。
+    image_prompt = compile_delta_image_prompt(image_prompt, beat, max_words=IMAGE_WORD_LIMIT)
     # reward 拍在上一行被原样放行（frame_state.TRANSITION_OPERATIONS），于是它是全序列
     # 唯一一张既没有继承句、也没有防倒退句的帧。这里把那两句补回去。
     if is_last:
@@ -6761,6 +6830,12 @@ def check_primary_landmarks_exact_match(image_prompt, packet, family='exterior')
         if name.lower() not in low:
             errors.append(f"IMAGE prompt fails to restate primary landmark name exactly: '{name}'")
 
+        # 活物锚点不判方位：它们锁的是身份/服装/比例，站位每一拍都可以变（见
+        # _canonical_anchor_clause）。过去这条硬校验正是把人偶钉死的第二道锁——
+        # composer 让人偶换个站位，这里就报「没写方位」，回炉一轮换回原样。
+        if _is_living_landmark(name):
+            continue
+
         # 方位检查（2026-08-05 起取代旧的"grid 串必须出现"）。旧判据是文字水印的直接
         # 成因：它强制把 'Grid A2' 写进送给图像模型的正文。现在要求的是同一条空间约束
         # 的散文形态——packet 里的格位翻成方位短语后必须出现在正文里。
@@ -6790,6 +6865,33 @@ _PERCENT_NEAR_PATTERN = re.compile(
 # 图像模型执行不了 5% 的精度差，63 与 65 之间的"漂移"过去会被判成违规、触发无意义回炉。
 _SCALE_PROSE_ALTERNATION = re.compile(
     '|'.join(re.escape(p) for _, p in _SCALE_PROSE_BUCKETS), re.IGNORECASE)
+
+
+def check_cast_in_frame(video_prompt, image_prompt, beat):
+    """这一拍观测到活物，交付提示词却一个字没提它们。
+
+    2026-08-23 实测（微缩树桩屋）：二十条 VIDEO 里十八条一个 figurine 字样都没有，
+    而每一张 IMAGE 又只剩锚点句里那个钉死的姿态——两头都不提，人偶当然不会动。
+    IMAGE 侧现在由 frame_state.compile_delta_image_prompt 确定性补一句；VIDEO 侧只能
+    靠这条校验把「漏听了 CAST IN FRAME」变成一次回炉。"""
+    errors = []
+    cast = str((beat or {}).get('cast_action') or '').strip()
+    if not cast:
+        return errors
+    low_cast = cast.lower()
+    cues = [c.strip() for c in _LIVING_ANCHOR_CUES if c.strip() and c.strip() in low_cast]
+    if not cues:
+        # 观测句里没有可锚的名词（写成了 "they" 之类），无从判起——不报，交给措辞校验。
+        return errors
+    for label, text in (('IMAGE', image_prompt), ('VIDEO', video_prompt)):
+        low = str(text or '').lower()
+        if not any(cue in low for cue in cues):
+            errors.append(
+                f"{label} prompt never mentions this beat's cast, but the reference film shows "
+                f"them in frame ({cast}). They are the only living thing in the shot: name them "
+                f"and write the one micro-motion they make this beat."
+            )
+    return errors
 
 
 def check_anchor_scale_lock(image_prompt, packet, family='exterior'):
@@ -7521,6 +7623,12 @@ _STRUCTURAL_VIDEO_ERROR_MARKERS = (
     # TBCP v7：过门前一拍的 VIDEO 末帧就是那张闭门帧。这一拍的片段若在结尾把门打开，
     # 或干脆预览了室内，和它自己的末帧直接矛盾——与旧 PBISP continuity 同一类交接断裂。
     'Pre-crossing VIDEO',
+    # 本拍观测到活物、VIDEO 却一个字没提它们（check_cast_in_frame）。归进结构性硬伤是
+    # 有意的：这不是「外套形容词写岔了」那一类措辞瑕疵，而是**画面里唯一的活物没有可拍
+    # 的动作**——和上面「无可见动作正文」同一类，i2v 只能交付一动不动的小人。定向回炉
+    # 只重写 VIDEO，且只在真的漏了的拍上各烧一次。IMAGE 侧不进这一组：它由
+    # frame_state.compile_delta_image_prompt 确定性补句，报出来只留痕。
+    "VIDEO prompt never mentions this beat's cast",
 )
 # 注意：具名人物锁的消息一律以 'Named Cast Lock [' 开头，刻意不含上面任何一条标记。
 # 那把锁是「谁穿了什么」，不是「这拍有没有可拍的画面」——把它划进结构性硬伤会让一条
@@ -7549,6 +7657,7 @@ def reverify_beat_repairs(i, video_prompt, image_prompt, beat, parsed_traces=Non
 
     这里给出唯一的事实来源：`reworked=True` 必须以本函数返回空列表为准。"""
     residual = []
+    residual += check_cast_in_frame(video_prompt, image_prompt, beat)
     residual += check_milestone_video_prompt(video_prompt, beat)
     residual += check_milestone_image_prompt(image_prompt, beat)
     residual += check_image_realizes_traces(image_prompt, parsed_traces)
@@ -9488,6 +9597,7 @@ def validate_beat_prompts(i, video_prompt, image_prompt, packet, mode, is_last, 
     # Landmark restatement / scale-lock / cross-family leakage checks (shot-family aware)
     errors.extend(check_primary_landmarks_exact_match(image_prompt, packet, family))
     errors.extend(check_anchor_scale_lock(image_prompt, packet, family))
+    errors.extend(check_cast_in_frame(video_prompt, image_prompt, beat))
     errors.extend(check_shot_family_leakage(image_prompt, packet, family))
     # Adaptive partial-crossing stages intentionally retain the rim/sill as orientation
     # evidence.  Door clearance becomes mandatory only on the establish settle-frame and
@@ -10991,6 +11101,7 @@ Required JSON keys:
    - "name": The exact name (e.g. "cracked floor seam")
    - "grid": Grid coordinate (from Grid A1 to Grid C3)
    - "z_depth_scale": Frame-height percentage scale (e.g., "60%")
+   - LIVING-SUBJECT RULE (mandatory): prefer fixed, immovable features. A living subject (a person, a miniature figurine couple, an animal) may be registered ONLY as the scale anchor, and then its "name" must carry NO pose and NO location — write "couple figurines", never "seated couple figurines on compacted soil". Their pose and where they stand change every beat by design; a pose written into the name is restated in every single frame prompt and freezes them for the whole sequence.
 4. "frame_boundaries": A JSON object with keys "left", "right", "top", "bottom", specifying Grid coordinates and physical features for each edge.
 5. "object_ledger": A list of detail-critical recurring objects. Each must be a JSON object with "name", "material_color", "initial_state", "grid", and "z_depth_scale". Provide a comprehensive list of all detail-critical objects with no hard limit. Prefer the real-world materials listed in REAL-WORLD MATERIALS REFERENCE below over generic placeholders when they fit the scene.
 6. "worker_choreography": The worker trajectory, silhouette (HAL), and manual tool lock (MTAL) details.
@@ -12244,9 +12355,15 @@ def _beat_block_text(i, contract):
     # 已经栽过一次的形状。字段只在多镜头链路上存在（见 apply_observed_shot_plan）。
     cast_action = str(beat.get('cast_action') or '').strip()
     cast_section = (
-        f"\nCAST IN FRAME (observed in the reference film): {cast_action}. Show them in this "
-        f"pose in this beat's IMAGE, and show them arriving at it in this beat's VIDEO. They never "
-        f"touch the work; their scale and costume never change.\n"
+        f"\nCAST IN FRAME (observed in the reference film): {cast_action}. This beat's IMAGE shows "
+        f"them settled in that pose; this beat's VIDEO must show them MOVING INTO it — one visible "
+        f"micro-motion that starts from the pose they hold in the previous IMAGE and ends in the "
+        f"pose this beat's IMAGE shows (they get up, turn, step closer, crouch, point, look across "
+        f"to the new work). Write that motion into the main working shot or the returning shot, in "
+        f"words. NEVER write that they remain, stay put, hold their position or are unchanged: a "
+        f"cast that holds one pose for the whole sequence is delivered as dolls that never move, "
+        f"and they are the only living thing in the frame. They never touch the work, never leave "
+        f"the frame, and their identity, costume and scale never change.\n"
         if cast_action else "")
     insert_subject = str(beat.get('insert_subject') or '').strip()
     insert_section = (

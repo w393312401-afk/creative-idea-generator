@@ -1241,7 +1241,7 @@ RULES
   - worker_count: how many people are visible in this beat, as an integer. 0 for a sterile beat, and it must agree with workers_present.
   - light_state: the light and time of day in this beat ("overcast midday, no cast shadows", "low golden side light from frame left"). The film spans days; a beat that does not declare its light gets a random one.
   - material_flow: where this beat's material went or came from ("excavated soil piled on the trench's north lip", "offcuts bundled and carried out through the doorway"). This is the Material & Spoil Balance rule's field — demolition must say where debris goes, installation must say what stock was consumed.
-  - cast_action: what EVERY living thing in frame is DOING WITH ITS BODY this beat, apart from the work itself — posture, which way it faces, where it looks, how far it has moved since the previous beat, a gesture. Living thing means a person, a miniature figurine, OR an animal (the site dog, a cat on the wall, a resin hen in the diorama) — cover each one that is in frame, not just the humans. ("crouches at the wall foot, head tilted to sight along the course"; "the two figurines now face the rising wall, the one in red half a step closer than before, while the brown dog has lain down in the shade of the stump"). Never repeat visible_action here: that one is the operation, this one is the body. If nothing alive is in frame, leave it out.
+  - cast_action: what EVERY living thing in frame is DOING WITH ITS BODY this beat, apart from the work itself — and above all HOW THAT CHANGED since the previous beat. Write it as a MOVE: the pose they held last beat -> the pose they hold now ("the two figurines get up off the stone and turn to face the rising wall, the one in red now half a step closer than before, while the brown dog rises from the shade and pads to the trench lip"; "crouches down at the wall foot, head tilted to sight along the course"). Living thing means a person, a miniature figurine, OR an animal (the site dog, a cat on the wall, a resin hen in the diorama) — cover each one that is in frame, not just the humans. NEVER write "remain", "stay", "unchanged", "in the same spot", "still standing where they were": that is a POSITION, not a move, and it is copied verbatim into every frame downstream, so the delivered film shows plastic dolls that never move once — the single most-reported failure of this pipeline. If a subject genuinely barely moved, write the smallest real change instead: a head turn, a shift of weight, a hand raised to point. Never repeat visible_action here: that one is the operation, this one is the body. If nothing alive is in frame, leave it out.
   - insert_subject: if the film CUTS to a closer framing inside this beat, name in a few words what that closer shot is ON ("the tweezer tip pressing a roof tile", "mortar squeezing out from under the block", "the two figurines watching from the moss"). Read it off the frames: a run of frames at a much closer framing inside one beat is that cut. Leave it out for a beat filmed as one uninterrupted shot — an invented insert is worse than none, because it will be reproduced verbatim.
 - Every claim must trace to a frame. Never write a tool, material, worker, or operation that no frame fact mentions.
 - state_before / state_after must be concrete spatial completion extent, never "partially done".
@@ -1303,7 +1303,7 @@ Return one JSON object, no prose, no code fences:
     "worker_count": <integer>,
     "light_state": "...",
     "material_flow": "...",
-    "cast_action": "<what the people/figurines in frame are doing with their bodies this beat, apart from the work; omit if nobody is in frame>",
+    "cast_action": "<how the people/figurines/animals in frame MOVED this beat — the pose they held last beat -> the pose they hold now, apart from the work; never 'remain/stay/unchanged'; omit if nobody is in frame>",
     "insert_subject": "<what the film's closer cut-in inside this beat is on; omit if this beat is one uninterrupted shot>",
     "workers_present": true|false,
     "source_event_ids": ["E01"],
@@ -2807,6 +2807,14 @@ _TRACE_MARK_CUES = re.compile(
     r'head\w*|hole\w*|line\w*|edge\w*)\b'
     r'|痕|印|屑|渍|沫|坑洼|划|斑', re.I)
 
+# 静态站位的措辞。cast_action 要写「从什么姿态动到什么姿态」，写成这些词就是在写
+# 「他们此刻在哪」——下游把它原样写进每一帧的图，逐帧姿态一致，人偶就不会动了。
+_STATIC_CAST_RE = re.compile(
+    r'\b(remain\w*|stay\w*|unchanged|unmoved|motionless|static|still (?:stand|sit|seat|kneel|'
+    r'crouch|watch|observ)\w*|where they (?:were|are)|same (?:position|spot|place|pose|stance)|'
+    r'in place|as before|hold(?:ing)? (?:their )?(?:position|pose|stance))\b'
+    r'|保持原样|站位不变|不变|原地|一动不动|纹丝不动', re.I)
+
 # 量词。状态字段要写「完成到哪儿」，不是「看起来怎样」。
 _QUANTITY_CUES = re.compile(
     r'\d|\bhalf\b|\bthird\b|\bquarter\b|\bfull\w*\b|\bentire\w*\b|\bwhole\b|\bevery\b|'
@@ -2893,7 +2901,7 @@ def _scan_beat_craft(beats):
     """
     macro_work, dup_detail, thin_trace = [], [], []
     vague_extent, echoed_state, wordy_op, no_anchor = [], [], [], []
-    no_insert, no_cast = [], []
+    no_insert, no_cast, static_cast = [], [], []
     missing = {key: [] for key, _label in _CRAFT_FIELD_LABELS}
 
     for beat in beats:
@@ -2930,6 +2938,14 @@ def _scan_beat_craft(beats):
         if (beat.get('workers_present') and not _is_transition_beat(beat)
                 and not str(beat.get('cast_action') or '').strip()):
             no_cast.append(bid)
+
+        # 二⓪b 写了，但写的是「位置」不是「动作」。2026-08-23 实测那条微缩片里，
+        # 二十拍的 cast_action 多数长这样：'two miniature figurines remain standing at the
+        # upper-left perimeter'——它交代的是人偶此刻站在哪，不是它从什么姿态动到什么姿态。
+        # 下游把这句原样写进 IMAGE，逐帧姿态自然完全一致，交付出来就是不动的小人。
+        cast_text = str(beat.get('cast_action') or '').strip()
+        if cast_text and _STATIC_CAST_RE.search(cast_text):
+            static_cast.append(bid)
 
         # 二① 原片这一拍切过刀，却没说那个插入镜拍的是什么。只对真的切过刀的拍报——
         # 一镜到底的拍本来就没有插入镜可抄，按缺字段报会把整片标红（实测一条 77 秒片
@@ -2981,6 +2997,7 @@ def _scan_beat_craft(beats):
         'detail_without_position': no_anchor,
         'missing_insert_subject': no_insert,
         'missing_cast_action': no_cast,
+        'static_cast_action': static_cast,
     }
     return buckets, missing
 
@@ -3003,6 +3020,7 @@ def _validate_beat_craft(beats):
     no_anchor = buckets['detail_without_position']
     no_insert = buckets['missing_insert_subject']
     no_cast = buckets['missing_cast_action']
+    static_cast = buckets['static_cast_action']
 
     def _ids(items):
         return '、'.join(x for x in dict.fromkeys(items) if x)
@@ -3050,6 +3068,15 @@ def _validate_beat_craft(beats):
                          f'身体语言（姿态/朝向/视线/位移/手势）。这一栏空着，交付出来的人'
                          f'就是从头到尾一动不动的——延时片里人是唯一的活物，冻住它等于把'
                          f'片子做成静物展示。工序动作写在「可见动作」里，这一栏只写人本身。'))
+
+    if static_cast:
+        out.append(_warn('static_cast_action',
+                         f'{_ids(static_cast)} 的「人物动作神情」写的是站位不是动作'
+                         f'（remain / stay / unchanged / 还在原地这类写法）。这一栏要写的是'
+                         f'**从上一拍的什么姿态、动到这一拍的什么姿态**；只写「他们还站在'
+                         f'左上角」，下游会把这句原样写进每一帧的图，逐帧姿态一模一样，'
+                         f'交付出来照样是一动不动的小人。真的几乎没动，就写那个最小的'
+                         f'真实变化（转头、换重心、抬手指一下）。'))
 
     if no_insert:
         out.append(_warn('missing_insert_subject',
@@ -4136,8 +4163,8 @@ def autofix_beats(config, beats_doc, overview=None, on_progress=None, max_rework
 CRAFT_REFINE_CODES = (
     'macro_env_work_product', 'detail_repeats_context', 'trace_without_mark',
     'state_without_quantity', 'result_echoes_state', 'operation_not_a_token',
-    'detail_without_position', 'missing_cast_action', 'missing_insert_subject',
-    'missing_craft_fields',
+    'detail_without_position', 'missing_cast_action', 'static_cast_action',
+    'missing_insert_subject', 'missing_craft_fields',
 )
 
 # 允许模型重写的字段：措辞层。
@@ -4187,6 +4214,13 @@ _CRAFT_ISSUE_BRIEFS = {
         "There are living subjects in frame (workers, miniature figures, animals) but cast_action is "
         "empty. Write their body language APART from the work: posture, facing, gaze, movement, "
         "gesture. The trade action itself belongs in visible_action, not here.",
+    'static_cast_action':
+        "cast_action names where the living subjects ARE, not how they MOVED. Rewrite it as a "
+        "change: the pose they held last beat -> the pose they hold now ('get up off the stone "
+        "and turn to face the new wall, the one in red now half a step closer'). Never 'remain', "
+        "'stay', 'unchanged', 'still standing where they were' - a cast frozen across the ladder "
+        "is delivered as dolls that never move. If a subject barely moved, write the smallest "
+        "real change: a head turn, a shift of weight, a hand raised to point.",
     'missing_insert_subject':
         "The source cut to a close-up inside this beat but insert_subject is empty. Name what that "
         "insert shot is on ('the tweezer tip pressing a roof tile', 'mortar squeezing out from under "

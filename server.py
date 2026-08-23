@@ -5035,27 +5035,14 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 get_or_create_task(task_id, {"type": "frames", "theme": title, "project_key": project_key,
                                              "userId": config.get('googleFxUserId') or None})
 
+                # 模式判定见 server_common.resolve_candidate_selection_mode：请求里
+                # 没有 generation_mode_explicit 时，'standard' 只是前端的默认值
+                # （刷新页面/换浏览器后 checkbox 与 localStorage 都是空的），
+                # 压不过项目 manifest 自己记着的 candidate_selection。此前这里
+                # 读了 manifest 却没用，一刷新就把 4选1 的单降级成单图直出。
                 manifest = read_manifest(project_dir) if project_dir else {}
-                is_explicitly_disabled = (
-                    body.get('candidate_selection') is False
-                    or body.get('candidateSelectionMode') is False
-                    or body.get('candidateSelection') is False
-                    or body.get('generation_mode') in ('standard', 'sequential', 'normal', 'single', 'default')
-                    or config.get('candidateSelection') is False
-                    or config.get('candidateSelectionMode') is False
-                    or config.get('generation_mode') in ('standard', 'sequential', 'normal', 'single', 'default')
-                )
-                if is_explicitly_disabled:
-                    is_candidate_selection = False
-                else:
-                    is_candidate_selection = bool(
-                        body.get('generation_mode') == 'candidate_selection'
-                        or body.get('candidate_selection') is True
-                        or body.get('candidateSelectionMode') is True
-                        or config.get('generation_mode') == 'candidate_selection'
-                        or config.get('candidateSelection') is True
-                        or config.get('candidateSelectionMode') is True
-                    )
+                is_candidate_selection = resolve_candidate_selection_mode(
+                    body, config, manifest, default=False)
                 target_worker = generate_frames_selection_worker if is_candidate_selection else generate_frames_worker
 
                 threading.Thread(
@@ -5162,12 +5149,6 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 config['_project_key'] = project_key
                 prompt_block = body.get('prompt_block', '')
                 sequence = body.get('sequence')
-                if body.get('candidate_selection') is not None:
-                    config['candidateSelection'] = bool(body.get('candidate_selection'))
-                    config['candidateSelectionMode'] = bool(body.get('candidate_selection'))
-                    config['candidate_selection'] = bool(body.get('candidate_selection'))
-                if body.get('generation_mode'):
-                    config['generation_mode'] = body.get('generation_mode')
                 if not isinstance(sequence, int):
                     self._send_json({'status': 'error', 'message': 'sequence 必须是整数'}, status=400)
                     return
@@ -5181,6 +5162,17 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 # 与 /api/generate_frames 同款互斥：修复也会整体改写同一份 manifest，
                 # 不能跟另一个渲染/修复 worker 同时跑同一个项目。
                 project_dir = _get_project_dir(project_key)
+
+                # 模式与 /api/generate_frames 同一口径（default=True：修复线的历史
+                # 默认就是走 4选1，除非用户明确关掉）。判定结果写回 config 的三个
+                # 键，pipeline_orchestrator.fix_frame_issue 照读即可，不必再各判一次。
+                _fix_is_candidate = resolve_candidate_selection_mode(
+                    body, config, read_manifest(project_dir) if project_dir else {}, default=True)
+                config['candidateSelection'] = _fix_is_candidate
+                config['candidateSelectionMode'] = _fix_is_candidate
+                config['candidate_selection'] = _fix_is_candidate
+                config['generation_mode'] = 'candidate_selection' if _fix_is_candidate else 'standard'
+
                 holder = claim_frame_run(project_dir, task_id)
                 if holder:
                     self._send_json({'status': 'ok', 'task_id': holder, 'already_running': True})

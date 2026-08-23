@@ -1903,6 +1903,11 @@ def _generate_frame_sequence_google_fx(config, title, prompt_block, on_progress=
                 for _k, _v in existing_manifest.items():
                     if _k not in manifest:
                         manifest[_k] = _v
+                # generation_mode 是「这一单的模式」而非「这一趟的链路」（后者看
+                # method）：硬写 'standard' 会把 4选1 的记录抹平，同 API 路径的说明。
+                _prev_mode = existing_manifest.get('generation_mode')
+                if isinstance(_prev_mode, str) and _prev_mode.strip():
+                    manifest['generation_mode'] = _prev_mode
         except Exception:
             pass
 
@@ -2508,6 +2513,14 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                     for _k, _v in existing_manifest.items():
                         if _k not in manifest:
                             manifest[_k] = _v
+                    # generation_mode 记的是「这一单是什么模式」，不是「这一趟怎么
+                    # 渲的」（后者看 method）。上面那圈合并救不回它——基础 dict 里
+                    # 已经硬写了 'standard'。误跑一趟标准渲染就把一单 4选1 的记录
+                    # 抹平，服务端此后再也认不出它该走 4选1（见 server_common.
+                    # resolve_candidate_selection_mode 的 manifest 兜底）。
+                    _prev_mode = existing_manifest.get('generation_mode')
+                    if isinstance(_prev_mode, str) and _prev_mode.strip():
+                        manifest['generation_mode'] = _prev_mode
         except Exception:
             pass
 

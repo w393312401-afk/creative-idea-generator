@@ -363,25 +363,41 @@ def compile_delta_image_prompt(
     milestone = _text(beat.get("milestone_name"))
     after = _text(beat.get("after_state"))
     extent = _text(beat.get("completion_extent"))
+    cast = _text(beat.get("cast_action"))
     traces = [_text(x) for x in (beat.get("persistent_traces") or []) if _text(x)][:3]
 
-    if preserve:
-        parts.append(f"Inherited state remains unchanged: {preserve}.")
-    parts.append(f"Only visible construction delta in this frame: {milestone}.")
-    if after:
-        parts.append(f"Completed terminal state: {after}.")
-    if extent:
-        parts.append(f"Completion extent: {extent}.")
-    if traces:
-        parts.append(f"Visible physical evidence remains: {', '.join(traces)}.")
-    parts.append(
-        "Show no unrelated work, no later-stage result, and no regression of any previously completed feature."
-    )
-    parts.append("One clean documentary photograph with no active construction and no text artifacts.")
+    # 白名单里必须有 cast_action。2026-08-23 实测：这一步把 composer 写的正文整段丢掉、
+    # 只按下面这几个字段重拼，人偶的姿态句就是在这里消失的——21 张图里只有第 1 帧
+    # （不走这条压缩）写了人偶，其余每一帧只剩锚点句里那个钉死的坐姿。
+    #
+    # 显示顺序固定；超长时按 drop_order 从后往前整句让位。让位次序是「谁重复得最多谁先走」：
+    # completion_extent 与 after_state 讲的基本是同一件事，persistent_traces 是锦上添花，
+    # 继承句在锚点句之外再兜一层。机位/锚点/本拍增量/人偶姿态/收尾那句净帧声明永不退——
+    # 人偶姿态句正是 2026-08-23 那条「交付出来一动不动」的修复本体，退了等于没改；
+    # 净帧那句带着防倒退约束，是 reward 帧倒退老账的兜底。
+    blocks = {
+        'preserve': f"Inherited state remains unchanged: {preserve}." if preserve else '',
+        'delta': f"Only visible construction delta in this frame: {milestone}.",
+        'cast': (f"Cast in frame: {cast} — same identity, costume and scale as before, "
+                 f"never touching the work.") if cast else '',
+        'after': f"Completed terminal state: {after}." if after else '',
+        'extent': f"Completion extent: {extent}." if extent else '',
+        'traces': (f"Visible physical evidence remains: {', '.join(traces)}."
+                   if traces else ''),
+        # 防倒退与净帧原本是分开的两句（共三十词）。人偶姿态句进白名单后 180 词的硬顶
+        # 塞不下，合并成一句省下七个词——两条约束一条不少，只是不再各占一句。
+        'guard': ("One clean documentary photograph: no unrelated work, no later-stage result, "
+                  "no regression of any previously completed feature, no active construction, "
+                  "no text artifacts."),
+    }
+    order = ['preserve', 'delta', 'cast', 'after', 'extent', 'traces', 'guard']
+    drop_order = ['traces', 'extent', 'after', 'preserve']
 
-    result = " ".join(parts)
-    words = result.split()
-    if len(words) > max_words:
-        # Preserve camera, anchors and the authoritative state delta; trim only the tail.
-        result = " ".join(words[:max_words]).rstrip(" ,;:") + "."
-    return result
+    def _assemble():
+        return " ".join(parts + [blocks[k] for k in order if blocks[k]])
+
+    # 整句让位，绝不切在句子中间。旧写法按词硬截，交付过 "…in central soil clearing. Show."
+    # 这样的残句（2026-08-23 实测帧 2：被切掉的正是 "Show no unrelated work…"）。
+    while len(_assemble().split()) > max_words and drop_order:
+        blocks[drop_order.pop(0)] = ''
+    return _assemble()

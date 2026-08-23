@@ -2918,9 +2918,7 @@ async function deleteFromLibrary(id) {
 
 function loadSavedIdea(idea, options = {}) {
     currentIdea = idea;
-    if (currentIdea && typeof isCandidateSelectionMode === 'function') {
-        currentIdea.generation_mode = isCandidateSelectionMode() ? 'candidate_selection' : 'standard';
-    }
+    syncCandidateModeToggleFromIdea(currentIdea);
     saveCurrentIdeaState();
     renderIdea(idea);
 
@@ -3485,6 +3483,81 @@ function isCandidateSelectionMode() {
     return toggle ? toggle.checked : false;
 }
 
+/**
+ * 「4选1 模式」的当前值是不是用户自己设定过的（拨过开关，或点过 4选1 入口）。
+ *
+ * 开关只活在这个浏览器里：刷新页面、换浏览器、换设备之后 localStorage 是空的，
+ * 此时 isCandidateSelectionMode() 返回的 false 只是页面默认值，不是用户的意思。
+ * 把它当成「用户明确要求标准模式」发给服务端，会压过项目自己记着的
+ * candidate_selection，一单 4选1 的活就悄悄降级成单图直出（每帧渲完不做 AI
+ * 鉴别直接下一帧）。服务端据这面旗子决定要不要拿 manifest 兜底，
+ * 见 server_common.resolve_candidate_selection_mode。
+ */
+function candidateSelectionModeIsExplicit() {
+    try {
+        return localStorage.getItem('pipeline_candidate_selection_mode') !== null;
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * 打开/恢复一个项目时，让「4选1 模式」开关跟着这一单走。
+ *
+ * 旧行为是反过来的：拿开关的当前值去写 idea.generation_mode。开关只活在浏览器
+ * 里，刷新之后是关的，于是一打开项目就把这单「我是 4选1」的记忆抹掉，之后的
+ * 续跑/单帧重试全部退回标准模式（每帧渲完不做 AI 鉴别直接下一帧）。模式是项目
+ * 的属性，不是浏览器的属性，所以这里只回填、不覆盖。
+ *
+ * 有意不写 localStorage：那份是「用户的全局默认」，不该被打开某个项目改写。
+ * 开关因此可能与 generation_mode_explicit 不同步，服务端会拿 manifest 兜底得出
+ * 同样的结论（server_common.resolve_candidate_selection_mode）。
+ */
+function syncCandidateModeToggleFromIdea(idea) {
+    if (!idea) return;
+    const mode = typeof idea.generation_mode === 'string' ? idea.generation_mode.trim() : '';
+    if (mode !== 'candidate_selection' && mode !== 'standard') {
+        // 这一单没记过模式（老项目、刚导入的提示词集）：沿用当前开关并写回去
+        if (typeof isCandidateSelectionMode === 'function') {
+            idea.generation_mode = isCandidateSelectionMode() ? 'candidate_selection' : 'standard';
+        }
+        return;
+    }
+    const on = (mode === 'candidate_selection');
+    const toggle = document.getElementById('pipeline-selection-checkbox');
+    if (toggle) toggle.checked = on;
+    const toggleLabel = document.getElementById('pipeline-selection-mode-toggle');
+    if (toggleLabel) toggleLabel.classList.toggle('is-active', on);
+    if (typeof config !== 'undefined' && config) {
+        config.candidateSelectionMode = on;
+        config.candidateSelection = on;
+        config.generation_mode = mode;
+    }
+    if (typeof updatePipelineBar === 'function') updatePipelineBar();
+}
+
+/** 把 4选1 模式记成用户的显式选择：开关、localStorage、config 三处一起对齐。
+    「🎯 4选1 智能生成」这类直接入口用它——点了就是表过态，刷新后不该丢。 */
+function markCandidateSelectionMode(enabled) {
+    const on = !!enabled;
+    const toggle = document.getElementById('pipeline-selection-checkbox');
+    if (toggle) toggle.checked = on;
+    const toggleLabel = document.getElementById('pipeline-selection-mode-toggle');
+    if (toggleLabel) toggleLabel.classList.toggle('is-active', on);
+    try {
+        localStorage.setItem('pipeline_candidate_selection_mode', on ? 'true' : 'false');
+    } catch (e) {}
+    if (typeof config !== 'undefined' && config) {
+        config.candidateSelectionMode = on;
+        config.candidateSelection = on;
+        config.generation_mode = on ? 'candidate_selection' : 'standard';
+        try {
+            localStorage.setItem('spark_config', JSON.stringify(config));
+        } catch (e) {}
+    }
+    if (typeof updatePipelineBar === 'function') updatePipelineBar();
+}
+
 async function generateFrames() {
     if (isCandidateSelectionMode()) {
         return generateFramesSelection();
@@ -3563,6 +3636,7 @@ async function generateFrames() {
             prompt_block: ownerIdea.prompt_block,
             generation_source: ownerIdea.generation_source,
             generation_mode: 'standard',
+            generation_mode_explicit: candidateSelectionModeIsExplicit(),
             candidate_selection: false,
             candidate_count: 1,
             degraded: ownerIdea.degraded === true,
@@ -3640,12 +3714,16 @@ async function generateFramesSelection() {
         if (ownerIdea) {
             ownerIdea.generation_mode = 'candidate_selection';
         }
+        // 从这个入口起过一单，就是用户对模式表过态了：同步开关与 localStorage，
+        // 否则刷新页面后开关还是关的，后续的续跑/重试会全部退回标准模式。
+        markCandidateSelectionMode(true);
         const body = {
             config: withCoverReference(config, ownerIdea),
             title: getIdeaSaveTitle(ownerIdea),
             display_title: ownerIdea.title,
             prompt_block: ownerIdea.prompt_block,
             generation_mode: 'candidate_selection',
+            generation_mode_explicit: true,
             candidate_selection: true,
             candidate_count: 4
         };
@@ -4565,11 +4643,13 @@ function initPipelineBar() {
             config.candidateSelection = candToggle.checked;
             config.generation_mode = candToggle.checked ? 'candidate_selection' : 'standard';
         }
-        if (typeof currentIdea !== 'undefined' && currentIdea) {
-            currentIdea.generation_mode = candToggle.checked ? 'candidate_selection' : 'standard';
-        }
         if (toggleLabel) {
             toggleLabel.classList.toggle('is-active', candToggle.checked);
+        }
+        // 刷新页面时 loadCurrentIdeaState 已经把上一单恢复进 currentIdea：让开关
+        // 跟着这一单走，而不是拿刚从 localStorage 读出来的开关值去覆盖它。
+        if (typeof currentIdea !== 'undefined' && currentIdea) {
+            syncCandidateModeToggleFromIdea(currentIdea);
         }
         candToggle.addEventListener('change', () => {
             const checked = candToggle.checked;

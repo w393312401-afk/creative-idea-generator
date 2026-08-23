@@ -4079,6 +4079,81 @@ def read_manifest(project_dir):
             return None
 
 
+# ── 4选1 候选优选模式：这一趟渲染到底走不走 ────────────────────────────────
+# 模式是「这一单的属性」，不是「这个浏览器的属性」。前端把它记在一个 checkbox
+# 和 localStorage 里，刷新页面、换浏览器、换设备之后那份状态就没了，请求体里
+# 于是发来一个只是默认值的 'standard'。旧口径把它当成用户明确要求，直接把一单
+# 4选1 的活降级成单图直出——表征是每帧渲完不做 AI 鉴别就接着下一帧。
+_STANDARD_MODE_ALIASES = ('standard', 'sequential', 'normal', 'single', 'default')
+
+
+def _candidate_mode_signal(source):
+    """从 body/config 这类扁平 dict 里读模式信号：True=4选1，False=standard，None=没表态。
+
+    多个键同时表态时按旧口径「任一处说 standard 就是 standard」合议。"""
+    if not isinstance(source, dict):
+        return None
+    votes = []
+    for key in ('candidate_selection', 'candidateSelection', 'candidateSelectionMode'):
+        v = source.get(key)
+        if isinstance(v, bool):
+            votes.append(v)
+    mode = source.get('generation_mode')
+    if isinstance(mode, str):
+        m = mode.strip().lower()
+        if m == 'candidate_selection':
+            votes.append(True)
+        elif m in _STANDARD_MODE_ALIASES:
+            votes.append(False)
+    if not votes:
+        return None
+    return all(votes)
+
+
+def _manifest_candidate_mode(manifest):
+    """项目自己记着的模式（candidate_selection_pipeline / frame_generator 落的）。"""
+    if not isinstance(manifest, dict):
+        return None
+    m = manifest.get('generation_mode')
+    if not isinstance(m, str):
+        return None
+    m = m.strip().lower()
+    if m == 'candidate_selection':
+        return True
+    if m in _STANDARD_MODE_ALIASES:
+        return False
+    return None
+
+
+def resolve_candidate_selection_mode(body, config, manifest, default=False):
+    """优先级：用户明确表态 > 开启信号 > 项目 manifest 的记录 > 请求里的默认值。
+
+    `body['generation_mode_explicit']` 由前端置真，含义是「这个模式是用户自己
+    设定的」（拨过开关，或本次就是点的 4选1 入口）。没有这面旗子时，请求里的
+    'standard' 只当作默认值看待，压不过 manifest；'candidate_selection' 则照收
+    ——点了 4选1 入口就是要 4选1，无需 manifest 背书。"""
+    body_signal = _candidate_mode_signal(body)
+    config_signal = _candidate_mode_signal(config)
+    explicit = bool(isinstance(body, dict) and body.get('generation_mode_explicit'))
+
+    if explicit:
+        for sig in (body_signal, config_signal):
+            if sig is not None:
+                return sig
+
+    if body_signal is True or config_signal is True:
+        return True
+
+    manifest_signal = _manifest_candidate_mode(manifest)
+    if manifest_signal is not None:
+        return manifest_signal
+
+    for sig in (body_signal, config_signal):
+        if sig is not None:
+            return sig
+    return default
+
+
 def write_manifest(project_dir, data):
     manifest_path = os.path.join(project_dir, 'manifest.json')
     with manifest_lock(project_dir):

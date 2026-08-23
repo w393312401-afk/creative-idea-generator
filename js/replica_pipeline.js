@@ -1837,10 +1837,10 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
                 ${selectField('camera_move', '运镜', REPLICA_CAMERA_MOVES)}
                 ${numberField('worker_count', '工人数（0＝清场帧）')}
                 ${beat.workers_present
-                    ? field('cast_action', '人物动作神情（画面里的人/人偶除了干活以外的身体语言：姿态、朝向、视线、比上一拍移动了多少、手势。别把可见动作再写一遍——那一栏是工序，这一栏是人。空着交付出来的人就是一动不动的）', 2)
+                    ? field('cast_action', '人物动作神情（写「从上一拍的什么姿态、动到这一拍的什么姿态」：起身、转向、上前半步、蹲下去看、抬手指。别写「还站在原地/保持原样」——那是站位不是动作，下游会把它原样写进每一帧的图，交付出来就是一动不动的小人。别把可见动作再写一遍：那一栏是工序，这一栏是人。真的几乎没动，就写那个最小的真实变化）', 2)
                     : `<details class="replica-field-optional">
                         <summary class="replica-hint">＋ 人物动作神情（本拍标注为清场帧，画面里没人；有人偶在旁观的话仍然要写）</summary>
-                        ${field('cast_action', '人物动作神情（姿态/朝向/视线/位移/手势）', 2)}
+                        ${field('cast_action', '人物动作神情（从什么姿态动到什么姿态，别写「保持原样」）', 2)}
                        </details>`}
                 ${field('light_state', '光照时段（如「阴天正午、无投影」；延时片跨天，不逐拍声明光就会自己跳）')}
                 ${field('material_flow', '物料去向（挖出来的土去哪了 / 耗掉的料从哪来）')}

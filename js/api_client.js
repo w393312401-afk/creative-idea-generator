@@ -1269,6 +1269,10 @@ async function retrySingleFrame(seq) {
                 prompt_block: ownerIdea.prompt_block,
                 generation_source: ownerIdea.generation_source,
                 generation_mode: isCand ? 'candidate_selection' : 'standard',
+                // 见 app.js candidateSelectionModeIsExplicit：没表过态时这里的
+                // 'standard' 只是刷新后开关的默认值，不该压过项目自己的记录
+                generation_mode_explicit: (typeof candidateSelectionModeIsExplicit === 'function')
+                    ? candidateSelectionModeIsExplicit() : false,
                 candidate_selection: isCand,
                 candidate_count: isCand ? 4 : 1,
                 degraded: ownerIdea.degraded === true,
@@ -1578,6 +1582,8 @@ async function fixFrameIssue(seq, manualReason, cascadeDownstream) {
                 prompt_block: ownerIdea.prompt_block,
                 sequence: seq,
                 generation_mode: isCand ? 'candidate_selection' : 'standard',
+                generation_mode_explicit: (typeof candidateSelectionModeIsExplicit === 'function')
+                    ? candidateSelectionModeIsExplicit() : false,
                 candidate_selection: isCand,
                 candidate_count: isCand ? 4 : 1,
                 cascade_downstream: isCascade,
