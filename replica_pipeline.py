@@ -924,6 +924,8 @@ def save_beats(job_id, beats):
     # 增删一次过门（见 reverse.normalize_beat_spaces）。
     reverse.normalize_beat_spaces(beats)
     reverse.reconcile_event_coverage(beats, overview, reconcile_unbound=False)
+    # 保证每拍三张证据帧（Start/Peak/End）
+    reverse.ensure_three_evidence_frames(beats, overview)
     # 拆拍/并拍改的就是时间窗，覆盖帧与观察到的镜头数必须跟着重算
     # （见 attach_coverage_frames / attach_shot_cuts）。
     reverse.attach_coverage_frames(beats, overview)
@@ -1493,6 +1495,8 @@ def _revalidate(state, persist=True):
     try:
         with open(path, 'r', encoding='utf-8') as f:
             overview = json.load(f)
+        # 顺手补齐每拍三张代表性证据帧（Start/Peak/End）
+        reverse.ensure_three_evidence_frames(beats, overview)
         # 顺手补覆盖帧：这条路径每次读状态都会走，存量任务（加这个字段之前跑的）
         # 不用重跑聚类也能在卡点上看到铺满拍窗的那一排帧。读不到 overview 就跳过，
         # 与校验同一档降级——变体 job 自己目录下没有 overview，走的就是这一支。

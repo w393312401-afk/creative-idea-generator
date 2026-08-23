@@ -872,7 +872,7 @@ def refresh_trend_refs(config):
         _build_live_trend_refs(config, search, trend_snippet, custom_snippet))
 
 
-def _chat(config, system, user, temperature=0.85, max_tokens=32768, timeout=240, on_chunk=None, model=None, enable_search=False):
+def _chat(config, system, user, temperature=0.85, max_tokens=65536, timeout=240, on_chunk=None, model=None, enable_search=False):
     if not model:
         model = config.get('model') or 'gemini-3.7-flash-high'
     base_url, api_key = resolve_gateway(model, config)

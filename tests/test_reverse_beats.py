@@ -765,8 +765,8 @@ class TestJsonReplyParsing(unittest.TestCase):
         self.assertNotIsInstance(ctx.exception, reverse.TruncatedReply)
 
     def test_pass_b_caps_the_evidence_frame_list(self):
-        """每拍回一长串帧名是回复被截断的头号原因。"""
-        self.assertIn('AT MOST THREE frames per beat', reverse._PASS_B_SYSTEM)
+        """每拍固定三张证据帧（Triad: Start / Peak / End）。"""
+        self.assertIn('EXACTLY THREE frames per beat', reverse._PASS_B_SYSTEM)
 
     def test_structurally_broken_reply_names_the_raw_text(self):
         """修不回来时，异常必须带上原始回复——上次故障日志里只有一句报错，
@@ -1506,6 +1506,47 @@ class TestCoverageFrames(unittest.TestCase):
         reverse.attach_coverage_frames(doc, overview)
         after = reverse.validate_beats(doc, overview)
         self.assertEqual([v['code'] for v in before], [v['code'] for v in after])
+
+
+class TestEnsureThreeEvidenceFrames(unittest.TestCase):
+    """固定三张证据帧（Triad）：保证每拍都有且仅有 3 张代表性证据帧（Start/Peak/End）。"""
+
+    def _timeline_overview(self, step=0.5, duration=10.0):
+        frames = []
+        n = int(duration / step) + 1
+        for i in range(n):
+            frames.append({'index': i + 1, 'timestamp': round(i * step, 3),
+                           'frame_path': f'/job/review_frames/review_{i + 1:03d}.png'})
+        return _overview(frames=frames)
+
+    def test_two_frames_are_padded_to_three_with_peak(self):
+        overview = self._timeline_overview(step=0.5, duration=10.0)
+        # B01 原先只有 2 张（review_001.png 和 review_011.png）
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [],
+               'beats': [_beat('B01', 0.0, 5.0, frames=['review_001.png', 'review_011.png'])]}
+        reverse.ensure_three_evidence_frames(doc, overview)
+        frames = doc['beats'][0]['evidence_frames']
+        self.assertEqual(len(frames), 3)
+        self.assertEqual(frames[0], 'review_001.png')
+        self.assertEqual(frames[-1], 'review_011.png')
+        # 中间补了峰值/中点帧 review_006.png (t=2.5s)
+        self.assertEqual(frames[1], 'review_006.png')
+
+    def test_one_frame_is_padded_to_three(self):
+        overview = self._timeline_overview(step=0.5, duration=10.0)
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [],
+               'beats': [_beat('B01', 0.0, 5.0, frames=['review_001.png'])]}
+        reverse.ensure_three_evidence_frames(doc, overview)
+        frames = doc['beats'][0]['evidence_frames']
+        self.assertEqual(len(frames), 3)
+
+    def test_variant_doc_updates_reference_frames(self):
+        overview = self._timeline_overview(step=0.5, duration=10.0)
+        doc = {'video_duration_sec': 10.0, 'variant_of': 'replica_orig',
+               'beats': [{'id': 'B01', 'start': 0.0, 'end': 5.0, 'reference_frames': ['review_001.png']}]}
+        reverse.ensure_three_evidence_frames(doc, overview)
+        frames = doc['beats'][0]['reference_frames']
+        self.assertEqual(len(frames), 3)
 
 
 class TestKeyDrift(unittest.TestCase):

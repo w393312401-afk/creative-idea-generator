@@ -1216,12 +1216,12 @@ RULES
 - Monotonic Chronological Inheritance across Spaces: When passing through a doorway or opening into a new space (space label changes), the first beat in the new space must physically inherit all completed exterior/prior work. Never regress already-finished elements (e.g. never describe a roof leaking or ground full of dead leaves if previous beats cleared/repaired them).
 - macro_environment: ONLY declare for the opening anchor beat (B01) AND the first beat after entering a new enclosed space / threshold crossing (when space label changes or stage is transition). ONE to THREE items describing the macro terrain, geology, climate/lighting, and spatial metric envelope visible in this beat — e.g. "arid desert sandstone cliff with natural ambient sunlight", "loose reddish-tan desert sand ground with ripples". For intermediate beats within the same space, do NOT declare macro_environment (keep empty [] or omit) to avoid context clutter and reduce interference with trade actions.
   - This field is what the place LOOKS LIKE ON ITS OWN, before anyone worked on it. NEVER put a work product here — a trench that was dug, a wall that was built, a floor that was laid belong in state_before / state_after, never in macro_environment. Those one-to-three items are the film's only macro-environment budget; spending one on a result you already wrote in the state fields costs you a real environment fact.
-- visible_details: THREE to SIX items, and AIM FOR FIVE OR SIX. Each names a material with its colour, texture or condition AND where it sits in frame — "yellow fibreglass batts in the left wall bays", not "insulation". These items are the only place the reference film's actual look survives into the prompt; a bare noun brings back a generic version of this work, not this film.
-  - Never spend one of these slots restating something already written in macro_environment or persistent_traces. The budget is five or six lines for the whole beat; a line that repeats the autumn foliage you already declared as macro environment is a line that is not describing the subject.
+- visible_details: THREE to FIVE items (each under ten words). Each names a material with its colour, texture or condition AND where it sits in frame — "yellow fibreglass batts in the left wall bays", not "insulation". These items are the only place the reference film's actual look survives into the prompt; a bare noun brings back a generic version of this work, not this film.
+  - Never spend one of these slots restating something already written in macro_environment or persistent_traces. The budget is 3-5 lines for the whole beat; a line that repeats the autumn foliage you already declared as macro environment is a line that is not describing the subject.
   - Spend the slots on what makes THIS subject recognisable — for a vehicle: its glazing, window rubbers, front face, wheels, rust; for a room: its openings, its edges, its floor build-up. Not on the background.
-- persistent_traces: AT LEAST TWO visible marks THIS beat leaves behind, each naming the mark AND the surface it sits on. A feature that was already there before this beat (fallen leaves, moss, old staining) is not a trace — it belongs in macro_environment or nowhere. Every item in this list is concatenated into one string downstream, so a pre-existing environment noun in here dilutes the marks that actually matter.
-- evidence_frames: list AT MOST THREE frames per beat — the one that best shows the start, the one that best shows the work, and the one that best shows the result. Do not echo every frame in the window; a long frame list is the single biggest cause of a reply that gets cut off before it finishes.
-- Keep the SENTENCE fields (visual_subject, visible_action, visible_result, state_before, state_after) under thirty words each. Length belongs in visible_details and persistent_traces, where it buys concrete look; in the sentence fields it only buys narration.
+- persistent_traces: EXACTLY TWO visible marks THIS beat leaves behind (each under ten words), each naming the mark AND the surface it sits on. A feature that was already there before this beat (fallen leaves, moss, old staining) is not a trace — it belongs in macro_environment or nowhere. Every item in this list is concatenated into one string downstream, so a pre-existing environment noun in here dilutes the marks that actually matter.
+- evidence_frames: list EXACTLY THREE frames per beat (the Triad: 1. start/pre-state anchor, 2. peak work/tool action, 3. resulting completion). Never fewer than three when at least three frames exist in the window. Do not echo every frame in the window; a long frame list is the single biggest cause of a reply that gets cut off before it finishes.
+- Keep the SENTENCE fields (visual_subject, visible_action, visible_result, state_before, state_after) under twenty words each. Length belongs in visible_details and persistent_traces, where it buys concrete look; in the sentence fields it only buys narration.
 - visible_result and state_after have DIFFERENT jobs and must not be the same sentence written twice:
   - visible_result = what you SEE at the moment the action lands (the body settles, the sling goes slack, a clod breaks off the wall).
   - state_after = HOW FAR the work got — a completion extent, carrying a quantity: a fraction, a percentage, a flush/level relation, a height, a count of bays or metres. "roof flush with surrounding grade, whole body below grade" is an extent; "the bus is in the pit" is not.
@@ -1307,8 +1307,8 @@ Return one JSON object, no prose, no code fences:
     "insert_subject": "<what the film's closer cut-in inside this beat is on; omit if this beat is one uninterrupted shot>",
     "workers_present": true|false,
     "source_event_ids": ["E01"],
-    "evidence_frames": ["review_007.png"],
-    "confidence": 0.0-1.0
+    "evidence_frames": ["review_001.png", "review_004.png", "review_007.png"],
+    "confidence": 0.95
   }]
 }"""
 
@@ -1421,8 +1421,8 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
         print('[REVERSE] 无可用拼图，Pass B 退回纯文本聚类（节拍边界精度会下降）')
 
     def _ask_pass_b(prompt):
-        # 预估输出 token 预算：基线 32768，确保长片多拍（20+ 拍）与结构回炉提示词不撞硬上限
-        target_tokens = 32768
+        # 预估输出 token 预算：基线 65536，确保长片多拍（20+ 拍）与结构回炉提示词不撞硬上限
+        target_tokens = 65536
         if sheet_paths:
             # `_multimodal_chat` 的 temperature 固定 0.1，比纯文本路径的 0.2 还低——
             # 聚类要的是稳定复现，不是花样，低一点正合适。
@@ -1435,79 +1435,78 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
 
     violations = []
     beats_doc = None
-    # 解析失败与校验未过是两类不同的失败，各有各的预算。共用一个计数器的话，一次
-    # 「模型忘了转义引号」就会吃掉本该留给结构回炉的那一轮。
-    parse_budget = _PARSE_RETRY_BUDGET
     truncated_once = False
     attempt = 0
     while attempt <= max_rework:
-        pp._raise_if_cancelled(on_progress)
-        if on_progress:
-            on_progress('replica_stage', {
-                'stage': 'cluster_beats',
-                'message': '正在把帧事实聚类成节拍阶梯…' if attempt == 0 else '节拍阶梯校验未过，正在定向回炉…',
-            })
-        prompt = user
-        if violations:
-            prompt = user + (
-                '\n==================== VALIDATION FAILURES (FIX THESE) ====================\n'
-                + '\n'.join(f'- {v["message"]}' for v in violations)
-                + '\nRe-inspect the frame facts before changing beat order. A misread frame is far '
-                  'more likely than an impossible build order.\n'
-            )
-        if truncated_once:
-            # 不说清楚它还会再写一份一样长的。截断的解药是写短，不是重试。
-            prompt += (
-                '\n==================== YOUR PREVIOUS REPLY WAS CUT OFF ====================\n'
-                'It ran past the output limit before it finished. Produce FEWER, WIDER beats by '
-                'merging adjacent events that belong to the same milestone, list at most two '
-                'evidence_frames per beat, and keep every prose field under twenty words.\n'
-            )
-        try:
-            raw = _ask_pass_b(prompt)
-        except pp.ResponseTruncated as e:
-            # 多模态路径把截断当异常抛（finish_reason=length），纯文本路径只能靠
-            # parse_json_reply 从半截 JSON 里认出来。两条路必须汇进同一个「写短一点再来」
-            # 的分支——否则上了拼图之后，一次本来能回炉的截断会变成整单失败。
-            parse_budget -= 1
-            truncated_once = True
-            if parse_budget < 0:
-                raise
+        parse_budget = _PARSE_RETRY_BUDGET
+        while True:
+            pp._raise_if_cancelled(on_progress)
             if on_progress:
                 on_progress('replica_stage', {
                     'stage': 'cluster_beats',
-                    'message': f'模型回复太长被截断（{e}），要求它合并节拍、写短一点后重试…',
+                    'message': '正在把帧事实聚类成节拍阶梯…' if attempt == 0 else '节拍阶梯校验未过，正在定向回炉…',
                 })
-            continue
-        try:
-            beats_doc = parse_json_reply(raw)
-        except TruncatedReply as e:
-            parse_budget -= 1
-            truncated_once = True
-            _dump_bad_reply(job_dir, 'cluster_beats_truncated', raw, e)
-            if parse_budget < 0:
-                raise
-            if on_progress:
-                on_progress('replica_stage', {
-                    'stage': 'cluster_beats',
-                    'message': '模型回复太长被截断，要求它合并节拍、写短一点后重试…',
-                })
-            continue
-        except ValueError as e:
-            # 既有的 beat ladder 生成循环就是这么处理的：解析炸了就再要一次，别让
-            # 几十次视觉调用的成果陪葬。
-            parse_budget -= 1
-            _dump_bad_reply(job_dir, 'cluster_beats', raw, e)
-            if parse_budget < 0:
-                raise
-            if on_progress:
-                on_progress('replica_stage', {
-                    'stage': 'cluster_beats',
-                    'message': f'模型回复不是合法 JSON，重新要一次（剩余 {parse_budget + 1} 次）…',
-                })
-            continue
-        if not isinstance(beats_doc, dict):
-            raise ValueError(f'Pass B 回复应当是一个 JSON 对象，实际是 {type(beats_doc).__name__}')
+            prompt = user
+            if violations:
+                prompt = user + (
+                    '\n==================== VALIDATION FAILURES (FIX THESE) ====================\n'
+                    + '\n'.join(f'- {v["message"]}' for v in violations)
+                    + '\nRe-inspect the frame facts before changing beat order. A misread frame is far '
+                      'more likely than an impossible build order. Keep each prose field strictly under twenty words.\n'
+                )
+            if truncated_once:
+                # 不说清楚它还会再写一份一样长的。截断的解药是写短，不是重试。
+                prompt += (
+                    '\n==================== YOUR PREVIOUS REPLY WAS CUT OFF ====================\n'
+                    'It ran past the output limit before it finished. Produce FEWER, WIDER beats by '
+                    'merging adjacent events that belong to the same milestone, and keep every prose field under twenty words.\n'
+                )
+            try:
+                raw = _ask_pass_b(prompt)
+            except pp.ResponseTruncated as e:
+                # 多模态路径把截断当异常抛（finish_reason=length），纯文本路径只能靠
+                # parse_json_reply 从半截 JSON 里认出来。两条路必须汇进同一个「写短一点再来」
+                # 的分支——否则上了拼图之后，一次本来能回炉的截断会变成整单失败。
+                parse_budget -= 1
+                truncated_once = True
+                if parse_budget < 0:
+                    raise
+                if on_progress:
+                    on_progress('replica_stage', {
+                        'stage': 'cluster_beats',
+                        'message': f'模型回复太长被截断（{e}），要求它合并节拍、写短一点后重试…',
+                    })
+                continue
+            try:
+                beats_doc = parse_json_reply(raw)
+            except TruncatedReply as e:
+                parse_budget -= 1
+                truncated_once = True
+                _dump_bad_reply(job_dir, 'cluster_beats_truncated', raw, e)
+                if parse_budget < 0:
+                    raise
+                if on_progress:
+                    on_progress('replica_stage', {
+                        'stage': 'cluster_beats',
+                        'message': '模型回复太长被截断，要求它合并节拍、写短一点后重试…',
+                    })
+                continue
+            except ValueError as e:
+                # 既有的 beat ladder 生成循环就是这么处理的：解析炸了就再要一次，别让
+                # 几十次视觉调用的成果陪葬。
+                parse_budget -= 1
+                _dump_bad_reply(job_dir, 'cluster_beats', raw, e)
+                if parse_budget < 0:
+                    raise
+                if on_progress:
+                    on_progress('replica_stage', {
+                        'stage': 'cluster_beats',
+                        'message': f'模型回复不是合法 JSON，重新要一次（剩余 {parse_budget + 1} 次）…',
+                    })
+                continue
+            if not isinstance(beats_doc, dict):
+                raise ValueError(f'Pass B 回复应当是一个 JSON 对象，实际是 {type(beats_doc).__name__}')
+            break
 
         beats_doc.setdefault('video_duration_sec', duration)
         beats_doc.setdefault('banned_elements', [])
@@ -1520,6 +1519,7 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
         _renumber_beats(beats_doc)
         normalize_beat_spaces(beats_doc)
         reconcile_event_coverage(beats_doc, overview)
+        ensure_three_evidence_frames(beats_doc, overview)
         attach_coverage_frames(beats_doc, overview)
         attach_shot_cuts(beats_doc, overview)
         # 定长窗随文档一起落盘：卡点上要拿它跟节拍对照，回炉时也要用同一份，不能
@@ -2599,6 +2599,118 @@ def observed_shot_stats(beats_doc):
         'cuts_per_second': round(cuts / span, 3) if span > 0 else None,
         'avg_shot_seconds': round(sum(lengths) / float(len(lengths)), 2) if lengths else None,
     }
+
+
+def ensure_three_evidence_frames(beats_doc, overview):
+    """确保每一拍都有且仅有三张代表性证据帧（Triad: 1. 起始帧, 2. 施工峰值帧, 3. 交付结果帧）。
+
+    如果大模型返回少于 3 张（例如只返回了起止 2 张），从拍窗 [start, end] 内部的抽帧时间轴
+    及绑定的 change_events 里自动补齐峰值作业帧（Peak Action），保证每拍都有严格的三态闭环。
+    """
+    if not isinstance(beats_doc, dict):
+        return beats_doc
+    timeline = _review_frame_timeline(overview or {})
+    if not timeline:
+        return beats_doc
+    ts_by_name = {name: ts for ts, name in timeline}
+    change_events = (overview or {}).get('change_events') or []
+    events_by_id = {e.get('event_id'): e for e in change_events
+                    if isinstance(e, dict) and e.get('event_id')}
+
+    is_var = is_variant_doc(beats_doc)
+    frame_key = 'reference_frames' if is_var else 'evidence_frames'
+
+    for beat in beats_doc.get('beats') or []:
+        if not isinstance(beat, dict):
+            continue
+        cur_frames = [f for f in (beat.get(frame_key) or [])
+                      if isinstance(f, str) and f in ts_by_name]
+        lo = _num(beat.get('start'))
+        hi = _num(beat.get('end'))
+        if lo > hi:
+            lo, hi = hi, lo
+        inside = [row for row in timeline if lo - 1e-6 <= row[0] <= hi + 1e-6]
+        if not inside:
+            if not cur_frames and timeline:
+                nearest = min(timeline, key=lambda row: min(abs(row[0] - lo), abs(row[0] - hi)))
+                beat[frame_key] = [nearest[1]]
+            continue
+
+        if len(inside) <= 3:
+            beat[frame_key] = [row[1] for row in inside]
+            continue
+
+        # If already exactly 3 distinct frames and all within window [lo-0.5, hi+0.5], keep them
+        if len(cur_frames) == 3 and len(set(cur_frames)) == 3:
+            all_inside = all(lo - 0.5 <= ts_by_name[f] <= hi + 0.5 for f in cur_frames)
+            if all_inside:
+                cur_frames.sort(key=lambda f: ts_by_name.get(f, 0.0))
+                beat[frame_key] = cur_frames
+                continue
+
+        # 1. Start frame: closest to lo
+        p_start_row = min(inside, key=lambda r: abs(r[0] - lo))
+        p_start = (cur_frames[0]
+                   if (cur_frames and abs(ts_by_name[cur_frames[0]] - lo) <= 1.0)
+                   else p_start_row[1])
+
+        # 2. End frame: closest to hi
+        p_end_row = min(inside, key=lambda r: abs(r[0] - hi))
+        p_end = (cur_frames[-1]
+                 if (len(cur_frames) >= 2 and abs(ts_by_name[cur_frames[-1]] - hi) <= 1.0 and cur_frames[-1] != p_start)
+                 else p_end_row[1])
+
+        # 3. Peak/Mid frame
+        p_peak = None
+        bound_ids = beat.get('source_event_ids') or []
+        for eid in bound_ids:
+            ev = events_by_id.get(eid)
+            if not ev:
+                continue
+            triad = ev.get('triad_frames') or {}
+            cand = triad.get('action_peak')
+            if cand and cand in ts_by_name and cand not in (p_start, p_end) and any(r[1] == cand for r in inside):
+                p_peak = cand
+                break
+            ev_frames = ev.get('evidence_frames') or []
+            if (len(ev_frames) >= 2 and ev_frames[1] in ts_by_name
+                    and ev_frames[1] not in (p_start, p_end)
+                    and any(r[1] == ev_frames[1] for r in inside)):
+                p_peak = ev_frames[1]
+                break
+            if ev.get('peak') is not None:
+                p_ts = _num(ev.get('peak'))
+                cand_row = min((r for r in inside if r[1] not in (p_start, p_end)),
+                               key=lambda r: abs(r[0] - p_ts), default=None)
+                if cand_row:
+                    p_peak = cand_row[1]
+                    break
+
+        if not p_peak:
+            mid_target = lo + (hi - lo) / 2.0
+            avail = [r for r in inside if r[1] not in (p_start, p_end)]
+            if avail:
+                p_peak_row = min(avail, key=lambda r: abs(r[0] - mid_target))
+                p_peak = p_peak_row[1]
+
+        chosen = [p_start]
+        if p_peak and p_peak not in chosen:
+            chosen.append(p_peak)
+        if p_end and p_end not in chosen:
+            chosen.append(p_end)
+
+        for target in (lo, (lo + hi) / 2.0, hi):
+            if len(chosen) >= 3:
+                break
+            avail = [r for r in inside if r[1] not in chosen]
+            if avail:
+                best = min(avail, key=lambda r: abs(r[0] - target))
+                chosen.append(best[1])
+
+        chosen.sort(key=lambda f: ts_by_name.get(f, 0.0))
+        beat[frame_key] = chosen
+
+    return beats_doc
 
 
 def attach_coverage_frames(beats_doc, overview):
@@ -3721,7 +3833,7 @@ def mutate_beats(config, beats_doc, axis_spec, on_progress=None, max_rework=1):
                 + '\n'.join(f'- {v["message"]}' for v in violations) + '\n'
             )
         raw = pp._chat(config, _MUTATE_SYSTEM, prompt, temperature=0.6,
-                       max_tokens=32768, timeout=240)
+                       max_tokens=65536, timeout=240)
         try:
             data = parse_json_reply(raw)
         except ValueError as e:
@@ -3966,7 +4078,7 @@ def autofix_beats(config, beats_doc, overview=None, on_progress=None, max_rework
             })
 
         raw = pp._chat(config, _AUTOFIX_SYSTEM, user_prompt, temperature=0.1,
-                       max_tokens=32768, timeout=240)
+                       max_tokens=65536, timeout=240)
         try:
             data = parse_json_reply(raw)
         except ValueError as e:
@@ -4451,6 +4563,7 @@ def autobalance_beats(beats_doc, overview=None, max_duration=6.0, min_duration=2
     _renumber_beats(beats_doc)
     normalize_beat_spaces(beats_doc)
     reconcile_event_coverage(beats_doc, overview)
+    ensure_three_evidence_frames(beats_doc, overview)
     attach_coverage_frames(beats_doc, overview)
     attach_shot_cuts(beats_doc, overview)
 
