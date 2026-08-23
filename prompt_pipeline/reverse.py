@@ -18,6 +18,7 @@ banned_elements 里本该出现的东西反而被写进了 beats。
 全套测试都用 `patch.object(pp, ...)` 打桩，import 绑定会把桩打空。
 """
 
+import copy
 import json
 import math
 import os
@@ -556,6 +557,14 @@ def _repair_json_text(text):
         out.append(ch)
         i += 1
     return ''.join(out)
+
+
+class CraftRefineRolledBack(RuntimeError):
+    """工艺精修产出了新的硬伤，整份已回滚。
+
+    单独一个类型而不是普通 ValueError：调用方要能把「精修没跑成」和「精修跑了但把阶梯
+    改坏了、已经退回原样」区分开——后者对用户是好消息（什么都没丢），措辞不该一样。
+    """
 
 
 class TruncatedReply(ValueError):
@@ -2762,13 +2771,14 @@ def _text_overlap(a, b):
     return len(wa & wb) / float(len(wa | wb))
 
 
-def _validate_beat_craft(beats):
-    """单拍内容体检：写串栏的、写重复的、写含糊的、以及六个制作字段缺不缺。
+def _scan_beat_craft(beats):
+    """单拍内容体检的**判据层**：返回 (症状码 → 拍号列表, 制作字段名 → 拍号列表)。
 
-    只出 warn，且每种毛病聚合成一条。判据都是文本启发式——它们指得出「这里值得再看
-    一眼」，指不出「这里一定错了」，所以绝不该有权力挡住合成。
+    与 `_validate_beat_craft` 的分工是判据 vs 措辞：那边把这里的结果聚合成人话 warn 挂到
+    人工卡点上，`refine_beat_craft` 按这里的拍号决定哪几拍要送模型精修。两边共用同一份
+    判据，绝不各写一份——判据一分叉，界面上报的毛病和精修实际修的毛病就不是同一件事，
+    而用户判断「修好了没有」靠的正是界面上那几条。
     """
-    out = []
     macro_work, dup_detail, thin_trace = [], [], []
     vague_extent, echoed_state, wordy_op, no_anchor = [], [], [], []
     no_insert, no_cast = [], []
@@ -2848,6 +2858,39 @@ def _validate_beat_craft(beats):
                 filled = bool(value)
             if not filled:
                 missing[key].append(bid)
+
+    buckets = {
+        'macro_env_work_product': macro_work,
+        'detail_repeats_context': dup_detail,
+        'trace_without_mark': thin_trace,
+        'state_without_quantity': vague_extent,
+        'result_echoes_state': echoed_state,
+        'operation_not_a_token': wordy_op,
+        'detail_without_position': no_anchor,
+        'missing_insert_subject': no_insert,
+        'missing_cast_action': no_cast,
+    }
+    return buckets, missing
+
+
+def _validate_beat_craft(beats):
+    """单拍内容体检：写串栏的、写重复的、写含糊的、以及七个制作字段缺不缺。
+
+    只出 warn，且每种毛病聚合成一条。判据都是文本启发式——它们指得出「这里值得再看
+    一眼」，指不出「这里一定错了」，所以绝不该有权力挡住合成。判据本身在
+    `_scan_beat_craft`，这里只负责把它翻成人话。
+    """
+    out = []
+    buckets, missing = _scan_beat_craft(beats)
+    macro_work = buckets['macro_env_work_product']
+    dup_detail = buckets['detail_repeats_context']
+    thin_trace = buckets['trace_without_mark']
+    vague_extent = buckets['state_without_quantity']
+    echoed_state = buckets['result_echoes_state']
+    wordy_op = buckets['operation_not_a_token']
+    no_anchor = buckets['detail_without_position']
+    no_insert = buckets['missing_insert_subject']
+    no_cast = buckets['missing_cast_action']
 
     def _ids(items):
         return '、'.join(x for x in dict.fromkeys(items) if x)
@@ -3959,6 +4002,332 @@ def autofix_beats(config, beats_doc, overview=None, on_progress=None, max_rework
     remaining_errors = [v for v in violations if v.get('level') == 'error']
     fixed_count = max(0, len(initial_errors) - len(remaining_errors))
     return beats_doc, max(1, fixed_count)
+
+
+# ── 工艺精修 ─────────────────────────────────────────────────────────────────
+#
+# 与 autofix 的分界线是 1:1：
+#   autofix   修的是**硬伤**——阶段倒退、供电链断、工序数越界。它有权改 stage / space /
+#             package_operations，因为那些字段本身就是被判死的东西。
+#   refine    修的是**措辞**——同一件事说得够不够准。画面上发生了什么一个字不动：拍号、
+#             时间窗、空间序列、施工阶段、工序包、认领的事件、证据帧全部只读。
+#
+# 之所以要单独一条路径：`autofix_beats` 第一件事就是「没有 error 就原样返回」，而工艺
+# 体检出的全是 warn。一条 0 硬伤、8 条工艺 warn 的阶梯按下「AI 修复硬伤」，模型一次都
+# 不会被调用，外层却照样重跑翻译、清掉合成产物、把 stage 退回卡点，最后弹一句「已解决
+# 全部硬伤」——用户看到的是修完了，实际一个字没改。
+
+# 本函数覆盖的症状码。共同点：改的是**怎么说**，不是**发生了什么**。
+# 不在其中的三条是有意留给别人的：evidence_out_of_window 与 beat_too_short 动的是时间窗
+# （autobalance / 人工的活），temporary_object_lingering 是「照实复刻 vs 产线规则」的取舍，
+# 只能由人裁决——把它交给模型，模型只会把用户真实观察到的那块防护布删掉。
+CRAFT_REFINE_CODES = (
+    'macro_env_work_product', 'detail_repeats_context', 'trace_without_mark',
+    'state_without_quantity', 'result_echoes_state', 'operation_not_a_token',
+    'detail_without_position', 'missing_cast_action', 'missing_insert_subject',
+    'missing_craft_fields',
+)
+
+# 允许模型重写的字段：措辞层。
+_CRAFT_REWRITE_FIELDS = (
+    'visual_subject', 'visible_details', 'visible_action', 'visible_result',
+    'state_before', 'state_after', 'persistent_traces', 'operation', 'macro_environment',
+)
+
+# 只补空、绝不覆盖已有值的字段。用户在卡点上手填过的，模型不得改写——他看着帧填的，
+# 模型看着同一批帧只是再猜一遍。
+_CRAFT_FILL_FIELDS = (
+    'tool', 'sfx', 'shot_scale', 'camera_move', 'worker_count',
+    'light_state', 'material_flow', 'cast_action', 'insert_subject',
+)
+
+# 每种症状给模型的定向指令。措辞与 `_validate_beat_craft` 报给用户的那几条同源，
+# 但这里是给模型的祈使句，且必须是英文——beats 正文是英文，中英混着下发会把改写
+# 结果也带成中英混排。
+_CRAFT_ISSUE_BRIEFS = {
+    'macro_env_work_product':
+        "macro_environment currently contains this beat's own work product. That column is only "
+        "for what this place looked like to begin with (terrain, geology, climate/light, spatial "
+        "envelope). Move any built/dug/installed result out of it into state_before/state_after.",
+    'detail_repeats_context':
+        "One visible_details entry restates something already covered by macro_environment or "
+        "persistent_traces. Replace that entry with a feature of THIS beat's subject that has not "
+        "been written yet. Keep 3-6 entries; aim for 5-6.",
+    'trace_without_mark':
+        "persistent_traces must name the mark itself AND the surface it landed on (bucket scars in "
+        "the trench wall, screw heads along the batten, sawdust on the deck). Pre-existing scenery "
+        "(fallen leaves, moss, old stains) is NOT a trace left by this beat - drop it.",
+    'state_without_quantity':
+        "state_before / state_after must carry a QUANTITY, not just an appearance: proportion, "
+        "extent, flush relationship, height difference, number of bays. 'roof tiles on the left two "
+        "thirds, right third still bare battens' is a quantity; 'roof partly tiled' is not.",
+    'result_echoes_state':
+        "visible_result and state_after are nearly the same sentence. Split them: visible_result = "
+        "what you SEE happen in this beat (the bus body sinking, the sling going slack); state_after "
+        "= how far the work has progressed (roof flush with grade).",
+    'operation_not_a_token':
+        "operation must be a 1-3 word milestone token ('seat bus', 'board ceiling'), not a clause "
+        "with an object. Move the object and the process into visible_action.",
+    'detail_without_position':
+        "Most visible_details entries do not say WHERE in the frame they are. Each entry = material "
+        "+ colour/texture/state + position ('yellow fibreglass batts in the left wall bays').",
+    'missing_cast_action':
+        "There are living subjects in frame (workers, miniature figures, animals) but cast_action is "
+        "empty. Write their body language APART from the work: posture, facing, gaze, movement, "
+        "gesture. The trade action itself belongs in visible_action, not here.",
+    'missing_insert_subject':
+        "The source cut to a close-up inside this beat but insert_subject is empty. Name what that "
+        "insert shot is on ('the tweezer tip pressing a roof tile', 'mortar squeezing out from under "
+        "the block') - something specific to THIS beat, not a generic tool-contact shot.",
+}
+
+_CRAFT_FILL_BRIEFS = {
+    'tool': "tool: the one geometric tool at the action peak (crane / jamb saw / rubber mallet / trowel).",
+    'sfx': "sfx: the physical sounds audible in this beat, one source per entry, max 4.",
+    'shot_scale': "shot_scale: one of extreme_wide | wide | medium | close | extreme_close.",
+    'camera_move': ("camera_move: one of static | push_in | pull_out | pan | tilt | orbit | follow | "
+                    "handheld | crane. Closed set - do not write free text."),
+    'worker_count': "worker_count: integer count of people visible in this beat's frames.",
+    'light_state': "light_state: lighting and time of day ('overcast midday, no cast shadows').",
+    'material_flow': ("material_flow: where the spoil went and where the stock came from "
+                      "('excavated soil piled on the trench's north lip')."),
+}
+
+_CRAFT_REFINE_SYSTEM = """You are a prompt craft editor for a shot-for-shot (1:1) replica of a time-lapse construction video.
+
+A beat ladder has already been reverse-engineered from the source video and APPROVED. Your job is NOT to re-interpret the video. Your job is to say the SAME facts more precisely, so an image/video model renders them consistently.
+
+=========== HARD 1:1 CONTRACT (violating this ruins the whole job) ===========
+- You may NOT change what happens on screen. Same work, same order, same extent, same people, same space.
+- You may NOT invent anything that is not visible in the attached evidence frames or already written in the beat.
+- The following are READ-ONLY CONTEXT. Never emit them, never propose changes to them:
+  id, start, end, space, stage, package_operations, workers_present, source_event_ids,
+  evidence_frames, coverage_frames, observed_cuts, observed_shot_count, confidence.
+- Do NOT add cinematic or quality vocabulary (cinematic, 8k, dramatic lighting, masterpiece,
+  award-winning, hyperrealistic). Those change what the source looked like. This is a replica.
+- Do NOT introduce anything named in BANNED ELEMENTS.
+- Keep the existing language and register: plain declarative English, present tense, no marketing adjectives.
+- If the frames do not let you fix an issue honestly, LEAVE THAT FIELD OUT of your reply. A field you
+  cannot ground is better left as it was. Never pad, never guess.
+
+=========== WHAT YOU MAY EDIT ===========
+Rewrite (wording only, same facts):
+  visual_subject, visible_details, visible_action, visible_result,
+  state_before, state_after, persistent_traces, operation, macro_environment
+Fill in ONLY if listed as missing below (never overwrite a value that is already there):
+  tool, sfx, shot_scale, camera_move, worker_count, light_state, material_flow,
+  cast_action, insert_subject
+
+=========== OUTPUT ===========
+Return ONE JSON object, no commentary, no code fences. Include ONLY the fields you actually changed:
+{"id": "<the beat id>", "<field>": <new value>, ...}
+If nothing can be honestly improved, return {"id": "<the beat id>"}."""
+
+
+def _resolve_frame_paths(frames_dir, names, limit=3):
+    """证据帧文件名 → 存在的绝对路径。找不到的静默跳过（老 job 的帧可能已清理）。"""
+    if not frames_dir:
+        return []
+    roots = [frames_dir,
+             os.path.join(frames_dir, 'review_frames'),
+             os.path.join(frames_dir, 'storyboard')]
+    out = []
+    for name in (names or []):
+        base = os.path.basename(str(name or '').strip())
+        if not base:
+            continue
+        for root in roots:
+            path = os.path.join(root, base)
+            if os.path.isfile(path):
+                out.append(path)
+                break
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _craft_todo(beats):
+    """哪几拍要精修，各自要修什么。返回 {beat_id: [症状码…]}，按拍号顺序。"""
+    buckets, missing = _scan_beat_craft(beats)
+    todo = {}
+    for code, ids in buckets.items():
+        for bid in ids:
+            todo.setdefault(bid, [])
+            if code not in todo[bid]:
+                todo[bid].append(code)
+    for field, ids in missing.items():
+        for bid in ids:
+            todo.setdefault(bid, [])
+            tag = f'missing:{field}'
+            if tag not in todo[bid]:
+                todo[bid].append(tag)
+    order = {b.get('id'): i for i, b in enumerate(beats)}
+    return dict(sorted(todo.items(), key=lambda kv: order.get(kv[0], 1 << 30)))
+
+
+def _merge_refined_beat(beat, patch):
+    """把一拍的精修结果并回去。返回实际改动的字段名列表。
+
+    两条纪律写死在这里，不指望模型自觉：
+    - `_CRAFT_REWRITE_FIELDS` 之外的键一律丢弃（模型改 stage / start 的冲动是真实存在的）；
+    - `_CRAFT_FILL_FIELDS` 只在原值为空时才写——用户在卡点上手填过的，模型不得覆盖。
+    """
+    if not isinstance(patch, dict):
+        return []
+    changed = []
+    for key, value in patch.items():
+        if key not in _CRAFT_REWRITE_FIELDS and key not in _CRAFT_FILL_FIELDS:
+            continue
+        if value in (None, '', [], {}):
+            continue
+        if key in _CRAFT_FILL_FIELDS:
+            existing = beat.get(key)
+            if isinstance(existing, str) and existing.strip():
+                continue
+            if isinstance(existing, (list, tuple, dict)) and len(existing):
+                continue
+            if isinstance(existing, int) and not isinstance(existing, bool):
+                continue
+        if key == 'worker_count':
+            # 人数与 workers_present 是同一件事的两种写法，而 normalize_beat_craft_fields
+            # 会拿人数去改布尔。模型把有人的拍写成 0，就等于凭空把这一拍变成清场帧、
+            # 让它成为 IMAGE 锚点候选——那是画面层面的改动，不是措辞。对不上就不要。
+            count = _coerce_count(value)
+            if count is None:
+                continue
+            present = beat.get('workers_present')
+            if present is True and count < 1:
+                continue
+            if present is False and count > 0:
+                continue
+            value = count
+        if beat.get(key) == value:
+            continue
+        beat[key] = value
+        changed.append(key)
+        if isinstance(beat.get('zh'), dict):
+            beat['zh'] = {k: v for k, v in beat['zh'].items() if k != key}
+            if not beat['zh']:
+                beat.pop('zh', None)
+    return changed
+
+
+def refine_beat_craft(config, beats_doc, overview=None, frames_dir=None, on_progress=None):
+    """看着证据帧逐拍精修措辞。返回 (beats_doc, 改动的拍数, 未覆盖的 warn 码列表)。
+
+    只送有毛病的那几拍，一拍一次调用：批量送会让模型把 B07 的帧记到 B08 头上，而
+    「位置锚」「量」「插入镜拍的是什么」这三类恰恰全靠看对帧。
+
+    收尾有一道回滚闸：精修后若**硬伤变多了**，整份原样退回。措辞层的改写不该产出新的
+    结构性违规；一旦产出了，说明模型越界改了它不该碰的东西，这时候留下半份比全退回更糟。
+    """
+    beats = beats_doc.get('beats') or []
+    if not beats:
+        return beats_doc, 0, []
+
+    todo = _craft_todo(beats)
+    if not todo:
+        return beats_doc, 0, []
+
+    before_violations = validate_beats(beats_doc, overview or {})
+    before_errors = len([v for v in before_violations if v.get('level') == 'error'])
+    snapshot = copy.deepcopy(beats_doc)
+
+    banned = [str(x).strip() for x in (beats_doc.get('banned_elements') or []) if str(x).strip()]
+    signature = str(beats_doc.get('scene_signature') or '').strip()
+    by_id = {b.get('id'): b for b in beats if isinstance(b, dict)}
+
+    refined = 0
+    total = len(todo)
+    for seq, (bid, codes) in enumerate(todo.items(), 1):
+        pp._raise_if_cancelled(on_progress)
+        beat = by_id.get(bid)
+        if not isinstance(beat, dict):
+            continue
+
+        briefs = []
+        for code in codes:
+            if code.startswith('missing:'):
+                field = code.split(':', 1)[1]
+                brief = _CRAFT_FILL_BRIEFS.get(field)
+                if brief:
+                    briefs.append(f'- MISSING FIELD -> {brief}')
+            elif code in _CRAFT_ISSUE_BRIEFS:
+                briefs.append(f'- {code}: {_CRAFT_ISSUE_BRIEFS[code]}')
+        if not briefs:
+            continue
+
+        readonly = {k: beat.get(k) for k in
+                    ('id', 'start', 'end', 'space', 'stage', 'package_operations',
+                     'workers_present', 'observed_shot_count')
+                    if beat.get(k) is not None}
+        editable = {k: beat.get(k) for k in (_CRAFT_REWRITE_FIELDS + _CRAFT_FILL_FIELDS)
+                    if beat.get(k) not in (None, '', [], {})}
+
+        frames = _resolve_frame_paths(frames_dir, beat.get('evidence_frames')
+                                      or beat.get('reference_frames'))
+        user_text = (
+            (f'SCENE SIGNATURE (true for the whole video): {signature}\n\n' if signature else '')
+            + (f'BANNED ELEMENTS (never mention these): {", ".join(banned)}\n\n' if banned else '')
+            + f'READ-ONLY CONTEXT for beat {bid} (never emit these):\n'
+            + json.dumps(readonly, ensure_ascii=False, indent=1)
+            + f'\n\nEDITABLE FIELDS as they stand now:\n'
+            + json.dumps(editable, ensure_ascii=False, indent=1)
+            + '\n\nISSUES TO FIX IN THIS BEAT:\n' + '\n'.join(briefs)
+            + ('\n\nThe evidence frames for this beat are attached in chronological order. '
+               'Ground every edit in what you can actually see in them.'
+               if frames else
+               '\n\nNO EVIDENCE FRAMES ARE AVAILABLE for this beat. Do NOT invent visual specifics '
+               '(positions, quantities, insert subjects) you cannot derive from the text above - '
+               'restructure only what is already written, and leave the rest out of your reply.')
+        )
+
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'review_beats',
+                'message': f'工艺精修 {seq}/{total}：{bid}（{len(briefs)} 项）…',
+            })
+
+        try:
+            if frames:
+                raw = pp._multimodal_chat(config, _CRAFT_REFINE_SYSTEM, user_text, frames,
+                                          max_tokens=4096, timeout=120)
+            else:
+                raw = pp._chat(config, _CRAFT_REFINE_SYSTEM, user_text,
+                               temperature=0.2, max_tokens=4096, timeout=120)
+            patch = parse_json_reply(raw)
+        except pp.GenerationCancelled:
+            raise
+        except Exception as e:
+            # 单拍失败不该拖垮整轮：19 拍里第 7 拍网络抖一下，前 6 拍的成果不能跟着丢。
+            if on_progress:
+                on_progress('replica_stage', {
+                    'stage': 'review_beats',
+                    'message': f'{bid} 精修失败，跳过：{e}',
+                })
+            continue
+
+        if isinstance(patch, list):
+            patch = next((x for x in patch if isinstance(x, dict)), None)
+        if _merge_refined_beat(beat, patch or {}):
+            refined += 1
+
+    normalize_beat_craft_fields(beats_doc)
+
+    after_violations = validate_beats(beats_doc, overview or {})
+    after_errors = len([v for v in after_violations if v.get('level') == 'error'])
+    if after_errors > before_errors:
+        beats_doc.clear()
+        beats_doc.update(snapshot)
+        beats_doc['validation'] = before_violations
+        raise CraftRefineRolledBack(
+            f'工艺精修后硬伤从 {before_errors} 项涨到 {after_errors} 项，已整份回滚——'
+            f'措辞层的改写不该产出新的结构性违规，说明模型越界改了不该碰的字段。')
+
+    beats_doc['validation'] = after_violations
+    uncovered = sorted({v.get('code') for v in after_violations
+                        if v.get('level') != 'error' and v.get('code') not in CRAFT_REFINE_CODES})
+    return beats_doc, refined, uncovered
 
 
 def autobalance_beats(beats_doc, overview=None, max_duration=6.0, min_duration=2.0, speed_multiplier=2.0):

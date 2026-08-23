@@ -99,6 +99,10 @@ const beatsHtml = call(`replicaRenderBeats(replicaState)`);
 assert.ok(beatsHtml.includes('id="replica-autofix-btn"'), '底部操作栏必须包含 AI 修复按钮');
 assert.ok(beatsHtml.includes('id="replica-banner-autofix-btn"'), '硬伤横幅必须包含一键 AI 修复按钮');
 assert.ok(beatsHtml.includes('AI 修复全部硬伤'), '横幅修复文案正确');
+// 工艺精修与 AI 修复硬伤是两条路：那条修被判死的硬伤（有权改 stage/工序包），
+// 这条只改措辞、画面内容一个字不动。0 硬伤的阶梯上只有这一条能动工艺 warn。
+assert.ok(beatsHtml.includes('id="replica-refine-craft-btn"'), '底部操作栏必须包含工艺精修按钮');
+assert.ok(beatsHtml.includes('不动 1:1'), '精修按钮必须写明它不改画面内容');
 
 // ── 5. 变体任务折叠/展开下拉功能测试 ───────────────────────────────────────
 const sampleJobs = [

@@ -11,7 +11,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import server_common
 import replica_pipeline as rp
@@ -503,6 +503,35 @@ class TestComposeGate(ReplicaTempRootCase):
              patch('prompt_pipeline.reverse.translate_beats', return_value=1):
             balanced_state, _ = rp.autobalance_job_beats({}, state['job_id'])
             self.assertIsNone(balanced_state['prompt_block'])
+
+    def test_autofix_with_nothing_to_fix_keeps_the_prompt_block_and_the_stage(self):
+        """0 硬伤时按下「AI 修复硬伤」，此前是一次纯亏损的返工。
+
+        `autofix_beats` 第一件事就是「没有 error 就原样返回」，而单拍工艺体检出的全是
+        warn。于是模型一次都没被调用，外层却照样重跑一遍翻译（真花钱）、清掉已经合成好
+        的 prompt_block、把 stage 从 completed 退回卡点，最后弹一句「已解决全部硬伤」。
+        用户看到的是修完了，实际一个字没改，还得重合成一次。
+        """
+        state = self._ingest()
+        state['prompt_block'] = 'VIDEO 1: composed prompt'
+        state['beats'] = {'beats': [{'id': 'B01', 'start': 0, 'end': 8}]}
+        state['stage'] = 'completed'
+        rp._save_state(state)
+
+        ov_path = os.path.join(rp.job_dir(state['job_id']), 'video_overview.json')
+        with open(ov_path, 'w', encoding='utf-8') as f:
+            json.dump({'review_sampling': {'frames': []}, 'change_events': []}, f)
+
+        translate = MagicMock(return_value=1)
+        with patch('prompt_pipeline.reverse.autofix_beats',
+                   return_value=({'beats': [{'id': 'B01'}]}, 0)), \
+             patch('prompt_pipeline.reverse.translate_beats', translate):
+            out, count = rp.autofix_job_beats({}, state['job_id'])
+
+        self.assertEqual(count, 0)
+        self.assertEqual(out['prompt_block'], 'VIDEO 1: composed prompt')
+        self.assertEqual(out['stage'], 'completed')
+        translate.assert_not_called()
 
 
 

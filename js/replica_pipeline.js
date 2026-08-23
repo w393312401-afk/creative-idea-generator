@@ -1496,6 +1496,8 @@ function replicaRenderBeats(state) {
               判断这两个是不是同一个按钮才敢点。 */''}
         <div class="replica-actions">
             <button type="button" id="replica-autofix-btn" class="action-btn text-btn" title="调用 AI 根据工序依赖与因果逻辑自动修正硬伤">🪄 AI 修复硬伤</button>
+            <button type="button" id="replica-refine-craft-btn" class="action-btn text-btn"
+                    title="看着证据帧把每一拍的措辞写准：补位置锚、补完成量、拆开结果与状态、补工具/声音/景别/运镜/光照/物料。画面上发生了什么一个字不动，1:1 不受影响。已有的合成提示词会作废，需要重新合成。">✨ 工艺精修（不动 1:1）</button>
             <button type="button" id="replica-actions-autobalance-btn" class="action-btn text-btn" title="按 2x 倍速时序规则自动拆解 >6.0s 超长拍并合并微拍">⚡ 自动平衡秒数/拆拍</button>
             <button type="button" id="replica-recluster-btn" class="action-btn text-btn"
                     title="帧事实走缓存，不会重付视觉调用的钱">重跑聚类</button>
@@ -2181,6 +2183,13 @@ function replicaBindBeatEvents(scope) {
 
     // 保存与合成不在这一排里，它们常驻吸底操作栏（见 replicaBindBottomBarEvents）。
     on('#replica-autofix-btn', (e) => replicaAdvance('autofix', {}, e.currentTarget));
+    // 精修会作废已有的 prompt_block（beats 一变，旧提示词就是按旧措辞合出来的）。
+    // 已经合成过的 job 上这是一次真实的返工，按之前先说清楚。
+    on('#replica-refine-craft-btn', (e) => {
+        const composed = !!(replicaState && (replicaState.prompt_block || replicaState.stage === 'completed'));
+        if (composed && !confirm('工艺精修只改措辞、不动画面内容，但它会让已经合成好的提示词作废，需要重新合成一次。继续？')) return;
+        replicaAdvance('refine_craft', {}, e.currentTarget);
+    });
     on('#replica-banner-autofix-btn', (e) => replicaAdvance('autofix', {}, e.currentTarget));
     on('#replica-autobalance-btn', (e) => replicaAdvance('autobalance', {}, e.currentTarget));
     on('#replica-actions-autobalance-btn', (e) => replicaAdvance('autobalance', {}, e.currentTarget));

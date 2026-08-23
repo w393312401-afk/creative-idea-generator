@@ -18,6 +18,7 @@
 渲染由既有的分步管线接手（beats 已经把拍数锁死，接上去就是 1:1）。
 """
 
+import copy
 import json
 import os
 import re
@@ -52,7 +53,8 @@ STAGES = [
 REVIEW_STAGES = {'confirm_cost', 'review_beats', 'audit_failed', 'compose_failed', 'mutate_failed'}
 ATTENTION_WAITING_YOU = {'confirm_cost', 'review_beats', 'audit_failed', 'compose_failed', 'mutate_failed'}
 
-VALID_ACTIONS = {'approve', 'variant', 'recluster', 'translate', 'autofix', 'fix_beats', 'autobalance', 'archive', 'rename'}
+VALID_ACTIONS = {'approve', 'variant', 'recluster', 'translate', 'autofix', 'fix_beats',
+                 'autobalance', 'refine_craft', 'archive', 'rename'}
 
 # stage → 中文标签的唯一真源。
 STAGE_LABELS = {
@@ -996,12 +998,34 @@ def autofix_job_beats(config, job_id, on_progress=None):
         raise ValueError('还没有节拍阶梯，无法修复')
 
     overview = _load_overview(state)
+    previous = copy.deepcopy(beats)
     fixed_doc, fixed_count = reverse.autofix_beats(
         config, beats, overview=overview, on_progress=on_progress
     )
 
+    # 2026-08-23：`autofix_beats` 第一件事是「没有 error 就原样返回」，而工艺体检出的
+    # 全是 warn。此前这里不分青红皂白往下跑：一条 0 硬伤的阶梯按下按钮，模型一次都没
+    # 被调用，却照样重跑一遍翻译（真花钱）、清掉已有的合成产物、把 stage 从 completed
+    # 退回卡点，最后弹一句「已解决全部硬伤」。什么都没修还收了钱、还退了工。
+    # 工艺 warn 要修走 `refine_job_craft`，不是这条路。
+    if not fixed_count:
+        # autofix_beats 的早退路径不写 validation，直接取会拿到上一轮的旧快照。
+        state['validation'] = reverse.validate_beats(fixed_doc, overview)
+        _save_state(state)
+        if on_progress:
+            warns = [v for v in state.get('validation') or [] if v.get('level') != 'error']
+            on_progress('replica_stage', {
+                'stage': state.get('stage'),
+                'message': ('这条阶梯没有硬伤可修，什么都没有改动。'
+                            + (f'剩下的 {len(warns)} 项是待人工确认的工艺项，'
+                               f'按「✨ 工艺精修」才会动它们。' if warns else '')),
+                'beats': fixed_doc,
+                'validation': state.get('validation') or [],
+            })
+        return state, 0
+
     # 翻译作废并重新翻译更新过的字段
-    reverse.prune_stale_translations(beats, fixed_doc)
+    reverse.prune_stale_translations(previous, fixed_doc)
     reverse.translate_beats(config, fixed_doc, on_progress=on_progress)
     _invalidate_compose_artifacts(state)
     _write_beats(state, fixed_doc)
@@ -1054,6 +1078,72 @@ def autobalance_job_beats(config, job_id, on_progress=None):
             'validation': state.get('validation') or [],
         })
     return state, changed_count
+
+
+def refine_job_craft(config, job_id, on_progress=None):
+    """工艺精修：在 1:1 不变的前提下，看着证据帧把每一拍的措辞写准。
+
+    与 `autofix_job_beats` 的分界见 `reverse.refine_beat_craft` 的注释——那条修硬伤、
+    有权改结构；这条只改措辞，画面上发生了什么一个字不动。
+
+    合成产物照样作废：beats 变了，已有的 prompt_block 就是按旧措辞合出来的，留着它
+    下次合成会走快速通道原样复用，精修等于白做。这一条对用户是有代价的（一次合成的
+    时间和钱），所以调用方必须先问过。
+    """
+    from prompt_pipeline import reverse
+
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+    if state.get('is_locked_baseline'):
+        raise ValueError('已加锁为 Gold Baseline，禁止精修节拍——'
+                         '母本一改，所有已派生变体的血统就和它对不上了。'
+                         '要改请先解锁，或以此母本派生变体后在变体上改。')
+    beats = state.get('beats')
+    if not beats or not beats.get('beats'):
+        raise ValueError('还没有节拍阶梯，无法精修')
+
+    overview = _load_overview(state)
+    # 证据帧在根母本的目录下：变体的 reference_frames 指回的是原片的帧。
+    frames_dir = job_dir(find_root_baseline_id(job_id))
+    previous = copy.deepcopy(beats)
+
+    refined_doc, refined_count, uncovered = reverse.refine_beat_craft(
+        config, beats, overview=overview, frames_dir=frames_dir, on_progress=on_progress)
+
+    if not refined_count:
+        # 一个字没改就别动 stage、别清合成产物、别重跑翻译。什么都没发生时假装发生过，
+        # 正是「AI 修复硬伤」在 0 硬伤阶梯上干的事。
+        state['validation'] = refined_doc.get('validation') or state.get('validation')
+        _save_state(state)
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': state.get('stage'),
+                'message': '工艺精修没有改动任何一拍：要么已经没有可修的工艺项，要么证据帧不足以支撑改写。',
+                'beats': refined_doc,
+                'validation': state.get('validation') or [],
+            })
+        return state, 0
+
+    reverse.prune_stale_translations(previous, refined_doc)
+    reverse.translate_beats(config, refined_doc, on_progress=on_progress)
+    _invalidate_compose_artifacts(state)
+    _write_beats(state, refined_doc)
+    state['stage'] = 'review_beats'
+    _save_state(state)
+
+    if on_progress:
+        tail = (f'仍有 {len(uncovered)} 类工艺精修覆盖不到的待确认项（{"、".join(uncovered)}），'
+                f'那几类改的是时间窗或观察本身，得由你来定。' if uncovered else '')
+        on_progress('replica_stage', {
+            'stage': 'review_beats',
+            'message': (f'工艺精修完成：{refined_count} 拍的措辞已按证据帧改写，'
+                        f'画面内容一个字没动。已有的合成提示词按旧措辞产出、已作废，'
+                        f'需要重新合成。{tail}'),
+            'beats': refined_doc,
+            'validation': state.get('validation') or [],
+        })
+    return state, refined_count
 
 
 # ── 二创 ─────────────────────────────────────────────────────────────────────
@@ -1939,6 +2029,7 @@ def advance_replica_job(config, job_id, action='approve', payload=None,
     variant  → 派生二创变体（payload: {axes, brief}），返回新 job 的 state
     recluster→ 重跑 Pass B（Pass A 的帧事实走缓存，不重付视觉钱）
     translate→ 重做中文对照（纯文本调用，不碰英文原文，也不动 stage）
+    refine_craft→ 工艺精修：看着证据帧改措辞，画面内容不动（1:1 不受影响）
     """
     if action not in VALID_ACTIONS:
         raise ValueError(f'不支持的 action: {action}，合法值为: {sorted(VALID_ACTIONS)}')
@@ -1976,6 +2067,9 @@ def advance_replica_job(config, job_id, action='approve', payload=None,
             return state
         if action == 'autobalance':
             state, changed_count = autobalance_job_beats(config, job_id, on_progress=on_progress)
+            return state
+        if action == 'refine_craft':
+            state, refined_count = refine_job_craft(config, job_id, on_progress=on_progress)
             return state
         raise ValueError(f'不支持的 action: {action}')
     except Exception as e:
