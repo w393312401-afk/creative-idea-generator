@@ -757,6 +757,28 @@ class AccountPool:
         entry["user_id"] = user_id
         return entry
 
+    def record_measured_credit(self, user_id: str, credit: int) -> None:
+        """把生成过程中实读到的余额写回状态，等价于一次成功的探测。
+
+        选号时探到的那个数字是**快照**，整批跑下来会越来越假（号池不伪造单张
+        扣费）。生成链路手上正好有打开的页面，读到的数就该写回来，免得控制台
+        一直显示一个几十分钟前的余额、下一批又照着它选号。
+        """
+        if credit is None:
+            return
+        with _LOCK:
+            state = _read_state()
+            if user_id not in state:
+                return
+            state[user_id]["credit"] = int(credit)
+            _sync_zero_credit_disabled(state[user_id], int(credit))
+            now = _now_iso()
+            state[user_id]["last_checked_at"] = now
+            state[user_id]["last_probe_at"] = now
+            state[user_id]["last_probe_status"] = "ok"
+            state[user_id]["last_probe_error"] = None
+            _write_state(state)
+
     def mark_exhausted(self, user_id: str, cooldown_hours: float = 24.0,
                        credit: Optional[int] = None):
         """账号额度不够用了：写回余额、进冷却。

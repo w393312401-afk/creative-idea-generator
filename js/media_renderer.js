@@ -295,11 +295,13 @@ function hydrateFramesPanel(idea) {
     if (!idea) return;
     const rec = (typeof getIdeaTaskRecord === 'function') ? getIdeaTaskRecord(idea.id, 'frames') : null;
     const btn = document.getElementById('generate-frames-btn');
+    const selBtn = document.getElementById('generate-frames-selection-btn');
     const progress = document.getElementById('frames-progress');
     const meta = document.getElementById('frames-meta');
     renderFramesForIdea(idea);
     if (rec) {
         if (btn) btn.disabled = true;
+        if (selBtn) selBtn.disabled = true;
         if (progress) progress.style.display = 'flex';
         if (meta) meta.textContent = rec.meta || '生成中...';
         if (rec.progressInfo && typeof setProgressBar === 'function') setProgressBar('frames', rec.progressInfo);
@@ -310,6 +312,10 @@ function hydrateFramesPanel(idea) {
         if (btn) {
             btn.disabled = deliveryBlocked;
             btn.title = deliveryBlocked ? '提示词处于降级或质量门未通过状态，不能生成帧序列' : '';
+        }
+        if (selBtn) {
+            selBtn.disabled = deliveryBlocked;
+            selBtn.title = deliveryBlocked ? '提示词处于降级或质量门未通过状态，不能生成帧序列' : '';
         }
         if (progress) progress.style.display = 'none';
         const wrap = document.getElementById('frames-live-feed');

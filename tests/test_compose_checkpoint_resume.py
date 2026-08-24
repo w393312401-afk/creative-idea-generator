@@ -54,6 +54,34 @@ class TestCheckpointStorage(unittest.TestCase):
         self.assertIsNone(pp.load_compose_checkpoint('fp-a'))
         self.assertEqual(pp.load_compose_checkpoint('fp-b')['title'], 'B')
 
+    def test_clear_compose_caches_takes_the_packets_too(self):
+        """「清理合成缓存」清的是两个文件。只清断点存档是最容易犯的那个错：
+        提示词逐字重生成了，Step 4 却命中旧 packet，空间契约与 camera DNA 还是老的
+        ——从成品上完全看不出来缓存没清干净。"""
+        with patch.object(pp, 'CACHE_PATH', os.path.join(self._tmp_dir, 'packet_cache.json')):
+            pp.save_compose_checkpoint('fp-a', {'title': 'A'})
+            pp.save_compose_checkpoint('fp-b', {'title': 'B'})
+            # packet 的键是「指纹 + 本次梯子哈希」，同一份 brief 会留下好几条。
+            pp.save_packet_cache({'fp-a:1111': {'p': 1}, 'fp-a:2222': {'p': 2},
+                                  'fp-b:3333': {'p': 3}})
+
+            cleared = pp.clear_compose_caches('fp-a')
+
+            self.assertEqual(cleared, {'checkpoint': 1, 'packets': 2})
+            self.assertIsNone(pp.load_compose_checkpoint('fp-a'))
+            self.assertEqual(sorted(pp.load_packet_cache()), ['fp-b:3333'])
+            # 别的任务的缓存不能被顺手清掉——这个页面上同时挂着好几单。
+            self.assertEqual(pp.load_compose_checkpoint('fp-b')['title'], 'B')
+
+    def test_clear_compose_caches_is_a_noop_when_there_is_nothing_to_clear(self):
+        with patch.object(pp, 'CACHE_PATH', os.path.join(self._tmp_dir, 'packet_cache.json')):
+            self.assertEqual(pp.clear_compose_caches('never-seen'),
+                             {'checkpoint': 0, 'packets': 0})
+            # 空指纹要短路：拿它去做前缀匹配会把整个 packet 缓存清光。
+            pp.save_packet_cache({'fp-a:1111': {'p': 1}})
+            self.assertEqual(pp.clear_compose_caches(''), {'checkpoint': 0, 'packets': 0})
+            self.assertEqual(sorted(pp.load_packet_cache()), ['fp-a:1111'])
+
     def test_encode_decode_slots_round_trip(self):
         encoded = pp._checkpoint_encode_slots({1: 'x', 2: 'y'})
         self.assertEqual(encoded, {'1': 'x', '2': 'y'})

@@ -62,7 +62,12 @@ const DEFAULT_CONFIG = {
     ideationTrendUrls: '',
     // 激发联网搜索词（可选）: 留空用默认「爆款延时改造视频」查询;
     // 自定义后按搜索词分别缓存 6 小时,改词立即生效
-    ideationSearchQuery: ''
+    ideationSearchQuery: '',
+    // 任务完成/失败多模态强提醒设置
+    soundNotificationEnabled: true,
+    notificationVolume: 80,
+    desktopNotificationEnabled: true,
+    taskbarFlashEnabled: true
 };
 
 // LLM 主模型清单（激发/合成/审核/质检判定共用；网关路由由服务端 resolve_gateway 处理）。

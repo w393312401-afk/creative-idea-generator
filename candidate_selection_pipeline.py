@@ -221,6 +221,38 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
     candidates_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
     os.makedirs(candidates_dir, exist_ok=True)
 
+    # 检查池中已有候选图与元数据，实现全量累积追加而非覆盖
+    existing_meta = []
+    meta_file = os.path.join(candidates_dir, 'candidates_meta.json')
+    if os.path.exists(meta_file):
+        try:
+            with open(meta_file, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+                if isinstance(payload, dict) and isinstance(payload.get('candidates'), list):
+                    existing_meta = [c for c in payload['candidates'] if isinstance(c, dict)]
+        except Exception:
+            existing_meta = []
+
+    max_existing_idx = 0
+    for cm in existing_meta:
+        try:
+            c_idx = int(cm.get('index') or 0)
+            if c_idx > max_existing_idx:
+                max_existing_idx = c_idx
+        except (TypeError, ValueError):
+            pass
+    if not existing_meta and os.path.isdir(candidates_dir):
+        for name in os.listdir(candidates_dir):
+            m = re.match(r'^candidate_(\d+)(?:_.*)?\.webp$', name)
+            if m:
+                try:
+                    max_existing_idx = max(max_existing_idx, int(m.group(1)))
+                except ValueError:
+                    pass
+
+    start_idx = max_existing_idx + 1
+    end_idx = max_existing_idx + candidate_count
+
     candidate_paths = []
     candidates_meta = []
     is_text_only = (seq == 1 and not reference_path)
@@ -331,11 +363,12 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
                 if fx_res.get('image_urls'):
                     fx_urls = fx_res['image_urls']
                     for idx, src_p in enumerate(fx_urls[:candidate_count]):
-                        cand_dest = os.path.join(candidates_dir, f'candidate_{idx+1}.webp')
+                        cand_idx = start_idx + idx
+                        cand_dest = os.path.join(candidates_dir, f'candidate_{cand_idx}.webp')
                         cand_uuid = _fx_extract_uuid(src_p)
                         cand_raw_jpg = None
                         if cand_uuid and os.path.exists(src_p) and src_p.lower().endswith('.jpg'):
-                            cand_raw_jpg = os.path.join(candidates_dir, f'candidate_{idx+1}_{cand_uuid}.jpg')
+                            cand_raw_jpg = os.path.join(candidates_dir, f'candidate_{cand_idx}_{cand_uuid}.jpg')
                             if src_p != cand_raw_jpg:
                                 shutil.copy2(src_p, cand_raw_jpg)
                         elif os.path.exists(src_p):
@@ -351,7 +384,7 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
                         
                         candidate_paths.append(cand_dest)
                         candidates_meta.append({
-                            'index': idx + 1,
+                            'index': cand_idx,
                             'path': cand_dest,
                             'raw_src': cand_raw_jpg or cand_dest,
                             'fx_uuid': cand_uuid,
@@ -383,10 +416,10 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
     # If Google FX produced fewer candidates or backend is API, use API generation
     elif len(candidate_paths) < candidate_count:
         missing_count = candidate_count - len(candidate_paths)
-        start_idx = len(candidate_paths) + 1
-        missing_indices = list(range(start_idx, candidate_count + 1))
+        cur_start_idx = start_idx + len(candidate_paths)
+        missing_indices = list(range(cur_start_idx, cur_start_idx + missing_count))
         max_workers = candidate_concurrency(config, missing_count)
-        log('INFO', 'CANDIDATE_GEN', f"IMG {seq:03d} 并发生成 {missing_count} 张候选图 (从 index {start_idx} 开始，并发度 {max_workers})...")
+        log('INFO', 'CANDIDATE_GEN', f"IMG {seq:03d} 并发生成 {missing_count} 张候选图 (从 index {cur_start_idx} 开始，并发度 {max_workers})...")
 
         if on_progress and on_progress('cancel_check', None):
             raise ConnectionError('用户取消了候选帧生成')
@@ -396,14 +429,15 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
                 'sequence': seq,
                 'candidate_index': None,
                 'total_candidates': candidate_count,
-                'message': f"IMG {seq:03d} 正在并发生成 {missing_count} 张候选图 (#{start_idx}~#{candidate_count})...",
+                'message': f"IMG {seq:03d} 正在并发生成 {missing_count} 张候选图 (#{cur_start_idx}~#{cur_start_idx + missing_count - 1})...",
             })
 
         def _make_cand(c_idx):
             cand_path = os.path.join(candidates_dir, f'candidate_{c_idx}.webp')
+            var_num = (c_idx - start_idx + 1)
             p_variant = prompt_text
-            if c_idx > 1:
-                p_variant = f"{prompt_text}\n\n[Variation #{c_idx}]"
+            if var_num > 1:
+                p_variant = f"{prompt_text}\n\n[Variation #{var_num}]"
             _generate_single_api_candidate(config, p_variant, reference_path, cand_path, is_text_only, ctrl_prompt)
             if os.path.exists(cand_path) and os.path.getsize(cand_path) > 0:
                 return {
@@ -423,7 +457,7 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
                         'sequence': seq,
                         'candidate_index': c_idx,
                         'total_candidates': candidate_count,
-                        'message': f"IMG {seq:03d} 正在生成候选图 #{c_idx}/{candidate_count}...",
+                        'message': f"IMG {seq:03d} 正在生成候选图 #{c_idx} (本批第 {c_idx - start_idx + 1}/{candidate_count} 张)...",
                     })
                 try:
                     meta = _make_cand(c_idx)
@@ -514,12 +548,13 @@ def generate_frame_candidates(config, title, item, reference_path, seq, candidat
     if not candidate_paths:
         raise RuntimeError(f"IMG {seq:03d} 生成候选图失败，未获得任何有效图片")
 
-    # Save candidates metadata for easy recovery/switch
+    # Save candidates metadata for easy recovery/switch (accumulate with existing_meta)
     try:
+        all_candidates_meta = existing_meta + candidates_meta
         meta_payload = {
             'sequence': seq,
             'project_url': returned_project_url,
-            'candidates': candidates_meta,
+            'candidates': all_candidates_meta,
         }
         with open(os.path.join(candidates_dir, 'candidates_meta.json'), 'w', encoding='utf-8') as f:
             json.dump(meta_payload, f, ensure_ascii=False, indent=2)
@@ -959,14 +994,22 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
 
 
 
-        best_idx = eval_result.get('best_index', 1)
-        best_candidate_path = candidate_paths[best_idx - 1]
+        cand_path_indices = []
+        for cp in candidate_paths:
+            m = re.search(r'candidate_(\d+)(?:_.*)?\.webp$', os.path.basename(cp))
+            cand_path_indices.append(int(m.group(1)) if m else len(cand_path_indices) + 1)
+
+        eval_best_pos = eval_result.get('best_index', 1)
+        if not isinstance(eval_best_pos, int) or eval_best_pos < 1 or eval_best_pos > len(candidate_paths):
+            eval_best_pos = 1
+        best_actual_idx = cand_path_indices[eval_best_pos - 1]
+        best_candidate_path = candidate_paths[eval_best_pos - 1]
         selection_reason = eval_result.get('selection_reason', '')
 
         # ── Step 3: Copy Best Candidate to Target Frame Path & fx_src ──
         shutil.copy2(best_candidate_path, target_path)
 
-        best_cand_meta = cand_meta_map.get(best_idx, {})
+        best_cand_meta = cand_meta_map.get(best_actual_idx, {})
         best_uuid = best_cand_meta.get('fx_uuid')
         best_raw_src = best_cand_meta.get('raw_src')
 
@@ -992,21 +1035,45 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
         # Set as previous_path for the next frame
         previous_path = target_path
 
-        # ── Step 4: Record into Manifest ──
-        rel_target_path = os.path.relpath(target_path, workspace_root).replace('\\', '/')
-        rel_candidates = [
-            {
-                'index': i + 1,
+        # ── Step 4: Record into Manifest (全量保留候选池所有批次候选) ──
+        existing_frame = manifest_frames_by_seq.get(seq, {})
+        existing_cands = existing_frame.get('candidates', []) if isinstance(existing_frame.get('candidates'), list) else []
+
+        updated_existing_cands = []
+        seen_cand_indices = set()
+        for ec in existing_cands:
+            if not isinstance(ec, dict):
+                continue
+            ec_idx = ec.get('index')
+            seen_cand_indices.add(ec_idx)
+            ec_copy = dict(ec)
+            ec_copy['is_chosen'] = (ec_idx == best_actual_idx)
+            updated_existing_cands.append(ec_copy)
+
+        new_rel_candidates = []
+        for i, cp in enumerate(candidate_paths):
+            c_idx = cand_path_indices[i]
+            if c_idx in seen_cand_indices:
+                continue
+            c_meta = cand_meta_map.get(c_idx, {})
+            eval_c = (eval_result.get('candidates') or [{}])[i] if i < len(eval_result.get('candidates') or []) else {}
+            c_model = c_meta.get('model') or (backend if backend == 'google_fx' else (config.get('imageModel') or 'gemini-3.1-flash-image'))
+            c_model_display = 'Google FX' if ('google_fx' in str(c_model).lower() or backend == 'google_fx') else ('GPT-2' if 'gpt' in str(c_model).lower() else 'Gemini')
+            new_rel_candidates.append({
+                'index': c_idx,
                 'file': os.path.relpath(cp, workspace_root).replace('\\', '/'),
                 'url': os.path.relpath(cp, workspace_root).replace('\\', '/'),
-                'fx_uuid': cand_meta_map.get(i + 1, {}).get('fx_uuid'),
-                'is_chosen': (i + 1 == best_idx),
-                'score': (eval_result.get('candidates') or [{}])[i].get('score', 80) if i < len(eval_result.get('candidates') or []) else 80,
-                'strengths': (eval_result.get('candidates') or [{}])[i].get('strengths', '') if i < len(eval_result.get('candidates') or []) else '',
-                'defects': (eval_result.get('candidates') or [{}])[i].get('defects', '') if i < len(eval_result.get('candidates') or []) else '',
-            }
-            for i, cp in enumerate(candidate_paths)
-        ]
+                'fx_uuid': c_meta.get('fx_uuid'),
+                'model': c_model,
+                'model_display': c_model_display,
+                'is_chosen': (c_idx == best_actual_idx),
+                'score': eval_c.get('score', 80),
+                'strengths': eval_c.get('strengths', ''),
+                'defects': eval_c.get('defects', ''),
+            })
+
+        full_candidates = updated_existing_cands + new_rel_candidates
+        rel_target_path = os.path.relpath(target_path, workspace_root).replace('\\', '/')
 
         frame_data = {
             'sequence': seq,
@@ -1018,11 +1085,11 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
             'prompt': item.get('prompt', ''),
             'reference': os.path.relpath(reference, workspace_root).replace('\\', '/') if reference else None,
             'quality_gate': 'auto_approved',
-            'vlm_qa_reason': f"AI 4选1 鉴别优选 (候选 #{best_idx}): {selection_reason}",
+            'vlm_qa_reason': f"AI 4选1 鉴别优选 (候选 #{best_actual_idx}): {selection_reason}",
             'selection_mode': 'candidate_selection',
-            'chosen_candidate_index': best_idx,
+            'chosen_candidate_index': best_actual_idx,
             'ai_evaluation': eval_result,
-            'candidates': rel_candidates,
+            'candidates': full_candidates,
             'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
         }
 
@@ -1048,10 +1115,10 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
         if on_progress:
             on_progress('candidate_ai_evaluation', {
                 'sequence': seq,
-                'best_index': best_idx,
+                'best_index': best_actual_idx,
                 'selection_reason': selection_reason,
-                'scores': [c.get('score') for c in rel_candidates],
-                'message': f"IMG {seq:03d} AI 鉴别选中候选 #{best_idx}：{selection_reason}",
+                'scores': [c.get('score') for c in full_candidates],
+                'message': f"IMG {seq:03d} AI 鉴别选中候选 #{best_actual_idx}：{selection_reason}",
             })
             on_progress('frame', {
                 'sequence': seq,
@@ -1260,7 +1327,10 @@ def switch_frame_candidate(title, seq, new_candidate_index):
                 if new_uuid:
                     frame['fx_uuid'] = new_uuid
                 for cand in frame.get('candidates', []):
-                    cand['is_chosen'] = (cand.get('index') == new_candidate_index)
+                    is_this = (cand.get('index') == new_candidate_index)
+                    cand['is_chosen'] = is_this
+                    if is_this and cand.get('model'):
+                        frame['model'] = cand['model']
                 break
 
         try:

@@ -597,11 +597,48 @@ class _CreditExhaustedError(Exception):
     pass
 
 
+def _looks_like_credit_exhaustion(err) -> bool:
+    """一条异常是不是在说"积分不够了"。
+
+    helpers.py 是图片链和视频链共用的，抛不出本模块私有的 _CreditExhaustedError，
+    约定用 "INSUFFICIENT_CREDITS:" 前缀捎信号；另外 Flow 的原始报错文案本身也
+    可能直接写着 out of credits 之类的措辞。两种都认。
+    """
+    text = str(err or "")
+    return "INSUFFICIENT_CREDITS" in text or is_credit_exhausted_message(text)
+
+
 # 2026-07-25：把"被判异常活动就强制换 IP"统一改成换号重试。换 IP 只换出口地址，
 # 账号侧的风控评分不会跟着重置，实测换完照样被判；而频繁换 IP 反而会把 Flow 的
 # 登录 token 打失效（见 SPARK server_common 的「换号不换 IP 阶梯」）。现在递增冷却
 # 后切到号池的下一个可用账号重试，IP 轮换完全交回 MIYA_ROTATE_THRESHOLD 配置的
 # 正常节奏（开浏览器前按请求数轮换）。换号实现见 utils.account_pool.switch_to_next_account。
+
+
+# ── 积分预算参数 ──
+# 每段视频消耗多少积分。号池不伪造单张扣费，这个数只用于「还够不够再跑一段」的
+# 事前判断，判错的代价只是多探一次余额或早换一次号，不写进任何账目。
+# 默认 15：2026-08-24 实测样本 —— 账号 59 分连续跑成 4 段 720p/8s 后第 5 段跑不动。
+# 控制台可用 server_config.json 的 videoCreditCostPerSegment 覆盖。
+_DEFAULT_CREDIT_COST_PER_SEGMENT = 15
+# 每提交几段实读一次余额。太密会拖慢批次（每次要点开头像菜单等异步数字），
+# 太疏就退化回"整批只看开头那个快照"的老问题。
+_CREDIT_RECHECK_EVERY_SUBMITS = 3
+
+
+def _credit_cost_per_segment() -> int:
+    try:
+        from ..utils.account_pool import AI_DIR
+        import json
+        cfg_file = AI_DIR / "server_config.json"
+        if cfg_file.exists():
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("videoCreditCostPerSegment"):
+                return max(1, int(data["videoCreditCostPerSegment"]))
+    except Exception:
+        pass
+    return _DEFAULT_CREDIT_COST_PER_SEGMENT
 
 
 # ── 批量流程参数 ──
@@ -712,6 +749,8 @@ class _ChunkRunner:
         # 本轮提交产生的 tile 映射（等待/早期封禁扫描用）
         self._prompts_map = {}
         self._tile_slices = {}
+        # 距上次"实读余额"过去了几次提交（见 _credit_checkpoint）
+        self._submits_since_credit_check = 0
 
     # ── 小工具 ──
 
@@ -768,11 +807,7 @@ class _ChunkRunner:
                 if self._run_round(remaining):
                     break
             except _CreditExhaustedError as e:
-                log(f"🧊 捕获到账号积分不足: {e}，立即换号重试剩余任务...", "GoogleFX-Video")
-                try:
-                    self._cooldown_and_switch_credit_exhausted(reason=str(e))
-                except Exception as switch_err:
-                    log(f"⛔ 积分耗尽换号终止: {switch_err}", "GoogleFX-Video")
+                if not self._handle_credit_exhausted(str(e)):
                     break
                 continue
             except _IPBlockedError:
@@ -802,6 +837,14 @@ class _ChunkRunner:
                 # 重建浏览器连接后即可继续。不计入 IP 重试，直接重跑一轮。
                 if "TargetClosedError" in type(e).__name__ or "Target page" in str(e):
                     log(f"⚠️ 浏览器页面意外关闭 (TargetClosedError)，重新连接后重试...", "GoogleFX-Video")
+                    continue
+                # 🧊 helpers 层（配置校验/提交前检查）不认识本模块私有的
+                # _CreditExhaustedError，只能用 INSUFFICIENT_CREDITS 前缀捎信号；
+                # 不在这里翻译回来的话，积分耗尽会走下面的 raise 变成"致命错误"，
+                # 整批直接死，既不换号也不给号池留标记。
+                if _looks_like_credit_exhaustion(e):
+                    if not self._handle_credit_exhausted(str(e)):
+                        break
                     continue
                 log(f"❌ 批量生成过程发生致命错误: {e}", "Error")
                 raise
@@ -1337,17 +1380,39 @@ class _ChunkRunner:
             self._prompts_map[_ad["tile_id"]] = _ad["req"].prompt
             self._tile_slices[_ad["tile_id"]] = self.chunk_slices.get(_ad["sub_idx"], '')
 
+        # 本轮真正点过 Generate 的任务数（认领的历史任务不算）。积分闸门要用它
+        # 判断"现在中断会不会把已经花掉积分、正在生成的片子一起扔了"。
+        inflight_this_round = 0
+
         # 当前已有的 tile_ids 作为基线，用于识别提交后新出现的 tile
         before_tile_ids = page.evaluate("""() => {
             return Array.from(document.querySelectorAll('div[data-tile-id]'))
                         .map(el => el.getAttribute('data-original-tile-id') || el.getAttribute('data-tile-id'));
         }""")
 
-        for sub_idx, req in remaining:
+        for position, (sub_idx, req) in enumerate(remaining):
             idx = self.chunk_start + sub_idx
             log(f"🎬 正在提交第 {idx + 1}/{self.total_reqs} 段视频任务: {req.prompt[:30]}...", "GoogleFX-Video")
             self._check_cancel()
             self._notify(idx, 'video_start', {'prompt': req.prompt})
+
+            # 🧊 批次中途重读余额。号池那边的积分是**选号那一刻**探的一个快照，
+            # 之后整批跑完都没人再看——2026-08-24 实测：14:21 探到 59 分，跑到
+            # 14:33 第 5 段时早已见底，而缓存里还写着 59，于是下一批继续派它出去。
+            # 号池不伪造单张扣费，所以唯一可靠的办法就是**隔几段真的再读一次**。
+            credit_stop = self._credit_checkpoint(
+                page, remaining_after=len(remaining) - position)
+            if credit_stop:
+                if inflight_this_round:
+                    # ⚠️ 本轮已经有片子在生成了——那些积分已经花出去了。此刻抛
+                    # _CreditExhaustedError 会跳过 _await_generation/_download_and_report，
+                    # 把它们连同刚花的积分一起扔掉。所以只停止**继续提交**，让本轮
+                    # 正常等完、收完；没提交的留在 remaining 里，下一轮开头的
+                    # checkpoint（那时没有在飞任务）再换号。
+                    log(f"🧊 {credit_stop}；本轮已有 {inflight_this_round} 段在生成，"
+                        f"先等它们收完再换号，剩余任务顺延到下一轮", "GoogleFX-Video")
+                    break
+                raise _CreditExhaustedError(credit_stop)
 
             self._ensure_video_config(page, req)
 
@@ -1409,7 +1474,7 @@ class _ChunkRunner:
             except (_IPBlockedError, _CreditExhaustedError, ConnectionError):
                 raise
             except Exception as submit_err:
-                page_credit_err = detect_page_credit_exhaustion(page)
+                page_credit_err = detect_page_credit_exhaustion(page, deep=True)
                 if page_credit_err or "INSUFFICIENT_CREDITS" in str(submit_err) or is_credit_exhausted_message(str(submit_err)):
                     raise _CreditExhaustedError(page_credit_err or f"Credit exhausted during submit: {submit_err}")
                 if "TargetClosedError" in type(submit_err).__name__ or "Target page" in str(submit_err):
@@ -1438,6 +1503,7 @@ class _ChunkRunner:
 
             tile_id = task_info["tile_id"]
             self.submitted_count += 1
+            inflight_this_round += 1
             self._notify(idx, 'request_submitted', {'tile_id': tile_id})
             submitted.append({
                 "sub_idx": sub_idx,
@@ -1634,6 +1700,91 @@ class _ChunkRunner:
                 "reason": "ip_blocked",
                 "retry": self.ip_retry,
             })
+
+    def _credit_checkpoint(self, page, remaining_after):
+        """每 _CREDIT_RECHECK_EVERY_SUBMITS 段实读一次余额。
+
+        返回值：余额已经跑不动下一段时返回原因字符串（调用方据此换号或停止继续
+        提交），其余情况返回 None。
+
+        够跑一段、但不够跑完剩下这些 → 只告警，不喊停：换号是有代价的（可能压根
+        没有下一个可用号，那时 run() 会 break，剩余任务全判失败），而"能跑一段是
+        一段"不会比现在更差，真跑干了自然会在下一个 checkpoint 或提交失败诊断里
+        被接住。
+
+        探测失败（读不到数字）一律当没发生：本模块的规矩是积分数字只信真实探测，
+        绝不凭猜把账号停用。
+        """
+        self._submits_since_credit_check += 1
+        if self._submits_since_credit_check < _CREDIT_RECHECK_EVERY_SUBMITS:
+            return None
+        self._submits_since_credit_check = 0
+
+        try:
+            from .google_fx_credit import (
+                read_page_credit_via_menu, min_usable_credit, _insufficient_credit_reason,
+            )
+            from ..utils.account_pool import AccountPool
+            from ..config import get_runtime_default_user_id
+        except Exception:
+            return None
+
+        try:
+            credit = read_page_credit_via_menu(page)
+        except Exception as e:
+            # 浏览器/标签页被人工关掉不是"探测失败"，要原样上抛交给 run() 的
+            # 会话恢复逻辑，不能在这里被下面那句 return 吞掉。
+            if type(e).__name__ == "BrowserSessionClosedError":
+                raise
+            log(f"⚠️ 批次中途积分复核跳过（探测异常 {type(e).__name__}）", "GoogleFX-Video")
+            return None
+
+        if credit is None:
+            log("⚠️ 批次中途积分复核未读到余额，按原计划继续", "GoogleFX-Video")
+            return None
+
+        # 实读成功：先把数字写回号池，缓存里那个选号时的快照早就旧了。
+        try:
+            current = (get_runtime_default_user_id() or "").strip()
+            if current:
+                AccountPool().record_measured_credit(current, credit)
+        except Exception as e:
+            log(f"⚠️ 回写实测积分失败（不影响生成）: {e}", "GoogleFX-Video")
+
+        threshold = min_usable_credit()
+        if credit < threshold:
+            # 已经低于「选号最低积分」——跑不动下一段了。返回原因，由调用方决定
+            # 是立刻换号还是先把在飞的任务收完。
+            return ("批次中途复核发现积分不足: "
+                    + _insufficient_credit_reason(
+                        credit, threshold, f"{credit} Google Flow credits"))
+
+        need = remaining_after * _credit_cost_per_segment()
+        if credit < need:
+            log(
+                f"⚠️ 积分预算告警：实读余额 {credit}，剩余 {remaining_after} 段约需 {need} "
+                f"（按每段 {_credit_cost_per_segment()} 分估）。会尽量跑到跑干为止，"
+                f"跑干后自动换号继续。",
+                "GoogleFX-Video",
+            )
+        else:
+            log(f"✅ 积分预算复核通过：实读余额 {credit}，剩余 {remaining_after} 段约需 {need}",
+                "GoogleFX-Video")
+        return None
+
+    def _handle_credit_exhausted(self, reason):
+        """积分耗尽的统一收口：标记号池冷却 + 换号。返回 True=可以继续重试剩余
+        任务，False=换不动号了，调用方应结束本 chunk。
+
+        run() 里有两条路会到这儿（原生 _CreditExhaustedError、helpers 层带
+        INSUFFICIENT_CREDITS 前缀的 RuntimeError），行为必须完全一致。"""
+        log(f"🧊 捕获到账号积分不足: {reason}，立即换号重试剩余任务...", "GoogleFX-Video")
+        try:
+            self._cooldown_and_switch_credit_exhausted(reason=reason)
+        except Exception as switch_err:
+            log(f"⛔ 积分耗尽换号终止: {switch_err}", "GoogleFX-Video")
+            return False
+        return True
 
     def _cooldown_and_switch_credit_exhausted(self, reason=None):
         """检测到积分不足/耗尽：标记当前账号 quota_exhausted，切换号池下一个可用账号。

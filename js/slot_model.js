@@ -123,10 +123,12 @@ const FRAME_BADGE_DEFS = [
         hover: f => ` (降档通道产出: ${f.degraded_reason || ''})`,
     },
     {
-        id: 'candidate-selection', text: '4选1', cls: 'candidate-selection-badge', isIssue: false,
+        id: 'candidate-selection',
+        text: f => (f && f.candidates && f.candidates.length > 4 ? `候选池(${f.candidates.length})` : '4选1'),
+        cls: 'candidate-selection-badge', isIssue: false,
         test: f => !!(f && f.candidates && f.candidates.length > 1),
-        tip: f => `4选1智能生成：AI已鉴别优选候选 #${f.chosen_candidate_index || 1}。点击卡片可查看4张候选对比并手动切换`,
-        hover: f => ` (4选1智能生成: 已优选候选 #${f.chosen_candidate_index || 1})`,
+        tip: f => `候选图池：共 ${f.candidates ? f.candidates.length : 0} 张候选，当前采用候选 #${f.chosen_candidate_index || 1}。点击卡片可查看所有候选对比并手动切换`,
+        hover: f => ` (候选图池: 共 ${f.candidates ? f.candidates.length : 0} 张，已优选候选 #${f.chosen_candidate_index || 1})`,
     },
 ];
 
@@ -177,7 +179,7 @@ function frameIsFixable(frame) {
 function collectBadges(defs, entry) {
     return defs.filter(d => d.test(entry)).map(d => ({
         id: d.id,
-        text: d.text,
+        text: typeof d.text === 'function' ? d.text(entry) : d.text,
         cls: d.cls,
         tip: d.tip(entry) || '',
         isIssue: d.isIssue !== false,
@@ -222,14 +224,18 @@ function frameActions(state, ctx) {
                 idle: '依据问题描述优化提示词后图生图重渲此帧',
             }));
         }
-        list.push(mk('describe-frame', state.flags.manualFlagged ? '改描述' : '描述问题', {
+        // 描述问题 / 改描述：查看/记录问题元数据（不触发重渲），生成中保持可用
+        list.push(slotAction('describe-frame', state.flags.manualFlagged ? '改描述' : '描述问题', {
             cls: 'describe-frame-btn',
             idle: '人工描述这一帧哪里不对，作为定向修复的依据',
+            busy: false,
         }));
         if (state.flags.hasCandidates) {
-            list.push(mk('view-candidates', '4选1', {
+            // 4选1：查看候选图对比与 AI 鉴别详情弹窗，属于只读/查看操作，生成中始终可用
+            list.push(slotAction('view-candidates', '4选1', {
                 cls: 'view-candidates-btn',
                 idle: '查看本帧的4张候选图与AI评审详情，可手动切换采用图',
+                busy: false,
             }));
         }
         if (state.flags.fixBackup) {

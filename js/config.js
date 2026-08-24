@@ -261,6 +261,28 @@ function loadConfig() {
         candidateConcurrencySelect.value = String(config.candidateConcurrency || DEFAULT_CONFIG.candidateConcurrency || 4);
     }
 
+    // 任务提醒设置
+    const soundNotifCb = document.getElementById('settings-sound-notification');
+    if (soundNotifCb) {
+        soundNotifCb.checked = config.soundNotificationEnabled !== false;
+    }
+    const notifVolInput = document.getElementById('settings-notification-volume');
+    const notifVolVal = document.getElementById('settings-notification-volume-val');
+    if (notifVolInput) {
+        const vol = typeof config.notificationVolume === 'number' ? config.notificationVolume : 80;
+        notifVolInput.value = vol;
+        if (notifVolVal) notifVolVal.textContent = `${vol}%`;
+    }
+    const taskbarFlashCb = document.getElementById('settings-taskbar-flash');
+    if (taskbarFlashCb) {
+        taskbarFlashCb.checked = config.taskbarFlashEnabled !== false;
+    }
+    const desktopNotifCb = document.getElementById('settings-desktop-notification');
+    if (desktopNotifCb) {
+        desktopNotifCb.checked = config.desktopNotificationEnabled !== false;
+    }
+    updateDesktopPermissionStatus();
+
     // 端口已永久固定（应用 8085 / 代理 8046，gpt-5.5 由服务端 resolve_gateway 固定路由），
     // 原「GPT 代理端口」选择器已移除，防止端口漂移。
     updateCoverModelDisplay();
@@ -350,6 +372,19 @@ function applySettingsFormToConfig() {
     if (candidateConcurrencySelect && candidateConcurrencySelect.value) {
         config.candidateConcurrency = parseInt(candidateConcurrencySelect.value, 10) || 4;
     }
+
+    // 任务提醒设置
+    const soundNotifCb = document.getElementById('settings-sound-notification');
+    if (soundNotifCb) config.soundNotificationEnabled = soundNotifCb.checked;
+
+    const notifVolInput = document.getElementById('settings-notification-volume');
+    if (notifVolInput) config.notificationVolume = parseInt(notifVolInput.value, 10) || 0;
+
+    const taskbarFlashCb = document.getElementById('settings-taskbar-flash');
+    if (taskbarFlashCb) config.taskbarFlashEnabled = taskbarFlashCb.checked;
+
+    const desktopNotifCb = document.getElementById('settings-desktop-notification');
+    if (desktopNotifCb) config.desktopNotificationEnabled = desktopNotifCb.checked;
 }
 
 function saveConfig() {
@@ -541,7 +576,168 @@ function initSettingsCenter() {
         });
     }
 
+    initNotificationSettingsEvents();
     switchSettingsSection(localStorage.getItem(SETTINGS_SECTION_KEY) || 'backend');
+}
+
+function updateDesktopPermissionStatus() {
+    const statusEl = document.getElementById('desktop-permission-status');
+    const reqBtn = document.getElementById('request-desktop-permission-btn');
+    if (!statusEl) return;
+    if (typeof window === 'undefined' || !('Notification' in window)) {
+        statusEl.textContent = '（当前浏览器不支持桌面通知）';
+        if (reqBtn) reqBtn.disabled = true;
+        return;
+    }
+    if (Notification.permission === 'granted') {
+        statusEl.textContent = '✓ 桌面通知已授权';
+        statusEl.style.color = 'var(--success-color, #10b981)';
+        if (reqBtn) {
+            reqBtn.textContent = '✓ 已授权';
+            reqBtn.disabled = true;
+        }
+    } else if (Notification.permission === 'denied') {
+        statusEl.textContent = '⚠️ 已被浏览器拦截（请在地址栏锁头图标中开启通知）';
+        statusEl.style.color = 'var(--error-color, #ef4444)';
+        if (reqBtn) {
+            reqBtn.textContent = '已被拦截';
+            reqBtn.disabled = true;
+        }
+    } else {
+        statusEl.textContent = '（尚未授权，点击左侧按钮开启）';
+        statusEl.style.color = 'var(--text-secondary, #94a3b8)';
+        if (reqBtn) {
+            reqBtn.textContent = '🔑 授权桌面通知权限';
+            reqBtn.disabled = false;
+        }
+    }
+}
+
+function initNotificationSettingsEvents() {
+    const volInput = document.getElementById('settings-notification-volume');
+    const volVal = document.getElementById('settings-notification-volume-val');
+    if (volInput && !volInput.dataset.bound) {
+        volInput.dataset.bound = '1';
+        volInput.addEventListener('input', () => {
+            const v = parseInt(volInput.value, 10) || 0;
+            if (volVal) volVal.textContent = `${v}%`;
+            config.notificationVolume = v;
+            autoSaveConfig();
+        });
+    }
+
+    const testSuccessBtn = document.getElementById('test-sound-success-btn');
+    if (testSuccessBtn && !testSuccessBtn.dataset.bound) {
+        testSuccessBtn.dataset.bound = '1';
+        testSuccessBtn.addEventListener('click', async () => {
+            if (typeof NotificationCenter !== 'undefined') {
+                const status = await NotificationCenter.playSuccessSound();
+                if (typeof showToast === 'function') {
+                    const v = typeof config.notificationVolume === 'number' ? config.notificationVolume : 80;
+                    // 试听没声音要说清原因：浏览器把 AudioContext 挂起、音量拉到 0、
+                    // 或者根本不支持 Web Audio，三种情况以前都表现成「点了没反应」。
+                    if (status === 'suspended') {
+                        showToast('⚠️ 浏览器暂时挂起了音频，请先在页面空白处点一下再试听', 'warning', 5000);
+                    } else if (status === 'muted') {
+                        showToast('⚠️ 当前提示音量为 0%（或声音提醒已关闭），听不到是正常的', 'warning', 5000);
+                    } else if (status === 'unsupported') {
+                        showToast('⚠️ 当前浏览器不支持 Web Audio，无法播放提示音', 'error', 5000);
+                    } else {
+                        showToast(`🔊 正在播放成功和弦提示音（当前音量: ${v}%）`, 'success', 2500);
+                    }
+                }
+            }
+        });
+    }
+
+    const testErrorBtn = document.getElementById('test-sound-error-btn');
+    if (testErrorBtn && !testErrorBtn.dataset.bound) {
+        testErrorBtn.dataset.bound = '1';
+        testErrorBtn.addEventListener('click', async () => {
+            if (typeof NotificationCenter !== 'undefined') {
+                const status = await NotificationCenter.playErrorSound();
+                if (typeof showToast === 'function') {
+                    const v = typeof config.notificationVolume === 'number' ? config.notificationVolume : 80;
+                    // 试听没声音要说清原因：浏览器把 AudioContext 挂起、音量拉到 0、
+                    // 或者根本不支持 Web Audio，三种情况以前都表现成「点了没反应」。
+                    if (status === 'suspended') {
+                        showToast('⚠️ 浏览器暂时挂起了音频，请先在页面空白处点一下再试听', 'warning', 5000);
+                    } else if (status === 'muted') {
+                        showToast('⚠️ 当前提示音量为 0%（或声音提醒已关闭），听不到是正常的', 'warning', 5000);
+                    } else if (status === 'unsupported') {
+                        showToast('⚠️ 当前浏览器不支持 Web Audio，无法播放提示音', 'error', 5000);
+                    } else {
+                        showToast(`🚨 正在播放失败警示双音（当前音量: ${v}%）`, 'error', 2500);
+                    }
+                }
+            }
+        });
+    }
+
+    const testActionBtn = document.getElementById('test-sound-action-btn');
+    if (testActionBtn && !testActionBtn.dataset.bound) {
+        testActionBtn.dataset.bound = '1';
+        testActionBtn.addEventListener('click', async () => {
+            if (typeof NotificationCenter !== 'undefined') {
+                const status = await NotificationCenter.playActionRequiredSound();
+                if (typeof showToast === 'function') {
+                    const v = typeof config.notificationVolume === 'number' ? config.notificationVolume : 80;
+                    // 试听没声音要说清原因：浏览器把 AudioContext 挂起、音量拉到 0、
+                    // 或者根本不支持 Web Audio，三种情况以前都表现成「点了没反应」。
+                    if (status === 'suspended') {
+                        showToast('⚠️ 浏览器暂时挂起了音频，请先在页面空白处点一下再试听', 'warning', 5000);
+                    } else if (status === 'muted') {
+                        showToast('⚠️ 当前提示音量为 0%（或声音提醒已关闭），听不到是正常的', 'warning', 5000);
+                    } else if (status === 'unsupported') {
+                        showToast('⚠️ 当前浏览器不支持 Web Audio，无法播放提示音', 'error', 5000);
+                    } else {
+                        showToast(`🔔 正在播放待审核门铃音（当前音量: ${v}%）`, 'info', 2500);
+                    }
+                }
+            }
+        });
+    }
+
+    const reqBtn = document.getElementById('request-desktop-permission-btn');
+    if (reqBtn && !reqBtn.dataset.bound) {
+        reqBtn.dataset.bound = '1';
+        reqBtn.addEventListener('click', async () => {
+            if (typeof NotificationCenter !== 'undefined') {
+                const res = await NotificationCenter.requestDesktopPermission();
+                updateDesktopPermissionStatus();
+                if (typeof showToast === 'function') {
+                    if (res === 'granted') {
+                        showToast('✓ 桌面系统通知权限已开启！', 'success', 3000);
+                    } else if (res === 'denied') {
+                        showToast('⚠️ 桌面通知权限被拦截，请在浏览器地址栏左侧锁头图标中允许通知。', 'warning', 6000);
+                    }
+                }
+            }
+        });
+    }
+
+    const testFullBtn = document.getElementById('test-full-notification-btn');
+    if (testFullBtn && !testFullBtn.dataset.bound) {
+        testFullBtn.dataset.bound = '1';
+        testFullBtn.addEventListener('click', async () => {
+            if (typeof NotificationCenter !== 'undefined') {
+                await NotificationCenter.testInstantNotification('success');
+                if (typeof showToast === 'function') {
+                    showToast('已触发立即测试提醒！若已切到其他软件，桌面卡片与任务栏闪烁已弹出。', 'info', 4000);
+                }
+            }
+        });
+    }
+
+    const testCountdownBtn = document.getElementById('test-countdown-notification-btn');
+    if (testCountdownBtn && !testCountdownBtn.dataset.bound) {
+        testCountdownBtn.dataset.bound = '1';
+        testCountdownBtn.addEventListener('click', () => {
+            if (typeof NotificationCenter !== 'undefined') {
+                NotificationCenter.startCountdownTest(3, 'success');
+            }
+        });
+    }
 }
 
 // 跨标签页同步：FX 控制台（console.html）在另一个标签页修改了 spark_config

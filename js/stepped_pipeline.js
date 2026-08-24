@@ -399,6 +399,8 @@ function destroySteppedPipeline() {
     }
 }
 
+let lastNotifiedStage = null;
+
 function updateSteppedUI(state) {
     if (!state) return;
     
@@ -411,5 +413,43 @@ function updateSteppedUI(state) {
     
     if (panelContent) {
         renderSteppedReviewPanel(panelContent, state);
+    }
+
+    // 强提醒：当阶段发生变更时按阶段触发多模态通知
+    if (state.stage && state.stage !== lastNotifiedStage) {
+        lastNotifiedStage = state.stage;
+        if (typeof NotificationCenter !== 'undefined') {
+            if (state.stage === 'review_anchor') {
+                NotificationCenter.notify({
+                    type: 'action_required',
+                    title: '分步审核：锚点帧已就绪',
+                    message: '基准锚点帧 Frame 1 已渲染完成，请在工作台确认是否通过'
+                });
+            } else if (state.stage === 'review_batch') {
+                NotificationCenter.notify({
+                    type: 'action_required',
+                    title: '分步审核：批次关键帧已就绪',
+                    message: `第 ${(state.current_batch_index != null ? state.current_batch_index + 1 : '')} 批关键帧已渲染完成，请审核多宫格拼图`
+                });
+            } else if (state.stage === 'final_review') {
+                NotificationCenter.notify({
+                    type: 'action_required',
+                    title: '分步审核：进入最终审查',
+                    message: '全套关键帧已生成完毕，请进行最终连贯性审查'
+                });
+            } else if (state.stage === 'completed') {
+                NotificationCenter.notify({
+                    type: 'success',
+                    title: '分步管线全流程完成',
+                    message: '所有的关键帧与视频序列已全部生成完毕！'
+                });
+            } else if (state.stage === 'failed') {
+                NotificationCenter.notify({
+                    type: 'error',
+                    title: '分步管线生成失败',
+                    message: state.error || '分步渲染过程中出现异常中断'
+                });
+            }
+        }
     }
 }

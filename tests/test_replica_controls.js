@@ -178,5 +178,35 @@ assert.equal(uploadBtn.disabled, false, '解除 busy 后动作按钮应恢复可
 assert.equal(topBtn.disabled, false, '解除 busy 后回到顶部按钮保持可用');
 assert.equal(permBtn.disabled, true, '解除 busy 后带 data-perm-disabled 的按钮依然保持禁用');
 
+// ── 「清理合成缓存」开关 ──────────────────────────────────────────────────
+//
+// 这个开关的失败方式和上面三个旋钮一模一样：勾了但没生效。它只在能合成的两个阶段
+// 出现（review_beats 与 audit_failed/compose_failed 的重新合成），且勾选态要能挺过
+// 一次吸底栏重建——那条栏每保存一次节拍就整段重建一回，状态存 DOM 里必被清掉。
+const barFor = (stage, extra) => {
+    call('replicaState = ' + JSON.stringify(Object.assign({
+        job_id: 'job_a', video_name: 'demo.mp4', stage,
+        beats: { beats: [{ id: 'B01' }], banned_elements: [] },
+        validation: [],
+    }, extra || {})));
+    return call('replicaRenderBottomBar(replicaState)');
+};
+
+assert.match(barFor('review_beats'), /id="replica-reset-cache"/,
+             '节拍卡点的吸底栏上必须有「清理合成缓存」开关');
+assert.match(barFor('audit_failed', { prompt_block: 'P' }), /id="replica-reset-cache"/,
+             '「重新合成」旁边同样要有这个开关——改完规则重跑走的正是这条路');
+assert.doesNotMatch(barFor('completed', { prompt_block: 'P', title: 'T' }),
+                    /id="replica-reset-cache"/,
+                    '已完成态没有合成动作，不该出现一个无处生效的开关');
+
+call('replicaResetCache = false;');
+assert.doesNotMatch(barFor('review_beats'), /id="replica-reset-cache" checked/,
+                    '默认不勾：断点续传省的是几分钟大模型钱');
+call('replicaResetCache = true;');
+assert.match(barFor('review_beats'), /id="replica-reset-cache" checked/,
+             '勾选态存在模块变量里，吸底栏重建后必须还原成勾上');
+call('replicaResetCache = false;');
+
 console.log('test_replica_controls.js: all assertions passed');
 

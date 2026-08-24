@@ -168,14 +168,35 @@ assert.deepStrictEqual(acts(s), [], '等待中的格子不该有任何操作按�
 s = frameSlotState({ sequence: 2, file: 'outputs/x/frames/img_002.webp' }, { seq: 2 });
 assert.strictEqual(s.kind, 'ready');
 
-// ── busy：只影响 disabled 与 title，绝不改变按钮的存在与否 ─────────────
-const idle = ready({ manual_issue: 'x' });
+// ── busy：影响写操作按钮的 disabled 与 title，只读/元数据操作（4选1、描述问题）在生成中保持可用 ─────────────
+const idle = ready({
+    manual_issue: 'x',
+    candidates: [{ index: 1, file: 'f1' }, { index: 2, file: 'f2' }],
+    chosen_candidate_index: 1,
+});
 const busy = frameSlotState(
-    { sequence: 3, url: '/o/img_003.webp', manual_issue: 'x' }, { seq: 3, busy: true });
+    {
+        sequence: 3,
+        url: '/o/img_003.webp',
+        manual_issue: 'x',
+        candidates: [{ index: 1, file: 'f1' }, { index: 2, file: 'f2' }],
+        chosen_candidate_index: 1,
+    },
+    { seq: 3, busy: true }
+);
 assert.deepStrictEqual(acts(busy), acts(idle), 'busy 不得增删按钮');
-assert.ok(busy.actions.every(a => a.disabled));
+// 生成/写操作在 busy 时禁用
+const mutatingActs = ['fix-frame', 'retry-frame', 'upload-frame', 'delete-slot', 'undo-fix'];
+busy.actions.filter(a => mutatingActs.includes(a.act)).forEach(a => {
+    assert.ok(a.disabled, `${a.act} 在 busy 态下必须 disabled`);
+    assert.ok(a.title.includes('请稍候'), `${a.act} 在 busy 态下必须带有稍候提示`);
+});
+// 只读/元数据操作在 busy 时保持可用
+const nonMutatingActs = ['view-candidates', 'describe-frame'];
+busy.actions.filter(a => nonMutatingActs.includes(a.act)).forEach(a => {
+    assert.ok(!a.disabled, `${a.act} 在 busy 态下必须保持可用`);
+});
 assert.ok(idle.actions.every(a => !a.disabled));
-assert.ok(busy.actions.every(a => a.title.includes('请稍候')));
 
 // 忙态下也要留着"不忙时该说什么"：网格解禁（setSlotGridButtonsBusy）不重新推导
 // 状态、只改 disabled 与 title，没有 idleTitle 就只能把提示一律置空——跑完一轮

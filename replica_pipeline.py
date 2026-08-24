@@ -1520,11 +1520,24 @@ def _revalidate(state, persist=True):
     return validation
 
 
-def run_compose(state, config, dimensions=None, on_progress=None):
+def run_compose(state, config, dimensions=None, on_progress=None, reset_cache=False):
     """beats → 提示词包。走既有合成器，一行合成逻辑都不重写。
 
     beat_outline 非空会让 compose_anchor_and_packet 切进「清单一比一还原」——拍数
     锁死为节拍数，不再走自适应密度公式。这正是复刻要的语义。
+
+    `reset_cache`：这一次不复用任何上次的合成产物，从 Phase 1 重头跑。
+
+    它要解决的是一个改规则的人一定会踩到的坑：合成缓存的键是 brief 指纹
+    （dimensions + 技能 profile + MILESTONE_POLICY_VERSION）。节拍没动而只改了提示词
+    规则/措辞时，指纹一个字都不变，于是「重新合成」照样命中旧断点，直接跳过整个
+    Phase 1——新规则一次也没执行过，用户看着进度条走完，拿到的还是旧规则那一份。
+    契约级改动可以靠换代 MILESTONE_POLICY_VERSION 逼它重排，但措辞级改动不该也不会
+    去动那个常量，只能给用户一个手动的开关。
+
+    清的是三处（少清一处都等于没清）：本 job 的 compose_state.json、
+    compose_checkpoints.json 里这条指纹的进度快照、packet_cache.json 里这条指纹名下
+    的全部 Drift Lock packet。
     """
     from prompt_pipeline import reverse
     from prompt_pipeline import compose_anchor_and_packet, compose_remaining_beats
@@ -1544,9 +1557,11 @@ def run_compose(state, config, dimensions=None, on_progress=None):
 
     # 快速通道：仅在任务此前停在 audit_failed 且已有提示词包经当前规则复核后已无任何禁用元素违规
     # （如修了分词误判，或用户删除了误判的禁用词）时生效，直接复核通过并落库，免去数分钟昂贵的大模型重复生成。
+    # 清缓存这一次不能走快速通道：它复用的正是上一轮的 prompt_block，而用户按这个
+    # 开关的意思就是「那一份是旧规则产的，别再拿给我」。
     current_prompt_block = state.get('prompt_block')
     banned = (beats or {}).get('banned_elements') or []
-    if current_prompt_block and state.get('stage') == 'audit_failed':
+    if not reset_cache and current_prompt_block and state.get('stage') == 'audit_failed':
         current_hits = reverse.banned_element_hits(current_prompt_block, banned)
         if not current_hits:
             if on_progress:
@@ -1560,6 +1575,24 @@ def run_compose(state, config, dimensions=None, on_progress=None):
     _save_state(state)
 
     dims = reverse.beats_to_dimensions(beats, dimensions)
+
+    # 清缓存。放在 dims 算好之后：指纹是从 dims 派生的，早一步算就只能算出一个错的。
+    # 三处一起清，且清完才允许往下走——留下任何一处，下面那段预填或 Step 4 的 packet
+    # 命中就会把旧产物重新带回这一轮。
+    if reset_cache:
+        from prompt_pipeline import (get_brief_fingerprint, clear_compose_caches,
+                                     active_skill_profile)
+        _invalidate_compose_artifacts(state)
+        cleared = clear_compose_caches(get_brief_fingerprint(dims, active_skill_profile(config)))
+        _save_state(state)
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'compose',
+                'message': (f'已清理合成缓存（断点存档 {cleared["checkpoint"]} 份、'
+                            f'空间锁定包 {cleared["packets"]} 份、本任务 Phase 1 产物），'
+                            f'本轮从头合成，不复用任何旧产物。'),
+            })
+
     if on_progress:
         on_progress('replica_stage', {
             'stage': 'compose',
@@ -1568,7 +1601,7 @@ def run_compose(state, config, dimensions=None, on_progress=None):
 
     # 若磁盘上已有本任务的 Phase 1 产物（packet / brief / ladder），预填进断点续传存档，
     # 避免重跑时重新解析 Brief 和规划工序（省时且省模型 token）。
-    cached_compose_state = load_compose_state(state.get('job_id'))
+    cached_compose_state = None if reset_cache else load_compose_state(state.get('job_id'))
     if cached_compose_state and cached_compose_state.get('packet') and cached_compose_state.get('beat_ladder'):
         try:
             from prompt_pipeline import get_brief_fingerprint, save_compose_checkpoint, active_skill_profile
@@ -2029,7 +2062,8 @@ def advance_replica_job(config, job_id, action='approve', payload=None,
                         on_progress=None):
     """推进人工卡点。
 
-    approve  → 合成提示词（1:1 复刻）
+    approve  → 合成提示词（1:1 复刻）。payload.reset_cache 为真时先清掉这份 brief 名下
+               的全部合成缓存，本轮从 Phase 1 重头跑（见 run_compose）。
     variant  → 派生二创变体（payload: {axes, brief}），返回新 job 的 state
     recluster→ 重跑 Pass B（Pass A 的帧事实走缓存，不重付视觉钱）
     translate→ 重做中文对照（纯文本调用，不碰英文原文，也不动 stage）
@@ -2047,7 +2081,8 @@ def advance_replica_job(config, job_id, action='approve', payload=None,
     try:
         if action == 'approve':
             return run_compose(state, config,
-                               dimensions=payload.get('dimensions'), on_progress=on_progress)
+                               dimensions=payload.get('dimensions'), on_progress=on_progress,
+                               reset_cache=bool(payload.get('reset_cache')))
         if action == 'variant':
             return run_mutate(state, config, {
                 'axes': payload.get('axes') or [],

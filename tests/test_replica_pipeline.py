@@ -418,6 +418,101 @@ class TestComposeGate(ReplicaTempRootCase):
             self.assertEqual(out['stage'], 'completed')
             self.assertEqual(out['banned_hits'], [])
 
+    def test_reset_cache_refuses_the_fast_path(self):
+        """勾了「清理合成缓存」还走极速通道，等于这个开关不存在。
+
+        极速通道复用的正是上一轮的 prompt_block，而按这个开关的意思就是「那一份是旧
+        规则产的」。这条是整个开关最容易被绕过的一处：条件里只要漏掉 reset_cache，
+        audit_failed 的任务永远走不到清缓存那一步，且不报任何错。
+        """
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': ['oven']}
+        state['prompt_block'] = 'VIDEO 1: a worker carries woven baskets into the room'
+        state['stage'] = 'audit_failed'
+        state['validation'] = []
+        rp._save_state(state)
+
+        with patch('prompt_pipeline.compose_anchor_and_packet',
+                   return_value={'title': 't'}) as mock_anchor, \
+             patch('prompt_pipeline.compose_remaining_beats',
+                   return_value='VIDEO 1: a lone worker trowels the wall'), \
+             patch('prompt_pipeline.clear_compose_caches',
+                   return_value={'checkpoint': 1, 'packets': 2}) as mock_clear, \
+             patch('server_common.write_library_item'):
+            rp.run_compose(state, {}, reset_cache=True)
+        mock_anchor.assert_called_once()
+        mock_clear.assert_called_once()
+
+    def test_reset_cache_clears_all_three_stores_and_skips_the_prefill(self):
+        """三处缓存少清一处都等于没清：留下的那一处会把旧 Phase 1 产物带回这一轮。"""
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': []}
+        state['validation'] = []
+        rp._save_state(state)
+        # 磁盘上留一份 Phase 1 产物：不清的话它会被预填进断点存档。
+        compose_path = rp._compose_state_path(state['job_id'])
+        os.makedirs(os.path.dirname(compose_path), exist_ok=True)
+        with open(compose_path, 'w', encoding='utf-8') as f:
+            json.dump({'packet': {'x': 1}, 'beat_ladder': [{'operation': 'repair'}],
+                       'title': 'old title'}, f)
+
+        # 合成成功后 run_compose 会重新写一份自己的 compose_state.json，所以事后查文件
+        # 在不在没有意义——要查的是「Phase 1 开跑的那一刻，旧的那一份已经不在了」。
+        seen = {}
+
+        def _phase1(*_a, **_kw):
+            seen['stale_artifact_present'] = os.path.exists(compose_path)
+            return {'title': 't'}
+
+        with patch('prompt_pipeline.compose_anchor_and_packet', side_effect=_phase1), \
+             patch('prompt_pipeline.compose_remaining_beats', return_value='IMAGE 1: a hut'), \
+             patch('prompt_pipeline.clear_compose_caches',
+                   return_value={'checkpoint': 1, 'packets': 3}) as mock_clear, \
+             patch('prompt_pipeline.save_compose_checkpoint') as mock_prefill, \
+             patch('server_common.write_library_item'):
+            rp.run_compose(state, {}, reset_cache=True)
+        mock_clear.assert_called_once()
+        # 指纹必须是从本次 dims 算出来的非空串，不是 None——传错等于清了个不存在的键。
+        self.assertTrue(mock_clear.call_args.args[0])
+        mock_prefill.assert_not_called()
+        self.assertIs(seen['stale_artifact_present'], False)
+
+    def test_compose_without_the_flag_still_reuses_the_cache(self):
+        """默认不清：断点续传省的是几分钟大模型钱，不该被这次改动顺手关掉。"""
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': []}
+        state['validation'] = []
+        rp._save_state(state)
+        compose_path = rp._compose_state_path(state['job_id'])
+        os.makedirs(os.path.dirname(compose_path), exist_ok=True)
+        with open(compose_path, 'w', encoding='utf-8') as f:
+            json.dump({'packet': {'x': 1}, 'beat_ladder': [{'operation': 'repair'}],
+                       'title': 'old title'}, f)
+
+        with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'title': 't'}), \
+             patch('prompt_pipeline.compose_remaining_beats', return_value='IMAGE 1: a hut'), \
+             patch('prompt_pipeline.clear_compose_caches') as mock_clear, \
+             patch('prompt_pipeline.save_compose_checkpoint') as mock_prefill, \
+             patch('server_common.write_library_item'):
+            rp.run_compose(state, {})
+        mock_clear.assert_not_called()
+        mock_prefill.assert_called_once()
+
+    def test_advance_forwards_the_reset_cache_flag(self):
+        """开关是从 payload 一路传进来的。断在 advance 这一层，前端勾了也白勾。"""
+        state = self._ingest()
+        state['beats'] = {'beats': [{'id': 'B01'}], 'banned_elements': []}
+        state['validation'] = []
+        rp._save_state(state)
+        with patch.object(rp, 'run_compose') as mock_compose:
+            rp.advance_replica_job({}, state['job_id'], action='approve',
+                                   payload={'reset_cache': True})
+        self.assertIs(mock_compose.call_args.kwargs['reset_cache'], True)
+
+        with patch.object(rp, 'run_compose') as mock_compose:
+            rp.advance_replica_job({}, state['job_id'], action='approve', payload={})
+        self.assertIs(mock_compose.call_args.kwargs['reset_cache'], False)
+
     def test_get_replica_status_auto_heals_audit_failed_when_clean(self):
         """读取任务状态时，若已无违规，自动自愈 audit_failed 状态为 completed 并落库。"""
         state = self._ingest()

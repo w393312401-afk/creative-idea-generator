@@ -1702,7 +1702,9 @@ def _submit_video_to_canvas(page, req, before_tile_ids, expect_slice=None):
 
     new_tile_id = _wait_for_new_tile_id(page, before_tile_ids, timeout=20, expect_slice=expect_slice)
     if not new_tile_id:
-        page_credit_err = detect_page_credit_exhaustion(page)
+        # deep=True：这一条正是 2026-08-24 漏判的现场——积分跑干时 Flow 点了
+        # Generate 不给 tile，页面上却不一定有任何耗尽文案，非得去头像菜单实读。
+        page_credit_err = detect_page_credit_exhaustion(page, deep=True)
         if page_credit_err:
             raise RuntimeError(f"INSUFFICIENT_CREDITS: {page_credit_err}")
         raise RuntimeError("Generate 后未检测到新 tile")
@@ -2858,6 +2860,14 @@ def _verify_and_fix_fx_config(page, model, ratio, want_video, context_label, mod
         # （实测 4 次整批重试，每次都是等满 10 秒后原样报错），改走带自愈动作的恢复流程。
         cfg_btn, status_text = _recover_missing_fx_config_button(page, context_label)
     if not cfg_btn:
+        # 同上：底部工具栏被积分弹窗整块盖住时，自愈流程（退智能体/清弹窗/重进
+        # 项目/刷新）一样救不回来，报"找不到配置按钮"同样是在描述现象而非原因。
+        credit_err = detect_page_credit_exhaustion(page, deep=True)
+        if credit_err:
+            raise RuntimeError(
+                f"INSUFFICIENT_CREDITS: {credit_err}"
+                f"（{context_label}底部配置按钮被积分提示挡住）"
+            )
         raise RuntimeError(
             f"{context_label}未找到底部配置按钮，无法确认配置，已停止生成"
             f"（已尝试退出智能体模式 / 清弹窗 / 重进项目页 / 刷新页面均无效；"
@@ -2887,6 +2897,27 @@ def _verify_and_fix_fx_config(page, model, ratio, want_video, context_label, mod
             fixed_keys.discard("model")
     unconfirmed = [key for key in initially_failed if key not in fixed_keys]
     if unconfirmed:
+        # 🧊 报"配置没切成"之前先问一句积分。2026-08-24 实测复盘：账号积分耗尽时
+        # Flow 会弹一个「积分已用完 / 刷新时间」对话框盖住配置面板，面板里的 tab
+        # 点不到，这里就抛「面板未确认项: video_submode」——一条既不指向真因、
+        # 又不含任何积分关键词的文案。上层 video_generator 靠
+        # is_credit_exhausted_message() 认积分失败，认不出来就不会 mark_exhausted()，
+        # 于是号池继续把这个空号派出去，每批都以同样的假错误挂掉。
+        # 全 repo 的积分探测原本只挂在"提交之后"（Generate 无新 tile / 轮询卡片），
+        # 配置阶段一处都没有——这里是补上的那一处。
+        # 深探要点开顶栏头像菜单，而这会儿配置面板还开着（fix_fx_config 打开的），
+        # 会挡住头像。先按 Escape 收掉——反正接下来无论如何都要抛异常了。
+        try:
+            page.keyboard.press("Escape")
+            random_sleep(0.3, 0.6)
+        except Exception:
+            pass
+        credit_err = detect_page_credit_exhaustion(page, deep=True)
+        if credit_err:
+            raise RuntimeError(
+                f"INSUFFICIENT_CREDITS: {credit_err}"
+                f"（{context_label}配置面板被积分提示挡住，未确认项: {', '.join(unconfirmed)}）"
+            )
         raise RuntimeError(
             f"{context_label}配置未完成，停止生成。当前状态: {status_text or '<空>'}；"
             f"面板未确认项: {', '.join(unconfirmed)}"
@@ -3163,6 +3194,10 @@ _OVERLAY_DISMISS_TEXTS = (
     "got it", "dismiss", "no thanks", "not now", "maybe later", "close", "ok", "okay",
     "continue", "accept", "i agree", "知道了", "我知道了", "好的", "关闭", "确定",
     "以后再说", "暂不", "同意", "继续",
+    # 2026-08-24 补：积分耗尽/刷新提示弹窗用的是这几种收尾按钮，原清单一个都不认，
+    # 于是弹窗一直盖在配置面板上，下游报成"面板未确认项: video_submode"。
+    "back", "return", "cancel", "done", "finish", "later", "skip", "no, thanks",
+    "返回", "取消", "完成", "跳过", "稍后", "下次再说",
 )
 # 出现这些内容的对话框是 FX 自己的配置/功能面板，不是意外弹窗，绝不能点掉
 _OVERLAY_KEEP_TOKENS = ("16:9", "9:16", "veo", "nano banana", "imagen", "outputs per prompt")
@@ -3211,8 +3246,36 @@ def _dismiss_unexpected_overlays(page, log_tag="GoogleFX"):
                     break
             if clicked:
                 dismissed = True
+                continue
+
+            # 认不出关闭按钮时的兜底：先按 Escape，再看弹窗是不是真的没了。
+            # 原来这里只打一条日志就放着不管，弹窗继续盖住底部工具栏/配置面板，
+            # 下游只能报"点不到元素"——2026-08-24 那次积分耗尽就是这么被伪装成
+            # "面板未确认项: video_submode" 的。
+            # Escape 对 Radix/cdk 这类 modal 是标准关闭手势，且上面的
+            # _OVERLAY_KEEP_TOKENS 已经把 FX 自己的配置面板挡在外面了，安全。
+            escaped = False
+            try:
+                page.keyboard.press("Escape")
+                random_sleep(0.4, 0.7)
+                escaped = not dialog.is_visible()
+            except Exception:
+                escaped = False
+
+            if escaped:
+                dismissed = True
+                log(f"🧹 清理未知弹窗: Escape 生效 (弹窗首行: {body.splitlines()[0][:60] if body else ''})", log_tag)
             elif body:
-                log(f"⚠️ 检测到未知弹窗但找不到明确的关闭按钮，未处理: {body.splitlines()[0][:80]}", log_tag)
+                first_line = body.splitlines()[0][:80]
+                log(f"⚠️ 检测到未知弹窗但找不到明确的关闭按钮，未处理: {first_line}", log_tag)
+                # 关不掉的弹窗，至少把全文留档：积分类提示的关键信息常常不在首行
+                # （典型是首行只有一个刷新时间），只打首行等于把线索丢了。
+                try:
+                    from .google_fx_credit import is_credit_hint_message
+                    if is_credit_exhausted_message(body) or is_credit_hint_message(body):
+                        log(f"  💡 该弹窗疑似与积分有关，全文: {body[:400]!r}", log_tag)
+                except Exception:
+                    pass
     except Exception as e:
         log(f"⚠️ 清理未知弹窗时异常: {type(e).__name__}: {e}", log_tag)
     return dismissed

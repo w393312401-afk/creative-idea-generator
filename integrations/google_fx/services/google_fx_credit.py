@@ -191,6 +191,47 @@ CREDIT_EXHAUSTED_KEYWORDS = [
     "没有点数",
     "缺少积分",
     "缺少点数",
+    # 机器可读的错误码/标记形态（下划线连写，不会被上面的空格短语命中）。
+    # video_generator 用本函数认「这次失败要不要 mark_exhausted」，而链路里
+    # 传的常常是 "INSUFFICIENT_CREDITS: ..." 这种前缀形态。
+    "insufficient_credits",
+    "insufficient_credit",
+    "out_of_credits",
+    "credits_exhausted",
+    "credit_exhausted",
+    "quota_exceeded",
+]
+
+# ⚠️ 弱信号，**不能**单独当"积分耗尽"的判据。
+# 2026-08-24 实测：账号跑干时 Flow 弹的对话框主体是一个刷新时间（日志里只留下
+# 首行 "Aug 24, 02:31 AM"），措辞里根本没有 out of credits 那类硬短语；但同样
+# 措辞也可能出现在套餐介绍里（"你的 1,000 月度积分将于每月 1 日刷新"）。把它
+# 塞进 CREDIT_EXHAUSTED_KEYWORDS 会让好账号被误停 24 小时，代价太大。
+# 正确用法：命中它只说明"这个弹窗可能跟积分有关"，据此升级到
+# detect_page_credit_exhaustion(deep=True) 去头像菜单读**真实余额**再下结论。
+CREDIT_REFRESH_HINT_KEYWORDS = [
+    "credits refresh",
+    "credits will refresh",
+    "credits reset",
+    "credits will reset",
+    "credits renew",
+    "credits will renew",
+    "credit refreshes",
+    "credits refresh on",
+    "credits refresh at",
+    "more credits on",
+    "积分将于",
+    "积分将在",
+    "积分刷新",
+    "积分将刷新",
+    "积分重置",
+    "积分恢复",
+    "点数刷新",
+    "点数重置",
+    "额度刷新",
+    "额度重置",
+    "配额刷新",
+    "配额重置",
 ]
 
 _ZERO_CREDIT_REGEXES = [
@@ -315,6 +356,19 @@ def is_credit_exhausted_message(message: str) -> bool:
     return any(pattern.search(text) is not None for pattern in _ZERO_CREDIT_REGEXES)
 
 
+def is_credit_hint_message(message: str) -> bool:
+    """弱信号命中：这段文案"可能"跟积分有关（典型是积分刷新时间提示）。
+
+    绝不能拿它直接判耗尽——见 CREDIT_REFRESH_HINT_KEYWORDS 上方说明。它唯一的
+    用途是把 detect_page_credit_exhaustion() 从"页面关键词匹配"升级到"点开头像
+    菜单读真实余额"。
+    """
+    text = (message or "").lower()
+    if not text:
+        return False
+    return any(keyword.lower() in text for keyword in CREDIT_REFRESH_HINT_KEYWORDS)
+
+
 def _insufficient_credit_reason(credit_num: int, threshold: int, raw_text: str) -> str:
     if credit_num == 0:
         return f"账号积分余额为 0 (当前读数: {raw_text}) [credit=0]"
@@ -322,12 +376,26 @@ def _insufficient_credit_reason(credit_num: int, threshold: int, raw_text: str) 
             f" (当前读数: {raw_text}) [credit={credit_num}]")
 
 
-def detect_page_credit_exhaustion(page) -> Optional[str]:
+def detect_page_credit_exhaustion(page, deep: bool = False) -> Optional[str]:
     """主动扫描当前 Flow 页面是否存在积分/配额耗尽的弹窗、提示、Toast 或余额为 0 的状态。
     若检测到，返回对应的错误描述字符串；否则返回 None。
+
+    deep=True 时，快路径没结论就再点开顶栏头像菜单读一次**真实余额**（见
+    _deep_probe_credit_via_menu）。
+
+    ⚠️ 快路径为什么会瞎：credit_display 那两个选择器（a[href*='credits']）只存在
+    于头像菜单弹层里，生成过程中菜单是关着的，第 2 段循环里 is_visible() 永远
+    False，整段空转。也就是说在项目页上，本函数实际只剩"弹窗/Toast 关键词匹配"
+    一条路——2026-08-24 实测：账号在第 5 段任务上跑干，Generate 点了不出 tile，
+    这里被调用却返回 None，于是抛的是"Generate 后未检测到新 tile"，号池那边一直
+    以为该号还有 59 分，下一批继续派它出去。deep 就是补这个洞的。
+
+    deep 有代价（要点开菜单、等异步数字、按 Escape 复原，秒级），所以只在失败
+    诊断路径上开，正常轮询仍走快路径。
     """
     if not page:
         return None
+    saw_credit_hint = False
     try:
         # 1. 检查可见的错误对话框 / 弹层 / 告警条 / Toast / 积分链接与按钮
         # balance=true 的那几个是"余额本体"选择器，读到的整行数字可以当真实余额拿去
@@ -383,6 +451,10 @@ def detect_page_credit_exhaustion(page) -> Optional[str]:
             if is_credit_exhausted_message(text):
                 first_line = text.splitlines()[0][:100].strip()
                 return f"页面提示积分耗尽: {first_line}"
+            if is_credit_hint_message(text):
+                # 弱信号：措辞像积分刷新提示，但也可能是套餐宣传。不下结论，
+                # 只记一笔，交给下面的深探去读真实余额。
+                saw_credit_hint = True
             if is_balance:
                 credit_num = _extract_credit_number(text)
                 if credit_num is not None and credit_num < threshold:
@@ -410,6 +482,55 @@ def detect_page_credit_exhaustion(page) -> Optional[str]:
     except Exception as e:
         log(f"⚠️ 页面积分状态探测异常: {type(e).__name__}: {e}", "GoogleFX")
 
+    # ── 深探：快路径在项目页上基本读不到余额，失败诊断时改点开头像菜单实读 ──
+    if deep or saw_credit_hint:
+        if saw_credit_hint and not deep:
+            log("💡 页面出现疑似积分刷新提示，升级为头像菜单实读余额", "GoogleFX")
+        return _deep_probe_credit_via_menu(page)
+
+    return None
+
+
+def read_page_credit_via_menu(page, budget_seconds: float = 12.0) -> Optional[int]:
+    """在**已经打开的** Flow 页面上点开头像菜单读一次真实余额，返回数字或 None。
+
+    与 probe_flow_credit() 的区别：那个是完整探针（自己连 AdsPower、抢浏览器槽位、
+    开页面），用于号池刷新；这个只借用调用方手里现成的 page，几秒就回来，供生成
+    过程中的复核/失败诊断用——生成中途去抢浏览器槽位会死锁（那个槽位正被自己占着）。
+    """
+    if not page:
+        return None
+    try:
+        return _read_credit_from_account_menu(page, overall_timeout_seconds=budget_seconds)
+    except BrowserSessionClosedError:
+        raise
+    except Exception as e:
+        log(f"⚠️ 头像菜单实读积分失败: {type(e).__name__}: {e}", "GoogleFX")
+        return None
+
+
+def _deep_probe_credit_via_menu(page, budget_seconds: float = 12.0) -> Optional[str]:
+    """点开顶栏头像菜单读真实余额，低于「选号最低积分」就返回耗尽描述。
+
+    复用探针那套读数逻辑（_read_credit_from_account_menu：整轮重试点击+读取、
+    等异步数字稳定两拍、读完按 Escape 复原页面），不另起一套，也绝不退化成
+    扫全页文字——本模块顶部那条硬性要求（页面上到处是套餐宣传数字）同样适用。
+
+    读不到就返回 None，让调用方保持原来的错误语义：宁可报一个含糊的失败，
+    也不能凭猜把好账号停用 24 小时。budget 比探针的 30s 短很多——这里跑在失败
+    诊断路径上，调用方还等着抛异常。
+    """
+    credit = read_page_credit_via_menu(page, budget_seconds=budget_seconds)
+    if credit is None:
+        log("⚠️ 头像菜单实读积分未成功，无法确认是否积分耗尽", "GoogleFX")
+        return None
+
+    threshold = min_usable_credit()
+    if credit < threshold:
+        log(f"🧊 头像菜单实读余额 {credit} < 选号最低积分 {threshold}，判定积分不足", "GoogleFX")
+        return _insufficient_credit_reason(credit, threshold, f"{credit} Google Flow credits")
+
+    log(f"✅ 头像菜单实读余额 {credit} ≥ 选号最低积分 {threshold}，本次失败与积分无关", "GoogleFX")
     return None
 
 

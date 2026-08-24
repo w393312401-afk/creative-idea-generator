@@ -2800,6 +2800,157 @@ def _win_force_foreground(hwnd):
             user32.AttachThreadInput(cur_tid, t, False)
 
 
+# 页面所在的浏览器窗口句柄。靠标题匹配找窗口有个致命盲区：浏览器窗口标题跟的是
+# **当前活动标签页**，用户一切到别的标签页，窗口就再也不叫「SPARK…」了——而那
+# 恰恰是最需要提醒的时候。所以页面获得焦点时先把当时的前台窗口记下来（那时前台
+# 窗口必然就是承载本页面的浏览器窗口），之后按句柄闪，标题变不变都不影响。
+_FLASH_TARGET_HWND = None
+_FLASH_TARGET_TITLE = ''
+
+
+def _win_window_title(hwnd):
+    import ctypes
+    buf = ctypes.create_unicode_buffer(512)
+    ctypes.windll.user32.GetWindowTextW(hwnd, buf, 512)
+    return (buf.value or '').strip()
+
+
+def win_register_flash_target(hwnd=None):
+    """把「页面所在的浏览器窗口」记下来，供之后的任务栏闪烁定位。
+
+    不传 hwnd 就取当前前台窗口——这个函数只在页面刚拿到焦点时被调用，那一刻
+    前台窗口就是承载页面的浏览器窗口。返回记下来的窗口标题（记不到就是空串）。
+    """
+    global _FLASH_TARGET_HWND, _FLASH_TARGET_TITLE
+    if os.name != 'nt':
+        return ''
+    try:
+        import ctypes
+        if hwnd is None:
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+        if not hwnd:
+            return ''
+        _FLASH_TARGET_HWND = hwnd
+        _FLASH_TARGET_TITLE = _win_window_title(hwnd)
+        return _FLASH_TARGET_TITLE
+    except Exception:
+        return ''
+
+
+def _win_flash_target_alive():
+    """记下来的窗口还在不在（被关掉了就别再往它身上闪）。"""
+    if not _FLASH_TARGET_HWND:
+        return False
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        return bool(u.IsWindow(_FLASH_TARGET_HWND) and u.IsWindowVisible(_FLASH_TARGET_HWND))
+    except Exception:
+        return False
+
+
+def win_flash_taskbar(title_hint=None, stop=False, detail=False):
+    """在 Windows 上闪烁任务栏图标（或者停止闪烁）。
+
+    使用 Win32 FlashWindowEx API。
+    dwFlags:
+      FLASHW_STOP = 0
+      FLASHW_ALL = 3 (标题栏 + 任务栏)
+      FLASHW_TIMERNOFG = 12 (持续闪烁任务栏直到窗口进入前台)
+
+    detail=True 时返回 dict（命中了几个窗口、目标是不是已经在前台、没闪的原因），
+    前端拿它给用户解释「点了没反应」到底是哪一步没走通；默认仍返回 bool，
+    老调用方不用改。
+    """
+    # supported=False 表示「这个平台压根没有任务栏闪烁」，不是「闪失败了」——
+    # mac / Linux 上前端据此把这一路标成"不适用"，而不是弹一条警告吓人。
+    info = {'flashed': False, 'matched': 0, 'foreground': False, 'reason': '',
+            'supported': os.name == 'nt'}
+
+    def _ret():
+        return info if detail else info['flashed']
+
+    if os.name != 'nt':
+        info['reason'] = '当前服务端不是 Windows：任务栏闪烁是 Win32 专有能力，'                          'mac / Linux 上由桌面通知与提示音承担强提醒'
+        return _ret()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [
+                ('cbSize', wintypes.UINT),
+                ('hwnd', wintypes.HWND),
+                ('dwFlags', wintypes.DWORD),
+                ('uCount', wintypes.UINT),
+                ('dwTimeout', wintypes.DWORD),
+            ]
+
+        user32 = ctypes.windll.user32
+        ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        targets = []
+        hints = [h.strip().lower() for h in ([title_hint] if title_hint else ['creative', 'idea generator', '提示词', 'chrome', 'edge', 'msedge', 'firefox']) if h and h.strip()]
+
+        def _cb(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            title = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(hwnd, title, 512)
+            val = (title.value or '').strip().lower()
+            if not val:
+                return True
+            if any(h in val for h in hints):
+                targets.append(hwnd)
+            return True
+
+        user32.EnumWindows(ENUMPROC(_cb), 0)
+
+        fg = user32.GetForegroundWindow()
+        if targets:
+            # 标题还认得出来，顺手把句柄刷新一遍，之后切标签页也丢不了
+            win_register_flash_target(targets[0])
+        else:
+            # 标题对不上（浏览器切到了别的标签页 / 页面标题改过），就用页面拿到
+            # 焦点时登记下来的那个窗口句柄。这一步才是「人在别的软件里也能看到
+            # 任务栏闪」的关键——退回前台窗口是没用的：Windows 对前台窗口的
+            # FlashWindowEx 根本不产生可见效果，等于白闪。
+            if _win_flash_target_alive():
+                targets.append(_FLASH_TARGET_HWND)
+                info['reason'] = '窗口标题已随标签页变化，按登记的浏览器窗口句柄闪烁'
+            elif fg:
+                targets.append(fg)
+                info['reason'] = '没有窗口标题命中 hint，也没有登记过窗口，已退回当前前台窗口'
+
+        info['matched'] = len(targets)
+        if not targets:
+            info['reason'] = '没有找到可闪烁的窗口'
+            return _ret()
+
+        # Windows 规定：窗口已经在前台时 FlashWindowEx 不产生任何可见效果。
+        # 「立即测试」正是这种情况——照样发请求，但如实告诉前端别当成故障。
+        info['foreground'] = bool(fg) and fg in targets
+
+        dwFlags = 0 if stop else (3 | 12)  # FLASHW_ALL | FLASHW_TIMERNOFG
+        uCount = 0
+
+        for hwnd in targets[:5]:
+            flash = FLASHWINFO()
+            flash.cbSize = ctypes.sizeof(FLASHWINFO)
+            flash.hwnd = hwnd
+            flash.dwFlags = dwFlags
+            flash.uCount = uCount
+            flash.dwTimeout = 0
+            user32.FlashWindowEx(ctypes.byref(flash))
+        info['flashed'] = True
+        return _ret()
+    except Exception as e:
+        if sys.stdout:
+            print(f"[win_flash_taskbar] Notice: {e}")
+        info['reason'] = str(e)
+        return _ret()
+
+
 def _win_explorer_title_matches(title, folder):
     """资源管理器窗口标题是不是指向 folder 这个目录。
 

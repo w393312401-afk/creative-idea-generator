@@ -4907,6 +4907,32 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/notify/flash_taskbar':
+            # 在 Windows 任务栏闪烁/取消闪烁浏览器窗口
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body() if self._body_bytes else {}
+                title_hint = body.get('title_hint') if isinstance(body, dict) else None
+                stop = bool(body.get('stop', False)) if isinstance(body, dict) else False
+                register = bool(body.get('register', False)) if isinstance(body, dict) else False
+                if register:
+                    # 页面刚拿到焦点：把承载它的浏览器窗口句柄记下来，之后用户切标签页
+                    # 导致窗口标题变了也照样闪得到（标题匹配在那种情况下必然落空）。
+                    win_title = server_common.win_register_flash_target()
+                    self._send_json({'status': 'ok', 'registered': bool(win_title), 'window_title': win_title})
+                    return
+                info = win_flash_taskbar(title_hint=title_hint, stop=stop, detail=True)
+                # 把命中窗口数/是否已在前台/没闪的原因一并回给前端：
+                # 「点了没反应」得能当场说清是哪一步没走通。
+                self._send_json({'status': 'ok', 'flashed': bool(info.get('flashed')),
+                                 'matched': info.get('matched', 0),
+                                 'foreground': bool(info.get('foreground')),
+                                 'supported': bool(info.get('supported', True)),
+                                 'reason': info.get('reason', '')})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/image/task/cancel':
             if not self._gate():
                 return
@@ -4935,7 +4961,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 to_delete = []
                 with ACTIVE_TASKS_LOCK:
                     for tid, t in ACTIVE_TASKS.items():
-                        if status_group == "completed" and t.get("status") == "completed":
+                        if status_group == "all":
+                            to_delete.append(tid)
+                        elif status_group == "completed" and t.get("status") == "completed":
                             to_delete.append(tid)
                         elif status_group == "failed_cancelled" and t.get("status") in ("failed", "cancelled"):
                             to_delete.append(tid)
@@ -4950,8 +4978,41 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     delete_task_files(tid)
 
                 deleted_library_ids = []
+                # 清空全部：同步清空点子库所有条目并彻底删除 outputs/ 目录下的所有本地媒体文件
+                if status_group == "all":
+                    for item in library_items:
+                        if isinstance(item, dict):
+                            item_id = item.get('id')
+                            if item_id not in (None, ''):
+                                title = item.get('project_key') or item.get('title')
+                                covers = item.get('covers') or []
+                                if title:
+                                    try:
+                                        delete_idea_output_files(title, covers)
+                                    except Exception as e:
+                                        if sys.stdout:
+                                            print(f"[CLEAR] 清理点子产物失败: {e}")
+                                removed = delete_library_item(item_id)
+                                if removed:
+                                    deleted_library_ids.append(item_id)
+                    # 彻底清理 outputs/ 目录下的所有残留项目文件夹与媒体文件
+                    try:
+                        outputs_dir = os.path.abspath(server_common.OUTPUT_ROOT if os.path.isabs(server_common.OUTPUT_ROOT) else os.path.join(base_dir, server_common.OUTPUT_ROOT))
+                        if os.path.isdir(outputs_dir):
+                            for entry in os.listdir(outputs_dir):
+                                ep = os.path.join(outputs_dir, entry)
+                                if os.path.isdir(ep):
+                                    shutil.rmtree(ep, ignore_errors=True)
+                                elif os.path.isfile(ep) and entry != '.gitkeep':
+                                    try:
+                                        os.remove(ep)
+                                    except Exception:
+                                        pass
+                    except Exception as e:
+                        if sys.stdout:
+                            print(f"[CLEAR] outputs 目录扫尾清理失败: {e}")
                 # 清空无封面：同步清空点子库中所有已收藏但无封面的条目
-                if status_group == "no_cover":
+                elif status_group == "no_cover":
                     for item in library_items:
                         if isinstance(item, dict) and not library_item_has_cover(item, base_dir=base_dir):
                             item_id = item.get('id')
@@ -8088,6 +8149,70 @@ def _sync_project_manifest_with_disk_locked(project_dir):
         frame.setdefault("image_size", manifest.get('image_size') or "2K")
         frame.setdefault("retry_count", 0)
         frame.setdefault("quality_gate", "pending_manual_review")
+
+        # 候选池同步与补齐（含 gpt-image-2 及所有历史生成帧）
+        cand_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
+        if not frame.get('candidates') or len(frame.get('candidates', [])) == 0:
+            loaded_cands = []
+            meta_file = os.path.join(cand_dir, 'candidates_meta.json')
+            if os.path.exists(meta_file):
+                try:
+                    with open(meta_file, 'r', encoding='utf-8') as f:
+                        m_payload = json.load(f)
+                        if isinstance(m_payload, dict) and isinstance(m_payload.get('candidates'), list):
+                            chosen_c_idx = frame.get('chosen_candidate_index') or 1
+                            for cm in m_payload['candidates']:
+                                c_idx = cm.get('index') or 1
+                                cand_f = cm.get('path') or os.path.join(cand_dir, f'candidate_{c_idx}.webp')
+                                rel_cand_path, rel_cand_url = _rel_url_for(cand_f)
+                                c_m = cm.get('model') or (frame.get('model') if frame else None) or 'gemini-3.1-flash-image'
+                                c_m_disp = cm.get('model_display') or ('GPT-2' if 'gpt' in str(c_m).lower() else ('Google FX' if ('google_fx' in str(c_m).lower() or cm.get('fx_uuid')) else 'Gemini'))
+                                loaded_cands.append({
+                                    'index': c_idx,
+                                    'file': rel_cand_path,
+                                    'url': rel_cand_url,
+                                    'fx_uuid': cm.get('fx_uuid'),
+                                    'model': c_m,
+                                    'model_display': c_m_disp,
+                                    'is_chosen': (c_idx == chosen_c_idx),
+                                    'score': 85,
+                                    'strengths': f'候选图 #{c_idx}',
+                                    'defects': '',
+                                })
+                except Exception:
+                    loaded_cands = []
+            elif os.path.exists(frame_path):
+                try:
+                    os.makedirs(cand_dir, exist_ok=True)
+                    cand_dest = os.path.join(cand_dir, 'candidate_1.webp')
+                    if not os.path.exists(cand_dest):
+                        shutil.copy2(frame_path, cand_dest)
+                    c_m = frame.get('model') or 'gemini-3.1-flash-image'
+                    c_m_disp = 'GPT-2' if 'gpt' in str(c_m).lower() else 'Gemini'
+                    cand_meta_dest = {'index': 1, 'path': cand_dest, 'raw_src': cand_dest, 'fx_uuid': None, 'model': c_m, 'model_display': c_m_disp}
+                    with open(meta_file, 'w', encoding='utf-8') as f:
+                        json.dump({'sequence': seq, 'candidates': [cand_meta_dest]}, f, ensure_ascii=False, indent=2)
+                    rel_cand_path, rel_cand_url = _rel_url_for(cand_dest)
+                    loaded_cands.append({
+                        'index': 1,
+                        'file': rel_cand_path,
+                        'url': rel_cand_url,
+                        'fx_uuid': None,
+                        'model': c_m,
+                        'model_display': c_m_disp,
+                        'is_chosen': True,
+                        'score': 85,
+                        'strengths': '基础主帧',
+                        'defects': '',
+                    })
+                except Exception:
+                    pass
+            if loaded_cands:
+                frame['candidates'] = loaded_cands
+                if not frame.get('chosen_candidate_index'):
+                    frame['chosen_candidate_index'] = 1
+                modified = True
+
         rebuilt_frames.append(frame)
     if rebuilt_frames:
         new_frames = rebuilt_frames

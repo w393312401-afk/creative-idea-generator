@@ -126,6 +126,28 @@
           "minItems": 2,
           "description": "本拍**新**留下、必须被后续状态继承的痕迹，每条须同时点名痕迹本身与它落在哪个面上。原本就在的环境物（落叶、青苔、旧污渍）不是痕迹——它们属于 macro_environment 或 scene_constants；混进来会稀释这一栏，因为 beats_to_dimensions 会把整栏拼成一个 trace 串下发。下界 2 不是本文件的发明——合成器的 frame-state 硬闸就是这么判的（prompt_pipeline/frame_state.py），少于两条会在合成前被打回。"
         },
+        "material_specs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "maxItems": 3,
+          "description": "本拍所用/所露材料的**工程规格**：标称厚度、等级、断面尺寸、表面纹理、光泽度（\"9mm OSB sheathing, raw matte face\"、\"2x4 SPF studs (38x89mm)\"）。Pass A 每一帧都在按这个口径记（_PASS_A_SYSTEM 的 material_specs），2026-08-24 之前 beats 这一层没有字段承接，逐帧量出来的规格全部止步于 frame_facts.json——交付出来的是「一块板」的通用想象，不是这条片子里那块板。与 visible_details 分工：那一栏写「什么料、什么颜色、在画面哪儿」，这一栏写「多厚、什么等级、什么面」。最多 3 条；没量到就留空，绝不猜一个标称值。"
+        },
+        "tool_specifics": {
+          "type": "string",
+          "description": "`tool` 那件工具的**具体型号/驱动方式/在用的刀头或批头**（\"18V cordless brushless impact driver with magnetic bit\"、\"pneumatic framing nailer\"、\"stainless steel notched trowel\"）。`tool` 回答「是什么工具」，这一栏回答「是哪一种、怎么驱动的」。Pass A 的 tool_specifics 一直在逐帧记，此前没有字段承接。留空只是没量到，不是「没有工具」。"
+        },
+        "fastening_and_bonding": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "maxItems": 3,
+          "description": "本拍可见的**紧固与粘接方式**：机械紧固件或化学粘接（\"countersunk black drywall screws\"、\"expanding PU foam sealant along the gap\"、\"construction adhesive bead\"、\"staples\"）。它决定这一拍的接缝长什么样，也决定 sfx 里那一下是拧、是钉还是挤——Pass A 逐帧记着它，此前没有字段承接。最多 3 条。"
+        },
+        "micro_traces": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "maxItems": 3,
+          "description": "本拍留下的**微观**痕迹：细木屑、铅笔弹线、石膏粉、过喷飞溅、边角料（\"fine sawdust along the pencil cut-line\"、\"chalk snap line on the subfloor\"）。与 persistent_traces 分工：那一栏是「必须被后续帧继承」的宏观痕迹（下界 2 条，整栏会被拼成一个 trace 串下发），这一栏是让这一拍看起来像真在施工的细节，不要求继承。Pass A 逐帧记着它，此前没有字段承接。最多 3 条。"
+        },
         "package_operations": {
           "type": "array",
           "minItems": 2,

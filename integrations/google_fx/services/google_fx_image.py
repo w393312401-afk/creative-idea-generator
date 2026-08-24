@@ -1348,7 +1348,8 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                         _check_cancelled()
 
                 # 超时前主动扫描一次页面是否存在积分/配额耗尽提示
-                page_credit_err = detect_page_credit_exhaustion(page)
+                # （deep：这是"等不到结果"的收尾诊断，值得花几秒读真实余额）
+                page_credit_err = detect_page_credit_exhaustion(page, deep=True)
                 if page_credit_err:
                     last_failed_detail[0] = page_credit_err
 
@@ -1807,7 +1808,7 @@ def _generate_images_batch_google_fx_single_attempt(req: ImageBatchRequest):
                     result["failed_index"] = idx
                     fail_detail = last_failed_detail[0]
                     if not fail_detail:
-                        fail_detail = detect_page_credit_exhaustion(page)
+                        fail_detail = detect_page_credit_exhaustion(page, deep=True)
                     if fail_detail:
                         result["message"] = f"第 {idx+1} 张图生成失败: {fail_detail}"
                     else:

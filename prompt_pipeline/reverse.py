@@ -1242,6 +1242,10 @@ RULES
   - light_state: the light and time of day in this beat ("overcast midday, no cast shadows", "low golden side light from frame left"). The film spans days; a beat that does not declare its light gets a random one.
   - material_flow: where this beat's material went or came from ("excavated soil piled on the trench's north lip", "offcuts bundled and carried out through the doorway"). This is the Material & Spoil Balance rule's field — demolition must say where debris goes, installation must say what stock was consumed.
   - cast_action: what EVERY living thing in frame is DOING WITH ITS BODY this beat, apart from the work itself — and above all HOW THAT CHANGED since the previous beat. Write it as a MOVE: the pose they held last beat -> the pose they hold now ("the two figurines get up off the stone and turn to face the rising wall, the one in red now half a step closer than before, while the brown dog rises from the shade and pads to the trench lip"; "crouches down at the wall foot, head tilted to sight along the course"). Living thing means a person, a miniature figurine, OR an animal (the site dog, a cat on the wall, a resin hen in the diorama) — cover each one that is in frame, not just the humans. NEVER write "remain", "stay", "unchanged", "in the same spot", "still standing where they were": that is a POSITION, not a move, and it is copied verbatim into every frame downstream, so the delivered film shows plastic dolls that never move once — the single most-reported failure of this pipeline. If a subject genuinely barely moved, write the smallest real change instead: a head turn, a shift of weight, a hand raised to point. Never repeat visible_action here: that one is the operation, this one is the body. If nothing alive is in frame, leave it out.
+  - material_specs: ONE to THREE engineering specs for the material this beat works with — nominal thickness, grade, section size, surface texture, sheen ("9mm OSB sheathing, raw matte face", "2x4 SPF studs (38x89mm)", "black polyethylene vapour barrier, red taped seams"). The FRAME FACTS you are given already carry a mat_specs field measured frame by frame; lift it from there. This is NOT visible_details: that one says what the material is, what colour it is and where it sits in frame; this one says how thick it is, what grade it is and what its face looks like. Copy nothing you cannot find in the frame facts — never fill in a plausible nominal size from trade habit.
+  - tool_specifics: the specific type, drive mechanism and active bit/blade of the ONE tool named in "tool" ("18V cordless brushless impact driver with magnetic bit", "pneumatic framing nailer", "stainless steel notched trowel"). The frame facts carry this as tool_specs. "tool" says which tool; this says which KIND of that tool. Leave it out if the frames never show it clearly enough to say.
+  - fastening_and_bonding: ONE to THREE visible fasteners or chemical bonds this beat uses ("countersunk black drywall screws", "expanding PU foam sealant along the gap", "construction adhesive bead", "staples"). The frame facts carry it as fasteners. This is what the beat's joints actually look like, and it is also what decides whether this beat's sfx is a driving whine, a nail crack, or a squeeze — keep the two consistent.
+  - micro_traces: ONE to THREE FINE marks this beat leaves ("fine sawdust along the pencil cut-line", "chalk snap line on the subfloor", "paint overspray on the sill"). The frame facts carry it as micro_traces. This is NOT persistent_traces: that one is the two macro marks later beats must inherit; this one is the grain of detail that makes the beat read as real work, and nothing downstream demands it be carried forward. Never repeat a persistent_traces item here.
   - insert_subject: if the film CUTS to a closer framing inside this beat, name in a few words what that closer shot is ON ("the tweezer tip pressing a roof tile", "mortar squeezing out from under the block", "the two figurines watching from the moss"). Read it off the frames: a run of frames at a much closer framing inside one beat is that cut. Leave it out for a beat filmed as one uninterrupted shot — an invented insert is worse than none, because it will be reproduced verbatim.
 - Every claim must trace to a frame. Never write a tool, material, worker, or operation that no frame fact mentions.
 - state_before / state_after must be concrete spatial completion extent, never "partially done".
@@ -1296,7 +1300,11 @@ Return one JSON object, no prose, no code fences:
     "state_before": "...",
     "state_after": "<how far the work got, carrying a quantity>",
     "persistent_traces": ["..."],
+    "material_specs": ["<one to three engineering specs lifted from the frame facts' mat_specs>"],
+    "fastening_and_bonding": ["<one to three visible fasteners or bonds, from the frame facts' fasteners>"],
+    "micro_traces": ["<one to three fine marks, from the frame facts' micro_traces; never repeat persistent_traces>"],
     "tool": "...",
+    "tool_specifics": "<the type/drive/bit of that tool, from the frame facts' tool_specs; omit if not readable>",
     "sfx": ["..."],
     "shot_scale": "<extreme_wide|wide|medium|close|extreme_close>",
     "camera_move": "<static|push_in|pull_out|pan|tilt|orbit|follow|handheld|crane>",
@@ -2372,7 +2380,15 @@ def normalize_beat_craft_fields(beats_doc):
             raw = beat['sfx']
             items = raw if isinstance(raw, (list, tuple)) else [raw]
             beat['sfx'] = [str(x).strip() for x in items if str(x or '').strip()][:4]
-        for key in ('tool', 'light_state', 'material_flow'):
+        # 微观取证三栏（2026-08-24）：单串写成列表、列表截到契约上界。模型把它们写成
+        # 一个逗号串是常事，不归一的话下游 `isinstance(raw, (list, tuple))` 那一道会
+        # 整栏判空——和没写一模一样，且不报错。
+        for key in ('material_specs', 'fastening_and_bonding', 'micro_traces'):
+            if key in beat:
+                raw = beat[key]
+                items = raw if isinstance(raw, (list, tuple)) else [raw]
+                beat[key] = [str(x).strip() for x in items if str(x or '').strip()][:3]
+        for key in ('tool', 'tool_specifics', 'light_state', 'material_flow'):
             if key in beat:
                 value = beat[key]
                 if isinstance(value, (list, tuple)):
@@ -4694,6 +4710,20 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
         sfx = [str(x).strip() for x in (beat.get('sfx') or []) if str(x).strip()]
         if sfx:
             entry['sfx'] = sfx
+
+        # 微观取证四栏（2026-08-24）。Pass A 逐帧量的规格/紧固/微痕在 2026-08-24 之前
+        # 连 beats 都进不去（schema 里没有字段），现在既然进来了，就必须一路走到写手
+        # 手上——否则只是把断点从 Pass B 挪到了这里。键名照例收短：清单条目会被整段
+        # 渲进规划提示词，长键名要按拍数乘一遍。
+        tool_specifics = str(beat.get('tool_specifics') or '').strip()
+        if tool_specifics:
+            entry['tool_specifics'] = tool_specifics
+        for src, dst in (('material_specs', 'mat_specs'),
+                         ('fastening_and_bonding', 'fasteners'),
+                         ('micro_traces', 'micro')):
+            items = [str(x).strip() for x in (beat.get(src) or []) if str(x).strip()]
+            if items:
+                entry[dst] = items
         for src, dst in (('shot_scale', 'shot_scale'), ('camera_move', 'camera_move'),
                          ('light_state', 'light'), ('material_flow', 'flow')):
             value = str(beat.get(src) or '').strip()

@@ -1434,9 +1434,12 @@ def _fx_find_ref_for(frames_dir, seq):
     if not os.path.isdir(src_dir):
         return None
     prefix = f'img_{seq - 1:03d}_'
+    matches = []
     for name in sorted(os.listdir(src_dir)):
         if name.startswith(prefix) and name.lower().endswith('.jpg') and _fx_extract_uuid(name):
-            return os.path.join(src_dir, name)
+            matches.append(os.path.join(src_dir, name))
+    if matches:
+        return matches[-1]
     return None
 
 
@@ -1488,26 +1491,31 @@ def _fx_local_frame_ref_jpg(frame_path, frames_dir, seq):
 
 
 def _fx_clear_frame_reference(frames_dir, seq):
-    """Remove every cached FX reference for one replaced frame slot.
+    """Archive every cached FX reference for one replaced frame slot without deleting.
 
-    A manual upload replaces ``img_NNN.webp`` but has no Flow canvas UUID.  Keeping the old
-    ``img_NNN_<uuid>.jpg`` would make the next frame silently mount the pre-upload image.
-    The local ``chain_ref_NNN.jpg`` conversion is equally stale and must be rebuilt too.
+    A manual upload replaces ``img_NNN.webp`` but has no Flow canvas UUID. Archiving the old
+    ``img_NNN_<uuid>.jpg`` prevents the next frame from mounting the pre-upload image while
+    preserving all files on disk in the pool.
     """
     src_dir = os.path.join(frames_dir, 'fx_src')
     if not os.path.isdir(src_dir):
         return []
     prefixes = (f'img_{int(seq):03d}_', f'chain_ref_{int(seq):03d}.jpg')
-    removed = []
+    archived = []
     for name in os.listdir(src_dir):
         if not (name.startswith(prefixes[0]) or name == prefixes[1]):
             continue
         path = os.path.join(src_dir, name)
         if not os.path.isfile(path):
             continue
-        os.remove(path)
-        removed.append(path)
-    return removed
+        arch_name = f'archived_{name}'
+        arch_path = os.path.join(src_dir, arch_name)
+        try:
+            os.replace(path, arch_path)
+            archived.append(arch_path)
+        except OSError:
+            pass
+    return archived
 
 
 def _fx_slot_reference_files(src_dir, seq):
@@ -1542,7 +1550,10 @@ def _fx_relocate_frame_reference(frames_dir, from_seq, to_seq, mode='swap'):
 
     if mode == 'copy':
         for name in dst_names:
-            os.remove(os.path.join(src_dir, name))
+            try:
+                os.replace(os.path.join(src_dir, name), os.path.join(src_dir, f'archived_{name}'))
+            except OSError:
+                pass
         for name in src_names:
             shutil.copyfile(os.path.join(src_dir, name),
                             os.path.join(src_dir, _renamed(name, to_seq)))
@@ -1561,7 +1572,10 @@ def _fx_relocate_frame_reference(frames_dir, from_seq, to_seq, mode='swap'):
     for seq in ((to_seq,) if mode == 'copy' else (from_seq, to_seq)):
         cached = os.path.join(src_dir, f'chain_ref_{seq:03d}.jpg')
         if os.path.isfile(cached):
-            os.remove(cached)
+            try:
+                os.replace(cached, os.path.join(src_dir, f'archived_chain_ref_{seq:03d}.jpg'))
+            except OSError:
+                pass
 
     for seq in (from_seq, to_seq):
         found = _fx_slot_reference_files(src_dir, seq)
@@ -1571,8 +1585,7 @@ def _fx_relocate_frame_reference(frames_dir, from_seq, to_seq, mode='swap'):
 
 def _fx_store_frame(src_path, frames_dir, seq):
     """外部脚本下载的原始 jpg → frames/img_NNN.webp，原始文件按
-    img_NNN_<uuid>.jpg 留档到 frames/fx_src/（同槽位旧档先清掉，防止
-    重试后按前缀找参考时命中旧 UUID）。返回 (webp_path, fx_src_path, uuid)。"""
+    img_NNN_<uuid>.jpg 留档到 frames/fx_src/。同槽位旧档归档至 candidates 池中保留。返回 (webp_path, fx_src_path, uuid)。"""
     target_path = os.path.join(frames_dir, f'img_{seq:03d}.webp')
     with Image.open(src_path) as img:
         img.convert('RGB').save(target_path, format='WEBP', quality=80)
@@ -1580,14 +1593,29 @@ def _fx_store_frame(src_path, frames_dir, seq):
     uuid_str = _fx_extract_uuid(src_path)
     src_dir = _fx_src_dir(frames_dir)
     prefix = f'img_{seq:03d}_'
+
+    # 将同槽位旧档安全移入候选池目录保留，绝不物理删除
+    cand_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
     for old in os.listdir(src_dir):
         if old.startswith(prefix):
+            old_path = os.path.join(src_dir, old)
             try:
-                os.remove(os.path.join(src_dir, old))
+                os.makedirs(cand_dir, exist_ok=True)
+                dest_cand = os.path.join(cand_dir, old)
+                if old_path != dest_cand:
+                    if not os.path.exists(dest_cand):
+                        os.replace(old_path, dest_cand)
+                    else:
+                        os.remove(old_path)
             except Exception:
                 pass
-    fx_src_path = os.path.join(src_dir, f'{prefix}{uuid_str or "nouuid"}.jpg')
-    shutil.copyfile(src_path, fx_src_path)
+
+    if uuid_str:
+        fx_src_path = os.path.join(src_dir, f'{prefix}{uuid_str}.jpg')
+    else:
+        fx_src_path = os.path.join(src_dir, f'{prefix}nouuid_{int(time.time() * 1000)}.jpg')
+    if src_path != fx_src_path:
+        shutil.copyfile(src_path, fx_src_path)
     return target_path, fx_src_path, uuid_str
 
 
@@ -2560,6 +2588,7 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
         already_exists = os.path.exists(target_path) and os.path.getsize(target_path) > 0
         skip_api_call = already_exists and (target_sequences is None)
 
+        existing_frame = manifest_frames_by_seq.get(seq)
         model = ""
         retries = 0
         vlm_qa_reason = None
@@ -2910,6 +2939,152 @@ def generate_frame_sequence(config, title, prompt_block, on_progress=None, targe
                         'continuity_check', 'family_id', 'prompt_dirty', 'prompt_dirty_at'):
                 if existing_frame.get(key) is not None:
                     frame_info[key] = existing_frame[key]
+
+        # 保留全量帧序列产物到候选池（不删除、不覆盖）
+        cand_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
+        meta_file = os.path.join(cand_dir, 'candidates_meta.json')
+        if not skip_api_call and os.path.exists(target_path):
+            os.makedirs(cand_dir, exist_ok=True)
+            existing_cands_meta = []
+            if os.path.exists(meta_file):
+                try:
+                    with open(meta_file, 'r', encoding='utf-8') as f:
+                        m_payload = json.load(f)
+                        if isinstance(m_payload, dict) and isinstance(m_payload.get('candidates'), list):
+                            existing_cands_meta = [c for c in m_payload['candidates'] if isinstance(c, dict)]
+                except Exception:
+                    existing_cands_meta = []
+
+            max_c_idx = 0
+            for cm in existing_cands_meta:
+                try:
+                    c_idx = int(cm.get('index') or 0)
+                    if c_idx > max_c_idx:
+                        max_c_idx = c_idx
+                except (TypeError, ValueError):
+                    pass
+            if not existing_cands_meta and os.path.isdir(cand_dir):
+                for fname in os.listdir(cand_dir):
+                    m = re.match(r'^candidate_(\d+)(?:_.*)?\.webp$', fname)
+                    if m:
+                        try:
+                            max_c_idx = max(max_c_idx, int(m.group(1)))
+                        except ValueError:
+                            pass
+
+            new_c_idx = max_c_idx + 1
+            cand_file_dest = os.path.join(cand_dir, f'candidate_{new_c_idx}.webp')
+            try:
+                shutil.copy2(target_path, cand_file_dest)
+            except Exception:
+                pass
+
+            new_cand_meta = {
+                'index': new_c_idx,
+                'path': cand_file_dest,
+                'raw_src': cand_file_dest,
+                'fx_uuid': None,
+            }
+            existing_cands_meta.append(new_cand_meta)
+            try:
+                with open(meta_file, 'w', encoding='utf-8') as f:
+                    json.dump({'sequence': seq, 'candidates': existing_cands_meta}, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+            existing_cands_manifest = (existing_frame.get('candidates', []) if existing_frame and isinstance(existing_frame.get('candidates'), list) else [])
+            updated_manifest_cands = []
+            for ec in existing_cands_manifest:
+                if isinstance(ec, dict):
+                    ec_copy = dict(ec)
+                    ec_copy['is_chosen'] = False
+                    updated_manifest_cands.append(ec_copy)
+
+            rel_cand_path = os.path.relpath(cand_file_dest, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+            c_model = model or config.get('imageModel') or 'gemini-3.1-flash-image'
+            c_model_display = 'GPT-2' if 'gpt' in str(c_model).lower() else ('Google FX' if 'google_fx' in str(c_model).lower() else 'Gemini')
+            updated_manifest_cands.append({
+                'index': new_c_idx,
+                'file': rel_cand_path,
+                'url': '/' + rel_cand_path if not rel_cand_path.startswith('/') else rel_cand_path,
+                'fx_uuid': None,
+                'model': c_model,
+                'model_display': c_model_display,
+                'is_chosen': True,
+                'score': 85,
+                'strengths': '标准生成帧',
+                'defects': '',
+            })
+            frame_info['candidates'] = updated_manifest_cands
+            frame_info['chosen_candidate_index'] = new_c_idx
+        elif skip_api_call and existing_frame and existing_frame.get('candidates'):
+            frame_info['candidates'] = existing_frame['candidates']
+            if existing_frame.get('chosen_candidate_index'):
+                frame_info['chosen_candidate_index'] = existing_frame['chosen_candidate_index']
+
+        # 候选池兜底补齐：无论何种模型（含 gpt-image-2）与复用路径，确保候选池与 manifest 同步
+        if not frame_info.get('candidates'):
+            cand_dir = os.path.join(frames_dir, 'candidates', f'frame_{seq:03d}')
+            meta_file = os.path.join(cand_dir, 'candidates_meta.json')
+            loaded_cands = []
+            if os.path.exists(meta_file):
+                try:
+                    with open(meta_file, 'r', encoding='utf-8') as f:
+                        m_payload = json.load(f)
+                        if isinstance(m_payload, dict) and isinstance(m_payload.get('candidates'), list):
+                            for cm in m_payload['candidates']:
+                                c_idx = cm.get('index') or 1
+                                cand_f = cm.get('path') or os.path.join(cand_dir, f'candidate_{c_idx}.webp')
+                                rel_cand_path = os.path.relpath(cand_f, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+                                c_m = cm.get('model') or (existing_frame.get('model') if existing_frame else None) or model or config.get('imageModel') or 'gemini-3.1-flash-image'
+                                c_m_disp = cm.get('model_display') or ('GPT-2' if 'gpt' in str(c_m).lower() else ('Google FX' if ('google_fx' in str(c_m).lower() or cm.get('fx_uuid')) else 'Gemini'))
+                                loaded_cands.append({
+                                    'index': c_idx,
+                                    'file': rel_cand_path,
+                                    'url': '/' + rel_cand_path if not rel_cand_path.startswith('/') else rel_cand_path,
+                                    'fx_uuid': cm.get('fx_uuid'),
+                                    'model': c_m,
+                                    'model_display': c_m_disp,
+                                    'is_chosen': (c_idx == (existing_frame.get('chosen_candidate_index') if existing_frame else 1)),
+                                    'score': 85,
+                                    'strengths': f'候选图 #{c_idx}',
+                                    'defects': '',
+                                })
+                except Exception:
+                    loaded_cands = []
+            elif os.path.exists(target_path):
+                os.makedirs(cand_dir, exist_ok=True)
+                cand_dest = os.path.join(cand_dir, 'candidate_1.webp')
+                if not os.path.exists(cand_dest):
+                    try:
+                        shutil.copy2(target_path, cand_dest)
+                    except Exception:
+                        pass
+                c_m = model or config.get('imageModel') or 'gemini-3.1-flash-image'
+                c_m_disp = 'GPT-2' if 'gpt' in str(c_m).lower() else 'Gemini'
+                cand_meta_dest = {'index': 1, 'path': cand_dest, 'raw_src': cand_dest, 'fx_uuid': None, 'model': c_m, 'model_display': c_m_disp}
+                try:
+                    with open(meta_file, 'w', encoding='utf-8') as f:
+                        json.dump({'sequence': seq, 'candidates': [cand_meta_dest]}, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+                rel_cand_path = os.path.relpath(cand_dest, os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
+                loaded_cands.append({
+                    'index': 1,
+                    'file': rel_cand_path,
+                    'url': '/' + rel_cand_path if not rel_cand_path.startswith('/') else rel_cand_path,
+                    'fx_uuid': None,
+                    'model': c_m,
+                    'model_display': c_m_disp,
+                    'is_chosen': True,
+                    'score': 85,
+                    'strengths': '基础主帧',
+                    'defects': '',
+                })
+            if loaded_cands:
+                frame_info['candidates'] = loaded_cands
+                if not frame_info.get('chosen_candidate_index'):
+                    frame_info['chosen_candidate_index'] = (existing_frame.get('chosen_candidate_index') if existing_frame else 1) or 1
 
         manifest_frames_by_seq[seq] = frame_info
         previous_path = target_path

@@ -263,3 +263,57 @@ def test_tasks_bulk_delete_and_safety(monkeypatch):
     # 核心安全契约：删除任务记录绝不能调用 delete_idea_output_files 物理抹除 outputs/ 成片
     assert len(purged_outputs) == 0
 
+
+def test_tasks_clear_all_and_purge(monkeypatch, tmp_path):
+    deleted_task_files = []
+    deleted_library_items = []
+    deleted_output_titles = []
+
+    monkeypatch.setattr(server, 'delete_task_files', lambda tid: deleted_task_files.append(tid))
+    monkeypatch.setattr(server, 'delete_library_item', lambda item_id: deleted_library_items.append(item_id) or True)
+    monkeypatch.setattr(server, 'delete_idea_output_files', lambda title, covers=None: deleted_output_titles.append(title) or {'project_dir': title, 'covers': []})
+
+    tasks = {
+        't_completed': {'id': 't_completed', 'status': 'completed', 'cancel_event': threading.Event(), 'result': {'title': '任务1'}},
+        't_running': {'id': 't_running', 'status': 'running', 'cancel_event': threading.Event(), 'result': {'title': '任务2'}},
+    }
+    lib_items = [
+        {'id': 'lib_1', 'project_key': 'pk_1', 'title': '点子1'},
+        {'id': 'lib_2', 'project_key': 'pk_2', 'title': '点子2'},
+    ]
+
+    out_dir = tmp_path / 'outputs'
+    out_dir.mkdir()
+    (out_dir / 'proj_extra').mkdir()
+    (out_dir / 'extra_file.png').write_text('dummy')
+    (out_dir / '.gitkeep').write_text('')
+
+    monkeypatch.setattr(server, 'ACTIVE_TASKS', tasks)
+    monkeypatch.setattr(server, 'read_library', lambda *a, **k: lib_items)
+    monkeypatch.setattr(server.server_common, 'OUTPUT_ROOT', str(out_dir))
+
+    h = object.__new__(server.SparkRequestHandler)
+    h.path = '/api/tasks/clear'
+    h._gate = lambda *a, **k: True
+    sent = []
+    h._send_json = lambda obj, status=200: sent.append((obj, status))
+    h._read_json_body = lambda: {'status_group': 'all'}
+
+    h.do_POST()
+
+    body, status = sent[0]
+    assert status == 200
+    assert body['status'] == 'ok'
+    assert body['count'] == 4  # 2 tasks + 2 library items
+    assert body['deleted_task_count'] == 2
+    assert body['deleted_library_count'] == 2
+    assert len(tasks) == 0
+    assert set(deleted_task_files) == {'t_completed', 't_running'}
+    assert set(deleted_library_items) == {'lib_1', 'lib_2'}
+    assert set(deleted_output_titles) == {'pk_1', 'pk_2'}
+    # 验证 outputs 目录下的残留文件夹与文件被清理，仅保留 .gitkeep
+    assert not (out_dir / 'proj_extra').exists()
+    assert not (out_dir / 'extra_file.png').exists()
+    assert (out_dir / '.gitkeep').exists()
+
+

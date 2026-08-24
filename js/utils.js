@@ -351,12 +351,29 @@ function handleManualInterventionEvent(type, data) {
             `处理完成后脚本会自动继续（最长等待 ${maxWaitMin} 分钟）`
         );
         showToast(`需要人工处理：${codeLabel}，脚本已暂停等待`, 'warning');
+        if (typeof NotificationCenter !== 'undefined') {
+            NotificationCenter.notify({
+                type: 'action_required',
+                title: `需要人工处理：${codeLabel}`,
+                message: `Google Flow 触发安全/登录拦截，请切到 AdsPower 处理`
+            });
+        }
     } else if (type === 'manual_intervention_cleared') {
         hideManualInterventionBanner();
         showToast('人工处理已完成，自动继续生成', 'success');
+        if (typeof NotificationCenter !== 'undefined') {
+            NotificationCenter.onWindowActivated();
+        }
     } else if (type === 'manual_intervention_timeout') {
         hideManualInterventionBanner();
         showToast(`等待人工处理超时（${codeLabel}），相关任务已标记失败`, 'error');
+        if (typeof NotificationCenter !== 'undefined') {
+            NotificationCenter.notify({
+                type: 'error',
+                title: `人工处理超时（${codeLabel}）`,
+                message: '任务已标记失败'
+            });
+        }
     }
 }
 

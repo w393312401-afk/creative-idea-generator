@@ -1177,6 +1177,13 @@ function setSlotGridButtonsBusy(type, busy) {
     const host = slotRenderTarget(kind);
     if (!host) return;
     host.querySelectorAll(`.slot-card[data-type="${kind}"] .slot-action-btn`).forEach(btn => {
+        const act = btn.dataset.act;
+        // view-candidates 与 describe-frame 属于只读/元数据操作，生成中始终保持可用
+        if (act === 'view-candidates' || act === 'describe-frame') {
+            btn.disabled = false;
+            btn.title = btn.dataset.idleTitle || '';
+            return;
+        }
         btn.disabled = !!busy;
         // 解禁时把"不忙时该说什么"还回去（renderSlotCard 写在 data-idle-title 上），
         // 而不是一律置空
@@ -1396,10 +1403,7 @@ async function describeFrameIssue(seq, existingIssue) {
         return;
     }
     const ownerIdea = currentIdea;
-    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
-        showToast("该创意的帧序列正在生成/修复中，请稍候", "error");
-        return;
-    }
+    const isBusy = typeof isIdeaTaskActive === 'function' && isIdeaTaskActive(ownerIdea.id, 'frames');
 
     const seqLabel = String(seq).padStart(3, '0');
     const answer = await customTextarea({
@@ -1410,7 +1414,7 @@ async function describeFrameIssue(seq, existingIssue) {
         defaultValue: existingIssue || '',
         placeholder: '例：塔吊在上一帧还在画面右侧，这一帧凭空消失了；左侧脚手架的层数也从 3 层变成了 5 层。',
         confirmLabel: '记录问题',
-        extraLabel: '记录并立即修复',
+        extraLabel: isBusy ? null : '记录并立即修复',
     });
     if (!answer) return;
 
@@ -1437,10 +1441,13 @@ async function describeFrameIssue(seq, existingIssue) {
         }
         showToast(description ? `已记录第 ${seq} 帧的问题描述。` : `已撤销第 ${seq} 帧的问题标记。`, "success");
 
-        // 「记录并立即修复」：描述已经落盘，这里不再重复传 manual_reason，
-        // fix_frame_issue 会自己从 manifest 读出来（连同机器判定一起）。
+        // 「记录并立即修复」：若当前没有任务在跑，立即触发修复；若正在生成中，提示已记录描述
         if (description && answer.action === 'extra') {
-            await fixFrameIssue(seq);
+            if (typeof isIdeaTaskActive === 'function' && isIdeaTaskActive(ownerIdea.id, 'frames')) {
+                showToast(`已记录 IMG ${seqLabel} 的问题描述。当前帧序列正在生成中，请在生成完成后点击「修复此帧问题」。`, "info");
+            } else {
+                await fixFrameIssue(seq);
+            }
         }
     } catch (e) {
         console.error(`Failed to flag frame ${seq}:`, e);

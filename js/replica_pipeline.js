@@ -70,6 +70,10 @@ const REPLICA_BEAT_STAGE_LABELS = {
 const REPLICA_LIST_FIELDS = new Set([
     'package_operations', 'persistent_traces', 'visible_details', 'macro_environment',
     'source_event_ids', 'evidence_frames', 'reference_frames', 'sfx',
+    // 微观取证三栏（2026-08-24）。漏在这一道上会静默变形：空着的栏 beat[key] 是
+    // undefined，Array.isArray 判假，用户敲进去的多行会被存成一个带换行的字符串，
+    // 而下游整条链路只认列表——存了等于没存，且不报错。
+    'material_specs', 'fastening_and_bonding', 'micro_traces',
 ]);
 
 // 景别与运镜是闭集（timelapse-beats.schema.json / reverse.SHOT_SCALES、CAMERA_MOVES）。
@@ -234,11 +238,53 @@ async function replicaLoadJobs() {
     return replicaJobs;
 }
 
+// 复刻线的阶段变更提醒：每个 job 单独记上一次已提醒的阶段，切任务不会误报，
+// 同一阶段轮询多次也只响一次。
+const replicaNotifiedStage = {};
+
+function replicaNotifyStageChange(state) {
+    if (!state || !state.job_id || typeof NotificationCenter === 'undefined') return;
+    const stage = state.stage;
+    if (!stage || replicaNotifiedStage[state.job_id] === stage) return;
+    const first = !(state.job_id in replicaNotifiedStage);
+    replicaNotifiedStage[state.job_id] = stage;
+    // 第一次加载已有任务时不补响历史阶段，只有真的发生了推进才提醒
+    if (first) return;
+
+    const title = state.title || state.source_title || '复刻任务';
+    if (stage === 'completed') {
+        NotificationCenter.notify({
+            type: 'success',
+            title: '复刻任务已完成',
+            message: `${title}：全流程已跑完，可以去交付区取片了`
+        });
+    } else if (stage === 'audit_failed' || stage === 'compose_failed' || stage === 'mutate_failed') {
+        NotificationCenter.notify({
+            type: 'error',
+            title: '复刻任务失败',
+            message: `${title}：${state.error || '流程中断，请查看任务详情'}`
+        });
+    } else if (stage === 'confirm_cost') {
+        NotificationCenter.notify({
+            type: 'action_required',
+            title: '复刻任务等待确认',
+            message: `${title}：请确认本次生成的花费后才会继续`
+        });
+    } else if (stage === 'review_beats') {
+        NotificationCenter.notify({
+            type: 'action_required',
+            title: '复刻任务等待审核',
+            message: `${title}：拍点已就绪，请在工作台确认是否通过`
+        });
+    }
+}
+
 async function replicaLoadJob(jobId) {
     const data = await replicaFetch(`/api/replica/status?job_id=${encodeURIComponent(jobId)}`,
         { headers: replicaHeaders() });
     const switched = !replicaState || replicaState.job_id !== jobId;
     replicaState = data.job_state;
+    replicaNotifyStageChange(replicaState);
     // 折叠状态按 beat.id 存，而 B01…B11 在每一条任务里都叫这个名字。不清空的话，
     // 在 A 任务折起来的 B03，切到 B 任务照样是折的——用户没折过它，它却是折的。
     if (switched) replicaBeatFoldState = {};
@@ -403,6 +449,9 @@ function replicaRenderHeaderToolbar(state) {
     </div>`;
 }
 
+// 「清理合成缓存」勾选状态。见 replicaRenderBottomBar 里那段说明。
+let replicaResetCache = false;
+
 // 吸底主操作栏：每个阶段只有一个主 CTA，永远够得着。
 //
 // 这条栏是「保存并重校验 / 合成提示词 / 确认并开始反推 / 存入项目」的**唯一**落点——
@@ -417,6 +466,20 @@ function replicaRenderBottomBar(state) {
     const hasBeats = !!(state.beats && (state.beats.beats || []).length);
     const isRunning = !!replicaSSE;
 
+    // 「清理合成缓存」。合成缓存的键是 brief 指纹（dimensions + 技能 profile +
+    // MILESTONE_POLICY_VERSION）——只改了提示词规则而没动节拍时，指纹一个字不变，
+    // 「重新合成」照样命中旧断点、直接跳过整个 Phase 1，用户看着进度条走完，拿到的
+    // 还是旧规则那一份。勾上它这一轮从头跑（见 replica_pipeline.run_compose 的
+    // reset_cache）。默认不勾：断点续传省的是几分钟大模型钱，不该为一个偶发场景
+    // 让每一次重试都全额重付。
+    // 状态存在模块变量而不是 DOM：这条栏会被 replicaRefreshBottomBar 整段重建，
+    // 存 DOM 里的话用户勾完随便保存一次就被清掉了。
+    const resetCacheToggleHtml = `
+        <label class="replica-inline-toggle" title="不复用任何上一轮的合成产物（断点存档、空间锁定包、本任务 Phase 1 产物），从头跑一遍。改过提示词规则后要的就是这个——否则指纹没变，会直接续上旧规则那一份。代价是多花一次 Phase 1 的模型调用。">
+            <input type="checkbox" id="replica-reset-cache" ${replicaResetCache ? 'checked' : ''}>
+            <span>清理合成缓存</span>
+        </label>`;
+
     let mainActionHtml = '';
     if (isRunning) {
         mainActionHtml = `<button type="button" id="replica-bar-cancel-btn" class="action-btn text-btn">中断这一轮</button>`;
@@ -425,6 +488,7 @@ function replicaRenderBottomBar(state) {
     } else if (stage === 'review_beats' || (hasBeats && stage !== 'completed' && stage !== 'audit_failed')) {
         mainActionHtml = `
             <button type="button" id="replica-bar-save-btn" class="action-btn text-btn">保存并重校验</button>
+            ${resetCacheToggleHtml}
             <button type="button" id="replica-bar-compose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词</button>
         `;
     } else if (stage === 'completed' || stage === 'audit') {
@@ -433,6 +497,7 @@ function replicaRenderBottomBar(state) {
         `;
     } else if (stage === 'audit_failed' || stage === 'compose_failed') {
         mainActionHtml = `
+            ${resetCacheToggleHtml}
             <button type="button" id="replica-bar-recompose-btn" class="action-btn primary-btn">重新合成</button>
         `;
     }
@@ -1828,9 +1893,16 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
                 ${field('state_after', '结束状态（完成到哪儿，须带一个量，别把可见结果再写一遍）', 2)}
                 ${field('persistent_traces',
                         `遗留痕迹（一行一条，须 ≥2 条；当前 ${(beat.persistent_traces || []).length} 条。只写本拍新留下的痕迹＋它落在哪个面上，原本就有的落叶青苔不算）`, 2)}
+                ${field('material_specs',
+                        `材料规格（一行一条，≤3 条；当前 ${(beat.material_specs || []).length} 条。写「多厚、什么等级、什么面」——9mm OSB 哑光面 / 2x4 SPF 龙骨；细节识别项那一栏写的是「什么料、什么颜色、在哪儿」，别重复）`, 2)}
+                ${field('fastening_and_bonding',
+                        `紧固与粘接（一行一条，≤3 条；当前 ${(beat.fastening_and_bonding || []).length} 条。沉头自攻钉 / 发泡胶封缝 / 结构胶。它决定接缝长什么样，也决定本拍那一下是拧、是钉还是挤）`, 2)}
+                ${field('micro_traces',
+                        `微观痕迹（一行一条，≤3 条；当前 ${(beat.micro_traces || []).length} 条。细木屑、铅笔弹线、过喷飞溅。与遗留痕迹分工：那一栏必须被后续帧继承，这一栏不要求）`, 2)}
             </div>
             <div class="replica-beat-fields replica-beat-craft">
                 ${field('tool', '主导工具（动作峰值上那一件：吊车 / 冲击钻 / 橡胶锤。三联绑定的一环，塞在动作句里合成器读不出来）')}
+                ${field('tool_specifics', '工具具体型号（哪一种、怎么驱动、在用什么刀头批头：18V 无刷冲击钻＋磁性批头 / 气动排钉枪 / 不锈钢齿口抹刀。上一栏答「是什么工具」，这一栏答「是哪一种」）')}
                 ${field('sfx',
                         `本拍声音（一行一个声源，1~3 条；当前 ${(beat.sfx || []).length} 条。原声物理音，绝不写配乐——交付口径是 ASMR 60% / BGM 0%）`, 2)}
                 ${selectField('shot_scale', '景别', REPLICA_SHOT_SCALES)}
@@ -2462,6 +2534,12 @@ function replicaBindBottomBarEvents() {
     on('#replica-bar-cancel-btn', replicaCancelRun);
     // 硬伤计数本身就是「带我去看」的入口：它是这条栏上唯一说得出问题在哪的东西。
     on('#replica-bar-errors-btn', () => replicaFocusSection('replica-sec-beats'));
+    const resetCacheBox = bar.querySelector('#replica-reset-cache');
+    if (resetCacheBox) {
+        resetCacheBox.addEventListener('change', () => {
+            replicaResetCache = resetCacheBox.checked;
+        });
+    }
 }
 
 // ── 滚动监听与 ScrollSpy ──────────────────────────────────────────────────────────
@@ -2754,7 +2832,15 @@ async function replicaCompose(btn) {
     // 合成前先把编辑器里的改动落盘：不然用户改了半天，合成用的还是磁盘上的旧节拍。
     const saved = await replicaSaveBeats(false);
     if (!saved) return;
-    replicaAdvance('approve', {}, btn instanceof HTMLElement ? btn : undefined);
+    // 勾选态在这里读一次就用完：清缓存是一次性动作，不该黏在下一次合成上——用户为
+    // 一轮改规则的重跑勾了它，接着改一拍再合成时不该又白付一次 Phase 1。
+    const payload = replicaResetCache ? { reset_cache: true } : {};
+    if (replicaResetCache) {
+        replicaResetCache = false;
+        const box = document.getElementById('replica-reset-cache');
+        if (box) box.checked = false;
+    }
+    replicaAdvance('approve', payload, btn instanceof HTMLElement ? btn : undefined);
 }
 
 // 「存入项目并打开激发结果」。

@@ -3321,6 +3321,41 @@ def clear_compose_checkpoint(fingerprint):
             _save_compose_checkpoints_all(checkpoints)
 
 
+def clear_compose_caches(fingerprint):
+    """清掉这一份 brief 指纹名下的**全部**合成缓存，返回 {'checkpoint': n, 'packets': n}。
+
+    为什么不是只清断点存档：Phase 1 的两件产物走两个不同的文件，只清一个等于没清。
+      · compose_checkpoints.json[fingerprint] —— 整份进度快照（梯子/packet/已完成的拍）
+      · packet_cache.json["{fingerprint}:{梯子哈希}"] —— Drift Lock packet 自己那一份
+    packet 的键是「指纹 + 本次梯子的里程碑哈希」，同一份 brief 在不同梯子下会留下好
+    几条，所以按前缀整簇清——留下任意一条，改完规则重合成时 Step 4 仍会命中旧 packet，
+    而 packet 里锁着 camera DNA 与锚点，那正是「新规则的提示词被旧缓存污染」最难看出
+    来的一种形态（提示词逐字重写过，空间契约还是老的）。
+
+    指纹本身已经带了 MILESTONE_POLICY_VERSION（见 get_brief_fingerprint）：契约级的
+    改动只要顺手把那个常量换代，存量缓存自然全部失效。这个函数补的是另一半——提示词
+    措辞/规则文案改了但契约没变时，指纹不动，旧缓存照样命中，只能手动清。
+    """
+    cleared = {'checkpoint': 0, 'packets': 0}
+    if not fingerprint:
+        return cleared
+    with COMPOSE_CHECKPOINT_LOCK:
+        checkpoints = load_compose_checkpoints()
+        if fingerprint in checkpoints:
+            del checkpoints[fingerprint]
+            _save_compose_checkpoints_all(checkpoints)
+            cleared['checkpoint'] = 1
+    with PACKET_CACHE_LOCK:
+        cache = load_packet_cache()
+        stale = [k for k in cache if str(k).startswith(f'{fingerprint}:')]
+        if stale:
+            for key in stale:
+                del cache[key]
+            save_packet_cache(cache)
+            cleared['packets'] = len(stale)
+    return cleared
+
+
 def _checkpoint_is_failed_terminal(checkpoint, total_beats):
     """A compose checkpoint with any placeholder is a FAILED-terminal diagnostic snapshot:
     resuming it would mark the flagged beats 'done', skip regenerating them, and instantly
@@ -4542,6 +4577,86 @@ def apply_observed_shot_plan(beat_ladder, parsed_brief, composer=None):
             observed_shot_count_of(b) for b in beat_ladder]
         parsed_brief['observed_shot_deviations'] = deviations
     return applied, deviations
+
+
+# 逐拍制作字段（复刻线）。键 = 交付侧读的名字，值 = 清单条目上的名字。
+# 只放「原片上量得到、且交付侧没有别的真相源」的字段：shot_count / shot_seconds 归
+# apply_observed_shot_plan（它还要判偏差），insert / cast 也在那边（它们有各自的门控）。
+_OBSERVED_CRAFT_KEYS = (
+    ('tool', 'tool'),
+    ('tool_specifics', 'tool_specifics'),
+    ('light', 'light'),
+    ('flow', 'flow'),
+    ('crew', 'crew'),
+    ('shot_scale', 'shot_scale'),
+    ('camera_move', 'camera_move'),
+)
+_OBSERVED_CRAFT_LIST_KEYS = (
+    ('sfx', 'sfx'),
+    ('macro_environment', 'macro_environment'),
+    # 微观取证三栏（2026-08-24）：Pass A 逐帧量的工程规格 / 紧固方式 / 微观痕迹。
+    ('mat_specs', 'mat_specs'),
+    ('fasteners', 'fasteners'),
+    ('micro', 'micro'),
+)
+
+
+def observed_craft_of(beat):
+    """这一拍从原片量到的制作字段，没有就是空字典。"""
+    craft = beat.get('observed_craft') if isinstance(beat, dict) else None
+    return craft if isinstance(craft, dict) and craft else {}
+
+
+def _craft_from_outline_entry(entry):
+    """一条清单条目 → 制作字段字典。全空返回 {}。"""
+    if not isinstance(entry, dict):
+        return {}
+    craft = {}
+    for dst, src in _OBSERVED_CRAFT_KEYS:
+        value = str(entry.get(src) or '').strip()
+        if value:
+            craft[dst] = value
+    for dst, src in _OBSERVED_CRAFT_LIST_KEYS:
+        raw = entry.get(src)
+        items = ([str(x).strip() for x in raw if str(x).strip()]
+                 if isinstance(raw, (list, tuple)) else [])
+        if items:
+            craft[dst] = items
+    return craft
+
+
+def apply_observed_craft_fields(beat_ladder, parsed_brief):
+    """把原片观察到的逐拍制作字段（工具/音效/光照/物料去向/人数/机位）按下标贴回梯子。
+
+    返回贴上的拍数。
+
+    为什么需要这一道：这六件事此前**只**出现在规划提示词里（build_outline_plan_block
+    的 TOOL / SFX / LIGHT / CREW / MATERIAL FLOW / SHOT 规则），指望规划器把它们转述进
+    ladder 自己的字段。ladder schema 里根本没有这几个字段，于是转述的落点只有
+    description 一处散文——写手（Phase 2）看到的是规划器的复述，不是原片的观测值，
+    漏一条没有任何东西会响。空间序列与镜头计划早就各自有一条确定性通路
+    （apply_observed_space_sequence / apply_observed_shot_plan），这条是同一条纪律
+    补上剩下的六项。
+
+    与那两个函数同一条纪律：清单条数与梯子长度对不上就整段不生效（规划四轮全灭退回
+    兜底梯子时，按下标硬贴只会把 A 拍的工具贴到 B 拍上）。只写 observed_craft 这一个
+    键，不碰任何施工字段。
+    """
+    if not isinstance(beat_ladder, list):
+        return 0
+    plan = (parsed_brief or {}).get('beat_outline') or []
+    if len(plan) != len(beat_ladder):
+        return 0
+    applied = 0
+    for beat, entry in zip(beat_ladder, plan):
+        if not isinstance(beat, dict):
+            continue
+        craft = _craft_from_outline_entry(entry)
+        if not craft:
+            continue
+        beat['observed_craft'] = craft
+        applied += 1
+    return applied
 
 
 def _beat_semantic_text(beat):
@@ -10897,6 +11012,14 @@ Space Type: {space_type}
                     f'原片每镜秒数 → 交付每镜秒数）'
                     if _shot_deviations else '')
             print(f'[SHOT] {_shots_applied} 拍带上了原片观察到的镜头计划{_dev}。')
+        # 制作字段收口（复刻线）：工具/音效/光照/物料去向/人数/机位以原片为准。
+        # 与上面两条同一条纪律与同一个位置——都是「不增删拍、只覆盖字段」的确定性
+        # 收口。缺了它，这六件事就只在规划提示词里出现过一次，写手（Phase 2）看到的
+        # 是规划器的转述而不是观测值（见 apply_observed_craft_fields 的说明）。
+        _craft_applied = apply_observed_craft_fields(beat_ladder, parsed_brief)
+        if _craft_applied and sys.stdout:
+            print(f'[CRAFT] {_craft_applied} 拍带上了原片观察到的制作字段'
+                  f'（工具/音效/光照/物料去向/人数/机位）。')
     else:
         # Transition slots are additive production beats.  Expanding only after the conceptual
         # construction ladder passes its count/order gates preserves every construction milestone.
@@ -12129,16 +12252,101 @@ def beat_outline_items(beat):
             if isinstance(item, dict) and str(item.get('text') or '').strip()]
 
 
+# 观测制作字段的渲染措辞。它必须让开三条已经存在的契约，否则这一段就是在和它们对撞：
+#   · LIGHT  让开 LIGHTING PHASE CONTRACT（那条管相位推进，这条只管相位之内的质感）
+#   · SHOT   让开 IMAGE 的 family camera declaration（那条钉死静帧机位，这条只管 VIDEO）
+#   · CREW   反过来**压过**通用的 "same lone worker" 措辞——复刻线上人数是从原片量出来
+#            的，通用规则那句默认值在这里就是错的。
+def observed_craft_directive(beat):
+    """这一拍从原片量到的制作字段的硬约束段。没有就返回空串。
+
+    数据由 apply_observed_craft_fields / bind_outline_to_ladder 钉在 beat['observed_craft']
+    上。此前这六件事**只**进过规划提示词（build_outline_plan_block 的 TOOL/SFX/LIGHT/
+    CREW/MATERIAL FLOW/SHOT 规则），写手一个字看不到，全靠规划器自愿把它们转述进
+    description 那一句散文——漏一条没有任何东西会响。"""
+    craft = observed_craft_of(beat)
+    if not craft:
+        return ""
+    lines = []
+    if craft.get('mat_specs'):
+        lines.append(
+            f"  · MATERIAL SPECS (measured off the film): {'; '.join(craft['mat_specs'])}. Write "
+            f"this material with THIS thickness, grade, section and surface — in the IMAGE and in "
+            f"the VIDEO. A bare noun in place of a measured spec brings back a generic version of "
+            f"this trade instead of this film's actual board, batt or membrane.")
+    if craft.get('fasteners'):
+        lines.append(
+            f"  · FASTENING (observed): {'; '.join(craft['fasteners'])}. This is how this beat's "
+            f"joints are actually made — name it, and keep the tool and the sound consistent with "
+            f"it. A screwed joint does not make a nail-gun crack.")
+    if craft.get('tool'):
+        _tool = craft['tool'] + (f" — {craft['tool_specifics']}" if craft.get('tool_specifics') else '')
+        lines.append(
+            f"  · TOOL (observed): {_tool}. This exact implement does this beat's work "
+            f"on camera — name it in the VIDEO, at this level of specificity. Never substitute a "
+            f"different tool for the same operation, and never let the work happen by itself.")
+    if craft.get('sfx'):
+        lines.append(
+            f"  · SOUND (observed on the reference film's own audio track): "
+            f"{'; '.join(craft['sfx'])}. These are this beat's sounds — write them into the VIDEO, "
+            f"bound to the moment the action lands. Add no music and no mood bed.")
+    if craft.get('micro'):
+        lines.append(
+            f"  · MICRO TRACES (observed): {'; '.join(craft['micro'])}. Fine marks this beat "
+            f"leaves — put them in the resulting IMAGE alongside its declared persistent traces. "
+            f"Unlike those, these are NOT required to survive into later beats.")
+    if craft.get('flow'):
+        lines.append(
+            f"  · MATERIAL FLOW (observed): {craft['flow']}. Show stock depleting and spoil "
+            f"accumulating exactly this way; the two stay in balance across the clip.")
+    if craft.get('light'):
+        lines.append(
+            f"  · LIGHT (observed): {craft['light']}. This is the light's character WITHIN the "
+            f"lighting phase this beat was already assigned — it qualifies that phase, it does not "
+            f"replace it. Where it disagrees with the LIGHTING PHASE CONTRACT, the phase contract "
+            f"wins and you carry over only the texture, direction and time-of-day feel.")
+    if craft.get('shot_scale') or craft.get('camera_move'):
+        shot = ' / '.join(x for x in (craft.get('shot_scale'), craft.get('camera_move')) if x)
+        lines.append(
+            f"  · SHOT (observed): {shot}. Reproduce that framing and that camera behaviour in "
+            f"THIS BEAT'S VIDEO. It does NOT override the resulting IMAGE's own camera "
+            f"declaration — the still frame keeps whatever its shot-family contract fixes. Do not "
+            f"upgrade a static beat into a sweeping move because the work looks dramatic, and do "
+            f"not push in on a beat filmed wide.")
+    if craft.get('crew'):
+        lines.append(
+            f"  · CREW (observed): {craft['crew']} worker(s) in frame this beat. Reproduce that "
+            f"count — this measured number SUPERSEDES any generic single-lone-worker phrasing "
+            f"elsewhere in these instructions. Their identity, costume and scale stay constant "
+            f"across the whole sequence; only the count is read off the film.")
+    if craft.get('macro_environment'):
+        lines.append(
+            f"  · MACRO ENV (observed): {'; '.join(craft['macro_environment'])}. This is the "
+            f"terrain, geology, climate and spatial envelope of the place ITSELF, never work "
+            f"anyone did to it. Keep it true in this beat's IMAGE.")
+    if not lines:
+        return ""
+    return ("- OBSERVED IN THE REFERENCE FILM FOR THIS BEAT (measured, not invented — these are "
+            "the nouns and numbers this job exists to reproduce):\n"
+            + '\n'.join(lines) + '\n')
+
+
 def outline_delivery_directive(beat):
     """卡片工序在提示词合成阶段的硬约束段。
 
-    没有 outline_items 时返回空串，整块契约的措辞就退回改造前的样子。有的时候，
-    它排在 VISIBLE MILESTONE CONTRACT 的**最前面**：用户是照着这几行中文挑的这条创意，
-    它比这拍自己的任何字段都更接近"必须交付什么"。英文复述给模型抄词用，中文原文
-    给它对齐语义用——两个都给，模型不必自己翻译一遍。"""
+    没有 outline_items 也没有观测制作字段时返回空串，整块契约的措辞就退回改造前的
+    样子。有的时候，它排在 VISIBLE MILESTONE CONTRACT 的**最前面**：用户是照着这几行
+    中文挑的这条创意，它比这拍自己的任何字段都更接近"必须交付什么"。英文复述给模型
+    抄词用，中文原文给它对齐语义用——两个都给，模型不必自己翻译一遍。
+
+    观测制作字段挂在同一段的末尾而不是另开一个调用点：这个函数已经是 Phase 2 两条
+    路径（批量的 _beat_block_text 与单拍的 base composer）唯一共用的入口，另开一个就
+    要在两条路径上各接一次，漏一条就是「主通路上靠运气」——这条线上已经栽过一次的
+    形状（见 _beat_block_text 里 insert_subject 那段注释）。"""
     items = beat_outline_items(beat)
+    craft_block = observed_craft_directive(beat)
     if not items:
-        return ""
+        return craft_block
     lines = []
     for item in items:
         delivery = str(item.get('delivery') or '').strip()
@@ -12165,7 +12373,7 @@ def outline_delivery_directive(beat):
     return ("- CARD WORK ITEM(S) THIS BEAT DELIVERS (hard requirement — the user chose this "
             "creative by reading exactly this list, so the IMAGE must visibly show "
             f"{plural} completed, by name):\n"
-            + '\n'.join(lines) + '\n')
+            + '\n'.join(lines) + '\n' + craft_block)
 
 
 def _milestone_beat_directive(beat, img_before="this beat's starting IMAGE",
@@ -14999,7 +15207,11 @@ def _outline_normalized_entries(outline):
                 # 「首拍与过门拍才发」的规则挑好了条目，归一化不认这个键，于是过门拍
                 # 那份新空间的地貌气候一个字都到不了规划器（首拍那份走的是文档级的
                 # initial_macro_environment，所以只有过门拍是哑的，不容易看出来）。
-                for key in ('sfx', 'macro_environment'):
+                # mat_specs / fasteners / micro（2026-08-24）：Pass A 逐帧量出来的
+                # 工程规格、紧固方式与微观痕迹。漏在这一道上不会报任何错——
+                # build_outline_plan_block 的 has_* 守卫查不到就整条规则不渲染，
+                # 于是「按原片规格复刻」静默退回按通用工艺想象。
+                for key in ('sfx', 'macro_environment', 'mat_specs', 'fasteners', 'micro'):
                     raw = entry.get(key)
                     items = ([str(x).strip() for x in raw if str(x).strip()]
                              if isinstance(raw, (list, tuple)) else [])
@@ -15016,7 +15228,8 @@ def _outline_normalized_entries(outline):
                 for key in ('space', 'zone', 'scope', 'trace', 'state_before', 'state_after',
                             'summary', 'operation_zh', 'headline_zh',
                             'shot_count', 'shot_seconds', 'insert', 'cast',
-                            'tool', 'shot_scale', 'camera_move', 'light', 'flow', 'crew'):
+                            'tool', 'tool_specifics',
+                            'shot_scale', 'camera_move', 'light', 'flow', 'crew'):
                     value = str(entry.get(key) or '').strip()
                     if key == 'scope':
                         value = value.lower()
@@ -15540,8 +15753,14 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
             rendered.append(f'     MACRO ENV: {"; ".join(entry["macro_environment"])}')
         if entry.get('mat'):
             rendered.append(f'     MATERIALS: {", ".join(entry["mat"])}')
+        if entry.get('mat_specs'):
+            rendered.append(f'     MAT SPECS: {", ".join(entry["mat_specs"])}')
+        if entry.get('fasteners'):
+            rendered.append(f'     FASTENING: {", ".join(entry["fasteners"])}')
         if entry.get('trace'):
             rendered.append(f'     LEAVES: {entry["trace"]}')
+        if entry.get('micro'):
+            rendered.append(f'     MICRO TRACES: {", ".join(entry["micro"])}')
         if entry.get('state_before'):
             rendered.append(f'     STATE BEFORE: {entry["state_before"]}')
         if entry.get('state_after'):
@@ -15555,7 +15774,8 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
         if multishot and entry.get('insert'):
             rendered.append(f'     INSERT: {entry["insert"]}')
         if entry.get('tool'):
-            rendered.append(f'     TOOL: {entry["tool"]}')
+            rendered.append(f'     TOOL: {entry["tool"]}'
+                            + (f' ({entry["tool_specifics"]})' if entry.get('tool_specifics') else ''))
         if entry.get('sfx'):
             rendered.append(f'     SFX: {", ".join(entry["sfx"])}')
         if entry.get('light'):
@@ -15583,11 +15803,15 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
     has_crew = any(e.get('crew') for e in plan)
     has_flow = any(e.get('flow') for e in plan)
     has_macro = any(e.get('macro_environment') for e in plan)
+    # 微观取证（2026-08-24）。三栏合成一个守卫：它们同源（Pass A 的逐帧取证）、
+    # 同一条规则说完，拆成三条守卫只会让规划提示词多出两段说同一件事的散文。
+    has_micro_forensics = any(e.get('mat_specs') or e.get('fasteners') or e.get('micro')
+                              for e in plan)
     observed_crossings = outline_space_crossings(plan)
     rich_block = ""
     if (has_scope or has_zone or has_trace or has_state or observed_crossings
             or has_shot or has_tool or has_sfx or has_light or has_crew or has_flow
-            or has_macro or has_insert or has_cast):
+            or has_macro or has_insert or has_cast or has_micro_forensics):
         rules = []
         if observed_crossings:
             # 观察到的过门位置。下面那段通用 THRESHOLD/CROSSING 规则说的是「挑一拍去
@@ -15677,12 +15901,30 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
                 "thing, named in the beat description in its own words. An entry with NO INSERT was "
                 "filmed as one uninterrupted shot; its insert falls back to that beat's own tool "
                 "contact and the traces it leaves, and you must not invent a cut-in subject for it.")
+        if has_micro_forensics:
+            rules.append(
+                "FORENSIC DETAIL: an entry's \"MAT SPECS\", \"FASTENING\" and \"MICRO TRACES\" were "
+                "measured off the reference film frame by frame — they are the difference between "
+                "reproducing THIS film's work and reproducing a generic version of the same trade. "
+                "MAT SPECS is the material's thickness, grade, section and surface: carry those "
+                "words into that beat's own materials wording, never round them off to a bare noun "
+                "(\"sheathing\" for \"9mm OSB, raw matte face\" throws away the only thing that made "
+                "it this film's board). FASTENING is how that beat's joints are actually made: name "
+                "it, and keep that beat's tool and sound consistent with it — a screwed joint does "
+                "not make a nail-gun crack. MICRO TRACES are the fine marks the work leaves; they "
+                "belong in that beat's own description alongside its persistent traces, and they "
+                "are NOT required to survive into later beats the way persistent traces are. Where "
+                "an entry gives none of the three, that beat had nothing readable in the frames — "
+                "invent nothing to fill the gap.")
         if has_tool:
             rules.append(
                 "TOOL: an entry's \"TOOL\" is the actual implement that delivers that beat's work "
                 "in the reference film. Name it in that beat's video prompt and let it do the work "
                 "on camera; never substitute a different tool for the same operation (a crane is "
-                "not a pair of hands) and never leave the work happening by itself.")
+                "not a pair of hands) and never leave the work happening by itself. Where the TOOL "
+                "carries a parenthesis, that is its observed type, drive and working bit — keep "
+                "that specificity in your wording rather than collapsing it back to the bare tool "
+                "name.")
         if has_sfx:
             rules.append(
                 "SFX: an entry's \"SFX\" are the physical sounds heard in the reference film at "
@@ -16307,6 +16549,21 @@ def bind_outline_to_ladder(config, outline, beat_ladder, violations=None):
                 if source.get(zh_key) and not beat.get(zh_key):
                     beat[zh_key] = source[zh_key]
         beat['outline_items'] = bound_items
+        # 制作字段的第二条入口。主通路是 apply_observed_craft_fields（按下标、
+        # 严格一比一时生效）；这里按**认领关系**再兜一次，覆盖两种它够不着的情形：
+        # 清单条数与梯子长度对不上，以及非严格模式下的合并认领。已经贴过就不动
+        # ——按下标那份是原片逐拍的原样，比按认领合并出来的更准。
+        if not observed_craft_of(beat):
+            merged = {}
+            for n in refs:
+                for key, value in _craft_from_outline_entry(entries[n - 1]).items():
+                    if isinstance(value, list):
+                        merged.setdefault(key, [])
+                        merged[key].extend(v for v in value if v not in merged[key])
+                    else:
+                        merged.setdefault(key, value)
+            if merged:
+                beat['observed_craft'] = merged
 
     if outline_requires_occupancy(outline):
         for beat in reversed(beat_ladder or []):

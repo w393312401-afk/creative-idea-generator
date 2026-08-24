@@ -1017,19 +1017,9 @@ function setupEventListeners() {
         });
     }
 
-    // 抽屉里那两个「清空已完成 / 清空失败」搬到了项目工作台工具栏；筛选与搜索
-    // 由 js/projects.js 的 chips 接管，不再需要这里的三个绑定。
-    const clearCompletedBtn = document.getElementById('projects-clear-completed-btn');
-    const clearNoCoverBtn = document.getElementById('projects-clear-nocover-btn');
-    const clearFailedBtn = document.getElementById('projects-clear-failed-btn');
-    if (clearCompletedBtn) {
-        clearCompletedBtn.addEventListener('click', () => clearTasks('completed'));
-    }
-    if (clearNoCoverBtn) {
-        clearNoCoverBtn.addEventListener('click', () => clearTasks('no_cover'));
-    }
-    if (clearFailedBtn) {
-        clearFailedBtn.addEventListener('click', () => clearTasks('failed_cancelled'));
+    const clearAllBtn = document.getElementById('projects-clear-all-btn');
+    if (clearAllBtn) {
+        clearAllBtn.addEventListener('click', () => clearTasks('all'));
     }
 
     // View Active Generation Progress
@@ -1562,7 +1552,10 @@ async function rerunCompletedTask(taskId, dimensions, event) {
 async function clearTasks(statusGroup) {
     let countHint = "";
     if (typeof projectsRows !== 'undefined' && Array.isArray(projectsRows)) {
-        if (statusGroup === "completed") {
+        if (statusGroup === "all") {
+            const n = projectsRows.length;
+            if (n > 0) countHint = `（共检测到约 ${n} 个项目）`;
+        } else if (statusGroup === "completed") {
             const n = projectsRows.filter(p => (p.task || {}).status === 'completed' || p.state === 'completed').length;
             if (n > 0) countHint = `（检测到约 ${n} 条）`;
         } else if (statusGroup === "failed_cancelled") {
@@ -1575,7 +1568,9 @@ async function clearTasks(statusGroup) {
     }
 
     let msg = "";
-    if (statusGroup === "completed") {
+    if (statusGroup === "all") {
+        msg = `⚠️ 确定要彻底清空所有项目及本地所有媒体文件吗${countHint}？\n（将清除所有点子库项目、任务记录，并彻底删除 outputs/ 目录下的所有已生成图片与成片视频，不可恢复）`;
+    } else if (statusGroup === "completed") {
         msg = `确定要清空所有【已完成】的任务记录吗${countHint}？（仅清理历史记录，不影响已收藏的创意与磁盘素材）`;
     } else if (statusGroup === "failed_cancelled") {
         msg = `确定要清空所有【已失败】和【已取消】的任务记录吗${countHint}？`;
@@ -1596,16 +1591,16 @@ async function clearTasks(statusGroup) {
             const data = await response.json();
             const libCount = data.deleted_library_count || 0;
             let toastMsg = `清空成功，共删除 ${data.count} 项`;
-            if (libCount > 0) {
+            if (statusGroup === "all") {
+                toastMsg = `彻底清空成功，已清理 ${data.count} 项及全部本地媒体文件`;
+            } else if (libCount > 0) {
                 toastMsg = `清空成功，共删除 ${data.count} 项（含 ${libCount} 个已收藏创意）`;
             }
             showToast(toastMsg, "success");
 
-            // 同步清理已收藏条目的前端缓存与持久化
-            if (Array.isArray(data.deleted_library_ids) && data.deleted_library_ids.length > 0) {
-                const deletedSet = new Set(data.deleted_library_ids);
-                if (typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
-                    savedIdeas = savedIdeas.filter(item => !deletedSet.has(item.id));
+            if (statusGroup === "all") {
+                if (typeof savedIdeas !== 'undefined') {
+                    savedIdeas = [];
                     try {
                         localStorage.setItem('spark_library', JSON.stringify(savedIdeas));
                     } catch (e) {
@@ -1615,35 +1610,73 @@ async function clearTasks(statusGroup) {
                 if (typeof updateFavoriteButtonState === 'function') {
                     updateFavoriteButtonState();
                 }
-            }
-            
-            // If the currently viewed task was deleted, reset the active task ID
-            const activeTaskId = localStorage.getItem('spark_active_task_id');
-            if (activeTaskId) {
-                const listRes = await fetch('/api/tasks');
-                if (listRes.ok) {
-                    const resData = await listRes.json();
-                    const tasks = Array.isArray(resData) ? resData : (resData.tasks || []);
-                    const remains = tasks.some(t => t.id === activeTaskId);
-                    if (!remains) {
-                        localStorage.removeItem('spark_active_task_id');
-                        localStorage.removeItem('spark_active_task_dimensions');
-                        if (currentGenerationController) {
-                            currentGenerationController.abort();
-                            currentGenerationController = null;
+                localStorage.removeItem('spark_active_task_id');
+                localStorage.removeItem('spark_active_task_dimensions');
+                if (currentGenerationController) {
+                    currentGenerationController.abort();
+                    currentGenerationController = null;
+                }
+                generationState.status = 'idle';
+                const placeholderView = document.getElementById('output-placeholder-view');
+                const loadingView = document.getElementById('output-loading-view');
+                const contentView = document.getElementById('output-content-view');
+                if (loadingView) loadingView.classList.remove('active');
+                if (placeholderView) placeholderView.classList.add('active');
+                if (contentView) contentView.classList.remove('active');
+                updateActiveGenerationBanner();
+                const genBtn = document.getElementById('generate-btn');
+                if (genBtn) {
+                    genBtn.disabled = false;
+                    genBtn.classList.remove('loading');
+                }
+                if (typeof loadGallery === 'function') {
+                    try { loadGallery(); } catch (e) {}
+                }
+            } else {
+                // 同步清理已收藏条目的前端缓存与持久化
+                if (Array.isArray(data.deleted_library_ids) && data.deleted_library_ids.length > 0) {
+                    const deletedSet = new Set(data.deleted_library_ids);
+                    if (typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
+                        savedIdeas = savedIdeas.filter(item => !deletedSet.has(item.id));
+                        try {
+                            localStorage.setItem('spark_library', JSON.stringify(savedIdeas));
+                        } catch (e) {
+                            console.warn('[library] localStorage 镜像写入失败', e);
                         }
-                        generationState.status = 'idle';
-                        const placeholderView = document.getElementById('output-placeholder-view');
-                        const loadingView = document.getElementById('output-loading-view');
-                        const contentView = document.getElementById('output-content-view');
-                        if (loadingView) loadingView.classList.remove('active');
-                        if (placeholderView) placeholderView.classList.add('active');
-                        if (contentView) contentView.classList.remove('active');
-                        updateActiveGenerationBanner();
-                        const genBtn = document.getElementById('generate-btn');
-                        if (genBtn) {
-                            genBtn.disabled = false;
-                            genBtn.classList.remove('loading');
+                    }
+                    if (typeof updateFavoriteButtonState === 'function') {
+                        updateFavoriteButtonState();
+                    }
+                }
+                
+                // If the currently viewed task was deleted, reset the active task ID
+                const activeTaskId = localStorage.getItem('spark_active_task_id');
+                if (activeTaskId) {
+                    const listRes = await fetch('/api/tasks');
+                    if (listRes.ok) {
+                        const resData = await listRes.json();
+                        const tasks = Array.isArray(resData) ? resData : (resData.tasks || []);
+                        const remains = tasks.some(t => t.id === activeTaskId);
+                        if (!remains) {
+                            localStorage.removeItem('spark_active_task_id');
+                            localStorage.removeItem('spark_active_task_dimensions');
+                            if (currentGenerationController) {
+                                currentGenerationController.abort();
+                                currentGenerationController = null;
+                            }
+                            generationState.status = 'idle';
+                            const placeholderView = document.getElementById('output-placeholder-view');
+                            const loadingView = document.getElementById('output-loading-view');
+                            const contentView = document.getElementById('output-content-view');
+                            if (loadingView) loadingView.classList.remove('active');
+                            if (placeholderView) placeholderView.classList.add('active');
+                            if (contentView) contentView.classList.remove('active');
+                            updateActiveGenerationBanner();
+                            const genBtn = document.getElementById('generate-btn');
+                            if (genBtn) {
+                                genBtn.disabled = false;
+                                genBtn.classList.remove('loading');
+                            }
                         }
                     }
                 }
@@ -1925,6 +1958,13 @@ async function streamProgress(taskId, dimensions) {
         contentView.classList.add('active');
         
         showToast("提示词集合合成成功！已开始在后台制作封面图。", "success");
+        if (typeof NotificationCenter !== 'undefined') {
+            NotificationCenter.notify({
+                type: 'success',
+                title: '提示词集合合成成功',
+                message: result.english_title || '创意母案与镜头提示词已就绪，已开始制作封面图'
+            });
+        }
         // Background asynchronous cover generation
         generateCover();
 
@@ -1966,6 +2006,13 @@ async function streamProgress(taskId, dimensions) {
                 errMsgEl.textContent = errorMsg;
             }
             showToast(errorMsg, "error");
+            if (typeof NotificationCenter !== 'undefined') {
+                NotificationCenter.notify({
+                    type: 'error',
+                    title: '提示词合成失败',
+                    message: errorMsg
+                });
+            }
         }
     } finally {
         if (isCurrent()) {
@@ -2266,7 +2313,10 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
 
     if (isViewing()) {
         btn.disabled = true;
+        const selBtn = document.getElementById('generate-frames-selection-btn');
+        if (selBtn) selBtn.disabled = true;
         progress.style.display = 'flex';
+        if (typeof setFrameGridButtonsBusy === 'function') setFrameGridButtonsBusy(true);
     }
     setMeta('连接帧生成事件流...');
 
@@ -2453,6 +2503,13 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                 framesFeedLine(ownerId, `🛑 帧序列已暂停：第 ${haltedBeat} 拍检出结构级问题，已渲 ${doneCount} 帧`, 'err');
                 setMeta(`帧序列已暂停在第 ${haltedBeat} 拍（已渲 ${doneCount} 帧）`);
                 showToast(`${titleTag()}帧序列在第 ${haltedBeat} 拍检出结构级问题已暂停，请修复该帧后续渲。`, 'warning');
+                if (typeof NotificationCenter !== 'undefined') {
+                    NotificationCenter.notify({
+                        type: 'warning',
+                        title: '帧序列已暂停',
+                        message: `第 ${haltedBeat} 拍检出结构级问题，已暂停等待修复`
+                    });
+                }
                 return;
             }
             framesFeedLine(ownerId, `🏁 帧序列全部完成，共 ${(watch.result.frames || []).length} 帧`, 'ok');
@@ -2463,6 +2520,13 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                 showToast(`${titleTag()}帧序列完成，但检测到质量风险，详见帧序列动态流。`, 'warning');
             } else {
                 showToast(`${titleTag()}已成功生成 ${(watch.result.frames || []).length} 帧连续帧序列图。`, "success");
+            }
+            if (typeof NotificationCenter !== 'undefined') {
+                NotificationCenter.notify({
+                    type: 'success',
+                    title: '帧序列生成完成',
+                    message: `${(watch.result.frames || []).length} 帧连续关键帧图已渲染完成！`
+                });
             }
         }
     } catch (e) {
@@ -2476,6 +2540,13 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
             setMeta(`帧序列生成失败: ${e.message}`);
             framesFeedLine(ownerId, `❌ 帧序列生成失败：${e.message}`, 'err');
             showToast(`${titleTag()}帧序列生成失败: ${e.message}`, "error");
+            if (typeof NotificationCenter !== 'undefined') {
+                NotificationCenter.notify({
+                    type: 'error',
+                    title: '帧序列生成失败',
+                    message: e.message || '生图任务发生异常中断'
+                });
+            }
         }
 
         if (isViewing()) renderFramesForIdea(ownerIdea);
@@ -2491,6 +2562,8 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                 if (isViewing()) {
                     progress.style.display = 'none';
                     btn.disabled = false;
+                    const selBtn = document.getElementById('generate-frames-selection-btn');
+                    if (selBtn) selBtn.disabled = false;
                     // 必须在 endIdeaTask 之后再重渲一次：renderFramesForIdea 的
                     // isFramePending 读的就是这条任务登记，catch/成功分支里那次重渲
                     // 发生在登记还在的时候，没轮到的槽位会继续画成「等待中」并一直
@@ -2683,6 +2756,13 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
             } else {
                 showToast(`${titleTag()}已成功生成 ${(watch.result.videos || []).length} 段连续视频。`, "success");
             }
+            if (typeof NotificationCenter !== 'undefined') {
+                NotificationCenter.notify({
+                    type: 'success',
+                    title: '视频序列生成完成',
+                    message: `已成功生成 ${(watch.result.videos || []).length} 段连续视频片段！`
+                });
+            }
         }
     } catch (e) {
         if (!isCurrent()) return;
@@ -2699,6 +2779,13 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
 
             await reloadManifestIntoIdea(ownerIdea);
             if (isViewing() && ownerIdea.frameRun) renderVideosForIdea(ownerIdea);
+            if (typeof NotificationCenter !== 'undefined') {
+                NotificationCenter.notify({
+                    type: 'error',
+                    title: '视频序列生成失败',
+                    message: e.message || '视频渲染任务发生异常中断'
+                });
+            }
         }
     } finally {
         if (isCurrent()) {
@@ -3796,8 +3883,24 @@ async function openCandidateSelectionModal(seq, frameData) {
     const gridEl = document.getElementById('candidates-modal-grid') || document.getElementById('candidate-cards-grid');
 
     const padSeq = String(seqNum || 1).padStart(3, '0');
+    let candidates = (frameData && Array.isArray(frameData.candidates)) ? frameData.candidates : [];
+    if (!candidates.length && frameData && (frameData.url || frameData.file)) {
+        candidates = [{
+            index: 1,
+            url: frameData.url || frameData.file,
+            score: 85,
+            strengths: '基础主帧画面',
+            defects: '',
+            is_chosen: true
+        }];
+    }
+
     if (seqEl) seqEl.textContent = `IMG ${padSeq}`;
-    if (titleEl) titleEl.textContent = `🎯 IMG ${padSeq} · 4选1 候选图对比与 AI 鉴别详情`;
+    if (titleEl) {
+        titleEl.textContent = candidates.length > 4
+            ? `🎯 IMG ${padSeq} · 候选图池 (${candidates.length}张) 对比与 AI 鉴别详情`
+            : `🎯 IMG ${padSeq} · 4选1 候选图对比与 AI 鉴别详情`;
+    }
 
     const aiEval = (frameData && frameData.ai_evaluation) || {};
     const chosenIdx = (frameData && frameData.chosen_candidate_index) || 1;
@@ -3807,76 +3910,149 @@ async function openCandidateSelectionModal(seq, frameData) {
     }
 
     if (reasonEl) {
-        const reasonText = aiEval.selection_reason || (frameData && frameData.candidate_selection_reason) || (frameData && frameData.vlm_qa_reason) || 'AI 4选1 智能鉴别优选完成';
+        const reasonText = aiEval.selection_reason || (frameData && frameData.candidate_selection_reason) || (frameData && frameData.vlm_qa_reason) || 'AI 智能鉴别优选完成';
         const bestIdx = aiEval.best_index || chosenIdx;
         reasonEl.innerHTML = `${escapeHtml(reasonText)} <span style="margin-left:8px; padding:2px 8px; border-radius:10px; background:rgba(16,185,129,0.2); color:#10b981; font-weight:600;">推荐采用: 候选 #${bestIdx}</span>`;
     }
 
-    if (gridEl) {
-        gridEl.innerHTML = '';
-        let candidates = (frameData && Array.isArray(frameData.candidates)) ? frameData.candidates : [];
+    const filterBarEl = document.getElementById('candidate-model-filter-bar');
 
-        if (!candidates.length && frameData && (frameData.url || frameData.file)) {
-            candidates = [{
-                index: 1,
-                url: frameData.url || frameData.file,
-                score: 85,
-                strengths: '基础主帧画面',
-                defects: '',
-                is_chosen: true
-            }];
+    function getCandidateModelInfo(cand) {
+        const m = ((cand && cand.model) || '').toLowerCase();
+        const disp = (cand && cand.model_display) || '';
+        const uuid = (cand && cand.fx_uuid) || '';
+        const fUrl = ((cand && (cand.url || cand.file)) || '').toLowerCase();
+
+        if (m.includes('gpt') || disp.includes('GPT') || fUrl.includes('gpt')) {
+            return { key: 'gpt', label: 'GPT-2', icon: '🟣', color: '#c084fc', bg: 'rgba(168,85,247,0.22)', border: 'rgba(192,132,252,0.45)' };
+        }
+        if (m.includes('google_fx') || m.includes('fx') || disp.includes('FX') || uuid || fUrl.includes('fx_batch')) {
+            return { key: 'fx', label: 'Google FX', icon: '🔵', color: '#38bdf8', bg: 'rgba(56,189,248,0.22)', border: 'rgba(56,189,248,0.45)' };
+        }
+        if (m.includes('gemini') || disp.includes('Gemini')) {
+            return { key: 'gemini', label: 'Gemini', icon: '🟢', color: '#34d399', bg: 'rgba(16,185,129,0.22)', border: 'rgba(52,211,153,0.45)' };
+        }
+        return { key: 'other', label: disp || '标准/通用', icon: '⚪', color: '#94a3b8', bg: 'rgba(148,163,184,0.18)', border: 'rgba(148,163,184,0.35)' };
+    }
+
+    let activeModelFilter = 'all';
+
+    function renderCandidateCards(filterKey = 'all') {
+        if (!gridEl) return;
+        gridEl.innerHTML = '';
+
+        const filtered = (filterKey === 'all')
+            ? candidates
+            : candidates.filter(c => getCandidateModelInfo(c).key === filterKey);
+
+        if (!filtered.length) {
+            gridEl.innerHTML = `<div style="grid-column:1/-1; text-align:center; padding:36px 20px; color:var(--text-muted);">
+                <div style="font-size:32px; margin-bottom:10px;">🔍</div>
+                <div style="font-weight:600; font-size:14px; color:var(--text-primary); margin-bottom:6px;">该模型分类下暂无候选图</div>
+                <div style="font-size:12px;">点击「全部」可查看该帧的所有历史候选图。</div>
+            </div>`;
+            return;
         }
 
-        if (!candidates.length) {
-            gridEl.innerHTML = `<div style="grid-column:1/-1; text-align:center; padding:36px 20px; color:var(--text-muted);">
-                <div style="font-size:32px; margin-bottom:10px;">🖼️</div>
-                <div style="font-weight:600; font-size:14px; color:var(--text-primary); margin-bottom:6px;">暂无该帧的 4 选 1 候选图记录</div>
-                <div style="font-size:12px;">请确保已开启「4选1 智能模式」并重新生成该帧。</div>
-            </div>`;
-        } else {
-            candidates.forEach(cand => {
-                const cIdx = cand.index || 1;
-                const isChosen = Number(cIdx) === Number(chosenIdx);
-                const score = cand.score != null ? cand.score : '--';
-                const strengths = cand.strengths || '';
-                const defects = cand.defects || '';
-                let fileUrl = cand.url || cand.file || '';
-                if (fileUrl && !fileUrl.startsWith('/') && !fileUrl.startsWith('http') && !fileUrl.startsWith('data:')) {
-                    fileUrl = '/' + fileUrl;
-                }
+        filtered.forEach(cand => {
+            const cIdx = cand.index || 1;
+            const isChosen = Number(cIdx) === Number(chosenIdx);
+            const score = cand.score != null ? cand.score : '--';
+            const strengths = cand.strengths || '';
+            const defects = cand.defects || '';
+            const mInfo = getCandidateModelInfo(cand);
+            let fileUrl = cand.url || cand.file || '';
+            if (fileUrl && !fileUrl.startsWith('/') && !fileUrl.startsWith('http') && !fileUrl.startsWith('data:')) {
+                fileUrl = '/' + fileUrl;
+            }
 
-                const card = document.createElement('div');
-                card.className = `candidate-card ${isChosen ? 'chosen' : ''}`;
+            const card = document.createElement('div');
+            card.className = `candidate-card ${isChosen ? 'chosen' : ''}`;
 
-                card.innerHTML = `
-                    <div class="candidate-thumb-wrap" style="position:relative; aspect-ratio: 9/16; background:#0f172a; overflow:hidden; cursor:pointer;" title="点击查看大图" onclick="if(window.openLightbox) openLightbox('${escapeHtml(fileUrl)}')">
-                        <img src="${escapeHtml(fileUrl)}" alt="Candidate #${cIdx}" style="width:100%; height:100%; object-fit:cover;" onerror="this.onerror=null; this.src='${escapeHtml(fileUrl)}';" />
-                        <div style="position:absolute; top:8px; left:8px; background:rgba(0,0,0,0.75); backdrop-filter:blur(4px); color:#fff; font-size:11px; padding:3px 7px; border-radius:4px; font-weight:bold;">
-                            #${cIdx}
-                        </div>
-                        <div style="position:absolute; top:8px; right:8px; background:${isChosen ? '#10b981' : 'rgba(0,0,0,0.65)'}; backdrop-filter:blur(4px); color:#fff; font-size:11px; padding:3px 7px; border-radius:4px; font-weight:bold;">
-                            ${score} 分
-                        </div>
-                        ${isChosen ? '<div style="position:absolute; bottom:8px; left:8px; right:8px; background:linear-gradient(135deg, #10b981, #059669); color:#fff; font-size:11px; text-align:center; padding:3px 6px; border-radius:4px; font-weight:bold; box-shadow:0 2px 6px rgba(0,0,0,0.3);">👑 当前采用</div>' : ''}
+            card.innerHTML = `
+                <div class="candidate-thumb-wrap" style="position:relative; aspect-ratio: 9/16; background:#0f172a; overflow:hidden; cursor:pointer;" title="点击查看大图" onclick="if(window.openLightbox) openLightbox('${escapeHtml(fileUrl)}')">
+                    <img src="${escapeHtml(fileUrl)}" alt="Candidate #${cIdx}" style="width:100%; height:100%; object-fit:cover;" onerror="this.onerror=null; this.src='${escapeHtml(fileUrl)}';" />
+                    <div style="position:absolute; top:8px; left:8px; background:rgba(0,0,0,0.8); backdrop-filter:blur(4px); color:#fff; font-size:11px; padding:3px 7px; border-radius:4px; font-weight:bold;">
+                        #${cIdx}
                     </div>
-                    <div style="padding:12px; font-size:12px; flex:1; display:flex; flex-direction:column; justify-content:space-between; gap:8px;">
-                        <div style="color:var(--text-muted, #94a3b8); line-height:1.45; font-size:11.5px;">
-                            ${strengths ? `<div style="color:#10b981; margin-bottom:4px;"><strong>+</strong> ${escapeHtml(strengths)}</div>` : ''}
-                            ${defects ? `<div style="color:#f87171;"><strong>-</strong> ${escapeHtml(defects)}</div>` : ''}
-                            ${!strengths && !defects ? `<div style="color:var(--text-secondary);">候选图 #${cIdx}（评分: ${score}）</div>` : ''}
-                        </div>
-                        <div style="margin-top:auto;">
-                            ${isChosen 
-                                ? `<button type="button" class="action-btn text-btn mini-btn" style="width:100%; border-color:#10b981; color:#10b981; background:rgba(16,185,129,0.1); cursor:default; font-weight:600;" disabled>✅ 当前已采用</button>`
-                                : `<button type="button" class="action-btn text-btn mini-btn" style="width:100%; color:var(--accent-orange, #f59e0b); border-color:rgba(245,158,11,0.5); font-weight:600;" onclick="switchCandidateForFrame(${seqNum}, ${cIdx})">👉 设为采用此图</button>`
-                            }
-                        </div>
+                    <div style="position:absolute; top:8px; left:48px; background:${mInfo.bg}; border:1px solid ${mInfo.border}; color:${mInfo.color}; font-size:10.5px; padding:2px 7px; border-radius:4px; font-weight:700; backdrop-filter:blur(4px); display:flex; align-items:center; gap:3px;">
+                        <span>${mInfo.icon}</span><span>${escapeHtml(mInfo.label)}</span>
                     </div>
-                `;
-                gridEl.appendChild(card);
+                    <div style="position:absolute; top:8px; right:8px; background:${isChosen ? '#10b981' : 'rgba(0,0,0,0.65)'}; backdrop-filter:blur(4px); color:#fff; font-size:11px; padding:3px 7px; border-radius:4px; font-weight:bold;">
+                        ${score} 分
+                    </div>
+                    ${isChosen ? '<div style="position:absolute; bottom:8px; left:8px; right:8px; background:linear-gradient(135deg, #10b981, #059669); color:#fff; font-size:11px; text-align:center; padding:3px 6px; border-radius:4px; font-weight:bold; box-shadow:0 2px 6px rgba(0,0,0,0.3);">👑 当前采用</div>' : ''}
+                </div>
+                <div style="padding:12px; font-size:12px; flex:1; display:flex; flex-direction:column; justify-content:space-between; gap:8px;">
+                    <div style="color:var(--text-muted, #94a3b8); line-height:1.45; font-size:11.5px;">
+                        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">
+                            <span style="font-weight:600; color:${mInfo.color}; font-size:11px;">${mInfo.icon} ${escapeHtml(mInfo.label)} 模型生成</span>
+                        </div>
+                        ${strengths ? `<div style="color:#10b981; margin-bottom:4px;"><strong>+</strong> ${escapeHtml(strengths)}</div>` : ''}
+                        ${defects ? `<div style="color:#f87171;"><strong>-</strong> ${escapeHtml(defects)}</div>` : ''}
+                        ${!strengths && !defects ? `<div style="color:var(--text-secondary);">候选图 #${cIdx}（评分: ${score}）</div>` : ''}
+                    </div>
+                    <div style="margin-top:auto;">
+                        ${isChosen 
+                            ? `<button type="button" class="action-btn text-btn mini-btn" style="width:100%; border-color:#10b981; color:#10b981; background:rgba(16,185,129,0.1); cursor:default; font-weight:600;" disabled>✅ 当前已采用</button>`
+                            : `<button type="button" class="action-btn text-btn mini-btn" style="width:100%; color:var(--accent-orange, #f59e0b); border-color:rgba(245,158,11,0.5); font-weight:600;" onclick="switchCandidateForFrame(${seqNum}, ${cIdx})">👉 设为采用此图</button>`
+                        }
+                    </div>
+                </div>
+            `;
+            gridEl.appendChild(card);
+        });
+    }
+
+    // Render model filter tabs
+    if (filterBarEl) {
+        filterBarEl.innerHTML = '';
+        if (candidates.length > 1) {
+            const counts = { all: candidates.length, gpt: 0, fx: 0, gemini: 0, other: 0 };
+            candidates.forEach(c => {
+                const k = getCandidateModelInfo(c).key;
+                if (counts[k] != null) counts[k]++;
             });
+
+            const filterTabs = [
+                { key: 'all', label: `🏷️ 全部 (${counts.all})`, color: 'var(--text-primary)' },
+                ...(counts.gpt > 0 ? [{ key: 'gpt', label: `🟣 GPT-2 (${counts.gpt})`, color: '#c084fc' }] : []),
+                ...(counts.fx > 0 ? [{ key: 'fx', label: `🔵 Google FX (${counts.fx})`, color: '#38bdf8' }] : []),
+                ...(counts.gemini > 0 ? [{ key: 'gemini', label: `🟢 Gemini (${counts.gemini})`, color: '#34d399' }] : []),
+                ...(counts.other > 0 ? [{ key: 'other', label: `⚪ 通用 (${counts.other})`, color: '#94a3b8' }] : []),
+            ];
+
+            if (filterTabs.length > 2) {
+                filterBarEl.style.display = 'flex';
+                filterTabs.forEach(tab => {
+                    const btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.className = `model-filter-btn ${activeModelFilter === tab.key ? 'active' : ''}`;
+                    btn.style.cssText = `padding: 4px 12px; border-radius: 16px; font-size: 12px; font-weight: 600; cursor: pointer; border: 1px solid ${activeModelFilter === tab.key ? tab.color : 'rgba(255,255,255,0.12)'}; background: ${activeModelFilter === tab.key ? 'rgba(255,255,255,0.1)' : 'transparent'}; color: ${activeModelFilter === tab.key ? tab.color : 'var(--text-secondary)'}; transition: all 0.2s ease;`;
+                    btn.textContent = tab.label;
+                    btn.onclick = () => {
+                        activeModelFilter = tab.key;
+                        filterBarEl.querySelectorAll('button').forEach(b => {
+                            b.style.background = 'transparent';
+                            b.style.borderColor = 'rgba(255,255,255,0.12)';
+                            b.style.color = 'var(--text-secondary)';
+                        });
+                        btn.style.background = 'rgba(255,255,255,0.1)';
+                        btn.style.borderColor = tab.color;
+                        btn.style.color = tab.color;
+                        renderCandidateCards(activeModelFilter);
+                    };
+                    filterBarEl.appendChild(btn);
+                });
+            } else {
+                filterBarEl.style.display = 'none';
+            }
+        } else {
+            filterBarEl.style.display = 'none';
         }
     }
+
+    renderCandidateCards('all');
 
     modal.style.display = 'flex';
     modal.classList.add('active');
