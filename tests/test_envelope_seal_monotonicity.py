@@ -345,8 +345,10 @@ class TestEnvelopeContractText(unittest.TestCase):
         contract = self._contract(ladder, 3)
         self.assertTrue(contract['is_first_interior_reveal'])
         text = contract['anchor_rule'] + contract['family_contract']
-        self.assertIn('SCOPE OF', contract['anchor_rule'])
+        self.assertIn('CONTINUITY, NOT A RESET', contract['anchor_rule'])
         self.assertIn('reset the CAMERA, not the', contract['anchor_rule'])
+        # 2026-08-24：门后必须是废墟的那一半已删，剩下的只有防倒退。
+        self.assertNotIn('at least three', contract['anchor_rule'].lower())
         # 已封构件从里面看必须仍是封的，但内表面允许毛坯。
         self.assertIn('already CLOSED', contract['anchor_rule'])
         self.assertIn('unfinished never means still open', text.lower())
@@ -364,7 +366,7 @@ class TestEnvelopeContractText(unittest.TestCase):
         ladder = _ladder_with_roof_sealed_before_cut()
         contract = self._contract(ladder, 5)
         self.assertFalse(contract['is_first_interior_reveal'])
-        self.assertNotIn('SCOPE OF', contract['anchor_rule'])
+        self.assertNotIn('CONTINUITY, NOT A RESET', contract['anchor_rule'])
 
     def test_batch_system_prompt_carries_the_shared_rule(self):
         prompt = pp._batch_shared_system_prompt(self.PACKET, '', '')

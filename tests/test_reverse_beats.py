@@ -761,8 +761,28 @@ class TestJsonReplyParsing(unittest.TestCase):
 
     def test_a_merely_malformed_reply_is_not_called_truncation(self):
         with self.assertRaises(ValueError) as ctx:
-            reverse.parse_json_reply('{"a": 1 "b": 2}')
+            reverse.parse_json_reply('{"a": !!! invalid @#$}')
         self.assertNotIsInstance(ctx.exception, reverse.TruncatedReply)
+
+    def test_missing_commas_between_properties_and_arrays_are_repaired(self):
+        self.assertEqual(reverse.parse_json_reply('{"a": 1\n "b": 2}'), {'a': 1, 'b': 2})
+        self.assertEqual(reverse.parse_json_reply('{"a": "hello"\n "b": "world"}'), {'a': 'hello', 'b': 'world'})
+        self.assertEqual(reverse.parse_json_reply('["one"\n "two"\n "three"]'), ['one', 'two', 'three'])
+        self.assertEqual(reverse.parse_json_reply('[{"id": 1}\n {"id": 2}]'), [{'id': 1}, {'id': 2}])
+
+    def test_rogue_closing_brackets_and_braces_are_repaired(self):
+        raw = '{"tool": "hand", "tool_specs": "manual grasping"\n ],\n "sfx": ["tap"]}'
+        out = reverse.parse_json_reply(raw)
+        self.assertEqual(out['tool_specs'], 'manual grasping')
+        self.assertEqual(out['sfx'], ['tap'])
+
+    def test_thinking_tags_and_comments_are_stripped(self):
+        raw = '<think>I need to format as JSON</think>\n// comment\n{"a": 1, /* block */ "b": 2}'
+        self.assertEqual(reverse.parse_json_reply(raw), {'a': 1, 'b': 2})
+
+    def test_python_literals_are_repaired(self):
+        self.assertEqual(reverse.parse_json_reply('{"a": True, "b": False, "c": None}'),
+                         {'a': True, 'b': False, 'c': None})
 
     def test_pass_b_caps_the_evidence_frame_list(self):
         """每拍固定三张证据帧（Triad: Start / Peak / End）。"""
@@ -1787,6 +1807,90 @@ class TestSceneConstants(unittest.TestCase):
         dims = reverse.beats_to_dimensions(doc)
         self.assertEqual(dims['scene_constants'], {'materials': ['mossy concrete wall']})
         self.assertEqual(dims['scene_signature'], 'A mossy concrete bunker in autumn woodland.')
+
+    # ── 全局人物识别项（2026-08-24）───────────────────────────────────────
+    #
+    # 与「常驻材质」同一条道理，但失效方式更刺眼：每一帧都是独立生成的，外形不写进
+    # 提示词就会被重新掷一次骰子——同一条片子里换人种、换肤色、换发型。
+
+    def _cast_facts(self, n=20, hit=None):
+        """前 hit 帧里有人，其余是空场。"""
+        hit = n if hit is None else hit
+        out = []
+        for i in range(n):
+            out.append({
+                'frame': f'review_{i:03d}.png', 'timestamp': float(i),
+                'materials': ['mossy concrete wall'], 'tools': [], 'traces': [],
+                'workers_present': i < hit,
+                'cast_appearance': (
+                    ['light-brown-skinned South Asian man, short black hair, '
+                     'faded red long-sleeve tee, dark blue jeans, brown leather boots']
+                    if i < hit else []),
+            })
+        return out
+
+    def test_a_person_in_most_frames_becomes_the_cast_constant(self):
+        c = reverse.analyze_scene_constants(self._cast_facts())
+        self.assertTrue(c.get('cast'))
+        joined = ' '.join(c['cast'])
+        self.assertIn('South Asian', joined)      # 人种/肤色是「同一个人」的判据
+        self.assertIn('red long-sleeve tee', joined)
+
+    def test_a_walk_on_in_two_frames_is_not_a_cast_constant(self):
+        c = reverse.analyze_scene_constants(self._cast_facts(n=20, hit=2))
+        self.assertFalse(c.get('cast'))
+
+    def test_pass_b_cast_identity_wins_over_the_local_statistic(self):
+        """两个来源并存、模型那份优先：统计只挑得出单帧读数的碎片，Pass B 看的是整段
+        帧序列，写得出「全片同一个人」这句话。"""
+        doc = {'beats': [], 'cast_identity': [
+            'the lone builder: light-brown-skinned South Asian man, early thirties, short black '
+            'hair, faded red tee, dark blue jeans, brown boots, no hardhat and no hi-vis vest']}
+        reverse.attach_scene_constants(doc, self._cast_facts())
+        self.assertEqual(len(doc['scene_constants']['cast']), 1)
+        self.assertIn('no hardhat', doc['scene_constants']['cast'][0])
+
+    def test_cast_reaches_the_prompt_lines_and_says_never_re_cast(self):
+        lines = reverse.scene_constants_lines({'cast': ['the lone builder: …red tee…']}, '')
+        self.assertTrue(any('never re-cast' in x for x in lines))
+
+    def test_cast_folds_into_worker_attire_as_a_fallback(self):
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [],
+               'scene_constants': {'cast': ['the lone builder: red tee, blue jeans, brown boots']},
+               'beats': [_beat('B01', 0.0, 10.0)]}
+        dims = reverse.beats_to_dimensions(doc)
+        self.assertEqual(dims['scene_constants']['cast'],
+                         ['the lone builder: red tee, blue jeans, brown boots'])
+        self.assertIn('red tee', dims['worker_attire'])
+
+    def test_an_explicit_worker_attire_is_never_overwritten_by_cast(self):
+        doc = {'video_duration_sec': 10.0, 'banned_elements': [],
+               'worker_attire': 'one lone craftsman in a grey work t-shirt',
+               'scene_constants': {'cast': ['the lone builder: red tee']},
+               'beats': [_beat('B01', 0.0, 10.0)]}
+        self.assertEqual(reverse.beats_to_dimensions(doc)['worker_attire'],
+                         'one lone craftsman in a grey work t-shirt')
+
+    def test_a_variant_keeps_the_cast_but_drops_the_rest_of_the_constants(self):
+        """四条变异轴没有一条动到出镜的人：换载体换环境，母本的青苔污渍不成立了，
+        那个穿红T恤的人还是同一个人。清空人物栏 = 让变体每一帧重新掷骰子。"""
+        from prompt_pipeline.mutate import generate_orthogonal_variant
+        baseline = {
+            'pipeline_id': 'job_base', 'video_duration_sec': 30.0,
+            'scene_constants': {'materials': ['mossy concrete wall'],
+                                'cast': ['the lone builder: red tee, blue jeans']},
+            'beats': [_beat('B01', 0.0, 30.0)],
+        }
+        variant = generate_orthogonal_variant(baseline, preset='polar')
+        self.assertEqual(variant['scene_constants'],
+                         {'cast': ['the lone builder: red tee, blue jeans']})
+
+    def test_a_variant_with_no_cast_still_starts_from_an_empty_constants_block(self):
+        from prompt_pipeline.mutate import generate_orthogonal_variant
+        baseline = {'pipeline_id': 'job_base', 'video_duration_sec': 30.0,
+                    'scene_constants': {'materials': ['mossy concrete wall']},
+                    'beats': [_beat('B01', 0.0, 30.0)]}
+        self.assertEqual(generate_orthogonal_variant(baseline, preset='polar')['scene_constants'], {})
 
     def test_the_prompt_lines_carry_the_signature_first(self):
         lines = reverse.scene_constants_lines(

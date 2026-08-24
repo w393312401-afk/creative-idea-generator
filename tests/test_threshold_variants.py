@@ -635,7 +635,7 @@ class TestBeatContractBridgeFlags(unittest.TestCase):
         later = self._contract(ladder, 5)
         self.assertFalse(later['is_bridge'])
         self.assertFalse(later['is_first_interior_reveal'])
-        self.assertNotIn('UNTOUCHED TRAUMA STATE', later['anchor_rule'])
+        self.assertNotIn('CONTINUITY, NOT A RESET', later['anchor_rule'])
 
     def test_pan_variant_turn_is_first_reveal_in_the_same_beat(self):
         ladder = _ladder_pan(n=6, t=3, turn_direction='right')  # single beat at 3, turn set
@@ -644,7 +644,7 @@ class TestBeatContractBridgeFlags(unittest.TestCase):
         self.assertTrue(cross['is_turn'])
         self.assertEqual(cross['family'], 'interior')
         self.assertTrue(cross['is_first_interior_reveal'])
-        self.assertIn('UNTOUCHED TRAUMA STATE', cross['anchor_rule'])
+        self.assertIn('CONTINUITY, NOT A RESET', cross['anchor_rule'])
         # The merged clip's contract text must describe the closing pan, not a
         # separate turn beat.
         self.assertIn('pan', cross['family_contract'].lower())
@@ -657,7 +657,7 @@ class TestBeatContractBridgeFlags(unittest.TestCase):
         cut = self._contract(ladder, 3)
         self.assertTrue(cut['is_cut'])
         self.assertIn('untouched pre-construction trauma', cut['anchor_rule'])
-        self.assertNotIn('UNTOUCHED TRAUMA STATE', cut['anchor_rule'])
+        self.assertNotIn('CONTINUITY, NOT A RESET', cut['anchor_rule'])
 
     def test_ordinary_interior_beat_states_door_clearance_only_once(self):
         # 2026-07-20 实机复盘：普通室内拍(非首现)的 anchor_rule 曾经和下面
@@ -683,9 +683,11 @@ class TestBeatContractBridgeFlags(unittest.TestCase):
         self.assertIn('IMAGE 4', contract)
         self.assertNotIn('placeholder', contract.lower())
         self.assertNotIn('no video clip', contract.lower())
-        # 跨越片段的三条硬条款（纯运镜/全程废墟/一镜到底）与 bridge 同权
+        # 跨越片段的三条硬条款（纯运镜/全程同一状态/一镜到底）与 bridge 同权。
+        # 2026-08-24：「全程废墟」改成「全程同一状态」——状态由这一拍自己申报。
         self.assertIn('sterile of workers', contract)
-        self.assertIn('untouched ruin', contract)
+        self.assertIn('one state throughout', contract)
+        self.assertIn('never a generic ruin', contract)
         self.assertIn('one unbroken take', contract.lower())
 
     def test_minimum_run_up_beat_ladder_helper_never_places_crossing_at_1_or_2(self):
@@ -736,25 +738,41 @@ class TestPostRevealCleanupContract(unittest.TestCase):
         self.assertFalse(self._contract(ladder, 5)['is_post_reveal_cleanup'])  # 再往后的普通室内拍
         self.assertNotIn('Post-crossing cleanout', self._contract(ladder, 5)['family_contract'])
 
+    def test_beat_after_crossing_that_is_not_clearing_gets_no_cleanout_contract(self):
+        """2026-08-24 证据闸门：位置对了还不够，这一拍自己得真的申报清理。原片进门直接
+        开工的片子不该被扣上一份「本拍是纯清理」的契约，凭空多出一道工序。"""
+        ladder = _ladder_coaxial(n=6, t=3)
+        ladder[3]['operation'] = 'framing'
+        ladder[3]['milestone_name'] = 'stud wall framed along the north side'
+        after = self._contract(ladder, 4)
+        self.assertFalse(after['is_post_reveal_cleanup'])
+        self.assertNotIn('Post-crossing cleanout', after['family_contract'])
+
     def test_standard_mode_never_marks_a_cleanup_beat(self):
         ladder = [{'index': i, 'operation': 'repair', 'description': f'step {i}',
                    'bridge_stage': None} for i in range(1, 6)]
         for i in range(1, 6):
             self.assertFalse(self._contract(ladder, i, mode='Standard')['is_post_reveal_cleanup'])
 
-    def test_first_reveal_demands_three_categories_and_zero_intervention(self):
+    def test_first_reveal_no_longer_dictates_a_ruin(self):
+        """2026-08-24：首现帧的「必须是废墟」硬规则已删。剩下的是防倒退 + 一句
+        「状态由这一拍自己申报」，两个方向的通用模板都不许再压上去。"""
         cross = self._contract(self._ladder_with_cleanup(t=3), 3)
         self.assertTrue(cross['is_first_interior_reveal'])
-        self.assertIn('AT LEAST THREE', cross['anchor_rule'])
-        self.assertIn('ZERO INTERVENTION EVIDENCE', cross['anchor_rule'])
-        self.assertIn('UNARRANGED', cross['anchor_rule'])
+        self.assertNotIn('AT LEAST THREE', cross['anchor_rule'])
+        self.assertNotIn('ZERO INTERVENTION EVIDENCE', cross['anchor_rule'])
+        self.assertNotIn('UNARRANGED', cross['anchor_rule'])
+        self.assertIn('never impose a generic ruin', cross['anchor_rule'])
+        self.assertIn('never impose a generic tidy room', cross['anchor_rule'])
+        self.assertIn('already CLOSED', cross['anchor_rule'])
 
-    def test_crossing_clip_contract_keeps_the_interior_raw_and_the_take_unbroken(self):
+    def test_crossing_clip_holds_one_state_and_the_take_unbroken(self):
         cross = self._contract(self._ladder_with_cleanup(t=3), 3)
         fc = cross['family_contract']
-        self.assertIn('raw interior throughout', fc)
+        self.assertIn('one state throughout', fc)
+        self.assertIn('never a generic ruin', fc)
         self.assertIn('one unbroken take', fc)
-        self.assertIn('NEXT beat', fc)
+        self.assertIn('either side of it', fc)
 
     def test_crossing_clip_with_outline_refs_remains_pure_and_sterile_of_work(self):
         """1:1 节拍映射下，过门拍依然是 100% 纯运镜拍，严禁要求在同一个镜头内继续施工。"""
@@ -764,9 +782,9 @@ class TestPostRevealCleanupContract(unittest.TestCase):
         ladder[2]['package_operations'] = ['lay', 'fasten']
         cross = self._contract(ladder, 3)
         fc = cross['family_contract']
-        self.assertIn('raw interior throughout', fc)
+        self.assertIn('one state throughout', fc)
         self.assertNotIn('continues into real work', fc)
-        self.assertIn('NEXT beat', fc)
+        self.assertIn('either side of it', fc)
 
 
 class TestBridgeClipWorkContentCheck(unittest.TestCase):

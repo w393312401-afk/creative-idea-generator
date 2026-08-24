@@ -31,7 +31,14 @@ import prompt_pipeline as pp
 
 
 # Pass A 的提示词版本号。改了 _PASS_A_SYSTEM 就必须改它，否则旧缓存会被当成新结果复用。
-PASS_A_PROMPT_VERSION = 'v3'
+# v4（2026-08-24）：新增 cast_appearance —— 画面里活物的外形（人种/肤色/发型/
+# 帽子/上下装颜色款式/鞋），供全局识别项 scene_constants.cast 统计。
+# v5（2026-08-25）：新增 camera_angle / camera_bearing —— 逐帧的拍摄角度读数（俯仰 +
+# 方位），Pass B 的逐拍角度分析据此有据可依，而不是凭工序想象机位。
+# v6（2026-08-25）：新增 lens_feel（焦段感）与 subject_placement（主体在画面里的位置与
+# 占比）——锚点系统的 grid / z_depth_scale 此前从没在原片上量过，全是 packet 那次调用
+# 按主题编的。
+PASS_A_PROMPT_VERSION = 'v6'
 
 # ── 实体规范化与消歧词典 ───────────────────────────────────────────────────
 #
@@ -255,6 +262,15 @@ HARD RULES
   - tool_specifics: Specific equipment/tool model, power source, and active bit/blade (e.g. "18V cordless brushless impact driver with magnetic bit", "pneumatic framing nailer", "stainless steel notched trowel", "airless paint spray gun").
   - fastening_and_bonding: Observable mechanical fasteners or chemical bonds (e.g. "countersunk black drywall screws", "expanding PU foam sealant along gap", "heavy-duty construction adhesive bead", "staples").
   - micro_traces: Visible microscopic physical marks left by the work (e.g. "fine wood sawdust along pencil cut-lines", "fresh drywall dust on floor edges", "chalk snap line", "paint overspray splatter").
+- cast_appearance: WHO/WHAT IS ALIVE IN THIS FRAME AND WHAT THEY LOOK LIKE. One item per living thing visible — a person, a miniature figurine, or an animal. Describe the BODY AND CLOTHING, never the action: apparent ethnicity / skin tone, build and apparent age band, hair (length, colour, tied or loose), facial hair, headwear, upper garment (type + colour), lower garment (type + colour), footwear, gloves, and any always-worn accessory. Example: "light-brown-skinned South Asian man, slim, short black hair, no beard, red long-sleeve tee, dark blue jeans, brown leather boots"; "brown short-haired dog, medium build".
+  - Ethnicity and skin tone are a VISIBLE physical fact here and must be recorded like any other: they are what keeps the same builder from turning into a different person between frames. Read them off the pixels; if the face is turned away, obscured, or too small to read, write only what you can see ("person in a red tee, face not visible") and lower the confidence — never guess, and never omit the whole item because one attribute is unreadable.
+  - If nobody and no animal is in the frame, return an empty list.
+- camera_angle / camera_bearing: WHERE THE CAMERA IS, read off this frame's own geometry — not off what is being built.
+  - camera_angle (vertical) is one of: bird_eye (straight or near-straight down, ground plane fills the frame), high_angle (above the subject looking down, top surfaces visible, horizon high or out of frame), eye_level (lens at standing height, frame reads level, horizon near the middle), low_angle (below the subject looking up, undersides visible, horizon low), worm_eye (lens on or near the ground looking sharply up), dutch_angle (the whole frame is rolled off horizontal — the horizon itself is tilted).
+  - camera_bearing (horizontal) is one of: front, three_quarter (a front and a side face both visible), side (the flank alone), rear_three_quarter, back — which face of the subject the lens is looking at.
+  - Read them from converging lines, which faces of objects are visible, and where the horizon sits. Write the exact token and nothing else. If the frame is too tight, too dark, or too featureless to tell, leave that one empty and lower the confidence — a guessed angle is worse than a blank one, because everything downstream will reproduce it.
+- lens_feel: how WIDE the lens is, read off the perspective itself — one of ultra_wide (strong barrel curvature at the edges, near objects looming, edges stretched), wide (noticeably expansive but not distorted), normal (perspective looks like unaided vision, no compression, no stretch), tele (background compressed and flattened onto the subject, shallow depth), macro (a subject smaller than a hand filling the frame at close focus). This is NOT the same reading as how much of the scene is in shot: a wide lens standing far back and a long lens standing close both give you "the whole wall". Leave it empty if the frame gives you nothing to judge by.
+- subject_placement: WHERE THE MAIN SUBJECT SITS IN THIS FRAME AND HOW BIG IT IS. One short sentence carrying three things: its horizontal position (left / centre / right, in thirds), its vertical position, and how much of the frame HEIGHT it occupies, plus where the horizon sits if one is visible. Example: "the shell sits centred, filling about three fifths of frame height, horizon across the upper third"; "the trench runs along the lower left, taking the bottom quarter of the frame". Write fractions in words, never digits or percent signs. This is the one reading that says what the reference film's composition actually is — everything downstream currently guesses it.
 - Describe completion extent spatially and concretely: "left two-thirds of the wall is coated, right third is bare" — never "partially done".
 - If a frame is too blurry, dark, or occluded to read, say so and give it a low confidence.
 
@@ -274,7 +290,12 @@ Return a JSON array, one object per frame given, in the same order:
   "tools": ["<visible tools, machines, equipment>"],
   "tool_specifics": ["<exact tool model/type, drive mechanism, bit/blade>"],
   "fastening_and_bonding": ["<countersunk screws, expanding foam, staples, adhesive>"],
+  "camera_angle": "<bird_eye|high_angle|eye_level|low_angle|worm_eye|dutch_angle, or empty if unreadable>",
+  "camera_bearing": "<front|three_quarter|side|rear_three_quarter|back, or empty if unreadable>",
+  "lens_feel": "<ultra_wide|wide|normal|tele|macro, or empty if unreadable>",
+  "subject_placement": "<one short sentence: the main subject's horizontal and vertical position and what fraction of frame height it fills, plus where the horizon sits; fractions in words>",
   "workers_present": true|false,
+  "cast_appearance": ["<one per living thing in frame: ethnicity/skin tone, build, hair, headwear, upper garment + colour, lower garment + colour, footwear; empty list if nobody is in frame>"],
   "completion_extent": "<concrete spatial state of the work visible in this frame>",
   "traces": ["<visible marks left by work: dust, drips, cut lines, offcuts, stains>"],
   "micro_traces": ["<fine dust, pencil layout marks, offcuts, splatter>"],
@@ -506,56 +527,294 @@ def estimate_pass_a_cost(overview, degraded=False, batch_size=_PASS_A_BATCH_SIZE
 # 重试，见 _chat_json。
 
 def _repair_json_text(text):
-    """扫一遍文本，转义字符串内的裸控制字符与内层引号，并去掉尾逗号。
-
-    判定引号是"闭合"还是"内层"的依据：闭合引号后面（跳过空白）只可能是 , : } ] 或结尾。
-    其余位置的引号必然是字符串内容的一部分，模型忘了转义。
+    """鲁棒的 JSON 修复引擎，专门应对大模型长输出中的语法瑕疵：
+    1. 键值对/数组元素之间漏掉逗号（例如 "key1": "val1"\\n "key2": "val2" 或 "k": 123\\n "k2": ...）
+    2. 幻觉多余/闭合错位的括号（例如标量字段后多写了 `],` 或多余的 `}`/`]`）
+    3. 字符串内部未转义的双引号（智能向前探查区分闭合引号与内嵌引号）
+    4. 字符串内部裸控制字符（\\n, \\r, \\t）转义
+    5. 对象/数组末尾多余的尾逗号（trailing commas）
+    6. Python 关键字（True, False, None）转为 JSON 标准值
+    7. C/JS 风格及 Python 风格注释过滤
+    8. 单引号字符串转双引号
+    9. 自动闭合流末尾未闭合的括号
     """
+    if not text:
+        return text
+
+    # 1. 过滤思考标签与 Markdown 代码块
+    cleaned = text.strip()
+    cleaned = re.sub(r'<think>.*?</think>', '', cleaned, flags=re.DOTALL).strip()
+    if cleaned.startswith('```'):
+        nl = cleaned.find('\n')
+        cleaned = cleaned[nl + 1:] if nl != -1 else cleaned[3:]
+    if cleaned.rstrip().endswith('```'):
+        cleaned = cleaned[:cleaned.rstrip().rfind('```')]
+    cleaned = cleaned.strip()
+
+    # 2. 提取最外层 JSON 结构
+    first_brace = cleaned.find('{')
+    first_bracket = cleaned.find('[')
+    if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+        start_idx = first_brace
+        end_char = '}'
+    elif first_bracket != -1:
+        start_idx = first_bracket
+        end_char = ']'
+    else:
+        start_idx = -1
+
+    if start_idx != -1:
+        last_end = cleaned.rfind(end_char)
+        if last_end != -1 and last_end > start_idx:
+            cleaned = cleaned[start_idx:last_end + 1]
+        else:
+            cleaned = cleaned[start_idx:]
+
+    # 快速路径：已经是合法 JSON 则直接返回
+    try:
+        json.loads(cleaned)
+        return cleaned
+    except Exception:
+        pass
+
+    # 3. 状态机流式扫描与语法修复
     out = []
-    in_string = False
-    i, n = 0, len(text)
+    stack = []  # 容器栈，记录 '{' 和 '['
+    i = 0
+    n = len(cleaned)
+    in_str = False
+    str_quote_char = '"'
+    str_escape = False
+
     while i < n:
-        ch = text[i]
-        if not in_string:
-            if ch == '"':
-                in_string = True
+        ch = cleaned[i]
+
+        # ── 字符串内部 ──
+        if in_str:
+            if str_escape:
                 out.append(ch)
-            elif ch == ',':
-                # 尾逗号：下一个非空白字符是 } 或 ] 就丢掉这个逗号。
+                str_escape = False
+                i += 1
+                continue
+            if ch == '\\':
+                out.append(ch)
+                str_escape = True
+                i += 1
+                continue
+
+            if ch == str_quote_char:
+                # 探查此引号是合法结束引号还是未转义的内嵌引号
                 j = i + 1
-                while j < n and text[j] in ' \t\r\n':
+                while j < n and cleaned[j] in ' \t\r\n':
                     j += 1
-                if j < n and text[j] in '}]':
+                next_ch = cleaned[j] if j < n else ''
+
+                is_closing = False
+                if j >= n:
+                    is_closing = True
+                elif next_ch in ',:}]':
+                    is_closing = True
+                elif next_ch in '"\'':
+                    # 漏逗号的连续字符串: "val1" "val2" 或 "val1" "key2":
+                    is_closing = True
+                elif next_ch.isalpha() or next_ch in '-0123456789':
+                    # 检查本行后续是否还有引号和分隔符（若有，说明当前引号是 "he said "hello" today" 中的内嵌引号）
+                    line_end = cleaned.find('\n', j)
+                    if line_end == -1:
+                        line_end = n
+                    rest_of_line = cleaned[j:line_end]
+                    if ('"' in rest_of_line or "'" in rest_of_line) and any(d in rest_of_line for d in (',', '}', ']', ':')):
+                        is_closing = False
+                    else:
+                        is_closing = True
+                elif next_ch in '{[':
+                    is_closing = True
+
+                if is_closing:
+                    in_str = False
+                    out.append('"')
+                else:
+                    out.append('\\"')
+                i += 1
+                continue
+
+            if ch in '\n\r\t':
+                ctrl_map = {'\n': '\\n', '\r': '\\r', '\t': '\\t'}
+                out.append(ctrl_map[ch])
+                i += 1
+                continue
+
+            out.append(ch)
+            i += 1
+            continue
+
+        # ── 字符串外部 ──
+
+        # 注释跳过
+        if ch == '/' and i + 1 < n:
+            if cleaned[i + 1] == '/':
+                nl = cleaned.find('\n', i)
+                i = nl if nl != -1 else n
+                continue
+            elif cleaned[i + 1] == '*':
+                end_c = cleaned.find('*/', i + 2)
+                i = end_c + 2 if end_c != -1 else n
+                continue
+        elif ch == '#':
+            nl = cleaned.find('\n', i)
+            i = nl if nl != -1 else n
+            continue
+
+        # 空白符
+        if ch in ' \t\r\n':
+            out.append(ch)
+            i += 1
+            continue
+
+        # 引号开始新字符串
+        if ch in ('"', "'"):
+            # 补逗号检查：如果前一个有效字符是值终止符，自动补逗号
+            k = len(out) - 1
+            while k >= 0 and out[k] in ' \t\r\n':
+                k -= 1
+            if k >= 0:
+                last_ch = out[k]
+                if last_ch in '"}]' or (last_ch.isalnum() and last_ch not in ':,'):
+                    if last_ch not in ':,' and last_ch not in '{[':
+                        out.append(',')
+
+            in_str = True
+            str_quote_char = ch
+            out.append('"')
+            i += 1
+            continue
+
+        # 打开容器 '{'
+        if ch == '{':
+            k = len(out) - 1
+            while k >= 0 and out[k] in ' \t\r\n':
+                k -= 1
+            if k >= 0 and (out[k] in '"}]' or out[k].isalnum()) and out[k] not in ':,{[':
+                out.append(',')
+            stack.append('{')
+            out.append('{')
+            i += 1
+            continue
+
+        # 打开容器 '['
+        if ch == '[':
+            k = len(out) - 1
+            while k >= 0 and out[k] in ' \t\r\n':
+                k -= 1
+            if k >= 0 and (out[k] in '"}]' or out[k].isalnum()) and out[k] not in ':,{[':
+                out.append(',')
+            stack.append('[')
+            out.append('[')
+            i += 1
+            continue
+
+        # 闭合容器 '}'
+        if ch == '}':
+            if not stack:
+                # 栈空时的孤立右大括号 -> 丢弃
+                i += 1
+                continue
+            if stack[-1] == '{':
+                k = len(out) - 1
+                while k >= 0 and out[k] in ' \t\r\n':
+                    k -= 1
+                if k >= 0 and out[k] == ',':
+                    out[k] = ' '
+                stack.pop()
+                out.append('}')
+                i += 1
+                continue
+            elif stack[-1] == '[':
+                if '{' in stack:
+                    k = len(out) - 1
+                    while k >= 0 and out[k] in ' \t\r\n':
+                        k -= 1
+                    if k >= 0 and out[k] == ',':
+                        out[k] = ' '
+                    stack.pop()
+                    out.append(']')
+                    continue
+                else:
                     i += 1
                     continue
-                out.append(ch)
-            else:
-                out.append(ch)
+
+        # 闭合容器 ']'
+        if ch == ']':
+            if not stack:
+                # 栈空时的孤立右中括号 -> 丢弃
+                i += 1
+                continue
+            if stack[-1] == '[':
+                k = len(out) - 1
+                while k >= 0 and out[k] in ' \t\r\n':
+                    k -= 1
+                if k >= 0 and out[k] == ',':
+                    out[k] = ' '
+                stack.pop()
+                out.append(']')
+                i += 1
+                continue
+            elif stack[-1] == '{':
+                # 在对象 `{}` 中意外遇到 `]`（例如大模型在字符串后多写了 `],`）
+                j = i + 1
+                while j < n and cleaned[j] in ' \t\r\n':
+                    j += 1
+                if j < n and cleaned[j] == ',':
+                    i = j + 1
+                else:
+                    i += 1
+                continue
+
+        # 逗号
+        if ch == ',':
+            k = len(out) - 1
+            while k >= 0 and out[k] in ' \t\r\n':
+                k -= 1
+            if k >= 0 and out[k] in ',:{[':
+                # 重复或位置错误的逗号 -> 丢弃
+                i += 1
+                continue
+            out.append(',')
             i += 1
             continue
 
-        # 字符串内部
-        if ch == '\\':
-            out.append(text[i:i + 2])
-            i += 2
+        # Python 字面量
+        if cleaned[i:i + 4] == 'True' and not (i + 4 < n and cleaned[i + 4].isalnum()):
+            out.append('true')
+            i += 4
             continue
-        if ch == '"':
-            j = i + 1
-            while j < n and text[j] in ' \t\r\n':
-                j += 1
-            if j >= n or text[j] in ',:}]':
-                in_string = False
-                out.append(ch)
-            else:
-                out.append('\\"')
-            i += 1
+        if cleaned[i:i + 5] == 'False' and not (i + 5 < n and cleaned[i + 5].isalnum()):
+            out.append('false')
+            i += 5
             continue
-        if ch in '\n\r\t':
-            out.append({'\n': '\\n', '\r': '\\r', '\t': '\\t'}[ch])
-            i += 1
+        if cleaned[i:i + 4] == 'None' and not (i + 4 < n and cleaned[i + 4].isalnum()):
+            out.append('null')
+            i += 4
             continue
+
+        # 数字或布尔标识符开始前补逗号检查
+        if (ch.isdigit() or ch in '-+') and (i == 0 or not cleaned[i - 1].isalnum()):
+            k = len(out) - 1
+            while k >= 0 and out[k] in ' \t\r\n':
+                k -= 1
+            if k >= 0 and (out[k] in '"}]' or out[k].isalnum()) and out[k] not in ':,{[':
+                out.append(',')
+
         out.append(ch)
         i += 1
+
+    # 清除尾逗号并自动闭合未匹配容器
+    k = len(out) - 1
+    while k >= 0 and out[k] in ' \t\r\n':
+        k -= 1
+    if k >= 0 and out[k] == ',':
+        out[k] = ' '
+
     return ''.join(out)
 
 
@@ -600,7 +859,7 @@ def _looks_truncated(text):
 
 
 def parse_json_reply(raw):
-    """模型回复 → Python 对象。先原样解析，失败再走一次保守修复。
+    """模型回复 → Python 对象。先原样解析，失败再走多级鲁棒修复。
 
     两次都失败就把原始回复带进异常消息（截断到 600 字）——上一次线上故障里，日志只有
     一句 `Expecting ',' delimiter: line 156 column 6`，没人能知道模型到底回了什么。
@@ -683,6 +942,19 @@ def _parse_facts_array(raw, expected_names, strict=False):
         fastening = [canonicalize_entity_phrase(x) for x in (item.get('fastening_and_bonding') or []) if str(x).strip()]
         traces = [str(x).strip() for x in (item.get('traces') or []) if str(x).strip()]
         micro_traces = [str(x).strip() for x in (item.get('micro_traces') or []) if str(x).strip()]
+        # 活物外形。不过 canonicalize_entity_phrase：那份词典是给材质/器具用词漂移的，
+        # 把人的衣着往材质词上归一只会毁掉这条读数。
+        cast_appearance = [str(x).strip() for x in (item.get('cast_appearance') or []) if str(x).strip()]
+        # 逐帧机位读数走和逐拍字段同一张近义词表：模型照样会写 "low angle shot"、
+        # "from the side"，认不出来的一律归零——留一个歪值下去，等于让整条片子的
+        # 角度分析建立在一句没人校对过的话上。
+        camera_angle = _coerce_enum(item.get('camera_angle'), CAMERA_ANGLES,
+                                    _CAMERA_ANGLE_SYNONYMS) or ''
+        camera_bearing = _coerce_enum(item.get('camera_bearing'), CAMERA_BEARINGS,
+                                      _CAMERA_BEARING_SYNONYMS) or ''
+        lens_feel = _coerce_enum(item.get('lens_feel'), LENS_FEELS, _LENS_FEEL_SYNONYMS) or ''
+        # 构图是自由文本（它要说位置、占比、地平线三件事，闭集装不下），只做去空白。
+        subject_placement = ' '.join(str(item.get('subject_placement') or '').split())
 
         out[name] = {
             'frame': name,
@@ -694,6 +966,11 @@ def _parse_facts_array(raw, expected_names, strict=False):
             'tool_specifics': tool_specifics,
             'fastening_and_bonding': fastening,
             'workers_present': bool(item.get('workers_present')),
+            'cast_appearance': cast_appearance,
+            'camera_angle': camera_angle,
+            'camera_bearing': camera_bearing,
+            'lens_feel': lens_feel,
+            'subject_placement': subject_placement,
             'completion_extent': str(item.get('completion_extent') or '').strip(),
             'traces': traces,
             'micro_traces': micro_traces,
@@ -985,10 +1262,15 @@ def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
     if not peak_names:
         return facts_payload
 
+    # action 让前端把这一段挂到自己的进度区间上：它跟逐帧提取同属 review_frames，
+    # 但发生在它之后——共用一个区间的话，"只增不减"的进度条会把它整段吃掉。
     if on_progress:
         on_progress('replica_stage', {
             'stage': 'review_frames',
+            'action': 'peak_verify',
             'message': f'强模型复核 {len(peak_names)} 张事件峰值帧（{model}）',
+            'done': 0,
+            'total': len(peak_names),
         })
 
     clean_config = _scrub_config_for_pass_a(config)
@@ -1063,11 +1345,25 @@ def verify_peak_frames(config, job_dir, facts_payload, on_progress=None):
             return {}
 
     refined = {}
+    peak_done = {'n': 0}
+
+    def _on_peak_done(_key, result):
+        peak_done['n'] += len(result or {})
+        if on_progress:
+            on_progress('replica_stage', {
+                'stage': 'review_frames',
+                'action': 'peak_verify',
+                'message': f'峰值帧复核 {peak_done["n"]}/{len(peak_names)}',
+                'done': peak_done['n'],
+                'total': len(peak_names),
+            })
+
     if batches:
         results = pp._map_parallel(
             _run_peak_batch,
             [(i, b) for i, b in enumerate(batches)],
             pp.review_concurrency(config),
+            on_done=_on_peak_done,
         )
         for chunk in results.values():
             refined.update(chunk or {})
@@ -1233,11 +1529,24 @@ RULES
   - NEVER invent or hallucinate residential appliances (kitchen cabinetry, ceramic sink, brass faucet, cooktop, oven, refrigerator, dining table, dining chairs, bathroom vanity) or extra functional rooms UNLESS they are explicitly observed and named in the FRAME FACTS / TIME WINDOWS.
   - In rustic/bushcraft/hobbit/shelter projects, if the space is a raw timber-framed foyer, bedroom, or alcove, describe ONLY the physical carpentry, membranes, insulation, and timber framing that actually exist in the footage. Do NOT default to "kitchen" or "dining room" just because it is an interior room.
 - worker_attire: Extract and carry the authoritative attire from frame facts: e.g. "one lone craftsman in a casual grey work t-shirt, dark cargo pants, and backwards baseball cap (no neon safety vest, no plastic hardhat)". Never substitute a municipal safety vest or hardhat when the builder is wearing casual/craftsman workwear.
+- cast_identity: ONE list for the WHOLE film (not per beat) — one item per living thing that recurs across the footage: each builder, each helper, each figurine, each animal. Each item is that individual's FIXED physical identity, head to toe, and nothing else: apparent ethnicity and skin tone, build and apparent age band, hair (length, colour, tied/loose), facial hair, headwear, upper garment with colour, lower garment with colour, footwear, gloves, always-worn accessory. Example: "the lone builder: light-brown-skinned South Asian man, early thirties, slim, short black hair, clean-shaven, faded red long-sleeve tee, dark blue jeans, brown leather boots, no hardhat and no hi-vis vest"; "the site dog: short-haired tan mongrel, medium build, red collar".
+  - Lift it from the frame facts' cast_appearance field, which records this frame by frame. Where frames disagree on a detail, take the reading that most frames agree on — a single frame that read the shirt as orange does not license a new person.
+  - This is IDENTITY, never ACTION: what they permanently look like, not what they are doing. The doing is each beat's own cast_action.
+  - Ethnicity and skin tone belong in this list. They are the single most visible thing about a person and the thing an image model most readily re-rolls between frames: leave them out and the same film delivers a different-looking builder in every shot. Record what the frames show; if faces are never readable, describe only what is visible and say so ("face never clearly visible") rather than inventing.
+  - Order the list with the person who appears most first. If the footage genuinely never shows a living thing, return an empty list.
 - PER-BEAT PRODUCTION FIELDS. Each of these is a separate channel downstream; do not smuggle them into the sentence fields and do not leave them out because "it is obvious from the action".
   - tool: the ONE geometric tool that delivers the action at its peak ("crawler crane on outriggers", "cordless impact driver", "rubber mallet"). This is the tool half of the Action-Tool-SFX triad. If machinery does the work, the machine IS the tool.
   - sfx: ONE to THREE physical sounds this beat actually makes, one sound source per item ("hydraulic crane whine", "soil clods sliding down the trench wall", "steel body thudding into the cut"). Match the audio_sfx spikes given to you in the CHANGE EVENTS where there are any. NEVER write music, score, mood beds, or narration — the delivery is 0% BGM, 100% physical sound.
   - shot_scale: one of extreme_wide | wide | medium | close | extreme_close — the framing this beat is filmed at.
   - camera_move: one of static | push_in | pull_out | pan | tilt | orbit | follow | handheld | crane — how the camera behaves during this beat. A transition beat crossing a threshold is normally push_in or follow. Use the exact token, never a phrase.
+  - camera_angle: WHERE THE CAMERA IS RELATIVE TO THE SUBJECT, VERTICALLY. One of bird_eye | high_angle | eye_level | low_angle | worm_eye | dutch_angle. Read it off the frame's own geometry, not off the subject: which way the converging lines run, whether you can see the TOP faces of things (looking down) or their UNDERSIDES and the sky/ceiling behind them (looking up), and where the horizon sits in the frame.
+    - bird_eye = straight or near-straight down, the ground plane fills the frame, the subject reads as a plan/footprint. high_angle = clearly above the subject looking down, top surfaces visible, horizon high in frame or out of it. eye_level = the lens sits at a standing person's height and the frame reads level, horizon near the middle. low_angle = clearly below the subject looking up, undersides visible, subject towering, horizon low in frame. worm_eye = lens on or near the ground, looking sharply up along the subject. dutch_angle = the whole frame is rolled off horizontal (the horizon itself is tilted) — use this ONLY for a genuinely canted frame, never for "the camera is off to one side".
+  - camera_bearing: WHERE THE CAMERA IS RELATIVE TO THE SUBJECT, HORIZONTALLY. One of front | three_quarter | side | rear_three_quarter | back — which face of the subject the lens is looking at: its front, a front corner (both a front and a side face visible), its flank alone, a rear corner, or its back.
+    - These two are INDEPENDENT axes and both must be declared: one beat can be low_angle AND side at the same time, and collapsing them into one reading throws away the half that makes this film look like itself — "worm's-eye from the flank" and "standing overhead from the front" are two completely different films of the same trade operation.
+    - The FRAME FACTS you are given already carry both readings frame by frame, shown as `view=<angle>/<bearing>`. Lift the beat's pair from the frames inside that beat's own window — where they disagree, take the reading that most of that window's frames agree on. Use the exact tokens, never a phrase, and never guess to fill the slot: they must be readable from the frames you were given. Where the camera genuinely does not move between beats, repeat the SAME pair — a stable tripod film declaring five different angles is a misread, not variety.
+  - lens_feel: how WIDE the lens is — one of ultra_wide | wide | normal | tele | macro. Read it off the perspective itself: edge curvature and looming near objects (ultra_wide), a compressed flattened background (tele), unaided-vision perspective (normal). The frame facts carry it per frame as `lens=`. This is NOT shot_scale: a wide lens standing far back and a long lens standing close both deliver "the whole wall", and they look nothing alike. Every beat filmed on the same camera in the same space normally repeats the SAME value — this is a production fact, not a per-beat choice.
+  - subject_placement: WHERE THE MAIN SUBJECT SITS IN THE FRAME AND HOW BIG IT IS, in one short sentence: horizontal position in thirds, vertical position, what fraction of the frame HEIGHT it occupies, and where the horizon sits if visible ("the shell sits centred, filling about three fifths of frame height, horizon across the upper third"). The frame facts carry it per frame as `placement=`; take the reading that holds for most of this beat's window. Fractions in words, never digits or percent signs. Downstream this is the ONLY measurement of the reference film's composition — without it the anchors' screen positions and frame-height shares are invented from scratch.
+  - time_treatment: how time runs in THIS beat — one of timelapse (work visibly racing, repeated cycles compressed, people moving unnaturally fast), real_time (a walk-through, a reveal, a single unhurried action at natural speed), slow_motion. Read it off how fast bodies and material move between the frames of this beat's own window, not off the film's overall speed_multiplier. The final reward/walk-through beat of these films is almost always real_time even though every construction beat around it is timelapse; declaring it timelapse is how a calm finished-home tour gets delivered as a frantic sped-up clip.
   - worker_count: how many people are visible in this beat, as an integer. 0 for a sterile beat, and it must agree with workers_present.
   - light_state: the light and time of day in this beat ("overcast midday, no cast shadows", "low golden side light from frame left"). The film spans days; a beat that does not declare its light gets a random one.
   - material_flow: where this beat's material went or came from ("excavated soil piled on the trench's north lip", "offcuts bundled and carried out through the doorway"). This is the Material & Spoil Balance rule's field — demolition must say where debris goes, installation must say what stock was consumed.
@@ -1276,6 +1585,9 @@ RULES
 - Beats are ordered by time and must not overlap.
 
 - ambient_motion: ONE list for the WHOLE film (not per beat), naming what keeps moving in the frame the whole way through without anyone doing it: running water, drifting smoke, a flame, wind in the canopy, falling snow or rain, laundry swinging, dust motes, a flickering filament. These never appear in any beat — a beat records what CHANGED, and these change nothing, they just never stop. Leaving them out is what makes a delivered clip read as a photograph with one moving hand in it. Write only what you can actually see moving across frames; if the film's background genuinely holds still, return an empty list.
+- ambient_sound, color_grade and cast_identity are written ONCE, at the top, exactly like scene_signature and ambient_motion — never restated inside a beat. Every beat downstream is rendered by an image model that has no memory of the previous frame; this list is the only thing that keeps one builder from becoming three different people over eleven shots.
+- ambient_sound: ONE list for the WHOLE film (not per beat), naming the sound that is under EVERY shot without anyone making it: wind in the canopy, a stream, distant traffic, surf, rain on a roof, the hollow room tone of a bare concrete space, insects. It is the exact audio counterpart of ambient_motion — a beat's sfx records what this beat's work SOUNDS LIKE, and this records what the PLACE sounds like when nobody is working. Nothing downstream measures it, so leaving it out means every clip's ambient line is invented from scratch and the film's acoustic space changes shot to shot. Write only what the footage supports; empty list if the audio is genuinely dead or unreadable.
+- color_grade: ONE sentence for the WHOLE film describing its LOOK as a photographic treatment, not as a mood: colour temperature bias, contrast, saturation, black level, and any film/digital character ("cool overcast neutral grade, gentle contrast, slightly lifted blacks, restrained saturation"; "warm golden bias with deep crushed shadows and punchy saturation"). This is the first thing a viewer registers about whether a copy looks like the original, and it is currently nowhere in this pipeline. Never write mood or genre words (cinematic, dramatic, moody, epic) — those are not gradings, and everything downstream will render its own idea of them.
 - scene_signature: ONE sentence naming the venue and how it looks throughout — its structure, its materials, its weathering, its surroundings, its standing light. Write what is true in the first frame and still true in the last. No work, no progress, no beat content. This is the one line that says why the reference film looks like itself; a generic version of it ("an interior space under renovation") is worse than none.
 
 OUTPUT
@@ -1284,6 +1596,9 @@ Return one JSON object, no prose, no code fences:
   "video_duration_sec": <number>,
   "scene_signature": "<one sentence, under thirty words>",
   "ambient_motion": ["<what keeps moving in frame all the way through, one per item; empty list if nothing does>"],
+  "ambient_sound": ["<what is audible under every shot with nobody making it, one per item; empty list if none>"],
+  "color_grade": "<one sentence: colour temperature bias, contrast, saturation, black level, film/digital character — never mood words>",
+  "cast_identity": ["<one per recurring living thing: ethnicity/skin tone, build, age band, hair, facial hair, headwear, upper garment + colour, lower garment + colour, footwear; identity only, never action; empty list if nobody appears>"],
   "banned_elements": ["..."],
   "beats": [{
     "id": "B01",
@@ -1307,6 +1622,11 @@ Return one JSON object, no prose, no code fences:
     "tool_specifics": "<the type/drive/bit of that tool, from the frame facts' tool_specs; omit if not readable>",
     "sfx": ["..."],
     "shot_scale": "<extreme_wide|wide|medium|close|extreme_close>",
+    "camera_angle": "<bird_eye|high_angle|eye_level|low_angle|worm_eye|dutch_angle>",
+    "camera_bearing": "<front|three_quarter|side|rear_three_quarter|back>",
+    "lens_feel": "<ultra_wide|wide|normal|tele|macro>",
+    "subject_placement": "<one short sentence: the subject's position in thirds, what fraction of frame height it fills, where the horizon sits; fractions in words>",
+    "time_treatment": "<timelapse|real_time|slow_motion>",
     "camera_move": "<static|push_in|pull_out|pan|tilt|orbit|follow|handheld|crane>",
     "worker_count": <integer>,
     "light_state": "...",
@@ -1359,6 +1679,14 @@ def _facts_digest(facts):
         if f.get('micro_traces'):
             parts.append(f'micro_traces={"/".join(f["micro_traces"])}')
         parts.append(f'workers={"yes" if f.get("workers_present") else "no"}')
+        if f.get('cast_appearance'):
+            parts.append(f'cast={"/".join(f["cast_appearance"])}')
+        if f.get('camera_angle') or f.get('camera_bearing'):
+            parts.append(f'view={f.get("camera_angle") or "?"}/{f.get("camera_bearing") or "?"}')
+        if f.get('lens_feel'):
+            parts.append(f'lens={f["lens_feel"]}')
+        if f.get('subject_placement'):
+            parts.append(f'placement={f["subject_placement"]}')
         parts.append(f'conf={f.get("confidence")}')
         lines.append(' | '.join(parts))
     return '\n'.join(lines)
@@ -1573,13 +1901,16 @@ TRANSLATE_FIELDS = (
     'state_before', 'state_after', 'visible_details', 'persistent_traces',
     'package_operations', 'macro_environment',
     # 2026-08-22：新增的制作字段里只有这四个是自由文本，需要中文对照。
-    # shot_scale / camera_move 是闭集枚举、worker_count 是整数——它们的中文在界面上
-    # 由 SHOT_SCALE_LABELS_ZH / CAMERA_MOVE_LABELS_ZH 直接渲染，翻译它们只会把闭集
-    # 值译成一句中文，再被 _coerce_enum 丢掉。
+    # shot_scale / camera_move / camera_angle / camera_bearing 是闭集枚举、
+    # worker_count 是整数——它们的中文在界面上由 *_LABELS_ZH 直接渲染，翻译它们只会把
+    # 闭集值译成一句中文，再被 _coerce_enum 丢掉。
     'tool', 'sfx', 'light_state', 'material_flow',
     # 2026-08-23：插入镜主体也是自由文本，且它是要被逐字抄进成片的一句，
     # 核对的人必须看得懂它写的是什么。
     'insert_subject', 'cast_action',
+    # 2026-08-25：主体构图也是自由文本（位置、占比、地平线三件事），核对的人必须看得懂。
+    # lens_feel / time_treatment 是闭集，不译（理由同上）。
+    'subject_placement',
 )
 
 _TRANSLATE_SYSTEM = """You translate a construction time-lapse beat ladder from English into Simplified Chinese for a human reviewer.
@@ -1996,7 +2327,7 @@ def _is_transient_tool(phrase):
 
 def analyze_scene_constants(facts, min_ratio=SCENE_CONSTANT_RATIO,
                             limit=_SCENE_CONSTANT_LIMIT):
-    """出现在超过 `min_ratio` 比例的帧里的可见物，按材质 / 痕迹 / 常驻器具分栏。
+    """出现在超过 `min_ratio` 比例的帧里的可见物，按材质 / 痕迹 / 常驻器具 / 常驻活物分栏。
 
     判据在词一级、展示在短语一级，与 `analyze_time_windows` 同一套方法（同一样东西
     每帧措辞不同，按整串统计会把一个恒常物拆成几十个「只出现一次」的条目）。
@@ -2008,8 +2339,12 @@ def analyze_scene_constants(facts, min_ratio=SCENE_CONSTANT_RATIO,
     n = len(rows)
 
     out = {}
+    # cast_appearance → cast：全片同一个人/同一条狗的外形（人种、肤色、发型、衣着、鞋）。
+    # 和材质/痕迹同一套「过半数帧里都在 = 恒常」的判据，因为它确实是恒常项：工序每拍都
+    # 变，穿的那件红T恤不变。它不落在任何一拍的 delta 里，所以和污渍青苔一样，不单独送
+    # 进提示词就会在每一帧被模型重新想象一次——同一条片子里换人种、换衣服、换发型。
     for field, key in (('materials', 'materials'), ('traces', 'traces'),
-                       ('tools', 'fixtures_in_shot')):
+                       ('tools', 'fixtures_in_shot'), ('cast_appearance', 'cast')):
         hits, best = {}, {}
         for fact in rows:
             seen_here = set()
@@ -2026,6 +2361,11 @@ def analyze_scene_constants(facts, min_ratio=SCENE_CONSTANT_RATIO,
             for word in seen_here:
                 hits[word] = hits.get(word, 0) + 1
 
+        # cast 单独压低上限。其余各栏多一条只是多一句环境描述，人物栏多一条却是**多一个
+        # 人**：同一个工人在不同帧里的措辞难免有出入（"red tee" / "faded red long-sleeve"），
+        # 每一条都收进去，交付出去的就是一段互相打架的人物描述，模型只能自己挑一个。
+        # 三条足够覆盖「工人 + 助手 + 一条狗」，再多几乎一定是同一个人的不同说法。
+        key_limit = 3 if key == 'cast' else limit
         picked, claimed = [], set()
         for word, k in sorted(hits.items(), key=lambda kv: -kv[1]):
             if k / n < min_ratio:
@@ -2037,7 +2377,7 @@ def analyze_scene_constants(facts, min_ratio=SCENE_CONSTANT_RATIO,
                 continue
             claimed.add(phrase.lower())
             picked.append(phrase)
-            if len(picked) >= limit:
+            if len(picked) >= key_limit:
                 break
         if picked:
             out[key] = picked
@@ -2061,6 +2401,26 @@ def attach_scene_constants(beats_doc, facts):
     motion = [str(x).strip() for x in (beats_doc.get('ambient_motion') or []) if str(x).strip()]
     if motion:
         constants['motion'] = motion
+    # 人物外形（cast）两个来源都要：本地统计（analyze_scene_constants 的 cast 栏）绝不
+    # 凭空捏造，但措辞是从单帧读数里挑的、偏碎；Pass B 的顶层 cast_identity 是看过整段
+    # 帧序列之后写的一句整话（"the same lone craftsman throughout: …"），读起来像人话，
+    # 也才写得出「全片同一个人」这层意思。有模型那份就用模型那份，没有就退回统计那份——
+    # 与 scene_signature / scene_constants 并存是同一条理由（失效方式相反）。
+    cast = [str(x).strip() for x in (beats_doc.get('cast_identity') or []) if str(x).strip()]
+    if cast:
+        constants['cast'] = cast
+    # 环境底噪与 motion 严格对称：那一栏是「一直在动」，这一栏是「一直在响」。同样统计
+    # 不出来（帧事实是一张张无声画面），只能由 Pass B 读，或人在卡点上补。不给它落脚点，
+    # 每条 VIDEO 结尾那句 "Ambient noise:" 就是模型现编的，整片的声场一拍一个样。
+    ambient_sound = [str(x).strip() for x in (beats_doc.get('ambient_sound') or []) if str(x).strip()]
+    if ambient_sound:
+        constants['ambient_sound'] = ambient_sound
+    # 影调：一句话，但仍然装进列表——这个容器全链路按列表读（scene_constants_lines、
+    # 卡片上的「、」分隔、beats_to_dimensions 的 list(v)）。为它单开一个字符串字段，
+    # 就要在这四处各加一个类型分支。
+    grade = ' '.join(str(beats_doc.get('color_grade') or '').split())
+    if grade:
+        constants['grade'] = [grade]
     beats_doc['scene_constants'] = constants
     return beats_doc['scene_constants']
 
@@ -2192,6 +2552,15 @@ def scene_constants_lines(constants, signature=None):
               ('materials', 'always-present materials and surfaces'),
               ('traces', 'always-present marks and weathering'),
               ('fixtures_in_shot', 'equipment permanently in shot'),
+              # 这一栏是「同一个人从头到尾」，不是「有个人在」。措辞里的 never re-cast
+              # 是给写手的：合成侧据此要求每一条 IMAGE/VIDEO 复述同一份外形
+              # （见 BaseComposer.scene_constants_block 的 cast_rule）。
+              ('cast', 'the same living cast in every shot, never re-cast — '
+                       'appearance is fixed, only the pose changes'),
+              ('grade', 'the film\'s photographic grade, identical in every frame'),
+              # 与 motion 那一栏同构：那条说「一直在动」，这条说「一直在响」。合成侧据此
+              # 要求每一条 VIDEO 的环境声都落在这上面（见 BaseComposer.scene_constants_block）。
+              ('ambient_sound', 'audible under every shot with nobody making it'),
               # 这一栏与上面四栏的动词不同：它们是「在」，这一栏是「在动」。合成侧据此
               # 要求每一条 VIDEO 都让它继续动（见 BaseComposer.scene_constants_block）。
               ('motion', 'never stops moving anywhere in the film'))
@@ -2259,6 +2628,31 @@ _BEAT_KEY_ALIASES = {
     'camera': 'camera_move',
     'camera_movement': 'camera_move',
     'camera_motion': 'camera_move',
+    'angle': 'camera_angle',
+    'shot_angle': 'camera_angle',
+    'camera_height': 'camera_angle',
+    'vertical_angle': 'camera_angle',
+    'camera_pitch': 'camera_angle',
+    'view_angle': 'camera_angle',
+    'bearing': 'camera_bearing',
+    'camera_side': 'camera_bearing',
+    'facing': 'camera_bearing',
+    'orientation': 'camera_bearing',
+    'horizontal_angle': 'camera_bearing',
+    'camera_azimuth': 'camera_bearing',
+    'lens': 'lens_feel',
+    'focal_length': 'lens_feel',
+    'lens_type': 'lens_feel',
+    'field_of_view': 'lens_feel',
+    'placement': 'subject_placement',
+    'composition': 'subject_placement',
+    'framing_position': 'subject_placement',
+    'subject_position': 'subject_placement',
+    'subject_scale': 'subject_placement',
+    'speed': 'time_treatment',
+    'time_mode': 'time_treatment',
+    'playback_speed': 'time_treatment',
+    'motion_treatment': 'time_treatment',
     'crew_size': 'worker_count',
     'worker_num': 'worker_count',
     'lighting': 'light_state',
@@ -2279,10 +2673,37 @@ _BEAT_KEY_ALIASES = {
 SHOT_SCALES = ('extreme_wide', 'wide', 'medium', 'close', 'extreme_close')
 CAMERA_MOVES = ('static', 'push_in', 'pull_out', 'pan', 'tilt', 'orbit',
                 'follow', 'handheld', 'crane')
+# 拍摄角度拆成两栏，因为它们是**两根互相独立的轴**：同一拍完全可以既是低角度仰拍、
+# 又是从侧面拍的。捏成一栏就得二选一，而被丢掉的那一半正是原片最像自己的地方——
+# 「贴地仰拍」和「站着俯看」是同一道工序的两条完全不同的片子。
+# 倾斜（荷兰角）严格说是第三根轴（滚转），但它罕见且一旦出现就是这一拍最抢眼的角度
+# 事实，所以并进 camera_angle，占掉那一格。
+CAMERA_ANGLES = ('bird_eye', 'high_angle', 'eye_level', 'low_angle', 'worm_eye', 'dutch_angle')
+CAMERA_BEARINGS = ('front', 'three_quarter', 'side', 'rear_three_quarter', 'back')
+# 焦段感（2026-08-25）。与景别是两件事：14mm 拍中景和 85mm 拍中景，透视、畸变、纵深
+# 完全两回事，而 camera_dna 里那句 "ultra-wide 16mm lens feel" 此前是模型自己编的。
+LENS_FEELS = ('ultra_wide', 'wide', 'normal', 'tele', 'macro')
+# 这一拍的时间处理。此前每一拍都被写成 "continuous construction time-lapse"——包括最后
+# 那个成品巡览拍，而原片的巡览基本都是实时的。没人报错，因为没有字段承接它。
+TIME_TREATMENTS = ('timelapse', 'real_time', 'slow_motion')
 
 SHOT_SCALE_LABELS_ZH = {
     'extreme_wide': '大远景', 'wide': '远景', 'medium': '中景',
     'close': '近景', 'extreme_close': '特写',
+}
+CAMERA_ANGLE_LABELS_ZH = {
+    'bird_eye': '鸟瞰', 'high_angle': '高角度俯拍', 'eye_level': '平视',
+    'low_angle': '低角度仰拍', 'worm_eye': '虫视', 'dutch_angle': '倾斜角',
+}
+CAMERA_BEARING_LABELS_ZH = {
+    'front': '正面', 'three_quarter': '前侧四分之三', 'side': '侧面',
+    'rear_three_quarter': '后侧四分之三', 'back': '背面',
+}
+LENS_FEEL_LABELS_ZH = {
+    'ultra_wide': '超广', 'wide': '广角', 'normal': '标准', 'tele': '长焦', 'macro': '微距',
+}
+TIME_TREATMENT_LABELS_ZH = {
+    'timelapse': '延时加速', 'real_time': '实时', 'slow_motion': '慢动作',
 }
 CAMERA_MOVE_LABELS_ZH = {
     'static': '固定', 'push_in': '缓推', 'pull_out': '缓拉', 'pan': '横摇',
@@ -2301,6 +2722,63 @@ _SHOT_SCALE_SYNONYMS = {
     'cu': 'close', 'close_up': 'close', 'closeup': 'close', 'close_shot': 'close',
     'ecu': 'extreme_close', 'extreme_close_up': 'extreme_close', 'macro': 'extreme_close',
     'detail': 'extreme_close', 'insert': 'extreme_close',
+}
+_CAMERA_ANGLE_SYNONYMS = {
+    'birds_eye': 'bird_eye', 'bird_s_eye': 'bird_eye', 'birdseye': 'bird_eye',
+    'top_down': 'bird_eye', 'topdown': 'bird_eye', 'overhead': 'bird_eye',
+    'straight_down': 'bird_eye', 'aerial': 'bird_eye', 'drone': 'bird_eye',
+    'plan_view': 'bird_eye', 'god_view': 'bird_eye',
+    'high': 'high_angle', 'looking_down': 'high_angle', 'downward': 'high_angle',
+    'elevated': 'high_angle', 'above': 'high_angle', 'raised': 'high_angle',
+    'eye': 'eye_level', 'eyelevel': 'eye_level', 'level': 'eye_level',
+    'neutral': 'eye_level', 'chest_height': 'eye_level', 'standing_height': 'eye_level',
+    'straight_on': 'eye_level', 'horizontal': 'eye_level',
+    'low': 'low_angle', 'looking_up': 'low_angle', 'upward': 'low_angle',
+    'below': 'low_angle', 'hero_angle': 'low_angle', 'up_angle': 'low_angle',
+    'worms_eye': 'worm_eye', 'worm_s_eye': 'worm_eye', 'wormseye': 'worm_eye',
+    'ground_level': 'worm_eye', 'ground': 'worm_eye', 'floor_level': 'worm_eye',
+    'straight_up': 'worm_eye',
+    'dutch': 'dutch_angle', 'dutch_tilt': 'dutch_angle', 'canted': 'dutch_angle',
+    'canted_angle': 'dutch_angle', 'tilted': 'dutch_angle', 'oblique': 'dutch_angle',
+    'skewed': 'dutch_angle',
+}
+_CAMERA_BEARING_SYNONYMS = {
+    'frontal': 'front', 'head_on': 'front', 'straight_on': 'front', 'face_on': 'front',
+    'front_on': 'front', 'facade': 'front',
+    'three_quarters': 'three_quarter', 'threequarter': 'three_quarter',
+    'front_three_quarter': 'three_quarter', 'front_quarter': 'three_quarter',
+    'corner': 'three_quarter', 'angled': 'three_quarter', 'diagonal': 'three_quarter',
+    'profile': 'side', 'lateral': 'side', 'side_on': 'side', 'broadside': 'side',
+    'flank': 'side', 'from_the_side': 'side',
+    'back_three_quarter': 'rear_three_quarter', 'rear_quarter': 'rear_three_quarter',
+    'over_the_shoulder': 'rear_three_quarter', 'ots': 'rear_three_quarter',
+    'rear': 'back', 'behind': 'back', 'from_behind': 'back', 'reverse': 'back',
+    'back_on': 'back', 'tail_on': 'back',
+}
+_LENS_FEEL_SYNONYMS = {
+    'ultrawide': 'ultra_wide', 'ultra_wide_angle': 'ultra_wide', 'uwa': 'ultra_wide',
+    'superwide': 'ultra_wide', 'super_wide': 'ultra_wide', 'fisheye': 'ultra_wide',
+    'action_cam': 'ultra_wide', 'gopro': 'ultra_wide', 'drone_lens': 'ultra_wide',
+    '10mm': 'ultra_wide', '12mm': 'ultra_wide', '14mm': 'ultra_wide', '16mm': 'ultra_wide',
+    '18mm': 'ultra_wide', '20mm': 'ultra_wide',
+    'wide_angle': 'wide', 'wideangle': 'wide', 'phone_wide': 'wide',
+    '24mm': 'wide', '28mm': 'wide', '35mm': 'wide',
+    'standard': 'normal', 'nifty_fifty': 'normal', 'natural_perspective': 'normal',
+    'no_distortion': 'normal', '40mm': 'normal', '50mm': 'normal', '55mm': 'normal',
+    'telephoto': 'tele', 'long_lens': 'tele', 'zoomed_in': 'tele', 'compressed': 'tele',
+    'flattened_perspective': 'tele',
+    '85mm': 'tele', '105mm': 'tele', '135mm': 'tele', '200mm': 'tele', '300mm': 'tele',
+    'macro_lens': 'macro', 'extreme_macro': 'macro', 'micro': 'macro', 'probe_lens': 'macro',
+}
+_TIME_TREATMENT_SYNONYMS = {
+    'time_lapse': 'timelapse', 'timelapsed': 'timelapse', 'hyperlapse': 'timelapse',
+    'sped_up': 'timelapse', 'speed_up': 'timelapse', 'fast_forward': 'timelapse',
+    'fastforward': 'timelapse', 'accelerated': 'timelapse', 'fast_motion': 'timelapse',
+    'realtime': 'real_time', 'real': 'real_time', 'normal_speed': 'real_time',
+    'actual_speed': 'real_time', 'one_x': 'real_time', '1x': 'real_time',
+    'live_action': 'real_time', 'unaccelerated': 'real_time',
+    'slowmo': 'slow_motion', 'slow_mo': 'slow_motion', 'slomo': 'slow_motion',
+    'high_speed': 'slow_motion', 'overcranked': 'slow_motion', 'slowed': 'slow_motion',
 }
 _CAMERA_MOVE_SYNONYMS = {
     'fixed': 'static', 'locked': 'static', 'locked_off': 'static', 'lockedoff': 'static',
@@ -2388,7 +2866,8 @@ def normalize_beat_craft_fields(beats_doc):
                 raw = beat[key]
                 items = raw if isinstance(raw, (list, tuple)) else [raw]
                 beat[key] = [str(x).strip() for x in items if str(x or '').strip()][:3]
-        for key in ('tool', 'tool_specifics', 'light_state', 'material_flow'):
+        for key in ('tool', 'tool_specifics', 'light_state', 'material_flow',
+                    'subject_placement'):
             if key in beat:
                 value = beat[key]
                 if isinstance(value, (list, tuple)):
@@ -2400,6 +2879,18 @@ def normalize_beat_craft_fields(beats_doc):
         if 'camera_move' in beat:
             beat['camera_move'] = _coerce_enum(
                 beat['camera_move'], CAMERA_MOVES, _CAMERA_MOVE_SYNONYMS) or ''
+        if 'camera_angle' in beat:
+            beat['camera_angle'] = _coerce_enum(
+                beat['camera_angle'], CAMERA_ANGLES, _CAMERA_ANGLE_SYNONYMS) or ''
+        if 'camera_bearing' in beat:
+            beat['camera_bearing'] = _coerce_enum(
+                beat['camera_bearing'], CAMERA_BEARINGS, _CAMERA_BEARING_SYNONYMS) or ''
+        if 'lens_feel' in beat:
+            beat['lens_feel'] = _coerce_enum(
+                beat['lens_feel'], LENS_FEELS, _LENS_FEEL_SYNONYMS) or ''
+        if 'time_treatment' in beat:
+            beat['time_treatment'] = _coerce_enum(
+                beat['time_treatment'], TIME_TREATMENTS, _TIME_TREATMENT_SYNONYMS) or ''
         if 'worker_count' in beat:
             count = _coerce_count(beat['worker_count'])
             if count is None:
@@ -2884,7 +3375,9 @@ def _ambient_concepts(text):
 
 _CRAFT_FIELD_LABELS = (
     ('tool', '主导工具'), ('sfx', '本拍声音'), ('shot_scale', '景别'),
-    ('camera_move', '运镜'), ('worker_count', '工人数'),
+    ('camera_angle', '拍摄角度'), ('camera_bearing', '机位方位'),
+    ('lens_feel', '焦段感'), ('subject_placement', '主体构图'),
+    ('camera_move', '运镜'), ('time_treatment', '时间处理'), ('worker_count', '工人数'),
     ('light_state', '光照时段'), ('material_flow', '物料去向'),
 )
 
@@ -3120,6 +3613,16 @@ _CRAFT_FIELD_WHY = {
            '而交付口径是 ASMR 原声 60%、BGM 0%——空着就只能由模型自己编声音。',
     'shot_scale': '复刻线逐拍此前没有任何机位字段，空着等于这一拍的景别由合成器替原片决定。',
     'camera_move': '同上——运镜空着，原片的镜头语言这一格就没锁住。',
+    'camera_angle': '俯仰角度（鸟瞰/俯拍/平视/仰拍/虫视/倾斜）是原片最像自己的一格：'
+                    '同一道工序，贴地仰拍和站着俯看是两条完全不同的片子。空着就由合成器'
+                    '默认成平视。',
+    'camera_bearing': '方位（正面/侧面/背面）和俯仰是两根独立的轴，只标一根等于扔掉另一半。',
+    'lens_feel': '焦段和景别是两件事：14mm 拍中景和 85mm 拍中景，透视、畸变、纵深完全两回事。'
+                 '空着，机位句里那个「超广 16mm」就还是编的。',
+    'subject_placement': '主体在画面哪儿、占多高——锚点的位置与占比此前从没在原片上量过，'
+                         '全是合成器按主题编的。空着，角度标得再准，构图也还是另一条片子的。',
+    'time_treatment': '空着，这一拍就会被默认写成延时加速——包括最后那个成品巡览拍，'
+                      '而原片的巡览基本都是实时的。',
     'worker_count': '「有工人」那枚芯片只是个布尔，且它压根没进合成绑定，'
                     '十几拍下来人数会自己漂。0 是清场帧，空着是没标注，两者不一样。',
     'light_state': '延时片跨天跨时段，不逐拍声明光照，每拍的光就会自己跳。',
@@ -3175,6 +3678,56 @@ def validate_beats(beats_doc, overview, schema=None):
     out.extend(_validate_temporary_objects(beats))
     out.extend(_validate_composer_frame_contract(beats))
     out.extend(_validate_beat_craft(beats))
+    out.extend(_validate_camera_angle_consistency(beats))
+    return out
+
+
+def _validate_camera_angle_consistency(beats):
+    """同一个空间里的拍摄角度不一致时说出来。
+
+    为什么必须说：IMAGE 的开场机位句是**族级**的（一个空间共用一句，见
+    `pp.observed_camera_angle_packet_rule`），所以一个空间只落得下**一个**角度——按这个
+    空间里出现最多的那一对写。于是标成少数派的那几拍，图会按多数派的角度出，只有它们的
+    VIDEO 还守着自己的角度。
+
+    这不是 bug，是族级机位这套结构的边界，但它绝不能静默发生：用户看着卡片上明明写了
+    「B07 鸟瞰」，出来的图却是平视，而整条链路一声不吭。所以在人工卡点上摊开，让他自己
+    决定——要么把那几拍的角度改成和同族一致（原片其实没换机位，是读错了），要么把它们
+    的 `space` 标成另一个空间（原片是真换了机位，那本来就该是另一个机位族）。
+    """
+    by_space = {}
+    for position, beat in enumerate(beats or [], start=1):
+        if not isinstance(beat, dict):
+            continue
+        angle = str(beat.get('camera_angle') or '').strip()
+        bearing = str(beat.get('camera_bearing') or '').strip()
+        if not angle and not bearing:
+            continue
+        space = str(beat.get('space') or '').strip() or '（未标空间）'
+        bid = str(beat.get('id') or f'B{position:02d}')
+        by_space.setdefault(space, []).append((bid, (angle, bearing)))
+
+    out = []
+    for space, rows in by_space.items():
+        counts = {}
+        for _bid, pair in rows:
+            counts[pair] = counts.get(pair, 0) + 1
+        if len(counts) < 2:
+            continue
+        dominant = max(counts.items(), key=lambda kv: kv[1])[0]
+        odd = [bid for bid, pair in rows if pair != dominant]
+        _label = lambda pair: ' / '.join(
+            x for x in (CAMERA_ANGLE_LABELS_ZH.get(pair[0], pair[0]),
+                        CAMERA_BEARING_LABELS_ZH.get(pair[1], pair[1])) if x)
+        out.append(_warn(
+            'mixed_camera_angle',
+            f'空间「{space}」里有两种以上拍摄角度：多数拍是{_label(dominant)}，'
+            f'而 {"、".join(odd)} 标的是'
+            f'{"；".join(sorted({_label(pair) for bid, pair in rows if pair != dominant}))}。'
+            f'同一个空间的静帧共用一句机位声明，只落得下一个角度——这几拍的**图**会按'
+            f'{_label(dominant)}出，只有它们的视频片段守着自己的角度。'
+            f'原片其实没换机位就把它们改回一致；原片真换了机位，就把这几拍的「空间」'
+            f'另起一个名字，它们会自己成为一个独立机位族。'))
     return out
 
 
@@ -3807,7 +4360,7 @@ WHAT YOU MUST NOT CHANGE
 WHAT YOU REWRITE
 Only along the requested mutation axes: visual_subject, visible_details, visible_action, visible_result, state_before, state_after, persistent_traces, operation, tool, sfx, material_flow, and the space NAMES (never their grouping).
 - tool / sfx / material_flow must be re-derived for the NEW carrier and its materials: the tool that achieves the same milestone on the new carrier, the sounds that tool and that material actually make, and where the new material's waste goes. A steel hull does not sound like a plaster wall.
-- shot_scale, camera_move and worker_count are the rhythm skeleton, not the subject. Leave them exactly as given; never restage the camera.
+- shot_scale, camera_angle, camera_bearing, lens_feel, subject_placement, camera_move, time_treatment and worker_count are the rhythm skeleton, not the subject. Leave them exactly as given; never restage the camera — the angle a shot is taken from belongs to the film being reproduced, not to what is being built in it.
 
 RULES
 - Do not carry the old carrier's construction habits onto the new one. A bus does not get brick footings; a boat hull does not get drywall screwed to studs. Re-derive the operation that achieves the SAME stage milestone on the NEW carrier.
@@ -4192,8 +4745,9 @@ _CRAFT_REWRITE_FIELDS = (
 # 只补空、绝不覆盖已有值的字段。用户在卡点上手填过的，模型不得改写——他看着帧填的，
 # 模型看着同一批帧只是再猜一遍。
 _CRAFT_FILL_FIELDS = (
-    'tool', 'sfx', 'shot_scale', 'camera_move', 'worker_count',
-    'light_state', 'material_flow', 'cast_action', 'insert_subject',
+    'tool', 'sfx', 'shot_scale', 'camera_angle', 'camera_bearing', 'lens_feel',
+    'subject_placement', 'camera_move', 'time_treatment',
+    'worker_count', 'light_state', 'material_flow', 'cast_action', 'insert_subject',
 )
 
 # 每种症状给模型的定向指令。措辞与 `_validate_beat_craft` 报给用户的那几条同源，
@@ -4249,6 +4803,26 @@ _CRAFT_FILL_BRIEFS = {
     'shot_scale': "shot_scale: one of extreme_wide | wide | medium | close | extreme_close.",
     'camera_move': ("camera_move: one of static | push_in | pull_out | pan | tilt | orbit | follow | "
                     "handheld | crane. Closed set - do not write free text."),
+    'camera_angle': ("camera_angle: where the camera is VERTICALLY - one of bird_eye | high_angle | "
+                     "eye_level | low_angle | worm_eye | dutch_angle. Read it off the frame's own "
+                     "geometry (converging lines, which faces of objects are visible, where the "
+                     "horizon sits), not off the work. Closed set - do not write free text."),
+    'camera_bearing': ("camera_bearing: where the camera is HORIZONTALLY - one of front | "
+                       "three_quarter | side | rear_three_quarter | back, i.e. which face of the "
+                       "subject the lens looks at. Independent of camera_angle; declare both. "
+                       "Closed set - do not write free text."),
+    'lens_feel': ("lens_feel: how wide the lens is - one of ultra_wide | wide | normal | tele | "
+                  "macro. Read it off the perspective (edge curvature and looming near objects vs a "
+                  "compressed flattened background), not off how much of the scene is in shot. "
+                  "Closed set - do not write free text."),
+    'subject_placement': ("subject_placement: one short sentence - where the main subject sits "
+                          "(horizontal position in thirds, vertical position), what fraction of "
+                          "frame HEIGHT it fills, and where the horizon sits if visible. Fractions "
+                          "in words, never digits or percent signs."),
+    'time_treatment': ("time_treatment: how time runs in this beat - one of timelapse | real_time | "
+                       "slow_motion. Judge it by how fast bodies and material move between this "
+                       "beat's own frames. A final walk-through/reveal is almost always real_time. "
+                       "Closed set - do not write free text."),
     'worker_count': "worker_count: integer count of people visible in this beat's frames.",
     'light_state': "light_state: lighting and time of day ('overcast midday, no cast shadows').",
     'material_flow': ("material_flow: where the spoil went and where the stock came from "
@@ -4277,8 +4851,9 @@ Rewrite (wording only, same facts):
   visual_subject, visible_details, visible_action, visible_result,
   state_before, state_after, persistent_traces, operation, macro_environment
 Fill in ONLY if listed as missing below (never overwrite a value that is already there):
-  tool, sfx, shot_scale, camera_move, worker_count, light_state, material_flow,
-  cast_action, insert_subject
+  tool, sfx, shot_scale, camera_angle, camera_bearing, lens_feel, subject_placement,
+  camera_move, time_treatment, worker_count, light_state, material_flow, cast_action,
+  insert_subject
 
 =========== OUTPUT ===========
 Return ONE JSON object, no commentary, no code fences. Include ONLY the fields you actually changed:
@@ -4448,6 +5023,10 @@ def refine_beat_craft(config, beats_doc, overview=None, frames_dir=None, on_prog
             on_progress('replica_stage', {
                 'stage': 'review_beats',
                 'message': f'工艺精修 {seq}/{total}：{bid}（{len(briefs)} 项）…',
+                # 分子/分母单独给字段，不只写进文案：进度条要拿它算段内百分比。
+                # 这一段是逐拍多模态调用，十几拍就是几分钟——没有它进度条全程不动。
+                'done': seq - 1,
+                'total': total,
             })
 
         try:
@@ -4724,7 +5303,12 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
             items = [str(x).strip() for x in (beat.get(src) or []) if str(x).strip()]
             if items:
                 entry[dst] = items
+        # 拍摄角度两栏（2026-08-25）走同一条通路。键名保持全称：`angle` / `bearing`
+        # 单看容易被读成「墙角」「方位角」，而这两个词会原样渲进规划提示词。
         for src, dst in (('shot_scale', 'shot_scale'), ('camera_move', 'camera_move'),
+                         ('camera_angle', 'camera_angle'), ('camera_bearing', 'camera_bearing'),
+                         ('lens_feel', 'lens_feel'), ('subject_placement', 'placement'),
+                         ('time_treatment', 'time_treatment'),
                          ('light_state', 'light'), ('material_flow', 'flow')):
             value = str(beat.get(src) or '').strip()
             if value:
@@ -4808,7 +5392,17 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
             )
         if first_beat.get('state_before'):
             dimensions['initial_state_before'] = str(first_beat.get('state_before')).strip()
-        attire = str(beats_doc.get('worker_attire') or first_beat.get('worker_attire') or '').strip()
+        # worker_attire 是给合成侧那条「主题自适应着装」规则用的单句权威口径。
+        # cast_identity（全片级、含人种/肤色）落在 scene_constants.cast 里，整段随
+        # SCENE CONSTANTS 进每一条提示词；这里额外把第一位（出镜最多的那个）折成一句
+        # 兜底 worker_attire，免得那条老规则在没有 worker_attire 的单子上回落成
+        # 「通用工装」，跟 SCENE CONSTANTS 里的真人对撞。
+        _cast = [str(x).strip()
+                 for x in ((beats_doc.get('scene_constants') or {}).get('cast')
+                           or beats_doc.get('cast_identity') or [])
+                 if str(x).strip()]
+        attire = str(beats_doc.get('worker_attire') or first_beat.get('worker_attire')
+                     or (_cast[0] if _cast else '')).strip()
         if attire:
             dimensions['worker_attire'] = attire
     dimensions['mutation_axes'] = list(beats_doc.get('mutation_axes') or [])

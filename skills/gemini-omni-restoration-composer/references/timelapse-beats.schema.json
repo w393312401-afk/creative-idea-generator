@@ -42,6 +42,20 @@
       "items": { "type": "string" },
       "description": "Pass B 产出口：整片一直在动的环境物（见 scene_constants.motion 的说明）。attach_scene_constants 会把它并进 scene_constants.motion，之后以那一份为准——两处并存只是因为机械统计与模型产出走的是两条路，最终只有一个真相源。"
     },
+    "ambient_sound": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Pass B 产出口：整片声轨上一直在响、且没有人在制造的声音（风穿树冠、溪流、远处车流、海浪、雨打屋顶、空混凝土房间的混响、虫鸣）。它是 ambient_motion 的听觉对偶——每一拍的 sfx 是「这一下活儿的声音」，这一栏是「没人干活时这地方的声音」。attach_scene_constants 会把它并进 scene_constants.ambient_sound；不给它落脚点，每条 VIDEO 结尾那句 Ambient noise 都是现编的，整片声场一拍一个样。"
+    },
+    "color_grade": {
+      "type": "string",
+      "description": "Pass B 产出口：整片的影调，一句话，只写摄影口径——色温偏向、对比、饱和、黑位、胶片/数码质感。绝不写情绪与品类词（cinematic / dramatic / moody / epic），那些不是影调，下游只会各自渲染自己对那个词的想象。attach_scene_constants 会把它并进 scene_constants.grade（装成单元素列表，因为这个容器全链路按列表读）。"
+    },
+    "cast_identity": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Pass B 产出口：整片反复出现的活物（每个工人/助手/人偶/动物）各一条的固定外形——人种与肤色、身形与年龄段、发型胡须、帽子、上衣与颜色、裤子与颜色、鞋。只写外形，不写动作（动作是每一拍自己的 cast_action）。attach_scene_constants 会把它并进 scene_constants.cast，之后以那一份为准；与 ambient_motion 同一条「两处并存、最终只有一个真相源」的理由。"
+    },
     "scene_constants": {
       "type": "object",
       "description": "场景恒常特征，由 prompt_pipeline.reverse.analyze_scene_constants 从帧事实本地统计（出现在超过三成半帧里的可见物），不花模型调用。存在的理由：整条反推链路围绕**变化**而建，节拍只承载每拍 delta，恒常的东西不产生 delta，于是被整条压掉——实测一条片子 57% 的帧都记到了墙上的污渍，而它在节拍阶梯里一个字都没有。人工卡点上可编辑；删空后不会被重新统计回来（判键在不在，不判值真不真）。",
@@ -50,6 +64,21 @@
         "materials": { "type": "array", "items": { "type": "string" } },
         "traces": { "type": "array", "items": { "type": "string" } },
         "fixtures_in_shot": { "type": "array", "items": { "type": "string" } },
+        "cast": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "全片常驻的活物（人/人偶/动物）各一条的固定外形：人种与肤色、身形与年龄段、发型胡须、帽子、上衣与颜色、裤子与颜色、鞋。来源二选一——Pass B 的顶层 cast_identity 优先（它看的是整段帧序列，写得出「全片同一个人」这层意思），没有就退回帧事实 cast_appearance 的本地统计。它的失效方式比其余各栏更刺眼：每一帧都是独立生成的，图像模型对上一帧没有记忆，外形不在这一条提示词里复述一遍就会被重新掷一次骰子——同一条片子里换人种、换肤色、换发型，休闲工装变成反光背心加安全帽。合成侧据此要求每一条 IMAGE/VIDEO 逐条复述这份外形，只换姿势不换人。"
+        },
+        "grade": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "全片影调（来自顶层 color_grade，通常只有一条）。「像不像那条片子」的第一眼因素，而它此前在这条链路上一个字都没有：每一帧的色温、对比、饱和都由图像模型自己定，十几张图拼起来像十几条片子。"
+        },
+        "ambient_sound": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "整片一直在响的环境底噪（来自顶层 ambient_sound）。与 motion 严格对称：那一栏是「一直在动」，这一栏是「一直在响」，两栏都统计不出来（帧事实是一张张无声的静止画面），只能由 Pass B 读或人在卡点上补。"
+        },
         "motion": {
           "type": "array",
           "items": { "type": "string" },
@@ -242,6 +271,32 @@
           "type": "string",
           "enum": ["static", "push_in", "pull_out", "pan", "tilt", "orbit", "follow", "handheld", "crane"],
           "description": "本拍运镜。闭集枚举，不收自由文本——自由文本会被规划器当成创作提示重新发挥。过门拍通常是 push_in / follow。"
+        },
+        "camera_angle": {
+          "type": "string",
+          "enum": ["bird_eye", "high_angle", "eye_level", "low_angle", "worm_eye", "dutch_angle"],
+          "description": "本拍机位的**垂直**角度：鸟瞰 / 高角度俯拍 / 平视 / 低角度仰拍 / 虫视 / 倾斜角。按画面自身的几何读（透视线往哪收、看得见物体的顶面还是底面、地平线落在画面第几分）——不是按工序猜。与 camera_bearing 是两根互相独立的轴，两栏都要标：同一道工序，贴地仰拍和站着俯看是两条完全不同的片子。倾斜角严格说是第三根轴（滚转），但它一旦出现就是这一拍最抢眼的角度事实，占掉这一格；只用于画面整体歪着（地平线本身是斜的），不要拿它表示「机位偏到一侧」。",
+          "x-binding": "beats_to_dimensions → _outline_normalized_entries → build_outline_plan_block 的 ANGLE 规则；并由 observed_camera_angle_packet_rule 写进族级 camera_dna（IMAGE 的开场句是族级的，逐拍再写一句角度只会和它打架）。"
+        },
+        "camera_bearing": {
+          "type": "string",
+          "enum": ["front", "three_quarter", "side", "rear_three_quarter", "back"],
+          "description": "本拍机位的**水平**方位：镜头对着主体的哪一面——正面 / 前侧四分之三（正面与一个侧面同时可见）/ 侧面 / 后侧四分之三 / 背面。闭集枚举，不收自由文本。"
+        },
+        "lens_feel": {
+          "type": "string",
+          "enum": ["ultra_wide", "wide", "normal", "tele", "macro"],
+          "description": "本拍的焦段感。与 shot_scale 是两件事：广角站远和长焦站近都能拍到「整面墙」，画面却完全不像。按透视本身读——边缘畸变与近处物体夸张（超广）、背景被压扁贴到主体上（长焦）、接近肉眼（标准）。camera_dna 里那句「ultra-wide 16mm lens feel」在这一栏出现之前是模型自己编的。"
+        },
+        "subject_placement": {
+          "type": "string",
+          "description": "主体在这一拍画面里的位置与占比，一句话：左/中/右（按三分）、上/下、占画面高度几分之几，以及地平线落在第几分。分数写英文单词，绝不写数字与百分号（会被图像模型当文字画进画面）。**这是整条链路上唯一一次量原片的构图**：primary_landmarks 的 grid 与 z_depth_scale 此前全由 packet 那次调用按主题编，再对齐我们自己渲出来的图，跟原片没有任何关系。",
+          "x-binding": "beats_to_dimensions（键收短成 placement）→ _outline_normalized_entries → build_outline_plan_block 的 PLACEMENT 规则；并由 observed_camera_angle_packet_rule 约束 packet 里的 z_depth_scale 与地平线钉位。"
+        },
+        "time_treatment": {
+          "type": "string",
+          "enum": ["timelapse", "real_time", "slow_motion"],
+          "description": "这一拍的时间处理。按本拍窗口内人与物料的移动速度读，不是按全片的 speed_multiplier。这类片子的最后一拍成品巡览几乎都是实时的，而它周围每一拍都是延时——此前所有拍一律被写成 \"continuous construction time-lapse\"，于是一段从容的成品巡览被交付成一条发疯的快放。"
         },
         "worker_count": {
           "type": "integer",

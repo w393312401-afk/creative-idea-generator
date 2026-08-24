@@ -838,111 +838,14 @@ class TestReworkDecayPlaceholderBeat(unittest.TestCase):
         self.assertEqual(out, STERILE_IMAGE)
 
 
-# --- FIRST INTERIOR REVEAL 强制衰败措辞事后校验（2026-07-21 水磨坊实测：过门后室内
-# 首现拍 (is_first_interior_reveal) 本该强制展示≥2类衰败痕迹的条款被 LLM 静默跳过，
-# 渲成了 "Completely sterile."——此前完全没有事后校验能抓到这个) ---
-
-FIRST_REVEAL_STERILE = (
-    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
-    "perspective down the central loft axis; camera pitch locked level; central "
-    "vanishing axis centered. Completely sterile. Locked anchors: historic cast-iron "
-    "drive gear hub at Grid B2 holding 45 percent of frame height."
-)
-
-FIRST_REVEAL_ONE_CATEGORY = (
-    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
-    "perspective down the central loft axis; camera pitch locked level. Rust streaks "
-    "down the cast-iron gear hub. Locked anchors: historic cast-iron drive gear hub at "
-    "Grid B2 holding 45 percent of frame height."
-)
-
-FIRST_REVEAL_TWO_CATEGORIES = (
-    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
-    "perspective down the central loft axis; camera pitch locked level. Rust streaks "
-    "down the cast-iron gear hub above a floor strewn with fallen debris. Locked "
-    "anchors: historic cast-iron drive gear hub at Grid B2 holding 45 percent of frame height."
-)
-
-FIRST_REVEAL_GOOD = (
-    "Static wide 18mm interior tripod shot, camera height 1.6m, locked eye-level "
-    "perspective down the central loft axis; camera pitch locked level. Rust streaks "
-    "down the cast-iron gear hub beside a thick patch of moss spreading across the "
-    "collapsed roof section overhead. Locked anchors: historic cast-iron drive gear hub "
-    "at Grid B2 holding 45 percent of frame height."
-)
-
-
-class TestCheckFirstInteriorRevealDecay(unittest.TestCase):
-    def test_not_first_reveal_is_noop_even_if_sterile(self):
-        self.assertEqual(pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, False), [])
-
-    def test_first_reveal_with_zero_categories_is_flagged(self):
-        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, True)
-        self.assertTrue(errs)
-        self.assertIn('FIRST INTERIOR REVEAL', errs[0])
-
-    def test_first_reveal_with_only_one_category_is_flagged(self):
-        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_ONE_CATEGORY, True)
-        self.assertTrue(errs)
-
-    def test_first_reveal_with_three_categories_passes(self):
-        # 锈迹(surface) + 苔藓(vegetation) + 塌陷(structural)
-        self.assertEqual(pp.check_first_interior_reveal_decay(FIRST_REVEAL_GOOD, True), [])
-
-    def test_first_reveal_with_only_two_categories_is_flagged(self):
-        # 2026-07-26 加严：门槛从 2 类提到 3 类，与 IMAGE 1 自己的 GENUINE DAMAGE 审计对齐
-        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_TWO_CATEGORIES, True)
-        self.assertTrue(errs)
-        self.assertIn('3+ decay categories', errs[0])
-
-    def test_empty_prompt_is_noop(self):
-        self.assertEqual(pp.check_first_interior_reveal_decay('', True), [])
-
-
-class TestFirstInteriorRevealInterventionEvidence(unittest.TestCase):
-    """2026-07-26 用户实测："过门帧有人工痕迹、不够原始"。首现帧按契约是没人进来过的
-    废墟，正文里出现梯子/工具/码放整齐的材料/刚清理过的地面 = 契约被违反；但契约本身
-    又鼓励写"no ladders, no tools anywhere in frame"这类澄清句（VLM 反馈修复更是主动
-    加这种句子），所以否定式表述必须放行。"""
-
-    def test_asserted_intervention_evidence_is_flagged(self):
-        prompt = FIRST_REVEAL_GOOD + " An aluminium ladder leans against the far wall beside neatly stacked timber."
-        errs = pp.check_first_interior_reveal_decay(prompt, True)
-        self.assertTrue(any('zero intervention evidence' in e for e in errs))
-        self.assertTrue(any('ladder' in e for e in errs))
-
-    def test_negated_absence_clause_is_not_flagged(self):
-        prompt = (FIRST_REVEAL_GOOD +
-                  " No ladders, no tools, no scaffolding and no staged materials anywhere in frame; "
-                  "every surface is untouched original decay.")
-        self.assertEqual(pp.check_first_interior_reveal_decay(prompt, True), [])
-
-    def test_intervention_check_is_skipped_for_other_beats(self):
-        prompt = FIRST_REVEAL_GOOD + " A ladder leans against the far wall."
-        self.assertEqual(pp.check_first_interior_reveal_decay(prompt, False), [])
-
-
-class TestReworkFirstInteriorRevealDecayBeat(unittest.TestCase):
-    def test_valid_rewrite_is_adopted(self):
-        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, True)
-        with patch.object(pp, '_chat', return_value=FIRST_REVEAL_GOOD):
-            out, adopted = pp.rework_first_interior_reveal_decay_beat({}, 4, FIRST_REVEAL_STERILE, errs)
-        self.assertTrue(adopted)
-        self.assertEqual(out, FIRST_REVEAL_GOOD)
-
-    def test_rewrite_still_insufficient_is_rejected(self):
-        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, True)
-        with patch.object(pp, '_chat', return_value=FIRST_REVEAL_ONE_CATEGORY):
-            out, adopted = pp.rework_first_interior_reveal_decay_beat({}, 4, FIRST_REVEAL_STERILE, errs)
-        self.assertFalse(adopted)
-        self.assertEqual(out, FIRST_REVEAL_STERILE)
-
-    def test_llm_exception_keeps_original(self):
-        errs = pp.check_first_interior_reveal_decay(FIRST_REVEAL_STERILE, True)
-        with patch.object(pp, '_chat', side_effect=RuntimeError('gateway down')):
-            out, adopted = pp.rework_first_interior_reveal_decay_beat({}, 4, FIRST_REVEAL_STERILE, errs)
-        self.assertFalse(adopted)
-        self.assertEqual(out, FIRST_REVEAL_STERILE)
+# --- FIRST INTERIOR REVEAL 强制衰败措辞校验：已于 2026-08-24 整条删除 ---
+#
+# 原本这里有三组用例（衰败类目计数、人工痕迹判定、定向回炉），守的是「过门后室内首现
+# 帧必须是没人碰过的废墟」那条硬规则。这条线现在跑的全是爆款复刻——门后是什么样由原片
+# 说了算，模板不再有权规定——check_first_interior_reveal_decay /
+# rework_first_interior_reveal_decay_beat 与 'decay' 那路缺陷回炉一并删除，用例随之退役。
+# 仍然生效、并且仍有用例覆盖的是防倒退那一半（见 test_envelope_seal_monotonicity.py 的
+# test_first_interior_reveal_scopes_untouched_to_unworked_surfaces）。
 
 
 # --- 相似度免检清单不再豁免 'sterile'（2026-07-21）：之前 'sterile' 在

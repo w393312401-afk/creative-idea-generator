@@ -162,7 +162,11 @@ class TestScopeAndFailure(unittest.TestCase):
                       persistent_traces=['screw dimples along the joist line',
                                          'sawdust smear on the trestle top'],
                       tool='cordless impact driver', sfx=['clutch chatter'],
-                      shot_scale='medium', camera_move='static', worker_count=1,
+                      shot_scale='medium', camera_move='static',
+                      camera_angle='eye_level', camera_bearing='front',
+                      lens_feel='wide', time_treatment='timelapse',
+                      subject_placement='the open bay sits centred, filling about half the frame height',
+                      worker_count=1,
                       light_state='overcast midday', material_flow='sheets from the left stack',
                       cast_action='the worker crouches under the open bay',
                       source_event_ids=['E02'], evidence_frames=['review_006.png'])

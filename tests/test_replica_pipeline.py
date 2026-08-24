@@ -10,6 +10,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -289,6 +290,61 @@ class TestSamplingDensity(ExtractedJobCase):
         self._run_extract_capturing_argv(state, base_fps=4)
         self.assertFalse(os.path.exists(cache))
         self.assertFalse(os.path.exists(stale))
+
+
+class TestExtractProgress(ExtractedJobCase):
+    """抽帧这一段此前是纯哑区：脚本只在结束时 print，页面上长视频要静默好几分钟。"""
+
+    def test_frames_landing_on_disk_are_reported_as_progress(self):
+        state = self._ingest()
+        collage = os.path.join(rp.job_dir(state['job_id']), 'clip_collage.jpg')
+        with open(collage, 'wb') as f:
+            f.write(b'jpg')
+        self._write_overview(state['job_id'], collage)
+        frames_dir = os.path.join(rp.job_dir(state['job_id']), 'review_frames')
+        events = []
+
+        # 帧必须在 communicate 期间才落盘：run_extract 开头会 _purge_extract_products，
+        # 把 review_frames 整个 rmtree 掉。预先铺好的帧在数帧线程跑起来之前就没了——
+        # 这也正是真实时序（目录是抽帧脚本自己建的）。
+        def fake_communicate(timeout=None):
+            os.makedirs(frames_dir, exist_ok=True)
+            for i in range(6):
+                with open(os.path.join(frames_dir, f'review_{i:03d}.png'), 'wb') as f:
+                    f.write(b'png')
+            time.sleep(2.4)
+            return ('', '')
+
+        def fake_popen(*_a, **_kw):
+            proc = MagicMock()
+            proc.communicate.side_effect = fake_communicate
+            proc.returncode = 0
+            return proc
+
+        with patch.object(rp.subprocess, 'Popen', side_effect=fake_popen), \
+             patch.object(rp, '_analyzer_script', return_value='/fake/analyze.py'):
+            rp.run_extract(state, on_progress=lambda stage, d: events.append((stage, d)),
+                           base_fps=2)
+
+        ticks = [d for stage, d in events
+                 if stage == 'replica_stage' and d.get('stage') == 'extract' and 'done' in d]
+        self.assertTrue(ticks, '抽帧过程中必须报出已落盘的帧数，否则这一段还是哑的')
+        # 分母是估的（时长 × 基线 fps），所以百分比封顶在 95%——先走到头再倒退比不动更糟。
+        self.assertTrue(all(t['done'] <= t['total'] * 0.95 + 1 for t in ticks))
+
+    def test_without_a_progress_callback_it_stays_on_the_simple_path(self):
+        """没人听进度时不该白起一条数文件的线程。"""
+        state = self._ingest()
+        collage = os.path.join(rp.job_dir(state['job_id']), 'clip_collage.jpg')
+        with open(collage, 'wb') as f:
+            f.write(b'jpg')
+        self._write_overview(state['job_id'], collage)
+        with patch.object(rp.subprocess, 'run') as run, \
+             patch.object(rp.subprocess, 'Popen') as popen, \
+             patch.object(rp, '_analyzer_script', return_value='/fake/analyze.py'):
+            run.return_value.returncode = 0
+            rp.run_extract(state, base_fps=2)
+        popen.assert_not_called()
 
 
 class TestReviewScopeThreading(ReplicaTempRootCase):
@@ -920,7 +976,9 @@ class TestPublishToProject(ReplicaTempRootCase):
                 rp.publish_to_project(state['job_id'])
 
 
-class TestSaveBeats(ReplicaTempRootCase):
+# 节拍相关用例的公共夹具。单独一层是为了让撤销那组用例能复用它，而不是去继承
+# TestSaveBeats——继承会把保存那一组的用例连带再跑一遍，跑绿的数字是假的。
+class BeatsFixtureCase(ReplicaTempRootCase):
     def _job_with_overview(self):
         state = self._ingest()
         payload = {
@@ -950,6 +1008,8 @@ class TestSaveBeats(ReplicaTempRootCase):
         beat.update(kw)
         return beat
 
+
+class TestSaveBeats(BeatsFixtureCase):
     def test_user_edits_are_revalidated_not_just_stored(self):
         """用户拆合了拍就可能拆出新的事件覆盖漏洞——只存不验等于把漏洞放行。"""
         state = self._job_with_overview()
@@ -991,6 +1051,84 @@ class TestSaveBeats(ReplicaTempRootCase):
     def test_unknown_job_is_rejected(self):
         with self.assertRaises(ValueError):
             rp.save_beats('replica_nope', {'beats': [self._beat()]})
+
+
+class TestUndoBeats(BeatsFixtureCase):
+    """整份覆盖必须留一版可回退。
+
+    autofix / 工艺精修 / 自动平衡 / 重跑聚类都是整份覆盖，此前磁盘上不留任何旧版：
+    模型把一条手工调好的阶梯改坏了，只能重跑 Pass B——重新付钱，结果还不一样。
+    """
+
+    def test_overwriting_leaves_the_previous_version_on_disk(self):
+        state = self._job_with_overview()
+        rp.save_beats(state['job_id'], {'video_duration_sec': 10.0, 'banned_elements': [],
+                                        'beats': [self._beat(operation='first')]})
+        # 第一次写的时候盘上还没有旧版，不该凭空造一个。
+        self.assertFalse(os.path.exists(rp._beats_prev_path(state['job_id'])))
+
+        rp.save_beats(state['job_id'], {'video_duration_sec': 10.0, 'banned_elements': [],
+                                        'beats': [self._beat(operation='second')]})
+        self.assertTrue(os.path.exists(rp._beats_prev_path(state['job_id'])))
+
+    def test_undo_restores_the_previous_ladder(self):
+        state = self._job_with_overview()
+        job_id = state['job_id']
+        for op in ('first', 'second'):
+            rp.save_beats(job_id, {'video_duration_sec': 10.0, 'banned_elements': [],
+                                   'beats': [self._beat(operation=op)]})
+        out = rp.undo_beats(job_id)
+        self.assertEqual(out['beats']['beats'][0]['operation'], 'first')
+        # 磁盘也要跟着回退，不能只改内存里那一份。
+        reloaded = rp.get_replica_status(job_id)
+        self.assertEqual(reloaded['beats']['beats'][0]['operation'], 'first')
+
+    def test_undo_is_itself_undoable(self):
+        """做成对调而不是单向恢复：误点一次撤销就把刚跑完的那一轮永久丢了，
+        而那正是这个功能要防的事，不该由它自己再制造一次。"""
+        state = self._job_with_overview()
+        job_id = state['job_id']
+        for op in ('first', 'second'):
+            rp.save_beats(job_id, {'video_duration_sec': 10.0, 'banned_elements': [],
+                                   'beats': [self._beat(operation=op)]})
+        rp.undo_beats(job_id)
+        out = rp.undo_beats(job_id)
+        self.assertEqual(out['beats']['beats'][0]['operation'], 'second')
+
+    def test_undo_invalidates_the_prompt_composed_from_the_ladder_it_replaced(self):
+        """撤销之后还留着旧提示词，用户会拿着一份跟当前阶梯对不上的东西去交付，
+        而页面上看不出任何异样。"""
+        state = self._job_with_overview()
+        job_id = state['job_id']
+        for op in ('first', 'second'):
+            rp.save_beats(job_id, {'video_duration_sec': 10.0, 'banned_elements': [],
+                                   'beats': [self._beat(operation=op)]})
+        cur = rp._load_state(job_id)
+        cur['prompt_block'] = 'VIDEO 1: ...'
+        cur['stage'] = 'completed'
+        rp._save_state(cur)
+
+        out = rp.undo_beats(job_id)
+        self.assertFalse(out.get('prompt_block'))
+        self.assertEqual(out['stage'], 'review_beats')
+
+    def test_undo_without_a_previous_version_is_refused(self):
+        state = self._job_with_overview()
+        rp.save_beats(state['job_id'], {'video_duration_sec': 10.0, 'banned_elements': [],
+                                        'beats': [self._beat()]})
+        with self.assertRaises(ValueError):
+            rp.undo_beats(state['job_id'])
+
+    def test_status_tells_the_page_whether_undo_is_available(self):
+        """没有可回退版本时摆一个点了必然报错的按钮，比不摆更糟。"""
+        state = self._job_with_overview()
+        job_id = state['job_id']
+        rp.save_beats(job_id, {'video_duration_sec': 10.0, 'banned_elements': [],
+                               'beats': [self._beat(operation='first')]})
+        self.assertFalse(rp.get_replica_status(job_id)['beats_undo_available'])
+        rp.save_beats(job_id, {'video_duration_sec': 10.0, 'banned_elements': [],
+                               'beats': [self._beat(operation='second')]})
+        self.assertTrue(rp.get_replica_status(job_id)['beats_undo_available'])
 
 
 class TestDeleteGuard(ReplicaTempRootCase):

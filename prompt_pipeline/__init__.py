@@ -4590,6 +4590,11 @@ _OBSERVED_CRAFT_KEYS = (
     ('crew', 'crew'),
     ('shot_scale', 'shot_scale'),
     ('camera_move', 'camera_move'),
+    ('camera_angle', 'camera_angle'),
+    ('camera_bearing', 'camera_bearing'),
+    ('lens_feel', 'lens_feel'),
+    ('placement', 'placement'),
+    ('time_treatment', 'time_treatment'),
 )
 _OBSERVED_CRAFT_LIST_KEYS = (
     ('sfx', 'sfx'),
@@ -4599,6 +4604,119 @@ _OBSERVED_CRAFT_LIST_KEYS = (
     ('fasteners', 'fasteners'),
     ('micro', 'micro'),
 )
+
+
+# ── 原片观察到的拍摄角度 → 机位 DNA ──────────────────────────────────────────
+#
+# 逐拍的 ANGLE 绑得住 VIDEO，绑不住 IMAGE：每一张 IMAGE 的开场句是**族级**的
+# camera_dna 逐字复述（见 _beat_contract 的 "must OPEN with this exact static camera
+# declaration"），逐拍再写一句「这拍是仰拍」只会和它当场打架，而 fix_camera_dna 会把
+# 族那句原样顶回去——那正是 worker_scale_percent 当年空转的形状（锁写了、永远注入不
+# 进去、校验器还报绿）。
+#
+# 所以角度必须在**写 camera_dna 的那一刻**就进去。这里把清单里每个空间的主导角度算
+# 出来，交给生成 packet 的那次调用，让族级机位句自己就是原片的角度。
+_ANGLE_PROSE = {
+    'bird_eye': 'straight down from directly overhead, the ground plane filling the frame',
+    'high_angle': 'clearly above the subject looking down, its top surfaces visible',
+    'eye_level': 'at a standing adult\'s eye height, the frame reading level',
+    'low_angle': 'clearly below the subject looking up, its undersides visible',
+    'worm_eye': 'on or near the ground looking sharply up along the subject',
+    'dutch_angle': 'rolled off horizontal, so the horizon itself is visibly tilted',
+}
+_LENS_PROSE = {
+    'ultra_wide': 'shot on a very wide lens — edge curvature, near objects looming, the space '
+                  'reading deeper than it is',
+    'wide': 'shot on a wide lens — expansive but without obvious distortion',
+    'normal': 'shot on a normal lens — perspective like unaided vision, neither stretched nor '
+              'compressed',
+    'tele': 'shot on a long lens — the background compressed and flattened onto the subject',
+    'macro': 'shot at macro distance — a small subject filling the frame at close focus',
+}
+_BEARING_PROSE = {
+    'front': 'square onto the subject\'s front face',
+    'three_quarter': 'onto a front corner, so a front face and a side face are both visible',
+    'side': 'onto the subject\'s flank alone, in profile',
+    'rear_three_quarter': 'onto a rear corner, from behind and to one side',
+    'back': 'onto the subject\'s back',
+}
+
+
+def observed_camera_angles_by_space(parsed_brief):
+    """{空间标签: {'angle','bearing','lens','placement'}}，取每个空间里出现最多的那一组。
+
+    角度/方位/焦段按三者的组合投票（它们描述同一个机位，拆开投票会拼出一个原片里
+    不存在的机位）；构图另投一次，因为它在同一个机位下也会随工序推进而变。
+
+    没有清单、清单没标这些栏时返回空字典，调用方据此整段不生效——与其余 observed_*
+    通路同一条纪律：宁可不注入，也不能拿一个猜出来的机位去改写族级机位句。
+    """
+    plan = _outline_normalized_entries((parsed_brief or {}).get('beat_outline'))
+    setups, placements = {}, {}
+    for idx, entry in enumerate(plan):
+        angle = str(entry.get('camera_angle') or '').strip()
+        bearing = str(entry.get('camera_bearing') or '').strip()
+        lens = str(entry.get('lens_feel') or '').strip()
+        placement = ' '.join(str(entry.get('placement') or '').split())
+        if not (angle or bearing or lens or placement):
+            continue
+        space = str(entry.get('space') or '').strip() or f'#{idx + 1}'
+        if angle or bearing or lens:
+            key = (angle, bearing, lens)
+            setups.setdefault(space, {})
+            setups[space][key] = setups[space].get(key, 0) + 1
+        if placement:
+            placements.setdefault(space, {})
+            placements[space][placement] = placements[space].get(placement, 0) + 1
+
+    out = {}
+    for space in set(setups) | set(placements):
+        angle = bearing = lens = ''
+        if setups.get(space):
+            angle, bearing, lens = max(setups[space].items(), key=lambda kv: kv[1])[0]
+        placement = ''
+        if placements.get(space):
+            placement = max(placements[space].items(), key=lambda kv: kv[1])[0]
+        out[space] = {'angle': angle, 'bearing': bearing,
+                      'lens': lens, 'placement': placement}
+    return out
+
+
+def observed_camera_angle_packet_rule(parsed_brief):
+    """写给 packet 生成调用的那一段：族级机位句必须落在原片观察到的机位上。
+
+    原片没标这些栏就返回空串——老任务、老断点、手输主题一律保持改动前的行为。
+    """
+    by_space = observed_camera_angles_by_space(parsed_brief)
+    if not by_space:
+        return ""
+    lines = []
+    for space, view in by_space.items():
+        bits = []
+        if view['angle'] in _ANGLE_PROSE:
+            bits.append(_ANGLE_PROSE[view['angle']])
+        if view['bearing'] in _BEARING_PROSE:
+            bits.append(_BEARING_PROSE[view['bearing']])
+        parts = []
+        if bits:
+            parts.append(f'the camera stands {", ".join(bits)}')
+        if view['lens'] in _LENS_PROSE:
+            parts.append(_LENS_PROSE[view['lens']])
+        if view['placement']:
+            parts.append(f'composition: {view["placement"]}')
+        if not parts:
+            continue
+        lines.append(f'- "{space}": ' + '; '.join(parts) + '.')
+    if not lines:
+        return ""
+    return ("""
+OBSERVED CAMERA SETUP (mandatory, measured off the reference film — this project reproduces a real film shot for shot):
+""" + "\n".join(lines) + """
+Write these INTO the camera sentences themselves: "camera_dna" takes the setup listed for the space filmed from outside, and each interior camera sentence takes the setup listed for its own space. State the camera height, the facing and the lens feel that actually produce that viewpoint (a low angle means a low lens height and upward-converging lines; an overhead angle means the ground plane fills the frame and there is no horizon to pin), and keep the rest of the sentence's job intact — perspective axis and boundaries.
+Where a composition is given, it is a MEASUREMENT of the reference film's framing, and it governs the numbers you invent elsewhere in this packet: the "z_depth_scale" you assign each primary landmark and the horizon pinning inside "camera_dna" must be consistent with it. Those figures have never been measured against the reference film before — this line is the only place they can be.
+This is an observation, not a preference: it OVERRIDES any default or scale rule above that would otherwise push the opening camera to a grounded eye-level wide view. Where they disagree, the observed setup wins, and the framing rules adapt to it (an overhead opening pins its subject in the centre of the ground plane instead of pinning a horizon).
+Every beat filmed from the same space shares that one camera sentence, exactly as it always has — this fixes WHERE the tripod stands, it does not license a new setup per beat.
+""")
 
 
 def observed_craft_of(beat):
@@ -7626,9 +7744,9 @@ def check_video_process_content(video_prompt, is_bridge=False, is_reveal=False, 
         if work_hit:
             errors.append(
                 f"Bridge VIDEO describes construction/cleanup work during the crossing "
-                f"('{work_hit.group(0)}') — the crossing clip is a pure camera move through an "
-                f"untouched ruin; the cleanout belongs to the next beat and every repair to a "
-                f"later one"
+                f"('{work_hit.group(0)}') — the crossing clip is a pure camera move, sterile of "
+                f"workers; whatever work this space needs belongs to the beats on either side of "
+                f"the crossing, not inside it"
             )
         return errors
 
@@ -7676,6 +7794,16 @@ def check_video_process_content(video_prompt, is_bridge=False, is_reveal=False, 
             "restrict the sterile clip to light/atmosphere changes"
         )
     return errors
+
+
+# 一拍「自己申报的活儿是不是清理」的判据。只认工序/里程碑/阶段这类**申报字段**里的
+# 动词，不看提示词正文——正文里的 "swept" 可能只是在描述地上原有的扫痕。
+_CLEANOUT_OPERATION_CUES = (
+    'clear', 'clean', 'cleanout', 'clean-out', 'clearance', 'sweep', 'swept', 'haul',
+    'debris', 'rubble', 'strip out', 'strip-out', 'muck out', 'demolition', 'demolish',
+    'gut', 'remove', 'removal', 'excavat', 'dig out', 'shovel', 'rake',
+    '清理', '清运', '清空', '拆除', '清挖', '清扫',
+)
 
 
 _CLEANOUT_RESULT_KEYWORDS = ('cleared', 'clear of', 'swept', 'emptied', 'empty of debris',
@@ -7759,8 +7887,7 @@ def split_structural_video_errors(errs):
 
 
 def reverify_beat_repairs(i, video_prompt, image_prompt, beat, parsed_traces=None,
-                          stage_scope=None, is_first_interior_reveal=False,
-                          beat_ladder=None, family=None):
+                          stage_scope=None, beat_ladder=None, family=None):
     """回读校验（write-then-verify）：对**最终采纳的**这一拍文本，把每一道带回炉通路的
     检查重跑一遍，返回仍然成立的违规项。
 
@@ -7780,7 +7907,6 @@ def reverify_beat_repairs(i, video_prompt, image_prompt, beat, parsed_traces=Non
     residual += check_stage_scope_wording(image_prompt, stage_scope)
     residual += check_signature_anchor_realized(image_prompt, beat)
     residual += check_image_decay_placeholder(image_prompt)
-    residual += check_first_interior_reveal_decay(image_prompt, is_first_interior_reveal)
     if beat_ladder:
         residual += check_envelope_seal_regression(image_prompt, i, beat_ladder,
                                                    family=family or 'exterior')
@@ -8730,17 +8856,13 @@ def rework_decay_placeholder_beat(config, i, image_prompt, placeholder_errs, bea
         return image_prompt, False
 
 
-_FIRST_REVEAL_DECAY_CATEGORY_KEYWORDS = {
-    'structural damage': ('crack', 'cracks', 'cracked', 'sagging', 'sag', 'sagged', 'collapse',
-                          'collapsed', 'collapsing', 'hole', 'holes', 'missing section', 'missing sections'),
-    'surface decay': ('rust', 'rusted', 'rusty', 'oxidiz', 'water stain', 'water-stain', 'peeling paint',
-                      'peeled paint', 'mold', 'mildew', 'corrosion', 'corroded'),
-    'vegetation intrusion': ('moss', 'mossy', 'vine', 'vines', 'root', 'roots', 'weed', 'weeds'),
-    'debris/clutter': ('rubble', 'debris', 'fallen material', 'fallen materials', 'scattered trash',
-                       'trash', 'collapsed fixture', 'collapsed fixtures', 'clutter'),
-}
-
-
+# 2026-08-24：首现帧「必须是废墟」的确定性闸门（check_first_interior_reveal_decay：
+# 数够 3 类衰败词 + 查人工痕迹）与它的定向回炉（rework_first_interior_reveal_decay_beat）
+# 一并删除，连同 _FIRST_REVEAL_DECAY_CATEGORY_KEYWORDS 词表。理由见 _beat_contract 里
+# anchor_rule 的说明：这条线现在跑的全是爆款复刻，门后是什么样由原片说了算。
+#
+# _FIRST_REVEAL_INTERVENTION_KEYWORDS / _mentions_without_negation 保留——它们另有
+# 使用者（check_pre_bridge_interior_preview、包络体倒退判定），删了会连带打断那两条。
 # 首现帧里出现即"有人来过"的人工痕迹词表（2026-07-26 用户实测："过门帧有人工痕迹，
 # 不够原始"）。命中判定必须绕开否定式表述——契约本身就要求写 "no ladders, no tools
 # anywhere in frame" 这类澄清句（fix_image_prompt_with_vlm_feedback 甚至主动加这种
@@ -8772,109 +8894,6 @@ def _mentions_without_negation(low_text, keywords):
             hits.append(kw)
             break
     return hits
-
-
-def check_first_interior_reveal_decay(image_prompt, is_first_interior_reveal):
-    """Deterministic (no-LLM) check for the FIRST INTERIOR REVEAL — UNTOUCHED TRAUMA STATE
-    mandatory clause (_beat_contract's is_first_interior_reveal branch): the beat's own
-    contract text tells the compose LLM to show decay categories and zero intervention
-    evidence, but like every other contract clause in direct mode, nothing previously
-    verified the LLM actually did it. 2026-07-21 real-run: this exact beat's IMAGE came
-    back as literally 'Completely sterile.' with zero decay wording — the mandatory clause
-    was silently dropped and nothing caught it. 2026-07-26: the bar rose to THREE categories
-    (matching IMAGE 1's own GENUINE DAMAGE audit) plus an intervention-evidence check, after
-    real runs kept producing crossing frames that read as already-tidied rooms. Only
-    meaningful when is_first_interior_reveal is True; returns [] for every other beat (they
-    follow their own STAGE SCOPE rule instead)."""
-    if not is_first_interior_reveal or not image_prompt:
-        return []
-    errors = []
-    low = image_prompt.lower()
-    hit_categories = [cat for cat, kws in _FIRST_REVEAL_DECAY_CATEGORY_KEYWORDS.items()
-                      if any(kw in low for kw in kws)]
-    if len(hit_categories) < 3:
-        missing = [cat for cat in _FIRST_REVEAL_DECAY_CATEGORY_KEYWORDS if cat not in hit_categories]
-        errors.append(
-            "This is the FIRST INTERIOR REVEAL beat (mandatory UNTOUCHED TRAUMA STATE clause) but "
-            f"its IMAGE prompt shows only {len(hit_categories)} of the required 3+ decay categories "
-            f"(found: {', '.join(hit_categories) or 'none'}). Add concrete, specific detail from at "
-            f"least one more of: {', '.join(missing)} — this beat must read as the same untouched "
-            "pre-renovation decay established outside, never a clean or staged room."
-        )
-    intervention = _mentions_without_negation(low, _FIRST_REVEAL_INTERVENTION_KEYWORDS)
-    if intervention:
-        errors.append(
-            "This is the FIRST INTERIOR REVEAL beat (zero intervention evidence) but its IMAGE "
-            f"prompt asserts human intervention already happened here: {', '.join(intervention)}. "
-            "Nobody has entered this space yet — remove these, or state their absence explicitly, "
-            "and leave every surface as pre-existing neglect nobody has prepared or acted on."
-        )
-    return errors
-
-
-def rework_first_interior_reveal_decay_beat(config, i, image_prompt, decay_errs, beat=None):
-    """Single-shot IMAGE rework (max one round) when the mandatory first-interior-reveal
-    decay clause didn't make it into the generated text (see check_first_interior_reveal_decay).
-    Same conservative contract as the other IMAGE reworks: camera/geometry/locked-anchor
-    sentences survive verbatim, only the state-delta sentence(s) get rewritten; the rewrite
-    is only adopted if it re-passes the check, otherwise the original is kept — never worse
-    than not reworking. Returns (image_prompt, adopted)."""
-    system = (
-        "You are repairing ONE missing content requirement in a still-frame construction IMAGE "
-        "prompt: this is the FIRST interior reveal right after a threshold crossing, and it must "
-        "read as the SAME untouched, pre-renovation trauma state already established outside — "
-        "nothing has been worked on inside yet. Hard rules:\n"
-        "- KEEP every sentence describing camera position, lens, geometry, locked anchors, grid "
-        "coordinates, or frame-height percentages EXACTLY VERBATIM.\n"
-        "- REWRITE the state-delta sentence(s) to add concrete, specific decay detail from at "
-        "least THREE of these categories: structural damage (cracks, sagging, holes, missing "
-        "sections), surface decay (rust, water stains, peeling paint, mold, corrosion), "
-        "biological/vegetation intrusion (moss, vines, roots, weeds), debris/clutter accumulation "
-        "(rubble, fallen materials, scattered trash, collapsed fixtures). Name the specific "
-        "material and location for each (e.g. \"rust streaks down the west wall\", \"moss "
-        "spreading across the collapsed roof section\") — do not use generic words like 'empty', "
-        "'clean', or 'sterile'.\n"
-        "- Every trace of decay must lie where gravity and time left it — debris scattered "
-        "unevenly across the floor, dirt drifted into corners — never gathered into neat piles, "
-        "swept aside, or arranged.\n"
-        "- Delete any ladder, scaffolding, tool, toolbox, paint can, tarp, drop cloth, work light, "
-        "safety cone, stacked/staged material, or already-repaired/cleaned/painted patch: nobody "
-        "has entered this space yet. If the original text named one, state its absence explicitly "
-        "(e.g. \"no ladders, no tools, no staged materials anywhere in frame\") rather than just "
-        "dropping the word.\n"
-        "- NEVER source that decay from an envelope element an earlier beat already sealed on "
-        "camera (roof/ceiling, exterior wall or shell, window/glazing, door): the crossing reset "
-        "the camera, not the construction progress, so that element stays closed here — no sky, "
-        "ridge, daylight shaft, rain, or snow through it and no hole, gap, or missing section in "
-        "it. Its inner face may read raw and unfinished (bare decking, exposed rafters, fastener "
-        "rows); put the required decay on the floor, lower walls, fittings, and contents instead.\n"
-        "- Do not invent new landmarks, change the camera, or contradict the established "
-        "structural state. Keep the full prompt under 250 words.\n"
-        "Output ONLY the corrected prompt text itself. Do not prefix it with any label, heading, "
-        "quotation marks, or repetition of these instructions, and do not add commentary or "
-        "markdown fences."
-    )
-    user = (
-        f"Here is the image prompt for beat {i}, delimited by triple quotes:\n"
-        f"\"\"\"\n{image_prompt}\n\"\"\"\n\n"
-        "Problems to fix (rewrite only the offending sentence(s), change nothing else):\n- "
-        + "\n- ".join(decay_errs)
-    )
-    try:
-        resp = _chat(config, system, user, temperature=0.6, timeout=90)
-        fixed = _strip_markdown_fences_only(resp).strip()
-        fixed = _strip_leading_label_line(fixed)
-        if not fixed or len(fixed.split()) > 300:
-            return image_prompt, False
-        if check_first_interior_reveal_decay(fixed, True):
-            return image_prompt, False
-        return fixed, True
-    except GenerationCancelled:
-        raise
-    except Exception as e:
-        if sys.stdout:
-            print(f"[DIRECT] Beat {i} 首现衰败措辞回炉调用失败（保留原文）: {e}")
-        return image_prompt, False
 
 
 # ============================================================================
@@ -9336,7 +9355,7 @@ _IMAGE_REPAIR_SUFFIX = (
 
 # 修复方向按「约束力从强到弱」排：物理连续性 → 必须补的内容 → 措辞。仅影响 system
 # prompt 里的呈现顺序，判据本身互相独立。
-_IMAGE_DEFECT_ORDER = ('envelope', 'decay', 'placeholder', 'traces', 'outline',
+_IMAGE_DEFECT_ORDER = ('envelope', 'placeholder', 'traces', 'outline',
                        'anchor', 'stage_scope', 'similarity')
 
 
@@ -9359,24 +9378,6 @@ def _image_defect_directive(key, image_prompt, beat=None, packet=None, parsed_tr
             "lines) — unfinished never means still open. If the removed wording was the frame's "
             "decay content, replace it with decay on surfaces no earlier beat has touched "
             "(floor, lower walls, fittings, debris), never by reopening the sealed element."
-        )
-    if key == 'decay':
-        return (
-            "* FIRST INTERIOR REVEAL — UNTOUCHED TRAUMA STATE: this is the first interior frame "
-            "right after a threshold crossing, and it must read as the SAME untouched, "
-            "pre-renovation trauma state already established outside — nothing has been worked "
-            "on inside yet. Add concrete, specific decay detail from at least THREE of these "
-            "categories: structural damage (cracks, sagging, holes, missing sections), surface "
-            "decay (rust, water stains, peeling paint, mold, corrosion), biological/vegetation "
-            "intrusion (moss, vines, roots, weeds), debris/clutter accumulation (rubble, fallen "
-            "materials, scattered trash, collapsed fixtures). Name the specific material and "
-            "location for each (e.g. \"rust streaks down the west wall\") — never generic words "
-            "like 'empty', 'clean', or 'sterile'. Every trace of decay lies where gravity and "
-            "time left it — scattered unevenly, drifted into corners — never in neat piles. "
-            "Delete any ladder, scaffolding, tool, toolbox, paint can, tarp, drop cloth, work "
-            "light, safety cone, staged material, or already-repaired patch: nobody has entered "
-            "this space yet; if the original text named one, state its absence explicitly. NEVER "
-            "source that decay from an envelope element an earlier beat already sealed on camera."
         )
     if key == 'placeholder':
         return (
@@ -9457,7 +9458,7 @@ def _image_defect_directive(key, image_prompt, beat=None, packet=None, parsed_tr
 
 def collect_image_defects(i, image_prompt, beat=None, packet=None, prev_image=None,
                           parsed_traces=None, stage_scope=None,
-                          is_first_interior_reveal=False, beat_ladder=None, family=None):
+                          beat_ladder=None, family=None):
     """跑完 IMAGE 侧全部「有定向回炉通路」的确定性检查，返回 {缺陷类别: [错误原文]}。
 
     这是合并回炉的**唯一**判据来源：初检和重写稿复检都走这一个函数，所以采纳条件
@@ -9465,7 +9466,6 @@ def collect_image_defects(i, image_prompt, beat=None, packet=None, prev_image=No
     defects = {}
     for key, errs in (
         ('envelope', check_envelope_seal_regression(image_prompt, i, beat_ladder, family=family)),
-        ('decay', check_first_interior_reveal_decay(image_prompt, is_first_interior_reveal)),
         ('placeholder', check_image_decay_placeholder(image_prompt)),
         ('traces', check_image_realizes_traces(image_prompt, parsed_traces)),
         ('outline', check_outline_delivery_realized(image_prompt, beat)),
@@ -9484,7 +9484,7 @@ def collect_image_defects(i, image_prompt, beat=None, packet=None, prev_image=No
 
 def repair_image_defects(config, i, image_prompt, defects, beat=None, packet=None,
                          prev_image=None, parsed_traces=None, stage_scope=None,
-                         is_first_interior_reveal=False, beat_ladder=None, family=None):
+                         beat_ladder=None, family=None):
     """一次调用修完这一拍 IMAGE 侧命中的**全部**缺陷。
 
     返回 (image_prompt, adopted, residual)：
@@ -9502,8 +9502,7 @@ def repair_image_defects(config, i, image_prompt, defects, beat=None, packet=Non
 
     verify_kwargs = dict(
         beat=beat, packet=packet, prev_image=prev_image, parsed_traces=parsed_traces,
-        stage_scope=stage_scope, is_first_interior_reveal=is_first_interior_reveal,
-        beat_ladder=beat_ladder, family=family)
+        stage_scope=stage_scope, beat_ladder=beat_ladder, family=family)
 
     directives = [
         _image_defect_directive(k, image_prompt, beat=beat, packet=packet,
@@ -11210,6 +11209,7 @@ OPENING SUBJECT SCALE LOCK (mandatory): compose this exterior camera around the 
 GROUND-UP BUILD ANCHOR RULE (mandatory for this project): IMAGE 1 is undeveloped raw ground before any construction, and the carrier structure is excavated and built from scratch on camera. Therefore all three "primary_landmarks" (and the exterior "frame_boundaries") MUST be permanent natural features of the SITE/TERRAIN that exist before construction (e.g. background trees, natural rock/earth bank, ground clearing perimeter). NEVER register the unbuilt shelter/carrier itself, any part of it (doorway, entrance rim, roof apex, deck platform), or the marker powder line as an exterior primary landmark. Do not hallucinate collapsed rotted structures or ruins in IMAGE 1 unless explicitly specified.
 """
 
+        _observed_angle_packet_rule = observed_camera_angle_packet_rule(parsed_brief)
         packet_system = f"""You are a spatial consistency supervisor for a time-lapse renovation prompt composer.
 Your job is to generate a comprehensive Drift Lock & SCUP Packet for the project.
 You must output ONLY a valid JSON object matching the keys below, with no other text, no markdown, and no code fences.
@@ -11240,7 +11240,7 @@ Required JSON keys:
 20. "camera_palette": The 9:16 shot families: entrance detail, shaft axis, landed partial, three-quarter oblique establish, floor/rail low angle, wall graze and far-wall reverse. A centered one-point view is reserved for one establish or final payoff.
 21. "origin_contract": Copy the authoritative project_origin, starting reality and no-premise-switch rule from Scene Variables. Do not reinterpret it from style words.
 22. "engineering_plan": Copy every required system from Scene Variables and state where it is roughed in, tested and later concealed. Drainage, waterproofing, ventilation and power may never be replaced by generic loose cable clutter.
-{_delivered_carrier_packet_rule}
+{_delivered_carrier_packet_rule}{_observed_angle_packet_rule}
 ==================== REFERENCE GUIDES ====================
 {assembly_ref}
 {scup_ref}
@@ -11624,9 +11624,21 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
     # 条契约：清走可搬运的杂物，但结构性衰败（锈迹、裂缝、剥落）原封不动留到后面的修复
     # 拍去处理。节拍梯层面这一拍的存在由 compose_anchor_and_packet 的结构校验保证。
     _prev_beat = beat_ladder[i - 2] if i >= 2 else None
+    # 2026-08-24 增补的证据闸门：位置对了还不够，这一拍**自己**得真的是清理拍。
+    # 原判据只看「上一拍是过门拍」，于是任何一条过门后第一拍不是清理的片子（原片进门
+    # 直接开始砌墙／进的是已完工空间）都会被扣上一份「本拍是纯清理」的契约，把原片里
+    # 没有的一道工序凭空写进去。与首现帧那条废墟硬规则同源，一并改成实事求是。
+    # 只看申报字段（工序/里程碑/阶段/工序包），不看 after_state：终态句里的
+    # "on the cleared floor" 说的是上一拍留下的地面，不是这一拍在清理。
+    _own_work_text = ' '.join(str(x or '') for x in (
+        beat.get('operation'), beat.get('milestone_name'), beat.get('stage'),
+        ' '.join(str(o) for o in (beat.get('package_operations') or [])),
+    )).lower()
+    _declares_cleanout = any(cue in _own_work_text for cue in _CLEANOUT_OPERATION_CUES)
     is_post_reveal_cleanup = (
         mode == 'Threshold' and family == 'interior'
         and not is_bridge and not is_cut and not is_threshold_or_reveal
+        and _declares_cleanout
         and isinstance(_prev_beat, dict)
         and (str(_prev_beat.get('transition_stage') or '') in
              ('interior_establish', 'secondary_establish')
@@ -11692,40 +11704,31 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
         # camera_dna 逐字开场句本身），导致 LLM 在生成的 IMAGE 正文里把整句 camera_dna
         # 逐字复读了两遍（见 img_5/7/9/10/11 实例），纯冗余文本 bug。保留一处权威表述
         # 即可，不影响约束力。
-        # First interior reveal only (see is_first_interior_reveal above): nothing has been
-        # worked on inside yet, so it must read as untouched decay, not a tidy/staged room.
-        # Later interior beats never get this — they follow their own STAGE SCOPE directive.
+        # 第一次过门落点帧（见上面的 is_first_interior_reveal）。
+        #
+        # 2026-08-24：这里原本写死一条「UNTOUCHED TRAUMA STATE」硬规则——首现帧必须展示
+        # ≥3 类衰败、零施工痕迹、地面不许读成已清空。那是原创线「先破后立」叙事的产物，
+        # 而现在这条线跑的全是爆款复刻：门后是什么样由原片说了算，不由模板说了算。原片
+        # 一进门就是干净毛坯/已完工/半成品的片子被这条规则一律改写成废墟，复刻反而不像。
+        # 已删除该硬规则，状态一律以这一拍自己申报的 state_before / state_after 为准。
+        #
+        # 保留的只有**防倒退**那一半：过门重置的是机位，不是施工进度。它与衰败无关，
+        # 治的是另一个方向的错（外面已经封好的屋顶，进门后又透出天空）。
         _first_reveal_rule = (
-            " FIRST INTERIOR REVEAL — UNTOUCHED TRAUMA STATE (mandatory): this is the FIRST "
-            "interior IMAGE after the threshold crossing, and no interior construction beat has "
-            "touched this space yet — it must read as the SAME untouched, pre-renovation trauma "
-            "state already established outside, never a tidy or staged room. Show the same "
-            "material palette and weathering established in the exterior beats, plus AT LEAST "
-            "THREE of these decay categories clearly visible: structural damage (cracks, sagging, "
-            "holes, missing sections), surface decay (rust, water stains, peeling paint, mold, "
-            "corrosion), biological/vegetation intrusion (moss, vines, roots, weeds), or "
-            "debris/clutter accumulation (rubble, fallen materials, scattered trash, collapsed "
-            "fixtures). ZERO INTERVENTION EVIDENCE (mandatory): no tools, toolboxes, ladders, "
-            "scaffolding, paint cans, buckets, tarps, drop cloths, work lights, safety cones, or "
-            "fresh/stacked construction materials anywhere in frame, and no patch that reads as "
-            "already repaired, re-clad, cleaned, or painted. UNARRANGED (mandatory): every piece "
-            "of wreckage lies exactly where gravity and time dropped it — debris scattered "
-            "unevenly, dirt drifted into corners, growth following cracks and moisture; never "
-            "swept, never gathered into neat piles, never aligned or set-dressed. The floor must "
-            "NOT read as cleared — that is the very next beat's job, not this one's. "
-            "SCOPE OF 'UNTOUCHED' (mandatory): the crossing reset the CAMERA, not the "
-            "construction progress. 'Untouched' covers only what no earlier beat worked on — "
-            "the floor, contents, fittings, and any surface still in its found state. Any "
-            "building-envelope element the exterior beats already sealed or repaired on camera "
-            "(roof/ceiling, exterior wall or shell, window/glazing, door) is seen here from its "
-            "OTHER FACE and must read as already CLOSED: no sky, clouds, distant ridge, horizon, "
-            "daylight shaft, rain, or snow may show through it, and it may carry no hole, gap, "
-            "breach, missing section, or collapse. Its inner face is expected to be raw and "
-            "unfinished — bare new decking, exposed rafters or ribs, fastener rows, fresh seam "
-            "lines on the underside of the new material — which is exactly how 'sealed outside, "
-            "not yet finished inside' should read; unfinished never means still open. Source the "
-            "three required decay categories from surfaces earlier beats did NOT touch, never by "
-            "reopening something already closed."
+            " INTERIOR REVEAL — CONTINUITY, NOT A RESET (mandatory): the crossing reset the "
+            "CAMERA, not the construction progress. Describe this space exactly as this beat's "
+            "own declared before/after state says it is — untouched, half-built or finished, "
+            "whichever the reference film actually shows; never impose a generic ruin, and never "
+            "impose a generic tidy room. Any building-envelope element an earlier beat already "
+            "sealed or repaired on camera (roof/ceiling, exterior wall or shell, window/glazing, "
+            "door) is seen here from its OTHER FACE and must read as already CLOSED: no sky, "
+            "clouds, distant ridge, horizon, daylight shaft, rain, or snow may show through it, "
+            "and it may carry no hole, gap, breach, missing section, or collapse. Its inner face "
+            "is expected to be raw and unfinished — bare new decking, exposed rafters or ribs, "
+            "fastener rows, fresh seam lines on the underside of the new material — which is "
+            "exactly how 'sealed outside, not yet finished inside' should read; unfinished never "
+            "means still open. Whatever decay this beat does declare must come from surfaces "
+            "earlier beats did NOT touch, never by reopening something already closed."
         ) if is_first_interior_reveal else ""
         if family_landmarks:
             _int_names = "; ".join(
@@ -11851,22 +11854,21 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
                "behind the camera)")
             + "; never invent a window or opening the carrier does not have.")
     if is_first_interior_reveal:
+        # 2026-08-24：删掉了「必须是废墟」那一半（见 anchor_rule 里同一处的说明）。
+        # 门后的状态由这一拍自己申报的 before/after 决定，这里只保留防倒退。
         family_contract_lines.append(
-            "- First interior reveal — untouched trauma state (mandatory): this beat's resulting "
-            "IMAGE must show the SAME pre-renovation decay/mess established outside (structural "
-            "damage, surface decay, vegetation intrusion, and/or debris/clutter — at least three "
-            "categories), with zero intervention evidence (no tools, ladders, scaffolding, tarps, "
-            "work lights, or stacked materials) and nothing swept, piled, or arranged; never a "
-            "clean or staged room. This applies ONLY here, not to later interior beats, which "
-            "follow STAGE SCOPE instead. It also does NOT reset construction progress: any "
-            "envelope element (roof/ceiling, exterior wall or shell, window/glazing) the exterior "
-            "beats already sealed on camera stays closed when seen from inside — raw and "
-            "unfinished on its inner face, but never open to sky, weather, or a distant ridge.")
+            "- Interior reveal — continuity, not a reset (mandatory): the crossing moved the "
+            "camera, not the construction clock. Show this space exactly as this beat's own "
+            "declared before/after state says it is — do not impose a generic untouched ruin, "
+            "and do not impose a generic clean room. Any envelope element (roof/ceiling, "
+            "exterior wall or shell, window/glazing) an earlier beat already sealed on camera "
+            "stays closed when seen from inside — raw and unfinished on its inner face, but "
+            "never open to sky, weather, or a distant ridge.")
     if is_post_reveal_cleanup:
         family_contract_lines.append(
-            "- Post-crossing cleanout (mandatory, this beat only): this is the FIRST work done "
-            f"inside, and it is pure clearing — IMAGE {i} (this beat's starting frame) is the "
-            "untouched, filthy first-reveal frame, and everything loose in it must be gone by "
+            "- Post-crossing cleanout (mandatory, this beat only): this beat declares clearing "
+            f"as its own work, and it is pure clearing — IMAGE {i} (this beat's starting frame) is "
+            "the space as the crossing left it, and everything loose in it must be gone by "
             f"IMAGE {i+1}: rubble, fallen material, scattered wreckage, dead vegetation, and "
             "drifted dirt hauled out, the floor swept back to its original bare surface across "
             "its FULL extent. Nothing is repaired, patched, coated, or installed here — the "
@@ -12064,14 +12066,14 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
             "camera here, and the interior anchors' scales are declared only for where they settle "
             f"in IMAGE {i+1}.")
         family_contract_lines.append(
-            "- Crossing clip — raw interior throughout (mandatory): the space this clip enters is "
-            "an untouched ruin at EVERY frame of the clip, not just at its end. Name the decay the "
-            "camera moves into (debris lying where it fell, dirt drifts, rust/water stains, growth "
-            "through the cracks) so the interior reads as filthy from the first moment it becomes "
-            "visible. Nothing may be cleaned, cleared, tidied, repaired, or installed during this "
-            "clip, and no tool, ladder, scaffolding, tarp, work light, or stacked material may "
-            "appear at any point — the crossing is a pure camera move, and the cleanout is the "
-            "NEXT beat's work.")
+            "- Crossing clip — one state throughout (mandatory): the space this clip enters looks "
+            f"the same at EVERY frame of the clip as it does in IMAGE {i+1}, from the first moment "
+            "it becomes visible. Describe it in that state — whatever this beat's own declared "
+            "before/after state says the space is, raw or already worked on — never a generic "
+            "ruin and never a generic tidy room. Nothing may be cleaned, cleared, tidied, "
+            "repaired, or installed DURING this clip, and no tool, ladder, scaffolding, tarp, "
+            "work light, or stacked material may appear at any point — the crossing is a pure "
+            "camera move; work belongs to the beats on either side of it.")
         family_contract_lines.append(
             "- Crossing clip — one unbroken take (mandatory): a single continuous take at one "
             "steady speed. No cut, no fade, no dissolve, no wipe transition, no speed ramp, no "
@@ -12104,13 +12106,14 @@ def _beat_contract(i, total_beats, beat_ladder, mode, packet, templates_raw, par
             f"at the start — IMAGE {i} keeps its entry CLOSED and opaque by design, and the reveal "
             "happens on camera here.")
         family_contract_lines.append(
-            "- Crossing clip — raw interior throughout (mandatory): the space this clip enters is "
-            "an untouched ruin at EVERY frame from the moment it becomes visible — debris lying "
-            "where it fell, dirt drifts, rust/water stains, growth through the cracks. Nothing may "
-            "be cleaned, cleared, tidied, repaired, or installed during this clip, and no tool, "
-            "ladder, scaffolding, tarp, work light, or stacked material may appear at any point; "
-            "the clip is sterile of workers (the entry opens on camera without a figure entering "
-            "frame), and the cleanout is the NEXT beat's work.")
+            "- Crossing clip — one state throughout (mandatory): the space this clip enters looks "
+            f"the same at EVERY frame from the moment it becomes visible as it does in IMAGE {i+1} "
+            "— whatever state this beat's own declared before/after says it is in, never a generic "
+            "ruin and never a generic tidy room. Nothing may be cleaned, cleared, tidied, "
+            "repaired, or installed DURING this clip, and no tool, ladder, scaffolding, tarp, "
+            "work light, or stacked material may appear at any point; the clip is sterile of "
+            "workers (the entry opens on camera without a figure entering frame), and the work "
+            "belongs to the beats on either side of the crossing.")
         family_contract_lines.append(
             "- Crossing clip — one unbroken take (mandatory): a single continuous take at one "
             "steady speed. No cut, no fade, no dissolve, no wipe transition, no speed ramp, no "
@@ -12255,6 +12258,11 @@ def beat_outline_items(beat):
 # 观测制作字段的渲染措辞。它必须让开三条已经存在的契约，否则这一段就是在和它们对撞：
 #   · LIGHT  让开 LIGHTING PHASE CONTRACT（那条管相位推进，这条只管相位之内的质感）
 #   · SHOT   让开 IMAGE 的 family camera declaration（那条钉死静帧机位，这条只管 VIDEO）
+#   · ANGLE  同上，且它在**族级 camera_dna 里已经落过一次**（见
+#            observed_camera_angle_packet_rule）——这里只是把同一个观测再对 VIDEO 说一遍，
+#            两处说的是同一件事，所以不会打架
+#   · TIME   反过来**压过**通用的 "continuous construction time-lapse" 措辞——那句是所有
+#            拍的默认口径，而原片的成品巡览拍基本都是实时的
 #   · CREW   反过来**压过**通用的 "same lone worker" 措辞——复刻线上人数是从原片量出来
 #            的，通用规则那句默认值在这里就是错的。
 def observed_craft_directive(beat):
@@ -12313,6 +12321,43 @@ def observed_craft_directive(beat):
             f"declaration — the still frame keeps whatever its shot-family contract fixes. Do not "
             f"upgrade a static beat into a sweeping move because the work looks dramatic, and do "
             f"not push in on a beat filmed wide.")
+    if craft.get('camera_angle') or craft.get('camera_bearing') or craft.get('lens_feel'):
+        _angle = ' / '.join(x for x in (craft.get('camera_angle'), craft.get('camera_bearing'),
+                                        craft.get('lens_feel')) if x)
+        _prose = '; '.join(filter(None, (
+            _ANGLE_PROSE.get(craft.get('camera_angle') or ''),
+            _BEARING_PROSE.get(craft.get('camera_bearing') or ''),
+            _LENS_PROSE.get(craft.get('lens_feel') or ''))))
+        lines.append(
+            f"  · ANGLE (observed): {_angle}"
+            + (f" — the camera stands {_prose}." if _prose else ".")
+            + " This is where the tripod actually stood for this beat in the reference film, on "
+              "two independent axes (vertical, then which face of the subject the lens looks at). "
+              "The VIDEO must move within THIS viewpoint and end in it — never drift to a "
+              "different height or swing round to another face of the subject mid-clip. The "
+              "resulting IMAGE keeps its shot family's own camera declaration verbatim; that "
+              "declaration was written from this same observation, so the two agree — if the "
+              "declaration reads as a different viewpoint, the declaration still wins for the "
+              "still frame and you write the clip to land on it.")
+    if craft.get('placement'):
+        lines.append(
+            f"  · COMPOSITION (measured off the film): {craft['placement']}. This is where the "
+            f"subject actually sits in the reference frame and how much of it it fills. The "
+            f"resulting IMAGE must be composed this way — consistent with the registered anchors' "
+            f"screen positions and frame-height shares, never a distant speck when the film says "
+            f"three fifths of frame height, and never full-bleed when it says a quarter.")
+    if craft.get('time_treatment'):
+        _time = craft['time_treatment']
+        _time_rule = {
+            'timelapse': "this beat's VIDEO IS a construction time-lapse: repeated work cycles "
+                         "compressed, material visibly consumed, bodies moving faster than life.",
+            'real_time': "this beat's VIDEO runs at NATURAL SPEED — it is NOT a construction "
+                         "time-lapse and must never be written or labelled as one. One unhurried "
+                         "continuous action at life speed: a walk-through, a reveal, a single move.",
+            'slow_motion': "this beat's VIDEO runs slower than life — one action stretched, "
+                           "never a time-lapse.",
+        }.get(_time, "")
+        lines.append(f"  · TIME (observed): {_time}. {_time_rule}".rstrip())
     if craft.get('crew'):
         lines.append(
             f"  · CREW (observed): {craft['crew']} worker(s) in frame this beat. Reproduce that "
@@ -12513,7 +12558,7 @@ Write the beats IN ORDER. Each beat's resulting IMAGE must continue directly and
 - THIS BEAT'S resulting IMAGE must be a clean frame with ZERO workers/machinery. Do NOT use the words 'worker', 'builder', 'carpenter', 'laborer', 'person', 'man', 'woman', or 'people' under any circumstances, even to state that they are absent or not present. Describe only static objects, surfaces, and traces. For every ordinary construction beat, follow its VISIBLE MILESTONE CONTRACT exactly: name the milestone anchor, state its completed full extent/count, preserve inherited and not-yet-worked state, and include at least two declared persistent contact traces. Never reduce the delta to a local patch, a beginning, or vague incremental progress.
 - THIS BEAT'S VIDEO must execute the same visible milestone from its exact before_state to after_state. It must include TWO independently observable progress lines: the main product growing to its complete extent/count, plus stock/container/spoil movement or a tightly coupled second component. Show first contact, repeated cycles, material source and movement path, and a clean terminal frame. Prior installed/finished features stay present and unchanged.
 - A construction package may contain up to three tightly related actions only when all actions occur in the same zone and jointly create the one named milestone. Do not leak unrelated demolition, rough-in, finish, lighting, or furnishing work into that package.
-- For threshold bridge beats (if a beat is a threshold bridge, per its own section below), follow the TBCP rules: the ENTIRE exterior-to-interior crossing is ONE single beat (bridge_stage 1) — there is no separate hold/sill/vestibule/turn beat. Its VIDEO is the ONLY visible clip for the crossing, bound normally from the previous beat's IMAGE to this beat's own IMAGE, and must depict the full exterior-to-settle arc (plus, in the PAN variant, ending in a stationary pan locking onto the interior's long axis) in one continuous shot, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it. EVERY crossing — bridge or DECLARED CUT-IN alike — starts from a CLOSED entry: the previous beat's IMAGE keeps its door/hatch shut (or, on a carrier with no leaf yet, its raw opening unlit and opaque) and shows nothing of the interior, and the crossing clip itself pushes that entry open on camera before advancing through it. There is no interior peek and no anchor scale-up before the clip. A DECLARED CUT-IN beat works the same way on the video side — its VIDEO is a real generated crossing clip, written as an ordinary video prompt bound from the previous beat's IMAGE to this beat's own IMAGE — while its IMAGE re-establishes the interior from scratch per its anchor rule. The crossing clip enters an untouched ruin and stays that way for its whole length — nothing is cleaned, cleared, tidied, repaired, or installed while the camera moves, and no tool, ladder, scaffolding, tarp, work light, or stacked material appears in it; write it as one unbroken take at a steady speed (no cut, fade, dissolve, speed ramp, or freeze), and never call it a construction time-lapse.
+- For threshold bridge beats (if a beat is a threshold bridge, per its own section below), follow the TBCP rules: the ENTIRE exterior-to-interior crossing is ONE single beat (bridge_stage 1) — there is no separate hold/sill/vestibule/turn beat. Its VIDEO is the ONLY visible clip for the crossing, bound normally from the previous beat's IMAGE to this beat's own IMAGE, and must depict the full exterior-to-settle arc (plus, in the PAN variant, ending in a stationary pan locking onto the interior's long axis) in one continuous shot, with the door-frame wipe, exposure/white-balance roll, and anchor scale-up all completing within it. EVERY crossing — bridge or DECLARED CUT-IN alike — starts from a CLOSED entry: the previous beat's IMAGE keeps its door/hatch shut (or, on a carrier with no leaf yet, its raw opening unlit and opaque) and shows nothing of the interior, and the crossing clip itself pushes that entry open on camera before advancing through it. There is no interior peek and no anchor scale-up before the clip. A DECLARED CUT-IN beat works the same way on the video side — its VIDEO is a real generated crossing clip, written as an ordinary video prompt bound from the previous beat's IMAGE to this beat's own IMAGE — while its IMAGE re-establishes the interior from scratch per its anchor rule. The crossing clip enters the space in exactly the state this beat's own IMAGE declares — raw, part-built, or already finished, whatever the beat says — and holds that same state for its whole length; nothing is cleaned, cleared, tidied, repaired, or installed while the camera moves, and no tool, ladder, scaffolding, tarp, work light, or stacked material appears in it; write it as one unbroken take at a steady speed (no cut, fade, dissolve, speed ramp, or freeze), and never call it a construction time-lapse.
 - THRESHOLD MONOTONIC INHERITANCE (P0): When crossing from exterior to interior (IMAGE T+1), the interior first reveal MUST 100% physically inherit all envelope/structural work completed in prior exterior beats:
   1. Roof/Ceiling: If exterior beats built or weatherproofed the roof, the ceiling underside in IMAGE T+1 MUST show the newly installed roof timbers/sheathing/membrane. NEVER describe ceiling cracks, missing roof sections, or water leaks.
   2. Ground/Floor: If an earlier exterior beat already cleared the earthen floor, the floor in IMAGE T+1 is already clean bare earth. DO NOT describe fallen timber or leaf piles again.
@@ -12817,7 +12862,7 @@ Hard vetoes to check against these two images:
 - NO WORKER BOUNDARY CHOREOGRAPHY: Never show or describe workers entering, arriving, exiting, walking out, or leaving the frame. Use the whole construction clip for visible work from t=0s through the final frame; the separate reward beat may be worker-free.
 - RIGID CONTAINER ENCAPSULATION: All loose materials, debris, fasteners, and liquids must be stored and tracked inside rigid, quantifiable containers (e.g. buckets, parts trays, boxes), and their volumes must be described as continuously increasing or decreasing.
 - INTERIOR ANCHOR QUALIFICATION (only applies if this beat is the threshold crossing beat, tagged [BRIDGE ...] or [CUT]): the interior landmarks this crossing lands on must plausibly ALREADY EXIST at crossing time — original structure, natural rock/wood formations, pre-existing wreckage, or items installed in an earlier on-camera beat. NEVER future construction products (an uncarved staircase, unplaced furniture, uninstalled fixtures).
-- SEALED ENTRY BEFORE ANY CROSSING (applies to EVERY crossing beat — [BRIDGE], [BRIDGE TURN] and [CUT] alike): the premise of every crossing in this system is that NOTHING of the interior is visible before it. A shut door, closed hatch, sealed shell, or pitch-black opening in the exterior IMAGE is the REQUIRED state — never report it as a missing interior peek, an unopened/unfinished entry, a blocked crossing, or a reason the next frame cannot be interior. There is no peek and no anchor scale-up to look for between these two images: the entry is opened and passed through INSIDE this beat's own clip. Conversely, an exterior IMAGE that already shows the entry standing open with the interior visible through it IS a violation of this rule. Judge the slot as a crossing clip (a pure camera move through an untouched ruin, sterile of workers) and never against the construction-clip rules (single milestone package, dual progress, worker entry/exit and agent flow, kinetic climax motion). The interior IMAGE is deliberately re-established rather than matched frame-to-frame against the exterior one, so do not report its different composition, framing, or camera position as a defect. What still applies across this crossing: construction order, envelope-seal continuity, and state monotonicity — it resets the camera only, so anything an earlier exterior beat sealed or repaired must read as still sealed and repaired on its inner face in the interior first frame. Those three apply PER SPACE: a crossing lands the camera in a space that has had no work done in it yet, so that space being raw, bare and untouched is the EXPECTED state and is never a regression of the space the camera just left — only report regression against work that was previously shown IN THIS SAME space.
+- SEALED ENTRY BEFORE ANY CROSSING (applies to EVERY crossing beat — [BRIDGE], [BRIDGE TURN] and [CUT] alike): the premise of every crossing in this system is that NOTHING of the interior is visible before it. A shut door, closed hatch, sealed shell, or pitch-black opening in the exterior IMAGE is the REQUIRED state — never report it as a missing interior peek, an unopened/unfinished entry, a blocked crossing, or a reason the next frame cannot be interior. There is no peek and no anchor scale-up to look for between these two images: the entry is opened and passed through INSIDE this beat's own clip. Conversely, an exterior IMAGE that already shows the entry standing open with the interior visible through it IS a violation of this rule. Judge the slot as a crossing clip (a pure camera move, sterile of workers, with no construction happening during the move) and never against the construction-clip rules (single milestone package, dual progress, worker entry/exit and agent flow, kinetic climax motion). The interior IMAGE is deliberately re-established rather than matched frame-to-frame against the exterior one, so do not report its different composition, framing, or camera position as a defect. What still applies across this crossing: construction order, envelope-seal continuity, and state monotonicity — it resets the camera only, so anything an earlier exterior beat sealed or repaired must read as still sealed and repaired on its inner face in the interior first frame. Those three apply PER SPACE: the space a crossing lands in may be raw and untouched or may already carry work from an earlier visit — judge it only against what THIS beat declares and against work previously shown IN THIS SAME space. A space that is bare is never a regression of the space the camera just left, and equally, a space that already looks worked on is not a violation when this film has been in it before. Never demand that an interior read as a ruin because it is the first time you are seeing it.
 - BRIDGE WHITE-BALANCE DIRECTION (only applies if this beat is the threshold/bridge crossing beat): the single threshold/bridge beat's merged crossing clip VIDEO prose must describe ONE consistent, gradual colour-temperature direction across its full arc, attributed to the same light source throughout. A mid-clip reversal is a violation.
 - DOOR-FRAME CLEARANCE (only after an INTERIOR ESTABLISH / SECONDARY ESTABLISH slot): once established, the rendered frame may be fully inside with the entry out of view. Earlier transition slots MUST retain the hatch/door rim, sill, ladder/tread, landing or divider edge needed for orientation; never penalize that required evidence.
 - INTERIOR OCCUPANCY: post-crossing interior frames must be dominated by the interior space itself — walls, ceiling, and floor reaching the frame edges — never a small bright interior rectangle surrounded by exterior or dark margins.
@@ -13745,7 +13790,8 @@ def fix_beat_from_sequence_review(config, video_prompt, image_prompt, issues, fa
     _is_crossing_slot = 'BRIDGE' in _meta or 'CUT' in _meta
     _cut_note = (
         " NOTE: this beat's VIDEO is the single exterior-to-interior crossing clip (a pure camera "
-        "move through an untouched ruin, sterile of workers). Keep its camera-motion sentences — "
+        "move, sterile of workers, into whatever state that space is declared to be in). Keep its "
+        "camera-motion sentences — "
         "never turn it into a static-camera or construction-work clip."
         if _is_crossing_slot else "")
 
@@ -13846,6 +13892,7 @@ def _strip_code_fences(s):
     Only use this on content expected to be JSON — see _strip_markdown_fences_only
     for free-form prose that may legitimately contain '[' / ']' / '{' / '}'."""
     s = s.strip()
+    s = re.sub(r'<think>.*?</think>', '', s, flags=re.DOTALL).strip()
     if s.startswith('```'):
         nl = s.find('\n')
         s = s[nl + 1:] if nl != -1 else s[3:]
@@ -15229,7 +15276,9 @@ def _outline_normalized_entries(outline):
                             'summary', 'operation_zh', 'headline_zh',
                             'shot_count', 'shot_seconds', 'insert', 'cast',
                             'tool', 'tool_specifics',
-                            'shot_scale', 'camera_move', 'light', 'flow', 'crew'):
+                            'shot_scale', 'camera_move', 'camera_angle', 'camera_bearing',
+                            'lens_feel', 'placement', 'time_treatment',
+                            'light', 'flow', 'crew'):
                     value = str(entry.get(key) or '').strip()
                     if key == 'scope':
                         value = value.lower()
@@ -15769,6 +15818,16 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
         shot_bits = [b for b in shot_bits if b]
         if shot_bits:
             rendered.append(f'     SHOT: {" / ".join(shot_bits)}')
+        # 拍摄角度自成一行，不并进 SHOT。SHOT 说的是「拍多大 / 镜头怎么动」，角度说的
+        # 是「机位站在哪」——三样挤进一行，规划器读到第三个 token 就开始当它是形容词。
+        angle_bits = [entry.get('camera_angle'), entry.get('camera_bearing'), entry.get('lens_feel')]
+        angle_bits = [b for b in angle_bits if b]
+        if angle_bits:
+            rendered.append(f'     ANGLE: {" / ".join(angle_bits)}')
+        if entry.get('placement'):
+            rendered.append(f'     PLACEMENT: {entry["placement"]}')
+        if entry.get('time_treatment'):
+            rendered.append(f'     TIME: {entry["time_treatment"]}')
         if entry.get('cast'):
             rendered.append(f'     CAST: {entry["cast"]}')
         if multishot and entry.get('insert'):
@@ -15795,6 +15854,10 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
     # 制作字段（2026-08-22，复刻线）。守卫逐条分开：一条卡片可能只填了机位没填音效，
     # 凭空给规划器一条「照抄清单里的 SFX」而清单里一条 SFX 也没有，它就会自己编几条。
     has_shot = any(e.get('shot_scale') or e.get('camera_move') for e in plan)
+    has_angle = any(e.get('camera_angle') or e.get('camera_bearing') or e.get('lens_feel')
+                    for e in plan)
+    has_placement = any(e.get('placement') for e in plan)
+    has_time = any(e.get('time_treatment') for e in plan)
     has_insert = bool(multishot) and any(e.get('insert') for e in plan)
     has_cast = any(e.get('cast') for e in plan)
     has_tool = any(e.get('tool') for e in plan)
@@ -15810,7 +15873,8 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
     observed_crossings = outline_space_crossings(plan)
     rich_block = ""
     if (has_scope or has_zone or has_trace or has_state or observed_crossings
-            or has_shot or has_tool or has_sfx or has_light or has_crew or has_flow
+            or has_shot or has_angle or has_placement or has_time
+            or has_tool or has_sfx or has_light or has_crew or has_flow
             or has_macro or has_insert or has_cast or has_micro_forensics):
         rules = []
         if observed_crossings:
@@ -15830,7 +15894,7 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
                 "schema below), whatever its number, and never mark a beat whose label equals the "
                 "previous entry's. There is no fixed number of crossings: reproduce exactly the ones "
                 "listed here. Each crossing beat's video depicts the pure camera move through that "
-                "opening (sterile of workers, untouched ruin); the "
+                "opening (sterile of workers, no construction during the move); the "
                 "beat before it ends with that opening still closed or unlit, nothing of the next "
                 "space visible. Work already finished in an earlier space stays finished — a crossing "
                 "moves the camera, it never resets construction.")
@@ -15883,6 +15947,48 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
                 "that beat's camera description. Do not upgrade a static beat into a sweeping move "
                 "because the work looks dramatic, and do not push in on a beat filmed wide — the "
                 "shot rhythm is half of why the reference film reads the way it does.")
+        if has_angle:
+            rules.append(
+                "ANGLE: an entry's \"ANGLE\" is WHERE THE CAMERA STOOD for that beat in the "
+                "reference film, on two independent axes, each from a closed set: vertically "
+                "(bird_eye|high_angle|eye_level|low_angle|worm_eye|dutch_angle) and horizontally "
+                "(front|three_quarter|side|rear_three_quarter|back — which face of the subject the "
+                "lens looks at), plus the lens feel where one is given (ultra_wide|wide|normal|"
+                "tele|macro — how wide the glass is, which is NOT the same as how much is in "
+                "shot). Write them into that beat's camera description in plain prose "
+                "(\"the camera sits low, close to the ground, looking up along the wall from its "
+                "flank\"), and keep them consistent with that beat's locked anchors and "
+                "frame-height shares. This is not a stylistic choice you get to make: a low, "
+                "close-to-the-ground angle and a standing overhead angle turn the same trade "
+                "operation into two completely different films, and the angle is the single "
+                "strongest reason the reference footage reads the way it does. Never flatten an "
+                "entry to eye_level/front because that is easier to describe, never re-stage the "
+                "camera because the work would 'read better' from elsewhere, and never let a beat "
+                "drift to a different angle from the entry beside it when both entries declare the "
+                "same pair — an unchanged pair means the tripod did not move."
+                + (" A dutch_angle entry means the FRAME ITSELF is rolled off horizontal; say so "
+                   "explicitly, and do not confuse it with a camera standing off to one side."
+                   if any(e.get('camera_angle') == 'dutch_angle' for e in plan) else ""))
+        if has_placement:
+            rules.append(
+                "PLACEMENT: an entry's \"PLACEMENT\" is the reference film's actual COMPOSITION "
+                "for that beat — where the subject sits in the frame, what fraction of the frame "
+                "height it fills, and where the horizon sits. It is a measurement, the only one "
+                "this job has of how the original is framed. Compose that beat around it: the "
+                "registered anchors' screen positions and frame-height shares must be consistent "
+                "with it, and a beat whose subject is declared as filling three fifths of the "
+                "frame must not be written as a distant speck or a full-bleed close-up. Where an "
+                "entry gives no placement, keep the composition its shot family already fixes.")
+        if has_time:
+            rules.append(
+                "TIME: an entry's \"TIME\" is how time runs in that beat in the reference film: "
+                "timelapse (work racing, cycles compressed), real_time (a walk-through, a reveal, "
+                "one unhurried action at natural speed), or slow_motion. Write that beat's VIDEO "
+                "accordingly — a real_time entry is NOT a construction time-lapse and must not be "
+                "labelled or paced as one, and a timelapse entry must read as compressed repeated "
+                "work. The final reveal of these films is usually real_time while every "
+                "construction beat around it is timelapse; flattening them all to time-lapse "
+                "delivers a calm finished-home tour as a frantic sped-up clip.")
         if has_cast:
             rules.append(
                 "CAST: an entry's \"CAST\" is what the people or figurines in that beat are "

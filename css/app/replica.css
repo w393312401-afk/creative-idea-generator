@@ -2815,3 +2815,107 @@ body.log-expanded .replica-bottom-bar-actions {
     color: #0f172a;
 }
 
+
+/* ── 运行中的输入锁 ─────────────────────────────────────────
+ *
+ * 跑着的时候节拍字段一律只读（见 replicaSetBusy）：那几分钟里敲的字会被这一轮的
+ * 结果整份覆盖，让它看起来还能改等于在骗人。刻意不用 disabled 的灰——文本必须
+ * 保持可读、可选中，用户在等结果时最常做的就是回头看自己写了什么。
+ */
+.replica-textarea.is-run-locked,
+input.is-run-locked,
+textarea.is-run-locked {
+    cursor: not-allowed;
+    border-color: rgba(255, 255, 255, 0.06);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.replica-stage-select.is-run-locked {
+    cursor: not-allowed;
+    opacity: 0.7;
+}
+
+/* ── 未保存标记 ─────────────────────────────────────────────
+ *
+ * 这一页的改动全部先落在内存里，落盘要用户自己按。此前页面上没有任何地方能回答
+ * 「我改的存了没有」——这个点就是那个答案。
+ */
+.replica-dirty-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    margin-left: 7px;
+    border-radius: 50%;
+    background: var(--warning, #f59e0b);
+    vertical-align: middle;
+}
+
+.replica-bar-save-dirty {
+    border-color: rgba(245, 158, 11, 0.55) !important;
+    color: var(--warning, #f59e0b) !important;
+}
+
+/* 阶段轨上的实际耗时。刻意做得比阶段名弱一档：它是回头复盘时才看的数，
+   不该在正常操作时抢走对「现在走到哪一步」的注意力。 */
+.replica-phase-dur {
+    margin-left: 6px;
+    font-size: 10.5px;
+    opacity: 0.6;
+    font-variant-numeric: tabular-nums;
+}
+
+/* 实际花费。默认收起：它是复盘用的数，不该在「选档位再开跑」这个决策上抢戏。 */
+.replica-spend {
+    margin: 8px 0 12px;
+}
+
+.replica-spend-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 8px 0;
+    font-size: 12px;
+}
+
+.replica-spend-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.03);
+    font-variant-numeric: tabular-nums;
+}
+
+/* 任务列表行上的活体进度。只在跑着的行上出现，所以不占常驻宽度；
+   超出一行就截断——这里要回答的是「它还在动吗」，不是把完整文案读完。 */
+.replica-job-live {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    max-width: 22em;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-size: 11.5px;
+    opacity: 0.75;
+}
+
+.replica-job-live-dot {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--neon-cyan, #6ee7ff);
+    animation: replica-live-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes replica-live-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.25; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .replica-job-live-dot { animation: none; }
+}

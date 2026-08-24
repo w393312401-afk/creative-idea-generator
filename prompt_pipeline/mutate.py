@@ -420,6 +420,16 @@ def generate_orthogonal_variant(
 
     pipeline_id = baseline_doc.get('job_id') or baseline_doc.get('pipeline_id') or 'baseline'
 
+    # 变体继承哪几栏：**人**和**影调**继承，其余不继承。
+    # 四条变异轴是 carrier / environment / material / pacing / reward，没有一条动到出镜的人；
+    # 影调同理——那是创作者的拍法，换个项目还是同一双眼睛。而材质、痕迹、常驻器具、环境
+    # 底噪都是**这个场地**的属性：换了载体换了环境，母本的青苔污渍和林间风都不再成立。
+    _baseline_constants = baseline_doc.get('scene_constants') or {}
+    baseline_carry = {}
+    for _key in ('cast', 'grade'):
+        _items = [str(x).strip() for x in (_baseline_constants.get(_key) or []) if str(x).strip()]
+        if _items:
+            baseline_carry[_key] = _items
     variant_doc = {
         'pipeline_id': pipeline_id,
         'variant_of': pipeline_id,
@@ -432,7 +442,7 @@ def generate_orthogonal_variant(
         'source_video': baseline_doc.get('source_video', baseline_doc.get('video_name', '')),
         'scene_signature': scene_sig,
         'banned_elements': banned_elems,
-        'scene_constants': {},
+        'scene_constants': dict(baseline_carry),
         'beats': variant_beats,
         'validation': [],
     }

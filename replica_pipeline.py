@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -54,7 +55,7 @@ REVIEW_STAGES = {'confirm_cost', 'review_beats', 'audit_failed', 'compose_failed
 ATTENTION_WAITING_YOU = {'confirm_cost', 'review_beats', 'audit_failed', 'compose_failed', 'mutate_failed'}
 
 VALID_ACTIONS = {'approve', 'variant', 'recluster', 'translate', 'autofix', 'fix_beats',
-                 'autobalance', 'refine_craft', 'archive', 'rename'}
+                 'autobalance', 'refine_craft', 'archive', 'rename', 'undo_beats'}
 
 # stage → 中文标签的唯一真源。
 STAGE_LABELS = {
@@ -128,6 +129,9 @@ def stage_catalog():
 
 _JOBS_DIRNAME = 'replica_jobs'
 _STATE_FILENAME = '.replica_pipeline.json'
+_BEATS_FILENAME = 'timelapse_beats.json'
+# 被覆盖的上一版阶梯（见 _write_beats / undo_beats）。只留一代。
+_BEATS_PREV_FILENAME = 'timelapse_beats.prev.json'
 
 
 # 抽帧脚本的默认参数就是为延时调过的（见脚本 docstring），不要在这里再调低。
@@ -403,7 +407,9 @@ def _save_state(state):
     directory = job_dir(valid_id)
     os.makedirs(directory, exist_ok=True)
     path = _state_path(valid_id)
-    state['updated_at'] = datetime.now().isoformat()
+    now = datetime.now()
+    state['updated_at'] = now.isoformat()
+    _record_stage_timing(state, now)
 
     beats = state.get('beats')
     if beats:
@@ -423,6 +429,84 @@ def _save_state(state):
         os.replace(tmp, path)
         _write_summary(state)
     return state
+
+
+# 阶段耗时台账。state 上此前只有 created_at / updated_at：一条任务跑完，没人知道
+# 时间花在哪，也没有任何数据能支撑 ETA。
+#
+# 封顶是必需的而不是保险：反复回炉的任务（改一拍、重合成、又退回卡点）会在同样几个
+# stage 之间来回跳几十次，不封顶就是往状态文件里无限追加。留最近这些足够算中位数。
+_STAGE_HISTORY_CAP = 200
+
+
+def _record_stage_timing(state, now):
+    """stage 变了就记一笔，并把上一段的实际耗时结算掉。"""
+    stage = state.get('stage')
+    if not stage:
+        return
+    history = state.get('stage_history')
+    if not isinstance(history, list):
+        history = []
+    if history and history[-1].get('stage') == stage:
+        return                      # 同一阶段内的多次落盘不记账
+    if history:
+        try:
+            started = datetime.fromisoformat(history[-1]['at'])
+            history[-1]['dur_sec'] = round((now - started).total_seconds(), 1)
+        except (KeyError, TypeError, ValueError):
+            pass
+    history.append({'stage': stage, 'at': now.isoformat()})
+    state['stage_history'] = history[-_STAGE_HISTORY_CAP:]
+
+
+def stage_durations(state):
+    """按 stage 汇总累计耗时（秒）。同一阶段跑过多次就累加——用户问的是
+    「这条任务在反推上花了多久」，不是「最后一次反推花了多久」。"""
+    totals = {}
+    for entry in state.get('stage_history') or []:
+        dur = entry.get('dur_sec')
+        if isinstance(dur, (int, float)):
+            totals[entry['stage']] = round(totals.get(entry['stage'], 0) + dur, 1)
+    return totals
+
+
+# 实际花费。确认卡点上一直摆着三档**预估**（见 run_extract），跑完却从不回填实际——
+# 于是那个预估永远没有被校准过，用户也无从判断上一次到底花了多少。
+#
+# 按任务类型分桶而不是记一个总数：整条线的钱几乎全在 Pass A（replica_start）上，
+# 一个总数看不出这一点，也就没法回答「值不值得把送审档位调高」。
+_SPEND_BUCKETS = {
+    'replica_extract': 'extract',
+    'replica': 'reverse',
+    'replica_advance': 'advance',
+    'replica_mutate': 'mutate',
+}
+
+
+def record_job_spend(job_id, task_type, usage):
+    """把一轮跑完的 token 用量累加进 job 状态。
+
+    静默失败：这是账目，不是正事。记账炸了不该让一条已经跑完的任务报错。
+    """
+    if not usage:
+        return
+    bucket = _SPEND_BUCKETS.get(task_type, task_type or 'other')
+    try:
+        state = _load_state(job_id)
+        if not state:
+            return
+        spend = state.get('spend')
+        if not isinstance(spend, dict):
+            spend = {}
+        cur = spend.get(bucket) or {}
+        for key in ('prompt_tokens', 'completion_tokens', 'total_tokens', 'api_calls'):
+            cur[key] = (cur.get(key) or 0) + (usage.get(key) or 0)
+        cur['runs'] = (cur.get('runs') or 0) + 1
+        spend[bucket] = cur
+        state['spend'] = spend
+        _save_state(state)
+    except Exception:
+        pass
 
 
 def job_display_name(job_id, state=None):
@@ -669,7 +753,7 @@ def _purge_extract_products(directory, state=None):
                     os.remove(os.path.join(directory, name))
                 except OSError:
                     pass
-    for name in ('.frame_facts_cache.json', 'frame_facts.json', 'timelapse_beats.json',
+    for name in ('.frame_facts_cache.json', 'frame_facts.json', _BEATS_FILENAME, _BEATS_PREV_FILENAME,
                  'compose_state.json'):
         try:
             os.remove(os.path.join(directory, name))
@@ -714,6 +798,68 @@ def _generate_collage_thumb(collage_path):
         return None
 
 
+def _run_analyzer(state, directory, base, dense, on_progress=None):
+    """跑抽帧脚本，并在跑的过程中按已落盘的帧数报进度。
+
+    脚本本身只在**结束时**才 print（见 analyze_timelapse_video.py 的收尾段），所以
+    这里没有 stdout 可以转发——真正能实时看见的信号是它正在往 review_frames/ 里落的
+    那些文件。改成 Popen + 一个数文件的线程，就是为了拿到这个信号：在此之前，抽帧
+    这一段在页面上是纯哑区，长视频要静默好几分钟。
+
+    分母是估的（时长 × 基线 fps，密采窗与首尾密采都会让实际帧数更多），所以百分比
+    **封顶在 95%**：宁可最后一跳补齐，也不要先走到头再倒退——倒退的进度条比不动的
+    更让人觉得出了事。
+    """
+    args = [sys.executable, _analyzer_script(),
+            '--video', state['video_path'], '--output-dir', directory,
+            '--base-fps', str(base), '--dense-fps', str(dense)]
+    if not on_progress:
+        return subprocess.run(args, capture_output=True, text=True,
+                              timeout=_ANALYZER_TIMEOUT_SEC, **_win_subprocess_flags())
+
+    duration = float((state.get('media') or {}).get('duration_sec') or 0)
+    expected = int(duration * base) if duration > 0 else 0
+    frames_dir = os.path.join(directory, 'review_frames')
+    stop = threading.Event()
+
+    def _watch():
+        last = -1
+        while not stop.wait(2.0):
+            try:
+                seen = len(os.listdir(frames_dir))
+            except OSError:
+                continue          # 目录还没建出来，下一轮再看
+            if seen == last:
+                continue
+            last = seen
+            detail = {'stage': 'extract',
+                      'message': f'正在抽帧：已落盘 {seen} 帧'
+                                 + (f'（预计 ~{expected} 帧起）' if expected else '')}
+            if expected:
+                detail['done'] = min(seen, int(expected * 0.95))
+                detail['total'] = expected
+            try:
+                on_progress('replica_stage', detail)
+            except Exception:
+                # 进度回调炸了不该拖垮抽帧本身：这条线程唯一的职责是报数。
+                return
+
+    watcher = threading.Thread(target=_watch, daemon=True)
+    watcher.start()
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, **_win_subprocess_flags())
+        try:
+            out, err = proc.communicate(timeout=_ANALYZER_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+    finally:
+        stop.set()
+    return subprocess.CompletedProcess(args, proc.returncode, out, err)
+
+
 def run_extract(state, on_progress=None, base_fps=None):
     """调 skill 自带的抽帧脚本。不重写它——它已经把延时特有的采样纪律做完了。
 
@@ -735,13 +881,7 @@ def run_extract(state, on_progress=None, base_fps=None):
 
     directory = job_dir(state['job_id'])
     _purge_extract_products(directory, state)
-    proc = subprocess.run(
-        [sys.executable, _analyzer_script(),
-         '--video', state['video_path'], '--output-dir', directory,
-         '--base-fps', str(base), '--dense-fps', str(dense)],
-        capture_output=True, text=True, timeout=_ANALYZER_TIMEOUT_SEC,
-        **_win_subprocess_flags(),
-    )
+    proc = _run_analyzer(state, directory, base, dense, on_progress=on_progress)
     if proc.returncode != 0:
         raise RuntimeError(f'抽帧脚本失败（exit {proc.returncode}）:\n{(proc.stderr or "")[-2000:]}')
 
@@ -891,13 +1031,72 @@ def run_reverse(state, config, on_progress=None, degraded=False, scope=None):
     return state
 
 
+def _beats_path(job_id):
+    return os.path.join(job_dir(job_id), _BEATS_FILENAME)
+
+
+def _beats_prev_path(job_id):
+    return os.path.join(job_dir(job_id), _BEATS_PREV_FILENAME)
+
+
 def _write_beats(state, beats):
-    path = os.path.join(job_dir(state['job_id']), 'timelapse_beats.json')
+    """写节拍阶梯，并把被覆盖的那一版留一份。
+
+    autofix / 工艺精修 / 自动平衡 / 重跑聚类都是**整份覆盖**，此前磁盘上不留任何旧版，
+    也没有恢复入口：模型把一条手工调好的阶梯改坏了，只能重跑 Pass B——重新付钱，
+    而且结果还不一样。
+
+    只留一代，不做版本树：这里要解决的是「刚才那一下改坏了」，不是版本管理。留多了
+    反而要在 UI 上回答「回到哪一版」，那是另一个问题。
+    """
+    job_id = state['job_id']
+    path = _beats_path(job_id)
+    if os.path.exists(path):
+        try:
+            shutil.copy2(path, _beats_prev_path(job_id))
+        except OSError:
+            # 备份失败不该拦住正事：没有上一版可回退，比写不进新版本轻。
+            pass
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(beats, f, ensure_ascii=False, indent=2)
     state['beats'] = beats
     state['validation'] = beats.get('validation') or []
     return path
+
+
+def undo_beats(job_id):
+    """回到上一版节拍阶梯。
+
+    做成**对调**而不是单向恢复：撤销本身也留下一份可撤销的现场，用户点错了能再点
+    回来。单向恢复的话，误点一次撤销就把刚跑完的那一轮结果永久丢了——那正是这个
+    功能要防的事，不该由它自己再制造一次。
+    """
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+    path, prev = _beats_path(job_id), _beats_prev_path(job_id)
+    if not os.path.exists(prev):
+        raise ValueError('没有可回退的上一版节拍阶梯')
+
+    with open(prev, 'r', encoding='utf-8') as f:
+        restored = json.load(f)
+
+    swap = path + '.swap'
+    if os.path.exists(path):
+        os.replace(path, swap)
+    os.replace(prev, path)
+    if os.path.exists(swap):
+        os.replace(swap, prev)
+
+    state['beats'] = restored
+    state['validation'] = restored.get('validation') or []
+    # 已有的提示词是按被撤掉的那一版措辞合出来的，必须作废——否则用户会拿着一份
+    # 跟当前阶梯对不上的提示词去交付，而页面上看不出任何异样。
+    _invalidate_compose_artifacts(state)
+    state['stage'] = 'review_beats'
+    _revalidate(state, persist=False)
+    _save_state(state)
+    return state
 
 
 def save_beats(job_id, beats):
@@ -2058,6 +2257,31 @@ def start_replica_job(config, job_id, on_progress=None, degraded=False, scope=No
         raise
 
 
+# 人工卡点上跑的这几个动作全都挂在 review_beats 这个 stage 底下，而 review_beats 在前端
+# 的进度区间是零宽的（它是个卡点，不是个阶段）。结果是：工艺精修逐拍跑好几分钟，进度条
+# 一动不动停在 68%，chip 上还写着「待人工核对」——界面在说"等你动手"，其实是机器在跑。
+#
+# 修法是让前端认得出"这一刻在跑哪个动作"，从而给它一段自己的区间。做成包一层而不是去改
+# 那十来处 on_progress 调用点，是因为前端的判据是「动作期间的每一条事件都带 action」：
+# 逐个 emission 手加字段，漏一条就会在那一瞬间闪回「待人工核对」，而且下次谁再加一条
+# 事件又会漏。包一层之后这条保证是结构性的。
+_ACTION_TAGGED = frozenset({'autofix', 'fix_beats', 'autobalance', 'refine_craft', 'translate'})
+
+
+def _tag_progress_with_action(on_progress, action):
+    """给这一轮的所有 replica_stage 事件盖上 action 戳。"""
+    if not on_progress or action not in _ACTION_TAGGED:
+        return on_progress
+
+    def _tagged(stage, details=None):
+        # cancel_check 是个**查询**（返回"要不要停"），不是广播，绝不能改它的返回值。
+        if stage == 'replica_stage' and isinstance(details, dict):
+            details = dict(details, action=action)
+        return on_progress(stage, details)
+
+    return _tagged
+
+
 def advance_replica_job(config, job_id, action='approve', payload=None,
                         on_progress=None):
     """推进人工卡点。
@@ -2072,6 +2296,7 @@ def advance_replica_job(config, job_id, action='approve', payload=None,
     if action not in VALID_ACTIONS:
         raise ValueError(f'不支持的 action: {action}，合法值为: {sorted(VALID_ACTIONS)}')
     payload = payload or {}
+    on_progress = _tag_progress_with_action(on_progress, action)
     state = _load_state(job_id)
     if not state:
         raise ValueError(f'找不到复刻任务 {job_id}')
@@ -2109,6 +2334,17 @@ def advance_replica_job(config, job_id, action='approve', payload=None,
             return state
         if action == 'refine_craft':
             state, refined_count = refine_job_craft(config, job_id, on_progress=on_progress)
+            return state
+        if action == 'undo_beats':
+            state = undo_beats(job_id)
+            if on_progress:
+                on_progress('replica_stage', {
+                    'stage': state.get('stage') or 'review_beats',
+                    'message': ('已回到上一版节拍阶梯。按合成产出的提示词已作废，需要重新合成。'
+                                '再点一次「撤销」可以回到刚才那一版。'),
+                    'beats': state.get('beats'),
+                    'validation': state.get('validation') or [],
+                })
             return state
         raise ValueError(f'不支持的 action: {action}')
     except Exception as e:
@@ -2189,6 +2425,10 @@ def get_replica_status(job_id):
             _save_state(state)
 
     state['frame_urls'] = frame_urls(state)
+    # 有没有上一版可回退。前端据此决定要不要摆「撤销」——没有可回退版本时摆一个
+    # 点了必然报错的按钮，比不摆更糟。
+    state['beats_undo_available'] = os.path.exists(_beats_prev_path(job_id))
+    state['stage_durations'] = stage_durations(state)
     state['stage_label'] = stage_label(state.get('stage'))
     state['phase'] = phase_of(state.get('stage'))
 

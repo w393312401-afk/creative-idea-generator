@@ -86,6 +86,41 @@ const REPLICA_SHOT_SCALES = [
     ['close', '近景'],
     ['extreme_close', '特写'],
 ];
+// 拍摄角度是两根**互相独立**的轴：同一拍可以既是低角度仰拍、又是从侧面拍的。
+// 捏成一栏就得二选一，而被丢掉的那一半正是原片最像自己的地方。
+const REPLICA_CAMERA_ANGLES = [
+    ['', '— 未标注 —'],
+    ['bird_eye', '鸟瞰（正上方俯视，地面铺满画面）'],
+    ['high_angle', '高角度俯拍（在主体之上往下看，看得见顶面）'],
+    ['eye_level', '平视（站立视高，画面水平）'],
+    ['low_angle', '低角度仰拍（在主体之下往上看，看得见底面）'],
+    ['worm_eye', '虫视（贴地往上看）'],
+    ['dutch_angle', '倾斜角（整幅画面歪着，地平线本身是斜的）'],
+];
+const REPLICA_CAMERA_BEARINGS = [
+    ['', '— 未标注 —'],
+    ['front', '正面'],
+    ['three_quarter', '前侧四分之三（正面＋一个侧面都看得见）'],
+    ['side', '侧面（只看得见侧面）'],
+    ['rear_three_quarter', '后侧四分之三'],
+    ['back', '背面'],
+];
+// 焦段感与景别是两件事：14mm 拍中景和 85mm 拍中景，透视、畸变、纵深完全两回事。
+const REPLICA_LENS_FEELS = [
+    ['', '— 未标注 —'],
+    ['ultra_wide', '超广（边缘有畸变、近处物体夸张、空间显得更深）'],
+    ['wide', '广角（开阔但没有明显畸变）'],
+    ['normal', '标准（透视接近肉眼，不拉伸也不压缩）'],
+    ['tele', '长焦（背景被压扁贴到主体上）'],
+    ['macro', '微距（很小的东西占满画面）'],
+];
+// 时间处理：此前每一拍都被默认写成「延时加速」，包括最后那个成品巡览拍。
+const REPLICA_TIME_TREATMENTS = [
+    ['', '— 未标注 —'],
+    ['timelapse', '延时加速（工序在飞，人动得比真实快）'],
+    ['real_time', '实时（巡览/揭示/一个不紧不慢的动作，原速）'],
+    ['slow_motion', '慢动作'],
+];
 const REPLICA_CAMERA_MOVES = [
     ['', '— 未标注 —'],
     ['static', '固定'],
@@ -106,6 +141,19 @@ let replicaDivergeBrief = '';
 let replicaDiverging = false;
 let replicaComparatorOpen = false;
 let replicaBeatFoldState = {};
+// 节拍卡片**内部**那些 <details> 的开合，键是 `${beat.id}:${字段名}`。
+// 服务端会在拆合拍后重排 id，所以它必须跟 replicaBeatFoldState 在同一时刻清空——
+// 不清的话，新占用 B05 这个名字的那一拍会带着上一任展开过的可选字段。
+let replicaFieldFoldState = {};
+// 节拍编辑器里所有会写回 replicaState.beats 的可编辑控件。三处用到：运行中锁只读
+// （replicaSetBusy）、脏标记（replicaBindBeatEvents）、Cmd+S 时的失焦提交。
+// 下拉框单列一份：readOnly 对 <select> 无效，只能 disabled。
+const REPLICA_BEAT_INPUT_SELECTOR =
+    'textarea[data-beat][data-key], input[data-beat][data-key], '
+    + '#replica-banned, #replica-scene-signature, [data-scene-key]';
+const REPLICA_BEAT_SELECT_SELECTOR = 'select[data-beat][data-key]';
+// 有未落盘的节拍改动。置位在各 input 处理器里，清零在 replicaSaveBeats 成功之后。
+let replicaDirty = false;
 let replicaJobListExpanded = false;
 let replicaJobListSearchQuery = '';
 let replicaVariantFoldState = {};
@@ -280,14 +328,22 @@ function replicaNotifyStageChange(state) {
 }
 
 async function replicaLoadJob(jobId) {
+    // 切走会把 replicaState 整个换掉，内存里没落盘的改动一起没。此前不问一句：改了
+    // 二十拍、顺手点了列表里另一条任务，没有任何提示，也回不来。
+    // 只在**真的切到另一条**时拦；同一条任务的刷新（SSE 收尾、保存后回读）不该弹窗。
+    if (replicaDirty && replicaState && replicaState.job_id !== jobId
+        && !window.confirm('当前任务有改动还没保存，切走就没了。确定切换？')) {
+        return replicaState;
+    }
     const data = await replicaFetch(`/api/replica/status?job_id=${encodeURIComponent(jobId)}`,
         { headers: replicaHeaders() });
     const switched = !replicaState || replicaState.job_id !== jobId;
+    if (switched) replicaMarkDirty(false);
     replicaState = data.job_state;
     replicaNotifyStageChange(replicaState);
     // 折叠状态按 beat.id 存，而 B01…B11 在每一条任务里都叫这个名字。不清空的话，
     // 在 A 任务折起来的 B03，切到 B 任务照样是折的——用户没折过它，它却是折的。
-    if (switched) replicaBeatFoldState = {};
+    if (switched) { replicaBeatFoldState = {}; replicaFieldFoldState = {}; }
     return replicaState;
 }
 
@@ -487,7 +543,10 @@ function replicaRenderBottomBar(state) {
         mainActionHtml = `<button type="button" id="replica-bar-start-btn" class="action-btn primary-btn">确认并开始反推</button>`;
     } else if (stage === 'review_beats' || (hasBeats && stage !== 'completed' && stage !== 'audit_failed')) {
         mainActionHtml = `
-            <button type="button" id="replica-bar-save-btn" class="action-btn text-btn">保存并重校验</button>
+            <button type="button" id="replica-bar-save-btn"
+                    class="action-btn text-btn ${replicaDirty ? 'replica-bar-save-dirty' : ''}"
+                    ${replicaDirty ? 'title="有改动还没存下来"' : ''}
+                >保存并重校验${replicaDirty ? '<span class="replica-dirty-dot"></span>' : ''}</button>
             ${resetCacheToggleHtml}
             <button type="button" id="replica-bar-compose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词</button>
         `;
@@ -652,6 +711,13 @@ function replicaRenderJobList() {
                 ${job.beat_count ? `<span class="replica-chip">${job.beat_count} 拍</span>` : ''}
                 ${job.error ? '<span class="replica-chip replica-chip-error">出错</span>' : ''}
                 ${isArchived ? '<span class="replica-chip">📦 已归档</span>' : ''}
+                ${/* 跑着的任务：把它当前在干什么摆到行上。列表行此前只有一个静态 stage
+                      chip，而 SSE 只连当前打开的那一条——同时跑两条时，另一条在列表里
+                      看不出任何进展，只能靠反复点进去确认。 */''}
+                ${job.active_task_id ? `<span class="replica-job-live" title="${
+                    escapeHtmlReplica(job.active_message || '正在后台运行')}">
+                    <span class="replica-job-live-dot"></span>${
+                    escapeHtmlReplica(job.active_message || '正在后台运行')}</span>` : ''}
             </button>
             ${lineageToggleHtml}
             <button type="button" class="replica-mini-btn" data-rename="${escapeHtmlReplica(job.job_id)}" title="重命名此任务">改名</button>
@@ -721,20 +787,36 @@ function replicaRenderJobList() {
     </details>`;
 }
 
+// 秒 → 人话。分钟级以上不再显示秒：反推跑了「23 分」比「1387 秒」有用得多。
+function replicaFormatDuration(sec) {
+    const n = Math.round(Number(sec) || 0);
+    if (n < 60) return `${n} 秒`;
+    if (n < 3600) return `${Math.round(n / 60)} 分`;
+    return `${(n / 3600).toFixed(1)} 小时`;
+}
+
 function replicaRenderPhases(state) {
     // 页面上原先编着 ①②③④⑤，后台却有十二个 stage —— chip 显示「聚类节拍」时用户
     // 在页面上找不到任何一块对应它。这条阶梯把两者对齐：四个阶段，各自对应页面上
     // 真实存在的一块区域。
     const at = replicaPhaseIndex(state.stage);
     const failed = state.stage === 'audit_failed' || !!state.error;
+    const durations = state.stage_durations || {};
     return `<ol class="replica-phases">${REPLICA_PHASES.map((p, i) => {
         const cls = i < at ? 'done' : (i === at ? (failed ? 'failed' : 'current') : 'todo');
         // 已经走到过的阶段才能点着跳回去；没到的阶段页面上还没有那一块。
         const canJump = i <= at;
-        const title = canJump ? `点击直达「${p.label}」区段` : '尚未进入该阶段';
+        // 这一大阶段实际花了多久（它底下所有 stage 的累计，见 stage_durations）。
+        // 摆出来是为了回答「时间到底花在哪」——在此之前这个问题在页面上无解，
+        // 只能去翻 server.log 对时间戳。
+        const spent = p.stages.reduce((sum, st) => sum + (Number(durations[st]) || 0), 0);
+        const spentText = spent > 0 ? replicaFormatDuration(spent) : '';
+        const title = (canJump ? `点击直达「${p.label}」区段` : '尚未进入该阶段')
+            + (spentText ? `　·　本阶段累计耗时 ${spentText}` : '');
         return `<li class="replica-phase ${cls} ${canJump ? 'is-jumpable' : 'is-locked'}"
-                    data-phase="${p.key}" title="${title}"><span class="replica-phase-dot">${i + 1}</span>
-            <span class="replica-phase-label">${p.label}</span></li>`;
+                    data-phase="${p.key}" title="${escapeHtmlReplica(title)}"><span class="replica-phase-dot">${i + 1}</span>
+            <span class="replica-phase-label">${p.label}</span>${
+                spentText ? `<span class="replica-phase-dur">${spentText}</span>` : ''}</li>`;
     }).join('')}</ol>`;
 }
 
@@ -1170,6 +1252,44 @@ function replicaRenderJob(state) {
     </div>`;
 }
 
+// 这条任务到目前为止真花掉的 token。
+//
+// 确认卡点上一直摆着三档预估，却从不回填实际——那个预估因此永远没有被校准过的机会，
+// 用户也无从判断「上次那一单到底花了多少」。摆在预估**旁边**是刻意的：这两个数只有
+// 并排看才有意义。
+function replicaRenderSpend(state) {
+    const spend = state.spend || {};
+    const rows = [
+        ['reverse', '反推（Pass A + 聚类）'],
+        ['advance', '卡点动作与合成'],
+        ['mutate', '二创派生'],
+        ['extract', '抽帧'],
+    ].filter(([key]) => (spend[key] || {}).total_tokens);
+    if (!rows.length) return '';
+
+    const grand = rows.reduce((sum, [key]) => sum + (spend[key].total_tokens || 0), 0);
+    const fmt = (n) => (n >= 10000 ? `${(n / 10000).toFixed(1)} 万` : String(n));
+    return `
+    <details class="replica-spend">
+        <summary class="replica-hint">
+            这条任务已实际花费 <b>${fmt(grand)}</b> tokens —— 展开看分布，可与上面的预估对照
+        </summary>
+        <div class="replica-spend-rows">
+            ${rows.map(([key, label]) => {
+                const b = spend[key];
+                return `<div class="replica-spend-row">
+                    <span>${label}</span>
+                    <span>${fmt(b.total_tokens || 0)} tokens · ${b.api_calls || 0} 次调用 · 跑过 ${b.runs || 0} 轮</span>
+                </div>`;
+            }).join('')}
+        </div>
+        <p class="replica-hint">
+            上面的预估算的是「送多少帧、几次视觉调用」，这里是真实 token 用量——
+            两者口径不同，但放在一起就能看出这条任务的钱到底花在了哪一段。
+        </p>
+    </details>`;
+}
+
 function replicaRenderExtract(state) {
     const ov = state.overview;
     if (!ov) return '';
@@ -1246,6 +1366,7 @@ function replicaRenderExtract(state) {
                     <b>抽帧已完成，还没有开始花钱。</b>Pass A 是整条线的成本大头——
                     下面三档决定送多少帧给多模态模型，选好再按开始。
                 </p>` : ''}
+                ${replicaRenderSpend(state)}
                 <label class="replica-radio">
                     <input type="radio" name="replica-mode" value="all" ${scope === 'all' ? 'checked' : ''}>
                     <span>全部（${every.frame_count || 0} 帧 / 约 ${every.batch_count || 0} 次视觉调用）——
@@ -1341,9 +1462,35 @@ function replicaRenderProgress() {
 // 每个 replica stage 在整条进度上的区间。
 const REPLICA_STAGE_RANGE = {
     ingest: [0, 3], extract: [3, 15], confirm_cost: [15, 15],
-    review_frames: [15, 45], cluster_beats: [45, 68], mutate_beats: [45, 68],
+    // review_frames 收窄到 38：峰值帧复核跟逐帧提取同属这个 stage，却发生在它之后。
+    // 共用一个区间的话，"只增不减"的进度条在逐帧提取跑到 45 之后就再也动不了，
+    // 复核那几十张强模型调用整段静默（见 REPLICA_ACTION_RANGE.peak_verify）。
+    review_frames: [15, 38], cluster_beats: [45, 68], mutate_beats: [45, 68],
     review_beats: [68, 68],
     compose: [68, 94], audit: [94, 99], audit_failed: [99, 99], completed: [100, 100],
+};
+
+// 人工卡点上的机器活。这四个动作都在 review_beats 这个 stage 下跑，而它的阶段区间是
+// 零宽的——所以它们各自需要一段自己的区间，否则进度条在几分钟里一动不动。
+// 区间都落在 68 往后：这些动作是在卡点上"往前修"，不是退回上一阶段。
+const REPLICA_ACTION_RANGE = {
+    peak_verify: [38, 45],
+    autofix: [68, 82],
+    fix_beats: [68, 82],
+    refine_craft: [68, 86],
+    autobalance: [68, 76],
+    translate: [68, 74],
+};
+
+// 动作期间 chip 上显示的名字。用动作名而不是阶段名——阶段名是「待人工核对」，
+// 在机器跑着的时候把它摆出来，等于给了用户一个错的答案。
+const REPLICA_ACTION_LABELS = {
+    peak_verify: '强模型复核峰值帧',
+    autofix: 'AI 修复硬伤',
+    fix_beats: 'AI 修复硬伤',
+    refine_craft: '工艺精修',
+    autobalance: '自动平衡时序',
+    translate: '重做中文对照',
 };
 
 // 合成器自己的事件（progress_model 认得的那一套）。beat_ready 单独处理：它带的是
@@ -1361,6 +1508,7 @@ function replicaResetProgress() {
         range: [0, 100],
         percent: 0,
         label: '',
+        actionLabel: '',   // 非空时盖过 stage 名（见 replicaHandleStageEvent）
         log: [],
         composeState: (window.ProgressModel && window.ProgressModel.createProgressState('compose')) || null,
     };
@@ -1375,7 +1523,8 @@ function replicaProgressPaint() {
         const el = box.querySelector(id);
         if (el) el.textContent = text;
     };
-    set('#replica-progress-stage', replicaStageLabel(replicaProgress.stage) || '进行中');
+    set('#replica-progress-stage',
+        replicaProgress.actionLabel || replicaStageLabel(replicaProgress.stage) || '进行中');
     set('#replica-progress-label', replicaProgress.label || '');
     set('#replica-progress-percent', `${Math.round(replicaProgress.percent)}%`);
     const fill = box.querySelector('#replica-progress-fill');
@@ -1407,10 +1556,32 @@ function replicaProgressUpdate(percent, label, stage) {
 
 function replicaHandleStageEvent(detail) {
     const stage = (detail && detail.stage) || '';
-    const range = REPLICA_STAGE_RANGE[stage] || replicaProgress.range || [0, 100];
+    const action = (detail && detail.action) || '';
+    // 人工卡点上跑的那几个动作（AI 修硬伤 / 自动平衡 / 工艺精修 / 重做中文对照）都挂在
+    // review_beats 底下，而它的区间是零宽的 [68,68]：进度条纹丝不动，chip 上还写着
+    // 「待人工核对」——界面在说"等你动手"，其实是机器在跑。带 action 的事件走一段
+    // 独立的动作区间，动作结束后自然落回 68 那个静态卡点。
+    //
+    // action 由后端随事件下发，而不是在按钮点击处于前端记：SSE 重连或事件重放之后
+    // 前端那个状态就没了，而那正是最需要它的时刻——用户刷新页面，恰恰因为他觉得卡住了。
+    const range = (action && REPLICA_ACTION_RANGE[action])
+        || REPLICA_STAGE_RANGE[stage]
+        || replicaProgress.range || [0, 100];
     replicaProgress.range = range;
-    // 进入一个新阶段时先落到它的区间起点，段内进度由该阶段自己的事件推进。
-    replicaProgressUpdate(range[0], (detail && detail.message) || '', stage);
+
+    // 后端多个阶段早就在事件里带了真实的分子/分母，此前这里一个都没用：Pass A 是整条
+    // 线最长的一段（占 30%），全程钉死在区间起点 15%，只有日志在滚。
+    const done = Number(detail && detail.done);
+    const total = Number(detail && detail.total);
+    const ratio = (Number.isFinite(done) && total > 0) ? Math.min(1, done / total) : 0;
+
+    // 段内进度由该阶段自己的事件推进；没有分子分母时行为与从前一致——落到区间起点。
+    replicaProgressUpdate(range[0] + ratio * (range[1] - range[0]),
+                          (detail && detail.message) || '', stage);
+    // chip 文案：动作期间显示动作名，否则回到阶段名。后端在这几条流程的**每一条**
+    // 事件上都带 action，所以这里可以直接按当前事件覆写，不需要额外的进入/退出信号。
+    replicaProgress.actionLabel = action ? (REPLICA_ACTION_LABELS[action] || '') : '';
+    replicaProgressPaint();
 }
 
 function replicaHandleComposerEvent(type, detail) {
@@ -1568,6 +1739,12 @@ function replicaRenderBeats(state) {
                     title="帧事实走缓存，不会重付视觉调用的钱">重跑聚类</button>
             <button type="button" id="replica-translate-btn" class="action-btn text-btn"
                     title="只翻译，不改英文原文。改过英文的字段中文会先作废，按这里补回来">重译中文</button>
+            ${/* 上面这排每一个都是整份覆盖。没有回退的话，模型把一条手工调好的阶梯改坏了
+                  只能重跑 Pass B——重新付钱，而且结果还不一样。
+                  没有可回退版本时不摆这个按钮：摆一个点了必然报错的按钮比不摆更糟。 */''}
+            ${state && state.beats_undo_available ? `
+            <button type="button" id="replica-undo-beats-btn" class="action-btn text-btn"
+                    title="回到上一版节拍阶梯。撤销本身也可以再撤销回来。已合成的提示词会作废">↩ 撤销上一次改写</button>` : ''}
         </div>
     </div>`;
 }
@@ -1606,7 +1783,19 @@ const REPLICA_SCENE_CONSTANT_FIELDS = [
     ['materials', '常驻材质与表面'],
     ['traces', '常驻痕迹与风化'],
     ['fixtures_in_shot', '常驻画面的器具'],
-    // 这一栏与上面四栏不同：它不是「一直在」而是「一直在动」，而且**统计不出来**
+    // 全片人物识别项。工序每拍都在变，穿的那件衣服不变，所以它和污渍青苔一样属于恒常
+    // 项、在节拍阶梯里没有落脚点。但它的失效方式更刺眼：每一帧都是独立生成的，图像模型
+    // 对上一帧没有记忆——外形不写进提示词，同一条片子里就会换人种、换肤色、换发型，
+    // 休闲工装变成反光背心加安全帽。人种/肤色写在这里不是标签，是「同一个人」的判据。
+    ['cast', '常驻人物与活物（人种/肤色、身形、发型胡须、帽子、上衣颜色、裤子颜色、鞋 —— 全片同一个人，只换姿势不换外形）'],
+    // 影调：「像不像那条片子」的第一眼因素。此前整条链路一个字都没有，每一帧的色温、
+    // 对比、饱和都由图像模型自己定，十几张图拼起来像十几条片子。只写摄影口径（色温偏向、
+    // 对比、饱和、黑位），别写「电影感/大片感」——那不是影调，是让模型自由发挥的口令。
+    ['grade', '全片影调（色温偏冷/偏暖、对比高低、饱和、黑位。别写「电影感」这类词）'],
+    // 环境底噪：与常驻运动严格对称的另一半——那条管画面里一直在动的，这条管声轨上一直
+    // 在响的。空着，每条视频的环境声都是模型现编的，整片声场一拍一个样。
+    ['ambient_sound', '常驻环境声（风穿树冠/溪流/远处车流/海浪/空房间的混响 —— 没人干活时这地方的声音）'],
+    // 这一栏与其余各栏不同：它不是「一直在」而是「一直在动」，而且**统计不出来**
     // （帧事实是一张张静止画面的清单，看不出水在流）。由 Pass B 读帧序列产出，
     // 或者在这里手补——漏掉它，交付出来的背景就是一张静止照片。
     ['motion', '常驻运动（溪水/烟/火苗/风吹树冠/雨雪/飘尘 —— 一直在动的东西）'],
@@ -1800,6 +1989,17 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
                    value="${typeof beat[key] === 'number' ? beat[key] : ''}">
         </label>`;
 
+    // 卡片**内部**那几块 <details> 的开合。此前完全没记过，而 replicaRefreshBeats 会在
+    // 每次保存、每次拆合拍、每次 AI 动作跑完之后重建整个节拍区——展开的可选字段全部
+    // 啪地合上，用户每存一次就得再翻一遍。
+    // 与 replicaBeatFoldState（整卡片折叠）分开存，但清空时机必须一致：见 replicaSplitBeat。
+    const foldAttrs = (name, defaultOpen) => {
+        const key = `${beat.id}:${name}`;
+        const remembered = replicaFieldFoldState[key];
+        const open = remembered === undefined ? defaultOpen : remembered;
+        return `data-fold-key="${escapeHtmlReplica(key)}"${open ? ' open' : ''}`;
+    };
+
     const violations = state.validation || (state.beats && state.beats.validation) || [];
     const isErr = violations.some(v => v.level === 'error' && v.beat_id === beat.id);
     const isMobile = typeof window !== 'undefined' && typeof window.innerWidth === 'number' && window.innerWidth <= 768;
@@ -1831,7 +2031,7 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
         macroEnvField = field('macro_environment', '大环境识别项（非首拍/过门拍建议留空以减少大模型干扰；一行一条）', 2);
     } else {
         macroEnvField = `
-            <details class="replica-field-optional">
+            <details class="replica-field-optional" ${foldAttrs('macro_environment', false)}>
                 <summary class="replica-hint">＋ 展开大环境识别项（非首拍/过门拍默认留空，避免干扰大模型）</summary>
                 ${field('macro_environment', '大环境识别项（地貌水体、气候光照、空间包络；一行一条）', 2)}
             </details>`;
@@ -1875,7 +2075,7 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
             <div class="replica-thumbs">${thumbs || '<span class="replica-hint">无证据帧</span>'}</div>
             ${isRef ? '<p class="replica-hint">变体：这些帧只作运镜与构图参考，不再是事实断言。</p>' : ''}
             ${coverage.length ? `
-            <details class="replica-coverage" ${beat.end - beat.start >= 6 ? 'open' : ''}>
+            <details class="replica-coverage" ${foldAttrs('coverage', beat.end - beat.start >= 6)}>
                 <summary class="replica-hint">覆盖帧 ${coverage.length} 张（${beat.start}s – ${beat.end}s 内按时间均分，仅供核对）</summary>
                 <div class="replica-cov-strip">${coverageThumbs}</div>
             </details>` : ''}
@@ -1906,11 +2106,16 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
                 ${field('sfx',
                         `本拍声音（一行一个声源，1~3 条；当前 ${(beat.sfx || []).length} 条。原声物理音，绝不写配乐——交付口径是 ASMR 60% / BGM 0%）`, 2)}
                 ${selectField('shot_scale', '景别', REPLICA_SHOT_SCALES)}
+                ${selectField('camera_angle', '拍摄角度（垂直：机位在主体的上方还是下方）', REPLICA_CAMERA_ANGLES)}
+                ${selectField('camera_bearing', '机位方位（水平：镜头对着主体的哪一面）', REPLICA_CAMERA_BEARINGS)}
+                ${selectField('lens_feel', '焦段感（多广的镜头，跟景别是两件事）', REPLICA_LENS_FEELS)}
+                ${field('subject_placement', '主体构图（主体在画面左/中/右、上/下，占画面高度几分之几，地平线在第几分。锚点的位置与占比此前从没在原片上量过，全靠这一栏。分数写汉字，别写数字和百分号）', 2)}
                 ${selectField('camera_move', '运镜', REPLICA_CAMERA_MOVES)}
+                ${selectField('time_treatment', '时间处理（这一拍是加速的还是原速的）', REPLICA_TIME_TREATMENTS)}
                 ${numberField('worker_count', '工人数（0＝清场帧）')}
                 ${beat.workers_present
                     ? field('cast_action', '人物动作神情（写「从上一拍的什么姿态、动到这一拍的什么姿态」：起身、转向、上前半步、蹲下去看、抬手指。别写「还站在原地/保持原样」——那是站位不是动作，下游会把它原样写进每一帧的图，交付出来就是一动不动的小人。别把可见动作再写一遍：那一栏是工序，这一栏是人。真的几乎没动，就写那个最小的真实变化）', 2)
-                    : `<details class="replica-field-optional">
+                    : `<details class="replica-field-optional" ${foldAttrs('cast_action', false)}>
                         <summary class="replica-hint">＋ 人物动作神情（本拍标注为清场帧，画面里没人；有人偶在旁观的话仍然要写）</summary>
                         ${field('cast_action', '人物动作神情（从什么姿态动到什么姿态，别写「保持原样」）', 2)}
                        </details>`}
@@ -1918,11 +2123,11 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
                 ${field('material_flow', '物料去向（挖出来的土去哪了 / 耗掉的料从哪来）')}
                 ${(typeof beat.observed_shot_count === 'number' && beat.observed_shot_count >= 2)
                     ? field('insert_subject', '插入镜主体（原片这一拍切进特写时拍的是什么，如「镊子尖压住的那片瓦」。空着就落回通用职责——工具接触点/持久痕迹，那是任何一拍都能写的话）')
-                    : `<details class="replica-field-optional">
+                    : `<details class="replica-field-optional" ${foldAttrs('insert_subject', false)}>
                         <summary class="replica-hint">＋ 插入镜主体（原片这一拍是一镜到底，没有插入镜可抄；编一个会被照抄进成片）</summary>
                         ${field('insert_subject', '插入镜主体')}
                        </details>`}
-                <details class="replica-field-optional">
+                <details class="replica-field-optional" ${foldAttrs('visual_subject', false)}>
                     <summary class="replica-hint">＋ 画面主体（派生字段：只在可见动作与可见结果都空着时兜底，另供自动标题取主语；平时不必改）</summary>
                     ${field('visual_subject', '画面主体')}
                 </details>
@@ -2265,14 +2470,25 @@ function replicaBindBeatEvents(scope) {
     on('#replica-banner-autofix-btn', (e) => replicaAdvance('autofix', {}, e.currentTarget));
     on('#replica-autobalance-btn', (e) => replicaAdvance('autobalance', {}, e.currentTarget));
     on('#replica-actions-autobalance-btn', (e) => replicaAdvance('autobalance', {}, e.currentTarget));
-    on('#replica-recluster-btn', (e) => replicaAdvance('recluster', {}, e.currentTarget));
-    on('#replica-translate-btn', async (e) => {
-        const btn = e.currentTarget;
-        if (!(await replicaSaveBeats(false, btn))) {
-            replicaToast('保存失败，未翻译', true);
-            return;
-        }
-        replicaAdvance('translate', {}, btn);
+    // 重跑聚类＝Pass B 整份重新生成节拍阶梯，手工拆合拍、时间微调、改过的措辞一次归零。
+    // 这是这一页破坏性最强的动作，此前却是全页唯一不问一句的（重抽帧/归档/删除/精修/中断
+    // 都有确认）。第二句同样重要：用户按不按得下去，取决于知不知道这一步要不要重新付钱。
+    on('#replica-recluster-btn', (e) => {
+        const hasBeats = !!(replicaState && ((replicaState.beats || {}).beats || []).length);
+        if (hasBeats && !window.confirm(
+            '重跑节拍聚类？当前这份阶梯会被整份重新生成——你手工拆合的拍、微调过的时间、'
+            + '改过的措辞都会丢失，且不可恢复。\n\n'
+            + '不会重新付逐帧读取（Pass A）的钱：帧事实走缓存，只重跑聚类这一步。')) return;
+        replicaAdvance('recluster', {}, e.currentTarget);
+    });
+    // 落盘同样由 replicaAdvance 统一做（见 REPLICA_LADDER_CONSUMERS），这里不再自己存一次。
+    on('#replica-translate-btn', (e) => replicaAdvance('translate', {}, e.currentTarget));
+    // 撤销不进 REPLICA_LADDER_CONSUMERS：它要丢掉的正是当前这一版，先落盘等于把
+    // 用户想扔的东西先存一遍，还会把「上一版」挤掉一代。
+    on('#replica-undo-beats-btn', (e) => {
+        if (!window.confirm('回到上一版节拍阶梯？当前这一版会被换下来（但仍可以再点一次撤销换回去）。'
+                            + '\n\n已合成的提示词是按当前这一版产出的，会一并作废，需要重新合成。')) return;
+        replicaAdvance('undo_beats', {}, e.currentTarget);
     });
     on('#replica-variant-btn', (e) => replicaVariant(e.currentTarget));
 
@@ -2439,6 +2655,23 @@ function replicaBindBeatEvents(scope) {
             if (!replicaState || !replicaState.beats) return;
             const sc = replicaState.beats.scene_constants || (replicaState.beats.scene_constants = {});
             sc[el.dataset.sceneKey] = replicaSplitList(el.value);
+        });
+    });
+
+    // 记住卡片内部 <details> 的开合。用委托监听 toggle（它不冒泡，所以要用捕获）。
+    scope.addEventListener('toggle', (e) => {
+        const el = e.target;
+        if (!el || !el.dataset || !el.dataset.foldKey) return;
+        replicaFieldFoldState[el.dataset.foldKey] = !!el.open;
+    }, true);
+
+    // 脏标记走事件委托，而不是往上面那四个处理器里各加一行：新增一类节拍字段时只要它
+    // 落在 REPLICA_BEAT_INPUT_SELECTOR 里就自动被算进来，不会再漏一处。
+    // 变异轴勾选与二创 brief 也在 scope 内，但它们不是节拍改动，所以这里必须按选择器筛。
+    const dirtySel = `${REPLICA_BEAT_INPUT_SELECTOR}, ${REPLICA_BEAT_SELECT_SELECTOR}`;
+    ['input', 'change'].forEach(evt => {
+        scope.addEventListener(evt, (e) => {
+            if (e.target && e.target.matches && e.target.matches(dirtySel)) replicaMarkDirty(true);
         });
     });
 
@@ -2699,6 +2932,26 @@ function replicaSetBusy(busy, activeBtn) {
         b.disabled = busy || b.hasAttribute('data-perm-disabled');
         b.classList.toggle('is-running', busy && b === activeBtn);
     });
+
+    // 输入框此前完全不受 busy 影响（这个函数只遍历 button）。于是跑着的时候照样能改字，
+    // 而 autofix / 工艺精修跑完会整份替换 replicaState.beats——那几分钟里敲的每一个键
+    // 都写进一份马上要被丢掉的文档，结束时无声消失。
+    //
+    // 用 readOnly 而不是 disabled：只读的文本仍可选中复制，禁用的连读都读不清，而用户
+    // 在等结果时最常做的事恰恰是回头看自己写了什么。
+    root.querySelectorAll(REPLICA_BEAT_INPUT_SELECTOR).forEach(el => {
+        el.readOnly = busy;
+        el.classList.toggle('is-run-locked', busy);
+        if (busy) {
+            el.title = '这一轮跑完之前不能改：改动会被这一轮的结果整份覆盖';
+        } else if (el.title === '这一轮跑完之前不能改：改动会被这一轮的结果整份覆盖') {
+            el.removeAttribute('title');
+        }
+    });
+    root.querySelectorAll(REPLICA_BEAT_SELECT_SELECTOR).forEach(el => {
+        el.disabled = busy;
+        el.classList.toggle('is-run-locked', busy);
+    });
 }
 
 /* --- 动作 --- */
@@ -2811,8 +3064,25 @@ async function replicaStart() {
     }
 }
 
+// 会「吃掉」当前节拍阶梯的 action：服务端一律从磁盘读 beats（autofix_job_beats 第一件事
+// 就是 _load_state），跑完再整份写回、由 SSE 收尾时的 replicaLoadJob 盖掉内存。所以不先
+// 落盘就等于拿上一次保存的版本去改，用户这一轮的手工改动会在没有任何报错的情况下蒸发。
+//
+// recluster 有意不在此列：它按设计就是丢掉这份阶梯重跑 Pass B，先存一次只是白写一遍磁盘。
+const REPLICA_LADDER_CONSUMERS = new Set([
+    'approve', 'autofix', 'fix_beats', 'autobalance', 'refine_craft', 'translate', 'variant',
+]);
+
 async function replicaAdvance(action, payload = {}, btn) {
     if (!replicaState) return;
+    // 落盘失败就地中止：宁可让用户看见「保存失败」，也不能让一次静默的旧版本改写跑出去。
+    if (REPLICA_LADDER_CONSUMERS.has(action) && (replicaState.beats || {}).beats) {
+        if (!(await replicaSaveBeats(false, btn))) {
+            replicaToast('改动没能存下来，这一步已中止——请再点一次「保存并重校验」看服务端说了什么', true);
+            replicaSetBusy(false);
+            return;
+        }
+    }
     replicaSetBusy(true, btn);
     try {
         const data = await replicaFetch('/api/replica/advance', {
@@ -2829,9 +3099,9 @@ async function replicaAdvance(action, payload = {}, btn) {
 }
 
 async function replicaCompose(btn) {
-    // 合成前先把编辑器里的改动落盘：不然用户改了半天，合成用的还是磁盘上的旧节拍。
-    const saved = await replicaSaveBeats(false);
-    if (!saved) return;
+    // 落盘由 replicaAdvance 统一负责（REPLICA_LADDER_CONSUMERS）。这里原先自己存一次，
+    // 于是全线只有「合成」这一个入口是对的，另外五个按钮各自漏掉——口径收到一处之后
+    // 新增推进动作只要进那张表就自动有保障。
     // 勾选态在这里读一次就用完：清缓存是一次性动作，不该黏在下一次合成上——用户为
     // 一轮改规则的重跑勾了它，接着改一拍再合成时不该又白付一次 Phase 1。
     const payload = replicaResetCache ? { reset_cache: true } : {};
@@ -3095,6 +3365,27 @@ function replicaConfig() {
 
 // model 就是真相：textarea 的 input 事件已经把每一次编辑写回 replicaState.beats
 // （见 replicaBindBeatEvents）。这里只做一次深拷贝，不再全量扫 DOM 反推文档。
+// 置/清脏标记，并就地更新吸底栏那颗点。
+//
+// 不走 replicaRefreshChrome：那会把整条吸底栏 outerHTML 重建一遍，而这个函数是挂在
+// input 事件上的——每敲一个键重建一次按钮栏，用户按到一半的按钮会在手底下被换掉。
+function replicaMarkDirty(dirty) {
+    if (replicaDirty === dirty) return;
+    replicaDirty = dirty;
+    const btn = document.getElementById('replica-bar-save-btn');
+    if (!btn) return;
+    btn.classList.toggle('replica-bar-save-dirty', dirty);
+    btn.title = dirty ? '有改动还没存下来' : '';
+    const dot = btn.querySelector('.replica-dirty-dot');
+    if (dirty && !dot) {
+        const span = document.createElement('span');
+        span.className = 'replica-dirty-dot';
+        btn.appendChild(span);
+    } else if (!dirty && dot) {
+        dot.remove();
+    }
+}
+
 function replicaCollectBeats() {
     if (!replicaState || !replicaState.beats) return null;
     return JSON.parse(JSON.stringify(replicaState.beats));
@@ -3110,6 +3401,7 @@ async function replicaSaveBeats(rerender, btn) {
             body: JSON.stringify({ job_id: replicaState.job_id, beats: doc }),
         });
         replicaState = data.job_state;
+        replicaMarkDirty(false);
         if (rerender) {
             // 只重建节拍区。整页重建会把用户滚到的位置一起丢掉，而节拍区恰恰是这一页
             // 最长的一块——几十拍改到一半被弹回顶端，等于每保存一次就罚一次。
@@ -3153,6 +3445,7 @@ function replicaSplitBeat(idx) {
     // 服务端会重排 id，折叠状态是按 id 存的：不清掉，旧的 B05 变成 B06 之后，
     // 新占用 B05 这个名字的那一拍会莫名其妙带着上一任的折叠态。
     replicaBeatFoldState = {};
+    replicaFieldFoldState = {};
     replicaPersistBeats('已拆成两拍并保存。事件与证据帧没有自动分配——请对着帧手工分给正确的那一半。');
 }
 
@@ -3173,6 +3466,7 @@ function replicaMergeBeat(idx) {
     doc.beats.splice(idx, 1);
     replicaState.beats = doc;
     replicaBeatFoldState = {};   // 同 replicaSplitBeat：id 会重排
+    replicaFieldFoldState = {};
     replicaPersistBeats('已合并并保存。若两拍是不同的物理工序，上方校验会告诉你。');
 }
 
@@ -3338,3 +3632,36 @@ async function replicaCancelRun() {
         replicaToast(e.message, true);
     }
 }
+
+/* --- 全局守卫与快捷键 --- */
+
+// 关页面 / 刷新前的最后一道拦截。节拍改动只落在内存里，浏览器不问的话它们就这么没了。
+//
+// 只在真的有未保存改动时挂钩子：无条件返回字符串会让每一次正常关页都弹一次确认，
+// 用户很快就会学会无脑点「离开」，等到真该拦的那一次也照点不误。
+window.addEventListener('beforeunload', (e) => {
+    if (!replicaDirty) return;
+    e.preventDefault();
+    e.returnValue = '';   // Chrome/Safari 仍要求写这一个才弹
+});
+
+// Cmd/Ctrl + S：保存并重校验。
+//
+// 这一页的核心动作是「改一拍、存一次」，几十拍就是几十趟鼠标跑到吸底栏。
+// 面板守卫是必须的，不是保险：app.js 里那条 Ctrl+Enter 就是因为没守卫，在图像工坊
+// 按一下会静默发起一次隐藏的合成任务（注释还留在 app.js 的监听器里）。这里同理——
+// 复刻页不可见时必须原样放行给浏览器的「保存网页」。
+document.addEventListener('keydown', (e) => {
+    if (!((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 's')) return;
+    // 可见性按面板的 mobile-active 判，与 app.js 里 Ctrl+Enter 那条守卫同一口径。
+    const panel = document.getElementById('panel-replica');
+    if (!panel || !panel.classList.contains('mobile-active')) return;
+    if (!replicaState || !((replicaState.beats || {}).beats || []).length) return;
+    if (replicaBusy) {                                       // 跑着的时候字段是只读的，存了也没意义
+        e.preventDefault();
+        replicaToast('这一轮还在跑，跑完再存', true);
+        return;
+    }
+    e.preventDefault();
+    replicaSaveBeats(true, document.getElementById('replica-bar-save-btn'));
+});

@@ -25,6 +25,9 @@ const sandbox = {
         getItem(k) { return this.store[k] || null; },
     },
 };
+// 模块在顶层给 window / document 挂了全局守卫（beforeunload 未保存拦截、Cmd+S）。
+// 沙箱里 window 就是 sandbox 本身，不给它一个 addEventListener，整个文件在加载时就炸。
+sandbox.addEventListener = () => {};
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
@@ -146,7 +149,23 @@ call(`
         { id: 'replica-bar-start-btn', dataset: {}, classList: { contains: () => false, toggle: () => {} }, hasAttribute: () => false, disabled: false },
         { id: 'perm-disabled-btn', dataset: {}, classList: { contains: () => false, toggle: () => {} }, hasAttribute: (a) => a === 'data-perm-disabled', disabled: false },
     ];
-    document.getElementById = (id) => (id === 'replica-root' ? { querySelectorAll: () => mockButtons } : null);
+    // 节拍字段与下拉框：replicaSetBusy 现在也要锁它们（跑着的时候改的字会被这一轮的
+    // 结果整份覆盖）。mock 必须按选择器分发——早先它对任何选择器都回同一份按钮数组，
+    // 于是"锁输入框"那两个循环会把取消按钮一起 disable 掉，测试反而先炸。
+    const mockInputs = [
+        { readOnly: false, title: '', classList: { toggle: () => {} }, removeAttribute() { this.title = ''; } },
+        { readOnly: false, title: '', classList: { toggle: () => {} }, removeAttribute() { this.title = ''; } },
+    ];
+    const mockSelects = [
+        { disabled: false, classList: { toggle: () => {} } },
+    ];
+    const pick = (sel) => {
+        if (sel === 'button') return mockButtons;
+        if (sel === REPLICA_BEAT_SELECT_SELECTOR) return mockSelects;
+        if (sel === REPLICA_BEAT_INPUT_SELECTOR) return mockInputs;
+        return [];
+    };
+    document.getElementById = (id) => (id === 'replica-root' ? { querySelectorAll: pick } : null);
     replicaSetBusy(true);
 `);
 
@@ -172,8 +191,22 @@ assert.equal(startBtn.disabled, true, '动作按钮 replica-bar-start-btn 在 bu
 assert.equal(saveBtn.disabled, true, '保存按钮 replica-float-save 在 busy 态下必须被禁用');
 assert.equal(permBtn.disabled, true, '带 data-perm-disabled 的按钮应始终禁用');
 
+// ── 7. 运行中节拍字段必须只读 ─────────────────────────────────────────────────
+// 此前 replicaSetBusy 只遍历 button，textarea 全程可编辑：autofix / 工艺精修跑完会
+// 整份替换 replicaState.beats，那几分钟里敲的每一个键都写进一份马上被丢掉的文档，
+// 结束时无声消失。用 readOnly 而不是 disabled——文本必须还能选中复制。
+const inputs = call('mockInputs');
+const selects = call('mockSelects');
+assert.ok(inputs.every(el => el.readOnly === true), 'busy 态下节拍输入框必须只读');
+assert.ok(inputs.every(el => !!el.title), 'busy 态下必须说清为什么不能改');
+assert.ok(selects.every(el => el.disabled === true),
+          'busy 态下施工阶段下拉框必须禁用（readOnly 对 select 无效）');
+
 // 恢复 non-busy 态
 call('replicaSetBusy(false);');
+assert.ok(inputs.every(el => el.readOnly === false), '解除 busy 后节拍输入框必须恢复可编辑');
+assert.ok(inputs.every(el => !el.title), '解除 busy 后那句解释必须撤掉');
+assert.ok(selects.every(el => el.disabled === false), '解除 busy 后下拉框必须恢复可用');
 assert.equal(uploadBtn.disabled, false, '解除 busy 后动作按钮应恢复可用');
 assert.equal(topBtn.disabled, false, '解除 busy 后回到顶部按钮保持可用');
 assert.equal(permBtn.disabled, true, '解除 busy 后带 data-perm-disabled 的按钮依然保持禁用');
@@ -207,6 +240,40 @@ call('replicaResetCache = true;');
 assert.match(barFor('review_beats'), /id="replica-reset-cache" checked/,
              '勾选态存在模块变量里，吸底栏重建后必须还原成勾上');
 call('replicaResetCache = false;');
+
+// ── 逐拍拍摄角度（2026-08-25）─────────────────────────────────────────────
+// 俯仰与方位是两根互相独立的轴，卡片上必须是两个下拉：同一拍可以既是低角度仰拍、
+// 又是从侧面拍的，捏成一栏就得二选一。闭集给下拉不给输入框——自由文本会被规划器
+// 当创作提示接着发挥。
+assert.ok(beatsHtml.includes('data-key="camera_angle"'), '节拍卡必须有拍摄角度下拉');
+assert.ok(beatsHtml.includes('data-key="camera_bearing"'), '节拍卡必须有机位方位下拉');
+assert.ok(beatsHtml.includes('低角度仰拍'), '角度选项要写人话，不能只有英文枚举值');
+assert.ok(beatsHtml.includes('虫视'), '虫视/鸟瞰这类极端角度必须可选');
+assert.ok(!beatsHtml.includes('data-key="camera_angle"><textarea'), '角度是闭集，不给输入框');
+
+// ── 焦段 / 构图 / 时间处理（2026-08-25）───────────────────────────────────
+assert.ok(beatsHtml.includes('data-key="lens_feel"'), '节拍卡必须有焦段感下拉');
+assert.ok(beatsHtml.includes('data-key="subject_placement"'), '节拍卡必须有主体构图输入');
+assert.ok(beatsHtml.includes('data-key="time_treatment"'), '节拍卡必须有时间处理下拉');
+assert.ok(beatsHtml.includes('长焦'), '焦段选项要写人话');
+assert.ok(beatsHtml.includes('实时'), '时间处理必须能标成实时——成品巡览拍不是延时');
+// 构图要说清写什么：位置、占比、地平线，且分数写汉字（数字会被图像模型画进画面）
+assert.ok(beatsHtml.includes('几分之几'), '构图栏要交代占比怎么写');
+
+// ── 全局识别项：人物外形（2026-08-24）─────────────────────────────────────
+// 场景恒常特征是「整片一直存在、会写进每一条提示词」的那一栏。人物外形属于它：
+// 工序每拍都变，穿的那件衣服不变。它必须和其余各栏一样可编辑——统计与模型都会误判，
+// 用户删得掉才敢让它进每一条提示词。
+const sceneHtml = call(`replicaRenderSceneConstants({
+    scene_signature: '一座长着青苔的混凝土掩体',
+    scene_constants: { cast: ['浅棕肤色的南亚男性，短黑发，褪色红长袖T恤，深蓝牛仔裤，棕色皮靴'] }
+})`);
+assert.ok(sceneHtml.includes('data-scene-key="cast"'), '场景恒常特征必须有人物外形一栏');
+assert.ok(sceneHtml.includes('data-scene-key="grade"'), '场景恒常特征必须有全片影调一栏');
+assert.ok(sceneHtml.includes('data-scene-key="ambient_sound"'), '场景恒常特征必须有常驻环境声一栏');
+assert.ok(sceneHtml.includes('别写「电影感」'), '影调栏要挡住情绪词——那不是影调');
+assert.ok(sceneHtml.includes('人种'), '人物栏必须点名人种/肤色——它是「同一个人」的判据');
+assert.ok(sceneHtml.includes('褪色红长袖T恤'), '已有的人物读数要回填进输入框');
 
 console.log('test_replica_controls.js: all assertions passed');
 

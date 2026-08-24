@@ -95,6 +95,53 @@ class BaseComposer:
             "catch them mid-motion rather than frozen. A clip in which only the worker's hands "
             "move and the water, smoke, flame and foliage hold still reads as a photograph with "
             "one animated cut-out on it.\n" if motion else "")
+        # 人物那一栏同样要单独叮一句，而且理由和运动项是同一类：光把它列进「一直都在」
+        # 是不够的。每一帧都是独立生成的，图像模型对上一帧没有记忆——外形只要不在这一条
+        # 提示词的正文里被复述一遍，它就会被重新掷一次骰子：同一条片子里换人种、换肤色、
+        # 换发型、把休闲工装换成反光背心加安全帽。所以这里要求的不是「知道有这个人」，
+        # 而是**每一条 IMAGE 与 VIDEO 都逐条复述这份外形**。
+        cast = [str(x).strip()
+                for x in ((brief.get('scene_constants') or {}).get('cast') or [])
+                if str(x).strip()]
+        cast_rule = (
+            "\nThe living cast listed above is FIXED IDENTITY, and it is the single easiest thing "
+            "in this job to lose: every frame is generated independently, so anyone whose "
+            "appearance is not spelled out in THIS prompt is re-invented from scratch in it. "
+            "Restate each person's/animal's appearance IN FULL in EVERY IMAGE and EVERY VIDEO "
+            "prompt where they are in frame — apparent ethnicity and skin tone, build, hair, "
+            "facial hair, headwear, upper garment and its colour, lower garment and its colour, "
+            "footwear — word for word the same attributes every time, in the same order. Never "
+            "vary them for visual interest, never let a beat's trade swap the outfit (no hardhat "
+            "or hi-vis vest appears unless the list itself says so), never let a later beat "
+            "change ethnicity, skin tone, hair, or clothing colour, and never add a second person "
+            "who is not on this list. What changes from beat to beat is only the POSE and the "
+            "action, never the person.\n" if cast else "")
+        # 环境底噪与 motion 是同一件事的两半：那条管「画面里一直在动的」，这条管
+        # 「声轨上一直在响的」。它的失效方式是**每条 VIDEO 各编一句**——这一拍林间风、
+        # 下一拍城市车流，整片的声场一拍一个样。每拍自己的 sfx 是「这一下活儿的声音」，
+        # 这一栏是「没人干活时这地方的声音」，两者叠在一起才是原片的声音。
+        ambient_sound = [str(x).strip()
+                         for x in ((brief.get('scene_constants') or {}).get('ambient_sound') or [])
+                         if str(x).strip()]
+        sound_rule = (
+            "\nThe items listed as audible under every shot are this film's ambient bed. EVERY "
+            "video clip's ambient line must be that bed and nothing else — it does not change "
+            "from beat to beat, it is not invented per clip, and it sits UNDER that beat's own "
+            "declared sfx rather than replacing them. A film whose acoustic space changes shot to "
+            "shot reads as a pile of stock clips rather than one continuous place. Never add "
+            "music, score, or a mood bed on top of it.\n" if ambient_sound else "")
+        # 影调是「像不像那条片子」的第一眼因素，而它此前在这条链路上一个字都没有：每一帧
+        # 的色温、对比、饱和都由图像模型自己决定，于是十几张图拼起来像十几条片子。
+        grade = [str(x).strip()
+                 for x in ((brief.get('scene_constants') or {}).get('grade') or [])
+                 if str(x).strip()]
+        grade_rule = (
+            "\nThe photographic grade listed above applies to EVERY IMAGE and EVERY VIDEO in this "
+            "job, identically. Carry its colour temperature bias, contrast, black level and "
+            "saturation into each prompt in those same plain photographic terms. Never upgrade it "
+            "with mood or quality vocabulary (cinematic, dramatic, moody, epic, award-winning) — "
+            "those are not gradings, and each one pulls the render toward a different film than "
+            "the one being reproduced.\n" if grade else "")
         return (
             "\n==================== SCENE CONSTANTS (THIS JOB ONLY) ====================\n"
             "These are present in the reference film from the first frame to the last. They are "
@@ -104,7 +151,7 @@ class BaseComposer:
             + "\nNever describe a surface these cover as clean, new, or unmarked unless a beat "
               "explicitly says that beat's work made it so. They are the reason the reference "
               "film looks like itself.\n"
-            + motion_rule)
+            + motion_rule + cast_rule + sound_rule + grade_rule)
 
     def batch_system_prompt(self, config, packet, scup_ref, tbcp_ref):
         """批量直出调用的共享 system prompt（每拍都相同的那部分）。"""
@@ -278,7 +325,6 @@ Instructions:
         defect_kwargs = dict(
             beat=beat, packet=packet, prev_image=prev_image, parsed_traces=parsed_traces,
             stage_scope=contract['stage_scope'],
-            is_first_interior_reveal=contract['is_first_interior_reveal'],
             beat_ladder=beat_ladder, family=contract['family'])
         defects = pp.collect_image_defects(i, i_p, **defect_kwargs)
         if defects:
@@ -494,8 +540,7 @@ Instructions:
                     residual = pp.reverify_beat_repairs(
                         i, v_p, i_p, beat, parsed_traces=parsed_traces,
                         stage_scope=contract['stage_scope'],
-                        is_first_interior_reveal=contract['is_first_interior_reveal'],
-                        beat_ladder=beat_ladder, family=family)
+                                    beat_ladder=beat_ladder, family=family)
                     remaining_milestone_errors = (
                         pp.check_milestone_video_prompt(v_p, beat) + pp.check_milestone_image_prompt(i_p, beat))
                     # 终帧倒退是整条序列最贵的失败，和里程碑硬门同级：重试整拍而不是留痕
@@ -828,8 +873,7 @@ Instructions:
                 residual = pp.reverify_beat_repairs(
                     i, v_p, i_p, contract['beat'], parsed_traces=parsed_traces,
                     stage_scope=contract['stage_scope'],
-                    is_first_interior_reveal=contract['is_first_interior_reveal'],
-                    beat_ladder=beat_ladder, family=contract['family'])
+                            beat_ladder=beat_ladder, family=contract['family'])
                 remaining_milestone_errors = (
                     pp.check_milestone_video_prompt(v_p, contract['beat'])
                     + pp.check_milestone_image_prompt(i_p, contract['beat']))

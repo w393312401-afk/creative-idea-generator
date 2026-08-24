@@ -1751,6 +1751,10 @@ def _replica_worker(task_id, config, job_id, label, run, task_type='replica'):
 
         job_state = run(progress_cb)
         usage = stop_and_get_accounting()
+        # 实际花费回填进 job 状态。此前 usage 只随 result 送给前端看一眼就丢，
+        # 于是确认卡点上那三档预估永远没有被校准过的机会。
+        from replica_pipeline import record_job_spend
+        record_job_spend(job_state.get('job_id') or job_id, task_type, usage)
 
         stage = job_state.get('stage', '')
         is_completed = stage == 'completed'
@@ -3665,19 +3669,30 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 # 跑着的任务连同它的 task_id 一起下发。前端刷新/切走再回来时靠它重连
                 # SSE —— 在此之前刷新一次就与任务失联：页面既不显示"在跑"，还会摆出
                 # 「开始反推」按钮诱导用户再点一次，把同一笔视觉调用付两遍。
+                #
+                # 顺带把那条任务最后一条进度文案也捎上：列表行此前只有一个静态 stage
+                # chip，同时跑两条时另一条在列表里完全看不出进展（SSE 只连当前打开的
+                # 那一条）。取事件尾部而不是订阅——列表是拉取式的，不该为它开第二条流。
                 running = {}
                 with ACTIVE_TASKS_LOCK:
                     for task_id, task in ACTIVE_TASKS.items():
                         if task.get('status') != 'running':
                             continue
                         job = str((task.get('dimensions') or {}).get('replica_job_id') or '')
-                        if job:
-                            running[job] = task_id
+                        if not job:
+                            continue
+                        last = ''
+                        for _etype, edata in reversed(task.get('events') or []):
+                            if isinstance(edata, dict) and edata.get('message'):
+                                last = str(edata['message'])[:120]
+                                break
+                        running[job] = (task_id, last)
                 for row in jobs:
-                    active_tid = running.get(row.get('job_id'))
-                    row['active_task_id'] = active_tid
-                    if active_tid:
+                    active = running.get(row.get('job_id'))
+                    row['active_task_id'] = active[0] if active else None
+                    if active:
                         row['attention'] = 'running'
+                        row['active_message'] = active[1]
                 self._send_json({'status': 'ok', 'jobs': jobs, 'catalog': stage_catalog()})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)

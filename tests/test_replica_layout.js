@@ -27,6 +27,9 @@ const sandbox = {
         getItem(k) { return this.store[k] || null; },
     },
 };
+// 模块在顶层给 window / document 挂了全局守卫（beforeunload 未保存拦截、Cmd+S）。
+// 沙箱里 window 就是 sandbox 本身，不给它一个 addEventListener，整个文件在加载时就炸。
+sandbox.addEventListener = () => {};
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
 vm.createContext(sandbox);

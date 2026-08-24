@@ -17,8 +17,12 @@ function element(id) {
         dataset: {},
         children: [],
         addEventListener() {},
+        removeAttribute() {},
+        appendChild() {},
+        closest() { return null; },
         querySelector(sel) { return this.children.find(c => `#${c.id}` === sel) || null; },
         querySelectorAll() { return []; },
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
     };
 }
 
@@ -37,11 +41,18 @@ const sandbox = {
         addEventListener() {},
         getElementById: (id) => (id === 'replica-root' ? root : null),
         querySelectorAll: () => [],
+        querySelector: () => null,
+        // 推进动作会走 replicaToast（建节点挂 body）与 replicaShell（root.closest）。
+        createElement: (tag) => element(`<${tag}>`),
+        body: { appendChild() {} },
     },
     EventSource: function () {},
     setTimeout: () => 1,
     clearTimeout: () => {},
 };
+// 模块在顶层给 window / document 挂了全局守卫（beforeunload 未保存拦截、Cmd+S）。
+// 沙箱里 window 就是 sandbox 本身，不给它一个 addEventListener，整个文件在加载时就炸。
+sandbox.addEventListener = () => {};
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
@@ -130,4 +141,114 @@ call(`replicaOpenLightbox([{ url: '/a.png' }, { url: '/b.png' }], 5)`);
 assert.equal(lightboxArgs.items.length, 2);
 assert.equal(lightboxArgs.index, 1, '越界的下标要夹回最后一张');
 
-console.log('test_replica_progress.js: all assertions passed');
+// ── 3.5 进度条必须用上后端给的分子/分母 ───────────────────────────────────────
+//
+// 后端多个阶段早就在事件里带 done/total，此前前端一个都没用：Pass A 是整条线最长的
+// 一段，全程钉死在区间起点 15%，只有日志在滚。
+call('replicaResetProgress()');
+call(`replicaHandleStageEvent({ stage: 'review_frames', message: '逐帧事实提取 0/40', done: 0, total: 40 })`);
+assert.equal(Math.round(call('replicaProgress.percent')), 15, '刚进这一段应落在区间起点');
+call(`replicaHandleStageEvent({ stage: 'review_frames', message: '逐帧事实提取 20/40', done: 20, total: 40 })`);
+const half = call('replicaProgress.percent');
+assert.ok(half > 15 && half < 38, `半程必须落在区间内部，实得 ${half}`);
+call(`replicaHandleStageEvent({ stage: 'review_frames', message: '逐帧事实提取 40/40', done: 40, total: 40 })`);
+assert.ok(call('replicaProgress.percent') > half, '分子涨了，进度条必须跟着涨');
+
+// 回归：不带 done/total 的事件行为必须与改动前逐字一致——落到区间起点，别的什么都不做。
+call('replicaResetProgress()');
+call(`replicaHandleStageEvent({ stage: 'compose', message: '在合成' })`);
+assert.equal(Math.round(call('replicaProgress.percent')), 68, '没有分子分母时仍落到区间起点');
+
+// ── 3.6 人工卡点上的机器活要有自己的区间和名字 ───────────────────────────────
+//
+// autofix / 工艺精修 / 自动平衡 / 重做中文对照全挂在 review_beats 底下，而它的区间是
+// 零宽的 [68,68]：进度条纹丝不动，chip 上还写着「待人工核对」——界面在说"等你动手"，
+// 其实是机器在跑。这比没有进度条更糟：没有只是不知道，这是给了个错的答案。
+call('replicaResetProgress()');
+call(`replicaHandleStageEvent({ stage: 'review_beats', action: 'refine_craft',
+                               message: '工艺精修 3/12', done: 3, total: 12 })`);
+const during = call('replicaProgress.percent');
+assert.ok(during > 68, `动作跑起来之后进度条必须离开 68，实得 ${during}`);
+assert.equal(call('replicaProgress.actionLabel'), '工艺精修',
+             'chip 必须显示动作名，不能是「待人工核对」');
+
+// 峰值帧复核跟逐帧提取同属 review_frames 却发生在它之后：共用区间的话，"只增不减"
+// 的进度条在逐帧提取跑满之后就再也动不了，那几十次强模型调用整段静默。
+call('replicaResetProgress()');
+call(`replicaHandleStageEvent({ stage: 'review_frames', done: 40, total: 40, message: '完' })`);
+const afterPassA = call('replicaProgress.percent');
+call(`replicaHandleStageEvent({ stage: 'review_frames', action: 'peak_verify',
+                               message: '峰值帧复核 5/10', done: 5, total: 10 })`);
+assert.ok(call('replicaProgress.percent') > afterPassA,
+          '峰值复核必须能在逐帧提取跑满之后继续推进进度条');
+
+// 动作结束、回到普通阶段事件时，chip 要回到阶段名，不能一直挂着动作名。
+call(`replicaHandleStageEvent({ stage: 'review_beats', message: '已停在人工卡点' })`);
+assert.equal(call('replicaProgress.actionLabel'), '', '动作结束后必须交还 chip');
+
+// ── 4. 推进动作一律先落盘 ─────────────────────────────────────────────────────
+//
+// 服务端所有节拍动作都从磁盘读 beats（autofix_job_beats 第一件事就是 _load_state），
+// 跑完整份写回、收尾时再盖掉内存。前端不先落盘，用户这一轮的手工改动就在没有任何
+// 报错的情况下蒸发。此前全线只有「合成」一个入口做对了，另外五个按钮各自漏掉。
+//
+// 这里盯的是「每一个 action」而不是某一个按钮：这类问题的复发方式，是下次新增第八个
+// 推进动作时又忘了——按按钮写的测试抓不到那一次。
+const calls = [];
+sandbox.fetch = async (url) => {
+    calls.push(url);
+    return { ok: true, status: 200, statusText: 'OK',
+             json: async () => ({ status: 'ok', job_state: { job_id: 'j1', beats: { beats: [{ id: 'B01' }] } },
+                                  validation: [], task_id: 't1' }) };
+};
+sandbox.confirm = () => true;
+sandbox.EventSource = function () { this.addEventListener = () => {}; this.close = () => {}; };
+
+const runAdvance = async (action) => {
+    calls.length = 0;
+    call(`replicaState = { job_id: 'j1', beats: { beats: [{ id: 'B01' }] } };`);
+    await call(`replicaAdvance('${action}', {}, undefined)`);
+    return calls;
+};
+
+(async () => {
+    for (const action of ['approve', 'autofix', 'fix_beats', 'autobalance',
+                          'refine_craft', 'translate', 'variant']) {
+        const urls = await runAdvance(action);
+        const save = urls.indexOf('/api/replica/beats');
+        const advance = urls.indexOf('/api/replica/advance');
+        assert.ok(save !== -1, `${action} 必须先落盘再推进，否则模型读到的是上一次保存的版本`);
+        assert.ok(save < advance, `${action} 的落盘必须发生在推进之前`);
+    }
+
+    // recluster 有意例外：它按设计就是丢掉这份阶梯重跑 Pass B，先存一次只是白写磁盘。
+    const urls = await runAdvance('recluster');
+    assert.ok(!urls.includes('/api/replica/beats'), 'recluster 不该先落盘——它本来就要丢掉这份阶梯');
+
+    // 落盘失败必须就地中止。宁可让用户看见「保存失败」，也不能让一次静默的旧版本改写跑出去。
+    sandbox.fetch = async () => ({ ok: false, status: 500, statusText: 'boom', json: async () => ({}) });
+    calls.length = 0;
+    call(`replicaState = { job_id: 'j1', beats: { beats: [{ id: 'B01' }] } };`);
+    await call(`replicaAdvance('autofix', {}, undefined)`);
+    assert.ok(!calls.includes('/api/replica/advance'), '落盘失败时不能继续推进');
+
+    // ── 5. 未保存守卫 ────────────────────────────────────────────────────────
+    // 切走会把 replicaState 整个换掉。此前不问一句：改了二十拍、顺手点了列表里另一条
+    // 任务，没有任何提示，也回不来。
+    sandbox.fetch = async () => ({ ok: true, status: 200, statusText: 'OK',
+        json: async () => ({ status: 'ok', job_state: { job_id: 'j2', beats: { beats: [] } } }) });
+    call(`replicaState = { job_id: 'j1', beats: { beats: [{ id: 'B01' }] } }; replicaDirty = true;`);
+    let asked = 0;
+    sandbox.confirm = () => { asked += 1; return false; };
+    await call(`replicaLoadJob('j2')`);
+    assert.equal(asked, 1, '有未保存改动时切任务必须先问一句');
+    assert.equal(call('replicaState.job_id'), 'j1', '用户点了取消就必须留在原地');
+
+    // 同一条任务的刷新（SSE 收尾、保存后回读）不该弹窗——那不是切走。
+    asked = 0;
+    sandbox.confirm = () => { asked += 1; return true; };
+    await call(`replicaLoadJob('j1')`);
+    assert.equal(asked, 0, '刷新当前任务不该弹确认');
+
+    console.log('test_replica_progress.js: all assertions passed');
+})().catch(e => { console.error(e); process.exit(1); });
