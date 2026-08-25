@@ -134,6 +134,68 @@ class DeltaPromptCastTests(unittest.TestCase):
         self.assertNotIn('Visible physical evidence remains:', out)
 
 
+class PastedSpriteTests(unittest.TestCase):
+    """2026-08-25 实测（run_replica_06edb8110d5a 河畔观景室）：IMG 011-015 背景从毛石一路
+    换到成品木地板，人物贴图五帧像素级重合。
+
+    这一条与 08-23 那条微缩片的区别在于**工人不是 primary_landmark**——于是
+    _canonical_anchor_clause 那句「free to take a new pose and a new spot this frame」
+    （活物锚点专有）根本没机会出现，整张提示词里关于人的指令只剩「同一身份、同样穿着、
+    同样大小」。纯粹的保持一致 + 上一帧当参考图 = 原样复制。放开姿态的配重不能只挂在
+    锚点那条路上。
+
+    另外两条是同一句话里的自相矛盾：cast_action 是一拍的动线（「先 A、然后 B」），静帧
+    渲不出来；而复刻线的工人本人就在施工，再写 never touching the work / no active
+    construction 就是给模型两条互斥指令——化解矛盾最省力的办法正是两条都不执行。
+    """
+
+    WORKING = dict(BEAT, cast_action=('stands atop ladder grinding overhead beams, '
+                                      'then crouches grinding floor grid welds'))
+
+    def test_pose_change_is_demanded_even_without_a_living_anchor(self):
+        """本体：只写「保持一致」不写「换姿态」，交付出来就是五帧同一张贴图。"""
+        out = compile_delta_image_prompt(ORIGINAL, self.WORKING)
+        self.assertIn('visibly different pose and position from the previous frame', out)
+        self.assertIn('never that posture copied over', out)
+
+    def test_a_motion_line_is_reduced_to_the_pose_the_frame_lands_in(self):
+        """静帧渲不出「先 A 然后 B」，只取落点那一段。"""
+        out = compile_delta_image_prompt(ORIGINAL, self.WORKING)
+        self.assertIn('Cast in frame: crouches grinding floor grid welds', out)
+        self.assertNotIn('stands atop ladder grinding overhead beams', out)
+
+    def test_a_working_cast_is_never_told_it_does_not_touch_the_work(self):
+        """复刻线：工人就是施工者，这句是假话，不许写。"""
+        out = compile_delta_image_prompt(ORIGINAL, self.WORKING)
+        self.assertNotIn('never touching the work', out)
+        self.assertNotIn('no active construction', out)
+        self.assertIn('no construction activity beyond the single cast pose', out)
+
+    def test_a_bystander_cast_keeps_both_miniature_rules(self):
+        """微缩线：人偶只旁观，never touching the work / no active construction 一条不少。"""
+        out = compile_delta_image_prompt(ORIGINAL, BEAT)
+        self.assertIn('never touching the work', out)
+        self.assertIn('no active construction', out)
+
+    def test_consecutive_beats_do_not_land_on_the_same_pose_text(self):
+        """连着几拍取到同一句落点，等于什么都没改。"""
+        ladder = [
+            'stands atop ladder grinding overhead beams, then crouches grinding floor grid welds',
+            'sweeps blower nozzle across floor, then climbs ladder to spray ceiling',
+            'steps backward while spraying floor bays, then mounts ladder pressing blue panels',
+        ]
+        poses = [compile_delta_image_prompt(ORIGINAL, dict(BEAT, cast_action=c)).split(
+            'Cast in frame: ')[1].split(' — ')[0] for c in ladder]
+        self.assertEqual(len(set(poses)), len(poses), poses)
+
+    def test_the_cast_line_still_fits_the_image_word_limit(self):
+        """配重句不能把 persistent_traces / completion_extent 挤下车。"""
+        out = compile_delta_image_prompt(ORIGINAL, self.WORKING, max_words=180)
+        self.assertLessEqual(len(out.split()), 180)
+        self.assertIn('Cast in frame:', out)
+        self.assertIn('Visible physical evidence remains:', out)
+
+
 class CastInFrameCheckTests(unittest.TestCase):
     """VIDEO 侧：漏听了 CAST IN FRAME 要变成一次回炉，不是静默交付。"""
 

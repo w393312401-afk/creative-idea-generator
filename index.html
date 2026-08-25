@@ -88,7 +88,7 @@
     <link rel="stylesheet" href="css/tokens.css?v=1.3.0">
     <!-- style.css split into ordered contiguous slices (concatenation == original); load order = cascade order -->
     <link rel="stylesheet" href="css/app/base.css?v=1.5.0">
-    <link rel="stylesheet" href="css/app/skill-output.css?v=1.4.0">
+    <link rel="stylesheet" href="css/app/skill-output.css?v=1.5.0">
     <link rel="stylesheet" href="css/app/efficiency.css?v=1.4.0">
     <link rel="stylesheet" href="css/app/panels-tabs.css?v=1.8.1">
     <!-- 激发结果页的极简布局（管线条 / 折叠标题 / section 弹层 / 宽屏分栏）。
@@ -105,7 +105,7 @@
          它复用工具栏/芯片视觉语言，只补自己的列表与详情栏。 -->
     <link rel="stylesheet" href="css/projects.css?v=1.3.0">
     <link rel="stylesheet" href="css/app/stepped_pipeline.css?v=1.0.0">
-    <link rel="stylesheet" href="css/app/replica.css?v=2.0.2">
+    <link rel="stylesheet" href="css/app/replica.css?v=2.2.0">
     <link rel="stylesheet" href="css/app/prompt_linter.css?v=1.0.0">
     <link rel="stylesheet" href="css/app/collage_viewer.css?v=1.0.0">
     <!-- 顶部工作区标签栏的自定义（排序 / 隐藏）。排在 panels-tabs.css 之后：
@@ -541,6 +541,31 @@
                                             <span>实时生成动态</span>
                                         </div>
                                         <div class="gen-live-feed-lines" id="frames-live-feed-lines"></div>
+                                    </div>
+                                    <!-- 一致性审查结论面板：一行一个问题（跨帧层的一条违规
+                                         去重成一行，不再按帧重复出现），点行滚到并高亮涉及的
+                                         格子，每行直挂「修复」。数据从当前 manifest 的
+                                         review_issues / manual_issue 现算，见 js/review_report.js -->
+                                    <div class="review-panel" id="frames-review-panel" hidden>
+                                        <div class="review-panel-head">
+                                            <button type="button" class="review-panel-toggle" aria-expanded="true" title="折叠/展开审查结论">
+                                                <span class="review-panel-caret">▾</span>
+                                                <span class="review-panel-title">🔍 审查结论</span>
+                                            </button>
+                                            <span class="review-panel-summary"></span>
+                                            <span class="review-panel-stamp"></span>
+                                        </div>
+                                        <div class="review-panel-body">
+                                            <ul class="review-issue-list"></ul>
+                                            <p class="review-panel-empty" hidden>本单没有待处理的审查问题。</p>
+                                            <!-- 未审查的帧单列一行：既不是"通过"也不是"有问题"，
+                                                 混进上面的清单会被读成没事 -->
+                                            <div class="review-panel-gap" hidden>
+                                                <span class="review-gap-tag">未审查</span>
+                                                <span class="review-gap-frames"></span>
+                                                <span class="review-gap-hint">这些帧没有审查结论（从没审过，或结论因重渲作废、审查服务不可用）——重跑一次「🔍 一致性审查」补齐。</span>
+                                            </div>
+                                        </div>
                                     </div>
                                     <!-- 槽位工具条：计数 / 筛选 / 多选批量操作 / 尺寸档。
                                          行为在 js/slot_toolbar.js，筛选与计数只读卡片上的
@@ -1697,16 +1722,18 @@
     <script src="js/progress_model.js?v=1.2.3" defer></script>
     <!-- 槽位状态模型（纯函数）与卡片渲染器：必须排在 api_client / media_renderer /
          app.js 之前——那三处的槽位渲染全部转调这里。见 docs/spark_result_slots_plan.md -->
-    <script src="js/slot_model.js?v=1.3.0" defer></script>
-    <script src="js/slot_card.js?v=1.3.0" defer></script>
+    <script src="js/slot_model.js?v=1.4.0" defer></script>
+    <script src="js/slot_card.js?v=1.4.0" defer></script>
     <script src="js/slot_toolbar.js?v=1.1.0" defer></script>
+    <!-- 审查结论面板 + 单帧违规详情弹层（消费 manifest 里既有的 review_issues） -->
+    <script src="js/review_report.js?v=1.0.0" defer></script>
     <!-- 日志语义规则表（纯函数）：必须排在 api_client 之前——日志面板的概览模式
          转调这里把日志行归成人话事件。见 docs/spark_log_panel_layout_plan.md -->
     <script src="js/log_semantics.js?v=1.0.0" defer></script>
-    <script src="js/api_client.js?v=1.9.0" defer></script>
+    <script src="js/api_client.js?v=1.9.1" defer></script>
     <script src="js/prompt_pipeline.js?v=1.2.6" defer></script>
     <script src="js/stepped_pipeline.js?v=1.0.0" defer></script>
-    <script src="js/replica_pipeline.js?v=2.0.3" defer></script>
+    <script src="js/replica_pipeline.js?v=2.2.0" defer></script>
     <script src="js/prompt_history.js?v=1.0.0" defer></script>
     <script src="js/prompt_linter.js?v=1.0.0" defer></script>
     <script src="js/collage_viewer.js?v=1.0.0" defer></script>
@@ -1714,7 +1741,7 @@
     <script src="js/prompt_editor.js?v=1.0.1" defer></script>
     <script src="js/lightbox.js?v=1.1.0" defer></script>
     <script src="js/media_renderer.js?v=1.11.0" defer></script>
-    <script src="app.js?v=1.6.4" defer></script>
+    <script src="app.js?v=1.6.5" defer></script>
     <script src="js/image_studio.js?v=1.0.4" defer></script>
     <script src="js/gallery.js?v=1.3.0" defer></script>
     <!-- 项目工作台：必须排在 app.js 之后（依赖它的 openSparkProject / viewTask /

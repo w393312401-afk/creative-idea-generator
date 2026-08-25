@@ -259,7 +259,7 @@ P0 是"这个模块能不能用"的分水岭，P1 是"用起来累不累"。
 | 项 | 落点 |
 |---|---|
 | P0-1 富字段绑定 | `reverse.beats_to_dimensions` 发 `mat/trace/state_before/state_after`；`_outline_normalized_entries` 透传；`build_outline_plan_block` 新增 STATE PAIR 绑定规则 |
-| P0-1 产线预检豁免 | `validate_scene_states(allow_lingering_temporaries=)`，由 `dimensions.reverse_engineered` 触发；删掉 `_translate_compose_failure` 的道歉分支 |
+| P0-1 产线预检豁免 | `validate_scene_states(reverse_engineered=)`（清场 + 持久结构件不得拆除两条纪律规则一并降级为 advisories），由 `dimensions.reverse_engineered` 触发；删掉 `_translate_compose_failure` 的道歉分支 |
 | P0-2 负面清单 | `composers/base.banned_elements_block()`（两个 profile 都走 `super()`）+ 规划器 `_banned_plan_block` |
 | P0-2 门禁 | `run_audit` 命中进 `audit_failed`，不 `_publish_to_library` |
 | P0-3 成本卡点 | 新 stage `confirm_cost`；`extract_replica_job` + `/api/replica/extract`；上传不再自动串 Pass A |

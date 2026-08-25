@@ -19,7 +19,8 @@ FURNISHING = {"furnishing", "placement", "move-in", "move_in"}
 # 工具/设备，一旦进入 furnishing 阶段就必须已经清场；PERSISTENT_STRUCTURAL 是
 # 承重/铺装类结构件，一旦 introduced 就不许再出现在任何一拍的 removed_objects
 # 里——这两类都是关键词提示，不是穷举分类，误报风险由调用方按需要降级为
-# warning-only（见 validate_scene_states 的 6/6 事故复盘同款克制原则）。
+# warning-only（见 validate_scene_states 的 6/6 事故复盘同款克制原则）：反推复刻线
+# 就是这么降级的，两条规则在那里都只记诊断不拦单。
 TEMPORARY_OBJECT_CUES = {
     "scaffold", "scaffolding", "ladder", "crane", "tarp", "tarpaulin",
     "temporary brace", "temporary bracing", "work platform", "mixer", "generator",
@@ -35,6 +36,18 @@ PERSISTENT_STRUCTURAL_CUES = {
 def _matches_cue(name: str, cues: set[str]) -> bool:
     lname = _text(name).lower()
     return bool(lname) and any(cue in lname for cue in cues)
+
+
+def _is_persistent_structural(name: str) -> bool:
+    """这个物体名是不是"一旦铺设就全程继承"的结构件。
+
+    临时态优先：PERSISTENT_STRUCTURAL_CUES 是子串匹配，"floor protection sheet"、
+    "floor-level dust sheet" 这类名字里带 floor 的**防护耗材**会被误锁成结构件，
+    之后它们照施工纪律被清场时反倒挨一条"结构件不许拆除"。名字同时命中两类提示时，
+    临时态说了算——它描述的是物件用途，比 floor 这个位置词更接近本义。
+    """
+    return (_matches_cue(name, PERSISTENT_STRUCTURAL_CUES)
+            and not _matches_cue(name, TEMPORARY_OBJECT_CUES))
 
 
 def _text(value: Any) -> str:
@@ -179,18 +192,31 @@ def validate_material_flow(state: dict[str, Any]) -> list[str]:
 
 
 def validate_scene_states(states: list[dict[str, Any]],
-                          allow_lingering_temporaries: bool = False) -> list[str]:
+                          reverse_engineered: bool = False,
+                          advisories: list[str] | None = None) -> list[str]:
     """校验场景状态账。
 
-    `allow_lingering_temporaries`：关掉「进入 furnishing 前必须清场」那一条。
-    只有反推复刻线该打开它（见 __init__.py 的 reverse_engineered 分支）。理由是这条
-    规则是为**原创**选题写的产线纪律——原创单里画面还立着脚手架就搬家具进场是失误；
-    而复刻单里那块防护布是从原片上读下来的**观察结果**，原片就是那么拍的。对着一份
-    照实转录判"你不该这样施工"，拦下的不是缺陷，是真实。其余各条（时序、before 承接、
-    重复移除、持久件不得拆除）对两条线一视同仁，它们查的是状态账自身对不对得上，
-    与题材来源无关。
+    `reverse_engineered`：这条阶梯是对一条真实成片的**转录**（反推复刻线），不是原创
+    施工方案。打开它会关掉两条**施工纪律**类规则：
+
+      · 「进入 furnishing 前临时件必须清场」——原创单里画面还立着脚手架就搬家具进场
+        是失误；复刻单里那块防护布是从原片上读下来的观察结果，原片就是那么拍的。
+      · 「持久结构件一旦铺设不得拆除」——2026-08-25 起。它和上一条是同一类判断：审的
+        是"该不该这么施工"，不是"状态账对不对得上"（先 introduce 后 remove 本身在账上
+        完全自洽）。实际打回的那单是一拍拆掉了自己先铺的 OSB 结构底板；无论原片真是
+        先铺后起，还是转录时把"被面层盖住、不再可见"写成了 removed_objects，让用户回
+        去手改一份 1:1 转录都不是修复——那等于要求他把转录改得不像原片。这与清场那条
+        当年 6/6 全倒的事故是同一个坑。
+
+    其余各条（时序、before 承接、同一物体重复移除、material_flow）对两条线一视同仁：
+    它们查的是状态账自身对不对得上，与题材来源无关。
+
+    `advisories`：传入一个列表，被上面两条豁免放过的判据会原样写进去。豁免不等于这些
+    观察没有价值——它们照旧落进 compose 诊断（config['_scene_state_advisories']），只是
+    不再拦下整单。
     """
     errors: list[str] = []
+    advisories = advisories if advisories is not None else []
     previous_after: dict[str, Any] = {}
     known: set[str] = set()
     # 2026-08-06 修复：系统提示词（__init__.py 的 object-lifecycle 字段说明与
@@ -227,25 +253,24 @@ def validate_scene_states(states: list[dict[str, Any]],
                     f"Beat {idx} removes object '{name}' again without a fresh introduction "
                     f"since it was last removed.")
             if key in persistent_locked:
-                errors.append(
+                (advisories if reverse_engineered else errors).append(
                     f"Beat {idx} removes '{name}', a persistent structural element that was "
                     f"already laid; persistent elements must be inherited through every "
                     f"subsequent beat and are never removed.")
             ever_removed.add(key)
         for name in state.get("introduced_objects") or []:
             known.add(name.lower())
-            if _matches_cue(name, PERSISTENT_STRUCTURAL_CUES):
+            if _is_persistent_structural(name):
                 persistent_locked.add(name.lower())
         for name in state.get("removed_objects") or []:
             known.discard(name.lower())
         # 临时态清场：进入 furnishing 阶段时，任何仍"存活"（已 introduced 未
         # removed）且匹配 TEMPORARY_OBJECT_CUES 的施工工具/设备都必须已经清场——
         # furnishing 拍写的是搬入家具，不该还有脚手架、工具箱、临时支撑立在画面里。
-        if (not allow_lingering_temporaries
-                and classify_material_flow(state.get("operation_type", "")) == "furnishing"):
+        if classify_material_flow(state.get("operation_type", "")) == "furnishing":
             lingering = sorted(n for n in known if _matches_cue(n, TEMPORARY_OBJECT_CUES))
             if lingering:
-                errors.append(
+                (advisories if reverse_engineered else errors).append(
                     f"Beat {idx} enters the furnishing phase but temporary construction "
                     f"objects are still present and not yet removed: {lingering}.")
         errors.extend(validate_material_flow(state))

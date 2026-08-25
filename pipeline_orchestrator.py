@@ -41,7 +41,7 @@ from datetime import datetime
 
 from server_common import (
     _get_project_dir, read_manifest, write_manifest, manifest_lock,
-    IMG2IMG_CONTROL_PROMPT,
+    IMG2IMG_CONTROL_PROMPT, log,
     frame_content_hash, drop_stale_review_verdicts, REAL_REVIEW_VERDICTS,
 )
 from prompt_pipeline import (
@@ -449,6 +449,46 @@ def _inline_result(project_dir, inline_ok):
     }
 
 
+def _classify_review_severity(config, issues, on_progress=None):
+    """给手动整套审查的违规补上影响分级（chain / cosmetic），就地写进每条的
+    'severity'。
+
+    分级器（chain_guard.classify_chain_impact）本来只服务于生成期链上守卫的停链
+    判定，手动审查这条路一直没调过它——于是"会一路传染进后面每一帧的结构问题"
+    与"只是光影色温差一点"在前端长得一模一样，人得逐条自己读文案去判断先修哪个。
+    这里补上，纯文本分类，一次调用分完整轮。
+
+    三条边界：
+    · 已经带 severity 的不重分（链上守卫审过的拍沿用它自己的判定，见 _inline_result）；
+    · 同一条文案只送一次，多帧共用的跨帧违规不重复计费；
+    · **失败就不分级**（on_error=None）。这里的分级只用于展示、不决定任何动作，
+      一次调用失败把整单标成"会传染下游"是在编造判定；前端见到没有 severity
+      会如实不画那枚标签（见 js/review_report.js）。
+    """
+    pending = [i for i in issues if not i.get('severity')]
+    if not pending:
+        return
+    # 按文案去重：跨帧层的一条违规会同时落在它涉及的每一帧上
+    texts = list(dict.fromkeys(i.get('text', '') for i in pending if i.get('text')))
+    if not texts:
+        return
+    # 延迟导入：chain_guard 反过来依赖本模块（_outline_items_for_review），
+    # 模块级 import 会成环
+    from chain_guard import classify_chain_impact
+    if on_progress:
+        on_progress('sequence_review', {
+            'message': f'正在给 {len(texts)} 条违规分级（会传染下游 / 仅观感）...',
+        })
+    severities = classify_chain_impact(config, texts, on_error=None)
+    if len(severities) != len(texts):
+        return  # 没分成就不分，绝不半套落盘
+    by_text = dict(zip(texts, severities))
+    for issue in pending:
+        sev = by_text.get(issue.get('text', ''))
+        if sev:
+            issue['severity'] = sev
+
+
 def _manifest_review_summary(project_dir, sequences):
     """这段已渲染序列**此刻**的审查状态（从 manifest 现读）：
     {'flagged': {seq: 原因}, 'unreviewed': [seq, ...]}。
@@ -591,11 +631,25 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
             elif state['unreviewed']:
                 names = '、'.join(f'{s:03d}' for s in state['unreviewed'])
                 tail = f'；另有 {len(state["unreviewed"])} 帧此前未审完（IMG {names}），可用「全量重审」补齐'
+            lines = [{'text': f'全部 {len(all_beats)} 拍的结论仍然成立'
+                              f'（帧图自上次审查后没有变化），本轮未重复审查', 'cls': 'ok'}]
+            if state['flagged']:
+                lines.append({'text': f'仍有 {len(state["flagged"])} 帧带着尚未修复的问题：',
+                              'cls': 'warn'})
+                for s in sorted(state['flagged']):
+                    lines.append({'text': f'　IMG {s:03d}：{state["flagged"][s]}', 'cls': 'warn'})
+            elif state['unreviewed']:
+                names = '、'.join(f'{s:03d}' for s in state['unreviewed'])
+                lines.append({'text': f'另有 {len(state["unreviewed"])} 帧此前未审完'
+                                      f'（IMG {names}），可用「全量重审」补齐', 'cls': 'warn'})
             on_progress('sequence_review_result', {
                 'passed': not state['flagged'] and not state['unreviewed'],
                 'partial': partial, 'reviewed_sequences': [],
                 'unreviewed_sequences': state['unreviewed'],
                 'reused_beats': len(all_beats), 'rendered_count': len(rendered),
+                'flagged_frames': [{'sequence': s, 'reason': state['flagged'][s]}
+                                   for s in sorted(state['flagged'])],
+                'lines': lines,
                 'message': (f'一致性审查：全部 {len(all_beats)} 拍的结论仍然成立'
                             f'（帧图自上次审查后没有变化），本轮未重复审查{tail}。'),
             })
@@ -697,9 +751,10 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
                       'unreviewed': 'sequence_review_skipped'}
     # 结构化违规按"归属帧"（beat+1，即该拍的到达画面）分组落盘
     issues_by_seq = {}
-    for issue in (final_result.get('issues') or []):
-        if issue.get('verified') is False:
-            continue  # 复核否决的不落盘，否则帧上会留着一堆已被推翻的指控
+    surviving = [i for i in (final_result.get('issues') or [])
+                 if i.get('verified') is not False]  # 复核否决的不落盘，否则帧上会留着一堆已被推翻的指控
+    _classify_review_severity(config, surviving, on_progress=on_progress)
+    for issue in surviving:
         issues_by_seq.setdefault(issue.get('beat', 0) + 1, []).append(issue)
     # 只写本轮真的审过的那些帧：其余帧的结论仍然成立（reusable），重新盖一遍章
     # 只会把 reviewed_at 刷新成谎话，还会把它们上一轮的 review_issues 抹掉。
@@ -728,12 +783,26 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
     reuse_note = f'（本轮增量重审 {len(beats_to_review)} 拍，另有 {reused_beats} 拍沿用既有结论）' \
         if reused_beats else ''
 
+    # 收尾那几条注解（只覆盖了前缀 / 复用了几拍）：两条路径共用，各自成行
+    def _tail_lines():
+        out = []
+        if partial:
+            out.append({'text': f'本轮只覆盖已渲染的前 {len(rendered)}/{len(all_seqs)} 帧，'
+                                f'其余帧渲完后请再跑一次', 'cls': 'warn'})
+        if reused_beats:
+            out.append({'text': f'本轮增量重审 {len(beats_to_review)} 拍，'
+                                f'另有 {reused_beats} 拍的帧图未变化、沿用了既有结论', 'cls': 'ok'})
+        return out
+
     if not flagged_seqs and not unreviewed_seqs:
         if on_progress:
             on_progress('sequence_review_result', {
                 'passed': True, 'partial': partial,
                 'reviewed_sequences': sorted(affected),
                 'reused_beats': reused_beats, 'rendered_count': len(rendered),
+                'flagged_frames': [], 'unreviewed_sequences': [],
+                'lines': [{'text': f'已渲染的前 {len(rendered)} 帧一致性审查通过',
+                           'cls': 'ok'}] + _tail_lines(),
                 **({'message': (f'已渲染的前 {len(rendered)} 帧一致性审查通过'
                                 f'{partial_note}{reuse_note}')}
                    if (partial or reuse_note) else {}),
@@ -751,11 +820,31 @@ def _sequence_consistency_review(config, title, prompt_block, project_dir, on_pr
             parts.append(f'另有 {len(unreviewed_seqs)} 帧未审完'
                          f'（IMG {"、".join(f"{s:03d}" for s in unreviewed_seqs)}），'
                          f'已标记为「未审查」，可重跑审查补齐')
+        # 结构化播报（2026-08-25）：上面那句 message 把"几帧有问题 + 每帧原因 +
+        # 未审完 + 前缀说明 + 增量说明"拼成一根字符串塞进日志流，读的人得在一行里
+        # 自己断句。lines 把同样的内容按语义拆开，前端逐行画（message 保留原样，
+        # 老前端与服务端日志不受影响）；flagged_frames 让前端不必回头解析那根字符串。
+        lines = []
+        if flagged_seqs:
+            lines.append({'text': f'发现 {len(flagged_seqs)} 帧存在问题'
+                                  f'（已保留渲染结果，未自动修改）', 'cls': 'warn'})
+            for s in flagged_seqs:
+                lines.append({'text': f'　IMG {s:03d}：{state["flagged"][s]}', 'cls': 'warn'})
+        if unreviewed_seqs:
+            lines.append({'text': f'另有 {len(unreviewed_seqs)} 帧未审完'
+                                  f'（IMG {"、".join(f"{s:03d}" for s in unreviewed_seqs)}）'
+                                  f'，已标记为「未审查」，可重跑审查补齐', 'cls': 'warn'})
+        lines.extend(_tail_lines())
+        lines.append({'text': '逐条明细与「修复」入口在帧网格上方的「🔍 审查结论」面板里',
+                      'cls': ''})
         on_progress('sequence_review_result', {
             'passed': False, 'beats': sorted((final_result.get('failures') or {}).keys()),
             'unreviewed_sequences': unreviewed_seqs,
             'partial': partial, 'reviewed_sequences': sorted(affected),
             'reused_beats': reused_beats, 'rendered_count': len(rendered),
+            'flagged_frames': [{'sequence': s, 'reason': state['flagged'][s]}
+                               for s in flagged_seqs],
+            'lines': lines,
             'message': '一致性审查' + '；'.join(parts) + '。' + partial_note + reuse_note,
         })
     return prompt_block
@@ -995,6 +1084,61 @@ def undo_frame_fix(title, sequence, prompt_block):
             'at': snap.get('at')}
 
 
+def _slot_body(item):
+    return (item.get('body') if isinstance(item, dict) else item) or ''
+
+
+def _slot_meta(item):
+    return (item.get('meta', '') if isinstance(item, dict) else '') or ''
+
+
+def _measure_fix_triptych(config, title, images, videos, sequence, *, include_right=True):
+    """读一次三联屏的两条缝：K-1 → K（上游继承）与 K → K+1（下游通道）。
+
+    修复前后各读一次，两份读数交给 frame_continuity.compare_triptych 比对——这就是
+    「三帧联排硬性审查门禁」的实现体。此前修复只复核「原来那几条问题解决没有」
+    （_reverify_frame_issues），从不问「有没有修出新问题」：一次修复可以在消灭 A 问题
+    的同时把 K-1→K 的透视撕开，而流程一声不吭地报「✅ 均已消失」。
+
+    每条缝的 `prompt` 取**候选帧**（缝的下游那一张）的正文：changed_grid_cells 圈出的
+    是那一帧自己申报的差量区，稳定区判读要把它挖掉。取错了会把本该变的地方算成漂移。
+
+    过门/换机位族的那条缝不判——两张图本来就不该像（is_transition_frame）。
+    `include_right=False` 用于 Level 3 连带重渲：K+1 这一趟本来就要被盖掉，拿它当基线
+    没有意义。
+    """
+    import frame_continuity
+
+    mode = frame_continuity.continuity_mode(config)
+    if mode == 'off':
+        return {'left': None, 'right': None}
+
+    def _frame(seq):
+        path = _frame_path(title, seq)
+        return path if os.path.exists(path) else None
+
+    seams = {'left': None, 'right': None}
+
+    # 左缝：参考 K-1，候选 K。sequence <= 1 时 is_transition_frame 直接为真（首帧没有
+    # 上游可继承），这条缝自然落空。
+    img_k = images.get(sequence)
+    if img_k is not None and not frame_continuity.is_transition_frame(
+            sequence, _slot_meta(img_k), _slot_meta(videos.get(sequence - 1))):
+        seams['left'] = frame_continuity.measure_seam(
+            _frame(sequence - 1), _frame(sequence),
+            prompt=_slot_body(img_k), mode=mode)
+
+    # 右缝：参考 K，候选 K+1。
+    img_next = images.get(sequence + 1)
+    if include_right and img_next is not None and not frame_continuity.is_transition_frame(
+            sequence + 1, _slot_meta(img_next), _slot_meta(videos.get(sequence))):
+        seams['right'] = frame_continuity.measure_seam(
+            _frame(sequence), _frame(sequence + 1),
+            prompt=_slot_body(img_next), mode=mode)
+
+    return seams
+
+
 def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, manual_reason=None, cascade_downstream=False):
     """人工确认修复流程的落地点：`_sequence_consistency_review` 只标记问题、不
     自动改写重渲，人工在帧网格看过 vlm_qa_reason 后点击「修复此帧问题」才会真正
@@ -1059,6 +1203,14 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
     # 修坏了可以一键退回去（undo_frame_fix）。修复是覆盖写同一个文件，不存就没了。
     snapshot = save_fix_snapshot(project_dir, title, sequence, entry, image_item,
                                  video_beat, video_item)
+
+    # 三联屏门禁的基线读数：必须在重渲前、也在提示词改写前取——磁盘上还是旧图、
+    # images/videos 里还是旧正文，两者对得上。换成新正文配旧图去量，差量区圈的就不是这张图
+    # 自己申报的那块，稳定区判读会把本该变的地方算成漂移。
+    #
+    # Level 3 连带重渲时不量右缝：K+1 这一趟本来就要被盖掉，拿它当基线没意义。
+    triptych_before = _measure_fix_triptych(
+        config, title, images, videos, sequence, include_right=not cascade_downstream)
 
     if on_progress:
         on_progress('frame_issue_fix_start', {
@@ -1145,6 +1297,48 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
             target_sequences=target_sequences,
         )
 
+    # ── 三帧联排硬性审查门禁 ──────────────────────────────────────────────────
+    #
+    # [K-1] ⇄ [修后 K] ⇄ [K+1]：两侧缝的连贯性读数拿修前基线比一次。任一侧档位
+    # 严格恶化（passed → warned/failed、warned → failed）就自动退回上一版。
+    #
+    # 为什么必须有这一道：_reverify_frame_issues 只复核「原来那几条问题解决没有」，
+    # 从不问「有没有修出新问题」。一次修复完全可以在消灭 A 问题的同时把 K-1→K 的
+    # 透视撕开，而流程一声不响地报「✅ 均已消失」。这台「越修越坏」的永动机与节拍层
+    # autofix 那一台同构，只是贵得多：帧的一次修复是 4 选 1 重渲。
+    #
+    # Level 3 连带重渲（cascade_downstream）不自动回滚：下游已经按新的 K 重渲过一轮，
+    # 而快照里只有 K 这一帧，单独退回 K 会留下一条修了一半的链（上游旧图、下游新血统），
+    # 比不回滚更坏。整链快照与整链回滚是另一件事，这里只把结论大声报出来。
+    triptych_after = _measure_fix_triptych(
+        config, title, images, videos, sequence, include_right=not cascade_downstream)
+    import frame_continuity as _fc
+    triptych = _fc.compare_triptych(triptych_before, triptych_after)
+    triptych['auto_rollback_available'] = not cascade_downstream
+
+    if triptych['verdict'] == 'regressed' and not cascade_downstream:
+        detail = _fc.describe_triptych(triptych)
+        if on_progress:
+            on_progress('frame_issue_triptych_gate', {
+                'sequence': sequence, 'verdict': 'regressed', 'triptych': triptych,
+                'message': (f"⛔ IMG {sequence:03d} 三联屏门禁未通过：{detail}。"
+                            f"本次修复已自动退回上一版——宁可不修，也不把链改坏。"),
+            })
+        restored = undo_frame_fix(title, sequence, new_prompt_block)
+        log('WARN', 'FRAMES',
+            f"IMG {sequence:03d} 修复后三联屏门禁判恶化，已自动回滚：{detail}", title=title)
+        return {'prompt_block': restored['prompt_block'], 'reason': reason,
+                'reverify': None, 'triptych': triptych, 'rolled_back': True,
+                'undoable': False}
+
+    if on_progress and triptych['verdict'] != 'ok':
+        on_progress('frame_issue_triptych_gate', {
+            'sequence': sequence, 'verdict': triptych['verdict'], 'triptych': triptych,
+            'message': (f"⚠️ IMG {sequence:03d} 三联屏门禁：{_fc.describe_triptych(triptych)}"
+                        + ("（连带重渲不自动回滚，请人工看一眼）"
+                           if triptych['verdict'] == 'regressed' else '')),
+        })
+
     # 重渲成功才清人工描述：中途抛错时描述必须原样留在 manifest 上，否则人得重新
     # 把问题再描述一遍。
     if manual_issue:
@@ -1174,7 +1368,7 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
 
     verify = _reverify_frame_issues(config, title, sequence, recorded_issues, on_progress=on_progress)
     return {'prompt_block': new_prompt_block, 'reason': reason, 'reverify': verify,
-            'undoable': True}
+            'triptych': triptych, 'rolled_back': False, 'undoable': True}
 
 
 def _reverify_frame_issues(config, title, sequence, recorded_issues, on_progress=None):

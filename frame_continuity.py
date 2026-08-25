@@ -366,6 +366,111 @@ def analyze_frame(reference_path: str, candidate_path: str, *, prompt: str = "",
     return result
 
 
+# ── 三联屏门禁 ───────────────────────────────────────────────────────────────
+#
+# analyze_frame 回答的是「这一张新渲的帧，相对它的参考帧漂了没有」——**向前建链**时
+# 每渲一帧问一次。它回答不了定向修复真正要问的那个问题：把已经在链上的第 K 帧换掉
+# 之后，它**两侧**的缝还咬得住吗？
+#
+# 修复此前是开环的（pipeline_orchestrator._reverify_frame_issues 只复核「原来那几条
+# 问题解决没有」，从不问「有没有修出新问题」）。于是一次修复可以在消灭 A 问题的同时
+# 把 K-1→K 的透视撕开，而整条链路一声不吭——用户看到的是「✅ 均已消失」。这与节拍层
+# 那台「越修越坏」的永动机是同一台，只是贵得多：帧的一次修复是 4 选 1 重渲。
+#
+# 判据刻意与本模块其余部分同源：**只认状态档位的严格恶化**（passed → warned/failed，
+# warned → failed）。数值变差但档位没跳的一律只报不拦——analyze_frame 本身就要求两个
+# 独立硬信号才否决，门禁不该比它更神经质，误判一次的代价是把一次真修好的重渲丢掉。
+
+TRIPTYCH_CONTRACT_VERSION = "frame-triptych-v1"
+
+_STATUS_RANK = {"passed": 0, "warned": 1, "failed": 2}
+
+# 两条缝的人类可读名。左缝＝上游继承（K-1 → K），右缝＝下游通道（K → K+1）。
+SEAM_LABELS = {"left": "K-1 → K（上游继承锁）", "right": "K → K+1（下游通道锁）"}
+
+
+def seam_rank(result: dict[str, Any] | None) -> int | None:
+    """把一条缝的读数折成可比较的档位；skipped / 读不出来一律 None（不参与判定）。"""
+    return _STATUS_RANK.get((result or {}).get("status"))
+
+
+def measure_seam(reference_path: str | None, candidate_path: str | None, *,
+                 prompt: str = "", beat: dict[str, Any] | None = None,
+                 mode: str = "balanced") -> dict[str, Any] | None:
+    """一条缝的连贯性读数。任一端缺图、或档位关闭时返回 None ＝这条缝不参与判定。
+
+    `prompt` 取**候选帧**（缝的下游那一张）的正文：changed_grid_cells 圈出的是这一帧
+    自己申报的差量区，稳定区判读要把它挖掉。左缝取第 K 帧的正文，右缝取第 K+1 帧的。
+    """
+    if mode == "off":
+        return None
+    if not reference_path or not candidate_path:
+        return None
+    if not (os.path.exists(reference_path) and os.path.exists(candidate_path)):
+        return None
+    result = analyze_frame(reference_path, candidate_path, prompt=prompt, beat=beat, mode=mode)
+    rank = seam_rank(result)
+    if rank is None:
+        # skipped / skipped_transition：读数存在但不可比，照样交出去给人看，只是不判。
+        return {"status": result.get("status"), "rank": None,
+                "reason": result.get("reason") or result.get("status"), "metrics": None}
+    return {
+        "status": result.get("status"),
+        "rank": rank,
+        "reason": result.get("reason"),
+        "metrics": result.get("previous"),
+    }
+
+
+def compare_triptych(before: dict[str, Any] | None,
+                     after: dict[str, Any] | None) -> dict[str, Any]:
+    """比对修前 / 修后的两条缝，回答「这次修复有没有把画面改坏」。
+
+    只有**两侧都读得出档位**的那条缝才参与判定：修前读不出（缺图、低纹理、档位关闭）
+    的缝，修后再差也没有基线可比，不能凭空判死一次重渲。
+
+    返回 {'version', 'regressed': [seam…], 'verdict': 'ok'|'regressed'|'unjudged',
+          'seams': {seam: {'before':…, 'after':…, 'regressed': bool}}}
+    """
+    before = before or {}
+    after = after or {}
+    seams: dict[str, Any] = {}
+    regressed: list[str] = []
+    judged = 0
+    for seam in ("left", "right"):
+        b, a = before.get(seam), after.get(seam)
+        b_rank, a_rank = seam_rank(b), seam_rank(a)
+        row: dict[str, Any] = {"before": b, "after": a, "regressed": False}
+        if b_rank is not None and a_rank is not None:
+            judged += 1
+            if a_rank > b_rank:
+                row["regressed"] = True
+                regressed.append(seam)
+        seams[seam] = row
+    verdict = "regressed" if regressed else ("ok" if judged else "unjudged")
+    return {"version": TRIPTYCH_CONTRACT_VERSION, "verdict": verdict,
+            "regressed": regressed, "judged_seams": judged, "seams": seams}
+
+
+def describe_triptych(comparison: dict[str, Any] | None) -> str:
+    """门禁结论的一句中文，直接进 on_progress 消息与日志。"""
+    comparison = comparison or {}
+    verdict = comparison.get("verdict")
+    if verdict == "regressed":
+        parts = []
+        for seam in comparison.get("regressed") or []:
+            row = (comparison.get("seams") or {}).get(seam) or {}
+            b = (row.get("before") or {}).get("status")
+            a = (row.get("after") or {}).get("status")
+            parts.append(f"{SEAM_LABELS.get(seam, seam)}：{b} → {a}"
+                         + (f"（{(row.get('after') or {}).get('reason')}）"
+                            if (row.get("after") or {}).get("reason") else ""))
+        return "；".join(parts)
+    if verdict == "ok":
+        return f"两侧缝均未恶化（判读了 {comparison.get('judged_seams')} 条缝）"
+    return "没有可比的基线读数，本次不做门禁判定"
+
+
 def transition_result(reference_path: str | None, master_path: str | None = None,
                       reason: str = "declared camera-family transition") -> dict[str, Any]:
     return {

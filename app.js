@@ -2174,7 +2174,7 @@ function updateFrameSlotCard(f) {
    TaskRecord.feedLines 缓冲区（无论用户是否正看着这个创意），只有正停留在
    这个创意页面时才顺带画进 DOM——这样切到另一个创意不会看到串台的动态行，
    切回来时也能从缓冲区完整回放，而不是"谁最后发起任务谁独占这块面板"。 */
-function _framesFeedAppendDom(text, cls, atDate) {
+function _framesFeedAppendDom(text, cls, atDate, key) {
     const lines = document.getElementById('frames-live-feed-lines');
     if (!lines) return;
     const wrap = document.getElementById('frames-live-feed');
@@ -2182,11 +2182,17 @@ function _framesFeedAppendDom(text, cls, atDate) {
     const nearBottom = lines.scrollHeight - lines.scrollTop - lines.clientHeight < 60;
     const d = atDate || new Date();
     const p = n => String(n).padStart(2, '0');
-    const line = document.createElement('div');
+    // 带 key 的行是"同一条进度就地改写"（逐拍审查计数条等）：命中最后一行的
+    // 同 key 就原地改，不再一拍灌一行把真正的结论顶出可视区
+    const last = lines.lastElementChild;
+    const line = (key && last && last.dataset.feedKey === key)
+        ? last : document.createElement('div');
+    const isNew = line !== last;
     line.className = 'gen-feed-line' + (cls ? ` ${cls}` : '');
+    if (key) line.dataset.feedKey = key; else delete line.dataset.feedKey;
     const safeText = escapeHtml(String(text).length > 220 ? String(text).slice(0, 220) + '…' : String(text));
     line.innerHTML = `<span class="gen-feed-time">[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}]</span> ${safeText}`;
-    lines.appendChild(line);
+    if (isNew) lines.appendChild(line);
     while (lines.children.length > 300) lines.removeChild(lines.firstChild);
     if (nearBottom) lines.scrollTop = lines.scrollHeight;
 }
@@ -2212,14 +2218,25 @@ function framesFeedReset(ideaId, introText) {
     if (introText) framesFeedLine(ideaId, introText);
 }
 
-function framesFeedLine(ideaId, text, cls) {
+/**
+ * key：可选。给同一条会不断刷新的进度用（如逐拍审查的 "已完成 N/M 拍"）——
+ * 缓冲区里最后一行是同 key 时就地改写，而不是追加。此前逐拍审查一拍灌一行，
+ * 十几拍下来把真正要读的结论顶出可视区，"干净"那十几行没有一行值得单独占位。
+ */
+function framesFeedLine(ideaId, text, cls, key) {
     const rec = getIdeaTaskRecord(ideaId, 'frames');
     const atDate = new Date();
     if (rec) {
-        rec.feedLines.push({ text, cls, time: atDate });
-        while (rec.feedLines.length > 300) rec.feedLines.shift();
+        const last = rec.feedLines[rec.feedLines.length - 1];
+        if (key && last && last.key === key) {
+            // 就地改写：回放（framesFeedHydrate）时也只会看到最终那一条
+            rec.feedLines[rec.feedLines.length - 1] = { text, cls, time: atDate, key };
+        } else {
+            rec.feedLines.push({ text, cls, time: atDate, key });
+            while (rec.feedLines.length > 300) rec.feedLines.shift();
+        }
     }
-    if (isViewingIdea(ideaId)) _framesFeedAppendDom(text, cls, atDate);
+    if (isViewingIdea(ideaId)) _framesFeedAppendDom(text, cls, atDate, key);
 }
 
 /** 把这个创意缓冲区里已经攒下的动态行整批回放进 DOM——切回它正在生成的页面时调用。 */
@@ -2234,7 +2251,7 @@ function framesFeedHydrate(ideaId) {
     }
     lines.innerHTML = '';
     wrap.style.display = 'block';
-    rec.feedLines.forEach(l => _framesFeedAppendDom(l.text, l.cls, l.time));
+    rec.feedLines.forEach(l => _framesFeedAppendDom(l.text, l.cls, l.time, l.key));
     const dot = document.getElementById('frames-feed-dot');
     if (dot) dot.classList.toggle('active', !!rec.live);
 }

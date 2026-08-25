@@ -796,13 +796,41 @@ class TestComposeGateRevalidates(ReplicaTempRootCase):
         self.assertEqual([v for v in out['validation'] if v['level'] == 'error'], [])
 
     def test_a_real_error_still_blocks_after_recomputation(self):
-        """重算不是放行：阶梯真脏的时候照样拦下。"""
+        """重算不是放行：阶梯真脏的时候照样拦下。
+
+        这里用阶段逆行当「真脏」的样本，而不是漏认领事件：后者对变体已降级为 warn
+        （见 `test_an_unbound_event_is_only_a_warning_on_a_variant`）。
+        """
         state = self._variant_job()
-        state['beats']['beats'][0]['source_event_ids'] = []
+        head = state['beats']['beats'][0]
+        head['stage'] = 'reveal'
+        tail = dict(head)
+        tail.update({'id': 'B02', 'start': 10.0, 'end': 12.0,
+                     'stage': 'demolition', 'source_event_ids': []})
+        state['beats']['beats'].append(tail)
+        state['beats']['video_duration_sec'] = 12.0
         rp._save_state(state)
         with self.assertRaises(RuntimeError) as ctx:
             rp.run_compose(state, {})
-        self.assertIn('E01', str(ctx.exception))
+        self.assertIn('B02', str(ctx.exception))
+
+    def test_an_unbound_event_is_only_a_warning_on_a_variant(self):
+        """变体不对原片的事件名册负责，漏认领不该拦下合成。
+
+        `overview` 是从源 job 复制过来的**原片**事件表。变体一改拍数或时间窗就报
+        `event_unbound`，而这条错任何文字改写都修不掉——判成 error 的后果是「AI 修复
+        硬伤」每轮重写全表、跑满轮次仍然剩着，也就是「越修越坏」。
+        """
+        state = self._variant_job()
+        state['beats']['beats'][0]['source_event_ids'] = []
+        rp._save_state(state)
+        with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'title': 't'}),              patch('prompt_pipeline.compose_remaining_beats',
+                   return_value='VIDEO 1: a worker trowels the wall'),              patch('server_common.write_library_item'):
+            out = rp.run_compose(state, {})
+        self.assertEqual(out['stage'], 'completed')
+        self.assertEqual([v for v in out['validation'] if v['level'] == 'error'], [])
+        self.assertTrue(any(v['code'] == 'event_unbound' and v['level'] == 'warn'
+                            for v in out['validation']))
 
 
 class TestStageCatalogAndFrameUrls(ReplicaTempRootCase):

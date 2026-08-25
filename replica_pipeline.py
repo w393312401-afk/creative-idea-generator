@@ -1209,17 +1209,30 @@ def autofix_job_beats(config, job_id, on_progress=None):
     # 被调用，却照样重跑一遍翻译（真花钱）、清掉已有的合成产物、把 stage 从 completed
     # 退回卡点，最后弹一句「已解决全部硬伤」。什么都没修还收了钱、还退了工。
     # 工艺 warn 要修走 `refine_job_craft`，不是这条路。
+    #
+    # 2026-08-25：`fixed_count == 0` 现在有**两种**含义，必须分开说。此前 autofix_beats
+    # 的返回值是 `max(1, ...)`，硬伤从 3 涨到 5 也照报 1，于是这道早退门形同虚设——更差
+    # 的稿子一路往下落盘、清合成产物、退工，用户看到的却是「已修复 1 项」。闸门补上之后
+    # 0 是真的 0：要么本来就没有硬伤（老含义），要么模型试满了轮次但没有一轮变好、改动
+    # 已被整轮丢弃（新含义）。后者绝不能说成「没有硬伤可修」。
     if not fixed_count:
         # autofix_beats 的早退路径不写 validation，直接取会拿到上一轮的旧快照。
-        state['validation'] = reverse.validate_beats(fixed_doc, overview)
+        state['validation'] = fixed_doc.get('validation') or reverse.validate_beats(fixed_doc, overview)
+        state['beats'] = fixed_doc
         _save_state(state)
         if on_progress:
+            errors = [v for v in state.get('validation') or [] if v.get('level') == 'error']
             warns = [v for v in state.get('validation') or [] if v.get('level') != 'error']
+            if errors:
+                msg = (f'AI 修复没能减少硬伤：{len(errors)} 项原样保留，本轮改动已整轮丢弃'
+                       f'（宁可不修，也不把阶梯改坏）。请对着证据帧人工核对这几拍。')
+            else:
+                msg = ('这条阶梯没有硬伤可修，什么都没有改动。'
+                       + (f'剩下的 {len(warns)} 项是待人工确认的工艺项，'
+                          f'按「✨ 工艺精修」才会动它们。' if warns else ''))
             on_progress('replica_stage', {
                 'stage': state.get('stage'),
-                'message': ('这条阶梯没有硬伤可修，什么都没有改动。'
-                            + (f'剩下的 {len(warns)} 项是待人工确认的工艺项，'
-                               f'按「✨ 工艺精修」才会动它们。' if warns else '')),
+                'message': msg,
                 'beats': fixed_doc,
                 'validation': state.get('validation') or [],
             })

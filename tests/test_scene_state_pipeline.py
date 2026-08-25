@@ -111,19 +111,62 @@ def test_reverse_engineered_ladders_may_keep_temporary_objects_through_furnishin
     beat2 = _beat(2, "furnishing")
     states = build_scene_states([beat1, beat2])
     assert not any("temporary construction objects" in e
-                   for e in validate_scene_states(states, allow_lingering_temporaries=True))
+                   for e in validate_scene_states(states, reverse_engineered=True))
 
 
-def test_the_replica_exemption_is_scoped_to_that_one_rule():
-    """豁免只放清场那一条。状态账自身对不对得上（时序、重复移除、持久件不得拆除）
-    与题材来源无关，复刻单错了照样是错。"""
+def test_reverse_engineered_ladders_may_remove_a_persistent_structural_element():
+    """2026-08-25 修复：复刻线同样豁免「持久结构件不得拆除」。
+
+    真实事故是一单 17 拍的复刻在"起掉自己先铺的 OSB 结构底板"上被判死。这条与清场
+    那条是同一类判断——审施工纪律，不审状态账（先 introduce 后 remove 在账上自洽）。
+    无论原片真是先铺后起，还是转录时把"被面层盖住"写成了 removed_objects，让用户回去
+    手改一份 1:1 转录都不是修复。
+    """
+    beat1 = _beat(1, "covering")
+    beat1["introduced_objects"] = ["18mm OSB-3 structural wood-strand subfloor panels"]
+    beat2 = _beat(2, "clearing")
+    beat2["removed_objects"] = ["18mm OSB-3 structural wood-strand subfloor panels"]
+    states = build_scene_states([beat1, beat2])
+    assert not any("persistent structural element" in e
+                   for e in validate_scene_states(states, reverse_engineered=True))
+
+
+def test_waived_discipline_rules_are_still_reported_as_advisories():
+    """豁免不等于观察被丢掉：两条纪律判据照旧写进 advisories，只是不拦单。"""
     beat1 = _beat(1, "installation")
-    beat1["introduced_objects"] = ["marble archway"]
+    beat1["introduced_objects"] = ["scaffolding", "marble archway"]
     beat2 = _beat(2, "covering")
     beat2["removed_objects"] = ["marble archway"]
+    beat3 = _beat(3, "furnishing")
+    advisories: list[str] = []
+    errors = validate_scene_states(build_scene_states([beat1, beat2, beat3]),
+                                   reverse_engineered=True, advisories=advisories)
+    assert errors == []
+    assert any("persistent structural element" in x for x in advisories)
+    assert any("temporary construction objects" in x for x in advisories)
+
+
+def test_the_replica_exemption_is_scoped_to_the_two_discipline_rules():
+    """豁免只放施工纪律那两条。状态账自身对不对得上（时序、before 承接、重复移除）
+    与题材来源无关，复刻单错了照样是错。"""
+    beat1 = _beat(1, "clearing")
+    beat1["removed_objects"] = ["mystery cabinet"]
+    beat2 = _beat(2, "clearing")
+    beat2["removed_objects"] = ["mystery cabinet"]
     errors = validate_scene_states(build_scene_states([beat1, beat2]),
-                                   allow_lingering_temporaries=True)
-    assert any("persistent structural element" in error for error in errors)
+                                   reverse_engineered=True)
+    assert any("again without a fresh introduction" in error for error in errors)
+
+
+def test_temporary_naming_wins_over_a_persistent_substring_cue():
+    """名字里带 floor 的防护耗材不是结构件："floor protection dust sheet" 该按临时态
+    走清场，不该被锁成"铺了就不许拆"。"""
+    beat1 = _beat(1, "installation")
+    beat1["introduced_objects"] = ["floor protection dust sheet"]
+    beat2 = _beat(2, "covering")
+    beat2["removed_objects"] = ["floor protection dust sheet"]
+    errors = validate_scene_states(build_scene_states([beat1, beat2]))
+    assert not any("persistent structural element" in error for error in errors)
 
 
 def test_scene_state_allows_persistent_and_cleared_temporary_objects_through_full_flow():

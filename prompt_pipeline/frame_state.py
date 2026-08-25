@@ -16,6 +16,48 @@ from .scene_state import PERSISTENT_STRUCTURAL_CUES, scrub_planning_annotations
 
 TRANSITION_OPERATIONS = {"threshold", "reward", "reframe"}
 
+# cast_action 是**一拍**的身体动线，写的是「先 A、然后 B」（'stands atop ladder grinding
+# overhead beams, then crouches grinding floor grid welds'）。VIDEO 要的就是这条动线，
+# 但 IMAGE 是一张静帧，渲不出「先 A 然后 B」——模型必须二选一，而上一帧正作为锚点参考图
+# 摆在它面前，最省力的一选就是「照抄上一帧那个人」。2026-08-25 实测（run_replica_06edb…
+# 河畔观景室）交付出来的正是这个：IMG 011-015 背景从毛石换到成品木地板，人物贴图五帧
+# 像素级重合。所以 IMAGE 侧只取动线**落点**那一段——与 _beat_block_text 的
+# "this beat's IMAGE shows them settled in that pose" 是同一个口径。
+_CAST_SEQUENCE_RE = re.compile(r',?\s+(?:and\s+)?then\s+', re.IGNORECASE)
+
+
+def _settled_cast_pose(cast: str) -> str:
+    """The pose a beat's cast LANDS in — the last leg of its 'A, then B' motion line."""
+    legs = [leg.strip(" ,;") for leg in _CAST_SEQUENCE_RE.split(_text(cast)) if leg.strip(" ,;")]
+    return legs[-1] if legs else _text(cast)
+
+
+# 「他们不碰活儿」是**微缩线专有**的规则（composers/miniature.py 第 2 节："They watch;
+# they never build"：施工全部由画外的巨人手完成，人偶只是住户）。复刻线的工人本人就是
+# 施工者，对着 'crouches grinding floor grid welds' 再写一句 never touching the work，
+# 是在同一句话里给模型两条互斥指令——而它手上正拿着上一帧当参考图，化解矛盾最省力的
+# 办法就是两条都不执行、把人原样搬过来。
+#
+# compile_delta_image_prompt 只收得到 beat，拿不到 profile（apply_proactive_fixes 的
+# family 是 interior/exterior，不是线别），所以判据取自 cast 文本自身：它描述了对活儿的
+# 接触，这句就是假的，不写；写的是旁观动线才写。两条线的实际取值分得开——微缩线是
+# 'get up off the stone and turn to face the new wall'（无工具无施工动词），复刻线是
+# 'crouches grinding floor grid welds'。拿不准时按「不写」走：漏掉一句真约束，比写进
+# 一句假约束便宜。
+_CAST_TOUCHES_WORK_RE = re.compile(
+    r'\b(?:grind\w*|weld\w*|shovel\w*|dig\w*|rake\w*|spray\w*|paint\w*|prime\w*|saw\w*|cut\w*|'
+    r'nail\w*|screw\w*|drill\w*|hammer\w*|trowel\w*|plaster\w*|tile\w*|lay\w*|laid|install\w*|'
+    r'fit\w*|fasten\w*|mount\w*|attach\w*|seal\w*|glue\w*|sand\w*|smooth\w*|screed\w*|float\w*|'
+    r'unroll\w*|roll\w*|stuff\w*|press\w*|push\w*|lift\w*|carr\w*|haul\w*|place\w*|set\w*|'
+    r'align\w*|click\w*|trim\w*|clamp\w*|solder\w*|wire\w*|pour\w*|mix\w*|brush\w*|scrape\w*|'
+    r'sweep\w*|blow\w*|clean\w*|clear\w*|strip\w*|panel\w*|board\w*|batt\w*|plank\w*)\b',
+    re.IGNORECASE)
+
+
+def _cast_is_bystander(cast: str) -> bool:
+    """True when the cast text describes watching/moving, not working the build."""
+    return not _CAST_TOUCHES_WORK_RE.search(_text(cast))
+
 # "这个面又变回生料/裸露了" 的措辞。只认字面词是不够的：一句完工描述里出现这些词，
 # 十有八九是被否定掉的（"…with no bare subfloor left exposed"、"…with no bare patches
 # remaining"），那恰恰是**完工**的说法，不是回退。2026-08-06 实测：兜底梯子的
@@ -363,7 +405,7 @@ def compile_delta_image_prompt(
     milestone = _text(beat.get("milestone_name"))
     after = _text(beat.get("after_state"))
     extent = _text(beat.get("completion_extent"))
-    cast = _text(beat.get("cast_action"))
+    cast = _settled_cast_pose(beat.get("cast_action"))
     traces = [_text(x) for x in (beat.get("persistent_traces") or []) if _text(x)][:3]
 
     # 白名单里必须有 cast_action。2026-08-23 实测：这一步把 composer 写的正文整段丢掉、
@@ -378,17 +420,34 @@ def compile_delta_image_prompt(
     blocks = {
         'preserve': f"Inherited state remains unchanged: {preserve}." if preserve else '',
         'delta': f"Only visible construction delta in this frame: {milestone}.",
-        'cast': (f"Cast in frame: {cast} — same identity, costume and scale as before, "
-                 f"never touching the work.") if cast else '',
+        # 「同一个人」与「同一个姿势」是两件事，这一句必须两边都写。只写前半句的后果
+        # 是确定的：2026-08-25 实测那条河畔片里，工人不是 primary_landmark，于是
+        # _canonical_anchor_clause 那句 "free to take a new pose and a new spot this frame"
+        # （活物锚点专有）根本没机会出现，整张提示词里关于人的指令只剩「同一身份、同样
+        # 穿着、同样大小」——纯粹的保持一致，配上上一帧当参考图，交付出来就是五帧同一张
+        # 人物贴图。放开姿态的配重不能只挂在锚点那条路上：画面里有活物就得给。
+        'cast': (f"Cast in frame: {cast} — same identity, costume and scale as before, but a "
+                 f"visibly different pose and position from the previous frame, never that "
+                 f"posture copied over"
+                 f"{', and never touching the work' if _cast_is_bystander(cast) else ''}."
+                 ) if cast else '',
         'after': f"Completed terminal state: {after}." if after else '',
         'extent': f"Completion extent: {extent}." if extent else '',
         'traces': (f"Visible physical evidence remains: {', '.join(traces)}."
                    if traces else ''),
         # 防倒退与净帧原本是分开的两句（共三十词）。人偶姿态句进白名单后 180 词的硬顶
         # 塞不下，合并成一句省下七个词——两条约束一条不少，只是不再各占一句。
+        # 「no active construction」这一条的本意是「别把下一阶段的施工画进来、别让在建
+        # 状态糊掉本帧要读的那个完成度」。但 cast 本身就在施工时（复刻线），它跟上面那句
+        # Cast in frame 是字面冲突的：一句要求画出这个人在磨焊缝，一句要求画面里没有施工。
+        # 模型只能二选一，而参考图就在手边——于是两句都不执行，人照抄上一帧。所以 cast
+        # 动手时把这一条收窄到「除上面那一个姿态之外」，本意一字不少，冲突消掉。
         'guard': ("One clean documentary photograph: no unrelated work, no later-stage result, "
-                  "no regression of any previously completed feature, no active construction, "
-                  "no text artifacts."),
+                  "no regression of any previously completed feature, "
+                  + ("no active construction"
+                     if (not cast or _cast_is_bystander(cast))
+                     else "no construction activity beyond the single cast pose stated above")
+                  + ", no text artifacts."),
     }
     order = ['preserve', 'delta', 'cast', 'after', 'extent', 'traces', 'guard']
     drop_order = ['traces', 'extent', 'after', 'preserve']

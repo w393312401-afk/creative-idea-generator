@@ -134,12 +134,134 @@ const REPLICA_CAMERA_MOVES = [
     ['crane', '升降'],
 ];
 
+// 节拍字段的元数据。此前每个字段的说明文是直接写死在 label 里的一整段话（30~90 字），
+// 22 个字段加起来 1400 多字常驻在卡片上——说明文的字数是数据本身的 5~10 倍，人要在
+// 一屏里找一个值，得先跳过一屏的教程。文案一个字没改，只是从「常驻」挪到了「按需」：
+//   name  卡片上常驻的短名（2~5 字）
+//   help  完整说明，收进短名后面那枚 ⓘ，悬停/聚焦才出
+//   count [min, max] 条数约束；渲染成右上角的小徽章，越界变红。此前它混在说明文里
+//         （「须 3~6 条；当前 4 条」），是说明不是状态，越界了也不会变色
+//   group 分到哪一组：fact 画面事实 / state 状态与痕迹 / shot 拍摄与声音 / more 更多
+//   rows  textarea 初始行数（浏览器不支持 field-sizing 时的回退值）
+const REPLICA_FIELD_META = {
+    space: {
+        name: '所在空间', group: 'fact', rows: 1,
+        help: '同一个空间逐字沿用同一个名字；换名字＝机位穿过开口进了另一个空间，会多出一次过门。',
+    },
+    macro_environment: {
+        name: '大环境', group: 'fact', rows: 2,
+        help: '地貌水体、气候光照、空间包络；一行一条。只写这地方本来长什么样，本拍挖出来/砌起来的东西写进起始状态。',
+    },
+    operation: {
+        name: '主导工序', group: 'fact', rows: 1,
+        help: '1~3 个词的里程碑工序词，如「吊装就位 / seat bus」；别写成带宾语的整句，合成器拿它做相位判定。',
+    },
+    package_operations: {
+        name: '工序包', group: 'fact', rows: 2, count: [2, 3],
+        help: '一行一道，须 2~3 道。',
+    },
+    visible_details: {
+        name: '细节识别项', group: 'fact', rows: 2, count: [3, 6],
+        help: '一行一条，须 3~6 条、建议顶到 5~6。每条＝材料+颜色/质感/状态+位置；别复述大环境或遗留痕迹。',
+    },
+    visible_action: {
+        name: '可见动作', group: 'fact', rows: 2,
+        help: '这一拍里眼睛能看见的工序动作本身。',
+    },
+    cast_action: {
+        name: '人物动作神情', group: 'fact', rows: 2,
+        help: '写「从上一拍的什么姿态、动到这一拍的什么姿态」：起身、转向、上前半步、蹲下去看、抬手指。'
+            + '别写「还站在原地/保持原样」——那是站位不是动作，下游会把它原样写进每一帧的图，交付出来就是一动不动的小人。'
+            + '别把可见动作再写一遍：那一栏是工序，这一栏是人。真的几乎没动，就写那个最小的真实变化。',
+    },
+    visible_result: {
+        name: '可见结果', group: 'state', rows: 2,
+        help: '这一下看见了什么：车体沉下去、吊索由紧转松。',
+    },
+    state_before: {
+        name: '起始状态', group: 'state', rows: 2,
+        help: '写「量」不是写「样」：范围/比例/齐平关系/高度差。',
+    },
+    state_after: {
+        name: '结束状态', group: 'state', rows: 2,
+        help: '完成到哪儿，须带一个量，别把可见结果再写一遍。',
+    },
+    persistent_traces: {
+        name: '遗留痕迹', group: 'state', rows: 2, count: [2, null],
+        help: '一行一条，须 ≥2 条。只写本拍新留下的痕迹＋它落在哪个面上，原本就有的落叶青苔不算。',
+    },
+    light_state: {
+        name: '光照时段', group: 'state', rows: 1,
+        help: '如「阴天正午、无投影」；延时片跨天，不逐拍声明光就会自己跳。',
+    },
+    subject_placement: {
+        name: '主体构图', group: 'shot', rows: 2,
+        help: '主体在画面左/中/右、上/下，占画面高度几分之几，地平线在第几分。'
+            + '锚点的位置与占比此前从没在原片上量过，全靠这一栏。分数写汉字，别写数字和百分号。',
+    },
+    tool: {
+        name: '主导工具', group: 'shot', rows: 1,
+        help: '动作峰值上那一件：吊车 / 冲击钻 / 橡胶锤。三联绑定的一环，塞在动作句里合成器读不出来。',
+    },
+    sfx: {
+        name: '本拍声音', group: 'shot', rows: 2, count: [1, 3],
+        help: '一行一个声源，1~3 条。原声物理音，绝不写配乐——交付口径是 ASMR 60% / BGM 0%。',
+    },
+    material_specs: {
+        name: '材料规格', group: 'more', rows: 2, count: [null, 3],
+        help: '一行一条，≤3 条。写「多厚、什么等级、什么面」——9mm OSB 哑光面 / 2x4 SPF 龙骨；'
+            + '细节识别项那一栏写的是「什么料、什么颜色、在哪儿」，别重复。',
+    },
+    fastening_and_bonding: {
+        name: '紧固与粘接', group: 'more', rows: 2, count: [null, 3],
+        help: '一行一条，≤3 条。沉头自攻钉 / 发泡胶封缝 / 结构胶。'
+            + '它决定接缝长什么样，也决定本拍那一下是拧、是钉还是挤。',
+    },
+    micro_traces: {
+        name: '微观痕迹', group: 'more', rows: 2, count: [null, 3],
+        help: '一行一条，≤3 条。细木屑、铅笔弹线、过喷飞溅。'
+            + '与遗留痕迹分工：那一栏必须被后续帧继承，这一栏不要求。',
+    },
+    tool_specifics: {
+        name: '工具具体型号', group: 'more', rows: 1,
+        help: '哪一种、怎么驱动、在用什么刀头批头：18V 无刷冲击钻＋磁性批头 / 气动排钉枪 / 不锈钢齿口抹刀。'
+            + '主导工具那一栏答「是什么工具」，这一栏答「是哪一种」。',
+    },
+    material_flow: {
+        name: '物料去向', group: 'more', rows: 1,
+        help: '挖出来的土去哪了 / 耗掉的料从哪来。',
+    },
+    insert_subject: {
+        name: '插入镜主体', group: 'more', rows: 1,
+        help: '原片这一拍切进特写时拍的是什么，如「镊子尖压住的那片瓦」。'
+            + '空着就落回通用职责——工具接触点/持久痕迹，那是任何一拍都能写的话。',
+    },
+    visual_subject: {
+        name: '画面主体', group: 'more', rows: 1,
+        help: '派生字段：只在可见动作与可见结果都空着时兜底，另供自动标题取主语；平时不必改。',
+    },
+};
+
+// 闭集参数压成一行：这七个都是从固定表里选一个值，此前每个都占一整格
+// （一行短名 + 一个全宽下拉），七个格子就是半张卡片的高度。改成内联「短名：值」
+// 胶囊，同样的信息占一行多一点。顺序按拍摄时真的会一起决定的先后：先景别、
+// 再机位、再镜头、最后时间处理。
+const REPLICA_SHOT_PARAMS = [
+    ['shot_scale', '景别', REPLICA_SHOT_SCALES, '这一拍是远景还是特写'],
+    ['camera_angle', '角度', REPLICA_CAMERA_ANGLES, '垂直：机位在主体的上方还是下方'],
+    ['camera_bearing', '方位', REPLICA_CAMERA_BEARINGS, '水平：镜头对着主体的哪一面'],
+    ['lens_feel', '焦段', REPLICA_LENS_FEELS, '多广的镜头，跟景别是两件事'],
+    ['camera_move', '运镜', REPLICA_CAMERA_MOVES, '机位在这一拍里怎么动'],
+    ['time_treatment', '时间', REPLICA_TIME_TREATMENTS, '这一拍是加速的还是原速的'],
+];
+
 let replicaActivePreset = 'custom';
 let replicaAiIdeas = [];
 let replicaActiveIdeaIndex = -1;
 let replicaDivergeBrief = '';
 let replicaDiverging = false;
 let replicaComparatorOpen = false;
+let replicaHelpScrollBound = false;
 let replicaBeatFoldState = {};
 // 节拍卡片**内部**那些 <details> 的开合，键是 `${beat.id}:${字段名}`。
 // 服务端会在拆合拍后重排 id，所以它必须跟 replicaBeatFoldState 在同一时刻清空——
@@ -404,6 +526,48 @@ function replicaRoot() {
     return document.getElementById('replica-root');
 }
 
+// 字段说明的浮层。单例，挂在 body 上而不是字段里：卡片有自己的圆角与溢出裁剪，
+// 说明文塞在格子里要么被裁掉一半，要么把那一格撑高、把整行推下去。
+function replicaHelpTip() {
+    let tip = document.getElementById('replica-help-tip');
+    if (!tip) {
+        tip = document.createElement('div');
+        tip.id = 'replica-help-tip';
+        tip.className = 'replica-help-tip';
+        tip.setAttribute('role', 'tooltip');
+        document.body.appendChild(tip);
+    }
+    return tip;
+}
+
+// 中文对照的开合。默认关：英文才是送去合成的事实源，中文只在核对时才需要，
+// 而它此前是全卡最跳的一层颜色、还占掉每一格三分之一的高度。
+function replicaZhMirrorOn() {
+    try {
+        return localStorage.getItem('replica_zh_mirror') === '1';
+    } catch (e) {
+        return false;
+    }
+}
+
+function replicaSetZhMirror(on) {
+    try {
+        localStorage.setItem('replica_zh_mirror', on ? '1' : '0');
+    } catch (e) { /* 隐私模式下存不住，本次会话内照常生效 */ }
+    replicaApplyZhMirror();
+}
+
+function replicaApplyZhMirror() {
+    const root = replicaRoot();
+    if (!root) return;
+    const on = replicaZhMirrorOn();
+    root.classList.toggle('replica-show-zh', on);
+    root.querySelectorAll('[data-zh-toggle]').forEach(btn => {
+        btn.textContent = on ? '中文对照 ✓' : '中文对照';
+        btn.setAttribute('aria-pressed', String(on));
+    });
+}
+
 // 这一页真正的滚动容器。全站在任何宽度下都是「单面板 + 面板内滚动」，window 从不滚动
 // （见 css/app/base.css 的 .app-main 与 panels-tabs.css 的 .glass-panel 手机规则）——
 // 所以任何存位/还位/滚动监听都必须挂在它身上，用 window.scrollY 得到的恒为 0。
@@ -426,7 +590,8 @@ function replicaRenderFloatingTools() {
     </div>`;
 }
 
-// 吸顶区段导航。
+// 右侧悬浮区段导航（Notion 目录式：页面右侧竖直居中，收起时只有一列短横线，
+// 悬停/聚焦展开成带文字的面板，样式见 css/app/replica.css）。
 //
 // 每一项的出现条件必须与「那一块到底渲不渲染」逐字一致——导航项指向一个不存在的
 // 锚点时，点它是彻底静默的：不滚动、不报错、不给任何反馈。所以这里的判据一律从
@@ -472,11 +637,13 @@ function replicaRenderNavBar(state) {
     if (!items.length) return '';
 
     return `
-    <nav class="replica-nav-bar" id="replica-nav-bar">
+    <nav class="replica-nav-bar" id="replica-nav-bar" aria-label="区段导航">
         <div class="replica-nav-scroll">
             ${items.map((item, idx) => `
-                <button type="button" class="replica-nav-item ${idx === 0 ? 'active' : ''}" data-nav-target="${item.id}">
-                    <span>${escapeHtmlReplica(item.label)}</span>
+                <button type="button" class="replica-nav-item ${idx === 0 ? 'active' : ''}" data-nav-target="${item.id}"
+                        title="${escapeHtmlReplica(item.label)}" aria-label="${escapeHtmlReplica(item.label)}">
+                    <span class="replica-nav-dash" aria-hidden="true"></span>
+                    <span class="replica-nav-label">${escapeHtmlReplica(item.label)}</span>
                     ${item.count ? `<span class="replica-nav-count">${item.count}</span>` : ''}
                     ${item.errors ? `<span class="replica-nav-badge-err">${item.errors}</span>` : ''}
                 </button>
@@ -1603,44 +1770,102 @@ function replicaHandleComposerEvent(type, detail) {
     replicaProgressUpdate(lo + (Number(out.percent) || 0) / 100 * (hi - lo), out.label);
 }
 
-function replicaRenderBeatTimeline(doc, state) {
+// 全片概览。此前这里是**两条**：一条「胶卷时间轴」（按时长比例排的块，块里写着
+// ID/阶段/起止时间/超长微拍标记），紧挨着一条「跳转 chip 条」（等宽小圆角，带
+// 错误/待确认/过门三种状态色）。两条回答的是同一个问题——有几拍、哪一拍有事、
+// 点它去那一拍——只是画法不同，加起来吃掉第一屏 147px，而且各缺一半信息：
+// 时间轴不知道哪一拍有硬伤，chip 条不知道哪一拍超长。
+//
+// 合并的办法不是二选一，是让两者各干一件事：
+//   · 比例条只回答「时间是怎么分配的」。块里一个字都不写——此前它按比例缩到
+//     48px 下限，却还要在里面塞三行文字（"B05" / "封板封闭" / "18s–22.5s (4.5s)"），
+//     30 拍往上那三行必然被截断，等于画了一条读不出内容的条。没有文字就没有下限
+//     问题，多少拍都成立。
+//   · chip 条只回答「哪一拍有事、点它去哪」。它等宽、能换行、状态色齐全，
+//     本来就是更好的跳轨控件。
+function replicaRenderLadderOverview(doc, errors, warns) {
     const beats = doc.beats || [];
     if (!beats.length) return '';
-    const totalDuration = doc.video_duration_sec || (beats[beats.length - 1] ? beats[beats.length - 1].end : 10) || 10;
+    const totalDuration = doc.video_duration_sec
+        || (beats[beats.length - 1] ? beats[beats.length - 1].end : 10) || 10;
     const speed = doc.speed_multiplier || (beats[0] && beats[0].speed_factor) || 2.0;
     const totalActionSec = (totalDuration * speed).toFixed(1);
-    
-    const blocks = beats.map((b, i) => {
-        const span = Math.max(0.1, ((b.end || 0) - (b.start || 0)));
-        const pct = Math.max(2, Math.min(100, (span / totalDuration) * 100));
-        const stage = b.stage || 'structural';
-        const label = REPLICA_BEAT_STAGE_LABELS[stage] || stage;
-        const aSec = (span * speed).toFixed(1);
-        const isTooLong = span > 6.0;
-        const isTooShort = span < 2.0;
-        const warnTag = isTooLong ? '<span class="replica-timeline-warn-tag is-toolong">⚠️超长</span>' : (isTooShort ? '<span class="replica-timeline-warn-tag is-tooshort">⚠️微拍</span>' : '');
 
-        return `
-        <div class="replica-timeline-block stage-${escapeHtmlReplica(stage)} ${isTooLong ? 'is-toolong' : ''} ${isTooShort ? 'is-tooshort' : ''}" style="width: ${pct.toFixed(1)}%;"
-             data-jump-beat="${escapeHtmlReplica(b.id)}" title="${escapeHtmlReplica(b.id)} (${b.start}s–${b.end}s, 2x等效动作 ${aSec}s): ${escapeHtmlReplica(label)} · ${escapeHtmlReplica(b.operation || '')}">
-            <div class="replica-timeline-block-id">${escapeHtmlReplica(b.id)} ${warnTag}</div>
-            <div class="replica-timeline-block-label">${escapeHtmlReplica(label)}</div>
-            <div class="replica-timeline-block-time">${b.start}s–${b.end}s <small class="replica-timeline-span">(${span.toFixed(1)}s)</small></div>
-        </div>`;
+    // 一拍的三种「有事」，比例条与 chip 条现在读的是同一份判断。
+    const flags = beats.map((b, i) => {
+        const span = Math.max(0.1, ((b.end || 0) - (b.start || 0)));
+        const prev = beats[i - 1];
+        return {
+            span,
+            isErr: errors.some(e => e.beat_id === b.id),
+            isWarn: warns.some(w => w.beat_id === b.id),
+            isCrossed: i > 0 && prev && prev.space && b.space
+                       && String(prev.space).toLowerCase() !== String(b.space).toLowerCase(),
+            isTooLong: span > 6.0,
+            isTooShort: span < 2.0,
+        };
+    });
+
+    const cls = (f, extra) => [
+        extra,
+        f.isErr ? 'is-error' : (f.isWarn ? 'is-warn' : ''),
+        f.isCrossed ? 'is-crossed' : '',
+        f.isTooLong ? 'is-toolong' : '',
+        f.isTooShort ? 'is-tooshort' : '',
+    ].filter(Boolean).join(' ');
+
+    const tip = (b, f) => {
+        const label = REPLICA_BEAT_STAGE_LABELS[b.stage] || b.stage || '';
+        const bits = [`${b.id} ${b.start}s–${b.end}s（${f.span.toFixed(1)}s，2x 等效动作 ${(f.span * speed).toFixed(1)}s）`];
+        if (label) bits.push(label);
+        if (b.operation) bits.push(b.operation);
+        if (f.isTooLong) bits.push('⚠️ 超长拍（>6.0s）');
+        if (f.isTooShort) bits.push('⚠️ 微拍（<2.0s）');
+        if (f.isCrossed) bits.push(`过门 → ${b.space}`);
+        if (f.isErr) bits.push('有硬伤');
+        else if (f.isWarn) bits.push('待人工确认');
+        return bits.join(' · ');
+    };
+
+    // 比例条。宽度仍按时长占比，但 flex-shrink:0 + min-width 让它在拍数多的时候
+    // 真的溢出、真的能横着滚，而不是把每一块继续压扁。
+    const segs = beats.map((b, i) => {
+        const f = flags[i];
+        // 减掉一格 gap：百分比之和恰好是 100%，再加上段间的 2px 就必然溢出，
+        // 于是每一份阶梯都挂着一条滚不出东西来的横向滚动条。
+        const pct = Math.max(0.6, Math.min(100, (f.span / totalDuration) * 100));
+        return `<button type="button" class="${cls(f, `replica-ladder-seg stage-${escapeHtmlReplica(b.stage || 'structural')}`)}"
+                style="width:calc(${pct.toFixed(2)}% - 2px)" data-jump-beat="${escapeHtmlReplica(b.id)}"
+                title="${escapeHtmlReplica(tip(b, f))}" aria-label="${escapeHtmlReplica(tip(b, f))}"></button>`;
     }).join('');
 
+    const chips = beats.map((b, i) => {
+        const f = flags[i];
+        return `<button type="button" class="${cls(f, 'replica-beat-jump-chip')}"
+                data-jump-beat="${escapeHtmlReplica(b.id)}" title="${escapeHtmlReplica(tip(b, f))}"
+                ><span>${escapeHtmlReplica(b.id)}</span>${f.isErr ? '<span class="dot-err">●</span>' : ''}</button>`;
+    }).join('');
+
+    const tooLong = flags.filter(f => f.isTooLong).length;
+    const tooShort = flags.filter(f => f.isTooShort).length;
+    const rhythmNote = (tooLong || tooShort)
+        ? `<span class="replica-overview-flag">${[
+            tooLong ? `${tooLong} 拍超长` : '', tooShort ? `${tooShort} 拍微拍` : ''
+          ].filter(Boolean).join(' · ')}</span>` : '';
+
     return `
-    <div class="replica-beat-timeline-wrap">
-        <div class="replica-timeline-header">
-            <span class="replica-timeline-title">🎬 节拍胶卷时间轴（共 ${beats.length} 拍 · 屏幕 ${totalDuration.toFixed(1)}s | 2x 等效动作 ${totalActionSec}s）</span>
-            <div class="replica-timeline-header-actions">
-                <button type="button" id="replica-autobalance-btn" class="action-btn text-btn replica-mini-btn" title="根据 2x 倍速时序规则自动拆解 >6.0s 超长拍并合并微拍">⚡ 自动平衡秒数/拆拍</button>
-                <span class="replica-timeline-hint">点击时间块可快速定位对应拍</span>
-            </div>
+    <div class="replica-ladder-overview">
+        <div class="replica-overview-head">
+            <span class="replica-overview-title">🎬 ${beats.length} 拍 · 屏幕 ${totalDuration.toFixed(1)}s · 2x 等效动作 ${totalActionSec}s</span>
+            ${rhythmNote}
+            <span class="replica-overview-actions">
+                <button type="button" id="replica-autobalance-btn" class="action-btn text-btn replica-mini-btn"
+                        title="根据 2x 倍速时序规则自动拆解 >6.0s 超长拍并合并微拍">⚡ 自动平衡秒数/拆拍</button>
+                <button type="button" id="replica-toggle-fold-all" class="action-btn text-btn replica-mini-btn">全部折叠 / 全部展开</button>
+            </span>
         </div>
-        <div class="replica-timeline-track">
-            ${blocks}
-        </div>
+        <div class="replica-ladder-bar" role="group" aria-label="节拍时长比例条，点一段跳到那一拍">${segs}</div>
+        <div class="replica-ladder-chips" role="group" aria-label="节拍跳转">${chips}</div>
     </div>`;
 }
 
@@ -1689,36 +1914,7 @@ function replicaRenderBeats(state) {
         </p>
         ${replicaShotRhythmLine(doc)}
         ${banner}
-        ${replicaRenderBeatTimeline(doc, state)}
-
-        <!-- 节拍快速跳轨与折叠控制条 -->
-        <div class="replica-beat-jump-bar">
-            <div class="replica-beat-jump-controls">
-                <div class="replica-fold-toggle">
-                    <button type="button" id="replica-toggle-fold-all" class="action-btn text-btn replica-mini-btn">
-                        全部折叠 / 全部展开
-                    </button>
-                </div>
-                <div class="replica-beat-jump-chips-wrap">
-                    ${(doc.beats || []).map((b, i) => {
-                        const isErr = errors.some(e => e.beat_id === b.id);
-                        const isWarn = !isErr && warns.some(w => w.beat_id === b.id);
-                        const isCrossed = i > 0 && doc.beats[i-1].space && b.space && doc.beats[i-1].space.toLowerCase() !== b.space.toLowerCase();
-                        const cls = [
-                            'replica-beat-jump-chip',
-                            isErr ? 'is-error' : '',
-                            isWarn ? 'is-warn' : '',
-                            isCrossed ? 'is-crossed' : '',
-                        ].filter(Boolean).join(' ');
-                        return `<button type="button" class="${cls}" data-jump-beat="${escapeHtmlReplica(b.id)}" title="${escapeHtmlReplica(b.id)}: ${escapeHtmlReplica(b.operation || '')}">
-                            <span>${escapeHtmlReplica(b.id)}</span>
-                            ${isErr ? '<span class="dot-err">●</span>' : ''}
-                        </button>`;
-                    }).join('')}
-                </div>
-            </div>
-        </div>
-
+        ${replicaRenderLadderOverview(doc, errors, warns)}
         ${replicaRenderTimeWindows(doc)}
         <div class="replica-beats">${cards}</div>
         <div class="replica-section">
@@ -1730,11 +1926,17 @@ function replicaRenderBeats(state) {
         ${/* 这一排只放别处没有的动作：保存与合成已经常驻吸底操作栏
               （replicaRenderBottomBar）。同一个动作在一屏之内出现两次，用户得先
               判断这两个是不是同一个按钮才敢点。 */''}
+        ${/* 「AI 修复硬伤」与「自动平衡秒数/拆拍」此前在这一排里各有一份，而它们
+              在别处已经各有一份了：修复挂在硬伤横幅上（硬伤清单就列在那里），平衡挂在
+              比例条头部（超长/微拍的标记就画在那里）。同一个动作在一屏之内出现两次，
+              用户得先判断这两个是不是同一个按钮才敢点——这条纪律保存与合成一直守着，
+              这两个漏了。
+              修复按钮同时还犯了另一条：0 硬伤时横幅里没有它，这一排里却还摆着一枚，
+              点下去无事发生。本文件里已有同款判断——「摆一个点了必然报错的按钮比不摆
+              更糟」（见下面撤销按钮的条件渲染）。现在它只在有硬伤时、只在硬伤旁边出现。 */''}
         <div class="replica-actions">
-            <button type="button" id="replica-autofix-btn" class="action-btn text-btn" title="调用 AI 根据工序依赖与因果逻辑自动修正硬伤">🪄 AI 修复硬伤</button>
             <button type="button" id="replica-refine-craft-btn" class="action-btn text-btn"
                     title="看着证据帧把每一拍的措辞写准：补位置锚、补完成量、拆开结果与状态、补工具/声音/景别/运镜/光照/物料。画面上发生了什么一个字不动，1:1 不受影响。已有的合成提示词会作废，需要重新合成。">✨ 工艺精修（不动 1:1）</button>
-            <button type="button" id="replica-actions-autobalance-btn" class="action-btn text-btn" title="按 2x 倍速时序规则自动拆解 >6.0s 超长拍并合并微拍">⚡ 自动平衡秒数/拆拍</button>
             <button type="button" id="replica-recluster-btn" class="action-btn text-btn"
                     title="帧事实走缓存，不会重付视觉调用的钱">重跑聚类</button>
             <button type="button" id="replica-translate-btn" class="action-btn text-btn"
@@ -1931,10 +2133,18 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
     // 来回动作，每看一帧就多一个标签页，用户得自己收拾一地窗口才能回到编辑器。
     // 灯箱走全局的那一份（js/lightbox.js）：点空白处 / Esc / 关闭键都能返回，
     // 同一拍的多张帧还能左右翻。
+    // 缩略图外面包一枚 button。此前它是裸 <img>：能点、能开灯箱，但键盘走不到——
+    // 整页 152 个可点元素里有 120 个是这种（另 30 个是旧时间轴的 <div>）。这一页的
+    // 校验横幅早就把「可点的东西是 button」做对了，缩略图只是漏了。
+    // data-* 跟着搬到 button 上，绑定那边按属性查、从同一个元素读 dataset，不受影响。
     const thumbs = frames.map((name, at) => `
-        <img class="replica-thumb" src="${replicaFrameUrl(state, name)}"
-             alt="${escapeHtmlReplica(name)}" title="${escapeHtmlReplica(name)}" loading="lazy"
-             data-lightbox-beat="${idx}" data-lightbox-at="${at}">`).join('');
+        <button type="button" class="replica-thumb-btn"
+                data-lightbox-beat="${idx}" data-lightbox-at="${at}"
+                title="${escapeHtmlReplica(name)}"
+                aria-label="放大证据帧 ${at + 1}／${frames.length}：${escapeHtmlReplica(name)}">
+            <img class="replica-thumb" src="${replicaFrameUrl(state, name)}"
+                 alt="" loading="lazy">
+        </button>`).join('');
 
     // 覆盖帧：按时间均分铺满整个拍窗（后端 attach_coverage_frames 算好的）。证据帧
     // 最多三张，一拍 10s 的窗光看那三张等于中段全黑；这一排是拿来看「这段时间里
@@ -1942,9 +2152,13 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
     const coverage = beat.coverage_frames || [];
     const coverageThumbs = coverage.map((item, at) => `
         <figure class="replica-cov-item">
-            <img class="replica-thumb replica-thumb-cov" src="${replicaFrameUrl(state, item.frame)}"
-                 alt="${escapeHtmlReplica(item.frame)}" title="${escapeHtmlReplica(item.frame)}"
-                 loading="lazy" data-cov-beat="${idx}" data-cov-at="${at}">
+            <button type="button" class="replica-thumb-btn"
+                    data-cov-beat="${idx}" data-cov-at="${at}"
+                    title="${escapeHtmlReplica(item.frame)}"
+                    aria-label="放大覆盖帧 ${item.timestamp}s：${escapeHtmlReplica(item.frame)}">
+                <img class="replica-thumb replica-thumb-cov" src="${replicaFrameUrl(state, item.frame)}"
+                     alt="" loading="lazy">
+            </button>
             <figcaption class="replica-cov-time">${item.timestamp}s</figcaption>
         </figure>`).join('');
 
@@ -1957,20 +2171,53 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
         return text ? `<span class="replica-field-zh">${escapeHtmlReplica(text)}</span>` : '';
     };
 
-    const field = (key, label, rows = 1) => `
-        <label class="replica-field">
-            <span class="replica-field-label">${label}</span>
-            <textarea class="replica-textarea" rows="${rows}" data-beat="${idx}" data-key="${key}"
+    // 条数徽章。以前这是说明文里的一句话（「须 3~6 条；当前 4 条」），越界了也还是
+    // 同一行灰字——是说明，不是状态。拆出来放右上角，越界就变红，扫一眼卡片能看出
+    // 哪一栏没写够。
+    const countBadge = (key, meta) => {
+        if (!meta.count) return '';
+        const [min, max] = meta.count;
+        const n = Array.isArray(beat[key])
+            ? beat[key].length
+            : String(beat[key] || '').split('\n').map(s => s.trim()).filter(Boolean).length;
+        const bad = (min && n < min) || (max && n > max);
+        const rule = min && max ? `须 ${min}~${max} 条` : (min ? `须 ≥${min} 条` : `≤${max} 条`);
+        return `<span class="replica-field-count${bad ? ' is-bad' : ''}"
+                      title="${rule}（当前 ${n} 条）">${n}${max ? `/${max}` : ''}</span>`;
+    };
+
+    // 一格字段：短名 + ⓘ + 条数徽章 + 输入框 + 中文对照。
+    // 外层不再是 <label>——ⓘ 是个 button，交互元素嵌在 label 里既不合法，点它还会
+    // 顺带把焦点扔进 textarea。改成 div + for/id 显式关联，可访问性没有丢。
+    // helpOverride：大环境识别项按「首拍 / 过门拍 / 其余」三种情形说三句不同的话，
+    // 那三句话本来就是写死在 label 里的，这里保留同一套措辞，只是换个位置出现。
+    const field = (key, helpOverride) => {
+        const meta = REPLICA_FIELD_META[key] || { name: key, help: '', rows: 2 };
+        const help = helpOverride || meta.help || '';
+        const id = `replica-f-${idx}-${key}`;
+        return `
+        <div class="replica-field">
+            <div class="replica-field-top">
+                <label class="replica-field-label" for="${id}">${escapeHtmlReplica(meta.name)}</label>
+                ${help ? `<button type="button" class="replica-field-help" tabindex="-1"
+                        data-help="${escapeHtmlReplica(help)}"
+                        aria-label="${escapeHtmlReplica(`${meta.name}：${help}`)}">?</button>` : ''}
+                ${countBadge(key, meta)}
+            </div>
+            <textarea class="replica-textarea" id="${id}" rows="${meta.rows || 2}"
+                      data-beat="${idx}" data-key="${key}"
                 >${escapeHtmlReplica(Array.isArray(beat[key]) ? beat[key].join('\n') : beat[key])}</textarea>
             ${mirror(key)}
-        </label>`;
+        </div>`;
+    };
 
     // 闭集字段。收下拉不收输入框，理由见 REPLICA_SHOT_SCALES 上方那段注释。
-    const selectField = (key, label, options) => {
+    // 一枚胶囊 = 一个「短名：值」，横向流式排；不再一人占一整格。
+    const paramPill = (key, label, options, title) => {
         const current = String(beat[key] || '');
         return `
-        <label class="replica-field">
-            <span class="replica-field-label">${label}</span>
+        <label class="replica-param" title="${escapeHtmlReplica(title || label)}">
+            <span class="replica-param-label">${escapeHtmlReplica(label)}</span>
             <select class="replica-select" data-beat="${idx}" data-key="${key}">
                 ${options.map(([value, text]) => `
                     <option value="${escapeHtmlReplica(value)}"${value === current ? ' selected' : ''}
@@ -1981,12 +2228,12 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
 
     // 人数。空着 = 没标注（保留 workers_present 那枚布尔芯片的旧口径）；填了数就以数为准，
     // 后端 normalize_beat_craft_fields 会据此回写 workers_present，两处不会打架。
-    const numberField = (key, label) => `
-        <label class="replica-field">
-            <span class="replica-field-label">${label}</span>
+    const workerPill = () => `
+        <label class="replica-param" title="画面里有几个人。0＝清场帧（锚点候选）；空着＝没标注">
+            <span class="replica-param-label">工人数</span>
             <input class="replica-number" type="number" min="0" max="12" step="1"
-                   data-beat="${idx}" data-key="${key}" data-num="1"
-                   value="${typeof beat[key] === 'number' ? beat[key] : ''}">
+                   data-beat="${idx}" data-key="worker_count" data-num="1"
+                   value="${typeof beat.worker_count === 'number' ? beat.worker_count : ''}">
         </label>`;
 
     // 卡片**内部**那几块 <details> 的开合。此前完全没记过，而 replicaRefreshBeats 会在
@@ -2022,20 +2269,51 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
         ? beat.macro_environment.length > 0
         : Boolean(String(beat.macro_environment || '').trim());
 
-    let macroEnvField = '';
-    if (isFirstBeat) {
-        macroEnvField = field('macro_environment', '大环境识别项（锚点首拍必填：地貌水体、气候光照、空间包络；一行一条。只写这地方本来长什么样，本拍挖出来/砌起来的东西写进起始状态）', 2);
-    } else if (isThreshold) {
-        macroEnvField = field('macro_environment', '大环境识别项（过门新空间首拍：新空间地貌、气候光照、空间三维包络；一行一条。不写本拍施工产物）', 2);
-    } else if (hasMacroEnv) {
-        macroEnvField = field('macro_environment', '大环境识别项（非首拍/过门拍建议留空以减少大模型干扰；一行一条）', 2);
-    } else {
-        macroEnvField = `
-            <details class="replica-field-optional" ${foldAttrs('macro_environment', false)}>
-                <summary class="replica-hint">＋ 展开大环境识别项（非首拍/过门拍默认留空，避免干扰大模型）</summary>
-                ${field('macro_environment', '大环境识别项（地貌水体、气候光照、空间包络；一行一条）', 2)}
-            </details>`;
-    }
+    // 大环境识别项在三种情形下说三句不同的话，措辞与此前逐字一致，只是从常驻 label
+    // 挪进了 ⓘ。第四种情形（非首拍且空着）仍然整块收进「更多」，见下面 moreFields。
+    const macroEnvHelp = isFirstBeat
+        ? '锚点首拍必填：地貌水体、气候光照、空间包络；一行一条。只写这地方本来长什么样，本拍挖出来/砌起来的东西写进起始状态。'
+        : (isThreshold
+            ? '过门新空间首拍：新空间地貌、气候光照、空间三维包络；一行一条。不写本拍施工产物。'
+            : '非首拍/过门拍建议留空以减少大模型干扰；一行一条。');
+    const macroEnvVisible = isFirstBeat || isThreshold || hasMacroEnv;
+    const macroEnvField = macroEnvVisible ? field('macro_environment', macroEnvHelp) : '';
+
+    // 「更多」里装的是本拍多半不用动的字段：工艺规格三件套、工具型号、物料去向，
+    // 外加两个派生/兜底字段。此前它们各自写了一段 if-else 散在这个函数里，视觉上
+    // 也和必填项一模一样重，占掉整整一排格子。
+    //
+    // 什么时候默认展开：本拍在这些字段上有值、或有值越界、或本拍有硬伤。
+    // 「有值却被折起来」是最坏的一种折叠——人会以为那一栏是空的。
+    const moreKeys = ['material_specs', 'fastening_and_bonding', 'micro_traces',
+                      'tool_specifics', 'material_flow', 'insert_subject', 'visual_subject'];
+    // 原片这一拍切过镜头，插入镜主体就不是可选项了，提到上面「拍摄与声音」那组里去。
+    const insertIsPrimary = typeof beat.observed_shot_count === 'number' && beat.observed_shot_count >= 2;
+    if (insertIsPrimary) moreKeys.splice(moreKeys.indexOf('insert_subject'), 1);
+    if (!macroEnvVisible) moreKeys.unshift('macro_environment');
+    // 清场帧里没人可写，但「有人偶在旁观」仍然要写——所以是收起来，不是拿掉。
+    if (!beat.workers_present) moreKeys.push('cast_action');
+
+    const hasValue = (key) => (Array.isArray(beat[key])
+        ? beat[key].length > 0
+        : Boolean(String(beat[key] === undefined || beat[key] === null ? '' : beat[key]).trim()));
+    const filledCount = moreKeys.filter(hasValue).length;
+    const moreOpen = isErr || filledCount > 0;
+    const moreFields = `
+        <details class="replica-field-more" ${foldAttrs('more', moreOpen)}>
+            <summary class="replica-hint">工艺规格与兜底字段（${moreKeys.length} 项，已填 ${filledCount} 项）</summary>
+            <div class="replica-beat-fields">${moreKeys.map(k => field(k)).join('')}</div>
+        </details>`;
+
+    // 头部此前是八枚同权重的圆角灰 chip（时间/时序/阶段/事件/工人/空间/原片镜数/低置信）。
+    // 里面真正要抢眼的只有一件事——这一拍有没有问题——它却和「事件 E04」长得一模一样。
+    // 现在头部只留「是哪一拍、多长、有没有事」，其余降到下面一行浅字元信息里；
+    // 元信息里只有异常项（过门、低置信、多镜）才会被染色。
+    const beatWarn = violations.some(v => v.level !== 'error' && v.beat_id === beat.id);
+    const lowConf = typeof beat.confidence === 'number' && beat.confidence < 0.5;
+    const statusCls = isErr ? 'is-error' : ((beatWarn || lowConf) ? 'is-warn' : 'is-ok');
+    const statusTitle = isErr ? '本拍有硬伤，必须先修掉才能合成'
+        : (beatWarn ? '本拍有待人工确认项' : (lowConf ? '模型对本拍的置信度低于 0.5' : '本拍通过全部机械校验'));
 
     return `
     <div class="replica-beat ${isCollapsed ? 'is-collapsed' : ''}" data-beat-id="${escapeHtmlReplica(beat.id)}" data-beat-index="${idx}">
@@ -2043,26 +2321,30 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
             <button type="button" class="replica-beat-fold-btn" data-beat-fold="${escapeHtmlReplica(beat.id)}" title="折叠/展开本拍">
                 ${isCollapsed ? '▾' : '⌃'}
             </button>
-            <b>${escapeHtmlReplica(beat.id)}</b>
-            <span class="replica-chip replica-time-chip" title="点击箭头微调时间，或在右侧拆拍/合并">
+            <b class="replica-beat-id">${escapeHtmlReplica(beat.id)}</b>
+            <span class="replica-time-chip" title="点击箭头微调时间，或在右侧拆拍/合并">
                 <button type="button" class="replica-nudge-btn" data-nudge-beat="${idx}" data-nudge-field="start" data-nudge-delta="-0.5" title="起始时间提早 0.5 秒">◀</button>
                 <b class="replica-time-val">${beat.start}s – ${beat.end}s</b>
                 <button type="button" class="replica-nudge-btn" data-nudge-beat="${idx}" data-nudge-field="end" data-nudge-delta="+0.5" title="结束时间延后 0.5 秒">▶</button>
             </span>
-            <span class="replica-chip replica-chip-timing" title="2x 倍速成片时序：屏幕时长 ${s_dur}s 对应 1.0x 真实物理动作 ${a_dur}s，旁白建议不超过 ${quota.max_words} 字">⏱️ ${s_dur}s (2x: ${a_dur}s) · 🎙️ 旁白 ≤${quota.max_words}字</span>
-            ${replicaStageSelect(beat, idx)}
-            ${beat.source_event_ids && beat.source_event_ids.length
-                ? `<span class="replica-chip">事件 ${escapeHtmlReplica(beat.source_event_ids.join(','))}</span>` : ''}
-            <span class="replica-chip">${beat.workers_present ? '有工人' : '清场帧（锚点候选）'}</span>
-            ${replicaSpaceChip(beat, idx, previousSpace)}
-            ${replicaShotCutChip(beat)}
-            ${typeof beat.confidence === 'number' && beat.confidence < 0.5
-                ? '<span class="replica-chip replica-chip-error">低置信</span>' : ''}
+            <span class="replica-beat-dot ${statusCls}" title="${escapeHtmlReplica(statusTitle)}"></span>
+            <span class="replica-beat-timing" title="2x 倍速成片时序：屏幕时长 ${s_dur}s 对应 1.0x 真实物理动作 ${a_dur}s，旁白建议不超过 ${quota.max_words} 字">${s_dur}s · 2x 实拍 ${a_dur}s · 旁白 ≤${quota.max_words} 字</span>
             <span class="replica-beat-tools">
+                <button type="button" class="replica-mini-btn" data-zh-toggle="1"
+                        title="中文对照只供核对，英文才是送去合成的事实源">中文对照</button>
                 <button type="button" class="replica-mini-btn" data-split="${idx}" title="从中点拆成两拍">拆拍</button>
                 <button type="button" class="replica-mini-btn" data-merge="${idx}" ${idx === 0 ? 'disabled' : ''}
                         title="并入上一拍">上并</button>
             </span>
+        </div>
+        <div class="replica-beat-meta">
+            ${replicaStageSelect(beat, idx)}
+            ${replicaSpaceChip(beat, idx, previousSpace)}
+            ${replicaShotCutChip(beat)}
+            <span class="replica-meta-item">${beat.workers_present ? '有工人' : '清场帧（锚点候选）'}</span>
+            ${beat.source_event_ids && beat.source_event_ids.length
+                ? `<span class="replica-meta-item">事件 ${escapeHtmlReplica(beat.source_event_ids.join(','))}</span>` : ''}
+            ${lowConf ? '<span class="replica-meta-item is-flag">低置信</span>' : ''}
         </div>
         <div class="replica-beat-summary">
             <span class="replica-summary-tag"><b>${escapeHtmlReplica(beat.id)}</b> · ${beat.start}–${beat.end}s</span>
@@ -2079,59 +2361,43 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
                 <summary class="replica-hint">覆盖帧 ${coverage.length} 张（${beat.start}s – ${beat.end}s 内按时间均分，仅供核对）</summary>
                 <div class="replica-cov-strip">${coverageThumbs}</div>
             </details>` : ''}
-            <div class="replica-beat-fields">
-                ${field('space', '所在空间（同一个空间逐字沿用同一个名字；换名字＝机位穿过开口进了另一个空间，会多出一次过门）')}
-                ${macroEnvField}
-                ${field('operation', '主导工序（1~3 个词的里程碑工序词，如「吊装就位 / seat bus」；别写成带宾语的整句，合成器拿它做相位判定）')}
-                ${field('package_operations',
-                        `工序包（一行一道，须 2~3 道；当前 ${(beat.package_operations || []).length} 道）`, 2)}
-                ${field('visible_details',
-                        `细节识别项（一行一条，须 3~6 条、建议顶到 5~6；当前 ${(beat.visible_details || []).length} 条。每条＝材料+颜色/质感/状态+位置；别复述大环境或遗留痕迹）`, 2)}
-                ${field('visible_action', '可见动作', 2)}
-                ${field('visible_result', '可见结果（这一下看见了什么：车体沉下去、吊索由紧转松）', 2)}
-                ${field('state_before', '起始状态（写「量」不是写「样」：范围/比例/齐平关系/高度差）', 2)}
-                ${field('state_after', '结束状态（完成到哪儿，须带一个量，别把可见结果再写一遍）', 2)}
-                ${field('persistent_traces',
-                        `遗留痕迹（一行一条，须 ≥2 条；当前 ${(beat.persistent_traces || []).length} 条。只写本拍新留下的痕迹＋它落在哪个面上，原本就有的落叶青苔不算）`, 2)}
-                ${field('material_specs',
-                        `材料规格（一行一条，≤3 条；当前 ${(beat.material_specs || []).length} 条。写「多厚、什么等级、什么面」——9mm OSB 哑光面 / 2x4 SPF 龙骨；细节识别项那一栏写的是「什么料、什么颜色、在哪儿」，别重复）`, 2)}
-                ${field('fastening_and_bonding',
-                        `紧固与粘接（一行一条，≤3 条；当前 ${(beat.fastening_and_bonding || []).length} 条。沉头自攻钉 / 发泡胶封缝 / 结构胶。它决定接缝长什么样，也决定本拍那一下是拧、是钉还是挤）`, 2)}
-                ${field('micro_traces',
-                        `微观痕迹（一行一条，≤3 条；当前 ${(beat.micro_traces || []).length} 条。细木屑、铅笔弹线、过喷飞溅。与遗留痕迹分工：那一栏必须被后续帧继承，这一栏不要求）`, 2)}
+            <div class="replica-field-group" data-group="fact">
+                <div class="replica-group-title">画面事实</div>
+                <div class="replica-beat-fields">
+                    ${field('space')}
+                    ${macroEnvField}
+                    ${field('operation')}
+                    ${field('package_operations')}
+                    ${field('visible_details')}
+                    ${field('visible_action')}
+                    ${beat.workers_present ? field('cast_action') : ''}
+                </div>
             </div>
-            <div class="replica-beat-fields replica-beat-craft">
-                ${field('tool', '主导工具（动作峰值上那一件：吊车 / 冲击钻 / 橡胶锤。三联绑定的一环，塞在动作句里合成器读不出来）')}
-                ${field('tool_specifics', '工具具体型号（哪一种、怎么驱动、在用什么刀头批头：18V 无刷冲击钻＋磁性批头 / 气动排钉枪 / 不锈钢齿口抹刀。上一栏答「是什么工具」，这一栏答「是哪一种」）')}
-                ${field('sfx',
-                        `本拍声音（一行一个声源，1~3 条；当前 ${(beat.sfx || []).length} 条。原声物理音，绝不写配乐——交付口径是 ASMR 60% / BGM 0%）`, 2)}
-                ${selectField('shot_scale', '景别', REPLICA_SHOT_SCALES)}
-                ${selectField('camera_angle', '拍摄角度（垂直：机位在主体的上方还是下方）', REPLICA_CAMERA_ANGLES)}
-                ${selectField('camera_bearing', '机位方位（水平：镜头对着主体的哪一面）', REPLICA_CAMERA_BEARINGS)}
-                ${selectField('lens_feel', '焦段感（多广的镜头，跟景别是两件事）', REPLICA_LENS_FEELS)}
-                ${field('subject_placement', '主体构图（主体在画面左/中/右、上/下，占画面高度几分之几，地平线在第几分。锚点的位置与占比此前从没在原片上量过，全靠这一栏。分数写汉字，别写数字和百分号）', 2)}
-                ${selectField('camera_move', '运镜', REPLICA_CAMERA_MOVES)}
-                ${selectField('time_treatment', '时间处理（这一拍是加速的还是原速的）', REPLICA_TIME_TREATMENTS)}
-                ${numberField('worker_count', '工人数（0＝清场帧）')}
-                ${beat.workers_present
-                    ? field('cast_action', '人物动作神情（写「从上一拍的什么姿态、动到这一拍的什么姿态」：起身、转向、上前半步、蹲下去看、抬手指。别写「还站在原地/保持原样」——那是站位不是动作，下游会把它原样写进每一帧的图，交付出来就是一动不动的小人。别把可见动作再写一遍：那一栏是工序，这一栏是人。真的几乎没动，就写那个最小的真实变化）', 2)
-                    : `<details class="replica-field-optional" ${foldAttrs('cast_action', false)}>
-                        <summary class="replica-hint">＋ 人物动作神情（本拍标注为清场帧，画面里没人；有人偶在旁观的话仍然要写）</summary>
-                        ${field('cast_action', '人物动作神情（从什么姿态动到什么姿态，别写「保持原样」）', 2)}
-                       </details>`}
-                ${field('light_state', '光照时段（如「阴天正午、无投影」；延时片跨天，不逐拍声明光就会自己跳）')}
-                ${field('material_flow', '物料去向（挖出来的土去哪了 / 耗掉的料从哪来）')}
-                ${(typeof beat.observed_shot_count === 'number' && beat.observed_shot_count >= 2)
-                    ? field('insert_subject', '插入镜主体（原片这一拍切进特写时拍的是什么，如「镊子尖压住的那片瓦」。空着就落回通用职责——工具接触点/持久痕迹，那是任何一拍都能写的话）')
-                    : `<details class="replica-field-optional" ${foldAttrs('insert_subject', false)}>
-                        <summary class="replica-hint">＋ 插入镜主体（原片这一拍是一镜到底，没有插入镜可抄；编一个会被照抄进成片）</summary>
-                        ${field('insert_subject', '插入镜主体')}
-                       </details>`}
-                <details class="replica-field-optional" ${foldAttrs('visual_subject', false)}>
-                    <summary class="replica-hint">＋ 画面主体（派生字段：只在可见动作与可见结果都空着时兜底，另供自动标题取主语；平时不必改）</summary>
-                    ${field('visual_subject', '画面主体')}
-                </details>
+            <div class="replica-field-group" data-group="state">
+                <div class="replica-group-title">状态与痕迹</div>
+                <div class="replica-beat-fields">
+                    ${field('visible_result')}
+                    ${field('state_before')}
+                    ${field('state_after')}
+                    ${field('persistent_traces')}
+                    ${field('light_state')}
+                </div>
             </div>
+            <div class="replica-field-group" data-group="shot">
+                <div class="replica-group-title">拍摄与声音</div>
+                <div class="replica-beat-params">
+                    ${REPLICA_SHOT_PARAMS.map(([key, label, options, title]) =>
+                        paramPill(key, label, options, title)).join('')}
+                    ${workerPill()}
+                </div>
+                <div class="replica-beat-fields">
+                    ${field('tool')}
+                    ${field('sfx')}
+                    ${field('subject_placement')}
+                    ${insertIsPrimary ? field('insert_subject') : ''}
+                </div>
+            </div>
+            ${moreFields}
         </div>
     </div>`;
 }
@@ -2459,7 +2725,6 @@ function replicaBindBeatEvents(scope) {
     };
 
     // 保存与合成不在这一排里，它们常驻吸底操作栏（见 replicaBindBottomBarEvents）。
-    on('#replica-autofix-btn', (e) => replicaAdvance('autofix', {}, e.currentTarget));
     // 精修会作废已有的 prompt_block（beats 一变，旧提示词就是按旧措辞合出来的）。
     // 已经合成过的 job 上这是一次真实的返工，按之前先说清楚。
     on('#replica-refine-craft-btn', (e) => {
@@ -2469,7 +2734,6 @@ function replicaBindBeatEvents(scope) {
     });
     on('#replica-banner-autofix-btn', (e) => replicaAdvance('autofix', {}, e.currentTarget));
     on('#replica-autobalance-btn', (e) => replicaAdvance('autobalance', {}, e.currentTarget));
-    on('#replica-actions-autobalance-btn', (e) => replicaAdvance('autobalance', {}, e.currentTarget));
     // 重跑聚类＝Pass B 整份重新生成节拍阶梯，手工拆合拍、时间微调、改过的措辞一次归零。
     // 这是这一页破坏性最强的动作，此前却是全页唯一不问一句的（重抽帧/归档/删除/精修/中断
     // 都有确认）。第二句同样重要：用户按不按得下去，取决于知不知道这一步要不要重新付钱。
@@ -2606,6 +2870,70 @@ function replicaBindBeatEvents(scope) {
         });
     });
 
+    // 字段说明的 ⓘ。走委托而不是逐个绑：一张卡片二十来个字段，几十拍就是几百个
+    // 监听器，而它们做的是同一件事。tooltip 单例挂在 body 上——挂在字段里会被
+    // .replica-beat 的 overflow 裁掉，也会把那一格撑高。
+    if (!scope.dataset.helpBound) {
+        scope.dataset.helpBound = '1';
+        const showHelp = (btn) => {
+            const tip = replicaHelpTip();
+            tip.textContent = btn.dataset.help || '';
+            tip.classList.add('is-on');
+            const r = btn.getBoundingClientRect();
+            const w = Math.min(360, window.innerWidth - 24);
+            tip.style.width = `${w}px`;
+            tip.style.left = `${Math.min(Math.max(8, r.left - 6), window.innerWidth - w - 12)}px`;
+            const below = r.bottom + 8;
+            tip.style.top = `${below + tip.offsetHeight > window.innerHeight - 8
+                ? Math.max(8, r.top - tip.offsetHeight - 8) : below}px`;
+        };
+        const hideHelp = () => {
+            const tip = document.getElementById('replica-help-tip');
+            if (tip) tip.classList.remove('is-on');
+        };
+        scope.addEventListener('mouseover', (e) => {
+            const btn = e.target.closest && e.target.closest('.replica-field-help');
+            if (btn) showHelp(btn);
+        });
+        scope.addEventListener('mouseout', (e) => {
+            if (e.target.closest && e.target.closest('.replica-field-help')) hideHelp();
+        });
+        // 键盘走到输入框时也把那一栏的说明亮出来——ⓘ 自己是 tabindex="-1"（它不
+        // 承载任何动作，塞进 Tab 序列只会让二十几个字段变成四十几站）。
+        scope.addEventListener('focusin', (e) => {
+            const wrap = e.target.closest && e.target.closest('.replica-field');
+            const btn = wrap && wrap.querySelector('.replica-field-help');
+            if (btn) showHelp(btn); else hideHelp();
+        });
+        scope.addEventListener('focusout', hideHelp);
+        // 触屏上没有悬停，点一下 ⓘ 也要能看到说明。
+        scope.addEventListener('click', (e) => {
+            const btn = e.target.closest && e.target.closest('.replica-field-help');
+            if (!btn) return;
+            e.preventDefault();
+            const tip = document.getElementById('replica-help-tip');
+            if (tip && tip.classList.contains('is-on') && tip.textContent === btn.dataset.help) hideHelp();
+            else showHelp(btn);
+        });
+        // 滚动就收起来（浮层是 fixed 的，不跟着内容走）。scroll 不冒泡，所以用捕获；
+        // 这一页真正滚动的是 .replica-shell 而不是 window。整个会话只绑一次——
+        // replicaBindBeatEvents 会被 #replica-root 和 #replica-beats-host 各调一遍。
+        if (!replicaHelpScrollBound) {
+            replicaHelpScrollBound = true;
+            window.addEventListener('scroll', hideHelp, { passive: true, capture: true });
+        }
+    }
+
+    // 中文对照：整卡一个开关，状态记在 localStorage。写的时候关掉，核对时打开——
+    // 此前它和可编辑的英文原文一样常驻，还是全卡最跳的一层颜色。
+    scope.querySelectorAll('[data-zh-toggle]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            replicaSetZhMirror(!replicaZhMirrorOn());
+        });
+    });
+    replicaApplyZhMirror();
+
     scope.querySelectorAll('[data-beat][data-key]').forEach(el => {
         const updateBeat = () => {
             const beat = ((replicaState || {}).beats || {}).beats || [];
@@ -2686,7 +3014,48 @@ function replicaBindBeatEvents(scope) {
     });
 }
 
-// 只重建节拍区，不动页面其余部分，并把滚动位置放回去。
+// 重建会把焦点连同光标位置一起扔掉——activeElement 落回 <body>。
+//
+// 这一页的主路径就是「边打字边 Cmd+S」（那个快捷键是这一页自己装的），而保存成功
+// 会立刻整份重建节拍区。于是每存一次，正在写的那一栏就失去焦点、光标归零，用户得
+// 重新找到那一栏、点回去、再把光标挪到刚才那个位置。滚动位置早就有人管了（见下面
+// 那段注释），焦点一直没有。
+//
+// 认字段用的是 data-beat + data-key 这一对，而不是元素引用——重建之后旧节点已经
+// 不在文档里了。禁用元素 / 场景一句话 / 场景恒常特征也在这一区里，它们没有这一对，
+// 按 id 或 data-scene-key 认。
+function replicaCaptureFocus(host) {
+    const el = document.activeElement;
+    if (!el || !host.contains(el)) return null;
+    const sel = (el.selectionStart !== undefined && el.selectionStart !== null)
+        ? { start: el.selectionStart, end: el.selectionEnd } : null;
+    if (el.dataset && el.dataset.beat !== undefined && el.dataset.key) {
+        return { q: `[data-beat="${el.dataset.beat}"][data-key="${el.dataset.key}"]`, sel };
+    }
+    if (el.id) return { q: `#${el.id}`, sel };
+    if (el.dataset && el.dataset.sceneKey) return { q: `[data-scene-key="${el.dataset.sceneKey}"]`, sel };
+    return null;
+}
+
+function replicaRestoreFocus(host, saved) {
+    if (!saved) return;
+    let next;
+    try {
+        next = host.querySelector(saved.q);
+    } catch (e) {
+        return;   // id 里有特殊字符时选择器不合法，放弃还位而不是把重建整个炸掉
+    }
+    if (!next) return;   // 拆合拍会重排 id，那一栏可能已经不在了
+    // preventScroll：还位必须交给下面的 scrollTop，focus() 自己滚会把刚存好的位置冲掉。
+    next.focus({ preventScroll: true });
+    if (saved.sel && next.setSelectionRange) {
+        try {
+            next.setSelectionRange(saved.sel.start, saved.sel.end);
+        } catch (e) { /* select 之类没有选区，忽略 */ }
+    }
+}
+
+// 只重建节拍区，不动页面其余部分，并把滚动位置与焦点放回去。
 //
 // 整页重建会把滚动位置一起丢掉，而节拍区恰恰是这一页最长的一块——几十拍改到一半被
 // 弹回顶端，等于每保存一次就罚一次。存位/还位必须用 replicaShell()：全站 window
@@ -2696,8 +3065,10 @@ function replicaRefreshBeats() {
     if (!host) { replicaRender(); return; }
     const shell = replicaShell();
     const top = shell ? shell.scrollTop : 0;
+    const focused = replicaCaptureFocus(host);
     host.innerHTML = replicaRenderBeats(replicaState);
     replicaBindBeatEvents(host);
+    replicaRestoreFocus(host, focused);
     // 硬伤数变了，栏外那两块也得跟着变：吸顶导航上的红色角标、吸底栏上的硬伤计数与
     // 「合成提示词」的禁用态，都是从同一份 validation 算出来的。只刷节拍区的话，
     // 保存完硬伤明明清零了，导航还挂着红角标、合成按钮还是灰的。
@@ -2706,7 +3077,7 @@ function replicaRefreshBeats() {
     if (shell) shell.scrollTop = top;
 }
 
-// 重画吸顶导航与吸底操作栏（都在节拍区之外，且都读 validation）。
+// 重画右侧区段导航与吸底操作栏（都在节拍区之外，且都读 validation）。
 function replicaRefreshChrome() {
     const navBar = document.getElementById('replica-nav-bar');
     if (navBar) {
@@ -2724,7 +3095,7 @@ function replicaRefreshChrome() {
 
 // ── 区段直达 ──────────────────────────────────────────────────────────────────────
 
-// 滚到某个区段并闪一下。三个入口（阶段轨、吸顶导航、页头「上传新视频」）此前各写了
+// 滚到某个区段并闪一下。三个入口（阶段轨、右侧导航、页头「上传新视频」）此前各写了
 // 一份一模一样的 scrollIntoView + flash + setTimeout。
 function replicaFocusSection(targetId) {
     const target = targetId && document.getElementById(targetId);
@@ -2737,7 +3108,7 @@ function replicaFocusSection(targetId) {
     return true;
 }
 
-// 吸顶区段导航。单独一函数是因为它要在 replicaRefreshBeats 里被重绑——保存一次
+// 右侧区段导航。单独一函数是因为它要在 replicaRefreshBeats 里被重绑——保存一次
 // 之后硬伤数会变，那个角标挂在导航药丸上。
 function replicaBindNavEvents() {
     const bar = document.getElementById('replica-nav-bar');

@@ -41,6 +41,12 @@ function slotActionsHtml(state) {
     return `<div class="slot-actions ${wrapCls}">${btns}</div>`;
 }
 
+/**
+ * 点开就有明细可看的徽标：这几类背后一定挂着 review_issues 或 manual_issue。
+ * 「未审查」「降级」这些没有条目可列，点了会是一个空弹层，不给点。
+ */
+const ISSUE_DETAIL_BADGES = ['review-failed', 'manual-flagged', 'continuity-failed'];
+
 function slotBadgesHtml(state) {
     if (!state.badges || !state.badges.length) return '';
     const items = state.badges.map(b =>
@@ -127,6 +133,11 @@ function renderSlotCard(cardEl, state) {
         if (!el) return;
         el.textContent = b.text;
         if (b.tip) el.title = b.tip;
+        // 能点开详情的徽标要看得出来能点（光标+下划线由 CSS 给）
+        if (state.type !== 'video' && ISSUE_DETAIL_BADGES.includes(b.id)) {
+            el.classList.add('is-clickable');
+            el.title = (b.tip ? b.tip + '\n' : '') + '点击查看全部违规明细（可复制）';
+        }
     });
 
     (state.actions || []).forEach(a => {
@@ -281,6 +292,16 @@ function bindSlotGrid(gridId) {
             if (typeof jumpFromMediaToPrompt === 'function') {
                 jumpFromMediaToPrompt(card.dataset.type || 'image', seq);
             }
+            return;
+        }
+
+        // 点击"有问题"类徽标展开该帧的违规详情弹层：原生 title= 只留一句摘要，
+        // 明细在弹层里可选中、可复制、按条排版（见 js/review_report.js）
+        const issueBadge = e.target.closest(
+            ISSUE_DETAIL_BADGES.map(id => `.slot-badge[data-badge="${id}"]`).join(','));
+        if (issueBadge && card.dataset.type !== 'video') {
+            e.stopPropagation();
+            if (typeof openFrameIssuePop === 'function') openFrameIssuePop(card, seq);
             return;
         }
 

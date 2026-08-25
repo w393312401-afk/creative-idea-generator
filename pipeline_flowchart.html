@@ -1,0 +1,209 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>「节拍阶梯对齐 × 三明治双向咬合」AI 视频生成与修复全流程规范</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+            margin: 0;
+            padding: 40px 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .container {
+            max-width: 1200px;
+            width: 100%;
+            background: #1e293b;
+            padding: 30px;
+            border-radius: 16px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+        }
+        h1 {
+            color: #38bdf8;
+            text-align: center;
+            margin-bottom: 8px;
+            font-size: 26px;
+        }
+        p.subtitle {
+            text-align: center;
+            color: #94a3b8;
+            margin-top: 0;
+            margin-bottom: 24px;
+        }
+        .mermaid-box {
+            background: #0f172a;
+            border-radius: 12px;
+            padding: 20px;
+            overflow-x: auto;
+            border: 1px solid #334155;
+            display: flex;
+            justify-content: center;
+        }
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+            margin-top: 30px;
+        }
+        .card {
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 10px;
+            padding: 18px;
+        }
+        .card h3 {
+            margin-top: 0;
+            color: #fde047;
+            font-size: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .card ul {
+            margin: 0;
+            padding-left: 20px;
+            color: #cbd5e1;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .btn-box {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        button {
+            background: #0284c7;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        button:hover {
+            background: #0369a1;
+            transform: translateY(-1px);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>「节拍阶梯对齐 × 三明治双向咬合」全流程规范</h1>
+        <p class="subtitle">工业级 AI 影视制作与错误收敛控制架构</p>
+        
+        <div class="btn-box">
+            <button onclick="window.print()">🖨️ 打印 / 导出为 PDF</button>
+        </div>
+
+        <div class="mermaid-box">
+            <div class="mermaid">
+flowchart TD
+    %% 阶段一：顶层契约与全序列生成
+    subgraph Phase1["【阶段一】上游节拍契约与全序列正向生成"]
+        A[🎬 视频脚本与分镜规划] --> B[📋 确立上游【节拍阶梯表 Beat Ladder】<br>★ 资产账本 / 差量账本 / 未来禁忌账本]
+        B --> C[✍️ 编写【爆款复刻合成提示词】<br>DLSP 5层景深 + 全域差量 + 纯净交付态/动态中途态]
+        C --> D[🖼️ 正向生成全部帧序列<br>Frame 1, Frame 2 ... Frame N]
+    end
+
+    %% 阶段二：全序列连贯性审查与病灶诊断
+    subgraph Phase2["【阶段二】连贯性审查与异常诊断"]
+        D --> E[🔍 全序列时空网络扫描]
+        E --> F{是否存在生成异常/断层?}
+        F -- 否: 全序列完美咬合 --> Z1[🚀 直通阶段四: 交付 I2V 视频生成]
+        F -- 是: 定位异常帧 Frame K --> G[🩺 对照【节拍阶梯】三步诊断病灶]
+        G --> G1["① 人物僵死/站桩 (死锁冲突)<br>② 未来态泄漏 (如图片7提前燃火)<br>③ 材质突变/镜面湿水<br>④ 空间拉伸/中柱幻觉"]
+    end
+
+    %% 阶段三：三明治双向绑定修复管线
+    subgraph Phase3["【阶段三】三明治双向上下文绑定修复管线 (K-1 ⇄ [K] ⇄ K+1)"]
+        G1 --> H[🔒 提取前后帧时空夹具<br>K-1 继承态 与 K+1 交付目标]
+        H --> I{判定修改风险层级}
+        
+        %% Level 1 局部修复
+        I -- "Level 1: 局部瑕疵/人物姿态/微瑕" --> J1["【像素级局部重绘 Inpainting】<br>• 100% 冻结背景与空间像素<br>• 仅 Mask 圈出病灶局部重绘<br>• 零空间漂移风险"]
+        
+        %% Level 2 光影微调
+        I -- "Level 2: 光照/视角/材质微调" --> J2["【ControlNet 约束图生图 I2I】<br>• 绑定 Frame K 原图或 K-1 Depth/Lineart<br>• 强制锁定三维网格与机位高度<br>• 严禁纯文生图 (T2I) 盲抽"]
+        
+        %% Level 3 结构大改
+        I -- "Level 3: 空间格局/硬装结构重构" --> J3["【启动连锁预警 Cascade Warning】<br>• 以修后的 Frame K 为全新基底<br>• 必须向后链式同步重渲 K+1, K+2...<br>• 彻底阻断后向断层"]
+
+        %% 修复提示词注入
+        J1 & J2 & J3 --> K_Prompt["📝 注入【三明治手术刀修复提示词】<br>① K-1 继承锁 + ② 局部差量 + ③ K+1 通道锁 + ④ 靶向排他负向词"]
+        K_Prompt --> K_Render[🎨 渲染生成修复后 Frame K]
+    end
+
+    %% 阶段四：三联屏门禁与视频插值
+    subgraph Phase4["【阶段四】三联屏门禁审查与 I2V 视频插值"]
+        K_Render --> L["🚪 【三帧联排硬性审查门禁】<br>[ Frame K-1 ] ⇄ [ 修后 Frame K ] ⇄ [ Frame K+1 ]"]
+        L --> M{三联屏比对核验}
+        
+        M -- "❌ 未通过 (仍有透视跳变/色温闪烁)" --> H
+        M -- "✅ 通过 (空间静止/材质连续/差量单调递增)" --> N[💾 固化合格关键帧 Frame K]
+        N --> O[🎬 同步校验/精简对应视频 I2V 提示词<br>去除机械时间切片，对齐尾帧动作]
+        O --> P[🎥 首尾帧 I2V 视频插值渲染<br>(Frame K-1 ➔ Frame K ➔ Frame K+1)]
+        P --> Q[🎉 输出完美无缝、人物生动的最终视频]
+    end
+
+    Z1 --> P
+
+    %% 样式与高亮
+    style B fill:#fef08a,stroke:#ca8a04,stroke-width:2px;
+    style H fill:#bae6fd,stroke:#0284c7,stroke-width:2px;
+    style L fill:#fed7aa,stroke:#ea580c,stroke-width:2px;
+    style Q fill:#bbf7d0,stroke:#16a34a,stroke-width:2px;
+            </div>
+        </div>
+
+        <div class="card-grid">
+            <div class="card">
+                <h3>📋 1. 节拍阶梯三大账本</h3>
+                <ul>
+                    <li><b>继承资产账本</b>：前序节拍累积的硬装成果，严禁倒退。</li>
+                    <li><b>当期差量账本</b>：本拍唯一允许新增的物理变化 $\Delta$。</li>
+                    <li><b>未来禁忌账本</b>：属于未来节拍的物品，一票否决。</li>
+                </ul>
+            </div>
+            <div class="card">
+                <h3>🥪 2. 三明治修复公式</h3>
+                <ul>
+                    <li><b>[K-1 继承锁]</b>：锁定前帧机位、硬装与色温。</li>
+                    <li><b>[局部差量]</b>：只写当前帧纠偏的局部区域。</li>
+                    <li><b>[K+1 通道锁]</b>：约束为下帧唯一物理前置。</li>
+                    <li><b>[靶向排他词]</b>：针对具体 bug 进行强负向压制。</li>
+                </ul>
+            </div>
+            <div class="card">
+                <h3>🚪 3. 三帧联排门禁</h3>
+                <ul>
+                    <li>拒绝单独看单张图，必须联排 <b>[K-1] - [K] - [K+1]</b>。</li>
+                    <li>快检后墙特征线静止、材质光影无跳变、动作因果链闭环。</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#0f172a',
+                primaryColor: '#1e293b',
+                primaryBorderColor: '#0284c7',
+                primaryTextColor: '#f8fafc',
+                lineColor: '#38bdf8'
+            }
+        });
+    </script>
+</body>
+</html>

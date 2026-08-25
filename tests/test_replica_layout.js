@@ -140,13 +140,38 @@ setState(cases.completed);
 assert.ok(call('replicaRenderBottomBar(replicaState)').includes('replica-chip-ok'),
           '通过态走 .replica-chip-ok，不用内联颜色');
 
-// ── 6. 节拍区保留两个 AI 修复入口，但不再重复保存/合成 ─────────────────────────
+// ── 6. 每个动作只有一个入口，且长在它要修的那个东西旁边 ────────────────────────
+//
+// 2026-08-25：此前「AI 修复硬伤」在节拍区里有**两个**入口（硬伤横幅 + 区段底部
+// 动作排），是当时刻意留的。现在收回成一个，理由有两条：
+//   · 底部那一枚不是条件渲染的，0 硬伤时照样摆在那里——点下去无事发生。本文件
+//     第 5 行立的规矩（同一个主操作不在一屏内出现两次）和 replica_pipeline.js 里
+//     「摆一个点了必然报错的按钮比不摆更糟」是同一条，这一枚两条都犯了。
+//   · 「离得远够不着」这个担心不成立：吸底栏上的「⚠️ N 项硬伤」本来就是一枚跳到
+//     横幅的按钮，且常驻可见。从阶梯任何位置到那唯一的修复入口都只要一下。
+// 同理，「自动平衡秒数/拆拍」也从底部动作排收回到比例条头部——超长/微拍的标记
+// 就画在那条上。
 setState(withBeats);
 const beats = call('replicaRenderBeats(replicaState)');
-assert.ok(beats.includes('id="replica-autofix-btn"'), '节拍区底部保留 AI 修复');
-assert.ok(beats.includes('id="replica-banner-autofix-btn"'), '硬伤横幅保留一键修复');
+assert.ok(beats.includes('id="replica-banner-autofix-btn"'), 'AI 修复挂在硬伤横幅上');
+assert.ok(!beats.includes('id="replica-autofix-btn"'),
+          'AI 修复只有横幅那一个入口，底部动作排不再放第二个');
+assert.ok(beats.includes('id="replica-autobalance-btn"'), '自动平衡挂在比例条头部');
+assert.ok(!beats.includes('id="replica-actions-autobalance-btn"'),
+          '自动平衡只有比例条那一个入口，底部动作排不再放第二个');
 assert.ok(!beats.includes('id="replica-save-btn"'), '节拍区不再重复「保存并重校验」');
 assert.ok(!beats.includes('id="replica-compose-btn"'), '节拍区不再重复「合成提示词」');
+
+// 全片概览合并成一块：比例条只画时间分配，跳轨条只管谁有事、点它去哪。
+assert.ok(beats.includes('replica-ladder-overview'), '缺全片概览');
+assert.ok(beats.includes('replica-ladder-bar'), '缺时长比例条');
+assert.ok(beats.includes('replica-ladder-chips'), '缺跳轨条');
+assert.ok(!beats.includes('replica-timeline-block'),
+          '旧的「胶卷时间轴」块已并入比例条，不该再渲染');
+assert.ok(beats.includes('id="replica-toggle-fold-all"'), '全部折叠/展开并进了概览头部');
+// 比例条上的每一段都必须是 button：此前是 <div>，能点但键盘走不到。
+assert.ok(/<button[^>]*class="[^"]*replica-ladder-seg/.test(beats),
+          '比例条的每一段是 button，不是可点的 div');
 
 // ── 8. 任务列表按注意力分组、成本醒目与血缘折叠 ─────────────────────────
 call('replicaJobs = ' + JSON.stringify([

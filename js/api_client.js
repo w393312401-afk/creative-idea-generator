@@ -1629,6 +1629,12 @@ async function fixFrameIssue(seq, manualReason, cascadeDownstream) {
                     feedLine(`🤖 ${(evData && evData.message) || `AI 模型正在多模态打分鉴别…`}`);
                 } else if (type === 'candidate_ai_evaluation') {
                     feedLine(`🎯 ${(evData && evData.message) || `AI 鉴别选定最佳候选`}`, 'ok');
+                } else if (type === 'frame_issue_triptych_gate') {
+                    // 三帧联排门禁（[K-1] ⇄ [修后 K] ⇄ [K+1]）：修复不只要问「原来那条
+                    // 问题解决没」，还要问「有没有修出新问题」。判恶化时后端已经自动退回上一版。
+                    const bad = evData && evData.verdict === 'regressed';
+                    feedLine(`${bad ? '⛔' : 'ℹ️'} ${(evData && evData.message) || '三联屏门禁已判读'}`,
+                             bad ? 'err' : 'warn');
                 } else if (type === 'frame_issue_reverify') {
                     // 修复闭环（2026-07-25）：重渲后对着新画面逐条复核"到底修好没有"
                     feedLine(`🔎 ${(evData && evData.message) || '正在复核问题是否已解决…'}`);
@@ -1687,6 +1693,15 @@ async function fixFrameIssue(seq, manualReason, cascadeDownstream) {
             if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
             // 复核结果决定这次修复该不该报"成功"：仍有问题时报 warning，别让人
             // 看着一个绿勾以为修好了（修复流程此前是开环的，没人回答这个问题）
+            // 门禁回滚的那一路必须先拦：回滚时 reverify 是 null，remaining 为空，落到下面
+            // 就会报「✅ 修复完成」——而画面根本没换，原来那几条问题一条都还在。
+            // 这正是这整套门禁要消灭的那句谎。
+            if (watch.result.rolled_back) {
+                const detail = watch.result.reason || '';
+                feedLine(`⛔ IMG ${String(seq).padStart(3, '0')} 修复未通过三联屏门禁，已自动退回修复前的版本`, 'err');
+                showToast(`第 ${seq} 帧修复把相邻帧的连贯性改坏了，已自动回滚。请换一种描述再试。`, "warning");
+                return { status: 'ok', rolled_back: true, remaining: detail ? [detail] : ['修复已回滚'] };
+            }
             const remaining = (reverify && reverify.remaining) || [];
             if (remaining.length) {
                 feedLine(`⚠️ IMG ${String(seq).padStart(3, '0')} 重渲完成，但仍有 ${remaining.length} 条问题未解决`, 'warn');
@@ -1696,7 +1711,7 @@ async function fixFrameIssue(seq, manualReason, cascadeDownstream) {
                 showToast(`第 ${seq} 帧已修复。`, "success");
             }
         }
-        return { status: 'ok', remaining: (reverify && reverify.remaining) || [] };
+        return { status: 'ok', rolled_back: false, remaining: (reverify && reverify.remaining) || [] };
     } catch (e) {
         if (e.name === 'AbortError') {
             feedLine(`⏹️ IMG ${String(seq).padStart(3, '0')} 修复已取消`, 'warn');
@@ -1796,6 +1811,7 @@ async function runSequenceReview(scope) {
         if (rec2) rec2.taskId = taskId;
 
         let reviewedBeats = 0;
+        let flaggedBeats = 0;
         let reviewSummary = null;
         const watch = await watchTaskUntilTerminal(taskId, {
             label: 'sequence-review',
@@ -1810,14 +1826,33 @@ async function runSequenceReview(scope) {
                     reviewedBeats += 1;
                     const total = (evData && evData.total) || 0;
                     if (total) meta.textContent = `一致性审查中… 已完成 ${reviewedBeats}/${total} 拍`;
-                    const cls = evData && evData.reviewed === false ? 'warn'
-                        : ((evData && evData.issues && evData.issues.length) ? 'warn' : 'ok');
-                    feedLine(`　${(evData && evData.message) || '逐拍审查进行中…'}`, cls);
+                    // 审干净的拍收进一条就地刷新的计数条：它们没有任何单独占一行的
+                    // 价值，十几拍灌下来只会把真正要读的结论顶出可视区。有发现的
+                    // 拍与没跑成的拍照旧各占一行——那才是要留下来的信息。
+                    const issues = (evData && evData.issues) || [];
+                    const failed = evData && evData.reviewed === false;
+                    if (!failed && !issues.length) {
+                        feedLine(`　逐拍审查 ${reviewedBeats}${total ? '/' + total : ''} 拍`
+                            + (flaggedBeats ? `，其中 ${flaggedBeats} 拍有发现` : '，暂无发现'),
+                            'ok', 'review-beat');
+                    } else {
+                        if (issues.length) flaggedBeats += 1;
+                        feedLine(`　${(evData && evData.message) || '逐拍审查进行中…'}`, 'warn');
+                    }
                 } else if (type === 'review_invalidated') {
                     // 上一轮审查之后有帧被重渲，那些结论已经作废（帧内容哈希对不上）
                     feedLine(`♻️ ${(evData && evData.message) || '部分帧的旧审查结论已作废'}`, 'warn');
                 } else if (type === 'sequence_review_result') {
-                    if (evData && evData.message) {
+                    // 结构化播报优先：后端把「几帧有问题 / 每帧原因 / 未审完 /
+                    // 只覆盖前缀 / 复用了几拍」拆成了 lines，各占一行按语义着色。
+                    // message 是同样内容拼成的一句话，留给老服务端做兜底——一行里
+                    // 塞进五件事正是"审查数据读着吃力"的来源。
+                    const lines = (evData && Array.isArray(evData.lines)) ? evData.lines : null;
+                    if (lines && lines.length) {
+                        feedLine(`${evData.passed ? '✅' : '🛠️'} 一致性审查完成`,
+                                 evData.passed ? 'ok' : 'warn');
+                        lines.forEach(l => feedLine(`　${l.text}`, l.cls || ''));
+                    } else if (evData && evData.message) {
                         feedLine(`${evData.passed ? '✅' : '🛠️'} ${evData.message}`, evData.passed ? 'ok' : 'warn');
                     } else if (evData && evData.passed) {
                         feedLine('✅ 整套序列一致性审查通过', 'ok');
@@ -1850,11 +1885,16 @@ async function runSequenceReview(scope) {
         // 从服务端重新拉一次 manifest 让帧网格的徽标反映最新审查结果。
         await reloadManifestIntoIdea(ownerIdea);
         if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
-        feedLine('✅ 一致性审查已完成', 'ok');
         // 复用了多少拍要说出来：跑得快不是因为"这次没查出问题"，而是那几拍的帧图
-        // 自上次审查后压根没变、结论直接沿用（全量重审入口在 ⚙ 里）
+        // 自上次审查后压根没变、结论直接沿用（全量重审入口在 ⚙ 里）。
+        // 后端给了结构化 lines 时这句已经在里面了，不再重复播一遍。
         const reused = (reviewSummary && reviewSummary.reused_beats) || 0;
-        if (reused) feedLine(`♻️ 其中 ${reused} 拍的帧图未变化，沿用了上一轮的结论`, 'ok');
+        const hadLines = !!(reviewSummary && Array.isArray(reviewSummary.lines)
+            && reviewSummary.lines.length);
+        if (!hadLines) {
+            feedLine('✅ 一致性审查已完成', 'ok');
+            if (reused) feedLine(`♻️ 其中 ${reused} 拍的帧图未变化，沿用了上一轮的结论`, 'ok');
+        }
         // 只审了已渲染前缀、或有帧没审成时给一条明确 toast——这两种情况下"审查完成"
         // 不等于"整单都查过了"，光看绿色徽标会误判
         if (reviewSummary && reviewSummary.partial) {

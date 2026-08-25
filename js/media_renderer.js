@@ -645,6 +645,9 @@ function renderFramesForIdea(idea) {
 
     // 整格重渲会换掉所有卡片：让工具条复原选中态、重新套用筛选、刷新计数
     if (typeof syncSlotToolbar === 'function') syncSlotToolbar('image');
+    // 审查结论面板与卡片同源、同一次重渲刷新：审查跑完/修完一帧后各处都会
+    // reloadManifestIntoIdea + renderFramesForIdea，面板因此不需要自己的刷新时机
+    if (typeof renderReviewPanel === 'function') renderReviewPanel(idea);
 }
 
 function renderVideosForIdea(idea) {

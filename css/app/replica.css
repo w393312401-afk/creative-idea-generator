@@ -75,10 +75,6 @@
     min-height: 1em;
 }
 
-.replica-status-error {
-    color: var(--danger, #ff7b7b);
-    opacity: 1;
-}
 
 /* ── 任务列表 ───────────────────────────────────────────────── */
 
@@ -287,10 +283,14 @@ details[open] > .replica-jobs-summary {
     border: 1px solid rgba(34, 197, 94, 0.3);
 }
 
+/* 锁定态 chip。2026-08-25 合并：此前这里是紫色的一条，文件后面又有一条绿色的
+   把它盖掉，而绿色那条只写了 border-color——边框的宽度与线型一直是从这条紫色的
+   border 简写里来的。合并成一条，渲染结果不变，但改它的人不必再猜哪条生效。 */
 .replica-chip-locked {
-    background: rgba(168, 85, 247, 0.15);
-    color: #c084fc;
-    border: 1px solid rgba(168, 85, 247, 0.3);
+    background: rgba(74, 222, 128, 0.15);
+    border: 1px solid rgba(74, 222, 128, 0.35);
+    color: #4ade80;
+    font-weight: 600;
 }
 
 
@@ -305,14 +305,18 @@ details[open] > .replica-jobs-summary {
     margin-bottom: 10px;
 }
 
+/* 2026-08-25 合并：文件后面本来还有一条，把 max-height 从 320 改成 290 并加了
+   transition，其余（边框/圆角/zoom-in）一直是从这条来的。合并后取的就是原先
+   两条叠加后的实际生效值。 */
 .replica-collage {
     display: block;
     width: 100%;
-    max-height: 320px;
+    max-height: 290px;
     object-fit: contain;
     border: 1px solid rgba(255, 255, 255, 0.15);
     border-radius: 6px;
     cursor: zoom-in;
+    transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .replica-cost {
@@ -489,10 +493,15 @@ details[open] > .replica-jobs-summary {
 
 /* ── 节拍卡片 ───────────────────────────────────────────────── */
 
+/* 节拍卡列宽封顶。此前卡片跟着面板一路撑到 2500px，里面的字段栅格是
+   auto-fit，于是在宽屏上裂成九到十列——人只能可靠地纵向扫两到四列，十列会
+   把「读一拍」变成满屏 Z 字乱扫，而且相邻两列在语义上毫无关系。
+   封顶之后卡片是一根可读的列，上方的横幅与时间线仍然占满宽度：概览宽、编辑窄。 */
 .replica-beats {
     display: flex;
     flex-direction: column;
     gap: 12px;
+    max-width: 1240px;
 }
 
 .replica-beat {
@@ -611,18 +620,96 @@ details[open] > .replica-jobs-summary {
     }
 }
 
+/* 头部只回答三件事：是哪一拍、多长、有没有问题。此前这里是八枚同权重的圆角灰
+   chip，唯一真正需要抢眼的「本拍有硬伤」和「事件 E04」长得一模一样。 */
 .replica-beat-head {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 8px;
-    margin-bottom: 10px;
+    gap: 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
 }
 
+.replica-beat-id {
+    font-size: 15px;
+    letter-spacing: 0.03em;
+    font-variant-numeric: tabular-nums;
+}
+
+/* 状态点。把「这一拍有没有事」从一枚可有可无的 chip 提成头部唯一的颜色。 */
+.replica-beat-dot {
+    flex: 0 0 auto;
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: rgba(120, 220, 150, 0.85);
+}
+
+.replica-beat-dot.is-warn {
+    background: rgba(255, 190, 90, 0.9);
+}
+
+.replica-beat-dot.is-error {
+    background: rgba(255, 100, 100, 0.95);
+    box-shadow: 0 0 0 3px rgba(255, 100, 100, 0.18);
+}
+
+.replica-beat-timing {
+    font-size: 11.5px;
+    opacity: 0.62;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+/* 降级下来的那几项：阶段、空间、原片镜数、有没有工人、来源事件。它们是背景信息，
+   不是待办；只有异常项（过门、多镜、低置信）保留自己的颜色。 */
+.replica-beat-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    padding: 8px 0 2px;
+    font-size: 11px;
+}
+
+.replica-meta-item {
+    opacity: 0.55;
+    white-space: nowrap;
+}
+
+.replica-meta-item.is-flag {
+    opacity: 1;
+    color: rgba(255, 190, 90, 0.95);
+    font-weight: 600;
+}
+
+/* 头部那排 chip 在元信息行里不该再有胶囊底色——它们现在是背景信息。
+   过门/多镜这两枚例外：它们靠底色说「这里不一样」。 */
+.replica-beat-meta .replica-chip:not(.replica-chip-cross):not(.replica-chip-multishot):not(.replica-stage-select) {
+    padding: 0;
+    background: none;
+    opacity: 0.55;
+}
+
+/* 拆拍/上并/中文对照：低频动作，常驻只会和「这一拍写了什么」抢注意力。
+   键盘可达（focus-within）不受悬停影响。 */
 .replica-beat-tools {
     margin-left: auto;
     display: flex;
     gap: 6px;
+    opacity: 0;
+    transition: opacity 0.16s ease;
+}
+
+.replica-beat:hover .replica-beat-tools,
+.replica-beat-tools:focus-within {
+    opacity: 1;
+}
+
+/* 触屏上没有悬停，常驻显示。 */
+@media (hover: none) {
+    .replica-beat-tools { opacity: 1; }
 }
 
 .replica-mini-btn {
@@ -649,13 +736,36 @@ details[open] > .replica-jobs-summary {
     margin-bottom: 10px;
 }
 
+/* 缩略图的按钮外壳：只为可点与可聚焦，视觉全部留在里面那张 img 上。 */
+.replica-thumb-btn {
+    flex: 0 0 auto;
+    display: block;
+    padding: 0;
+    border: 0;
+    background: none;
+    border-radius: 4px;
+    cursor: zoom-in;
+    line-height: 0;
+}
+
+.replica-thumb-btn:focus-visible {
+    outline: 2px solid var(--neon-cyan, #6ee7ff);
+    outline-offset: 2px;
+}
+
+/* min-width + 底色：帧文件 404 时 alt 是空的（无障碍名字在外层 button 上），
+   不给尺寸的话整排证据帧会悄悄塌成零高——这一页最不该有的就是静默失效。
+   给了尺寸，加载失败至少还是一个看得见的空框。 */
 .replica-thumb {
     height: 82px;
+    min-width: 48px;
+    background: rgba(255, 255, 255, 0.04);
     border-radius: 4px;
     border: 1px solid rgba(255, 255, 255, 0.15);
     cursor: zoom-in;
 }
 
+.replica-thumb-btn:hover .replica-thumb,
 .replica-thumb:hover {
     border-color: rgba(110, 231, 255, 0.6);
 }
@@ -694,25 +804,151 @@ details[open] > .replica-jobs-summary {
     margin-top: 2px;
 }
 
+/* 字段分栏。两处和此前不同：
+   一、列数写死成 1 / 2 / 3 三档，不再用 auto-fit 让浏览器自己算——auto-fit 没有
+       上限，宽屏上会一路裂到十列（见 .replica-beats 上方那段）。
+   二、用多列流而不是 grid。这些字段高度天生参差（工序包三行、可见动作一行），
+       grid 会把整行拉到最高那一格的高度，短字段右边就空出一大片洞；多列是纵向
+       填满的，读法也正好是「顺着读一列」。 */
 .replica-beat-fields {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    column-count: 1;
+    column-gap: 16px;
+}
+
+@media (min-width: 680px) {
+    .replica-beat-fields { column-count: 2; }
+}
+
+@media (min-width: 1020px) {
+    .replica-beat-fields { column-count: 3; }
+}
+
+/* 语义分组。此前只有「拍摄与工艺」一条虚线把卡片切成两半，其余十三个字段挤在
+   同一片栅格里；现在四组各有一个组名，组名本身就是信息——它告诉人这一排回答
+   的是同一个问题。 */
+.replica-field-group + .replica-field-group {
+    margin-top: 16px;
+}
+
+.replica-group-title {
+    display: flex;
+    align-items: center;
     gap: 10px;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    opacity: 0.55;
+    margin-bottom: 8px;
+}
+
+.replica-group-title::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: rgba(255, 255, 255, 0.09);
 }
 
 .replica-field {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 5px;
+    min-width: 0;
+    /* 多列流里一格不能被拆到两列去：标签留在上一列、输入框跑到下一列，
+       那一格就同时失去了名字和归属。 */
+    break-inside: avoid;
+    page-break-inside: avoid;
+    margin-bottom: 10px;
+}
+
+/* 短名 + ⓘ + 条数徽章。整段说明文此前就写在这一行，30~90 字一格，
+   22 格加起来 1400 多字——说明的字数是数据的 5~10 倍。 */
+.replica-field-top {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 16px;
 }
 
 .replica-field-label {
-    font-size: 11px;
+    font-size: 11.5px;
+    font-weight: 600;
+    opacity: 0.78;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+}
+
+.replica-field-help {
+    flex: 0 0 auto;
+    width: 14px;
+    height: 14px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    border-radius: 999px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: 9px;
+    line-height: 1;
+    opacity: 0.55;
+    cursor: help;
+    transition: opacity 0.15s ease, border-color 0.15s ease;
+}
+
+.replica-field-help:hover,
+.replica-field:focus-within .replica-field-help {
+    opacity: 1;
+    border-color: var(--neon-cyan, #6ee7ff);
+    color: var(--neon-cyan, #6ee7ff);
+}
+
+/* 条数徽章。此前是说明文里的一句话（「须 3~6 条；当前 4 条」），越界了也还是同一行
+   灰字。它是状态不是说明，所以越界就得变色。 */
+.replica-field-count {
+    margin-left: auto;
+    flex: 0 0 auto;
+    padding: 0 5px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.07);
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
     opacity: 0.7;
 }
 
-/* 英文原文下面那行中文对照。只读、只为核对——英文才是送去合成的事实源。 */
+.replica-field-count.is-bad {
+    background: rgba(255, 90, 90, 0.85);
+    color: #1a0f0f;
+    font-weight: 700;
+    opacity: 1;
+}
+
+/* 字段说明浮层。单例、挂在 body 上，见 replicaHelpTip()。 */
+.replica-help-tip {
+    position: fixed;
+    z-index: 3000;
+    max-width: 360px;
+    padding: 10px 12px;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 8px;
+    background: #10161d;
+    color: #e8eef5;
+    font-size: 12.5px;
+    line-height: 1.65;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.14s ease;
+}
+
+.replica-help-tip.is-on {
+    opacity: 1;
+}
+
+/* 英文原文下面那行中文对照。只读、只为核对——英文才是送去合成的事实源，
+   所以默认收起来，头部那枚「中文对照」开关统一开合（记在 localStorage）。 */
 .replica-field-zh {
+    display: none;
     font-size: 11px;
     line-height: 1.6;
     opacity: 0.72;
@@ -720,33 +956,85 @@ details[open] > .replica-jobs-summary {
     word-break: break-word;
 }
 
+.replica-show-zh .replica-field-zh {
+    display: block;
+}
+
 .replica-textarea {
     width: 100%;
-    padding: 6px 8px;
+    padding: 7px 9px;
     background: rgba(0, 0, 0, 0.35);
     border: 1px solid rgba(255, 255, 255, 0.14);
     border-radius: 6px;
     color: inherit;
     font: inherit;
-    font-size: 12px;
+    font-size: 12.5px;
     line-height: 1.55;
     resize: vertical;
 }
 
-/* 制作栏：工具 / 声音 / 机位 / 光照 / 物料去向。与上面那组「画面内容」分栏，是因为
-   它们回答的是另一个问题——上面写画面里有什么，这里写这一拍是怎么拍成的。 */
-.replica-beat-craft {
-    margin-top: 10px;
-    padding-top: 10px;
-    border-top: 1px dashed rgba(255, 255, 255, 0.12);
+/* 输入框跟着内容长。rows 是个固定值，写满就把后半句藏在框外——核对时看不见全文
+   等于核对不了，而这一页存在的全部意义就是核对。不支持 field-sizing 的浏览器
+   落回 rows 那一版，不会比现在更差。 */
+@supports (field-sizing: content) {
+    .replica-textarea {
+        field-sizing: content;
+        min-height: 2.3em;
+        max-height: 10em;
+        overflow-y: auto;
+        resize: none;
+    }
 }
 
-.replica-beat-craft::before {
-    content: '拍摄与工艺';
-    grid-column: 1 / -1;
+.replica-textarea:focus {
+    outline: none;
+    border-color: var(--neon-cyan, #6ee7ff);
+}
+
+/* 闭集参数行：景别 / 角度 / 方位 / 焦段 / 运镜 / 时间 / 工人数。
+   七个都是从固定表里挑一个值，此前每个占一整格（短名一行 + 全宽下拉一行），
+   合起来是半张卡片的高度。压成一行「短名：值」胶囊之后是一行多一点。 */
+.replica-beat-params {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 10px;
+    margin-bottom: 12px;
+}
+
+.replica-param {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 6px 4px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.replica-param:focus-within {
+    border-color: var(--neon-cyan, #6ee7ff);
+}
+
+.replica-param-label {
     font-size: 11px;
-    letter-spacing: 0.08em;
-    opacity: 0.5;
+    opacity: 0.6;
+    white-space: nowrap;
+}
+
+.replica-param .replica-select,
+.replica-param .replica-number {
+    width: auto;
+    max-width: 180px;
+    padding: 1px 2px;
+    border: 0;
+    background: transparent;
+    font-size: 12.5px;
+    cursor: pointer;
+}
+
+.replica-param .replica-number {
+    width: 46px;
+    cursor: text;
 }
 
 .replica-select,
@@ -767,27 +1055,32 @@ details[open] > .replica-jobs-summary {
     color: #e8eef5;
 }
 
-.replica-field-optional {
-    grid-column: 1 / -1;
-    margin: 2px 0 4px;
+/* 「更多」：工艺规格三件套 + 工具型号 + 物料去向 + 两个派生兜底字段。
+   本拍在它们身上有值、有值越界、或本拍有硬伤时默认展开——「有值却被折起来」
+   是最坏的一种折叠，人会以为那一栏是空的。 */
+.replica-field-more {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px dashed rgba(255, 255, 255, 0.12);
 }
 
-.replica-field-optional > summary {
+.replica-field-more > summary {
     cursor: pointer;
     user-select: none;
-    font-size: 11px;
-    opacity: 0.65;
+    font-size: 11.5px;
+    opacity: 0.6;
+    margin: 0;
     padding: 2px 0;
-    transition: opacity 0.15s ease;
+    transition: opacity 0.15s ease, color 0.15s ease;
 }
 
-.replica-field-optional > summary:hover {
-    opacity: 0.95;
-    color: var(--accent-cyan, #6ee7ff);
+.replica-field-more > summary:hover {
+    opacity: 1;
+    color: var(--neon-cyan, #6ee7ff);
 }
 
-.replica-field-optional[open] {
-    margin-bottom: 6px;
+.replica-field-more[open] > summary {
+    margin-bottom: 10px;
 }
 
 .replica-actions {
@@ -799,12 +1092,6 @@ details[open] > .replica-jobs-summary {
 
 /* ── 二创 ───────────────────────────────────────────────────── */
 
-.replica-axes {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 8px;
-    margin-bottom: 10px;
-}
 
 .replica-axis {
     display: flex;
@@ -984,198 +1271,58 @@ details[open] > .replica-jobs-summary {
 
 /* ── 任务列表搜索与状态筛选 ────────────────────────────────── */
 
-.replica-job-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 10px;
-    margin-bottom: 10px;
-}
 
-.replica-search-input {
-    flex: 1 1 200px;
-    max-width: 320px;
-    padding: 6px 12px;
-    font-size: 12px;
-    color: inherit;
-    background: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.16);
-    border-radius: 6px;
-    outline: none;
-    transition: border-color 0.2s;
-}
 
-.replica-search-input:focus {
-    border-color: var(--neon-cyan, #6ee7ff);
-}
 
-.replica-filter-bar {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin-bottom: 12px;
-}
 
-.replica-filter-chip {
-    padding: 3px 10px;
-    font-size: 11px;
-    background: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 999px;
-    color: inherit;
-    cursor: pointer;
-    transition: all 0.18s;
-}
 
-.replica-filter-chip:hover {
-    background: rgba(255, 255, 255, 0.1);
-    border-color: rgba(255, 255, 255, 0.25);
-}
 
-.replica-filter-chip.active {
-    background: rgba(110, 231, 255, 0.16);
-    border-color: var(--neon-cyan, #6ee7ff);
-    color: var(--neon-cyan, #6ee7ff);
-    font-weight: 600;
-}
 
 /* ── 全景时间轴轨道组件 (Timeline Strip) ───────────────────── */
 
-.replica-timeline-wrap {
-    margin: 14px 0 16px;
-    padding: 12px;
-    background: rgba(0, 0, 0, 0.2);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 8px;
-}
 
-.replica-timeline-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 8px;
-    margin-bottom: 10px;
-}
-
-.replica-timeline-title {
-    font-size: 12px;
-    font-weight: 700;
-    color: var(--neon-cyan, #6ee7ff);
-}
-
-.replica-timeline-head .replica-hint {
-    margin: 0;
-}
-
-.replica-timeline-track {
-    display: flex;
-    align-items: stretch;
-    gap: 4px;
-    overflow-x: auto;
-    padding-bottom: 6px;
-}
-
-.replica-timeline-block {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 6px 4px;
-    background: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 6px;
-    font-size: 11px;
-    text-align: center;
-    cursor: pointer;
-    user-select: none;
-    position: relative;
-    transition: all 0.18s;
-}
-
-.replica-timeline-block:hover {
-    background: rgba(110, 231, 255, 0.12);
-    border-color: var(--neon-cyan, #6ee7ff);
-    transform: translateY(-2px);
-}
-
-.replica-timeline-block.is-crossed {
-    border-left: 2px solid var(--neon-cyan, #6ee7ff);
-    background: rgba(110, 231, 255, 0.06);
-}
-
-.replica-timeline-block.is-warn {
-    border-color: rgba(255, 190, 90, 0.5);
-    background: rgba(255, 190, 90, 0.08);
-}
-
-.replica-timeline-block.is-error {
-    border-color: rgba(255, 90, 90, 0.7);
-    background: rgba(255, 90, 90, 0.12);
-}
-
-.replica-timeline-id {
-    font-weight: 700;
-    font-size: 12px;
-}
-
-.replica-timeline-stage {
-    font-size: 10px;
-    opacity: 0.8;
-    white-space: nowrap;
-    margin: 2px 0;
-}
-
-.replica-timeline-time {
-    font-size: 9px;
-    opacity: 0.6;
-    font-family: monospace;
-}
-
-.replica-timeline-door {
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    font-size: 10px;
-}
-
-.replica-timeline-badge.error {
-    position: absolute;
-    top: -4px;
-    right: -4px;
-    width: 14px;
-    height: 14px;
-    line-height: 14px;
-    text-align: center;
-    background: var(--danger, #ff7b7b);
-    color: #fff;
-    font-size: 10px;
-    font-weight: 900;
-    border-radius: 50%;
-}
-
-/* ── 吸顶工作流导轨导航条 ───────────────────────────────────── */
+/* ── 右侧悬浮区段导航（Notion 目录式） ───────────────────────
+ *
+ * 原来是一条吸顶的横向药丸条：它压在内容顶上，项目一多就要横向滚，且始终占着
+ * 第一屏的一整行高度。现在改成 Notion 文档右侧那种目录：默认只在页面右侧竖直
+ * 居中露出一列短横线（当前区段那根更长更亮），鼠标移上去或键盘聚焦时整块展开成
+ * 带文字的面板，计数与硬伤角标跟着一起显示。
+ * 交互契约不变：仍是 .replica-nav-item[data-nav-target] + .active，
+ * 由 replicaBindNavEvents / replicaUpdateNavActive 驱动。
+ */
 
 .replica-nav-bar {
-    position: sticky;
-    top: 0;
-    z-index: 80;
-    margin: -4px -2px 14px;
-    padding: 8px 12px;
-    background: rgba(14, 18, 26, 0.88);
+    position: fixed;
+    right: 16px;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 90;
+    max-height: 70vh;
+    padding: 8px 8px;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    background: transparent;
+    box-shadow: none;
+    transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.replica-nav-bar:hover,
+.replica-nav-bar:focus-within {
+    background: rgba(14, 18, 26, 0.92);
+    border-color: var(--border-glass, rgba(255, 255, 255, 0.12));
     backdrop-filter: blur(16px);
     -webkit-backdrop-filter: blur(16px);
-    border-bottom: 1px solid var(--border-glass, rgba(255, 255, 255, 0.12));
-    border-radius: 0 0 10px 10px;
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
 }
 
 .replica-nav-scroll {
     display: flex;
-    align-items: center;
-    gap: 6px;
-    overflow-x: auto;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+    max-height: calc(70vh - 16px);
+    overflow-y: auto;
+    overflow-x: hidden;
     scrollbar-width: none;
     -webkit-overflow-scrolling: touch;
 }
@@ -1185,55 +1332,121 @@ details[open] > .replica-jobs-summary {
 }
 
 .replica-nav-item {
-    display: inline-flex;
+    display: flex;
     align-items: center;
-    gap: 6px;
+    justify-content: flex-end;
+    gap: 8px;
     flex: 0 0 auto;
-    padding: 5px 12px;
-    border-radius: 999px;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    background: rgba(255, 255, 255, 0.04);
-    color: rgba(255, 255, 255, 0.8);
+    padding: 4px 6px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: rgba(255, 255, 255, 0.62);
     font-size: 12px;
     font-weight: 500;
+    line-height: 1.4;
     cursor: pointer;
     white-space: nowrap;
-    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    text-align: right;
+    transition: background 0.18s ease, color 0.18s ease;
     user-select: none;
 }
 
+/* 收起态的「短横线」。当前区段那根更长、更亮——这是收起时唯一的位置线索 */
+.replica-nav-dash {
+    flex: 0 0 auto;
+    width: 14px;
+    height: 2px;
+    border-radius: 2px;
+    background: currentColor;
+    opacity: 0.55;
+    transition: width 0.18s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.18s ease;
+}
+
+.replica-nav-item.active .replica-nav-dash {
+    width: 22px;
+    opacity: 1;
+}
+
+/* 收起态：文字与角标折叠到 0 宽，只留横线 */
+.replica-nav-label,
+.replica-nav-count,
+.replica-nav-badge-err {
+    max-width: 0;
+    opacity: 0;
+    overflow: hidden;
+    transform: translateX(6px);
+    transition: max-width 0.22s cubic-bezier(0.16, 1, 0.3, 1),
+                opacity 0.18s ease,
+                transform 0.22s cubic-bezier(0.16, 1, 0.3, 1),
+                padding 0.18s ease;
+}
+
+.replica-nav-bar:hover .replica-nav-label,
+.replica-nav-bar:focus-within .replica-nav-label {
+    max-width: 160px;
+    opacity: 1;
+    transform: translateX(0);
+}
+
+.replica-nav-bar:hover .replica-nav-count,
+.replica-nav-bar:focus-within .replica-nav-count,
+.replica-nav-bar:hover .replica-nav-badge-err,
+.replica-nav-bar:focus-within .replica-nav-badge-err {
+    max-width: 48px;
+    opacity: 1;
+    transform: translateX(0);
+    padding: 0 6px;
+}
+
+/* 展开后横线退成一个细指示条，位置感交给高亮的文字行 */
+.replica-nav-bar:hover .replica-nav-dash,
+.replica-nav-bar:focus-within .replica-nav-dash {
+    width: 10px;
+}
+
+.replica-nav-bar:hover .replica-nav-item.active .replica-nav-dash,
+.replica-nav-bar:focus-within .replica-nav-item.active .replica-nav-dash {
+    width: 14px;
+}
+
 .replica-nav-item:hover {
-    background: rgba(255, 255, 255, 0.09);
-    border-color: rgba(110, 231, 255, 0.4);
+    background: rgba(255, 255, 255, 0.07);
     color: #fff;
 }
 
+.replica-nav-item:focus-visible {
+    outline: 2px solid var(--neon-cyan, #6ee7ff);
+    outline-offset: 1px;
+}
+
 .replica-nav-item.active {
-    background: rgba(110, 231, 255, 0.14);
-    border-color: var(--neon-cyan, #6ee7ff);
     color: var(--neon-cyan, #6ee7ff);
     font-weight: 600;
-    box-shadow: 0 0 12px rgba(110, 231, 255, 0.2);
+}
+
+.replica-nav-bar:hover .replica-nav-item.active,
+.replica-nav-bar:focus-within .replica-nav-item.active {
+    background: rgba(110, 231, 255, 0.14);
 }
 
 .replica-nav-count {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    padding: 0 6px;
-    min-width: 16px;
+    padding: 0;
+    min-width: 0;
     height: 16px;
     border-radius: 999px;
     background: rgba(255, 255, 255, 0.12);
     font-size: 10px;
-    opacity: 0.85;
 }
 
 .replica-nav-badge-err {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    padding: 0 6px;
+    padding: 0;
     height: 16px;
     border-radius: 999px;
     background: var(--danger, #ff7b7b);
@@ -1242,32 +1455,128 @@ details[open] > .replica-jobs-summary {
     font-weight: 700;
 }
 
-/* ── 节拍快速跳轨与折叠控制 ─────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+    .replica-nav-bar,
+    .replica-nav-item,
+    .replica-nav-dash,
+    .replica-nav-label,
+    .replica-nav-count,
+    .replica-nav-badge-err {
+        transition: none;
+    }
+}
 
-.replica-beat-jump-bar {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    margin: 10px 0 14px;
+/* ── 全片概览：比例条 + 跳轨条 ───────────────────────────────
+ *
+ * 此前这里是两块：一块「胶卷时间轴」（按时长比例排的块，块里三行文字），紧挨着一块
+ * 「跳转 chip 条」。两块回答同一个问题、加起来吃掉第一屏 147px，还各缺一半信息。
+ * 现在拆成职责不重叠的两条，共用一个头部：上面那条只画时间怎么分配，下面那条只管
+ * 谁有事、点它去哪。理由写在 replicaRenderLadderOverview 上方。
+ */
+.replica-ladder-overview {
+    margin: 10px 0 12px;
     padding: 10px 12px;
-    background: rgba(0, 0, 0, 0.25);
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 8px;
 }
 
-.replica-beat-jump-controls {
+.replica-overview-head {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: 8px 12px;
+    margin-bottom: 8px;
 }
 
-.replica-beat-jump-chips-wrap {
+.replica-overview-title {
+    font-size: 12px;
+    font-weight: 600;
+    opacity: 0.85;
+    font-variant-numeric: tabular-nums;
+}
+
+/* 超长/微拍的计数。此前这两件事只画在时间块里（那三行被压到 48px 后就读不出来了），
+   现在提到头部说成一句话——它决定的是要不要按旁边那枚「自动平衡」。 */
+.replica-overview-flag {
+    font-size: 11px;
+    font-weight: 600;
+    color: rgba(255, 190, 90, 0.95);
+}
+
+.replica-overview-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+/* 比例条。块内不写字，所以没有「至少要多宽才读得出来」这个下限问题：
+   min-width 只保证一拍不会细到点不中（触控目标下限），flex-shrink:0 让它在
+   拍数多的时候真的溢出、真的能横着滚。 */
+.replica-ladder-bar {
+    display: flex;
+    align-items: stretch;
+    gap: 2px;
+    height: 26px;
+    padding: 3px;
+    background: rgba(0, 0, 0, 0.35);
+    border-radius: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+}
+
+.replica-ladder-seg {
+    flex: 0 0 auto;
+    min-width: 8px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: filter 0.15s ease, outline-color 0.15s ease;
+}
+
+.replica-ladder-seg:hover {
+    filter: brightness(1.45);
+}
+
+.replica-ladder-seg:focus-visible {
+    outline: 2px solid var(--neon-cyan, #6ee7ff);
+    outline-offset: 1px;
+}
+
+/* 有事的那几拍在条上也要看得见——此前比例条完全不知道哪一拍有硬伤，
+   这正是它旁边非得再摆一条 chip 条的原因之一。 */
+.replica-ladder-seg.is-warn {
+    box-shadow: inset 0 -3px 0 rgba(255, 190, 90, 0.95);
+}
+
+.replica-ladder-seg.is-error {
+    box-shadow: inset 0 -3px 0 rgba(255, 90, 90, 0.95);
+}
+
+.replica-ladder-seg.is-toolong {
+    background-image: repeating-linear-gradient(45deg,
+        transparent 0 4px, rgba(255, 255, 255, 0.18) 4px 8px);
+}
+
+.replica-ladder-seg.is-tooshort {
+    border-color: rgba(255, 190, 90, 0.7);
+}
+
+/* 过门：机位穿过一道开口进了另一个空间。画成一条竖线而不是换色——
+   它标的是两拍**之间**的那条缝，不是某一拍的属性。 */
+.replica-ladder-seg.is-crossed {
+    border-left: 2px solid var(--neon-cyan, #6ee7ff);
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+}
+
+.replica-ladder-chips {
     display: flex;
     flex-wrap: wrap;
-    gap: 5px;
-    align-items: center;
+    gap: 4px;
+    margin-top: 8px;
 }
 
 .replica-beat-jump-chip {
@@ -1314,23 +1623,8 @@ details[open] > .replica-jobs-summary {
     font-weight: bold;
 }
 
-.replica-fold-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-}
 
-.replica-btn-error-jump {
-    color: #ff8585 !important;
-    border-color: rgba(255, 90, 90, 0.4) !important;
-    background: rgba(255, 90, 90, 0.1) !important;
-    font-weight: 600;
-}
 
-.replica-btn-error-jump:hover {
-    background: rgba(255, 90, 90, 0.2) !important;
-    border-color: rgba(255, 90, 90, 0.7) !important;
-}
 
 /* ── 节拍卡片折叠与展开样式 ─────────────────────────────────── */
 
@@ -1373,7 +1667,16 @@ details[open] > .replica-jobs-summary {
 }
 
 .replica-beat.is-collapsed .replica-beat-head {
-    margin-bottom: 0;
+    padding-bottom: 0;
+    border-bottom: 0;
+}
+
+.replica-beat.is-collapsed .replica-beat-meta {
+    display: none;
+}
+
+.replica-beat-body {
+    padding-top: 10px;
 }
 
 .replica-beat.is-collapsed .replica-beat-summary {
@@ -1579,13 +1882,6 @@ details[open] > .replica-jobs-summary {
     font-weight: 600;
 }
 
-.replica-chip-locked {
-    background: rgba(74, 222, 128, 0.15);
-    border-color: rgba(74, 222, 128, 0.35);
-    color: #4ade80;
-    font-weight: 600;
-}
-
 .replica-workbench-grid {
     display: grid;
     grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
@@ -1642,14 +1938,6 @@ details[open] > .replica-jobs-summary {
     display: flex;
     justify-content: center;
     background: #08090d;
-}
-
-.replica-collage {
-    width: 100%;
-    max-height: 290px;
-    object-fit: contain;
-    display: block;
-    transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .replica-collage-container:hover .replica-collage {
@@ -2171,11 +2459,6 @@ details[open] > .replica-jobs-summary {
     flex: 1 1 auto;
 }
 
-.replica-preset-bar {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-}
 
 .replica-preset-label {
     font-size: 11.5px;
@@ -2523,15 +2806,22 @@ body.log-expanded .replica-bottom-bar-actions {
         padding-top: 12px;
     }
 
+    /* 手机上右侧鼠标悬停不存在，且窄屏经不起一条常驻竖栏：
+       收起态贴到右边缘，点一下（:focus-within）再展开。 */
     .replica-nav-bar {
-        margin: -8px calc(-1 * var(--replica-shell-pad-x)) 12px;
-        padding: 6px 8px;
+        right: 4px;
+        padding: 6px 4px;
+        max-height: 60vh;
+    }
+
+    .replica-nav-scroll {
+        max-height: calc(60vh - 12px);
     }
 
     .replica-nav-item {
-        padding: 5px 10px;
+        padding: 5px 6px;
         font-size: 12px;
-        min-height: 36px;
+        min-height: 28px;
     }
 
     .replica-metrics-grid {
@@ -2555,9 +2845,6 @@ body.log-expanded .replica-bottom-bar-actions {
         align-items: stretch;
     }
 
-    .replica-beat-jump-bar {
-        padding: 6px 8px;
-    }
 
     .replica-beat-jump-chip {
         min-height: 32px;
@@ -2611,126 +2898,8 @@ body.log-expanded .replica-bottom-bar-actions {
 
 /* ── 节拍胶卷时间轴与时间微调控件 ────────────────────────── */
 
-.replica-beat-timeline-wrap {
-    margin: 12px 0 16px;
-    padding: 10px 14px;
-    background: rgba(15, 20, 28, 0.7);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 10px;
-}
 
-.replica-timeline-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 8px;
-    font-size: 12px;
-    flex-wrap: wrap;
-    gap: 8px;
-}
 
-.replica-timeline-header-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-
-.replica-timeline-warn-tag {
-    font-size: 8.5px;
-    padding: 1px 3px;
-    border-radius: 3px;
-    font-weight: 600;
-    margin-left: 2px;
-}
-.replica-timeline-warn-tag.is-toolong {
-    background: rgba(239, 68, 68, 0.4);
-    color: #fecaca;
-    border: 1px solid rgba(239, 68, 68, 0.6);
-}
-.replica-timeline-warn-tag.is-tooshort {
-    background: rgba(245, 158, 11, 0.4);
-    color: #fef08a;
-    border: 1px solid rgba(245, 158, 11, 0.6);
-}
-
-.replica-timeline-span {
-    opacity: 0.85;
-    font-weight: 600;
-    color: #cbd5e1;
-}
-
-.replica-chip-timing {
-    background: rgba(14, 165, 233, 0.15) !important;
-    border-color: rgba(14, 165, 233, 0.4) !important;
-    color: #7dd3fc !important;
-    font-weight: 600;
-}
-
-.replica-timeline-title {
-    font-weight: 600;
-    color: #e2e8f0;
-}
-
-.replica-timeline-hint {
-    color: var(--text-muted, #94a3b8);
-    font-size: 11px;
-}
-
-.replica-timeline-track {
-    display: flex;
-    align-items: stretch;
-    width: 100%;
-    min-height: 48px;
-    background: rgba(0, 0, 0, 0.35);
-    border-radius: 6px;
-    overflow-x: auto;
-    overflow-y: hidden;
-    padding: 3px;
-    gap: 3px;
-}
-
-.replica-timeline-block {
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    align-items: center;
-    padding: 4px 6px;
-    min-width: 48px;
-    border-radius: 4px;
-    border: 1px solid transparent;
-    cursor: pointer;
-    text-align: center;
-    transition: transform 0.15s ease, filter 0.15s ease, border-color 0.15s ease;
-    user-select: none;
-}
-
-.replica-timeline-block:hover {
-    transform: translateY(-2px);
-    filter: brightness(1.2);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-    z-index: 2;
-}
-
-.replica-timeline-block-id {
-    font-size: 11px;
-    font-weight: 700;
-    line-height: 1.1;
-}
-
-.replica-timeline-block-label {
-    font-size: 10px;
-    opacity: 0.88;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 100%;
-}
-
-.replica-timeline-block-time {
-    font-size: 9.5px;
-    opacity: 0.72;
-    font-variant-numeric: tabular-nums;
-}
 
 /* 施工阶段色系定义 */
 .stage-demolition {
@@ -2779,13 +2948,18 @@ body.log-expanded .replica-bottom-bar-actions {
     color: #5eead4;
 }
 
-/* 时间微调按钮 */
+/* 时间微调按钮。此前它还挂着 .replica-chip 拿基础样式，现在头部不再是一排 chip，
+   所以那几条（flex/圆角/字号/不换行）在这里自带。 */
 .replica-time-chip {
+    flex: 0 0 auto;
     display: inline-flex;
     align-items: center;
     gap: 4px;
     padding: 2px 6px;
+    border-radius: 999px;
     background: rgba(255, 255, 255, 0.08);
+    font-size: 12px;
+    white-space: nowrap;
 }
 
 .replica-time-val {
@@ -2833,6 +3007,14 @@ textarea.is-run-locked {
 .replica-stage-select.is-run-locked {
     cursor: not-allowed;
     opacity: 0.7;
+}
+
+/* 闭集参数胶囊：可见的边框是外层那一枚，里面的 select 是透明无边的。不跟着一起
+   变暗的话，跑着的时候整排参数看上去还能改——正是这条注释上方说的「骗人」。 */
+.replica-param:has(.is-run-locked) {
+    cursor: not-allowed;
+    opacity: 0.7;
+    border-color: rgba(255, 255, 255, 0.06);
 }
 
 /* ── 未保存标记 ─────────────────────────────────────────────

@@ -3666,7 +3666,7 @@ def validate_beats(beats_doc, overview, schema=None):
 
     variant = is_variant_doc(beats_doc)
     out.extend(_validate_required_fields(beats_doc, beats, schema, variant=variant))
-    out.extend(_validate_event_coverage(beats, overview))
+    out.extend(_validate_event_coverage(beats, overview, variant=variant))
     out.extend(_validate_evidence_frames(beats, overview, variant=variant))
     out.extend(_validate_time_axis(
         beats,
@@ -4037,12 +4037,20 @@ def reconcile_event_coverage(beats_doc, overview=None, reconcile_unbound=True):
     return beats_doc
 
 
-def _validate_event_coverage(beats, overview):
+def _validate_event_coverage(beats, overview, variant=False):
     """每个 change_event 必须且只能被一拍认领。
 
     漏 = 原片里一次真实可见的变化被丢掉了；重 = 节拍窗口重叠。两者都会让阶梯与原片
-    对不上，而这正是 1:1 复刻唯一要保证的东西。"""
+    对不上，而这正是 1:1 复刻唯一要保证的东西。
+
+    变体整档降级为 warn，理由与 `_validate_evidence_frames` 同源（见 `is_variant_doc`）：
+    `overview` 是从源 job 复制过来的**原片**事件名册，而变体不再对原片的事实负责。变体
+    一改拍数或时间窗就报 `event_unbound`，而这条错**任何文字改写都修不掉**——只有机械
+    层的 reconcile 能碰它。判成 error 的后果是「AI 修复硬伤」每次都跑满 rework 轮次、
+    每轮重写全表，最后照样剩着，这正是「越修越坏」最主要的那台永动机。
+    """
     out = []
+    flag = _warn if variant else _err
     all_ids = [e.get('event_id') for e in (overview.get('change_events') or []) if e.get('event_id')]
     claimed = {}
     for beat in beats:
@@ -4052,15 +4060,16 @@ def _validate_event_coverage(beats, overview):
     for eid in all_ids:
         holders = claimed.get(eid) or []
         if not holders:
-            out.append(_err('event_unbound',
-                            f'变化事件 {eid} 没有被任何一拍认领（原片里的真实变化被丢掉了）'))
+            out.append(flag('event_unbound',
+                             f'变化事件 {eid} 没有被任何一拍认领（原片里的真实变化被丢掉了）'
+                             + ('。变体不对原片事实负责，这条仅供核对。' if variant else '')))
         elif len(holders) > 1:
-            out.append(_err('event_double_bound',
-                            f'变化事件 {eid} 被多拍同时认领：{"、".join(holders)}'))
+            out.append(flag('event_double_bound',
+                             f'变化事件 {eid} 被多拍同时认领：{"、".join(holders)}'))
     for eid, holders in claimed.items():
         if eid not in all_ids:
-            out.append(_err('event_unknown',
-                            f'{holders[0]} 认领了不存在的事件 {eid}', holders[0]))
+            out.append(flag('event_unknown',
+                             f'{holders[0]} 认领了不存在的事件 {eid}', holders[0]))
     return out
 
 
@@ -4558,11 +4567,21 @@ Return ONE JSON object, no commentary, no code fences:
 }"""
 
 
-def _merge_fixed_beats(beats_doc, data):
-    """把 AI 修复后的字段并回原 beats_doc，保护 timestamps、evidence_frames 等不被抹除。"""
+def _merge_fixed_beats(beats_doc, data, allowed_ids=None):
+    """把 AI 修复后的字段并回原 beats_doc，保护 timestamps、evidence_frames 等不被抹除。
+
+    `allowed_ids` 是本轮准许改写的拍号白名单（见 `autofix_beats` 的纪律 2）。给了就
+    严格按它挡：白名单外的拍即便模型回了内容也一律丢弃——报 2 条错重写 14 拍，正是
+    「越修越坏」里新错误的来源。传 None 表示不设限（纯全局错的回落路径）。
+
+    白名单存在时，**按序号取 patch 的那条回退路径也必须关掉**：模型被要求只回白名单
+    里的那几拍，此时 `by_id[0]` 是 B07 而不是 B01，按序号配对会把 B07 的修复内容糊到
+    B01 头上。
+    """
     raw_list = data.get('beats') if isinstance(data, dict) else data
     if not isinstance(raw_list, list):
         return beats_doc
+    allow = {str(x) for x in allowed_ids} if allowed_ids else None
 
     by_id = {}
     for idx, b in enumerate(raw_list):
@@ -4575,7 +4594,10 @@ def _merge_fixed_beats(beats_doc, data):
     out_beats = []
     for idx, src in enumerate(beats_doc.get('beats') or []):
         new = dict(src)
-        patch = by_id.get(src.get('id')) or by_id.get(idx) or {}
+        if allow is not None and str(src.get('id')) not in allow:
+            out_beats.append(new)
+            continue
+        patch = by_id.get(src.get('id')) or (by_id.get(idx) if allow is None else None) or {}
         for key in ('stage', 'operation', 'package_operations', 'persistent_traces',
                     'visual_subject', 'visible_details', 'visible_action', 'visible_result',
                     'state_before', 'state_after', 'space', 'workers_present', 'source_event_ids'):
@@ -4615,15 +4637,76 @@ def _heal_power_chain_mechanically(beats_doc):
             beats_doc['banned_elements'] = banned
 
 
+def _autofix_skeleton(beats_doc):
+    """喂给修复模型的阶梯正文。每轮都要按当前文档重算——此前它在循环外算一次，
+    第二轮拿着**第一轮之前**的阶梯配上**第一轮之后**的报错单下发，模型改的是一份
+    已经不存在的稿子。"""
+    return json.dumps([
+        {k: b.get(k) for k in ('id', 'start', 'end', 'space', 'stage', 'operation',
+                               'package_operations', 'visual_subject', 'visible_details',
+                               'visible_action', 'visible_result', 'state_before',
+                               'state_after', 'persistent_traces', 'workers_present', 'source_event_ids')
+         if b.get(k) is not None}
+        for b in (beats_doc.get('beats') or [])
+    ], ensure_ascii=False, indent=2)
+
+
+def _variant_context_block(beats_doc):
+    """变体阶梯的四轴上下文。
+
+    修复器此前看不到这一段：它拿到的只有施工文本和报错单，于是按通用装修常识改写措辞，
+    每修一轮就把「极地峡湾 + 芬兰松木 + 白鲸」往「通用毛坯房改造」拉回一点。四轴取值是
+    这条变体存在的**全部理由**，必须随稿下发并声明冻结。
+    """
+    if not is_variant_doc(beats_doc):
+        return ''
+    # 存量文档里 `mutation_axes` 也可能是一个轴名列表（早期写法）。
+    # 直接 `.items()` 会把一条本来只是想修阶段逆行的变体炸在修复入口上。
+    axes = beats_doc.get('mutation_axes')
+    if isinstance(axes, dict):
+        lines = [f'- {k}: {v}' for k, v in axes.items() if str(v or '').strip()]
+    elif isinstance(axes, (list, tuple)):
+        lines = [f'- {x}' for x in axes if str(x or '').strip()]
+    else:
+        lines = []
+    sig = str(beats_doc.get('scene_signature') or '').strip()
+    brief = str(beats_doc.get('mutation_brief') or '').strip()
+    body = ['==================== VARIANT AXES (FROZEN - DO NOT REWRITE) ====================']
+    if sig:
+        body.append(f'scene_signature: {sig}')
+    if lines:
+        body.append('mutation_axes:')
+        body.extend(lines)
+    if brief:
+        body.append(f'user brief: {brief}')
+    body.append(
+        'This ladder is a derived variant. The environment, material, function and hero-reveal '
+        'vocabulary above is FROZEN: never swap it back to generic renovation wording, never '
+        'substitute a different material or biome. Fix only the flagged structural errors and '
+        'keep every axis noun exactly as written.')
+    return '\n'.join(body) + '\n\n'
+
+
 def autofix_beats(config, beats_doc, overview=None, on_progress=None, max_rework=2):
     """AI 定向修复节拍阶梯中的硬伤与违规项。
 
     针对校验器指出的 stage_regression, rough_in_after_enclosure, power_chain_broken,
     package_operations, event_double_bound 等违规，机械层优先自动调解事件覆盖冲突与供电链暗线豁免，
     剩余逻辑回喂给 LLM 做定向修正，修复后重新执行机械校验。返回 (fixed_beats_doc, fixed_errors_count)。
+
+    三条纪律（2026-08-25，起因是「越修越坏」）：
+      1. **不许变坏**：每一轮的产物都要重新校验，只有 error 数**严格减少**才被采纳；
+         否则整轮丢弃、回到上一份最好的稿子。最坏情况是「没修动」，不再是「修坏了」。
+         此前没有这道闸门：每按一次按钮，更差的版本就永久落盘一次，连按三次就是三层
+         复合漂移，而返回值 `max(1, fixed_count)` 还保证外层永远以为修好了。
+      2. **定向**：报错点名了哪几拍，就只允许改哪几拍。此前报 2 条错会重写全部 14 拍，
+         本来干净的那 12 拍陪着一起被改写——新错误就是这么长出来的。
+      3. **不与机械层对拆**：循环里的事件调解改用 `reconcile_unbound=False`。默认的
+         `True` 第一件事是清空所有拍的 `source_event_ids` 再按时间窗重排，会把模型刚
+         改好的认领当场作废，两边每轮互相覆盖。
     """
     overview = overview or {}
-    
+
     raw_violations = validate_beats(beats_doc, overview)
     raw_errors = [v for v in raw_violations if v.get('level') == 'error']
     if not raw_errors:
@@ -4633,37 +4716,47 @@ def autofix_beats(config, beats_doc, overview=None, on_progress=None, max_rework
     reconcile_event_coverage(beats_doc, overview)
     # 2. 机械层确定性预修复：解决 power_chain_broken (原片无布线拍时的暗线豁免)
     _heal_power_chain_mechanically(beats_doc)
-    
+
     initial_violations = validate_beats(beats_doc, overview)
     initial_errors = [v for v in initial_violations if v.get('level') == 'error']
     if not initial_errors:
         beats_doc['validation'] = initial_violations
         return beats_doc, len(raw_errors)
 
-    source_beats = beats_doc.get('beats') or []
-    skeleton = json.dumps([
-        {k: b.get(k) for k in ('id', 'start', 'end', 'space', 'stage', 'operation',
-                               'package_operations', 'visual_subject', 'visible_details',
-                               'visible_action', 'visible_result', 'state_before',
-                               'state_after', 'persistent_traces', 'workers_present', 'source_event_ids')
-         if b.get(k) is not None}
-        for b in source_beats
-    ], ensure_ascii=False, indent=2)
+    # 机械层的产物是这一轮的地板：确定性、必然不坏，后面每一轮都要跟它比。
+    best_doc = copy.deepcopy(beats_doc)
+    best_violations = list(initial_violations)
+    best_errors = len(initial_errors)
 
+    variant_block = _variant_context_block(beats_doc)
     parse_budget = _PARSE_RETRY_BUDGET
-    violations = list(initial_violations)
     attempt = 0
 
     while attempt <= max_rework:
         pp._raise_if_cancelled(on_progress)
-        err_lines = [f"- [{v.get('level', 'error').upper()}] ({v.get('code')}) "
-                     f"{v.get('beat_id') or 'GLOBAL'}: {v.get('message')}" for v in violations]
+        round_errors = [v for v in best_violations if v.get('level') == 'error']
+
+        # 纪律 2：白名单 = 报错点名的拍。全局错（event_unbound 之类）不点名任何一拍，
+        # 也不该授权重写任何一拍；若一条点名的都没有，才回落到全表（老行为）。
+        allowed_ids = sorted({str(v.get('beat_id')) for v in round_errors if v.get('beat_id')})
+        scope_line = (
+            f'ONLY these beats may be modified: {", ".join(allowed_ids)}. '
+            'Return ONLY those beats in the "beats" array. Every other beat is frozen - '
+            'do not return it, do not rewrite it.\n'
+            if allowed_ids else
+            'Return the full beats array.\n')
+
+        err_lines = [f'- [{v.get("level", "error").upper()}] ({v.get("code")}) '
+                     f'{v.get("beat_id") or "GLOBAL"}: {v.get("message")}' for v in round_errors]
         user_prompt = (
-            f"==================== CURRENT BEAT LADDER ====================\n{skeleton}\n\n"
-            f"==================== VALIDATION FAILURES (FIX THESE) ====================\n"
-            + "\n".join(err_lines) + "\n\n"
-            "Please fix the errors above by correcting the stage classification, package_operations, "
-            "persistent_traces, source_event_ids, or descriptions. Preserve the beat IDs and real construction observations."
+            variant_block
+            + '==================== CURRENT BEAT LADDER ====================\n'
+            + _autofix_skeleton(best_doc) + '\n\n'
+            '==================== VALIDATION FAILURES (FIX THESE) ====================\n'
+            + '\n'.join(err_lines) + '\n\n'
+            + f'==================== SCOPE ====================\n{scope_line}\n'
+            'Please fix the errors above by correcting the stage classification, package_operations, '
+            'persistent_traces, source_event_ids, or descriptions. Preserve the beat IDs and real construction observations.'
         )
 
         if on_progress:
@@ -4677,7 +4770,7 @@ def autofix_beats(config, beats_doc, overview=None, on_progress=None, max_rework
                        max_tokens=65536, timeout=240)
         try:
             data = parse_json_reply(raw)
-        except ValueError as e:
+        except ValueError:
             parse_budget -= 1
             if parse_budget < 0:
                 raise
@@ -4691,25 +4784,34 @@ def autofix_beats(config, beats_doc, overview=None, on_progress=None, max_rework
         if not isinstance(data, (dict, list)):
             raise ValueError(f'AI 修复回复应当是一个 JSON 对象或数组，实际是 {type(data).__name__}')
 
-        _merge_fixed_beats(beats_doc, data)
-        normalize_beat_keys(beats_doc)
-        _renumber_beats(beats_doc)
-        normalize_beat_spaces(beats_doc)
-        reconcile_event_coverage(beats_doc, overview)
-        _heal_power_chain_mechanically(beats_doc)
-        attach_coverage_frames(beats_doc, overview)
-        attach_shot_cuts(beats_doc, overview)
+        # 纪律 1：本轮在**副本**上落地。没变好就整轮丢弃，best_doc 一个字不动。
+        candidate = copy.deepcopy(best_doc)
+        _merge_fixed_beats(candidate, data, allowed_ids=allowed_ids or None)
+        normalize_beat_keys(candidate)
+        _renumber_beats(candidate)
+        normalize_beat_spaces(candidate)
+        # 纪律 3：只解重复认领，不清空重排。
+        reconcile_event_coverage(candidate, overview, reconcile_unbound=False)
+        _heal_power_chain_mechanically(candidate)
+        attach_coverage_frames(candidate, overview)
+        attach_shot_cuts(candidate, overview)
 
-        violations = validate_beats(beats_doc, overview)
-        remaining_errors = [v for v in violations if v.get('level') == 'error']
-        if not remaining_errors:
-            break
+        violations = validate_beats(candidate, overview)
+        remaining = len([v for v in violations if v.get('level') == 'error'])
+        if remaining < best_errors:
+            best_doc, best_violations, best_errors = candidate, violations, remaining
+            if not remaining:
+                break
+        elif on_progress:
+            on_progress('replica_stage', {
+                'stage': 'review_beats',
+                'message': (f'第 {attempt + 1} 轮修复没有减少硬伤'
+                            f'（{best_errors} → {remaining}），已丢弃本轮改动。'),
+            })
         attempt += 1
 
-    beats_doc['validation'] = violations
-    remaining_errors = [v for v in violations if v.get('level') == 'error']
-    fixed_count = max(0, len(initial_errors) - len(remaining_errors))
-    return beats_doc, max(1, fixed_count)
+    best_doc['validation'] = best_violations
+    return best_doc, max(0, len(initial_errors) - best_errors)
 
 
 # ── 工艺精修 ─────────────────────────────────────────────────────────────────

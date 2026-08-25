@@ -47,10 +47,15 @@ _CHAIN_CLASSIFIER_SYSTEM_PROMPT = (
 )
 
 
-def classify_chain_impact(config, texts, timeout=30):
+def classify_chain_impact(config, texts, timeout=30, on_error='chain'):
     """对一组已复核的违规做纯文本影响分级（chain vs cosmetic）。
-    
+
     分级器异常/解析失败时 fail-safe 兜底为 'chain'（停链只赔一次重渲，放行要赔整条下游）。
+
+    on_error：兜底取值。停链判定必须用默认的 'chain'。传 None 则失败时返回空列表——
+    给**只拿分级当展示**的调用方（手动整套审查那条路，见
+    pipeline_orchestrator._sequence_consistency_review）：那里分级不决定任何动作，
+    一次调用失败就把整单标成"会传染下游"是在编造判定，不如如实标成"未分级"。
     """
     if not texts:
         return []
@@ -58,7 +63,7 @@ def classify_chain_impact(config, texts, timeout=30):
         "Classify the following violations:\n"
         + json.dumps(list(texts), ensure_ascii=False, indent=2)
     )
-    fallback = ['chain'] * len(texts)
+    fallback = ([on_error] * len(texts)) if on_error else []
     try:
         response = _multimodal_chat(
             config, _CHAIN_CLASSIFIER_SYSTEM_PROMPT, user_text,

@@ -11078,19 +11078,26 @@ Space Type: {space_type}
     frame_state_contract = build_frame_state_contract(beat_ladder)
     frame_state_errors = validate_frame_state_contract(frame_state_contract)
     scene_states = build_scene_states(beat_ladder)
-    # 反推复刻线（dimensions.reverse_engineered）豁免「进 furnishing 前必须清场」这一条，
-    # 且**只豁免这一条**。原因见 scene_state.validate_scene_states 的 docstring：那条
-    # 规则审的是施工纪律，而复刻单交付的是对原片的转录，原片里那块防护布确实一直在。
-    # 在此之前这条闸会把每一单照实复刻都判死，replica_pipeline 只能在外面写一段
-    # 中文道歉去翻译它——翻译报错不是修复，让闸知道题材来源才是。
+    # 反推复刻线（dimensions.reverse_engineered）豁免两条**施工纪律**类规则：进
+    # furnishing 前必须清场、持久结构件不得拆除。原因见 scene_state.validate_scene_states
+    # 的 docstring：这两条审的是"该不该这么施工"，而复刻单交付的是对原片的转录——原片里
+    # 那块防护布确实一直在，那块自铺的 OSB 底板也确实在第 17 拍被起掉了。在此之前这类闸
+    # 会把照实复刻判死，replica_pipeline 只能在外面写一段中文道歉去翻译它——翻译报错不是
+    # 修复，让闸知道题材来源才是。豁免掉的判据不丢：它们落进 _scene_state_advisories。
+    scene_state_advisories: list[str] = []
     scene_state_errors = validate_scene_states(
         scene_states,
-        allow_lingering_temporaries=bool(dimensions.get('reverse_engineered')))
+        reverse_engineered=bool(dimensions.get('reverse_engineered')),
+        advisories=scene_state_advisories)
+    if scene_state_advisories and sys.stdout:
+        print(f'[DEBUG] scene-state discipline advisories waived on the '
+              f'reverse-engineered line: {scene_state_advisories}')
     if isinstance(config, dict):
         config['_frame_state_contract'] = frame_state_contract
         config['_frame_state_contract_errors'] = frame_state_errors
         config['_scene_states'] = scene_states
         config['_scene_state_errors'] = scene_state_errors
+        config['_scene_state_advisories'] = scene_state_advisories
     if (frame_state_errors or scene_state_errors) and strict_frame_state_contract_enabled(config):
         raise ComposeFailure(
             'Structured scene-state preflight rejected the beat ladder before prompt generation: '

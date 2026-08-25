@@ -142,9 +142,19 @@ assert.deepStrictEqual(badges(s), []);
 s = ready({ quality_gate: 'i2i_fallback_degraded', manual_issue: '透视歪', stale_lineage: true });
 assert.deepStrictEqual(badges(s), ['degraded', 'manual-flagged', 'stale']);
 
-// 结构化违规按条进 hover，不再拼成一根字符串
+// 结构化违规在 hover 里只留摘要：明细归点徽标展开的弹层（js/review_report.js），
+// 原生 tooltip 装不下多条判定，也不能选中复制
 s = ready({ review_issues: [{ layer: 'global', text: '施工顺序倒置', frames: [3, 4] }] });
-assert.ok(s.title.includes('[跨帧] 施工顺序倒置（涉及 IMG 003/004）'));
+assert.ok(s.title.includes('共 1 条审查违规，点徽标查看明细'));
+assert.ok(!s.title.includes('施工顺序倒置'), 'hover 不再展开违规原文');
+// 复核否决的不计数（后端本来就不落盘，老 manifest 里可能还留着）
+s = ready({
+    review_issues: [
+        { layer: 'global', text: '施工顺序倒置', frames: [3, 4] },
+        { layer: 'local', text: '被推翻的指控', frames: [3], verified: false },
+    ],
+});
+assert.ok(s.title.includes('共 1 条审查违规'));
 
 // 人工换位/上传只进 hover 说明（既有行为，不额外画徽标）
 s = ready({ swapped_from_sequence: 7, source: 'manual_upload' });

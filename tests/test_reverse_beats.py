@@ -2209,6 +2209,134 @@ class TestAutofixBeats(unittest.TestCase):
         self.assertEqual(spaces, ['exterior', 'exterior', 'interior'])
 
 
+class TestAutofixDoesNotMakeThingsWorse(unittest.TestCase):
+    """「越修越坏」的四道闸门（2026-08-25）。
+
+    症状：变体阶梯在人工卡点上按「AI 修复硬伤」，硬伤越修越多，而横幅始终显示在修。
+    四条成因各有一条用例守着——少一条，回路就会重新开始自我恶化。
+    """
+
+    def _regressed_ladder(self):
+        """B03 逆行到 rough_in：一条只有一个报错点的阶梯。"""
+        return {
+            'video_duration_sec': 10.0,
+            'banned_elements': [],
+            'scene_signature': 'a room',
+            'beats': [
+                _beat('B01', 0.0, 3.0, stage='demolition', events=('E01',)),
+                _beat('B02', 3.0, 6.0, stage='surface', events=('E02',)),
+                _beat('B03', 6.0, 10.0, stage='rough_in', events=('E03',)),
+            ],
+        }
+
+    def test_a_round_that_does_not_reduce_errors_is_discarded_whole(self):
+        """模型把阶梯改得更脏时整轮丢弃，返回 0 而不是谎报 1。
+
+        此前 `return beats_doc, max(1, fixed_count)`：硬伤从 1 涨到 2 也照报 1，外层
+        据此落盘、清合成产物、退工，用户看到「已修复 1 项」。连按三次就是三层复合漂移。
+        """
+        overview = _overview(('E01', 'E02', 'E03'))
+        doc = self._regressed_ladder()
+
+        # 模型「修」完之后 B03 仍然逆行，还把 B02 一起拖下水：错误数只增不减。
+        worse = json.dumps({'beats': [
+            {'id': 'B02', 'stage': 'reveal', 'operation': 'hero shot'},
+            {'id': 'B03', 'stage': 'rough_in', 'operation': 'pulling cable'},
+        ]})
+        with patch.object(pp, '_chat', return_value=worse):
+            fixed_doc, fixed_count = reverse.autofix_beats({}, doc, overview)
+
+        self.assertEqual(fixed_count, 0)
+        # 循环外的机械层预修复（事件重排 / 暗线豁免）是确定性的，照旧保留；
+        # 这里守的是**模型那一轮**一个字也没落地。
+        self.assertEqual(fixed_doc['beats'][1]['stage'], 'surface')
+        self.assertNotEqual(fixed_doc['beats'][1]['operation'], 'hero shot')
+        self.assertNotEqual(fixed_doc['beats'][2]['operation'], 'pulling cable')
+
+    def test_only_the_beats_named_by_an_error_may_be_rewritten(self):
+        """报错点名了 B03，模型顺手改的 B01 一律丢弃。
+
+        此前 `_merge_fixed_beats` 对返回的每一拍无条件覆盖：报 2 条错重写全部 14 拍，
+        本来干净的那些拍陪着一起被改写，新错误就是这么长出来的。
+        """
+        overview = _overview(('E01', 'E02', 'E03'))
+        doc = self._regressed_ladder()
+        reply = json.dumps({'beats': [
+            {'id': 'B01', 'operation': 'SHOULD NOT LAND', 'visual_subject': 'a different wall'},
+            {'id': 'B03', 'stage': 'floor', 'operation': 'installing wood planks'},
+        ]})
+        with patch.object(pp, '_chat', return_value=reply):
+            fixed_doc, fixed_count = reverse.autofix_beats({}, doc, overview)
+
+        self.assertTrue(fixed_count >= 1)
+        self.assertEqual(fixed_doc['beats'][2]['stage'], 'floor')
+        self.assertNotEqual(fixed_doc['beats'][0]['operation'], 'SHOULD NOT LAND')
+        self.assertEqual(fixed_doc['beats'][0]['visual_subject'], 'a wall')
+
+    def test_the_prompt_carries_the_frozen_variant_axes(self):
+        """修变体时四轴取值必须随稿下发并声明冻结。
+
+        修复器此前看不到 `mutation_axes`：它只有施工文本和报错单，于是按通用装修常识
+        改写措辞，每修一轮就把「极地峡湾 + 芬兰松木 + 白鲸」往通用毛坯房拉回一点。
+        """
+        overview = _overview(('E01', 'E02', 'E03'))
+        doc = self._regressed_ladder()
+        doc.update({
+            'variant_of': 'replica_src',
+            'mutation_axes': {'environment': '极地厚积雪与深蓝峡湾',
+                              'material': '粗犷芬兰松木原木'},
+            'scene_signature': 'A heavy timber refuge cabin in arctic snow.',
+        })
+        reply = json.dumps({'beats': [{'id': 'B03', 'stage': 'floor'}]})
+        with patch.object(pp, '_chat', return_value=reply) as chat_mock:
+            reverse.autofix_beats({}, doc, overview)
+
+        user_prompt = chat_mock.call_args[0][2]
+        self.assertIn('VARIANT AXES (FROZEN', user_prompt)
+        self.assertIn('极地厚积雪与深蓝峡湾', user_prompt)
+        self.assertIn('粗犷芬兰松木原木', user_prompt)
+        self.assertIn('A heavy timber refuge cabin in arctic snow.', user_prompt)
+
+    def test_a_legacy_list_shaped_mutation_axes_does_not_crash_the_fixer(self):
+        """早期写法里 `mutation_axes` 是轴名列表，不是四轴字典。
+
+        直接 `.items()` 会把一条本来只是阶段逆行的变体炸在修复入口上。"""
+        overview = _overview(('E01', 'E02', 'E03'))
+        doc = self._regressed_ladder()
+        doc.update({'variant_of': 'replica_src', 'mutation_axes': ['carrier', 'material']})
+        reply = json.dumps({'beats': [{'id': 'B03', 'stage': 'floor'}]})
+        with patch.object(pp, '_chat', return_value=reply) as chat_mock:
+            reverse.autofix_beats({}, doc, overview)
+        self.assertIn('- carrier', chat_mock.call_args[0][2])
+
+    def test_the_loop_does_not_wipe_the_event_claims_the_model_just_fixed(self):
+        """循环内的事件调解只解重复认领，不清空重排。
+
+        默认的 `reconcile_unbound=True` 第一件事是把所有拍的 `source_event_ids` 清空
+        再按时间窗重排，会把模型刚改好的认领当场作废——两边每轮互相覆盖，误差在
+        stage/operation 上震荡。
+        """
+        overview = _overview(('E01', 'E02', 'E03'))
+        doc = self._regressed_ladder()
+        # 机械层的预修复（循环外那一次）照旧按时间窗重排，这里让它排出的结果就是原样。
+        reply = json.dumps({'beats': [{'id': 'B03', 'stage': 'floor'}]})
+
+        calls = []
+        real_reconcile = reverse.reconcile_event_coverage
+
+        def _spy(beats_doc, ov=None, reconcile_unbound=True):
+            calls.append(reconcile_unbound)
+            return real_reconcile(beats_doc, ov, reconcile_unbound=reconcile_unbound)
+
+        with patch.object(pp, '_chat', return_value=reply), \
+             patch.object(reverse, 'reconcile_event_coverage', side_effect=_spy):
+            reverse.autofix_beats({}, doc, overview)
+
+        self.assertEqual(calls[0], True, '循环外的确定性预修复照旧全量重排')
+        self.assertTrue(all(flag is False for flag in calls[1:]),
+                        f'循环内不得清空重排，实际 {calls}')
+
+
 class TestMicroEngineeringForensics(unittest.TestCase):
     """验证微观工程细节提取、细粒度实体本体规范化与 ROI 局部切片生成。"""
 

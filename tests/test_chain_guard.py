@@ -99,6 +99,18 @@ class TestChainGuard(unittest.TestCase):
             severities = cg.classify_chain_impact({}, ['问题一', '问题二'])
             self.assertEqual(severities, ['chain', 'chain'])
 
+    def test_display_only_callers_can_opt_out_of_the_chain_fallback(self):
+        """手动整套审查拿分级只用于展示、不决定任何动作（见
+        pipeline_orchestrator._classify_review_severity）。那条路失败时把整单标成
+        "会传染下游"是在编造判定，所以允许 on_error=None 换成"没分级"。
+        停链那条路必须继续用默认的 chain 兜底——上面那个用例守着。"""
+        with patch.object(cg, '_multimodal_chat', side_effect=Exception('LLM timeout')):
+            self.assertEqual(cg.classify_chain_impact({}, ['问题一'], on_error=None), [])
+        # 解析不出形状时同样走兜底
+        with patch.object(cg, '_multimodal_chat', return_value='not json'):
+            self.assertEqual(cg.classify_chain_impact({}, ['问题一'], on_error=None), [])
+            self.assertEqual(cg.classify_chain_impact({}, ['问题一']), ['chain'])
+
     def test_chain_issue_triggers_halt_and_sets_flag_without_review_frames_sha256(self):
         with patch.object(cg, 'check_beat_consistency', return_value=['天花板结构坍塌']), \
              patch.object(cg, '_verify_review_violation', return_value=True), \

@@ -375,12 +375,13 @@ function frameHoverTitle(frame, seq, flags) {
     FRAME_BADGE_DEFS.forEach(d => {
         if (d.test(frame)) t += d.hover(frame);
     });
-    // 结构化违规：哪一层检出的、涉及哪几帧都留了下来，按条列出比一根 '；' 好读
+    // 结构化违规只在 title= 里留一句摘要。原生 tooltip 装不下多条判定——不能选中
+    // 复制、断行不可控、鼠标一动就没；明细改由点徽标展开的弹层承接
+    // （slot_card 的 ISSUE_DETAIL_BADGES → review_report.openFrameIssuePop），
+    // 那边同时会把跨帧层重复挂在多帧上的同一条违规去重。
     if (Array.isArray(frame.review_issues) && frame.review_issues.length) {
-        t += '\n' + frame.review_issues.map(i =>
-            `· [${i.layer === 'global' ? '跨帧' : (i.layer === 'manual' ? '人工' : '本拍')}] `
-            + `${i.text}（涉及 IMG ${(i.frames || []).map(padSlot).join('/')}）`
-        ).join('\n');
+        const n = frame.review_issues.filter(i => i && i.verified !== false).length;
+        if (n) t += `\n共 ${n} 条审查违规，点徽标查看明细`;
     }
     if (flags.swappedFrom !== null) t += ` (人工从 IMG ${padSlot(flags.swappedFrom)} 拖过来)`;
     if (flags.manualUpload) t += ' (人工上传的本地图片)';

@@ -1136,6 +1136,124 @@ class TestReviewVerdictInvalidation(_TmpProjectCase):
         self.assertIn('review_frames_sha256', frames[3])
 
 
+class TestReviewSeverityAndStructuredResult(_TmpProjectCase):
+    """审查结论的可读化（2026-08-25）：
+
+    1. 影响分级（chain / cosmetic）此前只有生成期链上守卫在用——它需要它来决定停不
+       停链。手动整套审查这条路从没调过分级器，于是"会一路传染进后面每一帧的结构
+       问题"与"只是光影差一点"在前端长得一模一样。现在补上，落进 review_issues。
+    2. 结果播报此前是把「几帧有问题 + 每帧原因 + 未审完 + 只覆盖前缀 + 复用了几拍」
+       拼成一根字符串扔进日志流。现在同一份内容另出一份结构化的 lines/flagged_frames，
+       message 原样保留（老前端与服务端日志不受影响）。
+    """
+
+    def _three_flagged(self):
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
+        ]})
+        return _review({1: ['塔吊消失']}) | {
+            'issues': [{'text': '塔吊消失', 'layer': 'local', 'beat': 1,
+                        'frames': [1, 2], 'verified': True}],
+        }
+
+    def _run(self, review_result, classify=None, events=None):
+        cm = patch.object(po, 'check_full_sequence_consistency', return_value=review_result)
+        import chain_guard
+        cls = patch.object(chain_guard, 'classify_chain_impact',
+                           **({'side_effect': classify} if callable(classify)
+                              else {'return_value': classify if classify is not None else []}))
+        with cm, cls as spy:
+            po._sequence_consistency_review(
+                {}, self.TITLE, self.PROMPT_BLOCK, self.project_dir,
+                on_progress=(lambda s, d: events.append((s, d))) if events is not None else None)
+        return spy
+
+    def _issues_of(self, seq):
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        return frames[seq].get('review_issues') or []
+
+    def test_severity_is_classified_and_persisted(self):
+        spy = self._run(self._three_flagged(), classify=['chain'])
+        self.assertEqual([i.get('severity') for i in self._issues_of(2)], ['chain'])
+        # 只送文案，不送整个 dict
+        self.assertEqual(spy.call_args[0][1], ['塔吊消失'])
+
+    def test_classifier_failure_leaves_issues_unclassified_not_alarming(self):
+        """分级器挂了就不分级。这里的分级只用于展示、不决定任何动作，把整单标成
+        "会传染下游"是在编造判定（停链那条路才需要 fail-safe 到 chain）。"""
+        spy = self._run(self._three_flagged(), classify=[])   # on_error=None 的失败形状
+        self.assertNotIn('severity', self._issues_of(2)[0])
+        self.assertIn('on_error', spy.call_args.kwargs,
+                      '展示用的分级必须显式传 on_error，不能沿用停链的 chain 兜底')
+        self.assertIsNone(spy.call_args.kwargs['on_error'])
+
+    def test_partial_classification_is_discarded_whole(self):
+        # 分级器只回了一半：宁可整轮不分级，也不半套落盘
+        result = self._three_flagged()
+        result['issues'].append({'text': '地面材质突变', 'layer': 'local', 'beat': 1,
+                                 'frames': [1, 2], 'verified': True})
+        self._run(result, classify=['chain'])
+        self.assertTrue(all('severity' not in i for i in self._issues_of(2)))
+
+    def test_existing_severity_is_not_reclassified(self):
+        """链上守卫审过的拍自带判定（见 _inline_result），不重分也不重复计费。"""
+        result = self._three_flagged()
+        result['issues'][0]['severity'] = 'cosmetic'
+        spy = self._run(result, classify=['chain'])
+        self.assertEqual(self._issues_of(2)[0]['severity'], 'cosmetic')
+        spy.assert_not_called()
+
+    def test_same_text_across_frames_is_classified_once(self):
+        """跨帧层的一条违规会同时落在它涉及的每一帧上，分级只该送一次。"""
+        result = self._three_flagged()
+        result['issues'] = [
+            {'text': '施工顺序倒置', 'layer': 'global', 'beat': b,
+             'frames': [1, 2, 3], 'verified': True} for b in (1, 2)
+        ]
+        spy = self._run(result, classify=['chain'])
+        self.assertEqual(spy.call_args[0][1], ['施工顺序倒置'])   # 去重后只有一条
+
+    def test_rejected_issues_are_neither_classified_nor_persisted(self):
+        result = self._three_flagged()
+        result['issues'].append({'text': '被推翻的指控', 'layer': 'local', 'beat': 1,
+                                 'frames': [1, 2], 'verified': False})
+        spy = self._run(result, classify=['chain'])
+        self.assertEqual(spy.call_args[0][1], ['塔吊消失'])
+        self.assertEqual([i['text'] for i in self._issues_of(2)], ['塔吊消失'])
+
+    # ── 结构化播报 ──────────────────────────────────────────────────
+    def test_result_event_carries_structured_lines_and_frames(self):
+        events = []
+        self._run(self._three_flagged(), classify=['chain'], events=events)
+        ev = [d for s, d in events if s == 'sequence_review_result'][-1]
+
+        self.assertFalse(ev['passed'])
+        self.assertEqual([f['sequence'] for f in ev['flagged_frames']], [2])
+        self.assertIn('塔吊消失', ev['flagged_frames'][0]['reason'])
+        # 每帧原因各占一行，不再和"几帧有问题/未审完/复用"挤在同一句里
+        texts = [l['text'] for l in ev['lines']]
+        self.assertTrue(any('发现 1 帧存在问题' in t for t in texts))
+        self.assertTrue(any('IMG 002' in t and '塔吊消失' in t for t in texts))
+        self.assertTrue(all(isinstance(l.get('cls', ''), str) for l in ev['lines']))
+        # message 原样保留：老前端与服务端日志靠它
+        self.assertIn('一致性审查', ev['message'])
+
+    def test_passing_run_also_carries_lines(self):
+        for seq in (1, 2, 3):
+            self._touch_frame(seq)
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': s, 'quality_gate': 'pending_manual_review'} for s in (1, 2, 3)
+        ]})
+        events = []
+        self._run(_review({}), events=events)
+        ev = [d for s, d in events if s == 'sequence_review_result'][-1]
+        self.assertTrue(ev['passed'])
+        self.assertEqual(ev['flagged_frames'], [])
+        self.assertTrue(any('审查通过' in l['text'] for l in ev['lines']))
+
+
 class TestUndoFrameFix(_TmpProjectCase):
     """修复快照与撤销（2026-08-02）：定向修复是**覆盖写同一个帧文件**，旧图此前不留档
     ——修坏了只能盲重渲碰运气，也没法拿前后两张对比。删除整拍早有 .deleted_slots 快照，
