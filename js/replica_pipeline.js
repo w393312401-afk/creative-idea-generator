@@ -708,7 +708,29 @@ function replicaRenderBottomBar(state) {
         mainActionHtml = `<button type="button" id="replica-bar-cancel-btn" class="action-btn text-btn">中断这一轮</button>`;
     } else if (stage === 'confirm_cost') {
         mainActionHtml = `<button type="button" id="replica-bar-start-btn" class="action-btn primary-btn">确认并开始反推</button>`;
-    } else if (stage === 'review_beats' || (hasBeats && stage !== 'completed' && stage !== 'audit_failed')) {
+    } else if (stage === 'completed' || stage === 'audit') {
+        const hasPrompt = !!state.prompt_block;
+        mainActionHtml = `
+            <button type="button" id="replica-bar-save-btn"
+                    class="action-btn text-btn ${replicaDirty ? 'replica-bar-save-dirty' : ''}"
+                    ${replicaDirty ? 'title="有改动还没存下来"' : ''}
+                >保存并重校验${replicaDirty ? '<span class="replica-dirty-dot"></span>' : ''}</button>
+            ${resetCacheToggleHtml}
+            ${hasPrompt
+                ? `<button type="button" id="replica-bar-recompose-btn" class="action-btn text-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>重新合成</button>
+                   <button type="button" id="replica-bar-project-btn" class="action-btn primary-btn">存入项目并打开激发结果</button>`
+                : `<button type="button" id="replica-bar-compose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词</button>`}
+        `;
+    } else if (stage === 'audit_failed' || stage === 'compose_failed') {
+        mainActionHtml = `
+            <button type="button" id="replica-bar-save-btn"
+                    class="action-btn text-btn ${replicaDirty ? 'replica-bar-save-dirty' : ''}"
+                    ${replicaDirty ? 'title="有改动还没存下来"' : ''}
+                >保存并重校验${replicaDirty ? '<span class="replica-dirty-dot"></span>' : ''}</button>
+            ${resetCacheToggleHtml}
+            <button type="button" id="replica-bar-recompose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>重新合成</button>
+        `;
+    } else if (hasBeats) {
         mainActionHtml = `
             <button type="button" id="replica-bar-save-btn"
                     class="action-btn text-btn ${replicaDirty ? 'replica-bar-save-dirty' : ''}"
@@ -716,15 +738,6 @@ function replicaRenderBottomBar(state) {
                 >保存并重校验${replicaDirty ? '<span class="replica-dirty-dot"></span>' : ''}</button>
             ${resetCacheToggleHtml}
             <button type="button" id="replica-bar-compose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词</button>
-        `;
-    } else if (stage === 'completed' || stage === 'audit') {
-        mainActionHtml = `
-            <button type="button" id="replica-bar-project-btn" class="action-btn primary-btn">存入项目并打开激发结果</button>
-        `;
-    } else if (stage === 'audit_failed' || stage === 'compose_failed') {
-        mainActionHtml = `
-            ${resetCacheToggleHtml}
-            <button type="button" id="replica-bar-recompose-btn" class="action-btn primary-btn">重新合成</button>
         `;
     }
 
@@ -2426,9 +2439,10 @@ function replicaRenderOutput(state) {
         </div>`}
         <div class="replica-actions">
             <button type="button" id="replica-copy-btn" class="action-btn text-btn">复制全部</button>
+            <button type="button" id="replica-recompose-btn" class="action-btn ${blocked ? 'primary-btn' : 'text-btn'}"
+                    title="不重跑聚类，直接重新合成提示词">重新合成</button>
             ${blocked
-                ? `<button type="button" id="replica-recompose-btn" class="action-btn primary-btn"
-                           title="回到节拍阶梯改完后重新合成">重新合成</button>`
+                ? ''
                 : `<button type="button" id="replica-project-btn" class="action-btn primary-btn"
                            title="把这份已过门禁的提示词存成一个项目，并立刻打开它的激发结果页">存入项目并打开激发结果</button>`}
         </div>

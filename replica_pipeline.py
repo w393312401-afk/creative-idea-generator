@@ -1129,6 +1129,8 @@ def save_beats(job_id, beats):
     # （见 attach_coverage_frames / attach_shot_cuts）。
     reverse.attach_coverage_frames(beats, overview)
     reverse.attach_shot_cuts(beats, overview)
+    # 逐镜景别序列跟着切点一起重算：拆拍/并拍改的就是时间窗，镜头窗跟着变。
+    reverse.attach_shot_scales(beats, overview, job_dir=directory)
     beats['pipeline_id'] = job_id
     beats['validation'] = reverse.validate_beats(beats, overview)
     beats['edited_by_user'] = True
@@ -1140,6 +1142,8 @@ def save_beats(job_id, beats):
     beats_changed = (state.get('beats') or {}).get('beats') != beats.get('beats')
     if state.get('stage') != 'audit_failed' or beats_changed:
         _invalidate_compose_artifacts(state)
+        if state.get('stage') in ('completed', 'audit'):
+            state['stage'] = 'review_beats'
 
     _write_beats(state, beats)
     return _save_state(state)
@@ -1716,6 +1720,9 @@ def _revalidate(state, persist=True):
         # 同一条回填通路补上观察到的镜头切点：存量任务不用重跑抽帧/聚类，
         # 读一次状态就能在卡点上看见「原片这一拍切了几刀」。
         reverse.attach_shot_cuts(beats, overview)
+        # 同上，逐镜景别序列也在这条回填通路上补：存量任务读一次状态就补上，
+        # 不用重跑 Pass A（帧事实已经在盘上了，缺的只是按镜头窗投一次票）。
+        reverse.attach_shot_scales(beats, overview, job_dir=job_dir(state['job_id']))
         # 键名漂移同样在这里补救：存量任务不用重跑聚类，读一次状态就把「缺少字段」
         # 这类假硬伤化掉（真的缺内容当然还是照报）。
         reverse.normalize_beat_keys(beats)

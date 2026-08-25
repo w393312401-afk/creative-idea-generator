@@ -642,6 +642,10 @@ _TWO_ANCHOR_DECLARATION_RE = re.compile(
 _INTERPOLATION_CLAUSE_RE = re.compile(
     r'interpolat\w*\s+between\s+(?:those|these|the)\s+two\s+frame\s+images?', re.IGNORECASE)
 
+_SINGLE_ANCHOR_DECLARATION_RE = re.compile(
+    r'(?:sole\s+starting[- ]frame\s+anchor|starting\s+composition\s+and\s+environment\s+anchor|no\s+last[- ]frame\s+reference\s+image|without\s+inventing\s+extraneous\s+layouts)',
+    re.IGNORECASE | re.DOTALL)
+
 _SINGLE_FRAME_OPENING = (
     "Use the provided reference image (IMAGE 1) as the sole starting-frame anchor for this clip "
     "— use IMAGE 1 as the actual first-frame image. There is no last-frame reference image for "
@@ -657,6 +661,8 @@ _T2V_DISCARD_SENTENCE_RE = re.compile(
     r'\blast[\s-]frame\b.*?\bfirst[\s-]frame\b|'
     r'exact\s+composition\s+anchors|'
     r'sole\s+starting[- ]frame\s+anchor|'
+    r'starting\s+composition\s+and\s+environment\s+anchor|'
+    r'without\s+inventing\s+extraneous\s+layouts|'
     r'no\s+last[- ]frame\s+reference\s+image|'
     r'interpolat\w*\s+between\s+(?:those|these|the)\s+(?:two\s+)?frame\s+images?|'
     r'Use\s+(?:the\s+provided\s+)?(?:reference\s+image\s+)?\(?(?:IMAGE|图片)\s*\d+\)?\s+as\s+(?:the\s+)?(?:actual\s+)?first[- ]frame|'
@@ -699,26 +705,14 @@ def prepare_prompt_for_t2v(prompt: str) -> str:
 
 
 def rewrite_prompt_for_single_frame(prompt, start_slot):
-    """把一条为两张锚点帧写的视频正文改写成单图段（只上首帧）能用的正文。
-
-    2026-08-22：单帧分支此前只把 `IMAGE start_slot` 换成 `IMAGE 1`，正文里那句
-    "…and IMAGE 13 as the actual last-frame image" 原样留着，于是一个**裸的 IMAGE 13**
-    被送进模型——它会去找一张根本没上传的参考图。同一段还留着"在两张帧之间插值、不得
-    自造第三种布局"，而单图段恰恰没有第二张可插值的帧。两者叠起来，模型只能自由发挥。
-
-    三步：
-      1. 丢掉两卡位锚点声明句与插值指令句（整句就是这件事，删了不损失动作正文）；
-      2. 正文中残留的 `IMAGE start_slot` 换成 `IMAGE 1`，其余任何 `IMAGE n` 一律换成
-         「本段自己要抵达的完工态」——不能留裸编号；
-      3. 前置单锚点声明，并把"没有尾锚"这件事和"不得另起炉灶"一起写明。
-    """
+    """把一条为两张锚点帧写的视频正文改写成单图段（只上首帧）能用的正文。"""
     text = str(prompt or '').strip()
     if not text:
         return _SINGLE_FRAME_OPENING
 
     kept = []
     for sentence in re.split(r'(?<=[.!?])\s+', text):
-        if _TWO_ANCHOR_DECLARATION_RE.search(sentence) or _INTERPOLATION_CLAUSE_RE.search(sentence):
+        if _TWO_ANCHOR_DECLARATION_RE.search(sentence) or _INTERPOLATION_CLAUSE_RE.search(sentence) or _SINGLE_ANCHOR_DECLARATION_RE.search(sentence):
             continue
         kept.append(sentence)
     body = ' '.join(s for s in kept if s.strip()).strip()
@@ -1960,17 +1954,18 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
         raw_prompt = item['body'] if isinstance(item, dict) else item
         meta = str(item.get('meta', '') if isinstance(item, dict) else '').upper()
         dest_path = os.path.join(videos_dir, f'vid_{slot:03d}.mp4')
-        is_hero = 'HERO' in meta
-
-        is_t2v = (slot == first_slot)
-        start_frame_path = None
+        start_frame_path = os.path.join(frames_dir, f'img_{slot:03d}.webp')
+        has_initial_frame = (slot == first_slot) and os.path.exists(start_frame_path) and os.path.getsize(start_frame_path) > 0
+        is_t2v = (slot == first_slot) and not has_initial_frame
 
         if is_t2v:
+            start_frame_path = None
             prompt_for_gen = prepare_prompt_for_t2v(raw_prompt)
+        elif slot == first_slot and has_initial_frame:
+            prompt_for_gen = rewrite_prompt_for_single_frame(raw_prompt, start_slot=slot)
         else:
             prev_slot = slot - 1
             prev_video_path = os.path.join(videos_dir, f'vid_{prev_slot:03d}.mp4')
-            start_frame_path = os.path.join(frames_dir, f'img_{slot:03d}.webp')
 
             # 如果参考帧图片不存在，尝试从上一段视频的尾帧抽取
             if (not os.path.exists(start_frame_path) or os.path.getsize(start_frame_path) == 0) and os.path.exists(prev_video_path):

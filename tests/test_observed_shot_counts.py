@@ -181,14 +181,12 @@ class TestLadderSelection(unittest.TestCase):
                                                        'observed_shot_count': 6})
                     self.assertEqual(len(ladder), 3)
 
-    def test_the_timeline_sentence_follows_the_chosen_ladder(self):
-        """切点表是确定性注入的，选错梯就等于给这条片子发了一张错的切点表。"""
+    def test_the_ladder_selection_follows_the_chosen_ladder(self):
         composer = _composer('omni')
         beat = {'operation': 'build', 'observed_shot_count': 1}
-        text = composer.normalize_omni_video(
-            'The worker sets blocks along the course.', beat=beat)
-        self.assertIn('a returning wide shot', text)
-        self.assertNotIn('extreme close-up insert', text)
+        ladder = composer.ladder_for_beat(beat)
+        self.assertEqual(len(ladder), 3)
+        self.assertEqual([r.key for r in ladder], ['main', 'close', 'return'])
 
 
 if __name__ == '__main__':

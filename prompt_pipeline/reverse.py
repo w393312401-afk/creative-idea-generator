@@ -38,7 +38,11 @@ import prompt_pipeline as pp
 # v6（2026-08-25）：新增 lens_feel（焦段感）与 subject_placement（主体在画面里的位置与
 # 占比）——锚点系统的 grid / z_depth_scale 此前从没在原片上量过，全是 packet 那次调用
 # 按主题编的。
-PASS_A_PROMPT_VERSION = 'v6'
+# v7（2026-08-25）：新增逐帧 shot_scale（远/全/中/近/特）。此前景别只有**逐拍**一个读数，
+# 而原片一拍是由几个镜头组成的——多镜头交付线的镜头梯因此只能拿一个景别去排三到四镜，
+# 中间那两个插入镜的景别全是写死的。逐帧有了读数，才能按 observed_cuts 切出的每一个镜头
+# 各自投一次票（attach_shot_scales），镜头梯才真的是照着原片的景别序列排的。
+PASS_A_PROMPT_VERSION = 'v7'
 
 # ── 实体规范化与消歧词典 ───────────────────────────────────────────────────
 #
@@ -269,6 +273,7 @@ HARD RULES
   - camera_angle (vertical) is one of: bird_eye (straight or near-straight down, ground plane fills the frame), high_angle (above the subject looking down, top surfaces visible, horizon high or out of frame), eye_level (lens at standing height, frame reads level, horizon near the middle), low_angle (below the subject looking up, undersides visible, horizon low), worm_eye (lens on or near the ground looking sharply up), dutch_angle (the whole frame is rolled off horizontal — the horizon itself is tilted).
   - camera_bearing (horizontal) is one of: front, three_quarter (a front and a side face both visible), side (the flank alone), rear_three_quarter, back — which face of the subject the lens is looking at.
   - Read them from converging lines, which faces of objects are visible, and where the horizon sits. Write the exact token and nothing else. If the frame is too tight, too dark, or too featureless to tell, leave that one empty and lower the confidence — a guessed angle is worse than a blank one, because everything downstream will reproduce it.
+- shot_scale: HOW MUCH OF THE SUBJECT THIS FRAME HOLDS — one of extreme_wide (the whole site/landscape, the subject small in it), wide (the whole subject and its immediate surroundings), medium (part of the subject, roughly a person from the waist up), close (one component, joint, or a face filling most of the frame), extreme_close (a detail smaller than a hand — a screw head, a bead of sealant, a blade edge). Read it off how much of the FRAME the subject occupies, nothing else. This is NOT lens_feel: a wide lens standing close gives a close shot. Every frame gets one — if the frame is unreadable, leave it empty and lower the confidence.
 - lens_feel: how WIDE the lens is, read off the perspective itself — one of ultra_wide (strong barrel curvature at the edges, near objects looming, edges stretched), wide (noticeably expansive but not distorted), normal (perspective looks like unaided vision, no compression, no stretch), tele (background compressed and flattened onto the subject, shallow depth), macro (a subject smaller than a hand filling the frame at close focus). This is NOT the same reading as how much of the scene is in shot: a wide lens standing far back and a long lens standing close both give you "the whole wall". Leave it empty if the frame gives you nothing to judge by.
 - subject_placement: WHERE THE MAIN SUBJECT SITS IN THIS FRAME AND HOW BIG IT IS. One short sentence carrying three things: its horizontal position (left / centre / right, in thirds), its vertical position, and how much of the frame HEIGHT it occupies, plus where the horizon sits if one is visible. Example: "the shell sits centred, filling about three fifths of frame height, horizon across the upper third"; "the trench runs along the lower left, taking the bottom quarter of the frame". Write fractions in words, never digits or percent signs. This is the one reading that says what the reference film's composition actually is — everything downstream currently guesses it.
 - Describe completion extent spatially and concretely: "left two-thirds of the wall is coated, right third is bare" — never "partially done".
@@ -292,6 +297,7 @@ Return a JSON array, one object per frame given, in the same order:
   "fastening_and_bonding": ["<countersunk screws, expanding foam, staples, adhesive>"],
   "camera_angle": "<bird_eye|high_angle|eye_level|low_angle|worm_eye|dutch_angle, or empty if unreadable>",
   "camera_bearing": "<front|three_quarter|side|rear_three_quarter|back, or empty if unreadable>",
+  "shot_scale": "<extreme_wide|wide|medium|close|extreme_close, or empty if unreadable>",
   "lens_feel": "<ultra_wide|wide|normal|tele|macro, or empty if unreadable>",
   "subject_placement": "<one short sentence: the main subject's horizontal and vertical position and what fraction of frame height it fills, plus where the horizon sits; fractions in words>",
   "workers_present": true|false,
@@ -953,6 +959,9 @@ def _parse_facts_array(raw, expected_names, strict=False):
         camera_bearing = _coerce_enum(item.get('camera_bearing'), CAMERA_BEARINGS,
                                       _CAMERA_BEARING_SYNONYMS) or ''
         lens_feel = _coerce_enum(item.get('lens_feel'), LENS_FEELS, _LENS_FEEL_SYNONYMS) or ''
+        # 逐帧景别（v7）。走和逐拍 shot_scale 同一张近义词表：模型会写 "wide shot"、"CU"。
+        shot_scale = _coerce_enum(item.get('shot_scale'), SHOT_SCALES,
+                                  _SHOT_SCALE_SYNONYMS) or ''
         # 构图是自由文本（它要说位置、占比、地平线三件事，闭集装不下），只做去空白。
         subject_placement = ' '.join(str(item.get('subject_placement') or '').split())
 
@@ -969,6 +978,7 @@ def _parse_facts_array(raw, expected_names, strict=False):
             'cast_appearance': cast_appearance,
             'camera_angle': camera_angle,
             'camera_bearing': camera_bearing,
+            'shot_scale': shot_scale,
             'lens_feel': lens_feel,
             'subject_placement': subject_placement,
             'completion_extent': str(item.get('completion_extent') or '').strip(),
@@ -1550,7 +1560,7 @@ RULES
   - worker_count: how many people are visible in this beat, as an integer. 0 for a sterile beat, and it must agree with workers_present.
   - light_state: the light and time of day in this beat ("overcast midday, no cast shadows", "low golden side light from frame left"). The film spans days; a beat that does not declare its light gets a random one.
   - material_flow: where this beat's material went or came from ("excavated soil piled on the trench's north lip", "offcuts bundled and carried out through the doorway"). This is the Material & Spoil Balance rule's field — demolition must say where debris goes, installation must say what stock was consumed.
-  - cast_action: what EVERY living thing in frame is DOING WITH ITS BODY this beat, apart from the work itself — and above all HOW THAT CHANGED since the previous beat. Write it as a MOVE: the pose they held last beat -> the pose they hold now ("the two figurines get up off the stone and turn to face the rising wall, the one in red now half a step closer than before, while the brown dog rises from the shade and pads to the trench lip"; "crouches down at the wall foot, head tilted to sight along the course"). Living thing means a person, a miniature figurine, OR an animal (the site dog, a cat on the wall, a resin hen in the diorama) — cover each one that is in frame, not just the humans. NEVER write "remain", "stay", "unchanged", "in the same spot", "still standing where they were": that is a POSITION, not a move, and it is copied verbatim into every frame downstream, so the delivered film shows plastic dolls that never move once — the single most-reported failure of this pipeline. If a subject genuinely barely moved, write the smallest real change instead: a head turn, a shift of weight, a hand raised to point. Never repeat visible_action here: that one is the operation, this one is the body. If nothing alive is in frame, leave it out.
+  - cast_action: what EVERY living thing in frame is DOING WITH ITS BODY this beat, apart from the work itself — structured as an ACTION-REACTION CAUSAL CHAIN: [Trigger Event in this beat] -> [Immediate Reflex / Bodily Reaction] -> [Engaged Tracking / Motion] -> [Settled Posture] ("As the giant hand descends from the canopy -> the two figurines tilt heads back looking up in awe -> as the shack is gripped -> swiftly stand up onto their feet and step back -> turn to face the cleared footprint as the blueprint is lowered"; "As the shovel strikes the dirt -> turns head to track the blade -> steps closer to inspect the deepening trench"). Living thing means a person, a miniature figurine, OR an animal (the site dog, a cat on the wall, a resin hen in the diorama) — cover each one that is in frame, not just the humans. NEVER write "remain", "stay", "unchanged", "in the same spot", "still standing where they were": that is a POSITION, not a move, and it is copied verbatim into every frame downstream, so the delivered film shows plastic dolls that never move once — the single most-reported failure of this pipeline. If a subject genuinely barely moved, write the smallest real change instead: a head turn, a shift of weight, an eye-tracking response. Never repeat visible_action here: that one is the operation, this one is the body's reaction to the operation. If nothing alive is in frame, leave it out.
   - material_specs: ONE to THREE engineering specs for the material this beat works with — nominal thickness, grade, section size, surface texture, sheen ("9mm OSB sheathing, raw matte face", "2x4 SPF studs (38x89mm)", "black polyethylene vapour barrier, red taped seams"). The FRAME FACTS you are given already carry a mat_specs field measured frame by frame; lift it from there. This is NOT visible_details: that one says what the material is, what colour it is and where it sits in frame; this one says how thick it is, what grade it is and what its face looks like. Copy nothing you cannot find in the frame facts — never fill in a plausible nominal size from trade habit.
   - tool_specifics: the specific type, drive mechanism and active bit/blade of the ONE tool named in "tool" ("18V cordless brushless impact driver with magnetic bit", "pneumatic framing nailer", "stainless steel notched trowel"). The frame facts carry this as tool_specs. "tool" says which tool; this says which KIND of that tool. Leave it out if the frames never show it clearly enough to say.
   - fastening_and_bonding: ONE to THREE visible fasteners or chemical bonds this beat uses ("countersunk black drywall screws", "expanding PU foam sealant along the gap", "construction adhesive bead", "staples"). The frame facts carry it as fasteners. This is what the beat's joints actually look like, and it is also what decides whether this beat's sfx is a driving whine, a nail crack, or a squeeze — keep the two consistent.
@@ -1631,7 +1641,7 @@ Return one JSON object, no prose, no code fences:
     "worker_count": <integer>,
     "light_state": "...",
     "material_flow": "...",
-    "cast_action": "<how the people/figurines/animals in frame MOVED this beat — the pose they held last beat -> the pose they hold now, apart from the work; never 'remain/stay/unchanged'; omit if nobody is in frame>",
+    "cast_action": "<ACTION-REACTION CAUSAL CHAIN: Trigger Event -> Immediate Reflex -> Engaged Tracking -> Settled Posture; never 'remain/stay/unchanged'; omit if nobody is in frame>",
     "insert_subject": "<what the film's closer cut-in inside this beat is on; omit if this beat is one uninterrupted shot>",
     "workers_present": true|false,
     "source_event_ids": ["E01"],
@@ -1683,6 +1693,8 @@ def _facts_digest(facts):
             parts.append(f'cast={"/".join(f["cast_appearance"])}')
         if f.get('camera_angle') or f.get('camera_bearing'):
             parts.append(f'view={f.get("camera_angle") or "?"}/{f.get("camera_bearing") or "?"}')
+        if f.get('shot_scale'):
+            parts.append(f'scale={f["shot_scale"]}')
         if f.get('lens_feel'):
             parts.append(f'lens={f["lens_feel"]}')
         if f.get('subject_placement'):
@@ -1858,6 +1870,9 @@ def cluster_beats(config, job_dir, facts_payload=None, on_progress=None, max_rew
         ensure_three_evidence_frames(beats_doc, overview)
         attach_coverage_frames(beats_doc, overview)
         attach_shot_cuts(beats_doc, overview)
+        # 逐镜景别序列（v7）。必须排在 attach_shot_cuts 之后：它切镜头窗靠的就是那一步
+        # 挂上的 observed_cuts。
+        attach_shot_scales(beats_doc, overview, facts=facts)
         # 定长窗随文档一起落盘：卡点上要拿它跟节拍对照，回炉时也要用同一份，不能
         # 每次重算一遍——那样两次看到的「画面变化」可能不是同一份。
         beats_doc['time_windows'] = windows
@@ -3081,6 +3096,88 @@ def attach_shot_cuts(beats_doc, overview):
     return beats_doc
 
 
+def shot_windows_for_beat(beat):
+    """按 `observed_cuts` 把这一拍的拍窗切成逐个镜头窗，返回 [(start, end), …]。
+
+    没有切点数据时返回 []（**不是**「整拍算一镜」）：未知与一镜到底必须分得开，
+    与 attach_shot_cuts 同一条纪律。
+    """
+    if not isinstance(beat, dict) or 'observed_cuts' not in beat:
+        return []
+    lo, hi = sorted((_num(beat.get('start')), _num(beat.get('end'))))
+    if not (hi > lo):
+        return []
+    marks = [lo] + [t for t in (beat.get('observed_cuts') or []) if lo < t < hi] + [hi]
+    return [(marks[i], marks[i + 1]) for i in range(len(marks) - 1)]
+
+
+def attach_shot_scales(beats_doc, overview, facts=None, job_dir=None):
+    """给每一拍挂上 `observed_shot_scales`：这一拍**逐个镜头**的景别。派生数据，每次重算。
+
+    为什么需要它：景别此前只有逐拍一个读数，而原片一拍本来就是几个镜头。多镜头交付线的
+    镜头梯拿一个景别去排三到四镜，中间那两个插入镜的景别只能写死——「原片是远景切特写再
+    切中景」这件事整条链路一个字都接不住。有了逐帧 shot_scale（Pass A v7）与切点
+    （observed_cuts），每个镜头窗各投一次票，序列就是量出来的。
+
+    与 attach_shot_cuts / attach_coverage_frames 同一条纪律：读不到就把字段清掉，
+    不留一个看起来很确定的默认值。二创变体原样跳过（它自己目录下没有 overview）。
+    """
+    beats = beats_doc.get('beats') or []
+    if is_variant_doc(beats_doc):
+        return beats_doc
+    by_frame = _frame_facts_by_name(beats_doc, overview, facts, job_dir)
+    timeline = _review_frame_timeline(overview or {})
+    for beat in beats:
+        if not isinstance(beat, dict):
+            continue
+        windows = shot_windows_for_beat(beat) if (by_frame and timeline) else []
+        scales = []
+        for lo, hi in windows:
+            votes = {}
+            for ts, name in timeline:
+                if not (lo - 1e-6 <= ts <= hi + 1e-6):
+                    continue
+                scale = str((by_frame.get(name) or {}).get('shot_scale') or '').strip()
+                if scale in SHOT_SCALES:
+                    votes[scale] = votes.get(scale, 0) + 1
+            # 这一镜一张有读数的帧都没有时写空串占位——位置必须留着，否则序列与镜头
+            # 一一对应的关系就断了，下游只能按下标硬贴，贴错比不贴更坏。
+            scales.append(max(votes.items(), key=lambda kv: kv[1])[0] if votes else '')
+        if any(scales):
+            beat['observed_shot_scales'] = scales
+        else:
+            beat.pop('observed_shot_scales', None)
+    return beats_doc
+
+
+def _frame_facts_by_name(beats_doc, overview, facts=None, job_dir=None):
+    """{帧文件名: 帧事实}。读不到返回 {}。
+
+    facts 的三种到达形态都吃：调用方直接传进来的 list、frame_facts.json 那个
+    {'facts': [...]} 信封、以及只给了 job_dir 时自己去盘上读那一份（存量任务走这支：
+    读一次状态就补上序列，不用重跑 Pass A）。
+    """
+    if facts is None:
+        facts = (beats_doc or {}).get('facts') or (overview or {}).get('facts')
+    if facts is None and job_dir:
+        path = os.path.join(job_dir, _FRAME_FACTS_FILENAME)
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    facts = json.load(f)
+            except Exception:
+                facts = None
+    if isinstance(facts, dict):
+        facts = facts.get('facts') or []
+    if not isinstance(facts, list):
+        return {}
+    out = {}
+    for row in facts:
+        if isinstance(row, dict) and row.get('frame'):
+            out[os.path.basename(str(row['frame']))] = row
+    return out
+
+
 def observed_shot_stats(beats_doc):
     """整条阶梯的镜头节奏概览：给卡点上那行提示与合成前的偏差告警用。
 
@@ -3685,15 +3782,14 @@ def validate_beats(beats_doc, overview, schema=None):
 def _validate_camera_angle_consistency(beats):
     """同一个空间里的拍摄角度不一致时说出来。
 
-    为什么必须说：IMAGE 的开场机位句是**族级**的（一个空间共用一句，见
-    `pp.observed_camera_angle_packet_rule`），所以一个空间只落得下**一个**角度——按这个
-    空间里出现最多的那一对写。于是标成少数派的那几拍，图会按多数派的角度出，只有它们的
-    VIDEO 还守着自己的角度。
+    2026-08-25 之前这是一条**损失**告警：IMAGE 的机位句按空间发一句，一个空间只落得下
+    一个角度，少数派那几拍的图会按多数派出。现在机位按 (空间, 角度, 方位, 焦段) 分组
+    发句（`pp.observed_camera_setups`），少数派也拿得到自己的那一句，损失没有了。
 
-    这不是 bug，是族级机位这套结构的边界，但它绝不能静默发生：用户看着卡片上明明写了
-    「B07 鸟瞰」，出来的图却是平视，而整条链路一声不吭。所以在人工卡点上摊开，让他自己
-    决定——要么把那几拍的角度改成和同族一致（原片其实没换机位，是读错了），要么把它们
-    的 `space` 标成另一个空间（原片是真换了机位，那本来就该是另一个机位族）。
+    这条留着，是因为它换了一个理由：每多一个机位就多一把独立的几何锁。原片真换了机位，
+    那本来就该是两把；**读错了**角度的那一拍，现在不再是「图按多数派出」这种安静的降级，
+    而是图真的会凭空换一次机位——跨帧一致性从那一拍断开。所以仍然要在人工卡点上摊开，
+    只是要用户核的东西反过来了：不是「要不要拆空间」，而是「这几拍原片到底换没换机位」。
     """
     by_space = {}
     for position, beat in enumerate(beats or [], start=1):
@@ -3724,10 +3820,10 @@ def _validate_camera_angle_consistency(beats):
             f'空间「{space}」里有两种以上拍摄角度：多数拍是{_label(dominant)}，'
             f'而 {"、".join(odd)} 标的是'
             f'{"；".join(sorted({_label(pair) for bid, pair in rows if pair != dominant}))}。'
-            f'同一个空间的静帧共用一句机位声明，只落得下一个角度——这几拍的**图**会按'
-            f'{_label(dominant)}出，只有它们的视频片段守着自己的角度。'
-            f'原片其实没换机位就把它们改回一致；原片真换了机位，就把这几拍的「空间」'
-            f'另起一个名字，它们会自己成为一个独立机位族。'))
+            f'这几拍会各自生成一句自己的机位声明并按各自的角度出图（见 '
+            f'pp.observed_camera_setups）——原片真换了机位就是对的，不用改。'
+            f'但每多一个机位就多一把独立的几何锁，原片其实没换机位（读错了）时，'
+            f'那几拍的图会凭空换一次机位、跨帧一致性从这里断开：请照帧核一遍。'))
     return out
 
 
@@ -5428,6 +5524,13 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
             entry['shot_count'] = str(beat['observed_shot_count'])
         if isinstance(beat.get('observed_shot_seconds'), (int, float)):
             entry['shot_seconds'] = str(beat['observed_shot_seconds'])
+        # 逐镜景别序列（2026-08-25）。走 shot_count 同一条通路：随清单条目落到
+        # parsed_brief['beat_outline']，再由 pp.apply_observed_craft_fields 按下标贴回
+        # 梯子，最后由 composer 排梯时逐镜取用。它**不进规划提示词**——分镜是合成期
+        # 确定性排的，渲给规划器只会诱导它往 description 里自己写分镜。
+        scales = [str(x).strip() for x in (beat.get('observed_shot_scales') or [])]
+        if any(scales):
+            entry['shot_scales'] = '/'.join(x or '?' for x in scales)
         # 插入镜主体走的是另一条通路：它是**内容**，规划器要把它织进这一拍的描述里，
         # 所以它既进 parsed_brief（给合成期逐拍绑定）也进规划提示词（见
         # build_outline_plan_block 的 INSERT 规则，只在多镜头链路上渲染）。

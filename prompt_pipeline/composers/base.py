@@ -284,6 +284,16 @@ Instructions:
         """占位符兜底稿的收尾（base 不做任何额外处理）。"""
         return video_prompt
 
+    def normalize_reworked_video(self, video_prompt, beat=None):
+        """把**非 profile 感知**的回炉稿（如里程碑成对回炉）归一回本 profile 的镜头契约。
+        base 是一镜到底，无需归一。"""
+        return video_prompt
+
+    def video_profile_violations(self, video_prompt, beat=None):
+        """本 profile 独有的 VIDEO 硬伤（base 没有）。用于判断一轮回炉是否**引入**了
+        新的 profile 违规，而不是照单全收地把稿子判死。"""
+        return []
+
     def repair_beat_prompts(self, config, i, v_p, i_p, contract, packet, beat_ladder,
                             parsed_traces, prev_image, structural, style_errs, reworked,
                             log_prefix):
@@ -312,7 +322,9 @@ Instructions:
                 print(f"[DIRECT] {log_prefix} 显著里程碑骨架缺失，成对回炉一轮: "
                       f"VIDEO={milestone_video_errs}; IMAGE={milestone_image_errs}")
             v_p, i_p, milestone_reworked = pp.rework_milestone_prompt_pair(
-                config, i, v_p, i_p, beat, milestone_video_errs, milestone_image_errs)
+                config, i, v_p, i_p, beat, milestone_video_errs, milestone_image_errs,
+                normalize_video=lambda t: self.normalize_reworked_video(t, beat=beat),
+                profile_video_check=lambda t: self.video_profile_violations(t, beat=beat))
             structural = structural + milestone_video_errs
             style_errs = style_errs + milestone_image_errs
             reworked = milestone_reworked if reworked is None else (reworked or milestone_reworked)
@@ -466,6 +478,9 @@ Instructions:
             vid_prompt = ""
             img_prompt = ""
             new_ledger_items = None
+            # 硬门没过、但已经是**真实稿**的最好一版（里程碑措辞差几条，不含终帧倒退）。
+            # 全部重试用完后拿它兜底，见下面 best_effort 的采纳分支。
+            best_effort = None
 
             for attempt in range(max(0, int(config.get('composeBatchRetryCount', 1))) + 1):
                 request_started = pp.time.time()
@@ -555,6 +570,18 @@ Instructions:
                     if hard_gate_errors:
                         if sys.stdout:
                             print(f"[DIRECT] Beat {i} 硬门仍未通过，重试整拍: {hard_gate_errors}")
+                        # 终帧倒退不留后路（整条序列最贵的失败）；纯里程碑措辞差的这版
+                        # 是可用的真实稿，先留一份最好的，重试全用完后兜底采纳。
+                        if not payoff_blocking and (
+                                best_effort is None
+                                or len(hard_gate_errors) < len(best_effort['hard_gate'])):
+                            best_effort = {
+                                'video': v_p, 'image': i_p, 'traces': parsed_traces,
+                                'structural': structural, 'style_errs': style_errs,
+                                'reworked': reworked, 'image_reworked': image_reworked,
+                                'residual': residual, 'hard_gate': hard_gate_errors,
+                                'outline_missing_before': outline_missing_before,
+                            }
                         continue
                     if style_errs and sys.stdout:
                         print(f"[DIRECT] Beat {i} 校验有瑕疵（直出模式仅记录，不重写）: {style_errs}")
@@ -587,6 +614,27 @@ Instructions:
                     })
                     if sys.stdout:
                         print(f"[DEBUG] Beat {i} attempt {attempt+1} error: {e}")
+
+            if not (vid_prompt and img_prompt) and best_effort:
+                # 重试全部用完，但手里有一份完整的真实稿——只是里程碑骨架措辞还差几条。
+                # 旧行为是直接 ComposeFailure，把整单（这里是 19 拍）在第 7 拍上判死；
+                # 而这份稿子不是占位符，"production 禁止占位符" 这条并不适用于它。
+                # 采纳 + 记 needs_attention 留痕，交给渲染后的真实画面审查兜底。
+                if sys.stdout:
+                    print(f"[DIRECT] Beat {i} 重试用尽，采用硬门未过的最好真实稿（留痕）: "
+                          f"{best_effort['hard_gate']}")
+                pp.record_beat_audit(config, i, best_effort['structural'],
+                                     best_effort['style_errs'], best_effort['reworked'],
+                                     best_effort['image_reworked'],
+                                     milestone_name=beat.get('milestone_name'),
+                                     residual=list(dict.fromkeys(
+                                         list(best_effort['residual'] or [])
+                                         + list(best_effort['hard_gate']))))
+                pp.record_outline_delivery(config, i, best_effort['image'], beat,
+                                           missing_before=best_effort['outline_missing_before'])
+                vid_prompt = best_effort['video']
+                img_prompt = best_effort['image']
+                new_ledger_items = best_effort['traces']
 
             beat_succeeded = bool(vid_prompt and img_prompt)
             if not beat_succeeded:
@@ -624,7 +672,7 @@ Instructions:
                     _traces = ', '.join(beat.get('persistent_traces') or ['contact marks', 'material dust'])
                     vid_prompt = (
                         f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {i} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout. "
-                        f"This is a continuous construction time-lapse, not real-time footage, creating the {beat.get('milestone_name')} milestone through the cohesive {_package} package. At t=0s the visible state is {beat.get('before_state')}; the same lone worker is already positioned at the active work face, makes the first effective tool contact immediately, and repeatedly performs the work cycle along a visible movement path. The primary progression shows {beat.get('primary_progress')}; simultaneously the secondary progression shows {beat.get('secondary_progress')}. By the final moment {beat.get('after_state')} across {beat.get('completion_extent')}, while {_traces} remain and the worker continues the visible operation through the final frame."
+                        f"This is a continuous construction time-lapse, not real-time footage, creating the {beat.get('milestone_name')} milestone through the cohesive {_package} package. In the opening frame the visible state is {beat.get('before_state')}; the same lone worker is already positioned at the active work face, makes the first effective tool contact immediately, and repeatedly performs the work cycle along a visible movement path. The primary progression shows {beat.get('primary_progress')}; simultaneously the secondary progression shows {beat.get('secondary_progress')}. By the final moment {beat.get('after_state')} across {beat.get('completion_extent')}, while {_traces} remain and the worker continues the visible operation through the final frame."
                     )
                 else:
                     vid_prompt = (

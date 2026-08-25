@@ -349,12 +349,18 @@ class MiniatureComposer(OmniComposer):
 
     # ── 镜头梯 ──────────────────────────────────────────────────────────────
 
-    def ladder_for_kind(self, duration, kind='construction', observed_shots=None):
+    def ladder_for_kind(self, duration, kind='construction', observed_shots=None,
+                        observed_scale=None, observed_scales=None):
         """(时长, 拍型) → 微缩镜头梯。三套梯共用同一组镜头名与同一台锁死机位，
         差别只在逐镜职责——omni 的过门梯/兑现梯在这里一条都不能用，理由见模块 docstring。
 
         observed_shots 的口径与 omni 完全一致（复刻线按原片切点排梯，见
-        pp.apply_observed_shot_counts）；揭示拍与兑现拍恒为三镜。"""
+        pp.apply_observed_shot_counts）；揭示拍与兑现拍恒为三镜。
+
+        observed_scale / observed_scales 在这里**故意不生效**（收下只为与 omni 同签名，让共用的
+        ladder_for_beat 一处取梯）。本包的镜头名全部锚在 P0 微距契约上，按原片景别改写
+        主镜会写出 "wide working shot" 这类整包禁写的词，capture_style_rule 与镜头名审计
+        当场对撞。微缩线要吃原片景别，得先有一套自己的景别词表。"""
         if kind == 'traversal':
             return _MINIATURE_REVEAL_LADDER
         if kind == 'reward':
@@ -409,14 +415,7 @@ clean cut / match cut 衔接（禁止 cross-dissolve、fade、instant transforma
 SAME LOCKED SETUP（本包的锚点连续性就靠它）——第一镜与最后一镜是**同一台锁死的微距机位、同一构图、
 同一焦段**，只有施工完成度不同；正文在最后一镜里要写明它切回的是 the same locked macro setup as the
 opening macro working shot。插入镜是从这台机位推近的细部，切回来时完成度必须与切走那一刻一致。
-**相机不移动、不推轨、不摇、不拉开**——所谓"运动"只是巨人手与材料在动。
-
-SHOT TIMELINE（必写）——正文里必须原样带上这句切点表，位置紧跟锚定开场句之后：
-  "{timeline_sentence(duration, ladder)}"
-后面每个镜头的首句再用**英文单词**复述一次自己的入点（例如 "A clean cut at the three-second
-mark drops into a close-up insert on the tweezer tip ..."），与切点表形成冗余绑定。这句切点表是
-**唯一**允许出现阿拉伯数字的地方；正文其余部分的计数与尺寸一律写成英文单词或比较物
-（three roof tiles、about a thumb tall，不是 3 roof tiles、6-8cm）。
+CINEMATIC NARRATIVE FLOW (纯自然语言多镜头因果流)——严禁使用任何机械时间戳或数字切点表。正文必须使用流畅的电影分镜叙事连词（例如 "The scene opens with...", "The camera then cuts into a tight close-up insert on...", "Shifting to an extreme close-up insert...", "Finally, the camera cuts back to the primary locked diorama setup..."）来自然串联各个镜头。正文所有计数和尺寸一律写成英文单词（three roof tiles，不是 3 roof tiles；eight seconds，不是 8s）。
 
 拍型分流：剖面揭示拍（巨人手揭走外立面板/屋顶）与最终兑现拍走各自的三镜梯，镜头名相同、逐镜职责不同，
 两者都免除下面的节奏声明（它们是揭示与收尾，不压缩劳动），但**同样不许写成一镜到底**。
@@ -430,11 +429,12 @@ ACTOR ACROSS CUTS：施工主体自始至终是从画幅边缘伸入的超大真
 并发生第一次有效工具接触（不要为"手入画"单独安排一个镜头）；插入镜里只有指尖与工具接触点；
 切回镜里手完成最后一次操作后**退出画幅**，末帧是净帧。
 
-CAST IN FRAME（人偶必须是活的）：人偶全程只旁观、不碰工具、不出画、比例不变——但**每一拍都要有一个
-可见的微动作**（转身面向新砌起来的那面墙 / 上前半步 / 蹲下去看屋檐底下 / 一个抬手指另一个仰头 /
-坐到石子上）。这个动作写在主镜或切回镜里，人偶从上一拍的姿态**动到**本拍结果帧的姿态。
-绝不要写「人偶保持原样/站位不变」——整条序列一动不动的人偶会把交付读成静物幻灯片，
-而它们是画面里唯一的活物。上游给了本拍的 CAST IN FRAME 时，逐字照它写。
+CAST IN FRAME（活物即时应激与动作-反应咬合）：人偶是画面中唯一的活物，绝不能只在结尾贴一句站位，
+必须将其微动作与工匠施工动作形成【因果时序咬合】：
+- 手从边缘入画时：人偶立即产生生理/视线应激（抬头仰望、转头注视）；
+- 手持工具作业推进时：人偶视线跟随工具移动或微调站姿（上前半步、探头、指引）；
+- 手收尾撤出画面时：人偶身体定格在交付成果前观望。
+严禁写「人偶保持原样/站位不变/remain/stay」；当上游给出了 CAST IN FRAME 时，必须完整还原这一因果链。
 {self.capture_style_rule()}
 - PACING DECLARATION：普通工序拍在正文里声明一次时间基准，用这句原话——
   "{MINIATURE_PACING_PHRASE}"（揭示拍与兑现拍免除这句）。不要用 continuous 描述整条片段的拍法。
@@ -487,7 +487,7 @@ CAST IN FRAME（人偶必须是活的）：人偶全程只旁观、不碰工具�
 - ACTOR: Action must be executed by OVERSIZED HUMAN HANDS entering from frame margins with micro-tools.
 - DO NOT generate full-scale 1.78m workers, safety vests, or people inside the model.
 - OPTICS: Maintain macro diorama framing (fifty to eighty-five millimetre macro lens feel) and shallow depth of field with creamy background bokeh, on ONE locked camera setup for the whole clip.
-- SHOTS: This clip is cut, not a oner — write the shot ladder and the cut-mark timeline exactly as the multi-shot override above specifies.
+- SHOTS: This clip is cut, not a oner — write the shot ladder using fluent cinematic narrative transitions without numeric timestamps or robotic cut mark tables.
 - INTERIORS: If this is an interior stage, use open-front dollhouse cutaway framing filmed from the exterior tabletop perspective.
 - PACING & AUDIO: Use the edited miniature craft time-lapse pacing declaration and micro-tool contact sound effects (no human footsteps).
 """
@@ -513,7 +513,7 @@ CAST IN FRAME（人偶必须是活的）：人偶全程只旁观、不碰工具�
             text = text.rstrip() + '.'
         return (text.rstrip() + " In the opening macro working shot one oversized human hand is "
                 "already reaching in from the upper frame margin with its micro-tool and makes "
-                "the first effective tool contact at zero seconds; the hands withdraw clear of "
+                "the first effective tool contact from the opening instant; the hands withdraw clear of "
                 "the frame before the final moment.").strip()
 
     def fallback_ladder_clause(self, ladder):
@@ -538,14 +538,14 @@ CAST IN FRAME（人偶必须是活的）：人偶全程只旁观、不碰工具�
 {multishot_ref}
 
 Rewrite rules (additive — do not lose content):
-- Keep the opening anchor sentence ("Use the provided first frame and last frame as exact composition anchors. ...") VERBATIM as the first sentence.
-- Immediately after it, place this shot timeline VERBATIM: "{timeline_sentence(duration, ladder)}"
+- Keep the opening anchor sentence ("Use the provided image as the exact starting composition and environment anchor. ...") VERBATIM as the first sentence.
+- Express the multi-shot sequence using pure natural language cinematic transitions (e.g. 'The scene opens with...', 'The camera then cuts into a tight close-up insert on...', 'Shifting to an extreme close-up insert...', 'Finally, the camera cuts back to the primary locked diorama setup...'). Do NOT output numeric timestamps, seconds marks, or robotic cut mark tables.
 - Keep every concrete detail already in the draft: the same giant hands and their entry margin, the same named micro-tool, the same operation, the same craft traces, the same figurines, the same audio description, the same lighting. Redistribute them across the shots instead of inventing new ones.
-- Restructure the body into exactly {len(ladder)} shots IN THIS ORDER, naming each one in prose exactly as written here: {scales}. Join them with clean cuts or match cuts, and open each shot's sentence by restating its cut mark in English words (for example "A clean cut at the three-second mark ...").
+- Restructure the body into exactly {len(ladder)} shots IN THIS ORDER, naming each one in prose exactly as written here: {scales}. Join them with clean cuts or match cuts.
 - The first and the last shot are the SAME locked macro camera setup, framing, and focal length, differing only in how far the build has progressed; say so explicitly in the last shot ("the same locked macro setup as the opening macro working shot"). The insert(s) move closer on that same model and cut back at the same completion level. The camera itself never pans, tracks, pushes, or pulls back, and it never enters the model.
-- The builder is an OVERSIZED REAL HUMAN HAND (giant fingers) reaching in from a frame margin with a precision micro-tool — never a full-scale worker, never a person inside the model. One hand is already making effective tool contact at zero seconds in the opening macro working shot; that shot carries this beat's whole visible advance up to roughly three quarters; the insert(s) carry tool contact, material physics, and the persistent craft traces without advancing the state; the returning macro shot compresses the remaining repetitions the same way, and the hands withdraw clear of frame before the last moment so the final frame is clean.
+- The builder is an OVERSIZED REAL HUMAN HAND (giant fingers) reaching in from a frame margin with a precision micro-tool — never a full-scale worker, never a person inside the model. One hand is already making effective tool contact from the opening instant in the opening macro working shot; that shot carries this beat's whole visible advance up to roughly three quarters; the insert(s) carry tool contact, material physics, and the persistent craft traces without advancing the state; the returning macro shot compresses the remaining repetitions the same way, and the hands withdraw clear of frame before the last moment so the final frame is clean.
 - Interiors are filmed from OUTSIDE through an open-front dollhouse cutaway. Never write a walk-in threshold, a camera pushing through a doorway, or a full-size room.
-- The shot timeline is the ONLY place arabic digits may appear. Every other count or size is written in English words or as an everyday comparison (about a thumb tall).
+- All numbers, counts, and dimensions must be written in English words or everyday comparisons.
 - NEVER write oner, one-shot, one-take, single continuous take, one continuous take, single take, or unbroken take — there is no exemption.
 - Output ONLY the rewritten video prompt body. No headings, no labels, no commentary."""
 
@@ -679,11 +679,14 @@ PRIORITY & WORLDVIEW OVERRIDE:
    - Construction is executed 100% by OVERSIZED REAL HUMAN HANDS (Giant Hands / Macro Fingers) entering from frame margins (upper edge or lateral edges) wielding precision micro-tools (miniature pointing trowels, fine-tip tweezers, hobby craft blades, syringe glue applicators).
    - NEVER describe a 1.78m human worker, neon safety vests, hard hats, or people walking inside the miniature structure.
 
-2. THE RESIDENTS (Tiny Figurines) — they are CAST, not props:
+2. THE RESIDENTS (Tiny Figurines) — they are LIVING CAST, not static props:
    - Two cast-resin painted miniature figurines (one to twenty-four dollhouse scale couple, roughly a thumb tall) inhabit or observe the model from foreground edges. They watch; they never build.
-   - They are ALIVE in every beat. Each beat gives them at least one visible micro-action: turning to face the new work, taking half a step closer, crouching to look under the eave, one pointing while the other looks up, sitting down on a pebble, leaning in over the cutaway. The VIDEO shows the movement; the resulting IMAGE shows them in the new pose.
-   - What is LOCKED is their identity, costume and scale (same two figurines, same red jacket and blue dress, same thumb-tall height, never touching a tool, never leaving the frame). What is FREE is their pose, facing, gaze and where in the foreground they stand.
-   - NEVER write them as unchanged from the previous beat ("the two figurines remain where they were"). A pair of figurines frozen in one pose for the whole sequence is the single fastest way to make the delivery read as a still-life slideshow instead of a build — they are the only living thing in the frame.
+   - ACTION-REACTION CAUSAL INTERLOCK: They are ALIVE in every beat and actively respond to the craftsman:
+     * When hands/tools enter from margins, figurines immediately react with head/gaze shifts (tilting heads up in awe, turning to look).
+     * During active craft work, they track the tool motions with slight shifts of weight, steps closer, or pointing gestures.
+     * When work completes and hands withdraw, they settle into their final observing stance facing the new work.
+    - What is LOCKED is their identity, costume and scale (same two figurines, same attire, thumb-tall height, never touching a tool, never leaving the frame). What is FREE is their pose, orientation and micro-actions dynamically reacting to the work.
+   - NEVER write them as unchanged ("the two figurines remain where they were") or isolate their motion as a passive afterthought at the very end of the clip.
 
 3. MACRO OPTICS & DEPTH OF FIELD:
    - Macro lens feel (fifty to eighty-five millimetres equivalent), shallow depth of field with creamy background bokeh.

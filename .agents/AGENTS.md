@@ -10,8 +10,8 @@
    - 画面数量与节拍清单必须严格 1 对 1 对应（N 拍 = 精确 N 张关键帧图），严禁擅自拆分、合并或重复生成额外帧。
 
 2. **Visual Consistency & Anchor Lock (视觉连续性与基底锁定)**:
-   - 以第一帧作为基准锚点帧（Anchor Frame），锁定视角焦段、洞口构图与山体拱门结构。
-   - 采用增量编辑（Delta Editing），避免前后帧场景重构或结构扭曲。
+   - 以第一帧作为基准锚点帧（Anchor Frame），锁定基准建筑结构、空间开孔与物理地标。
+   - 采用增量编辑（Delta Editing），同一机位内保持透视稳定，跨机位严格按节拍清单的观测机位（`camera_setups`）切换，避免前后帧场景结构无序坍塌或扭曲。
 
 3. **Item Lifecycle & Material Rules (道具生命周期与材质锁死)**:
    - 施工工具（三脚架、测量仪、裸露电缆）仅允许在 [clearing] ~ [flooring] 阶段存在，在 [furnishing] 及以后拍中必须在负向提示词添加 `(tripod, construction tools, power cables:1.4)` 强制销毁撤场。
@@ -64,8 +64,10 @@
    - **道具人机工程学守恒与防空间膨胀 (Ergonomic Prop Allocation)**:
      - 严禁在紧凑型空间（直径/进深 ≤ 3.5m 的地穴、树洞、集装箱）中分配住宅级超大件家具（如 `two-tier bunk bed / double bunk bed` 高低双层床、大转角沙发等），严防 AI 为容纳大件家具而将空间无序拉伸为巨大礼堂（Cavernous hall）。
      - 必须降级为紧凑型人机工程道具：如 `low-profile single timber platform daybed`（单人地台床，高 0.4m）、`recessed wall berth`（内嵌壁龛床）、`compact 80cm-high workbench`。
-   - **镜头焦段与地平线基准统一 (Camera Normalization)**:
-     - 全片主镜头统一锁定为 `24mm wide-angle lens feel (natural perspective without extreme fisheye distortion)`，相机高度固定在 `1.3m (human chest level)`，地平线锁定在 `45%~50%` 画面高度。
+   - **观测机位与动态视角适配 (Observed Camera Setups & Dynamic Normalization)**:
+     - 拍摄角度、机位方位与焦段优先遵循原片反推观测到的多机位矩阵（`camera_setups`，涵盖 bird_eye, high_angle, eye_level, low_angle, worm_eye, dutch_angle 垂直俯仰角与 front, three_quarter, side, rear_three_quarter, back 水平方位，以及 ultra_wide, wide, normal, tele, macro 焦段），按节拍所属机位编号精准呈现。
+     - **严禁将俯拍/仰拍/特写强行压平为单一平视**；在无反推机位观测数据的纯原创或兜底场景下，默认采用 `24mm wide-angle lens feel (natural perspective without extreme fisheye distortion)`、胸高视点与 `45%~50%` 地平线基准。
+     - 同一机位内部严格锁定透视与地平线基准，跨机位切换时按当前节拍机位句精准执行。
    - **视频人体比例尺注入 (Video Scale Figure Lock)**:
      - 在视频 I2V 提示词中，必须显式声明工人的公制身高与在空间中的相对比例：`a lone male worker (1.78m tall, occupying ~35% of vertical frame height, realistically proportioned to the 2.2m ceiling)`，确保人物在整个生成过程中不忽大忽小、不滑步失真。
    - **负向防膨胀词库 (Negative Scale Restraints)**:
@@ -76,13 +78,13 @@
       - 严禁使用单镜头从室外一路直推穿过门框进室内的老旧直推法（避免空间拉伸畸变、门框撕裂、曝光骤变与人机施工混杂）。
       - 任何从室外到室内（或主空间到密闭新空间）的转场，**必须全局统一拆解为两个前后紧密咬合的独立节拍（Shot A 室外转场拍 + Shot B 室内承接拍）**。
     - **镜头 A：室外转场拍 · 物理开启与入口特写 (Shot A: Exterior Mechanical Opening & Portal Push-in)**:
-      - **构图与运镜**：室外中近景 $\rightarrow$ 特写推进（Push-in forward tracking shot，24mm 广角，机高 1.5m 滑动至 1.2m，微俯俯角 15°~30° 对准入口/阀门/舱盖）。
+      - **构图与运镜**：室外中近景 $\rightarrow$ 特写推进（Push-in forward tracking shot，机高与视角贴合入口，微俯俯角 15°~30° 对准入口/阀门/舱盖）。
       - **显式物理开启机制 (Mechanical Action)**：必须明确描写机械解锁与物理开启过程（如旋转潜艇式金属手轮/密封阀门、拉开厚重木门栓、液压支撑杆顶开舱盖、滑动闸门等），露出通向内部的垂直通道/爬梯/台阶。
       - **终帧 (Image T+1 特写)**：特写敞开的门洞/舱口（Portal Framing），清晰呈现门框、密封圈、铰链及通道首段结构（如垂直爬梯顶部、第一级台阶），天光倾泻入内，深处保持原始毛坯状态。
       - **零施工污染 (Zero Work Contamination)**：Shot A 内部全程无工人、无工具、无材料堆积，纯展现通道开启与机械解耦。
       - **音效设计 (ASMR 60%)**：金属阀门齿轮旋转喀哒声、气压密封泄放声、铰链开启摩擦与沉重金属/木质碰撞声。
     - **镜头 B：室内承接拍 · 工人人机入场与首道工序 (Shot B: Interior Entry, Staging & First Physical Work)**:
-      - **构图与机位**：室内全景固定三脚架机位（24mm 广角，1.3m 视高，平视，严禁鱼眼畸变），正对室内主景深轴线（如远端观景窗或主后墙），入口/爬梯位于画幅侧方（如 Grid B1/B3）。
+      - **构图与机位**：室内固定机位（按室内主 camera_setup 执行，自然透视无鱼眼畸变），正对室内主景深轴线（如远端观景窗或主后墙），入口/爬梯位于画幅侧方（如 Grid B1/B3）。
       - **起帧继承 (Image T+1 室内视角)**：100% 物理继承 Shot A 的敞开状态（上方或侧方入口有自然天光倾泻），空间呈现原始未动工毛坯状态（Raw shell: 未涂装氧化钢板/粗糙水泥/裸露石壁、地表浮尘）。
       - **工人入画与首道工序交付 (Entry + Tool Action)**：
         - 工人（1.78m 高，身着反光背心与安全帽，占画面高度约 35%）真实入画：顺着金属爬梯下行或迈过门槛步入室内，双脚踏上地面。
@@ -93,7 +95,7 @@
 11. **Depth-Layered Spatial Protocol & Anti-Distortion Perspective Lock (五层绝对景深协议与防畸变透视锁 · 彻底终结空间与道具漂移)**:
     - **五层绝对景深提示词架构 (DLSP 5-Layer Depth Staging)**:
       - 任何室内或受限空间首帧（IMAGE T+1 / Shot B 室内承接），提示词必须严格按 5 层物理景深编写：
-        1. **机位与视线 (Camera)**: 锁定 `24mm wide-angle interior shot at 1.3m eye-level, wide 3/4 diagonal oblique perspective from near corner`（从角落向对角开阔斜拍），严禁在长条空间使用单点对称正灭点（避免拉伸为 15 米保龄球道/火车车厢）。
+        1. **机位与视线 (Camera)**: 遵循当前空间 `camera_dna` 或所属 `camera_setup` 设定的机位视线（默认推荐从角落向对角开阔斜拍 3/4 diagonal oblique perspective），严禁在长条空间使用单点对称正灭点（避免拉伸为 15 米保龄球道/火车车厢）。
         2. **近景道具锚点 (Layer 1: Immediate Foreground <1m)**: 入口爬梯、门框或立柱必须显式声明为**镜头前 0.5m 近身物**（如 `Overhead in upper-right ceiling (Grid A3), circular submarine hatch with vertical steel ladder descending through immediate right-foreground (Grid A3-C3) flush to floor`），彻底阻断 AI 将爬梯放置到中景或远端后墙的错误。
         3. **中景开阔通廊 (Layer 2: Midground Staging Floor 1~4m)**: 声明平整开阔的地面主通廊（`expansive, broad floor expanse with weld seams, washed with water caustics, completely open for staging`）。
         4. **侧翼边界拓扑 (Layer 3: Longitudinal Boundaries)**: 必须逐面声明实壁与虚壁（如 `Left wall: two consecutive widescreen rectangular glass windows; Right wall: solid blue corrugated steel wall, zero windows`），严禁泛指导致 AI 脑补成三面玻璃小水箱。
@@ -111,7 +113,7 @@
     - **双向三明治约束架构 (Sandwich Bidirectional Context Triad: K-1 $\leftarrow$ [K] $\rightarrow$ K+1)**:
       - 任何单帧（Frame K）的修改必须同时受到**前向物理继承锚点**与**后向交付目标收口**的双向夹具约束：
         1. **前向物理锚定 (Preceding State Anchor - K-1)**:
-           - Frame K 必须 100% 物理继承 Frame K-1 的硬装基底、边界拓扑、材质色泽、镜头机位高度（1.3m）与透视灭点。
+           - Frame K 必须 100% 物理继承 Frame K-1 的硬装基底、边界拓扑、材质色泽；若与 Frame K-1 属于同一机位，则透视灭点与机位严格锁定，若为机位切换拍则忠实呈现目标机位。
            - 严禁发生“前序已完成产物在 Frame K 突变、消失或材质倒退”。
         2. **后向承接校验与物理通道锁 (Succeeding Target Boundary Lock - K+1)**:
            - Frame K 的修改成果必须是通往 Frame K+1 的自然且唯一的物理前置条件，确保差量 $\Delta(K \rightarrow K+1)$ 的工人动作与物料变化真实可达。
@@ -123,8 +125,23 @@
     - **三帧联排硬性审查门禁 (3-Frame Triptych Inspection Gate)**:
       - 单帧修改完成后，**严禁单独审查单张图即判定通过**。
       - 必须强制调取 `[Frame K-1] - [Modified Frame K] - [Frame K+1]` 进行三联屏并排动态比对，重点快检：
-        1. **空间与透视**：后墙水渍线、梁架走向、窗洞位置是否保持像素级稳定。
+        1. **空间与透视**：后墙水渍线、梁架走向、窗洞位置及机位透视是否保持物理连续与机位一致。
         2. **材质与状态**：地板/墙面是否发生湿水镜面化、突变反光或破损复活。
         3. **物料守恒**：工具与材料的出现/消耗是否在三帧之间具备连续的物理因果链。
       - 只有在三联屏比对确认无缝咬合后，方可写入管线并固化为最终帧。
+
+13. **Living Cast Dynamic Reflex & Action-Reaction Triad (活物即时应激与动作-反应三位一体律 · 彻底终结静止假人与动作脱节)**:
+    - **活物非静态布景准则 (Living Subjects as Reactive Narrative Actors)**:
+      - 在微缩沙盘（Miniature Diorama）、手工工坊或任何含有常驻微缩人偶/动物/常驻住户的画面中，活物是画面唯一的生命体，**严禁作为毫无知觉的静态道具存在**。
+      - 严禁在整条序列或单拍内部将人偶写为“保持原样不动”、“站位不变”（`remain`, `stay put`, `static in place`, `unchanged`）。
+    - **三段式因果时序咬合链 (Action-Reaction Causal Triad)**:
+      - 每一拍内部，活物的生理与视线反应必须与施工主体的物理动作形成**强因果时序咬合**：
+        1. **入场与接触应激 (Inception Reflex)**：当工匠手/工具从画幅边缘进入画面或接触工件时，活物必须产生即时的感知应激（如抬头仰望天空、身体惊起、视线迅速转向入画点）。
+        2. **作业过程追踪 (Operational Tracking)**：在工具切削、铲土、抹灰、搬运等作业过程中，活物必须呈现微观的视线追踪（Eye tracking）、重心微移（Shift of weight）、探头观察（Leaning in）或抬手指引动作。
+        3. **交付成果定格 (Settlement Stance)**：当手/工具完成操作并撤出画面时，活物身体转向并定格在最终成果前进行驻足注视（Settle facing the finished work）。
+    - **身份尺度锁定与姿态自由解耦 (Identity Lock vs. Dynamic Posture Decoupling)**:
+      - 严格锁定活物的身份、服装色彩与身材比例（如深肤色黑人夫妇、红夹克与蓝裙子、拇指高），**彻底放开姿态与朝向的动态演进**。
+    - **负向假人词库强注入 (Anti-Static Negative Restraints)**:
+      - 在生成与优化中严禁出现孤立静态人偶，确保视频大模型将活物渲染为具备灵性互动感的场景参与者。
+
 

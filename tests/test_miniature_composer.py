@@ -227,7 +227,7 @@ class TestMiniatureMultiShotLadder:
         assert (composer.ladder_for_kind(8, 'traversal')[0].role
                 != composer.ladder_for_kind(8, 'reward')[0].role)
 
-    def test_fix_chain_injects_the_timeline_and_kills_one_take_wording(self):
+    def test_fix_chain_cleans_timeline_and_kills_one_take_wording(self):
         composer = MiniatureComposer()
         composer.begin_run(dict(MINIATURE_CONFIG), {})
         raw = (
@@ -240,11 +240,8 @@ class TestMiniatureMultiShotLadder:
             3, raw, "A static macro diorama shot of the stump.", {'camera_dna': ''},
             'direct', False, False)
         low = fixed.lower()
-        # 切点表逐字注入，且带上本片长下的四个镜头名
-        assert 'cut this eight-second clip on these marks' in low
-        for name in ('a macro working shot', 'a close-up insert',
-                     'an extreme close-up insert', 'a returning macro shot'):
-            assert name in low
+        # 纯自然语言模式：不包含机器切点表
+        assert 'cut this' not in low
         # 一镜到底措辞（含本包旧的 continuous 节奏句）一并作废
         assert 'unbroken take' not in low
         assert 'continuous miniature craft time-lapse' not in low

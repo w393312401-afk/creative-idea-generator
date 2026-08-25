@@ -80,11 +80,18 @@ def _disk_state(run_dir):
     out = {}
     for sub in ("frames", "videos"):
         d = os.path.join(run_dir, sub)
+        if not os.path.isdir(d):
+            continue
         for name in sorted(os.listdir(d)):
-            with open(os.path.join(d, name), "rb") as f:
+            file_path = os.path.join(d, name)
+            if not os.path.isfile(file_path):
+                continue
+            with open(file_path, "rb") as f:
                 out["%s/%s" % (sub, name)] = f.read()
-    with open(os.path.join(run_dir, "manifest.json"), "rb") as f:
-        out["manifest.json"] = f.read()
+    manifest_path = os.path.join(run_dir, "manifest.json")
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, "rb") as f:
+            out["manifest.json"] = f.read()
     return out
 
 

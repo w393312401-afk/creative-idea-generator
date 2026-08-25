@@ -81,12 +81,12 @@ class TestDigitsToWords:
         """IMAGE 编号是锚点引用，不是计数。"""
         assert omni._digits_to_words('matching IMAGE 3 exactly') == 'matching IMAGE 3 exactly'
 
-    def test_timeline_seconds_are_left_alone(self):
-        """时间码豁免：切点必须钉在秒上，见 omni-output-templates.md §Timecode Exemption。"""
+    def test_timeline_sentences_are_stripped(self):
+        """纯自然语言模式：机械切点表会被 _digits_to_words 自动清除。"""
         text = ('Cut this ten-second clip on these marks and hold no other cuts — an '
                 'establishing long shot from 0.0 to 1.6, and a wide outro shot from 8.3 '
                 'to 10.0 seconds.')
-        assert omni._digits_to_words(text) == text
+        assert omni._digits_to_words(text) == ''
 
     def test_measurements_glued_to_units_are_left_alone(self):
         assert omni._digits_to_words('a 14mm lens') == 'a 14mm lens'

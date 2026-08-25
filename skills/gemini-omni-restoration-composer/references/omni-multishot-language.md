@@ -42,34 +42,18 @@ a traverse, not a work beat: it has three natural stations and no work face to i
 Both are exempt from the pacing declaration below — they traverse or reveal rather than
 compress work — but neither is exempt from the One-Take Ban.
 
-## Shot Timeline
+## Cinematic Multi-Shot Narrative Flow (纯自然语言多镜头因果流)
 
-Naming the shots is not enough: without stated cut marks the model picks its own, and the
-inserts either vanish or swallow the main shot. Every VIDEO body therefore carries one
-timeline sentence, placed immediately after the anchor-binding opening sentence:
+**We do NOT use rigid numeric timestamp tables or robotic cut mark sentences (e.g. `Cut this ten-second clip on these marks...` is forbidden).** Video diffusion models (Veo, Kling, Sora) respond best to **fluent cinematic narrative transitions** that naturally guide camera shifts, macro close-ups, and worker actions in pure English prose:
 
 ```text
-Cut this ten-second clip on these marks and hold no other cuts — a wide working shot from 0.0 to 3.2, a close-up insert from 3.2 to 5.3, an extreme close-up insert from 5.3 to 7.2, and a returning wide shot from 7.2 to 10.0 seconds.
-```
-
-At six seconds:
-
-```text
-Cut this six-second clip on these marks and hold no other cuts — a wide working shot from 0.0 to 2.4, a close-up insert from 2.4 to 3.9, and a returning wide shot from 3.9 to 6.0 seconds.
+The sequence opens with a wide working shot of the restoration area in its initial state, where the worker is already positioned and begins [primary action] with [tool]. The camera then cuts in closer to a tight close-up insert on the tool contact point, showing [material physics: mortar extrusion, wood shavings curling, adhesive spreading]. Next, an extreme close-up insert reveals [two persistent craft traces and micro-textures]. Finally, the camera cuts back to a returning wide shot from the exact same camera setup as the opening shot, where the worker continues the visible operation smoothly through to the finished state.
 ```
 
 Rules:
-
-- Time is split by shot weight, not evenly. The main working shot always gets the largest
-  slice, the returning shot the second largest, and the inserts what is left. An insert may
-  run near one second — an insert reads as an insert at that length; a *scale* does not.
-- Marks are monotonic and gapless: each shot starts exactly where the previous one ended,
-  the first starts at `0.0`, and the last ends exactly on the clip length.
-- Each shot's own sentence restates its entry mark **in English words** (`A clean cut at the
-  three-second mark drops into a close-up insert ...`), so prose and timeline bind twice.
-- **This sentence is the only place in the prompt body where arabic digits may appear** —
-  see the Timecode exemption in `omni-output-templates.md`. Every other count stays an
-  English word.
+- Express temporal progression and cut sequences using natural cinematic connectors (`The sequence opens with...`, `Cutting in closer to a close-up insert on...`, `An extreme close-up insert captures...`, `Cutting back to a returning wide shot from the same camera setup...`).
+- Never output robotic timecode tables, bracketed seconds (`0.0 to 3.2s:`), or decimal cut marks.
+- Keep the entire prompt in 100% natural prose. All counts and dimensions are written in English words.
 
 ## Pacing Declaration
 

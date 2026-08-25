@@ -1506,7 +1506,7 @@ def refine_packet_from_accepted_anchor(config, image_path, packet, parsed_brief=
         "camera_dna, geometry_lock, primary_landmarks, frame_boundaries, object_ledger, "
         "worker_choreography, lighting_phase_ladder, passive_environment, interest_budget, world_lock, "
         "carrier_envelope, entrance_topology, space_graph, camera_palette, origin_contract, "
-        "engineering_plan). IMAGE 1 is now rendered "
+        "engineering_plan, camera_setups). IMAGE 1 is now rendered "
         "reality: rewrite world_lock from what is actually visible, explicitly freezing terrain contour, "
         "foreground/mid/background landmarks, sky/water/weather, vegetation, exposure and key-light "
         "direction; set world_lock.status to accepted_image_1_frozen. Keep every "
@@ -1514,7 +1514,13 @@ def refine_packet_from_accepted_anchor(config, image_path, packet, parsed_brief=
         "primary_landmarks / frame_boundaries / object_ledger entries that clearly contradict what is "
         "visible (e.g. a landmark that isn't there, a grid position that's obviously wrong, a lens/height "
         "that doesn't match the visible framing). Do not invent new landmarks or objects that are not "
-        "visible in the image. No markdown, no code fences, no other text." + _delivered_note
+        "visible in the image. "
+        # camera_setups 是从原片量出来的机位，不是从 IMAGE 1 反推的。精修器只看得见第一张
+        # 图（其中一个机位），照它去改写另外几个机位，等于把原片其余机位抹平回这一个。
+        "'camera_setups' was MEASURED off a reference film, not derived from this image: copy it "
+        "through unchanged, every key and every sentence, even where a sentence describes a "
+        "viewpoint this image was not shot from. "
+        "No markdown, no code fences, no other text." + _delivered_note
     )
     user_text = f"Current packet:\n{json.dumps(packet, indent=2, ensure_ascii=False)}\n\nReconcile this packet against the attached IMAGE 1."
 
@@ -1847,6 +1853,15 @@ def normalize_packet(packet):
                 'secondary_interior_camera_dna', 'envelope_signature'):
         if key in packet and not isinstance(packet[key], str):
             packet[key] = _flatten_to_text(packet[key])
+    # camera_setups（复刻线）：{机位编号: 机位句}。值一律摊平成字符串——select_camera_dna
+    # 返回的这一句会被 fix_camera_dna / dedupe_camera_declaration 直接 .lower()，
+    # 一个 dict 形状的值就是一次 Beat N 当场中断（worker_choreography 当年的形状）。
+    if isinstance(packet.get('camera_setups'), dict):
+        packet['camera_setups'] = {
+            str(k): _flatten_to_text(v) for k, v in packet['camera_setups'].items()
+            if str(_flatten_to_text(v) or '').strip()}
+    elif 'camera_setups' in packet:
+        packet.pop('camera_setups')
     # aperture_ledger / aperture_denylist 保持 list（_envelope_terms 两种形状都吃），
     # 但 dict 形状要摊平成一行字，否则 ' | '.join 会拿到 dict。
     for key in ('aperture_ledger', 'aperture_denylist'):
@@ -3580,25 +3595,27 @@ def fix_image_clean_frame_proactive(prompt, allow_occupant=False):
     return " ".join(cleaned_sentences)
 
 
-def fix_video_opening(i, prompt, first_frame_index=None):
+def fix_video_opening(i, prompt, first_frame_index=None, profile=None, single_frame=False):
     """first_frame_index overrides which IMAGE the first-frame anchor binds to (defaults to
-    IMAGE i). No current threshold variant needs an override — the single threshold/bridge
-    beat's VIDEO binds normally from IMAGE i to IMAGE i+1 like any ordinary beat — but the
-    override stays available as a generic hook."""
+    IMAGE i). For Omni and Miniature (or single_frame=True), generates a single starting-frame anchor.
+    For Base/Veo, generates a two-anchor interpolation statement."""
     first_frame_index = i if first_frame_index is None else first_frame_index
-    expected_start = f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {first_frame_index} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout."
-    prompt_stripped = prompt.strip()
-    if "third layout." in prompt_stripped:
-        idx = prompt_stripped.lower().find("third layout.")
-        prompt_stripped = prompt_stripped[idx + len("third layout."):].strip()
-    elif "third layout" in prompt_stripped:
-        idx = prompt_stripped.lower().find("third layout")
-        prompt_stripped = prompt_stripped[idx + len("third layout"):].strip()
-    elif prompt_stripped.lower().startswith("use the provided first frame"):
-        dot_idx = prompt_stripped.find(".")
-        if dot_idx != -1:
-            prompt_stripped = prompt_stripped[dot_idx + 1:].strip()
-    return f"{expected_start} {prompt_stripped}"
+    if profile in ('omni', 'miniature') or single_frame:
+        expected_start = f"Use the provided image as the exact starting composition and environment anchor. Use IMAGE {first_frame_index} as the actual first-frame image; begin from this initial state and naturally progress the work through the multi-shot sequence without inventing extraneous layouts."
+    else:
+        expected_start = f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {first_frame_index} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout."
+    prompt_stripped = (prompt or '').strip()
+    for marker in ("extraneous layouts.", "extraneous layouts", "third layout.", "third layout"):
+        if marker in prompt_stripped.lower():
+            idx = prompt_stripped.lower().find(marker)
+            prompt_stripped = prompt_stripped[idx + len(marker):].strip()
+            break
+    else:
+        if prompt_stripped.lower().startswith("use the provided"):
+            dot_idx = prompt_stripped.find(".")
+            if dot_idx != -1:
+                prompt_stripped = prompt_stripped[dot_idx + 1:].strip()
+    return f"{expected_start} {prompt_stripped}".strip()
 
 
 # 2026-07-31「视频推进跳变」复盘：此前这一维**只有禁令没有正向要求**——
@@ -4589,6 +4606,8 @@ _OBSERVED_CRAFT_KEYS = (
     ('flow', 'flow'),
     ('crew', 'crew'),
     ('shot_scale', 'shot_scale'),
+    # 逐镜景别序列（2026-08-25）。'wide/close/medium' 这种串，? 表示这一镜没读到。
+    ('shot_scales', 'shot_scales'),
     ('camera_move', 'camera_move'),
     ('camera_angle', 'camera_angle'),
     ('camera_bearing', 'camera_bearing'),
@@ -4682,40 +4701,131 @@ def observed_camera_angles_by_space(parsed_brief):
     return out
 
 
-def observed_camera_angle_packet_rule(parsed_brief):
-    """写给 packet 生成调用的那一段：族级机位句必须落在原片观察到的机位上。
+def observed_camera_setups(parsed_brief):
+    """原片上量到的**互不相同的机位**，按首次出现顺序返回。
 
-    原片没标这些栏就返回空串——老任务、老断点、手输主题一律保持改动前的行为。
+    这是 observed_camera_angles_by_space 的继任者：那一版按**空间**分组，于是一个空间只
+    落得下一个机位——同一个房间里原片换过机位的那几拍，图会按多数派角度出，只有 VIDEO
+    还守着自己的角度（_validate_camera_angle_consistency 报的就是这件事）。复刻线的口径
+    是「原片拍了几个机位就是几个机位」，所以分组键从 space 变成 (space, 角度, 方位, 焦段)。
+
+    返回 [{'id','space','angle','bearing','lens','placement','beats'}]，beats 是 1 基下标。
+    构图（placement）在同一个机位下仍会随工序推进而变，取这一组里出现最多的那句。
+
+    没有清单、清单没标这几栏时返回 []——与其余 observed_* 通路同一条纪律：宁可不注入，
+    也不能拿一个猜出来的机位去改写机位句。
     """
-    by_space = observed_camera_angles_by_space(parsed_brief)
-    if not by_space:
+    plan = _outline_normalized_entries((parsed_brief or {}).get('beat_outline'))
+    order, setups = [], {}
+    for idx, entry in enumerate(plan):
+        angle = str(entry.get('camera_angle') or '').strip()
+        bearing = str(entry.get('camera_bearing') or '').strip()
+        lens = str(entry.get('lens_feel') or '').strip()
+        placement = ' '.join(str(entry.get('placement') or '').split())
+        if not (angle or bearing or lens):
+            # 只有构图没有机位读数时不单独成一个机位：机位句写的是「机器站在哪」，
+            # 拿一句构图去开一个新机位，等于凭空多出一台不存在的机器。
+            continue
+        space = str(entry.get('space') or '').strip() or f'#{idx + 1}'
+        key = (space, angle, bearing, lens)
+        if key not in setups:
+            order.append(key)
+            setups[key] = {'space': space, 'angle': angle, 'bearing': bearing,
+                           'lens': lens, 'placements': {}, 'beats': []}
+        setups[key]['beats'].append(idx + 1)
+        if placement:
+            setups[key]['placements'][placement] = setups[key]['placements'].get(placement, 0) + 1
+
+    out = []
+    for n, key in enumerate(order, start=1):
+        row = setups[key]
+        placement = ''
+        if row['placements']:
+            placement = max(row['placements'].items(), key=lambda kv: kv[1])[0]
+        out.append({'id': f'SETUP_{n}', 'space': row['space'], 'angle': row['angle'],
+                    'bearing': row['bearing'], 'lens': row['lens'],
+                    'placement': placement, 'beats': row['beats']})
+    return out
+
+
+def observed_camera_setup_prose(setup):
+    """一个机位的散文描述（给 packet 生成调用抄的那句）。全空返回空串。"""
+    bits = []
+    if setup.get('angle') in _ANGLE_PROSE:
+        bits.append(_ANGLE_PROSE[setup['angle']])
+    if setup.get('bearing') in _BEARING_PROSE:
+        bits.append(_BEARING_PROSE[setup['bearing']])
+    parts = []
+    if bits:
+        parts.append(f'the camera stands {", ".join(bits)}')
+    if setup.get('lens') in _LENS_PROSE:
+        parts.append(_LENS_PROSE[setup['lens']])
+    if setup.get('placement'):
+        parts.append(f'composition: {setup["placement"]}')
+    return '; '.join(parts)
+
+
+def apply_observed_camera_setups(beat_ladder, parsed_brief):
+    """把机位编号按下标钉回梯子（beat['camera_setup_id']）。返回钉上的拍数。
+
+    与 apply_observed_craft_fields / apply_observed_space_sequence 同一条纪律：清单条数与
+    梯子长度对不上就整段不生效（规划四轮全灭退回兜底梯子时，按下标硬贴只会把 A 拍的机位
+    贴到 B 拍上）。只写 camera_setup_id 这一个键，不碰任何施工字段。
+
+    没钉上编号的拍（原片这一拍没量到机位、老 job、原创单）在 select_camera_dna 里原样
+    回落到族级 camera_dna——改动前的行为逐字保留。
+    """
+    if not isinstance(beat_ladder, list):
+        return 0
+    plan = (parsed_brief or {}).get('beat_outline') or []
+    if len(plan) != len(beat_ladder):
+        return 0
+    by_beat = {}
+    for setup in observed_camera_setups(parsed_brief):
+        for position in setup['beats']:
+            by_beat[position] = setup['id']
+    applied = 0
+    for position, beat in enumerate(beat_ladder, start=1):
+        if not isinstance(beat, dict) or position not in by_beat:
+            continue
+        beat['camera_setup_id'] = by_beat[position]
+        applied += 1
+    if isinstance(parsed_brief, dict) and applied:
+        parsed_brief['observed_camera_setups'] = observed_camera_setups(parsed_brief)
+    return applied
+
+
+def observed_camera_angle_packet_rule(parsed_brief):
+    """写给 packet 生成调用的那一段：原片量到几个机位，就发几句机位。
+
+    2026-08-25 之前这一段按**空间**发一句，于是同一个空间里换过的机位全被投票投掉了。
+    现在改成按机位发：每个观测机位一句，各自带自己的几何锁（消失轴、边界、地平线钉位随
+    角度改写），合成期由 select_camera_dna 按 beat['camera_setup_id'] 取句。几何锁没有被
+    削弱，只是从一把变成几把——每一把仍然逐字复述、仍然管住它自己那几拍的跨帧一致性。
+
+    原片没标这几栏就返回空串——老任务、老断点、手输主题一律保持改动前的行为。
+    """
+    setups = observed_camera_setups(parsed_brief)
+    if not setups:
         return ""
     lines = []
-    for space, view in by_space.items():
-        bits = []
-        if view['angle'] in _ANGLE_PROSE:
-            bits.append(_ANGLE_PROSE[view['angle']])
-        if view['bearing'] in _BEARING_PROSE:
-            bits.append(_BEARING_PROSE[view['bearing']])
-        parts = []
-        if bits:
-            parts.append(f'the camera stands {", ".join(bits)}')
-        if view['lens'] in _LENS_PROSE:
-            parts.append(_LENS_PROSE[view['lens']])
-        if view['placement']:
-            parts.append(f'composition: {view["placement"]}')
-        if not parts:
+    for setup in setups:
+        prose = observed_camera_setup_prose(setup)
+        if not prose:
             continue
-        lines.append(f'- "{space}": ' + '; '.join(parts) + '.')
+        beats = ', '.join(f'beat {n}' for n in setup['beats'])
+        lines.append(f'- "{setup["id"]}" (space "{setup["space"]}"; used by {beats}): {prose}.')
     if not lines:
         return ""
     return ("""
-OBSERVED CAMERA SETUP (mandatory, measured off the reference film — this project reproduces a real film shot for shot):
+OBSERVED CAMERA SETUPS (mandatory, measured off the reference film — this project reproduces a real film shot for shot):
 """ + "\n".join(lines) + """
-Write these INTO the camera sentences themselves: "camera_dna" takes the setup listed for the space filmed from outside, and each interior camera sentence takes the setup listed for its own space. State the camera height, the facing and the lens feel that actually produce that viewpoint (a low angle means a low lens height and upward-converging lines; an overhead angle means the ground plane fills the frame and there is no horizon to pin), and keep the rest of the sentence's job intact — perspective axis and boundaries.
-Where a composition is given, it is a MEASUREMENT of the reference film's framing, and it governs the numbers you invent elsewhere in this packet: the "z_depth_scale" you assign each primary landmark and the horizon pinning inside "camera_dna" must be consistent with it. Those figures have never been measured against the reference film before — this line is the only place they can be.
-This is an observation, not a preference: it OVERRIDES any default or scale rule above that would otherwise push the opening camera to a grounded eye-level wide view. Where they disagree, the observed setup wins, and the framing rules adapt to it (an overhead opening pins its subject in the centre of the ground plane instead of pinning a horizon).
-Every beat filmed from the same space shares that one camera sentence, exactly as it always has — this fixes WHERE the tripod stands, it does not license a new setup per beat.
+23. "camera_setups": REQUIRED for this project. A JSON object whose keys are EXACTLY the setup ids listed above and whose values are one camera sentence each (~25-30 words), written to the same spec as "camera_dna" — shot type, lens feel, camera height, perspective axis, boundaries, horizon pinning. Every listed id must appear; invent no other ids.
+Each sentence must PRODUCE the viewpoint measured for that id: state the camera height, the facing and the lens feel that actually give it (a low angle means a low lens height and upward-converging lines; an overhead angle means the ground plane fills the frame and there is no horizon to pin, so pin the subject in the centre of the ground plane instead). Two setups in the same space share that space's geometry — the same walls, the same landmarks, the same distances — and differ ONLY in where the camera stands; never let them describe two different rooms.
+"camera_dna" itself still takes the setup used by the FIRST beat filmed from outside, and each interior camera sentence takes the setup used by its own space's first interior beat, so a project that never changes setup behaves exactly as before.
+Where a composition is given, it is a MEASUREMENT of the reference film's framing, and it governs the numbers you invent elsewhere in this packet: the "z_depth_scale" you assign each primary landmark and the horizon pinning inside the camera sentences must be consistent with it. Those figures have never been measured against the reference film before — this line is the only place they can be.
+This is an observation, not a preference: it OVERRIDES any default or scale rule above that would otherwise push the opening camera to a grounded eye-level wide view. Where they disagree, the observed setup wins, and the framing rules adapt to it.
+Every beat listed against one id shares that one camera sentence, verbatim — this fixes WHERE the tripod stands for each of them, it does not license a new setup per beat.
 """)
 
 
@@ -4723,6 +4833,38 @@ def observed_craft_of(beat):
     """这一拍从原片量到的制作字段，没有就是空字典。"""
     craft = beat.get('observed_craft') if isinstance(beat, dict) else None
     return craft if isinstance(craft, dict) and craft else {}
+
+
+# 原片景别的闭集。与 reverse.SHOT_SCALES 同源，但这里只认已经归一过的 token——
+# 逐拍字段进 beat['observed_craft'] 之前已经过 _coerce_enum，写不进闭集的一律是空串。
+_OBSERVED_SHOT_SCALES = ('extreme_wide', 'wide', 'medium', 'close', 'extreme_close')
+
+
+def observed_shot_scale_sequence_of(beat):
+    """这一拍**逐个镜头**的景别，如 ['wide', 'close', '', 'wide']；未知返回 []。
+
+    空串是占位、不是缺省：某一镜没读到景别时位置必须留着，否则序列与镜头一一对应的
+    关系就断了，排梯只能按下标硬贴，贴错比不贴更坏（见 reverse.attach_shot_scales）。
+    """
+    raw = str(observed_craft_of(beat).get('shot_scales') or '').strip()
+    if not raw:
+        return []
+    out = []
+    for token in raw.split('/'):
+        token = token.strip().lower()
+        out.append(token if token in _OBSERVED_SHOT_SCALES else '')
+    return out if any(out) else []
+
+
+def observed_shot_scale_of(beat):
+    """这一拍在原片里的景别；未知返回 None。
+
+    与 observed_shot_count_of 同一条纪律：未知与 'wide' 必须分得开。老 job / 原创单 /
+    二创变体拿不到这一栏，那时候镜头梯该保持改动前的形状（主镜恒为远景），而不是按一个
+    编出来的景别去排梯——镜头梯是审计与切点表共用的那一份，排错了每一拍都判违规。
+    """
+    value = str(observed_craft_of(beat).get('shot_scale') or '').strip().lower()
+    return value if value in _OBSERVED_SHOT_SCALES else None
 
 
 def _craft_from_outline_entry(entry):
@@ -5336,6 +5478,19 @@ def select_camera_dna(beat, base_camera_dna, packet=None, family=None):
     if family is None:
         bridge_stage = beat.get('bridge_stage') if beat else None
         family = 'interior' if bridge_stage == 1 else 'exterior'
+    # 复刻线：原片这一拍自己的机位（apply_observed_camera_setups 按下标钉的编号 →
+    # packet['camera_setups'] 里 packet 生成时写好的那一句）。它排在室内/室外分流**之前**：
+    # 编号本身就是按空间分的（见 observed_camera_setups 的分组键），室内拍拿到的必然是
+    # 室内那句，再走一次 family 分流只会把它换成族级的通用室内句。
+    # 没有编号（原创单、老 job、老断点的 packet 里没有 camera_setups、原片这一拍没量到
+    # 机位）时整段不生效，逐字回落到改动前的行为。
+    setup_id = beat.get('camera_setup_id') if isinstance(beat, dict) else None
+    if setup_id:
+        setups = (packet or {}).get('camera_setups')
+        if isinstance(setups, dict):
+            sentence = _flatten_to_text(setups.get(setup_id) or '').strip()
+            if sentence:
+                return sentence
     if family == 'interior':
         interior = _flatten_to_text((packet or {}).get('interior_camera_dna') or '').strip()
         return interior or _INTERIOR_IMAGE_CAMERA_DNA
@@ -5519,6 +5674,58 @@ def ensure_capture_style(prompt, config, parsed_brief=None, theme=''):
     if body and not body.endswith(('.', '!', '?')):
         body += '.'
     return f"{body} {UGC_CAPTURE_CLAUSE}"
+
+
+# 这一拍从原片量到的构图已经写进 IMAGE 了吗。判定按**读数自己的词**的重合度，不按
+# 一张通用构图词表：机位句里本来就写着 "horizon locked at half frame height"，拿
+# horizon / frame height 这类词去判，每一张图都会被判成"已经写过构图了"，注入器
+# 整个空转——正是它要来堵的那个形状。
+_PLACEMENT_INJECTED_MARKER = 'compose the frame exactly this way'
+_PLACEMENT_STOPWORDS = frozenset((
+    'about', 'across', 'along', 'and', 'from', 'into', 'over', 'that', 'the', 'this',
+    'with', 'sits', 'sit', 'runs', 'run', 'taking', 'filling', 'fills', 'frame',
+    'where', 'while', 'which', 'their', 'there', 'here',
+))
+
+
+def _placement_already_written(prompt, reading):
+    """正文是否已经带着这句构图（同义复述也算）。"""
+    low = (prompt or '').lower()
+    if _PLACEMENT_INJECTED_MARKER in low:
+        return True
+    words = {w for w in re.sub(r'[^a-z\s]', ' ', reading.lower()).split()
+             if len(w) > 3 and w not in _PLACEMENT_STOPWORDS}
+    if not words:
+        return False
+    hit = sum(1 for w in words if w in low)
+    return hit >= max(2, int(len(words) * 0.7))
+
+
+def fix_subject_placement(prompt, placement):
+    """把原片量到的构图确定性写进 IMAGE。没有读数或已经写过就原样返回。
+
+    为什么必须确定性注入：此前构图只有两个落点，一个是 packet 生成时按机位投一次票
+    （于是它是**整段常量**，逐拍变不了），一个是逐拍契约里那句劝导文字 COMPOSITION
+    （写手可写可不写，漏了没有任何东西会响）。锚点的屏幕位置与占高比因此始终是编的——
+    这正是 worker_scale_percent 空转过的形状：锁写了、注入不进去、校验器还报绿。
+
+    句子挂在开场机位句之后：机位句说"机器站在哪"，这句说"主体在画面里占哪、占多大"，
+    两句是同一件事的两半，隔开写会被模型读成两段无关的约束。
+    """
+    text = prompt or ''
+    reading = ' '.join(str(placement or '').split())
+    if not text or not reading:
+        return text
+    if _placement_already_written(text, reading):
+        return text
+    sentence = (f"Compose the frame exactly this way: {reading.rstrip('.')}. "
+                f"This framing is measured off the reference film and governs the subject's "
+                f"screen position and its share of frame height in this image.")
+    # 开场句之后、正文之前。找不到句号就整句前置——位置比顺序重要。
+    head, sep, tail = text.partition('. ')
+    if not sep:
+        return f"{text} {sentence}".strip()
+    return f"{head}. {sentence} {tail}".strip()
 
 
 def dedupe_camera_declaration(prompt, camera_dna):
@@ -6450,6 +6657,9 @@ def apply_proactive_fixes(i, video_prompt, image_prompt, packet, mode, is_last, 
 
     # 相机锁定块只留开场那一句，正文里的散文复述整句删掉（见 dedupe_camera_declaration）
     image_prompt = dedupe_camera_declaration(image_prompt, camera_dna)
+    # 逐拍构图（2026-08-25）。排在机位收口**之后**：dedupe_camera_declaration 会整句删掉
+    # 正文里的机位复述，先注入就会被它连着删掉。原片没量到构图时整段不生效。
+    image_prompt = fix_subject_placement(image_prompt, observed_craft_of(beat).get('placement'))
     # 末帧镜面地：以梯子为准，没有工序背书就降级回哑光（见 fix_rhma_blur）。VIDEO 侧
     # 同一判定同一处理——否则 IMAGE 不再要求镜面地，VIDEO 还留着「倒环氧做镜面」那道
     # 凭空多出来的工序，末条片子照样把地面整片重刷一遍。
@@ -6642,20 +6852,23 @@ def check_occupant_delivered(image_prompt, video_prompt, beat):
     return errors
 
 
-def check_video_opening(i, prompt, first_frame_index=None):
-    """Validate the mandatory first/last-frame anchor opening and its first-frame -> IMAGE i+1
-    binding. Mirrors fix_video_opening, which runs proactively, so well-formed prompts pass
-    here. first_frame_index overrides the expected first-frame IMAGE number (see
-    fix_video_opening's docstring — currently unused by any variant, kept as a generic
-    hook)."""
+def check_video_opening(i, prompt, first_frame_index=None, profile=None, single_frame=False):
+    """Validate the mandatory first-frame anchor opening and its frame binding."""
     first_frame_index = i if first_frame_index is None else first_frame_index
     errors = []
-    low = prompt.strip().lower()
-    if not low.startswith("use the provided first frame and last frame as exact composition anchors."):
-        errors.append(f"VIDEO {i} missing required opening sentence 'Use the provided first frame and last frame as exact composition anchors.'")
-    binding = f"use image {first_frame_index} as the actual first-frame image and image {i + 1} as the actual last-frame image".lower()
-    if binding not in low:
-        errors.append(f"VIDEO {i} opening must bind IMAGE {first_frame_index} (first frame) to IMAGE {i + 1} (last frame)")
+    low = (prompt or '').strip().lower()
+    if profile in ('omni', 'miniature') or single_frame or "starting composition and environment anchor" in low:
+        if not low.startswith("use the provided image as the exact starting composition and environment anchor."):
+            errors.append(f"VIDEO {i} missing required opening sentence 'Use the provided image as the exact starting composition and environment anchor.'")
+        binding = f"use image {first_frame_index} as the actual first-frame image".lower()
+        if binding not in low:
+            errors.append(f"VIDEO {i} opening must bind IMAGE {first_frame_index} as the starting frame")
+    else:
+        if not low.startswith("use the provided first frame and last frame as exact composition anchors."):
+            errors.append(f"VIDEO {i} missing required opening sentence 'Use the provided first frame and last frame as exact composition anchors.'")
+        binding = f"use image {first_frame_index} as the actual first-frame image and image {i + 1} as the actual last-frame image".lower()
+        if binding not in low:
+            errors.append(f"VIDEO {i} opening must bind IMAGE {first_frame_index} (first frame) to IMAGE {i + 1} (last frame)")
     return errors
 
 
@@ -6696,7 +6909,7 @@ def check_out_and_in(prompt, is_threshold_or_reveal=False):
                     sentence):
                 errors.append("VIDEO must not spend time on worker entrance or exit choreography")
                 break
-        starts_at_zero = ('t=0' in low or 'zero seconds' in low) and any(
+        starts_at_zero = ('t=0' in low or 'zero seconds' in low or 'opening frame' in low or 'opening instant' in low) and any(
             p in low for p in ('already at', 'already positioned', 'first effective tool contact',
                                'first tool contact', 'begins the first', 'starts the first'))
         if not starts_at_zero:
@@ -6758,9 +6971,17 @@ def check_stylistic_repetition(curr_prompt, prev_prompt, packet, is_video=True):
         # Replace digits with empty string or space to ignore frame index/beat numbers
         text = re.sub(r'\b\d+\b', '', text)
         
-        # Strip Camera DNA (_flatten_to_text: packet may come from an un-normalized caller)
-        dna = _flatten_to_text(packet.get('camera_dna', ''))
-        if dna:
+        # Strip Camera DNA (_flatten_to_text: packet may come from an un-normalized caller).
+        # 复刻线上机位句不止一句（camera_setups，见 select_camera_dna）：只剥族级那一句，
+        # 另外几个机位的措辞会原样留在正文里，被复读审计当成「这几拍在互相抄」。机位句
+        # 是结构件不是复读，全都要剥。
+        dnas = [_flatten_to_text(packet.get('camera_dna', ''))]
+        _setups = packet.get('camera_setups')
+        for sentence in (_setups.values() if isinstance(_setups, dict) else []):
+            dnas.append(_flatten_to_text(sentence))
+        for dna in dnas:
+            if not dna:
+                continue
             dna_clean = re.sub(r'\b\d+\b', '', dna.lower()).strip()
             dna_words = re.sub(r'[^\w\s]', ' ', dna_clean).split()
             for word in dna_words:
@@ -8743,8 +8964,15 @@ def check_milestone_video_prompt(video_prompt, beat):
 
 
 def rework_milestone_prompt_pair(config, i, video_prompt, image_prompt, beat,
-                                  video_errors=None, image_errors=None):
-    """One conservative pair rewrite for a failed milestone contract."""
+                                  video_errors=None, image_errors=None,
+                                  normalize_video=None, profile_video_check=None):
+    """One conservative pair rewrite for a failed milestone contract.
+
+    normalize_video / profile_video_check 是 profile 侧的收口钩子（见 composers.base
+    .normalize_reworked_video / video_profile_violations）。omni 这类多镜头 profile 里,
+    里程碑重写稿是照**一镜到底**的骨架契约写出来的：不归一就会把切点表/镜头梯洗掉,
+    下游 omni 复验再判违规 → 定向回炉 → 又把里程碑关键词洗掉,两道回炉互相拆台。
+    """
     video_errors = list(video_errors or [])
     image_errors = list(image_errors or [])
     if not video_errors and not image_errors:
@@ -8771,8 +8999,26 @@ def rework_milestone_prompt_pair(config, i, video_prompt, image_prompt, beat,
         if not new_video or not new_image:
             return video_prompt, image_prompt, False
         new_video = fix_video_opening(i, clean_prompt_text(new_video))
+        if callable(normalize_video):
+            new_video = normalize_video(new_video)
         new_image = fix_image_clean_frame_proactive(clean_prompt_text(new_image))
-        if check_milestone_video_prompt(new_video, beat) or check_milestone_image_prompt(new_image, beat):
+        # profile 侧硬伤（如 omni 的镜头语法）不许被这轮重写**引入**——原稿本来就有的
+        # 那几条不算,否则 profile 违规拍永远修不了里程碑。
+        if callable(profile_video_check):
+            before = set(profile_video_check(video_prompt) or ())
+            introduced = [e for e in (profile_video_check(new_video) or ()) if e not in before]
+            if introduced:
+                if sys.stdout:
+                    print(f"[DIRECT] Beat {i} 里程碑重写稿引入了 profile 侧硬伤，保留原稿: {introduced}")
+                return video_prompt, image_prompt, False
+        # 采纳条件从「一条不剩」放宽成「严格改善」：旧写法是全有全无——VIDEO 明明修好了,
+        # 只要 IMAGE 侧还剩一条就整对丢弃,下游里程碑硬门照旧不过 → 整拍重试 → 每轮重复
+        # 同一循环,最终整单 BEAT_GENERATION_FAILED（2026-08-25 Beat 7 实例）。
+        old_errs = set(check_milestone_video_prompt(video_prompt, beat)) | set(
+            check_milestone_image_prompt(image_prompt, beat))
+        new_errs = set(check_milestone_video_prompt(new_video, beat)) | set(
+            check_milestone_image_prompt(new_image, beat))
+        if new_errs and not (new_errs < old_errs):
             return video_prompt, image_prompt, False
         return new_video, new_image, True
     except GenerationCancelled:
@@ -11016,6 +11262,10 @@ Space Type: {space_type}
         # 收口。缺了它，这六件事就只在规划提示词里出现过一次，写手（Phase 2）看到的
         # 是规划器的转述而不是观测值（见 apply_observed_craft_fields 的说明）。
         _craft_applied = apply_observed_craft_fields(beat_ladder, parsed_brief)
+        # 机位编号（2026-08-25）。必须排在 packet 生成之前：packet 生成调用要按
+        # observed_camera_setups 发几句机位，合成期再按这里钉下的编号取句。两边同一个
+        # 函数算编号，钉不上（清单条数对不上梯子）时两边一起整段不生效。
+        _camera_setups_applied = apply_observed_camera_setups(beat_ladder, parsed_brief)
         if _craft_applied and sys.stdout:
             print(f'[CRAFT] {_craft_applied} 拍带上了原片观察到的制作字段'
                   f'（工具/音效/光照/物料去向/人数/机位）。')
@@ -12616,14 +12866,14 @@ def _beat_block_text(i, contract):
     cast_action = str(beat.get('cast_action') or '').strip()
     cast_section = (
         f"\nCAST IN FRAME (observed in the reference film): {cast_action}. This beat's IMAGE shows "
-        f"them settled in that pose; this beat's VIDEO must show them MOVING INTO it — one visible "
-        f"micro-motion that starts from the pose they hold in the previous IMAGE and ends in the "
-        f"pose this beat's IMAGE shows (they get up, turn, step closer, crouch, point, look across "
-        f"to the new work). Write that motion into the main working shot or the returning shot, in "
-        f"words. NEVER write that they remain, stay put, hold their position or are unchanged: a "
-        f"cast that holds one pose for the whole sequence is delivered as dolls that never move, "
-        f"and they are the only living thing in the frame. They never touch the work, never leave "
-        f"the frame, and their identity, costume and scale never change.\n"
+        f"them settled in that pose; this beat's VIDEO must show them MOVING INTO it via an "
+        f"ACTION-REACTION CAUSAL CHAIN: tie their immediate reflex to the craftsman's entry (e.g. "
+        f"tilting heads back in awe as hands enter), their movement/gaze tracking to the active tool work, "
+        f"and their settled posture to the finished result. Never isolate character movement as a passive "
+        f"afterthought at clip end. NEVER write that they remain, stay put, hold their position or are "
+        f"unchanged: a cast that holds one pose for the whole sequence is delivered as dolls that never move, "
+        f"and they are the only living thing in the frame. They never touch the work, never leave the frame, "
+        f"and their identity, costume and scale never change.\n"
         if cast_action else "")
     insert_subject = str(beat.get('insert_subject') or '').strip()
     insert_section = (
@@ -15283,7 +15533,8 @@ def _outline_normalized_entries(outline):
                             'summary', 'operation_zh', 'headline_zh',
                             'shot_count', 'shot_seconds', 'insert', 'cast',
                             'tool', 'tool_specifics',
-                            'shot_scale', 'camera_move', 'camera_angle', 'camera_bearing',
+                            'shot_scale', 'shot_scales',
+                            'camera_move', 'camera_angle', 'camera_bearing',
                             'lens_feel', 'placement', 'time_treatment',
                             'light', 'flow', 'crew'):
                     value = str(entry.get(key) or '').strip()
@@ -15998,14 +16249,15 @@ def build_outline_plan_block(beat_outline, max_total_beats, multishot=False):
                 "delivers a calm finished-home tour as a frantic sped-up clip.")
         if has_cast:
             rules.append(
-                "CAST: an entry's \"CAST\" is what the people or figurines in that beat are "
-                "doing with their bodies in the reference film, apart from the work itself — "
-                "posture, facing, gaze, how far they have moved since the previous beat. Carry it "
-                "into that beat: the resulting IMAGE shows them in that new pose and position, and "
-                "the VIDEO shows them getting there. They are the only living thing in a time-lapse; "
-                "reproducing them in the identical pose beat after beat is what turns the delivery "
-                "into a still-life slideshow. Their identity, costume and scale never change — only "
-                "their body does.")
+                "CAST: an entry's \"CAST\" is the ACTION-REACTION CAUSAL CHAIN of what the people or "
+                "figurines in that beat are doing with their bodies in response to the work — "
+                "immediate reflex when the hand/tool enters, gaze/body tracking during the operation, "
+                "and settled posture upon delivery. Carry it into that beat: the resulting IMAGE shows "
+                "them in that settled pose, and the VIDEO interweaves their reactive movement directly "
+                "with the craftsman's actions. They are the only living thing in a time-lapse; "
+                "reproducing them in the identical pose beat after beat or freezing them until the clip end "
+                "is what turns the delivery into a still-life slideshow. Their identity, costume and scale "
+                "never change — only their dynamic bodily reaction does.")
         if has_insert:
             rules.append(
                 "INSERT: an entry's \"INSERT\" is what the reference film's own cut-in inside "

@@ -6017,11 +6017,16 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 task_id = f"videos_{uuid.uuid4().hex}"
 
                 cleanup_old_tasks()
-                get_or_create_task(task_id, {"type": "videos", "theme": title, "project_key": project_key,
-                                             "userId": config.get('googleFxUserId') or None})
+                is_chain_model = (
+                    'omni' in str(config.get('videoModel') or '').lower()
+                    or 'miniature' in str(config.get('skillProfile') or '').lower()
+                    or 'miniature' in str(config.get('videoModel') or '').lower()
+                    or bool(config.get('videoChainMode'))
+                )
+                target_worker = generate_video_chain_worker if is_chain_model else generate_videos_worker
 
                 threading.Thread(
-                    target=generate_videos_worker,
+                    target=target_worker,
                     args=(task_id, config, title, prompt_block, target_slots, override_flagged),
                     daemon=True
                 ).start()

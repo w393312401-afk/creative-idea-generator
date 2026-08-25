@@ -48,35 +48,17 @@
 
 这两类拍免除下面的节奏声明（它们是揭示与收尾，不压缩劳动），但**都不免除一镜到底禁令**。
 
-## 切点表（Shot Timeline）
+## 纯自然语言多镜头因果流 (Pure Natural Language Shot Flow)
 
-只报菜名不够：不把切点钉在秒上，模型会自己挑，插入镜要么消失要么吃掉主镜。因此每一条
-VIDEO 正文都带一句切点表，位置紧跟锚定开场句之后。
-
-八秒（本链路默认）：
+**严禁使用任何机械时间戳与切点表（如 `Cut this eight-second clip on these marks...` 或 `0.0 to 2.6s:`）**。视频模型（Veo 3.1、Kling、Sora）依靠**带有电影分镜因果连词的纯自然语言英文散文**来驱动镜头推拉与手工动作：
 
 ```text
-Cut this eight-second clip on these marks and hold no other cuts — a macro working shot from 0.0 to 2.6, a close-up insert from 2.6 to 4.3, an extreme close-up insert from 4.3 to 5.8, and a returning macro shot from 5.8 to 8.0 seconds.
-```
-
-八秒的揭示拍与兑现拍（三镜）：
-
-```text
-Cut this eight-second clip on these marks and hold no other cuts — a macro working shot from 0.0 to 3.2, a close-up insert from 3.2 to 5.3, and a returning macro shot from 5.3 to 8.0 seconds.
+The scene opens with a locked macro diorama shot at model eye-level as an oversized human hand reaches in from the frame edge, holding [micro-tool] to [repeating micro-action]. The camera then cuts into a tight close-up insert on the tool contact point, showing [material physics: adhesive spreading, wood fibers bending, mortar squeezing]. Shifting to an extreme close-up insert, the macro optics highlight [two persistent craft traces: glue beads, matte grain texture, clean joint seams]. Finally, the camera cuts back to the primary locked diorama setup as the giant hand gives a gentle final press and smoothly withdraws clear of the frame, settling into the clean completed state.
 ```
 
 规则：
-
-- 时长按镜头权重分，不是平均分。主镜最长，切回镜次之，插入镜拿剩下的。插入镜跑到一秒
-  上下是正常的——一秒的**插入**读作插入，一秒的**景别**才读作闪帧。
-- 切点单调、无缝：每一镜从上一镜结束处开始，第一镜从 `0.0` 起，最后一镜正好落在片长上。
-- 每个镜头自己的首句要用**英文单词**复述一次自己的入点
-  （`A clean cut at the three-second mark drops into a close-up insert on the tweezer tip ...`），
-  与切点表形成冗余绑定。
-- **这句切点表是全篇唯一允许出现阿拉伯数字的地方**（见 `miniature-output-templates.md`
-  的记号禁用与时间码豁免）。正文其余部分的计数与尺寸一律写成英文单词或比较物。
-
-切点表由 composer 确定性注入并覆写——模型自己编的时间线不作数。
+- 镜头转换完全由自然叙事连词表达（`The scene opens with...`, `The camera then cuts into a tight close-up insert on...`, `Shifting to an extreme close-up insert...`, `Finally, the camera cuts back to the primary locked diorama setup...`）。
+- 全文一律不出现阿拉伯数字秒数、分段区间或机械切点记号，所有尺寸与计数均写成英文单词。
 
 ## 节奏声明（Pacing Declaration）
 

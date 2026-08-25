@@ -237,6 +237,7 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
         check(["lightbox"] in calls, "点出图卡应开 lightbox，实得 %s" % calls)
 
         # busy：只影响 disabled，不改变按钮存在与否，且 disabled 后点击不派发
+        # 注意：view-candidates 与 describe-frame 属于只读/元数据操作，生成中始终保持可用
         before = page.evaluate(
             "() => document.querySelectorAll('#frames-grid .slot-action-btn').length")
         page.evaluate("() => { window.__calls = []; setFrameGridButtonsBusy(true); }")
@@ -245,8 +246,9 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
         check(before == after, "busy 不应增删按钮 (%d -> %d)" % (before, after))
         disabled = page.evaluate(
             "() => Array.from(document.querySelectorAll('#frames-grid .slot-action-btn'))"
+            ".filter(b => b.dataset.act !== 'describe-frame' && b.dataset.act !== 'view-candidates')"
             ".every(b => b.disabled)")
-        check(disabled, "busy 时帧网格按钮应全部 disabled")
+        check(disabled, "busy 时帧网格写操作类按钮应全部 disabled")
         page.eval_on_selector('#frame-slot-4 [data-act="retry-frame"]', "el => el.click()")
         check(page.evaluate("() => window.__calls.length") == 0, "disabled 的按钮不该派发点击")
 
@@ -271,7 +273,7 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
             setFrameGridButtonsBusy(true);
             const st = t => Array.from(document.querySelectorAll(
                 `#beats-grid .slot-card[data-type="${t}"] .slot-action-btn`));
-            const busy = { img: st('image').every(b => b.disabled),
+            const busy = { img: st('image').filter(b => b.dataset.act !== 'describe-frame' && b.dataset.act !== 'view-candidates').every(b => b.disabled),
                            vid: st('video').some(b => b.disabled),
                            imgN: st('image').length, vidN: st('video').length };
             setFrameGridButtonsBusy(false);
@@ -293,7 +295,8 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
         # 选不中任何按钮，网格就永远停在禁用态。
         stuck = page.evaluate("""() => {
             const btns = () => Array.from(document.querySelectorAll(
-                '#beats-grid .slot-card[data-type="image"] .slot-action-btn'));
+                '#beats-grid .slot-card[data-type="image"] .slot-action-btn'))
+                .filter(b => b.dataset.act !== 'describe-frame' && b.dataset.act !== 'view-candidates');
             ideaTasksById['smoke1'] = { frames: { taskId: 't1' }, videos: null, cover: null };
             renderFramesForIdea(currentIdea);
             const during = btns().every(b => b.disabled);
@@ -311,7 +314,8 @@ def test_slot_grid_renders_states_badges_and_delegated_actions():
         page.wait_for_timeout(300)
         refreshed = page.evaluate("""() => {
             const btns = () => Array.from(
-                document.querySelectorAll('#frames-grid .slot-action-btn'));
+                document.querySelectorAll('#frames-grid .slot-action-btn'))
+                .filter(b => b.dataset.act !== 'describe-frame' && b.dataset.act !== 'view-candidates');
             ideaTasksById['smoke1'] = { frames: { taskId: 't1' }, videos: null, cover: null };
             refreshSlotGridBusy('image');
             const during = btns().every(b => b.disabled);

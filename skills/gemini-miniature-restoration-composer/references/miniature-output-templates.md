@@ -19,26 +19,17 @@ A static macro diorama eye-level vertical 9:16 tripod shot, centered on the mini
 A static macro diorama eye-level hero shot, centered on the completed luxury miniature [destiny name, e.g. two-story timber and stone woodland villa diorama]. The miniature home features warm interior LED lights glowing through clear windows, finished terracotta tiled roof, landscaped moss garden with pebble stepping stones. The two tiny resident figurines stand happily on the front porch waving at the camera, while an oversized human hand gently frames the upper roof apex in a warm protective gesture. Soft golden woodland lighting with creamy bokeh.
 ```
 
-## 2. VIDEO 提示词标准模板（多镜头组接）
+## 2. VIDEO 提示词标准模板（纯自然语言多镜头组接）
 
-> 单段 VIDEO 是**剪辑过的多镜头序列**，不是一镜到底。完整语法（镜头梯、切点表、节奏声明、
-> 镜内连续性）在 `miniature-multishot-language.md`；这里是照抄用的骨架。八秒四镜：
+> 单段 VIDEO 是**纯自然语言叙述的微距多镜头序列**，绝不使用数字切点表或时间戳。完整语法见 `miniature-multishot-language.md`。
 
 ```text
-Use IMAGE {i} as the first-frame anchor and IMAGE {i+1} as the last-frame anchor; all visible actions must interpolate between these two states. Cut this eight-second clip on these marks and hold no other cuts — a macro working shot from 0.0 to 2.6, a close-up insert from 2.6 to 4.3, an extreme close-up insert from 4.3 to 5.8, and a returning macro shot from 5.8 to 8.0 seconds. The opening macro working shot holds the locked macro framing, the shallow depth of field, and the diorama terrain exactly as anchored: one oversized human hand is already reaching in from the upper frame edge with a [specific micro-tool, e.g. miniature stainless pointing trowel] and is [concrete repeating micro-action, e.g. drawing craft mortar along the course and setting thumbnail-sized blocks into it one after another], while the two tiny figurines watch from the foreground corner. A clean cut at the two-and-a-half-second mark drops into a close-up insert on the tool contact point, where [material physics: mortar squeezing out, glue wetting the grain, clay grit lifting]. Another clean cut near the four-second mark holds an extreme close-up insert on [two persistent craft traces: struck bead, fallen crumbs, glue fillet, sawdust], with nothing advancing. The last cut is a returning macro shot from the same locked macro setup as the opening macro working shot, where the remaining repetitions happen the same way and the hands withdraw clear of the frame before the last moment, leaving [milestone product] clean and stable. Edited miniature craft time-lapse assembled from multiple macro camera setups, not real-time footage, with oversized human hands entering and withdrawing between passes. Near-field sound of [crisp miniature tapping, stone clinking, adhesive syringe clicks] over a quiet workshop room tone.
+Use the provided image as the exact starting composition and environment anchor. Use IMAGE {i} as the actual first-frame image; begin from this initial state and naturally progress the work through the multi-shot sequence without inventing extraneous layouts. A locked macro diorama setup at model eye-level, fifty to eighty-five millimetre macro lens feel with shallow depth of field and creamy background bokeh. The scene opens with a macro working shot holding the locked diorama framing: one oversized human hand is already reaching in from the upper frame edge with a [specific micro-tool, e.g. miniature stainless pointing trowel] and is [concrete repeating micro-action, e.g. drawing craft mortar along the course and setting thumbnail-sized blocks into it one after another], while two tiny resin figurines watch from the foreground corner. The camera then cuts into a tight close-up insert on the tool contact point, where [material physics: mortar squeezing out, glue wetting the grain, clay grit lifting]. Shifting to an extreme close-up insert, the macro view highlights [two persistent craft traces: struck bead, fallen crumbs, glue fillet, sawdust]. Finally, the camera cuts back to a returning macro shot from the exact same locked macro setup as the opening shot, where the remaining repetitions happen smoothly and the hands withdraw clear of the frame before the last moment, leaving [milestone product] clean and stable as this beat's finished state. Edited miniature craft time-lapse assembled from multiple macro camera setups, not real-time footage, with oversized human hands entering and withdrawing between passes. Near-field sound of [crisp miniature tapping, stone clinking, adhesive syringe clicks] at sixty percent volume with zero background music.
 ```
 
-揭示拍与兑现拍用三镜版切点表（`... a macro working shot from 0.0 to 3.2, a close-up insert
-from 3.2 to 5.3, and a returning macro shot from 5.3 to 8.0 seconds.`），并且**免除**上面那句
-节奏声明。
+### 记号禁用 (Notation Ban)
 
-### 记号禁用与时间码豁免 (Notation Ban)
-
-正文一律不出现阿拉伯数字、百分号与内部缩写：计数写成英文单词（`three roof tiles`），
-尺寸写成词形或比较物（`about a thumb tall`、`fifty to eighty-five millimetre`）。
-
-**唯一的例外是切点表那一句**——`Cut this eight-second clip on these marks ...` 里的秒数
-必须是阿拉伯数字，否则切点钉不住。除它之外，正文里任何一个裸数字都算违规。
+正文一律不出现阿拉伯数字、百分号、时间戳与内部缩写：计数写成英文单词（`three roof tiles`, `two figurines`），尺寸写成词形或比较物（`about a thumb tall`、`fifty to eighty-five millimetre`）。严禁任何形式的机器时间码或切点表。
 
 ## 3. 负向词库 (Miniature Negative Restraints)
 

@@ -232,7 +232,7 @@
         },
         "cast_action": {
           "type": "string",
-          "description": "画面里**每一个有主体性的活物**在这一拍除了干活以外的身体语言：姿态、朝向、视线、位移、手势、神情。活物 = 真人工人 / 微缩树脂人偶 / 动物（工地上的狗、屋顶的猫、沙盘里的树脂小鸡都算）。有几个就写几个。与 visible_action 分工不同——那一栏写的是工序（\"trowels the surface\"），这一栏写的是人本身（\"crouches at the wall foot with his head tilted to sight along the course\"、\"the two figurines turn from the moss to face the rising wall, the one in red half a step closer than before\"）。这一栏空着，交付出来的人就是一动不动的：延时片里人是唯一的活物，冻住它等于把片子变成静物展示。"
+          "description": "画面里**每一个有主体性的活物**在这一拍除了干活以外的身体语言，严格按「触发源 -> 即时应激动作 -> 过程视线/位移追踪 -> 收尾定格」因果链记录：姿态、朝向、视线、位移、手势、神情。活物 = 真人工人 / 微缩树脂人偶 / 动物（工地上的狗、屋顶的猫、沙盘里的树脂小鸡都算）。有几个就写几个。与 visible_action 分工不同——那一栏写的是工序（\"trowels the surface\"），这一栏写的是人本身对工序与环境变动的即时生理反应（\"As the hand enters from the canopy -> figurines tilt heads up in awe -> as the shack is gripped -> swiftly stand up -> turn to face the cleared footprint\"）。严禁写 remain / stay / static / unchanged 等静态位置词：延时片里人是唯一的活物，冻住它等于把片子变成静物展示。"
         },
         "insert_subject": {
           "type": "string",

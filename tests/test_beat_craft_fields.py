@@ -363,8 +363,10 @@ class TestCameraAngle(unittest.TestCase):
                                       'lens': '', 'placement': ''}})
 
     def test_one_space_filmed_from_two_angles_is_surfaced_not_swallowed(self):
-        """族级机位句一个空间只落得下一个角度。少数派那几拍的图会按多数派出——
-        这不是 bug，但绝不能静默发生：卡片上写着鸟瞰、出来的图却是平视。"""
+        """同空间两个机位现在各拿一句机位声明（observed_camera_setups），不再被投票投掉。
+
+        告警留着，理由换了：每多一个机位就多一把独立的几何锁，角度**读错**的那一拍会让
+        图凭空换一次机位、跨帧一致性从那里断开。所以仍然要在人工卡点上摊开让用户核。"""
         beats = [
             _craft_beat('B01', space='main room', camera_angle='eye_level', camera_bearing='front'),
             _craft_beat('B02', space='main room', camera_angle='eye_level', camera_bearing='front'),
@@ -703,3 +705,281 @@ class TestEverythingAliveIsCovered(unittest.TestCase):
         block = composer.scene_constants_block()
         self.assertIn('mossy concrete', block)
         self.assertNotIn('keep moving', block)
+
+
+class ObservedCameraSetupsTest(unittest.TestCase):
+    """原片量到几个机位就发几句机位（2026-08-25）。
+
+    改动前：机位句按**空间**发一句，同一个空间里换过的机位被多数派投票投掉，少数派那几拍
+    的图按多数派的角度出——用户看着卡片上写的「B07 鸟瞰」，出来的图却是平视，整条链路一声
+    不吭。现在分组键是 (空间, 角度, 方位, 焦段)，几何锁从一把变成几把，每一把仍然逐字复述。
+    """
+
+    def _brief(self):
+        return {'beat_outline': [
+            {'text': 'dig', 'space': 'outside', 'camera_angle': 'high_angle',
+             'camera_bearing': 'three_quarter', 'lens_feel': 'wide',
+             'placement': 'the trench runs along the lower left'},
+            {'text': 'tamp', 'space': 'outside', 'camera_angle': 'high_angle',
+             'camera_bearing': 'three_quarter', 'lens_feel': 'wide',
+             'placement': 'the trench runs along the lower left'},
+            {'text': 'nail', 'space': 'outside', 'camera_angle': 'low_angle',
+             'camera_bearing': 'side', 'lens_feel': 'normal',
+             'placement': 'the wall fills three fifths of frame height'},
+        ]}
+
+    def test_the_same_space_filmed_twice_yields_two_setups(self):
+        setups = pp.observed_camera_setups(self._brief())
+        self.assertEqual([s['id'] for s in setups], ['SETUP_1', 'SETUP_2'])
+        self.assertEqual(setups[0]['beats'], [1, 2])
+        self.assertEqual(setups[1]['beats'], [3])
+        self.assertEqual(setups[1]['angle'], 'low_angle')
+
+    def test_every_setup_gets_its_own_sentence_requested_from_the_packet(self):
+        rule = pp.observed_camera_angle_packet_rule(self._brief())
+        self.assertIn('"SETUP_1"', rule)
+        self.assertIn('"SETUP_2"', rule)
+        self.assertIn('"camera_setups"', rule)
+        # 同空间的两个机位不能被写成两个房间
+        self.assertIn('never let them describe two different rooms', rule)
+
+    def test_the_setup_id_is_pinned_to_the_beat_and_picks_the_sentence(self):
+        brief = self._brief()
+        ladder = [{'index': i} for i in range(3)]
+        self.assertEqual(pp.apply_observed_camera_setups(ladder, brief), 3)
+        self.assertEqual([b['camera_setup_id'] for b in ladder],
+                         ['SETUP_1', 'SETUP_1', 'SETUP_2'])
+        packet = {'camera_dna': 'FAMILY.',
+                  'camera_setups': {'SETUP_1': 'OVERHEAD SENTENCE.',
+                                    'SETUP_2': 'LOW ANGLE SENTENCE.'}}
+        picked = [pp.select_camera_dna(b, packet['camera_dna'], packet=packet, family='exterior')
+                  for b in ladder]
+        self.assertEqual(picked, ['OVERHEAD SENTENCE.', 'OVERHEAD SENTENCE.',
+                                  'LOW ANGLE SENTENCE.'])
+
+    def test_a_length_mismatch_disables_the_whole_thing(self):
+        """规划四轮全灭退回兜底梯子时，按下标硬贴只会把 A 拍的机位贴到 B 拍上。"""
+        ladder = [{'index': 0}, {'index': 1}]
+        self.assertEqual(pp.apply_observed_camera_setups(ladder, self._brief()), 0)
+        self.assertNotIn('camera_setup_id', ladder[0])
+
+    def test_no_reading_and_no_packet_key_fall_back_verbatim(self):
+        """原创单、老 job、老断点的 packet 里没有 camera_setups —— 逐字回落到族级机位句。"""
+        self.assertEqual(pp.observed_camera_setups({}), [])
+        self.assertEqual(pp.apply_observed_camera_setups([{'index': 0}], {}), 0)
+        self.assertEqual(
+            pp.select_camera_dna({'camera_setup_id': 'SETUP_1'}, 'FAMILY.',
+                                 packet={'camera_dna': 'FAMILY.'}, family='exterior'),
+            'FAMILY.')
+        self.assertEqual(
+            pp.select_camera_dna({}, 'FAMILY.',
+                                 packet={'camera_setups': {'SETUP_1': 'X.'}}, family='exterior'),
+            'FAMILY.')
+
+    def test_a_placement_alone_does_not_open_a_new_setup(self):
+        """机位句写的是「机器站在哪」。拿一句构图开一个新机位 = 凭空多出一台机器。"""
+        self.assertEqual(pp.observed_camera_setups({'beat_outline': [
+            {'text': 'a', 'space': 'outside', 'placement': 'centred, three fifths high'}]}), [])
+
+    def test_a_dict_shaped_sentence_is_flattened_not_shipped(self):
+        """dict 形状的值会在 fix_camera_dna 的 .lower() 上当场中断整单。"""
+        packet = pp.normalize_packet(
+            {'camera_setups': {'SETUP_1': {'text': 'sentence'}, 'SETUP_2': ''}})
+        self.assertIsInstance(packet['camera_setups']['SETUP_1'], str)
+        self.assertNotIn('SETUP_2', packet['camera_setups'])
+
+
+class ObservedShotScaleLadderTest(unittest.TestCase):
+    """镜头梯吃原片景别（2026-08-25）。
+
+    改动前施工梯的主镜/切回镜写死是远景，于是原片整拍拍在特写上时，切点表、逐镜职责、
+    镜头名审计、定向回炉四处一致地要求写 wide working shot——观测到的 shot_scale 只以
+    一句劝导文字下发，软的必然输给硬的。
+    """
+
+    def setUp(self):
+        from prompt_pipeline.composers import omni
+        self.omni = omni
+        self.four = omni._CONSTRUCTION_LADDERS[4]
+
+    def _phrases(self, ladder):
+        return [r.phrase for r in ladder]
+
+    def test_an_unknown_or_wide_scale_changes_nothing(self):
+        for scale in (None, '', 'wide', 'bogus'):
+            self.assertEqual(self.omni.apply_observed_scale(self.four, scale), self.four)
+
+    def test_a_close_beat_is_not_pulled_out_to_a_wide_master(self):
+        ladder = self.omni.apply_observed_scale(self.four, 'close')
+        self.assertEqual(self._phrases(ladder)[0], 'a close working shot')
+        self.assertEqual(self._phrases(ladder)[-1], 'a returning close shot')
+        # 主镜已经很紧时插入镜必须更紧，否则两镜写成同一个画面、四镜梯塌成两镜
+        self.assertEqual(self._phrases(ladder)[1], 'a macro detail insert')
+
+    def test_the_rung_keys_survive_the_rewrite(self):
+        """切点表、职责文案、缺镜头审计、越界景别审计、兜底稿全部按 rung.key 取值。"""
+        for scale in ('medium', 'close', 'extreme_close', 'extreme_wide'):
+            ladder = self.omni.apply_observed_scale(self.four, scale)
+            self.assertEqual([r.key for r in ladder], [r.key for r in self.four])
+
+    def test_the_timeline_and_the_audit_read_the_same_ladder(self):
+        """两边取梯口径不一致 = 每拍必判违规、每拍烧一轮回炉，报的还是「缺镜头」。"""
+        ladder = self.omni.apply_observed_scale(self.four, 'medium')
+        timeline = self.omni.timeline_sentence(8, ladder)
+        self.assertIn('a medium working shot', timeline)
+        self.assertEqual(self.omni._missing_shot_rungs(timeline, ladder), [])
+
+    def test_the_traversal_and_reward_ladders_are_untouched(self):
+        """过门梯/兑现梯的三个工位由职责定，景别是那份职责的一部分。"""
+        for ladder in (self.omni._TRAVERSAL_LADDER, self.omni._REWARD_LADDER):
+            self.assertEqual(self.omni.apply_observed_scale(ladder, 'close'), ladder)
+
+    def test_the_scale_reaches_the_ladder_through_the_beat(self):
+        self.assertEqual(pp.observed_shot_scale_of(
+            {'observed_craft': {'shot_scale': 'extreme_close'}}), 'extreme_close')
+        self.assertIsNone(pp.observed_shot_scale_of({}))
+        self.assertIsNone(pp.observed_shot_scale_of(
+            {'observed_craft': {'shot_scale': 'cinematic'}}))
+
+
+class ObservedShotScaleSequenceTest(unittest.TestCase):
+    """逐镜景别序列（2026-08-25）：原片一拍里远/全/中/近/特怎么切，交付就怎么切。
+
+    改动前景别只有**逐拍**一个读数，镜头梯拿它去排三到四镜，中间那两个插入镜的景别是
+    写死的——「原片是远景切特写再切中景」这件事整条链路一个字都接不住。
+    """
+
+    def setUp(self):
+        from prompt_pipeline.composers import omni
+        self.omni = omni
+        self.four = omni._CONSTRUCTION_LADDERS[4]
+
+    def _phrases(self, ladder):
+        return [r.phrase for r in ladder]
+
+    def test_the_middle_inserts_follow_the_reference_films_own_cuts(self):
+        ladder = self.omni.apply_observed_scale(
+            self.four, 'wide', shot_scales=['wide', 'extreme_close', 'medium', 'wide'])
+        self.assertEqual(self._phrases(ladder)[1], 'an extreme close insert')
+        self.assertEqual(self._phrases(ladder)[2], 'a medium insert')
+
+    def test_the_first_and_last_shot_return_to_the_beats_main_scale(self):
+        """两拍之间那张 IMAGE 同时属于两拍，景别只能有一个——首尾镜回到主景别，它才有唯一解。"""
+        ladder = self.omni.apply_observed_scale(
+            self.four, 'medium', shot_scales=['medium', 'extreme_wide', 'close', 'medium'])
+        self.assertEqual(self._phrases(ladder)[0], 'a medium working shot')
+        self.assertEqual(self._phrases(ladder)[-1], 'a returning medium shot')
+
+    def test_an_insert_at_the_main_scale_keeps_the_tighter_default(self):
+        """插入镜与主镜同框 = 两镜写成同一个画面，四镜梯当场塌成两镜。"""
+        ladder = self.omni.apply_observed_scale(
+            self.four, 'wide', shot_scales=['wide', 'wide', 'wide', 'wide'])
+        self.assertEqual(self._phrases(ladder), self._phrases(self.four))
+
+    def test_an_unreadable_middle_shot_keeps_its_default(self):
+        ladder = self.omni.apply_observed_scale(
+            self.four, 'wide', shot_scales=['wide', '', 'close', 'wide'])
+        self.assertEqual(self._phrases(ladder)[1], 'a close-up insert')
+        self.assertEqual(self._phrases(ladder)[2], 'a close insert')
+
+    def test_a_sequence_shorter_than_the_ladder_changes_only_what_it_covers(self):
+        """宁可少改一级，也不能把第三镜的景别贴到第二镜上。"""
+        ladder = self.omni.apply_observed_scale(self.four, 'wide', shot_scales=['wide', 'medium'])
+        self.assertEqual(self._phrases(ladder), self._phrases(self.four))
+
+    def test_the_sequence_survives_the_trip_through_the_outline(self):
+        self.assertEqual(
+            pp.observed_shot_scale_sequence_of({'observed_craft': {'shot_scales': 'wide/?/close'}}),
+            ['wide', '', 'close'])
+        self.assertEqual(
+            pp.observed_shot_scale_sequence_of({'observed_craft': {'shot_scales': '?/?'}}), [])
+        self.assertEqual(pp.observed_shot_scale_sequence_of({}), [])
+
+
+class ShotWindowsAndScaleVotingTest(unittest.TestCase):
+    """镜头窗按 observed_cuts 切，逐窗对帧读数投票（reverse.attach_shot_scales）。"""
+
+    def _overview(self):
+        return {'review_sampling': {'frames': [
+            {'frame_path': '/j/frames/f1.jpg', 'timestamp': 0.5},
+            {'frame_path': '/j/frames/f2.jpg', 'timestamp': 1.5},
+            {'frame_path': '/j/frames/f3.jpg', 'timestamp': 3.0},
+            {'frame_path': '/j/frames/f4.jpg', 'timestamp': 5.0},
+        ]}}
+
+    def _facts(self):
+        return {'facts': [
+            {'frame': 'f1.jpg', 'shot_scale': 'wide'},
+            {'frame': 'f2.jpg', 'shot_scale': 'wide'},
+            {'frame': 'f3.jpg', 'shot_scale': 'extreme_close'},
+            {'frame': 'f4.jpg', 'shot_scale': 'medium'},
+        ]}
+
+    def test_each_shot_window_votes_on_its_own_frames(self):
+        doc = {'beats': [{'id': 'B01', 'start': 0.0, 'end': 6.0, 'observed_cuts': [2.0, 4.0]}]}
+        reverse.attach_shot_scales(doc, self._overview(), facts=self._facts())
+        self.assertEqual(doc['beats'][0]['observed_shot_scales'],
+                         ['wide', 'extreme_close', 'medium'])
+
+    def test_no_cuts_data_means_no_sequence(self):
+        """未知与「一镜到底」必须分得开。"""
+        doc = {'beats': [{'id': 'B01', 'start': 0.0, 'end': 6.0}]}
+        reverse.attach_shot_scales(doc, self._overview(), facts=self._facts())
+        self.assertNotIn('observed_shot_scales', doc['beats'][0])
+
+    def test_a_shot_with_no_readable_frame_holds_its_slot(self):
+        """位置必须留着，否则序列与镜头一一对应的关系就断了。"""
+        doc = {'beats': [{'id': 'B01', 'start': 0.0, 'end': 6.0, 'observed_cuts': [2.0, 2.4]}]}
+        reverse.attach_shot_scales(doc, self._overview(), facts=self._facts())
+        self.assertEqual(doc['beats'][0]['observed_shot_scales'],
+                         ['wide', '', 'extreme_close'])
+
+    def test_a_stale_sequence_is_cleared_when_the_facts_are_gone(self):
+        doc = {'beats': [{'id': 'B01', 'start': 0.0, 'end': 6.0,
+                          'observed_cuts': [2.0], 'observed_shot_scales': ['wide', 'close']}]}
+        reverse.attach_shot_scales(doc, self._overview(), facts=[])
+        self.assertNotIn('observed_shot_scales', doc['beats'][0])
+
+    def test_shot_windows_split_the_beat_on_its_cuts(self):
+        self.assertEqual(
+            reverse.shot_windows_for_beat(
+                {'start': 0.0, 'end': 6.0, 'observed_cuts': [2.0, 4.0]}),
+            [(0.0, 2.0), (2.0, 4.0), (4.0, 6.0)])
+        self.assertEqual(reverse.shot_windows_for_beat({'start': 0.0, 'end': 6.0}), [])
+
+
+class SubjectPlacementBindsTheImageTest(unittest.TestCase):
+    """构图逐拍绑 IMAGE（2026-08-25）。
+
+    此前构图只有两个落点：packet 生成时按机位投一次票（于是它是整段常量，逐拍变不了），
+    和逐拍契约里那句劝导文字（写手可写可不写，漏了没有任何东西会响）。
+    """
+
+    IMG = ("Static tripod shot, 24mm lens feel, camera height 1.6m, horizon locked at half "
+           "frame height. A worker screws plasterboard to the joists.")
+    READING = ('the shell sits centred, filling about three fifths of frame height, '
+               'horizon across the upper third')
+
+    def test_the_reading_is_injected_after_the_camera_sentence(self):
+        out = pp.fix_subject_placement(self.IMG, self.READING)
+        self.assertIn('three fifths of frame height', out)
+        self.assertLess(out.index('Compose the frame'), out.index('A worker screws'))
+        self.assertGreater(out.index('Compose the frame'), out.index('Static tripod'))
+
+    def test_it_is_idempotent(self):
+        once = pp.fix_subject_placement(self.IMG, self.READING)
+        self.assertEqual(pp.fix_subject_placement(once, self.READING), once)
+
+    def test_the_camera_sentences_own_horizon_wording_does_not_count_as_composition(self):
+        """机位句里本来就写着 horizon / frame height。拿通用构图词表去判，注入器整个空转。"""
+        self.assertIn('Compose the frame', pp.fix_subject_placement(self.IMG, self.READING))
+
+    def test_a_paraphrase_already_in_the_body_is_not_doubled(self):
+        body = ("Static tripod. The shell is centred, occupying three fifths of the frame "
+                "height, the upper third carries the horizon.")
+        self.assertEqual(pp.fix_subject_placement(body, self.READING), body)
+
+    def test_no_reading_injects_nothing(self):
+        self.assertEqual(pp.fix_subject_placement(self.IMG, ''), self.IMG)
+        self.assertEqual(pp.fix_subject_placement('', self.READING), '')
+

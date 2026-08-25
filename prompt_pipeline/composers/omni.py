@@ -159,6 +159,96 @@ _CONSTRUCTION_LADDERS = {
 }
 _DEFAULT_CONSTRUCTION_LADDER = _CONSTRUCTION_LADDERS[4]
 
+# ── 原片景别 → 镜头梯改写 ───────────────────────────────────────────────────
+#
+# 施工梯的主镜与切回镜此前写死是**远景**。复刻线上这就是一条凭空的改写：原片整拍拍在
+# 中景或特写上时，切点表、逐镜职责、镜头名审计、定向回炉四处一致地要求写「wide working
+# shot」，于是交付片把一条特写工序拍拉成了远景——而观测到的 shot_scale 只以一句劝导
+# 文字下发（observed_craft_directive 的 SHOT），软的必然输给硬的。
+#
+# 这里按观测景别改写主镜/切回镜这一对（它们是同一个机位的两次出现，必须同步改，否则
+# 「切回与主镜完全相同的机位与构图」当场自相矛盾）。key 一律不动：切点表、职责文案、
+# 缺镜头审计、越界景别审计、兜底稿全部按 rung.key 取值，改 key 才会散架。
+_SCALE_WORDS = {
+    'extreme_wide': 'extreme wide',
+    'wide': 'wide',
+    'medium': 'medium',
+    'close': 'close',
+    'extreme_close': 'extreme close',
+}
+# 主镜已经很紧时，插入镜必须比主镜更紧——否则「插入」读不出插入，模型会把两镜写成
+# 同一个画面，四镜梯当场塌成两镜。
+_TIGHT_MAIN_SCALES = ('close', 'extreme_close')
+
+
+def _article(phrase):
+    return 'an' if phrase[:1].lower() in 'aeiou' else 'a'
+
+
+def _rescaled(rung, phrase, label_prefix):
+    """把一级镜头换成另一个景别的同一级镜头。key 一律不动。"""
+    return rung._replace(variants=(phrase,), label=f'{label_prefix} {phrase}',
+                         phrase=f'{_article(phrase)} {phrase}')
+
+
+def apply_observed_scale(ladder, shot_scale, shot_scales=None):
+    """按原片观测到的景别改写施工梯。
+
+    两个入参是两个不同的读数，缺一不可：
+      · shot_scale  —— 这一拍的**主景别**（原片这一拍出现最多的那个）。它决定主镜与
+        切回镜。这两级必须同时改、且必须相同：切回镜的职责就是「切回与主镜完全相同的
+        机位与构图」，也是这一拍首尾两张锚点 IMAGE 的景别。
+      · shot_scales —— 这一拍**逐个镜头**的景别序列（reverse.attach_shot_scales）。它只
+        决定中间那几个插入镜。原片在一拍里远/全/中/近/特怎么切，这里就怎么切。
+
+    为什么首尾镜不跟着逐镜序列走：两拍之间的那张 IMAGE **同时属于两拍**（它既是上一拍的
+    落点，也是下一拍的起点），景别只能有一个。让每拍的首尾镜都回到本拍主景别，这张共享
+    锚点就有唯一解，首尾帧锚不松——中间镜照样在变，画面该有的丰富度在那里。
+
+    shot_scale 为 None/'wide' 且没有序列时**原样返回**，非复刻线一个字节都不受影响。
+    过门梯与兑现梯整段不参与：它们的三个工位是由职责定的（逼近/门槛/落定、细部/拉开/
+    终局），景别是那份职责的一部分，按观测改写等于把过门拍改成不过门。
+    """
+    keys = {rung.key for rung in ladder}
+    if 'main' not in keys or 'return' not in keys:
+        return ladder
+    main_word = _SCALE_WORDS.get(str(shot_scale or '').strip().lower())
+    sequence = [str(x or '').strip().lower() for x in (shot_scales or [])]
+    if (not main_word or main_word == 'wide') and not any(sequence):
+        return ladder
+
+    # 中间插入镜的景别按下标从序列里取。序列长度与梯子长度对不上时（原片切了六刀、
+    # 梯子只排四镜，或反过来）掐掉首尾之后按下标取，取不到的那一级保持默认——宁可少改
+    # 一级，也不能把第三镜的景别贴到第二镜上。
+    middles = sequence[1:-1] if len(sequence) >= 3 else []
+    tight_main = str(shot_scale or '').strip().lower() in _TIGHT_MAIN_SCALES
+
+    out, middle_cursor = [], 0
+    for rung in ladder:
+        if rung.key == 'main' and main_word and main_word != 'wide':
+            rung = _rescaled(rung, f'{main_word} working shot', '主镜')
+        elif rung.key == 'return' and main_word and main_word != 'wide':
+            phrase = f'returning {main_word} shot'
+            rung = _rescaled(rung, phrase, '切回主镜')._replace(
+                role=rung.role.replace('opening wide working shot',
+                                       f'opening {main_word} working shot'))
+        elif rung.key in ('close', 'xclose'):
+            observed = _SCALE_WORDS.get(
+                middles[middle_cursor] if middle_cursor < len(middles) else '')
+            middle_cursor += 1
+            # 插入镜与主镜同景别时保持默认的更紧一级：这一镜的职责是把工具接触点与
+            # 材料物理放大，与主镜同框等于把两镜写成同一个画面，四镜梯当场塌成两镜。
+            if observed and observed != main_word:
+                rung = _rescaled(rung, f'{observed} insert',
+                                 '特写插入' if rung.key == 'close' else '第二处特写插入')
+            elif tight_main and rung.key == 'close':
+                rung = _rescaled(rung, 'macro detail insert', '特写插入')
+            elif tight_main:
+                rung = _rescaled(rung, 'extreme macro insert', '第二处特写插入')
+        out.append(rung)
+    return tuple(out)
+
+
 # 过门桥拍与兑现拍：三个自然工位，与时长无关（一次穿越就是逼近/门槛/落定，再切只是把
 # 同一件事切碎）。它们免除节奏声明——traverse/reveal 不压缩劳动。
 _TRAVERSAL_LADDER = (_R_APPROACH, _R_THRESHOLD, _R_ARRIVAL)
@@ -614,28 +704,12 @@ def omni_video_violations(video_prompt, ladder=None, duration=None, skip_shot_li
             + ") — omni 的多镜头契约没有例外，包括过门拍与最终兑现拍"
         )
 
-    if duration is not None:
-        expected_sentence = timeline_sentence(duration, ladder)
-        found = _TIMELINE_RE.search(video_prompt or '')
-        if not found:
-            errors.append(
-                OMNI_VIDEO_ERROR_PREFIX
-                + "VIDEO 缺少时间线句，切点没有被钉在秒上——必须原样带上："
-                + expected_sentence
-            )
-        elif _normalized(found.group(0)) != _normalized(expected_sentence):
-            errors.append(
-                OMNI_VIDEO_ERROR_PREFIX
-                + "VIDEO 的时间线句与本条片子的时长/镜头梯不符，必须原样改成："
-                + expected_sentence
-            )
-
     stray = _stray_digits(video_prompt)
     if stray:
         errors.append(
             OMNI_VIDEO_STYLE_PREFIX
-            + "正文出现时间码以外的阿拉伯数字（" + ', '.join(stray)
-            + "）——记号禁用只对时间线句开了口子，其余计数一律写成英文单词"
+            + "正文出现阿拉伯数字（" + ', '.join(stray)
+            + "）——必须使用纯自然语言，所有数字和计数一律写成英文单词"
         )
 
     return errors
@@ -698,7 +772,8 @@ class OmniComposer(BaseComposer):
         送给 Flow 面板的那个一致——两边都走 server_common.resolve_video_duration。"""
         return server_common.resolve_video_duration(self.config)
 
-    def ladder_for_kind(self, duration, kind='construction', observed_shots=None):
+    def ladder_for_kind(self, duration, kind='construction', observed_shots=None,
+                        observed_scale=None, observed_scales=None):
         """(时长, 拍型) → 镜头梯。**类内所有取梯的地方都必须走这里，且必须把
         observed_shots 一起传**——不要直接调模块级的 ladder_for。子 profile 可能有自己的
         一套镜头名与拍型映射（见 miniature），而复刻单的梯还随原片切点变；漏掉任何一处，
@@ -714,7 +789,11 @@ class OmniComposer(BaseComposer):
             # 插入镜（construction_shot_count 的分界），硬排等于每镜不足一秒的闪帧。
             capped = min(max(observed_shots, min(pp._MULTISHOT_LEGAL_SHOT_COUNTS)),
                          construction_shot_count(duration))
-            return _CONSTRUCTION_LADDERS[capped]
+            return apply_observed_scale(_CONSTRUCTION_LADDERS[capped], observed_scale,
+                                        shot_scales=observed_scales)
+        if kind == 'construction':
+            return apply_observed_scale(ladder_for(duration, kind), observed_scale,
+                                        shot_scales=observed_scales)
         return ladder_for(duration, kind)
 
     def ladder_for_beat(self, beat=None, is_threshold_or_reveal=None, is_crossing=None):
@@ -725,7 +804,9 @@ class OmniComposer(BaseComposer):
         if kind is None:
             return None
         return self.ladder_for_kind(self.clip_duration(), kind,
-                                    observed_shots=pp.observed_shot_count_of(beat))
+                                    observed_shots=pp.observed_shot_count_of(beat),
+                                    observed_scale=pp.observed_shot_scale_of(beat),
+                                    observed_scales=pp.observed_shot_scale_sequence_of(beat))
 
     # ── 风格分支 ────────────────────────────────────────────────────────────
 
@@ -822,11 +903,7 @@ SAME CAMERA SETUP（本次改造的核心）——第一镜与最后一镜是**�
 只有施工完成度不同。正文在最后一镜里要写明它切回的是 the same camera setup as the opening wide
 working shot。插入镜是从这个机位切进去的细部，切回来时完成度必须与切走那一刻一致。
 
-SHOT TIMELINE（必写）——正文里必须原样带上这句切点表，位置紧跟锚定开场句之后：
-  "{timeline_sentence(duration, ladder)}"
-后面每个镜头的首句再用**英文单词**复述一次自己的入点（例如 "A clean cut at the three-second
-mark drops into a close-up insert ..."），与切点表形成冗余绑定。这句切点表是**唯一**允许出现
-阿拉伯数字的地方；正文其余部分的计数一律写成英文单词（three roof beams，不是 3 roof beams）。
+CINEMATIC NARRATIVE FLOW (纯自然语言多镜头因果流)——严禁使用任何机械时间戳或数字切点表。正文必须使用流畅的电影分镜叙事连词（例如 "The sequence opens with...", "Cutting in closer to a close-up insert...", "An extreme close-up insert reveals...", "Cutting back to a returning wide shot from the same camera setup..."）来自然串联各个镜头。正文所有计数和尺寸一律写成英文单词（three roof beams，不是 3 roof beams；ten seconds，不是 10s）。
 
 拍型分流：过门桥拍走 逼近远景 / 门槛 / 落定室内远景 三镜，最终兑现拍走 细部 / 拉开 / 终局远景
 三镜，两者都免除下面的节奏声明（它们是穿越与揭示，不压缩劳动），但**同样不许写成一镜到底**。
@@ -845,7 +922,7 @@ single continuous take、one continuous take、single take、unbroken take 或�
 - PROGRESS ACROSS CUTS：每个镜头都从上一镜结束时的完成度开始；剪辑点只允许压缩"已经完整演示过一次"的重复动作，
   且必须在正文里说明（例如 after the remaining boards come loose the same way），不得跳过某类改动的第一次发生、
   不得凭空出现新物件、不得在剪辑点上让数量变化。
-- PHRASING VARIATION：镜头梯是固定骨架，因此逐拍复读是本技能的头号失败模式。锚定开场句、切点表、
+- PHRASING VARIATION：镜头梯是固定骨架，因此逐拍复读是本技能的头号失败模式。锚定开场句、
   镜头名、工人造型短语、节奏声明这几项**必须逐字保留**；除此之外，相邻两拍的句式模板、镜头内的从句顺序、
   动词选择、转场措辞、形容词搭配都必须换过。
 - 长度：整条 VIDEO 目标 {target} 词上下，硬顶 {ceiling} 词。主镜与切回镜各 60–90 词
@@ -948,6 +1025,20 @@ single continuous take、one continuous take、single take、unbroken take 或�
             reworked = omni_reworked if reworked is None else (reworked or omni_reworked)
         return video_prompt, reworked
 
+    def normalize_reworked_video(self, video_prompt, beat=None):
+        """里程碑成对回炉是照一镜到底骨架写的：先洗掉 one-take 措辞、补回切点表与节奏
+        声明，再交回上游复验——否则每修一次里程碑就把镜头梯拆一次。"""
+        return self.normalize_omni_video(video_prompt, beat=beat)
+
+    def video_profile_violations(self, video_prompt, beat=None):
+        """omni 的镜头语法硬伤（记号类瑕疵不算）。"""
+        ladder = self.ladder_for_beat(beat) if beat else None
+        residual = omni_video_violations(
+            video_prompt, ladder=ladder,
+            duration=self.clip_duration() if ladder else None,
+            skip_shot_list=is_expanded_transition_stage_beat(beat))
+        return [e for e in residual if e.startswith(OMNI_VIDEO_ERROR_PREFIX)]
+
     def finalize_fallback_video(self, video_prompt, contract):
         """占位符兜底稿：base 的兜底文案是照一镜到底写的（"One unbroken take..."、
         "one continuous coaxial move"），在 omni 下必须先清干净，再补一句镜头梯声明。"""
@@ -978,7 +1069,7 @@ single continuous take、one continuous take、single take、unbroken take 或�
         # 预压缩显式给下面的结构句注入让出余量，注入完再按硬顶复裁（见 video_draft_budget）。
         text = pp.compress_prompt_to_budget(text, video_draft_budget(shot_count), config,
                                             is_video=True)
-        text = pp.fix_video_opening(i, text)
+        text = pp.fix_video_opening(i, text, profile='omni')
         text = pp.fix_sound_design(text, family=family or 'exterior')
         text = self.ensure_actor_engagement(text, ladder, packet=packet, beat=beat,
                                             is_threshold_or_reveal=is_threshold_or_reveal)
@@ -1009,8 +1100,10 @@ single continuous take、one continuous take、single take、unbroken take 或�
         # 三镜，每一拍都必然判违规并烧掉一轮定向回炉——而且报的是「缺镜头」，
         # 看不出真因在取梯。
         ladder = self.ladder_for_kind(duration, kind,
-                                      observed_shots=pp.observed_shot_count_of(beat))
-        text = _inject_timeline(text, timeline_sentence(duration, ladder))
+                                      observed_shots=pp.observed_shot_count_of(beat),
+                                      observed_scale=pp.observed_shot_scale_of(beat),
+                                      observed_scales=pp.observed_shot_scale_sequence_of(beat))
+        text = _inject_timeline(text)
         if kind == 'construction':
             text = self.ensure_pacing(text)
         return text
@@ -1025,19 +1118,20 @@ single continuous take、one continuous take、single take、unbroken take 或�
 {multishot_ref}
 
 Rewrite rules (additive — do not lose content):
-- Keep the opening anchor sentence ("Use the provided first frame and last frame as exact composition anchors. ...") VERBATIM as the first sentence.
-- Immediately after it, place this shot timeline VERBATIM: "{timeline_sentence(duration, ladder)}"
+- Keep the opening anchor sentence ("Use the provided image as the exact starting composition and environment anchor. ...") VERBATIM as the first sentence.
+- Express the multi-shot sequence using pure natural language cinematic transitions (e.g. 'The sequence opens with...', 'Cutting in closer to...', 'An extreme close-up reveals...', 'Cutting back to...'). Do NOT output numeric timestamps, seconds marks, or robotic cut mark tables.
 - Keep every concrete detail already in the draft: the same single worker and costume, the same tool, the same operation, the same persistent traces, the same audio description, the same lighting progression. Redistribute them across the shots instead of inventing new ones.
-- Restructure the body into exactly {len(ladder)} shots IN THIS ORDER, naming each one in prose exactly as written here: {scales}. Join them with clean cuts or match cuts, and open each shot's sentence by restating its cut mark in English words (for example "A clean cut at the three-second mark ...").
+- Restructure the body into exactly {len(ladder)} shots IN THIS ORDER, naming each one in prose exactly as written here: {scales}. Join them with clean cuts or match cuts.
 - This is NOT a shot-scale rotation. Do not write "establishing long shot", "full shot", "medium shot", or "wide outro shot" anywhere — those names belong to the retired grammar and count as a contract violation.
 - The first and the last shot are the SAME camera setup, framing, and focal length, differing only in how far the work has progressed; say so explicitly in the last shot ("the same camera setup as the opening wide working shot"). The insert(s) cut into that setup and cut back at the same completion level.
-- The worker is already at the active work face in the opening wide working shot and makes the first effective tool contact at 0 seconds; that shot carries this beat's whole visible advance up to roughly three quarters; the insert(s) carry tool contact, material physics, and the persistent traces without advancing the state; the returning wide shot compresses the remaining repetitions the same way and reaches the beat's resulting state while visible work continues. Never show or describe a worker entrance or exit.
-- The shot timeline is the ONLY place arabic digits may appear. Every other count is written in English words.
+- The worker is already at the active work face in the opening wide working shot and makes the first effective tool contact from the opening instant; that shot carries this beat's whole visible advance up to roughly three quarters; the insert(s) carry tool contact, material physics, and the persistent traces without advancing the state; the returning wide shot compresses the remaining repetitions the same way and reaches the beat's resulting state while visible work continues. Never show or describe a worker entrance or exit.
+- Preserve the visible stage-milestone skeleton VERBATIM in meaning: the declared visible start state, the declared resulting state, both declared progress lines (primary and secondary material/stock), the first effective tool contact at the opening moment, the material source/container and the movement path, and repeated work cycles. Use the words "repeated"/"repeatedly"/"cycle by cycle"/"course by course" literally — "repetitions" alone does not read as repeated cycles.
+- All numbers and counts must be written in English words. Never include arabic digits.
 - NEVER write oner, one-shot, one-take, single continuous take, one continuous take, single take, or unbroken take — there is no exemption.
 - Output ONLY the rewritten video prompt body. No headings, no labels, no commentary."""
 
     def rework_omni_multishot(self, config, i, video_prompt, packet, beat=None):
-        """镜头语法定向回炉一轮：只重写 VIDEO，把正文改写成按切点表剪辑的多镜头序列。
+        """镜头语法定向回炉一轮：只重写 VIDEO，把正文改写成纯自然语言多镜头序列。
 
         与 base 的结构性回炉同款契约——加法式修改、锚定开场句逐字保留、重写稿必须真的
         通过 omni_video_violations 复验，否则保留原稿（只留痕）。返回
@@ -1059,9 +1153,7 @@ Rewrite rules (additive — do not lose content):
         candidate = pp._strip_leading_label_line((resp or '').strip())
         if not candidate:
             return video_prompt, False
-        candidate = pp.fix_video_opening(i, candidate)
-        # 拍型从 beat 反推（ladder_kind 的 beat 分支），这样回炉稿也能拿到该有的切点表与
-        # 节奏声明；beat 缺失时拍型不明，只做清洗，不硬塞一份可能违约的切点表。
+        candidate = pp.fix_video_opening(i, candidate, profile='omni')
         candidate = self.normalize_omni_video(candidate, beat=beat)
         residual = omni_video_violations(
             candidate, ladder=ladder, duration=duration if beat else None,
@@ -1070,6 +1162,14 @@ Rewrite rules (additive — do not lose content):
             if sys.stdout:
                 print(f"[OMNI] Beat {i} 多镜头回炉稿复验未通过，保留原稿（仅留痕）")
             return video_prompt, False
+        if beat:
+            before = set(pp.check_milestone_video_prompt(video_prompt, beat))
+            introduced = [e for e in pp.check_milestone_video_prompt(candidate, beat)
+                          if e not in before]
+            if introduced:
+                if sys.stdout:
+                    print(f"[OMNI] Beat {i} 多镜头回炉稿洗掉了里程碑骨架，保留原稿: {introduced}")
+                return video_prompt, False
         return candidate, True
 
 
@@ -1077,7 +1177,7 @@ def ensure_ladder_out_and_in(video_prompt, ladder, packet=None, beat=None,
                              is_threshold_or_reveal=False):
     """Compatibility-named Omni fixer for direct work from the first instant.
 
-    The worker is already at the active work face at zero seconds. Any old entrance/exit
+    The worker is already at the active work face from the opening instant. Any old entrance/exit
     language is removed and the clip uses every shot for the operation through the outro.
     """
     text = video_prompt or ''
@@ -1099,14 +1199,14 @@ def ensure_ladder_out_and_in(video_prompt, ladder, packet=None, beat=None,
         '', text)
     text = re.sub(r'\s{2,}', ' ', text).strip()
     low = text.lower()
-    if ('zero seconds' in low or 't=0' in low) and any(
+    if ('zero seconds' in low or 't=0' in low or 'opening frame' in low or 'opening instant' in low) and any(
             p in low for p in ('already at', 'already positioned', 'first effective tool contact')):
         return text
     costume = pp._worker_costume_from_packet(packet)
     if text and not text.rstrip().endswith(('.', '!', '?')):
         text = text.rstrip() + '.'
     clause = (
-        f" At zero seconds the same lone worker{costume} is already positioned at the active "
+        f" In the opening frame the same lone worker{costume} is already positioned at the active "
         "work face and makes the first effective tool contact immediately; every following shot "
         "continues that visible operation through the last shot of the clip."
     )
@@ -1116,7 +1216,16 @@ def ensure_ladder_out_and_in(video_prompt, ladder, packet=None, beat=None,
 def fallback_ladder_clause(ladder):
     """占位兜底稿补的镜头梯声明：一句话里按顺序带齐每一级镜头名与 UGC 拍摄质感，
     让占位稿至少不违反 omni 的镜头语法（占位稿本身仍计入 fallback_count 门禁）。"""
-    fragments = [_FALLBACK_SHOT_FRAGMENT[rung.key] for rung in ladder]
+    fragments = []
+    for rung in ladder:
+        fragment = _FALLBACK_SHOT_FRAGMENT[rung.key]
+        if rung.key == 'main':
+            fragment = (f'{rung.phrase} matching the first frame, with the worker already making '
+                        f'effective tool contact and carrying the whole visible advance of this beat')
+        elif rung.key == 'return':
+            fragment = (f'{rung.phrase} from the same camera setup, matching the last frame '
+                        f'while visible work continues')
+        fragments.append(fragment)
     joined = ', '.join(fragments[:-1]) + f", and {fragments[-1]}"
     count = _COUNT_WORDS.get(len(ladder), str(len(ladder)))
     return (f"The clip is cut as {count} shots in order — {joined} — joined by clean cuts and "
@@ -1146,15 +1255,11 @@ def _strip_base_even_rate(text):
 
 
 def _digits_to_words(text):
-    """一到二十的独立整数折成英文单词（记号禁用的确定性修复）。
+    """一到一百的独立整数折成英文单词（纯自然语言记号禁用的确定性修复）。
 
-    三处不动：时间线句里的秒数（本次新增的 Timecode exemption）、IMAGE 编号（锚点引用）、
-    以及紧贴单位的数字（14mm / 1.6m —— 没有空格，正则本来就不匹配）。"""
+    两处不动：IMAGE 编号（锚点引用）以及紧贴单位的数字（14mm / 1.6m）。"""
     source = text or ''
-    timeline = _TIMELINE_RE.search(source)
-    if timeline:
-        head, tail = source[:timeline.start()], source[timeline.end():]
-        return f"{_digits_to_words(head)}{timeline.group(0)}{_digits_to_words(tail)}"
+    source = _TIMELINE_RE.sub(' ', source)
 
     def replace(match):
         prefix = source[max(0, match.start() - 6):match.start()].lower()
@@ -1162,21 +1267,11 @@ def _digits_to_words(text):
             return match.group(0)
         return _integer_to_words(int(match.group(1))) or match.group(0)
 
-    return _DIGIT_COUNT_RE.sub(replace, source)
+    res = _DIGIT_COUNT_RE.sub(replace, source)
+    return re.sub(r'\s{2,}', ' ', res).strip()
 
 
-def _inject_timeline(text, sentence):
-    """把切点表钉在锚定开场句之后。模型自己编的时间线一律先清掉——切点表是确定性契约，
-    不是模型的创作空间。"""
+def _inject_timeline(text, sentence=None):
+    """在纯自然语言体系下，清除任何机械时间线句（Cut this...）。"""
     body = _TIMELINE_RE.sub(' ', text or '')
-    body = re.sub(r'\s{2,}', ' ', body).strip()
-
-    marker = 'third layout.'
-    index = body.lower().find(marker)
-    if index != -1:
-        head = body[:index + len(marker)]
-        tail = body[index + len(marker):].lstrip()
-        return f"{head} {sentence} {tail}".strip()
-    # 锚定句还没注入（回炉稿/兜底稿在 fix_video_opening 之前）：先放最前面，
-    # 后续的 fix_video_opening 会把锚定句补到它之前。
-    return f"{sentence} {body}".strip()
+    return re.sub(r'\s{2,}', ' ', body).strip()

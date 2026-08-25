@@ -84,24 +84,9 @@ is a known, registered conflict — see `omni-grid-notation-ban` in
 `references/contract-registry.json` — not an oversight, and not licence to add other
 notation.
 
-### Timecode Exemption
+### Pure Natural Language (No Timecode Exemption)
 
-The shot timeline sentence is the **only** place in a prompt body where arabic digits may
-appear, and only as `0.0`-style second marks:
-
-```text
-Cut this ten-second clip on these marks and hold no other cuts — a wide working shot from 0.0 to 3.2, ... and a returning wide shot from 7.2 to 10.0 seconds.
-```
-
-Everywhere else the ban stands, including inside the per-shot sentences, which restate their
-cut marks in English words (`at the three-second mark`). The no-rendered-text sentence is
-mandatory in every prompt that carries a timeline.
-
-Rationale for the carve-out: without stated cut marks the model picks its own, and the
-inserts either vanish into the main shot or swallow it — a larger and more certain failure
-than the overlay risk the ban guards against. If overlays do appear, the fallback is a
-word-form timeline (`the main working shot running longest, with each insert about one and a
-half seconds`), which costs cut precision but carries no digits.
+All numbers and counts in the prompt must be written in English words (`three roof beams`, `ten seconds`, `sixty percent`). No numeric timestamps, second marks (e.g. `0.0 to 3.2`), or decimal cut marks are permitted anywhere in the prompt body.
 
 ## Fenced Block Format
 
@@ -115,11 +100,11 @@ Generate an image of ...
 
 视频提示词
 视频 1:
-Use IMAGE 1 as the first-frame anchor and IMAGE 2 as the last-frame anchor. ...
+Use the provided image as the exact starting composition and environment anchor. Use IMAGE 1 as the actual first-frame image; begin from this initial state and naturally progress the work through the multi-shot sequence without inventing extraneous layouts. ...
 
 对话微调提示词
 编辑 1:
-Keep the same location, anchor images, shot order, and physical operation, but ...
+Keep the same location, starting anchor image, shot order, and physical operation, but ...
 ```
 
 ## IMAGE Prompt Pattern
@@ -136,13 +121,10 @@ restatements, not extra sections or field labels.
 
 ## VIDEO Prompt Pattern
 
-Each VIDEO prompt should be one compact English paragraph. It must carry the shot timeline
-sentence and then every shot of this clip in sentence form. The pattern below is the 10s /
-four-shot case; 4s and 6s clips drop the extreme close-up insert and fold its two persistent
-traces into the single close-up insert (see `omni-multishot-language.md`).
+Each VIDEO prompt should be one compact English paragraph written in 100% natural prose without numeric timestamps or robotic cut mark tables. The pattern below is the four-shot case; 3-shot clips drop the extreme close-up insert and fold its persistent traces into the single close-up insert (see `omni-multishot-language.md`).
 
 ```text
-Use IMAGE N as the first-frame anchor and IMAGE N+1 as the last-frame anchor; every shot must preserve the same location, object identity, lighting direction, and physical layout while showing only the single operation of [operation]. Cut this ten-second clip on these marks and hold no other cuts — a wide working shot from 0.0 to 3.2, a close-up insert from 3.2 to 5.3, an extreme close-up insert from 5.3 to 7.2, and a returning wide shot from 7.2 to 10.0 seconds. The clip opens on a wide working shot recorded like casual smartphone footage, matching IMAGE N with [worker/machine] already positioned at [work zone] and making the first effective contact with [specific tool/material] at zero seconds under [available lighting]; from there the same actor repeatedly [verb] [surface/object] with [specific tool], the first [board/stroke/fastener] shown coming together in full from contact to placement, [using a ladder or scaffold if the task is above arm reach,] tensing their muscles with each physical stroke as the changed area grows from nothing to about three quarters of this beat's target while fine dust or debris settles nearby, the phone briefly breathes focus before locking again, and a small handheld framing correction preserves the locked layout. A clean cut at the [entry mark in words] drops into a close-up insert on [tool contact and raw material physics], with minor motion blur, imperfect focus falloff, and small blown highlights on [bright material/source], capturing the material deformation as [force] bends timber fibers, showers rust flakes, or sprays fine dust, leaving [visible trace]. A second insert at the [entry mark in words] pushes to an extreme close-up insert on the evidence left behind: [trace one] and [trace two] remain visible in IMAGE N+1, with low-light noise or compression in shadow areas and natural scratches, wood grain, or concrete porosity on the [surface] texture. A final clean cut at the [entry mark in words] returns to a returning wide shot from the same camera setup as the opening wide working shot, matching the exposure and phone-recorded tone of IMAGE N+1, where — after the remaining [repetitions] are completed the same way — [worker/machine/tool] continues the visible operation through the final instant as the scene reaches the completed state. No shot shows or describes entrance, arrival, exit, walk-out, or a worker-free tail. Every shot opens at the progress level the previous shot ended with, and progress advances only during the wide working shot. Everything visible in the returning wide shot already exists in IMAGE N+1, and everything in IMAGE N+1 has an on-screen or stated origin inside this video — no overshoot and no missing elements. Use [available-light exposure dynamics], [UGC documentary realism with tactile material detail], and [location detail]. Keep the scene free of captions, subtitles, floating labels, UI text, and rendered prompt words. SFX and ambient noise follow the visible action.
+Use the provided image as the exact starting composition and environment anchor. Use IMAGE N as the actual first-frame image; begin from this initial state and naturally progress the work through the multi-shot sequence without inventing extraneous layouts. Every shot must preserve the same location, object identity, lighting direction, and physical layout while showing only the single operation of [operation]. The sequence begins with a wide working shot recorded like casual smartphone footage, matching IMAGE N with [worker/machine] already positioned at [work zone] and making the first effective contact with [specific tool/material] from the opening instant under [available lighting]; from there the same actor repeatedly [verb] [surface/object] with [specific tool], the first [board/stroke/fastener] shown coming together in full from contact to placement, [using a ladder or scaffold if the task is above arm reach,] tensing their muscles with each physical stroke as the changed area grows from nothing to about three quarters of this beat's target while fine dust or debris settles nearby. The camera then cuts in closer to a tight close-up insert focused on [tool contact and raw material physics], capturing the material deformation as [force] bends timber fibers, showers rust flakes, or sprays fine dust, leaving [visible trace]. Shifting to an extreme close-up insert, the shot highlights the evidence left behind: [trace one] and [trace two] remain permanently visible on the [surface] texture, with natural scratches, wood grain, or concrete porosity. Finally, the camera cuts back to a returning wide shot from the exact same camera setup as the opening wide working shot, where — after the remaining repetitions are completed the same way — [worker/machine/tool] continues the visible operation smoothly through the final moment as the scene reaches this beat's finished state. No shot shows or describes entrance, arrival, exit, walk-out, or a worker-free tail. Progress advances only during the work shots. Edited construction time-lapse assembled from multiple camera setups, not real-time footage. Rich ASMR sound effects and ambient noise follow the visible action at sixty percent volume, zero background music.
 ```
 
 ## Conversational Edit Pattern

@@ -150,35 +150,6 @@ class TestElasticLadder(_IsolatedServerConfig):
         self.assertIn('the same camera setup as the opening wide working shot', roles)
 
 
-class TestShotMarks(_IsolatedServerConfig):
-    def test_marks_are_monotonic_gapless_and_exact(self):
-        for duration in (4, 6, 8, 10):
-            ladder = omni_mod.ladder_for(duration, 'construction')
-            marks = omni_mod.shot_marks(duration, ladder)
-            self.assertEqual(marks[0][0], 0.0, f'{duration}s 首点必须是 0')
-            self.assertEqual(marks[-1][1], float(duration), f'{duration}s 末点必须等于时长')
-            for (start, end, _), (next_start, _, _) in zip(marks, marks[1:]):
-                self.assertGreater(end, start, f'{duration}s 出现零长/倒挂镜头')
-                self.assertEqual(end, next_start, f'{duration}s 切点有缝隙或重叠')
-
-    def test_every_shot_clears_the_readable_floor(self):
-        """主镜与切回镜 ≥1.3 秒，插入镜 ≥0.9 秒——插入本来就是短镜，读作插入。"""
-        for duration in (4, 6, 8, 10):
-            ladder = omni_mod.ladder_for(duration, 'construction')
-            for start, end, rung in omni_mod.shot_marks(duration, ladder):
-                floor = 0.9 if rung.key in ('close', 'xclose') else 1.3
-                self.assertGreaterEqual(round(end - start, 2), floor,
-                                        f'{duration}s 的 {rung.key} 只有 {end - start:.1f} 秒')
-
-    def test_the_work_shot_gets_the_largest_slice(self):
-        """主镜要装下"起始状态 + 第一次动作完整可见 + 重复循环"，配额必须最高。"""
-        for duration in (4, 6, 8, 10):
-            ladder = omni_mod.ladder_for(duration, 'construction')
-            spans = {r.key: round(e - s, 2) for s, e, r in omni_mod.shot_marks(duration, ladder)}
-            self.assertEqual(max(spans, key=spans.get), 'main', f'{duration}s: {spans}')
-            self.assertGreaterEqual(spans['main'], 1.5, f'{duration}s: {spans}')
-
-
 class TestTimelineSentence(_IsolatedServerConfig):
     def test_timeline_names_every_shot_in_order(self):
         ladder = omni_mod.ladder_for(10, 'construction')
@@ -187,7 +158,7 @@ class TestTimelineSentence(_IsolatedServerConfig):
         self.assertTrue(sentence.endswith('seconds.'))
         self.assertEqual(omni_mod._missing_shot_rungs(sentence, ladder), [])
 
-    def test_timeline_is_the_only_place_digits_may_appear(self):
+    def test_all_digits_are_converted_to_words(self):
         composer = _composer()
         fixed = composer.fix_omni_video(
             3, f"{ANCHOR} {BODY_ROTATION} The worker sets 3 boards and 12 fasteners.",
@@ -195,54 +166,39 @@ class TestTimelineSentence(_IsolatedServerConfig):
         self.assertIn('three boards', fixed)
         self.assertIn('twelve fasteners', fixed)
         self.assertEqual(omni_mod._stray_digits(fixed), [], fixed)
-        # 时间码本身与 IMAGE 编号照旧保留
         self.assertIn('IMAGE 3', fixed)
-        self.assertRegex(fixed, r'from 0\.0 to \d\.\d')
+        self.assertNotIn('Cut this', fixed)
 
-    def test_injection_sits_right_after_the_anchor_sentence(self):
-        composer = _composer()
-        fixed = composer.fix_omni_video(3, f"{ANCHOR} {BODY_ROTATION}", {}, False,
-                                        beat={'operation': 'repair'}, config=_config())
-        head, _, rest = fixed.partition('third layout.')
-        self.assertTrue(rest.strip().startswith('Cut this ten-second clip'), rest[:120])
-
-    def test_model_authored_timeline_is_overwritten_not_appended(self):
-        """切点表是确定性契约，不是模型的创作空间。"""
+    def test_model_authored_timeline_is_stripped(self):
+        """纯自然语言模式下，模型自编的机器切点表会被确定性清除。"""
         composer = _composer(duration='6')
         bogus = ("Cut this ten-second clip on these marks and hold no other cuts — an "
                  "establishing long shot from 0.0 to 5.0, and a wide outro shot from 5.0 to "
                  "10.0 seconds.")
         fixed = composer.fix_omni_video(3, f"{ANCHOR} {bogus} {BODY_ROTATION}", {}, False,
                                         beat={'operation': 'repair'}, config=_config('6'))
-        self.assertEqual(len(re.findall(r'Cut this', fixed)), 1, fixed)
-        self.assertIn('Cut this six-second clip', fixed)
+        self.assertNotIn('Cut this', fixed)
         self.assertNotIn('to 10.0 seconds', fixed)
 
     def test_reinjection_is_idempotent(self):
         composer = _composer()
         once = composer.fix_omni_video(3, f"{ANCHOR} {BODY_ROTATION}", {}, False,
-                                       beat={'operation': 'repair'}, config=_config())
+                                        beat={'operation': 'repair'}, config=_config())
         twice = composer.fix_omni_video(3, once, {}, False,
                                         beat={'operation': 'repair'}, config=_config())
-        self.assertEqual(len(re.findall(r'Cut this', twice)), 1)
+        self.assertNotIn('Cut this', twice)
         self.assertEqual(len(re.findall(re.escape(omni_mod.OMNI_PACING_PHRASE), twice)), 1)
         self.assertEqual(len(re.findall(re.escape(omni_mod.OMNI_INSHOT_PHRASE), twice)), 1)
 
 
 class TestTimelineAudit(_IsolatedServerConfig):
-    def test_missing_timeline_is_a_structural_error(self):
+    def test_missing_shot_is_a_structural_error(self):
         composer = _composer()
         ladder = omni_mod.ladder_for(10, 'construction')
-        errs = omni_mod.omni_video_violations(f"{ANCHOR} {BODY_ROTATION}", ladder=ladder, duration=10)
-        self.assertTrue(any('缺少时间线句' in e for e in errs), errs)
+        errs = omni_mod.omni_video_violations(f"{ANCHOR} The worker repoints the wall.", ladder=ladder, duration=10)
+        self.assertTrue(any('not an edited multi-shot sequence' in e for e in errs), errs)
         structural, _style = composer.split_structural_video_errors(errs)
-        self.assertTrue(any('缺少时间线句' in e for e in structural))
-
-    def test_timeline_that_disagrees_with_the_duration_is_rejected(self):
-        ladder = omni_mod.ladder_for(6, 'construction')
-        text = f"{ANCHOR} {omni_mod.timeline_sentence(10, ladder)} {BODY_ROTATION}"
-        errs = omni_mod.omni_video_violations(text, ladder=ladder, duration=6)
-        self.assertTrue(any('时长/镜头梯不符' in e for e in errs), errs)
+        self.assertTrue(any('not an edited multi-shot sequence' in e for e in structural))
 
     def test_the_ladder_audit_cannot_be_satisfied_by_the_timeline_alone(self):
         """回归：切点表本身按顺序列出了每一级镜头名。拿它去过镜头轮换检查等于自证——
@@ -257,7 +213,7 @@ class TestTimelineAudit(_IsolatedServerConfig):
         """记号瑕疵回炉一轮也未必修得掉，还要多烧一次调用——留痕即可。"""
         composer = _composer()
         ladder = omni_mod.ladder_for(10, 'construction')
-        text = f"{ANCHOR} {omni_mod.timeline_sentence(10, ladder)} {BODY_MAIN} It has 3 beams."
+        text = f"{ANCHOR} {BODY_MAIN} It has 3 beams."
         errs = omni_mod.omni_video_violations(text, ladder=ladder, duration=10)
         digit_errs = [e for e in errs if e.startswith(omni_mod.OMNI_VIDEO_STYLE_PREFIX)]
         self.assertEqual(len(digit_errs), 1, errs)
@@ -285,7 +241,7 @@ class TestBeatKindRouting(_IsolatedServerConfig):
             fixed = composer.fix_omni_video(3, f"{ANCHOR} The camera moves through.", {}, True,
                                             beat=beat, config=_config())
             self.assertNotIn(omni_mod.OMNI_PACING_MARKER, fixed.lower(), beat)
-            self.assertIn('Cut this ten-second clip', fixed, beat)
+            self.assertNotIn('Cut this', fixed, beat)
 
     def test_unknown_beat_kind_injects_nothing(self):
         """回炉通路只拿到一段文本时拍型不明——猜错等于给穿门镜头硬塞一张施工切点表。"""
@@ -393,10 +349,8 @@ class TestWordBudget(_IsolatedServerConfig):
         composer = _composer(duration='4')
         fixed = composer.fix_omni_video(3, f"{ANCHOR} {BODY_ROTATION}", {}, False,
                                         beat={'operation': 'repair'}, config=_config('4'))
-        self.assertIn('Cut this four-second clip', fixed)
-        marks = re.findall(r'from (\d\.\d) to (\d\.\d)', fixed)
-        self.assertEqual(len(marks), 3, marks)
-        self.assertEqual(marks[-1][1], '4.0')
+        self.assertNotIn('Cut this', fixed)
+        self.assertIn('edited construction time-lapse', fixed)
 
 
 if __name__ == '__main__':

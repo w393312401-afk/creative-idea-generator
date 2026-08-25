@@ -231,9 +231,12 @@ assert.match(barFor('review_beats'), /id="replica-reset-cache"/,
              '节拍卡点的吸底栏上必须有「清理合成缓存」开关');
 assert.match(barFor('audit_failed', { prompt_block: 'P' }), /id="replica-reset-cache"/,
              '「重新合成」旁边同样要有这个开关——改完规则重跑走的正是这条路');
-assert.doesNotMatch(barFor('completed', { prompt_block: 'P', title: 'T' }),
-                    /id="replica-reset-cache"/,
-                    '已完成态没有合成动作，不该出现一个无处生效的开关');
+assert.match(barFor('completed', { prompt_block: 'P', title: 'T' }),
+             /id="replica-reset-cache"/,
+             '已完成态支持重新合成提示词，必须有「清理合成缓存」开关');
+assert.match(barFor('completed', { prompt_block: 'P', title: 'T' }),
+             /id="replica-bar-recompose-btn"/,
+             '已完成态必须有「重新合成」按钮，无需重跑聚类即可重新制作提示词');
 
 call('replicaResetCache = false;');
 assert.doesNotMatch(barFor('review_beats'), /id="replica-reset-cache" checked/,
