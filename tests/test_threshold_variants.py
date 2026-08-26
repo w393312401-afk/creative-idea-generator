@@ -559,13 +559,20 @@ class TestMergeGateCut(_TmpDirCase):
 
     def test_skipped_cut_is_expected_gap_not_missing(self):
         self._make_frames(4)
-        # 槽位 2 是声明式硬切（旧单记录）；槽位 3 真缺失 → 门禁跳过无文件的槽位后合并，missing 只计 [1, 3]（槽位 1 缺少实际 mp4 文件），不计 2
+        # 槽位 2 是声明式硬切（旧单记录）；槽位 3 真缺失 → missing 只计 [1, 3]（槽位 1 缺少实际 mp4 文件），不计 2
         self._write_manifest(4, [
             {'slot': 1, 'status': 'success', 'file': 'videos/vid_001.mp4'},
             {'slot': 2, 'status': 'skipped_cut'},
         ])
-        with patch('video_generator._merge_skip_missing') as mock_skip_merge:
+        # 默认 allow_partial=False 时应拦截并抛出 PartialMergeBlocked
+        with self.assertRaises(PartialMergeBlocked) as ctx:
             merge_project_videos(self.tmp)
+        self.assertNotIn(2, ctx.exception.missing)
+        self.assertIn(3, ctx.exception.missing)
+
+        # allow_partial=True 时跳过无文件槽位合并
+        with patch('video_generator._merge_skip_missing') as mock_skip_merge:
+            merge_project_videos(self.tmp, allow_partial=True)
             self.assertTrue(mock_skip_merge.called)
             args = mock_skip_merge.call_args[0]
             missing = args[4]

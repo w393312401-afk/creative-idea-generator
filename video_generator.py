@@ -2126,19 +2126,27 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
     except Exception as coll_err:
         print(f"[VIDEO CHAIN] 生成拼图失败（非致命）: {coll_err}")
 
-    try:
-        merge_speed = config.get('_merge_speed', 2)
+    has_chain_failures = any(
+        v.get('status') not in ('success', 'skipped_cut', 'skipped_bridge_hold')
+        for v in writer.data.get('videos', []) if isinstance(v, dict)
+    )
+    if not has_chain_failures:
+        try:
+            merge_speed = config.get('_merge_speed', 2)
+            if on_progress:
+                on_progress('merge_start', {'message': f'正在自动以 {merge_speed}x 速率合并视频...'})
+            merged_info = merge_project_videos(
+                project_dir, speed=merge_speed,
+                cover_burn=config.get('_cover_burn', COVER_BURN_DEFAULT)
+            )
+            if merged_info:
+                writer.data['merged_video'] = merged_info
+                writer.save()
+        except Exception as merge_err:
+            print(f"[VIDEO CHAIN] 自动合并视频异常: {merge_err}")
+    else:
         if on_progress:
-            on_progress('merge_start', {'message': f'正在自动以 {merge_speed}x 速率合并视频...'})
-        merged_info = merge_project_videos(
-            project_dir, speed=merge_speed,
-            cover_burn=config.get('_cover_burn', COVER_BURN_DEFAULT)
-        )
-        if merged_info:
-            writer.data['merged_video'] = merged_info
-            writer.save()
-    except Exception as merge_err:
-        print(f"[VIDEO CHAIN] 自动合并视频异常: {merge_err}")
+            on_progress('merge_skip', {'message': '由于存在失败或未生成片段，已跳过自动合并。'})
 
     final_manifest = read_manifest(project_dir) or writer.data
     final_manifest['manifest'] = '/' + os.path.relpath(manifest_path, _BASE_DIR).replace('\\', '/')
@@ -2710,9 +2718,10 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
                          cover_burn=COVER_BURN_DEFAULT, cover_path=None):
     """合并项目内全部视频片段。
 
-    2026-08-10 改版：合并前不再有任何拦截。锚点不一致（疑似串片）的片段照常并入成片，
-    只在日志里留一条 WARN；真正缺失/失败（磁盘上没有文件）的槽位无内容可拼，跳过并
-    在返回结果里列出。allow_partial 参数保留只为兼容调用方，已不影响行为。
+    - 默认（allow_partial=False）：存在缺失/失败槽位时抛出 PartialMergeBlocked 拦截合并，
+      避免在视频不全时误生成残缺成片。
+    - allow_partial=True（或 force=True）：跳过无文件槽位进行缺口合并（_merge_skip_missing）。
+    - 锚点不一致（疑似串片）但文件实际存在的片段，并入成片并在日志中记录 WARN。
 
     cover_burn/cover_path：把封面烧进成片首帧（默认一帧，见 prepend_cover_intro）。
     """
@@ -2838,8 +2847,11 @@ def merge_project_videos(project_dir, allow_partial=False, speed=2.0,
                 print(f"[WARN] 槽位 {slot} 锚点校验未通过（{reason}），仍按用户要求并入合并。")
             good[slot] = abs_path
 
-    # 合并前不再拦截。仍有缺失槽位（磁盘上没有文件，无内容可拼）时跳过它们直接合并，
-    # 跳过清单随返回结果上报，不是背地里丢弃。
+    # 默认（allow_partial=False）：存在缺失槽位（磁盘上没有文件，无法完整拼装）时拦截合并并抛出 PartialMergeBlocked
+    if not allow_partial and missing:
+        raise PartialMergeBlocked(missing, mismatched)
+
+    # 强制合并（allow_partial=True）且确有缺失槽位：跳过缺失槽位直接合并
     if missing:
         print(f"[WARN] 跳过无文件的槽位后直接合并：missing={missing}")
         return _merge_skip_missing(

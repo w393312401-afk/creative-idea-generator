@@ -590,6 +590,36 @@ class TestMergeSkipMissing(unittest.TestCase):
             expected_slots=[1, 2], good={}, missing=[1, 2], mismatched=[])
         self.assertIsNone(result)
 
+    def test_merge_project_videos_raises_partial_merge_blocked(self):
+        """当视频片段不全且 allow_partial=False 时，必须拦截并抛出 PartialMergeBlocked。"""
+        manifest = {
+            'title': 'Partial Video Test',
+            'frames': [
+                {'slot': 1, 'sequence': 1, 'file': 'frames/img_001.webp'},
+                {'slot': 2, 'sequence': 2, 'file': 'frames/img_002.webp'},
+                {'slot': 3, 'sequence': 3, 'file': 'frames/img_003.webp'},
+            ],
+            'videos': [
+                {'slot': 1, 'status': 'success', 'file': 'videos/vid_001.mp4'},
+                # slot 2 is missing / failed
+            ]
+        }
+        with open(os.path.join(self.rel_project_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+
+        # 默认 allow_partial=False 抛出异常
+        with self.assertRaises(PartialMergeBlocked) as ctx:
+            merge_project_videos(self.rel_project_dir, allow_partial=False)
+        self.assertIn(2, ctx.exception.missing)
+
+        # allow_partial=True 时跳过缺失槽位合并
+        captured = {}
+        with patch('video_generator.subprocess.run', side_effect=self._fake_run(captured)):
+            result = merge_project_videos(self.rel_project_dir, allow_partial=True)
+            self.assertIsNotNone(result)
+            self.assertTrue(result.get('partial'))
+            self.assertEqual(result.get('skipped_slots'), [2])
+
 
 class TestMergeManualUploadTrust(unittest.TestCase):
     """2026-07-23 修复：手动上传（/api/upload_video）落盘前已经做过 verify_video_anchors

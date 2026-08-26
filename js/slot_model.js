@@ -238,6 +238,16 @@ function frameActions(state, ctx) {
                 busy: false,
             }));
         }
+        if (state.flags.rejectedFix) {
+            // 门禁判这次修复把链改坏了 → 已自动退回上一版，但修后那版留了档。
+            // 人看得见画面，门禁看不见——判错时这是把那一版拿回来的唯一入口。
+            list.push(mk('adopt-fix', '采用修后版', {
+                cls: 'adopt-fix-btn',
+                idle: '三联屏门禁退回了这一帧的修复结果，确认是误判就把修后那版放回来'
+                    + (state.flags.rejectedFix.gate_detail
+                        ? `（门禁结论：${state.flags.rejectedFix.gate_detail}）` : ''),
+            }));
+        }
         if (state.flags.fixBackup) {
             // 修复越修越糟时的退路：修复覆盖写同一个文件，没有这个入口就只能盲重渲
             list.push(mk('undo-fix', '撤销修复', {
@@ -350,6 +360,10 @@ function frameSlotState(frame, ctx) {
     // 有它才给「撤销修复」入口。修复是覆盖写同一个文件，没有快照就真的退不回去了。
     flags.fixBackup = (frame.fix_backup && typeof frame.fix_backup === 'object')
         ? frame.fix_backup : null;
+    // 被三联屏门禁退回的那一版（后端 stash_rejected_fix 留档）：门禁是概率判定，
+    // 判错时这是唯一的出口，否则那次 4选1 重渲的结果就彻底没了。
+    flags.rejectedFix = (frame.rejected_fix && typeof frame.rejected_fix === 'object')
+        ? frame.rejected_fix : null;
 
     const st = {
         type: 'image', seq, kind: 'ready', label, url,

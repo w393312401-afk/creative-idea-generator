@@ -1528,6 +1528,77 @@ async function undoFrameFix(seq) {
     }
 }
 
+// 「采用修后版」——三联屏门禁判定"这次修复把链改坏了"时会自动回滚，但那是概率判定
+// （两条缝的连贯性读数比对，见 frame_continuity.compare_triptych）。判错的时候用户在
+// 帧网格上看得见：修后那一版其实更好。后端在回滚前把它整份留了档
+// （pipeline_orchestrator.stash_rejected_fix），这里把它放回去。
+// 采用之前后端会先给"此刻这一版"存一份修复快照，所以采用完照样能「撤销修复」退回来。
+async function adoptRejectedFix(seq) {
+    if (!currentIdea || !currentIdea.prompt_block) {
+        showToast("请先激发一个创意点子！", "error");
+        return;
+    }
+    const ownerIdea = currentIdea;
+    if (isIdeaTaskActive(ownerIdea.id, 'frames')) {
+        showToast("该创意的帧序列正在生成/修复中，请稍候", "error");
+        return;
+    }
+    const seqLabel = String(seq).padStart(3, '0');
+    const proceed = await customConfirm(
+        `将把 IMG ${seqLabel} 换成被门禁退回的<b>修复后</b>那一版画面与提示词。<br><br>`
+        + '门禁当时判定这次修复会把相邻帧的连贯性改坏，如果你看过两版、确认是误判，'
+        + '就采用它。这一版<b>没有经过修复复核</b>，采用后会落「等你最终确认」。<br>'
+        + '采用之后仍可用「撤销修复」退回当前这一版。');
+    if (!proceed) return;
+
+    try {
+        const resp = await fetch('/api/adopt_rejected_fix', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                title: getIdeaSaveTitle(ownerIdea),
+                display_title: ownerIdea.title,
+                sequence: seq,
+                prompt_block: ownerIdea.prompt_block
+            })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data.status === 'error') throw new Error(data.message || `HTTP ${resp.status}`);
+
+        // 提示词换成修复改写后的那一版：与 undoFrameFix 同款写回（后续重试/再修/生成
+        // 视频读的都是这份文本）
+        if (data.prompt_block) {
+            ownerIdea.prompt_block = data.prompt_block;
+            if (currentIdea && currentIdea.id === ownerIdea.id) saveCurrentIdeaState();
+            const existingIdx = savedIdeas.findIndex(item => item.id === ownerIdea.id);
+            if (existingIdx !== -1) {
+                savedIdeas[existingIdx].prompt_block = data.prompt_block;
+                await persistIdeaItem(savedIdeas[existingIdx]);
+            }
+            if (isViewingIdea(ownerIdea.id)) {
+                if (typeof renderPromptDisplay === 'function') {
+                    renderPromptDisplay(ownerIdea.prompt_block);
+                } else {
+                    const blockEl = document.getElementById('idea-prompt-block');
+                    if (blockEl) blockEl.textContent = ownerIdea.prompt_block;
+                }
+            }
+        }
+        // 帧文件原地换成了另一张图：路径没变、内容变了，不回源就还是缓存里那张
+        const adoptedUrl = (data.frame && (data.frame.url || data.frame.file)) || '';
+        if (adoptedUrl) bustImageCache(adoptedUrl);
+        await reloadManifestIntoIdea(ownerIdea);
+        if (isViewingIdea(ownerIdea.id)) renderFramesForIdea(ownerIdea);
+        if (typeof framesFeedLine === 'function') {
+            framesFeedLine(ownerIdea.id, `🔧 IMG ${seqLabel} 已采用门禁退回的修复版，等你最终确认`, 'warn');
+        }
+        showToast(`第 ${seq} 帧已换成修复后的那一版。`, "success");
+    } catch (e) {
+        console.error(`Failed to adopt rejected fix for frame ${seq}:`, e);
+        showToast(`采用第 ${seq} 帧的修后版失败: ${e.message}`, "error");
+    }
+}
+
 // manualReason：可选，人工在别处现场写的问题描述；后端会先把它落盘再参与改写
 // （见 pipeline_orchestrator.fix_frame_issue）。走 describeFrameIssue 记录过的
 // 描述已经在 manifest 上，无需从这里再传一次。
@@ -1698,8 +1769,13 @@ async function fixFrameIssue(seq, manualReason, cascadeDownstream) {
             // 这正是这整套门禁要消灭的那句谎。
             if (watch.result.rolled_back) {
                 const detail = watch.result.reason || '';
-                feedLine(`⛔ IMG ${String(seq).padStart(3, '0')} 修复未通过三联屏门禁，已自动退回修复前的版本`, 'err');
-                showToast(`第 ${seq} 帧修复把相邻帧的连贯性改坏了，已自动回滚。请换一种描述再试。`, "warning");
+                // 门禁是概率判定，会判错。修后那一版留了档（stash_rejected_fix），
+                // 帧网格上会多出一个「采用修后版」按钮——不说的话用户不会知道还有这条路。
+                const kept = !!watch.result.rejected_fix;
+                feedLine(`⛔ IMG ${String(seq).padStart(3, '0')} 修复未通过三联屏门禁，已自动退回修复前的版本`
+                    + (kept ? '（修后那版已留档，可在帧网格点「采用修后版」）' : ''), 'err');
+                showToast(`第 ${seq} 帧修复把相邻帧的连贯性改坏了，已自动回滚。`
+                    + (kept ? '如确认是误判，可在帧网格点「采用修后版」。' : '请换一种描述再试。'), "warning");
                 return { status: 'ok', rolled_back: true, remaining: detail ? [detail] : ['修复已回滚'] };
             }
             const remaining = (reverify && reverify.remaining) || [];

@@ -998,7 +998,7 @@ class TestFixFrameIssue(_TmpProjectCase):
                           3: ('sequence_reviewed_pass', None)})
         render_calls = []
 
-        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4):
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4, chain_guard_review=True):
             render_calls.append(target_sequences)
 
         with patch.object(po, 'fix_beat_from_sequence_review',
@@ -1022,7 +1022,7 @@ class TestFixFrameIssue(_TmpProjectCase):
                           2: ('sequence_reviewed_pass', None), 3: ('sequence_reviewed_pass', None)})
         render_calls = []
 
-        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4):
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4, chain_guard_review=True):
             render_calls.append(target_sequences)
 
         with patch.object(po, 'fix_image_prompt_with_vlm_feedback',
@@ -1331,14 +1331,16 @@ class TestUndoFrameFix(_TmpProjectCase):
         self.assertIn('second frame\n', result['prompt_block'])
 
     def test_undo_runs_the_shared_finalize(self):
-        """撤销也是一次"这一帧的画面变了"：下游血统、相邻审查结论、成片都要作废。"""
+        """撤销也是一次"这一帧的画面变了"：相邻审查结论、成片都要作废。"""
         for s in (1, 2, 3):
             self._touch_frame(s)
+        server_common.write_manifest(self.project_dir, {
+            'frames': [{'sequence': 1}, self._entry(), {'sequence': 3}]})
         self._snapshot()
         with open(po._frame_path(self.TITLE, 2), 'wb') as f:
             f.write(b'fixed frame bytes')
         server_common.write_manifest(self.project_dir, {
-            'frames': [{'sequence': 1}, self._entry(), {'sequence': 3}],
+            'frames': [{'sequence': 1}, self._entry(), {'sequence': 3, 'stale_lineage': True}],
             'merged_video': {'file': 'merged.mp4'},
             'videos': [{'slot': 1}],
         })
@@ -1346,11 +1348,37 @@ class TestUndoFrameFix(_TmpProjectCase):
         po.undo_frame_fix(self.TITLE, 2, self.FIXED_BLOCK)
 
         manifest = self._read_manifest()
-        frames = {f['sequence']: f for f in manifest['frames']}
-        self.assertTrue(frames[3]['stale_lineage'])
-        self.assertNotIn('stale_lineage', frames[1])
         self.assertNotIn('merged_video', manifest)
         self.assertEqual(manifest['videos'], [])
+
+    def test_undo_puts_the_downstream_lineage_back_instead_of_dirtying_it(self):
+        """撤销是**按字节还原**：下游帧派生的正是这张刚拷回来的图，链回到了修复前的
+        样子，血统标记当然也该回到修复前的样子。
+
+        此前这里无条件走 update_manifest_stale_status(regenerated=[K])，把 K 之后的帧
+        一律标脏——一次（很可能是门禁误判的）自动回滚就让整条下游需要重渲。同一次调用
+        里基于哈希的 drop_stale_review_verdicts 反而正确地判定了"什么都没变"，两套失效
+        机制对同一件事给出相反结论。"""
+        for s in (1, 2, 3, 4):
+            self._touch_frame(s)
+        # 修复前：3 是干净的，4 因为别的缘故本来就挂着脏血统
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 1}, self._entry(), {'sequence': 3},
+            {'sequence': 4, 'stale_lineage': True}]})
+        self._snapshot()
+        # 修复发生了：帧图被覆盖，收尾把下游全标脏
+        with open(po._frame_path(self.TITLE, 2), 'wb') as f:
+            f.write(b'fixed frame bytes')
+        server_common.write_manifest(self.project_dir, {'frames': [
+            {'sequence': 1}, self._entry(), {'sequence': 3, 'stale_lineage': True},
+            {'sequence': 4, 'stale_lineage': True}]})
+
+        po.undo_frame_fix(self.TITLE, 2, self.FIXED_BLOCK)
+
+        frames = {f['sequence']: f for f in self._read_manifest()['frames']}
+        self.assertNotIn('stale_lineage', frames[1])
+        self.assertNotIn('stale_lineage', frames[3], '修复带来的脏标记随撤销一起消失')
+        self.assertTrue(frames[4]['stale_lineage'], '本来就脏的帧不因一次撤销变干净')
 
     def test_undo_without_a_snapshot_raises_instead_of_pretending(self):
         self._touch_frame(2)
@@ -1943,7 +1971,7 @@ class TestManualFrameIssue(_TmpProjectCase):
         ]})
         seen = {}
 
-        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4):
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4, chain_guard_review=True):
             seen['gate'] = self._read_manifest()['frames'][0]['quality_gate']
             seen['issue'] = self._read_manifest()['frames'][0].get('manual_issue')
             raise RuntimeError('上游炸了')
@@ -1984,7 +2012,7 @@ class TestManualFrameIssue(_TmpProjectCase):
         po.set_manual_frame_issue(self.TITLE, 1, '首帧地面太干净，不像废墟')
 
         render_calls = []
-        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4):
+        def fake_render(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4, chain_guard_review=True):
             render_calls.append(target_sequences)
 
         with patch.object(po, 'fix_image_prompt_with_vlm_feedback',

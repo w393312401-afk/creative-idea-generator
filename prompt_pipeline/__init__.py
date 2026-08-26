@@ -2143,7 +2143,9 @@ def backfill_package_operations(beat_ladder, parsed_brief=None):
         if not isinstance(beat, dict):
             continue
         op = _normalize_operation_token(beat.get('operation'))
-        if op in TRANSITION_OPERATIONS or beat.get('bridge_stage') or beat.get('hard_cut'):
+        stage = str(beat.get('stage') or '').strip().lower()
+        if (op in TRANSITION_OPERATIONS or stage in ('transition', 'threshold', 'reveal')
+                or beat.get('bridge_stage') or beat.get('hard_cut') or 'reveal' in op or 'reward' in op):
             continue
         package = [_normalize_operation_token(x)
                    for x in (beat.get('package_operations') or []) if str(x).strip()]
@@ -2241,12 +2243,13 @@ def milestone_ladder_violations(beat_ladder, mode='Standard'):
             errors.append('Beat ladder contains a non-object entry.')
             continue
         op = str(beat.get('operation') or '').strip().lower()
-        if op in ('reward', 'reframe'):
+        stage = str(beat.get('stage') or '').strip().lower()
+        if op in ('reward', 'reframe', 'reveal') or stage in ('reveal', 'reward') or 'reveal' in op or 'reward' in op:
             continue
         # 一比一模式下过门/硬切拍自己在交付一条真实清单工序（outline_refs 非空），
         # 同样要满足这套里程碑质量门槛（见 _milestone_beat_directive 同款判据）——
         # 只有没有 outline_refs 的老式纯占位过门/threshold 拍才继续豁免。
-        if (op == 'threshold' or beat.get('bridge_stage') or beat.get('hard_cut')) \
+        if (op == 'threshold' or stage in ('transition', 'threshold') or beat.get('bridge_stage') or beat.get('hard_cut')) \
                 and not beat.get('outline_refs'):
             continue
         idx = beat.get('index')
@@ -2382,7 +2385,9 @@ def repair_incompatible_package_operations(beat_ladder):
         if not isinstance(beat, dict):
             continue
         op = str(beat.get('operation') or '').strip().lower().replace('_', '-')
-        if op in ('threshold', 'reward', 'reframe') or beat.get('bridge_stage') or beat.get('hard_cut'):
+        stage = str(beat.get('stage') or '').strip().lower()
+        if (op in ('threshold', 'reward', 'reframe', 'reveal') or stage in ('transition', 'threshold', 'reveal')
+                or beat.get('bridge_stage') or beat.get('hard_cut') or 'reveal' in op or 'reward' in op):
             continue
         package = [str(x).strip().lower().replace('_', '-')
                    for x in (beat.get('package_operations') or []) if str(x).strip()]
@@ -3598,9 +3603,15 @@ def fix_image_clean_frame_proactive(prompt, allow_occupant=False):
 def fix_video_opening(i, prompt, first_frame_index=None, profile=None, single_frame=False):
     """first_frame_index overrides which IMAGE the first-frame anchor binds to (defaults to
     IMAGE i). For Omni and Miniature (or single_frame=True), generates a single starting-frame anchor.
-    For Base/Veo, generates a two-anchor interpolation statement."""
+    For Base/Veo, generates a two-anchor interpolation statement.
+
+    正文自己已经带着单帧开场句时也按单帧走（与 check_video_opening 同一条自动识别）：
+    profile 不是每个调用点都拿得到 —— rework_milestone_prompt_pair 这类**非 profile 感知**
+    的通路只拿得到一段文本。缺了这条识别，omni 稿子在那里会被改回 base 的双锚点开场，
+    而检查器有识别、双锚点句照样判过，于是修复器与检查器一起静默降级到 base 口径。"""
     first_frame_index = i if first_frame_index is None else first_frame_index
-    if profile in ('omni', 'miniature') or single_frame:
+    if (profile in ('omni', 'miniature') or single_frame
+            or "starting composition and environment anchor" in (prompt or '').lower()):
         expected_start = f"Use the provided image as the exact starting composition and environment anchor. Use IMAGE {first_frame_index} as the actual first-frame image; begin from this initial state and naturally progress the work through the multi-shot sequence without inventing extraneous layouts."
     else:
         expected_start = f"Use the provided first frame and last frame as exact composition anchors. Use IMAGE {first_frame_index} as the actual first-frame image and IMAGE {i+1} as the actual last-frame image; every visible action must interpolate between those two frame images without inventing a third layout."
@@ -8998,7 +9009,12 @@ def rework_milestone_prompt_pair(config, i, video_prompt, image_prompt, beat,
         new_image = _strip_leading_label_line(str(data.get('image') or '').strip())
         if not new_video or not new_image:
             return video_prompt, image_prompt, False
-        new_video = fix_video_opening(i, clean_prompt_text(new_video))
+        # 单帧/双锚点按**原稿**判，不按重写稿判：重写稿是 LLM 出的，开场句丢没丢不可控，
+        # 而原稿的开场句是本 profile 确定性注入的，它才是这条链路该守的口径。
+        new_video = fix_video_opening(
+            i, clean_prompt_text(new_video),
+            single_frame=('starting composition and environment anchor'
+                          in (video_prompt or '').lower()))
         if callable(normalize_video):
             new_video = normalize_video(new_video)
         new_image = fix_image_clean_frame_proactive(clean_prompt_text(new_image))
@@ -12829,6 +12845,10 @@ Write the beats IN ORDER. Each beat's resulting IMAGE must continue directly and
 - EXTERIOR WORK VISIBILITY: If a beat involves work on the EXTERIOR surface of the structure (e.g., exterior insulation, exterior membrane), and the camera is positioned INSIDE looking out, the VIDEO must show the worker operating at the boundary edges visible from inside (e.g., working at seam lines visible in Grid B1/B3 from the interior). Do not describe exterior work that would be invisible from the current camera position.
 - ZONE-APPROPRIATE PROTECTIVE LAYERS: only describe waterproofing membrane, tar/bitumen coating, or vapor barrier material on a surface with real moisture/weather exposure (below-grade wall/floor, roof, exterior envelope, bathroom/kitchen/pool). Never describe these on an ordinary dry interior wall, floor, or ceiling — use plain primer/paint finish there instead.
 - CONSTRUCTION ORDER CONSTRAINTS: Floor finish (hardwood, tile) MUST be installed BEFORE heavy anchored objects (fireplace, stove) are placed on it. If a beat installs a fireplace or heavy object, its IMAGE must show it sitting on the FINISHED floor, not on bare metal/subfloor. If the floor is not yet finished, the fireplace cannot be installed in that beat.
+- LIVING CAST & DYNAMIC WORKER CHOREOGRAPHY (P0):
+  1. Zero Frozen Figures: Never describe workers, figurines, characters, or animals as static, holding still, unmoving, or holding their previous posture (FORBIDDEN: 'remain standing', 'stay put', 'static in place', 'unchanged', 'standing still', 'holding position', 'where they were', 'same posture').
+  2. Action-Reaction Causal Chain: Every beat's VIDEO must describe active, continuous physical kinetic labor and bodily posture transitions from the starting image's pose to the resulting image's settled pose (e.g. Inception Reflex -> Active Tool/Hand Movement -> Settled Landing Posture).
+  3. Identity Locked vs Pose Decoupled: Restate their fixed identity, costume, and scale verbatim, but ensure their pose, action, and physical placement dynamically evolve across every single beat.
 
 For EACH beat listed in the user message, output its two prompts using EXACTLY these markers (replace N with that beat's own number):
 ===BEAT N VIDEO===
@@ -12864,15 +12884,22 @@ def _beat_block_text(i, contract):
     # 只靠规划器把它织进 description 是「绑在兜底通路上、主通路上靠运气」——这条线上
     # 已经栽过一次的形状。字段只在多镜头链路上存在（见 apply_observed_shot_plan）。
     cast_action = str(beat.get('cast_action') or '').strip()
+    from prompt_pipeline.frame_state import _cast_is_bystander
+    is_bystander = _cast_is_bystander(cast_action) if cast_action else True
+    cast_role_rule = (
+        "They watch, never touch the work, never leave the frame"
+        if is_bystander
+        else "They actively execute the physical work cycle without freezing, never leave the frame"
+    )
     cast_section = (
         f"\nCAST IN FRAME (observed in the reference film): {cast_action}. This beat's IMAGE shows "
         f"them settled in that pose; this beat's VIDEO must show them MOVING INTO it via an "
-        f"ACTION-REACTION CAUSAL CHAIN: tie their immediate reflex to the craftsman's entry (e.g. "
+        f"ACTION-REACTION CAUSAL CHAIN: tie their immediate reflex to the craftsman/worker entry (e.g. "
         f"tilting heads back in awe as hands enter), their movement/gaze tracking to the active tool work, "
         f"and their settled posture to the finished result. Never isolate character movement as a passive "
         f"afterthought at clip end. NEVER write that they remain, stay put, hold their position or are "
         f"unchanged: a cast that holds one pose for the whole sequence is delivered as dolls that never move, "
-        f"and they are the only living thing in the frame. They never touch the work, never leave the frame, "
+        f"and they are the only living thing in the frame. {cast_role_rule}, "
         f"and their identity, costume and scale never change.\n"
         if cast_action else "")
     insert_subject = str(beat.get('insert_subject') or '').strip()
@@ -16740,7 +16767,7 @@ def outline_binding_violations(outline, beat_ladder):
             # op 未声明（老形态的纯字符串条目）时无从比对，跳过而不是硬判
             if not op or op not in _OUTLINE_OPS_SET:
                 continue
-            if op in ('threshold', 'reward'):
+            if op in ('threshold', 'reward', 'reframe', 'reveal') or str(beat.get('stage') or '').strip().lower() in ('transition', 'threshold', 'reveal'):
                 # 过门/揭示拍的 operation 由 threshold 拆分规则和 reward 规则各自钉死，
                 # 认领它们的拍未必用同名 operation（过门可能被 bridge_stage/hard_cut 表达）
                 continue

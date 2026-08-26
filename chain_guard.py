@@ -194,6 +194,24 @@ def guard_beat(config, title, prompt_block, beat, project_dir, on_progress=None,
                 target_frame['quality_gate'] = 'sequence_review_flagged'
                 target_frame['vlm_qa_reason'] = '；'.join(chain_issues or [i['text'] for i in formatted_issues])
                 target_frame['flag_origin'] = 'chain_guard'
+                # 结构化问题清单也要落盘。定向修复读的正是它（pipeline_orchestrator
+                # .fix_frame_issue 的 recorded_issues），缺了就退化成"一条本地问题、
+                # frames=[K]"，于是修完复核时拿**单张 K** 去验一条"K-1 与 K 不一致"
+                # 的判定——单张图根本证否不了，复核必然落进"仍存在"。
+                # 这里每条都带着 beat / layer / frames=[K-1, K] / severity。
+                target_frame['review_issues'] = [dict(i) for i in formatted_issues]
+            elif verdict == 'pass' and target_frame.get('flag_origin') in ('chain_guard', 'fix_reverify'):
+                # 复审通过 → 收回自己这一路盖出来的 flag。autofix 的次序是
+                # 「fix_frame_issue（末尾的 _reverify 可能盖 flag）→ 本函数再判一次」，
+                # 本函数此前只在 halt 时写 gate、判过了什么都不写，于是那枚 flag 留在
+                # 原地：循环报「✅ 复审通过，继续往下生成」，manifest 上这一帧却永远
+                # 是 flagged，视频配对门禁一直拦着。只认自己人盖的记号，人工标记
+                # （manual_flagged）与整套审查的结论一概不碰。
+                target_frame.pop('flag_origin', None)
+                target_frame.pop('review_issues', None)
+                if target_frame.get('quality_gate') == 'sequence_review_flagged':
+                    target_frame['quality_gate'] = 'pending_manual_review'
+                    target_frame['vlm_qa_reason'] = None
             try:
                 write_manifest(project_dir, manifest)
             except Exception as e:

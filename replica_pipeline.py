@@ -1142,7 +1142,10 @@ def save_beats(job_id, beats):
     beats_changed = (state.get('beats') or {}).get('beats') != beats.get('beats')
     if state.get('stage') != 'audit_failed' or beats_changed:
         _invalidate_compose_artifacts(state)
-        if state.get('stage') in ('completed', 'audit'):
+        # 阶段回退只在**梯子真的变了**的时候发生。空保存（或只动了
+        # banned_elements/scene_constants）不该把一个 completed 的任务打回 review_beats：
+        # 那一步作废产物就够了，前端的 completed 分支按 prompt_block 在不在自己切按钮。
+        if beats_changed and state.get('stage') in ('completed', 'audit'):
             state['stage'] = 'review_beats'
 
     _write_beats(state, beats)

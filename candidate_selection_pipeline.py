@@ -717,7 +717,7 @@ def _generate_full_collage_from_frames(frames_dir, project_dir=None, manifest=No
         return None
 
 
-def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4):
+def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progress=None, target_sequences=None, candidate_count=4, chain_guard_review=True):
     """
     Main entry point for 4-candidate AI selection frame sequence generation.
     For each frame in the sequence:
@@ -1129,7 +1129,12 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
             })
 
         # 链上逐拍守卫审查
-        guard_mode = chain_guard_mode(config)
+        #
+        # chain_guard_review=False：这一趟整个不审。只有守卫自己的 autofix 分支会传
+        # （fix_frame_issue(suppress_chain_guard=True) 转下来）——那条路在本函数返回后
+        # 立刻对同一拍、同一对图再跑一次 guard_beat 拿停链结论，这里再审一遍是纯重复
+        # 的一整套 check + 逐条复核 + 分级，而且两次判定还可能互相打架。
+        guard_mode = chain_guard_mode(config) if chain_guard_review else 'off'
         if seq >= 2 and guard_mode != 'off':
             beat = seq - 1
             prev_seq = seq - 1
@@ -1177,11 +1182,14 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                                     'message': f"🔧 第 {beat} 拍检出结构级问题，正在就地自动修复 "
                                                f"IMG {seq:03d}（第 {attempt}/{_CHAIN_GUARD_AUTOFIX_ATTEMPTS} 次）：{texts}",
                                 })
-                            # 下游此刻还不存在，没有血统要清 → 不必连带重渲
+                            # 下游此刻还不存在，没有血统要清 → 不必连带重渲。
+                            # suppress_chain_guard：重渲内部不必再审这一拍，下面几行
+                            # 立刻就会拿 allow_halt=True 亲自再判一次。
                             try:
                                 fix_res = fix_frame_issue(
                                     config, title, prompt_block, seq,
                                     on_progress=on_progress, cascade_downstream=False,
+                                    suppress_chain_guard=True,
                                 )
                             except GenerationCancelled:
                                 raise
@@ -1193,6 +1201,26 @@ def run_candidate_selection_frame_sequence(config, title, prompt_block, on_progr
                                 log('WARN', 'CHAIN_GUARD',
                                     f"IMG {seq:03d} 自动修复第 {attempt} 次未跑成，转为停链: {fix_err}")
                                 break
+                            # 三联屏门禁判这次修复把画面改坏了 → 已经自动退回上一版，
+                            # 帧图与提示词都回到了修复前。再修一次只会拿同样的输入跑出
+                            # 同样的结果，每一轮还要白烧一整套守卫复审。当场转停链，让
+                            # 人来看：修后那一版留档在 .frame_fixes/<seq>_rejected，
+                            # 门禁误判的话可以在帧网格「采用修后版」。
+                            if (fix_res or {}).get('rolled_back'):
+                                log('WARN', 'CHAIN_GUARD',
+                                    f"IMG {seq:03d} 自动修复第 {attempt} 次被三联屏门禁退回"
+                                    f"（画面已还原），转为停链等人处理")
+                                if on_progress:
+                                    on_progress('chain_guard_autofix_rolled_back', {
+                                        'beat': beat, 'sequence': seq, 'attempt': attempt,
+                                        'triptych': (fix_res or {}).get('triptych'),
+                                        'rejected_fix': (fix_res or {}).get('rejected_fix'),
+                                        'message': f"↩️ IMG {seq:03d} 第 {attempt} 次自动修复被三联屏门禁退回，"
+                                                   f"画面已还原为修复前，转为停链等人处理",
+                                    })
+                                _resync_from_disk()
+                                break
+
                             new_block = (fix_res or {}).get('prompt_block')
                             if new_block:
                                 # 这一拍的 IMAGE/VIDEO 正文被改写过了。后续帧的提示词

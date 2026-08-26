@@ -542,42 +542,56 @@ function bindSlotSelection(gridId) {
     }, true);
 }
 
+let suppressNextCardClick = false;
+
+// 拦截框选刚结束时的鼠标释放点击，防止误触发 Lightbox
+if (typeof document !== 'undefined') {
+    document.addEventListener('click', (e) => {
+        if (suppressNextCardClick) {
+            suppressNextCardClick = false;
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            e.preventDefault();
+        }
+    }, true);
+}
+
 /**
- * 框选多选（Marquee Box Selection）：
- * 在网格空白区域按住鼠标左键拖拽，或按住 Shift/Ctrl 在任意位置拖拽，
- * 绘制半透明青色框选框，实时计算与卡片的 2D 矩形相交（AABB 碰撞），实现批量多选。
+ * 全局槽位框选多选（Boundless Marquee Box Selection Controller）：
+ * 覆盖整个结果面板区域（.frames-wrapper / #frames-section / #videos-section / #beats-grid / .frames-grid 等），
+ * 无论从网格空白处、边距、外围区域还是直接从卡片上方拖起，均能流畅拉出半透明青色框选框，
+ * 实时计算视口 2D AABB 矩形碰撞，高亮并多选触碰到的所有卡片。
  */
-function bindSlotMarqueeSelection(gridId) {
-    const grid = document.getElementById(gridId);
-    if (!grid || grid.dataset.marqueeBound === '1') return;
-    grid.dataset.marqueeBound = '1';
+let marqueeSelectionBound = false;
+
+function initGlobalSlotMarqueeSelection() {
+    if (marqueeSelectionBound) return;
+    marqueeSelectionBound = true;
 
     let marqueeEl = null;
     let isDragging = false;
     let startX = 0, startY = 0;
     let initialSelected = { image: new Set(), video: new Set() };
     let isAdditive = false;
-    let startGridType = 'image';
+    let startSection = 'image'; // 'image', 'video', or 'merged'
 
-    function getGridType() {
-        if (grid.id === 'beats-grid') return 'merged';
-        if (grid.id === 'videos-grid') return 'video';
-        return 'image';
-    }
-
-    grid.addEventListener('mousedown', (e) => {
-        // 仅响应鼠标左键
+    document.addEventListener('mousedown', (e) => {
+        // 仅响应鼠标主键（左键）
         if (e.button !== 0) return;
 
-        // 忽略交互型子元素（按钮、输入框、下拉框、操作条、徽标、卡片标签等）
-        if (e.target.closest('button, input, textarea, a, select, label, .slot-actions, .slot-badge, .slot-label, .slot-select, .slot-bulk, .slot-toolbar')) {
+        // 检查是否在结果槽位区域内
+        const resultsArea = e.target.closest('#results-view, #frames-section, #videos-section, .frames-wrapper, .frames-grid, #beats-grid, .idea-section');
+        if (!resultsArea) return;
+
+        // 点击在按钮、输入框、勾选框、操作栏等交互元素上时不触发框选
+        if (e.target.closest('button, input, textarea, a, select, label, .slot-actions, .slot-badge, .slot-label, .slot-select, .slot-bulk, .slot-toolbar, .review-panel, .section-tools')) {
             return;
         }
 
         const card = e.target.closest('.slot-card');
-        const hasModifier = e.shiftKey || e.ctrlKey || e.metaKey;
+        const hasModifier = !!(e.shiftKey || e.ctrlKey || e.metaKey);
 
-        // 若直接点在卡片上，且未按 Shift/Ctrl，则保留卡片的单击（灯箱）与原生拖拽（换位）行为
+        // 若直接点在卡片主体上且未按 Shift/Ctrl/Cmd，则保留卡片的单击（灯箱）与原生直接拖拽（换位/搬运）行为
         if (card && !hasModifier) {
             return;
         }
@@ -586,27 +600,41 @@ function bindSlotMarqueeSelection(gridId) {
         startY = e.clientY;
         isDragging = false;
         isAdditive = hasModifier;
-        startGridType = getGridType();
+
+        // 如果按了 Shift/Ctrl/Cmd 且点在卡片上，阻止浏览器默认的卡片 dragstart 与文本选区，进入框选模式
+        const tempDisabledCards = [];
+        if (hasModifier) {
+            e.preventDefault();
+            document.querySelectorAll('.slot-card[draggable="true"]').forEach(c => {
+                c.draggable = false;
+                tempDisabledCards.push(c);
+            });
+        }
+
+        // 判断起始区域
+        if (slotMergedView || e.target.closest('#beats-grid')) {
+            startSection = 'merged';
+        } else if (e.target.closest('#videos-section, #videos-grid, .slot-toolbar[data-slot-type="video"]')) {
+            startSection = 'video';
+        } else {
+            startSection = 'image';
+        }
 
         // 记录按下时刻的已有选中项快照
         initialSelected.image = new Set(slotToolbarState.image.selected);
         initialSelected.video = new Set(slotToolbarState.video.selected);
-
-        // 如果按了 Shift/Ctrl 且点在卡片上，阻止浏览器默认的卡片 dragstart 与文本选区
-        if (hasModifier) {
-            e.preventDefault();
-        }
 
         function onMouseMove(moveEvent) {
             const dx = moveEvent.clientX - startX;
             const dy = moveEvent.clientY - startY;
             const dist = Math.hypot(dx, dy);
 
-            // 拖拽阈值（至少移动 4 像素才进入框选，防止普通轻点误触发）
+            // 拖拽阈值（至少移动 4 像素才进入框选，防止普通单击误触发）
             if (!isDragging) {
                 if (dist < 4) return;
                 isDragging = true;
                 document.body.classList.add('is-slot-marquee-selecting');
+                try { window.getSelection()?.removeAllRanges(); } catch (err) {}
 
                 if (!marqueeEl) {
                     marqueeEl = document.createElement('div');
@@ -614,6 +642,8 @@ function bindSlotMarqueeSelection(gridId) {
                     document.body.appendChild(marqueeEl);
                 }
             }
+
+            moveEvent.preventDefault();
 
             // 视口坐标下的框选矩形
             const boxLeft = Math.min(startX, moveEvent.clientX);
@@ -630,15 +660,20 @@ function bindSlotMarqueeSelection(gridId) {
                 marqueeEl.style.height = boxHeight + 'px';
             }
 
-            // 获取当前网格中所有可供选择的卡片
-            const cards = Array.from(grid.querySelectorAll('.slot-card')).filter(c => {
+            // 获取当前所有可见、可选择的卡片
+            const cards = Array.from(document.querySelectorAll('.slot-card')).filter(c => {
                 if (c.classList.contains('slot-filtered-out')) return false;
                 if (c.dataset.kind === 'pending') return false;
+                // 排除处于隐藏容器内的卡片
+                if (c.offsetParent === null && getComputedStyle(c).display === 'none') return false;
                 return true;
             });
 
             const touchedImage = new Set(isAdditive ? initialSelected.image : []);
             const touchedVideo = new Set(isAdditive ? initialSelected.video : []);
+
+            let hasImageTouch = false;
+            let hasVideoTouch = false;
 
             cards.forEach(c => {
                 const rect = c.getBoundingClientRect();
@@ -654,6 +689,9 @@ function bindSlotMarqueeSelection(gridId) {
                 const seq = Number(c.dataset.seq);
                 if (!Number.isFinite(seq)) return;
 
+                if (cType === 'video') hasVideoTouch = true;
+                else hasImageTouch = true;
+
                 if (intersects) {
                     if (cType === 'video') touchedVideo.add(seq);
                     else touchedImage.add(seq);
@@ -664,12 +702,12 @@ function bindSlotMarqueeSelection(gridId) {
             });
 
             // 实时更新选中集合与工具条
-            if (startGridType === 'merged') {
+            if (startSection === 'merged' || (hasImageTouch && hasVideoTouch)) {
                 slotToolbarState.image.selected = touchedImage;
                 slotToolbarState.video.selected = touchedVideo;
                 syncSlotToolbar('image');
                 syncSlotToolbar('video');
-            } else if (startGridType === 'video') {
+            } else if (startSection === 'video') {
                 slotToolbarState.video.selected = touchedVideo;
                 syncSlotToolbar('video');
             } else {
@@ -683,30 +721,38 @@ function bindSlotMarqueeSelection(gridId) {
             window.removeEventListener('mouseup', onMouseUp, true);
             document.body.classList.remove('is-slot-marquee-selecting');
 
+            if (tempDisabledCards.length) {
+                tempDisabledCards.forEach(c => { c.draggable = true; });
+                tempDisabledCards.length = 0;
+            }
+
             if (marqueeEl) {
                 marqueeEl.remove();
                 marqueeEl = null;
             }
 
-            // 若只是在空白处单纯单击（未发生有效拖拽）且未按 Shift/Ctrl，则清空当前网格选中
-            if (!isDragging) {
-                if (!card && !hasModifier) {
-                    if (startGridType === 'merged') {
-                        clearSlotSelection('image');
-                        clearSlotSelection('video');
-                    } else {
-                        clearSlotSelection(startGridType);
-                    }
-                }
+            if (isDragging) {
+                // 刚完成框选拖拽，吞掉紧随其后的 click 事件以防误点开 Lightbox
+                suppressNextCardClick = true;
+                setTimeout(() => { suppressNextCardClick = false; }, 60);
+
+                // 拖拽结束：最后确保状态完全同步
+                syncSlotToolbar('image');
+                syncSlotToolbar('video');
                 return;
             }
 
-            // 拖拽结束：最后确保状态完全同步
-            if (startGridType === 'merged') {
-                syncSlotToolbar('image');
-                syncSlotToolbar('video');
-            } else {
-                syncSlotToolbar(startGridType);
+            // 若只是单纯单击（未发生有效拖拽）：
+            if (!card && !isAdditive) {
+                // 空白处单击：清空对应网格选中
+                if (startSection === 'merged') {
+                    clearSlotSelection('image');
+                    clearSlotSelection('video');
+                } else if (startSection === 'video') {
+                    clearSlotSelection('video');
+                } else {
+                    clearSlotSelection('image');
+                }
             }
         }
 
@@ -714,20 +760,27 @@ function bindSlotMarqueeSelection(gridId) {
         window.addEventListener('mouseup', onMouseUp, true);
     });
 
-    // 空白处单击直接清空选中集
-    grid.addEventListener('click', (e) => {
+    // 空白区域单击直接清空选中集
+    document.addEventListener('click', (e) => {
         if (e.shiftKey || e.ctrlKey || e.metaKey) return;
-        if (e.target.closest('.slot-card, button, input, textarea, a, select, label, .slot-actions, .slot-badge, .slot-label, .slot-select, .slot-bulk, .slot-toolbar')) {
+        const resultsArea = e.target.closest('#results-view, #frames-section, #videos-section, .frames-wrapper, .frames-grid, #beats-grid');
+        if (!resultsArea) return;
+        if (e.target.closest('.slot-card, button, input, textarea, a, select, label, .slot-actions, .slot-badge, .slot-label, .slot-select, .slot-bulk, .slot-toolbar, .review-panel, .section-tools')) {
             return;
         }
-        const gType = getGridType();
-        if (gType === 'merged') {
+        if (slotMergedView || e.target.closest('#beats-grid')) {
             clearSlotSelection('image');
             clearSlotSelection('video');
+        } else if (e.target.closest('#videos-section, #videos-grid')) {
+            clearSlotSelection('video');
         } else {
-            clearSlotSelection(gType);
+            clearSlotSelection('image');
         }
     });
+}
+
+function bindSlotMarqueeSelection(gridId) {
+    initGlobalSlotMarqueeSelection();
 }
 
 /**

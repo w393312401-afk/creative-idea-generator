@@ -296,12 +296,18 @@ def _pair_metrics(reference_path: str, candidate_path: str, cells: list[str]) ->
 
 def analyze_frame(reference_path: str, candidate_path: str, *, prompt: str = "",
                   beat: dict[str, Any] | None = None, master_path: str | None = None,
-                  mode: str = "balanced") -> dict[str, Any]:
+                  mode: str = "balanced", cells: list[str] | None = None) -> dict[str, Any]:
+    """``cells``：显式指定差量区，绕开从 prompt/beat 推断的那一步。
+
+    修复门禁要用（见 pipeline_orchestrator._measure_fix_triptych）：修前 / 修后两次读数
+    必须用**同一块**稳定区掩膜才可比，而定向修复恰恰会改写候选帧自己的正文——推断出来
+    的 cells 前后不同，比较的就是两个不同口径的读数，档位差异可能纯粹来自掩膜位移。
+    """
     if mode == "off":
         return {"version": CONTRACT_VERSION, "status": "skipped", "reason": "continuity mode is off"}
     mode = mode if mode in THRESHOLDS else "balanced"
     thresholds = THRESHOLDS[mode]
-    cells = changed_grid_cells(prompt, beat)
+    cells = list(cells) if cells is not None else changed_grid_cells(prompt, beat)
     result: dict[str, Any] = {
         "version": CONTRACT_VERSION,
         "status": "passed",
@@ -316,7 +322,11 @@ def analyze_frame(reference_path: str, candidate_path: str, *, prompt: str = "",
         if master_path and os.path.abspath(master_path) != os.path.abspath(reference_path):
             result["master"] = _pair_metrics(master_path, candidate_path, cells)
     except Exception as exc:
-        result.update(status="warned", reason=f"local continuity check unavailable: {exc}")
+        # 探针跑不起来（缺 OpenCV、图片解不开）＝**没有证据**，不是"画面被改坏了"的
+        # 证据。hard_votes 显式留空，三联屏门禁据此把它当软信号处理，不会因为一次
+        # 环境抖动就回滚掉一次真修好的重渲（见 effective_seam_rank）。
+        result.update(status="warned", reason=f"local continuity check unavailable: {exc}",
+                      hard_votes=[], warning_votes=["probe_unavailable"])
         return result
 
     metrics = [result["previous"]] + ([result["master"]] if result.get("master") else [])
@@ -362,6 +372,10 @@ def analyze_frame(reference_path: str, candidate_path: str, *, prompt: str = "",
         result["retry_recommended"] = bool(cells)
     else:
         result["retry_recommended"] = result["status"] == "failed"
+    # 硬 / 软信号分开留痕：下游的三联屏门禁要据此区分「一个硬漂移信号」与「低纹理
+    # 或差量区推进不足」这两种同样落 warned、代价却完全不同的读数。
+    result["hard_votes"] = sorted(hard_votes)
+    result["warning_votes"] = sorted(warning_votes | ({"no_progress"} if no_progress else set()))
     result["reason"] = "; ".join(result["reasons"]) or "continuity checks passed"
     return result
 
@@ -380,13 +394,33 @@ def analyze_frame(reference_path: str, candidate_path: str, *, prompt: str = "",
 # 判据刻意与本模块其余部分同源：**只认状态档位的严格恶化**（passed → warned/failed，
 # warned → failed）。数值变差但档位没跳的一律只报不拦——analyze_frame 本身就要求两个
 # 独立硬信号才否决，门禁不该比它更神经质，误判一次的代价是把一次真修好的重渲丢掉。
+#
+# 这条克制原来只写在注释里，实现却没有兑现，两处走样：
+#
+# 1) **软 warned 也被当成恶化**。analyze_frame 的 warned 有两种来源：一个硬漂移信号
+#    （camera/structure/landmarks/composition），或者纯软信号——低纹理关键点不够、
+#    差量区推进不足。后者根本不是"画面被改坏了"，却同样把 passed 顶成 warned。于是
+#    passed → warned 这条回滚线比 analyze_frame 自己的否决线（要两个硬信号）还紧。
+#    现在按 effective_seam_rank 折算：软信号造成的 warned 在判定上等同 passed，原始
+#    档位照常交出去给人看。
+#
+# 2) **右缝有结构性偏置**。右缝＝K → K+1，而 K+1 是从**修复前**的 K 图生图出来的：
+#    修复越有效，K 与 K+1 越不像。拿"修前 K ⇄ K+1"当基线去比"修后 K ⇄ K+1"，等于
+#    要求这次修复不要改动任何东西——门禁惩罚的正是它本该放行的那类修复。所以两条缝
+#    的判据不对称（SEAM_POLICY）：
+#      · 左缝 K-1 → K：上游是既成事实，修 K 不该动它，任何严格恶化都拦（strict）。
+#      · 右缝 K → K+1：只在跌到 failed（两个独立硬信号）时才拦，那是"链真的断了"，
+#        不是"下游还没跟上"。跌到 warned 照常报出来给人看，但不回滚。
 
-TRIPTYCH_CONTRACT_VERSION = "frame-triptych-v1"
+TRIPTYCH_CONTRACT_VERSION = "frame-triptych-v2"
 
 _STATUS_RANK = {"passed": 0, "warned": 1, "failed": 2}
 
 # 两条缝的人类可读名。左缝＝上游继承（K-1 → K），右缝＝下游通道（K → K+1）。
 SEAM_LABELS = {"left": "K-1 → K（上游继承锁）", "right": "K → K+1（下游通道锁）"}
+
+# 每条缝的拦截口径，理由见上方注释。
+SEAM_POLICY = {"left": "strict", "right": "failed_only"}
 
 
 def seam_rank(result: dict[str, Any] | None) -> int | None:
@@ -394,13 +428,31 @@ def seam_rank(result: dict[str, Any] | None) -> int | None:
     return _STATUS_RANK.get((result or {}).get("status"))
 
 
+def effective_seam_rank(result: dict[str, Any] | None) -> int | None:
+    """判定用档位：软信号造成的 warned 折回 passed。
+
+    只在读数**明确带着** hard_votes 字段（measure_seam 一定写）且为空时才折算。旧读数
+    /外部构造的读数没有这个字段＝硬软不明，保守按原档位算。
+    """
+    rank = seam_rank(result)
+    if rank != 1:
+        return rank
+    votes = (result or {}).get("hard_votes")
+    if isinstance(votes, list) and not votes:
+        return 0
+    return rank
+
+
 def measure_seam(reference_path: str | None, candidate_path: str | None, *,
                  prompt: str = "", beat: dict[str, Any] | None = None,
-                 mode: str = "balanced") -> dict[str, Any] | None:
+                 mode: str = "balanced", cells: list[str] | None = None) -> dict[str, Any] | None:
     """一条缝的连贯性读数。任一端缺图、或档位关闭时返回 None ＝这条缝不参与判定。
 
     `prompt` 取**候选帧**（缝的下游那一张）的正文：changed_grid_cells 圈出的是这一帧
     自己申报的差量区，稳定区判读要把它挖掉。左缝取第 K 帧的正文，右缝取第 K+1 帧的。
+
+    `cells` 显式给定时直接用它，不再从 prompt/beat 推断——修前 / 修后两次读数必须用同一
+    块掩膜才可比（见 analyze_frame 的同名参数）。读数里带回 `cells`，供第二次调用复用。
     """
     if mode == "off":
         return None
@@ -408,17 +460,25 @@ def measure_seam(reference_path: str | None, candidate_path: str | None, *,
         return None
     if not (os.path.exists(reference_path) and os.path.exists(candidate_path)):
         return None
-    result = analyze_frame(reference_path, candidate_path, prompt=prompt, beat=beat, mode=mode)
+    result = analyze_frame(reference_path, candidate_path, prompt=prompt, beat=beat,
+                           mode=mode, cells=cells)
+    used_cells = result.get("changed_grid_cells")
+    if used_cells is None:
+        used_cells = list(cells) if cells is not None else changed_grid_cells(prompt, beat)
     rank = seam_rank(result)
     if rank is None:
         # skipped / skipped_transition：读数存在但不可比，照样交出去给人看，只是不判。
         return {"status": result.get("status"), "rank": None,
-                "reason": result.get("reason") or result.get("status"), "metrics": None}
+                "reason": result.get("reason") or result.get("status"), "metrics": None,
+                "cells": used_cells, "hard_votes": result.get("hard_votes") or []}
     return {
         "status": result.get("status"),
         "rank": rank,
         "reason": result.get("reason"),
         "metrics": result.get("previous"),
+        "cells": used_cells,
+        "hard_votes": result.get("hard_votes") or [],
+        "warning_votes": result.get("warning_votes") or [],
     }
 
 
@@ -429,8 +489,14 @@ def compare_triptych(before: dict[str, Any] | None,
     只有**两侧都读得出档位**的那条缝才参与判定：修前读不出（缺图、低纹理、档位关闭）
     的缝，修后再差也没有基线可比，不能凭空判死一次重渲。
 
+    两条缝的拦截口径不对称，见 SEAM_POLICY 与本节顶部的注释：左缝任何严格恶化都算
+    恶化；右缝只有跌到 failed 才算——它天生偏向"修得越有效越难看"。
+
     返回 {'version', 'regressed': [seam…], 'verdict': 'ok'|'regressed'|'unjudged',
-          'seams': {seam: {'before':…, 'after':…, 'regressed': bool}}}
+          'seams': {seam: {'before':…, 'after':…, 'regressed': bool, 'policy':…,
+                           'worsened': bool}}}
+    `worsened` ＝档位确实变差了（无论是否触发拦截），供界面把"报出来但不回滚"的那一类
+    如实说出来。
     """
     before = before or {}
     after = after or {}
@@ -439,35 +505,51 @@ def compare_triptych(before: dict[str, Any] | None,
     judged = 0
     for seam in ("left", "right"):
         b, a = before.get(seam), after.get(seam)
-        b_rank, a_rank = seam_rank(b), seam_rank(a)
-        row: dict[str, Any] = {"before": b, "after": a, "regressed": False}
+        b_rank, a_rank = effective_seam_rank(b), effective_seam_rank(a)
+        policy = SEAM_POLICY.get(seam, "strict")
+        row: dict[str, Any] = {"before": b, "after": a, "regressed": False,
+                               "policy": policy, "worsened": False}
         if b_rank is not None and a_rank is not None:
             judged += 1
-            if a_rank > b_rank:
+            worsened = a_rank > b_rank
+            row["worsened"] = worsened
+            blocking = worsened and (policy != "failed_only" or a_rank >= _STATUS_RANK["failed"])
+            if blocking:
                 row["regressed"] = True
                 regressed.append(seam)
         seams[seam] = row
     verdict = "regressed" if regressed else ("ok" if judged else "unjudged")
     return {"version": TRIPTYCH_CONTRACT_VERSION, "verdict": verdict,
-            "regressed": regressed, "judged_seams": judged, "seams": seams}
+            "regressed": regressed, "judged_seams": judged, "seams": seams,
+            "worsened": [s for s in ("left", "right") if seams[s]["worsened"]]}
 
 
 def describe_triptych(comparison: dict[str, Any] | None) -> str:
     """门禁结论的一句中文，直接进 on_progress 消息与日志。"""
     comparison = comparison or {}
     verdict = comparison.get("verdict")
+    seams = comparison.get("seams") or {}
+
+    def _line(seam):
+        row = seams.get(seam) or {}
+        b = (row.get("before") or {}).get("status")
+        a = (row.get("after") or {}).get("status")
+        return (f"{SEAM_LABELS.get(seam, seam)}：{b} → {a}"
+                + (f"（{(row.get('after') or {}).get('reason')}）"
+                   if (row.get("after") or {}).get("reason") else ""))
+
     if verdict == "regressed":
-        parts = []
-        for seam in comparison.get("regressed") or []:
-            row = (comparison.get("seams") or {}).get(seam) or {}
-            b = (row.get("before") or {}).get("status")
-            a = (row.get("after") or {}).get("status")
-            parts.append(f"{SEAM_LABELS.get(seam, seam)}：{b} → {a}"
-                         + (f"（{(row.get('after') or {}).get('reason')}）"
-                            if (row.get("after") or {}).get("reason") else ""))
-        return "；".join(parts)
+        return "；".join(_line(seam) for seam in (comparison.get("regressed") or []))
+    # 档位变差、但按该缝的口径不构成拦截（几乎总是右缝 K → K+1：下游还派生自修复前的
+    # K，它变得不像本来就是修复奏效的副产物）。不拦，但必须如实说出来。
+    soft = [s for s in (comparison.get("worsened") or [])
+            if not ((seams.get(s) or {}).get("regressed"))]
     if verdict == "ok":
-        return f"两侧缝均未恶化（判读了 {comparison.get('judged_seams')} 条缝）"
+        head = f"两侧缝均未恶化（判读了 {comparison.get('judged_seams')} 条缝）"
+        if soft:
+            head = ("；".join(_line(s) for s in soft)
+                    + "，按该缝口径不构成拦截（下游尚未跟着重渲），已放行")
+        return head
     return "没有可比的基线读数，本次不做门禁判定"
 
 

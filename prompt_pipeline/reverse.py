@@ -5433,8 +5433,16 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
         package = [str(p).strip() for p in (beat.get('package_operations') or []) if str(p).strip()]
         if package:
             text = f'{text}（工序：{"、".join(package)}）'
+        raw_op = str(beat.get('operation') or beat.get('stage') or '').strip().lower()
+        stage = str(beat.get('stage') or '').strip().lower()
+        if stage == 'reveal' or raw_op in ('reward', 'reveal') or 'reveal' in raw_op or 'reward' in raw_op:
+            entry_op = 'reward'
+        elif stage in ('transition', 'threshold') or raw_op in ('threshold', 'reframe'):
+            entry_op = 'threshold'
+        else:
+            entry_op = beat.get('operation') or beat.get('stage')
         entry = {'text': text or (beat.get('visual_subject') or ''),
-                 'op': beat.get('operation') or beat.get('stage')}
+                 'op': entry_op}
         # 观察到的机位所在空间。合成期据此确定过门发生在第几拍、发生几次
         # （见 __init__.apply_observed_space_sequence）——不透传这一个键，
         # 复刻单的过门次数就仍由叙事骨架写死，与原片无关。

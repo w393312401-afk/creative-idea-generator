@@ -2666,3 +2666,40 @@ class TestObservedShotCuts(unittest.TestCase):
         self.assertEqual(stats['single_shot_beats'], 0)
         self.assertEqual(stats['max_shots'], 3)
         self.assertEqual(stats['avg_shots'], 2.5)
+
+    def test_reveal_stage_beat_is_exempt_from_multiple_package_operations_rule(self):
+        """Reveal stage beat (e.g. window view reveal) should be treated as transition/reward and not require 2-3 ops."""
+        from prompt_pipeline.frame_state import build_frame_state_contract, validate_frame_state_contract
+        ladder = [
+            {
+                'index': 1, 'operation': 'excavate pit',
+                'package_operations': ['mark outline', 'break soil', 'clear spoil'],
+                'before_state': 'raw hillside', 'after_state': 'excavated pit',
+                'milestone_name': 'excavated pit', 'preserve_state': 'trees',
+                'persistent_traces': ['staked perimeter lines', 'excavation chalk marks'],
+            },
+            {
+                'index': 2, 'stage': 'reveal', 'operation': 'window view reveal',
+                'package_operations': ['window view reveal'],
+                'before_state': 'finished room', 'after_state': 'window framing valley view',
+                'milestone_name': 'window framing valley view', 'preserve_state': 'finished room',
+            }
+        ]
+        contracts = build_frame_state_contract(ladder)
+        self.assertTrue(contracts[1]['transition'])
+        errors = validate_frame_state_contract(contracts)
+        self.assertEqual(errors, [])
+
+    def test_beats_to_dimensions_maps_reveal_stage_to_reward_op(self):
+        """beats_to_dimensions must normalize reveal stage / op to reward for outline contract."""
+        doc = {
+            'beats': [
+                {'id': 'B01', 'operation': 'excavate', 'package_operations': ['dig', 'clear']},
+                {'id': 'B02', 'stage': 'reveal', 'operation': 'window view reveal', 'package_operations': ['window view reveal']},
+            ]
+        }
+        dims = reverse.beats_to_dimensions(doc)
+        outline = dims.get('beat_outline', [])
+        self.assertEqual(len(outline), 2)
+        self.assertEqual(outline[1]['op'], 'reward')
+

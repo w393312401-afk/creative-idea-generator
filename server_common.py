@@ -4171,8 +4171,12 @@ def drop_stale_review_verdicts(manifest, project_dir):
                         break
                 if ibr_stale:
                     frame.pop('inline_beat_review', None)
-                    if frame.get('flag_origin') == 'chain_guard':
+                    if frame.get('flag_origin') in ('chain_guard', 'fix_reverify'):
                         frame.pop('flag_origin', None)
+                        # 守卫盖 flag 时同时落的结构化清单（chain_guard.guard_beat）
+                        # 说的是那两张旧图，图变了它一起作废——否则定向修复会拿着一份
+                        # 描述旧画面的问题清单去改写提示词。
+                        frame.pop('review_issues', None)
                         if frame.get('quality_gate') == 'sequence_review_flagged':
                             frame['quality_gate'] = 'pending_manual_review'
                             frame['vlm_qa_reason'] = None

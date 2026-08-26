@@ -217,7 +217,8 @@ _UNSET = object()
 
 
 def _set_manifest_quality_gate(project_dir, sequence, quality_gate, reason=None,
-                               review_issues=_UNSET, respect_manual_flag=False):
+                               review_issues=_UNSET, respect_manual_flag=False,
+                               flag_origin=_UNSET):
     """Overwrite one frame's recorded quality_gate/vlm_qa_reason in manifest.json.
     渲染路径本身不再产生任何判定（帧一律落 pending_manual_review），所以这里的写入方
     只剩手动一致性审查与人工标记两条。
@@ -255,6 +256,14 @@ def _set_manifest_quality_gate(project_dir, sequence, quality_gate, reason=None,
                         frame['review_issues'] = review_issues
                     else:
                         frame.pop('review_issues', None)
+                # flag_origin：这枚 flag 是谁盖的。链上守卫复审通过时要据此认领并清掉
+                # 自己这一路盖出来的 flag（见 chain_guard.guard_beat 的 pass 分支），
+                # 不能连人工标记与整套审查的结论一起洗掉。
+                if flag_origin is not _UNSET:
+                    if flag_origin:
+                        frame['flag_origin'] = flag_origin
+                    else:
+                        frame.pop('flag_origin', None)
                 break
         write_manifest(project_dir, manifest)
 
@@ -970,6 +979,13 @@ def save_fix_snapshot(project_dir, title, sequence, entry, image_item, video_bea
         'image': dict(image_item or {}),
         'video_beat': video_beat if video_item is not None else None,
         'video': dict(video_item or {}) if video_item is not None else None,
+        # 修复前**整条链**的血统标记。撤销是按字节把旧图拷回来，链于是回到修复前的
+        # 样子，下游帧的血统当然也该回到修复前的样子——而 update_manifest_stale_status
+        # 只认 regenerated_sequences，会把 K 之后的帧一律标成 stale_lineage，等于一次
+        # 撤销就让整条下游需要重渲。这份记录让 undo_frame_fix 能原样放回去。
+        'lineage': {str(f.get('sequence')): bool(f.get('stale_lineage'))
+                    for f in ((read_manifest(project_dir) or {}).get('frames') or [])
+                    if isinstance(f, dict) and isinstance(f.get('sequence'), int)},
     }
     with open(os.path.join(snap_dir, 'snapshot.json'), 'w', encoding='utf-8') as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -991,12 +1007,170 @@ def drop_fix_snapshots(project_dir, manifest=None, sequences=None):
     else:
         for seq in sequences:
             shutil.rmtree(_fix_snapshot_dir(project_dir, seq), ignore_errors=True)
+            shutil.rmtree(_rejected_fix_dir(project_dir, seq), ignore_errors=True)
     if not isinstance(manifest, dict):
         return
     wanted = None if sequences is None else {int(s) for s in sequences}
     for frame in manifest.get('frames') or []:
         if wanted is None or frame.get('sequence') in wanted:
             frame.pop('fix_backup', None)
+            # 被门禁退回的那一版同样按槽位号存，编号一变就张冠李戴，一起丢掉
+            frame.pop('rejected_fix', None)
+
+
+# ── 门禁退回的那一版 ────────────────────────────────────────────────────────
+#
+# 三联屏门禁判恶化时会自动回滚，而 undo_frame_fix 用完即删快照。门禁本身是概率判定
+# （见 frame_continuity 顶部：两条缝的口径已经放宽过一轮，但假阳性不可能归零），
+# 一次误判＝那次 4 选 1 重渲的结果被彻底丢弃，用户连"其实我想要那版"都没处说。
+# 所以回滚前先把修后那一版整份留下来，给一个「采用修后版」的出口。
+
+def _rejected_fix_dir(project_dir, sequence):
+    """刻意不放在 _fix_snapshot_dir 里面：回滚走的 undo_frame_fix 会把那个目录整个
+    rmtree 掉，放进去等于刚存就被删。"""
+    return os.path.join(project_dir, FIX_SNAPSHOT_DIR, f'{sequence:03d}_rejected')
+
+
+def stash_rejected_fix(project_dir, title, sequence, image_item, video_beat, video_item,
+                       reason, detail):
+    """门禁判恶化、即将自动回滚之前，把"修后那一版"整份留一份。
+
+    存的东西与 save_fix_snapshot 对称：帧图本体 + 这一帧与前一拍视频改写后的正文。
+    只保留最近一次；采用或再修一次即作废。返回落盘的元数据。"""
+    stash_dir = _rejected_fix_dir(project_dir, sequence)
+    shutil.rmtree(stash_dir, ignore_errors=True)
+    os.makedirs(stash_dir, exist_ok=True)
+
+    frame_path = _frame_path(title, sequence)
+    if os.path.exists(frame_path):
+        shutil.copyfile(frame_path, os.path.join(stash_dir, os.path.basename(frame_path)))
+    meta = {
+        'sequence': sequence,
+        'at': datetime.now().isoformat(timespec='seconds'),
+        'reason': reason,
+        'gate_detail': detail,
+        'image': dict(image_item or {}) if image_item is not None else None,
+        'video_beat': video_beat if video_item is not None else None,
+        'video': dict(video_item or {}) if video_item is not None else None,
+    }
+    with open(os.path.join(stash_dir, 'rejected.json'), 'w', encoding='utf-8') as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return meta
+
+
+def _read_rejected_fix(project_dir, sequence):
+    path = os.path.join(_rejected_fix_dir(project_dir, sequence), 'rejected.json')
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _mark_rejected_fix(project_dir, sequence, meta):
+    """在帧条目上留一枚"这一帧有一版被门禁退回、可以人工采用"的记号。
+
+    必须在回滚之后写：undo_frame_fix 会把整条 manifest 条目换成快照里的那份，
+    写在前面会被冲掉。"""
+    with manifest_lock(project_dir):
+        manifest = read_manifest(project_dir)
+        if not manifest:
+            return
+        for frame in manifest.get('frames', []):
+            if frame.get('sequence') == sequence:
+                frame['rejected_fix'] = {'at': meta.get('at'), 'reason': meta.get('reason'),
+                                         'gate_detail': meta.get('gate_detail')}
+                break
+        write_manifest(project_dir, manifest)
+
+
+def _drop_rejected_fix(project_dir, sequence, manifest=None):
+    """丢掉退回版与它的记号。再修一次 / 采用 / 撤销之后它都不再成立。
+
+    manifest 给了就就地摘记号（调用方负责写回），没给就自己开锁写。"""
+    shutil.rmtree(_rejected_fix_dir(project_dir, sequence), ignore_errors=True)
+    if isinstance(manifest, dict):
+        for frame in manifest.get('frames') or []:
+            if frame.get('sequence') == sequence:
+                frame.pop('rejected_fix', None)
+        return
+    with manifest_lock(project_dir):
+        mf = read_manifest(project_dir)
+        if not mf:
+            return
+        touched = False
+        for frame in mf.get('frames', []):
+            if frame.get('sequence') == sequence and 'rejected_fix' in frame:
+                frame.pop('rejected_fix', None)
+                touched = True
+        if touched:
+            write_manifest(project_dir, mf)
+
+
+def adopt_rejected_fix(title, sequence, prompt_block):
+    """人工采用被门禁退回的那一版：把修后的帧图与两段提示词正文放回去。
+
+    门禁是概率判定，判错的时候用户看得见——这是那种情况下的唯一出口。采用之前先给
+    "此刻这一版"（＝回滚后的旧图）存一份修复快照，所以采用完照样可以「撤销修复」退
+    回来，不会变成单向门。
+
+    返回 {'prompt_block': ..., 'frame': ..., 'at': 退回版的时间}。"""
+    project_dir = _get_project_dir(title)
+    stash = _read_rejected_fix(project_dir, sequence)
+    if not stash:
+        raise RuntimeError(f'IMG {sequence:03d} 没有可采用的「门禁退回版」'
+                           f'（只保留最近一次，采用或再修一次之后就没有了）')
+
+    images, videos = _parse_prompt_slots(prompt_block)
+    entry = _frame_manifest_entry(project_dir, sequence) or {}
+    video_beat = stash.get('video_beat')
+    save_fix_snapshot(project_dir, title, sequence, entry, images.get(sequence),
+                      video_beat if video_beat is not None else sequence - 1,
+                      videos.get(video_beat) if video_beat is not None else None)
+
+    stash_dir = _rejected_fix_dir(project_dir, sequence)
+    frame_path = _frame_path(title, sequence)
+    saved_image = os.path.join(stash_dir, os.path.basename(frame_path))
+    if not os.path.exists(saved_image):
+        raise RuntimeError(f'IMG {sequence:03d} 的门禁退回版缺少帧图文件，无法采用')
+    os.makedirs(os.path.dirname(frame_path), exist_ok=True)
+    shutil.copyfile(saved_image, frame_path)
+
+    if stash.get('image') and sequence in images:
+        images[sequence] = dict(stash['image'])
+    if stash.get('video') and video_beat in videos:
+        videos[video_beat] = dict(stash['video'])
+    adopted_block = _format_prompt_block(images, videos)
+
+    with manifest_lock(project_dir):
+        manifest = read_manifest(project_dir)
+        if manifest:
+            for frame in manifest.get('frames', []):
+                if frame.get('sequence') != sequence:
+                    continue
+                frame['prompt'] = _slot_body(images.get(sequence))
+                # 采用的是一版**没有经过复核**的画面：门禁拦下它的时候 reverify 根本
+                # 没跑（fix_frame_issue 在回滚分支直接 return）。落 pending_manual_review
+                # 等人看，不谎报审查通过。
+                frame['quality_gate'] = 'pending_manual_review'
+                frame['vlm_qa_reason'] = None
+                frame.pop('review_issues', None)
+                frame['fix_backup'] = {'at': datetime.now().isoformat(timespec='seconds'),
+                                       'reason': stash.get('reason') or '采用门禁退回版'}
+                frame['adopted_rejected_fix'] = {'at': stash.get('at'),
+                                                 'gate_detail': stash.get('gate_detail')}
+                break
+            _drop_rejected_fix(project_dir, sequence, manifest)
+            update_manifest_stale_status(manifest, project_dir,
+                                         regenerated_sequences=[sequence], finalize=True)
+            write_manifest(project_dir, manifest)
+
+    shutil.rmtree(stash_dir, ignore_errors=True)
+    return {'prompt_block': adopted_block,
+            'frame': _frame_manifest_entry(project_dir, sequence) or {},
+            'at': stash.get('at')}
 
 
 def _mark_fix_backup(project_dir, sequence, snapshot_at, reason):
@@ -1026,15 +1200,16 @@ def _read_fix_snapshot(project_dir, sequence):
         return None
 
 
-def undo_frame_fix(title, sequence, prompt_block):
+def undo_frame_fix(title, sequence, prompt_block, keep_rejected=False):
     """撤销这一帧最近一次定向修复：把快照里的帧图、manifest 条目、两段提示词正文
     原样放回，回到修复前的状态（问题描述与结构化违规一并回来，可以重新修一次）。
 
     只回滚这一帧涉及的槽位，**不整体还原 prompt_block**：修完 003 又修了 005 之后
     撤销 003，整体还原会把 005 的修复一起吞掉。
 
-    与其它写帧路径共用同一个收尾（update_manifest_stale_status finalize）：画面又
-    变了一次，下游帧的血统标记、相邻拍的审查结论、已合并成片都要跟着作废。
+    与其它写帧路径共用同一个收尾（update_manifest_stale_status finalize）：相邻拍的
+    审查结论、已合并成片都要跟着作废。**血统标记例外**——撤销是按字节还原，链回到了
+    修复前的样子，所以下游的 stale_lineage 也按快照里记的原样放回，不跟着标脏。
 
     返回 {'prompt_block': ..., 'frame': ..., 'at': 快照时间}。没有快照时报错——
     没有可回退的版本时静默"成功"比报错更糟。"""
@@ -1074,8 +1249,30 @@ def undo_frame_fix(title, sequence, prompt_block):
                     restored['url'] = frame['url']
                 manifest['frames'][idx] = restored
                 break
+            # 人手点的撤销：把上一次被门禁退回的那一版也丢掉——人已经明确要回到修复
+            # 前的样子了，留着一个"采用修后版"的按钮只会让人绕回来。门禁自己的自动
+            # 回滚是例外（keep_rejected=True）：它留档的正是这一版。
+            if not keep_rejected:
+                _drop_rejected_fix(project_dir, sequence, manifest)
             update_manifest_stale_status(manifest, project_dir,
                                          regenerated_sequences=[sequence], finalize=True)
+            # 血统标记原样放回：撤销把旧图按字节拷了回来，下游帧派生的正是这张图，
+            # 链在修复前是什么样、现在就还是什么样。上一行的收尾按"这一帧刚重渲过"
+            # 无条件把 K 之后全标脏，对**还原**这件事是错的——同一次调用里基于哈希的
+            # drop_stale_review_verdicts 也正确地判定了"什么都没变"。
+            # 老快照没有这份记录时保持既有行为（标脏是保守的那一侧）。
+            lineage = snap.get('lineage')
+            if isinstance(lineage, dict) and lineage:
+                for frame in manifest.get('frames') or []:
+                    if not isinstance(frame, dict):
+                        continue
+                    was = lineage.get(str(frame.get('sequence')))
+                    if was is None:
+                        continue
+                    if was:
+                        frame['stale_lineage'] = True
+                    else:
+                        frame.pop('stale_lineage', None)
             write_manifest(project_dir, manifest)
 
     shutil.rmtree(snap_dir, ignore_errors=True)
@@ -1092,7 +1289,8 @@ def _slot_meta(item):
     return (item.get('meta', '') if isinstance(item, dict) else '') or ''
 
 
-def _measure_fix_triptych(config, title, images, videos, sequence, *, include_right=True):
+def _measure_fix_triptych(config, title, images, videos, sequence, *, include_right=True,
+                          baseline=None):
     """读一次三联屏的两条缝：K-1 → K（上游继承）与 K → K+1（下游通道）。
 
     修复前后各读一次，两份读数交给 frame_continuity.compare_triptych 比对——这就是
@@ -1103,43 +1301,66 @@ def _measure_fix_triptych(config, title, images, videos, sequence, *, include_ri
     每条缝的 `prompt` 取**候选帧**（缝的下游那一张）的正文：changed_grid_cells 圈出的
     是那一帧自己申报的差量区，稳定区判读要把它挖掉。取错了会把本该变的地方算成漂移。
 
+    **与前向建链同源取数**：结构化拍梯（manifest.spatial_beats）一并传下去，和
+    frame_generator 渲每一帧时调 analyze_frame 的口径一致。少了它两处都会走样——
+      · changed_grid_cells 退化成正则扫正文，扫不到就兜底成 ["B2"]，于是"除中心格外
+        整张图都算稳定区"，修复动在别处就被整片计成漂移；
+      · 只靠 spatial_beats 声明（bridge_stage / hard_cut / transition_stage）的过场帧
+        在这里认不出来，那条本来就不该像的缝会被拿去判定。
+
+    **修前 / 修后必须用同一块掩膜**：`baseline` 传上一次的读数，差量区直接复用它算出
+    的 cells。定向修复恰恰会改写候选帧 K 自己的正文，重新推断出来的 cells 与修前不同，
+    比较的就是两个不同口径的读数——档位差异可能纯粹来自掩膜位移。
+
     过门/换机位族的那条缝不判——两张图本来就不该像（is_transition_frame）。
     `include_right=False` 用于 Level 3 连带重渲：K+1 这一趟本来就要被盖掉，拿它当基线
     没有意义。
     """
     import frame_continuity
+    from frame_generator import _continuity_beat
 
     mode = frame_continuity.continuity_mode(config)
     if mode == 'off':
         return {'left': None, 'right': None}
 
+    project_dir = _get_project_dir(title)
+    manifest = read_manifest(project_dir) or {}
+    baseline = baseline or {}
+
     def _frame(seq):
         path = _frame_path(title, seq)
         return path if os.path.exists(path) else None
+
+    def _cells(seam):
+        prev = baseline.get(seam)
+        return prev.get('cells') if isinstance(prev, dict) else None
 
     seams = {'left': None, 'right': None}
 
     # 左缝：参考 K-1，候选 K。sequence <= 1 时 is_transition_frame 直接为真（首帧没有
     # 上游可继承），这条缝自然落空。
     img_k = images.get(sequence)
+    beat_k = _continuity_beat(manifest, sequence)
     if img_k is not None and not frame_continuity.is_transition_frame(
-            sequence, _slot_meta(img_k), _slot_meta(videos.get(sequence - 1))):
+            sequence, _slot_meta(img_k), _slot_meta(videos.get(sequence - 1)), beat_k):
         seams['left'] = frame_continuity.measure_seam(
             _frame(sequence - 1), _frame(sequence),
-            prompt=_slot_body(img_k), mode=mode)
+            prompt=_slot_body(img_k), beat=beat_k, mode=mode, cells=_cells('left'))
 
     # 右缝：参考 K，候选 K+1。
     img_next = images.get(sequence + 1)
+    beat_next = _continuity_beat(manifest, sequence + 1)
     if include_right and img_next is not None and not frame_continuity.is_transition_frame(
-            sequence + 1, _slot_meta(img_next), _slot_meta(videos.get(sequence))):
+            sequence + 1, _slot_meta(img_next), _slot_meta(videos.get(sequence)), beat_next):
         seams['right'] = frame_continuity.measure_seam(
             _frame(sequence), _frame(sequence + 1),
-            prompt=_slot_body(img_next), mode=mode)
+            prompt=_slot_body(img_next), beat=beat_next, mode=mode, cells=_cells('right'))
 
     return seams
 
 
-def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, manual_reason=None, cascade_downstream=False):
+def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, manual_reason=None,
+                    cascade_downstream=False, suppress_chain_guard=False):
     """人工确认修复流程的落地点：`_sequence_consistency_review` 只标记问题、不
     自动改写重渲，人工在帧网格看过 vlm_qa_reason 后点击「修复此帧问题」才会真正
     触发这里——针对被标记的具体问题做定向提示词优化，再以 4选1 候选优选模式重渲。
@@ -1162,6 +1383,11 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
 
     重渲之后会对着新画面把这几条问题逐条再验一遍（_reverify_frame_issues），结果放在
     返回值的 'reverify' 里——修复流程此前是开环的，重渲完没人回答"到底修好没有"。
+
+    suppress_chain_guard=True：这一趟重渲里不跑链上守卫。**只有链上守卫的 autofix
+    分支该传**——它在拿到结果后自己会立刻对同一拍再跑一次 guard_beat 拿停链结论，
+    重渲内部那次审查是同一拍、同一对图的纯重复（check + 复核 + 分级各一整套），
+    而且两次 LLM 判定还可能互相打架。
 
     返回 {'prompt_block': ..., 'reason': ..., 'reverify': {...}|None, 'undoable': True}。"""
     project_dir = _get_project_dir(title)
@@ -1203,6 +1429,9 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
     # 修坏了可以一键退回去（undo_frame_fix）。修复是覆盖写同一个文件，不存就没了。
     snapshot = save_fix_snapshot(project_dir, title, sequence, entry, image_item,
                                  video_beat, video_item)
+    # 上一次被门禁退回的那一版就此作废：又修了一遍，"采用上次那版"已经没有意义，
+    # 留着只会让人采用到一版比当前还旧的画面。
+    _drop_rejected_fix(project_dir, sequence)
 
     # 三联屏门禁的基线读数：必须在重渲前、也在提示词改写前取——磁盘上还是旧图、
     # images/videos 里还是旧正文，两者对得上。换成新正文配旧图去量，差量区圈的就不是这张图
@@ -1280,6 +1509,7 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
             on_progress=on_progress,
             target_sequences=target_sequences,
             candidate_count=4,
+            chain_guard_review=not suppress_chain_guard,
         )
     else:
         if on_progress:
@@ -1311,24 +1541,37 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
     # 而快照里只有 K 这一帧，单独退回 K 会留下一条修了一半的链（上游旧图、下游新血统），
     # 比不回滚更坏。整链快照与整链回滚是另一件事，这里只把结论大声报出来。
     triptych_after = _measure_fix_triptych(
-        config, title, images, videos, sequence, include_right=not cascade_downstream)
+        config, title, images, videos, sequence, include_right=not cascade_downstream,
+        baseline=triptych_before)
     import frame_continuity as _fc
     triptych = _fc.compare_triptych(triptych_before, triptych_after)
     triptych['auto_rollback_available'] = not cascade_downstream
 
     if triptych['verdict'] == 'regressed' and not cascade_downstream:
         detail = _fc.describe_triptych(triptych)
+        # 回滚之前先把"修后那一版"整份留下来。门禁是概率判定，判错的代价此前是把一次
+        # 真修好的 4 选 1 重渲**彻底**丢掉（undo 用完即删快照），用户连说"其实我想要
+        # 那版"的地方都没有。留一份，给一个「采用修后版」的出口。
+        stash = stash_rejected_fix(project_dir, title, sequence, images.get(sequence),
+                                   video_beat, videos.get(video_beat), reason, detail)
         if on_progress:
             on_progress('frame_issue_triptych_gate', {
                 'sequence': sequence, 'verdict': 'regressed', 'triptych': triptych,
+                'rejected_fix': {'at': stash.get('at')},
                 'message': (f"⛔ IMG {sequence:03d} 三联屏门禁未通过：{detail}。"
-                            f"本次修复已自动退回上一版——宁可不修，也不把链改坏。"),
+                            f"本次修复已自动退回上一版——宁可不修，也不把链改坏。"
+                            f"修后那一版已留档，确认门禁误判可在帧网格点「采用修后版」。"),
             })
-        restored = undo_frame_fix(title, sequence, new_prompt_block)
+        restored = undo_frame_fix(title, sequence, new_prompt_block, keep_rejected=True)
+        # 记号必须写在回滚之后：undo 会把整条 manifest 条目换成快照里的那份
+        _mark_rejected_fix(project_dir, sequence, stash)
         log('WARN', 'FRAMES',
-            f"IMG {sequence:03d} 修复后三联屏门禁判恶化，已自动回滚：{detail}", title=title)
+            f"IMG {sequence:03d} 修复后三联屏门禁判恶化，已自动回滚（修后版留档于 "
+            f"{FIX_SNAPSHOT_DIR}/{sequence:03d}_rejected）：{detail}", title=title)
         return {'prompt_block': restored['prompt_block'], 'reason': reason,
                 'reverify': None, 'triptych': triptych, 'rolled_back': True,
+                'rejected_fix': {'at': stash.get('at'), 'reason': reason,
+                                 'gate_detail': detail},
                 'undoable': False}
 
     if on_progress and triptych['verdict'] != 'ok':
@@ -1346,7 +1589,15 @@ def fix_frame_issue(config, title, prompt_block, sequence, on_progress=None, man
 
     # 重渲之后才盖"可撤销"的记号：重渲会整体改写这条 manifest 条目，写在前面会被冲掉。
     # 中途抛错时也不该有这枚记号——那次修复没落地，没有"新版本"需要退回。
-    _mark_fix_backup(project_dir, sequence, snapshot.get('at'), reason)
+    #
+    # 连带重渲（Level 3）不盖这枚记号，快照里也只有 K 这一帧：单独退回 K 会留下
+    # 上游旧图 + 下游新血统的半截链，正是三联屏门禁上面那段拒绝自动做的事。此前
+    # 记号照盖不误，人手点一下「撤销修复」造出来的就是同一条半截链——自动不肯做、
+    # 手动却敞着门。整链快照与整链回滚是另一件事，没有之前这里就不给出口。
+    if cascade_downstream:
+        drop_fix_snapshots(project_dir, None, [sequence])
+    else:
+        _mark_fix_backup(project_dir, sequence, snapshot.get('at'), reason)
 
     # 自动刷新 5 列多宫格拼图大图
     try:
@@ -1407,12 +1658,17 @@ def _reverify_frame_issues(config, title, sequence, recorded_issues, on_progress
         (resolved if verdict is False else remaining).append(issue)
 
     if remaining:
+        # flag_origin 认领这枚 flag：链上守卫的 autofix 会在本函数之后立刻对同一拍再
+        # 判一次，判过了就该把这枚 flag 收回去。没有认领标记的话，"守卫说这拍过了、
+        # 循环打印 ✅ 继续往下渲"，而 manifest 上这一帧永远挂着 flagged ——
+        # video_generator 的配对门禁认的正是这个字段，一道早该消失的门会一直拦着。
         _set_manifest_quality_gate(
             project_dir, sequence, 'sequence_review_flagged',
-            '；'.join(i['text'] for i in remaining), review_issues=remaining)
+            '；'.join(i['text'] for i in remaining), review_issues=remaining,
+            flag_origin='fix_reverify')
     else:
         _set_manifest_quality_gate(project_dir, sequence, 'pending_manual_review', None,
-                                   review_issues=None)
+                                   review_issues=None, flag_origin=None)
 
     if on_progress:
         if remaining:

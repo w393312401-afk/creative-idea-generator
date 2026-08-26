@@ -2128,34 +2128,35 @@ def generate_videos_worker(task_id, config, title, prompt_block, target_slots, o
                 'completed_with_warnings' if has_quality_warnings else 'completed'
             )
 
-            # 2026-08-10：不再因为存在失败/缺失片段而跳过自动合并——有多少片段就合多少，
-            # 缺口处硬切，具体跳过的槽位由 merge_project_videos 带回 skipped_slots。
-            # Try to automatically merge videos
-            try:
-                merge_speed = config.get('_merge_speed', 2)
-                progress_cb('merge_start', {'message': f'正在自动以 {merge_speed}x 速率合并视频...'})
-                project_dir = _get_project_dir(title)
-                # 首帧封面跟手动合并同款：默认烧一帧，用哪张由 manifest 里的
-                # cover_roles（前端在封面页登记）决定，自动合并同样吃得到。
-                merged_info = merge_project_videos(
-                    project_dir, speed=merge_speed,
-                    cover_burn=config.get('_cover_burn', COVER_BURN_DEFAULT))
-                if merged_info:
-                    result['merged_video'] = merged_info
-                    # Also update manifest file on disk (locked read-modify-write)
-                    try:
-                        with manifest_lock(project_dir):
-                            mdata = read_manifest(project_dir)
-                            if mdata is not None:
-                                mdata['merged_video'] = merged_info
-                                write_manifest(project_dir, mdata)
-                    except Exception as e:
-                        log('WARN', 'VIDEOS', f"更新 manifest.json 的 merged_video 字段失败: {e}", title=title)
-                progress_cb('merge_done', {'merged_video': merged_info})
-            except Exception as merge_err:
-                log('ERROR', 'VIDEOS', f"自动合并视频失败: {merge_err}", title=title)
-                progress_cb('merge_error', {'message': f'自动合并视频失败: {str(merge_err)}'})
-                completion_state = 'partial_failed'
+            # 仅在所有片段均成功生成（无缺失/失败）时自动合并；存在缺口时跳过自动合并并留出重试/补全出口
+            if not has_failures:
+                try:
+                    merge_speed = config.get('_merge_speed', 2)
+                    progress_cb('merge_start', {'message': f'正在自动以 {merge_speed}x 速率合并视频...'})
+                    project_dir = _get_project_dir(title)
+                    # 首帧封面跟手动合并同款：默认烧一帧，用哪张由 manifest 里的
+                    # cover_roles（前端在封面页登记）决定，自动合并同样吃得到。
+                    merged_info = merge_project_videos(
+                        project_dir, speed=merge_speed,
+                        cover_burn=config.get('_cover_burn', COVER_BURN_DEFAULT))
+                    if merged_info:
+                        result['merged_video'] = merged_info
+                        # Also update manifest file on disk (locked read-modify-write)
+                        try:
+                            with manifest_lock(project_dir):
+                                mdata = read_manifest(project_dir)
+                                if mdata is not None:
+                                    mdata['merged_video'] = merged_info
+                                    write_manifest(project_dir, mdata)
+                        except Exception as e:
+                            log('WARN', 'VIDEOS', f"更新 manifest.json 的 merged_video 字段失败: {e}", title=title)
+                    progress_cb('merge_done', {'merged_video': merged_info})
+                except Exception as merge_err:
+                    log('ERROR', 'VIDEOS', f"自动合并视频失败: {merge_err}", title=title)
+                    progress_cb('merge_error', {'message': f'自动合并视频失败: {str(merge_err)}'})
+                    completion_state = 'partial_failed'
+            else:
+                progress_cb('merge_skip', {'message': '由于存在失败或未生成片段，已跳过自动合并。'})
 
             result['completion_state'] = completion_state
             result['has_failures'] = has_failures
@@ -5296,6 +5297,22 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                     status=409)
                     return
                 try:
+                    # 没有 fix_backup 记号就没有"可退回的上一版"。连带重渲（Level 3）
+                    # 之后刻意不盖这枚记号：快照里只有 K 这一帧，下游已经按新的 K 重渲
+                    # 过一轮，单独退回 K 会留下上游旧图 + 下游新血统的半截链——正是
+                    # 三联屏门禁拒绝自动做的那件事，手动入口同样不该敞着门。
+                    entry = None
+                    mf = read_manifest(project_dir) or {}
+                    for f in (mf.get('frames') or []):
+                        if f.get('sequence') == sequence:
+                            entry = f
+                            break
+                    if entry is not None and not isinstance(entry.get('fix_backup'), dict):
+                        self._send_json({'status': 'error',
+                                         'message': f'IMG {sequence:03d} 没有可撤销的修复记录'
+                                                    f'（连带重渲下游的那种修复不提供单帧撤销：'
+                                                    f'只退回这一帧会留下半截链）'}, status=400)
+                        return
                     from pipeline_orchestrator import undo_frame_fix
                     result = undo_frame_fix(title, sequence, prompt_block)
                 finally:
@@ -5303,6 +5320,45 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
 
                 log('INFO', 'FRAMES', f"撤销第 {sequence} 帧的定向修复（回到 {result.get('at')} 的版本）",
                     title=title)
+                self._send_json({'status': 'ok', **result})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/adopt_rejected_fix':
+            # 采用被三联屏门禁退回的那一版：门禁判"这次修复把链改坏了"就会自动回滚，
+            # 但它是概率判定，判错的时候用户在帧网格上看得见。修后那一版留档在
+            # .frame_fixes/<seq>_rejected，这里把它放回去（pipeline_orchestrator
+            # .adopt_rejected_fix）。同 undo_frame_fix：纯文件+manifest 操作、不跑
+            # 模型也不渲图，同步返回、不建后台任务。
+            try:
+                if not access_ok(self):
+                    self._send_json({'error': '访问码无效或缺失'}, status=401)
+                    return
+                body = self._read_json_body()
+                title = body.get('title', '')
+                sequence = body.get('sequence')
+                if not isinstance(sequence, int):
+                    self._send_json({'status': 'error', 'message': 'sequence 必须是整数'}, status=400)
+                    return
+                prompt_block = body.get('prompt_block', '')
+
+                import uuid
+                project_dir = _get_project_dir(title)
+                claim_id = f"adoptfix_{uuid.uuid4().hex}"
+                holder = claim_frame_run(project_dir, claim_id)
+                if holder:
+                    self._send_json({'status': 'error',
+                                     'message': '该创意的帧序列正在生成/修复中，请等它结束后再采用'},
+                                    status=409)
+                    return
+                try:
+                    from pipeline_orchestrator import adopt_rejected_fix
+                    result = adopt_rejected_fix(title, sequence, prompt_block)
+                finally:
+                    release_frame_run(project_dir, claim_id)
+
+                log('INFO', 'FRAMES',
+                    f"采用第 {sequence} 帧被门禁退回的修复版（{result.get('at')}）", title=title)
                 self._send_json({'status': 'ok', **result})
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
@@ -6017,13 +6073,18 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 task_id = f"videos_{uuid.uuid4().hex}"
 
                 cleanup_old_tasks()
-                is_chain_model = (
-                    'omni' in str(config.get('videoModel') or '').lower()
-                    or 'miniature' in str(config.get('skillProfile') or '').lower()
-                    or 'miniature' in str(config.get('videoModel') or '').lower()
-                    or bool(config.get('videoChainMode'))
-                )
+                # 多镜头包（omni / miniature）走链式生成：它们的 VIDEO 只上首帧，
+                # 后续槽位靠上一段的尾帧接力。判定必须走 active_skill_profile —— 它是
+                # 「本次请求该用哪个 profile」的唯一权威（SKILL_PROFILE 环境变量 >
+                # config.skillProfile > 按 videoModel 推断）。照 videoModel 的字面
+                # 自己再判一次，会漏掉「显式选了 omni、视频模型还是 Veo」这一档，
+                # 也会把显式选回 base 的人反手顶成链式。
+                is_chain_model = active_skill_profile(config) in ('omni', 'miniature')
                 target_worker = generate_video_chain_worker if is_chain_model else generate_videos_worker
+
+                get_or_create_task(task_id, {"type": "video_chain" if is_chain_model else "videos",
+                                             "theme": title, "project_key": project_key,
+                                             "userId": config.get('googleFxUserId') or None})
 
                 threading.Thread(
                     target=target_worker,

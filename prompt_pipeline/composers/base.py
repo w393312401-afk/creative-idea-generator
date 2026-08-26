@@ -234,6 +234,10 @@ Instructions:
   2. Ergonomic Prop Scale: In compact structures (diameter <= 3.5m), FORBID oversized residential furniture (e.g. two-tier bunk beds, large sectional sofas) that causes AI to hallucinate cavernous halls. Use compact ergonomic furniture (low-profile single platform daybed with under-bed storage, recessed berth, compact 80cm workbench).
   3. Camera Normalization: Default to 24mm wide-angle lens feel at 1.3m chest height, horizon/vanishing axis at 45%-50% frame height.
   4. Video Worker Scale Figure: VIDEO {i} must declare the worker's metric scale (e.g. 'one lone male worker, 1.78m tall, occupying ~35% of frame height, realistically proportioned to the 2.2m ceiling').
+- LIVING CAST & DYNAMIC WORKER CHOREOGRAPHY (P0):
+  1. Zero Frozen Figures: Never describe workers, figurines, characters, or animals as static, holding still, unmoving, or holding their previous posture (FORBIDDEN: 'remain standing', 'stay put', 'static in place', 'unchanged', 'standing still', 'holding position', 'where they were', 'same posture').
+  2. Action-Reaction Causal Chain: Every beat's VIDEO must describe active, continuous physical kinetic labor and bodily posture transitions from the starting image's pose to the resulting image's settled pose (e.g. Inception Reflex -> Active Tool/Hand Movement -> Settled Landing Posture).
+  3. Identity Locked vs Pose Decoupled: Restate their fixed identity, costume, and scale verbatim, but ensure their pose, action, and physical placement dynamically evolve across every single beat.
 - Output the prompts in the following format:
 ===VIDEO===
 <video prompt body>

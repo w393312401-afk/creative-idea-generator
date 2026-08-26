@@ -2452,6 +2452,14 @@ async function streamFramesProgress(taskId, ownerIdea, targetSequences) {
                     const mx = (data && data.max_attempts) || 1;
                     setMeta(`第 ${(data && data.beat) || 0} 拍检出结构级问题，正在自动修复（第 ${a}/${mx} 次）...`);
                     framesFeedLine(ownerId, `${(data && data.message) || '🔧 正在自动修复本帧'}`, 'warn');
+                } else if (type === 'chain_guard_autofix_rolled_back') {
+                    // 这一次自动修复被三联屏门禁退回了（画面已还原）。再修一次是拿同样
+                    // 的输入跑同样的结果，所以后端当场转停链——说清楚"还原了"和"修后
+                    // 那版留了档"，否则用户只会看到一次莫名其妙的停链。
+                    framesFeedLine(ownerId, `${(data && data.message) || '↩️ 自动修复被门禁退回，画面已还原'}`, 'warn');
+                    if (data && data.rejected_fix) {
+                        framesFeedLine(ownerId, '　修后那一版已留档：确认是门禁误判可在帧网格点「采用修后版」', 'warn');
+                    }
                 } else if (type === 'chain_guard_autofix_done') {
                     framesFeedLine(ownerId, `${(data && data.message) || '✅ 自动修复后复审通过，继续生成'}`, 'ok');
                 } else if (type === 'chain_guard_halt') {
@@ -4357,6 +4365,12 @@ async function mergeVideos(force = false) {
 
         const data = await response.json().catch(() => ({}));
 
+        // 合成门禁拦截：缺失/失败片段 → 给出「重试」「跳过缺口强制合并」两条出路
+        if (response.status === 409 && data.status === 'blocked') {
+            renderMergeBlocked(data);
+            return;
+        }
+
         if (!response.ok) {
             throw new Error(data.message || data.error || `HTTP ${response.status}`);
         }
@@ -4405,6 +4419,45 @@ async function mergeVideos(force = false) {
         mergeInFlight = false;
         updatePipelineBar();
     }
+}
+
+// 合成被门禁拦截时，在 videos-meta 区域渲染可操作面板：
+//   ① 重试缺失/失败片段并自动重合   ② 按当前所选速率跳过这些片段直接合并
+function renderMergeBlocked(data) {
+    const videosMeta = document.getElementById('videos-meta');
+    if (!videosMeta) return;
+
+    const missing = (data.missing || []).map(Number).filter(Number.isFinite);
+    const mismatched = (data.mismatched || []).map(Number).filter(Number.isFinite);
+    const all = [...new Set([...missing, ...mismatched])].sort((a, b) => a - b);
+
+    const parts = [];
+    if (missing.length) parts.push(`缺失/未生成：槽位 <b>${escapeHtml(missing.join(', '))}</b>`);
+    if (mismatched.length) parts.push(`疑似串片：槽位 <b>${escapeHtml(mismatched.join(', '))}</b>`);
+
+    videosMeta.innerHTML = `
+        <div class="merge-blocked" style="text-align:left; line-height:1.7;">
+            <div style="color:#f6c453; margin-bottom:8px;">⚠️ 视频片段不全，已拦截合并（避免成片缺失画面）：${parts.join('；')}。</div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <button type="button" class="action-btn text-btn" id="merge-retry-missing-btn">🔁 重试这些片段并合并 (${all.length})</button>
+                <button type="button" class="action-btn text-btn" id="merge-force-btn">⚡ 跳过缺口强制合并（${escapeHtml(mergeSpeedLabel())}）</button>
+            </div>
+        </div>`;
+
+    const retryBtn = document.getElementById('merge-retry-missing-btn');
+    if (retryBtn) retryBtn.addEventListener('click', () => {
+        if (typeof retryMissingVideos === 'function') {
+            retryMissingVideos(all);
+        } else {
+            showToast('重试功能不可用', 'error');
+        }
+    });
+
+    const forceBtn = document.getElementById('merge-force-btn');
+    if (forceBtn) forceBtn.addEventListener('click', async () => {
+        const ok = await customConfirm(`将跳过缺失的片段，把其余可用片段按原顺序直接拼接、以${mergeSpeedLabel()}合成（跳过处为硬切）。确定继续吗？`);
+        if (ok) mergeVideos(true);
+    });
 }
 
 

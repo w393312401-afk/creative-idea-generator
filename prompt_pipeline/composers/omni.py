@@ -709,7 +709,9 @@ def omni_video_violations(video_prompt, ladder=None, duration=None, skip_shot_li
         errors.append(
             OMNI_VIDEO_STYLE_PREFIX
             + "正文出现阿拉伯数字（" + ', '.join(stray)
-            + "）——必须使用纯自然语言，所有数字和计数一律写成英文单词"
+            + "）——必须使用纯自然语言，计数一律写成英文单词。"
+            + "IMAGE 编号（锚点引用）与紧贴单位的数字（14mm / 1.6m）不在此列，"
+            + "报出来的这几个不含那两类"
         )
 
     return errors

@@ -481,28 +481,47 @@ class TestRetryDirty:
 
 
 class TestMarqueeSelection:
-    def test_marquee_box_selects_intersected_cards(self, page):
-        """按住 Shift 框选或从网格间隙拖拽，应选中框内卡片并同步工具条。"""
-        # 获取第 1 张和第 2 张卡片的位置
-        box1 = page.eval_on_selector("#frame-slot-1", "el => { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; }")
-        box2 = page.eval_on_selector("#frame-slot-2", "el => { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; }")
+    def test_shift_drag_across_cards_selects_them(self, page):
+        """按住 Shift 并在卡片上方拖拽可框选多张卡片，且不会误开 Lightbox。"""
+        page.evaluate("() => { window.__lb = 0; window.openLightbox = () => window.__lb++; }")
 
-        # 按住 Shift 从卡片 1 拖拽到卡片 2
+        box1 = page.eval_on_selector("#frame-slot-1", "el => { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; }")
+        box3 = page.eval_on_selector("#frame-slot-3", "el => { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; }")
+
+        # 按住 Shift 从卡片 1 拖拽到卡片 3
         page.keyboard.down("Shift")
         page.mouse.move(box1["x"] + 5, box1["y"] + 5)
         page.mouse.down()
-        page.mouse.move(box2["x"] + box2["w"] - 5, box2["y"] + box2["h"] - 5)
+        page.mouse.move(box3["x"] + box3["w"] - 5, box3["y"] + box3["h"] - 5, steps=5)
         page.mouse.up()
         page.keyboard.up("Shift")
 
         selected = page.evaluate("() => Array.from(slotToolbarState.image.selected).sort((a, b) => a - b)")
-        assert 1 in selected and 2 in selected, "框选应包含槽位 1 和 2: %s" % selected
-        assert page.eval_on_selector("#frame-slot-1", "el => el.classList.contains('is-selected')")
-        assert page.eval_on_selector("#frame-slot-2", "el => el.classList.contains('is-selected')")
+        assert 1 in selected and 2 in selected and 3 in selected, "框选应包含槽位 1、2、3: %s" % selected
+        assert page.evaluate("() => window.__lb") == 0, "拖拽结束时不应误弹出 Lightbox"
+
+    def test_drag_starting_outside_grid_selects_cards(self, page):
+        """从卡片外围/顶部空白区域拖起，也能正常框选到卡片。"""
+        box1 = page.eval_on_selector("#frame-slot-1", "el => { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; }")
+        box2 = page.eval_on_selector("#frame-slot-2", "el => { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; }")
+
+        # 从卡片外围上方拖拽到卡片 2
+        page.mouse.move(box1["x"] - 20, box1["y"] - 15)
+        page.mouse.down()
+        page.mouse.move(box2["x"] + box2["w"] + 10, box2["y"] + box2["h"] + 10)
+        page.mouse.up()
+
+        selected = page.evaluate("() => Array.from(slotToolbarState.image.selected).sort((a, b) => a - b)")
+        assert 1 in selected and 2 in selected, "外围拖拽应框选到卡片 1 和 2: %s" % selected
+
+    def test_click_card_still_opens_lightbox(self, page):
+        """单纯点击卡片图片（未拖拽）应正常打开 Lightbox。"""
+        page.evaluate("() => { window.__lb = 0; window.openLightbox = () => window.__lb++; }")
+        page.eval_on_selector("#frame-slot-1 img", "el => el.click()")
+        assert page.evaluate("() => window.__lb") == 1, "单纯点击卡片图片应触发打开 Lightbox"
 
     def test_shift_drag_adds_to_existing_selection(self, page):
         """按住 Shift 框选可在已有选择基础上累加。"""
-        # 先选第 1 拍
         page.eval_on_selector("#frame-slot-1 .slot-select-box", "el => el.click()")
         assert page.evaluate("() => Array.from(slotToolbarState.image.selected)") == [1]
 
@@ -530,7 +549,6 @@ class TestMarqueeSelection:
 
     def test_shift_click_checkbox_selects_range(self, page):
         """Shift + 点击勾选框支持区间连选。"""
-        # 先点第 2 拍
         page.eval_on_selector("#frame-slot-2 .slot-select-box", "el => el.click()")
         assert page.evaluate("() => Array.from(slotToolbarState.image.selected)") == [2]
 

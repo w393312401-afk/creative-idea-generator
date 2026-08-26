@@ -126,6 +126,51 @@ class TestChainGuard(unittest.TestCase):
             self.assertEqual(frame2.get('flag_origin'), 'chain_guard')
             # 关键：绝不写 review_frames_sha256
             self.assertNotIn('review_frames_sha256', frame2)
+            # 结构化问题清单也要落盘：定向修复读的正是它。缺了就退化成"一条本地
+            # 问题、frames=[K]"，于是复核拿单张 K 去验一条"K-1 与 K 不一致"的判定
+            # ——单张图证否不了，复核必然落进"仍存在"。
+            issue = frame2['review_issues'][0]
+            self.assertEqual(issue['frames'], [1, 2])
+            self.assertEqual(issue['severity'], 'chain')
+            self.assertEqual(issue['beat'], 1)
+
+    def test_a_passing_recheck_takes_back_the_flag_it_had_set(self):
+        """autofix 的次序是「fix_frame_issue（末尾 _reverify 可能盖 flag）→ 守卫再判
+        一次」。守卫此前只在 halt 时写 gate，判过了什么都不写，于是那枚 flag 留在原地：
+        循环报「✅ 复审通过，继续往下生成」，manifest 上这一帧却永远是 flagged——
+        video_generator 的配对门禁认的正是这个字段。"""
+        for origin in ('chain_guard', 'fix_reverify'):
+            manifest = server_common.read_manifest(self.project_dir)
+            frame2 = next(f for f in manifest['frames'] if f['sequence'] == 2)
+            frame2.update(quality_gate='sequence_review_flagged', vlm_qa_reason='天花板结构坍塌',
+                          flag_origin=origin, review_issues=[{'text': '天花板结构坍塌'}])
+            server_common.write_manifest(self.project_dir, manifest)
+
+            with patch.object(cg, 'check_beat_consistency', return_value=[]):
+                res = cg.guard_beat({}, 'test_proj', self.prompt_block, 1, self.project_dir)
+            self.assertEqual(res['verdict'], 'pass')
+
+            frame2 = next(f for f in server_common.read_manifest(self.project_dir)['frames']
+                          if f['sequence'] == 2)
+            self.assertEqual(frame2['quality_gate'], 'pending_manual_review', origin)
+            self.assertIsNone(frame2['vlm_qa_reason'])
+            self.assertNotIn('flag_origin', frame2)
+            self.assertNotIn('review_issues', frame2)
+
+    def test_a_passing_recheck_never_touches_someone_elses_flag(self):
+        """只认自己人盖的记号：人工标记与整套一致性审查的结论一概不碰。"""
+        manifest = server_common.read_manifest(self.project_dir)
+        frame2 = next(f for f in manifest['frames'] if f['sequence'] == 2)
+        frame2.update(quality_gate='manual_flagged', manual_issue='门开反了')
+        server_common.write_manifest(self.project_dir, manifest)
+
+        with patch.object(cg, 'check_beat_consistency', return_value=[]):
+            cg.guard_beat({}, 'test_proj', self.prompt_block, 1, self.project_dir)
+
+        frame2 = next(f for f in server_common.read_manifest(self.project_dir)['frames']
+                      if f['sequence'] == 2)
+        self.assertEqual(frame2['quality_gate'], 'manual_flagged')
+        self.assertEqual(frame2['manual_issue'], '门开反了')
 
     def test_cosmetic_issue_does_not_halt(self):
         with patch.object(cg, 'check_beat_consistency', return_value=['微弱光比变化']), \
@@ -294,6 +339,8 @@ class TestChainGuard(unittest.TestCase):
         # 修了一次，且没连带重渲（下游此刻还不存在）
         self.assertEqual(fix_mock.call_count, 1)
         self.assertFalse(fix_mock.call_args.kwargs.get('cascade_downstream'))
+        # 重渲内部不再重复审这一拍：紧接着的那次 guard_beat 就是它的复审
+        self.assertTrue(fix_mock.call_args.kwargs.get('suppress_chain_guard'))
         # 改写后的提示词正文回传给调用方，但**不落盘**
         self.assertIn('IMAGE 9: fixed', manifest.get('prompt_block') or '')
         self.assertNotIn('prompt_block', server_common.read_manifest(self.project_dir))
@@ -319,6 +366,26 @@ class TestChainGuard(unittest.TestCase):
         self.assertEqual(len(halts), 1)
         self.assertTrue(halts[0]['autofix_exhausted'])
         self.assertNotIn('chain_guard_autofix_done', [e for e, _ in events])
+
+    def test_autofix_stops_when_the_triptych_gate_rolls_the_fix_back(self):
+        """门禁判这次修复把画面改坏了 → 已自动退回上一版，帧图与提示词都回到修复前。
+        再修一次是拿同样的输入跑同样的结果，每一轮还要白烧一整套守卫复审。当场转停链，
+        让人来看——修后那一版留了档，门禁误判的话可以「采用修后版」。"""
+        def fake_guard(config, title, pb, beat, project_dir, on_progress=None, allow_halt=True):
+            return self._guard_result(beat, allow_halt)
+
+        def fake_fix(config, title, pb, seq, on_progress=None, cascade_downstream=False, **kw):
+            return {'prompt_block': pb, 'reason': 'r', 'reverify': None, 'undoable': False,
+                    'rolled_back': True, 'rejected_fix': {'at': 'T'},
+                    'triptych': {'verdict': 'regressed'}}
+
+        manifest, events, _guard, fix_mock = self._autofix_env(fake_guard, fake_fix)
+
+        self.assertEqual(fix_mock.call_count, 1, '回滚即止，不把上限烧完')
+        self.assertEqual(manifest.get('halted_at_beat'), 1)
+        self.assertIn('chain_guard_autofix_rolled_back', [e for e, _ in events])
+        self.assertNotIn('chain_guard_autofix_done', [e for e, _ in events])
+        self.assertFalse(os.path.exists(os.path.join(self.frames_dir, 'img_003.webp')))
 
     def test_autofix_failure_halts_instead_of_rendering_on_a_known_bad_frame(self):
         """修复本身没跑成（网关异常）≠ 这帧没问题：必须停链，不能带着已知坏图往下渲。"""

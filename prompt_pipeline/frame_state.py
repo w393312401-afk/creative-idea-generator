@@ -14,7 +14,7 @@ from typing import Any
 from .scene_state import PERSISTENT_STRUCTURAL_CUES, scrub_planning_annotations
 
 
-TRANSITION_OPERATIONS = {"threshold", "reward", "reframe"}
+TRANSITION_OPERATIONS = {"threshold", "reward", "reframe", "reveal"}
 
 # cast_action 是**一拍**的身体动线，写的是「先 A、然后 B」（'stands atop ladder grinding
 # overhead beams, then crouches grinding floor grid welds'）。VIDEO 要的就是这条动线，
@@ -148,7 +148,12 @@ def build_frame_state_contract(beat_ladder: list[dict[str, Any]]) -> list[dict[s
             "persistent_traces": [_text(x) for x in (beat.get("persistent_traces") or []) if _text(x)],
             "phase": _phase(beat),
             "transition": bool(
-                op in TRANSITION_OPERATIONS or beat.get("bridge_stage") or beat.get("hard_cut")
+                op in TRANSITION_OPERATIONS
+                or beat.get("stage") in ("transition", "threshold", "reveal")
+                or beat.get("bridge_stage")
+                or beat.get("hard_cut")
+                or "reveal" in op
+                or "reward" in op
             ),
         })
     return contracts
@@ -190,7 +195,12 @@ def build_space_state_ledger(beat_ladder: list[dict[str, Any]]) -> dict[str, lis
         if not isinstance(beat, dict):
             continue
         op = _text(beat.get("operation")).lower()
-        if op in TRANSITION_OPERATIONS or beat.get("bridge_stage") or beat.get("hard_cut"):
+        if (op in TRANSITION_OPERATIONS
+                or beat.get("stage") in ("transition", "threshold", "reveal")
+                or beat.get("bridge_stage")
+                or beat.get("hard_cut")
+                or "reveal" in op
+                or "reward" in op):
             continue
         after = _completed_phrases(beat.get("after_state"))
         if not after:
@@ -386,7 +396,12 @@ def compile_delta_image_prompt(
     if not isinstance(beat, dict):
         return _text(original)
     op = _text(beat.get("operation")).lower()
-    if op in TRANSITION_OPERATIONS or beat.get("bridge_stage") or beat.get("hard_cut"):
+    if (op in TRANSITION_OPERATIONS
+            or beat.get("stage") in ("transition", "threshold", "reveal")
+            or beat.get("bridge_stage")
+            or beat.get("hard_cut")
+            or "reveal" in op
+            or "reward" in op):
         return _text(original)
     required = ("milestone_name", "after_state", "completion_extent", "preserve_state")
     if any(not _text(beat.get(field)) for field in required):

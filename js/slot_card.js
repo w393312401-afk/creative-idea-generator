@@ -212,6 +212,7 @@ const SLOT_ACTION_HANDLERS = {
         return fixFrameIssue(seq, undefined, cascade);
     },
     'undo-fix': seq => undoFrameFix(seq),
+    'adopt-fix': seq => adoptRejectedFix(seq),
     'describe-frame': seq => describeFrameIssue(seq, currentFrameManualIssue(seq)),
     'view-candidates': seq => {
         if (typeof openCandidateSelectionModal === 'function') {

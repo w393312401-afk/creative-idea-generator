@@ -460,6 +460,11 @@ function enableVideoSlotDnd(card, slotNum) {
     const slot = Number(slotNum);
 
     card.addEventListener('dragstart', (e) => {
+        // 当按住 Shift/Ctrl/Meta 修饰键时，将操作让位给框选多选；无修饰键时默认直接拖拽换位
+        if (e.shiftKey || e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            return false;
+        }
         if (!e.dataTransfer || !card.dataset.url) return;
         e.dataTransfer.effectAllowed = 'copyMove';
         e.dataTransfer.setData(VIDEO_SLOT_DND_MIME, String(slot));
@@ -504,6 +509,11 @@ function enableFrameSlotDnd(card, seq) {
     // 拖出：有图的帧格既能拖到别的格子换位，也能直接拖到 Finder/桌面导出这张图
     // （DownloadURL 是 Chromium 系的扩展，其它浏览器忽略它、换位照常工作）。
     card.addEventListener('dragstart', (e) => {
+        // 当按住 Shift/Ctrl/Meta 修饰键时，将操作让位给框选多选；无修饰键时默认直接拖拽换位
+        if (e.shiftKey || e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            return false;
+        }
         const imgUrl = card.dataset.url;
         if (!e.dataTransfer || !imgUrl) return;
         e.dataTransfer.effectAllowed = 'copyMove';
