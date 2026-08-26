@@ -405,6 +405,12 @@ function showPromptLinterModal(opts) {
     };
 
     modal.querySelector('.linter-close-btn').addEventListener('click', close);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) {
+            close();
+            if (onEdit) onEdit();
+        }
+    });
     modal.querySelector('.linter-cancel-btn').addEventListener('click', () => {
         close();
         if (onEdit) onEdit();

@@ -363,10 +363,32 @@
                   <button class="fx-button" id="fx-import-profiles" type="button">导入全部</button>
                 </div>
               </div>
+              <div id="fx-account-bulk-bar" class="fx-bulk-bar" style="display:none; align-items:center; gap:8px; padding:8px 12px; margin:0 0 10px 0; background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.25); border-radius:6px; flex-wrap:wrap;">
+                <span id="fx-account-bulk-count" style="font-size:12px; font-weight:600; color:var(--primary, #3b82f6);">已选 0 项</span>
+                <button class="fx-button" id="fx-account-bulk-priority" type="button">⭐ 设为优先</button>
+                <button class="fx-button" id="fx-account-bulk-unpriority" type="button">☆ 取消优先</button>
+                <button class="fx-button" id="fx-account-bulk-expires" type="button">📅 设置重置日期</button>
+                <button class="fx-button" id="fx-account-bulk-enable" type="button">✅ 批量启用</button>
+                <button class="fx-button" id="fx-account-bulk-disable" type="button">🚫 批量禁用</button>
+                <button class="fx-button" id="fx-account-bulk-password" type="button">🔑 批量设置密码</button>
+                <button class="fx-button" id="fx-account-bulk-refresh" type="button">🔎 批量刷新积分</button>
+                <button class="fx-button" id="fx-account-bulk-close" type="button">🛑 批量关闭</button>
+                <button class="fx-button fx-button-danger" id="fx-account-bulk-delete" type="button">🗑️ 批量移除</button>
+                <button class="fx-button" id="fx-account-bulk-clear" type="button">取消选择</button>
+              </div>
               <div class="fx-table-wrap">
                 <table class="fx-table">
-                  <thead><tr><th>账号</th><th class="fx-sortable-th" data-sort-key="credit" style="cursor:pointer;" title="点击按积分排序">积分 <span id="fx-th-sort-credit">↕</span></th><th class="fx-sortable-th" data-sort-key="tasks" style="cursor:pointer;" title="点击按任务数排序">任务数 (图/视) <span id="fx-th-sort-tasks">↕</span></th><th>状态</th><th>最后探测</th><th>操作</th></tr></thead>
-                  <tbody id="fx-account-table-body"><tr><td colspan="6" class="fx-empty">正在读取号池…</td></tr></tbody>
+                  <thead><tr>
+                    <th style="width:36px; text-align:center;"><input type="checkbox" id="fx-account-select-all" title="全选/取消全选" style="cursor:pointer;"></th>
+                    <th style="width:48px; text-align:center;">序号</th>
+                    <th>账号</th>
+                    <th class="fx-sortable-th" data-sort-key="credit" style="cursor:pointer;" title="点击按积分排序">积分 <span id="fx-th-sort-credit">↕</span></th>
+                    <th class="fx-sortable-th" data-sort-key="tasks" style="cursor:pointer;" title="点击按任务数排序">任务数 (图/视) <span id="fx-th-sort-tasks">↕</span></th>
+                    <th>状态</th>
+                    <th>最后探测</th>
+                    <th>操作</th>
+                  </tr></thead>
+                  <tbody id="fx-account-table-body"><tr><td colspan="8" class="fx-empty">正在读取号池…</td></tr></tbody>
                 </table>
               </div>
             </article>

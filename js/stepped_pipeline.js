@@ -235,9 +235,9 @@ function renderSteppedReviewPanel(container, state) {
         container.innerHTML = `
             <div class="review-panel-glass anchor-review-panel stepped-review-container">
                 <div class="review-header">
-                    <h3 class="review-title">审核锚点帧</h3>
+                    <h3 class="review-title">审核锚点帧 (Frame 1)</h3>
                 </div>
-                <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null">
+                <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null" title="点击单独放大查看锚点帧">
                     <img src="${imgUrl}" alt="Anchor Frame" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiPjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNlZWVlZWUiLz48dGV4dCB4PSI1MCUiIHk9IjUwJSIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMjAiIGZpbGw9IiM5OTk5OTkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIuM2VtIj5JbWFnZSBOb3QgRm91bmQ8L3RleHQ+PC9zdmc+'" />
                 </div>
                 <div class="review-actions">
@@ -259,12 +259,13 @@ function renderSteppedReviewPanel(container, state) {
         container.innerHTML = `
             <div class="review-panel-glass batch-review-panel stepped-review-container">
                 <div class="review-header">
-                    <h3 class="review-title">批次审核</h3>
+                    <h3 class="review-title">批次审核 · 多宫格与单帧检视</h3>
                     <div class="batch-counter-badge">批次 ${currentBatch + 1}/${totalBatches}</div>
                 </div>
-                <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null">
+                <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null" title="点击放大多宫格拼图大图">
                     <img src="${imgUrl}" alt="Batch Collage" />
                 </div>
+                ${renderSteppedBatchFrameThumbsHtml(state, batchInfo)}
                 <div class="review-actions">
                     <button class="review-btn review-btn-approve" onclick="onSteppedApprove()">
                         ✅ Approve (通过)
@@ -283,11 +284,12 @@ function renderSteppedReviewPanel(container, state) {
         container.innerHTML = `
             <div class="review-panel-glass final-review-panel stepped-review-container">
                 <div class="review-header">
-                    <h3 class="review-title">最终审查</h3>
+                    <h3 class="review-title">最终审查 · 全局连贯性与单帧快检</h3>
                 </div>
-                <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null">
+                <div class="review-image-wrapper" onclick="typeof openLightbox === 'function' ? openLightbox('${imgUrl}') : null" title="点击放大完整 5 列多宫格大图">
                     <img src="${imgUrl}" alt="Final Collage" />
                 </div>
+                ${renderSteppedFinalAllFramesThumbsHtml(state)}
                 <div class="review-actions">
                     <button class="review-btn review-btn-approve" onclick="onSteppedApprove()">
                         ✅ Approve (生成视频)
@@ -322,6 +324,78 @@ function renderSteppedLoading(container, text) {
             </div>
         </div>
     `;
+}
+
+function renderSteppedBatchFrameThumbsHtml(state, batchInfo) {
+    const sequences = batchInfo && Array.isArray(batchInfo.sequences) ? batchInfo.sequences : [];
+    if (!sequences.length) return '';
+    const title = state.title || '';
+    const safeTitle = typeof escapeHtml === 'function' ? escapeHtml(title) : title;
+    
+    return `
+        <div class="stepped-batch-frame-section">
+            <div class="stepped-batch-frame-title">📸 批次单帧明细 (共 ${sequences.length} 帧 · 点击任一帧可单独放大)：</div>
+            <div class="stepped-batch-frame-strip">
+                ${sequences.map((seq, idx) => {
+                    const frameUrl = steppedImageUrl(`/outputs/${title}/frames/img_${String(seq).padStart(3, '0')}.webp`);
+                    return `
+                        <div class="stepped-frame-thumb-card" onclick="openSteppedSequencesLightbox('${safeTitle}', ${JSON.stringify(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 帧">
+                            <div class="stepped-frame-thumb-box">
+                                <img src="${frameUrl}" alt="Frame ${seq}" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiPjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiMyMjIiLz48dGV4dCB4PSI1MCUiIHk9IjUwJSIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMTQiIGZpbGw9IiM4ODgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIuM2VtIj5JTUcg${seq}</dGV4dD48L3N2Zz4='" />
+                                <span class="stepped-frame-zoom-tag">🔍</span>
+                            </div>
+                            <span class="stepped-frame-seq-name">IMG ${String(seq).padStart(3, '0')}</span>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        </div>
+    `;
+}
+
+function renderSteppedFinalAllFramesThumbsHtml(state) {
+    const batches = state.batches || [];
+    let sequences = [];
+    batches.forEach(b => {
+        if (Array.isArray(b.sequences)) sequences.push(...b.sequences);
+    });
+    // 去重并升序排序
+    sequences = Array.from(new Set(sequences)).sort((a, b) => a - b);
+    if (!sequences.length) return '';
+    const title = state.title || '';
+    const safeTitle = typeof escapeHtml === 'function' ? escapeHtml(title) : title;
+    
+    return `
+        <div class="stepped-batch-frame-section">
+            <div class="stepped-batch-frame-title">📸 全套关键帧单帧列表 (共 ${sequences.length} 帧 · 点击任一帧可单独放大)：</div>
+            <div class="stepped-batch-frame-strip">
+                ${sequences.map((seq, idx) => {
+                    const frameUrl = steppedImageUrl(`/outputs/${title}/frames/img_${String(seq).padStart(3, '0')}.webp`);
+                    return `
+                        <div class="stepped-frame-thumb-card" onclick="openSteppedSequencesLightbox('${safeTitle}', ${JSON.stringify(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 帧">
+                            <div class="stepped-frame-thumb-box">
+                                <img src="${frameUrl}" alt="Frame ${seq}" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiPjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiMyMjIiLz48dGV4dCB4PSI1MCUiIHk9IjUwJSIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMTQiIGZpbGw9IiM4ODgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIuM2VtIj5JTUcg${seq}</dGV4dD48L3N2Zz4='" />
+                                <span class="stepped-frame-zoom-tag">🔍</span>
+                            </div>
+                            <span class="stepped-frame-seq-name">IMG ${String(seq).padStart(3, '0')}</span>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        </div>
+    `;
+}
+
+function openSteppedSequencesLightbox(title, sequences, activeIdx = 0) {
+    if (!sequences || !sequences.length) return;
+    const items = sequences.map((seq, i) => ({
+        type: 'image',
+        url: steppedImageUrl(`/outputs/${title}/frames/img_${String(seq).padStart(3, '0')}.webp`),
+        caption: `<strong>第 ${seq} 拍关键帧 (IMG ${String(seq).padStart(3, '0')})</strong> [${i + 1}/${sequences.length}] · ${title}`
+    }));
+    if (typeof openLightbox === 'function') {
+        openLightbox(items, activeIdx);
+    }
 }
 
 /* --- Button Click Handlers --- */

@@ -590,6 +590,9 @@ function openPromptImportDialog() {
 
     modal.querySelector('.close-btn').addEventListener('click', close);
     modal.querySelector('.cancel-btn').addEventListener('click', close);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) close();
+    });
     modal.querySelector('.confirm-btn').addEventListener('click', async () => {
         const raw = textarea.value;
         if (!raw.trim()) {

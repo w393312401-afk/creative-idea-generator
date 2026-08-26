@@ -60,6 +60,15 @@ FX_CONFIG_SPEC = {
         'type': 'integer', 'min': 0, 'max': 100000, 'default': 15, 'hot': True,
         'group': '号池', 'label': '选号最低积分（低于此值自动禁用）',
     },
+    'googleFxAccountStrategy': {
+        'type': 'enum', 'options': ['credit_desc', 'expiration_asc', 'rotation'],
+        'default': 'credit_desc', 'hot': True, 'group': '号池',
+        'label': '选号调度策略（积分最多 / 重置日期最早 / 均衡轮替）',
+    },
+    'googleFxPriorityUserIds': {
+        'type': 'account_list', 'default': [], 'hot': True, 'group': '号池',
+        'label': '优先级浏览器实例（多选，留空=全池）',
+    },
     # 'account' 类型的候选项来自号池（前端用 /api/account-pool 的结果渲染下拉），
     # 不写进 spec 的 options：号池是会变的运行时数据，固化进配置 schema 只会过期。
     'googleFxSequenceUserId': {
@@ -199,6 +208,17 @@ def validate_patch(patch):
             value = str(value or '').strip()
             if len(value) > 64:
                 raise ValueError(f'{key} 不是合法的 AdsPower 环境编号')
+        elif spec['type'] == 'account_list':
+            if isinstance(value, str):
+                items = [u.strip() for u in value.split(',') if u.strip()]
+            elif isinstance(value, (list, tuple, set)):
+                items = [str(u).strip() for u in value if str(u).strip()]
+            else:
+                items = []
+            for item in items:
+                if len(item) > 64:
+                    raise ValueError(f'{key} 包含非法的 AdsPower 环境 ID: {item}')
+            value = items
         elif value not in spec['options']:
             raise ValueError(f'{key} 不是允许的选项')
         clean[key] = value

@@ -891,6 +891,21 @@ function setupEventListeners() {
         updateLogsSizeInfo();
     });
     closeSettings.addEventListener('click', () => settingsModal.classList.remove('active'));
+    settingsModal.addEventListener('click', (e) => {
+        if (e.target === settingsModal) settingsModal.classList.remove('active');
+    });
+
+    // 点击半透明空白背景区域关闭弹窗（全局支持所有 .modal 容器）
+    document.addEventListener('click', (e) => {
+        if (e.target && e.target.classList && e.target.classList.contains('modal') && e.target.classList.contains('active')) {
+            const closeBtn = e.target.querySelector('.close-btn') || e.target.querySelector('.cancel-btn');
+            if (closeBtn) {
+                closeBtn.click();
+            } else {
+                e.target.classList.remove('active');
+            }
+        }
+    });
     
     // （API Key 输入框与可见性切换按钮已随死配置一并移除：托管模式密钥在服务端）
 

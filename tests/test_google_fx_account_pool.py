@@ -16,6 +16,8 @@ from integrations.google_fx.utils import account_pool as ap
 def isolated_state_file(tmp_path, monkeypatch):
     state_file = tmp_path / "account_pool.json"
     monkeypatch.setattr(ap, "_STATE_FILE", state_file)
+    from integrations.google_fx.utils import account_credentials as creds
+    monkeypatch.setattr(creds, "_STATE_FILE", tmp_path / "account_credentials.json")
     yield state_file
 
 

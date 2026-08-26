@@ -576,33 +576,77 @@ html[data-theme="dark"] .task-status-badge.completed {
     white-space: nowrap;
 }
 
-#trend-refs-manage-modal .ledger-tool-btn {
+.ledger-tool-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
     background: rgba(var(--ink-rgb), 0.04);
     border: 1px solid var(--border-color);
     border-radius: 8px;
-    color: var(--text-secondary);
+    color: var(--text-primary);
+    font-family: inherit;
     font-size: 12px;
     font-weight: 600;
     padding: 6px 12px;
     cursor: pointer;
-    transition: var(--transition-fast);
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
     white-space: nowrap;
+    user-select: none;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
 }
 
-#trend-refs-manage-modal .ledger-tool-btn:hover:not(:disabled) {
-    color: var(--neon-cyan);
-    border-color: rgba(176, 123, 82, 0.35);
+.ledger-tool-btn:hover:not(:disabled) {
+    color: var(--text-primary);
+    border-color: var(--border-glow, rgba(214, 154, 85, 0.45));
+    background: rgba(var(--ink-rgb), 0.08);
+    transform: translateY(-1px);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
 }
 
-#trend-refs-manage-modal .ledger-tool-btn.danger:hover:not(:disabled) {
-    color: #f87171;
-    border-color: rgba(239, 68, 68, 0.4);
-    background: rgba(239, 68, 68, 0.06);
+.ledger-tool-btn:active:not(:disabled) {
+    transform: translateY(0);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
 }
 
-#trend-refs-manage-modal .ledger-tool-btn:disabled {
+.ledger-tool-btn.active {
+    background: var(--primary-glow, rgba(214, 154, 85, 0.2));
+    border-color: var(--primary, #D69A55);
+    color: var(--primary, #D69A55);
+}
+
+.ledger-tool-btn.primary {
+    background: linear-gradient(135deg, rgba(214, 154, 85, 0.22), rgba(176, 123, 82, 0.12));
+    border-color: var(--primary, #D69A55);
+    color: var(--primary, #D69A55);
+    font-weight: 600;
+}
+
+.ledger-tool-btn.primary:hover:not(:disabled) {
+    background: var(--primary, #D69A55);
+    color: #ffffff;
+    border-color: var(--primary, #D69A55);
+    box-shadow: 0 3px 10px var(--primary-glow, rgba(214, 154, 85, 0.35));
+}
+
+.ledger-tool-btn.danger {
+    color: var(--color-danger, #ef4444);
+    border-color: rgba(239, 68, 68, 0.25);
+    background: rgba(239, 68, 68, 0.05);
+}
+
+.ledger-tool-btn.danger:hover:not(:disabled) {
+    color: #ffffff;
+    border-color: #ef4444;
+    background: #ef4444;
+    box-shadow: 0 2px 8px rgba(239, 68, 68, 0.35);
+}
+
+.ledger-tool-btn:disabled {
     opacity: 0.45;
     cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
 }
 
 #trend-refs-manage-modal .ledger-bulk-bar {
@@ -2296,8 +2340,353 @@ body.log-expanded .log-pill {
 }
 
 /* ── 视频生成号池管理 ──────────────────────────────────────────
-   规模小（几个账号），复用 trend-ref 的颜色令牌保持视觉一致，但不需要
-   那套搜索/排序/批量选择的复杂结构，就是简单的行列表。 */
+   生成号池 UI：工具栏、多选批量操作条、账号卡片、微型按键与底部添加栏。 */
+.account-pool-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+}
+
+.account-pool-toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.account-pool-toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-muted);
+    flex-wrap: wrap;
+}
+
+/* ── 概览统计条 ──────────────────────────────────────────────
+   每一格既是仪表也是筛选器：显示这一类账号有几个，点一下只看这一类，
+   再点一次退回全部。选中态用左侧色条 + 描边表示，颜色跟卡片上的
+   徽章语义对齐（绿=可用、黄=需处理、红=缺凭据）。 */
+.account-pool-stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 10px;
+}
+
+.account-pool-stat-tile {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 96px;
+    padding: 7px 12px;
+    border: 1px solid var(--border-color);
+    border-left: 3px solid var(--border-color);
+    border-radius: 10px;
+    background: rgba(var(--ink-rgb), 0.03);
+    color: var(--text-primary);
+    font-family: inherit;
+    cursor: pointer;
+    text-align: left;
+    transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.account-pool-stat-tile:hover:not(.is-static) {
+    background: rgba(var(--ink-rgb), 0.07);
+    transform: translateY(-1px);
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.08);
+}
+
+.account-pool-stat-tile.is-static {
+    cursor: default;
+}
+
+.account-pool-stat-tile.is-zero {
+    opacity: 0.5;
+}
+
+.account-pool-stat-tile.is-zero:hover {
+    opacity: 0.85;
+}
+
+.account-pool-stat-tile .stat-icon {
+    font-size: 15px;
+    line-height: 1;
+}
+
+.account-pool-stat-tile .stat-body {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    line-height: 1.1;
+}
+
+.account-pool-stat-tile .stat-value {
+    font-size: 16px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.account-pool-stat-tile .stat-label {
+    font-size: 10.5px;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+/* 语义色：只染左色条与数字，底色留给"选中"用，避免整条统计条花掉 */
+.account-pool-stat-tile.tone-good { border-left-color: #22c55e; }
+.account-pool-stat-tile.tone-good .stat-value { color: #16a34a; }
+.account-pool-stat-tile.tone-warn { border-left-color: #f59e0b; }
+.account-pool-stat-tile.tone-warn .stat-value { color: #d97706; }
+.account-pool-stat-tile.tone-danger { border-left-color: #ef4444; }
+.account-pool-stat-tile.tone-danger .stat-value { color: #dc2626; }
+.account-pool-stat-tile.tone-primary { border-left-color: #eab308; }
+.account-pool-stat-tile.tone-primary .stat-value { color: #ca8a04; }
+.account-pool-stat-tile.tone-credit { border-left-color: var(--primary, #D69A55); }
+.account-pool-stat-tile.tone-credit .stat-value { color: var(--primary, #D69A55); }
+.account-pool-stat-tile.tone-muted .stat-value { color: var(--text-muted); }
+
+html[data-theme="dark"] .account-pool-stat-tile.tone-good .stat-value { color: #4ade80; }
+html[data-theme="dark"] .account-pool-stat-tile.tone-warn .stat-value { color: #fbbf24; }
+html[data-theme="dark"] .account-pool-stat-tile.tone-danger .stat-value { color: #fca5a5; }
+html[data-theme="dark"] .account-pool-stat-tile.tone-primary .stat-value { color: #eab308; }
+
+.account-pool-stat-tile.active {
+    background: var(--primary-glow, rgba(214, 154, 85, 0.16));
+    border-color: var(--primary, #D69A55);
+    box-shadow: 0 0 0 1px var(--primary-glow, rgba(214, 154, 85, 0.3));
+    opacity: 1;
+}
+
+.account-pool-stat-tile.active .stat-label {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+/* ── 搜索框 ────────────────────────────────────────────────── */
+.account-pool-search-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    flex: 1 1 220px;
+    max-width: 300px;
+}
+
+.account-pool-search-icon {
+    position: absolute;
+    left: 9px;
+    font-size: 12px;
+    opacity: 0.65;
+    pointer-events: none;
+}
+
+.account-pool-search-input {
+    width: 100%;
+    height: 32px;
+    padding: 0 28px 0 28px;
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+    background: rgba(var(--ink-rgb), 0.03);
+    color: var(--text-primary);
+    font-size: 12px;
+    font-family: inherit;
+    outline: none;
+    transition: var(--transition-fast);
+}
+
+.account-pool-search-input::-webkit-search-cancel-button {
+    display: none; /* 用自己的 ✕，浏览器原生那个在深色底上看不见 */
+}
+
+.account-pool-search-input:focus {
+    border-color: var(--primary, #D69A55);
+    background: rgba(var(--ink-rgb), 0.06);
+    box-shadow: 0 0 0 2px var(--primary-glow, rgba(214, 154, 85, 0.2));
+}
+
+.account-pool-search-wrap.has-value .account-pool-search-input {
+    border-color: var(--primary, #D69A55);
+}
+
+.account-pool-search-clear {
+    position: absolute;
+    right: 6px;
+    width: 18px;
+    height: 18px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 50%;
+    background: rgba(var(--ink-rgb), 0.12);
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1;
+    cursor: pointer;
+    font-family: inherit;
+}
+
+.account-pool-search-clear:hover {
+    background: var(--primary, #D69A55);
+    color: #fff;
+}
+
+/* ── 添加 / 导入导出折叠面板 ─────────────────────────────────── */
+.account-pool-add-panel {
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: rgba(var(--ink-rgb), 0.025);
+    flex-shrink: 0;
+}
+
+.account-pool-add-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 9px 14px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-primary);
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+    border-radius: 10px;
+}
+
+.account-pool-add-summary::-webkit-details-marker {
+    display: none;
+}
+
+.account-pool-add-summary:hover {
+    background: rgba(var(--ink-rgb), 0.05);
+}
+
+.account-pool-add-summary-hint {
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--text-muted);
+}
+
+.account-pool-add-panel[open] > .account-pool-add-summary {
+    border-bottom: 1px solid var(--border-color);
+    border-radius: 10px 10px 0 0;
+    color: var(--primary, #D69A55);
+}
+
+/* 折叠提示文案由 CSS 出，省得再写一段 JS 去同步 open 状态 */
+.account-pool-add-summary-hint::after {
+    content: '点击展开';
+}
+
+.account-pool-add-panel[open] .account-pool-add-summary-hint::after {
+    content: '点击收起';
+}
+
+.account-pool-add-panel > .account-pool-bulk-row,
+.account-pool-add-panel > .account-pool-add-row,
+.account-pool-add-panel > .settings-inline-note {
+    padding-left: 14px;
+    padding-right: 14px;
+}
+
+.account-pool-add-panel > .account-pool-bulk-row {
+    padding-top: 12px;
+}
+
+.account-pool-add-panel > .settings-inline-note {
+    padding-bottom: 12px;
+}
+
+/* 批量条钉在列表顶部：选完往下滚时按钮不会跟着滚走 */
+.account-pool-bulk-title {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--primary, #D69A55);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+/* 视图切换分段控件 (列表 / 网格) */
+.account-pool-view-switcher {
+    display: inline-flex;
+    align-items: center;
+    background: rgba(var(--ink-rgb), 0.05);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 2px;
+    gap: 2px;
+}
+
+.account-pool-view-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 26px;
+    padding: 0 10px;
+    font-size: 11.5px;
+    font-weight: 500;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+    user-select: none;
+    font-family: inherit;
+}
+
+.account-pool-view-btn:hover {
+    color: var(--text-primary);
+    background: rgba(var(--ink-rgb), 0.06);
+}
+
+.account-pool-view-btn.active {
+    background: var(--bg-panel-solid, rgba(var(--ink-rgb), 0.12));
+    color: var(--primary, #D69A55);
+    font-weight: 600;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
+}
+
+html[data-theme="dark"] .account-pool-view-btn.active {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--primary, #D69A55);
+}
+
+.account-pool-bulk-count {
+    font-size: 12px;
+    color: var(--primary, #D69A55);
+    font-weight: 600;
+    white-space: nowrap;
+    padding: 3px 9px;
+    background: var(--primary-glow, rgba(214, 154, 85, 0.16));
+    border: 1px solid var(--border-glow, rgba(214, 154, 85, 0.3));
+    border-radius: 12px;
+}
+
+.account-pool-bulk-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 12px;
+    background: rgba(var(--ink-rgb), 0.035);
+    border: 1px solid var(--border-glow, rgba(214, 154, 85, 0.35));
+    border-radius: 9px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+}
+
+.account-pool-bulk-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
 .account-pool-sort-row {
     display: flex;
     align-items: center;
@@ -2305,43 +2694,577 @@ body.log-expanded .log-pill {
     gap: 8px;
     margin-bottom: 10px;
     font-size: 12px;
-    color: var(--text-muted, #888);
+    color: var(--text-muted);
 }
 
 .account-pool-sort-select {
-    padding: 4px 8px;
-    border-radius: 6px;
-    border: 1px solid rgba(var(--ink-rgb), 0.15);
-    background: rgba(var(--ink-rgb), 0.04);
-    color: var(--text-main, #333);
+    height: 32px;
+    padding: 0 10px;
+    border-radius: 7px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-card, rgba(var(--ink-rgb), 0.04));
+    color: var(--text-primary);
     font-size: 12px;
+    font-family: inherit;
     outline: none;
     cursor: pointer;
+    transition: var(--transition-fast);
 }
 
 .account-pool-sort-select:focus {
-    border-color: var(--primary, #4a90e2);
+    border-color: var(--primary, #D69A55);
+    box-shadow: 0 0 0 2px var(--primary-glow, rgba(214, 154, 85, 0.2));
 }
 
+.account-pool-sort-select option {
+    background: var(--bg-panel-solid, #221B14);
+    color: var(--text-primary, #ECE4D7);
+}
+
+/* ── 列表视图容器 ── */
+/* 声明成容器查询的容器：号池列表的可用宽度取决于配置中心右栏，跟视口宽度
+   没关系（视口很宽、右栏很窄是常态，浏览器放大后更是如此），所以窄栏布局
+   得按容器自身宽度切，@media 在这里量错了对象。 */
 .account-pool-list {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 8px;
     margin-bottom: 14px;
+    container-type: inline-size;
+    container-name: pool-list;
 }
 
+/* ── 列表行 (Row View) ── */
+/* 列表行：flex 但允许换行。不允许换行时，右边那组操作按钮（flex-shrink:0，
+   六个按钮加起来是死宽度）会先占满，主体 .account-pool-main 是 flex:1
+   也就是 basis 0，只能捡剩下的——窄栏或大字号下就被挤成几十像素，
+   徽章一个一行地竖排、输入框宽度归零、按钮压到徽章上面。 */
 .account-pool-row {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 8px 10px;
-    border: 1px solid rgba(var(--ink-rgb), 0.1);
-    border-radius: 8px;
-    background: rgba(var(--ink-rgb), 0.02);
+    flex-wrap: wrap;
+    gap: 8px 10px;
+    padding: 9px 12px;
+    border: 1px solid var(--border-color);
+    border-left: 3px solid var(--border-color);
+    border-radius: 10px;
+    background: rgba(var(--ink-rgb), 0.025);
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 左侧状态色条：跟顶部统计条同一套口径（红=缺凭据、黄=需处理、
+   灰=已禁用、绿=可用），扫一眼就知道哪几行要管。 */
+.account-pool-row.tone-good,
+.account-pool-card.tone-good { border-left-color: rgba(34, 197, 94, 0.6); }
+.account-pool-row.tone-warn,
+.account-pool-card.tone-warn { border-left-color: rgba(245, 158, 11, 0.75); }
+.account-pool-row.tone-danger,
+.account-pool-card.tone-danger { border-left-color: rgba(239, 68, 68, 0.75); }
+.account-pool-row.tone-disabled,
+.account-pool-card.tone-disabled { border-left-color: rgba(var(--ink-rgb), 0.25); }
+
+.account-pool-card {
+    border-left-width: 3px;
+}
+
+.account-pool-row:hover {
+    background: rgba(var(--ink-rgb), 0.05);
+    border-color: rgba(var(--ink-rgb), 0.22);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+}
+
+.account-pool-row.selected {
+    background: rgba(214, 154, 85, 0.08);
+    border-color: var(--primary, #D69A55);
+    box-shadow: 0 0 0 1px var(--primary-glow, rgba(214, 154, 85, 0.25));
 }
 
 .account-pool-row.disabled {
-    opacity: 0.55;
+    opacity: 0.65;
+}
+
+.account-pool-row-inputs {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 3px;
+    min-width: 0;
+}
+
+/* 命名占大头、备注跟在后面，两个都能收窄到 0 以下（min-width:auto 会
+   按 size 属性撑出一个默认宽度，不显式归零照样顶宽父容器）。 */
+.account-pool-row-inputs > .account-pool-name-input {
+    flex: 3 1 0;
+    min-width: 0;
+}
+
+.account-pool-row-inputs > .account-pool-note-input {
+    flex: 2 1 0;
+    min-width: 0;
+}
+
+/* 主体不参与收缩（flex-shrink:0）：账号名和徽章是这一行的正文，
+   宽度不够时该让右边那组按钮先折行，而不是把正文压到两百像素、
+   逼得每个徽章单独占一行。 */
+.account-pool-main {
+    flex: 1 0 300px;
+    min-width: 0;
+}
+
+/* 操作按钮改成可换行的块：放不下就自己折成两行，而不是把主体挤没。
+   最多占行宽的 46%，保证左边永远看得见账号名和徽章。 */
+.account-pool-row-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 6px;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 46%;
+    margin-left: auto;
+}
+
+/* 窄到并排放不下时，整行改成上下两层：主体独占一行、按钮组独占一行。
+   继续并排的话主体只剩不到一半宽度，账号名会被截成 "w3933124C" 这样。 */
+@container pool-list (max-width: 720px) {
+    .account-pool-row-actions {
+        max-width: none;
+        flex: 1 0 100%;
+        justify-content: flex-start;
+        margin-left: 0;
+        padding-top: 6px;
+        border-top: 1px solid rgba(var(--ink-rgb), 0.07);
+    }
+
+    .account-pool-main {
+        flex: 1 1 100%;
+    }
+}
+
+/* ── 网格视图容器 ── */
+.account-pool-list.view-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(272px, 1fr));
+    gap: 10px;
+    align-content: start;
+}
+
+/* ── 网格卡片 (Card View) ── */
+.account-pool-card {
+    display: flex;
+    flex-direction: column;
+    background: rgba(var(--ink-rgb), 0.03);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 11px 12px;
+    gap: 9px;
+    transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+    position: relative;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+}
+
+.account-pool-card:hover {
+    background: rgba(var(--ink-rgb), 0.055);
+    border-color: rgba(var(--ink-rgb), 0.25);
+    transform: translateY(-2px);
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.09);
+}
+
+.account-pool-card.selected {
+    background: rgba(214, 154, 85, 0.08);
+    border-color: var(--primary, #D69A55);
+    box-shadow: 0 0 0 1.5px var(--primary, #D69A55), 0 4px 14px rgba(214, 154, 85, 0.18);
+}
+
+.account-pool-card.disabled {
+    opacity: 0.65;
+}
+
+/* 头部允许换行：不换行的话这一行的 min-content 宽度（勾选框+序号+环境号+
+   放大+星标+状态徽章之和）会成为整张卡片的最小宽度，进而顶宽整个网格的列，
+   最右一列被容器切掉半张。换行后最小宽度只由最宽的单个元素决定。 */
+.account-pool-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(var(--ink-rgb), 0.07);
+    flex-wrap: wrap;
+}
+
+.account-pool-card-header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.account-pool-card-header-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.account-pool-card-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    flex: 1;
+}
+
+.account-pool-name-input.card-name-input {
+    font-size: 13.5px;
+    font-weight: 700;
+    padding: 3px 6px;
+    border-radius: 5px;
+    background: rgba(var(--ink-rgb), 0.03);
+    border: 1px solid transparent;
+}
+
+.account-pool-name-input.card-name-input:focus {
+    background: rgba(var(--ink-rgb), 0.06);
+    border-color: var(--primary, #D69A55);
+}
+
+.account-pool-note-input.card-note-input {
+    font-size: 11.5px;
+    padding: 2px 6px;
+    border-radius: 5px;
+}
+
+.account-pool-card-metrics {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    padding: 2px 0;
+    min-width: 0;
+}
+
+.account-pool-card-metrics > * {
+    max-width: 100%;
+}
+
+.account-pool-card-meta-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+
+.account-pool-card-meta-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    overflow: hidden;
+}
+
+.account-pool-card-meta-item .meta-label {
+    color: var(--text-muted);
+    font-size: 11px;
+    min-width: 32px;
+    flex-shrink: 0;
+}
+
+.account-pool-card-meta-item .meta-val {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+}
+
+.account-pool-card-meta-item .meta-val.monospace {
+    font-family: var(--font-mono, monospace);
+    font-size: 11px;
+}
+
+.account-pool-card-meta-item .meta-val.has-exp {
+    color: #3b82f6;
+    font-weight: 600;
+}
+
+html[data-theme="dark"] .account-pool-card-meta-item .meta-val.has-exp {
+    color: #60a5fa;
+}
+
+.account-pool-card-alert {
+    font-size: 11px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    line-height: 1.4;
+    margin-top: 2px;
+}
+
+.account-pool-card-alert.alert-warning {
+    background: rgba(245, 158, 11, 0.12);
+    color: #d97706;
+    border: 1px solid rgba(245, 158, 11, 0.25);
+}
+
+html[data-theme="dark"] .account-pool-card-alert.alert-warning {
+    background: rgba(245, 158, 11, 0.18);
+    color: #fbbf24;
+}
+
+.account-pool-card-alert.alert-info {
+    background: rgba(59, 130, 246, 0.1);
+    color: #2563eb;
+    border: 1px solid rgba(59, 130, 246, 0.25);
+}
+
+html[data-theme="dark"] .account-pool-card-alert.alert-info {
+    background: rgba(59, 130, 246, 0.18);
+    color: #60a5fa;
+}
+
+.account-pool-card-alert.alert-danger,
+.account-pool-card-alert.is-no-2fa {
+    background: rgba(239, 68, 68, 0.16);
+    color: #dc2626;
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    font-weight: 500;
+}
+
+html[data-theme="dark"] .account-pool-card-alert.alert-danger,
+html[data-theme="dark"] .account-pool-card-alert.is-no-2fa {
+    background: rgba(239, 68, 68, 0.24);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.45);
+}
+
+.account-pool-card-alert.alert-priority {
+    background: rgba(234, 179, 8, 0.12);
+    color: #ca8a04;
+    border: 1px solid rgba(234, 179, 8, 0.3);
+    font-weight: 600;
+}
+
+html[data-theme="dark"] .account-pool-card-alert.alert-priority {
+    color: #eab308;
+}
+
+/* 卡片底部按钮排成固定网格而不是 flex-wrap：
+   flex 布局下按钮的 min-content 宽度（"📅 2026-09-30" 这种长文案）会顶开列宽，
+   一路顶到整个网格容器横向溢出——表现就是最右一列的卡片被切掉半边。
+   固定 2 列 + 一个跨两行的删除键，配合 min-width:0 收住内在宽度。 */
+.account-pool-card-footer {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 6px;
+    padding-top: 9px;
+    border-top: 1px solid rgba(var(--ink-rgb), 0.07);
+}
+
+.account-pool-card-footer .account-pool-mini-btn {
+    min-width: 0;
+    padding: 4px 6px;
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: block;
+    text-align: center;
+}
+
+.account-pool-card-footer .account-pool-mini-btn.danger {
+    grid-column: 3;
+    grid-row: span 2;
+    width: 32px;
+    padding: 4px 0;
+}
+
+/* 卡片本身也要能收窄，否则内在宽度照样把网格顶出容器 */
+.account-pool-card {
+    min-width: 0;
+}
+
+.account-pool-card-header-right {
+    min-width: 0;
+    flex-shrink: 1;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+}
+
+.account-pool-mini-btn.card-zoom-icon {
+    width: 26px;
+    padding: 3px 0;
+    text-align: center;
+    flex-shrink: 0;
+}
+
+.account-pool-card-cred-wrap {
+    margin-top: 6px;
+}
+
+.account-pool-card-cred-wrap .account-pool-cred-form {
+    margin: 0;
+    border-radius: 8px;
+    border-left: 3px solid var(--primary, #D69A55);
+}
+
+/* ── 通用徽章与芯片 ── */
+.account-pool-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 5px;
+    background: rgba(var(--ink-rgb), 0.05);
+    color: var(--text-secondary);
+    border: 1px solid rgba(var(--ink-rgb), 0.08);
+    line-height: 1.3;
+    white-space: nowrap;
+    user-select: none;
+}
+
+.account-pool-chip.chip-sn {
+    background: rgba(214, 154, 85, 0.12);
+    color: var(--primary, #D69A55);
+    border-color: rgba(214, 154, 85, 0.3);
+    font-weight: 700;
+}
+
+.account-pool-chip.chip-uid {
+    font-family: var(--font-mono, monospace);
+    font-size: 10.5px;
+    opacity: 0.85;
+}
+
+.account-pool-chip.chip-expires.is-on {
+    background: rgba(59, 130, 246, 0.1);
+    color: #3b82f6;
+    border-color: rgba(59, 130, 246, 0.25);
+}
+
+html[data-theme="dark"] .account-pool-chip.chip-expires.is-on {
+    background: rgba(96, 165, 250, 0.15);
+    color: #60a5fa;
+    border-color: rgba(96, 165, 250, 0.35);
+}
+
+.account-pool-chip.chip-priority {
+    background: rgba(234, 179, 8, 0.12);
+    color: #ca8a04;
+    border-color: rgba(234, 179, 8, 0.35);
+    font-weight: 600;
+}
+
+html[data-theme="dark"] .account-pool-chip.chip-priority {
+    color: #eab308;
+    background: rgba(234, 179, 8, 0.18);
+}
+
+.account-pool-pill-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 6px;
+    line-height: 1.3;
+    white-space: nowrap;
+    border: 1px solid transparent;
+    user-select: none;
+}
+
+.account-pool-pill-badge.badge-credit-high {
+    background: rgba(34, 197, 94, 0.12);
+    color: #16a34a;
+    border-color: rgba(34, 197, 94, 0.3);
+}
+
+html[data-theme="dark"] .account-pool-pill-badge.badge-credit-high {
+    background: rgba(34, 197, 94, 0.18);
+    color: #4ade80;
+    border-color: rgba(74, 222, 128, 0.35);
+}
+
+.account-pool-pill-badge.badge-credit-medium {
+    background: rgba(245, 158, 11, 0.12);
+    color: #d97706;
+    border-color: rgba(245, 158, 11, 0.3);
+}
+
+html[data-theme="dark"] .account-pool-pill-badge.badge-credit-medium {
+    background: rgba(245, 158, 11, 0.18);
+    color: #fbbf24;
+    border-color: rgba(251, 191, 36, 0.35);
+}
+
+.account-pool-pill-badge.badge-credit-low {
+    background: rgba(239, 68, 68, 0.12);
+    color: #dc2626;
+    border-color: rgba(239, 68, 68, 0.3);
+}
+
+html[data-theme="dark"] .account-pool-pill-badge.badge-credit-low {
+    background: rgba(239, 68, 68, 0.18);
+    color: #f87171;
+    border-color: rgba(248, 113, 113, 0.35);
+}
+
+.account-pool-pill-badge.badge-credit-none {
+    background: rgba(var(--ink-rgb), 0.05);
+    color: var(--text-muted);
+    border-color: rgba(var(--ink-rgb), 0.1);
+}
+
+.account-pool-pill-badge.badge-cooldown {
+    background: rgba(6, 182, 212, 0.12);
+    color: #0891b2;
+    border-color: rgba(6, 182, 212, 0.3);
+}
+
+html[data-theme="dark"] .account-pool-pill-badge.badge-cooldown {
+    background: rgba(6, 182, 212, 0.18);
+    color: #22d3ee;
+    border-color: rgba(34, 211, 238, 0.35);
+}
+
+.account-pool-pill-badge.badge-tasks {
+    background: rgba(139, 92, 246, 0.1);
+    color: #7c3aed;
+    border-color: rgba(139, 92, 246, 0.25);
+}
+
+html[data-theme="dark"] .account-pool-pill-badge.badge-tasks {
+    background: rgba(139, 92, 246, 0.18);
+    color: #a78bfa;
+    border-color: rgba(167, 139, 250, 0.35);
+}
+
+.account-pool-meta-text {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.account-pool-bulk-check {
+    flex-shrink: 0;
+    width: 17px;
+    height: 17px;
+    margin: 0;
+    cursor: pointer;
+    accent-color: var(--primary, #D69A55);
+}
+
+.account-pool-seq-badge {
+    flex-shrink: 0;
+    font-size: 11.5px;
+    font-weight: 700;
+    color: var(--text-muted);
+    background: rgba(var(--ink-rgb), 0.05);
+    padding: 2px 7px;
+    border-radius: 5px;
+    min-width: 26px;
+    text-align: center;
+    user-select: none;
 }
 
 .account-pool-enable-toggle {
@@ -2351,104 +3274,295 @@ body.log-expanded .log-pill {
     cursor: pointer;
 }
 
-.account-pool-main {
-    flex: 1;
-    min-width: 0;
+/* 状态徽章：高对比度、明暗主题完美适配 */
+/* 状态徽章固定宽度：不固定的话「已启用/已禁用」宽度不同，
+   后面的账号名在每一行都从不同的 x 起跑，整列没法扫。 */
+.account-pool-row > .account-pool-status-badge {
+    min-width: 74px;
+    justify-content: center;
 }
+
+.account-pool-status-badge {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    font-size: 11.5px;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    user-select: none;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    white-space: nowrap;
+    line-height: 1.4;
+}
+
+.account-pool-status-badge.is-enabled {
+    border-color: rgba(34, 197, 94, 0.35);
+    color: #15803d;
+    background: rgba(34, 197, 94, 0.12);
+}
+
+html[data-theme="dark"] .account-pool-status-badge.is-enabled {
+    border-color: rgba(74, 222, 128, 0.4);
+    color: #4ade80;
+    background: rgba(34, 197, 94, 0.18);
+}
+
+.account-pool-status-badge.is-enabled:hover {
+    filter: brightness(1.1);
+    transform: translateY(-1px);
+}
+
+.account-pool-status-badge.is-disabled {
+    border-color: rgba(239, 68, 68, 0.3);
+    color: #b91c1c;
+    background: rgba(239, 68, 68, 0.1);
+}
+
+html[data-theme="dark"] .account-pool-status-badge.is-disabled {
+    border-color: rgba(248, 113, 113, 0.35);
+    color: #f87171;
+    background: rgba(239, 68, 68, 0.18);
+}
+
+.account-pool-status-badge.is-disabled:hover {
+    filter: brightness(1.1);
+    transform: translateY(-1px);
+}
+
+.account-pool-priority-star {
+    flex-shrink: 0;
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    user-select: none;
+    transition: transform 0.15s ease;
+    padding: 2px;
+}
+
+.account-pool-priority-star:hover {
+    transform: scale(1.2);
+}
+
+.account-pool-priority-star.is-priority {
+    color: #eab308;
+    filter: drop-shadow(0 0 4px rgba(234, 179, 8, 0.5));
+}
+
+.account-pool-priority-star.not-priority {
+    color: var(--text-muted, #888);
+    opacity: 0.45;
+}
+
+.account-pool-priority-star.not-priority:hover {
+    opacity: 1;
+    color: #eab308;
+}
+
+.account-pool-expires-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    background: rgba(var(--ink-rgb), 0.05);
+    padding: 1px 6px;
+    border-radius: 4px;
+    margin-left: 6px;
+    cursor: pointer;
+    border: 1px dashed rgba(var(--ink-rgb), 0.15);
+}
+
+.account-pool-expires-badge:hover {
+    border-color: var(--primary, #D69A55);
+    background: rgba(214, 154, 85, 0.08);
+}
+
 
 .account-pool-name-input {
     width: 100%;
     border: none;
+    border-bottom: 1px solid rgba(var(--ink-rgb), 0.12);
     background: transparent;
-    font-size: 12px;
+    font-size: 13px;
     font-weight: 600;
-    color: var(--text-main, #3A342C);
-    padding: 2px 0;
+    color: var(--text-primary);
+    padding: 2px 4px;
+    border-radius: 4px;
+    font-family: inherit;
+    transition: var(--transition-fast);
+}
+
+.account-pool-name-input:hover {
+    border-bottom-color: rgba(var(--ink-rgb), 0.2);
 }
 
 .account-pool-name-input:focus {
     outline: none;
-    border-bottom: 1px solid rgba(176, 123, 82, 0.55);
+    border-bottom-color: var(--primary, #D69A55);
+    background: rgba(var(--ink-rgb), 0.04);
 }
 
 .account-pool-note-input {
     width: 100%;
     border: none;
+    border-bottom: 1px solid transparent;
     background: transparent;
-    font-size: 11px;
+    font-size: 11.5px;
     font-style: italic;
-    color: var(--text-secondary, #6B6256);
-    padding: 1px 0;
+    color: var(--text-secondary);
+    padding: 2px 4px;
+    border-radius: 4px;
+    font-family: inherit;
+    transition: var(--transition-fast);
+}
+
+.account-pool-note-input:hover {
+    border-bottom-color: rgba(var(--ink-rgb), 0.15);
 }
 
 .account-pool-note-input:focus {
     outline: none;
     font-style: normal;
-    border-bottom: 1px solid rgba(176, 123, 82, 0.4);
+    border-bottom-color: var(--primary, #D69A55);
+    background: rgba(var(--ink-rgb), 0.04);
 }
 
 .account-pool-meta {
-    font-size: 10px;
-    color: var(--text-secondary, #6B6256);
+    font-size: 11px;
+    color: var(--text-secondary);
     margin-top: 2px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 5px 6px;
+    flex-wrap: wrap;
+    line-height: 1.4;
+    min-width: 0;
 }
 
+.account-pool-meta > * {
+    max-width: 100%;
+}
+
+/* 账号卡片行内微型操作按钮 */
 .account-pool-mini-btn {
     flex-shrink: 0;
-    font-size: 11px;
-    padding: 3px 8px;
-    border-radius: 4px;
-    border: 1px solid rgba(var(--ink-rgb), 0.12);
-    background: rgba(var(--ink-rgb), 0.03);
-    color: var(--text-secondary, #6B6256);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    font-size: 11.5px;
+    font-weight: 500;
+    padding: 4px 10px;
+    min-height: 28px;
+    border-radius: 7px;
+    border: 1px solid var(--border-color);
+    background: rgba(var(--ink-rgb), 0.04);
+    color: var(--text-primary);
     cursor: pointer;
+    transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+    white-space: nowrap;
+    user-select: none;
+    font-family: inherit;
 }
 
-.account-pool-mini-btn:hover {
-    background: rgba(var(--ink-rgb), 0.08);
-    color: var(--text-main, #3A342C);
+.account-pool-mini-btn:hover:not(:disabled) {
+    background: rgba(var(--ink-rgb), 0.09);
+    border-color: rgba(var(--ink-rgb), 0.28);
+    color: var(--text-primary);
+    transform: translateY(-1px);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
 }
 
-.account-pool-mini-btn.danger:hover {
-    border-color: rgba(200, 80, 60, 0.5);
-    color: #B34A32;
+.account-pool-mini-btn:active:not(:disabled) {
+    transform: translateY(0);
 }
 
 .account-pool-mini-btn:disabled {
-    opacity: 0.6;
-    cursor: default;
+    opacity: 0.45;
+    cursor: not-allowed;
+    transform: none;
 }
 
-/* 已配好自动登录凭据的账号，「🔑 登录凭据」按钮常亮，一眼扫得出哪些号还没配 */
+/* 已配好自动登录凭据的账号高亮状态 */
 .account-pool-mini-btn.is-on {
-    border-color: rgba(90, 150, 110, 0.45);
-    color: #3F7A52;
-    background: rgba(90, 150, 110, 0.08);
+    border-color: rgba(34, 197, 94, 0.4);
+    color: #15803d;
+    background: rgba(34, 197, 94, 0.1);
+    font-weight: 600;
+}
+
+html[data-theme="dark"] .account-pool-mini-btn.is-on {
+    border-color: rgba(74, 222, 128, 0.45);
+    color: #4ade80;
+    background: rgba(34, 197, 94, 0.16);
+}
+
+.account-pool-mini-btn.is-on:hover:not(:disabled) {
+    background: rgba(34, 197, 94, 0.24);
+    border-color: rgba(74, 222, 128, 0.65);
+    box-shadow: 0 2px 8px rgba(34, 197, 94, 0.22);
+}
+
+.account-pool-mini-btn.danger {
+    color: var(--text-muted);
+}
+
+.account-pool-mini-btn.danger:hover:not(:disabled) {
+    border-color: rgba(239, 68, 68, 0.4);
+    color: #f87171;
+    background: rgba(239, 68, 68, 0.12);
+    box-shadow: 0 2px 8px rgba(239, 68, 68, 0.2);
+}
+
+.account-pool-mini-btn.primary {
+    background: linear-gradient(135deg, rgba(214, 154, 85, 0.25), rgba(176, 123, 82, 0.15));
+    border-color: var(--primary, #D69A55);
+    color: var(--primary, #D69A55);
+    font-weight: 600;
+}
+
+.account-pool-mini-btn.primary:hover:not(:disabled) {
+    background: var(--primary, #D69A55);
+    color: #ffffff;
+    border-color: var(--primary, #D69A55);
+    box-shadow: 0 2px 8px var(--primary-glow, rgba(214, 154, 85, 0.3));
+}
+
+.account-pool-mini-btn.warning {
+    color: var(--color-warning, #f59e0b);
+    border-color: rgba(245, 158, 11, 0.35);
+    background: rgba(245, 158, 11, 0.08);
+}
+
+.account-pool-mini-btn.warning:hover:not(:disabled) {
+    background: rgba(245, 158, 11, 0.2);
+    border-color: rgba(245, 158, 11, 0.6);
 }
 
 /* ── 自动登录凭据表单 ────────────────────────────────────────────
-   作为 .account-pool-row 的兄弟节点插在它下面（行本身是 align-items:center
-   的单行 flex，塞不进多行表单）。负 margin + 左侧竖线把它在视觉上重新
-   绑回上面那一行。 */
+   作为 .account-pool-row 的兄弟节点插在它下面，左侧带有主题色竖线指示 */
 .account-pool-cred-form {
-    margin: -2px 0 4px 26px;
-    padding: 10px 12px;
-    border: 1px solid rgba(var(--ink-rgb), 0.1);
-    border-left: 2px solid rgba(176, 123, 82, 0.45);
-    border-radius: 0 8px 8px 0;
+    margin: -2px 0 6px 28px;
+    padding: 12px 16px;
+    border: 1px solid var(--border-color);
+    border-left: 3px solid var(--primary, #D69A55);
+    border-radius: 0 10px 10px 0;
     background: rgba(var(--ink-rgb), 0.035);
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 10px;
+    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.04);
 }
 
 .account-pool-cred-title {
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
-    color: var(--text-main, #3A342C);
+    color: var(--text-primary);
 }
 
 .account-pool-cred-fields {
@@ -2460,26 +3574,38 @@ body.log-expanded .log-pill {
 .account-pool-cred-fields input {
     flex: 1;
     min-width: 160px;
-    font-size: 11px;
-    padding: 5px 8px;
-    border: 1px solid rgba(var(--ink-rgb), 0.15);
-    border-radius: 4px;
-    background: var(--surface-raised, rgba(255, 255, 255, 0.6));
-    color: var(--text-main, #3A342C);
+    height: 32px;
+    font-size: 12px;
+    padding: 0 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: rgba(var(--ink-rgb), 0.05);
+    color: var(--text-primary);
+    font-family: inherit;
+    transition: var(--transition-fast);
+}
+
+.account-pool-cred-fields input::placeholder {
+    color: var(--text-muted);
 }
 
 .account-pool-cred-fields input:focus {
     outline: none;
-    border-color: rgba(176, 123, 82, 0.6);
+    border-color: var(--primary, #D69A55);
+    box-shadow: 0 0 0 2px var(--primary-glow, rgba(214, 154, 85, 0.2));
 }
 
 .account-pool-cred-check {
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 10px;
-    color: var(--text-secondary, #6B6256);
+    font-size: 11px;
+    color: var(--text-secondary);
     cursor: pointer;
+}
+
+.account-pool-cred-check input[type="checkbox"] {
+    accent-color: var(--primary, #D69A55);
 }
 
 .account-pool-cred-actions {
@@ -2489,49 +3615,347 @@ body.log-expanded .log-pill {
 }
 
 .account-pool-cred-hint {
-    font-size: 10px;
+    font-size: 11px;
     line-height: 1.5;
-    color: var(--text-secondary, #6B6256);
-    opacity: 0.85;
+    color: var(--text-muted);
 }
 
-/* 自动登录状态那行可能很长（含失败原因），不像上面的 meta 行那样单行截断 */
+/* 自动登录状态行 */
 .account-pool-login-meta {
     white-space: normal;
     overflow: visible;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    padding: 3.5px 8px;
+    border-radius: 6px;
+    margin-top: 4px;
+    line-height: 1.4;
+    background: rgba(59, 130, 246, 0.1);
+    color: #2563eb;
+    border: 1px solid rgba(59, 130, 246, 0.25);
 }
 
+html[data-theme="dark"] .account-pool-login-meta {
+    background: rgba(59, 130, 246, 0.18);
+    color: #60a5fa;
+    border-color: rgba(59, 130, 246, 0.35);
+}
+
+.account-pool-login-meta.alert-danger,
+.account-pool-login-meta.is-no-2fa {
+    background: rgba(239, 68, 68, 0.16) !important;
+    color: #dc2626 !important;
+    border: 1px solid rgba(239, 68, 68, 0.35) !important;
+}
+
+html[data-theme="dark"] .account-pool-login-meta.alert-danger,
+html[data-theme="dark"] .account-pool-login-meta.is-no-2fa {
+    background: rgba(239, 68, 68, 0.24) !important;
+    color: #fca5a5 !important;
+    border: 1px solid rgba(239, 68, 68, 0.45) !important;
+}
+
+/* 底部操作行与添加行 */
 .account-pool-bulk-row {
     display: flex;
     align-items: center;
     gap: 10px;
     flex-wrap: wrap;
-    padding-top: 10px;
-    border-top: 1px dashed rgba(var(--ink-rgb), 0.15);
+    padding-top: 12px;
+    border-top: 1px dashed var(--border-color);
 }
 
 .account-pool-bulk-row small {
     flex: 1;
     min-width: 200px;
     line-height: 1.4;
+    color: var(--text-muted);
+    font-size: 11.5px;
+}
+
+#account-pool-import-all-btn {
+    background: linear-gradient(135deg, rgba(214, 154, 85, 0.18), rgba(214, 154, 85, 0.08));
+    border-color: var(--primary, #D69A55);
+    color: var(--primary, #D69A55);
+    font-weight: 600;
+    padding: 7px 14px;
+}
+
+#account-pool-import-all-btn:hover:not(:disabled) {
+    background: linear-gradient(135deg, rgba(214, 154, 85, 0.32), rgba(214, 154, 85, 0.18));
+    color: var(--text-primary);
+    box-shadow: 0 3px 12px var(--primary-glow, rgba(214, 154, 85, 0.28));
+}
+
+/* 放大微型按钮 */
+.account-pool-mini-btn.zoom-btn {
+    color: var(--primary, #D69A55);
+    background: rgba(214, 154, 85, 0.08);
+    border-color: rgba(214, 154, 85, 0.25);
+    font-weight: 600;
+}
+
+.account-pool-mini-btn.zoom-btn:hover:not(:disabled) {
+    background: rgba(214, 154, 85, 0.18);
+    border-color: var(--primary, #D69A55);
+    box-shadow: 0 2px 8px var(--primary-glow, rgba(214, 154, 85, 0.25));
+}
+
+/* ── 账号详情放大看板弹窗 (Account Detail Enlarge Modal) ────────── */
+.account-pool-detail-modal {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.78);
+    backdrop-filter: blur(10px);
+    z-index: 1100;
+}
+
+.apd-modal-content {
+    background: var(--bg-panel-solid, #1c150f);
+    border: 1px solid var(--border-glow, rgba(214, 154, 85, 0.35));
+    border-radius: 14px;
+    box-shadow: 0 25px 60px rgba(0, 0, 0, 0.75), 0 0 35px var(--primary-glow, rgba(214, 154, 85, 0.15));
+    width: 90vw;
+    max-width: 820px;
+    max-height: 88vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    animation: apdModalIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    color: var(--text-primary);
+}
+
+@keyframes apdModalIn {
+    from { opacity: 0; transform: scale(0.96); }
+    to { opacity: 1; transform: scale(1); }
+}
+
+.apd-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 20px;
+    background: rgba(var(--ink-rgb), 0.04);
+    border-bottom: 1px solid var(--border-color);
+    gap: 12px;
+}
+
+.apd-header-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.apd-header-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.apd-nav-btn {
+    padding: 4px 10px;
+    font-size: 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+    background: rgba(var(--ink-rgb), 0.05);
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+.apd-nav-btn:hover:not(:disabled) {
+    background: rgba(var(--ink-rgb), 0.12);
+    border-color: var(--primary, #D69A55);
+}
+
+.apd-nav-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+
+.apd-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.apd-grid-2col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+}
+
+@media (max-width: 680px) {
+    .apd-grid-2col {
+        grid-template-columns: 1fr;
+    }
+}
+
+.apd-section-card {
+    background: rgba(var(--ink-rgb), 0.025);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.apd-section-title {
+    font-size: 12.5px;
+    font-weight: 700;
+    color: var(--primary, #D69A55);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid rgba(var(--ink-rgb), 0.06);
+}
+
+.apd-hero-metrics {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.apd-hero-metric-box {
+    flex: 1;
+    min-width: 120px;
+    background: rgba(var(--ink-rgb), 0.04);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.apd-hero-metric-label {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.apd-hero-metric-val {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.apd-field {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.apd-field-label {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.apd-input {
+    width: 100%;
+    height: 34px;
+    padding: 0 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: rgba(var(--ink-rgb), 0.04);
+    color: var(--text-primary);
+    font-size: 12.5px;
+    font-family: inherit;
+    transition: var(--transition-fast);
+}
+
+.apd-input:focus {
+    outline: none;
+    border-color: var(--primary, #D69A55);
+    box-shadow: 0 0 0 2px var(--primary-glow, rgba(214, 154, 85, 0.2));
+}
+
+.apd-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    background: rgba(var(--ink-rgb), 0.04);
+    border-top: 1px solid var(--border-color);
+    gap: 10px;
+    flex-wrap: wrap;
 }
 
 .account-pool-add-row {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding-top: 10px;
-    border-top: 1px dashed rgba(var(--ink-rgb), 0.15);
+    padding: 10px 12px;
+    background: rgba(var(--ink-rgb), 0.025);
+    border: 1px solid var(--border-color);
+    border-radius: 9px;
+}
+
+.account-pool-add-row select,
+.account-pool-add-row input[type="text"] {
+    height: 34px;
+    padding: 0 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+    background: rgba(var(--ink-rgb), 0.04);
+    color: var(--text-primary);
+    font-size: 12px;
+    font-family: inherit;
+    outline: none;
+    transition: var(--transition-fast);
 }
 
 .account-pool-add-row select {
     flex: 1.4;
     min-width: 0;
+    cursor: pointer;
+}
+
+.account-pool-add-row select option {
+    background: var(--bg-panel-solid, #221B14);
+    color: var(--text-primary, #ECE4D7);
 }
 
 .account-pool-add-row input[type="text"] {
     flex: 1;
     min-width: 0;
+}
+
+.account-pool-add-row input[type="text"]::placeholder {
+    color: var(--text-muted);
+}
+
+.account-pool-add-row select:focus,
+.account-pool-add-row input[type="text"]:focus {
+    border-color: var(--primary, #D69A55);
+    box-shadow: 0 0 0 2px var(--primary-glow, rgba(214, 154, 85, 0.2));
+}
+
+#account-pool-add-btn {
+    height: 34px;
+    padding: 0 16px;
+    border-radius: 6px;
+    background: var(--primary, #D69A55);
+    color: #ffffff;
+    border: 1px solid transparent;
+    font-weight: 600;
+}
+
+#account-pool-add-btn:hover:not(:disabled) {
+    filter: brightness(1.1);
+    box-shadow: 0 2px 10px var(--primary-glow, rgba(214, 154, 85, 0.35));
 }
 
 /* =====================================================================
@@ -2608,3 +4032,93 @@ body.log-expanded .log-pill {
         display: none;
     }
 }
+
+/* =====================================================================
+   号池全局 HUD 胶囊与动态健康分徽章样式 (方案一：轻量自动化)
+   ===================================================================== */
+.account-pool-global-hud {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    border: 1px solid rgba(var(--ink-rgb), 0.12);
+    background: rgba(var(--ink-rgb), 0.04);
+    user-select: none;
+}
+
+.account-pool-global-hud:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.08);
+}
+
+.account-pool-global-hud.hud-healthy {
+    border-color: rgba(34, 197, 94, 0.35);
+    background: rgba(34, 197, 94, 0.08);
+}
+.account-pool-global-hud.hud-healthy .hud-status-dot {
+    background: #22c55e;
+    box-shadow: 0 0 6px rgba(34, 197, 94, 0.6);
+}
+
+.account-pool-global-hud.hud-warning {
+    border-color: rgba(234, 179, 8, 0.35);
+    background: rgba(234, 179, 8, 0.09);
+}
+.account-pool-global-hud.hud-warning .hud-status-dot {
+    background: #eab308;
+    box-shadow: 0 0 6px rgba(234, 179, 8, 0.6);
+}
+
+.account-pool-global-hud.hud-danger {
+    border-color: rgba(239, 68, 68, 0.45);
+    background: rgba(239, 68, 68, 0.12);
+    color: #ef4444;
+}
+.account-pool-global-hud.hud-danger .hud-status-dot {
+    background: #ef4444;
+    box-shadow: 0 0 6px rgba(239, 68, 68, 0.8);
+    animation: hud-dot-blink 1.2s infinite;
+}
+
+.account-pool-global-hud .hud-status-dot {
+    width: 7.5px;
+    height: 7.5px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+@keyframes hud-dot-blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
+/* 动态健康分徽章 */
+.account-pool-pill-badge.badge-health-score {
+    font-weight: 600;
+}
+.badge-health-score.health-excellent {
+    background: rgba(34, 197, 94, 0.12);
+    color: #16a34a;
+    border: 1px solid rgba(34, 197, 94, 0.28);
+}
+.badge-health-score.health-good {
+    background: rgba(59, 130, 246, 0.12);
+    color: #2563eb;
+    border: 1px solid rgba(59, 130, 246, 0.28);
+}
+.badge-health-score.health-warning {
+    background: rgba(234, 179, 8, 0.14);
+    color: #d97706;
+    border: 1px solid rgba(234, 179, 8, 0.3);
+}
+.badge-health-score.health-poor {
+    background: rgba(239, 68, 68, 0.14);
+    color: #dc2626;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+

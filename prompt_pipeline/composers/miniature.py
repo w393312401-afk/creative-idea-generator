@@ -549,27 +549,71 @@ Rewrite rules (additive — do not lose content):
 - NEVER write oner, one-shot, one-take, single continuous take, one continuous take, single take, or unbroken take — there is no exemption.
 - Output ONLY the rewritten video prompt body. No headings, no labels, no commentary."""
 
+    def ensure_living_cast_reaction(self, video_prompt, beat=None, packet=None, is_threshold_or_reveal=False):
+        """确保微缩场景中常驻的人偶具备动态三段式因果时序咬合，杜绝死人/假人现象。"""
+        text = video_prompt or ''
+        if is_threshold_or_reveal:
+            return text
+        low = text.lower()
+
+        # 检查是否已包含人偶/居民描述
+        has_cast = any(k in low for k in ('figurin', 'couple', 'bystander', 'resident', 'cast in frame'))
+        if has_cast:
+            return text
+
+        # 若正文未提及人偶，自动在末段切回镜前或结尾注入微缩人偶的动态响应
+        cast_phrase = (
+            "Down by the diorama edge, the two miniature couple figurines tilt their heads up in awe "
+            "to track the giant hand as it works, shifting their stance and nodding approvingly as the stage settles."
+        )
+
+        if 'finally, the camera cuts back' in low:
+            text = re.sub(
+                r'(?i)(finally,\s+the\s+camera\s+cuts\s+back\s+to\s+[^.;]+?[.;])',
+                r'\1 Down by the diorama edge, the miniature couple figurines lean in with curiosity, their gaze actively tracking the final micro-adjustments before standing side by side to admire the finished work.',
+                text,
+                count=1
+            )
+        elif not text.rstrip().endswith(('.', '!', '?')):
+            text = text.rstrip() + f". {cast_phrase}"
+        else:
+            text = text.rstrip() + f" {cast_phrase}"
+        return text
+
     # ── 微缩专属的确定性清洗 ────────────────────────────────────────────────
 
     def fix_miniature_video(self, text):
-        """清洗视频提示词中的全尺寸工人、广角镜头与旧的一镜到底节奏声明。"""
+        """清洗视频提示词中的全尺寸工人、工匠、假人静态词、广角镜头与旧的一镜到底节奏声明。"""
         res = str(text or '')
-        # 清除 base fix_out_and_in / omni ensure_ladder_out_and_in 注入的工人起手句
+
+        # 1. 彻底清除 base fix_out_and_in / omni 注入的实景工人起手句与工匠句式
         res = re.sub(
             r'(?i)\b(?:at\s+t\s*=\s*0s?|at\s+zero\s+seconds?)[,;:]?\s*(?:the\s+same\s+)?'
-            r'(?:one\s+lone\s+|the\s+)?(?:male\s+)?workers?\b[^.;]*?'
-            r'\b(?:is\s+already\s+positioned|enters?|begins?)[^.;]*[.;]?',
+            r'(?:one\s+lone\s+|the\s+|a\s+)?(?:male\s+)?(?:workers?|craftsm[ae]n)\b[^.;]*?'
+            r'\b(?:is\s+already\s+positioned|is\s+already\s+stationed|is\s+already\s+at\s+the\s+work\s+face|'
+            r'makes?\s+(?:the\s+)?first\s+contact|enters?|begins?)[^.;]*[.;]?',
             '',
             res
         )
-        # 替换各类工人称谓为超大真人手
         res = re.sub(
-            r'(?i)\b(?:a|one)\s+(?:lone\s+)?(?:male\s+)?workers?\s*(?:\([^)]*\))?',
+            r'(?i)\b(?:one|the|a)\s+(?:lone\s+)?(?:male\s+)?(?:workers?|craftsm[ae]n)\s+(?:with\s+bare\s+hands\s+and\s+forearms[^.;]*?)?(?:is\s+already\s+)?(?:stationed\s+)?at\s+the\s+work\s+face\b[^.;]*?[.;]?',
+            '',
+            res
+        )
+        res = re.sub(
+            r'(?i)\ba\s+single\s+worker\'?s?\s+bare\s+hands\s+and\s+human\s+fingers\b',
+            'oversized human hands and fingers',
+            res
+        )
+
+        # 2. 替换各类实景工人/工匠称谓为超大真人手
+        res = re.sub(
+            r'(?i)\b(?:a|one)\s+(?:lone\s+)?(?:male\s+)?(?:workers?|craftsm[ae]n)\s*(?:\([^)]*\))?',
             'an oversized human hand',
             res
         )
         res = re.sub(
-            r'(?i)\bthe\s+(?:same\s+)?(?:lone\s+)?(?:male\s+)?workers?\b',
+            r'(?i)\bthe\s+(?:same\s+)?(?:lone\s+)?(?:male\s+)?(?:workers?|craftsm[ae]n)\b',
             'the giant hand',
             res
         )
@@ -578,25 +622,70 @@ Rewrite rules (additive — do not lose content):
             'oversized hands',
             res
         )
-        # 替换 24mm 广角机位为微距眼平机位
+        res = re.sub(
+            r'(?i)\b(?:the\s+)?craftsm[ae]n\b',
+            'the giant hand',
+            res
+        )
+        res = re.sub(
+            r'(?i)\bhuman\s+fingers\b',
+            'giant fingers',
+            res
+        )
+
+        # 3. 强力清洗假人/静止人偶词汇并转化为动态应激
+        res = re.sub(
+            r'(?i)\b(?:unmoving|motionless|static|frozen|still)\s+miniature\s+(?:bystander\s+)?figurines?\s+stand\s+watching\s+quietly\b',
+            'the curious miniature figurines tilt their heads and shift stance, attentively tracking the micro-tool movements',
+            res
+        )
+        res = re.sub(
+            r'(?i)\b(?:unmoving|motionless|static|frozen)\s+miniature\s+figurines?\b',
+            'miniature figurines',
+            res
+        )
+        res = re.sub(
+            r'(?i)\bminiature\s+(?:couple\s+)?figurines?\s+(?:remain|stay\s+put|stand\s+still|stand\s+quietly|are\s+unchanged)\b',
+            'miniature figurines shift their posture and turn their gaze',
+            res
+        )
+
+        # 4. 平滑化特写切镜语义，消除导致时序冻结的 zero advancement 措辞
+        res = re.sub(
+            r'(?i)\bwith\s+zero\s+(?:state\s+advancement|progress\s+advance)\b',
+            'capturing the continuous microscopic material shearing without skipping stages',
+            res
+        )
+        res = re.sub(
+            r'(?i)\bwithout\s+advancing\s+the\s+overall\s+build\s+(?:state|stage)\b',
+            'showcasing the fine material physics and tactile contact without skipping ahead',
+            res
+        )
+
+        # 5. 替换 24mm 广角机位为微距眼平机位
         res = re.sub(
             r'(?i)\b(?:\d+\s*mm|twenty[- ]four\s+millimeter)\s+wide-?angle\s+(?:tripod\s+shot|lens|view|framing)\b',
             'macro diorama eye-level tripod shot',
             res
         )
-        # 替换脚步声音效
+
+        # 6. 替换脚步声音效
         res = re.sub(
             r'(?i)\b(?:and\s+)?footsteps\s+of\s+this\s+beat\b',
             'and fine tool clicks of this beat',
             res
         )
         res = re.sub(r'(?i)\bfootsteps\b', 'craft contact sounds', res)
-        # 旧的一镜到底节奏声明 → 多镜头节奏声明；已经有一句了就直接删掉重复的那句
+
+        # 7. 旧的一镜到底节奏声明 → 多镜头节奏声明
         for pattern in _LEGACY_PACING_PATTERNS:
             if not pattern.search(res):
                 continue
             replacement = '' if MINIATURE_PACING_MARKER in res.lower() else MINIATURE_PACING_PHRASE
             res = pattern.sub(replacement, res)
+
+        # 8. 终极去重
+        res = self.deduplicate_boilerplate_phrases(res)
         return re.sub(r'\s{2,}', ' ', res).strip()
 
     def fix_miniature_image(self, text):
@@ -626,12 +715,15 @@ Rewrite rules (additive — do not lose content):
     def apply_proactive_fixes(self, i, video_prompt, image_prompt, packet, mode, is_last,
                               is_threshold_or_reveal, beat=None, config=None, family=None,
                               beat_ladder=None):
-        """先走 omni 的多镜头修复链（切点表、一镜到底清洗、字数预算），再做微缩清洗。"""
+        """先走 omni 的多镜头修复链（切点表、一镜到底清洗、字数预算），再做微缩清洗与活物动态保底。"""
         fixed_video, fixed_image = super().apply_proactive_fixes(
             i, video_prompt, image_prompt, packet, mode, is_last, is_threshold_or_reveal,
             beat=beat, config=config, family=family, beat_ladder=beat_ladder
         )
         fixed_video = self.fix_miniature_video(fixed_video)
+        fixed_video = self.ensure_living_cast_reaction(
+            fixed_video, beat=beat, packet=packet, is_threshold_or_reveal=is_threshold_or_reveal
+        )
         fixed_image = self.fix_miniature_image(fixed_image)
         return fixed_video, fixed_image
 

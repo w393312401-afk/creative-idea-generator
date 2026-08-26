@@ -20,7 +20,9 @@
     logTaskFilter: '',
     logKeyword: '',
     expandedTask: null,
-    accountSortKey: 'serial_asc'
+    accountSortKey: 'serial_asc',
+    selectedAccounts: new Set(),
+    lastAccountClickedIndex: -1
   };
 
   const $ = (id) => typeof document !== 'undefined' ? document.getElementById(id) : null;
@@ -398,10 +400,34 @@
     return list;
   }
 
+  function updateConsoleAccountBulkBar() {
+    const count = state.selectedAccounts ? state.selectedAccounts.size : 0;
+    const bar = $('fx-account-bulk-bar');
+    const countEl = $('fx-account-bulk-count');
+    if (countEl) countEl.textContent = count > 0 ? `已选 ${count} 项` : '';
+    if (bar) {
+      bar.style.display = count > 0 ? 'flex' : 'none';
+    }
+    const selectAllChk = $('fx-account-select-all');
+    if (selectAllChk) {
+      const accounts = state.accounts || [];
+      const allSelected = accounts.length > 0 && accounts.every(a => state.selectedAccounts && state.selectedAccounts.has(a.user_id));
+      selectAllChk.checked = allSelected;
+      selectAllChk.disabled = accounts.length === 0;
+    }
+  }
+
   function renderAccounts(accounts) {
     state.accounts = accounts;
     const body = $('fx-account-table-body');
     if (!body) return;
+
+    if (!state.selectedAccounts) state.selectedAccounts = new Set();
+    const validIds = new Set((accounts || []).map(a => a.user_id));
+    for (const uid of state.selectedAccounts) {
+      if (!validIds.has(uid)) state.selectedAccounts.delete(uid);
+    }
+    updateConsoleAccountBulkBar();
 
     if ($('fx-account-sort-select')) {
       $('fx-account-sort-select').value = state.accountSortKey;
@@ -416,16 +442,27 @@
     }
 
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="6" class="fx-empty">号池为空，可从右上角导入 AdsPower 环境。</td></tr>';
+      body.innerHTML = '<tr><td colspan="8" class="fx-empty">号池为空，可从右上角导入 AdsPower 环境。</td></tr>';
       return;
     }
 
     const sortedAccounts = sortAccounts(accounts, state.accountSortKey);
 
-    body.innerHTML = sortedAccounts.map((account) => {
+    const priorityList = Array.isArray(state.config?.googleFxPriorityUserIds)
+      ? state.config.googleFxPriorityUserIds.map(String)
+      : (typeof state.config?.googleFxPriorityUserIds === 'string'
+        ? state.config.googleFxPriorityUserIds.split(',').map(s => s.trim())
+        : []);
+    const prioritySet = new Set(priorityList);
+
+    body.innerHTML = sortedAccounts.map((account, index) => {
       const status = accountState(account);
       const uid = esc(account.user_id);
+      const isSelected = state.selectedAccounts && state.selectedAccounts.has(account.user_id);
+      const isPriority = prioritySet.has(account.user_id);
+      const priStar = isPriority ? `<span title="优先级浏览器实例（生成时优先调度）" style="color:#eab308; font-size:13px; margin-right:4px; user-select:none;">⭐</span>` : '';
       const note = account.note ? `<span class="fx-account-id">${esc(account.note)}</span>` : '';
+      const expTag = account.expires_at ? `<span class="fx-account-id" style="color:var(--text-muted, #888); font-size:11px; margin-left:4px;">[重置:${esc(account.expires_at)}]</span>` : '';
       const cooldownButton = (status.key === 'cooling' || status.key === 'login_required')
         ? `<button class="fx-button" data-action="clear-cooldown" data-user-id="${uid}">解除冷却</button>` : '';
       const imgCount = account.image_task_count || 0;
@@ -433,8 +470,10 @@
       const totalCount = account.task_count != null ? account.task_count : (imgCount + vidCount);
       const taskBadge = `<span class="fx-account-id" style="font-weight:600; color:var(--text-main, #333);">${totalCount}</span> <span class="fx-account-id" style="font-size:11px; color:var(--text-muted, #888);">(图${imgCount}/视${vidCount})</span>`;
 
-      return `<tr>
-        <td>${account.serial_number ? `<span class="fx-account-id" style="color:var(--text-muted, #888); font-weight:600; margin-right:4px;">[#${esc(account.serial_number)}]</span>` : ''}<span class="fx-account-name">${esc(account.name || account.user_id)}</span><span class="fx-account-id">${uid}</span>${note}</td>
+      return `<tr class="${isSelected ? 'fx-row-selected' : ''}">
+        <td style="text-align:center;"><input type="checkbox" class="fx-account-select" data-user-id="${uid}" ${isSelected ? 'checked' : ''} style="cursor:pointer;"></td>
+        <td style="text-align:center; font-weight:700; color:var(--text-muted, #888); font-size:11px;">#${index + 1}</td>
+        <td>${priStar}${account.serial_number ? `<span class="fx-account-id" style="color:var(--text-muted, #888); font-weight:600; margin-right:4px;">[环境#${esc(account.serial_number)}]</span>` : ''}<span class="fx-account-name">${esc(account.name || account.user_id)}</span><span class="fx-account-id">${uid}</span>${expTag}${note}</td>
         <td>${esc(creditLabel(account))}</td>
         <td>${taskBadge}</td>
         <td><span class="fx-badge fx-badge-${status.tone}" title="${esc(account.last_probe_error || account.cooldown_reason || '')}">${status.label}</span></td>
@@ -742,6 +781,27 @@
       return `<label class="fx-config-field"><span>${label}</span>
         <select data-config-key="${esc(key)}" data-config-account="1">${accountOptionsHtml(value)}</select></label>`;
     }
+    if (spec.type === 'account_list') {
+      const selectedList = Array.isArray(value)
+        ? value.map(String)
+        : (typeof value === 'string' && value ? value.split(',').map(s => s.trim()) : []);
+      const selectedSet = new Set(selectedList);
+      const rows = (state.accounts || []).map((account) => {
+        const uid = String(account.user_id);
+        const serial = account.serial_number ? `[#${esc(account.serial_number)}] ` : '';
+        const checked = selectedSet.has(uid) ? 'checked' : '';
+        return `<label style="display:inline-flex; align-items:center; gap:4px; margin-right:10px; font-size:12px; cursor:pointer;">
+          <input type="checkbox" data-config-account-item="${esc(uid)}" ${checked}>
+          <span>${serial}${esc(account.name || uid)}</span>
+        </label>`;
+      }).join('');
+      return `<div class="fx-config-field" data-config-key="${esc(key)}" data-config-type="account_list">
+        <span>${label}</span>
+        <div class="fx-config-account-list" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; padding:8px 10px; background:rgba(0,0,0,0.03); border-radius:6px; border:1px solid var(--border-color, rgba(0,0,0,0.1));">
+          ${rows || '<span style="color:var(--text-muted, #888); font-size:11px;">暂无号池账号</span>'}
+        </div>
+      </div>`;
+    }
     if (spec.type === 'bool') {
       return `<label class="fx-config-field"><span>${label}</span>
         <input type="checkbox" data-config-key="${esc(key)}" ${value ? 'checked' : ''}></label>`;
@@ -804,6 +864,13 @@
       if (!spec) return;
       if (spec.type === 'bool') patch[key] = el.checked;
       else if (spec.type === 'integer') patch[key] = Number(el.value);
+      else if (spec.type === 'account_list') {
+        const checked = [];
+        el.querySelectorAll('input[data-config-account-item]:checked').forEach((cb) => {
+          checked.push(cb.dataset.configAccountItem);
+        });
+        patch[key] = checked;
+      }
       else patch[key] = el.value;
     });
     return patch;
@@ -1431,9 +1498,226 @@
       finally { button.disabled = false; }
     });
 
+    $('fx-account-select-all')?.addEventListener('change', (event) => {
+      const checked = event.target.checked;
+      if (!state.selectedAccounts) state.selectedAccounts = new Set();
+      if (checked) {
+        (state.accounts || []).forEach(a => state.selectedAccounts.add(a.user_id));
+      } else {
+        state.selectedAccounts.clear();
+      }
+      renderAccounts(state.accounts || []);
+    });
+
     $('fx-account-table-body')?.addEventListener('click', (event) => {
+      const chk = event.target.closest('.fx-account-select');
+      if (chk) {
+        const uid = chk.dataset.userId;
+        if (!uid) return;
+        if (!state.selectedAccounts) state.selectedAccounts = new Set();
+        const sorted = sortAccounts(state.accounts || [], state.accountSortKey);
+        const idx = sorted.findIndex(a => a.user_id === uid);
+        if (event.shiftKey && state.lastAccountClickedIndex >= 0 && state.lastAccountClickedIndex !== idx) {
+          const start = Math.min(state.lastAccountClickedIndex, idx);
+          const end = Math.max(state.lastAccountClickedIndex, idx);
+          const shouldCheck = chk.checked;
+          for (let i = start; i <= end; i++) {
+            const a = sorted[i];
+            if (!a) continue;
+            if (shouldCheck) state.selectedAccounts.add(a.user_id);
+            else state.selectedAccounts.delete(a.user_id);
+          }
+          renderAccounts(state.accounts || []);
+          return;
+        }
+        state.lastAccountClickedIndex = idx;
+        if (chk.checked) state.selectedAccounts.add(uid);
+        else state.selectedAccounts.delete(uid);
+        chk.closest('tr')?.classList.toggle('fx-row-selected', chk.checked);
+        updateConsoleAccountBulkBar();
+        return;
+      }
       const button = event.target.closest('button[data-action]');
       if (button) handleAccountAction(button);
+    });
+
+    $('fx-account-bulk-clear')?.addEventListener('click', () => {
+      if (state.selectedAccounts) state.selectedAccounts.clear();
+      renderAccounts(state.accounts || []);
+    });
+
+    $('fx-account-bulk-priority')?.addEventListener('click', async (event) => {
+      const uids = Array.from(state.selectedAccounts || []);
+      if (!uids.length) return;
+      const currentList = Array.isArray(state.config?.googleFxPriorityUserIds)
+        ? state.config.googleFxPriorityUserIds.map(String)
+        : [];
+      const currentSet = new Set(currentList);
+      uids.forEach(u => currentSet.add(u));
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await post('/api/google-fx/config', { patch: { googleFxPriorityUserIds: Array.from(currentSet) } });
+        await refresh(true);
+        showToast(`已将 ${uids.length} 个账号设为优先级实例`);
+      } catch (e) {
+        showToast(`设为优先失败：${e.message}`, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    $('fx-account-bulk-unpriority')?.addEventListener('click', async (event) => {
+      const uids = Array.from(state.selectedAccounts || []);
+      if (!uids.length) return;
+      const currentList = Array.isArray(state.config?.googleFxPriorityUserIds)
+        ? state.config.googleFxPriorityUserIds.map(String)
+        : [];
+      const currentSet = new Set(currentList);
+      uids.forEach(u => currentSet.delete(u));
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await post('/api/google-fx/config', { patch: { googleFxPriorityUserIds: Array.from(currentSet) } });
+        await refresh(true);
+        showToast(`已取消 ${uids.length} 个账号的优先级`);
+      } catch (e) {
+        showToast(`取消优先失败：${e.message}`, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    $('fx-account-bulk-expires')?.addEventListener('click', async (event) => {
+      const uids = Array.from(state.selectedAccounts || []);
+      if (!uids.length) return;
+      const val = global.prompt(`批量设置重置日期：\n请输入要应用到选中的 ${uids.length} 个账号的重置日期 (格式: YYYY-MM-DD，留空清空)：`, '');
+      if (val === null) return;
+      const expDate = val.trim() || null;
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const res = await post('/api/account-pool/expires-at', { user_ids: uids, expires_at: expDate });
+        await refresh(true);
+        showToast(`已成功为 ${res.updated_count || uids.length} 个账号更新重置日期`);
+      } catch (e) {
+        showToast(`批量设置重置日期失败：${e.message}`, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    $('fx-account-bulk-enable')?.addEventListener('click', async (event) => {
+      const uids = Array.from(state.selectedAccounts || []);
+      if (!uids.length) return;
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await post('/api/account-pool/toggle', { user_ids: uids, disabled: false });
+        await refresh(true);
+        showToast(`已批量启用 ${uids.length} 个账号`);
+      } catch (e) {
+        showToast(`批量启用失败：${e.message}`, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    $('fx-account-bulk-disable')?.addEventListener('click', async (event) => {
+      const uids = Array.from(state.selectedAccounts || []);
+      if (!uids.length) return;
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await post('/api/account-pool/toggle', { user_ids: uids, disabled: true });
+        await refresh(true);
+        showToast(`已批量禁用 ${uids.length} 个账号`);
+      } catch (e) {
+        showToast(`批量禁用失败：${e.message}`, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    $('fx-account-bulk-password')?.addEventListener('click', async (event) => {
+      const uids = Array.from(state.selectedAccounts || []);
+      if (!uids.length) return;
+      const pwd = global.prompt(`批量设置密码：\n请输入要应用到选中的 ${uids.length} 个账号的统一密码：`, 'Sharpal2025');
+      if (pwd === null) return;
+      const password = pwd.trim();
+      if (!password) {
+        showToast('密码不能为空', true);
+        return;
+      }
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const res = await post('/api/account-pool/credentials', { user_ids: uids, password: password });
+        await refresh(true);
+        showToast(`已为 ${res.count || uids.length} 个账号统一更新登录密码`);
+      } catch (e) {
+        showToast(`批量设置密码失败：${e.message}`, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    $('fx-account-bulk-close')?.addEventListener('click', async (event) => {
+      const uids = Array.from(state.selectedAccounts || []);
+      if (!uids.length) return;
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await post('/api/account-pool/close-browser', { user_ids: uids });
+        showToast(`已向 ${uids.length} 个账号发送关闭浏览器指令`);
+      } catch (e) {
+        showToast(`批量关闭失败：${e.message}`, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    $('fx-account-bulk-delete')?.addEventListener('click', async (event) => {
+      const uids = Array.from(state.selectedAccounts || []);
+      if (!uids.length) return;
+      if (!global.confirm(`确定要从号池移除选中的 ${uids.length} 个账号吗？（不影响 AdsPower 里的浏览器环境）`)) return;
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await post('/api/account-pool/delete', { user_ids: uids });
+        if (state.selectedAccounts) state.selectedAccounts.clear();
+        state.profilesLoaded = false;
+        await refresh(true);
+        await loadProfiles(true);
+        showToast(`已成功移除 ${uids.length} 个账号`);
+      } catch (e) {
+        showToast(`批量移除失败：${e.message}`, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    $('fx-account-bulk-refresh')?.addEventListener('click', async (event) => {
+      const uids = Array.from(state.selectedAccounts || []);
+      if (!uids.length) return;
+      const button = event.currentTarget;
+      const originalText = button.textContent;
+      button.disabled = true;
+      let okCount = 0;
+      let failCount = 0;
+      for (let i = 0; i < uids.length; i++) {
+        button.textContent = `⏳ 探测中 (${i + 1}/${uids.length})...`;
+        try {
+          await post('/api/account-pool/refresh', { user_id: uids[i] });
+          okCount++;
+        } catch (e) {
+          failCount++;
+        }
+      }
+      button.disabled = false;
+      button.textContent = originalText;
+      await refresh(true);
+      showToast(`批量刷新完成：成功 ${okCount} 个${failCount > 0 ? `，跳过/失败 ${failCount} 个` : ''}`);
     });
     $('fx-proxy-table-body')?.addEventListener('click', (event) => {
       const button = event.target.closest('button[data-proxy-action]');

@@ -846,15 +846,82 @@ class OmniComposer(BaseComposer):
         文案取自类属性（pacing_phrase / inshot_phrase），子 profile 换皮即可——注入点、
         判定口径与「过门拍/兑现拍免除」的分流仍然只有这一处实现。"""
         text = video_prompt or ''
-        if self.pacing_marker not in text.lower():
+        low = text.lower()
+
+        # 1. 节奏声明检测（支持 marker 及常见变体正则）
+        has_pacing = bool(
+            self.pacing_marker in low
+            or re.search(r'(?i)\bedited\s+(?:miniature\s+craft|construction)\s+time-lapse\s+assembled\s+from\s+multiple', text)
+        )
+        if not has_pacing:
             if text and not text.endswith(('.', '!', '?')):
                 text += '.'
             text = f"{text} {self.pacing_phrase}".strip()
-        if self.inshot_marker not in text.lower():
+
+        # 2. 镜内连续性声明检测（支持 marker 及常见变体正则）
+        has_inshot = bool(
+            self.inshot_marker in low
+            or re.search(r'(?i)\binside\s+every\s+shot\s+the\s+frame\s+keeps\s+(?:living|moving)', text)
+            or re.search(r'(?i)\bthe\s+only\s+compressions\s+in\s+the\s+clip\s+fall', text)
+        )
+        if not has_inshot:
             if text and not text.endswith(('.', '!', '?')):
                 text += '.'
             text = f"{text} {self.inshot_phrase}".strip()
+
+        # 3. 终极去重清洗：若多次拼接产生重复的套话段落，保留第一处并清除多余副本
+        text = self.deduplicate_boilerplate_phrases(text)
         return text
+
+    @staticmethod
+    def deduplicate_boilerplate_phrases(text):
+        """清理提示词中因多次拼接或回炉产生的重复套话（如重复开场白、重复连续性声明、重复节奏声明）。"""
+        if not text or not isinstance(text, str):
+            return text
+
+        # (1) 开场白去重 (Use the provided image / Use IMAGE N ...)
+        anchor_pattern = re.compile(
+            r'(Use the provided (?:first frame and last frame|image) as (?:the )?exact (?:starting )?composition and environment anchor\.[^.;]*?[.;])',
+            re.IGNORECASE
+        )
+        anchor_matches = list(anchor_pattern.finditer(text))
+        if len(anchor_matches) > 1:
+            first_span = anchor_matches[0].span()
+            head = text[:first_span[1]]
+            tail = text[first_span[1]:]
+            for m in anchor_matches[1:]:
+                tail = tail.replace(m.group(0), '', 1)
+            text = head + tail
+
+        # (2) 镜内连续性声明去重 (Inside every shot the frame keeps living/moving...)
+        inshot_pattern = re.compile(
+            r'(Inside every shot the frame keeps (?:living|moving) from its first to its last moment — [^.;]+? — and this beat\'s change advances only during the (?:working|work) shots\.\s*The only compressions in the clip fall [^.;]+?; no shot contains a hold, a stall, or a deferred step that is then delivered all at once\.?)',
+            re.IGNORECASE
+        )
+        inshot_matches = list(inshot_pattern.finditer(text))
+        if len(inshot_matches) > 1:
+            first_span = inshot_matches[0].span()
+            head = text[:first_span[1]]
+            tail = text[first_span[1]:]
+            for m in inshot_matches[1:]:
+                tail = tail.replace(m.group(0), '', 1)
+            text = head + tail
+
+        # (3) 节奏声明去重 (edited miniature craft time-lapse / edited construction time-lapse...)
+        pacing_pattern = re.compile(
+            r'(edited (?:miniature craft|construction) time-lapse assembled from multiple (?:macro )?camera setups, not real-time footage(?:, with oversized human hands entering and withdrawing between passes)?\.?)',
+            re.IGNORECASE
+        )
+        pacing_matches = list(pacing_pattern.finditer(text))
+        if len(pacing_matches) > 1:
+            first_span = pacing_matches[0].span()
+            head = text[:first_span[1]]
+            tail = text[first_span[1]:]
+            for m in pacing_matches[1:]:
+                tail = tail.replace(m.group(0), '', 1)
+            text = head + tail
+
+        return re.sub(r'\s{2,}', ' ', text).strip()
 
     def fallback_ladder_clause(self, ladder):
         """占位兜底稿补的镜头梯声明。默认是 omni 的 UGC 手机质感版本。"""

@@ -146,6 +146,7 @@
                     <span class="status-dot"></span>
                     <span class="status-text">检测 API 连接中...</span>
                 </div>
+                <div id="account-pool-global-hud" class="account-pool-global-hud" style="display: none;" title="号池状态与自动调度"></div>
                 <!-- 「任务列表」「点子库」两个抽屉切换按钮已合并成这一个入口：
                      两者的内容现在都在「📁 项目」主标签页里（见 #panel-projects）。
                      角标 id 保持 active-task-count 不变，updateTasksBadge 与那路
@@ -749,9 +750,14 @@
                                     <span class="group-title" style="margin: 0; display: flex; align-items: center; gap: 8px; font-weight: 700; color: var(--neon-cyan);">
                                         🖼️ 视频关键帧多宫格拼图 (Keyframe Collage)
                                     </span>
-                                    <a id="collage-download-link" href="#" target="_blank" class="action-btn text-btn mini-btn" download style="text-decoration: none;">下载拼图</a>
+                                    <div style="display: flex; align-items: center; gap: 8px;">
+                                        <span style="font-size: 11.5px; color: var(--text-muted);">💡 点击多宫格可逐帧单独放大</span>
+                                        <a id="collage-download-link" href="#" target="_blank" class="action-btn text-btn mini-btn" download style="text-decoration: none;">下载拼图</a>
+                                    </div>
                                 </div>
-                                <img id="collage-preview-img" src="" alt="关键帧多宫格拼图" style="width: 100%; border-radius: 6px; border: 1px solid rgba(255,255,255,0.15); object-fit: contain; max-height: 300px; cursor: pointer;">
+                                <div class="collage-img-container" style="position: relative; cursor: pointer;">
+                                    <img id="collage-preview-img" src="" alt="关键帧多宫格拼图" style="width: 100%; border-radius: 6px; border: 1px solid rgba(255,255,255,0.15); object-fit: contain; max-height: 300px; cursor: pointer; display: block;">
+                                </div>
                             </div>
 
                             <!-- 原始 Markdown 提示词块（本页唯一内容，直接展开显示）。
@@ -1383,21 +1389,77 @@
                         <p class="settings-section-desc">帧序列 / 视频生成共用的 AdsPower + Flow 账号池，发起生成前自动挑一个还有积分的账号。</p>
 
                         <div class="account-pool-manage-body">
-                            <div class="account-pool-sort-row">
-                                <label for="account-pool-sort-select">↕ 排序方式：</label>
-                                <select id="account-pool-sort-select" class="account-pool-sort-select">
-                                    <option value="serial_asc">按环境编号 (升序)</option>
-                                    <option value="credit_desc">按积分余额 (高 → 低)</option>
-                                    <option value="credit_asc">按积分余额 (低 → 高)</option>
-                                    <option value="tasks_desc">按任务总数 (多 → 少)</option>
-                                    <option value="image_desc">按图片任务数 (多 → 少)</option>
-                                    <option value="video_desc">按视频任务数 (多 → 少)</option>
-                                    <option value="name_asc">按账号命名 (A → Z)</option>
-                                </select>
+                            <!-- 概览统计条：每格既是仪表也是筛选器（点一下只看这一类账号）。
+                                 号池长到几十个以后，"哪个号出问题了"比"池子里有谁"更常问，
+                                 所以把可用/禁用/低分/缺2FA 直接做成入口。 -->
+                            <div class="account-pool-stats" id="account-pool-stats"></div>
+
+                            <div class="account-pool-toolbar">
+                                <div class="account-pool-toolbar-left">
+                                    <div class="account-pool-search-wrap">
+                                        <span class="account-pool-search-icon">🔍</span>
+                                        <input type="search" id="account-pool-search" class="account-pool-search-input"
+                                               placeholder="搜索账号 / 备注 / 编号" autocomplete="off">
+                                        <button type="button" id="account-pool-search-clear" class="account-pool-search-clear" title="清空搜索" hidden>✕</button>
+                                    </div>
+                                    <button type="button" id="account-pool-select-all-btn" class="ledger-tool-btn"
+                                            title="勾选/取消勾选当前可见的全部账号">☑️ 全选</button>
+                                    <span class="account-pool-bulk-count" id="account-pool-bulk-count"></span>
+                                </div>
+                                <div class="account-pool-toolbar-right">
+                                    <div class="account-pool-view-switcher" role="group" aria-label="视图切换">
+                                        <button type="button" class="account-pool-view-btn active" id="account-pool-view-list-btn" title="列表视图 (紧凑列表)">📋 列表</button>
+                                        <button type="button" class="account-pool-view-btn" id="account-pool-view-grid-btn" title="网格视图 (卡片看板)">🔲 网格</button>
+                                    </div>
+                                    <label for="account-pool-strategy-select">⚡ 选号策略：</label>
+                                    <select id="account-pool-strategy-select" class="account-pool-sort-select" title="生成帧序列/视频序列时的优先调度策略">
+                                        <option value="credit_desc">🏆 积分最多优先（默认）</option>
+                                        <option value="expiration_asc">⏳ 重置日期最早优先</option>
+                                        <option value="rotation">🔄 均衡轮换（按换号节拍）</option>
+                                    </select>
+                                    <label for="account-pool-sort-select" style="margin-left:6px;">↕ 排序：</label>
+                                    <select id="account-pool-sort-select" class="account-pool-sort-select">
+                                        <option value="serial_asc">按环境编号 (升序)</option>
+                                        <option value="credit_desc">按积分余额 (高 → 低)</option>
+                                        <option value="credit_asc">按积分余额 (低 → 高)</option>
+                                        <option value="expires_asc">按重置日期 (最早 → 最晚)</option>
+                                        <option value="tasks_desc">按任务总数 (多 → 少)</option>
+                                        <option value="image_desc">按图片任务数 (多 → 少)</option>
+                                        <option value="video_desc">按视频任务数 (多 → 少)</option>
+                                        <option value="name_asc">按账号命名 (A → Z)</option>
+                                    </select>
+                                </div>
                             </div>
+
+                            <div class="account-pool-bulk-bar" id="account-pool-bulk-actions-bar" hidden>
+                                <span class="account-pool-bulk-title" id="account-pool-bulk-title">已选 0 个</span>
+                                <div class="account-pool-bulk-actions">
+                                    <button type="button" id="account-pool-bulk-priority-btn" class="ledger-tool-btn" title="将所选账号设为生成时的优先级浏览器实例">⭐ 设为优先级实例</button>
+                                    <button type="button" id="account-pool-bulk-unpriority-btn" class="ledger-tool-btn" title="取消所选账号的优先级">☆ 取消优先</button>
+                                    <button type="button" id="account-pool-bulk-expires-btn" class="ledger-tool-btn" title="批量设置所选账号的额度重置日期">📅 设置重置日期</button>
+                                    <button type="button" id="account-pool-bulk-enable-btn" class="ledger-tool-btn" title="批量启用所选账号">✅ 批量启用</button>
+                                    <button type="button" id="account-pool-bulk-disable-btn" class="ledger-tool-btn" title="批量禁用所选账号">🚫 批量禁用</button>
+                                    <button type="button" id="account-pool-bulk-password-btn" class="ledger-tool-btn" title="批量统一设置所选账号的登录密码">🔑 批量设置密码</button>
+                                    <button type="button" id="account-pool-bulk-refresh-btn" class="ledger-tool-btn" title="批量真实探测所选账号的积分">🔎 批量刷新积分</button>
+                                    <button type="button" id="account-pool-bulk-close-btn" class="ledger-tool-btn" title="批量关闭所选账号的 AdsPower 浏览器">🛑 批量关闭浏览器</button>
+                                    <button type="button" id="account-pool-bulk-export-btn" class="ledger-tool-btn" title="仅导出所选账号的配置">📤 导出所选</button>
+                                    <button type="button" id="account-pool-bulk-delete-btn" class="ledger-tool-btn danger" title="从号池移除所选账号">🗑️ 批量删除</button>
+                                </div>
+                                <button type="button" id="account-pool-bulk-clear-btn" class="ledger-tool-btn">取消选择</button>
+                            </div>
+
                             <div class="account-pool-list" id="account-pool-list"></div>
+
+                            <!-- 添加/导入导出默认收起：这几行是低频操作，展开着只会把
+                                 账号列表挤成一条缝（右栏高度是固定的）。展开状态记在
+                                 localStorage 里，习惯开着的人不用每次点。 -->
+                            <details class="account-pool-add-panel" id="account-pool-add-panel">
+                                <summary class="account-pool-add-summary">
+                                    <span>➕ 添加账号 · 导入 / 导出号池</span>
+                                    <span class="account-pool-add-summary-hint"></span>
+                                </summary>
                             <div class="account-pool-bulk-row">
-                                <button type="button" id="account-pool-import-all-btn" class="ledger-tool-btn"
+                                <button type="button" id="account-pool-import-all-btn" class="ledger-tool-btn primary"
                                         title="把本机 AdsPower 里所有浏览器环境一次性加进号池，已在池子里的跳过（不覆盖已改过的命名/备注）">📥 一键添加全部 AdsPower 环境</button>
                                 <button type="button" id="account-pool-export-btn" class="ledger-tool-btn"
                                         title="导出当前号池配置及状态（可选是否包含明文凭据与 2FA 密钥）">📤 导出号池配置</button>
@@ -1412,9 +1474,11 @@
                                 </select>
                                 <input type="text" id="account-pool-add-name" placeholder="账号命名（留空默认用邮箱地址）">
                                 <input type="text" id="account-pool-add-note" placeholder="备注（选填）">
-                                <button type="button" id="account-pool-add-btn" class="ledger-tool-btn">➕ 添加</button>
+                                <input type="date" id="account-pool-add-expires" title="额度重置日期（选填）">
+                                <button type="button" id="account-pool-add-btn" class="ledger-tool-btn primary">➕ 添加</button>
                             </div>
-                            <p class="settings-inline-note" title="池子为空时完全不影响现有行为：沿用「选号策略」里的「指定浏览器编号」单选。">积分只信「刷新积分」的真实探测结果（要开一次浏览器读 Flow 页面，较慢）；发起视频生成时缓存超过 30 分钟会自动刷一次。</p>
+                            <p class="settings-inline-note" title="池子为空时完全不影响现有行为：沿用「选号策略」里的「指定浏览器序号」单选。">积分只信「刷新积分」的真实探测结果（要开一次浏览器读 Flow 页面，较慢）；发起视频生成时缓存超过 30 分钟会自动刷一次。</p>
+                            </details>
                         </div>
                     </section>
 

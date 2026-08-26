@@ -1947,9 +1947,11 @@ def _generate_images_batch_google_fx_unlocked(req: ImageBatchRequest):
                             log("⚠️ 图片已生成，但无法解析实际 AdsPower 账号，任务数未记录", "GoogleFX")
                         else:
                             from ..utils.account_pool import AccountPool
-                            entry = AccountPool().record_task_count(
+                            pool_inst = AccountPool()
+                            entry = pool_inst.record_task_count(
                                 current_uid, image_count=len(images)
                             )
+                            pool_inst.optimistic_deduct_credit(current_uid, amount=len(images))
                             if entry is None:
                                 log(
                                     f"⚠️ 图片已生成，但账号 {current_uid} 不在账号池中，任务数未记录",

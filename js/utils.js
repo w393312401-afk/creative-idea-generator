@@ -125,6 +125,13 @@ function customPrompt(message, defaultValue = '') {
             close();
             resolve(val);
         });
+
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) {
+                close();
+                resolve(null);
+            }
+        });
         
         input.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') {
@@ -199,6 +206,10 @@ function customTextarea({ title = '输入内容', message = '', defaultValue = '
         modal.querySelector('.confirm-btn').addEventListener('click', () => finish('confirm'));
         if (extraBtn) extraBtn.addEventListener('click', () => finish('extra'));
 
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) finish(null);
+        });
+
         // Enter 在多行输入里是换行，提交要按 Ctrl/Cmd+Enter
         input.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
@@ -254,6 +265,13 @@ function customConfirm(message, confirmLabel = '确定', cancelLabel = '取消')
         modal.querySelector('.confirm-btn').addEventListener('click', () => {
             close();
             resolve(true);
+        });
+
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) {
+                close();
+                resolve(false);
+            }
         });
         
         modal.addEventListener('keydown', (e) => {

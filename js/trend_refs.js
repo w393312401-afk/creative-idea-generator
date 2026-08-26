@@ -918,6 +918,12 @@ function initTrendRefsManageModal() {
     if (openBtn) openBtn.addEventListener('click', openTrendRefsManageModal);
     const closeBtn = document.getElementById('trend-refs-manage-close-btn');
     if (closeBtn) closeBtn.addEventListener('click', closeTrendRefsManageModal);
+    const modal = document.getElementById('trend-refs-manage-modal');
+    if (modal) {
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) closeTrendRefsManageModal();
+        });
+    }
 
     const scopeBar = document.getElementById('trend-refs-manage-scope');
     if (scopeBar) {

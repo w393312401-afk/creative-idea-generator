@@ -31,7 +31,7 @@ class _FakePool:
     def list_accounts(self):
         return list(self._accounts)
 
-    def pick_account(self, min_credit=1):
+    def pick_account(self, min_credit=1, *args, **kwargs):
         self.pick_calls.append(min_credit)
         return self._chosen
 

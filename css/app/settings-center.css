@@ -7,9 +7,10 @@
    ========================================================================== */
 
 .modal-content.settings-center {
-    max-width: 900px;
+    max-width: 960px;
+    width: 94vw;
     /* 定高：分区之间切换时窗口不跳，长分区（号池）自己在右栏内部滚 */
-    height: 660px;
+    height: 680px;
     max-height: 88vh;
     max-height: 88dvh;
 }
@@ -579,6 +580,21 @@
     padding-right: 2px;
 }
 
+/* 统计条/工具栏/批量条都不参与纵向伸缩——右栏被压扁时先压列表，
+   而不是把这几行挤没（挤没了就没法筛选和取消选择了）。 */
+.settings-section[data-section="pool"] .account-pool-stats,
+.settings-section[data-section="pool"] .account-pool-toolbar,
+.settings-section[data-section="pool"] .account-pool-bulk-bar {
+    flex-shrink: 0;
+    margin-bottom: 0;
+}
+
+/* 折叠面板展开后自己滚，别把账号列表压到只剩一条缝 */
+.settings-section[data-section="pool"] .account-pool-add-panel[open] {
+    max-height: 42%;
+    overflow-y: auto;
+}
+
 /* ── 移动端：左栏折成顶部横向芯片行 ─────────────────────────────────── */
 @media (max-width: 768px) {
     .modal-content.settings-center {
@@ -629,5 +645,26 @@
 
     .settings-section[data-section="pool"] .account-pool-add-row {
         flex-wrap: wrap;
+    }
+
+    /* 窄屏：搜索框独占一行，统计条横向滚而不是折成三行占掉半屏 */
+    .account-pool-search-wrap {
+        max-width: none;
+        flex: 1 1 100%;
+    }
+
+    .account-pool-stats {
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        scrollbar-width: none;
+        padding-bottom: 2px;
+    }
+
+    .account-pool-stats::-webkit-scrollbar {
+        display: none;
+    }
+
+    .account-pool-stat-tile {
+        flex-shrink: 0;
     }
 }

@@ -47,10 +47,23 @@ function openCollageViewer(opts = {}) {
     
     // 提取有效帧列表
     let frames = [];
-    if (idea && idea.frameRun && Array.isArray(idea.frameRun.frames)) {
+    if (idea && idea.frameRun && Array.isArray(idea.frameRun.frames) && idea.frameRun.frames.length) {
         frames = idea.frameRun.frames.filter(f => f.url || f.file);
-    } else if (idea && Array.isArray(idea.covers)) {
+    } else if (idea && Array.isArray(idea.frames) && idea.frames.length) {
+        frames = idea.frames.filter(f => f.url || f.file);
+    } else if (idea && Array.isArray(idea.covers) && idea.covers.length) {
         frames = idea.covers.map((c, i) => ({ sequence: i + 1, url: typeof c === 'string' ? c : (c.url || c.file) }));
+    }
+
+    // 若 frames 仍为空但有创意标题和图片数，构建默认帧路径
+    if (!frames.length && idea && idea.title && (idea.image_count || (idea.frameRun && idea.frameRun.image_count))) {
+        const count = idea.image_count || idea.frameRun.image_count || 0;
+        for (let i = 1; i <= count; i++) {
+            frames.push({
+                sequence: i,
+                url: `/outputs/${idea.title}/frames/img_${String(i).padStart(3, '0')}.webp`
+            });
+        }
     }
 
     if (!collageUrl && !frames.length) {
@@ -99,6 +112,33 @@ function closeCollageViewer() {
     }
 }
 
+function openCollageFrameLightbox(index = 0) {
+    const st = collageViewerState;
+    if (!st.frames || !st.frames.length) {
+        if (st.collageUrl && typeof openLightbox === 'function') {
+            openLightbox([{
+                type: 'image',
+                url: st.collageUrl,
+                caption: `<strong>5 列全景多宫格拼图</strong> · ${st.idea && st.idea.title ? st.idea.title : ''}`
+            }], 0);
+        }
+        return;
+    }
+    const safeIdx = Math.max(0, Math.min(index, st.frames.length - 1));
+    const items = st.frames.map((f, i) => {
+        const seq = f.sequence || (i + 1);
+        const titleStr = (st.idea && st.idea.title) ? ` · ${st.idea.title}` : '';
+        return {
+            type: 'image',
+            url: f.url || f.file,
+            caption: `<strong>第 ${seq} 拍关键帧 (IMG ${String(seq).padStart(3, '0')})</strong> [${i + 1}/${st.frames.length}]${titleStr}`
+        };
+    });
+    if (typeof openLightbox === 'function') {
+        openLightbox(items, safeIdx);
+    }
+}
+
 function renderCollageViewerModal() {
     let modal = document.getElementById('collage-viewer-modal');
     if (!modal) {
@@ -121,20 +161,25 @@ function renderCollageViewerModal() {
                     <span class="cv-title-icon">🖼️</span>
                     <div class="cv-title-text">
                         <h3>交互式多宫格检查器 · 视觉连续性快检</h3>
-                        <span class="cv-subtitle">5 列全局拼图 · 局部放大镜 · 邻帧对比 · 地平透视对齐</span>
+                        <span class="cv-subtitle">5 列全局拼图 · 单帧点击放大 · 局部放大镜 · 邻帧对比 · 地平透视对齐</span>
                     </div>
                 </div>
 
                 <div class="cv-toolbar">
                     <!-- 模式切换 -->
                     <div class="cv-toolgroup cv-mode-group">
-                        <button type="button" class="cv-tool-btn ${st.mode === 'collage' ? 'is-active' : ''}" data-act="mode-collage" title="5列全景多宫格拼图总览">⊞ 5列拼图</button>
+                        <button type="button" class="cv-tool-btn ${st.mode === 'collage' ? 'is-active' : ''}" data-act="mode-collage" title="5列全景多宫格拼图总览 (支持点击任一帧单独放大)">⊞ 5列拼图</button>
                         <button type="button" class="cv-tool-btn ${st.mode === 'compare' ? 'is-active' : ''}" data-act="mode-compare" title="前后帧左右滑动对比">⇄ 邻帧对比</button>
+                    </div>
+
+                    <!-- 单独放大入口 -->
+                    <div class="cv-toolgroup cv-collage-only" ${st.mode !== 'collage' ? 'style="display:none;"' : ''}>
+                        <button type="button" class="cv-tool-btn" data-act="open-lightbox-current" title="以高清晰度灯箱单独放大浏览每一帧 (支持 ← / → 键盘连续翻页)">🔍 单帧放大</button>
                     </div>
 
                     <!-- 放大镜开关 (Collage模式) -->
                     <div class="cv-toolgroup cv-collage-only" ${st.mode !== 'collage' ? 'style="display:none;"' : ''}>
-                        <button type="button" class="cv-tool-btn ${st.magnifierActive ? 'is-active' : ''}" data-act="toggle-magnifier" title="开启/关闭跟随鼠标的高精局部放大镜 (2.5x)">🔍 放大镜</button>
+                        <button type="button" class="cv-tool-btn ${st.magnifierActive ? 'is-active' : ''}" data-act="toggle-magnifier" title="开启/关闭跟随鼠标的高精局部放大镜 (2.5x)">🔬 悬浮放大镜</button>
                     </div>
 
                     <!-- 辅助基准线 (Collage模式) -->
@@ -176,7 +221,7 @@ function renderCollageViewerModal() {
             <div class="cv-footer">
                 <div class="cv-footer-hints">
                     ${st.mode === 'collage' 
-                        ? '💡 提示：按住鼠标左键可平移画布，滚轮可无级缩放；开启放大镜后悬浮查看局部结构；地平线支持直接上下拖拽微调。'
+                        ? '💡 提示：点击拼图中任意画面即可<b>单独全屏放大</b>；按住鼠标左键可平移画布，滚轮无级缩放；地平线支持拖拽。'
                         : '💡 提示：拖动中间分界线滑动对比前后帧差异；支持快捷键「← / →」快速切换上一对/下一对相邻帧。'
                     }
                 </div>
@@ -190,6 +235,26 @@ function renderCollageViewerModal() {
     bindCollageViewerEvents(modal);
 }
 
+function renderCollageHotspotsHtml(st) {
+    const frames = st.frames;
+    if (!frames || !frames.length) return '';
+    const totalFrames = frames.length;
+    const cols = 5;
+    const rows = Math.ceil(totalFrames / cols);
+
+    const cells = frames.map((f, idx) => `
+        <div class="cv-collage-hotspot-cell" data-frame-idx="${idx}" title="点击单独放大查看第 ${f.sequence || (idx + 1)} 帧">
+            <span class="cv-hotspot-tag">IMG ${String(f.sequence || (idx + 1)).padStart(3, '0')} 🔍 放大</span>
+        </div>
+    `).join('');
+
+    return `
+        <div class="cv-collage-hotspot-grid" id="cv-collage-hotspot-grid" style="grid-template-columns: repeat(${cols}, 1fr); grid-template-rows: repeat(${rows}, 1fr);">
+            ${cells}
+        </div>
+    `;
+}
+
 function renderCollageViewHtml() {
     const st = collageViewerState;
     const filterCls = st.filter === 'mono' ? 'cv-filter-mono' : (st.filter === 'contrast' ? 'cv-filter-contrast' : '');
@@ -199,7 +264,8 @@ function renderCollageViewHtml() {
             <div class="cv-canvas-transform" id="cv-canvas-transform" style="transform: translate(${st.panX}px, ${st.panY}px) scale(${st.zoom});">
                 <div class="cv-image-container ${filterCls}" id="cv-image-container">
                     ${st.collageUrl 
-                        ? `<img src="${st.collageUrl}" id="cv-collage-img" class="cv-collage-img" alt="5-Column Keyframe Collage" draggable="false">` 
+                        ? `<img src="${st.collageUrl}" id="cv-collage-img" class="cv-collage-img" alt="5-Column Keyframe Collage" draggable="false">
+                           ${renderCollageHotspotsHtml(st)}` 
                         : renderDynamicCollageGridHtml()
                     }
                     
@@ -240,14 +306,15 @@ function renderDynamicCollageGridHtml() {
     const st = collageViewerState;
     if (!st.frames.length) return '<div class="cv-empty-hint">暂无可用帧画面</div>';
     
-    const cells = st.frames.map(f => `
-        <div class="cv-dyn-cell">
-            <img src="${f.url || f.file}" alt="Frame ${f.sequence}" draggable="false">
-            <span class="cv-dyn-cell-label">IMG ${String(f.sequence).padStart(3, '0')}</span>
+    const cells = st.frames.map((f, idx) => `
+        <div class="cv-dyn-cell" data-frame-idx="${idx}" title="点击单独放大查看第 ${f.sequence || (idx + 1)} 帧">
+            <img src="${f.url || f.file}" alt="Frame ${f.sequence || (idx + 1)}" draggable="false">
+            <span class="cv-dyn-cell-label">IMG ${String(f.sequence || (idx + 1)).padStart(3, '0')}</span>
+            <span class="cv-dyn-cell-zoom-icon">🔍 放大</span>
         </div>
     `).join('');
 
-    return `<div class="cv-dyn-grid" style="display: grid; grid-template-columns: repeat(5, 240px); gap: 4px; background: #000; padding: 4px; border-radius: 4px;">${cells}</div>`;
+    return `<div class="cv-dyn-grid" id="cv-dyn-grid" style="display: grid; grid-template-columns: repeat(5, 240px); gap: 6px; background: #000; padding: 6px; border-radius: 6px;">${cells}</div>`;
 }
 
 function renderCompareViewHtml() {
@@ -310,6 +377,9 @@ function bindCollageViewerEvents(modal) {
 
     // 1. 关闭按钮与 Esc
     modal.querySelector('.cv-close-btn').addEventListener('click', closeCollageViewer);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeCollageViewer();
+    });
     const onKeyDown = (e) => {
         if (!collageViewerState.open) {
             window.removeEventListener('keydown', onKeyDown);
@@ -338,6 +408,8 @@ function bindCollageViewerEvents(modal) {
         } else if (act === 'mode-compare') {
             st.mode = 'compare';
             renderCollageViewerModal();
+        } else if (act === 'open-lightbox-current') {
+            openCollageFrameLightbox(0);
         } else if (act === 'toggle-magnifier') {
             st.magnifierActive = !st.magnifierActive;
             renderCollageViewerModal();
@@ -410,13 +482,16 @@ function bindCollageCanvasEvents(modal) {
         applyZoom(st.zoom * delta);
     }, { passive: false });
 
-    // 拖拽画布平移
+    // 拖拽画布平移与单帧点击放大判定
     let isPanning = false;
     let startX = 0, startY = 0;
+    let downClientX = 0, downClientY = 0;
 
     viewport.addEventListener('mousedown', (e) => {
         if (e.target.closest('#cv-line-horizon')) return; // 避免冲突
         isPanning = true;
+        downClientX = e.clientX;
+        downClientY = e.clientY;
         startX = e.clientX - st.panX;
         startY = e.clientY - st.panY;
         viewport.style.cursor = 'grabbing';
@@ -429,10 +504,22 @@ function bindCollageCanvasEvents(modal) {
         updateTransform();
     });
 
-    window.addEventListener('mouseup', () => {
+    window.addEventListener('mouseup', (e) => {
         if (isPanning) {
             isPanning = false;
             if (viewport) viewport.style.cursor = '';
+            
+            // 若位移极小（< 6px），判定为纯点击动作，触发单帧放大
+            const dist = Math.hypot(e.clientX - downClientX, e.clientY - downClientY);
+            if (dist < 6) {
+                const cell = e.target.closest('[data-frame-idx]');
+                if (cell && cell.dataset.frameIdx !== undefined) {
+                    const idx = parseInt(cell.dataset.frameIdx, 10);
+                    if (!isNaN(idx)) {
+                        openCollageFrameLightbox(idx);
+                    }
+                }
+            }
         }
     });
 
@@ -552,6 +639,30 @@ function bindCompareSliderEvents(modal) {
             isSliding = false;
         });
     }
+
+    // 4. 点击对比标签单独放大
+    const tagA = modal.querySelector('.cv-split-tag.tag-a');
+    if (tagA) {
+        tagA.style.cursor = 'pointer';
+        tagA.title = '点击单独放大查看基准帧 A';
+        tagA.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const seqA = st.comparePair[0];
+            const idx = st.frames.findIndex(f => Number(f.sequence) === Number(seqA));
+            openCollageFrameLightbox(idx !== -1 ? idx : 0);
+        });
+    }
+    const tagB = modal.querySelector('.cv-split-tag.tag-b');
+    if (tagB) {
+        tagB.style.cursor = 'pointer';
+        tagB.title = '点击单独放大查看递进帧 B';
+        tagB.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const seqB = st.comparePair[1];
+            const idx = st.frames.findIndex(f => Number(f.sequence) === Number(seqB));
+            openCollageFrameLightbox(idx !== -1 ? idx : 1);
+        });
+    }
 }
 
 function navigateComparePair(delta) {
@@ -575,6 +686,7 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         openCollageViewer,
         closeCollageViewer,
+        openCollageFrameLightbox,
         collageViewerState,
     };
 }

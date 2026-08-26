@@ -92,7 +92,7 @@ def _persist_optimization_results(project_dir, title, prompt_block, optimization
 
 def optimize_single_video_prompt(config, start_frame_path, end_frame_path, original_video_prompt,
                                  slot_index=None, start_seq=None, end_seq=None,
-                                 video_meta='', spatial_contract=None):
+                                 video_meta='', spatial_contract=None, profile=None):
     """针对单段视频提示词（VIDEO i），基于真实的起始帧与结束帧图像进行多模态视觉差量分析与优化。
 
     - start_frame_path: 起始锚点帧图像路径 (IMAGE i)
@@ -102,6 +102,7 @@ def optimize_single_video_prompt(config, start_frame_path, end_frame_path, origi
     - start_seq / end_seq: 起始帧号与结束帧号（默认 start_seq=slot_index, end_seq=slot_index+1）
     - video_meta: 槽位元数据标签 (如 [BRIDGE], [CUT], [HERO] 等)
     - spatial_contract: 空间契约/Drift Lock 数据（可选）
+    - profile: 题材 Profile（'miniature', 'omni', 'base' 等）
 
     返回优化后的视频提示词字符串。若 VLM 调用失败或发生异常，安全降级返回原始提示词。
     """
@@ -119,6 +120,12 @@ def optimize_single_video_prompt(config, start_frame_path, end_frame_path, origi
     e_idx = end_seq if end_seq is not None else (s_idx + 1)
     meta_str = str(video_meta or '').upper()
     is_crossing = 'BRIDGE' in meta_str or 'CUT' in meta_str
+    
+    is_miniature = (
+        str(profile or '').lower() == 'miniature'
+        or 'miniature' in original_video_prompt.lower()
+        or 'macro diorama' in original_video_prompt.lower()
+    )
 
     contract_info = ""
     if isinstance(spatial_contract, dict) and spatial_contract:
@@ -129,13 +136,61 @@ def optimize_single_video_prompt(config, start_frame_path, end_frame_path, origi
     crossing_rules = (
         "\nCRITICAL TWO-SHOT TRANSITION RULE FOR CROSSING SLOTS:\n"
         "- This slot is marked as a TRANSITION / BRIDGE slot.\n"
-        "- If Shot A (Exterior Opening): The camera performs a 24mm forward push toward the entrance. "
+        "- If Shot A (Exterior Opening): The camera performs a forward push toward the entrance. "
         "Show explicit mechanical unlocking (turning hatch wheel, sliding bolt, unlatching). "
         "Strictly ZERO workers, ZERO tools, and ZERO construction work inside the frame.\n"
-        "- If Shot B (Interior Entry): Camera is locked inside facing main depth axis; worker enters "
+        "- If Shot B (Interior Entry): Camera is locked inside facing main depth axis; actor enters "
         "with tools to stage and deliver the first physical work."
         if is_crossing else ""
     )
+
+    if is_miniature:
+        actor_and_scale_rule = (
+            "3. ACTOR & SCALE (MINIATURE DIORAMA & GIANT HANDS):\n"
+            "   - Construction is executed 100% by OVERSIZED REAL HUMAN HANDS (Giant Hands / Macro Fingers) entering "
+            "from frame margins wielding micro-tools (precision tweezers, miniature trowels, craft knives, glue applicators).\n"
+            "   - Strictly NEVER describe a full-scale human worker, neon safety vests, hard hats, or people inside the miniature structure.\n"
+            "   - Camera perspective: Locked macro diorama framing (50-85mm macro lens feel, shallow depth of field, creamy background bokeh) on tripod.\n"
+        )
+        syntax_rule = (
+            "6. MANDATORY SYNTAX & CLAUSES:\n"
+            f"   - Opening sentence MUST be: \"Use the provided image as the exact starting composition and environment anchor. "
+            f"Use IMAGE {s_idx} as the actual first-frame image; begin from this initial state and naturally progress the work through "
+            "the multi-shot sequence without inventing extraneous layouts.\"\n"
+            "   - Pacing clause MUST be: \"edited miniature craft time-lapse assembled from multiple macro camera setups, not real-time footage, "
+            "with oversized human hands entering and withdrawing between passes.\"\n"
+        )
+        living_cast_rule = (
+            "5. LIVING CAST ACTION-REACTION INTERLOCK (MINIATURE FIGURINES):\n"
+            "   - When miniature figurines (e.g. resident couple) are present, NEVER omit them or freeze them into static dolls.\n"
+            "   - Interweave their bodily responses directly with the giant hands/tools: immediate reflex/head-tilt when hands enter, "
+            "active gaze/body tracking during tool operations, and nodding/stepping forward to admire upon hand withdrawal.\n"
+            "   - Strictly FORBID static/idle phrasing ('unmoving', 'remain standing', 'stay in place', 'unchanged', 'static pose', 'watching quietly').\n"
+        )
+    else:
+        actor_and_scale_rule = (
+            "3. HUMAN SCALE & WORKER CONTINUOUS POSE TRANSITION:\n"
+            "   - Describe the worker with exact scale: 'a lone male worker (1.78m tall, occupying ~35% of vertical "
+            "frame height, realistically proportioned to the ceiling clearance) in a solid work jacket, dark trousers, "
+            "boots, face never visible'.\n"
+            "   - If a worker or character is visible in Image 1 and/or Image 2, the video prompt MUST explicitly describe their continuous "
+            "kinetic labor and posture progression from Image 1's starting pose to Image 2's landing pose across the entire clip. "
+            "Strictly FORBID static poses or leaving the character unmoving (e.g. 'remain standing', 'stay put', 'static in place', 'standing still', 'holding position', 'where they were').\n"
+            "   - Camera perspective: Faithful to the camera angle, lens feel, and framing established in Image 1 and Image 2 (locked to the active camera setup without inventing new camera moves or altering the viewpoint angle).\n"
+        )
+        syntax_rule = (
+            "6. MANDATORY SYNTAX & CLAUSES:\n"
+            f"   - Opening sentence MUST be: \"Use the provided first frame and last frame as exact composition anchors. "
+            f"Use IMAGE {s_idx} as the actual first-frame image and IMAGE {e_idx} as the actual last-frame image; every "
+            "visible action must interpolate between those two frame images without inventing a third layout.\"\n"
+            "   - Pacing clause MUST be: \"Continuous construction time-lapse, not real-time footage.\"\n"
+        )
+        living_cast_rule = (
+            "5. LIVING CAST ACTION-REACTION INTERLOCK (WHEN FIGURES/ANIMALS ARE PRESENT):\n"
+            "   - When miniature figurines, resident characters, or animals are visible, NEVER omit them or freeze them into static dolls.\n"
+            "   - Interweave their bodily responses directly with the worker/craftsman actions: immediate reflex/head-tilt when hands or tools enter, active gaze/body tracking during tool operations, and settled posture facing the completed work upon completion.\n"
+            "   - Strictly FORBID static/idle phrasing ('unmoving', 'remain standing', 'stay in place', 'unchanged', 'static pose', 'watching quietly').\n"
+        )
 
     system_prompt = (
         "You are an expert visual supervisor and video prompt optimization engine for continuous "
@@ -155,30 +210,16 @@ def optimize_single_video_prompt(config, start_frame_path, end_frame_path, origi
         "   - Bottom / Floor: Bare ground, crushed gravel, waterproof membrane, floor joists, floorboards, rugs.\n"
         "   - Peripherals & Spoil: Waste stacks/crates accumulating, raw timber/materials visibly diminishing.\n"
         "2. ZERO PHANTOM CHANGES & ACTION-TOOL-SFX TRIAD:\n"
-        "   - Every visible change between Image 1 and Image 2 MUST be physically delivered by worker action.\n"
+        "   - Every visible change between Image 1 and Image 2 MUST be physically delivered by craftsman/worker action.\n"
         "   - Assign concrete action verbs, specific geometric hand/power tools (e.g. cordless drill, aluminum rake, "
         "utility knife, rubber mallet), and visible trace buildup (dust lines, screw heads, shavings).\n"
-        "   - No ghost work: structures must NEVER appear or melt away without an active worker.\n"
-        "3. HUMAN SCALE & WORKER CONTINUOUS POSE TRANSITION:\n"
-        "   - Describe the worker with exact scale: 'a lone male worker (1.78m tall, occupying ~35% of vertical "
-        "frame height, realistically proportioned to the ceiling clearance) in a solid work jacket, dark trousers, "
-        "boots, face never visible'.\n"
-        "   - If a worker or character is visible in Image 1 and/or Image 2, the video prompt MUST explicitly describe their continuous "
-        "kinetic labor and posture progression from Image 1's starting pose to Image 2's landing pose across the entire clip. "
-        "Strictly FORBID static poses or leaving the character unmoving (e.g. 'remain standing', 'stay put', 'static in place', 'standing still', 'holding position', 'where they were').\n"
-        "   - Camera perspective: Faithful to the camera angle, lens feel, and framing established in Image 1 and Image 2 (locked to the active camera setup without inventing new camera moves or altering the viewpoint angle).\n"
-        "4. ASMR SOUND EFFECTS (60% VOLUME, 0% BGM):\n"
+        "   - No ghost work: structures must NEVER appear or melt away without an active worker/craftsman.\n"
+        + actor_and_scale_rule
+        + "4. ASMR SOUND EFFECTS (60% VOLUME, 0% BGM):\n"
         "   - Include specific physical ASMR sound effects: gritty scraping, sawing buzzing, cordless drill chatter, "
         "hammer taps, rubber membrane crackle, footsteps on gravel/wood. Strictly NO background music (BGM).\n"
-        "5. LIVING CAST ACTION-REACTION INTERLOCK (WHEN FIGURES/ANIMALS ARE PRESENT):\n"
-        "   - When miniature figurines, resident characters, or animals are visible, NEVER omit them or freeze them into static dolls.\n"
-        "   - Interweave their bodily responses directly with the worker/craftsman actions: immediate reflex/head-tilt when hands or tools enter, active gaze/body tracking during tool operations, and settled posture facing the completed work upon completion.\n"
-        "   - Strictly FORBID static/idle phrasing ('remain standing', 'stay in place', 'unchanged', 'static pose').\n"
-        "6. MANDATORY SYNTAX & CLAUSES:\n"
-        f"   - Opening sentence MUST be: \"Use the provided first frame and last frame as exact composition anchors. "
-        f"Use IMAGE {s_idx} as the actual first-frame image and IMAGE {e_idx} as the actual last-frame image; every "
-        "visible action must interpolate between those two frame images without inventing a third layout.\"\n"
-        "   - Pacing clause MUST be: \"Continuous construction time-lapse, not real-time footage.\"\n\n"
+        + living_cast_rule
+        + syntax_rule
         + crossing_rules
         + contract_info
         + "\n\nOUTPUT FORMAT:\n"
@@ -216,13 +257,22 @@ def optimize_single_video_prompt(config, start_frame_path, end_frame_path, origi
         optimized = fix_camera_contradictions(optimized, is_moving=is_crossing)
 
         # 确保标准开篇句完整
-        expected_anchor = (
-            f"Use the provided first frame and last frame as exact composition anchors. "
-            f"Use IMAGE {s_idx} as the actual first-frame image and IMAGE {e_idx} as the actual last-frame image; "
-            f"every visible action must interpolate between those two frame images without inventing a third layout."
-        )
-        if not optimized.lower().startswith("use the provided first frame and last frame as exact composition anchors"):
-            optimized = f"{expected_anchor} {optimized}"
+        if is_miniature:
+            expected_anchor = (
+                f"Use the provided image as the exact starting composition and environment anchor. "
+                f"Use IMAGE {s_idx} as the actual first-frame image; begin from this initial state "
+                "and naturally progress the work through the multi-shot sequence without inventing extraneous layouts."
+            )
+            if not optimized.lower().startswith("use the provided image as the exact starting composition"):
+                optimized = f"{expected_anchor} {optimized}"
+        else:
+            expected_anchor = (
+                f"Use the provided first frame and last frame as exact composition anchors. "
+                f"Use IMAGE {s_idx} as the actual first-frame image and IMAGE {e_idx} as the actual last-frame image; "
+                f"every visible action must interpolate between those two frame images without inventing a third layout."
+            )
+            if not optimized.lower().startswith("use the provided first frame and last frame as exact composition anchors"):
+                optimized = f"{expected_anchor} {optimized}"
 
         return optimized
     except Exception as e:
@@ -271,6 +321,7 @@ def optimize_video_prompts_for_sequence(config, title, prompt_block, on_progress
     # 读取空间契约与 manifest 中已持久化的差量优化记录
     manifest_data = server_common.read_manifest(project_dir) or {}
     spatial_contract = manifest_data.get('spatial_contract')
+    profile = manifest_data.get('profile') or config.get('profile') or 'base'
     existing_optimizations = manifest_data.get('video_prompt_optimizations') or {}
     if not isinstance(existing_optimizations, dict):
         existing_optimizations = {}
@@ -369,6 +420,7 @@ def optimize_video_prompts_for_sequence(config, title, prompt_block, on_progress
             'end_seq': slot_idx + 1,
             'video_meta': meta,
             'spatial_contract': spatial_contract,
+            'profile': profile,
         }))
 
     completed_count = 0

@@ -52,68 +52,68 @@ ORTHOGONAL_AXES = {
 MUTATION_PRESETS: Dict[str, Dict[str, Any]] = {
     'polar': {
         'key': 'polar',
-        'name': '极地雪屋 (Polar Fjord Cabin)',
-        'description': '极地厚积雪 + 芬兰松木原木 + 防风雪观景木屋 + 野生北极白鲸',
+        'name': '极地防风雪避险庇护所 (Polar Fjord Refuge Shelter)',
+        'description': '极地厚积雪 + 芬兰松木原木与保温气凝胶 + 防风雪避难木屋 + 野生北极白鲸',
         'axes': {
             'environment': '极地厚积雪地貌与剔透深蓝峡湾海面',
-            'material': '粗犷芬兰松木原木 + 侘寂微水泥 + 黑色碳化防腐木',
-            'function': '防风雪极地观景木屋 + 粗石壁炉与羊毛卧榻',
+            'material': '粗犷芬兰松木原木 + 气凝胶保温层 + 侘寂微水泥 + 黑色碳化防腐木',
+            'function': '防风雪极地避险庇护所 + 粗石壁炉与防寒羽绒保暖卧榻',
             'hero_reveal': '野生北极白鲸群在窗外深蓝峡湾中缓缓掠过',
         },
-        'scene_signature': 'A heavy timber and stone insulated refuge cabin embedded in arctic snow, overlooking clear deep-blue fjord waters.',
-        'banned_elements': ['sci-fi capsule', 'cyberpunk', 'neon lights', 'spaceship', 'hologram', 'muddy riverbank', 'green river water', 'rusted mild steel container', 'warm yellow household lighting'],
+        'scene_signature': 'A heavy timber, aerogel insulated and stone refuge shelter cabin embedded in arctic snow, overlooking clear deep-blue fjord waters.',
+        'banned_elements': ['sci-fi capsule', 'cyberpunk', 'neon lights', 'spaceship', 'hologram', 'muddy riverbank', 'green river water', 'rusted mild steel container', 'warm yellow household lighting', 'generic cozy homestay'],
     },
     'volcano': {
         'key': 'volcano',
-        'name': '火山私汤 (Volcanic Hot Spring)',
-        'description': '火山热泉泥地 + 哑光黑碳钢 + 恒温天然私汤茶室 + 高山溪红点鲑群',
+        'name': '火山地热自持庇护所 (Volcanic Geothermal Shelter)',
+        'description': '火山热泉泥地 + 哑光黑耐候钢 + 恒温地热能源庇护所 + 高山溪红点鲑群',
         'axes': {
             'environment': '火山热泉泥地与冒泡地热蒸气水体',
-            'material': '哑光黑碳钢构件 + 黑色玄武岩打磨 + 碳化原木',
-            'function': '恒温天然私汤茶室 + 悬浮实木榻榻米',
+            'material': '哑光黑耐候钢构件 + 黑色玄武岩打磨 + 导热紫铜管 + 碳化原木',
+            'function': '恒温地热自持能源庇护所 + 地热温差发电与悬浮实木榻榻米',
             'hero_reveal': '地热温泉清澈水体中高山溪红点鲑群缓缓游弋',
         },
-        'scene_signature': 'A matte black carbon-steel geothermal bath pavilion nestled in volcanic hot spring terrain with porous black basalt stone walls.',
-        'banned_elements': ['sci-fi', 'futuristic', 'neon channels', 'glowing tech', 'iceberg', 'snowfield', 'office desk', 'bright fluorescent tube', 'muddy green river'],
+        'scene_signature': 'A matte black weathering-steel geothermal energy shelter pavilion nestled in volcanic hot spring terrain with porous black basalt stone walls.',
+        'banned_elements': ['sci-fi', 'futuristic', 'neon channels', 'glowing tech', 'iceberg', 'snowfield', 'office desk', 'bright fluorescent tube', 'muddy green river', 'generic cozy homestay'],
     },
     'rainforest': {
         'key': 'rainforest',
-        'name': '雨林工坊 (Rainforest Stilt Workshop)',
-        'description': '热带雨林水域 + 老柚木防腐榫卯 + 浮水木工坊 + 窗外野生水豚与巨骨舌鱼',
+        'name': '雨林防洪重工庇护所 (Rainforest Flood Refuge Bastion)',
+        'description': '热带雨林水域 + 老柚木防腐榫卯 + 悬空防洪浮水木工庇护所 + 窗外野生水豚与巨骨舌鱼',
         'axes': {
             'environment': '暴雨热带雨林与原生态清澈溪流水域',
-            'material': '缅甸老柚木防腐结构 + 粗糙毛石基座 + 铜质暗扣',
-            'function': '实木榫卯木工坊 + 手工皮革制作台与原木搁架',
+            'material': '缅甸老柚木防腐结构 + 悬空抬升毛石基座 + 铜质暗扣',
+            'function': '悬空防洪木工庇护所 + 手工皮革制作台与防潮原木搁架',
             'hero_reveal': '窗外清澈水流中野生水豚与巨骨舌鱼缓缓游弋',
         },
-        'scene_signature': 'A handcrafted reclaimed teak wood and rough stone craftsman stilt pavilion submerged along a tropical rainforest river.',
-        'banned_elements': ['sci-fi', 'cyberpunk', 'neon lights', 'rgb lighting', 'carbon fiber', 'hologram', 'polar bear', 'wooden cabin', 'tatami', 'hot spring steam', 'rustic bamboo'],
+        'scene_signature': 'A handcrafted reclaimed teak wood and rough stone flood-refuge craftsman stilt shelter submerged along a tropical rainforest river.',
+        'banned_elements': ['sci-fi', 'cyberpunk', 'neon lights', 'rgb lighting', 'carbon fiber', 'hologram', 'polar bear', 'wooden cabin', 'tatami', 'hot spring steam', 'rustic bamboo', 'generic cozy homestay'],
     },
     'cave': {
         'key': 'cave',
-        'name': '崖壁石窖 (Cliff Karst Den)',
-        'description': '天然石灰岩溶洞 + 玄武岩黄铜 + 恒温酒窖冥想室 + 地下暗河野生盲鱼群',
+        'name': '崖壁溶洞隐秘庇护所 (Cliff Karst Underground Shelter)',
+        'description': '天然石灰岩溶洞 + 玄武岩黄铜 + 恒温地下水储能隐蔽庇护所 + 地下暗河野生盲鱼群',
         'axes': {
             'environment': '天然石灰岩溶洞石壁与清冽地下暗河',
             'material': '粗糙玄武岩打磨 + 黄铜暗埋构件 + 老橡木实木梁',
-            'function': '隐秘溶洞恒温酒窖与茶歇冥想室',
+            'function': '隐秘溶洞恒温地下水与给养储藏庇护所',
             'hero_reveal': '溶洞地下清冽暗河中野生岩斑盲鱼群缓缓游弋',
         },
-        'scene_signature': 'A subterranean basalt and brass sanctuary built inside a natural karst cave alongside a clear underground river.',
-        'banned_elements': ['sci-fi', 'futuristic', 'crystal fantasy', 'glowing crystals', 'neon', 'sunlight', 'skyline', 'traffic noise', 'plastic panels', 'white drywalls'],
+        'scene_signature': 'A subterranean basalt and brass refuge sanctuary built inside a natural karst cave alongside a clear underground river.',
+        'banned_elements': ['sci-fi', 'futuristic', 'crystal fantasy', 'glowing crystals', 'neon', 'sunlight', 'skyline', 'traffic noise', 'plastic panels', 'white drywalls', 'generic cozy homestay'],
     },
     'desert': {
         'key': 'desert',
-        'name': '荒漠隐庐 (Desert Rammed-Earth Retreat)',
-        'description': '干旱荒漠红土 + 传统夯土墙胡杨木 + 穹顶采光茶室 + 绿洲清泉双峰驼',
+        'name': '荒漠防沙暴地下庇护所 (Desert Sandstorm Underground Shelter)',
+        'description': '干旱荒漠红土 + 传统夯土墙胡杨木 + 穹顶采光防沙庇护所 + 绿洲清泉双峰驼',
         'axes': {
             'environment': '干旱荒漠红土与绿洲清泉水体',
-            'material': '传统生土夯土墙 + 粗壮胡杨木大梁 + 透气陶土砖',
-            'function': '绿洲避暑茶室 + 穹顶自然采光与亚麻地台',
+            'material': '传统生土夯土墙 + 粗壮胡杨木大梁 + 透气陶土砖 + 防沙重力门',
+            'function': '绿洲地下防沙暴储能庇护所 + 穹顶自然采光与亚麻地台',
             'hero_reveal': '绿洲清泉边野生双峰驼低头静静饮水',
         },
-        'scene_signature': 'A monolithic rammed-earth and desert timber pavilion integrated into desert oasis terrain with deep shaded openings.',
-        'banned_elements': ['sci-fi', 'futuristic', 'neon', 'metal spacecraft', 'high-tech panels', 'blizzard', 'glacier'],
+        'scene_signature': 'A monolithic rammed-earth and desert timber underground sandstorm refuge shelter integrated into desert oasis terrain with deep shaded openings.',
+        'banned_elements': ['sci-fi', 'futuristic', 'neon', 'metal spacecraft', 'high-tech panels', 'blizzard', 'glacier', 'generic cozy homestay'],
     },
 }
 
@@ -450,41 +450,42 @@ def generate_orthogonal_variant(
     return variant_doc
 
 
-_AI_DIVERGE_SYSTEM = """你是一位顶尖的纪录片级视觉短视频创意总监与真实空间建造设计师。
-你的任务是根据给定的「1:1 黄金母本延时改造视频」的工序骨架和节奏，在确保物理工序拓扑与分镜完全可复用的前提下，进行四轴正交创意发散（AI Orthogonal Mutation），为创作者构思出具备极高网感、视觉奇观反差、高完播率但【100% 真实写实】的新创意方案。
+_AI_DIVERGE_SYSTEM = """你是一位顶尖的纪录片级视觉短视频创意总监与真实极限空间建造设计师。
+你的任务是根据给定的「1:1 黄金母本延时改造视频」的工序骨架和节奏，在确保物理工序拓扑与分镜完全可复用的前提下，进行四轴正交创意发散（AI Orthogonal Mutation），为创作者构思出具备极高网感、极端生存威胁与维生反差感、高完播率但【100% 真实写实】的【硬核生存庇护所 / 极限避难所 / 防灾自持隐蔽空间 (Realistic Survival Shelter & Bunker)】新创意方案。
 
 ★★★★★ REALISM-ONLY POLICY（去科幻 / 严格真实写实硬约束 — 违反直接废弃）：
 1. 严禁任何科幻、未来机能、太空宇航、外星异星、赛博朋克、全息投影、RGB霓虹灯带、发光科技面板、失重力、虚构魔法或超自然发光生物！
-2. 所有方案必须是【现实世界中可以真实施工建造的】建筑、庇护所、工坊或空间改造，具有强烈的工匠手作质感、真实物料触感与自然地理美感。
-3. 四大正交发散轴：
-   - 轴 1 地貌与水体环境 (Environment & Biome): 真实自然地理与微气候水体（如：雪山松林积雪与清澈冰溪、火山地热私汤、热带雨林水域、悬崖岩穴石壁、荒漠绿洲清泉、高山峡谷瀑布、海边礁石海湾）。
-   - 轴 2 材质与工艺体系 (Material & Craft): 真实建筑与手工施工材料（如：老柚木防腐原木、侘寂微水泥、哑光黑碳钢、粗石毛石、天然玄武岩打磨、传统夯土、手工红砖、黄铜五金、双层中空钢化玻璃）。严禁碳纤维RGB、太空合金、全息舱。
-   - 轴 3 空间功能与软装 (Space Function & Furnishing): 真实生活、手作与度假功能（如：雪山暖炉观景木屋、恒温地热私汤茶室、水上木工坊与皮具案台、崖穴恒温酒窖、荒漠避暑隐庐、林间画室）。严禁电竞舱、科研实验舱、太空观测台。
-   - 轴 4 终极生物/自然奇观揭示 (Hero Creature / Reveal): 真实自然生态野生动物或宏大自然水景（如：4米野生北极白鲸/独角鲸、高山马鹿缓缓走过、热带巨骨舌鱼/水豚、温泉猕猴群、野生双峰驼、高原雪豹）。严禁发光生物、异星怪兽、赛博机械兽。
+2. 严禁千篇一律的“小资网红温馨民宿/酒店样板间/咖啡馆/浪漫串灯/反光塑料地板”套路！
+3. 所有方案必须是【现实世界中可以真实施工建造的】极限庇护所、防灾掩体、隐蔽哨所或自持空间改造，具有强烈的工匠手作质感、硬核工程防护逻辑、真实物料触感与自然地理险境美感。
+4. 四大正交发散轴：
+   - 轴 1 地貌险境与水体环境 (Environment & Biome): 真实自然地理极端微气候与环境威胁（如：极地厚积雪冻土裂隙暴风雪、火山熔岩地热热泉与硫磺有毒蒸气、热带雨林红树林季风暴雨洪泛、悬崖岩穴石灰岩溶洞暗河、干旱荒漠红土特大沙尘暴、海边海蚀崖暗礁浪涌）。
+   - 轴 2 结构材质与防护工艺 (Material & Craft): 真实硬核建筑与防护施工材料（如：粗犷芬兰松木原木 + 气凝胶保温层、哑光黑耐候钢构件 + 黑色玄武岩打磨、缅甸老柚木防腐榫卯 + 悬空防洪毛石基座、粗糙天然玄武岩 + 黄铜暗埋构件、传统生土夯土厚墙 + 粗壮胡杨木大梁 + 重型防沙重力门、双层中空防爆夹胶钢化玻璃）。严禁碳纤维RGB、太空合金、全息舱。
+   - 轴 3 庇护所维生功能与硬核软装 (Shelter Function & Survival Systems): 真实自给自足维生与避险设施（如：极地防寒壁炉与气闸保暖舱、地热温差发电组与硫磺过滤新风塔、悬空防洪木作台与雨水多级净化槽、地下恒温水窖与气密粮仓、荒漠太阳能冷凝集水与防沙地下地堡、隐蔽工作台与防潮储物架）。严禁电竞舱、科研实验舱、太空观测台。
+   - 轴 4 终极生物/自然奇观揭示 (Hero Creature / Reveal): 真实自然生态野生动物或宏大自然水景（如：4米野生北极白鲸/独角鲸/极地北极熊、火山熔岩流与清澈溪流高山红点鲑、热带巨骨舌鱼/水豚/黑凯门鳄、溶洞地下暗河岩斑盲鱼群、荒漠绿洲清泉野生双峰驼、高山雪豹）。严禁发光生物、异星怪兽、赛博机械兽。
 
 硬性约束：
-- 构思 {count} 组风格截然不同、极具视觉冲击力的写实正交二创方案。
+- 构思 {count} 组地貌环境与材质工艺完全正交、绝不撞车、极具视觉冲击力与极限生存反差感的写实庇护所方案。
 - 方案必须符合工序施工的可视化逻辑（破拆 -> 结构 -> 隐蔽 -> 封板 -> 面层 -> 地面 -> 设备 -> 软装 -> 揭示），充满质感与具象细节，严禁空洞虚浮的抽象词汇。
-- 若用户提供了发散方向（User Direction/Brief），必须紧密围绕该方向深度发散出不同层次的方案（若方向中带有科幻词汇，必须将其转化为现实写实建造对应物）；若未提供，则自由发散最吸睛、反差感最强的爆款写实建造方向。
+- 若用户提供了发散方向（User Direction/Brief），必须紧密围绕该方向深度发散出不同层次的方案（若方向中带有科幻词汇，必须将其转化为现实写实建造对应物）；若未提供，则自由发散最吸睛、反差感最强的爆款写实庇护所方向。
 {trend_guidance}
 
 输出格式：
 严格返回一个 JSON 数组（无任何 Markdown 代码块，无额外废话），包含 {count} 个对象，每个对象结构如下：
 [
   {{
-    "id": "theme_unique_id",
-    "name": "中文创意主题名 (如：极地峡湾观景木屋)",
+    "id": "shelter_unique_id",
+    "name": "中文庇护所主题名 (如：极地防风雪避险庇护所)",
     "icon": "❄️",
-    "hook": "一句话爆款卖点（20字以内，如：冰封极地下的厚重松木木屋与北极白鲸）",
-    "trend_ref": "说明借鉴了哪条联网参考的哪个要点（如：借鉴极地避难所的双层保温木结构与全景防风雪窗）",
+    "hook": "一句话爆款卖点（20字以内，如：冰封极地下的厚重松木气凝胶木屋与北极白鲸）",
+    "trend_ref": "说明借鉴了哪条联网参考的哪个要点（如：借鉴极地避难所的双层气凝胶保温木结构与防风雪观察窗）",
     "axes": {{
-      "environment": "具体地貌与水体环境中文描述",
-      "material": "具体材质与工艺体系中文描述",
-      "function": "具体空间功能与软装中文描述",
+      "environment": "具体地貌险境与水体环境中文描述",
+      "material": "具体结构材质与防护工艺中文描述",
+      "function": "具体庇护所维生功能与硬核软装中文描述",
       "hero_reveal": "具体终极生物或事件揭示中文描述"
     }},
-    "scene_signature": "One concise English sentence summarizing the final structure and environment.",
-    "banned_elements": ["sci-fi", "cyberpunk", "neon", "glowing tech", "spaceship", "alien", "negative_keyword_1", "negative_keyword_2"]
+    "scene_signature": "One concise English sentence summarizing the final shelter structure, survival materials, and environment.",
+    "banned_elements": ["sci-fi", "cyberpunk", "neon", "glowing tech", "spaceship", "alien", "generic cozy homestay", "luxury hotel", "glowing fairy lights", "cheap glossy floor"]
   }}
 ]"""
 
@@ -495,83 +496,83 @@ def _generate_fallback_ideas(brief: Optional[str] = None, count: int = 4, trend_
     defaults = [
         {
             'id': 'polar_cabin',
-            'name': '极地雪屋',
+            'name': '极地防风雪庇护所',
             'icon': '❄️',
-            'hook': '冰封峡湾边的厚重防风雪木屋与北极白鲸',
-            'trend_ref': '借鉴极地避难所的双层保温木结构与全景防风雪窗',
+            'hook': '冰封峡湾边的厚重防风雪避险木屋与北极白鲸',
+            'trend_ref': '借鉴极地避难所的双层气凝胶保温木结构与全景防风雪观察窗',
             'trend_ref_ids': ref_ids,
             'axes': {
                 'environment': '极地厚积雪地貌与剔透深蓝峡湾海面',
-                'material': '粗犷芬兰松木原木 + 侘寂微水泥 + 黑色碳化防腐木',
-                'function': '防风雪极地观景木屋 + 粗石壁炉与羊毛卧榻',
+                'material': '粗犷芬兰松木原木 + 气凝胶保温层 + 侘寂微水泥 + 黑色碳化防腐木',
+                'function': '防风雪极地避险庇护所 + 粗石壁炉与防寒羽绒保暖卧榻',
                 'hero_reveal': '野生北极白鲸群在窗外深蓝峡湾中缓缓掠过',
             },
-            'scene_signature': 'A heavy timber and stone insulated refuge cabin embedded in arctic snow, overlooking clear deep-blue fjord waters.',
-            'banned_elements': ['sci-fi capsule', 'cyberpunk', 'neon lights', 'spaceship', 'hologram', 'muddy riverbank', 'green river water', 'rusted mild steel container'],
+            'scene_signature': 'A heavy timber, aerogel insulated and stone refuge shelter cabin embedded in arctic snow, overlooking clear deep-blue fjord waters.',
+            'banned_elements': ['sci-fi capsule', 'cyberpunk', 'neon lights', 'spaceship', 'hologram', 'muddy riverbank', 'green river water', 'rusted mild steel container', 'generic cozy homestay'],
         },
         {
             'id': 'volcanic_spa',
-            'name': '火山私汤茶室',
+            'name': '火山地热自持庇护所',
             'icon': '🌋',
-            'hook': '火山黑石地热热泉与高山溪红点鲑群',
-            'trend_ref': '借鉴火山地热私汤的黑色玄武岩打磨与暗调隐形透光',
+            'hook': '火山黑石地热自持避险所与高山溪红点鲑群',
+            'trend_ref': '借鉴火山地热自持庇护所的黑色玄武岩打磨与地热温差发电系统',
             'trend_ref_ids': ref_ids,
             'axes': {
                 'environment': '火山热泉泥地与冒泡地热蒸气水体',
-                'material': '哑光黑碳钢构件 + 黑色玄武岩打磨 + 碳化原木',
-                'function': '恒温天然私汤茶室 + 悬浮实木榻榻米',
+                'material': '哑光黑耐候钢构件 + 黑色玄武岩打磨 + 导热紫铜管 + 碳化原木',
+                'function': '恒温地热自持能源庇护所 + 地热温差发电与悬浮实木榻榻米',
                 'hero_reveal': '地热温泉清澈水体中高山溪红点鲑群缓缓游弋',
             },
-            'scene_signature': 'A matte black carbon-steel geothermal bath pavilion nestled in volcanic hot spring terrain with porous black basalt stone walls.',
-            'banned_elements': ['sci-fi', 'futuristic', 'neon channels', 'glowing tech', 'iceberg', 'snowfield', 'office desk', 'bright fluorescent tube'],
+            'scene_signature': 'A matte black weathering-steel geothermal energy shelter pavilion nestled in volcanic hot spring terrain with porous black basalt stone walls.',
+            'banned_elements': ['sci-fi', 'futuristic', 'neon channels', 'glowing tech', 'iceberg', 'snowfield', 'office desk', 'bright fluorescent tube', 'generic cozy homestay'],
         },
         {
             'id': 'rainforest_workshop',
-            'name': '雨林水上工坊',
+            'name': '雨林防洪重工庇护所',
             'icon': '🪵',
-            'hook': '热带雨林水上实木工坊与野生水豚',
-            'trend_ref': '借鉴雨林水上高脚屋的老柚木防腐榫卯与自然通风排湿结构',
+            'hook': '热带雨林悬空防洪浮水重工庇护所与野生水豚',
+            'trend_ref': '借鉴雨林水上高脚屋的老柚木防腐榫卯与离地悬空防洪排湿结构',
             'trend_ref_ids': ref_ids,
             'axes': {
                 'environment': '暴雨热带雨林与原生态清澈溪流水域',
-                'material': '缅甸老柚木防腐结构 + 粗糙毛石基座 + 铜质暗扣',
-                'function': '实木榫卯木工坊 + 手工皮革制作台与原木搁架',
+                'material': '缅甸老柚木防腐结构 + 悬空抬升毛石基座 + 铜质暗扣',
+                'function': '悬空防洪木工庇护所 + 手工皮革制作台与防潮原木搁架',
                 'hero_reveal': '窗外清澈水流中野生水豚与巨骨舌鱼缓缓游弋',
             },
-            'scene_signature': 'A handcrafted reclaimed teak wood and rough stone craftsman stilt pavilion submerged along a tropical rainforest river.',
-            'banned_elements': ['sci-fi', 'cyberpunk', 'neon lights', 'rgb lighting', 'carbon fiber', 'hologram', 'polar bear', 'tatami', 'hot spring steam'],
+            'scene_signature': 'A handcrafted reclaimed teak wood and rough stone flood-refuge craftsman stilt shelter submerged along a tropical rainforest river.',
+            'banned_elements': ['sci-fi', 'cyberpunk', 'neon lights', 'rgb lighting', 'carbon fiber', 'hologram', 'polar bear', 'tatami', 'hot spring steam', 'generic cozy homestay'],
         },
         {
             'id': 'cliff_cellar',
-            'name': '崖壁溶洞茶窖',
+            'name': '崖壁溶洞隐秘庇护所',
             'icon': '🪨',
-            'hook': '天然溶洞石壁恒温茶窖与地下清泉盲鱼',
-            'trend_ref': '借鉴天然石灰岩溶洞的恒温微气候与粗粝玄武岩黄铜工法',
+            'hook': '天然溶洞石壁地下恒温避险储能所与盲鱼群',
+            'trend_ref': '借鉴天然石灰岩溶洞的恒温微气候与粗粝玄武岩黄铜维生工法',
             'trend_ref_ids': ref_ids,
             'axes': {
                 'environment': '天然石灰岩溶洞石壁与清冽地下暗河',
                 'material': '粗糙玄武岩打磨 + 黄铜暗埋构件 + 老橡木实木梁',
-                'function': '隐秘溶洞恒温酒窖与茶歇冥想室',
+                'function': '隐秘溶洞恒温地下水与给养储藏庇护所',
                 'hero_reveal': '溶洞地下清冽暗河中野生岩斑盲鱼群缓缓游弋',
             },
-            'scene_signature': 'A subterranean basalt and brass sanctuary built inside a natural karst cave alongside a clear underground river.',
-            'banned_elements': ['sci-fi', 'futuristic', 'crystal fantasy', 'glowing crystals', 'neon', 'sunlight', 'skyline', 'traffic noise', 'white drywalls'],
+            'scene_signature': 'A subterranean basalt and brass refuge sanctuary built inside a natural karst cave alongside a clear underground river.',
+            'banned_elements': ['sci-fi', 'futuristic', 'crystal fantasy', 'glowing crystals', 'neon', 'sunlight', 'skyline', 'traffic noise', 'white drywalls', 'generic cozy homestay'],
         },
         {
             'id': 'desert_sanctuary',
-            'name': '荒漠夯土隐庐',
+            'name': '荒漠防沙暴地下庇护所',
             'icon': '🏜️',
-            'hook': '荒漠红土绿洲夯土避暑居与野生双峰驼',
-            'trend_ref': '借鉴传统生土夯土墙的蓄热调温与胡杨木大梁结构',
+            'hook': '荒漠红土绿洲夯土防风暴地堡与野生双峰驼',
+            'trend_ref': '借鉴传统生土夯土墙的蓄热调温与重型防沙重力门结构',
             'trend_ref_ids': ref_ids,
             'axes': {
                 'environment': '干旱荒漠红土与绿洲清泉水体',
-                'material': '传统生土夯土墙 + 粗壮胡杨木大梁 + 透气陶土砖',
-                'function': '绿洲避暑茶室 + 穹顶自然采光与亚麻地台',
+                'material': '传统生土夯土墙 + 粗壮胡杨木大梁 + 透气陶土砖 + 防沙重力门',
+                'function': '绿洲地下防沙暴储能庇护所 + 穹顶自然采光与亚麻地台',
                 'hero_reveal': '绿洲清泉边野生双峰驼低头静静饮水',
             },
-            'scene_signature': 'A monolithic rammed-earth and desert timber pavilion integrated into desert oasis terrain with deep shaded openings.',
-            'banned_elements': ['sci-fi', 'futuristic', 'neon', 'metal spacecraft', 'high-tech panels', 'blizzard', 'glacier'],
+            'scene_signature': 'A monolithic rammed-earth and desert timber underground sandstorm refuge shelter integrated into desert oasis terrain with deep shaded openings.',
+            'banned_elements': ['sci-fi', 'futuristic', 'neon', 'metal spacecraft', 'high-tech panels', 'blizzard', 'glacier', 'generic cozy homestay'],
         },
     ]
     return defaults[:count]

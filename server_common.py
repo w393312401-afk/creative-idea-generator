@@ -1693,11 +1693,63 @@ def _select_pool_account(config, pool):
             config['googleFxUserId'] = preferred
             return preferred
 
-    chosen = pool.pick_account(min_credit=min_credit)
+    priority_user_ids = config.get('googleFxPriorityUserIds')
+    if isinstance(priority_user_ids, str):
+        priority_user_ids = [u.strip() for u in priority_user_ids.split(',') if u.strip()]
+    strategy = str(config.get('googleFxAccountStrategy') or 'credit_desc').strip()
+
+    try:
+        chosen = pool.pick_account(min_credit=min_credit, priority_user_ids=priority_user_ids, strategy=strategy)
+    except TypeError:
+        chosen = pool.pick_account(min_credit=min_credit)
     if chosen is None:
         raise RuntimeError('号池所有账号积分不足或被禁用，请在「号池管理」里检查/刷新后重试')
     config['googleFxUserId'] = chosen['user_id']
     return chosen['user_id']
+
+
+def failover_and_select_next_account(config, pool, failed_user_id: str, reason: str = "failed", exclude=None):
+    """生成遇阻时触发异常即时无感漫游，自动将当前故障账号降权/冷却并切换到号池下一个可用账号。
+
+    返回新选中的 user_id；若全池无可换账号则返回 None。
+    """
+    failed_user_id = str(failed_user_id or '').strip()
+    if failed_user_id and pool:
+        try:
+            r_low = str(reason or '').lower()
+            if any(k in r_low for k in ("quota", "credit", "积分", "额度")):
+                pool.mark_exhausted(failed_user_id)
+            elif any(k in r_low for k in ("login", "登录", "sign in", "auth")):
+                pool.mark_login_required(failed_user_id)
+            else:
+                pool.record_generation_failure(failed_user_id, reason)
+        except Exception as e:
+            print(f"Warning: 标记故障账号状态异常: {e}")
+
+    excluded = set(exclude or [])
+    if failed_user_id:
+        excluded.add(failed_user_id)
+
+    min_credit = config.get('videoAccountPoolMinCredit', 1)
+    priority_user_ids = config.get('googleFxPriorityUserIds')
+    if isinstance(priority_user_ids, str):
+        priority_user_ids = [u.strip() for u in priority_user_ids.split(',') if u.strip()]
+    strategy = str(config.get('googleFxAccountStrategy') or 'credit_desc').strip()
+
+    try:
+        chosen = pool.pick_account(min_credit=min_credit, exclude=excluded,
+                                  priority_user_ids=priority_user_ids, strategy=strategy)
+    except Exception as e:
+        print(f"Warning: 故障漫游选号异常: {e}")
+        return None
+
+    if chosen and chosen.get('user_id'):
+        new_id = chosen['user_id']
+        config['googleFxUserId'] = new_id
+        print(f"🔁 [号池智能漫游] 检测到账号 {failed_user_id or '(未知)'} 异常 ({reason})，已自动无感切换至账号 {new_id} (健康分: {chosen.get('health_score', 'N/A')}, 积分: {chosen.get('credit', '未探测')})")
+        return new_id
+    print(f"⚠️ [号池智能漫游] 号池中无可切换的可用账号（已排除 {len(excluded)} 个）")
+    return None
 
 
 def _account_switch_interval(config):
@@ -1743,6 +1795,9 @@ def _account_rotation_ring(config, pool, first_user_id):
 
     可用 = 未禁用 + 不在冷却 + 积分未知或 ≥ min_credit（与 pick_account 同一口径）。
 
+    若配置了优先级浏览器实例 (googleFxPriorityUserIds) 或选号策略 (googleFxAccountStrategy)，
+    轮转环优先按优先级实例和选号策略组织顺序。
+
     「锁定默认环境」且本次确实选中了那个环境时返回单元素环：plan_frame_chunk_accounts /
     plan_generation_legs 见到 len(ring)<=1 就不切腿，整条序列留在同一个环境上。
     默认环境没被选中（不可用而降级了）时不锁——那样锁住的是降级后的替补账号，
@@ -1755,11 +1810,48 @@ def _account_rotation_ring(config, pool, first_user_id):
     except Exception as e:
         print(f"Warning: 读取号池轮转顺序失败，退回单账号模式 ({e})")
         return [first_user_id] if first_user_id else []
-    ring = [
-        acc['user_id'] for acc in accounts
+
+    usable = [
+        acc for acc in accounts
         if acc.get('user_id') and not acc.get('disabled')
         and not _account_in_cooldown(acc) and _account_has_credit(acc, min_credit)
     ]
+
+    priority_user_ids = config.get('googleFxPriorityUserIds')
+    if isinstance(priority_user_ids, str):
+        priority_user_ids = [u.strip() for u in priority_user_ids.split(',') if u.strip()]
+    priority_set = {str(u).strip() for u in (priority_user_ids or []) if str(u).strip()}
+    strategy = str(config.get('googleFxAccountStrategy') or 'credit_desc').strip()
+
+    from datetime import datetime
+    def _ring_sort_key(acc):
+        c = acc.get('credit')
+        credit_val = float(c) if c is not None else -1.0
+        if strategy == 'expiration_asc':
+            exp = acc.get('expires_at')
+            try:
+                exp_ts = datetime.fromisoformat(str(exp).replace('Z', '+00:00')).timestamp() if exp else 9999999999.0
+            except Exception:
+                exp_ts = 9999999999.0
+            has_exp = 0 if exp else 1
+            return (has_exp, exp_ts, -credit_val)
+        elif strategy == 'serial_asc':
+            try:
+                sn_val = int(acc.get('serial_number') or 999999)
+            except Exception:
+                sn_val = 999999
+            return (sn_val, -credit_val)
+        else:
+            # credit_desc
+            return -credit_val
+
+    if priority_set:
+        pri_accs = sorted([a for a in usable if a['user_id'] in priority_set], key=_ring_sort_key)
+        other_accs = sorted([a for a in usable if a['user_id'] not in priority_set], key=_ring_sort_key)
+        ring = [a['user_id'] for a in (pri_accs + other_accs)]
+    else:
+        ring = [a['user_id'] for a in sorted(usable, key=_ring_sort_key)]
+
     if first_user_id:
         ring = [first_user_id] + [uid for uid in ring if uid != first_user_id]
     return ring

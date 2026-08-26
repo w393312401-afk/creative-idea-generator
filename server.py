@@ -4112,7 +4112,7 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/account-pool':
-            # 号池新增/改名/改备注: {user_id, name, note}（同一 upsert 入口，
+            # 号池新增/改名/改备注/改重置日期: {user_id, name, note, expires_at}（同一 upsert 入口，
             # name=账号命名留空回退邮箱，note=备注按传入值直接覆盖）
             if not self._gate():
                 return
@@ -4123,8 +4123,38 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
                     return
                 pool = _get_account_pool()
-                entry = pool.add_account(user_id, body.get('name') or '', body.get('note') or '', serial_number=body.get('serial_number') or '')
+                entry = pool.add_account(
+                    user_id,
+                    body.get('name') or '',
+                    body.get('note') or '',
+                    serial_number=body.get('serial_number') or '',
+                    expires_at=body.get('expires_at')
+                )
                 self._send_json({'status': 'ok', 'account': entry})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/account-pool/expires-at':
+            # 设置账号重置日期（支持单账号或多选批量设置）
+            if not self._gate():
+                return
+            try:
+                body = self._read_json_body()
+                expires_at = body.get('expires_at')
+                user_ids = body.get('user_ids')
+                user_id = str(body.get('user_id') or '').strip()
+                pool = _get_account_pool()
+                if isinstance(user_ids, list):
+                    updated = pool.set_expires_at_multiple(user_ids, expires_at)
+                    self._send_json({'status': 'ok', 'updated_count': len(updated), 'accounts': updated})
+                elif user_id:
+                    account = pool.set_expires_at(user_id, expires_at)
+                    if account is None:
+                        self._send_json({'status': 'error', 'message': f'账号 {user_id} 不在号池里'}, status=404)
+                    else:
+                        self._send_json({'status': 'ok', 'account': account})
+                else:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id 或 user_ids'}, status=400)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -4167,37 +4197,46 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/account-pool/delete':
-            # 号池移除账号（显式 user_id 即确认过的意图，同 /api/ledger/delete 约定）
+            # 号池移除账号（显式 user_id 或 user_ids 即确认过的意图，同 /api/ledger/delete 约定）
             if not self._gate():
                 return
             try:
                 body = self._read_json_body()
+                user_ids = body.get('user_ids')
                 user_id = str(body.get('user_id') or '').strip()
-                if not user_id:
-                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
-                    return
                 pool = _get_account_pool()
-                pool.remove_account(user_id)
-                self._send_json({'status': 'ok'})
+                if isinstance(user_ids, list):
+                    count = pool.remove_accounts(user_ids)
+                    self._send_json({'status': 'ok', 'removed_count': count})
+                elif user_id:
+                    pool.remove_account(user_id)
+                    self._send_json({'status': 'ok'})
+                else:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id 或 user_ids'}, status=400)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/account-pool/toggle':
-            # 启用/禁用账号: {user_id, disabled}
+            # 启用/禁用账号: {user_id, disabled} 或 {user_ids: [...], disabled}
             if not self._gate():
                 return
             try:
                 body = self._read_json_body()
+                user_ids = body.get('user_ids')
                 user_id = str(body.get('user_id') or '').strip()
-                if not user_id:
-                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
-                    return
+                disabled = bool(body.get('disabled'))
                 pool = _get_account_pool()
-                entry = pool.set_disabled(user_id, bool(body.get('disabled')))
-                if entry is None:
-                    self._send_json({'status': 'error', 'message': '账号不存在'}, status=404)
-                    return
-                self._send_json({'status': 'ok', 'account': entry})
+                if isinstance(user_ids, list):
+                    entries = pool.set_disabled_multiple(user_ids, disabled)
+                    self._send_json({'status': 'ok', 'accounts': entries, 'count': len(entries)})
+                elif user_id:
+                    entry = pool.set_disabled(user_id, disabled)
+                    if entry is None:
+                        self._send_json({'status': 'error', 'message': '账号不存在'}, status=404)
+                        return
+                    self._send_json({'status': 'ok', 'account': entry})
+                else:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id 或 user_ids'}, status=400)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
@@ -4278,39 +4317,49 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 return
             try:
                 body = self._read_json_body()
+                user_ids = body.get('user_ids')
                 user_id = str(body.get('user_id') or '').strip()
-                if not user_id:
-                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
-                    return
-                entry = _get_account_pool().clear_cooldown(user_id)
-                if entry is None:
-                    self._send_json({'status': 'error', 'message': '账号不存在'}, status=404)
-                    return
-                self._send_json({'status': 'ok', 'account': entry})
+                pool = _get_account_pool()
+                if isinstance(user_ids, list):
+                    entries = pool.clear_cooldown_multiple(user_ids)
+                    self._send_json({'status': 'ok', 'accounts': entries, 'count': len(entries)})
+                elif user_id:
+                    entry = pool.clear_cooldown(user_id)
+                    if entry is None:
+                        self._send_json({'status': 'error', 'message': '账号不存在'}, status=404)
+                        return
+                    self._send_json({'status': 'ok', 'account': entry})
+                else:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id 或 user_ids'}, status=400)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/account-pool/close-browser' or path == '/api/account-pool/close':
-            # 关闭指定 user_id 的 AdsPower 浏览器实例
+            # 关闭指定 user_id 或 user_ids 的 AdsPower 浏览器实例
             if not self._gate():
                 return
             try:
                 body = self._read_json_body()
+                user_ids = body.get('user_ids')
                 user_id = str(body.get('user_id') or '').strip()
-                if not user_id:
-                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
-                    return
                 pool = _get_account_pool()
-                success, msg = pool.close_browser(user_id)
-                if not success:
-                    self._send_json({'status': 'error', 'message': msg}, status=500)
-                    return
-                self._send_json({'status': 'ok', 'message': msg, 'user_id': user_id})
+                if isinstance(user_ids, list):
+                    results = pool.close_browsers(user_ids)
+                    self._send_json({'status': 'ok', 'results': results, 'count': len(user_ids)})
+                elif user_id:
+                    success, msg = pool.close_browser(user_id)
+                    if not success:
+                        self._send_json({'status': 'error', 'message': msg}, status=500)
+                        return
+                    self._send_json({'status': 'ok', 'message': msg, 'user_id': user_id})
+                else:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id 或 user_ids'}, status=400)
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
         elif path == '/api/account-pool/credentials':
             # 保存账号的自动登录凭据: {user_id, email?, password?, totp_secret?}
+            # 或批量设置密码/凭据: {user_ids: [...], password?, email?, totp_secret?}
             #
             # ⚠️ 字段缺省 = "这一项不改"，传空字符串 = "清空这一项"。这个区分不能
             # 简化：列表接口从不回传密码明文，前端编辑表单里的密码框天然是空的，
@@ -4320,18 +4369,44 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 return
             try:
                 body = self._read_json_body()
+                user_ids = body.get('user_ids')
                 user_id = str(body.get('user_id') or '').strip()
-                if not user_id:
-                    self._send_json({'status': 'error', 'message': '缺少 user_id'}, status=400)
-                    return
-                from integrations.google_fx.utils import account_credentials
-                entry = account_credentials.save(
-                    user_id,
-                    email=body.get('email') if 'email' in body else None,
-                    password=body.get('password') if 'password' in body else None,
-                    totp_secret=body.get('totp_secret') if 'totp_secret' in body else None,
-                )
-                self._send_json({'status': 'ok', 'credentials': entry})
+                from integrations.google_fx.utils import account_credentials, account_pool
+                if isinstance(user_ids, list):
+                    pool = account_pool.AccountPool()
+                    acc_map = {a['user_id']: a for a in pool.list_accounts(heal=False)}
+                    saved_entries = []
+                    for uid in user_ids:
+                        uid_str = str(uid).strip()
+                        if not uid_str:
+                            continue
+                        existing_cred = account_credentials.get(uid_str)
+                        email = body.get('email') if 'email' in body else None
+                        if email is None:
+                            if existing_cred and existing_cred.get('email'):
+                                email = existing_cred['email']
+                            elif uid_str in acc_map and acc_map[uid_str].get('name'):
+                                raw_name = acc_map[uid_str]['name']
+                                match = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', raw_name)
+                                email = match.group(0) if match else raw_name
+                        entry = account_credentials.save(
+                            uid_str,
+                            email=email,
+                            password=body.get('password') if 'password' in body else None,
+                            totp_secret=body.get('totp_secret') if 'totp_secret' in body else None,
+                        )
+                        saved_entries.append(entry)
+                    self._send_json({'status': 'ok', 'count': len(saved_entries), 'credentials': saved_entries})
+                elif user_id:
+                    entry = account_credentials.save(
+                        user_id,
+                        email=body.get('email') if 'email' in body else None,
+                        password=body.get('password') if 'password' in body else None,
+                        totp_secret=body.get('totp_secret') if 'totp_secret' in body else None,
+                    )
+                    self._send_json({'status': 'ok', 'credentials': entry})
+                else:
+                    self._send_json({'status': 'error', 'message': '缺少 user_id 或 user_ids'}, status=400)
             except ValueError as e:
                 # TOTP 密钥格式错误走这里（TotpSecretError 是 ValueError 子类）。
                 # 400 而不是 500：是用户填错了，不是服务故障，文案能直接照着改。
