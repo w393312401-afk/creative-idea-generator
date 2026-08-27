@@ -1037,6 +1037,7 @@ class AccountPool:
         strategy：选号排序策略：
             - 'credit_desc'：积分最多优先（默认）
             - 'expiration_asc'：重置日期最早优先（有重置日期的按最早优先，无重置日期的排后）
+            - 'rotation'：均衡轮换——累计任务数最少的账号优先，把负载摊平
             - 'serial_asc'：环境编号升序
         """
         excluded = {str(u) for u in (exclude or ()) if u}
@@ -1077,6 +1078,11 @@ class AccountPool:
                 except (TypeError, ValueError):
                     sn_int = 999999
                 return (sn_int, -health, -(_UNPROBED_SORT_KEY if credit is None else credit))
+            elif strategy == "rotation":
+                # 均衡轮换：先摊平负载（累计任务数最少的先上），健康分与积分只做同数时的
+                # 决胜。fx_console 的 googleFxAccountStrategy 一直允许这个取值，但之前没有
+                # 对应分支，"均衡轮换"落到 else 里跑成了 credit_desc——界面上的选项是死的。
+                return (task_count, -health, -(_UNPROBED_SORT_KEY if credit is None else credit), -failures)
             else:
                 # 默认 credit_desc: 优先健康分高，其次积分由高到低，失败数由少到多，任务数由少到多
                 return (-health, -(_UNPROBED_SORT_KEY if credit is None else credit), -failures, -task_count)
@@ -1166,9 +1172,16 @@ class AccountPool:
                     break
                 try:
                     accounts = self.list_accounts(heal=False)
+                    # 被「积分低于阈值」自动停用的账号也要巡检：这条停用可能来自
+                    # optimistic_deduct_credit 的**预估**扣减（图片按 -1、视频按 -10 猜），
+                    # 猜错了就是把一个还有额度的账号锁死——它既进不了 pick_account 的候选，
+                    # 也不会有别的路径去探它的真值。refresh_credit 探到真额度后
+                    # _sync_zero_credit_disabled 会自动把它放回来。手动停用的账号仍然跳过。
                     stale_accounts = [
                         a for a in accounts
-                        if not a.get("disabled") and a.get("credit_stale") and a.get("user_id")
+                        if a.get("credit_stale") and a.get("user_id")
+                        and (not a.get("disabled")
+                             or a.get("disabled_reason") == _ZERO_CREDIT_DISABLED_REASON)
                     ]
                     for acc in stale_accounts:
                         if AccountPool._inspector_stop_event.is_set():

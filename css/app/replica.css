@@ -1128,6 +1128,80 @@ details[open] > .replica-jobs-summary {
     word-break: break-word;
 }
 
+/* ── 禁用词命中高亮与定位跳转 ── */
+.replica-hit-badge {
+    display: inline-flex;
+    align-items: center;
+    background: rgba(255, 77, 79, 0.2);
+    border: 1px solid rgba(255, 77, 79, 0.6);
+    color: #ff7875;
+    padding: 1px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.replica-jump-hit-btn {
+    cursor: pointer;
+    background: rgba(255, 77, 79, 0.15);
+    border: 1px solid rgba(255, 77, 79, 0.6);
+    border-radius: 4px;
+    padding: 3px 8px;
+    color: #ff9c9e;
+    font-size: 11.5px;
+    font-weight: 600;
+    transition: all 0.2s ease;
+}
+
+.replica-jump-hit-btn:hover {
+    background: rgba(255, 77, 79, 0.35);
+    border-color: #ff4d4f;
+    color: #fff;
+    transform: translateY(-1px);
+}
+
+.replica-banned-mark {
+    background: #ff4d4f;
+    color: #fff;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 4px;
+    box-shadow: 0 0 8px rgba(255, 77, 79, 0.9);
+    transition: all 0.3s ease;
+    scroll-margin: 60px;
+}
+
+.replica-banned-mark.replica-hit-pulse {
+    animation: replicaPulseGlow 2s ease-in-out infinite;
+}
+
+@keyframes replicaPulseGlow {
+    0% { background: #ff4d4f; box-shadow: 0 0 6px rgba(255, 77, 79, 0.8); }
+    50% { background: #ff7875; box-shadow: 0 0 18px rgba(255, 120, 117, 1); transform: scale(1.08); }
+    100% { background: #ff4d4f; box-shadow: 0 0 6px rgba(255, 77, 79, 0.8); }
+}
+
+.replica-prompt-editor {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.65;
+    background: rgba(8, 12, 20, 0.9);
+    color: var(--text-main, #e2e8f0);
+    border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.2));
+    border-radius: 8px;
+    padding: 12px;
+    resize: vertical;
+    min-height: 380px;
+}
+
+.replica-prompt-editor:focus {
+    outline: none;
+    border-color: var(--neon-cyan, #6ee7ff);
+    box-shadow: 0 0 10px rgba(110, 231, 255, 0.3);
+}
+
 /* ── 阶段阶梯 ───────────────────────────────────────────────── */
 /* 页面上原先编着 ①②③④⑤，后台却有十二个 stage，chip 显示「聚类节拍」时用户在
    页面上找不到对应区块。这条阶梯把两者对齐成四段。 */

@@ -1784,6 +1784,54 @@ def _click_video_duration_tab(page, panel_scope, duration_label):
         return "tab fallback"
     return ""
 
+def _click_video_resolution_tab(page, panel_scope, resolution_label):
+    """点击视频分辨率 tab: 如 360p 或 720p (Omni Flash 面板特有控件)。
+    精准匹配 Radix UI aria-controls 尾值: VIDEO_RESOLUTION_360P / VIDEO_RESOLUTION_720P。
+    """
+    root = panel_scope or page
+    res_clean = str(resolution_label or '').strip().lower()
+    if '360' in res_clean:
+        target_suffix = 'VIDEO_RESOLUTION_360P'
+        target_text = '360p'
+    elif '720' in res_clean:
+        target_suffix = 'VIDEO_RESOLUTION_720P'
+        target_text = '720p'
+    elif '1080' in res_clean:
+        target_suffix = 'VIDEO_RESOLUTION_1080P'
+        target_text = '1080p'
+    else:
+        target_suffix = f"VIDEO_RESOLUTION_{res_clean.upper()}"
+        target_text = res_clean
+
+    # 1. 优先按 aria-controls 尾值匹配
+    for sel in [
+        f"[aria-controls$='-{target_suffix}']",
+        f"button[role='tab'][aria-controls$='-{target_suffix}']",
+    ]:
+        try:
+            btn = root.locator(sel).first
+            if btn.is_visible(timeout=1500):
+                if btn.get_attribute("data-state") == "active" or btn.get_attribute("aria-selected") == "true":
+                    log(f"  ✅ 视频分辨率已是 {target_text}，无需切换", "GoogleFX")
+                    return f"{sel} (already active)"
+                btn.click(force=True)
+                random_sleep(0.4, 0.8)
+                return f"{sel} + 点击成功 ({target_text})"
+        except Exception:
+            pass
+
+    # 2. 文本匹配
+    for sel in ["button[role='tab']", "button"]:
+        try:
+            btn = root.locator(sel).filter(has_text=re.compile(rf"^\s*{re.escape(target_text)}\s*$", re.I)).first
+            if btn.is_visible(timeout=1000):
+                btn.click(force=True)
+                random_sleep(0.4, 0.8)
+                return f"{sel} + 文本精确匹配 ({target_text})"
+        except Exception:
+            pass
+    return ""
+
 def _switch_video_submode(page, target_suffix, scope=None):
     """切换视频子模式 tab: VIDEO_FRAMES (帧/首尾帧) 或 VIDEO_REFERENCES (素材)。
 
@@ -2350,13 +2398,13 @@ def _click_orientation_option(page, orientation, scope=None):
         log(f"  ⚠️ _click_orientation_option JS兜底失败: {type(e).__name__}: {e}", "GoogleFX")
         return None
 
-def check_fx_config(status_text, model="Nano Banana 2", orientation="Portrait", count="1x", duration=None, want_video=False, resolved_model_text=""):
+def check_fx_config(status_text, model="Nano Banana 2", orientation="Portrait", count="1x", duration=None, want_video=False, resolved_model_text="", resolution=None):
     """
     从状态文字判断当前配置是否正确。
     先清除图标噪声文字（arrow_drop_down 等）再判断。
 
     Known models:
-      Video: Veo 3.1 - Lite | Veo 3.1 - Fast | Veo 3.1 - Quality
+      Video: Veo 3.1 - Lite | Veo 3.1 - Fast | Veo 3.1 - Quality | Omni Flash
            | Veo 3.1 - Lite [Lower Priority]
       Image: Nano Banana Pro | Nano Banana 2 | Nano Banana 2 Lite
     """
@@ -2372,13 +2420,16 @@ def check_fx_config(status_text, model="Nano Banana 2", orientation="Portrait", 
     if want_video and duration:
         duration_label = _normalize_video_duration_label(duration)
         checks["duration"] = (duration_label in clean) if duration_label else True
+    if want_video and resolution:
+        res_label = "360p" if "360" in str(resolution).lower() else ("720p" if "720" in str(resolution).lower() else str(resolution).lower())
+        checks["resolution"] = (res_label in clean) if res_label else True
     if want_video:
         checks["mode"] = ("video" in clean) or ("视频" in clean) or ("veo" in clean)
     else:
         checks["mode"] = ("video" not in clean) and ("视频" not in clean) and ("veo" not in clean)
     return checks
 
-def fix_fx_config(page, cfg_btn, checks, model="Nano Banana 2", orientation="Portrait", count="1x", duration=None, want_video=False, mode_label="", video_submode=None):
+def fix_fx_config(page, cfg_btn, checks, model="Nano Banana 2", orientation="Portrait", count="1x", duration=None, want_video=False, mode_label="", video_submode=None, resolution=None):
     """打开配置面板并修正不正确的配置项。"""
     log("⚙️ 需要修改配置，打开面板...", "GoogleFX")
     cfg_btn.click()
@@ -2567,6 +2618,19 @@ def fix_fx_config(page, cfg_btn, checks, model="Nano Banana 2", orientation="Por
             fix_info["clicked_keys"].append("video_submode")
         else:
             log(f"  ⚠️ 视频子模式切换失败: {_submode_label}", "GoogleFX")
+
+    # ── 视频分辨率切换 (360p / 720p) ──
+    if want_video and resolution and not checks.get("resolution", True):
+        log(f"  → 切换视频分辨率到 {resolution}", "GoogleFX")
+        try:
+            res_match = _click_video_resolution_tab(page, panel_scope, resolution)
+            if res_match:
+                log(f"  ✅ 分辨率 {resolution} 已切换 ({res_match})", "GoogleFX")
+                fix_info["clicked_keys"].append("resolution")
+            else:
+                log(f"  ⚠️ 未找到 {resolution} 分辨率 tab", "GoogleFX")
+        except Exception as e:
+            log(f"  ⚠️ {resolution} 分辨率切换异常: {e}", "GoogleFX")
 
     # 新版内联设置面板需要显式保存；旧版 Radix 菜单没有保存按钮，才按 Escape。
     saved = False
@@ -2843,7 +2907,7 @@ def _safe_page_url(page):
 # 取代了（那里才是真正会 raise 的地方）。它顺带带走了一处 forensics.capture("config_invalid")
 # ——那个 capture 标签因此从来没产生过现场文件，别再去 Errors 目录里找它。
 
-def _verify_and_fix_fx_config(page, model, ratio, want_video, context_label, mode_label="", duration=None, video_submode=None, count="1x"):
+def _verify_and_fix_fx_config(page, model, ratio, want_video, context_label, mode_label="", duration=None, video_submode=None, count="1x", resolution=None):
     """统一的配置校验→面板修复确认流程 (三个生成函数共用)。
     video_submode: 'VIDEO_FRAMES' | 'VIDEO_REFERENCES' | None (仅 want_video 时生效)
     """
@@ -2873,7 +2937,7 @@ def _verify_and_fix_fx_config(page, model, ratio, want_video, context_label, mod
             f"（已尝试退出智能体模式 / 清弹窗 / 重进项目页 / 刷新页面均无效；"
             f"当前页面 {_safe_page_url(page)}，现场已留档到 Errors 目录）"
         )
-    checks = check_fx_config(status_text, model=model, orientation=vid_ratio, count=count, duration=duration, want_video=want_video)
+    checks = check_fx_config(status_text, model=model, orientation=vid_ratio, count=count, duration=duration, want_video=want_video, resolution=resolution)
     # video_submode 不在底部摘要中显示，始终标记为需要修复
     if want_video and video_submode:
         checks["video_submode"] = False
@@ -2882,7 +2946,7 @@ def _verify_and_fix_fx_config(page, model, ratio, want_video, context_label, mod
         return selected_ratio
     fix_info = fix_fx_config(page, cfg_btn, checks, model=model,
                              orientation=vid_ratio, count=count, duration=duration, want_video=want_video,
-                             mode_label=mode_label, video_submode=video_submode)
+                             mode_label=mode_label, video_submode=video_submode, resolution=resolution)
     initially_failed = [k for k, v in checks.items() if not v]
     fixed_keys = set((fix_info or {}).get("clicked_keys") or []) | set((fix_info or {}).get("resolved_keys") or [])
     # A click only proves that Playwright found and clicked a menu item; it does not prove

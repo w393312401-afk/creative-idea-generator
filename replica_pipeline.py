@@ -992,6 +992,40 @@ def run_reverse(state, config, on_progress=None, degraded=False, scope=None):
     state['degraded'] = scope == 'degraded'
     _save_state(state)
 
+    # 走极速原生反推还是标准 Pass A+B，只由配置决定（reverseMode='deep' / deepReverse）。
+    # 这里曾经还夹了一条 isinstance(..., MagicMock) 的"测试替身探测"来强制走标准链路——
+    # 生产代码按"我是不是正在被 mock"改行为，等于两条链路各自的真实覆盖都说不清；
+    # 要测哪条就在配置里明说哪条。
+    use_deep = bool((config or {}).get('reverseMode') == 'deep' or (config or {}).get('deepReverse'))
+
+    if not use_deep:
+        try:
+            from prompt_pipeline.fast_reverse import fast_video_native_reverse
+            state['stage'] = 'review_frames'
+            _save_state(state)
+            beats = fast_video_native_reverse(config, directory, on_progress=on_progress)
+            beats['pipeline_id'] = state['job_id']
+            _write_beats(state, beats)
+            # 极速链路的 beats 是模型直出的，自带不了 Pass B 的 validation 字段。不当场
+            # 重跑一遍确定性校验，人工卡点上永远显示"0 项硬伤"，run_compose 的
+            # validation error 闸也就空转——这条线唯一拦得住幻觉的两道闸会一起失灵。
+            _revalidate(state, persist=False)
+            state['stage'] = 'review_beats'
+            _save_state(state)
+            if on_progress:
+                errors = [v for v in (state.get('validation') or []) if v.get('level') == 'error']
+                on_progress('replica_stage', {
+                    'stage': 'review_beats',
+                    'message': (f'节拍阶梯已生成：{len(beats.get("beats") or [])} 拍，'
+                                f'{len(errors)} 项硬伤待处理。请对着证据帧核对后再合成提示词。'),
+                    'beats': beats,
+                    'validation': state.get('validation') or [],
+                })
+            return state
+        except Exception as e:
+            if sys.stdout:
+                print(f"[REPLICA] 极速原生反推异常，平滑降级至标准 Pass A+B 链路: {e}")
+
     facts = reverse.extract_frame_facts(config, directory, on_progress=on_progress,
                                         scope=scope)
     facts = reverse.verify_peak_frames(config, directory, facts, on_progress=on_progress)
@@ -1714,20 +1748,12 @@ def _revalidate(state, persist=True):
     try:
         with open(path, 'r', encoding='utf-8') as f:
             overview = json.load(f)
-        # 顺手补齐每拍三张代表性证据帧（Start/Peak/End）
         reverse.ensure_three_evidence_frames(beats, overview)
-        # 顺手补覆盖帧：这条路径每次读状态都会走，存量任务（加这个字段之前跑的）
-        # 不用重跑聚类也能在卡点上看到铺满拍窗的那一排帧。读不到 overview 就跳过，
-        # 与校验同一档降级——变体 job 自己目录下没有 overview，走的就是这一支。
         reverse.attach_coverage_frames(beats, overview)
-        # 同一条回填通路补上观察到的镜头切点：存量任务不用重跑抽帧/聚类，
-        # 读一次状态就能在卡点上看见「原片这一拍切了几刀」。
         reverse.attach_shot_cuts(beats, overview)
-        # 同上，逐镜景别序列也在这条回填通路上补：存量任务读一次状态就补上，
-        # 不用重跑 Pass A（帧事实已经在盘上了，缺的只是按镜头窗投一次票）。
         reverse.attach_shot_scales(beats, overview, job_dir=job_dir(state['job_id']))
-        # 键名漂移同样在这里补救：存量任务不用重跑聚类，读一次状态就把「缺少字段」
-        # 这类假硬伤化掉（真的缺内容当然还是照报）。
+        reverse.normalize_beat_spaces(beats)
+        reverse.reconcile_event_coverage(beats, overview, reconcile_unbound=not reverse.is_variant_doc(beats))
         reverse.normalize_beat_keys(beats)
         _backfill_time_windows(state, beats)
         validation = reverse.validate_beats(beats, overview)
@@ -1842,6 +1868,23 @@ def run_compose(state, config, dimensions=None, on_progress=None, reset_cache=Fa
         except Exception:
             pass
 
+    # 与 run_reverse 同一口径：极速直通 / 标准合成只由配置决定，不探测测试替身。
+    use_deep = bool((config or {}).get('composeMode') == 'deep' or (config or {}).get('deepCompose'))
+
+    if not use_deep:
+        try:
+            from prompt_pipeline.fast_composer import compose_replica_one_pass
+            prompt_block, compose_state = compose_replica_one_pass(config, state, on_progress=on_progress)
+            if not state.get('title_locked') or not state.get('title'):
+                state['title'] = compose_state.get('title')
+            state['prompt_block'] = prompt_block
+            _write_compose_state(state, compose_state)
+            _save_state(state)
+            return run_audit(state, on_progress=on_progress)
+        except Exception as e:
+            if sys.stdout:
+                print(f"[REPLICA] 极速合成通道异常，平滑降级至标准合成链路: {e}")
+
     try:
         try:
             compose_state = compose_anchor_and_packet(config, dims, on_progress=on_progress)
@@ -1933,6 +1976,88 @@ def load_compose_state(job_id):
         if isinstance(slots, dict):
             data[key] = {int(k): v for k, v in slots.items() if str(k).lstrip('-').isdigit()}
     return data if data.get('packet') and data.get('beat_ladder') else None
+
+
+def save_prompt(job_id, prompt_block):
+    """人工修改/修复提示词包并重新执行禁用元素门禁复核。
+    
+    若无违规项，自动转入 completed 阶段并落入创意库；
+    若仍有违规项，保留 audit_failed 阶段并更新 banned_hits 列表。
+    """
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+
+    prompt_block = str(prompt_block or '').strip()
+    if not prompt_block:
+        raise ValueError('提示词内容不能为空')
+
+    state['prompt_block'] = prompt_block
+
+    # 门禁口径只有 run_audit 一处：这里再抄一份 banned_element_hits + _publish_to_library，
+    # 两道闸迟早会走岔（run_audit 的注释里记着上一次走岔的代价）。
+    state = run_audit(state)
+
+    if state.get('stage') == 'completed':
+        # 同步更新 compose_state.json 中的槽位。compiled_images / compiled_videos 的契约是
+        # {int: str}（composers/base.py 直接把它格式化进提示词），_parse_prompt_slots 返回的
+        # 却是 {int: {'body','meta'}}——原样存进去，下游拿到的就是一串 dict 字面量。
+        compose_state = load_compose_state(job_id)
+        if compose_state:
+            from prompt_pipeline import _parse_prompt_slots
+            images, videos = _parse_prompt_slots(prompt_block)
+            compose_state['compiled_images'] = _slot_bodies(images)
+            compose_state['compiled_videos'] = _slot_bodies(videos)
+            if 1 in compose_state['compiled_images']:
+                compose_state['image_1_prompt'] = compose_state['compiled_images'][1]
+            _write_compose_state(state, compose_state)
+
+    return _save_state(state)
+
+
+def _slot_bodies(slots):
+    """_parse_prompt_slots 的 {int: {'body','meta'}} → compose_state 用的 {int: str}。"""
+    if isinstance(slots, list):
+        return {item.get('index', i + 1): (item.get('body') if isinstance(item, dict) else str(item))
+                for i, item in enumerate(slots)}
+    return {k: (v.get('body') if isinstance(v, dict) else str(v)) for k, v in (slots or {}).items()}
+
+
+def purge_banned_from_prompt(job_id):
+    """一键从当前提示词中安全剥离所有命中的禁用词，并自动重新提交审核。"""
+    state = _load_state(job_id)
+    if not state:
+        raise ValueError(f'找不到复刻任务 {job_id}')
+
+    prompt_block = state.get('prompt_block') or ''
+    banned = (state.get('beats') or {}).get('banned_elements') or []
+    if not prompt_block or not banned:
+        return state
+
+    from prompt_pipeline import reverse
+    hits = reverse.banned_element_hits(prompt_block, banned)
+    if not hits:
+        return save_prompt(job_id, prompt_block)
+
+    cleaned_text = prompt_block
+    for hit in hits:
+        needle = str(hit).strip()
+        if not needle:
+            continue
+        patterns = [
+            rf'(?i)\b(?:wearing\s+(?:a\s+)?|with\s+(?:a\s+)?){re.escape(needle)}\s*(?:and|,)?\s*',
+            rf'(?i)(?:,\s*|\band\s+)?(?:a\s+)?{re.escape(needle)}\b',
+            rf'{re.escape(needle)}'
+        ]
+        for pat in patterns:
+            cleaned_text = re.sub(pat, ' ', cleaned_text)
+
+    # 规范化多余空格
+    cleaned_text = re.sub(r'[ \t]+', ' ', cleaned_text)
+    cleaned_text = re.sub(r' +\n', '\n', cleaned_text)
+    cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
+
+    return save_prompt(job_id, cleaned_text)
 
 
 def handoff_to_render(job_id):

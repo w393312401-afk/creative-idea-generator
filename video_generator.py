@@ -16,7 +16,7 @@ from server_common import (
     apply_google_fx_runtime_overrides, fx_cancel_context, fx_request_deadline,
     read_manifest, write_manifest, manifest_lock, strict_gates_enabled, qa_gate_level, gate_setting,
     _is_cover_filename, _cover_candidate_path,
-    resolve_video_duration,
+    resolve_video_duration, resolve_video_resolution,
     stamp_manifest_capabilities,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
     _get_account_pool_service, _select_pool_account,
@@ -1530,8 +1530,10 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
     # server_common.resolve_video_duration，保证是同一个数。
     if 'omni' in str(video_model).strip().lower():
         video_duration = str(resolve_video_duration(config))
+        video_resolution = resolve_video_resolution(config)
     else:
         video_duration = None
+        video_resolution = None
     writer = _ManifestWriter(manifest_path, manifest_data, videos.keys())
     run_bridges = []
     existing_by_slot = {v['slot']: v for v in existing_videos if isinstance(v, dict) and 'slot' in v}
@@ -1615,6 +1617,7 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
             model=video_model,
             ratio=config.get('imageAspectRatio') or '9:16',
             duration=video_duration,
+            resolution=video_resolution,
             output_path=temp_out_dir
         )
         pending_items.append({'plan': plan, 'req': req, 'temp_out_dir': temp_out_dir})
@@ -1779,6 +1782,7 @@ def generate_video_sequence(config, title, prompt_block, on_progress=None, targe
                         prompt=old_req.prompt, image=old_req.image, end_image=old_req.end_image,
                         image_uuid=old_req.image_uuid, end_image_uuid=old_req.end_image_uuid,
                         model=old_req.model, ratio=old_req.ratio, duration=old_req.duration,
+                        resolution=getattr(old_req, 'resolution', None),
                         output_path=new_temp_dir,
                     )
                     retry_items.append({'plan': it['plan'], 'req': new_req, 'temp_out_dir': new_temp_dir})
@@ -1923,8 +1927,10 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
     video_model = config.get('videoModel') or 'Veo 3.1 - Lite [Lower Priority]'
     if 'omni' in str(video_model).strip().lower():
         video_duration = str(resolve_video_duration(config))
+        video_resolution = resolve_video_resolution(config)
     else:
         video_duration = None
+        video_resolution = None
 
     account_pool = _get_account_pool_service()
     pool_account_id = _select_pool_account(config, account_pool)
@@ -1945,6 +1951,28 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
 
     writer = _ManifestWriter(manifest_path, manifest_data, all_available_slots)
 
+    existing_videos = {
+        v['slot']: v for v in manifest_data.get('videos', [])
+        if isinstance(v, dict) and v.get('slot') and v.get('status') == 'success'
+    }
+
+    def _register_frame(frame_slot, frame_path, quality_gate, source):
+        """把抽出来的帧登记进 manifest.frames（同槽位覆盖）。抽帧文件写了却不登记，
+        帧面板与后续门禁就看不到它。"""
+        rel_f = os.path.relpath(frame_path, _BASE_DIR).replace('\\', '/')
+        flist = [f for f in writer.data.get('frames', []) if f.get('slot') != frame_slot]
+        flist.append({
+            'slot': frame_slot,
+            'sequence': frame_slot,
+            'file': rel_f,
+            'url': '/' + rel_f,
+            'quality_gate': quality_gate,
+            'source': source,
+        })
+        flist.sort(key=lambda x: x.get('slot', 0))
+        writer.data['frames'] = flist
+        writer.save()
+
     for seq_idx, slot in enumerate(slots_to_run, start=1):
         if cancel_check_cb():
             print(f"[VIDEO CHAIN] 任务已被用户取消，停止后续槽位生成")
@@ -1955,35 +1983,52 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
         meta = str(item.get('meta', '') if isinstance(item, dict) else '').upper()
         dest_path = os.path.join(videos_dir, f'vid_{slot:03d}.mp4')
         start_frame_path = os.path.join(frames_dir, f'img_{slot:03d}.webp')
-        has_initial_frame = (slot == first_slot) and os.path.exists(start_frame_path) and os.path.getsize(start_frame_path) > 0
-        is_t2v = (slot == first_slot) and not has_initial_frame
+
+        # 检查是否可以复用已生成的有效视频（非针对该单槽位的显式强制重试）
+        can_reuse = (
+            target_slots is None or (len(target_slots) > 1 and slot in target_slots)
+        ) and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0 and (slot in existing_videos)
+
+        if can_reuse and not override_flagged:
+            info = existing_videos[slot]
+            print(f"[VIDEO CHAIN] 槽位 {slot} 已存在生成好的视频，直接复用: {dest_path}")
+            writer.record(info)
+            if slot == first_slot:
+                first_f = os.path.join(frames_dir, f'img_{slot:03d}.webp')
+                if ((not os.path.exists(first_f) or os.path.getsize(first_f) == 0)
+                        and _extract_video_frame(dest_path, first_f, 'first')):
+                    _register_frame(slot, first_f, 'extracted_from_t2v_first_frame',
+                                    f'vid_{slot:03d}.mp4')
+            next_f = os.path.join(frames_dir, f'img_{slot+1:03d}.webp')
+            if ((not os.path.exists(next_f) or os.path.getsize(next_f) == 0)
+                    and _extract_video_frame(dest_path, next_f, 'last', sseof_offset=0.15)):
+                _register_frame(slot + 1, next_f, 'extracted_from_video_last_frame',
+                                f'vid_{slot:03d}.mp4')
+            if on_progress:
+                on_progress('video_done', {
+                    'index': slot, 'current': seq_idx, 'total': len(slots_to_run),
+                    'video': info,
+                })
+            continue
+
+        # 首段恒为 T2V：img_001.webp 在本通道里是**从首段视频反抽出来的**（见下方
+        # extracted_from_t2v_first_frame 与复用分支），不是用户提供的输入帧。曾经这里按
+        # "首帧文件存在就走 I2V" 判定，重跑/强制重试首段时就会拿自己上一轮的产物当参考帧
+        # 自噬——所以只认槽位，不认文件。
+        is_t2v = (slot == first_slot)
 
         if is_t2v:
             start_frame_path = None
             prompt_for_gen = prepare_prompt_for_t2v(raw_prompt)
-        elif slot == first_slot and has_initial_frame:
-            prompt_for_gen = rewrite_prompt_for_single_frame(raw_prompt, start_slot=slot)
         else:
             prev_slot = slot - 1
             prev_video_path = os.path.join(videos_dir, f'vid_{prev_slot:03d}.mp4')
 
             # 如果参考帧图片不存在，尝试从上一段视频的尾帧抽取
             if (not os.path.exists(start_frame_path) or os.path.getsize(start_frame_path) == 0) and os.path.exists(prev_video_path):
-                _extract_video_frame(prev_video_path, start_frame_path, 'last', sseof_offset=0.15)
-                rel_f = os.path.relpath(start_frame_path, _BASE_DIR).replace('\\', '/')
-                f_entry = {
-                    'slot': slot,
-                    'sequence': slot,
-                    'file': rel_f,
-                    'url': '/' + rel_f,
-                    'quality_gate': 'extracted_from_prev_video_last_frame',
-                    'source': f'vid_{prev_slot:03d}.mp4',
-                }
-                flist = [f for f in writer.data.get('frames', []) if f.get('slot') != slot]
-                flist.append(f_entry)
-                flist.sort(key=lambda x: x.get('slot', 0))
-                writer.data['frames'] = flist
-                writer.save()
+                if _extract_video_frame(prev_video_path, start_frame_path, 'last', sseof_offset=0.15):
+                    _register_frame(slot, start_frame_path, 'extracted_from_prev_video_last_frame',
+                                    f'vid_{prev_slot:03d}.mp4')
 
             if not os.path.exists(start_frame_path) or os.path.getsize(start_frame_path) == 0:
                 err_msg = f"缺少上一段视频 (vid_{prev_slot:03d}.mp4) 的尾帧作为参考帧，无法生成视频 {slot}！"
@@ -2020,6 +2065,7 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
             model=video_model,
             ratio=config.get('imageAspectRatio') or '9:16',
             duration=video_duration,
+            resolution=video_resolution,
             output_path=temp_out_dir,
             project_url=canvas_project_url or None,
         )
@@ -2091,35 +2137,13 @@ def generate_video_chain_sequence(config, title, prompt_block, on_progress=None,
             if is_t2v:
                 first_f = os.path.join(frames_dir, f'img_{slot:03d}.webp')
                 if _extract_video_frame(dest_path, first_f, 'first'):
-                    rel_f0 = os.path.relpath(first_f, _BASE_DIR).replace('\\', '/')
-                    flist = [f for f in writer.data.get('frames', []) if f.get('slot') != slot]
-                    flist.append({
-                        'slot': slot,
-                        'sequence': slot,
-                        'file': rel_f0,
-                        'url': '/' + rel_f0,
-                        'quality_gate': 'extracted_from_t2v_first_frame',
-                        'source': f'vid_{slot:03d}.mp4',
-                    })
-                    flist.sort(key=lambda x: x.get('slot', 0))
-                    writer.data['frames'] = flist
-                    writer.save()
+                    _register_frame(slot, first_f, 'extracted_from_t2v_first_frame',
+                                    f'vid_{slot:03d}.mp4')
 
             next_f = os.path.join(frames_dir, f'img_{slot+1:03d}.webp')
             if _extract_video_frame(dest_path, next_f, 'last', sseof_offset=0.15):
-                rel_f1 = os.path.relpath(next_f, _BASE_DIR).replace('\\', '/')
-                flist = [f for f in writer.data.get('frames', []) if f.get('slot') != (slot + 1)]
-                flist.append({
-                    'slot': slot + 1,
-                    'sequence': slot + 1,
-                    'file': rel_f1,
-                    'url': '/' + rel_f1,
-                    'quality_gate': 'extracted_from_video_last_frame',
-                    'source': f'vid_{slot:03d}.mp4',
-                })
-                flist.sort(key=lambda x: x.get('slot', 0))
-                writer.data['frames'] = flist
-                writer.save()
+                _register_frame(slot + 1, next_f, 'extracted_from_video_last_frame',
+                                f'vid_{slot:03d}.mp4')
 
     try:
         generate_video_collage(project_dir)

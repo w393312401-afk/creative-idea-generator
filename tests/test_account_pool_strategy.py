@@ -139,3 +139,59 @@ def test_server_common_select_pool_account_and_ring():
     ring = server_common._account_rotation_ring(config, pool, first_user_id="acc3")
     # acc3 first (first_user_id), then acc1 (priority), then acc2 (non-priority)
     assert ring == ["acc3", "acc1", "acc2"]
+
+
+def test_effective_config_carries_pool_scheduling_keys():
+    """号池调度字段必须被 effective_config 从 SERVER_CONFIG 搬进生成配置。
+
+    回归用：这两个键曾经存进了 server_config.json 却没登记进 effective_config 的搬运表，
+    于是 _select_pool_account 永远看不到它们——选号策略与优先级实例整条链路是死的。
+    """
+    saved = {k: server_common.SERVER_CONFIG.get(k)
+             for k in ('googleFxAccountStrategy', 'googleFxPriorityUserIds')}
+    try:
+        server_common.SERVER_CONFIG['googleFxAccountStrategy'] = 'expiration_asc'
+        server_common.SERVER_CONFIG['googleFxPriorityUserIds'] = ['accX', 'accY']
+        merged = server_common.effective_config({})
+        assert merged.get('googleFxAccountStrategy') == 'expiration_asc'
+        assert merged.get('googleFxPriorityUserIds') == ['accX', 'accY']
+
+        # 浏览器 localStorage 里的旧值不得覆盖服务端配置
+        merged = server_common.effective_config({
+            'googleFxAccountStrategy': 'credit_desc',
+            'googleFxPriorityUserIds': [],
+        })
+        assert merged.get('googleFxAccountStrategy') == 'expiration_asc'
+        assert merged.get('googleFxPriorityUserIds') == ['accX', 'accY']
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                server_common.SERVER_CONFIG.pop(k, None)
+            else:
+                server_common.SERVER_CONFIG[k] = v
+
+
+def test_rotation_strategy_balances_by_task_count():
+    """'均衡轮换' 必须真的按累计任务数摊平，而不是悄悄退化成 credit_desc。"""
+    pool = ap.AccountPool()
+    pool.add_account("busy", name="Busy", serial_number="1")
+    pool.add_account("idle", name="Idle", serial_number="2")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with ap._LOCK:
+        state = ap._read_state()
+        # 积分更高但已经干了一堆活；credit_desc 会选它，rotation 不该选它
+        state["busy"]["credit"] = 500
+        state["busy"]["last_checked_at"] = now_iso
+        state["busy"]["image_task_count"] = 40
+        state["idle"]["credit"] = 100
+        state["idle"]["last_checked_at"] = now_iso
+        state["idle"]["image_task_count"] = 0
+        ap._write_state(state)
+
+    assert pool.pick_account(min_credit=10, strategy="credit_desc")["user_id"] == "busy"
+    assert pool.pick_account(min_credit=10, strategy="rotation")["user_id"] == "idle"
+
+    config = {"videoAccountPoolMinCredit": 10, "googleFxAccountStrategy": "rotation"}
+    ring = server_common._account_rotation_ring(config, pool, first_user_id=None)
+    assert ring == ["idle", "busy"]

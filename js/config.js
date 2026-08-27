@@ -228,6 +228,12 @@ function loadConfig() {
         // 老配置里可能存着空串（"沿用 Flow 面板当前时长"，2026-08-01 已取消）——空值在
         // 下拉框里已经没有对应项，会显示成一个空白选项，回落到默认时长。
         fxVideoDurationSelect.value = config.videoDuration || DEFAULT_CONFIG.videoDuration;
+        fxVideoDurationSelect.onchange = updateOmniCreditEstimate;
+    }
+    const fxVideoResolutionSelect = document.getElementById('settings-fx-video-resolution');
+    if (fxVideoResolutionSelect) {
+        fxVideoResolutionSelect.value = config.videoResolution || DEFAULT_CONFIG.videoResolution;
+        fxVideoResolutionSelect.onchange = updateOmniCreditEstimate;
     }
     const fxVideoRefModeSelect = document.getElementById('settings-fx-video-ref-mode');
     if (fxVideoRefModeSelect) {
@@ -309,14 +315,39 @@ function updateFxImageModelVisibility() {
     updateFxVideoDurationVisibility();
 }
 
-// Omni Flash 时长切换仅该模型面板提供（Veo 系列时长固定），所以只在当前选中的
+// Omni Flash 积分消耗对照表（根据 Google Labs Flow 实际扣费）
+const OMNI_CREDIT_MATRIX = {
+    '720p': { '4': 6, '6': 9, '8': 12, '10': 15 },
+    '360p': { '4': 3, '6': 5, '8': 6, '10': 8 },
+};
+
+function updateOmniCreditEstimate() {
+    const durSelect = document.getElementById('settings-fx-video-duration');
+    const resSelect = document.getElementById('settings-fx-video-resolution');
+    const costValEl = document.getElementById('omni-credit-cost-val');
+    const costDescEl = document.getElementById('omni-credit-cost-desc');
+    if (!durSelect || !resSelect || !costValEl) return;
+
+    const dur = durSelect.value || '10';
+    const res = resSelect.value || '720p';
+    const cost = (OMNI_CREDIT_MATRIX[res] && OMNI_CREDIT_MATRIX[res][dur]) || (res === '360p' ? 8 : 15);
+
+    costValEl.textContent = String(cost);
+    if (costDescEl) {
+        costDescEl.textContent = `${dur}s · ${res}`;
+    }
+}
+
+// Omni Flash 时长与分辨率切换仅该模型面板提供（Veo 系列时长与分辨率固定），所以只在当前选中的
 // 视频模型是 Omni Flash 时显示。
 function updateFxVideoDurationVisibility() {
     const fxVideoModelSelect = document.getElementById('settings-fx-video-model');
     const durationGroup = document.getElementById('fx-video-duration-group');
-    if (!durationGroup) return;
+    const resolutionGroup = document.getElementById('fx-video-resolution-group');
     const isOmni = fxVideoModelSelect && fxVideoModelSelect.value === 'Omni Flash';
-    durationGroup.style.display = isOmni ? '' : 'none';
+    if (durationGroup) durationGroup.style.display = isOmni ? '' : 'none';
+    if (resolutionGroup) resolutionGroup.style.display = isOmni ? '' : 'none';
+    if (isOmni) updateOmniCreditEstimate();
 }
 
 // 把配置中心表单里的值收进 config 对象（不落盘）。saveConfig 与
@@ -351,6 +382,10 @@ function applySettingsFormToConfig() {
     const fxVideoDurationSelect = document.getElementById('settings-fx-video-duration');
     if (fxVideoDurationSelect) {
         config.videoDuration = fxVideoDurationSelect.value;
+    }
+    const fxVideoResolutionSelect = document.getElementById('settings-fx-video-resolution');
+    if (fxVideoResolutionSelect) {
+        config.videoResolution = fxVideoResolutionSelect.value;
     }
     const fxVideoRefModeSelect = document.getElementById('settings-fx-video-ref-mode');
     if (fxVideoRefModeSelect) {
@@ -417,7 +452,7 @@ function flashSettingsSaved() {
 // FX 模型设置由服务端 server_config.json 统一管理：前端改了之后要同步推到
 // 服务端，否则 effective_config 会采用 SERVER_CONFIG 里的旧值（服务端优先）。
 // 静默调用，失败不弹 toast——下一次生成请求仍然会把最新 config 带过去。
-const _FX_SERVER_SYNC_KEYS = ['videoModel', 'googleFxImageModel', 'videoDuration', 'videoRefMode'];
+const _FX_SERVER_SYNC_KEYS = ['videoModel', 'googleFxImageModel', 'videoDuration', 'videoResolution', 'videoRefMode'];
 let _fxSyncPending = null;
 
 function syncFxModelToServer() {
@@ -480,6 +515,10 @@ function resetConfig() {
     const fxVideoDurationSelect = document.getElementById('settings-fx-video-duration');
     if (fxVideoDurationSelect) {
         fxVideoDurationSelect.value = DEFAULT_CONFIG.videoDuration;
+    }
+    const fxVideoResolutionSelect = document.getElementById('settings-fx-video-resolution');
+    if (fxVideoResolutionSelect) {
+        fxVideoResolutionSelect.value = DEFAULT_CONFIG.videoResolution;
     }
     const fxVideoRefModeSelect = document.getElementById('settings-fx-video-ref-mode');
     if (fxVideoRefModeSelect) {
@@ -749,7 +788,7 @@ if (typeof window !== 'undefined') {
         try {
             const updated = JSON.parse(e.newValue);
             let dirty = false;
-            for (const key of ['videoModel', 'googleFxImageModel', 'videoDuration', 'videoRefMode']) {
+            for (const key of ['videoModel', 'googleFxImageModel', 'videoDuration', 'videoResolution', 'videoRefMode']) {
                 if (key in updated && config[key] !== updated[key]) {
                     config[key] = updated[key];
                     dirty = true;
@@ -763,6 +802,8 @@ if (typeof window !== 'undefined') {
                 if (fxImageModelSelect) fxImageModelSelect.value = config.googleFxImageModel || '';
                 const fxDurationSelect = document.getElementById('settings-fx-video-duration');
                 if (fxDurationSelect) fxDurationSelect.value = config.videoDuration || DEFAULT_CONFIG.videoDuration;
+                const fxResolutionSelect = document.getElementById('settings-fx-video-resolution');
+                if (fxResolutionSelect) fxResolutionSelect.value = config.videoResolution || DEFAULT_CONFIG.videoResolution;
                 const fxRefModeSelect = document.getElementById('settings-fx-video-ref-mode');
                 if (fxRefModeSelect) fxRefModeSelect.value = config.videoRefMode || DEFAULT_CONFIG.videoRefMode;
                 if (typeof syncIdeationSkillProfilePicker === 'function') syncIdeationSkillProfilePicker();

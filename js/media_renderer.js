@@ -330,12 +330,14 @@ function hydrateVideosPanel(idea) {
     if (!idea) return;
     const rec = (typeof getIdeaTaskRecord === 'function') ? getIdeaTaskRecord(idea.id, 'videos') : null;
     const btn = document.getElementById('generate-videos-btn');
+    const chainBtn = document.getElementById('generate-video-chain-btn');
     const progress = document.getElementById('videos-progress');
     const meta = document.getElementById('videos-meta');
     const grid = slotRenderTarget('video');
     renderVideosForIdea(idea);
     if (rec) {
         if (btn) btn.disabled = true;
+        if (chainBtn) chainBtn.disabled = true;
         if (progress) progress.style.display = 'flex';
         if (meta) meta.textContent = rec.meta || '生成中...';
         if (rec.progressInfo && typeof setProgressBar === 'function') setProgressBar('videos', rec.progressInfo);
@@ -354,6 +356,7 @@ function hydrateVideosPanel(idea) {
         }
     } else {
         if (btn) btn.disabled = false;
+        if (chainBtn) chainBtn.disabled = false;
         if (progress) progress.style.display = 'none';
     }
     if (typeof updatePipelineBar === 'function') updatePipelineBar();

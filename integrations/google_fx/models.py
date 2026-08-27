@@ -44,15 +44,12 @@ class VideoRequest(BrowserEnvLockedRequest):
     image_uuid: str = ""
     end_image_uuid: str = ""
     ratio: Optional[str] = None
-    # 可选: "Veo 3.1 - Fast" | "Veo 3.1 - Quality"
+    # 可选: "Veo 3.1 - Fast" | "Veo 3.1 - Quality" | "Omni Flash"
     model: str = Field(default_factory=get_runtime_google_fx_video_model)
     duration: Optional[str] = None
+    resolution: Optional[str] = None  # 可选: "360p" | "720p"
     output_path: str = ""
     project_url: Optional[str] = None  # Bound Flow canvas for the local project.
-
-
-
-
 
 
 class VideoBatchItem(BaseModel):
@@ -63,6 +60,7 @@ class VideoBatchItem(BaseModel):
     ratio: Optional[str] = None
     model: str = ""       # 为空时继承批量请求级别的 model
     duration: Optional[str] = None
+    resolution: Optional[str] = None  # 可选: "360p" | "720p"
     output_path: str = "" # 为空时继承批量请求级别的 output_path
 
 
@@ -72,6 +70,7 @@ class VideoBatchRequest(BrowserEnvLockedRequest):
     ratio: Optional[str] = None
     model: str = Field(default_factory=get_runtime_google_fx_video_model)
     duration: Optional[str] = None
+    resolution: Optional[str] = None  # 可选: "360p" | "720p"
     output_path: str = ""
     concurrent: bool = True       # 并行提交模式 (同一画布快速连续提交后统一监听)
     max_concurrent: int = 5       # 单次批量最大任务数 (画布同时生成上限)

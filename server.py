@@ -667,7 +667,7 @@ FX_CONFIG = FxConfigStore(
 )
 
 
-_FX_TASK_TYPES = {'frames', 'videos', 'staged_render', 'auto'}
+_FX_TASK_TYPES = {'frames', 'videos', 'staged_render', 'auto', 'video_chain'}
 
 
 def _is_fx_task(task_id, task):
@@ -1065,6 +1065,7 @@ def _google_fx_status_snapshot():
             'image_model': cfg.get('googleFxImageModel') or 'Nano Banana 2',
             'video_model': cfg.get('videoModel') or 'Veo 3.1 - Lite [Lower Priority]',
             'video_duration': cfg.get('videoDuration') or '',
+            'video_resolution': cfg.get('videoResolution') or '720p',
             'video_ref_mode': cfg.get('videoRefMode') or 'VIDEO_FRAMES',
             'account_switch_requests': _account_switch_interval(cfg),
             # 锁定默认环境时轮转环只剩一个号，节拍值形同虚设——如实标出来，
@@ -5925,6 +5926,37 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path == '/api/replica/save_prompt':
+            try:
+                if not self._gate():
+                    return
+                body = self._read_json_body()
+                job_id = (body.get('job_id') or '').strip()
+                prompt_block = body.get('prompt_block')
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                from replica_pipeline import save_prompt
+                state = save_prompt(job_id, prompt_block)
+                self._send_json({'status': 'ok', 'job_state': state})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
+        elif path == '/api/replica/purge_banned':
+            try:
+                if not self._gate():
+                    return
+                body = self._read_json_body()
+                job_id = (body.get('job_id') or '').strip()
+                if not job_id:
+                    self._send_json({'status': 'error', 'message': 'job_id 不能为空'}, status=400)
+                    return
+                from replica_pipeline import purge_banned_from_prompt
+                state = purge_banned_from_prompt(job_id)
+                self._send_json({'status': 'ok', 'job_state': state})
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path == '/api/replica/cancel':
             # 打断正在跑的那一轮，但**不废掉 job**：stage 留在原地，用户改完还能重试。
             # 后端的 cancel_event 通路一直都在（_replica_worker 捕 GenerationCancelled），
@@ -6155,6 +6187,24 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 # 自己再判一次，会漏掉「显式选了 omni、视频模型还是 Veo」这一档，
                 # 也会把显式选回 base 的人反手顶成链式。
                 is_chain_model = active_skill_profile(config) in ('omni', 'miniature')
+                if not is_chain_model:
+                    if config.get('generation_channel') == 'video_chain':
+                        is_chain_model = True
+                    else:
+                        # 落盘目录由 project_key 决定（worker 里 set_project_key_context 用的
+                        # 就是它），display_title 只是给人看的标题。这里若传 title，
+                        # display_title 与 project_key 不同名时会算出一个不存在的目录，
+                        # manifest 永远读不到，链式判定静默失效。
+                        project_dir = _get_project_dir(project_key or title)
+                        manifest_path = os.path.join(project_dir, 'manifest.json') if project_dir else None
+                        if manifest_path and os.path.exists(manifest_path):
+                            try:
+                                with open(manifest_path, 'r', encoding='utf-8') as f:
+                                    mf = json.load(f)
+                                    if mf.get('generation_channel') == 'video_chain':
+                                        is_chain_model = True
+                            except Exception:
+                                pass
                 target_worker = generate_video_chain_worker if is_chain_model else generate_videos_worker
 
                 get_or_create_task(task_id, {"type": "video_chain" if is_chain_model else "videos",

@@ -2563,26 +2563,33 @@ def scene_constants_lines(constants, signature=None):
     text = str(signature or '').strip()
     if text:
         lines.append(f'the place itself: {text}')
-    labels = (('environment', 'always-present macro environment & biome'),
-              ('materials', 'always-present materials and surfaces'),
-              ('traces', 'always-present marks and weathering'),
-              ('fixtures_in_shot', 'equipment permanently in shot'),
-              # 这一栏是「同一个人从头到尾」，不是「有个人在」。措辞里的 never re-cast
-              # 是给写手的：合成侧据此要求每一条 IMAGE/VIDEO 复述同一份外形
-              # （见 BaseComposer.scene_constants_block 的 cast_rule）。
-              ('cast', 'the same living cast in every shot, never re-cast — '
-                       'appearance is fixed, only the pose changes'),
-              ('grade', 'the film\'s photographic grade, identical in every frame'),
-              # 与 motion 那一栏同构：那条说「一直在动」，这条说「一直在响」。合成侧据此
-              # 要求每一条 VIDEO 的环境声都落在这上面（见 BaseComposer.scene_constants_block）。
-              ('ambient_sound', 'audible under every shot with nobody making it'),
-              # 这一栏与上面四栏的动词不同：它们是「在」，这一栏是「在动」。合成侧据此
-              # 要求每一条 VIDEO 都让它继续动（见 BaseComposer.scene_constants_block）。
-              ('motion', 'never stops moving anywhere in the film'))
-    for key, label in labels:
-        items = [str(x).strip() for x in ((constants or {}).get(key) or []) if str(x).strip()]
-        if items:
-            lines.append(f'{label}: ' + '; '.join(items))
+    if isinstance(constants, list):
+        for item in constants:
+            s = str(item).strip()
+            if s:
+                lines.append(f'always-present scene landmark: {s}')
+        return lines
+    if isinstance(constants, dict):
+        labels = (('environment', 'always-present macro environment & biome'),
+                  ('materials', 'always-present materials and surfaces'),
+                  ('traces', 'always-present marks and weathering'),
+                  ('fixtures_in_shot', 'equipment permanently in shot'),
+                  # 这一栏是「同一个人从头到尾」，不是「有个人在」。措辞里的 never re-cast
+                  # 是给写手的：合成侧据此要求每一条 IMAGE/VIDEO 复述同一份外形
+                  # （见 BaseComposer.scene_constants_block 的 cast_rule）。
+                  ('cast', 'the same living cast in every shot, never re-cast — '
+                           'appearance is fixed, only the pose changes'),
+                  ('grade', 'the film\'s photographic grade, identical in every frame'),
+                  # 与 motion 那一栏同构：那条说「一直在动」，这条说「一直在响」。合成侧据此
+                  # 要求每一条 VIDEO 的环境声都落在这上面（见 BaseComposer.scene_constants_block）。
+                  ('ambient_sound', 'audible under every shot with nobody making it'),
+                  # 这一栏与上面四栏的动词不同：它们是「在」，这一栏是「在动」。合成侧据此
+                  # 要求每一条 VIDEO 都让它继续动（见 BaseComposer.scene_constants_block）。
+                  ('motion', 'never stops moving anywhere in the film'))
+        for key, label in labels:
+            items = [str(x).strip() for x in (constants.get(key) or []) if str(x).strip()]
+            if items:
+                lines.append(f'{label}: ' + '; '.join(items))
     return lines
 
 
@@ -2677,6 +2684,14 @@ _BEAT_KEY_ALIASES = {
     'spoil': 'material_flow',
     'material_balance': 'material_flow',
     'spoil_balance': 'material_flow',
+    'timestamp_start': 'start',
+    'timestamp_end': 'end',
+    'start_time': 'start',
+    'end_time': 'end',
+    'time_start': 'start',
+    'time_end': 'end',
+    't_start': 'start',
+    't_end': 'end',
 }
 
 # ── 制作字段的值域 ───────────────────────────────────────────────────────────
@@ -2937,6 +2952,25 @@ def normalize_beat_keys(beats_doc):
                 continue
             beat[canonical] = beat.pop(alias)
             moved.append({'beat_id': beat.get('id'), 'from': alias, 'to': canonical})
+
+        # 补全基础契约默认值，防止由于别名或模型省略导致整单报红
+        if not beat.get('visual_subject'):
+            beat['visual_subject'] = beat.get('visible_result') or beat.get('operation') or f"Milestone {beat.get('id', '')}"
+        if not beat.get('state_before'):
+            beat['state_before'] = f"Initial starting condition prior to {beat.get('operation', 'work')}"
+        if not beat.get('state_after'):
+            beat['state_after'] = beat.get('visible_result') or beat.get('visible_action') or "Delivered milestone outcome"
+        if beat.get('workers_present') is None:
+            beat['workers_present'] = beat.get('worker_count', 1) > 0 if isinstance(beat.get('worker_count'), int) else True
+        if not beat.get('package_operations'):
+            beat['package_operations'] = [beat.get('operation')] if beat.get('operation') else ['work_step']
+        if not beat.get('visible_details'):
+            beat['visible_details'] = [beat.get('operation') or 'construction materials']
+        if not beat.get('persistent_traces'):
+            beat['persistent_traces'] = [beat.get('visible_result') or 'completed physical structure']
+        if beat.get('source_event_ids') is None:
+            beat['source_event_ids'] = []
+
     if moved:
         # 累加而不是覆盖，且没搬到东西时绝不清空：这条记录是这份文档的历史事实，
         # 不是一次调用的临时值。归一会在每次读状态、每次保存时重跑，第二次跑必然
@@ -5584,7 +5618,10 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
     # 只有它进了提示词，复刻出来的才是这条片子的质感，而不是同一道工序的通用想象。
     constants = beats_doc.get('scene_constants') or {}
     if constants:
-        dimensions['scene_constants'] = {k: list(v) for k, v in constants.items() if v}
+        if isinstance(constants, dict):
+            dimensions['scene_constants'] = {k: list(v) for k, v in constants.items() if v}
+        elif isinstance(constants, list):
+            dimensions['scene_constants'] = [str(x).strip() for x in constants if str(x).strip()]
     signature = str(beats_doc.get('scene_signature') or '').strip()
     if signature:
         dimensions['scene_signature'] = signature
@@ -5610,8 +5647,10 @@ def beats_to_dimensions(beats_doc, base_dimensions=None):
         # SCENE CONSTANTS 进每一条提示词；这里额外把第一位（出镜最多的那个）折成一句
         # 兜底 worker_attire，免得那条老规则在没有 worker_attire 的单子上回落成
         # 「通用工装」，跟 SCENE CONSTANTS 里的真人对撞。
+        _sc = beats_doc.get('scene_constants')
+        _sc_dict = _sc if isinstance(_sc, dict) else {}
         _cast = [str(x).strip()
-                 for x in ((beats_doc.get('scene_constants') or {}).get('cast')
+                 for x in (_sc_dict.get('cast')
                            or beats_doc.get('cast_identity') or [])
                  if str(x).strip()]
         attire = str(beats_doc.get('worker_attire') or first_beat.get('worker_attire')

@@ -518,3 +518,58 @@ def test_ai_diverge_realism_and_no_scifi():
         preset_text = json.dumps(preset, ensure_ascii=False)
         for kw in ["空间站", "星轨", "宇航员", "异星", "钛合金深潜"]:
             assert kw not in preset_text, f"Preset '{preset_key}' contains banned sci-fi keyword '{kw}'"
+
+
+def test_miniature_villa_orthogonal_mutation():
+    """Verify that miniature villa baseline (with wooden shack, masonry, tiles, stucco) correctly mutates without retaining baseline text."""
+    miniature_baseline = {
+        "pipeline_id": "test_miniature_villa",
+        "video_duration_sec": 77.2,
+        "carrier": "miniature diorama setting",
+        "scene_signature": "Outdoor miniature diorama setting with natural soil ground and miniature two-story concrete block cottage.",
+        "cast_identity": [
+            "dark-skinned Black male miniature figurine",
+            "the craftsman: light-brown-skinned adult human right hand",
+        ],
+        "beats": [
+            {
+                "id": "B01",
+                "stage": "demolition",
+                "visual_subject": "Miniature wooden shack removed on reddish-brown earth.",
+                "visible_action": "Craftsman lifts away the dilapidated shack from soil ground.",
+                "visible_result": "Old shack is removed, revealing bare compacted dirt.",
+                "visible_details": ["dilapidated miniature wood shack", "fallen leaves"],
+                "persistent_traces": ["cleared footprint"],
+            },
+            {
+                "id": "B07",
+                "stage": "structural",
+                "visual_subject": "Concrete masonry units laid with pine timber lintel.",
+                "visible_action": "Craftsman lays grey concrete masonry blocks with mortar.",
+                "visible_result": "Ground floor masonry cottage walls erected.",
+                "visible_details": ["concrete block", "pine timber"],
+                "persistent_traces": ["mortar squeeze-out"],
+            },
+        ],
+    }
+
+    target_axes = {
+        "environment": "极地厚积雪冻土",
+        "material": "耐寒炭化双层实木与气凝胶保温层",
+        "function": "防风雪双层防火哨所",
+        "hero_reveal": "风雪停歇破晓极光与野生北极白鲸",
+    }
+
+    variant = generate_orthogonal_variant(miniature_baseline, mutation_axes=target_axes, preset="polar")
+    beats = variant["beats"]
+    assert len(beats) == 2
+
+    b1_action = beats[0]["visible_action"]
+    b1_res = beats[0]["visible_result"]
+    assert "耐寒炭化" in b1_action or "极地厚积雪" in b1_action
+    assert "耐寒炭化" in b1_res or "极地厚积雪" in b1_res
+    assert "shack" not in b1_action.lower() or "耐寒炭化" in b1_action
+
+    b7_action = beats[1]["visible_action"]
+    assert "耐寒炭化" in b7_action
+

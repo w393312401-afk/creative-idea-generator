@@ -235,7 +235,7 @@ def map_asmr_audio(operation_type: str, material: str = '', action: str = '') ->
 
 
 def apply_slot_replacement(text: str, mutation_axes: Dict[str, Any]) -> str:
-    """对文本中的环境、材质、功用、生物进行正交槽位替换。"""
+    """对文本中的环境、材质、功用、生物进行正交槽位替换（支持通用母本词汇）。"""
     if not text or not isinstance(text, str):
         return ''
 
@@ -244,21 +244,30 @@ def apply_slot_replacement(text: str, mutation_axes: Dict[str, Any]) -> str:
     func = mutation_axes.get('function') or ''
     hero = mutation_axes.get('hero_reveal') or ''
 
-    # 替换规则映射：将母本常见词槽置换为目标正交词槽 (单遍扫描，防止递归嵌套污染)
     mapping = {}
     if env:
-        mapping[r'荒野河流泥岸|浑绿江水|河岸泥地|泥泞河滩|江水|河流泥岸|grassy riverbank|muddy riverbank|green river water|riverbank shoreline|river water|river shoreline'] = env
-        mapping[r'室外泥地|岸边坡地|水下岸边|河岸|江边|\bshoreline\b|\briverbank\b'] = f'{env}边缘'
+        # 地貌环境词汇
+        mapping[r'荒野河流泥岸|浑绿江水|河岸泥地|泥泞河滩|江水|河流泥岸|grassy riverbank|muddy riverbank|green river water|riverbank shoreline|river water|river shoreline|reddish-brown earth|brown loam|loose loam|compacted dirt|forest canopy|woodland clearing|tropical forest|natural soil ground|soil ground'] = env
+        mapping[r'室外泥地|岸边坡地|水下岸边|河岸|江边|\bshoreline\b|\briverbank\b|\bclearing\b'] = f'{env}边缘'
     if mat:
+        # 结构建筑材料与旧建筑
         mapping[r'蓝色钢构|废弃集装箱|沉水集装箱|集装箱钢板|集装箱波纹板|钢构舱体|shipping container|rusted container|\bcontainer\b'] = mat
-        mapping[r'暖橡木板|实木地板|橡木地板|木质板材|wood paneling|wood panels|paneled interior'] = f'{mat}配套饰面板'
-        mapping[r'条形暖光灯槽|家用日光灯|普通灯带|strip lights|warm lighting'] = f'{mat}专用隐形线型暖光灯槽'
+        mapping[r'破旧木棚|旧木棚|木结构小屋|石木别墅|木屋|shack|wooden shack|dilapidated shack|cottage|masonry cottage|two-story cottage|concrete block cottage|villa'] = f'{mat}主体结构'
+        mapping[r'混凝土砌块|空心砖|红砖|灰浆|砌块|砂浆|concrete masonry units|concrete masonry|concrete block|CMU|grey blockwork|mortar joints|mortar'] = f'{mat}砌体材料'
+        mapping[r'松木过梁|实木屋架|人字木屋架|木檩条|timber lintel|timber trusses|rafter trusses|pine timber|pine rafter|roof purlins|timber balcony'] = f'{mat}高强度结构梁架'
+        mapping[r'陶瓦|仿古瓦|屋顶瓦片|terracotta-style roof tiles|roof tiles|terracotta tiles'] = f'{mat}耐候顶层覆板'
+        mapping[r'米黄抹灰|外墙灰浆|抹灰面层|beige stucco plaster|stucco plaster|beige stucco'] = f'{mat}防护面层'
+        mapping[r'暖橡木板|实木地板|橡木地板|木质板材|wood paneling|wood panels|paneled interior|oak wood-grain flooring|light-oak wood'] = f'{mat}配套饰面板'
+        mapping[r'条形暖光灯槽|家用日光灯|普通灯带|复古壁灯|carriage lantern|strip lights|warm lighting'] = f'{mat}专用隐形线型暖光灯槽'
     if func:
-        mapping[r'全景江景卧房|水下江景卧房|水下卧室|江景卧房|卧房|卧室|\bunderwater room\b|\bbedroom\b|\bliving room\b'] = func
-        mapping[r'白棉麻床品|双人床|大床|\bbedding\b|\bbed\b'] = f'{func}核心定制配置'
+        # 空间功用与家具
+        mapping[r'全景江景卧房|水下江景卧房|水下卧室|江景卧房|卧房|卧室|度假别墅|两层别墅|\bunderwater room\b|\bbedroom\b|\bliving room\b|\bcottage interior\b'] = func
+        mapping[r'白棉麻床品|双人床|大床|实木餐桌|餐桌椅|L型橱柜|卫浴设施|\bbedding\b|\bbed\b|dining table|kitchen suite|cabinetry'] = f'{func}核心定制配置'
     if hero:
+        # 终极生物与揭示
         mapping[r'野生淡水大鲟鱼|2米巨型野生淡水大鲟鱼|大鲟鱼|鲟鱼|淡水大鱼|wild sturgeon|large sturgeon|giant sturgeon|\bsturgeon\b'] = hero
         mapping[r'大鱼游弋|鱼群掠过|fish swimming'] = f'{hero}游弋'
+        mapping[r'花园造景|石板小径|石板路|flagstone walkway|garden beds|flower shrubs'] = f'{hero}周边地貌'
 
     if not mapping:
         return text
@@ -301,6 +310,108 @@ def apply_trace_mapping(traces: Any, mutation_axes: Dict[str, Any]) -> List[str]
     return out_traces if out_traces else [f'{mat or "主体"}结构安装锁紧留存压痕', f'{mat or "表面"}接缝密封防水胶打胶留存细线']
 
 
+_LLM_MUTATE_BEATS_SYSTEM = """你是一位顶尖的纪录片级视觉短视频创意总监与极限空间建造设计师。
+你的任务是将给定的「N 拍母本工序阶梯 (Beat Ladder)」严格重构为全新的「四轴正交二创变体阶梯」。
+
+【必须严格遵守的铁律 (Strict Constraints)】：
+1. 【1:1 节拍同构与因果锁死】：输入几拍就输出几拍（精确 N 拍，Beat 1 到 Beat N），每一拍的物理施工因果阶段（破拆清场 -> 地基基础 -> 结构龙骨 -> 封闭保温 -> 面层饰面 -> 软装设备 -> 终极揭示）必须与原拍 100% 拓扑对齐！
+2. 【全量四轴正交置换】：
+   - 轴 1 环境地貌 (Environment): 将原环境全部替换为目标新环境（如极地冻土、冰雪裂隙、荒漠红岩等）。
+   - 轴 2 材质工艺 (Material): 将原建筑材质（如红砖、水泥砌块、普通原木等）全部替换为目标新材料（如耐寒炭化木、气凝胶保温层、耐候钢、火山玄武岩等）。
+   - 轴 3 功能设施 (Function): 将空间功能与软装全部替换为目标新功能（如防寒壁炉、气闸保暖舱、恒温水窖等）。
+   - 轴 4 终极奇观 (Hero Reveal): 将终拍的揭示物替换为目标终极生物/自然奇观。
+3. 【拍摄尺度与活物继承】：
+   - 若母本为微缩沙盘（Miniature Diorama / 巨人手 Craftsman Hands / 微缩人偶 Miniature Figurines），必须严格保留工匠手操作、微距景深与微缩人偶 living cast，但所有建造对象、工具和物料必须完全变成新材质！
+   - 若母本为全尺寸真人施工，保留真人与对应工具。
+4. 【去科幻与真实写实】：所有施工动作、工具与物料必须符合真实物理工序逻辑。
+
+【输出格式】：
+严格返回一个 JSON 数组，包含 N 个对象，对应 Beat 1 到 Beat N，无 Markdown 代码块，无多余文字：
+[
+  {
+    "id": "B01",
+    "visual_subject": "简练的一句话英文/中文视觉主体",
+    "visible_action": "工人的具体施工动作与工具（如：工匠右手用微型铁镐破开极地冻土...）",
+    "visible_result": "本拍完成后的物理交付状态",
+    "state_before": "动工前的状态",
+    "state_after": "完工后的状态",
+    "visible_details": ["具体新材质1", "具体新材质2"],
+    "persistent_traces": ["留存物理压痕/接缝胶线"]
+  }
+]"""
+
+
+def _llm_mutate_beats(
+    config: Optional[Dict[str, Any]],
+    source_beats: List[Dict[str, Any]],
+    effective_axes: Dict[str, Any],
+    baseline_doc: Dict[str, Any],
+    brief: Optional[str] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """调用大模型对全量节拍进行四轴正交智能重写。"""
+    if not config:
+        return None
+
+    import prompt_pipeline as pp
+    from prompt_pipeline.reverse import parse_json_reply
+
+    beats_input = []
+    for i, b in enumerate(source_beats):
+        if not isinstance(b, dict):
+            continue
+        beats_input.append({
+            'index': i + 1,
+            'id': b.get('id') or f'B{i+1:02d}',
+            'stage': b.get('stage') or b.get('operation_type') or 'construction',
+            'operation': b.get('operation') or '',
+            'visible_action': b.get('visible_action') or '',
+            'visible_result': b.get('visible_result') or '',
+            'state_before': b.get('state_before') or '',
+            'state_after': b.get('state_after') or '',
+            'visible_details': b.get('visible_details') or [],
+            'persistent_traces': b.get('persistent_traces') or [],
+            'space': b.get('space') or 'exterior',
+        })
+
+    carrier = baseline_doc.get('carrier') or baseline_doc.get('video_name') or '母本建筑'
+    scene_sig = baseline_doc.get('scene_signature') or ''
+    cast_id = baseline_doc.get('cast_identity') or []
+
+    user_prompt = (
+        f"【母本背景】\n"
+        f"- 载体/项目名: {carrier}\n"
+        f"- 原始场景特征: {scene_sig}\n"
+        f"- 常驻演员/比例尺: {', '.join(str(c) for c in cast_id) if cast_id else '未特指'}\n"
+        f"- 节拍总数: {len(beats_input)} 拍\n\n"
+        f"【四轴正交目标设定 (Target 4-Axis Settings)】\n"
+        f"- 轴 1 环境地貌 (Environment): {effective_axes.get('environment', '')}\n"
+        f"- 轴 2 材质工艺 (Material): {effective_axes.get('material', '')}\n"
+        f"- 轴 3 空间功能 (Function): {effective_axes.get('function', '')}\n"
+        f"- 轴 4 终极揭示 (Hero Reveal): {effective_axes.get('hero_reveal', '')}\n"
+        f"- 创作者补充指示 (Brief): {brief or '（无）'}\n\n"
+        f"【母本 {len(beats_input)} 拍工序输入】\n"
+        f"{json.dumps(beats_input, ensure_ascii=False, indent=2)}\n\n"
+        f"请直接输出包含精确 {len(beats_input)} 拍正交重写结果的 JSON 数组。"
+    )
+
+    try:
+        raw = pp._chat(
+            config=config,
+            system=_LLM_MUTATE_BEATS_SYSTEM,
+            user=user_prompt,
+            temperature=0.7,
+            max_tokens=8192,
+            timeout=90,
+        )
+        parsed = parse_json_reply(raw)
+        if isinstance(parsed, list) and len(parsed) == len(source_beats):
+            return parsed
+    except Exception as e:
+        if sys.stdout:
+            print(f"[mutate] LLM 全节拍重写异常，平滑降级至规则槽位替换: {e}")
+    return None
+
+
 def generate_orthogonal_variant(
     baseline_doc: Dict[str, Any],
     mutation_axes: Optional[Dict[str, Any]] = None,
@@ -308,7 +419,7 @@ def generate_orthogonal_variant(
     brief: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """通过词槽正交映射生成二创变体，严格确保物理骨架零坍塌、零漂移。
+    """通过词槽正交映射与大模型智能重构生成二创变体，严格确保物理骨架零坍塌、零漂移。
 
     参数:
         baseline_doc: 母本節拍階梯文档 (timelapse_beats.json 或 job_state)
@@ -346,11 +457,21 @@ def generate_orthogonal_variant(
         effective_axes.update(MUTATION_PRESETS['polar']['axes'])
         preset = 'polar'
 
+    # 优先尝试大模型四轴正交智能重写
+    llm_mutated_list = _llm_mutate_beats(
+        config=config,
+        source_beats=source_beats,
+        effective_axes=effective_axes,
+        baseline_doc=baseline_doc,
+        brief=brief,
+    )
+
     # 1. 骨架硬冻结 (Skeleton Freeze)
     # 节拍总数 N 恒定、相机焦段恒定、工序拓扑先后恒定、时间戳恒定
     variant_beats = []
     for idx, beat in enumerate(source_beats):
         v_beat = copy.deepcopy(beat)
+        llm_beat = (llm_mutated_list[idx] if llm_mutated_list and idx < len(llm_mutated_list) and isinstance(llm_mutated_list[idx], dict) else None)
         
         # 1.1 继承硬约束
         v_beat['id'] = beat.get('id') or f'B{idx+1:02d}'
@@ -358,7 +479,7 @@ def generate_orthogonal_variant(
         v_beat['end'] = beat.get('end', beat.get('end_sec', 0.0))
         v_beat['duration_sec'] = beat.get('duration_sec', round(float(v_beat['end'] - v_beat['start']), 3))
         v_beat['stage'] = beat.get('stage', beat.get('operation_type', 'demolition'))
-        v_beat['operation'] = beat.get('operation', v_beat['stage'])
+        v_beat['operation'] = (llm_beat.get('operation') if llm_beat and llm_beat.get('operation') else beat.get('operation', v_beat['stage']))
         v_beat['space'] = beat.get('space', 'interior')
         v_beat['camera_framing'] = beat.get('camera_framing', '14mm ultra-wide, eye-level 1.6m, horizon 50%')
         v_beat['grid_anchors'] = beat.get('grid_anchors', 'Grid B2 (Center), Grid B1-B3 across horizontal')
@@ -369,33 +490,39 @@ def generate_orthogonal_variant(
         v_beat['reference_frames'] = list(ev_frames)
         v_beat.pop('evidence_frames', None)
 
-        # 1.3 正交槽位注入替换
-        v_beat['visual_subject'] = apply_slot_replacement(
-            beat.get('visual_subject', beat.get('visible_subject', '')),
-            effective_axes
-        )
-        v_beat['visible_details'] = [
-            apply_slot_replacement(d, effective_axes)
-            for d in (beat.get('visible_details') or [])
-        ]
-        if not v_beat['visible_details']:
-            v_beat['visible_details'] = [effective_axes.get('material', '高强度结构材料')]
+        # 1.3 正交槽位注入替换 (若有 LLM 重写产物则优先使用，否则走规则替换)
+        if llm_beat:
+            v_beat['visual_subject'] = llm_beat.get('visual_subject') or apply_slot_replacement(beat.get('visual_subject', ''), effective_axes)
+            v_beat['visible_action'] = llm_beat.get('visible_action') or apply_slot_replacement(beat.get('visible_action', ''), effective_axes)
+            v_beat['visible_result'] = llm_beat.get('visible_result') or apply_slot_replacement(beat.get('visible_result', ''), effective_axes)
+            v_beat['state_before'] = llm_beat.get('state_before') or apply_slot_replacement(beat.get('state_before', ''), effective_axes)
+            v_beat['state_after'] = llm_beat.get('state_after') or apply_slot_replacement(beat.get('state_after', ''), effective_axes)
+            v_beat['visible_details'] = llm_beat.get('visible_details') or [apply_slot_replacement(d, effective_axes) for d in (beat.get('visible_details') or [])]
+            v_beat['persistent_traces'] = llm_beat.get('persistent_traces') or apply_trace_mapping(beat.get('persistent_traces', []), effective_axes)
+        else:
+            v_beat['visual_subject'] = apply_slot_replacement(
+                beat.get('visual_subject', beat.get('visible_subject', '')),
+                effective_axes
+            )
+            v_beat['visible_details'] = [
+                apply_slot_replacement(d, effective_axes)
+                for d in (beat.get('visible_details') or [])
+            ]
+            if not v_beat['visible_details']:
+                v_beat['visible_details'] = [effective_axes.get('material', '高强度结构材料')]
 
-        v_beat['visible_action'] = apply_slot_replacement(beat.get('visible_action', ''), effective_axes)
-        v_beat['visible_result'] = apply_slot_replacement(beat.get('visible_result', ''), effective_axes)
-        v_beat['state_before'] = apply_slot_replacement(beat.get('state_before', ''), effective_axes)
-        v_beat['state_after'] = apply_slot_replacement(beat.get('state_after', ''), effective_axes)
-        
-        # 1.4 遗留痕迹映射
-        v_beat['persistent_traces'] = apply_trace_mapping(
-            beat.get('persistent_traces', []),
-            effective_axes
-        )
+            v_beat['visible_action'] = apply_slot_replacement(beat.get('visible_action', ''), effective_axes)
+            v_beat['visible_result'] = apply_slot_replacement(beat.get('visible_result', ''), effective_axes)
+            v_beat['state_before'] = apply_slot_replacement(beat.get('state_before', ''), effective_axes)
+            v_beat['state_after'] = apply_slot_replacement(beat.get('state_after', ''), effective_axes)
+            
+            # 1.4 遗留痕迹映射
+            v_beat['persistent_traces'] = apply_trace_mapping(
+                beat.get('persistent_traces', []),
+                effective_axes
+            )
 
-        # 1.5 动态刷新 ASMR 音效特征。落到 `sfx` 这个契约键上：`audio_asmr_cues` 是这里
-        # 一直在写、而全链路一处也没在读的键，写完就断在这儿。`sfx` 才有出口
-        # （reverse.beats_to_dimensions → build_outline_plan_block 的 SFX 规则）。
-        # 旧键同步保留，存量变体文档读它的地方不至于突然空掉。
+        # 1.5 动态刷新 ASMR 音效特征
         v_beat['sfx'] = map_asmr_audio(
             v_beat['stage'],
             effective_axes.get('material', ''),
@@ -420,11 +547,8 @@ def generate_orthogonal_variant(
 
     pipeline_id = baseline_doc.get('job_id') or baseline_doc.get('pipeline_id') or 'baseline'
 
-    # 变体继承哪几栏：**人**和**影调**继承，其余不继承。
-    # 四条变异轴是 carrier / environment / material / pacing / reward，没有一条动到出镜的人；
-    # 影调同理——那是创作者的拍法，换个项目还是同一双眼睛。而材质、痕迹、常驻器具、环境
-    # 底噪都是**这个场地**的属性：换了载体换了环境，母本的青苔污渍和林间风都不再成立。
-    _baseline_constants = baseline_doc.get('scene_constants') or {}
+    _baseline_constants = baseline_doc.get('scene_constants')
+    _baseline_constants = _baseline_constants if isinstance(_baseline_constants, dict) else {}
     baseline_carry = {}
     for _key in ('cast', 'grade'):
         _items = [str(x).strip() for x in (_baseline_constants.get(_key) or []) if str(x).strip()]

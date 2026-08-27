@@ -1,6 +1,6 @@
 # Used Topic Ledger — 已用选题账本
 
-> Dedup memory for the Topic Ideation Engine. Every delivered/built topic is fingerprinted as `carrier-family / destiny / twist-family`. The Idea Engine rejects any candidate matching, or one edit-step away from, a row here (see [`idea-engine.md`](idea-engine.md) §2.3 and §4). Append a row whenever a topic is selected for full prompt generation.
+> Dedup memory for the Topic Ideation Engine. Every delivered/built topic is fingerprinted as `carrier-slug / destiny / twist-family`. The Idea Engine rejects any candidate matching, or one edit-step away from, a row here (see [`idea-engine.md`](idea-engine.md) §2.3 and §4). Append a row whenever a topic is selected for full prompt generation.
 >
 > **Provenance.** Rows dated on or before 2026-08-01 were inherited from the `restoration-prompt-composer` skill's ledger. A topic is burned by having been *built*, regardless of which composer built it — reusing one here would produce the same video with different shot grammar, which is not a new topic. New rows added by this skill should carry `Omni` in the Source column.
 

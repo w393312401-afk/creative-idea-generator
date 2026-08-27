@@ -318,6 +318,73 @@ class TestVideoChainSequenceGeneration(unittest.TestCase):
         # 仅生成了 Slot 1，Slot 2/3 被取消跳过
         self.assertEqual(mock_svc.generate_videos_batch_google_fx.call_count, 1)
 
+    @patch('video_generator._get_project_dir')
+    @patch('video_generator._get_google_fx_video_service')
+    @patch('video_generator._extract_video_frame')
+    @patch('video_generator.merge_project_videos')
+    @patch('video_generator.generate_video_collage')
+    def test_resume_and_reuse_existing_videos_in_chain(self, mock_collage, mock_merge, mock_extract, mock_fx_svc, mock_proj_dir):
+        """测试已存在的有效视频在整链重跑时被复用，仅渲染缺失槽位。"""
+        mock_proj_dir.return_value = self.tmp
+        mock_merge.return_value = {'file': 'videos/merged.mp4', 'url': '/videos/merged.mp4', 'speed': 2}
+        mock_collage.return_value = None
+
+        # 预先创建 vid_001.mp4, vid_002.mp4 及 manifest.json
+        videos_dir = os.path.join(self.tmp, 'videos')
+        frames_dir = os.path.join(self.tmp, 'frames')
+        os.makedirs(videos_dir, exist_ok=True)
+        os.makedirs(frames_dir, exist_ok=True)
+        with open(os.path.join(videos_dir, 'vid_001.mp4'), 'wb') as f:
+            f.write(b'vid1_bytes')
+        with open(os.path.join(videos_dir, 'vid_002.mp4'), 'wb') as f:
+            f.write(b'vid2_bytes')
+
+        manifest_path = os.path.join(self.tmp, 'manifest.json')
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'generation_channel': 'video_chain',
+                'videos': [
+                    {'slot': 1, 'sequence': 1, 'status': 'success', 'file': 'videos/vid_001.mp4'},
+                    {'slot': 2, 'sequence': 2, 'status': 'success', 'file': 'videos/vid_002.mp4'},
+                ]
+            }, f)
+
+        recorded_requests = []
+        def fake_generate_batch(reqs, on_progress=None, cancel_check=None):
+            for req in reqs:
+                recorded_requests.append(req)
+                fake_mp4 = os.path.join(req.output_path, 'fake_download.mp4')
+                with open(fake_mp4, 'wb') as f:
+                    f.write(b'vid3_bytes')
+            return []
+
+        mock_svc = MagicMock()
+        mock_svc.generate_videos_batch_google_fx.side_effect = fake_generate_batch
+        from integrations.google_fx import models
+        mock_fx_svc.return_value = (mock_svc, models)
+
+        def fake_extract(video_path, out_frame, pos, **kwargs):
+            os.makedirs(os.path.dirname(out_frame), exist_ok=True)
+            with open(out_frame, 'wb') as f:
+                f.write(b'frame_bytes')
+            return True
+
+        mock_extract.side_effect = fake_extract
+
+        res = generate_video_chain_sequence(
+            self.config, self.title, self.prompt_block
+        )
+
+        # 验证只对 Slot 3 真正调用了 Google FX 生成
+        self.assertEqual(len(recorded_requests), 1)
+        self.assertTrue(recorded_requests[0].image.endswith('img_003.webp'))
+
+        # 验证 manifest 中 1, 2, 3 全部成功
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            m = json.load(f)
+        self.assertEqual(len(m.get('videos', [])), 3)
+        self.assertTrue(all(v.get('status') == 'success' for v in m['videos']))
+
 
 if __name__ == '__main__':
     unittest.main()

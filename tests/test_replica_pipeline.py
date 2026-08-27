@@ -17,6 +17,12 @@ from unittest.mock import MagicMock, patch
 import server_common
 import replica_pipeline as rp
 
+# 这一批用例验的是**标准合成链路**（Pass1 compose_anchor_and_packet + Pass2
+# compose_remaining_beats）。run_compose 的默认通道已经换成 fast_composer 的
+# 一次性直出，所以要测标准链路就得在配置里明说——以前是靠生产代码探测
+# "我是不是正被 mock" 来倒推，那种写法两条链路的真实覆盖都说不清。
+DEEP_COMPOSE = {'composeMode': 'deep'}
+
 
 class ReplicaTempRootCase(unittest.TestCase):
     def setUp(self):
@@ -391,7 +397,7 @@ class TestComposeGate(ReplicaTempRootCase):
         state = self._job_with_beats([
             {'level': 'error', 'code': 'event_unbound', 'message': '变化事件 E01 没有被任何一拍认领'}])
         with self.assertRaises(RuntimeError) as ctx:
-            rp.run_compose(state, {})
+            rp.run_compose(state, DEEP_COMPOSE)
         self.assertIn('E01', str(ctx.exception))
 
     def test_warnings_alone_do_not_block(self):
@@ -400,7 +406,7 @@ class TestComposeGate(ReplicaTempRootCase):
                    return_value={'title': '石屋工作室'}) as phase1, \
              patch('prompt_pipeline.compose_remaining_beats',
                    return_value='IMAGE 1: a stone hut'):
-            out = rp.run_compose(state, {})
+            out = rp.run_compose(state, DEEP_COMPOSE)
         self.assertTrue(phase1.called)
         self.assertEqual(out['stage'], 'completed')
         self.assertEqual(out['title'], '石屋工作室')
@@ -420,7 +426,7 @@ class TestComposeGate(ReplicaTempRootCase):
              patch('prompt_pipeline.compose_remaining_beats',
                    return_value='VIDEO 1: an EXCAVATOR swings into frame'), \
              patch('server_common.write_library_item') as write_item:
-            out = rp.run_compose(state, {})
+            out = rp.run_compose(state, DEEP_COMPOSE)
         self.assertEqual(out['banned_hits'], ['excavator'])
         self.assertEqual(out['stage'], 'audit_failed')
         # 不入库：项目工作台上不该出现一份带幻觉元素的提示词。
@@ -435,7 +441,7 @@ class TestComposeGate(ReplicaTempRootCase):
              patch('prompt_pipeline.compose_remaining_beats',
                    return_value='VIDEO 1: a lone worker trowels the wall'), \
              patch('server_common.write_library_item') as write_item:
-            out = rp.run_compose(state, {})
+            out = rp.run_compose(state, DEEP_COMPOSE)
         self.assertEqual(out['banned_hits'], [])
         self.assertEqual(out['stage'], 'completed')
         write_item.assert_called_once()
@@ -450,7 +456,7 @@ class TestComposeGate(ReplicaTempRootCase):
              patch('prompt_pipeline.compose_remaining_beats',
                    return_value='VIDEO 1: an EXCAVATOR swings into frame'), \
              patch('server_common.write_library_item'):
-            rp.run_compose(state, {})
+            rp.run_compose(state, DEEP_COMPOSE)
         with self.assertRaises(ValueError) as ctx:
             rp.handoff_to_render(state['job_id'])
         self.assertIn('excavator', str(ctx.exception))
@@ -467,7 +473,7 @@ class TestComposeGate(ReplicaTempRootCase):
         with patch('prompt_pipeline.compose_anchor_and_packet') as mock_anchor, \
              patch('prompt_pipeline.compose_remaining_beats') as mock_beats, \
              patch('server_common.write_library_item') as mock_write:
-            out = rp.run_compose(state, {})
+            out = rp.run_compose(state, DEEP_COMPOSE)
             mock_anchor.assert_not_called()
             mock_beats.assert_not_called()
             mock_write.assert_called_once()
@@ -495,7 +501,7 @@ class TestComposeGate(ReplicaTempRootCase):
              patch('prompt_pipeline.clear_compose_caches',
                    return_value={'checkpoint': 1, 'packets': 2}) as mock_clear, \
              patch('server_common.write_library_item'):
-            rp.run_compose(state, {}, reset_cache=True)
+            rp.run_compose(state, DEEP_COMPOSE, reset_cache=True)
         mock_anchor.assert_called_once()
         mock_clear.assert_called_once()
 
@@ -526,7 +532,7 @@ class TestComposeGate(ReplicaTempRootCase):
                    return_value={'checkpoint': 1, 'packets': 3}) as mock_clear, \
              patch('prompt_pipeline.save_compose_checkpoint') as mock_prefill, \
              patch('server_common.write_library_item'):
-            rp.run_compose(state, {}, reset_cache=True)
+            rp.run_compose(state, DEEP_COMPOSE, reset_cache=True)
         mock_clear.assert_called_once()
         # 指纹必须是从本次 dims 算出来的非空串，不是 None——传错等于清了个不存在的键。
         self.assertTrue(mock_clear.call_args.args[0])
@@ -550,7 +556,7 @@ class TestComposeGate(ReplicaTempRootCase):
              patch('prompt_pipeline.clear_compose_caches') as mock_clear, \
              patch('prompt_pipeline.save_compose_checkpoint') as mock_prefill, \
              patch('server_common.write_library_item'):
-            rp.run_compose(state, {})
+            rp.run_compose(state, DEEP_COMPOSE)
         mock_clear.assert_not_called()
         mock_prefill.assert_called_once()
 
@@ -710,7 +716,7 @@ class TestComposedBlockHasNoDocumentWrapper(ReplicaTempRootCase):
         with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'title': '石屋工作室'}), \
              patch('prompt_pipeline.compose_remaining_beats', return_value=composed), \
              patch('server_common.write_library_item'):
-            return rp.run_compose(state, {})
+            return rp.run_compose(state, DEEP_COMPOSE)
 
     def test_head_and_tail_are_stripped_before_the_block_is_stored(self):
         out = self._compose(self.DOC)
@@ -791,7 +797,7 @@ class TestComposeGateRevalidates(ReplicaTempRootCase):
              patch('prompt_pipeline.compose_remaining_beats',
                    return_value='VIDEO 1: a worker trowels the wall'), \
              patch('server_common.write_library_item'):
-            out = rp.run_compose(state, {})
+            out = rp.run_compose(state, DEEP_COMPOSE)
         self.assertEqual(out['stage'], 'completed')
         self.assertEqual([v for v in out['validation'] if v['level'] == 'error'], [])
 
@@ -811,7 +817,7 @@ class TestComposeGateRevalidates(ReplicaTempRootCase):
         state['beats']['video_duration_sec'] = 12.0
         rp._save_state(state)
         with self.assertRaises(RuntimeError) as ctx:
-            rp.run_compose(state, {})
+            rp.run_compose(state, DEEP_COMPOSE)
         self.assertIn('B02', str(ctx.exception))
 
     def test_an_unbound_event_is_only_a_warning_on_a_variant(self):
@@ -826,7 +832,7 @@ class TestComposeGateRevalidates(ReplicaTempRootCase):
         rp._save_state(state)
         with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'title': 't'}),              patch('prompt_pipeline.compose_remaining_beats',
                    return_value='VIDEO 1: a worker trowels the wall'),              patch('server_common.write_library_item'):
-            out = rp.run_compose(state, {})
+            out = rp.run_compose(state, DEEP_COMPOSE)
         self.assertEqual(out['stage'], 'completed')
         self.assertEqual([v for v in out['validation'] if v['level'] == 'error'], [])
         self.assertTrue(any(v['code'] == 'event_unbound' and v['level'] == 'warn'
@@ -901,7 +907,7 @@ class TestHandoffToRenderer(ReplicaTempRootCase):
         with patch('prompt_pipeline.compose_anchor_and_packet', return_value=compose_state), \
              patch('prompt_pipeline.compose_remaining_beats', return_value='IMAGE 1: a stone hut'), \
              patch('server_common.write_library_item'):
-            rp.run_compose(state, {})
+            rp.run_compose(state, DEEP_COMPOSE)
         return state
 
     def test_handoff_carries_the_already_composed_phase_one(self):
@@ -953,7 +959,7 @@ class TestPublishToProject(ReplicaTempRootCase):
         with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'title': '石屋工作室'}), \
              patch('prompt_pipeline.compose_remaining_beats', return_value=self.BLOCK), \
              patch('server_common.write_library_item'):
-            rp.run_compose(state, {})
+            rp.run_compose(state, DEEP_COMPOSE)
         return state
 
     def test_the_published_item_is_a_real_project(self):
@@ -988,7 +994,7 @@ class TestPublishToProject(ReplicaTempRootCase):
              patch('prompt_pipeline.compose_remaining_beats',
                    return_value='视频提示词\n视频 1:\n一台 EXCAVATOR 转进画面\n'), \
              patch('server_common.write_library_item'):
-            rp.run_compose(state, {})
+            rp.run_compose(state, DEEP_COMPOSE)
         with patch('server_common.write_library_item') as write_item:
             with self.assertRaises(ValueError) as ctx:
                 rp.publish_to_project(state['job_id'])
@@ -1266,7 +1272,7 @@ class TestOptimizationPlanCoverage(ReplicaTempRootCase):
             with patch('prompt_pipeline.compose_anchor_and_packet', return_value={'slots': {'images': ['a']}, 'anchor_prompt': 'p', 'packet': 'pk'}):
                 with patch('prompt_pipeline.compose_remaining_beats', return_value={'blocks': ['b1']}):
                     with self.assertRaises(RuntimeError):
-                        rp.run_compose(state, {})
+                        rp.run_compose(state, DEEP_COMPOSE)
 
         loaded = rp._load_state(state['job_id'])
         self.assertEqual(loaded['stage'], 'compose_failed')
@@ -1472,6 +1478,41 @@ class TestReplicaGovernance(ReplicaTempRootCase):
             self.assertTrue(rp.delete_replica_job(job_id))
             # 关联的 task 文件也应该被级联删除
             self.assertFalse(os.path.exists(tpaths[0]))
+
+
+class TestSceneConstantsShapes(unittest.TestCase):
+    def test_beats_to_dimensions_with_list_constants(self):
+        from prompt_pipeline import reverse
+        doc = {
+            'beats': [{'id': 'B01', 'visual_subject': 'A', 'visible_result': 'B', 'space': 'room'}],
+            'banned_elements': ['crane'],
+            'scene_constants': ['Ocean horizon view', 'Basalt cave ceiling'],
+        }
+        dims = reverse.beats_to_dimensions(doc)
+        self.assertEqual(dims['scene_constants'], ['Ocean horizon view', 'Basalt cave ceiling'])
+        self.assertEqual(dims['banned_elements'], ['crane'])
+
+        # Test scene_constants_lines
+        lines = reverse.scene_constants_lines(dims['scene_constants'])
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(any('Ocean horizon view' in l for l in lines))
+
+    def test_beats_to_dimensions_with_dict_constants(self):
+        from prompt_pipeline import reverse
+        doc = {
+            'beats': [{'id': 'B01', 'visual_subject': 'A', 'visible_result': 'B', 'space': 'room'}],
+            'banned_elements': ['crane'],
+            'scene_constants': {'motion': ['flowing stream'], 'cast': ['tall craftsman']},
+        }
+        dims = reverse.beats_to_dimensions(doc)
+        self.assertEqual(dims['scene_constants']['motion'], ['flowing stream'])
+        self.assertEqual(dims['scene_constants']['cast'], ['tall craftsman'])
+        self.assertEqual(dims['worker_attire'], 'tall craftsman')
+
+        # Test scene_constants_lines
+        lines = reverse.scene_constants_lines(dims['scene_constants'])
+        self.assertTrue(any('flowing stream' in l for l in lines))
+        self.assertTrue(any('tall craftsman' in l for l in lines))
 
 
 if __name__ == '__main__':

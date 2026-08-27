@@ -86,7 +86,7 @@ Volume is cheap; these gates are what make ideas worth generating. Apply in orde
 
 1. **Orthogonal-Pairing Rule (反差配对)** — every destiny is now a shelter, so the contrast lives in the **carrier × shelter improbability**: pick shells nobody expects could become a home (missile silo → off-grid micro-home; blue-ice cave → snug winter refuge den; cement-mixer drum → one-room sleeping cabin). Reject on-the-nose pairs (lighthouse → seaside bedroom is too expected) unless rescued by a strong twist.
 2. **Mandatory Single Twist** — every surviving idea declares exactly **one** Axis-5 twist. Zero twists = generic = rejected. Two+ twists = cluttered = trim to the strongest one.
-3. **Dedup vs. Ledger** — compute a Topic DNA fingerprint `carrier-family / destiny / twist-family` and reject anything matching, or one edit-step away from, a row in [`used-topic-ledger.md`](used-topic-ledger.md). The redwood-trunk → bedroom → root-vein-window combo from the reference video is already burned and must not be re-proposed.
+3. **Dedup vs. Ledger** — compute a Topic DNA fingerprint `carrier-slug / destiny / twist-family` and reject anything matching, or one edit-step away from, a row in [`used-topic-ledger.md`](used-topic-ledger.md). The redwood-trunk → bedroom → root-vein-window combo from the reference video is already burned and must not be re-proposed.
 
    **Compare per axis, and compare the twist by ROOT** — the full dedup rules live in the ledger's own "Dedup Rules" section; read them, they are not optional. The short version, because this is where dedup measurably failed:
 

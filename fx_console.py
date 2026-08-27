@@ -45,6 +45,10 @@ FX_CONFIG_SPEC = {
         'type': 'enum', 'options': ['4', '6', '8', '10'], 'default': '10', 'hot': True,
         'group': '模型', 'label': 'Omni 视频时长（秒）',
     },
+    'videoResolution': {
+        'type': 'enum', 'options': ['720p', '360p'], 'default': '720p', 'hot': True,
+        'group': '模型', 'label': 'Omni 视频分辨率（720p / 360p）',
+    },
     'videoRefMode': {
         'type': 'enum', 'options': ['VIDEO_FRAMES', 'VIDEO_REFERENCES'],
         'default': 'VIDEO_FRAMES', 'hot': True,

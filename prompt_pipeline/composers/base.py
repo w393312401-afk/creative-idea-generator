@@ -86,8 +86,9 @@ class BaseComposer:
         # 「一直在动」那一栏要单独再叮一句：上面那段说的是「一直在」，而运动项的失效方式
         # 不是被写漏，是被写成静物（"a stream runs past the stump" 读起来完全合规，画面里
         # 那条溪却是一张静止的贴图）。每一条 VIDEO 都必须让它继续动。
+        sc_dict = brief.get('scene_constants') if isinstance(brief.get('scene_constants'), dict) else {}
         motion = [str(x).strip()
-                  for x in ((brief.get('scene_constants') or {}).get('motion') or [])
+                  for x in (sc_dict.get('motion') or [])
                   if str(x).strip()]
         motion_rule = (
             "\nThe items listed as never stopping are the film's ambient life: they keep moving "
@@ -101,7 +102,7 @@ class BaseComposer:
         # 换发型、把休闲工装换成反光背心加安全帽。所以这里要求的不是「知道有这个人」，
         # 而是**每一条 IMAGE 与 VIDEO 都逐条复述这份外形**。
         cast = [str(x).strip()
-                for x in ((brief.get('scene_constants') or {}).get('cast') or [])
+                for x in (sc_dict.get('cast') or [])
                 if str(x).strip()]
         cast_rule = (
             "\nThe living cast listed above is FIXED IDENTITY, and it is the single easiest thing "
@@ -121,7 +122,7 @@ class BaseComposer:
         # 下一拍城市车流，整片的声场一拍一个样。每拍自己的 sfx 是「这一下活儿的声音」，
         # 这一栏是「没人干活时这地方的声音」，两者叠在一起才是原片的声音。
         ambient_sound = [str(x).strip()
-                         for x in ((brief.get('scene_constants') or {}).get('ambient_sound') or [])
+                         for x in (sc_dict.get('ambient_sound') or [])
                          if str(x).strip()]
         sound_rule = (
             "\nThe items listed as audible under every shot are this film's ambient bed. EVERY "
@@ -133,7 +134,7 @@ class BaseComposer:
         # 影调是「像不像那条片子」的第一眼因素，而它此前在这条链路上一个字都没有：每一帧
         # 的色温、对比、饱和都由图像模型自己决定，于是十几张图拼起来像十几条片子。
         grade = [str(x).strip()
-                 for x in ((brief.get('scene_constants') or {}).get('grade') or [])
+                 for x in (sc_dict.get('grade') or [])
                  if str(x).strip()]
         grade_rule = (
             "\nThe photographic grade listed above applies to EVERY IMAGE and EVERY VIDEO in this "

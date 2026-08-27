@@ -52,17 +52,30 @@ async function loadAccountPoolStrategyConfig() {
 }
 
 async function saveAccountPoolStrategyConfig() {
+    // ⚠️ /api/google-fx/config 的 POST body 必须是 {patch: {...}}（server.py 读 body['patch']，
+    // 再交给 fx_console.validate_patch）。直接把字段摊在顶层会被判成"patch 必须是非空对象"
+    // 而以 400 拒绝——而这里原先既不带 patch 也不看 response.ok，于是优先级星标和选号
+    // 策略在界面上"看起来保存成功"，实际上一个都没落盘。
     try {
-        await fetch('/api/google-fx/config', {
+        const resp = await fetch('/api/google-fx/config', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                googleFxPriorityUserIds: Array.from(accountPoolPriorityUserIds),
-                googleFxAccountStrategy: accountPoolStrategy
+                patch: {
+                    googleFxPriorityUserIds: Array.from(accountPoolPriorityUserIds),
+                    googleFxAccountStrategy: accountPoolStrategy
+                }
             })
         });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok || !data || data.status !== 'ok') {
+            const msg = (data && data.message) || `HTTP ${resp.status}`;
+            console.error('Failed to save strategy config:', msg);
+            if (typeof showToast === 'function') showToast(`选号策略保存失败：${msg}`, 'error');
+        }
     } catch (e) {
         console.error('Failed to save strategy config:', e);
+        if (typeof showToast === 'function') showToast(`选号策略保存失败：${e.message}`, 'error');
     }
 }
 

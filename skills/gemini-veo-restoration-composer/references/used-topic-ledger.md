@@ -1,6 +1,6 @@
 # Used Topic Ledger — 已用选题账本
 
-> Dedup memory for the Topic Ideation Engine and `tiktok-abandoned-rebirth`. Every delivered/built topic is fingerprinted as `carrier-family / destiny / twist-family`. The Idea Engine rejects any candidate matching, or one edit-step away from, a row here (see [`idea-engine.md`](idea-engine.md) §2.3 and §4). Append a row whenever a topic is selected for full prompt generation.
+> Dedup memory for the Topic Ideation Engine and `tiktok-abandoned-rebirth`. Every delivered/built topic is fingerprinted as `carrier-slug / destiny / twist-family`. The Idea Engine rejects any candidate matching, or one edit-step away from, a row here (see [`idea-engine.md`](idea-engine.md) §2.3 and §4). Append a row whenever a topic is selected for full prompt generation.
 
 ## Dedup Rules (P0 — apply BEFORE scoring, on the DNA, not on the prose)
 

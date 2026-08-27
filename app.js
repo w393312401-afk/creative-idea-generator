@@ -1297,7 +1297,7 @@ function setupEventListeners() {
 // formatTaskDuration 已于 2026-07-31（P4）随「激发任务列表」抽屉一并删除，
 // 任务的展示与操作全部由「📁 项目」主标签页承担（js/projects.js）。
 // 这里只保留两样别处还在用的东西：
-const MEDIA_TASK_TYPES = new Set(['frames', 'staged_render', 'videos', 'cover']);
+const MEDIA_TASK_TYPES = new Set(['frames', 'staged_render', 'videos', 'cover', 'video_chain']);
 const REPLICA_TASK_TYPES = new Set(['replica', 'replica_extract', 'replica_advance', 'replica_mutate']);
 const isReplicaTask = (t) => {
     if (!t) return false;
@@ -2622,6 +2622,7 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
     if (!ownerIdea) return;
     const ownerId = ownerIdea.id;
     const btn = document.getElementById('generate-videos-btn');
+    const chainBtn = document.getElementById('generate-video-chain-btn');
     const progress = document.getElementById('videos-progress');
     const meta = document.getElementById('videos-meta');
     const grid = slotRenderTarget('video');
@@ -2644,6 +2645,7 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
 
     if (isViewing()) {
         btn.disabled = true;
+        if (chainBtn) chainBtn.disabled = true;
         progress.style.display = 'flex';
     }
     setMeta('连接视频生成事件流...');
@@ -2681,17 +2683,21 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
                     rec.total = total;
                     setMeta(`开始生成共 ${total} 段视频...`);
                     if (isViewing()) {
-                        clearSlotGrid(grid, 'video');
+                        const isSubset = targetSlots && targetSlots.length;
                         const slotsToRender = slots.length ? slots : Array.from({ length: total }, (_, i) => i + 1);
+                        if (!isSubset && (!grid.children.length || grid.querySelectorAll('.video-failed-card').length === grid.children.length)) {
+                            clearSlotGrid(grid, 'video');
+                        }
                         slotsToRender.forEach(slotIdx => {
-                            const placeholderCard = document.createElement('div');
-                            placeholderCard.id = `video-slot-${slotIdx}`;
-                            // 生成期间新建的占位卡此前漏了这一步，导致整单跑完
-                            // 之前这些格子接不住拖拽（上传/换位）——补上
-                            enableVideoSlotDnd(placeholderCard, slotIdx);
-                            renderSlotCard(placeholderCard, slotPendingState('video', slotIdx, '等待中'));
-                            placeSlotCard(placeholderCard, 'video', slotIdx);
-                            grid.appendChild(placeholderCard);
+                            let card = document.getElementById(`video-slot-${slotIdx}`);
+                            if (!card) {
+                                card = document.createElement('div');
+                                card.id = `video-slot-${slotIdx}`;
+                                enableVideoSlotDnd(card, slotIdx);
+                                placeSlotCard(card, 'video', slotIdx);
+                                grid.appendChild(card);
+                            }
+                            renderSlotCard(card, slotPendingState('video', slotIdx, '等待中'));
                         });
                     }
                 } else if (type === 'video_start') {
@@ -2836,6 +2842,7 @@ async function streamVideosProgress(taskId, ownerIdea, targetSlots) {
                 if (isViewing()) {
                     progress.style.display = 'none';
                     btn.disabled = false;
+                    if (chainBtn) chainBtn.disabled = false;
                     // 与 streamFramesProgress 同款收尾：必须在 endIdeaTask 之后再重渲
                     // 一次——上面成功/失败分支那次重渲发生在登记还在的时候，没轮到的
                     // 槽位会继续画成「等待中」转圈、卡片按钮也停在禁用态。

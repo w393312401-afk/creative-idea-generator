@@ -1214,6 +1214,8 @@ def active_skill_profile(config=None):
 FIXED_VIDEO_DURATION = 8
 OMNI_VIDEO_DURATIONS = (4, 6, 8, 10)
 OMNI_DEFAULT_VIDEO_DURATION = 10  # 主镜够长、且排得下第二个特写插入的时长，见 omni composer
+OMNI_VIDEO_RESOLUTIONS = ('360p', '720p')
+OMNI_DEFAULT_VIDEO_RESOLUTION = '720p'
 
 
 def resolve_video_duration(config=None):
@@ -1233,6 +1235,24 @@ def resolve_video_duration(config=None):
     except (TypeError, ValueError):
         return OMNI_DEFAULT_VIDEO_DURATION
     return value if value in OMNI_VIDEO_DURATIONS else OMNI_DEFAULT_VIDEO_DURATION
+
+
+def resolve_video_resolution(config=None):
+    """本次生成的视频分辨率（str: '360p' | '720p' 或 None）。
+    仅 Omni 系列模型支持切换分辨率；Veo 系列模型返回 None（面板固定）。"""
+    cfg = config if isinstance(config, dict) else SERVER_CONFIG
+    model = str(cfg.get('videoModel') or cfg.get('video_model') or SERVER_CONFIG.get('videoModel') or '').strip().lower()
+    if 'omni' not in model:
+        return None
+    raw = cfg.get('videoResolution') if 'videoResolution' in cfg else cfg.get('video_resolution')
+    if raw in (None, ''):
+        raw = SERVER_CONFIG.get('videoResolution')
+    raw_str = str(raw or '').strip().lower()
+    if '360' in raw_str:
+        return '360p'
+    elif '720' in raw_str:
+        return '720p'
+    return OMNI_DEFAULT_VIDEO_RESOLUTION
 
 
 
@@ -1840,10 +1860,17 @@ def _account_rotation_ring(config, pool, first_user_id):
                 sn_val = int(acc.get('serial_number') or 999999)
             except Exception:
                 sn_val = 999999
-            return (sn_val, -credit_val)
+            return (sn_val, -credit_val, 0.0)
+        elif strategy == 'rotation':
+            # 均衡轮换：累计任务数最少的排在环首，和 pick_account 的 'rotation' 同一口径。
+            try:
+                task_val = float(acc.get('task_count') or 0)
+            except Exception:
+                task_val = 0.0
+            return (task_val, -credit_val, 0.0)
         else:
             # credit_desc
-            return -credit_val
+            return (-credit_val, 0.0, 0.0)
 
     if priority_set:
         pri_accs = sorted([a for a in usable if a['user_id'] in priority_set], key=_ring_sort_key)
@@ -1931,14 +1958,14 @@ def _next_unused_account(config, pool, ring, exclude):
 # 配置中心（index.html）改这些项时会同步 POST /api/google-fx/config 写服务端，
 # 所以"服务端优先"不会把用户刚在配置中心选的值顶回去。
 _SERVER_AUTHORITATIVE_KEYS = frozenset({
-    'videoModel', 'googleFxImageModel', 'videoDuration', 'videoRefMode',
+    'videoModel', 'googleFxImageModel', 'videoDuration', 'videoResolution', 'videoRefMode',
 })
 
 # 托管模式（配了 apiKey 即是）下允许从浏览器/请求 config 透传的键。门禁那一段由
 # GATE_SETTINGS 派生，其余是模型/画幅/激发参考等非门禁项。
 _PASSTHROUGH_CLIENT_KEYS = (
     'imageAspectRatio', 'imageQuality', 'imageBackend', 'googleFxImageModel',
-    'videoModel', 'videoDuration', 'videoRefMode', 'adsPowerPort',
+    'videoModel', 'videoDuration', 'videoResolution', 'videoRefMode', 'adsPowerPort',
     'adsPowerSilentMode', 'adsPowerWindowPosition', 'adsPowerHeadless',
     'videoAccountPoolMinCredit', 'frameContinuityLocalEdit',
     'ideationTrendUrls', 'ideationSearchQuery', 'coverReferencePath', 'skillProfile',
@@ -1952,6 +1979,18 @@ _PASSTHROUGH_CLIENT_KEYS = (
 ) + _GATE_KEYS
 
 
+# 号池调度这一族字段的权威来源只有服务端配置（Google FX 服务管理中心 / 号池管理界面
+# 写入 server_config.json），浏览器 localStorage 里的旧值不得覆盖。
+# ⚠️ 新增号池配置项必须同时登记到这里：effective_config 只搬这张表里的键，
+# googleFxAccountStrategy / googleFxPriorityUserIds 就曾经因为漏登记，
+# 存进了 server_config.json 却永远到不了 _select_pool_account —— 选号策略与优先级
+# 实例在界面上可选可存，实际选号却一直跑默认的 credit_desc + 空优先级。
+_FX_POOL_SERVER_KEYS = (
+    'googleFxIpRotateRequests', 'googleFxSequenceUserId', 'googleFxSequenceUserLock',
+    'googleFxAccountStrategy', 'googleFxPriorityUserIds',
+)
+
+
 def effective_config(client_config):
     client_config = dict(client_config or {})
     # 默认环境与换号节拍只有一个权威来源：Google FX 服务管理中心写入的服务端配置。
@@ -1961,8 +2000,7 @@ def effective_config(client_config):
     from integrations.google_fx.model_catalog import normalize_google_fx_image_model
     if not SERVER_MANAGED:
         merged = dict(client_config)
-        for key in ('googleFxIpRotateRequests', 'googleFxSequenceUserId',
-                    'googleFxSequenceUserLock'):
+        for key in _FX_POOL_SERVER_KEYS:
             if key in SERVER_CONFIG:
                 merged[key] = SERVER_CONFIG[key]
         # FX 模型设置：服务端配置优先，防止浏览器旧缓存覆盖控制台的改动
@@ -2027,8 +2065,7 @@ def effective_config(client_config):
             merged[k] = client_config[k]
         elif k in SERVER_CONFIG:
             merged[k] = SERVER_CONFIG[k]
-    for k in ('googleFxIpRotateRequests', 'googleFxSequenceUserId',
-              'googleFxSequenceUserLock'):
+    for k in _FX_POOL_SERVER_KEYS:
         if k in SERVER_CONFIG:
             merged[k] = SERVER_CONFIG[k]
     if 'googleFxImageModel' in merged:
@@ -5171,7 +5208,7 @@ def cleanup_old_tasks():
 # 帧序列/分步渲染/视频/封面：它们不是独立项目，而是某个激发项目下的子作业。
 # 与 app.js 的 MEDIA_TASK_TYPES 同口径（那边用它把媒体任务整类挡在任务列表外，
 # 结果是失败的媒体任务完全不可见；这里改成挂成子作业，失败照样看得到）。
-MEDIA_TASK_TYPES = frozenset({'frames', 'staged_render', 'videos', 'cover'})
+MEDIA_TASK_TYPES = frozenset({'frames', 'staged_render', 'videos', 'cover', 'video_chain'})
 
 # 复刻线的任务类型：抽帧 / Pass A / Pass B / 节拍推进 / 提示词合成 / 正交发散等
 REPLICA_TASK_TYPES = frozenset({'replica', 'replica_extract', 'replica_advance', 'replica_mutate'})

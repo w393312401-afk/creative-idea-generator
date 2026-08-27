@@ -880,7 +880,7 @@
   // 避免主界面仍然发送旧模型覆盖服务端的最新选择。两个页面（index.html /
   // console.html）共享 localStorage，主页面刷新或跨标签页 storage 事件都会
   // 自动加载新值。
-  const _FX_MODEL_SYNC_KEYS = ['videoModel', 'googleFxImageModel', 'videoDuration', 'videoRefMode'];
+  const _FX_MODEL_SYNC_KEYS = ['videoModel', 'googleFxImageModel', 'videoDuration', 'videoResolution', 'videoRefMode'];
 
   function syncFxModelToMainConfig(serverConfig) {
     if (!serverConfig) return;

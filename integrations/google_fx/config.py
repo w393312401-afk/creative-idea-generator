@@ -190,6 +190,12 @@ def get_runtime_google_fx_video_ref_mode() -> str:
     return runtime_env_or_default("GOOGLE_FX_VIDEO_REF_MODE", "VIDEO_FRAMES")
 
 
+def get_runtime_google_fx_video_resolution() -> str:
+    """返回当前 Omni 视频分辨率: '360p' 或 '720p' (默认 720p)。"""
+    val = runtime_env_or_default("GOOGLE_FX_VIDEO_RESOLUTION", "720p").strip().lower()
+    return "360p" if "360" in val else "720p"
+
+
 def get_runtime_google_fx_image_model() -> str:
     return normalize_google_fx_image_model(
         runtime_env_or_default("GOOGLE_FX_IMAGE_MODEL", DEFAULT_GOOGLE_FX_IMAGE_MODEL)

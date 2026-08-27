@@ -1345,9 +1345,22 @@
                                 <option value="4">4s（三镜：远景/中景/结果远景）</option>
                                 <option value="6">6s（四镜：+近景）</option>
                                 <option value="8">8s（五镜：+全景）</option>
-                                <option value="10" selected>10s（六镜：+特写）</option>
+                                <option value="10" selected>10s（六镜：+特写 · 推荐标准成片）</option>
                             </select>
-                            <small class="settings-hint">仅 Omni Flash 模型面板提供该时长切换；Veo 系列时长固定，切到 Veo 模型时本项自动隐藏且不生效。Omni 提示词按这个时长排镜头切点时间线，短片长会按镜头梯自动裁镜头（远景/中景/结果远景三镜任何长度下都保留）</small>
+                            <small class="settings-hint">仅 Omni Flash 模型面板提供该时长切换；Veo 系列时长固定（8s），切到 Veo 模型时本项自动隐藏且不生效。Omni 提示词按这个时长排镜头切点时间线，短片长会按镜头梯自动裁镜头（远景/中景/结果远景三镜任何长度下都保留）。</small>
+                        </div>
+                        <div class="form-group settings-field" id="fx-video-resolution-group" style="display: none;">
+                            <label for="settings-fx-video-resolution">Omni Flash 视频分辨率</label>
+                            <select id="settings-fx-video-resolution">
+                                <option value="720p" selected>720p（高清 · 1.5 积分/秒 · 推荐画质）</option>
+                                <option value="360p">360p（标清 · 0.75 积分/秒 · 极速节省）</option>
+                            </select>
+                            <div id="omni-credit-estimate-box" class="settings-hint" style="color: #60a5fa; font-weight: 500; margin-top: 6px; display: flex; align-items: center; gap: 6px;">
+                                <span>💰 单段预估消耗：</span>
+                                <strong id="omni-credit-cost-val" style="color: #38bdf8; font-size: 1.05em;">15</strong>
+                                <span>积分（按当前 <span id="omni-credit-cost-desc" style="color: #93c5fd;">10s · 720p</span> 档位）</span>
+                            </div>
+                            <small class="settings-hint">仅 Omni Flash 模型支持切换分辨率；360p 扣费减半且生成速度快，适合批量预览；720p 适合高清成片交付。切到 Veo 模型时本项自动隐藏且不生效。</small>
                         </div>
                         <div class="form-group settings-field" id="fx-video-ref-mode-group">
                             <label for="settings-fx-video-ref-mode">视频参考模式</label>

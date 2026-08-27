@@ -10,6 +10,7 @@ let replicaState = null;      // 当前打开的 job_state
 let replicaTaskId = null;
 let replicaSSE = null;
 let replicaBusy = false;
+let replicaPromptEditing = false;   // 提示词包是否处于手动编辑态
 
 // stage → 中文标签的**兜底**副本。真源在 replica_pipeline.py 的 STAGE_LABELS，
 // 后端随 job 行下发 stage_label；这里只在拿不到时顶上（例如渲染一条本地拼出来的
@@ -466,6 +467,9 @@ async function replicaLoadJob(jobId) {
     // 折叠状态按 beat.id 存，而 B01…B11 在每一条任务里都叫这个名字。不清空的话，
     // 在 A 任务折起来的 B03，切到 B 任务照样是折的——用户没折过它，它却是折的。
     if (switched) { replicaBeatFoldState = {}; replicaFieldFoldState = {}; }
+    // 提示词编辑态同理：不清的话，在 A 任务点开的编辑器会带着 B 任务的正文继续开着，
+    // 用户以为自己还在改 A。
+    if (switched) replicaPromptEditing = false;
     return replicaState;
 }
 
@@ -626,7 +630,12 @@ function replicaRenderNavBar(state) {
             errors: errCount,
         });
         // 与 replicaRenderSceneConstants 的空判据同源
-        if (state.beats.scene_signature || (state.beats.scene_constants && Object.values(state.beats.scene_constants).some(a => a && a.length))) {
+        const hasConstants = state.beats.scene_constants && (
+            Array.isArray(state.beats.scene_constants)
+                ? state.beats.scene_constants.length > 0
+                : Object.values(state.beats.scene_constants).some(a => a && a.length)
+        );
+        if (state.beats.scene_signature || hasConstants) {
             items.push({ id: 'replica-sec-scene', label: '场景恒常' });
         }
     }
@@ -2017,9 +2026,17 @@ const REPLICA_SCENE_CONSTANT_FIELDS = [
 ];
 
 function replicaRenderSceneConstants(doc) {
-    const sc = doc.scene_constants || {};
+    const isArray = Array.isArray(doc.scene_constants);
+    const sc = (!isArray && doc.scene_constants) ? doc.scene_constants : {};
     const signature = doc.scene_signature || '';
-    if (!signature && !REPLICA_SCENE_CONSTANT_FIELDS.some(([k]) => (sc[k] || []).length)) return '';
+    const arrayItems = isArray ? (doc.scene_constants || []) : [];
+    if (!signature && !arrayItems.length && !REPLICA_SCENE_CONSTANT_FIELDS.some(([k]) => (sc[k] || []).length)) return '';
+    const arrayRow = arrayItems.length ? `
+        <label class="replica-field">
+            <span class="replica-field-label">常驻地标与环境特征（固定不动物体/背景地标，用、分隔）</span>
+            <textarea class="replica-textarea" rows="2" data-scene-array="true"
+                      placeholder="用、分隔">${escapeHtmlReplica(arrayItems.join('、'))}</textarea>
+        </label>` : '';
     const rows = REPLICA_SCENE_CONSTANT_FIELDS.map(([key, label]) => `
         <label class="replica-field">
             <span class="replica-field-label">${label}</span>
@@ -2039,6 +2056,7 @@ function replicaRenderSceneConstants(doc) {
                       placeholder="例：一座长着青苔的混凝土掩体，位于秋日林地，靠一盏三脚架工作灯照明"
                 >${escapeHtmlReplica(signature)}</textarea>
         </label>
+        ${arrayRow}
         <div class="replica-beat-fields">${rows}</div>
     </div>`;
 }
@@ -2415,38 +2433,101 @@ function replicaRenderBeatCard(state, beat, idx, previousSpace) {
     </div>`;
 }
 
+// 命中词高亮。**一次扫描原文**，命中段包 <mark>、其余段照常转义。
+// 不能"先整体转义、再拿每个命中词在结果串上反复 replace"：第二个词会匹配进第一个
+// <mark> 标签的属性里（禁用词恰好叫 mark / data / class / hit 就会发生），把 HTML
+// 结构撑坏。词边界口径与服务端 reverse.banned_element_hits 对齐——只有紧挨边界的是
+// 词字符时才加 \b，这样中文词也能正常命中。
+function replicaHighlightPromptBlock(text, hits) {
+    if (!text) return '';
+    const raw = String(text);
+    const names = [];
+    const parts = [];
+    (hits || []).forEach(hit => {
+        const name = String(hit || '').trim();
+        if (!name) return;
+        const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const prefix = /^[a-zA-Z0-9_]/.test(name) ? '\\b' : '';
+        const suffix = /[a-zA-Z0-9_]$/.test(name) ? '\\b' : '';
+        names.push(name);
+        parts.push(`(${prefix}${esc}${suffix})`);
+    });
+    if (!parts.length) return escapeHtmlReplica(raw);
+
+    let regex;
+    try {
+        regex = new RegExp(parts.join('|'), 'gi');
+    } catch (e) {
+        return escapeHtmlReplica(raw);
+    }
+
+    let out = '';
+    let last = 0;
+    let counter = 0;
+    let m;
+    while ((m = regex.exec(raw)) !== null) {
+        if (m[0] === '') { regex.lastIndex++; continue; }
+        out += escapeHtmlReplica(raw.slice(last, m.index));
+        const gi = m.slice(1).findIndex(g => g !== undefined);
+        const name = gi >= 0 ? names[gi] : m[0];
+        out += `<mark class="replica-banned-mark" id="replica-hit-mark-${counter++}"`
+             + ` data-hit="${escapeHtmlReplica(name)}">${escapeHtmlReplica(m[0])}</mark>`;
+        last = m.index + m[0].length;
+    }
+    out += escapeHtmlReplica(raw.slice(last));
+    return out;
+}
+
 function replicaRenderOutput(state) {
     if (!state.prompt_block) return '';
-    // 提示词只活在这一页里的话，用户合成完就没有下一步了。下一步只有一个去向：
-    // 存成项目、直接进激发结果页。渲染（分步合成 / 一键合成）在那一页里全都有，
-    // 复刻页不必自己再开一条只通向分步管线的窄路。
     const hits = state.banned_hits || [];
     const blocked = state.stage === 'audit_failed';
+    const highlightedHtml = replicaHighlightPromptBlock(state.prompt_block, hits);
+
     return `
     <div class="replica-section" id="replica-sec-output">
         <div class="replica-card-title">提示词包${state.title ? ` · ${escapeHtmlReplica(state.title)}` : ''}</div>
         ${blocked ? `<div class="replica-banner replica-banner-error">
-            <b>已拦下交付：命中 ${hits.length} 个禁用元素</b>（原片里并不存在）：
-            ${escapeHtmlReplica(hits.join('、'))}。<br>
-            这份提示词<b>没有写入创意库</b>，也不能送去渲染——照它渲出来的画面里会长出原片
-            没有的东西。两个改法：把这些表述从节拍阶梯里去掉后重新合成；
-            或者你确认它们其实出现在原片里，那就把它们从「禁用元素」里删掉再重跑。
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                <div>
+                    <b>已拦截交付：命中 ${hits.length} 个禁用元素</b>（原片里并不存在）：
+                    ${hits.map(h => `<span class="replica-hit-badge">${escapeHtmlReplica(h)}</span>`).join(' ')}。
+                </div>
+                <div style="display:flex; gap:8px;">
+                    <button type="button" id="replica-purge-banned-btn" class="action-btn primary-btn" style="padding:4px 12px; font-size:12px; background:#ff4d4f; border-color:#ff7875;" title="自动从提示词中剥离所有命中词并重新校验">🪄 一键自动剔除并交付</button>
+                </div>
+            </div>
+            <div style="margin-top:8px; font-size:12.5px; line-height:1.6;">
+                这份提示词<b>没有写入创意库</b>，也不能送去渲染。你可以：<br>
+                1. 📍 <b>点击下方按钮快速定位到问题点，就地编辑删除该词并保存</b>；<br>
+                2. 🪄 <b>点击右上角「一键自动剔除并交付」一秒完成修复</b>；<br>
+                3. 或者点击「重新合成」让模型重新写一份。
+            </div>
+            ${hits.length > 0 ? `
+            <div style="margin-top:10px; display:flex; align-items:center; flex-wrap:wrap; gap:6px;">
+                <span style="font-size:12px; font-weight:700;">📍 问题跳转：</span>
+                ${hits.map(h => `<button type="button" class="replica-jump-hit-btn" data-hit-name="${escapeHtmlReplica(h)}" title="点击直接滚动定位并高亮闪烁该词">定位到「${escapeHtmlReplica(h)}」📍</button>`).join('')}
+            </div>` : ''}
         </div>` : `<div class="replica-banner replica-banner-ok">
             已通过禁用元素门禁，并写入创意库${state.library_id
                 ? `（项目工作台可见：${escapeHtmlReplica(state.title || state.library_id)}）` : ''}。
             下一步按「存入项目并打开激发结果」：渲染（分步合成 / 一键合成）、手动改提示词、
             补主题与话题，都在那一页上。
         </div>`}
-        <div class="replica-actions">
+        <div class="replica-actions" style="display:flex; align-items:center; flex-wrap:wrap; gap:8px;">
             <button type="button" id="replica-copy-btn" class="action-btn text-btn">复制全部</button>
-            <button type="button" id="replica-recompose-btn" class="action-btn ${blocked ? 'primary-btn' : 'text-btn'}"
+            <button type="button" id="replica-toggle-edit-btn" class="action-btn ${replicaPromptEditing ? 'primary-btn' : 'text-btn'}">${replicaPromptEditing ? '👁️ 返回预览' : '✏️ 手动修改提示词'}</button>
+            ${replicaPromptEditing ? `<button type="button" id="replica-save-prompt-btn" class="action-btn primary-btn" style="background:#52c41a; border-color:#73d13d;">💾 保存修改并重新校验</button>` : ''}
+            <button type="button" id="replica-recompose-btn" class="action-btn text-btn"
                     title="不重跑聚类，直接重新合成提示词">重新合成</button>
             ${blocked
                 ? ''
                 : `<button type="button" id="replica-project-btn" class="action-btn primary-btn"
                            title="把这份已过门禁的提示词存成一个项目，并立刻打开它的激发结果页">存入项目并打开激发结果</button>`}
         </div>
-        <pre class="replica-prompt-block" id="replica-prompt-block">${escapeHtmlReplica(state.prompt_block)}</pre>
+        ${replicaPromptEditing
+            ? `<textarea class="replica-prompt-editor" id="replica-prompt-editor" rows="18">${escapeHtmlReplica(state.prompt_block)}</textarea>`
+            : `<pre class="replica-prompt-block" id="replica-prompt-block">${highlightedHtml}</pre>`}
     </div>`;
 }
 
@@ -2469,17 +2550,100 @@ function replicaBindEvents() {
         replicaRender();
     });
     // 模型选择改一下就落盘，不必等到点「开始反推」
-    // 模型选择改一下就落盘，不必等到点「开始反推」：用户很可能选完就去点了别的动作
-    // （比如 recluster），那条路径读的是 config，没落盘就等于没选。
     on('#replica-frame-model', replicaCaptureReverseModels, 'change');
     on('#replica-peak-model', replicaCaptureReverseModels, 'change');
     on('#replica-recompose-btn', replicaCompose);
     on('#replica-project-btn', (e) => replicaSaveToProject(e.currentTarget));
     on('#replica-cancel-btn', replicaCancelRun);
     on('#replica-copy-btn', () => {
-        const block = root.querySelector('#replica-prompt-block');
-        if (block) navigator.clipboard.writeText(block.textContent).then(
-            () => replicaToast('已复制'), () => replicaToast('复制失败', true));
+        const block = root.querySelector('#replica-prompt-block') || root.querySelector('#replica-prompt-editor');
+        if (block) {
+            const val = block.value !== undefined ? block.value : block.textContent;
+            navigator.clipboard.writeText(val).then(
+                () => replicaToast('已复制'), () => replicaToast('复制失败', true));
+        }
+    });
+
+    // 提示词编辑切换与保存
+    on('#replica-toggle-edit-btn', () => {
+        replicaPromptEditing = !replicaPromptEditing;
+        replicaRender();
+    });
+
+    on('#replica-save-prompt-btn', async () => {
+        const editor = root.querySelector('#replica-prompt-editor');
+        if (!editor || !replicaState) return;
+        const newText = editor.value.trim();
+        if (!newText) {
+            replicaToast('提示词内容不能为空', true);
+            return;
+        }
+        try {
+            const data = await replicaFetch('/api/replica/save_prompt', {
+                method: 'POST',
+                headers: replicaHeaders(),
+                body: JSON.stringify({ job_id: replicaState.job_id, prompt_block: newText }),
+            });
+            if (data && data.job_state) {
+                replicaState = data.job_state;
+                replicaPromptEditing = false;
+                replicaRender();
+                if (replicaState.stage === 'completed') {
+                    replicaToast('✅ 提示词修改已保存并通过门禁校验！已自动写入创意库。');
+                } else {
+                    replicaToast(`⚠️ 保存成功，但仍命中 ${ (replicaState.banned_hits || []).length } 个禁用元素`, true);
+                }
+            }
+        } catch (err) {
+            replicaToast(`保存失败: ${err.message}`, true);
+        }
+    });
+
+    // 一键剥离禁用词
+    on('#replica-purge-banned-btn', async () => {
+        if (!replicaState) return;
+        try {
+            const data = await replicaFetch('/api/replica/purge_banned', {
+                method: 'POST',
+                headers: replicaHeaders(),
+                body: JSON.stringify({ job_id: replicaState.job_id }),
+            });
+            if (data && data.job_state) {
+                replicaState = data.job_state;
+                replicaPromptEditing = false;
+                replicaRender();
+                if (replicaState.stage === 'completed') {
+                    replicaToast('🪄 已自动剔除所有禁用元素并校验通过！已可交付/送去渲染。');
+                } else {
+                    replicaToast('已尝试自动清理，仍有部分词需手动确认', true);
+                }
+            }
+        } catch (err) {
+            replicaToast(`自动清理失败: ${err.message}`, true);
+        }
+    });
+
+    // 问题位置定位跳转
+    root.querySelectorAll('.replica-jump-hit-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const hitName = btn.dataset.hitName;
+            if (replicaPromptEditing) {
+                replicaPromptEditing = false;
+                replicaRender();
+            }
+            const marks = Array.from(root.querySelectorAll(`.replica-banned-mark[data-hit="${hitName}"]`));
+            if (!marks.length) {
+                replicaToast(`未在文本中找到「${hitName}」`, true);
+                return;
+            }
+            const target = marks[0];
+            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            marks.forEach(m => {
+                m.classList.add('replica-hit-pulse');
+                setTimeout(() => m.classList.remove('replica-hit-pulse'), 3500);
+            });
+            replicaToast(`已定位到「${hitName}」所在位置 📍`);
+        });
     });
 
     // 快捷任务切换与新建
@@ -2992,9 +3156,19 @@ function replicaBindBeatEvents(scope) {
         });
     }
 
+    scope.querySelectorAll('[data-scene-array]').forEach(el => {
+        el.addEventListener('input', () => {
+            if (!replicaState || !replicaState.beats) return;
+            replicaState.beats.scene_constants = replicaSplitList(el.value);
+        });
+    });
+
     scope.querySelectorAll('[data-scene-key]').forEach(el => {
         el.addEventListener('input', () => {
             if (!replicaState || !replicaState.beats) return;
+            if (Array.isArray(replicaState.beats.scene_constants)) {
+                replicaState.beats.scene_constants = {};
+            }
             const sc = replicaState.beats.scene_constants || (replicaState.beats.scene_constants = {});
             sc[el.dataset.sceneKey] = replicaSplitList(el.value);
         });
@@ -3695,7 +3869,7 @@ async function replicaMutateOrthogonal(btn) {
             body: JSON.stringify({
                 baseline_job_id: replicaState.job_id,
                 mutation_axes: mutationAxes,
-                preset: (activeIdea && activeIdea.id) || replicaActivePreset || 'ai_variant',
+                preset: (activeIdea && (activeIdea.name || activeIdea.id)) || replicaActivePreset || 'ai_variant',
                 brief: replicaDivergeBrief || '',
                 config: replicaConfig(),
             }),

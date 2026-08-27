@@ -444,7 +444,8 @@ def _generate_video_google_fx(req: VideoRequest):
                 want_video=True,
                 context_label="切换Video",
                 duration=req.duration,
-                video_submode=_video_ref_mode
+                video_submode=_video_ref_mode,
+                resolution=getattr(req, "resolution", None),
             )
 
             # 🛠️ 3. 挂载参考图到提示词框（Start -> End 顺序）
@@ -1347,9 +1348,10 @@ class _ChunkRunner:
         # 只要模型/比例/时长没变，切换模式后整段配置校验都会被跳过，新模式永远不生效
         # ——正是当初把 duration 补进缓存键要修的同一类问题。
         _video_ref_mode = get_runtime_google_fx_video_ref_mode()
-        wanted = (req.model, req.ratio, req.duration, _video_ref_mode)
+        _req_resolution = getattr(req, "resolution", None)
+        wanted = (req.model, req.ratio, req.duration, _video_ref_mode, _req_resolution)
         if self._confirmed_config == wanted:
-            log("⚙️ 本会话已确认过相同配置（模型/比例/时长/参考模式未变），跳过重复校验",
+            log("⚙️ 本会话已确认过相同配置（模型/比例/时长/参考模式/分辨率未变），跳过重复校验",
                 "GoogleFX-Video")
             return
         _verify_and_fix_fx_config(
@@ -1359,7 +1361,8 @@ class _ChunkRunner:
             want_video=True,
             context_label="切换Video",
             duration=req.duration,
-            video_submode=_video_ref_mode
+            video_submode=_video_ref_mode,
+            resolution=_req_resolution,
         )
         self._confirmed_config = wanted
 

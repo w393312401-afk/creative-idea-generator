@@ -10601,11 +10601,12 @@ Required JSON keys:
     # 「原片里一直都在的东西」——墙上的污渍、青苔、常驻画面的那盏工作灯。它们不产生
     # 状态变化，因此在节拍阶梯里没有落脚点，一路被压掉；不把它们单独送进来，复刻出的
     # 就是同一道工序的通用想象，而不是这条片子的质感（见 reverse.analyze_scene_constants）。
-    _scene_constants = (dimensions.get('scene_constants')
-                        if isinstance(dimensions.get('scene_constants'), dict) else None)
-    if _scene_constants:
+    _scene_constants = dimensions.get('scene_constants')
+    if isinstance(_scene_constants, dict):
         parsed_brief['scene_constants'] = {k: [str(x).strip() for x in (v or []) if str(x).strip()]
                                            for k, v in _scene_constants.items()}
+    elif isinstance(_scene_constants, list):
+        parsed_brief['scene_constants'] = [str(x).strip() for x in _scene_constants if str(x).strip()]
     if str(dimensions.get('scene_signature') or '').strip():
         parsed_brief['scene_signature'] = str(dimensions['scene_signature']).strip()
     # 卡片原始清单也挂到 config 上：合成收尾算交付总账时要拿它回答"这张卡本来有几条"。

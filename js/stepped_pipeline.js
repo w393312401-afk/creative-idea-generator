@@ -326,11 +326,23 @@ function renderSteppedLoading(container, text) {
     `;
 }
 
+// 缩略图加载失败时的占位图。原先这里是一段把 `${seq}` 直接拼进 base64 中段的字符串
+// （…Ij5JTUcg${seq}</dGV4dD48L3N2Zz4=），既不是合法 base64 也含裸 `<`，浏览器一律解不出来，
+// 于是"加载失败"最终显示的还是碎图标。改成一段固定的、真的能解码的 SVG。
+const STEPPED_FRAME_PLACEHOLDER = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiPjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiMyMjIiLz48dGV4dCB4PSI1MCUiIHk9IjUwJSIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMTQiIGZpbGw9IiM4ODgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIuM2VtIj5JTUc8L3RleHQ+PC9zdmc+';
+
+// 把一个值序列化成能安全塞进 HTML 内联事件属性的 JS 字面量。
+// escapeHtml(title) 不够：属性值会被 HTML 解析器先解码回 `'`，标题里带撇号就把 onclick
+// 的 JS 字符串截断了。JSON.stringify 负责 JS 层引号，escapeHtml 负责 HTML 属性层。
+function steppedAttrArg(value) {
+    const json = JSON.stringify(value === undefined ? null : value);
+    return typeof escapeHtml === 'function' ? escapeHtml(json) : json;
+}
+
 function renderSteppedBatchFrameThumbsHtml(state, batchInfo) {
     const sequences = batchInfo && Array.isArray(batchInfo.sequences) ? batchInfo.sequences : [];
     if (!sequences.length) return '';
     const title = state.title || '';
-    const safeTitle = typeof escapeHtml === 'function' ? escapeHtml(title) : title;
     
     return `
         <div class="stepped-batch-frame-section">
@@ -339,9 +351,9 @@ function renderSteppedBatchFrameThumbsHtml(state, batchInfo) {
                 ${sequences.map((seq, idx) => {
                     const frameUrl = steppedImageUrl(`/outputs/${title}/frames/img_${String(seq).padStart(3, '0')}.webp`);
                     return `
-                        <div class="stepped-frame-thumb-card" onclick="openSteppedSequencesLightbox('${safeTitle}', ${JSON.stringify(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 帧">
+                        <div class="stepped-frame-thumb-card" onclick="openSteppedSequencesLightbox(${steppedAttrArg(title)}, ${steppedAttrArg(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 帧">
                             <div class="stepped-frame-thumb-box">
-                                <img src="${frameUrl}" alt="Frame ${seq}" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiPjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiMyMjIiLz48dGV4dCB4PSI1MCUiIHk9IjUwJSIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMTQiIGZpbGw9IiM4ODgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIuM2VtIj5JTUcg${seq}</dGV4dD48L3N2Zz4='" />
+                                <img src="${frameUrl}" alt="Frame ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
                                 <span class="stepped-frame-zoom-tag">🔍</span>
                             </div>
                             <span class="stepped-frame-seq-name">IMG ${String(seq).padStart(3, '0')}</span>
@@ -363,7 +375,6 @@ function renderSteppedFinalAllFramesThumbsHtml(state) {
     sequences = Array.from(new Set(sequences)).sort((a, b) => a - b);
     if (!sequences.length) return '';
     const title = state.title || '';
-    const safeTitle = typeof escapeHtml === 'function' ? escapeHtml(title) : title;
     
     return `
         <div class="stepped-batch-frame-section">
@@ -372,9 +383,9 @@ function renderSteppedFinalAllFramesThumbsHtml(state) {
                 ${sequences.map((seq, idx) => {
                     const frameUrl = steppedImageUrl(`/outputs/${title}/frames/img_${String(seq).padStart(3, '0')}.webp`);
                     return `
-                        <div class="stepped-frame-thumb-card" onclick="openSteppedSequencesLightbox('${safeTitle}', ${JSON.stringify(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 帧">
+                        <div class="stepped-frame-thumb-card" onclick="openSteppedSequencesLightbox(${steppedAttrArg(title)}, ${steppedAttrArg(sequences)}, ${idx})" title="点击单独放大查看第 ${seq} 帧">
                             <div class="stepped-frame-thumb-box">
-                                <img src="${frameUrl}" alt="Frame ${seq}" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiPjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiMyMjIiLz48dGV4dCB4PSI1MCUiIHk9IjUwJSIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMTQiIGZpbGw9IiM4ODgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIuM2VtIj5JTUcg${seq}</dGV4dD48L3N2Zz4='" />
+                                <img src="${frameUrl}" alt="Frame ${seq}" onerror="this.src='${STEPPED_FRAME_PLACEHOLDER}'" />
                                 <span class="stepped-frame-zoom-tag">🔍</span>
                             </div>
                             <span class="stepped-frame-seq-name">IMG ${String(seq).padStart(3, '0')}</span>

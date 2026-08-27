@@ -34,6 +34,9 @@ const DEFAULT_CONFIG = {
     // composers/omni.py 只排一个插入。此项**不再允许留空**——"沿用面板当前时长"是个不可知态，会让
     // 提示词里的切点表与实际生成时长对不上。
     videoDuration: '10',
+    // 视频分辨率（仅 Omni Flash 模型面板提供 360p / 720p 切换；Veo 系列分辨率固定，
+    // 该项对其无效）。默认 '720p'。
+    videoResolution: '720p',
     // 视频参考模式 = 发起视频前 Flow 面板停在哪个子模式上传参考图：
     // 'VIDEO_FRAMES'（帧/首尾帧，约束运动起止）| 'VIDEO_REFERENCES'（素材，当风格/主体参考）。
     // 与 fx_console.py FX_CONFIG_SPEC 的 videoRefMode 同一项，服务端配置优先。
