@@ -94,6 +94,45 @@ def test_reverse_model_choices_survive_the_managed_mode_config_whitelist():
     assert reverse._peak_verify_model(merged) is None
 
 
+def test_reverse_channel_survives_the_managed_mode_config_whitelist():
+    """反推通道（极速直读 / 标准深度）也走请求体里的 config，同一个白名单口子。
+
+    漏掉它的后果比模型选择更重：托管模式下用户选了「标准深度」，后端收到的是空值，
+    于是照常走极速直读——页面上写着深度、账单像深度之前那样便宜、节拍精度却没变，
+    三条线索互相矛盾，没人查得出来。
+    """
+    import unittest.mock as mock
+    import server_common
+
+    with mock.patch.object(server_common, 'SERVER_MANAGED', True):
+        deep = server_common.effective_config({'reverseMode': 'deep', 'deepReverse': True})
+        fast = server_common.effective_config({'reverseMode': 'fast', 'deepReverse': False})
+    assert deep.get('reverseMode') == 'deep'
+    assert deep.get('deepReverse') is True
+    # 选回极速也要传得过去：老键留在服务端配置里没被清掉的话，深度会被锁死。
+    assert fast.get('reverseMode') == 'fast'
+    assert fast.get('deepReverse') is False
+
+
+def test_compose_channel_survives_the_managed_mode_config_whitelist():
+    """合成通道（极速直通 / 标准合成）同样只能靠请求体里的 config 传过去。
+
+    这条比反推通道更难自查：两条链路产出的 prompt_block 长得一模一样，只有空间锁定包
+    不同（极速那条是写死的常量），所以「选了标准却被丢掉」不会在页面上留下任何痕迹，
+    要等渲染出来空间漂移才发现。
+    """
+    import unittest.mock as mock
+    import server_common
+
+    with mock.patch.object(server_common, 'SERVER_MANAGED', True):
+        deep = server_common.effective_config({'composeMode': 'deep', 'deepCompose': True})
+        fast = server_common.effective_config({'composeMode': 'fast', 'deepCompose': False})
+    assert deep.get('composeMode') == 'deep'
+    assert deep.get('deepCompose') is True
+    assert fast.get('composeMode') == 'fast'
+    assert fast.get('deepCompose') is False
+
+
 def test_sampling_and_scope_reach_the_pipeline_from_the_request_body():
     """抽帧密度与送审档位是两个独立旋钮，各自要有一条从 HTTP 到流水线的完整通路。"""
     import server

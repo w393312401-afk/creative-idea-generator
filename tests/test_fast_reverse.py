@@ -173,6 +173,59 @@ class TestFastReverse(unittest.TestCase):
         with open(beats_path, 'r', encoding='utf-8') as f:
             beats_on_disk = json.load(f)
         self.assertEqual(len(beats_on_disk['beats']), 1)
+        # 走了哪条通道要留在状态里：卡点上「这份阶梯多准」全靠它回答。
+        self.assertEqual(res_state.get('reverse_mode'), 'fast')
+        self.assertIsNone(res_state.get('reverse_fallback'))
+
+    def test_run_reverse_honours_deep_mode_from_config(self):
+        """config.reverseMode='deep' 必须真的走标准 Pass A+B，一次都不碰极速通道。
+
+        前端「反推通道」这个单选框的全部价值就在这一条上：选了深度却仍旧直读，
+        用户付了 3~6 分钟的时间，拿到的还是 20 帧压缩图直出的那份阶梯。
+        """
+        job_dir, overview = self._setup_mock_job()
+        job_id = os.path.basename(job_dir)
+        state = {
+            'job_id': job_id,
+            'video_name': 'test.mp4',
+            'stage': 'confirm_cost',
+            'video_path': os.path.join(job_dir, 'test.mp4'),
+        }
+        rp._save_state(state)
+
+        facts = {'frame_count': 2, 'model': 'stub', 'scope': 'plan', 'facts': []}
+        beats = {'beats': [{'id': 'B01', 'index': 1, 'start': 0.0, 'end': 25.0,
+                            'stage': 'demolition', 'operation': 'clearing'}]}
+
+        with patch('prompt_pipeline.fast_reverse.fast_video_native_reverse') as fast,              patch('prompt_pipeline.reverse.extract_frame_facts', return_value=facts),              patch('prompt_pipeline.reverse.verify_peak_frames', side_effect=lambda c, d, f, **kw: f),              patch('prompt_pipeline.reverse.cluster_beats', return_value=beats),              patch('prompt_pipeline.reverse.translate_beats'):
+            res_state = rp.run_reverse(state, {'reverseMode': 'deep'})
+
+        fast.assert_not_called()
+        self.assertEqual(res_state.get('reverse_mode'), 'deep')
+        self.assertEqual(res_state['stage'], 'review_beats')
+
+    def test_run_reverse_records_the_silent_fallback_to_deep(self):
+        """极速通道炸了会静默降级到标准链路——降级本身没问题，不留痕才有问题。"""
+        job_dir, overview = self._setup_mock_job()
+        job_id = os.path.basename(job_dir)
+        state = {
+            'job_id': job_id,
+            'video_name': 'test.mp4',
+            'stage': 'confirm_cost',
+            'video_path': os.path.join(job_dir, 'test.mp4'),
+        }
+        rp._save_state(state)
+
+        facts = {'frame_count': 2, 'model': 'stub', 'scope': 'plan', 'facts': []}
+        beats = {'beats': [{'id': 'B01', 'index': 1, 'start': 0.0, 'end': 25.0,
+                            'stage': 'demolition', 'operation': 'clearing'}]}
+
+        with patch('prompt_pipeline.fast_reverse.fast_video_native_reverse',
+                   side_effect=ValueError('极速反推未识别出有效节拍')),              patch('prompt_pipeline.reverse.extract_frame_facts', return_value=facts),              patch('prompt_pipeline.reverse.verify_peak_frames', side_effect=lambda c, d, f, **kw: f),              patch('prompt_pipeline.reverse.cluster_beats', return_value=beats),              patch('prompt_pipeline.reverse.translate_beats'):
+            res_state = rp.run_reverse(state, {})
+
+        self.assertEqual(res_state.get('reverse_mode'), 'deep')
+        self.assertIn('未识别出有效节拍', res_state.get('reverse_fallback') or '')
 
 
 if __name__ == '__main__':

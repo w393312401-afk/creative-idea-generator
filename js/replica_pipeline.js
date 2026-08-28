@@ -281,6 +281,13 @@ let replicaJobListExpanded = false;
 let replicaJobListSearchQuery = '';
 let replicaVariantFoldState = {};
 let replicaExtractExpanded = false;
+// 抽帧拼贴图默认收起。它是这一屏最高的一块（近 300px），而绝大多数时候用户只是路过
+// 它去下面的节拍阶梯——默认摊开等于每次都要多滚一屏。展开态跨重渲染活下来，
+// 与任务列表同一套做法（见 replicaJobListExpanded）。
+let replicaCollageExpanded = false;
+// 比例条下面那排拍号 chip。条上够宽的块现在自己写着拍号了，chip 条降级成索引，
+// 默认收起——它在拍多时能占掉三四行，把下面的节拍卡片全推出屏幕。
+let replicaLadderChipsOpen = false;
 let replicaRefsDrawerOpen = false;
 let replicaRefsDirectionOpen = false;
 let replicaRefsFilterQuery = '';
@@ -312,6 +319,38 @@ const REPLICA_FALLBACK_MODELS = [
 ];
 
 const REPLICA_PASS_A_DEFAULT_MODEL = 'gemini-3.7-flash-high';
+
+/* --- 反推通道：极速直读 / 标准深度 ---
+ *
+ * 后端一直有两条反推链路（replica_pipeline.run_reverse 按 config.reverseMode 分流），
+ * 但页面上从来没有入口——所有任务都默认走了极速直读，用户看到细节糊、工序接缝丢，
+ * 也没有别的档可换。这里把开关摆到成本确认卡点上：它和送审档位、反推模型是同一个
+ * 决定（要多准、愿意花多少），本来就该并排选。
+ *
+ * 键写两个：新键 reverseMode 与老键 deepReverse 在后端是 or 关系，只写新键的话，
+ * localStorage 里残留的 deepReverse=true 会让「极速」这一项永远选不回来。
+ */
+function replicaReverseChannel() {
+    const cfg = typeof config !== 'undefined' && config ? config : {};
+    return (cfg.reverseMode === 'deep' || cfg.deepReverse === true) ? 'deep' : 'fast';
+}
+
+/* --- 合成通道：极速直通 / 标准合成 ---
+ *
+ * 与反推通道同一件事的另一半（replica_pipeline.run_compose 按 config.composeMode 分流），
+ * 同样一直没有入口。差距在复刻这条线上比反推那边还大：极速直通的空间锁定包是
+ * 一份写死的常量（fast_composer.synthesize_drift_lock_packet，无论什么片子都是
+ * 3.2×4.5×2.2m 那一份），而且不跑 ground_anchor_on_reference——那是整条链路上唯一
+ * 一次让写手看见原片真实像素的机会。
+ */
+function replicaComposeChannel() {
+    const cfg = typeof config !== 'undefined' && config ? config : {};
+    return (cfg.composeMode === 'deep' || cfg.deepCompose === true) ? 'deep' : 'fast';
+}
+
+function replicaComposeChannelLabel() {
+    return replicaComposeChannel() === 'deep' ? '标准合成' : '极速直通';
+}
 
 function replicaModelChoices() {
     const groups = typeof LLM_MODEL_GROUPS !== 'undefined' ? LLM_MODEL_GROUPS : null;
@@ -697,6 +736,8 @@ function replicaRenderBottomBar(state) {
     const errors = violations.filter(v => v.level === 'error');
     const hasBeats = !!(state.beats && (state.beats.beats || []).length);
     const isRunning = !!replicaSSE;
+    // 按下去到底走哪条通道，写在按钮上——通道的选择块在节拍卡片底部，这条栏可能离它很远。
+    const composeChannel = replicaComposeChannelLabel();
 
     // 「清理合成缓存」。合成缓存的键是 brief 指纹（dimensions + 技能 profile +
     // MILESTONE_POLICY_VERSION）——只改了提示词规则而没动节拍时，指纹一个字不变，
@@ -704,7 +745,7 @@ function replicaRenderBottomBar(state) {
     // 还是旧规则那一份。勾上它这一轮从头跑（见 replica_pipeline.run_compose 的
     // reset_cache）。默认不勾：断点续传省的是几分钟大模型钱，不该为一个偶发场景
     // 让每一次重试都全额重付。
-    // 状态存在模块变量而不是 DOM：这条栏会被 replicaRefreshBottomBar 整段重建，
+    // 状态存在模块变量而不是 DOM：这条栏会被 replicaRefreshChrome 整段重建，
     // 存 DOM 里的话用户勾完随便保存一次就被清掉了。
     const resetCacheToggleHtml = `
         <label class="replica-inline-toggle" title="不复用任何上一轮的合成产物（断点存档、空间锁定包、本任务 Phase 1 产物），从头跑一遍。改过提示词规则后要的就是这个——否则指纹没变，会直接续上旧规则那一份。代价是多花一次 Phase 1 的模型调用。">
@@ -726,9 +767,9 @@ function replicaRenderBottomBar(state) {
                 >保存并重校验${replicaDirty ? '<span class="replica-dirty-dot"></span>' : ''}</button>
             ${resetCacheToggleHtml}
             ${hasPrompt
-                ? `<button type="button" id="replica-bar-recompose-btn" class="action-btn text-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>重新合成</button>
+                ? `<button type="button" id="replica-bar-recompose-btn" class="action-btn text-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>重新合成（${composeChannel}）</button>
                    <button type="button" id="replica-bar-project-btn" class="action-btn primary-btn">存入项目并打开激发结果</button>`
-                : `<button type="button" id="replica-bar-compose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词</button>`}
+                : `<button type="button" id="replica-bar-compose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词（${composeChannel}）</button>`}
         `;
     } else if (stage === 'audit_failed' || stage === 'compose_failed') {
         mainActionHtml = `
@@ -737,7 +778,7 @@ function replicaRenderBottomBar(state) {
                     ${replicaDirty ? 'title="有改动还没存下来"' : ''}
                 >保存并重校验${replicaDirty ? '<span class="replica-dirty-dot"></span>' : ''}</button>
             ${resetCacheToggleHtml}
-            <button type="button" id="replica-bar-recompose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>重新合成</button>
+            <button type="button" id="replica-bar-recompose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>重新合成（${composeChannel}）</button>
         `;
     } else if (hasBeats) {
         mainActionHtml = `
@@ -746,7 +787,7 @@ function replicaRenderBottomBar(state) {
                     ${replicaDirty ? 'title="有改动还没存下来"' : ''}
                 >保存并重校验${replicaDirty ? '<span class="replica-dirty-dot"></span>' : ''}</button>
             ${resetCacheToggleHtml}
-            <button type="button" id="replica-bar-compose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词</button>
+            <button type="button" id="replica-bar-compose-btn" class="action-btn primary-btn" ${errors.length ? 'disabled title="先修掉硬伤"' : ''}>合成提示词（${composeChannel}）</button>
         `;
     }
 
@@ -849,6 +890,9 @@ function replicaRenderJobList() {
             else att = 'stalled';
         }
         if (att === 'archived') att = 'stalled';
+        // 归一化后的分组写回：行上的左侧竖线（待处理/运行中）读的就是这一份，
+        // 不能读原始的 job.attention——那一份可能缺席或还是 'archived'。
+        job.attention = att;
         if (groups[att]) {
             groups[att].push(job);
         } else {
@@ -889,29 +933,39 @@ function replicaRenderJobList() {
         }
 
         const rowHtml = `
-        <div class="replica-job-row ${isCurrent ? 'active' : ''} ${isChild ? 'replica-job-variant-row' : ''}">
-            <button type="button" class="replica-job-open" data-job="${escapeHtmlReplica(job.job_id)}">
+        <div class="replica-job-row ${isCurrent ? 'active' : ''} ${isChild ? 'replica-job-variant-row' : ''}"
+             data-att="${escapeHtmlReplica(job.attention || '')}">
+            <button type="button" class="replica-job-open" data-job="${escapeHtmlReplica(job.job_id)}"
+                    title="${escapeHtmlReplica(displayName)}">
+                <span class="replica-job-icon">${job.variant_of ? '🧬' : '🎬'}</span>
                 <span class="replica-job-name">
-                    ${job.variant_of ? '🧬 ' : '🎬 '}<strong>${escapeHtmlReplica(displayName)}</strong>
+                    <strong>${escapeHtmlReplica(displayName)}</strong>${
+                        job.title_locked ? '<span class="replica-job-lock" title="名称已锁定">🔒</span>' : ''}
                 </span>
-                ${job.title_locked ? '<span class="replica-chip replica-chip-locked" title="名称已锁定">🔒</span>' : ''}
-                <span class="replica-chip ${job.stage === 'completed' ? 'replica-chip-done' : ''}">${escapeHtmlReplica(stageText)}</span>
-                ${costBadge}
-                ${job.beat_count ? `<span class="replica-chip">${job.beat_count} 拍</span>` : ''}
-                ${job.error ? '<span class="replica-chip replica-chip-error">出错</span>' : ''}
-                ${isArchived ? '<span class="replica-chip">📦 已归档</span>' : ''}
-                ${/* 跑着的任务：把它当前在干什么摆到行上。列表行此前只有一个静态 stage
-                      chip，而 SSE 只连当前打开的那一条——同时跑两条时，另一条在列表里
-                      看不出任何进展，只能靠反复点进去确认。 */''}
-                ${job.active_task_id ? `<span class="replica-job-live" title="${
-                    escapeHtmlReplica(job.active_message || '正在后台运行')}">
-                    <span class="replica-job-live-dot"></span>${
-                    escapeHtmlReplica(job.active_message || '正在后台运行')}</span>` : ''}
+                <span class="replica-job-meta">
+                    ${job.error ? '<span class="replica-chip replica-chip-error">出错</span>' : ''}
+                    ${costBadge}
+                    ${isArchived ? '<span class="replica-chip">📦 已归档</span>' : ''}
+                    ${job.beat_count ? `<span class="replica-job-beats">${job.beat_count} 拍</span>` : ''}
+                    ${/* 跑着的任务：把它当前在干什么摆到行上。列表行此前只有一个静态 stage
+                          chip，而 SSE 只连当前打开的那一条——同时跑两条时，另一条在列表里
+                          看不出任何进展，只能靠反复点进去确认。 */''}
+                    ${job.active_task_id ? `<span class="replica-job-live" title="${
+                        escapeHtmlReplica(job.active_message || '正在后台运行')}">
+                        <span class="replica-job-live-dot"></span>${
+                        escapeHtmlReplica(job.active_message || '正在后台运行')}</span>`
+                    : `<span class="replica-job-stage ${job.stage === 'completed' ? 'is-done' : ''}">${
+                        escapeHtmlReplica(stageText)}</span>`}
+                </span>
             </button>
+            ${/* 变体展开钮不进 ops：它是「这条底下还挂着东西」的指示，不是低频操作，
+                  藏进悬停态就等于没有。 */''}
             ${lineageToggleHtml}
-            <button type="button" class="replica-mini-btn" data-rename="${escapeHtmlReplica(job.job_id)}" title="重命名此任务">改名</button>
-            ${!isArchived ? `<button type="button" class="replica-mini-btn" data-archive="${escapeHtmlReplica(job.job_id)}" title="瘦身归档（删除视频与高清帧，释放磁盘空间）">归档</button>` : ''}
-            <button type="button" class="replica-mini-btn" data-delete="${escapeHtmlReplica(job.job_id)}" title="删除这个任务及其数据">删除</button>
+            <span class="replica-job-ops">
+                <button type="button" class="replica-mini-btn" data-rename="${escapeHtmlReplica(job.job_id)}" title="重命名此任务">改名</button>
+                ${!isArchived ? `<button type="button" class="replica-mini-btn" data-archive="${escapeHtmlReplica(job.job_id)}" title="瘦身归档（删除视频与高清帧，释放磁盘空间）">归档</button>` : ''}
+                <button type="button" class="replica-mini-btn replica-mini-btn-danger" data-delete="${escapeHtmlReplica(job.job_id)}" title="删除这个任务及其数据">删除</button>
+            </span>
         </div>`;
 
         // 如果是展开状态，渲染挂载的子变体
@@ -941,13 +995,15 @@ function replicaRenderJobList() {
         return `
         <div class="replica-job-group">
             <div class="replica-job-group-title">
-                ${icon} ${title} (${jobList.length}) ${extraBadge}
+                <span class="replica-job-group-name">${icon} ${title}</span>
+                <span class="replica-job-group-count">${jobList.length}</span>
+                ${extraBadge}
             </div>
             ${topLevelJobs.map(j => renderJobRow(j, false, jobList)).join('')}
         </div>`;
     }
 
-    const waitingHtml = renderGroupSection('待你处理', '🔥', groups.waiting_you, `<span class="replica-chip replica-chip-urgent">${groups.waiting_you.length} 条在等你</span>`);
+    const waitingHtml = renderGroupSection('待你处理', '🔥', groups.waiting_you);
     const runningHtml = renderGroupSection('运行中', '⚡', groups.running);
     const doneHtml = renderGroupSection('已完成', '✅', groups.done);
     const stalledHtml = renderGroupSection('已搁置 / 已归档', '📦', groups.stalled);
@@ -967,11 +1023,14 @@ function replicaRenderJobList() {
                        placeholder="🔍 搜索任务标题、ID、状态..."
                        value="${escapeHtmlReplica(replicaJobListSearchQuery)}">
             </div>
-            ${waitingHtml}
-            ${runningHtml}
-            ${doneHtml}
-            ${stalledHtml}
-            ${emptyNotice}
+            ${/* 搜索框在滚动区之外：任务多的时候它不能跟着列表滚走。 */''}
+            <div class="replica-job-scroll">
+                ${waitingHtml}
+                ${runningHtml}
+                ${doneHtml}
+                ${stalledHtml}
+                ${emptyNotice}
+            </div>
         </div>
     </details>`;
 }
@@ -1479,6 +1538,23 @@ function replicaRenderSpend(state) {
     </details>`;
 }
 
+// 抽帧拼贴图那一块。默认收起成一行摘要，点开才铺开图——它高、也重（整条序列一张大图），
+// 而它只在「核对某一帧到底长什么样」时才有人真去看。图本身仍挂着 #replica-collage，
+// 点图开灯箱的行为不变。
+function replicaRenderCollageFold(collage, frameCount) {
+    if (!collage) return '';
+    return `
+    <details class="replica-collage-fold" id="replica-collage-fold" ${replicaCollageExpanded ? 'open' : ''}>
+        <summary class="replica-collage-summary">
+            <span class="replica-collage-summary-label">关键帧拼贴图</span>
+            <span class="replica-collage-summary-hint">${
+                frameCount ? `${frameCount} 张 · ` : ''}展开看整条序列，点图开大图</span>
+        </summary>
+        <img class="replica-collage" id="replica-collage" src="${collage}"
+             alt="关键帧拼贴图" title="点开看大图" loading="lazy">
+    </details>`;
+}
+
 function replicaRenderExtract(state) {
     const ov = state.overview;
     if (!ov) return '';
@@ -1500,6 +1576,7 @@ function replicaRenderExtract(state) {
     const startLabel = atCostGate ? '确认并开始反推'
         : (isRetry ? '重试反推' : (hasBeats ? '换档位重跑反推' : '开始反推'));
     const scope = state.review_scope || (state.degraded ? 'degraded' : 'plan');
+    const channel = replicaReverseChannel();
     const fps = replicaCurrentFps(state);
 
     const isCollapsible = !atCostGate && state.stage !== 'extract' && hasBeats;
@@ -1511,7 +1588,7 @@ function replicaRenderExtract(state) {
             <span>抽帧结果</span>
             ${isCollapsible ? `
                 <button type="button" id="replica-toggle-extract-btn" class="action-btn text-btn replica-mini-btn">
-                    ${isCollapsed ? '展开抽帧与模型设置 ⌄' : '收起 ⌃'}
+                    ${isCollapsed ? '展开抽帧 / 反推通道 / 模型设置 ⌄' : '收起 ⌃'}
                 </button>
             ` : ''}
         </div>
@@ -1522,9 +1599,9 @@ function replicaRenderExtract(state) {
                 <span>基线 ${fps} fps</span>
                 <span>变化事件 ${ov.change_event_count ?? '—'} 个</span>
                 <span>送审档位 ${scope}</span>
+                <span>反推通道 ${state.reverse_mode === 'deep' ? '标准深度' : (state.reverse_mode ? '极速直读' : '—')}</span>
             </div>
-            ${collage ? `<img class="replica-collage replica-collage-folded" id="replica-collage" src="${collage}"
-                 alt="关键帧拼贴图" title="点开看大图" loading="lazy">` : ''}
+            ${replicaRenderCollageFold(collage, ov.frame_count)}
         ` : `
             <div class="replica-metrics">
                 <span>时长 ${ov.duration_sec ?? '—'}s</span>
@@ -1546,16 +1623,41 @@ function replicaRenderExtract(state) {
                     时间戳，换了密度同一个名字指向的是另一时刻的画面，所以旧的读数必须全丢。
                 </p>
             </div>
-            ${collage ? `<img class="replica-collage" id="replica-collage" src="${collage}"
-                 alt="关键帧拼贴图" title="点开看大图" loading="lazy">`
+            ${collage ? replicaRenderCollageFold(collage, ov.frame_count)
             : `<div class="replica-banner replica-banner-error">
                 拼贴图缺失。它是节拍映射的前置门禁，缺了等于没看过整条序列就要定义节拍。</div>`}
             <div class="replica-cost">
                 ${atCostGate ? `<p class="replica-hint replica-cost-gate">
-                    <b>抽帧已完成，还没有开始花钱。</b>Pass A 是整条线的成本大头——
-                    下面三档决定送多少帧给多模态模型，选好再按开始。
+                    <b>抽帧已完成，还没有开始花钱。</b>反推是整条线的成本大头——
+                    先选通道（极速直读 / 标准深度），再决定送多少帧给多模态模型，选好再按开始。
                 </p>` : ''}
                 ${replicaRenderSpend(state)}
+                <div class="replica-channel-picker">
+                    <div class="replica-card-subtitle">反推通道</div>
+                    <label class="replica-radio">
+                        <input type="radio" name="replica-reverse-channel" value="fast"
+                               ${channel === 'fast' ? 'checked' : ''}>
+                        <span><b>极速直读</b>（1 次视觉调用 · 约 30~45 秒）——
+                              取最多 20 张关键帧、压到 768px，单轮多模态直出整份节拍阶梯。
+                              快且便宜，但<b>不逐帧读、不复核峰值帧</b>；模型没给全的工艺字段由
+                              模板补齐、时间窗按时长均分。适合先看个大概、试主题。</span>
+                    </label>
+                    <label class="replica-radio">
+                        <input type="radio" name="replica-reverse-channel" value="deep"
+                               ${channel === 'deep' ? 'checked' : ''}>
+                        <span><b>标准深度（Deep Mode）</b>（按下面档位的调用次数 · 约 3~6 分钟）——
+                              Pass A 逐帧读事实（10 帧一批，解析失败二分重试并抬到 1024px）→
+                              强模型复核事件峰值帧（含原生尺寸 ROI 特写）→ Pass B 聚类成拍 → 中文对照。
+                              细节、工序接缝与节拍边界都准得多，代价是时间与调用次数。</span>
+                    </label>
+                    <p class="replica-hint">
+                        选「极速直读」时，下面的送审档位与峰值帧复核<b>都不生效</b>——那条通道自己定帧、
+                        也不跑复核，三档预估的调用次数只对深度通道成立。
+                        ${state.reverse_mode ? `上一轮实际走的是<b>${state.reverse_mode === 'deep' ? '标准深度' : '极速直读'}</b>。` : ''}
+                        ${state.reverse_fallback ? `<b>注意：</b>上一轮极速通道失败，已自动降级到标准深度跑完（${escapeHtmlReplica(state.reverse_fallback)}）。` : ''}
+                    </p>
+                </div>
+                <div id="replica-scope-choices" class="replica-scope-choices">
                 <label class="replica-radio">
                     <input type="radio" name="replica-mode" value="all" ${scope === 'all' ? 'checked' : ''}>
                     <span>全部（${every.frame_count || 0} 帧 / 约 ${every.batch_count || 0} 次视觉调用）——
@@ -1576,13 +1678,14 @@ function replicaRenderExtract(state) {
                     计划档只送 ${full.frame_count || 0} 张。要更密就选「全部」；抽出来的总数
                     本身不够，则回上面调抽帧密度重抽。
                 </p>
+                </div>
                 <div class="replica-model-picker">
                     <div class="replica-card-subtitle">反推模型</div>
                     <label class="replica-inline-field">逐帧识别（Pass A）
                         ${replicaModelSelect('replica-frame-model',
                             replicaConfigValue('frameFactsModel', REPLICA_PASS_A_DEFAULT_MODEL))}
                     </label>
-                    <label class="replica-inline-field">峰值帧复核
+                    <label class="replica-inline-field" id="replica-peak-field">峰值帧复核
                         ${replicaModelSelect('replica-peak-model',
                             replicaConfigValue('peakVerifyModel', ''),
                             [{ value: '', label: '跟随主模型（默认）' },
@@ -1593,6 +1696,8 @@ function replicaRenderExtract(state) {
                         读糊，而节拍阶梯完全建在这些读数上。便宜的 flash 打底 + 强模型复核
                         峰值帧是默认组合；对精度不满意就把逐帧识别也换成强模型，代价是
                         ${full.batch_count || 0} 次调用全部按强模型计价。
+                        <b>「逐帧识别」两条通道共用</b>（极速直读那一次调用也走它）；
+                        <b>峰值帧复核只在标准深度通道生效</b>。
                         ${state.facts && state.facts.model
                             ? `上一轮实际用的是 <code>${escapeHtmlReplica(state.facts.model)}</code>。` : ''}
                     </p>
@@ -1611,8 +1716,9 @@ function replicaRenderExtract(state) {
                 ${hasBeats && !atCostGate ? `<p class="replica-hint">
                     已经有一份节拍阶梯了。换档位重跑会覆盖它——你在下面改过的内容会丢。
                 </p>` : ''}
-                <button type="button" id="replica-start-btn" class="action-btn primary-btn">
-                    ${startLabel}
+                <button type="button" id="replica-start-btn" class="action-btn primary-btn"
+                        data-label-base="${startLabel}">
+                    ${startLabel}（${channel === 'deep' ? '标准深度' : '极速直读'}）
                 </button>
             </div>
         `}
@@ -1856,10 +1962,44 @@ function replicaRenderLadderOverview(doc, errors, warns) {
         // 减掉一格 gap：百分比之和恰好是 100%，再加上段间的 2px 就必然溢出，
         // 于是每一份阶梯都挂着一条滚不出东西来的横向滚动条。
         const pct = Math.max(0.6, Math.min(100, (f.span / totalDuration) * 100));
+        // 够宽的块直接把拍号与秒数写进去。此前这条比例条一个字都没有，要知道第几块
+        // 是哪一拍只能悬停一块试一块——下面那条 chip 条之所以非存在不可，一半原因
+        // 就在这里。窄块仍然留白（写不下的字比不写更糟），靠 chip 条与 tooltip 认。
+        const label = pct >= 6.5
+            ? `<span class="replica-ladder-seg-label"><b>${escapeHtmlReplica(b.id)}</b>${
+                pct >= 11 ? `<i>${f.span.toFixed(1)}s</i>` : ''}</span>`
+            : '';
         return `<button type="button" class="${cls(f, `replica-ladder-seg stage-${escapeHtmlReplica(b.stage || 'structural')}`)}"
                 style="width:calc(${pct.toFixed(2)}% - 2px)" data-jump-beat="${escapeHtmlReplica(b.id)}"
-                title="${escapeHtmlReplica(tip(b, f))}" aria-label="${escapeHtmlReplica(tip(b, f))}"></button>`;
+                title="${escapeHtmlReplica(tip(b, f))}" aria-label="${escapeHtmlReplica(tip(b, f))}">${label}</button>`;
     }).join('');
+
+    // 时间刻度。比例条按时长画宽度，却没有任何一处标出「这里是第几秒」——
+    // 于是「原片 30 秒那个动作在哪一拍」这种问题在页面上只能靠数块。
+    // 刻度按 5/10/15/30/60s 里挑一档，让整条大约落 5~8 根。
+    const tickStep = [5, 10, 15, 20, 30, 60, 120].find(st => totalDuration / st <= 8) || 300;
+    const ticks = [];
+    for (let t = 0; t <= totalDuration + 0.001; t += tickStep) {
+        const left = (t / totalDuration) * 100;
+        // 末端那一根由 is-end 单独画（它右对齐、写的是真实总时长）。整除时这里会
+        // 正好落在 100%，两根字会叠在一起，所以贴边的一律让给它。
+        if (left > 96) continue;
+        ticks.push(`<span class="replica-ladder-tick" style="left:${left.toFixed(2)}%">${Math.round(t)}s</span>`);
+    }
+    const rulerHtml = `<div class="replica-ladder-ruler" aria-hidden="true">${ticks.join('')}
+        <span class="replica-ladder-tick is-end" style="left:100%">${totalDuration.toFixed(0)}s</span></div>`;
+
+    // 图例。条上那几种画法（斜纹 = 超长、描边 = 微拍、底色条 = 硬伤/待确认、
+    // 左侧竖线 = 过门）此前只在 tooltip 里解释，等于没解释。只列出这一条上真出现过的。
+    const legendBits = [
+        flags.some(f => f.isTooLong) ? '<span class="replica-ladder-legend-item"><i class="lg-toolong"></i>超长拍 &gt;6.0s</span>' : '',
+        flags.some(f => f.isTooShort) ? '<span class="replica-ladder-legend-item"><i class="lg-tooshort"></i>微拍 &lt;2.0s</span>' : '',
+        flags.some(f => f.isCrossed) ? '<span class="replica-ladder-legend-item"><i class="lg-crossed"></i>过门换空间</span>' : '',
+        flags.some(f => f.isErr) ? '<span class="replica-ladder-legend-item"><i class="lg-error"></i>硬伤</span>' : '',
+        flags.some(f => f.isWarn && !f.isErr) ? '<span class="replica-ladder-legend-item"><i class="lg-warn"></i>待确认</span>' : '',
+    ].filter(Boolean).join('');
+    const legendHtml = legendBits
+        ? `<div class="replica-ladder-legend">${legendBits}</div>` : '';
 
     const chips = beats.map((b, i) => {
         const f = flags[i];
@@ -1887,7 +2027,46 @@ function replicaRenderLadderOverview(doc, errors, warns) {
             </span>
         </div>
         <div class="replica-ladder-bar" role="group" aria-label="节拍时长比例条，点一段跳到那一拍">${segs}</div>
-        <div class="replica-ladder-chips" role="group" aria-label="节拍跳转">${chips}</div>
+        ${rulerHtml}
+        ${legendHtml}
+        <details class="replica-ladder-chips-fold" ${replicaLadderChipsOpen ? 'open' : ''} id="replica-ladder-chips-fold">
+            <summary>拍号索引（${beats.length} 拍）</summary>
+            <div class="replica-ladder-chips" role="group" aria-label="节拍跳转">${chips}</div>
+        </details>
+    </div>`;
+}
+
+// 合成通道选择块。摆在节拍卡片底部、动作排前面：这里正是「阶梯核对完了，下一步合成」
+// 的那个位置，而吸底栏那颗 CTA 装不下这两条通道的差别说明。
+function replicaRenderComposeChannel(state) {
+    const channel = replicaComposeChannel();
+    return `
+    <div class="replica-section replica-channel-picker" id="replica-sec-compose-channel">
+        <div class="replica-card-subtitle">合成通道</div>
+        <label class="replica-radio">
+            <input type="radio" name="replica-compose-channel" value="fast"
+                   ${channel === 'fast' ? 'checked' : ''}>
+            <span><b>极速直通</b>（1 次调用 · 约 15~30 秒）——
+                  单轮直出全部 N+1 张 IMAGE 与 N 条 VIDEO。快，但
+                  <b>空间锁定包是写死的常量</b>（无论什么片子都是同一份 3.2×4.5×2.2m envelope 与
+                  Grid A2/B2/C2 地标），<b>锚点图不与原片首帧对齐</b>，也没有逐拍确定性修复与断点续传——
+                  那一次调用炸了就整份重来。适合先看提示词大概长什么样。</span>
+        </label>
+        <label class="replica-radio">
+            <input type="radio" name="replica-compose-channel" value="deep"
+                   ${channel === 'deep' ? 'checked' : ''}>
+            <span><b>标准合成（Deep Mode）</b>（8~15 次调用 · 约 3~5 分钟）——
+                  Phase 1 解析维度、按这条片子建空间锁定包、只写 IMAGE 1 锚点 →
+                  <b>拿原片首帧校准锚点</b>并用校准结果回头修 packet →
+                  Phase 2 带 SCUP 协议与模板逐拍写，每拍过确定性修复、每拍存断点。
+                  要贴合原片就选它。</span>
+        </label>
+        <p class="replica-hint">
+            两条通道最后都过同一道禁用元素门禁——「没报硬伤」不代表画面一致性也一样，
+            那道闸只拦禁用元素，拦不住空间漂移。
+            ${state && state.compose_mode ? `上一轮实际走的是<b>${state.compose_mode === 'deep' ? '标准合成' : '极速直通'}</b>。` : ''}
+            ${state && state.compose_fallback ? `<b>注意：</b>上一轮极速通道失败，已自动降级到标准合成跑完（${escapeHtmlReplica(state.compose_fallback)}）。` : ''}
+        </p>
     </div>`;
 }
 
@@ -1956,6 +2135,7 @@ function replicaRenderBeats(state) {
               修复按钮同时还犯了另一条：0 硬伤时横幅里没有它，这一排里却还摆着一枚，
               点下去无事发生。本文件里已有同款判断——「摆一个点了必然报错的按钮比不摆
               更糟」（见下面撤销按钮的条件渲染）。现在它只在有硬伤时、只在硬伤旁边出现。 */''}
+        ${replicaRenderComposeChannel(state)}
         <div class="replica-actions">
             <button type="button" id="replica-refine-craft-btn" class="action-btn text-btn"
                     title="看着证据帧把每一拍的措辞写准：补位置锚、补完成量、拆开结果与状态、补工具/声音/景别/运镜/光照/物料。画面上发生了什么一个字不动，1:1 不受影响。已有的合成提示词会作废，需要重新合成。">✨ 工艺精修（不动 1:1）</button>
@@ -2549,9 +2729,16 @@ function replicaBindEvents() {
         replicaExtractExpanded = !replicaExtractExpanded;
         replicaRender();
     });
-    // 模型选择改一下就落盘，不必等到点「开始反推」
-    on('#replica-frame-model', replicaCaptureReverseModels, 'change');
-    on('#replica-peak-model', replicaCaptureReverseModels, 'change');
+    // 通道与模型选择改一下就落盘，不必等到点「开始反推」
+    root.querySelectorAll('input[name="replica-reverse-channel"]').forEach((el) => {
+        el.addEventListener('change', () => {
+            replicaCaptureReverseSettings();
+            replicaSyncReverseChannelUI();
+        });
+    });
+    on('#replica-frame-model', replicaCaptureReverseSettings, 'change');
+    on('#replica-peak-model', replicaCaptureReverseSettings, 'change');
+    replicaSyncReverseChannelUI();
     on('#replica-recompose-btn', replicaCompose);
     on('#replica-project-btn', (e) => replicaSaveToProject(e.currentTarget));
     on('#replica-cancel-btn', replicaCancelRun);
@@ -2661,6 +2848,10 @@ function replicaBindEvents() {
 
     // 任务列表的展开态要跨重渲染活下来，否则展开它、点开一条任务、页面重画，它又收上了。
     on('#replica-sec-jobs', (e) => { replicaJobListExpanded = e.currentTarget.open; }, 'toggle');
+
+    // 同理：拼贴图的展开态也要跨重渲染活下来。
+    on('#replica-collage-fold', (e) => { replicaCollageExpanded = e.currentTarget.open; }, 'toggle');
+    on('#replica-ladder-chips-fold', (e) => { replicaLadderChipsOpen = e.currentTarget.open; }, 'toggle');
 
     // 阶段指示条点击跳转：四个用户可见阶段各对应页面上真实存在的一块区域。
     root.querySelectorAll('.replica-phase[data-phase]').forEach(li => {
@@ -2901,6 +3092,18 @@ function replicaBindBeatEvents(scope) {
         const el = scope.querySelector(sel);
         if (el) el.addEventListener(evt, fn);
     };
+
+    // 合成通道的单选框长在这张卡片里，所以绑在这里而不是 replicaBindEvents：
+    // 节拍区会被 replicaRefreshBeats 单独重绘（每次保存都会），绑在外面的话保存一次
+    // 这两个单选框就哑了，而它们看上去仍然可点。
+    // 换通道后只重建吸底栏与导航（按钮上写着走哪条通道），不重绘节拍区——那会把
+    // 用户改到一半、还没保存的文本框推回上一次保存的值。
+    scope.querySelectorAll('input[name="replica-compose-channel"]').forEach((el) => {
+        el.addEventListener('change', () => {
+            replicaCaptureComposeChannel();
+            replicaRefreshChrome();
+        });
+    });
 
     // 保存与合成不在这一排里，它们常驻吸底操作栏（见 replicaBindBottomBarEvents）。
     // 精修会作废已有的 prompt_block（beats 一变，旧提示词就是按旧措辞合出来的）。
@@ -3586,12 +3789,20 @@ async function replicaReExtract() {
     await replicaExtract(baseFps);
 }
 
-// 反推段的模型选择：先落进全局 config（写 localStorage），再随请求体发出去。
+// 反推段的通道与模型选择：先落进全局 config（写 localStorage），再随请求体发出去。
 // 落盘是为了下一条任务、下一次开页面还是这个选择——不落的话每次都回默认值，
 // 用户会以为自己选过了。
-function replicaCaptureReverseModels() {
+function replicaCaptureReverseSettings() {
     const root = replicaRoot();
     if (!root) return;
+    const chanEl = root.querySelector('input[name="replica-reverse-channel"]:checked');
+    if (chanEl) {
+        const deep = chanEl.value === 'deep';
+        replicaSetConfigValue('reverseMode', deep ? 'deep' : 'fast');
+        // 老键与新键在后端是 or 关系（run_reverse），两个一起写，否则残留的
+        // deepReverse=true 会把「极速」这一项锁死。
+        replicaSetConfigValue('deepReverse', deep);
+    }
     const frameEl = root.querySelector('#replica-frame-model');
     if (frameEl) replicaSetConfigValue('frameFactsModel', frameEl.value);
     const peakEl = root.querySelector('#replica-peak-model');
@@ -3599,11 +3810,47 @@ function replicaCaptureReverseModels() {
     if (peakEl) replicaSetConfigValue('peakVerifyModel', peakEl.value);
 }
 
+// 合成通道写回 config（新老键一起写，理由同反推通道），再由 replicaConfig() 随请求体发出。
+function replicaCaptureComposeChannel() {
+    const root = replicaRoot();
+    if (!root) return;
+    const el = root.querySelector('input[name="replica-compose-channel"]:checked');
+    if (!el) return;
+    const deep = el.value === 'deep';
+    replicaSetConfigValue('composeMode', deep ? 'deep' : 'fast');
+    replicaSetConfigValue('deepCompose', deep);
+}
+
+// 通道一换，卡点上「哪些控件还算数」就变了。这里就地改 DOM 而不是 replicaRender()：
+// 整卡重绘会把用户刚选还没重抽的抽帧密度顶回状态里的旧值。
+function replicaSyncReverseChannelUI() {
+    const root = replicaRoot();
+    if (!root) return;
+    const deep = replicaReverseChannel() === 'deep';
+    const scopeBox = root.querySelector('#replica-scope-choices');
+    if (scopeBox) {
+        scopeBox.classList.toggle('replica-inactive', !deep);
+        scopeBox.querySelectorAll('input[name="replica-mode"]').forEach((el) => {
+            el.disabled = !deep;
+        });
+    }
+    const peakField = root.querySelector('#replica-peak-field');
+    if (peakField) {
+        peakField.classList.toggle('replica-inactive', !deep);
+        const peakEl = peakField.querySelector('select');
+        if (peakEl) peakEl.disabled = !deep;
+    }
+    const btn = root.querySelector('#replica-start-btn');
+    if (btn && btn.dataset.labelBase) {
+        btn.textContent = `${btn.dataset.labelBase}（${deep ? '标准深度' : '极速直读'}）`;
+    }
+}
+
 async function replicaStart() {
     if (!replicaState) return;
     const modeEl = replicaRoot().querySelector('input[name="replica-mode"]:checked');
     const scope = replicaScopeFromMode(modeEl && modeEl.value);
-    replicaCaptureReverseModels();
+    replicaCaptureReverseSettings();
     replicaSetBusy(true);
     try {
         const data = await replicaFetch('/api/replica/start', {

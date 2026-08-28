@@ -662,6 +662,10 @@ def ingest_video(file_bytes, filename, config=None):
         'cost_estimate': None,
         'sampling': None,        # 抽帧密度，run_extract 定下来（EXTRACT_FPS_CHOICES）
         'review_scope': None,    # 送审档位，run_reverse 定下来（reverse.REVIEW_SCOPES）
+        'reverse_mode': None,    # 'fast' 极速直读 / 'deep' 标准 Pass A+B，run_reverse 定下来
+        'reverse_fallback': None,  # 极速通道失败自动降级时的原因，正常为 None
+        'compose_mode': None,    # 'fast' 极速直通 / 'deep' 标准 Phase 1+2，run_compose 定下来
+        'compose_fallback': None,  # 同上，合成侧的降级原因
         'degraded': False,
         'facts': None,
         'beats': None,
@@ -998,6 +1002,13 @@ def run_reverse(state, config, on_progress=None, degraded=False, scope=None):
     # 要测哪条就在配置里明说哪条。
     use_deep = bool((config or {}).get('reverseMode') == 'deep' or (config or {}).get('deepReverse'))
 
+    # 走了哪条通道要留在状态里：两条链路的节拍精度差着一档，回到卡点上（或者过几天再打开
+    # 这条任务）得能看出手里这份阶梯是直读出来的还是逐帧读出来的，否则「细节不对」根本
+    # 无从判断该重跑还是该手改。降级也记一笔，理由同上——静默降级最难查。
+    state['reverse_mode'] = 'deep' if use_deep else 'fast'
+    state['reverse_fallback'] = None
+    _save_state(state)
+
     if not use_deep:
         try:
             from prompt_pipeline.fast_reverse import fast_video_native_reverse
@@ -1025,6 +1036,9 @@ def run_reverse(state, config, on_progress=None, degraded=False, scope=None):
         except Exception as e:
             if sys.stdout:
                 print(f"[REPLICA] 极速原生反推异常，平滑降级至标准 Pass A+B 链路: {e}")
+            state['reverse_mode'] = 'deep'
+            state['reverse_fallback'] = str(e)[:200]
+            _save_state(state)
 
     facts = reverse.extract_frame_facts(config, directory, on_progress=on_progress,
                                         scope=scope)
@@ -1438,6 +1452,9 @@ def run_mutate(state, config, axis_spec, on_progress=None):
         'sampling': state.get('sampling'),
         'review_scope': state.get('review_scope'),
         'degraded': state.get('degraded'),
+        # 变体的节拍是从这份阶梯派生的，通道出身跟着一起带走：不带的话变体页上
+        # 「这份阶梯多准」就查不到出处了。
+        'reverse_mode': state.get('reverse_mode'),
         'facts': state.get('facts'),
         'beats': None,
         'validation': [],
@@ -1574,6 +1591,9 @@ def mutate_orthogonal(config, baseline_job_id, mutation_axes=None, preset=None, 
         'sampling': state.get('sampling'),
         'review_scope': state.get('review_scope'),
         'degraded': state.get('degraded'),
+        # 变体的节拍是从这份阶梯派生的，通道出身跟着一起带走：不带的话变体页上
+        # 「这份阶梯多准」就查不到出处了。
+        'reverse_mode': state.get('reverse_mode'),
         'facts': state.get('facts'),
         'beats': None,
         'validation': [],
@@ -1871,6 +1891,12 @@ def run_compose(state, config, dimensions=None, on_progress=None, reset_cache=Fa
     # 与 run_reverse 同一口径：极速直通 / 标准合成只由配置决定，不探测测试替身。
     use_deep = bool((config or {}).get('composeMode') == 'deep' or (config or {}).get('deepCompose'))
 
+    # 与反推通道同一条纪律：走了哪条要留痕。这两条通道产出的 packet 完全不是一回事
+    # （极速那条是写死的常量），而 prompt_block 上看不出区别——渲染出来空间漂移时，
+    # 没有这一笔就查不到是通道的问题。
+    state['compose_mode'] = 'deep' if use_deep else 'fast'
+    state['compose_fallback'] = None
+
     if not use_deep:
         try:
             from prompt_pipeline.fast_composer import compose_replica_one_pass
@@ -1884,6 +1910,8 @@ def run_compose(state, config, dimensions=None, on_progress=None, reset_cache=Fa
         except Exception as e:
             if sys.stdout:
                 print(f"[REPLICA] 极速合成通道异常，平滑降级至标准合成链路: {e}")
+            state['compose_mode'] = 'deep'
+            state['compose_fallback'] = str(e)[:200]
 
     try:
         try:

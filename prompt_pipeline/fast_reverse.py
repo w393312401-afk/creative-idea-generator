@@ -74,7 +74,7 @@ Rules:
    - "camera_angle": vertical angle ("eye_level", "high_angle", "low_angle", "bird_eye")
    - "camera_bearing": horizontal bearing ("front", "three_quarter", "side", "back")
    - "lens_feel": lens specification ("24mm_wide", "35mm_standard", "16mm_ultra_wide")
-   - "subject_placement": screen grid placement ("Grid B2 (center)", "Grid A2 (upper)", "Grid C2 (floor)")
+   - "subject_placement": detailed 3-zone spatial layout & grid placement. Explicitly declare horizontal thirds: where solid walls, main work face, and openings/portals sit (e.g. "Solid wall on left third (Grid A1-C1), portal opening strictly on right third (Grid A3-B3), puddle in lower center (Grid B2-C2)"). If the shot is 3/4 oblique or off-center, describe the exact asymmetry and NEVER default to centered framing.
    - "tool": primary hand/power tool used (e.g. "high-pressure hose", "framing hammer", "paint roller")
    - "sfx": ASMR physical sound effect description at 60% volume
    - "time_treatment": "time_lapse" or "real_time"
@@ -272,10 +272,14 @@ def fast_video_native_reverse(config, job_dir, on_progress=None):
         b.setdefault('sfx', f"ASMR physical sound effects of {b.get('operation')} at 60% volume")
         b.setdefault('shot_scale', 'wide_shot')
         b.setdefault('camera_angle', b.get('camera_angle') or 'eye_level')
-        b.setdefault('camera_bearing', b.get('camera_bearing') or 'three_quarter')
-        b.setdefault('lens_feel', b.get('lens_feel') or '24mm_wide')
-        b.setdefault('subject_placement', b.get('subject_placement') or 'Grid B2 (center workspace)')
-        b.setdefault('camera_move', b.get('camera_move') or 'static')
+        if not b.get('subject_placement'):
+            bearing = str(b.get('camera_bearing') or 'three_quarter').lower()
+            if 'three_quarter' in bearing:
+                b['subject_placement'] = 'Off-center three-quarter perspective across Grid B1-B3 workspace'
+            elif 'side' in bearing:
+                b['subject_placement'] = 'Side profile workspace spanning Grid B1-C2'
+            else:
+                b['subject_placement'] = 'Grid B2 (center workspace)'
         b.setdefault('time_treatment', 'time_lapse')
         b.setdefault('worker_count', 1)
         b.setdefault('light_state', 'worklight_daylight')

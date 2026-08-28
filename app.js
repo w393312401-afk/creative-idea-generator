@@ -1564,33 +1564,66 @@ async function rerunCompletedTask(taskId, dimensions, event) {
     }
 }
 
+function isReplicaProjectRow(p) {
+    if (!p) return false;
+    if (typeof projectReplicaJobId === 'function' && projectReplicaJobId(p)) return true;
+    const libId = String((p.library || {}).id || '');
+    if (libId.startsWith('replica')) return true;
+    const key = String(p.project_key || '');
+    if (key.includes('replica_') || key.startsWith('replica')) return true;
+    const title = String(p.title || '');
+    if (title.includes('爆款 1:1 复刻') || title.includes('二创变体') || title.includes('爆款复刻') || title.includes('· 爆款') || title.includes('· 二创')) return true;
+    const theme = String(p.theme || '');
+    if (theme.includes('爆款 1:1 复刻') || theme.includes('二创变体') || theme.includes('爆款复刻') || theme.includes('· 爆款') || theme.includes('· 二创')) return true;
+    const taskId = String((p.task || {}).id || '');
+    if (taskId.startsWith('replica')) return true;
+    return false;
+}
+
+function isReplicaIdea(item) {
+    if (!item) return false;
+    const id = String(item.id || '');
+    if (id.startsWith('replica')) return true;
+    if (String(item.source || '') === 'replica') return true;
+    const dims = item.dimensions || {};
+    if (dims.replica_job_id || item.replica_job_id || item.replica_variant_of) return true;
+    const pk = String(item.project_key || '');
+    if (pk.includes('replica_') || pk.startsWith('replica')) return true;
+    const creativity = String(item.creativity || '');
+    if (creativity.includes('爆款') || creativity.includes('复刻') || creativity.includes('二创变体')) return true;
+    const title = String(item.title || '');
+    const theme = String(item.theme || '');
+    if (title.includes('爆款 1:1 复刻') || title.includes('二创变体') || theme.includes('爆款 1:1 复刻') || theme.includes('二创变体') || title.includes('· 爆款') || title.includes('· 二创')) return true;
+    return false;
+}
+
 async function clearTasks(statusGroup) {
     let countHint = "";
     if (typeof projectsRows !== 'undefined' && Array.isArray(projectsRows)) {
         if (statusGroup === "all") {
-            const n = projectsRows.length;
-            if (n > 0) countHint = `（共检测到约 ${n} 个项目）`;
+            const n = projectsRows.filter(p => !isReplicaProjectRow(p)).length;
+            if (n > 0) countHint = `（共检测到约 ${n} 个常规项目，爆款复刻项目将完整保留）`;
         } else if (statusGroup === "completed") {
-            const n = projectsRows.filter(p => (p.task || {}).status === 'completed' || p.state === 'completed').length;
+            const n = projectsRows.filter(p => !isReplicaProjectRow(p) && ((p.task || {}).status === 'completed' || p.state === 'completed')).length;
             if (n > 0) countHint = `（检测到约 ${n} 条）`;
         } else if (statusGroup === "failed_cancelled") {
-            const n = projectsRows.filter(p => ['failed', 'cancelled'].includes((p.task || {}).status) || p.state === 'failed' || p.has_failed_jobs).length;
+            const n = projectsRows.filter(p => !isReplicaProjectRow(p) && (['failed', 'cancelled'].includes((p.task || {}).status) || p.state === 'failed' || p.has_failed_jobs)).length;
             if (n > 0) countHint = `（检测到约 ${n} 条）`;
         } else if (statusGroup === "no_cover") {
-            const n = projectsRows.filter(p => !p.cover && !(p.assets && p.assets.cover)).length;
+            const n = projectsRows.filter(p => !isReplicaProjectRow(p) && !p.cover && !(p.assets && p.assets.cover)).length;
             if (n > 0) countHint = `（检测到约 ${n} 条）`;
         }
     }
 
     let msg = "";
     if (statusGroup === "all") {
-        msg = `⚠️ 确定要彻底清空所有项目及本地所有媒体文件吗${countHint}？\n（将清除所有点子库项目、任务记录，并彻底删除 outputs/ 目录下的所有已生成图片与成片视频，不可恢复）`;
+        msg = `⚠️ 确定要彻底清空所有常规项目及本地媒体文件吗${countHint}？\n（将清除所有常规点子库项目、常规任务记录，并删除 outputs/ 目录下的非复刻生成文件。爆款复刻项目与素材将被完整保留，不受影响）`;
     } else if (statusGroup === "completed") {
-        msg = `确定要清空所有【已完成】的任务记录吗${countHint}？（仅清理历史记录，不影响已收藏的创意与磁盘素材）`;
+        msg = `确定要清空所有【已完成】的常规任务记录吗${countHint}？（仅清理常规历史记录，不影响爆款复刻项目及已收藏的创意与磁盘素材）`;
     } else if (statusGroup === "failed_cancelled") {
-        msg = `确定要清空所有【已失败】和【已取消】的任务记录吗${countHint}？`;
+        msg = `确定要清空所有【已失败】和【已取消】的常规任务记录吗${countHint}？`;
     } else if (statusGroup === "no_cover") {
-        msg = `确定要清空所有【无封面】的项目吗${countHint}？（将同时清除无封面项目的生成任务记录与点子库收藏，包括已收藏但无封面的项目）`;
+        msg = `确定要清空所有【无封面】的常规项目吗${countHint}？（将清除无封面常规项目的生成任务记录与点子库收藏，爆款复刻项目不受影响）`;
     }
     
     const confirmed = await customConfirm(msg);
@@ -1607,20 +1640,28 @@ async function clearTasks(statusGroup) {
             const libCount = data.deleted_library_count || 0;
             let toastMsg = `清空成功，共删除 ${data.count} 项`;
             if (statusGroup === "all") {
-                toastMsg = `彻底清空成功，已清理 ${data.count} 项及全部本地媒体文件`;
+                toastMsg = `彻底清空成功，已清理 ${data.count} 项及全部常规本地媒体文件（爆款复刻项目已完整保留）`;
             } else if (libCount > 0) {
                 toastMsg = `清空成功，共删除 ${data.count} 项（含 ${libCount} 个已收藏创意）`;
             }
             showToast(toastMsg, "success");
 
             if (statusGroup === "all") {
-                if (typeof savedIdeas !== 'undefined') {
-                    savedIdeas = [];
+                if (typeof savedIdeas !== 'undefined' && Array.isArray(savedIdeas)) {
+                    if (Array.isArray(data.deleted_library_ids) && data.deleted_library_ids.length > 0) {
+                        const deletedSet = new Set(data.deleted_library_ids);
+                        savedIdeas = savedIdeas.filter(item => !deletedSet.has(item.id));
+                    } else {
+                        savedIdeas = savedIdeas.filter(isReplicaIdea);
+                    }
                     try {
                         localStorage.setItem('spark_library', JSON.stringify(savedIdeas));
                     } catch (e) {
                         console.warn('[library] localStorage 镜像写入失败', e);
                     }
+                }
+                if (typeof loadLibrary === 'function') {
+                    try { await loadLibrary(); } catch (e) {}
                 }
                 if (typeof updateFavoriteButtonState === 'function') {
                     updateFavoriteButtonState();
@@ -1632,12 +1673,18 @@ async function clearTasks(statusGroup) {
                     currentGenerationController = null;
                 }
                 generationState.status = 'idle';
-                const placeholderView = document.getElementById('output-placeholder-view');
-                const loadingView = document.getElementById('output-loading-view');
-                const contentView = document.getElementById('output-content-view');
-                if (loadingView) loadingView.classList.remove('active');
-                if (placeholderView) placeholderView.classList.add('active');
-                if (contentView) contentView.classList.remove('active');
+
+                // 如果当前打开的不是复刻项目，才重置为主页空白占位
+                const isCurrentReplica = currentIdea && isReplicaIdea(currentIdea);
+                if (!isCurrentReplica) {
+                    currentIdea = null;
+                    const placeholderView = document.getElementById('output-placeholder-view');
+                    const loadingView = document.getElementById('output-loading-view');
+                    const contentView = document.getElementById('output-content-view');
+                    if (loadingView) loadingView.classList.remove('active');
+                    if (placeholderView) placeholderView.classList.add('active');
+                    if (contentView) contentView.classList.remove('active');
+                }
                 updateActiveGenerationBanner();
                 const genBtn = document.getElementById('generate-btn');
                 if (genBtn) {
@@ -1680,12 +1727,16 @@ async function clearTasks(statusGroup) {
                                 currentGenerationController = null;
                             }
                             generationState.status = 'idle';
-                            const placeholderView = document.getElementById('output-placeholder-view');
-                            const loadingView = document.getElementById('output-loading-view');
-                            const contentView = document.getElementById('output-content-view');
-                            if (loadingView) loadingView.classList.remove('active');
-                            if (placeholderView) placeholderView.classList.add('active');
-                            if (contentView) contentView.classList.remove('active');
+                            const isCurrentReplica = currentIdea && isReplicaIdea(currentIdea);
+                            if (!isCurrentReplica) {
+                                currentIdea = null;
+                                const placeholderView = document.getElementById('output-placeholder-view');
+                                const loadingView = document.getElementById('output-loading-view');
+                                const contentView = document.getElementById('output-content-view');
+                                if (loadingView) loadingView.classList.remove('active');
+                                if (placeholderView) placeholderView.classList.add('active');
+                                if (contentView) contentView.classList.remove('active');
+                            }
                             updateActiveGenerationBanner();
                             const genBtn = document.getElementById('generate-btn');
                             if (genBtn) {

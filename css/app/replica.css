@@ -92,7 +92,17 @@ details[open] > .replica-jobs-summary {
 .replica-job-list {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 8px;
+}
+
+/* 只有分组区滚动，搜索框常驻在它上面。 */
+.replica-job-scroll {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 52vh;
+    overflow-y: auto;
+    padding-right: 2px;
 }
 
 .replica-job-list-header {
@@ -118,42 +128,146 @@ details[open] > .replica-jobs-summary {
 .replica-job-group {
     display: flex;
     flex-direction: column;
-    gap: 5px;
+    gap: 2px;
 }
 
+/* 分组标题贴顶。列表滚到中段时，「这一段是待处理还是已归档」不能靠往回滚才知道。 */
 .replica-job-group-title {
+    position: sticky;
+    top: 0;
+    z-index: 2;
     display: flex;
     align-items: center;
     gap: 6px;
     font-size: 11px;
     font-weight: 600;
-    color: rgba(255, 255, 255, 0.7);
-    padding: 2px 4px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.62);
+    padding: 5px 4px 4px;
     margin-bottom: 2px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+    background: rgba(16, 18, 24, 0.95);
+    backdrop-filter: blur(4px);
+    letter-spacing: 0.4px;
 }
 
+.replica-job-group-count {
+    padding: 0 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    font-variant-numeric: tabular-nums;
+}
+
+/* 一行 = 图标｜名字（可挤压、单行截断）｜状态（右对齐）｜操作（悬停才现身）。
+   此前所有 chip 与三枚操作按钮平铺在一条 flex 里：每行 chip 数量不同，名字的结束
+   位置与按钮的起始位置逐行漂移，一列扫不下去。现在名字一列、状态一列、操作一列，
+   行高压到 30px，二十条任务一屏之内看得完。 */
 .replica-job-row {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     width: 100%;
-    padding: 8px 10px;
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid rgba(255, 255, 255, 0.05);
-    border-radius: 8px;
+    min-height: 30px;
+    padding: 3px 8px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
     box-sizing: border-box;
 }
 
+.replica-job-row + .replica-job-row {
+    border-top: 1px solid rgba(255, 255, 255, 0.045);
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+}
+
 .replica-job-row:hover {
-    background: rgba(255, 255, 255, 0.07);
+    background: rgba(255, 255, 255, 0.055);
+    border-color: transparent;
 }
 
 .replica-job-row.active {
-    border-color: var(--neon-cyan, #6ee7ff);
+    border-color: rgba(110, 231, 255, 0.45);
     background: rgba(110, 231, 255, 0.08);
+}
+
+/* 待你处理的那几条在行首挂一道竖线：分组标题滚过去之后，它仍然认得出自己。 */
+.replica-job-row[data-att="waiting_you"] {
+    box-shadow: inset 2px 0 0 rgba(239, 68, 68, 0.75);
+}
+
+.replica-job-row[data-att="running"] {
+    box-shadow: inset 2px 0 0 var(--neon-cyan, #6ee7ff);
+}
+
+.replica-job-icon {
+    flex: none;
+    font-size: 12px;
+    opacity: 0.8;
+}
+
+.replica-job-lock {
+    margin-left: 5px;
+    font-size: 10px;
+    opacity: 0.75;
+}
+
+/* 状态列。右对齐、不换行、不参与挤压——它是扫这一列时的锚点。 */
+.replica-job-meta {
+    flex: 0 1 auto;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-left: auto;
+    min-width: 0;
+    white-space: nowrap;
+}
+
+.replica-job-stage {
+    font-size: 11px;
+    opacity: 0.6;
+    min-width: 4.5em;
+    text-align: right;
+}
+
+.replica-job-stage.is-done {
+    color: #4ade80;
+    opacity: 0.85;
+}
+
+.replica-job-beats {
+    font-size: 11px;
+    opacity: 0.45;
+    font-variant-numeric: tabular-nums;
+}
+
+/* 操作列。改名/归档/删除是低频且三选一的动作，常驻等于在每一行里重复三遍噪声。
+   悬停、键盘聚焦、以及当前打开的那一条才现身；宽度用 visibility 占住，
+   现身时行内其它东西不会跳。 */
+.replica-job-ops {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.12s ease;
+}
+
+.replica-job-row:hover .replica-job-ops,
+.replica-job-row:focus-within .replica-job-ops,
+.replica-job-row.active .replica-job-ops {
+    opacity: 1;
+    visibility: visible;
+}
+
+.replica-mini-btn-danger:hover {
+    border-color: rgba(239, 68, 68, 0.6);
+    color: #f87171;
+}
+
+/* 指针设备之外（触屏）没有悬停这一说，直接常驻。 */
+@media (hover: none) {
+    .replica-job-ops { opacity: 1; visibility: visible; }
 }
 
 .replica-job-variant-row {
@@ -164,6 +278,8 @@ details[open] > .replica-jobs-summary {
 }
 
 .replica-job-variant-toggle {
+    flex: none;
+    white-space: nowrap;
     cursor: pointer;
     font-size: 11px;
     padding: 2px 6px;
@@ -192,7 +308,7 @@ details[open] > .replica-jobs-summary {
 .replica-job-open {
     display: flex;
     align-items: center;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     gap: 8px;
     flex: 1 1 auto;
     min-width: 0;
@@ -207,10 +323,11 @@ details[open] > .replica-jobs-summary {
 
 .replica-job-name {
     flex: 1 1 auto;
-    min-width: 0;
+    min-width: 3em;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    font-size: 12.5px;
 }
 
 .replica-chip {
@@ -376,6 +493,40 @@ details[open] > .replica-jobs-summary {
 .replica-reextract .replica-hint {
     flex: 1 1 100%;
     margin: 0;
+}
+
+/* 反推通道（极速直读 / 标准深度）：和反推模型同一块视觉分组。 */
+.replica-channel-picker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    margin-bottom: 4px;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+}
+
+.replica-channel-picker .replica-radio,
+.replica-channel-picker .replica-hint {
+    flex: 1 1 100%;
+    margin: 0;
+}
+
+.replica-scope-choices {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* 当前通道下不生效的控件：留在原地（要让人看见有这么一档），但明确画成不算数。 */
+.replica-inactive {
+    opacity: 0.42;
+}
+
+.replica-inactive .replica-radio,
+.replica-inactive.replica-inline-field {
+    cursor: not-allowed;
 }
 
 .replica-model-picker {
@@ -1592,7 +1743,7 @@ details[open] > .replica-jobs-summary {
     display: flex;
     align-items: stretch;
     gap: 2px;
-    height: 26px;
+    height: 34px;
     padding: 3px;
     background: rgba(0, 0, 0, 0.35);
     border-radius: 6px;
@@ -1603,11 +1754,130 @@ details[open] > .replica-jobs-summary {
 .replica-ladder-seg {
     flex: 0 0 auto;
     min-width: 8px;
-    padding: 0;
+    padding: 0 2px;
     border: 1px solid transparent;
     border-radius: 3px;
     cursor: pointer;
+    overflow: hidden;
     transition: filter 0.15s ease, outline-color 0.15s ease;
+}
+
+/* 够宽的块把拍号写在自己身上。窄块不给标签（写不下的字比不写更糟），
+   所以这里只管排版，给不给由渲染侧按宽度判。 */
+.replica-ladder-seg-label {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    width: 100%;
+    font-size: 10px;
+    line-height: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    color: rgba(255, 255, 255, 0.92);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+    pointer-events: none;
+}
+
+.replica-ladder-seg-label b {
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.replica-ladder-seg-label i {
+    font-style: normal;
+    opacity: 0.65;
+    font-variant-numeric: tabular-nums;
+}
+
+/* 时间刻度。比例条按时长画宽度，这一条回答「这里是第几秒」。 */
+.replica-ladder-ruler {
+    position: relative;
+    height: 14px;
+    margin: 3px 3px 0;
+    font-size: 9.5px;
+    color: rgba(255, 255, 255, 0.45);
+    font-variant-numeric: tabular-nums;
+}
+
+.replica-ladder-tick {
+    position: absolute;
+    top: 0;
+    transform: translateX(-50%);
+    padding-top: 4px;
+    border-left: 1px solid rgba(255, 255, 255, 0.16);
+    padding-left: 3px;
+    white-space: nowrap;
+}
+
+.replica-ladder-tick:first-child {
+    transform: none;
+}
+
+.replica-ladder-tick.is-end {
+    transform: translateX(-100%);
+    border-left: none;
+}
+
+/* 图例。只列这一条阶梯上真出现过的画法。 */
+.replica-ladder-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    margin-top: 6px;
+    font-size: 10.5px;
+    color: rgba(255, 255, 255, 0.55);
+}
+
+.replica-ladder-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.replica-ladder-legend-item i {
+    width: 14px;
+    height: 10px;
+    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.14);
+}
+
+.replica-ladder-legend-item i.lg-toolong {
+    background-image: repeating-linear-gradient(45deg,
+        transparent 0 3px, rgba(255, 255, 255, 0.45) 3px 6px);
+}
+
+.replica-ladder-legend-item i.lg-tooshort {
+    border: 1px solid rgba(255, 190, 90, 0.85);
+}
+
+.replica-ladder-legend-item i.lg-crossed {
+    border-left: 2px solid var(--neon-cyan, #6ee7ff);
+}
+
+.replica-ladder-legend-item i.lg-error {
+    box-shadow: inset 0 -3px 0 rgba(255, 90, 90, 0.95);
+}
+
+.replica-ladder-legend-item i.lg-warn {
+    box-shadow: inset 0 -3px 0 rgba(255, 190, 90, 0.95);
+}
+
+/* 拍号索引默认收起：条上够宽的块已经自己写着拍号，这一排降级成兜底索引。 */
+.replica-ladder-chips-fold {
+    margin-top: 8px;
+}
+
+.replica-ladder-chips-fold > summary {
+    font-size: 11px;
+    opacity: 0.6;
+    cursor: pointer;
+    list-style-position: inside;
+    user-select: none;
+}
+
+.replica-ladder-chips-fold > summary:hover {
+    opacity: 0.9;
 }
 
 .replica-ladder-seg:hover {
@@ -1650,7 +1920,7 @@ details[open] > .replica-jobs-summary {
     display: flex;
     flex-wrap: wrap;
     gap: 4px;
-    margin-top: 8px;
+    margin-top: 6px;
 }
 
 .replica-beat-jump-chip {
@@ -2731,8 +3001,43 @@ details[open] > .replica-jobs-summary {
     margin-top: 6px;
 }
 
-.replica-collage-folded {
+/* 拼贴图折叠块。默认收起成一行，展开才铺开近 300px 高的整图。 */
+.replica-collage-fold {
     margin-top: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.18);
+    overflow: hidden;
+}
+
+.replica-collage-summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    list-style-position: inside;
+    user-select: none;
+}
+
+.replica-collage-summary:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.replica-collage-summary-label {
+    font-weight: 600;
+}
+
+.replica-collage-summary-hint {
+    font-size: 11px;
+    opacity: 0.55;
+}
+
+.replica-collage-fold > .replica-collage {
+    border: none;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 0;
 }
 
 /* ── 页头任务切换条 ───────────────────────────────────────────── */

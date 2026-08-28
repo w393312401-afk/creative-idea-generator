@@ -16,6 +16,20 @@ from prompt_pipeline.fast_composer import (
 )
 
 
+# 标准链路那两条用例里 compose_remaining_beats 的返回值：run_compose 只对它做
+# _prompt_block_only + 槽位摘要补全，内容本身不重要，能被解析出槽位就够。
+COMPOSED_DOC = """===PROMPTS===
+IMAGE 1 (毛坯):
+A container.
+
+VIDEO 1 (切割):
+A worker cuts.
+
+IMAGE 2 (完成):
+A window.
+"""
+
+
 class TestFastComposer(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -152,6 +166,61 @@ A 9:16 wide shot of the container with a clean framed window opening.
             c_data = json.load(f)
             self.assertEqual(c_data['total_beats'], 1)
             self.assertEqual(len(c_data['compiled_images']), 2)
+        # 走了哪条通道要留痕：两条通道的 packet 完全不是一回事（极速那条是写死的常量），
+        # 而 prompt_block 上看不出区别——渲染出来空间漂移时靠这一笔才查得到源头。
+        self.assertEqual(out.get('compose_mode'), 'fast')
+        self.assertIsNone(out.get('compose_fallback'))
+
+    def test_run_compose_honours_deep_mode_from_config(self):
+        """config.composeMode='deep' 必须真的走标准 Phase 1+2，一次都不碰极速通道。
+
+        前端「合成通道」这个单选框的全部价值就在这一条上：选了标准却仍旧直通，
+        用户拿到的还是那份写死的空间锁定包、锚点也没跟原片首帧对过。
+        """
+        state = rp.ingest_video(b'video-bytes', 'test_clip.mp4')
+        state['beats'] = {
+            'carrier': '集装箱',
+            'destiny_zh': '设计师工作室',
+            'beats': [
+                {'visible_action': '切割钢板', 'visible_result': '开出窗洞', 'operation': 'framing'},
+            ],
+            'banned_elements': [],
+        }
+        state['validation'] = []
+        rp._save_state(state)
+
+        composed = COMPOSED_DOC
+        with patch('prompt_pipeline.fast_composer.compose_replica_one_pass') as fast,              patch('prompt_pipeline.compose_anchor_and_packet',
+                   return_value={'title': 'T', 'image_1_prompt': 'A container.',
+                                 'compiled_images': {}, 'packet': None}),              patch('prompt_pipeline.compose_remaining_beats', return_value=composed),              patch('server_common.write_library_item'):
+            out = rp.run_compose(state, {'composeMode': 'deep'})
+
+        fast.assert_not_called()
+        self.assertEqual(out.get('compose_mode'), 'deep')
+
+    def test_run_compose_records_the_silent_fallback_to_deep(self):
+        """极速合成炸了会静默降级到标准链路——降级没问题，不留痕才有问题。"""
+        state = rp.ingest_video(b'video-bytes', 'test_clip.mp4')
+        state['beats'] = {
+            'carrier': '集装箱',
+            'destiny_zh': '设计师工作室',
+            'beats': [
+                {'visible_action': '切割钢板', 'visible_result': '开出窗洞', 'operation': 'framing'},
+            ],
+            'banned_elements': [],
+        }
+        state['validation'] = []
+        rp._save_state(state)
+
+        composed = COMPOSED_DOC
+        with patch('prompt_pipeline.fast_composer.compose_replica_one_pass',
+                   side_effect=ValueError('单轮直出解析失败')),              patch('prompt_pipeline.compose_anchor_and_packet',
+                   return_value={'title': 'T', 'image_1_prompt': 'A container.',
+                                 'compiled_images': {}, 'packet': None}),              patch('prompt_pipeline.compose_remaining_beats', return_value=composed),              patch('server_common.write_library_item'):
+            out = rp.run_compose(state, {})
+
+        self.assertEqual(out.get('compose_mode'), 'deep')
+        self.assertIn('单轮直出解析失败', out.get('compose_fallback') or '')
 
     def test_save_prompt_in_place_fixes_audit_failed(self):
         state = rp.ingest_video(b'video-bytes', 'test_clip.mp4')

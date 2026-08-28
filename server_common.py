@@ -1974,6 +1974,12 @@ _PASSTHROUGH_CLIENT_KEYS = (
     # 托管模式下用户选了哪个模型会被整个丢掉，页面上却照常显示已切换——和
     # skillProfile / qaGateLevel 当年是同一个静默失效的口子。
     'frameFactsModel', 'peakVerifyModel', 'reviewModel',
+    # 反推通道（前端「反推通道」单选：'fast' 极速直读 / 'deep' 标准 Pass A+B）。
+    # deepReverse 是它的老写法，两个都放行，run_reverse 按 or 取。
+    'reverseMode', 'deepReverse',
+    # 合成通道（前端「合成通道」单选：'fast' 极速直通 / 'deep' 标准 Phase 1+2），
+    # deepCompose 同为老写法。run_compose 按 or 取。
+    'composeMode', 'deepCompose',
     'reviewConcurrency', 'candidateConcurrency',
     'candidateSelectionMode', 'candidateSelection', 'generation_mode', 'candidate_selection',
 ) + _GATE_KEYS
@@ -2539,20 +2545,26 @@ def delete_idea_output_files(title, covers=None):
 
     新布局下封面就在项目目录里，第一步的 rmtree 已经把它带走；covers 参数只对
     迁移前留在全局封面池里的历史封面还有用（清不掉的 URL 会被静默跳过）。
+    【安全防呆】：严禁删除 OUTPUT_ROOT 根目录或 outputs/replica_jobs 及其子目录。
     """
     deleted = {"project_dir": None, "covers": []}
+
+    output_root_abs = os.path.abspath(OUTPUT_ROOT)
+    replica_jobs_abs = os.path.abspath(os.path.join(output_root_abs, 'replica_jobs'))
 
     if title:
         try:
             project_dir = _get_project_dir(title)
             if project_dir and os.path.isdir(project_dir):
-                shutil.rmtree(project_dir, ignore_errors=True)
-                deleted["project_dir"] = project_dir
+                norm_pdir = os.path.abspath(project_dir)
+                # 严禁删除 outputs 根目录或 replica_jobs 目录
+                if norm_pdir != output_root_abs and norm_pdir != replica_jobs_abs and not replica_jobs_abs.startswith(norm_pdir + os.sep):
+                    shutil.rmtree(project_dir, ignore_errors=True)
+                    deleted["project_dir"] = project_dir
         except Exception as e:
             if sys.stdout:
                 print(f"[DELETE] Failed to remove project dir for '{title}': {e}")
 
-    output_root_abs = os.path.abspath(OUTPUT_ROOT)
     for cover_url in (covers or []):
         if not isinstance(cover_url, str):
             continue
@@ -2563,6 +2575,9 @@ def delete_idea_output_files(title, covers=None):
             continue
         cover_path = os.path.abspath(rel)
         if not (cover_path == output_root_abs or cover_path.startswith(output_root_abs + os.sep)):
+            continue
+        # 保护 replica_jobs 下的封面/拼图
+        if cover_path == replica_jobs_abs or cover_path.startswith(replica_jobs_abs + os.sep):
             continue
         try:
             if os.path.isfile(cover_path):
@@ -5480,11 +5495,12 @@ def library_item_has_cover(item, base_dir=None):
     return False
 
 
-def _is_replica_task(task):
+def is_replica_task(task):
     """判断是否为爆款复刻模块的任务。
 
     复刻模块的所有流水线任务（视频抽帧/Pass A/Pass B/节拍阶梯/提示词合成/正交变体等）
     仅在其专属的爆款复刻工作台中流转与管理，不作为激发任务或子作业出现在「项目」工作台（/api/projects）中。
+    在清空任务（/api/tasks/clear）等清理动作中也受到永久保护。
     """
     if not isinstance(task, dict):
         return False
@@ -5492,11 +5508,82 @@ def _is_replica_task(task):
     task_type = str(dims.get('type') or '').strip()
     if task_type in REPLICA_TASK_TYPES or task_type.startswith('replica'):
         return True
-    if dims.get('replica_job_id'):
+    if dims.get('replica_job_id') or dims.get('replica_variant_of'):
+        return True
+    if str(dims.get('source') or '').strip() == 'replica':
         return True
     task_id = str(task.get('id') or '').strip()
     if task_id.startswith('replica'):
         return True
+    result = task.get('result') if isinstance(task.get('result'), dict) else {}
+    if str(result.get('source') or '').strip() == 'replica' or result.get('replica_job_id') or result.get('replica_variant_of'):
+        return True
+    pk = str(dims.get('project_key') or result.get('project_key') or '').strip()
+    if 'replica_' in pk or pk.startswith('replica'):
+        return True
+    title = str(result.get('title') or dims.get('task_label') or dims.get('theme') or '').strip()
+    if '爆款 1:1 复刻' in title or '二创变体' in title or '· 爆款' in title or '· 二创' in title:
+        return True
+    return False
+
+
+_is_replica_task = is_replica_task
+
+
+def is_replica_library_item(item):
+    """判断一条点子库条目是否源自「爆款复刻」工作台。
+
+    复刻产出入库时具有 source='replica'、id=job_id（以 replica_ 开头）、
+    replica_job_id、creativity='爆款 1:1 复刻' 或 '二创变体' 等特征。
+    在执行各类项目或任务清空时必须 100% 豁免并保留。
+    """
+    if not isinstance(item, dict):
+        return False
+    item_id = str(item.get('id') or '').strip()
+    if item_id.startswith('replica'):
+        return True
+    if str(item.get('source') or '').strip() == 'replica':
+        return True
+    if item.get('replica_job_id') or item.get('replica_variant_of'):
+        return True
+    project_key = str(item.get('project_key') or '').strip()
+    if 'replica_' in project_key or project_key.startswith('replica'):
+        return True
+    creativity = str(item.get('creativity') or '').strip()
+    if '爆款' in creativity or '复刻' in creativity or '二创变体' in creativity:
+        return True
+    title = str(item.get('title') or '').strip()
+    theme = str(item.get('theme') or '').strip()
+    if '爆款 1:1 复刻' in title or '二创变体' in title or '爆款 1:1 复刻' in theme or '二创变体' in theme or '· 爆款' in title or '· 二创' in title:
+        return True
+    return False
+
+
+def is_replica_protected_path(path_or_name, base_dir=None):
+    """判断 outputs/ 下的某个路径或目录名是否属于爆款复刻受保护资产。
+
+    受到绝对保护的路径包括：
+    1. outputs/replica_jobs 目录及其所有子路径；
+    2. 目录名以 replica_ 或 run_replica_ 开头的目录；
+    3. 任何以 replica 开头的工程资产路径。
+    """
+    if not path_or_name:
+        return False
+    base_dir = base_dir or os.path.dirname(os.path.abspath(__file__))
+    out_root = os.path.abspath(OUTPUT_ROOT if os.path.isabs(OUTPUT_ROOT) else os.path.join(base_dir, OUTPUT_ROOT))
+    replica_jobs_abs = os.path.abspath(os.path.join(out_root, 'replica_jobs'))
+
+    clean_str = str(path_or_name).strip()
+    base_name = os.path.basename(clean_str.rstrip('\\/'))
+    if base_name in ('replica_jobs', '.gitkeep'):
+        return True
+    if base_name.startswith('replica_') or base_name.startswith('run_replica_') or 'replica' in base_name.lower():
+        return True
+
+    target_abs = os.path.abspath(clean_str if os.path.isabs(clean_str) else os.path.join(out_root, clean_str))
+    if target_abs == replica_jobs_abs or target_abs.startswith(replica_jobs_abs + os.sep):
+        return True
+
     return False
 
 
