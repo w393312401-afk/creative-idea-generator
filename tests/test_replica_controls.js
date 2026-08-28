@@ -84,6 +84,77 @@ assert.equal(JSON.parse(call(`localStorage.getItem('spark_config')`)).frameFacts
              'gemini-3.1-pro-high');
 assert.equal(call(`replicaConfigValue('peakVerifyModel', 'fallback')`), 'fallback');
 
+// ── 3b. 反推通道（极速直读 / 标准深度）─────────────────────────────────────────
+// 后端两条链路一直都在（run_reverse 按 reverseMode 分流），失败方式和上面几个旋钮
+// 一样：选了但没生效。这里盯三件事——默认必须是极速（换默认等于给每一单静默涨价）、
+// 老键 deepReverse 认得出来、写回时新老键一起写（只写新键的话残留的 deepReverse=true
+// 会把「极速」这一项永远锁死）。
+call(`config = {}`);
+assert.equal(call('replicaReverseChannel()'), 'fast', '默认必须是极速直读');
+call(`config = { reverseMode: 'deep' }`);
+assert.equal(call('replicaReverseChannel()'), 'deep');
+call(`config = { deepReverse: true }`);
+assert.equal(call('replicaReverseChannel()'), 'deep', '老键 deepReverse 也要认');
+call(`config = { reverseMode: 'fast' }`);
+assert.equal(call('replicaReverseChannel()'), 'fast');
+
+// 写回：模拟卡点上选中「标准深度」，再选回「极速」。
+const fakeRoot = (channelValue) => ({
+    querySelector(sel) {
+        if (sel === 'input[name="replica-reverse-channel"]:checked') return { value: channelValue };
+        return null;   // 模型下拉在这一节不参与
+    },
+});
+call(`config = {}`);
+const realReplicaRoot = sandbox.replicaRoot;
+sandbox.replicaRoot = () => fakeRoot('deep');
+call('replicaCaptureReverseSettings()');
+assert.equal(call('config.reverseMode'), 'deep');
+assert.equal(call('config.deepReverse'), true);
+sandbox.replicaRoot = () => fakeRoot('fast');
+call('replicaCaptureReverseSettings()');
+assert.equal(call('config.reverseMode'), 'fast');
+assert.equal(call('config.deepReverse'), false, '选回极速必须把老键一并清掉');
+assert.equal(JSON.parse(call(`localStorage.getItem('spark_config')`)).reverseMode, 'fast');
+sandbox.replicaRoot = realReplicaRoot;   // 后面几节还要用真的那个
+
+// ── 3c. 合成通道（极速直通 / 标准合成）─────────────────────────────────────────
+// 与反推通道同形，但失败更隐蔽：两条通道产出的提示词包长得一样，只有空间锁定包不同。
+call(`config = {}`);
+assert.equal(call('replicaComposeChannel()'), 'fast', '默认必须是极速直通');
+assert.equal(call('replicaComposeChannelLabel()'), '极速直通');
+call(`config = { composeMode: 'deep' }`);
+assert.equal(call('replicaComposeChannel()'), 'deep');
+assert.equal(call('replicaComposeChannelLabel()'), '标准合成');
+call(`config = { deepCompose: true }`);
+assert.equal(call('replicaComposeChannel()'), 'deep', '老键 deepCompose 也要认');
+
+const fakeComposeRoot = (v) => ({
+    querySelector(sel) {
+        return sel === 'input[name="replica-compose-channel"]:checked' ? { value: v } : null;
+    },
+});
+call(`config = {}`);
+const realRoot2 = sandbox.replicaRoot;
+sandbox.replicaRoot = () => fakeComposeRoot('deep');
+call('replicaCaptureComposeChannel()');
+assert.equal(call('config.composeMode'), 'deep');
+assert.equal(call('config.deepCompose'), true);
+sandbox.replicaRoot = () => fakeComposeRoot('fast');
+call('replicaCaptureComposeChannel()');
+assert.equal(call('config.composeMode'), 'fast');
+assert.equal(call('config.deepCompose'), false, '选回极速必须把老键一并清掉');
+sandbox.replicaRoot = realRoot2;
+
+// 吸底栏那颗 CTA 必须写明这一按走哪条通道：通道选择块在节拍卡片底部，可能离它很远，
+// 而两条通道的差别（3~5 分钟 vs 30 秒、贴不贴原片）恰恰是按下去之前要知道的。
+call(`config = { composeMode: 'deep' }`);
+const barDeep = call(`replicaRenderBottomBar({ stage: 'review_beats', beats: { beats: [{ id: 'B01' }] }, validation: [] })`);
+assert.ok(barDeep.includes('合成提示词（标准合成）'), '吸底 CTA 要带通道名');
+call(`config = { composeMode: 'fast' }`);
+const barFast = call(`replicaRenderBottomBar({ stage: 'review_beats', beats: { beats: [{ id: 'B01' }] }, validation: [] })`);
+assert.ok(barFast.includes('合成提示词（极速直通）'));
+
 // ── 4. 节拍阶梯硬伤时的 AI 修复按钮渲染 ──────────────────────────────────────
 const sampleStateWithErrors = {
     beats: {

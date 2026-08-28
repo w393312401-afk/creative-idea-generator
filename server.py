@@ -5053,6 +5053,9 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                 to_delete = []
                 with ACTIVE_TASKS_LOCK:
                     for tid, t in ACTIVE_TASKS.items():
+                        # 永久豁免所有爆款复刻任务
+                        if is_replica_task(t):
+                            continue
                         if status_group == "all":
                             to_delete.append(tid)
                         elif status_group == "completed" and t.get("status") == "completed":
@@ -5070,10 +5073,13 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     delete_task_files(tid)
 
                 deleted_library_ids = []
-                # 清空全部：同步清空点子库所有条目并彻底删除 outputs/ 目录下的所有本地媒体文件
+                # 清空全部：同步清空常规点子库条目并彻底删除 outputs/ 目录下的所有常规本地媒体文件（保留爆款复刻项目与资产）
                 if status_group == "all":
                     for item in library_items:
                         if isinstance(item, dict):
+                            # 永久豁免所有爆款复刻创意条目
+                            if is_replica_library_item(item):
+                                continue
                             item_id = item.get('id')
                             if item_id not in (None, ''):
                                 title = item.get('project_key') or item.get('title')
@@ -5087,15 +5093,20 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                                 removed = delete_library_item(item_id)
                                 if removed:
                                     deleted_library_ids.append(item_id)
-                    # 彻底清理 outputs/ 目录下的所有残留项目文件夹与媒体文件
+                    # 彻底清理 outputs/ 目录下的常规残留项目文件夹与媒体文件，严禁删除 replica_jobs 及复刻项目资产
                     try:
                         outputs_dir = os.path.abspath(server_common.OUTPUT_ROOT if os.path.isabs(server_common.OUTPUT_ROOT) else os.path.join(base_dir, server_common.OUTPUT_ROOT))
                         if os.path.isdir(outputs_dir):
                             for entry in os.listdir(outputs_dir):
+                                if entry == '.gitkeep':
+                                    continue
                                 ep = os.path.join(outputs_dir, entry)
+                                ep_abs = os.path.abspath(ep)
+                                if is_replica_protected_path(ep_abs, base_dir=base_dir):
+                                    continue
                                 if os.path.isdir(ep):
                                     shutil.rmtree(ep, ignore_errors=True)
-                                elif os.path.isfile(ep) and entry != '.gitkeep':
+                                elif os.path.isfile(ep):
                                     try:
                                         os.remove(ep)
                                     except Exception:
@@ -5103,10 +5114,13 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
                     except Exception as e:
                         if sys.stdout:
                             print(f"[CLEAR] outputs 目录扫尾清理失败: {e}")
-                # 清空无封面：同步清空点子库中所有已收藏但无封面的条目
+                # 清空无封面：同步清空常规点子库中所有已收藏但无封面的条目（保留复刻）
                 elif status_group == "no_cover":
                     for item in library_items:
                         if isinstance(item, dict) and not library_item_has_cover(item, base_dir=base_dir):
+                            # 永久豁免所有爆款复刻创意条目
+                            if is_replica_library_item(item):
+                                continue
                             item_id = item.get('id')
                             if item_id not in (None, ''):
                                 title = item.get('project_key') or item.get('title')

@@ -121,28 +121,30 @@ Adhere strictly to the following non-negotiable master rules:
 - Every beat i represents the physical transformation from IMAGE i to IMAGE i+1 executed in unbroken time-lapse by VIDEO i.
 - Exactly N beats -> Exactly N VIDEO prompts and N+1 IMAGE prompts. No missing slots, no extra slots.
 
-2. [9:16 Vertical Composition & Camera Normalization]
+2. [9:16 Vertical Composition & Asymmetric 3-Zone Spatial Registration]
 - Aspect ratio: 9:16 vertical (1080x1920).
 - Lens: 24mm wide-angle equivalent feel (natural perspective without extreme fisheye distortion), 1.3m chest-level eye height, horizon line at 45%-50%.
+- Respect observed 3-zone spatial layout (Grid A1-C1 Left Zone vs Grid A2-C2 Center Zone vs Grid A3-C3 Right Zone). If the reference scene is a 3/4 oblique or off-center perspective (e.g., solid wall on left, portal opening on right), preserve this exact asymmetric perspective and NEVER collapse it into a centered symmetrical tunnel.
 
 3. [ASMR Audio Mixing (60% Volume, Zero BGM)]
 - In EVERY VIDEO prompt, explicitly specify physical ASMR sound effects: tool impacts, sawing, scraping, power drills, welding sparks, high-pressure water sprays, or timber placement at 60% volume (`videoVolume: 0.6`).
 - Do NOT add background music (BGM is 0%).
 
-4. [Human Scale & Proportion Lock]
+4. [Human Scale, Clean Frame Anchor & Structural Balance]
 - In VIDEO prompts with workers, describe a lone male worker (1.78m tall, occupying ~35% of vertical frame height, realistically proportioned to the ~2.2m ceiling clearance).
 - Worker gear: Describe neutral, authentic utility attire (e.g., durable work shirt and rugged pants). STRICTLY AVOID describing any banned items (e.g., hard hats, safety helmets, or vests if prohibited).
 - Direct-at-zero action: workers are already positioned at the active work zone at t=0s.
 - Clean image frame boundary: all IMAGE anchors are pristine still frames with ZERO active workers and NO handheld tools in mid-air.
+- Structural Balance Compensation in IMAGE 1: When removing active workers from IMAGE 1, explicitly describe the stationary structural massing, rock ledges, ground platforms, or pillars in that zone to preserve authentic visual weight and prevent image models from sliding portals to the center.
 
 5. [Full-Field Delta Conservation (4-Zone Spatial Scanning)]
 - Scan all 4 physical zones: Top (Overhead/Ceiling), Middle (Walls/Facade), Bottom (Floor/Approach), Peripherals (Debris containers/Spoil piles).
 - 100% Action-Tool Triad: Any visible delta between IMAGE i and IMAGE i+1 MUST be physically performed by the worker using specific tools in VIDEO i. Zero phantom transformations.
 
-6. [DLSP 5-Layer Depth Staging & Perspective Lock]
+6. [DLSP 5-Layer Depth Staging & Asymmetry Lock]
 - Layer 1 Foreground (<1m): Entry rim, threshold, or nearest foreground structural landmark.
 - Layer 2 Midground (1-4m): Main expansive staging floor, active work face.
-- Layer 3 Longitudinal Walls: Distinct left and right wall boundaries.
+- Layer 3 Longitudinal Walls: Distinct left and right wall boundaries (e.g., solid left rock wall vs right portal opening). Forbid forced one-point center vanishing axes in asymmetric environments.
 - Layer 4 Far Background (>4m): Room rear wall closure, strict metric envelope (~2.2m ceiling clearance).
 
 7. [Matte Surface Texture & Zero Wet Glossy Reflections]
@@ -154,8 +156,8 @@ Adhere strictly to the following non-negotiable master rules:
   * Shot A (Exterior mechanical opening): Push-in to opening hatch/door with mechanical unlocking action; zero work contamination.
   * Shot B (Interior arrival & staging): Worker enters down ladder/steps, stages tools, and delivers the first interior physical milestone.
 
-9. [Negative Restraints & Anti-Cavernous Hall]
-- All prompts must strictly enforce: (cavernous hall, oversized room, giant space, miniature furniture, dollhouse scale, wet floor, high glossy mirror reflection, telephoto distortion:1.4).{banned_str}{const_str}
+9. [Negative Restraints & Anti-Centering Defenses]
+- All prompts must strictly enforce: (centered composition, symmetrical framing, central hole, circular portal, telescope vignette, tunnel vision, bowling alley effect, one-point perspective, cavernous hall, oversized room, giant space, miniature furniture, dollhouse scale, wet floor, high glossy mirror reflection, telephoto distortion:1.6).{banned_str}{const_str}
 
 10. [CRITICAL LANGUAGE SPECIFICATION - 100% ENGLISH PROMPT BODIES]
 - ALL IMAGE PROMPTS (IMAGE 1..N+1) AND ALL VIDEO PROMPTS (VIDEO 1..N) MUST BE WRITTEN IN 100% DESCRIPTIVE, PHOTOREALISTIC ENGLISH.
@@ -286,7 +288,7 @@ def synthesize_drift_lock_packet(theme, beats_list, carrier="structure"):
         "camera_dna": {
             "lens": "24mm wide-angle equivalent",
             "height": "1.3m chest-level",
-            "attitude": "camera pitch locked level, central vanishing axis centered",
+            "attitude": "camera pitch locked level, perspective locked to observed scene axis",
             "aspect_ratio": "9:16 vertical"
         },
         "geometry_lock": {
@@ -466,6 +468,43 @@ def compose_replica_one_pass(config, state, on_progress=None):
     if not image_1_prompt and parsed_images:
         first_k = sorted(parsed_images.keys())[0]
         image_1_prompt = compiled_images.get(first_k, '')
+
+    # 锚点图如果能找到原片真实首帧，自动走 ground_anchor_on_reference 进行像素级空间与材质校正
+    reference = None
+    if not reverse.is_variant_doc(beats_doc):
+        overview = state.get('overview') or state.get('video_overview') or {}
+        if not overview and state.get('job_dir'):
+            ov_path = os.path.join(state['job_dir'], 'video_overview.json')
+            if os.path.exists(ov_path):
+                try:
+                    with open(ov_path, 'r', encoding='utf-8') as f:
+                        overview = json.load(f)
+                except Exception:
+                    pass
+        reference = reverse.anchor_reference_frame(beats_doc, overview)
+        if not reference and state.get('job_dir'):
+            for sdir_name in ('review_frames', 'storyboard'):
+                sdir = os.path.join(state['job_dir'], sdir_name)
+                if os.path.isdir(sdir):
+                    cands = sorted([os.path.join(sdir, fn) for fn in os.listdir(sdir) if fn.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))])
+                    if cands:
+                        reference = cands[0]
+                        break
+
+    if reference and image_1_prompt:
+        try:
+            image_1_prompt = reverse.ground_anchor_on_reference(config, image_1_prompt, reference, on_progress=on_progress)
+            compiled_images[1] = image_1_prompt
+            if 1 in parsed_images:
+                if isinstance(parsed_images[1], dict):
+                    parsed_images[1]['body'] = image_1_prompt
+                else:
+                    parsed_images[1] = image_1_prompt
+                prompt_block_raw = pp._format_prompt_block(parsed_images, parsed_videos)
+                prompt_block = _ensure_prompt_block_summaries(prompt_block_raw, beats_doc)
+        except Exception as exc:
+            if sys.stdout:
+                print(f"[FAST_COMPOSER] 首帧参考图空间对齐软退: {exc}")
 
     beat_ladder = beats_to_ladder_payload(beats_list)
     packet = synthesize_drift_lock_packet(resolved_theme, beats_list, carrier=carrier)
