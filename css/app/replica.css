@@ -3175,3 +3175,192 @@ textarea.is-run-locked {
 @media (prefers-reduced-motion: reduce) {
     .replica-job-live-dot { animation: none; }
 }
+
+/* ── 重构判断矩阵 (Decision Framework) 样式 ──────── */
+
+.replica-decision-matrix-card {
+    margin: 12px 0 16px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    background: linear-gradient(180deg, rgba(30, 41, 59, 0.6) 0%, rgba(15, 23, 42, 0.7) 100%);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    transition: all 0.25s ease;
+}
+
+.replica-decision-matrix-card.is-safe {
+    border-color: rgba(34, 197, 94, 0.35);
+    background: linear-gradient(180deg, rgba(34, 197, 94, 0.08) 0%, rgba(15, 23, 42, 0.75) 100%);
+}
+
+.replica-decision-matrix-card.is-risky {
+    border-color: rgba(245, 158, 11, 0.45);
+    background: linear-gradient(180deg, rgba(245, 158, 11, 0.08) 0%, rgba(15, 23, 42, 0.75) 100%);
+}
+
+.replica-decision-matrix-card.is-incompatible {
+    border-color: rgba(239, 68, 68, 0.55);
+    background: linear-gradient(180deg, rgba(239, 68, 68, 0.1) 0%, rgba(15, 23, 42, 0.85) 100%);
+}
+
+.replica-decision-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+
+.replica-decision-title-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.replica-decision-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.replica-decision-badge.is-safe {
+    background: rgba(34, 197, 94, 0.15);
+    color: #4ade80;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.replica-decision-badge.is-risky {
+    background: rgba(245, 158, 11, 0.15);
+    color: #fbbf24;
+    border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.replica-decision-badge.is-incompatible {
+    background: rgba(239, 68, 68, 0.18);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.45);
+}
+
+.replica-decision-summary {
+    font-size: 12px;
+    line-height: 1.5;
+    margin-bottom: 10px;
+    color: rgba(255, 255, 255, 0.85);
+}
+
+.replica-decision-dims-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 8px;
+    margin-bottom: 10px;
+}
+
+.replica-decision-dim-item {
+    padding: 8px 10px;
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    font-size: 11.5px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.replica-decision-dim-item.status-pass {
+    border-left: 3px solid #22c55e;
+}
+
+.replica-decision-dim-item.status-warning {
+    border-left: 3px solid #f59e0b;
+    background: rgba(245, 158, 11, 0.04);
+}
+
+.replica-decision-dim-item.status-fail {
+    border-left: 3px solid #ef4444;
+    background: rgba(239, 68, 68, 0.06);
+}
+
+.replica-decision-dim-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    font-weight: 500;
+}
+
+.replica-decision-dim-status-icon {
+    font-size: 11px;
+}
+
+.replica-decision-dim-detail {
+    font-size: 11px;
+    opacity: 0.8;
+    line-height: 1.4;
+}
+
+.replica-decision-conflict-alert {
+    padding: 8px 12px;
+    border-radius: 6px;
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    color: #fca5a5;
+    font-size: 11.5px;
+    line-height: 1.45;
+    margin: 8px 0;
+}
+
+.replica-decision-action-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.07);
+    font-size: 11.5px;
+}
+
+.replica-ai-idea-compat-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10.5px;
+    font-weight: 500;
+    margin-left: 6px;
+}
+
+.replica-ai-idea-compat-badge.is-safe {
+    background: rgba(34, 197, 94, 0.2);
+    color: #4ade80;
+}
+
+.replica-ai-idea-compat-badge.is-risky {
+    background: rgba(245, 158, 11, 0.2);
+    color: #fbbf24;
+}
+
+.replica-ai-idea-compat-badge.is-incompatible {
+    background: rgba(239, 68, 68, 0.2);
+    color: #f87171;
+}
+
+.replica-decision-track-section {
+    margin: 8px 0 6px;
+}
+
+.replica-decision-track-title {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.9);
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+

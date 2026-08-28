@@ -80,7 +80,7 @@ Rules:
    - "time_treatment": "time_lapse" or "real_time"
    - "worker_count": integer count of active workers (e.g. 1)
    - "material_flow": description of raw material intake and spoil disposal
-   - "cast_action": physical posture, movement, and gaze of the worker
+   - "cast_action": ACTION-REACTION CAUSAL CHAIN of what all living things (workers, resident miniature figurines, or animals) are doing with their bodies, GAZE, AND FACIAL/EMOTIONAL EXPRESSIONS in response to the work: [Trigger Event] -> [Immediate Reflex / Bodily Reaction & Facial Expression] -> [Engaged Tracking / Motion] -> [Settled Posture & Demeanor]. For miniature dioramas with resident figurines, capture their emotional evolution (e.g. initial beats: haggard, distressed, sorrowful, helpless tearful gaze facing ruined shelter; mid-beats: astonished, leaning in with wide-eyed awe and rising hope; reveal beats: beaming with joyful smiles and relief). NEVER write static placeholders like 'remain', 'stay', 'unchanged'.
    - "zh": object containing Chinese translations:
      {
        "visible_action": "中文工人动作与工具描述",
@@ -95,6 +95,7 @@ Rules:
    - "trauma": Initial damaged/decayed starting condition
    - "destiny_zh": Chinese 4-10 char end-state phrase (e.g. "温馨隐居卧室", "极简设计师工坊")
    - "video_duration_sec": Total duration in seconds
+   - "cast_identity": array of strings describing the FIXED permanent physical identity, head-to-toe clothing, AND CLOTHING WEAR/CONDITION of each recurring living person, miniature figurine couple, or resident animal, including realistic weathering/distress and baseline demeanor (e.g. ["1:24 scale African male miniature figurine: distressed faded dusty blue short-sleeve shirt with dirt smudges, worn brown work trousers, haggard and sorrowful initial demeanor", "1:24 scale African female miniature figurine: weathered earth-toned patterned headwrap, faded scoop-neck top, traditional patterned wrap skirt, distressed and helpless initial gaze"]). Accurately record if clothing is ragged, weathered, dusty, or tattered in trauma scenes rather than assuming clean new clothes. Empty array [] if strictly nobody alive appears.
    - "banned_elements": array of objects or tools that NEVER appear in this video (e.g. ["excavator", "crane"])
    - "scene_constants": array of fixed spatial landmarks that stay unchanged
 
@@ -280,10 +281,11 @@ def fast_video_native_reverse(config, job_dir, on_progress=None):
         b.setdefault('worker_count', 1)
         b.setdefault('light_state', 'worklight_daylight')
         b.setdefault('material_flow', 'raw materials staged and consumed, debris cleared')
-        b.setdefault('cast_action', 'Worker actively operates tools at work zone')
+        b.setdefault('cast_action', 'Worker or resident figurines actively track and react to the construction process')
 
     beats_doc['beats'] = beats_list
     beats_doc.setdefault('video_duration_sec', duration)
+    beats_doc.setdefault('cast_identity', [])
     beats_doc.setdefault('banned_elements', [])
     beats_doc.setdefault('scene_constants', [])
 

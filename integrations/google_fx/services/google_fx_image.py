@@ -249,20 +249,11 @@ def _create_fresh_flow_canvas(page, stale_url=""):
     )
 
 
-def _enter_bound_project(page, requested_project_url, attempts=3):
+def _enter_bound_project(page, requested_project_url):
     """Navigate back into the task's own canvas and **prove** we landed in it.
 
-    2026-08-17 现场：AdsPower 每个请求都会把 profile 重新拉起，绑定的项目页于是常
-    在冷加载时撞上 Flow 的 "Something went wrong" 崩溃页。崩溃页由
-    ``ensure_flow_workspace`` 里的 ``_recover_from_flow_project_crash`` 处理——它把
-    页面弹回**工作台列表**然后返回 True。原来这里只看 workspace_ready，于是"回到列表"
-    被当成"已经进入绑定画布"：找不到编辑器就去点 New project，整条帧链换到一块空白
-    新画布上，上一帧的结果 tile 不在了，参考图只能一张张重新上传（日志里那串
-    「画布上挂不到该参考图，改用上传方式」）。
-
-    所以进门后必须核对 ``/project/<id>``。崩溃是瞬时的，reload 通常就能进去，
-    因此这里按 goto → (崩溃则 reload) → 核对 的节奏重试几轮，全都失败才允许上层
-    去新建画布。
+    若打开绑定画布失败、撞上崩溃页（Something went wrong）或未能进入已绑定项目
+    （如被弹回工作台列表），不再重试，直接返回 None 由上层立即新建替代画布。
     """
     requested_pid = _flow_project_id(requested_project_url)
 
@@ -274,43 +265,31 @@ def _enter_bound_project(page, requested_project_url, attempts=3):
             return None
         return current
 
-    for attempt in range(1, max(1, int(attempts)) + 1):
-        try:
-            page.goto(requested_project_url, timeout=60000, wait_until="domcontentloaded")
-            random_sleep(1, 2)
-        except Exception as nav_err:
-            log(f"⚠️ 第 {attempt} 次打开已绑定 Flow 画布失败: {nav_err}", "GoogleFX")
-            random_sleep(2, 3)
-            continue
+    try:
+        page.goto(requested_project_url, timeout=60000, wait_until="domcontentloaded")
+        random_sleep(1, 2)
+    except Exception as nav_err:
+        log(f"⚠️ 打开已绑定 Flow 画布失败: {nav_err}，不重试，直接新建画布", "GoogleFX")
+        return None
 
-        # 崩溃页先就地 reload：ensure_flow_workspace 的兜底是"退回项目列表"，
-        # 那等于主动放弃这块画布，只能作为 reload 也救不回来时的最后一步。
-        if _flow_project_crashed(page):
-            log(f"🔁 已绑定 Flow 画布撞上崩溃页，就地刷新重试 ({attempt}/{attempts})...", "GoogleFX")
-            try:
-                page.reload(timeout=60000, wait_until="domcontentloaded")
-                random_sleep(2, 3)
-            except Exception as reload_err:
-                log(f"⚠️ 崩溃页刷新失败: {reload_err}", "GoogleFX")
+    # 崩溃页直接放弃重试，由上层立即新建画布
+    if _flow_project_crashed(page):
+        log("⚠️ 已绑定 Flow 画布撞上崩溃页 (Something went wrong)，不重试，直接新建画布", "GoogleFX")
+        return None
 
-        # ensure_flow_workspace 返回 False = 这个项目本身进不了工作台（被删/失效）。
-        # 返回 True 也不代表进对了地方：崩溃恢复"退回项目列表"同样算 ready，
-        # 所以下面还要用 /project/<id> 核对落点。
-        ready = ensure_flow_workspace(page, timeout_seconds=30)
-        landed = _landed() if ready else None
-        if landed is not None:
-            if attempt > 1:
-                log(f"✅ 第 {attempt} 次尝试后已回到本任务的 Flow 画布", "GoogleFX")
-            return landed
+    # ensure_flow_workspace 返回 False = 这个项目本身进不了工作台（被删/失效）。
+    # 返回 True 也不代表进对了地方：崩溃恢复"退回项目列表"同样算 ready，
+    # 所以下面还要用 /project/<id> 核对落点。
+    ready = ensure_flow_workspace(page, timeout_seconds=30)
+    landed = _landed() if ready else None
+    if landed is not None:
+        return landed
 
-        landed_pid = _flow_project_id(str(getattr(page, "url", "") or ""))
-        log(
-            f"⚠️ 第 {attempt}/{attempts} 次未能进入已绑定画布"
-            f"（当前落点项目={landed_pid[:8] or '工作台列表'}），重试...",
-            "GoogleFX",
-        )
-        random_sleep(2, 4)
-
+    landed_pid = _flow_project_id(str(getattr(page, "url", "") or ""))
+    log(
+        f"⚠️ 未能进入已绑定画布（当前落点项目={landed_pid[:8] or '工作台列表'}），不重试，直接新建画布...",
+        "GoogleFX",
+    )
     return None
 
 
@@ -412,8 +391,8 @@ def _open_image_flow_canvas(page, requested_project_url=None, require_fresh_canv
         # uploaded into a replacement canvas below, so a dead project URL must
         # not permanently brick the whole frame sequence.
         log(
-            "⚠️ 已绑定 Flow 画布多次进入失败（崩溃页/被弹回列表/项目失效），"
-            "只能新建替代画布：本帧起 i2i 续链断开，参考图将改用上传方式重新挂载",
+            "⚠️ 已绑定 Flow 画布进入失败（崩溃页/被弹回列表/项目失效），"
+            "直接新建替代画布：本帧起 i2i 续链断开，参考图将改用上传方式重新挂载",
             "GoogleFX",
         )
         # 绑定的项目打不开时，页面上剩下的那块画布不是"替代品"而是别人的东西

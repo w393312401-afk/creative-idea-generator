@@ -18,6 +18,7 @@ from server_common import (
     _is_cover_filename, _cover_candidate_path,
     resolve_video_duration, resolve_video_resolution,
     stamp_manifest_capabilities,
+    resolve_binary,
     # 号池轮转口径（帧序列与视频序列共用，见 server_common 的「换 IP 已全局关停」注释）
     _get_account_pool_service, _select_pool_account,
     _account_switch_interval, _account_in_cooldown,
@@ -138,18 +139,61 @@ def _extract_video_frame(video_path, out_png, position, sseof_offset=0.3):
     sseof_offset 是 'last' 的取帧窗口（从片尾往回数的秒数），取窗口内的**第一**帧。
     默认 0.3 秒是锚点校验/冻结检测标定过的口径，不要改；节奏采样要的是真正的末帧，
     自己传更小的偏移（见 clip_step_profile）。"""
+    if not video_path or not os.path.exists(video_path):
+        return False
+
+    ffmpeg_bin = resolve_binary("ffmpeg")
+    is_webp = str(out_png).lower().endswith('.webp')
+    target_path = out_png
+    ffmpeg_target = out_png
+    tmp_png = None
+
+    parent_dir = os.path.dirname(os.path.abspath(out_png))
+    if parent_dir and not os.path.exists(parent_dir):
+        os.makedirs(parent_dir, exist_ok=True)
+
+    if is_webp:
+        # ffmpeg 诸多环境构建（如 macOS Homebrew 默认、部分 Linux/Windows 发行版）未集成 libwebp 编码器。
+        # 先由 ffmpeg 抽成标准 PNG 格式中间文件，再经由 PIL 高保真转存为 WebP。
+        tmp_name = f".tmp_extract_{os.path.basename(out_png)}_{time.time_ns()}.png"
+        tmp_png = os.path.join(parent_dir or ".", tmp_name)
+        ffmpeg_target = tmp_png
+
     if position == 'first':
-        cmd = ["ffmpeg", "-y", "-v", "error", "-i", video_path,
-               "-frames:v", "1", out_png]
+        cmd = [ffmpeg_bin, "-y", "-v", "error", "-i", video_path,
+               "-frames:v", "1", ffmpeg_target]
     else:
-        cmd = ["ffmpeg", "-y", "-v", "error", "-sseof", f"-{sseof_offset:.3f}",
-               "-i", video_path, "-frames:v", "1", "-update", "1", out_png]
+        cmd = [ffmpeg_bin, "-y", "-v", "error", "-sseof", f"-{sseof_offset:.3f}",
+               "-i", video_path, "-frames:v", "1", "-update", "1", ffmpeg_target]
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, encoding='utf-8', errors='replace', timeout=60,
                              **_win_subprocess_flags())
-        return res.returncode == 0 and os.path.exists(out_png) and os.path.getsize(out_png) > 0
+        if res.returncode != 0:
+            return False
+
+        if is_webp:
+            if not (os.path.exists(tmp_png) and os.path.getsize(tmp_png) > 0):
+                return False
+            try:
+                from PIL import Image
+                with Image.open(tmp_png) as img:
+                    img.save(out_png, 'WEBP')
+            finally:
+                if os.path.exists(tmp_png):
+                    try:
+                        os.remove(tmp_png)
+                    except OSError:
+                        pass
+            return os.path.exists(out_png) and os.path.getsize(out_png) > 0
+
+        return os.path.exists(out_png) and os.path.getsize(out_png) > 0
     except Exception:
+        if tmp_png and os.path.exists(tmp_png):
+            try:
+                os.remove(tmp_png)
+            except OSError:
+                pass
         return False
 
 

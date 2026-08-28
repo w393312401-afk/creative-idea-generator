@@ -186,6 +186,72 @@ A 9:16 wide shot of the container with a clean framed window opening.
         self.assertNotIn('hard hat', updated['prompt_block'])
         mock_lib.assert_called_once()
 
+    def test_build_system_prompt_miniature_includes_living_cast_rules(self):
+        cast_ids = ["two 1:24 miniature figurines: Black man in beige shirt, Black woman in wax-print dress"]
+        sys_prompt = build_fast_composer_system_prompt(
+            is_miniature=True,
+            cast_identity=cast_ids
+        )
+        self.assertIn('MINIATURE CRAFT TIME-LAPSE', sys_prompt)
+        self.assertIn('Living Cast Dynamic Reflex', sys_prompt)
+        self.assertIn('Black man in beige shirt', sys_prompt)
+        self.assertIn('Inception reflex', sys_prompt)
+        self.assertIn('Operational tracking', sys_prompt)
+        self.assertIn('Settlement stance', sys_prompt)
+        self.assertIn('EVERY IMAGE prompt', sys_prompt)
+
+    def test_build_user_prompt_includes_cast_identity_and_action(self):
+        beats = [
+            {
+                'visible_action': '开挖基坑',
+                'visible_result': '基坑成型',
+                'cast_action': 'Figurines look up as giant hand enters, tracking shovel movements'
+            }
+        ]
+        cast_ids = ["miniature resident couple"]
+        user_prompt = build_fast_composer_user_prompt(
+            '微缩树屋', '树屋', beats, cast_identity=cast_ids
+        )
+        self.assertIn('Permanent Living Cast Identity:', user_prompt)
+        self.assertIn('miniature resident couple', user_prompt)
+        self.assertIn('Cast Action: Figurines look up as giant hand enters', user_prompt)
+
+    def test_compose_replica_one_pass_miniature_ensures_cast_reflex(self):
+        mock_output = """===TITLE===
+微缩沙盘改造成避潮柚木屋
+
+===THEME===
+微缩沙盘
+
+===PROMPTS===
+IMAGE 1 (毛坯初始状态):
+A macro 9:16 vertical eye-level miniature diorama photograph of a driftwood shack with two miniature figurines.
+
+VIDEO 1 (巨手清理基底):
+From the viewpoint of IMAGE 1. A giant builder's hand lifts the old roof out of the frame. ASMR sound at videoVolume: 0.6.
+
+IMAGE 2 (最终揭晓):
+A macro 9:16 reveal of the finished miniature diorama.
+"""
+        state = {
+            'job_id': 'replica_mini_123',
+            'video_name': 'miniature_diorama.mp4',
+            'beats': {
+                'carrier': '微缩沙盘',
+                'destiny_zh': '避潮柚木屋',
+                'cast_identity': ['two miniature figurines'],
+                'beats': [
+                    {'visible_action': '清理基底', 'visible_result': '基底干净', 'operation': 'clearing'}
+                ],
+                'banned_elements': []
+            }
+        }
+        with patch('prompt_pipeline._chat', return_value=mock_output):
+            prompt_block, compose_state = compose_replica_one_pass({'skillProfile': 'miniature'}, state)
+
+        v1 = compose_state['compiled_videos'][1]
+        self.assertIn('figurin', v1.lower())
+
 
 if __name__ == '__main__':
     unittest.main()

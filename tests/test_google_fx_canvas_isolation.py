@@ -142,8 +142,8 @@ def test_dead_bound_project_falls_back_to_a_fresh_canvas(monkeypatch):
     )
 
     assert image_service._open_image_flow_canvas(page, dead_project) == FRESH_PROJECT
-    # 换新画布之前必须先重试进入绑定画布（Flow 的崩溃页多半是瞬时的）。
-    assert page.goto_calls == [dead_project] * 3 + [WORKSPACE]
+    # 遇到进不去的绑定画布不重试，直接换新画布。
+    assert page.goto_calls == [dead_project, WORKSPACE]
 
 
 def test_flow_project_id_extraction():
@@ -207,21 +207,26 @@ class _CrashOncePage(_StubPage):
         self.crashed = self.crash_left > 0
 
 
-def test_bound_canvas_survives_a_transient_crash_page(monkeypatch):
-    page = _CrashOncePage(WORKSPACE)  # 崩溃恢复已经把我们弹回了工作台列表
-    _patch_canvas_env(
-        monkeypatch,
-        new_project=lambda *a, **k: pytest.fail("崩溃页是瞬时的，不该换新画布"),
-    )
-    monkeypatch.setattr(image_service, "_flow_project_crashed", lambda p: p.crashed)
+def test_bound_canvas_crashed_page_directly_creates_new_canvas(monkeypatch):
+    """绑定画布撞上崩溃页时不重试，直接新建画布。"""
+    page = _StubPage(WORKSPACE)
+    created = []
 
-    assert image_service._open_image_flow_canvas(page, PREV_TASK_PROJECT) == PREV_TASK_PROJECT
-    assert page.reload_calls == 1
-    assert page.goto_calls == [PREV_TASK_PROJECT]
+    def _new_project(target, confirm_timeout=10.0):
+        created.append(target.url)
+        target.url = FRESH_PROJECT
+        return True
+
+    _patch_canvas_env(monkeypatch, new_project=_new_project)
+    monkeypatch.setattr(image_service, "_flow_project_crashed", lambda p: True)
+
+    result = image_service._open_image_flow_canvas(page, PREV_TASK_PROJECT)
+    assert result == FRESH_PROJECT
+    assert page.goto_calls == [PREV_TASK_PROJECT, WORKSPACE]
 
 
 def test_bounced_back_to_workspace_list_is_not_a_successful_entry(monkeypatch):
-    """崩溃恢复把我们留在工作台列表时，绝不能当作"已进入绑定画布"。"""
+    """崩溃恢复把我们留在工作台列表时，不重试，直接新建画布。"""
     page = _StubPage(WORKSPACE)
     created = []
 
@@ -237,6 +242,6 @@ def test_bounced_back_to_workspace_list_is_not_a_successful_entry(monkeypatch):
 
     result = image_service._open_image_flow_canvas(page, PREV_TASK_PROJECT)
 
-    # 重试用尽后才允许新建，且新建必须走"回项目列表"的正规路径
-    assert page.goto_calls == [PREV_TASK_PROJECT] * 3 + [WORKSPACE]
+    # 失败后直接新建，新建必须走"回项目列表"的正规路径
+    assert page.goto_calls == [PREV_TASK_PROJECT, WORKSPACE]
     assert result == FRESH_PROJECT

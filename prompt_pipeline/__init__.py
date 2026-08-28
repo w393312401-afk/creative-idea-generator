@@ -57,6 +57,11 @@ from .mutate import (
     apply_slot_replacement,
     apply_trace_mapping,
 )
+from .decision_framework import (
+    evaluate_variant_compatibility,
+    DIMENSION_METADATA,
+)
+
 
 
 def _raise_if_cancelled(on_progress):
@@ -1036,6 +1041,8 @@ def _multimodal_chat(config, system, user_text, image_paths, model=None, max_tok
 
     content_list = [{"type": "text", "text": user_text}]
     for path in image_paths:
+        if not path:
+            continue
         if not os.path.exists(path):
             raise FileNotFoundError(f"Image file not found: {path}")
         with open(path, "rb") as f:
@@ -1336,10 +1343,20 @@ def run_video_process_check(config, start_frame_path, mid_frame_paths, end_frame
             "- A hard defect H1/H2 is present: respond with: FAIL: <reason in Chinese, at most 2 "
             "sentences, name H1 or H2>"
         )
+        image_paths = [p for p in [start_frame_path, *mid_frame_paths, end_frame_path] if p]
+        if not image_paths or len(image_paths) < 2:
+            return True, "skipped:insufficient_frames_for_process_check"
+
+        labels = []
+        if start_frame_path:
+            labels.append("START anchor")
+        labels.extend([f"sampled mid-clip frame {i+1}" for i in range(mid_count)])
+        if end_frame_path:
+            labels.append("END anchor")
+
         user_text = (f"VIDEO prompt for this segment:\n{video_prompt}\n\n"
-                     f"First image = START anchor; middle {mid_count} image(s) = sampled mid-clip "
-                     "frames in time order; last image = END anchor. Judge the in-between process.")
-        image_paths = [start_frame_path, *mid_frame_paths, end_frame_path]
+                     f"Provided {len(image_paths)} image(s) in chronological order ({', '.join(labels)}). "
+                     "Judge the in-between process.")
         response = _multimodal_chat(config, system_prompt, user_text, image_paths)
         return _parse_gate_response(response.strip())
     except Exception as e:

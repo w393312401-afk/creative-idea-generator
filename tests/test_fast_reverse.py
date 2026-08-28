@@ -64,6 +64,9 @@ class TestFastReverse(unittest.TestCase):
         self.assertIn('timelapse_beats.json', sys_p)
         self.assertIn('package_operations', sys_p)
         self.assertIn('persistent_traces', sys_p)
+        self.assertIn('cast_identity', sys_p)
+        self.assertIn('cast_action', sys_p)
+        self.assertIn('ACTION-REACTION CAUSAL CHAIN', sys_p)
 
     def test_collect_keyframe_images(self):
         job_dir, overview = self._setup_mock_job()

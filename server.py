@@ -5875,7 +5875,34 @@ class SparkRequestHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'status': 'error', 'message': str(e)}, status=500)
 
+        elif path in ('/api/replica/evaluate_compatibility', '/api/replica/diagnose_variant'):
+            # 基于重构判断矩阵评估二创变体与母本的相容性
+            try:
+                body = self._read_json_body()
+                config = effective_config(body.get('config'))
+                baseline_job_id = (body.get('baseline_job_id') or body.get('job_id') or '').strip()
+                if not baseline_job_id:
+                    self._send_json({'status': 'error', 'message': 'baseline_job_id 不能为空'}, status=400)
+                    return
+                mutation_axes = body.get('mutation_axes') or body.get('axes') or {}
+                brief = body.get('brief') or ''
+                idea = body.get('idea') or {}
+                from replica_pipeline import evaluate_variant_compatibility
+                evaluation = evaluate_variant_compatibility(
+                    config=config,
+                    baseline_job_id=baseline_job_id,
+                    mutation_axes=mutation_axes,
+                    brief=brief,
+                    idea=idea
+                )
+                self._send_json({'status': 'ok', 'evaluation': evaluation})
+            except ValueError as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=400)
+            except Exception as e:
+                self._send_json({'status': 'error', 'message': str(e)}, status=500)
+
         elif path in ('/api/replica/pass_a', '/api/replica/pass_b'):
+
             # 规范文档别名路由支持
             try:
                 if not self._gate(with_rate=True, rate_action='compose'):

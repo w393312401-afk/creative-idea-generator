@@ -574,13 +574,19 @@ def generate_orthogonal_variant(
     return variant_doc
 
 
-_AI_DIVERGE_SYSTEM = """你是一位顶尖的纪录片级视觉短视频创意总监与真实极限空间建造设计师。
-你的任务是根据给定的「1:1 黄金母本延时改造视频」的工序骨架和节奏，在确保物理工序拓扑与分镜完全可复用的前提下，进行四轴正交创意发散（AI Orthogonal Mutation），为创作者构思出具备极高网感、极端生存威胁与维生反差感、高完播率但【100% 真实写实】的【硬核生存庇护所 / 极限避难所 / 防灾自持隐蔽空间 (Realistic Survival Shelter & Bunker)】新创意方案。
+_AI_DIVERGE_SYSTEM = """你是一位顶尖的纪录片级视觉短视频创意总监与真实极限空间建造设计师（精通 TikTok 爆款叙事心理学、情绪价值曲线与完播率留存钩子）。
+你的任务是根据给定的「1:1 黄金母本延时改造视频」的工序骨架和节奏，在确保物理工序拓扑与分镜完全可复用的前提下，进行四轴正交创意发散（AI Orthogonal Mutation），构思出具备【TikTok 爆款叙事灵魂、有血有肉的情感闭环、黄金 3 秒视觉钩子、极致前后反差】，且【100% 真实写实】的【硬核生存庇护所 / 极限避难所 / 微缩神迹工坊 / 治愈系庇护豪宅】新创意方案。
+
+★★★★★ TIKTOK VIRAL NARRATIVE & EMOTION POLICY（爆款叙事与情绪价值准则 — 绝不生成表面无血无肉的冰冷工具展示）：
+1. 黄金 3 秒痛点钩子 (Hook Inception): 绝不平淡开场！每一方案开局必须带有“完全毁坏破烂屋子/暴风雨冲垮废墟/流离失所绝境”的极端视觉痛点，瞬间锁住观众前 3 秒！
+2. 常驻角色与情感弧线 (Character Stakes & Emotional Arc): 若母本含有角色线（如穷困潦倒夫妇人偶、受助弱小生命），二创方案必须继承“展示设计图纸点燃希望 ➔ 全程满怀期盼注视 ➔ 完工喜极而泣搬入奢华新居”的有血有肉情感链条！
+3. 神来之手与降维奇观 (God-Hand Wonder): 若为微缩沙盘题材，保留巨人工匠之手（God Hand）如神迹降临微观世界的宏微视角反差与治愈感！
+4. 极致前后反差与多巴胺终局 (Extreme Contrast): 牢牢守住“从 0 分破烂废墟到 100 分奢华庄园/温暖宫殿”的强烈蜕变反差！
 
 ★★★★★ REALISM-ONLY POLICY（去科幻 / 严格真实写实硬约束 — 违反直接废弃）：
 1. 严禁任何科幻、未来机能、太空宇航、外星异星、赛博朋克、全息投影、RGB霓虹灯带、发光科技面板、失重力、虚构魔法或超自然发光生物！
 2. 严禁千篇一律的“小资网红温馨民宿/酒店样板间/咖啡馆/浪漫串灯/反光塑料地板”套路！
-3. 所有方案必须是【现实世界中可以真实施工建造的】极限庇护所、防灾掩体、隐蔽哨所或自持空间改造，具有强烈的工匠手作质感、硬核工程防护逻辑、真实物料触感与自然地理险境美感。
+3. 所有方案必须是【现实世界中可以真实施工建造的】极限庇护所、防灾掩体、隐蔽哨所、微缩手工庄园或自持空间改造，具有强烈的工匠手作质感、硬核工程防护逻辑、真实物料触感与自然地理险境美感。
 4. 四大正交发散轴：
    - 轴 1 地貌险境与水体环境 (Environment & Biome): 真实自然地理极端微气候与环境威胁（如：极地厚积雪冻土裂隙暴风雪、火山熔岩地热热泉与硫磺有毒蒸气、热带雨林红树林季风暴雨洪泛、悬崖岩穴石灰岩溶洞暗河、干旱荒漠红土特大沙尘暴、海边海蚀崖暗礁浪涌）。
    - 轴 2 结构材质与防护工艺 (Material & Craft): 真实硬核建筑与防护施工材料（如：粗犷芬兰松木原木 + 气凝胶保温层、哑光黑耐候钢构件 + 黑色玄武岩打磨、缅甸老柚木防腐榫卯 + 悬空防洪毛石基座、粗糙天然玄武岩 + 黄铜暗埋构件、传统生土夯土厚墙 + 粗壮胡杨木大梁 + 重型防沙重力门、双层中空防爆夹胶钢化玻璃）。严禁碳纤维RGB、太空合金、全息舱。
@@ -600,7 +606,7 @@ _AI_DIVERGE_SYSTEM = """你是一位顶尖的纪录片级视觉短视频创意�
     "id": "shelter_unique_id",
     "name": "中文庇护所主题名 (如：极地防风雪避险庇护所)",
     "icon": "❄️",
-    "hook": "一句话爆款卖点（20字以内，如：冰封极地下的厚重松木气凝胶木屋与北极白鲸）",
+    "hook": "一句话爆款卖点（20字以内，包含痛点钩子与终极反差，如：废墟破屋开局，神之手打造极地松木豪宅与白鲸）",
     "trend_ref": "说明借鉴了哪条联网参考的哪个要点（如：借鉴极地避难所的双层气凝胶保温木结构与防风雪观察窗）",
     "axes": {{
       "environment": "具体地貌险境与水体环境中文描述",
@@ -614,91 +620,162 @@ _AI_DIVERGE_SYSTEM = """你是一位顶尖的纪录片级视觉短视频创意�
 ]"""
 
 
-def _generate_fallback_ideas(brief: Optional[str] = None, count: int = 4, trend_refs: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
-    """当 LLM 不可用或解析失败时的丰富动态写实兜底方案（严格去科幻）。"""
+def _generate_fallback_ideas(
+    baseline_doc: Optional[Dict[str, Any]] = None,
+    brief: Optional[str] = None,
+    count: int = 4,
+    trend_refs: Optional[List[Dict[str, Any]]] = None
+) -> List[Dict[str, Any]]:
+    """当 LLM 不可用或解析失败时的丰富动态写实兜底方案（自适应微缩沙盘与成人庇护所题材）。"""
     ref_ids = [r['id'] for r in (trend_refs or []) if isinstance(r, dict) and r.get('id')]
-    defaults = [
-        {
-            'id': 'polar_cabin',
-            'name': '极地防风雪庇护所',
-            'icon': '❄️',
-            'hook': '冰封峡湾边的厚重防风雪避险木屋与北极白鲸',
-            'trend_ref': '借鉴极地避难所的双层气凝胶保温木结构与全景防风雪观察窗',
-            'trend_ref_ids': ref_ids,
-            'axes': {
-                'environment': '极地厚积雪地貌与剔透深蓝峡湾海面',
-                'material': '粗犷芬兰松木原木 + 气凝胶保温层 + 侘寂微水泥 + 黑色碳化防腐木',
-                'function': '防风雪极地避险庇护所 + 粗石壁炉与防寒羽绒保暖卧榻',
-                'hero_reveal': '野生北极白鲸群在窗外深蓝峡湾中缓缓掠过',
+    
+    # 检测母本题材特征
+    base_text = ""
+    if baseline_doc:
+        base_text = f"{baseline_doc.get('title', '')} {baseline_doc.get('video_name', '')} {baseline_doc.get('scene_signature', '')}"
+        for b in (baseline_doc.get('beats') or []):
+            if isinstance(b, dict):
+                base_text += f" {b.get('visual_subject', '')} {b.get('visible_action', '')}"
+    base_lower = base_text.lower()
+    is_miniature = any(k in base_lower for k in ['微缩', '沙盘', '手作', '人偶', 'miniature', 'diorama', 'tabletop'])
+    has_couple = any(k in base_lower for k in ['夫妇', '夫妻', '穷困', '人偶', '看图纸', 'couple', 'poor', 'homeless'])
+
+    if is_miniature or has_couple:
+        # 微缩沙盘与常驻夫妇情感题材专属高分兜底方案
+        defaults = [
+            {
+                'id': 'miniature_polar_hearth',
+                'name': '微缩极地暖炉庄园',
+                'icon': '❄️',
+                'hook': '完全毁坏破烂屋子开局，神来之手为穷困夫妇看设计图纸并精雕极地松木豪宅',
+                'trend_ref': '借鉴极地避难所的双层气凝胶保温木结构与全景防风雪观察窗',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '微缩极地雪山微观苔原与清澈冰湖桌面沙盘',
+                    'material': '微缩芬兰松木原木 + 迷你微型壁炉 + 微雕石膏罗马柱 + 侘寂微水泥',
+                    'function': '微缩极地暖炉避难庄园 + 夫妻人偶双人卧室与微型书房',
+                    'hero_reveal': '暖光点亮，夫妻俩喜极而泣搬入奢华卧室并向巨手致谢',
+                },
+                'scene_signature': 'A handcrafted miniature heavy timber polar refuge villa diorama crafted by giant god hand for a homeless figurine couple.',
+                'banned_elements': ['adult full scale', 'sci-fi capsule', 'cyberpunk', 'neon lights', 'spaceship', 'hologram', 'muddy riverbank', 'generic cozy homestay'],
             },
-            'scene_signature': 'A heavy timber, aerogel insulated and stone refuge shelter cabin embedded in arctic snow, overlooking clear deep-blue fjord waters.',
-            'banned_elements': ['sci-fi capsule', 'cyberpunk', 'neon lights', 'spaceship', 'hologram', 'muddy riverbank', 'green river water', 'rusted mild steel container', 'generic cozy homestay'],
-        },
-        {
-            'id': 'volcanic_spa',
-            'name': '火山地热自持庇护所',
-            'icon': '🌋',
-            'hook': '火山黑石地热自持避险所与高山溪红点鲑群',
-            'trend_ref': '借鉴火山地热自持庇护所的黑色玄武岩打磨与地热温差发电系统',
-            'trend_ref_ids': ref_ids,
-            'axes': {
-                'environment': '火山热泉泥地与冒泡地热蒸气水体',
-                'material': '哑光黑耐候钢构件 + 黑色玄武岩打磨 + 导热紫铜管 + 碳化原木',
-                'function': '恒温地热自持能源庇护所 + 地热温差发电与悬浮实木榻榻米',
-                'hero_reveal': '地热温泉清澈水体中高山溪红点鲑群缓缓游弋',
+            {
+                'id': 'miniature_volcano_spa',
+                'name': '微缩火山地热庄园',
+                'icon': '🌋',
+                'hook': '废墟破屋开局，巨人之手为穷困夫妇看图纸并手工精雕微缩地热黑石庄园',
+                'trend_ref': '借鉴火山地热自持庇护所的黑色玄武岩打磨与地热温差发电系统',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '微缩火山黑石与微观温泉冒泡水池沙盘',
+                    'material': '微缩黑色玄武岩微雕 + 迷你紫铜导热管 + 碳化原木构件',
+                    'function': '微缩恒温地热疗愈庄园 + 夫妻人偶微型温泉泡池与实木地台',
+                    'hero_reveal': '夫妻俩在微型温泉边欢呼拥抱，巨手在屋顶安放微型路灯',
+                },
+                'scene_signature': 'A miniature matte black basalt and copper hot spring spa villa diorama crafted for a homeless couple.',
+                'banned_elements': ['adult full scale', 'sci-fi', 'futuristic', 'neon channels', 'glowing tech', 'iceberg', 'snowfield', 'generic cozy homestay'],
             },
-            'scene_signature': 'A matte black weathering-steel geothermal energy shelter pavilion nestled in volcanic hot spring terrain with porous black basalt stone walls.',
-            'banned_elements': ['sci-fi', 'futuristic', 'neon channels', 'glowing tech', 'iceberg', 'snowfield', 'office desk', 'bright fluorescent tube', 'generic cozy homestay'],
-        },
-        {
-            'id': 'rainforest_workshop',
-            'name': '雨林防洪重工庇护所',
-            'icon': '🪵',
-            'hook': '热带雨林悬空防洪浮水重工庇护所与野生水豚',
-            'trend_ref': '借鉴雨林水上高脚屋的老柚木防腐榫卯与离地悬空防洪排湿结构',
-            'trend_ref_ids': ref_ids,
-            'axes': {
-                'environment': '暴雨热带雨林与原生态清澈溪流水域',
-                'material': '缅甸老柚木防腐结构 + 悬空抬升毛石基座 + 铜质暗扣',
-                'function': '悬空防洪木工庇护所 + 手工皮革制作台与防潮原木搁架',
-                'hero_reveal': '窗外清澈水流中野生水豚与巨骨舌鱼缓缓游弋',
+            {
+                'id': 'miniature_zen_courtyard',
+                'name': '微缩京都枯山水庄园',
+                'icon': '🪵',
+                'hook': '暴雨冲垮残破草棚开局，神来之手打造微缩日式枯山水原木奢华庄园',
+                'trend_ref': '借鉴日式枯山水原木榫卯与微观苔藓青石微雕工法',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '微缩白砂枯山水与微观苔藓青石沙盘',
+                    'material': '微缩缅甸老柚木榫卯 + 迷你日式白墙 + 微型黑瓦构件',
+                    'function': '微缩日式禅意豪宅 + 夫妻俩榻榻米茶室与观景推拉门',
+                    'hero_reveal': '夫妻人偶携手步入微型庭院，微型灯笼点亮，喜极而泣',
+                },
+                'scene_signature': 'A handcrafted miniature Japanese Zen courtyard villa diorama for a figurine couple.',
+                'banned_elements': ['adult full scale', 'sci-fi', 'cyberpunk', 'neon lights', 'rgb lighting', 'carbon fiber', 'generic cozy homestay'],
             },
-            'scene_signature': 'A handcrafted reclaimed teak wood and rough stone flood-refuge craftsman stilt shelter submerged along a tropical rainforest river.',
-            'banned_elements': ['sci-fi', 'cyberpunk', 'neon lights', 'rgb lighting', 'carbon fiber', 'hologram', 'polar bear', 'tatami', 'hot spring steam', 'generic cozy homestay'],
-        },
-        {
-            'id': 'cliff_cellar',
-            'name': '崖壁溶洞隐秘庇护所',
-            'icon': '🪨',
-            'hook': '天然溶洞石壁地下恒温避险储能所与盲鱼群',
-            'trend_ref': '借鉴天然石灰岩溶洞的恒温微气候与粗粝玄武岩黄铜维生工法',
-            'trend_ref_ids': ref_ids,
-            'axes': {
-                'environment': '天然石灰岩溶洞石壁与清冽地下暗河',
-                'material': '粗糙玄武岩打磨 + 黄铜暗埋构件 + 老橡木实木梁',
-                'function': '隐秘溶洞恒温地下水与给养储藏庇护所',
-                'hero_reveal': '溶洞地下清冽暗河中野生岩斑盲鱼群缓缓游弋',
+            {
+                'id': 'miniature_desert_oasis',
+                'name': '微缩荒漠绿洲庄园',
+                'icon': '🏜️',
+                'hook': '暴风沙摧毁破屋开局，神来之手为夫妇手工打造微缩夯土绿洲豪宅',
+                'trend_ref': '借鉴传统生土夯土墙的蓄热调温与重型防沙微型重力门结构',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '微缩干旱红土与绿洲微观清泉沙盘',
+                    'material': '微缩生土夯土墙 + 迷你胡杨木梁 + 陶土微砖',
+                    'function': '微缩绿洲防沙暴豪宅 + 穹顶自然采光与迷你双人亚麻地台',
+                    'hero_reveal': '清泉边微型双峰驼饮水，夫妻人偶幸福入住新居',
+                },
+                'scene_signature': 'A miniature monolithic rammed-earth and desert timber oasis villa diorama crafted by giant god hand.',
+                'banned_elements': ['adult full scale', 'sci-fi', 'futuristic', 'neon', 'metal spacecraft', 'high-tech panels', 'generic cozy homestay'],
             },
-            'scene_signature': 'A subterranean basalt and brass refuge sanctuary built inside a natural karst cave alongside a clear underground river.',
-            'banned_elements': ['sci-fi', 'futuristic', 'crystal fantasy', 'glowing crystals', 'neon', 'sunlight', 'skyline', 'traffic noise', 'white drywalls', 'generic cozy homestay'],
-        },
-        {
-            'id': 'desert_sanctuary',
-            'name': '荒漠防沙暴地下庇护所',
-            'icon': '🏜️',
-            'hook': '荒漠红土绿洲夯土防风暴地堡与野生双峰驼',
-            'trend_ref': '借鉴传统生土夯土墙的蓄热调温与重型防沙重力门结构',
-            'trend_ref_ids': ref_ids,
-            'axes': {
-                'environment': '干旱荒漠红土与绿洲清泉水体',
-                'material': '传统生土夯土墙 + 粗壮胡杨木大梁 + 透气陶土砖 + 防沙重力门',
-                'function': '绿洲地下防沙暴储能庇护所 + 穹顶自然采光与亚麻地台',
-                'hero_reveal': '绿洲清泉边野生双峰驼低头静静饮水',
+        ]
+    else:
+        # 成人硬核写实生存庇护所高分方案
+        defaults = [
+            {
+                'id': 'polar_cabin',
+                'name': '极地防风雪避险所',
+                'icon': '❄️',
+                'hook': '完全毁坏破烂木屋开局，打造冰封峡湾松木防寒避难所与白鲸',
+                'trend_ref': '借鉴极地避难所的双层气凝胶保温木结构与全景防风雪观察窗',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '极地厚积雪地貌与剔透深蓝峡湾海面',
+                    'material': '粗犷芬兰松木原木 + 气凝胶保温层 + 侘寂微水泥 + 黑色碳化防腐木',
+                    'function': '防风雪极地避险庇护所 + 粗石壁炉与防寒羽绒保暖卧榻',
+                    'hero_reveal': '野生北极白鲸群在窗外深蓝峡湾中缓缓掠过',
+                },
+                'scene_signature': 'A heavy timber, aerogel insulated and stone refuge shelter cabin embedded in arctic snow, overlooking clear deep-blue fjord waters.',
+                'banned_elements': ['sci-fi capsule', 'cyberpunk', 'neon lights', 'spaceship', 'hologram', 'muddy riverbank', 'generic cozy homestay'],
             },
-            'scene_signature': 'A monolithic rammed-earth and desert timber underground sandstorm refuge shelter integrated into desert oasis terrain with deep shaded openings.',
-            'banned_elements': ['sci-fi', 'futuristic', 'neon', 'metal spacecraft', 'high-tech panels', 'blizzard', 'glacier', 'generic cozy homestay'],
-        },
-    ]
+            {
+                'id': 'volcanic_spa',
+                'name': '火山地热自持所',
+                'icon': '🌋',
+                'hook': '残破废墟开局，火山黑石地热自持避险所与高山溪红点鲑群',
+                'trend_ref': '借鉴火山地热自持庇护所的黑色玄武岩打磨与地热温差发电系统',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '火山热泉泥地与冒泡地热蒸气水体',
+                    'material': '哑光黑耐候钢构件 + 黑色玄武岩打磨 + 导热紫铜管 + 碳化原木',
+                    'function': '恒温地热自持能源庇护所 + 地热温差发电与悬浮实木榻榻米',
+                    'hero_reveal': '地热温泉清澈水体中高山溪红点鲑群缓缓游弋',
+                },
+                'scene_signature': 'A matte black weathering-steel geothermal energy shelter pavilion nestled in volcanic hot spring terrain with porous black basalt stone walls.',
+                'banned_elements': ['sci-fi', 'futuristic', 'neon channels', 'glowing tech', 'iceberg', 'snowfield', 'generic cozy homestay'],
+            },
+            {
+                'id': 'rainforest_workshop',
+                'name': '雨林防洪重工所',
+                'icon': '🪵',
+                'hook': '暴雨冲垮残破草棚开局，热带雨林悬空防洪浮水工坊与水豚',
+                'trend_ref': '借鉴雨林水上高脚屋的老柚木防腐榫卯与离地悬空防洪排湿结构',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '暴雨热带雨林与原生态清澈溪流水域',
+                    'material': '缅甸老柚木防腐结构 + 悬空抬升毛石基座 + 铜质暗扣',
+                    'function': '悬空防洪木工庇护所 + 手工皮革制作台与防潮原木搁架',
+                    'hero_reveal': '窗外清澈水流中野生水豚与巨骨舌鱼缓缓游弋',
+                },
+                'scene_signature': 'A handcrafted reclaimed teak wood and rough stone flood-refuge craftsman stilt shelter submerged along a tropical rainforest river.',
+                'banned_elements': ['sci-fi', 'cyberpunk', 'neon lights', 'rgb lighting', 'carbon fiber', 'hologram', 'generic cozy homestay'],
+            },
+            {
+                'id': 'desert_sanctuary',
+                'name': '荒漠防沙暴地堡',
+                'icon': '🏜️',
+                'hook': '特大沙尘暴摧毁破屋开局，荒漠红土夯土防风暴地堡与双峰驼',
+                'trend_ref': '借鉴传统生土夯土墙的蓄热调温与重型防沙重力门结构',
+                'trend_ref_ids': ref_ids,
+                'axes': {
+                    'environment': '干旱荒漠红土与绿洲清泉水体',
+                    'material': '传统生土夯土墙 + 粗壮胡杨木大梁 + 透气陶土砖 + 防沙重力门',
+                    'function': '绿洲地下防沙暴储能庇护所 + 穹顶自然采光与亚麻地台',
+                    'hero_reveal': '绿洲清泉边野生双峰驼低头静静饮水',
+                },
+                'scene_signature': 'A monolithic rammed-earth and desert timber underground sandstorm refuge shelter integrated into desert oasis terrain with deep shaded openings.',
+                'banned_elements': ['sci-fi', 'futuristic', 'neon', 'metal spacecraft', 'high-tech panels', 'generic cozy homestay'],
+            },
+        ]
     return defaults[:count]
 
 
@@ -710,7 +787,7 @@ def ai_diverge_orthogonal_ideas(
     on_progress: Optional[Any] = None,
     trend_ref_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """调用大模型为黄金母本结合联网参考智能发散四轴正交二创创意方案。"""
+    """调用大模型为黄金母本结合联网参考智能发散四轴正交二创创意方案（自适应母本叙事与拓扑）。"""
     import prompt_pipeline as pp
     from prompt_pipeline.reverse import parse_json_reply
 
@@ -763,16 +840,45 @@ def ai_diverge_orthogonal_ideas(
             "并在每个方案的 trend_ref 字段中简明扼要说明具体借鉴了哪条参考的哪个要点（中文20字以内）。"
         )
 
+    # 提取母本题材与叙事特征
+    base_title = str(baseline_doc.get('title') or baseline_doc.get('video_name') or '')
+    base_scene_sig = str(baseline_doc.get('scene_signature') or '')
+    base_corpus = f"{base_title} {base_scene_sig}"
+    for b in (source_beats or []):
+        if isinstance(b, dict):
+            base_corpus += f" {b.get('visual_subject', '')} {b.get('visible_action', '')}"
+    base_lower = base_corpus.lower()
+
+    is_miniature = any(k in base_lower for k in ['微缩', '沙盘', '手作', '人偶', 'miniature', 'diorama', 'tabletop'])
+    has_couple = any(k in base_lower for k in ['夫妇', '夫妻', '穷困', '人偶', '看图纸', 'couple', 'poor', 'homeless'])
+    has_god_hand = any(k in base_lower for k in ['神来之手', '巨手', '巨人之手', 'god hand', 'giant hand']) or is_miniature
+    has_ruin_hook = any(k in base_lower for k in ['破烂', '完全毁坏', '破烂屋子', '废墟', '残破', 'ruin', 'dilapidated', 'destroyed'])
+
+    narrative_directives = []
+    if is_miniature:
+        narrative_directives.append("• 【题材约束·微缩沙盘微距手作】：母本为微缩沙盘模型题材，发散方案必须是微缩沙盘/微观手工微雕（Miniature Diorama），严禁写成真人 1.78m 成人建筑施工！")
+    if has_god_hand or is_miniature:
+        narrative_directives.append("• 【视角约束·神来之手介入】：必须在 hook、axes 中体现巨人工匠之手（God Hand）如神迹降临微缩世界、微距特写精雕的降维神性奇观！")
+    if has_couple:
+        narrative_directives.append("• 【叙事核心·常驻人偶夫妇情感闭环】：必须严格保留‘为穷困潦倒的夫妻人偶看设计图纸并帮他们打造奢华豪宅’的有血有肉情感线，体现从绝望破屋到喜极而泣搬入新居！")
+    if has_ruin_hook or is_miniature:
+        narrative_directives.append("• 【开局钩子·黄金3秒极端破败】：方案必须以‘完全毁坏/暴风雨冲垮的废墟破屋’开局，牢牢锁住前3秒完播率！")
+
+    narrative_block = ""
+    if narrative_directives:
+        narrative_block = "【黄金母本叙事与题材硬性约束 (Narrative Invariants - 必须 100% 继承)】\n" + "\n".join(narrative_directives) + "\n\n"
+
     user_prompt = (
         f"【黄金母本背景】\n"
-        f"- 视频标题/源文件：{baseline_doc.get('video_name', '母本视频')}\n"
+        f"- 视频标题/主题：{base_title}\n"
         f"- 节拍总数：{len(source_beats)} 拍\n"
-        f"- 原始场景特征：{baseline_doc.get('scene_signature', '户外江岸集装箱改造')}\n"
+        f"- 场景特征定义：{base_scene_sig or '极限空间改造'}\n"
         f"- 工序阶梯流转：\n{json.dumps(beats_summary, ensure_ascii=False, indent=2)}\n\n"
+        f"{narrative_block}"
         f"{trend_block}"
         f"【创作者发散偏好】\n"
         f"{brief.strip() if brief and brief.strip() else '（未指定特定风格，请自由发散最吸睛、反差感极强的 4 种高网感爆款主题）'}\n\n"
-        f"请基于以上母本工序骨架并深度结合联网参考，直接输出包含 {count} 个正交方案的 JSON 数组。"
+        f"请基于以上母本工序骨架并深度结合联网参考与叙事约束，直接输出包含 {count} 个正交方案的 JSON 数组。"
     )
 
     all_ref_ids = [r['id'] for r in selected_refs if isinstance(r, dict) and r.get('id')]
@@ -788,6 +894,7 @@ def ai_diverge_orthogonal_ideas(
         )
         data = parse_json_reply(raw)
         if isinstance(data, list) and len(data) > 0:
+            from .decision_framework import evaluate_variant_compatibility
             cleaned_ideas = []
             for idx, item in enumerate(data):
                 if not isinstance(item, dict):
@@ -795,27 +902,61 @@ def ai_diverge_orthogonal_ideas(
                 axes = item.get('axes') or {}
                 if not axes.get('environment') and not axes.get('material'):
                     continue
-                cleaned_ideas.append({
+                
+                env_text = str(axes.get('environment') or '')
+                mat_text = str(axes.get('material') or '')
+                func_text = str(axes.get('function') or '')
+                hero_text = str(axes.get('hero_reveal') or '')
+                hook_text = str(item.get('hook') or '')
+                name_text = str(item.get('name') or f'创意方案 {idx+1}')
+
+                # 自动保证母本核心题材前缀不丢失
+                if is_miniature and not any(k in env_text for k in ['微缩', '沙盘', 'miniature', 'diorama']):
+                    env_text = f"微缩{env_text}沙盘"
+                if is_miniature and not any(k in mat_text for k in ['微缩', '迷你', '微雕']):
+                    mat_text = f"微缩{mat_text}"
+
+                axes_dict = {
+                    'environment': env_text,
+                    'material': mat_text,
+                    'function': func_text,
+                    'hero_reveal': hero_text,
+                }
+                idea_entry = {
                     'id': str(item.get('id') or f'idea_{idx+1}'),
-                    'name': str(item.get('name') or f'创意方案 {idx+1}'),
+                    'name': name_text,
                     'icon': str(item.get('icon') or '✨'),
-                    'hook': str(item.get('hook') or ''),
+                    'hook': hook_text,
                     'trend_ref': str(item.get('trend_ref') or (selected_refs[idx % len(selected_refs)].get('label') if selected_refs else '')),
                     'trend_ref_ids': all_ref_ids,
-                    'axes': {
-                        'environment': str(axes.get('environment') or ''),
-                        'material': str(axes.get('material') or ''),
-                        'function': str(axes.get('function') or ''),
-                        'hero_reveal': str(axes.get('hero_reveal') or ''),
-                    },
+                    'axes': axes_dict,
                     'scene_signature': str(item.get('scene_signature') or ''),
                     'banned_elements': list(item.get('banned_elements') or []),
-                })
+                }
+                try:
+                    compat = evaluate_variant_compatibility(baseline_doc, mutation_axes=axes_dict, brief=brief, idea=idea_entry)
+                    idea_entry['compatibility'] = compat
+                except Exception as _ce:
+                    print(f"[mutate] 兼容性评估警告: {_ce}")
+                cleaned_ideas.append(idea_entry)
             if cleaned_ideas:
                 return cleaned_ideas[:count]
     except Exception as e:
-        print(f"[mutate] AI 发散模型调用或解析异常，采用高质量兜底方案: {e}")
+        print(f"[mutate] AI 发散模型调用或解析异常，采用高质量自适应兜底方案: {e}")
 
-    return _generate_fallback_ideas(brief=brief, count=count, trend_refs=selected_refs)
+    fallback_ideas = _generate_fallback_ideas(baseline_doc=baseline_doc, brief=brief, count=count, trend_refs=selected_refs)
+    try:
+        from .decision_framework import evaluate_variant_compatibility
+        for idea_entry in fallback_ideas:
+            idea_entry['compatibility'] = evaluate_variant_compatibility(
+                baseline_doc,
+                mutation_axes=idea_entry.get('axes'),
+                brief=brief,
+                idea=idea_entry
+            )
+    except Exception:
+        pass
+    return fallback_ideas
+
 
 

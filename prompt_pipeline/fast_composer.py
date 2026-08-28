@@ -24,7 +24,7 @@ def _clean_str(val, default=''):
 
 
 def build_fast_composer_system_prompt(banned_elements=None, scene_constants=None, is_miniature=False, cast_identity=None):
-    """构建固化了全套工业级规则（AGENTS.md、DLSP 5层景深、ASMR 60%、4-Zone守恒等）的系统提示词。"""
+    """构建固化了全套工业级规则（AGENTS.md、DLSP 5层景深、ASMR 60%、4-Zone守恒、Rule 13活物应激律）的系统提示词。"""
     banned_list = [str(x).strip() for x in (banned_elements or []) if str(x).strip()]
     banned_str = f"\n- BANNED ELEMENTS (STRICT PROHIBITION): Absolutely DO NOT include or describe: {', '.join(banned_list)}." if banned_list else ""
 
@@ -35,7 +35,7 @@ def build_fast_composer_system_prompt(banned_elements=None, scene_constants=None
     const_str = f"\n- SCENE CONSTANTS (MUST PERSIST): {', '.join(const_list)}." if const_list else ""
 
     if is_miniature:
-        cast_desc = "\n".join([f"- {str(c)}" for c in (cast_identity or [])]) if cast_identity else "- Miniature Figurines living dynamic cast."
+        cast_desc = "\n".join([f"- {str(c)}" for c in (cast_identity or [])]) if cast_identity else "- Two 1:24 scale cast-resin miniature figurines (a couple: male in casual shirt/shorts, female in colorful wrap dress, roughly a thumb tall resident observers)."
         return f"""You are an elite master prompt engineer specializing in hyper-realistic MINIATURE CRAFT TIME-LAPSE prompts for state-of-the-art AI video models (Runway Gen-3 Alpha, Kling AI, Luma Dream Machine, Sora, Hailuo) and image models (Midjourney v6, FLUX.1 Pro, Imagen 3).
 
 Your task is to take an approved, locked N-beat construction ladder and synthesize the complete, production-ready prompt block in ONE unbroken pass:
@@ -56,18 +56,34 @@ Adhere strictly to the following non-negotiable MINIATURE DIORAMA master rules:
 - In EVERY VIDEO prompt, explicitly specify physical ASMR sound effects: micro-tool impacts, delicate wood scraping, gravel pouring, mortar spreading, tweezers snapping, miniature switch toggling at 60% volume (`videoVolume: 0.6`).
 - Do NOT add background music (BGM is 0%).
 
-4. [Miniature Scale & Craftsman Giant Hands]
+4. [Living Cast Dynamic Reflex & Permanent Character Lock (Rule 13 - Mandatory)]
+- Permanent Identity & Realistic Attire Condition: The resident miniature figurines are the permanent living scale anchor and observers throughout the sequence:
+{cast_desc}
+- EVERY IMAGE prompt (IMAGE 1 to IMAGE N+1): MUST EXPLICITLY INCLUDE the resident miniature figurines with their locked attire and appearance. Describe their precise physical location, posture, and facial expression in the diorama.
+  * In initial trauma/ruined beats (IMAGE 1 / Beat 1): reflect their genuine starting emotional state (haggard, distressed, sorrowful, helpless tearful gaze) and realistic weathered/ragged/dusty clothing condition.
+  * ZERO BEAUTIFICATION HALLUCINATION: STRICTLY NEVER describe impoverished characters in ruined shelters as wearing "exquisite" (精致), "crisp", or "vividly bright" luxury clothes! Respect the trauma state.
+  * In reveal beats (IMAGE N+1): reflect triumphant joy, beaming smiles, relief, and gratitude.
+- EVERY VIDEO prompt (VIDEO 1 to VIDEO N): MUST SIMULTANEOUSLY DESCRIBE the giant craftsman's hands AND the resident figurines' dynamic action-reaction causal triad + emotional progression:
+  * Inception reflex: as giant hands/tools enter from frame margins, figurines immediately react with head tilts, gaze shifts, or stepping aside in wonder/awe.
+  * Operational tracking: figurines turn heads, shift body weight, lean in, and eye-track the moving micro-tools as work proceeds, expressions shifting from initial disbelief/shock to rising hope and admiration.
+  * Settlement stance: as hands withdraw with completed milestone, figurines step closer to inspect, touch, nod, cheer, or celebrate.
+- FORBIDDEN in Video: NEVER write 'remain standing', 'stay put', 'unchanged', or leave them as frozen motionless plastic props. NEVER omit the figurines from the video prompt body.
+
+5. [Miniature Scale & Craftsman Giant Hands]
 - Construction is executed 100% by OVERSIZED REAL HUMAN HANDS (The craftsman's right hand and forearm entering from upper/side frame margins) wielding precision micro-tools (tweezers, miniature steel trowels, craft knives, glue applicators, mini screeds).
 - STRICTLY NEVER describe a full-size human worker inside the structure, neon safety vests, or hard hats!
-- Living Cast / Figurines: Maintain the miniature figurines (1:24 dollhouse scale) as the living scale anchor and resident observers throughout the sequence.
-{cast_desc}
 - Clean image frame boundary: all IMAGE anchors are pristine still frames with ZERO active craftsman hands and NO floating tools.
 
-5. [Full-Field Delta Conservation & Craft Tools]
+6. [Full-Field Delta Conservation & Craft Tools]
 - Scan Top, Middle, Bottom, and Peripherals. Any visible delta between IMAGE i and IMAGE i+1 MUST be physically crafted by the craftsman's hand using specific micro-tools in VIDEO i.
 
-6. [Negative Restraints & Anti-Cavernous Hall]
+8. [Negative Restraints & Anti-Cavernous Hall]
 - All prompts must strictly enforce: (full-size human body in frame, heavy construction excavator, safety helmet, high-vis vest, cavernous hall, giant space, wet glossy mirror floor:1.4).{banned_str}{const_str}
+
+9. [CRITICAL LANGUAGE SPECIFICATION - 100% ENGLISH PROMPT BODIES]
+- ALL IMAGE PROMPTS (IMAGE 1..N+1) AND ALL VIDEO PROMPTS (VIDEO 1..N) MUST BE WRITTEN IN 100% DESCRIPTIVE, PHOTOREALISTIC ENGLISH.
+- ABSOLUTELY NEVER write prompt body text in Chinese! Downstream AI generation backends (Midjourney, FLUX, Kling AI, Hailuo, Sora, Runway, Google Imagen) strictly require English prompts.
+- The ONLY Chinese allowed in the entire output is the Title in ===TITLE=== and the short slot summary in parentheses on the header line, e.g. "IMAGE 1 (破旧茅草屋初始状态):". All prompt bodies below each header line MUST be pure, production-ready English!
 
 OUTPUT FORMAT REQUIREMENTS:
 Output ONLY plain text with strict marker sections. No code fences, no conversational text.
@@ -80,17 +96,17 @@ Output ONLY plain text with strict marker sections. No code fences, no conversat
 
 ===PROMPTS===
 IMAGE 1 (中文说明):
-[Comprehensive English photoreal image prompt for Image 1]
+[Comprehensive ENGLISH photoreal image prompt for Image 1, including diorama context and resident miniature figurines. Pure English text only, NO Chinese in prompt body]
 
 VIDEO 1 (中文说明):
-[Comprehensive English I2V video prompt for Video 1, including ASMR 60% sound effects and craftsman hand action]
+[Comprehensive ENGLISH I2V video prompt for Video 1, including ASMR 60% sound effects, craftsman hand action, and figurines' dynamic reflex / eye-tracking reaction. Pure English text only, NO Chinese in prompt body]
 
 ...
 VIDEO N (中文说明):
-[Comprehensive English I2V video prompt for Video N]
+[Comprehensive ENGLISH I2V video prompt for Video N, including ASMR 60% sound effects, craftsman hand action, and figurines' dynamic reflex / eye-tracking reaction. Pure English text only, NO Chinese in prompt body]
 
 IMAGE N+1 (中文说明):
-[Comprehensive English photoreal image prompt for final Image N+1 (reward / reveal)]
+[Comprehensive ENGLISH photoreal image prompt for final Image N+1 (reward / reveal), including finished diorama and celebrating resident figurines. Pure English text only, NO Chinese in prompt body]
 """
 
     return f"""You are an elite master prompt engineer specializing in hyper-realistic restoration time-lapse prompts for state-of-the-art AI video models (Runway Gen-3 Alpha, Kling AI, Luma Dream Machine, Sora, Hailuo) and image models (Midjourney v6, FLUX.1 Pro, Imagen 3).
@@ -141,6 +157,11 @@ Adhere strictly to the following non-negotiable master rules:
 9. [Negative Restraints & Anti-Cavernous Hall]
 - All prompts must strictly enforce: (cavernous hall, oversized room, giant space, miniature furniture, dollhouse scale, wet floor, high glossy mirror reflection, telephoto distortion:1.4).{banned_str}{const_str}
 
+10. [CRITICAL LANGUAGE SPECIFICATION - 100% ENGLISH PROMPT BODIES]
+- ALL IMAGE PROMPTS (IMAGE 1..N+1) AND ALL VIDEO PROMPTS (VIDEO 1..N) MUST BE WRITTEN IN 100% DESCRIPTIVE, PHOTOREALISTIC ENGLISH.
+- ABSOLUTELY NEVER write prompt body text in Chinese! Downstream AI generation backends (Midjourney, FLUX, Kling AI, Hailuo, Sora, Runway, Google Imagen) strictly require English prompts.
+- The ONLY Chinese allowed in the entire output is the Title in ===TITLE=== and the short slot summary in parentheses on the header line, e.g. "IMAGE 1 (初始未动工状态):". All prompt bodies below each header line MUST be pure, production-ready English!
+
 OUTPUT FORMAT REQUIREMENTS:
 Output ONLY plain text with strict marker sections. No code fences, no introductory or concluding conversational text.
 
@@ -152,30 +173,34 @@ Output ONLY plain text with strict marker sections. No code fences, no introduct
 
 ===PROMPTS===
 IMAGE 1 (中文说明):
-[Comprehensive English photoreal image prompt for Image 1]
+[Comprehensive ENGLISH photoreal image prompt for Image 1. Pure English text only, NO Chinese in prompt body]
 
 VIDEO 1 (中文说明):
-[Comprehensive English I2V video prompt for Video 1, including ASMR 60% sound effects and worker action]
+[Comprehensive ENGLISH I2V video prompt for Video 1, including ASMR 60% sound effects and worker action. Pure English text only, NO Chinese in prompt body]
 
 IMAGE 2 (中文说明):
-[Comprehensive English photoreal image prompt for Image 2]
+[Comprehensive ENGLISH photoreal image prompt for Image 2. Pure English text only, NO Chinese in prompt body]
 
 ...
 VIDEO N (中文说明):
-[Comprehensive English I2V video prompt for Video N]
+[Comprehensive ENGLISH I2V video prompt for Video N. Pure English text only, NO Chinese in prompt body]
 
 IMAGE N+1 (中文说明):
-[Comprehensive English photoreal image prompt for final Image N+1 (reward / reveal)]
+[Comprehensive ENGLISH photoreal image prompt for final Image N+1 (reward / reveal). Pure English text only, NO Chinese in prompt body]
 """
 
 
-def build_fast_composer_user_prompt(title, theme, beats_list, banned_elements=None, scene_constants=None, mutation_axes=None, scene_signature=None):
-    """构建用户端结构化节拍提示词，包含 N 拍全部客观事实与交付成果。"""
+def build_fast_composer_user_prompt(title, theme, beats_list, banned_elements=None, scene_constants=None, mutation_axes=None, scene_signature=None, cast_identity=None):
+    """构建用户端结构化节拍提示词，包含 N 拍全部客观事实、交付成果与人物动态行为。"""
     lines = []
     lines.append(f"Project Title: {title}")
     lines.append(f"Carrier / Theme: {theme}")
     if scene_signature:
         lines.append(f"Scene Signature: {scene_signature}")
+    if cast_identity:
+        lines.append("Permanent Living Cast Identity:")
+        for c in cast_identity:
+            lines.append(f"  - {c}")
     if isinstance(mutation_axes, dict) and mutation_axes:
         lines.append("Target 4-Axis Theme Settings:")
         for k, v in mutation_axes.items():
@@ -190,6 +215,8 @@ def build_fast_composer_user_prompt(title, theme, beats_list, banned_elements=No
         stage = b.get('stage') or op
         action = b.get('visible_action') or ''
         result = b.get('visible_result') or ''
+        cast_act = b.get('cast_action') or ''
+        cast_str = f" | Cast Action: {cast_act}" if cast_act else ""
         pkg = b.get('package_operations') or []
         pkg_str = f" [Operations: {', '.join(pkg)}]" if pkg else ""
         details = b.get('visible_details') or []
@@ -199,10 +226,10 @@ def build_fast_composer_user_prompt(title, theme, beats_list, banned_elements=No
         space = b.get('space') or 'main_space'
 
         lines.append(
-            f"- Beat {idx} (Space: {space}, Stage: {stage}): {action} -> {result}{pkg_str}{details_str}{traces_str}"
+            f"- Beat {idx} (Space: {space}, Stage: {stage}): {action} -> {result}{pkg_str}{details_str}{traces_str}{cast_str}"
         )
 
-    lines.append("\nPlease synthesize the full ===TITLE===, ===THEME===, and ===PROMPTS=== sequence now.")
+    lines.append("\nPlease synthesize the full ===TITLE===, ===THEME===, and ===PROMPTS=== sequence now. CRITICAL: all IMAGE and VIDEO prompt bodies MUST be written in pure descriptive ENGLISH (only slot headers have Chinese summaries).")
     return "\n".join(lines)
 
 
@@ -296,6 +323,53 @@ def synthesize_drift_lock_packet(theme, beats_list, carrier="structure"):
     }
 
 
+def _ensure_english_prompt_bodies(config, prompt_block, on_progress=None):
+    """确保所有 IMAGE 与 VIDEO 分槽的提示词正文 100% 为英文。
+    若模型因主题/标题混入中文而误输出了中文正文，进行确定性英文转译并保留分槽结构与中文说明。
+    """
+    if not prompt_block or not isinstance(prompt_block, str):
+        return prompt_block
+
+    parsed_images, parsed_videos = pp._parse_prompt_slots(prompt_block)
+    has_chinese_body = False
+    for item in list(parsed_images.values()) + list(parsed_videos.values()):
+        body = item.get('body', '') if isinstance(item, dict) else str(item)
+        # 提示词正文主体若含有大量中文字符（超过 5 个汉字），判定为中文正文
+        if len(re.findall(r'[\u4e00-\u9fa5]', body)) > 5:
+            has_chinese_body = True
+            break
+
+    if not has_chinese_body:
+        return prompt_block
+
+    if on_progress:
+        on_progress('replica_stage', {
+            'stage': 'compose',
+            'message': '检测到提示词正文包含中文，正在转换为 100% 英文生产提示词…',
+        })
+
+    system_prompt = (
+        "You are an expert AI prompt engineer specializing in translating and formatting image/video prompts "
+        "for AI generation backends (Midjourney v6, FLUX.1 Pro, Kling AI, Hailuo, Sora, Runway, Imagen 3).\n\n"
+        "Rules:\n"
+        "1. Translate all prompt bodies into descriptive, high-quality, photorealistic ENGLISH.\n"
+        "2. Keep the slot header lines e.g. '图片 1（中文说明）:' or '视频 1（中文说明）:' intact with their Chinese summaries.\n"
+        "3. Output ONLY the translated prompt block without markdown code fences or conversational text."
+    )
+    user_prompt = f"Please translate all IMAGE and VIDEO prompt bodies in the following prompt block into pure descriptive ENGLISH:\n\n{prompt_block}"
+
+    try:
+        translated = pp._chat(config, system_prompt, user_prompt, temperature=0.3, timeout=90)
+        cleaned = pp._strip_code_fences(translated).strip()
+        chk_img, chk_vid = pp._parse_prompt_slots(cleaned)
+        if len(chk_img) >= len(parsed_images) * 0.8:
+            return cleaned
+    except Exception as exc:
+        if sys.stdout:
+            print(f"[FAST_COMPOSER] 英文提示词转译异常: {exc}")
+    return prompt_block
+
+
 def compose_replica_one_pass(config, state, on_progress=None):
     """执行 1-Pass 极速直通合成。
     
@@ -347,6 +421,7 @@ def compose_replica_one_pass(config, state, on_progress=None):
         scene_constants=scene_constants,
         mutation_axes=mutation_axes,
         scene_signature=scene_signature,
+        cast_identity=cast_identity,
     )
 
     pp._raise_if_cancelled(on_progress)
@@ -367,11 +442,25 @@ def compose_replica_one_pass(config, state, on_progress=None):
     # 规范化 prompt_block，确保槽位中文说明与 beats_doc 对应
     from replica_pipeline import _ensure_prompt_block_summaries
     prompt_block = _ensure_prompt_block_summaries(prompt_block_raw, beats_doc)
+    prompt_block = _ensure_english_prompt_bodies(config, prompt_block, on_progress=on_progress)
 
     # 解析 slots
     parsed_images, parsed_videos = pp._parse_prompt_slots(prompt_block)
     compiled_images = {k: (v.get('body') if isinstance(v, dict) else str(v)) for k, v in parsed_images.items()}
     compiled_videos = {k: (v.get('body') if isinstance(v, dict) else str(v)) for k, v in parsed_videos.items()}
+
+    # 微缩模式主动后处理：确保人偶动态应激与巨人手施工口径一致
+    if is_miniature:
+        try:
+            from prompt_pipeline.composers.miniature import MiniatureComposer
+            mini_comp = MiniatureComposer()
+            for k, v in compiled_videos.items():
+                fixed_v = mini_comp.fix_miniature_video(v)
+                fixed_v = mini_comp.ensure_living_cast_reaction(fixed_v)
+                compiled_videos[k] = fixed_v
+        except Exception as exc:
+            if sys.stdout:
+                print(f"[FAST_COMPOSER] 微缩提示词人偶应激后处理提示: {exc}")
 
     image_1_prompt = compiled_images.get(1, '')
     if not image_1_prompt and parsed_images:

@@ -1169,6 +1169,168 @@ function replicaRenderTrendRefsDrawer() {
     </div>`;
 }
 
+function replicaDiagnoseClientCompatibility(state, axes, activeIdea, brief) {
+    if (activeIdea && activeIdea.compatibility) {
+        return activeIdea.compatibility;
+    }
+
+    const env = (axes.environment || '').toLowerCase();
+    const mat = (axes.material || '').toLowerCase();
+    const func = (axes.function || '').toLowerCase();
+    const hero = (axes.hero_reveal || '').toLowerCase();
+    const allText = `${brief || ''} ${env} ${mat} ${func} ${hero} ${(activeIdea && activeIdea.name) || ''} ${(activeIdea && activeIdea.hook) || ''}`;
+
+    let score = 100;
+    let level = 'compatible';
+    let conflictAlert = '';
+
+    const narrativeDims = [
+        { key: 'hook_crisis', label: '黄金 3 秒痛点钩子', icon: '🪝', status: 'pass', detail: '继承母本开局完全毁坏/废墟困境钩子，留存率有保障。' },
+        { key: 'character_emotion', label: '常驻角色情感羁绊', icon: '❤️', status: 'pass', detail: '穷困夫妇/受助生命看图纸燃起希望，情感闭环完整。' },
+        { key: 'god_hand_wonder', label: '神来之手与降维奇观', icon: '🖐️', status: 'pass', detail: '巨人工匠之手（God Hand）如神迹降临微缩世界，治愈奇观感强烈。' },
+        { key: 'contrast_reward', label: '极致前后蜕变反差', icon: '💎', status: 'pass', detail: '从 0 分破烂废墟到 100 分奢华庄园，多巴胺终局爽点拉满。' },
+    ];
+
+    const physicalDims = [
+        { key: 'spatial_force', label: '空间支撑与受力范式', icon: '🏗️', status: 'pass', detail: '基底载体同构，受力逻辑与建造工序契合。' },
+        { key: 'material_phase', label: '材料加工与物理相态', icon: '🪵', status: 'pass', detail: '实体木石钢构装配相态，切削与微雕工序通用。' },
+        { key: 'scale_envelope', label: '三维公制尺度与包络', icon: '📐', status: 'pass', detail: '微缩微距/紧凑尺度，机位透视与比例稳定。' },
+        { key: 'asmr_acoustic', label: 'ASMR 声画沉浸节拍', icon: '🎧', status: 'pass', detail: '微观撕纸、微型木石拼搭原声与 60% 物理音量动态映射。' },
+    ];
+
+    // 空间支撑冲突
+    if (['悬崖', '悬空', '挑空', '树屋', '树冠', '太空', '空间站', 'cliff', 'treehouse', 'space'].some(k => allText.includes(k))) {
+        physicalDims[0].status = 'fail';
+        physicalDims[0].detail = '悬崖/树冠/失重与母本基底受力冲突，无法执行常规建造工序。';
+        score -= 45;
+        conflictAlert = '空间载体硬冲突：悬崖/高空/太空无法硬套母本基础工序，建议升级为全新黄金母本！';
+    }
+
+    // 材料相态冲突
+    if (['冰雕', '纯冰', '熔岩琉璃', '3d打印', '增材'].some(k => allText.includes(k))) {
+        physicalDims[1].status = 'fail';
+        physicalDims[1].detail = '特殊物理相态（冰雕/熔岩/3D打印）与母本实体木石装配根本冲突。';
+        score -= 40;
+        if (!conflictAlert) conflictAlert = '材料相态冲突：冰雕/熔岩/3D打印无法硬套微缩装配工艺！建议建立专属母本。';
+    }
+
+    // 尺度严重膨胀冲突
+    if (['大教堂', '大礼堂', '巨型机库', '万平', '万人', 'cathedral', 'grand hall'].some(k => allText.includes(k))) {
+        physicalDims[2].status = 'fail';
+        physicalDims[2].detail = '空间体量严重膨胀，硬套微缩/紧凑镜头会导致 Cavernous 保龄球道畸变。';
+        score -= 40;
+        if (!conflictAlert) conflictAlert = '空间尺度严重膨胀：硬套会导致画面被拉伸为深长管道！';
+    }
+
+    // 叙事灵魂检查（针对微缩改造题材）
+    const isMiniatureTask = (state && (state.title || state.video_name || '')).includes('微缩') || allText.includes('微缩');
+    if (isMiniatureTask) {
+        if (['真人', '地下掩体', '工人亲自', '1.78m', '成年工人'].some(k => allText.includes(k)) && !['夫妇', '小人', '人偶'].some(k => allText.includes(k))) {
+            narrativeDims[1].status = 'fail';
+            narrativeDims[1].detail = '丢失穷困夫妇角色线：微缩爆款的核心是受助夫妇的情感共鸣，误套为普通真人工人施工将导致“没血没肉”！';
+            narrativeDims[2].status = 'fail';
+            narrativeDims[2].detail = '丢失神来之手：微缩沙盘被降级为成人平视，破坏了 God Hand 降维神迹奇观感。';
+            score -= 45;
+            if (!conflictAlert) conflictAlert = '🎭 叙事灵魂与情绪断层预警：母本核心是“神来之手为穷困夫妇看图纸造豪宅”，二创若丢掉夫妇情感弧线与微缩神之手，将沦为无灵魂的冰冷手工！';
+        }
+    }
+
+    score = Math.max(0, Math.min(100, score));
+    if (score < 60) level = 'incompatible';
+    else if (score < 90) level = 'risky';
+    else level = 'compatible';
+
+    const verdictTitle = level === 'compatible'
+        ? '✅ 允许 100% 骨架硬冻结正交派生 (Safe)'
+        : (level === 'risky' ? '⚠️ 需局部工序与叙事适配 (Risky)' : '🚫 严禁表面硬套（物理冲突或叙事灵魂丢失）');
+
+    return {
+        compatibility_level: level,
+        compatibility_score: score,
+        verdict_title: verdictTitle,
+        can_inherit_skeleton: level !== 'incompatible',
+        summary: level === 'compatible'
+            ? '母本与二创在 TikTok 叙事弧线、角色情感羁绊、空间载体与工艺拓扑上 100% 同构，兼具物理真实与爆款灵魂。'
+            : (level === 'risky' ? '检测到轻微工艺或叙事跨度，系统将自动适配工具、ASMR 与角色情感弧线。' : conflictAlert),
+        conflict_alert: conflictAlert,
+        dimensions: [...narrativeDims, ...physicalDims],
+        narrative_dimensions: narrativeDims,
+        physical_dimensions: physicalDims,
+        action_recommendation: {
+            action: level === 'incompatible' ? 'create_new_baseline' : (level === 'risky' ? 'adapt_and_mutate' : 'mutate_orthogonal'),
+            button_label: level === 'incompatible' ? '👑 升级为全新黄金母本 / 补全叙事灵魂' : '⚡ 一键生成二创变体提示词包 (Variant)',
+            explanation: level === 'incompatible' ? '物理规律冲突或严重丢失了母本的核心叙事灵魂（如穷困夫妇看图纸、神之手介入或破败开局钩子）。' : '拓扑同构且叙事灵魂闭环，允许受控发散。'
+        }
+    };
+}
+
+function replicaRenderDecisionMatrix(state, axes, activeIdea, brief) {
+    const diag = replicaDiagnoseClientCompatibility(state, axes, activeIdea, brief);
+    const lvl = diag.compatibility_level || 'compatible';
+    const score = diag.compatibility_score ?? 100;
+
+    const narrativeDims = diag.narrative_dimensions || (diag.dimensions || []).filter(d => ['hook_crisis', 'character_emotion', 'god_hand_wonder', 'contrast_reward'].includes(d.key));
+    const physicalDims = diag.physical_dimensions || (diag.dimensions || []).filter(d => !['hook_crisis', 'character_emotion', 'god_hand_wonder', 'contrast_reward'].includes(d.key));
+
+    return `
+    <div class="replica-decision-matrix-card is-${lvl}" id="replica-decision-framework-box">
+        <div class="replica-decision-header">
+            <div class="replica-decision-title-group">
+                <span>🛡️ 重构判断矩阵 (TikTok 深度叙事与工艺双轨诊断)</span>
+                <span class="replica-decision-badge is-${lvl}">
+                    ${escapeHtmlReplica(diag.verdict_title || '')} (${score}分)
+                </span>
+            </div>
+            <span class="replica-hint">${diag.can_inherit_skeleton ? '✓ 骨架与叙事可复用' : '✗ 需独立建母本/补全灵魂'}</span>
+        </div>
+        <div class="replica-decision-summary">
+            ${escapeHtmlReplica(diag.summary || '')}
+        </div>
+        ${diag.conflict_alert ? `
+            <div class="replica-decision-conflict-alert">
+                <b>⚠️ 爆款灵魂与硬套红线预警：</b>${escapeHtmlReplica(diag.conflict_alert)}
+            </div>
+        ` : ''}
+
+        <!-- 🎭 轨一：TikTok 爆款叙事与情绪价值弧线 -->
+        <div class="replica-decision-track-section">
+            <div class="replica-decision-track-title">🎭 TikTok 爆款叙事与情绪价值弧线 (Narrative & Emotional Soul)</div>
+            <div class="replica-decision-dims-grid">
+                ${narrativeDims.map(dim => `
+                    <div class="replica-decision-dim-item status-${dim.status || 'pass'}">
+                        <div class="replica-decision-dim-top">
+                            <span>${dim.icon || '🎭'} ${escapeHtmlReplica(dim.label)}</span>
+                            <span class="replica-decision-dim-status-icon">
+                                ${dim.status === 'pass' ? '🟢 契合' : (dim.status === 'warning' ? '🟡 需适配' : '🔴 缺失/断层')}
+                            </span>
+                        </div>
+                        <div class="replica-decision-dim-detail">${escapeHtmlReplica(dim.detail || '')}</div>
+                    </div>
+                `).join('')}
+            </div>
+        </div>
+
+        <!-- 🏗️ 轨二：全域物理工程与真实工艺拓扑 -->
+        <div class="replica-decision-track-section" style="margin-top: 10px;">
+            <div class="replica-decision-track-title">🏗️ 全域物理工程与真实工艺拓扑 (Physical Craft & Topology)</div>
+            <div class="replica-decision-dims-grid">
+                ${physicalDims.map(dim => `
+                    <div class="replica-decision-dim-item status-${dim.status || 'pass'}">
+                        <div class="replica-decision-dim-top">
+                            <span>${dim.icon || '📌'} ${escapeHtmlReplica(dim.label)}</span>
+                            <span class="replica-decision-dim-status-icon">
+                                ${dim.status === 'pass' ? '🟢 契合' : (dim.status === 'warning' ? '🟡 需适配' : '🔴 冲突')}
+                            </span>
+                        </div>
+                        <div class="replica-decision-dim-detail">${escapeHtmlReplica(dim.detail || '')}</div>
+                    </div>
+                `).join('')}
+            </div>
+        </div>
+    </div>
+    `;
+}
+
 function replicaRenderAiIdeas(state) {
     const ideas = (state && state.ai_diverged_ideas) || replicaAiIdeas || [];
     if (!ideas || !ideas.length) {
@@ -1191,10 +1353,16 @@ function replicaRenderAiIdeas(state) {
         <div class="replica-ai-ideas-grid">
             ${ideas.map((idea, idx) => {
                 const isActive = replicaActiveIdeaIndex === idx;
+                const compat = idea.compatibility;
+                const compatLvl = compat ? compat.compatibility_level : 'compatible';
+                const compatScore = compat ? compat.compatibility_score : 100;
+                const compatText = compatLvl === 'compatible' ? '🛡️ 100% 同构' : (compatLvl === 'risky' ? '⚠️ 需适配' : '🚫 物理冲突');
+
                 return `
                     <div class="replica-ai-idea-card ${isActive ? 'active' : ''}" data-idea-idx="${idx}" title="${escapeHtmlReplica(idea.hook || '')}">
                         <div class="replica-ai-idea-top">
                             <span class="replica-ai-idea-name">${escapeHtmlReplica(idea.icon || '✨')} ${escapeHtmlReplica(idea.name || `创意方案 ${idx + 1}`)}</span>
+                            <span class="replica-ai-idea-compat-badge is-${compatLvl}" title="重构判断矩阵评估：${compatScore}分">${compatText}</span>
                             ${isActive ? '<span class="replica-ai-idea-badge">已选用</span>' : ''}
                         </div>
                         <div class="replica-ai-idea-hook">${escapeHtmlReplica(idea.hook || '')}</div>
@@ -1210,6 +1378,7 @@ function replicaRenderDualWorkbench(state) {
     if (state.stage === 'ingest' || state.stage === 'extract' || state.stage === 'confirm_cost') {
         return '';
     }
+
 
     const isLocked = !!state.is_locked_baseline;
     const collage = replicaCollageUrl(state);
@@ -1378,6 +1547,9 @@ function replicaRenderDualWorkbench(state) {
                 </div>
             </div>
 
+            <!-- 🛡️ 重构判断矩阵 (Decision Framework) 实时诊断面板 -->
+            ${replicaRenderDecisionMatrix(state, axes, activeIdea, replicaDivergeBrief)}
+
             <div class="replica-guarantee-box">
                 <div class="replica-guarantee-title">🛡️ 骨架硬冻结保障 (Zero Drift Guarantee)：</div>
                 <div class="replica-guarantee-list">
@@ -1401,6 +1573,7 @@ function replicaRenderDualWorkbench(state) {
         </div>`}
     </div>
     ${canMutate ? replicaRenderDualTrackComparator(state) : ''}`;
+
 }
 
 function replicaRenderJob(state) {

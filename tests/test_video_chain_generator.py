@@ -24,6 +24,7 @@ from video_generator import (
     rewrite_prompt_for_single_frame,
     generate_video_chain_sequence,
     generate_video_collage,
+    _extract_video_frame,
 )
 
 
@@ -384,6 +385,46 @@ class TestVideoChainSequenceGeneration(unittest.TestCase):
             m = json.load(f)
         self.assertEqual(len(m.get('videos', [])), 3)
         self.assertTrue(all(v.get('status') == 'success' for v in m['videos']))
+
+
+class TestExtractVideoFrame(unittest.TestCase):
+    """测试抽帧逻辑（包含 WebP 转存兼容性与异常保护）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_extract_video_frame_nonexistent_video(self):
+        out_webp = os.path.join(self.tmp, 'img_001.webp')
+        self.assertFalse(_extract_video_frame('/nonexistent/video.mp4', out_webp, 'first'))
+
+    @patch('subprocess.run')
+    def test_extract_video_frame_webp_converts_via_pil(self, mock_run):
+        from PIL import Image
+        out_webp = os.path.join(self.tmp, 'img_002.webp')
+        dummy_video = os.path.join(self.tmp, 'test.mp4')
+        with open(dummy_video, 'wb') as f:
+            f.write(b'dummy_video')
+
+        def fake_ffmpeg(cmd, **kwargs):
+            # cmd 里面应该把输出写到了 .tmp_extract_*.png
+            target = cmd[-1]
+            self.assertTrue(target.endswith('.png'), f"Expected .png target for webp, got {target}")
+            # 创建真实 png 图片供 PIL 读取
+            im = Image.new('RGB', (10, 10), color='blue')
+            im.save(target, 'PNG')
+            res = MagicMock()
+            res.returncode = 0
+            return res
+
+        mock_run.side_effect = fake_ffmpeg
+
+        ok = _extract_video_frame(dummy_video, out_webp, 'last', sseof_offset=0.15)
+        self.assertTrue(ok)
+        self.assertTrue(os.path.exists(out_webp))
+        self.assertGreater(os.path.getsize(out_webp), 0)
 
 
 if __name__ == '__main__':

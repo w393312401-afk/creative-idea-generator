@@ -1527,7 +1527,35 @@ def ai_diverge_ideas(config, baseline_job_id, brief=None, count=4, on_progress=N
     return ideas
 
 
+def evaluate_variant_compatibility(config, baseline_job_id, mutation_axes=None, brief=None, idea=None):
+    """根据重构判断矩阵评估二创变体与黄金母本的物理与拓扑相容性。"""
+    from prompt_pipeline import decision_framework
+
+    baseline_job_id = validate_job_id(baseline_job_id)
+    state = _load_state(baseline_job_id)
+    if not state:
+        raise ValueError(f'找不到母本复刻任务 {baseline_job_id}')
+
+    source_beats = state.get('beats')
+    if not source_beats or not (source_beats.get('beats') if isinstance(source_beats, dict) else []):
+        raise ValueError('母本尚未生成节拍阶梯，无法进行相容性诊断')
+
+    baseline_doc = dict(source_beats) if isinstance(source_beats, dict) else {'beats': source_beats}
+    baseline_doc['title'] = state.get('title') or state.get('video_name') or ''
+    baseline_doc['video_name'] = state.get('video_name') or ''
+    baseline_doc['overview'] = state.get('overview') or {}
+
+    report = decision_framework.evaluate_variant_compatibility(
+        baseline_doc=baseline_doc,
+        mutation_axes=mutation_axes,
+        brief=brief,
+        idea=idea
+    )
+    return report
+
+
 def mutate_orthogonal(config, baseline_job_id, mutation_axes=None, preset=None, brief=None, on_progress=None):
+
     """基于已有的 1:1 母本执行四轴正交替换，瞬间派生二创 Job。"""
     from prompt_pipeline import reverse
     from prompt_pipeline import mutate

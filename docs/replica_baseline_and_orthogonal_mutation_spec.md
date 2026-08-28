@@ -157,7 +157,23 @@ def generate_orthogonal_variant(baseline_job: dict, mutation_axes: dict) -> dict
     return build_prompt_pack_from_beats(variant_beats, is_variant=True)
 ```
 
+### 3.4 重构判断矩阵与二创相容性防护网 (Decision Framework)
+
+为彻底阻断盲目硬套导致的骨架坍塌与物理常识硬伤，系统引入六维相容性诊断矩阵：
+1. **空间支撑与受力范式 (Spatial Force)**：地下/地表开挖 vs 悬崖挑空/树冠高空/水上漂浮/失重轨道。
+2. **材料加工与物理相态 (Material Phase)**：固体切削装配 vs 冰雪热熔/3D打印增材/熔岩/生土夯筑。
+3. **三维公制尺度与包络 (Scale Envelope)**：3m 紧凑掩体 vs 千平大礼堂 (防 Cavernous 畸变)。
+4. **施工主体与活物交互 (Actor Dynamics)**：1.78m 真人工匠 vs 微缩沙盘人偶 vs 自动化机械臂 vs 动物筑巢。
+5. **过门转场机制与视线 (Transition Portal)**：双镜头水密舱门下行 vs 敞开无门露台 vs 柔性气闸。
+6. **ASMR 声学质感与节奏 (ASMR Alignment)**：60% 物理敲击原声 vs 变体材质音效映射。
+
+输出三级决策控制：
+- 🟢 **SAFE (90~100)**：允许 100% 骨架硬冻结正交派生。
+- 🟡 **RISKY (60~89)**：存在轻微跨度，自动适配工序与 ASMR 映射。
+- 🔴 **INCOMPATIBLE (<60)**：严禁硬套母本，阻断幽灵变化，一键引导建立全新黄金母本。
+
 ---
+
 
 ## 4. 数据结构与后端 API 接口契约
 
@@ -216,9 +232,11 @@ def generate_orthogonal_variant(baseline_job: dict, mutation_axes: dict) -> dict
 | `/api/replica/save_beats`| `POST` | `{ job_id, beats }` | 保存人工核验后的节拍数据并触发 4-Zone 守恒与单调继承机械校验 |
 | `/api/replica/compose` | `POST` | `{ job_id }` | 100% 字段级绑定合成 1:1 标准提示词包与音频规范 |
 | `/api/replica/lock_baseline`| `POST`| `{ job_id }` | **[NEW]** 将验证通过的 1:1 Job 加锁固化为 `Gold Baseline` 并入库 |
+| `/api/replica/evaluate_compatibility`| `POST`| `{ baseline_job_id, mutation_axes, brief, idea }` | **[NEW]** 基于重构判断矩阵评估二创相容性，返回六维诊断与红线预警 |
 | `/api/replica/mutate_orthogonal`| `POST`| `{ baseline_job_id, mutation_axes }` | **[NEW]** 基于已加锁母本执行四轴正交替换，瞬间派生二创 Job |
 | `/api/replica/lineage` | `GET` | `?baseline_id=xxx` | **[NEW]** 查询某个母本派生出的所有二创变体树状关系 |
 | `/api/replica/handoff` | `POST` | `{ job_id }` | 将 1:1 母本或二创变体一键递交给分步渲染管线（`/api/stepped/start`） |
+
 
 ---
 
